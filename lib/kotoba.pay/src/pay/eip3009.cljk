@@ -1,0 +1,313 @@
+(ns pay.eip3009
+  "The x402 v2 `exact` scheme's EVM half: an EIP-3009
+  `transferWithAuthorization` checked and turned into a transaction — pure
+  Clojure/ClojureScript, no network I/O, no key custody.
+
+  This is what a facilitator does with a buyer's PaymentPayload, split so the
+  parts that need nothing but the payload are here and the parts that need a
+  chain or a key are the host's:
+
+  - `offline-errors`  — everything decidable from the payload alone: the v2
+    economic fields (`pay.x402/v2-payload-errors`), that the network and asset
+    are a USDC this facilitator knows the EIP-712 domain of, that the
+    signature is a well-formed low-s secp256k1 signature, and that it
+    RECOVERS TO `authorization.from` under that domain.
+  - `chain-errors`    — the two facts only a chain has, handed in by the host:
+    the payer's USDC balance and whether the authorization nonce is spent.
+    `balance-call` / `authorization-state-call` build the `eth_call`s.
+  - `simulation-call` / `simulation-errors` — the transaction itself, run as
+    an `eth_call`: the contract's own verdict, which is the only one that
+    covers EIP-1271 and EIP-7702 accounts (see the section below).
+  - `settle-calldata` / `settle-tx` — the `transferWithAuthorization` call
+    and the EIP-1559 transaction around it, for the host to sign and send.
+
+  WHY THE SETTLER HOLDS NO BUYER FUNDS. The transaction moves USDC straight
+  from `from` to `to`; the key that signs it pays gas and nothing else, and the
+  authorization it carries names the recipient and the amount. A compromised
+  settler key can spend its own ETH and can refuse to settle; it cannot
+  redirect a payment, because changing any field breaks the buyer's signature.
+
+  Only 65-byte signatures are accepted, sent through the `(v, r, s)` overload.
+  A longer smart-wallet signature (EIP-1271 / EIP-6492) needs the `bytes
+  signature` overload and is refused as `:eip3009/unsupported-signature`
+  rather than half-supported. A 65-byte signature from an account with code
+  is judged by the contract, which is why the simulation is the last gate."
+  (:require [kotoba.lang.text :as str]
+            [eth-crypto.core :as eth]
+            [pay.x402 :as x402]))
+
+;; ─── typed data ─────────────────────────────────────────────────────
+
+(def types
+  "EIP-3009's struct, field order as the USDC contract hashes it."
+  {"TransferWithAuthorization" [{:name "from" :type "address"}
+                                {:name "to" :type "address"}
+                                {:name "value" :type "uint256"}
+                                {:name "validAfter" :type "uint256"}
+                                {:name "validBefore" :type "uint256"}
+                                {:name "nonce" :type "bytes32"}]})
+
+(def chain-id-by-network
+  "Networks this facilitator can settle. A network is here only when
+  `pay.x402` also knows its USDC address and EIP-712 domain."
+  {"eip155:8453" 8453
+   "eip155:84532" 84532})
+
+(defn- lc [s] (some-> s str str/lower))
+
+(defn- hex? [s n] (and (string? s) (re-matches (re-pattern (str "0x[0-9a-fA-F]{" n "}")) s)))
+
+(defn domain
+  "The EIP-712 domain USDC on `network` declares, with string keys as
+  `eth-crypto` reads them. Throws for a network this facilitator does not know."
+  [network]
+  (let [{:keys [name version]} (x402/eip712-domain-for network)]
+    {"name" name
+     "version" version
+     "chainId" (or (chain-id-by-network network)
+                   (throw (ex-info "network is not settleable" {:type :eip3009/unknown-network
+                                                                 :network network})))
+     "verifyingContract" (x402/usdc-for network)}))
+
+(defn digest
+  "The 32-byte digest the buyer signed for `authorization` on `network`."
+  [network {:keys [from to value validAfter validBefore nonce]}]
+  (eth/eip712-digest (domain network) types "TransferWithAuthorization"
+                     {"from" from "to" to "value" (str value)
+                      "validAfter" (str (or validAfter "0")) "validBefore" (str validBefore)
+                      "nonce" nonce}))
+
+;; ─── signature ──────────────────────────────────────────────────────
+
+(def ^:private half-n
+  "secp256k1 n/2. USDC's ECRecover refuses s above it (EIP-2)."
+  "7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0")
+
+(defn split-signature
+  "0x r‖s‖v (65 bytes) -> {:r hex64 :s hex64 :v 27|28}, or nil when it is not a
+  signature USDC's `transferWithAuthorization(…, v, r, s)` would accept:
+  wrong length, v outside {0,1,27,28}, or high s."
+  [sig]
+  (when (hex? sig 130)
+    (let [h (lc (subs sig 2))
+          r (subs h 0 64) s (subs h 64 128)
+          v (#?(:clj Integer/parseInt :cljs js/parseInt) (subs h 128 130) 16)
+          v (if (< v 27) (+ v 27) v)]
+      (when (and (#{27 28} v) (<= (compare s half-n) 0)
+                 (not= r (apply str (repeat 64 "0"))) (not= s (apply str (repeat 64 "0"))))
+        {:r r :s s :v v}))))
+
+(defn recover-signer
+  "The lowercase address that signed `authorization` on `network`, or nil."
+  [network authorization sig]
+  (when-let [{:keys [r s v]} (split-signature sig)]
+    (try
+      (lc (eth/ecrecover-checksum (digest network authorization)
+                                  (eth/hex->bytes (str r s (if (= v 27) "1b" "1c")))))
+      (catch #?(:clj Exception :cljs :default) _ nil))))
+
+;; ─── verification ───────────────────────────────────────────────────
+
+(defn offline-errors
+  "Every reason `payment-payload` cannot be settled against `requirements`
+  that is decidable without a chain. Empty when it can.
+
+  `min-validity-seconds`: an authorization that expires before the settlement
+  transaction can land is refused now rather than reverted later (Base blocks
+  are 2 s; the default leaves room for a few)."
+  ([payment-payload requirements now] (offline-errors payment-payload requirements now 6))
+  ([{:keys [payload] :as payment-payload} {:keys [network asset extra] :as requirements} now min-validity-seconds]
+   (let [auth (:authorization payload)
+         base (x402/v2-payload-errors payment-payload requirements now)
+         known? (contains? chain-id-by-network network)]
+     (cond-> base
+       (not known?) (conj :eip3009/unknown-network)
+       (and known? (not= (lc asset) (lc (x402/usdc-for network)))) (conj :eip3009/asset-not-usdc)
+       (and known? (not= (select-keys extra [:name :version])
+                         (x402/eip712-domain-for network)))
+       (conj :eip3009/domain-mismatch)
+       (not (and (hex? (:from auth) 40) (hex? (:to auth) 40))) (conj :eip3009/invalid-address)
+       (not (hex? (:nonce auth) 64)) (conj :eip3009/invalid-nonce)
+       (not (and (re-matches #"[0-9]{1,78}" (str (:value auth)))
+                 (re-matches #"[0-9]{1,78}" (str (or (:validAfter auth) "0")))
+                 (re-matches #"[0-9]{1,78}" (str (:validBefore auth)))))
+       (conj :eip3009/invalid-number)
+       (and (re-matches #"[0-9]{1,15}" (str (:validBefore auth)))
+            (< (#?(:clj Long/parseLong :cljs js/parseInt) (str (:validBefore auth)))
+               (+ now min-validity-seconds)))
+       (conj :eip3009/expires-before-settlement)
+       (and (string? (:signature payload)) (nil? (split-signature (:signature payload))))
+       (conj :eip3009/unsupported-signature)))))
+
+(defn signature-errors
+  "[] when the payload's signature recovers to `authorization.from`. Separate
+  from `offline-errors` because it is the one expensive check (an EC point
+  multiplication) and is only worth running on a payload that passed the rest."
+  [{:keys [payload]} {:keys [network]}]
+  (let [auth (:authorization payload)]
+    (if (= (lc (:from auth)) (recover-signer network auth (:signature payload)))
+      []
+      [:eip3009/invalid-signature])))
+
+;; ─── chain reads (the host performs them) ──────────────────────────
+
+(defn- word
+  "A non-negative decimal or 0x-hex integer as a 64-hex-digit ABI word."
+  [v]
+  (let [h #?(:clj (.toString (if (and (string? v) (str/starts-with? v "0x"))
+                               (java.math.BigInteger. (subs v 2) 16)
+                               (java.math.BigInteger. (str v)))
+                             16)
+             :cljs (.toString (js/BigInt (str v)) 16))]
+    (when (> (count h) 64) (throw (ex-info "value exceeds uint256" {:type :eip3009/overflow})))
+    (str (apply str (repeat (- 64 (count h)) "0")) h)))
+
+(defn- address-word [a] (str (apply str (repeat 24 "0")) (lc (subs a 2))))
+
+(defn selector
+  "The 4-byte function selector of a canonical signature, as 8 hex digits."
+  [signature]
+  (subs (eth/bytes->hex (eth/keccak256 (eth/utf8 signature))) 0 8))
+
+(def transfer-with-authorization-sig
+  "transferWithAuthorization(address,address,uint256,uint256,uint256,bytes32,uint8,bytes32,bytes32)")
+
+(defn balance-call
+  "eth_call params reading `owner`'s USDC balance on `network`."
+  [network owner]
+  {:to (x402/usdc-for network)
+   :data (str "0x" (selector "balanceOf(address)") (address-word owner))})
+
+(defn authorization-state-call
+  "eth_call params reading whether `authorizer` has used `nonce`."
+  [network authorizer nonce]
+  {:to (x402/usdc-for network)
+   :data (str "0x" (selector "authorizationState(address,bytes32)")
+              (address-word authorizer) (lc (subs nonce 2)))})
+
+(defn- hex->int-str [h]
+  (let [h (str/replace (str h) #"^0x" "")]
+    (if (str/blank? h) "0"
+        #?(:clj (str (java.math.BigInteger. h 16)) :cljs (str (js/BigInt (str "0x" h)))))))
+
+(defn compare-int
+  "Compare two non-negative decimal integer strings numerically."
+  [a b]
+  (let [a (str/replace (str a) #"^0+(?=.)" "") b (str/replace (str b) #"^0+(?=.)" "")]
+    (if (= (count a) (count b)) (compare a b) (compare (count a) (count b)))))
+
+(defn chain-errors
+  "Reasons the chain refuses the payment, from the two `eth_call` results the
+  host fetched (raw 0x words). nil for a result the host could not read is a
+  refusal too: settling blind is how a facilitator pays gas for a revert."
+  [{:keys [payload]} {:keys [balance-word state-word]}]
+  (let [value (str (get-in payload [:authorization :value]))
+        bal (some-> balance-word hex->int-str)
+        used (some-> state-word hex->int-str)]
+    (cond-> []
+      (nil? bal) (conj :eip3009/balance-unknown)
+      (and bal (neg? (compare-int bal value))) (conj :eip3009/insufficient-funds)
+      (nil? used) (conj :eip3009/nonce-state-unknown)
+      (and used (not= "0" used)) (conj :eip3009/nonce-used))))
+
+;; ─── simulation ─────────────────────────────────────────────────────
+;;
+;; `signature-errors` recovers an address; the contract decides with
+;; SignatureChecker, which asks `isValidSignature` of any `from` that has code.
+;; An EIP-7702-delegated EOA has code (`0xef0100‖delegate`), so for it the
+;; contract's answer is the delegate's, not ecrecover's -- and only the chain
+;; can give it. Measured 2026-10-07: anvil's test key 0 carries a 7702
+;; delegation on Base and Base Sepolia, its signature recovers here, and USDC
+;; reverts `FiatTokenV2: invalid signature`. So a facilitator's last check is
+;; an `eth_call` of the very transaction it would send.
+
+(defn simulation-call
+  "eth_call params for the settlement as `caller` would send it. Any address
+  works for `caller`: transferWithAuthorization does not look at msg.sender."
+  [network caller calldata]
+  {:from caller :to (x402/usdc-for network) :data calldata})
+
+(def ^:private revert-reasons
+  [[#"invalid signature" :eip3009/invalid-signature]
+   [#"exceeds balance" :eip3009/insufficient-funds]
+   [#"authorization is used" :eip3009/nonce-used]
+   [#"authorization is not yet valid" :x402/authorization-not-yet-valid]
+   [#"authorization is expired" :x402/authorization-expired]
+   [#"blacklisted" :eip3009/blacklisted]
+   [#"paused" :eip3009/paused]])
+
+(defn simulation-errors
+  "[] for a simulation that returned; the reason for one that reverted with
+  `message` (the RPC error text)."
+  [message]
+  (if (nil? message)
+    []
+    [(or (some (fn [[re k]] (when (re-find re (str/lower message)) k)) revert-reasons)
+         :eip3009/simulation-reverted)]))
+
+;; ─── settlement ─────────────────────────────────────────────────────
+
+(defn settle-calldata
+  "0x calldata for USDC's `transferWithAuthorization(from, to, value,
+  validAfter, validBefore, nonce, v, r, s)`."
+  [{:keys [from to value validAfter validBefore nonce]} sig]
+  (let [{:keys [r s v]} (or (split-signature sig)
+                            (throw (ex-info "unsupported signature" {:type :eip3009/unsupported-signature})))]
+    (str "0x" (selector transfer-with-authorization-sig)
+         (address-word from) (address-word to)
+         (word value) (word (or validAfter "0")) (word validBefore)
+         (lc (subs nonce 2)) (word v) r s)))
+
+(defn settle-tx
+  "The EIP-1559 transaction map `eth-crypto.core/sign-tx-eip1559` signs. The
+  chain id comes from the network, never from the caller: the one parameter
+  that would aim a testnet settlement at mainnet is not a parameter."
+  [network calldata {:keys [nonce gas max-fee tip]}]
+  {:chain-id (or (chain-id-by-network network)
+                 (throw (ex-info "network is not settleable" {:type :eip3009/unknown-network})))
+   :nonce nonce
+   :max-priority-fee-per-gas tip
+   :max-fee-per-gas max-fee
+   :gas gas
+   :to (eth/hex->bytes (subs (x402/usdc-for network) 2))
+   :value 0
+   :data (eth/hex->bytes (subs calldata 2))})
+
+;; ─── wire responses ─────────────────────────────────────────────────
+
+(def reason-codes
+  "Internal reasons -> the x402 v2 `invalidReason` / `errorReason` strings."
+  {:x402/version-mismatch "invalid_x402_version"
+   :x402/accepted-requirements-mismatch "invalid_payment_requirements"
+   :x402/scheme-mismatch "unsupported_scheme"
+   :x402/network-not-caip2 "invalid_network"
+   :eip3009/unknown-network "invalid_network"
+   :eip3009/asset-not-usdc "invalid_payment_requirements"
+   :eip3009/domain-mismatch "invalid_payment_requirements"
+   :x402/wrong-recipient "invalid_exact_evm_payload_recipient_mismatch"
+   :x402/amount-not-exact "invalid_exact_evm_payload_authorization_value"
+   :x402/authorization-expired "invalid_exact_evm_payload_authorization_valid_before"
+   :eip3009/expires-before-settlement "invalid_exact_evm_payload_authorization_valid_before"
+   :x402/authorization-not-yet-valid "invalid_exact_evm_payload_authorization_valid_after"
+   :x402/missing-signature "invalid_exact_evm_payload_signature"
+   :eip3009/unsupported-signature "invalid_exact_evm_payload_signature"
+   :eip3009/invalid-signature "invalid_exact_evm_payload_signature"
+   :eip3009/invalid-address "invalid_payload"
+   :eip3009/invalid-nonce "invalid_payload"
+   :eip3009/invalid-number "invalid_payload"
+   :eip3009/insufficient-funds "insufficient_funds"
+   :eip3009/nonce-used "invalid_transaction_state"
+   :eip3009/blacklisted "invalid_transaction_state"
+   :eip3009/paused "invalid_transaction_state"
+   :eip3009/simulation-reverted "invalid_transaction_state"
+   :eip3009/balance-unknown "unexpected_verify_error"
+   :eip3009/nonce-state-unknown "unexpected_verify_error"})
+
+(defn reason-code [k] (get reason-codes k "invalid_payload"))
+
+(defn verify-response
+  "The v2 VerifyResponse for a payload whose checks produced `errors`."
+  [{:keys [payload]} errors]
+  (cond-> {:isValid (empty? errors)
+           :payer (get-in payload [:authorization :from])}
+    (seq errors) (assoc :invalidReason (reason-code (first errors)))))

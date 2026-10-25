@@ -1,0 +1,110 @@
+(ns pay.core-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [pay.core :as pay]))
+
+(deftest usdc-units
+  (testing "parse"
+    (is (= 10000000 (pay/parse-usdc "10.00")))
+    (is (= 10000000 (pay/parse-usdc "10")))
+    (is (= 10500000 (pay/parse-usdc "10.5")))
+    (is (= 1 (pay/parse-usdc "0.000001")))
+    ;; >6 frac digits truncate, matching the original parseUsdc
+    (is (= 123456 (pay/parse-usdc "0.1234567"))))
+  (testing "invalid input throws"
+    (is (thrown? #?(:clj Exception :cljs js/Error) (pay/parse-usdc "abc")))
+    (is (thrown? #?(:clj Exception :cljs js/Error) (pay/parse-usdc ".5"))))
+  (testing "format"
+    (is (= "10" (pay/format-usdc 10000000)))
+    (is (= "10.5" (pay/format-usdc 10500000)))
+    (is (= "0.000001" (pay/format-usdc 1))))
+  (testing "roundtrip"
+    (doseq [s ["0" "1" "10.5" "0.000001" "42.123456"]]
+      (is (= s (pay/format-usdc (pay/parse-usdc s)))))))
+
+(deftest flow-rate
+  (is (= 3 (pay/flow-rate-per-second "10.00 / month"))) ; 10e6 / 2592000
+  (is (= 1000000 (pay/flow-rate-per-second "1 / second")))
+  (is (thrown? #?(:clj Exception :cljs js/Error)
+               (pay/flow-rate-per-second "10 per month"))))
+
+(deftest splits
+  (testing "80/20 with dust to the creator"
+    (let [alloc (pay/creator-platform-split 1000001 "did:c" "did:p")]
+      (is (= 1000001 (reduce + (map :amount-micros alloc))))
+      (is (= 800001 (:amount-micros (first alloc))))   ; 800000 + 1 dust
+      (is (= 200000 (:amount-micros (second alloc))))))
+  (testing "bps must sum to 10000"
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (pay/split-allocations 100 [{:to "a" :bps 5000}])))))
+
+(def cap
+  {:payer-did "did:key:zPayer"
+   :payee-did "did:key:zCreator"
+   :purpose :tip
+   :scope {:character-id "char-1"}
+   :amount {:asset "USDC" :value "10.00"}
+   :issued-at "2026-07-09T00:00:00Z"
+   :expires-at "2026-07-10T00:00:00Z"
+   :constraints {:revocable true}})
+
+(deftest capability-validation
+  (is (pay/valid-capability? cap))
+  (is (some #{:pay/invalid-purpose}
+            (pay/capability-errors (assoc cap :purpose :bribe))))
+  (is (some #{:pay/amount-not-string}
+            (pay/capability-errors (assoc-in cap [:amount :value] 10.0))))
+  (testing "subscribe requires recurrence"
+    (is (some #{:pay/subscribe-needs-recurrence}
+              (pay/capability-errors (assoc cap :purpose :subscribe))))
+    (is (pay/valid-capability?
+         (assoc cap :purpose :subscribe :recurrence {:interval-days 30})))))
+
+(deftest expiry
+  (is (not (pay/expired? cap "2026-07-09T12:00:00Z")))
+  (is (pay/expired? cap "2026-07-10T00:00:00Z"))
+  (is (pay/expired? cap "2026-07-11T00:00:00Z")))
+
+(def receipt
+  (pay/->receipt {:tx-hash "0xabc" :block-number 123
+                  :from "0xPayer" :to "0xCreator"
+                  :amount-micros 10000000}))
+
+(deftest entitlement
+  (testing "grant only on verified, sufficient settlement"
+    (let [r (pay/entitle cap receipt {:included true} "2026-07-09T12:00:00Z")]
+      (is (:grant? r))
+      (is (= :tip (:purpose r)))
+      (is (= "0xabc" (:tx-hash r)))))
+  (testing "holds"
+    (is (= :pay/unverified-settlement
+           (:hold (pay/entitle cap receipt {:included false :reason "not-yet-anchored"}
+                               "2026-07-09T12:00:00Z"))))
+    (is (= :pay/capability-expired
+           (:hold (pay/entitle cap receipt {:included true} "2026-07-11T00:00:00Z"))))
+    (is (= :pay/invalid-capability
+           (:hold (pay/entitle (dissoc cap :payer-did) receipt {:included true}
+                               "2026-07-09T12:00:00Z"))))
+    (is (= :pay/underpaid
+           (:hold (pay/entitle (assoc-in cap [:amount :value] "11.00") receipt
+                               {:included true} "2026-07-09T12:00:00Z"))))))
+
+(deftest treasury-bridge
+  (testing "treasury verify-payment result maps onto entitle's verification"
+    (let [ok  (pay/verification<-treasury {:ok? true :reason :confirmed :entry {:run/kind :confirmed}})
+          bad (pay/verification<-treasury {:ok? false :reason :underpaid})]
+      (is (:grant? (pay/entitle cap receipt ok "2026-07-09T12:00:00Z")))
+      (let [r (pay/entitle cap receipt bad "2026-07-09T12:00:00Z")]
+        (is (not (:grant? r)))
+        (is (= :pay/unverified-settlement (:hold r)))
+        (is (= :underpaid (:reason r)))))))
+
+(deftest unprovisioned-rail-holds-everything
+  (let [rail pay/unprovisioned-rail]
+    (doseq [r [(pay/-pay! rail {:to "0x" :amount-micros 1})
+               (pay/-pay-stream! rail {:to "0x" :flow-rate 1})
+               (pay/-pay-stream-stop! rail "s1")
+               (pay/-split-distribute! rail {:split-address "0x" :amount-micros 1})
+               (pay/-escrow-open! rail {:to "0x" :amount-micros 1})
+               (pay/-escrow-release! rail "e1" :recipient)]]
+      (is (= :hold (:status r)))
+      (is (= :pay/unprovisioned-capability (:reason r))))))

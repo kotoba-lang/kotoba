@@ -1,0 +1,135 @@
+(ns pay.rail.base-l2-test
+  "pay.rail.base-l2 — the first real PayRail.
+
+  The bundler and smart account are the two seams the adapter is built on, so
+  they are the two things faked here; nothing in this file sends a
+  transaction. What the fakes cannot fake is asserted against `erc20.core`
+  instead — an independent encoder whose selectors are keccak-verified in its
+  own CI — so a wrong recipient or a wrong amount in the calldata is caught."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [pay.core :as pay]
+            [pay.rail.base-l2 :as rail]
+            [kotoba.lang.base-l2.abi :as abi]
+            [kotoba.lang.base-l2.paymaster :as paymaster]))
+
+(def ^:private payee-addr "0x00000000000000000000000000000000000ce7a1")
+(def ^:private payer-addr "0x00000000000000000000000000000000000f10a7")
+
+(defn- bundle
+  [sent & {:keys [success throw-transport] :or {success true}}]
+  {:bundler (reify paymaster/Bundler
+              (send-user-operation! [_ op]
+                (when throw-transport
+                  (throw (ex-info "bundler unreachable" {:transport true})))
+                (swap! sent conj op)
+                "0xuserop")
+              (wait-for-user-op-receipt! [_ _]
+                {:success success :receipt {:transaction-hash "0xREALTX"}}))
+   :smart-account (reify paymaster/SmartAccount
+                    (account-address [_] payer-addr))
+   :paymaster-address "0x0000000000000000000000000000000000000Pay"})
+
+(defn- rail-with [sent & opts]
+  (rail/base-l2-rail {:bundle (apply bundle sent opts)}))
+
+;; ── the one method that is real ──────────────────────────────────────
+
+(deftest pay-settles-and-returns-a-real-receipt
+  (let [sent (atom [])
+        r (rail-with sent)
+        receipt (pay/-pay! r {:to payee-addr :amount-micros 200000 :purpose :purchase})]
+    (testing "a receipt, not a hold"
+      (is (nil? (:status receipt)))
+      (is (= "0xREALTX" (:tx-hash receipt))))
+    (testing "amount is a STRING of micros on the wire — bigint-safe"
+      (is (= "200000" (:amount receipt)))
+      (is (string? (:amount receipt))))
+    (testing "from is the smart account, to is the payee"
+      (is (= payer-addr (:from receipt)))
+      (is (= payee-addr (:to receipt))))
+    (testing "exactly one UserOperation, to the USDC contract"
+      (is (= 1 (count @sent)))
+      (is (= rail/usdc-base (:to (first (:calls (first @sent)))))))))
+
+(deftest the-calldata-is-a-real-usdc-transfer
+  (testing "encodes transfer(address,uint256) with the payee and the amount"
+    (let [sent (atom [])
+          r (rail-with sent)]
+      (pay/-pay! r {:to payee-addr :amount-micros 1500000})
+      (is (= (abi/encode-function-call "transfer(address,uint256)"
+                                       ["address" "uint256"]
+                                       [payee-addr "1500000"])
+             (:data (first (:calls (first @sent)))))))))
+
+(deftest for-uri-becomes-the-record-uri
+  (let [r (rail-with (atom []))]
+    (is (= "at://x" (:record-uri (pay/-pay! r {:to payee-addr :amount-micros 1 :for-uri "at://x"}))))
+    (is (= "" (:record-uri (pay/-pay! r {:to payee-addr :amount-micros 1}))))))
+
+;; ── refusals are holds, and each one is distinct ─────────────────────
+
+(deftest an-unresolvable-payee-holds-and-sends-nothing
+  (doseq [bad ["did:web:example.com" "0xnope" "" nil 42]]
+    (let [sent (atom [])
+          r (rail-with sent)
+          res (pay/-pay! r {:to bad :amount-micros 1000})]
+      (is (= :pay/unresolvable-payee (:reason res)) (str "for " (pr-str bad)))
+      (is (= :hold (:status res)))
+      (is (empty? @sent) "nothing may be submitted for an unresolvable payee"))))
+
+(deftest a-bad-amount-holds-and-sends-nothing
+  (doseq [bad ["1.5" 1.5 0 -1 nil]]
+    (let [sent (atom [])
+          r (rail-with sent)
+          res (pay/-pay! r {:to payee-addr :amount-micros bad})]
+      (is (= :pay/invalid-amount (:reason res)) (str "for " (pr-str bad)))
+      (is (empty? @sent)))))
+
+(deftest a-reverted-userop-holds-rather-than-fabricating-a-receipt
+  (let [r (rail-with (atom []) :success false)
+        res (pay/-pay! r {:to payee-addr :amount-micros 1000})]
+    (is (= :hold (:status res)))
+    (is (= :pay/settlement-reverted (:reason res)))
+    (is (nil? (:tx-hash res)))))
+
+(deftest a-transport-failure-is-not-a-payment-decision-and-propagates
+  (testing "an unreachable bundler must not look like a refusal"
+    (let [r (rail-with (atom []) :throw-transport true)]
+      (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                   (pay/-pay! r {:to payee-addr :amount-micros 1000}))))))
+
+;; ── the five that still hold ─────────────────────────────────────────
+
+(deftest the-unbuilt-methods-hold-exactly-as-the-unprovisioned-rail-does
+  (let [r (rail-with (atom []))
+        u pay/unprovisioned-rail]
+    (testing "byte-identical holds — a caller cannot tell a not-yet-built rail
+              from a not-yet-built method, which is the honest answer"
+      (is (= (pay/-pay-stream! u {:to payee-addr :flow-rate 1})
+             (pay/-pay-stream! r {:to payee-addr :flow-rate 1})))
+      (is (= (pay/-pay-stream-stop! u "s1") (pay/-pay-stream-stop! r "s1")))
+      (is (= (pay/-split-distribute! u {:split-address payee-addr :amount-micros 1})
+             (pay/-split-distribute! r {:split-address payee-addr :amount-micros 1})))
+      (is (= (pay/-escrow-open! u {:to payee-addr :amount-micros 1})
+             (pay/-escrow-open! r {:to payee-addr :amount-micros 1})))
+      (is (= (pay/-escrow-release! u "e1" :recipient)
+             (pay/-escrow-release! r "e1" :recipient))))
+    (testing "and -pay! is the one that differs"
+      (is (not= (pay/-pay! u {:to payee-addr :amount-micros 1})
+                (pay/-pay! r {:to payee-addr :amount-micros 1}))))))
+
+;; ── construction ─────────────────────────────────────────────────────
+
+(deftest a-rail-without-a-bundle-is-refused-at-construction
+  (testing "no bundle means no signer — fail now, not at the first payment"
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                 (rail/base-l2-rail {})))))
+
+(deftest resolve-payee-lets-a-caller-pass-a-did
+  (let [sent (atom [])
+        r (rail/base-l2-rail {:bundle (bundle sent)
+                              :resolve-payee {"did:web:m.example" payee-addr}})]
+    (is (= "0xREALTX" (:tx-hash (pay/-pay! r {:to "did:web:m.example" :amount-micros 10}))))
+    (testing "and an unknown did still holds"
+      (is (= :pay/unresolvable-payee
+             (:reason (pay/-pay! r {:to "did:web:other" :amount-micros 10})))))))
