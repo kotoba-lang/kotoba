@@ -1,0 +1,152 @@
+#!/usr/bin/env kbb
+(ns buildbench.main
+  "buildbench — how build time grows with code size, with the checks attached.
+
+  usage:
+    kbb --backend sci --classpath src:<perfgate>/src:<machine>/src bin/buildbench.cljk \\
+      --scales 1,32,128,512,2048 --runs 7 --budget-ms 120000 \\
+      --amu /path/to/amu --output results/latest.json
+
+  Exit codes are three-valued on purpose: 0 clean, 1 a lane produced an
+  invalid artifact, 2 the harness could not answer at all. A run that could
+  not measure must not exit like a run that measured and found nothing wrong."
+  (:require ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:path" :as path]
+            [buildbench.host :as host]
+            [buildbench.lanes :as lanes]
+            [buildbench.measure :as measure]
+            [buildbench.report :as report]
+            [perfgate.core :as g]
+            [clojure.edn :as edn]
+            [clojure.string :as str]))
+
+(defn- opt [args flag default]
+  (if-let [i (first (keep-indexed #(when (= %2 flag) %1) args))]
+    (nth args (inc i) default)
+    default))
+
+(defn- keywordize-scale
+  "JSON round-trips lane ids and statuses as strings. Re-ranking an existing
+  run needs the same shape the measurement produced, so this puts the keys
+  back rather than teaching the report two shapes."
+  [s]
+  (-> s
+      (update :lanes #(into {} (for [[k v] %] [(keyword (name k)) v])))))
+
+(defn rerank
+  "Re-qualify an existing run under the current policy, without re-measuring.
+
+  A benchmark whose thresholds can only be revisited by rebuilding everything
+  invites nobody to revisit them."
+  [args]
+  (let [in (opt args "--input" nil)
+        out (opt args "--output" nil)]
+    (when-not (and in out)
+      (js/console.error "rerank needs --input and --output")
+      (js/process.exit 2))
+    (let [prev (js->clj (js/JSON.parse (fs/readFileSync in "utf8")) :keywordize-keys true)
+          rep (report/build
+               {:scales (mapv keywordize-scale (:scales prev))
+                :environment (:environment prev)
+                :machine (edn/read-string (:machineEdn prev))
+                :lane-metadata (:lanes prev)
+                :harness-source (get-in prev [:method :harness])
+                :policy g/default-policy
+                :generated-at (:generatedAt prev)})]
+      (fs/writeFileSync out (str (js/JSON.stringify (clj->js rep) nil 2) "\n"))
+      (println "buildbench: reranked" in "->" out)
+      (js/process.exit 0))))
+
+(defn -main [& args]
+  (when (= "rerank" (first args)) (rerank args))
+  (let [scales (mapv #(js/parseInt % 10) (str/split (opt args "--scales" "1,32,128,512") #","))
+        runs (js/parseInt (opt args "--runs" "7") 10)
+        budget (js/parseInt (opt args "--budget-ms" "120000") 10)
+        amu (opt args "--amu" nil)
+        out (opt args "--output" "results/latest.json")
+        harness (opt args "--harness-url"
+                     "https://github.com/kotoba-lang/buildbench")
+        work (fs/mkdtempSync (path/join (os/tmpdir) "buildbench-"))
+        fuel (js/parseInt (opt args "--fuel" "1048576") 10)
+        fuel-policy (lanes/write-fuel-policy! work fuel)
+        ;; Two lane sets, and the policy one is used only where the tool
+        ;; actually accepts it — a rejected policy must not silently turn a
+        ;; working toolchain into a lane that fails every sample.
+        with-policy (lanes/lanes {:amu amu :fuel-policy fuel-policy})
+        without-policy (lanes/lanes {:amu amu})
+        ;; One probe per lane before the clock starts. Two different things
+        ;; are decided here, and both would otherwise be discovered mid-run
+        ;; and recorded as if the workload had caused them: whether the fuel
+        ;; policy is accepted, and whether an installed tool can actually
+        ;; reach its target.
+        all (mapv (fn [lp ln]
+                    (let [kotoba? (= :kotoba (:language lp))
+                          chosen (if (and kotoba? (:available? lp) (lanes/lane-works? lp))
+                                   (assoc lp :fuelPolicy "declared")
+                                   (assoc ln :fuelPolicy
+                                          (cond (not kotoba?) "n/a"
+                                                (:available? lp) "rejected by tool; compiler default"
+                                                :else "n/a")))]
+                      (if-not (:available? chosen)
+                        chosen
+                        (if-let [err (lanes/probe chosen)]
+                          (assoc chosen :available? false :probeError err)
+                          chosen))))
+                  with-policy without-policy)
+        available (filterv :available? all)]
+    (when (empty? available)
+      (js/console.error "buildbench: no toolchain found on this host; refusing to report a pass")
+      (js/process.exit 2))
+    (println "buildbench: work dir" work)
+    (println "buildbench: lanes"
+             (str/join ", " (for [l all] (str (name (:id l))
+                                              (if (:available? l) "" " (unavailable)")))))
+    (let [scale-results
+          (vec (for [k scales]
+                 (let [r (measure/measure-scale
+                          {:k k :runs runs :budget-ms budget :warmups 1
+                           :work-root work :lanes all})]
+                   (println (report/summarize-line r))
+                   r)))
+          machine (host/descriptor)
+          lane-metadata (into {} (for [l all]
+                                   [(:id l)
+                                    (cond-> {:label (:label l)
+                                             :target (:target l)
+                                             :language (name (:language l))
+                                             :available (boolean (:available? l))}
+                                      (:note l) (assoc :note (:note l))
+                                      (:tool l) (assoc :tool (:tool l))
+                                      (:fuelPolicy l) (assoc :fuelPolicy (:fuelPolicy l))
+                                      (:probeError l) (assoc :unavailableBecause (:probeError l))
+                                      (:version-cmd l)
+                                      (assoc :version
+                                             (let [[c a] (:version-cmd l)]
+                                               (lanes/version-of c a))))]))
+          rep (report/build
+               {:scales scale-results
+                :environment (host/environment)
+                :machine machine
+                :lane-metadata lane-metadata
+                :harness-source harness
+                :declared-fuel fuel
+                :fuel-policy-accepted (into {} (for [l all] [(:id l) (:fuelPolicy l)]))
+                ;; perfgate's own default, unrelaxed. A gate loosened to let
+                ;; this run's claim through would be this benchmark measuring
+                ;; its own thresholds.
+                :policy g/default-policy
+                :generated-at (.toISOString (js/Date.))})
+          invalid (for [s scale-results
+                        [id r] (:lanes s)
+                        :when (#{"invalid" "failed"} (:status r))]
+                    (str "K=" (:k s) " " (name id) ": " (:status r) " — " (:error r)))]
+      (fs/mkdirSync (path/dirname out) #js {:recursive true})
+      (fs/writeFileSync out (str (js/JSON.stringify (clj->js rep) nil 2) "\n"))
+      (println "buildbench: wrote" out)
+      (when (seq invalid)
+        (println "\nbuildbench: lanes that did not produce the program:")
+        (doseq [l invalid] (println "  " l))
+        (js/process.exit 1)))))
+
+(apply -main *command-line-args*)
