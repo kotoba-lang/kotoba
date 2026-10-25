@@ -1,0 +1,365 @@
+(ns toml-scan-core
+  (:export [trim line-kind table-path array-table-path pair-key pair-value
+            bare-key-ok? scalar-kind basic-string-value integer-value]))
+
+;; The decision half of a TOML reader, written in Kotoba.
+;;
+;; What lives here is every question with a yes/no or which-one answer over one
+;; physical line: what kind of line is this, where does the key end, is this key
+;; well-formed, what type is this scalar, what does this escape mean. What does
+;; NOT live here is assembling the nested table — that is collection work, and
+;; `kotoba-lang/murakumo`'s `infer_join_core` records the same boundary
+;; ("partition-work / enrollment map assembly stay cljc").
+;;
+;; Every function is total: it answers with [:result T :string] rather than
+;; throwing, per the `:explicit-errors` invariant — an intentional security
+;; constraint, not a backend gap. Anything this subset does not implement is an
+;; error, never a guess: a parser that silently mis-reads a config it does not
+;; understand is worse than one that refuses it.
+;;
+;; ## Scanning is by codepoint, not by byte
+;;
+;; `string-substring` and `string-code-point-at` both take BYTE offsets and both
+;; TRAP if that offset is not a codepoint boundary (measured 2026-08-11:
+;; `string-substring-code-point-boundary` / `string-code-point-boundary`). An
+;; earlier draft of this module walked byte by byte and therefore trapped on the
+;; first non-ASCII string value it was given — and a config file is exactly the
+;; place where a description or a name is not ASCII, so that is not an edge case.
+;;
+;; So every scan advances by `next-index`, which derives the UTF-8 width from the
+;; codepoint itself, and `string-substring` is only ever called with offsets a
+;; scan has already proved to be boundaries. The rule that follows from this and
+;; is easy to break by accident: NEVER cut at a fixed offset. A prefix test
+;; (`string-substring v 0 3`), a suffix test (`string-substring v (- n 1) n`)
+;; and a closing-bracket test all read as cheap and are all traps the moment the
+;; value contains multi-byte text. Compare codepoints instead. Non-ASCII text flows through
+;; untouched; a non-ASCII bare key is REFUSED (it is not legal TOML) rather than
+;; trapping.
+;;
+;; ## Two profile facts shape the style, both learned from css-core
+;;
+;;   * `or`/`and` yield i64, so bools cannot be folded through them — nested `if`
+;;     returning `true`/`false` is the idiom, not a verbosity.
+;;   * `string=?` and `string-contains?` also yield i64, so they are used as
+;;     tests, never returned as bools.
+;;
+;; (css-core's own note that "there is no number->string builtin" is out of date:
+;; `string-from-i64` is admitted. This module does not need it, but the next one
+;; should not hand-roll digits on the strength of that comment.)
+
+;; --- codepoint constants ---------------------------------------------------
+;; Named so the scans below read as text rather than as arithmetic.
+
+(defn cp-tab [] :i64 9)
+(defn cp-space [] :i64 32)
+(defn cp-quote [] :i64 34)
+(defn cp-hash [] :i64 35)
+(defn cp-plus [] :i64 43)
+(defn cp-minus [] :i64 45)
+(defn cp-zero [] :i64 48)
+(defn cp-nine [] :i64 57)
+(defn cp-equals [] :i64 61)
+(defn cp-upper-a [] :i64 65)
+(defn cp-upper-z [] :i64 90)
+(defn cp-open-bracket [] :i64 91)
+(defn cp-close-bracket [] :i64 93)
+(defn cp-backslash [] :i64 92)
+(defn cp-underscore [] :i64 95)
+(defn cp-lower-a [] :i64 97)
+(defn cp-lower-n [] :i64 110)
+(defn cp-lower-r [] :i64 114)
+(defn cp-lower-t [] :i64 116)
+(defn cp-lower-z [] :i64 122)
+
+;; --- codepoint walking -----------------------------------------------------
+
+(defn cp-at [s :string i :i64] :i64
+  (string-code-point-at s i))
+
+(defn cp-width [c :i64] :i64
+  (if (< c 128) 1
+      (if (< c 2048) 2
+          (if (< c 65536) 3 4))))
+
+(defn next-index [s :string i :i64] :i64
+  (+ i (cp-width (cp-at s i))))
+
+(defn space-cp? [c :i64] :bool
+  (if (= c (cp-space)) true
+      (if (= c (cp-tab)) true false)))
+
+(defn digit-cp? [c :i64] :bool
+  (if (< c (cp-zero)) false
+      (if (> c (cp-nine)) false true)))
+
+;; --- trimming --------------------------------------------------------------
+
+(defn skip-space-from [s :string i :i64] :i64
+  (if (>= i (string-byte-length s))
+    i
+    (if (space-cp? (cp-at s i))
+      (skip-space-from s (next-index s i))
+      i)))
+
+;; The end is found by scanning FORWARD, remembering the offset just past the
+;; last non-space codepoint. Walking backwards a byte at a time looks cheaper and
+;; is wrong: `string-substring` traps on a non-boundary offset before any
+;; comparison can happen, so a line ending in multi-byte text trapped rather than
+;; trimmed (measured 2026-08-11, on `[日本]` and on a Japanese comment).
+
+(defn scan-end [s :string i :i64 last-end :i64] :i64
+  (if (>= i (string-byte-length s))
+    last-end
+    (let [c (cp-at s i)
+          j (next-index s i)]
+      (if (space-cp? c)
+        (scan-end s j last-end)
+        (scan-end s j j)))))
+
+(defn trim [s :string] :string
+  (let [b (skip-space-from s 0)
+        e (scan-end s 0 0)]
+    (if (<= e b) "" (string-substring s b e))))
+
+(defn scan-last-start [s :string i :i64 last-start :i64] :i64
+  (if (>= i (string-byte-length s))
+    last-start
+    (scan-last-start s (next-index s i) i)))
+
+;; The offset of the final codepoint, or -1 for an empty string. Needed because
+;; the last BYTE cannot be inspected directly: `string-substring` traps on a
+;; non-boundary offset before any comparison happens, so `(string-substring s
+;; (- n 1) n)` is a trap, not a test, whenever a value ends in multi-byte text.
+;; Measured 2026-08-11 against net-kotobase's deps.toml, whose Japanese prose
+;; lines inside a \"\"\" block trapped `table-path` instead of being refused.
+(defn last-cp-start [s :string] :i64
+  (if (< (string-byte-length s) 1) (- 0 1) (scan-last-start s 0 0)))
+
+;; --- line classification ---------------------------------------------------
+;; Answers with a name rather than a variant so the .cljc driver can dispatch on
+;; a string without the two sides having to agree on a tag encoding.
+
+(defn line-kind [line :string] :string
+  (let [t (trim line)
+        n (string-byte-length t)]
+    (if (< n 1)
+      "blank"
+      (let [c (cp-at t 0)]
+        (if (= c (cp-hash))
+          "comment"
+          (if (= c (cp-open-bracket))
+            (if (< n 2)
+              "unknown"
+              (if (= (cp-at t 1) (cp-open-bracket)) "array-table" "table"))
+            (if (string-contains? t "=") "pair" "unknown")))))))
+
+;; --- table headers ---------------------------------------------------------
+;; `open` is 1 for [table] and 2 for [[array of tables]]; the closing bracket run
+;; must be the same width, which is what tells `[a]]` apart from `[[a]]`.
+
+(defn closes-with-brackets? [t :string n :i64 open :i64] :bool
+  ;; The closing run is ASCII, so it is only there if the final codepoint starts
+  ;; at n-1 AND is `]` — which also proves n-open is a boundary for `open` <= 2.
+  (if (= (last-cp-start t) (- n 1))
+    (if (= (cp-at t (- n 1)) (cp-close-bracket))
+      (if (= open 1)
+        true
+        (if (= (cp-at t (- n 2)) (cp-close-bracket)) true false))
+      false)
+    false))
+
+(defn header-inner [line :string open :i64] [:result :string :string]
+  (let [t (trim line)
+        n (string-byte-length t)
+        close (- n open)]
+    (if (<= close open)
+      (result-err-of [:result :string :string] "table header is empty")
+      (if (closes-with-brackets? t n open)
+        (result-ok-of [:result :string :string] (trim (string-substring t open close)))
+        (result-err-of [:result :string :string] "table header is not closed")))))
+
+(defn table-path [line :string] [:result :string :string]
+  (header-inner line 1))
+
+(defn array-table-path [line :string] [:result :string :string]
+  (header-inner line 2))
+
+;; --- key = value -----------------------------------------------------------
+;; Split at the first `=`. A quoted key could legally contain one, so a leading
+;; quote is refused rather than mis-split — quoted keys are outside this subset.
+
+(defn eq-index-from [s :string i :i64] :i64
+  (if (>= i (string-byte-length s))
+    (- 0 1)
+    (if (= (cp-at s i) (cp-equals))
+      i
+      (eq-index-from s (next-index s i)))))
+
+(defn pair-key [line :string] [:result :string :string]
+  (let [t (trim line)]
+    (if (< (string-byte-length t) 1)
+      (result-err-of [:result :string :string] "empty line has no key")
+      (if (= (cp-at t 0) (cp-quote))
+        (result-err-of [:result :string :string] "quoted keys are outside this subset")
+        (let [i (eq-index-from t 0)]
+          (if (< i 0)
+            (result-err-of [:result :string :string] "key/value line has no =")
+            (let [k (trim (string-substring t 0 i))]
+              (if (< (string-byte-length k) 1)
+                (result-err-of [:result :string :string] "empty key")
+                (result-ok-of [:result :string :string] k)))))))))
+
+(defn pair-value [line :string] [:result :string :string]
+  (let [t (trim line)
+        i (eq-index-from t 0)]
+    (if (< i 0)
+      (result-err-of [:result :string :string] "key/value line has no =")
+      (result-ok-of [:result :string :string]
+                    (trim (string-substring t (+ i 1) (string-byte-length t)))))))
+
+;; --- bare keys -------------------------------------------------------------
+;; TOML bare keys are A-Za-z0-9_- only. The driver uses the key verbatim, so a
+;; key outside that set is refused here rather than passed through. A non-ASCII
+;; key is simply not one of those codepoints, so it answers false; the scan never
+;; asks for a codepoint at a non-boundary offset, so it cannot trap.
+
+(defn bare-key-cp? [c :i64] :bool
+  (if (digit-cp? c) true
+      (if (= c (cp-underscore)) true
+          (if (= c (cp-minus)) true
+              (if (< c (cp-upper-a)) false
+                  (if (<= c (cp-upper-z)) true
+                      (if (< c (cp-lower-a)) false
+                          (if (<= c (cp-lower-z)) true false))))))))
+
+(defn bare-key-rest? [k :string i :i64] :bool
+  (if (>= i (string-byte-length k))
+    true
+    (if (bare-key-cp? (cp-at k i))
+      (bare-key-rest? k (next-index k i))
+      false)))
+
+(defn bare-key-ok? [k :string] :bool
+  (if (< (string-byte-length k) 1) false (bare-key-rest? k 0)))
+
+;; --- scalar classification -------------------------------------------------
+
+(defn scalar-kind-short [v :string] :string
+  (let [c (cp-at v 0)]
+    (if (= c (cp-quote))
+      "string"
+      (if (= c (cp-open-bracket))
+        "array-open"
+        (if (string=? v "true")
+          "boolean"
+          (if (string=? v "false")
+            "boolean"
+            (if (digit-cp? c)
+              "integer"
+              (if (= c (cp-minus))
+                "integer"
+                (if (= c (cp-plus))
+                  "integer"
+                  "unsupported")))))))))
+
+(defn three-quotes? [v :string n :i64] :bool
+  ;; By codepoint, not by cutting three bytes. `(string-substring v 0 3)` looks
+  ;; like a cheap prefix test and is a trap on any value whose second character
+  ;; is multi-byte — `"金融…"` puts a boundary at 1 and the next at 4, so the cut
+  ;; at 3 lands inside a character (measured 2026-08-11 against deps.toml).
+  (if (< n 3)
+    false
+    (if (= (cp-at v 0) (cp-quote))
+      (if (= (cp-at v 1) (cp-quote))
+        (if (= (cp-at v 2) (cp-quote)) true false)
+        false)
+      false)))
+
+(defn scalar-kind [v :string] :string
+  (let [n (string-byte-length v)]
+    (if (< n 1)
+      "empty"
+      (if (three-quotes? v n)
+        "multiline-string-open"
+        (scalar-kind-short v)))))
+
+;; --- basic string values ---------------------------------------------------
+;; TOML also defines \b and \f. They are REFUSED rather than emitted, because the
+;; Kotoba reader rejects "\b" and "\f" in source (measured 2026-08-11: `source
+;; reader rejected input`), so this module cannot produce those bytes at all.
+;; Refusing is the honest answer; substituting anything else would corrupt the
+;; value silently. \uXXXX is refused for the same class of reason — there is no
+;; codepoint encoder in this profile.
+
+(defn escape-value [c :i64] [:result :string :string]
+  (if (= c (cp-lower-n)) (result-ok-of [:result :string :string] "\n")
+      (if (= c (cp-lower-t)) (result-ok-of [:result :string :string] "\t")
+          (if (= c (cp-lower-r)) (result-ok-of [:result :string :string] "\r")
+              (if (= c (cp-quote)) (result-ok-of [:result :string :string] "\"")
+                  (if (= c (cp-backslash)) (result-ok-of [:result :string :string] "\\")
+                      (result-err-of [:result :string :string]
+                                     "escape outside this subset")))))))
+
+;; `run` is the offset where the current literal stretch began; everything from
+;; there to the backslash is copied in ONE substring, so multi-byte text is never
+;; cut. Both ends are boundaries by construction: `run` follows either the
+;; opening quote or a two-byte ASCII escape, and `i` sits on a backslash.
+
+(defn unescape-from [s :string i :i64 e :i64 run :i64 acc :string] [:result :string :string]
+  (if (>= i e)
+    (result-ok-of [:result :string :string]
+                  (string-concat acc (string-substring s run e)))
+    (if (= (cp-at s i) (cp-backslash))
+      (if (>= (+ i 1) e)
+        (result-err-of [:result :string :string] "string ends in a backslash")
+        (match-result (escape-value (cp-at s (+ i 1))) [:result :string :string]
+                      (ok v (unescape-from s (+ i 2) e (+ i 2)
+                                           (string-concat
+                                            acc
+                                            (string-concat (string-substring s run i) v))))
+                      (err m (result-err-of [:result :string :string] m))))
+      (unescape-from s (next-index s i) e run acc))))
+
+(defn basic-string-value [v :string] [:result :string :string]
+  (let [n (string-byte-length v)]
+    (if (< n 2)
+      (result-err-of [:result :string :string] "string is not closed")
+      (if (= (cp-at v 0) (cp-quote))
+        ;; Same reason as closes-with-brackets?: the closing quote is only there
+        ;; if the final codepoint STARTS at n-1 and is a quote. Cutting the last
+        ;; byte to look at it traps on any value ending in multi-byte text.
+        (if (= (last-cp-start v) (- n 1))
+          (if (= (cp-at v (- n 1)) (cp-quote))
+            (unescape-from v 1 (- n 1) 1 "")
+            (result-err-of [:result :string :string] "string is not closed"))
+          (result-err-of [:result :string :string] "string is not closed"))
+        (result-err-of [:result :string :string] "not a basic string")))))
+
+;; --- integers --------------------------------------------------------------
+;; TOML allows `_` separators inside an integer; they carry no value. A non-digit
+;; anywhere else is an error, so `1.0` reaches the caller as an error rather than
+;; as 1 — a float read as its truncation is exactly the silent mis-read this
+;; module exists to prevent.
+
+(defn digits-from [s :string i :i64 acc :i64] [:result :i64 :string]
+  (if (>= i (string-byte-length s))
+    (result-ok-of [:result :i64 :string] acc)
+    (let [c (cp-at s i)]
+      (if (= c (cp-underscore))
+        (digits-from s (+ i 1) acc)
+        (if (digit-cp? c)
+          (digits-from s (+ i 1) (+ (* acc 10) (- c (cp-zero))))
+          (result-err-of [:result :i64 :string] "not an integer"))))))
+
+(defn integer-value [v :string] [:result :i64 :string]
+  (let [n (string-byte-length v)]
+    (if (< n 1)
+      (result-err-of [:result :i64 :string] "empty integer")
+      (let [c (cp-at v 0)]
+        (if (= c (cp-minus))
+          (match-result (digits-from v 1 0) [:result :i64 :string]
+                        (ok m (result-ok-of [:result :i64 :string] (- 0 m)))
+                        (err e (result-err-of [:result :i64 :string] e)))
+          (if (= c (cp-plus))
+            (digits-from v 1 0)
+            (digits-from v 0 0)))))))

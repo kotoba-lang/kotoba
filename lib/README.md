@@ -116,6 +116,7 @@ The bundled standard libraries live in this repository:
 | `org.openusd.usd` | `org.openusd.usd/src` | `kotoba.usd`, `usd.core`, `usd.usdc-bridge` (an external specification, publisher openusd.org) |
 | `org.threadgroup.thread` | `org.threadgroup.thread/src` | `thread.dispatch`, `thread.frag`, `thread.iphc`, `thread.mesh` (an external specification, publisher threadgroup.org) |
 | `org.threejs.core` | `org.threejs.core/src` | `org-threejs.core`, `org-threejs.gltf`, `org-threejs.interop`, `org-threejs.vrm` (an external specification, publisher threejs.org) |
+| `kotoba.toml` | `kotoba.toml/src` | `kotoba.toml`, `toml.core` (Kotoba project library) |
 | `kotoba.srt` | `kotoba.srt/src` | `kotoba.srt`, `srt.core` (Kotoba project library) |
 | `kotoba.sql` | `kotoba.sql/src` | `kotoba.sql`, `kotoba.sql.conn`, `sql.core` (Kotoba project library) |
 | `kotoba.sprite2d` | `kotoba.sprite2d/src` | `kami.sprite2d`, `kami.sprite2d.layout`, `kotoba.sprite2d`, `kotoba.sprite2d.animation` (Kotoba project library) |
