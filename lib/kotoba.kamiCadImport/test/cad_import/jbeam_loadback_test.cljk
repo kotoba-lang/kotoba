@@ -1,0 +1,124 @@
+(ns cad-import.jbeam-loadback-test
+  "Integration test — emit JBeam data for the demo assemblies, then load
+   it back through `vehicle.jbeam/load-edn` (kotoba-lang/kami-vehicle,
+   also restored to CLJC under ADR-2607010930) and verify the resulting
+   `Vehicle` matches the topology promised by `cad-import.jbeam-emit`.
+
+   Ported 1:1 from the original crate's `tests/jbeam_loadback.rs`
+   (kami-cad-import, kotoba-lang/kami-engine, deleted PR #82). The
+   original round-tripped through a JSON *string*
+   (`kami_vehicle::jbeam::load_str`); this port hands the emitted
+   Clojure map straight to `vehicle.jbeam/load-edn`, skipping
+   serialisation entirely — see `cad-import.jbeam-emit`'s namespace
+   docstring.
+
+   This proves the emitter output is not just structurally well-formed
+   data but is *semantically valid* JBeam that the actual soft-body
+   simulator accepts.
+
+   Settle / step physics is intentionally NOT exercised here — the
+   roadster's emitted spring constants come from the material table and
+   aren't tuned for kami-vehicle's default damping (see
+   `cad-import.jbeam-physics-smoke-test` for the settle/step smoke
+   coverage that *is* ported, with generous tolerances)."
+  (:require [kotoba.test :refer [deftest is]]
+            [cad-import.demos :as demos]
+            [cad-import.jbeam-emit :as je]
+            [vehicle.jbeam :as vjbeam]
+            [vehicle.node :as node]
+            [vehicle.wheel :as wheel]
+            [vehicle.vehicle :as veh]))
+
+(deftest synth-sedan-loads-back-through-kami-vehicle
+  (let [asm (demos/synth-sedan)
+        [estatus jbeam] (je/emit asm)
+        _ (is (= estatus :ok))
+        [lstatus v] (vjbeam/load-edn jbeam)]
+    (is (= lstatus :ok) (str "load-edn: " v))
+    ;; synth_sedan: 9 parts. Counts depend on each part's emit strategy:
+    ;;   chassis (Chassis)          -> AabbCube -> 8 nodes
+    ;;   hood / trunk (Body)        -> AabbHull20 -> 20 nodes each
+    ;;   windshield (Window)        -> AabbHull20 -> 20 nodes
+    ;;   engine (Powertrain)        -> AabbCube -> 8 nodes
+    ;;   4 x wheel                  -> WheelRing -> 14 nodes each
+    ;; 8 + 20 + 20 + 20 + 8 + 56 = 132 nodes
+    (is (= (count (:nodes v)) 132) "node count")
+    (is (= (count (:wheels v)) 4) "wheel count")
+    ;; Every beam should reference real nodes (load-edn would have
+    ;; returned an error otherwise -- this is just defence in depth).
+    (let [n (count (:nodes v))]
+      (doseq [b (:beams v)]
+        (is (and (>= (:n1 b) 0) (< (:n1 b) n)) "dangling n1")
+        (is (and (>= (:n2 b) 0) (< (:n2 b) n)) "dangling n2")))
+    ;; Every wheel axle pair should resolve.
+    (doseq [w (:wheels v)]
+      (is (= (count (:hub-nodes w)) 2) "wheel slot has 2 axle hub-nodes"))))
+
+(deftest roadster-loads-back-through-kami-vehicle
+  (let [asm (demos/roadster-na)
+        [_ jbeam] (je/emit asm)
+        [lstatus v] (vjbeam/load-edn jbeam)]
+    (is (= lstatus :ok))
+    ;; 33-part roadster -> 432 nodes / 1221 beams (matches example output).
+    (is (= (count (:nodes v)) 432) "node count")
+    (is (= (count (:beams v)) 1221) "beam count")
+    (is (= (count (:wheels v)) 4) "wheel count")
+    ;; Spot-check: at least one node should land in each kami-vehicle
+    ;; group we emit (body, cargo, wheel-hub, wheel-tire).
+    (let [groups (set (map :group (:nodes v)))]
+      (is (contains? groups :body) "no Body nodes -- chassis / suspension / brake")
+      (is (contains? groups :wheel-hub) "no WheelHub nodes -- wheel axles")
+      (is (contains? groups :wheel-tire) "no WheelTire nodes -- wheel ring")
+      (is (contains? groups :cargo) "no Cargo nodes -- engine / radiator / fuel tank"))))
+
+(deftest roadster-break-groups-propagate-into-vehicle-beams
+  ;; Every emitted beam carries :break-group from its part. The
+  ;; kami-vehicle BeamNG-style detach API consumes those groups.
+  (let [asm (demos/roadster-na)
+        [_ jbeam] (je/emit asm)
+        [_ v] (vjbeam/load-edn jbeam)
+        groups (set (keep :break-group (:beams v)))]
+    (is (and (contains? groups 1) (contains? groups 5))
+        (str "missing core break groups; got " groups))
+    ;; break_group(1) should detach a non-trivial number of beams.
+    (let [[_ detached] (veh/break-group v 1)]
+      (is (> detached 50)
+          (str "break-group 1 should detach the chassis frame (>50 beams), got " detached)))))
+
+(deftest roadster-wheel-tire-nodes-populate-via-jbeam-loader
+  ;; Phase 2 wheel-ring scaffolding emits 12 ring nodes per wheel and
+  ;; lists them in the wheel's :tire-nodes; the kami-vehicle loader maps
+  ;; them into Wheel::tire_nodes so per-wheel body forces and
+  ;; break-group attribution see the ring.
+  (let [asm (demos/roadster-na)
+        [_ jbeam] (je/emit asm)
+        [_ v] (vjbeam/load-edn jbeam)]
+    (doseq [w (:wheels v)]
+      (is (= (count (:tire-nodes w)) 12)
+          (str "wheel " (:id w) " should have 12 tire ring nodes, got " (count (:tire-nodes w))))
+      (doseq [nid (:tire-nodes w)]
+        (let [n (nth (:nodes v) nid)]
+          (is (= (:group n) :wheel-tire)))))))
+
+(deftest roadster-wheel-contact-mode-flips-to-tire-ring
+  ;; Phase 2.5: when the JBeam wheel slot ships >= 8 ring nodes, the
+  ;; loader switches Wheel :contact-mode to :tire-ring.
+  (let [asm (demos/roadster-na)
+        [_ jbeam] (je/emit asm)
+        [_ v] (vjbeam/load-edn jbeam)]
+    (doseq [w (:wheels v)]
+      (is (= (:contact-mode w) :tire-ring)
+          (str "wheel " (:id w) " should be in :tire-ring mode (got " (:contact-mode w) ")")))))
+
+(deftest roadster-wheel-axles-resolve-to-wheel-hub-nodes
+  (let [asm (demos/roadster-na)
+        [_ jbeam] (je/emit asm)
+        [_ v] (vjbeam/load-edn jbeam)]
+    (doseq [w (:wheels v)]
+      (doseq [nid (:hub-nodes w)]
+        (let [n (nth (:nodes v) nid)]
+          (is (= (:group n) :wheel-hub) "axle node should be in wheel-hub group")))
+      ;; Wheel slot must carry a sensible radius / width pulled from the
+      ;; AABB inference in cad-import.jbeam-emit's wheel-axes.
+      (is (and (> (:radius w) 0.20) (< (:radius w) 0.40)) (str "radius: " (:radius w)))
+      (is (and (> (:width w) 0.10) (< (:width w) 0.30)) (str "width: " (:width w))))))

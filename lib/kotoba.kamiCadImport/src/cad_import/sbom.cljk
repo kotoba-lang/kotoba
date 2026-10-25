@@ -1,0 +1,228 @@
+(ns cad-import.sbom
+  "VehicleAssembly -> CycloneDX 1.5 SBOM emitter.
+
+   Restored from kami-cad-import (kotoba-lang/kami-engine, deleted PR #82,
+   \"Remove Rust workspace\"), per ADR-2607010930. Ported 1:1 from the
+   original `src/sbom.rs`.
+
+   Output is a Clojure map with *string* keys spelled exactly as the
+   CycloneDX 1.5 JSON schema requires (e.g. `\"bom-ref\"`,
+   `\"specVersion\"`, `\"dependsOn\"`) — unlike the rest of this crate's
+   keyword-keyed data, this map is meant to be handed straight to a JSON
+   encoder by the caller (this crate stays zero-dependency and does not
+   bring in a JSON library itself, per ADR-2607010930), so exact key
+   spelling matters more than idiomatic Clojure style here. Each
+   `VehiclePart` becomes a CycloneDX component with `\"type\": \"device\"`
+   — the closest first-class fit for a physical car part in CDX 1.5. The
+   full spec is at <https://cyclonedx.org/docs/1.5/json/>."
+  (:require [kotoba.bytes :as kbytes] [kotoba.lang.text :as str]
+            [cad-import.part :as part]))
+
+(def cdx-spec-version "1.5")
+(def prop-ns "cdx:gftd:vehicle")
+
+(defn- fmt4
+  "Portable fixed 4-decimal-place formatting (clojure.core/format wraps
+   java.util.Formatter -- JVM-only, no cljs equivalent)."
+  [n]
+  #?(:clj (format "%.4f" (double n))
+     :cljs (.toFixed n 4)))
+
+(defn material-label [m]
+  (case m
+    :steel-hss "steel-hss"
+    :steel-mild "steel-mild"
+    :aluminium-cast "aluminium-cast"
+    :aluminium-sheet "aluminium-sheet"
+    :glass "glass"
+    :rubber "rubber"
+    :plastic "plastic"
+    :li-ion "lithium-ion"
+    :composite "composite"
+    :other "other"))
+
+(defn kind-label [k]
+  (case k
+    :chassis "chassis"
+    :body "body"
+    :window "window"
+    :powertrain "powertrain"
+    :suspension "suspension"
+    :wheel "wheel"
+    :brake "brake"
+    :interior "interior"
+    :electrical "electrical"
+    :fluid "fluid"
+    :trim "trim"))
+
+(defn hardpoint-label [k]
+  (case k
+    :bolt "bolt"
+    :weld "weld"
+    :hinge "hinge"
+    :latch "latch"
+    :press "press"
+    :adhesive "adhesive"))
+
+(def ^:private hex-digits "0123456789ABCDEF")
+
+(defn- byte->pct [b]
+  (let [b (bit-and b 0xFF)]
+    (str "%" (nth hex-digits (bit-shift-right b 4)) (nth hex-digits (bit-and b 0xF)))))
+
+(defn- pct-encode-char
+  "Percent-encode `c`'s UTF-8 bytes (`.getBytes` has no cljs equivalent;
+   `TextEncoder` is the portable substitute)."
+  [c]
+  #?(:clj (apply str (map byte->pct (kbytes/utf8-bytes (str c))))
+     :cljs (apply str (map byte->pct (js/Array.from (.encode (js/TextEncoder.) c))))))
+
+(defn urlencode
+  "Minimal `application/x-www-form-urlencoded`-compatible escaper. Kept
+   in-namespace to avoid pulling a URL-encoding dependency for one
+   helper (zero-dependency requirement, ADR-2607010930). ASCII
+   alnum + `-._~` pass through unescaped, matching conventional
+   percent-encoding (unlike `Character/isLetterOrDigit`, which the
+   original JVM-only version used and which treats any Unicode letter
+   as \"safe\" — non-standard for URL encoding, and unreachable from
+   cljs anyway)."
+  [s]
+  (apply str
+         (for [c s]
+           (if (or (re-matches #"[A-Za-z0-9]" (str c)) (contains? #{\- \. \_ \~} c))
+             c
+             (pct-encode-char c)))))
+
+(defn- synth-purl [asm p]
+  (let [q (cond-> []
+            (not (empty? (get-in p [:supplier :name])))
+            (conj (str "supplier=" (urlencode (get-in p [:supplier :name]))))
+            (not (empty? (get-in p [:supplier :mpn])))
+            (conj (str "mpn=" (urlencode (get-in p [:supplier :mpn])))))
+        q (-> q
+              (conj (str "material=" (material-label (:material p))))
+              (conj (str "kind=" (kind-label (:kind p))))
+              (conj (str "license=" (urlencode (get-in p [:source :license])))))]
+    (str "pkg:gftd-vehicle/" (urlencode (:vehicle-id asm))
+         "/part/" (urlencode (:id p)) "@" (urlencode (:revision p))
+         "?" (str/join "&" q))))
+
+(defn- vehicle-purl [asm]
+  (str "pkg:gftd-vehicle/" (urlencode (:vehicle-id asm)) "@" (urlencode (:revision asm))))
+
+(defn- build-part-component [asm p]
+  (let [props (cond-> [{"name" (str prop-ns ":break_group") "value" (str (part/effective-break-group p))}
+                        {"name" (str prop-ns ":mass_kg") "value" (fmt4 (part/effective-mass-kg p))}
+                        {"name" (str prop-ns ":material") "value" (material-label (:material p))}
+                        {"name" (str prop-ns ":kind") "value" (kind-label (:kind p))}]
+                 (:parent p)
+                 (conj {"name" (str prop-ns ":parent") "value" (:parent p)})
+                 (not (empty? (get-in p [:supplier :mpn])))
+                 (conj {"name" (str prop-ns ":supplier_mpn") "value" (get-in p [:supplier :mpn])}))
+        props (conj props {"name" (str prop-ns ":source_uri") "value" (get-in p [:source :uri])})]
+    (cond-> {"bom-ref" (:id p)
+             "type" "device"
+             "name" (:display-name p)
+             "version" (:revision p)
+             "purl" (synth-purl asm p)
+             "cpe" (get-in p [:supplier :cpe] "")
+             "licenses" [{"expression" (get-in p [:source :license])}]
+             "evidence" {"identity" {"field" "hash"
+                                      "concludedValue" (get-in p [:source :sha256])
+                                      "methods" [{"technique" "filename" "confidence" 1.0
+                                                  "value" (get-in p [:source :uri])}]}}
+             "properties" props}
+      (not (empty? (get-in p [:supplier :name])))
+      (assoc "manufacturer" {"name" (get-in p [:supplier :name])}))))
+
+(defn- build-root-component [asm]
+  {"bom-ref" (:vehicle-id asm)
+   "type" "device"
+   "name" (:display-name asm)
+   "version" (:revision asm)
+   "description" (str "driver.etzhayyim.com vehicle " (:vehicle-id asm))
+   "manufacturer" {"name" "gftd"}
+   "purl" (vehicle-purl asm)
+   "cpe" ""
+   "licenses" [{"expression" (get-in asm [:source :license])}]
+   "evidence" {"identity" {"field" "hash"
+                           "concludedValue" (get-in asm [:source :sha256])
+                           "methods" [{"technique" "filename" "confidence" 1.0
+                                       "value" (get-in asm [:source :uri])}]}}
+   "properties" [{"name" (str prop-ns ":total_mass_kg") "value" (fmt4 (part/total-mass-kg asm))}
+                 {"name" (str prop-ns ":part_count") "value" (str (count (:parts asm)))}
+                 {"name" (str prop-ns ":hardpoint_count") "value" (str (count (:hardpoints asm)))}]})
+
+(defn- build-dependencies [asm]
+  (let [deps (atom (sorted-map))
+        add! (fn [k v] (swap! deps update k (fnil conj []) v))]
+    (swap! deps assoc (:vehicle-id asm) (mapv :id (:parts asm)))
+    (doseq [p (:parts asm)]
+      (when-let [parent (:parent p)] (add! parent (:id p))))
+    (doseq [hp (:hardpoints asm)]
+      (add! (:from-part hp) (:to-part hp))
+      (add! (:to-part hp) (:from-part hp)))
+    (mapv (fn [[bom-ref depends-on]]
+            {"ref" bom-ref "dependsOn" (vec (distinct (sort depends-on)))})
+          @deps)))
+
+(defn- hardpoint-summary [hps]
+  (->> hps
+       (group-by :kind)
+       (map (fn [[k v]] [k (count v)]))
+       (sort-by (fn [[k _]] (.indexOf [:bolt :weld :hinge :latch :press :adhesive] k)))))
+
+(defn- deterministic-uuid-v5
+  "Stable URN-friendly id derived from a hex string. We don't depend on a
+   `uuid` library to keep the dep tree tiny — the format below is a
+   valid v5 layout (RFC 4122 §4.3 stub) for the sole purpose of
+   producing a stable URN per vehicle source hash."
+  [seed-hex]
+  (let [hex-chars (filter #(re-matches #"[0-9a-fA-F]" (str %)) (seq seed-hex))
+        hex-chars (->> hex-chars cycle (take 32) vec)
+        hex-chars (assoc hex-chars 12 \5)
+        c16 (nth hex-chars 16)
+        c16' (cond
+               (contains? #{\0 \1 \2 \3} c16) \8
+               (contains? #{\4 \5 \6 \7} c16) \9
+               (contains? #{\8 \9 \a \b} c16) \a
+               :else \b)
+        hex-chars (assoc hex-chars 16 c16')
+        s (apply str hex-chars)]
+    (str (subs s 0 8) "-" (subs s 8 12) "-" (subs s 12 16) "-" (subs s 16 20) "-" (subs s 20 32))))
+
+(defrecord CycloneDxOptions [serial-number timestamp])
+
+(defn default-cyclonedx-options []
+  {:serial-number nil :timestamp "2026-05-05T00:00:00Z"})
+
+(defn emit
+  "Emit a CycloneDX 1.5 SBOM (a Clojure map with CDX-spelled string
+   keys, see namespace docstring) for the vehicle assembly. `opts`
+   mirrors `CycloneDxOptions`: `{:serial-number nil-or-string
+   :timestamp nil-or-string}` — use `default-cyclonedx-options` for
+   Rust's `Default` behaviour. Returns `[:ok cdx-map]` or `[:error
+   error-map]`."
+  ([asm] (emit asm (default-cyclonedx-options)))
+  ([asm opts]
+   (let [[status err] (part/validate asm)]
+     (if (= status :error)
+       [:error err]
+       (let [hp-summary (hardpoint-summary (:hardpoints asm))
+             root (update (build-root-component asm) "properties"
+                           into (map (fn [[kind count]]
+                                       {"name" (str prop-ns ":hardpoints:" (hardpoint-label kind))
+                                        "value" (str count)})
+                                     hp-summary))
+             serial (or (:serial-number opts)
+                        (str "urn:uuid:" (deterministic-uuid-v5 (get-in asm [:source :sha256]))))
+             timestamp (or (:timestamp opts) "1970-01-01T00:00:00Z")]
+         [:ok {"bomFormat" "CycloneDX"
+               "specVersion" cdx-spec-version
+               "version" 1
+               "serialNumber" serial
+               "metadata" {"timestamp" timestamp
+                           "tools" [{"vendor" "gftd" "name" "kami-cad-import" "version" "0.1.0"}]
+                           "component" root}
+               "components" (mapv #(build-part-component asm %) (:parts asm))
+               "dependencies" (build-dependencies asm)}])))))
