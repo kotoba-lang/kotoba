@@ -1,0 +1,76 @@
+(ns bim.operations-test
+  (:require [kotoba.lang.text :as string]
+            [kotoba.test :refer [deftest is]]
+            [bim.operations :as operations]
+            #?(:clj [kotoba.lang.edn :as edn]
+               :cljs [cljs.reader :as edn])))
+
+(defn digest [text] (str "digest:" (hash text)))
+(defn encrypt [key-id plaintext] (str key-id ":" (string/reverse plaintext)))
+(defn decrypt [key-id ciphertext]
+  (let [prefix (str key-id ":")]
+    (when-not (string/starts-with? ciphertext prefix)
+      (throw (ex-info "wrong backup key" {:key-id key-id})))
+    (string/reverse (subs ciphertext (count prefix)))))
+
+(deftest tenant-isolation-scoped-principals-and-optimistic-project-writes
+  (let [state (-> (operations/control-plane)
+                  (operations/register-tenant
+                   {:id :a :name "A" :administrator :alice :timestamp 0})
+                  (operations/register-tenant
+                   {:id :b :name "B" :administrator :bob :timestamp 0}))
+        alice (operations/issue-principal
+               state :a :alice #{:project/read :project/write :backup/read
+                                  :backup/write :audit/read :tenant/admin} 0 100)
+        bob (operations/issue-principal state :b :bob #{:project/read} 0 100)
+        created (operations/put-project state alice :tower 0 {:name "Tower"} 1 digest)
+        state (:operations/state created)
+        stale (operations/put-project state alice :tower 0 {:name "Stale"} 2 digest)]
+    (is (= :created (:operations/status created)))
+    (is (= :conflict (:operations/status stale)))
+    (is (= {:name "Tower"}
+           (:project/document (operations/get-project state alice :tower 2))))
+    (is (nil? (operations/get-project state bob :tower 2)))
+    (is (thrown-with-msg? #?(:clj Exception :cljs js/Error) #"expired"
+                          (operations/get-project state alice :tower 100)))
+    (is (:audit/valid? (operations/verify-audit-chain state digest)))
+    (is (false? (:audit/valid?
+                 (operations/verify-audit-chain
+                  (assoc-in state [:operations/audit 0 :audit/action] :tampered)
+                  digest))))))
+
+(deftest encrypted-backup-restore-integrity-and-retention
+  (let [base (operations/register-tenant
+              (operations/control-plane)
+              {:id :tenant :name "Tenant" :administrator :admin :timestamp 0})
+        principal (operations/issue-principal
+                   base :tenant :admin #{:project/read :project/write
+                                         :backup/read :backup/write :audit/read} 0 100)
+        written (operations/put-project base principal :source 0
+                                        {:elements [{:id 1 :name "Wall"}]} 1 digest)
+        backup (operations/create-backup
+                (:operations/state written) principal :source :backup-1 2
+                {:encode pr-str :encrypt encrypt :digest digest :key-id :kms-key-1})
+        state (:operations/state backup)
+        stored (get-in state [:operations/backups :tenant :backup-1])
+        restored (operations/restore-backup
+                  state principal :backup-1 :recovered 0 3
+                  {:decode edn/read-string :decrypt decrypt :digest digest})
+        corrupted (assoc-in state [:operations/backups :tenant :backup-1
+                                   :backup/content] "corrupt")
+        retention (operations/retention-plan
+                   [{:backup/id :b1 :backup/created-at 1}
+                    {:backup/id :b2 :backup/created-at 2}
+                    {:backup/id :b3 :backup/created-at 10}
+                    {:backup/id :b4 :backup/created-at 11}]
+                   1 #(quot % 10))]
+    (is (:backup/valid? (operations/verify-backup stored digest)))
+    (is (= :restored (:operations/status restored)))
+    (is (= [{:id 1 :name "Wall"}]
+           (get-in restored [:operations/project :project/document :elements])))
+    (is (thrown-with-msg? #?(:clj Exception :cljs js/Error) #"integrity"
+                          (operations/restore-backup
+                           corrupted principal :backup-1 :other 0 4
+                           {:decode edn/read-string :decrypt decrypt :digest digest})))
+    (is (= #{:b2 :b4} (set (:retention/keep retention))))
+    (is (= [:b1 :b3] (:retention/delete retention)))))
