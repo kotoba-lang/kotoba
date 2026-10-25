@@ -1,0 +1,286 @@
+(ns eda-flow-demo.flow-test
+  "One deftest per pipeline stage, each asserting that stage's SPECIFIC,
+  independently-computed output (not just 'it didn't throw') -- reusing
+  the exact same fixtures `eda-flow-demo.flow/run-full-flow` threads, so
+  these tests double as documentation of what each stage really does.
+  Plus one end-to-end test running the whole flow once."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [eda-flow-demo.flow :as flow]
+            [lef.core :as lef]))
+
+(defn approx=
+  ([a b] (approx= a b 1e-6))
+  ([a b eps] (< (Math/abs (- (double a) (double b))) eps)))
+
+(defn approx-vec=
+  ([a b] (approx-vec= a b 1e-6))
+  ([a b eps]
+   (and (= (count a) (count b))
+        (every? true? (map #(approx= %1 %2 eps) a b)))))
+
+;; ---------------------------------------------------------------------------
+;; Stage 1 -- RTL parse (both frontends, header-only)
+;; ---------------------------------------------------------------------------
+
+(deftest stage-1-parse-verilog-extracts-header
+  (testing "rtl.hdl/parse-verilog extracts module name + flat port list -- header only, no body semantics"
+    (is (= [:ok ["counter2" ["clk" "rst" "q0" "q1"]]] (flow/stage-1-parse-verilog)))))
+
+(deftest stage-1-parse-vhdl-extracts-typed-ports
+  (testing "rtl.vhdl-adapter/parse-vhdl-source yields a richer rtl-module: direction + bit-width per port"
+    (let [[status module] (flow/stage-1-parse-vhdl)]
+      (is (= :ok status))
+      (is (= "counter2" (:name module)))
+      (is (= [{:name "clk" :direction :input :width 1 :signal-type :logic}
+              {:name "rst" :direction :input :width 1 :signal-type :logic}
+              {:name "q" :direction :output :width 2 :signal-type :logic}]
+             (:ports module)))
+      (testing "same circuit's interface, described the VHDL way: q as one 2-bit bus vs Verilog's scalar q0/q1"
+        (is (= 2 (:width (last (:ports module)))))))))
+
+;; ---------------------------------------------------------------------------
+;; Stage 2 -- gate-level synthesis (hand-built netlist)
+;; ---------------------------------------------------------------------------
+
+(defn- gates-of [netlist gate-type]
+  (filter #(= gate-type (:gate-type %)) (:gates netlist)))
+
+(deftest stage-2-synthesize-builds-real-counter-netlist
+  (let [{:keys [netlist stats]} (flow/stage-2-synthesize)]
+    (testing "4 gates: NOT, XOR, and 2 DFFs, with real feedback connectivity"
+      (is (= 4 (count (:gates netlist))))
+      (is (= #{:not :xor :dff} (set (map :gate-type (:gates netlist)))))
+      (is (= ["q0" "q1"] (:primary-outputs netlist))))
+    (testing "q0/q1 are simultaneously DFF outputs AND NOT/XOR inputs -- the real counter feedback loop"
+      (is (= #{"q0"} (set (:inputs (first (gates-of netlist :not))))))
+      (is (= #{"q0" "q1"} (set (:inputs (first (gates-of netlist :xor)))))))
+    (testing "rtl.synthesis/stats: 2 combinational gates (LUTs), 2 flip-flops, naive 1GHz max-freq estimate"
+      (is (= {:gate-count 4 :lut-count 2 :ff-count 2 :estimated-max-freq-mhz 1000.0} stats)))))
+
+;; ---------------------------------------------------------------------------
+;; Stage 3 -- SDC-constrained timing signoff
+;; ---------------------------------------------------------------------------
+
+(deftest stage-3-timing-signoff-passes-with-sane-slack
+  (let [netlist (:netlist (flow/stage-2-synthesize))
+        evidence (flow/stage-3-timing-signoff netlist flow/sdc-script)]
+    (testing "SDC's create_clock -period 1.0 was actually parsed and used (not a hardcoded default)"
+      (is (= :passed (:eda.signoff/status evidence)))
+      (is (= 1 (get-in evidence [:eda.signoff/metrics :corners])))
+      (testing "worst path: launch -> q0/q1 (0.2ns clock-to-Q) -> XOR (0.12ns) = 0.32ns; slack = 1.0 - 0.32 = 0.68ns"
+        (is (approx= 0.68 (get-in evidence [:eda.signoff/metrics :worst-slack-ns]) 1e-9))))))
+
+(deftest stage-3-timing-signoff-fails-with-a-too-tight-clock
+  (testing "negative test: a clock period tighter than the real 0.32ns worst-path delay genuinely fails signoff"
+    (let [netlist (:netlist (flow/stage-2-synthesize))
+          tight-sdc "create_clock -name clk -period 0.1 -waveform {0.0 0.05} [get_ports clk]\n"
+          evidence (flow/stage-3-timing-signoff netlist tight-sdc)]
+      (is (= :failed (:eda.signoff/status evidence)))
+      (is (neg? (get-in evidence [:eda.signoff/metrics :worst-slack-ns]))))))
+
+;; ---------------------------------------------------------------------------
+;; Stage 4 -- cell library
+;; ---------------------------------------------------------------------------
+
+(deftest stage-4-cell-library-parses-real-lef-macros
+  (let [{:keys [status lib]} (flow/stage-4-cell-library)]
+    (testing "org-si2-lef parses 3 real macros with real pin geometry, matching the netlist's gate types"
+      (is (= :ok status))
+      (is (= #{"INVX1" "XOR2X1" "DFFX1"} (set (map :name (:macros lib)))))
+      (is (approx-vec= [0.5 1.4] (:size (lef/find-macro lib "INVX1"))))
+      (is (approx-vec= [1.6 1.4] (:size (lef/find-macro lib "XOR2X1"))))
+      (is (approx-vec= [2.2 1.4] (:size (lef/find-macro lib "DFFX1"))))
+      (is (= 2 (count (:pins (lef/find-macro lib "INVX1")))))
+      (is (= 3 (count (:pins (lef/find-macro lib "DFFX1"))))))))
+
+(deftest stage-4-cell-library-pdk-generic-lib-is-independent-sanity-check
+  (let [{:keys [stdcell-lib tech-file]} (flow/stage-4-cell-library)]
+    (testing "pdk.stdcell/create-generic-lib genuinely generates its documented ~20-cell library (21 exactly)"
+      (is (= 21 (count (:cells stdcell-lib))))
+      (is (= "etzhayyim_GENERIC_N45" (:name stdcell-lib))))
+    (testing "pdk.technology/for-node genuinely generates a tech file with node-scaled metal stack"
+      (is (= 9 (:num-metal-layers tech-file))))))
+
+;; ---------------------------------------------------------------------------
+;; Stage 5 -- placement
+;; ---------------------------------------------------------------------------
+
+(deftest stage-5-placement-resolves-real-lef-widths-and-places
+  (let [lef-lib (:lib (flow/stage-4-cell-library))
+        {:keys [netlist-cells placement stats]} (flow/stage-5-placement lef-lib)]
+    (testing "each cell's :width-sites is resolved from the LEF macro's real SIZE, not hand-picked"
+      (is (= [3 8 11 11] (map :width-sites netlist-cells))))
+    (testing "greedy placement: NOT+XOR fill row0 (3+8=11/12 sites), both DFFs overflow into their own rows"
+      (is (= [0 0 1 2] (map :row-idx (:cells placement))))
+      (is (= [:n :n :fs :n] (map :orientation (:cells placement))))
+      (is (approx= 0.0 (:x (nth (:cells placement) 0))))
+      (is (approx= 0.6 (:x (nth (:cells placement) 1))))
+      (is (approx= 0.0 (:x (nth (:cells placement) 2))))
+      (is (approx= 0.0 (:x (nth (:cells placement) 3)))))
+    (testing "placement-stats: 4 placed cells, real utilization/HPWL"
+      (is (= 4 (:total-cells stats)))
+      (is (approx= (/ 4.0 36.0) (:utilization stats) 1e-6))
+      (is (approx= 3.4 (:hpwl stats) 1e-6)))))
+
+;; ---------------------------------------------------------------------------
+;; Stage 6 -- routing
+;; ---------------------------------------------------------------------------
+
+(deftest stage-6-routing-routes-a-real-net-between-real-pins
+  (let [lef-lib (:lib (flow/stage-4-cell-library))
+        placement-result (flow/stage-5-placement lef-lib)
+        {:keys [net stats]} (flow/stage-6-routing lef-lib placement-result)]
+    (testing "the NOT gate's Y output -> DFF0's D input net (real gate connectivity) routes successfully"
+      (is (some? net))
+      (is (= "n0" (:net-name net)))
+      (is (seq (:segments net))))
+    (testing "routing-stats: exactly 1 routed net, no overflow, non-zero wire length"
+      (is (= 1 (:routed-nets stats)))
+      (is (= 0 (:overflow-count stats)))
+      (is (pos? (:total-wire-length stats))))))
+
+;; ---------------------------------------------------------------------------
+;; Stage 7 -- 3-way export
+;; ---------------------------------------------------------------------------
+
+(deftest stage-7-export-gdsii-produces-valid-stream-and-real-geometry-count
+  (let [lef-lib (:lib (flow/stage-4-cell-library))
+        placement-result (flow/stage-5-placement lef-lib)
+        {:keys [gdsii-structure gdsii-bytes]} (flow/stage-7-export lef-lib placement-result)]
+    (testing "one cell-outline boundary + one boundary per pin PORT rect, per placed cell"
+      ;; INVX1 (2 pins) + XOR2X1 (3 pins) + DFFX1 (3 pins) x2 instances = 3+4+4+4 boundaries
+      (is (= 15 (count (:elements gdsii-structure)))))
+    (testing "a valid GDSII header stream (HEADER record, version 600 = 0x0258)"
+      (is (> (count gdsii-bytes) 20))
+      (is (= 0x00 (bit-and (aget gdsii-bytes 0) 0xFF)))
+      (is (= 0x06 (bit-and (aget gdsii-bytes 1) 0xFF)))
+      (is (= 0x02 (bit-and (aget gdsii-bytes 4) 0xFF)))
+      (is (= 0x58 (bit-and (aget gdsii-bytes 5) 0xFF))))))
+
+(deftest stage-7-export-def-carries-real-scaled-locations-and-orientations
+  (let [lef-lib (:lib (flow/stage-4-cell-library))
+        placement-result (flow/stage-5-placement lef-lib)
+        {:keys [def-design]} (flow/stage-7-export lef-lib placement-result)]
+    (testing "4 COMPONENTS, all PLACED, instance names carried straight through"
+      (is (= 4 (count (:components def-design))))
+      (is (every? #(= :placed (:status %)) (:components def-design)))
+      (is (= #{flow/not1-instance flow/xor1-instance flow/dff0-instance flow/dff1-instance}
+             (set (map :instance-name (:components def-design))))))
+    (testing "locations scaled to real microns, orientations carried through (DFF0's :fs matches stage 5)"
+      (let [by-name (into {} (map (juxt :instance-name identity)) (:components def-design))]
+        (is (approx-vec= [0.0 0.0] (:location (by-name flow/not1-instance))))
+        (is (approx-vec= [0.6 0.0] (:location (by-name flow/xor1-instance))))
+        (is (approx-vec= [0.0 1.4] (:location (by-name flow/dff0-instance))))
+        (is (approx-vec= [0.0 2.8] (:location (by-name flow/dff1-instance))))
+        (is (= :fs (:orientation (by-name flow/dff0-instance))))
+        (is (= :n (:orientation (by-name flow/dff1-instance))))))))
+
+(deftest stage-7-export-openaccess-flattens-all-placed-geometry
+  (let [lef-lib (:lib (flow/stage-4-cell-library))
+        placement-result (flow/stage-5-placement lef-lib)
+        {:keys [flat-shapes]} (flow/stage-7-export lef-lib placement-result)]
+    (testing "11 shapes total (2 + 3 + 3 + 3 pins across the 4 placed cells), every bbox well-formed"
+      (is (= 11 (count flat-shapes)))
+      (is (every? (fn [{[x1 y1 x2 y2] :bbox}] (and (<= x1 x2) (<= y1 y2))) flat-shapes)))))
+
+(deftest stage-7-export-openaccess-applies-real-orientation-math
+  (let [lef-lib (:lib (flow/stage-4-cell-library))
+        placement-result (flow/stage-5-placement lef-lib)
+        {:keys [orientation-probe]} (flow/stage-7-export lef-lib placement-result)
+        {:keys [identity-cell mirrored-cell flat-identity flat-mirrored]} orientation-probe]
+    (testing "fixture sanity: one cell forced to :n/R0 (identity), the other to :fs/MX (mirror-about-X)"
+      (is (= :n (:orientation identity-cell)))
+      (is (= :fs (:orientation mirrored-cell)))
+      (is (= 0 (:row-idx identity-cell)))
+      (is (= 1 (:row-idx mirrored-cell))))
+    (testing "R0 + zero offset is the identity transform -- flattened D-pin bbox equals the LEF-local rect exactly"
+      (is (approx-vec= [0.0 0.5 0.1 0.9] (:bbox (first flat-identity)))))
+    (testing "MX mirrors local (x,y) -> (x,-y) THEN translates by offset [0 1] -- hand-computed, not library-derived"
+      ;; local D-pin rect [0.0 0.5 0.1 0.9]; MX: (0.0,0.5)->(0.0,-0.5), (0.1,0.9)->(0.1,-0.9);
+      ;; + offset (0,1): (0.0,0.5), (0.1,0.1); renormalized bbox = [0.0 0.1 0.1 0.5]
+      (let [actual (:bbox (first flat-mirrored))
+            naive-translate-only [0.0 1.5 0.1 1.9] ; what pnr.lef-adapter's GDSII path would give (no orientation)
+            expected-mx [0.0 0.1 0.1 0.5]]
+        (is (approx-vec= expected-mx actual 1e-6))
+        (testing "and that is NOT what translate-only geometry would give -- real orientation math ran"
+          (is (not (approx-vec= naive-translate-only actual 1e-3)))
+          (is (> (Math/abs (- (nth actual 1) (nth naive-translate-only 1))) 0.5)))))))
+
+;; ---------------------------------------------------------------------------
+;; Stage 8 -- UPF power intent
+;; ---------------------------------------------------------------------------
+
+(deftest stage-8-power-intent-consistent-placement-has-zero-violations
+  (let [lef-lib (:lib (flow/stage-4-cell-library))
+        placement-result (flow/stage-5-placement lef-lib)
+        {:keys [violations partitions]} (flow/stage-8-power-intent (:placement placement-result))]
+    (testing "every cell's power domain (resolved from its instance path) matches its physical row's domain"
+      (is (= [] violations)))
+    (testing "partition-by-domain groups cells into PD_A (combinational) / PD_B (sequential)"
+      (is (= #{flow/not1-instance flow/xor1-instance}
+             (set (map :instance-name (get partitions "PD_A")))))
+      (is (= #{flow/dff0-instance flow/dff1-instance}
+             (set (map :instance-name (get partitions "PD_B"))))))))
+
+(deftest stage-8-power-intent-catches-a-real-misassignment
+  (let [lef-lib (:lib (flow/stage-4-cell-library))
+        placement-result (flow/stage-5-placement lef-lib)
+        {:keys [bad-violations]} (flow/stage-8-power-intent (:placement placement-result))]
+    (testing "DFF0 mis-tagged as PD_A while physically placed in PD_B's block is flagged, not silently accepted"
+      (is (= [{:cell "top/pdA/u_dff0" :expected-domain "PD_B"
+               :actual-domain "PD_A" :block "block-b"}]
+             bad-violations)))))
+
+;; ---------------------------------------------------------------------------
+;; Stage 9 -- signal integrity
+;; ---------------------------------------------------------------------------
+
+(deftest stage-9-signal-integrity-derives-real-eye-metrics
+  (let [{:keys [amplitude-mv rise-time-ps eye-data]} (flow/stage-9-signal-integrity)]
+    (testing "amplitude/rise-time genuinely derived from the IBIS V-I table + ramp, not hand-picked"
+      (is (approx= 1800.0 amplitude-mv 1e-6))
+      (is (approx= 600.0 rise-time-ps 1e-6)))
+    (testing "eye-diagram metrics are structurally sane (mirrors the ported Rust suite's own convention:
+              assert structural properties, not exact sample values -- see signal-integrity.eye-diagram docstring)"
+      (let [metrics (:eye/metrics eye-data)]
+        (is (>= (:eye/height-mv metrics) 0.0))
+        (is (< 0.0 (:eye/width-ps metrics) 500.0)) ; < bit-period-ps (1000/2.0gbps)
+        (is (approx= 5.0 (:eye/jitter-rms-ps metrics) 1e-9))
+        (is (<= 0.0 (:eye/ber-estimate metrics) 1.0))
+        (is (seq (:eye/samples eye-data)))))))
+
+;; ---------------------------------------------------------------------------
+;; Stage 10 -- UVM-style verification against rtl.simulator
+;; ---------------------------------------------------------------------------
+
+(deftest stage-10-verification-driver-monitor-round-trip-is-consistent
+  (let [{:keys [driven watched]} (flow/stage-10-verification)]
+    (testing "the driver actually applied the full stimulus sequence, in order"
+      (is (= flow/verification-stimulus driven)))
+    (testing "the monitor observed exactly what the driver applied -- the core UVM driver/monitor invariant"
+      (is (= driven watched)))))
+
+;; ---------------------------------------------------------------------------
+;; Full flow
+;; ---------------------------------------------------------------------------
+
+(deftest full-flow-runs-end-to-end
+  (let [result (flow/run-full-flow)]
+    (testing "every stage key is present"
+      (is (= #{:stage-1-rtl-parse :stage-2-synthesis :stage-3-timing-signoff :stage-4-cell-library
+               :stage-5-placement :stage-6-routing :stage-7-export :stage-8-power-intent
+               :stage-9-signal-integrity :stage-10-verification}
+             (set (keys result)))))
+    (testing "each stage's result is well-formed"
+      (is (= :ok (first (get-in result [:stage-1-rtl-parse :verilog]))))
+      (is (= :ok (first (get-in result [:stage-1-rtl-parse :vhdl]))))
+      (is (= 4 (count (get-in result [:stage-2-synthesis :netlist :gates]))))
+      (is (= :passed (get-in result [:stage-3-timing-signoff :eda.signoff/status])))
+      (is (= :ok (get-in result [:stage-4-cell-library :status])))
+      (is (= 4 (get-in result [:stage-5-placement :stats :total-cells])))
+      (is (= 1 (get-in result [:stage-6-routing :stats :routed-nets])))
+      (is (pos? (count (get-in result [:stage-7-export :gdsii-bytes]))))
+      (is (= [] (get-in result [:stage-8-power-intent :violations])))
+      (is (seq (get-in result [:stage-9-signal-integrity :eye-data :eye/samples])))
+      (is (= (get-in result [:stage-10-verification :driven])
+             (get-in result [:stage-10-verification :watched]))))))

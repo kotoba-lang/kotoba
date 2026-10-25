@@ -220,6 +220,7 @@ The bundled standard libraries live in this repository:
 | `org.postgresql.wire` | `org.postgresql.wire/src` | `kotobase.pg.sql`, `kotobase.pg.wire` (an external specification, publisher postgresql.org) |
 | `org.w3.sparqlProtocol` | `org.w3.sparqlProtocol/src` | `kotobase.protocols.sparql`, `kotobase.protocols.sparql.json`, `kotobase.protocols.sparql.ntriples`, `kotobase.protocols.sparql.parser` (an external specification, publisher w3.org) |
 | `org.iso.std16739` | `org.iso.std16739/src` | `ifc.core`, `ifc.ids`, `ifc.ids.xml`, `ifc.mvd` (an external specification, publisher iso.org) |
+| `kotoba.edaFlowDemo` | `kotoba.edaFlowDemo/src` | `eda-flow-demo.flow` (Kotoba project library) |
 | `kotoba.commoncrawlActor` | `kotoba.commoncrawlActor/src` | `commoncrawl.cdx`, `commoncrawl.embeddings`, `commoncrawl.extract`, `commoncrawl.iceberg` (Kotoba project library) |
 | `kotoba.langchainStore` | `kotoba.langchainStore/src` | `langchain-store.core` (Kotoba project library) |
 | `kotoba.comMicrosoftGraph` | `kotoba.comMicrosoftGraph/src` | `microsoft-graph.connector` (Kotoba project library) |
