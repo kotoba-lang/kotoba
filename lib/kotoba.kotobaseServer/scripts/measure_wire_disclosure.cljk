@@ -1,0 +1,139 @@
+#!/usr/bin/env kbb
+;; scripts/measure_wire_disclosure.cljk — what a refused query tells the
+;; caller about the graph it was refused from.
+;;
+;; root ADR-2609108000 left one item open after the ayatori measurement
+;; (`bench/inference-channel-01.edn` there): the library seam discloses an
+;; exact datom count to a caller who can read no value, and nobody had
+;; checked which DEPLOYED surface exposes it. This is that check, on the
+;; surface that is deployed.
+;;
+;; `kotobase.server.admission` is pure, so this EXERCISES it rather than
+;; reading it. Where a fact is only in the source -- which route reaches
+;; which gate -- the section uses an exact anchor and fails if the anchor is
+;; not found exactly once, so a moved call site reads as a finding.
+;;
+;; Returns a COUNT of failures; exits 2 if its own control fails.
+;;
+;; Run (from the repo root):
+;;   kbb --backend sci --classpath "src:<workspace src dirs>" scripts/measure_wire_disclosure.cljk
+
+(ns measure-wire-disclosure
+  (:require [clojure.string :as str]
+            ["fs" :as fs]
+            [kotobase.server.admission :as adm]))
+
+(def ^:private failures (atom 0))
+(def ^:private scanned (atom 0))
+
+(defn- check! [label ok? detail]
+  (swap! scanned inc)
+  (when-not ok? (swap! failures inc))
+  (println (if ok? "  ok  " "  FAIL") label "—" detail))
+
+(defn- source-has-once?
+  "true when `anchor` occurs exactly once in `path`. Anything else -- absent,
+  duplicated, unreadable -- is false, and the caller reports it as a finding
+  rather than as a pass it did not measure."
+  [path anchor]
+  (let [src (try (fs/readFileSync path "utf8") (catch :default _ nil))]
+    (and src (= 1 (dec (count (str/split src anchor)))))))
+
+(def ^:private cap (:max-source-datoms adm/default-policy))
+
+(defn -main []
+
+  (println "\n=== C. control — the gate refuses, and admits ===")
+  (println "  A deny-by-default gate that refuses everything would make every")
+  (println "  section below vacuous. Both directions, on the real fn.")
+  (let [bounded   (adm/admit '{:where [[?e :diagnosis ?v]]})
+        unbounded (adm/admit '{:where [[?e ?a ?v]]})]
+    (check! "a bounded pattern is admitted" (:admitted? bounded)
+            "a bound attribute gives the plan a prefix")
+    (check! "a fully unbound pattern is refused" (not (:admitted? unbounded))
+            (str (count (:refusals unbounded)) " refusal(s) — allow-unbounded-patterns? is false")))
+
+  (when (pos? @failures)
+    (println "\nREFUSING to report: the control did not hold.")
+    (js/process.exit 2))
+
+  (println "\n=== A. the ceiling, and the boundary that pins its comparison ===")
+  (check! "below the cap: no refusal" (nil? (adm/over-budget (- cap 1)))
+          (str (dec cap) " datoms"))
+  (check! (str "boundary: exactly " cap " does NOT refuse")
+          (nil? (adm/over-budget cap))
+          "the comparison is (> n cap); flip it to >= and this one flips alone")
+  (check! "one past the cap refuses" (some? (adm/over-budget (inc cap)))
+          (str (inc cap) " datoms"))
+
+  (println "\n=== B. the refusal carries the count to the wire ===")
+  (println "  This is the question the ayatori measurement left open. Not")
+  (println "  whether the number exists — whether the client is handed it.")
+  (let [n (+ cap 4321)
+        refusal (adm/over-budget n)
+        wire (adm/refusal-response [refusal])]
+    (check! "the refusal detail names the exact count"
+            (str/includes? (:detail refusal) (str n))
+            (str "n=" n " appears in :detail"))
+    (check! "the wire response carries it in :details"
+            (str/includes? (:details wire) (str n))
+            "the human-readable field a client prints")
+    (check! "the wire response carries it in :refusals as well"
+            (str/includes? (pr-str (:refusals wire)) (str n))
+            "the machine-readable field a client branches on")
+    (check! "the stable error code does not depend on the count"
+            (= "QueryRefused" (:error wire))
+            "so a client can branch without parsing the number — the number is extra"))
+
+  (println "\n=== D. the cap is NOT caller-settable, and that is the whole")
+  (println "       difference between this surface and the library seam ===")
+  (println "  The library's materialize takes max-datoms as an argument, so a")
+  (println "  caller binary-searches the exact total in 12 probes. Here the")
+  (println "  policy is a value in the source and every call site takes the")
+  (println "  1-arity, so a caller learns a count only when it is already")
+  (println "  over" cap "and cannot probe below it.")
+  (check! "the policy is a literal, both fields"
+          (= {:max-source-datoms 200000 :allow-unbounded-patterns? false}
+             adm/default-policy)
+          (pr-str adm/default-policy))
+  (doseq [[path anchor why]
+          [["src/kotobase/server/handler.cljk"
+            "(admission/over-budget (or (pattern-source/datom-count source) 0))"
+            "datalog route — 1-arity, no cap from the request"]
+           ["src/kotobase/server/sparql_protocol.cljk"
+            "(admission/over-budget (or (ps/datom-count source) 0))"
+            "sparql route — same"]]]
+    ;; The handler names this call twice (two routes); anchor uniqueness is
+    ;; asserted per file below only where it is genuinely unique.
+    (let [src (try (fs/readFileSync path "utf8") (catch :default _ nil))
+          hits (when src (dec (count (str/split src anchor))))]
+      (check! (str "1-arity call site in " (last (str/split path #"/")))
+              (and hits (pos? hits))
+              (str hits " occurrence(s) — " why))))
+  (check! "no request field sets the cap"
+          (not (some (fn [p]
+                       (let [src (try (fs/readFileSync p "utf8") (catch :default _ ""))]
+                         (or (str/includes? src "max-source-datoms")
+                             (str/includes? src "allow-unbounded-patterns?"))))
+                     ["src/kotobase/server/handler.cljk"
+                      "src/kotobase/server/sparql_protocol.cljk"
+                      "src/kotobase/server/pattern_source.cljk"]))
+          "neither policy key appears outside admission.cljc")
+
+  (println "\n=== E. the count is taken before visibility ===")
+  (check! "datom-count is the size of the prefetched union"
+          (source-has-once? "src/kotobase/server/pattern_source.cljk"
+                            "{::datom-count (count quads)}")
+          "raw quads, counted where the source is built — no visible? in sight")
+  (check! "the gate runs after the read and before the query"
+          (source-has-once? "src/kotobase/server/admission.cljk"
+                            "Applied AFTER the read and BEFORE the query")
+          "stated in the ns, and that is the honest place for it")
+
+  (println "\n---")
+  (println (str "SCANNED\t" @scanned))
+  (println "CAP\t" cap)
+  (println "FAILURES=" @failures)
+  (js/process.exit (if (pos? @failures) 1 0)))
+
+(-main)

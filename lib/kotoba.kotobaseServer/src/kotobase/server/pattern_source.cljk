@@ -1,0 +1,206 @@
+(ns kotobase.server.pattern-source
+  "`datom.source/IPatternSource` over `hot-datoms` — the in-process half of
+  the Datomic-API-as-an-index seam (superproject ADR-2608039970).
+
+  ## What it replaces, and why that matters
+
+  Compiled-query reads historically went through `hot-db`: hydrate the whole
+  chain into a db value, then run an algebra over it. That is O(database) per
+  query regardless of how few rows come back — `datom.source`'s own docstring
+  names this as the reason it exists. SPARQL and Cypher now consume this
+  source; Datomic-shaped `do-q` remains on `hot-db` until its broader grammar
+  has an equivalent source-backed plan.
+
+  `hot-datoms` is already the shape that avoids it: a filtered index read
+  (`:index` + prefix `:components`, snapshot + novelty merge, range-pruned on
+  the snapshot side, never a whole-graph rehydrate). One triple pattern is
+  one `hot-datoms` call. A query naming two predicates reads two index
+  ranges, whatever the graph's size.
+
+  ## The plan is shared, deliberately
+
+  Which index answers which bound positions lives in
+  `kotobase.datom-plan` (`kotoba-lang/kotobase-client`), the same namespace
+  `kotobase.datom-source` uses for the HTTP transport. Two transports, one
+  plan: if the in-process reads and the remote reads ever disagreed about
+  which index answers `[_ p o]`, the two would return different answers to
+  the same query and nothing would say so.
+
+  ## Async construction, synchronous scanning
+
+  `-scan` is synchronous by contract and `kotoba-lang/sparql`'s algebra walks
+  it synchronously, while `hot-datoms` is a value on JVM and a Promise on
+  cljs (ADR-2607051000). So `source-for` PREFETCHES the patterns a query
+  names and hands back a plain source over the result — the same split
+  `kotobase-protocols-worker` uses for documents, and the same one
+  `kotobase.datom-source` uses over HTTP.
+
+  What is read is the query's patterns. Not the database.
+
+  ## The object position IS pushed down, and here is the measurement
+
+  It was withheld at first because a one-datom corpus cannot tell `applied
+  and matched` from `ignored`, and a value component read wrongly returns
+  FEWER rows — a wrong answer that looks like an empty result. Measured
+  2026-08-04 against three datoms on one attribute, two of them sharing a
+  value (`e1 :role admin`, `e2 :role user`, `e3 :role admin`):
+
+    :avet (no components)                -> 3 rows
+    :avet components [\":role\"]           -> 3 rows
+    :avet components [\":role\" \"admin\"]   -> 2 rows, exactly e1 and e3
+    :avet components [\":role\" \"\\\"admin\\\"\"] -> 0 rows
+    :aevt components [\":role\"]           -> 3 rows
+
+  So the value component IS applied, it filters correctly, and it wants the
+  STORED value — which is exactly what quads carry here. `[_ p o]` is one
+  `:avet` range read now instead of a predicate scan filtered afterwards.
+
+  ## Two contracts that look alike and are not
+
+  **Quads carry STORED VALUES, not `v_edn`.** A row reports the object as
+  `v_edn` — its EDN encoding — and this decodes one level, so `:o` is the
+  value the write path actually stored. The write path stringifies, so
+  `:sp/age 30` is the string `\"30\"` here, not the number.
+
+  That is the representation a consumer can work in: a FILTER comparing
+  `?v > 25` can parse `\"30\"`, and cannot do anything sensible with the
+  seven characters of `v_edn`. Pattern components are in the same
+  representation — a caller holding a logical value passes `(str v)`, not
+  `(pr-str v)`.
+
+  **`visible?` here is the ROW-shaped predicate**, over
+  `{:e :a :v_edn :added}` — that is what `hot-datoms` forwards to both its
+  snapshot and novelty halves. It is NOT `datom.source`'s `{:s :p :o}`
+  predicate, despite the identical name and the identical purpose. A
+  `{:s :p :o}` predicate handed to `source-for` silently matches nothing and
+  therefore hides nothing."
+  (:require #?(:clj [kotoba.lang.edn :as edn] :cljs [cljs.reader :as edn])
+            [datom.source :as src]
+            [kotobase-peer.core :as eng]
+            [kotobase.server.datom-plan :as plan]))
+
+(defn- then*
+  "The platform split, same as `kotobase.server.handler`'s: kotobase-peer's
+  crypto-touching fns are values on JVM and `js/Promise`s on cljs."
+  [x f]
+  #?(:clj (f x)
+     :cljs (.then (js/Promise.resolve x) f)))
+
+(defn- all*
+  "Await a seq of per-read results into a seq of results."
+  [xs]
+  #?(:clj (vec xs)
+     :cljs (.then (js/Promise.all (clj->js (vec xs))) #(vec (array-seq %)))))
+
+(defn read-quads
+  "One planned read -> its asserted quads.
+
+  `visible?` is threaded into `hot-datoms` itself rather than applied after,
+  so a row the viewer may not see is never materialized into a quad — the
+  same place `do-datoms` applies it (ADR-2607050500, ADR-2607174500 3b)."
+  [store chain {:keys [index components]} visible?]
+  (then* (eng/hot-datoms (:get-fn store) chain
+                         {:index (keyword index) :components (vec components)}
+                         visible? (:blind-fn store) (:decrypt-fn store)
+                         (:async-get-fn store))
+         (fn [rows]
+           (into #{}
+                 (map (fn [q] (update q :o #(when (string? %) (edn/read-string %)))))
+                 (plan/rows->quads identity rows)))))
+
+(defn source-for
+  "Prefetch `patterns` from `chain` -> an `IPatternSource` over their union.
+  A value on JVM, a Promise on cljs.
+
+  Patterns planning to the same read are issued once: two patterns of one
+  query routinely differ only in a position that index's prefix cannot bind,
+  and issuing it twice is two reads for one answer.
+
+  A nil `chain` (a graph with nothing written yet) is an empty source, not an
+  error — the same posture `do-datoms` takes.
+
+  The result is `src/cached`, which is sound here for the reason that
+  namespace states and not by luck: the source is an immutable snapshot of
+  one chain CID, built once and discarded with the request, so a pattern
+  cannot answer differently on a second ask. What it buys is the fixpoint --
+  `datom.source`'s own measurement is a recursive rule issuing 22 scans that
+  were all the SAME pattern, because semi-naive evaluation shrinks the
+  binding frontier without specializing the clause. Without this, every one
+  of those re-filtered the whole prefetched union."
+  ([store chain patterns] (source-for store chain patterns (constantly true)))
+  ([store chain patterns visible?]
+   (if (nil? chain)
+     (then* nil (fn [_] (src/of-quads [])))
+     (then* (all* (map #(read-quads store chain % visible?) (plan/reads patterns)))
+            (fn [quad-sets]
+              (let [quads (plan/union-quads quad-sets)]
+                (with-meta (src/cached (src/of-quads quads))
+                  {::datom-count (count quads)})))))))
+
+(defn datom-count
+  "How many datoms a `source-for` source holds, or nil for a source built
+  somewhere else.
+
+  Carried as metadata rather than returned in a pair because every existing
+  caller takes the source itself, and a caller that does not ask this is a
+  caller that does not bound itself -- which is a thing an admission gate
+  should be able to SEE, by getting nil, rather than a thing hidden behind a
+  changed arity that everyone updates mechanically."
+  [source]
+  (::datom-count (meta source)))
+
+(defn- broad-pattern
+  "The clause with every variable and wildcard nil -- exactly
+  `datalog.core/broad-pattern`, which is what the hash-join path scans. Kept
+  identical on purpose: a cardinality computed for a different pattern than
+  the one the executor will scan is a hint about a relation that is not the
+  one being joined."
+  [clause]
+  (mapv (fn [t] (if (symbol? t) nil t)) (take 3 (concat clause (repeat nil)))))
+
+(defn- clause-seq
+  "Every triple clause reachable from one `:where`/rule-body element."
+  [clause]
+  (cond
+    (and (vector? clause) (seq? (first clause))) []
+    (vector? clause) [clause]
+    (seq? clause)
+    (let [[head & more] clause]
+      (cond
+        (= 'not head) (mapcat clause-seq more)
+        (= 'or head) (mapcat clause-seq more)
+        (= 'and head) (mapcat clause-seq more)
+        (= 'or-join head) (mapcat clause-seq (rest more))
+        :else []))
+    :else []))
+
+(defn clause-cardinality
+  "`{clause row-count}` for every triple clause of `query`, counted against
+  `source`.
+
+  This is the hint `datalog.core/q` needs to choose ONE broad scan plus an
+  in-memory hash join over N keyed scans. Without it the engine stays on the
+  keyed path, which is the correct default for a caller that did not plan --
+  and this server was that caller, so every join it ran was index-nested-loop.
+  Measured 2026-08-23 on a 963-quad graph: a two-clause join asked the source
+  61 times for a 60-row answer and a three-clause join asked 601 times for 40
+  rows, against a floor of 2 and 3.
+
+  Counting is nearly free HERE and would not be somewhere else, which is the
+  whole reason this belongs on this side of the seam. `source-for` has already
+  fetched every range the query names and wrapped them in a per-request scan
+  cache, so each broad pattern is one cached scan of resident data -- no block
+  read, no round trip. The engine's own budget comment warns that a broad scan
+  of a large relation is the mistake it exists to avoid; over a remote source
+  that is true, and over this one the relation is already in hand.
+
+  Rule bodies are included. The fixpoint re-asks its clauses every round, so
+  it is the place where N keyed scans hurt most -- and the hint only ever
+  ENABLES the hash path when the relation is small relative to the number of
+  scans it replaces, so including a clause can never make it choose worse."
+  [source {:keys [where rules]}]
+  (into {}
+        (map (fn [clause] [clause (count (src/scan-set source (broad-pattern clause)))]))
+        (distinct
+         (concat (mapcat clause-seq where)
+                 (mapcat (fn [rule] (mapcat clause-seq (rest rule))) rules)))))

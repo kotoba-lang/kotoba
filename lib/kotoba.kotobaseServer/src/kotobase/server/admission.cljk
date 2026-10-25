@@ -1,0 +1,246 @@
+(ns kotobase.server.admission
+  "Whether a query may run, decided from its READ PLAN, before a block is
+  fetched.
+
+  ## The thing being refused
+
+  `kotobase.server.datom-plan` maps `[s p o]` onto an index and a prefix.
+  Two of its six rows bind no prefix at all:
+
+      [_ _ o]  -> :eavt []   -- `:vaet` covers ref-valued attrs, not literals
+      [_ _ _]  -> :eavt []   -- full scan, as asked
+
+  Those are the whole graph, filtered afterwards in memory. The cost follows
+  the DATABASE and not the answer, which is the same shape as
+  `kotobase.query.bridge/materialize` — measured 2026-08-23 as linear in the
+  documents while the query itself stayed near 1ms across a 64x range
+  (`com-junkawasaki/root` 90-docs/kotobase-performance/2026-08-23-*). This
+  namespace is how a query carrying one of those stops being executable.
+
+  A rule body counts. `owl.rules/triple-rules`' base case is literally
+  `[?s ?p ?o]`, so a ruleset can smuggle a full scan into a query whose own
+  `:where` is perfectly bounded — and it is worse there than in a `:where`,
+  because a fixpoint re-asks its clauses every round.
+
+  ## Deny by default, and that is the whole point
+
+  `admit` refuses a clause shape it does not recognise (`:unrecognised-clause`)
+  rather than passing it. A gate whose unknown case is `allow` reports the
+  same verdict for `I checked and it is bounded` and `I could not tell`, and
+  those are the two answers that must never look alike — this repository has
+  a receipt for exactly that failure in its own deploy script
+  (`deploy-versioned.mjs`, an unreadable provenance answer returning the same
+  `false` as a mismatched one).
+
+  Clause shapes that provably issue no read — predicate/function clauses
+  (`[(> ?n 18)]`) and rule invocations (`(owl-type ?i ?c)`, which names no
+  attribute) — are admitted as reading nothing, not as unrecognised.
+
+  ## What it cannot decide statically, and what covers that
+
+  A bound predicate says the read is a RANGE, not that the range is small:
+  `[?e :rdf/type ?c]` is one index range and may still be most of the graph.
+  Nothing in a plan can tell. `over-budget` is the second half, applied to
+  what a prefetch actually returned — after the read, before the query runs,
+  so a fixpoint over an enormous source is stopped even though its first read
+  was already paid. That asymmetry is stated rather than papered over: this
+  bounds MEMORY AND EXECUTION, and bounds the first read only in so far as
+  the plan is unbounded on its face.
+
+  ## The refusal reports a cardinality, and that is measured
+
+  `over-budget`'s `:detail` names `n` -- the size of the prefetched union,
+  counted in `pattern-source` before any visibility decision exists -- and
+  `refusal-response` puts it on the wire in both `:details` and `:refusals`.
+  So a caller who can read no value of a graph still learns an exact count
+  of it, whenever their bounded patterns select more than the cap.
+
+  This is bounded in a way the library seam underneath is not, and the
+  difference is the whole reason to write it down. `kotobase.query.bridge/
+  materialize` takes `max-datoms` as an ARGUMENT, so a caller there
+  binary-searches an exact total in about a dozen probes
+  (`kotoba-lang/ayatori` `bench/inference-channel-01.edn`). Here the policy
+  is a literal in this file, every call site takes the 1-arity, and neither
+  policy key appears anywhere else -- so the disclosure is one number, only
+  for ranges already past the cap, with no way to probe below it.
+
+  Measured by `scripts/measure_wire_disclosure.cljk`, both directions:
+  removing `n` from the detail fails three assertions, flipping `>` to `>=`
+  fails the boundary one ALONE, and setting `allow-unbounded-patterns?` true
+  makes the harness refuse to report at all. Nothing here proposes changing
+  the message. A refusal that will not say why is its own defect, and which
+  of the two costs to pay is a decision, not a bug.
+
+  Pure: no store, no I/O, no platform split."
+  (:require [kotoba.lang.text :as str]))
+
+(def default-policy
+  "Stated in code, not discovered from the environment.
+
+  `max-source-datoms` is the ceiling on what one query's prefetched union may
+  hold. 200,000 is above every graph this fleet queries today and far below
+  what a Worker isolate can hold — it exists to make a runaway query fail
+  loudly rather than to tune anything, and it is a NUMBER so that raising it
+  is an edit somebody reviews.
+
+  `allow-unbounded-patterns?` is false and there is no code path that sets it
+  true from a request. A deployment that genuinely wants whole-graph scans
+  sets it where it is read, once, in the open."
+  {:max-source-datoms 200000
+   :allow-unbounded-patterns? false})
+
+(defn- lvar? [x] (and (symbol? x) (str/starts-with? (name x) "?")))
+
+(defn- triple-clause? [c] (and (vector? c) (not (seq? (first c)))))
+(defn- predicate-clause? [c] (and (vector? c) (seq? (first c))))
+
+(def ^:private special-heads '#{not or or-join and})
+
+(defn- branch-clauses
+  "The sub-clauses of a special form, or nil when `c` is not one."
+  [c]
+  (when (seq? c)
+    (let [[head & more] c]
+      (cond
+        (= 'not head)     (vec more)
+        (= 'or head)      (vec more)
+        (= 'and head)     (vec more)
+        (= 'or-join head) (vec (rest more))
+        :else             nil))))
+
+(defn- rule-invocation? [c]
+  (and (seq? c) (symbol? (first c)) (not (contains? special-heads (first c)))))
+
+(defn- triples-of
+  "Every triple pattern reachable from one clause, with the query part it came
+  from. Predicate/function clauses and rule invocations contribute none --
+  neither names an attribute, so neither issues a read."
+  [clause where]
+  (cond
+    (predicate-clause? clause) []
+    (rule-invocation? clause) []
+    (triple-clause? clause) [[clause where]]
+    :else (if-let [branches (branch-clauses clause)]
+            (into [] (mapcat #(triples-of % where)) branches)
+            [[::unrecognised where clause]])))
+
+(defn- triple-refusal
+  "The refusal one triple pattern earns, or nil.
+
+  Bounded means the PLAN binds a prefix, which `kotobase.server.datom-plan`
+  decides in this order: a bound subject gives `:eavt [s]` (or `[s p]`), and
+  failing that a bound attribute gives `:aevt [p]` (or `:avet [p o]`). So a
+  variable attribute is only a problem when the subject is unbound too --
+  `[\"e1\" ?attr ?v]` is one entity prefix and perfectly fine, and refusing it
+  would be this gate inventing a rule the planner does not have."
+  [[s p o] where clause]
+  (let [bound? (fn [x] (not (or (nil? x) (= '_ x) (symbol? x))))]
+    (cond
+      (bound? s) nil
+      (bound? p) nil
+      (lvar? p)
+      {:reason :variable-attribute :where where :clause clause
+       :detail (str "neither the subject nor the attribute is bound -- the attribute is the logic variable "
+                    p ", so no predicate index applies and this reads the whole graph")}
+      :else
+      {:reason :unbounded-pattern :where where :clause clause
+       :detail (str "neither the subject nor the attribute is bound, so this reads the whole graph "
+                    "and filters in memory"
+                    (when (bound? o)
+                      " -- an object literal does not narrow it, because :vaet covers ref-valued attributes, not literals"))})))
+
+(defn- query-triples
+  "`[[pattern where] ...]` for the whole query -- `:where` and every rule
+  body. An unrecognised clause comes back as a marker rather than being
+  dropped, because dropping it is how a gate reports `bounded` about
+  something it did not read."
+  [{:keys [where rules]}]
+  (into (into [] (mapcat #(triples-of % :where)) where)
+        (mapcat (fn [rule]
+                  (let [head (first rule)
+                        rname (if (seq? head) (first head) head)]
+                    (mapcat #(triples-of % [:rules rname]) (rest rule)))))
+        rules))
+
+(defn plan-refusals
+  "Every static refusal for a Datalog map query. `[]` means the plan is
+  bounded on its face -- NOT that the query is cheap (see the ns docstring)."
+  [query]
+  (let [entries (query-triples query)]
+    (into []
+          (keep (fn [entry]
+                  (if (= ::unrecognised (first entry))
+                    (let [[_ where clause] entry]
+                      {:reason :unrecognised-clause :where where :clause clause
+                       :detail "this gate could not tell what this clause reads, and refuses rather than guessing"})
+                    (let [[pattern where] entry]
+                      (triple-refusal pattern where pattern)))))
+          entries)))
+
+(defn admit
+  "`{:admitted? bool :refusals [...]}` for a Datalog map query.
+
+  A map query with no triple pattern anywhere is refused
+  (`:no-readable-pattern`): it would run against an empty source and answer
+  vacuously, which is the one wrong answer that looks exactly like a right
+  one."
+  ([query] (admit query default-policy))
+  ([query policy]
+   (let [entries (query-triples query)
+         unrecognised? (some #(= ::unrecognised (first %)) entries)
+         refusals (cond-> (plan-refusals query)
+                    ;; Not claimed when a clause was unrecognised: "there is no
+                    ;; readable pattern" is a statement about clauses this gate
+                    ;; READ, and it did not read that one.
+                    (and (not unrecognised?)
+                         (not (some #(not= ::unrecognised (first %)) entries)))
+                    (conj {:reason :no-readable-pattern :where :where
+                           :detail "no triple pattern in :where or any rule body, so this would run against an empty source"}))]
+     (if (and (seq refusals) (not (:allow-unbounded-patterns? policy)))
+       {:admitted? false :refusals (vec refusals)}
+       {:admitted? true :refusals []}))))
+
+(defn admit-patterns
+  "The same decision for a surface that speaks `[s p o]` patterns directly
+  (the SPARQL/Cypher compiled shape, whose wildcards are already `nil`)
+  rather than a Datalog map."
+  ([patterns] (admit-patterns patterns default-policy))
+  ([patterns policy]
+   (admit {:where (vec patterns)} policy)))
+
+(defn over-budget
+  "`nil`, or the refusal for a prefetched source that is too large to run a
+  query over. Applied AFTER the read and BEFORE the query -- see the ns
+  docstring for why that is the honest place for it."
+  ([n] (over-budget n default-policy))
+  ([n policy]
+   (let [cap (:max-source-datoms policy)]
+     (when (> n cap)
+       {:reason :source-over-budget
+        :where :prefetch
+        :detail (str "the patterns this query names read " n
+                     " datoms, over the " cap
+                     " this deployment will run a query across; bind an attribute or a subject, or narrow the query")}))))
+
+(defn refusal-response
+  "The wire shape for a refused query. `:error` is stable so a client can
+  branch on it; `:details` is for a person, and names every reason rather
+  than the first, because fixing one and rediscovering the next is the same
+  round trip twice."
+  [refusals]
+  {:ok false
+   :error "QueryRefused"
+   :details (str "this query was refused before it ran: "
+                 (str/join "; " (map (fn [{:keys [reason where clause detail]}]
+                                       (str (name reason)
+                                            " in " (if (vector? where)
+                                                     (str/join " " (map str where))
+                                                     (name where))
+                                            (when clause (str " -- " (pr-str clause)))
+                                            ": " detail))
+                                     refusals)))
+   :refusals (mapv (fn [r] (-> r
+                               (update :reason name)
+                               (update :where #(if (vector? %) (mapv str %) (name %)))
+                               (update :clause #(when % (pr-str %)))))
+                   refusals)})

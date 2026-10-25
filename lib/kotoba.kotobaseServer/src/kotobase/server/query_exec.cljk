@@ -1,0 +1,542 @@
+(ns kotobase.server.query-exec
+  "Shared execution layer for the SPARQL/Cypher compiled-query shape
+  (ADR-2607250100 axis 4 depth pass). A compiled query is:
+
+    {:find      [?v ... | {:agg :count :var ?x :as ?c} ...]
+     :where     [[s p o] ...]          ;; base BGP -> engine query
+     :unions    [[[s p o] ...] ...]    ;; alternative BGPs -> solution union
+     :optionals [[[s p o] ...] ...]    ;; OPTIONAL blocks -> LEFT JOIN
+     :filters   [{:var ?v :op :< :value \"10\"} ...]
+     :group-by  [?v ...]
+     :order-by  [{:var ?v :dir :asc|:desc} ...]
+     :limit     n}
+
+  Either :where or :unions supplies the base solutions -- :unions is the
+  bag union (SPARQL default semantics: duplicates kept) of each branch's
+  solutions, with variables absent from a branch nil-filled.
+
+  PUSH-DOWN (2026-07-25): constructs the engine (arrangement.datalog)
+  can evaluate NATIVELY are compiled into the single engine query instead
+  of run as a post-pass -- closing part of the maturity-bar axis-1
+  \"engine push-down\" gap. Pushable, and only when NO OPTIONAL is
+  present (OPTIONAL adds bindings the engine query doesn't see):
+    - COUNT / COUNT-DISTINCT aggregates -> engine `:find (count ?v)` with
+      GROUP BY = the bare find vars (engine computes the count during the
+      join; the handler never materializes the full row set);
+    - `=` / `!=` FILTER -> engine `[(= ?v lit)]` / `[(not= ?v lit)]`
+      predicate clauses (string equality, safe on wire-string values).
+  What STAYS a post-pass, with reason: OPTIONAL (engine has no left join),
+  numeric FILTER `< <= > >=` and SUM/AVG/MIN/MAX (engine's `<`/`+` need
+  numbers; values are wire strings the engine can't coerce), UNION
+  (multi-clause or-join branch support not relied on here), ORDER BY
+  (engine returns a set). The pushable path and the post-pass path are
+  asserted to agree by the same test suite (identical results either way)."
+  (:require [kotoba.lang.text :as str]
+            [kotoba.lang.coll]))
+
+(declare execute-post-pass execute-pushed)
+
+;; Every key a compiled query may carry. `execute` refuses anything else.
+;;
+;; This exists because the failure it prevents is silent. On 2026-08-13 the
+;; Cypher parser gained :paths, :renames and :distinct; an executor that simply
+;; did not look at them would have answered every variable-length, undirected or
+;; DISTINCT query with the wrong rows and no error at all. A compiled query
+;; naming something the executor cannot do must fail, not be approximated.
+(def ^:private known-keys
+  #{:find :where :unions :optionals :optional-paths :filters :group-by
+    :order-by :skip :limit :paths :renames :distinct :predicate :pipeline})
+
+(defn- assert-executable! [compiled]
+  (let [unknown (remove known-keys (keys compiled))]
+    (when (seq unknown)
+      (throw (ex-info (str "compiled query uses constructs this executor does not implement: "
+                           (pr-str (vec unknown)))
+                      {:kotobase/error :unexecutable-query :unknown (vec unknown)})))))
+
+(defn- fn-arg [bm a]
+  (cond (and (vector? a) (= :lit (first a))) (second a)
+        (symbol? a) (get bm a)
+        :else a))
+
+(defn- apply-fn
+  "The whitelisted RETURN functions. Kept tiny and total on purpose: a function
+  that cannot compute returns nil rather than throwing mid-projection, which is
+  what Cypher does with a missing property."
+  [{:keys [fn args]} bm]
+  (let [vs (mapv #(fn-arg bm %) args)]
+    (case fn
+      ;; Cypher coalesce: the first non-null argument.
+      :coalesce (first (remove nil? vs))
+      :tointeger (let [v (first vs)]
+                   (when (and v (re-matches #"-?[0-9]+" (str v)))
+                     #?(:clj (Long/parseLong (str v)) :cljs (js/parseInt (str v) 10))))
+      (throw (ex-info (str "no implementation for RETURN function " fn)
+                      {:kotobase/error :unimplemented-function :fn fn})))))
+
+(defn- apply-case [{:keys [subject when is-null then else]} bm]
+  (let [matches? (if is-null
+                   (nil? (get bm is-null))
+                   ;; In Cypher, null = null is null rather than true; simple
+                   ;; CASE therefore never selects a `WHEN null` branch.
+                   (let [actual (fn-arg bm subject)]
+                     (and (some? actual) (some? when) (= actual when))))]
+    (if matches? then else)))
+
+(defn- expand-path
+  "One `:paths` entry against bind-maps. BFS from each already-bound `:from`
+  value, following `attr` (both directions when `:both`), emitting one binding
+  per reachable node between :min and :max hops.
+
+  `:max nil` means unbounded, so the visited set is per-seed and mandatory:
+  LDBC's REPLY_OF chains are acyclic but `knows` is not, and an unbounded walk
+  over a cyclic graph without one does not terminate."
+  [bind-maps {:keys [from to attr min max both rel-var]} adjacency]
+  (let [step (fn [node] (adjacency attr node both))]
+    (vec (mapcat
+          (fn [bm]
+            (let [seed (get bm from)]
+              (if (nil? seed)
+                []
+                (loop [frontier [seed] depth 0 seen #{seed} out []]
+                  (let [out (if (>= depth min)
+                              (into out (map (fn [n]
+                                               (cond-> (assoc bm to n)
+                                                 rel-var (assoc rel-var (str attr "|" n))))
+                                             frontier))
+                              out)]
+                    (if (or (and max (>= depth max)) (empty? frontier))
+                      out
+                      (let [next-frontier (vec (remove seen (distinct (mapcat step frontier))))]
+                        (recur next-frontier (inc depth)
+                               (into seen next-frontier) out))))))))
+          bind-maps))))
+
+(defn- pattern-vars [patterns]
+  (vec (distinct (filter symbol? (mapcat identity patterns)))))
+
+(defn- rows->maps [vars rows]
+  (mapv #(zipmap vars %) rows))
+
+(defn- left-join
+  "bind-maps LEFT JOIN the rows of one OPTIONAL block."
+  [bind-maps opt-vars opt-rows]
+  (let [bound-vars (when (seq bind-maps) (set (keys (first bind-maps))))
+        join-vars (vec (filter (or bound-vars #{}) opt-vars))
+        new-vars (vec (remove (set join-vars) opt-vars))
+        opt-maps (rows->maps opt-vars opt-rows)
+        idx (group-by #(mapv % join-vars) opt-maps)
+        nil-fill (zipmap new-vars (repeat nil))]
+    (vec (mapcat (fn [bm]
+                   (let [matches (get idx (mapv bm join-vars))]
+                     (if (seq matches)
+                       (map #(merge bm (select-keys % new-vars)) matches)
+                       [(merge bm nil-fill)])))
+                 bind-maps))))
+
+(defn- bound-lookup-optional
+  "An OPTIONAL block of one triple whose subject is already bound, e.g. the
+  `[?n :firstName ?v]` a `RETURN n.firstName` compiles to. Evaluated as one
+  engine lookup per distinct bound subject.
+
+  The general path evaluates an OPTIONAL block as an INDEPENDENT engine query
+  and left-joins the result, which for this shape means scanning every value of
+  that attribute in the dataset. Measured 2026-08-13 on LDBC SF-0.1 (3,013,602
+  datoms, 303,482 entities): Interactive Short 1, a point lookup of one person,
+  did not finish in two minutes, with the main thread building a transient set
+  inside the engine -- it was materialising every entity's `:id` to answer
+  `RETURN p.id`. Property projection made this shape hot; before it, an OPTIONAL
+  block was rare and usually genuinely unbound."
+  [engine-query bind-maps [[s p o]]]
+  (let [subjects (into #{} (keep #(get % s)) bind-maps)
+        rows (into {} (mapcat (fn [subj]
+                                (map (fn [[v]] [[subj v] true])
+                                     (engine-query {:find [o] :where [[subj p o]]}))))
+                   subjects)
+        by-subject (reduce (fn [acc [[subj v] _]] (update acc subj (fnil conj []) v)) {} rows)]
+    (vec (mapcat (fn [bm]
+                   (if-let [vs (seq (get by-subject (get bm s)))]
+                     (map #(assoc bm o %) vs)
+                     [(assoc bm o nil)]))
+                 bind-maps))))
+
+(defn- bound-lookup-shape?
+  "One triple, a variable subject already bound in every binding, a literal
+  predicate, and a variable object nothing has bound yet."
+  [bind-maps patterns]
+  (and (= 1 (count patterns))
+       (let [[s p o] (first patterns)]
+         (and (symbol? s) (not (symbol? p)) (symbol? o)
+              (seq bind-maps)
+              (contains? (first bind-maps) s)
+              (not (contains? (first bind-maps) o))))))
+
+(defn- clause-vars [[s _ o]] (set (filter symbol? [s o])))
+
+(defn- connected-components
+  "Split a BGP into groups of clauses that share variables, transitively."
+  [clauses]
+  (reduce (fn [groups clause]
+            (let [vs (clause-vars clause)
+                  [touching separate] ((juxt filter remove)
+                                       (fn [g] (seq (kotoba.lang.coll/intersection vs (:vars g)))) groups)]
+              (conj (vec separate)
+                    {:vars (into vs (mapcat :vars touching))
+                     :clauses (into [clause] (mapcat :clauses touching))})))
+          [] clauses))
+
+(defn- component-score
+  "Planner score for choosing the next disconnected BGP component.
+
+  Existing bindings dominate because substituting them turns a broad scan into
+  keyed lookups.  With no bindings, literal terms are the only selectivity
+  signal available without engine statistics; more clauses are the stable
+  final tie-breaker.  Keeping this heuristic here makes the choice explicit and
+  replaceable when the engine exposes cardinality estimates."
+  [bound {:keys [vars clauses]}]
+  [(count (kotoba.lang.coll/intersection bound vars))
+   (reduce (fn [score [s p o]]
+             (+ score
+                (if (symbol? s) 0 10)
+                (cond
+                  (symbol? o) 0
+                  (= p ":label") 0
+                  (or (= p ":id") (str/ends-with? (str p) "/id")) 10
+                  :else 2)))
+           0 clauses)
+   (- (count clauses))])
+
+(defn- pick-component [bound components]
+  (last (sort-by #(component-score bound %) components)))
+
+(defn- natural-join
+  "Hash join two bind-map seqs on the variables they share. With no shared
+  variable this is a cross product, which is the correct answer for a genuinely
+  disconnected query and a disaster for one that is only disconnected because a
+  path has not been expanded yet -- hence the ordering in `solve-base`."
+  [left right]
+  (if (empty? left)
+    right
+    (let [shared (vec (kotoba.lang.coll/intersection (set (keys (first left))) (set (keys (first right)))))
+          idx (group-by #(mapv % shared) right)]
+      (vec (mapcat (fn [l] (map #(merge l %) (get idx (mapv l shared)))) left)))))
+
+(def ^:private component-pushdown-limit
+  "Above this many distinct shared-variable tuples, push nothing and materialise
+  the component once. One selective query per tuple beats one broad scan only
+  while the tuples are few; past that the broad scan is read once and the keyed
+  form reads most of it in pieces -- the same trade the engine makes for its own
+  hash join, and the same reason it defaults to the keyed path when it has no
+  estimate."
+  512)
+
+(defn- solve-component
+  "Rows for one BGP component, with the bindings already in hand substituted in
+  where they fit.
+
+  Without this the component is solved against the whole dataset and only then
+  joined. Measured 2026-08-13 on LDBC SF-0.1: Interactive Short 6 spent its time
+  materialising every forum-contains-post-moderated-by-person row in the
+  dataset, to keep the one whose post the path had already identified."
+  [engine-query bind-maps {:keys [clauses]}]
+  (let [vars (pattern-vars clauses)
+        solve-all (fn [] (rows->maps vars (engine-query {:find vars :where clauses})))]
+    (if (empty? bind-maps)
+      (solve-all)
+      (let [bound (set (keys (first bind-maps)))
+            shared (vec (kotoba.lang.coll/intersection bound (set vars)))
+            tuples (when (seq shared) (distinct (map #(mapv % shared) bind-maps)))]
+        (if (or (empty? shared) (> (count tuples) component-pushdown-limit))
+          (solve-all)
+          (vec (mapcat (fn [tuple]
+                         (let [sub (zipmap shared tuple)
+                               clauses' (mapv (fn [c] (mapv #(get sub % %) c)) clauses)
+                               vars' (pattern-vars clauses')]
+                           ;; The substituted variables are gone from the
+                           ;; clauses, so they are gone from the rows too --
+                           ;; merge them back or the join loses them.
+                           (map #(merge sub %)
+                                (rows->maps vars' (engine-query {:find vars' :where clauses'})))))
+                       tuples)))))))
+
+(defn- solve-base
+  "Solve the BGP and expand the paths, INTERLEAVED, pushing bindings into each
+  component as it is taken.
+
+  The previous order solved the whole BGP first and then expanded paths. When a
+  path is the only thing connecting two parts of the pattern -- LDBC Interactive
+  Short 6 is exactly this shape, `(m {id: $id})-[:REPLY_OF*0..]->(p:Post)` joined
+  to a forum and its moderator -- the BGP alone is disconnected, so solving it
+  first produces the cross product of both halves before the path can prune it.
+  Measured 2026-08-13 on LDBC SF-0.1: IS 6 returned 135,701 rows for a query
+  whose correct answer is one row, and took 8.2 s to do it.
+
+  Components are solved in an order that keeps them connected: a component is
+  taken when it shares a variable with what is already bound, and a path is
+  expanded as soon as its `:from` is bound."
+  ([engine-query where paths adjacency]
+   (solve-base engine-query where paths adjacency []))
+  ([engine-query where paths adjacency seed-bind-maps]
+   ;; A path-free BGP belongs in one engine query. kotobase-peer's query
+   ;; planner measures visible clause cardinalities (or consumes fresh scoped
+   ;; materialized statistics), cost-orders the clauses, and forwards those
+   ;; estimates to the join strategy. Splitting disconnected components here
+   ;; used to hide the whole BGP from that planner and replace its statistics
+   ;; with this layer's literal-count heuristic.
+   (if (and (empty? paths) (empty? seed-bind-maps))
+     (let [vars (pattern-vars where)]
+       (rows->maps vars (engine-query {:find vars :where where})))
+     (let [components (connected-components where)]
+      (loop [bind-maps (vec seed-bind-maps) pending (vec components) remaining-paths (vec paths)]
+      (let [bound (if (seq bind-maps) (set (keys (first bind-maps))) #{})
+            ready-path (first (filter #(contains? bound (:from %)) remaining-paths))]
+        (cond
+          ready-path
+          (recur (expand-path bind-maps ready-path adjacency) pending
+                 (vec (remove #{ready-path} remaining-paths)))
+
+          (empty? pending)
+          (reduce (fn [bms p] (expand-path bms p adjacency)) bind-maps remaining-paths)
+
+          :else
+          (let [connected (filter #(seq (kotoba.lang.coll/intersection bound (:vars %))) pending)
+                candidates (or (seq connected) (seq pending))
+                pick (pick-component bound candidates)
+                rows (solve-component engine-query bind-maps pick)]
+            (recur (natural-join bind-maps rows)
+                   (vec (remove #{pick} pending))
+                   remaining-paths)))))))))
+
+(defn- optional-vars [patterns paths]
+  (vec (distinct
+        (concat (pattern-vars patterns)
+                (mapcat (fn [{:keys [from to rel-var]}]
+                          (filter symbol? [from to rel-var]))
+                        paths)))))
+
+(defn- optional-join [engine-query bind-maps opt-patterns opt-paths adjacency]
+  (cond
+    ;; Nothing to left-join onto. The general path would still run the OPTIONAL
+    ;; block as an independent query -- scanning the attribute across the whole
+    ;; dataset to produce rows that are then joined against nothing. Measured
+    ;; 2026-08-13: a query whose base pattern matched nothing spent minutes here
+    ;; before returning the empty answer it already had.
+    (empty? bind-maps) bind-maps
+    :else
+    (if (and (empty? opt-paths) (bound-lookup-shape? bind-maps opt-patterns))
+      (bound-lookup-optional engine-query bind-maps opt-patterns)
+      ;; Solve the complete OPTIONAL group with the left-hand bindings already
+      ;; available. `solve-base` interleaves path expansion and BGP components,
+      ;; so a variable-length path can bind a later component without producing
+      ;; a cross product. Only after that do we left-join and nil-fill misses.
+      (let [opt-vars (optional-vars opt-patterns opt-paths)
+            matched (solve-base engine-query opt-patterns opt-paths adjacency bind-maps)
+            opt-rows (mapv #(mapv % opt-vars) matched)]
+        (left-join bind-maps opt-vars opt-rows)))))
+
+(defn- comparable-value [s]
+  (if (nil? s)
+    nil
+    (let [n #?(:clj (try (Double/parseDouble s) (catch Exception _ nil))
+               :cljs (let [x (js/parseFloat s)]
+                       (when (and (not (js/isNaN x))
+                                  (re-matches #"-?[0-9]+(?:\.[0-9]+)?" s))
+                         x)))]
+      (or n s))))
+
+(defn- filter-pred [{:keys [var op value]}]
+  (fn [bm]
+    (let [l (comparable-value (get bm var))
+          r (comparable-value value)]
+      (cond
+        (nil? l) false
+        (and (number? l) (number? r))
+        (case op := (== l r) :not= (not (== l r))
+              :< (< l r) :<= (<= l r) :> (> l r) :>= (>= l r))
+        :else
+        (let [c (compare (str (get bm var)) (str value))]
+          (case op := (zero? c) :not= (not (zero? c))
+                :< (neg? c) :<= (not (pos? c)) :> (pos? c) :>= (not (neg? c))))))))
+
+(defn- predicate-value [bm {:keys [op var cmp value args arg]}]
+  (case op
+    :cmp ((filter-pred {:var var :op cmp :value value}) bm)
+    :and (every? #(predicate-value bm %) args)
+    :or (boolean (some #(predicate-value bm %) args))
+    :not (not (predicate-value bm arg))
+    false))
+
+(defn- agg-fold [{:keys [agg var]} bms]
+  (let [vals (keep #(get % var) bms)
+        nums (keep #(let [v (comparable-value %)] (when (number? v) v)) vals)]
+    (case agg
+      :count (count vals)
+      :sum (reduce + 0 nums)
+      :min (when (seq nums) (reduce min nums))
+      :max (when (seq nums) (reduce max nums))
+      :avg (when (seq nums) (/ (reduce + 0.0 nums) (count nums))))))
+
+(defn- order-and-limit [rows find-keys order-by skip limit]
+  (let [rows
+        (if (seq order-by)
+          (let [idx-of (fn [v] (let [i (.indexOf find-keys v)]
+                                 (when (neg? i) (throw (ex-info "ORDER BY var not projected" {:var v})))
+                                 i))
+                specs (mapv (fn [{:keys [var dir cast]}] [(idx-of var) (or dir :asc) cast]) order-by)
+                ;; A recorded ORDER BY cast is applied here. `comparable-value`
+                ;; already promotes numeric-looking strings, so :tointeger is
+                ;; usually a no-op -- but it is applied explicitly so a
+                ;; non-numeric value sorts as nil rather than as text.
+                keyfn (fn [row] (mapv (fn [[i _ cast]]
+                                        (let [v (comparable-value (nth row i))]
+                                          (if (= :tointeger cast)
+                                            (when (number? v) v)
+                                            v)))
+                                      specs))
+                cmp (fn [ka kb]
+                      (loop [n 0]
+                        (if (= n (count specs))
+                          0
+                          (let [[_ dir _] (nth specs n)
+                                a (nth ka n) b (nth kb n)
+                                c (cond (and (number? a) (number? b)) (compare a b)
+                                        :else (compare (str a) (str b)))
+                                c (if (= dir :desc) (- c) c)]
+                            (if (zero? c) (recur (inc n) ) c)))))]
+            (vec (sort-by keyfn cmp rows)))
+          (vec rows))]
+    (cond->> rows
+      skip (drop skip)
+      limit (take limit)
+      true vec)))
+
+(defn- pushable?
+  "True iff the whole query can be answered by ONE engine query: no
+  OPTIONAL, every filter =/!=, every aggregate count/count-distinct, and
+  (when aggregating) GROUP BY exactly the bare find vars -- the engine's
+  implicit group-by is by the non-aggregate find columns, so a GROUP BY
+  that differs must stay a post-pass."
+  [{:keys [optionals filters find group-by distinct renames predicate]}]
+  (and (empty? optionals)
+       (nil? predicate)
+       (not distinct)
+       (empty? renames)
+       (every? #(#{:= :not=} (:op %)) filters)
+       (every? (fn [item] (or (symbol? item) (#{:count :count-distinct} (:agg item)))) find)
+       (let [aggregating? (some map? find)
+             bare (set (filter symbol? find))]
+         (or (not aggregating?)
+             (= (set group-by) bare)
+             (and (empty? group-by) (empty? bare))))))
+
+(defn- filter->clause [{:keys [var op value]}]
+  ;; engine query-fns whitelist: '= and 'not= compare with clojure =/not=,
+  ;; correct for wire-string values.
+  [(list (if (= op :=) '= 'not=) var value)])
+
+(defn- find->engine-find [item]
+  (if (map? item)
+    (list (if (= (:agg item) :count) 'count 'count-distinct) (:var item))
+    item))
+
+(defn- execute-pushed
+  "Single-engine-query path (see `pushable?`). Aggregates + =/!= filters go
+  INTO the engine query; only ORDER BY / LIMIT remain as a post-pass over
+  the (already grouped/counted) result."
+  [engine-query {:keys [find where filters order-by skip limit]}]
+  (let [engine-find (mapv find->engine-find find)
+        clauses (into (vec where) (map filter->clause filters))
+        rows (engine-query {:find engine-find :where clauses})
+        find-keys (mapv (fn [item] (if (map? item) (:as item) item)) find)
+        rows (order-and-limit rows find-keys order-by skip limit)]
+    {:vars (mapv str find-keys) :rows rows}))
+
+(defn execute
+  "engine-query: (fn [{:find [...] :where [...]}]) -> seq of tuples.
+  Returns {:vars [...] :rows [[...]...]} after UNION/OPTIONAL/FILTER/
+  aggregation/ORDER BY.
+
+  `adjacency`: (fn [attr node both?]) -> seq of neighbours, required only when
+  the compiled query carries `:paths`. Absent, a `:paths` query fails rather
+  than silently returning the zero-hop answer."
+  ([engine-query compiled] (execute engine-query compiled nil))
+  ([engine-query {:keys [unions paths optional-paths] :as compiled} adjacency]
+   (assert-executable! compiled)
+   (if-let [[first-stage second-stage] (:pipeline compiled)]
+     (let [first-result (execute engine-query first-stage adjacency)
+           first-keys (mapv (fn [item] (if (map? item) (:as item) item))
+                            (:find first-stage))
+           seeds (rows->maps first-keys (:rows first-result))]
+       (when (and (or (seq (:paths second-stage))
+                      (some seq (:optional-paths second-stage)))
+                  (nil? adjacency))
+         (throw (ex-info "compiled query has variable-length or undirected paths but no adjacency fn was supplied"
+                         {:kotobase/error :adjacency-required})))
+       (execute-post-pass engine-query second-stage adjacency seeds))
+     (do
+       (when (and (or (seq paths) (some seq optional-paths)) (nil? adjacency))
+         (throw (ex-info "compiled query has variable-length or undirected paths but no adjacency fn was supplied"
+                         {:kotobase/error :adjacency-required})))
+       (if (and (pushable? compiled) (empty? unions) (empty? paths))
+         (execute-pushed engine-query compiled)
+         (execute-post-pass engine-query compiled adjacency))))))
+
+(defn- execute-post-pass
+  ([engine-query compiled adjacency]
+   (execute-post-pass engine-query compiled adjacency []))
+  ([engine-query {:keys [find where unions optionals optional-paths filters group-by
+                         order-by skip limit paths renames distinct predicate]} adjacency seed-bind-maps]
+  (let [bind-maps
+        (if (seq unions)
+          (let [all-union-vars (vec (distinct (mapcat pattern-vars unions)))]
+            (vec (mapcat (fn [branch]
+                           (let [bvars (pattern-vars branch)
+                                 nil-fill (zipmap (remove (set bvars) all-union-vars) (repeat nil))]
+                             (map #(merge nil-fill %) (rows->maps bvars (engine-query {:find bvars :where branch})))))
+                         unions)))
+          (solve-base engine-query where paths adjacency seed-bind-maps))
+        ;; A union branch still expands its paths afterwards; only the plain
+        ;; BGP path gets the interleaved treatment.
+        bind-maps (if (seq unions)
+                    (reduce (fn [bms p] (expand-path bms p adjacency)) bind-maps paths)
+                    bind-maps)
+        bind-maps (reduce-kv
+                   (fn [bms idx opt-patterns]
+                     (optional-join engine-query bms opt-patterns
+                                    (get optional-paths idx []) adjacency))
+                   bind-maps (vec optionals))
+        ;; Renames run AFTER the OPTIONAL projection blocks: `RETURN n.attr AS x`
+        ;; is bound by one of those blocks, so renaming first copies a nil.
+        bind-maps (reduce (fn [bms [from to]]
+                            (mapv (fn [bm] (assoc bm to (get bm from))) bms))
+                          bind-maps (or renames []))
+        bind-maps (reduce (fn [bms f] (filterv (filter-pred f) bms)) bind-maps filters)
+        bind-maps (if predicate (filterv #(predicate-value % predicate) bind-maps) bind-maps)
+        bind-maps (reduce (fn [bms item]
+                            (mapv (fn [bm] (assoc bm (:as item) (apply-case (:case item) bm))) bms))
+                          bind-maps (filterv :case find))
+        ;; Whitelisted scalar functions, computed per row before projection.
+        bind-maps (reduce (fn [bms item]
+                            (mapv (fn [bm] (assoc bm (:as item) (apply-fn item bm))) bms))
+                          bind-maps (filterv :fn find))
+        find (mapv (fn [item] (if (or (:fn item) (:case item)) (:as item) item)) find)
+        aggregate? (some :agg find)
+        rows
+        (cond
+          aggregate?
+          (let [groups (if (seq group-by)
+                         (vals (clojure.core/group-by #(mapv % group-by) bind-maps))
+                         [bind-maps])]
+            (mapv (fn [g]
+                    (mapv (fn [item]
+                            (if (map? item)
+                              (agg-fold item g)
+                              (get (first g) item)))
+                          find))
+                  groups))
+          :else (mapv (fn [bm] (mapv #(get bm %) find)) bind-maps))
+        rows (if distinct (vec (clojure.core/distinct rows)) rows)
+        find-keys (mapv (fn [item] (if (map? item) (:as item) item)) find)
+        rows (order-and-limit rows find-keys order-by skip limit)]
+    {:vars (mapv str find-keys)
+     :rows rows})))
