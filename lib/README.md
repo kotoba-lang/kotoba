@@ -112,6 +112,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.sftp` | `org.ietf.sftp/src` | `kotobase.sftp.fs`, `kotobase.sftp.transport.sftp-subsystem`, `kotobase.sftp.transport.ssh`, `kotobase.sftp.transport.wire` (an external specification, publisher ietf.org) |
 | `org.ietf.smtp` | `org.ietf.smtp/src` | `smtp.client`, `smtp.protocol`, `smtp.transport` (an external specification, publisher ietf.org) |
 | `org.ietf.webdav` | `org.ietf.webdav/src` | `kotobase.protocols.http`, `kotobase.protocols.webdav` (an external specification, publisher ietf.org) |
+| `kotoba.unspsc` | `kotoba.unspsc/src` | `kotoba.unspsc`, `kotoba.unspsc.embedded`, `kotoba.unspsc.product` (Kotoba project library) |
 | `kotoba.uikit` | `kotoba.uikit/src` | `uikit.core` (Kotoba project library) |
 | `kotoba.torch` | `kotoba.torch/src` | `torch.checkpoint`, `torch.continuous`, `torch.continuous-ollama`, `torch.core` (Kotoba project library) |
 | `kotoba.tana` | `kotoba.tana/src` | `tana.aggregate`, `tana.member`, `tana.plan`, `tana.shard` (Kotoba project library) |
