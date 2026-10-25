@@ -1,0 +1,205 @@
+(ns shader-test
+  "Safety gate for adopting kami.wgsl in the live renderer. The shader runs via WebGPU, which can't
+   be screenshot headlessly, so we instead prove the GENERATED fragment is token-equivalent to the
+   hand-written WGSL that shipped: identical token stream once whitespace and (grouping/call)
+   parentheses are stripped. If kami.shaders/lit-fs ever drifts from the lighting that was verified
+   on-screen, this fails — so the EDN can drive the renderer without a visual re-check."
+  (:require [kotoba.test :refer [deftest is]]
+            [kotoba.lang.text :as str]
+            [kami.shaders :as sh]))
+
+;; Golden fragment for the current production lighting contract.
+(def golden-fs
+  "@fragment
+fn fs(i: VO) -> @location(0) vec4<f32> {
+  let N = normalize(i.n);
+  let L = normalize(-g.sun_dir.xyz);
+  let eye = vec3<f32>(g.sun_dir.w, g.sun_col.w, g.sky.w);
+  let V = normalize(eye - i.wpos);
+  let H = normalize(L + V);
+  let ndl = max(dot(N, L), 0.0);
+  let metallic  = clamp(i.mat.x, 0.0, 1.0);
+  let rough     = clamp(i.mat.y, 0.04, 1.0);
+  let emissive  = i.mat.z;
+  let amb = mix(g.light_a.rgb, g.sky.rgb*g.light_a.w, N.y*0.5+0.5);
+  let shininess = mix(g.light_c.x, g.light_c.y, 1.0 - rough);
+  let specStr   = mix(g.light_b.x, g.light_b.y, metallic);
+  let specTint  = mix(vec3<f32>(1.0), i.col, metallic);
+  let spec = pow(max(dot(N, H), 0.0), shininess) * specStr;
+  let rim  = pow(1.0 - max(dot(N, V), 0.0), g.light_b.w) * g.light_b.z;
+  let sh = shadow(i.wpos, ndl);
+  var c = i.col * (amb + ndl * g.sun_col.rgb * g.light_c.z * (1.0 - metallic*g.light_c.w) * sh)
+        + specTint * g.sun_col.rgb * spec * sh
+        + g.sky.rgb * rim
+        + i.col * emissive;
+  c = clamp((c * (2.51*c + vec3<f32>(0.03))) /
+            (c * (2.43*c + vec3<f32>(0.59)) + vec3<f32>(0.14)),
+            vec3<f32>(0.0), vec3<f32>(1.0));
+  c = pow(c, vec3<f32>(1.0/g.light_d.x));
+  return vec4<f32>(c, 1.0);
+}")
+
+;; token stream sans whitespace and parens (call + grouping). Equal canon ⇒ same operations/operands
+;; in the same order ⇒ functionally identical given kami.wgsl's tested operator precedence.
+(defn- canon [s] (str/replace s #"[\s()]" ""))
+
+(deftest lit-fs-matches-the-production-contract
+  (is (= (canon golden-fs) (canon (sh/lit-fs)))
+      "kami.wgsl-generated fragment is token-equivalent to the production WGSL contract"))
+
+;; the rest of the shipped shader: uniforms, shadow-map bindings, PCF shadow fn, varyings, vertex.
+(def golden-preamble
+  "struct G { vp: mat4x4<f32>, sun_dir: vec4<f32>, sun_col: vec4<f32>, sky: vec4<f32>, light_vp: mat4x4<f32>,
+           light_a: vec4<f32>, light_b: vec4<f32>, light_c: vec4<f32>, light_d: vec4<f32> };
+@group(0) @binding(0) var<uniform> g: G;
+@group(0) @binding(1) var shadowMap: texture_depth_2d;
+@group(0) @binding(2) var shadowSamp: sampler_comparison;
+fn shadow(wpos: vec3<f32>, ndl: f32) -> f32 {
+  let lc = g.light_vp * vec4<f32>(wpos, 1.0);
+  let ndc = lc.xyz / lc.w;
+  let uv = vec2<f32>(ndc.x*0.5+0.5, 0.5-ndc.y*0.5);
+  if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || ndc.z > 1.0) { return 1.0; }
+  let bias = max(g.light_d.y*(1.0-ndl), g.light_d.z);
+  let texel = g.light_d.w;
+  var lit = 0.0;
+  for (var dx = -1; dx <= 1; dx++) {
+    for (var dy = -1; dy <= 1; dy++) {
+      lit += textureSampleCompareLevel(shadowMap, shadowSamp, uv + vec2<f32>(f32(dx),f32(dy))*texel, ndc.z - bias);
+    }
+  }
+  return lit/9.0;
+}
+struct VO { @builtin(position) clip: vec4<f32>, @location(0) n: vec3<f32>, @location(1) col: vec3<f32>, @location(2) wpos: vec3<f32>, @location(3) mat: vec3<f32> };
+@vertex
+fn vs(@location(0) pos: vec3<f32>, @location(1) normal: vec3<f32>,
+      @location(2) m0: vec4<f32>, @location(3) m1: vec4<f32>, @location(4) m2: vec4<f32>, @location(5) m3: vec4<f32>,
+      @location(6) color: vec4<f32>, @location(7) material: vec4<f32>) -> VO {
+  let model = mat4x4<f32>(m0, m1, m2, m3);
+  let world = model * vec4<f32>(pos, 1.0);
+  var o: VO; o.clip = g.vp * world;
+  o.n = normalize((model * vec4<f32>(normal, 0.0)).xyz); o.col = color.rgb; o.wpos = world.xyz;
+  o.mat = material.xyz; return o;
+}")
+
+(deftest lit-shader-matches-the-production-contract
+  (is (= (canon (str golden-preamble "\n" golden-fs)) (canon (sh/lit-shader)))
+      "the complete generated shader is token-equivalent to the production WGSL contract"))
+
+;; the depth-only shadow pass (vertex from the sun's POV).
+(def golden-shadow
+  "struct G { vp: mat4x4<f32>, sun_dir: vec4<f32>, sun_col: vec4<f32>, sky: vec4<f32>, light_vp: mat4x4<f32> };
+@group(0) @binding(0) var<uniform> g: G;
+@vertex
+fn vs(@location(0) pos: vec3<f32>, @location(1) normal: vec3<f32>,
+      @location(2) m0: vec4<f32>, @location(3) m1: vec4<f32>, @location(4) m2: vec4<f32>, @location(5) m3: vec4<f32>,
+      @location(6) color: vec4<f32>, @location(7) material: vec4<f32>) -> @builtin(position) vec4<f32> {
+  let model = mat4x4<f32>(m0, m1, m2, m3);
+  return g.light_vp * model * vec4<f32>(pos, 1.0);
+}")
+
+(deftest shadow-shader-matches-the-shipped-shader
+  (is (= (canon golden-shadow) (canon (sh/shadow-shader)))
+      "the kami.wgsl-generated depth pass is token-equivalent to the shipped SHADOW-WGSL"))
+
+(deftest cascaded-shadow-contract
+  (let [lit (sh/cascaded-lit-shader)]
+    (is (str/includes? lit "texture_depth_2d_array"))
+    (is (str/includes? lit "shadow_splits"))
+    (is (str/includes? lit "textureSampleCompareLevel")))
+  (doseq [cascade (range 4)]
+    (let [depth (sh/cascaded-shadow-shader cascade)]
+      (is (str/includes? depth (str "g.light_vp" cascade))))))
+
+(deftest hdr-bloom-contract
+  (let [hdr (sh/cascaded-hdr-shader)
+        bloom (sh/bloom-shader)
+        composite (sh/hdr-composite-shader)]
+    (is (not (str/includes? hdr "2.51")) "scene shader keeps linear HDR values")
+    (is (str/includes? bloom "smoothstep(0.8, 1.3"))
+    (is (str/includes? bloom "sum / 16.0"))
+    (is (str/includes? composite "2.51"))
+    (is (str/includes? composite "bloomTex"))
+    (is (str/includes? composite "aoTex"))))
+
+(deftest ssao-contact-contract
+  (let [ao (sh/ssao-shader)
+        adaptive (sh/hdr-ao-composite-shader)]
+    (is (str/includes? ao "texture_depth_2d"))
+    (is (str/includes? ao "linearDepth"))
+    (is (str/includes? ao "depthGradient"))
+    (is (str/includes? ao "expectedDepth"))
+    (is (str/includes? ao "i < 12"))
+    (is (str/includes? ao "control: vec4<f32>"))
+    (is (str/includes? ao "clamp(params.control.x, 1.0, 12.0)"))
+    (is (str/includes? ao "(fi + 0.5) / clamp(params.control.x"))
+    (is (str/includes? ao "2.39996323"))
+    (is (str/includes? adaptive "aoTex"))
+    (is (= ao (sh/ssao-shader)))))
+
+(deftest atmosphere-cloud-fullscreen-contract
+  (let [wgsl (sh/atmosphere-cloud-shader)]
+    (is (str/includes? wgsl "struct Atmosphere"))
+    (is (str/includes? wgsl "@binding(0) var<uniform> atmosphere"))
+    (is (str/includes? wgsl "valueNoise"))
+    (is (str/includes? wgsl "cloud_seed_pad"))
+    (is (= wgsl (sh/atmosphere-cloud-shader)))))
+
+(deftest textured-pbr-contract
+  (let [wgsl (sh/cascaded-textured-hdr-shader)
+        direct (sh/cascaded-textured-lit-shader)]
+    (is (str/includes? wgsl "@binding(3) var albedoTex: texture_2d_array<f32>"))
+    (is (str/includes? wgsl "@binding(4) var normalTex: texture_2d_array<f32>"))
+    (is (str/includes? wgsl "@binding(5) var metallicRoughnessTex: texture_2d_array<f32>"))
+    (is (str/includes? wgsl "let materialLayer = i32(max((i.mat.w - 1.0), 0.0));"))
+    (is (str/includes? wgsl "textureSample(albedoTex, materialSamp, i.uv, materialLayer)"))
+    (is (str/includes? wgsl "@binding(7) var irradianceTex: texture_cube<f32>"))
+    (is (str/includes? wgsl "@binding(8) var prefilteredSpecularTex: texture_cube<f32>"))
+    (is (str/includes? wgsl "@binding(9) var brdfLut: texture_2d<f32>"))
+    (is (str/includes? wgsl "textureNumLevels(prefilteredSpecularTex)"))
+    (is (str/includes? wgsl "textureSampleLevel(prefilteredSpecularTex"))
+    (is (str/includes? wgsl "let iblSpecular ="))
+    (is (str/includes? wgsl "let normalWorld = normalize("))
+    (is (str/includes? wgsl "dot(m1.xyz, m1.xyz)"))
+    (is (str/includes? wgsl "o.n = normalWorld;"))
+    (is (str/includes? wgsl "@location(8) uv: vec2<f32>"))
+    (is (str/includes? wgsl "@location(10) uvTransform: vec4<f32>"))
+    (is (str/includes? wgsl "@location(11) biomeWeights: vec3<f32>"))
+    (is (str/includes? wgsl "let biomeSum = (i.biome.x + i.biome.y + i.biome.z);"))
+    (is (str/includes? wgsl "let biomeAlbedo ="))
+    (is (str/includes? wgsl "let biomeNormal ="))
+    (is (str/includes? wgsl "let biomeMr ="))
+    (is (str/includes? wgsl "@location(12) biomeLayerIndices: vec3<f32>"))
+    (is (str/includes? wgsl "let grassLayer = i32(max(i.biomeLayers.x, 0.0));"))
+    (doseq [texture ["albedoTex" "normalTex" "metallicRoughnessTex"]
+            layer ["grassLayer" "soilLayer" "rockLayer"]]
+      (is (str/includes? wgsl
+                         (str "textureSample(" texture ", materialSamp, i.uv, " layer ")"))))
+    (is (str/includes? wgsl "o.uv = ((uv * uvTransform.xy) + uvTransform.zw);"))
+    (is (str/includes? wgsl "cross(baseN, T)"))
+    (is (str/includes? wgsl "resolvedMr.g"))
+    (is (str/includes? wgsl "resolvedMr.b"))
+    (is (str/includes? wgsl "let D = (alpha2 / (3.14159265 * dDenom * dDenom));"))
+    (is (str/includes? wgsl "let F0 = mix(vec3<f32>(0.04), baseColor, metallic);"))
+    (is (str/includes? wgsl "let specular ="))
+    (is (not (str/includes? wgsl "shininess")))
+    (is (not (str/includes? wgsl "2.51")))
+    (is (str/includes? direct "2.51"))))
+
+(deftest foliage-cutout-and-wind-match-color-and-shadow-passes
+  (let [color (sh/cascaded-textured-hdr-shader)]
+    (is (str/includes? color "@location(13) foliage: vec4<f32>"))
+    (is (str/includes? color "let windWave = sin("))
+    (is (str/includes? color "discard;"))
+    (is (str/includes? color "albedoSample.a < i.foliage.x")))
+  (doseq [cascade (range 4)
+          :let [shadow (sh/cascaded-foliage-shadow-shader cascade)]]
+    (is (str/includes? shadow (str "g.light_vp" cascade)))
+    (is (str/includes? shadow "@binding(1) var albedoTex"))
+    (is (str/includes? shadow "let windWave = sin("))
+    (is (str/includes? shadow "discard;"))))
+
+(deftest foliage-wind-does-not-grow-the-established-cascade-uniform-abi
+  (is (not (str/includes? (sh/cascaded-lit-shader) "wind: vec4<f32>")))
+  (is (not (str/includes? (sh/cascaded-shadow-shader 0) "wind: vec4<f32>")))
+  (is (str/includes? (sh/cascaded-textured-hdr-shader) "wind: vec4<f32>"))
+  (is (str/includes? (sh/cascaded-foliage-shadow-shader 0) "wind: vec4<f32>")))
