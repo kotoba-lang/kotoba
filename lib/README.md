@@ -105,6 +105,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.snmp` | `org.ietf.snmp/src` | `snmp.message`, `snmp.pdu`, `snmp.types` (an external specification, publisher ietf.org) |
 | `org.apache.arrow` | `org.apache.arrow/src` | `arrow.build`, `arrow.decode`, `arrow.flatbuffers`, `arrow.ipc` (an external specification, publisher apache.org) |
 | `org.ietf.oauth2` | `org.ietf.oauth2/src` | `oauth2.core`, `oauth2.pkce` (an external specification, publisher ietf.org) |
+| `kotoba.kura` | `kotoba.kura/src` | `kura.audit`, `kura.hash`, `kura.kotoba-oracle`, `kura.manifest` (Kotoba project library) |
 | `kotoba.kotobaseProtocolCore` | `kotoba.kotobaseProtocolCore/src` | `kotobase.protocols.blocks`, `kotobase.protocols.cid`, `kotobase.protocols.hash`, `kotobase.protocols.http` (Kotoba project library) |
 | `kotoba.kotobaseBrowserWorker` | `kotoba.kotobaseBrowserWorker/src` | `kotobase.browser-worker.browser`, `kotobase.browser-worker.idb` (Kotoba project library) |
 | `kotoba.kotobaSelfhostContracts` | `kotoba.kotobaSelfhostContracts/src` | `kotoba.selfhost.analyzer`, `kotoba.selfhost.contracts`, `kotoba.selfhost.oracle` (Kotoba project library) |
