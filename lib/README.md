@@ -104,6 +104,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.radius` | `org.ietf.radius/src` | `radius.attribute`, `radius.auth`, `radius.bytes`, `radius.md5` (an external specification, publisher ietf.org) |
 | `org.ietf.snmp` | `org.ietf.snmp/src` | `snmp.message`, `snmp.pdu`, `snmp.types` (an external specification, publisher ietf.org) |
 | `org.apache.arrow` | `org.apache.arrow/src` | `arrow.build`, `arrow.decode`, `arrow.flatbuffers`, `arrow.ipc` (an external specification, publisher apache.org) |
+| `kotoba.srs` | `kotoba.srs/src` | `srs.core`, `srs.host`, `srs.lifecycle`, `srs.status` (Kotoba project library) |
 | `kotoba.okaimono` | `kotoba.okaimono/src` | `kotoba.okaimono`, `kotoba.okaimono.export`, `kotoba.okaimono.ui` (Kotoba project library) |
 | `kotoba.comSonyDualsense` | `kotoba.comSonyDualsense/src` | `kotoba.dualsense.crc32`, `kotoba.dualsense.input`, `kotoba.dualsense.output` (Kotoba project library) |
 | `kotoba.chIec61850` | `kotoba.chIec61850/src` | `iec61850.appdu`, `iec61850.data`, `iec61850.goose`, `iec61850.utctime` (Kotoba project library) |

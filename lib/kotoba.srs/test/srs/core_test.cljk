@@ -1,0 +1,139 @@
+(ns srs.core-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [srs.core :as srs]
+            [srs.time :as t]))
+
+(def t0 (t/civil->ms {:year 2024 :month 1 :day 15 :ms-of-day 0}))
+(defn d+ [n] (t/plus-days t0 n))
+
+(def reg (srs/empty-registry "com"))
+
+(defn- create! [registry nm registrar & {:as extra}]
+  (srs/execute registry
+               (merge {:command/kind :domain/create :command/name nm
+                       :command/registrar registrar
+                       :nameservers ["ns1.example.net"] :auth-info "hunter2"}
+                      extra)
+               t0))
+
+(deftest names-are-normalized-to-one-object
+  (let [r (:registry (create! reg "Example.COM." "reg-a"))]
+    (is (some? (srs/domain r "example.com")))
+    (is (some? (srs/domain r "EXAMPLE.com")))
+    (is (some? (srs/domain r "example.com.")))
+    (testing "so a second create under a different spelling is a duplicate"
+      (is (= 2302 (get-in (create! r "EXAMPLE.COM" "reg-b") [:error :error/code]))))))
+
+(deftest the-registry-refuses-names-outside-its-namespace
+  (is (= 2306 (get-in (create! reg "example.net" "reg-a") [:error :error/code])))
+  (is (= 2306 (get-in (create! reg "sub.example.com" "reg-a") [:error :error/code]))
+      "a third-level name belongs to the registrant's zone, not the registry")
+  (is (:ok? (create! reg "example.com" "reg-a"))))
+
+(deftest a-multi-label-suffix-registry-still-works
+  (let [jp (srs/empty-registry "co.jp")]
+    (is (srs/in-namespace? jp "example.co.jp"))
+    (is (not (srs/in-namespace? jp "a.example.co.jp")))
+    (is (not (srs/in-namespace? jp "example.jp")))))
+
+(deftest transforms-are-the-sponsoring-registrars-to-make
+  (let [r (:registry (create! reg "example.com" "reg-a"))]
+    (is (= 2201 (get-in (srs/execute r {:command/kind :domain/delete
+                                        :command/name "example.com"
+                                        :command/registrar "reg-b"} (d+ 10))
+                        [:error :error/code])))
+    (is (:ok? (srs/execute r {:command/kind :domain/delete
+                              :command/name "example.com"
+                              :command/registrar "reg-a"} (d+ 10))))
+    (testing "a nil registrar is the registry itself acting, and is allowed"
+      (is (:ok? (srs/execute r {:command/kind :domain/delete
+                                :command/name "example.com"} (d+ 10)))))))
+
+(deftest only-the-losing-registrar-may-approve-a-transfer
+  (let [r (:registry (create! reg "example.com" "reg-a"))
+        r (:registry (srs/execute r {:command/kind :domain/transfer-request
+                                     :command/name "example.com"
+                                     :command/registrar "reg-b"
+                                     :auth-info "hunter2"} (d+ 61)))]
+    (testing "the gaining registrar cannot approve its own request"
+      (is (= 2201 (get-in (srs/execute r {:command/kind :domain/transfer-approve
+                                          :command/name "example.com"
+                                          :command/registrar "reg-b"} (d+ 62))
+                          [:error :error/code]))))
+    (testing "nor can the losing registrar cancel it"
+      (is (= 2201 (get-in (srs/execute r {:command/kind :domain/transfer-cancel
+                                          :command/name "example.com"
+                                          :command/registrar "reg-a"} (d+ 62))
+                          [:error :error/code]))))
+    (testing "each side may do its own half"
+      (is (:ok? (srs/execute r {:command/kind :domain/transfer-approve
+                                :command/name "example.com"
+                                :command/registrar "reg-a"} (d+ 62))))
+      (is (:ok? (srs/execute r {:command/kind :domain/transfer-cancel
+                                :command/name "example.com"
+                                :command/registrar "reg-b"} (d+ 62)))))))
+
+(deftest a-failed-command-changes-nothing
+  (let [r (:registry (create! reg "example.com" "reg-a"))
+        bad (srs/execute r {:command/kind :domain/renew :command/name "example.com"
+                            :command/registrar "reg-a"
+                            :current-expires-at 999} (d+ 1))]
+    (is (false? (:ok? bad)))
+    (is (nil? (:registry bad)) "no partially-updated registry escapes")))
+
+(deftest unknown-and-missing-objects-are-distinguishable
+  (is (= 2303 (get-in (srs/execute reg {:command/kind :domain/renew
+                                        :command/name "nope.com"} t0)
+                      [:error :error/code])))
+  (is (= 2000 (get-in (srs/execute reg {:command/kind :domain/frobnicate
+                                        :command/name "example.com"} t0)
+                      [:error :error/code]))))
+
+(deftest execute-all-stops-at-the-first-failure-and-says-where
+  (let [r (srs/execute-all reg
+                           [{:command/kind :domain/create :command/name "a.com"
+                             :command/registrar "reg-a"}
+                            {:command/kind :domain/create :command/name "b.net"
+                             :command/registrar "reg-a"}
+                            {:command/kind :domain/create :command/name "c.com"
+                             :command/registrar "reg-a"}]
+                           t0)]
+    (is (false? (:ok? r)))
+    (is (= 1 (:failed-at r)))
+    (is (some? (srs/domain (:registry r) "a.com")))
+    (is (nil? (srs/domain (:registry r) "c.com")))))
+
+(deftest the-registry-sweep-advances-every-domain
+  (let [r (:registry (create! reg "a.com" "reg-a" :years 1))
+        r (:registry (create! r "b.com" "reg-a" :years 2))
+        swept (srs/advance r (t/plus-days (t/plus-years t0 1) 1))]
+    (is (= 1 (count (filter #(= :domain/auto-renewed (:event/kind %)) (:events swept)))))
+    (is (= "a.com" (:event/domain (first (:events swept)))))
+    (testing "running the same sweep again does nothing"
+      (is (empty? (:events (srs/advance (:registry swept)
+                                        (t/plus-days (t/plus-years t0 1) 1))))))))
+
+(deftest zone-records-exclude-everything-that-should-not-resolve
+  (let [r (:registry (create! reg "live.com" "reg-a"))
+        r (:registry (create! r "held.com" "reg-a"))
+        r (:registry (create! r "nons.com" "reg-a" :nameservers []))
+        r (:registry (srs/execute r {:command/kind :domain/update
+                                     :command/name "held.com" :command/registrar "reg-a"
+                                     :add-statuses [:clientHold]} (d+ 1)))
+        names (into #{} (map :name) (srs/zone-records r (d+ 1)))]
+    (is (= #{"live.com"} names))))
+
+(deftest info-projects-statuses-and-withholds-the-shared-secret
+  (let [r (:registry (create! reg "example.com" "reg-a"))
+        i (srs/info r "example.com" (d+ 1))]
+    (is (= #{:addPeriod} (:domain/statuses i)))
+    (is (not (contains? i :domain/auth-info))
+        "authInfo is the transfer secret; an info response must not carry it")))
+
+(deftest a-purged-name-is-available-again
+  (let [r (:registry (create! reg "example.com" "reg-a"))
+        r (:registry (srs/execute r {:command/kind :domain/delete
+                                     :command/name "example.com"
+                                     :command/registrar "reg-a"} (d+ 3)))]
+    (is (srs/available? r "example.com"))
+    (is (:ok? (create! r "example.com" "reg-b")))))

@@ -1,0 +1,221 @@
+(ns srs.lifecycle-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [srs.lifecycle :as lc]
+            [srs.status :as status]
+            [srs.time :as t]))
+
+(def t0 (t/civil->ms {:year 2024 :month 1 :day 15 :ms-of-day 0}))
+(defn d+ [n] (t/plus-days t0 n))
+(def policy lc/default-policy)
+
+(defn- created
+  ([] (created 1))
+  ([years]
+   (:domain (lc/create nil policy {:name "example.com" :registrar "reg-a"
+                                   :registrant "alice" :years years
+                                   :nameservers ["ns1.example.net"]
+                                   :auth-info "hunter2"}
+                       t0))))
+
+;; ── create ────────────────────────────────────────────────────────────────
+
+(deftest create-allocates-and-opens-the-add-grace-period
+  (let [r (lc/create nil policy {:name "example.com" :registrar "reg-a" :years 2
+                                 :nameservers ["ns1.example.net"]} t0)]
+    (is (:ok? r))
+    (is (= :active (get-in r [:domain :domain/phase])))
+    (is (= (t/plus-years t0 2) (get-in r [:domain :domain/expires-at])))
+    (is (lc/in-grace? (:domain r) :add (d+ 4)))
+    (is (not (lc/in-grace? (:domain r) :add (d+ 6))))
+    (is (= [:domain/created] (mapv :event/kind (:events r))))))
+
+(deftest create-refuses-an-existing-name-but-allows-a-purged-one
+  (let [d (created)]
+    (is (= 2302 (get-in (lc/create d policy {:name "example.com" :registrar "reg-b"} t0)
+                        [:error :error/code])))
+    (is (:ok? (lc/create (assoc d :domain/phase :purged) policy
+                         {:name "example.com" :registrar "reg-b"} t0)))))
+
+(deftest create-enforces-the-maximum-term
+  (is (= 2004 (get-in (lc/create nil policy {:name "e.com" :registrar "r" :years 11} t0)
+                      [:error :error/code])))
+  (is (:ok? (lc/create nil policy {:name "e.com" :registrar "r" :years 10} t0))))
+
+;; ── renew ─────────────────────────────────────────────────────────────────
+
+(deftest renew-requires-the-current-expiry-to-match
+  (let [d (created)
+        exp (:domain/expires-at d)]
+    (testing "a stale curExpDate is refused — this is the double-renew guard"
+      (is (= 2306 (get-in (lc/renew d policy {:years 1 :current-expires-at (d+ 999)} (d+ 10))
+                          [:error :error/code]))))
+    (testing "the matching one goes through"
+      (let [r (lc/renew d policy {:years 1 :current-expires-at exp} (d+ 10))]
+        (is (:ok? r))
+        (is (= (t/plus-years exp 1) (get-in r [:domain :domain/expires-at])))
+        (is (lc/in-grace? (:domain r) :renew (d+ 12)))))))
+
+(deftest renew-cannot-exceed-ten-years-ahead-of-now
+  (let [d (created 10)]
+    (is (= 2306 (get-in (lc/renew d policy {:years 1} (d+ 1)) [:error :error/code])))))
+
+(deftest renew-is-blocked-by-a-renew-prohibition
+  (let [d (assoc (created) :domain/statuses #{:clientRenewProhibited})
+        r (lc/renew d policy {:years 1} (d+ 10))]
+    (is (= 2304 (get-in r [:error :error/code])))
+    (is (= [:clientRenewProhibited] (get-in r [:error :error/statuses])))))
+
+;; ── delete / RGP ──────────────────────────────────────────────────────────
+
+(deftest delete-inside-the-add-grace-period-purges-immediately-and-refunds
+  (let [r (lc/delete (created) policy (d+ 3))]
+    (is (:ok? r))
+    (is (= :purged (get-in r [:domain :domain/phase])))
+    (is (= [:domain/deleted :domain/purged] (mapv :event/kind (:events r))))
+    (is (true? (:event/refundable? (first (:events r)))))
+    (is (= :add (:event/within-grace (first (:events r)))))))
+
+(deftest delete-outside-the-add-grace-period-enters-redemption
+  (let [r (lc/delete (created) policy (d+ 10))]
+    (is (= :redemption (get-in r [:domain :domain/phase])))
+    (is (false? (:event/refundable? (first (:events r)))))
+    (testing "the name stops resolving the moment it enters redemption"
+      (is (not (status/allows? (lc/effective-statuses (:domain r) (d+ 10)) :publish))))))
+
+(deftest the-full-redemption-sequence-runs-on-dates-alone
+  (let [d (:domain (lc/delete (created) policy (d+ 10)))
+        ;; 30 days redemption, then 5 days pendingDelete.
+        mid (lc/advance d policy (d+ 20))
+        after-redemption (lc/advance d policy (d+ 41))
+        after-purge (lc/advance d policy (d+ 46))]
+    (is (= :redemption (get-in mid [:domain :domain/phase])) "still redeemable at day 20")
+    (is (= :pending-delete (get-in after-redemption [:domain :domain/phase])))
+    (is (= :purged (get-in after-purge [:domain :domain/phase])))
+    (testing "a domain nobody looked at for a year still reports every step"
+      (is (= [:domain/pending-delete :domain/purged]
+             (mapv :event/kind (:events after-purge)))))
+    (testing "advance is idempotent for the same instant"
+      (is (= (:domain after-purge)
+             (:domain (lc/advance (:domain after-purge) policy (d+ 46))))))))
+
+(deftest restore-needs-a-report-and-expires-without-one
+  (let [d (:domain (lc/delete (created) policy (d+ 10)))
+        req (lc/restore d policy (d+ 20))]
+    (is (:ok? req))
+    (is (= :pending-restore (get-in req [:domain :domain/phase])))
+    (testing "the report brings it back"
+      (let [done (lc/restore-report (:domain req) policy (d+ 21))]
+        (is (= :active (get-in done [:domain :domain/phase])))))
+    (testing "no report inside 7 days and it falls back to redemption"
+      (let [lapsed (lc/advance (:domain req) policy (d+ 28))]
+        (is (= :redemption (get-in lapsed [:domain :domain/phase])))
+        (is (= [:domain/restore-expired] (mapv :event/kind (:events lapsed))))))
+    (testing "restore is refused outside redemption"
+      (is (= 2304 (get-in (lc/restore (created) policy (d+ 1)) [:error :error/code]))))))
+
+;; ── auto-renew ────────────────────────────────────────────────────────────
+
+(deftest expiry-auto-renews-and-opens-the-45-day-grace
+  (let [d (created 1)
+        after (lc/advance d policy (t/plus-days (:domain/expires-at d) 1))]
+    (is (= [:domain/auto-renewed] (mapv :event/kind (:events after))))
+    (is (= (t/plus-years (:domain/expires-at d) 1) (get-in after [:domain :domain/expires-at])))
+    (testing "a delete inside the auto-renew grace is refundable"
+      (let [del (lc/delete (:domain after) policy (t/plus-days (:domain/expires-at d) 10))]
+        (is (true? (:event/refundable? (first (:events del)))))
+        (is (= :auto-renew (:event/within-grace (first (:events del)))))))
+    (testing "and outside it is not"
+      (let [del (lc/delete (:domain after) policy (t/plus-days (:domain/expires-at d) 50))]
+        (is (false? (:event/refundable? (first (:events del)))))))))
+
+(deftest a-decade-of-neglect-produces-one-auto-renewal-per-year
+  (let [d (created 1)
+        after (lc/advance d policy (t/plus-years t0 6))]
+    (is (= 6 (count (filter #(= :domain/auto-renewed (:event/kind %)) (:events after)))))
+    (is (= (t/plus-years t0 7) (get-in after [:domain :domain/expires-at])))))
+
+;; ── transfer ──────────────────────────────────────────────────────────────
+
+(deftest transfer-is-locked-for-sixty-days-after-creation
+  (let [d (created)
+        early (lc/transfer-request d policy {:gaining-registrar "reg-b" :auth-info "hunter2"} (d+ 30))]
+    (is (= 2304 (get-in early [:error :error/code])))
+    (is (= (d+ 60) (get-in early [:error :error/unlocks-at])))
+    (is (:ok? (lc/transfer-request d policy {:gaining-registrar "reg-b" :auth-info "hunter2"} (d+ 61))))))
+
+(deftest transfer-requires-matching-auth-info
+  (let [d (created)]
+    (is (= 2201 (get-in (lc/transfer-request d policy {:gaining-registrar "reg-b"
+                                                       :auth-info "wrong"} (d+ 61))
+                        [:error :error/code])))))
+
+(deftest transfer-auto-approves-after-five-days-and-adds-a-year
+  (let [d (created)
+        req (:domain (lc/transfer-request d policy {:gaining-registrar "reg-b"
+                                                    :auth-info "hunter2"} (d+ 61)))]
+    (is (contains? (lc/effective-statuses req (d+ 62)) :pendingTransfer))
+    (testing "nothing happens on day 4"
+      (is (= "reg-a" (get-in (lc/advance req policy (d+ 65)) [:domain :domain/registrar]))))
+    (testing "day 5 completes it"
+      (let [done (lc/advance req policy (d+ 66))]
+        (is (= "reg-b" (get-in done [:domain :domain/registrar])))
+        (is (= :auto-approved (:event/how (first (:events done)))))
+        (is (= (t/plus-years (:domain/expires-at d) 1) (get-in done [:domain :domain/expires-at])))
+        (is (lc/in-grace? (:domain done) :transfer (d+ 68)))))))
+
+(deftest an-explicit-reject-leaves-everything-alone
+  (let [d (created)
+        req (:domain (lc/transfer-request d policy {:gaining-registrar "reg-b"
+                                                    :auth-info "hunter2"} (d+ 61)))
+        rej (lc/transfer-reject req policy (d+ 62))]
+    (is (= "reg-a" (get-in rej [:domain :domain/registrar])))
+    (is (nil? (get-in rej [:domain :domain/transfer])))
+    (is (= (:domain/expires-at d) (get-in rej [:domain :domain/expires-at])))
+    (testing "and a second reject has nothing to reject"
+      (is (= 2301 (get-in (lc/transfer-reject (:domain rej) policy (d+ 63)) [:error :error/code]))))))
+
+(deftest a-transfer-relocks-for-another-sixty-days
+  (let [d (created)
+        done (:domain (lc/advance
+                       (:domain (lc/transfer-request d policy {:gaining-registrar "reg-b"
+                                                               :auth-info "hunter2"} (d+ 61)))
+                       policy (d+ 66)))]
+    (is (= 2304 (get-in (lc/transfer-request done policy {:gaining-registrar "reg-c"
+                                                          :auth-info "hunter2"} (d+ 100))
+                        [:error :error/code])))
+    (is (:ok? (lc/transfer-request done policy {:gaining-registrar "reg-c"
+                                                :auth-info "hunter2"} (d+ 130))))))
+
+(deftest transfer-is-blocked-by-a-transfer-prohibition
+  (let [d (assoc (created) :domain/statuses #{:clientTransferProhibited})]
+    (is (= 2304 (get-in (lc/transfer-request d policy {:gaining-registrar "reg-b"
+                                                       :auth-info "hunter2"} (d+ 61))
+                        [:error :error/code])))))
+
+;; ── update ────────────────────────────────────────────────────────────────
+
+(deftest a-registrar-may-set-client-locks-but-not-server-locks
+  (let [d (created)]
+    (is (:ok? (lc/update-domain d policy {:add-statuses [:clientTransferProhibited]} (d+ 1))))
+    (let [r (lc/update-domain d policy {:add-statuses [:serverTransferProhibited]} (d+ 1))]
+      (is (= 2201 (get-in r [:error :error/code])))
+      (testing "and cannot clear one the registry set either"
+        (is (= 2201 (get-in (lc/update-domain
+                             (assoc d :domain/statuses #{:serverTransferProhibited})
+                             policy {:remove-statuses [:serverTransferProhibited]} (d+ 1))
+                            [:error :error/code])))))))
+
+(deftest removing-the-last-nameserver-makes-the-domain-inactive
+  (let [d (created)
+        r (lc/update-domain d policy {:nameservers []} (d+ 1))]
+    (is (contains? (lc/effective-statuses (:domain r) (d+ 1)) :inactive))
+    (is (not (status/allows? (lc/effective-statuses (:domain r) (d+ 1)) :publish)))))
+
+;; ── status projection ─────────────────────────────────────────────────────
+
+(deftest ok-is-reported-only-when-nothing-else-is
+  (let [d (created)]
+    ;; day 6: the add grace period has closed and nothing else applies.
+    (is (= #{:ok} (lc/effective-statuses d (d+ 6))))
+    (is (= #{:addPeriod} (lc/effective-statuses d (d+ 1))))
+    (is (= #{:clientHold} (lc/effective-statuses (assoc d :domain/statuses #{:clientHold}) (d+ 6))))))
