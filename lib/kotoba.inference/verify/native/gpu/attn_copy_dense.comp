@@ -1,0 +1,93 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+// attn_copy_dense: the KV-cache writes AND the decode attention of a layer in
+// ONE dispatch — fusion iteration 13 (G1 kernel-count roadmap; the launch-
+// bound class where fusion pays: >= 2 launches removed + buffer round trips).
+//
+// Phase 1: write THIS position's k and v row into the cache for FUTURE
+// dispatches — ONLY the first query head of each kv group writes (one writer
+// per location: no write races under GQA where several query heads share an
+// hkv), and nothing in THIS dispatch reads the written locations.
+// Phase 2: op_attn_decode's decode math verbatim, except that the CURRENT
+// position's row is read directly from DK/DV instead of the cache — so the
+// attention has NO dependency on phase 1 (no intra-dispatch cross-workgroup
+// ordering is needed or implied; review findings on this PR: the first
+// version read the just-written cache row, which needed both a correct
+// barrier order and cross-workgroup visibility, and raced under GQA).
+// Cross-dispatch visibility is the dispatch chain's barrier, which is exactly
+// what the old copy-then-attn order relied on.
+//
+// Decode only, dense decoders only (p0 != 0: no output gate — the `s` slot
+// carries dv instead). T <= 256 positions per step, same as op_attn_decode's
+// red[256] reduce.
+//
+// Bindings: 0 Meta (op_attn_decode's P struct), 1 A (dqr), 2 B (kc, rw),
+// 3 C (vc, rw), 4 O (dattn), 5 DV, 6 DK (dkr), 7 I (ids/position).
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer Meta { uint n; uint rows; uint aux; uint aux2; float eps; float scale; float p0; float p1; } P;
+layout(std430, binding = 1) readonly buffer A { float a[]; };
+layout(std430, binding = 2) buffer B { float b[]; };
+layout(std430, binding = 3) buffer C { float c[]; };
+layout(std430, binding = 4) buffer O { float o[]; };
+layout(std430, binding = 5) readonly buffer DV { float dv[]; };
+layout(std430, binding = 6) readonly buffer DK { float dk[]; };
+layout(std430, binding = 7) buffer I { uint ids[]; };
+
+shared float red[256];
+
+float wg_sum(uint t, float v) {   // verbatim from nex_ops (tree order = the arithmetic)
+  red[t] = v;
+  barrier();
+  for (uint st = 128u; st > 0u; st >>= 1u) { if (t < st) red[t] += red[t + st]; barrier(); }
+  float r = red[0];
+  barrier();
+  return r;
+}
+uint dyn_pos() { return ids[0]; }
+
+void main() {
+  uint h = gl_WorkGroupID.x, row = gl_WorkGroupID.y, t = gl_LocalInvocationID.x, d = P.n;
+  uint T = ((P.p1 != 0.0) ? dyn_pos() + 1u : P.aux) + row;
+  uint hkv = h / (P.rows / P.aux2);
+  uint qoff = row * P.rows * d;
+
+  // phase 1: this position's k and v row into the cache for future dispatches
+  // (op_copy_at's addresses: dyn_pos() * aux2 row stride). ONE writer per
+  // location: the first query head of the kv group. No synchronization needed
+  // here — nothing in this dispatch reads these locations.
+  if (h % (P.rows / P.aux2) == 0u) {
+    uint coff = dyn_pos() * P.aux2 * d + hkv * d;
+    for (uint i = t; i < d; i += 256u) {
+      b[coff + i] = dk[hkv * d + i];
+      c[coff + i] = dv[hkv * d + i];
+    }
+  }
+
+  // phase 2: op_attn_decode's decode math verbatim, with the current row read
+  // from DK/DV (identical values — the cache copy wrote exactly these bits)
+  uint pos = dyn_pos();
+  float sc = -1e30;
+  if (t < T) {
+    float dt = 0.0;
+    for (uint i = 0u; i < d; i++) {
+      float kv = (t == pos) ? dk[hkv * d + i] : b[(t * P.aux2 + hkv) * d + i];
+      dt += a[qoff + h * d + i] * kv;
+    }
+    sc = dt * P.scale;
+  }
+  red[t] = sc; barrier();
+  for (uint st = 128u; st > 0u; st >>= 1u) { if (t < st) red[t] = max(red[t], red[t + st]); barrier(); }
+  float m = red[0]; barrier();
+  float e = (t < T) ? exp(sc - m) : 0.0;
+  float denom = wg_sum(t, e);
+  float p = e / denom;
+  red[t] = p; barrier();
+  for (uint i = t; i < d; i += 256u) {
+    float acc = 0.0;
+    for (uint tt = 0u; tt < T; tt++) {
+      float vv = (tt == pos) ? dv[hkv * d + i] : c[(tt * P.aux2 + hkv) * d + i];
+      acc += red[tt] * vv;
+    }
+    o[qoff + h * d + i] = acc;   // P.p0 != 0: no output gate (dense decoders)
+  }
+}

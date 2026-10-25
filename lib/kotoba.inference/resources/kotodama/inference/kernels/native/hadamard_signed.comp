@@ -1,0 +1,69 @@
+#version 450
+// Prism activation transform for folded Bonsai weights.
+//
+// One workgroup transforms one 1024-value block of one activation row. The
+// forward matmul path computes H(Sx); the inverse embedding path computes
+// S(Hx). H is the normalized Sylvester-Walsh-Hadamard matrix and is its own
+// inverse. A recurrent ssm_out may additionally reorder tiled
+// [hd,nk,rep] features into grouped [hd,rep,nk] order before S/H.
+//
+// Dispatch: (width / 1024, rows, 1), local_size_x = 256.
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer Meta {
+  uint width; uint rows; uint block_size; uint perm_hd;
+  uint perm_nk; uint perm_rep; uint sign_after; uint pad;
+} params;
+layout(std430, binding = 1) readonly buffer X { float x[]; };
+layout(std430, binding = 2) readonly buffer Signs { float signs[]; };
+layout(std430, binding = 3) buffer O { float outp[]; };
+
+shared float tile[1024];
+
+uint source_index(uint dst) {
+  if (params.perm_rep <= 1u) return dst;
+  uint h = dst % params.perm_hd;
+  uint q = dst / params.perm_hd;
+  uint rep = q % params.perm_rep;
+  uint nk = q / params.perm_rep;
+  return h + params.perm_hd * (nk + params.perm_nk * rep);
+}
+
+void main() {
+  uint lane = gl_LocalInvocationID.x;
+  uint block = gl_WorkGroupID.x;
+  uint row = gl_WorkGroupID.y;
+  uint base = block * 1024u;
+  if (params.block_size != 1024u || row >= params.rows || base >= params.width) return;
+
+  for (uint k = 0u; k < 4u; ++k) {
+    uint local = lane + 256u * k;
+    uint dst = base + local;
+    uint src = source_index(dst);
+    float v = x[row * params.width + src];
+    tile[local] = (params.sign_after == 0u) ? v * signs[dst] : v;
+  }
+  memoryBarrierShared();
+  barrier();
+
+  for (uint stride = 1u; stride < 1024u; stride <<= 1u) {
+    for (uint k = 0u; k < 2u; ++k) {
+      uint pair = lane + 256u * k;
+      uint group = pair / stride;
+      uint j = pair - group * stride;
+      uint a = group * (2u * stride) + j;
+      uint b = a + stride;
+      float va = tile[a], vb = tile[b];
+      tile[a] = va + vb;
+      tile[b] = va - vb;
+    }
+    memoryBarrierShared();
+    barrier();
+  }
+
+  for (uint k = 0u; k < 4u; ++k) {
+    uint local = lane + 256u * k;
+    uint dst = base + local;
+    float v = tile[local] * 0.03125; // 1/sqrt(1024)
+    outp[row * params.width + dst] = (params.sign_after != 0u) ? v * signs[dst] : v;
+  }
+}

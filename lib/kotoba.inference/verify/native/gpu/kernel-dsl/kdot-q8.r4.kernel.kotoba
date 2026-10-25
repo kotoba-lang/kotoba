@@ -1,0 +1,71 @@
+;; kdot-q8.r4.kernel.kotoba — the SINGLE SOURCE of the Q8_0 kdot's arithmetic
+;; (JUN-139, kotoba kernel DSL, milestone 1). GLSL/SPIR-V and MSL are emitted
+;; from this file; the hand-maintained twins (kdot_h2_r1.comp / .msl.r4) are
+;; the measurement baseline this must match and eventually replace.
+;;
+;; THE IDENTITY CONTRACT (why this shape): the emitters are dumb syntax
+;; renderers; everything that affects rounding lives HERE:
+;;   * the f32 accumulation ORDER (:acc-chain)
+;;   * the conversion form (:conv = :i8h, the int8->half conversion — the
+;;     exponent trick measured 1.8x slower on Metal and rounds differently)
+;;   * the reduction tree (:reduce)
+;; A change to any of these is an arithmetic change requiring re-verification
+;; against the f64 oracle; emitter changes are not.
+;;
+;; The control skeleton (loops, bounds, grid/threadgroup builtin mapping) is
+;; emitter-side but shape-fixed and reviewed next to the renderers; the
+;; arithmetic lines in the skeleton are generated from THIS file only.
+
+{:kernel/name "kdot_h2_q8_r4"
+ :kernel/entry "kmain"
+ :kernel/shape {:threads 64
+                :rows-per-threadgroup 4          ;; the tuned dose: 4 chains safe, 8 spills on Apple (metal-iteration3)
+                :dispatch "grid = ceil(rows / rows-per-threadgroup), one threadgroup per output row-group"
+                :block-values 32 :block-bytes 34 :group-values 256 :group-bytes 272
+                :row-bytes "((cols + 31) / 32) * 34"
+                :ttype 8}                        ;; Q8_0 only
+
+ :kernel/bindings [{:i 0 :name "Meta" :space :constant :type "u32x8"}
+                   {:i 1 :name "W"    :space :device-ro :type "u32"}
+                   {:i 2 :name "X"    :space :device-ro :type "f32x4"}
+                   {:i 3 :name "O"    :space :device-rw :type "f32"}
+                   {:i 4 :name "E"    :space :device-ro :type "u32"}]
+ :kernel/meta [rows cols tensor_type positions input_per_expert pad0 pad1 pad2]
+
+ ;; per-thread index: t*4 values, one 256-group slice per (thread, group)
+ :vars {:index "t * 4u" :blocks "(cols + 255u) / 256u" :xrow "in_row * cols + index"}
+
+ ;; ---- the arithmetic (the identity contract) --------------------------------
+ :term8
+ ;; the Q8_0 32-value block product; kdot_h2_r1.comp's term32 tt==8 arm verbatim
+ {:block-offset "wb + (index / 32u) * 34u"                 ;; bo
+  :codes        [:u32-at "bo + 2u + (index & 31u)"]         ;; one u32 = 4 signed codes
+  :conv         :i8h                                       ;; (half)(int8_t) per byte, x then y then z then w
+  :scale        [:half-at "bo"]                            ;; the block's f16 d
+  :product      [:h2-mul :qlo :ylo :h2-mul :qhi :yhi]      ;; two packed half2 multiplies
+  :sum          [:f32-sum "(p0.x) (p0.y) (p1.x) (p1.y)"]   ;; LEFT-TO-RIGHT f32 sums in this order
+  :result       [:f32-mul :d :sum]}                        ;; d * (sum)
+
+ :acc-chain
+ ;; per thread: two accumulator chains, groups paired 2-per-iteration
+ {:acc0 ["group b"     "group b+1 tail-masked"]
+  :acc1 ["group b+1"   "the loop tail takes the odd last group"]
+  :thread-sum "acc0 + acc1"}                               ;; this order
+
+ :reduce
+ ;; the tree: simd_sum over the threadgroup, then lane-0 writes, then t==0
+ ;; sums the simdgroup partials IN simdgroup-index ORDER — both orders are
+ ;; part of the arithmetic and must not be reordered by an emitter
+ {:stage-1 :simd-sum-of-thread-sum
+  :stage-2 :lane0-writes-partial-by-simdgroup-index
+  :stage-3 :thread0-sums-partials-in-index-order}
+
+ :store "out[position * rows + row] = reduce"}
+
+;; The emit contract (emit-kernel.cljk):
+;;   kbb --backend sci emit-kernel.cljk kdot-q8.r4.kernel.kotoba glsl out.comp
+;;   kbb --backend sci emit-kernel.cljk kdot-q8.r4.kernel.kotoba msl  out.msl
+;; Acceptance (JUN-139 iteration 1): both compile, both pass kdot_check.py vs
+;; the CPU dequant reference, and the two agree with each other to <= 1 ulp on
+;; the same inputs (the mutual check validates the emitters against each other
+;; rather than against the hand twins).

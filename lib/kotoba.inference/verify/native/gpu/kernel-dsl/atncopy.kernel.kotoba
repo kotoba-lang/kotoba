@@ -1,0 +1,43 @@
+;; atncopy.kernel.kotoba — the SINGLE SOURCE of the fused KV-write + decode
+;; attention kernel's arithmetic (JUN-139 migration item 3). The hand form is
+;; attn_copy_dense.comp (merged via #50), including its review-fixed shape:
+;; the current position's row is read from DK/DV directly (nothing in the
+;; dispatch reads what it writes) and ONE writer per cache location.
+;;
+;; The identity contract for this kernel is the REDUCE ORDERS (the softmax):
+;;   * :score-reduce  — the per-position scores, then the MAX reduce in the
+;;     fixed butterfly (shuffle-xor halving) — NOT the backend's max
+;;   * :sum-reduce    — the exp-sum in the same fixed butterfly
+;;   * :weighted-sum  — the output accumulation over positions IN POSITION
+;;     ORDER (a plain loop; emitters may not reorder or vectorize it away)
+;; The exp and division are the only transcendental ops; their form is fixed:
+;; exp(score - max), then p = e / sum.
+
+{:kernel/name "attn_copy_dense"
+ :kernel/entry "kmain"
+ :kernel/shape {:threads 256
+                :pairing :one-query-head-per-workgroup
+                :dispatch "grid = (NH, positions, 1)"
+                :kv-write "ONE writer per cache location: the first query head of each kv group (h % (rows/aux2) == 0) writes this position's k/v row for FUTURE dispatches; nothing in this dispatch reads the written locations (the current row comes from DK/DV)"
+                :attention "op_attn_decode's decode math verbatim except the current row's read source"}
+ :kernel/bindings [{:i 0 :name "Meta" :space :constant :type "rope-meta-like"}
+                   {:i 1 :name "A"   :space :device-ro :type "f32"}   ;; dqr
+                   {:i 2 :name "B"   :space :device-rw :type "f32"}   ;; kc (rw: the cache)
+                   {:i 3 :name "C"   :space :device-rw :type "f32"}   ;; vc (rw: the cache)
+                   {:i 4 :name "O"   :space :device-rw :type "f32"}   ;; dattn
+                   {:i 5 :name "DV"  :space :device-ro :type "f32"}
+                   {:i 6 :name "DK"  :space :device-ro :type "f32"}
+                   {:i 7 :name "I"   :space :device-rw :type "u32"}]
+
+ :phase1-kv-write {:chain [[:store :B "dk[hkv*d + i]" "the k slice"] [:store :C "dv[hkv*d + i]" "the v slice"]]
+                   :writer "h % (P.rows / P.aux2) == 0 (first query head of the kv group)"
+                   :order "any; the targets are written once and read by NO later phase of this dispatch"}
+
+ :scores {:chain [:f32-dot :A-row ":B or :DK for the current position" "t < T"]
+          :scale [:f32-mul :dot "P.scale"]}
+ :score-reduce {:form :tree-halving-max :order "the hand wg_sum tree: red[t]=v; for st=128..1 if (t<st) red[t]=max(red[t],red[t+st]); thread-0 reads red[0]"}
+ :softmax {:e "exp(score - max)" :sum :sum-reduce :p [:f32-div :e :sum]}
+ :sum-reduce {:form :tree-halving-sum :order "the hand wg_sum tree: red[t]=v; for st=128..1 if (t<st) red[t]+=red[t+st]; thread-0 reads red[0]"}
+ :weighted-sum {:chain [:f32-macc "p[tt]" ":C-or-DV-row" "tt IN POSITION ORDER 0..T-1"]
+                :note "a plain loop in position order — the arithmetic; emitters may not reorder"}
+ :store "O[qoff + h*d + i] = weighted-sum  (P.p0 != 0: no output gate)"}

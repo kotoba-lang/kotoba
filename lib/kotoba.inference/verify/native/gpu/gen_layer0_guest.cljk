@@ -1,0 +1,146 @@
+;; Generate the :gpu/compute guest for ONE recurrent (gated delta-net) layer of
+;; Nex-N2.5-mini at position 0: every tensor of the layer MAPped by file offset,
+;; every op of the step one DISPATCH inside a single command buffer, the layer
+;; output READ back as hex. Checked by layer0_check.py against layer0_ref.py.
+;;
+;;   kbb --backend sci gen_layer0_guest.cljk <file.gguf> <layer> <dir-on-box> <out.kotoba>
+;;
+;; The program is straight-line: MAP/ALLOC/WRITE the constants, BEGIN, the
+;; dispatches, SUBMIT, READ. Root ADR-2609182400 C.
+(require '["fs" :as fs] '[clojure.string :as str])
+(def args (vec *command-line-args*))
+(when (not= 4 (count args)) (println "usage: <file.gguf> <layer> <dir-on-box> <out.kotoba>") (js/process.exit 2))
+(def gguf (args 0)) (def layer (js/parseInt (args 1))) (def box (args 2)) (def out (args 3))
+;; --- GGUF directory (header only) ---
+(def fd (fs/openSync gguf "r"))
+(def head (js/Buffer.alloc (* 64 1024 1024)))
+(def n (fs/readSync fd head 0 (.-length head) 0))
+(def buf (.subarray head 0 n))
+(def pos (atom 0))
+(defn- u8 [] (let [v (.readUInt8 buf @pos)] (swap! pos + 1) v))
+(defn- u32 [] (let [v (.readUInt32LE buf @pos)] (swap! pos + 4) v))
+(defn- u64 [] (let [v (.readBigUInt64LE buf @pos)] (swap! pos + 8) (js/Number v)))
+(defn- f32 [] (let [v (.readFloatLE buf @pos)] (swap! pos + 4) v))
+(defn- gstr [] (let [k (u64) s (.toString buf "utf8" @pos (+ @pos k))] (swap! pos + k) s))
+(declare read-value)
+(defn- read-value [t]
+  (case t 0 (u8) 1 (u8) 2 (do (swap! pos + 2) 0) 3 (do (swap! pos + 2) 0) 4 (u32) 5 (u32) 6 (f32) 7 (u8) 8 (gstr)
+    9 (let [et (u32) k (u64)] (doall (repeatedly k #(read-value et))) nil) 10 (u64) 11 (u64) 12 (do (swap! pos + 8) 0)))
+(swap! pos + 4) (u32) (def n-tensors (u64)) (def n-kv (u64))
+(def kv (into {} (for [_ (range n-kv)] (let [k (gstr) t (u32)] [k (read-value t)]))))
+(def tensors (into {} (for [_ (range n-tensors)] (let [name (gstr) nd (u32) dims (vec (repeatedly nd u64)) typ (u32) off (u64)] [name {:dims dims :type typ :offset off}]))))
+(def alignment (get kv "general.alignment" 32))
+(def data-start (* (quot (+ @pos alignment -1) alignment) alignment))
+(def eps (get kv "qwen35moe.attention.layer_norm_rms_epsilon"))
+(def block-bytes {12 144 13 176 14 210 23 136 0 nil})
+(defn tensor-bytes [{:keys [dims type]}]
+  (let [cols (first dims) rows (reduce * 1 (rest dims))]
+    (if (= 0 type) (* rows cols 4) (* rows (quot cols 256) (block-bytes type)))))
+(def p (str "blk." layer "."))
+(defn T [nm] (or (get tensors (str p nm)) (do (println "REFUSE no tensor" (str p nm)) (js/process.exit 2))))
+;; --- emission helpers: the program is a list of `(gpu "...")` lines bound with let ---
+(def lines (atom []))
+(def binds (atom []))
+(defn le32 [v] (let [b (js/Buffer.alloc 4)] (.writeUInt32LE b (js/Number v) 0) (.toString b "hex")))
+(defn lef32 [v] (let [b (js/Buffer.alloc 4)] (.writeFloatLE b v 0) (.toString b "hex")))
+(defn bind! [sym req] (swap! binds conj [sym req]))
+(defn step! [req-expr] (swap! lines conj req-expr))
+(defn cat [& xs] (reduce (fn [a b] (str "(string-concat " a " " b ")")) xs))
+(defn q [s] (str "\"" s "\""))
+(def counter (atom 0))
+(defn fresh [prefix] (swap! counter inc) (str prefix @counter))
+;; MAP a tensor -> symbol
+(defn map-tensor! [nm]
+  (let [t (T nm) sym (fresh "w")] (bind! sym (q (str "MAP " box "/nex.gguf " (+ data-start (:offset t)) " " (tensor-bytes t)))) sym))
+(defn alloc! [bytes] (let [sym (fresh "b")] (bind! sym (q (str "ALLOC " bytes))) sym))
+(defn zero! [sym] (step! (cat (q "ZERO ") sym)))
+(defn write! [sym hex] (step! (cat (q "WRITE ") sym (q (str " 0 " hex)))))
+(defn pipeline! [spv bindings] (let [sym (fresh "p")] (bind! sym (q (str "PIPELINE " box "/" spv " " bindings))) sym))
+(defn dispatch! [pipe x y z & handles] (step! (apply cat (q "DISPATCH ") pipe (q (str " " x " " y " " z)) (mapcat (fn [h] [(q " ") h]) handles))))
+;; meta buffers
+(defn ops-meta! [n rows aux aux2 eps scale] (let [m (alloc! 32)] (write! m (str (le32 n) (le32 rows) (le32 aux) (le32 aux2) (lef32 eps) (lef32 scale) (lef32 0) (lef32 0))) m))
+(defn kdot-meta! [rows cols type positions input-per-expert] (let [m (alloc! 32)] (write! m (str (le32 rows) (le32 cols) (le32 type) (le32 positions) (le32 input-per-expert) (le32 0) (le32 0) (le32 0))) m))
+;; --- the plan ---
+(def x (let [sym (fresh "x")] (bind! sym (q (str "MAP " box "/x.f32 0 8192"))) sym))
+(def zeros16 (alloc! 16)) ;; a read-only dummy for unused bindings / expert ids = 0
+(def ops (into {} (for [op ["rmsnorm" "l2norm" "gated_rmsnorm" "silu_mul" "conv1d_step" "softmax_topk" "gate_decay2" "weighted_sum" "add" "f32_matvec" "add_rmsnorm"]] [op (pipeline! (str "nex_" op ".spv") 7)])))
+(def kdot-r1 (pipeline! "kdot_f32_r1.spv" 5))
+(def kdot-r8 (pipeline! "kdot_f32_r8.spv" 5))
+(def deltanet (pipeline! "deltanet_step.spv" 8))
+(def w-attn-norm (map-tensor! "attn_norm.weight")) (def w-qkv (map-tensor! "attn_qkv.weight")) (def w-gate (map-tensor! "attn_gate.weight"))
+(def w-alpha (map-tensor! "ssm_alpha.weight")) (def w-beta (map-tensor! "ssm_beta.weight")) (def w-dt (map-tensor! "ssm_dt.bias")) (def w-a (map-tensor! "ssm_a"))
+(def w-conv (map-tensor! "ssm_conv1d.weight")) (def w-ssm-norm (map-tensor! "ssm_norm.weight")) (def w-out (map-tensor! "ssm_out.weight"))
+(def w-post-norm (map-tensor! "post_attention_norm.weight")) (def w-router (map-tensor! "ffn_gate_inp.weight")) (def w-shgate-inp (map-tensor! "ffn_gate_inp_shexp.weight"))
+(def w-gate-exps (map-tensor! "ffn_gate_exps.weight")) (def w-up-exps (map-tensor! "ffn_up_exps.weight")) (def w-down-exps (map-tensor! "ffn_down_exps.weight"))
+(def w-gate-sh (map-tensor! "ffn_gate_shexp.weight")) (def w-up-sh (map-tensor! "ffn_up_shexp.weight")) (def w-down-sh (map-tensor! "ffn_down_shexp.weight"))
+(def h (alloc! 8192)) (def qkv (alloc! 32768)) (def z (alloc! 16384)) (def alpha (alloc! 128)) (def betaL (alloc! 128)) (def gb (alloc! 256))
+(def ring (alloc! 98304)) (def conv (alloc! 32768)) (def qn (alloc! 8192)) (def kn (alloc! 8192)) (def S (alloc! 2097152)) (def dn (alloc! 16384))
+(def gnorm (alloc! 16384)) (def attn-out (alloc! 8192)) (def resid (alloc! 8192)) (def h2 (alloc! 8192)) (def router (alloc! 1024))
+(def ids (alloc! 64)) (def topw (alloc! 64)) (def gateE (alloc! 16384)) (def upE (alloc! 16384)) (def actE (alloc! 16384)) (def downE (alloc! 65536))
+(def sg (alloc! 2048)) (def su (alloc! 2048)) (def sact (alloc! 2048)) (def shdown (alloc! 8192)) (def shlogit (alloc! 16)) (def ffn (alloc! 8192)) (def xout (alloc! 8192))
+(zero! ring) (zero! S) (zero! zeros16)
+;; metas (written before BEGIN)
+(def m-attn-norm (ops-meta! 2048 1 0 0 eps 0)) (def m-qkv (kdot-meta! 8192 2048 (:type (T "attn_qkv.weight")) 1 0)) (def m-gate (kdot-meta! 4096 2048 (:type (T "attn_gate.weight")) 1 0))
+(def m-alpha (kdot-meta! 32 2048 (:type (T "ssm_alpha.weight")) 1 0)) (def m-beta (kdot-meta! 32 2048 (:type (T "ssm_beta.weight")) 1 0))
+(def m-gd (ops-meta! 32 32 32 0 0 0)) (def m-conv (ops-meta! 8192 1 0 0 0 0))
+(def m-l2q (ops-meta! 128 16 0 0 eps (/ 1.0 (js/Math.sqrt 128)))) (def m-l2k (ops-meta! 128 16 0 2048 eps 0))
+(def m-dn (let [m (alloc! 32)] (write! m (str (le32 32) (le32 128) (le32 128) (le32 16) (le32 4096) (le32 0) (le32 0) (le32 0))) m))
+(def m-gn (ops-meta! 128 32 0 0 eps 0)) (def m-out (kdot-meta! 2048 4096 (:type (T "ssm_out.weight")) 1 0))
+(def m-addn (ops-meta! 2048 1 0 0 eps 0)) (def m-router (ops-meta! 2048 256 0 0 0 0)) (def m-topk (ops-meta! 256 1 8 0 0 1.0))
+(def m-gate-exps (kdot-meta! 512 2048 (:type (T "ffn_gate_exps.weight")) 8 0)) (def m-down-exps (kdot-meta! 2048 512 (:type (T "ffn_down_exps.weight")) 8 1))
+(def m-silu8 (ops-meta! 4096 1 0 0 0 0)) (def m-gate-sh (kdot-meta! 512 2048 (:type (T "ffn_gate_shexp.weight")) 1 0)) (def m-down-sh (kdot-meta! 2048 512 (:type (T "ffn_down_shexp.weight")) 1 0))
+(def m-silu-sh (ops-meta! 512 1 0 0 0 0)) (def m-shlogit (ops-meta! 2048 1 0 0 0 0)) (def m-wsum (ops-meta! 2048 1 8 0 0 0)) (def m-add (ops-meta! 2048 1 0 0 0 0))
+(def beta-only (alloc! 256)) (def m-gd0 (ops-meta! 32 32 0 0 0 0))  ;; every WRITE before BEGIN: a copy inside the batch resets it
+;; --- the step, one command buffer ---
+(step! (q "BEGIN"))
+(dispatch! (ops "rmsnorm") 1 1 1 m-attn-norm x w-attn-norm zeros16 h zeros16 zeros16)
+(dispatch! kdot-r1 8192 1 1 m-qkv w-qkv h qkv zeros16)
+(dispatch! kdot-r1 4096 1 1 m-gate w-gate h z zeros16)
+(dispatch! kdot-r1 32 1 1 m-alpha w-alpha h alpha zeros16)
+(dispatch! kdot-r1 32 1 1 m-beta w-beta h betaL zeros16)
+(dispatch! (ops "gate_decay2") 1 1 1 m-gd alpha w-dt w-a gb betaL zeros16)
+(dispatch! (ops "conv1d_step") 32 1 1 m-conv qkv w-conv zeros16 conv ring zeros16)
+(dispatch! (ops "l2norm") 16 1 1 m-l2q conv zeros16 zeros16 qn zeros16 zeros16)
+(dispatch! (ops "l2norm") 16 1 1 m-l2k conv zeros16 zeros16 kn zeros16 zeros16)
+;; deltanet: q k v g beta state out ; g at gb[0..32), beta at gb[32..64) -> beta binding needs offset 32 elements:
+;; the kernel reads beta[h], so bind gb twice is wrong; gate_decay2 wrote beta at aux=32 -> pass a second gb view is
+;; impossible without ranges, so write beta at its own buffer: use aux = 0 with a separate output would collide.
+;; Resolution: m-gd aux = 32 and the deltanet Meta v_off handles v; for beta we dispatch gate_decay2 with o = gb and
+;; read beta from gb via k_heads trick is not available -> use a tiny copy: silu_mul cannot copy. Use a second
+;; gate_decay2 with aux = 0 into a beta-only buffer (2 x 32 floats of work).
+(dispatch! (ops "gate_decay2") 1 1 1 m-gd0 alpha w-dt w-a beta-only betaL zeros16)  ;; o[0..32) = g (unused), o[0..32) overwritten by beta? no: aux=0 makes o[h] = g then o[0+h] = beta -> beta wins (later write in the same thread)
+(dispatch! deltanet 32 1 1 m-dn qn kn conv gb beta-only S dn)
+(dispatch! (ops "gated_rmsnorm") 32 1 1 m-gn dn w-ssm-norm z gnorm zeros16 zeros16)
+(dispatch! kdot-r1 2048 1 1 m-out w-out gnorm attn-out zeros16)
+(dispatch! (ops "add_rmsnorm") 1 1 1 m-addn x attn-out w-post-norm resid h2 zeros16)
+(dispatch! (ops "f32_matvec") 256 1 1 m-router w-router h2 zeros16 router zeros16 zeros16)
+(dispatch! (ops "softmax_topk") 1 1 1 m-topk router zeros16 zeros16 topw zeros16 ids)
+(dispatch! kdot-r1 512 8 1 m-gate-exps w-gate-exps h2 gateE ids)
+(dispatch! kdot-r1 512 8 1 m-gate-exps w-up-exps h2 upE ids)
+(dispatch! (ops "silu_mul") 16 1 1 m-silu8 gateE upE zeros16 actE zeros16 zeros16)
+(dispatch! kdot-r1 2048 8 1 m-down-exps w-down-exps actE downE ids)
+(dispatch! kdot-r1 512 1 1 m-gate-sh w-gate-sh h2 sg zeros16)
+(dispatch! kdot-r1 512 1 1 m-gate-sh w-up-sh h2 su zeros16)
+(dispatch! (ops "silu_mul") 2 1 1 m-silu-sh sg su zeros16 sact zeros16 zeros16)
+(dispatch! kdot-r1 2048 1 1 m-down-sh w-down-sh sact shdown zeros16)
+(dispatch! (ops "f32_matvec") 1 1 1 m-shlogit w-shgate-inp h2 zeros16 shlogit zeros16 zeros16)
+(dispatch! (ops "weighted_sum") 8 1 1 m-wsum downE topw shdown ffn shlogit zeros16)
+(dispatch! (ops "add") 8 1 1 m-add resid ffn zeros16 xout zeros16 zeros16)
+;; --- emit ---
+(def body-steps (mapv (fn [l] (str "      (gpu " l ")")) @lines))
+(def src (str ";; GENERATED by verify/native/gpu/gen_layer0_guest.cljk -- do not edit.\n"
+              ";; One recurrent layer (blk." layer ") of Nex-N2.5-mini at position 0 on :gpu/compute: " (count @binds) " MAP/ALLOC/PIPELINE, "
+              (count @lines) " requests, one command buffer. Answer: \"<ns of the command buffer>|<hex of x_out (2048 f32)>|<hex of top-8 ids>\".\n"
+              "(ns gpu.layer" layer " (:export [main]))\n"
+              "(defn gpu [r :string] :string\n  (typed-cap-call :gpu/compute :string :string r))\n"
+              "(defn main [] :string\n"
+              "  (let [" (str/join "\n        " (map (fn [[s r]] (str s " (gpu " r ")")) @binds)) "]\n"
+              "    (do\n" (str/join "\n" body-steps) "\n"
+              "      (let [ns (gpu \"SUBMIT\")]\n"
+              "        " (cat "ns" (q "|") (str "(gpu " (cat (q "READ ") xout (q " 0 8192")) ")") (q "|") (str "(gpu " (cat (q "READ ") ids (q " 0 32")) ")")
+                     (q "|") (str "(gpu " (cat (q "READ ") h (q " 0 16")) ")") (q "|") (str "(gpu " (cat (q "READ ") qkv (q " 0 16")) ")")
+                     (q "|") (str "(gpu " (cat (q "READ ") gb (q " 0 16")) ")") (q "|") (str "(gpu " (cat (q "READ ") conv (q " 0 16")) ")")
+                     (q "|") (str "(gpu " (cat (q "READ ") dn (q " 0 16")) ")") (q "|") (str "(gpu " (cat (q "READ ") resid (q " 0 16")) ")")
+                     (q "|") (str "(gpu " (cat (q "READ ") router (q " 0 16")) ")") (q "|") (str "(gpu " (cat (q "READ ") topw (q " 0 16")) ")")) "))))\n"))
+(fs/writeFileSync out src)
+(println (str "wrote " out ": " (count @binds) " bindings, " (count @lines) " requests, data-start " data-start ", eps " eps))

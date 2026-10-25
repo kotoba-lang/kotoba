@@ -1,0 +1,116 @@
+;; Chat templates per family (iteration 58): a RECOGNIZER over tokenizer.chat_template (distinctive substrings), not a
+;; jinja engine, and one renderer per family, written from the jinja source of the GGUFs measured on K16 (Nex-N2.5-mini
+;; = ChatML + <think>, Qwen2.5-0.5B-Instruct = ChatML with a default system prompt, Llama-3.2-1B-Instruct = header ids)
+;; and compared byte for byte with llama-server's POST /apply-template by chat_template_check.cljk. Gemma and
+;; Mistral / Llama-2 are written from their published templates and are UNVERIFIED here (no GGUF measured yet).
+;; Loaded AFTER tokenizer_core.cljk (needs chat-template / tokens / bos-id); defines template-family and render.
+;; Messages are Clojure maps {:role :content}, content already a string (the shell flattens content parts).
+;;
+;; bos: llama.cpp renders the template (Llama 3's begins with {{ bos_token }}) and then STRIPS a leading bos string when
+;; the vocab says add_bos (common/chat.cpp "TODO: improve this later"), so the tokenizer adds the bos id once with
+;; add_special = true. render does the same: its text never starts with the bos string; the shell tokenizes it with
+;; encode-prompt, which prepends bos-id when add-bos?.
+(require '[clojure.string :as str])
+(defn classify-template
+  "The family of a jinja chat template, keyed on its distinctive control strings; nil when none is recognized."
+  [src]
+  (when (string? src)
+    (cond (str/includes? src "<|start_header_id|>") :llama3
+          (str/includes? src "<start_of_turn>") :gemma
+          (str/includes? src "[INST]") :mistral
+          (and (= "qwen35" pre-name) (str/includes? src "<|im_start|>") (str/includes? src "<think>")) :qwen35-think
+          (and (str/includes? src "<|im_start|>") (str/includes? src "<think>")) :chatml-think
+          (str/includes? src "<|im_start|>") :chatml
+          :else nil)))
+(def template-family (classify-template chat-template))
+(when (nil? template-family)
+  (println (str "REFUSE tokenizer.chat_template is " (if chat-template (str (count chat-template) " chars of an unrecognized template") "absent")
+                " (known families: chatml, chatml-think, qwen35-think, llama3, gemma, mistral)"))
+  (js/process.exit 2))
+;; ChatML default system prompt: the literal a `{%- else %}` branch emits when messages[0] is not a system message
+;; (Qwen2.5: "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."); nil when the template has none.
+(def chatml-default-system
+  (when (= :chatml template-family)
+    (some-> (re-find #"'<\|im_start\|>system\\n([^'<]+)<\|im_end\|>\\n'" chat-template) second)))
+(def stop-tokens
+  "The end-of-generation token strings of each family (the shell stops on any of them that the vocab has, plus eos-id)."
+  {:chatml ["<|im_end|>" "<|endoftext|>"] :chatml-think ["<|im_end|>" "<|endoftext|>"] :qwen35-think ["<|im_end|>" "<|endoftext|>"]
+   :llama3 ["<|eot_id|>" "<|end_of_text|>" "<|eom_id|>"] :gemma ["<end_of_turn>" "<eos>"] :mistral ["</s>"]})
+(defn- month-abbrev [m] (["Jan" "Feb" "Mar" "Apr" "May" "Jun" "Jul" "Aug" "Sep" "Oct" "Nov" "Dec"] m))
+(defn date-string
+  "strftime_now(\"%d %b %Y\") in local time, as llama.cpp's jinja runtime evaluates it for the Llama 3 template."
+  []
+  (let [d (js/Date.)] (str (.padStart (str (.getDate d)) 2 "0") " " (month-abbrev (.getMonth d)) " " (.getFullYear d))))
+(defn- render-chatml-think
+  "Nex-N2.5 / Qwen3.x thinking ChatML (unchanged from iteration 45; the template trims every content)."
+  [messages thinking?]
+  (str (apply str (map (fn [{:keys [role content]}]
+                         (let [content (str/trim content)]
+                           (str "<|im_start|>" role "\n" (if (= role "assistant") (str "<think>\n\n</think>\n\n" content) content) "<|im_end|>\n")))
+                       messages))
+       "<|im_start|>assistant\n<think>" (when-not thinking? "\n\n</think>\n\n")))
+(def qwen35-default-system
+  "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.")
+(defn- render-qwen35-think
+  "Qwen3.5 thinking ChatML: the model's xhigh directive is always the first system content."
+  [messages thinking?]
+  (let [system? (= "system" (:role (first messages)))
+        system-content (str qwen35-default-system (when system? (str "\n\n" (str/trim (:content (first messages))))))
+        rest-messages (if system? (rest messages) messages)]
+    (str "<|im_start|>system\n" system-content "<|im_end|>\n"
+         (apply str (map (fn [{:keys [role content]}]
+                           (let [content (str/trim content)]
+                             (str "<|im_start|>" role "\n" (if (= role "assistant") (str "<think>\n\n</think>\n\n" content) content) "<|im_end|>\n")))
+                         rest-messages))
+         "<|im_start|>assistant\n<think>\n" (when-not thinking? "\n</think>\n\n"))))
+(defn- render-chatml
+  "Qwen2.5-style ChatML: no <think>; a default system prompt when the first message is not a system message; content verbatim."
+  [messages]
+  (let [system? (= "system" (:role (first messages)))]
+    (str (when (and (not system?) chatml-default-system) (str "<|im_start|>system\n" chatml-default-system "<|im_end|>\n"))
+         (apply str (map (fn [{:keys [role content]}] (str "<|im_start|>" role "\n" content "<|im_end|>\n")) messages))
+         "<|im_start|>assistant\n")))
+(defn- render-llama3
+  "Llama 3.x: the system header always carries the knowledge cutoff and today's date; every content is trimmed. No bos (see above)."
+  [messages]
+  (let [system? (= "system" (:role (first messages)))
+        system-message (if system? (str/trim (:content (first messages))) "")
+        rest-messages (if system? (rest messages) messages)]
+    (str "<|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: " (date-string) "\n\n" system-message "<|eot_id|>"
+         (apply str (map (fn [{:keys [role content]}] (str "<|start_header_id|>" role "<|end_header_id|>\n\n" (str/trim content) "<|eot_id|>")) rest-messages))
+         "<|start_header_id|>assistant<|end_header_id|>\n\n")))
+(defn- render-gemma
+  "UNVERIFIED (no Gemma GGUF measured): a system message is folded into the first user turn; assistant is `model`."
+  [messages]
+  (let [system? (= "system" (:role (first messages)))
+        sys (when system? (str/trim (:content (first messages))))
+        ms (if system? (rest messages) messages)]
+    (str (apply str (map-indexed (fn [i {:keys [role content]}]
+                                   (let [role (if (= role "assistant") "model" role)
+                                         content (if (and (zero? i) sys) (str sys "\n\n" (str/trim content)) (str/trim content))]
+                                     (str "<start_of_turn>" role "\n" content "<end_of_turn>\n")))
+                                 ms))
+         "<start_of_turn>model\n")))
+(defn- render-mistral
+  "UNVERIFIED (no Mistral / Llama-2 GGUF measured): [INST] user [/INST] assistant</s>; a system message heads the first [INST]."
+  [messages]
+  (let [system? (= "system" (:role (first messages)))
+        sys (when system? (str/trim (:content (first messages))))
+        ms (if system? (rest messages) messages)]
+    (apply str (map-indexed (fn [i {:keys [role content]}]
+                              (case role
+                                "user" (str "[INST] " (when (and (zero? i) sys) (str sys "\n\n")) (str/trim content) " [/INST]")
+                                "assistant" (str " " (str/trim content) "</s>")
+                                (throw (js/Error. (str "mistral template: role " role " has no rendering")))))
+                            ms))))
+(defn render
+  "The prompt text of `messages` for this GGUF's template family with the generation prompt appended; thinking? applies to
+   :chatml-think only (false closes the think block as chat_template_kwargs.enable_thinking false would)."
+  [messages thinking?]
+  (case template-family
+    :qwen35-think (render-qwen35-think messages thinking?)
+    :chatml-think (render-chatml-think messages thinking?)
+    :chatml (render-chatml messages)
+    :llama3 (render-llama3 messages)
+    :gemma (render-gemma messages)
+    :mistral (render-mistral messages)))

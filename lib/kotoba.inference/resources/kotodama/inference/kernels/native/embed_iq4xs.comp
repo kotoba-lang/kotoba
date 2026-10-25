@@ -1,0 +1,96 @@
+#version 450
+// Token embedding lookup on the device: dequantise ONE IQ4_XS row of
+// token_embd.weight into f32 -- the row named by ids[meta.slot]. Written so a
+// greedy loop never leaves the GPU: token 0 reads the prompt id the host
+// WROTE, token t>0 reads the argmax the previous step's argmax_final left in
+// its ids buffer. One workgroup: thread t < blocks*8 owns sub-block t (32 values).
+// Root ADR-2609182400 C.
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer Meta { uint cols; uint slot; uint dyn; uint pad1; } P;   // dyn != 0: slot = pos[0] (binding 4), the device-side position (iteration 16)
+layout(std430, binding = 1) readonly buffer W { uint weights[]; };     // IQ4_XS rows, 136 B per 256 values
+layout(std430, binding = 2) readonly buffer I { uint ids[]; };
+layout(std430, binding = 3) buffer O { float o[]; };
+layout(std430, binding = 4) readonly buffer Pos { uint pos[]; };
+uint weight_byte(uint offset) { return (weights[offset >> 2u] >> ((offset & 3u) * 8u)) & 255u; }
+float weight_half(uint offset) { vec2 pr = unpackHalf2x16(weights[offset >> 2u]); return ((offset & 2u) != 0u) ? pr.y : pr.x; }
+int kvalue(uint i) {
+  uint w = (i < 4u) ? 0xBFAD9881u : (i < 8u) ? 0xF6EADDCFu : (i < 12u) ? 0x26190D01u : 0x71594535u;
+  return bitfieldExtract(int(w), int((i & 3u) * 8u), 8);
+}
+void main() {
+  uint t = gl_LocalInvocationID.x;
+  uint blocks = P.cols / 256u;
+#if !defined(Q8) && !defined(PTQ1) && !defined(B32)
+  if (t >= blocks * 8u) return;
+#endif
+  uint row = gl_WorkGroupID.y;   // prefill: token row of the batch (decode dispatches y = 1)
+#ifdef BATCH
+  uint tok = ids[row * P.pad1 + pos[row]];   // C-4 (iteration 51): rows are sequences; pad1 = token-buffer stride per row
+#elif defined(BPREFILL)
+  uint tok = ids[pos[1] * P.pad1 + pos[0] + row];   // iteration 57: P positions of sequence pos[1] from its base pos[0]
+#else
+  uint tok = ids[((P.dyn != 0u) ? pos[0] : P.slot) + row];
+#endif
+#if defined(Q8)
+  // -DQ8 (dense decoders, iteration 59): token_embd.weight in Q8_0 -- 32 values per block, f16 d + 32 int8 (34 B); thread t = block t
+  uint nb = P.cols / 32u; if (t >= nb) return;
+  uint b8 = tok * nb + t; uint bbase = b8 * 34u;
+  float d8 = weight_half(bbase);
+  for (uint j = 0u; j < 32u; j++) { int q = int(weight_byte(bbase + 2u + j)); if (q >= 128) q -= 256; o[row * P.cols + t * 32u + j] = d8 * float(q); }
+  return;
+#elif defined(B32)
+  // -DB32=<ggml type> (tick 57, Q4_K_M mixes): the four legacy 32-value block types, dequantised as ggml-quants.c does.
+  //   2 Q4_0 18 B: f16 d, 16 B nibbles (lo nibble = value j, hi = value j+16), value - 8
+  //   3 Q4_1 20 B: f16 d, f16 m, nibbles; value * d + m
+  //   6 Q5_0 22 B: f16 d, u32 qh (bit j -> 5th bit of value j), nibbles; (value | bit<<4) - 16
+  //   7 Q5_1 24 B: f16 d, f16 m, u32 qh, nibbles; (value | bit<<4) * d + m
+  // thread t = block t (P.cols / 32 blocks; 896 -> 28, tail-free because 896 = 28 * 32).
+  uint nb = P.cols / 32u; if (t >= nb) return;
+  uint bb = (B32 == 2) ? 18u : (B32 == 3) ? 20u : (B32 == 6) ? 22u : 24u;
+  uint bbase = (tok * nb + t) * bb;
+  float d = weight_half(bbase);
+  float m = (B32 == 3 || B32 == 7) ? weight_half(bbase + 2u) : 0.0;
+  uint qhoff = (B32 == 3 || B32 == 7) ? 4u : 2u;
+  uint qh = (B32 == 6 || B32 == 7) ? (weight_byte(bbase + qhoff) | (weight_byte(bbase + qhoff + 1u) << 8u) | (weight_byte(bbase + qhoff + 2u) << 16u) | (weight_byte(bbase + qhoff + 3u) << 24u)) : 0u;
+  uint qsoff = bb - 16u;
+  int off = (B32 == 2) ? 8 : (B32 == 6) ? 16 : 0;
+  for (uint j = 0u; j < 16u; j++) {
+    uint q = weight_byte(bbase + qsoff + j);
+    uint lo = q & 15u; uint hi = q >> 4u;
+    if (B32 == 6 || B32 == 7) { lo |= ((qh >> j) & 1u) << 4u; hi |= ((qh >> (j + 16u)) & 1u) << 4u; }
+    o[row * P.cols + t * 32u + j] = d * float(int(lo) - off) + m;
+    o[row * P.cols + t * 32u + 16u + j] = d * float(int(hi) - off) + m;
+  }
+  return;
+#elif defined(PTQ1)
+  // Prism PTQ1_0: qs[24], qh[2], fp16 scale; 128 values per block.
+  uint nb1 = P.cols / 128u;
+  for (uint ib = t; ib < nb1; ib += 256u) {
+    uint base1 = (tok * nb1 + ib) * 28u;
+    float d1 = weight_half(base1 + 26u);
+    for (uint e = 0u; e < 128u; ++e) {
+      uint bv; uint n1;
+      if (e < 80u) { bv = weight_byte(base1 + (e & 15u)); n1 = e >> 4u; }
+      else if (e < 120u) { uint q = e - 80u; bv = weight_byte(base1 + 16u + (q & 7u)); n1 = q >> 3u; }
+      else { uint q = e - 120u; bv = weight_byte(base1 + 24u + (q & 1u)); n1 = q >> 1u; }
+      for (uint j = 0u; j < n1; ++j) bv = (bv * 3u) & 255u;
+      int trit = int((bv * 3u) >> 8u) - 1;
+      o[row * P.cols + ib * 128u + e] = d1 * float(trit);
+    }
+  }
+  return;
+#else
+  uint blk = t / 8u, ib = t & 7u;
+  uint base = (tok * blocks + blk) * 136u;
+  float d = weight_half(base);
+  uint scales_h = weights[base >> 2u] >> 16u;
+  uint scales_l = weight_byte(base + 4u + ib / 2u);
+  int ls = int(((scales_l >> (4u * (ib & 1u))) & 15u) | (((scales_h >> (2u * ib)) & 3u) << 4u));
+  float dl = d * float(ls - 32);
+  for (uint j = 0u; j < 16u; j++) {
+    uint q = weight_byte(base + 8u + ib * 16u + j);
+    o[row * P.cols + blk * 256u + ib * 32u + j] = dl * float(kvalue(q & 15u));
+    o[row * P.cols + blk * 256u + ib * 32u + 16u + j] = dl * float(kvalue(q >> 4u));
+  }
+#endif
+}

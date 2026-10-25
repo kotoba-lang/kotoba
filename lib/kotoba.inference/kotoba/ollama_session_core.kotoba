@@ -1,0 +1,103 @@
+(ns ollama-session-core
+  (:export [never-expires expires-at-ms expired?
+            evict-for-load? exceeds-budget-alone? declared-bytes
+            reap-interval-ms
+            load-duration-nanos eval-duration-nanos total-duration-nanos]))
+
+;; Model-session lifecycle policy: when a loaded model may stay resident, when
+;; the reaper must unload it, and how a served request accounts for its own
+;; time. The host owns the sessions map, the locks, the reaper thread, and the
+;; clock; it owns no part of the answer.
+;;
+;; Before this core the host had no lifecycle policy at all: a loaded session
+;; lived until process exit, and /api/ps reported `expires_at` = last-used,
+;; which reads to an Ollama client as "expired the moment it was used". A
+;; 20 GiB dequantised Gemma4 never came back. See ADR-2608138800.
+;;
+;; Word-typed (i64/:bool) at both the export boundary and in the bodies — see
+;; ollama_protocol_core.kotoba for what those two mean and where each is checked.
+;; Parity: cljc/test/kotodama/inference/ollama_kotoba_parity_test.cljk
+
+;; ── expiry ───────────────────────────────────────────────────────────
+;; keep-alive-ms is already normalised by ollama-options-core: negative is the
+;; single "forever" sentinel, 0 means unload as soon as the request completes.
+
+(defn never-expires [] :i64 -1)
+
+(defn expires-at-ms [last-used-ms :i64 keep-alive-ms :i64] :i64
+  (if (< keep-alive-ms 0)
+    (never-expires)
+    (+ last-used-ms keep-alive-ms)))
+
+(defn expired? [now-ms :i64 last-used-ms :i64 keep-alive-ms :i64] :bool
+  (if (< keep-alive-ms 0)
+    false
+    (if (= keep-alive-ms 0)
+      true
+      (>= (- now-ms last-used-ms) keep-alive-ms))))
+
+;; ── admission under a memory budget ──────────────────────────────────
+;; A budget of 0 or less means unbounded, which is the current default: the
+;; host cannot measure dequantised residency honestly yet, and a budget derived
+;; from a guess would evict on invented numbers. Passing 0 is "not measured",
+;; not "no memory" — the two must not answer the same (ADR-2608136000 Q2).
+
+(defn evict-for-load? [resident-bytes :i64 incoming-bytes :i64 budget-bytes :i64] :bool
+  (if (<= budget-bytes 0)
+    false
+    (> (+ resident-bytes incoming-bytes) budget-bytes)))
+
+;; A model that does not fit the budget on its own cannot be made to fit by
+;; unloading anything, so the host must stop rather than evict every resident
+;; session and then fail anyway — which would take working models down to
+;; serve a request that was always going to be refused.
+;;
+;; Note the asymmetry with `evict-for-load?`: an unset budget (0) admits
+;; everything here too. "Not measured" must not become "nothing fits".
+
+(defn exceeds-budget-alone? [incoming-bytes :i64 budget-bytes :i64] :bool
+  (if (<= budget-bytes 0)
+    false
+    (> incoming-bytes budget-bytes)))
+
+;; What the budget is counted in: DECLARED size, from the model's own
+;; metadata, not measured residency. The JVM cannot see how many bytes a
+;; dequantised GGUF actually occupies, and a budget derived from a guess
+;; would evict live sessions on invented numbers. Declared bytes are wrong in
+;; a knowable direction — they undercount the dequantised working set — so
+;; the operator sets the budget against the same units the catalogue reports.
+;;
+;; A model whose spec declares no size counts as zero: unknown size must not
+;; silently mean "enormous" and refuse every load, nor be invented.
+
+(defn declared-bytes [size :i64] :i64
+  (if (< size 0) 0 size))
+
+;; ── reaper cadence ───────────────────────────────────────────────────
+;; Bounded on both ends: never busier than 1 s, never lazier than 60 s, so a
+;; long keep-alive still yields a live /api/ps and a keep_alive of 0 does not
+;; spin. The reaper is a floor on unload latency, not the mechanism — a session
+;; whose keep-alive is 0 is unloaded by the request that used it.
+
+(defn reap-interval-ms [keep-alive-ms :i64] :i64
+  (if (< keep-alive-ms 0)
+    60000
+    (if (< keep-alive-ms 1000)
+      1000
+      (if (> keep-alive-ms 60000) 60000 keep-alive-ms))))
+
+;; ── request time accounting (Ollama `*_duration` fields, nanoseconds) ─
+;; load_duration must be 0 when the session was already resident: a client
+;; reading a load cost on a warm request concludes the server reloads the model
+;; every time. `existed?` is the host's observation; the rule is here.
+
+(defn load-duration-nanos [existed? :bool started-nanos :i64 loaded-nanos :i64] :i64
+  (if existed?
+    0
+    (- loaded-nanos started-nanos)))
+
+(defn eval-duration-nanos [eval-started-nanos :i64 ended-nanos :i64] :i64
+  (- ended-nanos eval-started-nanos))
+
+(defn total-duration-nanos [started-nanos :i64 ended-nanos :i64] :i64
+  (- ended-nanos started-nanos))

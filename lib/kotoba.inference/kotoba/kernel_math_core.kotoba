@@ -1,0 +1,171 @@
+(ns kernel-math-core
+  (:export [dot sum-of-squares inv-rms max-element
+            exp-shifted softmax-denominator silu
+            clamp-unit clamp-non-negative]))
+
+;; The first slice of the inference ENGINE in Kotoba, as opposed to the
+;; surface's decisions (ADR-2608138800 amendment).
+;;
+;; Everything here is real float arithmetic over real weight vectors, and it
+;; is the half of a transformer step that is pure: a dot product, a sum of
+;; squares, an RMS scale, a max for softmax stability. The host keeps the
+;; bytes — GGUF mmap, dequantisation, KV cache — and hands rows in as
+;; `:vector-f64`.
+;;
+;; ── why this line, and not further in ──
+;;
+;; Measured 2026-08-13 on amu e8864273 + kotoba-kir 6d08e3c, the language has
+;; everything the arithmetic needs: `f64-add/sub/mul/div/min/max/sqrt`,
+;; `f64-lt/gt/...`, `i64-to-f64-rounded`, `:vector-f64` parameters and
+;; `vector-f64-at`/`vector-f64-count`, and tail self-recursion. A dot product
+;; over host-supplied vectors returns the right answer.
+;;
+;; What it does NOT have is any way to READ a `:bytes` value. amu's
+;; `bytes-operations` table is exactly `{bytes-empty 0}` — a constructor for
+;; the empty one, and nothing else. There is no length and no byte access, so
+;; a GGUF block cannot be dequantised here at all; that is the single
+;; primitive standing between this file and the rest of the engine, and it is
+;; `:not-yet-implemented`, not a safety constraint.
+;;
+;; ── this core deliberately does NOT claim native qualification ──
+;;
+;; ⚠ The reason WHY changed on 2026-09-09, and the old one was wrong twice
+;; over. It read: "`kotoba.kir/only-native-word-typed-features?` rejects f64
+;; expressions". Measured: it does not, and had not since ADR-2608030300 —
+;; `native-f64-arithmetic-operations` admits f64-add/sub/mul/div/min/max/abs/
+;; neg/sqrt and the bit conversions, and
+;;
+;;   (defn add [a :i64 b :i64] :i64
+;;     (f64-to-bits (f64-add (f64-from-bits a) (f64-from-bits b))))
+;;
+;; compiled to aarch64 while that sentence was in this file. What native
+;; refused was the SIGNATURE: `[x :f64] :f64` was not a shape the boundary
+;; carried. That admission landed the same day (osaho 74426bad, kotoba-verifier
+;; 39db2f3f), so `(defn scale [x :f64] :f64 (f64-mul x 2.5))` now lowers to
+;; MOVZ X1,#0x4004,LSL#48 / FMUL D0,D0,D1 on AArch64.
+;;
+;; What still keeps THIS file off native is the other half of its own
+;; docstring, above: `:vector-f64`. A vector is a context-owned handle that
+;; `native-private-handle-type?` carries between private functions and
+;; `native-function-boundary-type?` refuses at an export — so a dot product
+;; cannot be handed its operands. That is the same absence as the missing
+;; `:bytes` access, seen from the other side, and it is the one primitive
+;; between this file and a native inference kernel
+;; (com-junkawasaki adr-2609091800).
+;;
+;; Float code and word-typed code still live in separate files, and the parity
+;; test still asserts the split.
+;;
+;; Parity oracle: kotodama.inference.ops (dot-values, rms-normalize-values).
+;; Test: cljc/test/kotodama/inference/kernel_math_parity_test.cljk
+
+;; ── dot product ──────────────────────────────────────────────────────
+;; Tail self-recursion over an index; the host guarantees equal lengths, and
+;; `dot` reads its bound from `a`, so a shorter `b` traps on the read rather
+;; than silently producing a partial sum.
+
+(defn dot-from [a :vector-f64 b :vector-f64 i :i64 n :i64 acc :f64] :f64
+  (if (>= i n)
+    acc
+    (dot-from a b (+ i 1) n
+              (f64-add acc (f64-mul (vector-f64-at a i) (vector-f64-at b i))))))
+
+(defn dot [a :vector-f64 b :vector-f64] :f64
+  (dot-from a b 0 (vector-f64-count a) 0.0))
+
+;; ── sum of squares ───────────────────────────────────────────────────
+
+(defn sum-sq-from [a :vector-f64 i :i64 n :i64 acc :f64] :f64
+  (if (>= i n)
+    acc
+    (sum-sq-from a (+ i 1) n
+                 (f64-add acc (f64-mul (vector-f64-at a i) (vector-f64-at a i))))))
+
+(defn sum-of-squares [a :vector-f64] :f64
+  (sum-sq-from a 0 (vector-f64-count a) 0.0))
+
+;; ── RMS scale ────────────────────────────────────────────────────────
+;; The scalar `inv-rms` of kotodama.inference.ops/rms-normalize-values:
+;; 1 / sqrt(mean(x²) + eps). The elementwise multiply stays on the host,
+;; where the destination buffer lives.
+;;
+;; An empty vector would divide by zero here. It returns 0.0 instead of a
+;; NaN that would propagate silently through a whole layer — an empty row is
+;; a host bug, and the host can see a 0.0 scale.
+
+(defn inv-rms [a :vector-f64 eps :f64] :f64
+  (let [n (vector-f64-count a)]
+    (if (= n 0)
+      0.0
+      (f64-div 1.0
+               (f64-sqrt (f64-add (f64-div (sum-of-squares a)
+                                           (i64-to-f64-rounded n))
+                                  eps))))))
+
+;; ── max element (softmax stability) ──────────────────────────────────
+
+(defn max-from [a :vector-f64 i :i64 n :i64 acc :f64] :f64
+  (if (>= i n)
+    acc
+    (max-from a (+ i 1) n (f64-max acc (vector-f64-at a i)))))
+
+(defn max-element [a :vector-f64] :f64
+  (let [n (vector-f64-count a)]
+    (if (= n 0)
+      0.0
+      (max-from a 1 n (vector-f64-at a 0)))))
+
+;; ── softmax and SiLU ─────────────────────────────────────────────────
+;; `f64-exp-bounded` is named "bounded" but its domain is not narrow. Measured
+;; 2026-08-13 on amu e8864273: exp(-100) = 3.72e-44 and exp(100) = 2.69e43,
+;; i.e. the usable double range. The first version of this file said softmax
+;; was excluded because that domain "has not been measured" — so it got
+;; measured, and it was wide enough all along.
+;;
+;; Softmax is decomposed rather than returned as a vector: the host already
+;; owns the destination buffer, and a shifted exponential plus a denominator
+;; is the whole computation. `exp-shifted` takes the max explicitly so the
+;; caller cannot forget the stabilising subtraction.
+
+(defn exp-shifted [x :f64 m :f64] :f64
+  (f64-exp-bounded (f64-sub x m)))
+
+(defn softmax-denom-from [a :vector-f64 m :f64 i :i64 n :i64 acc :f64] :f64
+  (if (>= i n)
+    acc
+    (softmax-denom-from a m (+ i 1) n
+                        (f64-add acc (exp-shifted (vector-f64-at a i) m)))))
+
+(defn softmax-denominator [a :vector-f64 m :f64] :f64
+  (softmax-denom-from a m 0 (vector-f64-count a) 0.0))
+
+;; SiLU: x / (1 + exp(-x)). Matches kotodama.inference.ops/silu-value.
+
+(defn silu [x :f64] :f64
+  (f64-div x (f64-add 1.0 (f64-exp-bounded (f64-sub 0.0 x)))))
+
+;; ── measured, and deliberately NOT here ──────────────────────────────
+;;
+;; **RoPE.** `f64-sin-bounded`/`f64-cos-bounded` are exact at ±1000 and trap
+;; at 1e7 with `f64-bounded-angle-domain`. A RoPE angle is position divided by
+;; theta^(2i/d), and at the divisor of 1 that is the position itself — this
+;; model's context reaches 262144, well past 1000. Range reduction (mod 2π) on
+;; the host would fix it, but that is a decision about where reduction lives,
+;; not a line of arithmetic, so it is not made here.
+;;
+;; **gelu_pytorch_tanh** (Gemma4's gated MLP activation). `f64-tanh` does not
+;; exist — "operation has no admitted lowering", measured, not guessed. SiLU
+;; needs only exp, which is why it could come and GELU could not.
+;;
+;; **Dequantisation.** Still blocked on reading `:bytes`, as above.
+
+;; ── sampling parameter clamps ────────────────────────────────────────
+;; Moved off the Ollama surface (ollama_options_core.kotoba explains why they
+;; are here and not there): top_p is a probability and temperature cannot be
+;; negative. Both are float, so they belong in the float core.
+
+(defn clamp-unit [v :f64] :f64
+  (f64-min (f64-max v 0.0) 1.0))
+
+(defn clamp-non-negative [v :f64] :f64
+  (f64-max v 0.0))

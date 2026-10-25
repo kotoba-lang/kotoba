@@ -1,0 +1,162 @@
+#version 450
+// ggml K-quant dot, f32 activations, ONE row per workgroup, "s2": kdot_s1_r1
+// (block header staged through shared memory once per block) extended to every
+// format -- Q4_K/Q5_K stage the 16-byte header, IQ4_XS its 8-byte header,
+// Q6_K its 16 scale bytes + d (unaligned from the second block on, so through
+// weight_u32_at) -- and the activation read as one vec4 per thread instead of
+// four scalars. Written for nvgpu (Xavier), where the pinned-clock gap between
+// the K-quant kdot (14 GB/s) and the f32 kernel (79) is dequant arithmetic and
+// loads, not layout (root ADR-2609182400 C, iteration 8). Dispatch: (rows, positions, 1). -- the GLSL twin of
+// kotoba-lang/inference shaders/ggml_kdot_f32_r8.wgsl for the native
+// :gpu/compute path (root ADR-2609182400 C). Same bindings, same Meta, same
+// dequant helpers; every buffer is std430 storage so the .kotoba guest's
+// PIPELINE declares five storage bindings and nothing else.
+//   tensor_type: 12 Q4_K (144 B/256) | 13 Q5_K (176) | 14 Q6_K (210) | 23 IQ4_XS (136)
+// Dispatch: (ceil(rows / 8), positions, 1).
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer Meta {
+  uint rows; uint cols; uint tensor_type; uint positions; uint input_per_expert; uint pad0; uint pad1; uint pad2;
+} params;
+layout(std430, binding = 1) readonly buffer W { uint weights[]; };
+layout(std430, binding = 2) readonly buffer X { vec4 x4[]; };   // index is t*4 + multiples of 256: always vec4-aligned
+layout(std430, binding = 3) buffer O { float outp[]; };
+layout(std430, binding = 4) readonly buffer E { uint expert_ids[]; };
+
+shared float partial[64];
+shared uint hdr[5];   // this block's header (Q4/Q5: d, dmin, scales; IQ4_XS: d, scales_h, scales_l; Q6_K: 16 scales + d), loaded once per block
+uint hbyte(uint off) { return (hdr[off >> 2u] >> ((off & 3u) * 8u)) & 255u; }
+int h_scale(uint j) { if (j < 4u) return int(hbyte(4u + j) & 63u); return int((hbyte(8u + j) & 15u) | ((hbyte(j) >> 6u) << 4u)); }
+int h_min(uint j) { if (j < 4u) return int(hbyte(8u + j) & 63u); return int((hbyte(8u + j) >> 4u) | ((hbyte(4u + j) >> 6u) << 4u)); }
+
+uint weight_byte(uint offset) { return (weights[offset >> 2u] >> ((offset & 3u) * 8u)) & 255u; }
+float weight_half(uint offset) {
+  vec2 pair = unpackHalf2x16(weights[offset >> 2u]);
+  return ((offset & 2u) != 0u) ? pair.y : pair.x;
+}
+int q4_scale(uint base, uint j) {
+  if (j < 4u) return int(weight_byte(base + 4u + j) & 63u);
+  return int((weight_byte(base + 8u + j) & 15u) | ((weight_byte(base + j) >> 6u) << 4u));
+}
+int q4_min(uint base, uint j) {
+  if (j < 4u) return int(weight_byte(base + 8u + j) & 63u);
+  return int((weight_byte(base + 8u + j) >> 4u) | ((weight_byte(base + 4u + j) >> 6u) << 4u));
+}
+ivec4 q4_word_values(uint base, uint index) {
+  uint group = index / 64u; uint within = index & 63u;
+  uint w = weights[(base + 16u + group * 32u + (within & 31u)) >> 2u];
+  uint shift = (within >= 32u) ? 4u : 0u;
+  return ivec4(int((w >> shift) & 15u), int((w >> (8u + shift)) & 15u), int((w >> (16u + shift)) & 15u), int((w >> (24u + shift)) & 15u));
+}
+uint weight_u32_at(uint offset) {
+  uint w0 = weights[offset >> 2u]; uint shift = (offset & 3u) * 8u;
+  if (shift == 0u) return w0;
+  uint w1 = weights[(offset >> 2u) + 1u];
+  return (w0 >> shift) | (w1 << (32u - shift));
+}
+ivec4 q6_word_values(uint base, uint index) {
+  uint group = index / 128u; uint within = index & 127u; uint lane = within & 31u;
+  uint ql_base = base + group * 64u;
+  uint qh = weight_u32_at(base + 128u + group * 32u + lane);
+  uint quarter = within / 32u;
+  uint ql = weight_u32_at(ql_base + (((quarter & 1u) == 1u) ? 32u : 0u) + lane);
+  uint ql_shift = (quarter >= 2u) ? 4u : 0u;
+  uint qh_shift = quarter * 2u;
+  // written out: a dynamically indexed ivec4 in a loop goes to local memory on
+  // NVIDIA (measured 2026-09-19 on the Xavier: 1 GB/s against 54 for f32)
+  return ivec4(int(((ql >> ql_shift) & 15u) | (((qh >> qh_shift) & 3u) << 4u)) - 32,
+               int(((ql >> (8u + ql_shift)) & 15u) | (((qh >> (8u + qh_shift)) & 3u) << 4u)) - 32,
+               int(((ql >> (16u + ql_shift)) & 15u) | (((qh >> (16u + qh_shift)) & 3u) << 4u)) - 32,
+               int(((ql >> (24u + ql_shift)) & 15u) | (((qh >> (24u + qh_shift)) & 3u) << 4u)) - 32);
+}
+// IQ4_XS codebook (ggml kvalues_iq4nl) as four packed words of int8, selected
+// by comparison rather than indexed: a dynamically indexed constant array is
+// local memory on NVIDIA.
+//   -127,-104,-83,-65 | -49,-35,-22,-10 | 1,13,25,38 | 53,69,89,113
+int kvalue(uint i) {
+  uint w = (i < 4u) ? 0xBFAD9881u : (i < 8u) ? 0xF6EADDCFu : (i < 12u) ? 0x26190D01u : 0x71594535u;
+  return bitfieldExtract(int(w), int((i & 3u) * 8u), 8);
+}
+ivec4 q5_word_values(uint base, uint index) {
+  uint group = index / 64u; uint within = index & 63u; uint lane = within & 31u;
+  bool hi_half = within >= 32u;
+  uint qs = weights[(base + 48u + group * 32u + lane) >> 2u];
+  uint qh = weights[(base + 16u + lane) >> 2u];
+  uint shift = hi_half ? 4u : 0u;
+  uint bit = 2u * group + (hi_half ? 1u : 0u);
+  return ivec4(int(((qs >> shift) & 15u) | (((qh >> bit) & 1u) << 4u)),
+               int(((qs >> (8u + shift)) & 15u) | (((qh >> (8u + bit)) & 1u) << 4u)),
+               int(((qs >> (16u + shift)) & 15u) | (((qh >> (16u + bit)) & 1u) << 4u)),
+               int(((qs >> (24u + shift)) & 15u) | (((qh >> (24u + bit)) & 1u) << 4u)));
+}
+ivec4 iq4xs_word_values(uint base, uint index) {
+  uint ib = index / 32u; uint within = index & 31u; bool hi = within >= 16u;
+  uint w = weights[(base + 8u + ib * 16u + (hi ? within - 16u : within)) >> 2u];
+  uint shift = hi ? 4u : 0u;
+  return ivec4(kvalue((w >> shift) & 15u), kvalue((w >> (8u + shift)) & 15u),
+               kvalue((w >> (16u + shift)) & 15u), kvalue((w >> (24u + shift)) & 15u));
+}
+int iq4xs_scale(uint base, uint ib) {
+  uint scales_h = weights[base >> 2u] >> 16u;
+  uint scales_l = weight_byte(base + 4u + ib / 2u);
+  return int(((scales_l >> (4u * (ib & 1u))) & 15u) | (((scales_h >> (2u * ib)) & 3u) << 4u));
+}
+uint block_bytes_of(uint t) {
+  if (t == 12u) return 144u; if (t == 13u) return 176u; if (t == 14u) return 210u; if (t == 23u) return 136u; return 0u;
+}
+
+void main() {
+  uint row = gl_WorkGroupID.x;
+  uint position = gl_WorkGroupID.y;
+  uint t = gl_LocalInvocationID.x;
+  uint expert = expert_ids[position];
+  uint in_row = (params.input_per_expert == 1u) ? position : 0u;
+  uint blocks = params.cols / 256u;
+  uint tt = params.tensor_type;
+  uint block_bytes = block_bytes_of(tt);
+  uint row_bytes = blocks * block_bytes;
+  uint index = t * 4u;
+  float acc = 0.0; float mins = 0.0;
+  if (row < params.rows && position < params.positions) {
+    uint rowbase = (expert * params.rows + row) * row_bytes;
+    for (uint block = 0u; block < blocks; block++) {
+      uint xb = in_row * params.cols + block * 256u + index;
+      vec4 y = x4[xb >> 2u];
+      uint wb = rowbase + block * block_bytes;
+      if (tt == 12u || tt == 13u) {
+        if (t < 4u) hdr[t] = weights[(wb >> 2u) + t];
+        barrier();
+        uint j = index / 32u;
+        vec2 dd = unpackHalf2x16(hdr[0]);
+        ivec4 q = (tt == 12u) ? q4_word_values(wb, index) : q5_word_values(wb, index);
+        acc += dd.x * float(h_scale(j)) * dot(vec4(q), y);
+        mins += dd.y * float(h_min(j)) * (y.x + y.y + y.z + y.w);
+        barrier();
+      } else if (tt == 23u) {
+        if (t < 2u) hdr[t] = weights[(wb >> 2u) + t];
+        barrier();
+        uint ib = index / 32u;
+        uint scales_h = hdr[0] >> 16u;
+        uint scales_l = hbyte(4u + ib / 2u);
+        float ls = float(int(((scales_l >> (4u * (ib & 1u))) & 15u) | (((scales_h >> (2u * ib)) & 3u) << 4u)) - 32);
+        ivec4 q = iq4xs_word_values(wb, index);
+        acc += unpackHalf2x16(hdr[0]).x * ls * dot(vec4(q), y);
+        barrier();
+      } else {
+        if (t < 5u) hdr[t] = weight_u32_at(wb + 192u + t * 4u);
+        barrier();
+        uint j = index / 16u;
+        float scale = float(bitfieldExtract(int(hdr[j >> 2u]), int((j & 3u) * 8u), 8));
+        ivec4 q = q6_word_values(wb, index);
+        acc += unpackHalf2x16(hdr[4]).x * scale * dot(vec4(q), y);
+        barrier();
+      }
+    }
+  }
+  partial[t] = acc - mins;
+  barrier();
+  for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+    if (t < stride) partial[t] += partial[t + stride];
+    barrier();
+  }
+  if (t == 0u && row < params.rows && position < params.positions) outp[position * params.rows + row] = partial[0];
+}

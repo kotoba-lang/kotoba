@@ -1,0 +1,129 @@
+;; The Kotoba engine kernel against the cljc implementation it has to match.
+;;
+;; Unlike the ollama decision cores, this one has a REAL oracle: the same
+;; quantities are already computed by kotodama.inference.ops, which is what
+;; the running model uses. So parity here is not "does it match a literal I
+;; wrote down" but "does the Kotoba kernel agree with the engine".
+;;
+;; Float equality is exact where the operation order is identical (a left fold
+;; in both), and within a tolerance where it is not.
+
+(ns kotodama.inference.kernel-math-parity-test
+  (:require [clojure.edn :as edn]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]
+            [kotodama.inference.host.oracle :as oracle]
+            [kotodama.inference.ops :as ops]))
+
+(def ^:private source "kotoba/kernel_math_core.kotoba")
+
+(defn- call [export & args]
+  (oracle/call :kernel-math export args))
+
+(defn- close? [a b]
+  (< (Math/abs (- (double a) (double b))) 1.0e-9))
+
+;; ── the artifact is current ──────────────────────────────────────────
+
+(deftest shipped-artifact-matches-source
+  (is (= (edn/read-string (slurp "resources/kotodama/oracle/kernel_math_core.kir.edn"))
+         (:kir (compiler/compile-source (slurp source) :wasm32-kotoba-v1 {})))
+      "artifact is stale — run `kbb -M:test:gen`"))
+
+;; ── parity against the engine's own ops ──────────────────────────────
+
+(deftest dot-agrees-with-ops
+  (let [corpus [[[1.0 2.0 3.0] [4.0 5.0 6.0]]
+                [[0.0] [0.0]]
+                [[-1.5 2.25] [4.0 -0.5]]
+                [(vec (repeat 40 0.1)) (vec (repeat 40 0.3))]
+                [(mapv #(/ (double %) 7.0) (range 33))
+                 (mapv #(- (/ (double %) 11.0) 1.0) (range 33))]]]
+    (is (seq corpus))
+    (doseq [[a b] corpus]
+      (is (close? (ops/dot-values a b) (call :dot a b))
+          (str "dot mismatch for length " (count a))))))
+
+(deftest inv-rms-agrees-with-rms-normalize
+  ;; ops/rms-normalize-values scales every element by inv-rms; recovering the
+  ;; scalar from its first element is exactly the quantity this core returns.
+  (doseq [xs [[1.0 2.0 3.0]
+              [0.5 0.5 0.5 0.5]
+              (mapv #(+ 0.25 (/ (double %) 13.0)) (range 20))]]
+    (let [eps 1.0e-6
+          normalized (ops/rms-normalize-values xs eps)
+          expected (/ (double (first normalized)) (double (first xs)))]
+      (is (close? expected (call :inv-rms xs eps))
+          (str "inv-rms mismatch for length " (count xs))))))
+
+(deftest sum-of-squares-and-max
+  (doseq [xs [[1.0 2.0 3.0] [-4.0 0.5] [7.5]]]
+    (is (close? (reduce + (map #(* % %) xs)) (call :sum-of-squares xs)))
+    (is (close? (apply max xs) (call :max-element xs)))))
+
+(deftest empty-input-answers-zero-rather-than-nan
+  ;; An empty row is a host bug. A NaN scale would propagate silently through
+  ;; a whole layer; a 0.0 is visible to the caller.
+  (is (= 0.0 (call :inv-rms [] 1.0e-6)))
+  (is (= 0.0 (call :max-element []))))
+
+(deftest softmax-agrees-with-ops
+  ;; ops/softmax-values returns the whole distribution; this core returns the
+  ;; two scalars it is built from, so reconstruct and compare elementwise.
+  (doseq [xs [[1.0 2.0 3.0]
+              [0.0 0.0 0.0]
+              [-5.0 5.0]
+              (mapv #(- (/ (double %) 3.0) 4.0) (range 12))]]
+    (let [expected (ops/softmax-values xs)
+          m (call :max-element xs)
+          denom (call :softmax-denominator xs m)
+          actual (mapv #(/ (call :exp-shifted (double %) m) denom) xs)]
+      (is (every? true? (map close? expected actual))
+          (str "softmax mismatch for " xs))
+      (is (close? 1.0 (reduce + actual)) "reconstructed distribution must sum to 1"))))
+
+(deftest silu-agrees-with-ops
+  (doseq [x [0.0 1.0 -1.0 4.5 -4.5 20.0 -20.0]]
+    (is (close? (ops/silu-value x) (call :silu x))
+        (str "silu mismatch at " x))))
+
+(deftest exp-is-not-narrowly-bounded
+  ;; The reason softmax was originally left out of this core was an unmeasured
+  ;; assumption about f64-exp-bounded's domain. Pin the measurement so the
+  ;; assumption cannot come back.
+  ;; An absolute tolerance would pass here even if exp underflowed to zero,
+  ;; which is the exact failure this pins. Bracket it instead.
+  (let [v (call :exp-shifted -100.0 0.0)]
+    (is (< 1.0e-45 v 1.0e-43) (str "exp(-100) came back as " v)))
+  (let [v (call :exp-shifted 100.0 0.0)]
+    (is (< 1.0e42 v 1.0e44) (str "exp(100) came back as " v)))
+  (is (close? 1.0 (call :exp-shifted 5.0 5.0))))
+
+(deftest sampling-clamps
+  (is (= 0.0 (call :clamp-unit -0.5)))
+  (is (= 1.0 (call :clamp-unit 1.5)))
+  (is (= 0.7 (call :clamp-unit 0.7)))
+  (is (= 0.0 (call :clamp-non-negative -2.0)))
+  (is (= 1.3 (call :clamp-non-negative 1.3))))
+
+;; ── the native split is asserted, not assumed ────────────────────────
+
+(deftest float-core-is-outside-the-native-word-typed-walk
+  ;; Not a defect: kotoba.kir's walk rejects f64 while amu's own native
+  ;; backend pins it (amu ADR 0241). This test exists so that if the walk is
+  ;; extended, someone notices here rather than discovering it years later —
+  ;; and so the ollama cores' native claim is never quietly widened to
+  ;; include this file.
+  (let [hir (:hir (compiler/compile-source (slurp source) :wasm32-kotoba-v1 {}))]
+    (is (false? (boolean (ir/only-native-word-typed-features? hir)))
+        (str "kotoba.kir now admits f64 — this core can join the native gate, "
+             "and the comment in kernel_math_core.kotoba should be updated"))))
+
+(deftest decision-cores-stay-inside-it
+  (doseq [core ["kotoba/ollama_protocol_core.kotoba"
+                "kotoba/ollama_options_core.kotoba"
+                "kotoba/ollama_session_core.kotoba"]]
+    (is (true? (boolean (ir/only-native-word-typed-features?
+                         (:hir (compiler/compile-source (slurp core) :wasm32-kotoba-v1 {})))))
+        (str core " left the word-typed boundary"))))

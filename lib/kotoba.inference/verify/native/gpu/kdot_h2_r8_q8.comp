@@ -1,0 +1,100 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// kdot_h2_r8_q8: the kdot_h2_r1 Q8_0 dot with EIGHT output rows per workgroup
+// — the small-matvec class, second step (the lm-head's tail: 151936 rows /
+// 8 = 18992 workgroups vs r1's 151936; the layer-scan decomposition priced
+// the tail at 1.475 ms of which the lm-head ramp is the main part).
+//
+// Eight independent accumulator chains (constant loop bounds, one dot_row per
+// row) — the rows never mix, so the arithmetic is kdot_h2_r1's per-row dot
+// verbatim. Register footprint: 8 accumulators + the term temporaries; if a
+// compiler spills, the r4 kernel remains the fallback.
+//
+// Same 5-binding interface and Meta layout as kdot_h2_r1; grid = ceil(rows/8)
+// via the rows-of-spv filename convention. Q8_0 only (LMT/layer-type gates).
+// Bindings: 0 Meta, 1 W, 2 X, 3 O, 4 E (unused).
+// Dispatch: (ceil(rows / 8), positions, 1).
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer Meta {
+  uint rows; uint cols; uint tensor_type; uint positions; uint input_per_expert; uint pad0; uint pad1; uint pad2;
+} params;
+layout(std430, binding = 1) readonly buffer W { uint weights[]; };
+layout(std430, binding = 2) readonly buffer X { vec4 x4[]; };
+layout(std430, binding = 3) buffer O { float outp[]; };
+layout(std430, binding = 4) readonly buffer E { uint expert_ids[]; };
+
+shared float psum[8][8];   // [row-slot][subgroup], <= 8 subgroups of 64 threads
+
+uint weight_u32_at(uint offset) {
+  uint w0 = weights[offset >> 2u];
+  uint shift = (offset & 3u) * 8u;
+  if (shift == 0u) return w0;
+  uint w1 = weights[(offset >> 2u) + 1u];
+  return (w0 >> shift) | (w1 << (32u - shift));
+}
+float weight_half(uint offset) {
+  vec2 pair = unpackHalf2x16(weights[offset >> 2u]);
+  return ((offset & 2u) != 0u) ? pair.y : pair.x;
+}
+float term8(uint wb, uint index, f16vec2 ylo, f16vec2 yhi) {
+  uint bo = wb + (index / 32u) * 34u;
+  uint codes = weight_u32_at(bo + 2u + (index & 31u));
+  f16vec2 qlo = f16vec2(float16_t(bitfieldExtract(int(codes), 0, 8)), float16_t(bitfieldExtract(int(codes), 8, 8)));
+  f16vec2 qhi = f16vec2(float16_t(bitfieldExtract(int(codes), 16, 8)), float16_t(bitfieldExtract(int(codes), 24, 8)));
+  float d = weight_half(bo);
+  f16vec2 p0 = qlo * ylo, p1 = qhi * yhi;
+  return d * (float(p0.x) + float(p0.y) + float(p1.x) + float(p1.y));
+}
+float dot_row(uint rowbase, uint xrow, uint blocks, uint index) {
+  float acc0 = 0.0, acc1 = 0.0;
+  uint b = 0u;
+  for (; b + 1u < blocks; b += 2u) {
+    if (b * 256u + index >= params.cols) break;
+    vec4 y0 = x4[(xrow + b * 256u) >> 2u];
+    acc0 += term8(rowbase + b * 272u, index, f16vec2(y0.xy), f16vec2(y0.zw));
+    if ((b + 1u) * 256u + index < params.cols) {
+      vec4 y1 = x4[(xrow + (b + 1u) * 256u) >> 2u];
+      acc1 += term8(rowbase + (b + 1u) * 272u, index, f16vec2(y1.xy), f16vec2(y1.zw));
+    }
+  }
+  if (b < blocks && b * 256u + index < params.cols) {
+    vec4 y0 = x4[(xrow + b * 256u) >> 2u];
+    acc0 += term8(rowbase + b * 272u, index, f16vec2(y0.xy), f16vec2(y0.zw));
+  }
+  return acc0 + acc1;
+}
+
+void main() {
+  uint base_row = gl_WorkGroupID.x * 8u;
+  uint position = gl_WorkGroupID.y;
+  uint t = gl_LocalInvocationID.x;
+  uint index = t * 4u;
+  uint blocks = (params.cols + 255u) / 256u;
+  uint row_bytes = ((params.cols + 31u) / 32u) * 34u;
+  uint in_row = ((params.input_per_expert == 1u) ? ((params.pad0 > 1u) ? position / params.pad0 : position) : 0u) + params.pad1;
+  uint xrow = in_row * params.cols + index;
+  float s[8];
+  for (uint k = 0u; k < 8u; k++) s[k] = 0.0;
+  if (position < params.positions) {
+    for (uint k = 0u; k < 8u; k++) {
+      uint r = base_row + k;
+      if (r < params.rows) s[k] = dot_row(r * row_bytes, xrow, blocks, index);
+    }
+  }
+  for (uint k = 0u; k < 8u; k++) {
+    float g = subgroupAdd(s[k]);
+    if (subgroupElect()) psum[k][gl_SubgroupID] = g;
+  }
+  barrier();
+  if (t == 0u && position < params.positions) {
+    for (uint k = 0u; k < 8u; k++) {
+      uint r = base_row + k;
+      if (r < params.rows) {
+        float a = 0.0;
+        for (uint i = 0u; i < gl_NumSubgroups; i++) a += psum[k][i];
+        outp[position * params.rows + r] = a;
+      }
+    }
+  }
+}

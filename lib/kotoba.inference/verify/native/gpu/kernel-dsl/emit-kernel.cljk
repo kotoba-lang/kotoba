@@ -1,0 +1,457 @@
+;; emit-kernel.cljk — the kotoba kernel DSL emitter (JUN-139).
+;;
+;;   kbb --backend sci emit-kernel.cljk <src.kernel.kotoba> <glsl|msl> <out>
+;;
+;; Renders one kernel from the DSL source into GLSL or MSL. The arithmetic is
+;; rendered FROM THE SOURCE'S TAGGED CHAINS (:term8/:acc-chain/:reduce); the
+;; emitters never reorder or transform. Two shape rules, both learned by
+;; measurement and part of the contract:
+;;   * the row chains are emitted UNROLLED with named scalars (s0..sN) — a
+;;     `s[k]` array with loop indices goes to local memory and measured 1.8x
+;;     slower on Metal (the same spill class as the r8 dose);
+;;   * the simdgroup reduce is an explicit fixed-order butterfly
+;;     (shuffle-xor halving) in BOTH languages — the backend's simd_sum /
+;;     subgroupAdd have implementation-defined orders and measured 2.7e-3
+;;     apart; the source fixes the tree completely.
+(ns emit-kernel
+  (:require [clojure.edn :as edn] [clojure.string :as str] ["fs" :as fs] ["path" :as path]))
+
+(def args (vec *command-line-args*))
+(when (not= 3 (count args))
+  (println "usage: <src.kernel.kotoba> <glsl|msl> <out>") (js/process.exit 2))
+(def src (edn/read-string (fs/readFileSync (args 0) "utf8")))
+(def lang (keyword (args 1)))
+(def out-path (args 2))
+
+(def shape (:kernel/shape src))
+(def threads (:threads shape))
+(def rows-per (:rows-per-threadgroup shape))
+(def block-bytes (:block-bytes shape))
+(def group-bytes (:group-bytes shape))
+(def term8 (:term8 src))
+(def conv (:conv term8))
+(def sum-order (str/split (second (:sum term8)) #"\s+"))
+(def rows-u (str rows-per "u"))
+
+;; ---- the arithmetic renderers (the identity contract lives in the data) ----
+
+(defn conv-codes [lang codes-var]
+  ;; :conv :i8h -> four int8->half conversions, x y z w in this order. The
+  ;; exponent trick is BANNED (metal-iteration4: 1.8x slower AND different
+  ;; rounding); any other :conv form needs re-verification before it renders.
+  (assert (= conv :i8h) "only :conv :i8h is verified")
+  (case lang
+    :glsl (str "f16vec2 qlo = f16vec2(float16_t(bitfieldExtract(int(" codes-var "), 0, 8)), float16_t(bitfieldExtract(int(" codes-var "), 8, 8)));\n"
+               "  f16vec2 qhi = f16vec2(float16_t(bitfieldExtract(int(" codes-var "), 16, 8)), float16_t(bitfieldExtract(int(" codes-var "), 24, 8)));")
+    :msl  (str "half2 qlo = half2((half)(int8_t)(" codes-var " & 0xFFu), (half)(int8_t)((" codes-var " >> 8u) & 0xFFu));\n"
+               "  half2 qhi = half2((half)(int8_t)((" codes-var " >> 16u) & 0xFFu), (half)(int8_t)((" codes-var " >> 24u) & 0xFFu));")))
+
+(defn term8-body [lang]
+  ;; the Q8_0 block product; the SUM ORDER comes from the source verbatim
+  (assert (= sum-order ["(p0.x)" "(p0.y)" "(p1.x)" "(p1.y)"]) "sum order drift")
+  (let [codes-call (case lang
+                     :glsl "uint codes = weight_u32_at(bo + 2u + (index & 31u));"
+                     :msl  "uint codes = w_u32_at(weights, bo + 2u + (index & 31u));")
+        scale-call (case lang
+                     :glsl "float d = weight_half(bo);"
+                     :msl  "float d = w_half(weights, bo);")
+        ;; :product :f16-rounded — the CONTRACT is the f16 rounding of each
+        ;; product. GLSL's f16vec2 multiply rounds by spec; MSL's half2
+        ;; multiply may promote to f32 (the measured 2.7e-3 cross-backend
+        ;; drift), so the MSL renderer FORCES the rounding with explicit
+        ;; half() casts on each product.
+        prod (case lang
+               :glsl "f16vec2 p0 = qlo * ylo, p1 = qhi * yhi;"
+               :msl  (str "half2 p0 = half2(half(qlo.x * ylo.x), half(qlo.y * ylo.y));
+"
+                          "  half2 p1 = half2(half(qhi.x * yhi.x), half(qhi.y * yhi.y));"))]
+    (str "uint bo = wb + (index / 32u) * " block-bytes "u;\n  "
+         codes-call "\n  " (conv-codes lang "codes") "\n  "
+         scale-call "\n  " prod "\n  "
+         "return d * (" (str/join " + " ["float(p0.x)" "float(p0.y)" "float(p1.x)" "float(p1.y)"]) ");")))
+
+(defn red-fn [lang]
+  ;; :reduce stage 1 FIXED-ORDER: a shuffle-xor butterfly (halving) — the
+  ;; backend's own simd_sum/subgroupAdd orders are implementation-defined
+  ;; (measured 2.7e-3 apart across backends); this makes the tree identical.
+  (case lang
+    :glsl (str "float red_sum(float v, uint tg, float red[256]) { red[tg] = v; barrier();\n"
+               "  for (uint st = 128u; st > 0u; st >>= 1u) { if (tg < st) red[tg] += red[tg + st]; barrier(); }\n"
+               "  float r = red[0]; barrier(); return r; }")
+    :msl  (str "static inline float red_sum(float v, uint t_global, threadgroup float *red) { red[t_global] = v; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+               "  for (uint st = 128u; st > 0u; st >>= 1u) { if (t_global < st) red[t_global] += red[t_global + st]; threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
+               "  float r = red[0]; threadgroup_barrier(mem_flags::mem_threadgroup); return r; }")))
+
+(defn reduce-tail [lang]
+  ;; :reduce stages 2-3: lane-0 partials by simdgroup index, ONE barrier
+  ;; outside row divergence, thread-0 sums the partials in index order. The
+  ;; per-row chains are UNROLLED (named scalars).
+  (let [stages (:reduce src)]
+    (assert (= (:stage-2 stages) :lane0-writes-partial-by-simdgroup-index) "reduce order drift")
+    (str
+      (str/join "\n  " (for [k (range rows-per)]
+                         (str "float g" k " = red_sum(s" k "); if (" (case lang :glsl "subgroupElect()" :msl "lane == 0") ") partial[" k "]["
+                              (case lang :glsl "gl_SubgroupID" :msl "sgid") "] = g" k ";")))
+      "\n  " (case lang :glsl "barrier();" :msl "threadgroup_barrier(mem_flags::mem_threadgroup);") "\n"
+      "  if (live && t == 0u) {\n"
+      (case lang :glsl "" :msl "    uint ns = (63u / sgsz) + 1u;\n")
+      (str/join "\n" (for [k (range rows-per)]
+                       (str "    { uint row = base_row + " k "u; if (row < params.rows) {\n"
+                            "        float a = 0.0; for (uint i = 0u; i < " (case lang :glsl "gl_NumSubgroups" :msl "ns") "; i++) a += partial[" k "][i];\n"
+                            "        outp[position * params.rows + row] = a; } }")))
+      "\n  }")))
+
+;; ---- the skeletons (shape-fixed, parallel by construction) -----------------
+
+(defn common-body [lang]
+  (str "  uint t = " (case lang :glsl "gl_LocalInvocationID.x" :msl "lid.x") ";\n"
+       "  uint base_row = " (case lang :glsl "gl_WorkGroupID.x" :msl "wgid.x") " * " rows-u ";\n"
+       "  uint position = " (case lang :glsl "gl_WorkGroupID.y" :msl "wgid.y") ";\n"
+       "  uint expert = expert_ids[position];\n"
+       "  uint in_row = ((params.input_per_expert == 1u) ? ((params.pad0 > 1u) ? position / params.pad0 : position) : 0u) + params.pad1;\n"
+       "  uint index = t * 4u, blocks = (params.cols + 255u) / 256u;\n"
+       "  uint row_bytes = ((params.cols + 31u) / 32u) * " block-bytes "u;\n"
+       "  uint xrow = in_row * params.cols + index;\n"
+       "  bool live = position < params.positions;\n"
+       ;; the row chains UNROLLED: named scalars, no dynamic indexing (spill class)
+       (str/join "\n" (for [k (range rows-per)]
+                        (str "  float s" k " = 0.0" (when (= lang :msl) "f") ";")))
+       "\n"
+       (str/join "\n" (for [k (range rows-per)]
+                        (str "  if (live && base_row + " k "u < params.rows) s" k " = dot_row("
+                             (when (= lang :msl) "weights, x4, ")
+                             "(expert * params.rows + base_row + " k "u) * row_bytes, xrow, blocks"
+                             (when (= lang :msl) ", params.cols") ", index);")))
+       "\n  " (reduce-tail lang)))
+
+(defn glsl-kernel []
+  (str "#version 450\n"
+       "#extension GL_KHR_shader_subgroup_arithmetic : enable\n"
+       "#extension GL_KHR_shader_subgroup_shuffle : enable\n"
+       "#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require\n"
+       "// GENERATED by emit-kernel.cljk from " (path/basename (args 0)) " -- do not edit.\n"
+       "// " (:kernel/name src) "  rows-per-threadgroup=" rows-per " (the tuned dose; 8 spills on Apple)\n"
+       "layout(local_size_x = " threads ") in;\n"
+       "layout(std430, binding = 0) readonly buffer Meta { uint rows; uint cols; uint tensor_type; uint positions; uint input_per_expert; uint pad0; uint pad1; uint pad2; } params;\n"
+       "layout(std430, binding = 1) readonly buffer W { uint weights[]; };\n"
+       "layout(std430, binding = 2) readonly buffer X { vec4 x4[]; };\n"
+       "layout(std430, binding = 3) buffer O { float outp[]; };\n"
+       "layout(std430, binding = 4) readonly buffer E { uint expert_ids[]; };\n"
+       "shared float partial[" rows-per "][8];\n"
+       "uint weight_u32_at(uint offset) { uint w0 = weights[offset >> 2u]; uint shift = (offset & 3u) * 8u;\n"
+       "  if (shift == 0u) return w0; uint w1 = weights[(offset >> 2u) + 1u]; return (w0 >> shift) | (w1 << (32u - shift)); }\n"
+       "float weight_half(uint offset) { vec2 pair = unpackHalf2x16(weights[offset >> 2u]); return ((offset & 2u) != 0u) ? pair.y : pair.x; }\n"
+       (red-fn :glsl) "\n"
+       "float term8(uint wb, uint index, f16vec2 ylo, f16vec2 yhi) {\n  " (term8-body :glsl) "\n}\n"
+       "float dot_row(uint rowbase, uint xrow, uint blocks, uint index) {\n"
+       "  float acc0 = 0.0, acc1 = 0.0; uint b = 0u;\n"
+       "  for (; b + 1u < blocks; b += 2u) {\n"
+       "    if (b * 256u + index >= params.cols) break;\n"
+       "    vec4 y0 = x4[(xrow + b * 256u) >> 2u];\n"
+       "    acc0 += term8(rowbase + b * " group-bytes "u, index, f16vec2(y0.xy), f16vec2(y0.zw));\n"
+       "    if ((b + 1u) * 256u + index < params.cols) {\n"
+       "      vec4 y1 = x4[(xrow + (b + 1u) * 256u) >> 2u];\n"
+       "      acc1 += term8(rowbase + (b + 1u) * " group-bytes "u, index, f16vec2(y1.xy), f16vec2(y1.zw));\n"
+       "    }\n"
+       "  }\n"
+       "  if (b < blocks && b * 256u + index < params.cols) {\n"
+       "    vec4 y0 = x4[(xrow + b * 256u) >> 2u];\n"
+       "    acc0 += term8(rowbase + b * " group-bytes "u, index, f16vec2(y0.xy), f16vec2(y0.zw));\n"
+       "  }\n"
+       "  return acc0 + acc1;\n}\n"
+       "void main() {\n" (common-body :glsl) "\n}\n"))
+
+(defn msl-kernel []
+  (str "#include <metal_stdlib>\nusing namespace metal;\n"
+       "// GENERATED by emit-kernel.cljk from " (path/basename (args 0)) " -- do not edit.\n"
+       "// " (:kernel/name src) "  rows-per-threadgroup=" rows-per " (the tuned dose; 8 spills on Apple)\n"
+       "struct Meta { uint rows; uint cols; uint tensor_type; uint positions; uint input_per_expert; uint pad0; uint pad1; uint pad2; };\n"
+       "static inline uint w_u32_at(const device uint *weights, uint offset) { uint w0 = weights[offset >> 2u]; uint shift = (offset & 3u) * 8u;\n"
+       "  if (shift == 0u) return w0; uint w1 = weights[(offset >> 2u) + 1u]; return (w0 >> shift) | (w1 << (32u - shift)); }\n"
+       "static inline float w_half(const device uint *weights, uint offset) { uint w = weights[offset >> 2u]; half2 pair = as_type<half2>(w); return (float)(((offset & 2u) != 0u) ? pair.y : pair.x); }\n"
+       (red-fn :msl) "\n"
+       "static inline float term8(const device uint *weights, uint wb, uint index, half2 ylo, half2 yhi) {\n  " (term8-body :msl) "\n}\n"
+       "static inline float dot_row(const device uint *weights, const device float4 *x4, uint rowbase, uint xrow, uint blocks, uint n, uint index) {\n"
+       "  float acc0 = 0.0f, acc1 = 0.0f; uint b = 0u;\n"
+       "  for (; b + 1u < blocks; b += 2u) {\n"
+       "    if (b * 256u + index >= n) break;\n"
+       "    float4 y0 = x4[(xrow + b * 256u) >> 2u];\n"
+       "    acc0 += term8(weights, rowbase + b * " group-bytes "u, index, half2(y0.xy), half2(y0.zw));\n"
+       "    if ((b + 1u) * 256u + index < n) {\n"
+       "      float4 y1 = x4[(xrow + (b + 1u) * 256u) >> 2u];\n"
+       "      acc1 += term8(weights, rowbase + (b + 1u) * " group-bytes "u, index, half2(y1.xy), half2(y1.zw));\n"
+       "    }\n"
+       "  }\n"
+       "  if (b < blocks && b * 256u + index < n) {\n"
+       "    float4 y0 = x4[(xrow + b * 256u) >> 2u];\n"
+       "    acc0 += term8(weights, rowbase + b * " group-bytes "u, index, half2(y0.xy), half2(y0.zw));\n"
+       "  }\n"
+       "  return acc0 + acc1;\n}\n"
+       "kernel void kmain(constant Meta &params [[buffer(0)]], const device uint *weights [[buffer(1)]],\n"
+       "                  const device float4 *x4 [[buffer(2)]], device float *outp [[buffer(3)]],\n"
+       "                  const device uint *expert_ids [[buffer(4)]],\n"
+       "                  uint3 wgid [[threadgroup_position_in_grid]], uint3 lid [[thread_position_in_threadgroup]],\n"
+       "                  uint sgid [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],\n"
+       "                  uint sgsz [[threads_per_simdgroup]]) {\n"
+       "  threadgroup float partial[" rows-per "][8];\n"
+       "  (void)sgsz;\n" (common-body :msl) "\n}\n"))
+
+;; ---- the qkvr pair skeleton (migration item 2) -----------------------------
+
+(defn qkvr-epilogue [lang]
+  ;; the :bias-add + :rope chains rendered per pair. The v matvec runs
+  ;; :rope :identity (cs = 1, sn = 0 — the old op_add_bias; NO trig emitted).
+  ;; Order from the source: x0 = dot0 + bias0, x1 = dot1 + bias1, THEN rotate.
+  (let [rot (:rope src) neo (:neox rot)]
+    (assert (some? (:identity rot)) "the identity rope arm must be declared")
+    (case lang
+      :glsl (str "float x0 = a0 + bias_sel(sel, r0), x1 = a1 + bias_sel(sel, r1);\n"
+                 "    float cs = 1.0, sn = 0.0;\n"
+                 "    if (sel != 2u) {\n"
+                 "      float theta = float(((RP.p1 != 0.0) ? ids[0] : RP.aux2)) * pow(RP.scale, -2.0 * float(p) / float(RP.aux));\n"
+                 "      if (RP.eps != 0.0) theta /= fq[p];\n"
+                 "      cs = cos(theta); sn = sin(theta);\n"
+                 "    }\n"
+                 "    out_store_sel(sel, r0, x0 * cs - x1 * sn);\n"
+                 "    out_store_sel(sel, r1, x0 * sn + x1 * cs);")
+      :msl  (str "float x0 = a0 + bias_sel(sel, r0), x1 = a1 + bias_sel(sel, r1);\n"
+                 "    float cs = 1.0f, sn = 0.0f;\n"
+                 "    if (sel != 2u) {\n"
+                 "      float theta = float(((RP.p1 != 0.0) ? ids[0] : RP.aux2)) * pow(RP.scale, -2.0f * float(p) / float(RP.aux));\n"
+                 "      if (RP.eps != 0.0f) theta /= fq[p];\n"
+                 "      cs = cos(theta); sn = sin(theta);\n"
+                 "    }\n"
+                 "    out_store_sel(sel, r0, x0 * cs - x1 * sn);\n"
+                 "    out_store_sel(sel, r1, x0 * sn + x1 * cs);"))))
+
+(defn qkvr-kernel [lang]
+  ;; the FULL pair skeleton: 14 bindings, sel-indexed helpers, one workgroup
+  ;; per rope pair, two dot chains per matvec slot, the :bias-add + :rope
+  ;; epilogue. The term8 arithmetic is the kdot source's (term8-body asserts
+  ;; the chains); only the sel routing is added here.
+  (let [g (case lang :glsl "" :msl "")]
+    (str
+      (case lang
+        :glsl (str "#version 450\n"
+                   "#extension GL_KHR_shader_subgroup_arithmetic : enable\n"
+                   "#extension GL_KHR_shader_subgroup_shuffle : enable\n"
+                   "#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require\n")
+        :msl  "#include <metal_stdlib>\nusing namespace metal;\n")
+      "// GENERATED by emit-kernel.cljk (qkvr pair skeleton) -- do not edit.\n"
+      "// the :bias-add + :rope chains from qkvr.kernel.kotoba; v = :rope :identity\n"
+      (case lang
+        :glsl (str "layout(local_size_x = 64) in;\n"
+                   "layout(std430, binding = 0) readonly buffer Meta { uint rows_q; uint rows_kv; uint cols; uint tensor_type; uint positions; uint input_per_expert; uint pad0; uint pad1; } params;\n"
+                   "layout(std430, binding = 1) readonly buffer Wq { uint wq[]; };\n"
+                   "layout(std430, binding = 2) readonly buffer X { vec4 x4[]; };\n"
+                   "layout(std430, binding = 3) buffer Oq { float oq[]; };\n"
+                   "layout(std430, binding = 4) readonly buffer Wk { uint wk[]; };\n"
+                   "layout(std430, binding = 5) buffer Ok2 { float ok[]; };\n"
+                   "layout(std430, binding = 6) readonly buffer Wv { uint wv[]; };\n"
+                   "layout(std430, binding = 7) buffer Ov { float ov[]; };\n"
+                   "layout(std430, binding = 8) readonly buffer Bq { float bq[]; };\n"
+                   "layout(std430, binding = 9) readonly buffer Bk { float bk[]; };\n"
+                   "layout(std430, binding = 10) readonly buffer Bv { float bv[]; };\n"
+                   "layout(std430, binding = 11) readonly buffer RopeP { uint n; uint rows; uint aux; uint aux2; float eps; float scale; float p0; float p1; } RP;\n"
+                   "layout(std430, binding = 12) readonly buffer Fq { float fq[]; };\n"
+                   "layout(std430, binding = 13) readonly buffer I { uint ids[]; };\n")
+        :msl  (str "struct Meta { uint rows_q; uint rows_kv; uint cols; uint tensor_type; uint positions; uint input_per_expert; uint pad0; uint pad1; };\n"
+                   "struct RopeP { uint n; uint rows; uint aux; uint aux2; float eps; float scale; float p0; float p1; };\n"
+                   "kernel void kmain(constant Meta &params [[buffer(0)]],\n"
+                   "  const device uint *wq [[buffer(1)]], const device float4 *x4 [[buffer(2)]], device float *oq [[buffer(3)]],\n"
+                   "  const device uint *wk [[buffer(4)]], device float *ok [[buffer(5)]],\n"
+                   "  const device uint *wv [[buffer(6)]], device float *ov [[buffer(7)]],\n"
+                   "  const device float *bq [[buffer(8)]], const device float *bk [[buffer(9)]], const device float *bv [[buffer(10)]],\n"
+                   "  constant RopeP &RP [[buffer(11)]], const device float *fq [[buffer(12)]], const device uint *ids [[buffer(13)]],\n"
+                   "  uint3 wgid [[threadgroup_position_in_grid]], uint3 lid [[thread_position_in_threadgroup]],\n"
+                   "  uint sgid [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]], uint sgsz [[threads_per_simdgroup]]) {\n"))
+      "shared float psum[2][8];\n"
+      ;; the sel-indexed helpers (the weight and output routing by sel)
+      (case lang
+        :glsl (str "uint w_u32_at_sel(uint sel, uint offset) {\n"
+                   "  uint w0 = (sel == 0u) ? wq[offset >> 2u] : (sel == 1u) ? wk[offset >> 2u] : wv[offset >> 2u];\n"
+                   "  uint shift = (offset & 3u) * 8u;\n"
+                   "  if (shift == 0u) return w0;\n"
+                   "  uint w1 = (sel == 0u) ? wq[(offset >> 2u) + 1u] : (sel == 1u) ? wk[(offset >> 2u) + 1u] : wv[(offset >> 2u) + 1u];\n"
+                   "  return (w0 >> shift) | (w1 << (32u - shift)); }\n"
+                   "float weight_half_sel(uint sel, uint offset) {\n"
+                   "  uint w = (sel == 0u) ? wq[offset >> 2u] : (sel == 1u) ? wk[offset >> 2u] : wv[offset >> 2u];\n"
+                   "  vec2 pair = unpackHalf2x16(w); return ((offset & 2u) != 0u) ? pair.y : pair.x; }\n"
+                   "float bias_sel(uint sel, uint idx) { return (sel == 0u) ? bq[idx] : (sel == 1u) ? bk[idx] : bv[idx]; }\n"
+                   "void out_store_sel(uint sel, uint idx, float v) { if (sel == 0u) oq[idx] = v; else if (sel == 1u) ok[idx] = v; else ov[idx] = v; }\n")
+        :msl  (str "uint w_u32_at_sel(uint sel, uint offset) {\n"
+                   "  uint w0 = (sel == 0u) ? wq[offset >> 2u] : (sel == 1u) ? wk[offset >> 2u] : wv[offset >> 2u];\n"
+                   "  uint shift = (offset & 3u) * 8u;\n"
+                   "  if (shift == 0u) return w0;\n"
+                   "  uint w1 = (sel == 0u) ? wq[(offset >> 2u) + 1u] : (sel == 1u) ? wk[(offset >> 2u) + 1u] : wv[(offset >> 2u) + 1u];\n"
+                   "  return (w0 >> shift) | (w1 << (32u - shift)); }\n"
+                   "float weight_half_sel(uint sel, uint offset) {\n"
+                   "  uint w = (sel == 0u) ? wq[offset >> 2u] : (sel == 1u) ? wk[offset >> 2u] : wv[offset >> 2u];\n"
+                   "  half2 pair = as_type<half2>(w); return (float)(((offset & 2u) != 0u) ? pair.y : pair.x); }\n"
+                   "float bias_sel(uint sel, uint idx) { return (sel == 0u) ? bq[idx] : (sel == 1u) ? bk[idx] : bv[idx]; }\n"
+                   "void out_store_sel(uint sel, uint idx, float v) { if (sel == 0u) oq[idx] = v; else if (sel == 1u) ok[idx] = v; else ov[idx] = v; }\n"))
+      ;; term8 (sel-aware) — the kdot source's arithmetic chains
+      (case lang
+        :glsl (str "float term8(uint sel, uint wb, uint index, f16vec2 ylo, f16vec2 yhi) {\n  uint bo = wb + (index / 32u) * " block-bytes "u;\n  uint codes = w_u32_at_sel(sel, bo + 2u + (index & 31u));\n  " (conv-codes :glsl "codes") "\n  float d = weight_half_sel(sel, bo);\n  f16vec2 p0 = qlo * ylo, p1 = qhi * yhi;\n  return d * (" (str/join " + " ["float(p0.x)" "float(p0.y)" "float(p1.x)" "float(p1.y)"]) ");}\n")
+        :msl  (str "float term8(uint sel, uint wb, uint index, half2 ylo, half2 yhi) {\n  uint bo = wb + (index / 32u) * " block-bytes "u;\n  uint codes = w_u32_at_sel(sel, bo + 2u + (index & 31u));\n  " (conv-codes :msl "codes") "\n  float d = weight_half_sel(sel, bo);\n  half2 p0 = half2(half(qlo.x * ylo.x), half(qlo.y * ylo.y));\n  half2 p1 = half2(half(qhi.x * yhi.x), half(qhi.y * yhi.y));\n  return d * (" (str/join " + " ["float(p0.x)" "float(p0.y)" "float(p1.x)" "float(p1.y)"]) ");}\n"))
+      (red-fn lang) "\n"
+      ;; dot_row (sel-aware)
+      (case lang
+        :glsl (str "float dot_row(uint sel, uint rowbase, uint xrow, uint blocks, uint index) {\n"
+                   "  float acc0 = 0.0, acc1 = 0.0; uint b = 0u;\n"
+                   "  for (; b + 1u < blocks; b += 2u) {\n"
+                   "    if (b * 256u + index >= params.cols) break;\n"
+                   "    vec4 y0 = x4[(xrow + b * 256u) >> 2u];\n"
+                   "    acc0 += term8(sel, rowbase + b * " group-bytes "u, index, f16vec2(y0.xy), f16vec2(y0.zw));\n"
+                   "    if ((b + 1u) * 256u + index < params.cols) {\n"
+                   "      vec4 y1 = x4[(xrow + (b + 1u) * 256u) >> 2u];\n"
+                   "      acc1 += term8(sel, rowbase + (b + 1u) * " group-bytes "u, index, f16vec2(y1.xy), f16vec2(y1.zw));\n"
+                   "    }\n"
+                   "  }\n"
+                   "  if (b < blocks && b * 256u + index < params.cols) {\n"
+                   "    vec4 y0 = x4[(xrow + b * 256u) >> 2u];\n"
+                   "    acc0 += term8(sel, rowbase + b * " group-bytes "u, index, f16vec2(y0.xy), f16vec2(y0.zw));\n"
+                   "  }\n"
+                   "  return acc0 + acc1;\n}\n")
+        :msl  (str "float dot_row(uint sel, uint rowbase, uint xrow, uint blocks, uint n, uint index) {\n"
+                   "  float acc0 = 0.0f, acc1 = 0.0f; uint b = 0u;\n"
+                   "  for (; b + 1u < blocks; b += 2u) {\n"
+                   "    if (b * 256u + index >= n) break;\n"
+                   "    float4 y0 = x4[(xrow + b * 256u) >> 2u];\n"
+                   "    acc0 += term8(sel, rowbase + b * " group-bytes "u, index, half2(y0.xy), half2(y0.zw));\n"
+                   "    if ((b + 1u) * 256u + index < n) {\n"
+                   "      float4 y1 = x4[(xrow + (b + 1u) * 256u) >> 2u];\n"
+                   "      acc1 += term8(sel, rowbase + (b + 1u) * " group-bytes "u, index, half2(y1.xy), half2(y1.zw));\n"
+                   "    }\n"
+                   "  }\n"
+                   "  if (b < blocks && b * 256u + index < n) {\n"
+                   "    float4 y0 = x4[(xrow + b * 256u) >> 2u];\n"
+                   "    acc0 += term8(sel, rowbase + b * " group-bytes "u, index, half2(y0.xy), half2(y0.zw));\n"
+                   "  }\n"
+                   "  return acc0 + acc1;\n}\n"))
+      ;; the main: the pair skeleton + the epilogue
+      (case lang
+        :glsl (str "void main() {\n"
+                   "  uint gp = gl_WorkGroupID.x, position = gl_WorkGroupID.y, t = gl_LocalInvocationID.x;\n")
+        :msl  (str "  uint gp = wgid.x, position = wgid.y, t = lid.x;\n"))
+      (str "  uint hd = RP.n, hlf = RP.aux / 2u;\n"
+           "  uint q_pairs = (params.rows_q / hd) * hlf;\n"
+           "  uint kv_pairs = (params.rows_kv / hd) * hlf;\n"
+           "  uint total = q_pairs + 2u * kv_pairs;\n"
+           "  bool live = gp < total && position < params.positions;\n"
+           "  uint sel = (gp < q_pairs) ? 0u : (gp < q_pairs + kv_pairs) ? 1u : 2u;\n"
+           "  uint gp_sel = (sel == 0u) ? gp : (sel == 1u) ? (gp - q_pairs) : (gp - q_pairs - kv_pairs);\n"
+           "  uint head = gp_sel / hlf;\n"
+           "  uint p = gp_sel - head * hlf;\n"
+           "  uint r0 = head * hd + p, r1 = r0 + hlf;\n"
+           "  uint in_row = ((params.input_per_expert == 1u) ? ((params.pad0 > 1u) ? position / params.pad0 : position) : 0u) + params.pad1;\n"
+           "  uint index = t * 4u, blocks = (params.cols + 255u) / 256u;\n"
+           "  uint row_bytes = ((params.cols + 31u) / 32u) * " block-bytes "u;\n"
+           "  float s0 = 0.0, s1 = 0.0;\n"
+           "  if (live) {\n"
+           "    uint xrow = in_row * params.cols + index;\n"
+           "    s0 = dot_row(sel, r0 * row_bytes, xrow, blocks"
+           (when (= lang :msl) ", params.cols") ", index);\n"
+           "    s1 = dot_row(sel, r1 * row_bytes, xrow, blocks"
+           (when (= lang :msl) ", params.cols") ", index);\n"
+           "  }\n"
+           "  float g0 = red_sum(s0), g1 = red_sum(s1);\n"
+           "  if (" (case lang :glsl "subgroupElect()" :msl "lane == 0") ") { psum[0]["
+           (case lang :glsl "gl_SubgroupID" :msl "sgid") "] = g0; psum[1]["
+           (case lang :glsl "gl_SubgroupID" :msl "sgid") "] = g1; }\n"
+           "  " (case lang :glsl "barrier();" :msl "threadgroup_barrier(mem_flags::mem_threadgroup);") "\n"
+           "  if (live && t == 0u) {\n"
+           "    float a0 = 0.0, a1 = 0.0;\n"
+           (case lang :glsl "    for (uint i = 0u; i < gl_NumSubgroups; i++) { a0 += psum[0][i]; a1 += psum[1][i]; }"
+                      :msl  "    uint ns = (63u / sgsz) + 1u;\n    for (uint i = 0u; i < ns; i++) { a0 += psum[0][i]; a1 += psum[1][i]; }") "\n"
+           "    " (qkvr-epilogue lang) "\n"
+           "  }\n"
+           (case lang :glsl "}\n" :msl "}\n")))))
+
+(defn atncopy-kernel [lang]
+  ;; the atncopy skeleton (migration item 3): the KV-write phase (single
+  ;; writer per cache location, nothing reads the writes) + the decode
+  ;; attention whose REDUCE ORDERS come from the source: the max and exp-sum
+  ;; in the fixed shuffle-xor butterfly, the weighted sum in POSITION ORDER.
+  ;; The current position's row is read from DK/DV (the review-fixed shape).
+  (assert (= (:kernel/name src) "attn_copy_dense") "wrong source for this renderer")
+  (let [max-fn (case lang
+                 :glsl "float red_max(float v, uint tg, float red[256]) { red[tg] = v; barrier();\n  for (uint st = 128u; st > 0u; st >>= 1u) { if (tg < st) red[tg] = max(red[tg], red[tg + st]); barrier(); }\n  float r = red[0]; barrier(); return r; }"
+                 :msl  "static inline float red_max(float v, uint tg, threadgroup float *red) { red[tg] = v; threadgroup_barrier(mem_flags::mem_threadgroup);\n  for (uint st = 128u; st > 0u; st >>= 1u) { if (tg < st) red[tg] = max(red[tg], red[tg + st]); threadgroup_barrier(mem_flags::mem_threadgroup); }\n  float r = red[0]; threadgroup_barrier(mem_flags::mem_threadgroup); return r; }")]
+    (str (case lang
+           :glsl (str "#version 450\n"
+                      "#extension GL_KHR_shader_subgroup_arithmetic : enable\n"
+                      "#extension GL_KHR_shader_subgroup_shuffle : enable\n")
+           :msl  "#include <metal_stdlib>\nusing namespace metal;\n")
+         "// GENERATED by emit-kernel.cljk (atncopy) -- do not edit.\n"
+         "// reduce orders from atncopy.kernel.kotoba: fixed-order butterfly max/sum,\n"
+         "// the weighted sum in POSITION ORDER; the current row from DK/DV.\n"
+         (case lang
+           :glsl (str "layout(local_size_x = 256) in;\n"
+                      "layout(std430, binding = 0) readonly buffer Meta { uint n; uint rows; uint aux; uint aux2; float eps; float scale; float p0; float p1; } P;\n"
+                      "layout(std430, binding = 1) readonly buffer A { float a[]; };\n"
+                      "layout(std430, binding = 2) buffer B { float b[]; };\n"
+                      "layout(std430, binding = 3) buffer C { float c[]; };\n"
+                      "layout(std430, binding = 4) buffer O { float o[]; };\n"
+                      "layout(std430, binding = 5) readonly buffer DV { float dv[]; };\n"
+                      "layout(std430, binding = 6) readonly buffer DK { float dk[]; };\n"
+                      "layout(std430, binding = 7) readonly buffer I { uint ids[]; };\n"
+                      "shared float sbuf[256];\nshared float red[256];\n")
+           :msl  (str "struct P0 { uint n; uint rows; uint aux; uint aux2; float eps; float scale; float p0; float p1; };\n"
+                      "kernel void kmain(constant P0 &P [[buffer(0)]], const device float *a [[buffer(1)]],\n"
+                      "  device float *b [[buffer(2)]], device float *c [[buffer(3)]], device float *o [[buffer(4)]],\n"
+                      "  const device float *dv [[buffer(5)]], const device float *dk [[buffer(6)]], const device uint *ids [[buffer(7)]],\n"
+                      "  uint3 wgid [[threadgroup_position_in_grid]], uint3 lid [[thread_position_in_threadgroup]],\n"
+                      "  uint sgid [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]], uint sgsz [[threads_per_simdgroup]]) {\n"
+                      "  (void)sgsz; (void)sgid;\n"
+                      "  threadgroup float sbuf[256];\n  threadgroup float red[256];\n"))
+         (red-fn lang) "\n" max-fn "\n"
+         (case lang :glsl "void main() {\n" :msl "")
+         (str "  uint h = " (case lang :glsl "gl_WorkGroupID.x" :msl "wgid.x") ", row = " (case lang :glsl "gl_WorkGroupID.y" :msl "wgid.y") ", t = " (case lang :glsl "gl_LocalInvocationID.x" :msl "lid.x") ", d = P.n;\n"
+              "  uint T = ((P.p1 != 0.0) ? ids[0] + 1u : P.aux) + row;\n"
+              "  uint hkv = h / (P.rows / P.aux2); uint qoff = row * P.rows * d;\n"
+              "  uint pos = ids[0];\n"
+              "  // phase 1: ONE writer per cache location (the first query head of the kv group)\n"
+              "  if (h % (P.rows / P.aux2) == 0u) {\n"
+              "    uint coff = pos * P.aux2 * d + hkv * d;\n"
+              "    for (uint i = t; i < d; i += 256u) { b[coff + i] = dk[hkv * d + i]; c[coff + i] = dv[hkv * d + i]; }\n"
+              "  }\n"
+              "  // phase 2: the scores (the current row from DK) -> butterfly max -> exp -> butterfly sum\n"
+              "  float sc = -1e30" (if (= lang :msl) "f" "") ";\n"
+              "  if (t < T) {\n"
+              "    float dt = 0.0;\n"
+              "    for (uint i = 0u; i < d; i++) {\n"
+              "      float kv = (t == pos) ? dk[hkv * d + i] : b[(t * P.aux2 + hkv) * d + i];\n"
+              "      dt += a[qoff + h * d + i] * kv;\n"
+              "    }\n"
+              "    sc = dt * P.scale;\n"
+              "  }\n"
+              "  // the :score-reduce tree INLINE (the hand wg_sum shape): the order is the contract\n"
+              "  red[t] = sc; " (case lang :glsl "barrier();" :msl "threadgroup_barrier(mem_flags::mem_threadgroup);") "\n"
+              "  for (uint st = 128u; st > 0u; st >>= 1u) { if (t < st) red[t] = max(red[t], red[t + st]); " (case lang :glsl "barrier();" :msl "threadgroup_barrier(mem_flags::mem_threadgroup);") " }\n"
+              "  float m = red[0]; " (case lang :glsl "barrier();" :msl "threadgroup_barrier(mem_flags::mem_threadgroup);") "\n"
+              "  float e = (t < T) ? exp(sc - m) : 0.0;\n"
+              "  // the :sum-reduce tree INLINE (the same order)\n"
+              "  red[t] = e; " (case lang :glsl "barrier();" :msl "threadgroup_barrier(mem_flags::mem_threadgroup);") "\n"
+              "  for (uint st2 = 128u; st2 > 0u; st2 >>= 1u) { if (t < st2) red[t] += red[t + st2]; " (case lang :glsl "barrier();" :msl "threadgroup_barrier(mem_flags::mem_threadgroup);") " }\n"
+              "  float denom = red[0]; " (case lang :glsl "barrier();" :msl "threadgroup_barrier(mem_flags::mem_threadgroup);") "\n"
+              "  float p = e / denom;\n"
+              "  sbuf[t] = p;\n"
+              "  " (case lang :glsl "barrier();" :msl "threadgroup_barrier(mem_flags::mem_threadgroup);") "\n"
+              "  // the weighted sum IN POSITION ORDER (the source's :weighted-sum chain)\n"
+              "  for (uint i = t; i < d; i += 256u) {\n"
+              "    float acc = 0.0;\n"
+              "    for (uint tt = 0u; tt < T; tt++) {\n"
+              "      float vv = (tt == pos) ? dv[hkv * d + i] : c[(tt * P.aux2 + hkv) * d + i];\n"
+              "      acc += sbuf[tt] * vv;\n"
+              "    }\n"
+              "    o[qoff + h * d + i] = acc;   // P.p0 != 0: no output gate\n"
+              "  }\n"
+              "}\n"))))
+
+(def text (cond
+            (= (:kernel/name src) "attn_copy_dense") (atncopy-kernel lang)
+            (:pairing (:kernel/shape src)) (qkvr-kernel lang)
+            :else (case lang :glsl (glsl-kernel) :msl (msl-kernel) (do (println "unknown lang") (js/process.exit 2)))))
+(fs/writeFileSync out-path text)
+(println (str "wrote " out-path " (" (count text) " chars)"))

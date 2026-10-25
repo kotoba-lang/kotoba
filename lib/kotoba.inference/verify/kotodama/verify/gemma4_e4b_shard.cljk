@@ -1,0 +1,76 @@
+(ns kotodama.verify.gemma4-e4b-shard
+  "Rank-scoped verification of the REAL gemma4:e4b GGUF along a murakumo-plan
+  layer range: the node holding `--layers lo:hi` opens the local artifact and
+  proves it can serve its shard — every owned tensor present, the contract
+  tensors inside the range byte-identical (span + payload prefix), and the
+  shard's resident byte total reported for the credits ledger.
+
+  Runs under the JVM (kbb -M:verify-shard) AND babashka (kbb -cp …) so a
+  fleet node needs nothing but the bb binary and this repo's sources — the
+  distributed half of kotoba-native inference, before the compute lands.
+
+  usage: --layers 0:21 --first | --layers 21:42 --last [--model gemma4:e4b]"
+  (:require [kotoba.lang.text :as str]
+            [kotodama.inference.gemma :as gemma]
+            [kotodama.inference.shard :as shard]
+            [kotodama.verify.gemma4-e4b-gguf :as gguf-verify]))
+
+(defn- parse-args [args]
+  (loop [m {:model gguf-verify/default-model} [a & r] args]
+    (cond
+      (nil? a) m
+      (= a "--layers") (let [[lo hi] (map #(Long/parseLong %) (str/split (first r) #":"))]
+                         (recur (assoc m :layers [lo hi]) (rest r)))
+      (= a "--first") (recur (assoc m :first? true) r)
+      (= a "--last") (recur (assoc m :last? true) r)
+      (= a "--model") (recur (assoc m :model (first r)) (rest r))
+      :else (recur m r))))
+
+(defn- sha-256-hex [^bytes bs]
+  (let [d (java.security.MessageDigest/getInstance "SHA-256")]
+    (apply str (map #(format "%02x" (bit-and 0xff %)) (.digest d bs)))))
+
+(defn -main [& args]
+  (let [{:keys [layers first? last? model] :as spec} (parse-args args)
+        _ (when-not layers (throw (ex-info "--layers lo:hi required" {})))
+        expected gemma/gemma4-e4b-expected
+        rank {:layers layers :first? first? :last? last?}
+        path (or (System/getenv "KOTODAMA_VERIFY_GGUF_PATH")
+                 (gguf-verify/gguf-path model))
+        index (gguf-verify/read-gguf-tensor-index path #(shard/owned-tensor? rank %))
+        tensors (:gguf/tensors index)
+        owned-bytes (reduce + (map :span-bytes (vals tensors)))
+        ;; contract tensors that fall inside this rank: verify span + payload prefix
+        checks (for [[name spec'] (:gguf/required-tensors expected)
+                     :when (shard/owned-tensor? rank name)
+                     :let [t (get tensors name)]]
+                 (do
+                   (when-not t
+                     (throw (ex-info "owned contract tensor missing" {:tensor name})))
+                   (when-not (= (:shape t) (:shape spec'))
+                     (throw (ex-info "shape mismatch" {:tensor name :actual (:shape t)})))
+                   (when-let [span (get (:gguf/expected-tensor-spans expected) name)]
+                     (when-not (= span (:span-bytes t))
+                       (throw (ex-info "span mismatch" {:tensor name :actual (:span-bytes t)}))))
+                   (when-let [prefix (get (:gguf/payload-prefix-hex expected) name)]
+                     (let [n (/ (count prefix) 2)
+                           raf (java.io.RandomAccessFile. ^String path "r")
+                           bs (byte-array n)]
+                       (.seek raf (+ (:gguf/tensor-data-start index) (:offset t)))
+                       (.readFully raf bs)
+                       (.close raf)
+                       (let [hex (apply str (map #(format "%02x" (bit-and 0xff %)) bs))]
+                         (when-not (or (= hex prefix) (= (sha-256-hex bs) prefix))
+                           ;; contract stores either raw prefix hex or a sha of it
+                           (when-not (= (sha-256-hex bs) prefix)
+                             (throw (ex-info "payload prefix mismatch" {:tensor name})))))))
+                   name))
+        report {:shard/rank rank
+                :shard/model model
+                :shard/owned-tensors (count tensors)
+                :shard/owned-bytes owned-bytes
+                :shard/contract-verified (vec checks)
+                :shard/host (or (System/getenv "HOSTNAME")
+                                (.getHostName (java.net.InetAddress/getLocalHost)))
+                :shard/ok true}]
+    (prn report)))

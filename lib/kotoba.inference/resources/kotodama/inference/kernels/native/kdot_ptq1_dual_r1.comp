@@ -1,0 +1,87 @@
+#version 450
+// Ternary Bonsai dense SwiGLU projection (co-scientist iteration 65):
+// gate = Wa*x, up = Wb*x, then
+// out = silu(gate)*up. One row per 64-thread workgroup and one activation row
+// per dispatch-y. Both PTQ1_0 streams share the activation load and reduction
+// command. Bindings: meta, Wa, Wb, x, out, ids (unused compatibility slot).
+// Dispatch: (rows, positions, 1).
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer Meta {
+  uint rows; uint cols; uint tensor_type; uint positions; uint input_per_expert; uint pad0; uint pad1; uint pad2;
+} params;
+layout(std430, binding = 1) readonly buffer WA { uint wa[]; };
+layout(std430, binding = 2) readonly buffer WB { uint wb[]; };
+layout(std430, binding = 3) readonly buffer X { vec4 x4[]; };
+layout(std430, binding = 4) buffer O { float outp[]; };
+layout(std430, binding = 5) readonly buffer E { uint unused_ids[]; };
+shared float partial[128];
+
+uint pow3(uint n) { return n == 0u ? 1u : n == 1u ? 3u : n == 2u ? 9u : n == 3u ? 27u : 81u; }
+int decode_byte(uint b, uint p) { return int(((((b * p) & 255u) * 3u) >> 8u)) - 1; }
+
+ivec4 decode_a(uint base, uint index) {
+  uint e = index & 127u;
+  if (e < 120u) {
+    uint q = e < 80u ? e : e - 80u;
+    uint offset = e < 80u ? base + (e & 15u) : base + 16u + (q & 7u);
+    uint n = e < 80u ? e >> 4u : q >> 3u;
+    uint w = wa[offset >> 2u];
+    uvec4 b = uvec4(w & 255u, (w >> 8u) & 255u, (w >> 16u) & 255u, w >> 24u);
+    b = (b * pow3(n)) & uvec4(255u);
+    return ivec4((b * 3u) >> 8u) - ivec4(1);
+  }
+  uint w = wa[(base + 24u) >> 2u], n = (e - 120u) >> 1u;
+  uint b0 = w & 255u, b1 = (w >> 8u) & 255u, p0 = pow3(n), p1 = pow3(n + 1u);
+  return ivec4(decode_byte(b0,p0), decode_byte(b1,p0), decode_byte(b0,p1), decode_byte(b1,p1));
+}
+ivec4 decode_b(uint base, uint index) {
+  uint e = index & 127u;
+  if (e < 120u) {
+    uint q = e < 80u ? e : e - 80u;
+    uint offset = e < 80u ? base + (e & 15u) : base + 16u + (q & 7u);
+    uint n = e < 80u ? e >> 4u : q >> 3u;
+    uint w = wb[offset >> 2u];
+    uvec4 b = uvec4(w & 255u, (w >> 8u) & 255u, (w >> 16u) & 255u, w >> 24u);
+    b = (b * pow3(n)) & uvec4(255u);
+    return ivec4((b * 3u) >> 8u) - ivec4(1);
+  }
+  uint w = wb[(base + 24u) >> 2u], n = (e - 120u) >> 1u;
+  uint b0 = w & 255u, b1 = (w >> 8u) & 255u, p0 = pow3(n), p1 = pow3(n + 1u);
+  return ivec4(decode_byte(b0,p0), decode_byte(b1,p0), decode_byte(b0,p1), decode_byte(b1,p1));
+}
+float scale_a(uint base) { return unpackHalf2x16(wa[(base + 26u) >> 2u]).y; }
+float scale_b(uint base) { return unpackHalf2x16(wb[(base + 26u) >> 2u]).y; }
+float silu(float v) { return v / (1.0 + exp(-v)); }
+
+void main() {
+  uint row = gl_WorkGroupID.x, position = gl_WorkGroupID.y, t = gl_LocalInvocationID.x;
+  // Keep the sixth binding in both glslang/SPIR-V and naga/WGSL reflection.
+  // Dense projections require the compatibility expert id to be zero.
+  if (position < params.positions && unused_ids[position] != 0u) {
+    if (t == 0u && row < params.rows) outp[position * params.rows + row] = uintBitsToFloat(0x7fc00002u);
+    return;
+  }
+  if (params.tensor_type != 143u) {
+    if (t == 0u && row < params.rows && position < params.positions) outp[position * params.rows + row] = uintBitsToFloat(0x7fc00001u);
+    return;
+  }
+  uint row_bytes = (params.cols / 128u) * 28u, index = t * 4u;
+  float a = 0.0, b = 0.0;
+  if (row < params.rows && position < params.positions) {
+    for (uint block = 0u; block < params.cols / 256u; block++) {
+      uint xb = block * 256u + index;
+      vec4 y = x4[(position * params.cols + xb) >> 2u];
+      uint base = row * row_bytes + block * 56u;
+      uint qa = base + (index / 128u) * 28u;
+      a += scale_a(qa) * dot(vec4(decode_a(qa,index)), y);
+      b += scale_b(qa) * dot(vec4(decode_b(qa,index)), y);
+    }
+  }
+  partial[t] = a; partial[64u + t] = b;
+  barrier();
+  for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+    if (t < stride) { partial[t] += partial[t + stride]; partial[64u + t] += partial[64u + t + stride]; }
+    barrier();
+  }
+  if (t == 0u && row < params.rows && position < params.positions) outp[position * params.rows + row] = silu(partial[0]) * partial[64];
+}

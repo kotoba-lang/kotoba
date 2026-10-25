@@ -1,0 +1,117 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// kdot_h2_qkv_q8: ONE dispatch computing the attention q, k and v matvecs of a
+// layer from the SAME normalized input h — fusion iteration 9 (G1 kernel-count
+// roadmap; every removed kernel is ~11 us of per-kernel fixed cost on this
+// stack). Three kdot_h2_r1 calls (q, k, v) collapse into one workgroup set:
+// the global row selects which (weight, output) pair it belongs to.
+//
+// Q8_0 ONLY (the dense model's three tensors are all Q8_0): the dequant is the
+// term32 tt==8 path of kdot_h2_r1 VERBATIM (int8 -> half by conversion, two
+// packed multiplies, f32 accumulate) so the dots are arithmetic-identical to
+// the three separate kdots. No hdr staging (b32 path). Row output indexing is
+// unchanged: outp[position * rows + row] per matvec.
+//
+// Bindings: 0 Meta, 1 Wq, 2 X (h), 3 Oq, 4 Wk, 5 Ok, 6 Wv, 7 Ov.
+// Meta (u32 x8): rows_q, rows_kv, cols, tensor_type (8 = Q8_0, checked),
+// positions, input_per_expert, pad0, pad1 -- the kdot Meta fields re-purposed
+// as rows_q/rows_kv in the first two slots.
+// Dispatch: (rows_q + 2 * rows_kv, positions, 1).
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer Meta {
+  uint rows_q; uint rows_kv; uint cols; uint tensor_type;
+  uint positions; uint input_per_expert; uint pad0; uint pad1;
+} params;
+layout(std430, binding = 1) readonly buffer Wq { uint wq[]; };
+layout(std430, binding = 2) readonly buffer X { vec4 x4[]; };
+layout(std430, binding = 3) buffer Oq { float oq[]; };
+layout(std430, binding = 4) readonly buffer Wk { uint wk[]; };
+layout(std430, binding = 5) buffer Ok { float ok[]; };
+layout(std430, binding = 6) readonly buffer Wv { uint wv[]; };
+layout(std430, binding = 7) buffer Ov { float ov[]; };
+
+shared float partial[2];
+
+// sel: 0 = q, 1 = k, 2 = v (uniform per workgroup)
+uint w_u32_at_sel(uint sel, uint offset) {
+  // P2 review fix: load the second word ONLY when the shift needs it — for an
+  // aligned offset it is unused and on the tensor's last row it addresses bytes
+  // past the buffer (undefined in Vulkan).
+  uint w0;
+  if (sel == 0u) w0 = wq[offset >> 2u];
+  else if (sel == 1u) w0 = wk[offset >> 2u];
+  else w0 = wv[offset >> 2u];
+  uint shift = (offset & 3u) * 8u;
+  if (shift == 0u) return w0;
+  uint w1;
+  if (sel == 0u) w1 = wq[(offset >> 2u) + 1u];
+  else if (sel == 1u) w1 = wk[(offset >> 2u) + 1u];
+  else w1 = wv[(offset >> 2u) + 1u];
+  return (w0 >> shift) | (w1 << (32u - shift));
+}
+float weight_half_sel(uint sel, uint offset) {
+  uint w;
+  if (sel == 0u) w = wq[offset >> 2u];
+  else if (sel == 1u) w = wk[offset >> 2u];
+  else w = wv[offset >> 2u];
+  vec2 pair = unpackHalf2x16(w);
+  return ((offset & 2u) != 0u) ? pair.y : pair.x;
+}
+// the Q8_0 32-value block product, verbatim from kdot_h2_r1's term32 tt==8 arm
+float term8(uint sel, uint wb, uint index, f16vec2 ylo, f16vec2 yhi) {
+  uint bo = wb + (index / 32u) * 34u;
+  uint codes = w_u32_at_sel(sel, bo + 2u + (index & 31u));
+  f16vec2 qlo = f16vec2(float16_t(bitfieldExtract(int(codes), 0, 8)), float16_t(bitfieldExtract(int(codes), 8, 8)));
+  f16vec2 qhi = f16vec2(float16_t(bitfieldExtract(int(codes), 16, 8)), float16_t(bitfieldExtract(int(codes), 24, 8)));
+  float d = weight_half_sel(sel, bo);
+  f16vec2 p0 = qlo * ylo, p1 = qhi * yhi;
+  return d * (float(p0.x) + float(p0.y) + float(p1.x) + float(p1.y));
+}
+void out_store_sel(uint sel, uint idx, float v) {
+  if (sel == 0u) oq[idx] = v;
+  else if (sel == 1u) ok[idx] = v;
+  else ov[idx] = v;
+}
+
+void main() {
+  uint r = gl_WorkGroupID.x;
+  uint position = gl_WorkGroupID.y;
+  uint t = gl_LocalInvocationID.x;
+  uint total = params.rows_q + 2u * params.rows_kv;
+  bool live = r < total && position < params.positions;
+  uint sel = (r < params.rows_q) ? 0u : (r < params.rows_q + params.rows_kv) ? 1u : 2u;
+  uint row = (sel == 0u) ? r : (sel == 1u) ? (r - params.rows_q) : (r - params.rows_q - params.rows_kv);
+  uint rows = (sel == 0u) ? params.rows_q : params.rows_kv;
+  uint in_row = ((params.input_per_expert == 1u) ? ((params.pad0 > 1u) ? position / params.pad0 : position) : 0u) + params.pad1;
+  uint index = t * 4u;
+  uint blocks = (params.cols + 255u) / 256u;
+  uint row_bytes = ((params.cols + 31u) / 32u) * 34u;
+  uint rowbase = row * row_bytes;
+  float acc0 = 0.0, acc1 = 0.0;
+  if (live) {
+    uint xrow = in_row * params.cols + index;
+    uint b = 0u;
+    for (; b + 1u < blocks; b += 2u) {
+      if (b * 256u + index >= params.cols) break;
+      vec4 y0 = x4[(xrow + b * 256u) >> 2u];
+      acc0 += term8(sel, rowbase + b * 272u, index, f16vec2(y0.xy), f16vec2(y0.zw));
+      if ((b + 1u) * 256u + index < params.cols) {
+        vec4 y1 = x4[(xrow + (b + 1u) * 256u) >> 2u];
+        acc1 += term8(sel, rowbase + (b + 1u) * 272u, index, f16vec2(y1.xy), f16vec2(y1.zw));
+      }
+    }
+    if (b < blocks && b * 256u + index < params.cols) {
+      vec4 y0 = x4[(xrow + b * 256u) >> 2u];
+      acc0 += term8(sel, rowbase + b * 272u, index, f16vec2(y0.xy), f16vec2(y0.zw));
+    }
+  }
+  float sg = subgroupAdd(acc0 + acc1);
+  if (subgroupElect()) partial[gl_SubgroupID] = sg;
+  barrier();
+  if (live && t == 0u) {
+    float s = 0.0;
+    for (uint i = 0u; i < gl_NumSubgroups; i++) s += partial[i];
+    out_store_sel(sel, position * rows + row, s);
+  }
+}

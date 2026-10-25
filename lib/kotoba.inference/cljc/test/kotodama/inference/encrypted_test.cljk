@@ -1,0 +1,84 @@
+(ns kotodama.inference.encrypted-test
+  (:require [kotoba.lang.error :as kerror] [kotoba.test :refer [deftest is testing]]
+            [kotodama.inference.encrypted :as encrypted]
+            [paillier.core :as phe]))
+
+(defonce ^:private keypair (delay (phe/generate-keypair)))
+
+(def hidden [0.25 -0.5 1.0 0.75])
+(def weights [[0.1 0.2 -0.3 0.4]
+              [-0.4 0.3 0.2 0.1]
+              [0.5 -0.25 0.125 -0.75]])
+(def bias [0.05 -0.1 0.2])
+(def token-ids [17 42 99])
+
+(defn- encrypted-roundtrip []
+  (let [{:keys [public-key private-key]} @keypair
+        request (encrypted/prepare-lm-head-request
+                 public-key hidden
+                 {:activation-scale 1000 :hidden-bound 1.0})
+        response (encrypted/evaluate-lm-head
+                  request weights bias
+                  {:weight-scale 1000 :token-ids token-ids})]
+    {:request request
+     :response response
+     :result (encrypted/decrypt-lm-head-response private-key response)}))
+
+(deftest encrypted-lm-head-matches-exact-fixed-point-oracle
+  (let [{:keys [result]} (encrypted-roundtrip)
+        oracle (encrypted/quantized-lm-head hidden weights bias 1000 1000)]
+    (is (= (:integer-logits oracle) (:kotodama/integer-logits result)))
+    (is (= token-ids (:kotodama/token-ids result)))
+    (is (= 99 (:kotodama/selected-token-id result)))))
+
+(deftest encryption-boundary-carries-only-public-contract-and-ciphertexts
+  (let [{:keys [request response]} (encrypted-roundtrip)
+        hidden-wire (:kotodama.encrypted/hidden request)
+        response-logits (:kotodama.encrypted/logits response)]
+    (is (= #{:shape :ciphertexts} (set (keys hidden-wire))))
+    (is (= (count hidden) (count (:ciphertexts hidden-wire))))
+    (is (= #{:shape :ciphertexts :output-bounds}
+           (set (keys response-logits))))
+    (is (not-any? #(contains? request %)
+                  [:private-key :lambda :mu :plaintext :hidden-values]))
+    (is (not-any? #(contains? response %)
+                  [:private-key :lambda :mu :plaintext :logit-values
+                   :weights :bias]))))
+
+(deftest repeated-client-encryption-is-unlinkable-by-ciphertext-equality
+  (let [public-key (:public-key @keypair)
+        opts {:activation-scale 1000 :hidden-bound 1.0}
+        left (encrypted/prepare-lm-head-request public-key hidden opts)
+        right (encrypted/prepare-lm-head-request public-key hidden opts)]
+    (is (not= (get-in left [:kotodama.encrypted/hidden :ciphertexts])
+              (get-in right [:kotodama.encrypted/hidden :ciphertexts])))))
+
+(deftest plaintext-error-is-only-the-declared-fixed-point-error
+  (let [{:keys [result]} (encrypted-roundtrip)
+        plaintext (encrypted/plaintext-lm-head hidden weights bias)
+        errors (map #(Math/abs (- (double %1) (double %2)))
+                    plaintext (:kotodama/logits result))]
+    (is (< (reduce max errors) 1.0e-9))))
+
+(deftest malformed-or-out-of-contract-input-fails-closed
+  (let [{:keys [public-key private-key]} @keypair]
+    (testing "the client enforces its declared public range"
+      (is (thrown-with-msg?
+           kerror/ExceptionInfo #"exceeds"
+           (encrypted/prepare-lm-head-request
+            public-key [2.0] {:activation-scale 1000 :hidden-bound 1.0}))))
+    (testing "the server checks model/request dimensions"
+      (let [request (encrypted/prepare-lm-head-request
+                     public-key [0.5]
+                     {:activation-scale 1000 :hidden-bound 1.0})]
+        (is (thrown-with-msg?
+             kerror/ExceptionInfo #"dimensions"
+             (encrypted/evaluate-lm-head
+              request [[1.0 2.0]] [0.0]
+              {:weight-scale 1000 :token-ids [1]})))))
+    (testing "the client rejects a response for another key id"
+      (let [{:keys [response]} (encrypted-roundtrip)
+            tampered (assoc response :kotodama.encrypted/key-id "another-key")]
+        (is (thrown-with-msg?
+             kerror/ExceptionInfo #"another key"
+             (encrypted/decrypt-lm-head-response private-key tampered)))))))

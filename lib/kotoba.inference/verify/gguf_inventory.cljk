@@ -1,0 +1,101 @@
+;; GGUF header + tensor-directory inventory, JVM-free (kbb --backend sci, node fs).
+;;
+;; Reads only the header: metadata KV and the tensor directory (names, dims, ggml
+;; type, offset). Prints the architecture keys, the tensor-type histogram, the
+;; layer-0 tensor list, and the set of layers that carry linear-attention
+;; tensors -- what kotodama.inference needs to admit a checkpoint before any
+;; kernel is written for it. Root ADR-2609182100; verification target is Nex.
+;;
+;;   kbb --backend sci verify/gguf_inventory.cljk <file.gguf-or-head-bytes> [--edn]
+(require '["fs" :as fs] '[clojure.string :as str])
+
+(def ggml-type-names
+  {0 :f32 1 :f16 2 :q4_0 3 :q4_1 6 :q5_0 7 :q5_1 8 :q8_0 9 :q8_1 10 :q2_k 11 :q3_k 12 :q4_k 13 :q5_k 14 :q6_k
+   15 :q8_k 16 :iq2_xxs 17 :iq2_xs 18 :iq3_xxs 19 :iq1_s 20 :iq4_nl 21 :iq3_s 22 :iq2_s 23 :iq4_xs 24 :i8 25 :i16
+   26 :i32 27 :i64 28 :f64 29 :iq1_m 30 :bf16 142 :pq2_0 143 :ptq1_0})
+
+(def path (first *command-line-args*))
+;; GGUF weights routinely exceed Node's 2 GiB Buffer limit. Inventory needs
+;; only metadata + the tensor directory, so read a bounded header window just
+;; as the native generator does. Refuse if that window is actually exhausted;
+;; a truncated parse must not look like a valid admission.
+(def fd (fs/openSync path "r"))
+(def header-cap (* 64 1024 1024))
+(def header (js/Buffer.alloc header-cap))
+(def header-n (fs/readSync fd header 0 header-cap 0))
+(fs/closeSync fd)
+(def buf (.subarray header 0 header-n))
+(def pos (atom 0))
+(defn- u8 [] (let [v (.readUInt8 buf @pos)] (swap! pos + 1) v))
+(defn- u16 [] (let [v (.readUInt16LE buf @pos)] (swap! pos + 2) v))
+(defn- u32 [] (let [v (.readUInt32LE buf @pos)] (swap! pos + 4) v))
+(defn- i32 [] (let [v (.readInt32LE buf @pos)] (swap! pos + 4) v))
+(defn- f32 [] (let [v (.readFloatLE buf @pos)] (swap! pos + 4) v))
+(defn- u64 [] (let [v (.readBigUInt64LE buf @pos)] (swap! pos + 8) (js/Number v)))
+(defn- i64 [] (let [v (.readBigInt64LE buf @pos)] (swap! pos + 8) (js/Number v)))
+(defn- f64 [] (let [v (.readDoubleLE buf @pos)] (swap! pos + 8) v))
+(defn- gstr [] (let [n (u64) s (.toString buf "utf8" @pos (+ @pos n))] (swap! pos + n) s))
+(declare read-value)
+(defn- read-array []
+  (let [t (u32) n (u64)]
+    (if (> n 4096)
+      ;; tokenizer arrays run to 250k entries: skip their VALUES but keep the count
+      (do (dotimes [_ n] (read-value t)) {:array/type t :array/count n :skipped true})
+      (vec (repeatedly n #(read-value t))))))
+(defn read-value [t]
+  (case t
+    0 (u8) 1 (let [v (u8)] (if (> v 127) (- v 256) v)) 2 (u16) 3 (let [v (u16)] (if (> v 32767) (- v 65536) v))
+    4 (u32) 5 (i32) 6 (f32) 7 (not= 0 (u8)) 8 (gstr) 9 (read-array) 10 (u64) 11 (i64) 12 (f64)
+    (throw (ex-info "unknown gguf value type" {:type t :pos @pos}))))
+
+(let [magic (.toString buf "ascii" 0 4) _ (reset! pos 4)
+      version (u32) n-tensors (u64) n-kv (u64)]
+  (when (not= magic "GGUF") (throw (ex-info "not a GGUF file" {:magic magic})))
+  (let [kv (into {} (for [_ (range n-kv)] (let [k (gstr) t (u32)] [k (read-value t)])))
+        tensors (vec (for [_ (range n-tensors)]
+                       (let [name (gstr) nd (u32) dims (vec (repeatedly nd u64)) t (u32) off (u64)]
+                         {:name name :dims dims :type (get ggml-type-names t t) :offset off})))
+        arch (get kv "general.architecture")
+        ak (fn [k] (get kv (str arch "." k)))
+        by-type (frequencies (map :type tensors))
+        layer-of (fn [n] (when-let [m (re-find #"^blk\.(\d+)\." n)] (js/parseInt (second m))))
+        layers (sort (distinct (keep layer-of (map :name tensors))))
+        linear-layers (sort (distinct (keep (fn [{:keys [name]}] (when (re-find #"ssm_|linear_attn|attn_gate|conv1d|ssm_a|ssm_beta|ssm_alpha" name) (layer-of name))) tensors)))
+        full-attn-layers (sort (distinct (keep (fn [{:keys [name]}] (when (re-find #"attn_q\.weight" name) (layer-of name))) tensors)))
+        blk0 (filter #(= 0 (layer-of (:name %))) tensors)
+        blk-linear (filter #(= (first linear-layers) (layer-of (:name %))) tensors)
+        blk-attn (filter #(= (first full-attn-layers) (layer-of (:name %))) tensors)
+        elems (fn [{:keys [dims]}] (reduce * 1 dims))
+        bytes-per-elem {:f32 4 :f16 2 :bf16 2 :q8_0 1.0625 :q6_k 0.8203 :q5_k 0.6875 :q4_k 0.5625 :iq4_xs 0.53125 :q4_0 0.5625 :q3_k 0.4297 :q2_k 0.3281
+                        :pq2_0 0.265625 :ptq1_0 0.21875}
+        total-bytes (reduce + (map (fn [t] (* (elems t) (get bytes-per-elem (:type t) 4))) tensors))
+        experts (ak "expert_count") used (ak "expert_used_count")
+        alignment (get kv "general.alignment" 32)
+        report {:file path :version version :n-tensors n-tensors :n-kv n-kv :tensor-data-start (* (quot (+ @pos alignment -1) alignment) alignment)
+                :architecture arch
+                :meta {:block-count (ak "block_count") :embedding (ak "embedding_length") :ffn (ak "feed_forward_length")
+                       :expert-ffn (ak "expert_feed_forward_length") :heads (ak "attention.head_count") :kv-heads (ak "attention.head_count_kv")
+                       :key-length (ak "attention.key_length") :value-length (ak "attention.value_length")
+                       :rope-dim (ak "rope.dimension_count") :rope-base (ak "rope.freq_base") :context (ak "context_length")
+                       :experts experts :experts-used used :shared-expert-ffn (ak "expert_shared_feed_forward_length")
+                       :ssm {:conv (ak "ssm.conv_kernel") :d-inner (ak "ssm.inner_size") :d-state (ak "ssm.state_size") :heads (ak "ssm.group_count") :time-step-rank (ak "ssm.time_step_rank")}
+                       :full-attention-layers (vec full-attn-layers) :linear-attention-layers (vec linear-layers)
+                       :tokenizer-model (get kv "tokenizer.ggml.model") :tokenizer-pre (get kv "tokenizer.ggml.pre")
+                       :vocab-count (get-in kv ["tokenizer.ggml.tokens" :array/count])
+                       :chat-template? (contains? kv "tokenizer.chat_template")}
+                :tensor-types by-type
+                :approx-weight-gib (/ (js/Math.round (/ total-bytes 1073741.824)) 1000)
+                :layers (count layers)
+                :blk0 (mapv (fn [t] [(:name t) (:dims t) (:type t)]) blk0)
+                :first-linear-layer (mapv (fn [t] [(:name t) (:dims t) (:type t)]) blk-linear)
+                :first-full-attention-layer (mapv (fn [t] [(:name t) (:dims t) (:type t)]) blk-attn)
+                :hadamard {:block-size (get kv "prism.hadamard.block_size")
+                           :transform (get kv "prism.hadamard.transform") :axis (get kv "prism.hadamard.axis")
+                           :sign-mode (get kv "prism.hadamard.sign_mode") :sign-widths (get kv "prism.hadamard.sign_widths")
+                           :sign-values-count (get-in kv ["prism.hadamard.sign_values" :array/count])
+                           :weight-count (count (get kv "prism.hadamard.weight_names"))
+                           :inverse-weight-names (get kv "prism.hadamard.inverse_weight_names")
+                           :gdn-v-grouped (get kv "prism.hadamard.gdn_v_grouped")}
+                :non-block-tensors (mapv (fn [t] [(:name t) (:dims t) (:type t)]) (remove #(layer-of (:name %)) tensors))
+                :meta-keys (vec (sort (filter #(str/starts-with? % (str arch ".")) (keys kv))))}]
+    (println (pr-str report))))
