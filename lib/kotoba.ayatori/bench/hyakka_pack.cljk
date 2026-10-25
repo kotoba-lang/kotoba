@@ -1,0 +1,113 @@
+#!/usr/bin/env kbb
+;; bench/hyakka_pack.cljk — Co-Scientist iteration 02, second arm: the same
+;; question against a REAL corpus instead of a synthetic one.
+;;
+;; `many_packs.cljs` measures the crossover on a synthetic snapshot whose blocks
+;; are small and uniform. wiki.kotobase.net's corpus index is neither: 38 blocks,
+;; 13.5 MB, one 4,885-byte DAG-CBOR root over raw leaves with a 390 KB median.
+;; A shape that different is where a cost model earns or loses its keep.
+;;
+;; The two access patterns this index actually has:
+;;   point lookup   root + the ONE leaf whose [lo,hi] contains the key   = 2 blocks
+;;   prefix scan    root + up to `max-leaves` (4) consecutive leaves     = 5 blocks
+;;
+;; Input is the live CAR: `curl ".../ipfs/<root>?format=car" > /tmp/hyakka.car`.
+;; Reading the deployment rather than a fixture is the point -- a fixture would
+;; be this file's author choosing the block sizes that decide the answer.
+;;
+;; Run:
+;;   kbb --backend sci --classpath "$(cat bin/classpath.txt)" bench/hyakka_pack.cljk
+
+(ns hyakka-pack
+  (:require ["node:fs" :as fs]
+            [ayatori.pack :as pack]
+            [kotoba.lang.text :as str]
+            [ipld.car :as car]
+            [ipld.car.bytes :as b]
+            [ipld.car.v2 :as car2]
+            [ipld.core :as ipld]))
+
+(def car-path "/tmp/hyakka.car")
+
+(defn- load-blocks []
+  (when-not (fs/existsSync car-path)
+    (println "REFUSING: no" car-path "— fetch it first:")
+    (println "  curl -sL '.../ipfs/<root>?format=car' -H 'Accept: application/vnd.ipld.car' >" car-path)
+    (js/process.exit 2))
+  (let [p (car/decode (js/Uint8Array. (fs/readFileSync car-path)))]
+    {:root (str (first (:roots p)))
+     :blocks (mapv (fn [x] {:cid (str (nth x 0)) :bytes (nth x 1)}) (:blocks p))}))
+
+(defn- touched
+  "The CIDs one access pattern reads, from the real root. Not a guess: the leaf
+   descriptors are read out of the published root and the link unwrapped."
+  [root-node n-leaves]
+  (let [leaves (get-in root-node ["idx" "item" "leaves"])]
+    (mapv (fn [d] (let [c (nth (vec d) 2)]
+                    (if (ipld/link? c) (ipld/link-cid c) c)))
+          (take n-leaves leaves))))
+
+(defn- per-object [blocks-by-cid cids]
+  ;; 2 per block: one discovery, one fetch. Same model the synthetic arm uses.
+  {:round-trips (* 2 (count cids))
+   :bytes (reduce + (map #(b/bcount (get blocks-by-cid %)) cids))})
+
+(defn- packed
+  "`p` packs over the real blocks, split by insertion order (write locality),
+   read through the real `ayatori.pack` reader."
+  [{:keys [root blocks]} cids p]
+  (let [per (js/Math.ceil (/ (count blocks) p))
+        groups (vec (partition-all (max 1 per) blocks))
+        archives (mapv (fn [g] (:bytes (car2/pack {:roots [root] :blocks (vec g)}))) groups)
+        catalog (into {} (mapcat (fn [i g] (map (fn [{:keys [cid]}] [cid i]) g))
+                                 (range) groups))
+        reads (atom 0) bytes (atom 0) opens (atom 0) cache (atom {})
+        range-fn-for (fn [archive]
+                       (fn [{:keys [range]}]
+                         (swap! reads inc)
+                         (let [[_ from to] (re-matches #"bytes=(\d+)-(\d*)" range)
+                               start (js/parseInt from 10)
+                               total (b/bcount archive)
+                               end (if (seq to) (min total (inc (js/parseInt to 10))) total)
+                               slice (b/slice archive start (min end total))]
+                           (swap! bytes + (b/bcount slice))
+                           slice)))
+        pack-for (fn [i]
+                   (or (get @cache i)
+                       (let [op (pack/open-pack
+                                 {:range-fn (range-fn-for (nth archives i))
+                                  :profile {:blocks :packed-blocks :object #{:range-read}}})]
+                         (swap! opens inc) (swap! cache assoc i op) op)))
+        got (mapv (fn [cid]
+                    (when-let [i (get catalog cid)]
+                      (pack/read-block (pack-for i) cid)))
+                  cids)]
+    ;; GATE: every block asked for must come back, and come back whole.
+    (when (some nil? got)
+      (println "REFUSING: the packed arm did not return every block")
+      (js/process.exit 2))
+    {:round-trips @reads :bytes @bytes :packs-opened @opens :blocks (count got)}))
+
+(defn- fmt [& xs] (str/join (map (fn [[w v]] (.padStart (str v) w)) (partition 2 xs))))
+
+(let [{:keys [root blocks] :as corpus} (load-blocks)
+      by-cid (into {} (map (juxt :cid :bytes) blocks))
+      root-node (ipld/decode (js/Uint8Array. (get by-cid root)))]
+  (println)
+  (println "ayatori Co-Scientist 02 — the real wiki.kotobase.net corpus index")
+  (println (str "  " (count blocks) " blocks, " (reduce + (map #(b/bcount (:bytes %)) blocks))
+                " bytes, root " (b/bcount (get by-cid root)) " bytes"))
+  (println)
+  (doseq [[label n-leaves] [["point lookup (root + 1 leaf)" 1]
+                            ["prefix scan  (root + 4 leaves)" 4]]]
+    (let [cids (into [root] (touched root-node n-leaves))
+          base (per-object by-cid cids)]
+      (println label "—" (count cids) "blocks")
+      (println (fmt 10 "packs" 9 "opened" 13 "round-trips" 12 "bytes" 15 "vs per-object" 12 "bytes vs"))
+      (println (fmt 10 "-" 9 "-" 13 (:round-trips base) 12 (:bytes base) 15 "1.00x" 12 "1.000x"))
+      (doseq [p [1 2 4 38]]
+        (let [a (packed corpus cids p)]
+          (println (fmt 10 p 9 (:packs-opened a) 13 (:round-trips a) 12 (:bytes a)
+                        15 (str (.toFixed (/ (:round-trips base) (:round-trips a)) 2) "x")
+                        12 (str (.toFixed (/ (:bytes a) (:bytes base)) 3) "x")))))
+      (println))))

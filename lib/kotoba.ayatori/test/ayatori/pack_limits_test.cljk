@@ -1,0 +1,122 @@
+(ns ayatori.pack-limits-test
+  "What `open-pack` does with a pack whose header or index it cannot honour.
+
+  Two gaps, both of the shape where not measuring looks like measuring.
+
+  The index was fetched as `bytes=N-` -- the rest of the object, whatever
+  that was. The reader learns the size by holding it, so a large tail, or a
+  store that ignores Range, is an unbounded read that nothing downstream can
+  undo. Requesting a bounded range makes the ceiling the reader's choice.
+
+  The characteristics bitfield was parsed and dropped. CARv2 gives an archive
+  128 bits to say it is not an ordinary one; read and discarded, saying so and
+  saying nothing produced the same read."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [ayatori.pack :as pack]
+            [ipld.car.bytes :as b]
+            [ipld.car.v2 :as car2]
+            [ipld.core :as ipld]))
+
+(defn- err [f]
+  (try (f) nil
+       (catch #?(:clj Exception :cljs :default) e (:type (ex-data e)))))
+
+(defn- open
+  "Open `archive`, recording every range string the reader asked for."
+  ([archive requests] (open archive requests {}))
+  ([archive requests opts]
+   (pack/open-pack
+    (merge
+     {:profile {:blocks :packed-blocks :object #{:range-read}}
+      :range-fn
+      (fn [{:keys [range]}]
+        (swap! requests conj range)
+        (let [[_ a z] (re-matches #"bytes=(\d+)-(\d*)" range)
+              parse #?(:clj #(Long/parseLong %) :cljs #(js/parseInt % 10))
+              start (parse a)
+              end (if (seq z) (inc (parse z)) (b/bcount archive))]
+          (b/slice archive start (min end (b/bcount archive)))))}
+     opts))))
+
+(defn- fixture []
+  (car2/pack {:roots [(:cid (ipld/node->block {"n" 0}))]
+              :blocks (mapv #(ipld/node->block {"n" %}) (range 3))}))
+
+;; ── the index read is bounded ────────────────────────────────────────────────
+
+(deftest the_index_range_request_is_closed_not_open_ended
+  (let [requests (atom [])
+        packed (fixture)]
+    (open (:bytes packed) requests)
+    (is (= 2 (count @requests)))
+    (let [index-range (second @requests)]
+      (is (re-matches #"bytes=\d+-\d+" index-range)
+          (str "an open-ended index read cannot be bounded by the caller: "
+               index-range))
+      (let [[_ a z] (re-matches #"bytes=(\d+)-(\d+)" index-range)
+            parse #?(:clj #(Long/parseLong %) :cljs #(js/parseInt % 10))]
+        (is (= pack/max-index-bytes (inc (- (parse z) (parse a))))
+            "the window is the reader's ceiling, not the object's length")))))
+
+(deftest the_ceiling_is_the_callers_to_set
+  (let [requests (atom [])
+        packed (fixture)]
+    (open (:bytes packed) requests {:max-index-bytes 4096})
+    (let [[_ a z] (re-matches #"bytes=(\d+)-(\d+)" (second @requests))
+          parse #?(:clj #(Long/parseLong %) :cljs #(js/parseInt % 10))]
+      (is (= 4096 (inc (- (parse z) (parse a))))))))
+
+(deftest a_store_that_ignores_the_range_is_refused_not_held
+  ;; The hazard the bounded request alone does not close: asking for a window
+  ;; is not the same as being given one.
+  (let [packed (fixture)
+        oversized (b/concat [(:bytes packed) (b/->bytes (repeat 200 0))])
+        requests (atom [])]
+    (is (= :ayatori/index-too-large
+           (err #(pack/open-pack
+                  {:profile {:blocks :packed-blocks :object #{:range-read}}
+                   :max-index-bytes 16
+                   :range-fn (fn [{:keys [range]}]
+                               (swap! requests conj range)
+                               (if (= 1 (count @requests))
+                                 (b/slice oversized 0 pack/header-bytes)
+                                 oversized))}))))
+    (is (= 2 (count @requests)) "refused on the index read, before any block")))
+
+(deftest a_truncated_index_is_refused_rather_than_read_as_empty
+  ;; A short tail must not decode as "this pack indexes nothing" -- nothing
+  ;; downstream can tell that apart from a real pack with no blocks.
+  (let [packed (fixture)
+        cut (b/slice (:bytes packed) 0 (+ (:index-offset packed) 4))]
+    (is (contains? #{:car/index-overruns-buffer :car/read-out-of-range
+                     :car/index-codec}
+                   (err #(open cut (atom [])))))))
+
+;; ── the header is qualified, not partly read ─────────────────────────────────
+
+(deftest a_declared_characteristic_is_refused_rather_than_ignored
+  (let [packed (fixture)
+        body (b/slice (:bytes packed) car2/data-offset (b/bcount (:bytes packed)))
+        with-characteristic
+        (b/concat [car2/pragma
+                   (b/->bytes (concat [0x80] (repeat 15 0)))
+                   (b/u64-le (:data-offset packed))
+                   (b/u64-le (:data-size packed))
+                   (b/u64-le (:index-offset packed))
+                   body])
+        requests (atom [])]
+    (is (= :ayatori/unsupported-pack-characteristics
+           (err #(open with-characteristic requests))))
+    (is (= 1 (count @requests))
+        "refused on the header read, before the index is fetched")))
+
+(deftest an_ordinary_pack_still_opens_and_reads
+  ;; The other direction: the two refusals above must not cost a normal pack.
+  (let [packed (fixture)
+        requests (atom [])
+        p (open (:bytes packed) requests)
+        blocks (:blocks (car2/read-all (:bytes packed)))]
+    (testing "every block still reads back, verified"
+      (doseq [{:keys [cid]} (:entries packed)]
+        (is (b/equal? (get blocks cid) (pack/read-block p cid)))))
+    (is (= 5 (count @requests)) "header + index + one range read per block")))

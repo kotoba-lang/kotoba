@@ -1,0 +1,1936 @@
+(ns kotoba.verifier-test
+  (:require [kotoba.lang.error :as kerror] [kotoba.lang.edn :as edn]
+            [kotoba.io :as io]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.artifact.core :as artifact]
+            [kotoba.kir :as ir]
+            [kotoba.kir.compatibility :as compatibility]
+            [kotoba.kir.target :as target]
+            [kotoba.native.aggregate-abi :as aggregate-abi]
+            [kotoba.mir :as mir]
+            [kotoba.native.machine-ir :as machine]
+            [kotoba.native.x86-64 :as x86-64]
+            [kotoba.verifier]
+            [kotoba.verifier.conformance :as conformance]
+            [kotoba.verifier.signing]))
+
+;; Load gate: the split must not break namespace resolution. Each extracted
+;; namespace must load standalone from this repo's own dependency closure.
+(deftest every-extracted-namespace-loads
+  (is (some? (find-ns 'kotoba.verifier)) "kotoba.verifier must load")
+  (is (some? (find-ns 'kotoba.verifier.signing)) "kotoba.verifier.signing must load")
+  (is (some? (find-ns 'kotoba.verifier.conformance))
+      "kotoba.verifier.conformance must load"))
+
+(declare native-artifact)
+
+(deftest native-clock-provider-contract-is-independently-sealed
+  (let [request [:variant :kotoba.clock/request
+                 [[:wall :bool] [:monotonic :bool]]]
+        result [:variant :kotoba.clock/result
+                [[:wall [:record :kotoba.clock/wall
+                         [[:unix-millis :i64] [:observation-sequence :i64]]]]
+                 [:monotonic [:record :kotoba.clock/monotonic
+                              [[:nanos :i64] [:observation-sequence :i64]]]]
+                 [:error [:record :kotoba.clock/error
+                          [[:code :keyword] [:message :string]]]]]]]
+    (is (#'kotoba.verifier/native-provider-contract? 7 request result))
+    (is (not (#'kotoba.verifier/native-provider-contract? 8 request result)))
+    (is (not (#'kotoba.verifier/native-provider-contract?
+              7 (assoc request 1 :other/request) result)))
+    (is (not (#'kotoba.verifier/native-provider-contract?
+              7 request (update-in result [2] #(vec (reverse %))))))))
+
+(deftest native-dataspace-provider-contract-is-independently-sealed
+  (let [request [:variant :kotoba.dataspace/request
+                 [[:assert [:record :kotoba.dataspace/assert
+                            [[:assertion :document] [:facet :i64]]]]
+                  [:retract [:record :kotoba.dataspace/retract
+                             [[:assertion :document] [:facet :i64]]]]
+                  [:observe [:record :kotoba.dataspace/observe
+                             [[:pattern :document] [:facet :i64]]]]
+                  [:facet-enter :bool]
+                  [:facet-leave :i64]]]
+        result [:variant :kotoba.dataspace/result
+                [[:asserted [:record :kotoba.dataspace/asserted
+                             [[:count :i64] [:notices :document]]]]
+                 [:retracted [:record :kotoba.dataspace/retracted [[:count :i64]]]]
+                 [:matches [:record :kotoba.dataspace/matches
+                            [[:bindings :document] [:notices :document]]]]
+                 [:facet [:record :kotoba.dataspace/facet [[:id :i64]]]]
+                 [:error [:record :kotoba.dataspace/error
+                          [[:code :keyword] [:message :string]]]]]]]
+    (is (#'kotoba.verifier/native-provider-contract? 24 request result))
+    (is (not (#'kotoba.verifier/native-provider-contract? 7 request result)))
+    (is (not (#'kotoba.verifier/native-provider-contract? 24 request request)))))
+
+(deftest native-ui-provider-contract-is-independently-sealed
+  (let [parent [:option :keyword]
+        node [:record :kotoba.ui/node
+              [[:id :keyword] [:parent parent] [:kind :keyword] [:text :string]]]
+        nodes [:set node]
+        commit-request [:record :kotoba.ui/commit-request
+                        [[:base-revision :i64] [:nodes nodes]]]
+        commit-result [:record :kotoba.ui/commit-result
+                       [[:revision :i64] [:node-count :i64]]]
+        event-request [:record :kotoba.ui/event-request [[:after-revision :i64]]]
+        event [:record :kotoba.ui/event
+               [[:revision :i64] [:target :keyword] [:kind :keyword] [:value :string]]]
+        event-result [:option event]]
+    (is (#'kotoba.verifier/native-word-value-type? nodes))
+    (is (#'kotoba.verifier/native-word-value-type? event-result))
+    (is (#'kotoba.verifier/native-provider-contract? 9 commit-request commit-result))
+    (is (#'kotoba.verifier/native-provider-contract? 10 event-request event-result))
+    (is (not (#'kotoba.verifier/native-provider-contract? 9 commit-request event-result)))
+    (is (not (#'kotoba.verifier/native-provider-contract? 10 event-request event)))))
+
+(deftest aggregate-boundary-contract-does-not-widen-verifier-admission
+  (let [record-type [:record :t/pair [[:left :i64] [:ready :bool]]]
+        plan (aggregate-abi/record-boundary-plan record-type)
+        guarantees #{:per-function-frame
+                     :spill-live-values-across-call
+                     :parallel-argument-assignment
+                     :single-word-return-register}]
+    (is (= 7 (:abi/version aggregate-abi/contract)))
+    (is (= :pair-chain-handle (:boundary/results plan)))
+    (is (= :host-context (:boundary/ownership plan)))
+    (is (= 4096 (:boundary/arena-cell-limit plan)))
+    (is (= :recursive-word-handles (:boundary/field-representation plan)))
+    (is (= 32 (:boundary/max-nesting-depth plan)))
+    (is (= :admitted (:boundary/extracted-admission plan)))
+    (is (#'kotoba.verifier/native-boundary-type? record-type)
+        "the established boxed record boundary remains independently admitted")
+    (is (= :word-pair-chain-admitted
+           (get-in aggregate-abi/contract [:extracted :record-boundary])))
+    (is (= :recursive-payload-pair-handle-admitted
+           (get-in aggregate-abi/contract [:extracted :variant-boundary])))
+    (is (= :sealed-callable-admitted
+           (get-in aggregate-abi/contract [:extracted :call-admission])))
+    (is (= {:indirect :closed-ordinal-dispatch
+            :apply :bounded-pair-chain
+            :max-apply-arguments 4
+            :arbitrary-address false}
+           (get-in aggregate-abi/contract [:extracted :callable-dispatch])))
+    (is (= {:mode :closed-module-graph
+            :ambient-symbols false
+            :unresolved-symbols false}
+           (get-in aggregate-abi/contract [:extracted :linkage])))
+    (is (= guarantees (get-in aggregate-abi/contract
+                              [:extracted :call-requires])))
+    (doseq [target [:x86-64 :aarch64]]
+      (is (= (aggregate-abi/call-profile target)
+             (aggregate-abi/admit-extracted-call! target guarantees)) target)
+      (is (thrown-with-msg?
+           kerror/ExceptionInfo #"missing-call-guarantees"
+           (aggregate-abi/admit-extracted-call!
+            target (disj guarantees :spill-live-values-across-call))) target))
+    (is (not (#'kotoba.verifier/native-boundary-type?
+              [:record :t/duplicate [[:value :i64] [:value :bool]]]))
+        "the contract cannot widen the verifier's independently derived set")))
+
+(deftest recursive-record-boundary-is-independently-depth-bounded
+  (let [nested (fn [depth]
+                 (reduce (fn [field-type index]
+                           [:record (keyword "verified" (str "level-" index))
+                            [[:value field-type]]])
+                         :i64
+                         (range depth)))]
+    (is (#'kotoba.verifier/native-boundary-type? (nested 32)))
+    (is (not (#'kotoba.verifier/native-boundary-type? (nested 33))))))
+
+(deftest recursive-record-program-is-independently-verified-and-reemitted
+  (let [inner [:record :verified/inner [[:left :i64] [:right :i64]]]
+        outer [:record :verified/outer [[:inner inner] [:bonus :i64]]]
+        value (list 'record-new outer (list 'record-new inner 4 5) 6)
+        program {:format :kotoba.kir/v4
+                 :entry 'main :exports ['main]
+                 :signature {:params [] :result :i64}
+                 :effects #{}
+                 :functions
+                 [{:name 'main :params [] :param-types [] :result :i64
+                   :effects #{}
+                   :body (list 'let ['value value]
+                               (list '+
+                                     (list 'record-get inner
+                                           (list 'record-get outer 'value :inner)
+                                           :left)
+                                     (list 'record-get inner
+                                           (list 'record-get outer 'value :inner)
+                                           :right)
+                                     (list 'record-get outer 'value :bonus)))}]}
+        sealed (native-artifact program)]
+    (is (= 15 (:value sealed)))
+    (is (= program (#'kotoba.verifier/verify-program! program)))
+    (is (= sealed (kotoba.verifier/verify-artifact! sealed)))))
+
+(deftest scalar-direct-call-is-reemitted-by-the-pinned-production-backend
+  (let [program {:format :kotoba.kir/v3
+                 :entry 'main
+                 :exports ['main]
+                 :signature {:params [] :result :i64}
+                 :effects #{}
+                 :functions [{:name 'inc-one
+                              :params ['x]
+                              :param-types [:i64]
+                              :result :i64
+                              :effects #{}
+                              :body '(+ x 1)}
+                             {:name 'main
+                              :params []
+                              :result :i64
+                              :effects #{}
+                              :body '(let [live 40]
+                                       (+ live (inc-one 1)))}]}
+        sealed (native-artifact program)]
+    (is (= sealed (kotoba.verifier/verify-artifact! sealed)))
+    (is (pos? (get-in sealed [:exports 'main :offset]))
+        "the exported entry follows the internal callee in the code image")
+    (is (pos? (get-in sealed [:exports 'main :length])))))
+
+;; ── what a producer must do with a value a call cannot be trusted with ──────
+;;
+;; These three used to pin SPILL SLOTS as literals: "the caller has exactly one
+;; frame slot", "exactly one spill-store and one spill-load", "the fifth entry
+;; argument is stored to slot 0". That was true of the allocator that had four
+;; scratch registers and nothing else.
+;;
+;; kotoba-native `7b25376` gave the allocator a preserved tier -- RBX/R12-R15
+;; on x86-64, X19-X26 on AArch64 -- so a value that must survive a call now
+;; goes to a callee-saved register instead of the stack, and these programs
+;; spill nothing at all. That is strictly better and it made the pins false:
+;; measured 2026-09-02, bumping the kotoba-native pin from `a2023fe` to main
+;; turned 22 assertions in this suite red, all of them here, and NONE of them
+;; because a value stopped surviving its call.
+;;
+;; So what is pinned now is the property those literals stood for: a value the
+;; call cannot be trusted with is MATERIALISED exactly once, in a home the call
+;; cannot clobber, and a function that makes no call materialises nothing. A
+;; frame slot and a callee-saved register are both such a home, and which one
+;; the allocator picks is its business.
+;;
+;; `kotoba.mir/saved-registers` is read out of the SAME closure the pinned
+;; backend comes from -- deliberately not a top-level dependency, because the
+;; question is which registers THIS backend's frame saves, not which ones some
+;; other pin would.
+
+(defn- materialised-homes
+  "How many values FUNCTION parks where a call cannot reach them: frame slots
+  plus the callee-saved registers its frame has to save and restore."
+  [target function]
+  (+ (:mc/frame-slots function)
+     (count (mir/saved-registers target (:mc/instructions function)))))
+
+(defn- encodings-of [target function suffix]
+  (filter #(= (keyword (name target) suffix) (:mc/encoding %))
+          (:mc/instructions function)))
+
+(deftest pinned-producer-materializes-only-the-live-across-call-value
+  (let [kir {:format :kotoba.kir/v4
+             :exports ['main]
+             :functions
+             [{:name 'inc-one :params ['x] :result :i64 :body '(+ x 1)}
+              {:name 'main :params ['x] :result :i64
+               :body '(let [live 10] (+ live (inc-one x)))}]}]
+    (doseq [target [:x86-64 :aarch64]]
+      (let [[callee caller] (:mc/functions (->> kir machine/lower-kir-module
+                                                (machine/compile-gmir target)))]
+        (is (= :call-live (:mc/frame-policy caller)) target)
+        (is (= 1 (materialised-homes target caller))
+            (str target ": `live` crosses the call, so exactly one value is"
+                 " parked where the call cannot clobber it"))
+        (testing "a slot home costs exactly one store and one load; a register home costs neither"
+          (is (= (:mc/frame-slots caller) (count (encodings-of target caller "spill-store")))
+              target)
+          (is (= (:mc/frame-slots caller) (count (encodings-of target caller "spill-load")))
+              target))
+        (testing "and the leaf callee materialises nothing -- it has nothing to survive"
+          (is (= :allocator (:mc/frame-policy callee)) target)
+          (is (= 0 (materialised-homes target callee)) target))))))
+
+(deftest pinned-producer-assigns-four-entry-arguments-in-parallel
+  (let [kir {:format :kotoba.kir/v4
+             :exports ['main]
+             :functions
+             [{:name 'sum-four :params ['a 'b 'c 'd] :result :i64
+               :body '(+ (+ a b) (+ c d))}
+              {:name 'main :params ['a 'b 'c 'd] :result :i64
+               :body '(sum-four a b c d)}]}]
+    (doseq [target [:x86-64 :aarch64]]
+      (let [[callee caller]
+            (:mc/functions (->> kir machine/lower-kir-module
+                                (machine/compile-gmir target)))
+            argument-encoding (keyword (name target) "argument")
+            move-encoding (keyword (name target) "move")
+            spill-encodings #{(keyword (name target) "spill-store")
+                              (keyword (name target) "spill-load")}
+            expected-inputs (if (= :x86-64 target)
+                              [:x86-64/rdi :x86-64/rsi
+                               :x86-64/rdx :x86-64/rcx]
+                              [:aarch64/x0 :aarch64/x1
+                               :aarch64/x2 :aarch64/x3])]
+        (is (= [0 0] (mapv :mc/frame-slots [callee caller])) target)
+        (is (= [:allocator :call-live]
+               (mapv :mc/frame-policy [callee caller])) target)
+        (doseq [function [callee caller]]
+          (is (= expected-inputs
+                 (mapv :mir/dst
+                       (filter #(= argument-encoding (:mc/encoding %))
+                               (:mc/instructions function))))
+              [target (:mc/name function)])
+          (is (not-any? #(contains? spill-encodings (:mc/encoding %))
+                        (:mc/instructions function))
+              [target (:mc/name function)]))
+        (is (= (if (= :x86-64 target) 3 0)
+               (count (filter #(= move-encoding (:mc/encoding %))
+                              (:mc/instructions callee))))
+            target)))))
+
+(deftest pinned-producer-parks-only-the-fifth-entry-argument
+  ;; Five arguments fill the call-argument registers exactly, so the fifth is
+  ;; the one whose home the transfer would otherwise overwrite while shuffling
+  ;; the other four. It is parked and restored into its argument register
+  ;; immediately before the transfer -- which is the invariant. Whether the
+  ;; park is a stack slot or a callee-saved register is the allocator's choice
+  ;; and it has made both.
+  (let [kir {:format :kotoba.kir/v4
+             :exports ['main]
+             :functions
+             [{:name 'sum-five :params ['a 'b 'c 'd 'e] :result :i64
+               :body '(+ (+ (+ a b) (+ c d)) e)}
+              {:name 'main :params ['a 'b 'c 'd 'e] :result :i64
+               :body '(sum-five a b c d e)}]}]
+    (doseq [target [:x86-64 :aarch64]]
+      (let [[callee caller]
+            (:mc/functions (->> kir machine/lower-kir-module
+                                (machine/compile-gmir target)))
+            argument-encoding (keyword (name target) "argument")
+            tail-call-encoding (keyword (name target) "tail-call")
+            expected-inputs (if (= :x86-64 target)
+                              [:x86-64/rdi :x86-64/rsi :x86-64/rdx
+                               :x86-64/rcx :x86-64/r8]
+                              [:aarch64/x0 :aarch64/x1 :aarch64/x2
+                               :aarch64/x3 :aarch64/x4])
+            fifth-input (expected-inputs 4)
+            caller-instructions (vec (:mc/instructions caller))
+            transfer-index (first (keep-indexed
+                                   (fn [index instruction]
+                                     (when (= tail-call-encoding
+                                              (:mc/encoding instruction))
+                                       index))
+                                   caller-instructions))]
+        (is (= [:allocator :call-live]
+               (mapv :mc/frame-policy [callee caller])) target)
+        (testing "the callee calls nothing, so it parks nothing"
+          (is (= 0 (materialised-homes target callee)) target))
+        (testing "the caller parks exactly one value: the fifth argument"
+          (is (= 1 (materialised-homes target caller)) target)
+          (is (= (:mc/frame-slots caller)
+                 (count (encodings-of target caller "spill-store"))) target)
+          (is (= (:mc/frame-slots caller)
+                 (count (encodings-of target caller "spill-load"))) target))
+        (doseq [function [callee caller]]
+          (is (= expected-inputs
+                 (mapv :mir/dst
+                       (filter #(= argument-encoding (:mc/encoding %))
+                               (:mc/instructions function))))
+              [target (:mc/name function)]))
+        (testing "and the park is restored into the fifth argument register last"
+          (let [restore (get caller-instructions (dec transfer-index))]
+            (is (= fifth-input (:mir/dst restore))
+                (str target ": the instruction before the transfer writes "
+                     fifth-input ", got " (pr-str restore)))
+            (is (contains? #{(keyword (name target) "spill-load")
+                             (keyword (name target) "move")}
+                           (:mc/encoding restore))
+                (str target ": from a slot or from the register it was parked in"))
+            (when (= (keyword (name target) "move") (:mc/encoding restore))
+              (is (contains? (set (mir/preserved-registers target)) (:mir/src restore))
+                  (str target ": a register park must be a callee-saved one -- a"
+                       " caller-saved source would not have survived a real call")))))
+        (is (= tail-call-encoding
+               (:mc/encoding (get caller-instructions transfer-index))) target)
+        (is (= expected-inputs
+               (:mir/arguments (get caller-instructions transfer-index)))
+            (str target ": the transfer still carries all five in order"))))))
+
+(defn- vector-fixture []
+  (edn/read-string (slurp (io/resource "conformance/dual-surface-v1.edn"))))
+
+(defn- native-artifact
+  ([kir] (native-artifact kir 512))
+  ([kir fuel]
+  (let [program (select-keys kir [:format :entry :exports :signature
+                                  :effects :functions])
+        emitted (x86-64/emit-program program)
+        profile (target/profile :x86_64-kotoba-v1)]
+    (artifact/seal
+     {:format :kotoba.kexe/v1
+      :target :x86_64-kotoba-v1
+      :target-profile profile
+      :value (when (and (empty? (:effects program)) (some? (:entry program)))
+               (kotoba.kir/execute program (:entry program) [] {:fuel fuel}))
+      :kir-sha256 (artifact/sha256 program)
+      :lowering :runtime-sysv-v1
+      :fuel-abi {:mode :hidden-context-r9 :initial fuel}
+      :context-abi {:version 11 :fuel-offset 8 :allow-bitmap-offset 16
+                    :allow-bitmap-bytes 32 :cap-call-offset 48
+                    :pair-new-offset 56 :pair-first-offset 64
+                    :pair-second-offset 72 :pair-capacity 4096
+                    :kgraph-assert-offset 80 :kgraph-get-offset 88
+                    :kgraph-count-offset 96 :kgraph-entity-at-offset 104
+                    :kgraph-capacity 4096
+                    :string-equal-offset 112 :string-concat-offset 120
+                    :typed-cap-call-offset 128
+                    :string-substring-offset 136
+                    :string-code-point-at-offset 144
+                    :string-pool-capacity 65536
+                    :vector-new-empty-offset 152 :vector-conj-offset 160
+                    :vector-count-offset 168 :vector-at-offset 176
+                    :vector-assoc-offset 184 :vector-drop-offset 192
+                    :vector-alloc-offset 200
+                    :vector-assoc-in-place-offset 208
+                    :string-index-of-offset 216
+                    :arena-enter-offset 224 :arena-leave-offset 232
+                    :string-compare-offset 240 :string-fold-ascii-offset 248
+                    :string-find-blank-offset 256 :string-skip-blank-offset 264
+                    :string-index-of-from-offset 272 :string-compare-lines-offset 280
+                    :pair-used-pointer-offset 288 :pairs-base-offset 296
+                    :pair-validated-base-offset 304
+                    :vector-used-pointer-offset 312 :vectors-base-offset 320
+                    :vector-items-base-offset 328
+                    :string-find-byte-offset 336 :string-append-range-offset 344
+                    :string-from-utf8-offset 352 :bytes-from-vector-offset 360
+                    :bytes-slice-offset 368 :bytes-concat-offset 376
+                    :vector-capacity 4096
+                    :vector-item-capacity 65536}
+      :effects (:effects program)
+      :compatibility
+      (compatibility/descriptor
+       {:hir-format (if (= :kotoba.kir/v4 (:format program))
+                      :kotoba.hir/v3 :kotoba.hir/v2)
+        :kir-format (:format program)
+        :target :x86_64-kotoba-v1 :target-profile profile
+        :value-abi (if (= :kotoba.kir/v4 (:format program))
+                     :kotoba.typed/externref-v1 :kotoba.i64/direct-v1)})
+      :limits {:memory-bytes 65536 :fuel fuel :stack-bytes 4096}
+      :code (mapv #(bit-and (int %) 0xff) (:code emitted))
+      :program program
+      :exports (:exports emitted)}))))
+
+(deftest bounded-native-fuel-is-an-explicit-matched-artifact-contract
+  (let [{:keys [kir]} (vector-fixture)
+        raised (native-artifact kir 65536)]
+    (is (= raised (kotoba.verifier/verify-artifact! raised)))
+    (doseq [[label changed message]
+            [[:mismatch
+              (artifact/seal (assoc-in raised [:fuel-abi :initial] 65535))
+              #"fuel ABI is not admitted"]
+             [:zero
+              (artifact/seal (-> raised
+                                 (assoc-in [:fuel-abi :initial] 0)
+                                 (assoc-in [:limits :fuel] 0)))
+              #"native fuel budget is not admitted"]
+             [:over-maximum
+              ;; fuel64: one past `kotoba.kir/max-fuel`, not one past a
+              ;; literal. The old value here was 1,048,577 -- one past a 2^20
+              ;; ceiling that only the IMAGE route ever consulted, while the
+              ;; object route shipped tiers of 250,000,000 and 2,147,483,647
+              ;; past it. Written against the interpreter's constant so a
+              ;; future move of that constant cannot leave this assertion
+              ;; testing a number nothing enforces.
+              (artifact/seal (-> raised
+                                 (assoc-in [:fuel-abi :initial] (inc ir/max-fuel))
+                                 (assoc-in [:limits :fuel] (inc ir/max-fuel))))
+              #"native fuel budget is not admitted"]]]
+      (testing (name label)
+        (is (thrown-with-msg? kerror/ExceptionInfo message
+                              (kotoba.verifier/verify-artifact! changed)))))))
+
+;; fuel64: the positive half. Without it the test above says only that SOME
+;; number is refused, which a ceiling of 1 would also satisfy.
+(deftest a-native-budget-past-the-old-imm32-ceiling-is-admitted
+  (let [{:keys [kir]} (vector-fixture)]
+    (doseq [[label fuel] [["2^20, the ceiling this file used to carry" 1048576]
+                          ["one past it" 1048577]
+                          ["2^31, the first budget the old object imm32 could not write"
+                           2147483648]
+                          ["the object probe tier" 4300000000]
+                          ["the ceiling itself" ir/max-fuel]]]
+      (let [a (native-artifact kir fuel)]
+        (is (= a (kotoba.verifier/verify-artifact! a)) label)))))
+
+(deftest the-verifiers-ceiling-is-the-interpreters-ceiling
+  ;; Read rather than copied -- see the comment on `max-native-fuel`. This
+  ;; asserts the number as well, so that reading it from elsewhere cannot
+  ;; quietly become reading something else.
+  (is (= 9007199254740991 ir/max-fuel))
+  (is (= ir/max-fuel @#'kotoba.verifier/max-native-fuel)))
+
+(deftest checked-in-vector-proves-both-surfaces-preserve-one-kir-contract
+  (let [{:keys [kir admission expected]} (vector-fixture)
+        contract (conformance/kir-contract kir)
+        native (native-artifact kir)
+        component-surface (assoc contract :admission admission)
+        native-surface (assoc contract :admission admission :artifact native)
+        result (conformance/verify-dual-surface!
+                kir component-surface native-surface)]
+    (is (:equivalent? result))
+    (is (= (:exports expected) (:exports result)))
+    (is (= (:effects expected) (:effects result)))))
+
+(deftest conformance-fails-closed-on-each-shared-dimension
+  (let [{:keys [kir admission]} (vector-fixture)
+        contract (conformance/kir-contract kir)
+        surface (assoc contract :admission admission)]
+    (doseq [[label changed]
+            [[:exports (update surface :exports conj 'hidden)]
+             [:effects (update surface :effects conj [:cap/call 8])]
+             [:kir (assoc surface :kir-sha256 (apply str (repeat 64 "0")))]
+             [:admission (assoc-in surface [:admission :policy-id] :other)]]]
+      (testing (name label)
+        (is (thrown? kerror/ExceptionInfo
+                     (conformance/verify-dual-surface!
+                      kir surface changed)))))))
+
+;; ---------------------------------------------------------------------------
+;; Module shape rejections name the condition that failed
+;; ---------------------------------------------------------------------------
+
+(def ^:private ok-program
+  {:format :kotoba.kir/v3 :entry 'main :exports ['main]
+   :signature {:params [] :result :i64} :effects #{}
+   :functions [{:name 'main :params [] :result :i64 :effects #{} :body 1}]})
+
+(defn- shape-condition [program]
+  (try (#'kotoba.verifier/verify-program! program) nil
+       (catch kerror/ExceptionInfo e
+         (when (= "runtime KIR module shape rejected" (ex-message e))
+           (:condition (ex-data e))))))
+
+(deftest a-module-shape-rejection-names-the-failing-condition
+  ;; The whole set used to be one `and` reporting `{}`. A verifier may refuse
+  ;; anything it likes, but it must be possible to learn what it refused --
+  ;; without this, the most common way to hit the check (an entry returning a
+  ;; comparison, hence `:bool`) was indistinguishable from a malformed module.
+  (is (nil? (shape-condition ok-program)) "the reference program must verify")
+  (is (= :entry (shape-condition (assoc ok-program :entry 'not-main))))
+  (is (= :format (shape-condition (assoc ok-program :format :kotoba.kir/v9))))
+  (is (= :keys (shape-condition (assoc ok-program :extra 1))))
+  (is (= :signature-result
+         (shape-condition (assoc ok-program :signature {:params [] :result :f64})))
+      "an unsupported entry result must be reported as such, not as a shapeless failure")
+  (is (= :function-count (shape-condition (assoc ok-program :functions []))))
+  (is (= :exports-vector (shape-condition (assoc ok-program :exports #{'main}))))
+  (is (= :map (shape-condition "not a program"))
+      "a non-map must fail the first condition rather than throw"))
+
+;; ---------------------------------------------------------------------------
+;; vector-i64 / vector-f64 (ADR-2608030300)
+;; ---------------------------------------------------------------------------
+
+(defn- verifies? [body]
+  (try (#'kotoba.verifier/verify-program!
+        (assoc-in ok-program [:functions 0 :body] body))
+       true
+       (catch kerror/ExceptionInfo _ false)))
+
+(defn- rejection [body]
+  (try (#'kotoba.verifier/verify-program!
+        (assoc-in ok-program [:functions 0 :body] body))
+       nil
+       (catch kerror/ExceptionInfo e (ex-message e))))
+
+(deftest both-vector-families-are-admitted-at-their-kir-arities
+  (doseq [body ['(vector-new)
+                '(vector-new 1 2 3)
+                '(vector-count (vector-new 1))
+                '(vector-at (vector-new 1) 0)
+                '(vector-get (vector-new 1) 0 7)
+                '(vector-assoc (vector-new 1) 0 2)
+                '(vector-conj (vector-new 1) 2)
+                '(vector-drop (vector-new 1) 1)
+                '(vector-f64-new)
+                '(vector-f64-count (vector-f64-new 1))
+                '(vector-f64-at (vector-f64-new 1) 0)
+                '(vector-f64-get (vector-f64-new 1) 0 7)
+                '(vector-f64-assoc (vector-f64-new 1) 0 2)
+                '(vector-f64-conj (vector-f64-new 1) 2)
+                '(vector-f64-drop (vector-f64-new 1) 1)
+                ;; ABI v4 (superproject ADR-2609010200).
+                '(vector-alloc 4)
+                '(vector-assoc! (vector-alloc 4) 0 2)]]
+    (testing (str body)
+      (is (verifies? body)))))
+
+;; The bang is not a new operation, it is a claim about the handle -- so a
+;; different arity here would make it one, which is exactly what the KIR
+;; interpreter refuses to let it become. Neither has an f64 twin, and an
+;; operation this verifier does not know is refused by name rather than
+;; reaching a backend with no lowering for it.
+(deftest the-bang-is-the-same-shape-as-the-operation-without-it
+  (is (verifies? '(vector-assoc (vector-alloc 4) 0 2)))
+  (is (verifies? '(vector-assoc! (vector-alloc 4) 0 2)))
+  (is (= "runtime KIR vector operation arity rejected"
+         (rejection '(vector-assoc! (vector-alloc 4) 0))))
+  (is (= "runtime KIR vector operation arity rejected"
+         (rejection '(vector-alloc))))
+  (doseq [body ['(vector-f64-alloc 4)
+                '(vector-f64-assoc! (vector-f64-new 1) 0 2)]]
+    (testing (str body)
+      (is (some? (rejection body)) "no f64 twin exists to admit"))))
+
+;; The arity table is the point: an operation admitted at the wrong arity
+;; would reach a backend that reads an argument which is not there.
+(deftest a-wrong-vector-arity-is-rejected-and-says-which-operation
+  (doseq [body ['(vector-count)
+                '(vector-count (vector-new 1) 2)
+                '(vector-at (vector-new 1))
+                '(vector-get (vector-new 1) 0)
+                '(vector-assoc (vector-new 1) 0)
+                '(vector-conj (vector-new 1))
+                '(vector-drop (vector-new 1))
+                '(vector-f64-at (vector-f64-new 1))]]
+    (testing (str body)
+      (is (= "runtime KIR vector operation arity rejected" (rejection body))))))
+
+;; `vector-new` is the one variadic operation, so its bound is its element
+;; count rather than an arity. Checked here because nothing downstream would
+;; catch it: the native lowering expands one host call per element, so an
+;; unbounded literal is an unbounded expansion.
+(deftest a-vector-literal-past-the-item-limit-is-rejected
+  (is (verifies? (cons 'vector-new (repeat 16384 1))))
+  (is (= "runtime KIR vector literal exceeds the item limit"
+         (rejection (cons 'vector-new (repeat 16385 1)))))
+  (is (= "runtime KIR vector literal exceeds the item limit"
+         (rejection (cons 'vector-f64-new (repeat 16385 1))))))
+
+(deftest closure-parameter-refinement-is-checked
+  (let [consumer {:name 'consume :params ['closure] :param-types [:i64]
+                  :closure-param-indexes [0]
+                  :result :i64 :effects #{} :body 'closure}
+        program (update ok-program :functions conj consumer)]
+    (is (= program (#'kotoba.verifier/verify-program! program)))
+    (doseq [indexes [[1] [0 0] [0 -1] ["0"]]]
+      (testing (pr-str indexes)
+        (is (thrown-with-msg?
+             kerror/ExceptionInfo #"runtime KIR function shape rejected"
+             (#'kotoba.verifier/verify-program!
+              (assoc-in program [:functions 1 :closure-param-indexes] indexes))))))
+    (testing "the refined parameter keeps its i64 ABI type"
+      (is (thrown-with-msg?
+           kerror/ExceptionInfo #"runtime KIR function shape rejected"
+           (#'kotoba.verifier/verify-program!
+            (assoc-in program [:functions 1 :param-types] [:string])))))))
+
+(deftest closure-result-refinement-is-checked
+  (let [maker {:name 'make :params [] :param-types []
+               :closure-result? true
+               :result :i64 :effects #{} :body 0}
+        program (update ok-program :functions conj maker)]
+    (is (= program (#'kotoba.verifier/verify-program! program)))
+    (doseq [value [false 1 :yes]]
+      (testing (pr-str value)
+        (is (thrown-with-msg?
+             kerror/ExceptionInfo #"runtime KIR function shape rejected"
+             (#'kotoba.verifier/verify-program!
+              (assoc-in program [:functions 1 :closure-result?] value))))))
+    (is (thrown-with-msg?
+         kerror/ExceptionInfo #"runtime KIR function shape rejected"
+         (#'kotoba.verifier/verify-program!
+          (assoc-in program [:functions 1 :result] :string))))))
+
+(deftest i64-pair-chain-parameter-refinement-is-checked
+  (let [consumer {:name 'consume :params ['args] :param-types [:i64]
+                  :i64-pair-chain-param-indexes [0]
+                  :result :i64 :effects #{} :body 'args}
+        program (update ok-program :functions conj consumer)]
+    (is (= program (#'kotoba.verifier/verify-program! program)))
+    (doseq [indexes [[1] [0 0] [0 -1] ["0"]]]
+      (testing (pr-str indexes)
+        (is (thrown-with-msg?
+             kerror/ExceptionInfo #"runtime KIR function shape rejected"
+             (#'kotoba.verifier/verify-program!
+              (assoc-in program [:functions 1 :i64-pair-chain-param-indexes]
+                        indexes))))))
+    (testing "the refined parameter keeps its i64 ABI type"
+      (is (thrown-with-msg?
+           kerror/ExceptionInfo #"runtime KIR function shape rejected"
+           (#'kotoba.verifier/verify-program!
+            (assoc-in program [:functions 1 :param-types] [:string])))))
+    (testing "pair-chain and closure refinements cannot overlap"
+      (is (thrown-with-msg?
+           kerror/ExceptionInfo #"runtime KIR function shape rejected"
+           (#'kotoba.verifier/verify-program!
+            (assoc-in program [:functions 1 :closure-param-indexes] [0])))))))
+
+(deftest a-bool-entry-result-is-admitted
+  ;; kotoba-kir 38d1bd0 (2026-07-31) decided the value LEAVING a target is a
+  ;; host boolean, and wasm/ESM/reference all box one. Native was the target
+  ;; not yet carried across. What blocked it was kotoba.kir/lower's oracle fold
+  ;; guard being :i64-only -- nothing was sealed for a :bool entry, so the
+  ;; oracle check had nothing to compare against, and widening this set alone
+  ;; would have changed nothing. lower now folds and seals the boxed boolean.
+  (is (nil? (shape-condition (assoc ok-program :signature {:params [] :result :bool}))))
+  (is (nil? (shape-condition ok-program)))
+  ;; :string joined the admitted set (kbb slice 3, ADR-2607181900): a string
+  ;; is one machine word (the pair(offset,length) handle) and kexe_loader.c
+  ;; has read KEXE_RESULT_TYPE=string. :f64 remains outside.
+  (testing "a result type outside the pair is still rejected, and says so"
+    (is (= :signature-result
+           (shape-condition (assoc ok-program :signature {:params [] :result :f64}))))
+    (is (nil? (shape-condition (assoc ok-program :signature {:params [] :result :string})))
+        ":string is admitted at the entry boundary, same one-word shape as internal results")))
+
+(defn- function-rejected?
+  "True when PROGRAM fails specifically the FUNCTION shape check. Named rather
+  than reusing `verifies?` because the whole hazard here is a test that goes
+  green while some OTHER check is what rejected -- or admitted -- the input.
+  Anything but the function-shape rejection is reported as a distinct value, so
+  a row can never pass by being refused for an unrelated reason."
+  [program]
+  (try (#'kotoba.verifier/verify-program! program) false
+       (catch kerror/ExceptionInfo e
+         (if (= "runtime KIR function shape rejected" (ex-message e))
+           true
+           [:other (ex-message e)]))))
+
+(defn- with-param-types
+  "`ok-program` plus one helper function carrying PARAM-TYPES. Every other part
+  of the helper is deliberately boring -- an i64 result, no effects, a body that
+  is just the first parameter -- so the ONLY thing that can decide the outcome
+  is the parameter-type check."
+  [param-types]
+  (update ok-program :functions conj
+          {:name 'helper
+           :params (vec (map-indexed (fn [i _] (symbol (str "p" i))) param-types))
+           :param-types (vec param-types)
+           :result :i64 :effects #{}
+           :body (if (seq param-types) 'p0 0)}))
+
+(deftest a-bool-parameter-is-admitted-at-a-function-boundary
+  ;; This gate is admission only. What justifies it is EXECUTION: the 17 ISA
+  ;; rows in ADR 0003, run as real x86-64 and aarch64 processes against
+  ;; kotoba-native `f6f29e9`, 17/17 on both. Before that backend fix the same
+  ;; rows trapped on all 10 x86-64 rows whose bool argument is the literal
+  ;; `false` (ADR 0001), which is why this predicate was held for a cycle.
+  ;;
+  ;; Only the BARE-`:bool` rows below are gates for the guard removal. The
+  ;; wrapped and record-field rows are documentation: they reach admission by
+  ;; recursion through `native-word-value-type?` and passed before the change
+  ;; too. Measured by restoring the guard -- 8 assertions move, and those are
+  ;; the bare rows plus the kotoba-kir agreement flip.
+  (testing "alone"
+    (is (false? (function-rejected? (with-param-types [:bool])))))
+  (testing "alongside the other admitted boundary types, in both orders"
+    (doseq [types [[:string :bool] [:bool :string]
+                   [:i64 :bool] [:bool :i64]
+                   [:keyword :bool] [:bool :bool]]]
+      (testing (pr-str types)
+        (is (false? (function-rejected? (with-param-types types)))))))
+  (testing "wrapped, where `native-word-value-type?` already recursed into it"
+    (doseq [types [[[:option :bool]] [[:result :bool :i64]] [[:result :i64 :bool]]]]
+      (testing (pr-str types)
+        (is (false? (function-rejected? (with-param-types types)))))))
+  (testing "as a record field, which never depended on this predicate"
+    (is (false? (function-rejected?
+                 (with-param-types [[:record :t/r [[:a :bool] [:b :i64]]]])))))
+  ;; The negative half. Widening one type must not have widened the set: these
+  ;; are rejected before and after, and if any of them started passing the gate
+  ;; would have stopped being a gate.
+  ;;
+  ;; ⚠ `[:f64]` LEFT THIS LIST on 2026-09-09, and it did not leave quietly --
+  ;; it sat here asserting the opposite of a landed decision for a day, because
+  ;; this suite could not run. `verifier_f64_boundary_test` reads
+  ;; `kotoba.kir/native-float-boundary-types` across the repository boundary
+  ;; (deliberately, so the two admission sets cannot drift), and the osaho pin
+  ;; was left one commit behind the var it reads. The namespace failed to
+  ;; compile, `kbb -M:test` stopped at the first file, and the run reported
+  ;; ZERO tests rather than a failure. A suite that cannot run does not look
+  ;; like a suite that ran.
+  ;;
+  ;; So `:f64` is admitted now and asserted as such below; `:f32` is NOT, and
+  ;; that asymmetry is the current state of `native-float-boundary-types`
+  ;; rather than a decision this test makes.
+  (testing "an f64 parameter IS admitted -- the boundary widened"
+    (is (false? (function-rejected? (with-param-types [:f64])))))
+  (testing "types outside the one-word slice are still refused"
+    (doseq [types [[:f32] [:bytes] [:map] ["bool"] [nil]]]
+      (testing (pr-str types)
+        (is (true? (function-rejected? (with-param-types types)))))))
+  (testing "a malformed parameter-type table is still refused"
+    (is (true? (function-rejected?
+                (assoc-in (with-param-types [:bool]) [:functions 1 :param-types]
+                          [:bool :bool])))
+        "the table must still match the parameter count")
+    (is (true? (function-rejected?
+                (assoc-in (with-param-types [:bool]) [:functions 1 :param-types]
+                          '(:bool))))
+        "the table must still be a vector")))
+
+(deftest native-vector-parameters-are-private-function-boundaries-only
+  (doseq [vector-type [:vector-i64 :vector-f64 :bytes]]
+    (testing (name vector-type)
+      (let [private-helper (-> (with-param-types [vector-type])
+                               (assoc-in [:functions 1 :result] vector-type))
+            exported (update private-helper :exports conj 'helper)]
+        (is (false? (function-rejected? private-helper))
+            "a private native call carries the context-owned handle as one word")
+        (if (= :vector-f64 vector-type)
+          (is (true? (function-rejected? exported))
+              ":vector-f64 has no loader wire form and stays private")
+          (is (false? (function-rejected? exported))
+              "the loader's boundary codec builds and decodes :vector-i64 / :bytes"))))))
+
+(deftest native-vector-results-have-a-non-entry-export-copy-boundary
+  (doseq [vector-type [:vector-i64 :vector-f64]]
+    (testing (name vector-type)
+      (let [exported-result (-> (with-param-types [])
+                                (assoc-in [:functions 1 :result] vector-type)
+                                (update :exports conj 'helper))]
+        (is (false? (function-rejected? exported-result)))
+        (is (= :signature-result
+               (shape-condition
+                (-> exported-result
+                    (assoc-in [:functions 0 :result] vector-type)
+                    (assoc :signature {:params [] :result vector-type}))))
+            "entry results remain outside copy ABI v1 at the module boundary")))))
+
+(deftest native-vector-export-copy-v1-is-zero-arity
+  ;; :vector-i64 crosses through the boundary codec with parameters now.
+  (doseq [vector-type [:vector-f64]]
+    (let [exported-result (-> (with-param-types [:i64])
+                              (assoc-in [:functions 1 :result] vector-type)
+                              (update :exports conj 'helper))]
+      (is (true? (function-rejected? exported-result))))))
+
+(deftest native-string-index-is-private-and-its-operations-are-sealed
+  (let [private-helper (-> (with-param-types [:string-index])
+                           (assoc-in [:functions 1 :result] :string-index))]
+    (is (false? (function-rejected? private-helper)))
+    (is (true? (function-rejected?
+                (update private-helper :exports conj 'helper)))))
+  (doseq [form ['(string-index-new)
+                '(string-index-count (string-index-new))
+                '(string-index-contains (string-index-new) "cid")
+                '(string-index-get (string-index-new) "cid")
+                '(string-index-assoc (string-index-new) "cid" 7)]]
+    (is (verifies? form) (pr-str form)))
+  (doseq [form ['(string-index-new 1)
+                '(string-index-count)
+                '(string-index-contains index)
+                '(string-index-get index key extra)
+                '(string-index-assoc index key)]]
+    (is (= "runtime KIR string-index operation arity rejected"
+           (rejection form))
+        (pr-str form))))
+
+(deftest a-sealed-native-artifact-reemits-string-index-without-a-new-abi
+  (let [program (-> ok-program
+                    (assoc :format :kotoba.kir/v4)
+                    (assoc-in [:functions 0 :body]
+                              '(string-index-count
+                                (string-index-assoc
+                                 (string-index-new) "cid" 7))))
+        artifact (artifact/seal (assoc (native-artifact program) :value 1))
+        ;; The claim is that string-index adds no ABI OF ITS OWN, so compare
+        ;; against a program that uses none rather than against a literal
+        ;; version number -- which was 3, and went to 4 for an unrelated
+        ;; reason (the ABI v4 vector slots). A literal here turns every future
+        ;; bump into a failure of this test, which is about something else.
+        plain (artifact/seal (assoc (native-artifact ok-program) :value 1))]
+    (is (= (get-in plain [:context-abi :version])
+           (get-in artifact [:context-abi :version])))
+    (is (= artifact (kotoba.verifier/verify-artifact! artifact)))))
+
+(deftest a-bool-parameter-refinement-is-still-i64-only
+  ;; `:closure-param-indexes` / `:i64-pair-chain-param-indexes` name parameters
+  ;; that must be raw i64 words, and both check `param-types` themselves. A
+  ;; wider boundary type must not leak into them: a closure handle is not a
+  ;; boolean, and calling one that is would be a jump through a 0/1 word.
+  (let [program (with-param-types [:bool])]
+    (doseq [k [:closure-param-indexes :i64-pair-chain-param-indexes]]
+      (testing (name k)
+        (is (true? (function-rejected? (assoc-in program [:functions 1 k] [0]))))))))
+
+;; ---------------------------------------------------------------------------
+;; Agreement with kotoba-kir's independently derived boundary set (ADR 0003)
+;; ---------------------------------------------------------------------------
+
+;; This verifier re-derives the native boundary set from `kotoba.kir` ON PURPOSE
+;; rather than importing it (ADR 0063), so the two can and do differ. Being
+;; stricter is sound -- a verifier can only reject -- but a divergence nobody
+;; measures is indistinguishable from one nobody meant, and that is how a
+;; `:bool`-parameter module ended up passing `kotoba.kir`'s target selection
+;; only to be refused here as "runtime KIR function shape rejected".
+;;
+;; That divergence is now CLOSED: both sides admit a bare `:bool` PARAMETER --
+;; `kotoba.kir` since its ADR 0221 (`8de6215`), this verifier since ADR 0003,
+;; once kotoba-native `f6f29e9` fixed the x86-64 argument walk that made the
+;; type unsafe to admit (ADR 0001). Re-derivation is still the point: the whole
+;; reason this repo could hold the type for a cycle is that it does not import
+;; kotoba-kir's answer.
+;;
+;; This test is written to FAIL if either side moves, in either direction, so
+;; the next person to change either predicate finds the ADRs rather than a
+;; miscompile.
+(deftest the-native-boundary-set-agrees-with-kotoba-kirs
+  (let [kir-admits? (fn [type] (boolean (#'kotoba.kir/native-boundary-type? type {})))
+        ours? (fn [type] (boolean (#'kotoba.verifier/native-boundary-type? type)))]
+    (testing "every other boundary type agrees, so the divergence is exactly one type"
+      (doseq [type [:i64 :string :keyword :option-i64 :result-i64
+                    [:option :bool] [:option :i64] [:result :bool :i64]
+                    [:record :t/r [[:a :bool] [:b :i64]]]
+                    :f64 :f32 :bytes :map :vector-i64 nil "bool"]]
+        (testing (pr-str type)
+          (is (= (kir-admits? type) (ours? type))
+              (str "kotoba.kir " (if (kir-admits? type) "admits" "refuses")
+                   " " (pr-str type) " and this verifier does not agree")))))
+    ;; On this branch the divergence is CLOSED: both sides admit `:bool`. On
+    ;; `main` this asserts the opposite, and ADR 0001 says why. Landing this
+    ;; branch means landing this flip in the same commit as the predicate.
+    (testing "a bare :bool parameter now agrees too"
+      (is (true? (kir-admits? :bool)))
+      (is (true? (ours? :bool))))
+    ;; `:bool` is admitted in every position that is NOT a bare parameter, and
+    ;; always was. Held here so the ADR's scope cannot be misread as "native
+    ;; cannot carry a bool".
+    (testing ":bool is unaffected everywhere it already worked"
+      (is (nil? (shape-condition (assoc ok-program :signature {:params [] :result :bool})))
+          "as an entry result")
+      (is (true? (ours? [:option :bool])) "wrapped in an option")
+      (is (true? (ours? [:record :t/r [[:a :bool] [:b :i64]]])) "as a record field"))))
+
+;; ---------------------------------------------------------------------------
+;; A projection over a boxed record HANDLE (ADR 0004).
+;;
+;; A record that crosses a function boundary is boxed into a one-word pair
+;; chain. Reading a field back off that word is the same walk whether the word
+;; was projected on the spot or named by a `let` first, and whether the callee's
+;; result was declared expanded or by schema reference -- the backends do not
+;; distinguish any of it. This verifier did, and that is what these rows pin.
+
+(def ^:private rec '[:record :t/r [[:a :i64] [:b :i64]]])
+(def ^:private rec-ref '[:ref :t/r])
+(def ^:private other-rec '[:record :t/other [[:a :i64] [:b :i64]]])
+
+(defn- handle-program
+  "`ok-program` plus a `mk` declared to return RESULT, and a `main` whose body
+  is BODY. RESULT is the only thing that varies between the expanded and the
+  by-reference spelling, so nothing else can decide the outcome."
+  [result body]
+  (-> ok-program
+      (assoc-in [:functions 0 :body] body)
+      (update :functions conj
+              {:name 'mk :params [] :result result :effects #{}
+               :body (list 'record-new rec 4 9)})))
+
+(defn- handle-outcome
+  "nil when the program verifies, else the rejection message. Named rather than
+  a boolean so a row can never go green because some OTHER check refused the
+  input -- the hazard this whole area has."
+  [result body]
+  (try (#'kotoba.verifier/verify-program! (handle-program result body)) nil
+       (catch kerror/ExceptionInfo e (ex-message e))))
+
+(deftest a-let-bound-boxed-handle-may-be-projected
+  ;; `(let [h (mk)] (record-get … h :b))` -- murakumo's `infer_plan_core`,
+  ;; `infer_schedule_core` and `task_plan_core` all read a multi-field result
+  ;; this way, and it was the last shape in those three with no native lowering.
+  ;;
+  ;; Both fields are exercised on purpose. A chain walked to the wrong depth
+  ;; still yields a plausible i64, so a row that only ever selected `:a` would
+  ;; pass even when the walk is wrong; this gate cannot see depth at all, but
+  ;; the rows it shares with kotoba-native's execution table can, and they are
+  ;; kept the same shape deliberately.
+  (doseq [result [rec rec-ref]
+          field [:a :b]]
+    (testing (str (pr-str result) " / " field)
+      (is (nil? (handle-outcome result (list 'let ['h '(mk)]
+                                             (list 'record-get rec 'h field))))))))
+
+(deftest a-handle-projected-straight-off-the-call-may-be-declared-by-reference
+  ;; The second shape, and the one that had nothing to do with `let`:
+  ;; `(record-get … (mk) :b)` where `mk`'s result is `[:ref :t/r]` was refused
+  ;; while the identical program with the result written inline was admitted.
+  ;; `record-schema-of` resolved the call and then demanded
+  ;; `native-scalar-record-type?`, which a reference is not.
+  (doseq [field [:a :b]]
+    (testing (str "expanded / " field)
+      (is (nil? (handle-outcome rec (list 'record-get rec '(mk) field)))))
+    (testing (str "by reference / " field)
+      (is (nil? (handle-outcome rec-ref (list 'record-get rec '(mk) field)))))))
+
+(deftest a-handle-projected-twice-at-different-depths-is-admitted
+  (doseq [result [rec rec-ref]]
+    (testing (pr-str result)
+      (is (nil? (handle-outcome
+                 result
+                 (list 'let ['h '(mk)]
+                       (list '- (list 'record-get rec 'h :a)
+                             (list 'record-get rec 'h :b)))))))))
+
+(deftest projecting-the-wrong-schema-through-a-handle-is-still-rejected
+  ;; The property that makes admitting a reference BY NAME sound rather than
+  ;; trusting. A reference carries no field list, so the name is the whole
+  ;; check: a result declared `[:ref :t/r]` may not be projected as `:t/other`,
+  ;; even though both records have the same arity and field names and would
+  ;; therefore walk to a valid-looking depth.
+  (doseq [[why body]
+          [["let-bound" (list 'let ['h '(mk)] (list 'record-get other-rec 'h :b))]
+           ["straight off the call" (list 'record-get other-rec '(mk) :b)]]]
+    (testing why
+      (is (= "runtime KIR record projection rejected"
+             (handle-outcome rec-ref body))
+          "a reference to :t/r projected as :t/other")
+      (is (= "runtime KIR record projection rejected"
+             (handle-outcome rec body))
+          "an expanded :t/r projected as :t/other"))))
+
+(deftest a-let-bound-non-record-is-still-not-projectable
+  ;; Widening which BINDINGS carry a schema must not make every binding
+  ;; projectable. A slot holding an ordinary i64 is one word too, and walking it
+  ;; as a pair chain would read the arena at an address that is really a number.
+  (is (= "runtime KIR record projection rejected"
+         (handle-outcome rec (list 'let ['h 7] (list 'record-get rec 'h :b)))))
+  ;; A call whose result is NOT a record is the same hazard by another route.
+  (is (= "runtime KIR record projection rejected"
+         (handle-outcome :i64 (list 'let ['h '(mk)] (list 'record-get rec 'h :b))))))
+
+(deftest a-flattened-record-forwarded-through-a-second-binding-is-still-rejected
+  ;; Deliberately NOT admitted: a `let`-bound `record-new` is flattened into one
+  ;; slot per field, so rebinding it is N slots being read as one word, which
+  ;; both backends refuse. This gate stays exactly as wide as the emitter it
+  ;; re-derives -- `binding-record-schema` resolves a `record-new` and a call,
+  ;; and deliberately not a bare symbol.
+  (is (= "runtime KIR record projection rejected"
+         (handle-outcome rec (list 'let ['r (list 'record-new rec 4 9) 'r2 'r]
+                                   (list 'record-get rec 'r2 :b))))))
+
+(deftest a-same-schema-scalar-record-if-may-be-bound-and-projected
+  (let [record-if (list 'if 1
+                        (list 'record-new rec 1 2)
+                        (list 'record-new rec 3 4))]
+    (doseq [field [:a :b]]
+      (is (nil? (handle-outcome
+                 rec
+                 (list 'let ['r record-if]
+                       (list 'record-get rec 'r field))))))))
+
+(deftest a-same-schema-scalar-record-if-may-be-projected-directly
+  (let [record-if (list 'if 1
+                        (list 'record-new rec 1 2)
+                        (list 'record-new rec 3 4))]
+    (doseq [field [:a :b]]
+      (is (nil? (handle-outcome rec
+                                (list 'record-get rec record-if field)))))))
+
+(deftest record-sroa-binding-shape-stays-fail-closed
+  (let [string-rec '[:record :t/string-pair [[:a :string] [:b :i64]]]
+        nested-rec [:record :t/nested [[:a rec] [:b :i64]]]]
+    (doseq [[why projected-type record-if]
+            [["different branch schemas"
+              rec
+              (list 'if 1
+                    (list 'record-new rec 1 2)
+                    (list 'record-new other-rec 3 4))]
+             ["string field"
+              string-rec
+              (list 'if 1
+                    (list 'record-new string-rec "a" 2)
+                    (list 'record-new string-rec "b" 4))]
+             ["nested record field"
+              nested-rec
+              (list 'if 1
+                    (list 'record-new nested-rec (list 'record-new rec 1 2) 3)
+                    (list 'record-new nested-rec (list 'record-new rec 4 5) 6))]]]
+      (testing why
+        (is (= "runtime KIR record projection rejected"
+               (handle-outcome rec
+                               (list 'let ['r record-if]
+                                     (list 'record-get projected-type 'r :b)))))))))
+
+(def ^:private scalar-variant
+  '[:variant :t/value [[:number :i64] [:flag :bool]]])
+(def ^:private other-variant
+  '[:variant :t/other [[:number :i64] [:flag :bool]]])
+
+(defn- variant-outcome [body]
+  (try (#'kotoba.verifier/verify-program!
+        (assoc-in ok-program [:functions 0 :body] body))
+       nil
+       (catch kerror/ExceptionInfo e (ex-message e))))
+
+(defn- match-variant [value]
+  (list 'variant-match scalar-variant value
+        [[:number 'payload (list '+ 'payload 1)]
+         [:flag 'payload (list 'if 'payload 1 7)]]))
+
+(deftest a-local-scalar-variant-may-be-constructed-bound-and-matched
+  (doseq [constructor [(list 'variant-new scalar-variant :number 41)
+                       (list 'variant-new scalar-variant :flag false)]]
+    (is (nil? (variant-outcome
+               (list 'let ['v constructor] (match-variant 'v)))))))
+
+(deftest a-local-record-payload-variant-may-be-boxed-bound-and-matched
+  (let [record-type '[:record :t/pair [[:left :i64] [:right :i64]]]
+        variant-type `[:variant :t/record-or-count
+                       [[:record ~record-type] [:count :i64]]]
+        constructed (list 'variant-new variant-type :record
+                          (list 'record-new record-type 20 22))
+        matched (list 'variant-match variant-type 'value
+                      [[:record 'payload
+                        (list '+
+                              (list 'record-get record-type 'payload :left)
+                              (list 'record-get record-type 'payload :right))]
+                       [:count 'payload 'payload]])]
+    (is (nil? (variant-outcome (list 'let ['value constructed] matched))))))
+
+(deftest a-same-schema-scalar-variant-if-may-be-matched
+  (let [variant-if (list 'if 1
+                         (list 'variant-new scalar-variant :number 41)
+                         (list 'variant-new scalar-variant :flag false))]
+    (is (nil? (variant-outcome (match-variant variant-if))))
+    (is (nil? (variant-outcome
+               (list 'let ['v variant-if] (match-variant 'v)))))))
+
+(deftest variant-sroa-admission-stays-fail-closed
+  ;; ABI v8 boxes any one-word payload (a string is a pair handle), so the
+  ;; non-scalar family that must stay refused is one that is NOT one word.
+  (let [string-variant '[:variant :t/bytes [[:number :i64] [:blob :bytes]]]]
+    (testing "symbol forwarding"
+      (is (= "runtime KIR variant dispatch rejected"
+             (variant-outcome
+              (list 'let ['v (list 'variant-new scalar-variant :number 1)
+                          'v2 'v]
+                    (match-variant 'v2))))))
+    (testing "different branch schemas"
+      (is (= "runtime KIR variant dispatch rejected"
+             (variant-outcome
+              (match-variant
+               (list 'if 1
+                     (list 'variant-new scalar-variant :number 1)
+                     (list 'variant-new other-variant :flag false)))))))
+    (testing "non-scalar local payload family"
+      (is (= "runtime KIR variant dispatch rejected"
+             (variant-outcome
+              (list 'let ['v (list 'variant-new string-variant :number 1)]
+                    (list 'variant-match string-variant 'v
+                          [[:number 'x 'x] [:blob 'x 0]]))))))
+    (testing "reordered branches"
+      (is (= "runtime KIR variant dispatch rejected"
+             (variant-outcome
+             (list 'variant-match scalar-variant
+                    (list 'variant-new scalar-variant :number 1)
+                    [[:flag 'x 0] [:number 'x 'x]])))))))
+
+(def ^:private clock-request
+  [:variant :kotoba.clock/request [[:wall :bool] [:monotonic :bool]]])
+(def ^:private clock-wall
+  [:record :kotoba.clock/wall
+   [[:unix-millis :i64] [:observation-sequence :i64]]])
+(def ^:private clock-monotonic
+  [:record :kotoba.clock/monotonic
+   [[:nanos :i64] [:observation-sequence :i64]]])
+(def ^:private clock-error
+  [:record :kotoba.clock/error [[:code :keyword] [:message :string]]])
+(def ^:private clock-result
+  [:variant :kotoba.clock/result
+   [[:wall clock-wall] [:monotonic clock-monotonic] [:error clock-error]]])
+
+(def ^:private dataspace-request
+  [:variant :kotoba.dataspace/request
+   [[:assert [:record :kotoba.dataspace/assert
+              [[:assertion :document] [:facet :i64]]]]
+    [:retract [:record :kotoba.dataspace/retract
+               [[:assertion :document] [:facet :i64]]]]
+    [:observe [:record :kotoba.dataspace/observe
+               [[:pattern :document] [:facet :i64]]]]
+    [:facet-enter :bool]
+    [:facet-leave :i64]]])
+(def ^:private dataspace-asserted
+  [:record :kotoba.dataspace/asserted [[:count :i64] [:notices :document]]])
+(def ^:private dataspace-retracted
+  [:record :kotoba.dataspace/retracted [[:count :i64]]])
+(def ^:private dataspace-matches
+  [:record :kotoba.dataspace/matches
+   [[:bindings :document] [:notices :document]]])
+(def ^:private dataspace-facet
+  [:record :kotoba.dataspace/facet [[:id :i64]]])
+(def ^:private dataspace-error
+  [:record :kotoba.dataspace/error [[:code :keyword] [:message :string]]])
+(def ^:private dataspace-result
+  [:variant :kotoba.dataspace/result
+   [[:asserted dataspace-asserted] [:retracted dataspace-retracted]
+    [:matches dataspace-matches] [:facet dataspace-facet]
+    [:error dataspace-error]]])
+
+(defn- provider-program [cap-id body]
+  (-> ok-program
+      (assoc :format :kotoba.kir/v4 :effects #{[:cap/call cap-id]})
+      (assoc-in [:functions 0 :effects] #{[:cap/call cap-id]})
+      (assoc-in [:functions 0 :body] body)))
+
+(defn- clock-match [value]
+  (list 'variant-match clock-result value
+        [[:wall 'w (list 'record-get clock-wall 'w :unix-millis)]
+         [:monotonic 'm (list 'record-get clock-monotonic 'm :nanos)]
+         [:error 'e 0]]))
+
+(defn- dataspace-match [value]
+  (list 'variant-match dataspace-result value
+        [[:asserted 'a (list 'record-get dataspace-asserted 'a :count)]
+         [:retracted 'r (list 'record-get dataspace-retracted 'r :count)]
+         [:matches 'm 0]
+         [:facet 'f (list 'record-get dataspace-facet 'f :id)]
+         [:error 'e 0]]))
+
+(deftest clock-typed-cap-call-result-may-be-matched
+  (let [call (list 'typed-cap-call 7 clock-request clock-result
+                   (list 'variant-new clock-request :wall false))
+        program (provider-program 7 (clock-match call))
+        sealed (native-artifact program)]
+    (is (= program (#'kotoba.verifier/verify-program! program)))
+    (is (= sealed (kotoba.verifier/verify-artifact! sealed)))
+    (is (= (provider-program 7 (list 'let ['answer call] (clock-match 'answer)))
+           (#'kotoba.verifier/verify-program!
+            (provider-program 7 (list 'let ['answer call] (clock-match 'answer))))))))
+
+(deftest dataspace-typed-cap-call-result-may-be-matched
+  (let [call (list 'typed-cap-call 24 dataspace-request dataspace-result
+                   (list 'variant-new dataspace-request :facet-enter false))
+        program (provider-program 24 (dataspace-match call))
+        bound (provider-program 24 (list 'let ['answer call]
+                                         (dataspace-match 'answer)))]
+    (is (= program (#'kotoba.verifier/verify-program! program)))
+    (is (= bound (#'kotoba.verifier/verify-program! bound)))))
+
+(def ^:private ui-parent [:option :keyword])
+(def ^:private ui-node
+  [:record :kotoba.ui/node
+   [[:id :keyword] [:parent ui-parent] [:kind :keyword] [:text :string]]])
+(def ^:private ui-nodes [:set ui-node])
+(def ^:private ui-commit-request
+  [:record :kotoba.ui/commit-request
+   [[:base-revision :i64] [:nodes ui-nodes]]])
+(def ^:private ui-commit-result
+  [:record :kotoba.ui/commit-result [[:revision :i64] [:node-count :i64]]])
+(def ^:private ui-event-request
+  [:record :kotoba.ui/event-request [[:after-revision :i64]]])
+(def ^:private ui-event
+  [:record :kotoba.ui/event
+   [[:revision :i64] [:target :keyword] [:kind :keyword] [:value :string]]])
+(def ^:private ui-event-result [:option ui-event])
+
+(deftest ui-typed-cap-call-record-result-may-be-projected
+  (let [nodes (list 'typed-set-conj ui-nodes
+                    (list 'typed-set-new ui-nodes)
+                    (list 'record-new ui-node :view/title
+                          (list 'option-none-of ui-parent) :ui/text "ready"))
+        call (list 'typed-cap-call 9 ui-commit-request ui-commit-result
+                   (list 'record-new ui-commit-request 0 nodes))
+        program (provider-program 9 (list 'record-get ui-commit-result call :revision))
+        bound (provider-program 9 (list 'let ['answer call]
+                                        (list 'record-get ui-commit-result
+                                              'answer :revision)))]
+    (is (= program (#'kotoba.verifier/verify-program! program)))
+    (is (= bound (#'kotoba.verifier/verify-program! bound)))))
+
+(deftest ui-typed-cap-call-option-result-may-be-matched
+  (let [call (list 'typed-cap-call 10 ui-event-request ui-event-result
+                   (list 'record-new ui-event-request 0))
+        program (provider-program 10
+                 (list 'option-match ui-event-result call 0 'e
+                       (list 'record-get ui-event 'e :revision)))]
+    (is (= program (#'kotoba.verifier/verify-program! program)))))
+
+(deftest provider-typed-cap-call-match-stays-fail-closed
+  (is (= "runtime KIR variant dispatch rejected"
+         (variant-outcome
+          (clock-match (list 'variant-new clock-request :wall false))))
+      "a clock request cannot impersonate a clock result at match")
+  (is (= "runtime KIR variant dispatch rejected"
+         (try (#'kotoba.verifier/verify-program!
+               (provider-program 7
+                (clock-match (list 'typed-cap-call 7 clock-request scalar-variant
+                                   (list 'variant-new clock-request :wall false)))))
+              nil
+              (catch kerror/ExceptionInfo e (ex-message e))))
+      "a non-clock typed-cap-call result is not a clock-v1 match operand")
+  (is (= "runtime KIR variant dispatch rejected"
+         (variant-outcome
+          (dataspace-match (list 'variant-new dataspace-request :facet-enter false))))
+      "a dataspace request cannot impersonate a dataspace result at match"))
+
+(defn- variant-boundary-program [body]
+  {:format :kotoba.kir/v4
+   :entry nil
+   :exports ['consume]
+   :signature nil
+   :effects #{}
+   :functions
+   [{:name 'consume :params ['value] :param-types [scalar-variant]
+     :result :i64 :effects #{} :body body}]})
+
+(deftest scalar-variant-export-boundary-is-independently-verified-and-reemitted
+  (let [program (variant-boundary-program (match-variant 'value))
+        sealed (native-artifact program)]
+    (is (= program (#'kotoba.verifier/verify-program! program)))
+    (is (= sealed (kotoba.verifier/verify-artifact! sealed)))
+    (is (pos? (get-in sealed [:exports 'consume :length])))))
+
+(deftest scalar-variant-call-results-are-dispatchable
+  (let [program
+        (update (variant-boundary-program (match-variant '(make))) :functions
+                #(into [{:name 'make :params [] :param-types []
+                         :result scalar-variant :effects #{}
+                         :body (list 'variant-new scalar-variant :flag true)}]
+                       %))]
+    (is (= program (#'kotoba.verifier/verify-program! program)))))
+
+(deftest aggregate-payload-variant-boundary-is-independently-verified
+  (let [record-type '[:record :t/pair [[:left :i64] [:right :i64]]]
+        variant-type `[:variant :t/record-or-count
+                       [[:record ~record-type] [:count :i64]]]
+        program {:format :kotoba.kir/v4
+                 :entry nil
+                 :exports ['consume]
+                 :signature nil
+                 :effects #{}
+                 :functions
+                 [{:name 'consume :params ['value]
+                   :param-types [variant-type]
+                   :result :i64 :effects #{}
+                   :body (list 'variant-match variant-type 'value
+                               [[:record 'payload
+                                 (list '+
+                                       (list 'record-get record-type 'payload :left)
+                                       (list 'record-get record-type 'payload :right))]
+                                [:count 'payload 'payload]])}]}
+        verified (#'kotoba.verifier/verify-program! program)
+        sealed (native-artifact program)]
+    (is (#'kotoba.verifier/native-boundary-type? variant-type))
+    (is (= program verified))
+    (is (= sealed (kotoba.verifier/verify-artifact! sealed)))
+    (doseq [target [:x86-64 :aarch64]]
+      (is (seq (:code (machine/compile-kir-module target verified))) target))))
+
+(deftest scalar-variant-boundary-stays-narrow-and-ordinal-closed
+  (let [string-variant '[:variant :t/text [[:text :string]]]]
+    (is (thrown-with-msg?
+         kerror/ExceptionInfo #"function shape rejected"
+         (#'kotoba.verifier/verify-program!
+          (assoc-in (variant-boundary-program 0)
+                    [:functions 0 :param-types] [string-variant]))))
+    (is (thrown-with-msg?
+         kerror/ExceptionInfo #"variant dispatch rejected"
+         (#'kotoba.verifier/verify-program!
+          (variant-boundary-program
+           (list 'variant-match scalar-variant 'value
+                 [[:flag 'payload 0] [:number 'payload 'payload]])))))))
+
+(deftest an-undeclared-field-is-still-rejected-through-a-handle
+  (doseq [result [rec rec-ref]]
+    (is (= "runtime KIR record projection rejected"
+           (handle-outcome result (list 'let ['h '(mk)]
+                                        (list 'record-get rec 'h :nope)))))))
+
+;; ---------------------------------------------------------------------------
+;; sysops: the general atomics and the x86 system operations.
+;;
+;; This namespace re-derives its own kernel operation tables rather than
+;; importing the frontend's, and it rejects by ABSENCE: an operation missing
+;; from them fails with "runtime KIR operation rejected" no matter what the
+;; compiler admitted. Both new families were missing, and so was the target
+;; gate's own list -- which is exactly the two-gate shape kotoba-kir's own
+;; comment records for `string-contains?`: "Both gates had to open."
+;; ---------------------------------------------------------------------------
+
+(defn- sysops-verify-expr [form arity]
+  (#'kotoba.verifier/verify-expr!
+   form
+   (into #{} (map #(symbol (str "p" %))) (range arity))
+   {} 0 (volatile! 0) (volatile! {:effects #{} :calls #{}})))
+
+(defn- sysops-rejection [thunk]
+  (try (thunk) nil
+       (catch kerror/ExceptionInfo e (ex-message e))))
+
+(deftest sysops-kernel-operations-are-admitted-with-their-own-arities
+  (doseq [[form arity] [['(kernel-atomic-add-u32 p0 p1 p2 p3) 4]
+                        ['(kernel-atomic-add-u64 p0 p1 p2 p3) 4]
+                        ['(kernel-xchg-u32 p0 p1 p2 p3) 4]
+                        ['(kernel-xchg-u64 p0 p1 p2 p3) 4]
+                        ['(kernel-cmpxchg-u32 p0 p1 p2 p3 p4) 5]
+                        ['(kernel-cmpxchg-u64 p0 p1 p2 p3 p4) 5]
+                        ['(kernel-fence-load) 0]
+                        ['(kernel-fence-store) 0]
+                        ['(kernel-fence-full) 0]
+                        ['(kernel-rdtsc) 0]
+                        ['(kernel-rdtscp) 0]
+                        ['(kernel-swapgs) 0]]]
+    (testing (str form)
+      (is (nil? (sysops-rejection #(sysops-verify-expr form arity))) form))))
+
+(deftest sysops-kernel-operations-pin-their-arity-independently
+  ;; The reason this table is re-derived here rather than imported: an emitter
+  ;; handed a four-argument compare-exchange would take the replacement as the
+  ;; comparand and store whatever the register happened to hold.
+  (doseq [[form arity reason]
+          [['(kernel-cmpxchg-u32 p0 p1 p2 p3) 4
+            "runtime KIR kernel memory operation arity rejected"]
+           ['(kernel-cmpxchg-u64 p0 p1 p2 p3) 4
+            "runtime KIR kernel memory operation arity rejected"]
+           ['(kernel-atomic-add-u32 p0 p1 p2 p3 p4) 5
+            "runtime KIR kernel memory operation arity rejected"]
+           ['(kernel-xchg-u64 p0 p1 p2) 3
+            "runtime KIR kernel memory operation arity rejected"]
+           ['(kernel-fence-full p0) 1
+            "runtime KIR kernel privileged operation arity rejected"]
+           ['(kernel-rdtsc p0) 1
+            "runtime KIR kernel privileged operation arity rejected"]
+           ['(kernel-swapgs p0) 1
+            "runtime KIR kernel privileged operation arity rejected"]]]
+    (testing (str form)
+      (is (= reason (sysops-rejection #(sysops-verify-expr form arity))) form))))
+
+(deftest the-interrupt-entry-address-is-admitted-at-arity-one
+  ;; isr: this namespace re-derives its own privileged table and rejects by
+  ;; ABSENCE, so an operation kotoba-sema, kotoba-kir, kotoba-gmir and
+  ;; kotoba-native all admit still fails here with "runtime KIR operation
+  ;; rejected" until this row exists. That is the two-gate shape, and it is
+  ;; why this test is a membership test and not a formality.
+  (is (nil? (sysops-rejection
+             #(sysops-verify-expr '(kernel-isr-entry-address p0) 1))))
+  (is (nil? (sysops-rejection
+             #(sysops-verify-expr '(kernel-isr-entry-address 3) 0)))
+      "a literal vector is the shape a real IDT build has"))
+
+(deftest the-interrupt-entry-address-pins-arity-one-independently
+  ;; Arity ONE, where every other address operation in this family is
+  ;; zero-arity -- which is exactly why re-deriving the number here is worth
+  ;; the duplication. A zero-argument `kernel-isr-entry-address` would index
+  ;; the entry table with whatever the previous expression left in the
+  ;; register, and the caller's next act is to write the answer into an IDT
+  ;; gate descriptor. The failure is a jump to a plausible-looking address.
+  (doseq [[form arity]
+          [['(kernel-isr-entry-address) 0]
+           ['(kernel-isr-entry-address p0 p1) 2]]]
+    (testing (str form)
+      (is (= "runtime KIR kernel privileged operation arity rejected"
+             (sysops-rejection #(sysops-verify-expr form arity)))
+          form)))
+  ;; Pinned beside it: the four canned handler-address operations stay
+  ;; zero-arity here too, so widening one cannot be read as widening the
+  ;; family.
+  (doseq [form ['(kernel-page-fault-handler-address p0)
+                '(kernel-page-fault-recovery-handler-address p0)
+                '(kernel-double-fault-handler-address p0)
+                '(kernel-undefined-opcode-handler-address p0)]]
+    (testing (str form)
+      (is (= "runtime KIR kernel privileged operation arity rejected"
+             (sysops-rejection #(sysops-verify-expr form 1)))
+          form))))
+
+(deftest the-undefined-opcode-handler-address-is-admitted-at-arity-zero
+  ;; amu-h7: the canned #UD handler's address, beside
+  ;; `kernel-double-fault-handler-address` in every set that carries it.
+  ;; Admitted by membership at arity zero; before this row the whole family's
+  ;; absence refusal below was the answer, which is what the guest saw as
+  ;; `runtime KIR operation rejected` at the verify phase.
+  (is (nil? (sysops-rejection
+             #(sysops-verify-expr '(kernel-undefined-opcode-handler-address) 0)))
+      "zero-arity, an address: admitted")
+  (is (= "runtime KIR kernel privileged operation arity rejected"
+         (sysops-rejection
+          #(sysops-verify-expr '(kernel-undefined-opcode-handler-address p0) 1)))
+      "one operand is the isr-entry shape, not this one's"))
+
+(deftest an-unknown-kernel-operation-is-still-rejected-by-absence
+  ;; The floor under both tests above: this namespace admits by membership,
+  ;; so a misspelling is refused rather than passed through.
+  (is (= "runtime KIR operation rejected"
+         (sysops-rejection
+          #(sysops-verify-expr '(kernel-cmpxchg-u16 p0 p1 p2 p3 p4) 5)))))
+;; boot: which target may name the machine directly.
+;; ---------------------------------------------------------------------------
+
+(defn- privileged-artifact
+  "`native-artifact`, retargeted. Everything the runtime check compares --
+  profile, lowering, fuel ABI, context ABI, code, exports -- is identical
+  across these three targets, because they share the `:x86_64-kotoba-v1`
+  backend. The ONLY thing that varies is the target keyword, which is what
+  makes this a test of the target rule rather than of anything else."
+  [target kir]
+  (let [program (select-keys kir [:format :entry :exports :signature
+                                  :effects :functions])
+        emitted (x86-64/emit-program program)
+        profile (target/profile target)
+        fuel 512]
+    (artifact/seal
+     {:format :kotoba.kexe/v1
+      :target target
+      :target-profile profile
+      :value nil
+      :kir-sha256 (artifact/sha256 program)
+      :lowering :runtime-sysv-v1
+      :fuel-abi {:mode :hidden-context-r9 :initial fuel}
+      :context-abi {:version 11 :fuel-offset 8 :allow-bitmap-offset 16
+                    :allow-bitmap-bytes 32 :cap-call-offset 48
+                    :pair-new-offset 56 :pair-first-offset 64
+                    :pair-second-offset 72 :pair-capacity 4096
+                    :kgraph-assert-offset 80 :kgraph-get-offset 88
+                    :kgraph-count-offset 96 :kgraph-entity-at-offset 104
+                    :kgraph-capacity 4096
+                    :string-equal-offset 112 :string-concat-offset 120
+                    :typed-cap-call-offset 128
+                    :string-substring-offset 136
+                    :string-code-point-at-offset 144
+                    :string-pool-capacity 65536
+                    :vector-new-empty-offset 152 :vector-conj-offset 160
+                    :vector-count-offset 168 :vector-at-offset 176
+                    :vector-assoc-offset 184 :vector-drop-offset 192
+                    :vector-alloc-offset 200
+                    :vector-assoc-in-place-offset 208
+                    :string-index-of-offset 216
+                    :arena-enter-offset 224 :arena-leave-offset 232
+                    :string-compare-offset 240 :string-fold-ascii-offset 248
+                    :string-find-blank-offset 256 :string-skip-blank-offset 264
+                    :string-index-of-from-offset 272 :string-compare-lines-offset 280
+                    :pair-used-pointer-offset 288 :pairs-base-offset 296
+                    :pair-validated-base-offset 304
+                    :vector-used-pointer-offset 312 :vectors-base-offset 320
+                    :vector-items-base-offset 328
+                    :string-find-byte-offset 336 :string-append-range-offset 344
+                    :string-from-utf8-offset 352 :bytes-from-vector-offset 360
+                    :bytes-slice-offset 368 :bytes-concat-offset 376
+                    :vector-capacity 4096
+                    :vector-item-capacity 65536}
+      :effects (:effects program)
+      :compatibility
+      (compatibility/descriptor
+       {:hir-format :kotoba.hir/v2 :kir-format (:format program)
+        :target target :target-profile profile
+        :value-abi :kotoba.i64/direct-v1})
+      :limits {:memory-bytes 65536 :fuel fuel :stack-bytes 4096}
+      :code (mapv #(bit-and (int %) 0xff) (:code emitted))
+      :program program
+      :exports (:exports emitted)})))
+
+(defn- privileged-kir [body]
+  {:format :kotoba.kir/v3 :entry (quote main) :exports [(quote main)] :effects #{}
+   :signature {:params [] :result :i64}
+   :functions [{:name (quote main) :params [] :result :i64 :effects #{} :body body}]})
+
+(deftest the-uefi-target-may-name-the-machine
+  ;; A UEFI application runs at CPL0 on an identity-mapped machine with boot
+  ;; services live. Refusing it a port write was refusing the target its own
+  ;; profile describes -- and it is why aiueos's BOOTX64.EFI is still C: a
+  ;; bootloader cannot say anything without one.
+  ;;
+  ;; The bodies here are deliberately the OLD privileged operations rather
+  ;; than the four new firmware ones. This repository pins kotoba-native
+  ;; itself, on purpose (see deps.edn), and that pin predates their encodings;
+  ;; a body this repo's own backend cannot emit would fail at `emit` and say
+  ;; nothing about the target rule. The refusal cases below need no emitter,
+  ;; because the target check runs before it.
+  (doseq [body [(quote (kernel-out-u8 233 75))
+                (quote (kernel-in-u8 233))]]
+    (testing (str body " on the UEFI target")
+      (let [artifact (privileged-artifact :x86_64-aiueos-uefi-v1
+                                          (privileged-kir body))]
+        (is (= artifact (kotoba.verifier/verify-artifact! artifact)))))
+    (testing (str body " on the kernel target")
+      (let [artifact (privileged-artifact :x86_64-aiueos-kernel-v1
+                                          (privileged-kir body))]
+        (is (= artifact (kotoba.verifier/verify-artifact! artifact)))))))
+
+(deftest an-ordinary-native-target-still-may-not
+  ;; The same bodies, the same artifact shape, one different keyword.
+  ;;
+  ;; The four firmware operations are NOT here, and the reason is the rule
+  ;; about tests that go red for the wrong reason. Measured 2026-09-02 at this
+  ;; repository's own kotoba-native pin: `(kernel-load-ptr 4096 64)` on
+  ;; `:x86_64-kotoba-v1` throws "aggregate ABI rejected:
+  ;; call-abi-not-admitted", because a backend that predates the operation
+  ;; reads it as a call to an unknown function -- a refusal that would still
+  ;; happen with the target rule deleted. Listing them would have added four
+  ;; green assertions that discriminate nothing. Their target gate is tested
+  ;; in amu, where the toolchain is pinned new enough to emit them.
+  (doseq [body [(quote (kernel-out-u8 233 75))
+                (quote (kernel-in-u8 233))]]
+    (testing (str body " is refused for x86_64-kotoba-v1")
+      (is (thrown-with-msg?
+           kerror/ExceptionInfo
+           #"bounded kernel memory operation requires the aiueos kernel target"
+           (kotoba.verifier/verify-artifact!
+            (privileged-artifact :x86_64-kotoba-v1 (privileged-kir body))))))))
+
+(deftest a-function-address-is-admitted-on-a-hosted-native-target
+  ;; ⚠ `kernel-function-address` LEFT THE AIUEOS-ONLY SET on 2026-09-09, and
+  ;; the reason is that it had never had a reason of its own. It sat in that
+  ;; set beside `kernel-scratch-region` under one comment -- "a `.data`
+  ;; reservation and a function label are places in an image the toolchain
+  ;; laid out" -- and the reason belonged to the reservation.
+  ;;
+  ;; A function's label is a place in the EMITTED BUFFER, which every native
+  ;; target has: the kexe loader mmaps that buffer and jumps into it. The
+  ;; backend reaches it with the same instruction it reaches the literal pool
+  ;; with, `lea …,[rip+disp32]` on x86-64 and `adr` on AArch64.
+  ;;
+  ;; Two heads listed together under one reason, where the reason belonged to
+  ;; one of them. That is the shape to look for.
+  (let [artifact (privileged-artifact
+                  :x86_64-kotoba-v1
+                  (privileged-kir '(kernel-function-address main)))]
+    (is (= artifact (kotoba.verifier/verify-artifact! artifact))))
+  (testing "and on the aiueos targets it still is, so nothing was traded away"
+    (doseq [target [:x86_64-aiueos-uefi-v1 :x86_64-aiueos-kernel-v1]]
+      (let [artifact (privileged-artifact
+                      target (privileged-kir '(kernel-function-address main)))]
+        (is (= artifact (kotoba.verifier/verify-artifact! artifact))))))
+  (testing "THE CONTROL: the head it used to share a reason with is still refused"
+    ;; `kernel-scratch-region`'s answer outside an aiueos image is WRONG
+    ;; rather than absent -- `lea r10,[r9+0x60]` names the global descriptor
+    ;; table in a kernel image. If a later change removed the pair wholesale
+    ;; rather than the one head that was measured, this is what goes red.
+    (is (thrown-with-msg?
+         kerror/ExceptionInfo
+         #"bounded kernel memory operation requires the aiueos kernel target"
+         (kotoba.verifier/verify-artifact!
+          (privileged-artifact :x86_64-kotoba-v1
+                               (privileged-kir '(kernel-scratch-region))))))))
+
+(deftest the-firmware-boundary-marks-a-module-kernel-native
+  ;; This set decides whether the oracle re-executes an entry, and the same
+  ;; decision is made independently in `kotoba.kir/lower`. When the two
+  ;; disagree the failure surfaces in NEITHER one's terms: the compiler
+  ;; correctly seals no value, this side re-executes the entry, gets
+  ;; `:kernel-privileged-unavailable`, and refuses the artifact as "native
+  ;; artifact oracle evaluation rejected" -- an oracle mismatch it never had.
+  ;; Measured 2026-09-02: that is exactly what `(defn main []
+  ;; (kernel-system-table))` produced on the firmware target.
+  (let [operations @#'kotoba.verifier/kernel-native-operations]
+    (doseq [op (quote [kernel-system-table kernel-load-ptr
+                       kernel-uefi-call2 kernel-jump-to])]
+      (is (contains? operations op) op))
+    (testing "and the families that were already there stay there"
+      (doseq [op (quote [kernel-out-u8 kernel-read-msr kernel-cpuid-eax
+                         kernel-rdtsc kernel-load-u8])]
+        (is (contains? operations op) op)))))
+
+;; ---------------------------------------------------------------------------
+;; memwidth: the verifier rejects by ABSENCE, and this is what that costs.
+;;
+;; The first time a `slice-load-u8` fixture was compiled, every upstream gate
+;; was already open -- the frontend admitted it, `kotoba.kir` executed it, both
+;; backends emitted it -- and `amu compile` still failed with "runtime KIR
+;; operation rejected", from here. That is the design working (a gate on one
+;; route is not a gate), and it is why this namespace asserts the surface it
+;; admits rather than trusting that it followed.
+;; ---------------------------------------------------------------------------
+
+(defn- memwidth-kexe [body]
+  ;; `main` must be zero-arity for the module shape, so the operation under
+  ;; test lives in a helper beside it -- the same split every other fixture in
+  ;; this namespace uses.
+  {:format :kotoba.kir/v3 :entry 'main :exports ['main]
+   :signature {:params [] :result :i64} :effects #{}
+   :functions [{:name 'probe :params ['base 'length 'index 'value]
+                :result :i64 :effects #{} :body body}
+               {:name 'main :params [] :result :i64 :effects #{} :body 0}]})
+
+(defn- memwidth-verifies? [body]
+  (try (#'kotoba.verifier/verify-program! (memwidth-kexe body)) true
+       (catch kerror/ExceptionInfo _ false)))
+
+(deftest memwidth-every-width-and-tier-passes-the-verifier
+  (let [widths ["u8" "u16" "u32" "u64"]
+        tiers ["" "-4k" "-16k" "-64k"]
+        loads (concat (for [w widths t tiers] (str "kernel-load-" w t))
+                      (for [w widths] (str "slice-load-" w)))
+        stores (concat (for [w widths t tiers] (str "kernel-store-" w t))
+                       (for [w widths] (str "slice-store-" w)))]
+    (is (= 20 (count loads)))
+    (is (= 20 (count stores)))
+    (doseq [op loads]
+      (is (memwidth-verifies? (list (symbol op) 'base 'length 'index)) op))
+    (doseq [op stores]
+      (is (memwidth-verifies? (list (symbol op) 'base 'length 'index 'value)) op))
+    (testing "and the arity is still checked, per operation"
+      (doseq [op loads]
+        (is (not (memwidth-verifies? (list (symbol op) 'base 'length 'index 'value)))
+            (str op " must refuse a fourth argument")))
+      (doseq [op stores]
+        (is (not (memwidth-verifies? (list (symbol op) 'base 'length 'index)))
+            (str op " must refuse a missing value"))))
+    (testing "and an operation outside the table is still refused"
+      (is (not (memwidth-verifies? '(kernel-load-u128 base length index)))
+          "there is no 128-bit access")
+      (is (not (memwidth-verifies? '(kernel-load-u8-1m base length index)))
+          "and no 1 MiB tier"))))
+
+;; ---------------------------------------------------------------------------
+;; simd: the f32 dot product (kotoba-gmir ADR 0010).
+;; ---------------------------------------------------------------------------
+
+(deftest the-f32-dot-product-is-admitted-at-arity-five
+  ;; This namespace re-derives its own tables and rejects by ABSENCE, so an
+  ;; operation kotoba-sema, kotoba-kir, kotoba-gmir, kotoba-mir, kotoba-codegen
+  ;; and kotoba-native all admit still fails here with "runtime KIR operation
+  ;; rejected" until this row exists. It did -- measured, on the first real
+  ;; `.kotoba` program that used it.
+  (is (nil? (sysops-rejection
+             #(sysops-verify-expr '(kernel-dot-f32 p0 p1 p2 p3 p4) 5))))
+  (is (nil? (sysops-rejection
+             #(sysops-verify-expr '(kernel-dot-f32 p0 48 p1 48 12) 2)))
+      "literal lengths and a literal count are the shape a real caller has"))
+
+(deftest the-f32-dot-product-pins-arity-five-independently
+  ;; Worse here than for the compare-exchanges beside it. Four of the five
+  ;; arguments are INTERCHANGEABLE i64 words at this layer -- two bases and
+  ;; two lengths -- so a short call does not fail on a type, it silently
+  ;; takes a length as a base and folds whatever is at that address.
+  (doseq [[form arity] [['(kernel-dot-f32 p0 p1 p2 p3) 4]
+                        ['(kernel-dot-f32 p0 p1 p2) 3]
+                        ['(kernel-dot-f32 p0 p1 p2 p3 p4 p5) 6]]]
+    (testing (str form)
+      (is (= "runtime KIR kernel memory operation arity rejected"
+             (sysops-rejection #(sysops-verify-expr form arity)))
+          form))))
+
+(deftest the-f32-dot-product-suppresses-the-compile-time-oracle
+  ;; It reads memory the oracle has not been given, exactly as every windowed
+  ;; load does -- but it does NOT arrive in `kernel-native-operations` with
+  ;; that table, because its operands are two regions and a count rather than
+  ;; `base length index [value]`, so it has to be named.
+  ;;
+  ;; When this side and `kotoba.kir/lower` disagree the failure surfaces in
+  ;; neither one's terms: the compiler correctly seals no value, this side
+  ;; re-executes the entry, gets `:kernel-memory-unavailable`, and refuses the
+  ;; artifact as an oracle mismatch it never had.
+  (is (contains? @#'kotoba.verifier/kernel-native-operations 'kernel-dot-f32))
+  (testing "and the windowed family it is NOT a member of is still there"
+    (is (contains? @#'kotoba.verifier/kernel-native-operations 'kernel-load-u32))
+    (is (not (contains? @#'kotoba.verifier/kernel-memory-operations
+                        'kernel-dot-f32))
+        "its shape is not `base length index [value]`, so it is not in that table")))
+
+(def ^:private dequant-dot-heads
+  ;; dequant-iq: seven formats. The four codebook ones (kotoba-gmir ADR 0027)
+  ;; arrive with the same arity and the same shape -- their codebook is the
+  ;; compiler's read-only data rather than a caller's region, so there is no
+  ;; third base and nothing about this layer changes.
+  '[kernel-dequant-dot-q8-0 kernel-dequant-dot-q4-k kernel-dequant-dot-q6-k
+    kernel-dequant-dot-iq4-xs kernel-dequant-dot-iq2-s
+    kernel-dequant-dot-iq3-xxs kernel-dequant-dot-iq3-s
+    ;; dequant-ptq1: the eighth, PTQ1_0 (kotoba-gmir ADR 0031).
+    kernel-dequant-dot-ptq1-0])
+
+(deftest the-fused-dequant-dot-family-is-eight-formats
+  ;; A row added to the arity table and not to the native-operations set (or
+  ;; the reverse) is the failure this counts: the first rejects by absence
+  ;; with "runtime KIR operation rejected", the second lets the compile-time
+  ;; oracle try to fold a read of memory it was never given.
+  (is (= 8 (count dequant-dot-heads)))
+  (doseq [head dequant-dot-heads]
+    (is (contains? @#'kotoba.verifier/kernel-native-operations head) (str head))))
+
+(deftest the-fused-dequant-dot-family-is-admitted-at-arity-five
+  ;; dequant: same shape as the f32 dot product, same reason for it being
+  ;; here, and asserted PER FORMAT -- this namespace rejects by absence, so a
+  ;; missing row fails with "runtime KIR operation rejected" for a program
+  ;; every other repository admits.
+  (doseq [head dequant-dot-heads]
+    (is (nil? (sysops-rejection
+               #(sysops-verify-expr (list head 'p0 'p1 'p2 'p3 'p4) 5)))
+        (str head))
+    (is (nil? (sysops-rejection
+               #(sysops-verify-expr (list head 'p0 34 'p1 128 1) 2)))
+        (str head " with literal lengths and a literal block count"))))
+
+(deftest the-fused-dequant-dot-family-pins-arity-five-independently
+  ;; Four of the five arguments are interchangeable i64 words at this layer,
+  ;; so a short call does not fail on a type -- it silently takes a length as
+  ;; a base and folds whatever is at that address.
+  (doseq [head dequant-dot-heads
+          [form arity] [[(list head 'p0 'p1 'p2 'p3) 4]
+                        [(list head 'p0 'p1 'p2) 3]
+                        [(list head 'p0 'p1 'p2 'p3 'p4 'p5) 6]]]
+    (testing (str form)
+      (is (= "runtime KIR kernel memory operation arity rejected"
+             (sysops-rejection #(sysops-verify-expr form arity)))
+          (str form)))))
+
+(deftest the-fused-dequant-dot-family-suppresses-the-compile-time-oracle
+  ;; It reads memory the oracle has not been given, and it does not arrive in
+  ;; `kernel-native-operations` with the windowed table, so it has to be
+  ;; named -- once per format.
+  (doseq [head dequant-dot-heads]
+    (is (contains? @#'kotoba.verifier/kernel-native-operations head) (str head))
+    (is (not (contains? @#'kotoba.verifier/kernel-memory-operations head))
+        (str head " has no `base length index [value]` shape"))))
+
+(deftest the-extended-control-register-read-is-admitted-at-arity-one
+  ;; simd: `kernel-xgetbv` was landed in kotoba-gmir, kotoba-kir, kotoba-sema
+  ;; and kotoba-native and NOT here, so it fell to the terminal `:else` with
+  ;; "runtime KIR operation rejected". Nothing found that until a `.kotoba`
+  ;; program called it -- the f32 dot product's QEMU probe, which reports the
+  ;; AVX2 guard's own inputs so that "both arms agree" is not an agreement
+  ;; between a sequence and itself.
+  (is (nil? (sysops-rejection #(sysops-verify-expr '(kernel-xgetbv p0) 1))))
+  (is (nil? (sysops-rejection #(sysops-verify-expr '(kernel-xgetbv 0) 0)))
+      "a literal XCR index is the shape a real guard has")
+  (testing "arity ONE, where the cpuid four beside it take TWO"
+    (doseq [[form arity] [['(kernel-xgetbv) 0]
+                          ['(kernel-xgetbv p0 p1) 2]]]
+      (is (= "runtime KIR kernel privileged operation arity rejected"
+             (sysops-rejection #(sysops-verify-expr form arity)))
+          (str form))))
+  (testing "and it suppresses the compile-time oracle"
+    ;; Its only real argument is the literal 0, so a folder sees an operation
+    ;; over one constant with nothing about it to suggest an effect.
+    (is (contains? @#'kotoba.verifier/kernel-native-operations 'kernel-xgetbv))))
+
+(deftest the-extended-state-enable-is-admitted-at-its-three-arities
+  ;; xsave: the write half of the same feature check. Opened here as a SECOND
+  ;; gate, independently of kotoba-sema -- `kernel-xgetbv` was landed in four
+  ;; repositories and not this one, fell to the terminal `:else` with "runtime
+  ;; KIR operation rejected", and nothing found it until a .kotoba program
+  ;; called it. Being late twice for the same reason would be a pattern.
+  (testing "each is admitted at its declared arity"
+    (doseq [[form arity] [['(kernel-read-cr4) 0]
+                          ['(kernel-write-cr4 p0) 1]
+                          ['(kernel-write-cr4 262144) 0]
+                          ['(kernel-xsetbv p0 p1) 2]
+                          ['(kernel-xsetbv 0 7) 0]]]
+      (is (nil? (sysops-rejection #(sysops-verify-expr form arity))) (str form))))
+  ;; The arity table here is re-derived rather than imported, and this is the
+  ;; row that shows why: a one-argument `kernel-xsetbv` would take the VALUE as
+  ;; the XCR index and write EDX:EAX from whatever the register happened to
+  ;; hold -- into the register that governs whether the machine saves its
+  ;; vector state across a context switch. A wrong arity here does not crash.
+  (testing "and refuses every other arity, with the reason pinned"
+    (doseq [[form arity] [['(kernel-read-cr4 p0) 1]
+                          ['(kernel-write-cr4) 0]
+                          ['(kernel-write-cr4 p0 p1) 2]
+                          ['(kernel-xsetbv) 0]
+                          ['(kernel-xsetbv p0) 1]
+                          ['(kernel-xsetbv p0 p1 p2) 3]]]
+      (is (= "runtime KIR kernel privileged operation arity rejected"
+             (sysops-rejection #(sysops-verify-expr form arity)))
+          (str form))))
+  (testing "and all three suppress the compile-time oracle"
+    ;; `(kernel-read-cr4)` is zero-arity and `(kernel-xsetbv 0 7)` is two
+    ;; literals, so a folder sees nothing to suggest an effect. A disagreement
+    ;; with `kotoba.kir/lower` here surfaces in neither side's terms: the
+    ;; compiler seals no value, this side re-executes the entry, and the
+    ;; artifact is refused as an oracle mismatch it never had.
+    (doseq [op '[kernel-read-cr4 kernel-write-cr4 kernel-xsetbv]]
+      (is (contains? @#'kotoba.verifier/kernel-native-operations op) (str op))))
+  ;; There is no `kernel-write-cr2`: CR2 is written by the CPU when a page
+  ;; fault is taken, so a kernel that wrote it would be lying to its own
+  ;; handler. Asserted rather than merely absent.
+  (testing "and there is no CR2 write"
+    (is (= "runtime KIR operation rejected"
+           (sysops-rejection #(sysops-verify-expr '(kernel-write-cr2 p0) 1))))))
+;; boot-lit ───────────────────────────────────────────────────────────────────
+
+(defn- boot-lit-verify!
+  "Run the verifier's own KIR check over a program whose body is BODY.
+
+  Two other routes were tried first and both went red for the wrong reason,
+  which is why this helper exists and says so.
+
+  `privileged-artifact` CALLS the backend to produce `:code`, so a malformed
+  body never survives long enough to reach the verifier: the first run of this
+  suite reported `machine IR rejected: rodata-literal-malformed` for all eight
+  cases -- the BACKEND refusing, and green with every line of the verifier's
+  own check deleted. Substituting a body into an already-built artifact fails
+  earlier still, at `artifact integrity mismatch`, because the seal covers the
+  program.
+
+  So the check is invoked directly. It is the same function `verify-runtime!`
+  calls, and it runs before `emit` there."
+  [body]
+  (@#'kotoba.verifier/verify-program! (privileged-kir body)))
+
+(deftest boot-lit-the-wider-calls-and-the-literals-own-their-arities
+  ;; Re-derived here, independently of the frontend, for the reason every other
+  ;; arity in this file is: a wrong arity does not crash. A five-operand
+  ;; `kernel-uefi-call4` would pass whatever the register happened to hold as
+  ;; the fourth UEFI argument, and `AllocatePages` WRITES through its fourth.
+  (doseq [[body message]
+          [['(kernel-uefi-call4 1 2 3 4 5)
+            "runtime KIR kernel privileged operation arity rejected"]
+           ['(kernel-uefi-call6 1 2 3 4 5 6 7)
+            "runtime KIR kernel privileged operation arity rejected"]
+           ['(ucs2 "a" "b") "runtime KIR rodata literal arity rejected"]
+           ['(ucs2) "runtime KIR rodata literal arity rejected"]]]
+    (testing (str body)
+      (is (thrown-with-msg?
+           kerror/ExceptionInfo (re-pattern message)
+           (boot-lit-verify! body))
+          (str body))))
+  (testing "and each is ADMITTED at its own arity"
+    ;; Without this direction the four assertions above pass with the arity
+    ;; ROWS deleted: `(get table op)` returns nil, `(= nil (count args))` is
+    ;; false, and the operation is rejected for having no row rather than for
+    ;; having the wrong count. Measured 2026-09-02 -- deleting both rows left
+    ;; the suite green until this was added.
+    (doseq [body ['(kernel-uefi-call4 1 2 3 4 5 6)
+                  '(kernel-uefi-call6 1 2 3 4 5 6 7 8)]]
+      (is (some? (boot-lit-verify! body)) (str body)))))
+
+(deftest boot-lit-a-literal-argument-must-be-a-string-and-well-formed
+  ;; The content check is the one worth arguing for. A malformed GUID has no
+  ;; failure mode downstream: sixteen bytes get placed either way and the
+  ;; firmware answers EFI_UNSUPPORTED, which is exactly what a machine WITHOUT
+  ;; that protocol answers.
+  (doseq [[body message]
+          [['(ucs2 42) "runtime KIR rodata literal requires a string literal"]
+           ['(guid "5B1B31A1-9562-11D2-8E3F-00A0C96972")
+            "runtime KIR rodata literal is malformed for its encoding"]
+           ['(bytes-literal "abc")
+            "runtime KIR rodata literal is malformed for its encoding"]
+           ['(bytes-literal-length "zz")
+            "runtime KIR rodata literal is malformed for its encoding"]]]
+    (testing (str body)
+      (is (thrown-with-msg?
+           kerror/ExceptionInfo (re-pattern message)
+           (boot-lit-verify! body))
+          (str body))))
+  (testing "and a well-formed one passes the same check"
+    ;; The other direction, in the same file: a check that refused every
+    ;; literal would pass every assertion above.
+    (doseq [body ['(ucs2 "AIUEOS")
+                  '(guid "5B1B31A1-9562-11D2-8E3F-00A0C969723B")
+                  '(bytes-literal "deadbeef")
+                  '(bytes-literal-length "deadbeef")]]
+      (is (some? (boot-lit-verify! body)) (str body)))))
+
+(deftest boot-lit-the-literal-address-heads-mark-a-module-kernel-native
+  ;; This set has to agree with `kotoba.kir/lower`'s own. When the two disagree
+  ;; the failure surfaces in NEITHER one's terms: the compiler seals no value,
+  ;; this side re-executes the entry, gets the oracle's refusal, and reports an
+  ;; oracle mismatch it never had.
+  (let [operations @#'kotoba.verifier/kernel-native-operations]
+    (doseq [op '[ucs2 guid bytes-literal kernel-uefi-call4 kernel-uefi-call6]]
+      (is (contains? operations op) op))
+    (testing "and bytes-literal-length is deliberately NOT one"
+      ;; Its answer is a property of the literal text, so folding it is
+      ;; correct; kotoba-kir answers it rather than trapping, and marking a
+      ;; module kernel-native for it would cost a constant-folding pass for
+      ;; nothing.
+      (is (not (contains? operations 'bytes-literal-length))))))
+
+;; The literal TARGET rule -- which targets may name a literal pool at all --
+;; is asserted in amu (`kotoba.compiler.uefi-target-gate-test`), for the reason
+;; `an-ordinary-native-target-still-may-not` above records for the four
+;; ADR-0020 operations: reaching it here needs a backend that can EMIT a
+;; literal, and this repository pins kotoba-native itself, on purpose.
+;;
+;; That pin used to be stuck: bumping it imported 22 failures in
+;; `pinned-producer-*`. It is not stuck any more -- the 22 were three tests
+;; pinning spill slots as literals across an allocator that gained a
+;; callee-saved tier, and they now pin the property instead. The pin is at
+;; kotoba-native main.

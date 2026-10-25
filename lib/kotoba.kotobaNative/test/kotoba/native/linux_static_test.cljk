@@ -1,0 +1,316 @@
+(ns kotoba.native.linux-static-test
+  "The loader-less Linux static ELF packager (superproject adr-2609251400 C2).
+
+  What these tests can say on a macOS host is the image's STRUCTURE and that
+  every decision in it comes from the profile passed in. Execution is not
+  claimed here: the images were run on Linux (aarch64 natively, x86-64 under
+  qemu-x86_64 user mode) when the target landed -- recursive-list 500500,
+  recursive-tree 10, string-index-of 189600 on both ISAs, equal to the kexe
+  loader -- and that record is in the ADR, not in an assertion that could not
+  have failed here."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.artifact.core :as artifact]
+            [kotoba.native.linux-static :as linux-static]))
+
+;; The context ABI v11 an ordinary native artifact seals (amu nbb/cli
+;; compile-native!), restated because this repository does not depend on amu.
+(def context-abi
+  {:version 11 :fuel-offset 8 :allow-bitmap-offset 16 :allow-bitmap-bytes 32
+   :cap-call-offset 48 :pair-new-offset 56 :pair-first-offset 64
+   :pair-second-offset 72 :pair-capacity 4096 :kgraph-assert-offset 80
+   :kgraph-get-offset 88 :kgraph-count-offset 96 :kgraph-entity-at-offset 104
+   :kgraph-capacity 4096 :string-equal-offset 112 :string-concat-offset 120
+   :typed-cap-call-offset 128 :string-substring-offset 136
+   :string-code-point-at-offset 144 :string-pool-capacity 65536
+   :vector-new-empty-offset 152 :vector-conj-offset 160 :vector-count-offset 168
+   :vector-at-offset 176 :vector-assoc-offset 184 :vector-drop-offset 192
+   :vector-alloc-offset 200 :vector-assoc-in-place-offset 208
+   :string-index-of-offset 216 :arena-enter-offset 224 :arena-leave-offset 232
+   :string-compare-offset 240 :string-fold-ascii-offset 248
+   :string-find-blank-offset 256 :string-skip-blank-offset 264
+   :string-index-of-from-offset 272 :string-compare-lines-offset 280
+   :pair-used-pointer-offset 288 :pairs-base-offset 296
+   :pair-validated-base-offset 304 :vector-used-pointer-offset 312
+   :vectors-base-offset 320 :vector-items-base-offset 328
+   :string-find-byte-offset 336 :string-append-range-offset 344
+   :string-from-utf8-offset 352 :bytes-from-vector-offset 360
+   :bytes-slice-offset 368 :bytes-concat-offset 376
+   :vector-capacity 4096 :vector-item-capacity 65536})
+
+;; The shape of kotoba-lang lang/limits.edn :profile/native, reduced to the
+;; entries the packager reads. amu passes the real one.
+(def profile
+  {:fuel {:trap :budget/fuel}
+   :cells {:trap :budget/cells :default {:value 4096} :pair-arena-max {:value 67108864}}
+   :bytes {:trap :budget/bytes :default {:value 65536} :max {:value 1073741824}}
+   :static-elf {:admitted-slots {:value [:pair-new :pair-first :pair-second :string-equal
+                                         :string-concat :string-substring :string-index-of
+                                         :typed-cap-call]}
+                :capability-handlers {:value {7 :clock/now 20 :process/spawn 23 :entropy/draw
+                                              33 :env/read 34 :fs/browse 35 :fs/app-data
+                                              37 :io/write 38 :cli/args 39 :io/write-error 41 :io/read}}
+                ;; the real profile names none since C3's second half; the
+                ;; mechanism that names a refusal is exercised with one here
+                :refused-capabilities {:value {42 :gpu/compute}}
+                :unimplemented-slot-trap :slot/unimplemented
+                :exit-codes {:value {:ok 0 :trap/signal 120 :budget/fuel 122 :budget/cells 123
+                                     :budget/bytes 124 :slot/unimplemented 125
+                                     :capability/refused 126}}}})
+
+(def ^:private main-code
+  ;; x86-64: mov eax,42 ; ret     AArch64: movz x0,#42 ; ret
+  {:x86_64-linux-static-kotoba-v1 [0xb8 42 0 0 0 0xc3]
+   :aarch64-linux-static-kotoba-v1 [0x40 0x05 0x80 0xd2 0xc0 0x03 0x5f 0xd6]})
+
+(defn- sealed
+  ([target] (sealed target {}))
+  ([target extra]
+   (artifact/seal
+    (merge {:format :kotoba.kexe/v1 :target target
+            :program {:entry 'main}
+            :exports {'main {:offset 0 :arity 0}}
+            :limits {:fuel 100000 :fuel-metering :off}
+            :fuel-abi {:initial 9007199254740991}
+            :context-abi context-abi
+            :effects []
+            :code (get main-code target)}
+           extra))))
+
+(defn- u64 [bytes offset]
+  (reduce (fn [acc i] (+ (* acc 256) (nth bytes (+ offset i)))) 0 (range 7 -1 -1)))
+(defn- u16 [bytes offset] (+ (nth bytes offset) (* 256 (nth bytes (inc offset)))))
+(defn- u32 [bytes offset] (+ (u16 bytes offset) (* 65536 (u16 bytes (+ offset 2)))))
+
+(defn- segments [bytes]
+  (let [phoff (u64 bytes 32) n (u16 bytes 56)]
+    (mapv (fn [i] (let [o (+ phoff (* 56 i))]
+                    {:type (u32 bytes o) :flags (u32 bytes (+ o 4))
+                     :offset (u64 bytes (+ o 8)) :address (u64 bytes (+ o 16))
+                     :file-size (u64 bytes (+ o 32)) :memory-size (u64 bytes (+ o 40))}))
+          (range n))))
+
+(deftest packs-a-static-executable-with-no-interpreter-and-no-dynamic-section
+  (doseq [[target machine] [[:x86_64-linux-static-kotoba-v1 0x3e]
+                            [:aarch64-linux-static-kotoba-v1 0xb7]]]
+    (testing (name target)
+      (let [image (linux-static/package (sealed target) profile)
+            bytes (:bytes image)
+            segs (segments bytes)
+            loads (filter #(= 1 (:type %)) segs)
+            text (first (filter #(= 5 (:flags %)) loads))
+            entry (u64 bytes 24)]
+        (is (= [0x7f 0x45 0x4c 0x46 2 1 1] (subvec bytes 0 7)))
+        (is (= 2 (u16 bytes 16)) "ET_EXEC")
+        (is (= machine (u16 bytes 18)))
+        (is (= [1 1 0x6474e551] (mapv :type segs)) "two PT_LOADs and PT_GNU_STACK, nothing else")
+        (is (not-any? #(contains? #{2 3} (:type %)) segs) "no PT_DYNAMIC, no PT_INTERP")
+        (is (not-any? #(= 3 (bit-and (:flags %) 3)) loads) "no W+X segment")
+        (is (<= (:address text) entry (+ (:address text) (:file-size text))))
+        (is (= (get main-code target)
+               (subvec bytes (:code-offset image) (+ (:code-offset image) (:code-size image))))
+            "the artifact's code bytes, verbatim")
+        (is (= 11 (u64 bytes (:data-offset image))) "context version")
+        (is (= 9007199254740991 (u64 bytes (+ (:data-offset image) 8)))
+            "the fuel word is the artifact's :fuel-abi :initial")
+        (is (= {:cells 4096 :bytes 65536} (:budgets image)))
+        (is (= (:bytes image) (:bytes (linux-static/package (sealed target) profile)))
+            "deterministic")))))
+
+(deftest every-slot-is-bound-admitted-ones-to-code-the-rest-to-a-named-stub
+  (let [image (linux-static/package (sealed :aarch64-linux-static-kotoba-v1) profile)
+        bytes (:bytes image)
+        data (:data-offset image)
+        text (first (filter #(= 5 (:flags %)) (segments bytes)))
+        slot (fn [k] (u64 bytes (+ data (get context-abi k))))]
+    (is (= :implemented (get-in image [:slots :pair-new])))
+    (is (= :traps (get-in image [:slots :vector-conj])))
+    (is (= :traps (get-in image [:slots :cap-call])))
+    (is (not (contains? (:slots image) :pairs-base)) "a data pointer is not a slot")
+    (doseq [k [:pair-new-offset :string-index-of-offset :vector-conj-offset :cap-call-offset]]
+      (is (<= (:address text) (slot k) (+ (:address text) (:file-size text)))
+          (str k " points into the text")))
+    (is (= 36 (count (:slots image))) "every callable slot of context ABI v11")
+    (is (= (count (:slots image))
+           (count (distinct (map #(slot (keyword (str (name %) "-offset")))
+                                 (keys (:slots image))))))
+        "every slot has its own entry point")))
+
+(deftest the-decisions-are-the-profiles
+  (let [target :x86_64-linux-static-kotoba-v1
+        base (linux-static/package (sealed target) profile)]
+    (testing "a budget moves the image"
+      (let [small (linux-static/package (sealed target)
+                                        (assoc-in profile [:cells :default :value] 100))]
+        (is (= 100 (get-in small [:budgets :cells])))
+        (is (not= (:bytes base) (:bytes small)))))
+    (testing "an exit code moves the image"
+      (is (not= (:bytes base)
+                (:bytes (linux-static/package
+                         (sealed target)
+                         (assoc-in profile [:static-elf :exit-codes :value :budget/cells] 99))))))
+    (testing "an admitted slot with no code is a refusal, not a stub"
+      (is (= :admitted-slot-unimplemented
+             (try (linux-static/package
+                   (sealed target)
+                   (update-in profile [:static-elf :admitted-slots :value] conj :vector-conj))
+                  nil
+                  (catch #?(:clj Exception :cljs :default) e (:reason (ex-data e)))))))
+    (testing "a profile with no static-elf entry is refused, never defaulted"
+      (is (= :native-profile-incomplete
+             (try (linux-static/package (sealed target) (dissoc profile :static-elf))
+                  nil
+                  (catch #?(:clj Exception :cljs :default) e (:reason (ex-data e)))))))
+    (testing "a budget outside the profile's maximum is refused"
+      (is (= :cells-outside-profile
+             (try (linux-static/package (sealed target) profile {:cells 67108865})
+                  nil
+                  (catch #?(:clj Exception :cljs :default) e (:reason (ex-data e)))))))))
+
+(deftest refuses-what-a-pure-static-program-is-not
+  (let [target :aarch64-linux-static-kotoba-v1
+        reason (fn [f] (try (f) nil (catch #?(:clj Exception :cljs :default) e (:reason (ex-data e)))))]
+    (is (= :capability-without-handler
+           (reason #(linux-static/package (sealed target {:effects [[:cap/call 3]]}) profile))))
+    (is (= :entry-not-zero-arity
+           (reason #(linux-static/package (sealed target {:exports {'main {:offset 0 :arity 1}}}) profile))))
+    (is (= :not-linux-static
+           (reason #(linux-static/package (sealed :aarch64-linux-kotoba-v1) profile))))
+    (is (= :unsealed
+           (reason #(linux-static/package (assoc (sealed target) :code [0]) profile))))))
+
+;; ---------------------------------------------------------------------------
+;; C3: capability handlers (superproject adr-2609251400 C3). Execution is
+;; measured on Linux by amu scripts/test-linux-static-handlers.cljk against
+;; kexe + loader; what is asserted here is the packaging: what is refused, what
+;; is sealed, and that the decision code is carried verbatim.
+;; ---------------------------------------------------------------------------
+
+(defn- handler-artifact
+  "A stand-in for the sealed decision artifacts amu compiles: code whose
+  bytes are recognisable, and the exports the handlers call."
+  [isa marker exports]
+  (artifact/seal {:format :kotoba.kexe/v1
+                  :lowering (case isa :x86_64 :runtime-sysv-v1 :aarch64 :runtime-aapcs64-v1)
+                  :code (vec (repeat 32 marker))
+                  :exports (into {} (map-indexed (fn [i e] [e {:offset (* 8 i) :arity 5}])) exports)}))
+
+(defn- handlers [isa]
+  {:decisions (handler-artifact isa 0xd1 ['cap-admitted 'decide])
+   :handlers (handler-artifact isa 0xd2 ['decide])})
+
+(def ^:private io-effects [[:cap/call 37] [:cap/call 38]])
+
+(defn- reason-of [f]
+  (try (f) nil (catch #?(:clj Exception :cljs :default) e (ex-data e))))
+
+(deftest a-program-with-effects-carries-its-handlers-and-its-sealed-grant
+  (doseq [[target isa] [[:x86_64-linux-static-kotoba-v1 :x86_64]
+                        [:aarch64-linux-static-kotoba-v1 :aarch64]]]
+    (testing (name target)
+      (let [art (sealed target {:effects io-effects})
+            image (linux-static/package art profile {:handlers (handlers isa) :fs-scope "/srv/app"})
+            bytes (:bytes image)
+            data (:data-offset image)
+            allow (subvec bytes (+ data 16) (+ data 48))]
+        (is (= :implemented (get-in image [:slots :typed-cap-call])))
+        (is (= [37 38] (:grant image)) "the grant defaults to the effects")
+        (is (= "/srv/app" (:fs-scope image)))
+        (is (= [0 0 0 0 0x60 0 0 0] (subvec allow 0 8))
+            "bits 37 and 38 of the allow mask, and no other")
+        (is (every? zero? (subvec allow 8)))
+        (is (= [:decisions :handlers] (mapv :which (:decision-code image))))
+        (doseq [{:keys [which address size]} (:decision-code image)]
+          (is (= (vec (repeat 32 (if (= which :decisions) 0xd1 0xd2)))
+                 (subvec bytes address (+ address size)))
+              (str which " code carried verbatim"))
+          (is (zero? (mod address 16))))
+        (is (= (:bytes image)
+               (:bytes (linux-static/package art profile {:handlers (handlers isa) :fs-scope "/srv/app"})))
+            "deterministic")
+        (testing "a narrower grant clears the bit and nothing else moves but the mask"
+          (let [narrow (linux-static/package art profile {:handlers (handlers isa) :fs-scope "/srv/app"
+                                                          :grant #{37}})]
+            (is (= [37] (:grant narrow)))
+            (is (= 0x20 (nth (:bytes narrow) (+ data 16 4))))))))))
+
+(deftest a-pure-program-never-reaches-the-handlers
+  (let [image (linux-static/package (sealed :aarch64-linux-static-kotoba-v1) profile)]
+    (is (= :traps (get-in image [:slots :typed-cap-call]))
+        "admitted by the profile, but bound to its stub: nothing can call it")
+    (is (= [] (:decision-code image)))
+    (is (= [] (:grant image)))))
+
+(deftest what-a-program-with-effects-is-refused
+  (let [target :aarch64-linux-static-kotoba-v1
+        art (fn [effects] (sealed target {:effects effects}))
+        opts {:handlers (handlers :aarch64)}]
+    (testing "a capability with no handler here, by name"
+      (let [d (reason-of #(linux-static/package (art [[:cap/call 37] [:cap/call 42]]) profile opts))]
+        (is (= :capability-without-handler (:reason d)))
+        (is (= [[42 :gpu/compute]] (:capabilities d)))))
+    (testing "a grant may narrow the effects, never widen them"
+      (is (= {:reason :grant-widens-effects :wire-ids [41]}
+             (reason-of #(linux-static/package (art io-effects) profile (assoc opts :grant #{37 41}))))))
+    (testing "the decision code is required, sealed, and for this ISA"
+      (is (= :handlers-missing (:reason (reason-of #(linux-static/package (art io-effects) profile {})))))
+      (is (= :handler-isa
+             (:reason (reason-of #(linux-static/package (art io-effects) profile {:handlers (handlers :x86_64)})))))
+      (is (= :handler-unsealed
+             (:reason (reason-of #(linux-static/package (art io-effects) profile
+                                                        {:handlers (assoc-in (handlers :aarch64) [:handlers :code] [0])}))))))
+    (testing "the fs scope is one canonical absolute directory"
+      (doseq [bad ["relative" "/a/../b" "/a//b" "/a/" "/a/./b"]]
+        (is (= :fs-scope-not-canonical
+               (:reason (reason-of #(linux-static/package (art io-effects) profile (assoc opts :fs-scope bad)))))
+            bad))
+      (is (= "/" (:fs-scope (linux-static/package (art io-effects) profile (assoc opts :fs-scope "/"))))))
+    (testing "an effect that is not a capability call"
+      (is (= :effect-not-capability
+             (:reason (reason-of #(linux-static/package (art [[:abort 1]]) profile opts)))))
+      (is (= :effect-not-capability
+             (:reason (reason-of #(linux-static/package (art [:aborts]) profile opts))))
+          "a keyword that is not a pure ability"))
+    (testing "a pure ability (:abort, :state) needs no handler and seals no grant (2026-09-26)"
+      (let [image (linux-static/package (art (conj io-effects :abort :state)) profile opts)]
+        (is (= (:grant (linux-static/package (art io-effects) profile opts)) (:grant image)))
+        (is (= (:bytes (linux-static/package (art io-effects) profile opts)) (:bytes image))
+            "the image is the one the capability effects alone make")))))
+
+;; C3, second half (2026-09-25): :process/spawn's grant is sealed from the
+;; compile policy like the fs scope, and refused when it could be misread.
+(def ^:private spawn-effects [[:cap/call 20] [:cap/call 37]])
+
+(deftest the-spawn-grant-is-sealed-and-checked
+  (let [target :aarch64-linux-static-kotoba-v1
+        art (fn [effects] (sealed target {:effects effects}))
+        opts {:handlers (handlers :aarch64)}
+        spawn {:programs ["/bin/echo" "/usr/bin/false"] :env ["LANG"]}
+        pkg (fn [effects extra] (linux-static/package (art effects) profile (merge opts extra)))]
+    (testing "the grant is reported, defaults filled"
+      (is (= {:programs ["/bin/echo" "/usr/bin/false"] :path-lookup false :env ["LANG"]}
+             (:spawn (pkg spawn-effects {:spawn spawn}))))
+      (is (= {:programs [] :path-lookup false :env []} (:spawn (pkg spawn-effects {})))
+          "no :spawn: every program is refused at run time"))
+    (testing "the programs are sealed into the text: another list, another image"
+      (is (not= (:bytes (pkg spawn-effects {:spawn spawn}))
+                (:bytes (pkg spawn-effects {:spawn (assoc spawn :programs ["/bin/echo"])})))))
+    (testing "refusals, by reason"
+      (doseq [[reason effects bad] [[:spawn-without-capability io-effects spawn]
+                                    [:spawn-programs-malformed spawn-effects {:programs ["echo"]}]
+                                    [:spawn-programs-malformed spawn-effects {:programs ["/"]}]
+                                    [:spawn-programs-malformed spawn-effects {:programs ["/bin/../bin/echo"]}]
+                                    [:spawn-programs-malformed spawn-effects {:programs ["/bin/echo" "/bin/echo"]}]
+                                    [:spawn-programs-malformed spawn-effects
+                                     {:programs (mapv #(str "/p" %) (range 17))}]
+                                    [:spawn-path-lookup-malformed spawn-effects {:programs [] :path-lookup "yes"}]
+                                    [:spawn-lookup-ambiguous spawn-effects
+                                     {:programs ["/bin/echo" "/usr/bin/echo"] :path-lookup true}]
+                                    [:spawn-env-malformed spawn-effects {:env ["A=B"]}]
+                                    [:spawn-env-malformed spawn-effects {:env [""]}]]]
+        (is (= reason (:reason (reason-of #(pkg effects {:spawn bad}))))
+            (pr-str bad))))
+    (testing "a grant narrowed past wire 20 cannot carry a program list"
+      (is (= :spawn-without-capability
+             (:reason (reason-of #(pkg spawn-effects {:spawn spawn :grant #{37}}))))))
+    (testing "the same last segment is fine without lookup"
+      (is (= 2 (count (:programs (:spawn (pkg spawn-effects {:spawn {:programs ["/bin/echo" "/usr/bin/echo"]}})))))))))

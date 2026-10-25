@@ -1,0 +1,449 @@
+(ns kotoba.native.dequant-fusion-test
+  "dequant: the fused dequantize-and-dot family, as bytes.
+
+  `kernel-dot-f32` folds two f32 regions. A transformer's weights are not f32,
+  so using it means writing a dequantized row to memory and reading it back
+  once -- four bytes per weight of traffic that exists only because the
+  operation could not see the codes. These instructions remove it: the codes
+  are widened INSIDE the register file and multiplied by the activations
+  without ever becoming f32 in memory.
+
+  What the tests here can and cannot say. They can say that the two arms are
+  the byte sequences intended, that no VEX instruction runs before the guard
+  answers, that every register the sequence writes and does not own is pushed
+  and popped, and that the half-precision shortcut the machine takes is
+  exactly the C's equation over all 65536 inputs. They cannot say the two arms
+  compute the same number: that is a claim about a machine, and it is
+  measured in `os/aiueos/scripts/smoke-qemu-dequant-dot.cljs`, which runs the
+  same artifact under `-cpu max` and `-cpu qemu64` and compares the digits
+  with kotoba-kir's answer.
+
+  Every run below was assembled and read back with
+  `llvm-mc --disassemble --triple=x86_64-unknown-linux-gnu --show-encoding`
+  (LLVM 22.1.7) on 2026-09-02, not derived from the manual and trusted."
+  (:refer-clojure :exclude [bit-and bit-or bit-shift-left bit-shift-right])
+  (:require [kotoba.native.test-support :refer [bit-and bit-or bit-shift-left bit-shift-right]]
+            [kotoba.native.test-support :as support]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.native.x86-64 :as x86]))
+
+(def ^:private q8-0-program
+  {:format :kotoba.kir/v4 :exports ['main]
+   :functions [{:name 'main :params '[w wl x xl n]
+                :body '(kernel-dequant-dot-q8-0 w wl x xl n)}]})
+
+(defn- q8-0-code [] (vec (:code (x86/emit-program q8-0-program))))
+
+(defn- byte-run? [haystack needle]
+  (boolean (some #(= needle (subvec haystack % (+ % (count needle))))
+                 (range (inc (- (count haystack) (count needle)))))))
+
+(defn- byte-run-index [haystack needle]
+  (first (filter #(= needle (subvec haystack % (+ % (count needle))))
+                 (range (inc (- (count haystack) (count needle)))))))
+
+(defn- byte-run-count [haystack needle]
+  (count (filter #(= needle (subvec haystack % (+ % (count needle))))
+                 (range (inc (- (count haystack) (count needle)))))))
+
+;; ---------------------------------------------------------------------------
+;; the checks, in the oracle's order
+;; ---------------------------------------------------------------------------
+
+(def ^:private q8-0-span-bytes
+  ;; Both spans, each derived from the BLOCK COUNT by its own stride and each
+  ;; compared with its own region. This is where the family differs from
+  ;; `kernel-dot-f32`, which scales one count by four for both regions:
+  ;;
+  ;;   imul r10, rdi, 34    -- 34 bytes carry one block of codes
+  ;;   cmp  r10, rcx        -- against the packed region's declared length
+  ;;   ja   trap
+  ;;   imul r11, rdi, 128   -- 32 elements of four bytes each
+  ;;   cmp  r11, r8         -- against the activation region's
+  ;;   ja   trap
+  ;;
+  ;; `imul r64,r64,imm32` rather than the f32 dot product's two doublings,
+  ;; because 34 is not a power of two.
+  [0x4c 0x69 0xd7 0x22 0x00 0x00 0x00
+   0x49 0x39 0xca
+   0x0f 0x87])
+
+(def ^:private q8-0-element-span-bytes
+  [0x4c 0x69 0xdf 0x80 0x00 0x00 0x00
+   0x4d 0x39 0xc3
+   0x0f 0x87])
+
+(def ^:private q8-0-block-limit-bytes
+  ;; `cmp rdi, 512` -- the block ceiling, checked BEFORE either product above
+  ;; is formed. 512 is `min(65536/34, 65536/128)`, and it is the f32 side that
+  ;; binds: 512 blocks are 16384 elements, exactly what `kernel-dot-f32`
+  ;; admits.
+  [0x48 0x81 0xff 0x00 0x02 0x00 0x00
+   0x0f 0x87])
+
+(deftest dequant-checks-both-spans-against-their-own-region
+  (let [code (q8-0-code)]
+    (testing "the block ceiling comes before either multiply"
+      (is (byte-run? code q8-0-block-limit-bytes))
+      (is (< (byte-run-index code q8-0-block-limit-bytes)
+             (byte-run-index code q8-0-span-bytes))
+          "a block count of 2^60 scaled by 34 wraps, and a wrapped span passes
+           every length check there is"))
+    (testing "the packed span is blocks * 34"
+      (is (byte-run? code q8-0-span-bytes)))
+    (testing "the element span is blocks * 128, against the OTHER length"
+      (is (byte-run? code q8-0-element-span-bytes)))))
+
+;; ---------------------------------------------------------------------------
+;; the guard, and what may not run before it
+;; ---------------------------------------------------------------------------
+
+(def ^:private guard-bytes
+  ;; `x86-dot-avx2-guard`, shared verbatim with `kernel-dot-f32`. Leaf 0
+  ;; first, then leaf 1 ECX bits 27|28, then XCR0 bits 1|2, then leaf 7 EBX
+  ;; bit 5. The four displacements are elided: only the fixed head is pinned
+  ;; here, because the branches are resolved per instruction index.
+  [0x31 0xc0 0x31 0xc9 0x0f 0xa2 0x83 0xf8 0x07])
+
+(def ^:private save-bytes
+  ;; push rbx, rsi, rax, rcx, rdx -- the five registers this sequence writes
+  ;; that an allocator may own. R10, R11 and the vector file are the only ones
+  ;; it may take for free.
+  [0x53 0x56 0x50 0x51 0x52])
+
+(def ^:private restore-bytes
+  ;; pop rdx, rcx, rax, rsi, rbx -- the reverse, at `join`, BEFORE the answer
+  ;; is written to the destination.
+  [0x5a 0x59 0x58 0x5e 0x5b])
+
+(deftest dequant-executes-no-vex-instruction-before-the-guard-answers
+  ;; A VEX-prefixed instruction on a CPU without AVX raises #UD, and in a
+  ;; kernel that is a fault in the middle of feature detection. Nothing
+  ;; between the start of the sequence and the end of the guard may carry
+  ;; 0xc4 or 0xc5 as a prefix -- and neither byte appears for any other
+  ;; reason in this prefix range, which is why scanning for them is a test
+  ;; rather than an approximation.
+  (let [code (q8-0-code)
+        guard-at (byte-run-index code guard-bytes)
+        guard-end (+ guard-at 60)]
+    (is (some? guard-at))
+    (is (not (some #{0xc4 0xc5} (subvec code 0 guard-end)))
+        "a VEX prefix before the guard answers is a #UD on the machines this
+         guard exists to detect")))
+
+(deftest dequant-saves-every-register-it-clobbers-that-it-does-not-own
+  (let [code (q8-0-code)]
+    (is (byte-run? code save-bytes) "push rbx, rsi, rax, rcx, rdx")
+    (is (byte-run? code restore-bytes) "pop rdx, rcx, rax, rsi, rbx")
+    (is (< (byte-run-index code save-bytes) (byte-run-index code guard-bytes))
+        "the saves come before the guard, which destroys four of them")
+    (is (< (byte-run-index code guard-bytes) (byte-run-index code restore-bytes))
+        "and the restores after both arms")
+    (testing "the three operand values are pushed ON TOP of the saves"
+      ;; So they pop off first. The f32 dot product could restore RAX/RCX/RDX
+      ;; immediately after the guard; these arms use them as working
+      ;; registers, so the saves have to outlive the arms.
+      (is (= 8 (- (byte-run-index code [0x31 0xc0 0x31 0xc9 0x0f 0xa2])
+                  (byte-run-index code save-bytes)))
+          "five saves and three values, each one byte"))))
+
+;; ---------------------------------------------------------------------------
+;; the half-precision scale
+;; ---------------------------------------------------------------------------
+
+(def ^:private fp16-head-bytes
+  ;; movzx eax, word [r10]; the sign to bit 31 in RCX; the significand and
+  ;; exponent shifted 13 into RDX; then the exponent-31 test.
+  [0x41 0x0f 0xb7 0x02
+   0x48 0x89 0xc1 0x48 0x81 0xe1 0x00 0x80 0x00 0x00 0x48 0xc1 0xe1 0x10
+   0x48 0x89 0xc2 0x48 0x81 0xe2 0xff 0x7f 0x00 0x00 0x48 0xc1 0xe2 0x0d
+   0x48 0x81 0xe0 0x00 0x7c 0x00 0x00
+   0x48 0x81 0xf8 0x00 0x7c 0x00 0x00
+   0x0f 0x84])
+
+(def ^:private fp16-scale-vex-bytes
+  ;; vmovd xmm6, edx; vmulss xmm6, xmm6, xmm7; vmovd eax, xmm6
+  [0xc5 0xf9 0x6e 0xf2 0xc5 0xca 0x59 0xf7 0xc5 0xf9 0x7e 0xf0])
+
+(def ^:private fp16-scale-sse-bytes
+  ;; movd xmm6, edx; mulss xmm6, xmm7; movd eax, xmm6 -- the same three
+  ;; operations under the legacy encoding, for the arm that has not written a
+  ;; YMM register and must not start.
+  [0x66 0x0f 0x6e 0xf2 0xf3 0x0f 0x59 0xf7 0x66 0x0f 0x7e 0xf0])
+
+(def ^:private fp16-inf-nan-bytes
+  ;; mov rax, rdx; and rax, 0x7fffff; or rax, 0x7f800000; or rax, rcx
+  [0x48 0x89 0xd0
+   0x48 0x81 0xe0 0xff 0xff 0x7f 0x00
+   0x48 0x81 0xc8 0x00 0x00 0x80 0x7f
+   0x48 0x09 0xc8])
+
+(def ^:private magic-bytes
+  ;; mov eax, 0x77800000 -- 2^112 as binary32.
+  [0xb8 0x00 0x00 0x80 0x77])
+
+(deftest dequant-converts-the-block-scale-the-same-way-in-both-arms
+  (let [code (q8-0-code)]
+    (is (= 2 (byte-run-count code fp16-head-bytes))
+        "one conversion per arm, and the integer half is literally the same
+         bytes -- the two arms differ only in how the multiply is spelled")
+    (is (= 2 (byte-run-count code fp16-inf-nan-bytes)))
+    (is (= 2 (byte-run-count code magic-bytes)))
+    (is (byte-run? code fp16-scale-vex-bytes) "the AVX2 arm, VEX-encoded")
+    (is (byte-run? code fp16-scale-sse-bytes) "the scalar arm, legacy SSE")))
+
+;; The multiply-by-2^112 shortcut is not the C's algorithm; it is a claim that
+;; it agrees with the C's algorithm. That claim is checked here over the WHOLE
+;; input space rather than sampled, because the branches it collapses -- the
+;; normalising loop for subnormals, the zero case -- are exactly where a
+;; sampled test would look away.
+
+(defn- c-fp16-to-f32-bits
+  "`fp16_to_f32` from os/aiueos/kernel/qwen35_quant.c, transcribed. This is
+  the equation the oracle in kotoba-kir implements."
+  [half]
+  (let [sign (bit-shift-left (bit-and half 0x8000) 16)
+        exponent (bit-and (bit-shift-right half 10) 0x1f)
+        mantissa (bit-and half 0x3ff)]
+    (cond
+      (zero? exponent)
+      (if (zero? mantissa)
+        sign
+        (loop [m mantissa unbiased -14]
+          (if (zero? (bit-and m 0x400))
+            (recur (bit-shift-left m 1) (dec unbiased))
+            (bit-or sign (bit-shift-left (+ unbiased 127) 23)
+                    (bit-shift-left (bit-and m 0x3ff) 13)))))
+      (= 31 exponent) (bit-or sign 0x7f800000 (bit-shift-left mantissa 13))
+      :else (bit-or sign (bit-shift-left (+ exponent 112) 23)
+                    (bit-shift-left mantissa 13)))))
+
+(defn- machine-fp16-to-f32-bits
+  "What the emitted bytes compute, in the same order: the sign aside, the low
+  fifteen bits shifted 13, one binary32 multiply by 2^112 unless the exponent
+  is 31, and the sign back on."
+  [half]
+  (let [sign (bit-shift-left (bit-and half 0x8000) 16)
+        u (bit-shift-left (bit-and half 0x7fff) 13)]
+    (bit-or sign
+            (if (= 0x7c00 (bit-and half 0x7c00))
+              (bit-or (bit-and u 0x007fffff) 0x7f800000)
+              ;; binary32 x binary32: the f64 product is exact (48 significand
+              ;; bits) and `fround` is the one rounding, so this is the JVM's
+              ;; `float * float` bit for bit.
+              (bit-and 0xffffffff
+                       (support/float->raw-int-bits
+                        (js/Math.fround (* (support/int-bits->float u)
+                                           (support/int-bits->float 0x77800000)))))))))
+
+(deftest dequant-fp16-agrees-with-the-c
+  (let [disagreements (into [] (comp (map (fn [half]
+                                            [half
+                                             (c-fp16-to-f32-bits half)
+                                             (bit-and (machine-fp16-to-f32-bits half)
+                                                      0xffffffff)]))
+                                     (remove (fn [[_ a b]] (= a b))))
+                            (range 65536))]
+    (println (str "SCANNED\t65536\tDISAGREEMENTS\t" (count disagreements)))
+    (is (= 65536 (count (range 65536))) "the whole input space, not a sample")
+    (is (empty? disagreements)
+        (str "the machine's shortcut and the C's equation must answer the same
+              pattern for every binary16: " (take 4 disagreements)))))
+
+;; ---------------------------------------------------------------------------
+;; the two arms
+;; ---------------------------------------------------------------------------
+
+(def ^:private avx-group-bytes
+  ;; Eight elements, eight lanes wide:
+  ;;   vpmovsxbd ymm1,[r10]   eight signed codes to eight dwords
+  ;;   vcvtdq2ps ymm1,ymm1
+  ;;   vmulps    ymm1,ymm1,ymm3   * the broadcast scale        (round 1)
+  ;;   vmovups   ymm2,[r11]       the activations
+  ;;   vmulps    ymm1,ymm1,ymm2   * the activation             (round 2)
+  ;;   vextractf128 xmm2,ymm1,1
+  ;;   vaddps    xmm0,xmm0,xmm1   lower four, into lanes 0..3
+  ;;   vaddps    xmm0,xmm0,xmm2   upper four, into the SAME four
+  ;;
+  ;; NO `vfmadd231ps`. Fusing the second multiply into the add would drop a
+  ;; rounding and give a more accurate answer that the scalar arm does not
+  ;; give, which is the one thing an arm of this pair may not do.
+  [0xc4 0xc2 0x7d 0x21 0x0a
+   0xc5 0xfc 0x5b 0xc9
+   0xc5 0xf4 0x59 0xcb
+   0xc4 0xc1 0x7c 0x10 0x13
+   0xc5 0xf4 0x59 0xca
+   0xc4 0xe3 0x7d 0x19 0xca 0x01
+   0xc5 0xf8 0x58 0xc1
+   0xc5 0xf8 0x58 0xc2])
+
+(def ^:private scalar-element-bytes
+  ;; One element of the scalar arm, at group offset 0 and lane 0:
+  ;;   movsx    rax, byte [r10]      REX.W, so the whole register is the code
+  ;;   cvtsi2ss xmm4, rax
+  ;;   mulss    xmm4, xmm6           * the scale                (round 1)
+  ;;   movss    xmm5, [r11]
+  ;;   mulss    xmm4, xmm5           * the activation           (round 2)
+  ;;   addss    xmm0, xmm4           into lane e mod 4
+  [0x49 0x0f 0xbe 0x02
+   0xf3 0x48 0x0f 0x2a 0xe0
+   0xf3 0x0f 0x59 0xe6
+   0xf3 0x41 0x0f 0x10 0x2b
+   0xf3 0x0f 0x59 0xe5
+   0xf3 0x0f 0x58 0xc4])
+
+(def ^:private scalar-group-bytes
+  ;; The scalar arm's whole eight-element group body, 222 bytes. Element e
+  ;; reads `[r10+e]` and `[r11+4e]` and adds into accumulator e mod 4, so the
+  ;; displacements and the accumulator register together say which product
+  ;; joins which chain -- which is the accumulation tree, written out.
+  ;;
+  ;;   e=0 -> xmm0   e=1 -> xmm1   e=2 -> xmm2   e=3 -> xmm3   (lower half)
+  ;;   e=4 -> xmm0   e=5 -> xmm1   e=6 -> xmm2   e=7 -> xmm3   (upper half)
+  ;;
+  ;; which is `s += lower; s += upper` per lane, and is what the AVX2 arm's
+  ;; `vaddps xmm0,xmm0,xmm1` then `vaddps xmm0,xmm0,xmm2` does in two
+  ;; instructions.
+  [0x49 0x0f 0xbe 0x02 0xf3 0x48 0x0f 0x2a 0xe0 0xf3 0x0f 0x59
+   0xe6 0xf3 0x41 0x0f 0x10 0x2b 0xf3 0x0f 0x59 0xe5 0xf3 0x0f
+   0x58 0xc4 0x49 0x0f 0xbe 0x42 0x01 0xf3 0x48 0x0f 0x2a 0xe0
+   0xf3 0x0f 0x59 0xe6 0xf3 0x41 0x0f 0x10 0x6b 0x04 0xf3 0x0f
+   0x59 0xe5 0xf3 0x0f 0x58 0xcc 0x49 0x0f 0xbe 0x42 0x02 0xf3
+   0x48 0x0f 0x2a 0xe0 0xf3 0x0f 0x59 0xe6 0xf3 0x41 0x0f 0x10
+   0x6b 0x08 0xf3 0x0f 0x59 0xe5 0xf3 0x0f 0x58 0xd4 0x49 0x0f
+   0xbe 0x42 0x03 0xf3 0x48 0x0f 0x2a 0xe0 0xf3 0x0f 0x59 0xe6
+   0xf3 0x41 0x0f 0x10 0x6b 0x0c 0xf3 0x0f 0x59 0xe5 0xf3 0x0f
+   0x58 0xdc 0x49 0x0f 0xbe 0x42 0x04 0xf3 0x48 0x0f 0x2a 0xe0
+   0xf3 0x0f 0x59 0xe6 0xf3 0x41 0x0f 0x10 0x6b 0x10 0xf3 0x0f
+   0x59 0xe5 0xf3 0x0f 0x58 0xc4 0x49 0x0f 0xbe 0x42 0x05 0xf3
+   0x48 0x0f 0x2a 0xe0 0xf3 0x0f 0x59 0xe6 0xf3 0x41 0x0f 0x10
+   0x6b 0x14 0xf3 0x0f 0x59 0xe5 0xf3 0x0f 0x58 0xcc 0x49 0x0f
+   0xbe 0x42 0x06 0xf3 0x48 0x0f 0x2a 0xe0 0xf3 0x0f 0x59 0xe6
+   0xf3 0x41 0x0f 0x10 0x6b 0x18 0xf3 0x0f 0x59 0xe5 0xf3 0x0f
+   0x58 0xd4 0x49 0x0f 0xbe 0x42 0x07 0xf3 0x48 0x0f 0x2a 0xe0
+   0xf3 0x0f 0x59 0xe6 0xf3 0x41 0x0f 0x10 0x6b 0x1c 0xf3 0x0f
+   0x59 0xe5 0xf3 0x0f 0x58 0xdc])
+
+(def ^:private avx-reduce-bytes
+  ;; vhaddps xmm0,xmm0,xmm0 twice: [s0 s1 s2 s3] -> [s0+s1, s2+s3, ..] ->
+  ;; [(s0+s1)+(s2+s3), ..]
+  [0xc5 0xfb 0x7c 0xc0 0xc5 0xfb 0x7c 0xc0])
+
+(def ^:private scalar-reduce-bytes
+  ;; addss xmm0,xmm1; addss xmm2,xmm3; addss xmm0,xmm2 -- the tree the two
+  ;; `vhaddps` above compute, written out.
+  [0xf3 0x0f 0x58 0xc1 0xf3 0x0f 0x58 0xd3 0xf3 0x0f 0x58 0xc2])
+
+(def ^:private group-loop-bytes
+  ;; add r10,8; add r11,32; sub rsi,1; cmp rsi,1; jae -- the same five
+  ;; instructions close both arms' inner loop, so the two walk the row at the
+  ;; same stride by construction.
+  [0x49 0x81 0xc2 0x08 0x00 0x00 0x00
+   0x49 0x81 0xc3 0x20 0x00 0x00 0x00
+   0x48 0x81 0xee 0x01 0x00 0x00 0x00
+   0x48 0x81 0xfe 0x01 0x00 0x00 0x00
+   0x0f 0x83])
+
+(deftest dequant-emits-two-arms-with-one-accumulation-tree
+  (let [code (q8-0-code)]
+    (testing "the AVX2 arm folds eight elements at a time"
+      (is (byte-run? code avx-group-bytes))
+      (is (byte-run? code avx-reduce-bytes) "two vhaddps"))
+    (testing "the scalar arm folds one at a time into four accumulators"
+      (is (byte-run? code scalar-element-bytes))
+      (is (byte-run? code scalar-reduce-bytes)))
+    (testing "eight scalar elements per group, in order, into lane e mod 4"
+      ;; The WHOLE group body, not a count of each accumulator. Measured
+      ;; 2026-09-02: counting `addss xmm_k, xmm4` occurrences passes for
+      ;; `lane = e div 2` as well -- that assignment also touches each of the
+      ;; four accumulators twice, and the products it adds are the right
+      ;; products in the wrong chains. The chains ARE the contract, so the
+      ;; sequence is pinned rather than its histogram.
+      (is (byte-run? code scalar-group-bytes))
+      (is (= 1 (byte-run-count code scalar-group-bytes))
+          "one group body, reached four times by the inner loop"))
+    (testing "both inner loops close identically"
+      (is (= 2 (byte-run-count code group-loop-bytes))))
+    (testing "and both block loops count four groups"
+      (is (= 2 (byte-run-count code [0xbe 0x04 0x00 0x00 0x00]))
+          "mov esi, 4 -- 32 elements is four groups of eight"))))
+
+(deftest dequant-ends-the-avx-arm-with-vzeroupper
+  ;; The scalar sequences elsewhere in this backend are legacy SSE, and an
+  ;; AVX-to-SSE transition on a dirty upper half is what `vzeroupper` exists
+  ;; to remove.
+  (let [code (q8-0-code)
+        vzeroupper [0xc5 0xf8 0x77]]
+    (is (= 1 (byte-run-count code vzeroupper)))
+    (is (> (byte-run-index code vzeroupper)
+           (byte-run-index code avx-reduce-bytes))
+        "after the reduction, not before it")
+    (is (< (byte-run-index code vzeroupper)
+           (byte-run-index code scalar-reduce-bytes))
+        "and before the scalar arm, which is legacy-encoded")))
+
+(deftest dequant-sign-extends-its-answer
+  ;; MOVD writes a 32-bit register, which zeroes the upper half. The canonical
+  ;; f32 word is the pattern SIGN-extended from bit 31, so a negative answer
+  ;; without this is a word `f32-from-bits` refuses.
+  (let [code (q8-0-code)]
+    (is (byte-run? code [0x48 0x63]) "movsxd over the destination")
+    (is (> (byte-run-index code [0x48 0x63])
+           (byte-run-index code restore-bytes))
+        "the destination is written after the restores, so a destination that
+         is one of the saved registers gets the answer and not its old value")))
+
+(deftest dequant-traps-with-ud2
+  (let [code (q8-0-code)]
+    (is (byte-run? code [0x0f 0x0b]))))
+
+;; ---------------------------------------------------------------------------
+;; what the fusion is for
+;; ---------------------------------------------------------------------------
+
+(deftest dequant-inner-loop-is-four-times-shorter-in-the-vector-arm
+  ;; The point of the fusion, as a count rather than as a timing. Counted from
+  ;; the disassembly above (llvm-mc, 2026-09-02): the AVX2 group body is eight
+  ;; instructions plus the five that close the loop, and the scalar one is
+  ;; eight elements of six plus the same five.
+  ;;
+  ;; This is a STATIC count. It is not a speedup: QEMU TCG, which is the only
+  ;; machine on this workstation that has AVX2 at all, spends its time
+  ;; translating instructions rather than executing them, and measured
+  ;; 2026-09-02 it reported a ratio of 1.17 rather than 4. The count is what
+  ;; can be asserted here; the timing is reported by the aiueos smoke with
+  ;; that caveat attached.
+  (let [avx-body 13
+        scalar-body (+ (* 8 6) 5)]
+    (is (= 53 scalar-body))
+    (is (<= 4.0 (/ (double scalar-body) avx-body))
+        "eight elements cost 13 instructions vectorised and 53 scalar")
+    ;; And the bytes agree with the counts: the runs pinned above are the
+    ;; whole of each body apart from the loop close.
+    (let [code (q8-0-code)]
+      (is (= 36 (count avx-group-bytes)))
+      (is (= 26 (count scalar-element-bytes)))
+      (is (byte-run? code avx-group-bytes))
+      (is (byte-run? code scalar-element-bytes)))))
+
+;; ---------------------------------------------------------------------------
+;; the formats this backend emits
+;; ---------------------------------------------------------------------------
+
+(deftest dequant-emits-every-declared-format
+  ;; dequant-iq: this test used to assert the OPPOSITE for the K-quants --
+  ;; that they were refused by name because their thirty-two groups are not a
+  ;; loop and no arm had been unrolled for them. The unrolling exists now
+  ;; (`kotoba.native.dequant-kquant-test`), so all three emit.
+  ;;
+  ;; The refusal itself is NOT gone and is still tested, in that namespace, by
+  ;; taking a format's arms away: the failure it prevents is silent, because a
+  ;; `case` with no arm returns `nil` and a group body of no bytes is a loop
+  ;; that runs the right number of times and adds nothing.
+  (doseq [head '[kernel-dequant-dot-q8-0 kernel-dequant-dot-q4-k
+                 kernel-dequant-dot-q6-k]]
+    (is (pos? (count (vec (:code (x86/emit-program
+                                  {:format :kotoba.kir/v4 :exports ['main]
+                                   :functions [{:name 'main :params '[w wl x xl n]
+                                                :body (list head 'w 'wl 'x 'xl 'n)}]})))))
+        (str head " must emit"))))

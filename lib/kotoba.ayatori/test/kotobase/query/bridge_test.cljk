@@ -1,0 +1,446 @@
+(ns kotobase.query.bridge-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [arrangement.core :as arr]
+            [kotobase.local :as local]
+            [kotobase.store :as st]
+            [kotobase.query.bridge :as bridge]))
+
+(def ^:private everything (constantly true))
+
+(defn- fixture-store
+  "A LocalStore with two collections: `users` (several docs, one with a
+  multi-valued `:tags` attribute, one with no `:dept-key` at all) and
+  `departments` (the join target). Mirrors a realistic small dataset a
+  consumer repo (datomic-client-shim etc.) would materialize and query."
+  []
+  (let [s (local/local-store)]
+    (st/-put s "users" "u1" {:name "Alice" :role "admin" :dept-key "d1"
+                              :tags ["eng" "lead"]})
+    (st/-put s "users" "u2" {:name "Bob" :role "user" :dept-key "d2"})
+    (st/-put s "users" "u3" {:name "Carol" :role "admin" :dept-key "d1"})
+    (st/-put s "users" "u4" {:name "Dave" :role "user"}) ; no dept-key
+    (st/-put s "departments" "d1" {:name "Engineering" :budget 900000})
+    (st/-put s "departments" "d2" {:name "Sales" :budget 400000})
+    s))
+
+;; ------------------------------------------------------------- materialize
+
+(deftest materialize-produces-one-entity-per-doc-key
+  (let [db (bridge/materialize (fixture-store) ["users" "departments"])]
+    (is (= #{:users/u1 :users/u2 :users/u3 :users/u4
+             :departments/d1 :departments/d2}
+           (into #{} (keys (:eavt db))))
+        "one entity, keyword `coll/key`, per materialized doc")))
+
+(deftest materialize-maps-doc-attrs-and-synthetic-attrs
+  (let [db (bridge/materialize (fixture-store) ["users"])]
+    (is (= {:name #{"Alice"} :role #{"admin"} :dept-key #{"d1"}
+            :tags #{"eng" "lead"}
+            :kotobase/coll #{"users"} :kotobase/key #{"u1"}}
+          (arr/entity-attrs db :users/u1))
+        "top-level doc keys become attrs; :tags (a vector) becomes a
+        cardinality-many attribute (one datom per element, unioned into a
+        set on read-back); :kotobase/coll and :kotobase/key are always
+        present")))
+
+(deftest materialize-non-map-doc-falls-back-to-kotobase-value
+  (let [s (local/local-store)]
+    (st/-put s "counters" "c1" 42)
+    (let [db (bridge/materialize s ["counters"])]
+      (is (= {:kotobase/value #{42} :kotobase/coll #{"counters"} :kotobase/key #{"c1"}}
+             (arr/entity-attrs db :counters/c1))))))
+
+(deftest materialize-combines-multiple-collections-into-one-db
+  (let [db (bridge/materialize (fixture-store) ["users" "departments"])]
+    (is (contains? (:eavt db) :users/u1))
+    (is (contains? (:eavt db) :departments/d1))))
+
+;; -------------------------------------------------------------------- q / query
+
+(deftest equality-filter-single-var
+  (let [db (bridge/materialize (fixture-store) ["users"])
+        result (bridge/q db '{:find [?name] :where [[?u :role "admin"] [?u :name ?name]]}
+                          everything)]
+    (is (= #{["Alice"] ["Carol"]} result)
+        "only admins come back, by exact-value equality filter on :role")))
+
+(deftest multiple-find-vars
+  (let [db (bridge/materialize (fixture-store) ["users"])
+        result (bridge/q db '{:find [?u ?name] :where [[?u :role "admin"] [?u :name ?name]]}
+                          everything)]
+    (is (= #{[:users/u1 "Alice"] [:users/u3 "Carol"]} result)
+        "both the entity and the projected attribute come back when :find
+        lists more than one variable")))
+
+(deftest multi-valued-attribute-produces-one-row-per-value
+  (let [db (bridge/materialize (fixture-store) ["users"])
+        result (bridge/q db '{:find [?tag] :where [[?u :kotobase/key "u1"] [?u :tags ?tag]]}
+                          everything)]
+    (is (= #{["eng"] ["lead"]} result))))
+
+(deftest join-across-two-materialized-collections
+  (testing "a user's :dept-key value joins against the department entity's
+    :kotobase/key attribute -- a real cross-collection join, not a single
+    collection's [e a v] pattern"
+    (let [db (bridge/materialize (fixture-store) ["users" "departments"])
+          result (bridge/q db
+                            '{:find [?uname ?dname]
+                              :where [[?u :name ?uname]
+                                      [?u :dept-key ?dk]
+                                      [?d :kotobase/coll "departments"]
+                                      [?d :kotobase/key ?dk]
+                                      [?d :name ?dname]]}
+                            everything)]
+      (is (= #{["Alice" "Engineering"] ["Bob" "Sales"] ["Carol" "Engineering"]}
+             result)
+          "Dave (no :dept-key) correctly drops out of the join -- an
+          unbound clause fails to match, it does not produce a nil row"))))
+
+(deftest join-with-aggregate-and-equality-filter-combined
+  (testing "join, then count grouped by department name -- exercises
+    arrangement.datalog's group-by aggregate through this bridge, not just
+    a bare join"
+    (let [db (bridge/materialize (fixture-store) ["users" "departments"])
+          result (bridge/q db
+                            '{:find [?dname (count ?u)]
+                              :where [[?u :dept-key ?dk]
+                                      [?d :kotobase/key ?dk]
+                                      [?d :name ?dname]]}
+                            everything)]
+      (is (= #{["Engineering" 2] ["Sales" 1]} result)))))
+
+(deftest query-convenience-fn-equals-materialize-then-q
+  (let [store (fixture-store)
+        via-query (bridge/query store ["users" "departments"]
+                                 '{:find [?uname ?dname]
+                                   :where [[?u :name ?uname]
+                                           [?u :dept-key ?dk]
+                                           [?d :kotobase/key ?dk]
+                                           [?d :name ?dname]]}
+                                 everything)
+        via-materialize-then-q (bridge/q (bridge/materialize store ["users" "departments"])
+                                          '{:find [?uname ?dname]
+                                            :where [[?u :name ?uname]
+                                                    [?u :dept-key ?dk]
+                                                    [?d :kotobase/key ?dk]
+                                                    [?d :name ?dname]]}
+                                          everything)]
+    (is (= via-materialize-then-q via-query)
+        "the one-shot convenience fn is exactly materialize+q, no extra behavior")))
+
+(deftest visible-filters-out-redacted-entities
+  (let [db (bridge/materialize (fixture-store) ["users"])
+        no-bob? (fn [{:keys [s]}] (not= s :users/u2))
+        result (bridge/q db '{:find [?name] :where [[?u :name ?name]]} no-bob?)]
+    (is (not (contains? result ["Bob"])))
+    (is (contains? result ["Alice"]))))
+
+(deftest visible-is-required-not-defaulted
+  (is (thrown? #?(:clj clojure.lang.ArityException :cljs js/Error)
+               #_:clj-kondo/ignore ; deliberately wrong arity -- that's the point of this test
+               (bridge/q (bridge/materialize (fixture-store) ["users"])
+                         '{:find [?name] :where [[?u :name ?name]]}))
+      "q refuses to run with no stated visibility decision, same discipline
+      as arrangement.datalog/q and the retired kqe (ADR-2607050500)"))
+
+(deftest in-clause-inputs-are-threaded-through
+  (let [db (bridge/materialize (fixture-store) ["users"])
+        result (bridge/q db '{:find [?name] :in [?role] :where [[?u :role ?role] [?u :name ?name]]}
+                          everything ["admin"])]
+    (is (= #{["Alice"] ["Carol"]} result))))
+
+;; --- access paths (ADR-2608039970) ------------------------------------------
+;; The supported contract for a surface whose algebra is not Datalog. These
+;; are `arrangement.core`'s four covering indexes with `visible?` on them --
+;; the tests that matter are the ones about `visible?`, since that is the only
+;; thing the raw index reads above do not have.
+
+(deftest entity-id-is-the-materialize-convention
+  (testing "public so a surface addressing a known document does not re-derive
+            the keyword shape and drift from materialize"
+    (let [db (bridge/materialize (fixture-store) ["users"])]
+      (is (= :users/u1 (bridge/entity-id "users" "u1")))
+      (is (contains? (:eavt db) (bridge/entity-id "users" "u1"))))))
+
+(deftest access-paths-see-everything-under-a-permissive-predicate
+  (let [db (bridge/materialize (fixture-store) ["users" "departments"])]
+    (is (= {:name #{"Alice"} :role #{"admin"} :dept-key #{"d1"}
+            :tags #{"eng" "lead"}
+            :kotobase/coll #{"users"} :kotobase/key #{"u1"}}
+           (bridge/entity-attrs db :users/u1 everything))
+        "spo / EAVT")
+    (is (= {:users/u1 #{"admin"} :users/u2 #{"user"}
+            :users/u3 #{"admin"} :users/u4 #{"user"}}
+           (bridge/by-predicate db :role everything))
+        "pso / AEVT")
+    (is (= #{:users/u1 :users/u3}
+           (bridge/by-predicate-value db :role "admin" everything))
+        "pos / AVET")))
+
+(deftest by-predicate-value-is-the-foreign-key-reverse-lookup
+  (testing "who points at department d1 -- the join the worked example does by
+            hand, as one point lookup"
+    (let [db (bridge/materialize (fixture-store) ["users" "departments"])]
+      (is (= #{:users/u1 :users/u3}
+             (bridge/by-predicate-value db :dept-key "d1" everything))))))
+
+(deftest refs-to-is-empty-because-documents-hold-values-not-links
+  (testing "not a bug and not a stub: :vaet covers only objects satisfying
+            materialize's ref? (ipld.core/link?), and a document's foreign key
+            is a plain value. Asserted so the docstring cannot quietly stop
+            being true"
+    (let [db (bridge/materialize (fixture-store) ["users" "departments"])]
+      (is (= {} (bridge/refs-to db "d1" everything)))
+      (is (= {} (:vaet db))))))
+
+(deftest access-paths-apply-visible
+  (let [db (bridge/materialize (fixture-store) ["users"])
+        no-bob? (fn [{:keys [s]}] (not= s :users/u2))]
+    (is (= #{:users/u1 :users/u3} (bridge/by-predicate-value db :role "admin" no-bob?))
+        "unaffected: Bob is not an admin")
+    (is (nil? (get (bridge/by-predicate db :role no-bob?) :users/u2))
+        "Bob's :role datom is not readable through pso either")
+    (is (= {} (bridge/entity-attrs db :users/u2 no-bob?))
+        "and the whole entity is gone from spo")))
+
+(deftest an-attribute-hidden-in-full-is-dropped-not-emptied
+  (testing "an empty set under a key would answer 'this attribute exists, but
+            you may see none of its values' -- more than the caller is allowed
+            to know, and the reason these fns prune"
+    (let [db (bridge/materialize (fixture-store) ["users"])
+          no-roles? (fn [{:keys [p]}] (not= p :role))
+          attrs (bridge/entity-attrs db :users/u1 no-roles?)]
+      (is (not (contains? attrs :role)) "dropped, not present-with-an-empty-set")
+      (is (= #{"Alice"} (:name attrs)) "the rest of the entity is unaffected"))))
+
+(deftest visible-is-required-on-every-access-path
+  (testing "same discipline as q (ADR-2607050500): there is no permissive
+            default to fall back on, on any of the four.
+
+            `refs-to` is why this is an explicit check rather than a reliance
+            on the predicate being called: `:vaet` is empty, so nothing was
+            ever filtered, and the two-argument call answered `{}` with no
+            visibility decision at all. On the JVM the wrong arity is refused
+            before the body runs; under nbb/SCI it is not, so the check has to
+            be in the body -- hence the broad exception type here"
+    (let [db (bridge/materialize (fixture-store) ["users"])]
+      #_:clj-kondo/ignore ; deliberately wrong arity -- that's the point
+      (is (thrown? #?(:clj Exception :cljs js/Error) (bridge/entity-attrs db :users/u1)))
+      #_:clj-kondo/ignore
+      (is (thrown? #?(:clj Exception :cljs js/Error) (bridge/by-predicate db :role)))
+      #_:clj-kondo/ignore
+      (is (thrown? #?(:clj Exception :cljs js/Error) (bridge/by-predicate-value db :role "admin")))
+      #_:clj-kondo/ignore
+      (is (thrown? #?(:clj Exception :cljs js/Error) (bridge/refs-to db "d1"))))))
+
+(deftest datoms-is-the-whole-plane-under-visible
+  (let [db (bridge/materialize (fixture-store) ["users" "departments"])
+        all (bridge/datoms db everything)]
+    (is (= (reduce + (for [[_ pm] (:eavt db) [_ os] pm] (count os)))
+           (count all))
+        "every triple in the db, once")
+    (is (every? (fn [d] (= #{:s :p :o} (set (keys d)))) all))
+    (is (contains? (set all) {:s :users/u1 :p :name :o "Alice"}))))
+
+(deftest datoms-applies-visible-and-is-lazy
+  (let [db (bridge/materialize (fixture-store) ["users"])
+        no-bob? (fn [{:keys [s]}] (not= s :users/u2))
+        seen (bridge/datoms db no-bob?)]
+    (is (not-any? (fn [{:keys [s]}] (= s :users/u2)) seen)
+        "the predicate is applied to the scan, not left to the caller")
+    (is (seq? seen)
+        "lazy: the caller is reshaping every triple, so forcing a vector here
+         would hold the whole plane twice"))
+  (testing "and it refuses a missing predicate up front, like the other paths"
+    #_:clj-kondo/ignore ; deliberately wrong arity -- that's the point
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (bridge/datoms (bridge/materialize (fixture-store) ["users"]))))))
+
+(deftest datoms-agrees-with-the-fully-unbound-datalog-query
+  (testing "the scan a surface with its own engine starts from must say the
+            same thing as the Datalog frontend's unbound scan -- ADR-2608039970"
+    (let [db (bridge/materialize (fixture-store) ["users"])]
+      (is (= (into #{} (map (fn [{:keys [s p o]}] [s p o])) (bridge/datoms db everything))
+             (bridge/q db '{:find [?s ?p ?o] :where [[?s ?p ?o]]} everything))))))
+
+(deftest access-paths-agree-with-the-datalog-frontend
+  (testing "the two are peers over one plane, so they must not disagree about
+            what the plane says -- ADR-2608039970"
+    (let [db (bridge/materialize (fixture-store) ["users"])]
+      (is (= (bridge/by-predicate-value db :role "admin" everything)
+             (into #{} (map first)
+                   (bridge/q db '{:find [?u] :where [[?u :role "admin"]]} everything)))))))
+
+;; --- content-addressed memo (ADR-2607310900) -------------------------------
+
+(defn- seeded [n]
+  (let [s (local/local-store)]
+    (dotimes [i n] (st/-put s "users" (str "u" i) {:name (str "n" i)}))
+    s))
+
+(deftest memo-returns-the-same-db-for-the-same-version
+  (let [m (bridge/memo) s (seeded 5)
+        a (bridge/materialize-memo m s ["users"] "cid-A")
+        b (bridge/materialize-memo m s ["users"] "cid-A")]
+    (is (identical? a b) "second call is the memoised value, not an equal rebuild")
+    (is (= {:size 1 :hits 1 :misses 1} (select-keys (bridge/memo-stats m) [:size :hits :misses])))))
+
+(deftest a-different-version-is-a-different-key-not-a-dirty-entry
+  (testing "this is the whole reason the key is a content address: a changed
+            graph does not invalidate anything, it simply misses"
+    (let [m (bridge/memo) s (seeded 3)
+          a (bridge/materialize-memo m s ["users"] "cid-A")]
+      (st/-put s "users" "u9" {:name "new"})
+      (let [b (bridge/materialize-memo m s ["users"] "cid-B")]
+        (is (not (identical? a b)))
+        (is (= 4 (count (:eavt b))) "the new version sees the write")
+        (is (= 3 (count (:eavt a))) "and the old value is still the old snapshot")))))
+
+(deftest coll-keys-are-part-of-the-key-and-order-insensitive
+  (let [m (bridge/memo) s (seeded 2)]
+    (bridge/materialize-memo m s ["users"] "v1")
+    (bridge/materialize-memo m s ["users" "other"] "v1")
+    (is (= 2 (:size (bridge/memo-stats m))) "different collection sets are different entries")
+    (let [a (bridge/materialize-memo m s ["users" "other"] "v1")
+          b (bridge/materialize-memo m s ["other" "users"] "v1")]
+      (is (identical? a b) "asking for the same collections in another order is the same question"))))
+
+(deftest a-nil-version-is-refused-rather-than-cached-forever
+  (testing "defaulting the version would turn this into a cache that never
+            invalidates, which is not a cache but a bug returning stale data"
+    (is (thrown? #?(:clj AssertionError :cljs js/Error)
+                 (bridge/materialize-memo (bridge/memo) (seeded 1) ["users"] nil)))))
+
+(deftest the-memo-is-bounded
+  (let [m (bridge/memo 2) s (seeded 1)]
+    (doseq [v ["v1" "v2" "v3"]] (bridge/materialize-memo m s ["users"] v))
+    (is (= 2 (:size (bridge/memo-stats m))) "capacity is enforced, not aspirational")
+    (bridge/materialize-memo m s ["users"] "v1")
+    (is (= 4 (:misses (bridge/memo-stats m)))
+        "three inserts plus the re-fetch of the evicted v1")))
+
+(deftest materialize-must-never-take-visible
+  (testing "the memo is sound ONLY because materialize is visible?-free — one
+            db is correct for every caller. If this arity ever grows a
+            predicate argument, sharing a db across principals stops being safe
+            and this namespace has to be reconsidered, not patched"
+    ;; This used to assert `max arity = 2`, which made the INVARIANT and the
+    ;; ARGUMENT COUNT the same statement. They are not: the 3-arity added in
+    ;; 2026-08 is `max-datoms`, a ceiling, and a ceiling is the same value for
+    ;; every principal — it cannot make one caller's db wrong for another, which
+    ;; is the only thing this test is protecting. So the arglists are pinned by
+    ;; NAME instead. Any new parameter, including a predicate, still trips it;
+    ;; the difference is that the failure now says which one appeared.
+    (is (= '[[store coll-keys] [store coll-keys max-datoms]]
+           (:arglists (meta #'bridge/materialize))))
+    (is (not-any? #(re-find #"visible|pred|filter|see|auth" (name %))
+                  (mapcat identity (:arglists (meta #'bridge/materialize))))
+        "and nothing shaped like a visibility decision has appeared among them")))
+
+(deftest db-for-needs-both-halves-or-it-builds-fresh
+  (testing "a memo with no version has nothing to key on, and a version with no
+            memo has nowhere to put the result — neither half alone may silently
+            behave as if memoised"
+    (let [m (bridge/memo) s (seeded 2)]
+      (bridge/db-for {} s ["users"])
+      (bridge/db-for {:query-memo m} s ["users"])
+      (bridge/db-for {:query-version "v1"} s ["users"])
+      (is (= 0 (:size (bridge/memo-stats m))) "nothing was memoised")
+      (let [a (bridge/db-for {:query-memo m :query-version "v1"} s ["users"])
+            b (bridge/db-for {:query-memo m :query-version "v1"} s ["users"])]
+        (is (identical? a b))
+        (is (= 1 (:hits (bridge/memo-stats m))))))))
+
+;; --- string document keys ---------------------------------------------------
+;; Found in production 2026-07-31: every SPARQL query against kotobase.net
+;; returned "internal error: Doesn't support namespace: v2", whatever the query
+;; said, while /health answered 200 throughout. The cause was here — documents
+;; parsed out of JSON bodies (kotobase.protocols.atproto stores the record
+;; verbatim) have STRING keys, and this bridge passed them through as datom
+;; attributes. SPARQL's kw->iri-string calls `namespace`, which throws on a
+;; string in ClojureScript; Cypher's :text never matched "text" and returned
+;; empty. Every test in this repo used keyword keys, so nothing saw it.
+
+(deftest string-doc-keys-become-keyword-attributes
+  (let [s (local/local-store)]
+    (st/-put s "c" "k" {"text" "hello" "v2" 1})
+    (let [db (bridge/materialize s ["c"])
+          attrs (into #{} (for [[_ pm] (:eavt db) [p _] pm] p))]
+      (is (contains? attrs :text))
+      (is (contains? attrs :v2))
+      (is (every? keyword? attrs)
+          "a datom attribute must have one type, whatever the document used"))))
+
+(deftest string-and-keyword-keys-materialize-alike
+  (let [a (local/local-store) b (local/local-store)]
+    (st/-put a "c" "k" {"name" "Alice" "role" "admin"})
+    (st/-put b "c" "k" {:name "Alice" :role "admin"})
+    (is (= (:eavt (bridge/materialize a ["c"]))
+           (:eavt (bridge/materialize b ["c"]))))))
+
+(deftest a-string-keyed-doc-is-queryable
+  (let [s (local/local-store)]
+    (st/-put s "users" "u1" {"name" "Alice" "role" "admin"})
+    (st/-put s "users" "u2" {"name" "Bob" "role" "user"})
+    (is (= #{["Alice"]}
+           (bridge/q (bridge/materialize s ["users"])
+                     '{:find [?n] :where [[?e :role "admin"] [?e :name ?n]]}
+                     (constantly true))))))
+
+(deftest a-slashed-string-key-round-trips
+  ;; (keyword "a/b") splits on the slash; the IRI and Cypher forms both render
+  ;; it back as a/b, so the split is not a loss.
+  (let [s (local/local-store)]
+    (st/-put s "c" "k" {"a/b" 1})
+    (let [attrs (into #{} (for [[_ pm] (:eavt (bridge/materialize s ["c"])) [p _] pm] p))]
+      (is (contains? attrs :a/b))
+      (is (= "a" (namespace :a/b)))
+      (is (= "b" (name :a/b))))))
+
+;; ---------------------------------------------------- the materialize ceiling
+
+(defn- big-store
+  "`n` documents of three attributes each -- so roughly 5n datoms once
+  `:kotobase/coll` and `:kotobase/key` are added."
+  [n]
+  (let [s (local/local-store)]
+    (doseq [i (range n)]
+      (st/-put s "wide" (str "k" i) {:a (str "a" i) :b (str "b" i) :c (str "c" i)}))
+    s))
+
+(deftest materialize-refuses-above-its-ceiling
+  (testing "the scan that follows the database instead of the answer is bounded"
+    (let [s (big-store 200)
+          e (try (bridge/materialize s ["wide"] 100) nil
+                 (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) e e))]
+      (is (some? e) "200 documents is ~1000 datoms and the ceiling was 100")
+      (is (= :materialize-over-budget (:kotobase.query/error (ex-data e))))
+      (is (= "wide" (:collection (ex-data e))) "and it names the collection it stopped in")
+      (is (= 100 (:max-datoms (ex-data e)))))))
+
+(deftest materialize-aborts-the-scan-rather-than-checking-a-finished-db
+  (testing "a check applied afterwards would have paid for the whole scan"
+    (let [reads (atom 0)
+          s (big-store 400)
+          counting (reify st/IStore
+                     (-put [_ c k v] (st/-put s c k v))
+                     (-get [_ c k] (swap! reads inc) (st/-get s c k))
+                     (-list [_ c] (st/-list s c))
+                     (-append [_ st ev] (st/-append s st ev))
+                     (-read [_ st since] (st/-read s st since)))]
+      (try (bridge/materialize counting ["wide"] 100) (catch #?(:clj Exception :cljs :default) _ nil))
+      (is (< @reads 400)
+          (str "stopped early: " @reads " of 400 documents read"))
+      (is (pos? @reads) "and it did start, so this is not measuring a no-op"))))
+
+(deftest under-the-ceiling-nothing-changes
+  (testing "the half a ceiling usually breaks"
+    (let [db (bridge/materialize (fixture-store) ["users" "departments"])]
+      (is (seq (arr/by-predicate db :name)))
+      (is (= (bridge/materialize (fixture-store) ["users" "departments"] 10000)
+             db)
+          "and an explicit ceiling above the data gives the same db as the default"))))
+
+(deftest the-default-ceiling-is-a-number-in-the-source
+  (is (= 200000 bridge/default-max-datoms)
+      "changing it is an edit somebody reviews, not an environment variable"))

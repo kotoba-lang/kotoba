@@ -1,0 +1,231 @@
+#!/usr/bin/env kbb
+;; bench/caches_and_writes.cljk — Co-Scientist iteration 05. The three seeds
+;; iteration 04 left.
+;;
+;;   D  Hold the pack OPENS as well as the catalog. Iteration 04 predicted this
+;;      makes packed cost `N` and beat per-object's `2N` on every workload, and
+;;      called that "a large claim, so it needs the measurement and not the
+;;      arithmetic". The arithmetic is also UNFAIR, and section D is mostly about
+;;      that: per-object's `2N` is discover + fetch, and DISCOVERY IS CACHEABLE
+;;      TOO. Warming one arm and not the other measures the harness.
+;;   E  A real width-1 dependency chain instead of a list of CIDs known upfront.
+;;      The commit chain is one: commit N's block names commit N-1, and you
+;;      cannot ask for N-1 until you have decoded N.
+;;   F  The write side, which nothing has measured at all.
+;;
+;; Round trips, never wall clock.
+;;
+;; Run:
+;;   SECTION=d|e|f kbb --backend sci --classpath "$(cat bin/classpath.txt)" bench/caches_and_writes.cljk
+
+(ns caches-and-writes
+  (:require [arrangement.core :as arr]
+            [ayatori.pack :as pack]
+            [ayatori.remote :as remote]
+            [ipld.car.bytes :as b]
+            [ipld.car.v2 :as car2]
+            [ipld.core :as ipld]
+            [kotoba.lang.text :as str]))
+
+(defn- blind [x] (pr-str x))
+(defn- crypto [bytes] bytes)
+(defn- blind-async [x] (js/Promise.resolve (pr-str x)))
+(defn- crypto-async [bytes] (js/Promise.resolve bytes))
+
+(defn- quads [from to]
+  (vec (mapcat (fn [i]
+                 [{:s (str "s" i) :p "kind" :o (if (< i 3) "rare" "common")}
+                  {:s (str "s" i) :p "name" :o (str "Subject " i)}])
+               (range from to))))
+
+(defn- history [n-commits per]
+  (let [blocks (atom {})
+        writes (atom [])
+        put! (fn [cid by]
+               (swap! blocks assoc cid by)
+               (swap! writes conj {:cid cid :bytes (b/bcount by)})
+               (js/Promise.resolve cid))]
+    (letfn [(step [i prev db groups]
+              (if (= i n-commits)
+                (js/Promise.resolve {:head prev :blocks blocks :groups groups
+                                     :writes writes :commits n-commits})
+                (let [before (set (keys @blocks))
+                      db' (reduce arr/assert-quad db (quads (* i per) (* (inc i) per)))]
+                  (-> (arr/commit! put! db' prev arr/current-schema-version
+                                   blind-async crypto-async)
+                      (.then (fn [cid]
+                               (step (inc i) cid db' (conj groups (vec (remove before (keys @blocks))))))))))
+              )]
+      (step 0 nil (arr/empty-db) []))))
+
+(def ^:private query
+  '{:find [?s ?name] :where [[?s "kind" "rare"] [?s "name" ?name]]})
+
+(defn- archives-of [{:keys [head blocks groups]}]
+  {:archives (mapv (fn [g] (:bytes (car2/pack {:roots [head]
+                                               :blocks (mapv (fn [c] {:cid c :bytes (get @blocks c)}) g)})))
+                   groups)
+   :catalog (into {} (mapcat (fn [i g] (map (fn [c] [c i]) g)) (range) groups))})
+
+;; ── D: both caches held, and BOTH arms warmed ───────────────────────────────
+
+(defn- packed-runner
+  "A block source whose catalog AND opened packs live in caches passed IN, so a
+   caller decides what survives between queries."
+  [{:keys [archives catalog]} cat-cache open-cache ctr]
+  (let [{:keys [reads catalog-reads]} ctr]
+    (fn [cid]
+      (when-let [i (get catalog cid)]
+        (when-not (contains? @cat-cache i)
+          (swap! catalog-reads inc) (swap! cat-cache conj i))
+        (let [op (or (get @open-cache i)
+                     (let [archive (nth archives i)
+                           o (pack/open-pack
+                              {:range-fn (fn [{:keys [range]}]
+                                           (swap! reads inc)
+                                           (let [[_ from to] (re-matches #"bytes=(\d+)-(\d*)" range)
+                                                 start (js/parseInt from 10)
+                                                 total (b/bcount archive)
+                                                 end (if (seq to) (min total (inc (js/parseInt to 10))) total)]
+                                             (b/slice archive start (min end total))))
+                               :profile {:blocks :packed-blocks :object #{:range-read}}})]
+                       (swap! open-cache assoc i o) o))]
+          (pack/read-block op cid))))))
+
+(defn- run [{:keys [head blocks]} src provider-cache disc fetches]
+  (let [opened (remote/open-snapshot
+                {:snapshot-cid head
+                 :discover-fn (fn [cid]
+                                ;; The per-object arm's cacheable half. A
+                                ;; provider record for an immutable CID does not
+                                ;; go stale, so a deployment can hold it exactly
+                                ;; as it can hold a pack catalog.
+                                (when-not (contains? @provider-cache cid)
+                                  (swap! disc inc) (swap! provider-cache conj cid))
+                                {:ok? true :cid cid :mutates-cid? false
+                                 :providers [{:plane :discovery :cid cid :peer "p"
+                                              :addrs [] :mutates-cid? false}]})
+                 :fetch-fn (fn [_ cid] (when-not src (swap! fetches inc)) (get @blocks cid))
+                 :block-source src
+                 :blind-fn blind :decrypt-fn crypto})]
+    (count (remote/q opened query (constantly true)))))
+
+(defn- fmt [& xs] (str/join (map (fn [[w v]] (.padStart (str v) w)) (partition 2 xs))))
+
+(defn- section-d []
+  (println)
+  (println "D. every cache held, and BOTH arms warmed — three successive queries")
+  (println "   per-object caches provider records; packed caches catalog + opened packs")
+  (println)
+  (println (fmt 8 "query" 12 "| per-object" 8 "disc" 8 "fetch" 10 "| packed" 9 "catalog" 8 "reads" 10 "vs"))
+  (println (str/join (repeat 88 "-")))
+  (-> (history 4 200)
+      (.then (fn [h]
+               (let [ps (archives-of h)
+                     pcache (atom #{}) cat (atom #{}) opens (atom {})
+                     rows (atom [])]
+                 (doseq [i [1 2 3]]
+                   (let [d (atom 0) f (atom 0)
+                         r1 (run h nil pcache d f)
+                         ctr {:reads (atom 0) :catalog-reads (atom 0)}
+                         d2 (atom 0) f2 (atom 0)
+                         src (packed-runner ps cat opens ctr)
+                         r2 (run h src (atom #{}) d2 f2)]
+                     (when-not (= r1 r2 3)
+                       (println "REFUSING: arms disagree" r1 r2) (js/process.exit 2))
+                     (let [po (+ @d @f) pk (+ @(:reads ctr) @(:catalog-reads ctr))]
+                       (swap! rows conj [i @d @f po @(:catalog-reads ctr) @(:reads ctr) pk])
+                       (println (fmt 8 i 12 po 8 @d 8 @f
+                                     10 pk 9 @(:catalog-reads ctr) 8 @(:reads ctr)
+                                     10 (str (.toFixed (/ po (max 1 pk)) 2) "x"))))))
+                 (println)
+                 (println "   warm vs warm is the comparison iteration 04's arithmetic skipped.")))))
+  )
+
+;; ── E: a real width-1 dependency chain ──────────────────────────────────────
+
+(defn- section-e []
+  (println)
+  (println "E. walking the COMMIT chain — width 1, next CID unknown until this block decodes")
+  (println)
+  (println (fmt 9 "commits" 12 "| per-object" 10 "| packed" 9 "catalog" 8 "reads" 8 "opened" 10 "vs"))
+  (println (str/join (repeat 78 "-")))
+  (reduce
+   (fn [pr n]
+     (.then pr
+            (fn [_]
+              (-> (history n 50)
+                  (.then
+                   (fn [h]
+                     (let [ps (archives-of h)
+                           cat (atom #{}) opens (atom {})
+                           ctr {:reads (atom 0) :catalog-reads (atom 0)}
+                           src (packed-runner ps cat opens ctr)
+                           blocks @(:blocks h)
+                           ;; The chain: decode a commit block, read `prev`, repeat.
+                           ;; Nothing here can be batched, which is the point.
+                           walk (fn [get-block]
+                                  (loop [cid (:head h) seen 0]
+                                    (if (or (nil? cid) (> seen 200))
+                                      seen
+                                      (let [by (get-block cid)]
+                                        (if-not by
+                                          seen
+                                          (let [node (ipld/decode (js/Uint8Array. by))
+                                                prev (get node "prev")]
+                                            (recur (when (ipld/link? prev) (ipld/link-cid prev))
+                                                   (inc seen))))))))
+                           po-reads (atom 0)
+                           n-po (walk (fn [cid] (swap! po-reads inc) (get blocks cid)))
+                           n-pk (walk src)]
+                       (when-not (= n-po n-pk n)
+                         (println "REFUSING: the two walks did not visit the same"
+                                  n "commits:" n-po n-pk)
+                         (js/process.exit 2))
+                       (let [po (* 2 @po-reads)
+                             pk (+ @(:reads ctr) @(:catalog-reads ctr))]
+                         (println (fmt 9 n 12 po 10 pk 9 @(:catalog-reads ctr)
+                                       8 @(:reads ctr) 8 (count @opens)
+                                       10 (str (.toFixed (/ po (max 1 pk)) 2) "x"))))
+                       nil)))))))
+   (js/Promise.resolve nil)
+   [2 4 8 16]))
+
+;; ── F: the write side ───────────────────────────────────────────────────────
+
+(defn- section-f []
+  (println)
+  (println "F. the WRITE side — what sealing one pack per commit costs")
+  (println)
+  (println (fmt 9 "commits" 8 "blocks" 14 "| per-object" 10 "| packed" 12 "objects" 12 "bytes" 10 "overhead"))
+  (println (str/join (repeat 86 "-")))
+  (reduce
+   (fn [pr n]
+     (.then pr
+            (fn [_]
+              (-> (history n 50)
+                  (.then
+                   (fn [h]
+                     (let [{:keys [archives]} (archives-of h)
+                           nblocks (count @(:blocks h))
+                           raw-bytes (reduce + (map #(b/bcount %) (vals @(:blocks h))))
+                           pack-bytes (reduce + (map b/bcount archives))]
+                       ;; per-object: one PUT per block. packed: one PUT per pack.
+                       (println (fmt 9 n 8 nblocks
+                                     14 (str nblocks " puts")
+                                     10 (str (count archives) " puts")
+                                     12 (count archives)
+                                     12 pack-bytes
+                                     10 (str "+" (.toFixed (* 100 (- (/ pack-bytes raw-bytes) 1)) 1) "%")))
+                       nil)))))))
+   (js/Promise.resolve nil)
+   [1 2 4 8 16]))
+
+(def ^:private only (aget (.-env js/process) "SECTION"))
+(println)
+(println "ayatori Co-Scientist 05 — held caches, a real chain, and the write side.")
+(-> (case only
+      "d" (section-d) "e" (section-e) "f" (section-f)
+      (-> (section-d) (.then section-e) (.then section-f)))
+    (.then (fn [_] (println)))
+    (.catch (fn [e] (println "FAILED:" (.-message e)) (js/process.exit 2))))

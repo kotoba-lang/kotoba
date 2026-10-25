@@ -1,0 +1,183 @@
+(ns kotoba.lang.witness-quorum.quorum-test
+  (:require [kotoba.lang.error :as kerror] [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.witness-quorum.attestation :as attestation]
+            [kotoba.lang.witness-quorum.quorum :as quorum]
+            [kotoba.lang.witness-quorum.selector :as selector]
+            [kotoba.lang.witness-quorum.signer :as signer]
+            [ed25519.core :as ed])
+  (:import [java.security SecureRandom]
+           [java.util.concurrent LinkedBlockingQueue TimeUnit]))
+
+(defn- witnesses [n]
+  (vec (for [i (range n)] (selector/fleet-cell (str "node-" i) "CellA"))))
+
+(defn- attest [cell verdict attested-at]
+  {:cell-node (:node cell) :cell-id (:cell-id cell) :verdict verdict :attested-at attested-at})
+
+;; --- signature verification (witnesses WITH a declared :public-key) ---
+
+(defn- rand-seed ^bytes []
+  (let [b (byte-array 32)]
+    (.nextBytes (SecureRandom.) b)
+    b))
+
+(defn- keyed-witnesses [n]
+  (let [seeds (vec (repeatedly n rand-seed))]
+    {:seeds seeds
+     :witnesses (vec (for [i (range n)]
+                       (selector/fleet-cell (str "node-" i) "CellA"
+                                            (signer/ed25519-public-key-bytes (seeds i)))))}))
+
+(defn- signed-attest [cell seed verdict attested-at]
+  (let [canon (attestation/canonical-attestation-bytes
+               {:record-cid "cid-1" :cell-id (:cell-id cell) :verdict verdict
+                :reason "" :membrane-version "lex:1/rego:1/cell:abc" :attested-at attested-at})]
+    {:cell-node (:node cell) :cell-id (:cell-id cell) :verdict verdict :attested-at attested-at
+     :record-cid "cid-1" :reason nil :membrane-version "lex:1/rego:1/cell:abc"
+     :signature (ed/sign seed canon)}))
+
+(defn- forged-attest [cell verdict attested-at]
+  {:cell-node (:node cell) :cell-id (:cell-id cell) :verdict verdict :attested-at attested-at
+   :record-cid "cid-1" :reason nil :membrane-version "lex:1/rego:1/cell:abc"
+   :signature (byte-array 64 (byte 0))})
+
+(deftest quorum-state-verifies-signatures-when-public-key-is-known
+  (let [{:keys [seeds witnesses]} (keyed-witnesses 5)]
+    (testing "genuinely signed attestations reach quorum"
+      (let [atts [(signed-attest (witnesses 0) (seeds 0) :accept "t1")
+                  (signed-attest (witnesses 1) (seeds 1) :accept "t2")
+                  (signed-attest (witnesses 2) (seeds 2) :accept "t3")]]
+        (is (= :witnessed (:kind (quorum/quorum-state witnesses atts))))))
+    (testing "forged signatures against a KNOWN public key never count toward quorum"
+      (let [atts [(forged-attest (witnesses 0) :accept "t1")
+                  (forged-attest (witnesses 1) :accept "t2")
+                  (forged-attest (witnesses 2) :accept "t3")]]
+        (is (= :pending (:kind (quorum/quorum-state witnesses atts))))))
+    (testing "a missing :signature against a known public key is also rejected"
+      (let [atts [(dissoc (signed-attest (witnesses 0) (seeds 0) :accept "t1") :signature)
+                  (signed-attest (witnesses 1) (seeds 1) :accept "t2")
+                  (signed-attest (witnesses 2) (seeds 2) :accept "t3")]]
+        (is (= :pending (:kind (quorum/quorum-state witnesses atts))))))))
+
+(deftest quorum-state-skips-verification-for-a-witness-with-no-known-public-key
+  ;; Documented, deliberate: a library with no cell-key-registry of its own
+  ;; can't verify what it has no key material for. Preserves existing
+  ;; deterministic-test-signer / no-PKI-registry deployment behavior.
+  (let [w (witnesses 5)
+        atts [(forged-attest (w 0) :accept "t1")
+              (forged-attest (w 1) :accept "t2")
+              (forged-attest (w 2) :accept "t3")]]
+    (is (= :witnessed (:kind (quorum/quorum-state w atts))))))
+
+(deftest quorum-state-accept-test
+  (let [w (witnesses 5)
+        atts [(attest (w 0) :accept "t1") (attest (w 1) :accept "t2") (attest (w 2) :accept "t3")]]
+    (testing "reaches :witnessed once 3 accepts land (default threshold)"
+      (is (= :witnessed (:kind (quorum/quorum-state w atts)))))))
+
+(deftest quorum-state-reject-test
+  (let [w (witnesses 5)
+        atts [(attest (w 0) :reject "t1") (attest (w 1) :reject "t2") (attest (w 2) :reject "t3")]]
+    (is (= :rejected (:kind (quorum/quorum-state w atts))))))
+
+(deftest quorum-state-pending-test
+  (let [w (witnesses 5)
+        atts [(attest (w 0) :accept "t1")]]
+    (testing "not enough attestations yet, and witnesses haven't all responded"
+      (let [state (quorum/quorum-state w atts)]
+        (is (= :pending (:kind state)))
+        (is (= 4 (:remaining state)))))))
+
+(deftest quorum-state-escalate-council-test
+  (let [w (witnesses 5)
+        ;; all 5 respond, but no verdict reaches the threshold of 3 (2 accept / 2 reject / 1 escalate)
+        atts [(attest (w 0) :accept "t1") (attest (w 1) :accept "t2")
+              (attest (w 2) :reject "t3") (attest (w 3) :reject "t4")
+              (attest (w 4) :escalate "t5")]]
+    (is (= {:kind :escalated :reason :no-threshold}
+           (select-keys (quorum/quorum-state w atts) [:kind :reason])))))
+
+(deftest quorum-state-escalate-policy-reject-test
+  (testing "escalation-policy :reject falls back to :rejected on a genuine non-majority split (no escalate votes)"
+    (let [w (witnesses 4)
+          atts [(attest (w 0) :accept "t1") (attest (w 1) :accept "t2")
+                (attest (w 2) :reject "t3") (attest (w 3) :reject "t4")]
+          state (quorum/quorum-state w atts {:quorum-size 4 :quorum-threshold 3 :escalation-policy :reject})]
+      (is (= :rejected (:kind state)))))
+
+  (testing "any :escalate vote forces escalation regardless of :escalation-policy"
+    (let [w (witnesses 3)
+          atts [(attest (w 0) :accept "t1") (attest (w 1) :reject "t2") (attest (w 2) :escalate "t3")]
+          state (quorum/quorum-state w atts {:quorum-size 3 :quorum-threshold 2 :escalation-policy :reject})]
+      (is (= :escalated (:kind state))))))
+
+(deftest abstainers-are-separated-from-the-minority
+  (testing "ADR-2608055000 G1. Until 2026-08-05 a decided round returned
+            :minority (into rejects escalates), so a witness whose only act was
+            reporting 'I cannot decide this' was indistinguishable downstream
+            from one that asserted the losing verdict -- and slashing.clj
+            confiscated bond from both."
+    (let [w (witnesses 5)
+          atts [(attest (w 0) :accept "t1") (attest (w 1) :accept "t2")
+                (attest (w 2) :accept "t3")
+                (attest (w 3) :reject "t4") (attest (w 4) :escalate "t5")]
+          state (quorum/quorum-state w atts)
+          keys-of (fn [k] (set (map :cell-node (get state k))))]
+      (is (= :witnessed (:kind state)) "threshold=3 accepts reached")
+      (is (= #{"node-3"} (keys-of :minority)) "only the actual dissenter")
+      (is (= #{"node-4"} (keys-of :abstained)) "the abstainer is its own list")
+      (is (not (contains? (keys-of :minority) "node-4"))
+          "the regression: the abstainer must never appear in :minority"))))
+
+(deftest abstainers-are-separated-under-escalation-policy-reject
+  (testing "the same split exists on the :reject fallback path, which had the
+            identical (into accepts escalates) bug"
+    (let [w (witnesses 4)
+          atts [(attest (w 0) :accept "t1") (attest (w 1) :accept "t2")
+                (attest (w 2) :reject "t3") (attest (w 3) :reject "t4")]
+          state (quorum/quorum-state w atts {:quorum-size 4 :quorum-threshold 3
+                                             :escalation-policy :reject})]
+      (is (= :rejected (:kind state)))
+      (is (= 2 (count (:minority state))) "both accepts dissented")
+      (is (= [] (:abstained state)) "nobody abstained in this split"))))
+
+(deftest quorum-state-dedup-latest-wins-test
+  (let [w (witnesses 5)
+        atts [(attest (w 0) :reject "t1") (attest (w 0) :accept "t2") ; same cell, later timestamp flips its verdict
+              (attest (w 1) :accept "t1") (attest (w 2) :accept "t1")]]
+    (is (= :witnessed (:kind (quorum/quorum-state w atts))))))
+
+(deftest quorum-state-ignores-non-witness-attestations-test
+  (let [w (witnesses 5)
+        impostor (selector/fleet-cell "not-a-witness" "CellA")
+        atts [(attest (w 0) :accept "t1") (attest (w 1) :accept "t2") (attest impostor :accept "t3")]]
+    (is (= :pending (:kind (quorum/quorum-state w atts))))))
+
+(deftest quorum-state-validates-inputs-test
+  (testing "throws when threshold exceeds size"
+    (is (thrown? kerror/ExceptionInfo
+                 (quorum/quorum-state (witnesses 3) [] {:quorum-size 3 :quorum-threshold 4}))))
+  (testing "throws when witness count doesn't match quorum-size"
+    (is (thrown? kerror/ExceptionInfo
+                 (quorum/quorum-state (witnesses 3) [] {:quorum-size 5})))))
+
+;; --- collect-quorum, against a real LinkedBlockingQueue-backed poll-fn ---
+
+(defn- queue-poll-fn [^LinkedBlockingQueue q]
+  (fn [remaining-ms]
+    (let [item (.poll q (long (max 0 remaining-ms)) TimeUnit/MILLISECONDS)]
+      (if item {:status :value :value item} {:status :timeout}))))
+
+(deftest collect-quorum-reaches-witnessed-test
+  (let [w (witnesses 5)
+        q (LinkedBlockingQueue.)]
+    (doseq [i (range 3)] (.put q (attest (w i) :accept (str "t" i))))
+    (let [state (quorum/collect-quorum w (queue-poll-fn q) {:quorum-size 5 :quorum-threshold 3 :timeout-ms 2000})]
+      (is (= :witnessed (:kind state))))))
+
+(deftest collect-quorum-times-out-pending-test
+  (let [w (witnesses 5)
+        q (LinkedBlockingQueue.)]
+    (.put q (attest (w 0) :accept "t0"))
+    (let [state (quorum/collect-quorum w (queue-poll-fn q) {:quorum-size 5 :quorum-threshold 3 :timeout-ms 200})]
+      (is (= :pending (:kind state))))))

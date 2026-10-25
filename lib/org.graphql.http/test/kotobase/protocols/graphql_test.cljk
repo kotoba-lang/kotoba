@@ -1,0 +1,325 @@
+(ns kotobase.protocols.graphql-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [graphql.sdl :as sdl]
+            [graphql.validate :as validate]
+            [kotobase.local :as local]
+            [kotobase.protocols.graphql :as gql]
+            [kotobase.protocols.graphql.json :as json]
+            [kotobase.query.bridge :as bridge]
+            [kotobase.store :as st]))
+
+;; ------------------------------------------------------------ fixture schema
+;;
+;; Two kotobase.store collections ("users" / "departments") -- the same
+;; fixture data shape org-opencypher-cypher's test suite uses, so the two
+;; sibling query-protocol repos are easy to compare -- exposed through a
+;; SDL-defined GraphQL schema with three Query root fields and one
+;; cross-collection-JOIN field resolver (User.department).
+
+(def ^:private schema
+  (sdl/parse-schema
+   "type Query {
+      user(id: ID!): User
+      users: [User]
+      department(id: ID!): Department
+      broken: String
+    }
+
+    type User {
+      id: ID!
+      name: String
+      role: String
+      department: Department
+    }
+
+    type Department {
+      id: ID!
+      name: String
+      budget: Int
+    }"))
+
+(deftest fixture-schema-is-structurally-valid
+  (is (validate/valid? schema)
+      (str "fixture schema has structural problems: " (validate/problems schema))))
+
+;; ------------------------------------------------------------- resolvers
+
+(defn- users-resolver [_parent _args {:keys [store visible?]}]
+  (->> (bridge/query store ["users"]
+                     '{:find [?k ?name ?role]
+                       :where [[?u :kotobase/coll "users"]
+                               [?u :kotobase/key ?k]
+                               [?u :name ?name]
+                               [?u :role ?role]]}
+                     visible?)
+       (mapv (fn [[k name role]] {:id k :name name :role role}))
+       (sort-by :id)
+       vec))
+
+(defn- user-by-id-resolver [_parent args {:keys [store visible?]}]
+  (let [id (str (get args "id"))
+        rows (bridge/query store ["users"]
+                           '{:find [?name ?role]
+                             :in [?id]
+                             :where [[?u :kotobase/key ?id]
+                                     [?u :name ?name]
+                                     [?u :role ?role]]}
+                           visible? [id])]
+    (when-let [[name role] (first rows)]
+      {:id id :name name :role role})))
+
+(defn- department-by-id-resolver [_parent args {:keys [store visible?]}]
+  (let [id (str (get args "id"))
+        rows (bridge/query store ["departments"]
+                           '{:find [?name ?budget]
+                             :in [?id]
+                             :where [[?d :kotobase/key ?id]
+                                     [?d :name ?name]
+                                     [?d :budget ?budget]]}
+                           visible? [id])]
+    (when-let [[name budget] (first rows)]
+      {:id id :name name :budget budget})))
+
+(defn- user-department-resolver
+  "A real cross-collection JOIN through kotobase-query's bridge -- both
+  \"users\" and \"departments\" are materialized together and joined in a
+  single :where clause (?u :dept-key ?dk / ?d :kotobase/key ?dk), exactly
+  the join shape kotobase-query's own README worked example uses. Not a
+  stub: this exercises the bridge's actual arrangement.datalog join, not
+  two independent lookups glued together in application code."
+  [parent _args {:keys [store visible?]}]
+  (let [uid (:id parent)
+        rows (bridge/query store ["users" "departments"]
+                           '{:find [?dk ?dname ?dbudget]
+                             :in [?uid]
+                             :where [[?u :kotobase/key ?uid]
+                                     [?u :dept-key ?dk]
+                                     [?d :kotobase/key ?dk]
+                                     [?d :name ?dname]
+                                     [?d :budget ?dbudget]]}
+                           visible? [uid])]
+    (when-let [[dk dname dbudget] (first rows)]
+      {:id dk :name dname :budget dbudget})))
+
+(defn- broken-resolver
+  "Exists only to exercise the EXECUTION-error path (a resolver that
+  throws mid-request, as opposed to a request-level validation error) --
+  see `execution-error-produces-null-data-and-errors-not-a-crash` below."
+  [_parent _args _ctx]
+  (throw (ex-info "boom: broken resolver always fails" {})))
+
+(def ^:private resolvers
+  {["Query" "user"] user-by-id-resolver
+   ["Query" "users"] users-resolver
+   ["Query" "department"] department-by-id-resolver
+   ["Query" "broken"] broken-resolver
+   ["User" "department"] user-department-resolver})
+
+;; --------------------------------------------------------------- fixture data
+
+(def everything (constantly true))
+
+(defn- fixture-store
+  "users (Alice/admin/d1, Bob/user/d2, Carol/admin/d1, Dave/user/no-dept)
+  + departments (d1 Engineering 900000, d2 Sales 400000) -- same shape as
+  org-opencypher-cypher's fixture, deliberately, for cross-repo comparison."
+  []
+  (let [s (local/local-store)]
+    (st/-put s "users" "u1" {:name "Alice" :role "admin" :dept-key "d1"})
+    (st/-put s "users" "u2" {:name "Bob" :role "user" :dept-key "d2"})
+    (st/-put s "users" "u3" {:name "Carol" :role "admin" :dept-key "d1"})
+    (st/-put s "users" "u4" {:name "Dave" :role "user"}) ; no dept-key
+    (st/-put s "departments" "d1" {:name "Engineering" :budget 900000})
+    (st/-put s "departments" "d2" {:name "Sales" :budget 400000})
+    s))
+
+(defn- ctx
+  ([store] (ctx store everything))
+  ([store visible?]
+   {:store store :visible? visible? :schema schema :resolvers resolvers
+    :now "2026-07-17T00:00:00Z"}))
+
+(defn- post! [c query]
+  (gql/handle c {:method :post :path "/graphql" :body (json/encode {"query" query})}))
+
+(defn- body-of [res] (json/parse (:body res)))
+
+;; ---------------------------------------------------------- simple field
+
+(deftest end-to-end-simple-field-list
+  (let [c (ctx (fixture-store))
+        body (body-of (post! c "{ users { id name role } }"))]
+    (is (= 200 (:status (post! c "{ users { id name role } }"))))
+    (is (nil? (get body "errors")))
+    (is (= [{"id" "u1" "name" "Alice" "role" "admin"}
+            {"id" "u2" "name" "Bob" "role" "user"}
+            {"id" "u3" "name" "Carol" "role" "admin"}
+            {"id" "u4" "name" "Dave" "role" "user"}]
+           (get-in body ["data" "users"])))))
+
+(deftest end-to-end-simple-field-with-arg
+  (let [c (ctx (fixture-store))
+        body (body-of (post! c "{ user(id: \"u1\") { name role } }"))]
+    (is (= {"name" "Alice" "role" "admin"} (get-in body ["data" "user"])))))
+
+(deftest end-to-end-field-with-arg-not-found-is-null
+  (let [c (ctx (fixture-store))
+        body (body-of (post! c "{ user(id: \"nope\") { name } }"))]
+    (is (nil? (get body "errors")))
+    (is (nil? (get-in body ["data" "user"])))))
+
+;; ------------------------------------------------------------- cross-join
+
+(deftest end-to-end-cross-collection-join
+  (testing "User.department resolver joins users.dept-key against
+    departments.:kotobase/key through kotobase-query's bridge in ONE
+    query -- a real cross-collection join, not two glued-together lookups"
+    (let [c (ctx (fixture-store))
+          body (body-of (post! c "{ user(id: \"u1\") { name department { name budget } } }"))]
+      (is (= {"name" "Alice"
+              "department" {"name" "Engineering" "budget" 900000}}
+             (get-in body ["data" "user"]))))))
+
+(deftest end-to-end-cross-collection-join-no-department-is-null
+  (let [c (ctx (fixture-store))
+        body (body-of (post! c "{ user(id: \"u4\") { name department { name } } }"))]
+    (is (= {"name" "Dave" "department" nil} (get-in body ["data" "user"])))))
+
+(deftest end-to-end-cross-collection-join-multiple-users-share-department
+  (let [c (ctx (fixture-store))
+        alice (get-in (body-of (post! c "{ user(id: \"u1\") { department { id } } }"))
+                      ["data" "user" "department" "id"])
+        carol (get-in (body-of (post! c "{ user(id: \"u3\") { department { id } } }"))
+                      ["data" "user" "department" "id"])]
+      (is (= "d1" alice carol))))
+
+;; -------------------------------------------------------------- redaction
+
+(deftest visible-redacts-a-user-entity
+  (let [store (fixture-store)
+        no-bob? (fn [{:keys [s]}] (not= s :users/u2))
+        c (ctx store no-bob?)
+        body (body-of (post! c "{ users { id name } }"))]
+    (is (not (contains? (into #{} (get-in body ["data" "users"])) {"id" "u2" "name" "Bob"})))
+    (is (contains? (into #{} (map #(select-keys % ["id" "name"]) (get-in body ["data" "users"])))
+                   {"id" "u1" "name" "Alice"}))))
+
+(deftest visible-redacts-a-department-so-the-join-field-goes-null
+  (testing "visible? threads through the JOIN resolver too, not just
+    top-level scans -- redacting department d2's datoms makes Bob's
+    department field resolve to null even though Bob himself is visible"
+    (let [store (fixture-store)
+          no-dept-d2? (fn [{:keys [s]}] (not= s :departments/d2))
+          c (ctx store no-dept-d2?)
+          body (body-of (post! c "{ user(id: \"u2\") { name department { name } } }"))]
+      (is (= {"name" "Bob" "department" nil} (get-in body ["data" "user"]))))))
+
+;; ------------------------------------------------------------ invalid query
+
+(deftest malformed-field-produces-graphql-errors-not-a-crash
+  (let [c (ctx (fixture-store))
+        res (post! c "{ user(id: \"u1\") { bogusField } }")
+        body (body-of res)]
+    (is (= 400 (:status res)))
+    (is (nil? (get body "data")))
+    (is (= 1 (count (get body "errors"))))
+    (is (re-find #"Cannot query field \"bogusField\" on type \"User\""
+                (get (first (get body "errors")) "message")))))
+
+(deftest unknown-top-level-field-produces-graphql-error
+  (let [c (ctx (fixture-store))
+        body (body-of (post! c "{ nonExistentRootField }"))]
+    (is (re-find #"Cannot query field \"nonExistentRootField\" on type \"Query\""
+                (get (first (get body "errors")) "message")))))
+
+(deftest scalar-field-with-subselection-produces-graphql-error
+  (let [c (ctx (fixture-store))
+        body (body-of (post! c "{ user(id: \"u1\") { name { nope } } }"))]
+    (is (re-find #"must not have a selection"
+                (get (first (get body "errors")) "message")))))
+
+(deftest end-to-end-department-query
+  (let [c (ctx (fixture-store))
+        body (body-of (post! c "{ department(id: \"d2\") { name budget } }"))]
+    (is (= {"name" "Sales" "budget" 400000} (get-in body ["data" "department"])))))
+
+;; ---------------------------------------------------------- execution error
+
+(deftest execution-error-produces-null-data-and-errors-not-a-crash
+  (let [c (ctx (fixture-store))
+        res (post! c "{ broken }")
+        body (body-of res)]
+    (is (= 200 (:status res)) "execution began, so HTTP 200 per the GraphQL over HTTP spec")
+    (is (nil? (get body "data")))
+    (is (= 1 (count (get body "errors"))))
+    (is (re-find #"boom: broken resolver always fails" (get (first (get body "errors")) "message")))))
+
+;; -------------------------------------------------------- v0.1 scope guard
+
+(deftest mutation-operations-are-rejected
+  (let [c (ctx (fixture-store))
+        res (post! c "mutation { createUser(name: \"X\") { id } }")
+        body (body-of res)]
+    (is (= 400 (:status res)))
+    (is (nil? (get body "data")))
+    (is (re-find #"mutation operations are not supported" (get (first (get body "errors")) "message")))))
+
+(deftest variables-are-rejected-not-silently-mishandled
+  (let [c (ctx (fixture-store))
+        res (post! c "query ($id: ID!) { user(id: $id) { name } }")
+        body (body-of res)]
+    (is (= 400 (:status res)))
+    (is (re-find #"\$variable references are not supported" (get (first (get body "errors")) "message")))))
+
+;; -------------------------------------------------------------------- HTTP
+
+(deftest wrong-method-is-405
+  (let [c (ctx (fixture-store))]
+    (is (= 405 (:status (gql/handle c {:method :get :path "/graphql"}))))))
+
+(deftest wrong-path-is-404
+  (let [c (ctx (fixture-store))]
+    (is (= 404 (:status (gql/handle c {:method :post :path "/not/graphql"}))))))
+
+(deftest malformed-json-body-is-400
+  (let [c (ctx (fixture-store))
+        res (gql/handle c {:method :post :path "/graphql" :body "{oops"})
+        body (body-of res)]
+    (is (= 400 (:status res)))
+    (is (nil? (get body "data")))
+    (is (= 1 (count (get body "errors"))))))
+
+(deftest missing-query-field-is-400
+  (let [c (ctx (fixture-store))
+        res (gql/handle c {:method :post :path "/graphql" :body "{}"})]
+    (is (= 400 (:status res)))))
+
+(deftest ctx-without-visible-throws
+  (is (thrown? #?(:clj Exception :cljs js/Error)
+               (gql/handle {:store (fixture-store) :schema schema}
+                           {:method :post :path "/graphql" :body (json/encode {"query" "{ users { id } }"})}))
+      "handle refuses to run with no stated visibility decision (ADR-2607050500)"))
+
+(deftest ctx-without-schema-throws
+  (is (thrown? #?(:clj Exception :cljs js/Error)
+               (gql/handle {:store (fixture-store) :visible? everything}
+                           {:method :post :path "/graphql" :body (json/encode {"query" "{ users { id } }"})}))
+      "handle refuses to run with no schema (this repo does not auto-derive one, ADR-2607172500)"))
+
+;; ------------------------------------------------------------------ audit
+
+(deftest audit-trail-records-success-and-error
+  (let [store (fixture-store)
+        c (ctx store)]
+    (post! c "{ users { id } }")
+    (post! c "{ broken }")
+    (post! c "{ user(id: \"u1\") { bogusField } }") ; request-level error -- never executes
+    (let [events (->> (st/-read store :kotobase.protocols/audit 0)
+                      (filter #(= :graphql (:surface %))))]
+      (is (= [:query :query-error] (map :op events))
+          "the malformed-field request never reached execution (a request
+          error, HTTP 400) so it is not appended to the audit stream --
+          only requests that actually executed (successfully or with a
+          resolver throwing) are audited, same as org-opencypher-cypher
+          only auditing statements the Cypher parser accepted")
+      (is (string? (:error (second events)))))))

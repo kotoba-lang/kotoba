@@ -1,0 +1,96 @@
+(ns envelope.model-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [envelope.model :as m]))
+
+(deftest a-nonce-is-never-reused-under-one-key
+  (testing "distinct per chunk index"
+    (let [nonces (map #(m/chunk-nonce 0 %) (range 2000))]
+      (is (= 2000 (count (set nonces))))
+      (is (every? #(= m/nonce-bytes (count %)) nonces))))
+  (testing "distinct across epochs — this is what makes an in-place rewrite safe"
+    (is (not= (m/chunk-nonce 0 7) (m/chunk-nonce 1 7))))
+  (testing "deterministic: the nonce is derived, never stored"
+    (is (= (m/chunk-nonce 3 9) (m/chunk-nonce 3 9))))
+  (testing "big-endian, and the two fields cannot bleed into each other"
+    (is (= [0 0 0 0 0 0 0 0 0 0 0 1] (m/chunk-nonce 0 1)))
+    (is (= [0 0 0 1 0 0 0 0 0 0 0 0] (m/chunk-nonce 1 0)))
+    (is (= [0 0 0 0 0 0 0 0 0 0 1 0] (m/chunk-nonce 0 256)))))
+
+(deftest rewriting-a-chunk-moves-it-to-a-fresh-epoch
+  (let [env (assoc (m/envelope "obj" {:chunks 3}) :envelope/chunks 3)
+        env' (m/bump-epoch env 1)]
+    (is (= 0 (m/chunk-epoch env 1)))
+    (is (= 1 (m/chunk-epoch env' 1)))
+    (testing "untouched chunks keep opening under the epoch they were sealed with"
+      (is (= 0 (m/chunk-epoch env' 0)))
+      (is (= 0 (m/chunk-epoch env' 2))))
+    (testing "so the rewritten chunk's nonce differs from every nonce used before"
+      (is (not= (m/chunk-nonce (m/chunk-epoch env 1) 1)
+                (m/chunk-nonce (m/chunk-epoch env' 1) 1))))))
+
+(deftest aad-binds-position-object-and-length
+  (let [a (m/envelope "obj-a" {:chunks 3})
+        b (m/envelope "obj-b" {:chunks 3})]
+    (testing "index"
+      (is (not= (m/chunk-aad a 0) (m/chunk-aad a 1))))
+    (testing "object identity — a chunk cannot be moved between objects"
+      (is (not= (m/chunk-aad a 0) (m/chunk-aad b 0))))
+    (testing "chunk count — truncating the object changes every chunk's AAD"
+      (is (not= (m/chunk-aad a 0) (m/chunk-aad (assoc a :envelope/chunks 2) 0))))
+    (testing "epoch — an old ciphertext cannot be replayed over a rewritten chunk"
+      (is (not= (m/chunk-aad a 1) (m/chunk-aad (m/bump-epoch a 1) 1))))))
+
+(deftest wrap-aad-binds-object-and-recipient
+  (let [a (m/envelope "obj-a" {:chunks 1})
+        b (m/envelope "obj-b" {:chunks 1})]
+    (is (not= (m/wrap-aad a "did:key:z1") (m/wrap-aad a "did:key:z2")))
+    (is (not= (m/wrap-aad a "did:key:z1") (m/wrap-aad b "did:key:z1")))))
+
+(deftest an-empty-object-is-one-chunk-not-zero
+  ;; a zero-chunk envelope would let "truncated to nothing" read as valid
+  (is (= 1 (m/chunk-count 0 1024)))
+  (is (= 1 (m/chunk-count 1 1024)))
+  (is (= 1 (m/chunk-count 1024 1024)))
+  (is (= 2 (m/chunk-count 1025 1024)))
+  (is (= 3 (m/chunk-count (* 3 1024) 1024))))
+
+(deftest revoking-says-out-loud-that-it-is-not-enough
+  (let [env (-> (m/envelope "obj" {:chunks 1})
+                (m/put-recipient {:recipient/id "did:key:z1" :recipient/wrapped "w1"})
+                (m/put-recipient {:recipient/id "did:key:z2" :recipient/wrapped "w2"}))]
+    (is (= ["did:key:z1" "did:key:z2"] (m/recipient-ids env)))
+    (let [{:keys [envelope requires-rotation?]} (m/revoke env "did:key:z1")]
+      (is (= ["did:key:z2"] (m/recipient-ids envelope)))
+      (is (true? requires-rotation?)
+          "deleting a wrap stops a recipient deriving the key again; it does not
+           make them forget one they already derived"))
+    (testing "revoking someone who was never there needs no rotation"
+      (is (false? (:requires-rotation? (m/revoke env "did:key:zNOBODY")))))))
+
+(deftest put-recipient-replaces-rather-than-duplicates
+  ;; how a rotated content key is redistributed
+  (let [env (-> (m/envelope "obj" {:chunks 1})
+                (m/put-recipient {:recipient/id "z1" :recipient/wrapped "old"})
+                (m/put-recipient {:recipient/id "z1" :recipient/wrapped "new"}))]
+    (is (= 1 (count (:envelope/recipients env))))
+    (is (= "new" (:recipient/wrapped (first (:envelope/recipients env)))))))
+
+(deftest validity-is-structural-not-cryptographic
+  (let [env (m/envelope "obj" {:chunks 2})]
+    (is (m/valid? env))
+    (is (not (m/valid? (assoc env :envelope/chunks 0))))
+    (is (not (m/valid? (assoc env :envelope/id ""))))
+    (is (not (m/valid? (assoc env :envelope/alg :rot13))))
+    (is (not (m/valid? (assoc env :envelope/kem :rsa))))
+    (is (not (m/valid? (assoc env :envelope/version 99))))))
+
+(deftest a-link-grant-states-where-the-secret-must-not-go
+  (let [env (m/envelope "obj" {:chunks 1})
+        entry {:recipient/id (m/link-recipient-id "PUB") :recipient/kind :link}
+        grant (m/link-grant env entry "PRIV")]
+    (is (m/link? entry))
+    (is (= :url-fragment (:grant/placement grant)))
+    (is (true? (:grant/never-send-to-origin grant)))
+    (is (= "PRIV" (:grant/secret grant)))
+    (testing "the id is derived from the link's own public key"
+      (is (= "link:PUB" (:recipient/id entry))))))

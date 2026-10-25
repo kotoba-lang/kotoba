@@ -1,0 +1,692 @@
+(ns kotoba.native.interrupt-abi-test
+  "The toolchain-generated x86-64 interrupt entry, byte by byte.
+
+  EVERY byte string below came from the system assembler, not from a hand
+  carry. `clang -target x86_64-unknown-none` assembled the same sequence, and
+  `llvm-objcopy -O binary --only-section=.text` produced a 112-byte `.text`
+  that is byte-identical to `entry-bytes` for vector 3. The disassembly is in
+  the ADR.
+
+  NOT EXECUTED HERE. This repository does not run compiled programs, so a
+  green suite is encodings only. The entry is executed under QEMU by
+  `scripts/isr-qemu-fixture.cljk` against `test/fixtures/isr-qemu.kotoba`,
+  which is what stands in for execution -- and the two are different claims:
+  this file says the bytes are the instructions they are named for, and that
+  says they do what the instructions mean."
+  (:refer-clojure :exclude [bit-shift-left])
+  (:require [kotoba.native.test-support :refer [bit-shift-left]]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.artifact.core :as artifact]
+            [kotoba.native.elf64 :as elf64]
+            [kotoba.native.interrupt-abi :as isr]
+            [kotoba.native.machine-ir :as machine]
+            [kotoba.native.x86-64 :as x86-64]))
+
+;; ---------------------------------------------------------------------------
+;; the name
+;; ---------------------------------------------------------------------------
+
+(deftest an-entry-name-is-its-vector
+  (is (= 0 (isr/entry-vector 'aiueos-isr-0)))
+  (is (= 3 (isr/entry-vector 'aiueos-isr-3)))
+  (is (= 63 (isr/entry-vector 'aiueos-isr-63)))
+  (is (= "kotoba_aiueos_isr_3" (isr/entry-symbol 3)))
+  (is (= 'aiueos-isr-3 (isr/entry-name 3)))
+  (testing "inverse in both directions across the whole table"
+    (is (= (vec (range isr/vector-limit))
+           (mapv #(isr/entry-vector (isr/entry-name %))
+                 (range isr/vector-limit)))))
+  (testing "a name that reads as an entry and is not one"
+    ;; Each of these gets nil, and every caller refuses on nil rather than
+    ;; guessing. `-bp` has no vector to lay an entry at; `-64` is above the
+    ;; region the packager reserves; `-03` would be a second spelling of 3.
+    (doseq [name '[aiueos-isr-bp aiueos-isr-64 aiueos-isr-255 aiueos-isr-03
+                   aiueos-isr- aiueos-isr-3x]]
+      (is (nil? (isr/entry-vector name)) (str name))))
+  (testing "a name that is not an entry name at all"
+    (doseq [name '[main aiueos-sha256 aiueos-isrq-3]]
+      (is (nil? (isr/entry-vector name)) (str name)))))
+
+;; ---------------------------------------------------------------------------
+;; the bytes
+;; ---------------------------------------------------------------------------
+
+(def ^:private vector-3-entry
+  ;; clang -target x86_64-unknown-none, .text extracted with llvm-objcopy.
+  ;; Displacements are zero here because the assembler's `leaq 0(%rip)` and
+  ;; `callq .Lnext` encode zero; the packagers supply real ones.
+  [0x6a 0x00                                            ; push $0
+   0x50 0x51 0x52 0x53 0x55 0x56 0x57                   ; rax rcx rdx rbx rbp rsi rdi
+   0x41 0x50 0x41 0x51 0x41 0x52 0x41 0x53              ; r8 r9 r10 r11
+   0x41 0x54 0x41 0x55 0x41 0x56 0x41 0x57              ; r12 r13 r14 r15
+   0xfc                                                 ; cld
+   0x4c 0x8d 0x0d 0x00 0x00 0x00 0x00                   ; lea r9,[rip+0]
+   0x41 0xff 0x71 0x08                                  ; push qword [r9+8]
+   0x49 0xc7 0x41 0x08 0x00 0x10 0x00 0x00              ; mov qword [r9+8],4096
+   0xbf 0x03 0x00 0x00 0x00                             ; mov edi,3
+   0x48 0x8b 0xb4 0x24 0x80 0x00 0x00 0x00              ; mov rsi,[rsp+128]
+   0x48 0x8b 0x94 0x24 0x88 0x00 0x00 0x00              ; mov rdx,[rsp+136]
+   0x48 0x8b 0x8c 0x24 0xa0 0x00 0x00 0x00              ; mov rcx,[rsp+160]
+   0xe8 0x00 0x00 0x00 0x00                             ; call +0
+   0x41 0x8f 0x41 0x08                                  ; pop qword [r9+8]
+   0x41 0x5f 0x41 0x5e 0x41 0x5d 0x41 0x5c              ; r15 r14 r13 r12
+   0x41 0x5b 0x41 0x5a 0x41 0x59 0x41 0x58              ; r11 r10 r9 r8
+   0x5f 0x5e 0x5d 0x5b 0x5a 0x59 0x58                   ; rdi rsi rbp rbx rdx rcx rax
+   0x48 0x83 0xc4 0x08                                  ; add rsp,8
+   0x48 0xcf])                                          ; iretq
+
+(deftest the-entry-is-the-assembler-s-bytes
+  (is (= vector-3-entry
+         (isr/entry-bytes {:vector 3 :fuel isr/entry-fuel
+                           :context-displacement 0 :call-displacement 0})))
+  (is (= 112 (count vector-3-entry)))
+  (is (= 4096 isr/entry-fuel)
+      "the golden's immediate is the ABI's tier, not a number written twice"))
+
+(deftest a-vector-with-an-error-code-pushes-no-zero
+  ;; The ONE structural difference between the two forms, and it is two bytes.
+  ;; #PF (14) is entered with an error code already on the stack; every vector
+  ;; outside `error-code-vectors` is not, and the entry supplies a zero so that
+  ;; the frame -- and therefore the body's signature -- is the same either way.
+  (let [with-code (isr/entry-bytes {:vector 14 :fuel isr/entry-fuel
+                                    :context-displacement 0 :call-displacement 0})
+        without (isr/entry-bytes {:vector 14 :fuel isr/entry-fuel
+                                  :context-displacement 0 :call-displacement 0})]
+    (is (= with-code without))
+    (is (= 110 (count with-code)))
+    (is (not= 0x6a (first with-code)) "no synthetic error-code push")
+    (is (= 0x50 (first with-code)) "the first byte is push rax")
+    (testing "and the rest is the same sequence with a different vector"
+      ;; The `mov edi,imm32` immediate follows the context displacement, the
+      ;; fuel push and the replenish, so its position is derived rather than
+      ;; counted -- the same arithmetic the packagers use to find the fields
+      ;; they patch.
+      (let [vector-immediate (+ (isr/context-displacement-offset 14) 4 4 8 1)]
+        (is (= 0xbf (nth with-code (dec vector-immediate))))
+        (is (= (assoc (subvec vector-3-entry 2) vector-immediate 14)
+               (vec with-code)))))
+    (testing "the ten architectural error-code vectors, and only those"
+      (is (= #{8 10 11 12 13 14 17 21 29 30} isr/error-code-vectors))
+      (doseq [v (range isr/vector-limit)]
+        (let [b (isr/entry-bytes {:vector v :fuel isr/entry-fuel
+                                  :context-displacement 0 :call-displacement 0})]
+          (is (= (if (contains? isr/error-code-vectors v) 110 112) (count b))
+              (str "vector " v)))))))
+
+(deftest the-declared-sizes-are-the-emitted-sizes
+  ;; The packagers place the relocation and patch the call displacement from
+  ;; these three functions rather than by recounting the sequence, so a change
+  ;; to the sequence that did not move them would silently relocate the wrong
+  ;; four bytes.
+  (doseq [v (range isr/vector-limit)]
+    (let [b (isr/entry-bytes {:vector v :fuel isr/entry-fuel
+                              :context-displacement 0 :call-displacement 0})
+          ctx (isr/context-displacement-offset v)
+          call (isr/call-displacement-offset v)]
+      (is (= (count b) (isr/entry-size v)) (str "vector " v))
+      (is (<= (isr/entry-size v) isr/entry-stride) (str "vector " v))
+      (is (= [0x4c 0x8d 0x0d] (subvec b (- ctx 3) ctx))
+          (str "vector " v ": the context displacement follows lea r9,[rip+"))
+      (is (= 0xe8 (nth b (dec call)))
+          (str "vector " v ": the call displacement follows the call opcode")))))
+
+(deftest the-displacements-land-where-the-offsets-say
+  ;; Both fields are patched by address arithmetic in the packagers, so the
+  ;; only thing that makes that arithmetic right is these offsets naming the
+  ;; four bytes that are actually the displacement.
+  (let [b (isr/entry-bytes {:vector 3 :fuel isr/entry-fuel
+                            :context-displacement 0x11223344
+                            :call-displacement -2})
+        ctx (isr/context-displacement-offset 3)
+        call (isr/call-displacement-offset 3)]
+    (is (= [0x44 0x33 0x22 0x11] (subvec b ctx (+ ctx 4))))
+    (is (= [0xfe 0xff 0xff 0xff] (subvec b call (+ call 4)))
+        "a negative displacement is two's complement, not a throw")))
+
+(defn- pushed-quadwords
+  "How far the emitted prologue moves RSP before the call, read out of the
+  BYTES rather than recounted from the design. Every instruction between the
+  start and the `call` that touches the stack is a push, and there are exactly
+  three encodings of one here."
+  [bytes call-offset]
+  (loop [i 0 n 0]
+    (if (>= i (dec call-offset))
+      n
+      (let [b (nth bytes i)]
+        (cond
+          (and (= 0x6a b) (= 0x00 (nth bytes (inc i)))) (recur (+ i 2) (inc n))
+          (and (= 0x41 b) (<= 0x50 (nth bytes (inc i)) 0x57)) (recur (+ i 2) (inc n))
+          (<= 0x50 b 0x57) (recur (inc i) (inc n))
+          (= [0x41 0xff 0x71 0x08] (subvec bytes i (+ i 4))) (recur (+ i 4) (inc n))
+          (= [0x48 0x83 0xec] (subvec bytes i (+ i 3)))
+          (recur (+ i 4) (+ n (quot (nth bytes (+ i 3)) 8)))
+          :else (recur (inc i) n))))))
+
+(deftest the-stack-is-sixteen-byte-aligned-at-the-call
+  ;; In 64-bit mode the CPU aligns RSP to 16 before pushing the frame (Intel
+  ;; SDM Vol 3A 6.14.2), so RSP is 8 mod 16 after a five-word frame and 0 mod
+  ;; 16 after a six-word one. SysV then requires RSP == 0 mod 16 immediately
+  ;; before a `call`.
+  ;;
+  ;; This is also the reason there is no `sub rsp,8` in this sequence: the
+  ;; object wrapper needs one because it pushes nothing of its own, and adding
+  ;; one HERE would mis-align by eight. The fuel save supplies the same
+  ;; quadword and does something useful with it.
+  (doseq [v (range isr/vector-limit)]
+    (let [bytes (isr/entry-bytes {:vector v :fuel isr/entry-fuel
+                                  :context-displacement 0 :call-displacement 0})
+          cpu-words (if (contains? isr/error-code-vectors v) 6 5)
+          pushed (pushed-quadwords bytes (isr/call-displacement-offset v))
+          rsp-mod (mod (* 8 (+ cpu-words pushed)) 16)]
+      (is (zero? rsp-mod)
+          (str "vector " v ": RSP is " rsp-mod " mod 16 at the call"))
+      (is (= (if (contains? isr/error-code-vectors v) 16 17) pushed)
+          (str "vector " v ": fifteen registers, the fuel word, and the "
+               "synthetic error code where the CPU pushed none")))))
+
+(deftest the-frame-offsets-are-the-ones-the-entry-reads
+  ;; The three `mov reg,[rsp+disp32]` immediates ARE `frame-offsets`, so a
+  ;; body cannot be handed the CS selector where it expected the RIP.
+  (let [b (isr/entry-bytes {:vector 3 :fuel isr/entry-fuel
+                            :context-displacement 0 :call-displacement 0})
+        read-at (fn [reg-modrm]
+                  (let [i (first (keep-indexed
+                                  (fn [i _]
+                                    (when (= [0x48 0x8b reg-modrm 0x24]
+                                             (subvec b i (+ i 4)))
+                                      i))
+                                  (range (- (count b) 8))))]
+                    (reduce + (map-indexed
+                               (fn [k byte] (* byte (bit-shift-left 1 (* 8 k))))
+                               (subvec b (+ i 4) (+ i 8))))))]
+    (is (= (:error-code isr/frame-offsets) (read-at 0xb4)) "rsi <- error code")
+    (is (= (:rip isr/frame-offsets) (read-at 0x94)) "rdx <- interrupted rip")
+    (is (= (:rsp isr/frame-offsets) (read-at 0x8c)) "rcx <- interrupted rsp"))
+  (testing "the CPU's own five words sit above the fifteen this entry pushed"
+    (is (= [136 144 152 160 168]
+           (mapv isr/frame-offsets [:rip :cs :rflags :rsp :ss])))
+    (is (= 128 (:error-code isr/frame-offsets)))
+    (is (= 120 (:rax isr/frame-offsets))
+        "rax is pushed first, so it is the highest of the fifteen")))
+
+(deftest an-absent-vector-halts-rather-than-returning
+  ;; Every vector in the table has an address whether or not anything
+  ;; installed it, because the region is indexed by multiplication. A spurious
+  ;; interrupt landing on an empty slot must not run its neighbour's prologue
+  ;; against the wrong frame.
+  (is (= isr/entry-stride (count isr/absent-entry-bytes)))
+  (is (= [0xfa 0xf4 0xeb 0xfd] (subvec isr/absent-entry-bytes 0 4))
+      "cli; hlt; jmp $-1")
+  (is (every? #(= 0xcc %) (subvec isr/absent-entry-bytes 4))
+      "and a jump into the middle of the slot stops too")
+  ;; amu-h7: the one exception is vector 6, the trap this compiler emits.
+  (is (= 6 isr/undefined-opcode-vector))
+  (doseq [v (remove #{6} (range isr/vector-limit))]
+    (is (identical? isr/absent-entry-bytes (isr/absent-entry-bytes-for v))
+        (str "vector " v " is the silent halt")))
+  (let [slot (isr/absent-entry-bytes-for 6)
+        n (count isr/undefined-opcode-handler-bytes)]
+    (is (= isr/entry-stride (count slot)))
+    (is (= isr/undefined-opcode-handler-bytes (subvec slot 0 n))
+        "vector 6 is the canned #UD handler")
+    (is (every? #(= 0xcc %) (subvec slot n)))))
+
+;; ---------------------------------------------------------------------------
+;; the address
+;; ---------------------------------------------------------------------------
+
+(deftest the-address-sequences-are-the-assembler-s-bytes
+  (is (= [0x48 0x83 0xf8 0x40      ; cmp rax,64
+          0x72 0x02                ; jb +2
+          0x0f 0x0b                ; ud2
+          0x48 0xc1 0xe0 0x07      ; shl rax,7
+          0x49 0x03 0x81 0x48 0x01 0x00 0x00] ; add rax,[r9+0x148]
+         (isr/entry-address-from-rax)))
+  (is (= [0x49 0x83 0xfa 0x40      ; cmp r10,64
+          0x72 0x02 0x0f 0x0b      ; jb +2 ; ud2
+          0x4d 0x89 0xd3           ; mov r11,r10
+          0x49 0xc1 0xe3 0x07      ; shl r11,7
+          0x4d 0x03 0x99 0x48 0x01 0x00 0x00] ; add r11,[r9+0x148]
+         (isr/entry-address-r10-to-r11)))
+  (testing "the three constants appear once and both sequences read them"
+    (is (= isr/vector-limit (nth (isr/entry-address-from-rax) 3)))
+    (is (= isr/vector-limit (nth (isr/entry-address-r10-to-r11) 3)))
+    (is (= isr/entry-stride-shift (nth (isr/entry-address-from-rax) 11)))
+    (is (= isr/context-entry-base-offset 0x148))
+    (is (= isr/entry-stride (bit-shift-left 1 isr/entry-stride-shift)))))
+
+(deftest the-operation-lowers-through-the-pilot
+  ;; What a guest actually compiles to. Every input this backend was given
+  ;; pilots through `machine-ir/compile-expression`, so the sequence that
+  ;; reaches an image is the r10/r11 one; the direct arm is kept for parity
+  ;; with its siblings and is exercised by the golden above.
+  (let [code (:code (x86-64/emit-program
+                     {:format :kotoba.kir/v3 :entry 'main :exports ['main]
+                      :effects #{} :signature {:params [] :result :i64}
+                      :functions [{:name 'main :params [] :result :i64
+                                   :effects #{}
+                                   :body '(kernel-isr-entry-address 3)}]}))
+        window (isr/entry-address-r10-to-r11)]
+    (is (some #(= window %) (partition (count window) 1 code))
+        "the bound check, the shift and the context load reach machine code")
+    (is (some #(= [0x0f 0x0b] %) (partition 2 1 code))
+        "including the trap: a vector outside the table is not an address")))
+
+(defn- le32 [n]
+  (let [v (mod n 4294967296)]
+    (mapv #(mod (quot v (bit-shift-left 1 (* 8 %))) 256) (range 4))))
+
+(deftest the-undefined-opcode-handler-address-names-the-vector-6-slot-s-bytes
+  ;; amu-h7: what a kernel that lays NO entry region installs for vector 6.
+  ;; Both arms embed the canned bytes and answer with their address, the way
+  ;; the three canned handler addresses do, and the bytes are the ones the
+  ;; image lays in the vector-6 slot -- so a gate built from this operation
+  ;; and one built from `(kernel-isr-entry-address 6)` name ONE handler.
+  ;;
+  ;; RED with kotoba-gmir pinned before `:undefined-opcode-handler-address`
+  ;; entered `x86-privileged-action-arities` (`x86-privileged-arity`); GREEN
+  ;; once that pin advances. The op is inert for a guest until kotoba-kir,
+  ;; kotoba-sema and `guest-grammar.edn` admit it too.
+  (let [bytes isr/undefined-opcode-handler-bytes
+        n (count bytes)
+        has? (fn [code needle]
+               (boolean (some #(= (vec needle) (vec %))
+                              (partition (count needle) 1 code))))]
+    (is (= bytes (subvec (isr/absent-entry-bytes-for isr/undefined-opcode-vector) 0 n))
+        "the operation and the entry slot are the same bytes")
+    (testing "the machine-IR arm, which is what the pilot emits"
+      (let [code (machine/compile-expression :x86-64 [] '(kernel-undefined-opcode-handler-address))]
+        (is (has? code (concat [0xe9] (le32 n) bytes [0x4c 0x8d 0x15] (le32 (- (+ n 7)))))
+            "jmp over the handler; lea r10,[rip-(n+7)] -- the answer is the byte after the jmp")))
+    (testing "the direct arm, kept for parity"
+      (let [code (#'kotoba.native.x86-64/emit-expr '(kernel-undefined-opcode-handler-address)
+                  {} {:temp-depth 0 :tail? false})]
+        (is (has? code (concat [0xe9] (le32 n) bytes [0x48 0x8d 0x05] (le32 (- (+ n 7))))))))
+    (testing "and through the pilot, as a guest compiles it"
+      (let [code (:code (x86-64/emit-program
+                         {:format :kotoba.kir/v3 :entry 'main :exports ['main]
+                          :effects #{} :signature {:params [] :result :i64}
+                          :functions [{:name 'main :params [] :result :i64
+                                       :effects #{}
+                                       :body '(kernel-undefined-opcode-handler-address)}]}))]
+        (is (has? code bytes) "the canned #UD handler reaches machine code")
+        (is (has? code [0xb0 0x55 0x66 0xba 0xe9 0x00 0xee]) "including the letter: out 0xe9,'U'")))))
+
+;; ---------------------------------------------------------------------------
+;; the object route
+;; ---------------------------------------------------------------------------
+
+(defn- sealed [exports code program]
+  (artifact/seal
+   {:target :x86_64-aiueos-kernel-v1
+    :target-profile {:runtime :none :ambient-syscalls false}
+    :program program :exports exports
+    :limits {:fuel 4096} :fuel-abi {:initial 4096}
+    :code code}))
+
+(defn- entry-body [name]
+  {:name name :params '[vector error-code rip rsp] :result :i64
+   :effects #{} :body 0})
+
+(defn- entry-object-artifact
+  ([] (entry-object-artifact 'aiueos-isr-3 4))
+  ([name arity]
+   (sealed {name {:offset 0 :arity arity}}
+           [0xc3]
+           {:entry name :functions [(entry-body name)]})))
+
+(deftest an-entry-object-exports-the-entry-symbol
+  (let [packaged (elf64/package-kernel-object (entry-object-artifact))]
+    (is (= "kotoba_aiueos_isr_3" (:export packaged)))
+    (is (= 'aiueos-isr-3 (:source-entry packaged)))
+    (is (= :interrupt-entry (:stub-kind packaged))
+        "the field aiueos's K16 gate copies into its receipt's :stub")
+    (is (= 3 (:interrupt-vector packaged)))
+    (testing "the linked shape aiueos's verifier requires is unchanged"
+      ;; verify-kotoba-kernel-object.py: exactly one R_X86_64_PC32 into the
+      ;; object's own `.data`, addend -4, and no imports. The entry's
+      ;; `lea r9,[rip+ ]` is that one relocation, as the wrapper's was -- only
+      ;; its offset moved, which is why the offset is computed.
+      (is (= [{:section :text
+               :offset (isr/context-displacement-offset 3)
+               :type :r-x86-64-pc32 :symbol :data :addend -4}]
+             (:relocations packaged)))
+      (is (= [] (:imports packaged)))
+      (is (nil? (:interpreter packaged))))
+    (testing "the text begins with the entry, not with the SysV wrapper"
+      (let [text (subvec (:bytes packaged) 64 (+ 64 (isr/entry-size 3)))]
+        (is (= 0x6a (first text)) "push $0 -- vector 3 has no error code")
+        (is (= [0x48 0xcf] (subvec text (- (count text) 2)))
+            "and it ends with iretq, not ret")))))
+
+(deftest an-ordinary-object-is-untouched
+  ;; The floor under the test above: a non-entry object still gets the SysV
+  ;; wrapper, the relocation at offset 3, and `ret`.
+  (let [packaged (elf64/package-kernel-object
+                  (sealed {'aiueos-ipv4-checksum {:offset 0 :arity 2}}
+                          [0xc3]
+                          {:entry 'aiueos-ipv4-checksum
+                           :functions [{:name 'aiueos-ipv4-checksum
+                                        :params '[a b] :body 0}]}))]
+    (is (= "kotoba_aiueos_ipv4_checksum" (:export packaged)))
+    (is (nil? (:stub-kind packaged)))
+    (is (= 3 (:offset (first (:relocations packaged)))))
+    (is (= [0x4c 0x8d 0x0d] (subvec (:bytes packaged) 64 67)))))
+
+(deftest the-entry-address-has-no-answer-in-an-object
+  ;; The pinned refusal. An object's context is its own private 80 bytes and
+  ;; the entry-base slot is at 0x148, past the end of it; reading there would
+  ;; answer with whatever follows the object's `.data`.
+  (let [thrown (try (elf64/package-kernel-object
+                     (sealed {'main {:offset 0 :arity 0}} [0xc3]
+                             {:entry 'main
+                              :functions [{:name 'main :params []
+                                           :body '(kernel-isr-entry-address 3)}]}))
+                    nil
+                    (catch ExceptionInfo e e))]
+    (is (some? thrown))
+    (is (= :isr-address-needs-image (:reason (ex-data thrown))))
+    (is (= 'main (:entry (ex-data thrown))))
+    (is (= 0x148 (:context-slot (ex-data thrown))))
+    (is (= 80 (:object-context-size (ex-data thrown))))))
+
+(deftest the-refusal-is-scoped-to-what-the-object-entry-reaches
+  ;; One compile produces both an image and an object (amu's `compile-source*`
+  ;; calls both packagers), and a kernel image's `main` builds its IDT with
+  ;; this operation. Refusing the object because a SIBLING function used it
+  ;; would refuse the object route to every image that installs an entry.
+  ;;
+  ;; An object has exactly one public symbol, so `main` here is unreachable:
+  ;; nothing outside can enter it.
+  (let [artifact (sealed {'main {:offset 0 :arity 0}
+                          'aiueos-isr-3 {:offset 1 :arity 4}}
+                         [0xc3 0xc3]
+                         {:entry 'main
+                          :functions [{:name 'main :params []
+                                       :body '(kernel-isr-entry-address 3)}
+                                      (entry-body 'aiueos-isr-3)]})]
+    (is (= "kotoba_aiueos_isr_3" (:export (elf64/package-kernel-object artifact))))
+    (testing "but a body that reaches it THROUGH a helper is still refused"
+      (let [reaching (sealed {'aiueos-isr-3 {:offset 0 :arity 4}}
+                             [0xc3 0xc3]
+                             {:entry 'aiueos-isr-3
+                              :functions [(assoc (entry-body 'aiueos-isr-3)
+                                                 :body '(helper 3))
+                                          {:name 'helper :params '[v]
+                                           :body '(kernel-isr-entry-address v)}]})]
+        (is (= :isr-address-needs-image
+               (:reason (try (elf64/package-kernel-object reaching)
+                             (catch ExceptionInfo e (ex-data e))))))))))
+
+(deftest an-entry-body-with-the-wrong-arity-is-refused
+  ;; The entry loads four registers from the frame and calls. A body of any
+  ;; other arity reads registers it never asked for.
+  (doseq [arity [0 2 3 5]]
+    (testing (str "arity " arity)
+      (is (thrown-with-msg?
+           ExceptionInfo #"invalid SysV arity"
+           (elf64/package-kernel-object
+            (entry-object-artifact 'aiueos-isr-3 arity)))))))
+
+(deftest an-entry-name-that-is-not-a-vector-is-refused
+  (doseq [name '[aiueos-isr-bp aiueos-isr-64 aiueos-isr-03]]
+    (testing (str name)
+      (let [data (try (elf64/package-kernel-object
+                       (entry-object-artifact name 4))
+                      nil
+                      (catch ExceptionInfo e (ex-data e)))]
+        (is (= :isr-name-not-a-vector (:reason data)))
+        (is (= [name] (:names data)))
+        (is (= 64 (:vector-limit data)))))))
+
+(deftest an-object-carries-one-entry
+  (let [data (try (elf64/package-kernel-object
+                   (sealed {'aiueos-isr-3 {:offset 0 :arity 4}
+                            'aiueos-isr-14 {:offset 1 :arity 4}}
+                           [0xc3 0xc3]
+                           {:entry 'aiueos-isr-3
+                            :functions [(entry-body 'aiueos-isr-3)
+                                        (entry-body 'aiueos-isr-14)]}))
+                  nil
+                  (catch ExceptionInfo e (ex-data e)))]
+    (is (= :isr-object-has-one-entry (:reason data)))
+    (is (= [3 14] (:vectors data)))))
+
+;; ---------------------------------------------------------------------------
+;; the image route
+;; ---------------------------------------------------------------------------
+
+(defn- image-artifact []
+  (sealed {'main {:offset 0 :arity 0}
+           'aiueos-isr-3 {:offset 1 :arity 4}}
+          [0xc3 0xc3]
+          {:entry 'main
+           :functions [{:name 'main :params []
+                        :body '(kernel-isr-entry-address 3)}
+                       (entry-body 'aiueos-isr-3)]}))
+
+(defn- le64-at [bytes offset]
+  (reduce (fn [v i] (+ v (bit-shift-left (long (nth bytes (+ offset i))) (* 8 i))))
+          0 (range 8)))
+
+(deftest the-image-lays-an-entry-region-and-names-its-base
+  (let [packaged (elf64/package-kernel (image-artifact))
+        image (:bytes packaged)
+        base (:interrupt-entry-base packaged)
+        ;; The kernel RW context is at file offset 0x8000 in a small image
+        ;; (ADR-0036); the entry-base slot is `context-entry-base-offset` into
+        ;; it, and that is the quadword `kernel-isr-entry-address` loads.
+        slot (le64-at image (+ 0x8000 isr/context-entry-base-offset))]
+    (is (some? base))
+    (is (= base slot)
+        "the address the guest loads is the address the packager laid down")
+    (is (= 128 (:interrupt-entry-stride packaged)))
+    (is (= {3 (+ base (* 3 isr/entry-stride))} (:interrupt-entries packaged)))))
+
+(deftest the-image-entry-reaches-its-body-and-its-context
+  ;; Both displacements are computed from addresses, so the only thing that
+  ;; says they are right is resolving them back.
+  (let [packaged (elf64/package-kernel (image-artifact))
+        image (:bytes packaged)
+        base (:interrupt-entry-base packaged)
+        entry-address (+ base (* 3 isr/entry-stride))
+        ;; text is at file offset 0x1000 and virtual address 0x101000.
+        file-of (fn [address] (+ 0x1000 (- address 0x101000)))
+        at (fn [offset] (nth image (+ (file-of entry-address) offset)))
+        disp32 (fn [offset]
+                 (let [raw (reduce (fn [v i]
+                                     (+ v (bit-shift-left (long (at (+ offset i)))
+                                                          (* 8 i))))
+                                   0 (range 4))]
+                   (if (>= raw 0x80000000) (- raw 0x100000000) raw)))
+        ctx-off (isr/context-displacement-offset 3)
+        call-off (isr/call-displacement-offset 3)]
+    (is (= 0x6a (at 0)) "the entry really is at base + vector*stride")
+    (testing "lea r9,[rip+d] resolves to the kernel context"
+      (is (= 0x108000
+             (+ entry-address ctx-off 4 (disp32 ctx-off)))))
+    (testing "call resolves to the body, not to `main`"
+      ;; `main` is at artifact offset 0 and the body at offset 1, so an
+      ;; off-by-one in the base of the code would land on the entry point.
+      (let [artifact-address (+ 0x101000 77)]
+        (is (= (+ artifact-address 1)
+               (+ entry-address call-off 4 (disp32 call-off))))))))
+
+(deftest every-vector-in-the-table-has-a-slot
+  (let [packaged (elf64/package-kernel (image-artifact))
+        image (:bytes packaged)
+        base (:interrupt-entry-base packaged)
+        file-of (fn [address] (+ 0x1000 (- address 0x101000)))]
+    (doseq [v (range isr/vector-limit)]
+      (let [start (file-of (+ base (* v isr/entry-stride)))]
+        (cond
+          (= v 3)
+          (is (= 0x6a (nth image start)) "vector 3 is the installed entry")
+          (= v isr/undefined-opcode-vector)
+          (is (= isr/undefined-opcode-handler-bytes
+                 (subvec image start (+ start (count isr/undefined-opcode-handler-bytes))))
+              "vector 6 names itself (amu-h7)")
+          :else
+          (is (= [0xfa 0xf4 0xeb 0xfd]
+                 (subvec image start (+ start 4)))
+              (str "vector " v " halts")))))
+    (testing "the region is the whole table, and it is the only thing added"
+      ;; The TEXT segment, not the file: the file's size is dominated by the
+      ;; 77-KiB RW data region, which starts at a fixed offset and swallows
+      ;; 8 KiB of extra text without changing by a byte. Measuring the file
+      ;; here would have compared 0 to 8192 and read as a pass if the sign of
+      ;; the assertion were flipped.
+      ;;
+      ;; The comparison artifact has the SAME code size and function count and
+      ;; differs only in the second function's NAME, so the difference is the
+      ;; region and not the padding in front of it.
+      (let [text-filesz (fn [packaged]
+                          (le64-at (:bytes packaged) (+ 64 32)))
+            without (elf64/package-kernel
+                     (sealed {'main {:offset 0 :arity 0}
+                              'helper {:offset 1 :arity 4}}
+                             [0xc3 0xc3]
+                             {:entry 'main
+                              :functions [{:name 'main :params [] :body 0}
+                                          (entry-body 'helper)]}))]
+        (is (= (* isr/vector-limit isr/entry-stride)
+               (- (text-filesz packaged) (text-filesz without))))))))
+
+(deftest an-image-with-no-entry-declares-no-region
+  ;; Nothing above the region moves, so an image that installs nothing is what
+  ;; it was, and the base slot reads zero rather than a stale address.
+  (let [packaged (elf64/package-kernel
+                  (sealed {'main {:offset 0 :arity 0}} [0xc3]
+                          {:entry 'main
+                           :functions [{:name 'main :params [] :body 0}]}))]
+    (is (nil? (:interrupt-entry-base packaged)))
+    (is (= {} (:interrupt-entries packaged)))
+    (is (zero? (le64-at (:bytes packaged)
+                        (+ 0x8000 isr/context-entry-base-offset))))))
+
+(deftest an-image-entry-body-with-the-wrong-arity-is-refused
+  (let [data (try (elf64/package-kernel
+                   (sealed {'main {:offset 0 :arity 0}
+                            'aiueos-isr-3 {:offset 1 :arity 2}}
+                           [0xc3 0xc3]
+                           {:entry 'main
+                            :functions [{:name 'main :params [] :body 0}
+                                        (entry-body 'aiueos-isr-3)]}))
+                  nil
+                  (catch ExceptionInfo e (ex-data e)))]
+    (is (= :isr-body-arity (:reason data)))
+    (is (= 3 (:vector data)))
+    (is (= 2 (:arity data)))
+    (is (= 4 (:expected data)))))
+
+;; ---------------------------------------------------------------------------
+;; amu-h7: vector 6 names itself
+;; ---------------------------------------------------------------------------
+
+(deftest the-undefined-opcode-slot-names-itself
+  ;; Vector 6 is the trap this compiler itself emits -- every bounds check and
+  ;; every fuel charge ends in `ud2` -- so an image whose kernel installed no
+  ;; body for it must not go silent there. The slot writes 'U' to the debug
+  ;; port, 0x1d to isa-debug-exit, and halts.
+  (let [packaged (elf64/package-kernel (image-artifact))
+        image (:bytes packaged)
+        base (:interrupt-entry-base packaged)
+        file-of (fn [address] (+ 0x1000 (- address 0x101000)))
+        start (file-of (+ base (* 6 isr/entry-stride)))]
+    (is (= [0xfa 0xb0 0x55 0x66 0xba 0xe9 0x00 0xee]
+           (subvec image start (+ start 8)))
+        "cli; mov al,'U'; mov dx,0xe9; out dx,al")
+    (is (= [0xb8 0x1d 0x00 0x00 0x00 0x66 0xba 0xf4 0x00 0xef]
+           (subvec image (+ start 8) (+ start 18)))
+        "mov eax,0x1d; mov dx,0xf4; out dx,eax")
+    ;; k16 2026-09-08: after the receipts, the shared fatal tail -- reset the
+    ;; platform through 0xcf9, say 'H' if the chipset ignored it, then halt.
+    (is (= isr/fatal-tail-bytes (subvec image (+ start 18) (+ start 35)))
+        "mov al,6; mov dx,0xcf9; out dx,al; out 0xe9,'H'; hlt; jmp $-1")
+    (is (every? #(= 0xcc %) (subvec image (+ start 35) (+ start isr/entry-stride)))
+        "and a jump into the middle of the slot stops too")
+    (is (= isr/undefined-opcode-handler-bytes (subvec image start (+ start 35)))
+        "and those 35 bytes are the one definition both routes share")))
+
+;; ---------------------------------------------------------------------------
+;; k16 2026-09-08: a fatal handler resets the platform before it halts
+;; ---------------------------------------------------------------------------
+
+(def ^:private fatal-tail
+  ;; mov al,6; mov dx,0xcf9; out dx,al   Reset Control Register: SYS_RST|RST_CPU
+  ;; mov al,'H'; mov dx,0xe9; out dx,al  reached only if the chipset ignored it
+  ;; hlt; jmp $-1                        the fallback, and only the fallback
+  [0xb0 0x06 0x66 0xba 0xf9 0x0c 0xee
+   0xb0 0x48 0x66 0xba 0xe9 0x00 0xee
+   0xf4 0xeb 0xfd])
+
+(def ^:private halt-loop [0xf4 0xeb 0xfd])
+(def ^:private reset-write [0x66 0xba 0xf9 0x0c 0xee])           ; mov dx,0xcf9; out dx,al
+(def ^:private debug-exit-write [0x66 0xba 0xf4 0x00 0xef])      ; mov dx,0xf4; out dx,eax
+(def ^:private f-receipt                                          ; 'F', 0x1f
+  (into [0xb0 0x46 0x66 0xba 0xe9 0x00 0xee 0xb8 0x1f 0x00 0x00 0x00] debug-exit-write))
+
+(defn- occurrences [bytes needle]
+  (count (filter #(= (vec needle) (vec %)) (partition (count needle) 1 bytes))))
+
+(defn- ends-with? [bytes tail]
+  (let [bytes (vec bytes) tail (vec tail)]
+    (and (<= (count tail) (count bytes))
+         (= tail (subvec bytes (- (count bytes) (count tail)))))))
+
+(deftest every-fatal-handler-resets-the-platform-before-it-halts
+  ;; 2026-09-08, aiueos k16: the board's kernel ran out of fuel at 11:03 and
+  ;; took vector 6. The canned handler wrote 'U', wrote the debug-exit port
+  ;; that only QEMU listens to, and executed `hlt; jmp $-1` -- for nine hours,
+  ;; until a human reached the power button. A fleet node that can only be
+  ;; recovered by hand is not a fleet node. The aiueos kernel already ends its
+  ;; deliberate run with `(kernel-out-u8 3321 6)` -- 0xcf9 <- SYS_RST|RST_CPU
+  ;; -- and firmware comes back through PXE; a fatal handler must end the same
+  ;; way, so that a crash is one lost iteration and not a lost day.
+  ;;
+  ;; Ordering is the point: letter first (the evidence), debug-exit second (so
+  ;; every QEMU fixture still exits with its code before the reset is
+  ;; reached), reset third, and the halt loop LAST -- reached only when the
+  ;; chipset ignored the write, which is what the second letter 'H' says, the
+  ;; way the aiueos kernel returns 223 (STATUS DF) in the same case. 'H' and
+  ;; not 'X': the classifier already says 'X' for an NX fetch.
+  (is (= fatal-tail isr/fatal-tail-bytes) "the tail is the bytes it is named for")
+  (is (= 0xcf9 isr/reset-control-port))
+  (is (= 0x06 isr/reset-control-value) "SYS_RST | RST_CPU, the write the aiueos kernel makes at its run end")
+  (is (= 0x48 isr/reset-refused-letter) "'H'")
+  (doseq [[name bytes] [["#UD" isr/undefined-opcode-handler-bytes]
+                        ["#DF" isr/double-fault-handler-bytes]
+                        ["#PF classifier" isr/page-fault-classifier-handler-bytes]]]
+    (testing name
+      (is (ends-with? bytes fatal-tail) "ends in the shared tail")
+      (is (ends-with? bytes (concat debug-exit-write fatal-tail))
+          "the isa-debug-exit write is the instruction before the reset")
+      (is (= 1 (occurrences bytes halt-loop)) "exactly one halt loop, and it is after the reset")
+      (is (= 1 (occurrences bytes reset-write)) "exactly one reset write")
+      (is (< (.indexOf (vec bytes) 0xef) (count bytes)) "and a debug-exit write exists to be first")))
+  (testing "#UD: cli, 'U', 0x1d, tail -- nothing else"
+    (is (= (concat [0xfa 0xb0 0x55 0x66 0xba 0xe9 0x00 0xee
+                    0xb8 0x1d 0x00 0x00 0x00] debug-exit-write fatal-tail)
+           isr/undefined-opcode-handler-bytes)))
+  (testing "#DF: both receipts reach the one tail"
+    (let [bytes isr/double-fault-handler-bytes
+          d-receipt (into [0xb0 0x44 0x66 0xba 0xe9 0x00 0xee 0xb8 0x1c 0x00 0x00 0x00] debug-exit-write)]
+      (is (= 1 (occurrences bytes (concat d-receipt [0xeb (count f-receipt)])))
+          "'D', 0x1c, then a jump over the 'F' receipt into the tail")
+      (is (ends-with? bytes (concat f-receipt fatal-tail))
+          "'F', 0x1f falls straight into the tail")))
+  (testing "the classifier: one report path, so G/W/X/F all reach the tail"
+    (is (ends-with? isr/page-fault-classifier-handler-bytes
+                    (concat [0x66 0xba 0xe9 0x00 0xee 0x44 0x89 0xc0] debug-exit-write fatal-tail))
+        "out 0xe9,al; mov eax,r8d; out 0xf4,eax; tail"))
+  (testing "the recoverable #PF and timer handlers are unchanged: out of this change's scope"
+    ;; Their fail-closed 'F' arm still ends in the halt loop with no reset.
+    ;; Deliberate and narrow -- they have an `iretq` path and this change was
+    ;; scoped to the three handlers that never return. Extending the reset to
+    ;; them is a separate decision; this assertion is here so that doing it
+    ;; by accident (editing `fail-closed-tail`) is loud.
+    (doseq [[name bytes] [["#PF recovery" isr/page-fault-recovery-handler-bytes]
+                          ["timer" isr/rt-timer-handler-bytes]]]
+      (testing name
+        (is (ends-with? bytes (concat f-receipt halt-loop)))
+        (is (= 0 (occurrences bytes reset-write)))))))

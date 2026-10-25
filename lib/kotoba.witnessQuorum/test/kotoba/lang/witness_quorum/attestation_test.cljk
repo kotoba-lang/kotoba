@@ -1,0 +1,131 @@
+(ns kotoba.lang.witness-quorum.attestation-test
+  (:require [kotoba.bytes :as kbytes] [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.witness-quorum.attestation :as attestation]
+            [kotoba.lang.witness-quorum.selector :as selector]))
+
+(defn- mock-rule
+  ([] (mock-rule "test.example.foo"))
+  ([nsid]
+   {:v 1
+    :nsid nsid
+    :schema-ref {:path "00-contracts/lexicons/test/schema.json" :content-hash (apply str (repeat 64 "a")) :version "1.0.0"}
+    :policy-ref {:path "00-contracts/policies/test/policy.rego" :content-hash (apply str (repeat 64 "b")) :version "1.0.0"}
+    :cell-ref {:path "40-engine/kotoba/crates/kotoba-kotodama/cells/test/" :content-hash (apply str (repeat 64 "c")) :version "abcdef0"}
+    :quorum-size 5
+    :quorum-threshold 3
+    :escalation-policy :council
+    :registered-at "2026-05-23T00:00:00Z"}))
+
+(defn- sha256-test-signer [cell-id]
+  (fn [^bytes canonical]
+    (let [cell-bytes (kbytes/utf8-bytes ^String cell-id)
+          combined (byte-array (+ (alength canonical) (alength cell-bytes)))]
+      (System/arraycopy canonical 0 combined 0 (alength canonical))
+      (System/arraycopy cell-bytes 0 combined (alength canonical) (alength cell-bytes))
+      (.digest (java.security.MessageDigest/getInstance "SHA-256") combined))))
+
+(deftest minimal-schema-validator-test
+  (testing "accepts a record with a positive integer :v"
+    (is (= :accept (:verdict (attestation/minimal-schema-validator {:v 1 :hello "world"} (mock-rule))))))
+
+  (testing "rejects a non-map record"
+    (let [result (attestation/minimal-schema-validator "not a map" (mock-rule))]
+      (is (= :reject (:verdict result)))
+      (is (= "record is not an object" (:reason result)))))
+
+  (testing "rejects a vector record with the array-specific reason"
+    (let [result (attestation/minimal-schema-validator [1 2 3] (mock-rule))]
+      (is (= :reject (:verdict result)))
+      (is (= "record must be an object, not an array" (:reason result)))))
+
+  (testing "rejects a record missing :v"
+    (let [result (attestation/minimal-schema-validator {:hello "no v field"} (mock-rule))]
+      (is (= :reject (:verdict result)))
+      (is (re-find #"v must be a positive integer" (:reason result))))))
+
+(deftest validate-against-membrane-test
+  (testing "all-accept stubs by default"
+    (is (= :accept (:verdict (attestation/validate-against-membrane {:v 1} (mock-rule))))))
+
+  (testing "short-circuits on schema rejection"
+    (let [result (attestation/validate-against-membrane
+                  {:hello "no v"} (mock-rule)
+                  {:schema attestation/minimal-schema-validator})]
+      (is (= :reject (:verdict result)))
+      (is (= 1 (count (:layers result))))))
+
+  (testing "runs all 3 layers when each accepts"
+    (let [result (attestation/validate-against-membrane
+                  {:v 1} (mock-rule)
+                  {:schema attestation/minimal-schema-validator})]
+      (is (= :accept (:verdict result)))
+      (is (= 3 (count (:layers result)))))))
+
+(deftest membrane-version-for-test
+  (is (= "lex:1.0.0/rego:1.0.0/cell:abcdef0" (attestation/membrane-version-for (mock-rule))))
+
+  (testing "falls back to the first 7 chars of content-hash when :version is absent"
+    (let [rule (-> (mock-rule) (update :schema-ref dissoc :version))]
+      (is (= (str "lex:" (apply str (repeat 7 "a")) "/rego:1.0.0/cell:abcdef0")
+             (attestation/membrane-version-for rule))))))
+
+(deftest canonical-attestation-bytes-test
+  (testing "joins fields with newlines, verdict as its bare keyword name"
+    (let [bytes (attestation/canonical-attestation-bytes
+                 {:record-cid "bafy-cid-12345" :cell-id "CellA" :verdict :accept
+                  :reason "" :membrane-version "lex:1.0.0/rego:1.0.0/cell:abcdef0"
+                  :attested-at "2026-05-23T00:00:00Z"})]
+      (is (= "bafy-cid-12345\nCellA\naccept\n\nlex:1.0.0/rego:1.0.0/cell:abcdef0\n2026-05-23T00:00:00Z"
+             (kbytes/utf8-string ^bytes bytes))))))
+
+(deftest produce-attestation-test
+  (testing "emits a signed, verdict-tagged attestation"
+    (let [fleet (selector/flatten-fleet [{:hostname "node-0.test" :cells ["CellA" "CellB" "CellC"]}])
+          cell (first fleet)
+          rule (mock-rule)
+          att (attestation/produce-attestation
+               {:record-uri "at://did:web:test.example.com/test.example.foo/abc"
+                :record-cid "bafy-cid-12345"
+                :record {:v 1 :hello "world"}
+                :cell cell
+                :rule rule
+                :signer (sha256-test-signer (:cell-id cell))})]
+      (is (= 1 (:v att)))
+      (is (= :accept (:verdict att)))
+      (is (= (:cell-id cell) (:cell-id att)))
+      (is (= (:node cell) (:cell-node att)))
+      (is (= "bafy-cid-12345" (:record-cid att)))
+      (is (bytes? (:signature att)))
+      (is (= 32 (alength ^bytes (:signature att)))) ; sha256 test-signer size
+      (is (= (attestation/membrane-version-for rule) (:membrane-version att)))
+      (is (= 16 (count (:quorum-group att))))
+      (is (nil? (:escalation-target att)))))
+
+  (testing "rejects when the minimal schema validator rejects"
+    (let [fleet (selector/flatten-fleet [{:hostname "node-0.test" :cells ["CellA"]}])
+          cell (first fleet)
+          att (attestation/produce-attestation
+               {:record-uri "at://did:web:test.example.com/x/abc"
+                :record-cid "bafy-bad"
+                :record {:hello "no v field"}
+                :cell cell
+                :rule (mock-rule "test.example.bad")
+                :validators {:schema attestation/minimal-schema-validator}
+                :signer (sha256-test-signer (:cell-id cell))})]
+      (is (= :reject (:verdict att)))
+      (is (re-find #"v must be a positive integer" (:reason att)))))
+
+  (testing "attaches :escalation-target :council when the verdict is :escalate"
+    (let [fleet (selector/flatten-fleet [{:hostname "node-0.test" :cells ["CellA"]}])
+          cell (first fleet)
+          escalate-validator (fn [_record _rule] {:layer :schema :verdict :escalate :reason "ambiguous"})
+          att (attestation/produce-attestation
+               {:record-uri "at://did:web:test.example.com/x/abc"
+                :record-cid "bafy-esc"
+                :record {:v 1}
+                :cell cell
+                :rule (mock-rule)
+                :validators {:schema escalate-validator}
+                :signer (sha256-test-signer (:cell-id cell))})]
+      (is (= :escalate (:verdict att)))
+      (is (= :council (:escalation-target att))))))

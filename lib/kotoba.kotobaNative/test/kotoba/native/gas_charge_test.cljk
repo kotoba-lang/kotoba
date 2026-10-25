@@ -1,0 +1,95 @@
+(ns kotoba.native.gas-charge-test
+  "Consensus gas on the native backends (superproject adr-2610092340 D12).
+  `charge-gas` writes the reference's per-form debit (osaho
+  `kotoba.kir/execute-metered`) into the source KIR, and both encoders emit
+  it as an inline decrement of the context's gas word, 384 (ABI v12). The
+  RUN-TIME count is compared with the reference and wasm32 by amu's fuel
+  differential; this suite pins the shape: where the debits go, how many, and
+  that a program which names no schedule is not touched."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.native.machine-ir :as machine]
+            [kotoba.native.aarch64 :as arm]
+            [kotoba.native.x86-64 :as x86]))
+
+(def v0 {:gas-schedule/id :kotoba.gas/v0-draft :gas-schedule/version 0
+         :call 1 :default 1 :weights {}})
+
+(defn- module [schedule & functions]
+  (cond-> {:format :kotoba.kir/v4 :exports ['main] :functions (vec functions)}
+    schedule (assoc :gas-schedule schedule)))
+
+(defn- fn-of [name params body]
+  {:name name :params params :result :i64 :body body})
+
+(defn- subvector-count [haystack needle]
+  (count (filter #(= needle (vec %)) (partition (count needle) 1 haystack))))
+
+(def x86-gas-debit [0x49 0x29 0xb1 0x80 0x01 0x00 0x00]) ; sub qword [r9+384], rsi
+(def a64-gas-ldr [0xf0 0xc0 0x40 0xf9])                   ; ldr x16, [x7, #384]
+(def x86-version-check [0x49 0x83 0x39 0x0c])           ; cmp qword [r9], 12
+(def a64-version-check [0x1f 0x32 0x00 0xf1])           ; cmp x16, #12
+
+(deftest every-application-form-is-charged-before-its-operands
+  (is (= '(do (gas-charge! 1) (+ 1 (do (gas-charge! 1) (* 2 3))))
+         (:body (first (:functions (machine/charge-gas
+                                    (module v0 (fn-of 'main [] '(+ 1 (* 2 3)))))))))))
+
+(deftest the-schedule-sets-the-weights
+  (testing "a module function call weighs :call, a builtin its weight or :default"
+    (is (= '(do (gas-charge! 3) (sq (do (gas-charge! 2) (* 2 3))))
+           (:body (second (:functions (machine/charge-gas
+                                       (module (assoc v0 :call 3 :weights {'* 2})
+                                               (fn-of 'sq '[x] 'x)
+                                               (fn-of 'main [] '(sq (* 2 3))))))))))
+    (is (= '(+ 1 2)
+           (:body (first (:functions (machine/charge-gas
+                                      (module (assoc v0 :weights {'+ 0})
+                                              (fn-of 'main [] '(+ 1 2))))))))
+        "a weight of 0 writes no debit")))
+
+(deftest a-program-that-names-no-schedule-is-not-touched
+  (let [kir (module nil (fn-of 'main [] '(+ 1 (* 2 3))))]
+    (is (identical? kir (machine/charge-gas kir)))))
+
+(deftest a-schedule-it-cannot-price-by-is-refused
+  (doseq [bad [(assoc v0 :default 0) (assoc v0 :call 0) (dissoc v0 :gas-schedule/id)
+               (assoc v0 :weights {'+ -1}) (assoc v0 :weights {"+" 1})]]
+    (is (thrown? #?(:clj Exception :cljs :default)
+                 (machine/charge-gas (module bad (fn-of 'main [] '(+ 1 2))))))))
+
+;; A ten-iteration loop helper: if, <, the self call, + and + in the helper
+;; (5 static debits) and main's call (1) -- 6 debits in the code; at run time
+;; they cost 1 + 10*5 + 2 = 53, the number osaho's and kotoba-wasm's suites
+;; assert.
+(def counted-loop
+  (module v0
+          (fn-of '__kotoba_loop_1 '[i acc]
+                 '(if (< i 10) (__kotoba_loop_1 (+ i 1) (+ acc i)) acc))
+          (fn-of 'main [] '(__kotoba_loop_1 0 0))))
+
+(deftest both-encoders-emit-one-inline-debit-per-written-charge
+  (doseq [[label emit debit] [["x86-64" x86/emit-program x86-gas-debit]
+                              ["AArch64" arm/emit-program a64-gas-ldr]]]
+    (is (= 6 (subvector-count (vec (:code (emit counted-loop))) debit))
+        (str label ": six inline decrements of the gas word"))
+    (is (= 6 (subvector-count (vec (:code (emit counted-loop)))
+                              (if (= label "x86-64") x86-version-check a64-version-check)))
+        (str label ": each debit first refuses a pre-v12 host, whose word 384 is host state"))
+    (is (zero? (subvector-count (vec (:code (emit (dissoc counted-loop :gas-schedule)))) debit))
+        (str label ": no gas word is touched without a schedule"))))
+
+(deftest a-heavy-form-is-still-one-debit
+  ;; 2026-10-10: the weight is the debit's argument, not a repetition, so a
+  ;; form priced 50 costs the same code as one priced 1.
+  (let [heavy (module (assoc v0 :weights {'* 50}) (fn-of 'main [] '(* 6 7)))]
+    (is (= '(do (gas-charge! 50) (* 6 7)) (:body (first (:functions (machine/charge-gas heavy))))))
+    (doseq [[label emit debit] [["x86-64" x86/emit-program x86-gas-debit]
+                                ["AArch64" arm/emit-program a64-gas-ldr]]]
+      (is (= 1 (subvector-count (vec (:code (emit heavy))) debit))
+          (str label ": one debit for a weight of 50")))))
+
+(deftest gas-does-not-change-what-pays-fuel
+  ;; The gas debit is a charge, not a re-entry: metering gas must not give a
+  ;; function an entry fuel charge it did not have.
+  (is (= (set (keys (machine/entry-fuel-prefixes (dissoc counted-loop :gas-schedule) (constantly [:fuel]))))
+         (set (keys (machine/entry-fuel-prefixes (machine/charge-gas counted-loop) (constantly [:fuel])))))))

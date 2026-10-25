@@ -1,0 +1,140 @@
+(ns kotobase.protocols.sparql.quads-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotobase.local :as local]
+            [kotobase.store :as st]
+            [kotobase.query.bridge :as bridge]
+            [datom.source :as src]
+            [kotobase.protocols.sparql :as sparql]
+            [kotobase.protocols.sparql.parser :as parser]
+            [kotobase.protocols.sparql.quads :as quads]))
+
+(defn- fixture-store []
+  (let [s (local/local-store)]
+    (st/-put s "users" "u1" {:name "Alice" :role "admin" :dept-key "d1"})
+    (st/-put s "departments" "d1" {:name "Engineering"})
+    s))
+
+(deftest kw->iri-string-roundtrips
+  (is (= "urn:kotobase:users/u1" (quads/kw->iri-string :users/u1)))
+  (is (= "urn:kotobase:role" (quads/kw->iri-string :role)))
+  (is (= :users/u1 (quads/iri-string->kw "urn:kotobase:users/u1")))
+  (is (= :role (quads/iri-string->kw "urn:kotobase:role")))
+  (is (nil? (quads/iri-string->kw "http://example.org/x"))))
+
+(deftest datoms->quads-transforms-every-triple
+  (let [db (bridge/materialize (fixture-store) ["users" "departments"])
+        qs (quads/datoms->quads db (constantly true))]
+    (testing "every quad is subject=IRI, predicate=IRI, object=literal"
+      (is (seq qs))
+      (doseq [{:keys [subject predicate object]} qs]
+        (is (= :iri (:rdf/type subject)))
+        (is (= :iri (:rdf/type predicate)))
+        (is (= :literal (:rdf/type object)))))
+    (testing "a specific doc attr survives the transform"
+      (is (some #(and (= (quads/iri "urn:kotobase:users/u1") (:subject %))
+                       (= (quads/iri "urn:kotobase:name") (:predicate %))
+                       (= (quads/->literal "Alice") (:object %)))
+                qs)))
+    (testing "synthetic :kotobase/coll and :kotobase/key are present"
+      (is (some #(= (quads/iri "urn:kotobase:kotobase/coll") (:predicate %)) qs))
+      (is (some #(= (quads/iri "urn:kotobase:kotobase/key") (:predicate %)) qs)))))
+
+(deftest visible-filters-triples-before-quad-transform
+  (let [db (bridge/materialize (fixture-store) ["users" "departments"])
+        no-u1? (fn [{:keys [s]}] (not= s :users/u1))
+        qs (quads/datoms->quads db no-u1?)]
+    (is (not (some #(= (quads/iri "urn:kotobase:users/u1") (:subject %)) qs)))
+    (is (some #(= (quads/iri "urn:kotobase:departments/d1") (:subject %)) qs))))
+
+(deftest visible-is-required-not-defaulted
+  (let [db (bridge/materialize (fixture-store) ["users"])]
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                 (quads/datoms->quads db nil))
+        "no permissive default -- ADR-2607050500")))
+
+;; --- non-keyword attributes do not 500 the surface --------------------------
+;; kotobase.query.bridge normalises document keys to keywords, which is the
+;; real fix. This is the floor underneath it: production spent an unknown
+;; period answering every SPARQL query with "internal error: Doesn't support
+;; namespace: v2" — ClojureScript's `namespace` throwing on a string — while
+;; /health returned 200. A query surface meeting an unexpected identifier
+;; shape should produce a usable IRI, not an internal error.
+
+(deftest a-string-attribute-produces-an-iri-rather-than-throwing
+  (is (= "urn:kotobase:v2" (quads/kw->iri-string "v2")))
+  (is (= "urn:kotobase:text" (quads/kw->iri-string "text"))))
+
+(deftest keywords-are-unchanged
+  (is (= "urn:kotobase:users/u1" (quads/kw->iri-string :users/u1)))
+  (is (= "urn:kotobase:role" (quads/kw->iri-string :role))))
+
+(deftest datoms-to-quads-survives-a-string-attribute
+  ;; The exact shape that was failing in production, driven through the
+  ;; function that actually transforms terms.
+  (let [db {:eavt {:c/k {"v2" #{1} :ok #{2}}}}
+        qs (quads/datoms->quads db (constantly true))]
+    (is (= 2 (count qs)))
+    (is (= #{"urn:kotobase:v2" "urn:kotobase:ok"}
+           (into #{} (map (comp :value :predicate)) qs)))))
+
+;; ── pattern pushdown (ADR-2608039970 / kotobase-client#19) ──────────────────
+
+(deftest a-query-scans-only-the-patterns-it-names
+  (testing "the whole point: what is read is the algebra's patterns, not the
+            plane. A source that recorded a scan for a pattern the query never
+            mentions would fail this"
+    (let [parsed (parser/parse "SELECT ?n WHERE { ?s <urn:kotobase:role> \"admin\" . ?s <urn:kotobase:name> ?n }")]
+      (is (= [[nil "role" "admin"] [nil "name" nil]]
+             (sparql/scan-patterns parsed))))))
+
+(deftest terms-map-to-the-components-a-source-binds
+  (is (= nil (quads/term->component '?s)) "a variable is a wildcard")
+  (is (= "alice" (quads/term->component (quads/iri "urn:kotobase:alice"))))
+  (is (= "users/u1" (quads/term->component (quads/iri "urn:kotobase:users/u1")))
+      "the RAW suffix — a keyword would match no row of a Datomic-API source")
+  (is (= "tea" (quads/term->component (quads/->literal "tea"))))
+  (is (= "http://example.org/x" (quads/term->component (quads/iri "http://example.org/x")))
+      "a foreign IRI binds ITSELF — nil is a wildcard, which would read every
+       datom and answer rows the query never asked for"))
+
+(deftest a-bare-attr-iri-is-the-kotobase-shorthand
+  (testing "the form kotobase-server's graph.sparql has always taken. Without
+            this, swapping that surface's implementation turns
+            `?e <:sp/name> \"alice\"` into a pattern that matches nothing —
+            or into a wildcard. Not an error: a wrong answer"
+    (is (= "urn:kotobase::sp/name" (:value (quads/iri ":sp/name"))))
+    (is (= ":sp/name" (quads/term->component (quads/iri ":sp/name"))))
+    (is (= (quads/iri ":sp/name") (quads/iri "urn:kotobase::sp/name"))
+        "one attribute, one term, whichever spelling the query used — BGP
+         matching is plain = on terms")
+    (is (= "http://example.org/x" (:value (quads/iri "http://example.org/x")))
+        "a foreign IRI is left exactly as written, not coerced into the
+         kotobase namespace")))
+
+(deftest describe-scans-both-positions-per-term
+  (is (= [["alice" nil nil] [nil nil "alice"]]
+         (quads/describe-scan-patterns [(quads/iri "urn:kotobase:alice")]))))
+
+(deftest the-two-backends-answer-the-same-quads
+  (testing "materialized db and pattern source are interchangeable — if they
+            disagree, swapping backends silently changes query results"
+    (let [store (fixture-store)
+          db (bridge/materialize store ["users"])
+          from-db (set (quads/datoms->quads db (constantly true)))
+          source (src/of-quads (bridge/datoms db (constantly true)))
+          from-src (set (quads/source->quads source [[nil nil nil]] (constantly true)))]
+      (is (= from-db from-src)))))
+
+(deftest source-quads-are-a-set-before-the-term-transform
+  (testing "two overlapping patterns must not double-count — DISTINCT and the
+            solution count both read from this"
+    (let [source (src/of-quads [{:s "alice" :p "knows" :o "bob"}])
+          quads (quads/source->quads source
+                                     [[nil "knows" nil] ["alice" nil nil] [nil nil "bob"]]
+                                     (constantly true))]
+      (is (= 1 (count quads))))))
+
+(deftest source-quads-require-visible
+  #_:clj-kondo/ignore
+  (is (thrown? #?(:clj Exception :cljs js/Error)
+               (quads/source->quads (src/of-quads []) [[nil nil nil]]))))

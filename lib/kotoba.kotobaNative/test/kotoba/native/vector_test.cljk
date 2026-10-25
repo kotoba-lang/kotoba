@@ -1,0 +1,222 @@
+(ns kotoba.native.vector-test
+  "`vector-i64` / `vector-f64` on both native ISAs (ADR-2608030300).
+
+  `kotoba-kir` has declared these operators since before either native backend
+  existed and `kotoba-wasm` has implemented them all along; only native had
+  nothing. What closed the gap is NOT a new value representation: a vector
+  value is a one-word handle, the same width and the same discipline as the
+  pair handle every option, result, string and keyword already travels as, so
+  all six operations are ordinary context calls.
+
+  These tests pin the three claims that make that lowering true rather than
+  merely plausible: the host table offsets, that construction is linear rather
+  than quadratic, and that the f64 family is the SAME lowering rather than a
+  parallel one that could drift."
+  (:refer-clojure :exclude [bit-and bit-or bit-shift-left bit-shift-right])
+  (:require [kotoba.native.test-support :refer [bit-and bit-or bit-shift-left bit-shift-right]]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.native.x86-64 :as x86]
+            [kotoba.native.aarch64 :as arm]))
+
+(defn- program [params body]
+  {:format :kotoba.kir/v4 :exports ['main]
+   :functions [{:name 'main :params params :body body}]})
+
+(defn- code [emit params body]
+  (vec (:code (emit (program params body)))))
+
+;; `call qword ptr [r9+disp32]` -- the encoding emit-heap-call uses for every
+;; offset above 127, which all six vector offsets are.
+(defn- x86-context-call [offset]
+  [0x41 0xff 0x91
+   (bit-and offset 0xff) (bit-and (bit-shift-right offset 8) 0xff)
+   (bit-and (bit-shift-right offset 16) 0xff) (bit-and (bit-shift-right offset 24) 0xff)])
+
+(defn- occurrences [haystack needle]
+  (count (filter #(= needle (subvec haystack % (+ % (count needle))))
+                 (range (inc (- (count haystack) (count needle)))))))
+
+;; ---------------------------------------------------------------------------
+;; The host table offsets
+;; ---------------------------------------------------------------------------
+
+;; Pinned here as well as in `tools/kexe_loader.c`'s own `_Static_assert`s and
+;; `kotoba.verifier`'s expected context ABI, because a silent disagreement
+;; between producer and host is exactly the class of bug the loader's asserts
+;; cannot catch: they only prove the C struct's own layout, never that the
+;; compiler calls the slot it means to.
+(deftest each-operation-calls-its-own-context-slot
+  ;; ADR 0084 (2026-09-16): `vector-count`, `vector-at` and `vector-assoc!`
+  ;; are emitted IN LINE and reach no slot -- `inline-handle-ops-test` pins
+  ;; their bytes. The operations that are still a call keep their own slot.
+  ;; This test was written before 0084 and asserted one call for the inline
+  ;; three; no runner executed it between 0084 and 2026-09-18 (ADR 0086).
+  (doseq [[body offset] [['(vector-assoc v i x) 184]
+                         ['(vector-conj v x) 160]
+                         ['(vector-drop v n) 192]]]
+    (testing (str body)
+      (is (= 1 (occurrences (code x86/emit-program '[v i x n] body)
+                            (x86-context-call offset)))
+          "exactly one call, to this operation's own slot")))
+  (doseq [[body offset] [['(vector-count v) 168]
+                         ['(vector-at v i) 176]]]
+    (testing (str body " is inline (ADR 0084)")
+      (is (= 0 (occurrences (code x86/emit-program '[v i x n] body)
+                            (x86-context-call offset)))
+          "no call to the slot it used to reach"))))
+
+(deftest an-empty-vector-is-one-call-to-the-construction-slot
+  (is (= 1 (occurrences (code x86/emit-program [] '(vector-new))
+                        (x86-context-call 152)))))
+
+;; ---------------------------------------------------------------------------
+;; ABI v4: the two operations the copying table could not express
+;; ---------------------------------------------------------------------------
+
+;; `ldr x16, [x7, #offset]` -- how AArch64 loads a context slot before
+;; `blr x16`. The offset is scaled by 8 and sits in imm12, so this is the
+;; AArch64 twin of `x86-context-call` above.
+(defn- arm-context-load [offset]
+  (let [word (bit-or 0xf9400000 (bit-shift-left (quot offset 8) 10)
+                     (bit-shift-left 7 5) 16)]
+    [(bit-and word 0xff) (bit-and (bit-shift-right word 8) 0xff)
+     (bit-and (bit-shift-right word 16) 0xff) (bit-and (bit-shift-right word 24) 0xff)]))
+
+;; The whole reason `vector-assoc!` exists is that it calls a DIFFERENT slot
+;; from `vector-assoc`. If it called 184 the program would still compute the
+;; right answer -- a copy and an in-place write are indistinguishable on a
+;; handle the caller has proved dead, which is exactly why the KIR interpreter
+;; refuses to tell them apart -- and the only thing lost would be the cost
+;; model the operation exists for. So a test that only checked the ANSWER
+;; could not see this regression at all; nothing but the emitted slot can.
+(deftest abi-v4-operations-call-their-own-context-slot
+  ;; `vector-alloc` is still a call. `vector-assoc!` is inline since ADR 0084
+  ;; (its store is pinned in `inline-handle-ops-test`), so here it is asserted
+  ;; to reach NEITHER its old slot 208 nor the copying slot 184 on either ISA.
+  (doseq [[body offset] [['(vector-alloc n) 200]]]
+    (testing (str body)
+      (is (= 1 (occurrences (code x86/emit-program '[v i x n] body)
+                            (x86-context-call offset)))
+          "x86-64: exactly one call, to this operation's own slot")
+      (is (= 1 (occurrences (code arm/emit-program '[v i x n] body)
+                            (arm-context-load offset)))
+          "AArch64: exactly one context load, of this operation's own slot")))
+  (testing "(vector-assoc! v i x) is inline (ADR 0084)"
+    (let [x86 (code x86/emit-program '[v i x n] '(vector-assoc! v i x))
+          arm (code arm/emit-program '[v i x n] '(vector-assoc! v i x))]
+      (is (= 0 (occurrences x86 (x86-context-call 208))))
+      (is (= 0 (occurrences x86 (x86-context-call 184))) "and not the copying slot either")
+      (is (= 0 (occurrences arm (arm-context-load 208))))
+      (is (= 0 (occurrences arm (arm-context-load 184)))))))
+
+(deftest the-bang-is-the-only-difference-between-the-store-and-the-copy
+  ;; Since ADR 0084 the difference is larger than a slot number: the copy is
+  ;; still a call to 184 and the store is an inline check + table read +
+  ;; store that reaches no slot at all. What must still hold is that the
+  ;; store never reaches the ALLOCATING slot -- a store that copied would
+  ;; compute the right answer and lose the cost model the operation exists for.
+  (let [copy (code x86/emit-program '[v i x] '(vector-assoc v i x))
+        store (code x86/emit-program '[v i x] '(vector-assoc! v i x))]
+    (is (= 1 (occurrences copy (x86-context-call 184))))
+    (is (= 0 (occurrences copy (x86-context-call 208))))
+    (is (= 0 (occurrences store (x86-context-call 208))) "inline, no slot (ADR 0084)")
+    (is (= 0 (occurrences store (x86-context-call 184)))
+        "the store must not reach the allocating slot")
+    (is (not= copy store) "a copy and a store are different code")))
+
+;; KIR declares no `vector-f64-alloc` and no `vector-f64-assoc!`, so unlike
+;; every operation in `vector-op-aliases` these two have no f64 twin to stay
+;; in step with. Pinned so that adding one later is a deliberate act rather
+;; than something that quietly starts working.
+(deftest the-abi-v4-operations-have-no-f64-twin
+  (doseq [body ['(vector-f64-alloc n) '(vector-f64-assoc! v i x)]]
+    (testing (str body)
+      (is (thrown? ExceptionInfo
+                   (code x86/emit-program '[v i x n] body)))
+      (is (thrown? ExceptionInfo
+                   (code arm/emit-program '[v i x n] body))))))
+
+;; ---------------------------------------------------------------------------
+;; Construction is linear
+;; ---------------------------------------------------------------------------
+
+;; KIR's `vector-new` is variadic and the context ABI is not, so construction
+;; expands to one `conj` per element. That expansion is only acceptable
+;; because the host appends in place when the source slice ends at the arena
+;; top -- which every intermediate here does, by construction. If a future
+;; change made `vector-new` allocate a fresh copy per element instead, this
+;; count would not move but the loader's copy counter would; the paired
+;; guarantee lives in `checked_vector_conj`.
+(deftest construction-is-one-conj-per-element
+  (doseq [arity (range 0 5)]
+    (let [body (cons 'vector-new (take arity '[a b c d]))
+          emitted (code x86/emit-program '[a b c d] body)]
+      (testing (str body)
+        (is (= 1 (occurrences emitted (x86-context-call 152)))
+            "one empty-vector construction")
+        (is (= arity (occurrences emitted (x86-context-call 160)))
+            "one conj per element, and no more")))))
+
+;; ---------------------------------------------------------------------------
+;; The f64 family is the same lowering, not a parallel one
+;; ---------------------------------------------------------------------------
+
+;; A native f64 is already an i64 word carrying an IEEE-754 bit pattern, so an
+;; f64 vector is a vector of those words. Byte equality is the strongest
+;; available statement that the two KIR families cannot drift apart below this
+;; layer: not "both work", but "they are one emission".
+(deftest f64-vector-operations-emit-identically-to-their-i64-counterparts
+  (doseq [[i64-body f64-body params]
+          [['(vector-new a b) '(vector-f64-new a b) '[a b]]
+           ['(vector-count v) '(vector-f64-count v) '[v]]
+           ['(vector-at v i) '(vector-f64-at v i) '[v i]]
+           ['(vector-get v i d) '(vector-f64-get v i d) '[v i d]]
+           ['(vector-assoc v i x) '(vector-f64-assoc v i x) '[v i x]]
+           ['(vector-conj v x) '(vector-f64-conj v x) '[v x]]
+           ['(vector-drop v n) '(vector-f64-drop v n) '[v n]]]]
+    (testing (str f64-body)
+      (is (= (code x86/emit-program params i64-body)
+             (code x86/emit-program params f64-body))
+          "x86-64: same emission")
+      (is (= (code arm/emit-program params i64-body)
+             (code arm/emit-program params f64-body))
+          "AArch64: same emission"))))
+
+;; ---------------------------------------------------------------------------
+;; vector-get is total
+;; ---------------------------------------------------------------------------
+
+;; `vector-at` traps out of range; `vector-get` must not, because it carries a
+;; fallback. It therefore lowers to a bounds test around `vector-at` -- and
+;; the fallback is emitted ONCE, so nesting a `vector-get` inside another
+;; one's fallback cannot double the code size at each level.
+(deftest vector-get-tests-both-bounds-and-emits-its-fallback-once
+  ;; ADR 0084: `vector-count` and `vector-at` are inline, so the bound and
+  ;; the element read are no longer slot calls but the inline handle check
+  ;; (`lea r11,[rsi-1]; cmp r11,r10; jae`), which appears once per inline
+  ;; operation. What this test still says: one level of `vector-get` reads
+  ;; the count and the element exactly once each, and nesting adds one level.
+  (let [check [0x4c 0x8d 0x5e 0xff 0x4d 0x39 0xd3 0x0f 0x83]
+        emitted (code x86/emit-program '[v i d] '(vector-get v i d))]
+    (is (= 0 (occurrences emitted (x86-context-call 168))) "vector-count is inline")
+    (is (= 0 (occurrences emitted (x86-context-call 176))) "vector-at is inline")
+    (is (= 2 (occurrences emitted check))
+        "one inline handle check for the count and one for the element"))
+  (let [check [0x4c 0x8d 0x5e 0xff 0x4d 0x39 0xd3 0x0f 0x83]
+        single (code x86/emit-program '[v i d] '(vector-get v i d))
+        nested (code x86/emit-program '[v i d]
+                     '(vector-get v i (vector-get v i d)))]
+    (is (= 4 (occurrences nested check))
+        "two inline checks per nesting level, not per level squared")
+    (is (< (count nested) (* 2 (count single)))
+        "nesting adds a level, it does not double the whole expansion")))
+
+;; A vector handle is an ordinary one-word value, so it composes with the
+;; value forms that already exist rather than needing its own copies of them.
+(deftest a-vector-handle-is-an-ordinary-word
+  (doseq [[params body] [['[a] '(let [v (vector-new a)] (vector-count v))]
+                         ['[a] '(if (vector-count (vector-new a)) 1 0)]
+                         ['[a] '(vector-count (vector-conj (vector-new a) a))]]]
+    (testing (str body)
+      (is (seq (code x86/emit-program params body)) "x86-64")
+      (is (seq (code arm/emit-program params body)) "AArch64"))))

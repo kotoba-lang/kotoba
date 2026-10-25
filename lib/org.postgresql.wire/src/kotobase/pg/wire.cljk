@@ -1,0 +1,467 @@
+(ns kotobase.pg.wire
+  "PostgreSQL frontend/backend wire protocol (version 3.0) -- startup
+  handshake + the SIMPLE QUERY subprotocol only, over plain `node:net`
+  (zero npm dependencies), matching the `kotoba-lang/dtn` /
+  `kotoba-lang/org-ietf-sftp` real-TCP-transport precedent
+  (ADR-2607161817, ADR-2607162135; ADR-2607172300 names this repo as
+  following the same core/transport split). `.cljs`-only (node:net +
+  Buffer): cannot run on the JVM, and is never `:require`d by
+  `kotobase.pg.sql` (the pure `.cljc` SQL core) -- see that namespace's
+  own docstring for why the decoupling matters, and this repo's
+  `deps.edn` for how CI keeps the JVM compat suite from ever touching
+  this file.
+
+  > [!WARNING]
+  > **NO TLS. NO REAL AUTHENTICATION. NOT SAFE TO EXPOSE ON A NETWORK YOU
+  > DON'T FULLY TRUST.** A client's `SSLRequest` is answered `N` (\"no
+  > SSL available\", RFC-legal, causes any well-behaved client to fall
+  > back to plaintext) -- there is no TLS negotiation implemented at all.
+  > Every `StartupMessage` is answered `AuthenticationOk` unconditionally
+  > -- no password, no SCRAM, no cert check, no username/database
+  > enforcement of any kind. This is an explicit, deliberate v0.1
+  > carve-out (ADR-2607172300 names it: \"skip real auth for v0.1\"),
+  > not an oversight -- do not use this to protect anything sensitive,
+  > and do not run it on the open internet as-is.
+
+  ## What this namespace implements (and nothing more -- v0.1 scope)
+
+  - **Startup**: reads a client's `StartupMessage` (protocol version +
+    parameters), answers `SSLRequest` with a plain deny byte `N` (does
+    NOT implement TLS -- see warning), answers a real `StartupMessage`
+    with `AuthenticationOk` + a handful of `ParameterStatus` messages +
+    `BackendKeyData` + `ReadyForQuery`.
+  - **Simple Query subprotocol**: reads a `Query` message (`'Q'` + a
+    null-terminated SQL string), runs it through `kotobase.pg.sql`
+    (the ONLY query execution path -- this namespace has no SQL
+    knowledge of its own), and answers with `RowDescription` +
+    `DataRow` (one per result row) + `CommandComplete` + `ReadyForQuery`
+    on success, or `ErrorResponse` + `ReadyForQuery` if
+    `kotobase.pg.sql/execute` throws (out-of-scope/malformed SQL, or any
+    other execution error) -- an out-of-scope query is a normal
+    Postgres-shaped error to the client, never a silent
+    mis-execution or a crashed connection.
+  - `Terminate` (`'X'`) closes the connection cleanly.
+  - Every OTHER frontend message type (`Parse`/`Bind`/`Execute`/
+    `Describe`/`Sync`/`Close` -- the EXTENDED query protocol; `CopyData`
+    etc.) gets a plain `ErrorResponse` (\"unsupported message type\")
+    followed by `ReadyForQuery` -- not a crash, not a silent hang, but
+    also genuinely NOT IMPLEMENTED: this repo does not support prepared
+    statements, portals, or COPY. See ns docstring's WARNING and the
+    README for the full explicit out-of-scope list.
+
+  ## Result shaping (a real, documented narrowing)
+
+  Every column is reported to the client as Postgres OID 25 (`text`),
+  variable length, text format -- because `kotobase.query.bridge`
+  materializes schemaless documents (see that namespace's own doc->datom
+  mapping), there is no static column type to report. Every value is
+  therefore rendered to its Postgres TEXT wire representation:
+  strings as-is, numbers via `str`, booleans as `t`/`f`, `nil` as SQL
+  `NULL` (a `-1`-length `DataRow` field, no bytes). This is honest and
+  simple, not a claim of real Postgres type-OID fidelity -- a real `psql`
+  client displays every column as if it were `text`, which is correct
+  behavior for a `text`-typed column, just not what a real `int4`/`bool`
+  column would show.
+
+  ## What is verified vs. not (read before trusting this)
+
+  See this repo's README for the authoritative, up-to-date table. In
+  short: message encode/decode round-trips and the startup-code
+  classifier are unit-tested with no sockets involved
+  (`kotobase.pg.wire-test`); `test/kotobase/pg/wire_demo.cljk` spawns a
+  real second `nbb` OS process running this namespace as a server and
+  drives it from a genuinely separate process over a real TCP socket
+  with a minimal hand-rolled client (raw `StartupMessage`/`Query` bytes
+  built and sent by hand, raw response bytes parsed and checked byte-for-
+  byte) -- see that file for exactly what is and is not exercised.
+  Interop with a real `psql`/`libpq`/any off-the-shelf Postgres driver
+  has NOT been attempted and is NOT claimed."
+  (:require [kotoba.lang.text :as str]
+            [kotobase.pg.sql :as sql]
+            ["node:net" :as net]))
+
+;; ---------------------------------------------------------------------------
+;; Byte-level primitives -- public: reused by the unit tests
+;; (kotobase.pg.wire-test, no sockets) and by the hand-rolled test client in
+;; test/kotobase/pg/wire_demo.cljk to build requests / decode responses.
+;; ---------------------------------------------------------------------------
+
+(defn i32
+  "Big-endian signed 4-byte integer, as a Buffer. Used for every Postgres
+  wire int32 field, including ones the spec treats as unsigned (message
+  lengths, OIDs) -- every value this repo ever writes there fits well
+  within the signed positive range, so `writeInt32BE`/`readUInt32BE`
+  agree bit-for-bit; only the SEMANTICALLY negative fields (`-1` for
+  NULL / variable length / no type modifier) actually rely on the signed
+  interpretation."
+  [n]
+  (let [b (js/Buffer.alloc 4)]
+    (.writeInt32BE b n 0)
+    b))
+
+(defn read-u32 [^js buf offset] (.readUInt32BE buf offset))
+(defn read-i32 [^js buf offset] (.readInt32BE buf offset))
+
+(defn i16
+  [n]
+  (let [b (js/Buffer.alloc 2)]
+    (.writeInt16BE b n 0)
+    b))
+
+(defn read-i16 [^js buf offset] (.readInt16BE buf offset))
+
+(defn char-code [c] (.charCodeAt (str c) 0))
+
+(defn byte1 [c] (js/Buffer.from #js [(char-code c)]))
+
+(defn cstring
+  "Postgres wire `String`: UTF-8 bytes + a single NUL terminator."
+  [s]
+  (js/Buffer.concat #js [(js/Buffer.from (str s) "utf8") (js/Buffer.from #js [0])]))
+
+(defn read-cstring
+  "-> [string next-offset]. Reads bytes from `buf` starting at `offset`
+  up to (not including) the next NUL byte."
+  [^js buf offset]
+  (loop [i offset]
+    (if (zero? (aget buf i))
+      [(.toString buf "utf8" offset i) (inc i)]
+      (recur (inc i)))))
+
+(defn build-msg
+  "A tagged backend/frontend message: 1-byte `type-char` + int32 length
+  (INCLUDING the length field itself, per protocol convention, but NOT
+  the type byte) + `body`."
+  [type-char ^js body]
+  (js/Buffer.concat #js [(byte1 type-char) (i32 (+ 4 (.-length body))) body]))
+
+;; ---------------------------------------------------------------------------
+;; Startup-phase codes (RFC-less, but the exact magic numbers every real
+;; Postgres wire implementation -- including this one -- must recognize;
+;; see PostgreSQL's own protocol docs, section 52.2/52.7)
+;; ---------------------------------------------------------------------------
+
+(def protocol-version-3 196608) ;; 0x00030000 -- major 3, minor 0
+(def ssl-request-code 80877103) ;; 0x04D2162F
+(def cancel-request-code 80877102) ;; 0x04D2162E
+
+(defn classify-startup-code
+  "Pure classifier, no I/O -- unit-testable on its own. `code` is the
+  int32 that follows a startup packet's length field."
+  [code]
+  (cond
+    (= code ssl-request-code) :ssl-request
+    (= code cancel-request-code) :cancel-request
+    (= 3 (bit-shift-right code 16)) :startup-message
+    :else :unsupported))
+
+;; ---------------------------------------------------------------------------
+;; Message builders -- backend (server) -> frontend (client)
+;; ---------------------------------------------------------------------------
+
+(def ssl-deny-byte
+  "The (unframed -- NOT wrapped in build-msg) single-byte reply to
+  SSLRequest meaning \"no SSL support\" (a well-behaved client falls
+  back to plaintext on seeing this, per the protocol spec)."
+  (js/Buffer.from #js [(char-code \N)]))
+
+(defn build-authentication-ok [] (build-msg \R (i32 0)))
+
+(defn build-parameter-status [k v]
+  (build-msg \S (js/Buffer.concat #js [(cstring k) (cstring v)])))
+
+(defn build-backend-key-data [process-id secret-key]
+  (build-msg \K (js/Buffer.concat #js [(i32 process-id) (i32 secret-key)])))
+
+(defn build-ready-for-query [status-char] (build-msg \Z (byte1 status-char)))
+
+(def ^:private field-type-oid-text 25)
+
+(defn- field-descriptor [col-name]
+  (js/Buffer.concat
+   #js [(cstring col-name)
+        (i32 0)                       ;; table OID -- none, not backed by a real catalog table
+        (i16 0)                       ;; column attribute number -- none
+        (i32 field-type-oid-text)     ;; type OID -- always `text` (see ns docstring)
+        (i16 -1)                      ;; type length -- variable
+        (i32 -1)                      ;; type modifier -- none
+        (i16 0)]))                    ;; format code -- text
+
+(defn build-row-description [col-names]
+  (build-msg \T
+             (js/Buffer.concat
+              (into-array (cons (i16 (count col-names)) (map field-descriptor col-names))))))
+
+(defn pg-value->bytes
+  "A materialized `kotobase.query.bridge` cell value -> its Postgres TEXT
+  wire representation (a Buffer), or `nil` for SQL NULL. See ns
+  docstring's \"Result shaping\" section."
+  [v]
+  (cond
+    (nil? v) nil
+    (string? v) (js/Buffer.from v "utf8")
+    (boolean? v) (js/Buffer.from (if v "t" "f") "utf8")
+    (number? v) (js/Buffer.from (str v) "utf8")
+    :else (js/Buffer.from (pr-str v) "utf8")))
+
+(defn- data-row-field [v]
+  (if-let [b (pg-value->bytes v)]
+    (js/Buffer.concat #js [(i32 (.-length b)) b])
+    (i32 -1)))
+
+(defn build-data-row [values]
+  (build-msg \D
+             (js/Buffer.concat
+              (into-array (cons (i16 (count values)) (map data-row-field values))))))
+
+(defn build-command-complete [tag] (build-msg \C (cstring tag)))
+
+(defn build-empty-query-response [] (build-msg \I (js/Buffer.alloc 0)))
+
+(defn build-error-response
+  "A minimal ErrorResponse: Severity/SQLSTATE/Message fields only (no
+  Detail/Hint/Position -- real `libpq` tolerates a message with only the
+  fields it needs; these three are the ones every client actually reads).
+  `sqlstate` defaults to `42601` (`syntax_error`) -- this repo does not
+  attempt to map its own `kotobase.pg.sql` error `:reason`/`:feature`
+  keys onto the real, much larger, Postgres SQLSTATE catalog; every error
+  this repo can produce is, in spirit, a syntax/unsupported-syntax error."
+  ([message] (build-error-response message "42601"))
+  ([message sqlstate]
+   (build-msg \E
+              (js/Buffer.concat
+               #js [(byte1 \S) (cstring "ERROR")
+                    (byte1 \C) (cstring sqlstate)
+                    (byte1 \M) (cstring message)
+                    (js/Buffer.from #js [0])]))))
+
+;; ---------------------------------------------------------------------------
+;; Message decoders -- for tests / the demo's hand-rolled client to
+;; verify what the server actually sent, byte-for-byte, not merely "some
+;; response arrived."
+;; ---------------------------------------------------------------------------
+
+(defn parse-message-header
+  "A full tagged message Buffer (as produced by `build-msg`, or read off
+  a real socket) -> {:type <char string> :body <Buffer>}."
+  [^js buf]
+  {:type (.toString buf "utf8" 0 1)
+   :body (.subarray buf 5)})
+
+(defn decode-row-description [^js body]
+  (let [n (read-i16 body 0)]
+    (loop [i 0 off 2 acc []]
+      (if (= i n)
+        acc
+        (let [[name off2] (read-cstring body off)
+              off3 (+ off2 4 2 4 2 4 2)] ;; tableOid+colAttr+typeOid+typeLen+typeMod+formatCode
+          (recur (inc i) off3 (conj acc name)))))))
+
+(defn decode-data-row [^js body]
+  (let [n (read-i16 body 0)]
+    (loop [i 0 off 2 acc []]
+      (if (= i n)
+        acc
+        (let [len (read-i32 body off)]
+          (if (= len -1)
+            (recur (inc i) (+ off 4) (conj acc nil))
+            (recur (inc i) (+ off 4 len) (conj acc (.toString body "utf8" (+ off 4) (+ off 4 len))))))))))
+
+(defn decode-command-complete [^js body] (first (read-cstring body 0)))
+
+(defn decode-ready-for-query [^js body] (.toString body "utf8" 0 1))
+
+(defn decode-error-response
+  "-> {\"S\" \"ERROR\" \"C\" \"42601\" \"M\" \"...\"} (whatever fields
+  were present -- this repo only ever writes S/C/M, see
+  `build-error-response`)."
+  [^js body]
+  (loop [off 0 acc {}]
+    (let [field-type (aget body off)]
+      (if (zero? field-type)
+        acc
+        (let [[v next] (read-cstring body (inc off))]
+          (recur next (assoc acc (.toString body "utf8" off (inc off)) v)))))))
+
+(defn decode-parameter-status [^js body]
+  (let [[k off] (read-cstring body 0)
+        [v _] (read-cstring body off)]
+    [k v]))
+
+(defn decode-backend-key-data [^js body] {:process-id (read-i32 body 0) :secret-key (read-i32 body 4)})
+
+;; ---------------------------------------------------------------------------
+;; Frontend (client) message builders -- used by the demo's hand-rolled
+;; test client (and by any future real client), not by the server itself.
+;; ---------------------------------------------------------------------------
+
+(defn build-startup-message
+  "`params` a map of Postgres startup parameters, e.g.
+  `{\"user\" \"kotobase\" \"database\" \"kotobase\"}`."
+  [params]
+  (let [body (js/Buffer.concat
+              (into-array
+               (concat [(i32 protocol-version-3)]
+                       (mapcat (fn [[k v]] [(cstring k) (cstring v)]) params)
+                       [(js/Buffer.from #js [0])])))]
+    (js/Buffer.concat #js [(i32 (+ 4 (.-length body))) body])))
+
+(defn build-ssl-request []
+  (js/Buffer.concat #js [(i32 8) (i32 ssl-request-code)]))
+
+(defn build-query-message [sql] (build-msg \Q (cstring sql)))
+
+(defn build-terminate-message [] (build-msg \X (js/Buffer.alloc 0)))
+
+;; ---------------------------------------------------------------------------
+;; Server: connection state + incremental buffer processing
+;; ---------------------------------------------------------------------------
+
+(defn- new-connection-state [socket store visible?]
+  (atom {:socket socket :store store :visible? visible?
+         :raw (js/Buffer.alloc 0) :phase :startup :closed? false
+         ;; process-id/secret-key are only meaningful for a real
+         ;; CancelRequest flow, which this repo does not implement (see
+         ;; ns docstring) -- present only because BackendKeyData is part
+         ;; of a well-formed startup handshake every real client expects.
+         :process-id (rand-int 2147483647) :secret-key (rand-int 2147483647)}))
+
+(defn- send! [state-atom ^js buf]
+  (when-not (:closed? @state-atom)
+    (.write (:socket @state-atom) buf)))
+
+(defn- close! [state-atom]
+  (when-not (:closed? @state-atom)
+    (swap! state-atom assoc :closed? true)
+    (try (.destroy (:socket @state-atom)) (catch :default _ nil))))
+
+(def ^:private default-parameter-statuses
+  [["server_version" "13.0.0-kotobase-org-postgresql-wire-0.1"]
+   ["client_encoding" "UTF8"]
+   ["server_encoding" "UTF8"]
+   ["DateStyle" "ISO, MDY"]
+   ["integer_datetimes" "on"]])
+
+(defn- send-startup-response! [state-atom]
+  (send! state-atom (build-authentication-ok))
+  (doseq [[k v] default-parameter-statuses]
+    (send! state-atom (build-parameter-status k v)))
+  (send! state-atom (build-backend-key-data (:process-id @state-atom) (:secret-key @state-atom)))
+  (send! state-atom (build-ready-for-query \I)))
+
+(defn- handle-query! [state-atom sql-text]
+  (let [{:keys [store visible?]} @state-atom]
+    (if (str/blank? sql-text)
+      (do (send! state-atom (build-empty-query-response))
+          (send! state-atom (build-ready-for-query \I)))
+      (try
+        (let [{:keys [columns rows]} (sql/execute store sql-text visible?)]
+          (send! state-atom (build-row-description columns))
+          (doseq [row rows] (send! state-atom (build-data-row row)))
+          (send! state-atom (build-command-complete (str "SELECT " (count rows))))
+          (send! state-atom (build-ready-for-query \I)))
+        (catch :default e
+          (send! state-atom (build-error-response (or (.-message e) (str e))))
+          (send! state-atom (build-ready-for-query \I)))))))
+
+(defn- dispatch-normal-message! [state-atom msg-type ^js body]
+  (cond
+    (= msg-type (char-code \Q))
+    (handle-query! state-atom (first (read-cstring body 0)))
+
+    (= msg-type (char-code \X))
+    (close! state-atom)
+
+    :else
+    (do (send! state-atom
+               (build-error-response
+                (str "unsupported message type " (char msg-type)
+                     " -- only simple Query ('Q') and Terminate ('X') are supported "
+                     "in this v0.1 protocol subset (no extended query protocol, no COPY)")))
+        (send! state-atom (build-ready-for-query \I)))))
+
+(defn- take! [state n]
+  (let [raw (:raw state)]
+    [(.subarray raw 0 n) (assoc state :raw (.subarray raw n))]))
+
+(defn- process-startup! [state-atom]
+  (let [{:keys [raw] :as state} @state-atom]
+    (when (>= (.-length raw) 4)
+      (let [total-len (read-u32 raw 0)]
+        (when (>= (.-length raw) total-len)
+          (let [[packet state1] (take! state total-len)
+                code (read-u32 packet 4)
+                rest-buf (.subarray packet 8)]
+            (reset! state-atom state1)
+            (case (classify-startup-code code)
+              :ssl-request
+              (do (send! state-atom ssl-deny-byte) true)
+
+              :cancel-request
+              (do (close! state-atom) false)
+
+              :startup-message
+              (let [params (loop [off 0 acc {}]
+                              (if (>= off (dec (.-length rest-buf)))
+                                acc
+                                (let [[k off2] (read-cstring rest-buf off)
+                                      [v off3] (read-cstring rest-buf off2)]
+                                  (recur off3 (assoc acc k v)))))]
+                (swap! state-atom assoc :phase :normal :startup-params params)
+                (send-startup-response! state-atom)
+                true)
+
+              :unsupported
+              (do (close! state-atom) false))))))))
+
+(defn- process-normal! [state-atom]
+  (let [{:keys [raw] :as state} @state-atom]
+    (when (>= (.-length raw) 5)
+      (let [msg-len (read-u32 raw 1)
+            total (+ 1 msg-len)]
+        (when (>= (.-length raw) total)
+          (let [[full state1] (take! state total)
+                msg-type (aget full 0)
+                body (.subarray full 5)]
+            (reset! state-atom state1)
+            (dispatch-normal-message! state-atom msg-type body)
+            true))))))
+
+(defn- process! [state-atom]
+  (loop []
+    (when-not (:closed? @state-atom)
+      (let [advanced?
+            (case (:phase @state-atom)
+              :startup (process-startup! state-atom)
+              :normal (process-normal! state-atom)
+              nil)]
+        (when advanced? (recur))))))
+
+;; ---------------------------------------------------------------------------
+;; Public API
+;; ---------------------------------------------------------------------------
+
+(defn start-server!
+  "opts: {:port :store :visible? (required, see kotobase.pg.sql's ns
+  docstring -- no permissive default) :on-connection (optional, called
+  with the per-connection state-atom right when a socket connects, for
+  test/demo introspection)}. Returns the node:net Server."
+  [{:keys [port store visible? on-connection]}]
+  (when (nil? visible?)
+    (throw (ex-info "kotobase.pg.wire/start-server!: :visible? is required (no permissive default -- ADR-2607050500)"
+                     {:type :kotobase.pg.wire/visible-required})))
+  (let [server (net/createServer
+                (fn [socket]
+                  (let [state (new-connection-state socket store visible?)]
+                    (when on-connection (on-connection state))
+                    (.on socket "data"
+                         (fn [chunk]
+                           (swap! state update :raw (fn [prev] (js/Buffer.concat #js [prev chunk])))
+                           (process! state)))
+                    (.on socket "error" (fn [_e] (swap! state assoc :closed? true)))
+                    (.on socket "close" (fn [] (swap! state assoc :closed? true))))))]
+    (.listen server port)
+    server))
+
+(defn stop-server! [server]
+  (js/Promise. (fn [resolve _] (.close server (fn [_err] (resolve true))))))

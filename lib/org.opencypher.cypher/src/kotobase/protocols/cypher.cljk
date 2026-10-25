@@ -1,0 +1,1120 @@
+(ns kotobase.protocols.cypher
+  "cypher.kotobase.net -- an openCypher (openCypher.org) query surface over
+  kotobase, via the shared `kotobase.query.bridge` (ADR-2607172300 in
+  `com-junkawasaki/root`).
+
+  **Why HTTP, not Bolt**: Bolt is binary, stateful, and has no precedent in
+  this workspace; the HTTP transaction-endpoint shape (Neo4j's HTTP Cypher
+  API) fits the established `.cljc` ring-shaped handler pattern
+  (`kotobase.protocols.cypher.http`) directly, and is the ADR's explicit,
+  deliberate v0.1 decision -- not revisited here.
+
+  ## Wire shape: `POST /db/data/transaction/commit`
+
+  Request body (JSON):
+  ```json
+  {\"statements\": [{\"statement\": \"MATCH (n:users) WHERE n.role = 'admin' RETURN n.name, n.role\",
+                    \"parameters\": {}}]}
+  ```
+  Response body (JSON), always HTTP 200 once the request itself parses as
+  valid JSON with a `statements` array (matches real Neo4j: query-level
+  errors are reported IN the body, not via HTTP status):
+  ```json
+  {\"results\": [{\"columns\": [\"n.name\", \"n.role\"],
+                 \"data\": [{\"row\": [\"Alice\", \"admin\"], \"meta\": [null, null]}]}],
+   \"errors\": []}
+  ```
+  Statements run in order; the first statement whose Cypher fails to parse
+  or execute aborts the whole request -- `results` holds every statement
+  that ran successfully before it, `errors` holds exactly one entry
+  `{\"code\" \"...\" \"message\" \"...\"}`, and statements after the failing one
+  do not run. This mirrors the real HTTP Cypher API's auto-commit,
+  abort-on-first-error transaction semantics. `\"code\"` values are modeled on
+  (not a guaranteed-identical enumeration of) Neo4j's
+  `Neo.ClientError.Statement.*` / `Neo.ClientError.Request.*` naming.
+
+  Malformed JSON, or JSON without a `statements` array, is a request-level
+  failure -- HTTP 400, `{\"results\" [] \"errors\" [...]}` -- since there is no
+  statement to even attempt.
+
+  ## v0.1 Cypher subset (hard scope boundary, ADR-2607172300)
+
+  ```
+  MATCH (a:A)[-[:REL]->(b:B) ...]      ; any number of hops, rightward only
+    [WHERE <boolean expression>]         ; = < > <= >= <> CONTAINS IS [NOT] NULL
+                                         ; combined with AND / OR / NOT / ( )
+    RETURN [DISTINCT] <item> [AS alias] [, ...]
+                                         ; <item> is n.prop, count(*), count(n.prop)
+    [ORDER BY n.propA [ASC|DESC] [, ...]] [SKIP n] [LIMIT n]
+  ```
+
+  - exactly one `MATCH` clause, one `RETURN` clause, at most one `WHERE`.
+  - every node pattern MUST be labeled (`(n:Label)`, not bare `(n)`).
+  - `WHERE` is a boolean expression: `=`, `<`, `>`, `<=`, `>=`, `<>`,
+    combined with `AND`, `OR`, `NOT` and parentheses, at Cypher's own
+    precedence (OR looser than AND, AND looser than NOT). No `IS NULL`, no
+    string functions.
+  - `OR` branches may be conjunctions, because `arrangement.datalog` takes
+    `(and ...)` as a branch since kotoba-lang/arrangement#13 -- so a
+    comparison, `IS NULL`, or a parenthesised group inside `OR` all work.
+  - **`NOT` negates the OPERATOR rather than wrapping a datalog `not`.**
+    Cypher's logic is three-valued: `NOT n.age > 18` on a node with no `age`
+    is `NOT NULL`, which is NULL, which does not match. Operator negation
+    keeps that; a `(not [e a v])` would INCLUDE those rows, which is a
+    different query. `NOT` over a predicate with no negated form (CONTAINS)
+    is refused by name rather than guessed.
+  - `IS NULL` asks about ABSENCE. Neither Cypher nor this store distinguishes
+    a missing property from a null one -- `doc->datoms` emits no datom for a
+    nil -- so there is one answer and not two.
+  - **`count` counts NODES, not distinct values.** datalog has set semantics,
+    so the entity variables go into `:find` whenever an aggregate is present;
+    without them `count(n.role)` over four users holding two roles would be 2.
+    It is still a count of DISTINCT solutions, which differs from real
+    Cypher's bag exactly where someone is counting duplicates on purpose.
+    `=` translates to a literal IN the triple so the index can probe it; a
+    comparison binds the property to a fresh lvar and constrains it with an
+    `arrangement.datalog` predicate clause. Same operator family, two very
+    different plans, which is why they are not unified.
+  - `RETURN` projects one or more `var.prop` properties -- never a bare
+    node/relationship, never `*`, never an alias (`AS`), never an aggregate.
+  - `DISTINCT`, `ORDER BY` (per-item `ASC`/`DESC`), `SKIP` and `LIMIT` are
+    supported, applied to result ROWS in Cypher's clause order. `ORDER BY`
+    may only name a property `RETURN` projects -- ordering by an unreturned
+    one needs the sort key carried through the result set and dropped again,
+    so it is rejected by name rather than silently ignored.
+  - values are string/number/boolean/`null`/`$parameter` literals only.
+  - **no** `CREATE`/`MERGE`/`DELETE`/`SET`/`REMOVE`/`DETACH`/`FOREACH`/
+    `CALL`/`UNWIND`/`LOAD CSV` -- this is a READ-ONLY query surface,
+    rejected with an explicit, named error (not silently mis-executed).
+  - **no** variable-length paths (`-[:REL*1..3]->`), no multi-hop chains
+    (more than one relationship in a single pattern).
+  - each of these is rejected with a clear parse-time error, never
+    silently ignored or partially executed -- see `parse`.
+
+  With no `ORDER BY`, `execute` still sorts rows by their stringified value
+  for deterministic output across runs -- the bridge promises no order, and
+  an unstable result set is worse than an arbitrary but repeatable one. That
+  is an implementation convenience; `ORDER BY` is the contract.
+
+  ## Label -> collection mapping
+
+  A Cypher label names a `kotobase.store` collection materialized via
+  `kotobase.query.bridge/materialize`. A label that IS a collection key is used
+  verbatim -- `(n:users)` queries the `\"users\"` collection exactly, with no
+  case-folding, pluralization or other transform.
+
+  `kotobase.store` collection keys are not all strings, though, and that is
+  not a corner case: `kotobase.protocols.s3` keys its objects
+  `[:kotobase.s3/objects bucket]` and `kotobase.protocols.atproto` keys its
+  records `[:kotobase.at/records did nsid]`. Cypher has no syntax for a vector
+  label, so a deployment serving those alongside this surface had a Cypher that
+  could not address a single thing its own write paths had created.
+
+  So when `ctx` carries `:coll-keys` -- the collections that actually exist --
+  a label that is not itself a key is resolved against them by LEAF NAME: the
+  last element of a vector key, `name` of a keyword. `(n:users)` finds
+  `[:kotobase.s3/objects \"users\"]`. Resolution is by exact leaf equality and
+  nothing fuzzier.
+
+  Two labels can share a leaf (`[:kotobase.s3/objects \"users\"]` and
+  `[:kotobase.at/records \"did:x\" \"users\"]`). That is reported as an error
+  naming both candidates, not resolved by preferring one -- a query whose
+  meaning depends on which collection a bare label happened to pick is worse
+  than a query that refuses to run. A label matching nothing is left verbatim
+  and materializes empty, which is what it did before.
+
+  With no `:coll-keys` in `ctx` -- the 3-arity `execute`, every existing test --
+  nothing is resolved and the label is used verbatim, as it always was.
+
+  ## Bonus: relationship patterns (real cross-collection join, not required
+  by v0.1 but implemented since it maps naturally onto the bridge's join
+  capability)
+
+  `(a:LabelA)-[:REL_TYPE]->(b:LabelB)` (single hop, directed rightward
+  only -- no `<-`, no undirected `--`) translates to a real
+  `kotobase.query.bridge` cross-collection join: it requires `a`'s
+  materialized document to carry an attribute named
+  `(keyword (str/lower \"REL_TYPE\"))` (i.e. the
+  relationship type, case-folded to lower, underscores UNCHANGED -- e.g.
+  `WORKS_AT` -> `:works_at`) whose value equals `b`'s `:kotobase/key`
+  (materialized as a STRING, per `kotobase.query.bridge`'s own doc->datoms
+  mapping) -- exactly the foreign-key-attribute join convention
+  `kotobase-query`'s own README worked example uses, just with the
+  attribute name derived mechanically from the relationship type instead
+  of chosen ad hoc. This is this repo's own documented convention (there is
+  no such thing as a stored 'relationship' or 'edge' in kotobase's flat
+  document model) -- see `test/kotobase/protocols/cypher_test.cljk` for a
+  worked fixture.
+
+  ## `visible?` -- required, injectable, never defaulted
+
+  `ctx` passed to `handle` MUST include `:visible?`, a predicate over
+  materialized datoms (`(fn [{:keys [s p o]}] boolean?)`) -- the same
+  discipline `kotobase.query.bridge`/`arrangement.datalog` enforce
+  (ADR-2607050500, \"Query as first-class effect\"). `handle` throws
+  immediately (a ctx-construction bug, not a wire-protocol error) if
+  `:visible?` is missing -- there is no silent `(constantly true)` fallback
+  anywhere in this namespace.
+
+  ## Audit choice
+
+  This is a read-only surface, so there is nothing to audit in the
+  write-audit sense `kotobase.protocols.s3`/`ipfs-pinning` use (no mutated
+  doc to log). Per ADR-2607050500's \"query as first-class effect\"
+  framing, every processed statement is still appended to the shared
+  `:kotobase.protocols/audit` stream regardless of outcome: `{:surface
+  :cypher :op :query :statement <raw text> :row-count N}` on success,
+  `{:surface :cypher :op :query-error :statement <raw text> :code ...
+  :error ...}` on failure. Parameter VALUES are never audited (only the
+  raw statement text, which is the caller's own Cypher, and a row count) --
+  avoids leaking materialized property values or parameter payloads into
+  the audit trail."
+  (:require [kotoba.lang.text :as str]
+            [kotobase.protocols.cypher.http :as http]
+            [kotobase.protocols.cypher.json :as json]
+            [kotobase.query.bridge :as bridge]
+            [kotobase.store :as st]))
+
+;; --------------------------------------------------------------- errors
+
+(defn- syntax-err [msg]
+  (ex-info msg {:cypher/code "Neo.ClientError.Statement.SyntaxError"
+                :cypher/message msg}))
+
+(defn- semantic-err [msg]
+  (ex-info msg {:cypher/code "Neo.ClientError.Statement.SemanticError"
+                :cypher/message msg}))
+
+(defn- param-err [msg]
+  (ex-info msg {:cypher/code "Neo.ClientError.Request.InvalidFormat"
+                :cypher/message msg}))
+
+;; ------------------------------------------------------------- tokenize
+
+(defn- tokenize-backticked
+  "`s`, index `i` at the opening backtick -> `[identifier-name
+  index-after-closing-backtick]`.
+
+  openCypher quotes an identifier in backticks when it is not a bare
+  `[A-Za-z_][A-Za-z0-9_]*` word, and that is not a nicety here: this surface
+  names a `kotobase.store` collection with a label, and the collections it is
+  actually deployed beside are `[:kotobase.s3/objects bucket]` and
+  `[:kotobase.at/records did nsid]`. Their addressable leaf names are bucket
+  names (`my-bucket`) and nsids (`app.bsky.feed.post`) -- a hyphen scans as
+  `:dash` and a dot as `:dot`, so without this both are unsayable and the
+  collection is invisible rather than merely awkward to reach.
+
+  A literal backtick inside is written doubled, as openCypher specifies.
+  Unterminated and empty are errors: an empty identifier would name nothing
+  and silently match nothing."
+  [s i]
+  (let [n (count s)]
+    (loop [j (inc i) acc ""]
+      (cond
+        (>= j n)
+        (throw (syntax-err (str "unterminated backtick-quoted identifier "
+                                "starting at position " i)))
+
+        (= "`" (subs s j (inc j)))
+        (if (= "`" (subs s (inc j) (min n (+ j 2))))
+          (recur (+ j 2) (str acc "`"))
+          (if (empty? acc)
+            (throw (syntax-err (str "empty backtick-quoted identifier at position " i)))
+            [acc (inc j)]))
+
+        :else (recur (inc j) (str acc (subs s j (inc j))))))))
+
+(defn- tokenize-string
+  "`s`, index `i` at the opening quote char `quote` -> `[unescaped-value
+  index-after-closing-quote]`."
+  [s i quote]
+  (loop [i (inc i) acc ""]
+    (if (>= i (count s))
+      (throw (syntax-err "unterminated string literal"))
+      (let [c (subs s i (inc i))]
+        (cond
+          (= c quote) [acc (inc i)]
+          (= c "\\")
+          (let [e (subs s (inc i) (+ i 2))]
+            (cond
+              (= e "\\") (recur (+ i 2) (str acc "\\"))
+              (= e "n") (recur (+ i 2) (str acc "\n"))
+              (= e "t") (recur (+ i 2) (str acc "\t"))
+              (= e quote) (recur (+ i 2) (str acc quote))
+              :else (recur (+ i 2) (str acc e))))
+          :else (recur (inc i) (str acc c)))))))
+
+(def ^:private keyword-tokens
+  {"MATCH" :match "WHERE" :where "RETURN" :return "AND" :and "OR" :or "NOT" :not "IS" :is
+   "TRUE" :true "FALSE" :false "NULL" :null})
+
+(defn- tokenize
+  "Cypher statement string -> vector of token maps `{:type kw :val v}`.
+  Hand-rolled (no regex-based/3rd-party Cypher parser -- v0.1's grammar is
+  small enough that a scanner + recursive-descent parser over these tokens
+  is the right size of tool)."
+  [s]
+  (let [n (count s)]
+    (loop [i 0 toks []]
+      (if (>= i n)
+        toks
+        (let [c (subs s i (inc i))]
+          (cond
+            (re-matches #"[ \t\n\r]" c) (recur (inc i) toks)
+            (= c "(") (recur (inc i) (conj toks {:type :lparen}))
+            (= c ")") (recur (inc i) (conj toks {:type :rparen}))
+            (= c "[") (recur (inc i) (conj toks {:type :lbracket}))
+            (= c "]") (recur (inc i) (conj toks {:type :rbracket}))
+            (= c ":") (recur (inc i) (conj toks {:type :colon}))
+            (= c ".") (recur (inc i) (conj toks {:type :dot}))
+            (= c ",") (recur (inc i) (conj toks {:type :comma}))
+            ;; Two-char comparisons MUST be tested before the single-char
+            ;; ones, or "<=" scans as "<" followed by "=" and Cypher's "<>"
+            ;; becomes "<" followed by ">".
+            (and (= c "<") (= (subs s (inc i) (min n (+ i 2))) "="))
+            (recur (+ i 2) (conj toks {:type :lte}))
+            (and (= c "<") (= (subs s (inc i) (min n (+ i 2))) ">"))
+            (recur (+ i 2) (conj toks {:type :neq}))
+            (and (= c ">") (= (subs s (inc i) (min n (+ i 2))) "="))
+            (recur (+ i 2) (conj toks {:type :gte}))
+            (= c "<") (recur (inc i) (conj toks {:type :lt}))
+            (= c ">") (recur (inc i) (conj toks {:type :gt}))
+            (= c "=") (recur (inc i) (conj toks {:type :eq}))
+            (= c "*") (recur (inc i) (conj toks {:type :star}))
+            (= c "-")
+            (if (= (subs s (inc i) (min n (+ i 2))) ">")
+              (recur (+ i 2) (conj toks {:type :arrow}))
+              (recur (inc i) (conj toks {:type :dash})))
+            (= c "$")
+            (let [m (re-find #"^[A-Za-z_][A-Za-z0-9_]*" (subs s (inc i)))]
+              (if m
+                (recur (+ i 1 (count m)) (conj toks {:type :param :val m}))
+                (throw (syntax-err (str "expected an identifier after '$' at position " i)))))
+            ;; A backticked identifier is deliberately NOT looked up in
+            ;; keyword-tokens: quoting is what escapes keyword-ness, so
+            ;; `count` is a property named count and not the COUNT token.
+            (= c "`")
+            (let [[v i'] (tokenize-backticked s i)]
+              (recur i' (conj toks {:type :ident :val v})))
+            (or (= c "'") (= c "\""))
+            (let [[v i'] (tokenize-string s i c)]
+              (recur i' (conj toks {:type :string :val v})))
+            (re-matches #"[0-9]" c)
+            (let [m (re-find #"^[0-9]+(?:\.[0-9]+)?" (subs s i))
+                  numv (if (str/includes? m ".")
+                         #?(:clj (Double/parseDouble m) :cljs (js/parseFloat m))
+                         #?(:clj (Long/parseLong m) :cljs (js/parseInt m 10)))]
+              (recur (+ i (count m)) (conj toks {:type :number :val numv})))
+            (re-matches #"[A-Za-z_]" c)
+            (let [m (re-find #"^[A-Za-z_][A-Za-z0-9_]*" (subs s i))]
+              (recur (+ i (count m))
+                     (conj toks (if-let [kwtype (get keyword-tokens (str/upper m))]
+                                  {:type kwtype}
+                                  {:type :ident :val m}))))
+            :else
+            (throw (syntax-err (str "unexpected character '" c "' at position " i)))))))))
+
+;; ---------------------------------------------------------------- parse
+
+(defn- peek-type [toks] (:type (first toks)))
+
+(defn- describe-tok [t]
+  (case (:type t)
+    :ident (str "identifier '" (:val t) "'")
+    :string "string literal"
+    :number (str "number " (:val t))
+    :lt "'<'" :gt "'>'" :lte "'<='" :gte "'>='" :neq "'<>'"
+    :param (str "parameter '$" (:val t) "'")
+    nil "end of input"
+    (name (:type t))))
+
+(defn- expect [toks type]
+  (if (= type (peek-type toks))
+    (rest toks)
+    (throw (syntax-err (str "expected " (name type) ", got " (describe-tok (first toks)))))))
+
+(defn- take-ident [toks]
+  (if (= :ident (peek-type toks))
+    [(:val (first toks)) (rest toks)]
+    (throw (syntax-err (str "expected an identifier, got " (describe-tok (first toks)))))))
+
+(def ^:private unsupported-clause-keywords
+  #{"CREATE" "MERGE" "DELETE" "SET" "REMOVE" "DETACH" "FOREACH" "CALL" "UNWIND" "LOAD"})
+
+(defn- expect-match [toks]
+  (cond
+    (= :match (peek-type toks)) (rest toks)
+    (and (= :ident (peek-type toks))
+         (contains? unsupported-clause-keywords (str/upper (:val (first toks)))))
+    (throw (syntax-err (str (str/upper (:val (first toks)))
+                            " is not supported -- org-opencypher-cypher v0.1 is a"
+                            " READ-ONLY query surface (MATCH/WHERE/RETURN only;"
+                            " ADR-2607172300)")))
+    :else
+    (throw (syntax-err (str "expected MATCH, got " (describe-tok (first toks)))))))
+
+(defn- parse-node [toks]
+  (let [toks (expect toks :lparen)
+        [v toks] (take-ident toks)
+        [label toks] (if (= :colon (peek-type toks))
+                       (let [toks (rest toks)]
+                         (take-ident toks))
+                       (throw (syntax-err
+                               (str "node pattern '(" v ")' has no label -- v0.1 requires"
+                                    " every node pattern to be labeled, e.g. (" v ":users)"))))
+        toks (expect toks :rparen)]
+    [{:var v :label label} toks]))
+
+(defn- parse-rel [toks]
+  (let [toks (expect toks :dash)
+        toks (expect toks :lbracket)
+        toks (expect toks :colon)
+        [reltype toks] (take-ident toks)
+        _ (when (= :star (peek-type toks))
+            (throw (syntax-err
+                    "variable-length relationship patterns ([:REL*..]) are not supported in v0.1")))
+        toks (expect toks :rbracket)
+        toks (if (= :arrow (peek-type toks))
+               (rest toks)
+               (throw (syntax-err
+                       (str "only directed rightward relationship patterns -[:REL]-> are"
+                            " supported in v0.1 (no <-, no undirected --); got "
+                            (describe-tok (first toks))))))]
+    [reltype toks]))
+
+(defn- parse-pattern
+  "`(a:A)-[:R]->(b:B)-[:S]->(c:C)` -> `{:nodes [...] :rels [reltype ...]}`.
+
+  `:rels` has exactly one fewer entry than `:nodes`, so hop i joins node i to
+  node i+1. A single node is `{:nodes [n] :rels []}`, which is the shape every
+  caller already handled as `:rel-type nil`."
+  [toks]
+  (loop [[n toks] (parse-node toks) nodes [] rels []]
+    (let [nodes (conj nodes n)]
+      (if (= :dash (peek-type toks))
+        (let [[reltype toks] (parse-rel toks)]
+          (recur (parse-node toks) nodes (conj rels reltype)))
+        [{:nodes nodes :rels rels} toks]))))
+
+(defn- parse-value [toks]
+  (let [t (first toks)]
+    (case (:type t)
+      :string [(:val t) (rest toks)]
+      :number [(:val t) (rest toks)]
+      :true [true (rest toks)]
+      :false [false (rest toks)]
+      :null [nil (rest toks)]
+      :param [{:cypher/param (:val t)} (rest toks)]
+      :dash (let [t2 (second toks)]
+              (if (= :number (:type t2))
+                [(- (:val t2)) (drop 2 toks)]
+                (throw (syntax-err "expected a number after '-'"))))
+      (throw (syntax-err
+              (str "expected a value (string, number, true/false, null, or $parameter), got "
+                   (describe-tok t)))))))
+
+(def ^:private comparison-ops
+  "Cypher comparison token -> the `arrangement.datalog` whitelisted function
+  the translated predicate clause calls.
+
+  `=` is deliberately NOT in here: an equality predicate translates to a
+  literal in the triple itself, which the index can look up directly, and
+  routing it through a predicate clause would turn an index probe into a scan
+  plus a filter. Same operator, two very different plans."
+  {:lt '< :gt '> :lte '<= :gte '>= :neq 'not=})
+
+(def ^:private string-fns
+  "Cypher-ish string predicates, mapped onto `arrangement.datalog`'s whitelist.
+
+  `CONTAINS`/`STARTS WITH`/`ENDS WITH` are Cypher's own spelling; the single
+  identifier form is accepted for `CONTAINS` only, since the other two are two
+  words in Cypher and splitting them here would invent syntax."
+  {"CONTAINS" 'includes?})
+
+(defn- parse-predicate [toks]
+  (let [[v toks] (take-ident toks)
+        toks (expect toks :dot)
+        [prop toks] (take-ident toks)
+        op-type (peek-type toks)
+        op (get comparison-ops op-type)]
+    (cond
+      ;; `IS NULL` / `IS NOT NULL` -- absence, not a stored nil. Cypher treats a
+      ;; missing property and a null one the same way, and this store cannot
+      ;; hold the difference either: `doc->datoms` emits no datom for a nil.
+      (= :is op-type)
+      (let [toks (rest toks)
+            negated? (= :not (peek-type toks))
+            toks (if negated? (rest toks) toks)]
+        (when-not (= :null (peek-type toks))
+          (throw (syntax-err (str "expected NULL after IS" (when negated? " NOT")
+                                  " -- got " (describe-tok (first toks))))))
+        [{:var v :prop prop :kind :cmp :null? (not negated?)} (rest toks)])
+
+      (and (= :ident op-type)
+           (contains? string-fns (str/upper (str (:val (first toks))))))
+      (let [f (get string-fns (str/upper (str (:val (first toks)))))
+            [val toks] (parse-value (rest toks))]
+        [{:var v :prop prop :op f :value val} toks])
+
+      (or op (= :eq op-type))
+      (let [[val toks] (parse-value (rest toks))]
+        [(cond-> {:var v :prop prop :value val}
+           op (assoc :op op))
+         toks])
+
+      :else
+      (throw (syntax-err (str "expected a comparison operator (=, <, >, <=, >=, <>),"
+                              " CONTAINS, or IS [NOT] NULL after " v "." prop
+                              " -- got " (describe-tok (first toks))))))))
+
+(declare parse-or-expr)
+
+(defn- parse-not-expr
+  "`[NOT] comparison`, or a parenthesised expression."
+  [toks]
+  (cond
+    (= :not (peek-type toks))
+    (let [[e toks] (parse-not-expr (rest toks))]
+      [{:kind :not :arg e} toks])
+
+    (= :lparen (peek-type toks))
+    (let [[e toks] (parse-or-expr (rest toks))]
+      [e (expect toks :rparen)])
+
+    :else
+    (let [[p toks] (parse-predicate toks)]
+      [(assoc p :kind :cmp) toks])))
+
+(defn- parse-and-expr [toks]
+  (loop [[e toks] (parse-not-expr toks) args []]
+    (let [args (conj args e)]
+      (if (= :and (peek-type toks))
+        (recur (parse-not-expr (rest toks)) args)
+        [(if (= 1 (count args)) (first args) {:kind :and :args args}) toks]))))
+
+(defn parse-or-expr
+  "`WHERE` boolean expression. Precedence is Cypher's: OR looser than AND,
+  AND looser than NOT, NOT looser than a comparison. Parsing them at one level
+  would make `a OR b AND c` mean `(a OR b) AND c` -- a wrong answer, not a
+  rejected query."
+  [toks]
+  (loop [[e toks] (parse-and-expr toks) args []]
+    (let [args (conj args e)]
+      (if (= :or (peek-type toks))
+        (recur (parse-and-expr (rest toks)) args)
+        [(if (= 1 (count args)) (first args) {:kind :or :args args}) toks]))))
+
+(defn- parse-where [toks]
+  (if (= :where (peek-type toks))
+    (let [[e toks] (parse-or-expr (rest toks))]
+      [e toks])
+    [nil toks]))
+
+(declare kw-ident?)
+
+(defn- parse-return-item
+  "One RETURN projection: `var.prop`, `count(*)`, or `count(var.prop)`,
+  optionally `AS alias`.
+
+  `count` is the only aggregate. Cypher has many; implementing one and naming
+  it is better than implementing a family badly, and the grouping rule below is
+  the part that generalises."
+  [toks]
+  (let [agg? (and (= :ident (peek-type toks))
+                  (= "COUNT" (str/upper (str (:val (first toks)))))
+                  (= :lparen (:type (second toks))))
+        [item toks]
+        (if agg?
+          (let [toks (rest (rest toks))]
+            (if (= :star (peek-type toks))
+              [{:agg 'count :star? true} (expect (rest toks) :rparen)]
+              (let [[v toks] (take-ident toks)
+                    toks (expect toks :dot)
+                    [prop toks] (take-ident toks)]
+                [{:agg 'count :var v :prop prop} (expect toks :rparen)])))
+          (let [[v toks] (take-ident toks)
+                toks (expect toks :dot)
+                [prop toks] (take-ident toks)]
+            [{:var v :prop prop} toks]))
+        alias? (kw-ident? toks "AS")
+        [alias toks] (if alias? (take-ident (rest toks)) [nil toks])]
+    [(cond-> item alias (assoc :as alias)) toks]))
+
+(defn- parse-return [toks]
+  (let [toks (expect toks :return)
+        distinct? (and (= :ident (peek-type toks))
+                       (= "DISTINCT" (str/upper (str (:val (first toks))))))
+        toks (if distinct? (rest toks) toks)]
+    (when-not (= :ident (peek-type toks))
+      (throw (syntax-err "RETURN must project at least one property (var.prop)")))
+    (loop [toks toks items []]
+      (let [[item toks] (parse-return-item toks)
+            items (conj items item)]
+        (if (= :comma (peek-type toks))
+          (recur (rest toks) items)
+          [{:items items :distinct? distinct?} toks])))))
+
+
+;; ORDER BY / SKIP / LIMIT / DISTINCT are matched on the IDENTIFIER text rather
+;; than added to `keyword-tokens`, on purpose: a token type would make `order`,
+;; `skip` and `limit` unusable as PROPERTY names, so `RETURN n.limit` would stop
+;; parsing. Breaking a property name to add a clause keyword is a bad trade.
+
+(defn- kw-ident?
+  "True when the next token is the identifier `word`, case-insensitively."
+  [toks word]
+  (and (= :ident (peek-type toks))
+       (= word (str/upper (str (:val (first toks)))))))
+
+(defn- parse-order-by
+  "`ORDER BY item [ASC|DESC] [, ...]` -> `[[{:var :prop :desc?} ...] toks]`."
+  [toks]
+  (if-not (kw-ident? toks "ORDER")
+    [[] toks]
+    (let [toks (rest toks)]
+      (when-not (kw-ident? toks "BY")
+        (throw (syntax-err "expected BY after ORDER")))
+      (loop [toks (rest toks) items []]
+        (let [[{:keys [var prop]} toks] (parse-return-item toks)
+              desc? (kw-ident? toks "DESC")
+              toks (if (or desc? (kw-ident? toks "ASC")) (rest toks) toks)
+              items (conj items {:var var :prop prop :desc? desc?})]
+          (if (= :comma (peek-type toks))
+            (recur (rest toks) items)
+            [items toks]))))))
+
+(defn- parse-count
+  "`WORD n` -> `[n toks]` for SKIP/LIMIT. A negative or fractional count is
+  rejected at parse time rather than left for `drop`/`take` to reinterpret."
+  [toks word]
+  (if-not (kw-ident? toks word)
+    [nil toks]
+    (let [toks (rest toks)
+          t (first toks)]
+      (when-not (= :number (:type t))
+        (throw (syntax-err (str word " expects a number, got " (describe-tok t)))))
+      (let [v (:val t)]
+        (when-not (and (integer? v) (not (neg? v)))
+          (throw (syntax-err (str word " expects a non-negative integer, got " v))))
+        [v (rest toks)]))))
+
+
+(defn where-leaves
+  "Every comparison leaf in a WHERE expression tree, in written order."
+  [e]
+  (case (:kind e)
+    nil []
+    :cmp [e]
+    :not (where-leaves (:arg e))
+    (:and :or) (into [] (mapcat where-leaves) (:args e))))
+
+(defn parse
+  "Parse one Cypher v0.1 statement string into an AST map:
+  `{:pattern {:nodes [{:var :label} ...] :rels [rel-type ...]}
+    :where [{:var :prop :value} ...]
+    :return [{:var :prop} ...]}`.
+
+  Throws `ex-info` (`(:cypher/code (ex-data e))` is a
+  `\"Neo.ClientError.Statement.*\"` string, `(:cypher/message (ex-data e))`
+  a human-readable message) for anything outside the v0.1 subset -- see the
+  ns docstring's grammar section. Never silently accepts or partially
+  executes out-of-scope syntax."
+  [s]
+  (let [toks (tokenize s)
+        toks (expect-match toks)
+        [pattern toks] (parse-pattern toks)
+        [wpreds toks] (parse-where toks)
+        [{ritems :items distinct? :distinct?} toks] (parse-return toks)
+        [order-items toks] (parse-order-by toks)
+        [skip toks] (parse-count toks "SKIP")
+        [limit toks] (parse-count toks "LIMIT")]
+    (when (seq toks)
+      (throw (syntax-err (str "unexpected trailing input starting at " (describe-tok (first toks))))))
+    (when (empty? ritems)
+      (throw (syntax-err "RETURN must project at least one property (var.prop)")))
+    (let [declared (into #{} (map :var (:nodes pattern)))
+          check-var (fn [v where-desc]
+                      (when-not (contains? declared v)
+                        (throw (semantic-err
+                                (str "unknown variable '" v "' in " where-desc
+                                     " -- not declared in the MATCH pattern")))))]
+      (doseq [p (where-leaves wpreds)] (check-var (:var p) "WHERE"))
+      ;; `count(*)` names no variable, so there is nothing to check for it.
+      (doseq [r ritems :when (:var r)] (check-var (:var r) "RETURN"))
+      (doseq [o order-items] (check-var (:var o) "ORDER BY")))
+    ;; ORDER BY may only name something RETURN projects. Cypher itself allows
+    ;; ordering by an unreturned expression, but that needs the sort key in the
+    ;; result set and then dropped again -- a real feature, not a parse tweak.
+    ;; Rejected explicitly rather than silently ignored.
+    (let [returned (into #{} (comp (filter :var) (map (juxt :var :prop))) ritems)]
+      (doseq [{:keys [var prop]} order-items]
+        (when-not (contains? returned [var prop])
+          (throw (semantic-err
+                  (str "ORDER BY " var "." prop " is not in the RETURN list --"
+                       " ordering by an unreturned property is not supported yet"))))))
+    {:pattern pattern :where wpreds :return ritems
+     :distinct? distinct? :order-by order-items :skip skip :limit limit}))
+
+;; ------------------------------------------------------------ translate
+
+(defn leaf-name
+  "The bare name a collection key is addressable by from Cypher: the last
+  element of a vector key, `name` of a keyword, a string as itself."
+  [k]
+  (cond
+    (vector? k) (some-> (last k) leaf-name)
+    (keyword? k) (name k)
+    :else (str k)))
+
+(defn resolve-label
+  "A Cypher label -> the `kotobase.store` collection key it names, given
+  `available` (the keys that exist). See the ns docstring's label section.
+
+  Returns the label unchanged when `available` is empty (no ctx said what
+  exists), when the label is itself a key, or when nothing matches. Throws on
+  an ambiguous leaf rather than choosing."
+  [available label]
+  (let [available (seq available)]
+    (if-not available
+      label
+      (if (some #(= % label) available)
+        label
+        (let [matches (filterv #(= (leaf-name %) label) available)]
+          (case (count matches)
+            0 label
+            1 (first matches)
+            (throw (ex-info (str "label " (pr-str label) " is ambiguous: it names "
+                                 (count matches) " collections (" (pr-str matches)
+                                 "). Cypher has no syntax to disambiguate them, so "
+                                 "this query cannot be run as written.")
+                            {:cypher/code "Neo.ClientError.Statement.SemanticError"
+                             :label label
+                             :candidates matches}))))))))
+
+(defn resolve-collections
+  "Rewrite a translation so every label names a collection that exists.
+
+  Both places a label appears have to move together -- `:coll-keys` decides
+  what gets materialized and the `:kotobase/coll` clauses decide what matches
+  once it has -- so they are substituted from one map rather than resolved
+  twice. They do not take the same VALUE, though: `bridge/materialize` asserts
+  `{:p :kotobase/coll :o (str coll)}`, so the clause wants the stringified key
+  and `:coll-keys` wants the real one. That difference is invisible while every
+  key is a string, which is exactly why it is worth a sentence."
+  [available {:keys [coll-keys query] :as translated}]
+  (if-not (seq available)
+    translated
+    (let [sub (into {} (map (juxt identity #(resolve-label available %))) coll-keys)]
+      (-> translated
+          (assoc :coll-keys (into [] (comp (map #(get sub % %)) (distinct)) coll-keys))
+          (assoc :query
+                 (update query :where
+                         (fn [clauses]
+                           (mapv (fn [c]
+                                   (if (and (vector? c) (= 3 (count c))
+                                            (= :kotobase/coll (nth c 1)))
+                                     (assoc c 2 (str (get sub (nth c 2) (nth c 2))))
+                                     c))
+                                 clauses))))))))
+
+(defn- var-sym [v] (symbol (str "?" v)))
+
+(defn- fk-attr
+  "Relationship-type -> foreign-key attribute convention for the
+  (bonus, non-required) relationship-pattern join -- see ns docstring."
+  [rel-type]
+  (keyword (str/lower rel-type)))
+
+(defn- resolve-value [v parameters]
+  (if (and (map? v) (contains? v :cypher/param))
+    (let [pname (:cypher/param v)]
+      (if (contains? parameters pname)
+        (get parameters pname)
+        (throw (param-err (str "missing parameter: $" pname)))))
+    v))
+
+
+(defn- cmp-clauses
+  "The datalog clauses one comparison leaf becomes.
+
+  Equality is a single triple with the literal in it, which the index probes.
+  `IS NULL` is `(not [?e :prop _])` -- absence, since neither Cypher nor this
+  store distinguishes a missing property from a null one. Everything else binds
+  the property to a fresh lvar and constrains it, which is TWO clauses."
+  [{:keys [var prop value op null?]} parameters]
+  (let [v (var-sym var) a (keyword prop)]
+    (cond
+      (true? null?)  [(list 'not [v a '_])]
+      (false? null?) [[v a '_]]
+      op (let [cmp (gensym "?__cmp")]
+           [[v a cmp] [(list op cmp (resolve-value value parameters))]])
+      :else [[v a (resolve-value value parameters)]])))
+
+(def ^:private negated-op
+  " Operator negation, for pushing NOT down to the leaves.
+
+  Cypher's logic is three-valued: `NOT n.age > 18` on a node with no `age` is
+  `NOT NULL`, which is NULL, which does not match. Negating the OPERATOR keeps
+  that -- the property still has to exist -- whereas wrapping the whole
+  comparison in a datalog `not` would INCLUDE the rows missing it, which is a
+  different query. Equality is negated the same way and for the same reason,
+  rather than becoming `(not [e a v])`."
+  {'< '>=, '> '<=, '<= '>, '>= '<, 'not= nil, 'includes? nil})
+
+(defn- negate
+  " Push a NOT down to the leaves (De Morgan), so the clauses handed to datalog
+  never need a negated conjunction -- which `arrangement.datalog`'s `not` does
+  not take, and which would have the wrong three-valued semantics anyway.
+
+  `IS NULL` flips to `IS NOT NULL`. A predicate with no operator negation
+  available (CONTAINS, and `<>` which has no dedicated form here) becomes an
+  explicit refusal rather than a guess."
+  [e]
+  (case (:kind e)
+    :and {:kind :or  :args (mapv negate (:args e))}
+    :or  {:kind :and :args (mapv negate (:args e))}
+    :not (:arg e)
+    :cmp (let [{:keys [op null?]} e]
+           (cond
+             (some? null?) (assoc e :null? (not null?))
+             (nil? op)     (assoc e :op 'not= )
+             (= 'not= op)  (dissoc e :op)
+             (contains? negated-op op)
+             (if-let [n (get negated-op op)]
+               (assoc e :op n)
+               (throw (semantic-err
+                       (str "NOT over " op " is not supported -- there is no negated form"
+                            " of it in the whitelisted predicate set, and guessing one"
+                            " would change which rows come back"))))
+             :else (throw (semantic-err (str "NOT over " op " is not supported")))))))
+
+(declare branch-clause*)
+
+(defn- branch-clause
+  "One `or`/`not` branch as a SINGLE datalog clause.
+
+  A leaf that needs several clauses is wrapped in `(and ...)`, which
+  `arrangement.datalog` takes as a conjunction branch -- so a comparison, or
+  `IS NULL`, inside a disjunction is expressible now. This is what the earlier
+  'OR is only supported over equalities' error existed to refuse; the
+  limitation was the engine's, and it is gone."
+  [e parameters]
+  (case (:kind e)
+    :cmp (let [cs (cmp-clauses e parameters)]
+           (if (= 1 (count cs)) (first cs) (cons 'and cs)))
+    :not (branch-clause (negate (:arg e)) parameters)
+    :and (cons 'and (into [] (mapcat #(branch-clause* % parameters)) (:args e)))
+    :or  (cons 'or (mapv #(branch-clause % parameters) (:args e)))))
+
+(defn- branch-clause*
+  "`branch-clause` flattened: an `(and ...)` contributes its members rather
+  than nesting, so a nested AND inside an OR branch does not build a tower."
+  [e parameters]
+  (let [c (branch-clause e parameters)]
+    (if (and (seq? c) (= 'and (first c))) (rest c) [c])))
+
+(defn- translate-where
+  "WHERE expression tree -> a vector of `arrangement.datalog` clauses.
+
+  Top level is a conjunction, which is the shape `:where` already is, so `AND`
+  flattens. `OR` and `NOT` become `(or ...)` / `(not ...)`, and their branches
+  may now be `(and ...)` conjunctions -- so a comparison inside a disjunction
+  works. That needed `arrangement.datalog` to accept multi-clause branches; it
+  does since kotoba-lang/arrangement#13, and this file's previous 'only
+  equalities' refusal is deleted rather than merely relaxed."
+  [e parameters]
+  (case (:kind e)
+    nil []
+    :cmp (cmp-clauses e parameters)
+    :and (into [] (mapcat #(translate-where % parameters)) (:args e))
+    :not (translate-where (negate (:arg e)) parameters)
+    :or  [(cons 'or (mapv #(branch-clause % parameters) (:args e)))]))
+
+(defn translate
+  "AST (from `parse`) + `parameters` (a string-keyed map -- the JSON-parsed
+  `\"parameters\"` object from the request statement) -> a
+  `kotobase.query.bridge`-shaped query descriptor:
+  `{:coll-keys [...] :query {:find [...] :where [...]} :columns [...]}`,
+  `:columns` in `:find`/row order (`\"n.prop\"` strings, Neo4j-style)."
+  [{:keys [pattern where return distinct? order-by skip limit]} parameters]
+  (let [nodes (:nodes pattern)
+        rels (:rels pattern)
+        node-clauses (mapv (fn [{:keys [var label]}] [(var-sym var) :kotobase/coll label]) nodes)
+        ;; One join per hop. Each carries its own foreign-key lvar, named after
+        ;; the pair it joins so a three-hop pattern cannot collide with itself.
+        rel-clauses (into []
+                          (comp (map-indexed
+                                 (fn [i reltype]
+                                   (let [a (nth nodes i)
+                                         b (nth nodes (inc i))
+                                         fk (fk-attr reltype)
+                                         fk-var (symbol (str "?__fk" i "_" (:var a) "_" (:var b)))]
+                                     [[(var-sym (:var a)) fk fk-var]
+                                      [(var-sym (:var b)) :kotobase/key fk-var]])))
+                                cat)
+                          rels)
+        ;; Equality stays a literal IN the triple, so the index can probe it.
+        ;; A comparison cannot be a triple at all -- it binds the property to a
+        ;; fresh lvar and then constrains that lvar with one of
+        ;; `arrangement.datalog`'s whitelisted predicate clauses. The triple
+        ;; MUST come first: datalog rejects a predicate whose args are not
+        ;; already bound by an earlier clause, and that safety check is the
+        ;; thing keeping an unbound variable from silently matching everything.
+        where-clauses (translate-where where parameters)
+        ;; `count(*)` projects nothing -- it counts rows -- so it contributes no
+        ;; find symbol and no clause. Everything else binds its property.
+        bound (filterv #(not (:star? %)) return)
+        ;; With an aggregate present, the ENTITY vars go into :find as well.
+        ;; datalog has set semantics, so `RETURN count(n.works_at)` over three
+        ;; users sharing two departments would otherwise project {d1 d2} and
+        ;; count 2. Binding the entity keeps one solution per matched node,
+        ;; which is what Cypher counts. They are dropped again by `:project`.
+        agg? (boolean (some #(or (:agg %) (:star? %)) return))
+        entity-syms (if agg? (mapv (comp var-sym :var) nodes) [])
+        ;; Kept separate: zipping `bound` against the FULL find list pairs the
+        ;; first projection with an ENTITY symbol and emits `[?n :role ?n]`,
+        ;; which matches nothing. mapv stops at the shorter collection, so the
+        ;; mistake is silent — an empty result rather than an error.
+        prop-syms (mapv (fn [{:keys [var prop]}] (symbol (str "?" var "__" prop))) bound)
+        return-syms (into entity-syms prop-syms)
+        return-clauses (mapv (fn [{:keys [var prop]} rsym] [(var-sym var) (keyword prop) rsym])
+                             bound prop-syms)
+        columns (mapv (fn [{:keys [var prop as agg star?]}]
+                        (or as
+                            (cond
+                              star? "count(*)"
+                              agg (str agg "(" var "." prop ")")
+                              :else (str var "." prop))))
+                      return)]
+    {:coll-keys (into [] (distinct) (map :label nodes))
+     :query {:find return-syms
+             :where (-> []
+                        (into node-clauses)
+                        (into rel-clauses)
+                        (into where-clauses)
+                        (into return-clauses))}
+     :columns columns
+     ;; Aggregation is applied to result ROWS, like ordering and slicing: the
+     ;; bridge has no notion of grouping and inventing one there would mean
+     ;; reimplementing a planner this repo does not own. `:project` says, per
+     ;; output column, where its value comes from -- an index into the bound
+     ;; columns, or an aggregate over the group.
+     :project (let [idx (atom (dec (count entity-syms)))]
+                (mapv (fn [{:keys [agg star?]}]
+                        (if star?
+                          {:agg 'count :star? true}
+                          (let [i (swap! idx inc)]
+                            (if agg {:agg agg :index i} {:index i}))))
+                      return))
+     ;; Ordering and slicing are applied to RESULT ROWS by `execute`, not
+     ;; pushed into the Datalog query: the bridge's `:where` is a conjunction
+     ;; of clauses with no notion of order or of a row window, and inventing
+     ;; one there would mean reimplementing the parts of a query planner this
+     ;; repo explicitly does not own.
+     :distinct? (boolean distinct?)
+     ;; ORDER BY may name the alias or the underlying `var.prop`, because a
+     ;; query that renames a column still reads naturally ordering by either.
+     :order-by (let [col->idx (into {}
+                                    (comp (map-indexed
+                                           (fn [i {:keys [var prop as star? agg]}]
+                                             (cond-> [[(or as (cond star? "count(*)"
+                                                                    agg (str agg "(" var "." prop ")")
+                                                                    :else (str var "." prop)))
+                                                       i]]
+                                               (and as var prop (not agg))
+                                               (conj [(str var "." prop) i]))))
+                                          cat)
+                                    return)]
+                 (mapv (fn [{:keys [var prop desc?]}]
+                         (let [k (str var "." prop)]
+                           (when-not (contains? col->idx k)
+                             (throw (semantic-err
+                                     (str "ORDER BY " k " is not in the RETURN list"))))
+                           {:index (get col->idx k) :desc? (boolean desc?)}))
+                       order-by))
+     :skip skip
+     :limit limit}))
+
+;; --------------------------------------------------------------- execute
+
+(defn- apply-project
+  "Map bound-column rows onto the projected output columns, aggregating when
+  any output column is an aggregate.
+
+  Grouping follows Cypher: the non-aggregate outputs are the group key. With no
+  aggregate this is a pure reordering.
+
+  **`count` counts the rows this engine produces, and datalog has SET
+  semantics** -- duplicate solutions never arrive here, so `count(*)` counts
+  DISTINCT solutions. Real Cypher counts a bag. Stated rather than discovered,
+  because the two agree on most queries and differ exactly where someone is
+  counting duplicates on purpose."
+  [project rows]
+  (if-not (seq project)
+    rows
+    (if-not (some :agg project)
+      (mapv (fn [row] (mapv #(nth row (:index %) nil) project)) rows)
+      (let [key-fn (fn [row] (mapv #(nth row (:index %) nil) (remove :agg project)))
+            groups (reduce (fn [m row] (update m (key-fn row) (fnil conj []) row)) {} rows)]
+        (mapv (fn [[k group]]
+                (let [ks (atom -1)]
+                  (mapv (fn [{:keys [agg index star?]}]
+                          (cond
+                            star? (count group)
+                            agg (count (remove nil? (map #(nth % index nil) group)))
+                            :else (nth k (swap! ks inc) nil)))
+                        project)))
+              groups)))))
+
+(defn- row-comparator
+  " Comparator over result rows for `order-by` entries `{:index :desc?}`.
+
+  Written out rather than `sort-by` + `juxt` because that form can only sort
+  every key the same direction, and `ORDER BY a, b DESC` needs two. Values are
+  compared inside a type and across types by type name, with nil first, so a
+  heterogeneous column orders rather than throwing -- a result set binds
+  whatever the documents hold and does not promise homogeneity."
+  [order-by]
+  (fn [x y]
+    (loop [os (seq order-by)]
+      (if-not os
+        0
+        (let [{:keys [index desc?]} (first os)
+              a (nth x index nil) b (nth y index nil)
+              c (cond
+                  (and (nil? a) (nil? b)) 0
+                  (nil? a) -1
+                  (nil? b) 1
+                  (= (type a) (type b))
+                  (try (compare a b)
+                       (catch #?(:clj Exception :cljs :default) _
+                         (compare (str a) (str b))))
+                  :else (compare (str (type a)) (str (type b))))
+              c (if desc? (- c) c)]
+          (if (zero? c) (recur (next os)) c))))))
+
+(defn parse-and-translate-probe
+  "parse + translate in one call, for tests that assert on translate-time
+  rejections. Not part of the HTTP path, which catches these into the
+  response error shape."
+  [q] (translate (parse q) {}))
+
+(defn execute
+  " Run a `translate`d query descriptor against `store` via
+  `kotobase.query.bridge/query` (materialize + q), filtered by the REQUIRED
+  `visible?` predicate. Returns a vector of result rows in `:columns` order.
+
+  DISTINCT, ORDER BY, SKIP and LIMIT are applied here, in Cypher's own clause
+  order (distinct, then order, then skip, then limit) -- getting that order
+  wrong changes answers, e.g. LIMIT before DISTINCT returns fewer rows than
+  asked for.
+
+  With no ORDER BY the rows are still sorted by stringified value, which is
+  what this function has always done: the bridge does not promise an order and
+  an unstable result set is worse than an arbitrary but repeatable one."
+  ([store translated visible?] (execute {} store translated visible?))
+  ([ctx store translated visible?]
+  (let [{:keys [coll-keys query distinct? order-by skip limit project]}
+        (resolve-collections (:coll-keys ctx) translated)
+        ;; The bridge yields each row as a SEQ, not a vector -- indexed access
+        ;; is what ORDER BY needs and `nth` does not work on one. The old
+        ;; stringified sort only ever used `mapv`, so this never showed until
+        ;; there was a comparator that reads a column by position.
+        ;; db-for memoises when ctx carries a content address, and builds fresh
+        ;; when it does not (ADR-2607310900 L1). The 3-arity passes `{}`, so a
+        ;; caller with no ctx -- every existing one, including the tests --
+        ;; keeps the behaviour it had.
+        rows (mapv vec (bridge/q (bridge/db-for ctx store coll-keys) query visible?))
+        rows (apply-project project rows)
+        rows (if distinct? (distinct rows) rows)
+        rows (if (seq order-by)
+               (sort (row-comparator order-by) rows)
+               (sort-by (fn [row] (mapv str row)) rows))
+        rows (cond->> rows
+               (and skip (pos? skip)) (drop skip)
+               limit (take limit))]
+    (vec rows))))
+
+;; ----------------------------------------------------------------- HTTP
+
+(defn- json-response [status m]
+  (http/response status {"content-type" "application/json"} (json/encode m)))
+
+(defn- audit! [store op statement now extra]
+  (st/-append store :kotobase.protocols/audit
+              (merge {:surface :cypher :op op :statement statement :now now} extra)))
+
+(defn- run-statement
+  "Parse + translate + execute one `{\"statement\" \"...\" \"parameters\"
+  {...}}` map. Returns `{:ok true :result {...}}` or `{:ok false :error
+  {...}}` -- never throws (all failures inside the Cypher pipeline are
+  caught here and turned into the response's `errors` shape)."
+  [ctx store visible? now stmt]
+  (let [statement (get stmt "statement")
+        parameters (or (get stmt "parameters") {})]
+    (try
+      (if-not (string? statement)
+        (throw (param-err "each statement must have a string \"statement\" field"))
+        (let [ast (parse statement)
+              translated (translate ast parameters)
+              rows (execute ctx store translated visible?)]
+          (audit! store :query statement now {:row-count (count rows)})
+          {:ok true
+           :result {"columns" (:columns translated)
+                    "data" (mapv (fn [row]
+                                   {"row" (vec row) "meta" (vec (repeat (count row) nil))})
+                                 rows)}}))
+      (catch #?(:clj Exception :cljs :default) e
+        (let [data (ex-data e)
+              code (or (:cypher/code data) "Neo.ClientError.Statement.SyntaxError")
+              msg (or (:cypher/message data) #?(:clj (.getMessage e) :cljs (.-message e)) (str e))]
+          (audit! store :query-error statement now {:code code :error msg})
+          {:ok false :error {"code" code "message" msg}})))))
+
+(defn handle
+  "`POST /db/data/transaction/commit` handler -- Neo4j HTTP Cypher
+  transaction-endpoint-shaped (see ns docstring for the exact request/
+  response JSON and the v0.1 Cypher subset). `ctx` is
+  `{:store IStore :visible? (fn [datom] boolean?) :now optional-ISO-string}`.
+
+  `:visible?` is REQUIRED -- throws immediately (a ctx bug, not a wire
+  error) if missing; no permissive default (ADR-2607050500)."
+  [{:keys [store visible? now] :as ctx} req]
+  (when-not (fn? visible?)
+    (throw (ex-info
+            (str "kotobase.protocols.cypher/handle requires ctx :visible? -- a REQUIRED"
+                 " predicate fn over materialized datoms, no permissive default"
+                 " (ADR-2607050500). Pass (constantly true) to see everything.")
+            {:cypher/ctx-error true})))
+  (cond
+    (not= ["db" "data" "transaction" "commit"] (http/segments (:path req)))
+    (http/not-found)
+
+    (not= :post (:method req))
+    (http/method-not-allowed)
+
+    :else
+    (let [parsed (try (json/parse (or (:body req) "{}"))
+                       (catch #?(:clj Exception :cljs :default) _ ::malformed))]
+      (cond
+        (= parsed ::malformed)
+        (json-response 400 {"results" []
+                            "errors" [{"code" "Neo.ClientError.Request.InvalidFormat"
+                                       "message" "malformed JSON body"}]})
+
+        (not (sequential? (get parsed "statements")))
+        (json-response 400 {"results" []
+                            "errors" [{"code" "Neo.ClientError.Request.InvalidFormat"
+                                       "message" "body must be {\"statements\": [...]}"}]})
+
+        :else
+        (loop [stmts (get parsed "statements") results []]
+          (if (empty? stmts)
+            (json-response 200 {"results" results "errors" []})
+            (let [{:keys [ok result error]} (run-statement ctx store visible? now (first stmts))]
+              (if ok
+                (recur (rest stmts) (conj results result))
+                ;; A statement error aborts the whole transaction, matching
+                ;; the real HTTP Cypher API's auto-commit rollback-on-error
+                ;; semantics -- remaining statements never run.
+                (json-response 200 {"results" results "errors" [error]})))))))))

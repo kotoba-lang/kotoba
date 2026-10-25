@@ -1,0 +1,142 @@
+#!/usr/bin/env kbb
+(ns public-arrangement-bench
+  "Cold public-network proof over a real multi-block Arrangement snapshot.
+  Every block is discovered independently through cid.contact, fetched from
+  the returned Kotobase provider, and CID-verified before the async cursor can
+  decode it. Output is JSON for a dated evidence file."
+  (:require [ayatori.discovery :as discovery]
+            [ayatori.remote :as remote]))
+
+(def snapshot-cid "bafyreib662epgj5lnl2cisepwnq4z2hcqcm4eotvwwr72v76qrhvf45maq")
+(def partitions
+  [{:attr "score"
+    :boundaries [1000 2000 3000 4000 5000 6000 7000 8000 9000 10000 11000]
+    :budget-bits 4}])
+
+(defn- now [] (.now js/performance))
+
+(defn- json-http [{:keys [url headers]}]
+  (-> (js/fetch url #js {:method "GET" :headers (clj->js headers)})
+      (.then (fn [response]
+               (-> (.text response)
+                   (.then (fn [body]
+                            {:status (.-status response)
+                             :body (when (seq body)
+                                     (js->clj (js/JSON.parse body)
+                                              :keywordize-keys true))})))))))
+
+(defn- block-http [{:keys [url headers]}]
+  (-> (js/fetch url #js {:method "GET" :headers (clj->js headers)
+                         :redirect "follow"})
+      (.then (fn [response]
+               (if (= 200 (.-status response))
+                 (-> (.arrayBuffer response)
+                     (.then (fn [body]
+                              {:status 200 :body (js/Uint8Array. body)})))
+                 {:status (.-status response)})))))
+
+(defn- discover [cid]
+  (discovery/find-providers-async
+   json-http cid {:routers ["https://cid.contact/routing/v1"] :quorum 1}))
+
+;; Kotobase's canonical immutable IPLD route is /ipld/:cid. The provider's
+;; gateway-http multiaddr names the host; this benchmark declares that stable
+;; route instead of silently assuming the legacy /ipfs namespace.
+(def fetch-block
+  (remote/gateway-fetcher-async block-http {:path-prefix "/ipld/"}))
+
+(defn- open-cold []
+  (remote/open-snapshot-async
+   {:snapshot-cid snapshot-cid
+    :discover-fn discover
+    :fetch-fn fetch-block
+    :blind-fn #(js/Promise.resolve (pr-str %))
+    :decrypt-fn #(js/Promise.resolve %)
+    :partitions partitions}))
+
+(defn- sample [run]
+  (let [started (now)]
+    (-> (open-cold)
+        (.then (fn [opened]
+                 (-> (run opened)
+                     (.then (fn [result]
+                              {:ok true :ms (- (now) started)
+                               :result result :stats (remote/stats opened)})))))
+        (.catch (fn [e]
+                  {:ok false :ms (- (now) started)
+                   :type (some-> e ex-data :type name)
+                   :message (or (.-message e) (str e))})))))
+
+(defn- run-n [n f]
+  (reduce (fn [promise _]
+            (.then promise
+                   (fn [acc]
+                     (-> (f) (.then #(conj acc %))))))
+          (js/Promise.resolve [])
+          (range n)))
+
+(defn- percentile [xs p]
+  (when (seq xs)
+    (let [v (vec (sort xs))]
+      (nth v (max 0 (dec (js/Math.ceil (* p (count v)))))))))
+
+(defn- summarize [samples]
+  (let [ok (vec (filter :ok samples))
+        ms (map :ms ok)]
+    {:samples (count samples) :successes (count ok)
+     :failures (- (count samples) (count ok))
+     :p50-ms (percentile ms 0.50) :p95-ms (percentile ms 0.95)
+     :observations samples}))
+
+(defn- main []
+  (let [n (js/parseInt (or (aget js/process.env "AYATORI_ARRANGEMENT_SAMPLES") "10") 10)
+        full-n (js/parseInt (or (aget js/process.env "AYATORI_FULL_SCAN_SAMPLES") "3") 10)]
+    (-> (run-n n #(sample (fn [opened]
+                            (-> (remote/scan-range-report-async opened "score" 5010 5020)
+                                (.then (fn [r]
+                                         {:rows (count (:quads r))
+                                          :pruned? (:pruned? r)
+                                          :buckets (:buckets r)
+                                          :budget-bits (:budget-bits r)}))))))
+        (.then (fn [range-samples]
+                 (-> (run-n n #(sample (fn [opened]
+                                         (-> (remote/scan-async opened [nil "kind" "rare"])
+                                             (.then (fn [rows] {:rows (count rows)}))))))
+                     (.then (fn [rare-samples] [range-samples rare-samples])))))
+        (.then (fn [[range-samples rare-samples]]
+                 (-> (run-n n #(sample (fn [opened]
+                                         (-> (remote/q-async
+                                              opened
+                                              '{:find [?s ?score]
+                                                :where [[?s "score" ?score]
+                                                        [(>= ?score 5010)]
+                                                        [(< ?score 5020)]
+                                                        [?s "kind" "common"]]}
+                                              (constantly true))
+                                             (.then (fn [rows]
+                                                      {:rows (count rows)}))))))
+                     (.then (fn [datalog-samples]
+                              [range-samples rare-samples datalog-samples])))))
+        (.then (fn [[range-samples rare-samples datalog-samples]]
+                 (-> (run-n full-n #(sample (fn [opened]
+                                              (-> (remote/scan-async opened [nil "score" nil])
+                                                  (.then (fn [rows] {:rows (count rows)}))))))
+                     (.then (fn [full-samples]
+                              {:schema "ayatori.public-arrangement-benchmark/v2"
+                               :measured-at (.toISOString (js/Date.))
+                               :runtime (.-version js/process)
+                               :public-indexer "https://cid.contact/routing/v1"
+                               :provider-route "https://kotobase.net/ipld/:cid"
+                               :snapshot-cid snapshot-cid
+                               :fixture {:entities 12000 :quads 24000
+                                         :blocks 324 :bytes 6577346}
+                               :range-5010-5020 (summarize range-samples)
+                               :rare-pattern (summarize rare-samples)
+                               :datalog-range-kind-join (summarize datalog-samples)
+                               :full-score-pattern (summarize full-samples)})))))
+        (.then #(println (js/JSON.stringify (clj->js %) nil 2)))
+        (.catch (fn [e]
+                  (println (js/JSON.stringify #js {:fatal (or (.-stack e) (str e))}))
+                  (set! (.-exitCode js/process) 1))))))
+
+(main)

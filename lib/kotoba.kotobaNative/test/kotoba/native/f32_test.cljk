@@ -1,0 +1,315 @@
+(ns kotoba.native.f32-test
+  "Binary32 on both native ISAs (kotoba-lang ADR-kotoba-floating-point-on-native).
+
+  These are BYTE goldens, not shape assertions. The whole risk in this change is
+  emitting the double-precision instruction where the single-precision one was
+  meant: `ADDSD` and `ADDSS` differ in one prefix byte (0xf2 vs 0xf3), `FADD D`
+  and `FADD S` in one bit (22), and a program built from the wrong one still
+  runs, still returns a number, and returns the wrong one. Nothing but the bytes
+  catches that, so every case asserts the single-precision encoding is present
+  AND that its double-precision twin is not.
+
+  Every encoding here was assembled with clang -- `-target x86_64-apple-macos`
+  and `-target arm64-apple-macos` -- and read back with `otool -t`, which is the
+  standard both backends' own f64 blocks hold themselves to. It earned its keep:
+  a first hand-derivation of `FADD S0,S0,S1` came out 0x1E202800, and the
+  assembler says 0x1E212800.
+
+  The representation being pinned: an f32 occupies one integer word holding its
+  binary32 pattern SIGN-EXTENDED from bit 31. So `f32-to-bits` emits nothing,
+  `f32-from-bits` emits the sign extension, and every operation whose result
+  comes back out of the FP bank through a 32-bit destination re-extends -- since
+  writing eax/w0 zeroes the upper half of the 64-bit register. Without that, the
+  backend and the KIR oracle disagree on every negative float, because
+  `f32-to-i64-bits` yields a SIGNED i32.
+
+  Which register the result lands in is the ALLOCATOR's choice, not this
+  change's, so the result-side assertions are structural: they check that a
+  32-bit move out of the FP bank is immediately followed by a sign extension of
+  the same register, whichever register that is. Pinning the allocator's current
+  answer would make this file go red for a reason that has nothing to do with
+  floating point."
+  (:refer-clojure :exclude [bit-and])
+  (:require [kotoba.native.test-support :refer [bit-and]]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.native.x86-64 :as x86]
+            [kotoba.native.aarch64 :as arm]))
+
+(defn- program [params body]
+  {:format :kotoba.kir/v4 :exports ['main]
+   :functions [{:name 'main :params params :result :i64 :body body}]})
+
+(defn- x86-code [params body] (vec (:code (x86/emit-program (program params body)))))
+(defn- arm-code [params body] (vec (:code (arm/emit-program (program params body)))))
+
+(defn- contains-bytes? [bytes needle]
+  (boolean (some #(= (vec needle) %)
+                 (partition (count needle) 1 bytes))))
+
+;; `movd r32, xmm0` (66 0f 7e /r) immediately followed by `movsxd r64, r32`
+;; (REX.W 63 /r). The modrm bytes carry the allocator's register, so they are
+;; not compared -- what is asserted is that the narrowing move is never left
+;; standing without the extension that follows it.
+(defn- x86-narrow-out-then-sign-extend? [code]
+  (boolean (some (fn [i]
+                   (and (= [0x66 0x0f 0x7e] (subvec code i (+ i 3)))
+                        (= 0x48 (bit-and (nth code (+ i 4)) 0xf8))
+                        (= 0x63 (nth code (+ i 5)))))
+                 (range 0 (max 0 (- (count code) 6))))))
+
+;; `FMOV Wd, S0` (0x1E260000 | d) immediately followed by `SXTW Xd, Wd`
+;; (0x93407C00 | d<<5 | d), little-endian, register bits not compared.
+(defn- arm-narrow-out-then-sign-extend? [code]
+  (boolean (some (fn [i]
+                   (and (= [0x26 0x1e] [(nth code (+ i 2)) (nth code (+ i 3))])
+                        (= [0x7c 0x40 0x93] (subvec code (+ i 5) (+ i 8)))))
+                 (range 0 (max 0 (- (count code) 8))))))
+
+;; ---------------------------------------------------------------------------
+;; x86-64
+;; ---------------------------------------------------------------------------
+
+;; movd xmm0, eax / movd xmm1, ecx. The operands always enter through xmm0 and
+;; xmm1 -- that part is this backend's convention, not the allocator's.
+(def ^:private x86-in-0 [0x66 0x0f 0x6e 0xc0])
+(def ^:private x86-in-1 [0x66 0x0f 0x6e 0xc9])
+;; movq xmm0, rax -- the 64-bit form, which must NOT appear for an f32 operand.
+(def ^:private x86-in-0-wide [0x66 0x48 0x0f 0x6e 0xc0])
+
+;; addss/subss/mulss/divss xmm0, xmm1. The 0xf3 prefix is the scalar-single one;
+;; 0xf2 is scalar-double.
+(def ^:private x86-arithmetic
+  {'f32-add [0xf3 0x0f 0x58 0xc1]
+   'f32-sub [0xf3 0x0f 0x5c 0xc1]
+   'f32-mul [0xf3 0x0f 0x59 0xc1]
+   'f32-div [0xf3 0x0f 0x5e 0xc1]})
+
+(deftest x86-f32-arithmetic-emits-the-scalar-single-instruction
+  (doseq [[op bytes] x86-arithmetic]
+    (testing (str op)
+      (let [code (x86-code '[a b] (list op 'a 'b))]
+        (is (contains-bytes? code bytes)
+            "the scalar-SINGLE opcode")
+        (is (not (contains-bytes? code (assoc (vec bytes) 0 0xf2)))
+            "and not its scalar-double twin, which differs by one byte")
+        (is (contains-bytes? code x86-in-0) "operands enter through movd")
+        (is (contains-bytes? code x86-in-1))
+        (is (not (contains-bytes? code x86-in-0-wide))
+            "movq would carry 32 bits of whatever the word held above the pattern")
+        (is (x86-narrow-out-then-sign-extend? code)
+            "and the result is narrowed out and immediately re-extended")))))
+
+(deftest x86-f32-unary-and-conversions
+  (testing "sqrtss"
+    (let [code (x86-code '[a] '(f32-sqrt a))]
+      (is (contains-bytes? code [0xf3 0x0f 0x51 0xc0]))
+      (is (not (contains-bytes? code [0xf2 0x0f 0x51 0xc0])) "sqrtsd is the f64 one")
+      (is (x86-narrow-out-then-sign-extend? code))))
+  (testing "f32-neg is a bit operation on the sign-extended word"
+    ;; XOR with 0xFFFFFFFF80000000 flips bit 31 AND the whole upper half, so the
+    ;; result stays sign-extended in both directions. The constant arrives as a
+    ;; sign-extended imm32.
+    (let [code (x86-code '[a] '(f32-neg a))]
+      (is (contains-bytes? code [0x00 0x00 0x00 0x80])
+          "the imm32 whose sign extension is the f32 sign mask")
+      (is (not (contains-bytes? code [0x48 0x0f 0xba 0xf8 0x3f]))
+          "bit 63 is the f64 sign bit and would corrupt an f32")))
+  (testing "f32-abs clears bit 31 and everything above it"
+    (is (contains-bytes? (x86-code '[a] '(f32-abs a)) [0xff 0xff 0xff 0x7f])))
+  (testing "f32-from-bits sign-extends; f32-to-bits emits nothing"
+    ;; from-bits lowers to shift-left 32 / shift-right-signed 32, which is what
+    ;; `signed-i32-value` already emits for i32-wrap.
+    (is (contains-bytes? (x86-code '[a] '(f32-from-bits a)) [0x20 0x00 0x00 0x00])
+        "the shift count 32")
+    (is (= (x86-code '[a] 'a) (x86-code '[a] '(f32-to-bits a)))
+        "to-bits must be byte-identical to the bare operand"))
+  (testing "cvtss2sd widens and keeps the whole 64-bit word"
+    (let [code (x86-code '[a] '(f32-to-f64-exact a))]
+      (is (contains-bytes? code [0xf3 0x0f 0x5a 0xc0]))
+      (is (contains-bytes? code [0x66 0x48 0x0f 0x7e]) "an f64 result leaves through movq")
+      (is (not (x86-narrow-out-then-sign-extend? code))
+          "and must NOT be sign-extended from bit 31 -- it is not an f32")))
+  (testing "cvtsd2ss narrows and re-extends"
+    (let [code (x86-code '[a] '(f64-to-f32-rounded a))]
+      (is (contains-bytes? code [0xf2 0x0f 0x5a 0xc0]))
+      (is (contains-bytes? code x86-in-0-wide) "the f64 operand enters through movq")
+      (is (x86-narrow-out-then-sign-extend? code))))
+  (testing "cvtsi2ss / cvtsi2sd read the 64-bit register directly"
+    (let [code32 (x86-code '[a] '(i64-to-f32-rounded a))
+          code64 (x86-code '[a] '(i64-to-f64-rounded a))]
+      (is (contains-bytes? code32 [0xf3 0x48 0x0f 0x2a 0xc0]))
+      (is (x86-narrow-out-then-sign-extend? code32))
+      (is (contains-bytes? code64 [0xf2 0x48 0x0f 0x2a 0xc0]))
+      (is (contains-bytes? code64 [0x66 0x48 0x0f 0x7e]))
+      (is (not (x86-narrow-out-then-sign-extend? code64))))))
+
+(deftest x86-f32-comparisons-use-ucomiss-and-handle-unordered
+  ;; UCOMISS is UCOMISD without the 0x66 prefix and sets identical flags:
+  ;; ZF=PF=CF=1 when either operand is NaN. So the ordered tests must read CF,
+  ;; and lt/le SWAP the operands and reuse seta/setae rather than using
+  ;; setb/setbe, which would succeed on unordered.
+  (doseq [[op needle] {'f32-gt [0x0f 0x2e 0xc1 0x0f 0x97]
+                       'f32-ge [0x0f 0x2e 0xc1 0x0f 0x93]
+                       'f32-lt [0x0f 0x2e 0xc8 0x0f 0x97]
+                       'f32-le [0x0f 0x2e 0xc8 0x0f 0x93]
+                       'f32-unordered [0x0f 0x2e 0xc1 0x0f 0x9a]}]
+    (testing (str op)
+      (let [code (x86-code '[a b] (list op 'a 'b))]
+        (is (contains-bytes? code needle))
+        (is (not (contains-bytes? code [0x66 0x0f 0x2e 0xc1]))
+            "0x66 would make this UCOMISD and compare the wrong 64 bits")
+        (is (not (contains-bytes? code [0x66 0x0f 0x2e 0xc8]))))))
+  (testing "f32-eq additionally tests PF, because unordered also sets ZF"
+    (let [code (x86-code '[a b] '(f32-eq a b))]
+      (is (contains-bytes? code [0x0f 0x2e 0xc1 0x0f 0x94]))
+      (is (contains-bytes? code [0x0f 0x9b]) "setnp"))))
+
+;; ---------------------------------------------------------------------------
+;; AArch64
+;; ---------------------------------------------------------------------------
+
+;; Little-endian words. Each is its double-precision twin with ftype (bit 22)
+;; cleared: FADD D 0x1E612800 -> FADD S 0x1E212800.
+(def ^:private arm-in-0 [0x00 0x00 0x27 0x1e])   ; fmov s0, w0
+(def ^:private arm-in-1 [0x21 0x00 0x27 0x1e])   ; fmov s1, w1
+(def ^:private arm-in-0-wide [0x00 0x00 0x67 0x9e]) ; fmov d0, x0
+
+(def ^:private arm-arithmetic
+  {'f32-add [0x00 0x28 0x21 0x1e]
+   'f32-sub [0x00 0x38 0x21 0x1e]
+   'f32-mul [0x00 0x08 0x21 0x1e]
+   'f32-div [0x00 0x18 0x21 0x1e]})
+
+(def ^:private arm-f64-arithmetic
+  {'f32-add [0x00 0x28 0x61 0x1e]
+   'f32-sub [0x00 0x38 0x61 0x1e]
+   'f32-mul [0x00 0x08 0x61 0x1e]
+   'f32-div [0x00 0x18 0x61 0x1e]})
+
+(deftest arm-f32-arithmetic-emits-the-single-precision-encoding
+  (doseq [[op bytes] arm-arithmetic]
+    (testing (str op)
+      (let [code (arm-code '[a b] (list op 'a 'b))]
+        (is (contains-bytes? code bytes) "the single-precision word, ftype 00")
+        (is (not (contains-bytes? code (get arm-f64-arithmetic op)))
+            "and not its double-precision twin, one bit away")
+        (is (contains-bytes? code arm-in-0) "operands enter the S bank")
+        (is (contains-bytes? code arm-in-1))
+        (is (not (contains-bytes? code arm-in-0-wide))
+            "FMOV D,X would move 64 bits into a 32-bit lane")
+        (is (arm-narrow-out-then-sign-extend? code)
+            "and the result is narrowed out and immediately re-extended")))))
+
+(deftest arm-f32-unary-and-conversions
+  (testing "FSQRT single"
+    (let [code (arm-code '[a] '(f32-sqrt a))]
+      (is (contains-bytes? code [0x00 0xc0 0x21 0x1e]))
+      (is (not (contains-bytes? code [0x00 0xc0 0x61 0x1e])) "0x1e61c000 is FSQRT D")
+      (is (arm-narrow-out-then-sign-extend? code))))
+  (testing "f32-neg and f32-abs are bit operations, not FNEG/FABS"
+    ;; Deliberately: an EOR/AND against the sign-extended mask keeps the word
+    ;; canonical without a trip through the FP bank, exactly as the f64 path
+    ;; uses bit operations rather than FNEG.
+    (is (contains-bytes? (arm-code '[a] '(f32-neg a)) [0x00 0x00 0x01 0xca])
+        "EOR x0, x0, x1")
+    (is (contains-bytes? (arm-code '[a] '(f32-abs a)) [0x00 0x00 0x01 0x8a])
+        "AND x0, x0, x1"))
+  (testing "f32-from-bits is a sign extension; f32-to-bits emits nothing"
+    (is (contains-bytes? (arm-code '[a] '(f32-from-bits a)) [0x01 0x04 0x80 0xd2])
+        "the shift count 32")
+    (is (= (arm-code '[a] 'a) (arm-code '[a] '(f32-to-bits a)))
+        "to-bits must be byte-identical to the bare operand"))
+  (testing "FCVT widens and keeps the whole 64-bit word"
+    (let [code (arm-code '[a] '(f32-to-f64-exact a))]
+      (is (contains-bytes? code [0x00 0xc0 0x22 0x1e]) "FCVT D0, S0")
+      (is (contains-bytes? code arm-in-0) "the f32 operand enters the S bank")
+      (is (not (arm-narrow-out-then-sign-extend? code))
+          "an f64 result must not be sign-extended from bit 31")))
+  (testing "FCVT narrows and re-extends"
+    (let [code (arm-code '[a] '(f64-to-f32-rounded a))]
+      (is (contains-bytes? code [0x00 0x40 0x62 0x1e]) "FCVT S0, D0")
+      (is (contains-bytes? code arm-in-0-wide) "the f64 operand enters the D bank")
+      (is (arm-narrow-out-then-sign-extend? code))))
+  (testing "SCVTF reads the 64-bit register directly"
+    (let [code32 (arm-code '[a] '(i64-to-f32-rounded a))
+          code64 (arm-code '[a] '(i64-to-f64-rounded a))]
+      (is (contains-bytes? code32 [0x00 0x00 0x22 0x9e]) "SCVTF S0, X0")
+      (is (arm-narrow-out-then-sign-extend? code32))
+      (is (contains-bytes? code64 [0x00 0x00 0x62 0x9e]) "SCVTF D0, X0")
+      (is (not (arm-narrow-out-then-sign-extend? code64))))))
+
+(deftest arm-f32-comparisons-use-the-single-precision-fcmp
+  ;; FCMP sets identical flags for single and double, including N=0 Z=0 C=1 V=1
+  ;; when unordered, so the CSET words are the f64 table's unchanged and only
+  ;; the compare narrows.
+  (doseq [[op cset] {'f32-eq [0xe2 0x17 0x9f 0x9a]
+                     'f32-lt [0xe2 0x57 0x9f 0x9a]
+                     'f32-le [0xe2 0x87 0x9f 0x9a]
+                     'f32-gt [0xe2 0xd7 0x9f 0x9a]
+                     'f32-ge [0xe2 0xb7 0x9f 0x9a]
+                     'f32-unordered [0xe2 0x77 0x9f 0x9a]}]
+    (testing (str op)
+      (let [code (arm-code '[a b] (list op 'a 'b))]
+        (is (contains-bytes? code [0x00 0x20 0x21 0x1e]) "FCMP S0, S1")
+        (is (not (contains-bytes? code [0x00 0x20 0x61 0x1e]))
+            "0x1e612000 is FCMP D0, D1 and would compare the wrong 64 bits")
+        ;; The CSET's low three bits are the destination register. Compare the
+        ;; condition and the opcode, which are the top three bytes.
+        (is (contains-bytes? code (subvec cset 1))
+            "the condition that is FALSE when unordered")))))
+
+;; ---------------------------------------------------------------------------
+;; Parity, and the deliberate hole in it
+;; ---------------------------------------------------------------------------
+
+(def ^:private both-isas
+  ['(f32-add a b) '(f32-sub a b) '(f32-mul a b) '(f32-div a b)
+   '(f32-eq a b) '(f32-lt a b) '(f32-le a b) '(f32-gt a b) '(f32-ge a b)
+   '(f32-unordered a b)
+   '(f32-neg a) '(f32-abs a) '(f32-sqrt a)
+   '(f32-from-bits a) '(f32-to-bits a)
+   '(f32-to-f64-exact a) '(f64-to-f32-rounded a)
+   '(i64-to-f32-rounded a) '(i64-to-f64-rounded a)])
+
+;; The POSITIVE half of parity -- every operation above emits on both ISAs --
+;; lives in `kotoba.native.isa-parity-test`, which is the namespace that exists
+;; for exactly that property. It is not repeated here. What is here is the half
+;; that namespace cannot express: an operation deliberately absent from BOTH.
+
+(defn- emits? [emit body]
+  (try (seq (:code (emit {:format :kotoba.kir/v4 :exports ['main]
+                          :functions [{:name 'main :params '[a b] :result :i64
+                                       :body body}]})))
+       (catch :default _ false)))
+
+(deftest min-and-max-are-absent-from-both-and-that-is-the-decision
+  ;; x86 MINSS/MAXSS return the SECOND operand when either input is NaN;
+  ;; AArch64 FMIN/FMAX and the KIR oracle's Math/min return the NaN. So the
+  ;; operation cannot mean one thing across the two backends without an emitted
+  ;; NaN test. kotoba.kir refuses them at admission; neither backend implements
+  ;; them; and this case exists so that adding one to a single backend -- the
+  ;; exact shape of the bug isa-parity-test was written for -- fails loudly.
+  ;;
+  ;; The f64 twins ARE implemented on both, and therefore x86 already disagrees
+  ;; with the oracle on them. That is a pre-existing defect, recorded in the ADR
+  ;; rather than repaired here, because repairing it moves f64 goldens.
+  (doseq [body ['(f32-min a b) '(f32-max a b)]]
+    (testing (str body)
+      (is (false? (emits? x86/emit-program body)))
+      (is (false? (emits? arm/emit-program body)))))
+  (doseq [body ['(f64-min a b) '(f64-max a b)]]
+    (testing (str body)
+      (is (emits? x86/emit-program body) "the f64 twin is implemented")
+      (is (emits? arm/emit-program body)))))
+
+(deftest emission-is-deterministic
+  ;; Byte goldens are only meaningful if the same KIR gives the same bytes.
+  (doseq [body both-isas]
+    (testing (str body)
+      (is (= (x86-code '[a b] body) (x86-code '[a b] body)))
+      (is (= (arm-code '[a b] body) (arm-code '[a b] body))))))
+
+(deftest scanned-counts-are-nonzero
+  (is (= 19 (count both-isas)) "SCANNED parity")
+  (is (= 4 (count x86-arithmetic)) "SCANNED x86 arithmetic")
+  (is (= 4 (count arm-arithmetic)) "SCANNED arm arithmetic"))

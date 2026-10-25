@@ -1,0 +1,246 @@
+;; Not a unit test -- an EXECUTABLE end-to-end demo that must genuinely
+;; pass when run, matching the verification style
+;; ADR-2607161817/kotoba-lang/dtn's tcp_demo.cljs and
+;; kotoba-lang/org-ietf-sftp's ssh_demo.cljs established: it spawns an
+;; actual second `nbb` OS process (bin/pg_node.cljk, this repo's own
+;; server binary, invoked directly via node:child_process -- found by
+;; relative path, not $PATH), connects to its real bound TCP port from
+;; THIS process (acting as a minimal, hand-rolled Postgres wire CLIENT --
+;; there is no general-purpose client in this repo, see
+;; kotobase.pg.wire's own docstring: "no real client library is
+;; offered"), and proves the real chain:
+;;
+;;   SSLRequest -> deny byte 'N' -> real StartupMessage -> real
+;;   AuthenticationOk/ParameterStatus*/BackendKeyData/ReadyForQuery ->
+;;   real simple-query Query('Q') messages against the SECOND PROCESS's
+;;   own in-memory kotobase.local store, routed through
+;;   kotobase.pg.sql's real parser/translator/executor and
+;;   kotobase-query's real materialize+arrangement.datalog join engine
+;;   -> real RowDescription/DataRow/CommandComplete responses whose
+;;   actual byte content is decoded and checked against the fixture data
+;;   -- AND an out-of-scope query (COUNT(*)) genuinely producing a real
+;;   ErrorResponse rather than silently mis-executing -> Terminate.
+;;
+;; This is proof by protocol response content, not proof by log line: if
+;; the message framing, length fields, startup-code classification, or
+;; kotobase.pg.sql translation were wrong, the responses below would
+;; either never arrive in a well-formed shape (this client's own
+;; incremental reader would stall waiting for bytes that never
+;; complete a message, timing out) or would decode to values that don't
+;; match the known fixture data in bin/pg_node.cljk.
+;;
+;; HONEST SCOPE: this proves this repo's OWN hand-rolled client (this
+;; file) and OWN server (kotobase.pg.wire) correctly interoperate with
+;; EACH OTHER, across two real OS processes, over a real TCP socket. It
+;; does NOT prove interop with a real `psql`/`libpq`/any off-the-shelf
+;; Postgres driver -- no such test exists in this repo, and none is
+;; claimed. See the README's "What's actually verified" table.
+;;
+;; Prints PASS/FAIL per check, a final "RESULT: N/M checks passed" line,
+;; and exits 0 iff every check passed (else 1). Run from this repo's
+;; root:
+;;
+;;   kbb --backend sci --classpath "src:test:.deps/kotobase-query/src:.deps/kotobase/src:.deps/arrangement/src:.deps/prolly-tree/src:.deps/io-ipld/src:.deps/io-multiformats/src:.deps/org-ietf-cbor/src" \
+;;     test/kotobase/pg/wire_demo.cljk
+
+(ns kotobase.pg.wire-demo
+  (:require ["node:child_process" :as cp]
+            ["node:net" :as net]
+            [kotoba.lang.text :as str]
+            [promesa.core :as p]
+            [kotobase.pg.wire :as w]))
+
+(def classpath
+  "src:test:.deps/kotobase-query/src:.deps/kotobase/src:.deps/arrangement/src:.deps/prolly-tree/src:.deps/io-ipld/src:.deps/io-multiformats/src:.deps/org-ietf-cbor/src")
+(def demo-port 6543)
+
+(defn- sleep-ms [ms] (js/Promise. (fn [resolve _] (js/setTimeout resolve ms))))
+
+(defn- try-connect-once [host port]
+  (js/Promise.
+   (fn [resolve _]
+     (let [sock (net/createConnection #js {:host host :port port})]
+       (.on sock "connect" (fn [] (.destroy sock) (resolve true)))
+       (.on sock "error" (fn [_e] (.destroy sock) (resolve false)))))))
+
+(defn- wait-for-port [host port attempts interval-ms]
+  (p/let [ok? (try-connect-once host port)]
+    (cond
+      ok? true
+      (<= attempts 0) false
+      :else (p/let [_ (sleep-ms interval-ms)] (wait-for-port host port (dec attempts) interval-ms)))))
+
+;; ---------------------------------------------------------------------------
+;; A minimal, hand-rolled client-side incremental reader -- accumulates raw
+;; bytes off the socket's "data" event into `reader-atom`, and lets the demo
+;; script pull complete units (a single raw byte, for SSLRequest's deny
+;; response; or a full tagged message, for everything else) out of it via
+;; polling. Deliberately NOT part of kotobase.pg.wire's public API -- this
+;; repo does not offer a general-purpose client library, only this
+;; demo/test-only one (see ns docstring).
+;; ---------------------------------------------------------------------------
+
+(defn- new-reader [] (atom {:raw (js/Buffer.alloc 0)}))
+
+(defn- feed! [reader-atom ^js chunk]
+  (swap! reader-atom update :raw (fn [prev] (js/Buffer.concat #js [prev chunk]))))
+
+(defn- try-take-bytes! [reader-atom n]
+  (let [{:keys [raw]} @reader-atom]
+    (when (>= (.-length raw) n)
+      (let [taken (.subarray raw 0 n)]
+        (swap! reader-atom assoc :raw (.subarray raw n))
+        taken))))
+
+(defn- try-take-message! [reader-atom]
+  (let [{:keys [raw]} @reader-atom]
+    (when (>= (.-length raw) 5)
+      (let [len (w/read-u32 raw 1)
+            total (+ 1 len)]
+        (when (>= (.-length raw) total)
+          (let [full (.subarray raw 0 total)]
+            (swap! reader-atom assoc :raw (.subarray raw total))
+            (w/parse-message-header full)))))))
+
+(def ^:private poll-attempts 300) ;; up to ~15s per read -- this machine runs
+;; many concurrent Claude Code sessions in parallel (documented environment
+;; hazard elsewhere in this workspace, e.g. org-ietf-sftp's ssh_demo.cljs),
+;; so a short budget here produces flaky false FAILs, not a real signal.
+(def ^:private poll-interval-ms 50)
+
+(defn- wait-for [pred-fn attempts interval-ms]
+  (p/let [v (pred-fn)]
+    (cond
+      v v
+      (<= attempts 0) (throw (ex-info "kotobase.pg.wire-demo: timed out waiting for bytes" {}))
+      :else (p/let [_ (sleep-ms interval-ms)] (wait-for pred-fn (dec attempts) interval-ms)))))
+
+(defn- read-bytes! [reader-atom n]
+  (wait-for #(try-take-bytes! reader-atom n) poll-attempts poll-interval-ms))
+
+(defn- read-message! [reader-atom]
+  (wait-for #(try-take-message! reader-atom) poll-attempts poll-interval-ms))
+
+(defn- read-until-ready-for-query!
+  "Reads tagged messages until (and including) a ReadyForQuery ('Z'), -> a
+  vector of every message read, in order."
+  [reader-atom]
+  (p/let [m (read-message! reader-atom)]
+    (if (= "Z" (:type m))
+      [m]
+      (p/let [more (read-until-ready-for-query! reader-atom)]
+        (into [m] more)))))
+
+;; ---------------------------------------------------------------------------
+
+(def results (atom []))
+(defn- check! [label ok?]
+  (swap! results conj [label ok?])
+  (println (if ok? "PASS" "FAIL") label))
+
+(defn- msg-types [msgs] (mapv :type msgs))
+
+(defn run-demo []
+  (println "\n--- kotobase.pg.wire real cross-process demo ---")
+  (println "  spawning a second `nbb` OS process running bin/pg_node.cljk listen --port"
+            demo-port "...")
+  (let [err-chunks (atom [])
+        child (cp/spawn "nbb" #js ["--classpath" classpath "lib/org.postgresql.wire/bin/pg_node.cljk" "listen"
+                                    "--port" (str demo-port)]
+                         #js {:cwd (js/process.cwd)})]
+    (.on (.-stderr child) "data" (fn [chunk] (swap! err-chunks conj (str chunk))))
+    (-> (p/let [up? (wait-for-port "127.0.0.1" demo-port 150 150)] ;; up to ~22s, see ssh_demo.cljs's
+          ;; identical comment on cold-start time under this machine's load
+          (if-not up?
+            (do (println "FAIL: child `listen` process never bound port" demo-port)
+                (println "  child stderr:" (str/join "" @err-chunks))
+                (.kill child)
+                false)
+            (let [reader (new-reader)
+                  sock (net/createConnection #js {:host "127.0.0.1" :port demo-port})]
+              (.on sock "data" (fn [chunk] (feed! reader chunk)))
+              (p/let [_connected (js/Promise. (fn [resolve _] (.on sock "connect" resolve)))
+                      _ (println "  TCP connection established with the child process")
+
+                      ;; --- SSLRequest -> deny byte 'N' ---------------------
+                      _ (.write sock (w/build-ssl-request))
+                      ssl-reply (read-bytes! reader 1)
+                      _ (check! "SSLRequest -> a single 'N' deny byte (no TLS, see README warning)"
+                                (= (w/char-code \N) (aget ssl-reply 0)))
+
+                      ;; --- real StartupMessage -> full handshake ------------
+                      _ (.write sock (w/build-startup-message {"user" "kotobase" "database" "kotobase"}))
+                      handshake-msgs (read-until-ready-for-query! reader)
+                      _ (check! "StartupMessage -> AuthenticationOk is the first message"
+                                (= "R" (:type (first handshake-msgs))))
+                      _ (check! "StartupMessage -> AuthenticationOk body is authtype 0 (no password requested)"
+                                (= 0 (w/read-i32 (:body (first handshake-msgs)) 0)))
+                      _ (check! "StartupMessage -> at least one ParameterStatus message"
+                                (some #(= "S" %) (msg-types handshake-msgs)))
+                      _ (check! "StartupMessage -> a BackendKeyData message"
+                                (some #(= "K" %) (msg-types handshake-msgs)))
+                      _ (check! "StartupMessage -> ends with ReadyForQuery status 'I' (idle)"
+                                (let [z (last handshake-msgs)]
+                                  (and (= "Z" (:type z)) (= "I" (w/decode-ready-for-query (:body z))))))
+
+                      ;; --- simple query: real join-free equality filter ----
+                      _ (.write sock (w/build-query-message "SELECT name, role FROM users WHERE role = 'admin'"))
+                      q1-msgs (read-until-ready-for-query! reader)
+                      row-desc (first (filter #(= "T" (:type %)) q1-msgs))
+                      data-rows (filter #(= "D" (:type %)) q1-msgs)
+                      cmd-complete (first (filter #(= "C" (:type %)) q1-msgs))
+                      _ (check! "SELECT ... WHERE role = 'admin' -> RowDescription columns [name role]"
+                                (= ["name" "role"] (w/decode-row-description (:body row-desc))))
+                      _ (check! "SELECT ... WHERE role = 'admin' -> exactly 2 DataRow messages"
+                                (= 2 (count data-rows)))
+                      _ (check! "SELECT ... WHERE role = 'admin' -> rows are exactly Alice/Carol (decoded correctly from the SECOND process's own store)"
+                                (= #{["Alice" "admin"] ["Carol" "admin"]}
+                                   (set (map #(w/decode-data-row (:body %)) data-rows))))
+                      _ (check! "SELECT ... WHERE role = 'admin' -> CommandComplete tag is \"SELECT 2\""
+                                (= "SELECT 2" (w/decode-command-complete (:body cmd-complete))))
+                      _ (check! "SELECT ... WHERE role = 'admin' -> ends with ReadyForQuery"
+                                (= "Z" (:type (last q1-msgs))))
+
+                      ;; --- simple query: no WHERE clause, all rows with that col --
+                      _ (.write sock (w/build-query-message "SELECT name FROM users"))
+                      q2-msgs (read-until-ready-for-query! reader)
+                      q2-rows (filter #(= "D" (:type %)) q2-msgs)
+                      _ (check! "SELECT name FROM users (no WHERE) -> all 4 fixture rows"
+                                (= #{["Alice"] ["Bob"] ["Carol"] ["Dave"]}
+                                   (set (map #(w/decode-data-row (:body %)) q2-rows))))
+
+                      ;; --- out-of-scope query -> real ErrorResponse, not a
+                      ;; silent mis-execution or a dropped connection --------
+                      _ (.write sock (w/build-query-message "SELECT COUNT(*) FROM users"))
+                      q3-msgs (read-until-ready-for-query! reader)
+                      err-msg (first (filter #(= "E" (:type %)) q3-msgs))
+                      _ (check! "SELECT COUNT(*) (out of scope, no aggregates) -> a real ErrorResponse"
+                                (some? err-msg))
+                      _ (check! "  ... whose message names the actual out-of-scope construct"
+                                (and (some? err-msg)
+                                     (str/includes? (get (w/decode-error-response (:body err-msg)) "M" "")
+                                                     "aggregate")))
+                      _ (check! "  ... connection stays alive after the error (still ends in ReadyForQuery)"
+                                (= "Z" (:type (last q3-msgs))))
+
+                      ;; --- the connection still works after an error -------
+                      _ (.write sock (w/build-query-message "SELECT name FROM users WHERE age = 41"))
+                      q4-msgs (read-until-ready-for-query! reader)
+                      q4-rows (filter #(= "D" (:type %)) q4-msgs)
+                      _ (check! "connection survives a prior error -- numeric-literal WHERE still executes correctly"
+                                (= #{["Alice"]} (set (map #(w/decode-data-row (:body %)) q4-rows))))]
+                (.write sock (w/build-terminate-message))
+                (.destroy sock)
+                (.kill child)
+                (let [failures (filter (fn [[_ ok?]] (not ok?)) @results)]
+                  (println "\nRESULT:" (- (count @results) (count failures)) "/" (count @results) "checks passed")
+                  (empty? failures))))))
+        (.catch (fn [e]
+                  (println "DEMO CRASHED:" e)
+                  (println "  child stderr so far:" (str/join "" @err-chunks))
+                  (.kill child)
+                  false)))))
+
+(-> (run-demo)
+    (.then (fn [pass?] (js/process.exit (if pass? 0 1))))
+    (.catch (fn [e] (println "DEMO CRASHED (outer):" e) (js/process.exit 1))))

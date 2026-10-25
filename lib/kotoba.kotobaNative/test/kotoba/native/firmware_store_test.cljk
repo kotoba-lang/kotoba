@@ -1,0 +1,127 @@
+(ns kotoba.native.firmware-store-test
+  "fwstore: byte goldens for the allocation that answers with an address.
+
+  Every literal below was read back from `llvm-mc -triple x86_64
+  -show-encoding` rather than assembled from the intent. The three that matter
+  most are the two `[rsp+0x20]` forms and the `cmovne`: a wrong ModRM in the
+  first pair puts the out-word somewhere the callee owns, and a wrong
+  condition in the third answers with the firmware's out-word on FAILURE --
+  neither of which faults, and both of which produce a base a later window is
+  declared over."
+  (:refer-clojure :exclude [bit-and])
+  (:require [kotoba.native.test-support :refer [bit-and]]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.native.machine-ir]
+            [kotoba.native.x86-64 :as x86]))
+
+(defn- module [functions]
+  {:format :kotoba.kir/v4 :entry 'main :exports ['main]
+   :functions functions})
+
+(defn- code [functions]
+  (vec (map #(bit-and (long %) 0xff)
+            (:code (x86/emit-program (module functions))))))
+
+(defn- index-of-bytes [haystack needle]
+  (let [n (count needle)]
+    (first (filter #(= needle (subvec haystack % (+ % n)))
+                   (range 0 (inc (- (count haystack) n)))))))
+
+(defn- contains-bytes? [haystack needle]
+  (some? (index-of-bytes haystack needle)))
+
+;; One page, AllocateAnyPages, EfiLoaderData, at EFI_BOOT_SERVICES+0x28.
+(def ^:private allocation
+  [{:name 'main :params '[bs]
+    :body '(kernel-uefi-alloc-region bs 40 0 2 1 0)}])
+
+(def ^:private emitted (delay (code allocation)))
+
+(deftest the-out-pointer-is-this-frames-own-word
+  ;; `lea r9,[rsp+0x20]` -- R9 is the FOURTH Microsoft x64 argument register,
+  ;; and +0x20 is the fifth-argument slot of the frame this encoder just
+  ;; allocated. A four-parameter callee owns [rsp..rsp+0x18] and never writes
+  ;; above it, so the word survives the call it is an argument to.
+  ;;
+  ;; This is the load-bearing byte sequence of the whole stream. If the
+  ;; program supplied this pointer instead, it could supply a pointer to a
+  ;; word it wrote itself, and the region-provenance root kotoba-sema grants
+  ;; on the strength of "the firmware returned this" would be worth nothing.
+  (is (contains-bytes? @emitted [0x4c 0x8d 0x4c 0x24 0x20]))
+  (testing "and the answer is read back from that same word"
+    ;; `mov r10,[rsp+0x20]`
+    (is (contains-bytes? @emitted [0x4c 0x8b 0x54 0x24 0x20])))
+  (testing "the read comes after the call, not before it"
+    (is (< (index-of-bytes @emitted [0x41 0xff 0xd3])           ; call r11
+           (index-of-bytes @emitted [0x4c 0x8b 0x54 0x24 0x20])))))
+
+(deftest a-failed-allocation-answers-zero-branchlessly
+  ;; xor r11,r11 / test rax,rax / cmovne r10,r11. The `xor` SETS FLAGS, so it
+  ;; has to come before the `test` -- putting it after would compare RAX
+  ;; against itself and then overwrite ZF, and the `cmov` would read the
+  ;; xor's own flags instead of the status'.
+  (let [xor-at (index-of-bytes @emitted [0x4d 0x31 0xdb])
+        test-at (index-of-bytes @emitted [0x48 0x85 0xc0])
+        cmov-at (index-of-bytes @emitted [0x4d 0x0f 0x45 0xd3])]
+    (is (some? xor-at))
+    (is (some? test-at))
+    (is (some? cmov-at))
+    (is (< xor-at test-at cmov-at)
+        "the zero source must be materialised before the flags are set")
+    (testing "the flags come from RAX, which is where the callee left EFI_STATUS"
+      (is (= (+ test-at 3) cmov-at)
+          "nothing may sit between the test and the conditional move"))
+    (testing "and the condition is NE, not E"
+      ;; `cmove r10,r11` is `4d 0f 44 d3`, one bit away, and it answers with
+      ;; the out-word on FAILURE and with zero on SUCCESS -- exactly inverted,
+      ;; with no fault of any kind to say so.
+      (is (not (contains-bytes? @emitted [0x4d 0x0f 0x44 0xd3]))))))
+
+(deftest the-frame-is-the-wide-calls-frame-and-stays-sixteen-aligned
+  ;; and rsp,-16 ; sub rsp,0x60. 0x60 is a multiple of 16, so RSP is still
+  ;; 16-aligned at the call, which Microsoft x64 requires.
+  (is (contains-bytes? @emitted [0x48 0x83 0xe4 0xf0]))
+  (is (contains-bytes? @emitted [0x48 0x83 0xec 0x60]))
+  (testing "and the original RSP is restored from +0x28, not +0x30"
+    ;; +0x30 is where `x86-uefi-call-wide` parks it; this frame moved it down
+    ;; one slot to make room for the out-word at +0x20.
+    (is (contains-bytes? @emitted [0x48 0x8b 0xa4 0x24 0x28 0x00 0x00 0x00]))
+    (is (not (contains-bytes? @emitted
+                              [0x48 0x8b 0xa4 0x24 0x30 0x00 0x00 0x00])))))
+
+(deftest the-target-is-read-out-of-the-boot-services-table
+  ;; mov r11,[r10+r11] -- the same indexed load every firmware call uses to
+  ;; turn (table, slot) into a function pointer.
+  (is (contains-bytes? @emitted [0x4f 0x8b 0x1c 0x1a]))
+  (testing "and it is called indirectly through R11"
+    (is (contains-bytes? @emitted [0x41 0xff 0xd3])))
+  (testing "R11 is loaded before the frame is built, and nothing rewrites it
+            between the load and the call"
+    (is (< (index-of-bytes @emitted [0x4f 0x8b 0x1c 0x1a])
+           (index-of-bytes @emitted [0x48 0x83 0xec 0x60])
+           (index-of-bytes @emitted [0x41 0xff 0xd3])))))
+
+(deftest it-is-not-the-wide-call-with-a-different-name
+  ;; `kernel-uefi-call4` over the same operands is the other way to reach
+  ;; `AllocatePages`, and it answers with the STATUS. The two must not emit
+  ;; the same bytes, or the whole distinction is a name.
+  (let [wide (code [{:name 'main :params '[bs]
+                     :body '(kernel-uefi-call4 bs 40 0 2 1 0)}])]
+    (is (not= wide @emitted))
+    (testing "only this one has an out-pointer"
+      (is (not (contains-bytes? wide [0x4c 0x8d 0x4c 0x24 0x20]))))
+    (testing "only this one zeroes its answer on a non-zero status"
+      (is (not (contains-bytes? wide [0x4d 0x0f 0x45 0xd3]))))
+    (testing "and the wide call keeps its own frame layout"
+      (is (contains-bytes? wide [0x48 0x8b 0xa4 0x24 0x30 0x00 0x00 0x00])))))
+
+(deftest the-volatile-registers-the-firmware-may-clobber-are-saved
+  ;; RAX, RCX, RDX, R8 are kotoba.mir's scratch tier and R9 carries the
+  ;; guest's hidden context; Microsoft x64 preserves none of the five.
+  ;; `x86-stack-memory` uses a disp32, so each save is eight bytes.
+  (doseq [[label bytes] [["rax" [0x48 0x89 0x84 0x24 0x30 0x00 0x00 0x00]]
+                         ["rcx" [0x48 0x89 0x8c 0x24 0x38 0x00 0x00 0x00]]
+                         ["rdx" [0x48 0x89 0x94 0x24 0x40 0x00 0x00 0x00]]
+                         ["r8"  [0x4c 0x89 0x84 0x24 0x48 0x00 0x00 0x00]]
+                         ["r9"  [0x4c 0x89 0x8c 0x24 0x50 0x00 0x00 0x00]]]]
+    (is (contains-bytes? @emitted bytes) (str label " is not saved"))))

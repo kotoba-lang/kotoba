@@ -1,0 +1,169 @@
+#!/usr/bin/env kbb
+;; storefix: which aiueos objects read a bounded store's ANSWER, and which of
+;; those let it decide something?
+;;
+;; The evidence behind the blast-radius table in
+;; docs/adr/0051-a-bounded-store-answers-with-the-word-it-stored.md. It is an
+;; AUDIT, not a gate: it takes the directory to read as an argument, it lives
+;; outside this repository's tree, and nothing here runs it in CI. A check
+;; whose input is not in the tree it is attached to cannot be green or red for
+;; a reason anyone can act on -- see the `root-permit-index` note in the
+;; superproject's AGENTS.md.
+;;
+;;   kbb --backend sci scripts/aiueos-store-answer-audit.cljk <path-to>/os/aiueos/kotoba
+;;
+;; Every store is an expression, so "used in value position" cannot be read off
+;; a grep. This propagates taint from each `kernel-store-*` / `slice-store-*`
+;; node through `let` bindings AND `defn` return values -- the second is
+;; required, because this codebase's stores are wrapped in `store32`/`store64`
+;; helpers -- and then asks whether a tainted value reaches a comparison or an
+;; `if` test rather than only a `(* 0 ...)` ordering idiom.
+;;
+;;   DECIDES     a store answer reaches `=`/`<`/`>`/`<=`/`>=` or an `if` test
+;;   ORDER-ONLY  every use is under `(* 0 ...)`; only the data dependency
+;;               survives, which is why sha256.o hashed correctly on the
+;;               machine while the arena-shaped objects did not
+;;
+;; The taint is an over-approximation across `defn` boundaries: it does not
+;; track which call site a return value flows to, so a helper whose answer is
+;; zeroed at every call site still marks its file DECIDES. That is the honest
+;; direction for a blast-radius list.
+;;
+;; A file it cannot read is reported and the run refuses with exit 2 -- neither
+;; 0 nor 1 -- so "could not answer" cannot be read as "answered, and clean".
+
+(ns aiueos-store-answer-audit
+  (:require ["fs" :as fs]
+            ["path" :as path]
+            [kotoba.lang.text :as str]
+            [cljs.reader :as reader]))
+
+(defn- store-op? [x]
+  (and (symbol? x)
+       (or (str/starts-with? (name x) "kernel-store-")
+           (str/starts-with? (name x) "slice-store-"))))
+
+(defn- contains-store? [form]
+  (some #(and (seq? %) (store-op? (first %))) (tree-seq coll? seq form)))
+
+(defn- zero-multiplied?
+  "Is FORM the shape `(* 0 x)` or `(* x 0)`?"
+  [form]
+  (and (seq? form) (= '* (first form)) (= 3 (count form))
+       (or (= 0 (second form)) (= 0 (nth form 2)))))
+
+(defn- uses-outside-zero-multiply
+  "Every occurrence of SYM in FORM that is not inside a `(* 0 ...)`, as the
+  enclosing form."
+  [form sym]
+  (letfn [(walk [node zeroed?]
+            (cond
+              (= node sym) (if zeroed? [] [node])
+              (coll? node)
+              (let [z (or zeroed? (zero-multiplied? node))]
+                (mapcat #(walk % z) node))
+              :else []))]
+    (walk form false)))
+
+(defn- tainted-names
+  "Names bound (transitively) to a store's answer inside FORM's `let`s."
+  [form]
+  (loop [tainted #{}]
+    (let [grown
+          (reduce
+           (fn [acc node]
+             (if (and (seq? node) (= 'let (first node)) (vector? (second node)))
+               (reduce (fn [acc [sym value]]
+                         (if (and (symbol? sym)
+                                  (or (contains-store? value)
+                                      (some acc (filter symbol?
+                                                        (tree-seq coll? seq value)))))
+                           (conj acc sym)
+                           acc))
+                       acc (partition 2 (second node)))
+               acc))
+           tainted (tree-seq coll? seq form))]
+      (if (= grown tainted) tainted (recur grown)))))
+
+(def ^:private comparisons '#{= < > <= >= not=})
+
+(defn- taint-model
+  "Fixpoint over the whole file: which NAMES (let bindings and defn names) may
+  carry a store's answer. `defn` names are included so the analysis crosses the
+  `store32`/`store64` helpers this codebase writes."
+  [forms]
+  (loop [names #{}]
+    (letfn [(tainted-expr? [e]
+              (cond
+                (zero-multiplied? e) false
+                (symbol? e) (contains? names e)
+                (and (seq? e) (store-op? (first e))) true
+                (and (seq? e) (= 'let (first e))) (tainted-expr? (last e))
+                (and (seq? e) (= 'if (first e)))
+                (boolean (some tainted-expr? (drop 2 e)))
+                (seq? e) (or (contains? names (first e))
+                             (boolean (some tainted-expr? (rest e))))
+                :else false))]
+      (let [grown
+            (reduce
+             (fn [acc node]
+               (cond
+                 (and (seq? node) (= 'let (first node)) (vector? (second node)))
+                 (reduce (fn [acc [sym value]]
+                           (if (and (symbol? sym) (tainted-expr? value))
+                             (conj acc sym) acc))
+                         acc (partition 2 (second node)))
+                 (and (seq? node) (= 'defn (first node))
+                      (tainted-expr? (last node)))
+                 (conj acc (second node))
+                 :else acc))
+             names (tree-seq coll? seq forms))]
+        (if (= grown names)
+          {:names names :tainted? tainted-expr?}
+          (recur grown))))))
+
+(defn- classify [forms]
+  (let [{:keys [names tainted?]} (taint-model forms)
+        stores (filter #(and (seq? %) (store-op? (first %)))
+                       (tree-seq coll? seq forms))
+        deciding (for [node (tree-seq coll? seq forms)
+                       :when (seq? node)
+                       site (cond
+                              (contains? comparisons (first node))
+                              (filter tainted? (rest node))
+                              (= 'if (first node))
+                              (filter tainted? [(second node)])
+                              :else [])]
+                   (first node))]
+    {:stores (frequencies (map first stores))
+     :tainted-names (vec (sort names))
+     :deciding (frequencies (map str deciding))
+     :decides? (boolean (seq deciding))}))
+
+(defn -main [& args]
+  (let [dir (or (first args)
+                "/Users/junkawasaki/github/com-junkawasaki/orgs/kotoba-lang/aiueos/os/aiueos/kotoba")
+        files (sort (filter #(str/ends-with? % ".kotoba") (fs/readdirSync dir)))
+        unreadable (atom [])
+        rows (atom [])]
+    (doseq [f files]
+      (let [text (fs/readFileSync (path/join dir f) "utf8")
+            forms (try (reader/read-string (str "[" text "\n]"))
+                       (catch :default e
+                         (swap! unreadable conj [f (.-message e)]) nil))]
+        (when (and forms (contains-store? forms))
+          (swap! rows conj [f (classify forms)]))))
+    (println "SCANNED" (count files) "files; UNREADABLE" (count @unreadable))
+    (doseq [[f e] @unreadable] (println "  UNREADABLE" f e))
+    (when (pos? (count @unreadable))
+      (println "REFUSING to report a clean answer: a file could not be read")
+      (.exit js/process 2))
+    (println "FILES-WITH-A-BOUNDED-STORE" (count @rows))
+    (println "FILES-WHOSE-ANSWER-DECIDES-SOMETHING"
+             (count (filter (comp :decides? second) @rows)))
+    (doseq [[f {:keys [stores decides? deciding]}] @rows]
+      (println (str "  " (if decides? "DECIDES  " "ORDER-ONLY") "  " f
+                    "  " (pr-str stores)
+                    (when (seq deciding) (str "  in=" (pr-str deciding))))))))
+
+(apply -main (drop 3 (js->clj js/process.argv)))

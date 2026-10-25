@@ -1,0 +1,567 @@
+(ns kotobase.query.bridge
+  "Ayatori's compatibility bridge (formerly kotobase-query;
+  ADR-2607172300 in `com-junkawasaki/root`) --
+  materializes `kotobase.store/IStore` collections as datoms and runs
+  Datomic-shaped `:find`/`:where` Datalog queries over them via
+  `arrangement.datalog`.
+
+  **Why this repo exists**: `kotobase.store`/`kotobase.local` (`IStore`) is
+  a flat get/put/list(keys-in-one-collection)/append store -- no joins, no
+  predicates across collections, no query language. `kotoba-lang/arrangement`
+  is a 4-covering triple index (`spo`/`pso`/`pos`/`ocp` ≡ Datomic's
+  EAVT/AEVT/AVET/VAET) with a real Datalog engine (`arrangement.datalog/q`)
+  over it, but nothing wires `IStore` documents INTO that index. This
+  namespace is that wiring -- a thin bridge, not a reimplementation:
+  `arrangement.datalog` does all the actual query evaluation.
+
+  **v0.1 scope / limitation, read before depending on this** -- linear
+  materialization: `materialize` does a full `-list` + `-get` scan of every
+  requested collection on every call, builds a throwaway in-memory
+  `arrangement.core` db, and discards it. No incremental indexing, no
+  caching, no persistence, no `arrangement.core/commit!` (the CID-addressed
+  snapshot machinery is untouched -- this bridge never calls it). This is a
+  deliberate, accepted v0.1 limitation (ADR-2607172300): fine for the small/
+  test-scale query volume this bridge is built for right now; real
+  incremental indexing via `arrangement`'s own index maintenance is a
+  documented follow-up once there is real query-volume evidence, not a v0.1
+  requirement.
+
+  ## Doc -> datoms mapping
+
+  For a document `doc` stored at `(-get store coll k)`:
+
+  - the entity (`:s`) is `(keyword (str coll) (str k))` -- e.g. collection
+    `\"users\"` key `\"u1\"` becomes the entity `:users/u1`. Globally unique
+    across every materialized collection (no collision risk from bare keys
+    repeating across collections), and human-readable in query results.
+  - every entity ALWAYS gets two synthetic attributes so collection/key
+    identity survives materialization and so cross-collection joins have
+    something concrete to join ON: `:kotobase/coll` -> `(str coll)` and
+    `:kotobase/key` -> `(str k)`. A doc in another collection that stores a
+    foreign-key-shaped value (e.g. `{:dept-key \"d1\"}`) joins against the
+    referenced entity via its `:kotobase/key` attribute -- see the worked
+    join example below and in `test/kotobase/query/bridge_test.cljk`.
+  - if `doc` is a map: every top-level `[attr v]` pair becomes a datom
+    `{:s entity :p attr :o v}` -- `attr` is used AS-IS (whatever key shape
+    the document actually used, typically a keyword; not coerced to a
+    string). If `v` is itself a non-map collection (vector/set/list), it is
+    treated as a Datomic-style cardinality-many attribute: one datom per
+    element (`{:s entity :p attr :o el}` for each `el`), not one datom
+    whose `:o` is the whole collection.
+  - if `doc` is not a map (a bare scalar, or `nil`): one fallback datom
+    `{:s entity :p :kotobase/value :o doc}`.
+  - nested maps as attribute values are stored as an opaque `:o` value
+    (not recursively flattened into their own entity) -- out of scope for
+    v0.1, a documented limitation, not silently mishandled.
+
+  ## Worked example
+
+  ```clojure
+  (require '[kotobase.local :as local]
+           '[kotobase.store :as st]
+           '[kotobase.query.bridge :as bridge])
+
+  (def store (local/local-store))
+  (st/-put store \"users\" \"u1\" {:name \"Alice\" :dept-key \"d1\"})
+  (st/-put store \"departments\" \"d1\" {:name \"Engineering\"})
+
+  (bridge/query store [\"users\" \"departments\"]
+                '{:find [?uname ?dname]
+                  :where [[?u :kotobase/coll \"users\"]
+                          [?u :name ?uname]
+                          [?u :dept-key ?dk]
+                          [?d :kotobase/coll \"departments\"]
+                          [?d :kotobase/key ?dk]
+                          [?d :name ?dname]]}
+                (constantly true))
+  ;=> #{[\"Alice\" \"Engineering\"]}
+  ```
+
+  ## `visible?` is required, not defaulted
+
+  Every query fn here takes `visible?` as a REQUIRED argument, the same
+  discipline `arrangement.query`/`arrangement.datalog`/the retired `kqe`
+  already enforce (ADR-2607050500, \"Query as first-class effect\" -- no
+  permissive default to silently fall back on). Pass `(constantly true)` to
+  see everything materialized -- that is a caller's explicit choice, never
+  this bridge's default. `q`/`query` simply delegate arity to
+  `arrangement.datalog/q`, which itself throws (arity error) if `visible?`
+  is omitted -- there is no separate opt-out path to keep in sync.
+
+  ## The supported contract is `materialize` + the access paths, NOT `q`
+
+  ADR-2608039970 (`com-junkawasaki/root`). Datalog is ONE frontend over the
+  materialized datom plane, not the IR every other query language has to be
+  translated into. The datom plane (triple + content addressing) is what all
+  the surfaces share; `q`'s `:find`/`:where` grammar is not.
+
+  This was not a prediction. `org-w3-sparql-protocol` already uses
+  `materialize` and never calls `q`, and says why in its own README: it has a
+  complete SPARQL algebra of its own, so routing SPARQL through Datalog would
+  mean translating one algebra into another and back for no benefit. That
+  repo is on the SUPPORTED path, not off it. The same is true of any surface
+  whose language does not sit comfortably on Datalog's set semantics -- SQL's
+  bag semantics and ORDER BY, Cypher's variable-length paths.
+
+  So the contract is:
+
+  - `materialize` / `materialize-memo` / `db-for` -- `IStore` documents to
+    one datom plane. Shared, and the thing every surface must go through.
+  - `entity-id` -- the entity-naming convention, so a surface can address an
+    entity by `[coll k]` without hard-coding the keyword shape.
+  - `entity-attrs` / `by-predicate` / `by-predicate-value` / `refs-to` --
+    the four covering indexes (spo/pso/pos/ocp, Datomic's EAVT/AEVT/AVET/VAET),
+    each carrying `visible?`. A surface plans its own joins over these.
+  - `datoms` -- the whole plane, once, lazily. Where a surface with its own
+    engine starts: take every triple, reshape it, join it yourself.
+  - `q` / `query` -- the Datalog frontend. Still supported, still the right
+    choice when the caller's language IS Datalog-shaped (`datomic-client-shim`).
+    It is a peer of the surfaces that skip it, not their entry point.
+
+  What a surface must NOT do is give up on the datom plane and keep its own
+  physical representation of the same documents. What is shared is the plane
+  (`materialize`), not the language (`q`) -- those are different decisions and
+  ADR-2608039970 makes opposite calls on them.
+
+  ### Why the access paths are re-exported rather than pointed at
+
+  `arrangement.core` already exports these four (they are `datalog.index`'s,
+  re-exported there). Those take no `visible?` -- they are raw index reads.
+  Re-exporting them here is what puts the ADR-2607050500 discipline on the
+  supported path: a surface that reaches past this namespace into
+  `arrangement.core/entity-attrs` is not doing something faster, it is doing
+  something with no visibility decision in it. This repo's own tests did
+  exactly that before ADR-2608039970, which is how it was noticed.
+
+  Filtering also PRUNES: an attribute whose every value is invisible is
+  dropped from the returned map rather than left as an empty set. An empty
+  set under a key would tell the caller the attribute exists while hiding
+  what it holds, which is the leak `visible?` exists to prevent.
+
+  ### `refs-to` is empty for most materialized dbs, and that is not a bug
+
+  `:vaet` is populated only for objects satisfying the `ref?` predicate
+  `materialize` asserts with, which is `arrangement.core`'s default,
+  `ipld.core/link?`. Documents materialized here carry plain EDN values, so
+  in practice nothing lands in `:vaet` and `refs-to` returns `{}`. The
+  reverse lookup a surface actually wants -- \"who points at this key?\" -- is
+  `by-predicate-value`, since a foreign key here is a VALUE (`:dept-key
+  \"d1\"`), not an IPLD link. See the worked join example above.
+
+  Making `ref?` injectable so a surface could declare its own reference
+  attributes is a real follow-up, and it is not free: `materialize-memo`'s
+  key would have to cover it, and a function is not a memo key. A
+  declarative `:ref-attrs #{...}` set would be, which is the shape to reach
+  for if this is ever needed.
+
+  ## A note on `kqe`
+
+  ADR-2607172300's dependency table names `kotoba-lang/kqe` alongside
+  `kotoba-lang/arrangement`. As of this repo's landing, `kqe` is RETIRED --
+  its content (`[s p o]` pattern routing) was merged into `arrangement` as
+  `arrangement.query`, and the actual Datomic-shaped `:find`/`:where`
+  Datalog engine (`arrangement.datalog/q`, used here) lives in `arrangement`
+  too and never existed in `kqe` at all. This bridge therefore depends on
+  `kotoba-lang/arrangement` only -- see `kqe`'s README (\"this repo is
+  retired\") and `arrangement`'s own README/ADR-2607050700 for the merge."
+  (:require [arrangement.core :as arr]
+            [arrangement.datalog :as datalog]
+            [kotobase.store :as st]))
+
+;; ---------------------------------------------------------------- materialize
+
+(defn- ->attr
+  "A document key -> the datom attribute for it.
+
+  Documents arrive with BOTH key types and this is not a corner case:
+  `kotobase.protocols.atproto` stores the record it parsed out of a JSON
+  body verbatim, so its keys are strings, while every document written from
+  Clojure (and every test in this repo) has keyword keys. Left alone, the
+  same field is two different attributes depending on how it was written.
+
+  That broke both query surfaces at once, in the two worst ways available:
+
+    - SPARQL 500s. `kotobase.protocols.sparql.quads/kw->iri-string` calls
+      `namespace`, which in ClojureScript throws `Doesn't support namespace:
+      <x>` on a string. Every SPARQL query against such a graph failed,
+      whatever the query said. Found in production 2026-07-31, where the
+      surface had been answering 200 on /health the whole time.
+    - Cypher silently returns nothing. `n.text` translates to the keyword
+      `:text`, which never matches the string attribute `\"text\"`, so the
+      answer is an empty result set rather than an error.
+
+  Normalising here rather than in each surface is what makes those two
+  agree: the bridge is where a document becomes datoms, and a datom
+  attribute should have one type. `(keyword \"a/b\")` splits on the slash
+  into `:a/b`, which is what the IRI form and the Cypher form both already
+  render as `a/b`, so the round trip holds."
+  [k]
+  (if (string? k) (keyword k) k))
+
+(defn- doc->datoms
+  "One document `doc` (as read from `[coll k]`) -> a seq of `{:s :p :o}`
+  datoms for entity `entity`. See the ns docstring's \"Doc -> datoms
+  mapping\" section for the full contract. `:kotobase/coll`/`:kotobase/key`
+  are NOT emitted here -- `materialize` adds those two synthetic datoms
+  itself, since only the caller knows `coll`/`k`."
+  [entity doc]
+  (if (map? doc)
+    (into []
+          (mapcat (fn [[attr v]]
+                    (let [attr (->attr attr)]
+                      (if (and (coll? v) (not (map? v)))
+                        (map (fn [el] {:s entity :p attr :o el}) v)
+                        [{:s entity :p attr :o v}]))))
+          doc)
+    [{:s entity :p :kotobase/value :o doc}]))
+
+(defn entity-id
+  "The materialized entity for `[coll k]` -- `(keyword (str coll) (str k))`,
+  e.g. `[\"users\" \"u1\"]` -> `:users/u1`. See the ns docstring's
+  \"Doc -> datoms mapping\".
+
+  Public because a surface addressing a known document should not have to
+  re-derive this convention: an entity id built by hand somewhere else is a
+  copy that can drift from `materialize`'s, and the failure mode is an empty
+  result rather than an error."
+  [coll k]
+  (keyword (str coll) (str k)))
+
+(def default-max-datoms
+  "The ceiling on one `materialize`. It is a NUMBER and it is in the source,
+  so raising it is an edit somebody reviews.
+
+  Why there is a ceiling at all: this function reads every document in every
+  named collection, so its cost follows the DATABASE and not the answer.
+  Measured 2026-08-23 (`com-junkawasaki/root`
+  90-docs/kotobase-performance/2026-08-23-bridge-materialize-scaling.edn) --
+  17ms at 500 documents, 461ms at 32,000, while the query itself stayed near
+  1ms across that whole 64x range. Essentially the entire cost of a query on
+  this path is building a database value the answer did not need, and that
+  is measured on the in-memory floor: a deployment also pays the object-store
+  reads underneath.
+
+  200,000 is above every graph this bridge serves today and far below what a
+  Worker isolate can hold. It exists so a graph that outgrows this path fails
+  loudly instead of getting slower until someone notices."
+  200000)
+
+(defn- over-budget! [n cap coll]
+  (throw (ex-info (str "materialize refused: reading " (str coll)
+                       " passed " cap " datoms, the ceiling this bridge will "
+                       "build a database value up to. This path scans every "
+                       "document in every named collection, so its cost "
+                       "follows the database and not the answer -- a graph "
+                       "this size needs an index-backed read path, not a "
+                       "larger ceiling.")
+                  {:kotobase.query/error :materialize-over-budget
+                   :datoms n :max-datoms cap :collection (str coll)})))
+
+(defn materialize
+  "Materialize every document in each of `coll-keys` (a seq of
+  `kotobase.store` collection identifiers, e.g. `[\"users\" \"departments\"]`)
+  as datoms in one combined `arrangement.core` db (the `{:eavt :aevt :avet
+  :vaet}` 4-covering index) -- ready to hand to `q`/`arrangement.datalog/q`.
+  Reads `store` via `kotobase.store/-list` + `-get` only (never mutates it).
+
+  v0.1 linear scan: every call does a full `-list` + `-get` of every
+  collection and rebuilds the db from scratch -- see ns docstring.
+
+  **BOUNDED, and it aborts rather than reports.** The count is carried while
+  the scan runs and `:materialize-over-budget` is thrown the moment it passes
+  `max-datoms` (`default-max-datoms` unless given), so the work actually
+  stops -- a check applied to a finished db would bound the memory the caller
+  holds and nothing else, having already paid for the whole scan. `-list` per
+  collection is still paid in full; bounding that needs a store API that can
+  answer a count, which `kotobase.store/IStore` does not have.
+
+  This is the ceiling talked about as \"banning the full scan\": the scan is
+  what this function IS, so what is banned is doing it unboundedly. A caller
+  that needs a bigger answer than this needs a different read path -- see
+  `kotobase.server.pattern-source` for one that reads the ranges a query
+  names instead of everything."
+  ([store coll-keys] (materialize store coll-keys default-max-datoms))
+  ([store coll-keys max-datoms]
+   (let [seen (volatile! 0)]
+     (reduce
+      (fn [db coll]
+        (reduce
+         (fn [db k]
+           (let [entity (entity-id coll k)
+                 doc (st/-get store coll k)
+                 datoms (into [{:s entity :p :kotobase/coll :o (str coll)}
+                               {:s entity :p :kotobase/key :o (str k)}]
+                              (doc->datoms entity doc))
+                 n (vswap! seen + (count datoms))]
+             (when (> n max-datoms) (over-budget! n max-datoms coll))
+             (reduce arr/assert-quad db datoms)))
+         db
+         (st/-list store coll)))
+      (arr/empty-db)
+      coll-keys))))
+
+
+;; ------------------------------------------------------------------- memo
+;; ADR-2607310900. This is a MEMO, not a cache: the key is a content address,
+;; so a changed graph is a different key rather than a dirty entry and there is
+;; no invalidation path to get wrong.
+;;
+;; Two properties make it safe, and both are properties of `materialize` above
+;; rather than of anything here:
+;;
+;;   1. `materialize` takes no `visible?`. The predicate is applied by `q`, over
+;;      an already-built db. So ONE materialized db is correct for every caller
+;;      regardless of what any of them may see, and sharing it across principals
+;;      is safe by construction. If `materialize` ever grows a `visible?`
+;;      argument this whole namespace becomes unsound -- there is a test that
+;;      says so out loud.
+;;   2. The db is a value. Nothing handed out of here can be mutated by a
+;;      caller into something the next caller sees.
+;;
+;; What is deliberately NOT memoised: the ANSWER. A result memo would need
+;; `visible?` in its key, `visible?` is a function, and keying on one is how a
+;; principal ends up reading another principal's rows.
+
+(defn- lru-put
+  "`m` with `k`->`v`, evicting the oldest insertion past `cap`. Insertion order
+  is tracked explicitly rather than by relying on map ordering, which neither
+  host promises above a handful of entries."
+  [{:keys [entries order] :as m} k v cap]
+  (let [order (conj (vec (remove #(= k %) order)) k)
+        entries (assoc entries k v)
+        excess (- (count order) cap)]
+    (if (pos? excess)
+      ;; assoc onto `m`, never build a fresh map: the eviction branch used to
+      ;; return {:entries :order} and silently dropped :capacity/:hits/:misses,
+      ;; so the call after the first eviction read a nil capacity. Caught by
+      ;; the bounded-memo test, which is why that test exercises three
+      ;; insertions into a capacity of two rather than stopping at the edge.
+      (assoc m
+             :entries (apply dissoc entries (take excess order))
+             :order (vec (drop excess order)))
+      (assoc m :entries entries :order order))))
+
+(def default-memo-capacity
+  "Materialized dbs to keep. Small on purpose: each one holds every datom of
+  every collection it covers, so this is the knob that decides how much memory
+  a query surface uses, and a large default would hide that."
+  8)
+
+(defn memo
+  "A memo store for `materialize-memo`. Callers own it, so a test can hold one
+  and a Worker can hold one per isolate without either reaching the other."
+  ([] (memo default-memo-capacity))
+  ([capacity]
+   (assert (pos? capacity) "a capacity of zero would memoise nothing and still allocate")
+   (atom {:entries {} :order [] :capacity capacity :hits 0 :misses 0})))
+
+(defn materialize-memo
+  "`materialize`, memoised on `version` -- a CONTENT ADDRESS for the state of
+  `store` (the chain-head CID, in `kotobase-protocols-worker`'s case).
+
+  `version` is REQUIRED and must not be nil. A caller with no content address
+  has nothing that makes a cached db provably current, and defaulting it would
+  turn this into a cache that never invalidates -- which is not a cache, it is
+  a bug that returns yesterday's data. Such a caller should call `materialize`
+  directly and pay for it.
+
+  `version` must change whenever ANY document in `coll-keys` changes. A
+  revision counter is not automatically good enough: a counter is unique only
+  along one line of writes, and a content-addressed chain can fork such that
+  two forks reach the same counter with different contents (ADR-2607310900)."
+  [memo-atom store coll-keys version]
+  (assert (some? version)
+          "materialize-memo requires a non-nil version (a content address); use materialize when you have none")
+  (let [k [version (vec (sort (map str coll-keys)))]
+        cached (get-in @memo-atom [:entries k])]
+    (if cached
+      (do (swap! memo-atom update :hits inc) cached)
+      (let [db (materialize store coll-keys)]
+        (swap! memo-atom (fn [m] (-> (lru-put m k db (:capacity m))
+                                     (update :misses inc))))
+        db))))
+
+(defn memo-stats
+  "`{:size :capacity :hits :misses}` -- so a deploy can report whether the memo
+  is earning its memory instead of assuming it."
+  [memo-atom]
+  (let [m @memo-atom]
+    {:size (count (:entries m)) :capacity (:capacity m)
+     :hits (:hits m) :misses (:misses m)}))
+
+
+(defn db-for
+  "The materialized db for `coll-keys`, memoised when `ctx` carries BOTH a
+  `:query-memo` and a `:query-version`, and freshly built when it does not.
+
+  This is the seam a protocol handler calls instead of `query`, so that a
+  deployment able to name its state gets the memo and one that cannot still
+  works unchanged. Neither half alone is enough: a memo with no version has
+  nothing to key on, and a version with no memo has nowhere to put the result.
+
+  The caller supplying `:query-version` is asserting it changes whenever any
+  document in `coll-keys` changes. See `materialize-memo`."
+  [{:keys [query-memo query-version]} store coll-keys]
+  (if (and query-memo query-version)
+    (materialize-memo query-memo store coll-keys query-version)
+    (materialize store coll-keys)))
+
+;; -------------------------------------------------------------- access paths
+;;
+;; The four covering indexes, each carrying `visible?`. ADR-2608039970: this
+;; is the supported contract a query surface binds to when its own algebra is
+;; not Datalog -- see the ns docstring for why, and for why `refs-to` is
+;; empty on a typical materialized db.
+
+(defn- check-visible!
+  "Refuse a missing or non-callable `visible?` before reading anything.
+
+  Being CALLED is not a reliable way for the predicate to announce it is
+  missing: it is only called when the index has something to filter, and
+  `(refs-to db o)` on a db with an empty `:vaet` answered `{}` perfectly
+  cheerfully with no predicate at all. An access path that answers when it
+  was handed no visibility decision is what ADR-2607050500 forbids, and the
+  empty-index case is the worst version of it -- the answer looks fine."
+  [visible?]
+  (when-not (ifn? visible?)
+    (throw (ex-info (str "visible? is required (ADR-2607050500) -- pass "
+                         "(constantly true) to see everything materialized")
+                    {:kotobase.query/error :missing-visible-predicate}))))
+
+(defn- visible-objects
+  "The `os` an entity `s` still shows under predicate `p`."
+  [visible? s p os]
+  (into #{} (filter (fn [o] (visible? {:s s :p p :o o}))) os))
+
+(defn- visible-subjects
+  "The `ss` still holding `[s p o]` for a fixed `p`/`o`."
+  [visible? p o ss]
+  (into #{} (filter (fn [s] (visible? {:s s :p p :o o}))) ss))
+
+(defn- prune
+  "Drop entries whose value set came back empty. See the ns docstring: an
+  empty set under a key answers \"this exists, but you may see none of it\",
+  which is more than the caller is allowed to know."
+  [m]
+  (into {} (remove (comp empty? val)) m))
+
+(defn entity-attrs
+  "All `{p #{o ...}}` for subject `s`, under `visible?` -- spo, Datomic's
+  EAVT. `visible?` is REQUIRED (ns docstring)."
+  [db s visible?]
+  (check-visible! visible?)
+  (prune (into {}
+               (map (fn [[p os]] [p (visible-objects visible? s p os)]))
+               (arr/entity-attrs db s))))
+
+(defn by-predicate
+  "All `{s #{o ...}}` for predicate `p`, under `visible?` -- pso, Datomic's
+  AEVT scan. `visible?` is REQUIRED (ns docstring)."
+  [db p visible?]
+  (check-visible! visible?)
+  (prune (into {}
+               (map (fn [[s os]] [s (visible-objects visible? s p os)]))
+               (arr/by-predicate db p))))
+
+(defn by-predicate-value
+  "The subjects `s` where `[s p o]` holds, under `visible?` -- pos, Datomic's
+  AVET point lookup. `visible?` is REQUIRED (ns docstring).
+
+  This is the reverse lookup a surface materialized from documents actually
+  wants: a foreign key here is a value (`:dept-key \"d1\"`), so \"who points at
+  d1?\" is `(by-predicate-value db :dept-key \"d1\" visible?)`, not `refs-to`."
+  [db p o visible?]
+  (check-visible! visible?)
+  (visible-subjects visible? p o (arr/by-predicate-value db p o)))
+
+(defn refs-to
+  "All `{p #{s ...}}` referencing object `o`, under `visible?` -- ocp,
+  Datomic's VAET. `visible?` is REQUIRED (ns docstring).
+
+  Returns `{}` on a typical materialized db, and that is a property of the
+  data rather than of this function: `:vaet` covers only objects satisfying
+  `materialize`'s `ref?` (`ipld.core/link?`), and documents carry plain EDN.
+  Use `by-predicate-value`. See the ns docstring."
+  [db o visible?]
+  (check-visible! visible?)
+  (prune (into {}
+               (map (fn [[p ss]] [p (visible-subjects visible? p o ss)]))
+               (arr/refs-to db o))))
+
+(defn datoms
+  "Every `{:s :p :o}` in `db`, under `visible?` -- the fully-unbound scan,
+  lazy, in `:eavt` order. `visible?` is REQUIRED (ns docstring).
+
+  This is the access path a surface with its own engine actually starts
+  from: it wants the whole plane once, in its own shape, and does its own
+  joins afterwards. `org-w3-sparql-protocol` is the existing example -- it
+  turns every triple into an RDF quad and hands the seq to `sparql.core`.
+
+  It was missing from the first cut of this contract (ADR-2608039970), and
+  the omission was not harmless: the one surface that needed it read
+  `(:eavt db)` directly instead -- a raw index read, with nothing on the
+  supported path to apply `visible?` for it. That repo re-implemented the
+  predicate discipline itself and got it right; the next one would have had
+  to know to.
+
+  Lazy on purpose. The caller is transforming every triple into something
+  else, so forcing a vector here would hold the whole plane twice."
+  [db visible?]
+  (check-visible! visible?)
+  (filter visible?
+          (for [[s pm] (:eavt db) [p os] pm o os] {:s s :p p :o o})))
+
+;; --------------------------------------------------------------------- query
+
+(defn q
+  "Run a Datomic-shaped Datalog `query` (`{:find [...] :where [...] :in
+  [...] :rules [...]}`) over an already-materialized `db` (the return of
+  `materialize`, or any `arrangement.core` db). `visible?` is REQUIRED (see
+  ns docstring). Optional 4th arg `inputs` supplies `:in` parameter values,
+  positional, same order as `:in`.
+
+  A thin delegation to `arrangement.datalog/q` -- this bridge does not
+  reimplement query evaluation.
+
+  ## The vector form is refused here rather than answered wrongly
+
+  `query` must be the MAP form. The engine takes only that, and handed the
+  vector form (`[:find ?t :where [?e \"a/b\" ?t]]` -- what a Datomic or
+  DataScript caller writes, and what `kotobase.query.agent` helps a model
+  produce) it does not throw: `(:find <vector>)` is nil, so it runs an empty
+  query and returns `#{[]}`. Measured 2026-08-18:
+
+      map     {:find [?t] :where [[?e \"company/ticker\" ?t]]}  => #{[\"AAA\"] [\"BBB\"]}
+      vector  [:find ?t :where [?e \"company/ticker\" ?t]]      => #{[]}
+
+  One empty tuple is not distinguishable from a query that matched nothing,
+  so the caller reads a wrong answer as an answer. Convert with
+  `kotobase.query.agent/->engine-query` and pass the result."
+  ([db query visible?] (q db query visible? nil))
+  ([db query visible? inputs]
+   (when-not (map? query)
+     (throw (ex-info (str "kotobase.query.bridge/q takes the MAP form "
+                          "{:find [...] :where [...]}. The vector form is not "
+                          "rejected by the engine -- it silently returns #{[]}. "
+                          "Convert with kotobase.query.agent/->engine-query.")
+                     {:got (if (vector? query) :vector-form (type query))
+                      :query query})))
+   (if (nil? inputs)
+     (datalog/q db query visible?)
+     (datalog/q db query visible? inputs))))
+
+(defn query
+  "Convenience: `(q (materialize store coll-keys) query visible? inputs)` in
+  one call -- materialize `coll-keys` from `store` and immediately run
+  `query` over the result. `visible?` is REQUIRED (see ns docstring).
+
+  Prefer calling `materialize` once and `q` directly when running several
+  queries over the same snapshot of data (e.g. in a test, or a batch of
+  queries in one request) -- `query` re-materializes on every call, which
+  is wasteful (and, per the v0.1 linear-scan limitation, may observe a
+  different snapshot of `store` between two `query` calls if it is mutated
+  concurrently)."
+  ([store coll-keys query-form visible?]
+   (q (materialize store coll-keys) query-form visible?))
+  ([store coll-keys query-form visible? inputs]
+   (q (materialize store coll-keys) query-form visible? inputs)))

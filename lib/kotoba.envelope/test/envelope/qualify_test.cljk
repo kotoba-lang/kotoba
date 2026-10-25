@@ -1,0 +1,146 @@
+(ns envelope.qualify-test
+  "Real ML-KEM-768, real known answers, and a real evaluator.
+
+  `kotoba.security.crypto-policy/evaluate-pq-provider` is the thing that
+  decides whether a post-quantum provider counts. It is not reimplemented
+  here — the point of these tests is that the evidence `envelope.qualify`
+  produces is accepted by THAT function, and that each way of producing
+  weaker evidence is refused by it."
+  (:require ["node:crypto" :as node-crypto]
+            [kotoba.lang.text :as str]
+            ["node:fs" :as fs]
+            ["node:module" :refer [createRequire]]
+            ["node:path" :as path]
+            [cljs.reader :as reader]
+            [cljs.test :refer [deftest is testing async]]
+            [envelope.qualify :as qualify]
+            [kotoba.security.crypto-policy :as policy]))
+
+(def known-answers-path "lib/kotoba.envelope/test/vectors/ml-kem-768-known-answers.edn")
+
+(defn- hex->bytes [s]
+  (js/Uint8Array.from (clj->js (map #(js/parseInt (apply str %) 16) (partition 2 s)))))
+
+(def corpus
+  (reader/read-string (.readFileSync fs known-answers-path "utf8")))
+
+(def vectors
+  (mapv (fn [v]
+          {:id (:id v)
+           :encapsulation-key (hex->bytes (:encapsulation-key v))
+           :decapsulation-key (hex->bytes (:decapsulation-key v))
+           :ciphertext (hex->bytes (:ciphertext v))
+           :shared-secret (hex->bytes (:shared-secret v))})
+        (:vectors corpus)))
+
+(defn- sha256-hex [^js buf]
+  (-> (.createHash node-crypto "sha256") (.update buf) (.digest "hex")))
+
+(defn measure-module-digest
+  "The digest `qualify` binds to, measured the way an operator would.
+
+  It covers the three files inside @noble/post-quantum that implement
+  ML-KEM. It does NOT cover @noble/hashes or @noble/curves, which ml-kem.js
+  imports: those are a separate package and a separate pin, and saying the
+  binding reaches them when it does not is the failure this whole namespace
+  exists to avoid. What covers them is the known-answer test, which cannot
+  pass with a broken SHAKE."
+  []
+  (let [require* (createRequire (str (.cwd js/process) "/"))
+        entry (.resolve require* "@noble/post-quantum/ml-kem.js")
+        dir (.dirname path entry)
+        lines (map (fn [f] (str f " " (sha256-hex (.readFileSync fs (.join path dir f)))))
+                   qualify/module-files)]
+    (str "sha256:" (sha256-hex (str (str/join "\n" lines) "\n")))))
+
+;; ── the corpus is what it says it is ─────────────────────────────────────
+
+(deftest known-answers-carry-their-provenance
+  (is (= "kotoba-lang/security" (:source/repo corpus)))
+  (is (string? (:source/commit corpus)))
+  (is (= 64 (count (:source/sha256 corpus))))
+  (testing "an empty corpus would make every later assertion vacuous"
+    (is (= 3 (count vectors)))))
+
+(deftest known-answers-have-the-fips-203-sizes
+  (doseq [v vectors]
+    (testing (:id v)
+      (is (= 1184 (.-length (:encapsulation-key v))))
+      (is (= 2400 (.-length (:decapsulation-key v))))
+      (is (= 1088 (.-length (:ciphertext v))))
+      (is (= 32 (.-length (:shared-secret v)))))))
+
+;; ── the module ───────────────────────────────────────────────────────────
+
+(deftest the-installed-module-is-the-pinned-one
+  (testing "package.json's range cannot say this; only the bytes can"
+    (is (= qualify/pinned-module-digest (measure-module-digest)))))
+
+;; ── the evidence, and the evaluator's verdict on it ──────────────────────
+
+(deftest the-measured-module-qualifies
+  (async done
+    (-> (qualify/qualify {:module-digest (measure-module-digest)
+                          :expected-module-digest qualify/pinned-module-digest
+                          :implementation-version "0.5.4"
+                          :vectors vectors})
+        (.then (fn [evidence]
+                 (let [verdict (policy/evaluate-pq-provider
+                                evidence qualify/pinned-module-digest)]
+                   (is (= [] (:pq-provider/violations verdict))
+                       (str "violations: " (pr-str (:pq-provider/violations verdict))
+                            " evidence: " (pr-str (dissoc evidence :qualification/note))))
+                   (is (true? (:pq-provider/qualified? verdict)))
+                   (is (= 3 (:qualification/vectors-checked evidence)))
+                   (done)))))))
+
+(deftest no-vectors-is-not-a-pass
+  (testing "a known-answer test over no known answers returns the same true"
+    (async done
+      (-> (qualify/qualify {:module-digest (measure-module-digest)
+                            :expected-module-digest qualify/pinned-module-digest
+                            :implementation-version "0.5.4"
+                            :vectors []})
+          (.then (fn [evidence]
+                   (is (= :no-vectors (:qualification/refused evidence)))
+                   (is (false? (:pq-provider/qualified?
+                                (policy/evaluate-pq-provider
+                                 evidence qualify/pinned-module-digest))))
+                   (done)))))))
+
+(deftest a-module-that-is-not-the-pinned-one-is-refused
+  (async done
+    (-> (qualify/qualify {:module-digest "sha256:not-the-module"
+                          :expected-module-digest qualify/pinned-module-digest
+                          :implementation-version "0.5.4"
+                          :vectors vectors})
+        (.then (fn [evidence]
+                 (let [verdict (policy/evaluate-pq-provider
+                                evidence qualify/pinned-module-digest)]
+                   (is (false? (:pq-provider/qualified? verdict)))
+                   (is (some #{:module-binding} (:pq-provider/violations verdict)))
+                   (testing "and the refusal is the one the module accessor makes"
+                     (is (true? (:provider/module-load-failed-closed? evidence))))
+                   (done)))))))
+
+(deftest a-wrong-known-answer-fails-the-known-answer-test
+  (testing "the check has to be able to go red for the reason it names"
+    (async done
+      (let [tampered (update-in (vec vectors) [0 :shared-secret]
+                                (fn [^js ss]
+                                  (let [copy (js/Uint8Array.from ss)]
+                                    (aset copy 0 (bit-xor (aget copy 0) 1))
+                                    copy)))]
+        (-> (qualify/qualify {:module-digest (measure-module-digest)
+                              :expected-module-digest qualify/pinned-module-digest
+                              :implementation-version "0.5.4"
+                              :vectors tampered})
+            (.then (fn [evidence]
+                     (is (false? (:provider/known-answer-tests-passed? evidence)))
+                     (is (false? (:provider/decapsulation-verified? evidence)))
+                     (testing "encapsulation is a different measurement and still holds"
+                       (is (true? (:provider/encapsulation-verified? evidence))))
+                     (is (false? (:pq-provider/qualified?
+                                  (policy/evaluate-pq-provider
+                                   evidence qualify/pinned-module-digest))))
+                     (done))))))))

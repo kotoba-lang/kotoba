@@ -1,0 +1,281 @@
+(ns kotoba.native.layout-test
+  (:refer-clojure :exclude [bit-and unsigned-bit-shift-right])
+  (:require [kotoba.native.test-support :refer [bit-and unsigned-bit-shift-right]]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.native.aarch64 :as arm]
+            [kotoba.codegen.layout :as layout]
+            [kotoba.native.machine-ir :as machine]
+            [kotoba.native.x86-64 :as x86]))
+
+(defn- le32 [n]
+  (mapv #(bit-and (unsigned-bit-shift-right n (* 8 %)) 0xff) (range 4)))
+
+(defn- size-of [token]
+  (or (layout/token-size token)
+      (when (and (integer? token) (<= 0 token 255)) 1)))
+
+(defn- encode-branch [{:mir/keys [encoding]} displacement]
+  (case encoding
+    :x86-64/jz-rel32 (into [0x0f 0x84] (le32 displacement))
+    :x86-64/jmp-rel32 (into [0xe9] (le32 displacement))))
+
+(defn- resolve-layout [tokens]
+  (let [labels (layout/label-offsets tokens size-of)]
+    (layout/resolve-tokens tokens size-of labels encode-branch
+                           (fn [token _position] [token]))))
+
+(deftest labels-are-zero-width-and-forward-branches-use-final-layout
+  (let [target :test.label/else
+        tokens [(layout/relative-branch :x86-64/jz-rel32 target)
+                0xaa 0xbb
+                (layout/label target)]]
+    (is (= {target 8} (layout/label-offsets tokens size-of)))
+    (is (= (vec (concat [0x0f 0x84] (le32 2) [0xaa 0xbb]))
+           (resolve-layout tokens))))
+  (testing "the same branch is recomputed after an optimization changes arm size"
+    (let [target :test.label/after]
+      (is (= (vec (concat [0x0f 0x84] (le32 7) (repeat 7 0x90)))
+             (resolve-layout (concat [(layout/relative-branch :x86-64/jz-rel32 target)]
+                                     (repeat 7 0x90)
+                                     [(layout/label target)]))))
+      (is (= (vec (concat [0x0f 0x84] (le32 1) [0x90]))
+             (resolve-layout [(layout/relative-branch :x86-64/jz-rel32 target)
+                              0x90
+                              (layout/label target)]))))))
+
+(deftest backward-branches-use-signed-relative-displacements
+  (let [target :test.label/loop]
+    (is (= (vec (concat [0xaa 0xbb 0xe9] (le32 -7)))
+           (resolve-layout [(layout/label target)
+                            0xaa 0xbb
+                            (layout/relative-branch :x86-64/jmp-rel32 target)])))))
+
+(deftest malformed-or-unresolved-layout-fails-closed
+  (testing "duplicate labels"
+    (is (thrown-with-msg? ExceptionInfo #"duplicate MIR label"
+                          (layout/label-offsets [(layout/label :test.label/a)
+                                                 (layout/label :test.label/a)]
+                                                size-of))))
+  (testing "labels and targets are canonical qualified keywords"
+    (is (thrown-with-msg? ExceptionInfo #"qualified keyword"
+                          (layout/label-offsets [(layout/label :local)] size-of)))
+    (is (thrown-with-msg? ExceptionInfo #"qualified keyword"
+                          (layout/label-offsets
+                           [(layout/relative-branch :x86-64/jmp-rel32 :local)] size-of))))
+  (testing "unknown encodings and extra fields are rejected"
+    (is (thrown-with-msg? ExceptionInfo #"unsupported"
+                          (layout/label-offsets
+                           [(layout/relative-branch :x86-64/jne-rel32 :test.label/a)] size-of)))
+    (is (thrown-with-msg? ExceptionInfo #"non-canonical"
+                          (layout/label-offsets
+                           [(assoc (layout/label :test.label/a) :extra true)] size-of))))
+  (testing "AArch64 TBNZ operands are closed and range checked"
+    (is (= 4 (layout/token-size
+              (layout/relative-branch :aarch64/tbnz-imm14 :test.label/a [16 63]))))
+    (is (thrown-with-msg? ExceptionInfo #"TBNZ requires"
+                          (layout/label-offsets
+                           [(layout/relative-branch :aarch64/tbnz-imm14
+                                                    :test.label/a [32 0])]
+                           size-of)))
+    (is (thrown-with-msg? ExceptionInfo #"does not accept operands"
+                          (layout/label-offsets
+                           [(layout/relative-branch :aarch64/b-imm26
+                                                    :test.label/a [0])]
+                           size-of))))
+  (testing "unknown MIR operations never fall through as backend-owned maps"
+    (is (thrown-with-msg? ExceptionInfo #"unknown canonical MIR"
+                          (layout/label-offsets [{:mir/op :mir/invented}] (constantly 1)))))
+  (testing "all branch targets must exist"
+    (let [tokens [(layout/relative-branch :x86-64/jmp-rel32 :test.label/missing)]
+          labels (layout/label-offsets tokens size-of)]
+      (is (thrown-with-msg? ExceptionInfo #"unknown label"
+                            (layout/resolve-tokens tokens size-of labels encode-branch
+                                                   (fn [token _] [token]))))))
+  (testing "rel32 overflow is rejected instead of truncated"
+    (let [target :test.label/far
+          tokens [(layout/relative-branch :x86-64/jmp-rel32 target)]]
+      (is (thrown-with-msg? ExceptionInfo #"out of range"
+                            (layout/resolve-tokens tokens size-of
+                                                   {target 0x80000005}
+                                                   encode-branch
+                                                   (fn [token _] [token])))))))
+
+(deftest branch-encoder-must-honor-the-width-reserved-by-layout
+  (let [target :test.label/end
+        tokens [(layout/relative-branch :x86-64/jmp-rel32 target)
+                (layout/label target)]
+        labels (layout/label-offsets tokens size-of)]
+    (is (thrown-with-msg? ExceptionInfo #"reserved width"
+                          (layout/resolve-tokens tokens size-of labels
+                                                 (fn [_ _] [0xe9])
+                                                 (fn [token _] [token]))))))
+
+(deftest x86-if-production-path-uses-gmir-mir-mc-layout
+  (let [kir {:format :kotoba.kir/v4
+             :exports ['main]
+             :functions [{:name 'main :params ['p] :body '(if p 11 22)}]}
+        code (:code (x86/emit-program kir))]
+    ;; 30 rather than 43: this `if` is an acyclic leaf, so emit-program no
+    ;; longer prefixes the 13-byte fuel charge. The jz still lands on the else
+    ;; arm; the displacement is taken from the sizes selection actually chose.
+    (is (= 30 (count code)))
+    (is (= 1 (count (filter #(= [0x0f 0x84 0x09 0x00 0x00 0x00] %)
+                            (partition 6 1 code))))
+        "jz uses final MC sizes to reach the returning else arm")
+    (is (not-any? #(= 0xe9 %) code)
+        "tail arms return directly, so the selected MC needs no end jump")))
+
+(deftest aarch64-if-production-path-uses-gmir-mir-mc-layout
+  (let [kir {:format :kotoba.kir/v4
+             :exports ['main]
+             :functions [{:name 'main :params ['p] :body '(if p 11 22)}]}
+        code (:code (arm/emit-program kir))]
+    (is (= 20 (count code)))
+    (is (= 1 (count (filter #(= [0x60 0x00 0x00 0xb4] %)
+                            (partition 4 1 code))))
+        "cbz x0 uses final MC sizes to reach the returning else arm")
+    (is (not-any? #(= [0x05 0x00 0x00 0x14] %)
+                  (partition 4 1 code))
+        "tail arms return directly, so no end branch is selected")))
+
+(deftest typed-scalar-control-production-path-has-no-legacy-epilogue
+  (let [params ['a 'b 'c 'd 'e]
+        body '(let [x (+ a b) y (* x c)] (if (< y d) y e))
+        kir {:format :kotoba.kir/v4 :exports ['main]
+             :functions [{:name 'main :params params :result :i64 :body body}]}
+        x86-expression (machine/compile-expression :x86-64 params body)
+        arm-expression (machine/compile-expression :aarch64 params body)
+        x86-code (:code (x86/emit-program kir))
+        arm-code (:code (arm/emit-program kir))]
+    (is (= x86-expression (subvec x86-code (- (count x86-code)
+                                               (count x86-expression))))
+        "typed i64 ends in the allocated MC expression, not a legacy epilogue")
+    (is (= arm-expression (subvec arm-code (- (count arm-code)
+                                               (count arm-expression))))
+        "the fifth AArch64 argument is admitted by the same production path")))
+
+(deftest ordered-do-production-path-has-no-legacy-epilogue
+  (let [params ['a 'b]
+        body '(do (+ a 1) (quot a b) (* a b))
+        kir {:format :kotoba.kir/v4 :exports ['main]
+             :functions [{:name 'main :params params :result :i64 :body body}]}
+        x86-expression (machine/compile-expression :x86-64 params body)
+        arm-expression (machine/compile-expression :aarch64 params body)]
+    (is (= x86-expression
+           (subvec (:code (x86/emit-program kir))
+                   (- (count (:code (x86/emit-program kir)))
+                      (count x86-expression)))))
+    (is (= arm-expression
+           (subvec (:code (arm/emit-program kir))
+                   (- (count (:code (arm/emit-program kir)))
+                      (count arm-expression)))))))
+
+(deftest ordered-tail-do-production-path-has-no-legacy-epilogue
+  (let [params ['a 'b]
+        body '(do (+ a 1) (quot a b) (if (< a b) 11 22))
+        kir {:format :kotoba.kir/v4 :exports ['main]
+             :functions [{:name 'main :params params :result :i64 :body body}]}
+        x86-expression (machine/compile-expression :x86-64 params body)
+        arm-expression (machine/compile-expression :aarch64 params body)
+        x86-code (:code (x86/emit-program kir))
+        arm-code (:code (arm/emit-program kir))]
+    (is (= x86-expression
+           (subvec x86-code (- (count x86-code) (count x86-expression)))))
+    (is (= arm-expression
+           (subvec arm-code (- (count arm-code) (count arm-expression)))))))
+
+(deftest value-position-if-production-path-has-no-legacy-epilogue
+  (let [params ['a 'b]
+        body '(+ 1 (if a (* b 2) (- b 3)))
+        kir {:format :kotoba.kir/v4 :exports ['main]
+             :functions [{:name 'main :params params :result :i64 :body body}]}
+        x86-expression (machine/compile-expression :x86-64 params body)
+        arm-expression (machine/compile-expression :aarch64 params body)
+        x86-code (:code (x86/emit-program kir))
+        arm-code (:code (arm/emit-program kir))]
+    (is (= x86-expression
+           (subvec x86-code (- (count x86-code) (count x86-expression)))))
+    (is (= arm-expression
+           (subvec arm-code (- (count arm-code) (count arm-expression)))))
+    (is (zero? (:mc/frame-slots
+                (machine/compile-gmir :x86-64
+                                      (machine/lower-kir-expression params body)))))
+    (is (zero? (:mc/frame-slots
+                (machine/compile-gmir :aarch64
+                                      (machine/lower-kir-expression params body)))))))
+
+(defn- charged-body
+  "BODY as the production route compiles it: behind each constructor's one
+  unit of fuel (amu ADR 0353 floor :allocation-budget-native)."
+  [params body]
+  (-> {:functions [{:name 'main :params params :body body}]}
+      machine/charge-constructors :functions first :body))
+
+(deftest scalar-record-sroa-production-path-has-no-legacy-epilogue
+  (let [params ['a]
+        body '(let [r (if a
+                        (record-new [:record :test/pair [[:x :i64] [:y :i64]]] 1 2)
+                        (record-new [:record :test/pair [[:x :i64] [:y :i64]]] 3 4))]
+                (+ (record-get [:record :test/pair [[:x :i64] [:y :i64]]] r :x)
+                   (record-get [:record :test/pair [[:x :i64] [:y :i64]]] r :y)))
+        kir {:format :kotoba.kir/v4 :exports ['main]
+             :functions [{:name 'main :params params :result :i64 :body body}]}
+        charged (charged-body params body)
+        gmir (machine/lower-kir-expression params charged)
+        x86-expression (machine/compile-expression :x86-64 params charged)
+        arm-expression (machine/compile-expression :aarch64 params charged)
+        x86-code (:code (x86/emit-program kir))
+        arm-code (:code (arm/emit-program kir))]
+    (is (= 2 (count (filter #(= :gmir/phi (:gmir/op %))
+                            (:gmir/instructions gmir)))))
+    (is (= x86-expression
+           (subvec x86-code (- (count x86-code) (count x86-expression)))))
+    (is (= arm-expression
+           (subvec arm-code (- (count arm-code) (count arm-expression)))))
+    (is (zero? (:mc/frame-slots (machine/compile-gmir :x86-64 gmir))))
+    (is (zero? (:mc/frame-slots (machine/compile-gmir :aarch64 gmir))))))
+
+(deftest scalar-variant-sroa-production-path-has-no-legacy-epilogue
+  (let [params ['a]
+        body '(let [v (if a
+                        (variant-new [:variant :test/value
+                                      [[:number :i64] [:flag :bool]]]
+                                     :number 41)
+                        (variant-new [:variant :test/value
+                                      [[:number :i64] [:flag :bool]]]
+                                     :flag false))]
+                (variant-match [:variant :test/value
+                                [[:number :i64] [:flag :bool]]]
+                               v
+                               [[:number payload (+ payload 1)]
+                                [:flag payload (if payload 1 7)]]))
+        kir {:format :kotoba.kir/v4 :exports ['main]
+             :functions [{:name 'main :params params :result :i64 :body body}]}
+        charged (charged-body params body)
+        gmir (machine/lower-kir-expression params charged)
+        x86-expression (machine/compile-expression :x86-64 params charged)
+        arm-expression (machine/compile-expression :aarch64 params charged)
+        x86-code (:code (x86/emit-program kir))
+        arm-artifact (arm/emit-program kir)
+        arm-code (:code arm-artifact)
+        {:keys [offset length]} (get-in arm-artifact [:exports 'main])
+        arm-function (subvec arm-code offset (+ offset length))
+        arm-v2 (machine/compile-gmir :aarch64 gmir)
+        arm-v3 (machine/compile-gmir :aarch64
+                                     (machine/lower-kir-module kir))]
+    (is (= x86-expression
+           (subvec x86-code (- (count x86-code) (count x86-expression)))))
+    ;; v3 selection removes unique zero/equality definitions before RA, so its
+    ;; function is shorter than the v2 expression oracle. Compare the resolved
+    ;; function's architectural return suffix rather than using a negative
+    ;; backwards offset from the longer v2 byte vector.
+    (is (= [0xc0 0x03 0x5f 0xd6] (subvec arm-function (- length 4))))
+    (is (= (subvec arm-expression (- (count arm-expression) 4))
+           (subvec arm-function (- length 4))))
+    (is (< length (count arm-expression))
+        "v3 virtual fusion, not a legacy epilogue, explains the shorter body")
+    (is (some #(= :mc/branch-zero (:mc/op %)) (:mc/instructions arm-v2)))
+    (is (some #(= :mc/branch-nonzero (:mc/op %))
+              (get-in arm-v3 [:mc/functions 0 :mc/instructions])))
+    (is (zero? (:mc/frame-slots (machine/compile-gmir :x86-64 gmir))))
+    (is (zero? (:mc/frame-slots (machine/compile-gmir :aarch64 gmir))))))

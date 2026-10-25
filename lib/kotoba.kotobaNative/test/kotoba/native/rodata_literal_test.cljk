@@ -1,0 +1,234 @@
+(ns kotoba.native.rodata-literal-test
+  "boot-lit: byte goldens for read-only literals and the two wider firmware
+  calls.
+
+  Every literal below was cross-checked with `llvm-mc` on 2026-09-02 -- the
+  wide call's whole sequence was DISASSEMBLED and read back, not merely
+  assembled and compared -- so a disagreement here is this encoder's rather
+  than an assembler's opinion.
+
+  What the pool assertions are really about is the difference between an
+  OFFSET and an ADDRESS. `:x86-64/data-address` resolves to `mov reg, imm64`
+  holding an offset from the start of the emitted buffer, and something else
+  adds the base. Under firmware there is no something else."
+  (:refer-clojure :exclude [bit-and bit-or bit-shift-left])
+  (:require [kotoba.native.test-support :refer [bit-and bit-or bit-shift-left]]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.gmir :as gmir]
+            [kotoba.native.x86-64 :as x86]))
+
+(defn- program [params body]
+  {:format :kotoba.kir/v4 :exports ['main]
+   :functions [{:name 'main :params params :body body}]})
+
+(defn- code [params body]
+  (vec (map #(bit-and (long %) 0xff)
+            (:code (x86/emit-program (program params body))))))
+
+(defn- index-of-bytes [haystack needle]
+  (let [n (count needle)]
+    (first (filter #(= needle (subvec haystack % (+ % n)))
+                   (range 0 (inc (- (count haystack) n)))))))
+
+(defn- contains-bytes? [haystack needle]
+  (some? (index-of-bytes haystack needle)))
+
+(defn- count-bytes [haystack needle]
+  (let [n (count needle)]
+    (count (filter #(= needle (subvec haystack % (+ % n)))
+                   (range 0 (inc (- (count haystack) n)))))))
+
+(defn- u32-at [bytes index]
+  (reduce (fn [out offset]
+            (+ out (bit-shift-left (nth bytes (+ index offset)) (* 8 offset))))
+          0 (range 4)))
+
+(defn- lea-target
+  "Resolve the single `lea r64,[rip+disp32]` in BYTES to the offset it names.
+  x86 measures a rip-relative displacement from the END of the instruction,
+  which is what makes this arithmetic and not a lookup."
+  [bytes opcode-index]
+  (+ opcode-index 7 (u32-at bytes (+ opcode-index 3))))
+
+;; ── the pool ────────────────────────────────────────────────────────────────
+
+(deftest a-literal-resolves-to-a-rip-relative-address-not-an-offset
+  (let [bytes (code [] '(ucs2 "AIUEOS"))
+        lea (index-of-bytes bytes [0x48 0x8d 0x05])] ; lea rax,[rip+disp32]
+    (testing "the instruction is a lea, not a mov-immediate"
+      (is (some? lea))
+      ;; `mov rax, imm64` is 0x48 0xb8. The managed string family emits that
+      ;; and needs a runtime to add a base; there is no runtime under
+      ;; firmware, which is the whole reason this operation exists.
+      (is (not (contains-bytes? bytes [0x48 0xb8]))))
+    (testing "and it names the literal's bytes"
+      (let [target (lea-target bytes lea)]
+        (is (= (gmir/rodata-bytes :utf-16le-nul "AIUEOS")
+               (subvec bytes target (+ target 14))))))))
+
+(defn- rip-lea-targets
+  "Offsets named by every `lea r64,[rip+disp32]` in BYTES. ModRM mod=00 rm=101
+  is the rip-relative form; masking with 0xc7 separates it from
+  `lea dst,[base+disp32]`, which the immediate-add peephole also emits with
+  opcode 0x8d."
+  [bytes]
+  (->> (range 0 (- (count bytes) 7))
+       (filter (fn [index]
+                 (and (= 0x48 (bit-or 0x48 (nth bytes index)))
+                      (= 0x8d (nth bytes (inc index)))
+                      (= 0x05 (bit-and (nth bytes (+ index 2)) 0xc7)))))
+       (mapv #(lea-target bytes %))))
+
+(deftest every-literal-starts-eight-aligned
+  ;; UCS-2 needs 2 and EFI_GUID needs 4; 8 because edk2 compares a GUID as two
+  ;; UINT64s, and because one rule for the pool is cheaper to verify than
+  ;; three.
+  ;;
+  ;; Both halves of the rule need their own program, and neither program tests
+  ;; the other half. `(+ (ucs2 ...) (+ 1 2))` emits an ODD number of code
+  ;; bytes, so only the POOL START can align it -- with the padding removed,
+  ;; its literal lands at 29. The two-literal program has a 6-byte first
+  ;; entry, so only INTER-ENTRY padding can align the second.
+  (testing "the pool starts aligned even when the code does not end aligned"
+    (let [bytes (code [] '(+ (ucs2 "AB") (+ 1 2)))
+          targets (rip-lea-targets bytes)]
+      (is (= 1 (count targets)) (str "targets " targets))
+      (is (every? #(zero? (mod % gmir/rodata-alignment)) targets)
+          (str "targets " targets))))
+  (testing "and each entry after the first is padded up to it"
+    (let [bytes (code [] '(+ (ucs2 "AB")
+                            (guid "5B1B31A1-9562-11D2-8E3F-00A0C969723B")))
+          targets (rip-lea-targets bytes)]
+      (is (= 2 (count targets)) (str "targets " targets))
+      (is (every? #(zero? (mod % gmir/rodata-alignment)) targets)
+          (str "targets " targets)))))
+
+(deftest identical-literals-are-one-pool-entry
+  (let [bytes (code [] '(+ (ucs2 "AIUEOS") (ucs2 "AIUEOS")))
+        ucs2 (gmir/rodata-bytes :utf-16le-nul "AIUEOS")]
+    (is (= 1 (count-bytes bytes ucs2)))))
+
+(deftest the-same-text-under-two-encodings-is-two-entries
+  ;; Sixteen hex digits are a GUID's shape only by accident; as `:hex-bytes`
+  ;; they are eight bytes and as a GUID they would not parse at all. The pool
+  ;; is keyed on [encoding content], and this is why.
+  (let [bytes (code [] '(+ (bytes-literal "0011223344556677")
+                           (ucs2 "0011223344556677")))]
+    (is (contains-bytes? bytes (gmir/rodata-bytes :hex-bytes "0011223344556677")))
+    (is (contains-bytes? bytes (gmir/rodata-bytes :utf-16le-nul "0011223344556677")))))
+
+(deftest a-guid-is-placed-mixed-endian
+  (let [bytes (code [] '(guid "5B1B31A1-9562-11D2-8E3F-00A0C969723B"))]
+    (testing "the bytes EFI_LOADED_IMAGE_PROTOCOL_GUID has in memory"
+      (is (contains-bytes? bytes [0xa1 0x31 0x1b 0x5b 0x62 0x95 0xd2 0x11
+                                  0x8e 0x3f 0x00 0xa0 0xc9 0x69 0x72 0x3b])))
+    (testing "and not the hex decode of its text, which is a different GUID"
+      (is (not (contains-bytes? bytes [0x5b 0x1b 0x31 0xa1 0x95 0x62]))))))
+
+(deftest a-length-is-a-constant-and-reaches-no-pool
+  (let [bytes (code [] '(bytes-literal-length "deadbeef"))]
+    (testing "mov eax,4 -- the byte count, folded"
+      (is (contains-bytes? bytes [0xb8 0x04 0x00 0x00 0x00])))
+    (testing "and no lea, because there is nothing to address"
+      (is (not (contains-bytes? bytes [0x48 0x8d 0x05]))))
+    (testing "nor the literal's own bytes"
+      (is (not (contains-bytes? bytes [0xde 0xad 0xbe 0xef]))))))
+
+(deftest a-malformed-literal-is-refused-at-lowering
+  (doseq [[label form] [["a short GUID" '(guid "5B1B31A1-9562-11D2-8E3F-00A0C9697")]
+                        ["odd hex"      '(bytes-literal "abc")]
+                        ["a surrogate"  '(ucs2 "hello😀")]]]
+    (testing label
+      (is (thrown-with-msg? ExceptionInfo #"rodata-literal-malformed"
+                            (code [] form))
+          label)))
+  (testing "and a non-literal argument is refused too"
+    (is (thrown? ExceptionInfo (code '[s] '(ucs2 s))))))
+
+;; ── the wider firmware calls ────────────────────────────────────────────────
+
+(def ^:private wide-call-frame
+  "The one frame the wide encoder builds, in the order it builds it. Cut at
+  the point where the argument sources begin, because those registers are
+  whatever the allocator chose and are asserted separately."
+  [0x49 0x89 0xe2                    ; mov r10,rsp     (original)
+   0x48 0x83 0xe4 0xf0               ; and rsp,-16
+   0x48 0x83 0xec 0x60])             ; sub rsp,0x60
+
+(deftest a-wide-call-aligns-the-stack-and-reserves-six-argument-slots
+  (doseq [[label bytes]
+          [["call4" (code '[b s x y] '(kernel-uefi-call4 b s x y 3 4))]
+           ["call6" (code '[b s x y] '(kernel-uefi-call6 b s x y 3 4 5 6))]]]
+    (testing label
+      (is (contains-bytes? bytes wide-call-frame) label)
+      (testing "0x60 is a multiple of 16, so RSP is still aligned at the call"
+        (is (zero? (mod 0x60 16))))
+      (testing "and the original RSP comes back from the frame, not a register"
+        ;; R10 is volatile across a Microsoft x64 call, so parking the original
+        ;; RSP there would lose it.
+        (is (contains-bytes? bytes [0x48 0x8b 0xa4 0x24 0x30 0x00 0x00 0x00])
+            label))
+      (testing "call r11, not jmp"
+        (is (contains-bytes? bytes [0x41 0xff 0xd3]) label)))))
+
+(deftest a-wide-call-saves-the-scratch-tier-and-r9
+  ;; :mir/x86-privileged is not a `call-operation?`, so the scanner may hold a
+  ;; live value in RAX/RCX/RDX/R8 across this. R9 carries the guest's hidden
+  ;; context AND is an argument register in Microsoft x64, so it is the one
+  ;; that cannot be left to the allocator to notice.
+  (let [bytes (code '[b s x y] '(kernel-uefi-call6 b s x y 3 4 5 6))]
+    (doseq [[label save restore]
+            [["rax" [0x48 0x89 0x84 0x24 0x38] [0x48 0x8b 0x84 0x24 0x38]]
+             ["rcx" [0x48 0x89 0x8c 0x24 0x40] [0x48 0x8b 0x8c 0x24 0x40]]
+             ["rdx" [0x48 0x89 0x94 0x24 0x48] [0x48 0x8b 0x94 0x24 0x48]]
+             ["r8"  [0x4c 0x89 0x84 0x24 0x50] [0x4c 0x8b 0x84 0x24 0x50]]
+             ["r9"  [0x4c 0x89 0x8c 0x24 0x58] [0x4c 0x8b 0x8c 0x24 0x58]]]]
+      (testing label
+        (is (contains-bytes? bytes save) label)
+        (is (contains-bytes? bytes restore) label)))))
+
+(deftest a-wide-call-loads-the-argument-registers-from-the-frame
+  ;; The ordering rule, asserted as a fact about the byte stream: every load
+  ;; into an argument register happens AFTER the last store into the staging
+  ;; area, so no argument register write can destroy a source that has not
+  ;; been read yet. `x86-uefi-call2` solved the same problem by staging one
+  ;; argument through R10, which does not scale past two.
+  (let [bytes (code '[b s x y] '(kernel-uefi-call6 b s x y 3 4 5 6))
+        load-rcx (index-of-bytes bytes [0x48 0x8b 0x8c 0x24 0x00 0x00 0x00 0x00])
+        load-rdx (index-of-bytes bytes [0x48 0x8b 0x94 0x24 0x08 0x00 0x00 0x00])
+        load-r8  (index-of-bytes bytes [0x4c 0x8b 0x84 0x24 0x10 0x00 0x00 0x00])
+        load-r9  (index-of-bytes bytes [0x4c 0x8b 0x8c 0x24 0x18 0x00 0x00 0x00])
+        call     (index-of-bytes bytes [0x41 0xff 0xd3])]
+    (is (every? some? [load-rcx load-rdx load-r8 load-r9 call]))
+    (is (< load-rcx load-rdx load-r8 load-r9 call))
+    ;; The rule itself: the LAST store into the staging area comes before the
+    ;; FIRST load out of it. Loading rcx before the sixth argument is staged
+    ;; would destroy that argument whenever the allocator had put it in rcx.
+    (let [stores (keep #(index-of-bytes bytes [0x24 % 0x00 0x00 0x00])
+                       [0x00 0x08 0x10 0x18 0x20 0x28])]
+      (is (= 6 (count stores)))
+      (is (< (apply max stores) load-rcx)
+          (str "last store " (apply max stores) " load-rcx " load-rcx)))))
+
+(deftest only-a-six-argument-call-writes-the-two-stack-argument-slots
+  ;; [rsp+0x20] and [rsp+0x28] are where Microsoft x64 puts arguments five and
+  ;; six. A four-argument call allocates the same frame -- one layout to
+  ;; verify -- and must not write them, or `AllocatePages` would be handed two
+  ;; words it did not ask for on a stack the callee may read for its own
+  ;; locals.
+  (let [call4 (code '[b s x y] '(kernel-uefi-call4 b s x y 3 4))
+        call6 (code '[b s x y] '(kernel-uefi-call6 b s x y 3 4 5 6))
+        writes-arg-slots? (fn [bytes]
+                            [(some? (index-of-bytes bytes [0x24 0x20 0x00 0x00 0x00]))
+                             (some? (index-of-bytes bytes [0x24 0x28 0x00 0x00 0x00]))])]
+    (is (= [true true] (writes-arg-slots? call6)))
+    (is (= [false false] (writes-arg-slots? call4)))))
+
+(deftest the-narrow-call-keeps-its-own-frame
+  ;; :uefi-call2's bytes are the ones that booted (amu ADR-0291). Widening it
+  ;; into the new encoder would have changed them for no reason a boot could
+  ;; check.
+  (let [call2 (code '[b s x y] '(kernel-uefi-call2 b s x y))]
+    (is (contains-bytes? call2 [0x48 0x83 0xec 0x50]))
+    (is (not (contains-bytes? call2 [0x48 0x83 0xec 0x60])))
+    (is (contains-bytes? call2 [0x48 0x8b 0xa4 0x24 0x20 0x00 0x00 0x00]))))

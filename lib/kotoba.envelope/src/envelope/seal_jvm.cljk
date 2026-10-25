@@ -1,0 +1,152 @@
+(ns envelope.seal-jvm
+  "Synchronous JVM byte backend for the same envelope wire format as
+  `envelope.seal`. Policy and serialized fields remain in `envelope.model`;
+  this namespace only supplies JCA AES-GCM and the workspace-owned
+  `kotoba-lang/org-signal` X25519/HKDF implementation."
+  (:require [kotoba.bytes :as kbytes] [envelope.model :as m]
+            #?(:clj [kotoba.signal.hkdf :as hkdf])
+            #?(:clj [kotoba.signal.x25519 :as x25519]))
+  #?(:clj (:import
+                   (java.security SecureRandom)
+                   (javax.crypto Cipher)
+                   (javax.crypto.spec GCMParameterSpec SecretKeySpec))))
+
+#?(:clj
+   (do
+     (def ^:private rng (SecureRandom.))
+     (def ^:private wrap-info "kotoba/envelope/v1 wrap")
+     (def content-key-bytes 32)
+
+     (defn utf8 ^bytes [s]
+       (kbytes/utf8-bytes ^String s))
+
+     (defn b64url [^bytes bs]
+       (kbytes/base64url-encode bs {:pad? false}))
+
+     (defn unb64url ^bytes [s]
+       (kbytes/base64url-decode-bytes ^String s))
+
+     (defn- random-bytes ^bytes [n]
+       (let [out (byte-array n)]
+         (.nextBytes rng out)
+         out))
+
+     (defn- as-bytes ^bytes [v]
+       (if (bytes? v) v (byte-array (map unchecked-byte v))))
+
+     (defn- concat-bytes ^bytes [& parts]
+       (byte-array (mapcat seq parts)))
+
+     (defn- gcm
+       ^bytes [mode ^bytes raw-key ^bytes iv ^bytes input ^bytes aad]
+       (let [cipher (Cipher/getInstance "AES/GCM/NoPadding")]
+         (.init cipher mode (SecretKeySpec. raw-key "AES")
+                (GCMParameterSpec. 128 iv))
+         (.updateAAD cipher aad)
+         (.doFinal cipher input)))
+
+     (defn- gcm-encrypt [key iv plaintext aad]
+       (gcm Cipher/ENCRYPT_MODE key iv plaintext aad))
+
+     (defn- gcm-decrypt [key iv ciphertext aad]
+       (gcm Cipher/DECRYPT_MODE key iv ciphertext aad))
+
+     (defn generate-content-key [] (random-bytes content-key-bytes))
+
+     (defn generate-recipient
+       "Create a raw X25519 keypair suitable for `wrap-for` / `unwrap-with`."
+       []
+       (x25519/generate-keypair))
+
+     (defn seal-chunk [env content-key i plaintext]
+       (gcm-encrypt (as-bytes content-key)
+                    (as-bytes (m/chunk-nonce (m/chunk-epoch env i) i))
+                    (as-bytes plaintext)
+                    (utf8 (m/chunk-aad env i))))
+
+     (defn open-chunk [env content-key i ciphertext]
+       (gcm-decrypt (as-bytes content-key)
+                    (as-bytes (m/chunk-nonce (m/chunk-epoch env i) i))
+                    (as-bytes ciphertext)
+                    (utf8 (m/chunk-aad env i))))
+
+     (defn- wrap-key-from-dh [shared eph-pub recipient-pub]
+       (hkdf/hkdf nil shared
+                  (concat-bytes (utf8 wrap-info) eph-pub recipient-pub)
+                  content-key-bytes))
+
+     (defn wrap-bytes [plaintext pub aad]
+       (let [recipient-pub (if (string? pub) (unb64url pub) (as-bytes pub))
+             {eph-priv :priv eph-pub :pub} (x25519/generate-keypair)
+             shared (x25519/dh eph-priv recipient-pub)
+             iv (random-bytes m/nonce-bytes)
+             wrapped (gcm-encrypt (wrap-key-from-dh shared eph-pub recipient-pub)
+                                  iv (as-bytes plaintext) (utf8 aad))]
+         {:wrap/pub (b64url recipient-pub)
+          :wrap/ephemeral-pub (b64url eph-pub)
+          :wrap/iv (b64url iv)
+          :wrap/wrapped (b64url wrapped)}))
+
+     (defn unwrap-bytes
+       [{:keys [:wrap/pub :wrap/ephemeral-pub :wrap/iv :wrap/wrapped]}
+        priv aad]
+       (let [priv (if (string? priv) (unb64url priv) (as-bytes priv))
+             eph-pub (unb64url ephemeral-pub)
+             recipient-pub (unb64url pub)
+             shared (x25519/dh priv eph-pub)]
+         (gcm-decrypt (wrap-key-from-dh shared eph-pub recipient-pub)
+                      (unb64url iv) (unb64url wrapped) (utf8 aad))))
+
+     (defn wrap-for [env {:keys [id pub kind]} content-key]
+       (let [w (wrap-bytes content-key pub (m/wrap-aad env id))]
+         {:recipient/id id
+          :recipient/kind (or kind :did)
+          :recipient/pub (:wrap/pub w)
+          :recipient/ephemeral-pub (:wrap/ephemeral-pub w)
+          :recipient/iv (:wrap/iv w)
+          :recipient/wrapped (:wrap/wrapped w)}))
+
+     (defn unwrap-with [env entry priv]
+       (when (= m/hybrid-kem (:recipient/kem entry))
+         (throw (ex-info "hybrid JVM recipient opening is not implemented"
+                         {:recipient/id (:recipient/id entry)
+                          :recipient/kem (:recipient/kem entry)})))
+       (unwrap-bytes {:wrap/pub (:recipient/pub entry)
+                      :wrap/ephemeral-pub (:recipient/ephemeral-pub entry)
+                      :wrap/iv (:recipient/iv entry)
+                      :wrap/wrapped (:recipient/wrapped entry)}
+                     priv
+                     (m/wrap-aad env (:recipient/id entry) :x25519)))
+
+     (defn entry-for [env id]
+       (first (filter #(= id (:recipient/id %)) (:envelope/recipients env))))
+
+     (defn share-with [env from-entry from-priv recipient]
+       (m/put-recipient env
+                        (wrap-for env recipient
+                                  (unwrap-with env from-entry from-priv))))
+
+     (defn mint-link [env from-entry from-priv]
+       (let [{:keys [priv pub]} (x25519/generate-keypair)
+             id (m/link-recipient-id (b64url pub))
+             env' (share-with env from-entry from-priv
+                              {:id id :pub pub :kind :link})]
+         {:envelope env'
+          :grant (m/link-grant env' (entry-for env' id) (b64url priv))}))
+
+     (defn seal-object [env-id plaintext-chunks recipients & [opts]]
+       (let [chunks (vec plaintext-chunks)
+             env (m/envelope env-id (merge {:chunks (count chunks)} opts))
+             ck (generate-content-key)]
+         {:envelope (reduce (fn [e recipient]
+                              (m/put-recipient e (wrap-for e recipient ck)))
+                            env recipients)
+          :chunks (mapv (fn [i plaintext]
+                          (seal-chunk env ck i plaintext))
+                        (range) chunks)}))
+
+     (defn open-object [env entry priv ciphertext-chunks]
+       (let [ck (unwrap-with env entry priv)]
+         (mapv (fn [i ciphertext]
+                 (open-chunk env ck i ciphertext))
+               (range) ciphertext-chunks)))))

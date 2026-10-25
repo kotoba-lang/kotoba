@@ -1,0 +1,256 @@
+(ns nbb.executor-test
+  "The executor's decisions, on the Node host -- the same fixtures
+  `test/tender/native_test.cljk` pins on the JVM, plus what only this host
+  has: integers as bigint, and the loader's report re-read from text.
+
+  Runs on the nbb engine with the executor's dependency closure on the
+  classpath. amu's lock is the closure that is already resolved:
+
+    cd <amu> && node bin/kbb --backend sci \\
+      --classpath \"<kototama-native>/src:<kototama-native>/test:$(node bin/kbb --backend sci --classpath src scripts/print-classpath.cljk . | paste -sd:)\" \\
+      <kototama-native>/test/nbb/executor_test.cljk
+
+  Exit 0 only when every assertion passed and at least one ran."
+  (:require [cljs.test :refer [deftest is testing run-tests] :as t]
+            ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:path" :as node-path]
+            [kototama.native.executor :as executor]))
+
+(def i64-min (js/BigInt "-9223372036854775808"))
+(def i64-max (js/BigInt "9223372036854775807"))
+
+(deftest integers-of-both-representations
+  (let [signed? @#'executor/signed-i64?]
+    (is (true? (signed? 41)))
+    (is (true? (signed? i64-min)))
+    (is (true? (signed? i64-max)))
+    (is (false? (signed? (+ i64-max (js/BigInt 1)))))
+    (is (false? (signed? (- i64-min (js/BigInt 1)))))
+    (is (false? (signed? 4794697086780616226))
+        "a double past 2^53 is not a safe integer and is refused, not rounded")
+    (is (false? (signed? 1.5)))
+    (is (false? (signed? true)))))
+
+(deftest supervisor-report-validation-is-closed-and-bounded
+  (let [valid? @#'executor/valid-supervisor-report?
+        arenas {:vectors {:capacity 4096 :used 0}
+                :vector-items {:capacity 65536 :used 0}
+                :string-pool {:capacity 65536 :used 0}}
+        ok (merge arenas {:status :ok :result 7
+                          :fuel {:initial 512 :remaining 500}
+                          :heap {:capacity 4096 :used 32}})
+        string-ok (merge arenas {:status :ok :result 3 :result-type :string
+                                 :result-utf8-hex "6869f09f9880"
+                                 :fuel {:initial 512 :remaining 499}
+                                 :heap {:capacity 4096 :used 33}})
+        record-ok (merge arenas {:status :ok :result 9 :result-type :record
+                                 :result-words [-7 1]
+                                 :fuel {:initial 512 :remaining 498}
+                                 :heap {:capacity 4096 :used 34}})
+        option-ok (merge arenas {:status :ok :result 10 :result-type :option-i64
+                                 :result-tag true :result-word i64-min
+                                 :fuel {:initial 512 :remaining 497}
+                                 :heap {:capacity 4096 :used 35}})
+        variant-ok (merge arenas {:status :ok :result 12 :result-type :variant
+                                  :result-ordinal 1 :result-word 1
+                                  :fuel {:initial 512 :remaining 495}
+                                  :heap {:capacity 4096 :used 37}})
+        trap (merge arenas {:status :trap :exit 132
+                            :fuel {:initial 512 :remaining 0}
+                            :heap {:capacity 4096 :used 0}})]
+    (is (true? (valid? ok 0)))
+    (is (true? (valid? (assoc ok :result i64-max) 0)) "a bigint result word")
+    (is (true? (valid? string-ok 0)))
+    (is (false? (valid? (assoc string-ok :result-utf8-hex "ff") 0)))
+    (is (true? (valid? record-ok 0)))
+    (is (true? (valid? (assoc record-ok :result-words [i64-min 1]) 0)))
+    (is (false? (valid? (assoc record-ok :result-words [-7 true]) 0)))
+    (is (true? (valid? option-ok 0)))
+    (is (false? (valid? (assoc option-ok :result-tag false) 0)))
+    (is (true? (valid? variant-ok 0)))
+    (is (false? (valid? (assoc variant-ok :result-ordinal 32) 0)))
+    (is (false? (valid? (assoc-in ok [:fuel :remaining] 513) 0)))
+    (is (false? (valid? (assoc ok :ambient "forbidden") 0)))
+    (is (false? (valid? ok 1)))
+    (is (true? (valid? trap 132)))
+    (is (false? (valid? trap 0)) "a trap report on a zero exit is not the loader's")
+    (is (true? (valid? (assoc ok :vectors {:capacity 1200000 :used 1165132}) 0)))
+    (is (false? (valid? (dissoc ok :vectors) 0)))
+    (is (false? (valid? (assoc ok :string-pool {:capacity 0 :used 0}) 0)))))
+
+(deftest report-text-is-re-read-as-bigint-past-2-53
+  (let [read-report @#'executor/read-report
+        text (str "{:status :ok :result 4794697086780616226 "
+                  ":fuel {:initial 512 :remaining 506} :heap {:capacity 4096 :used 0} "
+                  ":string-pool {:capacity 65536 :used 0} :vectors {:capacity 4096 :used 0} "
+                  ":vector-items {:capacity 65536 :used 0}}")
+        report (read-report text)]
+    (is (= "4794697086780616226" (str (:result report))))
+    (is (identical? js/BigInt (type (:result report))))
+    (is (= 506 (get-in report [:fuel :remaining])) "small fields stay numbers")
+    (let [record (read-report (str "{:status :ok :result 1 :result-type :record "
+                                   ":result-words [-9223372036854775808 1 7] "
+                                   ":fuel {:initial 512 :remaining 1} :heap {:capacity 4096 :used 0} "
+                                   ":string-pool {:capacity 1 :used 0} :vectors {:capacity 1 :used 0} "
+                                   ":vector-items {:capacity 1 :used 0}}"))]
+      (is (= ["-9223372036854775808" "1" "7"] (mapv str (:result-words record))))
+      (is (= 1 (nth (:result-words record) 1))))))
+
+(deftest host-values-lower-to-loader-words
+  (let [marshal @#'executor/marshal-entry-arguments
+        record-type [:record :maturity/pair [[:left :i64] [:ready :bool]]]
+        variant-type [:variant :maturity/outcome [[:count :i64] [:ready :bool]]]]
+    (is (= [1 41] (marshal 'choose [:bool :i64] [true 41])))
+    (is (= ["0" "-9223372036854775808"]
+           (mapv str (marshal 'choose [:bool :i64] [false i64-min]))))
+    (is (thrown-with-msg? ExceptionInfo #"entry arguments"
+                          (marshal 'choose [:bool :i64] [1 41])))
+    (is (= ["s:6869f09f9880"] (marshal 'echo [:string] ["hi😀"])))
+    (is (thrown-with-msg? ExceptionInfo #"exceeds native host arena"
+                          (marshal 'echo [:string] [(apply str (repeat 65537 "a"))])))
+    (is (= ["r:-9223372036854775808,1"]
+           (marshal 'echo [record-type] [{:ready true :left i64-min}])))
+    (is (= ["o:none" "o:some:-9223372036854775808"]
+           (marshal 'options [:option-i64 :option-i64] [[false] [true i64-min]])))
+    (is (= ["e:ok:9223372036854775807" "e:err:-9"]
+           (marshal 'results [:result-i64 :result-i64] [[true i64-max] [false -9]])))
+    (is (= ["v:2:0:i:-9223372036854775808" "v:2:1:b:1"]
+           (marshal 'outcomes [variant-type variant-type]
+                    [[variant-type :count i64-min] [variant-type :ready true]])))
+    (is (= ["g:010203" "gl:0"]
+           (marshal 'slice [:i64 :i64] [{:region [1 2 3]} {:region-length 0}])))
+    (is (= ["g:0102" "gl:1"]
+           (marshal 'slice [:i64 :i64] [{:region [(js/BigInt 1) (js/BigInt 2)]}
+                                        {:region-length (js/BigInt 1)}]))
+        "bytes and ordinals arrive as bigint through the kotoba reader")
+    (is (thrown-with-msg? ExceptionInfo #"parameter type"
+                          (marshal 'echo [:f64] [1.0])))))
+
+(deftest selected-export-result-is-boxed-or-refused-by-type
+  (let [host-result @#'executor/host-result
+        record-type [:record :maturity/pair [[:left :i64] [:ready :bool]]]
+        variant-type [:variant :maturity/outcome [[:count :i64] [:ready :bool]]]]
+    (is (= 7 (host-result :i64 {:result 7})))
+    (is (= "4794697086780616226" (str (host-result :i64 {:result (js/BigInt "4794697086780616226")}))))
+    (is (true? (host-result :bool {:result 1})))
+    (is (true? (host-result :bool {:result (js/BigInt 1)})))
+    (is (thrown-with-msg? ExceptionInfo #"bool result is not 0/1"
+                          (host-result :bool {:result 2})))
+    (is (= "hi😀" (host-result :string {:result-utf8-hex "6869f09f9880"})))
+    (is (= [false] (host-result :option-i64 {:result-tag false :result-word 0})))
+    (is (= [true 7] (host-result :result-i64 {:result-tag true :result-word 7})))
+    (is (= {:left -7 :ready true} (host-result record-type {:result-words [-7 1]})))
+    (is (= [variant-type :ready true]
+           (host-result variant-type {:result-ordinal (js/BigInt 1) :result-word (js/BigInt 1)})))
+    (is (thrown-with-msg? ExceptionInfo #"ordinal is outside"
+                          (host-result variant-type {:result-ordinal 2 :result-word 0})))))
+
+(deftest make-dependency-files-parse-with-escapes-and-limits
+  (let [parse @#'executor/parse-dependency-file]
+    (is (= ["a.c" "/usr/include/stdio.h"]
+           (parse "loader-deps.o: a.c \\\n  /usr/include/stdio.h\n")))
+    (is (= ["with space.h" "hash#.h"]
+           (parse "x.o: with\\ space.h hash\\#.h")))
+    (is (= ["C:\\dir\\a.h"] (parse "x.o: C:\\dir\\a.h"))
+        "a backslash before an ordinary character is a path separator, not an escape")
+    (is (= [] (parse "x.o: ")))
+    (is (thrown-with-msg? ExceptionInfo #"no target separator" (parse "x.o:"))
+        "the separator is a colon FOLLOWED BY whitespace, so a bare colon is none")
+    (is (thrown-with-msg? ExceptionInfo #"no target separator" (parse "x.o a.c")))
+    (is (thrown-with-msg? ExceptionInfo #"ends in an escape" (parse "x.o: a.c\\")))
+    (is (thrown-with-msg? ExceptionInfo #"path exceeds limit"
+                          (parse (str "x.o: " (apply str (repeat 4097 "a"))))))
+    (is (thrown-with-msg? ExceptionInfo #"syntax limits" (parse "x.o: a\u0000c")))))
+
+(deftest policy-capability-ids-sort-as-numbers
+  (let [allowed @#'executor/allowed-capabilities]
+    (is (= "" (allowed {:allow #{}})))
+    (is (= "3,35" (allowed {:allow #{[:cap/call (js/BigInt 35)] [:cap/call 3] [:cap/other 1]}})))))
+
+(deftest toolchain-executables-are-found-through-symlinks
+  ;; Ubuntu's `/usr/bin/cc` is a symlink into /etc/alternatives. A PATH walk
+  ;; that lstat'd found no compiler there (2026-09-11).
+  (let [resolve @#'executor/resolve-executable
+        dir (.mkdtempSync fs (.join node-path (.tmpdir os) "kn-exec-test-"))
+        real (.join node-path dir "real-cc")
+        link (.join node-path dir "cc")
+        saved (aget (.-env js/process) "PATH")]
+    (try
+      (.writeFileSync fs real "#!/bin/sh\nexit 0\n" #js {:mode 448})
+      (.symlinkSync fs real link)
+      (aset (.-env js/process) "PATH" dir)
+      (is (= (.realpathSync fs real) (resolve "cc"))
+          "a symlinked executable resolves to its real path")
+      (is (thrown-with-msg? ExceptionInfo #"was not found" (resolve "no-such-tool")))
+      (finally
+        (aset (.-env js/process) "PATH" saved)
+        (.rmSync fs dir #js {:recursive true :force true})))))
+
+(deftest supervision-follows-the-artifacts-fuel-profile
+  ;; P4 of adr-2609242100: an unmetered artifact (the native default) runs
+  ;; with no KEXE_FUEL and must report :metered false at the counter's
+  ;; ceiling; a metered one runs at its sealed :limits :fuel. Both directions.
+  (let [profile @#'executor/fuel-profile
+        valid? @#'executor/valid-supervisor-report?
+        arenas {:vectors {:capacity 4096 :used 0}
+                :vector-items {:capacity 65536 :used 0}
+                :string-pool {:capacity 65536 :used 0}
+                :heap {:capacity 4096 :used 3001}}
+        unmetered-profile (profile {:limits {:fuel 100000 :fuel-metering :off}} :macos)
+        metered-profile (profile {:limits {:fuel 6006}} :linux)
+        unmetered (merge arenas {:status :ok :result 500500
+                                 :fuel {:initial 9007199254740991
+                                        :remaining 9007199254734985 :metered false}})
+        metered (merge arenas {:status :ok :result 500500
+                               :fuel {:initial 6006 :remaining 0}})]
+    (is (= {:env {} :initial 9007199254740991 :metered? false} unmetered-profile))
+    (is (= {:env {"KEXE_FUEL" "6006"} :initial 6006 :metered? true} metered-profile))
+    (is (= {:env {} :initial 512 :metered? true}
+           (profile {:limits {:fuel 6006 :fuel-metering :off}} :windows))
+        "the Windows loader reads no KEXE_FUEL and runs a fixed 512")
+    (is (true? (valid? unmetered 0 unmetered-profile)))
+    (is (false? (valid? unmetered 0 metered-profile)))
+    (is (true? (valid? metered 0 metered-profile)))
+    (is (false? (valid? metered 0 unmetered-profile)))
+    (is (false? (valid? (assoc-in unmetered [:fuel :metered] true) 0 unmetered-profile)))
+    (is (false? (valid? (assoc-in metered [:fuel :remaining] 6007) 0 metered-profile)))))
+
+(deftest loader-refusals-name-what-is-wrong
+  ;; Absent and not-executable were reported as "measured native loader does
+  ;; not match runtime identity" until 2026-10-09 -- a loader looked up in the
+  ;; wrong directory read as a tampered one. Only wrong bytes say that now.
+  (let [admit @#'executor/measured-loader-bytes!
+        raw-sha256 @#'executor/raw-sha256
+        read-bytes @#'executor/read-bytes
+        dir (.mkdtempSync fs (.join node-path (.tmpdir os) "kexe-loader-test-"))
+        loader (.join node-path dir "kotoba-loader")
+        plain (.join node-path dir "plain-loader")
+        refusal (fn [path runtime]
+                  (try (admit path runtime) nil
+                       (catch :default e [(ex-message e) (:phase (ex-data e))])))]
+    (try
+      (.writeFileSync fs loader "loader bytes")
+      (.chmodSync fs loader 448)
+      (.writeFileSync fs plain "loader bytes")
+      (.chmodSync fs plain 384)
+      (let [runtime {:loader-binary-sha256 (raw-sha256 (read-bytes loader))}]
+        (is (= (raw-sha256 (read-bytes loader)) (raw-sha256 (admit loader runtime)))
+            "the measured loader is admitted and its bytes returned")
+        (is (= ["native execution requires a measured loader" :execute] (refusal nil runtime)))
+        (is (= [(str "native loader not found: " (.join node-path dir "missing")) :execute]
+               (refusal (.join node-path dir "missing") runtime)))
+        (is (= [(str "native loader not found: " dir) :execute] (refusal dir runtime))
+            "a directory is not a loader")
+        (is (= [(str "native loader is not executable: " plain) :execute] (refusal plain runtime)))
+        (is (= ["measured native loader does not match runtime identity" :runtime-identity]
+               (refusal loader {:loader-binary-sha256 (apply str (repeat 64 "0"))}))))
+      (finally
+        (.rmSync fs dir #js {:recursive true :force true})))))
+
+(defmethod t/report [:cljs.test/default :end-run-tests] [m]
+  (let [ran (+ (:pass m) (:fail m) (:error m))]
+    (println (str "SCANNED\t" ran " assertions, " (:fail m) " failures, " (:error m) " errors"))
+    (js/process.exit (if (and (pos? ran) (t/successful? m)) 0 1))))
+
+(run-tests 'nbb.executor-test)

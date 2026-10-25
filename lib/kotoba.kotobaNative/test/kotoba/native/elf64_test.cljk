@@ -1,0 +1,275 @@
+(ns kotoba.native.elf64-test
+  (:refer-clojure :exclude [bit-shift-left])
+  (:require [kotoba.native.test-support :refer [bit-shift-left]]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.artifact.core :as artifact]
+            [kotoba.native.elf64 :as elf64]))
+
+(defn- sealed-kernel [target fuel]
+  (artifact/seal
+   {:target target
+    :target-profile {:runtime :none :ambient-syscalls false}
+    :program {:entry 'main}
+    :exports {'main {:offset 0 :arity 0}}
+    :limits {:fuel fuel}
+    :fuel-abi {:initial fuel}
+    :code [0xc3]}))
+
+(defn- le64 [bytes offset]
+  (reduce (fn [value index]
+            (+ value (bit-shift-left (long (nth bytes (+ offset index)))
+                                     (* index 8))))
+          0 (range 8)))
+
+(deftest kernel-image-context-uses-the-sealed-fuel-bound
+  (doseq [[target package]
+          [[:x86_64-aiueos-kernel-v1 elf64/package-kernel]
+           [:aarch64-aiueos-kernel-v1 elf64/package-kernel-aarch64]]]
+    (let [fuel 4096
+          image (:bytes (package (sealed-kernel target fuel)))]
+      (is (= fuel (le64 image (+ 0x8000 8)))
+          (str target)))))
+
+(deftest x86-kernel-image-owns-gdt-tss-and-rsp0-stack
+  (let [image (:bytes (elf64/package-kernel
+                       (sealed-kernel :x86_64-aiueos-kernel-v1 4096)))
+        data 0x8000]
+    (is (= 0x00af9a000000ffff (le64 image (+ data 104))))
+    (is (= 0x00cf92000000ffff (le64 image (+ data 112))))
+    (is (= 55 (+ (nth image (+ data 152))
+                 (bit-shift-left (nth image (+ data 153)) 8))))
+    (is (= 0x11b000 (le64 image (+ data 172))))
+    (is (= [0x0f 0x01 0x15] (subvec image 0x100c 0x100f)))
+    (is (= [0x0f 0x00 0xd8] (subvec image 0x1033 0x1036)))))
+
+(deftest value-runtime-kernel-installs-and-enters-a-closed-syscall-shim
+  (let [artifact (-> (sealed-kernel :x86_64-aiueos-kernel-v1 4096)
+                     (assoc :exports {'main {:offset 0 :arity 0}
+                                      'aiueos-value-runtime-syscall-plan
+                                      {:offset 1 :arity 5}
+                                      'aiueos-value-runtime-entry
+                                      {:offset 2 :arity 5}}
+                            :code [0xc3 0xc3 0xc3])
+                     (dissoc :sha256)
+                     artifact/seal)
+        packaged (elf64/package-kernel artifact)
+        image (:bytes packaged)
+        syscall-file-offset (+ 0x1000 144)]
+    (is (:value-runtime-live? packaged))
+    (is (= 0x101090 (:syscall-entry-address packaged)))
+    (is (some #(= [0xb9 0x82 0x00 0x00 0xc0 0xb8] %)
+              (partition 6 1 (subvec image 0x1000 syscall-file-offset)))
+        "boot writes IA32_LSTAR")
+    (is (= [0x48 0x89 0x25]
+           (subvec image syscall-file-offset (+ syscall-file-offset 3)))
+        "SYSCALL saves user RSP before switching stacks")
+    (is (= [0x0f 0x85 0x07 0x00 0x00 0x00 0x31 0xc0
+            0xe9 0x34 0x00 0x00 0x00]
+           (subvec image (+ syscall-file-offset 88)
+                         (+ syscall-file-offset 101)))
+        "a rejected plan returns zero without entering ValueRuntime")
+    (is (= [0xb9 0x84 0x00 0x00 0xc0
+            0xb8 0x00 0x77 0x04 0x00 0x31 0xd2 0x0f 0x30]
+           (subvec image (- syscall-file-offset 33)
+                         (- syscall-file-offset 19)))
+        "FMASK clears trap/interrupt/direction and privileged user flags")
+    (is (some #(= [0x48 0x0f 0x07] %)
+              (partition 3 1 (subvec image syscall-file-offset
+                                     (+ syscall-file-offset 192))))
+        "admitted and rejected calls return through SYSRETQ")
+    (is (= 77824 (le64 image (+ 64 56 40)))
+        "RW memory owns metadata, scratch, capability table, arena and stack")))
+
+(deftest a-half-value-runtime-boundary-never-installs-lstar
+  (let [artifact (-> (sealed-kernel :x86_64-aiueos-kernel-v1 4096)
+                     (assoc-in [:exports 'aiueos-value-runtime-entry]
+                               {:offset 0 :arity 5})
+                     (dissoc :sha256)
+                     artifact/seal)]
+    (let [packaged (elf64/package-kernel artifact)]
+      (is (false? (:value-runtime-live? packaged)))
+      (is (nil? (:syscall-entry-address packaged))))))
+
+(deftest large-kernel-image-moves-data-to-the-next-page
+  (let [fuel 4096
+        large (-> (sealed-kernel :x86_64-aiueos-kernel-v1 fuel)
+                  (assoc :code (vec (concat (repeat 30000 0x90) [0xc3])))
+                  (dissoc :sha256)
+                  artifact/seal)
+        image (:bytes (elf64/package-kernel large))]
+    (is (= fuel (le64 image (+ 0x9000 8))))
+    (is (> (count image) 0x9000))))
+
+(deftest kernel-image-rejects-disagreeing-fuel-identities
+  (let [value (assoc (sealed-kernel :x86_64-aiueos-kernel-v1 4096)
+                     :fuel-abi {:initial 512})]
+    (testing "resealing does not make contradictory context authority valid"
+      (is (thrown-with-msg? ExceptionInfo
+                            #"one valid sealed fuel bound"
+                            (elf64/package-kernel
+                             (artifact/seal (dissoc value :sha256))))))))
+
+(deftest aiueos-user-packaging-refuses-value-runtime-until-c-free-provider-qualification
+  (let [value (artifact/seal
+               {:target :x86_64-aiueos-user-v1
+                :program {:entry 'main
+                          :functions [{:name 'main :params []
+                                       :body '(value-release 1)}]}
+                :exports {'main {:offset 0 :arity 0}}
+                :effects #{}
+                :code [0xc3]})]
+    (is (thrown-with-msg? ExceptionInfo
+                          #"ValueRuntime provider is not qualified"
+                          (elf64/package-user value)))))
+
+;; amu#626 / aiueos ADR-0054. The JVM loads this file's twin `.clj`, not
+;; `.cljc`. Until ADR-0036 the `.clj` path still defaulted missing names to
+;; the probe symbol, so amu's refuse test compiled a colliding ET_REL.
+(deftest kernel-object-with-an-unlisted-aiueos-export-is-refused-not-given-the-probe-symbol
+  (testing "an unlisted aiueos-* export is refused, and names itself"
+    (let [artifact (-> (sealed-kernel :x86_64-aiueos-kernel-v1 512)
+                       (assoc :exports {'aiueos-not-in-the-table {:offset 0 :arity 1}
+                                        'main {:offset 1 :arity 0}}
+                              :code [0xc3 0xc3])
+                       (dissoc :sha256)
+                       artifact/seal)
+          thrown (try (elf64/package-kernel-object artifact)
+                      (catch ExceptionInfo e e))]
+      (is (instance? ExceptionInfo thrown)
+          "packaging must refuse rather than emit a colliding symbol")
+      (is (re-find #"no admitted symbol" (ex-message thrown)))
+      (is (= '[aiueos-not-in-the-table] (:unlisted-exports (ex-data thrown))))))
+  (testing "a source claiming no aiueos name still packages as the probe"
+    (is (= "kotoba_aiueos_probe"
+           (:export (elf64/package-kernel-object
+                     (sealed-kernel :x86_64-aiueos-kernel-v1 512))))))
+  (testing "the install intent admission is admitted under its own symbol"
+    (let [object (elf64/package-kernel-object
+                  (-> (sealed-kernel :x86_64-aiueos-kernel-v1 512)
+                      (assoc :exports {'aiueos-install-intent-admit {:offset 0 :arity 2}
+                                       'main {:offset 1 :arity 0}}
+                             :code [0xc3 0xc3])
+                      (dissoc :sha256)
+                      artifact/seal))]
+      (is (= "kotoba_aiueos_install_intent_admit" (:export object)))))
+  (testing "the C-free wave 1 flat-record objects are admitted under their own symbols (aiueos ADR-0219)"
+    (doseq [[entry arity symbol] [['aiueos-inference-status-valid 2 "kotoba_aiueos_inference_status_valid"]
+                                  ['aiueos-inference-milli-tokens-per-second 2 "kotoba_aiueos_inference_milli_tokens_per_second"]
+                                  ['aiueos-model-mapping-plan 3 "kotoba_aiueos_model_mapping_plan"]
+                                  ['aiueos-model-handoff-validate 2 "kotoba_aiueos_model_handoff_validate"]
+                                  ['aiueos-device-worker-poll-response 3 "kotoba_aiueos_device_worker_poll_response"]
+                                  ['aiueos-job-protocol 5 "kotoba_aiueos_job_protocol"]
+                                  ['aiueos-micro-infer-next 3 "kotoba_aiueos_micro_infer_next"]
+                                  ['aiueos-aes128-gcm-selftest 2 "kotoba_aiueos_aes128_gcm_selftest"]]]
+      (let [object (elf64/package-kernel-object
+                    (-> (sealed-kernel :x86_64-aiueos-kernel-v1 512)
+                        (assoc :exports {entry {:offset 0 :arity arity}
+                                         'main {:offset 1 :arity 0}}
+                               :code [0xc3 0xc3])
+                        (dissoc :sha256)
+                        artifact/seal))]
+        (is (= symbol (:export object)) (str entry))))))
+
+;; The Qwen3.5 forward-pass tranche. Two things are asserted, and the second is
+;; the one that has gone wrong before (ADR-0036): the export symbol, and the
+;; FUEL WORD the packager writes into the object's context. A tier that falls
+;; through to the 1,024 default is not a compile error -- it is a prologue
+;; `ud2` on an input the object was built to handle, which surfaces as an
+;; unexpected vector 6 and reads as an arithmetic bug rather than a fuel bug.
+;;
+;; File offset 75 is where the immediate of `mov qword [r9+8], imm32` lands:
+;; 64 bytes of ELF header, then `lea r9,[rip+.data]` (7) and four opcode bytes.
+(deftest qwen35-forward-pass-objects-carry-their-measured-fuel-tiers
+  (doseq [[entry arity symbol-name fuel]
+          [['aiueos-qwen35-dot-f32     5 "kotoba_aiueos_qwen35_dot_f32"     4194304]
+           ['aiueos-qwen35-dequant-row 5 "kotoba_aiueos_qwen35_dequant_row" 16777216]
+           ['aiueos-qwen35-matvec      4 "kotoba_aiueos_qwen35_matvec"      250000000]
+           ['aiueos-qwen35-activation  5 "kotoba_aiueos_qwen35_activation"  16777216]
+           ['aiueos-qwen35-norm        5 "kotoba_aiueos_qwen35_norm"        250000000]
+           ['aiueos-qwen35-attention   4 "kotoba_aiueos_qwen35_attention"   33554432]
+           ['aiueos-qwen35-recurrent-step
+            4 "kotoba_aiueos_qwen35_recurrent_step" 4194304]
+           ;; the Bonsai Hadamard transform (aiueos ADR-0222 stage A)
+           ['aiueos-qwen35-hadamard    4 "kotoba_aiueos_qwen35_hadamard"    33554432]
+           ['aiueos-qwen35-rope        4 "kotoba_aiueos_qwen35_rope"        16777216]
+           ;; the guest browser desktop frame with text (aiueos ADR-0224)
+           ['aiueos-browser-frame2     4 "kotoba_aiueos_browser_frame2"     262144]
+           ;; the guest browser desktop input method with the dictionary (aiueos ADR-0235)
+           ['aiueos-browser-key        5 "kotoba_aiueos_browser_key"        16384]
+           ;; the guest browser desktop damage (aiueos ADR-0242)
+           ['aiueos-browser-damage     5 "kotoba_aiueos_browser_damage"     262144]]]
+    (let [artifact (-> (sealed-kernel :x86_64-aiueos-kernel-v1 512)
+                       (assoc :exports {entry {:offset 0 :arity arity}
+                                        'main {:offset 1 :arity 0}}
+                              :code [0xc3 0xc3])
+                       (dissoc :sha256)
+                       artifact/seal)
+          packaged (elf64/package-kernel-object artifact)
+          image (:bytes packaged)
+          immediate (reduce (fn [v i] (+ v (bit-shift-left (long (nth image (+ 75 i)))
+                                                           (* 8 i))))
+                            0 (range 4))]
+      (is (= symbol-name (:export packaged)) (str entry))
+      (is (= fuel immediate)
+          (str entry " must carry its own tier, not the 1024 default")))))
+
+;; aiueos C-free waves 1-2 (aiueos ADR-0219 / ADR-0220): the four objects that
+;; do not take the 1024 default carry their tier, and the four that do are
+;; asserted AT the default so a later arm cannot move them silently.
+(deftest cfree-wave-objects-carry-their-measured-fuel-tiers
+  (doseq [[entry arity symbol-name fuel]
+          [['aiueos-device-worker-poll-response 3 "kotoba_aiueos_device_worker_poll_response" 10000000]
+           ['aiueos-job-protocol 5 "kotoba_aiueos_job_protocol" 65536]
+           ['aiueos-micro-infer-next 3 "kotoba_aiueos_micro_infer_next" 4096]
+           ['aiueos-aes128-gcm-selftest 2 "kotoba_aiueos_aes128_gcm_selftest" 250000000]
+           ['aiueos-inference-status-valid 2 "kotoba_aiueos_inference_status_valid" 1024]
+           ['aiueos-inference-milli-tokens-per-second 2 "kotoba_aiueos_inference_milli_tokens_per_second" 1024]
+           ['aiueos-model-mapping-plan 3 "kotoba_aiueos_model_mapping_plan" 1024]
+           ['aiueos-model-handoff-validate 2 "kotoba_aiueos_model_handoff_validate" 1024]]]
+    (let [artifact (-> (sealed-kernel :x86_64-aiueos-kernel-v1 512)
+                       (assoc :exports {entry {:offset 0 :arity arity}
+                                        'main {:offset 1 :arity 0}}
+                              :code [0xc3 0xc3])
+                       (dissoc :sha256)
+                       artifact/seal)
+          packaged (elf64/package-kernel-object artifact)
+          image (:bytes packaged)
+          immediate (reduce (fn [v i] (+ v (bit-shift-left (long (nth image (+ 75 i)))
+                                                           (* 8 i))))
+                            0 (range 4))]
+      (is (= symbol-name (:export packaged)) (str entry))
+      (is (= fuel immediate) (str entry " fuel tier")))))
+
+;; The streaming SHA-256 tranche (aiueos ADR-0139). Same two assertions as the
+;; qwen35 test above and for the same reason -- the export symbol, and the fuel
+;; word the packager writes.
+;;
+;; A THIRD assertion here, which that one does not need: the three tiers must be
+;; DISTINCT. The whole argument for three symbols over one is that a fuel tier
+;; is a per-CALL budget and these three calls are not the same size --
+;; 30,129 for the dearest single `stream` call against 244,038,584 for a
+;; whole-megabyte `region` one. If a future edit collapsed them onto one arm,
+;; every other assertion here would still pass and the reason the split exists
+;; would be gone.
+(deftest streaming-sha256-objects-carry-their-measured-fuel-tiers
+  (let [rows [['aiueos-sha256-stream        5 "kotoba_aiueos_sha256_stream"        262144]
+              ['aiueos-sha256-region        4 "kotoba_aiueos_sha256_region"        2147483647]
+              ['aiueos-device-worker-digest 4 "kotoba_aiueos_device_worker_digest" 250000000]]]
+    (doseq [[entry arity symbol-name fuel] rows]
+      (let [artifact (-> (sealed-kernel :x86_64-aiueos-kernel-v1 512)
+                         (assoc :exports {entry {:offset 0 :arity arity}
+                                          'main {:offset 1 :arity 0}}
+                                :code [0xc3 0xc3])
+                         (dissoc :sha256)
+                         artifact/seal)
+            packaged (elf64/package-kernel-object artifact)
+            image (:bytes packaged)
+            immediate (reduce (fn [v i] (+ v (bit-shift-left (long (nth image (+ 75 i)))
+                                                             (* 8 i))))
+                              0 (range 4))]
+        (is (= symbol-name (:export packaged)) (str entry))
+        (is (= fuel immediate)
+            (str entry " must carry its own MEASURED tier, not the 1024 default"))))
+    (is (= 3 (count (set (map last rows))))
+        "the three tiers must stay distinct; one shared arm would undo the
+         reason these are three symbols rather than one")))

@@ -1,0 +1,213 @@
+(ns kotoba.native.aggregate-abi-portable-test
+  "The six deftests of `kotoba.native.aggregate-abi-test` that never needed a
+  JVM, plus the half of the seventh that did not.
+
+  One assertion in that file genuinely needs the classpath:
+  `(= abi/contract (-> \"aggregate-abi.edn\" io/resource slurp edn/read-string))`
+  — the published EDN has to be compared against the file it is published as,
+  and that needs the side which can still read the file. It stays there.
+
+  Everything else was JVM-bound only by sharing a file with it, and the deftest
+  that owned that assertion is called `published-edn-is-the-portable-contract`.
+  It asserts the contract is portable, and it could only ever run on one host.
+  The perturbations it applies — a dropped target, an ambient policy smuggled
+  in, a case limit past the boundary, a missing extraction — are refusals
+  `validate-contract!` owes on BOTH hosts, and they are here now.
+
+  `aggregate-abi` carries no reader conditional and no bit arithmetic in 309
+  lines, so the expected result is parity. Parity nobody has executed is an
+  assumption."
+  (:require #?(:clj  [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing] :include-macros true])
+            [kotoba.native.aggregate-abi :as abi]
+            [kotoba.native.machine-ir :as machine]))
+
+(def scalar-pair
+  [:record :test/pair [[:left :i64] [:ready :bool]]])
+
+(def word-record
+  [:record :test/word [[:maybe [:option :i64]] [:text :string]]])
+
+(def nested-record
+  [:record :test/nested [[:value [:record :test/inner [[:x :i64]]]]]])
+
+(def scalar-variant
+  [:variant :test/outcome [[:count :i64] [:ready :bool]]])
+
+(def aggregate-variant
+  [:variant :test/aggregate-outcome
+   [[:pair scalar-pair] [:nested nested-record] [:count :i64]]])
+
+;; The same five shapes `published-edn-is-the-portable-contract` perturbed,
+;; named so a failure says which one was admitted rather than only that one of
+;; five was.
+(def dropped-target (update abi/contract :targets dissoc :aarch64))
+(def ambient-policy (assoc-in abi/contract [:portable/record :ambient/policy] true))
+(def case-limit-past-boundary
+  (assoc-in abi/contract [:portable/variant :boundary/case-limit] 33))
+(def target-ambient-policy
+  (assoc-in abi/contract [:targets :x86-64 :ambient/policy] true))
+(def missing-extraction (update abi/contract :extracted dissoc :variant-boundary))
+
+(deftest the-contract-validates-and-every-perturbation-is-refused
+  ;; The portable half of `published-edn-is-the-portable-contract`. It ran
+  ;; against the value read off the classpath; the value it compared that to is
+  ;; `abi/contract` itself, which needs no file, so the refusals can be asked
+  ;; for on both hosts.
+  (is (= abi/contract (abi/validate-contract! abi/contract)))
+  (doseq [[what invalid]
+          [[:a dropped-target] [:b ambient-policy] [:c case-limit-past-boundary]
+           [:d target-ambient-policy] [:e missing-extraction]]]
+    (testing (str what)
+      (is (thrown? #?(:clj ExceptionInfo :cljs ExceptionInfo)
+                   (abi/validate-contract! invalid))))))
+
+(deftest scalar-record-boundary-is-one-owned-admitted-handle
+  (let [plan (abi/record-boundary-plan scalar-pair)]
+    (is (= :pair-chain-handle (:boundary/parameters plan)))
+    (is (= :pair-chain-handle (:boundary/results plan)))
+    (is (= 1 (:boundary/word-count plan)))
+    (is (= :host-context (:boundary/ownership plan)))
+    (is (= 4096 (:boundary/arena-cell-limit plan)))
+    (is (= :admitted (:boundary/extracted-admission plan))))
+  (is (= :admitted
+         (:boundary/extracted-admission
+          (abi/record-boundary-plan word-record))))
+  (let [plan (abi/record-boundary-plan nested-record)]
+    (is (= :recursive-word-handles (:boundary/field-representation plan)))
+    (is (= 32 (:boundary/max-nesting-depth plan))))
+  ;; The record with no fields is `{}` passed as an options map (amu ADR 0353
+  ;; floor :options-map-argument): the empty pair chain, still one word.
+  (is (= :admitted
+         (:boundary/extracted-admission
+          (abi/record-boundary-plan [:record :test/empty []]))))
+  (doseq [type [[:record :test/duplicate [[:x :i64] [:x :bool]]]
+                [:variant :test/v [[:x :i64]]]]]
+    (is (thrown? #?(:clj ExceptionInfo :cljs ExceptionInfo)
+                 (abi/record-boundary-plan type)) type)))
+
+
+(deftest recursive-record-boundary-is-depth-bounded
+  (let [nested (fn [depth]
+                 (reduce (fn [field-type index]
+                           [:record (keyword "test" (str "level-" index))
+                            [[:value field-type]]])
+                         :i64
+                         (range depth)))]
+    (is (= :admitted
+           (:boundary/extracted-admission
+            (abi/record-boundary-plan (nested 32)))))
+    (is (thrown? #?(:clj ExceptionInfo :cljs ExceptionInfo)
+                 (abi/record-boundary-plan (nested 33))))))
+
+
+(deftest scalar-variant-boundary-is-one-owned-checked-handle
+  (let [plan (abi/variant-boundary-plan scalar-variant)]
+    (is (= :pair-tag-payload-handle (:boundary/parameters plan)))
+    (is (= :pair-tag-payload-handle (:boundary/results plan)))
+    (is (= :zero-based-declaration-ordinal (:boundary/tag plan)))
+    (is (= [:count :ready] (:boundary/cases plan)))
+    (is (= [:i64 :bool] (:boundary/payload-schemas plan)))
+    (is (= #{:i64 :bool :record :handle} (:boundary/payload-types plan)))
+    (is (= #{0 1} (:boundary/bool-words plan)))
+    (is (= :admitted (:boundary/extracted-admission plan))))
+  (let [plan (abi/variant-boundary-plan aggregate-variant)]
+    (is (abi/aggregate-payload-variant-type? aggregate-variant))
+    (is (= [scalar-pair nested-record :i64]
+           (:boundary/payload-schemas plan)))
+    (is (= :recursive-word-handles
+           (:boundary/payload-representation plan)))
+    (is (= 32 (:boundary/max-payload-nesting-depth plan))))
+  (doseq [type [[:variant :unqualified [[:x :i64]]]
+                [:variant :test/empty []]
+                [:variant :test/duplicate [[:x :i64] [:x :bool]]]
+                [:variant :test/unknown-payload [[:x :banana]]]
+                [:variant :test/unqualified-ref [[:x [:ref :node]]]]
+                [:variant :test/wide (mapv (fn [n] [(keyword (str "c" n)) :i64]) (range 33))]
+                [:record :test/not-variant [[:x :i64]]]]]
+    (is (thrown? #?(:clj ExceptionInfo :cljs ExceptionInfo)
+                 (abi/variant-boundary-plan type)) type)))
+
+;; ABI v8: a variant payload is any one-word handle, so a type may name itself.
+(def tree
+  [:variant :test/node [[:leaf :i64]
+                        [:branch [:vector [[:ref :test/node] [:ref :test/node]]]]]])
+
+(deftest recursive-and-generic-payloads-are-one-word-handles
+  (doseq [type [tree
+                [:variant :test/text [[:x :string]]]
+                [:variant :test/maybe [[:some [:option [:ref :test/node]]] [:none :i64]]]
+                [:variant :test/nest [[:inner scalar-variant] [:n :i64]]]]]
+    (is (= :admitted (:boundary/extracted-admission (abi/variant-boundary-plan type))) type)
+    (is (abi/aggregate-payload-variant-type? type) type))
+  (is (not (abi/aggregate-payload-variant-type? scalar-variant)))
+  (is (abi/hetero-vector-type? [:vector [[:ref :test/node] :i64]]))
+  (is (abi/scalar-record-type? [:record :test/cell [[:head :i64] [:tail [:ref :test/list]]]]))
+  (is (abi/scalar-record-type? [:record :test/holder [[:tree tree]]]))
+  (doseq [type [[:vector []]
+                [:vector (vec (repeat 33 :i64))]
+                [:vector [:banana]]
+                [:vector :i64]]]
+    (is (not (abi/hetero-vector-type? type)) type)))
+
+
+(deftest every-allocator-register-is-call-clobbered
+  (doseq [target [:x86-64 :aarch64]]
+    (let [{:keys [allocator-registers return-register call-clobbers]}
+          (abi/call-profile target)]
+      (is (= :all-allocator-registers call-clobbers) target)
+      (is (contains? (set allocator-registers) return-register) target)))
+  (is (thrown? #?(:clj ExceptionInfo :cljs ExceptionInfo) (abi/call-profile :riscv64))))
+
+
+(deftest scalar-call-admission-requires-all-versioned-guarantees
+  (testing "missing preservation facts are named"
+    (try
+      (abi/admit-extracted-call! :x86-64 #{:per-function-frame})
+      (is false "call must fail without every guarantee")
+      (catch #?(:clj ExceptionInfo :cljs ExceptionInfo) error
+        (is (= :missing-call-guarantees (:problem (ex-data error))))
+        (is (= #{:spill-live-values-across-call
+                 :parallel-argument-assignment
+                 :single-word-return-register}
+               (get-in (ex-data error) [:value :missing]))))))
+  (testing "the complete scalar call proof returns the target profile"
+    (is (= :all-allocator-registers
+           (:call-clobbers
+            (abi/admit-extracted-call!
+             :aarch64
+             #{:per-function-frame
+               :spill-live-values-across-call
+               :parallel-argument-assignment
+               :single-word-return-register})))))
+  (testing "standalone expressions still report the module boundary"
+    (try
+      (machine/lower-kir-expression ['x] '(callee x))
+      (is false "call-shaped KIR must not enter GMIR")
+      (catch #?(:clj ExceptionInfo :cljs ExceptionInfo) error
+        (is (= :aggregate-abi (:phase (ex-data error))))
+        (is (= :call-abi-not-admitted (:problem (ex-data error)))))))
+  (is (not (machine/pilot-expression? ['x] '(callee x)))))
+
+
+(deftest callable-and-linkage-admission-is-closed-and-bounded
+  (let [{:keys [callable-dispatch linkage]} (:extracted abi/contract)]
+    (is (= :closed-ordinal-dispatch (:indirect callable-dispatch)))
+    (is (= :bounded-pair-chain (:apply callable-dispatch)))
+    (is (= 4 (:max-apply-arguments callable-dispatch)))
+    (is (false? (:arbitrary-address callable-dispatch)))
+    (is (= :closed-module-graph (:mode linkage)))
+    (is (false? (:ambient-symbols linkage)))
+    (is (false? (:unresolved-symbols linkage))))
+  (let [evidence {:mode :closed-module-graph
+                  :module-graph-digest (apply str (repeat 64 "a"))
+                  :unresolved-symbols #{}
+                  :ambient-symbols false}]
+    (is (= evidence (abi/admit-closed-linkage! evidence)))
+    (doseq [invalid [(assoc evidence :unresolved-symbols #{'missing})
+                     (assoc evidence :ambient-symbols true)
+                     (assoc evidence :module-graph-digest "not-a-digest")
+                     (dissoc evidence :unresolved-symbols)]]
+      (is (thrown-with-msg? #?(:clj ExceptionInfo :cljs ExceptionInfo)
+                            #"unsealed-external-linkage"
+                            (abi/admit-closed-linkage! invalid))))))

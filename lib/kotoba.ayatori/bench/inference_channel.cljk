@@ -1,0 +1,197 @@
+#!/usr/bin/env kbb
+;; bench/inference_channel.cljk — what a caller learns about data it cannot
+;; read one value of.
+;;
+;; ADR-2609108000 (com-junkawasaki/root) says: measure the channel before
+;; adding a defence. This is that measurement, and it exists because
+;; `default-max-datoms` is a RESOURCE bound, not a privacy bound -- the two
+;; were being read as one thing.
+;;
+;; The shape under test is structural, not a mistake:
+;;
+;;   materialize : [store coll-keys]  |  [store coll-keys max-datoms]
+;;                  ^ no visible? in either arity
+;;
+;; `visible?` is applied by `q` OVER the materialized plane. That is safe for
+;; VALUES -- the ns docstring is right, and section C proves it. It is not a
+;; statement about CARDINALITY, and the ceiling that bounds the scan reports
+;; the cardinality it refused at, in `ex-data`, before any visibility
+;; decision has been made.
+;;
+;; Every section states what it would take to make it fail, and the run
+;; returns a COUNT of failures (a boolean cannot tell one regression from a
+;; broken build).
+;;
+;; Run:
+;;   kbb --backend sci --classpath "$(cat /path/to/cp.txt)" bench/inference_channel.cljk
+
+(ns inference-channel
+  (:require [kotobase.local :as local]
+            [kotobase.store :as st]
+            [kotobase.query.bridge :as bridge]))
+
+;; ------------------------------------------------------------------ fixture
+
+(def ^:private public-docs
+  {"d1" {:name "Engineering" :budget 900000}
+   "d2" {:name "Sales" :budget 400000}})
+
+;; The collection the caller holds no capability for. Field counts differ per
+;; document on purpose: a uniform shape would let section E pass by accident.
+(def ^:private clinical-docs
+  {"p1" {:patient "Alice" :diagnosis "C50" :stage 2 :clinician "dr-ito"}
+   "p2" {:patient "Bob" :diagnosis "E11"}
+   "p3" {:patient "Carol" :diagnosis "C50" :stage 4 :clinician "dr-ito" :trial "T-19"}})
+
+(defn- build [clinical]
+  (let [s (local/local-store)]
+    (doseq [[k v] public-docs] (st/-put s "departments" k v))
+    (doseq [[k v] clinical] (st/-put s "clinical" k v))
+    s))
+
+;; The policy: nothing in the `clinical` collection is visible, ever.
+;; `visible?` sees {:s :p :o}; entities are keyword `coll/key`.
+(defn- policy [{:keys [s]}]
+  (not= "clinical" (namespace s)))
+
+(def ^:private everything (constantly true))
+
+;; ------------------------------------------------------------------- probes
+
+(defn- refused?
+  "One probe: does materialize refuse this collection at this ceiling?
+  Returns the ex-data on refusal, nil when it completed."
+  [store colls cap]
+  (try (bridge/materialize store colls cap) nil
+       (catch :default e
+         (let [d (ex-data e)]
+           (when (= :materialize-over-budget (:kotobase.query/error d)) d)))))
+
+(defn- ground-truth
+  "The number this caller must not be able to learn, computed the way only an
+  authorized reader could: materialize with the ceiling out of the way and
+  count the datoms actually in the plane."
+  [store colls]
+  (let [db (bridge/materialize store colls 1000000)]
+    (reduce + (for [[_ attrs] (:eavt db) [_ os] attrs] (count os)))))
+
+(defn- recover
+  "Binary-search the exact datom count using ONLY the refuse/complete bit.
+  Returns [n probes]. The predicate is (> n cap), so the smallest cap that
+  does not refuse IS n."
+  [store colls hi]
+  (loop [lo 0 hi hi probes 0]
+    (if (>= lo hi)
+      [lo probes]
+      (let [mid (quot (+ lo hi) 2)]
+        (if (refused? store colls mid)
+          (recur (inc mid) hi (inc probes))
+          (recur lo mid (inc probes)))))))
+
+;; -------------------------------------------------------------------- report
+
+(def ^:private failures (atom 0))
+
+(defn- check! [label ok? detail]
+  (when-not ok? (swap! failures inc))
+  (println (if ok? "  ok  " "  FAIL") label "—" detail))
+
+(defn -main []
+  (let [with    (build clinical-docs)
+        without (build (dissoc clinical-docs "p3"))
+        colls   ["departments" "clinical"]]
+
+    (println "\n=== C. control — the values ARE hidden ===")
+    (println "If this section does not hold, nothing below means anything:")
+    (println "a caller who can read the rows learns the counts trivially.")
+    (let [db (bridge/materialize with colls)
+          rows (bridge/q db '{:find [?s ?d] :where [[?s :diagnosis ?d]]} policy)
+          attrs (bridge/entity-attrs db :clinical/p1 policy)
+          seen  (bridge/q db '{:find [?s ?n] :where [[?s :name ?n]]} policy)]
+      (check! "no clinical row is readable" (= #{} rows) (str "q -> " (pr-str rows)))
+      (check! "clinical entity is pruned, not emptied" (= {} attrs)
+              (str "entity-attrs :clinical/p1 -> " (pr-str attrs)))
+      (check! "the policy is not simply refusing everything" (seq seen)
+              (str (count seen) " public row(s) still readable")))
+
+    (when (pos? @failures)
+      (println "\nREFUSING to report the channel: the control did not hold.")
+      (js/process.exit 2))
+
+    (println "\n=== A. one call, and the ceiling names the cardinality ===")
+    (let [d (refused? with ["clinical"] 1)]
+      (check! "materialize refuses at cap 1" (some? d) (pr-str d))
+      (check! "ex-data carries a datom count of hidden data"
+              (and d (pos? (:datoms d)))
+              (str ":datoms " (:datoms d) " :collection " (pr-str (:collection d))
+                   " — disclosed with visible? never consulted")))
+
+    (println "\n=== B. exact totals, by the refuse/complete bit alone ===")
+    (let [truth-c (ground-truth with ["clinical"])
+          [got-c probes-c] (recover with ["clinical"] 4096)
+          truth-a (ground-truth with colls)
+          [got-a probes-a] (recover with colls 4096)]
+      (check! "exact clinical datom count recovered" (= truth-c got-c)
+              (str got-c " recovered in " probes-c " probes (truth " truth-c ")"))
+      (check! "exact whole-store datom count recovered" (= truth-a got-a)
+              (str got-a " recovered in " probes-a " probes (truth " truth-a ")"))
+      (println "  note  the caller supplied max-datoms, i.e. reached the 3-arity."))
+
+    (println "\n=== B2. the 2-arity discloses the count at the FIXED ceiling ===")
+    (println "  A wire surface that never lets a caller name max-datoms is not")
+    (println "  therefore silent: the built-in ceiling is a threshold like any")
+    (println "  other, and the refusal reports the running total that crossed it.")
+    (println "  Two stores either side of" bridge/default-max-datoms "datoms, 2-arity only.")
+    (let [mk (fn [n] (let [s (local/local-store)]
+                       (dotimes [i n] (st/-put s "clinical" (str "p" i) {:a 1 :b 2}))
+                       s))
+          ;; 4 datoms per doc (:a :b :kotobase/coll :kotobase/key).
+          per-doc 4
+          at   (mk (quot bridge/default-max-datoms per-doc))        ; exactly at
+          over (mk (inc (quot bridge/default-max-datoms per-doc)))  ; one doc past
+          d-at   (try (bridge/materialize at ["clinical"]) nil
+                      (catch :default e (ex-data e)))
+          d-over (try (bridge/materialize over ["clinical"]) nil
+                      (catch :default e (ex-data e)))]
+      (check! "a store exactly at the ceiling completes" (nil? d-at)
+              (str bridge/default-max-datoms " datoms — the boundary of the built-in cap"))
+      (check! "one document past it refuses, and names the total" (some? d-over)
+              (str ":datoms " (:datoms d-over) " — an exact count, from a caller"
+                   " that named no cap and read no value")))
+
+    (println "\n=== D. one-bit existence oracle for a named individual ===")
+    (println "  Two stores differing only by whether Carol has a clinical record.")
+    (let [[n-with _]    (recover with ["clinical"] 4096)
+          [n-without _] (recover without ["clinical"] 4096)]
+      (check! "presence of one hidden record changes the recovered count"
+              (not= n-with n-without)
+              (str "with=" n-with " without=" n-without " delta=" (- n-with n-without)
+                   " — the delta is Carol's field count, and no value of hers was read")))
+
+    (println "\n=== E. per-document field count, by differencing ===")
+    (let [base (recover without ["clinical"] 4096)
+          full (recover with ["clinical"] 4096)
+          delta (- (first full) (first base))
+          ;; +2: materialize always asserts :kotobase/coll and :kotobase/key
+          fields (- delta 2)]
+      (check! "Carol's field count is recoverable exactly"
+              (= fields (count (get clinical-docs "p3")))
+              (str "recovered " fields " fields, actual "
+                   (count (get clinical-docs "p3")))))
+
+    (println "\n=== F. boundary — the probe that pins the comparison ===")
+    (println "  The refusal is (> n max-datoms). A cap exactly AT n must not")
+    (println "  refuse; one below must. Flip the operator to >= and the first")
+    (println "  of these two flips. Without this pair the operator is invisible.")
+    (let [n (ground-truth with ["clinical"])]
+      (check! "cap exactly at n completes" (nil? (refused? with ["clinical"] n))
+              (str "cap=" n " (== n)"))
+      (check! "cap one below n refuses" (some? (refused? with ["clinical"] (dec n)))
+              (str "cap=" (dec n) " (n-1)")))
+
+    (println "\n---")
+    (println "PROBES are the unit here, not wall clock.")
+    (println "FAILURES=" @failures)
+    (js/process.exit (if (pos? @failures) 1 0))))
+
+(-main)

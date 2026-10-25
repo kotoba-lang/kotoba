@@ -1,0 +1,175 @@
+#!/usr/bin/env kbb
+;; bench/commit_packs.cljk — Co-Scientist iteration 03: the write policy itself.
+;;
+;; Iteration 02 measured the many-pack regime by SPLITTING one snapshot into P
+;; packs. That answers "what does a query pay when blocks are spread over P
+;; packs", and it is not the shape ADR-2608160100 proposes. The proposal is
+;; ONE COMMIT, ONE PACK, and a commit is not a shard: it writes only NOVELTY,
+;; and a prolly tree shares every subtree it did not change. So the blocks a
+;; query touches at commit N were written across commits 1..N, in whatever
+;; proportion the tree's sharing produced -- not in equal slices.
+;;
+;; This builds real successive commits (`arr/commit!` with `prev`), packs each
+;; commit's newly-written blocks, and asks the same query of the head.
+;;
+;; ## Two things iteration 02 left unpriced, and this one prices
+;;
+;; 1. The CATALOG. Both earlier benches used an in-memory map for CID -> pack,
+;;    which a deployment does not have: ADR-2608160100 puts the pack catalog on
+;;    the datom plane, so the FIRST lookup of a pack is a request. `--catalog`
+;;    counts it. Reporting the optimistic figure alone would be reporting a
+;;    deployment nobody can build.
+;; 2. Whether a commit is big enough to be worth a pack at all. Iteration 02's
+;;    rule is `blocks-read / packs-opened > 2`; this measures what that ratio
+;;    actually is when the packs are commits.
+;;
+;; Round trips, never wall clock. Both arms answer the same query over the same
+;; head and the harness exits 2 if they disagree.
+;;
+;; Run:
+;;   kbb --backend sci --classpath "$(cat bin/classpath.txt)" bench/commit_packs.cljk
+
+(ns commit-packs
+  (:require [arrangement.core :as arr]
+            [ayatori.pack :as pack]
+            [ayatori.remote :as remote]
+            [kotoba.lang.text :as str]
+            [ipld.car.bytes :as b]
+            [ipld.car.v2 :as car2]))
+
+(defn- blind [x] (pr-str x))
+(defn- crypto [bytes] bytes)
+(defn- blind-async [x] (js/Promise.resolve (pr-str x)))
+(defn- crypto-async [bytes] (js/Promise.resolve bytes))
+
+(def ^:private query
+  '{:find [?s ?name] :where [[?s "kind" "rare"] [?s "name" ?name]]})
+
+(defn- quads-for
+  "Subjects [from, to). The three rare ones are in the FIRST commit, so the
+   answer is fixed while history grows -- and so the query is forced to reach
+   back to the oldest commit, which is the case a chain of packs exists for."
+  [from to]
+  (vec (mapcat (fn [i]
+                 [{:s (str "s" i) :p "kind" :o (if (< i 3) "rare" "common")}
+                  {:s (str "s" i) :p "name" :o (str "Subject " i)}])
+               (range from to))))
+
+(defn- build-history
+  "`n-commits` successive commits of `per-commit` subjects each, threaded by
+   `prev`. Returns the head CID, all blocks, and the block set each commit
+   NEWLY wrote -- which is what one-commit-one-pack would seal."
+  [n-commits per-commit]
+  (let [blocks (atom {})
+        put! (fn [cid bytes] (swap! blocks assoc cid bytes) (js/Promise.resolve cid))]
+    (letfn [(step [i prev db groups]
+              (if (= i n-commits)
+                (js/Promise.resolve {:head prev :blocks blocks :groups groups})
+                (let [before (set (keys @blocks))
+                      db' (reduce arr/assert-quad db
+                                  (quads-for (* i per-commit) (* (inc i) per-commit)))]
+                  (-> (arr/commit! put! db' prev arr/current-schema-version
+                                   blind-async crypto-async)
+                      (.then (fn [cid]
+                               (let [added (remove before (keys @blocks))]
+                                 (step (inc i) cid db' (conj groups (vec added))))))))))]
+      (step 0 nil (arr/empty-db) []))))
+
+(defn- per-object-arm [{:keys [head blocks]}]
+  (let [disc (atom 0) reads (atom 0) bytes (atom 0)
+        opened (remote/open-snapshot
+                {:snapshot-cid head
+                 :discover-fn (fn [cid] (swap! disc inc)
+                                {:ok? true :cid cid :mutates-cid? false
+                                 :providers [{:plane :discovery :cid cid :peer "p"
+                                              :addrs [] :mutates-cid? false}]})
+                 :fetch-fn (fn [_ cid] (swap! reads inc)
+                             (let [by (get @blocks cid)]
+                               (swap! bytes + (if by (b/bcount by) 0)) by))
+                 :blind-fn blind :decrypt-fn crypto})]
+    {:rows (count (remote/q opened query (constantly true)))
+     :round-trips (+ @disc @reads) :bytes @bytes :reads @reads}))
+
+(defn- packed-arm
+  "One pack per commit. `catalog?` charges one request the first time a pack is
+   looked up, which is what a datom-plane catalog costs."
+  [{:keys [head blocks groups]} catalog?]
+  (let [archives (mapv (fn [g]
+                         (:bytes (car2/pack {:roots [head]
+                                             :blocks (mapv (fn [cid] {:cid cid :bytes (get @blocks cid)}) g)})))
+                       groups)
+        catalog (into {} (mapcat (fn [i g] (map (fn [cid] [cid i]) g)) (range) groups))
+        reads (atom 0) bytes (atom 0) opens (atom 0)
+        catalog-reads (atom 0) seen-packs (atom #{}) cache (atom {})
+        range-fn-for (fn [archive]
+                       (fn [{:keys [range]}]
+                         (swap! reads inc)
+                         (let [[_ from to] (re-matches #"bytes=(\d+)-(\d*)" range)
+                               start (js/parseInt from 10) total (b/bcount archive)
+                               end (if (seq to) (min total (inc (js/parseInt to 10))) total)
+                               slice (b/slice archive start (min end total))]
+                           (swap! bytes + (b/bcount slice)) slice)))
+        pack-for (fn [i]
+                   (or (get @cache i)
+                       (let [op (pack/open-pack
+                                 {:range-fn (range-fn-for (nth archives i))
+                                  :profile {:blocks :packed-blocks :object #{:range-read}}})]
+                         (swap! opens inc) (swap! cache assoc i op) op)))
+        opened (remote/open-snapshot
+                {:snapshot-cid head
+                 :discover-fn (fn [cid] {:ok? true :cid cid :mutates-cid? false
+                                         :providers [{:plane :discovery :cid cid :peer "p"
+                                                      :addrs [] :mutates-cid? false}]})
+                 :fetch-fn (fn [_ _] nil)
+                 :block-source (fn [cid]
+                                 (when-let [i (get catalog cid)]
+                                   (when (and catalog? (not (contains? @seen-packs i)))
+                                     (swap! catalog-reads inc)
+                                     (swap! seen-packs conj i))
+                                   (pack/read-block (pack-for i) cid)))
+                 :blind-fn blind :decrypt-fn crypto})]
+    {:rows (count (remote/q opened query (constantly true)))
+     :round-trips (+ @reads @catalog-reads) :bytes @bytes
+     :reads @reads :catalog-reads @catalog-reads :packs-opened @opens
+     :packs (count groups)}))
+
+(defn- fmt [& xs] (str/join (map (fn [[w v]] (.padStart (str v) w)) (partition 2 xs))))
+
+(defn -main []
+  (println)
+  (println "ayatori Co-Scientist 03 — one commit, one pack. Counted, not timed.")
+  (println "the three rare subjects are in the FIRST commit, so the query reaches the oldest one")
+  (println)
+  (println (fmt 9 "commits" 8 "per" 8 "blocks" 6 "rows" 12 "per-object"
+                9 "packs" 8 "opened" 8 "reads" 9 "catalog" 8 "total" 9 "N/P" 10 "vs"))
+  (println (str/join (repeat 116 "-")))
+  (-> (reduce
+       (fn [pr [n-commits per-commit]]
+         (.then pr
+                (fn [_]
+                  (-> (build-history n-commits per-commit)
+                      (.then
+                       (fn [h]
+                         (let [a (per-object-arm h)
+                               p (packed-arm h true)]
+                           (when-not (= (:rows a) (:rows p) 3)
+                             (println "REFUSING: arms disagree —" (:rows a) "vs" (:rows p))
+                             (js/process.exit 2))
+                           (println (fmt 9 n-commits 8 per-commit
+                                         8 (count @(:blocks h)) 6 (:rows a)
+                                         12 (:round-trips a)
+                                         9 (:packs p) 8 (:packs-opened p)
+                                         8 (:reads p) 9 (:catalog-reads p)
+                                         8 (:round-trips p)
+                                         9 (.toFixed (/ (:reads p) (max 1 (:packs-opened p))) 2)
+                                         10 (str (.toFixed (/ (:round-trips a) (:round-trips p)) 2) "x")))
+                           nil)))))))
+       (js/Promise.resolve nil)
+       [[1 800] [2 400] [4 200] [8 100] [16 50] [32 25]])
+      (.then (fn [_]
+               (println)
+               (println "N/P = blocks read per pack opened. Iteration 02: packing wins above 2.")
+               (println "catalog = one datom-plane request the first time each pack is located.")))
+      (.catch (fn [e] (println "FAILED:" (.-message e)) (js/process.exit 2)))))
+
+(-main)

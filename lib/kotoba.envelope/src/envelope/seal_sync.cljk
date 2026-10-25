@@ -1,0 +1,380 @@
+(ns envelope.seal-sync
+  "Synchronous ClojureScript byte backend for the same envelope wire format as
+  `envelope.seal` (Web Crypto, Promises) and `envelope.seal-jvm` (JCA).
+
+  It exists for callers that are synchronous by construction and run on a
+  Node-compatible host without a JVM: kbb/nbb command-line clients (a Git
+  remote helper, `bonsai.private-repo`), where every function answering a
+  Promise would turn a synchronous API into an asynchronous one. Its surface
+  is `envelope.seal-jvm`'s, function for function, so a `.cljk` caller can
+  require `#?(:clj envelope.seal-jvm :cljs envelope.seal-sync)` and change
+  nothing else. It adds what `seal-jvm` does not have: the hybrid
+  `:x25519+ml-kem-768` wraps, opened and created.
+
+  ## Where each primitive comes from, and why
+
+  - **X25519: `kotoba-lang/org-signal`** (`kotoba.signal.x25519`, audited
+    @noble/curves), the same call `envelope.seal` makes. This repo's rule is
+    that a second X25519 in the workspace is a second one to get wrong, so
+    `org-ietf-x25519` -- portable, but by its own docstring not
+    constant-time -- is not used here.
+  - **ML-KEM-768: `envelope.kem`**, i.e. the one @noble/post-quantum binding
+    `envelope.qualify` measures for `evaluate-pq-provider`. The hybrid
+    transcript is `kem/combiner-input`, the same definition the async
+    backend hashes, so the two cannot drift.
+  - **AES-256-GCM, HMAC-SHA256 (under HKDF) and randomness: `node:crypto`**
+    (OpenSSL).
+    org-signal's ClojureScript HKDF is Web Crypto and answers a Promise, and
+    Web Crypto has no synchronous AES-GCM. On Node, Web Crypto IS this
+    OpenSSL, so the async backend and this one compute AES and HKDF with the
+    same provider through different doors. The portable alternatives were
+    rejected on the rules this workspace already wrote down:
+    `kotoba-lang/security` keeps its own AEAD/HKDF platform-native
+    (\"no hand-rolled cipher/MAC\"), its crypto inventory names AES-256-GCM
+    by a platform provider (`qualification/crypto-policy.edn`, `:jca`), and
+    `org-nist-aes` says of itself that a table-lookup AES is not
+    constant-time and not for a process whose cache an attacker can
+    measure. A synchronous HKDF belongs in org-signal; until it has one, the
+    host's is used rather than a third implementation written here.
+  - **Randomness** is `node:crypto` `randomBytes` for content keys and IVs,
+    and `crypto.getRandomValues` (inside @noble) for X25519 and ML-KEM keys:
+    a CSPRNG everywhere, never a PRNG.
+
+  Bytes are Uint8Array in and out, as in `envelope.seal`. Failures throw
+  (synchronously) where `envelope.seal` rejects: a tampered ciphertext, a
+  wrong key, a wrong AAD, a hybrid entry without its ML-KEM key, a classical
+  wrap presented as a hybrid one or the reverse. Which construction opens an
+  entry is read off the entry, never negotiated."
+  (:require #?@(:cljs [["node:crypto" :as crypto]
+                       [envelope.model :as m]
+                       [envelope.kem :as kem]
+                       [kotoba.signal.x25519 :as x25519]])))
+
+#?(:cljs
+   (do
+     (def ^:private wrap-info "kotoba/envelope/v1 wrap")
+     (def ^:private symmetric-wrap-info "kotoba/envelope/v1 symmetric-wrap")
+     (def content-key-bytes 32)
+     (def ^:private tag-bytes 16)
+
+     ;; ------------------------------------------------------------ bytes
+
+     (defn- as-bytes
+       "Uint8Array of `v`. Int8Array (kotoba.bytes' host bytes on kbb) and
+        byte vectors are read as unsigned octets, mod 256."
+       [v]
+       (cond
+         (instance? js/Uint8Array v) v
+         (instance? js/Int8Array v) (js/Uint8Array. (.-buffer v) (.-byteOffset v) (.-length v))
+         :else (js/Uint8Array.from (clj->js (vec v)))))
+
+     (defn- u8 [^js buf] (js/Uint8Array. (.-buffer buf) (.-byteOffset buf) (.-length buf)))
+
+     (defn utf8 [s] (.encode (js/TextEncoder.) s))
+
+     (defn b64url
+       "Unpadded base64url, as `envelope.seal/b64url` and `envelope.seal-jvm/b64url`."
+       [bs]
+       (.toString (js/Buffer.from (as-bytes bs)) "base64url"))
+
+     (defn unb64url [s] (u8 (js/Buffer.from s "base64url")))
+
+     (defn- concat-bytes [& parts]
+       (u8 (js/Buffer.concat (clj->js (map as-bytes parts)))))
+
+     (defn- random-bytes [n] (u8 (crypto/randomBytes n)))
+
+     ;; ----------------------------------------------------------- AES-GCM
+
+     (defn- gcm-encrypt
+       "ciphertext || 16-byte tag, the layout Web Crypto and JCA both emit."
+       [key iv plaintext aad]
+       (let [c (crypto/createCipheriv "aes-256-gcm" (as-bytes key) (as-bytes iv)
+                                      #js {:authTagLength tag-bytes})]
+         (.setAAD c (as-bytes aad))
+         (let [head (.update c (as-bytes plaintext))
+               tail (.final c)]
+           (concat-bytes head tail (.getAuthTag c)))))
+
+     (defn- gcm-decrypt
+       "Inverse of `gcm-encrypt`. Throws if the tag does not verify; nothing
+        decrypted is returned before it has."
+       [key iv sealed aad]
+       (let [sealed (as-bytes sealed)
+             n (- (.-length sealed) tag-bytes)]
+         (when (neg? n)
+           (throw (ex-info "AES-GCM input shorter than its tag"
+                           {:reason :too-short-for-a-tag :length (.-length sealed)})))
+         (let [d (crypto/createDecipheriv "aes-256-gcm" (as-bytes key) (as-bytes iv)
+                                          #js {:authTagLength tag-bytes})]
+           (.setAAD d (as-bytes aad))
+           (.setAuthTag d (.subarray sealed n))
+           (let [head (.update d (.subarray sealed 0 n))
+                 tail (.final d)]
+             (concat-bytes head tail)))))
+
+     ;; -------------------------------------------------------------- HKDF
+
+     (defn- hmac-sha256 [key data]
+       (u8 (-> (crypto/createHmac "sha256" (as-bytes key)) (.update (as-bytes data)) (.digest))))
+
+     (defn- hkdf
+       "HKDF-SHA256 (RFC 5869) as extract-then-expand over the host's HMAC --
+        the composition org-signal's HKDF is on both of its runtimes (javax
+        Mac; Web Crypto HMAC), here over node:crypto's. A nil salt is HashLen
+        zero bytes.
+
+        Not `crypto/hkdfSync`: OpenSSL caps HKDF `info` at 1024 bytes, and the
+        hybrid combiner's info carries the 1088-byte ML-KEM ciphertext (1181
+        bytes in all, measured), so hkdfSync refuses exactly the derivation
+        the post-quantum wrap depends on."
+       [salt ikm info length]
+       (let [prk (hmac-sha256 (if salt (as-bytes salt) (js/Uint8Array. 32)) ikm)
+             info (as-bytes info)]
+         (when (> length (* 255 32))
+           (throw (ex-info "HKDF-SHA256 output longer than 255 blocks" {:length length})))
+         (loop [i 1 prev (js/Uint8Array. 0) out (js/Uint8Array. 0)]
+           (if (>= (.-length out) length)
+             (.slice out 0 length)
+             (let [t (hmac-sha256 prk (concat-bytes prev info (js/Uint8Array.of i)))]
+               (recur (inc i) t (concat-bytes out t)))))))
+
+     ;; ----------------------------------------------------- content keys
+
+     (defn generate-content-key [] (random-bytes content-key-bytes))
+
+     (defn generate-recipient
+       "A raw X25519 keypair, `{:priv :pub}`, as `envelope.seal-jvm/generate-recipient`."
+       []
+       (x25519/generate-keypair))
+
+     (defn generate-hybrid-recipient
+       "`{:priv :pub :pq-priv :pq-pub}`: an X25519 keypair and an ML-KEM-768
+        keypair. A hybrid recipient publishes both public halves."
+       []
+       (let [x (x25519/generate-keypair)
+             pq (kem/generate-keypair)]
+         {:priv (:priv x) :pub (:pub x) :pq-priv (:priv pq) :pq-pub (:pub pq)}))
+
+     (defn seal-chunk [env content-key i plaintext]
+       (gcm-encrypt content-key
+                    (m/chunk-nonce (m/chunk-epoch env i) i)
+                    plaintext
+                    (utf8 (m/chunk-aad env i))))
+
+     (defn open-chunk [env content-key i ciphertext]
+       (gcm-decrypt content-key
+                    (m/chunk-nonce (m/chunk-epoch env i) i)
+                    ciphertext
+                    (utf8 (m/chunk-aad env i))))
+
+     ;; ---------------------------------------------------------- key wrap
+
+     (defn- key-bytes [k] (if (string? k) (unb64url k) (as-bytes k)))
+
+     (defn- wrap-key-from-dh [shared eph-pub recipient-pub]
+       (hkdf nil shared (concat-bytes (utf8 wrap-info) eph-pub recipient-pub)
+             content-key-bytes))
+
+     (defn wrap-bytes
+       "Wrap `plaintext` to one X25519 public key under `aad`. The ECIES
+        construction of `envelope.seal/wrap-bytes`; the map it returns opens
+        there, and theirs opens here."
+       [plaintext pub aad]
+       (let [recipient-pub (key-bytes pub)
+             {eph-priv :priv eph-pub :pub} (x25519/generate-keypair)
+             shared (x25519/dh eph-priv recipient-pub)
+             iv (random-bytes m/nonce-bytes)]
+         {:wrap/pub (b64url recipient-pub)
+          :wrap/ephemeral-pub (b64url eph-pub)
+          :wrap/iv (b64url iv)
+          :wrap/wrapped (b64url (gcm-encrypt (wrap-key-from-dh shared eph-pub recipient-pub)
+                                             iv plaintext (utf8 aad)))}))
+
+     (defn unwrap-bytes
+       "Inverse of `wrap-bytes`. A map that declares a KEM is refused: it is a
+        hybrid wrap, and opening it classically is the downgrade."
+       [{:keys [:wrap/kem :wrap/pub :wrap/ephemeral-pub :wrap/iv :wrap/wrapped]} priv aad]
+       (when (some? kem)
+         (throw (ex-info "wrap declares a KEM; refusing to open it classically"
+                         {:wrap/kem kem})))
+       (let [eph-pub (unb64url ephemeral-pub)
+             shared (x25519/dh (key-bytes priv) eph-pub)]
+         (gcm-decrypt (wrap-key-from-dh shared eph-pub (unb64url pub))
+                      (unb64url iv) (unb64url wrapped) (utf8 aad))))
+
+     (defn- hybrid-wrap-key
+       [{:keys [x-shared pq-shared]} eph-pub recipient-pub pq-ct]
+       (let [{:keys [ikm info]} (kem/combiner-input x-shared pq-shared eph-pub
+                                                    recipient-pub pq-ct)]
+         (hkdf nil ikm info kem/wrap-key-bytes)))
+
+     (defn wrap-bytes-hybrid
+       "Wrap `plaintext` to a hybrid recipient `{:pub :pq-pub}` under `aad`.
+        The construction of `envelope.seal/wrap-bytes-hybrid`."
+       [plaintext {:keys [pub pq-pub]} aad]
+       (let [recipient-pub (key-bytes pub)
+             recipient-pq (key-bytes pq-pub)
+             {:keys [ephemeral-pub pq-ct] :as shared}
+             (kem/encapsulate-shared {:pub recipient-pub :pq-pub recipient-pq})
+             iv (random-bytes m/nonce-bytes)]
+         {:wrap/kem m/hybrid-kem
+          :wrap/pub (b64url recipient-pub)
+          :wrap/pq-pub (b64url recipient-pq)
+          :wrap/ephemeral-pub (b64url ephemeral-pub)
+          :wrap/pq-ct (b64url pq-ct)
+          :wrap/iv (b64url iv)
+          :wrap/wrapped (b64url (gcm-encrypt (hybrid-wrap-key shared ephemeral-pub
+                                                              recipient-pub pq-ct)
+                                             iv plaintext (utf8 aad)))}))
+
+     (defn unwrap-bytes-hybrid
+       "Inverse of `wrap-bytes-hybrid`. `keys` is `{:priv :pq-priv}`. A wrap
+        that does not declare the hybrid KEM is refused, never opened the
+        classical way."
+       [{:keys [:wrap/kem :wrap/pub :wrap/ephemeral-pub :wrap/pq-ct :wrap/iv :wrap/wrapped]}
+        {:keys [priv pq-priv]} aad]
+       (cond
+         (not= m/hybrid-kem kem)
+         (throw (ex-info "not a hybrid wrap; refusing to open it as one"
+                         {:wrap/kem kem :expected m/hybrid-kem}))
+         (nil? pq-priv)
+         (throw (ex-info "hybrid wrap needs the ML-KEM private key" {:wrap/kem kem})))
+       (let [eph-pub (unb64url ephemeral-pub)
+             pq-ct (unb64url pq-ct)
+             shared (kem/decapsulate-shared {:priv (key-bytes priv) :pq-priv (key-bytes pq-priv)}
+                                            {:ephemeral-pub eph-pub :pq-ct pq-ct})]
+         (gcm-decrypt (hybrid-wrap-key shared eph-pub (unb64url pub) pq-ct)
+                      (unb64url iv) (unb64url wrapped) (utf8 aad))))
+
+     (defn wrap-under-key
+       "The symmetric sibling: wrap under a secret both sides hold, via HKDF
+        with `salt`. The construction of `envelope.seal/wrap-under-key`."
+       [plaintext secret salt aad]
+       (let [iv (random-bytes m/nonce-bytes)
+             wk (hkdf salt secret (utf8 symmetric-wrap-info) content-key-bytes)]
+         {:wrap/kind :symmetric
+          :wrap/iv (b64url iv)
+          :wrap/salt (when salt (b64url salt))
+          :wrap/wrapped (b64url (gcm-encrypt wk iv plaintext (utf8 aad)))}))
+
+     (defn unwrap-under-key [{:keys [:wrap/iv :wrap/salt :wrap/wrapped]} secret aad]
+       (gcm-decrypt (hkdf (when salt (unb64url salt)) secret (utf8 symmetric-wrap-info)
+                          content-key-bytes)
+                    (unb64url iv) (unb64url wrapped) (utf8 aad)))
+
+     ;; -------------------------------------------------- recipient entries
+
+     (defn wrap-for
+       "Wrap `content-key` to one recipient's X25519 public key -- the
+        classical entry, AAD `m/wrap-aad` with `:x25519`."
+       [env {:keys [id pub kind]} content-key]
+       (let [w (wrap-bytes content-key pub (m/wrap-aad env id :x25519))]
+         {:recipient/id id
+          :recipient/kind (or kind :did)
+          :recipient/pub (:wrap/pub w)
+          :recipient/ephemeral-pub (:wrap/ephemeral-pub w)
+          :recipient/iv (:wrap/iv w)
+          :recipient/wrapped (:wrap/wrapped w)}))
+
+     (defn wrap-for-hybrid
+       "Wrap `content-key` to a recipient publishing both `:pub` and `:pq-pub`
+        -- the `:x25519+ml-kem-768` entry, hybrid AAD."
+       [env {:keys [id pq-pub kind] :as recipient} content-key]
+       (when (nil? pq-pub)
+         (throw (ex-info "a hybrid wrap needs the recipient's ML-KEM-768 public key"
+                         {:recipient/id id})))
+       (let [w (wrap-bytes-hybrid content-key recipient (m/wrap-aad env id m/hybrid-kem))]
+         {:recipient/id id
+          :recipient/kind (or kind :did)
+          :recipient/kem m/hybrid-kem
+          :recipient/pub (:wrap/pub w)
+          :recipient/pq-pub (:wrap/pq-pub w)
+          :recipient/ephemeral-pub (:wrap/ephemeral-pub w)
+          :recipient/pq-ct (:wrap/pq-ct w)
+          :recipient/iv (:wrap/iv w)
+          :recipient/wrapped (:wrap/wrapped w)}))
+
+     (defn- wrap-for-envelope
+       "The entry an envelope of this KEM takes. A hybrid envelope gets only
+        hybrid entries -- one classical entry in it would be the weakest
+        recipient deciding the object's post-quantum confidentiality -- and a
+        recipient without an ML-KEM key is refused rather than downgraded."
+       [env recipient content-key]
+       (if (m/hybrid? env)
+         (wrap-for-hybrid env recipient content-key)
+         (wrap-for env recipient content-key)))
+
+     (defn unwrap-with
+       "Recover the content key from `entry`. `priv` is the X25519 private key,
+        or `{:priv :pq-priv}`; a hybrid entry needs `pq-priv` (as the map or
+        as the fourth argument). The construction is the entry's."
+       ([env entry priv]
+        (if (map? priv)
+          (unwrap-with env entry (:priv priv) (:pq-priv priv))
+          (unwrap-with env entry priv nil)))
+       ([env {:keys [:recipient/id :recipient/pub :recipient/ephemeral-pub
+                     :recipient/iv :recipient/wrapped :recipient/kem
+                     :recipient/pq-pub :recipient/pq-ct]}
+         priv pq-priv]
+        (if (= m/hybrid-kem kem)
+          (do
+            (when (nil? pq-priv)
+              (throw (ex-info "hybrid recipient entry needs the ML-KEM private key"
+                              {:recipient/id id :recipient/kem kem})))
+            (unwrap-bytes-hybrid {:wrap/kem kem :wrap/pub pub :wrap/pq-pub pq-pub
+                                  :wrap/ephemeral-pub ephemeral-pub :wrap/pq-ct pq-ct
+                                  :wrap/iv iv :wrap/wrapped wrapped}
+                                 {:priv priv :pq-priv pq-priv}
+                                 (m/wrap-aad env id m/hybrid-kem)))
+          (unwrap-bytes {:wrap/pub pub :wrap/ephemeral-pub ephemeral-pub
+                         :wrap/iv iv :wrap/wrapped wrapped}
+                        priv
+                        (m/wrap-aad env id :x25519)))))
+
+     (defn entry-for [env id]
+       (first (filter #(= id (:recipient/id %)) (:envelope/recipients env))))
+
+     (defn share-with
+       "Grant `recipient` access by re-wrapping the content key; the ciphertext
+        is untouched. `from-priv` as in `unwrap-with`."
+       [env from-entry from-priv recipient]
+       (m/put-recipient env (wrap-for-envelope env recipient
+                                               (unwrap-with env from-entry from-priv))))
+
+     (defn mint-link
+       "A public share link: a recipient keypair nobody is. The grant carries
+        the link's private key for the URL fragment. Classical envelopes
+        only, as in `envelope.seal` and `envelope.seal-jvm`: a link secret is
+        one X25519 key, so a hybrid envelope refuses rather than holding a
+        classical entry."
+       [env from-entry from-priv]
+       (when (m/hybrid? env)
+         (throw (ex-info "a link is a classical recipient; a hybrid envelope refuses one"
+                         {:envelope/kem (:envelope/kem env)})))
+       (let [{:keys [priv pub]} (x25519/generate-keypair)
+             id (m/link-recipient-id (b64url pub))
+             env' (share-with env from-entry from-priv {:id id :pub pub :kind :link})]
+         {:envelope env'
+          :grant (m/link-grant env' (entry-for env' id) (b64url priv))}))
+
+     ;; ------------------------------------------------------------ objects
+
+     (defn seal-object
+       "Seal a whole object: fresh content key, every chunk encrypted, the key
+        wrapped to every recipient. -> {:envelope … :chunks [Uint8Array …]}.
+        `opts` may set `:envelope/kem :x25519+ml-kem-768`, and then every
+        recipient must carry `:pq-pub`. The content key is not returned."
+       [env-id plaintext-chunks recipients & [opts]]
+       (let [chunks (vec plaintext-chunks)
+             env (m/envelope env-id (merge {:chunks (count chunks)} opts))
+             ck (generate-content-key)]
+         {:envelope (reduce (fn [e r] (m/put-recipient e (wrap-for-envelope e r ck)))
+                            env recipients)
+          :chunks (mapv (fn [i pt] (seal-chunk env ck i pt)) (range) chunks)}))
+
+     (defn open-object
+       "Open every chunk with one recipient's key(s); `priv` as in `unwrap-with`."
+       [env entry priv ciphertext-chunks]
+       (let [ck (unwrap-with env entry priv)]
+         (mapv (fn [i ct] (open-chunk env ck i ct)) (range) ciphertext-chunks)))))

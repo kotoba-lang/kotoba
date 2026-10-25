@@ -1,0 +1,165 @@
+(ns kotoba.native.false-argument-test
+  "A call argument whose KIR form is the literal `false` must be emitted like
+  any other argument.
+
+  It was not. All three of this backend's argument walks -- the self tail call,
+  the ordinary call, and the host context call -- were written as `(if-let [arg
+  (first remaining)] …)`, and `if-let` tests the BOUND VALUE rather than the
+  sequence. A `false` argument therefore took the else branch, so THAT argument
+  AND EVERY ARGUMENT AFTER IT was never emitted, while the call still popped
+  the full arity. The program assembled, was shorter by exactly the missing
+  pushes, and then ran off its own stack.
+
+  The assertions here are byte COUNTS rather than runtime results on purpose.
+  A corrupted stack does not reliably fault -- a one-slot displacement often
+  reads a plausible word and returns a plausible answer -- so a runtime-only
+  test can pass by luck. The length of the emitted code cannot: a dropped
+  argument is exactly the eleven bytes of `movabs rax,imm64` + `push rax` that
+  did not get emitted, and eleven bytes is not a coincidence anything can
+  produce. The `true` and `false` forms of one program differ only in the
+  IMMEDIATE 1 vs 0, so their code must be the same length, and must differ in
+  exactly as many bytes as there are flipped literals.
+
+  Every row also runs on AArch64, where the same rows always passed: that
+  backend walks arguments with `mapcat` and has no truthiness test to get
+  wrong. Keeping the rows shared is what makes that an asserted property of
+  the pair rather than a remark -- the defect was never about how a `:bool` is
+  represented (both backends carry it as an i64 word), only about how one
+  backend's loop was written."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.native.x86-64 :as x86]
+            [kotoba.native.aarch64 :as arm]))
+
+(defn- program [functions]
+  {:format :kotoba.kir/v4 :exports ['main] :functions functions})
+
+(defn- code [emit functions] (vec (:code (emit (program functions)))))
+
+(defn- differing-bytes [a b]
+  (count (filter true? (map not= a b))))
+
+;; Each row builds the SAME program twice, with one boolean literal (or two)
+;; substituted, so that nothing but the immediate differs. `argument-site`
+;; names which of the three walks the substituted literal travels through.
+(def ^:private rows
+  [{:why "the only argument (emit-call)"
+    :argument-site :call
+    :flips 1
+    :build (fn [b] [{:name 'f :params '[p] :body '(if p 6 7)}
+                    {:name 'main :params [] :body (list 'f b)}])}
+
+   ;; The interesting position: with the defect, a `false` FIRST argument took
+   ;; the whole rest of the argument list with it, so `m` and `n` were never
+   ;; pushed at all while three pops still ran.
+   {:why "first of three, so the arguments after it are the ones dropped"
+    :argument-site :call
+    :flips 1
+    :build (fn [b] [{:name 'f :params '[p m n] :body '(if p m n)}
+                    {:name 'main :params [] :body (list 'f b 4 9)}])}
+
+   {:why "last of three"
+    :argument-site :call
+    :flips 1
+    :build (fn [b] [{:name 'f :params '[m n p] :body '(if p m n)}
+                    {:name 'main :params [] :body (list 'f 4 9 b)}])}
+
+   {:why "two boolean arguments, at opposite ends"
+    :argument-site :call
+    :flips 2
+    :build (fn [b] [{:name 'f :params '[p n q] :body '(+ (if p 100 200) (if q 10 20))}
+                    {:name 'main :params [] :body (list 'f b 9 b)}])}
+
+   ;; A string argument is a one-word handle into the literal pool, so it is
+   ;; pushed by the same walk -- and the pool offsets are what a dropped push
+   ;; would shift. Both orders, because only one of them puts the string AFTER
+   ;; the boolean where the defect could swallow it.
+   {:why "boolean before a string argument"
+    :argument-site :call
+    :flips 1
+    :build (fn [b] [{:name 'f :params '[p s] :body '(if p 1 (string-byte-length s))}
+                    {:name 'main :params [] :body (list 'f b "abcd")}])}
+
+   {:why "boolean after a string argument"
+    :argument-site :call
+    :flips 1
+    :build (fn [b] [{:name 'f :params '[s p] :body '(if p 1 (string-byte-length s))}
+                    {:name 'main :params [] :body (list 'f "abcd" b)}])}
+
+   ;; The self tail call takes its own walk (`emit-tail-self-call`), which
+   ;; writes the evaluated arguments back into the frame's own parameter slots.
+   ;; A missing push there does not merely misalign the call -- it stores the
+   ;; wrong words into live slots and then jumps back into the body, which is
+   ;; why this site faulted hardest. The outer call passes a plain i64 so that
+   ;; only the RECURSIVE argument is the substituted literal.
+   {:why "a literal in a self tail call (emit-tail-self-call)"
+    :argument-site :tail-self
+    :flips 1
+    :build (fn [b] [{:name 'f :params '[n p]
+                     :body (list 'if '(< n 1) '(if p 100 200)
+                                 (list 'f '(- n 1) b))}
+                    {:name 'main :params [] :body '(f 3 1)}])}
+
+   ;; The host context call (`emit-heap-call`). `option-some` lowers to
+   ;; `(pair 1 payload)`, so a boolean payload is the second of two arguments
+   ;; to a host callback -- one push, two pops, under the defect. This is the
+   ;; site that was reachable from ordinary source before any boundary was
+   ;; widened: `(option-some-of [:option :bool] false)` compiles today.
+   {:why "a boolean payload in a host context call (emit-heap-call)"
+    :argument-site :heap
+    :flips 1
+    :build (fn [b] [{:name 'main :params []
+                     :body (list 'if (list 'option-value (list 'option-some b) 1) 6 7)}])}
+
+   {:why "a boolean payload in a result constructor (emit-heap-call)"
+    :argument-site :heap
+    :flips 1
+    :build (fn [b] [{:name 'main :params []
+                     :body (list 'if (list 'result-value (list 'result-ok b) 1) 6 7)}])}])
+
+(deftest a-false-argument-emits-exactly-what-a-true-argument-emits
+  (doseq [{:keys [why flips build]} rows
+          [isa emit] [["x86-64" x86/emit-program] ["AArch64" arm/emit-program]]]
+    (testing (str isa " / " why)
+      (let [t (code emit (build true))
+            f (code emit (build false))]
+        (is (seq t) "the true form must emit code at all")
+        (is (= (count t) (count f))
+            (str "a `false` argument must emit the same number of bytes as a"
+                 " `true` one; short by " (- (count t) (count f))))
+        (when (= (count t) (count f))
+          (is (= flips (differing-bytes t f))
+              (str "the two forms may differ only in the flipped immediates")))))))
+
+;; The walk itself, without a program around it: N arguments must produce
+;; exactly N pushes, whatever the arguments are. This is the property the three
+;; call shapes all depend on and none of them could state, because each had its
+;; own copy of the loop.
+(deftest the-argument-walk-pushes-once-per-argument
+  (let [emit-pushed-arguments @#'kotoba.native.x86-64/emit-pushed-arguments
+        load-constant @#'kotoba.native.x86-64/load-constant
+        ;; The width of one argument is DERIVED from the encoding that emits it
+        ;; -- the constant, then one byte of `push rax` -- rather than written
+        ;; as a literal. It used to read 11, for `movabs rax,imm64` plus the
+        ;; push; `load-constant` now picks the narrowest form, so a literal
+        ;; here would have to be edited every time the encoder improves, and
+        ;; whoever edited it would be choosing a number that makes the test
+        ;; pass. Deriving it keeps the assertion exact -- a walk that skipped a
+        ;; push still fails -- without pinning a width nobody promised.
+        per-argument (+ (count (load-constant 0 0)) 1)
+        ctx {:param-count 0 :pad? true :temp-depth 0 :tail? false
+             :function-name 'main :function-names #{'main}}]
+    (doseq [argc (range 1 6)]
+      (testing (str argc " boolean arguments")
+        (is (= (* per-argument argc)
+               (count (emit-pushed-arguments (vec (repeat argc false)) {} ctx 0)))
+            "every `false` argument is pushed")
+        (is (= (count (emit-pushed-arguments (vec (repeat argc true)) {} ctx 0))
+               (count (emit-pushed-arguments (vec (repeat argc false)) {} ctx 0)))
+            "and pushed exactly as a `true` argument is")))
+    (testing "a false argument does not truncate the ones after it"
+      (is (= (count (emit-pushed-arguments [1 2 3] {} ctx 0))
+             (count (emit-pushed-arguments [false 2 3] {} ctx 0))
+             (count (emit-pushed-arguments [1 false 3] {} ctx 0))
+             (count (emit-pushed-arguments [1 2 false] {} ctx 0)))))
+    (testing "the empty argument list is still what terminates the walk"
+      (is (= [] (emit-pushed-arguments [] {} ctx 0))))))

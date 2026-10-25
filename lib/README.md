@@ -213,6 +213,18 @@ The bundled standard libraries live in this repository:
 | `org.iso.h264` | `org.iso.h264/src` | `h264.bitstream`, `h264.cabac`, `h264.cavlc`, `h264.decode` (an external specification, publisher iso.org) |
 | `org.iso.isobmff` | `org.iso.isobmff/src` | `isobmff.blob`, `isobmff.box`, `isobmff.bytes`, `isobmff.demux` (an external specification, publisher iso.org) |
 | `org.vrmC.vrm` | `org.vrmC.vrm/src` | `vrm`, `vrm.compat`, `vrm.compose`, `vrm.constraint` (an external specification, publisher vrmC.org) |
+| `org.signal.protocol` | `org.signal.protocol/src` | `kotoba.signal.group`, `kotoba.signal.hkdf`, `kotoba.signal.ratchet`, `kotoba.signal.sealed` (an external specification, publisher signal.org) |
+| `org.graphql.http` | `org.graphql.http/src` | `kotobase.protocols.graphql`, `kotobase.protocols.graphql.http`, `kotobase.protocols.graphql.json` (an external specification, publisher graphql.org) |
+| `org.opencypher.cypher` | `org.opencypher.cypher/src` | `kotobase.protocols.cypher`, `kotobase.protocols.cypher.http`, `kotobase.protocols.cypher.json` (an external specification, publisher opencypher.org) |
+| `org.apache.tinkerpopGremlin` | `org.apache.tinkerpopGremlin/src` | `kotobase.gremlin.envelope`, `kotobase.gremlin.json`, `kotobase.gremlin.traversal`, `kotobase.gremlin.wire` (an external specification, publisher apache.org) |
+| `org.postgresql.wire` | `org.postgresql.wire/src` | `kotobase.pg.sql`, `kotobase.pg.wire` (an external specification, publisher postgresql.org) |
+| `org.w3.sparqlProtocol` | `org.w3.sparqlProtocol/src` | `kotobase.protocols.sparql`, `kotobase.protocols.sparql.json`, `kotobase.protocols.sparql.ntriples`, `kotobase.protocols.sparql.parser` (an external specification, publisher w3.org) |
+| `kotoba.kototamaNative` | `kotoba.kototamaNative/src` | `kototama.native.executor`, `kototama.native.lease-transport` (Kotoba project library) |
+| `kotoba.kotobaVerifier` | `kotoba.kotobaVerifier/src` | `kotoba.verifier`, `kotoba.verifier.conformance`, `kotoba.verifier.linux-static`, `kotoba.verifier.signing` (Kotoba project library) |
+| `kotoba.kotobaNative` | `kotoba.kotobaNative/src` | `kotoba.native.aarch64`, `kotoba.native.affine`, `kotoba.native.aggregate-abi`, `kotoba.native.document` (Kotoba project library) |
+| `kotoba.witnessQuorum` | `kotoba.witnessQuorum/src` | `kotoba.lang.witness-quorum.attestation`, `kotoba.lang.witness-quorum.orchestrator`, `kotoba.lang.witness-quorum.outcome`, `kotoba.lang.witness-quorum.quorum` (Kotoba project library) |
+| `kotoba.ayatori` | `kotoba.ayatori/src` | `ayatori.agent`, `ayatori.disclosure`, `ayatori.disclosure-open`, `ayatori.discovery` (Kotoba project library) |
+| `kotoba.envelope` | `kotoba.envelope/src` | `envelope.kem`, `envelope.keystore`, `envelope.model`, `envelope.passkey` (Kotoba project library) |
 | `kotoba.webgl` | `kotoba.webgl/src` | `kami.webgl`, `kami.webgl.glsl`, `kotoba.webgl`, `kotoba.webgl.glsl` (Kotoba project library) |
 | `kotoba.step` | `kotoba.step/src` | `kotoba.step`, `step.core` (Kotoba project library) |
 | `kotoba.sky` | `kotoba.sky/src` | `kami.sky`, `kotoba.sky` (Kotoba project library) |
