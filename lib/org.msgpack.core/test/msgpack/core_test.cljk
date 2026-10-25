@@ -1,0 +1,149 @@
+(ns msgpack.core-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [msgpack.bytes :as b]
+            [msgpack.core :as mp]
+            [msgpack.vectors :as v]))
+
+;; ------------------------------------------- known answers from @msgpack/msgpack
+
+(deftest encodes-what-msgpack-encodes
+  (doseq [{:keys [name value encoded] :as vec'} v/vectors]
+    (is (= encoded (b/hex (mp/encode! value)))
+        (str "encode " name))))
+
+(deftest decodes-what-msgpack-produced
+  (doseq [{:keys [name value] :as vec'} v/vectors]
+    (let [r (mp/decode (v/bytes-of vec'))]
+      (is (= :ok (:status r)) (str "decode " name))
+      (is (= value (:value r)) (str "decode " name)))))
+
+(deftest round-trips-through-both-directions
+  (doseq [{:keys [name value]} v/vectors]
+    (is (= value (mp/decode! (mp/encode! value))) (str "round trip " name))))
+
+;; --------------------------------------------------------- format coverage
+
+(deftest integer-format-boundaries
+  (doseq [[n prefix] [[0 [0x00]] [127 [0x7F]]
+                      [128 [0xCC]] [255 [0xCC]]
+                      [256 [0xCD]] [65535 [0xCD]]
+                      [65536 [0xCE]] [4294967295 [0xCE]]
+                      [4294967296 [0xCF]]
+                      [-1 [0xFF]] [-32 [0xE0]]
+                      [-33 [0xD0]] [-128 [0xD0]]
+                      [-129 [0xD1]] [-32768 [0xD1]]
+                      [-32769 [0xD2]] [-2147483648 [0xD2]]
+                      [-2147483649 [0xD3]]]]
+    (let [bs (mp/encode! n)]
+      (is (= prefix [(first bs)]) (str n " must use the smallest format"))
+      (is (= n (mp/decode! bs)) (str n " must survive the round trip")))))
+
+(deftest string-format-boundaries
+  (doseq [[len prefix] [[0 0xA0] [31 0xBF] [32 0xD9] [255 0xD9] [256 0xDA] [65536 0xDB]]]
+    (let [s (apply str (repeat len "a"))
+          bs (mp/encode! s)]
+      (is (= prefix (first bs)) (str "a string of " len " must use the smallest format"))
+      (is (= s (mp/decode! bs))))))
+
+(deftest collection-format-boundaries
+  (testing "array"
+    (doseq [[len prefix] [[0 0x90] [15 0x9F] [16 0xDC] [65536 0xDD]]]
+      (let [v (vec (repeat len 0))]
+        (is (= prefix (first (mp/encode! v))))
+        (is (= v (mp/decode! (mp/encode! v)))))))
+  (testing "map"
+    (doseq [[len prefix] [[0 0x80] [15 0x8F] [16 0xDE]]]
+      (let [m (into (array-map) (map (fn [i] [(str i) i])) (range len))]
+        (is (= prefix (first (mp/encode! m))))
+        (is (= (into {} m) (mp/decode! (mp/encode! m))))))))
+
+(deftest binary-format-boundaries
+  (doseq [[len prefix] [[0 0xC4] [255 0xC4] [256 0xC5] [65536 0xC6]]]
+    (let [x {:msgpack/bin (vec (repeat len 7))}]
+      (is (= prefix (first (mp/encode! x))))
+      (is (= x (mp/decode! (mp/encode! x)))))))
+
+(deftest extension-types
+  (testing "the five fixed widths"
+    (doseq [[len prefix] [[1 0xD4] [2 0xD5] [4 0xD6] [8 0xD7] [16 0xD8]]]
+      (let [x {:msgpack/ext {:type 5 :data (vec (repeat len 1))}}]
+        (is (= prefix (first (mp/encode! x))))
+        (is (= x (mp/decode! (mp/encode! x)))))))
+  (testing "the variable widths, and a negative type (reserved by the spec)"
+    (doseq [[len prefix] [[3 0xC7] [255 0xC7] [256 0xC8] [65536 0xC9]]]
+      (let [x {:msgpack/ext {:type -1 :data (vec (repeat len 1))}}]
+        (is (= prefix (first (mp/encode! x))))
+        (is (= x (mp/decode! (mp/encode! x))))))))
+
+(deftest floats
+  (testing "float64 round trips exactly"
+    (doseq [x [0.5 -0.5 3.5 1.0e300 -1.0e-300 3.141592653589793]]
+      (is (= x (mp/decode! (mp/encode! x))))))
+  (testing "float32 is decoded, though never emitted"
+    ;; 0xca 3f800000 is 1.0f. Hand-built: nothing here produces a float32.
+    (is (= 1.0 (mp/decode! [0xCA 0x3F 0x80 0x00 0x00])))))
+
+(deftest utf8-strings
+  (doseq [s ["" "a" "さようなら" "🌏" (apply str (repeat 100 "漢"))]]
+    (is (= s (mp/decode! (mp/encode! s))))))
+
+;; ------------------------------------------------------------- streaming
+
+(deftest incomplete-input-is-not-an-error
+  (let [bs (mp/encode! (array-map "op" "put" "n" 60000))]
+    (doseq [n (range 0 (count bs))]
+      (is (= :incomplete (:status (mp/decode (subvec bs 0 n))))
+          (str "a " n "-byte prefix must be :incomplete, not :error")))
+    (is (= :ok (:status (mp/decode bs))))))
+
+(deftest decode-all-drains-a-stream
+  (let [bs (into (mp/encode! 1) (into (mp/encode! "two") (mp/encode! [3])))
+        {:keys [values rest]} (mp/decode-all bs)]
+    (is (= [1 "two" [3]] values))
+    (is (= [] rest)))
+  (testing "a trailing partial value survives for the next read"
+    (let [whole (mp/encode! "hello")
+          bs (into whole (subvec (mp/encode! "world") 0 3))
+          {:keys [values rest]} (mp/decode-all bs)]
+      (is (= ["hello"] values))
+      (is (= 3 (count rest))))))
+
+;; ------------------------------------------------------------ rejections
+
+(deftest integers-outside-the-shared-exact-range-are-refused
+  (testing "encode refuses rather than writing a number it cannot read back"
+    (is (= :integer-unrepresentable (:reason (mp/encode (inc mp/max-safe-integer)))))
+    (is (= :integer-unrepresentable (:reason (mp/encode (dec mp/min-safe-integer))))))
+  (testing "the boundary itself is fine"
+    (is (= mp/max-safe-integer (mp/decode! (mp/encode! mp/max-safe-integer))))
+    (is (= mp/min-safe-integer (mp/decode! (mp/encode! mp/min-safe-integer)))))
+  (testing "decode refuses a uint64 it cannot represent, before folding it"
+    ;; 0xffffffffffffffff. On the JVM the fold throws `long overflow`, so a
+    ;; guard placed after it would never run in the case it exists for.
+    (is (= :integer-unrepresentable
+           (:reason (mp/decode [0xCF 0xFF 0xFF 0xFF 0xFF 0xFF 0xFF 0xFF 0xFF]))))
+    ;; 2^53 exactly -- the first value that stops being distinguishable from
+    ;; its successor under ClojureScript.
+    (is (= :integer-unrepresentable
+           (:reason (mp/decode [0xCF 0x00 0x20 0x00 0x00 0x00 0x00 0x00 0x00])))))
+  (testing "decode refuses an int64 outside the range, in both directions"
+    (is (= :integer-unrepresentable
+           (:reason (mp/decode [0xD3 0x80 0x00 0x00 0x00 0x00 0x00 0x00 0x00]))))
+    (is (= :integer-unrepresentable
+           (:reason (mp/decode [0xD3 0x00 0x20 0x00 0x00 0x00 0x00 0x00 0x00])))))
+  (testing "a 64-bit encoding that IS in range still decodes"
+    (is (= 4294967296 (mp/decode! [0xCF 0x00 0x00 0x00 0x01 0x00 0x00 0x00 0x00])))
+    (is (= -4294967296 (mp/decode! [0xD3 0xFF 0xFF 0xFF 0xFF 0x00 0x00 0x00 0x00])))))
+
+(deftest the-never-used-byte-is-rejected
+  (is (= :never-used-byte (:reason (mp/decode [0xC1])))))
+
+(deftest values-without-a-representation-are-refused
+  (is (= :unsupported-type (:reason (mp/encode #{1 2}))))
+  (is (= :unsupported-type (:reason (mp/encode (fn [] nil))))))
+
+(deftest keywords-become-strings-and-say-so
+  (is (= "a" (mp/decode! (mp/encode! :a))))
+  (is (= "ns/a" (mp/decode! (mp/encode! :ns/a))))
+  (is (= {"a" 1} (mp/decode! (mp/encode! {:a 1})))
+      "the asymmetry is documented, not hidden: msgpack has no keyword type"))
