@@ -1,0 +1,115 @@
+(ns kotoba.plm.erp
+  "ERP-side tx builders shared by the thread + cost namespaces: chart of
+   accounts, balanced GL journals, rolled-cost snapshots, and OCEL events.
+   Pure functions returning Datomic entity maps (no I/O)."
+  (:require [kotoba.plm.db :as db]))
+
+(defn now [] #?(:clj (java.util.Date.) :cljs (js/Date.)))
+
+(defn ->bigdec
+  "Portable arbitrary-precision decimal: `bigdec` on the JVM, pass-through
+   under cljs (no bignum type there; callers already deal in js numbers)."
+  [x]
+  #?(:clj (bigdec x) :cljs x))
+
+;; ───────────────────────────── chart of accounts ───────────────────────────
+
+(def chart
+  "Minimal COA seed for the inventory→GL thread (ADR-0025 coa.seeded analog)."
+  [{:erp.account/code "1400" :erp.account/name "Inventory"                     :erp.account/type :asset}
+   {:erp.account/code "1500" :erp.account/name "Work In Process"               :erp.account/type :asset}
+   {:erp.account/code "2150" :erp.account/name "GR/IR Clearing"                :erp.account/type :liability}
+   {:erp.account/code "5900" :erp.account/name "Inventory Revaluation Variance" :erp.account/type :expense}
+   {:erp.account/code "5100" :erp.account/name "Labor & Overhead Absorbed"      :erp.account/type :expense}])
+
+;; ───────────────────────────── builders ────────────────────────────────────
+
+(defn journal
+  "Balanced GL journal entity. `lines` is a seq of
+   {:account \"1400\" :debit n :credit n :item iid?}. Throws if debits≠credits
+   so an unbalanced posting can never reach the ledger."
+  [{:keys [id date memo lines]}]
+  (let [dr (reduce + 0M (map #(->bigdec (or (:debit %) 0M)) lines))
+        cr (reduce + 0M (map #(->bigdec (or (:credit %) 0M)) lines))]
+    (when (not= dr cr)
+      (throw (ex-info "unbalanced journal" {:id id :debit dr :credit cr})))
+    {:erp.journal/id    id
+     :erp.journal/date  date
+     :erp.journal/memo  memo
+     :erp.journal/lines (mapv (fn [l]
+                                (cond-> {:erp.jline/account (:account l)
+                                         :erp.jline/debit   (->bigdec (or (:debit l) 0M))
+                                         :erp.jline/credit  (->bigdec (or (:credit l) 0M))}
+                                  (:item l) (assoc :erp.jline/item [:plm.item/id (:item l)])))
+                              lines)}))
+
+(defn cost-snapshot
+  "An immutable rolled-standard-cost snapshot for `iid`."
+  [iid rolled]
+  (let [t (now)]
+    {:erp.cost/id    (str iid "@" (.getTime t) "-" (subs (str (random-uuid)) 0 8))
+     :erp.cost/item  [:plm.item/id iid]
+     :erp.cost/rolled (->bigdec rolled)
+     :erp.cost/as-of t}))
+
+(defn ocel
+  "An OCEL 2.0 event. `objects` is a seq of lookup refs (e.g. [:plm.item/id id])."
+  [type apqc objects]
+  {:ocel/id      (str "ocel-" (random-uuid))
+   :ocel/type    type
+   :ocel/apqc    apqc
+   :ocel/at      (now)
+   :ocel/objects (vec objects)})
+
+;; ───────────────────────────── reporting queries ───────────────────────────
+
+(defn inventory-rows
+  "[{:item iid :qty q :std c :value q*c} ...] for all perpetual-inventory rows."
+  [d]
+  (->> (db/q '[:find ?iid ?q ?c
+               :where
+               [?inv :erp.inventory/item ?it]
+               [?it :plm.item/id ?iid]
+               [?inv :erp.inventory/qty-on-hand ?q]
+               [?inv :erp.inventory/std-cost ?c]]
+             d)
+       (map (fn [[iid q c]] {:item iid :qty q :std c :value (* q c)}))
+       (sort-by :item)
+       vec))
+
+(defn inventory-value [d]
+  (reduce + 0M (map :value (inventory-rows d))))
+
+(defn trial-balance
+  "{account-code {:name .. :debit Σ :credit Σ :balance Dr-Cr}} across all journals."
+  [d]
+  (let [rows (db/q '[:find ?code ?name ?dr ?cr
+                     :where
+                     [?l :erp.jline/account ?code]
+                     [?l :erp.jline/debit ?dr]
+                     [?l :erp.jline/credit ?cr]
+                     [?a :erp.account/code ?code]
+                     [?a :erp.account/name ?name]]
+                   d)]
+    (->> rows
+         (group-by first)
+         (reduce-kv (fn [m code rs]
+                      (let [dr (reduce + 0M (map #(nth % 2) rs))
+                            cr (reduce + 0M (map #(nth % 3) rs))]
+                        (assoc m code {:name (second (first rs))
+                                       :debit dr :credit cr :balance (- dr cr)})))
+                    {}))))
+
+(defn ocel-log
+  "OCEL events as [{:type .. :apqc .. :at ..} ...] sorted by time."
+  [d]
+  (->> (db/q '[:find ?t ?type ?apqc ?at
+               :where
+               [?e :ocel/type ?type]
+               [?e :ocel/apqc ?apqc]
+               [?e :ocel/at ?at]
+               [?e :ocel/id ?t]]
+             d)
+       (map (fn [[_ type apqc at]] {:type type :apqc apqc :at at}))
+       (sort-by :at)
+       vec))

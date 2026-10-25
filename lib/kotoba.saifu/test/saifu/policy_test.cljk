@@ -1,0 +1,119 @@
+(ns saifu.policy-test
+  "policy は **値** であり、attenuate は単調でなければならない。
+
+  ここが崩れると『agent に狭めた権限を渡した』が嘘になる。"
+  (:require [kotoba.test :refer [deftest testing is]]
+            [saifu.policy :as p]))
+
+(def owner
+  {:chains #{:akash :cosmos}
+   :msg-types #{:MsgSend :MsgCreateDeployment :MsgDepositDeployment}
+   :recipients :any
+   :max-spend {:uakt 10000000}
+   :max-per-tx {:uakt 2000000}
+   :expires-at 2000000000000
+   :disposition :commit})
+
+(def t0 1785000000000)
+
+;; ── attenuate は緩められない ────────────────────────────────────────────────
+
+(deftest narrowing-is-allowed
+  (testing "狭める方向は通る"
+    (let [c (p/attenuate owner {:chains #{:akash}
+                                :msg-types #{:MsgCreateDeployment}
+                                :max-spend {:uakt 500000}
+                                :max-per-tx {:uakt 500000}
+                                :expires-at (+ t0 3600000)
+                                :disposition :escalate})]
+      (is (nil? (:error c)))
+      (is (= #{:akash} (:chains c)))
+      (is (= :escalate (:disposition c))))))
+
+(deftest widening-is-an-error-not-a-silent-drop
+  (testing "緩い child は **無視ではなく error**。無視すると『狭めたつもりが
+            狭まっていない』が沈黙で成立し、委譲の意味が消える"
+    (doseq [[label child field]
+            [["別チェーンを足す"   {:chains #{:akash :cosmos :osmosis}} :chains]
+             ["msg 種別を足す"     {:msg-types #{:MsgSend :MsgUndelegate}} :msg-types]
+             ["上限を上げる"       {:max-spend {:uakt 99999999}} :max-spend]
+             ["1件上限を上げる"    {:max-per-tx {:uakt 99999999}} :max-per-tx]
+             ["期限を延ばす"       {:expires-at 9999999999999} :expires-at]
+             ["disposition を緩める" {:disposition :commit
+                                      :chains #{:akash}} nil]]]
+      (let [parent (assoc owner :disposition :escalate)
+            r (p/attenuate parent child)]
+        (when field
+          (is (= :widens (:error r)) (str label " が通ってしまった"))
+          (is (some #(= field (:field %)) (:widens r))
+              (str label ": 理由に " field " が無い")))))))
+
+(deftest unlisted-denom-is-widening
+  (testing "parent に無い denom を child が持つのは拡大。
+            『指定が無い = 無制限』にすると、狭めたつもりが穴になる"
+    (is (= :widens (:error (p/attenuate owner {:max-spend {:uatom 1}}))))))
+
+(deftest disposition-can-only-get-stricter
+  (testing "commit → escalate → hold の順に厳しい"
+    (is (true? (p/at-least-as-cautious? :commit :escalate)))
+    (is (true? (p/at-least-as-cautious? :escalate :hold)))
+    (is (false? (p/at-least-as-cautious? :hold :escalate)))
+    (is (false? (p/at-least-as-cautious? :escalate :commit)))))
+
+(deftest attenuation-composes
+  (testing "2 段委譲しても単調。孫が親を超えられない"
+    (let [child (p/attenuate owner {:chains #{:akash} :max-spend {:uakt 1000000}})
+          grand (p/attenuate child {:max-spend {:uakt 2000000}})]
+      (is (= :widens (:error grand)) "孫が親（child）を超えた"))))
+
+;; ── gate ────────────────────────────────────────────────────────────────────
+
+(def deploy-policy
+  (p/attenuate owner {:chains #{:akash}
+                      :msg-types #{:MsgCreateDeployment}
+                      :max-spend {:uakt 1000000}
+                      :max-per-tx {:uakt 600000}
+                      :expires-at (+ t0 3600000)
+                      :disposition :commit}))
+
+(defn- g [req spent] (p/gate deploy-policy req spent t0))
+
+(deftest gate-allows-what-the-policy-allows
+  (is (= {:disposition :commit :reason :allowed}
+         (g {:chain :akash :msg-type :MsgCreateDeployment :amount {:uakt 500000}} {}))))
+
+(deftest gate-refuses-with-a-reason
+  (testing "拒否には必ず理由を付ける —— 理由が無いと運用者は
+            『分からないから緩める』という一番危ない直し方をする"
+    (doseq [[reason req spent]
+            [[:chain-not-allowed    {:chain :cosmos :msg-type :MsgCreateDeployment :amount {:uakt 1}} {}]
+             [:msg-type-not-allowed {:chain :akash :msg-type :MsgSend :amount {:uakt 1}} {}]
+             [:over-per-tx          {:chain :akash :msg-type :MsgCreateDeployment :amount {:uakt 700000}} {}]
+             [:over-max-spend       {:chain :akash :msg-type :MsgCreateDeployment :amount {:uakt 500000}} {:uakt 800000}]]]
+      (let [r (p/gate deploy-policy req spent t0)]
+        (is (= :hold (:disposition r)) (str reason " が通ってしまった"))
+        (is (= reason (:reason r)))))))
+
+(deftest expiry-holds
+  (testing "期限切れは hold。時刻は引数で入る（純粋関数）"
+    (let [r (p/gate deploy-policy
+                    {:chain :akash :msg-type :MsgCreateDeployment :amount {:uakt 1}}
+                    {} (+ t0 3600001))]
+      (is (= :hold (:disposition r)))
+      (is (= :expired (:reason r))))))
+
+(deftest spend-limit-is-evaluated-against-supplied-ledger
+  (testing "累計は引数で受け取る。プロセス内カウンタを持たないのは、
+            同じ鍵を 2 プロセスが使うと内部カウンタが黙って 2 倍を許すから"
+    (let [req {:chain :akash :msg-type :MsgCreateDeployment :amount {:uakt 600000}}]
+      (is (= :commit (:disposition (p/gate deploy-policy req {:uakt 0} t0))))
+      (is (= :hold (:disposition (p/gate deploy-policy req {:uakt 500000} t0)))))))
+
+(deftest agent-default-denies-everything
+  (testing "既定が緩いと『とりあえず既定で』が事故になる"
+    (let [r (p/gate p/agent-default
+                    {:chain :akash :msg-type :MsgCreateDeployment :amount {:uakt 1}} {} t0)]
+      (is (= :hold (:disposition r))))))
+
+(deftest no-policy-holds
+  (is (= :hold (:disposition (p/gate nil {:chain :akash} {} t0)))))

@@ -1,0 +1,91 @@
+(ns torch.kv-cache-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [torch.kv-cache :as kv]))
+
+(deftest paged-pool-allocates-reuses-and-checks-capacity
+  (let [p0 (kv/pool 3 2)
+        p1 (kv/allocate-sequence p0 :a)
+        a (kv/append-tokens p1 :a 3)
+        p2 (:pool a)]
+    (is (= [{:block 0 :offset 0}
+            {:block 0 :offset 1}
+            {:block 1 :offset 0}]
+           (:placements a)))
+    (is (= {:length 3 :blocks [0 1]} (kv/block-table p2 :a)))
+    (is (kv/valid? p2))
+    (let [p3 (kv/release-sequence p2 :a)
+          p4 (kv/allocate-sequence p3 :b)
+          b (kv/append-token p4 :b)]
+      (is (= 0 (:block b)) "lowest released block is deterministically reused")
+      (is (kv/valid? (:pool b))))))
+
+(deftest partial-prefix-fork-is-copy-on-write
+  (let [base (kv/allocate-sequence (kv/pool 4 4) :parent)
+        base (:pool (kv/append-tokens base :parent 3))
+        forked (kv/fork-sequence base :parent :child)
+        child-write (kv/append-token forked :child)
+        split (:pool child-write)]
+    (is (= {:from 0 :to 1 :tokens 3} (:copy child-write)))
+    (is (= {:length 4 :blocks [1]} (kv/block-table split :child)))
+    (is (= {:length 3 :blocks [0]} (kv/block-table split :parent)))
+    (is (= [1 1 0 0] (:refcounts split)))
+    (is (kv/valid? split))
+    (let [parent-write (kv/append-token split :parent)]
+      (is (nil? (:copy parent-write))
+          "the parent owns its partial block exclusively after the split")
+      (is (= 0 (:block parent-write)))
+      (is (= 3 (:offset parent-write)))
+      (is (kv/valid? (:pool parent-write))))))
+
+(deftest full-prefix-blocks-stay-shared
+  (let [base (kv/allocate-sequence (kv/pool 3 2) :parent)
+        base (:pool (kv/append-tokens base :parent 2))
+        forked (kv/fork-sequence base :parent :child)
+        child-write (kv/append-token forked :child)]
+    (is (nil? (:copy child-write)))
+    (is (= [0 1] (:blocks (kv/block-table (:pool child-write) :child))))
+    (is (= [2 1 0] (:refcounts (:pool child-write))))
+    (is (kv/valid? (:pool child-write)))))
+
+(deftest continuous-scheduler-admits-evicts-and-preserves-fifo
+  (let [s0 (-> (kv/scheduler (kv/pool 3 2) 2)
+               (kv/enqueue :a [1 2 3])
+               (kv/enqueue :b [4])
+               (kv/enqueue :c [5 6])
+               kv/admit)]
+    (is (= [:a :b] (:order s0)))
+    (is (= [:c] (mapv :id (:waiting s0))))
+    (is (= 1 (get-in s0 [:running :a :placements 2 :block])))
+    (is (kv/valid? (:pool s0)))
+    (let [advanced (kv/advance s0)]
+      (is (= {:block 1 :offset 1}
+             (get-in advanced [:running :a :decode-placement])))
+      (is (= {:block 2 :offset 1}
+             (get-in advanced [:running :b :decode-placement])))
+      (let [replaced (kv/finish advanced :a)]
+        (is (= [:b :c] (:order replaced)))
+        (is (empty? (:waiting replaced)))
+        (is (= 0 (get-in replaced [:running :c :placements 0 :block])))
+        (is (kv/valid? (:pool replaced)))))))
+
+(deftest admission-is-transactional-on-pool-exhaustion
+  (let [s (-> (kv/scheduler (kv/pool 2 2) 2)
+              (kv/enqueue :too-large (range 5))
+              (kv/enqueue :small [1])
+              kv/admit)]
+    (is (empty? (:running s)))
+    (is (= [:too-large :small] (mapv :id (:waiting s))))
+    (is (= #{0 1} (set (get-in s [:pool :free]))))
+    (is (kv/valid? (:pool s)))))
+
+(deftest invalid-ownership-operations-fail-loudly
+  (testing "duplicate/unknown IDs and exhaustion are explicit"
+    (let [p (kv/allocate-sequence (kv/pool 1 1) :a)
+          p (:pool (kv/append-token p :a))]
+      (is (thrown? #?(:clj Exception :cljs js/Error)
+                   (kv/allocate-sequence p :a)))
+      (is (thrown? #?(:clj Exception :cljs js/Error)
+                   (kv/release-sequence p :missing)))
+      (is (thrown-with-msg?
+           #?(:clj Exception :cljs js/Error) #"out of physical blocks"
+           (kv/append-token p :a))))))

@@ -1,0 +1,239 @@
+(ns kotoba.p2p.graphsync-scheduler-test
+  (:require #?(:clj [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing] :include-macros true])
+            [ipld.core :as ipld]
+            [kotoba.p2p.graphsync :as gs]
+            [kotoba.p2p.graphsync-scheduler :as scheduler]))
+
+(def config {:max-active 2 :max-blocks-per-message 1
+             :max-block-bytes-per-message 4096
+             :max-traversal-work-per-step 32
+             :max-extensions 4
+             :extension-specs
+             {"window" {:phases #{:new :update}
+                        :validate (fn [value]
+                                    (when-not (and (map? value)
+                                                   (integer? (get value "blocks")))
+                                      (throw (ex-info "invalid window" {})))
+                                    value)}}})
+(def traversal-limits {:max-blocks 8 :max-bytes 4096
+                       :max-depth 8 :max-matches 16})
+(def wire-limits {:max-message-bytes 65536 :max-requests 8
+                  :max-responses 8 :max-blocks 8})
+
+(defn request-id [seed]
+  #?(:clj (byte-array (map unchecked-byte (range seed (+ seed 16))))
+     :cljs (js/Uint8Array.from (clj->js (range seed (+ seed 16))))))
+
+(def recursive-selector
+  {:selector :explore-recursive
+   :limit {:mode :none}
+   :sequence {:selector :explore-union
+              :members [{:selector :matcher}
+                        {:selector :explore-all
+                         :next {:selector :explore-recursive-edge}}]}})
+
+(defn fixture []
+  (let [store (atom {})
+        put! (fn [cid bytes] (swap! store assoc cid bytes))
+        leaf (ipld/put-node! put! {"name" "leaf"})
+        middle (ipld/put-node! put! {"child" (ipld/link leaf)})
+        root (ipld/put-node! put! {"child" (ipld/link middle)})]
+    {:store store :root root :blocks [root middle leaf]}))
+
+(defn new-request [id root priority]
+  {:id id :type :new :root root :priority priority
+   :selector recursive-selector})
+
+(deftest admission-is-read-free-and-steps-partial-then-full
+  (let [{:keys [store root blocks]} (fixture)
+        reads (atom [])
+        get-counted (fn [cid] (swap! reads conj cid) (get @store cid))
+        request (new-request (request-id 0) root 3)
+        admitted (scheduler/handle-message
+                  (scheduler/new-scheduler config) get-counted
+                  {:requests [request]} traversal-limits)
+        reads-at-admission (count @reads)
+        drained (scheduler/drain (:scheduler admitted) get-counted 5)
+        messages (:messages drained)]
+    (is (= 10 (get-in admitted [:message :responses 0 :status])))
+    (is (zero? reads-at-admission))
+    (is (= [14 14 14 20] (mapv #(get-in % [:responses 0 :status]) messages)))
+    (is (= blocks (mapv #(get-in % [:blocks 0 :cid]) (butlast messages))))
+    (is (= blocks @reads))
+    (is (zero? (scheduler/active-count (:scheduler drained))))
+    (testing "every emitted chunk remains a valid GraphSync wire message"
+      (is (= [14 14 14 20]
+             (mapv #(-> %
+                        (gs/encode-message wire-limits)
+                        (gs/decode-message wire-limits)
+                        (get-in [:responses 0 :status]))
+                   messages))))))
+
+(deftest priority-order-update-and-cancel-are-deterministic
+  (let [{:keys [store root]} (fixture)
+        low (new-request (request-id 0) root 1)
+        high (new-request (request-id 32) root 9)
+        admitted (scheduler/handle-message
+                  (scheduler/new-scheduler config) #(get @store %)
+                  {:requests [low high]} traversal-limits)
+        updated (scheduler/handle-message
+                 (:scheduler admitted) #(get @store %)
+                 {:requests [{:id (:id low) :type :update
+                              :extensions {"window" {"blocks" 1}}}]}
+                 traversal-limits)
+        first-step (scheduler/step (:scheduler updated) #(get @store %))
+        cancelled (scheduler/handle-message
+                   (:scheduler first-step) #(get @store %)
+                   {:requests [{:id (:id high) :type :cancel}]}
+                   traversal-limits)]
+    (is (= (vec (:id high))
+           (-> first-step :message :responses first :id vec)))
+    (is (= {"window" {"blocks" 1}}
+           (get-in updated [:scheduler :active (vec (:id low)) :extensions])))
+    (is (= 35 (get-in cancelled [:message :responses 0 :status])))
+    (is (= #{(vec (:id low))}
+           (scheduler/active-request-ids (:scheduler cancelled))))))
+
+(deftest capacity-duplicates-missing-content-and-unknown-control-fail-closed
+  (let [{:keys [store root]} (fixture)
+        one (new-request (request-id 0) root 1)
+        two (new-request (request-id 32) root 1)
+        three (new-request (request-id 64) root 1)
+        admitted (scheduler/handle-message
+                  (scheduler/new-scheduler config) #(get @store %)
+                  {:requests [one two three one]} traversal-limits)]
+    (is (= [10 10 31 30]
+           (mapv :status (get-in admitted [:message :responses]))))
+    (let [unknown (request-id 96)
+          controlled (scheduler/handle-message
+                      (:scheduler admitted) #(get @store %)
+                      {:requests [{:id unknown :type :cancel}
+                                  {:id unknown :type :update
+                                   :extensions {"x" true}}]}
+                      traversal-limits)]
+      (is (nil? (:message controlled)))
+      (is (= [:unknown-cancel :unknown-update]
+             (mapv :reason (:events controlled)))))
+    (let [missing (new-request (request-id 96) "bafyreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku" 1)
+          admitted-missing (scheduler/handle-message
+                            (scheduler/new-scheduler config) #(get @store %)
+                            {:requests [missing]} traversal-limits)
+          failed (scheduler/step (:scheduler admitted-missing) #(get @store %))]
+      (is (= 10 (get-in admitted-missing [:message :responses 0 :status])))
+      (is (= 34 (get-in failed [:message :responses 0 :status])))
+      (is (zero? (scheduler/active-count (:scheduler failed)))))))
+
+(deftest configured-resource-bounds-are-enforced
+  (let [{:keys [store root]} (fixture)
+        request (new-request (request-id 0) root 1)]
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (scheduler/new-scheduler (assoc config :max-active 0))))
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (scheduler/new-scheduler (assoc config :max-extensions 0))))
+    (let [tiny (scheduler/new-scheduler
+                (assoc config :max-block-bytes-per-message 1))
+          admitted (scheduler/handle-message tiny #(get @store %)
+                                             {:requests [request]} traversal-limits)
+          result (scheduler/step (:scheduler admitted) #(get @store %))]
+      (is (= 32 (get-in result [:message :responses 0 :status])))
+      (is (= :block-too-large (get-in result [:event :reason]))))
+    (testing "unregistered extensions are rejected at admission"
+      (let [request (assoc (new-request (request-id 96) root 1)
+                           :extensions {"ambient-authority" true})
+            result (scheduler/handle-message
+                    (scheduler/new-scheduler config) #(get @store %)
+                    {:requests [request]} traversal-limits)]
+        (is (= (:rejected gs/status)
+               (get-in result [:message :responses 0 :status])))
+        (is (= :graphsync/extension-rejected
+               (get-in result [:events 0 :reason])))))
+    (let [admitted (scheduler/handle-message
+                    (scheduler/new-scheduler config) #(get @store %)
+                    {:requests [request]} traversal-limits)]
+      (is (thrown? #?(:clj Exception :cljs js/Error)
+                   (scheduler/drain (:scheduler admitted) #(get @store %) 2))))))
+
+(deftest cancellation-stops-future-storage-reads
+  (let [{:keys [store root]} (fixture)
+        reads (atom [])
+        get-counted (fn [cid] (swap! reads conj cid) (get @store cid))
+        request (new-request (request-id 0) root 1)
+        admitted (scheduler/handle-message
+                  (scheduler/new-scheduler config) get-counted
+                  {:requests [request]} traversal-limits)
+        first-step (scheduler/step (:scheduler admitted) get-counted)
+        reads-before-cancel (count @reads)
+        cancelled (scheduler/handle-message
+                   (:scheduler first-step) get-counted
+                   {:requests [{:id (:id request) :type :cancel}]}
+                   traversal-limits)
+        idle (scheduler/step (:scheduler cancelled) get-counted)]
+    (is (= 1 reads-before-cancel))
+    (is (= 35 (get-in cancelled [:message :responses 0 :status])))
+    (is (nil? (:message idle)))
+    (is (= reads-before-cancel (count @reads)))))
+
+(deftest traversal-work-budget-emits-paused-and-resumes
+  (let [{:keys [store root]} (fixture)
+        request (new-request (request-id 0) root 1)
+        scheduler (scheduler/new-scheduler
+                   (assoc config :max-traversal-work-per-step 1))
+        admitted (scheduler/handle-message scheduler #(get @store %)
+                                           {:requests [request]} traversal-limits)
+        root-step (scheduler/step (:scheduler admitted) #(get @store %))
+        paused (scheduler/step (:scheduler root-step) #(get @store %))
+        resumed (scheduler/step (:scheduler paused) #(get @store %))]
+    (is (= 14 (get-in root-step [:message :responses 0 :status])))
+    (is (= 15 (get-in paused [:message :responses 0 :status])))
+    (is (= :work-budget (get-in paused [:event :reason])))
+    (is (some? (:message resumed)))))
+
+(deftest durable-checkpoint-is-cid-and-request-bound
+  (let [{:keys [store root]} (fixture)
+        get-fn #(get @store %)
+        request (new-request (request-id 0) root 1)
+        admitted (scheduler/handle-message (scheduler/new-scheduler config) get-fn
+                                           {:requests [request]} traversal-limits)
+        root-step (scheduler/step (:scheduler admitted) get-fn)
+        saved (scheduler/checkpoint-request (:scheduler root-step) (:id request))
+        advanced (scheduler/step (:scheduler root-step) get-fn)
+        restored (scheduler/restore-request (:scheduler advanced) (:id request)
+                                            (:cid saved) (:bytes saved))
+        replayed (scheduler/step restored get-fn)]
+    (is (= (ipld/link (:cid saved))
+           (get-in saved [:extensions scheduler/checkpoint-extension])))
+    (is (= (get-in advanced [:message :blocks 0 :cid])
+           (get-in replayed [:message :blocks 0 :cid])))
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (scheduler/restore-request (:scheduler advanced) (:id request)
+                                            root (:bytes saved))))))
+
+(deftest checkpoint-extension-persists-fetches-verifies-and-restores
+  (let [{:keys [store root]} (fixture)
+        checkpoints (atom {})
+        get-fn #(or (get @store %) (get @checkpoints %))
+        request (new-request (request-id 0) root 1)
+        admitted (scheduler/handle-message (scheduler/new-scheduler config) get-fn
+                                           {:requests [request]} traversal-limits)
+        root-step (scheduler/step (:scheduler admitted) get-fn)
+        saved (scheduler/persist-checkpoint!
+               (:scheduler root-step) (:id request)
+               (fn [cid bytes] (swap! checkpoints assoc cid bytes) :stored))
+        advanced (scheduler/step (:scheduler root-step) get-fn)
+        updated (scheduler/handle-message
+                 (:scheduler advanced) get-fn
+                 {:requests [{:id (:id request) :type :update
+                              :extensions (:extensions saved)}]}
+                 traversal-limits)
+        replayed (scheduler/step (:scheduler updated) get-fn)]
+    (is (= :stored (:receipt saved)))
+    (is (= :request/restored (get-in updated [:events 0 :type])))
+    (is (= (get-in advanced [:message :blocks 0 :cid])
+           (get-in replayed [:message :blocks 0 :cid])))
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (scheduler/handle-message
+                  (:scheduler root-step) get-fn
+                  {:requests [{:id (:id request) :type :update
+                               :extensions {scheduler/checkpoint-extension "not-a-link"}}]}
+                  traversal-limits)))))

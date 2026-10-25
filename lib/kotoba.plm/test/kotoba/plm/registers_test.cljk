@@ -1,0 +1,139 @@
+(ns kotoba.plm.registers-test
+  "The three movements a single inventory column cannot tell apart."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.plm.registers :as reg]))
+
+;; `kotoba.plm.db/attr` takes a real db value. These tests exercise the pure
+;; parts -- effects / posting / divergence -- so `d` is just a map of
+;; inv-id -> {attr value} and the two readers are rebound to look in it.
+(defn- with-db [rows f]
+  (with-redefs [reg/onhand (fn [d id] (get-in d [id reg/onhand-attr]))
+                reg/accounting (fn [d id] (get-in d [id reg/accounting-attr]))]
+    (f rows)))
+
+(deftest which-registers-move-comes-from-the-vocabulary
+  (testing "produce and consume move both"
+    (is (= {:onhand :increment :accounting :increment} (reg/effects :produce :both)))
+    (is (= {:onhand :decrement :accounting :decrement} (reg/effects :consume :both))))
+  (testing "a title sale moves ownership only"
+    (is (= {:onhand nil :accounting :increment} (reg/effects :transferAllRights :receiver)))
+    (is (= {:onhand nil :accounting :decrement} (reg/effects :transferAllRights :provider))))
+  (testing "consignment moves custody only"
+    (is (= {:onhand :increment :accounting nil} (reg/effects :transferCustody :receiver)))
+    (is (= {:onhand :decrement :accounting nil} (reg/effects :transferCustody :provider))))
+  (testing "a full transfer moves both, and from each side in opposite directions"
+    (is (= {:onhand :increment :accounting :increment} (reg/effects :transfer :receiver)))
+    (is (= {:onhand :decrement :accounting :decrement} (reg/effects :transfer :provider))))
+  (testing "work and use touch no register"
+    (is (= {:onhand nil :accounting nil} (reg/effects :work :both)))
+    (is (= {:onhand nil :accounting nil} (reg/effects :use :both)))))
+
+(deftest a-consignment-receipt-does-not-inflate-what-we-own
+  ;; The case the single column got wrong: material on our floor that the
+  ;; supplier still owns. MRP must see it; the balance sheet must not.
+  (with-db {"INV-X" {reg/onhand-attr 10M reg/accounting-attr 10M}}
+    (fn [d]
+      (let [r (reg/posting d "INV-X" :transferCustody 5M {:side :receiver})]
+        (is (:ok? r))
+        (is (= 15M (get (:tx r) reg/onhand-attr)) "available to a work order")
+        (is (not (contains? (:tx r) reg/accounting-attr))
+            "ownership is untouched, not written as unchanged")))))
+
+(deftest a-title-sale-in-transit-does-not-empty-the-warehouse
+  (with-db {"INV-X" {reg/onhand-attr 10M reg/accounting-attr 10M}}
+    (fn [d]
+      (let [r (reg/posting d "INV-X" :transferAllRights 4M {:side :provider})]
+        (is (:ok? r))
+        (is (= 6M (get (:tx r) reg/accounting-attr)) "we no longer own four")
+        (is (not (contains? (:tx r) reg/onhand-attr))
+            "they are still physically here")))))
+
+(deftest an-ordinary-movement-moves-both-registers-together
+  (with-db {"INV-X" {reg/onhand-attr 10M reg/accounting-attr 10M}}
+    (fn [d]
+      (let [r (reg/posting d "INV-X" :produce 3M {})]
+        (is (= 13M (get (:tx r) reg/onhand-attr)))
+        (is (= 13M (get (:tx r) reg/accounting-attr)))))))
+
+(deftest netting-uses-custody-not-title
+  (with-db {"INV-X" {reg/onhand-attr 15M reg/accounting-attr 10M}}
+    (fn [d]
+      (is (= 15M (reg/available d "INV-X"))
+          "consignment material on the floor is available to consume")))
+  (with-db {"INV-Y" {reg/accounting-attr 40M}}
+    (fn [d]
+      (is (= 0M (reg/available d "INV-Y"))
+          "goods owned but still on a ship cannot be consumed"))))
+
+;; ── not recorded is not zero ───────────────────────────────────────────────
+
+(deftest a-legacy-row-reports-its-fallback-rather-than-hiding-it
+  (with-db {"INV-OLD" {reg/onhand-attr 7M}}
+    (fn [d]
+      (is (= {:value 7M :source :onhand-fallback} (reg/accounting-or-onhand d "INV-OLD"))
+          "a row written before the second register existed must be distinguishable")))
+  (with-db {"INV-NEW" {reg/onhand-attr 7M reg/accounting-attr 7M}}
+    (fn [d]
+      (is (= {:value 7M :source :accounting} (reg/accounting-or-onhand d "INV-NEW"))
+          "same number, different fact")))
+  (with-db {}
+    (fn [d]
+      (is (= {:value nil :source :unrecorded} (reg/accounting-or-onhand d "INV-NONE"))
+          "nil, not 0 — a company that owns nothing is a different claim"))))
+
+;; ── refusals ──────────────────────────────────────────────────────────────
+
+(deftest an-unknown-action-is-refused
+  (with-db {}
+    (fn [d]
+      (let [r (reg/posting d "INV-X" :teleport 1M {})]
+        (is (false? (:ok? r)))
+        (is (= :unknown-action (:code (:error r))))))))
+
+(deftest a-non-positive-quantity-is-refused
+  (with-db {}
+    (fn [d]
+      (is (= :quantity-not-positive (:code (:error (reg/posting d "INV-X" :produce 0M {})))))
+      (is (= :quantity-not-positive (:code (:error (reg/posting d "INV-X" :produce -2M {})))))
+      (is (= :quantity-not-positive (:code (:error (reg/posting d "INV-X" :produce nil {}))))))))
+
+(deftest an-action-that-would-move-nothing-is-refused-rather-than-posted
+  ;; `work` is a real action with a real quantity, but it touches no
+  ;; inventory. Posting it would write an unchanged row and report success.
+  (with-db {"INV-X" {reg/onhand-attr 1M}}
+    (fn [d]
+      (let [r (reg/posting d "INV-X" :work 3M {})]
+        (is (false? (:ok? r)))
+        (is (= :action-moves-no-register (:code (:error r))))))))
+
+(deftest a-transfer-inside-one-set-of-books-nets-to-nothing-and-says-so
+  (with-db {"INV-X" {reg/onhand-attr 5M reg/accounting-attr 5M}}
+    (fn [d]
+      (let [r (reg/posting d "INV-X" :transfer 2M {:side :both})]
+        (is (false? (:ok? r)))
+        (is (= :action-moves-no-register (:code (:error r))))
+        (is (= {:onhand nil :accounting nil} (:effects (:error r)))
+            "a decrementIncrement seen from both sides at once cancels; the caller has to pick a side")))))
+
+;; ── the report a single register could not produce ─────────────────────────
+
+(deftest divergence-names-what-kind-of-mismatch-it-is
+  (with-db {"INV-A" {reg/onhand-attr 10M reg/accounting-attr 10M}
+            "INV-B" {reg/onhand-attr 15M reg/accounting-attr 10M}
+            "INV-C" {reg/onhand-attr 2M reg/accounting-attr 9M}
+            "INV-D" {reg/onhand-attr 4M}}
+    (fn [d]
+      (let [r (reg/divergence d ["INV-A" "INV-B" "INV-C" "INV-D"])
+            by (into {} (map (juxt :inventory :kind)) (:rows r))]
+        (is (= 4 (:scanned r)))
+        (is (= 3 (:diverged r)))
+        (is (nil? (get by "INV-A")) "equal registers are not a divergence")
+        (is (= :held-not-owned (get by "INV-B")) "consignment in")
+        (is (= :owned-not-held (get by "INV-C")) "sold in transit, or at a subcontractor")
+        (is (= :accounting-unrecorded (get by "INV-D")) "a legacy row, not a real mismatch"))))
+  (testing "an empty id list reports that it scanned nothing"
+    (with-db {}
+      (fn [d]
+        (let [r (reg/divergence d [])]
+          (is (= 0 (:scanned r)))
+          (is (:empty-input? r) "0 diverged out of 0 scanned is not a clean bill"))))))

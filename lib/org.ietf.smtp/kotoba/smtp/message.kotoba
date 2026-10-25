@@ -1,0 +1,166 @@
+;; What a message IS, as Kotoba (ADR-2608261100).
+;;
+;; The slice `kotoba/smtp/session.kotoba` declared next: composing the RFC
+;; 5322 message and making it safe to put inside DATA. Three exports carry
+;; rules that are the library's product semantics, not plumbing —
+;;
+;;   recipients   who the transaction addresses. To, Cc AND Bcc, in that
+;;                order, de-duplicated. A Bcc is a recipient.
+;;   mime-message the headers. Bcc is never one of them: a blind carbon copy
+;;                is blind because the address appears in RCPT TO and NOT in
+;;                the message, and writing it into a header hands every
+;;                recipient the list of people who were meant to be invisible.
+;;   dot-stuff    RFC 5321 §4.5.2 transparency. A body line that begins with
+;;                "." has to be doubled, or the first such line ENDS the
+;;                message early and the rest of it is read as SMTP commands.
+;;
+;; `payload` is the two composed, which is what `session/init` writes after
+;; the 354.
+;;
+;; The previous slice recorded splitting a string as the thing that was
+;; missing here — `string-split-count` counts pieces and does not return
+;; them, and there is no index-of. That turned out to be the wrong shape to
+;; want. Dot-stuffing does not need the lines: a line begins with "." exactly
+;; when the text begins with "." or a "\n." occurs, so it is
+;; `string-replace-all "\n." "\n.."` plus one test of the first character.
+;; No scan, no per-character recursion, and nothing here is bounded by how
+;; long the body is. The gap note in session.kotoba comes out with this file.
+;;
+;; The one-or-many shape of `:to` / `:cc` / `:bcc` is read with
+;; `document-kind`, so a caller may pass one address or a vector, exactly as
+;; `smtp.protocol/header-list` allows.
+;;
+;; `.cljc` remains the oracle. This file is not required from
+;; `smtp.protocol` (require-graph). Clojure-shaped twin: message.cljk.
+;;
+;; Compile (the CLI needs -M and an ABSOLUTE source path):
+;;   kotoba -M compile /ABS/kotoba/smtp/message.kotoba \
+;;     --target wasm32-browser --output message.wasm
+;;   kotoba -M compile /ABS/kotoba/smtp/message.kotoba \
+;;     --target js-browser --output message.mjs
+
+(ns smtp.message
+  (:export [dot-stuff mime-message payload recipients]))
+
+;; --- document accessors ---------------------------------------------------
+
+(defn- dg [d :document k :keyword] :document
+  (option-value-of [:option :document] (document-get d k) (document-null)))
+
+(defn- dstr [d :document] :string
+  (option-value-of [:option :string] (document-string-value d) ""))
+
+(defn- ds [d :document k :keyword] :string
+  (dstr (dg d k)))
+
+(defn- elem [v :document i :i64] :string
+  (dstr (option-value-of [:option :document] (document-vector-at v i) (document-null))))
+
+;; --- header values --------------------------------------------------------
+
+;; `str/join ", "`, and join does NOT drop an empty element: the oracle only
+;; removes nils, and a document has no nil to remove. `["" "a"]` is ", a" on
+;; both sides.
+(defn- join-from [v :document i :i64 acc :string] :string
+  (cond
+    (>= i (document-count v)) acc
+    (= i 0) (join-from v 1 (elem v 0))
+    :else (join-from v (+ i 1)
+                     (string-concat acc (string-concat ", " (elem v i))))))
+
+(defn- header-value [v :document] :string
+  (cond
+    (= (document-kind v) :string) (dstr v)
+    (= (document-kind v) :vector) (join-from v 0 "")
+    :else ""))
+
+;; Whether the header is written at all. One address writes it even when the
+;; address is empty (the oracle's `when-let` binds ""); a vector that joins
+;; to nothing does not (its `not-empty` answers nil). Reproducing that split
+;; is why `document-kind` is read rather than the joined string alone.
+(defn- header-present? [v :document] :bool
+  (cond
+    (= (document-kind v) :string) true
+    (= (document-kind v) :vector) (not (string=? (join-from v 0 "") ""))
+    :else false))
+
+(defn- named-header [name :string v :document] :string
+  (if (header-present? v)
+    (string-concat name (string-concat (header-value v) "\r\n"))
+    ""))
+
+;; --- recipients -----------------------------------------------------------
+
+(defn- has-from? [v :document i :i64 s :string] :bool
+  (cond
+    (>= i (document-count v)) false
+    (string=? (elem v i) s) true
+    :else (has-from? v (+ i 1) s)))
+
+(defn- add-unique [acc :document s :string] :document
+  (if (has-from? acc 0 s)
+    acc
+    (document-vector-conj acc (document-string s))))
+
+(defn- add-field [acc :document v :document i :i64] :document
+  (cond
+    (= (document-kind v) :string) (add-unique acc (dstr v))
+    (= (document-kind v) :vector)
+    (if (>= i (document-count v))
+      acc
+      (add-field (add-unique acc (elem v i)) v (+ i 1)))
+    :else acc))
+
+(defn recipients [msg :document] :document
+  (add-field (add-field (add-field (document-vector) (dg msg :to) 0)
+                        (dg msg :cc) 0)
+             (dg msg :bcc) 0))
+
+;; --- the message ----------------------------------------------------------
+
+(defn mime-message [msg :document] :string
+  (let [from (string-concat "From: " (string-concat (ds msg :from) "\r\n"))
+        ;; To is written even when it is empty — the oracle interpolates
+        ;; `header-list`'s nil straight into the string.
+        to (string-concat "To: " (string-concat (header-value (dg msg :to)) "\r\n"))
+        cc (named-header "Cc: " (dg msg :cc))
+        subject (string-concat "Subject: " (string-concat (ds msg :subject) "\r\n"))
+        in-reply-to (ds msg :in-reply-to)
+        reply (if (string=? in-reply-to "")
+                ""
+                (string-concat "In-Reply-To: " (string-concat in-reply-to "\r\n")))
+        fixed "Content-Type: text/plain; charset=UTF-8\r\nMIME-Version: 1.0\r\n\r\n"]
+    (string-concat
+     from
+     (string-concat
+      to
+      (string-concat
+       cc
+       (string-concat
+        subject
+        (string-concat reply (string-concat fixed (ds msg :body)))))))))
+
+;; --- DATA transparency ----------------------------------------------------
+
+(defn- first-char [s :string] :string
+  (if (>= (string-length s) 1)
+    (string-substring s 0 1)
+    ""))
+
+(defn dot-stuff [text :string] :string
+  (let [normalized (string-replace-all text "\r\n" "\n")
+        ;; Every line but the first: it begins with "." exactly when a "\n."
+        ;; precedes it. `string-replace-all` does not rescan what it wrote,
+        ;; so "\n.." becomes "\n..." and not "\n.....".
+        stuffed (string-replace-all normalized "\n." "\n..")
+        ;; The first line has no "\n" in front of it to match on.
+        leading (if (string=? (first-char stuffed) ".")
+                  (string-concat "." stuffed)
+                  stuffed)]
+    (string-concat (string-replace-all leading "\n" "\r\n") "\r\n.\r\n")))
+
+(defn payload [msg :document] :string
+  (let [raw (dg msg :raw)]
+    (if (= (document-kind raw) :string)
+      (dot-stuff (dstr raw))
+      (dot-stuff (mime-message msg)))))

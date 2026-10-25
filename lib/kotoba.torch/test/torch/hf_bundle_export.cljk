@@ -1,0 +1,85 @@
+(ns torch.hf-bundle-export
+  "Export Hugging Face Llama safetensors/tokenizer artifacts for Deno Metal."
+  (:require [kotoba.io :as kio] [num.array :as arr]
+            [num.cpu :as cpu]
+            [torch.generate :as generate]
+            [torch.huggingface-resource :as resource]
+            [torch.metal-bundle-export :as export]
+            [torch.num-backend :as nb]
+            [torch.tokenizer :as tokenizer]))
+
+(defn- step [backend loaded token-id caches]
+  (let [input (arr/from-vec backend [token-id] [1])
+        result (nb/llama-lm-step (:model loaded) (:weights loaded) input caches)
+        logits (arr/->vec (:logits result))]
+    (arr/release! input)
+    (arr/release! (:logits result))
+    {:logits logits :caches (:caches result)}))
+
+(defn- greedy-generate [backend loaded prompt-ids token-count]
+  (let [caches* (atom (nb/init-llama-caches backend (:model loaded) 32))]
+    (try
+      (let [prefill (reduce (fn [{:keys [caches]} token-id]
+                              (let [result (step backend loaded token-id caches)]
+                                (reset! caches* (:caches result)) result))
+                            {:caches @caches*} prompt-ids)]
+        (loop [{:keys [logits caches]} prefill generated []]
+          (if (= token-count (count generated))
+            generated
+            (let [token-id (generate/sample-token logits {:temperature 0.0})
+                  result (step backend loaded token-id caches)]
+              (reset! caches* (:caches result))
+              (recur result (conj generated token-id))))))
+      (finally (nb/release-llama-caches! @caches*)))))
+
+(defn -main
+  [& [config-path checkpoint-path tokenizer-path tokenizer-config-path output-path]]
+  (when-not (every? some? [config-path checkpoint-path tokenizer-path
+                           tokenizer-config-path output-path])
+    (throw (ex-info
+            "usage: ... config.json model.safetensors tokenizer.json tokenizer_config.json output.tgb"
+            {})))
+  (let [backend (cpu/cpu-backend)
+        descriptor (resource/descriptor
+                    "public-hf" config-path checkpoint-path
+                    {:tokenizer-path tokenizer-path
+                     :tokenizer-config-path tokenizer-config-path})
+        loaded (resource/load-resource backend descriptor)]
+    (try
+      (let [config (:config loaded)
+            tokenizer* (:tokenizer loaded)
+            vocab (count (:tokens tokenizer*))
+            prompt-ids (tokenizer/encode tokenizer* "Hello")
+            generated-ids (greedy-generate backend loaded prompt-ids 4)
+            parameters (reduce + (map #(reduce * (:shape %))
+                                      (mapcat vals (:weights loaded))))
+            manifest
+            {:format :torch/llama-metal-bundle-v3
+             :config (assoc config :vocab vocab)
+             :chat-template (:chat-template tokenizer*)
+             :details {:parent_model "dacorvo/tiny-random-llama"
+                       :format "safetensors" :family "llama"
+                       :families ["llama"]
+                       :parameter_size (format "%.1fM" (/ parameters 1.0e6))
+                       :quantization_level "F32"}
+             :model-info {"general.architecture" "llama"
+                          "general.parameter_count" parameters
+                          "llama.block_count" (:block-count config)
+                          "llama.context_length" (:context-length config)
+                          "llama.embedding_length" (:embed-dim config)
+                          "llama.feed_forward_length" (:hidden-dim config)
+                          "llama.attention.head_count" (:head-count config)
+                          "llama.attention.head_count_kv" (:kv-head-count config)}
+             :capabilities ["completion" "embedding"]
+             :tokenizer (select-keys
+                         tokenizer*
+                         [:tokens :merges :model :space-prefix :prepend-space?
+                          :strip-leading-space? :special-ids :unk-id :bos-id
+                          :eos-id :add-bos? :add-eos?])
+             :prompt-ids prompt-ids :generated-ids generated-ids}
+            manifest (export/export! output-path manifest (:weights loaded))]
+        (prn {:status :exported :path output-path
+              :bytes (kio/length (kio/file output-path))
+              :weights (reduce + (map count (:weights manifest)))
+              :prompt-ids prompt-ids :generated-ids generated-ids}))
+      (finally (resource/unload-resource! loaded)))))

@@ -1,0 +1,250 @@
+(ns torch.optim-test
+  (:require [kotoba.test :refer [deftest is]]
+            [num.array :as arr]
+            [num.cpu :as cpu]
+            [torch.model :as m]
+            [torch.num-backend :as nb]
+            [torch.optim :as optim]
+            [torch.train :as train]))
+
+(def backend (cpu/cpu-backend))
+
+(deftest adamw-applies-default-options
+  (let [parameter (arr/from-vec backend [1.0] [1])
+        gradient (arr/from-vec backend [0.5] [1])
+        result (optim/adamw-step [{:w parameter}] [{:w gradient}] nil)]
+    (is (= 1 (get-in result [:state :step])))
+    (is (< (first (arr/->vec (get-in result [:weights 0 :w]))) 1.0))))
+
+(deftest sgd-momentum-nesterov-and-weight-decay-match-reference-equations
+  (let [weights [{:w (arr/from-vec backend [1.0] [1])}]
+        gradients [{:w (arr/from-vec backend [0.5] [1])}]
+        options {:learning-rate 0.1 :momentum 0.9 :weight-decay 0.1
+                 :nesterov true}
+        first-step (optim/sgd-step weights gradients nil options)
+        second-step (optim/sgd-step (:weights first-step) gradients
+                                    (:state first-step) options)]
+    (is (< (Math/abs (- 0.886
+                        (first (arr/->vec (get-in first-step [:weights 0 :w])))))
+           1.0e-12))
+    (is (< (Math/abs (- 0.725566
+                        (first (arr/->vec (get-in second-step [:weights 0 :w])))))
+           1.0e-12))
+    (is (= 2 (get-in second-step [:state :step])))
+    (is (< (Math/abs (- 1.1286
+                        (first (arr/->vec
+                                (get-in second-step
+                                        [:state :slots 0 :w :momentum-buffer])))))
+           1.0e-12))))
+
+(deftest sgd-first-buffer-skips-dampening-and-maximize-reverses-direction
+  (let [weights [{:w (arr/from-vec backend [1.0] [1])}]
+        gradients [{:w (arr/from-vec backend [0.5] [1])}]
+        options {:learning-rate 0.1 :momentum 0.5 :dampening 0.2}
+        first-step (optim/sgd-step weights gradients nil options)
+        second-step (optim/sgd-step (:weights first-step) gradients
+                                    (:state first-step) options)
+        maximized (optim/sgd-step weights gradients nil
+                                  {:learning-rate 0.1 :maximize true})]
+    (is (< (Math/abs (- 0.95 (first (arr/->vec
+                                     (get-in first-step [:weights 0 :w])))))
+           1.0e-12))
+    (is (< (Math/abs (- 0.885 (first (arr/->vec
+                                      (get-in second-step [:weights 0 :w])))))
+           1.0e-12))
+    (is (< (Math/abs (- 1.05 (first (arr/->vec
+                                     (get-in maximized [:weights 0 :w])))))
+           1.0e-12))
+    (is (thrown-with-msg?
+         #?(:clj Exception :cljs js/Error) #"invalid SGD"
+         (optim/sgd-step weights gradients nil
+                         {:momentum 0.9 :dampening 0.1 :nesterov true})))))
+
+(deftest dynamic-loss-scaling-unscales-and-detects-overflow
+  (let [scaler (optim/grad-scaler {:initial-scale 8.0 :growth-interval 2})
+        finite [(hash-map :w (arr/from-vec backend [16.0 -8.0] [2]))]
+        result (optim/unscale-gradients finite (:scale scaler))
+        stable-1 (optim/update-grad-scaler scaler false)
+        stable-2 (optim/update-grad-scaler stable-1 false)
+        overflow [(hash-map :w (arr/from-vec backend [##Inf] [1]))]
+        overflow-result (optim/unscale-gradients overflow (:scale stable-2))]
+    (is (= [2.0 -1.0] (arr/->vec (get-in result [:gradients 0 :w]))))
+    (is (false? (:found-inf? result)))
+    (is (= 16.0 (:scale stable-2)))
+    (is (:found-inf? overflow-result))
+    (is (= 8.0 (:scale (optim/update-grad-scaler stable-2 true))))))
+
+(deftest loss-scaling-multiplies-backward-gradients-only
+  (let [model (m/sequential (m/linear 2 2))
+        input (arr/from-vec backend [1.0 -2.0] [1 2])
+        target (arr/from-vec backend [0.0 1.0] [1 2])
+        weights (nb/random-weights backend model 19)
+        plain (train/loss-and-gradients model weights input target)
+        scaled (train/loss-and-gradients model weights input target {:loss-scale 32.0})]
+    (is (= (:loss plain) (:loss scaled)))
+    (is (every? true?
+                (map (fn [a b] (< (Math/abs (- (* 32.0 a) b)) 1.0e-9))
+                     (arr/->vec (get-in plain [:gradients 0 :w]))
+                     (arr/->vec (get-in scaled [:gradients 0 :w])))))))
+
+(deftest scaled-adamw-skips-overflow-without-mutating-state
+  (let [weights [{:w (arr/from-vec backend [1.0] [1])}]
+        scaler (optim/grad-scaler {:initial-scale 8.0})
+        overflow [{:w (arr/from-vec backend [##Inf] [1])}]
+        skipped (optim/scaled-adamw-step weights overflow nil scaler)
+        finite [{:w (arr/from-vec backend [4.0] [1])}]
+        updated (optim/scaled-adamw-step weights finite nil scaler
+                                          {:learning-rate 0.01
+                                           :weight-decay 0.0})]
+    (is (:skipped? skipped))
+    (is (identical? weights (:weights skipped)))
+    (is (nil? (:optimizer-state skipped)))
+    (is (= 4.0 (:scale (:scaler skipped))))
+    (is (false? (:skipped? updated)))
+    (is (= 1 (get-in updated [:optimizer-state :step])))
+    (is (< (first (arr/->vec (get-in updated [:weights 0 :w]))) 1.0))))
+
+#?(:clj
+   (deftest async-scaled-adamw-matches-control-flow-contract
+     (let [weights [{:w (arr/from-vec backend [1.0 -2.0] [2])}]
+           scaler (optim/grad-scaler {:initial-scale 8.0 :growth-interval 2})
+           finite [{:w (arr/from-vec backend [4.0 -2.0] [2])}]
+           updated (.get (optim/scaled-adamw-step-async
+                          weights finite nil scaler
+                          {:learning-rate 0.01 :weight-decay 0.0}))
+           overflow [{:w (arr/from-vec backend [##Inf 1.0] [2])}]
+           skipped (.get (optim/scaled-adamw-step-async
+                          weights overflow nil scaler))]
+       (is (false? (:skipped? updated)))
+       (is (= 1 (get-in updated [:optimizer-state :step])))
+       (is (= 1 (get-in updated [:scaler :growth-tracker])))
+       (is (:skipped? skipped))
+       (is (identical? weights (:weights skipped)))
+       (is (= 4.0 (get-in skipped [:scaler :scale]))))))
+
+(deftest mixed-precision-unet-step-keeps-f32-master-weights
+  (let [model (m/sequential (m/conv2d 1 2 3 1 1)
+                            (m/groupnorm 1 2)
+                            (m/silu))
+        weights (nb/random-weights backend model 44)
+        input (arr/from-vec backend (mapv #(- (* 0.04 %) 0.3) (range 16))
+                            [1 1 4 4])
+        target (arr/from-vec backend (repeat 32 0.1) [1 2 4 4])
+        scaler (optim/grad-scaler {:initial-scale 128.0})
+        result (train/mixed-precision-adamw-step
+                model weights input target nil scaler
+                {:autocast-dtype :f16
+                 :adamw-options {:learning-rate 0.002 :weight-decay 0.0}})]
+    (is (false? (:skipped? result)))
+    (is (= :f16 (:dtype (:prediction result))))
+    (is (= :f32 (:dtype (get-in result [:weights 0 :w]))))
+    (is (= 1 (get-in result [:optimizer-state :step])))
+    (is (= 1 (:growth-tracker (:scaler result))))
+    (is (not= (arr/->vec (get-in weights [0 :w]))
+              (arr/->vec (get-in result [:weights 0 :w]))))))
+
+(deftest mixed-precision-unet-step-skips-overflow
+  (let [model (m/sequential (m/conv2d 1 2 3 1 1) (m/silu))
+        weights (nb/random-weights backend model 7)
+        input (arr/from-vec backend (repeat 16 1.0e20) [1 1 4 4])
+        target (arr/from-vec backend (repeat 32 0.0) [1 2 4 4])
+        scaler (optim/grad-scaler {:initial-scale 1.0e30})
+        result (train/mixed-precision-adamw-step
+                model weights input target nil scaler
+                {:autocast-dtype :f16})]
+    (is (:skipped? result))
+    (is (identical? weights (:weights result)))
+    (is (nil? (:optimizer-state result)))
+    (is (= 5.0e29 (:scale (:scaler result))))))
+
+(deftest mixed-precision-learned-attention-updates-f32-master-weights
+  (let [model (m/sequential (m/multihead-attention 4 1))
+        weights (nb/random-weights backend model 19)
+        input (arr/from-vec backend [0.1 0.2 0.3 0.4, -0.2 0.1 0.5 -0.3]
+                            [1 2 4])
+        target (arr/from-vec backend (repeat 8 0.0) [1 2 4])
+        scaler (optim/grad-scaler {:initial-scale 32.0})
+        pass (train/loss-and-gradients model weights input target
+                                       {:autocast-dtype :f16
+                                        :loss-scale (:scale scaler)})
+        result (train/mixed-precision-adamw-step
+                model weights input target nil scaler
+                {:autocast-dtype :f16
+                 :adamw-options {:learning-rate 0.001 :weight-decay 0.0}})
+        async-result #?(:clj
+                        (.get (train/mixed-precision-adamw-step-async
+                               model weights input target nil scaler
+                               {:autocast-dtype :f16
+                                :adamw-options {:learning-rate 0.001
+                                                :weight-decay 0.0}}))
+                        :cljs nil)
+        next-pass (train/loss-and-gradients model (:weights result) input target
+                                            {:autocast-dtype :f16})]
+    (is (false? (:skipped? result)))
+    (is (= :f16 (:dtype (:prediction result))))
+    (is (= :f32 (:dtype (get-in result [:weights 0 :qw]))))
+    (is (= 1 (get-in result [:optimizer-state :step])))
+    (is (or (nil? async-result)
+            (= (arr/->vec (get-in result [:weights 0 :qw]))
+               (arr/->vec (get-in async-result [:weights 0 :qw])))))
+    (is (= #{:f32} (set (map :dtype (vals (first (:gradients pass)))))))
+    (is (< (:loss next-pass) (:loss pass)))
+    (is (not= (arr/->vec (get-in weights [0 :qw]))
+              (arr/->vec (get-in result [:weights 0 :qw]))))))
+
+(deftest adamw-trains-and-preserves-aligned-immutable-state
+  (let [model (m/sequential (m/linear 2 4) (m/silu) (m/linear 4 2))
+        input (arr/from-vec backend [1 0 0 1 1 1] [3 2])
+        target (arr/from-vec backend [1 0 0 1 1 0] [3 2])
+        initial (nb/random-weights backend model 73)
+        initial-loss (:loss (train/loss-and-gradients model initial input target))
+        trained
+        (loop [iteration 0 weights initial state nil]
+          (if (= iteration 80)
+            {:weights weights :state state}
+            (let [{:keys [gradients]} (train/loss-and-gradients
+                                       model weights input target)
+                  next (optim/adamw-step weights gradients state
+                                         {:learning-rate 0.03
+                                          :weight-decay 0.001})]
+              (recur (inc iteration) (:weights next) (:state next)))))
+        final-loss (:loss (train/loss-and-gradients
+                           model (:weights trained) input target))]
+    (is (< final-loss initial-loss))
+    (is (= 80 (get-in trained [:state :step])))
+    (is (nil? (second (:weights trained))))
+    (is (nil? (get-in trained [:state :slots 1])))
+    (is (= [2 4] (:shape (get-in trained [:state :slots 0 :w :moment]))))
+    (is (not= (arr/->vec (:w (first initial)))
+              (arr/->vec (:w (first (:weights trained))))))))
+
+(deftest unified-optimizer-step-connects-model-autograd-and-stateful-sgd
+  (let [model (m/sequential (m/linear 2 4) (m/silu) (m/linear 4 2))
+        input (arr/from-vec backend [1 0 0 1 1 1] [3 2])
+        target (arr/from-vec backend [1 0 0 1 1 0] [3 2])
+        initial (nb/random-weights backend model 83)
+        trained
+        (loop [iteration 0 weights initial state nil losses []]
+          (if (= iteration 60)
+            {:weights weights :state state :losses losses}
+            (let [result
+                  (train/optimizer-step
+                   model weights input target state
+                   {:optimizer :sgd
+                    :optimizer-options
+                    {:learning-rate 0.05 :momentum 0.9 :nesterov true
+                     :weight-decay 0.001}})]
+              (recur (inc iteration) (:weights result)
+                     (:optimizer-state result) (conj losses (:loss result))))))]
+    (is (< (last (:losses trained)) (first (:losses trained))))
+    (is (= 60 (get-in trained [:state :step])))
+    (is (some? (get-in trained [:state :slots 0 :w :momentum-buffer])))
+    (is (nil? (get-in trained [:state :slots 1]))))
+  (is (thrown-with-msg?
+       #?(:clj Exception :cljs js/Error) #"optimizer must"
+       (train/optimizer-step
+        (m/sequential (m/linear 1 1))
+        [{:w (arr/from-vec backend [1.0] [1 1])
+          :b (arr/from-vec backend [0.0] [1])}]
+        (arr/from-vec backend [1.0] [1 1])
+        (arr/from-vec backend [0.0] [1 1]) nil {:optimizer :unknown}))))

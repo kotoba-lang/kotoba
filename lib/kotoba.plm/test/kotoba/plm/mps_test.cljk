@@ -1,0 +1,58 @@
+(ns kotoba.plm.mps-test
+  (:require [kotoba.test :refer [deftest testing is]]
+            [kotoba.plm.db :as db]
+            #?(:clj [kotoba.plm.db-host :as db-host])
+            [kotoba.plm.item :as plm]
+            [kotoba.plm.erp :as erp]
+            [kotoba.plm.thread :as thread]
+            [kotoba.plm.mps :as mps]
+            [kotoba.plm.mrp :as mrp]))
+
+(def ^:private week1 #inst "2026-08-03T00:00:00.000-00:00")
+(def ^:private week2 #inst "2026-08-10T00:00:00.000-00:00")
+(def ^:private horizon-end #inst "2026-09-01T00:00:00.000-00:00")
+
+(defn- world []
+  (let [conn #?(:clj (db-host/fresh-conn (str "t-mps-" (System/nanoTime)))
+                :cljs (throw (ex-info "Datomic Local test oracle is JVM-only" {})))]
+    (db/tx! conn erp/chart)
+    (db/tx! conn
+      [(plm/item {:part-no "PN-2000" :make-buy :buy :std-unit-cost 100})
+       (plm/item {:part-no "PN-2001" :make-buy :buy :std-unit-cost 50})
+       (plm/item {:part-no "PN-1000" :make-buy :make})])
+    (db/tx! conn
+      [(plm/bom-edge {:parent "PN-1000@A" :child "PN-2000@A" :qty 4 :find-no 1})
+       (plm/bom-edge {:parent "PN-1000@A" :child "PN-2001@A" :qty 2 :find-no 2})])
+    (doseq [iid ["PN-2000@A" "PN-2001@A" "PN-1000@A"]] (thread/release-item! conn iid))
+    conn))
+
+(deftest draft-lines-do-not-feed-demand
+  (let [conn (world)]
+    (db/tx! conn [(mps/mps-line {:item "PN-1000@A" :period week1 :qty 10 :kind :firm})])
+    (is (= [{:period week1 :qty 10M :kind :firm :state :draft}]
+           (mps/mps-for-item (db/db conn) "PN-1000@A")))
+    (is (= 0M (mps/approved-demand-for-item (db/db conn) "PN-1000@A" nil nil))
+        ":draft lines are not MRP-eligible")))
+
+(deftest approved-lines-sum-within-horizon
+  (let [conn (world)]
+    (db/tx! conn
+      [(mps/mps-line {:item "PN-1000@A" :period week1 :qty 10 :kind :firm})
+       (mps/mps-line {:item "PN-1000@A" :period week2 :qty 6 :kind :firm})])
+    (db/tx! conn [{:plm.mps/id (str "PN-1000@A|" (.getTime week1)) :plm.mps/state :approved}
+                  {:plm.mps/id (str "PN-1000@A|" (.getTime week2)) :plm.mps/state :approved}])
+    (is (= 16M (mps/approved-demand-for-item (db/db conn) "PN-1000@A" nil nil))
+        "both approved weeks sum")
+    (is (= 10M (mps/approved-demand-for-item (db/db conn) "PN-1000@A" nil week2))
+        "horizon end excludes week2 (exclusive upper bound)")))
+
+(deftest mrp-run-from-mps-nets-against-on-hand-and-raises-po
+  (let [conn (world)]
+    (db/tx! conn [(mps/mps-line {:item "PN-1000@A" :period week1 :qty 10 :kind :firm})])
+    (db/tx! conn [{:plm.mps/id (str "PN-1000@A|" (.getTime week1)) :plm.mps/state :approved}])
+    (let [r (mrp/mrp-run-from-mps! conn "PN-1000@A" nil horizon-end)]
+      (is (:ok r))
+      (is (= 10M (:demand r)))
+      (is (= #{"PN-2000@A" "PN-2001@A"} (set (map :item (:ordered r)))))
+      (is (= 40M (:net (first (filter #(= "PN-2000@A" (:item %)) (:plan r))))) "4 x 10")
+      (is (= 20M (:net (first (filter #(= "PN-2001@A" (:item %)) (:plan r))))) "2 x 10"))))

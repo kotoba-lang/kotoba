@@ -1,0 +1,186 @@
+(ns kotobase.lfs.engine
+  "Batch and verify, decided from resolved inputs.
+
+  The engine does no I/O. It is given what the store already said — a stat
+  per oid, and a transfer grant per object that needs one — and returns
+  `{:status n :body m}`. Everything asynchronous stays outside.
+
+  That split is not stylistic. The deployment target is a Cloudflare Worker,
+  where `-stat-object` and any SigV4 presign return Promises; an engine that
+  called them inline would work on the JVM and return unresolved Promises in
+  production. `kotobase-storage` already draws this line for blocks (a
+  separate async contract, and async ports), and this is the same line.
+
+  So a caller runs three steps:
+
+      (def parsed (batch/parse-request body))          ; pure
+      (def stats  (resolve every (:objects parsed)))   ; awaited by the caller
+      (def needs  (engine/grants-needed parsed ctx stat))
+      (def grants (presign every need))                ; awaited by the caller
+      (engine/handle-batch (assoc ctx :stat .. :grant ..) parsed)
+
+  On a synchronous store, `stat-fn` and `proxy-grant-fn` collapse steps 2-4
+  into one call and the whole thing reads like it did before.
+
+  An LFS oid IS the object's CID — both carry the same sha2-256 digest — so
+  `kotobase.storage.object-id` converts between them with no registry
+  (superproject ADR-2608012600 D1). An oid that cannot be converted is
+  refused, never stored under a name nothing can resolve."
+  (:require [kotobase.lfs.batch :as batch]
+            [kotobase.storage.object :as object]
+            [kotobase.storage.object-id :as oid]))
+
+(def ^:private missing-message "Object does not exist")
+(def ^:private size-mismatch-message
+  "Object size does not match the size recorded for this oid")
+
+;; ── input resolution helpers (synchronous platforms) ────────────────────────
+
+(defn stat-fn
+  "A `:stat` for a SYNCHRONOUS store. A Worker builds the map from awaited
+  promises instead and passes `(fn [oid] (get stats oid))`.
+
+  The store is validated here rather than per-object: a provider that
+  declares a transfer profile it does not implement should be caught when
+  the server wires itself up, not by the first customer's first push."
+  [store]
+  (object/validate-object-store! store)
+  (fn [oid*]
+    (when-let [cid (oid/wire-id->cid :lfs oid*)]
+      (object/-stat-object store cid))))
+
+(defn proxy-grant-fn
+  "A `:grant` that points clients back at this server — the only option for a
+  provider whose declared profile is `:proxied-transfer`."
+  [{:keys [objects-base proxy-headers expires-in]}]
+  (fn [{:keys [oid]}]
+    {:href (str objects-base "/" oid)
+     :headers proxy-headers
+     :expires-in expires-in}))
+
+(defn- decision
+  "What the engine will do with one requested object, before any grant
+  exists. Shared by `grants-needed` and the response builders so the two can
+  never disagree about which objects get an action."
+  [{:keys [operation]} {:keys [max-object-bytes]} stat {:keys [oid size]}]
+  (let [cid (oid/wire-id->cid :lfs oid)]
+    (cond
+      (nil? cid) [:error 422 "oid is not a sha256 digest"]
+
+      (= "download" operation)
+      (cond
+        (nil? stat) [:error 404 missing-message]
+        (not= size (:size-bytes stat)) [:error 422 size-mismatch-message]
+        :else [:grant :download cid])
+
+      ;; Present already: `actions` is omitted, which is how the protocol
+      ;; says so. An upload href here makes every client re-push everything.
+      (and stat (= size (:size-bytes stat))) [:present]
+
+      ;; Present under this oid with a different length. The digest is the
+      ;; name, so one of the two sizes is wrong about the same bytes; both
+      ;; storing and serving would be a guess.
+      stat [:error 422 size-mismatch-message]
+
+      (and max-object-bytes (> size max-object-bytes))
+      [:error 413 (str "object exceeds the " max-object-bytes
+                       "-byte limit of this plane")]
+
+      :else [:grant :upload cid])))
+
+(defn grants-needed
+  "Which objects need a transfer grant, so an async caller can presign them
+  all in one await before calling `handle-batch`.
+
+  Returns `[{:op :download|:upload :oid hex :cid cid :size n} …]`."
+  [parsed ctx stat]
+  (into []
+        (keep (fn [{:keys [oid size] :as o}]
+                (let [[kind op cid] (decision parsed ctx (stat oid) o)]
+                  (when (= :grant kind)
+                    {:op op :oid oid :cid cid :size size}))))
+        (:objects parsed)))
+
+;; ── batch ───────────────────────────────────────────────────────────────────
+
+(defn- answer [parsed ctx stat grant {:keys [oid size] :as o}]
+  (let [[kind a b] (decision parsed ctx (stat oid) o)]
+    (case kind
+      :error (batch/object-error o a b)
+      :present (batch/object-already-present o)
+      :grant
+      (let [g (grant {:op a :oid oid :cid b :size size})]
+        (batch/object-with-actions
+         o (if (= :upload a)
+             {:upload (batch/action g)
+              ;; verify points back at THIS server even when the bytes went
+              ;; straight to storage — it is the only place that learns an
+              ;; upload finished.
+              :verify (batch/action {:href (str (:objects-base ctx) "/" oid "/verify")
+                                     :headers (:proxy-headers ctx)
+                                     :expires-in (:expires-in ctx)})}
+             {:download (batch/action g)}))))))
+
+(defn handle-batch
+  "POST {endpoint}/objects/batch.
+
+  `ctx` = {:stat             (fn [oid]) → stat map or nil          (required)
+           :grant            (fn [{:op :oid :cid :size}]) → grant  (required)
+           :objects-base     absolute URL of {endpoint}/objects    (required)
+           :expires-in       seconds a grant stays valid
+           :proxy-headers    headers a client must send back here
+           :max-object-bytes
+           :quota            (fn [{:keys [new-bytes new-objects]}])
+                             → nil to allow, or {:status n :body m}}
+
+  `body` is the decoded JSON request (re-parsing an already-parsed request
+  is a no-op)."
+  [{:keys [stat grant quota] :as ctx} body]
+  ;; ALWAYS parse. An earlier version skipped validation when the body
+  ;; already looked parsed, which meant a client could get its own
+  ;; unvalidated request back by including the field the shortcut tested
+  ;; for. Parsing is pure and idempotent, so there is nothing to save.
+  (let [parsed (batch/parse-request body)]
+    (if (:status parsed)
+      parsed
+      (let [{:keys [operation objects]} parsed]
+        (if (= "download" operation)
+          {:status 200
+           :body (batch/response (map #(answer parsed ctx stat grant %) objects))}
+          ;; Quota is decided BEFORE grants are issued, and on the bytes the
+          ;; client has not stored yet. Once a presigned grant is out, the
+          ;; server has no further say in whether those bytes arrive.
+          (let [new (remove #(stat (:oid %)) objects)
+                denial (when quota
+                         (quota {:new-bytes (reduce + 0 (map :size new))
+                                 :new-objects (count new)}))]
+            (or denial
+                {:status 200
+                 :body (batch/response
+                        (map #(answer parsed ctx stat grant %) objects))})))))))
+
+(defn handle-verify
+  "POST {endpoint}/objects/{oid}/verify — the client telling us an upload
+  finished.
+
+  With a presigned grant the bytes never passed through this server, so this
+  is where it learns the object arrived. It reports what the STORE said, not
+  what the client claims."
+  [{:keys [stat]} oid* size]
+  (let [cid (oid/wire-id->cid :lfs oid*)
+        s (when cid (stat oid*))]
+    (cond
+      (nil? cid) {:status 422 :body {:message "oid is not a sha256 digest"}}
+      (nil? s) {:status 404 :body {:message missing-message}}
+      (and (some? size) (not= size (:size-bytes s)))
+      {:status 422 :body {:message size-mismatch-message}}
+      :else {:status 200 :body {}})))
+
+(defn locks-not-implemented
+  "The locking API is not implemented, and says so with 501.
+
+  A 501 is a real answer: clients degrade on it. What must not happen is a
+  200 with an empty lock list, which tells a client its lock succeeded while
+  nothing enforces anything."
+  []
+  {:status 501 :body {:message "this server does not implement the LFS locking API"}})

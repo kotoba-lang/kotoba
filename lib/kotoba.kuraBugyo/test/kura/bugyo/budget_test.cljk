@@ -1,0 +1,95 @@
+(ns kura.bugyo.budget-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kura.bugyo.budget :as budget]
+            [kura.bugyo.pricing :as pricing]))
+
+(def rates (pricing/rates {}))
+(def launch pricing/launch-layout)
+(def pol (budget/policy {:monthly-usd-cap 25.00}))
+
+(def ^:private tb (long 1e12))
+
+(deftest rates-are-published-figures
+  (is (= 6.95 (get-in budget/provider-rates [:backblaze-b2 :usd-tb-month]))
+      "corrected 2026-07-30 from $6.00 against the pricing page itself")
+  (is (seq (get-in budget/provider-rates [:backblaze-b2 :source]))
+      "the rate that prices the entire rented fleet cites where it was read")
+  (is (= 15.00 (get-in budget/provider-rates [:cloudflare-r2 :usd-tb-month])))
+  (testing "owned disk is zero MARGINAL cost, and says that is what it means"
+    (is (= 0.00 (get-in budget/provider-rates [:self-hosted :usd-tb-month])))
+    (is (= :marginal (get-in budget/provider-rates [:self-hosted :provenance])))
+    (is (re-find #"0\.26" (get-in budget/provider-rates [:self-hosted :note]))
+        "and cites the replacement-cost figure, so free-marginal is not read as free")))
+
+(deftest an-unpriced-provider-is-charged-the-most-expensive-rate
+  (testing "defaulting an uncosted backend to zero is how a ceiling gets
+            bypassed by adding a provider nobody priced"
+    (let [known (budget/projected-monthly-usd {:cloudflare-r2 tb})
+          unknown (budget/projected-monthly-usd {:some-new-cloud tb})]
+      (is (= known unknown) "unknown is charged the worst known rate, not zero")
+      (is (pos? unknown)))))
+
+(deftest cost-is-computed-on-physical-bytes
+  (testing "a ceiling in logical TB silently doubles when the code's parameters
+            change — which is the shape of every surprising cloud bill"
+    (is (= 6.95 (budget/projected-monthly-usd {:backblaze-b2 tb})))
+    (is (= 13.90 (budget/projected-monthly-usd {:backblaze-b2 (* 2 tb)})))
+    (testing "and a mirror across B2 and owned disk costs only the B2 half"
+      (is (= 6.95 (budget/projected-monthly-usd {:backblaze-b2 tb :self-hosted tb}))))))
+
+(deftest the-cap-refuses-rather-than-warns
+  (let [usage {:backblaze-b2 (* 2 tb)}]
+    (testing "under the cap"
+      (let [r (budget/admit-write? pol usage :backblaze-b2 tb)]
+        (is (:allow? r))
+        (is (= 20.85 (:projected-usd r)))
+        (is (< 4.14 (:headroom-usd r) 4.16))))
+    (testing "over it — refused, with the arithmetic in the reason"
+      (let [r (budget/admit-write? pol usage :backblaze-b2 (* 2 tb))]
+        (is (false? (:allow? r)))
+        (is (= :budget-exceeded (:reason r)))
+        (is (re-find #"\$27\.8" (:note r)))))
+    (testing "refusal is a return value, not a throw — hitting a ceiling is an
+              expected state for an experiment that is working"
+      (is (map? (budget/admit-write? pol usage :backblaze-b2 (* 99 tb)))))))
+
+(deftest warning-fires-before-the-wall
+  (let [r (budget/admit-write? pol {} :backblaze-b2 (* 3 tb))]
+    (is (:allow? r))
+    (is (:warn? r) "20.85 of 25 is past the 70% mark")
+    (is (< 0.8 (:pressure r) 0.9))))
+
+(deftest free-capacity-does-not-buy-infinite-capacity-silently
+  (testing "an all-owned mix has no bill, so the cap cannot bound it — the
+            answer is unbounded rather than a large finite lie"
+    (is (= ##Inf (budget/capacity-tb pol launch {:self-hosted 1.0}))))
+  (testing "and a real mix gives a real number"
+    (let [b2-only (budget/capacity-tb pol launch {:backblaze-b2 1.0})
+          mirrored (budget/capacity-tb pol launch {:backblaze-b2 0.5 :self-hosted 0.5})]
+      ;; $25 cap, 2.0x multiplier, $6.95/TB -> 25/13.90 logical TB on B2 alone.
+      (is (< 1.7 b2-only 1.9))
+      (is (< (* 1.9 b2-only) mirrored (* 2.1 b2-only))
+          "mirroring half onto owned disk doubles what the cap buys"))))
+
+(deftest the-report-states-the-loss-instead-of-hiding-it
+  (let [r (budget/report pol rates launch {:backblaze-b2 (* 2 tb)})]
+    (is (= 2.0 (:physical-tb r)))
+    (is (= 1.0 (:logical-tb r)) "2 physical TB at 2.0x is 1 logical TB")
+    (is (= 13.90 (:cost-usd-month r)))
+    (is (< 4.6 (:notional-revenue-usd-month r) 4.7))
+    (is (true? (:loss-making? r)))
+    (is (neg? (:net-usd-month r)) "loses about $7.38 a month per logical TB")
+    (is (re-find #"buys operational knowledge, not margin" (:note r))
+        "the framing is in the report, so it cannot quietly slip")))
+
+(deftest mirroring-onto-owned-disk-turns-the-loss-around
+  (testing "the finding that matters for a B2-backed experiment: half on B2 and
+            half on a machine you own costs the SAME as B2 alone at 1.0x, and
+            survives losing B2 entirely"
+    (let [b2-coded (budget/report pol rates launch {:backblaze-b2 (* 2 tb)})
+          mirrored (budget/report pol rates launch {:backblaze-b2 tb :self-hosted tb})]
+      (is (= (:logical-tb b2-coded) (:logical-tb mirrored)) "same data stored")
+      (is (= 6.95 (:cost-usd-month mirrored)))
+      (is (= 13.90 (:cost-usd-month b2-coded)))
+      (is (> (:net-usd-month mirrored) (:net-usd-month b2-coded))
+          "half the bill for the same durability the code was paying 2x for"))))

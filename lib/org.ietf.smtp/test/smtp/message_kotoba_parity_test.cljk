@@ -1,0 +1,233 @@
+;; `kotoba/smtp/message.kotoba` against `smtp.protocol`.
+;;
+;; The slice is what a message IS: who it addresses, what headers it
+;; carries, and what has to happen to its body before it can go inside DATA.
+;; Three rules here are the reason this is product semantics and not
+;; plumbing, and each has a test named after it below —
+;;
+;;   * a Bcc is a recipient and never a header;
+;;   * a body line beginning with "." has to be doubled, or it ends the
+;;     message early (RFC 5321 §4.5.2);
+;;   * the same address named twice is one RCPT TO.
+;;
+;; `.cljc` stays the oracle and is not required from the guest
+;; (require-graph). Nothing but this file notices the two drifting apart.
+
+(ns smtp.message-kotoba-parity-test
+  (:require [kotoba.io :as io]
+            [clojure.java.shell :as shell]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]
+            [smtp.guest-document :refer [->doc strings]]
+            [smtp.protocol :as p]))
+
+(def ^:private kotoba-file
+  (io/file (System/getProperty "user.dir") "kotoba" "smtp" "message.kotoba"))
+
+(def ^:private cljk-file
+  (io/file (System/getProperty "user.dir") "kotoba" "smtp" "message.cljk"))
+
+(defn- source-available? []
+  (let [kotoba? (io/exists? kotoba-file)
+        cljk? (io/exists? cljk-file)]
+    (is kotoba? (str "kotoba object not found at " kotoba-file))
+    (is cljk? (str "cljk object not found at " cljk-file))
+    (and kotoba? cljk?)))
+
+(def ^:private kir
+  (delay (:kir (compiler/compile-source (slurp kotoba-file) :wasm32-kotoba-v1 {}))))
+
+(def ^:private cljk-kir
+  (delay (:kir (compiler/compile-source (slurp cljk-file) :wasm32-kotoba-v1 {}))))
+
+(defn- call [compiled f args] (ir/execute compiled f args))
+
+;; --- dot-stuff --------------------------------------------------------------
+
+;; Bodies that exercise every position a "." can hold: first character, after
+;; a newline, doubled already, and none at all. `\r\n` and bare `\n` both
+;; appear because the oracle normalises them and a caller supplies either.
+(def ^:private bodies
+  [""
+   "."
+   ".x"
+   "a"
+   "no dots here"
+   "\r\n"
+   "\n"
+   "a\n"
+   "a\r\n.b\r\nc"
+   ".\n."
+   "line\r\n..dots\r\n"
+   "..\r\n.\r\n"
+   ".\r\n.\r\n."
+   "ends with a dot ."
+   "\n\n.\n\n"])
+
+(deftest kotoba-message-objects-are-present
+  (source-available?))
+
+(deftest dot-stuffing-agrees-with-the-cljc-oracle
+  (when (source-available?)
+    (doseq [body bodies]
+      (is (= (p/dot-stuff body) (call @kir 'dot-stuff [body]))
+          (str "dot-stuff " (pr-str body)))
+      (is (= (call @kir 'dot-stuff [body]) (call @cljk-kir 'dot-stuff [body]))
+          (str "cljk drifted on dot-stuff " (pr-str body))))))
+
+(deftest a-leading-dot-must-go-red
+  "The first line has no \"\\n\" in front of it to match on, so it is the one
+  line `string-replace-all` cannot reach. A body that begins with \".\" and
+  is not stuffed ENDS the message at its first line, and everything after it
+  is read by the server as SMTP commands.
+
+  Assert the mutation changed the emitted value before asserting the
+  disagreement — a guest that fails to compile must not count as the control
+  firing."
+  (when (source-available?)
+    (let [mutated (str/replace (slurp kotoba-file)
+                               "(string=? (first-char stuffed) \".\")"
+                               "(string=? (first-char stuffed) \"\\u0000\")")
+          _ (is (not= mutated (slurp kotoba-file))
+                "the leading-dot test was not found — the control mutated nothing")
+          mutated-kir (:kir (compiler/compile-source mutated :wasm32-kotoba-v1 {}))
+          got (call mutated-kir 'dot-stuff [".hidden\r\nrest of the body"])]
+      (is (= ".hidden\r\nrest of the body\r\n.\r\n" got)
+          "the mutation has to actually stop stuffing the first line")
+      (is (not= (p/dot-stuff ".hidden\r\nrest of the body") got)
+          "an unstuffed leading dot terminates the message early"))))
+
+;; --- headers and recipients -------------------------------------------------
+
+;; `from` is a field of the message for the guest; the oracle takes it from
+;; the session and is handed the same value here.
+(def ^:private messages
+  [{:from "me@example.com" :to "a@example.com" :subject "s" :body "hi"}
+   {:from "me@example.com" :to ["a@example.com" "b@example.com"]
+    :cc "c@example.com" :subject "s" :body "hi"}
+   {:from "me@example.com" :to ["a@example.com"]
+    :cc ["c@example.com" "d@example.com"] :bcc "secret@example.com"
+    :subject "s" :body "hi"}
+   {:from "me@example.com" :to "a@example.com" :subject "s" :body "hi"
+    :in-reply-to "<earlier@example.com>"}
+   {:from "me@example.com" :to "a@example.com" :subject "s" :body "hi"
+    :in-reply-to ""}
+   {:from "me@example.com" :to [] :cc [] :subject "s" :body "hi"}
+   {:from "me@example.com" :to "" :subject "s" :body "hi"}
+   {:from "me@example.com" :to ["" "a@example.com"] :subject "s" :body "hi"}
+   {:from "me@example.com" :to [""] :cc [""] :subject "s" :body "hi"}
+   {:from "me@example.com" :to "a@example.com" :cc "" :subject "s" :body "hi"}
+   {:from "me@example.com" :to "a@example.com" :subject "s"
+    :body ".dot line\r\nnext"}
+   {:from "me@example.com" :to "a@example.com" :subject "" :body ""}
+   {:from "me@example.com" :to "a@example.com"
+    :raw "Subject: =?UTF-8?B?5pel?=\r\n\r\nbody"}
+   {:from "me@example.com" :to ["a@example.com" "a@example.com" "b@example.com"]
+    :cc "a@example.com" :bcc ["b@example.com" "z@example.com"]
+    :subject "s" :body "hi"}])
+
+;; `recipients-of` is private to `smtp.client`; this is the same rule, and
+;; the client tests pin the client's own copy of it.
+(defn- oracle-recipients [msg]
+  (let [as-list (fn [v] (cond (nil? v) []
+                              (string? v) [v]
+                              (sequential? v) (vec (remove nil? v))
+                              :else [v]))]
+    (vec (distinct (concat (as-list (:to msg))
+                           (as-list (:cc msg))
+                           (as-list (:bcc msg)))))))
+
+(defn- oracle-payload [msg]
+  (p/dot-stuff (or (:raw msg) (p/mime-message msg))))
+
+(deftest composition-agrees-with-the-cljc-oracle
+  (when (source-available?)
+    (doseq [msg messages]
+      (testing (pr-str (dissoc msg :body :raw))
+        (let [doc (->doc msg)]
+          (is (= (p/mime-message msg) (call @kir 'mime-message [doc])))
+          (is (= (oracle-payload msg) (call @kir 'payload [doc])))
+          (is (= (oracle-recipients msg) (strings (call @kir 'recipients [doc]))))
+          (is (= (call @kir 'mime-message [doc]) (call @cljk-kir 'mime-message [doc]))
+              "cljk drifted on mime-message")
+          (is (= (call @kir 'recipients [doc]) (call @cljk-kir 'recipients [doc]))
+              "cljk drifted on recipients"))))))
+
+(deftest bcc-is-a-recipient-and-never-a-header
+  "A blind carbon copy is blind because the address is in RCPT TO and not in
+  the message. A guest that renders it hands every recipient the list of
+  people who were meant to be invisible."
+  (when (source-available?)
+    (let [doc (->doc {:from "me@example.com" :to "a@example.com"
+                      :bcc "secret@example.com" :subject "s" :body "hi"})]
+      (is (contains? (set (strings (call @kir 'recipients [doc])))
+                     "secret@example.com")
+          "delivered to")
+      (is (not (str/includes? (call @kir 'mime-message [doc]) "secret@example.com"))
+          "and not named in the message")
+      (is (not (str/includes? (call @kir 'mime-message [doc]) "Bcc"))))))
+
+(deftest the-same-address-twice-is-one-recipient
+  "Three transactions is three separate messages, each carrying only its own
+  address; a duplicate that becomes a second RCPT TO is the same mistake one
+  step smaller."
+  (when (source-available?)
+    (let [doc (->doc {:from "me@example.com"
+                      :to ["a@example.com" "a@example.com"]
+                      :cc "a@example.com" :subject "s" :body "hi"})]
+      (is (= ["a@example.com"] (strings (call @kir 'recipients [doc])))))))
+
+(deftest an-empty-address-is-carried-through-rather-than-quietly-dropped
+  "A defect of the design both sides share, pinned rather than fixed on one
+  side only. `recipients-of` removes nils and NOT empty strings, so
+  `{:to [\"\" \"a@example.com\"]}` puts `RCPT TO:<>` on the wire and renders
+  `To: , a@example.com`. Changing that in the guest alone would make the two
+  disagree while the oracle kept sending it; it is a change to make in both,
+  as its own commit, with the client tests that pin the current wire."
+  (when (source-available?)
+    (let [msg {:from "me@example.com" :to ["" "a@example.com"]
+               :subject "s" :body "hi"}
+          doc (->doc msg)]
+      (is (= ["" "a@example.com"] (oracle-recipients msg)))
+      (is (= ["" "a@example.com"] (strings (call @kir 'recipients [doc]))))
+      (is (str/includes? (call @kir 'mime-message [doc]) "To: , a@example.com")))))
+
+;; --- the compile leg --------------------------------------------------------
+
+(defn- kotoba-bin []
+  (or (System/getenv "KOTOBA") "kotoba"))
+
+(defn- kotoba-runnable?
+  "Whether the CLI can be EXECUTED, not whether a name resolves on PATH.
+
+  `which` answered yes for a two-line shim whose exec target had been cleaned
+  out of /tmp; the shell then exited 126 and the test reported a compile
+  failure that was really an absent toolchain. Run it and read the exit code."
+  []
+  (try (zero? (:exit (shell/sh (kotoba-bin) "--help")))
+       (catch Exception _ false)))
+
+(deftest kotoba-cli-compiles-message-sources
+  "The public compile path is the CLI. `-M` is the execution boundary, the
+  wasm target is `wasm32-browser`, the flag is `--output`, and the source
+  path must be absolute. Skip rather than fail when no runnable binary is
+  present: that is a host fact, not a disagreement between the two."
+  (when (source-available?)
+    (if (kotoba-runnable?)
+      (let [dir (io/file (System/getProperty "java.io.tmpdir")
+                         (str "smtp-message-" (System/nanoTime)))]
+        (io/mkdirs dir)
+        (doseq [[label src] [["kotoba" kotoba-file] ["cljk" cljk-file]]
+                [target ext] [["wasm32-browser" ".wasm"] ["js-browser" ".mjs"]]
+                :let [out (io/file dir (str label "-" target ext))
+                      result (shell/sh (kotoba-bin) "-M" "compile"
+                                       (io/absolute-path src)
+                                       "--target" target
+                                       "--output" (io/absolute-path out))]]
+          (is (zero? (:exit result))
+              (str label " -M compile --target " target "\n" (:err result) (:out result)))
+          (is (io/file? out) (str label " " target " emitted nothing"))))
+      (println "SKIP kotoba-cli-compiles-message-sources: no runnable"
+               (kotoba-bin) "— set KOTOBA to a working CLI"))))

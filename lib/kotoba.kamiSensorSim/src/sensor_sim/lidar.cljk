@@ -1,0 +1,175 @@
+(ns sensor-sim.lidar
+  "RotatingLidar — analytic raycast lidar against simple scene primitives.
+
+   Restored 1:1 from `lidar.rs` (`kotoba-lang/kami-engine`'s deleted
+   `kami-sensor-sim` crate, removed in PR #82 \"Remove Rust workspace\"),
+   per ADR-2607010930 (`com-junkawasaki/root`).
+
+   Mirrors `isaacsim.sensors.RotatingLidarPhysX` (Isaac Sim 4.x) at the level
+   of public Python API surface. The scene is a small list of analytic
+   primitives (sphere, ground plane, AABB) with explicit ray-intersection
+   formulas — no BVH (the original crate's R1.2+ WGSL/BVH ray-query plan was
+   never implemented before deletion, so there is nothing further to port).
+
+   Conventions: ROS REP-105 sensor frame (+x forward, +y left, +z up) — the
+   Isaac Sim default for lidar; this differs from the Camera convention
+   (+z forward, +y down) intentionally, matching upstream NVIDIA/ROS
+   defaults for their respective sensor types. Lidar emits a regular grid of
+   beams within (HFOV x VFOV) and returns one 3D hit point per beam in
+   sensor frame (`##Inf` range for non-hits).
+
+   `Primitive`/`Scene`/`Primitive::intersect` are also reused by
+   `sensor-sim.contact` (`primitive-closest`), same as the original crate's
+   `contact.rs` reused `crate::lidar::{Primitive, Scene}`."
+  (:require [sensor-sim.math :as m]))
+
+;; ---------------------------------------------------------------------
+;; LidarIntrinsics
+;; ---------------------------------------------------------------------
+
+(defn lidar-intrinsics-vlp16
+  "Velodyne VLP-16-equivalent: 360 deg HFOV x 30 deg VFOV, 1800 az x 16 el."
+  []
+  {:hfov (* 2.0 Math/PI)
+   :vfov (m/deg->rad 30.0)
+   :h-beams 1800
+   :v-beams 16
+   :range-min 0.5
+   :range-max 100.0})
+
+(defn lidar-intrinsics-toy
+  "A small toy intrinsics convenient for unit tests."
+  []
+  {:hfov (/ Math/PI 2.0)            ; 90 deg
+   :vfov (m/deg->rad 30.0)          ; 30 deg
+   :h-beams 8
+   :v-beams 4
+   :range-min 0.05
+   :range-max 50.0})
+
+;; ---------------------------------------------------------------------
+;; Primitive — {:type :ground-plane :height h}
+;;             {:type :sphere       :center c :radius r}
+;;             {:type :aabb         :min mn :max mx}
+;; ---------------------------------------------------------------------
+
+(defn ground-plane [height] {:type :ground-plane :height height})
+(defn sphere [center radius] {:type :sphere :center center :radius radius})
+(defn aabb [mn mx] {:type :aabb :min mn :max mx})
+
+(defn primitive-intersect
+  "Slab / quadratic intersection. Returns the smallest positive t along
+   ray(origin, dir) (dir must be normalized), or nil."
+  [prim origin dir]
+  (case (:type prim)
+    :ground-plane
+    (let [height (:height prim)]
+      (when-not (< (Math/abs (m/vz dir)) 1e-6)
+        (let [t (/ (- height (m/vz origin)) (m/vz dir))]
+          (when (pos? t) t))))
+
+    :sphere
+    (let [{:keys [center radius]} prim
+          oc (m/v-sub origin center)
+          b (m/v-dot oc dir)
+          c (- (m/v-dot oc oc) (* radius radius))
+          disc (- (* b b) c)]
+      (when-not (neg? disc)
+        (let [sq (Math/sqrt disc)
+              t0 (- (- b) sq)
+              t1 (+ (- b) sq)]
+          (cond
+            (> t0 1e-4) t0
+            (> t1 1e-4) t1
+            :else nil))))
+
+    :aabb
+    (let [{mn :min mx :max} prim
+          inv [(/ 1.0 (m/vx dir)) (/ 1.0 (m/vy dir)) (/ 1.0 (m/vz dir))]
+          t1 (m/v-mul (m/v-sub mn origin) inv)
+          t2 (m/v-mul (m/v-sub mx origin) inv)
+          tmin (m/v-max-element (m/v-min t1 t2))
+          tmax (m/v-min-element (m/v-max t1 t2))]
+      (cond
+        (or (neg? tmax) (> tmin tmax)) nil
+        (> tmin 1e-4) tmin
+        (> tmax 1e-4) tmax
+        :else nil))))
+
+;; ---------------------------------------------------------------------
+;; Scene
+;; ---------------------------------------------------------------------
+
+(defn scene-new [] {:primitives []})
+
+(defn scene-add
+  "Add a primitive, returning the updated scene (functional; chain with `->`
+   the way the original `&mut self -> &mut Self` builder was chained)."
+  [scene prim]
+  (update scene :primitives conj prim))
+
+(defn scene-nearest-hit
+  "Find the nearest hit along ray(origin, dir). Returns `[t idx]` or nil."
+  [scene origin dir]
+  (reduce
+   (fn [best [i p]]
+     (if-let [t (primitive-intersect p origin dir)]
+       (if (or (nil? best) (< t (first best))) [t i] best)
+       best))
+   nil
+   (map-indexed vector (:primitives scene))))
+
+;; ---------------------------------------------------------------------
+;; LidarReturn
+;; ---------------------------------------------------------------------
+
+(defn lidar-return-miss []
+  {:range ##Inf :point-sensor m/v-zero :prim-index nil})
+
+;; ---------------------------------------------------------------------
+;; Lidar
+;; ---------------------------------------------------------------------
+
+(defn lidar-new [name prim-path intrinsics]
+  {:name name :prim-path prim-path :intrinsics intrinsics :view (m/affine3-identity)})
+
+(defn lidar-set-view [lidar view] (assoc lidar :view view))
+
+(defn- sensor-to-world [lidar] (m/affine3-inverse (:view lidar)))
+
+(defn- beam-dir-sensor
+  "One beam direction in sensor frame for grid (i-h, i-v). Sensor frame is
+   ROS REP-105: +x forward, +y left, +z up. At zero azimuth + zero elevation
+   the beam points along +x. Azimuth is measured counter-clockwise from +x
+   in the horizontal plane (+y direction is positive azimuth); elevation is
+   measured above the horizontal plane (+z direction is positive
+   elevation)."
+  [lidar i-h i-v]
+  (let [{:keys [hfov vfov h-beams v-beams]} (:intrinsics lidar)
+        az-min (* hfov -0.5)
+        el-min (* vfov -0.5)
+        az-step (if (> h-beams 1) (/ hfov h-beams) 0.0)
+        el-step (if (> v-beams 1) (/ vfov v-beams) 0.0)
+        az (+ az-min (* (+ i-h 0.5) az-step))
+        el (+ el-min (* (+ i-v 0.5) el-step))
+        sa (Math/sin az) ca (Math/cos az)
+        se (Math/sin el) ce (Math/cos el)]
+    (m/v-normalize [(* ce ca) (* ce sa) se])))
+
+(defn acquire-data
+  "Cast all (h-beams x v-beams) rays into `scene` and return one LidarReturn
+   per beam (row-major: idx = v * h-beams + h)."
+  [lidar scene]
+  (let [s2w (sensor-to-world lidar)
+        origin-world (m/affine3-transform-point3 s2w m/v-zero)
+        {:keys [h-beams v-beams range-min range-max]} (:intrinsics lidar)]
+    (vec
+     (for [v (range v-beams)
+           h (range h-beams)]
+       (let [dir-sensor (beam-dir-sensor lidar h v)
+             dir-world (m/v-normalize-or-zero (m/affine3-transform-vector3 s2w dir-sensor))
+             hit (scene-nearest-hit scene origin-world dir-world)]
+         (if (and hit (<= range-min (first hit)) (<= (first hit) range-max))
+           (let [[t idx] hit]
+             {:range t :point-sensor (m/v-scale dir-sensor t) :prim-index idx})
+           (lidar-return-miss)))))))

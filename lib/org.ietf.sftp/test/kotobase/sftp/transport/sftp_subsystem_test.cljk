@@ -1,0 +1,145 @@
+;; .cljs-only. Exercises kotobase.sftp.transport.sftp-subsystem's SFTP
+;; opcode encode/decode/dispatch DIRECTLY against kotobase.sftp.fs — no
+;; sockets, no SSH transport framing, no second OS process. This is the
+;; fast, deterministic coverage of "does every implemented SSH_FXP_*
+;; opcode round-trip correctly against the fs core"; the SLOWER, real
+;; cross-process proof that this same logic also works correctly when
+;; carried over the actual encrypted SSH transport is
+;; test/kotobase/sftp/transport/ssh_demo.cljk (see its own docstring).
+(ns kotobase.sftp.transport.sftp-subsystem-test
+  (:require [kotoba.lang.text :as str]
+            [cljs.test :refer [deftest is testing]]
+            [kotobase.local :as local]
+            [kotobase.sftp.transport.sftp-subsystem :as sftp]
+            [kotobase.sftp.transport.wire :as w]))
+
+(defn- fs-ctx [] {:store (local/local-store) :now "2026-07-17T00:00:00Z"})
+
+(defn- send! [fs-ctx session req-bytes]
+  (sftp/handle-packet-bytes fs-ctx "home" session req-bytes))
+
+(defn- status-of [^js resp]
+  (let [{:keys [type body]} (sftp/parse-sftp-packet resp)]
+    (when (= type sftp/fxp-status)
+      {:code (w/read-uint32 body 4)})))
+
+(deftest sftp-packet-framing-round-trips
+  (let [body (js/Buffer.from "abc")
+        packet (sftp/build-sftp-packet 42 body)
+        {:keys [type body]} (sftp/parse-sftp-packet packet)]
+    (is (= 42 type))
+    (is (= "abc" (.toString body "utf8")))))
+
+(deftest init-returns-version-3
+  (let [session (sftp/new-session)
+        resp (send! (fs-ctx) session (sftp/build-sftp-packet sftp/fxp-init (w/uint32 3)))
+        {:keys [type body]} (sftp/parse-sftp-packet resp)]
+    (is (= sftp/fxp-version type))
+    (is (= 3 (w/read-uint32 body 0)))))
+
+(deftest full-file-lifecycle-through-opcodes
+  (let [ctx (fs-ctx)
+        session (sftp/new-session)]
+    (testing "MKDIR"
+      (let [resp (send! ctx session (sftp/build-sftp-packet
+                                      sftp/fxp-mkdir
+                                      (js/Buffer.concat #js [(w/uint32 1) (w/ssh-string "alice") (w/uint32 0)])))]
+        (is (= sftp/fx-ok (:code (status-of resp))))))
+
+    (testing "OPEN for write, WRITE, CLOSE"
+      (let [open-resp (send! ctx session (sftp/build-sftp-packet
+                                           sftp/fxp-open
+                                           (js/Buffer.concat #js [(w/uint32 2) (w/ssh-string "alice/a.txt")
+                                                                   (w/uint32 0x0A) (w/uint32 0)])))
+            {:keys [type body]} (sftp/parse-sftp-packet open-resp)
+            _ (is (= sftp/fxp-handle type))
+            [handle _] (w/read-ssh-string body 4)
+            write-resp (send! ctx session (sftp/build-sftp-packet
+                                            sftp/fxp-write
+                                            (js/Buffer.concat #js [(w/uint32 3) (w/ssh-string handle)
+                                                                    (w/uint32 0) (w/uint32 0) (w/ssh-string "hi")])))
+            close-resp (send! ctx session (sftp/build-sftp-packet
+                                            sftp/fxp-close
+                                            (js/Buffer.concat #js [(w/uint32 4) (w/ssh-string handle)])))]
+        (is (= sftp/fx-ok (:code (status-of write-resp))))
+        (is (= sftp/fx-ok (:code (status-of close-resp))))))
+
+    (testing "OPEN for read + READ round-trips the write above"
+      (let [open-resp (send! ctx session (sftp/build-sftp-packet
+                                           sftp/fxp-open
+                                           (js/Buffer.concat #js [(w/uint32 5) (w/ssh-string "alice/a.txt")
+                                                                   (w/uint32 0x01) (w/uint32 0)])))
+            [handle _] (w/read-ssh-string (:body (sftp/parse-sftp-packet open-resp)) 4)
+            read-resp (send! ctx session (sftp/build-sftp-packet
+                                           sftp/fxp-read
+                                           (js/Buffer.concat #js [(w/uint32 6) (w/ssh-string handle)
+                                                                   (w/uint32 0) (w/uint32 0) (w/uint32 4096)])))
+            {:keys [type body]} (sftp/parse-sftp-packet read-resp)
+            [data _] (w/read-ssh-string body 4)]
+        (is (= sftp/fxp-data type))
+        (is (= "hi" (.toString data "utf8")))))
+
+    (testing "READ past EOF returns SSH_FX_EOF"
+      (let [open-resp (send! ctx session (sftp/build-sftp-packet
+                                           sftp/fxp-open
+                                           (js/Buffer.concat #js [(w/uint32 7) (w/ssh-string "alice/a.txt")
+                                                                   (w/uint32 0x01) (w/uint32 0)])))
+            [handle _] (w/read-ssh-string (:body (sftp/parse-sftp-packet open-resp)) 4)
+            resp (send! ctx session (sftp/build-sftp-packet
+                                      sftp/fxp-read
+                                      ;; uint64 offset = (high, low) — see
+                                      ;; sftp-subsystem's read-uint64-narrow;
+                                      ;; offset=2 (== the file's own length,
+                                      ;; "hi") is exactly at EOF.
+                                      (js/Buffer.concat #js [(w/uint32 8) (w/ssh-string handle)
+                                                              (w/uint32 0) (w/uint32 2) (w/uint32 4096)])))]
+        (is (= sftp/fx-eof (:code (status-of resp))))))
+
+    (testing "STAT reports a SIZE attr for the file"
+      (let [resp (send! ctx session (sftp/build-sftp-packet
+                                      sftp/fxp-stat
+                                      (js/Buffer.concat #js [(w/uint32 9) (w/ssh-string "alice/a.txt")])))
+            {:keys [type body]} (sftp/parse-sftp-packet resp)]
+        (is (= sftp/fxp-attrs type))
+        (is (= sftp/attr-size-flag (w/read-uint32 body 4)))))
+
+    (testing "OPENDIR + READDIR lists a.txt, then EOFs on the second call"
+      (let [opendir-resp (send! ctx session (sftp/build-sftp-packet
+                                              sftp/fxp-opendir
+                                              (js/Buffer.concat #js [(w/uint32 10) (w/ssh-string "alice")])))
+            [dh _] (w/read-ssh-string (:body (sftp/parse-sftp-packet opendir-resp)) 4)
+            readdir-resp (send! ctx session (sftp/build-sftp-packet
+                                              sftp/fxp-readdir
+                                              (js/Buffer.concat #js [(w/uint32 11) (w/ssh-string dh)])))
+            {:keys [type body]} (sftp/parse-sftp-packet readdir-resp)
+            readdir-eof (send! ctx session (sftp/build-sftp-packet
+                                             sftp/fxp-readdir
+                                             (js/Buffer.concat #js [(w/uint32 12) (w/ssh-string dh)])))]
+        (is (= sftp/fxp-name type))
+        (is (str/includes? (.toString body "utf8") "a.txt"))
+        (is (= sftp/fx-eof (:code (status-of readdir-eof))))))
+
+    (testing "RENAME then REMOVE then RMDIR"
+      (let [rename-resp (send! ctx session (sftp/build-sftp-packet
+                                             sftp/fxp-rename
+                                             (js/Buffer.concat #js [(w/uint32 13) (w/ssh-string "alice/a.txt")
+                                                                     (w/ssh-string "alice/b.txt")])))
+            remove-resp (send! ctx session (sftp/build-sftp-packet
+                                             sftp/fxp-remove
+                                             (js/Buffer.concat #js [(w/uint32 14) (w/ssh-string "alice/b.txt")])))
+            rmdir-resp (send! ctx session (sftp/build-sftp-packet
+                                            sftp/fxp-rmdir
+                                            (js/Buffer.concat #js [(w/uint32 15) (w/ssh-string "alice")])))]
+        (is (= sftp/fx-ok (:code (status-of rename-resp))))
+        (is (= sftp/fx-ok (:code (status-of remove-resp))))
+        (is (= sftp/fx-ok (:code (status-of rmdir-resp))))))))
+
+(deftest mkdir-missing-parent-maps-to-no-such-file
+  (let [resp (send! (fs-ctx) (sftp/new-session)
+                     (sftp/build-sftp-packet sftp/fxp-mkdir
+                                              (js/Buffer.concat #js [(w/uint32 1) (w/ssh-string "a/b") (w/uint32 0)])))]
+    (is (= sftp/fx-no-such-file (:code (status-of resp))))))
+
+(deftest unsupported-opcode-returns-failure-status-not-a-crash
+  (let [resp (send! (fs-ctx) (sftp/new-session) (sftp/build-sftp-packet 200 (w/uint32 1)))]
+    (is (= sftp/fx-failure (:code (status-of resp))))))

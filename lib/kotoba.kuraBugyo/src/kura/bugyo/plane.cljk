@@ -1,0 +1,211 @@
+(ns kura.bugyo.plane
+  "The metadata plane: what the coordinator knows, and the shape that keeps it
+  answerable.
+
+  ADR-2607299200 section 3 and section 4 rest on one claim, and this namespace
+  is where it is either true or quietly false:
+
+      node N is gone — which placement groups are now below threshold?
+
+  That question is a join across `{PG -> node set}`, `{node -> liveness}`,
+  `{PG -> durability class}` and `{PG -> last audit}`. Section 4 forbids
+  splitting those across refs, because kura's query plane reaches exactly one
+  ref and a sharded plane makes this question unanswerable rather than merely
+  slow. Section 3 forbids storing `shard -> node` directly, because at 64 MiB
+  objects and n=32 that is 500 million rows per petabyte.
+
+  So the plane holds **placement groups, not shards**: one row per group, and
+  an object's group is a function of its id (`kura.placement/group-of`), never
+  a stored row. A petabyte is ~10^5 rows instead of ~10^8, and the question
+  above becomes a scan of the group table.
+
+  **Single writer, on purpose.** Every mutation goes through `apply-event`, a
+  pure function from state and event to state. Concurrency is handled by there
+  being one writer — a Durable Object in deployment — rather than by locking,
+  because ADR-260726 (query plane is one ref) points out that a shared ref with
+  CAS serialisation is solved better by removing the contention than by
+  managing it. The store is injected; nothing here knows whether it is a map,
+  D1, or a ref.
+
+  **What this namespace is not.** It holds no bytes, does no I/O, and decides
+  no prices. It is the coordinator's memory, and the scheduler reads it."
+  (:require [erasure.lrc :as lrc]
+            [kura.placement :as placement]
+            [kura.repair :as repair]))
+
+;; --- state -----------------------------------------------------------------
+
+(defn empty-plane
+  "An empty plane. `:groups` is group-id -> group, `:nodes` is node-id -> node.
+
+  Both are plain maps because the plane's *shape* is the design decision and
+  its *storage* is not: a D1-backed implementation replaces the maps and
+  changes nothing else here."
+  [{:keys [layout group-count]}]
+  (assert layout "a layout is required — the plane's thresholds come from the code")
+  (assert (pos? group-count) "group-count must be positive")
+  {:layout layout
+   :group-count group-count
+   :tolerated (lrc/max-tolerated-erasures layout)
+   :groups {}
+   :nodes {}
+   :seq 0})
+
+(defn node
+  "A node as the plane records it.
+
+  `:availability` is carried because the plane is what answers *node N is gone,
+  which groups are below threshold* — and for an `:intermittent` node the
+  answer is usually **none of them, it is asleep**. A plane that cannot tell a
+  rented bucket from a laptop treats every closed lid as a death, schedules
+  repair against shards that are perfectly fine, and bills the fleet for it.
+  Required rather than defaulted, for the reason `kura.placement/node` gives."
+  [{:keys [node-id physical-tb bond-usd domains availability] :or {domains {}}}]
+  (assert (contains? placement/availabilities availability)
+          (str ":availability must be one of " placement/availabilities
+               ", got " (pr-str availability)
+               ". The plane decides when to spend repair bandwidth; it cannot "
+               "do that without knowing which absences were expected."))
+  {:node-id node-id
+   :physical-tb physical-tb
+   :bond-usd bond-usd
+   :domains domains
+   :availability availability
+   :state :live
+   :unreachable-since nil})
+
+;; --- events ----------------------------------------------------------------
+;; Every mutation is an event. Not for event-sourcing ceremony — because the
+;; coordinator is a trusted point (section 6f) and the only thing that makes a
+;; trusted point auditable is that its decisions are replayable from a log
+;; anyone can read.
+
+(defmulti apply-event (fn [_plane event] (:kind event)))
+
+(defmethod apply-event :node/joined [plane {:keys [node]}]
+  (assoc-in plane [:nodes (:node-id node)] node))
+
+(defmethod apply-event :node/unreachable [plane {:keys [node-id at]}]
+  (if (get-in plane [:nodes node-id])
+    (-> plane
+        (assoc-in [:nodes node-id :state] :unreachable)
+        (assoc-in [:nodes node-id :unreachable-since] at))
+    plane))
+
+(defmethod apply-event :node/live [plane {:keys [node-id]}]
+  (if (get-in plane [:nodes node-id])
+    (-> plane
+        (assoc-in [:nodes node-id :state] :live)
+        (assoc-in [:nodes node-id :unreachable-since] nil))
+    plane))
+
+(defmethod apply-event :node/departed [plane {:keys [node-id]}]
+  ;; Departed, not deleted. A node that left still appears in the groups that
+  ;; held it until they are repaired, and forgetting it would make those groups
+  ;; look healthy.
+  (if (get-in plane [:nodes node-id])
+    (assoc-in plane [:nodes node-id :state] :lost)
+    plane))
+
+(defmethod apply-event :group/placed [plane {:keys [group nodes]}]
+  (assoc-in plane [:groups group] {:group group
+                                   :nodes (vec nodes)
+                                   :repaired-at nil
+                                   :audited-at nil}))
+
+(defmethod apply-event :group/repaired [plane {:keys [group at]}]
+  (if (get-in plane [:groups group])
+    (assoc-in plane [:groups group :repaired-at] at)
+    plane))
+
+(defmethod apply-event :group/audited [plane {:keys [group at]}]
+  (if (get-in plane [:groups group])
+    (assoc-in plane [:groups group :audited-at] at)
+    plane))
+
+(defmethod apply-event :default [plane event]
+  ;; Unknown events are recorded as rejected rather than ignored. A plane that
+  ;; silently drops what it does not understand diverges from its own log, and
+  ;; the divergence is invisible until someone replays it.
+  (update plane :rejected (fnil conj []) event))
+
+(defn commit
+  "Apply one event, advancing the sequence. The single writer's only mutator."
+  [plane event]
+  (-> (apply-event plane event)
+      (update :seq inc)))
+
+(defn replay
+  "Rebuild a plane from its event log — the property that makes a trusted
+  coordinator checkable by someone who is not it."
+  [initial events]
+  (reduce commit initial events))
+
+;; --- the question the whole shape exists to answer -------------------------
+
+(defn shard-state
+  "How each shard index of `group` looks right now, derived from node liveness.
+
+  Takes no clock: `kura.repair/assess` applies the grace period against the
+  timestamps carried on the nodes, so there is nothing here that needs to know
+  what time it is."
+  [plane group]
+  (let [g (get-in plane [:groups group])]
+    (into {}
+          (map-indexed (fn [i node-id]
+                         (let [n (get-in plane [:nodes node-id])]
+                           [i (case (:state n)
+                                :live {:state :live}
+                                :unreachable {:state :unreachable
+                                              :unreachable-since (:unreachable-since n)}
+                                :lost {:state :lost}
+                                {:state :lost})])))
+          (:nodes g))))
+
+(defn groups-holding
+  "Groups that place a shard on `node-id`.
+
+  The scan section 3 exists to make cheap. It is O(groups), not O(objects x
+  shards): at a petabyte that is ~10^5 rows rather than ~10^8, which is the
+  difference between a query and a data-warehouse job."
+  [plane node-id]
+  (into (sorted-set)
+        (keep (fn [[gid g]] (when (some #{node-id} (:nodes g)) gid)))
+        (:groups plane)))
+
+(defn assess-group
+  [plane pol group now]
+  (repair/assess (:layout plane) pol now (shard-state plane group)))
+
+(defn at-risk
+  "Every group below the repair threshold, with its assessment.
+
+  This is the coordinator's tick. Returns the groups in no particular order —
+  `kura.bugyo.scheduler` ranks them, because ranking is a policy decision and
+  this is a query."
+  [plane pol now]
+  (into {}
+        (keep (fn [[gid _]]
+                (let [a (assess-group plane pol gid now)]
+                  (when (seq (:erased a)) [gid a]))))
+        (:groups plane)))
+
+(defn node-death-impact
+  "What losing `node-id` costs: which groups, and how close each then is.
+
+  The named question from section 4, answered in one pass. Reported with the
+  margin AFTER the loss, because the number that matters to a scheduler is not
+  how many groups were touched but how many are now near the cliff."
+  [plane pol node-id now]
+  (let [affected (groups-holding plane node-id)
+        after (commit plane {:kind :node/departed :node-id node-id})]
+    {:node-id node-id
+     :groups-touched (count affected)
+     :groups (into (sorted-map)
+                   (map (fn [gid]
+                          (let [a (assess-group after pol gid now)]
+                            [gid {:erased (vec (:erased a))
+                                  :readable? (:readable? a)
+                                  :margin (repair/margin (:layout plane) (:erased a))}])))
+                   affected)
+     :total-groups (count (:groups plane))}))

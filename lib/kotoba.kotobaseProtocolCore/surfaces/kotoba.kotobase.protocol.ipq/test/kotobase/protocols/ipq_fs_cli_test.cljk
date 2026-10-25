@@ -1,0 +1,267 @@
+(ns kotobase.protocols.ipq-fs-cli-test
+  (:require [cljs.test :refer [deftest is testing]]
+            [kotobase.protocols.ipq.fs-cli :as cli]
+            [kotobase.protocols.ipq-fs-test :as fixture]
+            [ipld.car.bytes :as bytes]
+            [multiformats.core :as mf]))
+
+(def node-fs (js/require "node:fs"))
+(def node-path (js/require "node:path"))
+(def node-os (js/require "node:os"))
+(def child-process (js/require "node:child_process"))
+
+(defn git! [project & args]
+  (.execFileSync child-process "git" (clj->js (concat ["-C" project] args))
+                 #js {:encoding "utf8" :stdio #js ["ignore" "pipe" "pipe"]}))
+
+(defn problem [f]
+  (try (do (f) nil)
+       (catch :default e (:problem (ex-data e)))))
+
+(deftest materialize-command-produces-a-real-read-only-tree
+  (let [{:keys [root car-bytes]} (fixture/fixture)
+        temp (.mkdtempSync node-fs (.join node-path (.tmpdir node-os) "ipq-fs-cli-"))
+        car-file (.join node-path temp "snapshot.car")
+        cache-root (.join node-path temp "cache")]
+    (try
+      (.writeFileSync node-fs car-file car-bytes)
+      (let [receipt (cli/run! ["materialize" "--car" car-file "--root" root
+                               "--scope-root" "/workspace"
+                               "--cache-root" cache-root])
+            local-root (:local-root receipt)
+            materialized (.join node-path local-root "docs" "readme.txt")]
+        (is (= :materialized (:status receipt)))
+        (is (= 4 (:entries receipt)))
+        (is (= 2 (:files receipt)))
+        (is (= "alpha\nbeta\nalpha\n" (.readFileSync node-fs materialized "utf8")))
+        (is (= 292 (bit-and 511 (.-mode (.statSync node-fs materialized))))))
+      (finally
+        (fixture/test-make-writable! temp)
+        (.rmSync node-fs temp #js {:recursive true :force true})))))
+
+(deftest command-refuses-ambiguous-input
+  (is (= :command (problem #(cli/parse-args []))))
+  (is (= :required-option (problem #(cli/parse-args ["materialize" "--root" "bafkqaaa"]))))
+  (is (= :unknown-option
+         (problem #(cli/parse-args ["materialize" "--car" "x" "--root" "bafkqaaa"
+                                    "--write" "yes"]))))
+  (is (= :duplicate-option
+         (problem #(cli/parse-args ["materialize" "--car" "x" "--car" "y"
+                                    "--root" "bafkqaaa"]))))
+  (is (= :option-not-allowed
+         (problem #(cli/parse-args ["git-materialize" "--project" "."
+                                    "--snapshot" "docs" "--car" "x"
+                                    "--root" "bafkqaaa"])))))
+
+(deftest git-project-manifest-is-shared-identity-not-shared-cache
+  (let [{:keys [root car-bytes]} (fixture/fixture)
+        temp (.mkdtempSync node-fs (.join node-path (.tmpdir node-os) "ipq-fs-git-"))
+        project (.join node-path temp "project")
+        metadata-dir (.join node-path project ".kotoba")
+        manifest (.join node-path metadata-dir "ipq.edn")
+        car-file (.join node-path temp "snapshot.car")
+        cache-root (.join node-path temp "cache")]
+    (try
+      (.mkdirSync node-fs metadata-dir #js {:recursive true})
+      (.writeFileSync node-fs car-file car-bytes)
+      (.writeFileSync node-fs manifest
+                      (pr-str {:schema cli/git-manifest-schema
+                               :snapshots {"docs" {:root root
+                                                   :scope-root "/workspace"}}}))
+      (git! project "init" "-b" "main")
+      (git! project "config" "user.name" "IPQ Test")
+      (git! project "config" "user.email" "ipq-test@example.invalid")
+      (git! project "add" cli/git-manifest-path)
+      (git! project "commit" "-m" "Track IPQ snapshot identity")
+      ;; Other worktree changes do not alter the committed IPQ identity.
+      (.writeFileSync node-fs (.join node-path project "notes.txt") "local only\n")
+      (let [receipt (cli/run! ["git-materialize" "--project" project
+                               "--snapshot" "docs" "--car" car-file
+                               "--cache-root" cache-root])
+            expected-commit (.trim (git! project "rev-parse" "HEAD"))]
+        (is (= :materialized (:status receipt)))
+        (is (= (.realpathSync node-fs project) (:git-project receipt)))
+        (is (= expected-commit (:git-commit receipt)))
+        (is (= "docs" (:git-snapshot receipt)))
+        (is (= cli/git-manifest-path (:git-manifest receipt)))
+        (is (= "alpha\nbeta\nalpha\n"
+               (.readFileSync node-fs
+                              (.join node-path (:local-root receipt) "docs" "readme.txt")
+                              "utf8"))))
+      (.writeFileSync node-fs manifest
+                      (pr-str {:schema cli/git-manifest-schema :snapshots {}}))
+      (is (= :git-manifest-dirty
+             (problem #(cli/run! ["git-materialize" "--project" project
+                                  "--snapshot" "docs" "--car" car-file
+                                  "--cache-root" cache-root]))))
+      (git! project "restore" cli/git-manifest-path)
+      (is (= :git-snapshot
+             (problem #(cli/run! ["git-materialize" "--project" project
+                                  "--snapshot" "missing" "--car" car-file
+                                  "--cache-root" cache-root]))))
+      (finally
+        (fixture/test-make-writable! temp)
+        (.rmSync node-fs temp #js {:recursive true :force true})))))
+
+(deftest snapshot-command-round-trips-a-real-directory-including-binary
+  ;; The writer is checked by the reader, on real files, through the disk.
+  ;; A writer verified only by its own arithmetic is a writer nobody checked.
+  (let [temp (.mkdtempSync node-fs (.join node-path (.tmpdir node-os) "ipq-fs-snap-"))
+        tree (.join node-path temp "tree")
+        docs (.join node-path tree "docs")
+        blocks (.join node-path temp "blocks")
+        car-file (.join node-path temp "snapshot.car")
+        cache-root (.join node-path temp "cache")
+        ;; A PNG signature followed by bytes that are not UTF-8 at all.
+        binary (js/Uint8Array.from #js [137 80 78 71 13 10 26 10 0 255 254 253])]
+    (try
+      (.mkdirSync node-fs docs #js {:recursive true})
+      (.writeFileSync node-fs (.join node-path tree "readme.txt") "alpha\nbeta\n")
+      (.writeFileSync node-fs (.join node-path docs "utf8.txt") "hello 😀\n")
+      (.writeFileSync node-fs (.join node-path docs "logo.png") binary)
+      ;; 200 KB, so the next assertion is about the DESIGN and not about
+      ;; which of two small numbers happens to be larger.
+      (.writeFileSync node-fs (.join node-path tree "big.txt")
+                      (.repeat "0123456789" 20480))
+      (let [written (cli/run! ["snapshot" "--tree" tree "--scope-root" "/workspace"
+                               "--car" car-file "--blocks-dir" blocks])]
+        (is (= :snapshot (:status written)))
+        (is (= 4 (:files written)))
+        (is (= 6 (:entries written)) "four files, the scope root, and docs")
+        (is (re-matches #"^bafkrei[a-z2-7]{52}$" (:root written)))
+        (is (= 4 (count (js->clj (.readdirSync node-fs blocks))))
+            "one block per file, named by its CID")
+        (is (> (:referenced-bytes written) 204800))
+        (is (< (:manifest-bytes written) 1024)
+            "the manifest grows with the NUMBER of files, not their bytes -- this
+             is the whole property, and version 1 would have had to carry all
+             204,834 of them inside the block being validated")
+
+        (let [receipt (cli/run! ["materialize" "--car" car-file "--root" (:root written)
+                                 "--scope-root" "/workspace" "--blocks-dir" blocks
+                                 "--cache-root" cache-root])
+              local (:local-root receipt)
+              same? (fn [there original]
+                      (let [got (.readFileSync node-fs there)]
+                        (= (vec (array-seq got)) (vec (array-seq original)))))]
+          (is (= :materialized (:status receipt)))
+          (is (same? (.join node-path local "readme.txt")
+                     (.readFileSync node-fs (.join node-path tree "readme.txt"))))
+          (is (same? (.join node-path local "big.txt")
+                     (.readFileSync node-fs (.join node-path tree "big.txt"))))
+          (is (same? (.join node-path local "docs" "utf8.txt")
+                     (.readFileSync node-fs (.join node-path docs "utf8.txt"))))
+          (is (same? (.join node-path local "docs" "logo.png") (js/Buffer.from binary))
+              "the binary file survives the round trip byte for byte")))
+      (finally
+        (fixture/test-make-writable! temp)
+        (.rmSync node-fs temp #js {:recursive true :force true})))))
+
+(deftest a-referenced-manifest-without-blocks-refuses-rather-than-materializing-half
+  (let [temp (.mkdtempSync node-fs (.join node-path (.tmpdir node-os) "ipq-fs-snap2-"))
+        tree (.join node-path temp "tree")
+        blocks (.join node-path temp "blocks")
+        car-file (.join node-path temp "snapshot.car")]
+    (try
+      (.mkdirSync node-fs tree #js {:recursive true})
+      (.writeFileSync node-fs (.join node-path tree "a.txt") "a\n")
+      (let [written (cli/run! ["snapshot" "--tree" tree "--scope-root" "/w"
+                               "--car" car-file "--blocks-dir" blocks])]
+        (is (= :blocks-port-required
+               (problem #(cli/run! ["materialize" "--car" car-file
+                                    "--root" (:root written) "--scope-root" "/w"
+                                    "--cache-root" (.join node-path temp "cache")]))))
+        (is (= :content-block-missing
+               (problem #(cli/run! ["materialize" "--car" car-file
+                                    "--root" (:root written) "--scope-root" "/w"
+                                    "--blocks-dir" (.join node-path temp "empty")
+                                    "--cache-root" (.join node-path temp "cache2")])))))
+      (finally
+        (fixture/test-make-writable! temp)
+        (.rmSync node-fs temp #js {:recursive true :force true})))))
+
+(deftest the-host-digest-is-installed-and-is-the-one-being-paid-for
+  ;; Loading fs-cli installs node:crypto's SHA-256 through multiformats'
+  ;; seam. Two things are worth asserting and only one of them is obvious.
+  ;;
+  ;; That it AGREES is already enforced by install-sha256!, which throws --
+  ;; so a test that only checked agreement would be checking the library.
+  ;; What this repo has to check is that the install took EFFECT, because the
+  ;; failure it prevents is silent: everything still works, 180x slower, and
+  ;; the comment saying otherwise stays true-looking. That is the exact
+  ;; failure sha256-provider was added to make askable.
+  (is (some? cli/node-crypto) "the namespace is loaded")
+  (is (= :installed (mf/sha256-provider))
+      "fs-cli installs the host digest at module scope")
+  (doseq [sample [(js/Uint8Array. 0)
+                  (js/Buffer.from "a" "utf8")
+                  (js/Buffer.from "hello 😀\n" "utf8")
+                  (js/Uint8Array.from #js [137 80 78 71 13 10 26 10 0 255 254 253])
+                  (js/Buffer.from (.repeat "0123456789" 10000) "utf8")]]
+    (is (re-matches #"^bafkrei[a-z2-7]{52}$" (mf/cidv1-raw (bytes/as-bytes sample)))
+        (str "a well-formed raw CIDv1 for " (.-length sample) " bytes"))))
+
+(deftest a-path-list-snapshots-exactly-what-it-names
+  (let [temp (.mkdtempSync node-fs (.join node-path (.tmpdir node-os) "ipq-fs-paths-"))
+        tree (.join node-path temp "tree")
+        docs (.join node-path tree "docs")
+        blocks (.join node-path temp "blocks")
+        listed (.join node-path temp "paths.txt")]
+    (try
+      (.mkdirSync node-fs docs #js {:recursive true})
+      (.writeFileSync node-fs (.join node-path tree "wanted.txt") "a\n")
+      (.writeFileSync node-fs (.join node-path docs "wanted.txt") "b\n")
+      (.writeFileSync node-fs (.join node-path tree "ignored.bin") "c\n")
+      (.writeFileSync node-fs listed
+                      "# the two documents, not the third file\nwanted.txt\ndocs/wanted.txt\n")
+      (let [written (cli/run! ["snapshot" "--tree" tree "--scope-root" "/w"
+                               "--car" (.join node-path temp "a.car")
+                               "--blocks-dir" blocks "--paths" listed])]
+        (is (= 2 (:files written)) "only the listed files")
+        (is (= 4 (:entries written)) "plus /w and /w/docs")
+        (is (= 2 (count (js->clj (.readdirSync node-fs blocks))))
+            "and only their blocks were written"))
+
+      (testing "a path that is not there is refused, never skipped"
+        (.writeFileSync node-fs listed "wanted.txt\ndocs/gone.txt\n")
+        (is (= :no-such-path
+               (problem #(cli/run! ["snapshot" "--tree" tree "--scope-root" "/w"
+                                    "--car" (.join node-path temp "b.car")
+                                    "--blocks-dir" blocks "--paths" listed])))))
+
+      (testing "and a path that would leave the tree is refused as its shape"
+        (.writeFileSync node-fs listed "../escape.txt\n")
+        (is (= :unusable-path
+               (problem #(cli/run! ["snapshot" "--tree" tree "--scope-root" "/w"
+                                    "--car" (.join node-path temp "c.car")
+                                    "--blocks-dir" blocks "--paths" listed])))))
+      (finally
+        (fixture/test-make-writable! temp)
+        (.rmSync node-fs temp #js {:recursive true :force true})))))
+
+(deftest naming-every-file-gives-the-same-cid-as-walking-for-them
+  ;; The root CID is a function of the encoded entries, so the two routes
+  ;; have to agree about their order or the same tree would have two
+  ;; identities depending on which flag produced it.
+  (let [temp (.mkdtempSync node-fs (.join node-path (.tmpdir node-os) "ipq-fs-same-"))
+        tree (.join node-path temp "tree")
+        docs (.join node-path tree "docs")
+        listed (.join node-path temp "paths.txt")]
+    (try
+      (.mkdirSync node-fs docs #js {:recursive true})
+      (.writeFileSync node-fs (.join node-path tree "b.txt") "b\n")
+      (.writeFileSync node-fs (.join node-path tree "a.txt") "a\n")
+      (.writeFileSync node-fs (.join node-path docs "c.txt") "c\n")
+      (.writeFileSync node-fs listed "b.txt\na.txt\ndocs/c.txt\n")
+      (let [walked (cli/run! ["snapshot" "--tree" tree "--scope-root" "/w"
+                              "--car" (.join node-path temp "w.car")
+                              "--blocks-dir" (.join node-path temp "wb")])
+            named (cli/run! ["snapshot" "--tree" tree "--scope-root" "/w"
+                             "--car" (.join node-path temp "n.car")
+                             "--blocks-dir" (.join node-path temp "nb")
+                             "--paths" listed])]
+        (is (= (:entries walked) (:entries named)))
+        (is (= (:root walked) (:root named))))
+      (finally
+        (fixture/test-make-writable! temp)
+        (.rmSync node-fs temp #js {:recursive true :force true})))))

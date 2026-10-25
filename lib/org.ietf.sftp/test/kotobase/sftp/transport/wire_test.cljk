@@ -1,0 +1,186 @@
+;; .cljs-only (mirrors kotobase.sftp.transport.wire itself). Unit-level
+;; tests for the wire PRIMITIVES: packet framing, KEXINIT
+;; build/parse/negotiate, mpint encoding against RFC 4251 §5's own worked
+;; examples, and exchange-hash/key-derivation self-consistency. These do
+;; NOT open a socket — the real cross-process proof that two independent
+;; processes actually complete a handshake and exchange encrypted SFTP
+;; traffic is test/kotobase/sftp/transport/ssh_demo.cljk, run as its own
+;; CI step (see ci.yml and that file's own docstring for exactly what it
+;; does and does not prove).
+(ns kotobase.sftp.transport.wire-test
+  (:require [cljs.test :refer [deftest is testing]]
+            ["node:crypto" :as crypto]
+            [kotobase.sftp.transport.wire :as w]))
+
+(defn- bytes-of [n v] (js/Buffer.from (into-array (repeat n v))))
+
+(deftest plaintext-packet-framing-round-trips
+  (let [payload (js/Buffer.from "hello sftp payload")
+        packet (w/build-plaintext-packet payload)
+        {:keys [payload consumed]} (w/parse-plaintext-packet packet)]
+    (is (= "hello sftp payload" (.toString payload "utf8")))
+    (is (= consumed (.-length packet)))
+    (testing "packet_length + padding_length + payload + padding (everything
+              AFTER the 4-byte length field itself) is a multiple of the block
+              size — the length field is excluded, per RFC 4253 §6"
+      (is (zero? (mod (- consumed 4) 8))))))
+
+(deftest kexinit-build-parse-round-trip
+  (let [ki (w/build-kexinit)
+        parsed (w/parse-kexinit ki)]
+    (is (= ["curve25519-sha256"] (:kex-algorithms parsed)))
+    (is (= ["ssh-ed25519"] (:server-host-key-algorithms parsed)))
+    (is (= ["aes128-ctr"] (:encryption-c2s parsed)))
+    (is (= ["aes128-ctr"] (:encryption-s2c parsed)))
+    (is (= ["hmac-sha2-256"] (:mac-c2s parsed)))
+    (is (= ["none"] (:compression-c2s parsed)))))
+
+(deftest negotiate-picks-clients-preference-first-match
+  (is (= "curve25519-sha256" (w/negotiate ["curve25519-sha256"] ["curve25519-sha256"])))
+  (is (= "b" (w/negotiate ["a" "b" "c"] ["x" "b" "c"])))
+  (is (nil? (w/negotiate ["a"] ["b"]))))
+
+(deftest mpint-matches-rfc4251-section5-worked-examples
+  (testing "0 -> empty string"
+    (is (= "00000000" (.toString (w/mpint (js/Buffer.from #js [0])) "hex"))))
+  (testing "0x80 -> 00 80 (high bit set, needs a leading zero byte)"
+    (is (= "000000020080" (.toString (w/mpint (js/Buffer.from #js [0x80])) "hex"))))
+  (testing "0x9a378f9b2e332a7 -> 09 a3 78 f9 b2 e3 32 a7 (high bit clear, no leading zero)"
+    (is (= "0000000809a378f9b2e332a7"
+           (.toString (w/mpint (js/Buffer.from #js [0x09 0xa3 0x78 0xf9 0xb2 0xe3 0x32 0xa7])) "hex")))))
+
+(deftest x25519-ecdh-shared-secret-matches-both-directions
+  (let [a (w/x25519-keypair)
+        b (w/x25519-keypair)
+        a-raw (w/x25519-raw-pub (.-publicKey a))
+        b-raw (w/x25519-raw-pub (.-publicKey b))
+        s1 (w/x25519-shared-secret (.-privateKey a) b-raw)
+        s2 (w/x25519-shared-secret (.-privateKey b) a-raw)]
+    (is (= 32 (.-length a-raw)))
+    (is (.equals s1 s2))))
+
+(deftest ed25519-sign-verify-round-trips-through-raw-bytes
+  (let [kp (w/ed25519-keypair)
+        raw (w/ed25519-raw-pub (.-publicKey kp))
+        msg (js/Buffer.from "sign me")
+        sig (w/ed25519-sign (.-privateKey kp) msg)
+        pub2 (w/ed25519-pub-from-raw raw)
+        wrong-msg (js/Buffer.from "not the message")]
+    (is (= 32 (.-length raw)))
+    (is (= 64 (.-length sig)))
+    (is (w/ed25519-verify pub2 msg sig))
+    (is (not (w/ed25519-verify pub2 wrong-msg sig)))))
+
+(deftest exchange-hash-and-derive-keys-are-self-consistent
+  (let [k (bytes-of 32 7)
+        h (w/exchange-hash {:v-c "SSH-2.0-testclient" :v-s "SSH-2.0-testserver"
+                             :i-c (js/Buffer.from "IC") :i-s (js/Buffer.from "IS")
+                             :k-s (js/Buffer.from "KS")
+                             :q-c (bytes-of 32 1) :q-s (bytes-of 32 2) :k k})
+        derived (w/derive-keys k h h)]
+    (is (= 32 (.-length h)))
+    (testing "every derived key/iv has the length its algorithm needs"
+      (is (= 16 (.-length (:iv-c2s derived))))
+      (is (= 16 (.-length (:iv-s2c derived))))
+      (is (= 16 (.-length (:enc-key-c2s derived))))
+      (is (= 16 (.-length (:enc-key-s2c derived))))
+      (is (= 32 (.-length (:mac-key-c2s derived))))
+      (is (= 32 (.-length (:mac-key-s2c derived)))))
+    (testing "the six derived values are pairwise distinct (different tag chars)"
+      (let [vs (vals derived)]
+        (is (= (count vs) (count (distinct (map #(.toString % "hex") vs)))))))
+    (testing "same inputs -> byte-identical outputs (both sides of a real handshake
+              compute this independently and must agree)"
+      (let [h2 (w/exchange-hash {:v-c "SSH-2.0-testclient" :v-s "SSH-2.0-testserver"
+                                  :i-c (js/Buffer.from "IC") :i-s (js/Buffer.from "IS")
+                                  :k-s (js/Buffer.from "KS")
+                                  :q-c (bytes-of 32 1) :q-s (bytes-of 32 2) :k k})]
+        (is (.equals h h2))))))
+
+(deftest reader-writer-plaintext-round-trip-across-arbitrary-chunk-splits
+  (let [writer (w/new-writer)
+        reader (w/new-reader)
+        received (atom [])
+        p1 (js/Buffer.from "packet one")
+        p2 (js/Buffer.from "packet two, a bit longer than the first")
+        b1 (w/encode-packet writer p1)
+        _ (w/advance-writer! writer)
+        b2 (w/encode-packet writer p2)
+        _ (w/advance-writer! writer)
+        all (js/Buffer.concat #js [b1 b2])]
+    ;; Feed in arbitrary 3-byte chunks, deliberately NOT aligned to packet
+    ;; boundaries — proves feed! doesn't assume a chunk == a packet.
+    (doseq [i (range 0 (.-length all) 3)]
+      (w/feed! reader (.subarray all i (min (.-length all) (+ i 3)))
+               (fn [payload] (swap! received conj (.toString payload "utf8")))))
+    (is (= ["packet one" "packet two, a bit longer than the first"] @received))))
+
+(deftest reader-writer-encrypted-round-trip-including-newkeys-boundary-in-one-chunk
+  (let [key (crypto/randomBytes 16)
+        iv (crypto/randomBytes 16)
+        mac-key (crypto/randomBytes 32)
+        writer (w/new-writer)
+        reader (w/new-reader)
+        received (atom [])
+        newkeys-payload (js/Buffer.from #js [w/msg-newkeys])
+        after-payload (js/Buffer.from "first encrypted packet right after newkeys")
+        nk-bytes (w/encode-packet writer newkeys-payload)
+        _ (w/advance-writer! writer)
+        cipher (crypto/createCipheriv "aes-128-ctr" key iv)
+        _ (w/arm-writer-encryption! writer {:cipher cipher :mac-key mac-key :block-size 16 :mac-len 32})
+        enc-bytes (w/encode-packet writer after-payload)
+        _ (w/advance-writer! writer)
+        ;; NEWKEYS and the packet right after it arrive in ONE chunk — this is
+        ;; the case that requires arm-reader-encryption! to take effect
+        ;; synchronously, mid-feed!, via the on-packet callback (see feed!'s
+        ;; own docstring).
+        combined (js/Buffer.concat #js [nk-bytes enc-bytes])
+        decipher (crypto/createDecipheriv "aes-128-ctr" key iv)]
+    (w/feed! reader combined
+             (fn [payload]
+               (swap! received conj payload)
+               (when (= w/msg-newkeys (aget payload 0))
+                 (w/arm-reader-encryption! reader {:decipher decipher :mac-key mac-key
+                                                    :block-size 16 :mac-len 32}))))
+    (is (= 2 (count @received)))
+    (is (= w/msg-newkeys (aget (first @received) 0)))
+    (is (= "first encrypted packet right after newkeys" (.toString (second @received) "utf8")))))
+
+(deftest reader-rejects-a-payload-tampered-with-after-encryption
+  (let [key (crypto/randomBytes 16)
+        iv (crypto/randomBytes 16)
+        mac-key (crypto/randomBytes 32)
+        writer (w/new-writer)
+        cipher (crypto/createCipheriv "aes-128-ctr" key iv)
+        _ (w/arm-writer-encryption! writer {:cipher cipher :mac-key mac-key :block-size 16 :mac-len 32})
+        payload (js/Buffer.from "sensitive-payload-content")
+        bytes (w/encode-packet writer payload)
+        tampered (js/Buffer.from bytes)
+        ;; Flip a byte squarely inside the encrypted PAYLOAD region (index 8,
+        ;; well past the 5-byte length+padlen header) so packet_length is
+        ;; untouched and the read completes fully — exercising the MAC check
+        ;; itself, not the separate packet-too-large guard a corrupted LENGTH
+        ;; field would hit instead (see the next test).
+        _ (aset tampered 8 (bit-xor (aget tampered 8) 0xff))
+        decipher (crypto/createDecipheriv "aes-128-ctr" key iv)
+        reader (w/new-reader)
+        _ (w/arm-reader-encryption! reader {:decipher decipher :mac-key mac-key :block-size 16 :mac-len 32})]
+    (is (thrown-with-msg? js/Error #"MAC verification failed"
+                           (w/feed! reader tampered (fn [_] (throw (ex-info "should not decode" {}))))))))
+
+(deftest reader-rejects-an-absurd-packet-length
+  ;; A corrupted/malicious first 4 bytes claiming a huge packet_length must
+  ;; not make this reader buffer unboundedly waiting for bytes that will
+  ;; never arrive — see feed!'s 256 KiB guard.
+  (let [reader (w/new-reader)
+        huge-length-header (w/uint32 (* 10 1024 1024))]
+    (is (thrown-with-msg? js/Error #"packet_length exceeds"
+                           (w/feed! reader huge-length-header (fn [_] nil))))))
+
+(deftest hmac-sha256-known-answer
+  ;; RFC 4231 test case 1 (key = 20 bytes of 0x0b, data = "Hi There")
+  (let [key (bytes-of 20 0x0b)
+        data (js/Buffer.from "Hi There")
+        mac (w/hmac-sha256 key data)]
+    (is (= "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+           (.toString mac "hex")))))

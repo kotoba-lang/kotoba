@@ -1,0 +1,110 @@
+(ns kotoba.package-registry.ipfs
+  "Verified HTTP/IPFS transport for the pure Kotoba package registry.
+
+  ## Why this is `.cljc` and not `.clj`
+
+  Three imports made this namespace JVM-only — `java.net.URI`,
+  `java.net.http`, and `java.time.Duration` — and all three sat inside
+  `http-fetch`, the DEFAULT transport. The part that matters, and the part
+  this repo exists for, is the verification: check the CID's shape before
+  any I/O, check the returned bytes hash back to the CID that was asked
+  for, and hand only verified bytes to
+  `kotoba.lang.package-registry`. None of that is host work, and none of it
+  should have pinned a caller to a runtime just because one default
+  argument did.
+
+  `fetch-fn` was already injectable, so the split costs nothing: the
+  verification is shared, and the JVM `HttpClient` is a `#?(:clj …)` form
+  that ClojureScript never reads.
+
+  ## There is no portable synchronous HTTP, and this does not pretend there is
+
+  On ClojureScript there is no default transport. `js/fetch` returns a
+  promise, and this function's whole signature is synchronous — a caller
+  gets `{:ok? …}` back, not a promise of one. Turning the API async to
+  supply a default would change every existing caller in order to add a
+  convenience.
+
+  So on ClojureScript `fetch-fn` has no default and omitting it is a
+  fail-closed `:registry/no-transport`, which is the same shape as every
+  other refusal here. That is deliberately NOT the same as returning
+  `{:ok? true}` with nothing fetched, and not the same as a nil-pointer
+  either: a transport that could not run is a distinct answer from one that
+  ran and found nothing.
+
+  ## The byte container is the platform's
+
+  `:bytes` in a fetch result is whatever `multiformats.core/cidv1-raw`
+  hashes — a `byte[]` on the JVM and a `Uint8Array` on ClojureScript — and
+  the UTF-8 decode on the way to `edn/read-string` uses the platform's own
+  decoder for the same reason. `js/TextDecoder` is a global in Node and in
+  browsers alike, so this does not smuggle in a Node-only dependency."
+  (:require [kotoba.bytes :as kbytes] [kotoba.lang.edn :as edn]
+            [kotoba.lang.package-contract :as contract]
+            [kotoba.lang.package-registry :as registry]
+            [multiformats.core :as mf])
+  #?(:clj (:import [java.net URI]
+                   [java.net.http HttpClient HttpRequest HttpResponse$BodyHandlers]
+                   [java.time Duration])))
+
+#?(:clj
+   (defn- http-fetch
+     "The JVM default transport. Stays `:clj`-only: `java.time.Duration` here
+     is the timeout argument `HttpClient` demands, not date arithmetic, so
+     there is nothing to make portable that is not the HTTP client itself."
+     [cid {:keys [gateway-base timeout-ms]}]
+     (let [request (-> (HttpRequest/newBuilder)
+                       (.uri (URI/create (str gateway-base cid)))
+                       (.timeout (Duration/ofMillis timeout-ms))
+                       (.GET)
+                       (.build))
+           response (.send (HttpClient/newHttpClient) request
+                           (HttpResponse$BodyHandlers/ofByteArray))]
+       {:status (.statusCode response) :bytes (.body response)})))
+
+(defn- utf8-string
+  "Platform bytes → string. Both branches are the host's own UTF-8 decoder,
+  so they agree byte for byte; there is no Clojure primitive for this and
+  `kotoba.bytes` encodes but does not decode."
+  [b]
+  #?(:clj (kbytes/utf8-string ^bytes b)
+     :cljs (.decode (js/TextDecoder.) b)))
+
+(defn lock-from-requests
+  "Fetch CID, verify exact bytes, decode EDN, then delegate resolution to the
+  pure language registry. `fetch-fn` is injectable for alternate transports and
+  deterministic tests; it returns {:status integer :bytes platform-bytes}.
+
+  On the JVM `fetch-fn` defaults to `http-fetch`. On ClojureScript it has no
+  default — see the namespace docstring — and omitting it returns
+  `:registry/no-transport` rather than a pass over bytes nobody fetched."
+  ([cid requests] (lock-from-requests cid requests {}))
+  ([cid requests {:keys [gateway-base timeout-ms fetch-fn]
+                  :or {gateway-base "http://127.0.0.1:8080/ipfs/"
+                       timeout-ms 10000
+                       fetch-fn #?(:clj http-fetch :cljs nil)}}]
+   (cond
+     (not (contract/cid? cid))
+     {:ok? false :problems [{:problem :registry/cid-invalid}]}
+
+     (nil? fetch-fn)
+     {:ok? false :problems [{:problem :registry/no-transport}]}
+
+     :else
+     (try
+       (let [{:keys [status bytes]}
+             (fetch-fn cid {:gateway-base gateway-base
+                            :timeout-ms timeout-ms})]
+         (cond
+           (not= 200 status)
+           {:ok? false :problems [{:problem :registry/fetch-http-status
+                                   :status status}]}
+           (not= cid (mf/cidv1-raw bytes))
+           {:ok? false :problems [{:problem :registry/cid-mismatch}]}
+           :else
+           (registry/lock-from-requests
+            (edn/read-string (utf8-string bytes)) requests)))
+       (catch #?(:clj Exception :cljs :default) error
+         {:ok? false
+          :problems [{:problem :registry/fetch-failed
+                      :message (ex-message error)}]})))))

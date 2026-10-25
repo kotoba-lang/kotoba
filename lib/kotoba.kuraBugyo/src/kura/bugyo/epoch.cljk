@@ -1,0 +1,173 @@
+(ns kura.bugyo.epoch
+  "Closing a payout epoch: what each node is owed, and a root anybody can
+  check it against.
+
+  ADR-2607299200 section 6d. The coordinator decides placement, issues audits
+  and computes payouts — it is a trusted point, and saying so is not the same
+  as leaving it unchecked. What this namespace buys is that the coordinator
+  **cannot lie about the total or about any node's share** without
+  contradicting something it already published:
+
+  - every honoured order becomes a `merkle-sum` leaf whose `:sum` is the bytes
+    it moved, so the tree's root sums to what the epoch owes;
+  - the root goes on chain;
+  - each node claims with an inclusion proof.
+
+  A coordinator that understates the total contradicts some node's proof. One
+  that inflates a node's share contradicts the published root. The
+  sum-shrinking trick `merkle-sum` already rejects is the third case. What
+  remains uncovered is a coordinator that omits a node's orders entirely —
+  which the node detects immediately, because it holds the signed orders and
+  can show them. Detection, not prevention; the escalation is the dispute
+  path, and pretending otherwise would be the kind of claim this design keeps
+  refusing to make.
+
+  Slashing is applied **before** the tree is built, not after. A deduction
+  applied afterwards would make the published root disagree with what was
+  actually paid, and the root is the only thing anyone can check."
+  (:require [kura.bugyo.collateral :as collateral]
+            [kura.bugyo.pricing :as pricing]
+            [merkle-sum.core :as ms]))
+
+(defn- usd-micros
+  "USD as integer micros. `merkle-sum` sums integers and rejects negatives,
+  and money in floating point does not survive being summed over a large
+  epoch — a payout ledger that disagrees with itself by a rounding error is
+  a dispute, not a rounding error."
+  [usd]
+  (long (Math/round (* usd 1000000.0))))
+
+(defn micros-usd [m] (/ (double m) 1000000.0))
+
+(defn node-entry
+  "One node's claim on an epoch, before the tree.
+
+  `orders` are the settlement leaves `kura.node.accounting/epoch-ledger`
+  produced. `findings` are audit outcomes to slash for."
+  [rates pol layout {:keys [node-id physical-tb served-tb orders findings bond-usd]
+                     :or {served-tb 0 orders [] findings [] bond-usd 0.0}}]
+  (let [earn (pricing/node-earnings rates {:physical-tb physical-tb
+                                           :served-tb served-tb})
+        required (:bond-usd (collateral/bond-required-usd rates pol layout physical-tb))
+        slashes (reduce (fn [acc f]
+                          (let [r (collateral/slash {:bond-usd (:bond acc)
+                                                     :required-usd required} f)]
+                            {:bond (:remaining-usd r)
+                             :deducted (+ (:deducted acc) (:deducted-usd r))}))
+                        {:bond bond-usd :deducted 0.0}
+                        findings)
+        ;; Status is computed from the final bond against the requirement, NOT
+        ;; carried out of the slashing fold. Under-bonding is a state, not only
+        ;; a consequence of a finding: a node that commits more capacity than
+        ;; its bond covers is under-bonded on a clean epoch, and a coordinator
+        ;; that only noticed it after a slash would keep placing shards on it
+        ;; until something went wrong.
+        final-bond (:bond slashes)
+        status (cond
+                 (<= final-bond 0.0) :forfeited
+                 (< final-bond required) :under-bonded
+                 :else :bonded)
+        gross (:total-usd earn)
+        ;; A slashed epoch forfeits earnings up to the deduction. Deducting
+        ;; from the bond alone would let a node profit from an epoch it was
+        ;; caught cheating in, which is not a penalty.
+        withheld (min gross (:deducted slashes))
+        net (- gross withheld)]
+    {:node-id node-id
+     :physical-tb physical-tb
+     :served-tb served-tb
+     :orders (count orders)
+     :order-bytes (reduce + 0 (map :sum orders))
+     :gross-usd gross
+     :withheld-usd withheld
+     :net-usd net
+     :net-micros (usd-micros net)
+     :bond-remaining-usd (:bond slashes)
+     :bond-required-usd required
+     :bond-status status
+     :findings (vec findings)}))
+
+(defn close
+  "Close an epoch. Returns the entries, the tree, and the root to publish.
+
+  `hash-hex` is injected — this namespace holds no crypto, like everything
+  else in the stack."
+  [hash-hex rates pol layout epoch-id nodes]
+  (let [entries (mapv #(node-entry rates pol layout %) nodes)
+        leaves (mapv (fn [{:keys [node-id net-micros]}]
+                       {:id node-id
+                        :hash (hash-hex (str epoch-id "|" node-id "|" net-micros))
+                        :sum net-micros})
+                     entries)
+        tree (ms/build-tree hash-hex leaves)]
+    {:epoch epoch-id
+     :entries entries
+     :tree tree
+     :root (:root tree)
+     :total-micros (get-in tree [:root :sum])
+     :total-usd (micros-usd (get-in tree [:root :sum]))
+     :nodes (count entries)
+     :under-bonded (into (sorted-set)
+                         (keep #(when (not= :bonded (:bond-status %)) (:node-id %)))
+                         entries)}))
+
+(defn claim
+  "A node's payout claim: its amount plus the inclusion proof."
+  [settlement node-id]
+  (when-let [entry (first (filter #(= node-id (:node-id %)) (:entries settlement)))]
+    {:epoch (:epoch settlement)
+     :node-id node-id
+     :net-usd (:net-usd entry)
+     :net-micros (:net-micros entry)
+     :root (:root settlement)
+     :proof (ms/inclusion-proof (:tree settlement) node-id)}))
+
+(defn verify-claim
+  "Third-party check of a claim against the published root.
+
+  Anyone can run this: the root is on chain, the proof is in the claim, and
+  the leaf preimage is a documented string. That is the whole of what the
+  coordinator's trustworthiness rests on being checkable."
+  [hash-hex {:keys [epoch node-id net-micros root proof]}]
+  (boolean
+   (and proof
+        (ms/verify hash-hex
+                   (hash-hex (str epoch "|" node-id "|" net-micros))
+                   net-micros proof root))))
+
+(defn treasury-instruction
+  "What to send on chain: the root to publish and the total to fund.
+
+  Deliberately just data. This namespace does not touch a wallet — the USDC
+  transfer goes through `kotoba-lang/pay`, which holds no keys either, and
+  the signing happens where the keys are."
+  [settlement]
+  {:epoch (:epoch settlement)
+   :publish-root (get-in settlement [:root :hash])
+   :committed-total-micros (:total-micros settlement)
+   :committed-total-usd (:total-usd settlement)
+   :currency :usdc
+   :chain :base
+   :payees (mapv #(select-keys % [:node-id :net-micros]) (:entries settlement))})
+
+(defn reconcile
+  "Whether every entry still verifies against the published root.
+
+  Cheap, and worth running before funding. A settlement whose entries and
+  root have drifted apart is one where a payout was edited after the
+  commitment, and the only moment that is recoverable is before the money
+  moves. Checks each leaf's proof rather than only the arithmetic, because
+  the sums can agree while a leaf has been swapped."
+  [hash-hex settlement]
+  (let [bad (into (sorted-set)
+                  (keep (fn [{:keys [node-id]}]
+                          (when-not (verify-claim hash-hex (claim settlement node-id))
+                            node-id)))
+                  (:entries settlement))
+        entries-total (reduce + 0 (map :net-micros (:entries settlement)))]
+    {:published-root (get-in settlement [:root :hash])
+     :entries-total-micros entries-total
+     :root-total-micros (:total-micros settlement)
+     :sums-agree? (= entries-total (:total-micros settlement))
+     :unverifiable bad
+     :consistent? (and (empty? bad) (= entries-total (:total-micros settlement)))}))

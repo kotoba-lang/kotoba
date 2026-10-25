@@ -1,0 +1,158 @@
+(ns kura.bugyo.plane-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [erasure.lrc :as lrc]
+            [kura.bugyo.plane :as plane]
+            [kura.placement :as placement]
+            [kura.repair :as repair]))
+
+(def layout (lrc/layout {:k 16 :r 4 :g 12}))
+(def pol (repair/policy {:grace-seconds 900 :repair-threshold 5}))
+
+(defn- now-ms
+  "Wall clock in milliseconds. Reader-conditional because this file is .cljc
+  and `System/nanoTime` does not exist under ClojureScript — a timing helper
+  that only compiles on one host makes the whole namespace one-host."
+  []
+  #?(:clj (/ (System/nanoTime) 1e6) :cljs (js/performance.now)))
+
+(defn- fleet [n]
+  (mapv (fn [i] (placement/node {:id (str "n-" i) :availability :always-on
+                                   :domains {:rack (str "r-" (mod i 40))}}))
+        (range n)))
+
+(defn- populate
+  "A plane with `groups` placement groups over `nodes` nodes, placed by the
+  real placement function rather than by hand — an assessment that depends on
+  a hand-picked layout is an assessment of the fixture."
+  [groups nodes]
+  (let [ns- (fleet nodes)
+        cfg {:group-count groups :nodes ns- :n (:n layout)
+             :pol (placement/policy {:caps {:rack 8}})}
+        base (reduce (fn [p n] (plane/commit p {:kind :node/joined
+                                                :node (plane/node {:node-id (:id n)
+                                                                   :physical-tb 10.0
+                                                                   :bond-usd 500.0
+                                                                   :availability :always-on
+                                                                   :domains (:domains n)})}))
+                     (plane/empty-plane {:layout layout :group-count groups})
+                     ns-)]
+    (reduce (fn [p g]
+              (plane/commit p {:kind :group/placed
+                               :group g
+                               :nodes (map :id (:nodes (placement/select
+                                                        (placement/group-name g)
+                                                        ns- (:n layout) (:pol cfg))))}))
+            base
+            (range groups))))
+
+(deftest a-plane-is-groups-not-shards
+  (testing "ADR section 3: one row per group, and an object's group is a
+            function of its id — never a stored row. That is the difference
+            between ~10^5 rows per petabyte and ~10^8."
+    (let [p (populate 200 60)]
+      (is (= 200 (count (:groups p))))
+      (is (= 60 (count (:nodes p))))
+      (testing "no shard-level rows exist anywhere in the plane"
+        (is (every? #(= (:n layout) (count (:nodes %))) (vals (:groups p))))
+        (is (nil? (:shards p)))))))
+
+(deftest every-mutation-is-replayable
+  (testing "the coordinator is a trusted point, and the only thing that makes a
+            trusted point auditable is that its decisions replay from a log"
+    (let [events [{:kind :node/joined :node (plane/node {:node-id "a" :physical-tb 1.0 :bond-usd 100.0 :availability :always-on})}
+                  {:kind :node/joined :node (plane/node {:node-id "b" :physical-tb 1.0 :bond-usd 100.0 :availability :always-on})}
+                  {:kind :group/placed :group 0 :nodes ["a" "b"]}
+                  {:kind :node/unreachable :node-id "b" :at 1000}
+                  {:kind :group/audited :group 0 :at 1200}]
+          init (plane/empty-plane {:layout layout :group-count 1})
+          built (reduce plane/commit init events)
+          replayed (plane/replay init events)]
+      (is (= built replayed))
+      (is (= 5 (:seq built)))
+      (is (= :unreachable (get-in built [:nodes "b" :state]))))))
+
+(deftest an-unknown-event-is-recorded-not-dropped
+  (testing "a plane that silently ignores what it does not understand diverges
+            from its own log, and the divergence is invisible until replay"
+    (let [p (plane/commit (plane/empty-plane {:layout layout :group-count 1})
+                          {:kind :node/teleported :node-id "x"})]
+      (is (= 1 (count (:rejected p))))
+      (is (= 1 (:seq p)) "and it still advances the sequence"))))
+
+(deftest a-departed-node-is-not-forgotten
+  (testing "forgetting it would make the groups that held it look healthy"
+    (let [p (-> (populate 10 40)
+                (plane/commit {:kind :node/departed :node-id "n-0"}))]
+      (is (contains? (:nodes p) "n-0"))
+      (is (= :lost (get-in p [:nodes "n-0" :state]))))))
+
+(deftest the-node-death-question-is-answered-in-one-pass
+  (testing "ADR section 4's named question: node N is gone, which groups are
+            now below threshold"
+    (let [p (populate 300 50)
+          impact (plane/node-death-impact p pol "n-7" 10000)]
+      (is (pos? (:groups-touched impact)) "the node held some groups")
+      (is (= 300 (:total-groups impact)))
+      (is (= (:groups-touched impact) (count (:groups impact))))
+      (testing "and every touched group reports its margin AFTER the loss —
+                the number a scheduler acts on"
+        (is (every? (fn [[_ g]] (and (contains? g :margin)
+                                     (contains? g :readable?)
+                                     (= 1 (count (:erased g)))))
+                    (:groups impact))))
+      (testing "one node's death does not touch every group"
+        (is (< (:groups-touched impact) 300))))))
+
+(deftest groups-holding-is-exact
+  (let [p (populate 120 45)
+        held (plane/groups-holding p "n-3")]
+    (is (every? (fn [g] (some #{"n-3"} (get-in p [:groups g :nodes]))) held))
+    (is (every? (fn [[g grp]] (or (contains? held g)
+                                  (not (some #{"n-3"} (:nodes grp)))))
+                (:groups p))
+        "and misses nothing")))
+
+(deftest the-scan-is-linear-in-groups-not-objects
+  (testing "the claim the whole two-level scheme exists to make true. A
+            petabyte is ~10^5 groups; if this were shard-addressed it would be
+            ~10^8 rows and the question would be a batch job."
+    (let [p (populate 100000 200)
+          t0 (now-ms)
+          impact (plane/node-death-impact p pol "n-11" 10000)
+          ms (- (now-ms) t0)]
+      (is (= 100000 (:total-groups impact)))
+      (is (pos? (:groups-touched impact)))
+      (is (< ms 20000)
+          (str "100k groups scanned in " (int ms) "ms — the point is that this "
+               "is a query, not a data-warehouse job")))))
+
+(deftest liveness-drives-shard-state-not-a-separate-table
+  (testing "shard state is derived from node liveness, so there is nothing to
+            keep in sync — the class of bug where a node is marked dead and its
+            shards are still marked live cannot occur"
+    (let [p (-> (populate 5 40)
+                (plane/commit {:kind :node/unreachable :node-id "n-1" :at 500}))
+          g (first (plane/groups-holding p "n-1"))
+          st (plane/shard-state p g)]
+      (is (some (fn [[_ s]] (= :unreachable (:state s))) st))
+      (testing "and grace still applies — unreachable is not yet erased"
+        (let [a (plane/assess-group p pol g 600)]
+          (is (empty? (:erased a)))
+          (is (seq (:degraded a))))
+        (let [a (plane/assess-group p pol g 5000)]
+          (is (seq (:erased a)) "past grace, it counts"))))))
+
+(deftest the-plane-records-whether-a-node-stays-awake
+  (testing "it cannot be omitted — the plane decides when to spend repair
+            bandwidth, and it cannot do that without knowing which absences
+            were expected"
+    (is (thrown? #?(:clj AssertionError :cljs js/Error)
+                 (plane/node {:node-id "n-1" :physical-tb 10.0 :bond-usd 0.0}))))
+  (testing "and it survives the round trip into the plane, because an operator
+            who declared a laptop must still be a laptop when repair is costed"
+    (let [p (plane/commit (plane/empty-plane {:layout layout :group-count 4})
+                          {:kind :node/joined
+                           :node (plane/node {:node-id "lap-1" :physical-tb 0.8
+                                              :bond-usd 0.0
+                                              :availability :intermittent})})]
+      (is (= :intermittent (get-in p [:nodes "lap-1" :availability]))))))

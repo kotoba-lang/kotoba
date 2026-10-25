@@ -1,0 +1,168 @@
+(ns kotoba.annex.sealed-test
+  "封緘 backend のテスト。envelope の実暗号（X25519 + AES-256-GCM）を使い、
+   内側の store と state は in-memory で観測する —— **内側が何を見たか**を
+   assert したいので、mock ではなく記録つきの実装にする。"
+  (:require [kotoba.test :refer [deftest is testing async]]
+            [kotoba.annex.cid :as cid]
+            [kotoba.annex.sealed :as sealed]
+            [kotoba.signal.x25519 :as x25519]))
+
+(defn- sha256-hex [b]
+  (-> (js/require "crypto") (.createHash "sha256") (.update b) (.digest "hex")))
+
+(def payload (js/Buffer.from "the plaintext that must never reach the store"))
+(def payload-key (str "SHA256E-s" (.-length payload) "--" (sha256-hex payload) ".bin"))
+
+(defn- recipient []
+  (let [{:keys [priv pub]} (x25519/generate-keypair)]
+    {:priv priv :pub pub :id "did:key:test-operator"}))
+
+(defn- recording-inner
+  "store 契約 + 受け取った key/bytes を全部残す（何を見たかを assert するため）。"
+  [seen]
+  (let [a (atom {})]
+    {:backing a
+     :seen seen
+     :store!   (fn [k b] (swap! seen conj {:key k :bytes b}) (swap! a assoc k b) true)
+     :retrieve (fn [k] (get @a k))
+     :present? (fn [k] (if (contains? @a k) :yes :no))
+     :remove!  (fn [k] (swap! a dissoc k) true)
+     :init!    (fn [] true)
+     :prepare! (fn [_] true)}))
+
+(defn- mem-state []
+  (let [a (atom {})]
+    {:backing a
+     :get (fn [k] (get @a k))
+     :set! (fn [k v] (swap! a assoc k v) true)}))
+
+(defn- fixture [& {:keys [reader?] :or {reader? true}}]
+  (let [r (recipient)
+        seen (atom [])
+        inner (recording-inner seen)
+        st (mem-state)]
+    {:r r :seen seen :inner inner :state st
+     :store (sealed/sealed-store
+             {:inner inner :recipients [r] :state st
+              :reader (when reader? {:id (:id r) :priv (:priv r)})})}))
+
+(deftest sealed-roundtrip
+  (testing "封緘して置き、取り出すと元のバイト列に戻る"
+    (async done
+      (let [{:keys [store]} (fixture)]
+        (-> ((:store! store) payload-key payload)
+            (.then (fn [ok]
+                     (is (true? ok))
+                     ((:present? store) payload-key)))
+            (.then (fn [p]
+                     (is (= :yes p))
+                     ((:retrieve store) payload-key)))
+            (.then (fn [b]
+                     (is (some? b) "復号できた")
+                     (is (= (sha256-hex payload) (sha256-hex b)))
+                     (done))))))))
+
+(deftest sealed-identity-never-reaches-the-store
+  (testing "内側の store は平文も identity CID も一度も見ない"
+    (async done
+      (let [{:keys [store seen]} (fixture)
+            identity-cid (cid/key->cid payload-key)]
+        (-> ((:store! store) payload-key payload)
+            (.then (fn [_]
+                     (is (= 1 (count @seen)) "1 object = 1 put")
+                     (let [{:keys [key bytes]} (first @seen)]
+                       (is (not= key payload-key) "identity key は渡っていない")
+                       (is (not= (cid/key->cid key) identity-cid)
+                           "location CID は identity CID と別物")
+                       (is (not= (sha256-hex bytes) (sha256-hex payload))
+                           "平文は渡っていない")
+                       ;; 平文が暗号文の中に素で現れていないこと（AEAD なので当然だが、
+                       ;; 「封緘したつもりで素通しした」実装は同じ形で通ってしまう）
+                       (is (not (.includes (.toString bytes "utf8")
+                                           "the plaintext that must never"))
+                           "暗号文に平文の断片が無い"))
+                     (done))))))))
+
+(deftest sealed-state-is-the-only-map
+  (testing "対応表が無ければ :no。持っていない場所を知っているふりをしない"
+    (async done
+      (let [{:keys [store state]} (fixture)]
+        (-> ((:store! store) payload-key payload)
+            (.then (fn [_] ((:present? store) payload-key)))
+            (.then (fn [p]
+                     (is (= :yes p))
+                     ;; 対応表だけを失う（bytes は内側に残っている）
+                     (reset! (:backing state) {})
+                     ((:present? store) payload-key)))
+            (.then (fn [p]
+                     (is (= :no p) ":unknown でも :yes でもなく :no")
+                     ((:retrieve store) payload-key)))
+            (.then (fn [b] (is (nil? b)) (done))))))))
+
+(deftest sealed-state-written-only-after-bytes-land
+  (testing "内側の store が失敗したら対応表に書かない（在ることになっている項目を作らない）"
+    (async done
+      (let [{:keys [store inner state]} (fixture)]
+        ;; 内側を失敗させる
+        (set! (.-storeFn js/globalThis) nil)
+        (let [failing (assoc inner :store! (fn [_ _] false))
+              s2 (sealed/sealed-store
+                  {:inner failing :recipients [(recipient)] :state state})]
+          (-> ((:store! s2) payload-key payload)
+              (.then (fn [ok]
+                       (is (false? ok))
+                       (is (empty? @(:backing state)) "対応表は空のまま")
+                       (done)))))))))
+
+(deftest sealed-wrong-reader-cannot-open
+  (testing "別人の秘密鍵では開けない（nil。壊れたバイト列を返さない）"
+    (async done
+      (let [{:keys [store state inner r]} (fixture)
+            other (recipient)]
+        (-> ((:store! store) payload-key payload)
+            (.then (fn [_]
+                     (let [s2 (sealed/sealed-store
+                               {:inner inner :recipients [r] :state state
+                                :reader {:id (:id r) :priv (:priv other)}})]
+                       ((:retrieve s2) payload-key))))
+            (.then (fn [b] (is (nil? b)) (done))))))))
+
+(deftest sealed-tampered-ciphertext-is-refused
+  (testing "暗号文が差し替わっていたら nil"
+    (async done
+      (let [{:keys [store inner seen]} (fixture)]
+        (-> ((:store! store) payload-key payload)
+            (.then (fn [_]
+                     (let [lk (:key (first @seen))]
+                       (swap! (:backing inner) assoc lk
+                              (js/Buffer.from "not the ciphertext you sealed")))
+                     ((:retrieve store) payload-key)))
+            (.then (fn [b] (is (nil? b)) (done))))))))
+
+(deftest sealed-write-only-reader
+  (testing "reader が無ければ書けるが読めない（黙って壊れたものを返さない）"
+    (async done
+      (let [{:keys [store]} (fixture :reader? false)]
+        (-> ((:store! store) payload-key payload)
+            (.then (fn [ok]
+                     (is (true? ok))
+                     ((:retrieve store) payload-key)))
+            (.then (fn [b] (is (nil? b)) (done))))))))
+
+(deftest sealed-refuses-without-recipients
+  (testing "受信者ゼロは封緘ではなく紛失 —— store! も prepare! も落ちる"
+    (let [{:keys [inner state]} (fixture)
+          s (sealed/sealed-store {:inner inner :recipients [] :state state})]
+      (is (thrown? js/Error ((:store! s) payload-key payload)))
+      (is (thrown? js/Error ((:prepare! s) {}))))))
+
+(deftest sealed-refuses-without-state-port
+  (testing "対応表を置けないなら走り出さない"
+    (let [{:keys [inner r]} (fixture)
+          s (sealed/sealed-store {:inner inner :recipients [r] :state {}})]
+      (is (thrown? js/Error ((:prepare! s) {}))))))
+
+(deftest sealed-refuses-underivable-key
+  (testing "annex 層で暗号化/chunk された key は受けない（封緘はこの seam の仕事）"
+    (let [{:keys [store]} (fixture)]
+      (is (thrown? js/Error ((:store! store) "GPGHMACSHA1--c51589abcdef" payload))))))

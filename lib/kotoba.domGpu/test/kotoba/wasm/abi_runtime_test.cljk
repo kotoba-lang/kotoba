@@ -1,0 +1,454 @@
+(ns kotoba.wasm.abi-runtime-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.wasm.abi :as abi]
+            [kotoba.wasm.dom :as dom]
+            [kotoba.wasm.host :as host]
+            [kotoba.wasm.host.retained :as retained]
+            [cssom.layout :as layout]
+            [kotoba.wasm.runtime :as runtime]
+            [re-frame.core :as rf]
+            [reagent.core :as r]))
+
+(defn reset-counter! [n]
+  (rf/clear!)
+  (rf/reg-event-db :init (fn [_ _] {:count n :events []}))
+  (rf/reg-event-db :inc (fn [db [_ event]]
+                          (-> db
+                              (update :count inc)
+                              (update :events conj event))))
+  (rf/reg-sub :count (fn [db _] (:count db)))
+  (rf/reg-sub :events (fn [db _] (:events db)))
+  (rf/dispatch-sync [:init]))
+
+(defn reset-input-capture! []
+  (rf/clear!)
+  (rf/reg-event-db :init-input (fn [_ _] {:value "" :events []}))
+  (rf/reg-event-db :capture-input
+                   (fn [db [_ event]]
+                     (-> db
+                         (assoc :value (:value event))
+                         (update :events conj event))))
+  (rf/reg-event-db :capture-key
+                   (fn [db [_ event]]
+                     (update db :events conj event)))
+  (rf/reg-sub :input-value (fn [db _] (:value db)))
+  (rf/reg-sub :events (fn [db _] (:events db)))
+  (rf/dispatch-sync [:init-input]))
+
+(defn rich-counter []
+  [:main#root.shell
+   [:h1 "Counter"]
+   (for [label ["a" "b"]]
+     [:span.item label])
+   nil
+   false
+   [:button#inc.primary.large
+    {:class [:hot "wide"]
+     :style {:padding "12px" :width "120px" :background "#334455"}
+     :on-click (fn [event] (rf/dispatch [:inc event]))}
+    "inc"]
+   [:span.value @(rf/subscribe [:count])]])
+
+(defn input-capture []
+  [:main
+   [:input#name
+    {:value @(rf/subscribe [:input-value])
+     :on-input (fn [event] (rf/dispatch [:capture-input event]))
+     :on-key-down (fn [event] (rf/dispatch [:capture-key event]))}]
+   [:span.value @(rf/subscribe [:input-value])]])
+
+(deftest reagent-compatible-shorthand-and-seq-children
+  (reset-counter! 2)
+  (let [{:keys [document handlers]} (r/render [rich-counter])
+        root (dom/node document (:root document))
+        button-id (->> (:nodes document)
+                       (some (fn [[id node]]
+                               (when (= "inc" (get-in node [:attrs :id])) id))))
+        button (dom/node document button-id)]
+    (testing "tag shorthand maps to tag/id/class attrs"
+      (is (= :main (:tag root)))
+      (is (= "root" (get-in root [:attrs :id])))
+      (is (= "shell" (get-in root [:attrs :class]))))
+    (testing "class attrs merge with shorthand classes"
+      (is (= "primary large hot wide" (get-in button [:attrs :class]))))
+    (testing "style map becomes namespaced style attributes for host ABI"
+      (is (= "12px" (get-in button [:attrs :style/padding])))
+      (is (= "120px" (get-in button [:attrs :style/width]))))
+    (testing "lazy child seqs are flattened and nil/false children are ignored"
+      (is (= "Counterabinc2" (dom/text-content document))))
+    (is (= 1 (count handlers)))))
+
+(deftest abi-batch-validation-covers-invalid-inputs
+  (is (= {:abi/version 1
+          :ops [{:op :create-element :id 1 :tag "div"}
+                {:op :set-attr :id 1 :namespace "style" :name "width" :value "12"}]}
+         (abi/encode-batch [[:dom/create-element 1 :div]
+                            [:dom/set-attr 1 :style/width 12]])))
+  (is (thrown-with-msg? js/Error #"Unsupported"
+                        (abi/validate-batch {:abi/version 999 :ops []})))
+  (is (thrown-with-msg? js/Error #"Invalid create-element"
+                        (abi/validate-batch {:abi/version 1
+                                             :ops [{:op :create-element :id "bad" :tag "div"}]})))
+  (doseq [[message op] [["Invalid create-element" [:dom/create-element 1 nil]]
+                        ["Invalid set-attr" [:dom/set-attr 1 nil "x"]]
+                        ["Invalid add-event-listener" [:dom/add-event-listener 1 nil 9]]
+                        ["Invalid add-event-listener" [:dom/add-event-listener 1 :click nil]]
+                        ["Invalid remove-event-listener" [:dom/remove-event-listener 1 nil 9]]
+                        ["Invalid remove-event-listener" [:dom/remove-event-listener 1 :click nil]]
+                        ["Invalid append-child" [:dom/append-child 1 nil]]
+                        ["Invalid remove-children" [:dom/remove-children nil]]
+                        ["Invalid remove-child" [:dom/remove-child nil 2]]
+                        ["Invalid remove-child" [:dom/remove-child 1 nil]]
+                        ["Invalid insert-before" [:dom/insert-before nil 2 3]]
+                        ["Invalid insert-before" [:dom/insert-before 1 nil 3]]
+                        ["Invalid insert-before" [:dom/insert-before 1 2 "bad"]]
+                        ["Invalid set-text" [:dom/set-text nil "hello"]]
+                        ["Invalid create-fragment" [:dom/create-fragment nil]]
+                        ["Invalid focus" [:dom/focus nil]]
+                        ["Invalid blur" [:dom/blur nil]]
+                        ["Invalid remove-attr" [:dom/remove-attr 1 nil]]]]
+    (is (thrown-with-msg? js/Error (re-pattern message)
+                          (abi/validate-batch (abi/encode-batch [op])))))
+  (is (thrown-with-msg? js/Error #"Unknown"
+                        (abi/encode-batch [[:dom/nope 1]]))))
+
+(deftest abi-batch-validation-accepts-real-string-handler-ids
+  ;; The confirmed repro, found via live-Chrome verification of a genuinely
+  ;; unrelated fix (kotoba.wasm.dom's multi-listener bridging): the real
+  ;; QuickJS webapi shim's own __kotobaHandlerId() (quickjs_wasm.cljc)
+  ;; generates STRING handler-ids ("handler-1", "handler-2", ...), and the
+  ;; window/document global-listener path uses its own string scheme
+  ;; ("global-" + target + "-" + eventType) -- but validate-batch's
+  ;; :add-event-listener/:dispatch-event cases required `(int? handler)`,
+  ;; so ANY real script calling addEventListener() crashed the whole
+  ;; commit with "Invalid add-event-listener op" the instant a real batch
+  ;; reached this validation -- a pre-existing, previously-latent bug
+  ;; nothing had exercised end to end before (host/commit! is the real
+  ;; commit path every real host, including the live demo, uses).
+  (is (= "handler-1"
+         (:handler (first (:ops (abi/validate-batch
+                                  (abi/encode-batch [[:dom/add-event-listener 1 :click "handler-1"]])))))))
+  (is (= "handler-1"
+         (:handler (first (:ops (abi/validate-batch
+                                  (abi/encode-batch [[:dom/dispatch-event "handler-1" {:type :click}]])))))))
+  (testing "nil is still rejected -- only nil, not every non-numeric value"
+    (is (thrown-with-msg? js/Error #"Invalid add-event-listener"
+                          (abi/validate-batch (abi/encode-batch [[:dom/add-event-listener 1 :click nil]]))))
+    (is (thrown-with-msg? js/Error #"Invalid dispatch-event"
+                          (abi/validate-batch (abi/encode-batch [[:dom/dispatch-event nil {:type :click}]]))))))
+
+(deftest abi-encodes-and-validates-remove-event-listener
+  ;; Sibling gap to the add-event-listener/insert-before/remove-child fixes
+  ;; above: kotoba.wasm.dom/remove-event-listener's own emitted op
+  ;; ([:dom/remove-event-listener node-id event-name handler-id]) had NO
+  ;; kotoba.wasm.abi/op->record case at all, so encode-batch itself threw
+  ;; "Unknown kotoba DOM op" the instant a real removeEventListener() call
+  ;; reached host/commit! (the same real commit path every real host,
+  ;; including the live demo, uses) -- confirmed via direct REPL
+  ;; reproduction before this fix. Same opaque, non-numeric handler shape
+  ;; as add-event-listener, so a real string handler-id must validate too.
+  (is (= {:abi/version 1
+          :ops [{:op :remove-event-listener :id 1 :name "click" :handler "handler-1"}]}
+         (abi/encode-batch [[:dom/remove-event-listener 1 :click "handler-1"]])))
+  (is (= (abi/encode-batch [[:dom/remove-event-listener 1 :click "handler-1"]])
+         (abi/validate-batch (abi/encode-batch [[:dom/remove-event-listener 1 :click "handler-1"]])))))
+
+(deftest abi-encodes-and-validates-focus-blur-set-text-and-create-fragment
+  ;; Four MORE real, common, JS-reachable ops browser.dom-bridge already
+  ;; emits (element.focus()/.blur(), a Text node's .data/.nodeValue
+  ;; setter, document.createDocumentFragment()) that op->record had NO
+  ;; case for at all -- encode-batch itself threw "Unknown kotoba DOM op"
+  ;; the instant a real page ever called any of them, crashing the ENTIRE
+  ;; host/commit! batch (every other legitimate mutation queued alongside
+  ;; it too), confirmed via direct REPL reproduction before this fix. The
+  ;; exact same bug shape/severity already fixed for :add-event-listener/
+  ;; :remove-event-listener/:insert-before/:remove-child above.
+  (is (= {:abi/version 1 :ops [{:op :set-text :id 1 :text "hello"}]}
+         (abi/encode-batch [[:dom/set-text 1 "hello"]])))
+  (is (= {:abi/version 1 :ops [{:op :create-fragment :id 5}]}
+         (abi/encode-batch [[:dom/create-fragment 5]])))
+  (is (= {:abi/version 1 :ops [{:op :focus :id 7}]}
+         (abi/encode-batch [[:dom/focus 7]])))
+  (is (= {:abi/version 1 :ops [{:op :blur :id 7}]}
+         (abi/encode-batch [[:dom/blur 7]])))
+  (doseq [op [[:dom/set-text 1 "hello"] [:dom/create-fragment 5] [:dom/focus 7] [:dom/blur 7]]]
+    (is (= (abi/encode-batch [op]) (abi/validate-batch (abi/encode-batch [op])))
+        (str "validate-batch must accept the real encoded record for " op " unchanged")))
+  (doseq [[message op] [["Invalid set-text" [:dom/set-text nil "hello"]]
+                        ["Invalid create-fragment" [:dom/create-fragment nil]]
+                        ["Invalid focus" [:dom/focus nil]]
+                        ["Invalid blur" [:dom/blur nil]]]]
+    (is (thrown-with-msg? js/Error (re-pattern message)
+                          (abi/validate-batch (abi/encode-batch [op]))))))
+
+(deftest abi-encodes-and-validates-remove-attr
+  ;; A real removeAttribute()/boolean-attribute-off setter -- previously had
+  ;; NO op->record case at all, so browser.dom-bridge's own remove-attribute
+  ;; never even attempted to emit one (see dom-attribute-removal-op-replays-
+  ;; through-abi-and-retained-state below for the end-to-end staleness this
+  ;; caused). Mirrors :set-attr's own {:op :namespace :name} record shape.
+  (is (= {:abi/version 1 :ops [{:op :remove-attr :id 1 :namespace nil :name "checked"}]}
+         (abi/encode-batch [[:dom/remove-attr 1 :checked]])))
+  (is (= {:abi/version 1 :ops [{:op :remove-attr :id 1 :namespace "style" :name "color"}]}
+         (abi/encode-batch [[:dom/remove-attr 1 :style/color]])))
+  (is (= (abi/encode-batch [[:dom/remove-attr 1 :checked]])
+         (abi/validate-batch (abi/encode-batch [[:dom/remove-attr 1 :checked]])))))
+
+(deftest abi-encodes-insert-before-and-remove-child-ops
+  ;; Before this fix, kotoba.wasm.dom/insert-before and remove-child's own
+  ;; emitted ops ([:dom/insert-before parent child before] /
+  ;; [:dom/remove-child parent child], see kotoba.wasm.dom.cljc) had no
+  ;; kotoba.wasm.abi/op->record case and fell through to its default branch,
+  ;; throwing "Unknown kotoba DOM op". This proves both now encode to the
+  ;; same {:op ... :parent ... :child ...}-shaped record convention
+  ;; append-child/remove-children already use, and validate cleanly.
+  (is (= {:abi/version 1
+          :ops [{:op :insert-before :parent 1 :child 2 :before 3}]}
+         (abi/encode-batch [[:dom/insert-before 1 2 3]])))
+  (testing "insert-before's before id is optional (nil means append at the end, mirrors kotoba.wasm.dom/insert-before's own fallback)"
+    (is (= {:abi/version 1
+            :ops [{:op :insert-before :parent 1 :child 2 :before nil}]}
+           (abi/encode-batch [[:dom/insert-before 1 2 nil]]))))
+  (is (= {:abi/version 1
+          :ops [{:op :remove-child :parent 1 :child 2}]}
+         (abi/encode-batch [[:dom/remove-child 1 2]])))
+  (is (= (abi/encode-batch [[:dom/insert-before 1 2 3]])
+         (abi/validate-batch (abi/encode-batch [[:dom/insert-before 1 2 3]]))))
+  (is (= (abi/encode-batch [[:dom/remove-child 1 2]])
+         (abi/validate-batch (abi/encode-batch [[:dom/remove-child 1 2]])))))
+
+(deftest dom-insert-before-and-remove-child-ops-replay-through-abi-and-retained-state
+  ;; End-to-end: kotoba.wasm.dom's own document model -> the ops it emits ->
+  ;; kotoba.wasm.abi/encode-batch (host/commit!'s exact encode path) ->
+  ;; kotoba.wasm.host.retained/apply-op (the same reducer the webgl/webgpu
+  ;; hosts use). All three layers must agree on the resulting child order.
+  (let [[root document] (dom/create-element dom/empty-document :main)
+        document (dom/set-root document root)
+        [a document] (dom/create-element document :span)
+        [b document] (dom/create-element document :span)
+        document (-> document
+                    (dom/append-child root a)
+                    (dom/append-child root b))
+        [c document] (dom/create-element document :span)
+        document (dom/insert-before document root c b) ; [a b] -> [a c b]
+        document (dom/remove-child document root a)    ; [a c b] -> [c b]
+        [ops _document] (dom/consume-ops document)
+        batch (abi/validate-batch (abi/encode-batch ops))
+        retained-state (reduce retained/apply-op retained/base-state (:ops batch))]
+    (testing "kotoba.wasm.dom's own document model reflects the edits"
+      (is (= [c b] (get-in document [:nodes root :children]))))
+    (testing "the ABI batch carries both ops through validate-batch without throwing"
+      (is (some #(= :insert-before (:op %)) (:ops batch)))
+      (is (some #(= :remove-child (:op %)) (:ops batch))))
+    (testing "replaying the batch through the shared retained-state reducer agrees with the dom document"
+      (is (= [c b] (get-in retained-state [:nodes root :children]))))))
+
+(deftest dom-remove-event-listener-ops-replay-through-abi-and-retained-state
+  ;; End-to-end: kotoba.wasm.dom's own document model -> the ops it emits ->
+  ;; kotoba.wasm.abi/encode-batch (host/commit!'s exact encode path) ->
+  ;; kotoba.wasm.host.retained/apply-op (the same reducer the webgl/webgpu
+  ;; hosts use, and the SAME place a second, previously-latent gap was
+  ;; found alongside the abi.cljc fix: :remove-event-listener had no case
+  ;; there either, silently leaving :listeners stale after a real removal).
+  (let [[root document] (dom/create-element dom/empty-document :button)
+        document (dom/set-root document root)
+        document (dom/add-event-listener document root "click" "handler-1")
+        document (dom/remove-event-listener document root "click" "handler-1")
+        [ops _document] (dom/consume-ops document)
+        batch (abi/validate-batch (abi/encode-batch ops))
+        retained-state (reduce retained/apply-op retained/base-state (:ops batch))]
+    (testing "the ABI batch carries the remove op through validate-batch without throwing"
+      (is (some #(= :remove-event-listener (:op %)) (:ops batch))))
+    (testing "replaying the batch through the shared retained-state reducer clears the listener"
+      (is (= {} (get-in retained-state [:listeners root]))))))
+
+(deftest dom-attribute-removal-op-replays-through-abi-and-retained-state
+  ;; The severe, invisible bug this fix closes: kotoba.wasm.dom's own
+  ;; document model correctly dissoc'd a removed attribute on the JS-facing
+  ;; side, but emitted NO op at all for it -- so the real GPU-rendered
+  ;; host's retained tree (this same retained/apply-op reducer, replayed
+  ;; from :ops by webgl.cljs/webgpu.cljs's render!) kept the attribute
+  ;; stale FOREVER once set, even though getAttribute/queries on the
+  ;; JS-facing document looked correct immediately. Confirmed via direct
+  ;; REPL reproduction before this fix: a real checkbox's `checked` attr,
+  ;; removed via browser.dom-bridge's remove-attribute, stayed
+  ;; `{:checked true}` in the replayed retained state forever.
+  (let [[root document] (dom/create-element dom/empty-document :input)
+        document (dom/set-root document root)
+        document (dom/set-attribute document root :checked "true")
+        [ops-1 document] (dom/consume-ops document)
+        retained-state-1 (reduce retained/apply-op retained/base-state (:ops (abi/encode-batch ops-1)))
+        _ (is (= {:checked "true"} (get-in retained-state-1 [:nodes root :attrs]))
+              "sanity: the retained state reflects the real set-attr op before removal")
+        document (dom/remove-attribute document root :checked)
+        [ops-2 _document] (dom/consume-ops document)
+        batch (abi/validate-batch (abi/encode-batch ops-2))
+        retained-state-2 (reduce retained/apply-op retained-state-1 (:ops batch))]
+    (testing "kotoba.wasm.dom's own document model reflects the removal"
+      (is (not (contains? (get-in document [:nodes root :attrs]) :checked))))
+    (testing "the ABI batch carries a real remove-attr op through validate-batch without throwing"
+      (is (some #(= :remove-attr (:op %)) (:ops batch))))
+    (testing "replaying the batch through the shared retained-state reducer clears the attribute -- no longer stale"
+      (is (not (contains? (get-in retained-state-2 [:nodes root :attrs]) :checked))))))
+
+(deftest host-commit-applies-add-and-remove-event-listener-ops
+  ;; host/commit! (used by runtime/mount!/rerender!) calls abi/encode-batch
+  ;; then applies every record to the host -- this is the exact call site
+  ;; that used to crash with "Unknown kotoba DOM op" for remove-event-listener.
+  (let [dom-host (host/recording-host)]
+    (host/commit! dom-host [[:dom/create-element 1 :button]
+                           [:dom/set-root 1]
+                           [:dom/add-event-listener 1 :click "handler-1"]
+                           [:dom/remove-event-listener 1 :click "handler-1"]])
+    (is (= [:create-element :set-root :add-event-listener :remove-event-listener]
+           (mapv :op (:ops (host/recorded dom-host)))))))
+
+(deftest host-commit-applies-remove-attr-op
+  ;; host/commit! (used by runtime/mount!/rerender!) calls abi/encode-batch
+  ;; then applies every record to the host -- this is the exact call site
+  ;; that used to silently drop a real attribute removal (no op ever
+  ;; emitted for it in the first place, so nothing here ever crashed --
+  ;; unlike the ABI-crash-class bugs above, this bug was invisible rather
+  ;; than loud).
+  (let [dom-host (host/recording-host)]
+    (host/commit! dom-host [[:dom/create-element 1 :input]
+                           [:dom/set-root 1]
+                           [:dom/set-attr 1 :checked "true"]
+                           [:dom/remove-attr 1 :checked]])
+    (is (= [:create-element :set-root :set-attr :remove-attr]
+           (mapv :op (:ops (host/recorded dom-host)))))))
+
+(deftest host-commit-applies-focus-blur-set-text-and-create-fragment-ops
+  ;; This is the exact call site that used to crash the ENTIRE batch --
+  ;; every op here (including the perfectly ordinary create-element/
+  ;; set-root pair) would have been dropped the instant :dom/focus (or
+  ;; any of its three siblings) was reached, confirmed via direct REPL
+  ;; reproduction before this fix.
+  (let [dom-host (host/recording-host)]
+    (host/commit! dom-host [[:dom/create-element 1 :input]
+                           [:dom/set-root 1]
+                           [:dom/create-text 2 "old"]
+                           [:dom/set-text 2 "new"]
+                           [:dom/create-fragment 3]
+                           [:dom/focus 1]
+                           [:dom/blur 1]])
+    (is (= [:create-element :set-root :create-text :set-text :create-fragment :focus :blur]
+           (mapv :op (:ops (host/recorded dom-host)))))))
+
+(deftest host-commit-applies-insert-before-and-remove-child-ops
+  ;; host/commit! (used by runtime/mount!/rerender!) calls abi/encode-batch
+  ;; then applies every record to the host -- this is the exact call site
+  ;; that used to crash with "Unknown kotoba DOM op" for these two ops.
+  (let [dom-host (host/recording-host)]
+    (host/commit! dom-host [[:dom/create-element 1 :main]
+                           [:dom/set-root 1]
+                           [:dom/create-element 2 :span]
+                           [:dom/append-child 1 2]
+                           [:dom/create-element 3 :span]
+                           [:dom/insert-before 1 3 2]
+                           [:dom/remove-child 1 2]])
+    (is (= [:create-element :set-root :create-element :append-child
+            :create-element :insert-before :remove-child]
+           (mapv :op (:ops (host/recorded dom-host)))))))
+
+(deftest dom-document-ops-cover-removal-dispatch-and-consume
+  (let [[root-id document] (dom/create-element dom/empty-document :main)
+        [child-id document] (dom/create-text-node document "x")
+        document (-> document
+                     (dom/set-root root-id)
+                     (dom/append-child root-id child-id)
+                     (dom/add-event-listener root-id :click 42))
+        document (dom/dispatch-event document root-id :click {:x 1})
+        [ops document] (dom/consume-ops document)
+        document (dom/remove-children document root-id)]
+    (is (= "x" (dom/text-content (assoc document :root root-id :nodes (assoc-in (:nodes document) [root-id :children] [child-id])))))
+    (is (some #(= [:dom/dispatch-event 42 {:x 1}] %) ops))
+    (is (= [[:dom/remove-children root-id]] (:ops document)))
+    (is (= "" (dom/text-content document)))
+    (is (= [[:dom/remove-children root-id]] (:ops document)))))
+
+(deftest function-map-host-commits-through-same-runtime-path
+  (let [state (atom {:ops [] :events [] :present-count 0})
+        function-host {:apply-op! (fn [_ op] (swap! state update :ops conj op))
+                       :present! (fn [_] (swap! state update :present-count inc))
+                       :poll-event! (fn [_] nil)}
+        batch (host/commit! function-host [[:dom/create-element 1 :button]
+                                           [:dom/set-root 1]])]
+    (is (= 1 (:present-count @state)))
+    (is (= [:create-element :set-root] (mapv :op (:ops @state))))
+    (is (= (:ops batch) (:ops @state)))))
+
+(deftest host-commit-validates-before-mutating-host
+  (let [state (atom {:ops [] :present-count 0})
+        function-host {:apply-op! (fn [_ op] (swap! state update :ops conj op))
+                       :present! (fn [_] (swap! state update :present-count inc))
+                       :poll-event! (fn [_] nil)}]
+    (is (thrown-with-msg? js/Error #"Invalid add-event-listener"
+                          (host/commit! function-host [[:dom/create-element 1 :button]
+                                                       [:dom/add-event-listener 1 nil 9]])))
+    (is (= [] (:ops @state)))
+    (is (zero? (:present-count @state)))))
+
+(deftest runtime-event-normalization-and-unknown-handler-behavior
+  (reset-counter! 0)
+  (let [mounted (runtime/mount! (host/recording-host) rich-counter)
+        handler-id (first (keys (:handlers mounted)))
+        dom-host (host/recording-host [{:handler handler-id
+                                        :target 4
+                                        :name :click
+                                        :x 10
+                                        :y 20
+                                        :value 9}
+                                       {:handler 999 :target 4 :name :click}])
+        mounted (runtime/mount! dom-host rich-counter)
+        pumped (runtime/pump-events! mounted)]
+    (is (= "Counterabinc1" (dom/text-content (:document pumped))))
+    (is (= [{:target 4 :name "click" :x 10.0 :y 20.0 :value "9" :key nil}]
+           @(rf/subscribe [:events])))))
+
+(deftest runtime-pumps-input-and-key-events-from-reagent-listeners
+  (reset-input-capture!)
+  (let [mounted (runtime/mount! (host/recording-host) input-capture)
+        input-id (->> (get-in mounted [:document :nodes])
+                      (some (fn [[id node]]
+                              (when (= "name" (get-in node [:attrs :id])) id))))
+        ;; :listeners now holds an ORDERED collection of handler-ids per
+        ;; (node, event-type), not a single scalar -- see kotoba.wasm.dom's
+        ;; own multi-listener fix. Exactly one reagent-attached listener is
+        ;; registered here, so `first` recovers the same real handler-id
+        ;; this test always meant to grab.
+        input-handler (first (get-in mounted [:document :listeners input-id :input]))
+        key-handler (first (get-in mounted [:document :listeners input-id :key-down]))
+        dom-host (host/recording-host [{:handler input-handler
+                                        :target input-id
+                                        :name :input
+                                        :value "kotoba"}
+                                       {:handler key-handler
+                                        :target input-id
+                                        :name :key-down
+                                        :key :Enter}])
+        mounted (runtime/mount! dom-host input-capture)
+        pumped (runtime/pump-events! mounted)]
+    (is (= "kotoba" (dom/text-content (:document pumped))))
+    (is (= [{:target input-id :name "input" :x 0.0 :y 0.0 :value "kotoba" :key nil}
+            {:target input-id :name "key-down" :x 0.0 :y 0.0 :value nil :key "Enter"}]
+           @(rf/subscribe [:events])))))
+
+(deftest layout-respects-basic-style-and-hit-semantics
+  (reset-counter! 5)
+  (let [tree (dom/tree (:document (r/render [rich-counter])))
+        ops (layout/draw-ops tree {:width 480})
+        button-rect (some #(when (and (= :rect (:draw/op %)) (= :button (:tag %))) %) ops)
+        button-node (some #(when (and (= :node (:draw/op %)) (= :button (:tag %))) %) ops)]
+    (is (= "#334455" (:color button-rect)))
+    ;; A declared `width` on a <button> IS its border box: the UA
+    ;; stylesheet gives a button `box-sizing: border-box`, read straight off
+    ;; getComputedStyle in Brave 2026-08-04 (`<button style="width:200px">`
+    ;; reports 200, not 216 -- and the same reading leaves <input> at 208
+    ;; and <textarea> at 206, which are content-box). This asserted 136 --
+    ;; 120 of content plus the button's own 6px padding and 2px border per
+    ;; side -- which is what content-box sizing would give and what no
+    ;; browser reports. See kotoba-lang/cssom's ua-control-box.
+    (is (= 120 (:w button-node)))
+    (is (= "primary large hot wide" (:class button-node)))
+    (is (= [:click] (:listeners button-node)))))

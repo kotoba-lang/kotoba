@@ -1,0 +1,619 @@
+(ns conformance.run
+  "Differential parser conformance: htmldom.core vs a real Blink browser.
+
+   For every case in cases.edn this parses the SAME markup twice -- once
+   through `htmldom.core/parse-into-document` -> `kotoba.wasm.dom/tree`, and
+   once in a real headless Chrome/Brave -- and compares the TREE SHAPE the
+   two built: the flattened, document-ordered sequence of element tag names
+   with their nesting depth, plus text nodes normalised for whitespace, plus
+   comment nodes.
+
+   Why tree shape and not the serialised HTML: this parser's DOM has no
+   html/head/body synthesis (deliberately -- see `htmldom.core`'s L2/L3
+   commentary), no comment node type, and it folds `style=\"...\"` into its
+   own `:style-inline` attribute for the cascade. Serialised markup would
+   score all of those at once and attribute nothing. Tag names, nesting and
+   text are what both sides genuinely agree on when the parse is right --
+   and it is exactly the part nothing in this repo has ever measured.
+
+   The browser side is read the same way the sibling cssom harness reads
+   layout: `--headless=old --dump-dom`, a page script that base64s its
+   result into a <pre>, and no CDP client, no Playwright, no driver. The one
+   structural difference from that harness is that each case is injected
+   with `innerHTML` on a detached <div> rather than written into the page
+   source. That is not cosmetic:
+
+     - `innerHTML` on a <div> IS the HTML fragment parsing algorithm with a
+       <div> context element -- the same insertion modes, the same foster
+       parenting, the same adoption agency -- which is precisely the job
+       `parse-into-document` does (it parses a fragment into a `:document`
+       root, never a whole document).
+     - It ISOLATES the cases from each other. Written into page source, an
+       unterminated `<table>` stays in the 'in table' insertion mode across
+       everything that follows it and swallows the rest of the corpus,
+       including the measurement script. Half this corpus is deliberately
+       malformed, so isolation is a correctness requirement, not tidiness.
+     - Scripts inserted via `innerHTML` never execute, so the raw-text cases
+       cannot run anything.
+
+   Usage:
+     kbb --backend sci --classpath \"src:<dom-gpu>/src:<cssom>/src\" conformance/run.cljk \\
+       [--browser <path to Chrome/Brave binary>] [--only table/] \\
+       [--ledger path/to/ledger.edn] [--verbose]"
+  (:require ["node:child_process" :as cp]
+            ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:path" :as path]
+            [kotoba.lang.edn :as edn]
+            [kotoba.lang.text :as str]
+            [htmldom.core :as html]
+            [kotoba.wasm.dom :as dom]))
+
+(def browser-candidates
+  ;; Brave first: it is the named comparison target, and this list had
+  ;; Chrome ahead of it while the ns docstring said Brave -- so the harness
+  ;; reported "oracle: Chrome" every run and no one had to be told a
+  ;; fallback happened, because none did. Same engine either way (verified
+  ;; in the sibling cssom harness: Brave and Chrome produce byte-identical
+  ;; measurements over CDP), but the run should measure what it claims to.
+  ["/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"
+   "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+   "/Applications/Brave Browser Beta.app/Contents/MacOS/Brave Browser Beta"
+   "/Applications/Chromium.app/Contents/MacOS/Chromium"])
+
+(defn- parse-args [argv]
+  (loop [args (vec argv) out {}]
+    (if-let [a (first args)]
+      (case a
+        "--browser" (recur (drop 2 args) (assoc out :browser (second args)))
+        "--only" (recur (drop 2 args) (assoc out :only (second args)))
+        "--ledger" (recur (drop 2 args) (assoc out :ledger (second args)))
+        "--verbose" (recur (rest args) (assoc out :verbose true))
+        (recur (rest args) out))
+      out)))
+
+(defn- find-browsers
+  "The ordered list of oracle candidates. Every candidate is the SAME parser
+   (Blink's): Brave is Chromium plus network/privacy shields, and shields do
+   not change HTML parsing. So falling through to another candidate when one
+   refuses to produce a dump measures the identical parser rather than a
+   different one. The oracle that actually produced the numbers is printed
+   and recorded in the ledger, so a fallback is never silent."
+  [explicit]
+  (if explicit
+    (if (fs/existsSync explicit)
+      [explicit]
+      (throw (ex-info "browser not found at --browser path" {:path explicit})))
+    (let [found (filterv fs/existsSync browser-candidates)]
+      (when (empty? found)
+        (throw (ex-info "no Blink browser found; pass --browser <path>"
+                        {:looked-at browser-candidates})))
+      found)))
+
+;; ---- the browser (oracle) side ----
+
+(def ^:private serialize-script
+  "Runs INSIDE the real browser, once, over EVERY case.
+
+   Each case's markup is handed to `innerHTML` on a DETACHED <div>, which
+   runs the HTML fragment parsing algorithm with a <div> context element --
+   the same thing `parse-into-document` claims to do. Detached rather than
+   appended so that a case's `<style>` cannot reach another case and a
+   case's `<script>` has no chance of ever being live; `innerHTML` never
+   executes scripts either way.
+
+   The result is a FLAT, document-ordered list with an explicit depth on
+   every entry rather than a nested structure. Flat is what makes 'first
+   divergence' reportable at all: two nested trees that differ at one point
+   have to be walked in lockstep to say where, while two flat lists have an
+   index. Depth carries the nesting, so nothing is lost.
+
+   Output is base64 so arbitrary case markup can never break the <pre> it is
+   read back out of, and the corpus goes IN the same way for the same
+   reason -- a case containing `</script>` would otherwise end the script
+   element that carries it."
+  "
+  (function () {
+    var CORPUS = JSON.parse(decodeURIComponent(escape(atob(CORPUS_B64))));
+    var out = {};
+    for (var i = 0; i < CORPUS.length; i++) {
+      var host = document.createElement('div');
+      host.innerHTML = CORPUS[i];
+      var items = [];
+      (function rec(node, depth) {
+        var kids = node.childNodes;
+        for (var j = 0; j < kids.length; j++) {
+          var c = kids[j];
+          if (c.nodeType === 1) {
+            var attrs = {};
+            for (var k = 0; k < c.attributes.length; k++) {
+              attrs[c.attributes[k].name] = c.attributes[k].value;
+            }
+            items.push({ k: 'e', d: depth, n: c.tagName.toLowerCase(), a: attrs });
+            rec(c, depth + 1);
+          } else if (c.nodeType === 3) {
+            items.push({ k: 't', d: depth, v: c.nodeValue });
+          } else if (c.nodeType === 8) {
+            items.push({ k: 'c', d: depth, v: c.nodeValue });
+          }
+        }
+      })(host, 0);
+      out['case-' + i] = items;
+    }
+    var pre = document.createElement('pre');
+    pre.id = 'kotoba-htmldom-conformance-out';
+    pre.textContent = btoa(unescape(encodeURIComponent(JSON.stringify(out))));
+    document.body.appendChild(pre);
+  })();
+  ")
+
+(defn- corpus-page [cases]
+  (let [b64 (-> (js/Buffer.from (js/JSON.stringify (clj->js (mapv :html cases))) "utf8")
+                (.toString "base64"))]
+    (str "<!doctype html><html><head><meta charset=\"utf-8\">"
+         "<title>htmldom conformance</title></head><body><script>"
+         "var CORPUS_B64 = \"" b64 "\";"
+         serialize-script
+         "</script></body></html>")))
+
+(defn- run-cdp!
+  "Reads the measurement block by driving the browser over the DevTools
+   protocol (conformance/cdp_dump.cljk, ported from the sibling cssom
+   harness along with the reason it exists).
+
+   Primary transport, not a fallback: Brave 151's `--dump-dom` produces
+   nothing at all -- zero bytes, no stderr, in every headless mode -- while
+   answering CDP normally, so a `--dump-dom`-only harness silently stops
+   measuring the browser it names and measures Chrome instead. That is what
+   this harness was doing until 2026-08-04. CDP is also far faster, because
+   it does not wait on a headless Chromium to exit, which it never does."
+  [browser file]
+  (let [out-file (path/join (fs/mkdtempSync (path/join (os/tmpdir) "kotoba-htmldom-cdp-")) "block.html")
+        res (cp/spawnSync "nbb" #js ["conformance/cdp_dump.cljk" browser file out-file]
+                          #js {:encoding "utf8" :timeout 240000})
+        out (if (fs/existsSync out-file) (fs/readFileSync out-file "utf8") "")]
+    (when-not (str/includes? out "kotoba-htmldom-conformance-out")
+      (throw (ex-info "browser produced no measurement block over CDP"
+                      {:status (.-status res)
+                       :stderr (str/trim (or (.-stderr res) ""))})))
+    out))
+
+(defn- run-dump-dom!
+  "Runs the corpus page in a real Blink browser and returns its serialised
+   trees.
+
+   Two details inherited from the sibling cssom harness, both measured there
+   rather than assumed, and both re-confirmed here:
+
+   1. `--headless=old`. `--headless=new --dump-dom` prints nothing at all
+      (exit 0, empty stdout) and bare `--headless` never returns. Old
+      headless is deprecated upstream, so when a future Chrome drops it this
+      is the first thing to re-measure -- the harness then fails loudly (no
+      measurement block) instead of silently scoring zero.
+
+   2. Output goes to a FILE, through `sh -c ... > file`, never a pipe.
+      Chromium's child processes inherit stdout and keep it open after the
+      parent is killed, so a pipe never reaches EOF and the reader hangs
+      forever; `spawnSync`'s own `:timeout` does not help, because it kills
+      the parent and then still waits on the pipe. Redirecting to a file
+      removes the EOF dependency entirely, and `timeout -s KILL` bounds the
+      run (headless Chromium writes its dump and then ignores SIGTERM, so
+      plain `timeout` hangs -- the exit status is deliberately ignored below
+      and only the file content is trusted)."
+  [browser file]
+  (let [profile (fs/mkdtempSync (path/join (os/tmpdir) "htmldom-conf-"))
+        out-file (path/join profile "dump.html")
+        cmd (str "timeout -s KILL 45 '" browser "' --headless=old --disable-gpu"
+                 " --no-first-run --no-default-browser-check --disable-extensions"
+                 " --user-data-dir='" profile "'"
+                 " --dump-dom 'file://" file "' > '" out-file "' 2>/dev/null")
+        res (cp/spawnSync "/bin/sh" #js ["-c" cmd] #js {:encoding "utf8" :timeout 120000})
+        stdout (if (fs/existsSync out-file) (fs/readFileSync out-file "utf8") "")
+        marker "kotoba-htmldom-conformance-out\">"]
+    (when-not (str/includes? stdout marker)
+      (fs/rmSync profile #js {:recursive true :force true})
+      (throw (ex-info "browser produced no measurement block"
+                      {:status (.-status res) :bytes (count stdout)})))
+    (fs/rmSync profile #js {:recursive true :force true})
+    stdout))
+
+(defn- parse-block
+  "Both transports hand back the same `<pre id=...>` shape, so there is one
+   parser for one format."
+  [raw]
+  (let [marker "kotoba-htmldom-conformance-out\">"
+        from (+ (str/index-of raw marker) (count marker))
+        end (str/index-of raw "</pre>" from)]
+    (-> (js/Buffer.from (subs raw from end) "base64")
+        (.toString "utf8")
+        js/JSON.parse
+        (js->clj :keywordize-keys true))))
+
+(defn- run-browser!
+  "CDP first, `--dump-dom` second: the two fail independently, and which one
+   produced the numbers is reported rather than assumed."
+  [browser file]
+  (try
+    {:transport :cdp :data (parse-block (run-cdp! browser file))}
+    (catch :default cdp-err
+      (try
+        {:transport :dump-dom :data (parse-block (run-dump-dom! browser file))}
+        (catch :default dump-err
+          (throw (ex-info (str "no measurement block: CDP -- " (ex-message cdp-err)
+                               "; --dump-dom -- " (ex-message dump-err))
+                          {:cdp (ex-data cdp-err) :dump-dom (ex-data dump-err)})))))))
+
+;; ---- the htmldom side ----
+
+(defn- engine-items
+  "htmldom's own answer, flattened into the same shape the oracle reports.
+
+   `parse-into-document` builds a `:document` root element and hangs the
+   fragment's own top-level nodes directly under it, so the root's CHILDREN
+   line up with the oracle's context <div>'s children -- depth 0 on both
+   sides is 'a top-level node of the fragment'. `dom/comment-tree` gives
+   elements as maps, text nodes as bare strings and comments as
+   `{:node/type :comment :text ...}` -- the DOM view, rather than
+   `dom/tree`'s layout view which omits comments by design. This harness
+   compares against a browser's node list, so it wants the view that keeps
+   them; until comment nodes existed at all, the oracle's `:comment`
+   entries had nothing on this side to line up against."
+  [html-src]
+  (let [root (dom/comment-tree (html/parse-into-document html-src))
+        out (volatile! [])]
+    (letfn [(rec [node depth]
+              (doseq [c (:children node)]
+                (cond
+                  (string? c)
+                  (vswap! out conj {:k "t" :d depth :v c})
+
+                  (= :comment (:node/type c))
+                  (vswap! out conj {:k "c" :d depth :v (:text c)})
+
+                  :else
+                  (do (vswap! out conj {:k "e" :d depth
+                                        :n (name (:tag c))
+                                        ;; `:style/<prop>` keys are dropped
+                                        ;; HERE rather than in norm-attrs,
+                                        ;; because `name` erases the
+                                        ;; namespace that identifies them:
+                                        ;; `(name :style/width)` is plain
+                                        ;; `width`, and an element with an
+                                        ;; inline style was reporting a
+                                        ;; phantom attribute of that name.
+                                        :a (into {}
+                                                 (comp (remove (fn [[k _]]
+                                                                 (= "style" (namespace k))))
+                                                       (map (fn [[k v]] [(name k) (str v)])))
+                                                 (:attrs c))})
+                      (rec c (inc depth))))))]
+      (rec root 0))
+    @out))
+
+;; ---- normalisation (applied identically to BOTH sides) ----
+
+(def ^:private ws-pattern
+  "Whitespace for text normalisation: SPACE, TAB, LF, FF, CR only --
+   deliberately NOT the regex `\\s` class.
+
+   `\\s` also matches U+00A0 NO-BREAK SPACE, and collapsing that would erase
+   the difference between a `&nbsp;` that was decoded and one that was left
+   as a literal `&nbsp;` -- which is exactly what the entity cases are here
+   to measure. The five characters listed are the ones HTML itself calls
+   ASCII whitespace."
+  #"[ \t\n\f\r]+")
+
+(defn- norm-text
+  "Collapse runs of ASCII whitespace to a single space -- and do NOT trim.
+
+   Trimming would delete whitespace-only text nodes entirely, and those are
+   real: `<a>one</a>\\n  <a>two</a>` renders as `one two` in every browser
+   precisely because that run survives into the DOM, and this parser only
+   started keeping such runs on 2026-08-03 (`fix(core): keep whitespace-only
+   text runs`). Where such a run lands -- inside a table or foster-parented
+   out of it, before or after an implied tag -- is genuine parser behaviour,
+   so it stays in the comparison as its own `#ws` item rather than being
+   normalised out of existence."
+  [s]
+  (str/replace (str s) ws-pattern " "))
+
+(def ^:private ignored-attrs
+  "Attributes excluded from the SECONDARY (attribute) axis, and why. None of
+   these are tree shape, so the primary score never sees them.
+
+   - `style`: htmldom does not keep it. `apply-attrs` folds it into
+     `:style-inline` / `:style-inline-important` plus a parsed `:style` map
+     for the cascade, which is the whole reason this repo has a calc()
+     evaluator in it. Comparing a parsed map against a browser's raw string
+     would score the cascade bridge, not the parser.
+   - `style-inline` / `style-inline-important`: the engine-side halves of
+     the same thing. So is every `:style/<prop>` key `apply-attrs` writes
+     beside them, which the tree walk above drops by NAMESPACE -- `name`
+     erases it, so `(name :style/width)` is plain `width` and an element
+     carrying an inline style was reporting a phantom attribute of that
+     name. Found by `:table/bare-col-gets-an-implied-colgroup`, the first
+     case in this corpus to put an inline style on an element with no other
+     attributes.
+   - `default-value` / `default-checked` / `default-selected`: synthesised
+     by `initialize-form-defaults`. In a real browser these are DOM
+     PROPERTIES (`el.defaultValue`), never content attributes, so the oracle
+     cannot have them and their absence is not a divergence."
+  #{"style" "style-inline" "style-inline-important"
+    "default-value" "default-checked" "default-selected"})
+
+(def ^:private ignored-attrs-by-tag
+  "Attributes excluded on SPECIFIC tags, because `initialize-form-defaults`
+   overwrites the content attribute with the computed DOM property there:
+   `<select>` gets a `:value` it never had in the source, `<option>` gets
+   `:selected` rewritten to a boolean, `<textarea>` gets `:value` set from
+   its text content. All three are properties in a browser, not attributes."
+  {"select" #{"value"}
+   "option" #{"selected"}
+   "textarea" #{"value"}})
+
+(defn- norm-attrs [tag a]
+  (let [drop? (into ignored-attrs (get ignored-attrs-by-tag tag #{}))]
+    (into {} (comp (remove (fn [[k _]] (contains? drop? (str/lower (name k)))))
+                   (map (fn [[k v]] [(str/lower (name k)) (str v)])))
+          a)))
+
+(defn- coalesce-text
+  "Merge adjacent text nodes at the same depth, on BOTH sides, before
+   anything else.
+
+   MEASURED, not assumed: a browser appends characters to the existing text
+   node when the last child already is one, so a token it drops in between
+   (an ignored `</b>`, a comment it keeps as its own node, an unterminated
+   tag at EOF) leaves ONE text node; htmldom emits one text node per `:text`
+   token and never merges. Without this step `<p>a</b>b</p>` was scored as a
+   tree-shape divergence -- `#text \"a\"`, `#text \"b\"` against `#text
+   \"ab\"` -- when the two trees are `Node.normalize()`-identical and no
+   consumer can tell them apart. That is a NODE BOUNDARY difference, not a
+   tree shape one, and this harness measures shape.
+
+   Applied to both sides symmetrically, and applied to the RAW text before
+   whitespace normalisation, so `\"a \" + \" b\"` becomes `\"a  b\"` exactly
+   as a browser would have built it. Which is how it stays honest: it
+   removes the boundary artefact and leaves the real content divergence it
+   was hiding visible (`<p>a < b</p>` still fails -- htmldom drops the bare
+   `<` that a browser keeps)."
+  [items]
+  (reduce (fn [acc {:keys [k d v] :as it}]
+            (let [prev (peek acc)]
+              (if (and (= "t" k) (= "t" (:k prev)) (= d (:d prev)))
+                (conj (pop acc) (assoc prev :v (str (:v prev) v)))
+                (conj acc it))))
+          []
+          items))
+
+(defn- shape
+  "Both sides reduced to the comparable sequence: elements as tag+depth,
+   text nodes whitespace-normalised, comments as their own kind.
+
+   A whitespace-only text node becomes `:whitespace` rather than `:text`.
+   It is still compared -- where such a run lands is real parser behaviour
+   -- but giving it its own kind makes its divergences aggregate into one
+   honest bucket instead of hiding inside `text-content`."
+  [items]
+  (->> items
+       coalesce-text
+       (map (fn [{:keys [k d n v a]}]
+              (case k
+                "e" {:kind :element :depth d :name n :attrs a}
+                "t" (let [t (norm-text v)]
+                      (if (str/blank? t)
+                        {:kind :whitespace :depth d}
+                        {:kind :text :depth d :text t}))
+                "c" {:kind :comment :depth d :text (str/trim (norm-text v))}
+                nil)))
+       (remove nil?)
+       vec))
+
+(defn- render-item [it]
+  (case (:kind it)
+    :element (str (:name it) "@" (:depth it))
+    :text (str "#text@" (:depth it) " " (pr-str (:text it)))
+    :whitespace (str "#ws@" (:depth it))
+    :comment (str "#comment@" (:depth it) " " (pr-str (:text it)))
+    "-"))
+
+(defn- first-divergence
+  "Index and the two items at the first position where the sequences differ,
+   comparing shape only (attributes are the separate axis). `nil` when they
+   agree."
+  [want got]
+  (let [key-of (fn [it] (when it (dissoc it :attrs)))]
+    (loop [i 0]
+      (cond
+        (and (>= i (count want)) (>= i (count got))) nil
+        (not= (key-of (nth want i nil)) (key-of (nth got i nil)))
+        {:index i :want (nth want i nil) :got (nth got i nil)}
+        :else (recur (inc i))))))
+
+(defn- divergence-category
+  "A coarse cause for the first divergence, so a run's failures group into a
+   handful of named categories instead of a list of case ids. Deliberately
+   shallow -- it reads the two items at the divergence point and nothing
+   else, because anything cleverer starts guessing -- with ONE whole-tree
+   look-ahead: if the browser's tree has a comment node anywhere and this
+   parser's has none, the case is about comments no matter where the two
+   sequences first part company. `kotoba.wasm.dom` has no comment node type
+   at all, so a dropped comment shifts everything after it and the first
+   divergence lands on whatever text or element followed -- reporting that
+   as `text-content` would send the reader looking for a text bug that
+   isn't there."
+  [{:keys [want got]} want-tree got-tree]
+  (cond
+    (and (some #(= :comment (:kind %)) want-tree)
+         (not-any? #(= :comment (:kind %)) got-tree))
+    "comment-node-dropped"
+
+    :else
+    (cond
+    (or (= :comment (:kind want)) (= :comment (:kind got))) "comment-node-dropped"
+    (or (= :whitespace (:kind want)) (= :whitespace (:kind got))) "whitespace-node"
+    (and want (nil? got)) (str "missing-" (name (:kind want))
+                               (when (= :element (:kind want)) (str "/" (:name want))))
+    (and got (nil? want)) (str "extra-" (name (:kind got))
+                               (when (= :element (:kind got)) (str "/" (:name got))))
+    (not= (:kind want) (:kind got)) (str (name (:kind want)) "-vs-" (name (:kind got)))
+    (= :element (:kind want)) (if (= (:name want) (:name got))
+                                (str "nesting-depth/" (:name want))
+                                (str "wrong-element/" (:name want) "-vs-" (:name got)))
+    :else (if (= (:depth want) (:depth got)) "text-content" "text-depth"))))
+
+(defn- attr-agreement
+  "Secondary axis: how many elements carry exactly the attribute map the
+   oracle gave them. Only elements that line up positionally (same index,
+   same tag) are counted -- an element the shape axis already disagrees
+   about has nothing meaningful to compare attributes against."
+  [want got]
+  (reduce (fn [acc i]
+            (let [w (nth want i nil) g (nth got i nil)]
+              (if (and (= :element (:kind w)) (= :element (:kind g))
+                       (= (:name w) (:name g)) (= (:depth w) (:depth g)))
+                (let [wa (norm-attrs (:name w) (:attrs w))
+                      ga (norm-attrs (:name g) (:attrs g))]
+                  (-> acc
+                      (update :total inc)
+                      (cond-> (= wa ga) (update :agree inc))
+                      (cond-> (not= wa ga)
+                        (update :diffs conj {:tag (:name w) :want wa :got ga}))))
+                acc)))
+          {:total 0 :agree 0 :diffs []}
+          (range (max (count want) (count got)))))
+
+(defn- compare-case [oracle-items c]
+  (let [want (shape oracle-items)
+        got (try (shape (engine-items (:html c)))
+                 (catch :default e {:error (ex-message e)}))]
+    (if (map? got)
+      {:id (:id c) :group (:group c) :status :error :detail (:error got)}
+      (let [div (first-divergence want got)
+            attrs (attr-agreement want got)]
+        (merge {:id (:id c) :group (:group c) :attrs attrs
+                :want want :got got}
+               (if div
+                 {:status :fail :divergence div
+                  :category (divergence-category div want got)}
+                 {:status :pass}))))))
+
+;; ---- report ----
+
+(defn- pct [n d] (if (zero? d) 0 (js/Math.round (* 100 (/ n d)))))
+
+;; nbb/ClojureScript has no clojure.core/format.
+(defn- pad-right [s n] (let [s (str s)] (str s (apply str (repeat (max 0 (- n (count s))) " ")))))
+(defn- pad-left [s n] (let [s (str s)] (str (apply str (repeat (max 0 (- n (count s))) " ")) s)))
+
+(defn- context
+  "A few items either side of the divergence, so a failure reads as a tree
+   fragment rather than as one orphan line."
+  [items idx]
+  (->> (range (max 0 (- idx 1)) (min (count items) (+ idx 2)))
+       (map (fn [i] (str (if (= i idx) " > " "   ") (render-item (nth items i)))))
+       (str/join "\n")))
+
+(let [{:keys [browser only ledger verbose]} (parse-args *command-line-args*)
+      candidates (find-browsers browser)
+      all-cases (edn/read-string (fs/readFileSync "conformance/cases.edn" "utf8"))
+      cases (vec (if only (filter #(str/includes? (str (:id %)) only) all-cases) all-cases))
+      _ (when (empty? cases) (throw (ex-info "no cases selected" {:only only})))
+      ;; A per-run directory, not a fixed name in tmpdir. Two runs of this
+      ;; harness (or of the sibling cssom one, which had the identical bug)
+      ;; overlap routinely now that agents run them in parallel, and a
+      ;; shared path means run B overwrites the page run A is about to
+      ;; measure -- so A reads B's corpus through A's case indices and
+      ;; scores near-zero on everything. Observed exactly that: 3/190 lines
+      ;; and 0/750 boxes, with a box count from a corpus this run had never
+      ;; seen.
+      page (path/join (fs/mkdtempSync (path/join (os/tmpdir) "htmldom-conf-page-"))
+                      "corpus.html")
+      _ (fs/writeFileSync page (corpus-page cases))
+      [browser transport oracle]
+      (loop [[b & more] candidates failures []]
+        (if (nil? b)
+          (throw (ex-info "no candidate browser produced a measurement block"
+                          {:tried failures}))
+          (let [r (try (let [{:keys [transport data]} (run-browser! b page)]
+                         [b transport data])
+                       (catch :default e
+                         (println (str "oracle unusable: " b " -- " (ex-message e)))
+                         nil))]
+            (or r (recur more (conj failures b))))))
+      _ (println (str "\noracle:  " browser " (" (name transport) ")"
+                      "\nmethod:  innerHTML fragment parse on a detached <div>"
+                      "\ncases:   " (count cases) "\n"))
+      results (vec (map-indexed
+                    (fn [i c] (compare-case (get oracle (keyword (str "case-" i)) []) c))
+                    cases))
+      passed (filter #(= :pass (:status %)) results)
+      by-group (->> results
+                    (group-by :group)
+                    (sort-by key)
+                    (mapv (fn [[g rs]] [g (count (filter #(= :pass (:status %)) rs)) (count rs)])))]
+
+  (doseq [r results]
+    (println (str (pad-right (name (:status r)) 8) (pad-right (str (:id r)) 42)
+                  (case (:status r)
+                    :pass ""
+                    :error (str "error: " (:detail r))
+                    (str "#" (:index (:divergence r)) " "
+                         (str (:category r))
+                         "  want " (render-item (:want (:divergence r)))
+                         "  got " (render-item (:got (:divergence r))))))))
+
+  (when verbose
+    (doseq [r results :when (= :fail (:status r))]
+      (println (str "\n--- " (:id r) " (first divergence at #" (:index (:divergence r)) ")"))
+      (println "  browser:")
+      (println (context (:want r) (:index (:divergence r))))
+      (println "  htmldom:")
+      (println (context (:got r) (:index (:divergence r))))))
+
+  (println)
+  (doseq [[g p t] by-group]
+    (println (str "  " (pad-right (name g) 18) (pad-left p 3) "/" (pad-left t 3)
+                  (pad-left (pct p t) 5) "%")))
+
+  (let [cats (->> results
+                  (filter #(= :fail (:status %)))
+                  (group-by #(str (:category %)))
+                  (sort-by (fn [[_ rs]] (- (count rs)))))]
+    (when (seq cats)
+      (println "\nDIVERGENCE CATEGORIES (by first divergence):")
+      (doseq [[cat rs] cats]
+        (println (str "  " (pad-left (count rs) 3) "  " (pad-right cat 34) "  "
+                      (str/join ", " (map (comp str :id) (take 3 rs))))))))
+
+  (let [as (map :attrs (filter :attrs results))
+        total (reduce + 0 (map :total as))
+        agree (reduce + 0 (map :agree as))
+        diffs (mapcat :diffs as)]
+    (println (str "\nATTRIBUTES  " agree "/" total " comparable elements carry the same attributes ("
+                  (pct agree total) "%)"))
+    (doseq [d (take 8 diffs)]
+      (println (str "  <" (:tag d) ">  browser " (pr-str (:want d)) "  htmldom " (pr-str (:got d))))))
+
+  (println (str "\nTREE SHAPE  " (count passed) "/" (count results) " = "
+                (pct (count passed) (count results)) "%"))
+
+  (when ledger
+    (let [as (map :attrs (filter :attrs results))
+          entry {:conformance/kind :parser-tree-shape
+                 :conformance/oracle (last (str/split browser #"/"))
+                 :conformance/total (count results)
+                 :conformance/passed (count passed)
+                 :conformance/pct (pct (count passed) (count results))
+                 :conformance/by-group (into {} (map (fn [[g p t]] [g [p t]]) by-group))
+                 :conformance/failing (vec (sort (map (comp str :id)
+                                                      (remove #(= :pass (:status %)) results))))
+                 :conformance/categories (->> results
+                                              (filter #(= :fail (:status %)))
+                                              (group-by #(str (:category %)))
+                                              (map (fn [[k v]] [k (count v)]))
+                                              (into {}))
+                 :conformance/attrs-agree (reduce + 0 (map :agree as))
+                 :conformance/attrs-total (reduce + 0 (map :total as))}]
+      (fs/appendFileSync ledger (str (pr-str entry) "\n"))
+      (println (str "\nappended to " ledger)))))

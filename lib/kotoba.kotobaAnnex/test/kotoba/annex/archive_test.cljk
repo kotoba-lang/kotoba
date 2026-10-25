@@ -1,0 +1,96 @@
+(ns kotoba.annex.archive-test
+  "/ipfs/:cid backend のテスト。実 kotobase.net は叩かず、
+   **b2_write/handle-archive-put の実挙動**（201 で保存 / 401 unauthorized /
+   413 too large / 422 digest mismatch、GET は未認証）を mock で模す。"
+  (:require [kotoba.test :refer [deftest is testing async]]
+            [kotoba.annex.cid :as cid]
+            [kotoba.annex.archive :as arc]))
+
+(defn- sha256-hex [b]
+  (-> (js/require "crypto") (.createHash "sha256") (.update b) (.digest "hex")))
+
+(def payload (js/Buffer.from "kagaku narration bytes"))
+(def payload-hash (sha256-hex payload))
+(def payload-key (str "SHA256E-s" (.-length payload) "--" payload-hash ".wav"))
+
+(defn mock-archive
+  "PUT /ipfs/:cid の契約を模す。token 検証・digest 検証まで本番と同じ順で行う。"
+  [backing token]
+  (fn [u & [opts]]
+    (let [o (or opts #js {})
+          c (last (.split u "/"))
+          method (or (.-method o) "GET")
+          auth (some-> (.-headers o) (aget "authorization"))]
+      (js/Promise.resolve
+       (cond
+         (= method "PUT")
+         (cond
+           (not= auth (str "Bearer " token)) #js {:ok false :status 401}
+           ;; 本番と同じ fail-closed: CID digest と body sha256 の一致
+           (not= (cid/hex->cid (sha256-hex (.-body o))) c) #js {:ok false :status 422}
+           :else (do (swap! backing assoc c (.-body o)) #js {:ok true :status 201}))
+         :else
+         (if-let [b (get @backing c)]
+           #js {:ok true :status 200
+                :arrayBuffer (fn [] (js/Promise.resolve b))}
+           #js {:ok false :status 404}))))))
+
+(deftest archive-roundtrip
+  (testing "store→present?→retrieve が /ipfs/:cid 契約で回る（base64/CBOR/chunk 無し）"
+    (async done
+      (let [backing (atom {})
+            s (arc/archive-store {:token "T" :fetch (mock-archive backing "T")})]
+        (-> ((:store! s) payload-key payload)
+            (.then (fn [ok] (is ok "store! は 201 で true")))
+            (.then (fn [_]
+                     (is (= 1 (count @backing)) "B2 に 1 オブジェクト（chunk 分割されない）")
+                     (is (= payload (get @backing (cid/key->cid payload-key)))
+                         "**生バイト列がそのまま置かれる**（base64 も DAG-CBOR も挟まない）")))
+            (.then (fn [_] ((:present? s) payload-key)))
+            (.then (fn [p] (is (= :yes p) "present after store")))
+            (.then (fn [_] ((:retrieve s) payload-key)))
+            (.then (fn [b] (is (= (.toString b) (.toString payload)) "retrieve が一致")))
+            (.then (fn [_] ((:present? s) (str "SHA256E-s3--" (apply str (repeat 64 "0")) ".bin"))))
+            (.then (fn [p] (is (= :no p) "未保存の key は :no") (done))))))))
+
+(deftest wrong-token-is-not-reported-as-success
+  (testing "401 を成功と report しない（『成功と報告して実は失敗』を作らない）"
+    (async done
+      (let [s (arc/archive-store {:token "WRONG" :fetch (mock-archive (atom {}) "T")})]
+        (-> ((:store! s) payload-key payload)
+            (.then (fn [ok] (is (false? ok) "401 → false") (done))))))))
+
+(deftest non-derivable-keys-fail-closed
+  (testing "**実測の核心**: chunk / 暗号化 key は CID 導出不可 → throw（別 CID に流さない）"
+    (let [s (arc/archive-store {:token "T" :fetch (mock-archive (atom {}) "T")})
+          chunk-key (str "SHA256E-s100000-S32768-C1--" (apply str (repeat 64 "a")) ".bin")
+          gpg-key "GPGHMACSHA1--c515891369dd6f47f2336d2c5a5892c57a9f1260"]
+      (is (thrown? js/Error ((:store! s) chunk-key payload)) "chunk key は扱えない")
+      (is (thrown? js/Error ((:store! s) gpg-key payload)) "GPGHMAC key は扱えない")
+      (is (thrown? js/Error ((:present? s) chunk-key)) "present? も同様に fail-closed"))))
+
+(deftest key-hash-vs-bytes-mismatch-guard
+  (testing "key の hash と実バイト列が食い違うなら送る前に落とす（本番の 422 を先取り）"
+    (let [s (arc/archive-store {:token "T" :fetch (mock-archive (atom {}) "T")})
+          lying-key (str "SHA256E-s5--" (apply str (repeat 64 "b")) ".bin")]
+      (is (thrown? js/Error ((:store! s) lying-key payload))))))
+
+(deftest size-guard-matches-production
+  (testing "4MiB 上限は本番 archive-put/max-object-bytes と一致（超過は 413）"
+    (is (= (* 4 1024 1024) arc/max-object-bytes))
+    (let [s (arc/archive-store {:token "T" :fetch (mock-archive (atom {}) "T")})
+          big (js/Buffer.alloc (inc arc/max-object-bytes))
+          k (str "SHA256E-s" (.-length big) "--" (sha256-hex big) ".bin")]
+      (is (thrown? js/Error ((:store! s) k big))))))
+
+(deftest remove-is-honest
+  (testing "delete 面が無いので REMOVE は false（tombstone で消えたことにしない）"
+    (async done
+      (let [s (arc/archive-store {:token "T" :fetch (mock-archive (atom {}) "T")})]
+        (-> ((:remove! s) payload-key)
+            (.then (fn [r] (is (false? r) "REMOVE-FAILURE を返させる") (done))))))))
+
+(deftest prepare-requires-token
+  (testing "token 未設定なら prepare! で落ちる（黙って 401 を積まない）"
+    (let [s (arc/archive-store {:token "" :fetch (fn [& _])})]
+      (is (thrown? js/Error ((:prepare! s) {}))))))

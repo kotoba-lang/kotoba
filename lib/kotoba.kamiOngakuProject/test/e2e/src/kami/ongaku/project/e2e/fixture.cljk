@@ -1,0 +1,303 @@
+(ns kami.ongaku.project.e2e.fixture
+  "Shared, portable (.cljc -- JVM + cljs, required UNMODIFIED by both the
+   real-browser worklet bundle and the offline nbb cross-check) fixture for
+   kami-ongaku-project's real-browser AudioWorklet multi-track bus-graph
+   MIXING proof (see test/e2e/run_e2e.cljk and README, 'Real bus-graph
+   mixing proof').
+
+   kami-ongaku-project is the L3 SESSION model tying kami-ongaku-notation
+   (score IR) and kami-ongaku-sequencer (MIDI-equivalent event IR) together
+   via tracks/buses/clips -- but it has never actually rendered a session to
+   audio (out of scope per its own README v0, 'No audio rendering'). This
+   fixture builds a real, two-track, three-bus PROJECT using ONLY this
+   repo's own kami.ongaku.project constructors (track/bus/clip-placement/
+   tempo-point/project), places REAL kami-ongaku-notation and
+   kami-ongaku-sequencer content on the project's own integer-tick timeline
+   via real clip-placement start-ticks, checks it with this repo's own
+   `validate-project`, and then defines the actual BUS-GRAPH MIXING MATH
+   (gain-scaled summation over each bus's :bus/inputs, recursively) as a
+   pure, audio-library-free function -- the oscillator/ADSR synthesis itself
+   (which DOES need kotoba-lang/audio) lives in worklet_dsp.cljs (worklet
+   side) and run_e2e.cljs (offline nbb reference), both of which require
+   this namespace unmodified, exactly the separation of concerns
+   kami-ongaku-notation's and kami-ongaku-sequencer's own E2E fixtures use.
+
+   Session layout (all built via kami.ongaku.project's real constructors):
+
+     track \"t-notation\" (:notation, output-bus \"b-inst\")
+       -- clip \"c-notation\", start-tick 0, a real kami.ongaku.notation
+          part: one 4/4 measure at 120 BPM, 3 notes (C4 quarter mf, E4
+          quarter mf, G4 half ff) -- durations sum to exactly 1 whole note
+          (1/4+1/4+1/2 = 1), a real validate/validate-part-clean measure.
+     track \"t-midi\" (:midi, output-bus \"b-drums\")
+       -- clip \"c-midi\", start-tick 2400 (one quarter-note GAP after the
+          notation clip's own 1920-tick/1-whole-note length, so the two
+          tracks' audible content never overlaps in time -- a deliberate
+          fixture-design choice so onset/amplitude measurements on the
+          MIXED master output are unambiguous about which track's content
+          they are looking at), a real kami.ongaku.sequencer pattern: 3
+          note events, quarter-note (480-tick) spacing, distinct pitches
+          (D4/F4/A4 = 62/65/69) and velocities (90/100/110).
+     bus \"b-inst\"   (name Instruments, inputs #{\"t-notation\"}, gain 1.0)
+     bus \"b-drums\"  (name Drums,       inputs #{\"t-midi\"},     gain <param>)
+     bus \"b-master\" (name Master,      inputs #{\"b-inst\" \"b-drums\"}, gain 1.0)
+
+   `build-project`'s ONE parameter, `drums-gain`, is the actual thing this
+   E2E proves: the SAME two tracks' content, routed through the SAME bus
+   GRAPH shape, mixed via THIS repo's own :bus/inputs + :bus/gain, rendered
+   twice (drums-gain 0.5 and drums-gain 1.0) -- the captured master output's
+   measured peak amplitude for the drums-bus track's notes should differ by
+   ~2x between the two renders, while the instruments-bus track's notes'
+   measured peak should NOT change (proving the gain change is scoped to
+   the \"b-drums\" bus, not a global scale) -- see README, 'Real bus-graph
+   mixing proof', for the full writeup."
+  (:require [kami.ongaku.project :as project]
+            [kami.ongaku.notation :as notation]
+            [kami.ongaku.notation.pitch :as pitch]
+            [kami.ongaku.notation.rational :as r]
+            [kami.ongaku.notation.validate :as notation-validate]
+            [kami.ongaku.sequencer :as sq]))
+
+;; --- shared tempo/resolution/audio-rate constants ---------------------------
+;; One constant tempo (120 BPM, no tempo-change events -- matches
+;; kami-ongaku-sequencer's own E2E fixture convention), so tick -> seconds is
+;; a single linear formula for BOTH tracks (this is the actual point of a
+;; project-level tick timeline: kami.ongaku.notation's rational whole-note
+;; durations and kami.ongaku.sequencer's own tick durations both convert
+;; through the SAME project ppq/bpm, not two independent clocks).
+
+(def BPM 120)
+(def SR 48000)
+(def PPQ 480)
+(def whole-note-ticks (* 4 PPQ)) ;; 1920: a whole note at this PPQ
+
+;; ADSR envelope shape shared by every note in the session (seconds) -- same
+;; order of magnitude as org-w3-webaudio's/kami-ongaku-sampler's/
+;; kami-ongaku-sequencer's/kami-ongaku-notation's own E2E fixtures.
+(def attack-seconds 0.01)
+(def decay-seconds 0.02)
+(def sustain-level 0.7)
+(def release-seconds 0.05)
+
+(defn- round-half-up [x]
+  #?(:clj (long (Math/round (double x)))
+     :cljs (long (js/Math.round x))))
+
+(defn seconds->samples [s] (round-half-up (* (double s) SR)))
+
+(def attack-samples (seconds->samples attack-seconds))
+(def decay-samples (seconds->samples decay-seconds))
+(def release-samples (seconds->samples release-seconds))
+
+(defn tick->seconds
+  "Ticks -> seconds at the constant BPM/PPQ above (also valid for a tick
+   COUNT, not just an absolute tick position, since seconds-per-tick is
+   constant here -- same convention kami-ongaku-sequencer's own fixture
+   documents)."
+  [tick]
+  (/ (* (double tick) 60.0) (* BPM PPQ)))
+
+(defn tick->sample [tick] (seconds->samples (tick->seconds tick)))
+
+(defn rational->ticks
+  "Exact tick count for `whole-r` (a kami.ongaku.notation.rational fraction
+   of a WHOLE note) at this fixture's PPQ -- all-rational arithmetic until
+   `rational/->int`'s single, exact integer extraction (mirrors
+   kami-ongaku-notation's own fixture.cljc whole-units->samples, but landing
+   on the project's own tick timeline instead of samples directly, since
+   THIS repo's clip-placement positions things in ticks, not samples)."
+  [whole-r]
+  (-> whole-r (r/mul (r/int->rational whole-note-ticks)) r/->int))
+
+(defn midi->freq
+  "Standard equal-tempered A4=440Hz formula: 440 * 2^((note-69)/12)."
+  [note]
+  (* 440.0 (Math/pow 2.0 (/ (- note 69) 12.0))))
+
+(defn velocity->gain [velocity] (/ (double velocity) 127.0))
+
+;; ---------------------------------------------------------------------------
+;; track 1 content: a real kami.ongaku.notation part (3 notes, built via this
+;; repo's OWN dependency on kami-ongaku-notation's real constructors, not a
+;; reimplementation).
+
+(def notation-note-specs
+  [{:step :C :octave 4 :type :quarter :dynamic :mf}
+   {:step :E :octave 4 :type :quarter :dynamic :mf}
+   {:step :G :octave 4 :type :half    :dynamic :ff}])
+
+(defn- spec->note [{:keys [step octave type dynamic]}]
+  (notation/note {:pitches [{:step step :octave octave}] :type type :dynamic dynamic}))
+
+(def notation-notes (mapv spec->note notation-note-specs))
+
+(def notation-part
+  (notation/part
+   {:id "P1" :name "Lead"
+    :measures
+    [(notation/measure
+      {:number 1
+       :time-sig {:beats 4 :beat-type 4}
+       :key-sig {:fifths 0}
+       :tempo {:bpm BPM}
+       :notes notation-notes})]}))
+
+(defn notation-part-valid?
+  "True if the phrase's single measure sums to the 4/4 capacity exactly
+   (kami-ongaku-notation's OWN validate/validate-part, exact rational
+   arithmetic)."
+  []
+  (:validate/valid? (notation-validate/validate-part notation-part)))
+
+(def notation-clip-start-tick 0)
+(def notation-clip-length-ticks whole-note-ticks) ;; 1920: exactly 1 whole note
+
+;; ---------------------------------------------------------------------------
+;; track 2 content: a real kami.ongaku.sequencer pattern (3 note events,
+;; built via this repo's OWN dependency on kami-ongaku-sequencer's real event
+;; shape, not a reimplementation). Placed (via clip-placement's own
+;; :clip/start-tick) one quarter-note AFTER the notation clip ends, so the
+;; two tracks' audible content never overlaps -- see namespace docstring.
+
+(def midi-events
+  [{:type :note :pitch 62 :velocity 90  :tick 0   :duration-ticks 240 :channel 0}
+   {:type :note :pitch 65 :velocity 100 :tick 480 :duration-ticks 240 :channel 0}
+   {:type :note :pitch 69 :velocity 110 :tick 960 :duration-ticks 240 :channel 0}])
+
+(def midi-pattern
+  {:name "e2e-drums-pattern" :length-ticks 1200 :loop? false :events midi-events})
+
+(defn midi-pattern-valid?
+  "True if every event is valid and none overflows the pattern's own
+   length-ticks (kami-ongaku-sequencer's OWN validate-pattern, not a
+   reimplementation) -- the same extra-rigor role notation-part-valid? plays
+   for the notation track above."
+  []
+  (empty? (sq/validate-pattern midi-pattern)))
+
+(def midi-clip-start-tick (+ notation-clip-start-tick notation-clip-length-ticks PPQ)) ;; 1920+480 = 2400
+(def midi-clip-length-ticks (:length-ticks midi-pattern))
+
+;; ---------------------------------------------------------------------------
+;; the real Project (this repo's OWN track/bus/clip-placement/tempo-point/
+;; project constructors) -- `drums-gain` is the ONE thing that varies across
+;; the two E2E renders this fixture drives.
+
+(defn build-project
+  [drums-gain]
+  (project/project
+   {:ppq PPQ :sample-rate SR
+    :tempo-map [(project/tempo-point {:tick 0 :bpm BPM :time-sig [4 4]})]
+    :tracks
+    [(project/track {:id "t-notation" :type :notation :name "Lead" :output-bus "b-inst"})
+     (project/track {:id "t-midi" :type :midi :name "Drums" :output-bus "b-drums"})]
+    :buses
+    [(project/bus {:id "b-inst" :name "Instruments" :inputs #{"t-notation"} :gain 1.0})
+     (project/bus {:id "b-drums" :name "Drums" :inputs #{"t-midi"} :gain drums-gain})
+     (project/bus {:id "b-master" :name "Master" :inputs #{"b-inst" "b-drums"} :gain 1.0})]
+    :clips
+    [(project/clip-placement {:id "c-notation" :track-id "t-notation"
+                               :start-tick notation-clip-start-tick
+                               :length-ticks notation-clip-length-ticks
+                               :content notation-part})
+     (project/clip-placement {:id "c-midi" :track-id "t-midi"
+                               :start-tick midi-clip-start-tick
+                               :length-ticks midi-clip-length-ticks
+                               :content midi-pattern})]}))
+
+(defn validation-errors
+  "This repo's OWN validate-project, run on the real constructed project --
+   not skipped. Empty vector = a real, clean, valid session."
+  [drums-gain]
+  (project/validate-project (build-project drums-gain)))
+
+;; ---------------------------------------------------------------------------
+;; per-track note -> common playback-parameter shape:
+;;   {:onset-sample :gate-off-sample :local-length :freq :gain}
+;; onset-sample is where, in ONE continuous per-track buffer, this note's
+;; render should start. gate-off-sample is LOCAL to that note's own render
+;; (its duration converted to samples). local-length is gate-off-sample +
+;; release-samples (how long this note's own attack/decay/sustain/release
+;; render is before it always reaches exactly 0). Normalizing BOTH domains
+;; (notation's rational whole-note durations, sequencer's integer tick
+;; durations) to this ONE shape is what lets a single, generic bus-mixing
+;; function (below) treat every track uniformly.
+
+(defn notation-track-notes []
+  (let [notes notation-notes
+        onset-ticks
+        (:onsets (reduce (fn [{:keys [cum onsets]} n]
+                            (let [cum' (r/add cum (notation/duration-value n))]
+                              {:cum cum' :onsets (conj onsets (rational->ticks cum))}))
+                          {:cum r/zero :onsets []}
+                          notes))]
+    (mapv (fn [n onset-tick]
+            (let [dur-ticks (rational->ticks (notation/duration-value n))
+                  global-onset-tick (+ notation-clip-start-tick onset-tick)
+                  onset-sample (tick->sample global-onset-tick)
+                  gate-off-sample (tick->sample dur-ticks)
+                  local-length (+ gate-off-sample release-samples)
+                  freq (midi->freq (pitch/pitch->midi (first (:note/pitches n))))
+                  gain (/ (double (get notation/dynamic->velocity (:note/dynamic n))) 127.0)]
+              {:onset-sample onset-sample :gate-off-sample gate-off-sample
+               :local-length local-length :freq freq :gain gain}))
+          notes onset-ticks)))
+
+(defn midi-track-notes []
+  (mapv (fn [{:keys [tick pitch velocity duration-ticks]}]
+          (let [global-tick (+ midi-clip-start-tick tick)
+                onset-sample (tick->sample global-tick)
+                gate-off-sample (tick->sample duration-ticks)
+                local-length (+ gate-off-sample release-samples)]
+            {:onset-sample onset-sample :gate-off-sample gate-off-sample
+             :local-length local-length :freq (midi->freq pitch) :gain (velocity->gain velocity)}))
+        midi-events))
+
+(defn track-notes-by-id []
+  {"t-notation" (notation-track-notes) "t-midi" (midi-track-notes)})
+
+(defn overall-total-samples
+  "Smallest buffer that fits every note (of either track) at its onset-sample
+   + local-length, plus a small safety pad -- same convention as
+   kami-ongaku-sequencer's own fixture/render-plan."
+  [track-notes-map]
+  (+ 10 (reduce max 0 (mapcat (fn [notes] (map #(+ (:onset-sample %) (:local-length %)) notes))
+                               (vals track-notes-map)))))
+
+;; ---------------------------------------------------------------------------
+;; REAL bus-graph mixing math -- pure numeric (no audio dependency at all),
+;; over THIS repo's own :project/buses / :bus/inputs / :bus/gain. Given
+;; per-track SYNTHESIZED buffers (produced by the caller via kotoba-lang/
+;; audio, see worklet_dsp.cljs / run_e2e.cljs), recursively sums each bus's
+;; inputs (tracks and/or other buses) and scales by that bus's OWN gain --
+;; the actual thing this E2E proves (not just "each track plays back
+;; correctly", but "the project's bus graph mixes them together with the
+;; correct gains").
+
+(defn- bus-by-id [proj id]
+  (first (filter #(= (:bus/id %) id) (:project/buses proj))))
+
+(defn mix-node
+  "-> a buffer (persistent vector of doubles, length `total`) for `node-id`
+   (a track id or a bus id) in `proj`. Track ids resolve directly to their
+   already-synthesized buffer in `track-buffers`; bus ids resolve by summing
+   every one of that bus's OWN :bus/inputs (recursively -- an input may
+   itself be another bus, walking the REAL bus graph, not a flattened one)
+   and then scaling the sum by that bus's OWN :bus/gain."
+  [proj track-buffers total node-id]
+  (if (contains? track-buffers node-id)
+    (get track-buffers node-id)
+    (let [b (bus-by-id proj node-id)
+          gain (double (:bus/gain b))
+          summed (reduce (fn [acc input-id]
+                            (mapv + acc (mix-node proj track-buffers total input-id)))
+                          (vec (repeat total 0.0))
+                          (:bus/inputs b))]
+      (mapv #(* gain %) summed))))
+
+(defn mix-master
+  "-> the master bus's (\"b-master\") fully mixed output buffer, given
+   `proj` (a real project from build-project) and `track-buffers` (a map of
+   track-id -> synthesized buffer, each of length `total`)."
+  [proj track-buffers total]
+  (mix-node proj track-buffers total "b-master"))

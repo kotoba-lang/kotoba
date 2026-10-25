@@ -1,0 +1,263 @@
+(ns torch.continuous-test
+  (:require [kotoba.test :refer [deftest is]]
+            [num.array :as arr]
+            [num.cpu :as cpu]
+            [num.tensor :as t]
+            [torch.continuous :as continuous]
+            [torch.core :as core]
+            [torch.kv-cache :as kv]
+            [torch.model :as model]
+            [torch.num-backend :as nb]
+            [torch.paged-runtime :as paged]))
+
+(def backend (cpu/cpu-backend))
+
+(defn- cpu-storage [block-count block-size heads kv-heads]
+  (let [keys (atom (vec (repeat block-count (vec (repeat block-size nil)))))
+        values (atom (vec (repeat block-count (vec (repeat block-size nil)))))
+        attend (fn [query blocks length]
+                 (let [addresses (for [position (range length)]
+                                   [(nth blocks (quot position block-size))
+                                    (mod position block-size)])
+                       key-data (vec (mapcat #(get-in @keys %) addresses))
+                       value-data (vec (mapcat #(get-in @values %) addresses))
+                       kv-width (quot (count key-data) length)]
+                   (t/multi-head-attention
+                    query (arr/from-vec backend key-data [length kv-width])
+                    (arr/from-vec backend value-data [length kv-width])
+                    heads {:kv-heads kv-heads})))]
+    {:write! (fn [key value block offset]
+               (swap! keys assoc-in [block offset] (arr/->vec key))
+               (swap! values assoc-in [block offset] (arr/->vec value)))
+     :copy-block! (fn [source destination tokens]
+                    (doseq [offset (range tokens)]
+                      (swap! keys assoc-in [destination offset]
+                             (get-in @keys [source offset]))
+                      (swap! values assoc-in [destination offset]
+                             (get-in @values [source offset]))))
+     :attention
+     attend
+     :attention-many
+     (fn [query block-tables lengths]
+       (let [output
+             (t/cat (mapv (fn [index]
+                            (attend
+                             (t/squeeze
+                              (t/slice-axis query 0 index (inc index)) 0)
+                             (nth block-tables index) (nth lengths index)))
+                          (range (count lengths))) 0)]
+         (t/reshape output [(count lengths) 1 (last (:shape output))])))}))
+
+(deftest ragged-continuous-paged-llama-admits-releases-and-reuses
+  (let [model* (model/sequential
+                (model/embedding 6 4)
+                (model/llama-block 4 2 8 {:kv-heads 1})
+                (model/llama-block 4 2 8 {:kv-heads 1})
+                (model/rmsnorm 4) (model/lm-head 4 6))
+        weights (nb/random-weights backend model* 89)
+        runtimes (mapv (fn [_]
+                         (paged/runtime (kv/pool 3 2)
+                                        (cpu-storage 3 2 2 1)))
+                       (range 2))
+        calls (atom [])
+        batch-calls (atom [])
+        step-fn (fn [token runtimes request-id]
+                  (swap! calls conj [request-id token])
+                  (let [step (nb/llama-lm-paged-step
+                              model* weights (arr/from-vec backend [token] [1])
+                              runtimes request-id)]
+                    (assoc step :logits (arr/->vec (:logits step)))))
+        batch-step-fn
+        (fn [tokens runtimes request-ids]
+          (swap! batch-calls conj [request-ids tokens])
+          (let [step (nb/llama-lm-paged-batch-step
+                      model* weights
+                      (arr/from-vec backend tokens [(count tokens) 1])
+                      runtimes request-ids)]
+            (assoc step :logits
+                   (mapv vec (partition 6 (arr/->vec (:logits step)))))))
+        admitted (-> (continuous/engine runtimes step-fn batch-step-fn 2)
+                     (continuous/enqueue :a [2]
+                                         {:temperature 0.0 :max-new-tokens 2
+                                          :eos-id -1})
+                     (continuous/enqueue :b [1 3 2]
+                                         {:temperature 0.0 :max-new-tokens 2
+                                          :eos-id -1})
+                     (continuous/enqueue :c [4]
+                                         {:temperature 0.0 :max-new-tokens 1
+                                          :eos-id -1})
+                     continuous/admit)]
+    (is (= [:a :b] (:order admitted)))
+    (is (= [:c] (mapv :id (:waiting admitted))))
+    (is (every? empty? (map #(get-in % [:pool :free]) (:runtimes admitted))))
+    (let [tick1 (continuous/tick-batched admitted)]
+      (is (= [:a :b] (:order tick1)))
+      (is (= [:c] (mapv :id (:waiting tick1))))
+      (is (= 2 (get-in tick1 [:runtimes 0 :pool :sequences :a :length])))
+      (is (= 4 (get-in tick1 [:runtimes 0 :pool :sequences :b :length])))
+      (let [tick2 (continuous/tick-batched tick1)]
+        (is (= [:c] (:order tick2))
+            "a/b release blocks and c is immediately ragged-prefilled")
+        (is (= 1 (get-in tick2 [:runtimes 0 :pool :sequences :c :length])))
+        (let [tick3 (continuous/tick-batched tick2)]
+          (is (empty? (:running tick3)))
+          (is (= #{:a :b :c} (set (keys (:completed tick3))))
+              "different prompt lengths and completion times share one pool")
+          (is (every? #(= #{0 1 2} (set (get-in % [:pool :free])))
+                      (:runtimes tick3)))
+          (is (every? #(kv/valid? (:pool %)) (:runtimes tick3)))
+          (is (= 5 (count @calls)) "ragged prefill remains request-local")
+          (is (= 1 (count @batch-calls)))
+          (is (= [:a :b] (ffirst @batch-calls)))
+          (is (= 2 (count (second (first @batch-calls))))))))))
+
+(deftest head-of-line-request-waits-without-mutating-layer-pools
+  (let [storage {:write! (fn [& _]) :copy-block! (fn [& _])
+                 :attention (fn [& _] [0.0])}
+        runtime (paged/runtime (kv/pool 1 2) storage)
+        engine (-> (continuous/engine [runtime]
+                                      (fn [_ runtimes _]
+                                        {:logits [1.0] :runtimes runtimes}) 1)
+                   (continuous/enqueue :large [1 2 3])
+                   (continuous/enqueue :small [1])
+                   continuous/admit)]
+    (is (empty? (:running engine)))
+    (is (= [:large :small] (mapv :id (:waiting engine))))
+    (is (= #{0} (set (get-in engine [:runtimes 0 :pool :free]))))
+    (is (kv/valid? (get-in engine [:runtimes 0 :pool])))))
+
+(deftest submit-rejects-a-sequence-that-can-never-fit
+  (let [storage {:write! (fn [& _]) :copy-block! (fn [& _])
+                 :attention (fn [& _] [0.0])}
+        runtime (paged/runtime (kv/pool 2 2) storage)
+        engine (continuous/engine [runtime]
+                                  (fn [_ runtimes request-id]
+                                    {:logits [1.0]
+                                     :runtimes
+                                     (mapv #(-> (paged/append-kv! % request-id [] [])
+                                                :runtime)
+                                           runtimes)}) 1)
+        prompt-too-long (continuous/submit engine :prompt [1 2 3 4 5]
+                                           {:max-new-tokens 1})
+        decode-too-long (continuous/submit engine :decode [1 2]
+                                           {:max-new-tokens 4})]
+    (is (false? (:accepted? prompt-too-long)))
+    (is (= :sequence-capacity (:reason prompt-too-long)))
+    (is (:accepted? decode-too-long))
+    (is (empty? (get-in prompt-too-long [:engine :waiting])))
+    (is (= 1 (get-in prompt-too-long [:engine :metrics :rejected])))
+    (let [finished (-> (:engine decode-too-long)
+                       continuous/admit continuous/tick continuous/tick)]
+      (is (= :length (get-in finished [:completed :decode :reason])))
+      (is (= 2 (count (get-in finished [:completed :decode :generated-ids]))))
+      (is (= #{0 1} (set (get-in finished [:runtimes 0 :pool :free])))))))
+
+(deftest fused-batch-paged-llama-matches-ragged-full-sequences
+  (let [model* (model/sequential
+                (model/embedding 6 4)
+                (model/llama-block 4 2 8 {:kv-heads 1})
+                (model/llama-block 4 2 8 {:kv-heads 1})
+                (model/rmsnorm 4) (model/lm-head 4 6))
+        weights (nb/random-weights backend model* 91)
+        runtimes (mapv (fn [_]
+                         (-> (paged/runtime (kv/pool 5 2)
+                                            (cpu-storage 5 2 2 1))
+                             (paged/allocate-sequence :a)
+                             (paged/allocate-sequence :b)))
+                       (range 2))
+        prefill-a (nb/llama-lm-paged-step
+                   model* weights (arr/from-vec backend [2] [1]) runtimes :a)
+        prefill-b1 (nb/llama-lm-paged-step
+                    model* weights (arr/from-vec backend [1] [1])
+                    (:runtimes prefill-a) :b)
+        prefill-b2 (nb/llama-lm-paged-step
+                    model* weights (arr/from-vec backend [3] [1])
+                    (:runtimes prefill-b1) :b)
+        batch-step (nb/llama-lm-paged-batch-step
+                    model* weights (arr/from-vec backend [0 2] [2 1])
+                    (:runtimes prefill-b2) [:a :b])
+        ;; Compare against ordinary full causal runs, selecting each final row.
+        full-a (arr/->vec
+                (core/run (nb/num-backend backend weights) model*
+                          (arr/from-vec backend [2 0] [2])))
+        full-b (arr/->vec
+                (core/run (nb/num-backend backend weights) model*
+                          (arr/from-vec backend [1 3 2] [3])))
+        expected (vec (concat (subvec full-a 6 12) (subvec full-b 12 18)))]
+    (is (= [2 1 6] (:shape (:logits batch-step))))
+    (is (every? #(< (Math/abs %) 1.0e-5)
+                (map - expected (arr/->vec (:logits batch-step)))))
+    (is (= [[2 3] [2 3]]
+           (mapv (fn [runtime*]
+                   [(get-in runtime* [:pool :sequences :a :length])
+                    (get-in runtime* [:pool :sequences :b :length])])
+                 (:runtimes batch-step))))))
+
+(deftest serving-control-applies-backpressure-cancel-timeout-and-metrics
+  (let [events (atom [])
+        storage {:write! (fn [& args] (swap! events conj [:write args]))
+                 :copy-block! (fn [& args] (swap! events conj [:copy args]))
+                 :attention (fn [& _] [1.0])}
+        runtime (paged/runtime (kv/pool 1 2) storage)
+        step-fn (fn [token [runtime*] request-id]
+                  (let [write (paged/append-kv! runtime* request-id token token)]
+                    {:logits [1.0] :runtimes [(:runtime write)]}))
+        engine0 (continuous/engine [runtime] step-fn nil 1 {:max-waiting 2})
+        one (continuous/submit engine0 :one [1] {:deadline-ms 1000})
+        two (continuous/submit (:engine one) :two [2] {:deadline-ms 50})
+        rejected (continuous/submit (:engine two) :three [3] {})
+        admitted (continuous/admit (:engine rejected))]
+    (is (:accepted? one))
+    (is (:accepted? two))
+    (is (false? (:accepted? rejected)))
+    (is (= :backpressure (:reason rejected)))
+    (is (= [:one] (:order admitted)))
+    (is (empty? (get-in admitted [:runtimes 0 :pool :free])))
+    (let [cancelled (continuous/cancel admitted :one)
+          replaced (continuous/admit (:engine cancelled))]
+      (is (:cancelled? cancelled))
+      (is (= [:two] (:order replaced)))
+      (is (= :cancelled (get-in replaced [:completed :one :reason])))
+      (let [expired (continuous/expire replaced 100)
+            snapshot (continuous/metrics expired)]
+        (is (empty? (:running expired)))
+        (is (= :timeout (get-in expired [:completed :two :reason])))
+        (is (= #{0} (set (get-in expired [:runtimes 0 :pool :free]))))
+        (is (= {:submitted 2 :admitted 2 :rejected 1 :completed 2
+                :cancelled 1 :timed-out 1 :prompt-tokens 2
+                :generated-tokens 0 :decode-batches 0 :decode-requests 0
+                :speculative-steps 0 :drafted-tokens 0
+                :accepted-draft-tokens 0
+                :peak-running 1 :peak-waiting 2 :running 0 :waiting 0
+                :completed-retained 2 :free-blocks-per-layer [1]}
+               snapshot))))))
+
+(deftest speculative-tick-commits-multiple-verified-tokens-and-releases
+  (let [storage {:write! (fn [& _]) :copy-block! (fn [& _])
+                 :attention (fn [& _] [0.0])}
+        runtime (paged/runtime (kv/pool 4 2) storage)
+        step-fn (fn [_ [runtime*] request-id]
+                  (let [write (paged/append-kv! runtime* request-id [] [])]
+                    {:logits [0.0 1.0] :runtimes [(:runtime write)]}))
+        speculative-step
+        (fn [_ [runtime*] request-id max-tokens]
+          (let [tokens (subvec [1 2 3] 0 (min 3 max-tokens))
+                runtime* (reduce (fn [r _]
+                                   (:runtime (paged/append-kv! r request-id [] [])))
+                                 runtime* tokens)]
+            {:tokens tokens :logits [1.0 0.0] :runtimes [runtime*]
+             :drafted 3 :accepted 2}))
+        admitted (-> (continuous/engine [runtime] step-fn nil 1
+                                        {:speculative-step-fn speculative-step})
+                     (continuous/enqueue :spec [0]
+                                         {:temperature 0.0 :max-new-tokens 3
+                                          :eos-id -1})
+                     continuous/admit)
+        finished (continuous/tick-speculative admitted)
+        snapshot (continuous/metrics finished)]
+    (is (= [1 2 3] (get-in finished [:completed :spec :generated-ids])))
+    (is (= :length (get-in finished [:completed :spec :reason])))
+    (is (= 1 (:speculative-steps snapshot)))
+    (is (= 3 (:drafted-tokens snapshot)))
+    (is (= 2 (:accepted-draft-tokens snapshot)))
+    (is (= #{0 1 2 3} (set (get-in finished [:runtimes 0 :pool :free]))))))

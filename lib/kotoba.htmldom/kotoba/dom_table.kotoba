@@ -1,0 +1,240 @@
+(ns dom-table
+  ;; A DOM as a STRING, because it cannot be a nested `:document`.
+  ;;
+  ;; ## Why not a tree
+  ;;
+  ;; `docs/dom_encoding_probe.cljk` measures it: a nested `:document` mirroring
+  ;; the element tree fails on DEPTH at FOUR element levels, and this repo's
+  ;; conformance corpus reaches six. Tree depth becomes document depth, one
+  ;; element level costs about 2.2 of them, and 9 levels is all there is
+  ;; (`document-depth-limit` 8, root at 0).
+  ;;
+  ;; Depth is also the bound least worth arguing with. The node budget was
+  ;; raised 256 -> 4096 on 2026-09-10 because it was a number nobody derived
+  ;; (osaho#88), but depth bounds recursion in every walker on every backend --
+  ;; it has a derivation, and a deep value is a hazard for the host, not just
+  ;; for this module.
+  ;;
+  ;; A flat parent-pointer table is depth-proof: its depth is constant however
+  ;; deep the tree is. As a `:document` it still spends about 13 document nodes
+  ;; per DOM node, so it caps near 300. As a STRING it spends bytes, and the
+  ;; text budget is 65536 -- about 9x more room.
+  ;;
+  ;; `pattern-vm` reached the same conclusion for its program, for the same
+  ;; reason, and this format is deliberately the same shape so the two read
+  ;; alike.
+  ;;
+  ;; ## The format
+  ;;
+  ;;   header  "D" count(6 hex)                                7 chars
+  ;;   nodes   count x [ kind(1) tag(4) parent(6) kid(6) next(6) ]  23 chars
+  ;;
+  ;;   kind 0 element   tag = index into the host's tag table
+  ;;   kind 1 text      tag unused
+  ;;   kind 2 comment   tag unused
+  ;;
+  ;;   parent/kid/next are node indices; ffffff means none.
+  ;;
+  ;; Fixed width on purpose: a node is addressed by arithmetic, so nothing has
+  ;; to be scanned to find it. Text lives in the host's side table, addressed
+  ;; by node index -- keeping it out of here is what leaves the byte budget for
+  ;; structure.
+  ;;
+  ;; ## What this costs
+  ;;
+  ;; Parsing on every access, charged as fuel per function entry. Fuel is a
+  ;; budget the CALLER chooses (`{:budgets {:fuel n}}`, default 512, ceiling
+  ;; 2^53-1), so unlike depth and unlike the node count it is not a wall
+  ;; compiled into the language. That is the trade this format makes.
+  (:export [main
+            none header-ok? node-count node-at
+            node-kind node-tag node-parent node-first-child node-next-sibling
+            empty-table append-node depth-of
+            test-header test-roundtrip test-tree test-none test-depth])
+  (:schemas {:dt/walk [:record :dt/walk
+                       [[:t :string] [:i :i64] [:acc :i64]]]}))
+
+;; --- hex, the same shape pattern-vm uses ----------------------------------
+
+(defn hex-digit [cp :i64] :i64
+  (if (if (>= cp 48) (<= cp 57) false)
+    (- cp 48)
+    (if (if (>= cp 97) (<= cp 102) false) (+ 10 (- cp 97)) -1)))
+
+(defn hex-digit-char [d :i64] :string
+  (if (< d 10)
+    (string-from-i64 d)
+    (if (= d 10) "a" (if (= d 11) "b" (if (= d 12) "c"
+      (if (= d 13) "d" (if (= d 14) "e" "f")))))))
+
+(defn nibble [n :i64] :i64
+  (- n (* 16 (quot n 16))))
+
+(defn hex6 [n :i64] :string
+  (string-concat
+   (app (ref hex-digit-char) (nibble (quot n 1048576)))
+   (string-concat
+    (app (ref hex-digit-char) (nibble (quot n 65536)))
+    (string-concat
+     (app (ref hex-digit-char) (nibble (quot n 4096)))
+     (string-concat
+      (app (ref hex-digit-char) (nibble (quot n 256)))
+      (string-concat
+       (app (ref hex-digit-char) (nibble (quot n 16)))
+       (app (ref hex-digit-char) (nibble n))))))))
+
+(defn hex4 [n :i64] :string
+  (string-concat
+   (app (ref hex-digit-char) (nibble (quot n 4096)))
+   (string-concat
+    (app (ref hex-digit-char) (nibble (quot n 256)))
+    (string-concat
+     (app (ref hex-digit-char) (nibble (quot n 16)))
+     (app (ref hex-digit-char) (nibble n))))))
+
+(defn hex-scan [x [:ref :dt/walk]] :i64
+  (let [t (record-get x :t)
+        i (record-get x :i)
+        acc (record-get x :acc)]
+    (if (<= i 0)
+      acc
+      (app (ref hex-scan)
+           (record-new [:ref :dt/walk] t (- i 1) acc)))))
+
+;; read n hex digits at offset i
+(defn hex-at [s :string i :i64 n :i64] :i64
+  (if (<= n 0)
+    0
+    (+ (* (app (ref hex-at) s i (- n 1)) 16)
+       (app (ref hex-digit) (string-code-point-at s (+ i (- n 1)))))))
+
+;; --- the format -----------------------------------------------------------
+
+(defn none [] :i64 16777215)
+
+(defn record-width [] :i64 23)
+
+(defn header-width [] :i64 7)
+
+(defn header-ok? [t :string] :bool
+  (if (< (string-length t) (app (ref header-width)))
+    false
+    (= 68 (string-code-point-at t 0))))
+
+(defn node-count [t :string] :i64
+  (app (ref hex-at) t 1 6))
+
+(defn node-at [t :string i :i64] :i64
+  (+ (app (ref header-width)) (* i (app (ref record-width)))))
+
+(defn node-kind [t :string i :i64] :i64
+  (app (ref hex-at) t (app (ref node-at) t i) 1))
+
+(defn node-tag [t :string i :i64] :i64
+  (app (ref hex-at) t (+ (app (ref node-at) t i) 1) 4))
+
+(defn node-parent [t :string i :i64] :i64
+  (app (ref hex-at) t (+ (app (ref node-at) t i) 5) 6))
+
+(defn node-first-child [t :string i :i64] :i64
+  (app (ref hex-at) t (+ (app (ref node-at) t i) 11) 6))
+
+(defn node-next-sibling [t :string i :i64] :i64
+  (app (ref hex-at) t (+ (app (ref node-at) t i) 17) 6))
+
+;; --- building -------------------------------------------------------------
+
+(defn empty-table [] :string
+  (string-concat "D" (app (ref hex6) 0)))
+
+(defn append-node [t :string kind :i64 tag :i64 parent :i64] :string
+  ;; The new node has no children and no sibling yet; the caller links it.
+  (let [n (app (ref node-count) t)
+        body (string-substring t (app (ref header-width)) (string-length t))
+        rec (string-concat
+             (app (ref hex-digit-char) kind)
+             (string-concat
+              (app (ref hex4) tag)
+              (string-concat
+               (app (ref hex6) parent)
+               (string-concat (app (ref hex6) (app (ref none)))
+                              (app (ref hex6) (app (ref none)))))))]
+    (string-concat (string-concat "D" (app (ref hex6) (+ n 1)))
+                   (string-concat body rec))))
+
+;; --- depth, which is the whole point --------------------------------------
+;;
+;; The TREE's depth, walked through parent pointers. The TABLE's own document
+;; depth is 2 whatever this answers, which is the property a nested document
+;; could not give.
+
+(defn climb [x [:ref :dt/walk]] :i64
+  (let [t (record-get x :t)
+        i (record-get x :i)
+        acc (record-get x :acc)]
+    (if (= i (app (ref none)))
+      acc
+      (app (ref climb)
+           (record-new [:ref :dt/walk] t (app (ref node-parent) t i) (+ acc 1))))))
+
+(defn depth-of [t :string i :i64] :i64
+  (app (ref climb) (record-new [:ref :dt/walk] t i 0)))
+
+;; --- self-checks ----------------------------------------------------------
+
+(defn test-header [] :bool
+  (let [t (app (ref empty-table))]
+    (and (app (ref header-ok?) t)
+         (and (= 0 (app (ref node-count) t))
+              (and (= 7 (string-length t))
+                   (not (app (ref header-ok?) "X000000")))))))
+
+(defn test-roundtrip [] :bool
+  ;; one element node, every field read back as written
+  (let [t (app (ref append-node) (app (ref empty-table)) 0 291 (app (ref none)))]
+    (and (= 1 (app (ref node-count) t))
+         (and (= 0 (app (ref node-kind) t 0))
+              (and (= 291 (app (ref node-tag) t 0))
+                   (and (= (app (ref none)) (app (ref node-parent) t 0))
+                        (and (= (app (ref none)) (app (ref node-first-child) t 0))
+                             (= 30 (string-length t)))))))))
+
+(defn test-tree [] :bool
+  ;; html > body > div, linked by parent only
+  (let [a (app (ref append-node) (app (ref empty-table)) 0 1 (app (ref none)))
+        b (app (ref append-node) a 0 2 0)
+        c (app (ref append-node) b 0 3 1)]
+    (and (= 3 (app (ref node-count) c))
+         (and (= 0 (app (ref node-parent) c 1))
+              (and (= 1 (app (ref node-parent) c 2))
+                   (and (= 2 (app (ref node-tag) c 1))
+                        (= 3 (app (ref node-tag) c 2))))))))
+
+(defn test-none [] :bool
+  ;; the sentinel is a real value and round-trips as one
+  (and (= 16777215 (app (ref none)))
+       (let [t (app (ref append-node) (app (ref empty-table)) 1 0 (app (ref none)))]
+         (= (app (ref none)) (app (ref node-next-sibling) t 0)))))
+
+(defn test-depth [] :bool
+  ;; ⚠ the point of the whole format: tree depth far past what a nested
+  ;; :document can hold, in a value whose OWN depth is 2
+  (let [a (app (ref append-node) (app (ref empty-table)) 0 1 (app (ref none)))
+        b (app (ref append-node) a 0 1 0)
+        c (app (ref append-node) b 0 1 1)
+        d (app (ref append-node) c 0 1 2)
+        e (app (ref append-node) d 0 1 3)
+        f (app (ref append-node) e 0 1 4)
+        g (app (ref append-node) f 0 1 5)
+        h (app (ref append-node) g 0 1 6)
+        i (app (ref append-node) h 0 1 7)
+        j (app (ref append-node) i 0 1 8)
+        k (app (ref append-node) j 0 1 9)
+        l (app (ref append-node) k 0 1 10)]
+    (and (= 12 (app (ref node-count) l))
+         (and (= 1 (app (ref depth-of) l 0))
+              ;; twelve levels deep -- a nested document refuses at four
+              (= 12 (app (ref depth-of) l 11))))))
+
+(defn main [] :i64
+  (app (ref node-count) (app (ref empty-table))))

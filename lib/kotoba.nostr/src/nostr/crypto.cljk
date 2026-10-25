@@ -1,0 +1,295 @@
+(ns nostr.crypto
+  "Dependency-free SHA-256 and secp256k1/BIP-340 (Schnorr) primitives,
+  portable .cljc: :clj uses java.security.MessageDigest + java.math.BigInteger
+  (JDK built-ins, zero deps), :cljs (nbb/Node) uses node:crypto's createHash
+  (Node core module, zero npm deps) + native JS BigInt.
+
+  THIS IS REAL, SPEC-COMPLIANT VERIFICATION — not a stand-in. `schnorr-verify`
+  is checked in test/nostr/crypto_test.cljk against the official BIP-340 test
+  vectors (bitcoin/bips, bip-0340/test-vectors.csv), both positive and
+  negative cases, not merely self-consistency. `schnorr-sign` exists ONLY to
+  let this repo's own tests build genuinely-signed fixture events without a
+  second, only-partially-real crypto path — nostr.event/nostr.blossom never
+  sign anything; signing is exclusively a client concern in real Nostr.
+
+  No elliptic-curve library dependency: point arithmetic (add/double/
+  scalar-mul), field inversion (Fermat little theorem via mod-pow), and
+  lift-x are hand-implemented here over the standard secp256k1 domain
+  parameters. This is the single swap-in point if this workspace later wants
+  a vetted external secp256k1 implementation instead — every caller in this
+  repo (`nostr.event`, `nostr.blossom`) only ever calls `schnorr-verify`,
+  never the field/point internals directly."
+  (:require [kotoba.lang.text :as str]
+            #?@(:cljs [["node:crypto" :as ncrypto]]))
+  #?(:clj (:import (java.security MessageDigest)
+                    (java.math BigInteger))))
+
+;; --------------------------------------------------------------- bigint shim
+;; The only platform-specific primitives. Everything below this section
+;; (field math, point math, tagged-hash, sign/verify) is written ONCE and
+;; runs identically on both platforms via these four functions + ordinary
+;; +, -, *, mod, =, <, zero? — all of which behave consistently on
+;; java.math.BigInteger and native js/BigInt without further shims (verified
+;; empirically: both support arbitrary-precision +, -, *, mod, =, <, zero?
+;; directly; neither supports bit-shift-right/quot/odd?/even? uniformly,
+;; which is why int-div and mod-2 below exist instead of those).
+
+;; NOTE: each function below is its OWN full top-level #?(:clj expr :cljs
+;; expr) form (never grouped via #?@ splicing, never grouped via a shared
+;; #?(:clj (do ...) :cljs (do ...)) wrapper) — this is the one shape that
+;; actually works on BOTH platforms, found the hard way:
+;;   - #?@ splicing directly at the top level is a genuine JVM Clojure
+;;     reader error: "Reader conditional splicing not allowed at the top
+;;     level" (confirmed against Clojure CLI 1.12).
+;;   - A single #?(:clj (do (defn a..) (defn b..)) :cljs (do ...)) form
+;;     reads fine on both, but nbb's self-hosted ClojureScript compiler
+;;     does NOT register defns nested inside a top-level `do` as resolvable
+;;     top-level vars (confirmed empirically — `bar` stayed unresolvable
+;;     after a `do`-wrapped `(defn bar ...)` even though it evaluated
+;;     without error), while JVM Clojure handles that shape fine. So
+;;     splicing satisfies nbb but breaks JVM; do-wrapping satisfies JVM but
+;;     breaks nbb. One-function-per-conditional-form satisfies both.
+;;
+;; ALSO EMPIRICALLY VERIFIED (the hard way — an infinite loop during
+;; development): `zero?`/`odd?`/`even?`/`quot` on nbb's cljs core are BROKEN
+;; for js/BigInt — `(zero? (js/BigInt 0))` silently returns `false` (not an
+;; exception, just wrong), which would otherwise turn every mod-pow/
+;; scalar-mul loop below into an infinite loop. `zero-big?` here is the
+;; portable, correct replacement (`=` against a BigInt zero literal DOES
+;; work correctly, verified) — every zero-check on a bigint value anywhere
+;; in this file goes through it, never bare `zero?`.
+;;
+;; ALSO EMPIRICALLY VERIFIED, ONE MORE JVM-only bigint gotcha: `biginteger`
+;; produces a REAL java.math.BigInteger, but Clojure's generic +/-/*/mod on
+;; BigInteger operands auto-PROMOTE the result to Clojure's OWN
+;; clojure.lang.BigInt (the type behind `10000000000N` literals /
+;; `(bigint x)`) — confirmed via `(class (- (biginteger 5) (biginteger 3)))`
+;; => clojure.lang.BigInt, not java.math.BigInteger. A `^BigInteger` type
+;; hint on int-div/mod-pow's params therefore threw
+;; ClassCastException (BigInt cannot be cast to BigInteger) once real
+;; point-math call chains (mod-p/sub-p/mul-p, all built from generic +/-/*)
+;; started feeding them values. Fix: no type hints on these params; coerce
+;; defensively with `biginteger` (which accepts EITHER BigInt or BigInteger
+;; input) right before any BigInteger-only method call (.divide/.modPow).
+#?(:clj
+   (defn big
+     "Long/Integer/String(decimal) -> BigInteger."
+     [x] (biginteger x))
+   :cljs
+   (defn big [x] (js/BigInt x)))
+
+#?(:clj
+   (defn hex->big [^String s] (BigInteger. s 16))
+   :cljs
+   (defn hex->big [s] (js/BigInt (str "0x" s))))
+
+#?(:clj
+   (defn int-div [a b] (.divide (biginteger a) (biginteger b)))
+   :cljs
+   ;; native BigInt `/` truncates toward zero (== quot for non-negatives)
+   (defn int-div [a b] (/ a b)))
+
+#?(:clj
+   (defn zero-big? [x] (zero? x))
+   :cljs
+   (defn zero-big? [x] (= x (js/BigInt 0))))
+
+#?(:clj
+   (defn mod-pow [base exp m]
+     (.modPow (biginteger base) (biginteger exp) (biginteger m)))
+   :cljs
+   (defn mod-pow [base exp m]
+     (loop [result (js/BigInt 1) b (mod base m) e exp]
+       (if (zero-big? e)
+         result
+         (let [bit (mod e (js/BigInt 2))
+               result' (if (= bit (js/BigInt 1)) (mod (* result b) m) result)]
+           (recur result' (mod (* b b) m) (int-div e (js/BigInt 2))))))))
+
+(defn big->hex
+  "Non-negative bigint -> lowercase hex string, zero-padded to byte-len*2 chars."
+  [x byte-len]
+  #?(:clj (let [s (.toString (biginteger x) 16)
+                pad (- (* 2 byte-len) (count s))]
+            (if (pos? pad) (str (apply str (repeat pad \0)) s) s))
+     :cljs (.padStart (.toString x 16) (* 2 byte-len) "0")))
+
+;; ------------------------------------------------------------------- bytes
+;; A "byte vector" here is a plain Clojure vector of ints in [0,255] — a
+;; portable representation that avoids clj byte-array (signed -128..127)
+;; vs. cljs Uint8Array/Buffer divergence at every call site; only the sha256
+;; core and str->bytes/bytes->str boundary functions below touch the native
+;; per-platform byte types.
+
+(defn hex->bytes [^String hex]
+  (mapv (fn [i] #?(:clj (Integer/parseInt (subs hex i (+ i 2)) 16)
+                   :cljs (js/parseInt (subs hex i (+ i 2)) 16)))
+        (range 0 (count hex) 2)))
+
+(defn bytes->hex [byte-vec]
+  (apply str (map (fn [b] (let [s #?(:clj (Integer/toHexString (bit-and b 0xff))
+                                      :cljs (.toString (bit-and b 0xff) 16))]
+                             (if (= 1 (count s)) (str "0" s) s)))
+                   byte-vec)))
+
+(defn big->bytes [x byte-len] (hex->bytes (big->hex x byte-len)))
+(defn bytes->big [byte-vec] (hex->big (bytes->hex byte-vec)))
+
+(defn str->bytes
+  "UTF-8 encode a string to a byte vector."
+  [^String s]
+  #?(:clj (vec (map #(bit-and % 0xff) (.getBytes s "UTF-8")))
+     :cljs (vec (js/Array.from (.encode (js/TextEncoder.) s)))))
+
+;; -------------------------------------------------------------------- sha256
+
+(defn sha256-bytes
+  "byte-vec -> byte-vec (32 bytes), real SHA-256 (JDK MessageDigest on :clj,
+  node:crypto createHash on :cljs — both platform built-ins, zero deps)."
+  [byte-vec]
+  #?(:clj (let [ba (byte-array (map (fn [b] (byte (if (> b 127) (- b 256) b))) byte-vec))
+                digest (.digest (MessageDigest/getInstance "SHA-256") ba)]
+            (vec (map #(bit-and (int %) 0xff) digest)))
+     :cljs (let [buf (js/Buffer.from (clj->js byte-vec))
+                 h (.update (.createHash ncrypto "sha256") buf)]
+             (vec (js/Array.from (.digest h))))))
+
+(defn sha256-hex [byte-vec] (bytes->hex (sha256-bytes byte-vec)))
+(defn sha256-of-str [s] (sha256-hex (str->bytes s)))
+
+;; ----------------------------------------------------------- secp256k1 curve
+
+;; Standard secp256k1 domain parameters (SEC 2, also used by Bitcoin/Nostr).
+(def ^:private P  (hex->big "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F"))
+(def ^:private N  (hex->big "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141"))
+(def ^:private Gx (hex->big "79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798"))
+(def ^:private Gy (hex->big "483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8"))
+(def ^:private G  [Gx Gy])
+
+(defn mod-p [x] (mod x P))
+(defn mod-n [x] (mod x N))
+(defn add-p [a b] (mod-p (+ a b)))
+(defn sub-p [a b] (mod-p (- a b)))
+(defn mul-p [a b] (mod-p (* a b)))
+(defn inv-p [x] (mod-pow (mod-p x) (- P (big 2)) P)) ;; Fermat: x^(p-2) mod p, p prime
+
+(defn point-double [P1]
+  (if (= P1 :inf)
+    :inf
+    (let [[x y] P1]
+      (if (zero-big? y)
+        :inf
+        (let [l  (mul-p (mul-p (big 3) (mul-p x x)) (inv-p (mul-p (big 2) y)))
+              x3 (sub-p (mul-p l l) (mul-p (big 2) x))
+              y3 (sub-p (mul-p l (sub-p x x3)) y)]
+          [x3 y3])))))
+
+(defn point-add [P1 Q]
+  (cond
+    (= P1 :inf) Q
+    (= Q :inf) P1
+    (and (= (first P1) (first Q)) (zero-big? (add-p (second P1) (second Q)))) :inf
+    (= P1 Q) (point-double P1)
+    :else
+    (let [[x1 y1] P1 [x2 y2] Q
+          l  (mul-p (sub-p y2 y1) (inv-p (sub-p x2 x1)))
+          x3 (sub-p (sub-p (mul-p l l) x1) x2)
+          y3 (sub-p (mul-p l (sub-p x1 x3)) y1)]
+      [x3 y3])))
+
+(defn scalar-mul
+  "k * Pt via double-and-add. k must be a non-negative bigint."
+  [k Pt]
+  (loop [k k acc :inf base Pt]
+    (if (zero-big? k)
+      acc
+      (let [bit (mod k (big 2))
+            acc' (if (= bit (big 1)) (point-add acc base) acc)]
+        (recur (int-div k (big 2)) acc' (point-double base))))))
+
+(defn has-even-y? [Pt] (and (not= Pt :inf) (zero-big? (mod (second Pt) (big 2)))))
+
+(defn- lift-x
+  "BIP-340 lift_x: x (bigint) -> the curve point with that x-coordinate and
+  even y, or nil if x has no valid point (x >= p, or x^3+7 is not a QR mod p)."
+  [x]
+  (when (< x P)
+    (let [y2 (mod-p (+ (mul-p (mul-p x x) x) (big 7)))
+          y  (mod-pow y2 (int-div (+ P (big 1)) (big 4)) P)] ;; valid sqrt since p ≡ 3 mod 4
+      (when (zero-big? (sub-p (mul-p y y) y2))
+        (if (zero-big? (mod y (big 2))) [x y] [x (- P y)])))))
+
+;; --------------------------------------------------------------- tagged hash
+
+(defn tagged-hash
+  "BIP-340 tagged hash: SHA256(SHA256(tag) || SHA256(tag) || data), where
+  `tag` is a plain ASCII string (e.g. \"BIP0340/challenge\") and `data` is a
+  byte-vec. Returns a byte-vec (32 bytes)."
+  [tag data-bytes]
+  (let [th (sha256-bytes (str->bytes tag))]
+    (sha256-bytes (vec (concat th th data-bytes)))))
+
+;; ------------------------------------------------------------------- verify
+
+(defn schnorr-verify
+  "BIP-340 Schnorr signature verification.
+  pubkey-hex: 32-byte-hex x-only public key.
+  msg-bytes:  the 32-byte message as a byte-vec (for Nostr: the event id's
+              raw bytes, i.e. (hex->bytes event-id)).
+  sig-hex:    64-byte-hex signature (r || s).
+  -> boolean. Never throws on malformed input (returns false)."
+  [pubkey-hex msg-bytes sig-hex]
+  (try
+    (boolean
+     (and (string? pubkey-hex) (= 64 (count pubkey-hex))
+          (string? sig-hex) (= 128 (count sig-hex))
+          (= 32 (count msg-bytes))
+          (let [Pt (lift-x (hex->big pubkey-hex))]
+            (and Pt
+                 (let [r (hex->big (subs sig-hex 0 64))
+                       s (hex->big (subs sig-hex 64 128))]
+                   (and (< r P) (< s N)
+                        (let [e (mod-n (bytes->big
+                                        (tagged-hash "BIP0340/challenge"
+                                                     (vec (concat (big->bytes r 32)
+                                                                  (hex->bytes pubkey-hex)
+                                                                  msg-bytes)))))
+                              R (point-add (scalar-mul s G) (scalar-mul (mod-n (- N e)) Pt))]
+                          (and (not= R :inf)
+                               (has-even-y? R)
+                               (= (first R) r)))))))))
+    #?(:clj (catch Exception _ false)
+       :cljs (catch :default _ false))))
+
+;; --------------------------------------------------------------------- sign
+;; TEST-FIXTURE-ONLY. Real Nostr clients sign; this relay/blob-store library
+;; never does. Exists solely so test/nostr/fixtures.cljk can build genuinely
+;; BIP-340-signed events/auth-headers for round-trip tests without faking a
+;; signature. Implements the full deterministic-nonce algorithm (no RNG),
+;; so it's reproducible in tests.
+
+(defn pubkey-for
+  "32-byte-hex x-only public key for private key scalar d' (bigint, 1<=d'<=n-1)."
+  [d']
+  (let [Pt (scalar-mul d' G)]
+    (big->hex (first Pt) 32)))
+
+(defn schnorr-sign
+  "d': private key scalar (bigint). msg-bytes: 32-byte-vec. aux-rand-bytes:
+  32-byte-vec (all-zero is valid per BIP-340 and used by this repo's fixed
+  test fixtures for reproducibility). -> 64-byte-hex signature."
+  [d' msg-bytes aux-rand-bytes]
+  (let [Pt (scalar-mul d' G)
+        d  (if (has-even-y? Pt) d' (mod-n (- N d')))
+        t  (mapv bit-xor (big->bytes d 32) aux-rand-bytes)
+        pubkey-bytes (big->bytes (first Pt) 32)
+        rand-bytes (tagged-hash "BIP0340/nonce" (vec (concat t pubkey-bytes msg-bytes)))
+        k' (mod-n (bytes->big rand-bytes))]
+    (when (zero-big? k') (throw (ex-info "schnorr-sign: k' == 0, retry with different aux-rand" {})))
+    (let [R (scalar-mul k' G)
+          k (if (has-even-y? R) k' (mod-n (- N k')))
+          e (mod-n (bytes->big
+                    (tagged-hash "BIP0340/challenge"
+                                 (vec (concat (big->bytes (first R) 32) pubkey-bytes msg-bytes)))))
+          s (mod-n (+ k (* e d)))]
+      (str (big->hex (first R) 32) (big->hex s 32)))))

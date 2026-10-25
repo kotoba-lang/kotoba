@@ -1,0 +1,174 @@
+;; Authority test for kotoba/capability_admission_core.kotoba.
+;;
+;; The binding that matters most here is the BIT ORDER. `effect-bit` assigns
+;; bit i to index i of :effect-ops, so reordering that vector — which looks
+;; like formatting — silently changes what every stored mask means. Nothing
+;; else in the repo would notice. This test does.
+;;
+;; The rest checks the algebra as laws rather than as examples, because the
+;; consumer folds `effect-bit` over an arbitrary program: the cases that break
+;; it are the ones nobody thought to write down.
+;;
+;; The compiler is test-only (ADR-reliability-t63).
+
+(ns kotoba.selfhost.capability-admission-core-test
+  (:require [kotoba.lang.edn :as edn]
+            [kotoba.io :as io]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]))
+
+(def ^:private facts
+  (edn/read-string (slurp (io/resource "kotoba/selfhost/safe_analyzer_facts.edn"))))
+
+(def ^:private effect-ops (vec (:effect-ops facts)))
+
+(def ^:private kir
+  (:kir (compiler/compile-source (slurp "lib/kotoba.kotobaSelfhostContracts/kotoba/capability_admission_core.kotoba")
+                                 :wasm32-kotoba-v1 {})))
+
+(defn- k [export & args] (ir/execute kir (symbol export) (vec args)))
+
+(def ^:private universe (k "known-effect-mask"))
+
+(def ^:private codes
+  {:admit             (k "code-admit")
+   :unknown-kind      (k "code-unknown-kind")
+   :missing-grant     (k "code-missing-grant")
+   :expired-grant     (k "code-expired-grant")
+   :empty-intersection (k "code-empty-intersection")})
+
+(deftest bit-assignment-follows-effect-ops-order
+  (testing "bit i is index i — reordering :effect-ops is a wire change"
+    (doseq [[i op] (map-indexed vector effect-ops)]
+      (is (= (bit-shift-left 1 i) (k "effect-bit" op))
+          (str op " is at index " i " so it must be bit " i))))
+  (testing "the universe is exactly the ops the seed names"
+    (is (= (dec (bit-shift-left 1 (count effect-ops))) universe)))
+  (testing "an op the seed does not name carries no effect"
+    (doseq [op (concat (:non-executable-forms facts)
+                       ["+" "my-fn" "" "kgraph-drop!"])]
+      (when-not (contains? (set effect-ops) op)
+        (is (zero? (k "effect-bit" op)) (str op " must not carry an effect bit"))))))
+
+(deftest core-declares-the-seed-it-mirrors
+  (is (= (:schema facts) (k "facts-schema"))))
+
+;; ── algebra as laws, over the whole mask space ───────────────────────
+
+(defn- outside
+  "complement within the 6-bit universe, computed independently of the .kotoba"
+  [m] (bit-and (bit-not m) 63))
+
+(def ^:private masks (range 0 64))
+
+(deftest union-is-bit-or
+  ;; effect-union is spelled arithmetically because :js lacks bit-or; that is
+  ;; only safe if it is bit-or on every input, not on the ones in the fixture.
+  (doseq [a masks b masks]
+    (is (= (bit-or a b) (k "effect-union" a b))
+        (str "union " a " " b))))
+
+(deftest complement-stays-inside-the-universe
+  (doseq [m masks]
+    (let [c (k "effect-complement" m)]
+      (is (= c (bit-and c universe)) (str "complement of " m " left the universe"))
+      (is (zero? (bit-and c m)) (str "complement of " m " overlaps it"))
+      (is (= universe (bit-or c m)) (str "complement of " m " is not total")))))
+
+(deftest declaration-check-is-subset
+  (doseq [inferred masks declared masks]
+    (is (= (zero? (bit-and inferred (outside declared)))
+           (k "declaration-satisfied?" inferred declared))
+        (str "declared " declared " vs inferred " inferred))))
+
+(deftest unused-grants-is-declared-minus-inferred
+  (doseq [inferred masks declared masks]
+    (is (= (bit-and declared (outside inferred))
+           (k "unused-grants" inferred declared))
+        (str "declared " declared " inferred " inferred))))
+
+(deftest minimal-policy-is-the-smallest-that-admits
+  (doseq [inferred masks]
+    (let [p (k "minimal-policy" inferred)]
+      (is (= inferred p) "minimal policy is exactly the inferred set")
+      (when (pos? inferred)
+        (is (k "admits?" inferred inferred p 0 1)
+            "the minimal policy must admit")
+        (is (k "authority-sufficient?" inferred inferred p)
+            "and must leave no shortfall")
+        ;; Minimal means "drop any bit and the program is short of authority",
+        ;; NOT "drop any bit and it is denied": :empty-intersection only denies
+        ;; an EMPTY intersection, so a partial policy is admitted with a
+        ;; narrowed scope. An earlier version of this test asserted denial and
+        ;; was wrong about the model.
+        (doseq [drop-bit (filter #(pos? (bit-and inferred %))
+                                 (map #(bit-shift-left 1 %) (range 6)))]
+          (let [narrowed (bit-xor p drop-bit)]
+            (is (= drop-bit (k "authority-shortfall" inferred inferred narrowed))
+                (str "policy " p " minus " drop-bit " left no shortfall"))
+            (is (not (k "authority-sufficient?" inferred inferred narrowed)))))))))
+
+(deftest shortfall-is-what-the-program-will-not-get
+  (doseq [inferred masks d [0 1 3 21 63] p [0 1 3 42 63]]
+    (is (= (bit-and inferred (outside (bit-and inferred (bit-and d p))))
+           (k "authority-shortfall" inferred d p)))))
+
+(deftest admitted-does-not-mean-sufficient
+  ;; the distinction the deny ladder cannot express on its own
+  (let [needs 3]
+    (is (k "admits?" needs needs 1 0 9))
+    (is (not (k "authority-sufficient?" needs needs 1)))
+    (is (= 2 (k "authority-shortfall" needs needs 1)))))
+
+(deftest effective-scope-is-three-way-intersection
+  (doseq [r masks d masks p masks]
+    (is (= (bit-and r (bit-and d p)) (k "effective-scope" r d p)))))
+
+(deftest requesting-alone-is-never-authority
+  ;; :plain-resource-is-not-authority, over every request
+  (doseq [r masks]
+    (is (zero? (k "effective-scope" r 0 universe)))
+    (is (zero? (k "effective-scope" r universe 0)))))
+
+(deftest attenuation-is-one-directional
+  (doseq [parent masks child masks]
+    (is (= (not (zero? (bit-and child (outside parent))))
+           (k "attenuation-violation?" parent child))
+        (str "parent " parent " child " child))))
+
+(deftest production-policy-refuses-the-wildcard
+  (doseq [p masks]
+    (is (= (not= universe p) (k "production-policy-ok?" p)))))
+
+;; ── deny ladder ──────────────────────────────────────────────────────
+
+(deftest deny-ladder-order-is-observable
+  (testing "each rule has its own code"
+    (is (= (:unknown-kind codes)       (k "admission-code" 64 1 1 0 9)))
+    (is (= (:missing-grant codes)      (k "admission-code" 1 0 1 0 9)))
+    (is (= (:expired-grant codes)      (k "admission-code" 1 1 1 10 9)))
+    (is (= (:empty-intersection codes) (k "admission-code" 1 2 3 0 9)))
+    (is (= (:admit codes)              (k "admission-code" 3 3 1 0 9))))
+  (testing "an earlier rule is never rescued by a later one"
+    ;; every one of these would also fail a later rule
+    (is (= (:unknown-kind codes)  (k "admission-code" 64 0 0 10 9)))
+    (is (= (:missing-grant codes) (k "admission-code" 1 0 0 10 9)))
+    (is (= (:expired-grant codes) (k "admission-code" 1 2 3 10 9))))
+  (testing "codes are distinct"
+    (is (= 5 (count (set (vals codes)))))))
+
+(deftest admits-agrees-with-code-everywhere
+  (doseq [r masks d [0 1 3 63] p [0 1 3 63] [now exp] [[0 9] [10 9] [9 9]]]
+    (is (= (= (:admit codes) (k "admission-code" r d p now exp))
+           (k "admits?" r d p now exp)))))
+
+(deftest inference-grants-nothing
+  ;; The distinction this whole file exists to make executable: a program whose
+  ;; effects are fully inferred AND fully declared is still denied without a
+  ;; grant, for every non-empty effect set.
+  (doseq [inferred (rest masks)]
+    (is (k "declaration-satisfied?" inferred inferred))
+    (is (= (:missing-grant codes)
+           (k "admission-code" inferred 0 universe 0 9))
+        (str "inferred " inferred " was admitted with no grant"))))

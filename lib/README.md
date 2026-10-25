@@ -105,6 +105,53 @@ The bundled standard libraries live in this repository:
 | `org.ietf.snmp` | `org.ietf.snmp/src` | `snmp.message`, `snmp.pdu`, `snmp.types` (an external specification, publisher ietf.org) |
 | `org.apache.arrow` | `org.apache.arrow/src` | `arrow.build`, `arrow.decode`, `arrow.flatbuffers`, `arrow.ipc` (an external specification, publisher apache.org) |
 | `org.ietf.oauth2` | `org.ietf.oauth2/src` | `oauth2.core`, `oauth2.pkce` (an external specification, publisher ietf.org) |
+| `org.ietf.epp` | `org.ietf.epp/src` | `epp.command`, `epp.response`, `epp.server`, `epp.transport` (an external specification, publisher ietf.org) |
+| `org.ietf.imap` | `org.ietf.imap/src` | `imap.client`, `imap.protocol`, `imap.transport` (an external specification, publisher ietf.org) |
+| `org.ietf.pop3` | `org.ietf.pop3/src` | `pop3.client`, `pop3.protocol`, `pop3.transport` (an external specification, publisher ietf.org) |
+| `org.ietf.rdap` | `org.ietf.rdap/src` | `rdap.jcard`, `rdap.response`, `rdap.service`, `rdap.status` (an external specification, publisher ietf.org) |
+| `org.ietf.sftp` | `org.ietf.sftp/src` | `kotobase.sftp.fs`, `kotobase.sftp.transport.sftp-subsystem`, `kotobase.sftp.transport.ssh`, `kotobase.sftp.transport.wire` (an external specification, publisher ietf.org) |
+| `org.ietf.smtp` | `org.ietf.smtp/src` | `smtp.client`, `smtp.protocol`, `smtp.transport` (an external specification, publisher ietf.org) |
+| `org.ietf.webdav` | `org.ietf.webdav/src` | `kotobase.protocols.http`, `kotobase.protocols.webdav` (an external specification, publisher ietf.org) |
+| `kotoba.htmldom` | `kotoba.htmldom/src` | `htmldom.core` (Kotoba project library) |
+| `kotoba.cssom` | `kotoba.cssom/src` | `cssom.core`, `cssom.layout` (Kotoba project library) |
+| `kotoba.domGpu` | `kotoba.domGpu/src` | `kotoba.wasm.abi`, `kotoba.wasm.debug`, `kotoba.wasm.demo`, `kotoba.wasm.demo-document` (Kotoba project library) |
+| `kotoba.codeGraph` | `kotoba.codeGraph/src` | `code-graph.async`, `code-graph.core`, `code-graph.evidence` (Kotoba project library) |
+| `kotoba.yield` | `kotoba.yield/src` | `yield`, `yield.aging`, `yield.corner`, `yield.monte-carlo` (Kotoba project library) |
+| `kotoba.watchlistScreen` | `kotoba.watchlistScreen/src` | `watchlist.adapters.aml-port`, `watchlist.adapters.edn-index`, `watchlist.adapters.eu-consolidated`, `watchlist.adapters.jp-mof` (Kotoba project library) |
+| `kotoba.unspsc` | `kotoba.unspsc/src` | `kotoba.unspsc`, `kotoba.unspsc.embedded`, `kotoba.unspsc.product` (Kotoba project library) |
+| `kotoba.uikit` | `kotoba.uikit/src` | `uikit.core` (Kotoba project library) |
+| `kotoba.torch` | `kotoba.torch/src` | `torch.checkpoint`, `torch.continuous`, `torch.continuous-ollama`, `torch.core` (Kotoba project library) |
+| `kotoba.tana` | `kotoba.tana/src` | `tana.aggregate`, `tana.member`, `tana.plan`, `tana.shard` (Kotoba project library) |
+| `kotoba.saifu` | `kotoba.saifu/src` | `saifu.address`, `saifu.policy`, `saifu.sign`, `saifu.tx` (Kotoba project library) |
+| `kotoba.wallet` | `kotoba.wallet/src` | `wallet.chain`, `wallet.chains`, `wallet.keystore`, `wallet.signer` (Kotoba project library) |
+| `kotoba.route` | `kotoba.route/src` | `route.browser`, `route.core`, `route.reagent` (Kotoba project library) |
+| `kotoba.release` | `kotoba.release/src` | `kotoba.release.admission`, `kotoba.release.cli`, `kotoba.release.tag` (Kotoba project library) |
+| `kotoba.providerTransport` | `kotoba.providerTransport/src` | `provider.tls-channel`, `provider.transport` (Kotoba project library) |
+| `kotoba.provider` | `kotoba.provider/src` | `provider.clock`, `provider.clock-transport`, `provider.conformance`, `provider.dataspace` (Kotoba project library) |
+| `kotoba.pricingOracle` | `kotoba.pricingOracle/src` | `pricing-oracle.core` (Kotoba project library) |
+| `kotoba.plm` | `kotoba.plm/src` | `kotoba.plm.app`, `kotoba.plm.core`, `kotoba.plm.cost`, `kotoba.plm.db` (Kotoba project library) |
+| `kotoba.paging` | `kotoba.paging/src` | `paging.core` (Kotoba project library) |
+| `kotoba.packageRegistryIpfs` | `kotoba.packageRegistryIpfs/src` | `kotoba.package-registry.ipfs` (Kotoba project library) |
+| `kotoba.p2p` | `kotoba.p2p/src` | `kotoba.p2p.graphsync`, `kotoba.p2p.graphsync-checkpoint-store`, `kotoba.p2p.graphsync-extension`, `kotoba.p2p.graphsync-prolly` (Kotoba project library) |
+| `kotoba.nostr` | `kotoba.nostr/src` | `nostr.blossom`, `nostr.crypto`, `nostr.event`, `nostr.http` (Kotoba project library) |
+| `kotoba.mokurokuUi` | `kotoba.mokurokuUi/src` | `mokuroku-ui.core` (Kotoba project library) |
+| `kotoba.traversal` | `kotoba.traversal/src` | `traversal.core` (Kotoba project library) |
+| `kotoba.perfgate` | `kotoba.perfgate/src` | `perfgate.core` (Kotoba project library) |
+| `kotoba.loopGameAutoplay` | `kotoba.loopGameAutoplay/src` | `loop-game-autoplay.env`, `loop-game-autoplay.policy`, `loop-game-autoplay.qualify`, `loop-game-autoplay.server` (Kotoba project library) |
+| `kotoba.layout` | `kotoba.layout/src` | `layout.core` (Kotoba project library) |
+| `kotoba.kuraNode` | `kotoba.kuraNode/src` | `kura.node.accounting`, `kura.node.async`, `kura.node.audit`, `kura.node.contract` (Kotoba project library) |
+| `kotoba.kuraBugyo` | `kotoba.kuraBugyo/src` | `kura.bugyo.budget`, `kura.bugyo.collateral`, `kura.bugyo.epoch`, `kura.bugyo.plane` (Kotoba project library) |
+| `kotoba.kura` | `kotoba.kura/src` | `kura.audit`, `kura.hash`, `kura.kotoba-oracle`, `kura.manifest` (Kotoba project library) |
+| `kotoba.kotobaseProtocolCore` | `kotoba.kotobaseProtocolCore/src` | `kotobase.protocols.blocks`, `kotobase.protocols.cid`, `kotobase.protocols.hash`, `kotobase.protocols.http` (Kotoba project library) |
+| `kotoba.kotobaseBrowserWorker` | `kotoba.kotobaseBrowserWorker/src` | `kotobase.browser-worker.browser`, `kotobase.browser-worker.idb` (Kotoba project library) |
+| `kotoba.kotobaSelfhostContracts` | `kotoba.kotobaSelfhostContracts/src` | `kotoba.selfhost.analyzer`, `kotoba.selfhost.contracts`, `kotoba.selfhost.oracle` (Kotoba project library) |
+| `kotoba.kotobaComponent` | `kotoba.kotobaComponent/src` | `kotoba.component.admission`, `kotoba.component.artifact`, `kotoba.component.composition`, `kotoba.component.core` (Kotoba project library) |
+| `kotoba.kotobaWasm` | `kotoba.kotobaWasm/src` | `kotoba.wasm.canonical-abi`, `kotoba.wasm.core`, `kotoba.wasm.tools`, `kotoba.wasm.typed` (Kotoba project library) |
+| `kotoba.kotobaAnnex` | `kotoba.kotobaAnnex/src` | `kotoba.annex.archive`, `kotoba.annex.cid`, `kotoba.annex.directory`, `kotoba.annex.grant` (Kotoba project library) |
+| `kotoba.kamiSensorSim` | `kotoba.kamiSensorSim/src` | `sensor-sim`, `sensor-sim.camera`, `sensor-sim.contact`, `sensor-sim.imu` (Kotoba project library) |
+| `kotoba.kamiSceneContracts` | `kotoba.kamiSceneContracts/src` | `kami.scene.authority-manifest`, `kami.scene.contracts`, `kami.scene.fixture-sync`, `kami.scene.mirror-check` (Kotoba project library) |
+| `kotoba.kamiOngakuProject` | `kotoba.kamiOngakuProject/src` | `kami.ongaku.project` (Kotoba project library) |
+| `kotoba.kamiMangakaExpression` | `kotoba.kamiMangakaExpression/src` | `kami.mangaka.expression` (Kotoba project library) |
 | `kotoba.kamiEngineSdk` | `kotoba.kamiEngineSdk/src` | `kami.avatar`, `kami.backend.browser`, `kami.backend.host`, `kami.benchmark` (Kotoba project library) |
 | `kotoba.kamiEngineCfd` | `kotoba.kamiEngineCfd/src` | `kami-cfd`, `kami-cfd.d3`, `kami-cfd.duct`, `kami-cfd.mesh` (Kotoba project library) |
 | `kotoba.kamiContracts` | `kotoba.kamiContracts/src` | `kami.app-fixtures`, `kami.app-state-machines`, `kami.component`, `kami.contracts.gpu` (Kotoba project library) |

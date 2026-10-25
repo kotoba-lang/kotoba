@@ -1,0 +1,193 @@
+;; Not a unit test — an EXECUTABLE end-to-end demo/test that must genuinely
+;; pass when run, matching kotoba-lang/dtn's
+;; test/kotoba/dtn/transport/tcp_demo.cljs precedent exactly: real sockets,
+;; real bytes, PASS/FAIL per scenario, a final "RESULT: N/M scenarios
+;; passed" line, process exit 0 iff all passed.
+;;
+;; Proves nostr.relay.transport's hand-rolled RFC 6455 WebSocket handshake
+;; and frame codec against a REAL client socket driving the REAL client
+;; side of the protocol (this test file's own minimal WS client, built on
+;; node:net + node:crypto — same zero-npm-dependency discipline as the
+;; server, and it deliberately reuses transport.cljs's own
+;; try-decode-frame/encode-frame primitives rather than a second
+;; hand-rolled parser, so a bug in decoding isn't independently duplicated
+;; and masked): scenario 1 connects, sends a client-MASKED EVENT text
+;; frame, and receives an OK text frame. Scenario 2 proves REQ live
+;; fan-out: a second connection subscribes, a first connection publishes a
+;; matching event, and the subscriber receives it as an unsolicited EVENT
+;; push — not just the static REQ/EOSE query path.
+;;
+;; Run from this repo's root:
+;;   kbb --backend sci --classpath "src:test:.deps/kotobase/src" test/nostr/relay_transport_test.cljk
+
+(ns nostr.relay-transport-test
+  (:require ["node:net" :as net]
+            ["node:crypto" :as ncrypto]
+            [kotoba.lang.text :as str]
+            [promesa.core :as p]
+            [nostr.fixtures :as fx]
+            [nostr.json :as json]
+            [nostr.relay.transport :as transport]))
+
+(defn- sleep-ms [ms]
+  (js/Promise. (fn [resolve _] (js/setTimeout resolve ms))))
+
+;; ---------------------------------------------------------------------------
+;; Minimal real WS client (test-only; separate from transport.cljs's server
+;; code, but reuses its frame codec functions directly rather than
+;; reimplementing them a second time).
+;; ---------------------------------------------------------------------------
+
+(defn- ws-connect
+  "Real TCP connect + real RFC 6455 client handshake (Sec-WebSocket-Key,
+  waits for the literal 101 response). Returns a Promise<socket>."
+  [port]
+  (js/Promise.
+   (fn [resolve reject]
+     (let [socket (net/createConnection #js {:host "127.0.0.1" :port port})
+           key (.toString (.randomBytes ncrypto 16) "base64")
+           handshake-buf (atom (js/Buffer.alloc 0))
+           handshake-done (atom false)]
+       (.on socket "connect"
+            (fn []
+              (.write socket
+                      (str "GET / HTTP/1.1\r\n"
+                           "Host: 127.0.0.1:" port "\r\n"
+                           "Upgrade: websocket\r\n"
+                           "Connection: Upgrade\r\n"
+                           "Sec-WebSocket-Key: " key "\r\n"
+                           "Sec-WebSocket-Version: 13\r\n\r\n"))))
+       (.on socket "data"
+            (fn [chunk]
+              (when-not @handshake-done
+                (swap! handshake-buf (fn [b] (js/Buffer.concat #js [b chunk])))
+                (let [text (.toString @handshake-buf "latin1")]
+                  (when (str/includes? text "\r\n\r\n")
+                    (reset! handshake-done true)
+                    (if (str/includes? text "101")
+                      (resolve socket)
+                      (reject (js/Error. (str "handshake failed: " text)))))))))
+       (.on socket "error" reject)))))
+
+(defn- mask-payload
+  "Client frames MUST be masked (RFC 6455 §5.1). Returns [mask-key-buf masked-payload-buf]."
+  [payload-buf]
+  (let [mask (.randomBytes ncrypto 4)
+        masked (js/Buffer.alloc (.-length payload-buf))]
+    (dotimes [i (.-length payload-buf)]
+      (.writeUInt8 masked
+                   (bit-xor (.readUInt8 payload-buf i) (.readUInt8 mask (mod i 4)))
+                   i))
+    [mask masked]))
+
+(defn- ws-client-send-text!
+  "Encode+send a REAL masked client text frame — deliberately NOT reusing
+  transport.cljs's encode-frame (that one is server-side/unmasked-only);
+  this is the genuine client-side masking path the server's unmask! must
+  correctly reverse."
+  [socket s]
+  (let [payload (js/Buffer.from s "utf8")
+        [mask-key masked] (mask-payload payload)
+        len (.-length masked)
+        b0 (bit-or 0x80 0x1) ;; FIN=1, opcode=text
+        len-byte-and-ext (cond
+                           (< len 126) (js/Buffer.from #js [(bit-or 0x80 len)]) ;; MASK bit + len
+                           (< len 65536) (let [b (js/Buffer.alloc 3)]
+                                           (.writeUInt8 b (bit-or 0x80 126) 0)
+                                           (.writeUInt16BE b len 1) b)
+                           :else (let [b (js/Buffer.alloc 9)]
+                                   (.writeUInt8 b (bit-or 0x80 127) 0)
+                                   (.writeBigUInt64BE b (js/BigInt len) 1) b))
+        frame (js/Buffer.concat #js [(js/Buffer.from #js [b0]) len-byte-and-ext mask-key masked])]
+    (.write socket frame)))
+
+(defn- collect-text-frames!
+  "Attach a data listener to `socket` that decodes complete (unmasked,
+  server->client) WS text frames via transport.cljs's OWN
+  try-decode-frame, appending each decoded JSON-parsed message to `out`
+  (an atom holding a vector)."
+  [socket out]
+  (let [buf-atom (atom (js/Buffer.alloc 0))]
+    (.on socket "data"
+         (fn [chunk]
+           (swap! buf-atom (fn [b] (js/Buffer.concat #js [b chunk])))
+           (loop []
+             (when-let [{:keys [opcode payload consumed]} (transport/try-decode-frame @buf-atom)]
+               (swap! buf-atom #(.slice % consumed))
+               (when (= opcode 0x1)
+                 (swap! out conj (json/parse (.toString payload "utf8"))))
+               (recur)))))))
+
+(defn- wait-for [pred-fn attempts interval-ms]
+  (p/let [ok? (pred-fn)]
+    (cond
+      ok? true
+      (<= attempts 0) false
+      :else (p/let [_ (sleep-ms interval-ms)] (wait-for pred-fn (dec attempts) interval-ms)))))
+
+;; ---------------------------------------------------------------------------
+;; Scenario 1 — real handshake + real masked EVENT frame -> real OK frame
+;; ---------------------------------------------------------------------------
+
+(defn- scenario-1 []
+  (println "\n--- Scenario 1: real WS handshake, client sends masked EVENT frame, receives OK ---")
+  (let [port 8901
+        node (transport/start-relay! {:port port})]
+    (p/let [socket (ws-connect port)
+            _ (println "  real RFC 6455 handshake completed (101 Switching Protocols received)")
+            received (atom [])
+            _ (collect-text-frames! socket received)
+            ev (fx/text-note fx/alice-sk "hello over a real masked WS frame")
+            _ (ws-client-send-text! socket (json/encode ["EVENT" ev]))
+            _ (wait-for #(p/resolved (seq @received)) 50 50)]
+      (let [msg (first @received)
+            pass? (and (= "OK" (first msg))
+                       (= (get ev "id") (second msg))
+                       (true? (nth msg 2)))]
+        (println "  received:" (pr-str msg))
+        (println (if pass? "PASS" "FAIL")
+                  " scenario 1: real client handshake + masked frame -> relay decoded/validated/stored the event and replied OK")
+        (.destroy socket)
+        (p/let [_ (transport/stop-relay! node)] pass?)))))
+
+;; ---------------------------------------------------------------------------
+;; Scenario 2 — REQ subscription + live fan-out on a second connection
+;; ---------------------------------------------------------------------------
+
+(defn- scenario-2 []
+  (println "\n--- Scenario 2: REQ subscription on connection A, live push when connection B publishes a matching EVENT ---")
+  (let [port 8902
+        node (transport/start-relay! {:port port})]
+    (p/let [sock-a (ws-connect port)
+            sock-b (ws-connect port)
+            received-a (atom [])
+            _ (collect-text-frames! sock-a received-a)
+            _ (ws-client-send-text! sock-a (json/encode ["REQ" "sub1" {"authors" [(fx/pubkey fx/bob-sk)]}]))
+            _ (wait-for #(p/resolved (some (fn [m] (= "EOSE" (first m))) @received-a)) 50 50)
+            _ (println "  connection A subscribed (REQ), got EOSE (no matching stored events yet)")
+            ev (fx/text-note fx/bob-sk "live-pushed message")
+            _ (ws-client-send-text! sock-b (json/encode ["EVENT" ev]))
+            _ (wait-for #(p/resolved (some (fn [m] (and (= "EVENT" (first m)) (= "sub1" (second m))))
+                                            @received-a))
+                        50 50)]
+      (let [pushed (some (fn [m] (and (= "EVENT" (first m)) (= "sub1" (second m)) m)) @received-a)
+            pass? (and (some? pushed) (= ev (nth pushed 2)))]
+        (println "  connection A received live push?" (some? pushed))
+        (println (if pass? "PASS" "FAIL")
+                  " scenario 2: REQ subscription on one real connection received a live EVENT published from a second real connection")
+        (.destroy sock-a) (.destroy sock-b)
+        (p/let [_ (transport/stop-relay! node)] pass?)))))
+
+;; ---------------------------------------------------------------------------
+;; Driver
+;; ---------------------------------------------------------------------------
+
+(-> (p/let [r1 (scenario-1)
+            r2 (scenario-2)]
+      (let [results [r1 r2]
+            passed (count (filter true? results))]
+        (println (str "\nRESULT: " passed "/2 scenarios passed"))
+        (js/process.exit (if (= passed 2) 0 1))))
+    (.catch (fn [e]
+              (println "DEMO CRASHED:" e)
+              (js/process.exit 1))))

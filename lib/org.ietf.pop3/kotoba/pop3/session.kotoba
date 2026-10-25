@@ -1,0 +1,806 @@
+;; Opening a POP3 maildrop and listing it, as a Kotoba application
+;; (ADR-2608261100). This is the vertical slice, not another judgement table:
+;; the contract is the one `examples/todo-app.kotoba` and
+;; `org-ietf-smtp/kotoba/smtp/session.kotoba` use —
+;;
+;;   init     (config)       -> state
+;;   step     (state, line)  -> state    ; one reply line in
+;;   closed   (state)        -> state    ; the host saw EOF
+;;   outgoing (state)        -> string   ; the inert effect out
+;;
+;; State is a `:document`, and so is the `config` handed to `init`: `:user`,
+;; `:has-password?`, `:has-access-token?`, `:uidl?`, and `:want`
+;; (`:list`, the default, or `:retrieve` with `:number`).
+;;
+;; **No credential reaches the guest.** `init` is told *whether* a password
+;; and a token exist, never what they are. The effect channel is a pair:
+;; `outgoing-kind` says what the host must write and `outgoing` carries the
+;; line when the guest can write it in full. Four kinds name a credential the
+;; host holds and the guest does not:
+;;
+;;   :line                     write `outgoing` verbatim
+;;   :none                     write nothing
+;;   :credential/pass          write `PASS <password>` CRLF
+;;   :credential/apop          write `APOP <user> <md5(stamp,secret)>` CRLF
+;;   :credential/sasl-plain    write base64(NUL user NUL password) CRLF
+;;   :credential/sasl-xoauth2  write base64(the XOAUTH2 blob) CRLF
+;;
+;; This is not a workaround, and it is not only about secrets being secret.
+;; The guest's product decision is *which mechanism a server's advertisement
+;; makes preferable, and what each reply means at each step*. Assembling
+;; `NUL user NUL password` is credential handling, which is exactly the
+;; ambient authority the `:authority` shielding axis names
+;; (adr-2608301500). The socket, TLS, STLS upgrade, base64 and MD5 are
+;; mechanism for the same reason.
+;;
+;; It also removes a byte this file cannot honestly contain. Measured
+;; 2026-08-30 on amu 88ae83e: the Kotoba reader has no `\uXXXX` escape —
+;; `"\u0000"` is rejected `:kotoba/source-read-failed`, and a **raw** NUL
+;; byte is accepted. So SASL PLAIN's separator could only have been written
+;; as a raw control byte, which is what the superproject's
+;; `verify-source-nul-bytes` detector reports and which makes `grep` answer
+;; about this file as though a word were absent. A guest that does not build
+;; credentials never needs the byte.
+;;
+;; What `+OK` and `-ERR` mean, when a multi-line response has ended, that a
+;; body line beginning `..` was stuffed, and that LIST and UIDL must be
+;; joined on the message number are product semantics and live here.
+;;
+;; The oracle is `pop3.client/connect!` + `authenticate!` + `list-messages!`,
+;; which carry four RFC rules this module reproduces:
+;;
+;;   * CAPA answering `-ERR` is not a failure (RFC 2449) — it means a plain
+;;     RFC 1939 server, so capabilities are empty and the session proceeds;
+;;   * UIDL is in RFC 1939's optional-commands section, so a server without
+;;     it yields listings with an absent `:uid`, not a failed listing;
+;;   * the message *number* does not survive the session and the UID does
+;;     (§7), so a listing that reports only numbers is not the same answer;
+;;   * a body line sent as `..` was byte-stuffed (§3) and must lose one dot.
+;;
+;; `throw` is not in the language (ADR-2608650000: permanent, and refined
+;; 2026-08-30 by adr-2608301500 to "no UNTRACKED control effects" — the
+;; ambient form stays rejected on every backend). The oracle's five
+;; `ex-info` sites become the `:failed` phase plus `error-text`. The messages
+;; are byte-identical to the oracle's so the parity test compares them
+;; directly.
+;;
+;; ## Two deliberate design decisions, both measured
+;;
+;; **One module, not four.** `org-ietf-smtp` split its slice across four
+;; namespaces and recorded the cost in its own header: the CLI's
+;; multi-module route reaches only `js-browser` (measured 2026-08-28 on amu
+;; 82c7e064 — `compile --module-lock … --target wasm32-browser` answers
+;; `:usage`). POP3's surface fits one file, so this compiles through the
+;; single-file route, which is JVM-free (`bin/amu`'s `nbbNativeTargets`
+;; covers `wasm32-browser`; project mode does not and fails closed under
+;; `--jvm-free`). Q9 forbids a JVM build dependency, so the single-module
+;; form is not a stylistic preference here. Removal: nothing to remove —
+;; when `compile --module-lock` accepts a non-JS target this file may split
+;; if it ever outgrows one module.
+;;
+;; **RETR passes bytes through; it does not hold them.** A retrieved message
+;; is bytes, and a `:document` cannot hold them. The bound that binds first
+;; is `:container-items 32`, so a guest collecting body lines traps
+;; `document-vector-too-large` on the 33rd line of an ordinary mail --
+;; measured, by making it accumulate and watching the control below fail
+;; with exactly that trap. (`:nodes 256` and `:aggregate-utf8-bytes 65536`
+;; are the other ceilings; 32 is the one a message meets first.) The principle
+;; ADR-2608039970 states for the datom plane applies here: bytes do not go
+;; through the value plane. So the guest owns *when the body starts, when
+;; the terminator ends it, and whether a line was stuffed* — and hands the
+;; host one unstuffed line at a time, keeping none of them:
+;;
+;;   body-state  :none -> :open -> :closed   ; the host opens and seals a buffer
+;;   body-line?                              ; did THIS step produce a line
+;;   body-line                               ; the line to append
+;;
+;; `retrieved-bytes` counts what went past, which is semantics (the caller
+;; asked for a message and is owed an answer about it) and costs one i64.
+;; The message itself is never a guest value. `session-carries-no-message-
+;; bytes` is the negative control: it drives a 2000-line body past every one
+;; of those bounds, which only completes because nothing here accumulates
+;; it.
+;;
+;; CAPA / LIST / UIDL are accumulated because they are bounded and
+;; structured — they are semantics, not payload.
+;;
+;; No regular expressions: the oracle's four `re-find` sites became
+;; positional scans (ADR-2608650000 decision 6 — redesign the scan, do not
+;; wait for the operation). `org-ietf-smtp/kotoba/smtp/protocol_response`
+;; is the precedent.
+;;
+;; `.cljc` remains the oracle and is not required from here (require-graph).
+;;
+;; ## Type annotations: 25 of the 217 this file used to carry
+;;
+;; They were written when an absent annotation meant `:i64`, so anything
+;; touching a string or a document had to say so. The frontend now infers a
+;; parameter's type from what its body requires and a result's from what its
+;; body returns, and 192 of the 217 said nothing it did not already know.
+;;
+;; Established by measurement, not by reading: each annotation was removed
+;; one at a time and the removal kept only when the whole module's signature
+;; map -- 83 functions, every parameter type and every result -- came back
+;; identical. The emitted wasm32 is byte-identical either way.
+;;
+;; The 25 that stayed were measured too: removing any one of them alone is
+;; refused. Three reasons, and only the first is about this file.
+;;
+;;   * A function whose result feeds its own recursive call has no result to
+;;     infer from until it has one. Eleven of these -- `trim-right`,
+;;     `i64->string`, `ci-eq-from?`, `ci-has-token?`, `stamp-from`,
+;;     `capa-sasl`, `capa-has?`, `uid-for`, `scan-listing`, `uidl-listing`,
+;;     `join-uids`. Without the annotation the checker answers `if branches
+;;     must have the same value type`.
+;;
+;;   * `dg`'s key. `document-get` takes a keyword OR a document, so nothing
+;;     in the body pins `k` and the callers' keywords meet a provisional
+;;     `:i64`.
+;;
+;;   * The rest are the frontend's shape, not this file's. Parameters are
+;;     inferred before results (`frontend.cljc`: "Parameters before
+;;     results"), a body's inference stops at its first unresolved form, and
+;;     only a complaint naming a bare parameter drives a refinement -- so a
+;;     parameter whose requirement lies past a call to a still-unannotated
+;;     helper is never reached. Result inference is two passes, which is one
+;;     short for `on-status` and `step`: a six-pass copy of the same frontend
+;;     infers both. Re-measure these when the frontend moves; they are the
+;;     annotations most likely to stop being necessary.
+;;
+;; Compile (the CLI needs -M, an ABSOLUTE path, `--output`, and the
+;; `wasm32-browser` / `js-browser` target names — ADR-2608262000):
+;;   kotoba -M compile /ABS/kotoba/pop3/session.kotoba \
+;;     --target wasm32-browser --output session.wasm
+;;
+;; Measured 2026-08-30 on amu 88ae83e, both without a JDK on PATH:
+;;   amu check   … --jvm-free                     -> :ok true, :effects #{}
+;;   amu compile … --jvm-free --target wasm32-browser
+;;                                                -> 12554-byte .wasm
+;; Those are observations of one build, not a contract; re-measure rather
+;; than quoting them.
+
+(ns pop3.session
+  (:export [init step closed
+            phase outgoing outgoing-kind error-text
+            body-state body-line? body-line retrieved-bytes
+            apop-timestamp
+            message-count message-number-at message-size-at message-uid-at
+            drop-count drop-size
+            supports? sasl-plain? sasl-xoauth2?]))
+
+;; --- document accessors ---------------------------------------------------
+
+(defn- dg [d k :keyword]
+  (option-value-of [:option :document] (document-get d k) (document-null)))
+
+(defn- ds [d k]
+  (option-value-of [:option :string] (document-string-value (dg d k)) ""))
+
+(defn- di [d k]
+  (option-value-of [:option :i64] (document-i64-value (dg d k)) -1))
+
+(defn- dk [d k]
+  (option-value-of [:option :keyword] (document-keyword-value (dg d k)) :none))
+
+(defn- db [d k]
+  (option-value-of [:option :bool] (document-bool-value (dg d k)) false))
+
+(defn- at [v i]
+  (option-value-of [:option :document] (document-vector-at v i) (document-null)))
+
+(defn- at-str [v i]
+  (option-value-of [:option :string] (document-string-value (at v i)) ""))
+
+;; --- byte scanning --------------------------------------------------------
+;; `string-substring` indexes are checked UTF-8 byte boundaries, and POP3's
+;; wire grammar (RFC 1939 §3) is US-ASCII, so byte offsets are the right
+;; unit for the scans below. Message *text* is not scanned here at all.
+
+(defn- space? [c] (or (= c 32) (= c 9)))
+
+(defn- digit? [c] (and (>= c 48) (<= c 57)))
+
+(defn- at-byte [s i]
+  (if (< i (string-byte-length s)) (string-code-point-at s i) -1))
+
+(defn- starts-with? [s prefix]
+  (let [n (string-byte-length prefix)]
+    (if (> n (string-byte-length s))
+      false
+      (string=? (string-substring s 0 n) prefix))))
+
+(defn- skip-spaces [s i]
+  (if (space? (at-byte s i)) (skip-spaces s (+ i 1)) i))
+
+(defn- skip-token [s i]
+  (let [c (at-byte s i)]
+    (if (or (= c -1) (space? c)) i (skip-token s (+ i 1)))))
+
+(defn- trim-right [s n] :string
+  (cond
+    (<= n 0) ""
+    (space? (at-byte s (- n 1))) (trim-right s (- n 1))
+    :else (string-substring s 0 n)))
+
+;; Trim both ends. The oracle calls `str/trim`; POP3 status text routinely
+;; arrives with a trailing CR the host's line reader did not strip.
+(defn- trim [s]
+  (let [i (skip-spaces s 0)]
+    (trim-right (string-substring s i (string-byte-length s))
+                (- (string-byte-length s) i))))
+
+;; Digits at `i`, or -1 when there is no digit there. -1 rather than an
+;; option because every caller here treats "no number" as "not a listing
+;; line" and skips it, which is what the oracle's `keep` does.
+(defn- read-i64 [s i acc]
+  (let [c (at-byte s i)]
+    (cond
+      (digit? c) (read-i64 s (+ i 1) (+ (* (if (< acc 0) 0 acc) 10) (- c 48)))
+      :else acc)))
+
+(defn- parse-i64-at [s i]
+  (if (digit? (at-byte s i)) (read-i64 s i -1) -1))
+
+;; --- integers to text -----------------------------------------------------
+;; `RETR <n>` puts a number on the wire and there is no integer-to-string
+;; builtin, so the digits come out of a literal — the same way
+;; `examples/todo-app.kotoba` reads its counter. `rem` is spelled as a
+;; subtraction because `max` is in `:admitted-builtins` and still has no
+;; lowering (measured 2026-08-30), and one such surprise per file is enough.
+;;
+;; This is the second copy of these four lines in the workspace
+;; (`org-ietf-imap` has the first). They cannot be shared: the only linking
+;; route is the project route, which the CLI runs on the JVM, which Q9
+;; forbids — see adr-2608302100 for the measurement and the removal
+;; conditions.
+
+(defn- digit-char [n]
+  (string-substring "0123456789" n (+ n 1)))
+
+(defn- i64->string [n] :string
+  (if (< n 10)
+    (digit-char n)
+    (string-concat (i64->string (quot n 10))
+                   (digit-char (- n (* (quot n 10) 10))))))
+
+;; --- ASCII case folding ---------------------------------------------------
+;; RFC 2449 §5 makes capability names case-insensitive, and comparing them
+;; literally works against one server and not the next. The oracle
+;; upper-cases both sides into a map; there is no code-point-to-string
+;; builtin in the guest, so this compares without constructing a string —
+;; which is the same decision and one allocation fewer.
+
+(defn- fold [c] (if (and (>= c 97) (<= c 122)) (- c 32) c))
+
+(defn- ci-eq-from? [a ai b bi n] :bool
+  (cond
+    (<= n 0) true
+    (not (= (fold (at-byte a ai)) (fold (at-byte b bi)))) false
+    :else (ci-eq-from? a (+ ai 1) b (+ bi 1) (- n 1))))
+
+;; Is the whitespace-delimited token starting at `ai` equal to `b`, ignoring
+;; ASCII case?
+(defn- ci-token=? [a ai b]
+  (let [end (skip-token a ai)]
+    (and (= (- end ai) (string-byte-length b))
+         (ci-eq-from? a ai b 0 (string-byte-length b)))))
+
+;; Does any whitespace-delimited token of `s` from `i` equal `b`?
+(defn- ci-has-token? [s i b] :bool
+  (let [start (skip-spaces s i)]
+    (cond
+      (= (at-byte s start) -1) false
+      (ci-token=? s start b) true
+      :else (ci-has-token? s (skip-token s start) b))))
+
+;; --- status lines (RFC 1939 §3) -------------------------------------------
+;; POP3 has exactly two status indicators and no numeric codes; that is the
+;; whole of its error model.
+
+(defn- ok-line? [line] (starts-with? line "+OK"))
+
+(defn- err-line? [line] (starts-with? line "-ERR"))
+
+(defn- status-line? [line] (or (ok-line? line) (err-line? line)))
+
+(defn- status-text [line]
+  (cond
+    (ok-line? line) (trim (string-substring line 3 (string-byte-length line)))
+    (err-line? line) (trim (string-substring line 4 (string-byte-length line)))
+    :else ""))
+
+(defn- terminator? [line] (string=? line "."))
+
+;; RFC 1939 §3 byte-stuffing, undone. A client that does not remove the extra
+;; dot corrupts every message containing a line starting with a period —
+;; which is rarer than it sounds and therefore worse.
+(defn- unstuff [line]
+  (if (starts-with? line "..")
+    (string-substring line 1 (string-byte-length line))
+    line))
+
+;; The `<process.clock@host>` a greeting carries when the server offers APOP
+;; (RFC 1939 §7). Its presence in the greeting is APOP's ONLY advertisement —
+;; there is no capability for it — so a client that discards the greeting
+;; cannot know the option exists.
+(defn- stamp-end [s i]
+  (let [c (at-byte s i)]
+    (cond (= c -1) -1
+          (= c 62) i
+          :else (stamp-end s (+ i 1)))))
+
+(defn- stamp-from [s i] :string
+  (let [c (at-byte s i)]
+    (cond
+      (= c -1) ""
+      (= c 60) (let [e (stamp-end s (+ i 1))]
+                 (if (< e 0) "" (string-substring s i (+ e 1))))
+      :else (stamp-from s (+ i 1)))))
+
+;; --- commands (RFC 1939 §5, RFC 2449, RFC 5034) ---------------------------
+
+(defn- line1 [verb] (string-concat verb "\r\n"))
+
+(defn- line2 [verb :string arg]
+  (string-concat verb (string-concat " " (line1 arg))))
+
+;; --- state constructors ---------------------------------------------------
+
+(defn init [config]
+  (document-map :phase (document-keyword :greeting)
+                :user (document-string (ds config :user))
+                :has-password (document-bool (db config :has-password?))
+                :has-token (document-bool (db config :has-access-token?))
+                :uidl-wanted (document-bool
+                              (option-value-of [:option :bool]
+                                               (document-bool-value (dg config :uidl?))
+                                               true))
+                :want (document-keyword
+                       (option-value-of [:option :keyword]
+                                        (document-keyword-value (dg config :want))
+                                        :list))
+                :number (document-i64
+                         (option-value-of [:option :i64]
+                                          (document-i64-value (dg config :number))
+                                          0))
+                :body-state (document-keyword :none)
+                :body-line (document-string "")
+                :has-body-line (document-bool false)
+                :retrieved (document-i64 0)
+                :apop-stamp (document-string "")
+                :sasl (document-string "")
+                :capa (document-vector)
+                :messages (document-vector)
+                :uids (document-vector)
+                :drop-count (document-i64 0)
+                :drop-size (document-i64 0)
+                :acc (document-vector)
+                :out (document-string "")
+                :out-kind (document-keyword :none)
+                :error (document-string "")))
+
+;; `body-line?` exists because "" is a line a message can contain: RFC 2822
+;; separates headers from body with an empty one. A channel that signalled
+;; "no line this step" by returning "" would merge the headers into the body
+;; of every message -- which the parity test caught on the first run, and
+;; which no amount of staring at `body-line` alone would have shown.
+(defn- clear-body [state]
+  (document-assoc (document-assoc state :body-line (document-string ""))
+                  :has-body-line (document-bool false)))
+
+(defn- quiet [state]
+  (clear-body
+   (document-assoc (document-assoc state :out (document-string ""))
+                   :out-kind (document-keyword :none))))
+
+(defn- send-line [state next-phase line]
+  (clear-body
+   (document-assoc
+    (document-assoc
+     (document-assoc state :phase (document-keyword next-phase))
+     :out (document-string line))
+    :out-kind (document-keyword :line))))
+
+;; The guest names a credential it does not hold. `outgoing` stays "" — the
+;; host owns the secret, the base64 (RFC 5034) and the MD5 (RFC 1939 §7).
+(defn- send-credential [state next-phase kind]
+  (clear-body
+   (document-assoc
+    (document-assoc
+     (document-assoc state :phase (document-keyword next-phase))
+     :out (document-string ""))
+    :out-kind (document-keyword kind))))
+
+(defn- fail [state message]
+  (clear-body
+   (document-assoc
+    (document-assoc
+     (document-assoc
+      (document-assoc state :phase (document-keyword :failed))
+      :error (document-string message))
+     :out (document-string ""))
+    :out-kind (document-keyword :none))))
+
+;; --- accumulating a multi-line response -----------------------------------
+
+(defn- reset-acc [state]
+  (document-assoc state :acc (document-vector)))
+
+(defn- push-acc [state line]
+  (document-assoc state :acc
+                  (document-vector-conj (dg state :acc)
+                                        (document-string (unstuff line)))))
+
+;; --- capabilities (RFC 2449) ----------------------------------------------
+;; The oracle builds an upper-cased map. What the session actually decides
+;; from it is which mechanism to use, so the capability lines are kept as
+;; given and asked case-insensitive questions. `sasl` is the SASL line's
+;; argument list, which is the one capability whose *value* matters.
+
+(defn- capa-sasl [acc i] :string
+  (cond
+    (>= i (document-count acc)) ""
+    (ci-token=? (at-str acc i) (skip-spaces (at-str acc i) 0) "SASL")
+    (let [line (at-str acc i)]
+      (string-substring line
+                        (skip-spaces line (skip-token line (skip-spaces line 0)))
+                        (string-byte-length line)))
+    :else (capa-sasl acc (+ i 1))))
+
+(defn- capa-has? [acc i name :string] :bool
+  (cond
+    (>= i (document-count acc)) false
+    (ci-token=? (at-str acc i) (skip-spaces (at-str acc i) 0) name) true
+    :else (capa-has? acc (+ i 1) name)))
+
+;; --- listings (RFC 1939 §5, §7) -------------------------------------------
+;; `+OK 2 320` -> count and size; `1 120` -> number and size; `1 whqtswO00`
+;; -> number and UID. The oracle reaches for `re-find` three times; these are
+;; the same three grammars read positionally.
+
+(defn- stat-count [line]
+  (parse-i64-at line (skip-spaces line 3)))
+
+(defn- stat-size [line]
+  (let [i (skip-spaces line 3)]
+    (parse-i64-at line (skip-spaces line (skip-token line i)))))
+
+(defn- listing-number [line]
+  (parse-i64-at line (skip-spaces line 0)))
+
+(defn- listing-second-i64 [line]
+  (let [i (skip-spaces line 0)]
+    (parse-i64-at line (skip-spaces line (skip-token line i)))))
+
+(defn- listing-second-token [line]
+  (let [i (skip-spaces line 0)
+        s (skip-spaces line (skip-token line i))]
+    (string-substring line s (skip-token line s))))
+
+;; LIST body -> [{:number :size}]. A line without a leading number is skipped,
+;; which is what the oracle's `keep` does.
+(defn- scan-listing [acc i out :document] :document
+  (if (>= i (document-count acc))
+    out
+    (let [line (at-str acc i)
+          n (listing-number line)]
+      (scan-listing acc (+ i 1)
+                    (if (< n 0)
+                      out
+                      (document-vector-conj
+                       out
+                       (document-map :number (document-i64 n)
+                                     :size (document-i64 (listing-second-i64 line))
+                                     :uid (document-string ""))))))))
+
+(defn- uidl-listing [acc i out :document] :document
+  (if (>= i (document-count acc))
+    out
+    (let [line (at-str acc i)
+          n (listing-number line)]
+      (uidl-listing acc (+ i 1)
+                    (if (< n 0)
+                      out
+                      (document-vector-conj
+                       out
+                       (document-map :number (document-i64 n)
+                                     :uid (document-string
+                                           (listing-second-token line)))))))))
+
+;; The join RFC 1939 §7 makes necessary. LIST gives sizes against numbers
+;; that do not survive the session; UIDL gives the identifier that does.
+;; Neither alone is the answer a caller can cache.
+(defn- uid-for [uids i number] :string
+  (cond
+    (>= i (document-count uids)) ""
+    (= (di (at uids i) :number) number) (ds (at uids i) :uid)
+    :else (uid-for uids (+ i 1) number)))
+
+(defn- join-uids [msgs uids :document i out :document] :document
+  (if (>= i (document-count msgs))
+    out
+    (join-uids msgs uids (+ i 1)
+               (document-vector-conj
+                out
+                (document-assoc (at msgs i) :uid
+                                (document-string
+                                 (uid-for uids 0 (di (at msgs i) :number))))))))
+
+;; --- choosing an authentication mechanism ---------------------------------
+;; XOAUTH2 when a token exists, then SASL PLAIN, then APOP where the greeting
+;; offered it, then USER/PASS. This is the one decision in the session that is
+;; not forced by the wire: it is why a mailbox already covered by an OAuth
+;; grant does not need an app password. The guest picks; the host supplies the
+;; secret the pick names.
+
+(defn- begin-auth [state]
+  (let [sasl (ds state :sasl)
+        pass (db state :has-password)
+        token (db state :has-token)]
+    (cond
+      (and token (ci-has-token? sasl 0 "XOAUTH2"))
+      (send-line state :auth-xoauth2-init (line2 "AUTH" "XOAUTH2"))
+
+      (and pass (ci-has-token? sasl 0 "PLAIN"))
+      (send-line state :auth-plain-init (line2 "AUTH" "PLAIN"))
+
+      ;; APOP digests MD5 over the greeting stamp and the secret. Choosing it
+      ;; is the decision; `apop-timestamp` tells the host what to digest.
+      (and pass (not (string=? (ds state :apop-stamp) "")))
+      (send-credential state :apop :credential/apop)
+
+      pass (send-line state :user (line2 "USER" (ds state :user)))
+
+      :else (fail state "POP3 の認証情報がありません。"))))
+
+;; --- after authentication -------------------------------------------------
+
+(defn- begin-stat [state]
+  (send-line state :stat (line1 "STAT")))
+
+(defn- begin-list [state]
+  (send-line (reset-acc state) :list (line1 "LIST")))
+
+;; RETR is the other half of what a POP3 client is for. The number goes on
+;; the wire; the message that comes back does not come in here.
+(defn- begin-retr [state]
+  (send-line state :retr
+             (line2 "RETR" (i64->string (di state :number)))))
+
+(defn- begin-work [state]
+  (if (= (dk state :want) :retrieve)
+    (begin-retr state)
+    (begin-list state)))
+
+(defn- after-list [state]
+  (let [msgs (scan-listing (dg state :acc) 0 (document-vector))
+        kept (document-assoc state :messages msgs)]
+    (if (db state :uidl-wanted)
+      (send-line (reset-acc kept) :uidl (line1 "UIDL"))
+      (send-line kept :quit (line1 "QUIT")))))
+
+(defn- after-uidl [state]
+  (let [uids (uidl-listing (dg state :acc) 0 (document-vector))]
+    (send-line
+     (document-assoc (document-assoc state :uids uids)
+                     :messages (join-uids (dg state :messages) uids 0 (document-vector)))
+     :quit (line1 "QUIT"))))
+
+;; --- transitions ----------------------------------------------------------
+
+(defn- on-status [state line] :document
+  (let [p (dk state :phase)
+        ok (ok-line? line)
+        text (status-text line)]
+    (cond
+      (= p :greeting)
+      (if ok
+        (send-line (document-assoc state :apop-stamp
+                                   (document-string (stamp-from line 0)))
+                   :capa (line1 "CAPA"))
+        (fail state "POP3 greeting was not +OK"))
+
+      ;; RFC 2449: a server without CAPA answers -ERR, and that is not a
+      ;; failure worth unwinding a session over.
+      (= p :capa)
+      (if ok (quiet (document-assoc state :phase (document-keyword :capa-body)))
+          (begin-auth state))
+
+      ;; RFC 5034: the success line and the continuation both begin with
+      ;; `+` — `+OK` against a bare `+ ` — so success is tested first.
+      ;; Testing the `+` prefix first sends the credentials a second time,
+      ;; in answer to the server saying they were accepted, and then blocks
+      ;; on a reply that is never coming.
+      (= p :auth-plain-init)
+      (cond
+        ok (begin-stat state)
+        (err-line? line)
+        (fail state (string-concat "POP3 AUTH PLAIN failed: " text))
+        (starts-with? line "+")
+        (send-credential state :auth-plain-payload :credential/sasl-plain)
+        :else (quiet state))
+
+      (= p :auth-xoauth2-init)
+      (cond
+        ok (begin-stat state)
+        (err-line? line)
+        (fail state (string-concat "POP3 AUTH XOAUTH2 failed: " text))
+        (starts-with? line "+")
+        (send-credential state :auth-xoauth2-payload :credential/sasl-xoauth2)
+        :else (quiet state))
+
+      (= p :auth-plain-payload)
+      (cond
+        ok (begin-stat state)
+        (err-line? line) (fail state (string-concat "POP3 AUTH PLAIN failed: " text))
+        :else (quiet state))
+
+      (= p :auth-xoauth2-payload)
+      (cond
+        ok (begin-stat state)
+        (err-line? line) (fail state (string-concat "POP3 AUTH XOAUTH2 failed: " text))
+        :else (quiet state))
+
+      (= p :apop)
+      (if ok (begin-stat state)
+          (fail state (string-concat "POP3 APOP failed: " text)))
+
+      (= p :user)
+      (if ok (send-credential state :pass :credential/pass)
+          (fail state (string-concat "POP3 USER failed: " text)))
+
+      (= p :pass)
+      (if ok (begin-stat state)
+          (fail state (string-concat "POP3 PASS failed: " text)))
+
+      (= p :stat)
+      (if ok
+        (begin-work
+         (document-assoc
+          (document-assoc state :drop-count (document-i64 (let [v (stat-count line)] (if (< v 0) 0 v))))
+          :drop-size (document-i64 (let [v (stat-size line)] (if (< v 0) 0 v)))))
+        (fail state (string-concat "POP3 STAT failed: " text)))
+
+      (= p :list)
+      (if ok (quiet (document-assoc state :phase (document-keyword :list-body)))
+          (fail state (string-concat "POP3 LIST failed: " text)))
+
+      ;; RFC 1939 §3 sends the body only on success, so reading for a
+      ;; terminator after -ERR waits for a line that is never coming.
+      (= p :retr)
+      (if ok
+        (quiet (document-assoc
+                (document-assoc state :phase (document-keyword :retr-body))
+                :body-state (document-keyword :open)))
+        (fail state (string-concat "POP3 RETR failed: " text)))
+
+      ;; UIDL is optional (RFC 1939 §7). Its absence leaves the caller with
+      ;; numbers only, which is an absent :uid rather than a failed listing.
+      (= p :uidl)
+      (if ok (quiet (document-assoc state :phase (document-keyword :uidl-body)))
+          (send-line state :quit (line1 "QUIT")))
+
+      ;; QUIT moves the server into UPDATE state and releases the maildrop
+      ;; lock. The oracle swallows a failed QUIT because the transport closes
+      ;; either way; so does this.
+      (= p :quit) (quiet (document-assoc state :phase (document-keyword :done)))
+
+      :else (quiet state))))
+
+(defn- on-body [state line :string]
+  (let [p (dk state :phase)]
+    (cond
+      ;; The message is handed over one unstuffed line at a time and kept
+      ;; nowhere. Only the count survives in the guest.
+      (and (= p :retr-body) (not (terminator? line)))
+      (document-assoc
+       (document-assoc
+        (document-assoc
+         (document-assoc (quiet state) :body-line (document-string (unstuff line)))
+         :has-body-line (document-bool true))
+        :retrieved (document-i64 (+ (di state :retrieved) 1)))
+       :body-state (document-keyword :open))
+
+      (= p :retr-body)
+      (send-line (document-assoc state :body-state (document-keyword :closed))
+                 :quit (line1 "QUIT"))
+
+      (not (terminator? line)) (quiet (push-acc state line))
+
+      (= p :capa-body)
+      (begin-auth
+       (document-assoc
+        (document-assoc state :capa (dg state :acc))
+        :sasl (document-string (capa-sasl (dg state :acc) 0))))
+
+      (= p :list-body) (after-list state)
+      (= p :uidl-body) (after-uidl state)
+      :else (quiet state))))
+
+(defn- body-phase? [p :keyword]
+  (or (= p :capa-body)
+      (or (= p :list-body) (or (= p :uidl-body) (= p :retr-body)))))
+
+;; RFC 5034's AUTH exchange is not made of status lines: the server's
+;; request for the initial response is a bare `+`. Applying the status-line
+;; grammar to it reports a protocol violation on a conforming server.
+(defn- auth-phase? [p :keyword]
+  (or (or (= p :auth-plain-init) (= p :auth-xoauth2-init))
+      (or (= p :auth-plain-payload) (= p :auth-xoauth2-payload))))
+
+(defn step [state line :string] :document
+  (let [p (dk state :phase)]
+    (cond
+      (= p :done) (quiet state)
+      (= p :failed) (quiet state)
+      (body-phase? p) (on-body state line)
+      (auth-phase? p) (on-status state line)
+      (not (status-line? line)) (fail state "unparseable POP3 status line")
+      :else (on-status state line))))
+
+;; EOF mid-response. The oracle throws "POP3 connection closed mid-response";
+;; a closed socket is a host fact, so the host reports it and the guest owns
+;; what it means for the session.
+(defn closed [state]
+  (let [p (dk state :phase)]
+    (cond
+      (= p :done) (quiet state)
+      (= p :failed) (quiet state)
+      :else (fail state "POP3 connection closed mid-response"))))
+
+;; --- projections ----------------------------------------------------------
+
+(defn phase [state] (dk state :phase))
+
+(defn outgoing [state] (ds state :out))
+
+(defn outgoing-kind [state] (dk state :out-kind))
+
+(defn error-text [state] (ds state :error))
+
+;; :none -> :open -> :closed. The host opens a buffer on :open, appends every
+;; non-empty `body-line`, and seals it on :closed. Nothing here holds the
+;; message.
+(defn body-state [state] (dk state :body-state))
+
+;; Did this step produce a body line? Ask before reading `body-line`: ""
+;; is a line a message can contain (RFC 2822's header/body separator), so
+;; the emptiness of the string cannot carry "there was none".
+(defn body-line? [state] (db state :has-body-line))
+
+;; The unstuffed line the host should append. Valid only for the step that
+;; produced it, and only when `body-line?`.
+(defn body-line [state] (ds state :body-line))
+
+;; How many body lines went past. The caller asked for a message and is owed
+;; an answer about it; that answer costs one i64, not the message.
+(defn retrieved-bytes [state] (di state :retrieved))
+
+(defn apop-timestamp [state] (ds state :apop-stamp))
+
+(defn drop-count [state] (di state :drop-count))
+
+(defn drop-size [state] (di state :drop-size))
+
+(defn message-count [state]
+  (document-count (dg state :messages)))
+
+(defn message-number-at [state i]
+  (di (at (dg state :messages) i) :number))
+
+(defn message-size-at [state i]
+  (di (at (dg state :messages) i) :size))
+
+;; "" where the oracle answers nil: the guest has no nil, and a server
+;; without UIDL is the ordinary case, not an error.
+(defn message-uid-at [state i]
+  (ds (at (dg state :messages) i) :uid))
+
+(defn supports? [state name :string]
+  (capa-has? (dg state :capa) 0 name))
+
+(defn sasl-plain? [state]
+  (ci-has-token? (ds state :sasl) 0 "PLAIN"))
+
+(defn sasl-xoauth2? [state]
+  (ci-has-token? (ds state :sasl) 0 "XOAUTH2"))

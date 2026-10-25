@@ -1,0 +1,122 @@
+(ns kotoba.wasm-document-bytes-link-test
+  "The :bytes and :link document kinds on the typed Wasm profile (root
+  ADR-2610092310 S3). Before this, each of document-bytes,
+  document-bytes-value, document-link and document-link-value was refused
+  `typed Wasm operation is not qualified`.
+
+  A document is a host value, so each operation is one `kotoba:typed`
+  intrinsic: the guest passes the document descriptor, the bytes descriptor
+  and the operand, and the host (amu runtime/browser-host.mjs) builds the
+  document or the option. Pinned here:
+  - each operation lowers, the module validates, and the module imports that
+    operation's intrinsic;
+  - the four intrinsics are imported only by a module that uses one of them,
+    so a host that predates them still runs every other document module;
+  - the operands reach the host in order: document descriptor, bytes
+    descriptor, value -- each descriptor the sealed index of its type.
+
+  The semantics (canonical bytes, sha256, CIDv1 boundaries, none for the other
+  kind) live in the host and are measured end to end through amu."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.wasm.core :as wasm]
+            [kotoba.wasm.typed :as typed]
+            [kotoba.wasm.tools :as wasm-tools]))
+
+(def ^:private payload-imports
+  #{"document-bytes" "document-bytes-value" "document-link" "document-link-value"})
+
+(defn- validation-error
+  "nil when `module` validates, otherwise the validator's sentence."
+  [module]
+  #?(:clj
+     (let [file (java.io.File/createTempFile "kotoba-document-bytes-link-" ".wasm")]
+       (try
+         (with-open [out (java.io.FileOutputStream. file)] (.write out ^bytes module))
+         (try (wasm-tools/run-command! ["wasm-tools" "validate" (str file)]) nil
+              (catch clojure.lang.ExceptionInfo error
+                (or (:output (ex-data error)) (ex-message error))))
+         (finally (.delete file))))
+     :cljs
+     (when-not (js/WebAssembly.validate module)
+       (try (js/WebAssembly.Module. module) "refused without a message"
+            (catch :default error (.-message error))))))
+
+(defn- emitted [kir]
+  (try (wasm/emit kir :wasm32-browser-kotoba-v1 {:fuel 512})
+       (catch :default error
+         {:refused (ex-message error) :data (ex-data error)})))
+
+(defn- module-of [body param-types result]
+  {:format :kotoba.kir/v4
+   :exports ['call]
+   :schemas {}
+   :effects #{}
+   :functions [{:name 'call :params (vec (take (count param-types) '[a b c d]))
+                :param-types param-types :result result :body body}]})
+
+(def ^:private cases
+  [["document-bytes" '(document-bytes a) [:bytes] :document]
+   ["document-link" '(document-link a) [:bytes] [:option :document]]
+   ["document-bytes-value" '(document-bytes-value a) [:document] [:option :bytes]]
+   ["document-link-value" '(document-link-value a) [:document] [:option :bytes]]])
+
+(defn- import-names [module]
+  #?(:clj (let [text (String. ^bytes module "ISO-8859-1")]
+            (set (filter #(.contains text (str "kotoba:typed" (char (count %)) %))
+                         (conj payload-imports "document-null"))))
+     :cljs (set (map #(.-name %) (js/WebAssembly.Module.imports
+                                  (js/WebAssembly.Module. module))))))
+
+(deftest the-four-operations-lower-and-validate
+  (doseq [[import body param-types result] cases]
+    (testing import
+      (let [module (emitted (module-of body param-types result))]
+        (is (not (map? module)) (str "emit refused: " (:refused module)))
+        (when-not (map? module)
+          (is (nil? (validation-error module)))
+          (is (contains? (import-names module) import)
+              "the operation's intrinsic is imported")
+          (is (= payload-imports (into #{} (filter payload-imports) (import-names module)))
+              "with its three siblings, as one conditional block"))))))
+
+(deftest the-intrinsics-are-imported-only-when-used
+  (let [module (emitted (module-of '(document-sha256 (document-null)) [] :string))]
+    (is (not (map? module)) (str "emit refused: " (:refused module)))
+    (when-not (map? module)
+      (is (nil? (validation-error module)))
+      (is (contains? (import-names module) "document-null"))
+      (is (empty? (filter payload-imports (import-names module)))
+          "an existing document module asks its host for none of the four"))))
+
+(deftest the-operations-are-typed
+  (is (= :document (typed/infer-type '(document-bytes a) {'a :bytes} {})))
+  (is (= [:option :document] (typed/infer-type '(document-link a) {'a :bytes} {})))
+  (is (= [:option :bytes] (typed/infer-type '(document-bytes-value a) {'a :document} {})))
+  (is (= [:option :bytes] (typed/infer-type '(document-link-value a) {'a :document} {}))))
+
+#?(:cljs
+   (deftest operands-reach-the-host-in-order
+     (doseq [[import body param-types result] cases]
+       (testing import
+         (let [kir (module-of body param-types result)
+               indices (typed/descriptor-indices kir)
+               module (js/WebAssembly.Module. (emitted kir))
+               calls #js []
+               imports (js-obj)]
+           (doseq [entry (js/WebAssembly.Module.imports module)]
+             (let [table (or (aget imports (.-module entry))
+                             (let [t (js-obj)] (aset imports (.-module entry) t) t))
+                   field (.-name entry)]
+               (aset table field
+                     (if (contains? payload-imports field)
+                       (fn [document-descriptor bytes-descriptor value]
+                         (.push calls #js [field document-descriptor bytes-descriptor value])
+                         #js ["answer"])
+                       (fn [& args] (if (= field "assert-ref") (second args) (first args)))))))
+           (let [call (.-call (.-exports (js/WebAssembly.Instance. module imports)))
+                 operand #js ["operand"]]
+             (call operand)
+             (is (= [[import (get indices :document) (get indices :bytes)]]
+                    (mapv (fn [c] (vec (take 3 c))) (js->clj calls))))
+             (is (identical? operand (aget (aget calls 0) 3)) "the value is passed through"))))))
+   :clj nil)

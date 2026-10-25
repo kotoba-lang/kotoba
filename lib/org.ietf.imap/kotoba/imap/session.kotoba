@@ -1,0 +1,643 @@
+;; Opening an IMAP mailbox, as a Kotoba application (ADR-2608261100).
+;; The vertical slice, not a judgement table: the contract is the one
+;; `examples/todo-app.kotoba`, `org-ietf-smtp/kotoba/smtp/session.kotoba`
+;; and `org-ietf-pop3/kotoba/pop3/session.kotoba` use —
+;;
+;;   init     (config)       -> state
+;;   step     (state, line)  -> state    ; one reply line in
+;;   closed   (state)        -> state    ; the host saw EOF
+;;   outgoing (state)        -> string   ; the inert effect out
+;;
+;; greeting, CAPABILITY, the strongest authentication the server
+;; advertised, SELECT (or EXAMINE), the fold of everything the server said
+;; on the way in, and -- when `:want :fetch` -- one `UID FETCH` whose
+;; literal is handed to the host a byte count at a time.
+;;
+;; ## What this slice is for
+;;
+;; RFC 3501 §2.3.1.1. A UID is only meaningful together with the
+;; UIDVALIDITY it was issued under. A client that stores UIDs across
+;; sessions and never reads UIDVALIDITY is correct right up until a server
+;; reissues it, after which every stored UID names a different message, or
+;; none — and the failure is silent and looks like corruption rather than
+;; like a protocol mistake. `uidvalidity` is therefore the export this
+;; module exists to get right, and `uidvalidity-survives-select` is the
+;; negative control that says so.
+;;
+;; The other thing IMAP asks of a client is the tagged/untagged split
+;; (§7). Everything that is not the completion of the command we sent
+;; arrives as `* …`, including responses to nothing we asked for, and a
+;; client must tolerate the ones it cannot interpret. So `step` folds what
+;; it recognises, ignores what it does not, and completes ONLY on a
+;; tagged line carrying our own tag — never on `* OK`, and never on
+;; another tag's completion.
+;;
+;; ## No credential reaches the guest
+;;
+;; `init` is told *whether* a password and a token exist, never what they
+;; are. The effect channel is a pair — `outgoing-kind` says what the host
+;; must write, `outgoing` carries the line when the guest can write it in
+;; full:
+;;
+;;   :none                     write nothing
+;;   :line                     write `outgoing` verbatim
+;;   :credential/login         write `<outgoing-tag> LOGIN <user> <password>`,
+;;                             both arguments quoted (RFC 3501 §4.3)
+;;   :credential/sasl-plain    write base64(NUL user NUL password) CRLF
+;;   :credential/sasl-xoauth2  write base64(the XOAUTH2 blob) CRLF
+;;
+;; The guest's product decision is *which mechanism the server's
+;; advertisement makes preferable, and what each reply means*. Assembling
+;; a credential is not that decision; it is the ambient authority the
+;; `:authority` shielding axis names (adr-2608301500). The socket, TLS,
+;; STARTTLS upgrade and base64 are mechanism for the same reason.
+;;
+;; It also keeps a byte out of this file. Measured 2026-08-30 on amu
+;; 88ae83e: the Kotoba reader has no backslash-u escape (the 6-character
+;; form is rejected `:kotoba/source-read-failed`) and a RAW NUL byte is
+;; accepted — so SASL PLAIN's separator could only be written as a raw
+;; control byte, which is what the superproject's `verify-source-nul-bytes`
+;; detector reports and which makes `grep` answer about the file as though
+;; a word were absent. A guest that does not build credentials never needs
+;; it.
+;;
+;; ## Deliberate boundaries
+;;
+;; **Literals pass through; they are not held.** A `{n}` marker means the
+;; next `n` bytes are not line-oriented, and those bytes are a message. A
+;; `:document` cannot hold one: the bound that binds first is
+;; `:container-items 32`, and the aggregate is 65536 UTF-8 bytes, both of
+;; which an ordinary message with an attachment passes. Bytes do not go
+;; through the value plane (the principle ADR-2608039970 states for the
+;; datom plane), so the guest owns *that* a literal was announced and how
+;; many bytes it covers, and the host owns the buffer:
+;;
+;;   literal-bytes   how many bytes to read next; 0 for none. Valid only
+;;                   for the step that produced it -- the next `step`
+;;                   clears it, exactly as `org-ietf-pop3` does with its
+;;                   body channel.
+;;   body-state      :none -> :open -> :closed
+;;
+;; This is the byte-counted twin of POP3's terminator-delimited body. The
+;; guest reads the count and never the content; `fetch-carries-no-message-
+;; bytes` is the negative control.
+;;
+;; **One module, not several.** The CLI's multi-module route reaches only
+;; `js-browser` (measured 2026-08-28 on amu 82c7e064 and recorded in
+;; `org-ietf-smtp`'s session header), so a single file is what keeps the
+;; JVM-free route Q9 requires. The byte-scanning helpers below are
+;; therefore duplicated from `org-ietf-pop3`'s session rather than shared.
+;; They are not product semantics — they are the string library
+;; `lang/stdlib/core.kotoba` does not have yet — so this is not the mirror
+;; ADR-2608261100 forbids. The trigger for extracting them is the third
+;; copy; this is the second, and it is noted here so the third does not
+;; get written without noticing.
+;;
+;; No regular expressions: the oracle reaches for `re-find` / `re-matches`
+;; fifteen times in `imap.protocol`, and every scan this slice needs became
+;; positional (ADR-2608650000 decision 6 — redesign the scan, do not wait
+;; for the operation).
+;;
+;; `.cljc` remains the oracle and is not required from here (require-graph).
+;;
+;; ## Type annotations: 13 of the 170 this file used to carry
+;;
+;; They were written when an absent annotation meant `:i64`, so anything
+;; touching a string or a document had to say so. The frontend now infers a
+;; parameter's type from what its body requires and a result's from what its
+;; body returns, and 157 of the 170 said nothing it did not already know.
+;;
+;; Established by measurement, not by reading: each annotation was removed
+;; one at a time and the removal kept only when the whole module's signature
+;; map -- 64 functions, every parameter type and every result -- came back
+;; identical. The emitted wasm32 is byte-identical either way.
+;;
+;; The 13 that stayed were measured too: removing any one of them alone is
+;; refused. Three reasons, and only the first two are about this file.
+;;
+;;   * A function whose result feeds its own recursive call has no result to
+;;     infer from until it has one: `i64->string`, `ci-eq-from?`,
+;;     `ci-has-token?`.
+;;
+;;   * A value nothing constrains. `dg`'s key -- `document-get` takes a
+;;     keyword OR a document, so nothing in the body pins `k`. `fold-code`'s
+;;     `state`, which one `cond` branch returns unchanged; a parameter that
+;;     is only handed back is asked for no type at all.
+;;
+;;   * The rest are the frontend's shape, not this file's. Parameters are
+;;     inferred before results (`frontend.cljc`: "Parameters before
+;;     results"), a body's inference stops at its first unresolved form, and
+;;     only a complaint naming a bare parameter drives a refinement -- so
+;;     `capability?`'s `name` is never reached, because inference of that
+;;     body stops at `(ds state :capabilities)` while `ds`'s own result is
+;;     still provisional. Result inference is two passes, which is one short
+;;     for `on-completion`: a six-pass copy of the same frontend infers it.
+;;     Re-measure these when the frontend moves; they are the annotations
+;;     most likely to stop being necessary.
+;;
+;; Compile (the CLI needs -M, an ABSOLUTE path and `--output`;
+;; ADR-2608262000):
+;;   kotoba -M compile /ABS/kotoba/imap/session.kotoba \
+;;     --target wasm32-browser --output session.wasm
+;;
+;; Measured 2026-08-30 on amu 88ae83e, both without a JDK on PATH:
+;;   amu check   … --jvm-free                     -> :ok true, :effects #{}
+;;   amu compile … --jvm-free --target wasm32-browser
+;;                                                -> 11019-byte .wasm
+;; Observations of one build, not a contract; re-measure rather than
+;; quoting them.
+
+(ns imap.session
+  (:export [init step closed
+            phase outgoing outgoing-kind outgoing-tag error-text
+            body-state literal-bytes
+            capability?
+            mailbox-exists mailbox-recent uidvalidity uidnext unseen
+            read-only-state has-flag? has-permanent-flag?]))
+
+;; --- document accessors ---------------------------------------------------
+
+(defn- dg [d k :keyword]
+  (option-value-of [:option :document] (document-get d k) (document-null)))
+
+(defn- ds [d k]
+  (option-value-of [:option :string] (document-string-value (dg d k)) ""))
+
+(defn- di [d k]
+  (option-value-of [:option :i64] (document-i64-value (dg d k)) -1))
+
+(defn- dk [d k]
+  (option-value-of [:option :keyword] (document-keyword-value (dg d k)) :none))
+
+(defn- db [d k]
+  (option-value-of [:option :bool] (document-bool-value (dg d k)) false))
+
+
+;; --- byte scanning --------------------------------------------------------
+;; `string-substring` indexes are checked UTF-8 byte boundaries, and RFC
+;; 3501's wire grammar is US-ASCII, so byte offsets are the right unit.
+;; Message text is not scanned here at all.
+
+(defn- space? [c] (or (= c 32) (= c 9)))
+
+(defn- digit? [c] (and (>= c 48) (<= c 57)))
+
+(defn- at-byte [s i]
+  (if (< i (string-byte-length s)) (string-code-point-at s i) -1))
+
+(defn- starts-with? [s prefix]
+  (let [n (string-byte-length prefix)]
+    (if (> n (string-byte-length s))
+      false
+      (string=? (string-substring s 0 n) prefix))))
+
+(defn- skip-spaces [s i]
+  (if (space? (at-byte s i)) (skip-spaces s (+ i 1)) i))
+
+(defn- skip-token [s i]
+  (let [c (at-byte s i)]
+    (if (or (= c -1) (space? c)) i (skip-token s (+ i 1)))))
+
+(defn- read-i64 [s i acc]
+  (let [c (at-byte s i)]
+    (if (digit? c)
+      (read-i64 s (+ i 1) (+ (* (if (< acc 0) 0 acc) 10) (- c 48)))
+      acc)))
+
+;; -1 when there is no digit at `i`; every caller treats that as "not the
+;; shape I was looking for" and moves on, which is what the oracle's
+;; `re-matches`-returning-nil does.
+(defn- parse-i64-at [s i]
+  (if (digit? (at-byte s i)) (read-i64 s i -1) -1))
+
+;; Index of the first `c` at or after `i`, or -1.
+(defn- index-of [s c i]
+  (let [x (at-byte s i)]
+    (cond (= x -1) -1
+          (= x c) i
+          :else (index-of s c (+ i 1)))))
+
+;; --- integers to text -----------------------------------------------------
+;; IMAP commands are tagged and the tags are ours to generate (RFC 3501
+;; §2.2.1). There is no integer-to-string builtin in the guest, so the
+;; digits come out of a literal, the same way `examples/todo-app.kotoba`
+;; reads its counter. `rem` is spelled as a subtraction because `max` is
+;; in `:admitted-builtins` and still has no lowering (measured 2026-08-30),
+;; and one such surprise per file is enough.
+
+(defn- digit-char [n]
+  (string-substring "0123456789" n (+ n 1)))
+
+(defn- i64->string [n] :string
+  (if (< n 10)
+    (digit-char n)
+    (string-concat (i64->string (quot n 10))
+                   (digit-char (- n (* (quot n 10) 10))))))
+
+;; --- ASCII case folding ---------------------------------------------------
+;; RFC 3501 §2.3.2 makes system flags case-insensitive, and two clients
+;; disagreeing about `\SEEN` and `\Seen` is a bug that only appears against
+;; one server. Capability names and response codes are likewise
+;; case-insensitive. The oracle lower-cases into keywords; there is no
+;; code-point-to-string builtin in the guest, so this compares without
+;; constructing a string — the same decision, one allocation fewer.
+
+(defn- fold [c] (if (and (>= c 97) (<= c 122)) (- c 32) c))
+
+;; A leading backslash is not part of a system flag's name.
+(defn- unslash [s i]
+  (if (= (at-byte s i) 92) (+ i 1) i))
+
+(defn- ci-eq-from? [a ai b bi n] :bool
+  (cond
+    (<= n 0) true
+    (not (= (fold (at-byte a ai)) (fold (at-byte b bi)))) false
+    :else (ci-eq-from? a (+ ai 1) b (+ bi 1) (- n 1))))
+
+;; Is the whitespace-delimited token at `ai` equal to `b`, ignoring ASCII
+;; case and a leading backslash on either side?
+(defn- ci-token=? [a ai b]
+  (let [s (unslash a ai)
+        e (skip-token a s)
+        bs (unslash b 0)
+        bn (- (string-byte-length b) bs)]
+    (and (= (- e s) bn) (ci-eq-from? a s b bs bn))))
+
+(defn- ci-has-token? [s i b] :bool
+  (let [start (skip-spaces s i)]
+    (cond
+      (= (at-byte s start) -1) false
+      (ci-token=? s start b) true
+      :else (ci-has-token? s (skip-token s start) b))))
+
+;; --- IMAP line shapes -----------------------------------------------------
+
+(defn- untagged? [line] (starts-with? line "* "))
+
+;; The bracketed response code a status line may carry (RFC 3501 §7.1):
+;; `[UIDVALIDITY 1]`, `[PERMANENTFLAGS (\Seen)]`, `[READ-ONLY]`. "" when
+;; there is none.
+(defn- bracket-body [line]
+  (let [o (index-of line 91 0)]
+    (if (< o 0)
+      ""
+      (let [c (index-of line 93 (+ o 1))]
+        (if (< c 0) "" (string-substring line (+ o 1) c))))))
+
+;; The parenthesised list in `line`, without the parentheses, or "".
+(defn- paren-body [line]
+  (let [o (index-of line 40 0)]
+    (if (< o 0)
+      ""
+      (let [c (index-of line 41 (+ o 1))]
+        (if (< c 0) "" (string-substring line (+ o 1) c))))))
+
+;; The value after the code word inside a bracket body.
+(defn- bracket-value [body]
+  (let [i (skip-spaces body 0)]
+    (string-substring body (skip-spaces body (skip-token body i))
+                      (string-byte-length body))))
+
+;; RFC 3501 4.3: a line ending `{n}` announces that the next n bytes are
+;; not line-oriented. Read from the end -- trailing spaces, the brace, the
+;; digits -- because a message header can contain a brace and only the last
+;; one is the marker. -1 for a line that announces none.
+(defn- rskip-spaces [s i]
+  (if (and (>= i 0) (space? (at-byte s i))) (rskip-spaces s (- i 1)) i))
+
+(defn- rdigits-start [s i]
+  (if (and (>= i 0) (digit? (at-byte s i))) (rdigits-start s (- i 1)) i))
+
+(defn- literal-size [line]
+  (let [e (rskip-spaces line (- (string-byte-length line) 1))]
+    (if (not (= (at-byte line e) 125))
+      -1
+      (let [d (rdigits-start line (- e 1))]
+        (cond
+          (= d (- e 1)) -1
+          (not (= (at-byte line d) 123)) -1
+          :else (parse-i64-at line (+ d 1)))))))
+
+;; The completion of OUR tag, and only ours. `A1` is a prefix of `A10`, so
+;; the space is part of the match — as it is in the oracle's `(str tag " ")`.
+(defn- tagged-for? [line tag]
+  (and (starts-with? line (string-concat tag " "))
+       (let [i (skip-spaces line (string-byte-length tag))]
+         (or (ci-token=? line i "OK")
+             (or (ci-token=? line i "NO") (ci-token=? line i "BAD"))))))
+
+(defn- completion-ok? [line tag]
+  (ci-token=? line (skip-spaces line (string-byte-length tag)) "OK"))
+
+(defn- completion-text [line tag]
+  (let [i (skip-spaces line (string-byte-length tag))]
+    (string-substring line (skip-spaces line (skip-token line i))
+                      (string-byte-length line))))
+
+;; --- state ----------------------------------------------------------------
+
+(defn- quote-mailbox [name]
+  (string-concat "\"" (string-concat name "\"")))
+
+(defn init [config]
+  (document-map :phase (document-keyword :greeting)
+                :user (document-string (ds config :user))
+                :has-password (document-bool (db config :has-password?))
+                :has-token (document-bool (db config :has-access-token?))
+                :mailbox (document-string (ds config :mailbox))
+                :examine (document-bool (db config :read-only?))
+                :want (document-keyword
+                       (option-value-of [:option :keyword]
+                                        (document-keyword-value (dg config :want))
+                                        :select))
+                :uid (document-i64
+                      (option-value-of [:option :i64]
+                                       (document-i64-value (dg config :uid))
+                                       0))
+                :body-state (document-keyword :none)
+                :literal (document-i64 0)
+                :counter (document-i64 0)
+                :tag (document-string "")
+                :capabilities (document-string "")
+                :flags (document-string "")
+                :permanent-flags (document-string "")
+                :exists (document-i64 -1)
+                :recent (document-i64 -1)
+                :uidvalidity (document-i64 -1)
+                :uidnext (document-i64 -1)
+                :unseen (document-i64 -1)
+                :read-only (document-keyword :unknown)
+                :out (document-string "")
+                :out-kind (document-keyword :none)
+                :error (document-string "")))
+
+(defn- clear-literal [state]
+  (document-assoc state :literal (document-i64 0)))
+
+(defn- quiet [state]
+  (clear-literal
+   (document-assoc (document-assoc state :out (document-string ""))
+                   :out-kind (document-keyword :none))))
+
+(defn- next-tag [state]
+  (let [n (+ (di state :counter) 1)]
+    (document-assoc (document-assoc state :counter (document-i64 n))
+                    :tag (document-string (string-concat "A" (i64->string n))))))
+
+(defn- send-command [state next-phase body :string]
+  (let [tagged (next-tag state)]
+    (clear-literal
+     (document-assoc
+      (document-assoc
+       (document-assoc tagged :phase (document-keyword next-phase))
+       :out (document-string
+             (string-concat (ds tagged :tag)
+                            (string-concat " " (string-concat body "\r\n")))))
+      :out-kind (document-keyword :line)))))
+
+
+;; The guest names a credential it does not hold. `outgoing` stays "";
+;; `outgoing-tag` is what the host needs to build a tagged LOGIN.
+(defn- send-credential [state next-phase kind]
+  (clear-literal
+   (document-assoc
+    (document-assoc
+     (document-assoc state :phase (document-keyword next-phase))
+     :out (document-string ""))
+    :out-kind (document-keyword kind))))
+
+(defn- send-tagged-credential [state next-phase :keyword kind :keyword]
+  (send-credential (next-tag state) next-phase kind))
+
+(defn- fail [state message]
+  (clear-literal
+   (document-assoc
+    (document-assoc
+     (document-assoc
+      (document-assoc state :phase (document-keyword :failed))
+      :error (document-string message))
+     :out (document-string ""))
+    :out-kind (document-keyword :none))))
+
+;; --- folding what the server said -----------------------------------------
+;; RFC 3501 §7: a client must tolerate untagged responses it did not
+;; request and cannot interpret, so anything unrecognised leaves the state
+;; unchanged rather than failing.
+
+(defn- fold-code [state :document line]
+  (let [body (bracket-body line)
+        value (bracket-value body)]
+    (cond
+      (string=? body "") state
+      (ci-token=? body 0 "UIDVALIDITY")
+      (document-assoc state :uidvalidity (document-i64 (parse-i64-at value 0)))
+      (ci-token=? body 0 "UIDNEXT")
+      (document-assoc state :uidnext (document-i64 (parse-i64-at value 0)))
+      (ci-token=? body 0 "UNSEEN")
+      (document-assoc state :unseen (document-i64 (parse-i64-at value 0)))
+      (ci-token=? body 0 "PERMANENTFLAGS")
+      (document-assoc state :permanent-flags (document-string (paren-body body)))
+      (ci-token=? body 0 "READ-ONLY")
+      (document-assoc state :read-only (document-keyword :yes))
+      (ci-token=? body 0 "READ-WRITE")
+      (document-assoc state :read-only (document-keyword :no))
+      :else state)))
+
+(defn- fold-untagged [state line]
+  (let [rest-i (skip-spaces line 2)
+        n (parse-i64-at line rest-i)]
+    (cond
+      ;; `* <n> EXISTS` / `* <n> RECENT`
+      (>= n 0)
+      (let [word (skip-spaces line (skip-token line rest-i))]
+        (cond
+          (ci-token=? line word "EXISTS") (document-assoc state :exists (document-i64 n))
+          (ci-token=? line word "RECENT") (document-assoc state :recent (document-i64 n))
+          :else state))
+
+      (ci-token=? line rest-i "FLAGS")
+      (document-assoc state :flags (document-string (paren-body line)))
+
+      (ci-token=? line rest-i "CAPABILITY")
+      (document-assoc state :capabilities
+                      (document-string
+                       (string-substring line (skip-spaces line (skip-token line rest-i))
+                                         (string-byte-length line))))
+
+      ;; `* OK [UIDVALIDITY 1] …` and friends. BYE is the server closing.
+      (ci-token=? line rest-i "BYE") (fold-code state line)
+      (or (ci-token=? line rest-i "OK")
+          (or (ci-token=? line rest-i "NO") (ci-token=? line rest-i "BAD")))
+      (fold-code state line)
+
+      :else state)))
+
+;; --- choosing an authentication mechanism ---------------------------------
+;; XOAUTH2 when a token exists and the server offers it, then SASL PLAIN,
+;; then LOGIN. The guest picks; the host supplies the secret the pick names.
+;; Without XOAUTH2 an OAuth-connected mailbox has to ask its owner for a
+;; second credential, in the form of an app password, to read a mailbox the
+;; first credential already authorises.
+
+(defn- begin-auth [state]
+  (let [caps (ds state :capabilities)
+        pass (db state :has-password)
+        token (db state :has-token)]
+    (cond
+      (and token (ci-has-token? caps 0 "AUTH=XOAUTH2"))
+      (send-command state :auth-xoauth2-init "AUTHENTICATE XOAUTH2")
+
+      (and pass (ci-has-token? caps 0 "AUTH=PLAIN"))
+      (send-command state :auth-plain-init "AUTHENTICATE PLAIN")
+
+      pass (send-tagged-credential state :login :credential/login)
+
+      :else (fail state "IMAP の認証情報がありません。"))))
+
+(defn- begin-select [state]
+  (send-command state :select
+                (string-concat (if (db state :examine) "EXAMINE" "SELECT")
+                               (string-concat " " (quote-mailbox (ds state :mailbox))))))
+
+;; --- transitions ----------------------------------------------------------
+
+(defn- on-completion [state line] :document
+  (let [p (dk state :phase)
+        tag (ds state :tag)
+        ok (completion-ok? line tag)
+        text (completion-text line tag)]
+    (cond
+      (= p :capability) (if ok (begin-auth state)
+                            (fail state (string-concat "IMAP CAPABILITY failed: " text)))
+      (= p :login) (if ok (begin-select state)
+                       (fail state (string-concat "IMAP LOGIN failed: " text)))
+      (= p :auth-plain-init) (if ok (begin-select state)
+                                 (fail state (string-concat "IMAP AUTHENTICATE PLAIN failed: " text)))
+      (= p :auth-plain-payload) (if ok (begin-select state)
+                                    (fail state (string-concat "IMAP AUTHENTICATE PLAIN failed: " text)))
+      (= p :auth-xoauth2-init) (if ok (begin-select state)
+                                   (fail state (string-concat "IMAP AUTHENTICATE XOAUTH2 failed: " text)))
+      (= p :auth-xoauth2-payload) (if ok (begin-select state)
+                                      (fail state (string-concat "IMAP AUTHENTICATE XOAUTH2 failed: " text)))
+
+      ;; SELECT's own tagged OK carries [READ-WRITE] / [READ-ONLY], which
+      ;; is the only place a client learns it. Reading only the untagged
+      ;; lines loses it.
+      (= p :select)
+      (if ok
+        (let [folded (fold-code state line)]
+          (if (= (dk folded :want) :fetch)
+            (send-command folded :fetch
+                          (string-concat "UID FETCH "
+                                         (string-concat (i64->string (di folded :uid))
+                                                        " (BODY.PEEK[])")))
+            (quiet (document-assoc folded :phase (document-keyword :done)))))
+        (fail state (string-concat "IMAP SELECT failed: " text)))
+
+      ;; The literal has already gone to the host by the time the tagged
+      ;; completion arrives; this only seals the buffer.
+      (= p :fetch)
+      (if ok
+        (quiet (document-assoc
+                (document-assoc state :phase (document-keyword :done))
+                :body-state (document-keyword :closed)))
+        (fail state (string-concat "IMAP UID FETCH failed: " text)))
+
+      :else (quiet state))))
+
+;; The SASL continuation. RFC 3501 §6.2.2: the server asks for the initial
+;; response with a bare `+`, and that is not a status line.
+(defn- continuation? [line] (starts-with? line "+"))
+
+(defn step [state line :string]
+  (let [p (dk state :phase)
+        tag (ds state :tag)]
+    (cond
+      (= p :done) (quiet state)
+      (= p :failed) (quiet state)
+
+      (= p :greeting)
+      (if (and (untagged? line) (ci-token=? line (skip-spaces line 2) "OK"))
+        (send-command (fold-untagged state line) :capability "CAPABILITY")
+        (fail state "IMAP greeting was not * OK"))
+
+      ;; Ours, and only ours. `* OK` is not a completion, and neither is
+      ;; another tag's.
+      (tagged-for? line tag) (on-completion state line)
+
+      (and (continuation? line) (= p :auth-plain-init))
+      (send-credential state :auth-plain-payload :credential/sasl-plain)
+
+      (and (continuation? line) (= p :auth-xoauth2-init))
+      (send-credential state :auth-xoauth2-payload :credential/sasl-xoauth2)
+
+      ;; RFC 3501 4.3. The guest reads the count and hands it over; the
+      ;; bytes it names never become a guest value.
+      (and (untagged? line) (>= (literal-size line) 0))
+      (document-assoc
+       (document-assoc (quiet (fold-untagged state line))
+                       :literal (document-i64 (literal-size line)))
+       :body-state (document-keyword :open))
+
+      (untagged? line) (quiet (fold-untagged state line))
+
+      ;; Anything else is a line this client does not model. §7 asks that
+      ;; it be tolerated, not that it be understood.
+      :else (quiet state))))
+
+;; EOF mid-response. The oracle throws "IMAP connection closed
+;; mid-response"; a closed socket is a host fact, so the host reports it
+;; and the guest owns what it means for the session.
+(defn closed [state]
+  (let [p (dk state :phase)]
+    (cond
+      (= p :done) (quiet state)
+      (= p :failed) (quiet state)
+      :else (fail state "IMAP connection closed mid-response"))))
+
+;; --- projections ----------------------------------------------------------
+
+(defn phase [state] (dk state :phase))
+
+(defn outgoing [state] (ds state :out))
+
+(defn outgoing-kind [state] (dk state :out-kind))
+
+(defn outgoing-tag [state] (ds state :tag))
+
+(defn error-text [state] (ds state :error))
+
+;; :none -> :open -> :closed. The host opens a buffer when a literal is
+;; announced and seals it when the command completes.
+(defn body-state [state] (dk state :body-state))
+
+;; How many bytes the host must read next, 0 for none. Valid only for the
+;; step that produced it: the next `step` clears it. The bytes themselves
+;; are never a guest value -- see `fetch-carries-no-message-bytes`.
+(defn literal-bytes [state] (di state :literal))
+
+(defn capability? [state name :string]
+  (ci-has-token? (ds state :capabilities) 0 name))
+
+(defn mailbox-exists [state] (di state :exists))
+
+(defn mailbox-recent [state] (di state :recent))
+
+;; -1 means the server never said. RFC 3501 §2.3.1.1 makes this the value a
+;; client must not lose: a UID cached under one UIDVALIDITY names a
+;; different message, or none, once the server reissues it.
+(defn uidvalidity [state] (di state :uidvalidity))
+
+(defn uidnext [state] (di state :uidnext))
+
+(defn unseen [state] (di state :unseen))
+
+;; :unknown / :yes / :no — three states, because "the server did not say"
+;; is not "writable".
+(defn read-only-state [state] (dk state :read-only))
+
+(defn has-flag? [state name :string]
+  (ci-has-token? (ds state :flags) 0 name))
+
+(defn has-permanent-flag? [state name :string]
+  (ci-has-token? (ds state :permanent-flags) 0 name))

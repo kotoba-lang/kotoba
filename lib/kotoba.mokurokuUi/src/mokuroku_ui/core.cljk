@@ -1,0 +1,296 @@
+(ns mokuroku-ui.core
+  "Renders a `mokuroku` catalog as a window, on the kotoba-lang design system.
+
+  Every app in the `kotoba-lang/app-*` suite shows the same window: a title and
+  a search field at the top, a list of rows in the middle, an inspector at the
+  side, a command bar, and a line saying what is on screen versus what exists.
+  This is that window, once.
+
+  What an app supplies is what genuinely differs: which columns to show (from
+  its source descriptor), how to render a cell value, and its theme. What it
+  does not supply is layout, type, colour, or the ARIA — those come from
+  `kotoba-ui` + `appkit`, and re-deriving them per app is how nine apps end up
+  looking like nine apps.
+
+  Split from `mokuroku` rather than folded into it for the same reason
+  `byoubu-ui` is split from `byoubu`: the kernel must stay dependency-free so a
+  host that renders some other way can still use it."
+  (:require [appkit.core :as appkit]
+            [kotoba.lang.text :as str]
+            [kotoba-ui.core :as ui]
+            [mokuroku.item :as item]
+            [mokuroku.source :as source]))
+
+;; ------------------------------------------------------------- formatting
+
+(def ^:private byte-units ["B" "KB" "MB" "GB" "TB"])
+
+(defn human-bytes
+  "Bytes as a short string; nil stays nil so an absent value renders as absent
+  rather than as zero."
+  [n]
+  (when (number? n)
+    (loop [x (double n) [u & more] byte-units]
+      (if (or (< x 1024) (nil? (seq more)))
+        (str (if (or (= "B" u) (>= x 100))
+               (long x)
+               (/ (Math/round (* 10.0 x)) 10.0))
+             " " u)
+        (recur (/ x 1024) more)))))
+
+(defn human-duration
+  "Seconds as m:ss / h:mm:ss."
+  [secs]
+  (when (number? secs)
+    (let [total (long secs)
+          h (quot total 3600)
+          m (rem (quot total 60) 60)
+          s (rem total 60)
+          pad (fn [v] (if (< v 10) (str "0" v) (str v)))]
+      (if (pos? h)
+        (str h ":" (pad m) ":" (pad s))
+        (str m ":" (pad s))))))
+
+(defn percent [n]
+  (when (number? n)
+    (str (/ (Math/round (* 10.0 (double n))) 10.0) "%")))
+
+(defn plain
+  "The default cell renderer: absent is a dash, not an empty cell.
+
+  An empty cell is ambiguous — it reads as either 'no value' or 'the renderer
+  broke'. A dash says the first one on purpose."
+  [v]
+  (cond
+    (nil? v) "--"
+    (keyword? v) (name v)
+    (boolean? v) (if v "Yes" "No")
+    :else (str v)))
+
+(def default-formatters
+  "Formatters keyed by attribute type, used when the app names none for a
+  specific column."
+  {:bytes human-bytes
+   :duration human-duration
+   :percent percent})
+
+(defn- format-cell [formatters attr-key attr-type value]
+  (let [f (or (get formatters attr-key)
+              (get formatters attr-type)
+              (get default-formatters attr-type))]
+    (if f (or (f value) "--") (plain value))))
+
+;; ------------------------------------------------------------------- rows
+
+(defn- visible-columns
+  "Columns to show in a row. `:columns` in opts wins; otherwise the first three
+  sortable attributes the descriptor declares, because a row wider than that
+  stops being scannable and starts being a spreadsheet."
+  [descriptor opts]
+  (or (:columns opts)
+      (->> (:source/attributes descriptor)
+           (filter :attribute/sortable?)
+           (take 3)
+           (mapv :attribute/key))))
+
+(defn row
+  "One list row.
+
+  Selection is announced twice on purpose: a class for the eye and
+  `aria-selected` for everything else. They are not redundant — a class tells
+  a screen reader nothing, and this element is the one carrying
+  `role=\"listitem\"`, which is where `aria-selected` belongs.
+
+  The `:attrs` opt this relies on was added to `liquid-glass/list-row` for
+  exactly this reason; before it existed, passing an attrs map here was
+  silently dropped and this code would have read as accessible while
+  rendering nothing of the sort."
+  [view it opts]
+  (let [descriptor (:view/descriptor view)
+        formatters (:formatters opts)
+        cols (visible-columns descriptor opts)
+        types (into {} (map (juxt :attribute/key :attribute/type))
+                    (:source/attributes descriptor))
+        selected? (contains? (:selection/ids (:view/selection view)) (:item/id it))]
+    (ui/list-row
+     (into [:span {:class "mokuroku__row"}]
+           (map-indexed
+            (fn [idx k]
+              [:span {:class (str "mokuroku__cell"
+                                  (when (= :number (get types k))
+                                    " mokuroku__cell--numeric"))}
+               [:span {:class (if (zero? idx) "hig-body" "hig-footnote")}
+                (if (zero? idx)
+                  (:item/label it)
+                  (format-cell formatters k (get types k) (item/attr it k)))]])
+            cols))
+     {:act [:select (:item/id it)]
+      :class (when selected? "mokuroku__row--selected")
+      :attrs {:aria-selected (if selected? "true" "false")}
+      :trailing (when-let [badge-fn (:badge opts)]
+                  (when-let [b (badge-fn it)] (ui/badge b)))})))
+
+(defn listing [view opts]
+  (let [items (:result/items (:view/result view))]
+    (if (seq items)
+      (appkit/list-view (mapv #(row view % opts) items))
+      (ui/empty-state
+       {:title (if (:view/fetched? view)
+                 (or (:empty-title opts) "Nothing here")
+                 "Not loaded")
+        :body (if (:view/fetched? view)
+                (or (:empty-body opts) "Nothing matches the current filter.")
+                ;; Naming the capability is the whole point: an empty list and
+                ;; a refused grant are otherwise indistinguishable.
+                (str "Waiting on the "
+                     (:source/capability (:view/descriptor view))
+                     " grant."))}))))
+
+;; -------------------------------------------------------------- inspector
+
+(defn- field [formatters types {:keys [field/key field/label field/value]}]
+  [:div {:class "mokuroku__field"}
+   [:span {:class "hig-caption1"} label]
+   [:span {:class "hig-callout"}
+    (if (vector? key)
+      ;; an aggregate, e.g. [:sum :size]
+      (format-cell formatters (second key) (get types (second key)) value)
+      (format-cell formatters key (get types key) value))]])
+
+(defn inspector [view opts]
+  (let [i (:view/inspector view)
+        types (into {} (map (juxt :attribute/key :attribute/type))
+                    (:source/attributes (:view/descriptor view)))]
+    (appkit/panel
+     (ui/stack {:gap :2}
+       [:h2 {:class "hig-headline"} (:inspector/title i)]
+       (when-not (str/blank? (str (:inspector/subtitle i)))
+         [:p {:class "hig-footnote"} (:inspector/subtitle i)])
+       (ui/divider)
+       (into [:div {:class "mokuroku__fields"}]
+             (map #(field (:formatters opts) types %) (:inspector/fields i)))))))
+
+;; ----------------------------------------------------------------- chrome
+
+(defn command-bar
+  "A destructive command is marked with a class and a title, so the
+  confirmation the kernel will demand is visible before the click.
+
+  `button` takes :class/:title/:act/:disabled/:type and nothing else, so those
+  are what is used — not an :attrs map it would drop."
+  [view]
+  (ui/toolbar
+   (mapv (fn [c]
+           (ui/button (:command/label c)
+                      (cond-> {:act [:command (:command/id c)]}
+                        (:command/destructive? c)
+                        (assoc :class "mokuroku__command--destructive"
+                               :title "Asks for confirmation"))))
+         (:view/commands view))))
+
+(defn status-line
+  "What is on screen versus what exists.
+
+  A truncated listing that reported only the visible count would tell the user
+  a folder holds 200 items when it holds 40,000."
+  [view opts]
+  (let [{:result/keys [items matched total truncated?]} (:view/result view)
+        dropped (:problems/dropped-selection (:view/problems view))
+        noun (or (:noun opts) "items")]
+    [:p {:class "hig-footnote"}
+     (str (count items)
+          (when truncated? (str " of " matched))
+          (if (= matched total)
+            (str " of " total " " noun)
+            (str " shown, " total " total"))
+          (when (seq dropped)
+            (str " · " (count dropped) " selected " noun " no longer exist")))]))
+
+(defn window
+  "The whole window. OPTS:
+
+  | key | meaning |
+  |---|---|
+  | `:columns` | attribute keys to show as columns (default: first 3 sortable) |
+  | `:formatters` | attribute-key or attribute-type → value → string |
+  | `:badge` | item → string or nil, rendered at the row's end |
+  | `:noun` | what the status line calls a row (default \"items\") |
+  | `:empty-title` / `:empty-body` | the empty state's words |
+  | `:search-placeholder` | the search field's placeholder |
+  | `:detail` | `view` → hiccup for the SELECTED item, above the listing |
+
+  `:detail` is where a catalog shows the thing rather than the row about it.
+  Every app in this suite has one: Photos shows the photograph, Music the
+  album art, Preview the page. Without it each of them would compose its own
+  window and the split this repo exists for — the kernel decides what is
+  true, this decides what it looks like — would hold for the listing and not
+  for the part people are actually looking at.
+
+  It takes the whole view rather than the selected item because what to draw
+  is often a lookup the app owns: Preview holds rendered pages by index, and
+  the item carries the index."
+  ([view] (window view {}))
+  ([view opts]
+   (ui/app-shell
+    {:nav (ui/nav-bar
+           (:source/label (:view/descriptor view))
+           {:trailing [(ui/search-field
+                        {:placeholder (or (:search-placeholder opts) "Search")
+                         :aria-label (or (:search-placeholder opts) "Search")
+                         :value (:query/text (:view/query view))
+                         :act :search})]})
+     :sidebar (inspector view opts)}
+    (ui/stack {:gap :3}
+      (command-bar view)
+      ;; Above the listing, not beside it: the sidebar is the inspector's,
+      ;; and a viewer squeezed into a third column is a viewer nobody can
+      ;; read. `nil` when there is no selection, which `stack` drops.
+      (when-let [detail (:detail opts)]
+        (let [drawn (detail view)]
+          (when drawn (appkit/panel drawn))))
+      (listing view opts)
+      (status-line view opts)))))
+
+;; ------------------------------------------------------------------- page
+
+(def app-css
+  "Unlayered app CSS, so it wins over the library layers without one compound
+  selector (kotoba-ui rule 3). Every value is a token; there is no literal
+  colour or font size here."
+  (str
+   ".mokuroku__row{display:grid;"
+   "grid-template-columns:minmax(0,2fr) repeat(auto-fit,minmax(4rem,1fr));"
+   "gap:var(--hig-spacing-3);align-items:baseline;min-width:0}"
+   ".mokuroku__cell{min-width:0;overflow-wrap:break-word}"
+   ".mokuroku__cell--numeric{text-align:right;font-variant-numeric:tabular-nums}"
+   ".mokuroku__row--selected{background:var(--hig-fill-quaternary)}"
+   ".mokuroku__command--destructive{color:var(--hig-palette-red)}"
+   ".mokuroku__fields{display:grid;gap:var(--hig-spacing-2)}"
+   ".mokuroku__field{display:flex;justify-content:space-between;"
+   "gap:var(--hig-spacing-3);min-width:0}"))
+
+(def default-theme
+  "The suite's shared appearance. `:auto` because a system app should follow
+  the system, and the accent is the one place a hex is legitimate."
+  {:accent "#3E7BFA" :appearance :auto})
+
+(defn ->page
+  "A complete HTML document for CAT's view. OPTS as `window`, plus `:title`,
+  `:description`, `:theme`, and `:extra-css` for an app that genuinely needs a
+  rule this one does not have."
+  [view opts]
+  (ui/->page {:title (or (:title opts)
+                         (:source/label (:view/descriptor view)))
+              :description (:description opts)
+              :theme (or (:theme opts) default-theme)
+              :head [[:style (str app-css (:extra-css opts))]]}
+             (window view opts)))
+
+(defn ->html [view opts]
+  (ui/->html (window view opts)))
+
+(defn column
+  "Convenience re-export so an app can declare its descriptor without also
+  requiring `mokuroku.source`."
+  [& args]
+  (apply source/attribute args))

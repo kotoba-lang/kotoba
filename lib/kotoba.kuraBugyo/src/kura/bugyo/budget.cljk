@@ -1,0 +1,220 @@
+(ns kura.bugyo.budget
+  "A spending ceiling, enforced by refusing writes rather than by hoping.
+
+  The Phase 0 fleet rents its storage, and renting is structurally loss-making
+  at these rates: Backblaze B2 is $6/TB-month against a $1.50/TB-month node
+  payout, so every rented terabyte loses $4.50 a month. That is an acceptable
+  price for learning how the thing behaves under real cost — but only if the
+  price is bounded, and **an experiment without a ceiling is not an
+  experiment.**
+
+  So the ceiling lives here, in the admission path, not in a dashboard someone
+  remembers to check. `admit-write?` refuses once the projected bill passes the
+  cap. A cap that is a monitor is a cap you discover you exceeded.
+
+  **Physical, not logical.** The bill is for what actually lands on the
+  provider, so the erasure multiplier is inside the calculation. A ceiling
+  expressed in logical terabytes silently doubles when someone changes the
+  code's parameters, which is the shape of every surprising cloud bill.
+
+  **Free capacity still counts as capacity, not as free.** A node on owned
+  hardware costs nothing marginal, and `provider-rates` gives it a rate of
+  zero — but it is still tracked, because the operator needs to know how full
+  their disk is even when the bill does not."
+  (:require [kura.bugyo.pricing :as pricing]))
+
+(def provider-rates
+  "USD per PHYSICAL TB-month, by provider.
+
+  B2 and R2 read from their published pages. `self-hosted` is zero because the
+  marginal cost of a disk you already own is zero — the capital is sunk and the
+  power is rounding error at this scale. That is a statement about *marginal*
+  cost and not an argument that owned storage is free: at replacement scale it
+  is about $0.26/TB-month (a 20 TB drive at ~$250 over five years plus ~6 W),
+  which is the number that matters when buying, and the number that makes a
+  $1.50 node payout viable.
+
+  **B2 was carried here at $6.00 and the published rate is $6.95.** Corrected
+  2026-07-30 against the pricing page itself rather than a recollection of it,
+  which is the same discipline the node egress rate needed (see
+  `kura.bugyo.pricing/default-rates`, where a search summary put Storj's egress
+  payout at ten times its real figure). A 16% error in the one rate that prices
+  the entire rented fleet is worth the churn it causes downstream: what the
+  $25 cap buys drops from ~2.08 logical TB on B2 alone to ~1.80."
+  {:backblaze-b2 {:usd-tb-month 6.95 :provenance :published
+                  :source "backblaze.com/cloud-storage/pricing pay-as-you-go, read 2026-07-30"}
+   :cloudflare-r2 {:usd-tb-month 15.00 :provenance :published :read-at "2026-07-30"}
+   :self-hosted {:usd-tb-month 0.00 :provenance :marginal
+                 :note "owned disk; ~$0.26/TB-month at replacement cost"}})
+
+(defn policy
+  "`:monthly-usd-cap` is the hard ceiling on projected provider spend.
+  `:warn-at` is the fraction of it that starts reporting pressure."
+  [{:keys [monthly-usd-cap warn-at] :or {monthly-usd-cap 25.00 warn-at 0.7}}]
+  (assert (pos? monthly-usd-cap) "a cap of zero would refuse the first write")
+  {:monthly-usd-cap monthly-usd-cap :warn-at warn-at})
+
+(defn- rate [provider]
+  (get-in provider-rates [provider :usd-tb-month]
+          ;; An unknown provider is charged the most expensive known rate
+          ;; rather than zero. Defaulting an unpriced provider to free is how a
+          ;; ceiling gets bypassed by adding a backend nobody costed.
+          (apply max (map :usd-tb-month (vals provider-rates)))))
+
+(defn projected-monthly-usd
+  "Cost of holding `usage` — a map of provider to physical bytes."
+  [usage]
+  (reduce-kv (fn [acc provider physical-bytes]
+               (+ acc (* (rate provider) (/ (double physical-bytes) 1e12))))
+             0.0
+             usage))
+
+(defn blended-usd-tb-month
+  "What one physical TB-month costs across a provider `mix` — provider to
+  fraction of physical bytes."
+  [mix]
+  (reduce-kv (fn [acc p f] (+ acc (* f (rate p)))) 0.0 mix))
+
+(defn capacity-tb
+  "Logical TB the cap allows, given a layout and a provider mix.
+
+  `mix` is provider -> fraction of physical bytes. The multiplier is applied
+  here so the answer is in the unit a customer buys."
+  [pol layout mix]
+  (let [per-logical (* (blended-usd-tb-month mix) (pricing/multiplier layout))]
+    (if (zero? per-logical)
+      ##Inf
+      (/ (:monthly-usd-cap pol) per-logical))))
+
+(def replication-fallback
+  "How objects too small to erasure-code are stored instead.
+
+  A 128 KB block split k=16 gives 8 KB shards and a read that touches sixteen
+  nodes to fetch what one replica would have answered, so below the threshold
+  `kotobase-storage-kura` keeps three copies. Stated here because a tier's
+  worst case depends on it and a retail margin computed without it is quoting
+  the wrong multiplier for exactly the workload — a datom plane's 16-128 KB
+  blocks — most likely to arrive first (ADR-2607299200, section 0 addendum)."
+  {:replication-factor 3.0
+   :replication-threshold-bytes 1048576
+   :provenance :design
+   :source "ADR-2607299200 — kotobase-storage-kura default threshold"})
+
+(defn cost-basis
+  "The basis `kura.bugyo.pricing/tier-economics` requires, built from a real
+  provider mix instead of a default nobody chose.
+
+  This is the join between the two namespaces: `pricing` owns what things are
+  worth and refuses to guess what they cost, `budget` owns what they cost and
+  has no opinion on what they are worth."
+  [layout mix]
+  (merge (select-keys replication-fallback
+                      [:replication-factor :replication-threshold-bytes])
+         {:usd-physical-tb-month (blended-usd-tb-month mix)
+          :coded-multiplier (pricing/multiplier layout)
+          :mix mix}))
+
+(defn admit-write?
+  "Whether `additional-bytes` of PHYSICAL data may be written to `provider`.
+
+  Returns `{:allow? :projected-usd :cap-usd :headroom-usd}` and a `:reason`
+  when refused. Refusal is a return value, not an exception: hitting a budget
+  ceiling is an expected state for an experiment that is working, and a node
+  that throws there has that path exercised the first time it succeeds."
+  [pol usage provider additional-bytes]
+  (let [after (update usage provider (fnil + 0) additional-bytes)
+        projected (projected-monthly-usd after)
+        cap (:monthly-usd-cap pol)]
+    (cond-> {:allow? (<= projected cap)
+             :projected-usd projected
+             :cap-usd cap
+             :headroom-usd (- cap projected)
+             :pressure (/ projected cap)
+             :warn? (>= (/ projected cap) (:warn-at pol))}
+      (> projected cap)
+      (assoc :reason :budget-exceeded
+             :note (str "writing " additional-bytes " bytes to " (name provider)
+                        " would project $" (/ (Math/round (* 100 projected)) 100.0)
+                        " against a $" cap " cap")))))
+
+(defn report
+  "What the experiment is costing, and what it is buying — on the WHOLESALE
+  basis.
+
+  Reports the loss explicitly. The rented fleet is known to be loss-making and
+  the point of running it is to learn, not to earn — a cost report that hid the
+  loss would let that framing quietly slip.
+
+  **`:loss-making?` here is a statement about selling capacity by the terabyte
+  at the node-payout rate card, and about nothing else.** The same bytes under
+  a retail subscription are profitable, because a subscription is not priced
+  per terabyte; `retail-report` computes that basis. Neither number is the
+  business on its own, and an unlabelled one is worse than either — which is
+  why `:basis` is on both."
+  [pol rates layout usage]
+  (let [projected (projected-monthly-usd usage)
+        physical-tb (/ (reduce + 0 (vals usage)) 1e12)
+        logical-tb (/ physical-tb (pricing/multiplier layout))
+        revenue (* logical-tb (pricing/storage-price-usd-tb-month rates layout))]
+    {:basis :wholesale
+     :providers (into {} (map (fn [[p b]]
+                                [p {:physical-tb (/ (double b) 1e12)
+                                    :usd-month (* (rate p) (/ (double b) 1e12))
+                                    :rate-usd-tb-month (rate p)}]))
+                      usage)
+     :physical-tb physical-tb
+     :logical-tb logical-tb
+     :cost-usd-month projected
+     :cap-usd-month (:monthly-usd-cap pol)
+     :headroom-usd (- (:monthly-usd-cap pol) projected)
+     :notional-revenue-usd-month revenue
+     :net-usd-month (- revenue projected)
+     :loss-making? (< revenue projected)
+     :basis-note (str "Revenue here is the wholesale rate card — node payout x "
+                      "multiplier, marked up. It is what kura would charge for "
+                      "capacity by the terabyte, NOT what a subscriber pays. "
+                      "See retail-report for the other basis.")
+     :note (str "Rented storage loses money by construction at these rates — "
+                "B2 is $6.95/TB-month against a $1.50 node payout. The "
+                "experiment buys operational knowledge, not margin. Owned disk "
+                "at ~$0.26/TB-month is where the economics close.")}))
+
+(defn retail-report
+  "The same provider bill, against subscription revenue.
+
+  `subscriptions` is tier keyword -> how many are being paid for. With none,
+  revenue is zero and this is loss-making — but for a reason the wholesale
+  report cannot express, and the difference matters: *no customers yet* is a
+  stage, while *the price does not cover the cost* is a defect. `:why` says
+  which one is being reported so the two are never read as the same finding."
+  ([pol usage subscriptions layout mix]
+   (retail-report pol usage subscriptions layout mix
+                  pricing/default-tiers pricing/default-fx))
+  ([pol usage subscriptions layout mix tiers fx]
+   (let [cost (projected-monthly-usd usage)
+         basis (cost-basis layout mix)
+         by-tier (into {} (map (juxt :tier identity))
+                       (map #(pricing/tier-economics % basis fx) tiers))
+         revenue (reduce-kv (fn [acc t n]
+                              (+ acc (* n (get-in by-tier [t :revenue-usd-month] 0.0))))
+                            0.0
+                            (or subscriptions {}))
+         paying (reduce-kv (fn [acc t n]
+                             (+ acc (if (pos? (get-in by-tier [t :jpy-month] 0)) n 0)))
+                           0
+                           (or subscriptions {}))]
+     {:basis :retail
+      :subscriptions (or subscriptions {})
+      :paying-subscriptions paying
+      :revenue-usd-month revenue
+      :cost-usd-month cost
+      :cap-usd-month (:monthly-usd-cap pol)
+      :net-usd-month (- revenue cost)
+      :loss-making? (< revenue cost)
+      :why (if (zero? paying)
+             (str "no paying subscriptions — this is the cost of an experiment "
+                  "with no revenue attached, not a price that fails to cover "
+                  "its cost")
+             (str "computed against " paying " paying subscription(s) at the "
+                  "adopted tier prices"))
+      :card (pricing/retail-card basis tiers fx pricing/default-egress-terms)})))

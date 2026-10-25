@@ -1,0 +1,174 @@
+(ns kotobase.protocols.blocks-test
+  "ADR-2608039970: bytes belong on a block plane, not on the datom plane.
+  The assertions that matter here are the two the ADR turns on -- that a
+  ctx with a `:blocks` port puts NOTHING in the document collection, and
+  that `:cid-of` refuses bytes that do not hash to their key."
+  (:require #?(:clj [kotoba.test :refer [deftest is testing]]
+               :org.babashka/nbb [kotoba.test :refer [deftest is testing]]
+               :cljs [kotoba.test.cljs :refer-macros [deftest is testing]])
+            [kotobase.local :as local]
+            [kotobase.protocols.blocks :as blocks]
+            [kotobase.store :as st]))
+
+(def cid "bafkreigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi")
+(def other-cid "bafkreiaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+
+(defn- fake-port
+  "A block port over an atom -- what a deploy shell binds to R2."
+  [a]
+  {:get (fn [c] (get @a c))
+   :put! (fn [c block] (swap! a assoc c block))
+   :list (fn [] (vec (keys @a)))})
+
+;; --------------------------------------------------- the legacy store arity
+
+(deftest a-bare-store-still-works
+  (testing "kotobase-protocols-worker calls (put-block! store cid block) and is
+            live -- a port it has not adopted must not change what it does"
+    (let [store (local/local-store)]
+      (is (= {:bytes "hi" :content-type "text/plain"}
+             (blocks/put-block! store cid {:bytes "hi" :content-type "text/plain"})))
+      (is (= {:bytes "hi" :content-type "text/plain"} (blocks/get-block store cid)))
+      (is (= [cid] (vec (blocks/list-cids store))))
+      (is (= "application/octet-stream"
+             (:content-type (blocks/put-block! store other-cid {:bytes "x"})))
+          "content-type still defaults")
+      (is (some #(= :blocks (:surface %)) (st/-read store :kotobase.protocols/audit 0))
+          "and still audits"))))
+
+(deftest a-ctx-with-only-a-store-is-the-same-plane
+  (let [store (local/local-store)
+        ctx {:store store}]
+    (blocks/put-block! store cid {:bytes "hi"})
+    (is (= "hi" (:bytes (blocks/get-block ctx cid)))
+        "a block written through the legacy arity reads back through ctx")
+    (blocks/put-block! ctx other-cid {:bytes "there"})
+    (is (= "there" (:bytes (blocks/get-block store other-cid)))
+        "and the other way round -- one plane, two arities")))
+
+;; ------------------------------------------------------------- the port
+
+(deftest a-port-keeps-bytes-off-the-document-plane
+  (testing "the whole point of ADR-2608039970: in kotobase-protocols-worker a
+            document value becomes a datom, so a 5 MB body becomes datoms"
+    (let [store (local/local-store)
+          blocks (atom {})
+          ctx {:store store :blocks (fake-port blocks)}]
+      (blocks/put-block! ctx cid {:bytes "big" :content-type "image/png"})
+      (is (= {:bytes "big" :content-type "image/png"} (blocks/get-block ctx cid)))
+      (is (= [cid] (vec (blocks/list-cids ctx))))
+      (is (empty? (st/-list store blocks/coll))
+          "NOTHING landed in the document collection")
+      (is (nil? (blocks/get-block store cid))
+          "and the legacy plane genuinely does not have it"))))
+
+(deftest audit-stays-on-the-document-plane
+  (testing "audit is metadata about the write, not the bytes"
+    (let [store (local/local-store)
+          ctx {:store store :blocks (fake-port (atom {}))}]
+      (blocks/put-block! ctx cid {:bytes "b"})
+      (is (= [{:surface :blocks :op :put :cid cid :size 1}]
+             (mapv #(dissoc % :seq) (st/-read store :kotobase.protocols/audit 0)))))))
+
+(deftest a-port-without-a-store-has-nowhere-to-audit-and-says-so-by-not-failing
+  (let [ctx {:blocks (fake-port (atom {}))}]
+    (is (= "b" (:bytes (blocks/put-block! ctx cid {:bytes "b"}))))
+    (is (= "b" (:bytes (blocks/get-block ctx cid))))))
+
+;; ------------------------------------------------------------ verification
+
+(defn- cid-of-fixture
+  "A stand-in for the shell's real digest: the CID is whatever the block
+  says it is under `:claimed`. Enough to exercise the invariant without
+  putting a hash function in a pure library's tests."
+  [block]
+  (:claimed block cid))
+
+(deftest a-block-that-does-not-hash-to-its-key-is-refused-before-anything-is-written
+  (let [blocks (atom {})
+        ctx {:blocks (fake-port blocks) :cid-of cid-of-fixture}]
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (blocks/put-block! ctx other-cid {:bytes "mismatched"})))
+    (is (empty? @blocks)
+        "bytes are never stored under a key they do not hash to")
+    (is (= "ok" (:bytes (blocks/put-block! ctx cid {:bytes "ok"})))
+        "and a block that does hash to its key goes through")))
+
+(deftest a-tampered-block-throws-on-read-rather-than-reading-as-absent
+  (testing "omitting it would turn a corrupt store into a shorter answer --
+            bytes quietly gone, looking exactly like a cache miss"
+    (let [blocks (atom {})
+          ctx {:blocks (fake-port blocks) :cid-of cid-of-fixture}]
+      (swap! blocks assoc cid {:bytes "tampered" :claimed other-cid})
+      (is (thrown? #?(:clj Exception :cljs js/Error) (blocks/get-block ctx cid)))
+      (is (nil? (blocks/get-block ctx "bafkreimissing"))
+          "a miss is still nil -- absence and corruption are different answers"))))
+
+(deftest the-mismatch-carries-what-was-expected-and-what-was-found
+  (let [ctx {:blocks (fake-port (atom {})) :cid-of cid-of-fixture}]
+    (try
+      (blocks/put-block! ctx other-cid {:bytes "x"})
+      (is false "should have thrown")
+      (catch #?(:clj Exception :cljs :default) e
+        (let [d (ex-data e)]
+          (is (= :kotobase.protocols/cid-mismatch (:type d)))
+          (is (= other-cid (:cid d)))
+          (is (= cid (:actual d))))))))
+
+(deftest without-cid-of-nothing-is-verified
+  (testing "what this namespace did unconditionally before -- stated in a test
+            so the deployment question 'do you have one?' has an answer"
+    (let [ctx {:blocks (fake-port (atom {}))}]
+      (blocks/put-block! ctx other-cid {:bytes "not really this cid"})
+      (is (= "not really this cid" (:bytes (blocks/get-block ctx other-cid)))))))
+
+;; ------------------------------- why the kotobase dependency cannot be dropped
+
+(defrecord RecordStore [a])
+
+(extend-type RecordStore
+  st/IStore
+  (-put [s coll k v] (swap! (:a s) assoc-in [:docs coll k] v) v)
+  (-get [s coll k] (get-in @(:a s) [:docs coll k]))
+  (-list [s coll] (vec (keys (get-in @(:a s) [:docs coll]))))
+  (-append [s stream event]
+    (swap! (:a s) update-in [:streams stream] (fnil conj []) event) event)
+  (-read [s stream _] (vec (get-in @(:a s) [:streams stream]))))
+
+(deftest a-record-shaped-istore-is-a-supported-shape-no-structural-test-can-see
+  (testing "`deps.edn` claimed src was the bottom of the stack; it is not, and
+            this is the control for why it cannot go back to being one. The
+            bare-IStore arity is selected by `satisfies? st/IStore`. Every
+            structural stand-in for that -- `map?`, `record?`, `(:store t)`,
+            `(:blocks t)` -- gets THIS store wrong, because an IStore reached
+            by `extend-type` over a `defrecord` IS a map and carries neither
+            key. `satisfies?` gets it right, and `satisfies?` needs the
+            protocol var."
+    (let [store (->RecordStore (atom {}))]
+      (is (satisfies? st/IStore store)
+          "it is a bare IStore -- the arity kotobase-protocols-worker calls")
+      (is (map? store)
+          "and it is ALSO a map: `map?` cannot tell it from a ctx")
+      (is (nil? (:blocks store))
+          "with no :blocks port, so `map?` routing would fall through...")
+      (is (nil? (:store store))
+          "...to (doc-port nil), on a store that works perfectly today")
+      ;; and it does work today, through the document plane, on both runtimes
+      (is (= {:bytes "hi" :content-type "application/octet-stream"}
+             (blocks/put-block! store cid {:bytes "hi"})))
+      (is (= "hi" (:bytes (blocks/get-block store cid))))
+      (is (= [cid] (vec (blocks/list-cids store))))
+      (is (= [{:surface :blocks :op :put :cid cid :size 2}]
+             (st/-read store :kotobase.protocols/audit 0))))))
+
+(deftest audit-needs-the-protocol-even-when-a-blocks-port-is-carried
+  (testing "the second half of the same control. `satisfies?` is not the only
+            line that needs `kotobase.store`: `audit!` calls `st/-append`, and
+            it does so on a ctx that HAS a :blocks port. So the dependency is
+            not confined to the legacy fallback -- it is on every path that
+            carries a `:store`, which is every deployed one."
+    (let [store (local/local-store)
+          ctx {:store store :blocks (fake-port (atom {}))}]
+      (blocks/put-block! ctx cid {:bytes "b"})
+      (is (seq (st/-read store :kotobase.protocols/audit 0))
+          "bytes went to the port; the audit event still went through st/-append"))))

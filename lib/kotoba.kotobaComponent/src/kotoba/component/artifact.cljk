@@ -1,0 +1,109 @@
+(ns kotoba.component.artifact
+  "Validated Component Model packaging for qualified Canonical ABI slices.
+
+  Portable since 2026-09-11 (amu ADR 0348 iteration 6). The packaging is the
+  same four files in a private temporary directory and the same two
+  `wasm-tools component` commands on both hosts; the digest is `MessageDigest`
+  on the JVM and `node:crypto` on Node. `:bytes` is the host's byte container
+  (`byte[]` / `Buffer`), and the preamble check reads octets on both."
+  {:kotoba/export [assert-qualified-slice! assert-scalar-slice! package target tool-version]}
+  (:require [kotoba.component.core :as component-core]
+            [kotoba.wasm.tools :as wasm-tools]
+            #?@(:cljs [["node:crypto" :as crypto]
+                       ["node:fs" :as fs]
+                       ["node:os" :as os]
+                       ["node:path" :as path]]))
+  #?(:clj (:import [java.nio.file Files]
+                   [java.nio.file.attribute FileAttribute]
+                   [java.security MessageDigest])))
+
+(def tool-version wasm-tools/version)
+(def target :wasm-component-kotoba-v1)
+
+(defn- reject [message data]
+  (throw (ex-info message (assoc data :phase :component-artifact))))
+
+(defn- hex2 [n]
+  (let [digits "0123456789abcdef" n (bit-and n 0xff)]
+    (str (.charAt digits (bit-shift-right n 4)) (.charAt digits (bit-and n 0xf)))))
+
+(defn- sha256 [bytes]
+  #?(:clj (let [digest (.digest (MessageDigest/getInstance "SHA-256") ^bytes bytes)]
+            (apply str (map hex2 digest)))
+     :cljs (-> (.createHash crypto "sha256") (.update bytes) (.digest "hex"))))
+
+(defn- preamble [bytes]
+  #?(:clj (mapv #(bit-and (int %) 0xff) (take 8 bytes))
+     :cljs (vec (js/Array.from (.subarray bytes 0 8)))))
+
+(defn assert-qualified-slice! [kir wit]
+  (let [lowering (component-core/assert-supported! kir)]
+    (when (and (seq (:imports wit))
+               (not (contains? #{:scalar-capability-call :record-capability-call
+                                  :variant-capability-call
+                                  :structural-union-capability-call
+                                  :different-variant-capability-call
+                                  :structural-union-match-module
+                                  ;; ADR 0076 increment 1: the general lowering
+                                  ;; now emits per-capability typed imports, so
+                                  ;; it may carry WIT imports too.
+                                  :scalar-with-capabilities
+                                  :scalar-literal-capability-call
+                                  :string-literal-unit-capability-call
+                                  :stream-byte-count-call
+                                  :object-put-block-call
+                                  :object-compare-and-set-call
+                                  :typed-v3-projected-call
+                                  :vector-i64-identity
+                                  :vector-i64-literal}
+                                lowering)))
+      (reject "component capability imports require Canonical provider lowering"
+              {:imports (:imports wit)}))
+    lowering))
+
+(defn assert-scalar-slice!
+  "Compatibility entry point retained for callers of the first artifact slice."
+  [kir wit]
+  (assert-qualified-slice! kir wit)
+  true)
+
+(defn package
+  "Embed WIT metadata into a compatible core module and produce a validated
+  Component Model binary with the pinned official toolchain."
+  [core-bytes kir wit]
+  (let [lowering (assert-qualified-slice! kir wit)]
+    (wasm-tools/assert-version!)
+    (let [dir #?(:clj (Files/createTempDirectory "kotoba-component-" (make-array FileAttribute 0))
+                 :cljs (.mkdtempSync fs (.join path (.tmpdir os) "kotoba-component-")))
+          file (fn [name] #?(:clj (.resolve dir name) :cljs (.join path dir name)))
+          world (file "world.wit")
+          core (file "core.wasm")
+          embedded (file "embedded.wasm")
+          component (file "component.wasm")]
+      (try
+        #?(:clj (do (Files/writeString world ^String (:source wit) (make-array java.nio.file.OpenOption 0))
+                    (Files/write core ^bytes core-bytes (make-array java.nio.file.OpenOption 0)))
+           :cljs (do (.writeFileSync fs world (:source wit) "utf8")
+                     (.writeFileSync fs core core-bytes)))
+        (wasm-tools/run-command!
+         (cond-> ["wasm-tools" "component" "embed" (str world) (str core)
+                  "--encoding" "utf8" "-o" (str embedded)]
+           (:world wit) (into ["--world" (:world wit)])))
+        (wasm-tools/run-command! ["wasm-tools" "component" "new" (str embedded)
+                                  "--reject-legacy-names" "-o" (str component)])
+        (let [bytes #?(:clj (Files/readAllBytes component)
+                       :cljs (.readFileSync fs component))]
+          (when-not (= [0 97 115 109 13 0 1 0] (preamble bytes))
+            (reject "component binary preamble is invalid" {}))
+          {:format :wasm-component/v1 :target (or (:target wit) target)
+           :component-world (:world wit)
+           :wasi-version "0.3.0"
+           :bytes bytes :sha256 (sha256 bytes) :wit-sha256 (:sha256 wit)
+           :imports (:imports wit) :exports (:exports wit)
+           :canonical-name-encoding :component-model/standard32
+           :canonical-lowering lowering
+           :tool {:name :wasm-tools :version tool-version}})
+        (finally
+          #?(:clj (do (doseq [p [component embedded core world]] (Files/deleteIfExists p))
+                      (Files/deleteIfExists dir))
+             :cljs (.rmSync fs dir #js {:recursive true :force true})))))))

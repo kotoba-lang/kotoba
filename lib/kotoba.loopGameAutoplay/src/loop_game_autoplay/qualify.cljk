@@ -1,0 +1,221 @@
+(ns loop-game-autoplay.qualify
+  "Qualify a trained champion on a real booted iOS Simulator, and record it.
+
+  ```
+  kbb --backend sci --classpath src:../shinka/src:../hinshitsu/src -m loop-game-autoplay.qualify \\
+      --champion target/run-champion.edn --seed 1
+  ```
+
+  Training happens in headless Chromium (see `loop-game-autoplay.train`).
+  This is the other half: the *same* page, the *same* driver, the *same*
+  genome, rendered by WebKit on a real device envelope, playing in real time,
+  with the frames captured.
+
+  ## Why `simctl openurl` and not a built app
+
+  `kotoba-lang/shell` can scaffold and build a WKWebView host, install it and
+  launch it, and that is the right path when the artefact under test is an
+  app. Here the artefact under test is a **web game** and a policy; a wrapper
+  app would add an Xcode project, a bundle ID and a signing story to the
+  evidence chain without changing what is rendered. `openurl` reaches the same
+  WebKit through Safari.
+
+  What that costs, recorded honestly in the receipt: the video contains
+  Safari's chrome, and there is no eval channel — which is why the driver
+  reports its own outcome back to the server that served it.
+
+  ## What the receipt claims
+
+  `hinshitsu.core/evidence` maps, aggregated by `hinshitsu.core/gate`. The
+  blankness check is ImageMagick's mean brightness on a real screenshot, not
+  a file-size proxy: a black screen is the failure mode that most looks like
+  success."
+  (:require ["fs" :as fs]
+            ["path" :as path]
+            ["child_process" :as cp]
+            [clojure.edn :as edn]
+            [kotoba.lang.text :as str]
+            [hinshitsu.core :as h]
+            [loop-game-autoplay.policy :as policy]
+            [loop-game-autoplay.server :as server]))
+
+(defn- arg [args k default]
+  (if-let [i (first (keep-indexed #(when (= %2 (str "--" k)) %1) args))]
+    (nth args (inc i) default)
+    default))
+
+(defn- sh
+  "Run a command and return `{:code :out :err}`. Synchronous on purpose --
+  every call here is a simctl step whose ordering is the point."
+  [cmd argv]
+  (let [r (cp/spawnSync cmd (clj->js argv) #js {:encoding "utf8"})]
+    {:code (.-status r)
+     :out (str/trim (or (.-stdout r) ""))
+     :err (str/trim (or (.-stderr r) ""))}))
+
+(defn- booted-udid []
+  (let [{:keys [out]} (sh "xcrun" ["simctl" "list" "devices" "booted" "-j"])
+        j (try (js->clj (js/JSON.parse out) :keywordize-keys true) (catch :default _ nil))
+        devs (mapcat val (:devices j))]
+    (some :udid devs)))
+
+(defn- sleep [ms] (js/Promise. (fn [r] (js/setTimeout r ms))))
+
+(defn- mean-brightness
+  "0.0 (black) .. 1.0 (white) via ImageMagick. `nil` if it could not be read."
+  [png]
+  (let [{:keys [code out]} (sh "magick" ["identify" "-format" "%[fx:mean]" png])]
+    (when (zero? code) (js/parseFloat out))))
+
+(defn- reported [srv phase]
+  (first (filter #(= phase (:phase %)) @(:results srv))))
+
+(defn- wait-for-end
+  "Poll the server's result box for the page's own end-of-run report.
+
+  The page pushes; we do not guess a duration. A `start` report arriving
+  without an `end` is a *different* outcome from nothing arriving at all --
+  the first says the phone loaded and played, the second says it never got
+  there -- so the receipt records both separately."
+  [srv timeout-ms]
+  (let [deadline (+ (js/Date.now) timeout-ms)
+        step (fn step []
+               (cond
+                 (reported srv "end") (js/Promise.resolve (reported srv "end"))
+                 (> (js/Date.now) deadline) (js/Promise.resolve nil)
+                 :else (.then (sleep 1000) step)))]
+    (step)))
+
+(defn -main [& args]
+  (let [champion-file (arg args "champion" "target/run-champion.edn")
+        out-dir (arg args "out-dir" "target/qualify")
+        seed (js/parseInt (arg args "seed" "1") 10)
+        timeout-ms (js/parseInt (arg args "timeout-ms" "180000") 10)
+        udid (or (arg args "udid" nil) (booted-udid))]
+    (when-not (fs/existsSync champion-file)
+      (println "champion not found:" champion-file) (js/process.exit 2))
+    (when-not udid
+      (println "no booted simulator. `xcrun simctl boot <udid>` first.") (js/process.exit 2))
+    (let [champ (edn/read-string (fs/readFileSync champion-file "utf8"))
+          game (:game champ)
+          _ (when-not (fs/existsSync game)
+              (println "game file from champion not found:" game) (js/process.exit 2))
+          _ (when-not (fs/existsSync out-dir) (fs/mkdirSync out-dir #js {:recursive true}))
+          video (path/join out-dir "run.mp4")
+          shot (path/join out-dir "run.png")]
+      (println (str "qualify: udid " udid))
+      (println (str "champion fitness " (:fitness champ) " from generation " (:found-in-generation champ)))
+      (-> (server/start! {:game-file game})
+          (.then
+           (fn [srv]
+             (let [url (str "http://127.0.0.1:" (:port srv) "/?mode=play&seed=" seed
+                                        ;; The DRIVER's shape ({:w :b}), not the champion's flat genome.
+                            ;; Handing it the genome is the bug that produced a
+                            ;; 20-minute video of a frozen level-up modal.
+                            "&genome=" (js/encodeURIComponent
+                                        (js/JSON.stringify
+                                         (clj->js (select-keys (policy/genome->policy (:genome champ))
+                                                               [:w :b])))))
+                   recorder (cp/spawn "xcrun" (clj->js ["simctl" "io" udid "recordVideo" "--codec" "h264" "-f" video])
+                                      #js {:stdio "ignore"})]
+               (println (str "serve:  http://127.0.0.1:" (:port srv) "/"))
+               (println "record: started")
+               (-> (sleep 1500)
+                   (.then (fn [_]
+                            (let [r (sh "xcrun" ["simctl" "openurl" udid url])]
+                              (println (str "openurl: exit " (:code r) (when (seq (:err r)) (str " " (:err r)))))
+                              r)))
+                   (.then (fn [openurl] (.then (sleep 12000) (fn [_] openurl))))
+                   ;; mid-run screenshot: the frame that proves the game was
+                   ;; actually rendering, not that the page merely loaded
+                   (.then (fn [openurl]
+                            ;; `shot-run` and not `shot`: the outer `shot` is
+                            ;; the PATH, and binding the command result to the
+                            ;; same name shadowed it -- `existsSync` then ran
+                            ;; against a map and reported a screenshot that had
+                            ;; in fact been written as missing.
+                            (let [s (sh "xcrun" ["simctl" "io" udid "screenshot" shot])]
+                              {:openurl openurl :shot-run s})))
+                   (.then (fn [ctx] (.then (wait-for-end srv (- timeout-ms 13500))
+                                           (fn [res] (assoc ctx :result res
+                                                            :started (reported srv "start"))))))
+                   (.then
+                    (fn [ctx]
+                      (.kill recorder "SIGINT")
+                      (-> (sleep 2500)
+                          (.then (fn [_] ctx)))))
+                   (.then
+                    (fn [{:keys [openurl shot-run result started]}]
+                      (server/stop! srv)
+                      (let [vsize (if (fs/existsSync video) (.-size (fs/statSync video)) 0)
+                            bright (when (fs/existsSync shot) (mean-brightness shot))
+                            evidences
+                            [(h/evidence (if (zero? (:code openurl)) :passed :failed)
+                                         ["openurl"]
+                                         (str "simctl openurl exited " (:code openurl))
+                                         {:command ["xcrun" "simctl" "openurl" udid "<url>"]})
+                             (h/evidence (if (and (zero? (:code shot-run)) (fs/existsSync shot)) :passed :failed)
+                                         ["screenshot"]
+                                         (str "screenshot " (if (fs/existsSync shot) "written" "missing"))
+                                         {:data {:path shot :exit (:code shot-run)}})
+                             (h/evidence (cond (nil? bright) :skipped
+                                               (> bright 0.02) :passed
+                                               :else :failed)
+                                         ["not-blank"]
+                                         (str "mean brightness " bright
+                                              " (a black screen is the failure that looks like success)")
+                                         {:data {:mean-brightness bright :threshold 0.02}})
+                             (h/evidence (if (> vsize 100000) :passed :failed)
+                                         ["recorded"]
+                                         (str "video " vsize " bytes")
+                                         {:data {:path video :bytes vsize}})
+                             (h/evidence (if started :passed :failed)
+                                         ["launched"]
+                                         (if started
+                                           (str "the page reported it started: " (:ua started))
+                                           "the page never reported starting — it may not have loaded at all")
+                                         {:data started})
+                             (h/evidence (if (reported srv "error") :failed :passed)
+                                         ["no-page-error"]
+                                         (if-let [e (reported srv "error")]
+                                           (str "the page reported an error: " (:error e))
+                                           "the page reported no error")
+                                         {:data (reported srv "error")})
+                             (h/evidence (cond (nil? result) :failed
+                                               (> (:survivedMs result) 5000) :passed
+                                               :else :failed)
+                                         ["played"]
+                                         (if result
+                                           (str "survived " (.toFixed (/ (:survivedMs result) 1000) 1)
+                                                "s, level " (:level result)
+                                                ", " (if (:won result) "won" "died"))
+                                           "the page never reported a result")
+                                         {:data result})]
+                            g (h/gate evidences {:required-checks #{"openurl" "launched" "no-page-error" "played" "recorded" "not-blank"}})
+                            receipt {:schema "loop-game-autoplay.qualify/v1"
+                                     :udid udid
+                                     :device-runtime (:out (sh "xcrun" ["simctl" "list" "devices" "booted"]))
+                                     :game game
+                                     :driver "autoplay-driver/v1"
+                                     :champion {:file champion-file
+                                                :training-fitness (:fitness champ)
+                                                :found-in-generation (:found-in-generation champ)
+                                                :obs-dim (:obs-dim champ)
+                                                :act-dim (:act-dim champ)}
+                                     :play-seed seed
+                                     :on-device result
+                                     :on-device-start started
+                                     :artifacts {:video video :video-bytes vsize
+                                                 :screenshot shot :mean-brightness bright}
+                                     :evidence evidences
+                                     :gate g}]
+                        (fs/writeFileSync (path/join out-dir "receipt.edn") (pr-str receipt))
+                        (println "")
+                        (doseq [e evidences]
+                          (println (str "  " (name (:hinshitsu/status e))
+                                        "  " (str/join "," (:hinshitsu/checks e))
+                                        "  " (:hinshitsu/detail e))))
+                        (println (str "\ngate: " (:hinshitsu/status g)))
+                        (println (str "receipt: " (path/join out-dir "receipt.edn")))
+                        (js/process.exit (if (h/passed? g) 0 1)))))))))
+          (.catch (fn [e] (println "ERROR" (str e)) (js/process.exit 1)))))))

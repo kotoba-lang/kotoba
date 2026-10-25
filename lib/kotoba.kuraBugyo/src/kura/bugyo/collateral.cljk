@@ -1,0 +1,216 @@
+(ns kura.bugyo.collateral
+  "How much a node must bond, and what it loses when it fails an audit.
+
+  Onboarding is **permissionless**; the bond is the barrier, not a gatekeeper
+  (ADR-2607299200 open question 1, resolved 2026-07-29). Anyone may run a
+  node. The bond is USDC, not a network token, for the reason
+  `kura.bugyo.pricing` gives: a security budget denominated in the thing whose
+  value depends on the network's reputation is worth least exactly when it is
+  needed most.
+
+  **Two anchors, and the larger wins.**
+
+  A bond that only deters is too small. The usual derivation asks what a
+  cheating node *gains* — storage cost avoided while undetected — and prices
+  the bond above it. Run that here and it comes out remarkably cheap, because
+  the audit is strong: 688 challenges catch 1% deletion with probability
+  0.999, so a node that deletes everything is caught in essentially one epoch
+  and gains one epoch of storage cost. For 10 TB at $1.50/TB-month that is
+  $15. A bond of $150 is a 10x deterrent and still trivial.
+
+  But the network's loss is not the node's gain. When a node's shards are
+  gone, somebody has to **rebuild them**, and rebuilding is the expensive
+  thing this whole design exists to minimise. Repairing what a node held costs
+  reading `r/k` of it from peers plus writing a replacement — traffic the
+  network pays for whether or not the node profited. So the second anchor is
+  the repair bill, and it is the larger one.
+
+  `bond-required` takes the max. Deterrence alone would leave the network
+  paying to clean up after cheap defections; repair cost alone would be
+  arbitrary if the audit were weak. Both are computed, neither is asserted."
+  (:require [erasure.lrc :as lrc]
+            [kura.audit :as audit]
+            [kura.bugyo.pricing :as pricing]))
+
+(def default-policy
+  {:safety-factor 3.0
+   :audit-fraction 0.01
+   :audit-confidence 0.999
+   :minimum-bond-usd 50.0})
+
+(defn policy [overrides] (merge default-policy overrides))
+
+;; --- anchor 1: what a cheat gains ------------------------------------------
+
+(defn epochs-undetected
+  "Expected epochs a node deleting fraction `f` survives before an audit
+  catches it, given `q` challenges per epoch.
+
+  `1 / P(detect)`. Small deletions hide longer but save less, which is why
+  the deterrence anchor peaks at total deletion rather than at some awkward
+  middle."
+  [f q]
+  (let [p (audit/detection-probability q f)]
+    (if (<= p 0.0) ##Inf (/ 1.0 p))))
+
+(defn deterrence-anchor-usd
+  "Storage cost a node avoids by deleting everything, before it is caught.
+
+  The worst case over deletion fractions is `f = 1`: a node that deletes all
+  of it saves all of it and is caught almost immediately, and any smaller
+  fraction saves proportionally less for not much longer. Computed by search
+  over fractions rather than assumed, so a weaker audit would move the peak
+  and the number would follow."
+  [rates pol physical-tb]
+  (let [q (audit/samples-needed (:audit-fraction pol) (- 1.0 (:audit-confidence pol)))
+        months (/ (double (get-in rates [:epoch-days :value])) 30.0)
+        rate (get-in rates [:node-storage-usd-tb-month :value])]
+    (apply max
+           (for [f [0.001 0.01 0.05 0.1 0.25 0.5 0.75 1.0]]
+             (* f physical-tb rate months (epochs-undetected f q))))))
+
+;; --- anchor 2: what the network pays to clean up ---------------------------
+
+(defn repair-cost-usd
+  "Cost of rebuilding everything a node held.
+
+  A lost shard is rebuilt by reading its local group — `r` shards for every
+  `k` of data, so `r/k` of the lost volume — and writing the replacement.
+  Both legs are egress the network pays for. This is the number the local
+  parity design drives down, and pricing the bond against it is what makes a
+  node's bond scale with the mess it can make."
+  [rates layout physical-tb]
+  (let [read-ratio (/ (double (:r layout)) (:k layout))
+        traffic-tb (* physical-tb (+ read-ratio 1.0))]
+    (* traffic-tb (get-in rates [:node-egress-usd-tb :value]))))
+
+;; --- the bond --------------------------------------------------------------
+
+(defn bond-required-usd
+  "USDC a node must lock to commit `physical-tb`.
+
+  `max(deterrence, repair) x safety`, floored at a minimum so that a trivially
+  small node still has something to lose. Returns the components as well as
+  the total: an operator deciding whether to join is owed the derivation, not
+  a number."
+  [rates pol layout physical-tb]
+  (let [deter (deterrence-anchor-usd rates pol physical-tb)
+        repair (repair-cost-usd rates layout physical-tb)
+        base (max deter repair)
+        bond (max (:minimum-bond-usd pol) (* base (:safety-factor pol)))]
+    {:physical-tb physical-tb
+     :deterrence-anchor-usd deter
+     :repair-anchor-usd repair
+     :binding-anchor (if (>= repair deter) :repair :deterrence)
+     :safety-factor (:safety-factor pol)
+     :bond-usd bond
+     :bond-usd-per-tb (if (zero? physical-tb) 0.0 (/ bond physical-tb))}))
+
+(defn payback-epochs
+  "How many epochs of earnings the bond is worth.
+
+  **Read `capital-cost` instead when deciding whether the bond is too
+  large.** This number frames the bond as if it were spent, and it is not —
+  it is collateral, returned when the node exits cleanly. At the modelled
+  rates it comes out around 5 epochs, which sounds prohibitive and is not:
+  what an operator actually gives up is the *return* on locked capital, not
+  the capital. Kept because it is the number people ask for first, labelled
+  because it is the wrong one to decide on."
+  [rates pol layout physical-tb]
+  (let [{:keys [bond-usd]} (bond-required-usd rates pol layout physical-tb)
+        earn (:total-usd (pricing/node-earnings rates {:physical-tb physical-tb}))]
+    (if (zero? earn) ##Inf (/ bond-usd earn))))
+
+(defn capital-cost
+  "What locking the bond actually costs an operator, as a fraction of the
+  revenue it protects.
+
+  The bond is returned; only the foregone return on it is a cost. At an
+  annual opportunity cost `apy` the drag is `bond x apy` per year against
+  `earnings x epochs-per-year` of revenue. This is the number that decides
+  whether a permissionless network has priced out its operators — a five
+  epoch payback at a few percent drag is a rounding error on a hardware
+  business, and reading the payback figure instead would have had us cutting
+  the safety factor to fix a problem that was not there."
+  ([rates pol layout physical-tb] (capital-cost rates pol layout physical-tb 0.10))
+  ([rates pol layout physical-tb apy]
+   (let [{:keys [bond-usd]} (bond-required-usd rates pol layout physical-tb)
+         epochs-per-year (/ 365.0 (get-in rates [:epoch-days :value]))
+         annual-revenue (* epochs-per-year
+                           (:total-usd (pricing/node-earnings
+                                        rates {:physical-tb physical-tb})))]
+     {:bond-usd bond-usd
+      :assumed-apy apy
+      :annual-carry-usd (* bond-usd apy)
+      :annual-revenue-usd annual-revenue
+      :drag-fraction (if (zero? annual-revenue) ##Inf
+                         (/ (* bond-usd apy) annual-revenue))})))
+
+;; --- slashing --------------------------------------------------------------
+
+(def slash-schedule
+  "What a failure costs, as a fraction of the bond.
+
+  Graduated, because the failures are not alike. A missed challenge may be a
+  network partition; sustained failures are not. Deleting data outright is
+  the thing the bond exists for and takes the lot.
+
+  `:unavailable` deliberately does not slash on the first occurrence — a node
+  that is punished for a reboot will not run, and availability is what the
+  grace period in `kura.repair` already handles."
+  {:audit-miss 0.0
+   :audit-fail 0.05
+   :audit-fail-repeated 0.25
+   :data-loss-confirmed 1.0
+   :unavailable-beyond-grace 0.10})
+
+(defn slash
+  "Apply a finding to a bond. Returns the deduction and what remains.
+
+  A bond that falls below the requirement does not silently continue: the
+  node is marked `:under-bonded`, which is the coordinator's signal to stop
+  placing new shards on it and to drain what it holds. Slashing that leaves a
+  node operating with too little at stake is a fine, not a bond.
+
+  **A node is not slashed for the absence it declared.** `:availability
+  :intermittent` says up front that the machine sleeps, and
+  `kura.placement/policy`'s `:max-intermittent` has already made the network
+  pay for that: it placed fewer shards there and kept the object readable from
+  always-on nodes alone. Deducting the bond as well counts the same fact
+  twice — and it would settle the question of whether consumer hardware can
+  join this network as *no*, because every laptop on earth would be fined for
+  going in a bag. Losing or corrupting data stays slashable at full weight;
+  that has nothing to do with being awake."
+  [{:keys [bond-usd required-usd availability]} finding]
+  (let [declared-absence? (and (= :intermittent availability)
+                               (= :unavailable-beyond-grace finding))
+        fraction (if declared-absence? 0.0 (get slash-schedule finding 0.0))
+        deducted (* bond-usd fraction)
+        remaining (- bond-usd deducted)]
+    {:finding finding
+     :fraction fraction
+     :waived-as-declared-absence? declared-absence?
+     :deducted-usd deducted
+     :remaining-usd remaining
+     :status (cond
+               (<= remaining 0.0) :forfeited
+               (< remaining required-usd) :under-bonded
+               :else :bonded)}))
+
+(defn onboarding-quote
+  "Everything a prospective operator needs to decide, in one call.
+
+  Permissionless means the answer to `can I join` is yes; this is the answer
+  to `should I`."
+  [rates pol layout physical-tb]
+  (let [bond (bond-required-usd rates pol layout physical-tb)
+        earn (pricing/node-earnings rates {:physical-tb physical-tb})]
+    (merge bond
+           {:epoch-earnings-usd (:total-usd earn)
+            :epoch-days (get-in rates [:epoch-days :value])
+            :payback-epochs (payback-epochs rates pol layout physical-tb)
+            :audit-challenges-per-epoch
+            (audit/samples-needed (:audit-fraction pol)
+                                  (- 1.0 (:audit-confidence pol)))
+            :slash-schedule slash-schedule
+            :tolerated-losses (lrc/max-tolerated-erasures layout)})))

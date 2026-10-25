@@ -1,0 +1,98 @@
+(ns kotoba.plm.demo
+  "End-to-end PLM→ERP thread demo. Run: kbb -M:run (or `kbb -M:demo`).
+
+   Builds a small make assembly over two buy components, releases them (EBOM→
+   MBOM→inventory→rolled cost), receives goods (perpetual inventory → GL), then
+   releases an ECO that raises a component's standard cost and watches it ripple
+   into a revaluation variance (design change → standard cost → P/L)."
+  (:require [kotoba.plm.db :as db]
+            [kotoba.plm.db-host :as db-host]
+            [kotoba.plm.item :as plm]
+            [kotoba.plm.erp :as erp]
+            [kotoba.plm.thread :as thread]
+            [kotoba.plm.mrp :as mrp]
+            [kotoba.plm.production :as prod]
+            [kotoba.plm.kotobase :as kb]
+            [kotoba.pprint :as pp]))
+
+(defn- line [] (println (apply str (repeat 72 "─"))))
+(defn- h [s] (line) (println s) (line))
+
+(defn- seed! [conn]
+  (db/tx! conn erp/chart)
+  ;; items first (so BOM-edge lookup refs resolve cleanly)
+  (db/tx! conn
+    [(plm/item {:part-no "PN-2000" :name "Resistor 10k"  :make-buy :buy :std-unit-cost 100 :category :electronic})
+     (plm/item {:part-no "PN-2001" :name "Capacitor 1uF" :make-buy :buy :std-unit-cost 50  :category :electronic})
+     (plm/item {:part-no "PN-1000" :name "Controller PCBA" :make-buy :make :category :assembly})])
+  ;; MBOM structure
+  (db/tx! conn
+    [(plm/bom-edge {:parent "PN-1000@A" :child "PN-2000@A" :qty 4 :find-no 1 :ref-designator "R1-R4" :view :mbom})
+     (plm/bom-edge {:parent "PN-1000@A" :child "PN-2001@A" :qty 2 :find-no 2 :ref-designator "C1-C2" :view :mbom})]))
+
+(defn -main [& _]
+  (let [conn (db-host/fresh-conn)]
+    (seed! conn)
+
+    (h "1) Release components + assembly (released-gating: only released → ERP)")
+    (doseq [iid ["PN-2000@A" "PN-2001@A" "PN-1000@A"]]
+      (println " release-item!" iid "→" (thread/release-item! conn iid)))
+    (println " draft no-op check (PN-9999@A):" (thread/release-item! conn "PN-9999@A"))
+
+    (h "2) Receive 10 × PN-1000@A at standard (perpetual inventory → GL)")
+    (println " receive-goods!" (thread/receive-goods! conn "PN-1000@A" 10))
+
+    (let [d (db/db conn)]
+      (h "   Inventory after receipt")
+      (doseq [r (erp/inventory-rows d)] (println "  " r))
+      (println "   total inventory value =" (erp/inventory-value d)))
+
+    (h "3) Release ECO-1: raise PN-2000 standard 100 → 130 (design change)")
+    (db/tx! conn [(plm/change-order {:id "ECO-1" :kind :eco
+                                     :affected ["PN-2000@A"] :new-unit-cost 130})])
+    (let [res (thread/release-eco! conn "ECO-1")]
+      (println " release-eco! →" (dissoc res :parents))
+      (doseq [p (:parents res)] (println "   parent revalue:" p)))
+
+    (let [d (db/db conn)]
+      (h "   Inventory after revaluation")
+      (doseq [r (erp/inventory-rows d)] (println "  " r))
+      (println "   total inventory value =" (erp/inventory-value d))
+
+      (h "   Trial balance (GL)")
+      (doseq [[code {:keys [name debit credit balance]}] (sort (erp/trial-balance d))]
+        (println (format "   %-5s %-32s Dr %10s Cr %10s  bal %10s"
+                         code name (str debit) (str credit) (str balance))))
+
+      (h "   OCEL event thread (APQC-tagged)")
+      (doseq [e (erp/ocel-log d)]
+        (println (format "   %-22s APQC %-5s" (str (:type e)) (:apqc e)))))
+
+    (h "4) MRP: explode demand 10 × PN-1000@A → net on-hand → auto PO")
+    (let [r (mrp/mrp-run! conn "PN-1000@A" 10)]
+      (doseq [o (:ordered r)] (println "   PO" (:item o) "qty" (:net o) "@unit" (:unit-cost o))))
+
+    (h "5) Revision: PN-1000 A→B (inherits BOM), release supersedes A")
+    (db/tx! conn (plm/revise-item-tx (db/db conn) "PN-1000@A" "B"))
+    (println " release-item! PN-1000@B →"
+             (select-keys (thread/release-item! conn "PN-1000@B") [:ok :rolled-cost :superseded]))
+    (println " lifecycle PN-1000@A =" (plm/lifecycle (db/db conn) "PN-1000@A")
+             "| PN-1000@B =" (plm/lifecycle (db/db conn) "PN-1000@B"))
+
+    (h "6) Production: stock components, complete 5 × PN-1000@B (backflush WIP)")
+    (thread/receive-goods! conn "PN-2000@A" 20)
+    (thread/receive-goods! conn "PN-2001@A" 10)
+    (println " complete-production! →"
+             (select-keys (prod/complete-production! conn "PN-1000@B" 5)
+                          [:ok :wip-cleared :finished-value]))
+    (let [d (db/db conn)
+          tb (erp/trial-balance d)]
+      (println "   WIP(1500) balance =" (get-in tb ["1500" :balance]) "(closed)")
+      (println "   PN-1000@B on-hand =" (db/attr d :erp.inventory/qty-on-hand [:erp.inventory/id "INV-PN-1000@B"])))
+
+    (h "7) kotobase projection: PLM item → kg.ingest entity (tenant write path)")
+    (pp/pprint (kb/item->kg-entity (db/db conn) "PN-1000@B"))
+
+    (line)
+    (println "done — EBOM→MBOM→inventory→cost→GL + effectivity / MRP / revision / production + kotobase projection.")
+    (shutdown-agents)))

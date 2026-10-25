@@ -1,0 +1,98 @@
+(ns torch.huggingface-resource-test
+  (:require [json.data-json :as json]
+            [kotoba.test :refer [deftest is]]
+            [num.array :as arr]
+            [num.cpu :as cpu]
+            [torch.huggingface :as hf]
+            [torch.huggingface-resource :as resource]
+            [torch.model-registry :as registry]
+            [torch.num-backend :as nb]
+            [torch.registry-runtime :as runtime]
+            [torch.safetensors :as safe])
+  (:import [java.nio.file Files OpenOption]
+           [java.nio.file.attribute FileAttribute]))
+
+(deftest accounts-artifacts-and-runs-registry-lifecycle-once
+  (let [directory (Files/createTempDirectory "torch-hf-resource-"
+                                             (make-array FileAttribute 0))
+        config (.resolve directory "config.json")
+        checkpoint (.resolve directory "model.safetensors")
+        tokenizer (.resolve directory "tokenizer.json")
+        tokenizer-config (.resolve directory "tokenizer_config.json")
+        backend (cpu/cpu-backend)
+        loads (atom 0)
+        released (atom [])]
+    (try
+      (Files/write config (.getBytes "{}") (make-array OpenOption 0))
+      (Files/write tokenizer (.getBytes "{}") (make-array OpenOption 0))
+      (Files/write tokenizer-config (.getBytes "{}") (make-array OpenOption 0))
+      (safe/write-file! checkpoint
+                        {"weight" (arr/from-vec backend [1.0] [1])})
+      (let [descriptor (resource/descriptor
+                        "hf-tiny" config checkpoint
+                        {:tokenizer-path (str tokenizer)
+                         :tokenizer-config-path (str tokenizer-config)
+                         :digest "sha:test"})
+            expected-size (reduce + (map #(Files/size %)
+                                         [config checkpoint tokenizer
+                                          tokenizer-config]))]
+        (is (= expected-size (:size descriptor)))
+        (is (= 4 (count (:artifacts descriptor))))
+        (with-redefs [hf/load-llama-resource
+                      (fn [config-path checkpoint-path loaded-backend options]
+                        (swap! loads inc)
+                        {:config-path config-path :checkpoint-path checkpoint-path
+                         :backend loaded-backend :options options
+                         :model :model :tokenizer :tokenizer
+                         :weights [{:w :weight}]})
+                      nb/release-weights! #(swap! released conj %)]
+          (let [callbacks (resource/callbacks
+                           backend #(assoc % :kind :sync-engine))
+                registry* (-> (registry/registry (* 2 expected-size)
+                                                 (:load-fn callbacks)
+                                                 (:unload-fn callbacks))
+                              (registry/register descriptor))
+                runtime* (runtime/runtime registry*)
+                first-acquire (runtime/acquire! runtime* "hf-tiny" 10)
+                second-acquire (runtime/acquire! runtime* "hf-tiny" 11)]
+            (is (:loaded? first-acquire))
+            (is (not (:loaded? second-acquire)))
+            (is (= :sync-engine (get-in first-acquire [:resource :engine :kind])))
+            (is (= 1 @loads))
+            (runtime/release! runtime* "hf-tiny" 20 0)
+            (runtime/release! runtime* "hf-tiny" 21 0)
+            (runtime/expire! runtime* 21)
+            (is (= 1 (count @released)))
+            (is (= 0 (:loaded-models (runtime/stats runtime*)))))))
+      (finally
+        (doseq [path [tokenizer-config tokenizer checkpoint config directory]]
+          (Files/deleteIfExists path))))))
+
+(deftest descriptor-counts-index-and-every-distinct-shard
+  (let [directory (Files/createTempDirectory "torch-hf-shard-size-"
+                                             (make-array FileAttribute 0))
+        config (.resolve directory "config.json")
+        index (.resolve directory "model.safetensors.index.json")
+        shard-a (.resolve directory "model-00001-of-00002.safetensors")
+        shard-b (.resolve directory "model-00002-of-00002.safetensors")
+        backend (cpu/cpu-backend)]
+    (try
+      (Files/write config (.getBytes "{}") (make-array OpenOption 0))
+      (safe/write-file! shard-a {"a" (arr/from-vec backend [1.0] [1])})
+      (safe/write-file! shard-b {"b" (arr/from-vec backend [2.0] [1])})
+      (Files/writeString
+       index
+       (json/write-str
+        {"weight_map" {"a" "model-00001-of-00002.safetensors"
+                       "b" "model-00002-of-00002.safetensors"}})
+       (make-array OpenOption 0))
+      (let [descriptor (resource/descriptor "sharded" config index)
+            expected (reduce + (map #(Files/size %)
+                                    [config index shard-a shard-b]))]
+        (is (= expected (:size descriptor)))
+        (is (= 4 (count (:artifacts descriptor))))
+        (is (some #(.endsWith ^String % "model-00002-of-00002.safetensors")
+                  (:artifacts descriptor))))
+      (finally
+        (doseq [path [index shard-b shard-a config directory]]
+          (Files/deleteIfExists path))))))

@@ -1,0 +1,79 @@
+(ns torch.gguf-bundle-export
+  "Export a compact manifest + binary-weight bundle for Deno/Metal."
+  (:require [kotoba.io :as kio] [num.array :as arr]
+            [num.cpu :as cpu]
+            [torch.generate :as generate]
+            [torch.gguf :as gguf]
+            [torch.gguf-resource :as resource]
+            [torch.metal-bundle-export :as export]
+            [torch.num-backend :as nb]
+            [torch.tokenizer :as tokenizer]))
+
+(defn- greedy-generate [backend loaded prompt-ids token-count]
+  (let [caches* (atom (nb/init-llama-caches backend (:model loaded) 32))]
+    (try
+      (let [prefill (reduce
+                     (fn [_ token-id]
+                       (let [step (nb/llama-lm-step
+                                   (:model loaded) (:weights loaded)
+                                   (arr/from-vec backend [token-id] [1]) @caches*)]
+                         (reset! caches* (:caches step)) step))
+                     nil prompt-ids)]
+        (loop [logits (:logits prefill) generated []]
+          (if (= token-count (count generated))
+            generated
+            (let [token-id (generate/sample-token
+                            (arr/->vec logits) {:temperature 0.0})
+                  step (nb/llama-lm-step
+                        (:model loaded) (:weights loaded)
+                        (arr/from-vec backend [token-id] [1]) @caches*)]
+              (reset! caches* (:caches step))
+              (recur (:logits step) (conj generated token-id))))))
+      (finally (nb/release-llama-caches! @caches*)))))
+
+(defn -main [& [gguf-path output-path]]
+  (when-not (and gguf-path output-path)
+    (throw (ex-info "usage: ... model.gguf target/bundle.tgb" {})))
+  (let [backend (cpu/cpu-backend)
+        loaded (resource/load-resource
+                backend (resource/descriptor "public-gguf" gguf-path))]
+    (try
+      (let [config (gguf/llama-config (:gguf loaded))
+            vocab (count (get-in loaded [:tokenizer :tokens]))
+            prompt-ids (tokenizer/encode (:tokenizer loaded) "Hello")
+            generated-ids (greedy-generate backend loaded prompt-ids 4)
+            continuous-fixtures
+            (mapv (fn [[id prompt]]
+                    (let [ids (tokenizer/encode (:tokenizer loaded) prompt)]
+                      {:id id :prompt prompt :prompt-ids ids
+                       :generated-ids (greedy-generate backend loaded ids 2)}))
+                  [[:a "Hello"] [:b "Hi there"] [:c "Hello world"]])
+            bundle {:format :torch/gguf-metal-bundle-v2
+                    :config (assoc config :vocab vocab)
+                    :chat-template (get-in loaded [:gguf :metadata
+                                                   "tokenizer.chat_template"])
+                    :details {:parent_model "" :format "gguf"
+                              :family "llama" :families ["llama"]
+                              :parameter_size "1.0M"
+                              :quantization_level "Q4_K_M"}
+                    :model-info {"general.architecture" "llama"
+                                 "general.parameter_count" 1032256
+                                 "llama.block_count" (:block-count config)
+                                 "llama.context_length" (:context-length config)
+                                 "llama.embedding_length" (:embed-dim config)
+                                 "llama.feed_forward_length" (:hidden-dim config)
+                                 "llama.attention.head_count" (:head-count config)
+                                 "llama.attention.head_count_kv" (:kv-head-count config)}
+                    :capabilities ["completion" "embedding"]
+                    :tokenizer (select-keys
+                                (:tokenizer loaded)
+                                [:tokens :merges :scores :model :space-prefix
+                                 :unk-id :bos-id :eos-id :add-bos? :add-eos?])
+                    :prompt-ids prompt-ids :generated-ids generated-ids
+                    :continuous-fixtures continuous-fixtures}
+            bundle (export/export! output-path bundle (:weights loaded))]
+        (prn {:status :exported :path output-path
+              :bytes (kio/length (kio/file output-path))
+              :weights (reduce + (map count (:weights bundle)))
+              :generated-ids generated-ids}))
+      (finally (resource/unload-resource! loaded)))))

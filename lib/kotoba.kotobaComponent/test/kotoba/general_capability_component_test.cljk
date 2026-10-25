@@ -1,0 +1,1321 @@
+(ns kotoba.general-capability-component-test
+  "ADR 0076 increment 1: a capability-using component is no longer restricted to
+  four hand-written single-function shapes.
+
+  The blocker was that the general component path imported the generic
+  `kotoba:typed`/`cap-call` intrinsic, which no WIT interface can be bound to.
+  Each `typed-cap-call` now becomes a call to its own typed import, so any
+  program shape works as long as its exports and capability calls are scalar.
+
+  `typed-cap-call` is a KIR form, not source syntax, so these fixtures build
+  KIR directly -- the same way `component-artifact-test` does."
+  (:require [kotoba.lang.error :as kerror] [kotoba.io :as kio] [kotoba.process :as shell]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.text :as str]
+            [kotoba.component.artifact :as artifact]
+            [kotoba.component.composition :as composition]
+            [kotoba.component.core :as component-core]
+            [kotoba.component.wit :as wit]))
+
+;; clock/now, id 7 in the component-model contract: interface "clock",
+;; function "now".
+(def ^:private clock-now 7)
+
+;; A shape that was rejected before this increment: a helper function, real
+;; computation on both sides of the capability call, two exports, and the same
+;; capability invoked from two places.
+(def ^:private multi-function-kir
+  {:format :kotoba.kir/v4
+   :exports ['measure 'twice]
+   :schemas {}
+   :functions [{:name 'scale :params ['x] :param-types [:i64] :result :i64
+                :body '(* x 2)}
+               {:name 'measure :params ['request] :param-types [:i64] :result :i64
+                :body (list '+ (list 'typed-cap-call clock-now :i64 :i64
+                                     '(scale request))
+                            7)}
+               {:name 'twice :params ['request] :param-types [:i64] :result :i64
+                :body (list '+
+                            (list 'typed-cap-call clock-now :i64 :i64 'request)
+                            (list 'typed-cap-call clock-now :i64 :i64 'request))}]})
+
+(def ^:private passthrough-kir
+  {:format :kotoba.kir/v4
+   :exports ['measure]
+   :schemas {}
+   :functions [{:name 'measure :params ['request] :param-types [:i64] :result :i64
+                :body (list 'typed-cap-call clock-now :i64 :i64 'request)}]})
+
+(def ^:private union-match-capability-kir
+  {:format :kotoba.kir/v4
+   :exports ['choose 'echo]
+   :schemas {}
+   :effects #{:clock/read}
+   :functions
+   [{:name 'choose
+     :params ['value 'fallback]
+     :param-types [[:option :i64] :i64]
+     :result :i64
+     :effects #{:clock/read}
+     :body (list 'option-match [:option :i64] 'value 'fallback 'item
+                 (list 'typed-cap-call clock-now :i64 :i64 'item))}
+    {:name 'echo
+     :params ['value]
+     :param-types [:i64]
+     :result :i64
+     :effects #{}
+     :body 'value}]})
+
+(deftest multi-function-capability-program-is-admitted
+  (testing "the general lowering claims a shape the allowlist never covered"
+    (is (= :scalar-with-capabilities
+           (component-core/assert-supported! multi-function-kir))))
+  (testing "a bare passthrough still takes the hand-written shape"
+    ;; Ordering matters: the four enumerated shapes stay ahead of the general
+    ;; one, so this increment changes no existing artifact.
+    (is (= :scalar-capability-call
+           (component-core/assert-supported! passthrough-kir)))))
+
+(deftest capability-imports-are-typed-and-deduplicated
+  (let [imports (component-core/scalar-capability-imports multi-function-kir)]
+    (testing "one import per capability id, not per call site"
+      (is (= 1 (count imports)))
+      (is (= clock-now (:id (first imports)))))
+    (testing "named for the standard32 binding wasm-tools resolves"
+      (is (= "cm32p2|kotoba:application/clock@1" (:module (first imports))))
+      (is (= "now" (:field (first imports)))))
+    (testing "signature is the scalar lowering: one i64 param, one i64 result"
+      ;; 0x60 functype, 1 param, 0x7e i64, 1 result, 0x7e i64.
+      (is (= [0x60 1 0x7e 1 0x7e] (:type (first imports)))))))
+
+(deftest capability-binding-is-fail-closed
+  (testing "an unknown capability id yields no bindings"
+    (is (nil? (component-core/scalar-capability-imports
+               (assoc-in passthrough-kir [:functions 0 :body]
+                         (list 'typed-cap-call 9999 :i64 :i64 'request))))))
+  (testing "a program with no capability call has no bindings"
+    (is (nil? (component-core/scalar-capability-imports
+               {:format :kotoba.kir/v4 :exports ['add] :schemas {}
+                :functions [{:name 'add :params ['l 'r] :param-types [:i64 :i64]
+                             :result :i64 :body '(+ l r)}]})))))
+
+(deftest emitted-core-module-binds-the-capability-directly
+  (let [bytes (component-core/emit multi-function-kir :wasm32-wasi-kotoba-v1)
+        text (String. (byte-array (map unchecked-byte bytes)) "ISO-8859-1")]
+    (testing "the module imports the typed capability"
+      (is (str/includes? text "cm32p2|kotoba:application/clock@1"))
+      (is (str/includes? text "now")))
+    (testing "the generic cap-call intrinsic is gone once a typed binding exists"
+      ;; `kotoba:typed` is the module name many intrinsics share, so its mere
+      ;; presence proves nothing. An import is encoded as
+      ;; <len> module <len> field, so the generic binding is exactly
+      ;; "kotoba:typed" followed by the length byte 8 and "cap-call".
+      ;; If this regresses the module still compiles, but nothing can bind the
+      ;; import -- exactly the failure this increment removes.
+      (is (not (str/includes? text (str "kotoba:typed" (char 8) "cap-call")))))))
+
+(deftest generic-intrinsic-is-still-used-without-a-typed-binding
+  ;; Negative control for the assertion above: with an unknown capability id
+  ;; there is no typed binding, so the generic import must still appear. Without
+  ;; this, that assertion could pass because the byte pattern never occurs.
+  (let [unbound (assoc-in passthrough-kir [:functions 0 :body]
+                          (list 'typed-cap-call clock-now :i64 :i64 'request))
+        bytes (component-core/emit
+               (assoc unbound :exports ['measure 'echo]
+                      :functions (conj (:functions unbound)
+                                       {:name 'echo :params ['x] :param-types [:i64]
+                                        :result :i64 :body 'x}))
+               :wasm32-wasi-kotoba-v1)
+        text (String. (byte-array (map unchecked-byte bytes)) "ISO-8859-1")]
+    (is (str/includes? text "cm32p2|kotoba:application/clock@1")
+        "a bound capability must reach the typed import")))
+
+(deftest structural-union-match-module-composes-with-a-named-capability
+  (let [world (wit/emit union-match-capability-kir)
+        imports (component-core/scalar-capability-imports
+                 union-match-capability-kir)
+        core (component-core/emit
+              union-match-capability-kir :wasm32-wasi-kotoba-v1)
+        component (artifact/package core union-match-capability-kir world)
+        text (String. (byte-array (map unchecked-byte core)) "ISO-8859-1")]
+    (is (= :structural-union-match-module
+           (component-core/assert-supported! union-match-capability-kir)))
+    (is (= [{:id clock-now
+             :module "cm32p2|kotoba:application/clock@1"
+             :field "now"
+             :type [0x60 1 0x7e 1 0x7e]}]
+           imports))
+    (is (str/includes? text "cm32p2|kotoba:application/clock@1"))
+    (is (not (str/includes? text (str "kotoba:typed" (char 8) "cap-call"))))
+    (is (= [:clock/now] (:imports world)))
+    (is (= :structural-union-match-module (:canonical-lowering component)))
+    (is (= [:clock/now] (:imports component))))
+  (let [unsupported
+        (-> union-match-capability-kir
+            (assoc :effects #{:unsupported/read})
+            (assoc-in [:functions 0 :body]
+                      (list 'option-match [:option :i64]
+                            'value 'fallback 'item
+                            (list 'typed-cap-call clock-now
+                                  :string :i64 'item))))]
+    (is (thrown-with-msg?
+         kerror/ExceptionInfo #"no qualified Canonical lowering"
+         (component-core/assert-supported! unsupported))
+        "a non-scalar capability cannot fall back to a generic ambient import")))
+
+(deftest structural-union-match-module-calls-an-aggregate-capability
+  (let [descriptor [:option :vector-i64]
+        kir {:format :kotoba.kir/v4
+             :exports ['choose 'echo]
+             :schemas {}
+             :effects #{:clock/read}
+             :functions
+             [{:name 'choose
+               :params ['value 'fallback]
+               :param-types [descriptor :i64]
+               :result :i64
+               :effects #{:clock/read}
+               :body
+               (list 'option-match descriptor 'value 'fallback 'items
+                     (list 'option-match descriptor
+                           (list 'typed-cap-call
+                                 clock-now descriptor descriptor
+                                 (list 'option-some-of descriptor 'items))
+                           'fallback 'returned
+                           (list 'vector-count 'returned)))}
+              {:name 'echo
+               :params ['value]
+               :param-types [:i64]
+               :result :i64
+               :effects #{}
+               :body 'value}]}
+        world (wit/emit kir)
+        core (component-core/emit kir :wasm32-wasi-kotoba-v1)
+        application (artifact/package core kir world)
+        provider
+        (composition/package-structural-union-identity-provider
+         :clock/now descriptor)
+        closed (composition/compose-closed application [provider])
+        path (kio/temp-file
+              "kotoba-match-aggregate-capability-" ".wasm")]
+    (try
+      (kio/write-bytes path ^bytes (:bytes closed))
+      (is (= :structural-union-match-module
+             (component-core/assert-supported! kir)))
+      (is (= [:clock/now] (:imports application)))
+      (doseq [[invoke expected]
+              [["choose(none, 9)" "9"]
+               ["choose(some([]), 9)" "0"]
+               ["choose(some([1, -2, 3]), 9)" "3"]]]
+        (let [run (shell/sh "wasmtime" "run" "--invoke"
+                            invoke (str path))]
+          (is (zero? (:exit run)) (:err run))
+          (is (= expected (str/trim (:out run))) invoke)))
+      (let [maximum-values (str/join "," (repeat 16384 "0"))
+            maximum (shell/sh
+                     "wasmtime" "run" "--invoke"
+                     (str "choose(some([" maximum-values "]), 9)")
+                     (str path))
+            over-values (str maximum-values ",0")
+            over (shell/sh
+                  "wasmtime" "run" "--invoke"
+                  (str "choose(some([" over-values "]), 9)")
+                  (str path))]
+        (is (zero? (:exit maximum)) (:err maximum))
+        (is (= "16384" (str/trim (:out maximum))))
+        (is (not (zero? (:exit over)))
+            "the Canonical boundary rejects 16,385 list elements"))
+      (finally
+        (kio/delete-if-exists path)))))
+
+(deftest structural-union-match-module-calls-a-f64-list-capability
+  (let [descriptor [:option :vector-f64]
+        kir {:format :kotoba.kir/v4
+             :exports ['choose 'echo]
+             :schemas {}
+             :effects #{:clock/read}
+             :functions
+             [{:name 'choose
+               :params ['value 'fallback]
+               :param-types [descriptor :i64]
+               :result :i64
+               :effects #{:clock/read}
+               :body
+               (list 'option-match descriptor 'value 'fallback 'items
+                     (list 'option-match descriptor
+                           (list 'typed-cap-call
+                                 clock-now descriptor descriptor
+                                 (list 'option-some-of descriptor 'items))
+                           'fallback 'returned
+                           (list 'vector-f64-count 'returned)))}
+              {:name 'echo
+               :params ['value]
+               :param-types [:i64]
+               :result :i64
+               :effects #{}
+               :body 'value}]}
+        application
+        (artifact/package
+         (component-core/emit kir :wasm32-wasi-kotoba-v1)
+         kir (wit/emit kir))
+        provider
+        (composition/package-structural-union-identity-provider
+         :clock/now descriptor)
+        closed (composition/compose-closed application [provider])
+        path (kio/temp-file
+              "kotoba-match-f64-list-capability-" ".wasm")]
+    (try
+      (kio/write-bytes path ^bytes (:bytes closed))
+      (is (= :structural-union-match-module
+             (component-core/assert-supported! kir)))
+      (is (= [:clock/now] (:imports application)))
+      (doseq [[invoke expected]
+              [["choose(none, 9)" "9"]
+               ["choose(some([]), 9)" "0"]
+               ["choose(some([1.5, -2.25, 3.0]), 9)" "3"]]]
+        (let [run (shell/sh "wasmtime" "run" "--invoke"
+                            invoke (str path))]
+          (is (zero? (:exit run)) (:err run))
+          (is (= expected (str/trim (:out run))) invoke)))
+      (finally
+        (kio/delete-if-exists path)))))
+
+(deftest structural-result-list-match-calls-a-named-capability
+  (doseq [[descriptor count-op values]
+          [[[:result :vector-i64 :vector-i64]
+            'vector-count "[1, -2, 3]"]
+           [[:result :vector-f64 :vector-f64]
+            'vector-f64-count "[1.5, -2.25, 3.0]"]]]
+    (let [inner
+          (fn [constructor binder]
+            (list 'result-match-of descriptor
+                  (list 'typed-cap-call
+                        clock-now descriptor descriptor
+                        (list constructor descriptor binder))
+                  'returned-ok (list count-op 'returned-ok)
+                  'returned-err (list count-op 'returned-err)))
+          kir {:format :kotoba.kir/v4
+               :exports ['choose 'echo]
+               :schemas {}
+               :effects #{:clock/read}
+               :functions
+               [{:name 'choose
+                 :params ['value]
+                 :param-types [descriptor]
+                 :result :i64
+                 :effects #{:clock/read}
+                 :body
+                 (list 'result-match-of descriptor 'value
+                       'ok-items (inner 'result-ok-of 'ok-items)
+                       'err-items (inner 'result-err-of 'err-items))}
+                {:name 'echo
+                 :params ['value]
+                 :param-types [:i64]
+                 :result :i64
+                 :effects #{}
+                 :body 'value}]}
+          application
+          (artifact/package
+           (component-core/emit kir :wasm32-wasi-kotoba-v1)
+           kir (wit/emit kir))
+          provider
+          (composition/package-structural-union-identity-provider
+           :clock/now descriptor)
+          closed (composition/compose-closed application [provider])
+          path (kio/temp-file
+                "kotoba-result-list-match-capability-" ".wasm")]
+      (try
+        (kio/write-bytes path ^bytes (:bytes closed))
+        (is (= :structural-union-match-module
+               (component-core/assert-supported! kir)))
+        (is (= [:clock/now] (:imports application)))
+        (doseq [[invoke expected]
+                [[(str "choose(ok(" values "))") "3"]
+                 [(str "choose(err(" values "))") "3"]
+                 ["echo(11)" "11"]]]
+          (let [run (shell/sh "wasmtime" "run" "--invoke"
+                              invoke (str path))]
+            (is (zero? (:exit run)) (:err run))
+            (is (= expected (str/trim (:out run))) invoke)))
+        (finally
+          (kio/delete-if-exists path))))))
+
+(deftest structural-string-like-match-calls-a-named-capability
+  (doseq [[descriptor body calls]
+          (for [leaf [:string :keyword]
+                kind [:option :result]
+                :let [descriptor (if (= kind :option)
+                                   [:option leaf]
+                                   [:result leaf leaf])
+                      inner
+                      (fn [constructor binder]
+                        (if (= kind :option)
+                          (list 'option-match descriptor
+                                (list 'typed-cap-call
+                                      clock-now descriptor descriptor
+                                      (list constructor descriptor binder))
+                                9 'returned
+                                (list 'string-byte-length 'returned))
+                          (list 'result-match-of descriptor
+                                (list 'typed-cap-call
+                                      clock-now descriptor descriptor
+                                      (list constructor descriptor binder))
+                                'returned-ok
+                                (list 'string-byte-length 'returned-ok)
+                                'returned-err
+                                (list 'string-byte-length 'returned-err))))
+                      body (if (= kind :option)
+                             (list 'option-match descriptor 'value 9 'selected
+                                   (inner 'option-some-of 'selected))
+                             (list 'result-match-of descriptor 'value
+                                   'selected-ok
+                                   (inner 'result-ok-of 'selected-ok)
+                                   'selected-err
+                                   (inner 'result-err-of 'selected-err)))
+                      calls (if (= kind :option)
+                              [["choose(none)" "9"]
+                               ["choose(some(\"安全\"))" "6"]]
+                              [["choose(ok(\"安全\"))" "6"]
+                               ["choose(err(\"abc\"))" "3"]])]]
+            [descriptor body calls])]
+    (let [kir {:format :kotoba.kir/v4
+               :exports ['choose 'echo]
+               :schemas {}
+               :effects #{:clock/read}
+               :functions
+               [{:name 'choose
+                 :params ['value]
+                 :param-types [descriptor]
+                 :result :i64
+                 :effects #{:clock/read}
+                 :body body}
+                {:name 'echo
+                 :params ['value]
+                 :param-types [:i64]
+                 :result :i64
+                 :effects #{}
+                 :body 'value}]}
+          application
+          (artifact/package
+           (component-core/emit kir :wasm32-wasi-kotoba-v1)
+           kir (wit/emit kir))
+          provider
+          (composition/package-structural-union-identity-provider
+           :clock/now descriptor)
+          closed (composition/compose-closed application [provider])
+          path (kio/temp-file
+                "kotoba-string-like-match-capability-" ".wasm")]
+      (try
+        (kio/write-bytes path ^bytes (:bytes closed))
+        (is (= :structural-union-match-module
+               (component-core/assert-supported! kir)))
+        (is (= [:clock/now] (:imports application)))
+        (doseq [[invoke expected] calls]
+          (let [run (shell/sh "wasmtime" "run" "--invoke"
+                              invoke (str path))]
+            (is (zero? (:exit run)) (:err run))
+            (is (= expected (str/trim (:out run))) invoke)))
+        (finally
+          (kio/delete-if-exists path))))))
+
+(deftest structural-admitted-list-match-calls-a-named-capability
+  (doseq [[descriptor body calls]
+          (for [leaf [:string :keyword :bool]
+                kind [:option :result]
+                :let [list-type [:list leaf]
+                      descriptor (if (= kind :option)
+                                   [:option list-type]
+                                   [:result list-type list-type])
+                      inner
+                      (fn [constructor binder]
+                        (if (= kind :option)
+                          (list 'option-match descriptor
+                                (list 'typed-cap-call
+                                      clock-now descriptor descriptor
+                                      (list constructor descriptor binder))
+                                9 'returned
+                                (list 'vector-count 'returned))
+                          (list 'result-match-of descriptor
+                                (list 'typed-cap-call
+                                      clock-now descriptor descriptor
+                                      (list constructor descriptor binder))
+                                'returned-ok
+                                (list 'vector-count 'returned-ok)
+                                'returned-err
+                                (list 'vector-count 'returned-err))))
+                      body (if (= kind :option)
+                             (list 'option-match descriptor 'value 9 'selected
+                                   (inner 'option-some-of 'selected))
+                             (list 'result-match-of descriptor 'value
+                                   'selected-ok
+                                   (inner 'result-ok-of 'selected-ok)
+                                   'selected-err
+                                   (inner 'result-err-of 'selected-err)))
+                      items (if (= leaf :bool)
+                              "[true, false]"
+                              "[\"安全\", \"abc\"]")
+                      one-item (if (= leaf :bool) "[true]" "[\"x\"]")
+                      calls (if (= kind :option)
+                              [["choose(none)" "9"]
+                               ["choose(some([]))" "0"]
+                               [(str "choose(some(" items "))") "2"]]
+                              [[(str "choose(ok(" items "))") "2"]
+                               [(str "choose(err(" one-item "))") "1"]])]]
+            [descriptor body calls])]
+    (let [kir {:format :kotoba.kir/v4
+               :exports ['choose 'echo]
+               :schemas {}
+               :effects #{:clock/read}
+               :functions
+               [{:name 'choose
+                 :params ['value]
+                 :param-types [descriptor]
+                 :result :i64
+                 :effects #{:clock/read}
+                 :body body}
+                {:name 'echo
+                 :params ['value]
+                 :param-types [:i64]
+                 :result :i64
+                 :effects #{}
+                 :body 'value}]}
+          application
+          (artifact/package
+           (component-core/emit kir :wasm32-wasi-kotoba-v1)
+           kir (wit/emit kir))
+          provider
+          (composition/package-structural-union-identity-provider
+           :clock/now descriptor)
+          closed (composition/compose-closed application [provider])
+          path (kio/temp-file
+                "kotoba-indirect-list-match-capability-" ".wasm")]
+      (try
+        (kio/write-bytes path ^bytes (:bytes closed))
+        (is (= :structural-union-match-module
+               (component-core/assert-supported! kir)))
+        (is (= [:clock/now] (:imports application)))
+        (doseq [[invoke expected] calls]
+          (let [run (shell/sh "wasmtime" "run" "--invoke"
+                              invoke (str path))]
+            (is (zero? (:exit run)) (:err run))
+            (is (= expected (str/trim (:out run))) invoke)))
+        (finally
+          (kio/delete-if-exists path))))))
+
+(deftest structural-indirect-list-match-validates-untrusted-provider-results
+  (let [descriptor [:option [:list :string]]
+        kir {:format :kotoba.kir/v4
+             :exports ['choose 'echo]
+             :schemas {}
+             :effects #{:clock/read}
+             :functions
+             [{:name 'choose
+               :params ['value]
+               :param-types [descriptor]
+               :result :i64
+               :effects #{:clock/read}
+               :body
+               (list 'option-match descriptor 'value 9 'selected
+                     (list 'option-match descriptor
+                           (list 'typed-cap-call
+                                 clock-now descriptor descriptor
+                                 (list 'option-some-of descriptor 'selected))
+                           9 'returned
+                           (list 'vector-count 'returned)))}
+              {:name 'echo
+               :params ['value]
+               :param-types [:i64]
+               :result :i64
+               :effects #{}
+               :body 'value}]}
+        core (component-core/emit kir :wasm32-wasi-kotoba-v1)
+        path (kio/temp-file
+              "kotoba-indirect-list-provider-validation-" ".wasm")]
+    (try
+      (kio/write-bytes path ^bytes core)
+      (let [script
+            (str
+             "const fs=require('fs');let inst,mode=0,bad,over;"
+             "const imports={['cm32p2|kotoba:application/clock@1']:{"
+             "now:(disc,ptr,count,ret)=>{const v=new DataView(inst.exports.cm32p2_memory.buffer);"
+             "v.setUint8(ret,1);v.setUint32(ret+4,mode===0?bad:over,true);"
+             "v.setUint32(ret+8,mode===0?1:17,true);}}};"
+             "WebAssembly.instantiate(fs.readFileSync(process.argv[1]),imports)"
+             ".then(({instance})=>{inst=instance;const e=instance.exports;"
+             "e.cm32p2_initialize();const alloc=(a,n)=>e.cm32p2_realloc(0,0,a,n);"
+             "const request=alloc(4,8),byte=alloc(1,1);"
+             "bad=alloc(4,8);over=alloc(4,17*8);const shared=alloc(1,65536);"
+             "const v=new DataView(e.cm32p2_memory.buffer);"
+             "v.setUint8(byte,65);v.setUint32(request,byte,true);v.setUint32(request+4,1,true);"
+             "v.setUint32(bad,0xfffffff0,true);v.setUint32(bad+4,32,true);"
+             "for(let i=0;i<17;i++){v.setUint32(over+i*8,shared,true);"
+             "v.setUint32(over+i*8+4,65536,true);}"
+             "let malformed=false,aggregate=false;"
+             "try{e['cm32p2||choose'](1,request,1);}catch(_){malformed=true;}"
+             "mode=1;try{e['cm32p2||choose'](1,request,1);}catch(_){aggregate=true;}"
+             "console.log(JSON.stringify({malformed,aggregate}));"
+             "if(!malformed||!aggregate)process.exit(1);});")
+            run (shell/sh "node" "-e" script (str path))]
+        (is (zero? (:exit run)) (:err run))
+        (is (= "{\"malformed\":true,\"aggregate\":true}"
+               (str/trim (:out run)))))
+      (finally
+        (kio/delete-if-exists path)))))
+
+(deftest structural-bool-list-match-rejects-noncanonical-provider-items
+  (let [descriptor [:option [:list :bool]]
+        kir {:format :kotoba.kir/v4
+             :exports ['choose 'echo]
+             :schemas {}
+             :effects #{:clock/read}
+             :functions
+             [{:name 'choose
+               :params ['value]
+               :param-types [descriptor]
+               :result :i64
+               :effects #{:clock/read}
+               :body
+               (list 'option-match descriptor 'value 9 'selected
+                     (list 'option-match descriptor
+                           (list 'typed-cap-call
+                                 clock-now descriptor descriptor
+                                 (list 'option-some-of descriptor 'selected))
+                           9 'returned
+                           (list 'vector-count 'returned)))}
+              {:name 'echo
+               :params ['value]
+               :param-types [:i64]
+               :result :i64
+               :effects #{}
+               :body 'value}]}
+        core (component-core/emit kir :wasm32-wasi-kotoba-v1)
+        path (kio/temp-file
+              "kotoba-bool-list-provider-validation-" ".wasm")]
+    (try
+      (kio/write-bytes path ^bytes core)
+      (let [script
+            (str
+             "const fs=require('fs');let inst,bad;"
+             "const imports={['cm32p2|kotoba:application/clock@1']:{"
+             "now:(disc,ptr,count,ret)=>{const v=new DataView(inst.exports.cm32p2_memory.buffer);"
+             "v.setUint8(ret,1);v.setUint32(ret+4,bad,true);v.setUint32(ret+8,1,true);}}};"
+             "WebAssembly.instantiate(fs.readFileSync(process.argv[1]),imports)"
+             ".then(({instance})=>{inst=instance;const e=instance.exports;"
+             "e.cm32p2_initialize();const alloc=(a,n)=>e.cm32p2_realloc(0,0,a,n);"
+             "const request=alloc(1,1);bad=alloc(1,1);"
+             "const v=new DataView(e.cm32p2_memory.buffer);"
+             "v.setUint8(request,1);v.setUint8(bad,2);let trapped=false;"
+             "try{e['cm32p2||choose'](1,request,1);}catch(_){trapped=true;}"
+             "console.log(trapped);if(!trapped)process.exit(1);});")
+            run (shell/sh "node" "-e" script (str path))]
+        (is (zero? (:exit run)) (:err run))
+        (is (= "true" (str/trim (:out run)))))
+      (finally
+        (kio/delete-if-exists path)))))
+
+(deftest structural-record-list-match-validates-all-provider-item-bools
+  (let [inner-type
+        [:record :demo/match-inner [[:ok :bool] [:weight :f64]]]
+        item-type
+        [:record :demo/match-item
+         [[:x :i64] [:enabled :bool] [:inner [:ref :demo/match-inner]]]]
+        schemas {:demo/match-inner inner-type :demo/match-item item-type}
+        descriptor [:option [:list [:ref :demo/match-item]]]
+        body
+        (list 'option-match descriptor 'value 9 'selected
+              (list 'option-match descriptor
+                    (list 'typed-cap-call
+                          clock-now descriptor descriptor
+                          (list 'option-some-of descriptor 'selected))
+                    9 'returned
+                    (list 'vector-count 'returned)))
+        kir {:format :kotoba.kir/v4
+             :exports ['choose 'echo]
+             :schemas schemas
+             :effects #{:clock/read}
+             :functions
+             [{:name 'choose
+               :params ['value]
+               :param-types [descriptor]
+               :result :i64
+               :effects #{:clock/read}
+               :body body}
+              {:name 'echo
+               :params ['value]
+               :param-types [:i64]
+               :result :i64
+               :effects #{}
+               :body 'value}]}
+        application
+        (artifact/package
+         (component-core/emit kir :wasm32-wasi-kotoba-v1)
+         kir (wit/emit kir))
+        provider
+        (composition/package-structural-union-identity-provider
+         :clock/now descriptor schemas)
+        closed (composition/compose-closed application [provider])
+        path (kio/temp-file
+              "kotoba-record-list-match-capability-" ".wasm")
+        core-path (kio/temp-file
+                   "kotoba-record-list-provider-validation-" ".wasm")]
+    (try
+      (kio/write-bytes path ^bytes (:bytes closed))
+      (kio/write-bytes core-path
+                   ^bytes (component-core/emit kir :wasm32-wasi-kotoba-v1))
+      (is (= :structural-union-match-module
+             (component-core/assert-supported! kir)))
+      (doseq [[invoke expected]
+              [["choose(none)" "9"]
+               ["choose(some([]))" "0"]
+               [(str "choose(some([{x: 7, enabled: true, "
+                     "inner: {ok: false, weight: 1.5}}]))")
+                "1"]]]
+        (let [run (shell/sh "wasmtime" "run" "--invoke"
+                            invoke (str path))]
+          (is (zero? (:exit run)) (:err run))
+          (is (= expected (str/trim (:out run))) invoke)))
+      (let [script
+            (str
+             "const fs=require('fs');let inst,bad;"
+             "const imports={['cm32p2|kotoba:application/clock@1']:{"
+             "now:(disc,ptr,count,ret)=>{const v=new DataView(inst.exports.cm32p2_memory.buffer);"
+             "v.setUint8(ret,1);v.setUint32(ret+4,bad,true);v.setUint32(ret+8,1,true);}}};"
+             "WebAssembly.instantiate(fs.readFileSync(process.argv[1]),imports)"
+             ".then(({instance})=>{inst=instance;const e=instance.exports;"
+             "e.cm32p2_initialize();const alloc=(a,n)=>e.cm32p2_realloc(0,0,a,n);"
+             "const request=alloc(8,32);bad=alloc(8,32);"
+             "const v=new DataView(e.cm32p2_memory.buffer);"
+             "v.setBigInt64(request,7n,true);v.setUint8(request+8,1);"
+             "v.setUint8(request+16,0);v.setFloat64(request+24,1.5,true);"
+             "v.setBigInt64(bad,7n,true);v.setUint8(bad+8,2);"
+             "v.setUint8(bad+16,0);v.setFloat64(bad+24,1.5,true);"
+             "let trapped=false;try{e['cm32p2||choose'](1,request,1);}catch(_){trapped=true;}"
+             "console.log(trapped);if(!trapped)process.exit(1);});")
+            run (shell/sh "node" "-e" script (str core-path))]
+        (is (zero? (:exit run)) (:err run))
+        (is (= "true" (str/trim (:out run)))))
+      (finally
+        (kio/delete-if-exists path)
+        (kio/delete-if-exists core-path)))))
+
+(deftest structural-union-list-match-validates-only-active-provider-cases
+  (let [item-type [:result :string :bool]
+        descriptor [:option [:list item-type]]
+        body
+        (list 'option-match descriptor 'value 9 'selected
+              (list 'option-match descriptor
+                    (list 'typed-cap-call
+                          clock-now descriptor descriptor
+                          (list 'option-some-of descriptor 'selected))
+                    9 'returned
+                    (list 'vector-count 'returned)))
+        kir {:format :kotoba.kir/v4
+             :exports ['choose 'echo]
+             :schemas {}
+             :effects #{:clock/read}
+             :functions
+             [{:name 'choose
+               :params ['value]
+               :param-types [descriptor]
+               :result :i64
+               :effects #{:clock/read}
+               :body body}
+              {:name 'echo :params ['value] :param-types [:i64]
+               :result :i64 :effects #{} :body 'value}]}
+        application
+        (artifact/package
+         (component-core/emit kir :wasm32-wasi-kotoba-v1)
+         kir (wit/emit kir))
+        provider
+        (composition/package-structural-union-identity-provider
+         :clock/now descriptor)
+        closed (composition/compose-closed application [provider])
+        component-path
+        (kio/temp-file
+         "kotoba-union-list-match-capability-" ".wasm")
+        core-path
+        (kio/temp-file
+         "kotoba-union-list-provider-validation-" ".wasm")]
+    (try
+      (kio/write-bytes component-path ^bytes (:bytes closed))
+      (kio/write-bytes core-path
+                   ^bytes (component-core/emit kir :wasm32-wasi-kotoba-v1))
+      (is (= :structural-union-match-module
+             (component-core/assert-supported! kir)))
+      (let [run (shell/sh "wasmtime" "run" "--invoke"
+                          "choose(some([ok(\"safe\"), err(true)]))"
+                          (str component-path))]
+        (is (zero? (:exit run)) (:err run))
+        (is (= "2" (str/trim (:out run)))))
+      (let [script
+            (str
+             "const fs=require('fs');let inst,mode=0,returned,shared;"
+             "const imports={['cm32p2|kotoba:application/clock@1']:{"
+             "now:(disc,ptr,count,ret)=>{const v=new DataView(inst.exports.cm32p2_memory.buffer);"
+             "v.setUint8(ret,1);v.setUint32(ret+4,returned,true);"
+             "if(mode===4){v.setUint32(ret+8,17,true);"
+             "for(let i=0;i<17;i++){const p=returned+i*12;v.setUint8(p,0);"
+             "v.setUint32(p+4,shared,true);v.setUint32(p+8,65536,true);}}"
+             "else{v.setUint32(ret+8,1,true);"
+             "if(mode===0){v.setUint8(returned,1);v.setUint32(returned+4,0xffffff01,true);}"
+             "if(mode===1){v.setUint8(returned,1);v.setUint8(returned+4,2);}"
+             "if(mode===2){v.setUint8(returned,0);v.setUint32(returned+4,0xfffffff0,true);v.setUint32(returned+8,32,true);}"
+             "if(mode===3){v.setUint8(returned,2);}}}}};"
+             "WebAssembly.instantiate(fs.readFileSync(process.argv[1]),imports)"
+             ".then(({instance})=>{inst=instance;const e=instance.exports;"
+             "e.cm32p2_initialize();const alloc=(a,n)=>e.cm32p2_realloc(0,0,a,n);"
+             "const request=alloc(4,12);returned=alloc(4,17*12);shared=alloc(1,65536);"
+             "const v=new DataView(e.cm32p2_memory.buffer);"
+             "v.setUint8(request,1);v.setUint32(request+4,0xffffff00,true);"
+             "let outcomes=[];for(mode=0;mode<5;mode++){let trapped=false;"
+             "try{e['cm32p2||choose'](1,request,1);}catch(_){trapped=true;}"
+             "outcomes.push(trapped);}console.log(JSON.stringify(outcomes));"
+             "if(JSON.stringify(outcomes)!=='[false,true,true,true,true]')process.exit(1);});")
+            run (shell/sh "node" "-e" script (str core-path))]
+        (is (zero? (:exit run)) (:err run))
+        (is (= "[false,true,true,true,true]" (str/trim (:out run)))))
+      (finally
+        (kio/delete-if-exists component-path)
+        (kio/delete-if-exists core-path)))))
+
+(deftest structural-recursive-list-match-validates-the-active-value-graph
+  (let [inner-type
+        [:record :demo/recursive-inner [[:tag :keyword] [:enabled :bool]]]
+        item-type
+        [:record :demo/recursive-item
+         [[:label :string]
+          [:choice [:result [:list :bool] [:ref :demo/recursive-inner]]]]]
+        schemas {:demo/recursive-inner inner-type
+                 :demo/recursive-item item-type}
+        descriptor [:option [:list [:ref :demo/recursive-item]]]
+        body
+        (list 'option-match descriptor 'value 9 'selected
+              (list 'option-match descriptor
+                    (list 'typed-cap-call
+                          clock-now descriptor descriptor
+                          (list 'option-some-of descriptor 'selected))
+                    9 'returned
+                    (list 'vector-count 'returned)))
+        kir {:format :kotoba.kir/v4
+             :exports ['choose 'echo]
+             :schemas schemas
+             :effects #{:clock/read}
+             :functions
+             [{:name 'choose :params ['value] :param-types [descriptor]
+               :result :i64 :effects #{:clock/read} :body body}
+              {:name 'echo :params ['value] :param-types [:i64]
+               :result :i64 :effects #{} :body 'value}]}
+        application
+        (artifact/package
+         (component-core/emit kir :wasm32-wasi-kotoba-v1)
+         kir (wit/emit kir))
+        provider
+        (composition/package-structural-union-identity-provider
+         :clock/now descriptor schemas)
+        closed (composition/compose-closed application [provider])
+        component-path
+        (kio/temp-file
+         "kotoba-recursive-list-match-capability-" ".wasm")
+        core-path
+        (kio/temp-file
+         "kotoba-recursive-list-provider-validation-" ".wasm")]
+    (try
+      (kio/write-bytes component-path ^bytes (:bytes closed))
+      (kio/write-bytes core-path
+                   ^bytes (component-core/emit kir :wasm32-wasi-kotoba-v1))
+      (let [run
+            (shell/sh
+             "wasmtime" "run" "--invoke"
+             (str "choose(some([{label: \"outer\", "
+                  "choice: ok([true, false])}, "
+                  "{label: \"other\", choice: err({tag: \"safe\", "
+                  "enabled: true})}]))")
+             (str component-path))]
+        (is (zero? (:exit run)) (:err run))
+        (is (= "2" (str/trim (:out run)))))
+      (let [script
+            (str
+             "const fs=require('fs');let inst,mode=0,returned,shared,bools;"
+             "const imports={['cm32p2|kotoba:application/clock@1']:{"
+             "now:(disc,ptr,count,ret)=>{const v=new DataView(inst.exports.cm32p2_memory.buffer);"
+             "v.setUint8(ret,1);v.setUint32(ret+4,returned,true);"
+             "v.setUint32(ret+8,mode===4?17:1,true);"
+             "const fill=(p)=>{v.setUint32(p,shared,true);v.setUint32(p+4,0,true);"
+             "v.setUint8(p+8,1);v.setUint32(p+12,shared,true);"
+             "v.setUint32(p+16,0,true);v.setUint8(p+20,0);};"
+             "if(mode===4){for(let i=0;i<17;i++){const p=returned+i*24;fill(p);"
+             "v.setUint32(p,shared,true);v.setUint32(p+4,65536,true);}}"
+             "else{fill(returned);"
+             "if(mode===1){v.setUint32(returned,0xfffffff0,true);v.setUint32(returned+4,32,true);}"
+             "if(mode===2){v.setUint8(returned+8,0);v.setUint32(returned+12,bools,true);"
+             "v.setUint32(returned+16,1,true);v.setUint8(bools,2);}"
+             "if(mode===3){v.setUint8(returned+20,2);}"
+             "if(mode===5){v.setUint8(returned+8,0);v.setUint32(returned+12,bools,true);"
+             "v.setUint32(returned+16,16384,true);}"
+             "if(mode===6){v.setUint32(returned,shared,true);v.setUint32(returned+4,2,true);"
+             "v.setUint8(shared,0xc0);v.setUint8(shared+1,0x80);}"
+             "if(mode===7){v.setUint32(returned,shared,true);v.setUint32(returned+4,3,true);"
+             "v.setUint8(shared,0xed);v.setUint8(shared+1,0xa0);v.setUint8(shared+2,0x80);}"
+             "if(mode===8){v.setUint32(returned,shared,true);v.setUint32(returned+4,4,true);"
+             "v.setUint8(shared,0xf4);v.setUint8(shared+1,0x90);"
+             "v.setUint8(shared+2,0x80);v.setUint8(shared+3,0x80);}"
+             "if(mode===9){v.setUint32(returned,shared,true);v.setUint32(returned+4,2,true);"
+             "v.setUint8(shared,0xe2);v.setUint8(shared+1,0x82);}"
+             "if(mode===10){v.setUint32(returned,shared,true);v.setUint32(returned+4,3,true);"
+             "v.setUint8(shared,0xe5);v.setUint8(shared+1,0xae);v.setUint8(shared+2,0x89);}"
+             "}}}};"
+             "WebAssembly.instantiate(fs.readFileSync(process.argv[1]),imports)"
+             ".then(({instance})=>{inst=instance;const e=instance.exports;"
+             "e.cm32p2_initialize();const alloc=(a,n)=>e.cm32p2_realloc(0,0,a,n);"
+             "const request=alloc(4,24);returned=alloc(4,17*24);"
+             "shared=alloc(1,65536);bools=alloc(1,16384);"
+             "const v=new DataView(e.cm32p2_memory.buffer);"
+             "v.setUint32(request,shared,true);v.setUint32(request+4,0,true);"
+             "v.setUint8(request+8,1);v.setUint32(request+12,shared,true);"
+             "v.setUint32(request+16,0,true);v.setUint8(request+20,0);"
+             "let outcomes=[];for(mode=0;mode<11;mode++){let trapped=false;"
+             "try{e['cm32p2||choose'](1,request,1);}catch(_){trapped=true;}"
+             "outcomes.push(trapped);}console.log(JSON.stringify(outcomes));"
+             "if(JSON.stringify(outcomes)!=='[false,true,true,true,true,true,true,true,true,true,false]')process.exit(1);});")
+            run (shell/sh "node" "-e" script (str core-path))]
+        (is (zero? (:exit run)) (:err run))
+        (is (= "[false,true,true,true,true,true,true,true,true,true,false]"
+               (str/trim (:out run)))))
+      (finally
+        (kio/delete-if-exists component-path)
+        (kio/delete-if-exists core-path)))))
+
+(deftest structural-nested-list-match-shares-one-total-item-budget
+  (doseq [[descriptor invoke expected]
+          [[[:option [:list [:list :i64]]]
+            "choose(some([[1, 2], [], [-3]]))" "3"]
+           [[:option [:list [:list [:list :i64]]]]
+            "choose(some([[[1], [2, 3]], [[]]]))" "2"]]]
+    (let [body
+          (list 'option-match descriptor 'value 9 'selected
+                (list 'option-match descriptor
+                      (list 'typed-cap-call
+                            clock-now descriptor descriptor
+                            (list 'option-some-of descriptor 'selected))
+                      9 'returned
+                      (list 'vector-count 'returned)))
+          kir {:format :kotoba.kir/v4
+               :exports ['choose 'echo]
+               :schemas {}
+               :effects #{:clock/read}
+               :functions
+               [{:name 'choose
+                 :params ['value]
+                 :param-types [descriptor]
+                 :result :i64
+                 :effects #{:clock/read}
+                 :body body}
+                {:name 'echo
+                 :params ['value]
+                 :param-types [:i64]
+                 :result :i64
+                 :effects #{}
+                 :body 'value}]}
+          application
+          (artifact/package
+           (component-core/emit kir :wasm32-wasi-kotoba-v1)
+           kir (wit/emit kir))
+          provider
+          (composition/package-structural-union-identity-provider
+           :clock/now descriptor)
+          closed (composition/compose-closed application [provider])
+          path (kio/temp-file
+                "kotoba-nested-list-match-capability-" ".wasm")]
+      (try
+        (kio/write-bytes path ^bytes (:bytes closed))
+        (is (= :structural-union-match-module
+               (component-core/assert-supported! kir)))
+        (doseq [[call result]
+                [["choose(none)" "9"]
+                 ["choose(some([]))" "0"]
+                 [invoke expected]]]
+          (let [run (shell/sh "wasmtime" "run" "--invoke"
+                              call (str path))]
+            (is (zero? (:exit run)) (:err run))
+            (is (= result (str/trim (:out run))) call)))
+        (finally
+          (kio/delete-if-exists path)))))
+  (let [descriptor [:option [:list [:list :i64]]]
+        body
+        (list 'option-match descriptor 'value 9 'selected
+              (list 'option-match descriptor
+                    (list 'typed-cap-call
+                          clock-now descriptor descriptor
+                          (list 'option-some-of descriptor 'selected))
+                    9 'returned
+                    (list 'vector-count 'returned)))
+        kir {:format :kotoba.kir/v4
+             :exports ['choose 'echo]
+             :schemas {}
+             :effects #{:clock/read}
+             :functions
+             [{:name 'choose :params ['value] :param-types [descriptor]
+               :result :i64 :effects #{:clock/read} :body body}
+              {:name 'echo :params ['value] :param-types [:i64]
+               :result :i64 :effects #{} :body 'value}]}
+        core (component-core/emit kir :wasm32-wasi-kotoba-v1)
+        path (kio/temp-file
+              "kotoba-nested-list-total-validation-" ".wasm")]
+    (try
+      (kio/write-bytes path ^bytes core)
+      (let [script
+            (str
+             "const fs=require('fs');let inst,outer;"
+             "const imports={['cm32p2|kotoba:application/clock@1']:{"
+             "now:(disc,ptr,count,ret)=>{const v=new DataView(inst.exports.cm32p2_memory.buffer);"
+             "v.setUint8(ret,1);v.setUint32(ret+4,outer,true);v.setUint32(ret+8,2,true);}}};"
+             "WebAssembly.instantiate(fs.readFileSync(process.argv[1]),imports)"
+             ".then(({instance})=>{inst=instance;const e=instance.exports;"
+             "e.cm32p2_initialize();const alloc=(a,n)=>e.cm32p2_realloc(0,0,a,n);"
+             "const request=alloc(4,8),empty=alloc(8,8);"
+             "outer=alloc(4,16);const shared=alloc(8,8192*8);"
+             "const v=new DataView(e.cm32p2_memory.buffer);"
+             "v.setUint32(request,empty,true);v.setUint32(request+4,0,true);"
+             "for(let i=0;i<2;i++){v.setUint32(outer+i*8,shared,true);"
+             "v.setUint32(outer+i*8+4,8192,true);}"
+             "let trapped=false;try{e['cm32p2||choose'](1,request,1);}catch(_){trapped=true;}"
+             "console.log(trapped);if(!trapped)process.exit(1);});")
+            run (shell/sh "node" "-e" script (str path))]
+        (is (zero? (:exit run)) (:err run))
+        (is (= "true" (str/trim (:out run)))))
+      (finally
+        (kio/delete-if-exists path)))))
+
+(deftest structural-option-record-match-calls-a-named-capability
+  (let [record-type
+        [:record :demo/cap-record
+         [[:x :i64] [:enabled :bool] [:weight :f32]]]
+        schemas {:demo/cap-record record-type}
+        descriptor [:option [:ref :demo/cap-record]]
+        kir {:format :kotoba.kir/v4
+             :exports ['choose 'echo]
+             :schemas schemas
+             :effects #{:clock/read}
+             :functions
+             [{:name 'choose
+               :params ['value 'fallback]
+               :param-types [descriptor :i64]
+               :result :i64
+               :effects #{:clock/read}
+               :body
+               (list 'option-match descriptor 'value 'fallback 'selected
+                     (list 'option-match descriptor
+                           (list 'typed-cap-call
+                                 clock-now descriptor descriptor
+                                 (list 'option-some-of descriptor 'selected))
+                           'fallback 'returned
+                           (list 'record-get record-type
+                                 'returned :x)))}
+              {:name 'echo
+               :params ['value]
+               :param-types [:i64]
+               :result :i64
+               :effects #{}
+               :body 'value}]}
+        application
+        (artifact/package
+         (component-core/emit kir :wasm32-wasi-kotoba-v1)
+         kir (wit/emit kir))
+        provider
+        (composition/package-structural-union-identity-provider
+         :clock/now descriptor schemas)
+        closed (composition/compose-closed application [provider])
+        path (kio/temp-file
+              "kotoba-option-record-match-capability-" ".wasm")]
+    (try
+      (kio/write-bytes path ^bytes (:bytes closed))
+      (is (= :structural-union-match-module
+             (component-core/assert-supported! kir)))
+      (is (= [:clock/now] (:imports application)))
+      (doseq [[invoke expected]
+              [["choose(none, 9)" "9"]
+               ["choose(some({x: 7, enabled: true, weight: 1.5}), 9)" "7"]
+               ["echo(11)" "11"]]]
+        (let [run (shell/sh "wasmtime" "run" "--invoke"
+                            invoke (str path))]
+          (is (zero? (:exit run)) (:err run))
+          (is (= expected (str/trim (:out run))) invoke)))
+      (finally
+        (kio/delete-if-exists path)))))
+
+(deftest structural-union-capability-transports-bounded-lists
+  (let [descriptor [:option :vector-i64]
+        kir {:format :kotoba.kir/v4
+             :exports ['echo]
+             :schemas {}
+             :effects #{:clock/read}
+             :functions
+             [{:name 'echo
+               :params ['request]
+               :param-types [descriptor]
+               :result descriptor
+               :effects #{:clock/read}
+               :body (list 'typed-cap-call clock-now
+                           descriptor descriptor 'request)}]}
+        world (wit/emit kir)
+        application
+        (artifact/package
+         (component-core/emit kir :wasm32-wasi-kotoba-v1)
+         kir world)
+        provider
+        (composition/package-structural-union-identity-provider
+         :clock/now descriptor)
+        closed (composition/compose-closed application [provider])
+        path (kio/temp-file
+              "kotoba-aggregate-capability-list-" ".wasm")]
+    (try
+      (kio/write-bytes path ^bytes (:bytes closed))
+      (is (= :structural-union-capability-call
+             (component-core/assert-supported! kir)))
+      (is (= [:clock/now] (:imports application)))
+      (doseq [[invoke expected]
+              [["echo(none)" "none"]
+               ["echo(some([]))" "some([])"]
+               ["echo(some([1, -2, 3]))" "some([1, -2, 3])"]]]
+        (let [run (shell/sh "wasmtime" "run" "--invoke"
+                            invoke (str path))]
+          (is (zero? (:exit run)) (:err run))
+          (is (= expected (str/trim (:out run))) invoke)))
+      (finally
+        (kio/delete-if-exists path)))))
+
+(deftest structural-union-capability-transports-nested-indirect-values
+  (let [descriptor [:result [:option :vector-f64] :string]
+        kir {:format :kotoba.kir/v4
+             :exports ['echo]
+             :schemas {}
+             :effects #{:clock/read}
+             :functions
+             [{:name 'echo
+               :params ['request]
+               :param-types [descriptor]
+               :result descriptor
+               :effects #{:clock/read}
+               :body (list 'typed-cap-call clock-now
+                           descriptor descriptor 'request)}]}
+        world (wit/emit kir)
+        application
+        (artifact/package
+         (component-core/emit kir :wasm32-wasi-kotoba-v1)
+         kir world)
+        provider
+        (composition/package-structural-union-identity-provider
+         :clock/now descriptor)
+        closed (composition/compose-closed application [provider])
+        path (kio/temp-file
+              "kotoba-aggregate-capability-nested-" ".wasm")]
+    (try
+      (kio/write-bytes path ^bytes (:bytes closed))
+      (doseq [[invoke expected]
+              [["echo(ok(none))" "ok(none)"]
+               ["echo(ok(some([1.5, -2.25])))" "ok(some([1.5, -2.25]))"]
+               ["echo(err(\"denied\"))" "err(\"denied\")"]]]
+        (let [run (shell/sh "wasmtime" "run" "--invoke"
+                            invoke (str path))]
+          (is (zero? (:exit run)) (:err run))
+          (is (= expected (str/trim (:out run))) invoke)))
+      (finally
+        (kio/delete-if-exists path)))))
+
+(deftest structural-union-capability-transports-list-of-records
+  (let [descriptor [:option [:list [:ref :demo/point]]]
+        schemas {:demo/point
+                 [:record :demo/point
+                  [[:x :i64]
+                   [:visible :bool]]]}
+        kir {:format :kotoba.kir/v4
+             :exports ['echo]
+             :schemas schemas
+             :effects #{:clock/read}
+             :functions
+             [{:name 'echo
+               :params ['request]
+               :param-types [descriptor]
+               :result descriptor
+               :effects #{:clock/read}
+               :body (list 'typed-cap-call clock-now
+                           descriptor descriptor 'request)}]}
+        world (wit/emit kir)
+        application
+        (artifact/package
+         (component-core/emit kir :wasm32-wasi-kotoba-v1)
+         kir world)
+        provider
+        (composition/package-structural-union-identity-provider
+         :clock/now descriptor schemas)
+        closed (composition/compose-closed application [provider])
+        path (kio/temp-file
+              "kotoba-aggregate-capability-record-list-" ".wasm")]
+    (try
+      (kio/write-bytes path ^bytes (:bytes closed))
+      (is (= :structural-union-capability-call
+             (component-core/assert-supported! kir)))
+      (is (= [:clock/now] (:imports application)))
+      (doseq [[invoke expected]
+              [["echo(none)" "none"]
+               ["echo(some([]))" "some([])"]
+               ["echo(some([{x:7,visible:true},{x:-2,visible:false}]))"
+                "some([{x: 7, visible: true}, {x: -2, visible: false}])"]]]
+        (let [run (shell/sh "wasmtime" "run" "--invoke"
+                            invoke (str path))]
+          (is (zero? (:exit run)) (:err run))
+          (is (= expected (str/trim (:out run))) invoke)))
+      (finally
+        (kio/delete-if-exists path)))))
+
+(deftest structural-union-capability-transports-list-of-strings
+  (let [descriptor [:option [:list :string]]
+        kir {:format :kotoba.kir/v4
+             :exports ['echo] :schemas {}
+             :effects #{:clock/read}
+             :functions
+             [{:name 'echo
+               :params ['request]
+               :param-types [descriptor]
+               :result descriptor
+               :effects #{:clock/read}
+               :body (list 'typed-cap-call clock-now
+                           descriptor descriptor 'request)}]}
+        application
+        (artifact/package
+         (component-core/emit kir :wasm32-wasi-kotoba-v1)
+         kir (wit/emit kir))
+        provider
+        (composition/package-structural-union-identity-provider
+         :clock/now descriptor)
+        closed (composition/compose-closed application [provider])
+        path (kio/temp-file
+              "kotoba-aggregate-capability-string-list-" ".wasm")]
+    (try
+      (kio/write-bytes path ^bytes (:bytes closed))
+      (is (= :structural-union-capability-call
+             (component-core/assert-supported! kir)))
+      (doseq [[invoke expected]
+              [["echo(none)" "none"]
+               ["echo(some([]))" "some([])"]
+               ["echo(some([\"hello\",\"安全\"]))"
+                "some([\"hello\", \"安全\"])"]]]
+        (let [run (shell/sh "wasmtime" "run" "--invoke"
+                            invoke (str path))]
+          (is (zero? (:exit run)) (:err run))
+          (is (= expected (str/trim (:out run))) invoke)))
+      (finally
+        (kio/delete-if-exists path)))))
+
+(deftest structural-union-capability-transports-list-of-unions
+  (let [descriptor [:option [:list [:option :string]]]
+        kir {:format :kotoba.kir/v4
+             :exports ['echo] :schemas {}
+             :effects #{:clock/read}
+             :functions
+             [{:name 'echo :params ['request] :param-types [descriptor]
+               :result descriptor :effects #{:clock/read}
+               :body (list 'typed-cap-call clock-now
+                           descriptor descriptor 'request)}]}
+        application
+        (artifact/package
+         (component-core/emit kir :wasm32-wasi-kotoba-v1)
+         kir (wit/emit kir))
+        provider
+        (composition/package-structural-union-identity-provider
+         :clock/now descriptor)
+        closed (composition/compose-closed application [provider])
+        path (kio/temp-file
+              "kotoba-aggregate-capability-union-list-" ".wasm")]
+    (try
+      (kio/write-bytes path ^bytes (:bytes closed))
+      (is (= :structural-union-capability-call
+             (component-core/assert-supported! kir)))
+      (doseq [[invoke expected]
+              [["echo(none)" "none"]
+               ["echo(some([]))" "some([])"]
+               ["echo(some([none,some(\"hello\")]))"
+                "some([none, some(\"hello\")])"]]]
+        (let [run (shell/sh "wasmtime" "run" "--invoke"
+                            invoke (str path))]
+          (is (zero? (:exit run)) (:err run))
+          (is (= expected (str/trim (:out run))) invoke)))
+      (finally
+        (kio/delete-if-exists path)))))
+
+(deftest structural-union-capability-transports-nested-lists
+  (let [descriptor [:option [:list [:list :i64]]]
+        kir {:format :kotoba.kir/v4
+             :exports ['echo] :schemas {}
+             :effects #{:clock/read}
+             :functions
+             [{:name 'echo :params ['request] :param-types [descriptor]
+               :result descriptor :effects #{:clock/read}
+               :body (list 'typed-cap-call clock-now
+                           descriptor descriptor 'request)}]}
+        application
+        (artifact/package
+         (component-core/emit kir :wasm32-wasi-kotoba-v1)
+         kir (wit/emit kir))
+        provider
+        (composition/package-structural-union-identity-provider
+         :clock/now descriptor)
+        closed (composition/compose-closed application [provider])
+        path (kio/temp-file
+              "kotoba-aggregate-capability-nested-list-" ".wasm")]
+    (try
+      (kio/write-bytes path ^bytes (:bytes closed))
+      (is (= :structural-union-capability-call
+             (component-core/assert-supported! kir)))
+      (doseq [[invoke expected]
+              [["echo(none)" "none"]
+               ["echo(some([]))" "some([])"]
+               ["echo(some([[1,2],[],[-3]]))"
+                "some([[1, 2], [], [-3]])"]]]
+        (let [run (shell/sh "wasmtime" "run" "--invoke"
+                            invoke (str path))]
+          (is (zero? (:exit run)) (:err run))
+          (is (= expected (str/trim (:out run))) invoke)))
+      (finally
+        (kio/delete-if-exists path)))))
+
+(deftest structural-union-capability-transports-maximum-list
+  (let [descriptor [:option :vector-i64]
+        kir {:format :kotoba.kir/v4
+             :exports ['echo]
+             :schemas {}
+             :effects #{:clock/read}
+             :functions
+             [{:name 'echo
+               :params ['request]
+               :param-types [descriptor]
+               :result descriptor
+               :effects #{:clock/read}
+               :body (list 'typed-cap-call clock-now
+                           descriptor descriptor 'request)}]}
+        application
+        (artifact/package
+         (component-core/emit kir :wasm32-wasi-kotoba-v1)
+         kir (wit/emit kir))
+        provider
+        (composition/package-structural-union-identity-provider
+         :clock/now descriptor)
+        closed (composition/compose-closed application [provider])
+        path (kio/temp-file
+              "kotoba-aggregate-capability-max-list-" ".wasm")
+        values (str/join "," (repeat 16384 "0"))
+        invoke (str "echo(some([" values "]))")]
+    (try
+      (kio/write-bytes path ^bytes (:bytes closed))
+      (let [run (shell/sh "wasmtime" "run" "--invoke" invoke (str path))]
+        (is (zero? (:exit run)) (:err run))
+        (is (= (str "some([" values "])")
+               (str/replace (str/trim (:out run)) " " ""))))
+      (finally
+        (kio/delete-if-exists path)))))
+
+(deftest declared-fuel-still-reaches-a-capability-component
+  ;; The new lowering goes through the real backend, so it must keep the
+  ;; property ADR 0075 established rather than silently becoming host-only.
+  (is (= :module-global (component-core/fuel-enforcement multi-function-kir)))
+  (is (= :host-only (component-core/fuel-enforcement passthrough-kir))))

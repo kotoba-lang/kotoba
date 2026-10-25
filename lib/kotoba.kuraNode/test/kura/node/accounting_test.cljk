@@ -1,0 +1,83 @@
+(ns kura.node.accounting-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kura.node.accounting :as acc]
+            [kura.order :as order]))
+
+(def ord
+  (order/order {:node-id "node-1" :action :get :shard-id "obj-1/0/0"
+                :max-bytes 1000 :expires-at 9999 :issued-at 0 :nonce "n-1"}))
+
+(def admitted
+  (order/admit ord {:node-id "node-1" :action :get :now 100
+                    :verify-fn (fn [_ _] true) :signature "sig"}))
+
+(deftest a-transfer-cannot-open-on-a-rejected-order
+  (is (:ok? admitted))
+  (let [rejected (order/admit ord {:node-id "someone-else" :now 100
+                                   :verify-fn (fn [_ _] true) :signature "sig"})]
+    (is (false? (:ok? rejected)))
+    (is (thrown? #?(:clj Throwable :cljs js/Error) (acc/open ord rejected)))))
+
+(deftest the-limit-is-enforced-per-chunk-not-once
+  (testing "a node that checks at the start and then streams has not checked —
+            the client controls how much it sends"
+    (let [t0 (acc/open ord admitted)
+          r1 (acc/feed t0 400)
+          r2 (acc/feed (:transfer r1) 400)
+          r3 (acc/feed (:transfer r2) 400)]
+      (is (:allowed? r1))
+      (is (:allowed? r2))
+      (is (false? (:allowed? r3)) "the third chunk would exceed 1000")
+      (is (= :limit-exceeded (:reason r3)))
+      (is (= 200 (:remaining r3)))
+      (is (= 1200 (:would-have-been r3)))
+      (is (= 800 (:transferred (:transfer r3)))
+          "a refused chunk does not advance the counter — the bytes were not
+           sent, so charging for them would be charging for a refusal"))))
+
+(deftest exact-fit-is-allowed
+  (let [r (acc/feed (acc/open ord admitted) 1000)]
+    (is (:allowed? r))
+    (is (= 0 (:remaining r)))))
+
+(deftest refusal-is-not-an-error
+  (testing "hitting the limit is the ordinary end of a transfer for a client
+            that asked for more than it paid for; a node that throws here has
+            that path exercised by every over-eager client on the network"
+    (let [r (acc/feed (acc/open ord admitted) 5000)]
+      (is (false? (:allowed? r)))
+      (is (map? r)))))
+
+(deftest closing-is-idempotent
+  (let [t (-> (acc/open ord admitted) (acc/feed 100) :transfer acc/close)]
+    (is (:closed? t))
+    (is (= t (acc/close t)))
+    (let [r (acc/feed t 10)]
+      (is (false? (:allowed? r)))
+      (is (= :transfer-closed (:reason r))))))
+
+(deftest ledger-entry-sums-to-bytes-actually-moved
+  (let [t (-> (acc/open ord admitted) (acc/feed 250) :transfer
+              (acc/feed 250) :transfer acc/close)
+        leaf (acc/ledger-entry t (fn [_] "order-digest"))]
+    (is (= 500 (:sum leaf)) "billed for what moved, not for the limit")
+    (is (= "node-1|n-1" (:id leaf)))))
+
+(deftest open-transfers-are-excluded-from-the-epoch
+  (testing "a transfer still running at the boundary belongs to the next epoch;
+            folding it in early bills for bytes that may yet be refused"
+    (let [closed (-> (acc/open ord admitted) (acc/feed 300) :transfer acc/close)
+          running (-> (acc/open ord admitted) (acc/feed 700) :transfer)
+          leaves (acc/epoch-ledger [closed running] (fn [_] "d"))
+          totals (acc/epoch-totals [closed running])]
+      (is (= 1 (count leaves)))
+      (is (= 300 (:sum (first leaves))))
+      (is (= {:transfers 2 :closed 1 :open 1 :claimed-bytes 300 :chunks 2} totals)))))
+
+(deftest totals-report-what-is-not-billable-too
+  (testing "many refusals mean clients are asking for more than their orders
+            authorise, or the coordinator is issuing limits too small to use"
+    (let [t (acc/open ord admitted)
+          r (acc/feed t 2000)]
+      (is (false? (:allowed? r)))
+      (is (= 0 (:chunks (:transfer r))) "a refused chunk is not counted"))))

@@ -1,0 +1,175 @@
+(ns conformance.ws-probe
+  "Reads, out of a real Blink browser, the EXACT text-node contents a
+   fragment parse produces -- codepoint by codepoint, with no normalisation
+   of any kind -- so that 'the parser removed it' can be separated from
+   'layout collapsed it'.
+
+   That separation is the whole reason this exists and is why
+   conformance/run.cljk cannot answer it: that harness deliberately
+   NORMALISES whitespace inside text on both sides (see its README,
+   'Exact whitespace inside text'), because how many spaces survive is a
+   `white-space` question and `white-space` is CSS. Which is correct for
+   scoring the tree shape, and exactly wrong for deciding what the PARSER
+   is required to drop. This one keeps every character.
+
+   Each shape is measured twice in one pass: once through `innerHTML` on a
+   DETACHED div, which is the HTML fragment parsing algorithm and so gives
+   the parse with no layout anywhere near it; and once ATTACHED, which
+   gives the rendered boxes and `elementFromPoint` hits for the same
+   markup. Having both side by side is what lets a run say 'the characters
+   are in the DOM AND the box is 77px wide' rather than inferring one from
+   the other.
+
+   Findings it produced on 2026-08-06, all in the READMEs that cite them:
+   the parser collapses NOTHING (`<div>   a   b   </div>` keeps all its
+   spaces); it drops exactly one leading newline after `<pre>`/`<textarea>`;
+   CR and CRLF become LF everywhere including inside `<pre>`; and content
+   HANGING past a box's edge is hit-tested only over the line's own content
+   area, not the full box height.
+
+   Transport is the sibling harness's, verbatim (CDP, via cdp_dump.cljs),
+   because its constraints were measured there and have not changed.
+
+   Usage:
+     kbb --backend sci --classpath \"src:<dom-gpu>/src:<cssom>/src\" conformance/ws_probe.cljk \\
+       <shapes.edn> [--browser <path>]
+
+   A shape is `{:name \"...\" :html \"...\" :wrap \"<css for the wrapper>\"}`.
+   `:wrap` defaults to the cssom corpus's own page context (14px monospace,
+   20px lines, 800px wide) so numbers read here are directly comparable
+   with that harness's. An element with `id=\"probe\"` additionally gets a
+   grid of `elementFromPoint` hits reported across and down its box."
+  (:require ["node:child_process" :as cp]
+            ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:path" :as path]
+            [kotoba.lang.edn :as edn]
+            [kotoba.lang.text :as str]))
+
+(def browser-candidates
+  ["/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"
+   "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+   "/Applications/Chromium.app/Contents/MacOS/Chromium"])
+
+(def ^:private script
+  "
+  (function () {
+    var CORPUS = JSON.parse(decodeURIComponent(escape(atob(CORPUS_B64))));
+    var out = {};
+    for (var i = 0; i < CORPUS.length; i++) {
+      var c = CORPUS[i];
+      var items = [];
+      var host = document.createElement('div');
+      host.innerHTML = c.html;
+      (function rec(node, depth) {
+        var kids = node.childNodes;
+        for (var j = 0; j < kids.length; j++) {
+          var n = kids[j];
+          if (n.nodeType === 1) {
+            items.push({ k: 'e', d: depth, n: n.tagName.toLowerCase() });
+            rec(n, depth + 1);
+          } else if (n.nodeType === 3) {
+            var cps = [];
+            for (var q = 0; q < n.nodeValue.length; q++) cps.push(n.nodeValue.charCodeAt(q));
+            items.push({ k: 't', d: depth, v: n.nodeValue, cp: cps });
+          } else if (n.nodeType === 8) {
+            items.push({ k: 'c', d: depth, v: n.nodeValue });
+          }
+        }
+      })(host, 0);
+
+      // Rendered measurement, in the corpus's own page context, for the
+      // same markup: attached this time, since offsetWidth needs a layout.
+      var live = document.createElement('div');
+      live.setAttribute('style', c.wrap || 'font: 14px monospace; line-height: 20px; width: 800px');
+      live.innerHTML = c.html;
+      document.body.appendChild(live);
+      var boxes = [];
+      var all = live.querySelectorAll('*');
+      for (var m = 0; m < all.length; m++) {
+        var r = all[m].getBoundingClientRect();
+        boxes.push({ n: all[m].tagName.toLowerCase(),
+                     w: Math.round(r.width * 100) / 100,
+                     h: Math.round(r.height * 100) / 100,
+                     sw: all[m].scrollWidth, cw: all[m].clientWidth });
+      }
+      var pb = live.querySelector('#probe');
+      if (pb) {
+        var pr = pb.getBoundingClientRect();
+        var hits = [];
+        for (var py = 1; py < 20; py += 6) {
+          var row = [];
+          for (var px = 55; px < 95; px += 10) {
+            var el = document.elementFromPoint(pr.left + px, pr.top + py);
+            row.push(px + ':' + (el ? el.tagName.toLowerCase() + (el.id ? '#' + el.id : '') : 'none'));
+          }
+          hits.push('y' + py + '[' + row.join(' ') + ']');
+        }
+        boxes.push({ n: 'HITS ' + hits.join(' '), w: 0, h: 0 });
+      }
+      out['case-' + i] = { items: items, boxes: boxes,
+                           lw: Math.round(live.getBoundingClientRect().width * 100) / 100,
+                           lh: Math.round(live.getBoundingClientRect().height * 100) / 100 };
+      document.body.removeChild(live);
+    }
+    var pre = document.createElement('pre');
+    pre.id = 'kotoba-htmldom-conformance-out';
+    pre.textContent = btoa(unescape(encodeURIComponent(JSON.stringify(out))));
+    document.body.appendChild(pre);
+  })();
+  ")
+
+(defn- page [shapes]
+  (let [b64 (-> (js/Buffer.from (js/JSON.stringify (clj->js shapes)) "utf8")
+                (.toString "base64"))]
+    (str "<!doctype html><html><head><meta charset=\"utf-8\">"
+         "<title>ws probe</title></head><body><script>"
+         "var CORPUS_B64 = \"" b64 "\";" script "</script></body></html>")))
+
+(defn- run-cdp! [browser file]
+  (let [out-file (path/join (fs/mkdtempSync (path/join (os/tmpdir) "ws-probe-")) "block.html")
+        res (cp/spawnSync "nbb" #js ["conformance/cdp_dump.cljk" browser file out-file]
+                          #js {:encoding "utf8" :timeout 240000})
+        out (if (fs/existsSync out-file) (fs/readFileSync out-file "utf8") "")]
+    (when-not (str/includes? out "kotoba-htmldom-conformance-out")
+      (throw (ex-info "no measurement block over CDP"
+                      {:status (.-status res) :stderr (str/trim (or (.-stderr res) ""))})))
+    out))
+
+(defn- parse-block [raw]
+  (let [marker "kotoba-htmldom-conformance-out\">"
+        from (+ (str/index-of raw marker) (count marker))
+        end (str/index-of raw "</pre>" from)]
+    (-> (js/Buffer.from (subs raw from end) "base64")
+        (.toString "utf8") js/JSON.parse (js->clj :keywordize-keys true))))
+
+(defn- show-cp [cps]
+  (str/join " " (map (fn [c]
+                       (case c
+                         32 "SP" 9 "TAB" 10 "LF" 13 "CR" 12 "FF" 160 "NBSP"
+                         (str (char c))))
+                     cps)))
+
+(defn -main [& argv]
+  (let [args (vec argv)
+        shapes-file (first (remove #(str/starts-with? % "--") args))
+        explicit (second (drop-while #(not= % "--browser") args))
+        browser (or explicit (first (filter fs/existsSync browser-candidates)))
+        shapes (edn/read-string (fs/readFileSync shapes-file "utf8"))
+        tmp (path/join (fs/mkdtempSync (path/join (os/tmpdir) "ws-probe-page-")) "p.html")]
+    (fs/writeFileSync tmp (page shapes))
+    (let [data (parse-block (run-cdp! browser tmp))]
+      (doseq [[i shape] (map-indexed vector shapes)]
+        (let [{:keys [items boxes lw lh]} (get data (keyword (str "case-" i)))]
+          (println "\n=== " (:name shape))
+          (println "    html: " (pr-str (:html shape)))
+          (doseq [it items]
+            (println (str "    " (apply str (repeat (* 2 (:d it)) " "))
+                          (case (:k it)
+                            "e" (str "<" (:n it) ">")
+                            "t" (str "#text [" (show-cp (:cp it)) "]")
+                            "c" (str "<!--" (:v it) "-->")))))
+          (println "    rendered:" (str lw "x" lh)
+                   (str/join ", " (map #(str (:n %) " " (:w %) "x" (:h %)) boxes))))))))
+
+(apply -main *command-line-args*)
