@@ -1,0 +1,267 @@
+(ns kotoba.clj-host.frame
+  "KAMI columnar render-IR frame decoder — the clj-host side of the
+  clj -> Rust render-IR contract (kami-engine-sdk-clj `kami.ipc/pack`, and
+  the frame-layout authority in `kami.contracts.ipc`). Pure, GPU-free, no
+  network/IO — only byte-buffer parsing — so it is portable across JVM
+  (`java.nio.ByteBuffer`) and ClojureScript (`js/DataView`) via `#?(:clj
+  :cljs)` reader conditionals. Ported from the retired Rust decoder
+  `kami-clj-host/src/frame.rs` (kami-engine, pre-clj-wgsl-migration
+  Phase 4); this namespace is the domain-logic replacement, byte-exact
+  with the Rust original.
+
+  Buffer layout (little-endian; see `kami.ipc` docstring in
+  kami-engine-sdk-clj):
+
+  ```text
+  [Frame header        16B] magic 'KAMI' u32 | version u16 | ncols u16 |
+                            frame_n u32 | pad u32
+  [Column header  16B x n]  dtype u8 | stride u8 | pad u16 | len u32 |
+                            offset u32 | pad u32
+  [payload, 16B-aligned]    raw element bytes per column at its `offset`
+  ```
+
+  Column 0 is always the camera (2 x mat4 = view, proj). Columns 1..n are
+  the per-draw instance model-matrix arrays (v1), or `[model, tint]`
+  column pairs (v2), in the same order as the draw-table that travels
+  alongside as JSON meta.
+
+  `decode` never throws on malformed input: every failure mode returns
+  `{:ok? false :error <keyword> :data {...}}` (mirrors the Rust
+  `DecodeError` enum's variants as keywords) rather than dropping columns
+  silently or panicking on untrusted bytes.")
+
+;; ---------------------------------------------------------------------------
+;; constants (mirror kami-core::ipc::Dtype and frame.rs)
+;; ---------------------------------------------------------------------------
+
+;; ASCII 'KAMI' read as a little-endian u32 (bytes 4B 41 4D 49).
+(def magic 0x494D414B)
+;; v1 layout: camera mat4 + one model mat4 column per draw.
+(def version 1)
+;; v2 layout: camera mat4 + per draw a [model mat4, tint f16x4] column pair.
+(def version-tint 2)
+
+(def dtype-f32 0)
+(def dtype-f16 1)
+(def dtype-u32 2)
+(def dtype-u16 3)
+(def dtype-u8 4)
+(def dtype-i16 5)
+(def dtype-mat4 6)
+(def dtype-quat 7)
+
+(def ^:private known-versions #{version version-tint})
+
+(defn element-size
+  "Element size in bytes for a Dtype tag (mirrors kami-core::ipc::Dtype).
+  0 for an unknown tag."
+  [dtype]
+  (case (long dtype)
+    0 4   ;; f32
+    1 2   ;; f16
+    2 4   ;; u32
+    3 2   ;; u16
+    4 1   ;; u8
+    5 2   ;; i16
+    6 64  ;; mat4
+    7 8   ;; quat
+    0))
+
+;; ---------------------------------------------------------------------------
+;; byte-buffer reads (little-endian, absolute offset) — the only platform
+;; split in this namespace. JVM reads via java.nio.ByteBuffer; ClojureScript
+;; reads via js/DataView over the same backing bytes. `buf` is a JVM
+;; byte-array on :clj, a js/Uint8Array on :cljs.
+;; ---------------------------------------------------------------------------
+
+#?(:clj
+   (defn- byte-buffer
+     ^java.nio.ByteBuffer [^bytes buf]
+     (doto (java.nio.ByteBuffer/wrap buf)
+       (.order java.nio.ByteOrder/LITTLE_ENDIAN))))
+
+#?(:cljs
+   (defn- data-view
+     [buf]
+     (js/DataView. (.-buffer buf) (.-byteOffset buf) (.-byteLength buf))))
+
+(defn buf-length
+  "Byte length of `buf` on either platform."
+  [buf]
+  #?(:clj (alength ^bytes buf)
+     :cljs (.-byteLength buf)))
+
+(defn rd-u8
+  "Unsigned byte at absolute offset `o`."
+  [buf o]
+  #?(:clj (bit-and (long (aget ^bytes buf (int o))) 0xff)
+     :cljs (aget buf o)))
+
+(defn rd-u16
+  "Little-endian unsigned u16 at absolute offset `o`."
+  [buf o]
+  #?(:clj (bit-and (long (.getShort (byte-buffer buf) (int o))) 0xffff)
+     :cljs (.getUint16 (data-view buf) o true)))
+
+(defn rd-u32
+  "Little-endian unsigned u32 at absolute offset `o`."
+  [buf o]
+  #?(:clj (bit-and (long (.getInt (byte-buffer buf) (int o))) 0xffffffff)
+     :cljs (.getUint32 (data-view buf) o true)))
+
+(defn rd-f32
+  "Little-endian f32 at absolute offset `o`."
+  [buf o]
+  #?(:clj (double (.getFloat (byte-buffer buf) (int o)))
+     :cljs (.getFloat32 (data-view buf) o true)))
+
+;; ---------------------------------------------------------------------------
+;; f16 -> f32 (mirrors frame.rs::f16_to_f32, the inverse of kami.ipc/f16-bits)
+;; ---------------------------------------------------------------------------
+
+(defn- pow2 [exp]
+  #?(:clj (Math/pow 2.0 (double exp))
+     :cljs (.pow js/Math 2 exp)))
+
+(defn f16->f32
+  "Decode an IEEE-754 binary16 (the dtype the clj packer emits for
+  tint/quat columns) into an f32-precision double."
+  [h]
+  (let [h    (long h)
+        sign (if (zero? (bit-and h 0x8000)) 1.0 -1.0)
+        exp  (bit-and (bit-shift-right h 10) 0x1f)
+        man  (double (bit-and h 0x3ff))]
+    (* sign
+       (cond
+         (zero? exp)  (* man (pow2 -24))                ;; subnormal (man=0 -> 0)
+         (= exp 0x1f) (if (zero? man)
+                        #?(:clj Double/POSITIVE_INFINITY :cljs js/Infinity)
+                        #?(:clj Double/NaN :cljs js/NaN))
+         :else        (* (+ 1.0 (/ man 1024.0)) (pow2 (- exp 15)))))))
+
+;; ---------------------------------------------------------------------------
+;; decode
+;; ---------------------------------------------------------------------------
+
+(defn- err [kind data]
+  {:ok? false :error kind :data data})
+
+(defn- decode-columns
+  "Parse `ncols` column headers starting at byte 16, bounds-checking each
+  payload against `n` (the buffer length). Returns a vector of column maps
+  on success, or an error map (from `err`) short-circuited via `reduced`."
+  [buf n ncols]
+  (reduce
+   (fn [cols i]
+     (let [h (+ 16 (* i 16))]
+       (if (> (+ h 16) n)
+         (reduced (err :too-short {:at :column-header :index i}))
+         (let [dtype  (rd-u8 buf h)
+               stride (rd-u8 buf (+ h 1))
+               len    (rd-u32 buf (+ h 4))
+               offset (rd-u32 buf (+ h 8))
+               esize  (element-size dtype)]
+           (if (zero? esize)
+             (reduced (err :unknown-dtype {:index i :dtype dtype}))
+             (let [payload (* esize len (max 1 stride))
+                   end     (+ offset payload)]
+               (if (> end n)
+                 (reduced (err :column-out-of-bounds
+                               {:index i :offset offset :end end :buf n}))
+                 (conj cols {:dtype dtype :stride stride :len len
+                             :offset offset :end end}))))))))
+   []
+   (range ncols)))
+
+(defn decode
+  "Decode a KAMI columnar buffer. Validates magic/version and bounds-checks
+  every column payload against the buffer length. Zero-copy: each column
+  map stores `{:offset :end}` into `buf` rather than copying bytes.
+
+  Returns `{:ok? true :value {:frame-n .. :version .. :columns [...]}}` on
+  success, or `{:ok? false :error <keyword> :data {...}}` on any malformed
+  input (never throws on untrusted bytes)."
+  [buf]
+  (let [n (buf-length buf)]
+    (cond
+      (< n 16)
+      (err :too-short {:len n})
+
+      :else
+      (let [magic-v (rd-u32 buf 0)]
+        (cond
+          (not= magic-v magic)
+          (err :bad-magic {:magic magic-v})
+
+          :else
+          (let [version-v (rd-u16 buf 4)]
+            (cond
+              (not (known-versions version-v))
+              (err :bad-version {:version version-v})
+
+              :else
+              (let [ncols   (rd-u16 buf 6)
+                    frame-n (rd-u32 buf 8)
+                    result  (decode-columns buf n ncols)]
+                (if (map? result) ;; decode-columns short-circuited to an err map
+                  result
+                  {:ok? true
+                   :value {:frame-n frame-n :version version-v :columns result}})))))))))
+
+;; ---------------------------------------------------------------------------
+;; column / frame accessors (mirror ColumnView / FrameView in frame.rs)
+;; ---------------------------------------------------------------------------
+
+(defn mat4s
+  "Decode `column`'s raw payload (in `buf`) as a vector of column-major
+  16-float mat4s. `column` must have `:dtype` mat4. `:len` x `:stride`
+  matrices total."
+  [buf column]
+  (let [{:keys [len stride offset]} column
+        cnt (* len (max 1 stride))]
+    (mapv (fn [m]
+            (let [base (+ offset (* m 64))]
+              (mapv #(rd-f32 buf (+ base (* % 4))) (range 16))))
+          (range cnt))))
+
+(defn f16x4s
+  "Decode `column`'s raw payload (in `buf`) as a vector of `[r g b a]`
+  f32-precision tints, decoded from half precision. `column` must have
+  `:dtype` f16, `:stride` 4. `:len` tints total."
+  [buf column]
+  (let [{:keys [len stride offset]} column
+        per (max 1 stride)]
+    (mapv (fn [i]
+            (let [base (+ offset (* i per 2))]
+              (mapv #(f16->f32 (rd-u16 buf (+ base (* % 2))))
+                    (range (min per 4)))))
+          (range len))))
+
+(defn camera
+  "The camera column (column 0) of decoded `frame-view`: `[view proj]`
+  mat4s, or nil if the frame has no camera column or too few mat4s."
+  [buf {:keys [columns]}]
+  (when-let [c (first columns)]
+    (let [ms (mat4s buf c)]
+      (when (>= (count ms) 2)
+        [(nth ms 0) (nth ms 1)]))))
+
+(defn draw-instances
+  "The per-draw instance columns (columns 1..n) of decoded `frame-view`.
+  In v1 each is a draw's model matrix array; in v2 they interleave
+  `[model, tint]` — prefer `draws` there."
+  [{:keys [columns]}]
+  (vec (rest columns)))
+
+(defn draws
+  "Per-draw `[model tint]` column pairs of decoded `frame-view`,
+  version-aware: v1 yields one model column per draw with a nil tint; v2
+  pairs each `[model, tint]` block."
+  [{:keys [columns version]}]
+  (if (<= (count columns) 1)
+    []
+    (let [body (vec (rest columns))]
+      (if (>= version version-tint)
+        (->> (partition-all 2 body)
+             (mapv (fn [pair] [(first pair) (second pair)])))
+        (mapv (fn [model] [model nil]) body)))))
