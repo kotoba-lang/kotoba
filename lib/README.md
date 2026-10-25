@@ -121,6 +121,7 @@ The bundled standard libraries live in this repository:
 | `org.ieee.find` | `org.ieee.find/src` | `` (an external specification, publisher ieee.org) |
 | `org.jsonrpc.core` | `org.jsonrpc.core/src` | `` (an external specification, publisher jsonrpc.org) |
 | `org.oasisOpen.odf` | `org.oasisOpen.odf/src` | `` (an external specification, publisher oasisOpen.org) |
+| `org.w3.activitypub` | `org.w3.activitypub/src` | `` (an external specification, publisher w3.org) |
 | `kotoba.ops` | `kotoba.ops/src` | `` (Kotoba project library) |
 | `kotoba.nQuads` | `kotoba.nQuads/src` | `` (Kotoba project library) |
 | `kotoba.microsoft` | `kotoba.microsoft/src` | `` (Kotoba project library) |
