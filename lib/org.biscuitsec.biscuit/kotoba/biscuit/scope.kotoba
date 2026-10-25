@@ -1,0 +1,262 @@
+;; The delegated-scope intersection, as a Kotoba application
+;; (ADR-2608261100).
+;;
+;;   init        (request)        -> state
+;;   offer-fact  (state, fact)    -> state   ; one fact of the current block
+;;   end-block   (state)          -> state   ; that block is closed
+;;   decide      (state, opts)    -> keyword ; :granted, or why not
+;;
+;; ## The one term biscuit fills, decided where no secret is
+;;
+;; `lang/capability-semantics.edn` writes the answer as an intersection and
+;; gives biscuit exactly one term of it (`:biscuit-role
+;; :delegated-grant-only`). `biscuit.token/verify` walks a chain of PUBLIC
+;; keys, so the whole decision needs the token, a root public key, a local
+;; policy and a clock -- and no private key anywhere. That is what lets it
+;; run in a Worker or a browser, and it is also what makes it a guest: the
+;; curve is the host's, the intersection is not.
+;;
+;;   the guest owns   the attenuation fold and the intersection: which
+;;                    resource this token still confers for this kind, and
+;;                    who it was delegated to
+;;   the host owns    the signature chain, the wire format, and the clock
+;;
+;; ## One (kind, resource) question at a time, so nothing accumulates
+;;
+;; The host replays the token's facts for the pair actually being asked
+;; about, and the guest keeps booleans. A token has no bound on its blocks,
+;; its kinds, or its resources; a `:document` map holds 32. Accumulating
+;; them would put a ceiling on a format that has none, and one that silently
+;; truncated would DROP a restriction a later block imposed -- failing
+;; toward more authority, which is the one direction this must never fail.
+;;
+;; ## What `biscuit.kotoba/->delegated` gets wrong, measured
+;;
+;; Its docstring says a later block "can never introduce a kind" and that
+;; attenuation-only "is the only thing this function can express". Its fold
+;; is
+;;
+;;     (if (empty? block) acc (if (empty? acc) block (intersect acc block)))
+;;
+;; and `(empty? acc)` is true when the AUTHORITY block declared no `cap`
+;; facts. Measured on cd98347: a token whose authority block carries only
+;; `holder` and `before`, plus one appended block carrying
+;; `[cap ":net/connect" "https://evil.example"]`, yields exactly that grant.
+;; Appending a block is what every holder of a biscuit may do offline
+;; without any key -- it is the feature -- so this is a widening any holder
+;; can perform.
+;;
+;; Here the authority block is distinguished by its POSITION, not by whether
+;; it happened to say anything: a kind block 0 did not confer is
+;; `:attenuation-cannot-introduce-a-kind`, and no later block can change
+;; that.
+;;
+;; ## The holder the token names, and the holder the caller asks for
+;;
+;; `->delegated` computes `:grant/holder` from the authority block.
+;; `biscuit.effective/authorize` never reads it, and stamps
+;; `:cap/holder (:cap/holder requested)` -- the CALLER's -- onto the
+;; capability it returns. `:cap/holder` is one of the semantics'
+;; `:identity-keys`, so that is a field of the capability's identity that
+;; the token never bound. `:holder-mismatch` and `:ambiguous-holder` are
+;; this guest's own decisions and are tested separately from parity.
+;;
+;; ## Expiry is deliberately NOT moved here
+;;
+;; `biscuit.effective` compares instants with `compare`, which on strings is
+;; lexicographic; two spellings of the same instant with different offsets
+;; order wrongly. Fixing that needs an instant parser, which is a second
+;; slice and not this one. The guest takes `:expired?` as a decided boolean
+;; and says so, rather than pretending the term is absent.
+;;
+;; `.cljc` stays the oracle for the fold it does get right and is not
+;; required from here (require-graph). It did not grow a second copy
+;; (ADR-2608261100).
+
+(ns biscuit.scope
+  (:export [main init offer-fact end-block decide
+            blocks-seen token-holder holder-count
+            authority-confers? still-granted? widening-attempted?]))
+
+;; --- document accessors -----------------------------------------------------
+
+(defn- dg [d :document k :keyword] :document
+  (option-value-of [:option :document] (document-get d k) (document-null)))
+
+(defn- ds [d :document k :keyword] :string
+  (option-value-of [:option :string] (document-string-value (dg d k)) ""))
+
+(defn- di [d :document k :keyword] :i64
+  (option-value-of [:option :i64] (document-i64-value (dg d k)) -1))
+
+(defn- db [d :document k :keyword] :bool
+  (option-value-of [:option :bool] (document-bool-value (dg d k)) false))
+
+(defn- same? [a :string b :string] :bool
+  (if (= (string-length a) (string-length b))
+    (if (string-contains? a b) true false)
+    false))
+
+(defn- put-bool [d :document k :keyword v :bool] :document
+  (document-assoc d k (document-bool v)))
+
+(defn- put-i64 [d :document k :keyword v :i64] :document
+  (document-assoc d k (document-i64 v)))
+
+;; --- state --------------------------------------------------------------------
+
+(defn init [request :document] :document
+  (document-map
+   ;; the pair being asked about
+   :kind (document-string (ds request :kind))
+   :resource (document-string (ds request :resource))
+   :asked-holder (document-string (ds request :holder))
+   ;; where the fold is
+   :block (document-i64 0)
+   ;; block 0
+   :authority-kind (document-bool false)      ; block 0 mentioned the kind
+   :authority-grants (document-bool false)    ; block 0 conferred the resource
+   ;; the block being read
+   :cur-kind (document-bool false)
+   :cur-grants (document-bool false)
+   ;; the running answer across closed blocks
+   :granted (document-bool false)
+   :widening (document-bool false)
+   ;; the authority block's holder facts
+   :holder (document-string "")
+   :holders (document-i64 0)))
+
+;; --- one fact -------------------------------------------------------------------
+;; `{:pred "cap"|"holder"|... :a <kind or holder> :b <resource>}`. Anything
+;; else is read and confers nothing -- the same one-directional ignorance
+;; `biscuit.authority` documents, for the same reason: an unread fact cannot
+;; widen a grant.
+
+(defn offer-fact [state :document fact :document] :document
+  (let [pred (ds fact :pred)
+        a (ds fact :a)
+        b (ds fact :b)]
+    (if (same? pred "cap")
+      (if (same? a (ds state :kind))
+        (put-bool (put-bool state :cur-kind true)
+                  :cur-grants (if (db state :cur-grants) true
+                                  (if (same? b (ds state :resource)) true false)))
+        state)
+      (if (same? pred "holder")
+        ;; Only the authority block may name the holder. A later block that
+        ;; names one is naming someone the issuer did not.
+        (if (= (di state :block) 0)
+          (put-i64 (document-assoc state :holder (document-string a))
+                   :holders (+ (di state :holders) 1))
+          state)
+        state))))
+
+;; --- closing a block --------------------------------------------------------------
+
+(defn end-block [state :document] :document
+  (let [i (di state :block)
+        mentions (db state :cur-kind)
+        grants (db state :cur-grants)
+        auth-kind (if (= i 0) mentions (db state :authority-kind))]
+    (put-bool
+     (put-bool
+      (put-bool
+       (put-bool
+        (put-i64 (put-bool (put-bool state :cur-kind false) :cur-grants false)
+                 :block (+ i 1))
+        :authority-kind auth-kind)
+       :authority-grants (if (= i 0) grants (db state :authority-grants)))
+      ;; The running answer. Block 0 sets it; a later block that mentions the
+      ;; kind may only narrow it; a later block that mentions a kind block 0
+      ;; never conferred confers nothing.
+      :granted (if (= i 0) grants
+                   (if mentions (if (db state :granted) grants false)
+                       (db state :granted))))
+     ;; ...and is recorded, so the two events stay distinguishable: a token
+     ;; that confers nothing, and a token that tried to confer something its
+     ;; issuer did not.
+     :widening (if (db state :widening) true
+                   (if (= i 0) false
+                       (if mentions (if auth-kind false true) false))))))
+
+;; --- the decision -------------------------------------------------------------------
+
+(defn decide [state :document opts :document] :keyword
+  (cond
+    ;; The measured widening. It is named separately from `:missing-grant`
+    ;; because they are different events: one is a token that confers
+    ;; nothing, the other is a token that TRIED to confer something its
+    ;; issuer did not.
+    (if (db state :authority-kind) false (db state :widening))
+    :attenuation-cannot-introduce-a-kind
+
+    (if (db state :authority-kind) false true) :missing-grant
+
+    (> (di state :holders) 1) :ambiguous-holder
+
+    (if (db opts :require-holder?)
+      (if (= (string-length (ds state :holder)) 0) true
+          (if (same? (ds state :holder) (ds state :asked-holder)) false true))
+      false)
+    :holder-mismatch
+
+    (db opts :expired?) :expired-grant
+
+    (if (db opts :forbid-wildcard?)
+      (if (same? (ds state :resource) "*") true
+          (if (db opts :policy-wildcard?) true false))
+      false)
+    :production-effective-wildcard
+
+    ;; requested n delegated n local-policy, in that order and with no step
+    ;; skippable.
+    (if (db state :granted) false true) :empty-intersection
+
+    (if (db opts :policy-allows?) false
+        (if (db opts :policy-wildcard?) false true))
+    :empty-intersection
+
+    :else :granted))
+
+;; --- projections ----------------------------------------------------------------------
+
+(defn blocks-seen [state :document] :i64 (di state :block))
+(defn token-holder [state :document] :string (ds state :holder))
+(defn holder-count [state :document] :i64 (di state :holders))
+(defn authority-confers? [state :document] :bool (db state :authority-kind))
+(defn still-granted? [state :document] :bool (db state :granted))
+(defn widening-attempted? [state :document] :bool (db state :widening))
+
+;; --- the artifact's own conformance check ------------------------------------------
+;;
+;; `main` is the browser profile's entry point -- `runtime/browser-host.mjs`
+;; refuses to instantiate a module without one -- and it is not a stub. It
+;; walks one token end to end: an authority block that confers nothing and
+;; an appended block that names a kind, which is the widening this slice
+;; exists to refuse. It answers 0 only when that still decides the way this
+;; object was built to decide, so a COMPILED artifact can be asked whether
+;; it is itself by a host that knows nothing about biscuits.
+;;
+;; One walk, not several: a module's fuel is a private global baked in at
+;; compile time (512 by default) and is spent over the life of an INSTANCE,
+;; so everything `main` does shares one budget. The native backends put a
+;; second bound on the same function, evaluating it as a compile-time
+;; oracle. The wider check lives in the suite, which has neither limit.
+
+(defn- cap-fact [k :string r :string] :document
+  (document-map :pred (document-string "cap")
+                :a (document-string k)
+                :b (document-string r)))
+
+(defn main [] :i64
+  (let [s0 (init (document-map :kind (document-string ":net/connect")
+                               :resource (document-string "x")
+                               :holder (document-string "")))
+        b0 (end-block s0)
+        b1 (end-block (offer-fact b0 (cap-fact ":net/connect" "x")))
+        d (decide b1 (document-map :policy-allows? (document-bool true)
+                                   :policy-wildcard? (document-bool false)
+                                   :expired? (document-bool false)
+                                   :require-holder? (document-bool false)
+                                   :forbid-wildcard? (document-bool false)))]
+    (if (= d :attenuation-cannot-introduce-a-kind) 0 1)))

@@ -1,0 +1,144 @@
+(ns biscuit.token-test
+  (:require [biscuit.authorizer :as az]
+            [biscuit.datalog :as d]
+            [biscuit.keys :as k]
+            [biscuit.token :as bt]
+            [kotoba.test :refer [deftest is testing]]))
+
+(def root (k/keypair "root"))
+(def k1 (k/keypair "one"))
+(def k2 (k/keypair "two"))
+
+(defn- base-token []
+  (bt/authority {:facts '[[right "prices" read] [user "alice"]]
+                 :checks []
+                 :next-public-key (:public k1)
+                 :root-private-key (:private root)
+                 :sign-fn k/sign-fn}))
+
+(deftest attenuation-needs-no-secret-of-the-issuer
+  (testing "the property public-key attenuation exists for"
+    (let [t (bt/append (base-token)
+                       {:checks '[{:body [[operation read]]}]
+                        :next-public-key (:public k2)
+                        :private-key (:private k1)   ; NOT the root key
+                        :sign-fn k/sign-fn})]
+      (is (:ok? (bt/verify t (:public root) k/verify-fn)))
+      (is (= 2 (:blocks (bt/verify t (:public root) k/verify-fn)))))))
+
+(deftest verification-needs-no-secret-at-all
+  (testing "only the root PUBLIC key — which is why any node can verify"
+    (let [t (base-token)]
+      (is (:ok? (bt/verify t (:public root) k/verify-fn)))
+      (is (false? (:ok? (bt/verify t (:public k1) k/verify-fn)))))))
+
+(deftest a-block-cannot-choose-the-key-that-validates-it
+  (let [t (bt/append (base-token) {:checks [] :next-public-key (:public k2)
+                                   :private-key (:private k1) :sign-fn k/sign-fn})
+        ;; forge: re-sign block 1 with a key of the attacker's choosing
+        forged (assoc-in t [:biscuit/blocks 1 :block/signature]
+                         (k/sign-fn (:private k2) "anything"))]
+    (is (false? (:ok? (bt/verify forged (:public root) k/verify-fn))))
+    (is (= 1 (:index (bt/verify forged (:public root) k/verify-fn))))))
+
+(deftest editing-any-block-breaks-the-chain
+  (let [t (bt/append (base-token) {:checks '[{:body [[operation read]]}]
+                                   :next-public-key (:public k2)
+                                   :private-key (:private k1) :sign-fn k/sign-fn})]
+    (doseq [[path v] [[[:biscuit/blocks 0 :block/facts] '[[right "everything" read]]]
+                      [[:biscuit/blocks 0 :block/next-public-key] (:public k2)]
+                      ;; dropping the restriction block 1 imposed on itself --
+                      ;; the edit an attenuated token's holder would most want
+                      [[:biscuit/blocks 1 :block/checks] []]]]
+      (is (false? (:ok? (bt/verify (assoc-in t path v) (:public root) k/verify-fn)))
+          (str "editing " path " should break verification")))))
+
+(deftest a-block-cannot-be-spliced-onto-a-different-continuation
+  (testing "the signature must cover the key the block names, or the chain is forgeable"
+    ;; The attack, in full: an attacker holds a legitimately signed authority
+    ;; block. They rewrite its `next-public-key` to a key THEY control, then
+    ;; append blocks signed with their own private key. If the signature did
+    ;; not cover the next key, block 0 would still verify, and block 1 would
+    ;; verify against the key block 0 now names -- a token minted by nobody.
+    (let [attacker (k/keypair "mallory")
+          stolen (assoc-in (base-token) [:biscuit/blocks 0 :block/next-public-key]
+                           (:public attacker))
+          forged (bt/append stolen {:facts '[[right "everything" write]]
+                                    :next-public-key (:public attacker)
+                                    :private-key (:private attacker)
+                                    :sign-fn k/sign-fn})
+          result (bt/verify forged (:public root) k/verify-fn)]
+      (is (false? (:ok? result)))
+      (testing "and it fails at the block that was tampered with, not later"
+        (is (= 0 (:index result)))))))
+
+(deftest third-party-blocks-are-refused-by-name
+  (is (thrown? #?(:clj Exception :cljs :default)
+               (bt/append (base-token) {:third-party? true :next-public-key (:public k2)
+                                        :private-key (:private k1) :sign-fn k/sign-fn}))))
+
+(deftest crypto-is-not-defaulted
+  (is (thrown? #?(:clj Exception :cljs :default)
+               (bt/authority {:next-public-key (:public k1) :root-private-key (:private root)}))))
+
+(deftest a-block-must-name-its-successor
+  (is (thrown? #?(:clj Exception :cljs :default)
+               (bt/authority {:root-private-key (:private root) :sign-fn k/sign-fn}))))
+
+;; ---------------------------------------------------------------------------
+
+(deftest a-later-block-cannot-satisfy-an-earlier-blocks-check
+  (testing "the invariant that makes attenuation monotone"
+    ;; Block 1 restricts itself to read operations. Block 2 then asserts
+    ;; `operation(write)` -- if facts were pooled, block 1's check would be
+    ;; satisfied by a fact added AFTER it.
+    (let [t (-> (base-token)
+                (bt/append {:checks '[{:body [[operation read]]}]
+                            :next-public-key (:public k2)
+                            :private-key (:private k1) :sign-fn k/sign-fn})
+                (bt/append {:facts '[[operation read]]
+                            :next-public-key (:public k2)
+                            :private-key (:private k2) :sign-fn k/sign-fn}))
+          d (az/authorize t {:root-public-key (:public root) :verify-fn k/verify-fn
+                             :facts '[[operation write]]
+                             :policies '[{:kind :allow :body [[user "alice"]]}]})]
+      (is (false? (:allowed? d)))
+      (is (= :check-failed (:reason d))))))
+
+(deftest the-authorizers-own-facts-do-reach-every-block
+  (testing "scoping excludes later BLOCKS, not the verifier's context"
+    (let [t (bt/append (base-token) {:checks '[{:body [[operation read]]}]
+                                     :next-public-key (:public k2)
+                                     :private-key (:private k1) :sign-fn k/sign-fn})
+          d (az/authorize t {:root-public-key (:public root) :verify-fn k/verify-fn
+                             :facts '[[operation read]]
+                             :policies '[{:kind :allow :body [[user "alice"]]}]})]
+      (is (true? (:allowed? d)))
+      (is (= :allowed-by-policy (:reason d))))))
+
+(deftest a-token-cannot-allow-itself
+  (testing "there is no allow inside a token"
+    (let [t (base-token)
+          d (az/authorize t {:root-public-key (:public root) :verify-fn k/verify-fn
+                             :facts [] :policies []})]
+      (is (false? (:allowed? d)))
+      (is (= :no-policy-matched (:reason d))))))
+
+(deftest no-policy-matched-is-not-the-same-as-denied
+  (let [t (base-token)
+        none (az/authorize t {:root-public-key (:public root) :verify-fn k/verify-fn
+                              :facts [] :policies []})
+        denied (az/authorize t {:root-public-key (:public root) :verify-fn k/verify-fn
+                                :facts [] :policies '[{:kind :deny :body [[user "alice"]]}]})]
+    (is (= :no-policy-matched (:reason none)))
+    (is (= :denied-by-policy (:reason denied)))
+    (is (false? (:allowed? none)))
+    (is (false? (:allowed? denied)))))
+
+(deftest policies-never-run-on-an-unverified-token
+  (let [t (assoc-in (base-token) [:biscuit/blocks 0 :block/facts] '[[user "eve"]])
+        d (az/authorize t {:root-public-key (:public root) :verify-fn k/verify-fn
+                           :facts [] :policies '[{:kind :allow :body [[user "eve"]]}]})]
+    (is (false? (:allowed? d)))
+    (is (false? (:verified? d)))
+    (is (= :signature-mismatch (:reason d)))))

@@ -1,0 +1,355 @@
+;; `kotoba/biscuit/scope.kotoba` -- the delegated-scope intersection.
+;;
+;; The token is built with the library's own `biscuit.token/authority` and
+;; `append`, signed with the test keypairs, and verified with the real
+;; chain, so nothing here is a hand-written token shape. The guest is then
+;; driven from the SAME verified blocks the library reads.
+;;
+;; ## Parity
+;;
+;; `the-guest-agrees-with-authorize` walks the cases `biscuit.effective`
+;; gets right: a grant that is conferred and survives attenuation, one
+;; narrowed away by a later block, an unknown kind, a token that delegates
+;; nothing, and a local policy that does not allow the resource.
+;;
+;; ## Three findings, each executed rather than described
+;;
+;;   * `a-later-block-can-introduce-a-kind` -- `->delegated`'s fold is
+;;     `(if (empty? acc) block ...)`, and `acc` is empty when the AUTHORITY
+;;     block declared no `cap` facts. Appending a block is what every holder
+;;     of a biscuit may do offline with no key at all, so this is a widening
+;;     any holder can perform. Its own docstring says "It can never
+;;     introduce a kind".
+;;
+;;   * `the-capabilitys-holder-comes-from-the-caller` -- `->delegated`
+;;     computes `:grant/holder` from the authority block and `authorize`
+;;     never reads it, stamping `:cap/holder (:cap/holder requested)` on the
+;;     capability it returns. `:cap/holder` is one of the semantics'
+;;     `:identity-keys`.
+;;
+;;   * `expiry-is-compared-lexicographically` -- `authorize` orders instants
+;;     with `compare`, which on strings is byte order. Two spellings of the
+;;     same instant with different offsets order wrongly, so a token that
+;;     expired can be live and one that is live can be expired. The guest
+;;     does NOT fix this: it takes `:expired?` already decided, because
+;;     fixing it needs an instant parser and that is a different slice. The
+;;     test shows the defect where it is.
+;;
+;; `.cljc` stays the oracle for the fold it gets right and is not required
+;; from the guest (require-graph). It did not grow a second copy
+;; (ADR-2608261100).
+
+(ns biscuit.scope-kotoba-test
+  (:require [biscuit.effective :as eff]
+            [biscuit.keys :as k]
+            [biscuit.kotoba :as bk]
+            [biscuit.token :as bt]
+            [biscuit.scope-guest-document :refer [->doc]]
+            [kotoba.io :as io]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]))
+
+(def ^:private guest-file
+  (io/file (System/getProperty "user.dir") "kotoba" "biscuit" "scope.kotoba"))
+
+(def ^:private kir
+  (delay (:kir (compiler/compile-project {'biscuit.scope (slurp guest-file)}
+                                         'biscuit.scope :wasm32-kotoba-v1))))
+
+(defn- call
+  ([f args] (ir/execute @kir f args))
+  ([f args fuel] (ir/execute @kir f args {:fuel fuel})))
+
+(def ^:private root (k/keypair "root"))
+(def ^:private k1 (k/keypair "one"))
+(def ^:private k2 (k/keypair "two"))
+
+(def ^:private kinds #{:net/connect :fs/read})
+
+(defn- token
+  "An authority block and zero or more appended blocks, each signed by the
+  previous block's key -- which is what any holder can do, offline."
+  [authority-facts & later]
+  (reduce (fn [t facts]
+            (bt/append t {:facts facts :checks [] :next-public-key (:public k2)
+                          :private-key (:private k1) :sign-fn k/sign-fn}))
+          (bt/authority {:facts authority-facts :checks []
+                         :next-public-key (:public k1)
+                         :root-private-key (:private root)
+                         :sign-fn k/sign-fn})
+          later))
+
+(defn- verified! [t]
+  (let [v (bt/verify t (:public root) k/verify-fn)]
+    (is (:ok? v) "the token must verify, or the test is about nothing")
+    t))
+
+;; --- the host: replay this token's facts for one (kind, resource) pair ---------
+
+(defn- fact->doc [[pred a b]]
+  (->doc {:pred (name pred) :a (str a) :b (str b)}))
+
+(defn- drive
+  "Blocks in order; every fact of each; then close the block."
+  [t {:keys [kind resource holder]} opts]
+  (let [s0 (call 'init [(->doc {:kind (str kind) :resource (str resource)
+                                :holder (or holder "")})])
+        final (reduce (fn [s b]
+                        (call 'end-block
+                              [(reduce (fn [s' f] (call 'offer-fact [s' (fact->doc f)]))
+                                       s (:block/facts b))]))
+                      s0 (:biscuit/blocks t))]
+    {:decision (call 'decide [final (->doc opts)])
+     :blocks (call 'blocks-seen [final])
+     :holder (call 'token-holder [final])
+     :holders (call 'holder-count [final])
+     :authority? (call 'authority-confers? [final])
+     :granted? (call 'still-granted? [final])
+     :widening? (call 'widening-attempted? [final])}))
+
+(def ^:private semantics
+  ;; The three-term reading `biscuit.effective` implements. The live
+  ;; semantics file declares the five-term one and `authorize` refuses it
+  ;; outright (`:logic-authorizer-required`), so the oracle is asked with
+  ;; the rules it was written against -- otherwise every parity case would
+  ;; return the same refusal and the comparison would prove nothing.
+  {:kinds kinds
+   :rules {:effective-scope :requested-intersect-delegated-intersect-local-policy
+           :plain-resource-is-not-authority true
+           :unknown-kind :deny :missing-grant :deny :expired-grant :deny
+           :empty-intersection :deny :scope-attenuation-only true}})
+
+(defn- authorize [t requested local-policy]
+  (eff/authorize {:semantics semantics :token t :root-public-key (:public root)
+                  :verify-fn k/verify-fn :requested requested
+                  :local-policy local-policy :now "2026-08-31T12:00:00Z"
+                  :call "test"}))
+
+;; --- tests -----------------------------------------------------------------------
+
+(deftest guest-source-is-present
+  (is (io/exists? guest-file) (str "kotoba object not found at " guest-file)))
+
+(deftest the-guest-agrees-with-authorize
+  (doseq [[label facts request policy expected]
+          [["conferred and unattenuated"
+            [['[cap ":net/connect" "https://a.example"]]]
+            {:cap/kind :net/connect :cap/resource "https://a.example"}
+            {:policy/allow ["https://a.example"]} :granted]
+
+           ["narrowed away by a later block"
+            [['[cap ":net/connect" "https://a.example"]
+              '[cap ":net/connect" "https://b.example"]]
+             ['[cap ":net/connect" "https://b.example"]]]
+            {:cap/kind :net/connect :cap/resource "https://a.example"}
+            {:policy/allow ["https://a.example"]} :empty-intersection]
+
+           ["kept by a later block that mentions it"
+            [['[cap ":net/connect" "https://a.example"]
+              '[cap ":net/connect" "https://b.example"]]
+             ['[cap ":net/connect" "https://a.example"]]]
+            {:cap/kind :net/connect :cap/resource "https://a.example"}
+            {:policy/allow ["https://a.example"]} :granted]
+
+           ["a kind the token never mentions"
+            [['[cap ":fs/read" "/tmp/x"]]]
+            {:cap/kind :net/connect :cap/resource "https://a.example"}
+            {:policy/allow ["https://a.example"]} :missing-grant]
+
+           ["local policy does not allow it"
+            [['[cap ":net/connect" "https://a.example"]]]
+            {:cap/kind :net/connect :cap/resource "https://a.example"}
+            {:policy/allow ["https://other.example"]} :empty-intersection]
+
+           ["local policy allows everything"
+            [['[cap ":net/connect" "https://a.example"]]]
+            {:cap/kind :net/connect :cap/resource "https://a.example"}
+            {:policy/allow ["*"]} :granted]]]
+    (testing label
+      (let [t (verified! (apply token facts))
+            o (authorize t request policy)
+            allowed (set (:policy/allow policy))
+            g (drive t {:kind (:cap/kind request) :resource (:cap/resource request)}
+                     {:policy-allows? (contains? allowed (:cap/resource request))
+                      :policy-wildcard? (contains? allowed "*")
+                      :expired? false :require-holder? false :forbid-wildcard? false})]
+        (is (= expected (:decision g)) "the guest")
+        (is (= (= :granted expected) (:allowed? o)) "and the oracle agrees on the outcome")
+        (when-not (:allowed? o)
+          (is (= expected (:reason o)) "and on the reason"))))))
+
+;; --- finding one: a later block introduces a kind ---------------------------------
+
+(deftest a-later-block-can-introduce-a-kind
+  (let [t (verified!
+           (token '[[holder "did:key:alice"] [before "2030-01-01T00:00:00Z"]]
+                  '[[cap ":net/connect" "https://evil.example"]]))]
+    (testing "the authority block confers nothing"
+      (is (empty? (keep (fn [[p]] (when (= 'cap p) p))
+                        (get-in t [:biscuit/blocks 0 :block/facts])))))
+    (testing "and an appended block -- which any holder may add, with no key --"
+      (let [d (bk/->delegated t kinds)]
+        (is (= [{:grant/kind :net/connect
+                 :grant/resources ["https://evil.example"]
+                 :grant/expires "2030-01-01T00:00:00Z"
+                 :grant/id (:grant/id (first (:grants d)))}]
+               (:grants d))
+            "becomes the grant, though the docstring says a later block can
+             never introduce a kind")))
+    (testing "and authorize hands out the capability"
+      (let [o (authorize t {:cap/kind :net/connect :cap/resource "https://evil.example"}
+                         {:policy/allow ["*"]})]
+        (is (true? (:allowed? o)))
+        (is (= "https://evil.example" (:cap/resource (:capability o))))))
+    (testing "the guest refuses, and names the event"
+      (let [g (drive t {:kind :net/connect :resource "https://evil.example"}
+                     {:policy-allows? false :policy-wildcard? true :expired? false
+                      :require-holder? false :forbid-wildcard? false})]
+        (is (= :attenuation-cannot-introduce-a-kind (:decision g)))
+        (is (true? (:widening? g)))
+        (is (false? (:authority? g)))))))
+
+(deftest an-honest-attenuation-is-not-mistaken-for-a-widening
+  ;; The new refusal must not fire on the ordinary shape: block 0 confers the
+  ;; kind, a later block narrows the resources.
+  (let [t (verified! (token '[[cap ":net/connect" "https://a.example"]
+                              [cap ":net/connect" "https://b.example"]]
+                            '[[cap ":net/connect" "https://a.example"]]))
+        g (drive t {:kind :net/connect :resource "https://a.example"}
+                 {:policy-allows? true :policy-wildcard? false :expired? false
+                  :require-holder? false :forbid-wildcard? false})]
+    (is (= :granted (:decision g)))
+    (is (false? (:widening? g)))))
+
+;; --- finding two: the holder ----------------------------------------------------------
+
+(deftest the-capabilitys-holder-comes-from-the-caller
+  (let [t (verified! (token '[[holder "did:key:alice"]
+                              [cap ":net/connect" "https://a.example"]]))]
+    (testing "the token names its holder and ->delegated reads it"
+      (is (= "did:key:alice" (:grant/holder (bk/->delegated t kinds)))))
+    (testing "and authorize stamps the caller's instead"
+      (let [o (authorize t {:cap/kind :net/connect :cap/resource "https://a.example"
+                            :cap/holder "did:key:mallory"}
+                         {:policy/allow ["*"]})]
+        (is (true? (:allowed? o)))
+        (is (= "did:key:mallory" (:cap/holder (:capability o)))
+            ":cap/holder is one of the semantics' :identity-keys, and the
+             token bound a different one")))
+    (testing "the guest compares them"
+      (is (= :holder-mismatch
+             (:decision (drive t {:kind :net/connect :resource "https://a.example"
+                                  :holder "did:key:mallory"}
+                               {:policy-allows? true :policy-wildcard? false
+                                :expired? false :require-holder? true
+                                :forbid-wildcard? false}))))
+      (is (= :granted
+             (:decision (drive t {:kind :net/connect :resource "https://a.example"
+                                  :holder "did:key:alice"}
+                               {:policy-allows? true :policy-wildcard? false
+                                :expired? false :require-holder? true
+                                :forbid-wildcard? false})))))))
+
+(deftest two-holder-facts-are-an-ambiguity-not-an-absence
+  (let [t (verified! (token '[[holder "did:key:alice"] [holder "did:key:mallory"]
+                              [cap ":net/connect" "https://a.example"]]))]
+    (testing "->delegated answers nil, which is what it also answers for a token
+              that names no holder at all"
+      (is (nil? (:grant/holder (bk/->delegated t kinds))))
+      (is (nil? (:grant/holder (bk/->delegated (verified! (token '[[cap ":net/connect" "https://a.example"]]))
+                                               kinds)))))
+    (testing "the guest keeps the two apart"
+      (let [g (drive t {:kind :net/connect :resource "https://a.example"
+                        :holder "did:key:alice"}
+                     {:policy-allows? true :policy-wildcard? false :expired? false
+                      :require-holder? true :forbid-wildcard? false})]
+        (is (= 2 (:holders g)))
+        (is (= :ambiguous-holder (:decision g)))))))
+
+(deftest a-later-block-cannot-name-the-holder
+  ;; Only the authority block's holder facts count. A holder named by an
+  ;; appended block is named by whoever appended it.
+  (let [t (verified! (token '[[cap ":net/connect" "https://a.example"]]
+                            '[[holder "did:key:mallory"]
+                              [cap ":net/connect" "https://a.example"]]))
+        g (drive t {:kind :net/connect :resource "https://a.example"
+                    :holder "did:key:mallory"}
+                 {:policy-allows? true :policy-wildcard? false :expired? false
+                  :require-holder? true :forbid-wildcard? false})]
+    (is (= 0 (:holders g)) "the appended holder fact confers nothing")
+    (is (= :holder-mismatch (:decision g)))))
+
+;; --- finding three: the instants ---------------------------------------------------------
+
+(deftest expiry-is-compared-lexicographically
+  ;; `authorize` orders instants with `compare`. On strings that is byte
+  ;; order, and RFC 3339 lets one instant be written many ways.
+  (testing "the same instant, written two ways, does not compare equal"
+    (is (neg? (compare "2026-08-31T12:00:00Z" "2026-08-31T21:00:00+09:00"))
+        "these name the same instant; byte order says the first is earlier"))
+  (let [;; A token that expired an hour ago, spelled with an offset.
+        t (verified! (token '[[cap ":net/connect" "https://a.example"]
+                              [before "2026-08-31T20:00:00+09:00"]]))
+        o (eff/authorize {:semantics semantics :token t
+                          :root-public-key (:public root) :verify-fn k/verify-fn
+                          :requested {:cap/kind :net/connect
+                                      :cap/resource "https://a.example"}
+                          :local-policy {:policy/allow ["*"]}
+                          :now "2026-08-31T12:00:00Z"   ; 21:00+09:00 -- after it
+                          :call "test"})]
+    (is (true? (:allowed? o))
+        "the grant expired at 11:00Z and the clock reads 12:00Z, and it is
+         allowed, because \"2026-08-31T12:00:00Z\" sorts before
+         \"2026-08-31T20:00:00+09:00\" byte by byte"))
+  (testing "and the expiry branch does work, so the acceptance above is the
+            offset and not a term that is never checked"
+    (let [t (verified! (token '[[cap ":net/connect" "https://a.example"]
+                                [before "2026-08-31T11:00:00Z"]]))
+          o (eff/authorize {:semantics semantics :token t
+                            :root-public-key (:public root) :verify-fn k/verify-fn
+                            :requested {:cap/kind :net/connect
+                                        :cap/resource "https://a.example"}
+                            :local-policy {:policy/allow ["*"]}
+                            :now "2026-08-31T12:00:00Z"
+                            :call "test"})]
+      (is (false? (:allowed? o)))
+      (is (= :expired-grant (:reason o))
+          "the same instant an hour earlier, spelled with Z, is refused")))
+  (testing "the guest does not fix this and does not pretend to: it takes the
+            decided boolean, so a host that gets the comparison right gets the
+            right answer"
+    (let [t (verified! (token '[[cap ":net/connect" "https://a.example"]
+                                [before "2026-08-31T20:00:00+09:00"]]))]
+      (is (= :expired-grant
+             (:decision (drive t {:kind :net/connect :resource "https://a.example"}
+                               {:policy-allows? true :policy-wildcard? false
+                                :expired? true :require-holder? false
+                                :forbid-wildcard? false})))))))
+
+;; --- the wildcard ------------------------------------------------------------------------
+
+(deftest a-production-policy-refuses-an-effective-wildcard
+  (let [t (verified! (token '[[cap ":net/connect" "*"]]))]
+    (is (= :production-effective-wildcard
+           (:decision (drive t {:kind :net/connect :resource "*"}
+                             {:policy-allows? true :policy-wildcard? false
+                              :expired? false :require-holder? false
+                              :forbid-wildcard? true}))))
+    (is (= :granted
+           (:decision (drive t {:kind :net/connect :resource "*"}
+                             {:policy-allows? true :policy-wildcard? false
+                              :expired? false :require-holder? false
+                              :forbid-wildcard? false}))))))
+
+(deftest the-default-budget-still-suffices
+  ;; Measured in both directions rather than guessed.
+  (let [t (verified! (token '[[cap ":net/connect" "https://a.example"]]))]
+    (is (= :granted (:decision (drive t {:kind :net/connect
+                                         :resource "https://a.example"}
+                                      {:policy-allows? true :policy-wildcard? false
+                                       :expired? false :require-holder? false
+                                       :forbid-wildcard? false}))))
+    (is (thrown? Exception
+                 (call 'init [(->doc {:kind "k" :resource "r" :holder ""})] 4))
+        "and a budget of four is not enough, so the assertion above is not vacuous")))

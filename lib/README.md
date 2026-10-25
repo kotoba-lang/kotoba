@@ -138,6 +138,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.dns` | `org.ietf.dns/src` | `nameserver.amano`, `nameserver.custom-tld`, `nameserver.delegate`, `nameserver.domain-verification` (an external specification, publisher ietf.org) |
 | `org.chainagnostic.cacao` | `org.chainagnostic.cacao/src` | `cacao.cli`, `cacao.conformance`, `cacao.core`, `cacao.edge.base58` (an external specification, publisher chainagnostic.org) |
 | `org.canCia.canopen` | `org.canCia.canopen/src` | `canopen.cob-id`, `canopen.emcy`, `canopen.nmt`, `canopen.pdo` (an external specification, publisher canCia.org) |
+| `org.biscuitsec.biscuit` | `org.biscuitsec.biscuit/src` | `biscuit.authority`, `biscuit.authorizer`, `biscuit.datalog`, `biscuit.effective` (an external specification, publisher biscuitsec.org) |
 | `app.bsky.atproto` | `app.bsky.atproto/src` | `atproto.core`, `atproto.sdk` (Kotoba project library) |
 | `com.microsoft.riff` | `com.microsoft.riff/src` | `riff.bytes`, `riff.core` (Kotoba project library) |
 | `com.pkware.zip` | `com.pkware.zip/src` | `zip.bytes`, `zip.core`, `zip.write` (Kotoba project library) |
