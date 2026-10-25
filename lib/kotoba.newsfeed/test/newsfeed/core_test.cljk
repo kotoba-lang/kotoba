@@ -1,0 +1,312 @@
+(ns newsfeed.core-test
+  "Cases are drawn from real feeds wherever a real feed exercised the rule —
+   the RFC 822 offsets, the empty CDATA description, the `rel=\"self\"` trap and
+   the arXiv/StorageReview ranking behaviour all come from the 2026-08-03
+   ingest, not from imagination."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [newsfeed.xml :as xml]
+            [newsfeed.instant :as instant]
+            [newsfeed.parse :as parse]
+            [newsfeed.article :as article]
+            [newsfeed.catalog :as catalog]
+            [newsfeed.score :as score]
+            [newsfeed.digest :as digest]))
+
+;; ── xml ──────────────────────────────────────────────────────────────────────
+
+(deftest entities
+  (is (= "a & b" (xml/decode-entities "a &amp; b")))
+  (is (= "<tag>" (xml/decode-entities "&lt;tag&gt;")))
+  (is (= "A—B…" (xml/decode-entities "A&mdash;B&hellip;")))
+  (is (= "é" (xml/decode-entities "&#233;")))
+  (is (= "é" (xml/decode-entities "&#xe9;")))
+  (testing "an unknown reference is left alone rather than dropped"
+    (is (= "50% &foo; more" (xml/decode-entities "50% &foo; more"))))
+  (testing "a bare ampersand is not an entity"
+    (is (= "AT&T" (xml/decode-entities "AT&T")))))
+
+(deftest structure
+  (let [r (xml/parse "<?xml version=\"1.0\"?><!DOCTYPE x><rss><!-- c --><channel><title>T</title></channel></rss>")]
+    (is (= "rss" (:tag r)))
+    (is (= "T" (xml/child-text (xml/element r "channel") "title"))))
+  (testing "CDATA is text, not markup"
+    (is (= "a <b> c" (xml/text (xml/parse "<t><![CDATA[a <b> c]]></t>")))))
+  (testing "a > inside a quoted attribute does not end the tag"
+    (let [r (xml/parse "<a t=\"x > y\"><b/></a>")]
+      (is (= "x > y" (get-in r [:attrs "t"])))
+      (is (= 1 (count (xml/elements r "b"))))))
+  (testing "self-closing and empty elements"
+    (is (= "" (xml/text (xml/parse "<d><![CDATA[]]></d>"))))
+    (is (= [] (:children (xml/parse "<a/>")))))
+  (testing "namespace prefixes are kept on :tag and stripped by local-name"
+    (let [r (xml/parse "<item><content:encoded>x</content:encoded></item>")]
+      (is (= "content:encoded" (:tag (first (xml/elements r)))))
+      (is (= "x" (xml/child-text r "encoded")))))
+  (testing "a BOM does not defeat the parser"
+    (is (= "rss" (:tag (xml/parse "﻿<rss><channel/></rss>"))))))
+
+;; ── instant ──────────────────────────────────────────────────────────────────
+
+(deftest rfc822
+  (is (= "2026-07-31T16:11:03Z" (instant/normalize "Fri, 31 Jul 2026 17:11:03 +0100")))
+  (is (= "2026-07-30T15:09:09Z" (instant/normalize "Thu, 30 Jul 2026 15:09:09 GMT")))
+  (testing "a negative offset rolls the date forward"
+    (is (= "2026-08-03T00:23:32Z" (instant/normalize "Sun, 02 Aug 2026 20:23:32 -0400"))))
+  (testing "the weekday and the seconds are both optional"
+    (is (= "2026-08-02T09:11:00Z" (instant/normalize "02 Aug 2026 09:11 GMT"))))
+  (testing "a named US zone"
+    (is (= "2026-08-02T19:00:00Z" (instant/normalize "Sun, 02 Aug 2026 12:00:00 PDT")))))
+
+(deftest iso8601
+  (is (= "2026-07-31T22:16:17Z" (instant/normalize "2026-07-31T22:16:17Z")))
+  (is (= "2026-07-31T13:16:17Z" (instant/normalize "2026-07-31T22:16:17+09:00")))
+  (is (= "2026-08-01T03:16:17Z" (instant/normalize "2026-07-31T22:16:17-05:00")))
+  (testing "fractional seconds are dropped, not rounded"
+    (is (= "2026-07-31T22:16:17Z" (instant/normalize "2026-07-31T22:16:17.482Z"))))
+  (testing "a bare date is midnight UTC"
+    (is (= "2026-07-31T00:00:00Z" (instant/normalize "2026-07-31"))))
+  (testing "the '-' of a date is not mistaken for a zone"
+    (is (= "2026-07-31T22:16:17Z" (instant/normalize "2026-07-31T22:16:17")))))
+
+(deftest unparseable-is-nil
+  (is (nil? (instant/normalize "yesterday")))
+  (is (nil? (instant/normalize "")))
+  (is (nil? (instant/normalize nil))))
+
+(deftest civil-roundtrip
+  (doseq [[y m d] [[1970 1 1] [2000 2 29] [2026 8 3] [2100 3 1]]]
+    (is (= [y m d] (instant/civil-from-days (instant/days-from-civil y m d))))))
+
+(deftest day-arithmetic
+  (is (= 3 (instant/days-between "2026-07-31T00:00:00Z" "2026-08-03T00:00:00Z")))
+  (is (= 0 (instant/days-between "2026-08-03T23:00:00Z" "2026-08-03T01:00:00Z"))))
+
+;; ── parse ────────────────────────────────────────────────────────────────────
+
+(def rss-doc
+  (str "<rss><channel><title>Feed</title><link>https://e.example/</link>"
+       "<item><title><![CDATA[Hello &amp; goodbye]]></title>"
+       "<link>https://e.example/a</link>"
+       "<pubDate>Fri, 31 Jul 2026 17:11:03 +0100</pubDate>"
+       "<description><![CDATA[<p>Body <b>text</b></p>]]></description>"
+       "<category>gpu</category><category>ai</category></item>"
+       ;; measured shape: Blocks & Files ships an empty CDATA description
+       "<item><title>No summary</title><link>https://e.example/b</link>"
+       "<pubDate>Fri, 31 Jul 2026 10:00:00 +0000</pubDate>"
+       "<description><![CDATA[]]></description></item>"
+       "</channel></rss>"))
+
+(def atom-doc
+  (str "<feed><title>A</title><link rel=\"self\" href=\"https://e.example/feed\"/>"
+       "<entry><title>Entry one</title>"
+       "<link rel=\"self\" href=\"https://e.example/feed/1\"/>"
+       "<link rel=\"alternate\" href=\"https://e.example/one\"/>"
+       "<published>2026-07-30T05:26:20Z</published>"
+       "<summary>Sum</summary><author><name>N</name></author></entry></feed>"))
+
+(deftest rss-parsing
+  (let [f (parse/feed rss-doc)
+        [a b] (:items f)]
+    (is (= :rss (:dialect f)))
+    (is (= "Feed" (:title f)))
+    (is (= "Hello & goodbye" (:title a)))
+    (is (= "2026-07-31T16:11:03Z" (:published a)))
+    (testing "html in a description becomes words, with a separating space"
+      (is (= "Body text" (:summary a))))
+    (is (= ["gpu" "ai"] (:categories a)))
+    (testing "an empty CDATA description yields no summary rather than \"\""
+      (is (nil? (:summary b))))))
+
+(deftest atom-parsing
+  (let [f (parse/feed atom-doc)
+        e (first (:items f))]
+    (is (= :atom (:dialect f)))
+    (testing "rel=alternate wins over rel=self — using self would give every
+              entry the feed's own url and collapse them to one article"
+      (is (= "https://e.example/one" (:link e))))
+    (is (= "2026-07-30T05:26:20Z" (:published e)))
+    (is (= ["N"] (:authors e)))))
+
+(deftest not-a-feed
+  (is (nil? (parse/feed "<html><body>hi</body></html>")))
+  (is (nil? (parse/feed "")))
+  (is (nil? (parse/feed nil))))
+
+;; ── article ──────────────────────────────────────────────────────────────────
+
+(deftest canonical-urls
+  (is (= "https://e.example/a" (article/canonical-url "https://E.Example/a#frag")))
+  (is (= "https://e.example/a" (article/canonical-url "https://e.example/a?utm_source=x&utm_medium=y")))
+  (is (= "https://e.example/a?id=7" (article/canonical-url "https://e.example/a?id=7&fbclid=z")))
+  (testing "path case and trailing slash are preserved — they distinguish real urls"
+    (is (= "https://e.example/A/" (article/canonical-url "https://e.example/A/")))
+    (is (not= (article/canonical-url "https://e.example/a")
+              (article/canonical-url "https://e.example/a/")))))
+
+(def src {:news.source/sourceId "s1" :news.source/name "S One"
+          :news.source/lang "en" :news.source/rightsPolicy "fair-use-quote"
+          :news.source/credibility 0.8 :news.source/class "trade"})
+
+(defn- hex [s] (str "h" (hash s)))
+
+(deftest article-mapping
+  (let [a (article/->article (first (:items (parse/feed rss-doc))) src hex)]
+    (is (= (str "art-" (hex "https://e.example/a")) (:news/id a)))
+    (is (= "newsfeed" (:source/dataset a)))
+    (is (= "e.example" (:news/authority a)))
+    (is (= "fair-use-quote" (:news/rightsPolicy a))))
+  (testing "an item with no url is dropped, never given a synthetic id"
+    (is (nil? (article/->article {:title "t"} src hex)))))
+
+(deftest dedupe-keeps-first
+  (let [a {:news/id "x" :news/sourceId "vendor"}
+        b {:news/id "x" :news/sourceId "aggregator"}]
+    (is (= ["vendor"] (map :news/sourceId (article/dedupe-articles [a b]))))))
+
+(deftest freshness
+  (let [now "2026-08-03T00:00:00Z"]
+    (is (article/fresh? {:news/publishedAt "2026-08-01T00:00:00Z"} now 7))
+    (is (not (article/fresh? {:news/publishedAt "2026-07-01T00:00:00Z"} now 7)))
+    (testing "an undated article is never fresh"
+      (is (not (article/fresh? {:news/title "t"} now 7))))))
+
+;; ── catalog ──────────────────────────────────────────────────────────────────
+
+(def fixture-catalog
+  {:sources [{:news.source/sourceId "s1" :news.source/name "S One"
+              :news.source/class "trade" :news.source/credibility 0.9
+              :news.source/rightsPolicy "fair-use-quote"}
+             {:news.source/sourceId "s2" :news.source/name "S Two"
+              :news.source/class "preprint" :news.source/credibility 0.5
+              :news.source/rightsPolicy "unknown"}]
+   :channels [{:channel/id :c1 :channel/sources ["s1"]}]})
+
+(deftest catalog-join-beats-the-ledger-snapshot
+  (testing "a stale value written at ingest time loses to the current catalog"
+    (let [stale {:news/sourceId "s1" :news/credibility 0.1 :news/rightsPolicy "unknown"}
+          [a] (catalog/enrich [stale] fixture-catalog)]
+      (is (= 0.9 (:news/credibility a)))
+      (is (= "fair-use-quote" (:news/rightsPolicy a)))
+      (is (= "trade" (:news/sourceClass a)))))
+  (testing "an article from a source the catalog dropped is left untouched"
+    (is (= [{:news/sourceId "gone"}] (catalog/enrich [{:news/sourceId "gone"}] fixture-catalog)))))
+
+(deftest channel-source-declaration-is-honoured
+  (let [ch (catalog/channel fixture-catalog :c1)]
+    (is (= ["s1"] (map :news/sourceId (catalog/for-channel [{:news/sourceId "s1"} {:news/sourceId "s2"}] ch))))
+    (is (empty? (catalog/unknown-sources fixture-catalog ch))))
+  (testing "a source id no catalog entry defines is reported"
+    (is (= ["typo"] (catalog/unknown-sources fixture-catalog {:channel/sources ["s1" "typo"]})))))
+
+;; ── score ────────────────────────────────────────────────────────────────────
+
+(def ch1
+  {:channel/id :c :channel/min-score 4
+   :channel/keywords {3 ["gpu"] 1 ["cloud"]}
+   :channel/url-hints {"/storage/" 4 "/offbeat/" -6}})
+
+(deftest title-outweighs-summary
+  (let [in-title (score/score {:news/title "A GPU story" :news/credibility 0.5} ch1)
+        in-body  (score/score {:news/title "A story" :news/summary "about gpu" :news/credibility 0.5} ch1)]
+    (is (> (:score/total in-title) (:score/total in-body)))))
+
+(deftest repetition-is-not-relevance
+  (let [once  (score/score {:news/title "gpu" :news/credibility 0.5} ch1)
+        often (score/score {:news/title "gpu gpu gpu gpu" :news/credibility 0.5} ch1)]
+    (is (= (:score/total once) (:score/total often)))))
+
+(deftest url-hints-cut-both-ways
+  (let [good (score/score {:news/title "gpu" :news/url "https://x/storage/1" :news/credibility 0.5} ch1)
+        bad  (score/score {:news/title "gpu" :news/url "https://x/offbeat/1" :news/credibility 0.5} ch1)]
+    (is (= 400 (:score/url good)))
+    (is (= -600 (:score/url bad)))
+    (is (> (:score/total good) (:score/total bad)))))
+
+(deftest source-bias-applies
+  (let [ch (assoc ch1 :channel/source-bias {"p" -3})
+        biased (score/score {:news/title "gpu" :news/sourceId "p" :news/credibility 0.5} ch)
+        plain  (score/score {:news/title "gpu" :news/sourceId "q" :news/credibility 0.5} ch)]
+    (is (= -300 (:score/bias biased)))
+    (is (= 300 (- (:score/total plain) (:score/total biased))))))
+
+(deftest rank-reports-both-sides
+  (let [{:keys [selected rejected]}
+        (score/rank [{:news/title "gpu news" :news/credibility 0.5}
+                     {:news/title "unrelated" :news/credibility 0.5}]
+                    ch1)]
+    (is (= 1 (count selected)))
+    (testing "what fell below the bar is returned, not discarded — a threshold
+              cannot be tuned against results it never sees"
+      (is (= 1 (count rejected))))))
+
+;; ── digest ───────────────────────────────────────────────────────────────────
+
+(deftest clustering
+  (is (digest/similar? "NVIDIA ships Blackwell Ultra to cloud partners"
+                       "Blackwell Ultra ships to NVIDIA cloud partners"
+                       digest/default-threshold))
+  (is (not (digest/similar? "NVIDIA ships Blackwell Ultra" "Seagate HAMR drive pricing"
+                            digest/default-threshold)))
+  (testing "the real duplicate the threshold was chosen for (2026-08-03 corpus)"
+    (is (digest/similar? "Kioxia launches its first PCIe gen 5 liquid-cooled SSD"
+                         "KIOXIA's First Liquid-Cooled SSD Arrives in the E1.S NX1 Series"
+                         digest/default-threshold)))
+  (testing "and the false merge it was chosen to avoid"
+    (is (not (digest/similar? "Co-Designing AI Model Attention for Fast, Interactive Long-Context Inference"
+                              "LFM2.5-Encoders for Fast Long-Context Inference on CPU"
+                              digest/default-threshold))))
+  (let [cs (digest/cluster [{:news/title "Acme buys Beta unit" :news/id "1" :news/sourceId "a"}
+                            {:news/title "Acme buys Beta unit for $1bn" :news/id "2" :news/sourceId "b"}
+                            {:news/title "Totally other thing" :news/id "3" :news/sourceId "a"}])]
+    (is (= 2 (count cs)))
+    (is (= 1 (count (:also (first cs))))))
+  (testing "two near-identical headlines from ONE outlet stay separate — a
+            publisher does not run the same story twice"
+    (let [cs (digest/cluster [{:news/title "Dell Pro 5 14 Intel Review" :news/id "1" :news/sourceId "a"}
+                              {:news/title "Dell Pro 7 14 Intel Review" :news/id "2" :news/sourceId "a"}])]
+      (is (= 2 (count cs))))))
+
+(deftest spread-caps
+  (let [cl (fn [id src cls] {:lead {:news/id id :news/sourceId src :news/sourceClass cls} :also []})
+        clusters [(cl "1" "a" "preprint") (cl "2" "a" "preprint") (cl "3" "b" "preprint")
+                  (cl "4" "c" "vendor")  (cl "5" "c" "vendor")]
+        out (digest/take-spread clusters 5 {:max-per-source 2
+                                            :max-per-class {"preprint" 1 :default 2}
+                                            :class-of :news/sourceClass})]
+    (testing "one preprint may lead; the rest stay available as citations"
+      (is (= ["1" "4" "5"] (map (comp :news/id :lead) out)))))
+  (testing "with no class declared, a source is capped on its own id"
+    (let [cl (fn [id src] {:lead {:news/id id :news/sourceId src} :also []})
+          out (digest/take-spread [(cl "1" "a") (cl "2" "a") (cl "3" "a") (cl "4" "b")]
+                                  4 {:max-per-source 2 :class-of :news/sourceClass})]
+      (is (= ["1" "2" "4"] (map (comp :news/id :lead) out))))))
+
+(deftest brief-shape
+  (let [now "2026-08-03T00:00:00Z"
+        ch (merge ch1 {:channel/window-days 7 :channel/sources ["s1"]
+                       :channel/max-per-source 2})
+        arts [{:news/id "a" :news/sourceId "s1" :news/title "Big gpu news"
+               :news/url "https://x/storage/a" :news/publishedAt "2026-08-02T00:00:00Z"
+               :news/credibility 0.8 :news/sourceName "S" :news/rightsPolicy "fair-use-quote"}
+              {:news/id "b" :news/sourceId "s2" :news/title "Other gpu news"
+               :news/publishedAt "2026-08-02T00:00:00Z" :news/credibility 0.8}]
+        b (digest/brief arts ch now)]
+    (is (= :ok (:brief/status b)))
+    (testing "the topic line is the lead headline verbatim — no model in between"
+      (is (= "Big gpu news" (:brief/topic b))))
+    (testing "an undeclared source contributes nothing"
+      (is (= 1 (:declared-sources (:brief/pool b)))))
+    (testing "every citation carries its rights policy, which the governor gates on"
+      (is (every? :cite/rights (:brief/citations b))))
+    (is (= ["a"] (map :cite/id (:brief/citations b))))))
+
+(deftest brief-says-no-story-rather-than-lowering-the-bar
+  (let [b (digest/brief [{:news/id "a" :news/sourceId "s1" :news/title "nothing relevant"
+                          :news/publishedAt "2026-08-02T00:00:00Z" :news/credibility 0.5}]
+                        (merge ch1 {:channel/sources ["s1"]})
+                        "2026-08-03T00:00:00Z")]
+    (is (= :no-story (:brief/status b)))
+    (is (nil? (:brief/topic b)))
+    (testing "and still shows what it saw"
+      (is (= 1 (:in-window (:brief/pool b))))
+      (is (seq (:brief/near-misses b))))))
