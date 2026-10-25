@@ -105,6 +105,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.snmp` | `org.ietf.snmp/src` | `snmp.message`, `snmp.pdu`, `snmp.types` (an external specification, publisher ietf.org) |
 | `org.apache.arrow` | `org.apache.arrow/src` | `arrow.build`, `arrow.decode`, `arrow.flatbuffers`, `arrow.ipc` (an external specification, publisher apache.org) |
 | `org.ietf.oauth2` | `org.ietf.oauth2/src` | `oauth2.core`, `oauth2.pkce` (an external specification, publisher ietf.org) |
+| `kotoba.ioFilecoinNode` | `kotoba.ioFilecoinNode/src` | `filecoin.node.actors`, `filecoin.node.basefee`, `filecoin.node.block`, `filecoin.node.mpool` (Kotoba project library) |
 | `kotoba.industry` | `kotoba.industry/src` | `kotoba.industry`, `kotoba.industry.embedded`, `kotoba.industry.wave` (Kotoba project library) |
 | `kotoba.ieFlow` | `kotoba.ieFlow/src` | `etzhayyim.ie-flow.boundary`, `etzhayyim.ie-flow.colony`, `etzhayyim.ie-flow.control`, `etzhayyim.ie-flow.coscientist` (Kotoba project library) |
 | `kotoba.i18nCid` | `kotoba.i18nCid/src` | `i18n-cid.core`, `i18n-cid.pack`, `i18n-cid.pin`, `i18n-cid.seam` (Kotoba project library) |
