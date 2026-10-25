@@ -1,0 +1,181 @@
+#!/usr/bin/env kbb
+(ns delta.cli
+  "kotoba-delta CLI (ADR-2607161325).
+  record  --log L --key PEM --workspace D --kind edit|write|remove --file F
+          [--old S] [--new S | --new-file P] [--turn T] [--keys fleet-keys.edn]
+  verify  --log L                 ;; chain + signatures + content hash
+  replay  --log L --workspace D   ;; materialize files (deterministic)
+  project --log L --repo D        ;; replay + deterministic git commit"
+  (:require ["node:child_process" :as cp]
+            ["node:crypto" :as crypto]
+            ["node:fs" :as fs]
+            ["node:path" :as path]
+            [cljs.reader :as reader]
+            [kotoba.lang.text :as str]
+            [delta.op :as op]))
+
+(defn die [m] (js/console.error (str "delta: " m)) (js/process.exit 1))
+(defn slurp* [f] (fs/readFileSync f "utf8"))
+(defn sha256 [s] (-> (crypto/createHash "sha256") (.update s "utf8") (.digest "hex")))
+
+(def ^:private spki-prefix "302a300506032b6570032100")
+(defn verify-sig [pubkey-hex payload sig-hex]
+  (try (crypto/verify nil (js/Buffer.from payload "utf8")
+                      (crypto/createPublicKey
+                       #js {:key (js/Buffer.from (str spki-prefix pubkey-hex) "hex")
+                            :format "der" :type "spki"})
+                      (js/Buffer.from sig-hex "hex"))
+       (catch :default _ false)))
+(defn sign [pem payload]
+  (-> (crypto/sign nil (js/Buffer.from payload "utf8") (crypto/createPrivateKey pem))
+      (.toString "hex")))
+(defn pub-hex [pem]
+  (let [d (.export (crypto/createPublicKey (crypto/createPrivateKey pem))
+                   #js {:format "der" :type "spki"})]
+    (-> d (.subarray (- (.-length d) 32)) (.toString "hex"))))
+
+;; did:key (subset of fleet.did, ed25519 only)
+(def ^:private b58 "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
+(defn- hexbytes [h] (mapv #(js/parseInt (subs h % (+ % 2)) 16) (range 0 (count h) 2)))
+(defn did-of [pubkey-hex]
+  (let [bs (into [0xed 0x01] (hexbytes pubkey-hex))
+        n0 (reduce (fn [a b] (+ (* a (js/BigInt 256)) (js/BigInt b))) (js/BigInt 0) bs)]
+    (loop [n n0 out ""]
+      (if (= n (js/BigInt 0))
+        (str "did:key:z" out)
+        (let [q (/ n (js/BigInt 58)) r (- n (* q (js/BigInt 58)))]
+          (recur q (str (nth b58 (js/Number r)) out)))))))
+(defn did->pub [did-str log-entries]
+  ;; prototype: resolve did -> pubkey from the log's own actor table
+  (some #(when (= did-str (:actor %)) (:pubkey %)) log-entries))
+
+(defn load-log [f]
+  (if (fs/existsSync f)
+    (mapv reader/read-string (remove str/blank? (str/split (slurp* f) #"\n")))
+    []))
+(defn ops-of [entries] (mapv #(select-keys % [:op :sig]) (filter :op entries)))
+(defn actors-of [entries] (filter :actor entries))
+
+(defn parse-args [argv]
+  (loop [o {} [a & m] argv]
+    (cond (nil? a) o
+          (str/starts-with? a "--")
+          (let [k (keyword (subs a 2))]
+            (if (or (nil? (first m)) (str/starts-with? (first m) "--"))
+              (recur (assoc o k true) m)
+              (recur (assoc o k (first m)) (rest m))))
+          :else (recur o m))))
+
+(defn verify-log
+  "-> {:ok? bool :head-id hex|nil :errors [..] :files ..}"
+  [entries]
+  (let [actors (actors-of entries)
+        ops    (ops-of entries)
+        errors
+        (loop [errs [] head nil [{:keys [op sig] :as e} & more] ops i 0]
+          (if (nil? e)
+            errs
+            (let [pub (did->pub (:op/actor op) actors)
+                  v (op/admit {:op op :sig sig}
+                              {:head head :verify-fn verify-sig :hash-fn sha256
+                               :actor-pubkey pub :grant-ok? (some? pub)})]
+              (recur (if (= :accept (:verdict v)) errs
+                         (conj errs {:index i :reasons (:reasons v)}))
+                     {:op op :sig sig} more (inc i)))))
+        r (op/replay {} (map :op ops))]
+    {:ok? (and (empty? errors) (not (:conflict r)))
+     :head-id (when (seq ops) (op/op-id sha256 (:op (last ops))))
+     :errors errors :conflict (:conflict r)
+     :files (:files r)
+     :content-hash (op/content-hash sha256 (:files r))}))
+
+(defn cmd-record [{:keys [log key workspace kind file old new new-file turn keys]}]
+  (when-not (and log key kind file) (die "record needs --log --key --kind --file"))
+  (let [pem (slurp* key)
+        pub (pub-hex pem)
+        did (did-of pub)
+        entries (load-log log)
+        ops (ops-of entries)
+        head (last ops)
+        grant-ok? (if keys
+                    (let [cfg (reader/read-string (slurp* keys))]
+                      (contains? (get cfg :delta/editors #{}) did))
+                    true)
+        new* (cond new-file (slurp* new-file) new new :else nil)
+        o (op/make-op {:parent (when head (op/op-id sha256 (:op head)))
+                       :actor did :at (.toISOString (js/Date.))
+                       :kind (keyword kind) :file file :old old :new new* :turn turn})
+        sig (sign pem (op/canonical-str o))
+        v (op/admit {:op o :sig sig}
+                    {:head head :verify-fn verify-sig :hash-fn sha256
+                     :actor-pubkey pub :grant-ok? grant-ok?})]
+    (if (= :reject (:verdict v))
+      (do (js/console.error "REJECTED:" (pr-str (:reasons v))) (js/process.exit 1))
+      (do
+        (when-not (some #(= did (:actor %)) (actors-of entries))
+          (fs/appendFileSync log (str (pr-str {:actor did :pubkey pub}) "\n")))
+        (fs/appendFileSync log (str (pr-str {:op o :sig sig}) "\n"))
+        (when workspace
+          (let [r (op/apply-op
+                   (into {} (keep (fn [f] (let [p (path/join workspace f)]
+                                            (when (fs/existsSync p) [f (slurp* p)])))
+                                  [file]))
+                   o)]
+            (if (:conflict r)
+              (do (js/console.error "workspace conflict:" (pr-str (:conflict r)))
+                  (js/process.exit 1))
+              (doseq [[f c] r]
+                (let [p (path/join workspace f)]
+                  (fs/mkdirSync (path/dirname p) #js {:recursive true})
+                  (fs/writeFileSync p c))))))
+        (println "op" (subs (op/op-id sha256 o) 0 12) (name (keyword kind)) file
+                 (if turn (str "turn=" turn) ""))))))
+
+(defn cmd-verify [{:keys [log]}]
+  (when-not log (die "verify needs --log"))
+  (let [{:keys [ok? head-id errors conflict content-hash files]} (verify-log (load-log log))]
+    (if ok?
+      (println "OK:" (count files) "file(s), head" (subs head-id 0 12)
+               "content" (subs content-hash 0 12))
+      (do (js/console.error "INVALID:" (pr-str (or (seq errors) conflict)))
+          (js/process.exit 1)))))
+
+(defn cmd-replay [{:keys [log workspace]}]
+  (when-not (and log workspace) (die "replay needs --log --workspace"))
+  (let [{:keys [ok? files content-hash errors conflict]} (verify-log (load-log log))]
+    (when-not ok? (die (str "log invalid: " (pr-str (or (seq errors) conflict)))))
+    (doseq [[f c] files]
+      (let [p (path/join workspace f)]
+        (fs/mkdirSync (path/dirname p) #js {:recursive true})
+        (fs/writeFileSync p c)))
+    (println "replayed" (count files) "file(s), content" (subs content-hash 0 12))))
+
+(defn cmd-project [{:keys [log repo]}]
+  (when-not (and log repo) (die "project needs --log --repo"))
+  (let [entries (load-log log)
+        {:keys [ok? files content-hash]} (verify-log entries)
+        last-at (:op/at (:op (last (ops-of entries))))]
+    (when-not ok? (die "log invalid"))
+    (fs/mkdirSync repo #js {:recursive true})
+    (doseq [[f c] files]
+      (let [p (path/join repo f)]
+        (fs/mkdirSync (path/dirname p) #js {:recursive true})
+        (fs/writeFileSync p c)))
+    ;; deterministic commit: fixed author/committer identity + last op's time
+    (let [env (str "GIT_AUTHOR_DATE='" last-at "' GIT_COMMITTER_DATE='" last-at "' "
+                   "GIT_AUTHOR_NAME=kotoba-delta GIT_AUTHOR_EMAIL=delta@kotoba "
+                   "GIT_COMMITTER_NAME=kotoba-delta GIT_COMMITTER_EMAIL=delta@kotoba")
+          run (fn [c] (cp/execSync c #js {:cwd repo :stdio "pipe"}))]
+      (run "git init -q .")
+      (run "git add -A")
+      (run (str env " git -c user.name=kotoba-delta -c user.email=delta@kotoba "
+                "commit -q --allow-empty -m 'kotoba-delta projection: content "
+                content-hash "'"))
+      (println "projected commit:"
+               (str/trim (.toString (cp/execSync "git rev-parse HEAD" #js {:cwd repo})))
+               "content" (subs content-hash 0 12)))))
+
+(let [[cmd & rest-args] *command-line-args*
+      f ({"record" cmd-record "verify" cmd-verify
+          "replay" cmd-replay "project" cmd-project} cmd)]
+  (if f (f (parse-args rest-args)) (die "usage: delta {record|verify|replay|project} ...")))
