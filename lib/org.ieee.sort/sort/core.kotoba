@@ -1,0 +1,661 @@
+;; sort -- POSIX sort (IEEE Std 1003.1), byte order, with -r, -u and -n.
+;;
+;;   sort FILE...        the lines of every operand, merged, ascending
+;;   sort -r FILE...     descending
+;;   sort -u FILE...     ascending, adjacent duplicates dropped AFTER sorting
+;;   sort -n FILE...     by a leading numeric key
+;;
+;; ONE flag, and it is argument 0. Combining them is out of scope -- see the
+;; README. The flag is recognised by argument 0's SHAPE and never by the
+;; argument COUNT: `org-ieee-cut` asked about the count until 2026-09-10 and
+;; was right for exactly one operand, so this asks the question that stays
+;; right when a second operand appears.
+;;
+;; ## The ordering is one host call (context ABI v7, 2026-09-16)
+;;
+;; Until 2026-09-16 the language had no string comparison but `string=`, and
+;; this walked both lines with `string-code-point-at`, one host call per
+;; code point per line per merge level -- 12.5 s of a 33 MB sort where
+;; `/usr/bin/sort` spent 0.38. `string-compare` (ABI v7, slot 240) is the
+;; loader's memcmp over the common prefix, the shorter first; UTF-8
+;; preserves code point order lexicographically, so that IS byte order,
+;; and `less?` below is one call.
+;;
+;; ## Byte order, so the comparison is `LC_ALL=C sort`
+;;
+;; Measured 2026-09-10 on `b a B A`: the default locale answers `a A b B` and
+;; LC_ALL=C answers `A B a b`. On `日 é z` the default answers `日 é z` and
+;; LC_ALL=C answers `z é 日`. This produces the second in both cases -- the
+;; POSIX locale -- and the test compares against it.
+;;
+;; ## sort ADDS the newline a last line lacks
+;;
+;; Measured: a 13-byte file whose last line has no newline produces 14 bytes.
+;; Same as grep, opposite of head.
+;;
+;; ## Merge sort, on the loader's tail append (2026-09-15)
+;;
+;; Substrings are VIEWS and cost no arena bytes; `string-concat` is what
+;; allocates, and the arena never reclaims. The first shape was a selection
+;; sort that rebuilt the remainder once per line, which is O(n) copies of
+;; the remainder per line -- quadratic in the pool, and measured to trap at
+;; 4,600 lines. The merge sort below spends n * log2(lines) pool bytes, each
+;; merge appending line views onto its run with the tail append (see the
+;; sort section). The numeric key is still built out of substrings only.
+(ns sort.core (:export [main]))
+
+(defn arg [i :string] :string
+  (typed-cap-call :cli/args :string :string i))
+
+(defn emit [s :string] :string
+  (typed-cap-call :io/write :string :string s))
+
+(defn slurp-file [path :string] :string
+  (typed-cap-call :fs/app-data :string :string path))
+
+(defn emit-error [s :string] :string
+  (typed-cap-call :io/write-error :string :string s))
+
+;; Is PATH a file this command may read? Wire 35's EXISTS form answers "1" or
+;; "0"; a path outside the granted scope answers "0", which is what the read
+;; form would trap on.
+;;
+;; This has to be ASKED. The read form TRAPS on a path it cannot serve, and a
+;; trap cannot be caught, so there is no way to notice afterwards.
+(defn readable? [path :string] :bool
+  (string=? (typed-cap-call :fs/app-data :string :string
+                            (string-concat path "EXISTS_SEP"))
+            "1"))
+
+
+(defn nl [] :string
+  (string-substring "a
+b" 1 2))
+
+;; Is A strictly less than B in byte order? One host comparison (ABI v7):
+;; byte order over the common prefix, then a proper prefix is less than
+;; what extends it, which is exactly `LC_ALL=C`.
+(defn less? [a :string b :string] :bool
+  (< (string-compare a b) 0))
+
+;; --- the numeric key, for -n ---------------------------------------------
+;;
+;; Measured against `LC_ALL=C /usr/bin/sort -n` on 2026-09-10, one shape at a
+;; time, because every one of these was a guess that turned out to have an
+;; answer. The model that fits ALL of them:
+;;
+;;   key(line) = the leading numeric prefix, after [ \t]* and an optional '-'
+;;   ties on the key are broken by comparing the WHOLE LINE in byte order
+;;
+;; and the second half is not a detail. `1 01 " 1" 1x` all have key 1 and come
+;; out ` 1`, `01`, `1`, `1x` -- which is byte order and is NOT the input
+;; order, so `sort -n` is not stable with respect to equal keys. That is what
+;; lets a selection sort reproduce it: the order is total, so there is no
+;; input position to preserve.
+;;
+;; What the measurement contradicted:
+;;
+;;   `+5`     is NOT a number. `+5 3 +1 10` answers `+1 +5 3 10` -- key 0 for
+;;            both plus-signed lines, then the byte tiebreak. A '+' reader
+;;            would have answered `+1 3 +5 10`.
+;;   `\v` `\f` are NOT blanks. Only space and tab are skipped.
+;;   `-0`     EQUALS 0. `-0` against `  0` answers `  0` first, which is the
+;;            byte tiebreak; a sign that made -0 strictly negative would have
+;;            answered `-0` first. Both orderings agree on `-0` vs `0`, which
+;;            is why that pair alone could not decide it.
+;;   `1e3`    is 1, not 1000: the prefix stops at the first non-digit.
+;;   the tiebreak is the WHOLE line, not the part after the number: `1a` and
+;;            `01b` answer `01b 1a`, which is the whole line, where comparing
+;;            the remainders would have answered `1a 01b`.
+;;   the value is not a float and not an i64. Thirty ones against twenty-nine
+;;            ones and a two are ordered correctly, and no binary float and no
+;;            64-bit integer can tell those apart. So this compares DECIMAL
+;;            DIGITS, which is also why it needs no `text->i64` and cannot
+;;            overflow.
+
+(defn digit-at [s :string i :i64] :i64
+  (if (>= i (string-byte-length s))
+    -1
+    (let [c (string-code-point-at s i)]
+      (if (< c 48) -1 (if (> c 57) -1 (- c 48))))))
+
+;; Space and tab, and nothing else. Measured: `\v7 \f6 5` answers `\v7 \f6 5`,
+;; which is byte order over three key-0 lines -- so `\v` and `\f` did not get
+;; skipped and `7` and `6` were never read.
+(defn blank-at? [s :string i :i64] :bool
+  (if (>= i (string-byte-length s))
+    false
+    (let [c (string-code-point-at s i)]
+      (if (= c 32) true (= c 9)))))
+
+(defn char-is? [s :string i :i64 c :i64] :bool
+  (if (>= i (string-byte-length s))
+    false
+    (= (string-code-point-at s i) c)))
+
+(defn skip-blanks [s :string i :i64] :i64
+  (if (blank-at? s i) (skip-blanks s (+ i 1)) i))
+
+(defn scan-digits [s :string i :i64] :i64
+  (if (>= (digit-at s i) 0) (scan-digits s (+ i 1)) i))
+
+;; Where the number may start: past the blanks, past one '-'. There is no '+'
+;; branch, and its absence is measured rather than forgotten.
+(defn sign-at [s :string] :i64
+  (skip-blanks s 0))
+
+(defn negative-sign? [s :string] :bool
+  (char-is? s (sign-at s) 45))
+
+(defn digits-start [s :string] :i64
+  (if (negative-sign? s) (+ (sign-at s) 1) (sign-at s)))
+
+(defn int-end [s :string] :i64
+  (scan-digits s (digits-start s)))
+
+;; A '.' right after the integer digits opens the fraction; otherwise the
+;; fraction is the empty span at `int-end`, since `scan-digits` stopped there
+;; on a byte that is not a digit.
+(defn frac-start [s :string] :i64
+  (if (char-is? s (int-end s) 46) (+ (int-end s) 1) (int-end s)))
+
+(defn frac-end [s :string] :i64
+  (scan-digits s (frac-start s)))
+
+;; Both are SUBSTRINGS -- views, no arena. Every offset came from a scan over
+;; ASCII bytes, so every one of them is a code point boundary.
+(defn int-part [s :string] :string
+  (string-substring s (digits-start s) (int-end s)))
+
+(defn frac-part [s :string] :string
+  (string-substring s (frac-start s) (frac-end s)))
+
+(defn skip-zeros [d :string i :i64] :i64
+  (if (char-is? d i 48) (skip-zeros d (+ i 1)) i))
+
+(defn all-zeros? [d :string i :i64] :bool
+  (if (>= i (string-byte-length d))
+    true
+    (if (char-is? d i 48) (all-zeros? d (+ i 1)) false)))
+
+;; Two digit spans of the SAME length, left to right. -1, 0 or 1.
+(defn cmp-same-length [a :string b :string] :i64
+  (string-compare a b))
+
+;; Integer magnitudes as decimal digits: leading zeros dropped, then more
+;; digits is more, then left to right. `007` and `7` compare equal, which is
+;; what makes them fall to the whole-line tiebreak, which is what puts `007`
+;; first.
+(defn cmp-int [a :string b :string] :i64
+  (let [sa (string-substring a (skip-zeros a 0) (string-byte-length a))
+        sb (string-substring b (skip-zeros b 0) (string-byte-length b))
+        la (string-byte-length sa)
+        lb (string-byte-length sb)]
+    (if (< la lb) -1 (if (> la lb) 1 (cmp-same-length sa sb)))))
+
+;; Fractions, digit by digit, a missing digit reading as 0 -- so `1.5` and
+;; `1.50` are equal and `1.10` is below `1.5`.
+(defn cmp-frac-digit [d :i64] :i64
+  (if (< d 0) 0 d))
+
+(defn cmp-frac-at [a :string b :string i :i64] :i64
+  (if (< (cmp-frac-digit (digit-at a i)) (cmp-frac-digit (digit-at b i)))
+    -1
+    (if (> (cmp-frac-digit (digit-at a i)) (cmp-frac-digit (digit-at b i)))
+      1
+      0)))
+
+;; Runs until BOTH spans are exhausted, so the shorter one keeps reading 0.
+(defn cmp-fraction [a :string b :string i :i64] :i64
+  (if (if (>= i (string-byte-length a)) (>= i (string-byte-length b)) false)
+    0
+    (let [c (cmp-frac-at a b i)] (if (= c 0) (cmp-fraction a b (+ i 1)) c))))
+
+(defn cmp-magnitude [a :string b :string] :i64
+  (let [c (cmp-int (int-part a) (int-part b))]
+    (if (= c 0) (cmp-fraction (frac-part a) (frac-part b) 0) c)))
+
+;; `-0` is not negative. Measured: `-0` against `  0` answers `  0` first,
+;; which is the whole-line tiebreak between two EQUAL keys.
+(defn zero-magnitude? [s :string] :bool
+  (if (all-zeros? (int-part s) 0) (all-zeros? (frac-part s) 0) false))
+
+(defn negative? [s :string] :bool
+  (if (negative-sign? s) (if (zero-magnitude? s) false true) false))
+
+(defn cmp-numeric [a :string b :string] :i64
+  (let [na (negative? a)
+        nb (negative? b)]
+    (if (if na (if nb false true) false)
+      -1
+      (if (if nb (if na false true) false)
+        1
+        (let [c (cmp-magnitude a b)]
+          (if na (- 0 c) c))))))
+
+;; The key, then the whole line. Both halves are measured; see above.
+(defn numeric-less? [a :string b :string] :bool
+  (let [c (cmp-numeric a b)]
+    (if (< c 0) true (if (> c 0) false (less? a b)))))
+
+;; --- index merge sort (2026-09-16) -----------------------------------------
+;;
+;; The lines are never moved until they are written. A vector holds the
+;; byte offset where each line starts (`fill`), a bottom-up merge sort
+;; orders the OFFSETS between two vectors written in place
+;; (`vector-assoc!`, one store per element per level), and the sorted
+;; text is appended from the offsets at the end, a thousand lines per
+;; region. A comparison is one host call over the two lines in place
+;; (`string-compare-lines`, context ABI v8, newline excluded -- with it a
+;; line holding a tab would sort after a line it is a prefix of); only
+;; -n cuts views, for its numeric keys, inside a region.
+;;
+;; Until 2026-09-16 this was a merge sort over the TEXT: every level
+;; rebuilt the whole file with the tail append and searched every line end
+;; again, about eleven host calls per line per level -- 2.69 s on 33 MB
+;; where the index sort takes 0.77 (uutils sort 0.19, /usr/bin/sort
+;; 0.36). Before that a selection sort trapped at 4,600 lines. What made
+;; the index sort possible is `vector-item-limit` moving from 16,384 to
+;; 2^24 (osaho #93) and the loader's vector arenas becoming per-run
+;; budgets: this command is packaged with `--vector-items` for two words
+;; per line, and the line count is what bounds the file it can sort.
+;;
+;; A function carries five parameters, so the merge packs its cursors:
+;; II = i * 2^20 + iend, JJ = mode * 2^41 + j * 2^20 + jend (a line index
+;; below 2^20, the item limit's order of magnitude for two vectors).
+
+;; Just past the newline ending the line at I, or N. A region: the needle
+;; is a literal, a handle each time it is evaluated.
+(defn line-after [s :string i :i64 n :i64] :i64
+  (let [k (string-find-byte s 10 i)]
+    (if (< k 0) n (+ k 1))))
+
+(defn count-lines [text :string pos :i64 n :i64 acc :i64] :i64
+  (if (>= pos n) acc (count-lines text (line-after text pos n) n (+ acc 1))))
+
+;; --- the numeric key, once per line (2026-09-16) ---------------------------
+;;
+;; Under -n every comparison used to rebuild both keys from views, a host
+;; call per digit; at 33 MB that exhausted a 4 x 10^9 fuel budget. The key
+;; is now computed ONCE per line at `fill` and carried in the same vector
+;; word as the line's offset: `(key + 2^30) * 2^31 + offset` (the pool is
+;; at most 1 GiB, so an offset fits 31 bits). The key is the line's numeric
+;; prefix as `sign * (integer * 1000 + fraction)` when the integer part has
+;; at most six significant digits and the fraction at most three -- every
+;; number that fits is compared exactly, since the model above compares
+;; decimal digits and these ARE its digits -- and the SENTINEL 2^30 - 1
+;; otherwise, which sends the comparison to the digit-by-digit path over
+;; views (`numeric-less?`). `-0` is 0. Every other mode stores the bare
+;; offset, which `item-pos` reads back unchanged.
+(defn item-pos [item :i64] :i64 (bit-and item 2147483647))
+(defn item-key [item :i64] :i64 (- (i64-shift-right item 31) 1073741824))
+(defn pack-item [key :i64 pos :i64] :i64
+  (+ (i64-shift-left (+ key 1073741824) 31) pos))
+(defn key-sentinel [] :i64 1073741823)
+
+;; A code point at I of TEXT, -1 past the end (I is a boundary: every
+;; offset here follows an ASCII byte).
+(defn cp-at [text :string i :i64] :i64
+  (if (>= i (string-byte-length text)) -1 (string-code-point-at text i)))
+
+(defn skip-space-tab [text :string i :i64] :i64
+  (let [c (cp-at text i)]
+    (if (if (= c 32) true (= c 9)) (skip-space-tab text (+ i 1)) i)))
+
+;; The integer part from I: `end * 2^32 + value`, or -1 (the whole word)
+;; when more than six significant digits were seen -- a negative low half
+;; would not survive the shift, measured: `(end << 32) - 1` reads back as
+;; end - 1 and 2^32 - 1. Leading zeros are not significant.
+(defn int-digits [text :string i :i64 value :i64 digits :i64] :i64
+  (let [c (cp-at text i)]
+    (if (if (< c 48) true (> c 57))
+      (if (> digits 6) -1 (+ (i64-shift-left i 32) value))
+      (let [d (- c 48)
+            significant? (if (> digits 0) true (> d 0))]
+        (int-digits text (+ i 1)
+                    (if (> digits 6) value (+ (* value 10) d))
+                    (if significant? (+ digits 1) digits))))))
+
+;; The fraction from I (just past the '.'): `end * 2^32 + scaled` with
+;; scaled the first three digits padded to three, or -1 (the whole word)
+;; when a fourth digit exists (the exact path decides those).
+(defn frac-digits [text :string i :i64 scaled :i64 digits :i64] :i64
+  (let [c (cp-at text i)]
+    (if (if (< c 48) true (> c 57))
+      (if (> digits 3)
+        -1
+        (+ (i64-shift-left i 32)
+           (* scaled (if (= digits 0) 1000 (if (= digits 1) 100 (if (= digits 2) 10 1))))))
+      (frac-digits text (+ i 1) (if (> digits 2) scaled (+ (* scaled 10) (- c 48))) (+ digits 1)))))
+
+(defn line-key [text :string pos :i64] :i64
+  (let [s (skip-space-tab text pos)
+        neg? (= (cp-at text s) 45)
+        ie (int-digits text (if neg? (+ s 1) s) 0 0)]
+    (if (< ie 0)
+      (key-sentinel)
+      (let [int-end (i64-shift-right ie 32)
+            int-value (- ie (i64-shift-left int-end 32))
+            fe (if (= (cp-at text int-end) 46) (frac-digits text (+ int-end 1) 0 0) (i64-shift-left int-end 32))]
+        (if (< fe 0)
+          (key-sentinel)
+          (let [frac-value (- fe (i64-shift-left (i64-shift-right fe 32) 32))
+                m (+ (* int-value 1000) frac-value)]
+            (if neg? (- 0 m) m)))))))
+
+(defn- fill [text :string v :vector-i64 k :i64 pos :i64] :vector-i64
+  (let [n (string-byte-length text)]
+    (if (>= pos n)
+      v
+      (fill text (vector-assoc! v k pos) (+ k 1) (line-after text pos n)))))
+
+(defn- fill-keyed [text :string v :vector-i64 k :i64 pos :i64] :vector-i64
+  (let [n (string-byte-length text)]
+    (if (>= pos n)
+      v
+      (fill-keyed text (vector-assoc! v k (pack-item (arena-scope (line-key text pos)) pos))
+                  (+ k 1) (line-after text pos n)))))
+
+;; --- the order ------------------------------------------------------------
+;;
+;; MODE is a bit set since 2026-09-17: 1 = -r, 2 = -n, 4 = -u, in any
+;; combination -- `sort -rn` is 1,031 of the measured agent calls and was
+;; refused as an unknown flag while `-r` and `-n` alone were accepted.
+;; Three bits, so NM = n * 8 + mode and JJ carries the mode at bit 41.
+;; Does the line at SB go before the line at SA? Stable: a line of the first
+;; run goes first unless the second run's is strictly before it.
+;; ITEM-A / ITEM-B are the vector words: an offset, or under -n the key
+;; and the offset packed. A key equal on both sides is the whole-line
+;; tiebreak, in place; a sentinel on either side is the exact digit path.
+;; Is the line of ITEM-X strictly before the line of ITEM-Y in the BASE
+;; order (numeric under -n, bytes otherwise)? -r reverses by swapping the
+;; two, which keeps the merge stable: equal lines stay in input order.
+;; Under -n, equal keys are tiebroken by bytes -- `sort -n` of b, a is a, b
+;; -- EXCEPT under -u, where equal keys are one line and the FIRST IN INPUT
+;; ORDER is the one kept: `sort -nu` of b, a is b (measured 2026-09-17 on
+;; /usr/bin/sort; also 1.0, 1, 01 -> 1.0). So -u makes the numeric
+;; comparison stable: NOTIE? skips the byte tiebreak.
+(defn- base-less? [text :string item-x :i64 item-y :i64 numeric? :bool notie? :bool] :bool
+  (let [sx (item-pos item-x)
+        sy (item-pos item-y)]
+    (if numeric?
+      (let [kx (item-key item-x)
+            ky (item-key item-y)]
+        (if (if (= kx (key-sentinel)) true (= ky (key-sentinel)))
+          (arena-scope
+           (let [n (string-byte-length text)
+                 ex (line-after text sx n)
+                 ey (line-after text sy n)
+                 a (string-substring text sx (- ex 1))
+                 b (string-substring text sy (- ey 1))]
+             (if notie? (< (cmp-numeric a b) 0) (numeric-less? a b))))
+          (if (< kx ky)
+            true
+            (if (> kx ky)
+              false
+              (if notie? false (< (string-compare-lines text sx text sy) 0))))))
+      (< (string-compare-lines text sx text sy) 0))))
+
+(defn take-second? [text :string item-a :i64 item-b :i64 mode :i64] :bool
+  (if (= 1 (bit-and mode 1))
+    (base-less? text item-a item-b (= 2 (bit-and mode 2)) (= 4 (bit-and mode 4)))
+    (base-less? text item-b item-a (= 2 (bit-and mode 2)) (= 4 (bit-and mode 4)))))
+
+;; Merge src[i, iend) and src[j, jend) into dst from k = i + j - iend.
+(defn- merge-runs [text :string src :vector-i64 dst :vector-i64 ii :i64 jj :i64] :vector-i64
+  (let [i (i64-shift-right ii 20)
+        iend (bit-and ii 1048575)
+        j (bit-and (i64-shift-right jj 20) 1048575)
+        jend (bit-and jj 1048575)
+        mode (i64-shift-right jj 41)
+        k (- (+ i j) iend)]
+    (if (>= i iend)
+      (if (>= j jend)
+        dst
+        (merge-runs text src (vector-assoc! dst k (vector-at src j)) ii (+ jj 1048576)))
+      (if (>= j jend)
+        (merge-runs text src (vector-assoc! dst k (vector-at src i)) (+ ii 1048576) jj)
+        (if (take-second? text (vector-at src i) (vector-at src j) mode)
+          (merge-runs text src (vector-assoc! dst k (vector-at src j)) ii (+ jj 1048576))
+          (merge-runs text src (vector-assoc! dst k (vector-at src i)) (+ ii 1048576) jj))))))
+
+;; One pass of width W over N lines: LW = lo * 2^24 + w, NM = n * 4 + mode.
+(defn- pass [text :string src :vector-i64 dst :vector-i64 lw :i64 nm :i64] :vector-i64
+  (let [lo (i64-shift-right lw 24)
+        w (bit-and lw 16777215)
+        n (i64-shift-right nm 3)
+        mode (bit-and nm 7)
+        mid (if (> (+ lo w) n) n (+ lo w))
+        hi (if (> (+ lo (* 2 w)) n) n (+ lo (* 2 w)))]
+    (if (>= lo n)
+      dst
+      (pass text src
+            (merge-runs text src dst (+ (i64-shift-left lo 20) mid)
+                        (+ (i64-shift-left mode 41) (i64-shift-left mid 20) hi))
+            (+ (i64-shift-left hi 24) w) nm))))
+
+(defn- passes [text :string src :vector-i64 dst :vector-i64 w :i64 nm :i64] :vector-i64
+  (if (>= w (i64-shift-right nm 3))
+    src
+    (passes text (pass text src dst w nm) src (* 2 w) nm)))
+
+;; --- the output -----------------------------------------------------------
+;;
+;; The sorted text, appended from the offsets a thousand lines per region:
+;; a line costs two handles (its view and its append), so the batch is
+;; bounded by LINES, not bytes -- a sorted C file starts with thousands of
+;; one-byte lines, which is how a byte bound trapped at 4,096 handles.
+;; Under -u a line equal to the one before it (`string-compare-lines`, in
+;; place) is skipped. PREV is the previous emitted line's offset, or -1.
+(defn- emit-from [text :string v :vector-i64 k :i64 end :i64 acc :string] :string
+  (if (>= k end)
+    acc
+    (let [pos (item-pos (vector-at v k))
+          e (line-after text pos (string-byte-length text))]
+      (emit-from text v (+ k 1) end (string-append-range acc text pos e)))))
+
+;; Are the items EQUAL for -u? Under -n two lines are one when neither is
+;; numerically before the other (`1`, `1.0` and `01` are one line, and so
+;; are every two non-numbers -- measured, `sort -nu` of `b` and `a` prints
+;; `b`); otherwise byte-equal. The mode rides in PE's bit 20 (prev is an
+;; index under 2^20; 2^20 means none).
+(defn- same-for-unique? [text :string item-p :i64 item-q :i64 numeric? :bool] :bool
+  (if numeric?
+    ;; The KEY alone -- numeric-less? tiebreaks equal keys by bytes, which
+    ;; is right for ordering and wrong here: `a` and `b` are one line to -nu.
+    (let [kp (item-key item-p)
+          kq (item-key item-q)]
+      (if (if (= kp (key-sentinel)) true (= kq (key-sentinel)))
+        (arena-scope
+         (let [n (string-byte-length text)
+               sp (item-pos item-p)
+               sq (item-pos item-q)
+               ep (line-after text sp n)
+               eq (line-after text sq n)]
+           (= 0 (cmp-numeric (string-substring text sp (- ep 1))
+                             (string-substring text sq (- eq 1))))))
+        (= kp kq)))
+    (= 0 (string-compare-lines text (item-pos item-p) text (item-pos item-q)))))
+
+(defn- emit-unique-from [text :string v :vector-i64 k :i64 pe :i64 acc :string] :string
+  ;; PE = prev * 2^22 + numeric * 2^21 + end; prev < 2^20 is an INDEX into V,
+  ;; 2^20 means none.
+  (let [prev (i64-shift-right pe 22)
+        numeric? (= 1 (bit-and (i64-shift-right pe 21) 1))
+        end (bit-and pe 2097151)]
+    (if (>= k end)
+      acc
+      (let [pos (item-pos (vector-at v k))
+            e (line-after text pos (string-byte-length text))]
+        (if (if (= prev 1048576) false (same-for-unique? text (vector-at v prev) (vector-at v k) numeric?))
+          (emit-unique-from text v (+ k 1) pe acc)
+          (emit-unique-from text v (+ k 1) (+ (i64-shift-left k 22) (+ (i64-shift-left (if numeric? 1 0) 21) end))
+                            (string-append-range acc text pos e)))))))
+
+(defn- emit-batch [text :string v :vector-i64 k :i64 end :i64 mode :i64] :i64
+  (do (emit (if (= 4 (bit-and mode 4))
+              (emit-unique-from text v k (+ (i64-shift-left (if (= k 0) 1048576 (- k 1)) 22)
+                                            (+ (i64-shift-left (if (= 2 (bit-and mode 2)) 1 0) 21) end)) "")
+              (emit-from text v k end "")))
+      end))
+
+(defn- emit-all [text :string v :vector-i64 k :i64 nm :i64] :i64
+  (let [n (i64-shift-right nm 3)]
+    (if (>= k n)
+      0
+      (emit-all text v
+                (arena-scope (emit-batch text v k (if (> (+ k 1024) n) n (+ k 1024)) (bit-and nm 7)))
+                nm))))
+
+(defn emit-sorted [s :string mode :i64] :i64
+  (let [n (string-byte-length s)]
+    (if (= n 0)
+      0
+      (let [lines (count-lines s 0 n 0)
+            nm (+ (* lines 8) mode)
+            filled (if (= 2 (bit-and mode 2)) (fill-keyed s (vector-alloc lines) 0 0) (fill s (vector-alloc lines) 0 0))
+            sorted (passes s filled (vector-alloc lines) 1 nm)]
+        (emit-all s sorted 0 nm)))))
+
+;; There is no trim of the final newline, and its ABSENCE is deliberate.
+;;
+;; The first version had one, on the reasoning that a file ending in "\n"
+;; would otherwise sort an empty line to the front. It never did: the walk
+;; stops when the remainder is empty, so the piece after the last newline is
+;; never produced as a line. The control that removed the trim passed all
+;; nine cases -- which said the code was dead.
+;;
+;; It was worse than dead. A file ending in "\n\n" has a genuinely EMPTY last
+;; line, and sort prints it. Measured 2026-09-10 on `a\n\n`: /usr/bin/sort
+;; answers an empty line then `a`; with the trim this answered `a` alone.
+;; The fixture that catches it is in the suite.
+
+(defn digit-text [d :i64] :string
+  (string-substring "0123456789" d (+ d 1)))
+
+(defn decimal-of [n :i64] :string
+  (if (< n 10)
+    (digit-text n)
+    (string-concat (decimal-of (quot n 10))
+                   (digit-text (- n (* 10 (quot n 10)))))))
+
+;; --- several operands ----------------------------------------------------
+;;
+;; sort MERGES its operands: there are no headers and the operand order does
+;; not affect the output, since everything is sorted together. Duplicates
+;; survive -- the same file twice yields every line twice.
+;;
+;; A file whose last line has NO trailing newline still contributes that line
+;; WHOLE. Measured against /usr/bin/sort 2026-09-10, and it is the case that
+;; separates reading operands as LINES from concatenating their bytes:
+;;
+;;   sort nn.txt s2.txt      -> a c x      (`x` is its own line)
+;;   cat nn.txt s2.txt | sort -> c xa      (`x` and `a` ran together)
+;;
+;; So each operand is terminated before the next is appended.
+(defn terminated [text :string] :string
+  (let [n (string-byte-length text)]
+    (if (= n 0)
+      text
+      (if (string=? (string-substring text (- n 1) n) "\n")
+        text
+        (string-concat text (nl))))))
+
+;; Every operand's text, joined and each one terminated. I is where the
+;; operands begin: 1 when argument 0 was a flag, 0 when it was not.
+(defn gather [i :i64 total :string acc :string] :string
+  (if (string=? (decimal-of i) total)
+    acc
+    (gather (+ i 1) total
+            (string-concat acc (terminated (slurp-file (arg (decimal-of i))))))))
+
+;; sort writes NOTHING when an operand is unreadable -- not the readable ones
+;; and not a partial answer. Measured: `sort s1 nope s2` exits 2 with empty
+;; stdout, where cat and wc print what they could. So the operands are all
+;; checked BEFORE any is read. Measured again with each flag: `sort -r nope`,
+;; `sort -u nope` and `sort -n nope` all answer exactly the same way.
+(defn all-readable? [i :i64 total :string] :bool
+  (if (string=? (decimal-of i) total)
+    true
+    (if (readable? (arg (decimal-of i)))
+      (all-readable? (+ i 1) total)
+      false)))
+
+;; --- the flag -------------------------------------------------------------
+;;
+;; Argument 0's SHAPE decides, never the argument COUNT. `org-ieee-cut` asked
+;; `(= 3 count)` until 2026-09-10, which was right for exactly one operand and
+;; silently wrong for two. A leading '-' is a question that keeps its answer
+;; when a second operand shows up. Operand paths are absolute here, so they
+;; begin with '/' and cannot collide with it.
+(defn flagged? [] :bool
+  (= (string-index-of (arg "0") "-") 0))
+
+;; -1 means "argument 0 began with '-' and is not one of the three". The
+;; system utility answers that with `sort: invalid option -- x` followed by
+;; its whole Usage block, which is a BSD-version-specific string this does not
+;; try to reproduce; see the README.
+;; The bits of one flag argument's letters (after the dash); -1 for a letter
+;; this does not have.
+(defn- letters-bits [a :string i :i64 acc :i64] :i64
+  (if (>= i (string-byte-length a))
+    acc
+    (let [c (string-code-point-at a i)]
+      (if (= c 114) (letters-bits a (+ i 1) (bit-or acc 1))
+        (if (= c 110) (letters-bits a (+ i 1) (bit-or acc 2))
+          (if (= c 117) (letters-bits a (+ i 1) (bit-or acc 4))
+            -1))))))
+
+;; Every leading dash argument contributes: `-rn`, `-r -n`, `-nru` all mean
+;; the same set. A lone `-` is not a flag.
+(defn- flags-from [i :i64 acc :i64] :i64
+  (let [a (arg (decimal-of i))]
+    (if (if (string=? (decimal-of i) (arg "")) true (not (= (string-index-of a "-") 0)))
+      acc
+      (if (< (string-byte-length a) 2)
+        -1
+        (let [bits (letters-bits a 1 0)]
+          (if (< bits 0) -1 (flags-from (+ i 1) (bit-or acc bits))))))))
+
+(defn mode-of [] :i64
+  (flags-from 0 0))
+
+(defn- first-operand-from [i :i64] :i64
+  (let [a (arg (decimal-of i))]
+    (if (if (string=? (decimal-of i) (arg "")) true (not (= (string-index-of a "-") 0)))
+      i
+      (first-operand-from (+ i 1)))))
+
+(defn first-operand [] :i64
+  (first-operand-from 0))
+
+(defn stdin [n :string] :string
+  (typed-cap-call :io/read :string :string n))
+
+(defn main [] :i64
+  (let [total (arg "")]
+    (if (string=? total "0")
+      ;; No operand: standard input, whole (wire 41, 2026-09-16 -- 97% of
+      ;; sort's invocations in agent tool use are a later pipeline segment).
+      ;; Input past the string pool is refused, never sorted short.
+      (emit-sorted (terminated (stdin "")) 0)
+      (let [mode (mode-of)
+            start (first-operand)]
+        (if (< mode 0)
+          (do
+            (emit-error "sort: invalid option")
+            (emit-error (nl))
+            2)
+          (if (string=? (decimal-of start) total)
+            ;; A flag and no operand: standard input again.
+            (emit-sorted (terminated (stdin "")) mode)
+            (if (all-readable? start total)
+              (emit-sorted (gather start total "") mode)
+              ;; `sort: No such file or directory`, exit 2. sort names NO path
+              ;; and exits 2 where cat, wc, head and uniq name the path and
+              ;; exit 1 -- measured on each of them rather than assumed from
+              ;; one.
+              (do
+                (emit-error "sort: No such file or directory")
+                (emit-error (nl))
+                2))))))))
