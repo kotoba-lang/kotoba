@@ -1,0 +1,401 @@
+(ns soukai.governor-contract-test
+  "The propose→draft-only contract as executable tests — soukai's analog of
+  koyomi's/kekkai's/tayori's governor_contract_test. Invariant: the actor
+  never sends the convocation notice / finalizes the minutes / records a
+  resolution outcome the ResolutionGovernor would reject; drafting never
+  auto-actuates; sending/finalizing always route to a human regardless of
+  phase; a resolution's recorded :outcome is always soukai.tally's verbatim
+  output."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [langgraph.graph :as g]
+            [soukai.store :as store]
+            [soukai.noticeport :as noticeport]
+            [soukai.secretaryllm :as secretaryllm]
+            [soukai.governor :as gov]
+            [soukai.tally :as tally]
+            [soukai.operation :as op]))
+
+(defn- fresh []
+  (let [s (store/seed-db) sent (atom {}) distributed (atom [])
+        np (noticeport/mock-noticeport sent #(swap! distributed conj %))]
+    [s (op/build s {:noticeport np}) sent distributed]))
+
+(defn- ctx [phase] {:phase phase})
+(defn- run [actor tid req phase] (g/run* actor {:request req :context (ctx phase)} {:thread-id tid}))
+
+;; ───────────────────────── ingest ─────────────────────────
+
+(deftest ingest-always-records
+  (testing "observe path records a ground fact regardless of phase"
+    (let [[s actor] (fresh)
+          res (run actor "i" {:op :meeting/register :meeting "mtg-x"
+                              :value {:id "mtg-x" :tenant "cloud-itonami" :kind :ordinary
+                                      :meeting-date "2026-12-01T10:00:00Z" :place "第二会議室"
+                                      :record-date "2026-10-01" :notice-scenario :non-public-with-board
+                                      :electronic-provision? false}} 0)]
+      (is (= :record (get-in res [:state :disposition])))
+      (is (= "第二会議室" (:place (store/meeting s "mtg-x")))))))
+
+;; ───────────────────────── clean ops auto-commit at phase 3 ─────────────────────────
+
+(deftest clean-convocation-draft-auto-commits-no-human-needed
+  (testing "phase 3: a clean+confident convocation draft is data, not actuation — commits without interrupting"
+    (let [[s actor] (fresh)
+          res (run actor "d" {:op :convocation/draft :meeting "mtg-clean"} 3)]
+      (is (not= :interrupted (:status res)))
+      (is (= :commit (get-in res [:state :disposition])))
+      (is (= :proposed (:status (store/draft-of s (store/convocation-key "mtg-clean")))))
+      (is (= "cloud-itonami" (:tenant (:content (store/draft-of s (store/convocation-key "mtg-clean")))))))))
+
+(deftest clean-resolution-finalize-auto-commits
+  (testing "clean ordinary-resolution majority auto-commits and records tally's verbatim :approved"
+    (let [[s actor] (fresh)
+          res (run actor "r" {:op :resolution/finalize :agenda "agenda-clean-1"} 3)]
+      (is (not= :interrupted (:status res)))
+      (is (= :commit (get-in res [:state :disposition])))
+      (is (= :approved (:outcome (store/draft-of s (store/resolution-key "agenda-clean-1"))))))))
+
+(deftest clean-minutes-draft-auto-commits
+  (let [[s actor] (fresh)
+        res (run actor "md" {:op :minutes/draft :meeting "mtg-clean"} 3)]
+    (is (not= :interrupted (:status res)))
+    (is (= :commit (get-in res [:state :disposition])))
+    (is (= "本店会議室" (:held-at (:content (store/draft-of s (store/minutes-key "mtg-clean"))))))))
+
+;; ───────────────────────── no-actuation (all five assess ops) ─────────────────────────
+
+(deftest no-actuation-invariant-on-draft
+  (testing "a convocation-draft proposal that claims a non-:draft effect is held"
+    (let [[s _] (fresh)
+          bad-adv (reify secretaryllm/Advisor
+                    (-advise [_ _ _] {:recommendation :draft
+                                      :content {:tenant "cloud-itonami" :meeting-date "2026-08-15T10:00:00Z"
+                                                :place "本店会議室" :agenda-titles ["x"] :notice-date "2026-08-01"}
+                                      :outcome nil :effect :send :summary "x" :rationale "x"
+                                      :cites [] :redactions [] :confidence 0.9}))
+          actor (op/build s {:advisor bad-adv})
+          res (g/run* actor {:request {:op :convocation/draft :meeting "mtg-clean"} :context (ctx 3)}
+                      {:thread-id "na"})]
+      (is (not= :interrupted (:status res)) "hard violations hold directly, no approval offered")
+      (is (= :hold (get-in res [:state :disposition])))
+      (is (some #{:no-actuation} (-> (store/ledger s) last :basis))))))
+
+(deftest no-actuation-applies-even-to-send-and-finalize
+  (testing "soukai diverges from koyomi's :event/share exemption: no-actuation is UNCONDITIONAL across
+            all five assess ops, so :convocation/send is held too if the advisor claims a non-:draft effect"
+    (let [[s actor] (fresh)
+          _  (run actor "d0" {:op :convocation/draft :meeting "mtg-clean"} 3)
+          bad-adv (reify secretaryllm/Advisor
+                    (-advise [_ st req] (assoc (secretaryllm/infer st req) :effect :send)))
+          actor2 (op/build s {:advisor bad-adv})
+          res (g/run* actor2 {:request {:op :convocation/send :meeting "mtg-clean"} :context (ctx 3)}
+                      {:thread-id "na2"})]
+      (is (not= :interrupted (:status res)))
+      (is (= :hold (get-in res [:state :disposition])))
+      (is (some #{:no-actuation} (-> (store/ledger s) last :basis))))))
+
+;; ───────────────────────── tenant-isolation ─────────────────────────
+
+(deftest tenant-mismatch-is-held
+  (testing "a convocation draft that claims a tenant other than the meeting's registered tenant is a hijack — HOLD"
+    (let [[s _] (fresh)
+          bad-adv (reify secretaryllm/Advisor
+                    (-advise [_ _ _] {:recommendation :draft
+                                      :content {:tenant "rogue-tenant" :meeting-date "2026-08-15T10:00:00Z"
+                                                :place "本店会議室" :agenda-titles ["x"] :notice-date "2026-08-01"}
+                                      :outcome nil :effect :draft :summary "x" :rationale "x"
+                                      :cites [] :redactions [] :confidence 0.9}))
+          actor (op/build s {:advisor bad-adv})
+          res (g/run* actor {:request {:op :convocation/draft :meeting "mtg-clean"} :context (ctx 3)}
+                      {:thread-id "tm"})]
+      (is (not= :interrupted (:status res)))
+      (is (= :hold (get-in res [:state :disposition])))
+      (is (some #{:tenant-mismatch} (-> (store/ledger s) last :basis))))))
+
+;; ───────────────────────── always-human (send / finalize) ─────────────────────────
+
+(deftest convocation-send-always-requires-human-signoff
+  (testing "even a clean convocation-send never auto-sends — it interrupts for a human"
+    (let [[s actor _sent distributed] (fresh)
+          _  (run actor "d2" {:op :convocation/draft :meeting "mtg-clean"} 3)
+          r1 (run actor "s2" {:op :convocation/send :meeting "mtg-clean"} 3)]
+      (is (= :interrupted (:status r1)) "sending is high-stakes → always human")
+      (is (empty? @distributed) "nothing distributed before sign-off")
+      (let [r2 (g/run* actor {:approval {:status :approved :by "shoumu-alice"}}
+                       {:thread-id "s2" :resume? true})]
+        (is (= :commit (get-in r2 [:state :disposition])))
+        (is (= :sent (:status (store/draft-of s (store/convocation-key "mtg-clean")))))
+        (is (= 1 (count @distributed)))))))
+
+(deftest minutes-finalize-always-requires-human-signoff
+  (testing "even a clean minutes-finalize never auto-finalizes — it interrupts for a human"
+    (let [[s actor] (fresh)
+          _  (run actor "md2" {:op :minutes/draft :meeting "mtg-clean"} 3)
+          r1 (run actor "mf2" {:op :minutes/finalize :meeting "mtg-clean"} 3)]
+      (is (= :interrupted (:status r1)))
+      (let [r2 (g/run* actor {:approval {:status :approved :by "shoumu-alice"}}
+                       {:thread-id "mf2" :resume? true})]
+        (is (= :commit (get-in r2 [:state :disposition])))
+        (is (= :finalized (:status (store/draft-of s (store/minutes-key "mtg-clean")))))))))
+
+(deftest reject-signoff-holds
+  (testing "a human rejection records a hold, never a send"
+    (let [[s actor _sent distributed] (fresh)
+          _  (run actor "d3" {:op :convocation/draft :meeting "mtg-clean"} 3)
+          _  (run actor "s3" {:op :convocation/send :meeting "mtg-clean"} 3)
+          r2 (g/run* actor {:approval {:status :rejected :by "shoumu-alice"}}
+                     {:thread-id "s3" :resume? true})]
+      (is (= :hold (get-in r2 [:state :disposition])))
+      (is (= :proposed (:status (store/draft-of s (store/convocation-key "mtg-clean")))) "draft stays proposed, never flips to sent")
+      (is (empty? @distributed)))))
+
+;; ───────────────────────── notice-period-gate ─────────────────────────
+
+(deftest notice-period-gate-holds-when-notice-too-late
+  (testing "a committed convocation draft whose :notice-date is short of the statutory minimum → HARD HOLD"
+    (let [[s actor] (fresh)]
+      (store/record-datom! s {:kind :draft :id (store/convocation-key "mtg-late-notice")
+                              :value {:content {:tenant "cloud-itonami" :meeting-date "2026-09-01T10:00:00Z"
+                                                :place "本店会議室" :agenda-titles ["x"] :notice-date "2026-08-30"}
+                                      :status :proposed :confidence 0.9 :cites [] :redactions []}})
+      (let [res (run actor "late" {:op :convocation/send :meeting "mtg-late-notice"} 3)]
+        (is (not= :interrupted (:status res)) "hard violations hold directly, no approval offered")
+        (is (= :hold (get-in res [:state :disposition])))
+        (is (some #{:notice-period-gate} (-> (store/ledger s) last :basis)))
+        (is (= :proposed (:status (store/draft-of s (store/convocation-key "mtg-late-notice")))) "never sent")))))
+
+;; ───────────────────────── electronic-provision-gate ─────────────────────────
+
+(deftest electronic-provision-gate-holds-when-url-missing
+  (testing "electronic-provision? true meeting whose committed convocation draft lacks the URL → HARD HOLD"
+    (let [[s actor] (fresh)]
+      ;; mtg-tokushu-2 has :electronic-provision? true. :notice-date is comfortably
+      ;; compliant (21 days) so this test isolates the electronic-provision-gate
+      ;; violation from notice-period-gate.
+      (store/record-datom! s {:kind :draft :id (store/convocation-key "mtg-tokushu-2")
+                              :value {:content {:tenant "cloud-itonami" :meeting-date "2026-10-01T10:00:00Z"
+                                                :place "本店会議室" :agenda-titles ["x"] :notice-date "2026-09-10"}
+                                      :status :proposed :confidence 0.9 :cites [] :redactions []}})
+      (let [res (run actor "noep" {:op :convocation/send :meeting "mtg-tokushu-2"} 3)]
+        (is (not= :interrupted (:status res)))
+        (is (= :hold (get-in res [:state :disposition])))
+        (is (= [:electronic-provision-gate] (-> (store/ledger s) last :basis))
+            "notice-date is compliant, so this is the ONLY violation")))))
+
+;; ───────────────────────── resolution-mismatch (the core invariant) ─────────────────────────
+
+(deftest resolution-mismatch-holds-unoverridable
+  (testing "a bad advisor claims :approved for an agenda the deterministic tally resolves as :no-quorum
+            → HARD HOLD, un-overridable — this is the invariant the whole actor exists to enforce"
+    (let [[s _] (fresh)
+          bad-adv (reify secretaryllm/Advisor
+                    (-advise [_ _ _] {:recommendation :finalize
+                                      :content {:tenant "cloud-itonami" :meeting-id "mtg-special-noquorum"
+                                                :agenda-title "事業譲渡承認の件" :resolution-type :special-resolution}
+                                      :outcome :approved :effect :draft :summary "x" :rationale "x"
+                                      :cites [] :redactions [] :confidence 0.95}))
+          actor (op/build s {:advisor bad-adv})
+          res (g/run* actor {:request {:op :resolution/finalize :agenda "agenda-special-1"} :context (ctx 3)}
+                      {:thread-id "mismatch"})]
+      (is (not= :interrupted (:status res)) "hard violations hold directly, no approval offered")
+      (is (= :hold (get-in res [:state :disposition])))
+      (is (some #{:resolution-mismatch} (-> (store/ledger s) last :basis)))
+      (is (nil? (store/draft-of s (store/resolution-key "agenda-special-1"))) "no false outcome was ever recorded"))))
+
+(deftest resolution-mismatch-holds-even-when-proposal-agrees-with-a-different-agendas-outcome
+  (testing "a bad advisor claims :rejected for the CLEAN majority agenda (whose true outcome is :approved)"
+    (let [[s _] (fresh)
+          bad-adv (reify secretaryllm/Advisor
+                    (-advise [_ _ _] {:recommendation :finalize
+                                      :content {:tenant "cloud-itonami" :meeting-id "mtg-clean"
+                                                :agenda-title "取締役選任の件" :resolution-type :ordinary-resolution}
+                                      :outcome :rejected :effect :draft :summary "x" :rationale "x"
+                                      :cites [] :redactions [] :confidence 0.95}))
+          actor (op/build s {:advisor bad-adv})
+          res (g/run* actor {:request {:op :resolution/finalize :agenda "agenda-clean-1"} :context (ctx 3)}
+                      {:thread-id "mismatch2"})]
+      (is (= :hold (get-in res [:state :disposition])))
+      (is (some #{:resolution-mismatch} (-> (store/ledger s) last :basis))))))
+
+;; ───────────────────────── no-quorum is honest math, not a violation ─────────────────────────
+
+(deftest no-quorum-is-a-clean-outcome-not-a-violation
+  (testing "the HONEST mock echoes soukai.tally's :no-quorum verbatim — this is a CLEAN commit, not a governor violation"
+    (let [[s actor] (fresh)
+          res (run actor "nq" {:op :resolution/finalize :agenda "agenda-special-1"} 3)]
+      (is (not= :interrupted (:status res)))
+      (is (= :commit (get-in res [:state :disposition])))
+      (is (= :no-quorum (:outcome (store/draft-of s (store/resolution-key "agenda-special-1"))))))))
+
+;; ───────────────────────── minutes-legal-fields-gate ─────────────────────────
+
+(deftest minutes-legal-fields-gate-holds-when-field-missing
+  (testing "a bad advisor omits :minutes-preparer at draft time → the incomplete draft commits cleanly
+            (no fields-gate check at draft time), but :minutes/finalize HARD HOLDS on it"
+    (let [[s actor] (fresh)
+          bad-adv (reify secretaryllm/Advisor
+                    (-advise [_ st req]
+                      (if (= :minutes/draft (:op req))
+                        (update (secretaryllm/infer st req) :content dissoc :minutes-preparer)
+                        (secretaryllm/infer st req))))
+          actor-bad (op/build s {:advisor bad-adv})
+          d-res (g/run* actor-bad {:request {:op :minutes/draft :meeting "mtg-clean"} :context (ctx 3)}
+                        {:thread-id "mfd"})]
+      (is (= :commit (get-in d-res [:state :disposition])) "draft-time has no legal-fields check")
+      (is (nil? (:minutes-preparer (:content (store/draft-of s (store/minutes-key "mtg-clean"))))))
+      (let [res (run actor "mff" {:op :minutes/finalize :meeting "mtg-clean"} 3)]
+        (is (not= :interrupted (:status res)))
+        (is (= :hold (get-in res [:state :disposition])))
+        (is (some #{:minutes-legal-fields-gate} (-> (store/ledger s) last :basis)))
+        (is (not= :finalized (:status (store/draft-of s (store/minutes-key "mtg-clean")))))))))
+
+;; ───────────────────────── close-margin SOFT escalate ─────────────────────────
+
+(deftest close-margin-resolution-escalates-even-though-math-is-unambiguous
+  (testing "a for/against split within margin-band of the exact threshold still escalates to a human,
+            even though soukai.tally's outcome is mathematically unambiguous"
+    (let [[s actor] (fresh)]
+      (store/record-datom! s {:kind :agenda :id "agenda-margin"
+                              :value {:id "agenda-margin" :meeting-id "mtg-clean" :title "報酬改定の件"
+                                      :resolution-type :ordinary-resolution}})
+      (store/record-datom! s {:kind :vote :id nil
+                              :value {:shareholder-id "sh-1" :agenda-id "agenda-margin"
+                                      :voting-rights 520 :choice :for :method :in-person}})
+      (store/record-datom! s {:kind :vote :id nil
+                              :value {:shareholder-id "sh-2" :agenda-id "agenda-margin"
+                                      :voting-rights 480 :choice :against :method :in-person}})
+      (let [res (run actor "margin" {:op :resolution/finalize :agenda "agenda-margin"} 3)]
+        (is (= :interrupted (:status res)) "close to the 1/2 threshold (52%) still escalates")
+        (let [r2 (g/run* actor {:approval {:status :approved :by "shoumu-alice"}}
+                         {:thread-id "margin" :resume? true})]
+          (is (= :commit (get-in r2 [:state :disposition])))
+          (is (= :approved (:outcome (store/draft-of s (store/resolution-key "agenda-margin"))))
+              "a human CAN approve past a close margin (unlike a hard violation)"))))))
+
+;; ───────────────────────── phase gating ─────────────────────────
+
+(deftest phase0-disables-assessments
+  (let [[s actor] (fresh)
+        res (run actor "p0" {:op :convocation/draft :meeting "mtg-clean"} 0)]
+    (is (= :hold (get-in res [:state :disposition])))
+    (is (= :phase-disabled (-> (store/ledger s) last :phase-reason)))))
+
+;; ───────────────────────── fail-closed ─────────────────────────
+
+(deftest unrecognized-op-is-held
+  (testing "fail-closed: an op the governor doesn't recognize is a hard violation, not a silent pass"
+    (let [[s actor] (fresh)
+          res (run actor "uo" {:op :convocation/teleport :meeting "mtg-clean"} 3)]
+      (is (not= :interrupted (:status res)))
+      (is (= :hold (get-in res [:state :disposition])))
+      (is (some #{:unrecognized-op} (-> (store/ledger s) last :basis))))))
+
+;; ───────────────────────── subject-exists ─────────────────────────
+
+(deftest missing-meeting-is-held
+  (testing "a nonexistent meeting-id is a hard violation on its own"
+    (let [[s actor] (fresh)
+          res (run actor "mm" {:op :convocation/draft :meeting "mtg-missing"} 3)]
+      (is (not= :interrupted (:status res)))
+      (is (= :hold (get-in res [:state :disposition])))
+      (is (some #{:missing-meeting} (-> (store/ledger s) last :basis))))))
+
+(deftest missing-agenda-is-held-for-resolution-finalize
+  (testing "resolution/finalize on a nonexistent agenda-id is a hard violation — it must never
+            silently no-op tenant-isolation or resolution-mismatch downstream"
+    (let [[s actor] (fresh)
+          res (run actor "ma" {:op :resolution/finalize :agenda "agenda-missing"} 3)]
+      (is (not= :interrupted (:status res)))
+      (is (= :hold (get-in res [:state :disposition])))
+      (is (some #{:missing-meeting} (-> (store/ledger s) last :basis))))))
+
+;; ───────────────────────── 定款(AOI) override: notice-period-gate uses the CLAMPED figure ─────────────────────────
+
+(deftest notice-period-gate-uses-clamped-figure-not-illegal-aoi-override
+  (testing "an illegal AOI notice-period override (below the statutory minimum, on a scenario NOT
+            eligible for the 会社法299条1項ただし書 exception) does NOT let a too-short notice
+            through — the HARD notice-period-gate enforces the CLAMPED statutory figure, exactly
+            as if no override had ever been attempted. Without this, a bogus :aoi/notice-period-days
+            registered at ingest time could otherwise be used to slip a non-compliant convocation
+            past the gate."
+    (let [[s actor] (fresh)]
+      (store/record-datom! s {:kind :meeting :id "mtg-aoi-illegal"
+                              :value {:id "mtg-aoi-illegal" :tenant "cloud-itonami" :kind :ordinary
+                                      :meeting-date "2026-09-15T10:00:00Z" :place "本店会議室"
+                                      :record-date "2026-07-01" :notice-scenario :public-or-voting-enabled
+                                      :electronic-provision? false
+                                      ;; illegal: public-or-voting-enabled may not shorten below 14
+                                      :aoi/notice-period-days 5}})
+      ;; 10 days before the meeting: clears the illegal 5-day override, but NOT the statutory
+      ;; (and here, correctly-clamped) 14-day minimum.
+      (store/record-datom! s {:kind :draft :id (store/convocation-key "mtg-aoi-illegal")
+                              :value {:content {:tenant "cloud-itonami" :meeting-date "2026-09-15T10:00:00Z"
+                                                :place "本店会議室" :agenda-titles ["x"] :notice-date "2026-09-05"}
+                                      :status :proposed :confidence 0.9 :cites [] :redactions []}})
+      (let [res (run actor "aoi-illegal" {:op :convocation/send :meeting "mtg-aoi-illegal"} 3)]
+        (is (not= :interrupted (:status res)) "hard violations hold directly, no approval offered")
+        (is (= :hold (get-in res [:state :disposition])))
+        (is (some #{:notice-period-gate} (-> (store/ledger s) last :basis))
+            "10 days would have cleared the illegal 5-day AOI override but not the clamped
+             statutory 14-day minimum — the clamp actually protects the HARD gate")
+        (is (= :proposed (:status (store/draft-of s (store/convocation-key "mtg-aoi-illegal")))) "never sent")))))
+
+(deftest notice-period-gate-honors-legal-short-notice-aoi-override
+  (testing "a legitimate :non-public-without-board short-notice AOI override (within 会社法
+            299条1項ただし書's legal bounds) IS honored — no HARD hold fires where the
+            un-overridden statutory 7-day figure would have held"
+    (let [[s actor] (fresh)]
+      (store/record-datom! s {:kind :meeting :id "mtg-aoi-legal"
+                              :value {:id "mtg-aoi-legal" :tenant "cloud-itonami" :kind :ordinary
+                                      :meeting-date "2026-09-15T10:00:00Z" :place "本店会議室"
+                                      :record-date "2026-07-01" :notice-scenario :non-public-without-board
+                                      :electronic-provision? false
+                                      ;; legal: non-public-without-board may shorten below 7
+                                      :aoi/notice-period-days 3}})
+      ;; 5 days before the meeting: fails the statutory 7-day default, but clears the legal
+      ;; AOI-shortened 3-day figure.
+      (store/record-datom! s {:kind :draft :id (store/convocation-key "mtg-aoi-legal")
+                              :value {:content {:tenant "cloud-itonami" :meeting-date "2026-09-15T10:00:00Z"
+                                                :place "本店会議室" :agenda-titles ["x"] :notice-date "2026-09-10"}
+                                      :status :proposed :confidence 0.9 :cites [] :redactions []}})
+      (let [res (run actor "aoi-legal" {:op :convocation/send :meeting "mtg-aoi-legal"} 3)]
+        (is (= :interrupted (:status res)) "sending is always high-stakes -> human sign-off, but NOT a HARD hold")
+        (is (= :escalate (get-in res [:state :disposition])) "no notice-period-gate HARD violation fired")
+        (let [r2 (g/run* actor {:approval {:status :approved :by "shoumu-alice"}}
+                         {:thread-id "aoi-legal" :resume? true})]
+          (is (= :commit (get-in r2 [:state :disposition])))
+          (is (= :sent (:status (store/draft-of s (store/convocation-key "mtg-aoi-legal"))))
+              "the legal short-notice override let a clean send through"))))))
+
+;; ───────────────────────── 定款(AOI) override: SOFT :aoi-clamped? escalation ─────────────────────────
+
+(deftest aoi-clamped-signal-fires-in-verdict-on-otherwise-clean-op
+  (testing "an illegal (out-of-legal-bounds) AOI resolution-requirements override on an otherwise
+            clean resolution/finalize escalates via the SOFT :aoi-clamped? signal, even though
+            there is no hard violation and the margin isn't close — a human should learn their
+            registered AOI override didn't take effect"
+    (let [[s _] (fresh)]
+      (store/record-datom! s {:kind :agenda :id "agenda-aoi-clamped"
+                              :value {:id "agenda-aoi-clamped" :meeting-id "mtg-clean"
+                                      :title "配当方針変更の件" :resolution-type :special-resolution
+                                      ;; illegal: special-resolution's quorum floor is 1/3, this is 1/5
+                                      :aoi/quorum-num 1 :aoi/quorum-den 5}})
+      (store/record-datom! s {:kind :vote :id nil
+                              :value {:shareholder-id "sh-1" :agenda-id "agenda-aoi-clamped"
+                                      :voting-rights 600 :choice :for :method :in-person}})
+      (store/record-datom! s {:kind :vote :id nil
+                              :value {:shareholder-id "sh-2" :agenda-id "agenda-aoi-clamped"
+                                      :voting-rights 300 :choice :for :method :proxy}})
+      (let [ag       (store/agenda s "agenda-aoi-clamped")
+            snapshot (store/snapshot-of s "mtg-clean")
+            votes    (store/votes-of s "agenda-aoi-clamped")
+            computed (tally/outcome-of ag snapshot votes)
+            proposal {:content {:tenant "cloud-itonami" :meeting-id "mtg-clean"
+                                :agenda-title (:title ag) :resolution-type :special-resolution}
+                      :outcome (:outcome computed) :effect :draft :confidence 0.95}
+            verdict  (gov/check {:op :resolution/finalize :agenda "agenda-aoi-clamped"} proposal s)]
+        (is (false? (:hard? verdict)) "the effective (clamped) figure still matches the recomputed
+                                        tally, so resolution-mismatch never fires")
+        (is (false? (:close-margin? verdict)) "900/900 for is nowhere near the 2/3 threshold boundary")
+        (is (true? (:aoi-clamped? verdict)))
+        (is (true? (:escalate? verdict)) "aoi-clamped? alone is enough to escalate an otherwise-clean op")))))

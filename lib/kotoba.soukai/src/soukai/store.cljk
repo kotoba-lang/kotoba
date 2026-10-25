@@ -1,0 +1,262 @@
+(ns soukai.store
+  "SSoT for soukai — a shareholders'-general-meeting (株主総会) governance
+  control plane, behind a `Store` protocol so the backend is a swap
+  (MemStore default ‖ DatomicStore via langchain.db, itself swappable to
+  real Datomic Local / kotoba-server).
+
+  Domain = drafting and finalizing a meeting's convocation notice, its
+  resolutions' outcomes, and its legal minutes. The actor only ever writes
+  :draft records (control-plane proposals); actually sending the
+  convocation notice is an EXTERNAL effect performed by a NoticeTarget
+  port, and only after human approval — same charter as koyomi's
+  ScheduleTarget / draft-then-actuate split.
+
+    meeting  — a durable ground fact: id/tenant/kind/meeting-date/place/
+               record-date/notice-scenario/electronic-provision?. Recorded
+               by the ingest flow (:meeting/register), no LLM involved.
+    snapshot — the record-date shareholder registry for one meeting:
+               {shareholder-id -> voting-rights}. One per meeting, recorded
+               by :record-date/snapshot. `soukai.tally/outcome-of`'s
+               `snapshot` argument IS this map (not the wrapping record).
+    agenda   — a ground fact: id/meeting-id/title/resolution-type. The
+               resolution-type is set MECHANICALLY at :agenda/register time
+               (from the board resolution or equivalent authorizing it) —
+               never LLM-inferred; the secretary-LLM only ever READS it.
+    vote     — a ground fact: shareholder-id/agenda-id/voting-rights/
+               choice/method. One per shareholder per agenda item, recorded
+               by :vote/record. `soukai.tally/outcome-of` structurally
+               excludes any vote whose shareholder-id isn't in that
+               agenda's meeting's snapshot (record-date-consistency
+               enforcement — a store/tally responsibility, never the
+               governor's to catch after the fact).
+    draft    — the committed/proposed secretary-LLM content for one of
+               THREE draft kinds sharing a single drafts map, disambiguated
+               by a compound key (see the `*-key` constructors below):
+                 [:convocation meeting-id]  — 招集通知案
+                 [:resolution  agenda-id]   — 決議結果の説明文(:outcome
+                                              must equal soukai.tally's
+                                              verbatim output — enforced by
+                                              the governor, never trusted
+                                              from the draft alone)
+                 [:minutes     meeting-id]  — 議事録案(施行規則72条)
+
+  Charter: the append-only **ledger is soukai's meeting-governance audit
+  trail** (who drafted/proposed what, on what legal basis, who approved
+  sending the notice / finalizing the minutes, when, and — for a
+  resolution — which deterministic tally run backed the recorded outcome).
+  Same anti-surveillance charter as koyomi's/kekkai's/tayori's ledgers: it
+  records dispositions and bases, not full document bodies at rest beyond
+  what's already in a committed draft."
+  (:require #?(:clj  [kotoba.lang.edn :as edn]
+               :cljs [cljs.reader :as edn])
+            [kotoba.lang.text :as str]
+            [langchain.db :as d]))
+
+;; ───────────────────────── draft key convention ─────────────────────────
+;; One drafts map holds three draft KINDS (convocation/resolution/minutes);
+;; every caller (governor/operation/secretaryllm/sim/tests) that needs to
+;; read or write a draft goes through these constructors so the convention
+;; stays exactly one place, never re-derived ad hoc at each call site.
+
+(defn convocation-key [meeting-id] [:convocation meeting-id])
+(defn resolution-key [agenda-id] [:resolution agenda-id])
+(defn minutes-key [meeting-id] [:minutes meeting-id])
+
+(defprotocol Store
+  (meeting [s id])
+  (snapshot-of [s meeting-id] "record-date {shareholder-id -> voting-rights} for a meeting, or nil")
+  (agenda [s id])
+  (agenda-items-of [s meeting-id] "every agenda item registered for a meeting, sorted by :id")
+  (votes-of [s agenda-id]         "every vote recorded for an agenda item")
+  (draft-of [s key]               "committed/proposed draft for a [:convocation|:resolution|:minutes id] key, or nil")
+  (ledger [s])
+  (record-datom! [s record]       "append/merge a soukai ground fact to the SSoT")
+  (append-ledger! [s fact]        "append one immutable meeting-governance audit fact")
+  (seed! [s data]                 "bulk-seed entity collections (idempotent upsert)"))
+
+;; ───────────────────────── demo data ─────────────────────────
+;;
+;; Five scenarios, each exercising a distinct HARD check or a distinct
+;; branch of soukai.tally/outcome-of's math (ADR-2607121700 §4/§6):
+;;
+;;   mtg-clean            非公開・取締役会設置、:ordinary-resolution 議案
+;;                        1件、明確多数の :for 票 → convocation/resolution/
+;;                        minutes の全フローが HARD violation ゼロで通る
+;;                        (人間承認が要る箇所は govern する、が violation は無い)。
+;;   mtg-late-notice      同型だが、convocation の :notice-date を governor
+;;                        テスト/sim が意図的に法定最短(7日)未満へ差し替えて
+;;                        notice-period-gate の HARD hold を実演する。
+;;   mtg-special-noquorum :special-resolution 議案、出席議決権が定足数
+;;                        (1/2)未満 → soukai.tally/outcome-of は :no-quorum
+;;                        を返す。secretary-LLM のモックはその値をそのまま
+;;                        引用するだけなので、これは CLEAN commit(数式が
+;;                        正直に定足数未達を報告しているだけで、governor の
+;;                        violation ではない)。
+;;   mtg-tokushu-2        :special-resolution-2(会社法309条3項)議案 —
+;;                        定足数要件が無い代わりに、頭数(頭数閾値は総株主
+;;                        頭数が母数)・議決権(母数は総議決権)の両方を
+;;                        クリアする必要がある特殊決議の頭数math を演習する。
+;;
+;; resolution-mismatch(HARD #5)の敵対的シナリオは、上の mtg-special-
+;; noquorum の議案を再利用し、"bad advisor" がそこに :outcome :approved を
+;; 主張するテストとして governor_contract_test.clj 側で構成する(demo-data
+;; 自体を汚さない — koyomi の bad-adv パターンと同じ)。
+
+(defn demo-data []
+  {:meetings
+   {"mtg-clean"
+    {:id "mtg-clean" :tenant "cloud-itonami" :kind :ordinary
+     :meeting-date "2026-08-15T10:00:00Z" :place "本店会議室"
+     :record-date "2026-06-30" :notice-scenario :non-public-with-board
+     :electronic-provision? false}
+    "mtg-late-notice"
+    {:id "mtg-late-notice" :tenant "cloud-itonami" :kind :ordinary
+     :meeting-date "2026-09-01T10:00:00Z" :place "本店会議室"
+     :record-date "2026-07-15" :notice-scenario :non-public-with-board
+     :electronic-provision? false}
+    "mtg-special-noquorum"
+    {:id "mtg-special-noquorum" :tenant "cloud-itonami" :kind :extraordinary
+     :meeting-date "2026-08-20T10:00:00Z" :place "本店会議室"
+     :record-date "2026-07-01" :notice-scenario :non-public-with-board
+     :electronic-provision? false}
+    "mtg-tokushu-2"
+    {:id "mtg-tokushu-2" :tenant "cloud-itonami" :kind :extraordinary
+     :meeting-date "2026-10-01T10:00:00Z" :place "本店会議室"
+     :record-date "2026-08-15" :notice-scenario :non-public-with-board
+     :electronic-provision? true}}
+
+   :snapshots
+   {"mtg-clean"            {:meeting-id "mtg-clean" :shareholders {"sh-1" 600 "sh-2" 300 "sh-3" 100}}
+    "mtg-late-notice"      {:meeting-id "mtg-late-notice" :shareholders {"sh-1" 100}}
+    "mtg-special-noquorum" {:meeting-id "mtg-special-noquorum" :shareholders {"sh-1" 200 "sh-2" 300 "sh-3" 500}}
+    "mtg-tokushu-2"        {:meeting-id "mtg-tokushu-2" :shareholders {"sh-1" 250 "sh-2" 250 "sh-3" 250 "sh-4" 250}}}
+
+   :agenda-items
+   {"agenda-clean-1"   {:id "agenda-clean-1" :meeting-id "mtg-clean" :title "取締役選任の件" :resolution-type :ordinary-resolution}
+    "agenda-late-1"    {:id "agenda-late-1" :meeting-id "mtg-late-notice" :title "計算書類承認の件" :resolution-type :ordinary-resolution}
+    "agenda-special-1" {:id "agenda-special-1" :meeting-id "mtg-special-noquorum" :title "事業譲渡承認の件" :resolution-type :special-resolution}
+    "agenda-tokushu-1" {:id "agenda-tokushu-1" :meeting-id "mtg-tokushu-2" :title "特定株主からの自己株式取得の件" :resolution-type :special-resolution-2}}
+
+   :votes
+   {"agenda-clean-1"
+    {"sh-1" {:shareholder-id "sh-1" :agenda-id "agenda-clean-1" :voting-rights 600 :choice :for :method :in-person}
+     "sh-2" {:shareholder-id "sh-2" :agenda-id "agenda-clean-1" :voting-rights 300 :choice :for :method :proxy}}
+    "agenda-late-1"
+    {"sh-1" {:shareholder-id "sh-1" :agenda-id "agenda-late-1" :voting-rights 100 :choice :for :method :written}}
+    "agenda-special-1"
+    {"sh-1" {:shareholder-id "sh-1" :agenda-id "agenda-special-1" :voting-rights 200 :choice :for :method :in-person}}
+    "agenda-tokushu-1"
+    {"sh-1" {:shareholder-id "sh-1" :agenda-id "agenda-tokushu-1" :voting-rights 250 :choice :for :method :in-person}
+     "sh-2" {:shareholder-id "sh-2" :agenda-id "agenda-tokushu-1" :voting-rights 250 :choice :for :method :proxy}
+     "sh-3" {:shareholder-id "sh-3" :agenda-id "agenda-tokushu-1" :voting-rights 250 :choice :for :method :electronic}}}})
+
+;; ───────────────────────── MemStore (default) ─────────────────────────
+
+(defrecord MemStore [a]
+  Store
+  (meeting [_ id] (get-in @a [:meetings id]))
+  (snapshot-of [_ meeting-id] (get-in @a [:snapshots meeting-id :shareholders]))
+  (agenda [_ id] (get-in @a [:agenda-items id]))
+  (agenda-items-of [_ meeting-id]
+    (->> (vals (:agenda-items @a)) (filter #(= meeting-id (:meeting-id %))) (sort-by :id) vec))
+  (votes-of [_ agenda-id] (vec (vals (get-in @a [:votes agenda-id]))))
+  (draft-of [_ key] (get-in @a [:drafts key]))
+  (ledger [_] (:ledger @a))
+  (record-datom! [s {:keys [kind id value]}]
+    (case kind
+      :meeting  (swap! a update-in [:meetings id] merge value)
+      :snapshot (swap! a update-in [:snapshots id] merge value)
+      :agenda   (swap! a update-in [:agenda-items id] merge value)
+      :vote     (swap! a update-in [:votes (:agenda-id value) (:shareholder-id value)] merge value)
+      :draft    (swap! a update-in [:drafts id] merge value)
+      nil)
+    s)
+  (append-ledger! [_ fact] (swap! a update :ledger conj fact) fact)
+  (seed! [s data] (swap! a merge (select-keys data [:meetings :snapshots :agenda-items :votes])) s))
+
+(defn seed-db []
+  (->MemStore (atom (assoc (demo-data) :drafts {} :ledger []))))
+
+;; ───────────────────────── DatomicStore (langchain.db) ─────────────────────────
+
+(def ^:private schema
+  {:meeting/id  {:db/unique :db.unique/identity}
+   :snapshot/id {:db/unique :db.unique/identity}
+   :agenda/id   {:db/unique :db.unique/identity}
+   :vote/id     {:db/unique :db.unique/identity}
+   :draft/id    {:db/unique :db.unique/identity}
+   :ledger/seq  {:db/unique :db.unique/identity}})
+
+(defn- enc [v] (pr-str v))
+(defn- dec* [s] (when s (edn/read-string s)))
+(defn- vote-ident [agenda-id shareholder-id] (str agenda-id "|" shareholder-id))
+(defn- draft-ident [key] (pr-str key))
+
+;; The store talks to its backend ONLY through the langchain.db `:db-api` map
+;; {:q :transact! :db :pull :entid}. langchain.db/api (in-process EAVT) and
+;; langchain.kotoba-db/kotoba-api (kotoba-server XRPC, e.g. kotobase.net) both
+;; implement it, so the same record runs on either by construction.
+
+(defn- q* [{:keys [api conn]} query & inputs]
+  (apply (:q api) query ((:db api) conn) inputs))
+(defn- pull* [{:keys [api conn]} pattern eid] ((:pull api) ((:db api) conn) pattern eid))
+(defn- tx* [{:keys [api conn]} txd] ((:transact! api) conn txd))
+
+(defrecord DatomicStore [api conn]
+  Store
+  (meeting [this id]
+    (-> (pull* this [:meeting/edn] [:meeting/id id]) :meeting/edn dec*))
+  (snapshot-of [this meeting-id]
+    (-> (pull* this [:snapshot/edn] [:snapshot/id meeting-id]) :snapshot/edn dec* :shareholders))
+  (agenda [this id]
+    (-> (pull* this [:agenda/edn] [:agenda/id id]) :agenda/edn dec*))
+  (agenda-items-of [this meeting-id]
+    (->> (q* this '[:find [?id ...] :where [?e :agenda/id ?id]])
+         (map #(agenda this %))
+         (filter #(= meeting-id (:meeting-id %)))
+         (sort-by :id) vec))
+  (votes-of [this agenda-id]
+    (->> (q* this '[:find [?id ...] :where [?e :vote/id ?id]])
+         (map (fn [id] (-> (pull* this [:vote/edn] [:vote/id id]) :vote/edn dec*)))
+         (filter #(= agenda-id (:agenda-id %))) vec))
+  (draft-of [this key]
+    (-> (pull* this [:draft/edn] [:draft/id (draft-ident key)]) :draft/edn dec*))
+  (ledger [this]
+    (->> (q* this '[:find ?s ?f :where [?e :ledger/seq ?s] [?e :ledger/fact ?f]])
+         (sort-by first) (mapv (comp dec* second))))
+  (record-datom! [s {:keys [kind id value]}]
+    (case kind
+      :meeting  (tx* s [{:meeting/id id :meeting/edn (enc (merge (meeting s id) value))}])
+      :snapshot (tx* s [{:snapshot/id id :snapshot/edn (enc (merge {:meeting-id id :shareholders (snapshot-of s id)} value))}])
+      :agenda   (tx* s [{:agenda/id id :agenda/edn (enc (merge (agenda s id) value))}])
+      :vote     (let [vid (vote-ident (:agenda-id value) (:shareholder-id value))
+                      cur (-> (pull* s [:vote/edn] [:vote/id vid]) :vote/edn dec*)]
+                  (tx* s [{:vote/id vid :vote/edn (enc (merge cur value))}]))
+      :draft    (tx* s [{:draft/id (draft-ident id) :draft/edn (enc (merge (draft-of s id) value))}])
+      nil)
+    s)
+  (append-ledger! [s fact]
+    (tx* s [{:ledger/seq (count (ledger s)) :ledger/fact (enc fact)}]) fact)
+  (seed! [s data]
+    (doseq [[id m] (:meetings data)]      (record-datom! s {:kind :meeting :id id :value m}))
+    (doseq [[id sn] (:snapshots data)]    (record-datom! s {:kind :snapshot :id id :value sn}))
+    (doseq [[id ag] (:agenda-items data)] (record-datom! s {:kind :agenda :id id :value ag}))
+    (doseq [[_ by-sh] (:votes data)
+            [_ v]     by-sh]              (record-datom! s {:kind :vote :id nil :value v}))
+    s))
+
+(defn datomic-store
+  "DatomicStore on the in-process langchain.db EAVT backend (default Datomic-
+  shaped store; verifiable offline). For the kotoba-server pod (kotobase.net),
+  see soukai.kotoba/kotoba-store — same record, different :db-api."
+  ([] (datomic-store nil))
+  ([data] (let [s (->DatomicStore d/api (d/create-conn schema))]
+            (when data (seed! s data)) s)))
+
+(defn datomic-seed-db [] (datomic-store (demo-data)))
+
+;; ───────────────────────── ledger formatting ─────────────────────────
+
+(defn ledger-line [{:keys [op subject disposition basis]}]
+  (str/join " · " [(name (or disposition :record)) (str "op=" op)
+                   (str "subject=" subject) (str "basis=" (pr-str basis))]))
