@@ -1,0 +1,204 @@
+(ns safetensors.json
+  "Minimal, dependency-free JSON codec for exactly the subset a safetensors header
+   uses/produces: objects, arrays, strings (with `\\\" \\\\ \\/ \\b \\f \\n \\r \\t \\uXXXX`
+   escapes), integers, and true/false/null. Not a general-purpose JSON library — kept
+   deliberately small and zero-dependency, the same way `kotoba-lang/org-openusd`'s USDA reader
+   is a from-scratch text-format parser rather than a dependency (ADR-2607041500 precedent for
+   this org's `.cljc` external-format libraries).
+
+   Number handling: safetensors headers never contain a floating-point JSON value in practice
+   (`data_offsets`/`shape` are non-negative integers; `__metadata__` values are always strings
+   per the spec) — but a JSON float token is still parsed correctly here via straightforward
+   decimal accumulation. That float path is not claimed to be bit-exact IEEE-754
+   round-to-nearest for pathological inputs; it is not exercised by any real safetensors file."
+  (:require [kotoba.lang.text :as str]))
+
+(declare parse-value*)
+
+;; ---- host char/codepoint seam (the one genuinely host-specific piece) ------------------------
+
+(defn- char-of-code [code]
+  #?(:clj (char code)
+     :cljs (js/String.fromCharCode code)))
+
+;; ---- lexing helpers (pure string ops — portable without reader conditionals) ------------------
+
+(defn- ws? [c] (or (= c \space) (= c \tab) (= c \newline) (= c \return)))
+
+(defn- skip-ws [s i n]
+  (loop [i i] (if (and (< i n) (ws? (nth s i))) (recur (inc i)) i)))
+
+(def ^:private hex-digits "0123456789abcdef")
+
+(defn- hex-val [c]
+  (or (str/index-of hex-digits (str/lower (str c)))
+      (throw (ex-info (str "invalid hex digit " c) {}))))
+
+(def ^:private dec-digits "0123456789")
+
+(defn- digit-val [c]
+  (str/index-of dec-digits (str c)))
+
+(defn- parse-literal [s i n lit v]
+  (let [end (+ i (count lit))]
+    (if (and (<= end n) (= lit (subs s i end)))
+      [v end]
+      (throw (ex-info (str "invalid JSON literal at position " i) {:pos i})))))
+
+(defn- parse-int-token [tok]
+  (let [neg (str/starts-with? tok "-")
+        tok (if neg (subs tok 1) tok)]
+    (* (if neg -1 1) (reduce (fn [acc c] (+ (* acc 10) (digit-val c))) 0 tok))))
+
+(defn- parse-float-token [tok]
+  (let [neg (str/starts-with? tok "-")
+        tok (if neg (subs tok 1) tok)
+        e-idx (or (str/index-of tok "e") (str/index-of tok "E"))
+        [mant exp-part] (if e-idx [(subs tok 0 e-idx) (subs tok (inc e-idx))] [tok nil])
+        dot-idx (str/index-of mant ".")
+        [int-part frac-part] (if dot-idx [(subs mant 0 dot-idx) (subs mant (inc dot-idx))] [mant ""])
+        int-val (if (seq int-part) (parse-int-token int-part) 0)
+        frac-val (first (reduce (fn [[acc scale] c] [(+ acc (* (digit-val c) scale)) (/ scale 10.0)])
+                                 [0.0 0.1] frac-part))
+        exp-val (if exp-part (parse-int-token exp-part) 0)]
+    (* (if neg -1.0 1.0) (+ (double int-val) frac-val) (Math/pow 10 exp-val))))
+
+(defn- parse-number [s i n]
+  (let [start i
+        i (if (and (< i n) (= (nth s i) \-)) (inc i) i)
+        i (loop [i i] (if (and (< i n) (digit-val (nth s i))) (recur (inc i)) i))
+        has-frac (and (< i n) (= (nth s i) \.))
+        i (if has-frac
+            (loop [i (inc i)] (if (and (< i n) (digit-val (nth s i))) (recur (inc i)) i))
+            i)
+        has-exp (and (< i n) (or (= (nth s i) \e) (= (nth s i) \E)))
+        i (if has-exp
+            (let [i2 (inc i)
+                  i2 (if (and (< i2 n) (or (= (nth s i2) \+) (= (nth s i2) \-))) (inc i2) i2)]
+              (loop [i i2] (if (and (< i n) (digit-val (nth s i))) (recur (inc i)) i)))
+            i)
+        tok (subs s start i)]
+    (when (empty? tok) (throw (ex-info (str "invalid JSON number at position " start) {:pos start})))
+    (if (or has-frac has-exp)
+      [(parse-float-token tok) i]
+      [(parse-int-token tok) i])))
+
+(defn- parse-json-string
+  "s[i] must be the opening quote. Returns [string end-index-after-closing-quote]."
+  [s i n]
+  (loop [i (inc i) acc []]
+    (when (>= i n) (throw (ex-info "unterminated JSON string" {:pos i})))
+    (let [c (nth s i)]
+      (cond
+        (= c \") [(apply str acc) (inc i)]
+        (= c \\)
+        (let [e (nth s (inc i))]
+          (cond
+            (= e \") (recur (+ i 2) (conj acc \"))
+            (= e \\) (recur (+ i 2) (conj acc \\))
+            (= e \/) (recur (+ i 2) (conj acc \/))
+            (= e \b) (recur (+ i 2) (conj acc \backspace))
+            (= e \f) (recur (+ i 2) (conj acc \formfeed))
+            (= e \n) (recur (+ i 2) (conj acc \newline))
+            (= e \r) (recur (+ i 2) (conj acc \return))
+            (= e \t) (recur (+ i 2) (conj acc \tab))
+            (= e \u)
+            (let [hex (subs s (+ i 2) (+ i 6))
+                  code (reduce (fn [acc c] (+ (* acc 16) (hex-val c))) 0 hex)]
+              (recur (+ i 6) (conj acc (char-of-code code))))
+            :else (throw (ex-info (str "invalid escape \\" e) {:pos i}))))
+        :else (recur (inc i) (conj acc c))))))
+
+(defn- parse-array [s i n]
+  ;; s[i] == \[
+  (let [i (skip-ws s (inc i) n)]
+    (if (= (nth s i) \])
+      [[] (inc i)]
+      (loop [i i acc (transient [])]
+        (let [i (skip-ws s i n)
+              [v i] (parse-value* s i n)
+              acc (conj! acc v)
+              i (skip-ws s i n)]
+          (cond
+            (= (nth s i) \,) (recur (inc i) acc)
+            (= (nth s i) \]) [(persistent! acc) (inc i)]
+            :else (throw (ex-info "expected ',' or ']'" {:pos i}))))))))
+
+(defn- parse-object [s i n]
+  ;; s[i] == \{
+  (let [i (skip-ws s (inc i) n)]
+    (if (= (nth s i) \})
+      [{} (inc i)]
+      (loop [i i acc (transient {})]
+        (let [i (skip-ws s i n)
+              _ (when (not= (nth s i) \") (throw (ex-info "expected string key" {:pos i})))
+              [k i] (parse-json-string s i n)
+              i (skip-ws s i n)
+              _ (when (not= (nth s i) \:) (throw (ex-info "expected ':'" {:pos i})))
+              i (skip-ws s (inc i) n)
+              [v i] (parse-value* s i n)
+              acc (assoc! acc k v)
+              i (skip-ws s i n)]
+          (cond
+            (= (nth s i) \,) (recur (inc i) acc)
+            (= (nth s i) \}) [(persistent! acc) (inc i)]
+            :else (throw (ex-info "expected ',' or '}'" {:pos i}))))))))
+
+(defn- parse-value* [s i n]
+  (let [i (skip-ws s i n)]
+    (when (>= i n) (throw (ex-info "unexpected end of JSON input" {:pos i})))
+    (let [c (nth s i)]
+      (cond
+        (= c \{) (parse-object s i n)
+        (= c \[) (parse-array s i n)
+        (= c \") (parse-json-string s i n)
+        (= c \t) (parse-literal s i n "true" true)
+        (= c \f) (parse-literal s i n "false" false)
+        (= c \n) (parse-literal s i n "null" nil)
+        :else (parse-number s i n)))))
+
+(defn parse-json
+  "Parse a JSON text (the safetensors-header subset described above) into Clojure data:
+   objects -> maps (string keys), arrays -> vectors, strings -> strings, integers -> integers,
+   floats -> doubles, true/false/null -> boolean/nil."
+  [s]
+  (let [n (count s)
+        i (skip-ws s 0 n)
+        [v _] (parse-value* s i n)]
+    v))
+
+;; ---- writer (only needs to emit exactly the safetensors header shape) -------------------------
+
+(defn- escape-json-str [s]
+  (str "\""
+       (apply str (map (fn [c]
+                          (cond
+                            (= c \") "\\\""
+                            (= c \\) "\\\\"
+                            (= c \newline) "\\n"
+                            (= c \return) "\\r"
+                            (= c \tab) "\\t"
+                            :else (str c)))
+                        s))
+       "\""))
+
+(defn write-json
+  "Encode Clojure data as JSON text. Supports exactly what a safetensors header needs: maps
+   (string or keyword keys), vectors/seqs, strings/keywords, integers, booleans, nil. Not a
+   general-purpose JSON writer."
+  [v]
+  (cond
+    (nil? v) "null"
+    (true? v) "true"
+    (false? v) "false"
+    (string? v) (escape-json-str v)
+    (keyword? v) (escape-json-str (name v))
+    (map? v) (str "{" (str/join "," (map (fn [[k val]]
+                                            (str (escape-json-str (if (keyword? k) (name k) (str k)))
+                                                 ":" (write-json val)))
+                                          v))
+                  "}")
+    (or (vector? v) (seq? v)) (str "[" (str/join "," (map write-json v)) "]")
+    (integer? v) (str v)
+    (number? v) (str v)
+    :else (throw (ex-info "cannot encode value as JSON" {:value v}))))
