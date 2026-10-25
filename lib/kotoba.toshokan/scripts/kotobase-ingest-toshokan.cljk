@@ -1,0 +1,209 @@
+#!/usr/bin/env kbb
+;; kotobase-ingest-toshokan.cljs — pull-based batch fold job that closes
+;; ADR-2607072300's "journal -> kotobase-peer fold job" gap for this repo,
+;; the same shape as scripts/kotobase-ingest-cloud-itonami-lei.cljs
+;; (ADR-2607113500) with one difference: that script fetches many *other*
+;; repos' journals over the GitHub Contents API (105 cloud-itonami-lei-*
+;; repos, one per company); this repo IS its own single source, so this
+;; script reads `80-data/public/*.journal.edn` straight off the local
+;; working tree instead.
+;;
+;; Run (from this repo's root, after `npm install` in kotobase-client once):
+;;   NODE_PATH="<path-to>/kotobase-client/node_modules" npx nbb \
+;;     --classpath "<path-to>/kotobase-client/src:src" \
+;;     scripts/kotobase-ingest-toshokan.cljk
+;;
+;; Identity: a fresh Ed25519 seed is generated on first run and persisted to
+;; scripts/.kotobase-ingest-toshokan-identity.hex (gitignored, NEVER commit
+;; this file). The graph is `kotobase/db/<that-did>/toshokan-library-catalog`,
+;; self-sovereign per ADR-2607072300/root AGENTS.md's CACAO actor pattern.
+;; Re-running with the SAME identity file re-asserts the same [entity attr]
+;; facts (cardinality-one upsert per entity+attr, idempotent). Losing the
+;; identity file starts a NEW, empty graph — back it up before treating it
+;; as disposable.
+;;
+;; tx_edn wire shape (kotoba-lang/kotobase-server handler.cljc
+;; `tx-edn->quads`): a vector of ENTITY MAPS `[{:db/id "e" :ns/attr v ...}
+;; ...]` — same gotcha the LEI script's own header documents.
+
+(ns kotobase-ingest-toshokan
+  (:require ["node:crypto" :as node-crypto]
+            ["node:fs" :as fs]
+            ["node:path" :as path]
+            [cljs.reader :as edn]
+            [kotoba.lang.text :as str]
+            [kotobase.client :as client]))
+
+(def script-dir
+  (let [argv (js->clj js/process.argv)
+        idx (or (some (fn [[i a]] (when (str/ends-with? a "kotobase-ingest-toshokan.cljk") i))
+                       (map-indexed vector argv))
+                2)]
+    (path/dirname (nth argv idx))))
+
+(def identity-path
+  (path/join script-dir ".kotobase-ingest-toshokan-identity.hex"))
+
+(defn load-or-create-identity! []
+  (if (fs/existsSync identity-path)
+    (js/Uint8Array.from (js/Buffer.from (str/trim (fs/readFileSync identity-path "utf8")) "hex"))
+    (let [sk (js/Uint8Array. (.randomBytes node-crypto 32))]
+      (fs/writeFileSync identity-path (.toString (js/Buffer.from sk) "hex"))
+      (println "Minted a NEW ingestion identity at" identity-path
+                "— back this file up, losing it orphans the graph.")
+      sk)))
+
+(def sk (load-or-create-identity!))
+;; Edge is kotobase.net (cf-wasm). backend.kotobase.net rejects direct
+;; client writes with 401 "reachable only through the kotobase.net edge".
+(def c (client/make-client {:endpoint "https://kotobase.net"
+                             :operator-did "did:web:kotobase.net"
+                             :secret-key sk}))
+(def db-name "toshokan-library-catalog")
+
+(def repo-root (path/join script-dir ".."))
+
+(def sources ["ndl" "loc" "korea-nl" "dnb" "bnf" "kb-nl" "libris-se" "nb-no" "iccu-it" "gutenberg"])
+
+(defn journal-path [source]
+  (path/join repo-root "80-data" "public" (str source ".journal.edn")))
+
+(defn read-journal [source]
+  (let [p (journal-path source)]
+    (if (fs/existsSync p)
+      (edn/read-string (fs/readFileSync p "utf8"))
+      [])))
+
+(defn build-tx-data
+  "Groups a journal's [entity attr value tx op] quads by entity, folds the
+  :add ops of each into one entity map (last value per attr wins for
+  cardinality-one attrs; repeated attrs like :library/creator naturally
+  become a single scalar per quad here since kotobase's tx_edn is a plain
+  attr->value map — re-asserting the same attr multiple times per entity
+  keeps only the last one, a known simplification vs. true cardinality-many;
+  acceptable for a first ingest, revisit if kotobase's entity-map wire
+  format grows list-valued attr support)."
+  [source journal]
+  (let [by-entity (group-by first journal)]
+    (vec (for [[entity entries] by-entity]
+           (into {:db/id entity :library/harvest-source source}
+                 (keep (fn [[_ a v _tx op]] (when (= op :add) [a v])))
+                 entries)))))
+
+(def ^:const default-chunk-size
+  "Entity maps per transact. Full-source payloads (100k+ chars) hit
+   kotobase edge 503/error-1102. Prefer small chunks + cool-down retry.
+   2026-07-26: lowered 15→8 after sustained 1102 on every ndl chunk."
+  8)
+
+(def ^:const max-chunk-attempts 4)
+
+(defn- sleep [ms]
+  (js/Promise. (fn [res _] (js/setTimeout res ms))))
+
+(defn- partition-all [n coll]
+  (loop [xs (vec coll) acc []]
+    (if (empty? xs)
+      acc
+      (recur (subvec xs (min n (count xs)))
+             (conj acc (subvec xs 0 (min n (count xs))))))))
+
+(defn- transact-chunk! [source chunk idx total]
+  (let [tx-edn (pr-str (vec chunk))]
+    ((fn attempt [n]
+       (-> (client/transact c db-name tx-edn {:retry? true})
+           (.then (fn [res]
+                    (println "OK  " source " chunk" (inc idx) "/" total
+                             " n=" (count chunk)
+                             " datom_count=" (.-datom_count res)
+                             (when (> n 1) (str " (attempt " n ")")))
+                    {:ok true :datoms (.-datom_count res)}))
+           (.catch
+            (fn [e]
+              (if (< n max-chunk-attempts)
+                (let [wait (min 30000 (* 2000 n n))]
+                  (println "RETRY" source "chunk" (inc idx)
+                           "attempt" n "/" max-chunk-attempts
+                           "wait" wait "ms" (.-message e))
+                  (-> (sleep wait)
+                      (.then (fn [_] (attempt (inc n))))))
+                (do (println "FAIL" source "chunk" (inc idx) (.-message e))
+                    (js/Promise.resolve {:ok false :error (.-message e)})))))))
+     1)))
+
+(defn ingest-source! [source]
+  (let [journal (read-journal source)]
+    (if (empty? journal)
+      (do (println "SKIP" source "(no journal / empty)")
+          (js/Promise.resolve {:source source :ok true :entities 0}))
+      (let [tx-data (build-tx-data source journal)
+            chunks (partition-all default-chunk-size tx-data)
+            total (count chunks)]
+        (println "INGEST" source "entities=" (count tx-data)
+                 "chunks=" total "chunk-size=" default-chunk-size)
+        (-> (reduce
+             (fn [chain-p [i chunk]]
+               (.then chain-p
+                      (fn [acc]
+                        (-> (transact-chunk! source chunk i total)
+                            (.then (fn [r]
+                                     (-> (sleep 800)
+                                         (.then (fn [_] (conj acc r))))))))))
+             (js/Promise.resolve [])
+             (map-indexed vector chunks))
+            (.then
+             (fn [rs]
+               (let [failed (filter (complement :ok) rs)
+                     datoms (reduce + 0 (map #(or (:datoms %) 0) rs))]
+                 (if (seq failed)
+                   (do (println "FAIL" source "partial"
+                                (- total (count failed)) "/" total "chunks ok")
+                       {:source source :ok false :entities (count tx-data)
+                        :error (:error (first failed))})
+                   (do (println "OK  " source " entities=" (count tx-data)
+                                " total_datoms≈" datoms)
+                       {:source source :ok true :entities (count tx-data)}))))))))))
+
+(defn run-sequential [sources]
+  (reduce (fn [chain-p source]
+            (.then chain-p (fn [acc]
+                             (-> (ingest-source! source)
+                                 (.then (fn [r] (.concat acc #js [r])))))))
+          (js/Promise.resolve #js [])
+          sources))
+
+(defn- parse-source-args [argv]
+  (loop [xs argv out []]
+    (cond
+      (empty? xs) out
+      (= (first xs) "--source")
+      (if (seq (rest xs))
+        (recur (drop 2 xs) (conj out (second xs)))
+        out)
+      :else (recur (rest xs) out))))
+
+(defn -main []
+  (let [argv (js->clj js/process.argv)
+        idx (or (some (fn [[i a]]
+                        (when (str/ends-with? a "kotobase-ingest-toshokan.cljk") i))
+                      (map-indexed vector argv))
+                2)
+        only (parse-source-args (drop (inc idx) argv))
+        src-list (if (seq only) only sources)]
+    (println "ingest identity did:" (:did c) "sources=" (pr-str src-list))
+    (-> (run-sequential src-list)
+        (.then (fn [results]
+                 (let [results (js->clj results :keywordize-keys true)
+                       ok (filter :ok results)
+                       failed (remove :ok results)]
+                   (println "=== SUMMARY ===")
+                   (println "total:" (count results) "ok:" (count ok) "failed:" (count failed))
+                   (when (seq failed)
+                     (doseq [f failed] (println " -" (:source f) (:error f)))
+                     (js/process.exit 1)))))
+        (.catch (fn [e]
+                  (println "FATAL:" (.-message e))
+                  (println (.-stack e))
+                  (js/process.exit 1))))))
+
+(-main)

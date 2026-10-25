@@ -1,0 +1,468 @@
+#!/usr/bin/env kbb
+;; fulltext-gutenberg.cljs — Project Gutenberg public-domain full text.
+;;
+;; Uses gutendex.com (JSON, no key) which exposes `copyright: false` for
+;; public-domain works. Only those are downloaded. Body goes under
+;; fulltext/gutenberg/<id>/ (git-annex); bibliographic quads go to
+;; 80-data/public/gutenberg.journal.edn (plain git, same as other sources).
+;;
+;; Usage (repo root):
+;;   kbb --backend sci --classpath src scripts/fulltext-gutenberg.cljk --seed "Pride and Prejudice" --limit 2
+;;   kbb --backend sci --classpath src scripts/fulltext-gutenberg.cljk --id 1342
+;;   kbb --backend sci --classpath src scripts/fulltext-gutenberg.cljk --from-seeds --limit 1
+
+(ns fulltext-gutenberg
+  (:require ["node:fs" :as fs]
+            ["node:path" :as path]
+            ["node:crypto" :as crypto]
+            ["node:child_process" :as cp]
+            [kotoba.lang.text :as str]
+            [cljs.reader :as edn]
+            [toshokan.quad :as quad]))
+
+(def gutendex "https://gutendex.com/books/")
+(def ua "toshokan-library-harvester/0.1 (kotoba-lang/toshokan; public-domain fulltext; https://github.com/kotoba-lang/toshokan)")
+(def journal-path (path/join "80-data" "public" "gutenberg.journal.edn"))
+(def fulltext-root (path/join "fulltext" "gutenberg"))
+
+(defn- ensure-dir! [p]
+  (fs/mkdirSync p #js {:recursive true}))
+
+(defn- sha256-hex [buf]
+  (-> (.createHash crypto "sha256") (.update buf) .digest (.toString "hex")))
+
+(defn- known-ids []
+  (->> (quad/read-journal journal-path)
+       (filter #(= (second %) :library/gutenberg-id))
+       (map #(str (nth % 2)))
+       set))
+
+(defn- fetch-json [url]
+  (-> (js/fetch url #js {:headers #js {"User-Agent" ua}})
+      (.then (fn [^js r]
+               (if (.-ok r)
+                 (.json r)
+                 (throw (js/Error. (str "HTTP " (.-status r) " " url))))))
+      (.then #(js->clj % :keywordize-keys true))))
+
+(defn- fetch-bytes [url]
+  (-> (js/fetch url #js {:headers #js {"User-Agent" ua}})
+      (.then (fn [^js r]
+               (if (.-ok r)
+                 (.arrayBuffer r)
+                 (throw (js/Error. (str "HTTP " (.-status r) " " url))))))
+      (.then (fn [ab] (js/Buffer.from ab)))))
+
+(defn- plain-text-urls
+  "Candidate plain-text body URLs for a gutendex book map, highest preference
+   first. Multiple fallbacks needed because gutendex format URLs and the
+   canonical cache path sometimes 404 (seen on e.g. pg76404)."
+  [book]
+  (let [fm (:formats book)
+        entries (if (map? fm) (seq fm) nil)
+        id (:id book)
+        from-formats
+        (into []
+              (keep (fn [[k v]]
+                      (let [ks (str k)]
+                        (when (and v
+                                   (str/includes? ks "text/plain")
+                                   (not (str/includes? ks "zip")))
+                          v)))
+                    entries))
+        ;; prefer utf-8 listed first
+        utf8 (filterv #(or (str/includes? (str %) "utf-8")
+                           (str/includes? (str %) "utf8"))
+                      from-formats)
+        other (filterv #(not (or (str/includes? (str %) "utf-8")
+                                 (str/includes? (str %) "utf8")))
+                       from-formats)
+        fallbacks (when id
+                    [(str "https://www.gutenberg.org/cache/epub/" id "/pg" id ".txt")
+                     (str "https://www.gutenberg.org/files/" id "/" id "-0.txt")
+                     (str "https://www.gutenberg.org/files/" id "/" id "-8.txt")
+                     (str "https://www.gutenberg.org/files/" id "/" id ".txt")
+                     (str "https://www.gutenberg.org/ebooks/" id ".txt.utf-8")])]
+    (->> (concat utf8 other fallbacks)
+         (remove str/blank?)
+         ;; gutendex sometimes lists audio-book "readme" stubs as text/plain
+         (remove #(or (str/includes? (str %) "readme")
+                      (str/includes? (str %) "-readme.")
+                      (str/includes? (str %) ".readme")))
+         distinct
+         vec)))
+(defn- plain-text-url [book]
+  (first (plain-text-urls book)))
+
+(defn- book->fields [book]
+  (let [id (str (:id book))
+        authors (map :name (:authors book))
+        subjects (:subjects book)
+        urls (plain-text-urls book)]
+    {:entity (str "gutenberg:" id)
+     :gutenberg-id id
+     :title (:title book)
+     :creators authors
+     :subjects subjects
+     :languages (:languages book)
+     :media-type (:media_type book)
+     :download-count (:download_count book)
+     :copyright? (boolean (:copyright book))
+     :source-url (str "https://www.gutenberg.org/ebooks/" id)
+     :text-url (first urls)
+     :text-urls urls}))
+(defn- write-body! [fields buf]
+  (let [id (:gutenberg-id fields)
+        dir (path/join fulltext-root id)
+        txt-path (path/join dir (str "pg" id ".txt"))
+        meta-path (path/join dir "meta.edn")
+        digest (sha256-hex buf)]
+    (ensure-dir! dir)
+    (fs/writeFileSync txt-path buf)
+    (fs/writeFileSync
+     meta-path
+     (str (pr-str {:gutenberg/id id
+                   :library/title (:title fields)
+                   :library/source-url (:source-url fields)
+                   :fulltext/url (:text-url fields)
+                   :fulltext/sha256 digest
+                   :fulltext/bytes (.-length buf)
+                   :fulltext/retrieved-at (.toISOString (js/Date.))
+                   :fulltext/license :public-domain
+                   :fulltext/source :project-gutenberg})
+          "\n"))
+    {:path txt-path :sha256 digest :bytes (.-length buf)}))
+
+(defn- append-quads! [fields body-info]
+  (let [existing (quad/read-journal journal-path)
+        tx (quad/next-tx existing)
+        retrieved-at (.toISOString (js/Date.))
+        quads (quad/record->quads
+               (:entity fields) tx
+               {:library/source :gutenberg
+                :library/source-url (:source-url fields)
+                :library/title (:title fields)
+                :library/creator (:creators fields)
+                :library/subject (:subjects fields)
+                :library/language (:languages fields)
+                :library/gutenberg-id (:gutenberg-id fields)
+                :library/copyright false
+                :library/fulltext-path (:path body-info)
+                :library/fulltext-sha256 (:sha256 body-info)
+                :library/fulltext-bytes (:bytes body-info)
+                :library/fulltext-license :public-domain
+                :library/retrieved-at retrieved-at})]
+    (ensure-dir! (path/dirname journal-path))
+    (quad/append-journal! journal-path quads)
+    (count quads)))
+
+(defn ingest-book!
+  "Download one gutendex book map if public-domain + has plain text."
+  [book]
+  (let [fields (book->fields book)
+        known (known-ids)]
+    (cond
+      (:copyright? fields)
+      (do (println "[fulltext] SKIP copyrighted id=" (:gutenberg-id fields)
+                   (pr-str (:title fields)))
+          (js/Promise.resolve {:ok false :reason :copyright}))
+
+      (contains? known (:gutenberg-id fields))
+      (do (println "[fulltext] SKIP already have id=" (:gutenberg-id fields))
+          (js/Promise.resolve {:ok false :reason :duplicate}))
+
+      (empty? (:text-urls fields))
+      (do (println "[fulltext] SKIP no plain-text format id=" (:gutenberg-id fields))
+          (js/Promise.resolve {:ok false :reason :no-text}))
+
+      :else
+      ;; Try each candidate URL until one succeeds (404 on cache path is common).
+      ((fn try-url [urls]
+         (if-not (seq urls)
+           (do (println "[fulltext] SKIP all text urls failed id="
+                        (:gutenberg-id fields))
+               (js/Promise.resolve {:ok false :reason :all-urls-failed}))
+           (-> (fetch-bytes (first urls))
+               (.then
+                (fn [buf]
+                  (let [fields* (assoc fields :text-url (first urls))
+                        body (write-body! fields* buf)
+                        nq (append-quads! fields* body)]
+                    (println "[fulltext] OK id=" (:gutenberg-id fields)
+                             "title=" (pr-str (:title fields))
+                             "bytes=" (:bytes body)
+                             "quads=" nq
+                             "url=" (first urls))
+                    {:ok true :id (:gutenberg-id fields) :bytes (:bytes body)
+                     :title (:title fields)})))
+               (.catch
+                (fn [e]
+                  (println "[fulltext] try-fail" (first urls) (.-message e))
+                  (try-url (rest urls)))))))
+       (:text-urls fields)))))
+
+(defn search-books
+  "Fetch public-domain gutendex hits for q. Pulls a larger page than `limit`
+   so callers can skip already-held ids and still fill the requested quota."
+  [q limit]
+  (let [page-size (max 32 (* 4 (or limit 2)))]
+    (-> (fetch-json (str gutendex "?search=" (js/encodeURIComponent q)
+                         "&copyright=false"))
+        (.then (fn [resp]
+                 (->> (:results resp)
+                      (remove :copyright)
+                      (take page-size)
+                      vec))))))
+
+(defn browse-books
+  "Page through gutendex popular public-domain catalog (no search query).
+   Used when seed search saturates on already-held classics."
+  [page]
+  (-> (fetch-json (str gutendex "?copyright=false&sort=popular&page="
+                       (max 1 (or page 1))))
+      (.then (fn [resp]
+               (->> (:results resp)
+                    (remove :copyright)
+                    vec)))))
+
+(defn fetch-book-by-id [id]
+  (fetch-json (str gutendex id)))
+
+(defn- cjk-query?
+  "Gutenberg has near-zero CJK catalog hits; skip pure CJK seed strings."
+  [q]
+  (boolean (re-find #"[\u3040-\u30ff\u3400-\u9fff]" (str q))))
+
+(defn- seeds-from-file []
+  "Hand seeds only for gutendex search. Grown catalog creators are noisy
+   (roles, dates, CJK romanization) and waste ticks; long-tail PD discovery
+   is --browse's job."
+  (let [m (try (edn/read-string (fs/readFileSync "seeds.edn" "utf8"))
+               (catch :default _ {:seeds []}))]
+    (->> (:seeds m)
+         (remove :grown-from)
+         (map :query)
+         (remove str/blank?)
+         (remove cjk-query?)
+         ;; Drop catalog-shaped strings that never hit Gutenberg usefully
+         (remove #(re-find #"(?i)\b(author|verfass|éditeur|übersetz|herausgeber)\b" (str %)))
+         (remove #(> (count (str %)) 80))
+         distinct
+         vec)))
+
+(defn- rotate-take
+  "Round-robin window over qs so --from-seeds does not forever re-query the
+   first 8 classics we already hold (was the main fulltext stall)."
+  [qs n offset]
+  (let [m (count qs)]
+    (if (or (zero? m) (zero? n))
+      []
+      (let [start (mod (or offset 0) m)]
+        (vec (for [i (range (min n m))]
+               (nth qs (mod (+ start i) m))))))))
+
+(defn- parse-args [argv]
+  (loop [xs argv acc {:limit 2 :from-seeds? false :browse? false :seeds [] :ids []}]
+    (if-not (seq xs)
+      acc
+      (let [[a & more] xs]
+        (case a
+          "--limit" (recur (rest more)
+                           (assoc acc :limit (js/parseInt (first more) 10)))
+          "--seed" (recur (rest more)
+                          (update acc :seeds conj (first more)))
+          "--id" (recur (rest more)
+                        (update acc :ids conj (first more)))
+          "--from-seeds" (recur more (assoc acc :from-seeds? true))
+          "--browse" (recur more (assoc acc :browse? true))
+          (recur more acc))))))
+
+(defn- run-sequential [promise-fns]
+  (reduce (fn [chain f]
+            (.then chain
+                   (fn [acc]
+                     (-> (f)
+                         (.then (fn [r] (conj acc r)))
+                         (.catch (fn [e]
+                                   (println "[fulltext] error" (.-message e))
+                                   (conj acc {:ok false :error (.-message e)})))))))
+          (js/Promise.resolve [])
+          promise-fns))
+
+(defn- count-ok [summary]
+  (->> summary
+       (mapcat (fn [x]
+                 (cond
+                   (and (map? x) (contains? x :ok) (not (contains? x :results))) [x]
+                   (and (map? x) (:results x))
+                   (mapcat (fn [r] (if (sequential? r) r [r])) (:results x))
+                   (sequential? x) x
+                   :else [])))
+       (filter :ok)
+       count))
+
+(defn- browse-fresh!
+  "Walk popular gutendex pages until `want` fresh PD books ingested.
+   Page start rotates within popular range 1–60."
+  [known0 want]
+  (let [start-page (inc (mod (count known0) 60))]
+    (println "[fulltext] browse fallback start-page=" start-page "want=" want)
+    ((fn step [page remaining known acc]
+       (if (or (zero? remaining) (> page (+ start-page 12)))
+         (js/Promise.resolve
+          {:browse true
+           :page-start start-page
+           :page-end page
+           :ok (count (filter :ok acc))
+           :results acc})
+         (-> (browse-books page)
+             (.then
+              (fn [books]
+                (let [fresh (->> books
+                                 (remove #(contains? known (str (:id %))))
+                                 (take remaining)
+                                 vec)]
+                  (println "[fulltext] browse page=" page
+                           "hits=" (count books)
+                           "fresh=" (count fresh)
+                           "remaining=" remaining)
+                  (if (empty? fresh)
+                    (step (inc page) remaining known acc)
+                    (-> (run-sequential
+                         (map (fn [b] (fn [] (ingest-book! b))) fresh))
+                        (.then
+                         (fn [rs]
+                           (let [ok-n (count (filter :ok rs))
+                                 known* (into known
+                                              (keep (fn [r]
+                                                      (when (:ok r)
+                                                        (str (:id r))))
+                                                    rs))]
+                             (step (inc page)
+                                   (max 0 (- remaining ok-n))
+                                   known*
+                                   (into acc rs)))))))))))))
+     start-page want known0 [])))
+
+(defn- ingest-fresh-books!
+  "Ingest up to remaining books; returns promise of {:ok-n :ids :results}."
+  [books remaining]
+  (let [fresh (->> books
+                   (take remaining)
+                   vec)]
+    (if (empty? fresh)
+      (js/Promise.resolve {:ok-n 0 :ids #{} :results []})
+      (-> (run-sequential (map (fn [b] (fn [] (ingest-book! b))) fresh))
+          (.then (fn [rs]
+                   (let [ok-ids (into #{}
+                                      (keep (fn [r]
+                                              (when (:ok r) (str (:id r))))
+                                            rs))]
+                     {:ok-n (count ok-ids)
+                      :ids ok-ids
+                      :results rs})))))))
+
+(defn- search-seeds-with-budget!
+  "Search seed queries under a global remaining budget (not per-seed)."
+  [seed-qs want known0]
+  (let [state (atom {:remaining want :known known0 :acc []})]
+    ((fn step [qs]
+       (let [st @state
+             remaining (:remaining st)
+             known (:known st)
+             acc (:acc st)]
+         (if (or (zero? remaining) (empty? qs))
+           (js/Promise.resolve acc)
+           (let [q (first qs)]
+             (-> (search-books q remaining)
+                 (.then (fn [books]
+                          (let [candidates (->> books
+                                                (remove #(contains? known (str (:id %))))
+                                                vec)]
+                            (println "[fulltext] search" (pr-str q)
+                                     "hits=" (count books)
+                                     "fresh=" (count candidates)
+                                     "remaining=" remaining)
+                            (-> (ingest-fresh-books! candidates remaining)
+                                (.then (fn [res]
+                                         (swap! state
+                                                (fn [s]
+                                                  {:remaining (max 0 (- (:remaining s) (:ok-n res)))
+                                                   :known (into (:known s) (:ids res))
+                                                   :acc (conj (:acc s)
+                                                              {:query q
+                                                               :results (:results res)})}))
+                                         (step (rest qs)))))))))))))
+     (vec seed-qs))))
+
+(defn -main []
+  (let [argv (js->clj js/process.argv)
+        idx (or (some (fn [[i a]]
+                        (when (str/ends-with? a "fulltext-gutenberg.cljk") i))
+                      (map-indexed vector argv))
+                2)
+        opts (parse-args (drop (inc idx) argv))
+        known (known-ids)
+        seed-offset (count known)
+        want (or (:limit opts) 1)
+        seed-window (min 12 (max 4 (* 3 want)))
+        file-seeds (when (:from-seeds? opts) (seeds-from-file))
+        seed-qs0 (cond-> (vec (:seeds opts))
+                   (seq file-seeds)
+                   (into (rotate-take file-seeds seed-window seed-offset)))
+        seed-qs (if (and (empty? seed-qs0)
+                         (empty? (:ids opts))
+                         (not (:browse? opts)))
+                  ["Pride and Prejudice" "Iliad" "Origin of Species"
+                   "Romeo and Juliet" "Divine Comedy" "Moby Dick"
+                   "Frankenstein" "Don Quixote" "Candide" "Beowulf"]
+                  seed-qs0)
+        allow-browse? (:browse? opts)]
+    (println "[fulltext] start"
+             (pr-str (assoc opts
+                            :resolved-seeds seed-qs
+                            :known-count (count known)
+                            :seed-offset seed-offset
+                            :seed-window seed-window
+                            :want want)))
+    (-> (run-sequential
+         (for [id (:ids opts)]
+           (fn []
+             (-> (fetch-book-by-id id)
+                 (.then ingest-book!)))))
+        (.then
+         (fn [id-results]
+           (let [id-ok (count (filter :ok id-results))
+                 rem-after-ids (max 0 (- want id-ok))
+                 known* (into known
+                              (keep (fn [r] (when (:ok r) (str (:id r))))
+                                    id-results))]
+             (if (and (pos? rem-after-ids) (seq seed-qs))
+               (-> (search-seeds-with-budget! seed-qs rem-after-ids known*)
+                   (.then (fn [seed-acc]
+                            {:id-results id-results
+                             :seed-results seed-acc})))
+               (js/Promise.resolve
+                {:id-results id-results
+                 :seed-results []})))))
+        (.then
+         (fn [summary]
+           (let [id-results (:id-results summary)
+                 seed-results (:seed-results summary)
+                 ok-n (+ (count (filter :ok id-results))
+                         (count-ok seed-results))
+                 rem (max 0 (- want ok-n))]
+             (if-not (and allow-browse? (pos? rem))
+               (do (println "[fulltext] done ok=" ok-n "want=" want
+                            (pr-str summary))
+                   summary)
+               (-> (browse-fresh! (known-ids) rem)
+                   (.then
+                    (fn [br]
+                      (let [out (assoc summary :browse br)
+                            total (+ ok-n (or (:ok br) 0))]
+                        (println "[fulltext] done ok=" total "want=" want
+                                 (pr-str out))
+                        out)))))))))))
+
+(-main)
