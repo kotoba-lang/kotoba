@@ -1,0 +1,95 @@
+(ns journal.core-test
+  (:require [kotoba.lang.error :as kerror] [kotoba.test :refer [deftest is testing]]
+            [journal.core :as journal]
+            [journal.fs :as journal.fs]))
+
+(defn- tx [n & datoms] {:tx n :tx-data (vec datoms)})
+
+(deftest round-trips-events-in-file-order
+  (let [io (journal.fs/memory-io)
+        {:keys [append read]} (journal/journal io)]
+    (append :decisions (tx 1 [:db/add 1 :authn.decision/decision :authenticated]))
+    (append :decisions (tx 2 [:db/add 2 :authn.decision/decision :denied]))
+    (is (= [(tx 1 [:db/add 1 :authn.decision/decision :authenticated])
+            (tx 2 [:db/add 2 :authn.decision/decision :denied])]
+           (read :decisions 0))
+        "what you read back equals what you appended, in the order you appended it")))
+
+(deftest reads-only-its-own-stream
+  (let [io (journal.fs/memory-io)
+        {:keys [append read]} (journal/journal io)]
+    (append :authn (tx 1 [:db/add 1 :authn.decision/decision :authenticated]))
+    (append :authz (tx 1 [:db/add 1 :authz.decision/decision :allow]))
+    (append :authn (tx 2 [:db/add 2 :authn.decision/decision :denied]))
+    (is (= 2 (count (read :authn 0))))
+    (is (= 1 (count (read :authz 0))))
+    (is (= [[:db/add 1 :authz.decision/decision :allow]]
+           (:tx-data (first (read :authz 0)))))))
+
+(deftest since-is-exclusive-by-tx
+  (let [{:keys [append read]} (journal/journal (journal.fs/memory-io))]
+    (doseq [n [1 2 3]] (append :s (tx n [:db/add n :a n])))
+    (is (= [1 2 3] (mapv :tx (read :s 0))))
+    (is (= [3] (mapv :tx (read :s 2))))
+    (is (= [] (read :s 3)))))
+
+(deftest appends-never-rewrite
+  (let [io (journal.fs/memory-io)
+        {:keys [append]} (journal/journal io)]
+    (append :s (tx 1 [:db/add 1 :a "first"]))
+    (let [after-one @(:atom io)]
+      (append :s (tx 2 [:db/add 2 :a "second"]))
+      (is (= after-one (subs @(:atom io) 0 (count after-one)))
+          "the first line is still byte-identical after the second append"))))
+
+(deftest a-newline-in-a-value-is-not-a-record-boundary
+  (let [{:keys [append read]} (journal/journal (journal.fs/memory-io))
+        event (tx 1 [:db/add 1 :authz.decision/reason "denied:\nno matching rule"])]
+    (append :s event)
+    (is (= [event] (read :s 0)))))
+
+(deftest decodes-a-hand-edited-file-with-blank-lines
+  (is (= [{:tx 1 :tx-data []} {:tx 2 :tx-data []}]
+         (journal/decode "{:tx 1 :tx-data []}\n\n  \n{:tx 2 :tx-data []}\n"))))
+
+(deftest empty-journal-reads-empty
+  (is (= [] (journal/decode nil)))
+  (is (= [] (journal/decode "")))
+  (is (= [] ((:read (journal/journal (journal.fs/memory-io))) :s 0))))
+
+(deftest rejects-a-sink-that-is-not-one
+  (is (thrown? kerror/ExceptionInfo
+               (journal/journal {:read-text "not a fn"}))))
+
+#?(:clj
+   (deftest file-sink-survives-a-restart
+     (testing "a fresh sink over the same path reads the previous run's history"
+       (let [dir (str (System/getProperty "java.io.tmpdir")
+                      "/journal-test-" (System/nanoTime))
+             path (str dir "/nested/decisions.journal.edn")]
+         (try
+           (let [{:keys [append]} (journal/journal (journal.fs/file-io path))]
+             (append :s (tx 1 [:db/add 1 :a "before restart"])))
+           (let [{:keys [read]} (journal/journal (journal.fs/file-io path))]
+             (is (= [(tx 1 [:db/add 1 :a "before restart"])] (read :s 0))
+                 "and the parent directory was created on first append"))
+           (finally
+             (doseq [f (reverse (file-seq (clojure.java.io/file dir)))]
+               (.delete f))))))))
+
+#?(:clj
+   (deftest file-sink-does-not-interleave-under-contention
+     (let [path (str (System/getProperty "java.io.tmpdir")
+                     "/journal-contention-" (System/nanoTime) ".edn")
+           {:keys [append read]} (journal/journal (journal.fs/file-io path))
+           n 50]
+       (try
+         (let [threads (mapv (fn [i]
+                               (Thread. (fn [] (append :s (tx (inc i) [:db/add 1 :a i])))))
+                             (range n))]
+           (run! #(.start ^Thread %) threads)
+           (run! #(.join ^Thread %) threads))
+         (is (= n (count (read :s 0)))
+             "every line is whole and parseable -- no half-written record")
+         (finally
+           (.delete (clojure.java.io/file path)))))))
