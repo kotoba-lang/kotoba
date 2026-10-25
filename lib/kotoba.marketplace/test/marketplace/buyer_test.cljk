@@ -1,0 +1,134 @@
+(ns marketplace.buyer-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [marketplace.buyer :as buyer]))
+
+(defn- addr [& {:as over}]
+  (buyer/address (merge {:line1 "1-2-3 Shibuya" :city "Tokyo"
+                         :postal-code "150-0002" :country "JPN"
+                         :recipient "山田太郎"}
+                        over)))
+
+(defn- b [& {:as over}]
+  (buyer/account (merge {:id "buyer-1" :contact "buyer@example.test"
+                         :level :guest}
+                        over)))
+
+;; ───────────────── the asymmetry with sellers ─────────────────
+
+(deftest a-guest-with-only-a-contact-is-valid
+  (testing "an operator that forces registration to sell someone a bottle
+            of cola is collecting data it has no use for"
+    (is (empty? (buyer/account-errors (b))))
+    (is (true? (buyer/can-purchase? (b))))
+    (is (nil? (:buyer/display-name (b))))
+    (is (empty? (:buyer/addresses (b))))))
+
+(deftest a-buyer-account-is-never-a-kyc-artefact
+  (is (false? (:buyer/kyc? (b))))
+  (is (some #(= :buyer-marked-as-kyc (:buyer.error/code %))
+            (buyer/account-errors (assoc (b) :buyer/kyc? true)))))
+
+(deftest the-one-thing-actually-required-is-a-way-to-reach-them
+  (is (some #(= :missing-contact (:buyer.error/code %))
+            (buyer/account-errors (b :contact ""))))
+  (is (some #(= :missing-id (:buyer.error/code %))
+            (buyer/account-errors (b :id "")))))
+
+;; ───────────────────────── levels ─────────────────────────
+
+(deftest levels-order-correctly-and-unknown-ones-fail-closed
+  (is (true? (buyer/level>= :identity-verified :guest)))
+  (is (true? (buyer/level>= :guest :guest)))
+  (is (false? (buyer/level>= :guest :phone-verified)))
+  (testing "a typo in an operator's policy must fail closed, not open"
+    (is (false? (buyer/level>= :super-verified :guest)))
+    (is (false? (buyer/level>= :guest :super-verified)))))
+
+(deftest the-required-level-is-an-operator-input
+  (testing "there is no built-in rule that a purchase over some amount
+            needs identity verification — that threshold is a
+            jurisdiction- and product-specific operator decision"
+    (is (true? (buyer/can-purchase? (b))))
+    (is (false? (buyer/can-purchase? (b) {:require-level :phone-verified})))
+    (is (true? (buyer/can-purchase? (b :level :phone-verified)
+                                    {:require-level :phone-verified})))
+    (is (some #(= :insufficient-level (:buyer.error/code %))
+              (buyer/purchase-errors (b) {:require-level :identity-verified})))))
+
+;; ───────────────────────── shipping ─────────────────────────
+
+(deftest physical-goods-need-an-address-in-the-destination
+  (let [with-jp (b :addresses [(addr)])]
+    (is (true? (buyer/can-purchase? with-jp {:needs-shipping? true :destination "JPN"})))
+    (is (some #(= :no-address-in-destination (:buyer.error/code %))
+              (buyer/purchase-errors with-jp {:needs-shipping? true :destination "USA"})))
+    (is (some #(= :no-shipping-address (:buyer.error/code %))
+              (buyer/purchase-errors (b) {:needs-shipping? true}))))
+  (testing "digital goods need none"
+    (is (true? (buyer/can-purchase? (b) {:needs-shipping? false})))))
+
+(deftest address-validation-and-the-fields-deliberately-absent
+  (is (empty? (buyer/address-errors (addr))))
+  (is (seq (buyer/address-errors (addr :line1 ""))))
+  (is (seq (buyer/address-errors (addr :recipient ""))))
+  (is (seq (buyer/address-errors (addr :country "JP"))))
+  (testing "a courier does not need date of birth, gender or occupation,
+            and a marketplace should not hold them"
+    (let [ks (set (map name (keys (addr))))]
+      (is (not (contains? ks "dob")))
+      (is (not (contains? ks "gender")))
+      (is (not (contains? ks "occupation"))))))
+
+(deftest shipping-address-selects-by-destination
+  (let [x (b :addresses [(addr) (addr :country "USA" :city "Seattle")])]
+    (is (= "Tokyo" (:address/city (buyer/shipping-address x "JPN"))))
+    (is (= "Seattle" (:address/city (buyer/shipping-address x "USA"))))
+    (is (nil? (buyer/shipping-address x "DEU")))))
+
+;; ───────────────────────── redaction ─────────────────────────
+
+(deftest redact-keeps-what-a-governor-needs-and-drops-the-rest
+  (let [r (buyer/redact (b :display-name "Taro" :country "JPN" :addresses [(addr)]))]
+    (testing "kept: id (records join), level and country (eligibility)"
+      (is (= "buyer-1" (:buyer/id r)))
+      (is (= :guest (:buyer/level r)))
+      (is (= "JPN" (:buyer/country r))))
+    (testing "the destination country survives because a cross-border check
+              needs it; the street does not"
+      (is (= ["JPN"] (:buyer/address-countries r))))
+    (testing "dropped: contact, display name, every address line"
+      (is (nil? (:buyer/contact r)))
+      (is (nil? (:buyer/display-name r)))
+      (is (nil? (:buyer/addresses r))))
+    (is (true? (buyer/redacted? r)))))
+
+(deftest leaks-pii-catches-a-raw-buyer-embedded-in-a-proposal
+  (testing "the check a governor runs before writing to an append-only
+            ledger nobody can later scrub"
+    (let [raw (b :display-name "Taro" :addresses [(addr)])]
+      (is (true? (buyer/leaks-pii? {:value {:buyer raw}})))
+      (is (false? (buyer/leaks-pii? {:value {:buyer (buyer/redact raw)}})))
+      (is (false? (buyer/redacted? raw))))))
+
+;; ───────────────────────── retention ─────────────────────────
+
+(deftest retention-classes-drive-what-may-be-purged
+  (let [x (b :addresses [(addr :retention :order-lifetime)
+                         (addr :retention :account-saved :city "Osaka")
+                         (addr :retention :legal-hold :city "Kyoto")])]
+    (testing "order-lifetime purges once orders close"
+      (is (= ["Tokyo"] (mapv :address/city
+                             (buyer/purgeable-addresses x {:orders-closed? true})))))
+    (testing "account-saved purges only when the account closes"
+      (is (= ["Osaka"] (mapv :address/city
+                             (buyer/purgeable-addresses x {:closing-account? true})))))
+    (testing "legal-hold never purges"
+      (is (not-any? #(= "Kyoto" (:address/city %))
+                    (buyer/purgeable-addresses x {:orders-closed? true
+                                                  :closing-account? true}))))
+    (testing "and nothing purges while orders are open"
+      (is (empty? (buyer/purgeable-addresses x {}))))))
+
+(deftest an-unknown-retention-class-is-refused
+  (is (some #(= :invalid-retention (:buyer.error/code %))
+            (buyer/address-errors (addr :retention :forever)))))

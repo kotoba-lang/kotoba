@@ -1,0 +1,156 @@
+(ns marketplace.listing-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.product-party :as pp]
+            [marketplace.catalog :as catalog]
+            [marketplace.listing :as listing]))
+
+(def product (pp/product-id {:gtin "5449000000996"}))
+
+(defn- l [& {:keys [seller category status attested title keywords]
+             :or {seller "merchant.a" category :beverages status :live
+                  attested #{} title "Coca-Cola 500ml"}}]
+  (listing/listing {:offer (str "offer." seller)
+                    :product product
+                    :seller seller
+                    :title title
+                    :description "冷えた炭酸飲料"
+                    :category category
+                    :keywords (or keywords ["cola" "コーラ" "drink"])
+                    :images ["https://example.test/1.jpg"]
+                    :status status
+                    :attested attested}))
+
+(defn- adm [listing* & {:as opts}]
+  (listing/admission listing* (merge {:seller-ok? true} opts)))
+
+(deftest happy-path-is-admissible
+  (is (= :admissible (:admission/outcome (adm (l)))))
+  (is (true? (listing/displayable? (l) {:seller-ok? true}))))
+
+(deftest restricted-baseline-is-refused
+  (testing "the baseline floor refuses without any operator policy supplied"
+    (doseq [c [:weapons-firearms :controlled-substances :counterfeit-goods
+               :csam :human-remains-organs :government-identity-documents]]
+      (let [a (adm (l :category c))]
+        (is (= :refused (:admission/outcome a)) (str c))
+        (is (some #{:restricted-category} (:admission/reasons a)) (str c)))))
+  (testing "an operator's own jurisdiction policy adds to the floor"
+    (is (= :admissible (:admission/outcome (adm (l :category :alcohol)))))
+    (is (= :refused (:admission/outcome (adm (l :category :alcohol)
+                                             :policy #{:alcohol}))))))
+
+(deftest unsellable-seller-cannot-display
+  (let [a (listing/admission (l) {:seller-ok? false})]
+    (is (= :refused (:admission/outcome a)))
+    (is (some #{:seller-not-sellable} (:admission/reasons a)))))
+
+(deftest counterfeit-signal-refuses-display-without-finding-guilt
+  (let [a (adm (l) :counterfeit-signal true)]
+    (is (= :refused (:admission/outcome a)))
+    (is (some #{:counterfeit-signal} (:admission/reasons a)))
+    (is (true? (:admission/non-adjudicating a))
+        "refusing to display is not a finding that the seller counterfeited")))
+
+(deftest missing-attestation-escalates-rather-than-refusing
+  (let [a (adm (l) :require #{:authentic-goods :right-to-sell})]
+    (is (= :review (:admission/outcome a)))
+    (is (= #{:authentic-goods :right-to-sell} (set (:admission/missing-attestations a)))))
+  (testing "attested listings pass"
+    (is (= :admissible (:admission/outcome
+                        (adm (l :attested #{:authentic-goods :right-to-sell})
+                             :require #{:authentic-goods :right-to-sell}))))))
+
+(deftest content-requirements
+  (is (some #{:missing-title} (:admission/reasons (adm (l :title "")))))
+  (is (some #{:title-too-long}
+            (:admission/reasons (adm (l :title (apply str (repeat 201 "a")))))))
+  (testing "a listing with no images is refused"
+    (is (some #{:no-images}
+              (:admission/reasons (adm (dissoc (l) :listing/images))))))
+  (testing "status gates"
+    (is (= :review (:admission/outcome (adm (l :status :draft)))))
+    (is (= :review (:admission/outcome (adm (l :status :suppressed)))))
+    (is (= :refused (:admission/outcome (adm (l :status :withdrawn)))))))
+
+;; ───────────────────────────── search ─────────────────────────────
+
+(deftest search-index-excludes-non-displayable
+  (let [ok (l :seller "merchant.a")
+        banned (l :seller "merchant.b" :category :weapons-firearms)
+        draft (l :seller "merchant.c" :status :draft)
+        idx (listing/index-listings [ok banned draft] {:seller-ok? true})]
+    (is (= 1 (count (:search/docs idx))))
+    (testing "the buyer surface cannot leak what admission declined —
+              it is simply not in the index"
+      (is (empty? (listing/search-listings idx "weapons")))
+      (is (seq (listing/search-listings idx "cola"))))))
+
+(deftest index-admissible-honours-a-pre-decided-verdict
+  (let [a (l :seller "merchant.a")
+        b (l :seller "merchant.b")
+        idx (listing/index-admissible [[a {:admission/outcome :admissible}]
+                                       [b {:admission/outcome :refused}]])]
+    (is (= 1 (count (:search/docs idx))))
+    (is (contains? (:search/docs idx) (:listing/id a)))))
+
+(deftest search-document-carries-facets
+  (let [d (listing/->search-document (l))]
+    (is (= "Coca-Cola 500ml" (:search/title d)))
+    (is (contains? (:search/tags d) "beverages"))
+    (is (contains? (:search/tags d) "merchant.a"))
+    (is (contains? (:search/tags d) product))
+    (is (contains? (:search/tags d) "コーラ"))))
+
+(deftest japanese-recall-limitation-is-real-and-mitigated-by-keywords
+  (let [idx (listing/index-listings [(l :title "ワイヤレスイヤホン"
+                                        :keywords ["イヤホン" "wireless"])]
+                                    {:seller-ok? true})]
+    (testing "the upstream tokenizer does not segment Japanese, so a substring
+              query does NOT match the title — asserted so the limitation is
+              visible in the suite rather than discovered in production"
+      (is (empty? (listing/search-listings idx "ヤホン"))))
+    (testing "explicit keywords are what make the term findable"
+      (is (seq (listing/search-listings idx "イヤホン"))))
+    (testing "ASCII terms tokenize normally"
+      (is (seq (listing/search-listings idx "wireless"))))))
+
+;; ───────────────────────────── product page ─────────────────────────────
+
+(defn- offer-for [seller price]
+  (catalog/offer {:product product :seller seller :price-minor price :currency "JPY"}))
+
+(defn- listing-for [o]
+  (listing/listing {:offer (:offer/id o) :product product :seller (:offer/seller o)
+                    :title "Coca-Cola 500ml" :category :beverages
+                    :images ["https://example.test/1.jpg"] :status :live}))
+
+(deftest product-page-shows-the-losing-offers-too
+  (let [oa (offer-for "merchant.a" 1200)
+        ob (offer-for "merchant.b" 1100)
+        cat (reduce catalog/add-offer (catalog/empty-catalog) [oa ob])
+        page (listing/product-page cat product [(listing-for oa) (listing-for ob)])]
+    (is (= 2 (:page/offer-count page)))
+    (is (= ["merchant.a" "merchant.b"] (:page/sellers page)))
+    (is (= "merchant.b" (:offer/seller (:buy-box/winner (:page/buy-box page)))))
+    (testing "every offer is on the page, not just the winner — hiding the
+              losers would hide the mechanism"
+      (is (= 2 (count (:page/offers page))))
+      (is (= 2 (count (:page/listings page)))))
+    (testing "a fully wired page has no orphans on either side"
+      (is (empty? (:page/orphan-listings page)))
+      (is (empty? (:page/unlisted-offers page))))))
+
+(deftest product-page-surfaces-wiring-mistakes-instead-of-dropping-them
+  (let [oa (offer-for "merchant.a" 1200)
+        ob (offer-for "merchant.b" 1100)
+        cat (reduce catalog/add-offer (catalog/empty-catalog) [oa ob])
+        ;; a listing pointing at an offer id that does not exist, and an
+        ;; offer (ob) with no listing at all
+        page (listing/product-page cat product [(listing-for oa)
+                                                (l :seller "merchant.c")])]
+    (is (= 1 (count (:page/listings page))))
+    (testing "the dangling listing is reported, not silently discarded"
+      (is (= 1 (count (:page/orphan-listings page))))
+      (is (= "merchant.c" (:listing/seller (first (:page/orphan-listings page))))))
+    (testing "an offer with no listing is reported too"
+      (is (= [(:offer/id ob)] (mapv :offer/id (:page/unlisted-offers page)))))))

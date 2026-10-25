@@ -105,6 +105,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.snmp` | `org.ietf.snmp/src` | `snmp.message`, `snmp.pdu`, `snmp.types` (an external specification, publisher ietf.org) |
 | `org.apache.arrow` | `org.apache.arrow/src` | `arrow.build`, `arrow.decode`, `arrow.flatbuffers`, `arrow.ipc` (an external specification, publisher apache.org) |
 | `org.ietf.oauth2` | `org.ietf.oauth2/src` | `oauth2.core`, `oauth2.pkce` (an external specification, publisher ietf.org) |
+| `kotoba.marketplace` | `kotoba.marketplace/src` | `marketplace.acceptance`, `marketplace.buyer`, `marketplace.catalog`, `marketplace.crossborder` (Kotoba project library) |
 | `kotoba.kamiNvCompat` | `kotoba.kamiNvCompat/src` | `kotoba.lang.kami-nv-compat.actions.action-term`, `kotoba.lang.kami-nv-compat.actions.articulated-env`, `kotoba.lang.kami-nv-compat.actions.task-space-actions`, `kotoba.lang.kami-nv-compat.alpamayo` (Kotoba project library) |
 | `kotoba.ioAlembic` | `kotoba.ioAlembic/src` | `alembic.objects`, `alembic.properties`, `ogawa.core` (Kotoba project library) |
 | `kotoba.arxiv` | `kotoba.arxiv/src` | `arxiv-kotoba.dialogue`, `arxiv-kotoba.manifest`, `arxiv-kotoba.ops`, `arxiv-kotoba.policy` (Kotoba project library) |

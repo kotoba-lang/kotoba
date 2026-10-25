@@ -1,0 +1,542 @@
+(ns marketplace.edge
+  "The HOST half of a marketplace actor, written once.
+
+  Every actor in this marketplace is the same shape: a synchronous
+  advisor/governor/phase core over a `Store`, and a host that has to get
+  documents in front of it and writes out of it. The core differs per
+  actor. The host does not — and the first version of it was copied into
+  `orderops.edge.worker` and would have been copied into five more.
+  This repo has watched that go wrong before (`cacao.cljc` reached ~25
+  repos with a \"keep in sync\" comment and then diverged anyway), so the
+  host lives here and the actors call it.
+
+  ## What a host is for
+
+  `kotoba-lang/kotobase-client` is Promise-based; the actor is
+  synchronous. Making every `Store` protocol in the fleet async to suit
+  one transport would be the tail wagging the dog, so the host brackets
+  one actor pass instead:
+
+      prefetch (the documents the request NAMES)
+        -> seed a recording db-api
+          -> run the actor, synchronously, exactly as the tests run it
+        -> flush every recorded write in ONE transact
+
+  The actor cannot tell the difference between this and a local map,
+  which is the point: the same code path the test suite exercises is the
+  one that runs in production.
+
+  ## What this namespace refuses to do
+
+  It mints no CACAO — the client does that, and
+  `kotoba-lang/org-chainagnostic-cacao` owns the primitives. It holds no
+  key material beyond reading the seed the platform hands it. It does
+  not adjudicate, price or decide anything; every judgement stays in the
+  actor's own governor.
+
+  Bracket access (`aget`) throughout, for `:advanced-optimization`
+  safety."
+  (:require [cljs.reader :as reader]
+            [kotoba.lang.text :as str]
+            [kotobase.client :as kb]
+            [marketplace.persist :as persist]))
+
+(def default-endpoint "https://kotobase.net")
+
+(def default-db
+  "ONE ref for the whole marketplace.
+
+  AGENTS.md's kotobase rule is that a Datalog join reaches exactly one
+  ref: `open` takes a single `:ref-name`, so anything split across refs
+  can never be joined again. Everything here wants joining — an order
+  against the credential that admitted its seller, a payout against the
+  delivery that earned it, a return against the order it came from — so
+  every marketplace actor writes into this one ref and none of them
+  shards.
+
+  The cost, stated rather than discovered: one ref means one writer
+  lease per commit at the storage layer, so throughput is bounded by
+  CAS contention rather than by capacity. The rule's own answer to that
+  is a single writer that batches, not a shard."
+  "marketplace")
+
+;; ───────────────────────── responses ─────────────────────────
+
+(defn json [body status]
+  (js/Response. (js/JSON.stringify (clj->js body))
+                #js {:status status
+                     :headers #js {"content-type" "application/json; charset=utf-8"
+                                   "cache-control" "no-store"}}))
+
+(defn authorised?
+  "Bearer check against a shared secret. Write routes only: reads of
+  published marketplace data are open by design."
+  [request env]
+  (let [want (aget env "ACTOR_WRITE_TOKEN")
+        got (some-> (.get (aget request "headers") "authorization")
+                    (str/replace #"^Bearer " ""))]
+    (and want (not (str/blank? (str got))) (= want got))))
+
+;; ───────────────────────── identity ─────────────────────────
+
+(defn- b64->bytes [s]
+  (let [bin (js/atob s)
+        n (.-length bin)
+        out (js/Uint8Array. n)]
+    (dotimes [i n] (aset out i (.charCodeAt bin i)))
+    out))
+
+(defn client-for
+  "Build the kotobase client from the actor's Ed25519 seed.
+
+  Returns nil when the seed is absent, and the host then fails closed
+  rather than falling back to anything local — the same discipline
+  `marketplace.persist/store` applies to its database API.
+
+  All marketplace actors are handed the SAME seed, because `:apex`
+  requires the graph scope to equal the issuer DID and they share one
+  graph (see `default-db`). Per-actor attribution does not depend on the
+  key: `persist/stream-ctx` scopes every ledger by actor name, so the
+  audit trails stay separate inside the shared ref."
+  [env]
+  (when-let [seed (aget env "KOTOBASE_SECRET_KEY")]
+    (kb/make-client {:endpoint (or (aget env "KOTOBASE_ENDPOINT") default-endpoint)
+                     :secret-key (b64->bytes seed)
+                     :operator-did (or (aget env "KOTOBASE_OPERATOR_DID")
+                                       "did:web:kotobase.net")
+                     :auth-profile :apex})))
+
+;; ───────────────────────── ledger ordinals ─────────────────────────
+
+(defn- pad [width n]
+  (let [s (str n)]
+    (str (subs "0000000000000000" 0 (max 0 (- width (count s)))) s)))
+
+(defn ordinal-fn
+  "A ledger ordinal a Worker may actually use.
+
+  The obvious implementation — a counter starting at 1 — is WRONG here,
+  and shipped wrong once. `persist/append-event!` derives the entity id
+  from the ordinal, so two isolates that each count from 1 write the
+  same id and the second append silently replaces the first. The
+  append-only audit ledger is the whole basis of the actor pattern's
+  traceability claim; one that drops facts under concurrency is worse
+  than none, because it still looks complete.
+
+  So the ordinal carries its own uniqueness:
+
+      <15-digit ms> - <4-digit within-request counter> - <isolate nonce>
+
+  Sorting it lexically gives clock order across writers and exact order
+  within a request. Two isolates writing in the same millisecond
+  interleave arbitrarily — that is the honest limit of a multi-writer
+  host, and it is a limit on ORDER, not on retention: nothing is lost.
+
+  A globally monotonic sequence needs a single writer. The right one
+  here is a Durable Object used purely as a serializer (AGENTS.md: a DO
+  is globally unique and single-threaded, so \"exactly one writer\" comes
+  for free rather than being implemented with leases and fencing). That
+  is a deliberate later step, not an oversight."
+  []
+  (let [n (atom 0)
+        nonce (.toString (js/Math.floor (* (js/Math.random) 0xffffff)) 16)]
+    (fn [] (str (pad 15 (js/Date.now)) "-" (pad 4 (swap! n inc)) "-" nonce))))
+
+;; ───────────────────────── reads ─────────────────────────
+
+(defn- rows->docs
+  "Fold a `datomic.q` response into `[[id doc] ..]` for one kind.
+
+  Rows come back `{s p o}` — the pattern engine's own shape, the same
+  positions as a datom's `{e a v}` (`kotobase-peer.core/datoms` says so
+  explicitly). The id is taken from the SUBJECT, where `persist/doc-eid`
+  put it, so nothing has to look up a per-kind id attribute."
+  [kind res]
+  (let [rows (or (aget res "rows") (aget res "rows_edn") #js [])
+        pre (str "mp." (name kind) "/")]
+    (vec
+     (keep (fn [r]
+             (let [s (str (or (aget r "s") (aget r "e")))
+                   o (or (aget r "o") (aget r "v") (aget r "v_edn"))]
+               (when (str/starts-with? s pre)
+                 [(subs s (count pre))
+                  (persist/dec* (if (and (string? o) (str/starts-with? o "\""))
+                                  (reader/read-string o)
+                                  o))])))
+           (array-seq rows)))))
+
+(defn q-pattern
+  "Run one `[s p o]` pattern against the ref.
+
+  `datomic.q` on the apex takes a triple PATTERN with `nil` wildcards —
+  NOT a `[:find .. :where ..]` datalog query. That distinction cost this
+  actor a whole-graph read for a day: a datalog query sent here parses
+  as a six-element vector, matches nothing, and returns `rows: []`,
+  which is indistinguishable from an empty database. The two transports
+  genuinely differ — `:direct-v1` reads the string as datalog — so this
+  is a fact about the apex, not a bug to route around.
+
+  Every read is SIGNED. Skipping the CACAO mint (`:public? true`) looked
+  like a saving of one signature per prefetched kind and is simply
+  refused — the apex answers 401, because a read of a key-derived graph
+  is still a read of someone's graph. Measured, not assumed."
+  [client db pattern]
+  (kb/q client (or db default-db) pattern))
+
+(defn load-kind
+  "Every document of one kind. ONE query, bounded by the kind's own
+  attribute rather than by the size of the graph."
+  ([client kind] (load-kind client default-db kind))
+  ([client db kind]
+   (-> (q-pattern client db (str "[nil \":mp." (name kind) "/doc\" nil]"))
+       (.then #(rows->docs kind %)))))
+
+(defn load-one
+  "One document by id.
+
+  This SHOULD be a single-subject query — `[\"mp.order/ord-1\"
+  \":mp.order/doc\" nil]` — and was, until `datomic.*` began bridging to
+  kotobase-storage-d1. Measured against kotobase.net on 2026-07-28:
+
+    [nil \":mp.order/doc\" nil]                 200
+    [\"mp.buyer/buyer-a\" \":mp.buyer/doc\" nil]  400 InvalidDatomicRequest
+    [\"mp.buyer/buyer-a\" nil nil]              400 InvalidDatomicRequest
+
+  A bound SUBJECT is refused; only a wildcard subject is accepted. So this
+  reads the kind and filters here.
+
+  That is a real regression in read precision and is written down rather than
+  smoothed over: it is still bounded by KIND — one attribute, not the whole
+  graph — but a request for one buyer now transfers every buyer. When the
+  bridge accepts a bound subject again, this function goes back to one query
+  and nothing else changes."
+  ([client kind id] (load-one client default-db kind id))
+  ([client db kind id]
+   (-> (load-kind client db kind)
+       (.then (fn [pairs] (filterv #(= (str id) (first %)) pairs))))))
+
+(defn prefetch
+  "Load exactly the documents a request names, and nothing else.
+
+  `wants` is `{kind ids}` where ids is a seq or `:all`. A named id is one
+  single-subject query; `:all` is one whole-kind query. Both are bounded
+  reads — the previous implementation scanned the entire ref on every
+  request and folded it in memory, which worked and would not have kept
+  working.
+
+  Missing documents are simply absent. The actor's governor is what
+  decides that an absent seller or offer is a refusal, and it must keep
+  deciding that rather than having the host pre-empt it with an error."
+  [client db wants]
+  (-> (js/Promise.all
+       (clj->js
+        (for [[kind ids] wants
+              :let [db (or db default-db)]
+              p (if (= :all ids)
+                  [(-> (load-kind client db kind)
+                       (.then (fn [pairs] (mapv (fn [[id doc]] [kind id doc]) pairs))))]
+                  (map (fn [id]
+                         (-> (load-one client db kind id)
+                             (.then (fn [pairs] (mapv (fn [[i doc]] [kind i doc]) pairs)))))
+                       (distinct (remove nil? ids))))]
+          p)))
+      (.then (fn [results] (vec (mapcat identity (array-seq results)))))))
+
+(defn seed-tx
+  "Turn selected documents into the tx-data `persist`'s recording api
+  seeds from — the same triples it writes, so the round trip is
+  symmetric by construction."
+  [picked]
+  (vec (mapcat (fn [[kind id doc]] (persist/doc->tx* kind id doc)) picked)))
+
+
+;; ───────────────────────── the ledger, readable ─────────────────────────
+
+(defn read-ledger
+  "Every fact on one actor's stream, in order.
+
+  The stream name is not queried for — it is READ OFF the entity id, which
+  `persist/append-event!` builds as `mp.event/<actor>/<stream>/<ordinal>`.
+  One pattern query for `:mp.event/fact` therefore returns every event in the
+  ref, and this narrows to the stream asked for.
+
+  Sorted here rather than trusted from the store. Datom order is not a
+  guarantee any backend makes, and an audit ledger read out of order is worse
+  than no ledger — the ordinal sorts lexically by design
+  (`<15-digit ms>-<counter>-<nonce>`), so clock order survives the round trip."
+  ([client actor stream] (read-ledger client default-db actor stream))
+  ([client db actor stream]
+   (let [prefix (str "mp.event/" (name actor) "/" (name stream) "/")]
+     (-> (q-pattern client db "[nil \":mp.event/fact\" nil]")
+         (.then (fn [res]
+                  (let [rows (or (aget res "rows") (aget res "rows_edn") #js [])]
+                    (->> (array-seq rows)
+                         (keep (fn [r]
+                                 (let [e (str (or (aget r "s") (aget r "e")))
+                                       o (or (aget r "o") (aget r "v") (aget r "v_edn"))]
+                                   (when (str/starts-with? e prefix)
+                                     [(subs e (count prefix))
+                                      (persist/dec* (if (and (string? o)
+                                                             (str/starts-with? o "\""))
+                                                      (reader/read-string o)
+                                                      o))]))))
+                         (sort-by first)
+                         (mapv second)))))))))
+
+(defn fact-ref
+  "What a ledger fact is ABOUT, across actors that name it differently.
+
+  `edge/run` writes `:ref`, but an actor with its own runner may write
+  `:order-id`, `:applicant-id`, `:task-id` and so on — the order actor does.
+  Matching only on `:ref` would silently pair nothing, and an approval queue
+  that quietly shows zero open items is worse than one that errors: it reads
+  as 'nothing to do'."
+  [fact]
+  (or (:ref fact)
+      (some (fn [[k v]] (when (and v (str/ends-with? (name k) "-id")) v)) fact)))
+
+(defn escalations
+  "The approval queue: what this actor handed to a human and NOBODY HAS
+  ANSWERED YET.
+
+  Why this exists at all: every marketplace actor is built so that the
+  high-stakes moves — cancelling a sub-order, binding a payout destination,
+  releasing an escrow, issuing a seller credential, accepting an HS
+  classification — do not commit on a machine's say-so. They escalate. Those
+  escalations were being written faithfully into the ledger and there was no
+  way to READ them, which made every one of those gates a black hole: the
+  actor correctly refused to decide, and no human could see that it had.
+
+  An escalation is OPEN until a later fact on the same stream names the same
+  `:ref`. Resolved ones are counted, not listed — a queue that shows finished
+  work stops being read."
+  ([client actor] (escalations client default-db actor))
+  ([client db actor]
+   (-> (read-ledger client db actor :ledger)
+       (.then (fn [facts]
+                (let [asked (filterv #(= :approval-requested (:t %)) facts)
+                      answered (into #{} (comp (remove #(= :approval-requested (:t %)))
+                                               (keep fact-ref))
+                                     facts)
+                      open (remove #(contains? answered (fact-ref %)) asked)]
+                  {:actor (name actor)
+                   :open (mapv (fn [f] {:ref (fact-ref f)
+                                        :op (some-> (:op f) name)
+                                        :reason (some-> (:reason f) name)})
+                               open)
+                   :open-count (count open)
+                   :resolved-count (- (count asked) (count open))}))))))
+
+;; ───────────────────────── the actor pass ─────────────────────────
+
+(defn run
+  "One actor pass: advise -> govern -> phase-gate -> commit | escalate |
+  hold. Synchronous, so it is the SAME path the test suite runs; the
+  Promise work is `with-store`'s bracket around it.
+
+  Every marketplace actor's Worker calls this, and it belongs here rather
+  than in each of them for the reason `ledger-routes` does: six copies of
+  a decision pipeline drift, and the one that drifts is the one nobody
+  reads. `ops` is the actor's own five functions, so nothing generic here
+  decides anything:
+
+    :advise      (st request)                  -> proposal
+    :check       (request context proposal st) -> verdict
+    :disposition (verdict)                     -> :commit | :escalate | :hold
+    :gate        (phase request disposition)   -> {:disposition .. :reason ..}
+    :commit!     (st proposal request)         -> record   (only on :commit)
+    :ledger!     (st fact)                                (every outcome)
+    :hold-fact   (request context verdict)     -> fact     (only on :hold)
+
+  THE LEDGER IS WRITTEN ON EVERY PATH, including escalate. An escalation
+  that is not written is a gate nobody can see -- `escalations` reads
+  exactly the `:approval-requested` facts this writes, and pairs them by
+  `:ref`, so both halves of the approval queue are defined in one place.
+
+  Returns the actor's own words: `{:disposition kw :violations [..] :ref
+  .. :op .. :confidence ..}`. `outcome` turns that into a response body."
+  [ops store context request]
+  (let [proposal ((:advise ops) store request)
+        verdict ((:check ops) request context proposal store)
+        base ((:disposition ops) verdict)
+        {:keys [disposition reason]} ((:gate ops) (:phase context) request base)
+        ref (fact-ref request)
+        base-fact {:op (:op request) :ref ref :actor (:actor-id context)}]
+    (case disposition
+      :commit
+      (let [record ((:commit! ops) store proposal request)]
+        ((:ledger! ops) store (assoc base-fact
+                                     :t :committed
+                                     :disposition :commit
+                                     :basis (:cites proposal)
+                                     :summary (:summary proposal)))
+        {:disposition :commit :violations [] :ref ref :op (:op request)
+         :confidence (:confidence verdict) :record record})
+
+      :escalate
+      (do ((:ledger! ops) store (assoc base-fact
+                                       :t :approval-requested
+                                       ;; The phase gate's reason when it is the
+                                       ;; cause, else why the governor stopped
+                                       ;; short of committing. `escalations`
+                                       ;; shows this to whoever has to answer.
+                                       :reason (or reason
+                                                   (cond (:high-stakes? verdict) :always-escalate
+                                                         :else :low-confidence))
+                                       :phase (:phase context)
+                                       :confidence (:confidence verdict)))
+          {:disposition :escalate :violations [] :ref ref :op (:op request)
+           :reason (or reason (if (:high-stakes? verdict) :always-escalate :low-confidence))
+           :confidence (:confidence verdict)})
+
+      (let [fact ((:hold-fact ops) request context verdict)]
+        ((:ledger! ops) store (cond-> (merge base-fact fact {:disposition :hold})
+                                reason (assoc :phase-reason reason
+                                              :phase (:phase context))))
+        {:disposition :hold
+         :violations (:violations verdict)
+         :ref ref :op (:op request) :confidence (:confidence verdict)}))))
+
+(defn outcome
+  "One actor pass as a response body.
+
+  Dispositions and rules go out as STRINGS: this is JSON, and a caller
+  reading `\"hold\"` should not have to know Clojure's keyword printing to
+  compare it. The shape matches what the non-actor routes return by hand
+  (`{:ref .. :disposition \"commit\" :violations []}`), because a client
+  should not need to know which routes ran an actor.
+
+  Violations keep their rule AND their detail. A refusal that says only
+  `escrow-not-releasable` sends the reader back to the source to find out
+  which half was false."
+  [ref result]
+  {:ref ref
+   :disposition (name (:disposition result))
+   :op (some-> (:op result) name)
+   :violations (mapv (fn [v]
+                       (cond-> {:rule (some-> (:rule v) name)}
+                         (:detail v) (assoc :detail (:detail v))))
+                     (:violations result))
+   :reason (some-> (:reason result) name)
+   :confidence (:confidence result)})
+
+;; ───────────────────────── writes ─────────────────────────
+
+(defn flush-tx!
+  "One transact of everything the request wrote.
+
+  Nothing when it wrote nothing: an empty transact would still advance
+  the head and make a read look like a write in the audit trail.
+  Retries are OFF — a re-applied append with a fresh ordinal would
+  duplicate a ledger entry, exactly the hazard the client's own
+  `transact` docstring warns about."
+  ([client tx-data] (flush-tx! client default-db tx-data))
+  ([client db tx-data]
+   (if (seq tx-data)
+     (kb/transact client db (pr-str (vec tx-data)))
+     (js/Promise.resolve nil))))
+
+;; ───────────────────────── the bracket ─────────────────────────
+
+(defn with-store
+  "prefetch -> run -> flush, for any actor.
+
+  `store-fn` receives `{:db-api .. :seq-fn ..}` and returns that actor's
+  own durable store. `f` receives the store and runs the actor
+  synchronously. Returns a Promise of `(f st)` plus `:written`, the
+  number of triples that reached the ref."
+  [{:keys [client db wants store-fn]} f]
+  (let [db (or db default-db)]
+    (-> (prefetch client db wants)
+        (.then (fn [picked]
+                 (let [api (persist/recording-db-api (seed-tx picked))
+                       st (store-fn {:db-api api :seq-fn (ordinal-fn)})
+                       result (f st)
+                       written (persist/recorded api)]
+                   (-> (flush-tx! client db written)
+                       (.then (fn [_] (assoc result :written (count written)))))))))))
+
+(defn read-doc
+  "One document straight out of the ref, without running an actor."
+  ([client kind id] (read-doc client default-db kind id))
+  ([client db kind id]
+   (-> (load-one client db kind id) (.then (fn [pairs] (second (first pairs)))))))
+
+(defn read-all
+  "Every document of a kind, id-sorted for determinism."
+  ([client kind] (read-all client default-db kind))
+  ([client db kind]
+   (-> (load-kind client db kind)
+       (.then (fn [pairs] (mapv second (sort-by first pairs)))))))
+
+;; ───────────────────────── the fetch handler ─────────────────────────
+
+(defn ledger-routes
+  "The two read routes every marketplace actor should expose, implemented
+  once.
+
+  `GET /escalations`  what this actor handed to a human and nobody answered.
+  `GET /ledger`       the whole append-only stream.
+
+  Both are GATED. The ledger names orders, sellers, amounts and the basis of
+  every refusal; it is the audit trail, not public information. Returns nil
+  when the path is neither, so an actor's own `routes` can fall through."
+  [client request env method path actor]
+  (cond
+    (and (= method "GET") (= path "/escalations"))
+    (if-not (authorised? request env)
+      (js/Promise.resolve (json {:error "unauthorised"} 401))
+      (-> (escalations client actor) (.then #(json % 200))))
+
+    (and (= method "GET") (= path "/ledger"))
+    (if-not (authorised? request env)
+      (js/Promise.resolve (json {:error "unauthorised"} 401))
+      (-> (read-ledger client actor :ledger)
+          (.then (fn [facts]
+                   (json {:actor (name actor)
+                          :count (count facts)
+                          :facts (mapv (fn [f]
+                                         (-> f
+                                             (update :t #(some-> % name))
+                                             (update :op #(some-> % name))
+                                             (dissoc :violations)))
+                                       facts)}
+                         200)))))
+
+    :else nil))
+
+(defn serve
+  "The shape every marketplace Worker's `fetch` has.
+
+  `routes` is a function of `[client request env method path url]`
+  returning a Promise of a Response, or nil to fall through to 404.
+  Handles the two things all of them get wrong otherwise: failing closed
+  when the seed is missing, and turning a store error into a 502 with
+  its message instead of an opaque 500."
+  [service request env routes]
+  (let [url (js/URL. (aget request "url"))
+        path (aget url "pathname")
+        method (aget request "method")
+        client (client-for env)]
+    (cond
+      (= path "/health")
+      (js/Promise.resolve
+       (json {:ok (some? client)
+              :service service
+              :store "kotobase.net via kotoba-lang/kotobase-client"
+              :db default-db
+              :auth "CACAO minted per request by the client (:apex profile)"
+              :did (:did client)}
+             (if client 200 503)))
+
+      (nil? client)
+      (js/Promise.resolve
+       (json {:error "no KOTOBASE_SECRET_KEY -- refusing to serve without a store"
+              :service service}
+             503))
+
+      :else
+      (or (some-> (routes client request env method path url)
+                  (.catch (fn [e]
+                            (json {:store-error (str (or (aget e "message") e))} 502))))
+          (js/Promise.resolve (json {:error "not found"} 404))))))

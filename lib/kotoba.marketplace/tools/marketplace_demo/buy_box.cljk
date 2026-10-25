@@ -1,0 +1,424 @@
+(ns marketplace-demo.buy-box
+  "Generate `docs/buy-box.html` by RUNNING `marketplace.catalog/buy-box`.
+
+  ## Why this exists
+
+  The README makes a claim that is checkable only if someone checks it:
+  the buy box is a pure function whose ranking key is entirely observable
+  by sellers, so *a seller who lost can reproduce the result*. A prose
+  claim and a hand-drawn mock-up are indistinguishable from a working
+  one. This generator closes that: every id, every amount and every
+  exclusion reason on the page is a value the library returned on the run
+  that wrote the file. Nothing on it is typed.
+
+  ## It refuses rather than shipping a page that proves nothing
+
+  Three preconditions, each of which would leave a page that *looks*
+  fine while demonstrating nothing:
+
+  - **no exclusion** — a ranking with nothing excluded cannot show that
+    the excluded offers carry a reason,
+  - **the winner is also the lowest sticker price** — then the page
+    cannot distinguish a landed-price ranking from a naive one, which is
+    the whole subject,
+  - **a cell that HTML-escaping would rewrite** — the round-trip below
+    would then compare an escaped string against an unescaped one and
+    report a mismatch that is an artefact of this generator, not of the
+    render.
+
+  ## The verifier is checked on every run
+
+  `mismatches` reads the rendered table back and counts cells that
+  disagree with the computed result — a COUNT, not a boolean, because a
+  boolean cannot tell one drifted cell from a render that collapsed.
+  Byte-identity is not enough on its own: AGENTS.md records two defects
+  from 2026-09-09 where a build succeeded and the output was wrong
+  (`str/replace` letting JavaScript interpret `$&` in the replacement,
+  and `js->clj` dropping a match's `.index`), and only a check that read
+  the artefact back caught them.
+
+  But a verifier that never fires is indistinguishable from one that
+  cannot. So before writing, `main` runs `mismatches` against a copy of
+  the render with one digit of the winner's landed price changed, and
+  REFUSES if that copy passes. The gate has to discriminate on this run
+  to be allowed to pass on this run.
+
+  Run it:
+
+      npm run demo    # amu compile --target wasm32-browser demo && node out/gen-buy-box-demo.js"
+  (:require [kotoba.lang.text :as str]
+            [kotoba.product-party :as pp]
+            [ekyc.model :as ekyc-model]
+            [marketplace.catalog :as catalog]
+            [marketplace.seller :as seller]
+            [jp-go-dds.core :as dds]
+            [jp-go-dds.page :as dds-page]
+            [jp-go-dds.tokens :as tokens]
+            [html.core :as html]
+            [shadow.resource :as rc]
+            ["node:fs" :as fs]
+            ["node:path" :as path]))
+
+;; The vendored DADS stylesheet, inlined at COMPILE time. The page has to
+;; be one self-contained file (AGENTS.md's app plane: a document that
+;; fetches its own runtime over the network is not covered by its own
+;; address), and a Node script cannot slurp a classpath resource at run
+;; time anyway.
+(def dds-css (rc/inline "jp_go_dds/dds.css"))
+
+;; ───────────────────────────── the scenario ─────────────────────────────
+
+(def now
+  "The clock is an argument everywhere in this library, so the demo
+  supplies one rather than reading a real one — the page has to render
+  the same bytes tomorrow."
+  "2026-06-01T00:00:00Z")
+
+(def issuer "did:web:marketplace.example")
+
+(def gtin
+  "A real GTIN-13 with a valid GS1 mod-10 check digit. `product-id`
+  below re-derives the canonical id from it, and `guard-scenario!`
+  refuses if product-party disagrees — so this demo cannot ship a
+  product id that the catalog itself would reject."
+  "5449000000996")
+
+(def product (pp/product-id {:gtin gtin}))
+
+(def sellers
+  "Six sellers on one canonical product. Two of them exist to be
+  EXCLUDED, and one of those two holds the cheapest offer on the page —
+  without that, an exclusion list is decoration."
+  [{:id "merchant.aoyama-denki" :name "青山電機 株式会社"    :payout-bound? true}
+   {:id "merchant.kanda-books"  :name "神田商会 株式会社"    :payout-bound? true}
+   {:id "merchant.osaka-parts"  :name "大阪パーツ 株式会社"  :payout-bound? true}
+   {:id "merchant.sendai-reuse" :name "仙台リユース 合同会社" :payout-bound? true}
+   {:id "merchant.hakata-mart"  :name "博多マート 株式会社"  :payout-bound? true}
+   ;; Identity-verified and unable to receive money. ISIC 4791 hard-holds
+   ;; a verified-but-unlinked merchant exactly like an unverified one, and
+   ;; `seller/sellable?` is where that shows up here.
+   {:id "merchant.niigata-shoji" :name "新潟商事 株式会社"   :payout-bound? false}])
+
+(def offers-spec
+  "price-minor is JPY, an integer count of the smallest circulating unit.
+  `shipping` is quoted per offer in the same currency."
+  [{:seller "merchant.aoyama-denki"  :price 12800 :condition :new            :availability :in-stock  :lead 2 :shipping 0}
+   {:seller "merchant.kanda-books"   :price 12300 :condition :new            :availability :in-stock  :lead 4 :shipping 800}
+   {:seller "merchant.osaka-parts"   :price 12900 :condition :new            :availability :in-stock  :lead 1 :shipping 0}
+   {:seller "merchant.sendai-reuse"  :price 11500 :condition :used-like-new  :availability :in-stock  :lead 3 :shipping 1400}
+   {:seller "merchant.hakata-mart"   :price 11900 :condition :new            :availability :backorder :lead 9 :shipping 0}
+   {:seller "merchant.niigata-shoji" :price 11000 :condition :new            :availability :in-stock  :lead 2 :shipping 0}])
+
+(defn- credential
+  "A structurally clean credential for `s`, with the full evidence set
+  this protocol's floor re-derives from the seller kind. Built through
+  `ekyc.model` and `seller/evidence-summary` rather than hand-shaped, so
+  the demo cannot carry an evidence summary the library would refuse."
+  [{:keys [id name payout-bound?]}]
+  (let [kind    :company
+        checks  (seller/required-checks kind)
+        session (ekyc-model/session (str "sess-" id) (str "subj-" id)
+                                    {:required-checks checks :provider :demo})]
+    (seller/credential
+     {:id id :kind kind :legal-name name :country "JPN" :issuer issuer
+      :issued-at "2026-01-01T00:00:00Z" :expires-at "2027-01-01T00:00:00Z"
+      :status :issued :payout-bound? payout-bound?
+      :evidence (seller/evidence-summary
+                 {:ekyc-session  session
+                  :ekyc-evidence (mapv #(ekyc-model/evidence session % :verified
+                                                             {:evidence-ref (str "ref-" (clojure.core/name %))})
+                                       checks)
+                  :aml-results   [{:aml/route :yabai :aml/level :clear
+                                   :aml/non-adjudicating true}]})})))
+
+(defn scenario
+  "Everything the page is derived from, computed by the library."
+  []
+  (let [creds    (into {} (map (juxt :id credential) sellers))
+        names    (into {} (map (juxt :id :name) sellers))
+        offers   (mapv (fn [{:keys [seller price condition availability lead]}]
+                         (catalog/offer {:product product :seller seller
+                                         :price-minor price :currency "JPY"
+                                         :condition condition :availability availability
+                                         :lead-time-days lead}))
+                       offers-spec)
+        cat      (reduce catalog/add-offer (catalog/empty-catalog) offers)
+        shipping (into {} (map (fn [o s] [(:offer/id o) (:shipping s)]) offers offers-spec))
+        result   (catalog/buy-box cat product
+                                  {:shipping  shipping
+                                   :eligible? #(seller/sellable? (creds (:offer/seller %)) now)})]
+    {:offers offers :catalog cat :shipping shipping :credentials creds
+     :names names :result result}))
+
+;; ───────────────────────────── rows ─────────────────────────────
+
+(defn yen
+  "JPY minor units with a thousands separator. Integer arithmetic only —
+  `reji`'s discipline is that money never touches a float, and a demo
+  that formats with one would be showing the wrong thing about a library
+  whose whole point is that it does not.
+
+  Groups from the RIGHT. The first version of this grouped from the left
+  and rendered 12800 as `¥1,280,0`; the page built, the round-trip check
+  below passed (it compares the render against this function's own
+  output, so a wrong number renders faithfully), and only reading the
+  artefact caught it. `money-refusals` is the check that would have."
+  [minor]
+  (let [digits   (str (abs minor))
+        n        (count digits)
+        head-len (let [r (mod n 3)] (if (zero? r) 3 r))
+        groups   (cons (subs digits 0 head-len)
+                       (map #(subs digits % (+ % 3)) (range head-len n 3)))]
+    (str (when (neg? minor) "-") "¥" (str/join "," groups))))
+
+(defn money-refusals
+  "Reasons `yen` must not be trusted with `amounts`, `[]` when it may be.
+
+  Two independent properties, because the render round-trip cannot see
+  either of them:
+
+  - **it round-trips** — strip the ¥ and the separators and the digits
+    are the integer that went in,
+  - **the groups are 3 digits** after the first, which is what a
+    thousands separator MEANS. `¥1,280,0` round-trips perfectly and is
+    still wrong, so the first property alone is not enough."
+  [amounts]
+  (vec
+   (mapcat
+    (fn [minor]
+      (let [s      (yen minor)
+            body   (str/replace (str/replace s "¥" "") "," "")
+            groups (str/split (str/replace s "¥" "") #",")]
+        (concat
+         (when-not (= (str (abs minor)) (str/replace body "-" ""))
+           [(str "yen " minor " => " s " does not round-trip")])
+         (for [g (rest groups) :when (not= 3 (count g))]
+           (str "yen " minor " => " s " has a " (count g) "-digit group; a thousands separator groups by 3")))))
+    amounts)))
+
+(defn- condition-label [c]
+  ({:new "新品" :refurbished "整備済" :used-like-new "中古 (ほぼ新品)"
+    :used-good "中古 (良)" :used-acceptable "中古 (可)"} c (str c)))
+
+(defn- reason-label [r]
+  ({:not-in-stock "在庫なし — :in-stock だけが買い箱の対象"
+    :seller-ineligible "seller/sellable? が false — 本人確認は通っているが払込先が未接続"
+    :mixed-currency "通貨が混在 — 換算せず拒否"} r (str r)))
+
+(defn ranked-rows
+  "The ranking table as data. Every cell is a value the library returned."
+  [{:keys [shipping names result]}]
+  (vec (map-indexed
+        (fn [i o]
+          [(str (inc i))
+           (names (:offer/seller o))
+           (yen (:offer/price-minor o))
+           (yen (get shipping (:offer/id o) 0))
+           (yen (+ (:offer/price-minor o) (get shipping (:offer/id o) 0)))
+           (condition-label (:offer/condition o))
+           (str (:offer/lead-time-days o) " 日")])
+        (:buy-box/ranked result))))
+
+(defn excluded-rows
+  [{:keys [names result offers]}]
+  (let [by-id (into {} (map (juxt :offer/id identity) offers))]
+    (vec (map (fn [{:keys [offer/id reason]}]
+                (let [o (by-id id)]
+                  [(names (:offer/seller o))
+                   (yen (:offer/price-minor o))
+                   (reason-label reason)]))
+              (:buy-box/excluded result)))))
+
+;; ───────────────────────────── refusals ─────────────────────────────
+
+(def ^:private escaping-chars #"[&<>\"']")
+
+(defn scenario-refusals
+  "Reasons this scenario must not be rendered, `[]` when it may be.
+  Each one is a way the page would look right and demonstrate nothing."
+  [{:keys [result] :as sc} rows excl]
+  (let [winner    (:buy-box/winner result)
+        cheapest  (first (sort-by :offer/price-minor (:offers sc)))]
+    (vec
+     (concat
+      (when-not (pp/valid-gtin? (pp/normalize-gtin gtin))
+        ["the GTIN in this generator fails its own GS1 check digit"])
+      (when-not winner
+        ["buy-box returned no winner — there is nothing to show"])
+      (when (empty? excl)
+        ["no offer was excluded — the page cannot show that an exclusion carries a reason"])
+      (when (and winner cheapest (= (:offer/id winner) (:offer/id cheapest)))
+        ["the winner also holds the lowest sticker price — the page cannot tell a landed-price ranking from a naive one"])
+      (when-not (:buy-box/landed? result)
+        ["buy-box reports landed? false — the shipping quotes did not reach it"])
+      ;; Every amount this page will print, plus boundary widths the
+      ;; scenario happens not to reach. A comparison whose inputs never
+      ;; sit on the boundary cannot see the boundary (AGENTS.md, 5th of
+      ;; the eight questions).
+      (money-refusals (concat [0 1 999 1000 1001 999999 1000000]
+                              (map :offer/price-minor (:offers sc))
+                              (vals (:shipping sc))
+                              (map #(+ (:offer/price-minor %)
+                                       (get (:shipping sc) (:offer/id %) 0))
+                                   (:offers sc))))
+      (for [row (concat rows excl)
+            cell row
+            :when (str/re-find escaping-chars cell)]
+        (str "cell " (pr-str cell) " contains a character HTML-escaping would rewrite"))))))
+
+(def ^:private markdown-in-html
+  ;; `**bold**` and `[text](url)`. NOT ATX headings: those need a
+  ;; line-start anchor, JavaScript has no inline `(?m)`, and the
+  ;; tag-stripped text puts every string mid-line anyway -- a pattern
+  ;; that cannot fire is worse than one that is not there, because it
+  ;; reads like coverage.
+  #"\*\*|\[[^\]]+\]\([^)]+\)")
+
+(defn prose-refusals
+  "Markdown syntax that reached the HTML. `**bold**` in a hiccup string
+  is not bold — it is two asterisks, and the page ships them. Found by
+  reading the rendered text, which is the only place it is visible: the
+  source looks like the prose everything else in this repo is written
+  in, and the build is green either way."
+  [doc]
+  (let [body (subs doc (or (str/index-of doc "<body>") 0))
+        text (str/replace body #"<[^>]*>" " ")]
+    (vec (map #(str "markdown syntax " (pr-str %) " reached the rendered text; hiccup is not markdown")
+              (distinct (str/re-seq markdown-in-html text))))))
+
+;; ───────────────────────────── render ─────────────────────────────
+
+(defn ranking-table [rows]
+  (dds/table {:caption "買い箱ランキング — landed price 昇順、次に状態、次にリードタイム、最後に offer id"
+              :headers ["#" "出品者" "本体価格" "送料" "landed price" "状態" "リードタイム"]
+              :rows rows}))
+
+(defn exclusion-table [excl]
+  (dds/table {:caption "除外された出品 — 理由つき。負けた出品者が結果を再現できる"
+              :headers ["出品者" "本体価格" "除外理由"]
+              :rows excl}))
+
+(defn document
+  "The whole page. `tables` are pre-rendered strings so the verifier can
+  check that exactly those bytes reached the document."
+  [{:keys [result] :as sc} ranking-html exclusion-html]
+  (let [winner (:buy-box/winner result)
+        wname  ((:names sc) (:offer/seller winner))]
+    (html/->html
+     (dds-page/page
+      {:title "買い箱の再現 — marketplace.catalog/buy-box"
+       :description "marketplace.catalog/buy-box を実行して生成したページ。表の値はすべてライブラリの戻り値。"
+       :css dds-css
+       :app-css tokens/bridge-css}
+      (dds/container
+       (dds/section
+        (dds/heading 1 "買い箱の再現")
+        [:p "このページは "
+         [:code "marketplace.catalog/buy-box"] " を実際に実行して生成した。"
+         "表に出ている id・金額・除外理由は、そのときライブラリが返した値そのもので、手で書いたものは一つもない。"
+         "生成器は " [:code "tools/marketplace_demo/buy_box.cljk"] "。"]
+        (dds/notification-banner
+         {:type :info-1 :heading (str "買い箱: " wname " — " (yen (+ (:offer/price-minor winner)
+                                                                     (get (:shipping sc) (:offer/id winner) 0))))}
+         [:p "商品 " [:code product] "（GTIN-13 " gtin " を "
+          [:code "kotoba.product-party"] " が正規化し、GS1 mod-10 の検査数字を検証したもの）に "
+          (str (count (:offers sc))) " 件の出品。"
+          "うち " (str (count (:buy-box/excluded result))) " 件は買い箱の対象外。"])
+
+        (dds/heading 2 "ランキング")
+        [:p "並び順は landed price（本体 + 送料）の昇順。"
+         [:strong "最安の本体価格が勝つとは限らない"]
+         " —— 送料込みで比較するので、本体が安く送料が高い出品は順位を落とす。"
+         "この鍵はすべて出品者から観測できるので、負けた出品者は結果を再現できる。"]
+        [:hiccup/raw ranking-html]
+
+        (dds/heading 2 "除外")
+        [:p "除外は理由つきで返る。ここが空になるような入力では、生成器は書き込みを拒否する —— "
+         "何も除外されていないページは、除外に理由があることを示せない。"]
+        [:hiccup/raw exclusion-html]
+
+        (dds/heading 2 "このページが主張していないこと")
+        [:ul
+         [:li "本番の取引が通ったこと。このライブラリはネットワークに触れず、PSP にも接続していない。"]
+         [:li "為替。通貨が混在した商品は換算されず " [:code ":mixed-currency"] " で拒否される。"]
+         [:li "日本語検索の再現率。" [:code "search.model/tokenize"] " に形態素解析は無い（README 参照）。"]]
+        (dds/divider)
+        [:p [:small "生成: " [:code "npm run demo"] " — 生成物であって手書きではない。"
+             "編集するなら生成器を編集する。"]]))))))
+
+;; ───────────────────────────── verify ─────────────────────────────
+
+(def ^:private cell-re #"<t[dh][^>]*>([^<]*)</t[dh]>")
+
+(defn cells
+  "Every table cell's text, in document order, from a rendered table."
+  [table-html]
+  (mapv second (str/re-seq cell-re table-html)))
+
+(defn mismatches
+  "How many cells of `expected` the rendered table does not carry, in
+  order. A COUNT: a boolean could not tell one drifted cell from a table
+  that rendered empty, and those want different responses."
+  [table-html headers expected-rows]
+  (let [got  (cells table-html)
+        want (into (vec headers) (apply concat expected-rows))]
+    (+ (abs (- (count got) (count want)))
+       (count (remove true? (map = got want))))))
+
+(defn- corrupt
+  "One digit of the first data cell that holds one, changed. Used as the
+  negative control: if `mismatches` cannot see this, it cannot see
+  anything, and this run has no verifier."
+  [table-html]
+  (str/replace-first table-html #"(<td>[^<0-9]*)([0-9])" (fn [[_ pre d]]
+                                                           (str pre (mod (+ (js/parseInt d 10) 1) 10)))))
+
+;; ───────────────────────────── main ─────────────────────────────
+
+(def out-path "docs/buy-box.html")
+
+(defn- refuse! [lines]
+  (println "REFUSED — nothing written")
+  (doseq [l lines] (println "  -" l))
+  (js/process.exit 2))
+
+(defn main [& _]
+  (let [sc    (scenario)
+        rows  (ranked-rows sc)
+        excl  (excluded-rows sc)
+        stop  (scenario-refusals sc rows excl)]
+    (when (seq stop) (refuse! stop))
+    (let [rank-headers ["#" "出品者" "本体価格" "送料" "landed price" "状態" "リードタイム"]
+          excl-headers ["出品者" "本体価格" "除外理由"]
+          rank-html (html/->html (ranking-table rows))
+          excl-html (html/->html (exclusion-table excl))
+          ;; The verifier, checked before it is trusted. A corrupted copy
+          ;; that still passes means this run has no verifier at all.
+          control   (mismatches (corrupt rank-html) rank-headers rows)
+          drift     (+ (mismatches rank-html rank-headers rows)
+                       (mismatches excl-html excl-headers excl))
+          doc       (document sc rank-html excl-html)
+          embedded  (+ (if (str/includes? doc rank-html) 0 1)
+                       (if (str/includes? doc excl-html) 0 1))
+          prose     (prose-refusals doc)]
+      (cond
+        (seq prose) (refuse! prose)
+
+        (zero? control)
+        (refuse! ["the verifier passed a table with a digit changed — it is not checking anything"])
+
+        (pos? drift)
+        (refuse! [(str drift " rendered cell(s) disagree with the buy-box result")])
+
+        (pos? embedded)
+        (refuse! [(str embedded " rendered table(s) did not survive into the document")])
+
+        :else
+        (do
+          (fs/mkdirSync (path/dirname out-path) #js {:recursive true})
+          (fs/writeFileSync out-path doc)
+          (println "WROTE" out-path (str (count doc)) "bytes")
+          (println "  ranked" (count rows) " excluded" (count excl)
+                   " winner" (:offer/seller (:buy-box/winner (:result sc))))
+          (println "  verifier control (corrupted copy):" control "mismatch(es) — it discriminates")
+          (println "  drift against buy-box result:" drift))))))

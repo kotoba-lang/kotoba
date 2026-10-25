@@ -1,0 +1,138 @@
+(ns marketplace.catalog-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.product-party :as pp]
+            [marketplace.catalog :as catalog]))
+
+;; A real GTIN-13 with a valid GS1 mod-10 check digit (Coca-Cola, the
+;; same trade item kotoba.product-party's own demo graph uses).
+(def gtin "5449000000996")
+(def product (pp/product-id {:gtin gtin}))
+
+(defn- o [seller price & {:keys [condition availability lead qty]
+                          :or {condition :new availability :in-stock}}]
+  (catalog/offer (cond-> {:product product
+                          :seller seller
+                          :price-minor price
+                          :currency "JPY"
+                          :condition condition
+                          :availability availability}
+                   lead (assoc :lead-time-days lead)
+                   qty  (assoc :quantity qty))))
+
+(defn- cat-with [& offers]
+  (reduce catalog/add-offer (catalog/empty-catalog) offers))
+
+(deftest product-identity-is-delegated
+  (testing "canonical ids come from product-party, so a bad check digit
+            cannot enter the catalog through this door"
+    (is (= "gtin.05449000000996" product))
+    (is (true? (pp/valid-gtin? (pp/normalize-gtin gtin))))
+    (testing "product-party's valid-product-id? verifies the GS1 mod-10 check
+              digit, so a well-shaped but arithmetically impossible GTIN is
+              rejected here without this namespace implementing GS1 at all"
+      (let [bad (catalog/offer {:product "gtin.99999999999999" :seller "merchant.a"
+                                :price-minor 100 :currency "JPY"})]
+        (is (some #(= :invalid-product-id (:offer.error/code %))
+                  (catalog/offer-errors bad)))))
+    (let [bad-shape (catalog/offer {:product "not-a-product" :seller "merchant.a"
+                                    :price-minor 100 :currency "JPY"})]
+      (is (some #(= :invalid-product-id (:offer.error/code %))
+                (catalog/offer-errors bad-shape))))))
+
+(deftest offer-validation
+  (testing "money is integer minor units — a float price is refused"
+    (is (some #(= :invalid-price (:offer.error/code %))
+              (catalog/offer-errors (o "merchant.a" 12.5)))))
+  (testing "negative price is refused"
+    (is (some #(= :invalid-price (:offer.error/code %))
+              (catalog/offer-errors (o "merchant.a" -1)))))
+  (testing "in-stock with zero quantity is self-contradictory"
+    (is (some #(= :in-stock-with-zero-quantity (:offer.error/code %))
+              (catalog/offer-errors (o "merchant.a" 100 :qty 0)))))
+  (testing "currency must be ISO-4217 alpha-3"
+    (is (some #(= :invalid-currency (:offer.error/code %))
+              (catalog/offer-errors (catalog/offer {:product product :seller "merchant.a"
+                                                    :price-minor 100 :currency "yen"}))))))
+
+(deftest many-sellers-one-product
+  (let [c (cat-with (o "merchant.a" 1200) (o "merchant.b" 1100) (o "merchant.c" 1300))]
+    (is (= 3 (count (catalog/offers-for-product c product))))
+    (is (= ["merchant.a" "merchant.b" "merchant.c"]
+           (catalog/sellers-for-product c product))
+        "this is the affordance the fleet lacked: N sellers on one canonical product")
+    (is (= 1 (count (catalog/offers-by-seller c "merchant.a"))))))
+
+(deftest buy-box-is-cheapest-and-reproducible
+  (let [c (cat-with (o "merchant.a" 1200) (o "merchant.b" 1100) (o "merchant.c" 1300))
+        bb (catalog/buy-box c product)]
+    (is (= "merchant.b" (:offer/seller (:buy-box/winner bb))))
+    (is (= ["merchant.b" "merchant.a" "merchant.c"]
+           (mapv :offer/seller (:buy-box/ranked bb))))
+    (testing "the ranking is total and deterministic — re-running gives the same order"
+      (is (= (:buy-box/ranked bb) (:buy-box/ranked (catalog/buy-box c product)))))))
+
+(deftest buy-box-tie-breaks-are-observable
+  (testing "equal price falls to condition, then lead time, then id"
+    (let [c (cat-with (o "merchant.a" 1000 :condition :used-good)
+                      (o "merchant.b" 1000 :condition :new))]
+      (is (= "merchant.b" (:offer/seller (:buy-box/winner (catalog/buy-box c product))))))
+    (let [c (cat-with (o "merchant.a" 1000 :lead 5) (o "merchant.b" 1000 :lead 1))]
+      (is (= "merchant.b" (:offer/seller (:buy-box/winner (catalog/buy-box c product))))))
+    (testing "an offer with no stated lead time sorts last, not first"
+      (let [c (cat-with (o "merchant.a" 1000) (o "merchant.b" 1000 :lead 9))]
+        (is (= "merchant.b" (:offer/seller (:buy-box/winner (catalog/buy-box c product)))))))))
+
+(deftest buy-box-uses-landed-price-when-shipping-known
+  (let [c (cat-with (o "merchant.a" 1000) (o "merchant.b" 900))
+        ;; b is cheaper on the item but dearer once shipping is counted.
+        bb (catalog/buy-box c product
+                            {:shipping {(:offer/id (o "merchant.a" 1000)) 0
+                                        (:offer/id (o "merchant.b" 900)) 500}})]
+    (is (= "merchant.a" (:offer/seller (:buy-box/winner bb))))
+    (is (true? (:buy-box/landed? bb))
+        "the result records that it compared landed prices, not bare prices")))
+
+(deftest buy-box-excludes-and-says-why
+  (let [c (cat-with (o "merchant.a" 1000 :availability :backorder)
+                    (o "merchant.b" 1100))
+        bb (catalog/buy-box c product)]
+    (is (= "merchant.b" (:offer/seller (:buy-box/winner bb))))
+    (is (= [:not-in-stock] (mapv :reason (:buy-box/excluded bb)))))
+  (testing "an ineligible seller can never take the buy box"
+    (let [c (cat-with (o "merchant.a" 900) (o "merchant.b" 1100))
+          bb (catalog/buy-box c product
+                              {:eligible? #(= "merchant.b" (:offer/seller %))})]
+      (is (= "merchant.b" (:offer/seller (:buy-box/winner bb))))
+      (is (= [:seller-ineligible] (mapv :reason (:buy-box/excluded bb)))))))
+
+(deftest mixed-currency-is-refused-not-converted
+  (let [c (-> (catalog/empty-catalog)
+              (catalog/add-offer (o "merchant.a" 1000))
+              (catalog/add-offer (catalog/offer {:product product :seller "merchant.b"
+                                                 :price-minor 9 :currency "USD"})))
+        bb (catalog/buy-box c product)]
+    (is (nil? (:buy-box/winner bb))
+        "no FX rate exists here, so inventing a comparison would be fabrication")
+    (is (= #{:mixed-currency} (set (map :reason (:buy-box/excluded bb)))))
+    (is (nil? (:buy-box/currency bb)))))
+
+(deftest remove-offer-clears-the-product-index
+  (let [offer-a (o "merchant.a" 1000)
+        c (-> (cat-with offer-a (o "merchant.b" 1100))
+              (catalog/remove-offer (:offer/id offer-a)))]
+    (is (= ["merchant.b"] (catalog/sellers-for-product c product)))
+    (is (= c (catalog/remove-offer c "offer.nonexistent")) "removing an unknown id is a no-op")))
+
+(deftest add-offer-refuses-invalid
+  (is (thrown? js/Error
+               (catalog/add-offer (catalog/empty-catalog) (o "merchant.a" -5)))))
+
+(deftest merchant-edge-never-asserts-brand-ownership
+  (let [e (catalog/->merchant-edge (o "merchant.a" 1000))]
+    (is (= :merchant (:party.product/role e)))
+    (is (= :representative (:party.product/sourcing e))
+        "an offer is a merchant's own claim, not an authoritative brand fact")
+    (is (not= :brand-owner (:party.product/role e)))
+    (testing "an out-of-stock offer projects as a revoked edge"
+      (is (= :revoked (:party.product/status
+                       (catalog/->merchant-edge (o "merchant.a" 1000 :availability :out-of-stock))))))))

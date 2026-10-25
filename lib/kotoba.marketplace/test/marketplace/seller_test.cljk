@@ -1,0 +1,157 @@
+(ns marketplace.seller-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [ekyc.model :as ekyc-model]
+            [marketplace.seller :as seller]))
+
+(def issuer "did:web:marketplace.example")
+(def other-issuer "did:web:other.example")
+
+(defn- ekyc-session [required]
+  (ekyc-model/session "sess-1" "subj-1" {:required-checks required
+                                         :provider :test}))
+
+(defn- verified-evidence [session checks]
+  (mapv #(ekyc-model/evidence session % :verified {:evidence-ref (str "ref-" (name %))})
+        checks))
+
+(defn- aml-clear []
+  [{:aml/route :yabai :aml/level :clear :aml/non-adjudicating true}])
+
+(defn- summary [kind checks aml]
+  (let [needed (seller/required-checks kind)
+        s (ekyc-session needed)]
+    (seller/evidence-summary {:ekyc-session s
+                              :ekyc-evidence (verified-evidence s checks)
+                              :aml-results aml})))
+
+(defn- cred
+  ([kind checks aml] (cred kind checks aml {}))
+  ([kind checks aml overrides]
+   (seller/credential
+    (merge {:id "merchant.riverside"
+            :kind kind
+            :legal-name "Riverside Trading K.K."
+            :country "JPN"
+            :issuer issuer
+            :issued-at "2026-01-01T00:00:00Z"
+            :expires-at "2027-01-01T00:00:00Z"
+            :status :issued
+            :payout-bound? true
+            :evidence (summary kind checks aml)}
+           overrides))))
+
+(deftest evidence-summary-delegates-to-upstream
+  (testing "eKYC completion and AML status are delegated, not reimplemented"
+    (let [s (summary :company #{:document-authenticity :sanctions} (aml-clear))]
+      (is (true? (:evidence/ekyc-complete? s)))
+      (is (= :clear (:evidence/aml-status s)))
+      (is (= #{:document-authenticity :sanctions} (:evidence/verified-checks s)))
+      (is (empty? (:evidence/missing-checks s)))))
+  (testing "an unscreened seller is :not-run, distinct from :clear"
+    (is (= :not-run (:evidence/aml-status
+                     (summary :company #{:document-authenticity :sanctions} []))))))
+
+(deftest evidence-floor-is-re-derived-not-trusted
+  (testing "a credential whose issuer verified fewer checks than this protocol's
+            floor is refused AT THE RECEIVING INSTANCE"
+    ;; The issuer only ran :document-authenticity. Its own eKYC session
+    ;; would report complete? for ITS floor, but ours also needs
+    ;; :sanctions (and :liveness for an individual).
+    (let [c (cred :individual #{:document-authenticity} (aml-clear))
+          errs (seller/credential-errors c)]
+      (is (some #(= :insufficient-evidence (:seller.error/code %)) errs))
+      (is (= :refused (:admission/outcome (seller/admission c "2026-06-01T00:00:00Z"))))))
+  (testing "a company needs a smaller check set than an individual — liveness
+            is meaningless for a corporate applicant"
+    (is (= #{:document-authenticity :sanctions} (seller/required-checks :company)))
+    (is (contains? (seller/required-checks :individual) :liveness))
+    (is (empty? (seller/credential-errors
+                 (cred :company #{:document-authenticity :sanctions} (aml-clear)))))))
+
+(deftest aml-hold-refuses-and-review-escalates
+  (let [hold [{:aml/route :yabai :aml/level :deny :aml/non-adjudicating true}]
+        review [{:aml/route :yabai :aml/level :monitor :aml/non-adjudicating true}]
+        checks #{:document-authenticity :sanctions}]
+    (is (= :refused (:admission/outcome
+                     (seller/admission (cred :company checks hold) "2026-06-01T00:00:00Z"))))
+    (testing "an AML review level is a human gate, not a structural refusal"
+      (let [adm (seller/admission (cred :company checks review) "2026-06-01T00:00:00Z")]
+        (is (= :review (:admission/outcome adm)))
+        (is (some #{:aml-review} (:admission/reasons adm)))))
+    (testing "no screening at all is refused, never silently treated as clear"
+      (is (= :refused (:admission/outcome
+                       (seller/admission (cred :company checks []) "2026-06-01T00:00:00Z")))))))
+
+(deftest expiry-boundary-is-inclusive
+  (let [c (cred :company #{:document-authenticity :sanctions} (aml-clear))]
+    (is (false? (seller/expired? c "2026-12-31T23:59:59Z")))
+    (testing "a credential expiring exactly now is already expired — it cannot
+              be used for one more transaction on the boundary tick"
+      (is (true? (seller/expired? c "2027-01-01T00:00:00Z")))
+      (is (false? (seller/active? c "2027-01-01T00:00:00Z")))
+      (is (= :refused (:admission/outcome (seller/admission c "2027-01-01T00:00:00Z")))))))
+
+(deftest foreign-issuer-is-usable-but-not-auto-trusted
+  (let [c (cred :company #{:document-authenticity :sanctions} (aml-clear))]
+    (testing "at its home instance it is admissible"
+      (is (= :admissible (:admission/outcome (seller/admission c "2026-06-01T00:00:00Z" issuer)))))
+    (testing "at a foreign instance it downgrades to review, not refusal —
+              federation means usable, not automatically trusted"
+      (let [adm (seller/admission c "2026-06-01T00:00:00Z" other-issuer)]
+        (is (= :review (:admission/outcome adm)))
+        (is (some #{:foreign-issuer} (:admission/reasons adm)))))))
+
+(deftest sellable-requires-both-identity-and-payout
+  (let [checks #{:document-authenticity :sanctions}
+        ok      (cred :company checks (aml-clear))
+        unbound (cred :company checks (aml-clear) {:payout-bound? false})]
+    (is (true? (seller/sellable? ok "2026-06-01T00:00:00Z" issuer)))
+    (testing "identity-verified but not payout-bound is NOT sellable — the same
+              gate ISIC 4791 applies with :payment-processor-linked?"
+      (is (false? (seller/sellable? unbound "2026-06-01T00:00:00Z" issuer))))))
+
+(deftest status-gates
+  (let [checks #{:document-authenticity :sanctions}
+        at "2026-06-01T00:00:00Z"]
+    (is (= :refused (:admission/outcome
+                     (seller/admission (cred :company checks (aml-clear) {:status :revoked}) at))))
+    (is (= :review (:admission/outcome
+                    (seller/admission (cred :company checks (aml-clear) {:status :suspended}) at))))
+    (is (= :review (:admission/outcome
+                    (seller/admission (cred :company checks (aml-clear) {:status :draft}) at))))))
+
+(deftest invalid-shapes-are-refused
+  (let [checks #{:document-authenticity :sanctions}
+        at "2026-06-01T00:00:00Z"]
+    (testing "seller id must be carryable into the product-party graph"
+      (is (= :refused (:admission/outcome
+                       (seller/admission (cred :company checks (aml-clear) {:id "seller-1"}) at)))))
+    (testing "issuer must be a resolvable instance did"
+      (is (= :refused (:admission/outcome
+                       (seller/admission (cred :company checks (aml-clear) {:issuer "example.com"}) at)))))
+    (testing "country must be ISO-3166 alpha-3"
+      (is (= :refused (:admission/outcome
+                       (seller/admission (cred :company checks (aml-clear) {:country "JP"}) at)))))))
+
+(deftest portability-carries-no-documents
+  (let [c (cred :company #{:document-authenticity :sanctions} (aml-clear))
+        env (seller/portability-envelope c "2026-06-01T00:00:00Z")]
+    (is (true? (:portability/verifiable-without-issuer? env)))
+    (is (false? (:portability/carries-documents? env)))
+    (testing "the envelope round-trips into a receiving instance's decision"
+      (let [acc (seller/accept-envelope env "2026-06-01T00:00:00Z" other-issuer)]
+        (is (empty? (:accept/errors acc)))
+        (is (= :review (:admission/outcome (:accept/admission acc))))))
+    (testing "at the home instance the same envelope is admissible"
+      (is (= :admissible (:admission/outcome
+                          (:accept/admission
+                           (seller/accept-envelope env "2026-06-01T00:00:00Z" issuer))))))))
+
+(deftest malformed-envelope-is-distinguished-from-refusable-credential
+  (let [c (cred :company #{:document-authenticity :sanctions} (aml-clear))
+        env (assoc (seller/portability-envelope c "2026-06-01T00:00:00Z")
+                   :portability/version 99)
+        acc (seller/accept-envelope env "2026-06-01T00:00:00Z" issuer)]
+    (is (seq (:accept/errors acc)))
+    (is (nil? (:accept/admission acc))
+        "a malformed envelope yields no admission decision at all")))
