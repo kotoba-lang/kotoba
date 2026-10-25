@@ -1,0 +1,149 @@
+(ns wasm-suite
+  "Run this engine's own tests INSIDE wasm32, in chunks.
+
+  A wasm32 module may carry at most 256 typed ABI literals (`browser-host.mjs`
+  rejects more with `too many typed ABI literals`). The engine is close enough
+  to that ceiling that the build which also carries all 170 test functions --
+  each holding its JavaScript source as a string -- goes over it.
+
+  Restricting the EXPORT list does not help, and that is worth stating
+  precisely because it is the opposite of how unreachable functions behave:
+  measured 2026-08-29, a build that DEFINES 170 tests and exports 3 still
+  exceeds the ceiling, while a build that physically contains only those 3
+  passes. Function bodies are dropped when unreachable; their literals are
+  not.
+
+  So the split is physical: the source is sliced into chunks of test
+  functions, each chunk compiled and run on its own.
+
+  Run:  kbb --backend sci test/wasm-suite.cljk [chunk-size]
+
+  Exit: 0 every test passed, 1 a test failed, 2 the harness could NOT answer
+  (no compiler, no host) -- which is not the same as passing and must never
+  be read as such."
+  (:require [clojure.string :as str]
+            ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:path" :as path]
+            ["node:child_process" :as cp]))
+
+;; Run from the repository root; the refusals below are what catch it when
+;; that is not true, rather than a path guess that silently points elsewhere.
+(def repo (path/resolve (js/process.cwd)))
+(def amu (path/resolve repo ".." "amu"))
+(def source (path/join repo "src" "ecma262.kotoba"))
+(def host (path/join amu "runtime" "browser-host.mjs"))
+
+(defn- run [cmd args opts]
+  (let [r (cp/spawnSync cmd (clj->js args)
+                        (clj->js (merge {:encoding "utf8" :maxBuffer 33554432} opts)))]
+    {:status (.-status r) :out (or (.-stdout r) "") :err (or (.-stderr r) "")}))
+
+(defn- refuse! [why]
+  (println (str "REFUSING to report a pass: " why))
+  (js/process.exit 2))
+
+(defn- compiler
+  "The compiler, chosen by RUNNING it rather than by `which`. bin/kotoba's
+  shebang resolves nbb through npx, which on some machines exits 194 with no
+  output at all -- a check that only looked for the file would report a pass
+  it never measured."
+  []
+  (let [direct (run "kotoba" ["--help"] {})]
+    (if (zero? (or (:status direct) 1))
+      ["kotoba"]
+      (let [viaNbb (run "nbb" [(path/join amu "bin" "kotoba") "--help"] {:cwd amu})]
+        (if (zero? (or (:status viaNbb) 1))
+          ["nbb" (path/join amu "bin" "kotoba")]
+          (refuse! (str "no working Kotoba compiler: `kotoba` and `nbb "
+                        (path/join amu "bin" "kotoba") "` both failed")))))))
+
+(defn- slice
+  "Engine plus one contiguous run of test functions, exporting exactly those.
+
+  Everything ABOVE the first `(defn test-` is carried into every chunk; a
+  helper defined below it belongs to whichever chunk happens to contain the
+  test it was written next to, and the other chunks fail to compile where they
+  call it. Measured 2026-08-29: `dom-is` was written beside the tests that use
+  it and the last chunk -- the only one without it -- failed with `operation
+  has no admitted lowering`. Put test helpers above the first test."
+  [src from n]
+  (let [marker ";; tests -- each runs"
+        cut (str/index-of src marker)
+        head (subs src 0 cut)
+        tail (subs src cut)
+        ;; Anchored to a line start. Unanchored, the first PROSE mention of
+        ;; the marker became the boundary -- measured 2026-08-29, when a
+        ;; comment explaining this very rule cut the helpers off above itself.
+        first-test (inc (str/index-of tail "\n(defn test-"))
+        helpers (subs tail 0 first-test)
+        blocks (->> (str/split (subs tail first-test) #"(?=\n\(defn test-)")
+                    (map str/trim)
+                    (remove str/blank?)
+                    vec)
+        chunk (vec (take n (drop from blocks)))
+        names (map #(second (re-find #"\(defn (test-[a-z0-9-]+)" %)) chunk)]
+    (when (seq chunk)
+      {:names names
+       :source (str/replace-first
+                (str head helpers (str/join "\n" chunk) "\n")
+                #"\(:export \[[^\]]*\]\)"
+                (str "(:export [main " (str/join " " names) "])"))})))
+
+(defn- run-chunk [kc idx {:keys [names source]}]
+  (let [dir (fs/mkdtempSync (path/join (os/tmpdir) "ecma262-wasm-"))
+        src (path/join dir "chunk.kotoba")
+        out (path/join dir "chunk.wasm")]
+    (fs/writeFileSync src source)
+    (let [c (run (first kc) (concat (rest kc)
+                                    ["-M" "compile" src "--target" "wasm32-browser"
+                                     "--fuel" "4000000000" "--output" out])
+                 {:cwd amu})]
+      (if-not (fs/existsSync out)
+        {:idx idx :error (str "compile failed: " (str/trim (str (:err c) (:out c))))}
+        (let [probe (str "import('" (str "file://" host) "').then(async m => {"
+                         "const fsx = await import('node:fs');"
+                         "const i = await m.instantiateKotoba(fsx.readFileSync('" out "'));"
+                         "const ex = i.instance.exports;"
+                         "const bad = Object.keys(ex).filter(n => n.startsWith('test-'))"
+                         ".filter(n => { const v = ex[n](); return !(v === 1n || v === 1); });"
+                         "console.log(JSON.stringify(bad));"
+                         "}).catch(e => { console.log('HOSTFAIL ' + (e.cause ? e.cause.message : e.message)); })")
+              p (run "node" ["--input-type=module" "-e" probe] {:cwd amu})
+              text (str/trim (:out p))]
+          (cond
+            (str/starts-with? text "HOSTFAIL") {:idx idx :error text}
+            (str/blank? text) {:idx idx :error (str "no answer from the host: " (str/trim (:err p)))}
+            :else {:idx idx :total (count names) :failed (js->clj (js/JSON.parse text))}))))))
+
+(defn -main []
+  (when-not (fs/existsSync source) (refuse! (str "no engine source at " source)))
+  (when-not (fs/existsSync host) (refuse! (str "no browser host at " host)))
+  (let [size (js/parseInt (or (first *command-line-args*) "40"))
+        kc (compiler)
+        src (fs/readFileSync source "utf8")
+        chunks (loop [from 0 acc []]
+                 (if-let [c (slice src from size)]
+                   (recur (+ from size) (conj acc c))
+                   acc))]
+    (when (empty? chunks) (refuse! "the source yielded no test chunks"))
+    (println (str "CHUNKS\t" (count chunks) "\tof up to " size " tests each"))
+    (loop [[c & more] (map-indexed vector chunks) total 0 failed [] broke []]
+      (if (nil? c)
+        (do
+          (println (str "SCANNED\t" total "\ttests inside wasm32"))
+          (println (str (- total (count failed)) "/" total " pass"))
+          (when (seq failed) (println (str "FAILED: " (str/join " " failed))))
+          (when (seq broke) (doseq [b broke] (println (str "CHUNK ERROR: " b))))
+          (js/process.exit (cond (seq broke) 2 (seq failed) 1 :else 0)))
+        (let [[idx chunk] c
+              r (run-chunk kc idx chunk)]
+          (if (:error r)
+            (do (println (str "  chunk " idx ": ERROR"))
+                (recur more total failed (conj broke (:error r))))
+            (do (println (str "  chunk " idx ": "
+                              (- (:total r) (count (:failed r))) "/" (:total r)))
+                (recur more (+ total (:total r))
+                       (into failed (:failed r)) broke))))))))
+
+(-main)

@@ -1,0 +1,121 @@
+(ns aozora.pds.push
+  "Best-effort Web Push fan-out for new messages (ADR: push-notifications
+  plan). Wired ONLY into aozora.pds.convo/send-message — NOT into
+  send-key-distribution: a sender-key distribution always co-occurs with an
+  actual send-message call in the same user action (aozora.pds.convo's
+  send-key-distribution docstring; yoro-ui.interop.signal-group's
+  ensure-sender-key! runs as a pre-send check immediately before the visible
+  message), so pushing on both would double-notify the same recipients for
+  one logical event. The message's own push already covers it.
+
+  Fire-and-forget from the caller: every failure here (missing VAPID config,
+  an expired subscription, a network error) is caught and logged, never
+  thrown — a push failure must never fail or delay the authoritative write."
+  (:require [aozora.pds.webpush :as webpush]
+            [aozora.appview.push :as appview-push]
+            [aozora.pds.per-actor :as per-actor]
+            [aozora.pds.repo :as repo]))
+
+(defn- non-blank [s] (when (and (string? s) (seq s)) s))
+
+(defn- vapid-config [^js env]
+  (let [priv (non-blank (.-VAPID_PRIVATE_KEY env))
+        pub (non-blank (.-VAPID_PUBLIC_KEY env))]
+    (when (and priv pub env)
+      {:private-jwk (js->clj (js/JSON.parse priv) :keywordize-keys true)
+       :public-key pub
+       :subject (or (non-blank (.-VAPID_SUBJECT env)) "mailto:ops@aozora.app")})))
+
+(defn- endpoint-origin [endpoint] (.-origin (js/URL. endpoint)))
+
+(defn- dead-status?
+  "404/410 means the push service itself says this subscription is
+  permanently gone (browser unsubscribed, or the endpoint expired) —
+  distinct from a transient failure (network error, 5xx, rate limit) that
+  must NOT trigger cleanup, since those subscriptions are still good."
+  [status]
+  (or (= 404 status) (= 410 status)))
+
+(defn- post-one!
+  "Deliver one payload to one subscription. Promise<{:ok bool :dead? bool}>,
+  never rejects — an individual dead/expired subscription must not sink the
+  rest of the fan-out."
+  [{:keys [private-jwk public-key subject]} {:keys [endpoint p256dh auth]} payload-str]
+  (-> (js/Promise.all #js [(webpush/encrypt-payload p256dh auth payload-str)
+                           (webpush/vapid-authorization-header
+                            private-jwk public-key (endpoint-origin endpoint) subject)])
+      (.then (fn [^js pair]
+               (js/fetch endpoint #js {:method "POST"
+                                       :headers #js {"content-encoding" "aes128gcm"
+                                                     "content-type" "application/octet-stream"
+                                                     "ttl" "86400"
+                                                     "authorization" (aget pair 1)}
+                                       :body (aget pair 0)})))
+      (.then (fn [^js resp] {:ok (.-ok resp) :dead? (dead-status? (.-status resp))}))
+      (.catch (fn [^js e]
+                (js/console.error "aozora push: delivery failed" (.-message e))
+                {:ok false :dead? false}))))
+
+(defn- cleanup-dead-subscription!
+  "Deletes a subscription record confirmed dead by post-one!'s status check.
+  Same collection/rkey convention as aozora.pds.pushsub/unsubscribe, but
+  called from this fire-and-forget fan-out context (no authenticated
+  session to check) rather than through that self-service XRPC handler."
+  [client db {:keys [did deviceId]}]
+  (when (and did deviceId)
+    (-> (repo/delete-record client db {:repo did
+                                       :collection "app.aozora.push.subscription"
+                                       :rkey (str "sub-" deviceId)})
+        (.catch (fn [^js e] (js/console.error "aozora push: dead-subscription cleanup failed" (.-message e)) nil)))))
+
+(defn- deliver-and-cleanup!
+  [client db vapid subscription payload]
+  (-> (post-one! vapid subscription payload)
+      (.then (fn [{:keys [dead?]}]
+               (when dead? (cleanup-dead-subscription! client db subscription))))))
+
+(defn- push-body [kind]
+  (if (= "group" kind) "新しいグループメッセージがあります" "新しいメッセージがあります"))
+
+(defn notify-new-message!
+  "Best-effort push to every OTHER member of `convo-id` after a successful
+  aozora.pds.convo/send-message write. `env` is the handler's `:_env` (nil in
+  tests/local dev without a Worker Env — a no-op then, not an error). Always
+  resolves, never rejects; callers fire this without awaiting it."
+  [^js env {:keys [convo-id sender-did]}]
+  (let [vapid (vapid-config env)]
+    (if (nil? vapid)
+      (js/Promise.resolve nil)
+      (let [[appview-client appview-db] (per-actor/appview-client-db env)]
+        (-> (appview-push/push-targets-for-convo appview-client appview-db convo-id sender-did)
+            (.then (fn [{:keys [kind subscriptions]}]
+                     (when (seq subscriptions)
+                       (let [payload (js/JSON.stringify #js {:title "aozora" :body (push-body kind) :convoId convo-id})]
+                         (js/Promise.all (into-array (map #(deliver-and-cleanup! appview-client appview-db vapid % payload) subscriptions)))))))
+            (.catch (fn [^js e] (js/console.error "aozora push: fan-out failed" (.-message e)) nil)))))))
+
+(defn notify-sealed-message!
+  "Best-effort push to `to-did` directly after a successful
+  aozora.pds.convo/send-sealed-message write. Doesn't resolve a convo-member
+  roster (would leak sealed-sender's whole point — who's in the convo — into
+  a code path that only needs to know one already-explicit recipient); the
+  push body stays as generic as the regular path's, never hinting a sender.
+  Same fire-and-forget/never-rejects contract as notify-new-message!.
+
+  Called ONLY for intro-route (toDid-addressed) sealed messages. Mailbox-
+  route messages (ADR-2610081200 R1 — addressed by an opaque session mailbox
+  id) are deliberately NOT pushed: resolving a mailbox id to a push
+  subscription would need a stored mailbox→DID mapping, which is exactly
+  the linkage that route exists to avoid. Recipients poll
+  listSealedMessages for them instead."
+  [^js env {:keys [convo-id to-did]}]
+  (let [vapid (vapid-config env)]
+    (if (nil? vapid)
+      (js/Promise.resolve nil)
+      (let [[appview-client appview-db] (per-actor/appview-client-db env)]
+        (-> (appview-push/subscriptions-for-did appview-client appview-db to-did)
+            (.then (fn [subscriptions]
+                     (when (seq subscriptions)
+                       (let [payload (js/JSON.stringify #js {:title "aozora" :body (push-body "dm") :convoId convo-id})]
+                         (js/Promise.all (into-array (map #(deliver-and-cleanup! appview-client appview-db vapid % payload) subscriptions)))))))
+            (.catch (fn [^js e] (js/console.error "aozora push: sealed fan-out failed" (.-message e)) nil)))))))

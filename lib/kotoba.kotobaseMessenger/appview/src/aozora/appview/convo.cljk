@@ -1,0 +1,469 @@
+(ns aozora.appview.convo
+  "Read projections for app.aozora.convo.* records.
+
+  Messenger state is projected from the same kotobase scan as the social feed,
+  but filtered by explicit convo collections."
+  (:require [kotoba.lang.text :as str]
+            [aozora.appview.scan :as scan]
+            [aozora.appview.feed :as feed]))
+
+(defn- clamp [n lo hi] (max lo (min hi n)))
+
+(defn- convo-records [records]
+  (->> records
+       (filter #(= "app.aozora.convo.message" (:collection %)))
+       (map :value)
+       (filter map?)))
+
+(defn- receipt-records [records]
+  (->> records
+       (filter #(= "app.aozora.convo.readReceipt" (:collection %)))
+       (map :value)
+       (filter map?)))
+
+(defn- reaction-records [records]
+  (->> records
+       (filter #(= "app.aozora.convo.reaction" (:collection %)))
+       (map :value)
+       (filter map?)))
+
+(defn- attachment-records [records]
+  (->> records
+       (filter #(= "app.aozora.convo.attachment" (:collection %)))
+       (map :value)
+       (filter map?)))
+
+(defn- typing-records [records]
+  (->> records
+       (filter #(= "app.aozora.convo.typing" (:collection %)))
+       (map :value)
+       (filter map?)))
+
+(defn- key-distribution-records [records]
+  (->> records
+       (filter #(= "app.aozora.convo.keyDistribution" (:collection %)))
+       (map :value)
+       (filter map?)))
+
+(defn- sealed-message-records [records]
+  (->> records
+       (filter #(= "app.aozora.convo.sealedMessage" (:collection %)))
+       (map :value)
+       (filter map?)))
+
+(defn- preference-records-for
+  "app.aozora.convo.convoPreference records AUTHORED by `did` — filtered by
+  the scan row's own author (:did, per aozora.pds.encode/record->entity*'s
+  did-from-uri), not a claimed :value field. A preference record only ever
+  describes the AUTHOR's own mute/archive/pin state (unlike group
+  membership, there's no separate \"who's allowed to assert this\" question —
+  self-sovereign by construction), so simple author-filtering is enough."
+  [records did]
+  (->> records
+       (filter #(= "app.aozora.convo.convoPreference" (:collection %)))
+       (filter #(= did (:did %)))
+       (keep :value)
+       (filter map?)
+       (reduce (fn [acc p] (assoc acc (:convoId p) p)) {})))
+
+(defn- convo-metadata [records]
+  (->> records
+       (filter #(= "app.aozora.convo.convo" (:collection %)))
+       (map :value)
+       (filter map?)))
+
+(defn- member-records-raw
+  "app.aozora.convo.member rows with the AUTHOR did preserved (the record's
+  top-level scan-row :did — the repo that actually signed the write, per
+  aozora.pds.encode/record->entity*'s did-from-uri — as :authorDid), not just
+  the claimed :value. A record's OWN :did field only says who it CLAIMS is a
+  member; it says nothing about who's allowed to make that claim."
+  [records]
+  (->> records
+       (filter #(= "app.aozora.convo.member" (:collection %)))
+       (keep (fn [r] (when (map? (:value r)) (assoc (:value r) :authorDid (:did r)))))))
+
+(defn- creator-by-convo [records]
+  (reduce (fn [acc c] (assoc acc (:convoId c) (:creatorDid c))) {} (convo-metadata records)))
+
+(defn- member-records
+  "Only membership records AUTHORED by the convo's creator are trusted. A
+  membership claim written under any OTHER actor's own repo — whether via a
+  buggy/malicious direct com.atproto.repo.createRecord call, or a rogue
+  aozora.pds.convo/add-member request — is a self-asserted, unverifiable
+  claim (repos are self-sovereign; anyone can write ANY collection under
+  their own did) and must never be projected as real group membership. The
+  PDS-side add-member/remove-member creator check (aozora.pds.convo) is the
+  first line of defense; this is the one that actually closes the hole,
+  since it also covers writes that bypass the dedicated procedure entirely."
+  [records]
+  (let [creators (creator-by-convo records)]
+    (->> (member-records-raw records)
+         (filter #(= (get creators (:convoId %)) (:authorDid %))))))
+
+(defn- message->view [m profiles handles]
+  {:convoId (or (:convoId m) "")
+   :rkey (or (:rkey m) "")
+   :senderDid (or (:senderDid m) "")
+   :sender (scan/profile-row->view (or (:senderDid m) "") profiles handles)
+   :text (or (:text m) "")
+   :createdAt (or (:createdAt m) "")
+   :editedAt (or (:editedAt m) "")
+   :replyTo (or (:replyTo m) "")
+   :kind (or (:kind m) "")
+   :contentType (or (:contentType m) "")
+   :encryption (or (:encryption m) "")
+   :facets (or (:facets m) [])
+   :hasEmbed (some? (:embed m))})
+
+(defn- own-message
+  "The caller's own app.aozora.convo.message record for (convoId, rkey) —
+  filtered by the scan row's own author (:did, per aozora.pds.encode/
+  record->entity*'s did-from-uri), same reasoning as block-records-by/
+  preference-records-for, even though message->view above trusts the raw
+  :senderDid claim inside :value for DISPLAY (a pre-existing gap, out of
+  scope here) — edit-message's own-record lookup shouldn't inherit that gap
+  just because the display path already has it."
+  [records did convo-id rkey]
+  (->> records
+       (filter #(= "app.aozora.convo.message" (:collection %)))
+       (filter #(= did (:did %)))
+       (keep :value)
+       (filter map?)
+       (filter #(and (= convo-id (:convoId %)) (= rkey (:rkey %))))
+       first))
+
+(defn get-own-message
+  "Promise<message-value-or-nil>. Used by aozora.pds.convo/edit-message to
+  read-before-write: kotobase stores a record's whole value as one blob per
+  entity, so a partial create-record call for an edit would silently drop
+  every field the edit didn't touch (senderDid/createdAt/kind/contentType/
+  replyTo/encryption) — this fetches the existing value first so the PDS
+  handler can merge just the edited fields in."
+  [client db-name did convo-id rkey]
+  (-> (feed/scan-yoro client db-name)
+      (.then (fn [{:keys [records]}]
+               (own-message records did convo-id rkey)))))
+
+(defn- convo->view [c messages]
+  (let [convo-id (or (:convoId c) "")
+        last-msg (last (sort-by :createdAt messages))]
+    {:convoId convo-id
+     :kind (or (:kind c) "dm")
+     :title (or (:title c) "")
+     :encryption (or (:encryption c) "")
+     :createdAt (or (:createdAt c) "")
+     :creatorDid (or (:creatorDid c) "")
+     :members (vec (or (:members c) []))
+     :lastMessageAt (or (:lastMessageAt c) (:createdAt last-msg) "")
+     :lastMessage (when last-msg (select-keys last-msg [:senderDid :text :createdAt :rkey]))}))
+
+(defn- related-items
+  "`mapped-records` must already be collection-filtered AND :value-mapped
+  (e.g. (receipt-records records), NOT raw scan records) — a raw scan row's
+  :convoId lives inside :value, not at the top level, so filtering by
+  convo-id on a raw row silently matches nothing. This bit get-convo before:
+  every one of its receipts/reactions/attachments/members fields resolved to
+  [] regardless of what was actually stored, because it was passed raw
+  `records` directly instead of the appropriate *-records helper's output."
+  [mapped-records convo-id fields]
+  (->> mapped-records
+       (filter #(= convo-id (:convoId %)))
+       (mapv #(select-keys % fields))))
+
+(defn- receipt-by [records convo-id did]
+  (first (filter #(and (= convo-id (:convoId %)) (= did (:did %))) (receipt-records records))))
+
+(defn- unread-count [messages receipt]
+  (let [last-seen (some-> receipt :lastSeenRkey)]
+    (if (str/blank? (or last-seen ""))
+      (count messages)
+      (count (drop-while #(not= last-seen (:rkey %)) messages)))))
+
+(defn- rkey-position [messages rkey]
+  (when rkey
+    (some (fn [[i m]] (when (= (:rkey m) rkey) i)) (map-indexed vector messages))))
+
+(defn list-messages
+  "GET app.aozora.convo.listMessages. `before` is a cursor (the :rkey of the
+  oldest message already loaded) for fetching the next, older page — same
+  semantics as get-convo's own `before`/`limit`/`cursor`/`hasMore`."
+  [client db-name {:keys [convoId limit before]}]
+  (let [lim (clamp (or limit 50) 1 200)]
+    (-> (feed/scan-yoro client db-name)
+        (.then (fn [{:keys [records profiles handles]}]
+                 (let [all-messages (->> (convo-records records)
+                                         (filter #(or (nil? convoId) (= convoId (:convoId %))))
+                                         (sort-by :createdAt)
+                                         (mapv #(message->view % profiles handles)))
+                       before-idx (rkey-position all-messages before)
+                       older (if before-idx (subvec all-messages 0 before-idx) all-messages)
+                       page (vec (take-last lim older))
+                       has-more (> (count older) (count page))]
+                   {:messages page
+                    :cursor (when has-more (:rkey (first page)))
+                    :hasMore (boolean has-more)}))))))
+
+(defn- with-preference [convo-view prefs]
+  (let [p (get prefs (:convoId convo-view))]
+    (assoc convo-view
+           :muted (boolean (:muted p))
+           :archived (boolean (:archived p))
+           :pinned (boolean (:pinned p)))))
+
+(defn list-convos [client db-name {:keys [limit did]}]
+  (let [lim (clamp (or limit 50) 1 200)]
+    (-> (feed/scan-yoro client db-name)
+        (.then (fn [{:keys [records profiles handles]}]
+                 (let [messages (group-by :convoId (convo-records records))
+                       prefs (preference-records-for records did)
+                       convos (->> (convo-metadata records)
+                                   (map (fn [c]
+                                          (let [convo-id (:convoId c)
+                                                msgs (get messages convo-id [])
+                                                receipt (receipt-by records convo-id did)]
+                                            (-> (convo->view c msgs)
+                                                (assoc :unreadCount (unread-count msgs receipt))
+                                                (with-preference prefs)))))
+                                   ;; newest-active first, THEN pinned first — sort-by is a
+                                   ;; STABLE sort, so applying it twice (secondary key
+                                   ;; first) composes into "pinned desc, then lastMessageAt
+                                   ;; desc" without needing a combined comparator. Archived
+                                   ;; stays IN the result — listConvos doesn't hide
+                                   ;; anything server-side, same "server doesn't decide UI
+                                   ;; policy" stance every other *Preference field here has;
+                                   ;; the caller filters archived out of the main list view.
+                                   (sort-by :lastMessageAt #(compare %2 %1))
+                                   (sort-by :pinned #(compare %2 %1))
+                                   (take lim)
+                                   vec)]
+                   {:convos (mapv #(update % :members vec) convos)}))))))
+
+(defn list-members [client db-name {:keys [convoId limit]}]
+  (let [lim (clamp (or limit 50) 1 200)]
+    (-> (feed/scan-yoro client db-name)
+        (.then (fn [{:keys [records profiles handles]}]
+                 {:members (->> (member-records records)
+                                (filter #(or (nil? convoId) (= convoId (:convoId %))))
+                                (take lim)
+                                (mapv (fn [m]
+                                        {:convoId (:convoId m)
+                                         :did (:did m)
+                                         :role (or (:role m) "member")
+                                         :joinedAt (or (:joinedAt m) "")
+                                         :member (scan/profile-row->view (:did m) profiles handles)})))})))))
+
+(defn creator-did
+  "Promise<did|nil> — the convo's creatorDid, for a caller (aozora.pds.convo's
+  add-member/remove-member) that needs to authorize a membership change
+  before writing, not to render a full convo view."
+  [client db-name convo-id]
+  (-> (feed/scan-yoro client db-name)
+      (.then (fn [{:keys [records]}]
+               (:creatorDid (first (filter #(= convo-id (:convoId %)) (convo-metadata records))))))))
+
+(defn get-convo-record
+  "Promise<convo-record-value-or-nil> — the raw stored app.aozora.convo.convo
+  record for `convo-id`, for aozora.pds.convo/update-convo's read-before-
+  write (preserve every field the update doesn't touch — kotobase stores a
+  record's whole value as one blob per entity, so a partial create-record
+  call would silently drop kind/createdAt/creatorDid/encryption/members)."
+  [client db-name convo-id]
+  (-> (feed/scan-yoro client db-name)
+      (.then (fn [{:keys [records]}]
+               (first (filter #(= convo-id (:convoId %)) (convo-metadata records)))))))
+
+(defn get-convo-preference
+  "Promise<{:muted :archived :pinned}|nil> — `did`'s own current preference
+  for `convo-id`, for aozora.pds.convo/set-convo-preference's read-before-
+  merge (setConvoPreference is a PARTIAL update; omitted fields must keep
+  their previous value, so the write handler needs to see what's already
+  there before it decides what to write)."
+  [client db-name convo-id did]
+  (-> (feed/scan-yoro client db-name)
+      (.then (fn [{:keys [records]}]
+               (get (preference-records-for records did) convo-id)))))
+
+(defn get-convo
+  "GET app.aozora.convo.getConvo. `limit`/`before` page the MESSAGES field
+  only (newest page first, oldest-first within a page) — `convo`'s own
+  :lastMessageAt/:lastMessage always reflect the true latest message
+  regardless of paging, computed from the full unpaginated set before any
+  slicing happens. `before` is a cursor: the :rkey of the oldest message
+  already loaded client-side — pass it back to fetch the next (older)
+  page. :cursor in the response is what to pass as `before` for THAT next
+  call, nil once there's nothing older left."
+  [client db-name {:keys [convoId limit before]}]
+  (let [lim (clamp (or limit 50) 1 200)]
+    (-> (feed/scan-yoro client db-name)
+        (.then (fn [{:keys [records profiles handles]}]
+                 (let [all-messages (->> (convo-records records)
+                                         (filter #(= convoId (:convoId %)))
+                                         (sort-by :createdAt)
+                                         (mapv #(message->view % profiles handles)))
+                       before-idx (rkey-position all-messages before)
+                       older (if before-idx (subvec all-messages 0 before-idx) all-messages)
+                       page (vec (take-last lim older))
+                       has-more (> (count older) (count page))
+                       convo (first (filter #(= convoId (:convoId %))
+                                            (convo-metadata records)))
+                       receipts (related-items (receipt-records records) convoId [:convoId :did :lastSeenRkey :seenAt])
+                       reactions (related-items (reaction-records records) convoId [:convoId :messageRkey :did :emoji :createdAt])
+                       attachments (related-items (attachment-records records) convoId [:convoId :messageRkey :did :uri :cid :contentType :createdAt])
+                       members (related-items (member-records records) convoId [:convoId :did :role :joinedAt :authorDid])]
+                   (if convo
+                     {:convo (assoc (convo->view convo all-messages)
+                                    :receipts receipts
+                                    :reactions reactions
+                                    :attachments attachments
+                                    :members members)
+                      :messages page
+                      :cursor (when has-more (:rkey (first page)))
+                      :hasMore (boolean has-more)}
+                     {:convo nil
+                      :messages []
+                      :notFound true})))))))
+
+(defn list-receipts [client db-name {:keys [convoId did limit]}]
+  (let [lim (clamp (or limit 50) 1 200)]
+    (-> (feed/scan-yoro client db-name)
+        (.then (fn [{:keys [records]}]
+                 {:receipts (->> (receipt-records records)
+                                 (filter #(or (nil? convoId) (= convoId (:convoId %))))
+                                 (filter #(or (nil? did) (= did (:did %))))
+                                 (take lim)
+                                 (mapv #(select-keys % [:convoId :did :lastSeenRkey :seenAt])))})))))
+
+(def ^:private typing-stale-ms
+  "A typing heartbeat older than this is treated as stale (peer likely
+  stopped without an explicit setTyping isTyping=false — tab close, crash,
+  network drop) — comfortably longer than the frontend's own re-ping
+  interval so an actively-typing peer never flickers to \"stopped\"
+  between pings."
+  8000)
+
+(defn- fresh-typing? [updated-at now-ms]
+  (when-let [t (some-> updated-at js/Date. .getTime)]
+    (< (- now-ms t) typing-stale-ms)))
+
+(defn list-typing [client db-name {:keys [convoId did]}]
+  (let [now-ms (.getTime (js/Date.))]
+    (-> (feed/scan-yoro client db-name)
+        (.then (fn [{:keys [records]}]
+                 {:typing (->> (typing-records records)
+                               (filter #(= convoId (:convoId %)))
+                               (remove #(= did (:did %)))
+                               (filter #(fresh-typing? (:updatedAt %) now-ms))
+                               (mapv #(select-keys % [:convoId :did :updatedAt])))})))))
+
+(defn list-reactions [client db-name {:keys [convoId messageRkey did limit]}]
+  (let [lim (clamp (or limit 50) 1 200)]
+    (-> (feed/scan-yoro client db-name)
+        (.then (fn [{:keys [records]}]
+                 {:reactions (->> (reaction-records records)
+                                  (filter #(or (nil? convoId) (= convoId (:convoId %))))
+                                  (filter #(or (nil? messageRkey) (= messageRkey (:messageRkey %))))
+                                  (filter #(or (nil? did) (= did (:did %))))
+                                  (take lim)
+                                  (mapv #(select-keys % [:convoId :messageRkey :did :emoji :createdAt])))})))))
+
+(defn list-attachments [client db-name {:keys [convoId messageRkey did limit]}]
+  (let [lim (clamp (or limit 50) 1 200)]
+    (-> (feed/scan-yoro client db-name)
+        (.then (fn [{:keys [records]}]
+                 {:attachments (->> (attachment-records records)
+                                    (filter #(or (nil? convoId) (= convoId (:convoId %))))
+                                    (filter #(or (nil? messageRkey) (= messageRkey (:messageRkey %))))
+                                    (filter #(or (nil? did) (= did (:did %))))
+                                    (take lim)
+                                    (mapv #(select-keys % [:convoId :messageRkey :did :uri :cid :contentType :createdAt])))})))))
+
+(defn list-key-distributions
+  "Group sender-key distributions addressed to `toDid` — at most one per
+  sender, since aozora.pds.convo/send-key-distribution writes under a
+  deterministic (convoId, toDid, fromDid) rkey, so a rotation OVERWRITES the
+  previous distribution rather than accumulating; callers never need to
+  compare multiple records from the same sender to find the newest one."
+  [client db-name {:keys [convoId toDid limit]}]
+  (let [lim (clamp (or limit 50) 1 200)]
+    (-> (feed/scan-yoro client db-name)
+        (.then (fn [{:keys [records]}]
+                 {:distributions (->> (key-distribution-records records)
+                                      (filter #(or (nil? convoId) (= convoId (:convoId %))))
+                                      (filter #(or (nil? toDid) (= toDid (:toDid %))))
+                                      (take lim)
+                                      (mapv #(select-keys % [:convoId :toDid :fromDid :text :contentType :encryption :createdAt])))})))))
+
+(def ^:private max-mailbox-ids
+  "Upper bound on mailboxIds per listSealedMessages call — one id per open
+  session is the expected shape; this only stops an unbounded filter set."
+  64)
+
+(defn- mailbox-id-set
+  "listSealedMessages' `mailboxIds` → set of non-blank ids. Accepts a vector
+  (direct handler call / JSON) or a single string, comma-separated for
+  several: the AppView router's GET parse-input keeps only the LAST value
+  of a repeated query key, so a repeated `mailboxIds=` would silently drop
+  all but one (base64url ids never contain a comma)."
+  [mailbox-ids]
+  (->> (cond
+         (string? mailbox-ids) (str/split mailbox-ids #",")
+         (sequential? mailbox-ids) mailbox-ids
+         :else [])
+       (filter string?)
+       (map str/trim)
+       (remove str/blank?)
+       (take max-mailbox-ids)
+       set))
+
+(defn list-sealed-messages
+  "app.aozora.convo.sealedMessage records for the caller — sorted
+  oldest-first like list-messages; the caller (yoro-ui.interop.signal) must
+  decrypt each `ciphertext` to learn the sender and the actual content.
+
+  Two selectors, either or both (results are the union):
+  - `toDid` (+ optional `convoId`): intro-route records (the
+    session-establishing message), which carry toDid in the clear.
+  - `mailboxIds`: mailbox-route records (ADR-2610081200 R1), which carry
+    only an opaque session mailbox id — no toDid, no convoId. The view
+    returns `mailboxId` (never `toDid`) for these. `convoId` does not
+    filter them (they have none in the clear).
+
+  With neither selector the result is empty, not every sealed message ever
+  stored (every sealedMessage record lives under the same shared
+  mailbox-repo). Nothing is persisted about who asked for which mailbox id;
+  the AppView sees that association only for the duration of the request."
+  [client db-name {:keys [convoId toDid mailboxIds limit]}]
+  (let [lim (clamp (or limit 50) 1 200)
+        to-did (when-not (str/blank? (or toDid "")) toDid)
+        mids (mailbox-id-set mailboxIds)]
+    (if (and (nil? to-did) (empty? mids))
+      (js/Promise.resolve {:messages []})
+      (-> (feed/scan-yoro client db-name)
+          (.then (fn [{:keys [records]}]
+                   {:messages (->> (sealed-message-records records)
+                                   (filter (fn [r]
+                                             (or (and to-did (= to-did (:toDid r))
+                                                      (or (nil? convoId) (= convoId (:convoId r))))
+                                                 (and (string? (:mailboxId r)) (contains? mids (:mailboxId r))))))
+                                   (sort-by :createdAt)
+                                   (take-last lim)
+                                   (mapv #(select-keys % [:convoId :rkey :toDid :mailboxId :ciphertext :createdAt])))}))))))
+
+(defn list-unread-counts [client db-name {:keys [did limit]}]
+  (let [lim (clamp (or limit 50) 1 200)]
+    (-> (feed/scan-yoro client db-name)
+        (.then (fn [{:keys [records]}]
+                 (let [messages (group-by :convoId (convo-records records))
+                       convo-ids (sort (set (concat (keys messages)
+                                                    (map :convoId (convo-metadata records))
+                                                    (map :convoId (receipt-records records)))))]
+                   {:items (->> convo-ids
+                                (take lim)
+                                (mapv (fn [convo-id]
+                                        (let [msgs (get messages convo-id [])
+                                              receipt (receipt-by records convo-id did)]
+                                          {:convoId convo-id
+                                           :unreadCount (unread-count msgs receipt)
+                                           :lastMessageAt (or (:createdAt (last msgs))
+                                                              "")})) ))})))))) 

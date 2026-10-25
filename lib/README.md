@@ -116,6 +116,20 @@ The bundled standard libraries live in this repository:
 | `org.openusd.usd` | `org.openusd.usd/src` | `kotoba.usd`, `usd.core`, `usd.usdc-bridge` (an external specification, publisher openusd.org) |
 | `org.threadgroup.thread` | `org.threadgroup.thread/src` | `thread.dispatch`, `thread.frag`, `thread.iphc`, `thread.mesh` (an external specification, publisher threadgroup.org) |
 | `org.threejs.core` | `org.threejs.core/src` | `org-threejs.core`, `org-threejs.gltf`, `org-threejs.interop`, `org-threejs.vrm` (an external specification, publisher threejs.org) |
+| `org.ecmaInternational.ecma262` | `org.ecmaInternational.ecma262/src` | `` (an external specification, publisher ecmaInternational.org) |
+| `org.ieee.du` | `org.ieee.du/src` | `` (an external specification, publisher ieee.org) |
+| `org.ieee.find` | `org.ieee.find/src` | `` (an external specification, publisher ieee.org) |
+| `kotoba.ops` | `kotoba.ops/src` | `` (Kotoba project library) |
+| `kotoba.nQuads` | `kotoba.nQuads/src` | `` (Kotoba project library) |
+| `kotoba.microsoft` | `kotoba.microsoft/src` | `` (Kotoba project library) |
+| `kotoba.meetingRecorder` | `kotoba.meetingRecorder/src` | `` (Kotoba project library) |
+| `kotoba.meet` | `kotoba.meet/src` | `` (Kotoba project library) |
+| `kotoba.llm` | `kotoba.llm/src` | `` (Kotoba project library) |
+| `kotoba.lexiconsBundle` | `kotoba.lexiconsBundle/src` | `` (Kotoba project library) |
+| `kotoba.kyber` | `kotoba.kyber/src` | `` (Kotoba project library) |
+| `kotoba.kotobaseMessenger` | `kotoba.kotobaseMessenger/src` | `` (Kotoba project library) |
+| `kotoba.kotobaUtil` | `kotoba.kotobaUtil/src` | `` (Kotoba project library) |
+| `kotoba.kotobaTime` | `kotoba.kotobaTime/src` | `` (Kotoba project library) |
 | `kotoba.kotobaSecurity` | `kotoba.kotobaSecurity/src` | `` (Kotoba project library) |
 | `kotoba.kotobaRegistry` | `kotoba.kotobaRegistry/src` | `` (Kotoba project library) |
 | `kotoba.kotobaLangOrg` | `kotoba.kotobaLangOrg/src` | `` (Kotoba project library) |

@@ -1,0 +1,214 @@
+;; find -- POSIX find (IEEE Std 1003.1): the walk with no expression, and
+;; with `-type f` / `-type d`.
+;;
+;;   find DIR           every path under DIR, DIR included
+;;   find DIR -type f   the regular files only
+;;   find DIR -type d   the directories only
+;;
+;; ## The walk is one pass over each listing, and the order is `find -s`
+;;
+;; Wire 34 answers a directory as "NAME<TAB>D" lines sorted by bytes, D being
+;; "1" for a directory. This walks that listing ONCE, left to right, with a
+;; byte cursor: at each line it takes the name as a zero-copy view, joins it
+;; to the directory's prefix, reports it, and -- when D is "1" -- descends
+;; into it right there before moving to the next line. So the order is:
+;; each directory before its contents, and within a directory the entries in
+;; byte order, files and directories interleaved. That is exactly what BSD
+;; `find -s` emits (measured 2026-09-15 against /usr/bin/find -s on a tree
+;; holding files beside directories), so the suite compares the SEQUENCE
+;; against `find -s`, not just the set.
+;;
+;; The previous shape walked each listing three times (files, then the
+;; subdirectory names, then the stack) through `string-index-of`, which on
+;; native allocates one pair handle per byte scanned, and carried the pending
+;; directories as one "\n"-joined string that was re-concatenated -- copied
+;; whole into the pool -- at every pop. Measured 2026-09-15: SIGILL after
+;; 7,272 files of a 34,803-entry tree, the arenas exhausted. This shape
+;; allocates two pairs per entry (the name view and the joined path) and
+;; copies each path once.
+;;
+;; ## `scan-to` walks by code point, not by byte
+;;
+;; `string-code-point-at` refuses an offset that is not a code-point
+;; boundary, and directory names are UTF-8, so the cursor advances by the
+;; width the code point's VALUE implies (< 0x80 one byte, < 0x800 two,
+;; < 0x10000 three, else four). The bytes searched for -- TAB and the newline
+;; -- are ASCII and never occur inside a multi-byte sequence.
+;;
+;; ## Why descent and iteration are one function
+;;
+;; Mutual recursion is not available -- a callee must be declared before its
+;; caller -- so "walk this listing" and "descend into a directory" cannot be
+;; two functions calling each other. `walk-lines` does both: the descent is
+;; a non-tail self-call whose depth is the tree's depth, and moving to the
+;; next line is a tail self-call.
+(ns find.core (:export [main]))
+
+(defn arg [i :string] :string
+  (typed-cap-call :cli/args :string :string i))
+
+(defn emit [s :string] :string
+  (typed-cap-call :io/write :string :string s))
+
+(defn emit-error [s :string] :string
+  (typed-cap-call :io/write-error :string :string s))
+
+(defn entries-of [dir :string] :string
+  (typed-cap-call :fs/browse :string :string dir))
+
+(defn nl [] :string
+  (string-substring "a
+b" 1 2))
+
+(defn exists? [path :string] :bool
+  (string=? (typed-cap-call :fs/app-data :string :string
+                            (string-concat path "EXISTS_SEP"))
+            "1"))
+
+(defn digit-value [s :string i :i64] :i64
+  (let [c (string-code-point-at s i)]
+    (if (< c 48) -1 (if (> c 57) -1 (- c 48)))))
+
+(defn text->i64 [s :string i :i64 n :i64 acc :i64] :i64
+  (if (>= i n)
+    acc
+    (let [d (digit-value s i)]
+      (if (< d 0) -1 (text->i64 s (+ i 1) n (+ (* acc 10) d))))))
+
+(defn parse-count [s :string] :i64
+  (let [n (string-byte-length s)]
+    (if (= n 0) -1 (text->i64 s 0 n 0))))
+
+(defn digit-text [d :i64] :string
+  (string-substring "0123456789" d (+ d 1)))
+
+(defn decimal-of [n :i64] :string
+  (if (< n 10)
+    (digit-text n)
+    (string-concat (decimal-of (quot n 10))
+                   (digit-text (- n (* 10 (quot n 10)))))))
+
+;; --- which kinds to report -----------------------------------------------
+;; 0 = every path, 1 = files only (-type f), 2 = directories only (-type d).
+;; Argument SHAPE decides, not the count: `find a c` is also two arguments.
+(defn type-arg [] :string
+  (let [n (parse-count (arg ""))]
+    (if (< n 2)
+      ""
+      (if (string=? (arg (decimal-of (- n 2))) "-type")
+        (arg (decimal-of (- n 1)))
+        ""))))
+
+(defn mode [] :i64
+  (let [t (type-arg)]
+    (if (string=? t "f") 1 (if (string=? t "d") 2 0))))
+
+;; The operands: every argument, minus the trailing `-type X` when present.
+(defn root-count [] :i64
+  (let [n (parse-count (arg ""))]
+    (if (string=? (type-arg) "") n (- n 2))))
+
+;; --- the scan ------------------------------------------------------------
+;; The byte offset of the first code point equal to B at or after I in S, or
+;; -1 when none lies before N. B is ASCII, so it is never a continuation
+;; byte and the cursor cannot pass over it inside a wider sequence.
+(defn scan-to [s :string i :i64 n :i64 b :i64] :i64
+  (if (>= i n)
+    -1
+    (let [c (string-code-point-at s i)]
+      (if (= c b)
+        i
+        (scan-to s
+                 (+ i (if (< c 128) 1 (if (< c 2048) 2 (if (< c 65536) 3 4))))
+                 n b)))))
+
+(defn report [path :string eol :string] :i64
+  (do (emit path) (emit eol) 0))
+
+;; --- the walk ------------------------------------------------------------
+;; LISTING is one directory's wire-34 answer, I the offset of the line under
+;; the cursor, PREFIX that directory's path plus "/", M the mode, EOL the
+;; newline. A line is NAME, TAB, D; lines are joined by "\n" with no trailing
+;; one, so the line after the one whose TAB is at T starts at T + 3.
+;;
+;; Every pair handle counts: the arena never reclaims, and a walk of
+;; orgs/kotoba-lang (857,268 entries) trapped at 607,572 with five handles
+;; per entry. EOL is threaded through as a parameter rather than rebuilt by
+;; `(nl)` per line -- that view was one of the five -- and the byte length is
+;; re-read from the listing each iteration, which allocates nothing. What
+;; remains per entry is the name view, the joined path, and the two write
+;; counts wire 37 answers with; a directory adds its listing and its prefix.
+;; Each entry is a REGION (arena-scope, ABI v6): the joined path, the write
+;; counts and -- for a directory -- the whole subtree's listings and paths
+;; are released when the scope returns. What stays live across a directory
+;; is its listing and its prefix, so the arena holds depth x one listing,
+;; whatever the tree's size: measured 2026-09-16, orgs/kotoba-lang's 857,322
+;; entries walk under the loader's DEFAULT 4,096 handles (with a 4 MiB pool
+;; for the 12,727-entry listing on the way), where the unscoped walk needed
+;; 3.9 Mi handles and 110 MiB. The descent inside the scope is a non-tail
+;; self-call, which is what it always was.
+(defn walk-lines [listing :string i :i64 prefix :string m :i64 eol :string] :i64
+  (if (>= i (string-byte-length listing))
+    0
+    (let [t (scan-to listing i (string-byte-length listing) 9)]
+      (do
+        (arena-scope
+         (let [path (string-concat prefix (string-substring listing i t))]
+           (if (= (string-code-point-at listing (+ t 1)) 49)
+             (do
+               (if (= m 1) 0 (report path eol))
+               (walk-lines (entries-of path) 0 (string-concat path "/") m eol))
+             (if (= m 2) 0 (report path eol)))))
+        (walk-lines listing (+ t 3) prefix m eol)))))
+
+;; --- is this operand a directory -----------------------------------------
+;; From STAT's fourth field. find's root is frequently the granted scope
+;; root itself, whose parent lies OUTSIDE the grant, so the parent-listing
+;; trick org-ieee-cp and org-ieee-ls use would trap here.
+(defn field-4 [s :string i :i64 seen :i64] :string
+  (let [n (string-byte-length s)]
+    (if (>= i n)
+      ""
+      (let [sp (scan-to s i n 32)]
+        (if (< sp 0)
+          (if (= seen 3) (string-substring s i n) "")
+          (if (= seen 3)
+            (string-substring s i sp)
+            (field-4 s (+ sp 1) (+ seen 1))))))))
+
+(defn dir? [p :string] :bool
+  (string=? (field-4 (typed-cap-call :fs/app-data :string :string
+                                     (string-concat p "STAT_SEP"))
+                     0 0)
+            "1"))
+
+;; --- the operands --------------------------------------------------------
+;; A root that is NOT a directory is reported and not descended into. A root
+;; that is not there is a diagnostic and exit 1.
+(defn one-root [path :string m :i64] :i64
+  (if (exists? path)
+    (if (dir? path)
+      (do
+        (if (= m 1) 0 (report path (nl)))
+        (walk-lines (entries-of path) 0 (string-concat path "/") m (nl)))
+      (if (= m 2) 0 (report path (nl))))
+    (do (emit-error "find: ")
+        (emit-error path)
+        (emit-error ": No such file or directory")
+        (emit-error (nl))
+        1)))
+
+(defn each [i :i64 stop :i64 m :i64 worst :i64] :i64
+  (if (>= i stop)
+    worst
+    (let [r (one-root (arg (decimal-of i)) m)]
+      (each (+ i 1) stop m (if (= r 1) 1 worst)))))
+
+(defn main [] :i64
+  (let [n (root-count)]
+    (if (< n 1)
+      ;; No operand. POSIX find defaults to the working directory; there is
+      ;; no cwd capability, so this refuses rather than walking something
+      ;; else.
+      1
+      (each 0 n (mode) 0))))

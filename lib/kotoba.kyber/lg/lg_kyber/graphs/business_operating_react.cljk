@@ -1,0 +1,240 @@
+(ns lg.lg-kyber.graphs.business-operating-react
+  "kyber business_operating_react — active-inference ReAct loop. Faithful langgraph-clj
+  port of graphs/business_operating_react.py (ADR-2606280030, supersedes the earlier
+  unit_refactor host-gated stubs).
+
+  Runs daily 06:00 JST. Pipeline: load_context → react_loop → synthesize → notify → END.
+
+  House style: state stays string-keyed maps, byte-for-byte the shapes the python
+  produced. The three I/O nodes are ported via INJECTION SEAMS (the actor Store/Advisor
+  swap), not host gates, so the WHOLE graph compiles AND invokes under bb:
+    - load_context reads the `:db-api` (lg.lg-kyber.db) for KPI fetchvals
+    - react_loop  reads the `:llm-api`  (lg.lg-kyber.graphs.llm) Murakumo caller
+    - notify      reads the `:db-api` + an optional `:notify` fn (Teams webhook → outbox)
+  Tests inject match-db / mock-llm / a stub notify; production injects live-llm + a real
+  PG db-api. `synthesize` is a pure transform. Each python try/except → default is kept."
+  (:require [langgraph.graph :as g]
+            [cheshire.core :as json]
+            [lg.lg-kyber.db :as db]
+            [lg.lg-kyber.graphs.llm :as llm]
+            [lg.lg-kyber.graphs.util :as u]))
+
+(def max-react-iters 3)
+
+;; key under which an optional notify-fn is injected (default = default-notify)
+(def notify-fn-key ::notify-fn)
+
+;; BusinessOperatingReactState (TypedDict, total=False) — string-keyed shape:
+;;   "product_id" "run_date" "context" "react_steps" "final_observation"
+;;   "risks_flagged" "report" "notified"
+
+;; ── load_context (node) ─────────────────────────────────────────────────────────
+(def ^:private stars-sql
+  "SELECT COUNT(*) FROM vertex_kyber_oss_event WHERE event_type='star' AND created_at >= NOW() - INTERVAL '30 days'")
+(def ^:private tenants-paid-sql
+  "SELECT COUNT(*) FROM vertex_kyber_tenant WHERE tier != 'free' AND status = 'active'")
+(def ^:private mrr-sql
+  "SELECT COALESCE(SUM(qty), 0) FROM vertex_kyber_billing_event WHERE metric = 'mrr_jpy' AND ts_ms >= EXTRACT(EPOCH FROM date_trunc('month', NOW())) * 1000")
+(def ^:private hypotheses-sql
+  "SELECT slug, block, statement, status FROM vertex_kyber_bmc_hypothesis WHERE status = 'active' LIMIT 5")
+
+(defn- safe-int
+  "int(await fetchval(q) or 0) wrapped in try/except → nil on failure (the python ctx
+  default for a failed KPI block)."
+  [fetchval q]
+  (try (long (or (fetchval q) 0))
+       (catch #?(:clj Exception :default :default) _ nil)))
+
+(defn load-context [state]
+  (let [{:keys [fetchval fetch]} (db/db-of state)
+        today (u/today-iso)
+        ctx {"product"               "kyber"
+             "description"           "GL/AP/AR + HR + 在庫 SaaS — 脱出できる ERP (AT Protocol DID-native)"
+             "phase"                 "Phase 1 — OSS Developer Adoption"
+             "revenue_model"         "Free/¥3,800/¥12,000/¥38,000/Enterprise"
+             "arr_target_2026q4_jpy" 3000000
+             "date"                  today
+             "oss_stars_30d"         (safe-int fetchval stars-sql)
+             "cloud_tenants_paid"    (safe-int fetchval tenants-paid-sql)
+             "cloud_mrr_jpy"         (safe-int fetchval mrr-sql)
+             "active_hypotheses"     (try (vec (fetch hypotheses-sql))
+                                          (catch #?(:clj Exception :default :default) _ []))}]
+    (merge state {"run_date" today "context" ctx "react_steps" [] "risks_flagged" []})))
+
+;; ── react_loop (node) ────────────────────────────────────────────────────────────
+(def ^:private system-prompt
+  (str "You are the kyber active-inference business operating agent.\n"
+       "kyber is GL/AP/AR + HR + 在庫 SaaS targeting Japan SMB. Phase 1: OSS developer adoption.\n"
+       "ARR target: ¥3M by 2026 Q4.\n"
+       "Analyze the given context and produce a JSON object:\n"
+       "{ \"observation\": \"...\", \"action\": {\"type\": \"bmc_update_hypothesis\"|\"flag_risk\"|\"no_action\", \"detail\": \"...\"} }\n"
+       "Be concise (≤200 chars per field). Japanese is fine."))
+
+(defn react-loop [state]
+  (let [{:keys [call-json]} (llm/llm-of state)
+        ctx (or (get state "context") {})]
+    (loop [i 0
+           steps (vec (or (get state "react_steps") []))
+           risks (vec (or (get state "risks_flagged") []))
+           final-obs ""]
+      (if (>= i max-react-iters)
+        (merge state {"react_steps" steps "final_observation" final-obs "risks_flagged" risks})
+        (let [user-prompt (json/generate-string {"context" ctx "steps_so_far" steps "iteration" (inc i)})
+              [parsed source] (call-json (str system-prompt "\n\n" user-prompt) {:max-tokens 300})]
+          (if-not parsed
+            (merge state {"react_steps" steps "final_observation" final-obs "risks_flagged" risks})
+            (let [obs (u/truncate (get parsed "observation" "") 200)
+                  action (or (get parsed "action") {})
+                  action-type (str (get action "type" "no_action"))
+                  detail (u/truncate (get action "detail" "") 200)
+                  step {"iteration" (inc i) "observation" obs "action_type" action-type
+                        "detail" detail "source" source}
+                  steps' (conj steps step)
+                  risks' (if (= action-type "flag_risk")
+                           (conj risks {"severity" "medium" "summary" detail
+                                        "source" (str "react-iter-" (inc i))})
+                           risks)]
+              (if (= action-type "no_action")
+                (merge state {"react_steps" steps' "final_observation" obs "risks_flagged" risks'})
+                (recur (inc i) steps' risks' obs)))))))))
+
+;; ── synthesize (node) — PURE ─────────────────────────────────────────────────────
+(defn synthesize [state]
+  (let [ctx       (or (get state "context") {})
+        steps     (or (get state "react_steps") [])
+        risks     (or (get state "risks_flagged") [])
+        run-date  (get state "run_date" (u/today-iso))
+        mrr       (or (get ctx "cloud_mrr_jpy") 0)
+        tenants   (or (get ctx "cloud_tenants_paid") 0)
+        stars     (or (get ctx "oss_stars_30d") 0)
+        final-obs (get state "final_observation" "異常なし")
+        report    {"run_id"            (str "kyber-bo-react-" run-date)
+                   "product"           "kyber"
+                   "date"              run-date
+                   "summary"           {"oss_stars_30d"      stars
+                                        "cloud_mrr_jpy"      mrr
+                                        "cloud_tenants_paid" tenants
+                                        "react_iterations"   (count steps)
+                                        "risks_flagged"      (count risks)}
+                   "final_observation" final-obs
+                   "react_steps"       steps
+                   "risks"             risks}]
+    (merge state {"report" report})))
+
+;; ── notify (node) ────────────────────────────────────────────────────────────────
+(defn notify-summary-text
+  "Build the kyber BO-React summary line from a report map + run-date (pure). Mirrors the
+  python f-string before any I/O."
+  [report run-date]
+  (let [summary (or (get report "summary") {})]
+    (str "[" run-date "] kyber BO-React: "
+         "stars30d=" (get summary "oss_stars_30d" "?") " "
+         "tenants_paid=" (get summary "cloud_tenants_paid" "?") " "
+         "mrr=¥" (u/group-thousands (get summary "cloud_mrr_jpy" 0)) " "
+         "| " (u/truncate (get report "final_observation" "") 100))))
+
+(defn- teams-card [summary-text]
+  {"type" "message"
+   "attachments" [{"contentType" "application/vnd.microsoft.card.adaptive"
+                   "content" {"$schema" "http://adaptivecards.io/schemas/adaptive-card.json"
+                              "type" "AdaptiveCard" "version" "1.4"
+                              "body" [{"type" "TextBlock" "text" "kyber Business Operating Daily"
+                                       "weight" "Bolder" "size" "Medium"}
+                                      {"type" "TextBlock" "text" summary-text "wrap" true}]}}]})
+
+(def ^:private outbox-sql
+  "INSERT INTO vertex_kyber_outbox (vertex_id, org_did, kind, subject, body_text, recipient_email, status, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)")
+
+(defn- outbox-notify [{:keys [summary-text run-date db]}]
+  (try
+    ((:execute db) outbox-sql
+     (str (random-uuid)) "did:web:kyber.etzhayyim.com" "bo-react-daily"
+     (str "kyber BO-React Daily " run-date) summary-text
+     "jun@etzhayyim.group" "queued-no-recipient" (u/today-iso))
+    true
+    (catch #?(:clj Exception :default :default) _ false)))
+
+(defn- allowed-webhook? [webhook]
+  #?(:clj
+     (try
+       (let [uri (java.net.URI. webhook)
+             scheme (.getScheme uri)
+             host (some-> (.getHost uri) .toLowerCase)
+             port (.getPort uri)
+             loopback? (contains? #{"localhost" "127.0.0.1" "::1"} host)
+             teams? (or (= host "webhook.office.com")
+                        (and host (.endsWith host ".webhook.office.com"))
+                        (= host "logic.azure.com")
+                        (and host (.endsWith host ".logic.azure.com")))]
+         (and host
+              (nil? (.getUserInfo uri))
+              (or (and (= scheme "https") teams?)
+                  (and (#{"http" "https"} scheme) loopback?
+                       (<= 1 port 65535)))))
+       (catch #?(:clj Exception :default :default) _ false))
+     :default
+     (try
+       (let [u (js/URL. webhook)
+             scheme (.-protocol u)
+             host (.-hostname u)
+             teams? (or (= host "webhook.office.com")
+                        (.endsWith host ".webhook.office.com")
+                        (= host "logic.azure.com")
+                        (.endsWith host ".logic.azure.com"))]
+         (and host
+              (not (.includes (.-href u) "@"))
+              (or (and (= scheme "https:") teams?)
+                  (and (#{"http:" "https:"} scheme)
+                       (contains? #{"localhost" "127.0.0.1" "::1"} host)))))
+       (catch :default _ false))))
+
+(defn notify-with
+  "Invoke a host-provided HTTP capability for an approved Teams endpoint, falling back
+  to the injected DB outbox. Portable code neither discovers environment nor resolves
+  an HTTP implementation."
+  [http-post webhook args]
+  (let [teams-ok (when (and (fn? http-post) (string? webhook)
+                            (allowed-webhook? webhook))
+                   (try
+                     (http-post webhook {:headers {"content-type" "application/json"}
+                                         :body (json/generate-string
+                                                (teams-card (:summary-text args)))
+                                         :timeout 10000})
+                     true
+                     (catch #?(:clj Exception :default :default) _ false)))]
+    (if teams-ok true (outbox-notify args))))
+
+(defn default-notify
+  "Authority-free default: persist to the injected outbox only. A host that owns a
+  Teams HTTP capability injects a partially applied `notify-with` instead."
+  [args]
+  (outbox-notify args))
+
+(defn notify [state]
+  (let [report (or (get state "report") {})
+        run-date (get state "run_date" (u/today-iso))
+        summary-text (notify-summary-text report run-date)
+        notify-fn (or (get state notify-fn-key) default-notify)
+        notified (boolean (notify-fn {:summary-text summary-text :run-date run-date
+                                      :db (db/db-of state)}))]
+    (merge state {"notified" notified})))
+
+;; ── build / GRAPH ────────────────────────────────────────────────────────────────
+(defn build
+  "Compile the BO-React StateGraph (load_context → react_loop → synthesize → notify → END)."
+  []
+  (-> (g/state-graph)
+      (g/add-node :load-context load-context)
+      (g/add-node :react-loop react-loop)
+      (g/add-node :synthesize synthesize)
+      (g/add-node :notify notify)
+      (g/set-entry-point :load-context)
+      (g/add-edge :load-context :react-loop)
+      (g/add-edge :react-loop :synthesize)
+      (g/add-edge :synthesize :notify)
+      (g/set-finish-point :notify)
+      (g/compile-graph)))
+
+(def graph (build))
+
+(defn run [input] (g/invoke graph input))

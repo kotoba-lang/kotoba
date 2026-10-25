@@ -1,0 +1,204 @@
+(ns lg.lg-kyber.tests.test-graphs
+  "clj-port test-suite for the lg-kyber graphs (port of the implicit python behaviour;
+  ADR-2606280030). Every ported graph compiles AND invokes under bb; the injected
+  db-api / llm-api seams drive deterministic runs that assert the python's shapes."
+  (:require [kotoba.lang.error :as kerror] [kotoba.test :refer [deftest is testing]]
+            [lg.lg-kyber.db :as db]
+            [lg.lg-kyber.graphs.llm :as llm]
+            [lg.lg-kyber.graphs.util :as u]
+            [lg.lg-kyber.graphs.health :as health]
+            [lg.lg-kyber.graphs.metrics-daily :as metrics-daily]
+            [lg.lg-kyber.graphs.business-operating-react :as bo-react]
+            [lg.lg-kyber.server :as server]))
+
+;; ── util ──────────────────────────────────────────────────────────────────────
+(deftest test-group-thousands
+  (testing "¥{n:,} grouping"
+    (is (= "0" (u/group-thousands 0)))
+    (is (= "1,234" (u/group-thousands 1234)))
+    (is (= "1,000,000" (u/group-thousands 1000000)))
+    (is (= "-12,345" (u/group-thousands -12345)))))
+
+(deftest test-truncate
+  (testing "str(x)[:n]"
+    (is (= "abc" (u/truncate "abcdef" 3)))
+    (is (= "12" (u/truncate 12345 2)))
+    (is (= "" (u/truncate "" 5)))))
+
+;; ── llm ───────────────────────────────────────────────────────────────────────
+(deftest test-strip-think
+  (testing "<think>…</think> stripped + trimmed"
+    (is (= "{\"a\":1}" (llm/strip-think "<think>reasoning</think>{\"a\":1}")))
+    (is (= "x" (llm/strip-think "  x  ")))))
+
+(deftest test-mock-llm-sequence
+  (testing "mock-llm returns canned pairs in order, then deterministic"
+    (let [{:keys [call-json]} (llm/mock-llm [[{"observation" "ok"} "mock"]])]
+      (is (= [{"observation" "ok"} "mock"] (call-json "p")))
+      (is (= [nil "deterministic"] (call-json "p"))))))
+
+(deftest test-http-llm-capability
+  (testing "missing HTTP capabilities fail closed before network access"
+    (is (thrown-with-msg? kerror/ExceptionInfo #"explicit HTTP capabilities"
+                          (llm/call-llm-json-with nil nil {} "p" {}))))
+  (testing "explicit Murakumo capability preserves JSON wire behavior"
+    (let [seen (atom [])
+          api (llm/http-llm
+               (fn [url _]
+                 (swap! seen conj url)
+                 {:body "{\"fleet\":{\"healthPct\":100}}"})
+               (fn [url _]
+                 (swap! seen conj url)
+                 {:body "{\"choices\":[{\"message\":{\"content\":\"{\\\"ok\\\":true}\"}}]}"})
+               {})]
+      (is (= [{"ok" true} "llm"] ((:call-json api) "p")))
+      (is (= ["https://murakumo.etzhayyim.com/_app/meta"
+              "https://murakumo.etzhayyim.com/api/openai/v1/chat/completions"]
+             @seen)))))
+
+;; ── db ────────────────────────────────────────────────────────────────────────
+(deftest test-match-db
+  (testing "match-db pins fetchval/fetch by query substring"
+    (let [exec-log (atom [])
+          d (db/match-db {:fetchval {"oss_event" 7 "tenant" 3}
+                          :fetch {"bmc_hypothesis" [{"slug" "h1"}]}
+                          :exec-log exec-log})]
+      (is (= 7 ((:fetchval d) "… vertex_kyber_oss_event …")))
+      (is (= 3 ((:fetchval d) "… vertex_kyber_tenant …")))
+      (is (= 0 ((:fetchval d) "… unmatched …")))
+      (is (= [{"slug" "h1"}] ((:fetch d) "… bmc_hypothesis …")))
+      (is (= [] ((:fetch d) "… unmatched …")))
+      ((:execute d) "INSERT …" :a :b)
+      (is (= 1 (count @exec-log))))))
+
+(deftest test-pg-db-host-gated
+  (testing "pg-db raises explicitly (never a silent wrong answer)"
+    (is (thrown? #?(:clj Exception :default :default) (db/pg-db)))))
+
+;; ── health graph ────────────────────────────────────────────────────────────────
+(deftest test-health-graph
+  (testing "health compiles + invokes (START → probe → END)"
+    (let [out (health/run {})]
+      (is (true? (get out "ok")))
+      (is (string? (get out "version")))
+      (is (number? (get out "ts"))))
+    (is (= "host-version" (get (health/run {health/version-key "host-version"})
+                                "version")))))
+
+;; ── metrics_daily graph ─────────────────────────────────────────────────────────
+(deftest test-metrics-daily-graph
+  (testing "metrics_daily runs end-to-end with an injected db-api"
+    (let [exec-log (atom [])
+          d (db/match-db {:fetchval {"event_type = 'star'" 42
+                                     "event_type = 'download'" 100
+                                     "tier = 'free'" 5
+                                     "tier != 'free'" 2
+                                     "api_call_count_24h" 999
+                                     "metric = 'mrr_jpy'" 24000
+                                     "outreach_status = 'new'" 8}
+                          :exec-log exec-log})
+          out (metrics-daily/run {db/db-api-key d})]
+      (is (= 42 (get out "oss_stars_30d")))
+      (is (= 100 (get out "oss_downloads_30d")))
+      (is (= 5 (get out "cloud_tenants_free")))
+      (is (= 2 (get out "cloud_tenants_paid")))
+      (is (= 999 (get out "cloud_api_calls_24h")))
+      (is (= 24000 (get out "cloud_mrr_jpy")))
+      (is (= 8 (get out "leads_new")))
+      (is (= 1 (count @exec-log)) "write_snapshot executed one INSERT")
+      (testing "report summary string shape"
+        (is (re-find #"^\[.*\] kyber metrics: oss_stars30d=42 tenants=5F\+2P mrr=¥24,000 leads_new=8$"
+                     (get out "summary")))))))
+
+;; ── business_operating_react graph ──────────────────────────────────────────────
+(deftest test-bo-react-graph
+  (testing "BO-React runs load_context → react_loop → synthesize → notify with injected seams"
+    (let [exec-log (atom [])
+          d (db/match-db {:fetchval {"event_type='star'" 30
+                                     "tier != 'free'" 4
+                                     "metric = 'mrr_jpy'" 50000}
+                          :fetch {"bmc_hypothesis" [{"slug" "pricing" "status" "active"}]}
+                          :exec-log exec-log})
+          ;; iter1: flag_risk (continues), iter2: no_action (breaks)
+          mllm (llm/mock-llm [[{"observation" "OSS adoption lagging"
+                                "action" {"type" "flag_risk" "detail" "low star velocity"}} "mock"]
+                              [{"observation" "no further action"
+                                "action" {"type" "no_action" "detail" ""}} "mock"]])
+          notified? (atom nil)
+          out (bo-react/run {db/db-api-key d
+                             llm/llm-api-key mllm
+                             bo-react/notify-fn-key (fn [m] (reset! notified? m) true)})
+          report (get out "report")]
+      (testing "context loaded from db-api"
+        (is (= 30 (get-in out ["context" "oss_stars_30d"])))
+        (is (= 4 (get-in out ["context" "cloud_tenants_paid"])))
+        (is (= 50000 (get-in out ["context" "cloud_mrr_jpy"])))
+        (is (= [{"slug" "pricing" "status" "active"}] (get-in out ["context" "active_hypotheses"]))))
+      (testing "react loop ran 2 iterations, flagged 1 risk, broke on no_action"
+        (is (= 2 (count (get out "react_steps"))))
+        (is (= 1 (count (get out "risks_flagged"))))
+        (is (= "no further action" (get out "final_observation"))))
+      (testing "synthesize report shape (string-keyed, byte-faithful)"
+        (is (= "kyber" (get report "product")))
+        (is (= 30 (get-in report ["summary" "oss_stars_30d"])))
+        (is (= 50000 (get-in report ["summary" "cloud_mrr_jpy"])))
+        (is (= 2 (get-in report ["summary" "react_iterations"])))
+        (is (= 1 (get-in report ["summary" "risks_flagged"]))))
+      (testing "notify invoked with the pure summary line"
+        (is (true? (get out "notified")))
+        (is (re-find #"kyber BO-React: stars30d=30 tenants_paid=4 mrr=¥50,000"
+                     (:summary-text @notified?)))))))
+
+(deftest test-bo-react-no-parse-breaks-loop
+  (testing "an empty parse ends the ReAct loop immediately (python `if not parsed: break`)"
+    (let [d (db/match-db {})
+          mllm (llm/mock-llm [])  ; first call → [nil deterministic]
+          out (bo-react/run {db/db-api-key d
+                             llm/llm-api-key mllm
+                             bo-react/notify-fn-key (fn [_] true)})]
+      (is (= 0 (count (get out "react_steps"))))
+      ;; react_loop sets final_observation="" before the first call, so synthesize's
+      ;; get(..,"異常なし") default never fires — faithful to the python (key present).
+      (is (= "" (get-in out ["report" "final_observation"]))))))
+
+(deftest test-bo-react-notify-capability
+  (testing "approved webhook uses the injected HTTP capability and preserves its wire contract"
+    (let [wire (atom nil)
+          args {:summary-text "safe summary" :run-date "2026-07-19"
+                :db (db/match-db {})}]
+      (is (true? (bo-react/notify-with
+                  (fn [url opts] (reset! wire [url opts]) {:status 200})
+                  "https://tenant.webhook.office.com/hooks/id" args)))
+      (is (= "https://tenant.webhook.office.com/hooks/id" (first @wire)))
+      (is (= "application/json" (get-in @wire [1 :headers "content-type"])))
+      (is (re-find #"safe summary" (get-in @wire [1 :body])))))
+  (testing "malformed, off-fleet and lookalike endpoints fail closed before HTTP"
+    (doseq [url ["not a url"
+                 "https://example.com/hook"
+                 "https://webhook.office.com.evil.example/hook"]]
+      (let [called? (atom false)
+            exec-log (atom [])]
+        (is (true? (bo-react/notify-with
+                    (fn [& _] (reset! called? true)) url
+                    {:summary-text "fallback" :run-date "2026-07-19"
+                     :db (db/match-db {:exec-log exec-log})})))
+        (is (false? @called?))
+        (is (= 1 (count @exec-log))))))
+  (testing "missing raw HTTP capability cannot perform network I/O"
+    (let [exec-log (atom [])]
+      (is (true? (bo-react/notify-with
+                  nil "https://tenant.webhook.office.com/hooks/id"
+                  {:summary-text "fallback" :run-date "2026-07-19"
+                   :db (db/match-db {:exec-log exec-log})})))
+      (is (= 1 (count @exec-log))))))
+
+;; ── server dispatcher ───────────────────────────────────────────────────────────
+(deftest test-server-dispatch
+  (testing "dispatch routes ported graphs, 404s unknown / not-yet-ported"
+    (is (true? (get (server/dispatch {"graph" "health"}) "ok")))
+    (is (= "health" (get (server/dispatch {"graph" "health"}) "graph")))
+    (is (false? (get (server/dispatch {"graph" "sales"}) "ok"))
+        "sales is registered but .py-only → not-yet-ported")
+    (is (re-find #"not yet ported" (get (server/dispatch {"graph" "sales"}) "error")))
+    (is (re-find #"unknown graph" (get (server/dispatch {"graph" "nope"}) "error")))
+    (is (= server/all-graph-ids (get (server/health-response) "graphs")))))

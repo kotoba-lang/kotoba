@@ -1,0 +1,182 @@
+(ns yoro-ui.state.convos
+  "DM (convo) list state — port of $lib/atproto-agent listConvos + $lib/w/convo-store reload.
+
+   app.aozora.convo.* reads over the yoro AppView. The UI does not talk to the
+   PDS directly for list/detail projections; it asks the AppView for the
+   projected convo feed and unread counts.
+
+   svelte の教訓 (AGENTS.md §Messages Page): reload() を getSession() でガードすると本番で
+   session が常に nil となりスケルトンが永続化する。よって session ゲートはせず直接 XRPC を
+   呼び、失敗時は :error 状態へ遷移する."
+  (:require [re-frame.core :as rf]))
+
+(defn- normalize-member [member]
+  (let [base (or (:member member) member)
+        did (or (:did base) (:did member) "")
+        display-name (or (:displayName base) (:display-name base) "")
+        handle (or (:handle base) "")
+        avatar (or (:avatar base) (:avatarUrl base))]
+    (cond-> {:did did}
+      (seq display-name) (assoc :displayName display-name)
+      (seq handle) (assoc :handle handle)
+      (seq avatar) (assoc :avatar avatar))))
+
+(defn- normalize-convo [cv]
+  {:id           (or (:convoId cv) (:id cv))
+   :kind         (or (:kind cv) "dm")
+   :title        (or (:title cv) "")
+   :members      (mapv normalize-member (:members cv))
+   :muted        (boolean (:muted cv))
+   :archived     (boolean (:archived cv))
+   :pinned       (boolean (:pinned cv))
+   :unread-count (or (:unreadCount cv) 0)
+   :last-message  {:message {:text   (or (get-in cv [:lastMessage :text]) "")
+                             :sentAt (or (get-in cv [:lastMessage :sentAt])
+                                         (:lastMessageAt cv)
+                                         (:createdAt cv))}}})
+
+;; ---------------------------------------------------------------------------
+;; subs
+
+(rf/reg-sub
+  :convos/list
+  (fn [db _]
+    (get-in db [:convos :list] [])))
+
+(rf/reg-sub
+  :convos/list-visible
+  :<- [:convos/list]
+  (fn [convos _]
+    ;; the main list view hides archived convos — listConvos itself never
+    ;; filters them out server-side (a convoPreference is UI policy, not an
+    ;; access-control decision), so this stays a client-side view filter,
+    ;; not a query param.
+    (remove :archived convos)))
+
+(rf/reg-sub
+  :convos/list-archived
+  :<- [:convos/list]
+  (fn [convos _] (filter :archived convos)))
+
+(rf/reg-sub
+  :convos/active-id
+  (fn [db _]
+    (get-in db [:convos :active-id])))
+
+(rf/reg-sub
+  :convos/active
+  (fn [db _]
+    (get-in db [:convos :active])))
+
+(rf/reg-sub
+  :convos/active-records
+  (fn [db _]
+    (get-in db [:convos :active-records] [])))
+
+(rf/reg-sub
+  :convos/is-loading?
+  (fn [db _]
+    (get-in db [:convos :is-loading?] false)))
+
+(rf/reg-sub
+  :convos/error
+  (fn [db _]
+    (get-in db [:convos :error])))
+
+(rf/reg-sub
+  :convos/unread
+  (fn [db _]
+    (get-in db [:convos :unread] 0)))
+
+(rf/reg-sub
+  :convos/cursor
+  (fn [db _]
+    (get-in db [:convos :cursor])))
+
+(rf/reg-sub
+  :convos/direct-ids
+  (fn [db _]
+    (get-in db [:convos :direct-ids] [])))
+
+;; ---------------------------------------------------------------------------
+;; events
+
+(rf/reg-event-db
+  :convos/set-active
+  (fn [db [_ convo-id]]
+    (assoc-in db [:convos :active-id] convo-id)))
+
+(rf/reg-event-fx
+  :convos/refresh
+  (fn [{:keys [db]} _]
+    (let [did (get-in db [:auth :session :did])]
+      (when did
+        {:db (-> db
+                 (assoc-in [:convos :is-loading?] true)
+                 (assoc-in [:convos :error] nil))
+         :atproto/query {:nsid       "app.aozora.convo.listConvos"
+                         :params     {:limit 50 :did did}
+                         :on-success [:convos/refresh-success]
+                         :on-failure [:convos/refresh-failure]}}))))
+
+(rf/reg-event-db
+  :convos/refresh-success
+  (fn [db [_ resp]]
+    (let [convos (mapv normalize-convo (:convos resp))
+          unread (reduce + (map #(or (:unread-count %) 0) convos))]
+      (-> db
+          (assoc-in [:convos :list] convos)
+          (assoc-in [:convos :cursor] (:cursor resp))
+          (assoc-in [:convos :unread] unread)
+          (assoc-in [:convos :error] nil)
+          (assoc-in [:convos :is-loading?] false)))))
+
+(rf/reg-event-db
+  :convos/refresh-failure
+  (fn [db [_ err]]
+    (-> db
+        (assoc-in [:convos :is-loading?] false)
+        (assoc-in [:convos :error] (str err)))))
+
+;; ---------------------------------------------------------------------------
+;; DM unread badge — app.aozora.convo.listUnreadCounts
+
+(rf/reg-event-db
+  :convos/unread-count
+  (fn [db [_ n]] (assoc-in db [:convos :unread] n)))
+
+(rf/reg-event-fx
+  :convos/fetch-unread
+  (fn [{:keys [db]} _]
+    (when-let [did (get-in db [:auth :session :did])]
+      {:atproto/query {:nsid       "app.aozora.convo.listUnreadCounts"
+                       :params     {:did did :limit 200}
+                       :on-success (fn [res]
+                                     (let [items (or (:items res) [])
+                                           unread (reduce + (map #(or (:unreadCount %) 0) items))]
+                                       (rf/dispatch [:convos/unread-count unread])))
+                       :on-failure nil}})))
+
+;; ---------------------------------------------------------------------------
+;; convo preference — app.aozora.convo.setConvoPreference (mute/archive/pin)
+
+(defn- update-convo-in-list [db convo-id f]
+  (update-in db [:convos :list]
+             (fn [convos] (mapv (fn [c] (if (= (:id c) convo-id) (f c) c)) convos))))
+
+(rf/reg-event-fx
+  :convos/set-preference!
+  (fn [{:keys [db]} [_ convo-id field value]]
+    (let [prev (first (filter #(= (:id %) convo-id) (get-in db [:convos :list])))]
+      {;; optimistic — flips instantly in the list, the XRPC round trip
+       ;; corrects it on failure rather than gating the UI on a response.
+       :db (update-convo-in-list db convo-id #(assoc % field value))
+       :atproto/procedure
+       {:nsid "app.aozora.convo.setConvoPreference"
+        :body {:convoId convo-id field value}
+        :on-failure [:convos/set-preference-failed convo-id field (get prev field)]}})))
+
+(rf/reg-event-db
+  :convos/set-preference-failed
+  (fn [db [_ convo-id field prev-value]]
+    (update-convo-in-list db convo-id #(assoc % field prev-value))))
