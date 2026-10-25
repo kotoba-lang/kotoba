@@ -1,0 +1,202 @@
+;; nbb smoke for webauthn.adapters.edge, driven by a virtual authenticator that
+;; really signs. `kbb -M:test` cannot reach this namespace at all -- it is
+;; CLJS-only (js/crypto.subtle, js/Uint8Array, js/TextDecoder).
+;;
+;;   kbb --backend sci --classpath "src:test:<cacao>/src" test/webauthn/edge_smoke.cljk
+;;
+;; Requires Node >= 20. Exits nonzero on any failure.
+(ns webauthn.edge-smoke
+  (:require [webauthn.adapters.edge :as edge]
+            [webauthn.virtual-authenticator :as va]))
+
+(def rp-id "authn.kotobase.net")
+(def origin "https://authn.kotobase.net")
+(def config {:rp-id rp-id :origin origin})
+(def challenge "Y2hhbGxlbmdlLTAwMDAwMDAwMDAwMDAwMDAwMDAw")
+
+(def failures (atom []))
+(defn check! [label ok? & [detail]]
+  (if ok?
+    (println "ok  -" label)
+    (do (println "FAIL-" label (or detail "")) (swap! failures conj label))))
+
+(defn- expect-deny [label result]
+  (check! label (false? (:ok result)) (pr-str (select-keys result [:ok :status :error]))))
+
+(defn run [auth]
+  (let [register! (:register! auth)
+        assert! (:assert! auth)
+        state (atom {})]
+    (-> (edge/verify-registration! config (assoc (register! {:origin origin :challenge challenge})
+                                                 :challenge challenge))
+        (.then (fn [r]
+                 (swap! state assoc :registration r)
+                 (check! "a real registration ceremony verifies" (true? (:ok r)) (pr-str r))
+                 (check! "the credential id round-trips as base64url"
+                         (= (:credential-id auth) (:credential-id r))
+                         (str (:credential-id auth) " vs " (:credential-id r)))
+                 (check! "the COSE P-256 key decodes to a 65-byte uncompressed point"
+                         (= 65 (aget (edge/b64url->bytes
+                                      (-> (:public-key-b64 r)
+                                          (.replace (js/RegExp. "\\+" "g") "-")
+                                          (.replace (js/RegExp. "/" "g") "_")
+                                          (.replace (js/RegExp. "=+$" "") "")))
+                                     "length")))
+                 ;; a registration whose clientData names a different origin
+                 (edge/verify-registration! config
+                                            (assoc (register! {:origin "https://evil.example"
+                                                               :challenge challenge})
+                                                   :challenge challenge))))
+        (.then (fn [r] (expect-deny "registration for a different origin is refused" r)
+                 (edge/verify-registration! config
+                                            (assoc (register! {:origin origin :challenge challenge})
+                                                   :challenge "a-different-challenge"))))
+        (.then (fn [r] (expect-deny "registration against a challenge we did not issue is refused" r)
+                 (edge/verify-registration! config
+                                            (assoc (register! {:origin origin :challenge challenge
+                                                               :user-present? false})
+                                                   :challenge challenge))))
+        (.then (fn [r] (expect-deny "registration with the user-present flag clear is refused" r)
+                 (assert! {:origin origin :challenge challenge :sign-count 1})))
+        (.then (fn [a]
+                 (edge/verify-authentication!
+                  config (assoc a :challenge challenge
+                                :public-key-b64 (:public-key-b64 (:registration @state))))))
+        (.then (fn [r]
+                 (check! "a real assertion verifies against the stored key" (true? (:ok r)) (pr-str r))
+                 (check! "the sign count is reported for the caller's clone check"
+                         (= 1 (:sign-count r)))
+                 (assert! {:origin origin :challenge challenge :tamper-signature? true})))
+        (.then (fn [a]
+                 (edge/verify-authentication!
+                  config (assoc a :challenge challenge
+                                :public-key-b64 (:public-key-b64 (:registration @state))))))
+        (.then (fn [r] (expect-deny "a tampered signature is refused" r)
+                 (assert! {:origin "https://evil.example" :challenge challenge})))
+        (.then (fn [a]
+                 (edge/verify-authentication!
+                  config (assoc a :challenge challenge
+                                :public-key-b64 (:public-key-b64 (:registration @state))))))
+        (.then (fn [r] (expect-deny "an assertion made for a different origin is refused" r)
+                 (assert! {:origin origin :challenge challenge :user-present? false})))
+        (.then (fn [a]
+                 (edge/verify-authentication!
+                  config (assoc a :challenge challenge
+                                :public-key-b64 (:public-key-b64 (:registration @state))))))
+        (.then (fn [r]
+                 ;; The signature is VALID here -- only the flag byte differs.
+                 ;; Verifying the signature alone would accept this.
+                 (expect-deny "an assertion with the user-present flag clear is refused" r)
+                 (.then (js/crypto.subtle.digest "SHA-256" (.encode (js/TextEncoder.) "other.example"))
+                        (fn [h] (assert! {:origin origin :challenge challenge
+                                          :rp-hash (js/Uint8Array. h)})))))
+        (.then (fn [a]
+                 (edge/verify-authentication!
+                  config (assoc a :challenge challenge
+                                :public-key-b64 (:public-key-b64 (:registration @state))))))
+        (.then (fn [r]
+                 (expect-deny "an assertion whose authData names another RP is refused" r)
+                 (assert! {:origin origin :challenge "some-other-challenge"})))
+        (.then (fn [a]
+                 (edge/verify-authentication!
+                  config (assoc a :challenge challenge
+                                :public-key-b64 (:public-key-b64 (:registration @state))))))
+        (.then (fn [r]
+                 (expect-deny "an assertion for a challenge we did not issue is refused" r)
+                 (assert! {:origin origin :challenge challenge :client-data-type "webauthn.create"})))
+        (.then (fn [a]
+                 (edge/verify-authentication!
+                  config (assoc a :challenge challenge
+                                :public-key-b64 (:public-key-b64 (:registration @state))))))
+        (.then (fn [r]
+                 (expect-deny "a registration ceremony replayed as a login is refused" r)
+                 (edge/verify-authentication!
+                  config {:client-data-json-b64url "!!!not-base64url!!!"
+                          :authenticator-data-b64url "AA" :signature-b64url "AA"
+                          :challenge challenge :public-key-b64 "AA"})))
+        (.then (fn [r]
+                 (check! "malformed input is a 400, never an internal error"
+                         (and (false? (:ok r)) (= 400 (:status r))) (pr-str r))))
+        (.then (fn [_]
+                 (check! "sign-count: a counter-less authenticator (0 -> 0) is accepted"
+                         (edge/sign-count-ok? 0 0))
+                 (check! "sign-count: a strictly increasing count is accepted"
+                         (edge/sign-count-ok? 4 5))
+                 (check! "sign-count: a repeated count is a clone signal"
+                         (not (edge/sign-count-ok? 5 5)))
+                 (check! "sign-count: a decreasing count is a clone signal"
+                         (not (edge/sign-count-ok? 5 4)))))
+
+        ;; ── user verification, the default ──────────────────────────────────
+        ;;
+        ;; Every check above ran with UV set, because that is what a ceremony
+        ;; under `userVerification: "required"` produces. These are the ones
+        ;; that matter: the signature is genuine and everything else is in
+        ;; order, and only the UV bit differs.
+        (.then (fn [_] (edge/verify-registration!
+                        config (assoc (register! {:origin origin :challenge challenge
+                                                  :user-verified? false})
+                                      :challenge challenge))))
+        (.then (fn [r]
+                 (expect-deny "registration without user verification is refused by default" r)
+                 (assert! {:origin origin :challenge challenge :user-verified? false})))
+        (.then (fn [a]
+                 (edge/verify-authentication!
+                  config (assoc a :challenge challenge
+                                :public-key-b64 (:public-key-b64 (:registration @state))))))
+        (.then (fn [r]
+                 (expect-deny "an assertion without user verification is refused by default" r)
+                 (assert! {:origin origin :challenge challenge :user-verified? false})))
+
+        ;; An unrecognised policy value must NOT read as "no policy". Only the
+        ;; exact keyword :preferred opts out; a typo has to over-refuse.
+        (.then (fn [a]
+                 (edge/verify-authentication!
+                  (assoc config :user-verification :prefered) ;; deliberate typo
+                  (assoc a :challenge challenge
+                         :public-key-b64 (:public-key-b64 (:registration @state))))))
+        (.then (fn [r]
+                 (expect-deny "a misspelt user-verification policy still refuses UV=0" r)
+                 (assert! {:origin origin :challenge challenge :user-verified? false})))
+        (.then (fn [a]
+                 (edge/verify-authentication!
+                  (assoc config :user-verification :preferred)
+                  (assoc a :challenge challenge
+                         :public-key-b64 (:public-key-b64 (:registration @state))))))
+        (.then (fn [r]
+                 (check! "an explicit :preferred lane accepts UV=0" (true? (:ok r)) (pr-str r))
+                 (check! "…and says so, so the caller can grade the session"
+                         (false? (:user-verified? r)) (pr-str r))
+
+                 ;; ── backup eligibility / backup state ────────────────────
+                 (assert! {:origin origin :challenge challenge
+                           :backup-eligible? true :backed-up? true})))
+        (.then (fn [a]
+                 (edge/verify-authentication!
+                  config (assoc a :challenge challenge
+                                :public-key-b64 (:public-key-b64 (:registration @state))))))
+        (.then (fn [r]
+                 (check! "a synced credential reports BE and BS"
+                         (and (true? (:ok r)) (true? (:backup-eligible? r)) (true? (:backed-up? r)))
+                         (pr-str r))
+                 (assert! {:origin origin :challenge challenge :backup-eligible? true})))
+        (.then (fn [a]
+                 (edge/verify-authentication!
+                  config (assoc a :challenge challenge
+                                :public-key-b64 (:public-key-b64 (:registration @state))))))
+        (.then (fn [r]
+                 ;; Sync turned off: eligible, no longer backed up. Reported,
+                 ;; never refused — a device-bound credential is what an
+                 ;; administrator carrying two hardware keys has.
+                 (check! "a credential that is eligible but not backed up is accepted and reported"
+                         (and (true? (:ok r)) (true? (:backup-eligible? r)) (false? (:backed-up? r)))
+                         (pr-str r)))))))
+
+(-> (va/create! rp-id)
+    (.then run)
+    (.then (fn [_]
+             (if (seq @failures)
+               (do (println "\nFAILED:" (count @failures) (pr-str @failures))
+                   (set! (.-exitCode js/process) 1))
+               (println "\nwebauthn edge ceremony smoke: all checks passed"))))
+    (.catch (fn [e] (println "threw:" e) (set! (.-exitCode js/process) 1))))

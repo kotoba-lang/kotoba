@@ -1,0 +1,266 @@
+(ns bone-geometry-test
+  "JVM proofs for the anatomical generators in `kami.webgpu.geometry` — `loft`,
+  `long-bone`, `vertebral-body`.
+
+  These need no GPU and no browser, which is the whole reason the generators live
+  in this repo rather than in the app that draws them. A bone mesh has four
+  properties that are invisible on screen until they are catastrophic:
+
+    closed      every edge borders exactly two triangles, so the solid has no gap
+    sound       no triangle has zero area, so no normal is undefined
+    oriented    every shared edge is traversed in OPPOSITE directions by its two
+                triangles, and the signed volume is positive — together that is
+                the exact statement that every face points outward
+    shaded      every vertex normal agrees with every face that uses it
+
+  The last one is the one that bit. A shading normal in the opposite hemisphere
+  from its own face lights as a hole, and a hole looks like a shader bug rather
+  than a geometry bug, so it is looked for in the wrong repo.
+
+  Positions are compared after quantisation because a seam vertex is duplicated
+  on purpose (to carry u=0 and u=1 at the same place) and a creased ring is
+  duplicated on purpose too; both are the SAME POINT and the topology has to be
+  judged on the point, not the index."
+  (:require [kotoba.test :refer [deftest is testing run-tests]]
+            [kami.webgpu.geometry :as g]))
+
+;; --- helpers -----------------------------------------------------------------
+
+(defn- tri-verts [{:keys [positions indices]}]
+  (map (fn [[a b c]] [(nth positions a) (nth positions b) (nth positions c)])
+       (partition 3 indices)))
+
+(defn- face-normal [[p q r]]
+  (let [[ux uy uz] (mapv - q p) [vx vy vz] (mapv - r p)]
+    [(- (* uy vz) (* uz vy)) (- (* uz vx) (* ux vz)) (- (* ux vy) (* uy vx))]))
+
+(defn- mag [[x y z]] (Math/sqrt (+ (* x x) (* y y) (* z z))))
+
+(defn- tri-area [t] (* 0.5 (mag (face-normal t))))
+
+(defn- signed-volume
+  "Six times the signed volume, summed as tetrahedra on the origin. Positive iff
+  the (consistently oriented) surface faces outward."
+  [m]
+  (reduce + (for [[[ax ay az] [bx by bz] [cx cy cz]] (tri-verts m)]
+              (/ (+ (* ax (- (* by cz) (* bz cy)))
+                    (* ay (- (* bz cx) (* bx cz)))
+                    (* az (- (* bx cy) (* by cx))))
+                 6.0))))
+
+(defn- pkey [p] (mapv #(Math/round (* 1e7 (double %))) p))
+
+(defn- directed-edges [m]
+  (mapcat (fn [[p q r]] [[(pkey p) (pkey q)] [(pkey q) (pkey r)] [(pkey r) (pkey p)]])
+          (tri-verts m)))
+
+(defn- edge-share-counts
+  "How many triangles border each undirected edge, keyed by position."
+  [m]
+  (frequencies (map (fn [[a b]] (if (neg? (compare a b)) [a b] [b a])) (directed-edges m))))
+
+(defn- bbox [{:keys [positions]}]
+  (mapv (fn [i] [(apply min (map #(nth % i) positions))
+                 (apply max (map #(nth % i) positions))])
+        [0 1 2]))
+
+(defn- extent [m i] (let [[lo hi] (nth (bbox m) i)] (- hi lo)))
+
+(defn- close? [a b tol] (< (Math/abs (- (double a) (double b))) tol))
+
+(defn- ring-radii
+  "Max distance from the y-axis at each distinct height. A cylinder's are all
+  equal; a bone's are not, and that difference is the whole point of this change."
+  [{:keys [positions]}]
+  (->> positions
+       (group-by #(Math/round (* 1e6 (double (nth % 1)))))
+       (map (fn [[_ ps]] (apply max (map (fn [[x _ z]] (Math/sqrt (+ (* x x) (* z z)))) ps))))
+       (remove #(< % 1e-9))
+       vec))
+
+;; The three meshes under test, at the scale the app actually draws them (a
+;; forearm is ~0.26 m long and ~0.026 m thick) plus one at unit scale, because a
+;; bone whose girth is comparable to its length is the aspect ratio that produced
+;; the near-180° condylar ridge.
+(def ^:private specimens
+  {:unit-long-bone (g/long-bone)
+   :forearm (g/long-bone {:length 0.26 :shaft-radius 0.026 :sectors 20
+                          :proximal-flare 1.55 :distal-flare 1.25 :flatten 0.82})
+   :bowed-femur (g/long-bone {:length 0.42 :shaft-radius 0.034 :sectors 20
+                              :proximal-flare 1.9 :distal-flare 2.1 :bow 0.5
+                              :flatten 0.9})
+   :vertebra (g/vertebral-body)
+   :lumbar (g/vertebral-body {:length 0.24 :radius 0.06 :sectors 20
+                              :endplate-flare 1.2 :waist 0.8 :posterior-flatten 0.55})})
+
+;; --- counts ------------------------------------------------------------------
+
+(deftest loft-counts-follow-the-profile-and-the-stations
+  (testing "a sweep with no crease: (stations + 2 caps) rings of (n+1) verts"
+    (let [n 12
+          m (g/loft (g/ring-profile n)
+                    [{:y 0.0 :radius [1.0 1.0]}
+                     {:y 1.0 :radius [1.1 1.1]}
+                     {:y 2.0 :radius [1.0 1.0]}])]
+      (is (= (* (+ 3 2) (inc n)) (count (:positions m)))
+          "3 stations + 2 cap rings, each (n+1) verts")
+      (is (= (* 2 n 3) (g/tri-count m)) "2·n per band, plus n per cap")
+      (is (= (count (:positions m)) (count (:normals m))))
+      (is (= (count (:positions m)) (count (:uvs m))))
+      (is (every? #(< -1 % (count (:positions m))) (:indices m)) "every index in range")))
+  (testing "long-bone has 15 stations, so 30·sectors triangles"
+    (doseq [s [8 16 20 24]]
+      (is (= (* 30 s) (g/tri-count (g/long-bone {:sectors s}))))))
+  (testing "vertebral-body has 5 stations, so 10·sectors triangles"
+    (doseq [s [8 16 20]]
+      (is (= (* 10 s) (g/tri-count (g/vertebral-body {:sectors s})))))))
+
+(deftest a-creasing-ring-is-duplicated-and-the-vertex-count-says-so
+  ;; The vertex count is the observable consequence of the crease split, so it is
+  ;; also the way to prove the split happened at all rather than being a comment.
+  (let [n 12
+        ;; two bands that meet at a right angle: straight up, then straight out
+        stations [{:y 0.0 :radius [1.0 1.0]}
+                  {:y 1.0 :radius [1.0 1.0]}
+                  {:y 1.02 :radius [2.0 2.0]}]
+        split (g/loft (g/ring-profile n) stations)
+        smooth (g/loft (g/ring-profile n) stations {:crease-angle-deg 179.0})]
+    (is (= (* (+ 3 2) (inc n)) (count (:positions smooth)))
+        "with the threshold relaxed past the crease, nothing is duplicated")
+    (is (= (* (+ 3 1 2) (inc n)) (count (:positions split)))
+        "at the default 60° the middle ring is duplicated: one extra ring of verts")
+    (is (= (g/tri-count smooth) (g/tri-count split))
+        "splitting a ring adds vertices, never triangles")))
+
+;; --- the four mesh properties ------------------------------------------------
+
+(deftest bone-meshes-are-closed-manifolds
+  (doseq [[nm m] specimens]
+    (let [bad (remove #(= 2 (val %)) (edge-share-counts m))]
+      (is (empty? bad)
+          (str nm ": every edge must border exactly two triangles; "
+               (count bad) " did not, e.g. " (first bad))))))
+
+(deftest bone-meshes-have-no-degenerate-triangles
+  (doseq [[nm m] specimens]
+    (let [scale (reduce max (map (fn [[lo hi]] (- hi lo)) (bbox m)))
+          floor (* 1e-9 scale scale)
+          bad (filter #(<= (tri-area %) floor) (tri-verts m))]
+      (is (empty? bad)
+          (str nm ": " (count bad) " triangles of area <= " floor
+               " (a zero-area triangle has no normal, so it shades as garbage)")))))
+
+(deftest bone-meshes-are-consistently-wound-outward
+  ;; Two claims that are only meaningful together. The directed-edge test says the
+  ;; orientation is CONSISTENT (no triangle disagrees with its neighbour); the
+  ;; signed volume says which way that consistent orientation faces. Either alone
+  ;; is satisfied by a mesh that is inside-out.
+  (doseq [[nm m] specimens]
+    (let [dupes (remove #(= 1 (val %)) (frequencies (directed-edges m)))]
+      (is (empty? dupes)
+          (str nm ": every directed edge must appear exactly once — a shared edge "
+               "traversed the same way twice means the two triangles disagree; "
+               (count dupes) " did")))
+    (is (pos? (signed-volume m))
+        (str nm ": signed volume " (signed-volume m)
+             " — consistently wound, but inside out"))))
+
+(deftest bone-normals-agree-with-the-faces-that-use-them
+  ;; The regression that motivated the crease split. Measured 2026-09-06 on
+  ;; long-bone defaults with central-difference normals: 32 of 416 faces were lit
+  ;; by a normal pointing into the opposite hemisphere.
+  (doseq [[nm m] specimens]
+    (let [{:keys [positions normals indices]} m
+          bad (for [[a b c] (partition 3 indices)
+                    :let [fn' (face-normal [(nth positions a) (nth positions b) (nth positions c)])]
+                    v [a b c]
+                    :when (<= (reduce + (map * fn' (nth normals v))) 0.0)]
+                [v fn'])]
+      (is (empty? bad)
+          (str nm ": " (count bad) " vertex-normal/face pairs point into opposite "
+               "hemispheres — that shades as a hole")))
+    (is (every? #(close? 1.0 (mag %) 1e-9) (:normals m))
+        (str nm ": every supplied normal must be unit length"))))
+
+;; --- the parameters mean what they say ---------------------------------------
+
+(deftest long-bone-bounding-box-is-the-requested-length-and-girth
+  (doseq [[len r pf df flat] [[1.0 1.0 1.7 1.7 1.0]
+                              [0.26 0.026 1.55 1.25 0.82]
+                              [2.0 0.5 1.7 1.3 0.75]]]
+    (let [m (g/long-bone {:length len :shaft-radius r :sectors 16
+                          :proximal-flare pf :distal-flare df :flatten flat :bow 0.0})
+          widest (* r (max pf df 1.05))]
+      (is (close? len (extent m 1) 1e-12)
+          (str "y extent must be exactly the requested length " len))
+      (is (close? (* 2 widest) (extent m 0) 1e-12)
+          (str "x extent must be 2·max(flare)·shaft-radius = " (* 2 widest)))
+      (is (close? (* 2 widest flat) (extent m 2) 1e-12)
+          (str "z extent must be that × :flatten = " (* 2 widest flat))))))
+
+(deftest vertebral-body-bounding-box-is-the-requested-length-and-girth
+  (let [len 0.24 r 0.06 flare 1.2 post 0.55
+        m (g/vertebral-body {:length len :radius r :sectors 16
+                             :endplate-flare flare :posterior-flatten post})]
+    (is (close? len (extent m 1) 1e-12) "y extent is the requested length")
+    (is (close? (* 2 flare r) (extent m 0) 1e-12) "x extent is 2·endplate-flare·radius")
+    (is (close? (* flare r (+ 1.0 post)) (extent m 2) 1e-12)
+        "z extent is short on the posterior side by the flattening factor")))
+
+(deftest long-bone-tracks-the-length-it-is-given
+  ;; The simulator hands over a segment length that moves with stature. The mesh
+  ;; has to follow it without changing shape or triangle budget.
+  (let [a (g/long-bone {:length 0.24 :shaft-radius 0.03})
+        b (g/long-bone {:length 0.36 :shaft-radius 0.03})]
+    (is (close? 0.24 (extent a 1) 1e-12))
+    (is (close? 0.36 (extent b 1) 1e-12))
+    (is (= (g/tri-count a) (g/tri-count b)) "a longer bone is not a denser bone")
+    (is (close? (extent a 0) (extent b 0) 1e-12)
+        "girth is set by :shaft-radius alone, not by the length")))
+
+(deftest a-long-bone-is-not-the-cylinder-it-replaces
+  ;; The discriminating assertion. Every other test here would also pass on a
+  ;; cylinder: a cylinder is closed, sound, oriented and correctly shaded, and its
+  ;; bounding box is its length by its girth. What a cylinder is NOT is varying in
+  ;; radius along its length.
+  (let [cyl (ring-radii (g/cylinder 1.0 1.0 16))
+        bone (ring-radii (g/long-bone {:sectors 16}))
+        ratio (fn [rs] (/ (apply max rs) (apply min rs)))]
+    (is (close? 1.0 (ratio cyl) 1e-9)
+        "a cylinder has one radius at every height — that is the thing being replaced")
+    (is (> (ratio bone) 1.5)
+        (str "a long bone's widest ring must be at least 1.5× its narrowest; got "
+             (ratio bone)))
+    (is (< (apply min bone) (apply max cyl))
+        "and its waist must be narrower than the rod it replaces, not merely lumpier"))
+  (let [vb (ring-radii (g/vertebral-body {:sectors 16}))]
+    (is (> (/ (apply max vb) (apply min vb)) 1.2)
+        "a vertebral body is waisted between its endplates")))
+
+(deftest long-bone-bow-displaces-the-shaft-and-not-the-ends
+  ;; The bow has to leave the ends on the axis, because the ends are where the
+  ;; joints are and the app places the bone by its endpoints.
+  (let [straight (g/long-bone {:length 1.0 :shaft-radius 0.1 :sectors 16 :bow 0.0})
+        bowed (g/long-bone {:length 1.0 :shaft-radius 0.1 :sectors 16 :bow 0.6})
+        ;; ##-Inf rather than (apply max) on an empty seq: when a break moves the
+        ;; stations, an empty filter should FAIL with the label, not throw
+        widest (fn [ps] (if (seq ps) (apply max ps) ##-Inf))
+        mid-x (fn [m] (widest (->> (:positions m)
+                                   (filter #(< (Math/abs (double (nth % 1))) 1e-9))
+                                   (map first))))
+        end-x (fn [m] (widest (->> (:positions m)
+                                   (filter #(close? 0.5 (nth % 1) 1e-9))
+                                   (map first))))]
+    (is (> (mid-x bowed) (+ (mid-x straight) 0.05))
+        "the mid-shaft moves along +X when bowed")
+    (is (close? (end-x straight) (end-x bowed) 1e-12)
+        "the ends do not move: the joints stay where the pose put them")))
+
+(deftest bone-generators-are-deterministic
+  (is (= (g/long-bone {:sectors 12 :bow 0.3}) (g/long-bone {:sectors 12 :bow 0.3})))
+  (is (= (g/vertebral-body {:sectors 12}) (g/vertebral-body {:sectors 12})))
+  (is (= (g/ring-profile 9) (g/ring-profile 9))))
+
+(let [{:keys [fail error]} (run-tests 'bone-geometry-test)]
+  (when (pos? (+ fail error))
+    (throw (ex-info "bone geometry tests failed" {:fail fail :error error}))))

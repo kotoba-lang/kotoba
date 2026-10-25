@@ -1,0 +1,128 @@
+(ns macaroon.core-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [macaroon.caveat :as cav]
+            [macaroon.core :as m]
+            [macaroon.hmac :as h]))
+
+(def root-key "server-root-key-32-bytes-or-more!")
+
+(defn- fresh []
+  (m/mint {:location "kotobase.net" :identifier "tenant/acme/table/prices"
+           :root-key root-key :hmac-fn h/hmac}))
+
+(deftest a-holder-can-narrow-without-a-key
+  (testing "the property the whole construction exists for"
+    (let [t (fresh)
+          narrowed (m/attenuate t {:caveat/kind :before :caveat/instant "2026-09-01T00:00:00Z"}
+                                h/hmac)]
+      ;; No root key was used to attenuate — only the token's own signature.
+      (is (m/intact? narrowed root-key h/hmac))
+      (is (not= (:macaroon/signature t) (:macaroon/signature narrowed))))))
+
+(deftest a-caveat-cannot-be-removed
+  (let [t (-> (fresh)
+              (m/attenuate {:caveat/kind :before :caveat/instant "2026-09-01T00:00:00Z"} h/hmac)
+              (m/attenuate {:caveat/kind :holder :caveat/did "did:key:zBob"} h/hmac))
+        stripped (update t :macaroon/caveats pop)]
+    (testing "dropping a caveat leaves a signature that no longer recomputes"
+      (is (m/intact? t root-key h/hmac))
+      (is (not (m/intact? stripped root-key h/hmac))))
+    (testing "and the signature a stripped token WOULD need is only computable with the root key"
+      ;; `stripped` still carries the two-caveat signature, so it is the
+      ;; attacker's position exactly: the caveat list can be edited freely
+      ;; and the signature cannot be recomputed to match it.
+      (let [server-would-sign (m/signature-of stripped root-key h/hmac)]
+        (is (not= server-would-sign (:macaroon/signature stripped)))
+        ;; and with that signature installed it IS intact -- which is why the
+        ;; root key must never leave the verifier.
+        (is (m/intact? (assoc stripped :macaroon/signature server-would-sign)
+                       root-key h/hmac))))))
+
+(deftest caveat-order-is-signed
+  (let [a {:caveat/kind :before :caveat/instant "2026-09-01T00:00:00Z"}
+        b {:caveat/kind :holder :caveat/did "did:key:zBob"}
+        ab (-> (fresh) (m/attenuate a h/hmac) (m/attenuate b h/hmac))
+        ba (-> (fresh) (m/attenuate b h/hmac) (m/attenuate a h/hmac))]
+    (testing "the chain is a fold, so reordering is a different token"
+      (is (not= (:macaroon/signature ab) (:macaroon/signature ba)))
+      (is (m/intact? ab root-key h/hmac))
+      (is (m/intact? ba root-key h/hmac)))))
+
+(deftest verification-distinguishes-broken-from-expired
+  (let [t (m/attenuate (fresh) {:caveat/kind :before :caveat/instant "2026-09-01T00:00:00Z"} h/hmac)]
+    (is (= :verified (:reason (m/verify t {:root-key root-key :hmac-fn h/hmac
+                                           :now "2026-08-18T00:00:00Z"}))))
+    (testing "an expired token is Tuesday; a broken one is an attack"
+      (is (= :caveat-not-met (:reason (m/verify t {:root-key root-key :hmac-fn h/hmac
+                                                   :now "2026-09-02T00:00:00Z"}))))
+      (is (= :signature-mismatch
+             (:reason (m/verify (update t :macaroon/caveats pop)
+                                {:root-key root-key :hmac-fn h/hmac
+                                 :now "2026-08-18T00:00:00Z"})))))))
+
+(deftest a-caveat-the-verifier-cannot-answer-fails-closed
+  (testing "no clock means :before is not met, rather than not checked"
+    (let [t (m/attenuate (fresh) {:caveat/kind :before :caveat/instant "2026-09-01T00:00:00Z"} h/hmac)]
+      (is (false? (:ok? (m/verify t {:root-key root-key :hmac-fn h/hmac}))))))
+  (testing "an opaque caveat with no verifier is not met"
+    (let [t (m/attenuate (fresh) {:caveat/kind :opaque :caveat/predicate {:ip "10.0.0.1"}} h/hmac)]
+      (is (false? (:ok? (m/verify t {:root-key root-key :hmac-fn h/hmac
+                                     :now "2026-08-18T00:00:00Z"}))))
+      (is (true? (:ok? (m/verify t {:root-key root-key :hmac-fn h/hmac
+                                    :now "2026-08-18T00:00:00Z"
+                                    :opaque-verify (constantly true)})))))))
+
+(deftest an-unknown-caveat-kind-is-refused-at-mint-time
+  (testing "for the party who can fix it, not the one who can only deny"
+    (is (thrown? #?(:clj Exception :cljs :default)
+                 (m/attenuate (fresh) {:caveat/kind :ip :caveat/value "10.0.0.1"} h/hmac)))))
+
+(deftest a-caveat-kind-this-verifier-never-heard-of-fails-closed
+  (testing "the realistic path: a token minted by a newer version"
+    ;; `attenuate` normalises, so an unknown kind cannot be created here. It
+    ;; arrives by DESERIALIZATION -- which is the entire reason the rule
+    ;; exists, and the case a mint-time refusal cannot cover. The signature
+    ;; is made intact on purpose, so the test isolates caveat handling from
+    ;; integrity.
+    (let [unknown {:caveat/kind :ip-range :caveat/value "10.0.0.0/8"}
+          t (-> (fresh)
+                (update :macaroon/caveats conj unknown))
+          t (assoc t :macaroon/signature (m/signature-of t root-key h/hmac))
+          v (m/verify t {:root-key root-key :hmac-fn h/hmac
+                         :now "2026-08-18T00:00:00Z"})]
+      (is (m/intact? t root-key h/hmac))
+      (testing "an unrecognised restriction must not read as an absent one"
+        (is (false? (:ok? v)))
+        (is (= :caveat-not-met (:reason v)))
+        (is (= [unknown] (:unmet v)))))))
+
+(deftest an-empty-scope-caveat-is-refused
+  (is (thrown? #?(:clj Exception :cljs :default)
+               (cav/caveat {:caveat/kind :scope :caveat/scopes []}))))
+
+(deftest an-empty-identifier-is-refused
+  (is (thrown? #?(:clj Exception :cljs :default)
+               (m/mint {:identifier "" :root-key root-key :hmac-fn h/hmac}))))
+
+(deftest crypto-is-not-defaulted
+  (testing "a token library with a built-in MAC is a library that owns keys"
+    (is (thrown? #?(:clj Exception :cljs :default)
+                 (m/mint {:identifier "x" :root-key root-key})))))
+
+(deftest third-party-caveat-seals-to-the-signature-at-that-point
+  (let [seal-fn (fn [sig k] (h/hmac sig k))          ; a stand-in binder
+        t1 (m/add-third-party (fresh) {:location "auth.example" :caveat-key "ck1"
+                                       :identifier "user-is-employee"}
+                              {:hmac-fn h/hmac :seal-fn seal-fn})
+        t2 (m/add-third-party (m/attenuate (fresh) {:caveat/kind :holder :caveat/did "did:key:zA"} h/hmac)
+                              {:location "auth.example" :caveat-key "ck1"
+                               :identifier "user-is-employee"}
+                              {:hmac-fn h/hmac :seal-fn seal-fn})
+        vid-of (fn [t] (-> t :macaroon/caveats last :caveat/predicate :third-party/vid))]
+    (testing "the same caveat key at two different chain positions seals differently"
+      (is (not= (vid-of t1) (vid-of t2))))
+    (is (m/intact? t1 root-key h/hmac))))
+
+(deftest serialization-is-canonical
+  (let [t (m/attenuate (fresh) {:caveat/kind :holder :caveat/did "did:key:zBob"} h/hmac)]
+    (is (= (m/serialize t) (m/serialize (into {} (reverse (seq t))))))))

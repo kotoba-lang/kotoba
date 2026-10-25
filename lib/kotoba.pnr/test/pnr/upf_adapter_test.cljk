@@ -1,0 +1,99 @@
+(ns pnr.upf-adapter-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [upf.domain :as upf-domain]
+            [upf.strategy :as upf-strategy]
+            [pnr.upf-adapter :as upf-adapter]))
+
+(def domains
+  "Small hand-built domain registry with nested/prefixed scopes, mirroring
+  org-ieee-upf's own domain_test fixture: PD_TOP covers the whole chip,
+  PD_CPU is nested under it, PD_CPU_CORE is nested one level deeper still
+  -- exercises longest-prefix-match resolution."
+  [(upf-domain/create-power-domain "PD_TOP" ["top"])
+   (upf-domain/create-power-domain "PD_CPU" ["top/cpu"])
+   (upf-domain/create-power-domain "PD_CPU_CORE" ["top/cpu/core"])])
+
+(deftest cell-power-domain-resolves-longest-prefix
+  (testing "a placed cell's :instance-name resolves via longest-prefix match"
+    (is (= "PD_CPU_CORE"
+           (upf-adapter/cell-power-domain
+            domains {:cell-name "ALU" :instance-name "top/cpu/core/alu"})))
+    (is (= "PD_CPU"
+           (upf-adapter/cell-power-domain
+            domains {:cell-name "DEC" :instance-name "top/cpu/decode"})))
+    (is (= "PD_TOP"
+           (upf-adapter/cell-power-domain
+            domains {:cell-name "MEMCTL" :instance-name "top/mem"}))))
+  (testing "an instance path no domain's scope covers resolves to nil (unscoped)"
+    (is (nil? (upf-adapter/cell-power-domain
+               domains {:cell-name "IO" :instance-name "other/thing"})))))
+
+(deftest partition-by-domain-groups-across-domains-and-unscoped
+  (let [placed-cells [{:cell-name "INV" :instance-name "top/cpu/u0"
+                        :x 0 :y 0.0 :orientation :n :row-idx 0}
+                       {:cell-name "BUF" :instance-name "top/cpu/core/u1"
+                        :x 1 :y 0.0 :orientation :n :row-idx 0}
+                       {:cell-name "NAND2" :instance-name "other/gpu/u2"
+                        :x 2 :y 0.0 :orientation :n :row-idx 0}]
+        parts (upf-adapter/partition-by-domain domains placed-cells)]
+    (testing "cells land in their resolved domain's bucket"
+      (is (= #{"top/cpu/u0"} (set (map :instance-name (get parts "PD_CPU")))))
+      (is (= #{"top/cpu/core/u1"} (set (map :instance-name (get parts "PD_CPU_CORE"))))))
+    (testing "a cell whose instance path no domain covers (outside PD_TOP's \"top\" scope too) lands under :unscoped"
+      (is (= #{"other/gpu/u2"} (set (map :instance-name (get parts :unscoped))))))
+    (testing "every input cell is accounted for exactly once"
+      (is (= 3 (apply + (map count (vals parts))))))))
+
+(deftest domain-crossing-nets-flags-only-crossing-nets
+  (let [cells [{:cell-name "INV" :instance-name "top/cpu/a"
+                :x 0 :y 0.0 :orientation :n :row-idx 0}
+               {:cell-name "BUF" :instance-name "top/cpu/b"
+                :x 1 :y 0.0 :orientation :n :row-idx 0}
+               {:cell-name "NAND2" :instance-name "top/cpu/core/c"
+                :x 2 :y 0.0 :orientation :n :row-idx 0}]
+        net->pins {"net_same" ["top/cpu/a" "top/cpu/b"]
+                   "net_cross" ["top/cpu/a" "top/cpu/core/c"]}
+        strategies [(upf-strategy/set-isolation "ISO1" "PD_CPU_CORE" "iso_en" 0 :coarse)
+                    (upf-strategy/set-level-shifter "LS1" "PD_CPU" :self)]
+        crossings (upf-adapter/domain-crossing-nets domains cells net->pins strategies)]
+    (testing "a net entirely within one domain (PD_CPU) is not flagged"
+      (is (nil? (some #(= "net_same" (:net %)) crossings))))
+    (testing "a net spanning PD_CPU and PD_CPU_CORE is flagged with both domains"
+      (is (= 1 (count crossings)))
+      (let [crossing (first crossings)]
+        (is (= "net_cross" (:net crossing)))
+        (is (= #{"PD_CPU" "PD_CPU_CORE"} (:domains crossing)))
+        (testing "required-strategies combines applicable-strategies for every domain touched"
+          (is (= #{"ISO1" "LS1"} (set (map :strategy-name (:required-strategies crossing))))))))
+    (testing "the 3-arity (no strategies) still detects crossings, with empty required-strategies"
+      (let [crossings-no-strategies (upf-adapter/domain-crossing-nets domains cells net->pins)]
+        (is (= 1 (count crossings-no-strategies)))
+        (is (= [] (:required-strategies (first crossings-no-strategies))))))))
+
+(deftest validate-domain-placement-detects-violation
+  (let [blocks [{:name "cpu_block" :x 0.0 :y 0.0 :width 10.0 :height 10.0 :power-domain "PD_CPU"}]]
+    (testing "a cell inside a domain-scoped block resolving to a DIFFERENT domain is a violation"
+      (let [cells [{:cell-name "INV" :instance-name "top/cpu/core/bad"
+                    :x 2.0 :y 2.0 :orientation :n :row-idx 0}]
+            violations (upf-adapter/validate-domain-placement domains cells blocks)]
+        (is (= [{:cell "top/cpu/core/bad" :expected-domain "PD_CPU"
+                 :actual-domain "PD_CPU_CORE" :block "cpu_block"}]
+               violations))))
+    (testing "an unscoped cell inside a domain-scoped block is also a violation"
+      (let [cells [{:cell-name "IO" :instance-name "other/thing"
+                    :x 2.0 :y 2.0 :orientation :n :row-idx 0}]
+            violations (upf-adapter/validate-domain-placement domains cells blocks)]
+        (is (= [{:cell "other/thing" :expected-domain "PD_CPU"
+                 :actual-domain nil :block "cpu_block"}]
+               violations))))))
+
+(deftest validate-domain-placement-consistent-fixture-has-no-violations
+  (let [blocks [{:name "cpu_block" :x 0.0 :y 0.0 :width 10.0 :height 10.0 :power-domain "PD_CPU"}
+                {:name "misc_block" :x 10.0 :y 0.0 :width 10.0 :height 10.0}]
+        cells [{:cell-name "INV" :instance-name "top/cpu/ok"
+                :x 2.0 :y 2.0 :orientation :n :row-idx 0}
+               {:cell-name "BUF" :instance-name "top/gpu/whatever"
+                :x 12.0 :y 2.0 :orientation :n :row-idx 0}]]
+    (testing "a cell matching its enclosing domain-scoped block's domain, plus a cell of a
+              different domain inside a block that declares no :power-domain -- zero violations"
+      (is (= [] (upf-adapter/validate-domain-placement domains cells blocks))))))

@@ -1,0 +1,257 @@
+(ns kotoba.teleop
+  "Teleop -> kotoba.robotics bridge: the governed bridge between a
+  game-controller input device and a robot's safety-gated actuation
+  contract. This is *policy and mapping only* — no device I/O (a host
+  loop reads the physical controller and hands this namespace decoded
+  axis-state frames), no network I/O (a host loop opens the rosbridge/DDS
+  transport and hands `->twist`'s output to `kotoba.ros.msgs/encode-twist`
+  itself). This namespace only decides *what to propose* and *when to
+  stop*; `kotoba.robotics/gate` — called by the operator/governor, not by
+  this namespace — decides what may reach hardware.
+
+  ## Device-agnostic core
+
+  Every function here works over a generic axis-state map, not a specific
+  controller brand:
+
+  ```
+  {:left-stick [<x -1..1> <y -1..1>] :right-stick [<x -1..1> <y -1..1>]
+   :l2 <0..1> :r2 <0..1> :buttons #{...keywords...} :dpad <keyword>}
+  ```
+
+  `kotoba.teleop.dualsense/decoded->axis-state` is the only place that
+  knows about a specific controller (Sony DualSense, via
+  `kotoba.dualsense.input`); a future Xbox/generic-HID adapter would add
+  its own `decoded->axis-state` analogue and reuse everything in this
+  namespace unchanged.
+
+  ## Turbo mode is deliberately gated behind human sign-off
+
+  `speed-modes`' `:turbo` entry carries `:safety :high`. That is not an
+  oversight — a `:move` action built while in turbo mode always comes
+  back `:require-sign-off` from `kotoba.robotics/gate`, *even if* `:high`
+  is in the caller's allowed safety-class set (`gate` treats `:high` and
+  `:safety-critical` as always requiring a separate human-in-the-loop
+  stage, never a bare `:permit`). Turbo is the one speed mode that lets
+  an operator drive at 2x normal linear/angular rate; requiring a human
+  sign-off before that reaches hardware is the actual safety mechanism
+  for the mode, not a side effect of it.
+
+  ## The deadman-switch and e-stop chord bypass the gate entirely — on
+  purpose
+
+  A *stop* must never wait on a permission check. `step` therefore never
+  routes a `kotoba.robotics/safety-stop` through `kotoba.robotics/gate`:
+  both the deadman-release stop and the e-stop-chord stop are emitted
+  directly, unconditionally, the instant the triggering condition is
+  observed.
+
+  - **Deadman switch** (default: `:l2` held past `0.5`): motion is only
+    ever proposed while the deadman axis is held past its threshold —
+    this is a hold-to-drive control, not a toggle. The moment it
+    transitions held -> not-held (the operator deliberately let go, or
+    simply stopped actively holding it), `step` emits a `safety-stop`
+    with reason **`:operator`** — not `:e-stop`. That distinction is
+    deliberate: releasing a hold-to-drive control is an ordinary,
+    expected, non-emergency way to stop (the operator did not hit an
+    emergency-stop control; they stopped asserting \"drive\"), so it is
+    modeled as an operator-sourced stop, not an emergency one.
+  - **E-stop chord** (default: `#{:ps :options}` held together): a
+    deliberate two-button combo unlikely to be triggered by accident.
+    Holding it emits a `safety-stop` with reason **`:e-stop`**,
+    unconditionally, taking priority over every other check `step` makes.
+
+  This mirrors the design of `com-etzhayyim-tazuna`'s independently-built
+  teleop-safety reasoner
+  (`orgs/etzhayyim/com-etzhayyim-tazuna/methods/teleop_safety.cljc`,
+  `ALWAYS-PERMITTED #{\"halt\" \"estop\" \"handback\"}`): halt/estop-class
+  commands are *never gated or signed*, because by the time an operator
+  needs to stop, asking a governor for permission first is exactly the
+  failure mode a safety-stop exists to avoid. tazuna is cited here as
+  design rationale only — this namespace does not depend on or modify it.
+
+  ## `->twist` mapping (standard differential-drive convention)
+
+  `->twist` maps the left stick's Y axis to `linear.x` (forward/back) and
+  the right stick's X axis to `angular.z` (turn rate), both scaled by the
+  speed-mode's `:scale`. `linear.y`/`linear.z`/`angular.x`/`angular.y`
+  stay `0.0` — a differential-drive base can't strafe or fly, so those
+  axes are meaningless for it. This is the standard RC-car-style teleop
+  mapping (also `sensor_msgs/Joy` -> `geometry_msgs/Twist` teleop-twist
+  convention in ROS)."
+  (:require [kotoba.lang.coll :as set]
+            [kotoba.robotics :as rob]))
+
+;; ---------------------------------------------------------------------------
+;; Speed modes
+;; ---------------------------------------------------------------------------
+
+(def speed-modes
+  "Teleop speed-mode table: each mode's linear/angular scale factor and
+  the `kotoba.robotics` safety class a `:move` action built in that mode
+  carries.
+
+  `:turbo`'s `:safety :high` is the actual safety mechanism for turbo
+  mode, not an oversight: `kotoba.robotics/gate` always routes `:high`
+  (and `:safety-critical`) actions to `:require-sign-off`, so a turbo-mode
+  move action can never reach hardware without a human-in-the-loop
+  sign-off, however permissive the operator's allowed safety-class set
+  is. See the namespace docstring's \"Turbo mode\" section."
+  {:crawl  {:scale 0.25 :safety :low}
+   :normal {:scale 1.0  :safety :medium}
+   :turbo  {:scale 2.0  :safety :high}})
+
+;; ---------------------------------------------------------------------------
+;; Deadman switch
+;; ---------------------------------------------------------------------------
+
+(def default-deadman-axis
+  "Default deadman-switch axis: the DualSense L2 analog trigger, a
+  natural hold-to-drive control."
+  :l2)
+
+(def default-deadman-threshold
+  "Default deadman-switch threshold: the deadman axis must be held past
+  this value (on the axis-state's 0..1 trigger scale) for motion to be
+  permitted at all."
+  0.5)
+
+(defn deadman-held?
+  "True when the deadman control is held past `threshold` (default
+  `default-deadman-threshold`) on `axis` (default `default-deadman-axis`).
+  Callers may pass a different `:axis`/`:threshold` to use another
+  physical control (e.g. `:r2`, or a digital button read as 0/1) as the
+  deadman switch — the predicate is generic over any numeric axis-state
+  key."
+  [axis-state & {:keys [axis threshold]
+                 :or {axis default-deadman-axis threshold default-deadman-threshold}}]
+  (let [v (get axis-state axis)]
+    (boolean (and (number? v) (> v threshold)))))
+
+;; ---------------------------------------------------------------------------
+;; E-stop chord
+;; ---------------------------------------------------------------------------
+
+(def default-estop-chord
+  "Default e-stop chord: PS + Options held together — a deliberate
+  two-button combo unlikely to be pressed by accident during normal
+  driving."
+  #{:ps :options})
+
+(defn estop-chord-held?
+  "True when every button in `chord` (default `default-estop-chord`) is
+  currently held in `axis-state`'s `:buttons` set."
+  [axis-state & {:keys [chord] :or {chord default-estop-chord}}]
+  (set/subset? (set chord) (set (:buttons axis-state))))
+
+;; ---------------------------------------------------------------------------
+;; Twist mapping + move actions
+;; ---------------------------------------------------------------------------
+
+(defn ->twist
+  "Map `axis-state` + `speed-mode` (a key of `speed-modes`) to a
+  `geometry_msgs/msg/Twist`-shaped EDN map: `linear.x` from the left
+  stick's Y axis, `angular.z` from the right stick's X axis, both scaled
+  by the mode's `:scale`; every other field is `0.0` (see the namespace
+  docstring's mapping section). Callers who need wire bytes call
+  `kotoba.ros.msgs/encode-twist` on the result themselves — this
+  namespace never encodes CDR."
+  [axis-state speed-mode]
+  (let [scale (get-in speed-modes [speed-mode :scale] 1.0)
+        [_lx ly] (:left-stick axis-state)
+        [rx _ry] (:right-stick axis-state)]
+    {:linear  {:x (double (* (or ly 0.0) scale)) :y 0.0 :z 0.0}
+     :angular {:x 0.0 :y 0.0 :z (double (* (or rx 0.0) scale))}}))
+
+(defn ->move-action
+  "A `kotoba.robotics/action` `:move` action for `axis-state` at
+  `speed-mode`: safety class taken from `speed-modes`, params carrying
+  the `->twist`-shaped twist."
+  [id mission-id axis-state speed-mode]
+  (rob/action id mission-id :move (get-in speed-modes [speed-mode :safety])
+              :params {:twist (->twist axis-state speed-mode)}))
+
+;; ---------------------------------------------------------------------------
+;; The pure fold: one axis-state frame -> what to emit this tick
+;; ---------------------------------------------------------------------------
+
+(defn initial-state
+  "Construct the initial internal `step` state for one teleop session
+  bound to `mission-id`. Overridable via opts:
+
+  - `:speed-mode` (default `:normal`) — the starting entry in `speed-modes`.
+  - `:deadman-axis`/`:deadman-threshold` (defaults `default-deadman-axis`/
+    `default-deadman-threshold`).
+  - `:estop-chord` (default `default-estop-chord`)."
+  [mission-id & {:keys [speed-mode deadman-axis deadman-threshold estop-chord]
+                 :or {speed-mode :normal
+                      deadman-axis default-deadman-axis
+                      deadman-threshold default-deadman-threshold
+                      estop-chord default-estop-chord}}]
+  {:mission-id mission-id
+   :speed-mode speed-mode
+   :deadman-held? false
+   :deadman-axis deadman-axis
+   :deadman-threshold deadman-threshold
+   :estop-chord estop-chord
+   :next-id 0})
+
+(defn- mint-id
+  "A deterministic, monotonically-increasing action/stop id derived from
+  `state` alone — keeps `step` a pure fold (no gensym/UUID/wall-clock
+  impurity)."
+  [state]
+  (str "teleop-" (:next-id state 0)))
+
+(defn step
+  "Pure fold: given the previous internal `state` (see `initial-state`)
+  and one new `axis-state` frame, decide what to emit this tick, in
+  priority order:
+
+  1. **E-stop chord.** If held, emit a `safety-stop` with reason
+     `:e-stop`, unconditionally — this bypasses every other check,
+     including the deadman state, and is never routed through
+     `kotoba.robotics/gate`.
+  2. **Deadman release.** If the deadman was held last tick and is not
+     held this tick, emit a `safety-stop` with reason `:operator`
+     (deliberately not `:e-stop` — see the namespace docstring). Also
+     never routed through `gate`.
+  3. **Deadman held.** Otherwise, if the deadman is held this tick,
+     propose a `->move-action` at the current speed-mode. This *is*
+     subject to `kotoba.robotics/gate` — applied by the caller/governor,
+     not by this namespace — which is exactly where turbo mode's `:high`
+     safety class routes to `:require-sign-off`.
+  4. Otherwise (deadman not held, wasn't held last tick either): emit
+     nothing.
+
+  `dt` (seconds since the previous frame) is threaded through for a
+  future rate-limiting need; none of the logic above uses it yet — this
+  intentionally does not build out rate-limiting ahead of a real need.
+
+  Returns `{:state' <next-state> :emit [<action-or-safety-stop> ...]}`."
+  [state axis-state dt]
+  (let [{:keys [mission-id speed-mode deadman-axis deadman-threshold estop-chord]} state
+        was-held? (boolean (:deadman-held? state))
+        id (mint-id state)
+        state (update state :next-id (fnil inc 0))
+        now-held? (deadman-held? axis-state :axis deadman-axis :threshold deadman-threshold)]
+    (cond
+      (estop-chord-held? axis-state :chord estop-chord)
+      {:state' (assoc state :deadman-held? false)
+       :emit [(rob/safety-stop mission-id :e-stop
+                                :source :teleop
+                                :detail {:trigger :estop-chord :chord estop-chord :dt dt})]}
+
+      (and was-held? (not now-held?))
+      {:state' (assoc state :deadman-held? false)
+       :emit [(rob/safety-stop mission-id :operator
+                                :source :teleop
+                                :detail {:trigger :deadman-released :dt dt})]}
+
+      now-held?
+      {:state' (assoc state :deadman-held? true)
+       :emit [(->move-action id mission-id axis-state speed-mode)]}
+
+      :else
+      {:state' (assoc state :deadman-held? false)
+       :emit []})))

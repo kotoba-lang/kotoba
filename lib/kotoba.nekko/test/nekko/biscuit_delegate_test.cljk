@@ -1,0 +1,112 @@
+(ns nekko.biscuit-delegate-test
+  "Push delegation as Biscuit attenuation (superproject adr-2609241800 step 6).
+   Every refusal pins its reason literal, so a token refused for some other
+   reason does not count as the case the test names."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [nekko.bytes :as nb]
+            [ed25519.core :as ed]
+            [nekko.biscuit-delegate :as bd]))
+
+(def owner-seed (nb/->ba (range 32)))
+(def a-seed (nb/->ba (map #(mod (+ % 1) 256) (range 32))))
+(def b-seed (nb/->ba (map #(mod (+ % 2) 256) (range 32))))
+(def outsider-seed (nb/->ba (map #(mod (+ % 3) 256) (range 32))))
+
+(def owner-did (ed/did-key-from-seed owner-seed))
+(def a-did (ed/did-key-from-seed a-seed))
+(def b-did (ed/did-key-from-seed b-seed))
+(def outsider-did (ed/did-key-from-seed outsider-seed))
+
+(def rid "rid-1")
+(def now "2026-09-24T00:00:00Z")
+(def later "2099-01-01T00:00:00Z")
+
+(defn- push [t ref-name signer]
+  (bd/authorize-push t owner-did rid ref-name signer {:now now}))
+
+(defn- addressed-to-a [resources]
+  (bd/grant owner-seed {:resources resources :next-did a-did :holder a-did :expires later}))
+
+(defn- bearer-to-a-key [resources]
+  (bd/grant owner-seed {:resources resources :next-did a-did :expires later}))
+
+(deftest the-holder-may-push-what-was-granted
+  (is (= {:allowed? true :holder a-did}
+         (push (addressed-to-a [(bd/push-resource-wildcard rid)]) "refs/heads/main" a-did)))
+  (is (true? (bd/authorized? (addressed-to-a [(bd/push-resource rid "refs/heads/main")])
+                             owner-did rid "refs/heads/main" a-did {:now now}))))
+
+(deftest attenuation-narrows-a-wider-request-is-refused
+  (testing "an exact grant does not reach another ref"
+    (is (= :out-of-scope
+           (:reason (push (addressed-to-a [(bd/push-resource rid "refs/heads/main")])
+                          "refs/heads/other" a-did)))))
+  (testing "the delegate narrows the owner's wildcard to one ref"
+    (let [narrowed (bd/attenuate (bearer-to-a-key [(bd/push-resource-wildcard rid)]) a-seed
+                                 {:resources [(bd/push-resource rid "refs/heads/main")]
+                                  :holder a-did})]
+      (is (:allowed? (push narrowed "refs/heads/main" a-did)))
+      (is (= :out-of-scope (:reason (push narrowed "refs/heads/other" a-did))))))
+  (testing "a block claiming more than its parent conferred refuses the token"
+    (let [widened (bd/attenuate (addressed-to-a [(bd/push-resource rid "refs/heads/main")])
+                                a-seed {:resources [(bd/push-resource-wildcard rid)]})]
+      (is (= :escalation-attempted (:reason (push widened "refs/heads/other" a-did))))
+      (is (= :escalation-attempted (:reason (push widened "refs/heads/main" a-did))))))
+  (testing "another repo is out of scope"
+    (is (= :out-of-scope
+           (:reason (bd/authorize-push (addressed-to-a [(bd/push-resource-wildcard rid)])
+                                       owner-did "rid-2" "refs/heads/main" a-did
+                                       {:now now}))))))
+
+(deftest sub-delegation-addresses-a-bearer-token-once
+  (let [to-b (bd/attenuate (bearer-to-a-key [(bd/push-resource-wildcard rid)]) a-seed
+                           {:resources [(bd/push-resource rid "refs/heads/main")]
+                            :holder b-did :next-did b-did})]
+    (is (= {:allowed? true :holder b-did} (push to-b "refs/heads/main" b-did)))
+    (is (= :wrong-holder (:reason (push to-b "refs/heads/main" a-did)))
+        "A handed it on; A no longer pushes with it")
+    (testing "B may narrow further and repeat its own holder"
+      (let [narrower (bd/attenuate to-b b-seed {:holder b-did :expires "2030-01-01T00:00:00Z"})]
+        (is (:allowed? (push narrower "refs/heads/main" b-did)))))))
+
+(deftest re-addressing-is-refused
+  (let [moved (bd/attenuate (addressed-to-a [(bd/push-resource-wildcard rid)]) a-seed
+                            {:resources [(bd/push-resource rid "refs/heads/main")]
+                             :holder b-did :next-did b-did})]
+    (is (= {:allowed? false :reason :holder-readdressed} (push moved "refs/heads/main" b-did)))
+    (is (= {:allowed? false :reason :holder-readdressed} (push moved "refs/heads/main" a-did))))
+  (testing "a bearer token that was never addressed pushes nothing"
+    (is (= {:allowed? false :reason :holder-absent}
+           (push (bearer-to-a-key [(bd/push-resource-wildcard rid)]) "refs/heads/main" a-did)))))
+
+(deftest a-cacao-is-refused-by-name
+  (doseq [presented ["o2FoomF0Z2VpcDQzNjE"
+                     ["o2FoomF0Z2VpcDQzNjE" "o2FoomF0Z2VpcDQzNjI"]
+                     {:cacao-b64 "o2FoomF0Z2VpcDQzNjE"}]]
+    (is (= {:allowed? false :reason :cacao-not-accepted}
+           (push presented "refs/heads/main" a-did)))))
+
+(deftest the-root-is-the-owner
+  (testing "a token the owner did not sign"
+    (let [forged (bd/grant outsider-seed {:resources [(bd/push-resource-wildcard rid)]
+                                          :next-did a-did :holder a-did :expires later})]
+      (is (= :unverified (:reason (push forged "refs/heads/main" a-did))))))
+  (testing "a block signed by a key the previous block did not name"
+    (let [spliced (bd/attenuate (bearer-to-a-key [(bd/push-resource-wildcard rid)])
+                                outsider-seed {:holder outsider-did})]
+      (is (= :unverified (:reason (push spliced "refs/heads/main" outsider-did))))))
+  (testing "absent and not-a-biscuit are distinct from denied"
+    (is (= :absent (:reason (push nil "refs/heads/main" a-did))))
+    (is (= :not-a-biscuit (:reason (push {:rid rid} "refs/heads/main" a-did))))))
+
+(deftest expiry
+  (let [t (bd/grant owner-seed {:resources [(bd/push-resource-wildcard rid)]
+                                :next-did a-did :holder a-did
+                                :expires "2026-10-01T00:00:00Z"})]
+    (is (:allowed? (push t "refs/heads/main" a-did)))
+    (is (= :expired-or-no-trusted-time
+           (:reason (bd/authorize-push t owner-did rid "refs/heads/main" a-did
+                                       {:now "2026-10-01T00:00:01Z"}))))
+    (is (= :expired-or-no-trusted-time
+           (:reason (bd/authorize-push t owner-did rid "refs/heads/main" a-did {})))
+        "no clock is a denial")))

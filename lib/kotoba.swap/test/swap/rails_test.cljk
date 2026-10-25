@@ -1,0 +1,464 @@
+(ns swap.rails-test
+  "Both rails, driven with response FIXTURES rather than live vendors: the plan
+  builder, the fee wiring, the approve-only-when-needed rule, and — for
+  THORChain — the refusal to build a transfer from a memo that does not match
+  what was requested."
+  (:require [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [swap.aggregator :as agg]
+            [swap.chains :as chains]
+            [swap.core :as core]
+            [swap.fee :as fee]
+            [swap.thorchain :as tc]))
+
+(def usdc {:chain "ETH" :chain-id 1 :asset "ETH.USDC" :symbol "USDC" :decimals 6
+           :address "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"})
+(def weth {:chain "ETH" :chain-id 1 :asset "ETH.WETH" :symbol "WETH" :decimals 18
+           :address "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"})
+(def btc {:chain "BTC" :asset "BTC.BTC" :symbol "BTC" :decimals 8})
+(def eth {:chain "ETH" :chain-id 1 :asset "ETH.ETH" :symbol "ETH" :decimals 18})
+
+;; ══ aggregator rail ══
+
+(def agg-intent
+  (core/intent {:from usdc :to weth :amount "1.5" :taker "0xtaker"
+                :slippage-bps 100 :fee-bps 30 :fee-recipient "0xfee"}))
+
+(def zero-ex (get agg/adapters :zero-ex-v2))
+
+(deftest aggregator-request-carries-the-fee-params
+  (let [{:keys [url provider sell-units]} (agg/quote-request agg-intent zero-ex)]
+    (is (= :zero-ex-v2 provider))
+    (is (= "1500000" sell-units) "1.5 USDC at 6 decimals, exactly")
+    (is (str/includes? url "sellAmount=1500000"))
+    (is (str/includes? url "swapFeeBps=30"))
+    (is (str/includes? url "swapFeeRecipient=0xfee"))
+    (is (str/includes? url "swapFeeToken=0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2")
+        "the fee is taken in the BUY token")
+    (is (str/includes? url "slippageBps=100"))))
+
+(deftest aggregator-request-omits-fee-params-when-no-fee
+  (let [i (core/intent {:from usdc :to weth :amount "1" :taker "0xt"})
+        {:keys [url]} (agg/quote-request i zero-ex)]
+    (is (not (str/includes? url "swapFeeBps")))))
+
+(deftest aggregator-refuses-cross-chain
+  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+               (agg/quote-request (core/intent {:from btc :to weth :amount "0.01"})
+                                  zero-ex))
+      "the aggregator rail is same-chain only"))
+
+(def agg-body-needs-approve
+  {"transaction" {"to" "0xdef1c0ded9bec7f1a1670819833240f027b25eff" "data" "0xdeadbeef" "value" "0" "gas" "210000"}
+   "buyAmount" "600000000000000000"
+   "minBuyAmount" "597000000000000000"
+   "issues" {"allowance" {"spender" "0xdef1c0ded9bec7f1a1670819833240f027b25eff" "actual" "0"}}})
+
+(def agg-body-has-allowance
+  (assoc agg-body-needs-approve "issues" {"allowance" nil}))
+
+(deftest aggregator-plan-includes-approve-when-allowance-short
+  (let [req (agg/quote-request agg-intent zero-ex)
+        q (agg/parse-quote agg-intent zero-ex agg-body-needs-approve req)
+        [s1 s2] (:steps q)]
+    (is (= 2 (count (:steps q))))
+    (is (= :erc20-approve (:step/kind s1)))
+    (is (= (:address usdc) (:to s1)) "approve is sent to the TOKEN, not the router")
+    (is (str/starts-with? (:data s1) "0x095ea7b3") "approve(address,uint256) selector")
+    (is (str/ends-with? (:data s1) "16e360")
+        "1500000 encoded as hex 0x16e360, not as a decimal string")
+    (is (str/includes? (:step/why s1) "1.5 USDC")
+        "the reason is in the user's units, for a confirmation prompt")
+    (is (= :evm-call (:step/kind s2)))
+    (is (= "0xdef1c0ded9bec7f1a1670819833240f027b25eff" (:to s2)))
+    (is (= "0xdeadbeef" (:data s2)))))
+
+(deftest aggregator-plan-skips-approve-when-allowance-sufficient
+  (let [req (agg/quote-request agg-intent zero-ex)
+        q (agg/parse-quote agg-intent zero-ex agg-body-has-allowance req)]
+    (is (= 1 (count (:steps q))) "no unnecessary approval transaction")
+    (is (= :evm-call (:step/kind (first (:steps q)))))))
+
+(deftest aggregator-plan-skips-approve-when-allowance-already-large
+  (let [body (assoc-in agg-body-needs-approve ["issues" "allowance" "actual"]
+                       "999999999999")
+        req (agg/quote-request agg-intent zero-ex)
+        q (agg/parse-quote agg-intent zero-ex body req)]
+    (is (= 1 (count (:steps q))))))
+
+(deftest aggregator-plan-approves-when-allowance-slightly-short
+  (testing "1499999 < 1500000 — off-by-one must still approve"
+    (let [body (assoc-in agg-body-needs-approve ["issues" "allowance" "actual"] "1499999")
+          req (agg/quote-request agg-intent zero-ex)
+          q (agg/parse-quote agg-intent zero-ex body req)]
+      (is (= 2 (count (:steps q)))))))
+
+(deftest aggregator-quote-normalizes-and-passes-check
+  (let [req (agg/quote-request agg-intent zero-ex)
+        q (agg/parse-quote agg-intent zero-ex agg-body-needs-approve req)]
+    (is (= :aggregator (:rail q)))
+    (is (= "600000000000000000" (:expected-out q)))
+    (is (= "597000000000000000" (:min-out q)))
+    (is (= :protocol-affiliate (:fee-mechanism q)))
+    (is (= 30 (:fee-bps q)))
+    (is (false? (:verified-adapter? q))
+        "the shipped adapters are honestly marked unverified against a live key")
+    (is (:ok? (core/check agg-intent q 1000)))))
+
+(deftest aggregator-fails-loudly-on-unmapped-response
+  (testing "a vendor field rename must not yield a quote with a nil min-out"
+    (let [req (agg/quote-request agg-intent zero-ex)]
+      (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                   (agg/parse-quote agg-intent zero-ex
+                                    (dissoc agg-body-needs-approve "minBuyAmount")
+                                    req))))))
+
+;; ══ thorchain rail ══
+
+;; base-url is required now — there is no usable public THORNode default
+;; (thorchain.quote/known-endpoints records why), so tests name a node too.
+(def own-node "https://thornode.example.internal")
+
+(def tc-intent
+  (core/intent {:from btc :to eth :amount "0.05"
+                :destination "0xe6a30f4f3bad978910e2cbb4d97581f5b5a0ade0"
+                :slippage-bps 300 :fee-bps 30 :fee-recipient "kb"}))
+
+(deftest thorchain-request-uses-1e8-and-affiliate
+  (let [{:keys [url amount-1e8]} (tc/quote-request tc-intent {:base-url own-node :affiliate "kb"})]
+    (is (= "5000000" amount-1e8) "0.05 in 1e8 fixed point")
+    (is (str/includes? url "amount=5000000"))
+    (is (str/includes? url "affiliate=kb"))
+    (is (str/includes? url "affiliate_bps=30"))
+    (is (str/includes? url "tolerance_bps=300"))
+    (is (str/starts-with? url own-node) "the caller's node, not a baked-in default")))
+
+(deftest thorchain-quote-request-requires-a-node
+  (testing "no base-url must fail here, not at fund-moving time"
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                 (tc/quote-request tc-intent {})))))
+
+(defn tc-body [memo]
+  {"inbound_address" "bc1qvault"
+   "memo" memo
+   "expected_amount_out" "203529920800"
+   "expiry" 2000
+   "outbound_delay_seconds" 600
+   "total_swap_seconds" 660
+   "recommended_min_amount_in" "119000"
+   "dust_threshold" "10000"})
+
+(def good-memo
+  "=:ETH.ETH:0xe6a30f4f3bad978910e2cbb4d97581f5b5a0ade0:200000000000/1/0:kb:30")
+
+(deftest thorchain-plan-is-one-native-transfer
+  (let [req (tc/quote-request tc-intent {:base-url own-node})
+        q (tc/parse-quote tc-intent req (tc-body good-memo))
+        [step] (:steps q)]
+    (is (= :thorchain (:rail q)))
+    (is (= 1 (count (:steps q))))
+    (is (= :native-transfer (:step/kind step)))
+    (is (= "BTC" (:chain step)))
+    (is (= "bc1qvault" (:to step)))
+    (is (= "5000000" (:amount step)) "satoshis — 0.05 BTC at 8 decimals")
+    (is (= good-memo (:memo step)))
+    (is (str/includes? (:step/why step) "affiliate fee")
+        "the fee is stated in the confirmation reason")))
+
+(deftest thorchain-min-out-comes-from-the-memo-limit
+  (let [req (tc/quote-request tc-intent {:base-url own-node})
+        q (tc/parse-quote tc-intent req (tc-body good-memo))]
+    (is (= "200000000000" (:min-out q)) "the memo's LIM field is the on-chain guard")
+    (is (:ok? (core/check tc-intent q 1000)))))
+
+(deftest thorchain-missing-limit-is-reported-not-papered-over
+  (testing "a memo with no limit means NO on-chain guard — must not default to expected-out"
+    (let [memo "=:ETH.ETH:0xe6a30f4f3bad978910e2cbb4d97581f5b5a0ade0::kb:30"
+          req (tc/quote-request tc-intent {:base-url own-node})
+          q (tc/parse-quote tc-intent req (tc-body memo))
+          {:keys [ok? problems]} (core/check tc-intent q 1000)]
+      (is (nil? (:min-out q)))
+      (is (false? ok?))
+      (is (some #(= :missing-min-out (:problem %)) problems)))))
+
+(deftest thorchain-refuses-substituted-destination
+  (let [attack "=:ETH.ETH:0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef:200000000000/1/0:kb:30"
+        req (tc/quote-request tc-intent {:base-url own-node})]
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                 (tc/parse-quote tc-intent req (tc-body attack)))
+        "a quote endpoint must not be able to redirect the output")))
+
+(deftest thorchain-refuses-dropped-affiliate-fee
+  (let [memo "=:ETH.ETH:0xe6a30f4f3bad978910e2cbb4d97581f5b5a0ade0:200000000000/1/0"
+        req (tc/quote-request tc-intent {:base-url own-node})]
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                 (tc/parse-quote tc-intent req (tc-body memo))))))
+
+(deftest thorchain-refuses-missing-inbound-address
+  (let [req (tc/quote-request tc-intent {:base-url own-node})]
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                 (tc/parse-quote tc-intent req
+                                 (dissoc (tc-body good-memo) "inbound_address"))))))
+
+(deftest thorchain-evm-inbound-goes-through-the-router
+  (let [i (core/intent {:from eth :to btc :amount "1"
+                        :destination "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh"
+                        :slippage-bps 300})
+        req (tc/quote-request i {:base-url own-node})
+        memo "=:BTC.BTC:bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh:100000/1/0"
+        q (tc/parse-quote i req (assoc (tc-body memo) "router" "0xdef1c0ded9bec7f1a1670819833240f027b25eff"))
+        [step] (:steps q)]
+    (is (= :evm-call (:step/kind step)))
+    (is (= "0xdef1c0ded9bec7f1a1670819833240f027b25eff" (:router step)))
+    (is (true? (:needs-router-calldata? step))
+        "router calldata must come from the node, not a hard-coded ABI here")
+    (is (= "1000000000000000000" (:amount step)) "wei, not 1e8")))
+
+(deftest thorchain-preflight-flags-halted-chain-and-small-amounts
+  (let [req (tc/quote-request tc-intent {:base-url own-node})
+        q (tc/parse-quote tc-intent req (tc-body good-memo))
+        halted {"BTC" {:address "bc1qvault" :halted true}}
+        fine {"BTC" {:address "bc1qvault" :halted false}}]
+    (is (some #(= :chain-not-sendable (:problem %)) (tc/preflight tc-intent q halted)))
+    (is (empty? (tc/preflight tc-intent q fine)))
+    (testing "an amount below the node's recommended minimum is flagged"
+      (let [tiny-intent (core/intent {:from btc :to eth :amount "0.00001"
+                                      :destination "0xe6a30f4f3bad978910e2cbb4d97581f5b5a0ade0"
+                                      :slippage-bps 300})
+            tiny-memo "=:ETH.ETH:0xe6a30f4f3bad978910e2cbb4d97581f5b5a0ade0:1/1/0"
+            tq (tc/parse-quote tiny-intent (tc/quote-request tiny-intent {:base-url own-node})
+                               (tc-body tiny-memo))]
+        (is (some #(= :below-recommended-minimum (:problem %))
+                  (tc/preflight tiny-intent tq fine)))))))
+
+;; ══ fee accounting ══
+
+(deftest fee-bps-to-fraction-and-split
+  (is (= 0.003 (fee/bps->frac 30)))
+  (let [{:keys [usd fee net]} (fee/split 100 30)]
+    (is (= 100.0 usd))
+    (is (< (abs (- 0.3 fee)) 1e-9))
+    (is (< (abs (- 99.7 net)) 1e-9))))
+
+(deftest fee-quote-fee-reports-mechanism-honestly
+  (is (= {:bps 30 :mechanism :protocol-affiliate :recipient "0xfee" :preferred? true}
+         (fee/quote-fee {:fee-bps 30 :fee-recipient "0xfee"} :protocol-affiliate)))
+  (is (= :separate-transfer
+         (:mechanism (fee/quote-fee {:fee-bps 30 :fee-recipient "0xfee"}
+                                    :separate-transfer))))
+  (is (false? (:preferred? (fee/quote-fee {:fee-bps 30 :fee-recipient "0xfee"}
+                                          :separate-transfer))))
+  (testing "no fee requested -> :none regardless of the mechanism offered"
+    (is (= :none (:mechanism (fee/quote-fee {:fee-bps 0} :protocol-affiliate))))))
+
+(deftest fee-ledger-entries-are-pending-until-confirmed
+  (let [p (fee/pending-entry {:payer "did:key:zAlice" :usd 100 :bps 30
+                              :chain "ethereum" :tx-id "0xtx"})
+        c (fee/confirmed-entry {:payer "did:key:zAlice" :usd 100 :bps 30
+                                :chain "ethereum" :tx-id "0xtx"})]
+    (is (= :pending (:run/kind p)))
+    (is (= :crypto-pending (:treasury/proof p)))
+    (is (= :confirmed (:run/kind c)))
+    (is (= :crypto-confirmed (:treasury/proof c)))
+    (is (< (abs (- 0.3 (:treasury/fee c))) 1e-9))
+    (is (< (abs (- 99.7 (:treasury/net c))) 1e-9))))
+
+;; ══ the two defects a LIVE call found that fixtures could not (2026-07-26) ══
+
+(deftest lifi-request-includes-required-to-chain
+  (testing "LI.FI 400s outright without toChain — fixtures never noticed"
+    (let [i (core/intent {:from usdc :to weth :amount "100" :taker "0xt"})
+          {:keys [url]} (agg/quote-request i (get agg/adapters :lifi))]
+      (is (str/includes? url "toChain=1"))
+      (is (str/includes? url "fromChain=1")))))
+
+(deftest units-are-per-vendor
+  (testing "the SAME 30 bps is 30 for 0x and 0.003 for LI.FI"
+    (is (= "30" (agg/bps->param :bps 30)))
+    (is (= "0.003" (agg/bps->param :fraction 30)))
+    (is (= "0.1" (agg/bps->param :fraction 1000)) "1000 bps = 10%")
+    (is (= "0.0005" (agg/bps->param :fraction 5)))
+    (is (= "0" (agg/bps->param :fraction 0)))
+    (testing "no exponent notation, ever — a vendor may not parse 3.0E-4"
+      (doseq [bps [1 5 30 250 1000]]
+        (is (not (str/includes? (agg/bps->param :fraction bps) "E"))
+            (str bps))
+        (is (not (str/includes? (agg/bps->param :fraction bps) "e"))
+            (str bps))))))
+
+(deftest lifi-sends-fee-as-fraction-not-bps
+  (let [i (core/intent {:from usdc :to weth :amount "100" :taker "0xt"
+                        :fee-bps 30 :fee-recipient "kotoba"})
+        {:keys [url]} (agg/quote-request i (get agg/adapters :lifi))]
+    (is (str/includes? url "fee=0.003")
+        "sending fee=30 would be out of LI.FI's 0<=x<1 range")
+    (is (str/includes? url "slippage=0.01")
+        "slippage is a fraction for LI.FI too — 100 bps is 0.01, not 100")
+    (is (str/includes? url "integrator=kotoba")
+        "LI.FI's recipient parameter is an integrator ID, not an address")))
+
+(deftest zero-ex-still-sends-bps
+  (let [i (core/intent {:from usdc :to weth :amount "100" :taker "0xt"
+                        :fee-bps 30 :fee-recipient "0xfee"})
+        {:keys [url]} (agg/quote-request i (get agg/adapters :zero-ex-v2))]
+    (is (str/includes? url "swapFeeBps=30"))
+    (is (str/includes? url "slippageBps=100") "0x wants bps for slippage")))
+
+(deftest adapter-verification-status-is-honest
+  (testing ":lifi is live-verified; :zero-ex-v2 is docs-only (no API key here)"
+    (is (true? (:verified? (get agg/adapters :lifi))))
+    (is (false? (:verified? (get agg/adapters :zero-ex-v2))))
+    (testing "…and the flag reaches the normalized quote, so a caller cannot miss it"
+      (let [i (core/intent {:from usdc :to weth :amount "1.5" :taker "0xtaker"})
+            req (agg/quote-request i (get agg/adapters :lifi))
+            q (agg/parse-quote i (get agg/adapters :lifi)
+                               {"transactionRequest" {"to" "0xdef1c0ded9bec7f1a1670819833240f027b25eff"
+                                                      "data" "0xabcd" "value" "0"}
+                                "estimate" {"toAmount" "600000000000000000"
+                                            "toAmountMin" "597000000000000000"}}
+                               req)]
+        (is (true? (:verified-adapter? q)))))))
+
+(deftest adapter-without-allowance-paths-builds-no-approve-step
+  (testing "a nil field path must yield nil, not the whole response body"
+    ;; :lifi declares no allowance paths. If `at` returned the body for a nil
+    ;; path, `spender` would be a truthy MAP, needs-approve? would be true, and
+    ;; the plan builder would throw trying to encode a map as an address.
+    (let [i (core/intent {:from usdc :to weth :amount "1.5" :taker "0xtaker"})
+          adapter (get agg/adapters :lifi)
+          req (agg/quote-request i adapter)
+          q (agg/parse-quote i adapter
+                             {"transactionRequest" {"to" "0xdef1c0ded9bec7f1a1670819833240f027b25eff"
+                                                    "data" "0xabcd" "value" "0"}
+                              "estimate" {"toAmount" "600000000000000000"
+                                          "toAmountMin" "597000000000000000"}}
+                             req)]
+      (is (= 1 (count (:steps q))))
+      (is (= :evm-call (:step/kind (first (:steps q))))))))
+
+;; ══ LI.FI-only is enforced, not remembered (owner decision 2026-07-26) ══
+
+(deftest default-adapter-is-the-verified-one
+  (is (= :lifi agg/default-adapter))
+  (is (= (get agg/adapters :lifi) (agg/adapter)))
+  (is (true? (:verified? (agg/adapter))))
+  (testing "the default and the live-verified adapter are the same thing"
+    (is (= agg/default-adapter
+           (first (keep (fn [[k v]] (when (:verified? v) k)) agg/adapters))))))
+
+(deftest unverified-adapter-is-refused
+  (testing "an unverified mapping is the same risk as an untested one, wearing docs"
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                 (agg/adapter :zero-ex-v2)))
+    (testing "…but reachable on purpose"
+      (is (= (get agg/adapters :zero-ex-v2)
+             (agg/adapter :zero-ex-v2 {:allow-unverified? true}))))))
+
+(deftest unknown-adapter-is-refused
+  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+               (agg/adapter :one-inch))))
+
+(deftest resolved-adapter-still-quotes
+  (testing "the default resolves into a working request without naming a vendor"
+    (let [i (core/intent {:from usdc :to weth :amount "100" :taker "0xt"})
+          {:keys [url provider]} (agg/quote-request i (agg/adapter))]
+      (is (= :lifi provider))
+      (is (str/includes? url "li.quest")))))
+
+
+;; ══ cross-chain is a per-ADAPTER capability, not a rail-wide ban ══
+
+(deftest lifi-accepts-cross-chain
+  (testing "LI.FI is a BRIDGE aggregator over 72 chains — the old blanket refusal
+            restricted the rail to a fraction of the vendor we actually use"
+    (let [i (core/intent {:from (chains/token :ethereum :usdc)
+                          :to (chains/token :base :usdc)
+                          :amount "100" :taker "0xt"})
+          {:keys [url]} (agg/quote-request i (agg/adapter :lifi))]
+      (is (true? (core/cross-chain? i)))
+      (is (str/includes? url "fromChain=1"))
+      (is (str/includes? url "toChain=8453")))))
+
+(deftest zero-ex-still-refuses-cross-chain
+  (testing "0x's Swap API really does settle on one chain, so the refusal belongs
+            to the adapter that needs it"
+    (is (false? (:cross-chain? (agg/adapter :zero-ex-v2 {:allow-unverified? true}))))
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                 (agg/quote-request (core/intent {:from (chains/token :ethereum :usdc)
+                                                  :to (chains/token :base :usdc)
+                                                  :amount "100" :taker "0xt"})
+                                    (agg/adapter :zero-ex-v2 {:allow-unverified? true}))))))
+
+(deftest same-chain-still-works-on-both
+  (doseq [id [:lifi :zero-ex-v2]]
+    (let [i (core/intent {:from (chains/token :ethereum :usdc) :to (chains/native :ethereum)
+                          :amount "100" :taker "0xt"})]
+      (is (map? (agg/quote-request i (agg/adapter id {:allow-unverified? true})))
+          (name id)))))
+
+;; ══ a contract fee recipient must exist on the chain the fee lands on ══
+;; Measured on a real Safe (2026-07-26): deployed on Ethereum mainnet as v1.4.1,
+;; and eth_getCode EMPTY on BSC, Avalanche, Base, Polygon, Arbitrum and Optimism.
+;; Paying a fee to it on any of those six is unrecoverable by anyone.
+
+(def safe-recipient "0x640404B566D34c401996eBb360F40BC4cECFA881")
+(def deployed-code "0x608060405273ffffffffffffffffffffffffffffffffffffffff")
+(def no-code "0x")
+
+(def fee-ok-quote
+  {:rail :aggregator :provider :test
+   :expected-out "600000000000000000"
+   :min-out "597000000000000000"
+   :fee-bps 30 :fee-mechanism :protocol-affiliate
+   :expires-at 2000
+   :steps [{:step/kind :evm-call :step/why "swap" :to "0xr" :data "0x" :value "0"}]})
+
+(def fee-intent
+  (core/intent {:from usdc :to weth :amount "100" :taker "0xt"
+                :fee-bps 30 :fee-recipient safe-recipient
+                :fee-recipient-contract? true}))
+
+(deftest contract-code?-reads-eth-getCode
+  (is (true? (core/contract-code? deployed-code)))
+  (is (false? (core/contract-code? no-code)))
+  (is (false? (core/contract-code? nil))))
+
+(deftest fee-recipient-with-no-code-is-refused
+  (testing "the failure this exists to prevent — a fee paid into a dead address"
+    (let [{:keys [ok? problems]}
+          (core/check fee-intent fee-ok-quote 1000 {:fee-recipient-code no-code})]
+      (is (false? ok?))
+      (is (some #(= :fee-recipient-has-no-code (:problem %)) problems)))))
+
+(deftest fee-recipient-with-code-passes
+  (is (:ok? (core/check fee-intent fee-ok-quote 1000 {:fee-recipient-code deployed-code}))))
+
+(deftest declared-but-unchecked-is-its-own-problem
+  (testing "a caller must not be able to forget to look"
+    (let [{:keys [ok? problems]} (core/check fee-intent fee-ok-quote 1000)]
+      (is (false? ok?))
+      (is (some #(= :fee-recipient-unverified (:problem %)) problems)))))
+
+(deftest an-eoa-recipient-needs-no-code-check
+  (testing "not declaring a contract keeps the old behaviour, so nothing breaks"
+    (let [i (core/intent {:from usdc :to weth :amount "100" :taker "0xt"
+                          :fee-bps 30 :fee-recipient "0xfee"})]
+      (is (false? (:fee-recipient-contract? i)))
+      (is (:ok? (core/check i fee-ok-quote 1000))))))
+
+(deftest a-zero-fee-swap-skips-the-recipient-check
+  (testing "no fee, nothing to lose, no check to run"
+    (let [i (core/intent {:from usdc :to weth :amount "100" :taker "0xt"
+                          :fee-recipient-contract? true})]
+      (is (:ok? (core/check i (assoc fee-ok-quote :fee-bps 0 :fee-mechanism :none) 1000))))))
+
+(deftest fee-recipient-code-request-and-verify
+  (let [req (fee/recipient-code-request fee-intent)]
+    (is (= "eth_getCode" (:method req)))
+    (is (= [safe-recipient "latest"] (:params req))))
+  (testing "verify-recipient reports the chain the fee would land on"
+    (let [{:keys [ok? problem chain]} (fee/verify-recipient fee-intent no-code)]
+      (is (false? ok?))
+      (is (= :recipient-has-no-code problem))
+      (is (= "ETH" chain))))
+  (is (:ok? (fee/verify-recipient fee-intent deployed-code))))

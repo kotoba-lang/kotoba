@@ -1,0 +1,125 @@
+(ns pnr.lef-adapter-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [lef.core :as lef]
+            [pnr.lef-adapter :as lef-adapter]))
+
+(def sample-lef
+  "Small hand-built LEF fixture: two real macros (INV_X1 on metal1,
+  BUF_X2 with one metal2 pin and one pin on a layer this adapter's
+  hardcoded map doesn't know, to exercise the 99 fallback) plus a
+  pin-less macro (NAND2_X1) sized so its width doesn't exactly tile a
+  0.2um site grid, to exercise the ceil-round-up in `macro->site-width`."
+  "
+MACRO INV_X1
+  CLASS CORE ;
+  SIZE 0.8 BY 1.4 ;
+  SYMMETRY X Y ;
+  SITE core_site ;
+  PIN A
+    DIRECTION INPUT ;
+    PORT
+      LAYER metal1 ;
+        RECT 0.0 0.0 0.1 0.4 ;
+    END
+  END A
+  PIN Y
+    DIRECTION OUTPUT ;
+    PORT
+      LAYER metal1 ;
+        RECT 0.6 0.0 0.8 0.4 ;
+    END
+  END Y
+END INV_X1
+MACRO BUF_X2
+  CLASS CORE ;
+  SIZE 1.6 BY 1.4 ;
+  SITE core_site ;
+  PIN A
+    DIRECTION INPUT ;
+    PORT
+      LAYER metal2 ;
+        RECT 0.0 0.0 0.1 0.4 ;
+    END
+  END A
+  PIN Y
+    DIRECTION OUTPUT ;
+    PORT
+      LAYER metal9 ;
+        RECT 1.4 0.0 1.6 0.4 ;
+    END
+  END Y
+END BUF_X2
+MACRO NAND2_X1
+  CLASS CORE ;
+  SIZE 0.9 BY 1.4 ;
+  SITE core_site ;
+END NAND2_X1
+")
+
+(def lib (let [[status parsed] (lef/parse-lef sample-lef)]
+           (assert (= :ok status))
+           parsed))
+
+(deftest macro->site-width-rounds-up
+  (testing "an exact multiple of the site width divides cleanly"
+    (is (= 4 (lef-adapter/macro->site-width (lef/find-macro lib "INV_X1") 0.2))))
+  (testing "a non-exact multiple rounds up to a whole number of sites"
+    ;; 0.9 / 0.2 = 4.5 -> ceil -> 5
+    (is (= 5 (lef-adapter/macro->site-width (lef/find-macro lib "NAND2_X1") 0.2)))))
+
+(deftest netlist-cell-from-lef-resolves-real-width
+  (testing "a known cell resolves :width-sites from its real LEF SIZE"
+    (is (= {:cell-name "INV_X1" :instance-name "U0" :width-sites 4}
+           (lef-adapter/netlist-cell-from-lef lib "INV_X1" "U0" 0.2))))
+  (testing "an unknown cell-name yields nil rather than a bogus width"
+    (is (nil? (lef-adapter/netlist-cell-from-lef lib "NOT_IN_LIB" "U1" 0.2)))))
+
+(deftest placed-cell->gdsii-elements-untranslated
+  (let [placed {:cell-name "INV_X1" :instance-name "U0" :x 0 :y 0.0
+                :orientation :n :row-idx 0}
+        els (lef-adapter/placed-cell->gdsii-elements lib placed 0.2 1.4)]
+    (testing "cell outline boundary matches the macro's SIZE, in GDSII db units (1 um = 1000 db units)"
+      (is (= {:kind :boundary :layer 1 :datatype 0
+              :xy [[0 0] [800 0] [800 1400] [0 1400] [0 0]]}
+             (first els))))
+    (testing "one boundary per pin PORT rect, on the mapped metal layer"
+      (is (= 3 (count els)))
+      (is (= {:kind :boundary :layer 10 :datatype 0
+              :xy [[0 0] [100 0] [100 400] [0 400] [0 0]]}
+             (nth els 1)))
+      (is (= {:kind :boundary :layer 10 :datatype 0
+              :xy [[600 0] [800 0] [800 400] [600 400] [600 0]]}
+             (nth els 2))))))
+
+(deftest placed-cell->gdsii-elements-translates-by-placement-offset
+  (testing "x (site units) / row-idx (row units) offset the geometry before it's scaled to db units"
+    (let [placed {:cell-name "INV_X1" :instance-name "U1" :x 4 :y 1.4
+                  :orientation :fs :row-idx 1}
+          els (lef-adapter/placed-cell->gdsii-elements lib placed 0.2 1.4)]
+      ;; ox = 4 sites * 0.2um/site = 0.8um = 800 dbu; oy = row 1 * 1.4um/row = 1400 dbu
+      (is (= [[800 1400] [1600 1400] [1600 2800] [800 2800] [800 1400]]
+             (:xy (first els)))))))
+
+(deftest placed-cell->gdsii-elements-unknown-layer-falls-back-and-unknown-cell-is-nil
+  (testing "a pin on a layer not in the hardcoded map falls back to layer 99"
+    (let [placed {:cell-name "BUF_X2" :instance-name "U2" :x 0 :y 0.0
+                  :orientation :n :row-idx 0}
+          els (lef-adapter/placed-cell->gdsii-elements lib placed 0.2 1.4)]
+      (is (= 3 (count els)))
+      (is (= 11 (:layer (nth els 1)))) ; metal2
+      (is (= 99 (:layer (nth els 2)))))) ; metal9, unmapped
+  (testing "an unresolvable cell-name yields nil, not a crash"
+    (is (nil? (lef-adapter/placed-cell->gdsii-elements
+               lib {:cell-name "GHOST" :instance-name "U3" :x 0 :y 0.0
+                    :orientation :n :row-idx 0}
+               0.2 1.4)))))
+
+(deftest design->gdsii-structure-flattens-and-skips-unresolved-cells
+  (let [placed-cells [{:cell-name "INV_X1" :instance-name "U0" :x 0 :y 0.0 :orientation :n :row-idx 0}
+                       {:cell-name "BUF_X2" :instance-name "U1" :x 4 :y 0.0 :orientation :n :row-idx 0}
+                       {:cell-name "GHOST" :instance-name "U2" :x 8 :y 0.0 :orientation :n :row-idx 0}]
+        structure (lef-adapter/design->gdsii-structure lib placed-cells 0.2 1.4 "TOP")]
+    (is (= "TOP" (:name structure)))
+    ;; INV_X1 (3 elements) + BUF_X2 (3 elements) + GHOST (skipped, 0 elements)
+    (is (= 6 (count (:elements structure))))
+    (is (every? #(= :boundary (:kind %)) (:elements structure)))))

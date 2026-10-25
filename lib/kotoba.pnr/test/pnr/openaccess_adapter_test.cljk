@@ -1,0 +1,143 @@
+(ns pnr.openaccess-adapter-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [lef.core :as lef]
+            [openaccess.library :as oa-lib]
+            [pnr.placement :as placement]
+            [pnr.openaccess-adapter :as oa-adapter]))
+
+(def sample-macro
+  "Hand-built LEF macro map (`lef.core/parse-lef`'s exact per-macro shape,
+  not parsed from text): one 2-pin CORE cell plus one OBS rect, to exercise
+  both pin-PORT and OBS rect conversion by `lef-macro->oa-cell` in a single
+  macro."
+  {:name "INVX" :class :core :size [2.0 4.0] :symmetry "" :site "core_site"
+   :pins [{:name "A" :direction "INPUT"
+           :port [{:layer "metal1" :rect [0.0 0.0 1.0 2.0]}]}
+          {:name "Y" :direction "OUTPUT"
+           :port [{:layer "metal1" :rect [1.0 2.0 2.0 4.0]}]}]
+   :obs [{:layer "metal2" :rect [0.0 0.0 2.0 4.0]}]})
+
+(deftest lef-macro->oa-cell-converts-pins-and-obs
+  (testing "one View named/typed :layout, shapes = pin PORT rects then OBS rects, no sub-instances"
+    (is (= {:name "INVX"
+            :views [{:name "layout" :view-type :layout
+                     :content-ref
+                     {:shapes [{:kind :rect :layer :metal1 :bbox [0.0 0.0 1.0 2.0]}
+                               {:kind :rect :layer :metal1 :bbox [1.0 2.0 2.0 4.0]}
+                               {:kind :rect :layer :metal2 :bbox [0.0 0.0 2.0 4.0]}]
+                      :instances []}}]}
+           (oa-adapter/lef-macro->oa-cell sample-macro)))))
+
+(def sample-lef
+  "Small hand-built LEF fixture, parsed via `lef.core/parse-lef`: three
+  macros (INVX/BUFX with pin geometry, NAND2X pin-less) with deliberately
+  whole-number SIZE/RECT coordinates -- LEF text is always parsed to
+  doubles (`lef.core/parse-num` uses `Double/parseDouble`), but whole
+  numbers round-trip through double arithmetic exactly, so hand-computed
+  expected transform coordinates below (see
+  `design->flat-shapes-applies-orientation-transform`) aren't at the mercy
+  of floating-point rounding."
+  "
+MACRO INVX
+  CLASS CORE ;
+  SIZE 2 BY 4 ;
+  SITE core_site ;
+  PIN A
+    DIRECTION INPUT ;
+    PORT
+      LAYER metal1 ;
+        RECT 0 0 1 2 ;
+    END
+  END A
+  PIN Y
+    DIRECTION OUTPUT ;
+    PORT
+      LAYER metal1 ;
+        RECT 1 2 2 4 ;
+    END
+  END Y
+END INVX
+MACRO BUFX
+  CLASS CORE ;
+  SIZE 3 BY 4 ;
+  SITE core_site ;
+  PIN A
+    DIRECTION INPUT ;
+    PORT
+      LAYER metal1 ;
+        RECT 0 0 1 4 ;
+    END
+  END A
+END BUFX
+MACRO NAND2X
+  CLASS CORE ;
+  SIZE 2 BY 4 ;
+  SITE core_site ;
+END NAND2X
+")
+
+(def lib (let [[status parsed] (lef/parse-lef sample-lef)]
+           (assert (= :ok status))
+           parsed))
+
+(deftest lef-library->oa-library-converts-every-macro
+  (let [oa-library (oa-adapter/lef-library->oa-library "STDCELLS" lib)]
+    (testing "cell count matches macro count"
+      (is (= 3 (count (:macros lib))))
+      (is (= 3 (count (:cells oa-library)))))
+    (testing "cell names carry straight through"
+      (is (= #{"INVX" "BUFX" "NAND2X"} (set (map :name (:cells oa-library))))))
+    (testing "a pin-less macro (NAND2X) converts to a cell with an empty shape list, not an error"
+      (is (= {:shapes [] :instances []}
+             (:content-ref (oa-lib/find-cell-view oa-library "NAND2X" :layout)))))))
+
+(def oa-library (oa-adapter/lef-library->oa-library "STDCELLS" lib))
+
+(def sample-placement
+  "Two INVX instances placed in two single-site, single-cell rows (so the
+  second cell spills onto row 1) plus one GHOST instance in a third row
+  whose :cell-name isn't in `oa-library` -- exercises both `:n` (row 0,
+  even) and `:fs` (row 1, odd) orientations, and the unresolved-cell skip.
+  `:site-width 1` (an int) keeps `:x` an int/exact placement-site count,
+  matching `pnr.def-adapter-test/sample-placement`'s unscaled convention."
+  (let [rows [{:y 0 :height 4 :site-width 1 :num-sites 1}
+              {:y 4 :height 4 :site-width 1 :num-sites 1}
+              {:y 8 :height 4 :site-width 1 :num-sites 1}]
+        cells [{:cell-name "INVX" :instance-name "U0" :width-sites 1}
+               {:cell-name "INVX" :instance-name "U1" :width-sites 1}
+               {:cell-name "GHOST" :instance-name "U2" :width-sites 1}]]
+    (placement/place-cells cells rows)))
+
+(deftest placement->oa-design-builds-instances-with-translated-orientation
+  (let [design (oa-adapter/placement->oa-design "TOP" sample-placement oa-library)]
+    (testing "fixture sanity: U0 landed :n on row 0, U1 landed :fs on row 1"
+      (is (= [:n :fs] (map :orientation (take 2 (:cells sample-placement))))))
+    (testing "no top-level shapes -- everything is an instance"
+      (is (= [] (:shapes design))))
+    (testing "one instance per resolvable placed cell, :orientation translated to OA's vocabulary, GHOST (unresolvable) skipped"
+      (is (= [{:cell-ref "INVX" :view-ref :layout
+               :transform {:offset [0 0] :orientation :R0}}
+              {:cell-ref "INVX" :view-ref :layout
+               :transform {:offset [0 1] :orientation :MX}}]
+             (:instances design))))))
+
+(deftest design->flat-shapes-applies-orientation-transform
+  (let [design (oa-adapter/placement->oa-design "TOP" sample-placement oa-library)
+        flat (oa-adapter/design->flat-shapes oa-library design)]
+    (testing "2 shapes (pin A, pin Y) per placed INVX instance, GHOST contributes none"
+      (is (= 4 (count flat))))
+    (testing "U0 (:n / R0, offset [0 0]) is untouched -- R0 + zero offset is the identity"
+      (is (= {:kind :rect :layer :metal1 :bbox [0.0 0.0 1.0 2.0]} (nth flat 0)))
+      (is (= {:kind :rect :layer :metal1 :bbox [1.0 2.0 2.0 4.0]} (nth flat 1))))
+    (testing "U1 (:fs / MX, offset [0 1]) is mirrored about X (y -> -y) THEN translated -- not merely translated"
+      ;; hand computed: MX sends local (x,y) -> (x,-y), then + offset (0,1).
+      ;; pin A [0 0 1 2]: corners (0,0)->(0,0)+off->[0 1]; (1,2)->(1,-2)+off->[1 -1];
+      ;;   renormalized bbox = [0 -1 1 1].
+      (is (= {:kind :rect :layer :metal1 :bbox [0.0 -1.0 1.0 1.0]} (nth flat 2)))
+      ;; pin Y [1 2 2 4]: corners (1,2)->(1,-2)+off->[1 -1]; (2,4)->(2,-4)+off->[2 -3];
+      ;;   renormalized bbox = [1 -3 2 -1].
+      (is (= {:kind :rect :layer :metal1 :bbox [1.0 -3.0 2.0 -1.0]} (nth flat 3)))
+      (testing "and that mirrored result is NOT what translate-only (pnr.lef-adapter's GDSII path) would give"
+        ;; translate-only (no orientation applied) would just add the offset:
+        ;; pin A [0 0 1 2] + offset (0,1) -> [0 1 1 3], a different bbox entirely.
+        (is (not= [0.0 1.0 1.0 3.0] (:bbox (nth flat 2))))))))

@@ -1,0 +1,144 @@
+(ns vertex-layout-test
+  "Gate: the vertex layout is data, and the data still describes the layout the
+   executor shipped before it was data.
+
+   Three separate claims, because they fail for different reasons:
+
+   1. **The default layout is unchanged.** The old layout was a literal `#js`
+      structure inside `kami.webgpu/vlayout`. Moving it into `kami.webgpu.ir`
+      only helps if it moved *without editing* — so the expected strides,
+      offsets, formats and shader locations are written out here as the literals
+      that were in the executor, not derived from the thing under test.
+
+   2. **The checker rejects what a device would reject, and what a device would
+      silently accept.** The second kind matters more: a stride that disagrees
+      with the packer's float count is a valid GPU layout that reads the wrong
+      bytes per instance.
+
+   3. **The executor's instance ABI and the layout's stride cannot drift.**
+      `INST-FLOATS` used to be `32` in the executor beside a bare `128` in the
+      layout, with nothing comparing them. This asserts the executor now derives
+      it from `kami.webgpu.ir` — a source check, because `kami/webgpu.cljs` is
+      .cljs and no JVM test can require it.
+
+   NOT checked here (needs a real WebGPU device): that a custom layout actually
+   draws. `vertex-layout-declared-layout-builds-on-real-gpu` in
+   playwright_vertex_layout_test.clj does that on hardware."
+  (:require [kotoba.test :refer [deftest is run-tests testing]]
+            [kotoba.lang.text :as str]
+            [kami.webgpu.ir :as ir]))
+
+;; --- 1. the default layout is what shipped ---------------------------------
+
+(def shipped-layout
+  "Transcribed from kami/webgpu.cljs `vlayout` as it stood at 7021020 —
+   arrayStride 72 (mesh) / 128 (instance, stepMode \"instance\"), with
+   (vattr format offset shaderLocation) triples in source order."
+  [{:stride 72
+    :attributes [["float32x3" 0 0] ["float32x3" 12 1]
+                 ["float32x2" 24 8] ["float32x4" 32 9]
+                 ["float32x3" 48 11] ["float32x3" 60 12]]}
+   {:stride 128
+    :step :instance
+    :attributes [["float32x4" 0 2] ["float32x4" 16 3] ["float32x4" 32 4]
+                 ["float32x4" 48 5] ["float32x4" 64 6] ["float32x4" 80 7]
+                 ["float32x4" 96 10] ["float32x4" 112 13]]}])
+
+(defn- triples [buf]
+  (mapv (juxt :format :offset :location) (:attributes buf)))
+
+(deftest default-layout-matches-what-shipped
+  (is (= (count shipped-layout) (count ir/default-vertex-layout)))
+  (doseq [[i expected] (map-indexed vector shipped-layout)]
+    (let [actual (nth ir/default-vertex-layout i)]
+      (is (= (:stride expected) (:stride actual))
+          (str "buffer " i " arrayStride"))
+      (is (= (:step expected) (when (= :instance (:step actual)) :instance))
+          (str "buffer " i " stepMode"))
+      (is (= (:attributes expected) (triples actual))
+          (str "buffer " i " attributes (format offset shaderLocation)"))))
+  (testing "and it passes its own checker"
+    (is (nil? (ir/vertex-layout-problems ir/default-vertex-layout)))))
+
+(deftest instance-stride-is-derived-not-restated
+  (is (= 128 (* 4 ir/instance-floats)))
+  (is (= (* 4 ir/instance-floats)
+         (:stride (second ir/default-vertex-layout)))
+      "the instance buffer's stride must be 4x the packer's float count")
+  (testing "and it is *written* as the derivation, not as a literal that happens
+            to equal it today — 128 == 4x32 is true until someone changes 32, and
+            a value assertion cannot tell the two spellings apart"
+    (is (str/includes? (slurp "lib/kotoba.webgpu/src/kami/webgpu/ir.cljk")
+                       ":stride (* 4 instance-floats)")
+        "default-vertex-layout's instance stride must be derived from instance-floats")))
+
+;; --- 2. the checker ---------------------------------------------------------
+
+(defn- reasons [layout]
+  (set (map :reason (ir/vertex-layout-problems layout))))
+
+(def ok-buffer
+  {:stride 16 :attributes [{:format "float32x4" :offset 0 :location 0}]})
+
+(deftest checker-accepts-usable-layouts
+  (is (ir/valid-vertex-layout? [ok-buffer]))
+  (testing "an empty layout is legal — that is what a :fullscreen pass wants"
+    (is (ir/valid-vertex-layout? [])))
+  (testing "instance step is legal"
+    (is (ir/valid-vertex-layout? [(assoc ok-buffer :step :instance)]))))
+
+(deftest checker-rejects-what-a-device-would-reject
+  (is (= #{:vertex-layout/not-sequential} (reasons {:stride 16})))
+  (is (= #{:vertex-layout/bad-buffer} (reasons ["nope"])))
+  (is (contains? (reasons [(assoc ok-buffer :stride 0)]) :vertex-layout/bad-stride))
+  (is (contains? (reasons [(assoc ok-buffer :stride 18)]) :vertex-layout/bad-stride)
+      "stride must be a multiple of 4")
+  (is (contains? (reasons [(assoc ok-buffer :step :sometimes)]) :vertex-layout/bad-step))
+  (is (contains? (reasons [(assoc ok-buffer :attributes [])]) :vertex-layout/no-attributes))
+  (is (contains? (reasons [(assoc ok-buffer :attributes
+                                  [{:format "float64x9" :offset 0 :location 0}])])
+                 :vertex-layout/unknown-format))
+  (is (contains? (reasons [(assoc ok-buffer :attributes
+                                  [{:format "float32" :offset 2 :location 0}])])
+                 :vertex-layout/bad-offset)
+      "offset must be a multiple of 4")
+  (is (contains? (reasons [(assoc ok-buffer :attributes
+                                  [{:format "float32x4" :offset 4 :location 0}])])
+                 :vertex-layout/overflows-stride))
+  (is (contains? (reasons [(assoc ok-buffer :attributes
+                                  [{:format "float32" :offset 0}])])
+                 :vertex-layout/bad-location))
+  (testing "shader locations are unique across ALL buffers, not per buffer —
+            WebGPU's location space is global to the pipeline"
+    (is (= #{:vertex-layout/duplicate-location}
+           (reasons [ok-buffer ok-buffer])))))
+
+(deftest checker-rejects-what-a-device-would-silently-accept
+  (testing "a stride that disagrees with the packer's float count is a valid GPU
+            layout reading the wrong bytes per instance — the failure this whole
+            change exists to make impossible"
+    (is (= #{:vertex-layout/stride-floats-drift}
+           (reasons [{:stride 128 :step :instance :floats 33
+                      :attributes [{:format "float32x4" :offset 0 :location 0}]}])))
+    (testing "and raising the float count without the stride is caught too"
+      (is (contains? (reasons (assoc-in (vec ir/default-vertex-layout) [1 :floats] 40))
+                     :vertex-layout/stride-floats-drift)))))
+
+;; --- 3. the executor cannot restate the ABI --------------------------------
+
+(def executor "lib/kotoba.webgpu/src/kami/webgpu.cljk")
+
+(deftest executor-derives-the-instance-abi-from-ir
+  (let [src (slurp executor)]
+    (is (str/includes? src "(def ^:private INST-FLOATS ir/instance-floats)")
+        (str executor " must take INST-FLOATS from kami.webgpu.ir, not restate it"))
+    (is (not (str/includes? src ":arrayStride 128"))
+        "the instance stride must not appear as a literal beside the derived one")
+    (is (str/includes? src "(vertex-buffers ir/default-vertex-layout)")
+        "vlayout must build from the shared data")
+    (is (str/includes? src "(some? vertex-layout) (vertex-buffers vertex-layout)")
+        "build-pipeline must honour a pipeline's own :vertex-layout")))
+
+(let [{:keys [fail error]} (run-tests 'vertex-layout-test)]
+  (when (pos? (+ fail error))
+    (throw (ex-info "vertex layout gate failed" {:fail fail :error error}))))
