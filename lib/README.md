@@ -126,6 +126,7 @@ The bundled standard libraries live in this repository:
 | `org.w3.epub` | `org.w3.epub/src` | `` (an external specification, publisher w3.org) |
 | `org.w3.turtle` | `org.w3.turtle/src` | `` (an external specification, publisher w3.org) |
 | `org.w3.vc` | `org.w3.vc/src` | `` (an external specification, publisher w3.org) |
+| `kotoba.sumitsubo` | `kotoba.sumitsubo/src` | `` (Kotoba project library) |
 | `kotoba.sourceChain` | `kotoba.sourceChain/src` | `` (Kotoba project library) |
 | `kotoba.site` | `kotoba.site/src` | `` (Kotoba project library) |
 | `kotoba.shacl` | `kotoba.shacl/src` | `` (Kotoba project library) |
