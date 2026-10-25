@@ -1,0 +1,242 @@
+;; Canonical DNS name order, as a Kotoba application (ADR-2608261100) --
+;; RFC 4034 §6.1 and §3.1.7, RFC 1035 §2.3.4 and §4.1.4.
+;;
+;;   name-problem   (name)      -> keyword   ; :none when representable
+;;   compare-names  (a, b)      -> i64       ; -1, 0, 1
+;;   same-name?     (a, b)      -> bool
+;;   wire-length    (name)      -> i64
+;;   label-count    (name)      -> i64
+;;
+;; ## Why this is the decision and not a formatting detail
+;;
+;; `dnssec.canonical/compare-names` says it in its own docstring: "every
+;; place it disagrees produces an NSEC chain that proves the nonexistence of
+;; names that do exist". Canonical order is what the NSEC and NSEC3 chains
+;; are built on, so a name that folds or orders differently on two machines
+;; is a zone that denies different things depending on where it was signed.
+;; There is no key in any of it.
+;;
+;;   the guest owns   what a name IS: its labels, whether it can be put on
+;;                    the wire at all, and how two of them order
+;;   the host owns    SHA-1, the octets, the signature, and the zone file
+;;
+;; ## Three things measured on this library, at cd98347's successor
+;;
+;; **The fold is locale-aware, in a function whose docstring forbids that.**
+;; `canonical-name` says "only uppercase *ASCII* letters are folded, which
+;; matters for names carrying bytes above 0x7F: a locale-aware or
+;; Unicode-aware lower-casing would change octets the spec requires to be
+;; left alone" -- and then calls `clojure.string/lower-case`, which is
+;; exactly such a lower-casing. Measured with the default locale set to
+;; tr-TR:
+;;
+;;     (canonical-name "IETF.example")  =>  "ıetf.example."
+;;     (encode-name    "IETF.example")  =>  [4 305 101 116 102 ...]
+;;
+;; 305 is not an octet: ASCII went in and something that cannot be put on
+;; the wire came out. The same zone signed on two machines produces
+;; different signing blobs and different NSEC chains, and nothing in the
+;; library notices. Here folding is `A`-`Z` and nothing else, so no locale
+;; can reach it.
+;;
+;; A Kotoba string is UTF-8 and a DNS label is arbitrary octets, so above
+;; 0x7F the two domains do not line up and there is no faithful reading. A
+;; name whose presentation is not ASCII is `:non-ascii-presentation`, and
+;; `compare-names` answers a value outside {-1, 0, 1} rather than an order
+;; it cannot justify.
+;;
+;; **A long label emits the compression marker.** `encode-name`'s docstring
+;; is "**Never compressed**". It writes `(count l)` as the length octet with
+;; no bound, and RFC 1035 §4.1.4 gives the top two bits of that octet to the
+;; pointer form. Measured: a 192-character label emits `192` -- `0xC0`, the
+;; pointer marker -- and a 64-character label emits `64`, which is the other
+;; reserved pattern. A parser reading that wire form does not see the name
+;; that was encoded. §2.3.4 caps a label at 63 octets and a name at 255, and
+;; those are the bounds that keep the length octet a length.
+;;
+;; **A dot is not always a separator, and an empty label is not a label.**
+;; `labels` splits on every `.`, so `a\.b.example` -- one label containing a
+;; dot in RFC 1035 §5.1 presentation format -- becomes the three labels
+;; `a\`, `b`, `example`, and `a..com` becomes a name with an empty label
+;; whose wire form carries a zero octet in the middle, which is where a name
+;; ends. This guest does not implement presentation escapes; it REFUSES a
+;; name containing a backslash (`:escape-unsupported`), because a
+;; canonicaliser that mis-splits is worse than one that declines.
+;;
+;; ## Order is by label from the right, and the leftmost label rarely speaks
+;;
+;; §6.1. `example.com` precedes `a.example.com`; `z.a.example.com` precedes
+;; `a.b.example.com`. String order disagrees at both.
+;;
+;; `.cljc` stays the oracle for the wire encoding, the RRset assembly and
+;; the NSEC3 chain, and is not required from here (require-graph). It did
+;; not grow a second copy of the ordering (ADR-2608261100).
+
+(ns dnssec.canonical
+  (:export [main name-problem compare-names same-name? wire-length label-count]))
+
+;; --- characters -----------------------------------------------------------------
+
+(defn- cp [s :string i :i64] :i64 (string-code-point-at s i))
+
+(defn- dot [] :i64 46)
+(defn- backslash [] :i64 92)
+
+;; RFC 4034 §6.1: fold `A`-`Z` and nothing else. Every other octet, including
+;; every octet above 0x7F, is left exactly as it is.
+(defn- fold [c :i64] :i64
+  (if (>= c 65) (if (<= c 90) (+ c 32) c) c))
+
+;; --- the effective end of a name ---------------------------------------------------
+;; One trailing dot is the root terminator and not a separator, so
+;; `example.com` and `example.com.` are the same name. A second one is an
+;; empty label, which `name-problem` refuses.
+
+(defn- root-trimmed [s :string] :i64
+  (let [n (string-length s)]
+    (if (= n 0) 0
+        (if (= (cp s (- n 1)) (dot)) (- n 1) n))))
+
+;; --- walking labels ------------------------------------------------------------------
+
+(defn- next-dot [s :string i :i64 end :i64] :i64
+  (if (>= i end) end
+      (if (= (cp s i) (dot)) i (next-dot s (+ i 1) end))))
+
+(defn- prev-dot [s :string end :i64] :i64
+  (if (<= end 0) -1
+      (if (= (cp s (- end 1)) (dot)) (- end 1) (prev-dot s (- end 1)))))
+
+(defn- has-char? [s :string i :i64 c :i64] :bool
+  (if (>= i (string-length s)) false
+      (if (= (cp s i) c) true (has-char? s (+ i 1) c))))
+
+;; A Kotoba string is UTF-8 and a DNS label is arbitrary octets, so the two
+;; domains do not line up above 0x7F: one non-ASCII character is several
+;; bytes, and there is no faithful reading of it as a label. The walk stops
+;; AT the first such byte and never steps into a continuation byte.
+(defn- first-non-ascii [s :string i :i64] :i64
+  (if (>= i (string-length s)) -1
+      (if (> (cp s i) 127) i (first-non-ascii s (+ i 1)))))
+
+(defn- labels-problem [s :string i :i64 end :i64] :keyword
+  (if (>= i end) :none
+      (let [d (next-dot s i end)
+            n (- d i)]
+        (cond
+          ;; §2.3.4 and §4.1.4: a zero length octet is where a name ENDS, so
+          ;; an empty label in the middle truncates the name it is part of.
+          (= n 0) :empty-label
+          (> n 63) :label-too-long
+          :else (labels-problem s (+ d 1) end)))))
+
+(defn- count-labels [s :string i :i64 end :i64] :i64
+  (if (>= i end) 0
+      (+ 1 (count-labels s (+ (next-dot s i end) 1) end))))
+
+;; --- is this a name at all? ------------------------------------------------------------
+
+(defn name-problem [s :string] :keyword
+  (let [end (root-trimmed s)]
+    (cond
+      ;; Answered first, because every other walk here reads one byte at a
+      ;; time and a multi-byte character has no single byte to read.
+      (>= (first-non-ascii s 0) 0) :non-ascii-presentation
+
+      ;; Presentation-format escapes (`\.`, `\DDD`) are not implemented, and
+      ;; a canonicaliser that mis-splits is worse than one that declines.
+      (has-char? s 0 (backslash)) :escape-unsupported
+
+      (= end 0) :none                      ; the root
+
+      ;; A second trailing dot is an empty final label. One is the root
+      ;; terminator and was already trimmed.
+      (= (cp s (- end 1)) (dot)) :empty-label
+
+      :else
+      (let [p (labels-problem s 0 end)]
+        (if (= p :none)
+          ;; §2.3.4: 255 octets for the whole encoded name. Each label costs
+          ;; its length plus one octet, and the root costs one -- which for a
+          ;; name with no empty labels is exactly its character count plus
+          ;; two.
+          (if (> (+ end 2) 255) :name-too-long :none)
+          p)))))
+
+(defn wire-length [s :string] :i64
+  (let [end (root-trimmed s)]
+    (if (= end 0) 1 (+ end 2))))
+
+(defn label-count [s :string] :i64
+  (let [end (root-trimmed s)]
+    (if (= end 0) 0 (count-labels s 0 end))))
+
+;; --- canonical order (§6.1) --------------------------------------------------------------
+
+;; Outside {-1, 0, 1} on purpose: a value a caller cannot mistake for an
+;; ordering, for the pair this guest declines to order.
+(defn- not-comparable [] :i64 -2)
+
+(defn- cmp-octets [a :string b :string i :i64] :i64
+  (let [na (string-length a) nb (string-length b)]
+    (cond
+      (if (>= i na) (if (>= i nb) true false) false) 0
+      (>= i na) -1                          ; a shorter prefix sorts first
+      (>= i nb) 1
+      :else
+      (let [x (fold (cp a i)) y (fold (cp b i))]
+        (cond
+          ;; Not comparable rather than guessed. `name-problem` answers
+          ;; `:non-ascii-presentation` for the same input, and a caller that
+          ;; asked it first never reaches this.
+          (> x 127) (not-comparable)
+          (> y 127) (not-comparable)
+          (< x y) -1
+          (> x y) 1
+          :else (cmp-octets a b (+ i 1)))))))
+
+;; Label by label from the RIGHT. `ea`/`eb` are exclusive ends; a name that
+;; has run out of labels is a suffix of the other and sorts first.
+(defn- cmp-from-right [a :string b :string ea :i64 eb :i64] :i64
+  (cond
+    (if (<= ea 0) (if (<= eb 0) true false) false) 0
+    (<= ea 0) -1
+    (<= eb 0) 1
+    :else
+    (let [sa (+ (prev-dot a ea) 1)
+          sb (+ (prev-dot b eb) 1)
+          c (cmp-octets (string-substring a sa ea) (string-substring b sb eb) 0)]
+      (if (= c (not-comparable)) (not-comparable)
+          (if (= c 0) (cmp-from-right a b (- sa 1) (- sb 1)) c)))))
+
+(defn compare-names [a :string b :string] :i64
+  (if (>= (first-non-ascii a 0) 0) (not-comparable)
+      (if (>= (first-non-ascii b 0) 0) (not-comparable)
+          (cmp-from-right a b (root-trimmed a) (root-trimmed b)))))
+
+(defn same-name? [a :string b :string] :bool
+  (if (= (compare-names a b) 0) true false))
+
+;; --- the artifact's own conformance check ------------------------------------------
+;;
+;; `main` is the browser profile's entry point -- `runtime/browser-host.mjs`
+;; refuses to instantiate a module without one -- and it is not a stub. It
+;; runs the ordering and one refusal back through the decisions above and
+;; answers 0 only when each still decides the way this object was built to
+;; decide, so a COMPILED artifact can be asked whether it is itself by a
+;; host that knows nothing about DNS.
+;;
+;; Three, not ten: the native backends evaluate `main` as a compile-time
+;; oracle with a budget, and ten calls of this shape is `native artifact
+;; oracle evaluation rejected`. The wider check lives in the suite.
+;;
+;; The names here are short on purpose. A module's fuel is a private global
+;; baked in at compile time and the default is 512, which the suite measured
+;; is enough for an ordinary name and not for the 192-character label.
+
+(defn main [] :i64
+  (cond
+    (if (= (compare-names "example.com" "a.example.com") -1) false true) 1
+    (if (= (name-problem "a..com") :empty-label) false true) 2
+    (if (same-name? "EXAMPLE.COM" "example.com.") false true) 3
+    :else 0))

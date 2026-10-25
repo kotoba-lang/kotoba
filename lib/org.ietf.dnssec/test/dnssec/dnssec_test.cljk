@@ -1,0 +1,227 @@
+(ns dnssec.dnssec-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [dnssec.canonical :as c]
+            [dnssec.sign :as sign]))
+
+;; The "signer" returns the blob it was handed. Every assertion below is about
+;; *which bytes get signed*, which is where DNSSEC actually breaks — the
+;; signature arithmetic is almost never the bug.
+(defn- echo-signer [_algo _key octets] (vec octets))
+(defn- fake-digest [_type octets] (vec (take 32 (concat octets (repeat 0)))))
+
+(defn- a-rr [nm addr & [ttl]]
+  {:zone/name nm :zone/ttl (or ttl 300) :zone/class "IN" :zone/type "A"
+   :zone/rdata {:zone/address addr}})
+
+;; ── canonical names ───────────────────────────────────────────────────────
+
+(deftest names-are-lowercased-and-uncompressed
+  (is (= "example.com." (c/canonical-name "EXAMPLE.CoM")))
+  (is (= "example.com." (c/canonical-name "example.com.")))
+  (is (= "." (c/canonical-name ".")))
+  (testing "the wire form is length-prefixed labels, no pointers"
+    (is (= [7 101 120 97 109 112 108 101 3 99 111 109 0] (c/encode-name "Example.COM")))
+    (is (= [0] (c/encode-name ".")))))
+
+(deftest canonical-name-order-is-right-to-left-not-string-order
+  (testing "a suffix sorts before what extends it"
+    (is (neg? (c/compare-names "example.com" "a.example.com"))))
+  (testing "and the comparison starts at the rightmost label"
+    ;; Reversed, these are [com example z] and [com example b a]: the first two
+    ;; labels tie and then "z" > "b", so a.b.example.com sorts FIRST. Plain
+    ;; string order says the opposite ("a.b…" < "z.…" is true there too, but
+    ;; for the wrong reason — it compares the leftmost label first, which
+    ;; disagrees as soon as the shared suffix is not a prefix of both).
+    (is (pos? (c/compare-names "z.example.com" "a.b.example.com")))
+    (is (neg? (c/compare-names "a.b.example.com" "z.example.com")))
+    (is (neg? (c/compare-names "z.a.example.com" "a.b.example.com"))
+        "here string order disagrees: it would put a.b… first")
+    (is (pos? (c/compare-names "a.example.com" "example.com"))))
+  (testing "the RFC 4034 §6.1 worked example"
+    ;; The RFC writes \001 and \200 as escapes for the octets 0x01 and 0x80.
+    ;; Spelling them as literal backslash text would compare 0x5C instead and
+    ;; test nothing about the octet ordering the RFC is demonstrating.
+    (let [oct1 (str (char 1) ".z.example.")
+          oct200 (str (char 128) ".z.example.")]
+      (is (= ["example." "a.example." "yljkjljk.a.example." "Z.a.example."
+              "zABC.a.EXAMPLE." "z.example." oct1 "*.z.example." oct200]
+             (c/sort-names ["a.example." "Z.a.example." "yljkjljk.a.example."
+                            "zABC.a.EXAMPLE." "z.example." oct1
+                            "*.z.example." oct200 "example."]))
+          "the ordering example from RFC 4034 §6.1")))
+  (testing "case does not affect order"
+    (is (zero? (c/compare-names "EXAMPLE.COM" "example.com")))))
+
+;; ── canonical RR form ─────────────────────────────────────────────────────
+
+(deftest the-original-ttl-is-used-not-the-records-own
+  (let [rr (a-rr "example.com." "192.0.2.1" 60)
+        signed-at-origin (c/encode-rr rr 3600)
+        signed-from-cache (c/encode-rr rr 60)]
+    (is (not= signed-at-origin signed-from-cache))
+    (testing "a cached copy has a decremented TTL; using it would validate at the origin and fail everywhere else"
+      ;; layout after the name: type(2) class(2) ttl(4) rdlength(2) rdata(4),
+      ;; so the TTL is ten octets from the end.
+      (is (= [0 0 14 16] (subvec signed-at-origin (- (count signed-at-origin) 10)
+                                 (- (count signed-at-origin) 6)))
+          "3600 as a big-endian u32 sits in the TTL field"))))
+
+(deftest rrsets-sort-by-rdata-octets
+  (let [rrs [(a-rr "e.com." "192.0.2.10") (a-rr "e.com." "192.0.2.2") (a-rr "e.com." "10.0.0.1")]
+        sorted (c/sort-rrset rrs)]
+    (is (= ["10.0.0.1" "192.0.2.2" "192.0.2.10"]
+           (mapv #(get-in % [:zone/rdata :zone/address]) sorted))
+        "unsigned octet order, so 192.0.2.2 precedes 192.0.2.10 — not string order")
+    (testing "ordering is stable regardless of input order"
+      (is (= sorted (c/sort-rrset (reverse rrs)))))))
+
+(deftest an-embedded-name-is-lowercased-in-canonical-rdata
+  (let [mx {:zone/name "e.com." :zone/type "MX" :zone/ttl 300 :zone/class "IN"
+            :zone/rdata {:zone/pref 10 :zone/exchange "MAIL.Example.COM."}}]
+    (is (= (c/encode-rdata "MX" (:zone/rdata mx))
+           (c/encode-rdata "MX" {:zone/pref 10 :zone/exchange "mail.example.com."})))))
+
+(deftest an-unmodelled-type-signs-through-its-raw-octets
+  (is (= [1 2 3] (c/encode-rdata "TYPE65535" {:zone/raw [1 2 3]}))
+      "a signer need not understand an RR, only serialize it the way a validator will")
+  (is (thrown? js/Error
+               (c/encode-rdata "TYPE65535" {:zone/something "x"}))))
+
+;; ── key tag ───────────────────────────────────────────────────────────────
+
+(deftest the-key-tag-is-a-checksum-and-can-collide
+  (let [k (sign/dnskey {:name "example.com." :algorithm :ed25519
+                        :public-key (vec (range 32)) :ksk? true})]
+    (is (integer? (sign/dnskey-tag k :ed25519)))
+    (is (<= 0 (sign/dnskey-tag k :ed25519) 0xFFFF))
+    (testing "it is deterministic"
+      (is (= (sign/dnskey-tag k :ed25519) (sign/dnskey-tag k :ed25519))))
+    (testing "a different key gives a different tag"
+      (let [k2 (sign/dnskey {:name "example.com." :algorithm :ed25519
+                             :public-key (vec (range 1 33)) :ksk? true})]
+        (is (not= (sign/dnskey-tag k :ed25519) (sign/dnskey-tag k2 :ed25519))))))
+  (testing "algorithm 1 has a different rule and is refused rather than answered wrongly"
+    (is (thrown? js/Error
+                 (sign/key-tag [1 2 3 4] 1)))))
+
+(deftest the-sep-bit-distinguishes-a-ksk
+  (let [ksk (sign/dnskey {:name "e.com." :algorithm :ed25519 :public-key [1] :ksk? true})
+        zsk (sign/dnskey {:name "e.com." :algorithm :ed25519 :public-key [1]})]
+    (is (= [1 1] (subvec (get-in ksk [:zone/rdata :zone/raw]) 0 2)) "257")
+    (is (= [1 0] (subvec (get-in zsk [:zone/rdata :zone/raw]) 0 2)) "256")
+    (testing "protocol is fixed at 3 (RFC 4034 §2.1.2)"
+      (is (= 3 (nth (get-in ksk [:zone/rdata :zone/raw]) 2))))
+    (testing "then the algorithm number"
+      (is (= 15 (nth (get-in ksk [:zone/rdata :zone/raw]) 3)) "Ed25519 is 15, RFC 8080"))))
+
+;; ── DS ────────────────────────────────────────────────────────────────────
+
+(deftest the-ds-digest-covers-the-owner-name-then-the-dnskey-rdata
+  (let [k (sign/dnskey {:name "example.com." :algorithm :ed25519
+                        :public-key (vec (range 32)) :ksk? true})
+        input (sign/ds-digest-input k)]
+    (is (= (c/encode-name "example.com.") (subvec input 0 (count (c/encode-name "example.com.")))))
+    (is (= (get-in k [:zone/rdata :zone/raw])
+           (subvec input (count (c/encode-name "example.com."))))))
+  (testing "the DS record carries tag, algorithm, digest type, digest"
+    (let [k (sign/dnskey {:name "example.com." :algorithm :ed25519
+                          :public-key (vec (range 32)) :ksk? true})
+          d (sign/ds k {:algorithm :ed25519 :digest-type :sha256 :digest-fn fake-digest})
+          raw (get-in d [:zone/rdata :zone/raw])]
+      (is (= "DS" (:zone/type d)))
+      (is (= (sign/dnskey-tag k :ed25519) (:dnssec/key-tag d)))
+      (is (= 15 (nth raw 2)))
+      (is (= 2 (nth raw 3)) "SHA-256 is digest type 2")
+      (is (= 36 (count raw)) "2 tag + 1 algo + 1 digest-type + 32 digest"))))
+
+;; ── RRSIG ─────────────────────────────────────────────────────────────────
+
+(def sig-params
+  {:algorithm :ed25519 :key :secret :key-tag 12345 :signer "example.com."
+   :original-ttl 3600 :inception 1700000000 :expiration 1702592000
+   :sign-fn echo-signer})
+
+(deftest the-signed-blob-is-the-rrsig-prefix-then-the-records
+  (let [rrs [(a-rr "www.example.com." "192.0.2.2") (a-rr "www.example.com." "192.0.2.1")]
+        blob (sign/signing-blob rrs (assoc sig-params
+                                           :type-covered "A"
+                                           :name "www.example.com."))
+        prefix (sign/rrsig-rdata-prefix (assoc sig-params
+                                               :type-covered "A"
+                                               :name "www.example.com."))]
+    (is (= prefix (subvec blob 0 (count prefix)))
+        "omitting the prefix is a real and common mistake; a validator rebuilds it from the RRSIG it got")
+    (testing "and the records follow in canonical order, not input order"
+      (let [rest-of (subvec blob (count prefix))
+            expected (vec (mapcat #(c/encode-rr % 3600) (c/sort-rrset rrs)))]
+        (is (= expected rest-of))))))
+
+(deftest the-labels-field-excludes-root-and-a-leading-wildcard
+  (let [p #(nth (sign/rrsig-rdata-prefix (assoc sig-params :type-covered "A" :name %)) 3)]
+    (is (= 3 (p "www.example.com.")))
+    (is (= 2 (p "example.com.")))
+    (is (= 0 (p ".")))
+    (is (= 2 (p "*.example.com."))
+        "a wildcard's own label is not counted — an off-by-one here breaks only wildcard proofs")))
+
+(deftest an-rrsig-covers-exactly-one-rrset
+  (is (thrown? js/Error
+               (sign/rrsig [(a-rr "a.example.com." "192.0.2.1")
+                            (a-rr "b.example.com." "192.0.2.2")]
+                           sig-params)))
+  (is (thrown? js/Error
+               (sign/rrsig [] sig-params)))
+  (is (:zone/rdata (sign/rrsig [(a-rr "a.example.com." "192.0.2.1")] sig-params))))
+
+(deftest the-rrsig-record-embeds-the-prefix-then-the-signature
+  (let [rrs [(a-rr "www.example.com." "192.0.2.1")]
+        sig (sign/rrsig rrs sig-params)
+        raw (get-in sig [:zone/rdata :zone/raw])
+        prefix (sign/rrsig-rdata-prefix (assoc sig-params :type-covered "A"
+                                               :name "www.example.com."))]
+    (is (= "RRSIG" (:zone/type sig)))
+    (is (= "www.example.com." (:zone/name sig)))
+    (is (= "A" (:dnssec/type-covered sig)))
+    (is (= prefix (subvec raw 0 (count prefix))))
+    (testing "the echo signer makes the signed blob visible in the record"
+      (is (= (sign/signing-blob rrs (assoc sig-params :type-covered "A"
+                                           :name "www.example.com."))
+             (subvec raw (count prefix)))))))
+
+;; ── NSEC ──────────────────────────────────────────────────────────────────
+
+(deftest the-type-bitmap-counts-bits-from-the-most-significant-end
+  (testing "type A is 1, so window 0 bit 1 — the second-highest bit of octet 0"
+    (is (= [0 1 0x40] (sign/type-bitmap #{"A"}))))
+  (testing "A(1) NS(2) SOA(6)"
+    (is (= [0 1 (bit-or 0x40 0x20 0x02)] (sign/type-bitmap #{"A" "NS" "SOA"}))))
+  (testing "only non-empty windows are emitted"
+    (let [bm (sign/type-bitmap #{"A" "CAA"})]        ; CAA is 257 -> window 1
+      (is (= 0 (first bm)))
+      (is (some #{1} bm) "window 1 is present")
+      (is (not (some #{2 3 4} (take 2 bm))) "windows in between are absent, not zero-filled"))))
+
+(deftest the-nsec-chain-is-circular
+  (let [records [(a-rr "example.com." "192.0.2.1")
+                 (a-rr "www.example.com." "192.0.2.2")
+                 (a-rr "mail.example.com." "192.0.2.3")]
+        chain (sign/nsec-chain records {:apex "example.com."})]
+    (is (= 3 (count chain)))
+    (is (= ["example.com." "mail.example.com." "www.example.com."]
+           (mapv :zone/name chain))
+        "canonical name order, not string order")
+    (testing "the last name points back at the apex"
+      (let [last-next (c/encode-name "example.com.")
+            raw (get-in (last chain) [:zone/rdata :zone/raw])]
+        (is (= last-next (subvec raw 0 (count last-next)))
+            "without the wrap, every name after the last one is unprovable")))
+    (testing "each NSEC asserts NSEC and RRSIG at its own name"
+      (let [raw (get-in (first chain) [:zone/rdata :zone/raw])
+            next-len (count (c/encode-name "mail.example.com."))
+            bitmap (subvec raw next-len)]
+        (is (= bitmap (sign/type-bitmap #{"A" "NSEC" "RRSIG"})))))))
+
+(deftest deprecated-algorithms-are-not-selectable
+  (is (nil? (get sign/algorithms :rsasha1)))
+  (is (nil? (get sign/digests :sha1))
+      "RFC 8624 deprecates both; leaving them out means nobody picks one by autocompleting"))

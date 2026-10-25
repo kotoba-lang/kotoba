@@ -100,6 +100,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.sdJwtVc` | `org.ietf.sdJwtVc/src` | `sd-jwt-vc.core` (an external specification, publisher ietf.org) |
 | `org.w3.webauthn` | `org.w3.webauthn/src` | `webauthn.core` (an external specification, publisher w3.org) |
 | `org.w3.png` | `org.w3.png/src` | `png.bytes`, `png.core`, `png.decode`, `png.encode` (an external specification, publisher w3.org) |
+| `org.ietf.dnssec` | `org.ietf.dnssec/src` | `dnssec.canonical`, `dnssec.nsec3`, `dnssec.provider`, `dnssec.sign` (an external specification, publisher ietf.org) |
 | `kotoba.oidc` | `kotoba.oidc/src` | `oidc.adapters.discovery`, `oidc.adapters.identity-bridge`, `oidc.adapters.jwks`, `oidc.adapters.jwt-claims` (Kotoba project library) |
 | `kotoba.codebase` | `kotoba.codebase/src` | `kotoba.codebase.actor`, `kotoba.codebase.authoring`, `kotoba.codebase.backend`, `kotoba.codebase.backend.kotobase` (Kotoba project library) |
 | `kotoba.arrangement` | `kotoba.arrangement/src` | `arrangement.core`, `arrangement.datalog`, `arrangement.partitioned`, `arrangement.query` (Kotoba project library) |
