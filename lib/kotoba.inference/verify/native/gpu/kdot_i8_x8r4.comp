@@ -1,0 +1,223 @@
+#version 450
+#extension GL_EXT_integer_dot_product : require
+// ggml K-quant dot on int8 activations with the packed 4x8-bit integer dot product, on the
+// x8 lane mapping with R rows in flight (iteration 34): 256 threads = 8 block slots x 32 lanes,
+// a lane owns eight consecutive values (two code words, two activation words, two dots), R
+// rows share the activation words. kdot_i8_r8's arithmetic (iteration 31) on kdot_x8r8's
+// layout (iteration 33). Six bindings; dispatch (ceil(rows / ROWS), positions, 1).
+//   tensor_type: 12 Q4_K (144 B/256) | 13 Q5_K (176) | 14 Q6_K (210) | 23 IQ4_XS (136) | 8 Q8_0 (272) | 2 Q4_0 (144) | 1 F16 (512)
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer Meta {
+  uint rows; uint cols; uint tensor_type; uint positions; uint input_per_expert; uint pad0; uint pad1; uint pad2;
+} params;
+layout(std430, binding = 1) readonly buffer W { uint weights[]; };
+layout(std430, binding = 2) readonly buffer X { uint xq[]; };       // int8 activations, four per word (quant_q8)
+layout(std430, binding = 3) buffer O { float outp[]; };
+layout(std430, binding = 4) readonly buffer E { uint expert_ids[]; };
+layout(std430, binding = 5) readonly buffer XS { float xscale[]; };   // one scale per 32 activations
+
+#ifndef ROWS
+#define ROWS 4   // rows per workgroup; -DROWS=4|16|32 builds kdot_f32_r4 / r16 / r32 (iteration 29 sweep)
+#endif
+const uint ROWS_PER_WG = uint(ROWS);
+shared float partial[ROWS * 256];
+uint weight_byte(uint offset) { return (weights[offset >> 2u] >> ((offset & 3u) * 8u)) & 255u; }
+float weight_half(uint offset) {
+  vec2 pair = unpackHalf2x16(weights[offset >> 2u]);
+  return ((offset & 2u) != 0u) ? pair.y : pair.x;
+}
+int q4_scale(uint base, uint j) {
+  if (j < 4u) return int(weight_byte(base + 4u + j) & 63u);
+  return int((weight_byte(base + 8u + j) & 15u) | ((weight_byte(base + j) >> 6u) << 4u));
+}
+int q4_min(uint base, uint j) {
+  if (j < 4u) return int(weight_byte(base + 8u + j) & 63u);
+  return int((weight_byte(base + 8u + j) >> 4u) | ((weight_byte(base + 4u + j) >> 6u) << 4u));
+}
+ivec4 q4_word_values(uint base, uint index) {
+  uint group = index / 64u; uint within = index & 63u;
+  uint w = weights[(base + 16u + group * 32u + (within & 31u)) >> 2u];
+  uint shift = (within >= 32u) ? 4u : 0u;
+  return ivec4(int((w >> shift) & 15u), int((w >> (8u + shift)) & 15u), int((w >> (16u + shift)) & 15u), int((w >> (24u + shift)) & 15u));
+}
+uint weight_u32_at(uint offset) {
+  uint w0 = weights[offset >> 2u]; uint shift = (offset & 3u) * 8u;
+  if (shift == 0u) return w0;
+  uint w1 = weights[(offset >> 2u) + 1u];
+  return (w0 >> shift) | (w1 << (32u - shift));
+}
+ivec4 q6_word_values(uint base, uint index) {
+  uint group = index / 128u; uint within = index & 127u; uint lane = within & 31u;
+  uint ql_base = base + group * 64u;
+  uint qh = weight_u32_at(base + 128u + group * 32u + lane);
+  uint quarter = within / 32u;
+  uint ql = weight_u32_at(ql_base + (((quarter & 1u) == 1u) ? 32u : 0u) + lane);
+  uint ql_shift = (quarter >= 2u) ? 4u : 0u;
+  uint qh_shift = quarter * 2u;
+  // written out: a dynamically indexed ivec4 in a loop goes to local memory on
+  // NVIDIA (measured 2026-09-19 on the Xavier: 1 GB/s against 54 for f32)
+  return ivec4(int(((ql >> ql_shift) & 15u) | (((qh >> qh_shift) & 3u) << 4u)) - 32,
+               int(((ql >> (8u + ql_shift)) & 15u) | (((qh >> (8u + qh_shift)) & 3u) << 4u)) - 32,
+               int(((ql >> (16u + ql_shift)) & 15u) | (((qh >> (16u + qh_shift)) & 3u) << 4u)) - 32,
+               int(((ql >> (24u + ql_shift)) & 15u) | (((qh >> (24u + qh_shift)) & 3u) << 4u)) - 32);
+}
+// IQ4_XS codebook (ggml kvalues_iq4nl) as four packed words of int8, selected
+// by comparison rather than indexed: a dynamically indexed constant array is
+// local memory on NVIDIA.
+//   -127,-104,-83,-65 | -49,-35,-22,-10 | 1,13,25,38 | 53,69,89,113
+int kvalue(uint i) {
+  uint w = (i < 4u) ? 0xBFAD9881u : (i < 8u) ? 0xF6EADDCFu : (i < 12u) ? 0x26190D01u : 0x71594535u;
+  return bitfieldExtract(int(w), int((i & 3u) * 8u), 8);
+}
+ivec4 q5_word_values(uint base, uint index) {
+  uint group = index / 64u; uint within = index & 63u; uint lane = within & 31u;
+  bool hi_half = within >= 32u;
+  uint qs = weights[(base + 48u + group * 32u + lane) >> 2u];
+  uint qh = weights[(base + 16u + lane) >> 2u];
+  uint shift = hi_half ? 4u : 0u;
+  uint bit = 2u * group + (hi_half ? 1u : 0u);
+  return ivec4(int(((qs >> shift) & 15u) | (((qh >> bit) & 1u) << 4u)),
+               int(((qs >> (8u + shift)) & 15u) | (((qh >> (8u + bit)) & 1u) << 4u)),
+               int(((qs >> (16u + shift)) & 15u) | (((qh >> (16u + bit)) & 1u) << 4u)),
+               int(((qs >> (24u + shift)) & 15u) | (((qh >> (24u + bit)) & 1u) << 4u)));
+}
+ivec4 iq4xs_word_values(uint base, uint index) {
+  uint ib = index / 32u; uint within = index & 31u; bool hi = within >= 16u;
+  uint w = weights[(base + 8u + ib * 16u + (hi ? within - 16u : within)) >> 2u];
+  uint shift = hi ? 4u : 0u;
+  return ivec4(kvalue((w >> shift) & 15u), kvalue((w >> (8u + shift)) & 15u),
+               kvalue((w >> (16u + shift)) & 15u), kvalue((w >> (24u + shift)) & 15u));
+}
+int iq4xs_scale(uint base, uint ib) {
+  uint scales_h = weights[base >> 2u] >> 16u;
+  uint scales_l = weight_byte(base + 4u + ib / 2u);
+  return int(((scales_l >> (4u * (ib & 1u))) & 15u) | (((scales_h >> (2u * ib)) & 3u) << 4u));
+}
+uint block_bytes_of(uint t) {
+  if (t == 12u) return 144u; if (t == 13u) return 176u; if (t == 14u) return 210u; if (t == 23u) return 136u;
+  if (t == 8u) return 272u; if (t == 2u) return 144u; if (t == 1u) return 512u; return 0u;
+}
+
+// Q6_K: the four 6-bit codes of index..index+3 as one byte-per-code word (before the -32)
+uint q6_codes(uint base, uint index) {
+  uint group = index / 128u; uint within = index & 127u; uint lane = within & 31u;
+  uint quarter = within / 32u;
+  uint qh = weight_u32_at(base + 128u + group * 32u + lane);
+  uint ql = weight_u32_at(base + group * 64u + (((quarter & 1u) == 1u) ? 32u : 0u) + lane);
+  uint nib = ((quarter >= 2u) ? (ql >> 4u) : ql) & 0x0F0F0F0Fu;
+  uint h = ((qh >> (quarter * 2u)) & 0x03030303u) << 4u;
+  return nib | h;
+}
+// Q4_K: the four nibbles of index..index+3 as one byte-per-code word
+uint q4_codes(uint base, uint index) {
+  uint group = index / 64u; uint within = index & 63u;
+  uint w = weights[(base + 16u + group * 32u + (within & 31u)) >> 2u];
+  return ((within >= 32u) ? (w >> 4u) : w) & 0x0F0F0F0Fu;
+}
+// Q5_K: Q4 nibbles plus the fifth bit from qh, as one byte-per-code word
+uint q5_codes(uint base, uint index) {
+  uint group = index / 64u; uint within = index & 63u; uint lane = within & 31u;
+  bool hi_half = within >= 32u;
+  uint qs = weights[(base + 48u + group * 32u + lane) >> 2u];
+  uint qh = weights[(base + 16u + lane) >> 2u];
+  uint bit = 2u * group + (hi_half ? 1u : 0u);
+  uint nib = (hi_half ? (qs >> 4u) : qs) & 0x0F0F0F0Fu;
+  uint h = ((qh >> bit) & 0x01010101u) << 4u;
+  return nib | h;
+}
+// Q8_0 (type 8) / Q4_0 (type 2) / F16 (type 1), iteration 53 (int8 twin of the kdot_f32_* arms): 32-value blocks
+// (Q8_0 34 B = f16 d + 32 int8; Q4_0 18 B = f16 d + 16 B of nibbles, code q - 8) or none (F16, 2 B/value).
+// block_bytes_of() answers bytes per 256 values (272 / 144 / 512) so the 256-group loop and `wb` are unchanged; a
+// lane's eight values never straddle a 32-value block (index is a multiple of 8), so one d, one block and one
+// activation scale serve both words. Rows need not be 256-multiples (Qwen2.5-0.5B: 896 = 28 blocks): blocks =
+// ceil(cols / 256), row_bytes = ceil(cols / 32) * 34 (18 / 64), tail group masked in main. Block starts are
+// 2-byte aligned (34 = 18 = 2 mod 4) so the codes go through weight_u32_at; the last block of a row whose block
+// count is odd reads 2 B past the row end (inside the buffer except at the tensor's very end).
+//   Q8_0: the codes ARE the signed int8 bytes -- the word goes straight into dotPacked4x8EXT (no offset, no mins).
+//   Q4_0: the nibble word (0..15 per byte) is dotted and the -8 is folded as 8 * ysum, the way Q6_K folds its -32.
+//   F16:  there is no int8 weight; the halves are dotted in f32 against the DEQUANTIZED activation (xq * sx), so
+//         this arm carries the activation's quantization error and nothing else (measured, not NaN).
+uint q8_0_codes(uint base, uint index) { return weight_u32_at(base + (index / 32u) * 34u + 2u + (index & 31u)); }
+uint q4_0_codes(uint base, uint index) {   // value j < 16: low nibble of byte j; j >= 16: high nibble of byte j - 16
+  uint within = index & 31u;
+  uint w = weight_u32_at(base + (index / 32u) * 18u + 2u + (within & 15u));
+  return ((within >= 16u) ? (w >> 4u) : w) & 0x0F0F0F0Fu;
+}
+vec4 f16_values(uint base, uint index) {   // four halves = two words; aligned because cols is even (row_bytes = 2 * cols)
+  uint w = (base + index * 2u) >> 2u;
+  return vec4(unpackHalf2x16(weights[w]), unpackHalf2x16(weights[w + 1u]));
+}
+vec4 i8_values(int w) { return vec4(bitfieldExtract(w, 0, 8), bitfieldExtract(w, 8, 8), bitfieldExtract(w, 16, 8), bitfieldExtract(w, 24, 8)); }
+
+
+void main() {
+  uint row0 = gl_WorkGroupID.x * ROWS_PER_WG;
+  uint position = gl_WorkGroupID.y;
+  uint t = gl_LocalInvocationID.x;
+  uint expert = expert_ids[position];
+  uint in_row = ((params.input_per_expert == 1u) ? ((params.pad0 > 1u) ? position / params.pad0 : position) : 0u) + params.pad1;   // pad0 > 1: positions per input row (prefill MoE); pad1: input row offset (the lm_head on a prefill's last row) -- iterations 36-37
+  uint tt = params.tensor_type;
+  bool b32 = (tt == 8u || tt == 2u || tt == 1u);   // 32-value blocks / no blocks: rows need not be 256-multiples
+  uint blocks = b32 ? (params.cols + 255u) / 256u : params.cols / 256u;
+  uint block_bytes = block_bytes_of(tt);
+  uint row_bytes = b32 ? ((params.cols + 31u) / 32u) * (block_bytes / 8u) : blocks * block_bytes;
+  uint b0 = t >> 5u;
+  uint index = (t & 31u) * 8u;
+  float acc[ROWS]; float mins[ROWS];
+  for (uint r = 0u; r < ROWS_PER_WG; r++) { acc[r] = 0.0; mins[r] = 0.0; }
+  uint nrows = min(ROWS_PER_WG, params.rows - min(row0, params.rows));
+  if (position < params.positions) {
+    for (uint block = b0; block < blocks; block += 8u) {
+      // tail of a non-256-multiple row (b32 only; never false for K-quant). Written as an `if` around the body, NOT
+      // as `continue` or a per-lane loop bound: with the three b32 arms present those two forms cost the f32 x8r4
+      // kernel 35% on Q5_K (190 -> 123 GB/s, anv, tick 55) while this form measures 183 -- a compiler cliff, not
+      // the arms (each arm alone, or all three with a uniform loop, measures 182-186).
+      if (block * 256u + index < params.cols) {
+      uint xb = in_row * params.cols + block * 256u + index;
+      int xw0 = int(xq[xb >> 2u]), xw1 = int(xq[(xb >> 2u) + 1u]);
+      float sx = xscale[xb >> 5u];
+      float ysum = float(dotPacked4x8EXT(0x01010101, xw0) + dotPacked4x8EXT(0x01010101, xw1)) * sx;
+      uint base0 = (expert * params.rows + row0) * row_bytes + block * block_bytes;
+      for (uint r = 0u; r < nrows; r++) {
+        uint wb = base0 + r * row_bytes;
+        if (tt == 12u || tt == 13u) {
+          uint j = index / 32u;
+          float scale = float(q4_scale(wb, j));
+          uint ca = (tt == 12u) ? q4_codes(wb, index) : q5_codes(wb, index);
+          uint cb = (tt == 12u) ? q4_codes(wb, index + 4u) : q5_codes(wb, index + 4u);
+          acc[r] += weight_half(wb) * scale * sx * float(dotPacked4x8EXT(int(ca), xw0) + dotPacked4x8EXT(int(cb), xw1));
+          mins[r] += weight_half(wb + 2u) * float(q4_min(wb, j)) * ysum;
+        } else if (tt == 23u) {
+          uint ib = index / 32u; uint within = index & 31u; bool hi = within >= 16u;
+          uint w = weights[(wb + 8u + ib * 16u + (hi ? within - 16u : within)) >> 2u];
+          uint w2 = weights[(wb + 8u + ib * 16u + (hi ? within - 12u : within + 4u)) >> 2u];
+          uint c = (hi ? (w >> 4u) : w) & 0x0F0F0F0Fu, c2 = (hi ? (w2 >> 4u) : w2) & 0x0F0F0F0Fu;
+          int va = (kvalue(c & 15u) & 255) | ((kvalue((c >> 8u) & 15u) & 255) << 8) | ((kvalue((c >> 16u) & 15u) & 255) << 16) | ((kvalue((c >> 24u) & 15u) & 255) << 24);
+          int vb = (kvalue(c2 & 15u) & 255) | ((kvalue((c2 >> 8u) & 15u) & 255) << 8) | ((kvalue((c2 >> 16u) & 15u) & 255) << 16) | ((kvalue((c2 >> 24u) & 15u) & 255) << 24);
+          float ls = float(iq4xs_scale(wb, ib) - 32);
+          acc[r] += weight_half(wb) * ls * sx * float(dotPacked4x8EXT(va, xw0) + dotPacked4x8EXT(vb, xw1));
+        } else if (tt == 8u) {
+          acc[r] += weight_half(wb + (index / 32u) * 34u) * sx * float(dotPacked4x8EXT(int(q8_0_codes(wb, index)), xw0) + dotPacked4x8EXT(int(q8_0_codes(wb, index + 4u)), xw1));
+        } else if (tt == 2u) {
+          acc[r] += weight_half(wb + (index / 32u) * 18u) * (sx * float(dotPacked4x8EXT(int(q4_0_codes(wb, index)), xw0) + dotPacked4x8EXT(int(q4_0_codes(wb, index + 4u)), xw1)) - 8.0 * ysum);
+        } else if (tt == 1u) {
+          acc[r] += sx * (dot(f16_values(wb, index), i8_values(xw0)) + dot(f16_values(wb, index + 4u), i8_values(xw1)));
+        } else {
+          uint j = index / 16u;
+          uint sb = weight_byte(wb + 192u + j);
+          float scale = float((sb >= 128u) ? int(sb) - 256 : int(sb));
+          uint ca = q6_codes(wb, index), cb = q6_codes(wb, index + 4u);
+          acc[r] += weight_half(wb + 208u) * scale * (sx * float(dotPacked4x8EXT(int(ca), xw0) + dotPacked4x8EXT(int(cb), xw1)) - 32.0 * ysum);
+        }
+      }
+      }
+    }
+  }
+  for (uint r = 0u; r < ROWS_PER_WG; r++) partial[r * 256u + t] = acc[r] - mins[r];
+  barrier();
+  for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+    if (t < stride) for (uint r = 0u; r < ROWS_PER_WG; r++) partial[r * 256u + t] += partial[r * 256u + t + stride];
+    barrier();
+  }
+  if (t < nrows && position < params.positions) outp[position * params.rows + row0 + t] = partial[t * 256u];
+}

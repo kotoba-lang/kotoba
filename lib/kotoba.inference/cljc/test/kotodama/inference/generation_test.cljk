@@ -1,0 +1,91 @@
+(ns kotodama.inference.generation-test
+  "Unit coverage for the new v1 generation stack (tokenizer/sample/decode).
+  Uses a tiny self-contained fixture vocab, not the real Gemma4 GGUF (that is
+  exercised end-to-end by `kotodama.verify.gemma4-e4b-generate-smoke`, which
+  needs a real local model artifact and is out of scope for a fast unit test)."
+  (:require [kotodama.inference.tokenizer :as tokenizer]
+            [kotodama.inference.sample :as sample]
+            [kotodama.inference.decode :as decode]
+            #?(:clj [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer-macros [deftest is testing]])))
+
+(def fixture-vocab
+  ;; ids:                0      1      2      3      4    5    6    7    8    9    10     11
+  {:tokens ["<pad>" "<eos>" "<bos>" "<unk>" "T" "h" "e" "▁" "c" "a" "The" "▁c"]
+   :merges ["T h" "Th e" "▁ c"]
+   :bos-token-id 2
+   :eos-token-id 1
+   :add-bos-token? true})
+
+(deftest tokenizer-round-trips-ascii
+  (let [tok (tokenizer/build fixture-vocab)]
+    (testing "BPE merges greedily by rank, BOS is prepended"
+      (is (= [2 10] (tokenizer/encode tok "The"))))
+    (testing "space -> ▁ marker merges too, and decode restores the literal space
+             (decode is a dumb id->text mapper: real callers, like
+             kotodama.inference.decode/generate, only ever decode the
+             *generated* suffix, never the BOS-prefixed prompt, so the test
+             drops the leading BOS id the same way)"
+      (is (= "The c" (tokenizer/decode tok (rest (tokenizer/encode tok "The c"))))))
+    (testing "byte-fallback for an unmapped character round-trips through <0xXX>"
+      (let [tok-with-fallback (tokenizer/build
+                                (update fixture-vocab :tokens conj "<0x7A>")) ; 'z' = 0x7A
+            ids (rest (tokenizer/encode tok-with-fallback "z"))]
+        (is (= "z" (tokenizer/decode tok-with-fallback ids)))))))
+
+(deftest tokenizer-respects-add-bos-token-flag
+  (let [tok (tokenizer/build (assoc fixture-vocab :add-bos-token? false))]
+    (is (= [10] (tokenizer/encode tok "The")))))
+
+(deftest greedy-picks-argmax
+  (is (= 1 (sample/greedy [0.1 5.2 -3.0 4.9])))
+  (is (= 0 (sample/greedy [7.0 7.0 -1.0]))
+      "ties resolve to the first (lowest) index"))
+
+(deftest sample-with-zero-temperature-is-greedy
+  (is (= 2 (sample/sample [0.0 0.0 9.0] {:kotodama/temperature 0}))))
+
+(deftest sample-top-k-restricts-candidates
+  ;; rand01 = 0.0 always selects the highest-probability surviving candidate.
+  (is (= 2 (sample/sample [0.0 0.1 9.0 8.9]
+                          {:kotodama/temperature 1.0 :kotodama/top-k 2 :kotodama/rand01 0.0}))))
+
+(deftest sample-accepts-a-stateful-random-source
+  (let [calls (atom 0)]
+    (sample/sample [0.0 1.0]
+                   {:kotodama/temperature 1.0
+                    :kotodama/rand01 (fn [] (swap! calls inc) 0.0)})
+    (is (= 1 @calls))))
+
+(deftest decode-generate-stops-on-eos
+  (let [tok (tokenizer/build fixture-vocab)
+        streamed (atom [])
+        ;; forward-fn: after 1 generated token, always route to eos-token-id (1).
+        forward-fn (fn [ids]
+                     (if (< (count ids) (inc (count (tokenizer/encode tok "The"))))
+                       [0 0 0 0 0 0 0 0 0 0 100.0 0] ; argmax -> id 10 ("The")
+                       [0 100.0 0 0 0 0 0 0 0 0 0 0])) ; argmax -> id 1 (eos)
+        result (decode/generate {:kotodama/tokenizer tok
+                                  :kotodama/forward-fn forward-fn
+                                  :kotodama/prompt "The"
+                                  :kotodama/max-tokens 10
+                                  :kotodama/on-token (fn [id text _nanos]
+                                                       (swap! streamed conj [id text]))})]
+    (is (= :eos (:kotodama/stop-reason result)))
+    (is (= [10] (:kotodama/generated-token-ids result)))
+    (is (= [[10 "The"]] @streamed) "EOS is not exposed as a generated stream chunk")))
+
+(deftest decode-generate-stops-on-max-tokens
+  (let [tok (tokenizer/build fixture-vocab)
+        forward-fn (fn [_] [0 0 0 0 0 0 0 0 0 0 100.0 0])] ; always argmax -> id 10, never eos
+    (is (= :max-tokens
+           (:kotodama/stop-reason
+            (decode/generate {:kotodama/tokenizer tok
+                              :kotodama/forward-fn forward-fn
+                              :kotodama/prompt "The"
+                              :kotodama/max-tokens 3}))))
+    (is (= 3 (count (:kotodama/generated-token-ids
+                     (decode/generate {:kotodama/tokenizer tok
+                                       :kotodama/forward-fn forward-fn
+                                       :kotodama/prompt "The"
+                                       :kotodama/max-tokens 3})))))))

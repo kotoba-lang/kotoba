@@ -1,0 +1,335 @@
+(ns scheduler-core
+  (:export [;; P3 — paged KV cache
+            kv-blocks-needed kv-blocks-to-append kv-can-allocate kv-slot-index
+            kv-append-offset kv-free-after-alloc
+            ;; P4 — continuous batching and chunked prefill
+            batch-prefill-chunk batch-budget-after batch-admit
+            batch-decode-slots preempt-rank
+            ;; P5 — prefix caching and speculative decoding
+            prefix-cached-blocks prefix-tokens-to-compute cache-hit-bp
+            spec-accept-count spec-emitted-tokens spec-worth-it
+
+            test-kv-blocks-needed test-kv-blocks-to-append test-kv-can-allocate
+            test-kv-slot-index test-kv-append-offset test-kv-free-after-alloc
+            test-batch-prefill-chunk test-batch-budget-after test-batch-admit
+            test-batch-decode-slots test-preempt-rank
+            test-prefix-cached-blocks test-prefix-tokens-to-compute
+            test-cache-hit-bp test-spec-accept-count test-spec-emitted-tokens
+            test-spec-worth-it]))
+
+;; The scheduling half of an inference server, in Kotoba.
+;;
+;; P3 (paged KV cache), P4 (continuous batching, chunked prefill) and P5
+;; (prefix caching, speculative decoding) are what vLLM and SGLang actually
+;; ARE. Their kernels are cuBLAS and FlashAttention; what they own is the
+;; decision of which sequence runs, how many of its tokens run this step, and
+;; which blocks it may hold. That half is arithmetic over small integers, and
+;; it is expressible in the subset the native backends admit today.
+;;
+;; ── why the signatures are scalars ──
+;;
+;; The same split `kernel_math_core.kotoba` makes for bytes, made here for
+;; aggregates, and for the same measured reason. A native export cannot take a
+;; handle: `native-private-handle-type?` carries `:vector-i64` between private
+;; functions and `native-function-boundary-type?` refuses it at an export.
+;; `:document` crosses, but only `document-edn-read`/`-print` are admitted on
+;; native, so its contents cannot be read (measured 2026-09-09: a
+;; `document-get` program is refused with "typed values currently require the
+;; kotoba-script web target ...").
+;;
+;; So the host keeps the block table, the sequence list and the radix trie, and
+;; asks this core the questions those structures exist to answer. That is the
+;; shape `murakumo.infer.join` and `murakumo.infer.credits` already use through
+;; their shipped KIR, and it is not a workaround: the aggregates are the
+;; server's state, and the decisions are the policy. Only the policy needs to
+;; be one authority.
+;;
+;; ── totality ──
+;;
+;; Every function here is total. A negative count, a zero block size and an
+;; over-large budget all have defined answers, because a scheduler that traps
+;; is a server that stops, and because `quot` by zero traps. The guards are the
+;; first line of each body rather than a caller's obligation.
+;;
+;; Parity oracle: `kotodama.inference.scheduler` (cljc), which the host calls
+;; and which asserts this same case table.
+
+
+;; ── two helpers, because `min`/`max` have no admitted native lowering ───────
+;; Measured 2026-09-09: `(i-max watermark 0)` is refused with
+;; "operation has no admitted lowering" on aarch64. `if` is the whole language
+;; this needs, and writing them out keeps the core inside the subset every
+;; backend shares rather than the one the JVM oracle happens to have.
+
+(defn i-max [a :i64 b :i64] :i64 (if (> a b) a b))
+(defn i-min [a :i64 b :i64] :i64 (if (< a b) a b))
+
+;; ── P3: paged KV cache ──────────────────────────────────────────────────────
+;;
+;; A sequence's KV is stored in fixed-size blocks. Nothing here allocates: the
+;; host owns the free list. These answer how many blocks a length needs, where
+;; a token lands, and whether an allocation may proceed.
+
+(defn kv-blocks-needed [tokens :i64 block-size :i64] :i64
+  ;; ceil(tokens / block-size), guarded. Zero tokens is zero blocks, not one:
+  ;; a sequence with no KV holds nothing.
+  (if (< block-size 1)
+    0
+    (if (< tokens 1)
+      0
+      (quot (+ tokens (- block-size 1)) block-size))))
+
+(defn kv-blocks-to-append [held :i64 new-tokens :i64 block-size :i64] :i64
+  ;; The INCREMENT, not the total. Appending inside a partially filled block
+  ;; costs nothing, which is the whole reason a paged cache is cheaper than a
+  ;; contiguous one, and a scheduler that charged for the total would refuse
+  ;; admissions it could serve.
+  (if (< block-size 1)
+    0
+    (if (< new-tokens 1)
+      0
+      (- (kv-blocks-needed (+ held new-tokens) block-size)
+         (kv-blocks-needed held block-size)))))
+
+(defn kv-can-allocate [free-blocks :i64 need :i64 watermark :i64] :i64
+  ;; vLLM's watermark: an allocation that would leave fewer than `watermark`
+  ;; blocks free is refused even though it fits. Without it a prefill can
+  ;; consume every block and then every running sequence deadlocks on its next
+  ;; append, which is a livelock the scheduler cannot recover from without
+  ;; preempting something it just admitted.
+  (if (< need 0)
+    0
+    (if (>= (- free-blocks need) (i-max watermark 0)) 1 0)))
+
+(defn kv-free-after-alloc [free-blocks :i64 need :i64] :i64
+  (i-max 0 (- free-blocks (i-max need 0))))
+
+(defn kv-slot-index [block-id :i64 offset :i64 block-size :i64] :i64
+  ;; Flat slot in the KV pool. -1 is the refusal, not a trap: the host reads a
+  ;; negative as "no slot" and the alternative -- trapping -- takes the server
+  ;; down for a bad index.
+  (if (< block-size 1)
+    -1
+    (if (< block-id 0)
+      -1
+      (if (< offset 0)
+        -1
+        (if (>= offset block-size)
+          -1
+          (+ (* block-id block-size) offset))))))
+
+(defn kv-append-offset [filled :i64 block-size :i64] :i64
+  ;; Where the next token goes inside the last block, or -1 when a new block is
+  ;; required. `filled` is the token count in that block.
+  (if (< block-size 1)
+    -1
+    (if (< filled 0)
+      -1
+      (if (>= filled block-size) -1 filled))))
+
+;; ── P4: continuous batching and chunked prefill ─────────────────────────────
+;;
+;; One step schedules a token budget across prefills and decodes. Chunked
+;; prefill is what stops a long prompt from stalling every decode behind it:
+;; the prompt is split, and each step takes as much of it as the budget allows.
+
+(defn batch-prefill-chunk [remaining :i64 budget :i64 max-chunk :i64] :i64
+  ;; The smallest of what is left, what the step can afford, and the cap.
+  ;; Never negative, so a caller that already spent its budget schedules
+  ;; nothing rather than un-scheduling something.
+  (if (< remaining 1)
+    0
+    (i-max 0 (i-min remaining (i-min (i-max budget 0) (i-max max-chunk 0))))))
+
+(defn batch-budget-after [budget :i64 scheduled :i64] :i64
+  (i-max 0 (- budget (i-max scheduled 0))))
+
+(defn batch-admit [free-blocks :i64 need :i64 watermark :i64
+                   running :i64 max-running :i64] :i64
+  ;; Both limits, and the concurrency one first: a server that admits past its
+  ;; batch width is a server whose latency target is a wish. Returns 0/1.
+  (if (>= running (i-max max-running 0))
+    0
+    (kv-can-allocate free-blocks need watermark)))
+
+(defn batch-decode-slots [running :i64 budget :i64] :i64
+  ;; One token per running sequence per step, bounded by the budget. This is
+  ;; where chunked prefill and decode compete: whatever prefill took, decode
+  ;; cannot have.
+  (i-max 0 (i-min (i-max running 0) (i-max budget 0))))
+
+(defn preempt-rank [arrival :i64 blocks-held :i64] :i64
+  ;; Higher rank is preempted first. Newest-first (LIFO): preempting the oldest
+  ;; sequence would let a stream of arrivals starve it forever, and the newest
+  ;; has the least work to lose on recompute. Blocks held break the tie, so
+  ;; between two equally new sequences the one that frees more memory goes.
+  ;;
+  ;; A rank, not a choice: the host holds the sequence list and sorts by this.
+  (+ (* (i-max arrival 0) 1024) (i-min (i-max blocks-held 0) 1023)))
+
+;; ── P5: prefix caching and speculative decoding ─────────────────────────────
+
+(defn prefix-cached-blocks [matched-tokens :i64 block-size :i64] :i64
+  ;; Only FULL blocks are reusable. A partially filled block belongs to the
+  ;; sequence that is still writing into it, so sharing it would let one
+  ;; sequence see another's future tokens -- floor, never ceil, and this is the
+  ;; one place in this file where rounding down is the correctness condition
+  ;; rather than a convenience.
+  (if (< block-size 1)
+    0
+    (if (< matched-tokens 1)
+      0
+      (quot matched-tokens block-size))))
+
+(defn prefix-tokens-to-compute [prompt-tokens :i64 cached-blocks :i64
+                                block-size :i64] :i64
+  ;; What prefill still has to do after a cache hit. Never negative and never
+  ;; more than the prompt, so a stale cache entry claiming more blocks than the
+  ;; prompt has cannot make the scheduler compute a negative number of tokens.
+  (if (< block-size 1)
+    (i-max 0 prompt-tokens)
+    (i-max 0 (- (i-max 0 prompt-tokens)
+              (* (i-max 0 cached-blocks) block-size)))))
+
+(defn cache-hit-bp [hit-tokens :i64 total-tokens :i64] :i64
+  ;; Basis points, because this core has no floats at the boundary and a rate
+  ;; reported as a truncated percent hides the difference between 0.4% and 0%.
+  (if (< total-tokens 1)
+    0
+    (i-min 10000 (quot (* (i-max 0 hit-tokens) 10000) total-tokens))))
+
+(defn spec-accept-count [matched :i64 draft-len :i64] :i64
+  ;; The accepted prefix of a draft is the longest run that matched, capped by
+  ;; the draft length. `matched` is what the verifier found; this is the rule
+  ;; that turns it into a count, and the cap is what stops a miscounted match
+  ;; from emitting tokens the model never produced.
+  (i-max 0 (i-min (i-max 0 matched) (i-max 0 draft-len))))
+
+(defn spec-emitted-tokens [accepted :i64 draft-len :i64] :i64
+  ;; Accepted tokens plus the bonus token. The verifier's own next-token
+  ;; prediction is always emitted -- that is why speculative decoding is never
+  ;; slower than one token per step -- and when every draft token was accepted
+  ;; the bonus extends the run by one.
+  (if (< draft-len 0)
+    1
+    (+ (i-max 0 (i-min accepted draft-len)) 1)))
+
+(defn spec-worth-it [accept-bp :i64 draft-cost-bp :i64] :i64
+  ;; Speculation pays when the accepted fraction beats what the draft cost.
+  ;; Equality is NOT worth it: a wash that adds a draft model is a loss in
+  ;; complexity, and a scheduler that speculates on a tie will keep doing it
+  ;; forever without ever measuring a gain.
+  (if (> (i-max 0 accept-bp) (i-max 0 draft-cost-bp)) 1 0))
+
+;; ── tests ───────────────────────────────────────────────────────────────────
+;;
+;; `amu test` runs every exported zero-arity `test-*` on all semantic backends.
+;; Each comparison here has a case ON the boundary as well as either side of
+;; it: without one, flipping `>` to `>=` leaves the suite green, which is the
+;; failure this workspace names explicitly.
+
+(defn test-kv-blocks-needed [] :i64
+  (if (= 0 (kv-blocks-needed 0 16))
+    (if (= 1 (kv-blocks-needed 1 16))
+      (if (= 1 (kv-blocks-needed 16 16))          ; exactly one block
+        (if (= 2 (kv-blocks-needed 17 16))        ; one past it
+          (if (= 0 (kv-blocks-needed 100 0))      ; zero block size does not trap
+            (if (= 0 (kv-blocks-needed -5 16)) 1 0) 0) 0) 0) 0) 0))
+
+(defn test-kv-blocks-to-append [] :i64
+  (if (= 0 (kv-blocks-to-append 4 4 16))          ; still inside block 0
+    (if (= 1 (kv-blocks-to-append 12 8 16))       ; crosses into block 1
+      (if (= 1 (kv-blocks-to-append 16 1 16))     ; first token of a new block
+        (if (= 0 (kv-blocks-to-append 5 0 16))
+          (if (= 2 (kv-blocks-to-append 0 32 16)) 1 0) 0) 0) 0) 0))
+
+(defn test-kv-can-allocate [] :i64
+  (if (= 1 (kv-can-allocate 10 5 2))
+    (if (= 1 (kv-can-allocate 10 8 2))            ; exactly at the watermark
+      (if (= 0 (kv-can-allocate 10 9 2))          ; one past it
+        (if (= 1 (kv-can-allocate 3 3 0))         ; no watermark, exact fit
+          (if (= 0 (kv-can-allocate 10 -1 2)) 1 0) 0) 0) 0) 0))
+
+(defn test-kv-free-after-alloc [] :i64
+  (if (= 5 (kv-free-after-alloc 10 5))
+    (if (= 0 (kv-free-after-alloc 5 5))
+      (if (= 0 (kv-free-after-alloc 3 9)) 1 0) 0) 0))
+
+(defn test-kv-slot-index [] :i64
+  (if (= 0 (kv-slot-index 0 0 16))
+    (if (= 31 (kv-slot-index 1 15 16))            ; last slot of block 1
+      (if (= -1 (kv-slot-index 1 16 16))          ; one past the block
+        (if (= -1 (kv-slot-index -1 0 16))
+          (if (= -1 (kv-slot-index 0 0 0)) 1 0) 0) 0) 0) 0))
+
+(defn test-kv-append-offset [] :i64
+  (if (= 0 (kv-append-offset 0 16))
+    (if (= 15 (kv-append-offset 15 16))           ; last free slot
+      (if (= -1 (kv-append-offset 16 16))         ; block is full
+        (if (= -1 (kv-append-offset -1 16)) 1 0) 0) 0) 0))
+
+(defn test-batch-prefill-chunk [] :i64
+  (if (= 512 (batch-prefill-chunk 2048 512 512))  ; budget and cap agree
+    (if (= 100 (batch-prefill-chunk 100 512 512)) ; prompt is smaller
+      (if (= 256 (batch-prefill-chunk 2048 256 512))
+        (if (= 0 (batch-prefill-chunk 0 512 512))
+          (if (= 0 (batch-prefill-chunk 2048 0 512)) 1 0) 0) 0) 0) 0))
+
+(defn test-batch-budget-after [] :i64
+  (if (= 0 (batch-budget-after 512 512))          ; exactly spent
+    (if (= 256 (batch-budget-after 512 256))
+      (if (= 0 (batch-budget-after 512 900)) 1 0) 0) 0))
+
+(defn test-batch-admit [] :i64
+  (if (= 1 (batch-admit 100 4 2 3 8))
+    (if (= 0 (batch-admit 100 4 2 8 8))           ; exactly at max-running
+      (if (= 1 (batch-admit 100 4 2 7 8))         ; one below it
+        (if (= 0 (batch-admit 5 4 2 0 8)) 1 0) 0) 0) 0))
+
+(defn test-batch-decode-slots [] :i64
+  (if (= 8 (batch-decode-slots 8 512))
+    (if (= 4 (batch-decode-slots 8 4))            ; budget binds
+      (if (= 0 (batch-decode-slots 0 512)) 1 0) 0) 0))
+
+(defn test-preempt-rank [] :i64
+  ;; Newest first, ties broken by blocks held.
+  (if (> (preempt-rank 9 0) (preempt-rank 8 1023))
+    (if (> (preempt-rank 5 10) (preempt-rank 5 9))
+      (if (= (preempt-rank 0 0) 0) 1 0) 0) 0))
+
+(defn test-prefix-cached-blocks [] :i64
+  (if (= 1 (prefix-cached-blocks 16 16))          ; exactly one full block
+    (if (= 1 (prefix-cached-blocks 31 16))        ; the partial one is not shared
+      (if (= 2 (prefix-cached-blocks 32 16))
+        (if (= 0 (prefix-cached-blocks 15 16))
+          (if (= 0 (prefix-cached-blocks 100 0)) 1 0) 0) 0) 0) 0))
+
+(defn test-prefix-tokens-to-compute [] :i64
+  (if (= 100 (prefix-tokens-to-compute 100 0 16))
+    (if (= 68 (prefix-tokens-to-compute 100 2 16))
+      (if (= 0 (prefix-tokens-to-compute 32 2 16))  ; the whole prompt was cached
+        (if (= 0 (prefix-tokens-to-compute 32 99 16)) 1 0) 0) 0) 0))
+
+(defn test-cache-hit-bp [] :i64
+  (if (= 10000 (cache-hit-bp 100 100))
+    (if (= 5000 (cache-hit-bp 50 100))
+      (if (= 40 (cache-hit-bp 4 1000))            ; 0.4%, which a percent hides
+        (if (= 0 (cache-hit-bp 0 100))
+          (if (= 0 (cache-hit-bp 5 0)) 1 0) 0) 0) 0) 0))
+
+(defn test-spec-accept-count [] :i64
+  (if (= 3 (spec-accept-count 3 5))
+    (if (= 5 (spec-accept-count 5 5))             ; every draft token accepted
+      (if (= 5 (spec-accept-count 9 5))           ; a miscount cannot exceed the draft
+        (if (= 0 (spec-accept-count -1 5)) 1 0) 0) 0) 0))
+
+(defn test-spec-emitted-tokens [] :i64
+  (if (= 1 (spec-emitted-tokens 0 5))             ; nothing accepted, bonus only
+    (if (= 4 (spec-emitted-tokens 3 5))
+      (if (= 6 (spec-emitted-tokens 5 5))         ; all accepted, plus the bonus
+        (if (= 6 (spec-emitted-tokens 9 5)) 1 0) 0) 0) 0))
+
+(defn test-spec-worth-it [] :i64
+  (if (= 1 (spec-worth-it 6000 4000))
+    (if (= 0 (spec-worth-it 4000 4000))           ; a tie is not worth it
+      (if (= 0 (spec-worth-it 3000 4000)) 1 0) 0) 0))

@@ -1,0 +1,86 @@
+;; Generate a :gpu/compute guest that runs the K-quant dot kernel on ONE real
+;; tensor of a GGUF file: reads the tensor directory (header only), writes
+;; `kdot_<tensor>.kotoba` with the byte offset, geometry and ggml type as
+;; literals -- a .kotoba program cannot parse GGUF (no file capability), so the
+;; directory is resolved at build time and the program MAPs the file by path.
+;;
+;;   kbb --backend sci verify/native/gpu/gen_kdot_guest.cljk <file.gguf> <tensor> <r1|r4|r8|r16|r32|p|x8r4|x8r8|i8r8|i8x8r4|s4r1|h2r1|h2q6r1> <gguf-path-on-box> <x-path-on-box> <out.kotoba>
+;;
+;; s4r1 / h2r1 / h2q6r1 name the nvgpu kernels kdot_s4_r1.spv / kdot_h2_r1.spv / kdot_h2q6_r1.spv (one row per
+;; workgroup; tick 55). KDOT_SPV_DIR (default /root/kgpu) is the directory the guest names the .spv in, so a
+;; rebuilt kernel can be measured from a side directory before it replaces the installed one.
+;;
+;; Answer of the generated program: "<ns one dispatch>|<ns 10 dispatches in one
+;; command buffer>|<hex of the first 64 outputs>" -- checked by kdot_check.py
+;; against kdot_ref.py's CPU dequant. Root ADR-2609182400 C.
+(require '["fs" :as fs] '[clojure.string :as str])
+(def args (vec *command-line-args*))
+(when (not= 6 (count args)) (println "usage: <file.gguf> <tensor> <r1|r4|r8|r16|r32|p|x8r4|x8r8|i8r8|i8x8r4|s4r1|h2r1|h2q6r1> <gguf-path-on-box> <x-path-on-box> <out.kotoba>") (js/process.exit 2))
+(def gguf (args 0)) (def tensor (args 1)) (def layout (args 2)) (def gguf-on-box (args 3)) (def x-on-box (args 4)) (def out (args 5))
+(def fd (fs/openSync gguf "r"))
+(def head (js/Buffer.alloc (* 64 1024 1024)))
+(def n (fs/readSync fd head 0 (.-length head) 0))
+(def buf (.subarray head 0 n))
+(def pos (atom 0))
+(defn- u8 [] (let [v (.readUInt8 buf @pos)] (swap! pos + 1) v))
+(defn- u32 [] (let [v (.readUInt32LE buf @pos)] (swap! pos + 4) v))
+(defn- u64 [] (let [v (.readBigUInt64LE buf @pos)] (swap! pos + 8) (js/Number v)))
+(defn- gstr [] (let [k (u64) s (.toString buf "utf8" @pos (+ @pos k))] (swap! pos + k) s))
+(declare read-value)
+(defn- read-value [t]
+  (case t
+    0 (u8) 1 (u8) 2 (do (swap! pos + 2) 0) 3 (do (swap! pos + 2) 0) 4 (u32) 5 (u32) 6 (do (swap! pos + 4) 0) 7 (u8) 8 (gstr)
+    9 (let [et (u32) k (u64)] (doall (repeatedly k #(read-value et))) nil)
+    10 (u64) 11 (u64) 12 (do (swap! pos + 8) 0)))
+(when-not (= "GGUF" (.toString buf "latin1" 0 4)) (println "REFUSE not a GGUF file") (js/process.exit 2))
+(swap! pos + 4)
+(def version (u32)) (def n-tensors (u64)) (def n-kv (u64))
+(def alignment (atom 32))
+(dotimes [_ n-kv] (let [k (gstr) t (u32) v (read-value t)] (when (= k "general.alignment") (reset! alignment v))))
+(def tensors (vec (for [_ (range n-tensors)] (let [name (gstr) nd (u32) dims (vec (repeatedly nd u64)) typ (u32) off (u64)] {:name name :dims dims :type typ :offset off}))))
+(def data-start (* (quot (+ @pos @alignment -1) @alignment) @alignment))
+(def block-bytes {12 144 13 176 14 210 23 136 142 68 143 56 8 272 2 144 1 512 30 512 3 160 6 176 7 192})   ;; bytes per 256 values (8 Q8_0 / 2 Q4_0 / 1 F16 = eight 32-value blocks or 256 halves, iteration 53; 3 Q4_1 / 6 Q5_0 / 7 Q5_1 = eight 20 / 22 / 24 B blocks, 53b)
+(def block32-bytes {8 34 2 18 1 64 30 64 3 20 6 22 7 24})   ;; the native unit of the non-K-quant types: rows are ceil(cols / 32) blocks, cols need not be a 256-multiple
+(def t (or (first (filter #(= tensor (:name %)) tensors)) (do (println "REFUSE no tensor" tensor "in" (count tensors)) (js/process.exit 2))))
+(def cols (first (:dims t))) (def rows (second (:dims t)))
+(def bb (or (block-bytes (:type t)) (do (println "REFUSE ggml type" (:type t) "has no kernel arm") (js/process.exit 2))))
+(def nbytes (if-let [b32 (block32-bytes (:type t))] (* rows (quot (+ cols 31) 32) b32) (* rows (quot cols 256) bb)))
+(when-not (zero? (mod cols (if (block32-bytes (:type t)) 32 256))) (println "REFUSE cols" cols "is not a multiple of the block size for type" (:type t)) (js/process.exit 2))
+(defn le32 [v] (let [b (js/Buffer.alloc 4)] (.writeUInt32LE b v 0) (.toString b "hex")))
+(def meta (str (le32 rows) (le32 cols) (le32 (:type t)) (le32 1) (le32 0) (le32 0) (le32 0) (le32 0)))
+(def i8? (str/starts-with? layout "i8"))   ;; i8r8 | i8x8r4: int8 activations + packed 4x8 integer dot (kdot_i8_*.comp), preceded by nex_quant_q8 (iterations 31, 34)
+(def rows-per-wg (if (or (= layout "r1") (= layout "p")) 1 (js/parseInt (second (re-find #"r(\d+)$" layout)))))   ;; r1 | r4 | r8 | r16 | r32 (kdot_f32_r8.comp -DROWS) | x8r4 | x8r8 (kdot_x8r8.comp -DROWS, anv) | i8r8 | i8x8r4 | s4r1 | h2r1 | h2q6r1
+(def wg (quot (+ rows rows-per-wg -1) rows-per-wg))
+(def spv-dir (or (aget js/process.env "KDOT_SPV_DIR") "/root/kgpu"))
+(def nv-spv {"s4r1" "kdot_s4_r1.spv" "h2r1" "kdot_h2_r1.spv" "h2q6r1" "kdot_h2q6_r1.spv"})   ;; the nvgpu one-row kernels (tick 55)
+(def spv (cond i8? (str spv-dir "/kdot_i8_" (subs layout 2) ".spv") (str/starts-with? layout "x8") (str spv-dir "/kdot_" layout ".spv") (= layout "p") (str spv-dir "/kdot_f32_p1.spv") (nv-spv layout) (str spv-dir "/" (nv-spv layout)) :else (str spv-dir "/kdot_f32_" layout ".spv")))   ;; p: the positions-inner-loop kernel built -DPFIX=1 (one position, dispatch (rows, 1, 1))
+(def qmeta (str (le32 cols) (le32 1) (le32 0) (le32 0) (le32 0) (le32 0) (le32 0) (le32 0)))   ;; quant_q8: n = cols
+(def cat (fn [& xs] (reduce (fn [a b] (str "(string-concat " a " " b ")")) xs)))
+(def src (str ";; GENERATED by verify/native/gpu/gen_kdot_guest.cljk -- do not edit.\n"
+              ";; K-quant dot (" layout ") on " tensor " (ggml type " (:type t) ", " rows " x " cols ", " nbytes " bytes at file offset " (+ data-start (:offset t)) ") through :gpu/compute.\n"
+              ";; Answer: \"<ns one dispatch>|<ns 10 dispatches in one command buffer>|<hex of the first 64 outputs>\".\n"
+              "(ns gpu.kdot-" layout "-" (str/replace tensor #"[^a-zA-Z0-9]" "-") " (:export [main]))\n"
+              "(defn gpu [r :string] :string\n  (typed-cap-call :gpu/compute :string :string r))\n"
+              "(defn dispatches [n :i64 req :string] :i64\n  (if (< n 1) 0 (do (gpu req) (dispatches (- n 1) req))))\n"
+              "(defn main [] :string\n"
+              "  (let [w (gpu \"MAP " gguf-on-box " " (+ data-start (:offset t)) " " nbytes "\")\n"
+              "        x (gpu \"MAP " x-on-box " 0 " (* cols 4) "\")\n"
+              "        o (gpu \"ALLOC " (* rows 4) "\")\n"
+              "        m (gpu \"ALLOC 32\")\n"
+              "        e (gpu \"ALLOC 16\")\n"
+              "        p (gpu \"PIPELINE " spv " " (if i8? 6 5) "\")\n"
+              (if i8? (str "        xq (gpu \"ALLOC " cols "\")\n        xs (gpu \"ALLOC " (* 4 (quot cols 32)) "\")\n        qm (gpu \"ALLOC 32\")\n        qp (gpu \"PIPELINE /root/kgpu/nex_quant_q8.spv 7\")\n") "")
+              "        ]\n"
+              "    (do\n"
+              "      (gpu " (cat "\"WRITE \"" "m" (str "\" 0 " meta "\"")) ")\n"
+              "      (gpu " (cat "\"WRITE \"" "e" "\" 0 00000000000000000000000000000000\"") ")\n"
+              (if i8? (str "      (gpu " (cat "\"WRITE \"" "qm" (str "\" 0 " qmeta "\"")) ")\n"
+                           "      (gpu " (cat "\"DISPATCH \"" "qp" (str "\" " (quot (+ (quot cols 32) 255) 256) " 1 1 \"") "qm" "\" \"" "x" "\" \"" "e" "\" \"" "e" "\" \"" "xs" "\" \"" "e" "\" \"" "xq") ")\n") "")
+              "      (let [req " (if i8? (cat "\"DISPATCH \"" "p" (str "\" " wg " 1 1 \"") "m" "\" \"" "w" "\" \"" "xq" "\" \"" "o" "\" \"" "e" "\" \"" "xs")
+                                  (cat "\"DISPATCH \"" "p" (str "\" " wg " 1 1 \"") "m" "\" \"" "w" "\" \"" "x" "\" \"" "o" "\" \"" "e")) "\n"
+              "            one (gpu req)]\n"
+              "        (do\n          (gpu \"BEGIN\")\n          (dispatches 10 req)\n"
+              "          (let [ten (gpu \"SUBMIT\")]\n"
+              "            " (cat "one" "\"|\"" "ten" "\"|\"" (str "(gpu " (cat "\"READ \"" "o" "\" 0 256\"") ")")) "))))))\n"))
+(fs/writeFileSync out src)
+(println (str "wrote " out " tensor=" tensor " type=" (:type t) " rows=" rows " cols=" cols " bytes=" nbytes " offset=" (+ data-start (:offset t)) " wg=" wg))

@@ -1,0 +1,76 @@
+(ns amu.bench.iq4xs-dot (:export [dot-n]))
+
+;; IQ4_XS row x f32 activations, in SCALAR Kotoba, because the fused
+;; `kernel-dequant-dot-iq4-xs` is declared and refused on both ISAs
+;; (kotoba-native ADR 0075) and the head is not in the guest grammar. This
+;; is what an amu-native binary can do for Nex's 391 IQ4_XS tensors today.
+;; Block layout and decode as `dequantize_row_iq4_xs` (see the rodata-codebook
+;; fixture in this repository's tests).
+;;
+;; The whole loop state rides in ONE word because every function has five
+;; parameter words and two granted regions take four of them:
+;;   bits  0..23  element index (block*256 + e)
+;;   bits 24..31  repetitions remaining (timing only)
+;;   bits 32..63  accumulator, f32 bit pattern
+;; The per-element decode therefore recomputes d, ls and dl for every element
+;; -- it cannot hoist them into a sub-block loop without a second state word.
+
+(defn- shr2n [value :i64 times :i64]
+  (if (< times 1) value (shr2n (u64-shift-right value 2) (- times 1))))
+
+(defn- half-bits [half :i64]
+  (let [sign (i64-shift-left (bit-and half 32768) 16)
+        rest (i64-shift-left (bit-and half 32767) 13)
+        pattern (if (= 31744 (bit-and half 31744))
+                  (bit-or sign (bit-or rest 2139095040))
+                  (bit-or sign
+                          (bit-and 4294967295
+                                   (f32-to-bits
+                                    (f32-mul (f32-from-bits rest)
+                                             (f32-from-bits 2004877312))))))]
+    (if (< pattern 2147483648) pattern (- pattern 4294967296))))
+
+(defn- kvalue [index :i64]
+  (let [raw (slice-get (slice-of-u8 (bytes-literal "8198adbfcfddeaf6010d192635455971") 16)
+                       (bit-and index 15))]
+    (if (< raw 128) raw (- raw 256))))
+
+(defn- weight [block [:slice :u8] off :i64 element :i64]
+  (let [d (bit-or (slice-get block off) (i64-shift-left (slice-get block (+ off 1)) 8))
+        scales-h (bit-or (slice-get block (+ off 2)) (i64-shift-left (slice-get block (+ off 3)) 8))
+        ib (quot element 32)
+        j (- element (* ib 32))
+        low (< j 16)
+        jj (if low j (- j 16))
+        packed (slice-get block (+ off (+ 8 (+ (* ib 16) jj))))
+        nibble (if low (bit-and packed 15) (u64-shift-right packed 4))
+        sl (slice-get block (+ off (+ 4 (quot ib 2))))
+        sl4 (if (= 0 (- ib (* 2 (quot ib 2))))
+              (bit-and sl 15)
+              (bit-and (u64-shift-right sl 4) 15))
+        sh2 (bit-and (shr2n scales-h ib) 3)
+        ls (bit-or sl4 (i64-shift-left sh2 4))
+        dl (f32-mul (f32-from-bits (half-bits d))
+                    (i64-to-f32-rounded (- ls 32)))]
+    (f32-to-bits (f32-mul dl (i64-to-f32-rounded (kvalue nibble))))))
+
+(defn- go [w [:slice :u8] x [:slice :u32] st :i64]
+  (let [i (bit-and st 16777215)
+        times (bit-and (u64-shift-right st 24) 255)
+        acc (u64-shift-right st 32)
+        total (* 256 (quot (slice-length w) 136))]
+    (if (< i total)
+      (let [blk (quot i 256)
+            e (- i (* blk 256))
+            wv (f32-from-bits (weight w (* blk 136) e))
+            xv (f32-from-bits (slice-get x i))
+            acc2 (bit-and 4294967295 (f32-to-bits (f32-add (f32-from-bits acc) (f32-mul wv xv))))]
+        (go w x (bit-or (+ i 1) (bit-or (i64-shift-left times 24) (i64-shift-left acc2 32)))))
+      (if (< times 2)
+        acc
+        (go w x (bit-or (i64-shift-left (- times 1) 24) (i64-shift-left acc 32)))))))
+
+(defn dot-n [wbase :i64 wlen :i64 xbase :i64 xlen :i64 spec :i64]
+  ;; spec: bits 16..23 repetitions (the block count is the region's own)
+  (go (slice-of-u8 wbase wlen) (slice-of-u32 xbase (quot xlen 4))
+      (i64-shift-left (bit-and (u64-shift-right spec 16) 255) 24)))

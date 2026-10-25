@@ -1,0 +1,182 @@
+;; Generate the :gpu/compute guest for the Nex-N2.5-mini decode step of ONE token
+;; at position 0 through the first N layers (recurrent and attention), then
+;; output norm, lm_head and argmax: every tensor of the layer MAPped by file offset,
+;; every op of the step one DISPATCH inside a single command buffer, the layer
+;; output READ back as hex. Checked by layer0_check.py against layer0_ref.py.
+;;
+;;   kbb --backend sci gen_decode_guest.cljk <file.gguf> <layers> <dir-on-box> <out.kotoba>
+;;
+;; The program is straight-line: MAP/ALLOC/WRITE every constant, then ONE
+;; command buffer (BEGIN .. SUBMIT) holding every dispatch of every layer and the
+;; lm_head, then READ. Checked by decode_check.py against decode_ref.py.
+;; Root ADR-2609182400 C.
+(require '["fs" :as fs] '[clojure.string :as str])
+(def args (vec *command-line-args*))
+(when (not= 4 (count args)) (println "usage: <file.gguf> <layer> <dir-on-box> <out.kotoba>") (js/process.exit 2))
+(def gguf (args 0)) (def layers (js/parseInt (args 1))) (def box (args 2)) (def out (args 3))
+;; --- GGUF directory (header only) ---
+(def fd (fs/openSync gguf "r"))
+(def head (js/Buffer.alloc (* 64 1024 1024)))
+(def n (fs/readSync fd head 0 (.-length head) 0))
+(def buf (.subarray head 0 n))
+(def pos (atom 0))
+(defn- u8 [] (let [v (.readUInt8 buf @pos)] (swap! pos + 1) v))
+(defn- u32 [] (let [v (.readUInt32LE buf @pos)] (swap! pos + 4) v))
+(defn- u64 [] (let [v (.readBigUInt64LE buf @pos)] (swap! pos + 8) (js/Number v)))
+(defn- f32 [] (let [v (.readFloatLE buf @pos)] (swap! pos + 4) v))
+(defn- gstr [] (let [k (u64) s (.toString buf "utf8" @pos (+ @pos k))] (swap! pos + k) s))
+(declare read-value)
+(defn- read-value [t]
+  (case t 0 (u8) 1 (u8) 2 (do (swap! pos + 2) 0) 3 (do (swap! pos + 2) 0) 4 (u32) 5 (u32) 6 (f32) 7 (u8) 8 (gstr)
+    9 (let [et (u32) k (u64)] (doall (repeatedly k #(read-value et))) nil) 10 (u64) 11 (u64) 12 (do (swap! pos + 8) 0)))
+(swap! pos + 4) (u32) (def n-tensors (u64)) (def n-kv (u64))
+(def kv (into {} (for [_ (range n-kv)] (let [k (gstr) t (u32)] [k (read-value t)]))))
+(def tensors (into {} (for [_ (range n-tensors)] (let [name (gstr) nd (u32) dims (vec (repeatedly nd u64)) typ (u32) off (u64)] [name {:dims dims :type typ :offset off}]))))
+(def alignment (get kv "general.alignment" 32))
+(def data-start (* (quot (+ @pos alignment -1) alignment) alignment))
+(def eps (get kv "qwen35moe.attention.layer_norm_rms_epsilon"))
+(def block-bytes {12 144 13 176 14 210 23 136 0 nil})
+(defn tensor-bytes [{:keys [dims type]}]
+  (let [cols (first dims) rows (reduce * 1 (rest dims))]
+    (if (= 0 type) (* rows cols 4) (* rows (quot cols 256) (block-bytes type)))))
+(defn T* [full] (or (get tensors full) (do (println "REFUSE no tensor" full) (js/process.exit 2))))
+(def interval (get kv "qwen35moe.full_attention_interval" 4))
+(def recurrent (vec (for [il (range 64)] (if (zero? (mod (inc il) interval)) 0 1))))  ;; llama.cpp: full attention every `interval`-th layer
+(def nrot (get kv "qwen35moe.rope.dimension_count")) (def rope-base (get kv "qwen35moe.rope.freq_base"))
+;; --- emission helpers: the program is a list of `(gpu "...")` lines bound with let ---
+(def lines (atom []))
+(def binds (atom []))
+(defn le32 [v] (let [b (js/Buffer.alloc 4)] (.writeUInt32LE b (js/Number v) 0) (.toString b "hex")))
+(defn lef32 [v] (let [b (js/Buffer.alloc 4)] (.writeFloatLE b v 0) (.toString b "hex")))
+(defn bind! [sym req] (swap! binds conj [sym req]))
+(defn step! [req-expr] (swap! lines conj req-expr))
+(defn cat [& xs] (reduce (fn [a b] (str "(string-concat " a " " b ")")) xs))
+(defn q [s] (str "\"" s "\""))
+(def counter (atom 0))
+(defn fresh [prefix] (swap! counter inc) (str prefix @counter))
+;; MAP a tensor -> symbol
+(defn map-tensor! [nm]
+  (let [t (T* nm) sym (fresh "w")] (bind! sym (q (str "MAP " box "/nex.gguf " (+ data-start (:offset t)) " " (tensor-bytes t)))) sym))
+(defn alloc! [bytes] (let [sym (fresh "b")] (bind! sym (q (str "ALLOC " bytes))) sym))
+(defn zero! [sym] (step! (cat (q "ZERO ") sym)))
+(defn write! [sym hex] (step! (cat (q "WRITE ") sym (q (str " 0 " hex)))))
+(defn pipeline! [spv bindings] (let [sym (fresh "p")] (bind! sym (q (str "PIPELINE " box "/" spv " " bindings))) sym))
+(defn dispatch! [pipe x y z & handles] (step! (apply cat (q "DISPATCH ") pipe (q (str " " x " " y " " z)) (mapcat (fn [h] [(q " ") h]) handles))))
+;; meta buffers
+(defn ops-meta! [n rows aux aux2 eps scale] (let [m (alloc! 32)] (write! m (str (le32 n) (le32 rows) (le32 aux) (le32 aux2) (lef32 eps) (lef32 scale) (lef32 0) (lef32 0))) m))
+(defn kdot-meta! [rows cols type positions input-per-expert] (let [m (alloc! 32)] (write! m (str (le32 rows) (le32 cols) (le32 type) (le32 positions) (le32 input-per-expert) (le32 0) (le32 0) (le32 0))) m))
+
+;; --- the plan ---
+(def x (let [sym (fresh "x")] (bind! sym (q (str "MAP " box "/x.f32 0 8192"))) sym))
+(def zeros16 (alloc! 16))
+(def ops (into {} (for [op ["rmsnorm" "l2norm" "gated_rmsnorm" "silu_mul" "conv1d_step" "softmax_topk" "gate_decay2" "weighted_sum" "add" "f32_matvec" "add_rmsnorm" "rope_neox" "attn_decode" "argmax_partial" "argmax_final"]] [op (pipeline! (str "nex_" op ".spv") 7)])))
+(def kdot-r1 (pipeline! "kdot_f32_r1.spv" 5))
+(def kdot-r8 (pipeline! "kdot_f32_r8.spv" 5))
+(def deltanet (pipeline! "deltanet_step.spv" 8))
+;; shared activation buffers (every layer reuses them; the residual stream ping-pongs x <-> xout)
+(def h (alloc! 8192)) (def qkv (alloc! 32768)) (def z (alloc! 16384)) (def alpha (alloc! 128)) (def betaL (alloc! 128)) (def gb (alloc! 256)) (def beta-only (alloc! 256))
+(def conv (alloc! 32768)) (def qn (alloc! 8192)) (def kn (alloc! 8192)) (def dn (alloc! 16384)) (def gnorm (alloc! 16384)) (def attn-out (alloc! 8192))
+(def qfull (alloc! 32768)) (def kproj (alloc! 2048)) (def vproj (alloc! 2048)) (def qnorm (alloc! 16384)) (def knorm (alloc! 2048)) (def qrope (alloc! 16384)) (def krope (alloc! 2048)) (def attno (alloc! 16384))
+(def resid (alloc! 8192)) (def h2 (alloc! 8192)) (def router (alloc! 1024)) (def ids (alloc! 64)) (def topw (alloc! 64))
+(def gateE (alloc! 16384)) (def upE (alloc! 16384)) (def actE (alloc! 16384)) (def downE (alloc! 65536))
+(def sg (alloc! 2048)) (def su (alloc! 2048)) (def sact (alloc! 2048)) (def shdown (alloc! 8192)) (def shlogit (alloc! 16)) (def ffn (alloc! 8192))
+(def xa (alloc! 8192)) (def xb (alloc! 8192))
+(zero! zeros16)
+;; per-layer state (position 0: fresh)
+(def rings (vec (for [il (range layers) :when (= 1 (recurrent il))] (let [r (alloc! 98304)] (zero! r) r))))
+(def states (vec (for [il (range layers) :when (= 1 (recurrent il))] (let [s (alloc! 2097152)] (zero! s) s))))
+;; metas shared by every layer (shapes are identical across layers of a kind)
+(def m-norm (ops-meta! 2048 1 0 0 eps 0)) (def m-qkv (kdot-meta! 8192 2048 13 1 0)) (def m-gate (kdot-meta! 4096 2048 23 1 0))
+(def m-ab (kdot-meta! 32 2048 23 1 0)) (def m-gd (ops-meta! 32 32 32 0 0 0)) (def m-gd0 (ops-meta! 32 32 0 0 0 0)) (def m-conv (ops-meta! 8192 1 0 0 0 0))
+(def m-l2q (ops-meta! 128 16 0 0 eps (/ 1.0 (js/Math.sqrt 128)))) (def m-l2k (ops-meta! 128 16 0 2048 eps 0))
+(def m-dn (let [m (alloc! 32)] (write! m (str (le32 32) (le32 128) (le32 128) (le32 16) (le32 4096) (le32 0) (le32 0) (le32 0))) m))
+(def m-gn (ops-meta! 128 32 0 0 eps 0)) (def m-out (kdot-meta! 2048 4096 23 1 0))
+(def m-q (kdot-meta! 8192 2048 23 1 0)) (def m-k (kdot-meta! 512 2048 23 1 0)) (def m-v (kdot-meta! 512 2048 13 1 0))
+(def m-qnorm (ops-meta! 256 16 512 0 eps 0)) (def m-knorm (ops-meta! 256 2 0 0 eps 0))
+(def m-ropeq (ops-meta! 256 16 nrot 0 0 rope-base)) (def m-ropek (ops-meta! 256 2 nrot 0 0 rope-base))
+(def m-attn (ops-meta! 256 16 1 2 -1.0 (/ 1.0 16.0)))   ;; aux = T = 1, aux2 = heads_kv, eps < 0 -> gate interleaved in qfull, scale = 1/sqrt(256)
+(def m-attn-o (kdot-meta! 2048 4096 23 1 0))
+(def m-addn (ops-meta! 2048 1 0 0 eps 0)) (def m-router (ops-meta! 2048 256 0 0 0 0)) (def m-topk (ops-meta! 256 1 8 0 0 1.0))
+(def m-gate-exps (kdot-meta! 512 2048 23 8 0)) (def m-down-exps (kdot-meta! 2048 512 23 8 1))
+(def m-silu8 (ops-meta! 4096 1 0 0 0 0)) (def m-gate-sh (kdot-meta! 512 2048 23 1 0)) (def m-down-sh (kdot-meta! 2048 512 23 1 0))
+(def m-silu-sh (ops-meta! 512 1 0 0 0 0)) (def m-shlogit (ops-meta! 2048 1 0 0 0 0)) (def m-wsum (ops-meta! 2048 1 8 0 0 0)) (def m-add (ops-meta! 2048 1 0 0 0 0))
+;; lm_head: output_norm -> Q6_K [248320 x 2048] r8 -> argmax over 248320 (61 partials of 4096)
+(def w-out-norm (map-tensor! "output_norm.weight")) (def w-lm (map-tensor! "output.weight"))
+(def hN (alloc! 8192)) (def logits (alloc! (* 248320 4))) (def amax-s (alloc! 256)) (def amax-ids (alloc! 256))
+(def m-lm (kdot-meta! 248320 2048 14 1 0)) (def m-am1 (ops-meta! 248320 1 61 0 0 0)) (def m-am2 (ops-meta! 248320 1 61 0 0 0))
+;; every tensor of every layer, MAPped once
+(def layer-w (vec (for [il (range layers)]
+  (let [p (str "blk." il ".") m (fn [nm] (map-tensor! (str p nm)))]
+    (merge {:norm (m "attn_norm.weight") :post (m "post_attention_norm.weight") :router (m "ffn_gate_inp.weight") :shgate-inp (m "ffn_gate_inp_shexp.weight")
+            :gate-exps (m "ffn_gate_exps.weight") :up-exps (m "ffn_up_exps.weight") :down-exps (m "ffn_down_exps.weight")
+            :gate-sh (m "ffn_gate_shexp.weight") :up-sh (m "ffn_up_shexp.weight") :down-sh (m "ffn_down_shexp.weight")}
+           (if (= 1 (recurrent il))
+             {:qkv (m "attn_qkv.weight") :gate (m "attn_gate.weight") :alpha (m "ssm_alpha.weight") :beta (m "ssm_beta.weight") :dt (m "ssm_dt.bias") :a (m "ssm_a")
+              :conv (m "ssm_conv1d.weight") :ssm-norm (m "ssm_norm.weight") :out (m "ssm_out.weight")}
+             {:q (m "attn_q.weight") :k (m "attn_k.weight") :v (m "attn_v.weight") :qn (m "attn_q_norm.weight") :kn (m "attn_k_norm.weight") :o (m "attn_output.weight")}))))))
+;; --- the step, one command buffer ---
+(step! (q "BEGIN"))
+(def rec-index (atom 0))
+(doseq [il (range layers)]
+  (let [w (layer-w il) xin (if (zero? il) x (if (odd? il) xa xb)) xout (if (odd? il) xb xa)]
+    (dispatch! (ops "rmsnorm") 1 1 1 m-norm xin (:norm w) zeros16 h zeros16 zeros16)
+    (if (= 1 (recurrent il))
+      (let [ring (rings @rec-index) S (states @rec-index)]
+        (swap! rec-index inc)
+        (dispatch! kdot-r1 8192 1 1 m-qkv (:qkv w) h qkv zeros16)
+        (dispatch! kdot-r1 4096 1 1 m-gate (:gate w) h z zeros16)
+        (dispatch! kdot-r1 32 1 1 m-ab (:alpha w) h alpha zeros16)
+        (dispatch! kdot-r1 32 1 1 m-ab (:beta w) h betaL zeros16)
+        (dispatch! (ops "gate_decay2") 1 1 1 m-gd alpha (:dt w) (:a w) gb betaL zeros16)
+        (dispatch! (ops "gate_decay2") 1 1 1 m-gd0 alpha (:dt w) (:a w) beta-only betaL zeros16)
+        (dispatch! (ops "conv1d_step") 32 1 1 m-conv qkv (:conv w) zeros16 conv ring zeros16)
+        (dispatch! (ops "l2norm") 16 1 1 m-l2q conv zeros16 zeros16 qn zeros16 zeros16)
+        (dispatch! (ops "l2norm") 16 1 1 m-l2k conv zeros16 zeros16 kn zeros16 zeros16)
+        (dispatch! deltanet 32 1 1 m-dn qn kn conv gb beta-only S dn)
+        (dispatch! (ops "gated_rmsnorm") 32 1 1 m-gn dn (:ssm-norm w) z gnorm zeros16 zeros16)
+        (dispatch! kdot-r1 2048 1 1 m-out (:out w) gnorm attn-out zeros16))
+      (do
+        (dispatch! kdot-r1 8192 1 1 m-q (:q w) h qfull zeros16)
+        (dispatch! kdot-r1 512 1 1 m-k (:k w) h kproj zeros16)
+        (dispatch! kdot-r1 512 1 1 m-v (:v w) h vproj zeros16)
+        (dispatch! (ops "rmsnorm") 16 1 1 m-qnorm qfull (:qn w) zeros16 qnorm zeros16 zeros16)
+        (dispatch! (ops "rmsnorm") 2 1 1 m-knorm kproj (:kn w) zeros16 knorm zeros16 zeros16)
+        (dispatch! (ops "rope_neox") 16 1 1 m-ropeq qnorm zeros16 zeros16 qrope zeros16 zeros16)
+        (dispatch! (ops "rope_neox") 2 1 1 m-ropek knorm zeros16 zeros16 krope zeros16 zeros16)
+        ;; T = 1 at position 0: the K/V cache IS this token's k/v
+        (dispatch! (ops "attn_decode") 16 1 1 m-attn qrope krope vproj attno qfull zeros16)
+        (dispatch! kdot-r1 2048 1 1 m-attn-o (:o w) attno attn-out zeros16)))
+    (dispatch! (ops "add_rmsnorm") 1 1 1 m-addn xin attn-out (:post w) resid h2 zeros16)
+    (dispatch! (ops "f32_matvec") 256 1 1 m-router (:router w) h2 zeros16 router zeros16 zeros16)
+    (dispatch! (ops "softmax_topk") 1 1 1 m-topk router zeros16 zeros16 topw zeros16 ids)
+    (dispatch! kdot-r1 512 8 1 m-gate-exps (:gate-exps w) h2 gateE ids)
+    (dispatch! kdot-r1 512 8 1 m-gate-exps (:up-exps w) h2 upE ids)
+    (dispatch! (ops "silu_mul") 16 1 1 m-silu8 gateE upE zeros16 actE zeros16 zeros16)
+    (dispatch! kdot-r1 2048 8 1 m-down-exps (:down-exps w) actE downE ids)
+    (dispatch! kdot-r1 512 1 1 m-gate-sh (:gate-sh w) h2 sg zeros16)
+    (dispatch! kdot-r1 512 1 1 m-gate-sh (:up-sh w) h2 su zeros16)
+    (dispatch! (ops "silu_mul") 2 1 1 m-silu-sh sg su zeros16 sact zeros16 zeros16)
+    (dispatch! kdot-r1 2048 1 1 m-down-sh (:down-sh w) sact shdown zeros16)
+    (dispatch! (ops "f32_matvec") 1 1 1 m-shlogit (:shgate-inp w) h2 zeros16 shlogit zeros16 zeros16)
+    (dispatch! (ops "weighted_sum") 8 1 1 m-wsum downE topw shdown ffn shlogit zeros16)
+    (dispatch! (ops "add") 8 1 1 m-add resid ffn zeros16 xout zeros16 zeros16)))
+(def x-final (if (odd? (dec layers)) xb xa))
+(dispatch! (ops "rmsnorm") 1 1 1 m-norm x-final w-out-norm zeros16 hN zeros16 zeros16)
+(dispatch! kdot-r8 31040 1 1 m-lm w-lm hN logits zeros16)
+(dispatch! (ops "argmax_partial") 61 1 1 m-am1 logits zeros16 zeros16 zeros16 amax-s amax-ids)
+(dispatch! (ops "argmax_final") 1 1 1 m-am2 amax-s zeros16 zeros16 amax-s amax-s amax-ids)
+;; --- emit ---
+(def body-steps (mapv (fn [l] (str "      (gpu " l ")")) @lines))
+(def src (str ";; GENERATED by verify/native/gpu/gen_decode_guest.cljk -- do not edit.\n"
+              ";; Nex-N2.5-mini decode step, one token at position 0, layers 0.." (dec layers) " + output norm + lm_head + argmax, on :gpu/compute: "
+              (count @binds) " MAP/ALLOC/PIPELINE, " (count @lines) " requests, one command buffer.\n"
+              ";; Answer: \"<ns of the command buffer>|<hex of x after the last layer (2048 f32)>|<hex of argmax ids[61] (u32)>|<hex of the max logit>\".\n"
+              "(ns gpu.decode" layers " (:export [main]))\n"
+              "(defn gpu [r :string] :string\n  (typed-cap-call :gpu/compute :string :string r))\n"
+              "(defn main [] :string\n"
+              "  (let [" (str/join "\n        " (map (fn [[s r]] (str s " (gpu " r ")")) @binds)) "]\n"
+              "    (do\n" (str/join "\n" body-steps) "\n"
+              "      (let [ns (gpu \"SUBMIT\")]\n"
+              "        " (cat "ns" (q "|") (str "(gpu " (cat (q "READ ") x-final (q " 0 8192")) ")") (q "|") (str "(gpu " (cat (q "READ ") amax-ids (q " 244 4")) ")") (q "|") (str "(gpu " (cat (q "READ ") amax-s (q " 0 4")) ")")) "))))\n"))
+(fs/writeFileSync out src)
+(println (str "wrote " out ": " (count @binds) " bindings, " (count @lines) " requests, layers " layers))

@@ -1,0 +1,293 @@
+;; The Kotoba decision cores of the Ollama-compatible surface, checked three
+;; ways (ADR-2608138800):
+;;
+;;   1. authority  — the shipped resources/kotodama/oracle/*.kir.edn is what
+;;                   kotoba/*_core.kotoba compiles to right now. Without this a
+;;                   stale artifact keeps serving while the source reads
+;;                   correct, and nothing says so.
+;;   2. semantics  — each export against the Ollama wire contract, written out
+;;                   as literals. The oracle here is the protocol, not a second
+;;                   Clojure implementation of it; a mirror implementation
+;;                   would just be the thing this migration removes.
+;;   3. admission  — every DECISION core stays inside the native word-typed
+;;                   boundary, so "qualifies on the native backend" is measured
+;;                   rather than asserted in a comment. kernel_math_core is
+;;                   float-typed and deliberately outside it (ADR-2608139000);
+;;                   kernel_math_parity_test owns that split and asserts both
+;;                   sides of it.
+;;
+;; Requires the compiler, which is :test-only. Production never compiles.
+
+(ns kotodama.inference.ollama-kotoba-parity-test
+  (:require [kotoba.lang.error :as kerror] [clojure.edn :as edn]
+            [kotoba.io :as io]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]
+            [kotodama.inference.host.oracle :as oracle]
+            [kotodama.inference.kotoba-oracle-gen :as gen]))
+
+(defn- compiled [source-path]
+  (compiler/compile-source (slurp source-path) :wasm32-kotoba-v1 {}))
+
+(defn- call [oracle-id export & args]
+  (oracle/call oracle-id export args))
+
+;; ── 1. authority ─────────────────────────────────────────────────────
+
+(def ^:private ollama-cores
+  "The decision cores. kernel_math_core is engine arithmetic, not surface
+  policy, and is float-typed — it is checked by kernel_math_parity_test and is
+  deliberately outside the native-admission gates below."
+  ["kotoba/ollama_protocol_core.kotoba"
+   "kotoba/ollama_options_core.kotoba"
+   "kotoba/ollama_session_core.kotoba"
+   "kotoba/ollama_chat_core.kotoba"
+   "kotoba/openai_chat_core.kotoba"
+   "kotoba/vllm_infer_core.kotoba"])
+
+(deftest shipped-artifacts-match-their-source
+  (let [artifacts (gen/discover-artifacts)]
+    ;; Evidence floor: discovery returning nothing must not read as "every
+    ;; artifact is current" (AGENTS.md, ADR-2608136000 Q1).
+    ;; EIGHT: six surface cores, kernel-math, and the scheduler. The count is
+    ;; asserted rather than the presence, and "adjust deliberately" is the
+    ;; instruction it carries -- a core arriving without this number moving is
+    ;; a core nobody decided to ship.
+    (is (= 8 (count artifacts))
+        "expected six decision cores, kernel-math and the scheduler; adjust deliberately")
+    (doseq [{:keys [source out]} artifacts]
+      (testing (str out " is a current compile of " source)
+        (is (io/exists? (io/file out))
+            "artifact missing — run `kbb -M:test:gen`")
+        (is (= (edn/read-string (slurp out)) (:kir (compiled source)))
+            "artifact is stale — run `kbb -M:test:gen`")))))
+
+(deftest every-core-is-catalogued-and-loadable
+  (is (= (set (map #(io/file-name (io/file (:out %))) (gen/discover-artifacts)))
+         (set (map #(io/file-name (io/file %)) (vals oracle/catalog))))
+      "a core with no catalog entry is shipped but unreachable")
+  ;; `preload!` sorts, so this list is the catalog in key order. `:scheduler`
+  ;; joined it 2026-09-09: the artifact had been shipped since the P3-P5 cores
+  ;; landed and was never catalogued, so `load-all!` never loaded it and the
+  ;; assertion above was correctly red -- for a day, unlooked-at, because the
+  ;; maturity loop runs in a checkout that was four commits behind and did not
+  ;; have the artifact at all.
+  (is (= [:kernel-math :ollama-chat :ollama-options :ollama-protocol :ollama-session
+          :openai-chat :scheduler :vllm-infer]
+         (oracle/preload!))))
+
+(deftest a-missing-artifact-fails-closed
+  ;; There is no Clojure fallback, on purpose: a fallback answers with an
+  ;; unreviewed second copy of the policy and looks identical to success.
+  (is (thrown? kerror/ExceptionInfo (oracle/call :no-such-oracle :x []))))
+
+;; ── 2. semantics ─────────────────────────────────────────────────────
+
+(deftest route-table-is-the-ollama-surface
+  (testing "every served route"
+    (is (= (call :ollama-protocol :route-version) (call :ollama-protocol :route-code "GET" "/api/version")))
+    (is (= (call :ollama-protocol :route-tags) (call :ollama-protocol :route-code "GET" "/api/tags")))
+    (is (= (call :ollama-protocol :route-ps) (call :ollama-protocol :route-code "GET" "/api/ps")))
+    (is (= (call :ollama-protocol :route-show) (call :ollama-protocol :route-code "POST" "/api/show")))
+    (is (= (call :ollama-protocol :route-generate) (call :ollama-protocol :route-code "POST" "/api/generate")))
+    (is (= (call :ollama-protocol :route-chat) (call :ollama-protocol :route-code "POST" "/api/chat")))
+    (is (= (call :ollama-protocol :route-openai-chat)
+           (call :ollama-protocol :route-code "POST" "/v1/chat/completions")))
+    (is (= (call :ollama-protocol :route-openai-models)
+           (call :ollama-protocol :route-code "GET" "/v1/models"))))
+  (testing "route codes are distinct, so the host dispatch cannot collapse two routes"
+    (let [codes (mapv #(call :ollama-protocol %)
+                      [:route-version :route-tags :route-ps :route-show
+                       :route-generate :route-chat :route-openai-chat
+                       :route-openai-models])]
+      (is (= 8 (count (set codes))))
+      (is (not (contains? (set codes) (call :ollama-protocol :route-not-found))))))
+  (testing "method and path both matter"
+    (is (= (call :ollama-protocol :route-not-found) (call :ollama-protocol :route-code "POST" "/api/tags")))
+    (is (= (call :ollama-protocol :route-not-found) (call :ollama-protocol :route-code "GET" "/api/generate")))
+    (is (= (call :ollama-protocol :route-not-found) (call :ollama-protocol :route-code "DELETE" "/api/delete")))
+    (is (= (call :ollama-protocol :route-not-found) (call :ollama-protocol :route-code "GET" "/api/tags/"))))
+  (testing "only POST routes read a body — reading one that has none blocks"
+    (is (false? (call :ollama-protocol :route-reads-body? (call :ollama-protocol :route-tags))))
+    (is (false? (call :ollama-protocol :route-reads-body? (call :ollama-protocol :route-not-found))))
+    (is (true? (call :ollama-protocol :route-reads-body? (call :ollama-protocol :route-show))))
+    (is (true? (call :ollama-protocol :route-reads-body? (call :ollama-protocol :route-generate))))
+    (is (true? (call :ollama-protocol :route-reads-body? (call :ollama-protocol :route-chat))))
+    (is (true? (call :ollama-protocol :route-reads-body? (call :ollama-protocol :route-openai-chat))))
+    (is (false? (call :ollama-protocol :route-reads-body? (call :ollama-protocol :route-openai-models)))
+        "/v1/models is a GET — reading a body that never arrives blocks")))
+
+(deftest the-two-surfaces-disagree-about-streaming-on-purpose
+  ;; The single most breakable difference between them. An OpenAI client
+  ;; receiving unrequested SSE reports a parse error, not a server error.
+  (testing "absent stream key"
+    (is (true? (call :ollama-options :stream? false false)) "Ollama streams")
+    (is (false? (call :openai-chat :stream? false false)) "OpenAI does not"))
+  (testing "explicit values are honoured by both"
+    (is (true? (call :ollama-options :stream? true true)))
+    (is (true? (call :openai-chat :stream? true true)))
+    (is (false? (call :ollama-options :stream? true false)))
+    (is (false? (call :openai-chat :stream? true false)))))
+
+(deftest openai-envelope-decisions
+  (testing "n is not silently narrowed to the one completion we produce"
+    (is (= 1 (call :openai-chat :choices-produced)))
+    (is (true? (call :openai-chat :n-admissible? 1)))
+    (is (false? (call :openai-chat :n-admissible? 3)))
+    (is (false? (call :openai-chat :n-admissible? 0))))
+  (testing "max_tokens follows the same engine cap as num_predict"
+    (is (= 32 (call :openai-chat :max-tokens false 0)))
+    (is (= 32 (call :openai-chat :max-tokens true -1)))
+    (is (= 7 (call :openai-chat :max-tokens true 7)))
+    (is (= (call :ollama-options :default-max-tokens)
+           (call :openai-chat :max-tokens false 0))
+        "the cap is a property of this engine, so both wires inherit it"))
+  (testing "finish_reason and done_reason coincide today, and the pin says so"
+    (doseq [code [(call :ollama-protocol :stop-eos)
+                  (call :ollama-protocol :stop-max-tokens)
+                  (call :ollama-protocol :stop-unknown)]]
+      (is (= (call :ollama-protocol :done-reason code)
+             (call :openai-chat :finish-reason code)))))
+  (testing "SSE framing"
+    (is (= "data: " (call :openai-chat :sse-data-prefix)))
+    (is (= "\n\n" (call :openai-chat :sse-frame-suffix)))
+    (is (= "data: [DONE]\n\n" (call :openai-chat :sse-terminator))))
+  (is (= "chat.completion" (call :openai-chat :object-completion)))
+  (is (= "chat.completion.chunk" (call :openai-chat :object-chunk))))
+
+(deftest conversation-rules
+  (testing "role names map to codes and back"
+    (doseq [name ["system" "user" "assistant" "tool"]]
+      (let [code (call :ollama-chat :role-code name)]
+        (is (true? (call :ollama-chat :role-valid? code)))
+        (is (= name (call :ollama-chat :role-wire-name code))))))
+  (testing "an unknown role is not silently a user turn"
+    (is (= (call :ollama-chat :role-unknown) (call :ollama-chat :role-code "moderator")))
+    (is (= (call :ollama-chat :role-unknown) (call :ollama-chat :role-code "")))
+    (is (false? (call :ollama-chat :role-valid? (call :ollama-chat :role-unknown)))))
+  (testing "only a turn the model would answer may end the conversation"
+    (is (true? (call :ollama-chat :admissible-final-role? (call :ollama-chat :role-user))))
+    (is (true? (call :ollama-chat :admissible-final-role? (call :ollama-chat :role-tool))))
+    (is (false? (call :ollama-chat :admissible-final-role? (call :ollama-chat :role-assistant)))
+        "ending on assistant asks the model to continue its own turn")
+    (is (false? (call :ollama-chat :admissible-final-role? (call :ollama-chat :role-system)))
+        "ending on system has no question in it"))
+  (is (= "assistant" (call :ollama-chat :assistant-wire-role))))
+
+(deftest wire-names-and-statuses
+  (is (= "length" (call :ollama-protocol :done-reason (call :ollama-protocol :stop-max-tokens))))
+  (is (= "stop" (call :ollama-protocol :done-reason (call :ollama-protocol :stop-eos))))
+  (is (= "stop" (call :ollama-protocol :done-reason (call :ollama-protocol :stop-unknown)))
+      "an unrecognised stop reason ends orderly rather than inventing a name")
+  (is (= 404 (call :ollama-protocol :error-status (call :ollama-protocol :error-not-found))))
+  (is (= 400 (call :ollama-protocol :error-status (call :ollama-protocol :error-bad-request))))
+  (is (= 500 (call :ollama-protocol :error-status (call :ollama-protocol :error-internal))))
+  (is (string? (call :ollama-protocol :api-version))))
+
+(deftest num-predict-policy
+  (is (= 32 (call :ollama-options :default-max-tokens)))
+  (is (= 32 (call :ollama-options :max-tokens false 0)) "absent takes the default")
+  (is (= 2 (call :ollama-options :max-tokens true 2)))
+  (testing "non-positive requests take the default instead of generating nothing"
+    ;; Pre-Kotoba the host passed these straight through, so `num_predict: -1`
+    ;; — which every Ollama client spells as "no limit" — silently produced an
+    ;; empty completion.
+    (is (= 32 (call :ollama-options :max-tokens true 0)))
+    (is (= 32 (call :ollama-options :max-tokens true -1)))))
+
+(deftest stream-defaults-on
+  (is (true? (call :ollama-options :stream? false false)) "absent streams")
+  (is (true? (call :ollama-options :stream? true true)))
+  (is (false? (call :ollama-options :stream? true false)) "only an explicit false disables"))
+
+(deftest keep-alive-policy
+  (is (= 300000 (call :ollama-options :default-keep-alive-ms)))
+  (is (= 300000 (call :ollama-options :keep-alive-ms false 0)) "absent takes 5 minutes")
+  (is (= 0 (call :ollama-options :keep-alive-ms true 0)) "zero means unload after this request")
+  (is (= 60000 (call :ollama-options :keep-alive-ms true 60)))
+  (is (= (call :ollama-options :forever) (call :ollama-options :keep-alive-ms true -1)))
+  (is (= (call :ollama-options :forever) (call :ollama-options :keep-alive-ms true -3600))
+      "every negative normalises to one sentinel, so downstream has one shape to test"))
+
+(deftest top-k-policy
+  (is (= 0 (call :ollama-options :top-k true -5)) "negative top_k is meaningless")
+  (is (= 40 (call :ollama-options :top-k true 40))))
+
+(deftest session-expiry
+  (testing "elapsed idle time against keep-alive"
+    (is (false? (call :ollama-session :expired? 1000 1000 300000)))
+    (is (false? (call :ollama-session :expired? 300999 1000 300000)))
+    (is (true? (call :ollama-session :expired? 301000 1000 300000)) "boundary is inclusive"))
+  (testing "sentinels"
+    (is (true? (call :ollama-session :expired? 1000 1000 0)) "keep_alive 0 expires at once")
+    (is (false? (call :ollama-session :expired? Long/MAX_VALUE 0 -1)) "forever never expires"))
+  (testing "expires_at is a real future instant, not last-used"
+    ;; /api/ps used to report last-used here, which reads to a client as
+    ;; "expired the moment it was used".
+    (is (= 301000 (call :ollama-session :expires-at-ms 1000 300000)))
+    (is (= (call :ollama-session :never-expires) (call :ollama-session :expires-at-ms 1000 -1)))))
+
+(deftest eviction-under-a-budget
+  (testing "an unmeasured budget does not evict on invented numbers"
+    (is (false? (call :ollama-session :evict-for-load? 0 (* 20 1024 1024 1024) 0)))
+    (is (false? (call :ollama-session :evict-for-load? 0 1 -1))))
+  (is (false? (call :ollama-session :evict-for-load? 10 10 20)) "exactly fits")
+  (is (true? (call :ollama-session :evict-for-load? 10 11 20))))
+
+(deftest reaper-cadence-is-bounded-both-ways
+  (is (= 60000 (call :ollama-session :reap-interval-ms 300000)) "never lazier than a minute")
+  (is (= 60000 (call :ollama-session :reap-interval-ms -1)) "forever still ticks, for /api/ps")
+  (is (= 1000 (call :ollama-session :reap-interval-ms 0)) "never busier than a second")
+  (is (= 5000 (call :ollama-session :reap-interval-ms 5000))))
+
+(deftest duration-accounting
+  (is (= 0 (call :ollama-session :load-duration-nanos true 100 900))
+      "a warm request reports no load cost, or clients conclude we reload every time")
+  (is (= 800 (call :ollama-session :load-duration-nanos false 100 900)))
+  (is (= 400 (call :ollama-session :eval-duration-nanos 600 1000)))
+  (is (= 900 (call :ollama-session :total-duration-nanos 100 1000))))
+
+;; ── 3. admission ─────────────────────────────────────────────────────
+;;
+;; Two independent conditions, checked separately because passing one says
+;; nothing about the other: `only-native-word-typed-features?` walks expression
+;; bodies, while the kexe export boundary is a statement about export
+;; signatures.
+;;
+;; They are not nested. Measured 2026-08-13 against compiler e78241d /
+;; kotoba-kir d58972d: a `[:ref :some/record]` parameter passes the feature
+;; walk and fails the boundary check, and an `:f64` parameter does the reverse
+;; — it is rejected by the feature walk while `:f64` is a perfectly ordinary
+;; scalar as far as a signature is concerned. Neither check subsumes the other.
+
+(def ^:private native-boundary-types
+  "What a kexe export can carry (ADR-2608110200)."
+  #{:i64 :bool :string})
+
+(deftest core-bodies-use-only-native-admitted-features
+  (is (seq ollama-cores))
+  (doseq [source ollama-cores]
+    (is (true? (ir/only-native-word-typed-features? (:hir (compiled source))))
+        (str source " uses an expression the native backend does not admit"))))
+
+(deftest every-export-signature-crosses-the-native-boundary
+  (let [artifacts (filter (fn [{:keys [source]}] (some #{source} ollama-cores))
+                          (gen/discover-artifacts))
+        checked (atom 0)]
+    (is (= 6 (count artifacts)) "a decision core stopped being discovered")
+    (doseq [{:keys [out]} artifacts]
+      (let [kir (edn/read-string (slurp out))
+            exported (set (:exports kir))]
+        (doseq [{:keys [name result param-types]} (:functions kir)
+                :when (contains? exported name)]
+          (swap! checked inc)
+          (is (contains? native-boundary-types result)
+              (str out " export " name " returns " result
+                   ", which cannot cross a kexe export boundary"))
+          (doseq [t param-types]
+            (is (contains? native-boundary-types t)
+                (str out " export " name " takes " t
+                     ", which cannot cross a kexe export boundary"))))))
+    ;; Evidence floor: zero exports inspected must not read as "all clean".
+    (is (<= 25 @checked) (str "only " @checked " exports inspected"))))

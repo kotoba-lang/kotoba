@@ -1,0 +1,90 @@
+(ns kotodama.inference.shard-test
+  "Executable proof that layer-sharded execution over murakumo-plan boundaries
+  is EXACTLY the unsharded computation — same doubles, same op order, with the
+  activation crossing a printed-EDN handoff at every rank boundary."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotodama.inference.ops :as ops]
+            [kotodama.inference.shard :as shard]))
+
+;; A deterministic micro decoder stack in the kotodama style: each layer is
+;; residual + RMSNorm(matvec) with fixed per-layer weights. No randomness —
+;; float equality below is exact, so a single reordered multiply would fail.
+
+(def dim 8)
+(def n-layers 12)
+
+(defn- w [layer i j]
+  ;; fixed, layer-dependent, no RNG (portable + reproducible)
+  (/ (double (+ 1 (mod (+ (* 31 layer) (* 7 i) j) 13))) 26.0))
+
+(defn- matvec [layer xs]
+  (mapv (fn [i]
+          (reduce + (map-indexed (fn [j x] (* (w layer i j) (double x))) xs)))
+        (range dim)))
+
+(defn- layer-fn [hidden layer]
+  (let [norm-w (mapv #(w layer % %) (range dim))]
+    (mapv + hidden (ops/gemma-rmsnorm-values (matvec layer hidden) norm-w))))
+
+(def input (mapv #(/ (double %) 10.0) (range dim)))
+
+(def full (shard/rank-forward layer-fn input [0 n-layers]))
+
+;; a REAL murakumo.infer.plan output shape (heterogeneous fleet fixture):
+(def murakumo-plan-assignments
+  [{:node {:name "naphtali"} :layers [0 3] :span 3}
+   {:node {:name "levi"} :layers [3 5] :span 2}
+   {:node {:name "dead"} :layers [5 5] :span 0}
+   {:node {:name "joseph"} :layers [5 9] :span 4}
+   {:node {:name "head" :head? true} :layers [9 12] :span 3}])
+
+(deftest plan-to-rank-specs
+  (let [specs (shard/plan->rank-specs murakumo-plan-assignments)]
+    (testing "zero-span nodes drop out; first/last derived from serving order"
+      (is (= 4 (count specs)))
+      (is (:first? (first specs)))
+      (is (:last? (last specs)))
+      (is (not-any? #(and (:first? %) (:last? %)) specs)))
+    (testing "the specs tile the stack exactly"
+      (is (shard/covers-exactly? specs n-layers)))))
+
+(deftest tensor-ownership
+  (let [specs (shard/plan->rank-specs murakumo-plan-assignments)
+        [r0 _ _ r3] specs]
+    (testing "block tensors belong to the rank whose range holds their index"
+      (is (shard/owned-tensor? r0 "blk.0.ffn_up.weight"))
+      (is (shard/owned-tensor? r0 "blk.2.attn_q.weight"))
+      (is (not (shard/owned-tensor? r0 "blk.3.attn_q.weight"))))
+    (testing "embedding rides the first rank, the head rides the last"
+      (is (shard/owned-tensor? r0 "token_embd.weight"))
+      (is (not (shard/owned-tensor? r3 "token_embd.weight")))
+      (is (shard/owned-tensor? r3 "output_norm.weight"))
+      (is (shard/owned-tensor? r3 "output.weight"))
+      (is (not (shard/owned-tensor? r0 "output_norm.weight"))))
+    (testing "every contract tensor of gemma4-e4b finds exactly one owner"
+      (doseq [t ["token_embd.weight" "blk.0.attn_k.weight" "blk.11.ffn_up.weight"
+                 "output_norm.weight"]]
+        (is (= 1 (count (filter #(shard/owned-tensor? % t) specs))) t)))))
+
+(deftest handoff-round-trip
+  (let [h (shard/handoff 5 3 [0.1 -2.5 3.75])]
+    (is (= h (shard/read-handoff (shard/write-handoff h))))
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (shard/read-handoff "{:shard/v 99}")))))
+
+(deftest sharded-equals-full
+  (testing "the murakumo plan cut computes EXACTLY the unsharded forward"
+    (let [specs (shard/plan->rank-specs murakumo-plan-assignments)]
+      (is (= full (shard/sharded-forward layer-fn input specs {})))))
+  (testing "…and so does EVERY possible 2-rank cut point"
+    (doseq [cut (range 1 n-layers)]
+      (let [specs (shard/plan->rank-specs
+                   [{:layers [0 cut] :span cut}
+                    {:layers [cut n-layers] :span (- n-layers cut)}])]
+        (is (= full (shard/sharded-forward layer-fn input specs {}))
+            (str "cut at layer " cut)))))
+  (testing "…and a 4-rank uneven cut"
+    (let [specs (shard/plan->rank-specs
+                 [{:layers [0 1] :span 1} {:layers [1 6] :span 5}
+                  {:layers [6 7] :span 1} {:layers [7 12] :span 5}])]
+      (is (= full (shard/sharded-forward layer-fn input specs {}))))))

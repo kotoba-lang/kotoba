@@ -1,0 +1,173 @@
+(ns ingest
+  "Fetch every active source, map items to article datoms, append the new ones
+   to the ledger, and report per-source what actually happened.
+
+     kbb --backend sci --classpath src:resources bin/ingest.cljk \\
+       [--sources resources/sources.edn] [--ledger state/articles.ledger.edn] \\
+       [--only <sourceId,…>] [--dry-run] [--concurrency 5]
+
+   The report is the point as much as the ingest is. A feed that 404s, one that
+   answers 200 with an empty document, and one that parses to zero items are
+   three different faults with three different fixes, and a run that printed
+   only a total would hide all of them behind a smaller number. Every source
+   ends up in exactly one bucket and the buckets are printed even when empty.
+
+   Exit code is 0 unless EVERY source failed — a partial ingest is a normal
+   night, not an error, and making it non-zero would train the caller to
+   ignore the code."
+  (:require ["fs" :as fs]
+            ["path" :as path]
+            ["crypto" :as crypto]
+            [kotoba.lang.edn :as edn]
+            [kotoba.lang.text :as str]
+            [promesa.core :as p]
+            [newsfeed.parse :as parse]
+            [newsfeed.article :as article]))
+
+(def user-agent "newsfeed/0.1 (+https://github.com/kotoba-lang/newsfeed)")
+
+(defn- sha256-hex [s]
+  (-> (crypto/createHash "sha256") (.update s "utf8") (.digest "hex")))
+
+(defn- parse-args [argv]
+  (loop [args argv opts {:sources "resources/sources.edn"
+                         :ledger "state/articles.ledger.edn"
+                         :concurrency 5
+                         :dry-run false}]
+    (if (empty? args)
+      opts
+      (let [[a & more] args]
+        (case a
+          "--sources"     (recur (rest more) (assoc opts :sources (first more)))
+          "--ledger"      (recur (rest more) (assoc opts :ledger (first more)))
+          "--only"        (recur (rest more) (assoc opts :only (set (str/split (first more) #","))))
+          "--concurrency" (recur (rest more) (assoc opts :concurrency (js/parseInt (first more) 10)))
+          "--dry-run"     (recur more (assoc opts :dry-run true))
+          (recur more opts))))))
+
+(defn- now-iso []
+  (-> (js/Date.) .toISOString (str/replace #"\.\d+Z$" "Z")))
+
+;; ── fetch ────────────────────────────────────────────────────────────────────
+
+(defn fetch-text
+  "→ {:ok body} | {:error kind :detail s}. One retry, and only on a transport
+   error: an HTTP status is the server's answer and repeating the request will
+   not change it."
+  ([url] (fetch-text url 1))
+  ([url retries]
+   (let [ctl (js/AbortController.)
+         timer (js/setTimeout #(.abort ctl) 30000)]
+     (-> (js/fetch url (clj->js {:headers {"user-agent" user-agent
+                                           "accept" "application/atom+xml, application/rss+xml, application/xml, text/xml, */*"}
+                                 :redirect "follow"
+                                 :signal (.-signal ctl)}))
+         (p/then (fn [res]
+                   (js/clearTimeout timer)
+                   (if (.-ok res)
+                     (p/then (.text res) (fn [t] {:ok t}))
+                     {:error :http :detail (str (.-status res))})))
+         (p/catch (fn [e]
+                    (js/clearTimeout timer)
+                    (if (pos? retries)
+                      (fetch-text url (dec retries))
+                      {:error :transport :detail (str (.-message e))})))))))
+
+(defn ingest-source
+  "One source → {:source-id :bucket :count :articles :detail}"
+  [source]
+  (p/let [url (:news.source/feedUrl source)
+          id  (:news.source/sourceId source)
+          res (fetch-text url)]
+    (cond
+      (:error res)
+      {:source-id id :bucket (:error res) :count 0 :articles []
+       :detail (:detail res)}
+
+      :else
+      (let [feed (try (parse/feed (:ok res)) (catch :default e {::throw (.-message e)}))]
+        (cond
+          (::throw feed)
+          {:source-id id :bucket :parse-error :count 0 :articles [] :detail (::throw feed)}
+
+          (nil? feed)
+          {:source-id id :bucket :not-a-feed :count 0 :articles []
+           :detail (str "no rss/atom/rdf root in " (count (:ok res)) " bytes")}
+
+          (empty? (:items feed))
+          {:source-id id :bucket :empty :count 0 :articles []
+           :detail (str (name (:dialect feed)) ", 0 items")}
+
+          :else
+          (let [arts (keep #(article/->article % source sha256-hex) (:items feed))]
+            {:source-id id
+             :bucket (if (seq arts) :ok :no-urls)
+             :count (count arts)
+             :articles (vec arts)
+             :detail (str (name (:dialect feed)) ", " (count (:items feed)) " items")}))))))
+
+(defn- in-batches
+  "Run f over items, at most n concurrently. Feeds are other people's servers;
+   opening seventeen sockets at once to be two seconds faster is rude and gets
+   the agent blocked."
+  [n items f]
+  (p/loop [remaining (vec items) done []]
+    (if (empty? remaining)
+      done
+      (p/let [batch (vec (take n remaining))
+              results (p/all (map f batch))]
+        (p/recur (vec (drop n remaining)) (into done results))))))
+
+;; ── ledger ───────────────────────────────────────────────────────────────────
+
+(defn- read-ledger-ids [file]
+  (if (fs/existsSync file)
+    (->> (str/split-lines (fs/readFileSync file "utf8"))
+         (remove str/blank?)
+         (keep #(try (:news/id (edn/read-string %)) (catch :default _ nil)))
+         set)
+    #{}))
+
+(defn- append-ledger! [file records]
+  (fs/mkdirSync (path/dirname file) #js {:recursive true})
+  (fs/appendFileSync file (str (str/join "\n" (map pr-str records)) "\n")))
+
+;; ── main ─────────────────────────────────────────────────────────────────────
+
+(defn -main [& argv]
+  (let [{:keys [sources ledger only dry-run concurrency]} (parse-args argv)
+        catalog (edn/read-string (fs/readFileSync sources "utf8"))
+        active (cond->> (:sources catalog)
+                 true (filter #(= "active" (:news.source/status %)))
+                 only (filter #(only (:news.source/sourceId %))))
+        started (now-iso)]
+    (println (str "newsfeed ingest — " (count active) " sources, " started))
+    (p/let [results (in-batches concurrency active ingest-source)]
+      (let [by-bucket (group-by :bucket results)
+            all (article/dedupe-articles (mapcat :articles results))
+            known (read-ledger-ids ledger)
+            fresh (remove #(known (:news/id %)) all)]
+
+        ;; per-source, every bucket, always
+        (doseq [b [:ok :empty :no-urls :not-a-feed :parse-error :http :transport]]
+          (when-let [rs (seq (get by-bucket b))]
+            (println (str "\n" (name b) " (" (count rs) ")"))
+            (doseq [r (sort-by :source-id rs)]
+              (println (str "  " (:source-id r)
+                            (when (pos? (:count r)) (str "  " (:count r) " articles"))
+                            "  — " (:detail r))))))
+
+        (println (str "\nfetched " (count (mapcat :articles results)) " articles"
+                      " → " (count all) " after dedupe"
+                      " → " (count fresh) " new"
+                      " (" (count known) " already in " ledger ")"))
+
+        (if dry-run
+          (println "dry-run: ledger not written")
+          (when (seq fresh)
+            (append-ledger! ledger (map #(assoc % :newsfeed/ingested-at started) fresh))
+            (println (str "appended " (count fresh) " → " ledger))))
+
+        (js/process.exit (if (and (seq active) (empty? (get by-bucket :ok))) 1 0))))))
+
+(apply -main (drop 3 (js->clj js/process.argv)))

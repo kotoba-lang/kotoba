@@ -1,0 +1,156 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// kdot_h2_qkvr_q8: ONE dispatch computing the attention q, k and v matvecs of
+// a layer WITH their bias and NeoX rope folded into the epilogue -- fusion
+// iteration 11 (G1 kernel-count roadmap): after the qkv fusion this removes
+// the v add_bias and the two rope dispatches too (-3 tiny launches/layer —
+// the launch-bound class where fusion pays; iteration 10 showed big-matvec
+// fusions do not).
+//
+// The rope needs the PAIR of output elements (p, p + nrot/2 within a head),
+// so one workgroup computes BOTH rows of a pair: two dots over the shared
+// input h, then x0 = dot0 + bias0, x1 = dot1 + bias1 and
+//   o[p]     = x0 * cos(theta) - x1 * sin(theta)
+//   o[p+hlf] = x0 * sin(theta) + x1 * cos(theta)
+// with theta = pos * pow(scale, -2 * p / nrot) — the op_rope_neox + -DBIAS
+// math VERBATIM (arithmetic-identical to add_bias -> rope_neox order). The v
+// matvec has no rotation: its pair runs with cs = 1, sn = 0, giving
+// o = dot + bias exactly as op_add_bias did. Requires nrot == head_dim (the
+// dense models' NeoX rope; the generator gates on it).
+//
+// Q8_0 only; the dot is kdot_h2_r1's term32 tt==8 path verbatim.
+//
+// Bindings: 0 Meta, 1 Wq, 2 X (h), 3 Oq (dqr), 4 Wk, 5 Ok (dkr), 6 Wv,
+// 7 Ov (dv), 8 bias_q, 9 bias_k, 10 bias_v, 11 RopeP (the rope op Meta),
+// 12 rope-freqs (or zeros), 13 ids (position).
+// Meta (u32 x8): rows_q, rows_kv, cols, type, positions, ipe, pad0, pad1.
+// Dispatch: ((NH + 2 * NKV) * (head_dim / 2), positions, 1).
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer Meta {
+  uint rows_q; uint rows_kv; uint cols; uint tensor_type;
+  uint positions; uint input_per_expert; uint pad0; uint pad1;
+} params;
+layout(std430, binding = 1) readonly buffer Wq { uint wq[]; };
+layout(std430, binding = 2) readonly buffer X { vec4 x4[]; };
+layout(std430, binding = 3) buffer Oq { float oq[]; };
+layout(std430, binding = 4) readonly buffer Wk { uint wk[]; };
+layout(std430, binding = 5) buffer Ok { float ok[]; };
+layout(std430, binding = 6) readonly buffer Wv { uint wv[]; };
+layout(std430, binding = 7) buffer Ov { float ov[]; };
+layout(std430, binding = 8) readonly buffer Bq { float bq[]; };
+layout(std430, binding = 9) readonly buffer Bk { float bk[]; };
+layout(std430, binding = 10) readonly buffer Bv { float bv[]; };
+layout(std430, binding = 11) readonly buffer RopeP {
+  uint n; uint rows; uint aux; uint aux2; float eps; float scale; float p0; float p1;
+} RP;
+layout(std430, binding = 12) readonly buffer Fq { float fq[]; };
+layout(std430, binding = 13) readonly buffer I { uint ids[]; };
+
+shared float psum[2][8];   // [sum][subgroup] — the family assumes <= 8 subgroups of 64 threads
+
+uint w_u32_at_sel(uint sel, uint offset) {
+  // P2 review fix: load the second word ONLY when the shift needs it — for an
+  // aligned offset it is unused and on the tensor's last row it addresses bytes
+  // past the buffer (undefined in Vulkan).
+  uint w0;
+  if (sel == 0u) w0 = wq[offset >> 2u];
+  else if (sel == 1u) w0 = wk[offset >> 2u];
+  else w0 = wv[offset >> 2u];
+  uint shift = (offset & 3u) * 8u;
+  if (shift == 0u) return w0;
+  uint w1;
+  if (sel == 0u) w1 = wq[(offset >> 2u) + 1u];
+  else if (sel == 1u) w1 = wk[(offset >> 2u) + 1u];
+  else w1 = wv[(offset >> 2u) + 1u];
+  return (w0 >> shift) | (w1 << (32u - shift));
+}
+float weight_half_sel(uint sel, uint offset) {
+  uint w;
+  if (sel == 0u) w = wq[offset >> 2u];
+  else if (sel == 1u) w = wk[offset >> 2u];
+  else w = wv[offset >> 2u];
+  vec2 pair = unpackHalf2x16(w);
+  return ((offset & 2u) != 0u) ? pair.y : pair.x;
+}
+float bias_sel(uint sel, uint idx) {
+  return (sel == 0u) ? bq[idx] : (sel == 1u) ? bk[idx] : bv[idx];
+}
+void out_store_sel(uint sel, uint idx, float v) {
+  if (sel == 0u) oq[idx] = v;
+  else if (sel == 1u) ok[idx] = v;
+  else ov[idx] = v;
+}
+// the Q8_0 32-value block product, verbatim from kdot_h2_r1's term32 tt==8 arm
+float term8(uint sel, uint wb, uint index, f16vec2 ylo, f16vec2 yhi) {
+  uint bo = wb + (index / 32u) * 34u;
+  uint codes = w_u32_at_sel(sel, bo + 2u + (index & 31u));
+  f16vec2 qlo = f16vec2(float16_t(bitfieldExtract(int(codes), 0, 8)), float16_t(bitfieldExtract(int(codes), 8, 8)));
+  f16vec2 qhi = f16vec2(float16_t(bitfieldExtract(int(codes), 16, 8)), float16_t(bitfieldExtract(int(codes), 24, 8)));
+  float d = weight_half_sel(sel, bo);
+  f16vec2 p0 = qlo * ylo, p1 = qhi * yhi;
+  return d * (float(p0.x) + float(p0.y) + float(p1.x) + float(p1.y));
+}
+// this thread's slice of one output row's dot
+float dot_row(uint sel, uint rowbase, uint xrow, uint blocks, uint index) {
+  float acc0 = 0.0, acc1 = 0.0;
+  uint b = 0u;
+  for (; b + 1u < blocks; b += 2u) {
+    if (b * 256u + index >= params.cols) break;
+    vec4 y0 = x4[(xrow + b * 256u) >> 2u];
+    acc0 += term8(sel, rowbase + b * 272u, index, f16vec2(y0.xy), f16vec2(y0.zw));
+    if ((b + 1u) * 256u + index < params.cols) {
+      vec4 y1 = x4[(xrow + (b + 1u) * 256u) >> 2u];
+      acc1 += term8(sel, rowbase + (b + 1u) * 272u, index, f16vec2(y1.xy), f16vec2(y1.zw));
+    }
+  }
+  if (b < blocks && b * 256u + index < params.cols) {
+    vec4 y0 = x4[(xrow + b * 256u) >> 2u];
+    acc0 += term8(sel, rowbase + b * 272u, index, f16vec2(y0.xy), f16vec2(y0.zw));
+  }
+  return acc0 + acc1;
+}
+
+void main() {
+  uint gp = gl_WorkGroupID.x;
+  uint position = gl_WorkGroupID.y;
+  uint t = gl_LocalInvocationID.x;
+  uint hd = RP.n, hlf = RP.aux / 2u;
+  uint q_pairs = (params.rows_q / hd) * hlf;
+  uint kv_pairs = (params.rows_kv / hd) * hlf;
+  uint total = q_pairs + 2u * kv_pairs;
+  bool live = gp < total && position < params.positions;
+  uint sel = (gp < q_pairs) ? 0u : (gp < q_pairs + kv_pairs) ? 1u : 2u;
+  uint gp_sel = (sel == 0u) ? gp : (sel == 1u) ? (gp - q_pairs) : (gp - q_pairs - kv_pairs);
+  uint head = gp_sel / hlf;
+  uint p = gp_sel - head * hlf;
+  uint r0 = head * hd + p, r1 = r0 + hlf;
+  uint in_row = ((params.input_per_expert == 1u) ? ((params.pad0 > 1u) ? position / params.pad0 : position) : 0u) + params.pad1;
+  uint index = t * 4u;
+  uint blocks = (params.cols + 255u) / 256u;
+  uint row_bytes = ((params.cols + 31u) / 32u) * 34u;
+  float s0 = 0.0, s1 = 0.0;
+  if (live) {
+    uint xrow = in_row * params.cols + index;
+    s0 = dot_row(sel, r0 * row_bytes, xrow, blocks, index);
+    s1 = dot_row(sel, r1 * row_bytes, xrow, blocks, index);
+  }
+  float g0 = subgroupAdd(s0), g1 = subgroupAdd(s1);
+  if (subgroupElect()) { psum[0][gl_SubgroupID] = g0; psum[1][gl_SubgroupID] = g1; }
+  barrier();
+  if (live && t == 0u) {
+    float a0 = 0.0, a1 = 0.0;
+    for (uint i = 0u; i < gl_NumSubgroups; i++) { a0 += psum[0][i]; a1 += psum[1][i]; }
+    float x0 = a0 + bias_sel(sel, r0);
+    float x1 = a1 + bias_sel(sel, r1);
+    float cs = 1.0, sn = 0.0;
+    if (sel != 2u) {
+      // op_rope_neox (-DBIAS) math verbatim for the pair (p, p + hlf)
+      float theta = float(((RP.p1 != 0.0) ? ids[0] : RP.aux2)) * pow(RP.scale, -2.0 * float(p) / float(RP.aux));
+      if (RP.eps != 0.0) theta /= fq[p];
+      cs = cos(theta); sn = sin(theta);
+    }
+    out_store_sel(sel, r0, x0 * cs - x1 * sn);
+    out_store_sel(sel, r1, x0 * sn + x1 * cs);
+  }
+}

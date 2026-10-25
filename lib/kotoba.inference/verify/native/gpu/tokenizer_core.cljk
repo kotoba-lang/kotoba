@@ -1,0 +1,156 @@
+;; Byte-level BPE tokenizer CORE (iteration 42; the CLI is gguf_tokenizer.cljk): tokenizer.ggml.tokens /
+;; merges / token_type / pre. Encode = the pre-tokenizer regexes of `tokenizer.ggml.pre` (iteration 58: qwen2, qwen35,
+;; llama-bpe, gpt-2 and default, spelled from llama.cpp's llama-vocab.cpp; an unknown pre is REFUSED, not guessed),
+;; GPT-2's byte->unicode map, then greedy lowest-rank merges; decode = the inverse. A kbb tool (the
+;; serving shell's text <-> ids), checked against llama-server's /tokenize and /detokenize by
+;; tokenizer_check.cljk. Reads only the GGUF header (the tensor data is never touched).
+;; `tokenizer.ggml.model` other than gpt2 (e.g. "llama" = SentencePiece) is REFUSED with exit 2.
+;; Also exposes the model's special-token facts for the serving shell: bos-id / eos-id / add-bos? (Llama 3 says
+;; add_bos_token true and llama-server prepends <|begin_of_text|> to every prompt; encode itself never adds it,
+;; encode-prompt does when add-bos?) and chat-template (tokenizer.chat_template, the jinja source, for chat_templates.cljk).
+;;
+;; Loaded with (load-file "tokenizer_core.cljk") after NEX_GGUF (or the first CLI arg) names the file; defines encode / decode.
+(require '["fs" :as fs] '[clojure.string :as str])
+(def gguf-path (or (aget js/process.env "NEX_GGUF") (first *command-line-args*)))   ;; the GGUF (or its header dump)
+(def fd (fs/openSync gguf-path "r"))
+(def head (js/Buffer.alloc (* 64 1024 1024)))
+(def n (fs/readSync fd head 0 (.-length head) 0))
+(def buf (.subarray head 0 n))
+(def pos (atom 0))
+(defn- u8 [] (let [v (.readUInt8 buf @pos)] (swap! pos + 1) v))
+(defn- u32 [] (let [v (.readUInt32LE buf @pos)] (swap! pos + 4) v))
+(defn- i32 [] (let [v (.readInt32LE buf @pos)] (swap! pos + 4) v))
+(defn- u64 [] (let [v (.readBigUInt64LE buf @pos)] (swap! pos + 8) (js/Number v)))
+(defn- gstr [] (let [k (u64) s (.toString buf "utf8" @pos (+ @pos k))] (swap! pos + k) s))
+(declare read-value)
+(defn- read-value [t keep?]
+  (case t
+    0 (u8) 1 (u8) 2 (do (swap! pos + 2) 0) 3 (do (swap! pos + 2) 0) 4 (u32) 5 (i32) 6 (do (swap! pos + 4) 0) 7 (u8) 8 (gstr)
+    9 (let [et (u32) k (u64)] (if keep? (vec (repeatedly k #(read-value et true))) (do (dotimes [_ k] (read-value et false)) nil)))
+    10 (u64) 11 (u64) 12 (do (swap! pos + 8) 0)))
+(when-not (= "GGUF" (.toString buf "latin1" 0 4)) (println "REFUSE not a GGUF file") (js/process.exit 2))
+(swap! pos + 4) (u32) (u64)
+(def n-kv (u64))
+(def wanted #{"tokenizer.ggml.tokens" "tokenizer.ggml.merges" "tokenizer.ggml.token_type" "tokenizer.ggml.pre" "tokenizer.ggml.model"
+              "tokenizer.ggml.bos_token_id" "tokenizer.ggml.eos_token_id" "tokenizer.ggml.add_bos_token" "tokenizer.chat_template"})
+(def kv (into {} (for [_ (range n-kv)] (let [k (gstr) t (u32) v (read-value t (contains? wanted k))] [k v]))))
+(def tokens (kv "tokenizer.ggml.tokens"))
+(def merges (kv "tokenizer.ggml.merges"))
+(def tokenizer-model (kv "tokenizer.ggml.model"))
+(when-not (= "gpt2" tokenizer-model)
+  (println (str "REFUSE tokenizer.ggml.model = " (pr-str tokenizer-model) " is not byte-level BPE (gpt2); "
+                (if (= "llama" tokenizer-model) "SentencePiece (SPM) is not implemented here" "no implementation for this model")))
+  (js/process.exit 2))
+(when-not (and tokens merges) (println "REFUSE the GGUF has no tokenizer.ggml.tokens / merges") (js/process.exit 2))
+;; GPT-2 byte <-> unicode
+(def byte->char
+  (let [printable (concat (range 33 127) (range 161 173) (range 174 256))
+        base (into {} (map (fn [b] [b (js/String.fromCodePoint b)]) printable))]
+    (loop [b 0 nxt 256 m base]
+      (if (= b 256) m
+          (if (contains? m b) (recur (inc b) nxt m) (recur (inc b) (inc nxt) (assoc m b (js/String.fromCodePoint nxt))))))))
+(def char->byte (into {} (map (fn [[b c]] [c b]) byte->char)))
+(def token->id (into {} (map-indexed (fn [i t] [t i]) tokens)))
+(def rank (into {} (map-indexed (fn [i m] [m i]) merges)))   ;; "a b" -> rank
+;; --- the pre-tokenizer, keyed on tokenizer.ggml.pre (llama.cpp src/llama-vocab.cpp, llm_tokenizer_bpe ctor, read 2026-09-20 at
+;; 911f6cdc) --- Each entry is the regex list llama.cpp applies IN SEQUENCE: every piece is split by the next regex and the
+;; text between matches is kept as its own piece (unicode_regex_split_stl / the custom splitters do the same), which is why
+;; the gpt-2 regex may end in \s+(?!\S) without a \s+ fallback. The `(?i:'s|'t|...)` group of llama3 / qwen2 is spelled
+;; case by case as llama.cpp does (inline modifiers need V8 >= 12.5; the boxes run node 18). :ignore-merges = a piece that
+;; is itself a token is emitted whole without running the merges (llama.cpp ignore_merges, set for the llama3 family);
+;; :add-bos = llama.cpp's default before tokenizer.ggml.add_bos_token overrides it.
+(def contraction "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])")
+(def gpt2-re "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)")
+(def pre-table
+  {"qwen2"     {:res [(str contraction "|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+")] :ignore-merges false :add-bos false}
+   "qwen35"    {:res [(str contraction "|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+")] :ignore-merges false :add-bos false}   ;; Nex-N2.5 / Qwen3.5: \p{M} joins letters
+   "llama-bpe" {:res [(str contraction "|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+")] :ignore-merges true :add-bos true}
+   "gpt-2"     {:res [gpt2-re] :ignore-merges false :add-bos false}
+   "default"   {:res ["[\\p{P}\\$\\+<=>\\^~\\|]+" gpt2-re "\\p{N}+" "[0-9][0-9][0-9]"] :ignore-merges false :add-bos false}})
+;; llama.cpp's aliases of the same pre type (the `tokenizer_pre == ...` chains of the ctor)
+(def pre-alias {"deepseek-r1-qwen" "qwen2" "kormo" "qwen2" "f2llmv2" "qwen2"
+                "llama3" "llama-bpe" "llama-v3" "llama-bpe" "falcon3" "llama-bpe" "falcon-h1" "llama-bpe" "pixtral" "llama-bpe" "midm-2.0" "llama-bpe" "lfm2" "llama-bpe"
+                "phi-2" "gpt-2" "jina-es" "gpt-2" "jina-de" "gpt-2" "gigachat" "gpt-2" "jina-v2-es" "gpt-2" "jina-v2-de" "gpt-2" "a.x-4.0" "gpt-2" "mellum" "gpt-2"
+                "" "default"})
+(def pre-name (let [p (or (kv "tokenizer.ggml.pre") "")] (get pre-alias p p)))
+(def pre (or (pre-table pre-name)
+             (do (println (str "REFUSE tokenizer.ggml.pre = " (pr-str (kv "tokenizer.ggml.pre")) " has no pre-tokenizer here (known: " (str/join ", " (sort (keys pre-table))) ")"))
+                 (js/process.exit 2))))
+(def pre-res (mapv #(js/RegExp. % "gu") (:res pre)))
+(def ignore-merges? (:ignore-merges pre))
+;; special-token facts (the shell prepends bos when add-bos?; encode itself is add_special = false)
+(def bos-id (kv "tokenizer.ggml.bos_token_id"))
+(def eos-id (kv "tokenizer.ggml.eos_token_id"))
+(def add-bos? (let [v (kv "tokenizer.ggml.add_bos_token")] (if (nil? v) (:add-bos pre) (= 1 v))))
+(def chat-template (kv "tokenizer.chat_template"))
+(when (and add-bos? (nil? bos-id)) (println "REFUSE add_bos_token is true but the GGUF names no tokenizer.ggml.bos_token_id") (js/process.exit 2))
+(defn split-keep-gaps
+  "One regex over one piece: the matches in order, with the text between (and after) them kept as pieces of their own."
+  [re piece]
+  (set! (.-lastIndex re) 0)
+  (loop [last 0 out []]
+    (let [m (.exec re piece)]
+      (cond (nil? m) (if (< last (count piece)) (conj out (subs piece last)) out)
+            (zero? (count (aget m 0))) (do (set! (.-lastIndex re) (inc (.-lastIndex re))) (recur last out))   ;; never loop on an empty match
+            :else (let [j (.-index m) tok (aget m 0)]
+                    (recur (+ j (count tok)) (-> out (cond-> (> j last) (conj (subs piece last j))) (conj tok))))))))
+(defn pre-tokenize [text]
+  (reduce (fn [pieces re] (vec (mapcat #(split-keep-gaps re %) pieces))) [text] pre-res))
+(defn bytes->units [s] (mapv #(byte->char %) (array-seq (js/Buffer.from s "utf8"))))
+(defn bpe [units]
+  (loop [parts units]
+    (let [pairs (map vector parts (rest parts))
+          best (reduce (fn [acc [a b]] (let [r (rank (str a " " b))] (if (and r (or (nil? acc) (< r (second acc)))) [[a b] r] acc))) nil pairs)]
+      (if (nil? best) parts
+          (let [[[a b] _] best merged (str a b)]
+            (recur (loop [ps parts out []]
+                     (cond (empty? ps) out
+                           (and (= (first ps) a) (= (second ps) b)) (recur (drop 2 ps) (conj out merged))
+                           :else (recur (rest ps) (conj out (first ps)))))))))))
+;; special tokens matched verbatim BEFORE the pre-tokenizer, longest first, as llama.cpp's tokenizer_st_partition does:
+;; user-defined tokens (tokenizer.ggml.token_type 4, e.g. gpt-neox's "  " indentation tokens) ALWAYS, control tokens
+;; (type 3, e.g. <|im_start|> <|im_end|> <think>) only with parse_special = true (iteration 45, the chat template; iteration
+;; 58 split the two kinds the way llama.cpp does -- its test oracle is parse_special = false and still emits type-4 tokens).
+(def token-types (or (kv "tokenizer.ggml.token_type") []))
+(defn- special-re [kinds]
+  (let [toks (->> (map-indexed (fn [i t] [i t]) token-types) (filter #(contains? kinds (second %))) (map #(tokens (first %))) (sort-by #(- (count %))))]
+    (when (seq toks) (js/RegExp. (str/join "|" (map #(str/replace % #"[.*+?^${}()|\[\]\\]" "\\$&") toks)) "g"))))
+(def control-tokens (->> (map-indexed (fn [i t] [i t]) token-types) (filter #(contains? #{3 4} (second %))) (map #(tokens (first %))) vec))
+(def control-re (special-re #{3 4}))        ;; parse_special = true
+(def user-defined-re (special-re #{4}))     ;; parse_special = false
+(defn- piece-ids [piece]
+  (let [units (bytes->units piece)
+        whole (when ignore-merges? (token->id (apply str units)))]
+    (if whole [whole]
+      (map #(or (token->id %) (do (println "REFUSE no token for" (pr-str %)) (js/process.exit 3))) (bpe units)))))
+(defn encode-plain
+  "The pre-tokenizer + merges only (no special-token matching at all)."
+  [text]
+  (vec (mapcat piece-ids (pre-tokenize text))))
+(defn encode*
+  "encode with llama.cpp's parse_special flag: true matches control + user-defined tokens verbatim, false user-defined only."
+  [text parse-special?]
+  (let [re (if parse-special? control-re user-defined-re)]
+    (if-not re (encode-plain text)
+      (loop [i 0 out []]
+        (set! (.-lastIndex re) i)
+        (let [m (.exec re text)]
+          (if-not m (into out (encode-plain (subs text i)))
+            (let [j (.-index m) tok (aget m 0)]
+              (recur (+ j (count tok)) (-> out (into (encode-plain (subs text i j))) (conj (token->id tok)))))))))))
+(defn encode
+  "parse_special = true: what the serving shell tokenizes a rendered chat prompt with (add_special = false: no bos)."
+  [text] (encode* text true))
+(defn encode-prompt
+  "encode with add_special = true as llama-server tokenizes a prompt: bos first when the model says add_bos_token."
+  [text]
+  (let [ids (encode text)]
+    (if (and add-bos? (not= (first ids) bos-id)) (into [bos-id] ids) ids)))
+(defn token-bytes
+  "One token's bytes (a Buffer); a token can end inside a UTF-8 sequence, so streaming decodes with TextDecoder {stream true}."
+  [id]
+  (js/Buffer.from (clj->js (mapv #(char->byte %) (array-seq (js/Array.from (tokens id)))))))
+(defn decode [ids]
+  (let [units (apply str (map #(tokens %) ids))
+        bytes (js/Buffer.from (clj->js (mapv #(char->byte %) (array-seq (js/Array.from units)))))]
+    (.toString bytes "utf8")))

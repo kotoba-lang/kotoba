@@ -1,0 +1,210 @@
+#!/usr/bin/env kbb
+;; breath.cljk — proof-of-life cell for the etzhayyim substrate (cljc port of
+;; breath.py, ADR clj/bb repo rule). One invocation = one breath: load → mutate →
+;; save cell state, anchor its evolving state-root to EtzhayyimAnchor on Base L2 /
+;; geth-private / local anvil.
+;;
+;; This port drops web3 + eth_account entirely: the legacy tx is built + signed
+;; with the dependency-free pure-Clojure lib eth-crypto-clj (Keccak-256 /
+;; secp256k1 / RFC-6979 ECDSA / EIP-155 / RLP), so it runs under babashka with no
+;; native deps and no eth_account. JSON-RPC is a minimal babashka.http-client POST
+;; (eth_sendRawTransaction for the write, eth_call for the rootCount read).
+;;
+;; Usage:
+;;   kbb breath.cljk                 # one breath (defaults = local anvil acct[0])
+;;   kbb breath.cljk --dry-run       # build + SIGN locally, do NOT broadcast
+;;   kbb breath.cljk selftest        # offline EIP-155 sign-path self-check
+;;   ETZ_RPC=http://… ETZ_ANCHOR=0x… ETZ_PK=0x… kbb breath.cljk
+;;
+;; Env (same names as breath.py / deploy.sh): ETZ_RPC, ETZ_ANCHOR, ETZ_PK.
+(ns breath
+  (:require [babashka.http-client :as http]
+            [cheshire.core :as json]
+            [clojure.edn :as edn]
+            [eth-crypto.core :as eth]))
+
+;; ─── Config (env-overridable, identical defaults to breath.py) ───────
+
+(def DEFAULT-RPC "http://localhost:8545")
+(def DEFAULT-ANCHOR "0x5fbdb2315678afecb367f032d93f642f64180aa3") ; deps.toml local_anvil
+;; Anvil pre-funded acct[0] — well-known testing key, NOT for production.
+(def DEFAULT-PK "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")
+
+(defn env [k d] (or (not-empty (System/getenv k)) d))
+(def RPC-URL     (env "ETZ_RPC" DEFAULT-RPC))
+(def ANCHOR-ADDR (env "ETZ_ANCHOR" DEFAULT-ANCHOR))
+(def PRIVATE-KEY (env "ETZ_PK" DEFAULT-PK))
+
+(def script-dir
+  (-> (or (System/getProperty "babashka.file") *file*)
+      (java.io.File.) (.getAbsoluteFile) (.getParent)))
+(def STATE-PATH (str script-dir "/state.edn"))
+
+;; ─── Cell state ─────────────────────────────────────────────────────
+
+(defn load-state []
+  (let [f (java.io.File. STATE-PATH)]
+    (if (.exists f)
+      (edn/read-string (slurp f))
+      {:counter 0 :last-anchor-tx nil :last-block 0})))
+
+(defn save-state [state]
+  (spit STATE-PATH (str (pr-str (into (sorted-map) state)) "\n")))
+
+(defn iso-now []
+  (.format (java.time.OffsetDateTime/now java.time.ZoneOffset/UTC)
+           java.time.format.DateTimeFormatter/ISO_OFFSET_DATE_TIME))
+
+(defn mutate-state [state]
+  (-> state
+      (assoc :counter (inc (or (:counter state) 0)))
+      (assoc :last-tick-at (iso-now))))
+
+(defn state-root ^bytes [state]
+  "Mock MST root = sha256 of the canonical sorted EDN state form. Production swaps
+  this for a proper AT MST root CID (ADR-2605171800); the bytes32 shape is unchanged."
+  (let [canon (pr-str (into (sorted-map) state))]
+    (.digest (java.security.MessageDigest/getInstance "SHA-256")
+             (.getBytes ^String canon "UTF-8"))))
+
+;; ─── ABI encode (anchor(bytes32 rootHash, bytes ipfsCid, uint64 batchSize)) ──
+
+(defn- uint-word ^String [v]
+  (let [^bytes ba (.toByteArray (biginteger v))
+        n (alength ba) o (byte-array 32)]
+    (cond
+      (= n 32) (eth/bytes->hex ba)
+      (< n 32) (do (System/arraycopy ba 0 o (- 32 n) n) (eth/bytes->hex o))
+      :else    (eth/bytes->hex (java.util.Arrays/copyOfRange ba (- n 32) n)))))
+
+(defn- selector ^String [sig]
+  (subs (eth/bytes->hex (eth/keccak256 (eth/utf8 sig))) 0 8))
+
+(defn encode-anchor-call
+  "ABI-encode anchor(bytes32,bytes,uint64): 3 head words (root, dyn-offset 0x60,
+  batchSize) + dynamic tail (len word + right-padded ipfsCid)."
+  ^String [^bytes root ^bytes ipfs-cid batch-size]
+  (let [len  (alength ipfs-cid)
+        pad  (mod (- 32 (mod len 32)) 32)
+        tail (let [o (byte-array (+ len pad))]
+               (System/arraycopy ipfs-cid 0 o 0 len)
+               (eth/bytes->hex o))]
+    (str "0x" (selector "anchor(bytes32,bytes,uint64)")
+         (eth/bytes->hex root)          ; bytes32, in-place (32 bytes = 64 hex)
+         (uint-word 96)                 ; offset to ipfsCid data = 3*32
+         (uint-word batch-size)         ; uint64 batchSize
+         (uint-word len)                ; ipfsCid length
+         tail)))
+
+;; ─── Minimal JSON-RPC transport ─────────────────────────────────────
+
+(def ^:private rpc-id (atom 0))
+
+(defn rpc! [method params]
+  (let [body (json/generate-string {:jsonrpc "2.0" :id (swap! rpc-id inc)
+                                    :method method :params params})
+        resp (http/post RPC-URL {:headers {"content-type" "application/json"} :body body})
+        parsed (json/parse-string (:body resp) true)]
+    (if-let [err (:error parsed)]
+      (throw (ex-info (str "JSON-RPC error: " (:message err)) {:error err :method method}))
+      (:result parsed))))
+
+(defn eth-call ^String [to data] (rpc! "eth_call" [{:to to :data data} "latest"]))
+(defn send-raw ^String [raw]     (rpc! "eth_sendRawTransaction" [raw]))
+(defn tx-count [addr]            (rpc! "eth_getTransactionCount" [addr "latest"]))
+(defn gas-price []               (rpc! "eth_gasPrice" []))
+(defn chain-id []                (rpc! "eth_chainId" []))
+
+(defn wait-receipt [tx-hash & {:keys [timeout-ms poll-ms] :or {timeout-ms 30000 poll-ms 200}}]
+  (let [deadline (+ (System/currentTimeMillis) timeout-ms)]
+    (loop []
+      (let [r (rpc! "eth_getTransactionReceipt" [tx-hash])]
+        (cond
+          (some? r) r
+          (> (System/currentTimeMillis) deadline) (throw (ex-info "tx receipt timeout" {:tx tx-hash}))
+          :else (do (Thread/sleep poll-ms) (recur)))))))
+
+(defn hex->long [h] (Long/parseLong (eth/strip0x h) 16))
+
+;; ─── Build + sign the legacy anchor tx (replaces eth_account) ────────
+
+(defn build-and-sign
+  "Build the EIP-155 legacy anchor() tx with live nonce/gasPrice/chainId and sign
+  it with eth-crypto-clj. Returns {:raw 0x… :from 0x… :data … :nonce … :chain-id …}."
+  [^bytes privkey calldata]
+  (let [from  (eth/address-of-privkey privkey)
+        nonce (tx-count from)
+        gp    (gas-price)
+        cid   (chain-id)
+        tx    {:nonce nonce :gas-price gp :gas 250000
+               :to ANCHOR-ADDR :value 0 :data calldata :chain-id cid}
+        raw   (eth/sign-tx-legacy tx privkey)]
+    {:raw raw :from from :nonce nonce :chain-id cid :data calldata}))
+
+;; ─── Anchor call (one breath) ───────────────────────────────────────
+
+(defn breath
+  "Run one breath. Returns a Unix-style exit code. When dry-run?, build + SIGN the
+  tx locally but do NOT broadcast (no-server-key posture)."
+  [dry-run?]
+  (let [privkey (eth/hex->bytes PRIVATE-KEY)]
+    ;; connectivity probe (≈ web3.is_connected)
+    (if-not (try (chain-id) (catch Exception _ nil))
+      (do (binding [*out* *err*] (println (str "[first-breath] cannot reach RPC " RPC-URL))) 2)
+      (let [state    (mutate-state (load-state))
+            root     (state-root state)
+            ipfs-cid (.getBytes (str "bafyreidemo-breath-" (:counter state)) "UTF-8")
+            calldata (encode-anchor-call root ipfs-cid (:counter state))]
+        (println (str "[first-breath] tick #" (:counter state)))
+        (println (str "[first-breath]   ts:        " (:last-tick-at state)))
+        (println (str "[first-breath]   root:      0x" (eth/bytes->hex root)))
+        (println (str "[first-breath]   ipfs_cid:  " (String. ipfs-cid "UTF-8")))
+        (let [{:keys [raw from]} (build-and-sign privkey calldata)]
+          (if dry-run?
+            (do
+              (println (str "[first-breath]   signer:    " from))
+              (println (str "[first-breath]   raw_tx:    " raw))
+              (println "[first-breath] --dry-run: built + signed, NOT broadcast (no-server-key).")
+              0)
+            (let [tx-hash (send-raw raw)
+                  receipt (wait-receipt tx-hash)]
+              (if (not= 1 (hex->long (:status receipt)))
+                (do (binding [*out* *err*]
+                      (println (str "[first-breath] anchor tx reverted: " tx-hash))) 3)
+                (let [block (hex->long (:blockNumber receipt))
+                      state (-> state (assoc :last-anchor-tx tx-hash) (assoc :last-block block))]
+                  (save-state state)
+                  (let [count (eth/strip0x (eth-call ANCHOR-ADDR (str "0x" (selector "rootCount()"))))]
+                    (println (str "[first-breath]   anchored:  tx " tx-hash " block " block))
+                    (println (str "[first-breath]   verified:  Anchor.rootCount() = "
+                                  (BigInteger. count 16))))
+                  (println (str "[first-breath] breath " (:counter state) " complete."))
+                  0)))))))))
+
+;; ─── Offline EIP-155 sign-path self-check ───────────────────────────
+
+(defn selftest
+  "Exercise the SIGN path offline with the canonical EIP-155 worked example, proving
+  the actor's signing path uses the verified eth-crypto-clj lib byte-for-byte."
+  []
+  (let [pk  (eth/hex->bytes "0x4646464646464646464646464646464646464646464646464646464646464646")
+        tx  {:nonce 9 :gas-price 20000000000 :gas 21000
+             :to "0x3535353535353535353535353535353535353535"
+             :value 1000000000000000000 :data "0x" :chain-id 1}
+        got (eth/sign-tx-legacy tx pk)
+        exp "0xf86c098504a817c800825208943535353535353535353535353535353535353535880de0b6b3a76400008025a028ef61340bd939bc2195fe537567866003e1a15d3c71ff63e1590620aa636276a067cbe9d8997f761aecb703304b3800ccf555c9f3dc64214b297fb1966a3b6d83"]
+    (println "[selftest] EIP-155 raw signed tx:")
+    (println "  got: " got)
+    (println "  exp: " exp)
+    (if (= got exp)
+      (do (println "[selftest] PASS — sign path matches the EIP-155 spec vector.") 0)
+      (do (binding [*out* *err*] (println "[selftest] FAIL — sign path diverged.")) 1))))
+
+(defn -main [& args]
+  (let [argset (set args)]
+    (cond
+      (contains? argset "selftest") (System/exit (selftest))
+      :else (System/exit (breath (contains? argset "--dry-run"))))))
+
+(when (= *file* (System/getProperty "babashka.file"))
+  (apply -main *command-line-args*))

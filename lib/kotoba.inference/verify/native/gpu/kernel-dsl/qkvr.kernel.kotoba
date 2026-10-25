@@ -1,0 +1,60 @@
+;; qkvr.kernel.kotoba — the SINGLE SOURCE of the fused qkv+rope+bias kernel's
+;; arithmetic (JUN-139 migration series, item 2 of 3). The hand form is
+;; kdot_h2_qkvr_q8.comp (merged via #49) and its MSL twin would be hand-written
+;; — this source replaces both.
+;;
+;; The identity contract extends the kdot source with two new chains:
+;;   * :bias-add   — x = dot + bias (f32, one add per element)
+;;   * :rope       — the op_rope_neox -DBIAS math VERBATIM: theta = pos *
+;;     pow(scale, -2*p/nrot) with the pair rotation (x0*cs - x1*sn /
+;;     x0*sn + x1*cs). The v matvec runs the IDENTITY rotation (cs=1, sn=0),
+;;     which is exactly the old op_add_bias — recorded as :rope :identity so
+;;     no emitter may invent trig for it.
+;;
+;; The PAIR structure is shape, not arithmetic: one workgroup computes the two
+;; rows of a rope pair (p, p + nrot/2); the single-pair dose is the tuned
+;; optimum on Metal (the multi-pair 2-pair form measured +0.4ms on the
+;; composite — iteration30) and stays.
+
+{:kernel/name "kdot_h2_qkvr_q8"
+ :kernel/entry "kmain"
+ :kernel/shape {:threads 64
+                :pairing :one-rope-pair-per-workgroup
+                :dispatch "grid = (NH + 2*NKV) * (head_dim / 2) pairs, one threadgroup per pair"
+                :block-values 32 :block-bytes 34 :group-values 256 :group-bytes 272
+                :row-bytes "((cols + 31) / 32) * 34"
+                :ttype 8}
+
+ :kernel/bindings [{:i 0 :name "Meta"  :space :constant :type "u32x8"}
+                   {:i 1 :name "Wq"    :space :device-ro :type "u32"}
+                   {:i 2 :name "X"     :space :device-ro :type "f32x4"}
+                   {:i 3 :name "Oq"    :space :device-rw :type "f32"}
+                   {:i 4 :name "Wk"    :space :device-ro :type "u32"}
+                   {:i 5 :name "Ok"    :space :device-rw :type "f32"}
+                   {:i 6 :name "Wv"    :space :device-ro :type "u32"}
+                   {:i 7 :name "Ov"    :space :device-rw :type "f32"}
+                   {:i 8 :name "Bq"    :space :device-ro :type "f32"}
+                   {:i 9 :name "Bk"    :space :device-ro :type "f32"}
+                   {:i 10 :name "Bv"   :space :device-ro :type "f32"}
+                   {:i 11 :name "RopeP" :space :constant :type "rope-meta"}
+                   {:i 12 :name "Fq"   :space :device-ro :type "f32"}
+                   {:i 13 :name "Ids"  :space :device-rw :type "u32"}]
+ :kernel/meta [rows_q rows_kv cols tensor_type positions input_per_expert pad0 pad1]
+
+ :term8 {:same-as "kdot-q8.r4.kernel.kotoba :term8"   ;; the Q8_0 block product, identical
+         :conv :i8h
+         :sum [[:f32-sum "(p0.x)" "(p0.y)" "(p1.x)" "(p1.y)"]]}
+
+ :bias-add {:chain [:f32-add :dot-sum :bias[row]]}   ;; x = dot + bias, one f32 add
+
+ :rope
+ {:neox {:theta  [:f32-mul :pos [:pow :scale [:f32-neg [:f32-div [:f32-mul 2 p] nrot]]]]   ;; pos * pow(scale, -2p/nrot)
+          :theta-freq-div [:f32-div :theta [:load Fq p]]                                  ;; if eps != 0 (Qwen: absent)
+          :rotate {:first-half  [:f32-sub [:f32-mul x0 cs] [:f32-mul x1 sn]]
+                   :second-half [:f32-add [:f32-mul x0 sn] [:f32-mul x1 cs]]}
+          :order "x0 = dot0 + bias0, x1 = dot1 + bias1, THEN rotate — the same order as add_bias -> op_rope_neox"}
+  :identity {:note "the v matvec: cs = 1, sn = 0 — the rotation is the identity, i.e. the old op_add_bias. No trig is emitted for :identity."}}
+
+ :acc-chain {:same-as "kdot-q8.r4.kernel.kotoba :acc-chain" :per "one chain per row of the pair (2 rows x 3 matvecs = 6 chains per workgroup)"}
+ :reduce {:same-as "kdot-q8.r4.kernel.kotoba :reduce" :stage-1 :fixed-order-shuffle-xor-butterfly}
+ :store "Oq/Ov/Ok: out[position * rows + row] = reduce; then bias+rope per the :rope chain"}

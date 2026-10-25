@@ -1,0 +1,324 @@
+;; The serving shell (iteration 42 one process per request; iteration 43 RESIDENT): an OpenAI-compatible
+;; POST /v1/completions in front of one resident kexe (`… fn - resident` guest). The guest MAPs the weights
+;; once and then takes one message per token step on its standard input -- "<token id>,<reset flag>" --
+;; and answers "<ns>|<hex argmax id>" on its standard output; the shell feeds the prompt (flag 1 on the
+;; first token rewinds the position) and then feeds each argmax back, so a request costs its steps and
+;; nothing else. Requests are serialized (one step in flight). The guest's string pool and pair heap are
+;; bump allocators (measured K16 12L: 11.3 KiB and 3.5 K pairs per step), so the shell respawns the guest
+;; after `steps-per-life` steps (default 15000: the loader ceilings are a 1 GiB pool and 2^26 pairs, 2^26 / 3.5 K = 19 k steps), when it exits, or when the
+;; loader's 86400 s wall ceiling ends it (a day per guest life; a respawn is the MAP cost, 1.3 s for 12 layers on K16).
+;; Sampling (iteration 50): `temperature` (default 1.0; 0 = greedy), `top_p` (default 1.0) and `seed` (default: a fresh
+;; random u32, echoed in the answer) ride on the 5-word message "t,f,Tbits,top_p_bits,seed" for the last prompt token
+;; and every generated token; the guest replays its sampled step (nex_sample_* chain, u = hash(seed, position)), which
+;; decode_tokens_ref.py --sample reproduces in f64. Generation stops at an end-of-generation
+;; token (<|im_end|> / <|endoftext|>, finish_reason "stop") or at max_tokens ("length").
+;; POST /v1/chat/completions (iteration 45) renders the model's ChatML template the way llama-server's
+;; /apply-template does for this GGUF -- "<|im_start|>{role}\n{content}<|im_end|>\n" per message, earlier assistant
+;; turns prefixed by "<think>\n\n</think>\n\n", the generation prompt "<|im_start|>assistant\n<think>" -- and answers
+;; reasoning_content (up to </think>) and content separately. `stream: true` (iteration 46) answers Server-Sent Events,
+;; one `data:` chunk per generated token as the guest returns it (text via TextDecoder {stream true}, so a token that
+;; ends inside a UTF-8 sequence waits for the next), the chat form as `delta.reasoning_content` until `</think>` and
+;; `delta.content` after, then a final chunk with `finish_reason` and `usage`, then `data: [DONE]`. `chat_template_kwargs.enable_thinking false` closes the
+;; think block in the prompt (ours: the llama-server on K16 ignores that kwarg for this template).
+;; Iteration 58: the template is no longer hardcoded -- chat_templates.cljk recognizes the family of tokenizer.chat_template
+;; (chatml-think = this Nex rendering, unchanged; chatml with Qwen2.5's default system prompt; llama3 header ids + bos) and
+;; the prompt ids get the bos id first when the GGUF says add_bos_token (tokenizer_core encode-prompt); stop tokens come from
+;; eos_token_id + the family's list. The guest itself is still the Nex kexe -- another family's GGUF only changes the shell's text side.
+;;
+;;   NEX_GGUF=<gguf or head dump> node /opt/kbb-engine/cli.js serve_http.cljk <kexe-loader> <resident.bin> <offset> <x86_64|aarch64> <port> [allow-csv] [steps-per-life]
+;;   curl -s localhost:8099/v1/completions -H 'Content-Type: application/json' -d '{"prompt":"The capital of France is","max_tokens":8}'
+(require '["http" :as http] '["child_process" :as cp] '["path" :as path] '[clojure.string :as str] '[nbb.core :refer [load-file]])
+(def args (vec *command-line-args*))
+(when (< (count args) 5) (println "usage: <kexe-loader> <resident.bin> <offset> <isa> <port> [allow-csv] [steps-per-life] [prefill-bucket] [batch-rows]") (js/process.exit 2))
+(def loader (args 0)) (def bin (args 1)) (def offset (args 2)) (def isa (args 3)) (def port (args 4))
+(def model-id (or (aget js/process.env "NEX_MODEL_ID") "nex-n2.5-mini/kotoba-native"))
+(def context-size (js/parseInt (or (aget js/process.env "NEX_CONTEXT") "4096")))
+(def allow (or (get args 5) "42,33,41,37,39"))
+(def steps-per-life (js/parseInt (or (get args 6) "15000")))
+;; prefill bucket P of a `resident-replay … prefill:<P>` guest (iteration 49): the prompt goes in as chunks of P tokens
+;; per message ("t0,…,tP-1,flag"), the remainder one token per message; 0 = the guest has no prefill step.
+(def prefill-bucket (js/parseInt (or (get args 7) "0")))
+;; batch rows B of a `… batch:<B>` guest (iteration 53, C-4): the shell becomes a SCHEDULER -- B rows are slots, a
+;; request takes a free row and leaves it on stop / length, and every step is one 2B-word message (B tokens, B flags)
+;; that advances every occupied row at once (an empty row is fed 0 with flag 1). The batch step is greedy and one
+;; token per row per step; sampling is per row (iteration 55: the message carries T / top_p / seed per row, T = 0 rows
+;; take the argmax); with prefill-bucket P and a `prefill:<P>` adaptive guest a row with more than P prompt tokens left
+;; gets its own prefill tick (iteration 57). 0 = the serial shell as before.
+;; iteration 54: "1,2,4" names an ADAPTIVE guest (`batch:1,2,4`) -- one kept step per B; each tick uses the smallest B that
+;; covers the highest occupied row, so a lone request in row 0 pays a one-row step.
+(def batch-sizes (vec (sort (map js/parseInt (str/split (or (get args 8) "0") #",")))))
+(def batch-rows (apply max batch-sizes))
+(load-file (path/join (path/dirname *file*) "tokenizer_core.cljk"))
+(load-file (path/join (path/dirname *file*) "chat_templates.cljk"))
+;; the pick's slot in a row of the guest's ids buffer = the argmax partial count ceil(vocab / 4096) (61 Nex, 38 Qwen2.5, 32 Llama-3.2);
+;; from the tokenizer's token count, or NEX_PICK_SLOT when the GGUF's output rows are padded past the next 4096 boundary (iteration 59)
+(def pick-slot (js/parseInt (or (aget js/process.env "NEX_PICK_SLOT") (str (quot (+ (count tokens) 4095) 4096)))))
+(def pick-off (* 4 pick-slot))   ;; iteration 58: template-family / render / stop-tokens from tokenizer.chat_template
+(def eog-ids (set (concat (when eos-id [eos-id]) (keep token->id (stop-tokens template-family)))))
+(when (empty? eog-ids) (println "REFUSE the GGUF names no eos_token_id and none of" (pr-str (stop-tokens template-family))) (js/process.exit 2))
+(println (str "TEMPLATE\t" (name template-family) "\tpre " pre-name "\tadd_bos " add-bos? "\teog " (pr-str (vec (sort eog-ids)))))
+;; --- the resident guest: one process, a line reader, a waiter for the next reply ---
+(def guest (atom nil))   ;; {:proc :buf :waiter :steps :born}
+(defn spawn-guest! []
+  (let [env (js/Object.assign #js {} js/process.env #js {:KEXE_RESULT_TYPE "string" :KEXE_STRUCTURED_REPORT "1" :KEXE_FUEL "1000000000000" :KEXE_WALL_SECONDS "86400"
+                                                          :KEXE_STRING_POOL "1073741824" :KEXE_PAIRS "67108864"})
+        p (cp/spawn loader (clj->js [bin offset "0" isa allow]) (clj->js {:env env :stdio ["pipe" "pipe" "pipe"]}))
+        g {:proc p :buf (atom "") :waiter (atom nil) :steps (atom 0) :born (js/Date.now)}]
+    (.on (.-stdout p) "data" (fn [chunk]
+                               (swap! (:buf g) str (.toString chunk "utf8"))
+                               (loop []
+                                 (let [b @(:buf g) i (.indexOf b "\n")]
+                                   (when (>= i 0)
+                                     (reset! (:buf g) (subs b (inc i)))
+                                     (when-let [w @(:waiter g)] (reset! (:waiter g) nil) (w (subs b 0 i)))
+                                     (recur))))))
+    (.on (.-stderr p) "data" (fn [chunk] (let [s (.toString chunk "utf8")] (when (seq (str/trim s)) (js/console.error (str "guest: " (str/trim s)))))))
+    (.on p "exit" (fn [code sig] (js/console.error (str "guest exited code=" code " sig=" sig " after " @(:steps g) " steps")) (when (= @guest g) (reset! guest nil))
+                    (when-let [w @(:waiter g)] (reset! (:waiter g) nil) (w nil))))
+    (reset! guest g)
+    g))
+(defn f32-bits [x] (let [b (js/Buffer.alloc 4)] (.writeFloatLE b x 0) (.readUInt32LE b 0)))
+(defn step!
+  "Feed one token (or a vector of exactly prefill-bucket tokens: one batched step); with SAMPLE {:T :top-p :seed} the
+   message carries the sampler's parameters (the guest's sampled step). Resolves to [ns id] or nil if the guest died."
+  [g tok reset? & [sample]]
+  (js/Promise. (fn [resolve _]
+                 (reset! (:waiter g) (fn [line] (swap! (:steps g) inc)
+                                       (resolve (when line (let [[ns idhex] (str/split line #"\|")] [(js/parseInt ns) (.readUInt32LE (js/Buffer.from idhex "hex") 0)])))))
+                 (.write (.-stdin (:proc g)) (str (if (vector? tok) (str/join "," tok) tok) "," (if reset? 1 0)
+                                                  (when sample (str "," (f32-bits (:T sample)) "," (f32-bits (:top-p sample)) "," (:seed sample))))))))
+(defn batch-step!
+  "One batch message: TOKS, FLAGS and per-row (T, top_p, seed) -- 5B words (T = 0 rows take the argmax). Resolves to
+   [ns [pick-per-row]] or nil if the guest died."
+  [g toks flags samples]
+  (js/Promise. (fn [resolve _]
+                 (reset! (:waiter g) (fn [line] (swap! (:steps g) inc)
+                                       (resolve (when line (let [[ns idhex] (str/split line #"\|") buf (js/Buffer.from idhex "hex")]
+                                                             [(js/parseInt ns) (mapv #(.readUInt32LE buf (+ (* % 256) pick-off)) (range (count toks)))])))))
+                 (.write (.-stdin (:proc g)) (str/join "," (concat toks flags (mapcat (fn [sm] (if sm [(f32-bits (:T sm)) (f32-bits (:top-p sm)) (:seed sm)] [0 0 0])) samples)))))))
+(defn ensure-guest! []
+  (let [g @guest]
+    (if (and g (< @(:steps g) steps-per-life)) g
+        (do (when g (js/console.error (str "guest retired after " @(:steps g) " steps")) (.end (.-stdin (:proc g))))
+            (spawn-guest!)))))
+(defn run-request
+  "Prompt ids -> promise of {:generated [...] :ns [...] :finish \"stop\"|\"length\"} (greedy: each argmax is the next input;
+   an end-of-generation id ends the request and is not part of the answer)."
+  [ids max-tokens & [on-token sample]]
+  (let [g (ensure-guest!) out (atom []) nss (atom []) P prefill-bucket]
+    (letfn [(feed [i tok]
+              ;; i = index of the first token this message carries; a chunk of P prompt tokens when strictly more than a
+              ;; chunk of prompt is left (the last prompt token is always a single message: its reply is the first pick)
+              (let [chunk? (and (pos? P) (not (vector? tok)) (< (+ i P) (count ids)))
+                    msg (if chunk? (subvec ids i (+ i P)) tok)
+                    nxt (+ i (if chunk? P 1))
+                    sampled (when (and sample (>= nxt (count ids))) sample)]   ;; the message whose reply is kept
+              (.then (step! g msg (= i 0) sampled)
+                     (fn [r]
+                       (if-not r {:error "guest died"}
+                         (let [[ns am] r] (swap! nss conj ns)
+                           (cond (< nxt (count ids)) (feed nxt (ids nxt))       ;; still the prompt: the reply is not kept
+                                 (contains? eog-ids am) {:generated @out :ns @nss :finish "stop"}
+                                 :else (do (swap! out conj am) (when on-token (on-token am))
+                                           (if (< (count @out) max-tokens) (feed nxt am) {:generated @out :ns @nss :finish "length"})))))))))]
+      (feed 0 (ids 0)))))
+(defn message-text
+  "A message's content as text: a string, or the OpenAI parts array (text parts joined; an image part is refused --
+   the native path serves no vision, the mmproj stays with llama.cpp)."
+  [m]
+  (let [c (.-content m)]
+    (cond (nil? c) ""
+          (string? c) c
+          (array? c) (apply str (map (fn [part] (case (.-type part) "text" (.-text part)
+                                                  (throw (js/Error. (str "content part " (.-type part) " is not served on the native path (text only)")))))
+                                     (array-seq c)))
+          :else (str c))))
+(defn render-chat
+  "The chat template of this GGUF as llama-server's /apply-template renders it (chat_templates.cljk: the family is recognized
+   from tokenizer.chat_template; checked byte for byte on 3 message shapes for Nex / Qwen2.5 / Llama-3.2 by chat_template_check.cljk).
+   thinking? closes the think block when false (:chatml-think only)."
+  [messages thinking?]
+  (render (mapv (fn [m] {:role (.-role m) :content (message-text m)}) (array-seq messages)) thinking?))
+(defn split-think
+  "Generated text after a prompt that ends in <think>: [reasoning content]."
+  [text]
+  (let [i (.indexOf text "</think>")]
+    (if (neg? i) ["" text] [(str/trim (subs text 0 i)) (str/replace (subs text (+ i 8)) #"^\n+" "")])))
+(def queue (atom (js/Promise.resolve nil)))   ;; requests serialized: one step in flight at a time
+(defn enqueue [thunk] (let [p (.then @queue (fn [_] (thunk)))] (reset! queue (.catch p (fn [_] nil))) p))
+;; --- the batch scheduler (batch-rows > 0) ---
+(def rows (atom (vec (repeat (max 0 batch-rows) nil))))   ;; slot -> request state or nil
+(def pending (atom []))                                     ;; arrived requests waiting for a row
+(def ticking (atom false))
+(defn admit! []
+  (swap! rows (fn [rs] (reduce (fn [rs i] (if (and (nil? (rs i)) (seq @pending))
+                                             (let [r (first @pending)] (swap! pending subvec 1) (assoc rs i (assoc r :reset? true)))
+                                             rs))
+                               rs (range (count rs))))))
+(defn prefill-tick!
+  "Batch prefill (iteration 57): row I has more than prefill-bucket prompt tokens left -- one message 'P tokens, row, flag, 0'
+   advances that row by P (its reply is not kept); the batch tick follows."
+  [g i]
+  (let [row (@rows i) P prefill-bucket chunk (subvec (:ids row) (:i row) (+ (:i row) P))]
+    (js/Promise. (fn [resolve _]
+                   (reset! (:waiter g) (fn [line] (swap! (:steps g) inc) (resolve (some? line))))
+                   (.write (.-stdin (:proc g)) (str/join "," (concat chunk [i (if (:reset? row) 1 0) 0])))))))
+(defn tick! []
+  (admit!)
+  (if (every? nil? @rows)
+    (reset! ticking false)
+    (if-let [i (and (pos? prefill-bucket) (first (keep-indexed (fn [i r] (when (and r (> (- (count (:ids r)) (:i r)) prefill-bucket)) i)) @rows)))]
+      (.then (prefill-tick! (ensure-guest!) i)
+             (fn [ok?]
+               (if-not ok?
+                 (do (doseq [row @rows :when row] ((:resolve row) {:error "guest died"})) (reset! rows (vec (repeat batch-rows nil))) (reset! ticking false))
+                 (do (swap! rows update i (fn [r] (let [i2 (+ (:i r) prefill-bucket)] (assoc r :reset? false :i i2 :next ((:ids r) i2))))) (tick!)))))
+    (let [g (ensure-guest!) rs @rows t0 (js/Date.now)
+          top (inc (apply max (keep-indexed (fn [i r] (when r i)) rs)))   ;; rows 0..top-1 must be in the step
+          B (or (first (filter #(>= % top) batch-sizes)) batch-rows)   ;; the smallest step that covers them
+          rs (subvec rs 0 B)
+          toks (mapv #(if % (:next %) 0) rs) flags (mapv #(if (and % (:reset? %)) 1 (if % 0 1)) rs)
+          ;; a row samples only where its reply is kept: the last prompt token and every generated token
+          samples (mapv #(when (and % (:sample %) (>= (inc (:i %)) (count (:ids %)))) (:sample %)) rs)]
+      (.then (batch-step! g toks flags samples)
+             (fn [r]
+               (if-not r
+                 (do (doseq [row rs :when row] ((:resolve row) {:error "guest died"})) (reset! rows (vec (repeat batch-rows nil))) (reset! ticking false))
+                 (let [[ns picks] r]
+                   (swap! rows (fn [cur]
+                     (vec (map-indexed
+                           (fn [i row]
+                             (if (or (nil? row) (>= i (count picks))) row
+                               (let [row (-> row (assoc :reset? false) (update :i inc) (update :ns conj ns))
+                                     pick (picks i)]
+                                 (cond (< (:i row) (count (:ids row))) (assoc row :next ((:ids row) (:i row)))   ;; still the prompt
+                                       (contains? eog-ids pick) (do ((:resolve row) {:generated (:out row) :ns (:ns row) :finish "stop"}) nil)
+                                       :else (let [row (-> row (update :out conj pick) (assoc :next pick))]
+                                               (when-let [f (:on-token row)] (f pick))
+                                               (if (>= (count (:out row)) (:max-tokens row))
+                                                 (do ((:resolve row) {:generated (:out row) :ns (:ns row) :finish "length"}) nil)
+                                                 row))))))
+                           cur))))
+                   (tick!)))))))))
+(defn run-batched
+  "Prompt ids -> promise; the request joins the batch step at the next tick."
+  [ids max-tokens & [on-token sample]]
+  (js/Promise. (fn [resolve _]
+                 (swap! pending conj {:ids ids :i 0 :out [] :ns [] :next (ids 0) :max-tokens max-tokens :on-token on-token :resolve resolve :sample sample})
+                 (when-not @ticking (reset! ticking true) (tick!)))))
+(defn submit
+  "The request path: the batch scheduler when batch-rows > 0 (greedy, no prefill chunks), else the serial shell."
+  [ids max-tokens on-token sample]
+  (if (pos? batch-rows)
+    (run-batched ids max-tokens on-token sample)
+    (enqueue #(run-request ids max-tokens on-token sample))))
+(defn sample-of
+  "The request's sampler parameters, or nil for greedy (temperature 0)."
+  [body]
+  (let [T (if (some? (.-temperature body)) (js/Number (.-temperature body)) 1.0)
+        tp (if (some? (.-top_p body)) (js/Number (.-top_p body)) 1.0)
+        seed (if (some? (.-seed body)) (bit-and (js/Number (.-seed body)) 0xFFFFFFFF) (js/Math.floor (* (js/Math.random) 4294967296)))]
+    (when (pos? T) {:T T :top-p tp :seed seed})))
+;; --- streaming ---
+(defn sse-writer [res]
+  (.writeHead res 200 #js {"Content-Type" "text/event-stream" "Cache-Control" "no-cache" "Connection" "keep-alive"})
+  (fn [obj] (.write res (str "data: " (if (string? obj) obj (js/JSON.stringify obj)) "\n\n"))))
+(defn stream-request
+  "Run IDS and write SSE chunks: (chunk-fn text-delta) per token, (final-fn finish usage timing) at the end."
+  [res ids max-tokens chunk-fn final-fn sample]
+  (let [send (sse-writer res) dec (js/TextDecoder. "utf-8") t0 (js/Date.now)
+        on-token (fn [id] (let [text (.decode dec (token-bytes id) #js {:stream true})] (when (seq text) (when-let [c (chunk-fn text)] (send c)))))]
+    (.then (submit ids max-tokens on-token sample)
+           (fn [{:keys [generated ns error finish]}]
+             (if error (send #js {:error #js {:message error :type "server_error"}})
+               (let [tail (.decode dec)]   ;; whatever an incomplete trailing sequence held
+                 (when (seq tail) (when-let [c (chunk-fn tail)] (send c)))
+                 (send (final-fn finish #js {:prompt_tokens (count ids) :completion_tokens (count generated) :total_tokens (+ (count ids) (count generated))}
+                                 #js {:ms_per_token (/ (reduce + ns) (max 1 (count ns)) 1e6) :steps (count ns) :wall_ms (- (js/Date.now) t0)}))))
+             (send "[DONE]") (.end res)))))
+(defn stream-completion [res body ids max-tokens]
+  (let [id (str "cmpl-" (js/Date.now)) created (quot (js/Date.now) 1000)]
+    (stream-request res ids max-tokens
+                    (fn [text] #js {:id id :object "text_completion" :created created :model model-id :choices #js [#js {:index 0 :text text :finish_reason nil}]})
+                    (fn [finish usage timing] #js {:id id :object "text_completion" :created created :model model-id :choices #js [#js {:index 0 :text "" :finish_reason finish}] :usage usage :timing timing})
+                    (sample-of body))))
+(defn stream-chat [res body ids max-tokens]
+  (let [id (str "chatcmpl-" (js/Date.now)) created (quot (js/Date.now) 1000) phase (atom :reasoning) buf (atom "")
+        ;; after </think> the newlines the template puts there are dropped; the first real text opens the content
+        recur-lead (fn [] (let [t (str/replace @buf #"^\n+" "")] (if (seq t) (do (reset! phase :content) (reset! buf "") #js {:content t}) nil)))]
+    (stream-request res ids max-tokens
+                    (fn [text]
+                      ;; before </think> the text is reasoning; the marker itself and the newlines after it are dropped
+                      (let [delta (case @phase
+                                    :reasoning (let [b (swap! buf str text) i (.indexOf b "</think>")]
+                                                 (if (neg? i) #js {:reasoning_content text}
+                                                   (do (reset! phase :lead) (reset! buf (subs b (+ i 8))) (recur-lead))))
+                                    :lead (do (swap! buf str text) (recur-lead))
+                                    #js {:content text})]
+                        (when delta
+                          #js {:id id :object "chat.completion.chunk" :created created :model model-id :choices #js [#js {:index 0 :delta delta :finish_reason nil}]})))
+                    (fn [finish usage timing] #js {:id id :object "chat.completion.chunk" :created created :model model-id :choices #js [#js {:index 0 :delta #js {} :finish_reason finish}] :usage usage :timing timing})
+                    (sample-of body))))
+(defn completion [body]
+  (let [prompt (or (.-prompt body) "") max-tokens (or (.-max_tokens body) 16) ids (encode-prompt prompt) t0 (js/Date.now) sample (sample-of body)]
+    (if (or (empty? ids) (not (pos? max-tokens)) (> (+ (count ids) max-tokens) context-size))
+      (js/Promise.resolve #js {:error #js {:message (if (empty? ids) "empty prompt" (str "prompt + max_tokens exceeds context " context-size)) :type "invalid_request_error"}})
+      (.then (submit ids max-tokens nil sample)
+             (fn [{:keys [generated ns error finish]}]
+               (if error
+                 #js {:error #js {:message error :type "server_error"}}
+                 #js {:id (str "cmpl-" (js/Date.now)) :object "text_completion" :created (quot (js/Date.now) 1000) :model model-id
+                      :seed (:seed sample) :temperature (:T sample 0) :top_p (:top-p sample)
+                      :choices #js [#js {:index 0 :text (decode generated) :finish_reason finish :token_ids (clj->js generated)}]
+                      :usage #js {:prompt_tokens (count ids) :completion_tokens (count generated) :total_tokens (+ (count ids) (count generated))}
+                      :timing #js {:ms_per_token (/ (reduce + ns) (max 1 (count ns)) 1e6) :steps (count ns) :wall_ms (- (js/Date.now) t0) :guest_steps @(:steps @guest)}}))))))
+(defn chat-completion [body]
+  (let [messages (or (.-messages body) #js []) max-tokens (or (.-max_tokens body) 256)
+        thinking? (not (false? (some-> body .-chat_template_kwargs .-enable_thinking)))
+        prompt (render-chat messages thinking?) ids (encode-prompt prompt) t0 (js/Date.now) sample (sample-of body)]
+    (if (or (zero? (.-length messages)) (not (pos? max-tokens)) (> (+ (count ids) max-tokens) context-size))
+      (js/Promise.resolve #js {:error #js {:message (if (zero? (.-length messages)) "no messages" (str "prompt + max_tokens exceeds context " context-size)) :type "invalid_request_error"}})
+      (.then (submit ids max-tokens nil sample)
+             (fn [{:keys [generated ns error finish]}]
+               (if error
+                 #js {:error #js {:message error :type "server_error"}}
+                 (let [[reasoning content] (split-think (decode generated))]
+                   #js {:id (str "chatcmpl-" (js/Date.now)) :object "chat.completion" :created (quot (js/Date.now) 1000) :model model-id
+                        :seed (:seed sample) :temperature (:T sample 0) :top_p (:top-p sample)
+                        :choices #js [#js {:index 0 :message #js {:role "assistant" :content content :reasoning_content reasoning} :finish_reason finish}]
+                        :usage #js {:prompt_tokens (count ids) :completion_tokens (count generated) :total_tokens (+ (count ids) (count generated))}
+                        :timing #js {:ms_per_token (/ (reduce + ns) (max 1 (count ns)) 1e6) :steps (count ns) :wall_ms (- (js/Date.now) t0) :guest_steps @(:steps @guest)}})))))))
+(def server
+  (http/createServer
+   (fn [req res]
+     (if (and (= "POST" (.-method req)) (contains? #{"/v1/completions" "/v1/chat/completions"} (.-url req)))
+       (let [chunks (atom [])]
+         (.on req "data" #(swap! chunks conj %))
+         (.on req "end" (fn []
+                          (try
+                          (let [body (try (js/JSON.parse (.toString (js/Buffer.concat (clj->js @chunks)) "utf8")) (catch :default _ nil))
+                                chat? (= "/v1/chat/completions" (.-url req))]
+                            (if (and body (true? (.-stream body)))
+                              (let [ids (encode-prompt (if chat? (render-chat (or (.-messages body) #js []) (not (false? (some-> body .-chat_template_kwargs .-enable_thinking)))) (or (.-prompt body) "")))
+                                    max-tokens (or (.-max_tokens body) (if chat? 256 16))]
+                                (if (or (empty? ids) (not (pos? max-tokens)) (> (+ (count ids) max-tokens) context-size))
+                                  (do (.writeHead res 400 #js {"Content-Type" "application/json"}) (.end res (js/JSON.stringify #js {:error #js {:message (if (empty? ids) "empty prompt" (str "prompt + max_tokens exceeds context " context-size)) :type "invalid_request_error"}})))
+                                  (if chat? (stream-chat res body ids max-tokens) (stream-completion res body ids max-tokens))))
+                              (.then (cond (nil? body) (js/Promise.resolve #js {:error #js {:message "bad json" :type "invalid_request_error"}})
+                                           chat? (chat-completion body)
+                                           :else (completion body))
+                                     (fn [out]
+                                       (.writeHead res (if (.-error out) (if (= "server_error" (.. out -error -type)) 500 400) 200) #js {"Content-Type" "application/json"})
+                                       (.end res (js/JSON.stringify out))))))
+                          (catch :default e
+                            (.writeHead res 400 #js {"Content-Type" "application/json"})
+                            (.end res (js/JSON.stringify #js {:error #js {:message (str (.-message e)) :type "invalid_request_error"}})))))))
+       (cond (and (= "GET" (.-method req)) (contains? #{"/health" "/"} (.-url req)))
+             (do (.writeHead res 200 #js {"Content-Type" "application/json"}) (.end res (js/JSON.stringify #js {:status "ok" :guest (if @guest "resident" "spawning") :guest_steps (if @guest @(:steps @guest) 0)})))
+             (and (= "GET" (.-method req)) (= "/slots" (.-url req)))   ;; llama-server's shape, read by the gateway's capacity probe: one slot, busy while a step is in flight
+             (do (.writeHead res 200 #js {"Content-Type" "application/json"}) (.end res (js/JSON.stringify #js [#js {:id 0 :is_processing (boolean (some-> @guest :waiter deref)) :n_ctx context-size}])))
+             (and (= "GET" (.-method req)) (= "/v1/models" (.-url req)))
+             (do (.writeHead res 200 #js {"Content-Type" "application/json"}) (.end res (js/JSON.stringify #js {:object "list" :data #js [#js {:id model-id :object "model" :owned_by "kotoba-lang"}]})))
+             :else (do (.writeHead res 404 #js {"Content-Type" "application/json"}) (.end res (js/JSON.stringify #js {:error "POST /v1/completions | /v1/chat/completions, GET /health | /slots | /v1/models"}))))))))
+(.listen server (js/parseInt port)
+         (fn [] (spawn-guest!) (println (str "SERVE\t" model-id "\thttp://0.0.0.0:" port "/v1/{chat/,}completions\tguest " bin " @" offset "\tsteps-per-life " steps-per-life "\tprefill-bucket " prefill-bucket "\tbatch-rows " batch-rows))))

@@ -1,0 +1,469 @@
+(ns kotodama.inference.ollama-server-test
+  (:require [json.data-json :as json]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [kotodama.inference.host.ollama-server :as server])
+  (:import [java.net URI]
+           [java.net.http HttpClient HttpRequest HttpRequest$BodyPublishers
+            HttpResponse$BodyHandlers]
+           [java.time Instant]))
+
+(defn- request [port method path body]
+  (let [builder (-> (HttpRequest/newBuilder
+                     (URI/create (str "http://127.0.0.1:" port path)))
+                    (.header "content-type" "application/json"))
+        request (case method
+                  :get (.GET builder)
+                  :post (.POST builder (HttpRequest$BodyPublishers/ofString
+                                        (json/write-str body))))
+        response (.send (HttpClient/newHttpClient)
+                        (.build request)
+                        (HttpResponse$BodyHandlers/ofString))]
+    {:status (.statusCode response)
+     :content-type (some-> (.firstValue (.headers response) "content-type") (.orElse nil))
+     :body (.body response)}))
+
+(defn- parsed [response]
+  (json/read-str (:body response) :key-fn keyword))
+
+(defn- fixture []
+  (let [loads (atom 0)
+        closes (atom 0)
+        sessions (atom [])
+        models {"fixture:latest"
+                {:name "fixture:latest"
+                 :model "fixture:latest"
+                 :modified_at "2026-07-13T00:00:00Z"
+                 :size 42
+                 :digest "sha256:fixture"
+                 :details {:format "gguf" :family "gemma4"
+                           :parameter_size "8.0B"
+                           :quantization_level "Q4_K_M"}
+                 ;; Explicit delimiters rather than a Go template: this
+                 ;; runtime does not implement Go templates and will not
+                 ;; invent markers for a model whose real ones it has not
+                 ;; read. Role codes come from ollama-chat-core.
+                 :kotodama/chat {:turn-open {2 "<u>" 3 "<a>" 1 "<s>" 4 "<t>"}
+                                 :turn-close "</>"
+                                 :generation-open "<a>"}}
+                "no-template:latest"
+                {:name "no-template:latest"
+                 :model "no-template:latest"
+                 :details {:format "gguf" :family "gemma4"}}}
+        running
+        (server/start-server!
+         {:port 0
+          :service-opts
+          {:models models
+           :load-fn (fn [opts]
+                      (swap! loads inc)
+                      {:id @loads :opts opts})
+           :generate-fn
+           (fn [{:keys [kotodama/session kotodama/on-token]}]
+             (swap! sessions conj session)
+             (when on-token
+               (on-token 11 " Paris" 10)
+               (on-token 12 "." 20))
+             {:kotodama/prompt-token-ids [2 3 4]
+              :kotodama/generated-token-ids [11 12]
+              :kotodama/text " Paris."
+              :kotodama/stop-reason :max-tokens})
+           :close-fn (fn [_] (swap! closes inc))}})]
+    {:running running :loads loads :closes closes :sessions sessions}))
+
+(deftest ollama-compatible-discovery-and-lifecycle
+  (let [{:keys [running loads closes]} (fixture)
+        port (:port running)]
+    (try
+      (testing "tags advertises configured GGUF metadata without loading it"
+        (let [response (request port :get "/api/tags" nil)
+              model (first (:models (parsed response)))]
+          (is (= 200 (:status response)))
+          (is (= "fixture:latest" (:name model)))
+          (is (= "Q4_K_M" (get-in model [:details :quantization_level])))
+          (is (zero? @loads))))
+      (testing "show and version expose Ollama-compatible objects"
+        (is (= "gemma4"
+               (get-in (parsed (request port :post "/api/show"
+                                        {:model "fixture:latest"}))
+                       [:details :family])))
+        (is (string? (:version (parsed (request port :get "/api/version" nil))))))
+      (testing "ps contains only lazily loaded models"
+        (is (empty? (:models (parsed (request port :get "/api/ps" nil))))))
+      (finally
+        (server/stop-server! running)))
+    (is (zero? @closes))))
+
+(deftest generate-supports-json-streaming-and-session-reuse
+  (let [{:keys [running loads closes sessions]} (fixture)
+        port (:port running)]
+    (try
+      (testing "non-streaming response includes generation accounting"
+        (let [response (request port :post "/api/generate"
+                                {:model "fixture:latest"
+                                 :prompt "The capital of France is"
+                                 :stream false
+                                 :options {:num_predict 2}})
+              body (parsed response)]
+          (is (= 200 (:status response)))
+          (is (= "application/json; charset=utf-8" (:content-type response)))
+          (is (= " Paris." (:response body)))
+          (is (= true (:done body)))
+          (is (= "length" (:done_reason body)))
+          (is (= 3 (:prompt_eval_count body)))
+          (is (= 2 (:eval_count body)))
+          (is (= [2 3 4 11 12] (:context body)))))
+      (testing "default streaming is newline-delimited and flushes token chunks"
+        (let [response (request port :post "/api/generate"
+                                {:model "fixture:latest" :prompt "x"})
+              chunks (mapv #(json/read-str % :key-fn keyword)
+                           (remove str/blank? (str/split-lines (:body response))))]
+          (is (= 200 (:status response)))
+          (is (= "application/x-ndjson; charset=utf-8" (:content-type response)))
+          (is (= [" Paris" "." ""] (mapv :response chunks)))
+          (is (= [false false true] (mapv :done chunks)))))
+      (testing "both requests shared one loaded model session"
+        (is (= 1 @loads))
+        (is (= 2 (count @sessions)))
+        (is (apply = @sessions))
+        (is (= ["fixture:latest"]
+               (mapv :name (:models (parsed (request port :get "/api/ps" nil)))))))
+      (finally
+        (server/stop-server! running)))
+    (is (= 1 @closes))))
+
+(deftest unknown-model-is-a-json-404
+  (let [{:keys [running]} (fixture)]
+    (try
+      (let [response (request (:port running) :post "/api/generate"
+                              {:model "missing" :prompt "x" :stream false})]
+        (is (= 404 (:status response)))
+        (is (= "model not found" (:error (parsed response)))))
+      (finally
+        (server/stop-server! running)))))
+
+;; ── session lifecycle (ollama-session-core) ──────────────────────────
+;; Before these, a loaded session lived until process exit: a 20 GiB
+;; dequantised Gemma4 was never given back. See ADR-2608138800.
+
+(deftest keep-alive-zero-unloads-when-the-request-is-answered
+  (let [{:keys [running loads closes]} (fixture)
+        port (:port running)]
+    (try
+      (let [response (request port :post "/api/generate"
+                              {:model "fixture:latest" :prompt "x" :stream false
+                               :keep_alive 0})]
+        (is (= 200 (:status response)))
+        (is (= 1 @loads))
+        (is (= 1 @closes) "keep_alive 0 means unload now, not at shutdown")
+        (is (empty? (:models (parsed (request port :get "/api/ps" nil))))))
+      (finally
+        (server/stop-server! running)))))
+
+(deftest the-reaper-unloads-only-what-has-gone-idle
+  (let [{:keys [running closes]} (fixture)
+        port (:port running)
+        service (:service running)]
+    (try
+      (request port :post "/api/generate"
+               {:model "fixture:latest" :prompt "x" :stream false :keep_alive 60})
+      (is (= [] (server/reap-expired! service (System/currentTimeMillis)))
+          "a session inside its keep-alive is left alone")
+      (is (zero? @closes))
+      (is (= ["fixture:latest"]
+             (server/reap-expired! service (+ (System/currentTimeMillis) 60001))))
+      (is (= 1 @closes))
+      (is (empty? (:models (parsed (request port :get "/api/ps" nil)))))
+      (finally
+        (server/stop-server! running)))))
+
+(deftest ps-reports-a-future-expiry-not-the-last-use
+  (let [{:keys [running]} (fixture)
+        port (:port running)]
+    (try
+      (request port :post "/api/generate"
+               {:model "fixture:latest" :prompt "x" :stream false :keep_alive "1m"})
+      (let [entry (first (:models (parsed (request port :get "/api/ps" nil))))
+            loaded (Instant/parse (:loaded_at entry))
+            expires (Instant/parse (:expires_at entry))]
+        (is (.isAfter expires loaded))
+        (is (<= 59 (.between java.time.temporal.ChronoUnit/SECONDS loaded expires) 61)
+            "keep_alive accepts Ollama duration strings, not only seconds"))
+      (finally
+        (server/stop-server! running)))))
+
+(deftest keep-alive-forever-never-expires
+  (let [{:keys [running closes]} (fixture)
+        port (:port running)
+        service (:service running)]
+    (try
+      (request port :post "/api/generate"
+               {:model "fixture:latest" :prompt "x" :stream false :keep_alive -1})
+      (is (= [] (server/reap-expired! service Long/MAX_VALUE)))
+      (is (zero? @closes))
+      (is (= "9999-12-31T23:59:59Z"
+             (:expires_at (first (:models (parsed (request port :get "/api/ps" nil)))))))
+      (finally
+        (server/stop-server! running)))))
+
+;; ── /api/chat (ollama-chat-core) ─────────────────────────────────────
+
+(deftest chat-renders-the-conversation-and-answers-with-a-message
+  (let [{:keys [running]} (fixture)
+        port (:port running)]
+    (try
+      (let [response (request port :post "/api/chat"
+                              {:model "fixture:latest" :stream false
+                               :messages [{:role "system" :content "be brief"}
+                                          {:role "user" :content "capital of France?"}]})
+            body (parsed response)]
+        (is (= 200 (:status response)))
+        (is (= "assistant" (get-in body [:message :role])))
+        (is (= " Paris." (get-in body [:message :content])))
+        (is (true? (:done body)))
+        (is (nil? (:response body)) "/api/chat carries message, not response")
+        (is (nil? (:context body)) "context is a /api/generate field"))
+      (finally (server/stop-server! running)))))
+
+(deftest chat-streams-message-deltas
+  (let [{:keys [running]} (fixture)
+        port (:port running)]
+    (try
+      (let [response (request port :post "/api/chat"
+                              {:model "fixture:latest"
+                               :messages [{:role "user" :content "x"}]})
+            chunks (mapv #(json/read-str % :key-fn keyword)
+                         (remove str/blank? (str/split-lines (:body response))))]
+        (is (= "application/x-ndjson; charset=utf-8" (:content-type response)))
+        (is (= [" Paris" "." ""] (mapv #(get-in % [:message :content]) chunks)))
+        (is (= [false false true] (mapv :done chunks))))
+      (finally (server/stop-server! running)))))
+
+(deftest chat-rejects-conversations-the-model-cannot-answer
+  (let [{:keys [running]} (fixture)
+        port (:port running)]
+    (try
+      (doseq [[label body expected]
+              [["empty messages"
+                {:model "fixture:latest" :messages [] :stream false}
+                "messages must not be empty"]
+               ["ends on assistant"
+                {:model "fixture:latest" :stream false
+                 :messages [{:role "user" :content "a"} {:role "assistant" :content "b"}]}
+                "the last message must be from user or tool"]
+               ["unknown role"
+                {:model "fixture:latest" :stream false
+                 :messages [{:role "moderator" :content "a"}]}
+                "unknown message role: \"moderator\""]]]
+        (testing label
+          (let [response (request port :post "/api/chat" body)]
+            (is (= 400 (:status response)))
+            (is (= expected (:error (parsed response)))))))
+      (finally (server/stop-server! running)))))
+
+(deftest chat-refuses-a-model-with-no-delimiters
+  ;; Rather than assembling a prompt from invented markers.
+  (let [{:keys [running loads]} (fixture)
+        port (:port running)]
+    (try
+      (let [response (request port :post "/api/chat"
+                              {:model "no-template:latest" :stream false
+                               :messages [{:role "user" :content "x"}]})]
+        (is (= 400 (:status response)))
+        (is (= "model has no chat template configured" (:error (parsed response))))
+        (is (zero? @loads) "a model that cannot be rendered must not be loaded"))
+      (finally (server/stop-server! running)))))
+
+(deftest chat-prompt-is-the-rendered-conversation
+  ;; The generate-fn records what it was asked to complete, so the rendering
+  ;; is asserted rather than inferred from the reply.
+  (let [seen (atom nil)
+        running (server/start-server!
+                 {:port 0
+                  :service-opts
+                  {:models {"m" {:name "m" :model "m"
+                                 :kotodama/chat {:turn-open {1 "<s>" 2 "<u>" 3 "<a>" 4 "<t>"}
+                                                 :turn-close "</>"
+                                                 :generation-open "<a>"}}}
+                   :load-fn (fn [_] {:id 1})
+                   :generate-fn (fn [opts]
+                                  (reset! seen (:kotodama/prompt opts))
+                                  {:kotodama/text "ok"
+                                   :kotodama/prompt-token-ids []
+                                   :kotodama/generated-token-ids []
+                                   :kotodama/stop-reason :eos})
+                   :close-fn (fn [_] nil)}})]
+    (try
+      (request (:port running) :post "/api/chat"
+               {:model "m" :stream false
+                :messages [{:role "system" :content "S"}
+                           {:role "user" :content "U"}]})
+      (is (= "<s>S</><u>U</><a>" @seen))
+      (finally (server/stop-server! running)))))
+
+;; ── /v1 (openai-chat-core) ───────────────────────────────────────────
+
+(deftest openai-completion-envelope
+  (let [{:keys [running]} (fixture)
+        port (:port running)]
+    (try
+      (let [response (request port :post "/v1/chat/completions"
+                              {:model "fixture:latest"
+                               :messages [{:role "user" :content "capital of France?"}]})
+            body (parsed response)
+            choice (first (:choices body))]
+        (is (= 200 (:status response)))
+        (is (= "application/json; charset=utf-8" (:content-type response))
+            "absent stream means ONE json object, not SSE")
+        (is (= "chat.completion" (:object body)))
+        (is (str/starts-with? (:id body) "chatcmpl-"))
+        (is (= 0 (:index choice)))
+        (is (= "assistant" (get-in choice [:message :role])))
+        (is (= " Paris." (get-in choice [:message :content])))
+        (is (= "length" (:finish_reason choice)))
+        (is (= {:prompt_tokens 3 :completion_tokens 2 :total_tokens 5} (:usage body))))
+      (finally (server/stop-server! running)))))
+
+(deftest openai-streams-sse-only-when-asked
+  (let [{:keys [running]} (fixture)
+        port (:port running)]
+    (try
+      (let [response (request port :post "/v1/chat/completions"
+                              {:model "fixture:latest" :stream true
+                               :messages [{:role "user" :content "x"}]})
+            frames (->> (str/split (:body response) #"\n\n")
+                        (remove str/blank?)
+                        (mapv str/trim))
+            payloads (mapv #(str/replace-first % "data: " "") frames)]
+        (is (str/starts-with? (:content-type response) "text/event-stream"))
+        (is (= "[DONE]" (last payloads))
+            "without [DONE] a client cannot tell finished from dropped")
+        (let [events (mapv #(json/read-str % :key-fn keyword) (butlast payloads))]
+          (is (every? #(= "chat.completion.chunk" (:object %)) events))
+          (is (= [" Paris" "." nil]
+                 (mapv #(get-in % [:choices 0 :delta :content]) events)))
+          (is (= [nil nil "length"]
+                 (mapv #(get-in % [:choices 0 :finish_reason]) events)))
+          (is (apply = (mapv :id events)) "every chunk shares one completion id")))
+      (finally (server/stop-server! running)))))
+
+(deftest openai-rejects-multiple-choices
+  (let [{:keys [running]} (fixture)]
+    (try
+      (let [response (request (:port running) :post "/v1/chat/completions"
+                              {:model "fixture:latest" :n 3
+                               :messages [{:role "user" :content "x"}]})]
+        (is (= 400 (:status response)))
+        (is (= "only n=1 is supported" (:error (parsed response)))))
+      (finally (server/stop-server! running)))))
+
+(deftest openai-shares-the-conversation-rules
+  ;; Same core as /api/chat: the admissible final role is not re-decided.
+  (let [{:keys [running]} (fixture)]
+    (try
+      (let [response (request (:port running) :post "/v1/chat/completions"
+                              {:model "fixture:latest"
+                               :messages [{:role "user" :content "a"}
+                                          {:role "assistant" :content "b"}]})]
+        (is (= 400 (:status response)))
+        (is (= "the last message must be from user or tool" (:error (parsed response)))))
+      (finally (server/stop-server! running)))))
+
+(deftest openai-lists-models
+  (let [{:keys [running]} (fixture)]
+    (try
+      (let [body (parsed (request (:port running) :get "/v1/models" nil))
+            ids (mapv :id (:data body))]
+        (is (= "list" (:object body)))
+        (is (= ["fixture:latest" "no-template:latest"] ids))
+        (is (every? #(= "model" (:object %)) (:data body))))
+      (finally (server/stop-server! running)))))
+
+;; ── memory budget (ollama-session-core) ──────────────────────────────
+;; The budget existed as a rule with no input: the host never measured
+;; anything and always passed 0, so evict-for-load? could not fire.
+
+(defn- sized-fixture [budget]
+  (let [loads (atom 0) closes (atom [])
+        spec (fn [n size] {:name n :model n :size size
+                           :details {:format "gguf" :family "gemma4"}})
+        running (server/start-server!
+                 {:port 0
+                  :service-opts
+                  {:memory-budget-bytes budget
+                   :models {"small" (spec "small" 100)
+                            "also-small" (spec "also-small" 100)
+                            "third-small" (spec "third-small" 100)
+                            "huge" (spec "huge" 10000)}
+                   :load-fn (fn [opts] (swap! loads inc) {:m (:kotodama/model opts)})
+                   :generate-fn (fn [_] {:kotodama/text "x"
+                                         :kotodama/prompt-token-ids []
+                                         :kotodama/generated-token-ids []
+                                         :kotodama/stop-reason :eos})
+                   :close-fn (fn [session] (swap! closes conj (:m session)))}})]
+    {:running running :loads loads :closes closes}))
+
+(defn- generate! [port model]
+  (request port :post "/api/generate"
+           {:model model :prompt "x" :stream false :keep_alive 3600}))
+
+(deftest a-load-that-would-exceed-the-budget-evicts-the-least-recently-used
+  (let [{:keys [running closes]} (sized-fixture 250)
+        port (:port running)]
+    (try
+      (is (= 200 (:status (generate! port "small"))))
+      (is (= 200 (:status (generate! port "also-small"))))
+      (is (= [] @closes) "200 of 250 fits; nothing should have been unloaded")
+      ;; A third 100 would make 300 > 250, so the least recently used goes.
+      (is (= 200 (:status (generate! port "third-small"))))
+      (is (= ["small"] @closes) "the oldest, not an arbitrary one")
+      (is (= #{"also-small" "third-small"}
+             (set (mapv :name (:models (parsed (request port :get "/api/ps" nil)))))))
+      (finally (server/stop-server! running)))))
+
+(deftest a-model-larger-than-the-budget-is-refused-without-evicting-anything
+  ;; Unloading every working session to serve a request that was always going
+  ;; to fail is worse than the failure.
+  (let [{:keys [running closes loads]} (sized-fixture 250)
+        port (:port running)]
+    (try
+      (is (= 200 (:status (generate! port "small"))))
+      (let [response (generate! port "huge")]
+        (is (= 500 (:status response)))
+        (is (= "model exceeds the configured memory budget" (:error (parsed response)))))
+      (is (= [] @closes) "the resident session must survive a refused load")
+      (is (= 1 @loads))
+      (is (= ["small"] (mapv :name (:models (parsed (request port :get "/api/ps" nil))))))
+      (finally (server/stop-server! running)))))
+
+(deftest an-unset-budget-admits-everything
+  ;; 0 is "not measured", not "no memory".
+  (let [{:keys [running closes]} (sized-fixture 0)
+        port (:port running)]
+    (try
+      (doseq [m ["small" "also-small" "third-small" "huge"]]
+        (is (= 200 (:status (generate! port m)))))
+      (is (= [] @closes))
+      (is (= 4 (count (:models (parsed (request port :get "/api/ps" nil))))))
+      (finally (server/stop-server! running)))))
+
+(deftest keep-alive-accepts-compound-durations
+  ;; Go's ParseDuration concatenates components, which is what Ollama
+  ;; accepts. Reading only the first made "1h30m" mean one hour.
+  (let [{:keys [running]} (fixture)
+        port (:port running)
+        expiry-seconds (fn [keep-alive]
+                         (request port :post "/api/generate"
+                                  {:model "fixture:latest" :prompt "x" :stream false
+                                   :keep_alive keep-alive})
+                         (let [entry (first (:models (parsed (request port :get "/api/ps" nil))))]
+                           (.between java.time.temporal.ChronoUnit/SECONDS
+                                     (Instant/parse (:loaded_at entry))
+                                     (Instant/parse (:expires_at entry)))))]
+    (try
+      (is (<= 5399 (expiry-seconds "1h30m") 5401))
+      (is (<= 5429 (expiry-seconds "90m30s") 5431))
+      (is (<= 59 (expiry-seconds "1m") 61))
+      (is (<= 299 (expiry-seconds "not-a-duration") 301)
+          "unparseable takes the default rather than a partial reading")
+      (finally (server/stop-server! running)))))

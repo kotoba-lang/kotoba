@@ -1,0 +1,103 @@
+#version 450
+// One recurrent (gated delta-net) step for ONE head per workgroup, fused (iteration 24):
+//   gate_decay2 (decay g, beta) + conv1d_step (+silu) on the head's q / k / v channels +
+//   l2norm of q (scaled) and k + the delta rule on S + gated rmsnorm x silu(z)
+// -- seven dispatches and five barriers of the unfused path become one dispatch.
+// The conv ring is DOUBLE-BUFFERED by the position's parity (pos from binding 12):
+// q / k channels are shared by two heads (h and h + 16), so every head reads slot
+// p and only the owning head (h == kh) writes slot 1 - p; v channels are per head.
+// Dispatch: (heads, 1, 1). 512 threads: thread (j = t & 127, part = t >> 7) owns value
+// column j and a quarter of the key dimension in the two state loops (iteration 26:
+// the 128-step serial loops of the 128-thread version were the B70 layer's largest
+// latency item; the quarters are reduced through shared memory).
+layout(local_size_x = 512) in;
+layout(std430, binding = 0) readonly buffer Meta { uint heads; uint k_dim; uint v_dim; uint k_heads; uint v_off; uint n; float eps; float qscale; } P;
+layout(std430, binding = 1) readonly buffer QKV { float qkv[]; };      // kdot output: q | k | v, n channels
+layout(std430, binding = 2) readonly buffer CW { float convw[]; };     // (n, 4) channel-major
+layout(std430, binding = 3) buffer Ring { float ring[]; };             // 2 slots x 3 x n
+layout(std430, binding = 4) readonly buffer Al { float alpha[]; };
+layout(std430, binding = 5) readonly buffer Bl { float betaL[]; };
+layout(std430, binding = 6) readonly buffer Dt { float dt[]; };
+layout(std430, binding = 7) readonly buffer Aa { float ssm_a[]; };
+layout(std430, binding = 8) buffer St { float state[]; };
+layout(std430, binding = 9) readonly buffer Nw { float ssm_norm[]; };
+layout(std430, binding = 10) readonly buffer Z { float z[]; };
+layout(std430, binding = 11) buffer Out { float outp[]; };
+layout(std430, binding = 12) readonly buffer Pos { uint pos[]; };   // pos[0]: absolute position (ring parity); pos[1]: row of the batched inputs this step reads (0 in decode; p in a prefill of P tokens, iteration 36)
+shared float sq[128]; shared float sk[128]; shared float red[512]; shared float cq[128]; shared float ck[128]; shared float cv[128]; shared float part4[4][128];
+float silu(float v) { return v / (1.0 + exp(-v)); }
+float sigmoid(float v) { return 1.0 / (1.0 + exp(-v)); }
+float softplus(float v) { return (v > 20.0) ? v : log(1.0 + exp(v)); }
+float wg_sum(uint t, float v) {
+  red[t] = v; barrier();
+  for (uint st = 256u; st > 0u; st >>= 1u) { if (t < st) red[t] += red[t + st]; barrier(); }
+  float r = red[0]; barrier(); return r;
+}
+// conv1d step + silu for channel c, reading ring slot p; returns the activation, writes slot 1-p if `own`
+// -DBATCH (iteration 51, C-4): the rows are INDEPENDENT SEQUENCES, row = workgroup y; binding 12 holds one
+// absolute position per row (pos[row]); the ring and the state are per row (row * their single-sequence size).
+#ifdef BATCH
+#define ROW gl_WorkGroupID.y
+#define MYPOS pos[ROW]
+#define SEQ ROW
+#elif defined(BPREFILL)
+// -DBPREFILL (iteration 57): a PREFILL of P positions of ONE batch sequence -- the stepbuf is [position, row, seq]
+#define ROW pos[1]
+#define MYPOS pos[0]
+#define SEQ pos[2]
+#else
+#define ROW pos[1]
+#define MYPOS pos[0]
+#endif
+float conv_step(uint c, uint p, bool own, uint qoff) {
+  uint n = P.n, rb = p * 3u * n, wb = (1u - p) * 3u * n;
+#if defined(BATCH) || defined(BPREFILL)
+  rb += SEQ * 6u * n; wb += SEQ * 6u * n;
+#endif
+  // position 0 has no history (iteration 43): a resident guest rewinds the position to 0 for a new
+  // request and never zeroes the ring or the state, so both read as zero when pos[0] == 0.
+  bool fresh = MYPOS == 0u;
+  float x0 = fresh ? 0.0 : ring[rb + c], x1 = fresh ? 0.0 : ring[rb + n + c], x2 = fresh ? 0.0 : ring[rb + 2u * n + c], x3 = qkv[qoff + c];
+  float y = convw[c * 4u] * x0 + convw[c * 4u + 1u] * x1 + convw[c * 4u + 2u] * x2 + convw[c * 4u + 3u] * x3;
+  if (own) { ring[wb + c] = x1; ring[wb + n + c] = x2; ring[wb + 2u * n + c] = x3; }
+  return silu(y);
+}
+void main() {
+  uint h = gl_WorkGroupID.x, t = gl_LocalInvocationID.x, j = t & 127u, part = t >> 7u;
+  uint K_ = P.k_dim, V_ = P.v_dim, kh = h % P.k_heads, p = MYPOS & 1u;
+  uint row = ROW;                             // prefill: which token of the batch (BATCH: which sequence); the kdot outputs are [P x n], alpha/beta [P x heads], z / out [P x heads*V_]
+  uint qoff = row * P.n, hoff = row * P.heads, voff = row * P.heads * V_;
+  // conv on this head's channels (part 0 only; the ring is written once): q (shared with head h + k_heads), k (same), v (own)
+  if (part == 0u) {
+    cq[j] = conv_step(kh * K_ + j, p, h == kh, qoff);
+    ck[j] = conv_step(P.k_heads * K_ + kh * K_ + j, p, h == kh, qoff);
+    cv[j] = conv_step(P.v_off + h * V_ + j, p, true, qoff);
+  }
+  barrier();
+  float qc = cq[j], kc = ck[j], vc = cv[j];
+  // l2 norms of the head's q and k (every part holds the same 128 values; only part 0 contributes to the sums)
+  float qn = qc * inversesqrt(wg_sum(t, (part == 0u) ? qc * qc : 0.0) + P.eps) * P.qscale;
+  float kn = kc * inversesqrt(wg_sum(t, (part == 0u) ? kc * kc : 0.0) + P.eps);
+  if (part == 0u) { sq[j] = qn; sk[j] = kn; }
+  barrier();
+  // gate and beta
+  float decay = exp(softplus(alpha[hoff + h] + dt[h]) * ssm_a[h]), b = sigmoid(betaL[hoff + h]);
+  // delta rule on the head's state (K_ x V_): this thread owns column j, keys [i0, i1)
+  uint sbase = h * K_ * V_, quarter = K_ / 4u, i0 = part * quarter, i1 = i0 + quarter;
+#if defined(BATCH) || defined(BPREFILL)
+  sbase += SEQ * P.heads * K_ * V_;
+#endif
+  float kv_mem = 0.0;
+  bool fresh = MYPOS == 0u;   // no history at position 0 (iteration 43)
+  for (uint i = i0; i < i1; i++) { float s_ = (fresh ? 0.0 : state[sbase + i * V_ + j]) * decay; state[sbase + i * V_ + j] = s_; kv_mem += s_ * sk[i]; }
+  part4[part][j] = kv_mem; barrier();
+  float delta = (vc - (part4[0][j] + part4[1][j] + part4[2][j] + part4[3][j])) * b;
+  barrier();
+  float o = 0.0;
+  for (uint i = i0; i < i1; i++) { float s_ = state[sbase + i * V_ + j] + sk[i] * delta; state[sbase + i * V_ + j] = s_; o += s_ * sq[i]; }
+  part4[part][j] = o; barrier();
+  o = part4[0][j] + part4[1][j] + part4[2][j] + part4[3][j];
+  // gated rmsnorm over the head's V_ outputs (part 0 contributes), times silu(z)
+  float inv = inversesqrt(wg_sum(t, (part == 0u) ? o * o : 0.0) / float(V_) + P.eps);
+  if (part == 0u) outp[voff + h * V_ + j] = o * inv * ssm_norm[j] * silu(z[voff + h * V_ + j]);
+}
