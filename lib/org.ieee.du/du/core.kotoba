@@ -1,0 +1,380 @@
+;; du -- POSIX du (IEEE Std 1003.1), the default block report and `-s`/`-a`.
+;;
+;;   du DIR...        every directory under each operand, then the operand
+;;   du -s DIR...     only the total for each operand
+;;   du -a DIR...     every FILE as well as every directory
+;;
+;; ## What du reports is BLOCKS, and blocks are not bytes
+;;
+;; Measured against /usr/bin/du on macOS 26.4 (Darwin 25.4.0), 2026-09-10.
+;; A 6-byte file reports 8 and an 18-byte file reports 8; a 5000-byte file
+;; reports 16. Those are 512-byte units taken from `st_blocks`, so `st_size`
+;; cannot produce them -- 6 bytes and 18 bytes occupy the same disk and a
+;; size-based sum would say 24 where du says 32.
+;;
+;; This is why the command reads wire 35's STAT form rather than the file:
+;; `"<path>STAT_SEP"` -> `"<mode> <size> <blocks> <isdir>"`, and field three
+;; is the number du prints. Directories on APFS measured `st_blocks` 0, so a
+;; directory's line is the sum of what is under it plus its own zero -- but
+;; the own-blocks term is added anyway, because 0 is a filesystem's answer
+;; and not a rule.
+;;
+;; ## The line, measured
+;;
+;; `"%lld\t%s\n"` -- the count, one TAB, the operand as it was written.
+;; There is no padding: `16<TAB>data/zz`. And the operand is echoed
+;; VERBATIM, which is visible in the trailing-slash case: `du data/aa/`
+;; prints `data/aa//b` and `data/aa/`. This implementation joins the same
+;; way, so it reproduces that.
+;;
+;; ## Order is readdir order and is NOT matched
+;;
+;; /usr/bin/du walks with fts and no comparison function, so siblings arrive
+;; in directory order. Measured on a directory holding `f1.txt`, `empty`,
+;; `zz`, `aa` and `mm`: du emitted them in exactly that sequence, which is
+;; neither sorted nor creation order. Wire 34 answers its listing sorted by
+;; bytes and has no request form that asks for readdir order.
+;;
+;; So the SEQUENCE cannot be reproduced and the test compares stdout as
+;; sorted lines, the same concession org-ieee-find makes for the same reason.
+;; What is reproduced exactly is every number, every path, all of stderr and
+;; the exit status.
+;;
+;; This implementation's own order is a property and is asserted separately:
+;; depth-first, siblings in byte order, every directory AFTER its contents.
+;;
+;; ## The walk is one worklist, not two functions
+;;
+;; Mutual recursion is unavailable -- a callee is declared before its caller
+;; -- so "sum this directory, which means summing its subdirectories" cannot
+;; be two functions calling each other. `walk` carries two "\n"-joined
+;; stacks instead:
+;;
+;;   stack   paths still to account for. A leading "!" marks the second
+;;           visit to a directory: the point at which its subtotal is known
+;;           and its line is printed. Popping directory D replaces it with
+;;           its children followed by "!D", which is what makes the output
+;;           post-order without a second traversal.
+;;   sums    one partial total per directory currently open, innermost
+;;           first. A file adds its blocks to the top; "!D" pops the top,
+;;           prints it and adds it to the enclosing frame.
+;;
+;; A path containing a newline would corrupt both stacks. So would a path
+;; beginning with "!", which cannot happen: every path here is absolute.
+;;
+;; ## What is NOT implemented, and why it is named rather than half-done
+;;
+;;   HARD LINKS are counted once by /usr/bin/du and every time by this one.
+;;   Measured: a directory holding a file and a hard link to it reports 16
+;;   under du -- the link is not even listed by `du -a` -- and would report
+;;   24 here. du remembers (device, inode) pairs; the STAT form answers
+;;   neither, so this cannot be fixed in the guest. Fixtures contain no hard
+;;   links and the README says so.
+;;
+;;   SYMLINKS are listed by du with their own block count. Wire 35 opens
+;;   O_NOFOLLOW, so a symlink answers the empty string here and is skipped
+;;   entirely: not counted, not printed. Fixtures contain none.
+;;
+;;   NO OPERAND. POSIX defaults to `.`; there is no working-directory
+;;   capability and wire 35 requires an absolute path, so this refuses with
+;;   a diagnostic instead of guessing. All operands must be absolute.
+;;
+;;   -A -c -l -n -x -H -L -P -g -h -k -m -d -B -I -t are not implemented.
+;;   They are REFUSED with du's own usage text rather than ignored, because
+;;   ignoring `-k` would print 512-byte units under a flag that asked for
+;;   1024-byte ones and look like a working answer.
+;;
+;; Capabilities: :fs/browse (34), :fs/app-data (35), :io/write (37),
+;; :cli/args (38), :io/write-error (39).
+(ns du.core (:export [main]))
+
+(defn arg [i :string] :string
+  (typed-cap-call :cli/args :string :string i))
+
+(defn emit [s :string] :string
+  (typed-cap-call :io/write :string :string s))
+
+(defn emit-error [s :string] :string
+  (typed-cap-call :io/write-error :string :string s))
+
+(defn listing [dir :string] :string
+  (typed-cap-call :fs/browse :string :string dir))
+
+;; "<mode> <size> <blocks> <isdir>", or "" when the path cannot be stat'ed --
+;; missing, a symlink (the host opens O_NOFOLLOW), or a directory this run
+;; may not read. The empty answer is the only way a guest learns that; the
+;; READ form traps, and a trap cannot be caught.
+(defn stat-of [path :string] :string
+  (typed-cap-call :fs/app-data :string :string
+                  (string-concat path "STAT_SEP")))
+
+(defn nl [] :string
+  (string-substring "a
+b" 1 2))
+
+(defn tab [] :string
+  (string-substring "a	b" 1 2))
+
+(defn digit-text [d :i64] :string
+  (string-substring "0123456789" d (+ d 1)))
+
+(defn decimal-of [n :i64] :string
+  (if (< n 10)
+    (digit-text n)
+    (string-concat (decimal-of (quot n 10))
+                   (digit-text (- n (* 10 (quot n 10)))))))
+
+;; --- reading the wire answers -------------------------------------------
+
+(defn first-line [s :string] :string
+  (let [i (string-index-of s "\n")]
+    (if (< i 0) s (string-substring s 0 i))))
+
+(defn rest-lines [s :string] :string
+  (let [i (string-index-of s "\n")]
+    (if (< i 0) "" (string-substring s (+ i 1) (string-byte-length s)))))
+
+(defn field-head [s :string] :string
+  (let [i (string-index-of s " ")]
+    (if (< i 0) s (string-substring s 0 i))))
+
+(defn field-tail [s :string] :string
+  (let [i (string-index-of s " ")]
+    (if (< i 0) "" (string-substring s (+ i 1) (string-byte-length s)))))
+
+(defn digit-value [s :string i :i64] :i64
+  (let [c (string-code-point-at s i)]
+    (if (< c 48) -1 (if (> c 57) -1 (- c 48)))))
+
+(defn text->i64 [s :string i :i64 n :i64 acc :i64] :i64
+  (if (>= i n)
+    acc
+    (let [d (digit-value s i)]
+      (if (< d 0) -1 (text->i64 s (+ i 1) n (+ (* acc 10) d))))))
+
+(defn parse-num [s :string] :i64
+  (let [n (string-byte-length s)]
+    (if (= n 0) -1 (text->i64 s 0 n 0))))
+
+;; Field three of the STAT answer: the 512-byte units du prints.
+(defn stat-blocks [st :string] :i64
+  (parse-num (field-head (field-tail (field-tail st)))))
+
+;; Field four. "1" for a directory.
+(defn stat-dir? [st :string] :bool
+  (string=? (field-tail (field-tail (field-tail st))) "1"))
+
+;; One "NAME<TAB>D" listing line.
+(defn entry-name [line :string] :string
+  (let [i (string-index-of line (tab))]
+    (if (< i 0) line (string-substring line 0 i))))
+
+(defn join-path [dir :string name :string] :string
+  (string-concat (string-concat dir "/") name))
+
+;; --- the two stacks ------------------------------------------------------
+
+;; ITEMS then STACK, as one "\n"-joined list. Used to push onto the front of
+;; a stack and to append one path to a listing under construction.
+(defn join-lines [items :string stack :string] :string
+  (if (= (string-byte-length items) 0)
+    stack
+    (if (= (string-byte-length stack) 0)
+      items
+      (string-concat (string-concat items (nl)) stack))))
+
+;; Every entry of one listing as a full path, in the byte order wire 34 gave.
+(defn child-paths [dir :string rest :string acc :string] :string
+  (if (= (string-byte-length rest) 0)
+    acc
+    (child-paths dir (rest-lines rest)
+                 (join-lines acc
+                             (join-path dir (entry-name (first-line rest)))))))
+
+(defn sums-top [sums :string] :i64
+  (parse-num (first-line sums)))
+
+(defn sums-add [sums :string n :i64] :string
+  (join-lines (decimal-of (+ (sums-top sums) n)) (rest-lines sums)))
+
+(defn marked? [s :string] :bool
+  (string=? (string-substring s 0 1) "!"))
+
+(defn unmark [s :string] :string
+  (string-substring s 1 (string-byte-length s)))
+
+(defn print-entry [blocks :i64 path :string] :i64
+  (do (emit (decimal-of blocks))
+      (emit (tab))
+      (emit path)
+      (emit (nl))
+      0))
+
+;; --- the walk ------------------------------------------------------------
+;;
+;; MODE: 0 = directories only, 1 = -a (files too), 2 = -s (the operand only).
+;;
+;; Under -s the operand's own line is the one whose enclosing sums stack is
+;; the single root frame -- so "is this the outermost directory" is asked of
+;; the accumulator and needs no depth counter, which would have been a sixth
+;; thing to carry.
+(defn walk [stack :string sums :string mode :i64] :i64
+  (if (= (string-byte-length stack) 0)
+    0
+    (let [head (first-line stack)
+          rest (rest-lines stack)]
+      (if (marked? head)
+        (let [total (sums-top sums)
+              outer (rest-lines sums)]
+          (do
+            (if (if (= mode 2) (< (string-index-of outer "\n") 0) true)
+              (print-entry total (unmark head))
+              0)
+            (walk rest (sums-add outer total) mode)))
+        (let [st (stat-of head)]
+          (if (= (string-byte-length st) 0)
+            (walk rest sums mode)
+            (if (stat-dir? st)
+              (walk (join-lines (child-paths head (listing head) "")
+                                (join-lines (string-concat "!" head) rest))
+                    (join-lines (decimal-of (stat-blocks st)) sums)
+                    mode)
+              (do
+                (if (= mode 1) (print-entry (stat-blocks st) head) 0)
+                (walk rest (sums-add sums (stat-blocks st)) mode)))))))))
+
+;; --- option parsing ------------------------------------------------------
+;;
+;; BSD getopt stops at the first non-option, so `du DIR -s` treats `-s` as an
+;; operand -- measured: it reported `du: -s: No such file or directory` and
+;; still walked DIR. Flags are leading only here for the same reason.
+
+(defn option-arg? [s :string] :bool
+  (if (> (string-byte-length s) 1)
+    (string=? (string-substring s 0 1) "-")
+    false))
+
+(defn terminator? [s :string] :bool
+  (string=? s "--"))
+
+;; The index of the first operand: past every leading option cluster, and
+;; past a `--` if one closed them.
+(defn first-operand [i :i64 total :string] :i64
+  (if (string=? (decimal-of i) total)
+    i
+    (let [s (arg (decimal-of i))]
+      (if (terminator? s)
+        (+ i 1)
+        (if (option-arg? s) (first-operand (+ i 1) total) i)))))
+
+(defn cluster-has? [s :string j :i64 n :i64 c :i64] :bool
+  (if (>= j n)
+    false
+    (if (= (string-code-point-at s j)
+           c)
+      true
+      (cluster-has? s (+ j 1) n c))))
+
+(defn has-flag? [i :i64 total :string c :i64] :bool
+  (if (string=? (decimal-of i) total)
+    false
+    (let [s (arg (decimal-of i))]
+      (if (terminator? s)
+        false
+        (if (option-arg? s)
+          (if (cluster-has? s 1 (string-byte-length s) c)
+            true
+            (has-flag? (+ i 1) total c))
+          false)))))
+
+;; The byte offset of the first character in this cluster that is neither
+;; `s` (115) nor `a` (97), or -1.
+(defn cluster-bad [s :string j :i64 n :i64] :i64
+  (if (>= j n)
+    -1
+    (let [c (string-code-point-at s j)]
+      (if (= c 115)
+        (cluster-bad s (+ j 1) n)
+        (if (= c 97) (cluster-bad s (+ j 1) n) j)))))
+
+;; argument index * 4096 + byte offset, or -1. Packed because a recursion
+;; carries back one i64 and the diagnostic needs both halves: du names the
+;; offending CHARACTER, not the argument it came in.
+(defn bad-option [i :i64 total :string] :i64
+  (if (string=? (decimal-of i) total)
+    -1
+    (let [s (arg (decimal-of i))]
+      (if (terminator? s)
+        -1
+        (if (option-arg? s)
+          (let [b (cluster-bad s 1 (string-byte-length s))]
+            (if (< b 0)
+              (bad-option (+ i 1) total)
+              (+ (* i 4096) b)))
+          -1)))))
+
+;; The UTF-8 width of the code point at an offset, so the offending
+;; character is cut on a code-point boundary even when it is not ASCII.
+(defn cp-width [c :i64] :i64
+  (if (< c 128) 1 (if (< c 2048) 2 (if (< c 65536) 3 4))))
+
+;; Measured byte for byte, 2026-09-10:
+;;   du -q DIR   -> `du: invalid option -- q` then the usage line, exit 64
+;;   du -a -s D  -> the usage line alone, exit 64
+(defn usage [] :i64
+  (do
+    (emit-error "usage: du [-Aclnx] [-H | -L | -P] [-g | -h | -k | -m] [-a | -s | -d depth] [-B blocksize] [-I mask] [-t threshold] [file ...]")
+    (emit-error (nl))
+    64))
+
+(defn invalid-option [packed :i64] :i64
+  (let [i (quot packed 4096)
+        off (- packed (* 4096 i))
+        s (arg (decimal-of i))
+        c (string-code-point-at s off)]
+    (do
+      (emit-error "du: invalid option -- ")
+      (emit-error (string-substring s off (+ off (cp-width c))))
+      (emit-error (nl))
+      (usage))))
+
+;; --- operands ------------------------------------------------------------
+
+(defn complain [path :string] :i64
+  (do (emit-error "du: ")
+      (emit-error path)
+      (emit-error ": No such file or directory")
+      (emit-error (nl))
+      1))
+
+;; A FILE named directly as an operand is printed whether or not -a was
+;; given -- measured: `du data/f1.txt` prints `0<TAB>data/f1.txt`, while the
+;; same file inside a directory appears only under -a.
+(defn each [i :i64 total :string mode :i64 failed :i64] :i64
+  (if (string=? (decimal-of i) total)
+    failed
+    (let [path (arg (decimal-of i))
+          st (stat-of path)]
+      (if (= (string-byte-length st) 0)
+        (do (complain path) (each (+ i 1) total mode 1))
+        (if (stat-dir? st)
+          (do (walk path "0" mode) (each (+ i 1) total mode failed))
+          (do (print-entry (stat-blocks st) path)
+              (each (+ i 1) total mode failed)))))))
+
+(defn main [] :i64
+  (let [total (arg "")
+        bad (bad-option 0 total)]
+    (if (>= bad 0)
+      (invalid-option bad)
+      (if (if (has-flag? 0 total 115) (has-flag? 0 total 97) false)
+        (usage)
+        (let [start (first-operand 0 total)
+              mode (if (has-flag? 0 total 97) 1
+                     (if (has-flag? 0 total 115) 2 0))]
+          (if (string=? (decimal-of start) total)
+            (do
+              (emit-error "du: no file operand, and this build has no working-directory capability")
+              (emit-error (nl))
+              1)
+            (each start total mode 0)))))))
