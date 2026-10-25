@@ -501,3 +501,5 @@ retains repository history and immutable dependency pins; the inventory records
 eligibility, while the linked Linear task records actual GitHub readback.
 
 `lib/kbb/` remains the existing guest script library.
+
+Official path and oracles: see [ORACLE.md](ORACLE.md).
