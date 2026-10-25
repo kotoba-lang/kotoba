@@ -1,0 +1,177 @@
+(ns yobidashi.home
+  "The home node: a user's own HLR, push server and voicemail box in one.
+
+  A user picks two or three home nodes (a Raspberry Pi at home, a community
+  server, a friend's rooftop node) and authorizes each with a device
+  certificate carrying the `:home` role. Callers learn the home nodes from the
+  user's contact card and send their invite to any of them.
+
+      enroll           user's root statements + policy → the home serves them
+      update-location  device-signed record of how to reach it now
+      handle-invite    monban decides; rings are scheduled for each device
+      handle-ack       a device answered; stop paging the others
+      tick             re-send rings into each device's next window until
+                       answered or expired (radio is lossy)
+
+  Pure state machine; effects are data:
+
+      {:effect :page  :device hex :packet ring-packet :transmit-at-ms t :bearer kw :call-id hex}
+      {:effect :reply :call-id hex :callback hex :status :paging|:voicemail|:rejected|:answered|:declined|:busy|:expired}"
+  (:require [nafuda.core :as n]
+            [nafuda.statement :as st]
+            [monban.policy :as policy]
+            [yobidashi.invite :as inv]
+            [yobidashi.ring :as ring]
+            [yobidashi.schedule :as sched]
+            [tsunagi.identity :as id]
+            [tsunagi.wire :as w]))
+
+(defn home
+  [identity]
+  {:identity identity
+   :users {}      ; root hex → {:statements [...] :policy cfg :policy-state {} :locations {device-hex loc}}
+   :calls {}})    ; call-id hex → {...}
+
+(defn- s [now-ms] (quot now-ms 1000))
+
+(defn enroll
+  "Serve the user whose root is `root-hex`. `statements` must include a
+  certificate authorizing this home node (`:home` role). Answers
+  `[home :enrolled]` or `[home :not-authorized]`."
+  [h root-hex statements policy-config now-ms]
+  (if (n/authorized? root-hex statements (:identity h) :home (s now-ms))
+    [(assoc-in h [:users root-hex] {:statements (vec statements)
+                                    :policy (assoc policy-config :callee root-hex)
+                                    :policy-state {}
+                                    :locations {}})
+     :enrolled]
+    [h :not-authorized]))
+
+(defn location
+  "A device's signed location record."
+  [device root-hex {:keys [profile bearers not-after]}]
+  (st/sign device {:nafuda/kind :location
+                   :yobidashi/root root-hex
+                   :yobidashi/profile profile
+                   :yobidashi/bearers (set bearers)
+                   :nafuda/not-after not-after}))
+
+(defn update-location
+  "Store a device's location record if the device may be paged for that user.
+  Answers `[home status]`."
+  [h loc now-ms]
+  (let [m (:statement loc)
+        root (:yobidashi/root m)
+        dev (:nafuda/signer m)
+        user (get-in h [:users root])]
+    (cond
+      (nil? user) [h :unknown-user]
+      (not (and (st/valid? loc) (= :location (:nafuda/kind m)) (st/in-force? loc (s now-ms))))
+      [h :invalid]
+      (not (n/authorized? root (:statements user) dev :page (s now-ms))) [h :not-authorized]
+      (not (contains? sched/profiles (:yobidashi/profile m))) [h :unknown-profile]
+      :else [(assoc-in h [:users root :locations dev] m) :stored])))
+
+(defn- page-effects [h call device-hex loc now-ms]
+  (let [device (id/public-only (w/unhex device-hex))
+        profile (get sched/profiles (:yobidashi/profile loc))
+        page-dest (id/destination-hash device ring/page-app)
+        bearers (:yobidashi/bearers loc)]
+    {:effect :page
+     :call-id (:call-id call)
+     :device device-hex
+     :bearer (cond (contains? bearers :mesh) :mesh
+                   (contains? bearers :lora) :lora
+                   :else (first (sort bearers)))
+     :transmit-at-ms (sched/transmit-at profile page-dest now-ms)
+     :packet (ring/build (:identity h) device
+                         {:call-id (w/unhex (:call-id call))
+                          :expires (:expires call)
+                          :verdict (:verdict call)
+                          :caller-root-hash (:hash (id/public-only (w/unhex (:caller call))))
+                          :callback (w/unhex (:callback call))
+                          :bearers (:bearers call)})}))
+
+(defn- live-devices [user now-ms]
+  (into {} (filter (fn [[_ loc]] (< (s now-ms) (:nafuda/not-after loc)))) (:locations user)))
+
+(defn handle-invite
+  "Decide and act on an invite bundle. Answers `{:home … :effects […]}`."
+  [h bundle now-ms]
+  (let [f (inv/fields bundle)
+        user (and f (get-in h [:users (:callee f)]))
+        reply (fn [h status extra]
+                {:home h
+                 :effects [(merge {:effect :reply :call-id (:call-id f) :callback (:callback f)
+                                   :status status}
+                                  extra)]})]
+    (cond
+      (nil? f) {:home h :effects []}
+      (nil? user) (reply h :rejected {:reason :unknown-callee})
+      (<= (:expires f) (s now-ms)) (reply h :expired {})
+      (contains? (:calls h) (:call-id f)) {:home h :effects []}
+      (not (n/authorized? (:caller f) (:attachments bundle) (:caller-device f) :call (s now-ms)))
+      (reply h :rejected {:reason :caller-device-not-certified})
+      :else
+      (let [{:keys [verdict reason state]}
+            (policy/decide (:policy user) (:policy-state user)
+                           {:caller (:caller f)
+                            :now (s now-ms)
+                            :stamp-target (inv/stamp-target (:call-id f) (:callee f) (:expires f))
+                            :stamp (:stamp f)
+                            :introductions (:attachments bundle)
+                            :memberships (:attachments bundle)
+                            :blocklists (get-in user [:policy :blocklists] [])})
+            h (assoc-in h [:users (:callee f) :policy-state] state)]
+        (case verdict
+          (:ring :screen)
+          (let [call (assoc f :verdict verdict :reason reason :status :paging
+                            :devices (set (keys (live-devices user now-ms))))
+                h (assoc-in h [:calls (:call-id f)] call)
+                pages (mapv (fn [[dev loc]] (page-effects h call dev loc now-ms))
+                            (sort-by key (live-devices user now-ms)))]
+            {:home h
+             :effects (into [{:effect :reply :call-id (:call-id f) :callback (:callback f)
+                              :status (if (seq pages) :paging :voicemail) :reason reason}]
+                            pages)})
+          :voicemail (reply h :voicemail {:reason reason})
+          (reply h :rejected {:reason reason}))))))
+
+(defn handle-ack
+  "A device answered a ring. Answers `{:home … :effects […]}`."
+  [h ack-packet now-ms]
+  (if-let [{:keys [call-id status device]} (ring/open-ack (:identity h) ack-packet)]
+    (let [cid (w/hex call-id)
+          call (get-in h [:calls cid])
+          dev (w/hex (:public device))]
+      (if (and call (contains? (:devices call) dev) (= :paging (:status call)))
+        (if (= :ringing status)
+          {:home (assoc-in h [:calls cid :ringing-on] dev) :effects []}
+          {:home (assoc-in h [:calls cid :status] status)
+           :effects [{:effect :reply :call-id cid :callback (:callback call)
+                      :status (case status :accepted :answered status) :device dev}]})
+        {:home h :effects []}))
+    {:home h :effects []}))
+
+(defn tick
+  "Re-page every still-paging call into each device's next window, and expire
+  calls nobody answered (the caller is told to leave voicemail)."
+  [h now-ms]
+  (reduce
+   (fn [{:keys [home effects]} [cid call]]
+     (cond
+       (not= :paging (:status call)) {:home home :effects effects}
+       (<= (:expires call) (s now-ms))
+       {:home (assoc-in home [:calls cid :status] :expired)
+        :effects (conj effects {:effect :reply :call-id cid :callback (:callback call)
+                                :status :voicemail :reason :no-answer})}
+       :else
+       (let [user (get-in home [:users (:callee call)])]
+         {:home home
+          :effects (into effects
+                         (keep (fn [dev]
+                                 (when-let [loc (get-in user [:locations dev])]
+                                   (page-effects home call dev loc now-ms))))
+                         (sort (:devices call)))})))
+   {:home h :effects []}
+   (sort-by key (:calls h))))
