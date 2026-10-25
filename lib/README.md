@@ -112,6 +112,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.sftp` | `org.ietf.sftp/src` | `kotobase.sftp.fs`, `kotobase.sftp.transport.sftp-subsystem`, `kotobase.sftp.transport.ssh`, `kotobase.sftp.transport.wire` (an external specification, publisher ietf.org) |
 | `org.ietf.smtp` | `org.ietf.smtp/src` | `smtp.client`, `smtp.protocol`, `smtp.transport` (an external specification, publisher ietf.org) |
 | `org.ietf.webdav` | `org.ietf.webdav/src` | `kotobase.protocols.http`, `kotobase.protocols.webdav` (an external specification, publisher ietf.org) |
+| `kotoba.loopRenderFidelity` | `kotoba.loopRenderFidelity/src` | `render-fidelity.gate`, `render-fidelity.main`, `render-fidelity.measure` (Kotoba project library) |
 | `kotoba.kekkaiCli` | `kotoba.kekkaiCli/src` | `kekkai.cli.commands`, `kekkai.cli.config`, `kekkai.cli.desired`, `kekkai.cli.main` (Kotoba project library) |
 | `kotoba.sdkPy` | `kotoba.sdkPy/src` | `etzhayyim-sdk.config`, `etzhayyim-sdk.errors`, `etzhayyim-sdk.llm`, `etzhayyim-sdk.metrics` (Kotoba project library) |
 | `kotoba.kotobaDelta` | `kotoba.kotobaDelta/src` | `delta.anchor`, `delta.op`, `delta.store` (Kotoba project library) |

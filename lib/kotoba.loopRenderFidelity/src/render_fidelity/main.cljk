@@ -1,0 +1,135 @@
+(ns render-fidelity.main
+  "The local runner: find a corpus, measure it, ratchet, append evidence.
+
+  ## Local, and why that is not a limitation
+
+  The corpus is whatever PDFs are on this machine — contracts, invoices,
+  papers, scans. They cannot be committed and should not be: they are
+  somebody's documents, and a renderer that is only ever tested against
+  fixtures is a renderer that is only ever right about fixtures. Everything
+  this session found came from real files.
+
+  So what is committed is the METRIC, not the corpus, and the ledger records
+  which corpus root produced each row. Two machines will not have the same
+  numbers, and comparing them would be meaningless — the ratchet compares a
+  machine with itself.
+
+  ## What a cloud gate could not do
+
+  `scripts/fleet-ci` runs on tailnet nodes with no local documents at all,
+  so this cannot be a fleet gate however much it looks like one. That is the
+  whole reason it is a local loop."
+  (:require [kotoba.io :as kio] [kotoba.lang.edn :as edn]
+            [clojure.java.io :as io]
+            [kotoba.lang.text :as str]
+            [render-fidelity.gate :as gate]
+            [render-fidelity.measure :as measure]))
+
+(def ^:private min-bytes 10240)
+
+(def ^:private read-timeout-ms
+  "How long a file gets to prove its bytes are local.
+
+  A file that is really on this disk answers in microseconds. A cloud
+  placeholder blocks — sometimes for minutes — and then throws
+  `IOException: Operation timed out`, which is a correct answer arriving far
+  too late to run a loop on."
+  400)
+
+(defn- has-local-bytes?
+  "Whether the file's bytes are really here.
+
+  Measured before this existed: a first pass over this machine's corpus came
+  back with 35 of 48 documents 'failing', and every one was a cloud
+  placeholder rather than a renderer error. A loop that counted those as
+  regressions would have been wrong on its first run and every run after.
+
+  Defined as *reading is instant*, because that is what the property
+  actually is. The obvious alternative — comparing allocated blocks against
+  length — is not portable: `unix:blocks` is not a recognised attribute on
+  this platform at all, which is how the first version of this found zero
+  documents in a directory full of them."
+  [^java.io.File f]
+  (and (.isFile f)
+       (>= (.length f) min-bytes)
+       (let [probe (future
+                     (try
+                       (with-open [in (io/input-stream f)]
+                         (let [head (byte-array 5)]
+                           (.read in head)
+                           (= "%PDF-" (String. head "ISO-8859-1"))))
+                       (catch Exception _ false)))
+             answer (deref probe read-timeout-ms ::timeout)]
+         (when (= ::timeout answer) (future-cancel probe))
+         (true? answer))))
+
+(defn corpus
+  "Readable PDFs under `root`, sampled to at most `limit`.
+
+  Spread across the walk rather than taken from the front: the first N
+  files of a directory walk are all in one directory, and one directory is
+  one producer. Every finding this loop exists for came from noticing that
+  producers differ."
+  [root limit]
+  (let [all (->> (file-seq (io/file root))
+                 (filter #(str/ends-with? (str/lower (.getName ^java.io.File %)) ".pdf"))
+                 (filter has-local-bytes?)
+                 (sort-by #(.getPath ^java.io.File %)))
+        step (max 1 (quot (count all) (max 1 limit)))]
+    (vec (take limit (take-nth step all)))))
+
+(defn- read-bytes [^java.io.File f]
+  (mapv #(bit-and (int %) 0xff) (kio/read-all-bytes f)))
+
+(defn- ledger-path [dir] (io/file dir "evidence.edn"))
+
+(defn- previous
+  "The last row for this corpus root, or nil.
+
+  Per root, because the ratchet compares like with like — a run over a
+  different directory is a different measurement and must not be allowed to
+  set or clear the bar for this one."
+  [dir root]
+  (let [f (ledger-path dir)]
+    (when (.exists f)
+      (->> (str/split-lines (slurp f))
+           (remove str/blank?)
+           (map edn/read-string)
+           (filter #(= root (:run/corpus %)))
+           last))))
+
+(defn- append!
+  "One line, appended. Never rewritten: this is a measurement series, and a
+  series somebody edits is a series that proves whatever they wanted."
+  [dir row]
+  (.mkdirs (io/file dir))
+  (spit (ledger-path dir) (str (pr-str row) "\n") :append true))
+
+(defn run
+  [{:keys [root limit evidence]}]
+  (let [files (corpus root limit)
+        results (mapv #(measure/measure-document (read-bytes %)) files)
+        summary (measure/summarise results)
+        prev (previous evidence root)
+        v (gate/verdict summary (:run/summary prev))
+        row {:run/corpus root
+             :run/documents (count files)
+             :run/summary summary
+             :run/pass? (:pass? v)
+             :run/findings (:findings v)}]
+    (append! evidence row)
+    {:summary summary :verdict v :targets (gate/targets summary)}))
+
+(defn -main [& args]
+  (let [opts (into {} (map vec (partition 2 args)))
+        root (get opts "--root")
+        limit (Integer/parseInt (get opts "--limit" "48"))
+        evidence (get opts "--evidence" "evidence")]
+    (when-not root
+      (println "usage: -M:run --root <dir> [--limit 48] [--evidence <dir>]")
+      (System/exit 2))
+    (let [{:keys [verdict] :as out} (run {:root root :limit limit :evidence evidence})]
+      (println (gate/render-report out))
+      ;; The exit code is the ratchet's, so a shell loop or a pre-commit
+      ;; hook can use this without parsing anything.
+      (System/exit (if (:pass? verdict) 0 1)))))
