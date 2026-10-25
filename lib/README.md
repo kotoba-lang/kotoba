@@ -223,6 +223,7 @@ The bundled standard libraries live in this repository:
 | `org.ethereum.jsonrpc` | `org.ethereum.jsonrpc/src` | `kotobase.ethereum.client`, `kotobase.ethereum.rpc` (an external specification, publisher ethereum.org) |
 | `org.ietf.hpke` | `org.ietf.hpke/src` | `hpke.core`, `hpke.dhkem`, `hpke.kdf` (an external specification, publisher ietf.org) |
 | `org.ietf.srtp` | `org.ietf.srtp/src` | `srtp.aes-cm`, `srtp.index`, `srtp.kdf`, `srtp.packet` (an external specification, publisher ietf.org) |
+| `kotoba.kotobaIso20022` | `kotoba.kotobaIso20022/src` | `` (Kotoba project library) |
 | `kotoba.kotobaActorSdk` | `kotoba.kotobaActorSdk/src` | `` (Kotoba project library) |
 | `kotoba.externalServiceAdapter` | `kotoba.externalServiceAdapter/src` | `` (Kotoba project library) |
 | `kotoba.kaigi` | `kotoba.kaigi/src` | `kaigi.invite`, `kaigi.model`, `kaigi.plan`, `kaigi.realtimekit` (Kotoba project library) |
