@@ -1,0 +1,136 @@
+(ns gmail.retry-test
+  (:require [kotoba.test :refer [deftest is]]
+            [gmail.client :as client]
+            [gmail.retry :as retry]))
+
+(deftest retryable-status-covers-429-and-5xx-only
+  (is (retry/retryable-status? 429))
+  (is (retry/retryable-status? 500))
+  (is (retry/retryable-status? 502))
+  (is (retry/retryable-status? 503))
+  (is (retry/retryable-status? 504))
+  ;; not retryable: client errors, success, and a nil status (no ex-data)
+  (is (not (retry/retryable-status? 400)))
+  (is (not (retry/retryable-status? 401)))
+  (is (not (retry/retryable-status? 403)))
+  (is (not (retry/retryable-status? 404)))
+  (is (not (retry/retryable-status? 200)))
+  (is (not (retry/retryable-status? nil))))
+
+(deftest backoff-delay-stays-within-the-full-jitter-window
+  ;; full jitter: delay in [0, min(max-ms, base*2^attempt)] for every attempt.
+  ;; Aggregate each attempt's draws into one assertion to keep the assertion
+  ;; count sane while still sampling widely for a bounds violation.
+  (dotimes [attempt 6]
+    (let [ceiling (min 30000 (* 500 (bit-shift-left 1 attempt)))
+          draws (repeatedly 40 #(retry/backoff-delay-ms attempt {:base-ms 500 :max-ms 30000}))]
+      (is (every? #(<= 0 % ceiling) draws))))
+  ;; the cap actually binds: once base*2^attempt exceeds max-ms every draw is
+  ;; within [0, max-ms].
+  (is (every? #(<= 0 % 1000)
+              (repeatedly 40 #(retry/backoff-delay-ms 20 {:base-ms 500 :max-ms 1000})))))
+
+#?(:clj
+(deftest with-retry-retries-a-retryable-failure-then-succeeds
+  (let [calls (atom 0)
+        sleeps (atom [])
+        thunk (fn []
+                (swap! calls inc)
+                (if (< @calls 3)
+                  (throw (ex-info "boom" {:status 503}))
+                  :ok))
+        result (retry/with-retry thunk {:max-attempts 5
+                                        :sleep-fn (fn [ms] (swap! sleeps conj ms))})]
+    (is (= :ok result))
+    (is (= 3 @calls))                 ; failed twice, succeeded on the third
+    (is (= 2 (count @sleeps)))        ; slept between each of the two retries
+    (is (every? #(<= 0 %) @sleeps)))))
+
+#?(:clj
+(deftest with-retry-reraises-original-once-attempts-exhausted
+  (let [calls (atom 0)
+        thunk (fn [] (swap! calls inc) (throw (ex-info "always down" {:status 500})))]
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"always down"
+         (retry/with-retry thunk {:max-attempts 3 :sleep-fn (fn [_])})))
+    (is (= 3 @calls)))))              ; exactly :max-attempts tries, no more
+
+#?(:clj
+(deftest with-retry-does-not-retry-a-non-retryable-status
+  (let [calls (atom 0)
+        thunk (fn [] (swap! calls inc) (throw (ex-info "denied" {:status 401})))]
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"denied"
+         (retry/with-retry thunk {:max-attempts 5 :sleep-fn (fn [_])})))
+    (is (= 1 @calls)))))              ; a 401 fails on the first try, no retry
+
+#?(:clj
+(deftest with-retry-does-not-retry-a-non-ex-info-throw
+  (let [calls (atom 0)
+        thunk (fn [] (swap! calls inc) (throw (RuntimeException. "network gone")))]
+    (is (thrown? RuntimeException
+                 (retry/with-retry thunk {:max-attempts 5 :sleep-fn (fn [_])})))
+    (is (= 1 @calls)))))             ; no :status => not retryable => surfaced now
+
+#?(:clj
+(deftest with-retry-preserves-a-legitimate-nil-return
+  ;; an empty-200 body makes the thunk return nil; that's success, not "retry".
+  (let [calls (atom 0)
+        thunk (fn [] (swap! calls inc) nil)]
+    (is (nil? (retry/with-retry thunk {:sleep-fn (fn [_])})))
+    (is (= 1 @calls)))))
+
+;; ── integration with gmail.client/request! ──
+
+#?(:clj
+(deftest request-without-retry-throws-immediately-on-first-failure
+  ;; backward-compat: omitting :retry must behave EXACTLY as before -- one
+  ;; call, throw on the first non-2xx.
+  (let [calls (atom 0)
+        http-fn (fn [_req] (swap! calls inc) {:status 503 :body "{\"error\":\"down\"}"})]
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"Gmail API request failed"
+         (client/request! "/threads" {:http-fn http-fn :token "t"})))
+    (is (= 1 @calls)))))            ; no retry when :retry is absent
+
+#?(:clj
+(deftest request-with-retry-retries-a-transient-503-then-succeeds
+  (let [calls (atom 0)
+        http-fn (fn [_req]
+                  (swap! calls inc)
+                  (if (< @calls 3)
+                    {:status 503 :body "{\"error\":\"down\"}"}
+                    {:status 200 :body "{\"threads\":[]}"}))
+        resp (client/request! "/threads"
+                              {:http-fn http-fn :token "t"
+                               :retry {:max-attempts 5 :sleep-fn (fn [_])}})]
+    (is (= {:threads []} resp))
+    (is (= 3 @calls)))))
+
+#?(:clj
+(deftest request-retry-true-uses-defaults-and-a-noop-is-not-required-to-pass-fast
+  ;; :retry true == default opts; give it a real (but tiny) base so the test
+  ;; still exercises the true-branch without a long sleep. It succeeds on the
+  ;; 2nd try, so at most one real sleep of <= base-ms occurs.
+  (let [calls (atom 0)
+        http-fn (fn [_req]
+                  (swap! calls inc)
+                  (if (< @calls 2)
+                    {:status 429 :body "{\"error\":\"rate\"}"}
+                    {:status 200 :body "{\"ok\":true}"}))
+        resp (client/request! "/threads"
+                              {:http-fn http-fn :token "t"
+                               :retry {:base-ms 1 :max-ms 1 :sleep-fn (fn [_])}})]
+    (is (= {:ok true} resp))
+    (is (= 2 @calls)))))
+
+#?(:clj
+(deftest request-with-retry-gives-up-on-a-non-retryable-401
+  (let [calls (atom 0)
+        http-fn (fn [_req] (swap! calls inc) {:status 401 :body "{\"error\":\"denied\"}"})]
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"Gmail API request failed"
+         (client/request! "/threads"
+                          {:http-fn http-fn :token "t"
+                           :retry {:max-attempts 5 :sleep-fn (fn [_])}})))
+    (is (= 1 @calls)))))
