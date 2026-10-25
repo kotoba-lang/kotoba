@@ -1,0 +1,462 @@
+(ns bacnet.core-test
+  (:require [kotoba.test :refer [deftest testing is run-tests]]
+            [bacnet.tags :as tags]
+            [bacnet.npdu :as npdu]
+            [bacnet.bvlc :as bvlc]
+            [bacnet.apdu :as apdu]
+            [bacnet.services :as services]))
+
+;; ══════════════════════════════════════════════════════════════════════
+;; bacnet.tags
+;; ══════════════════════════════════════════════════════════════════════
+
+(deftest object-identifier-pack-unpack
+  (testing "round-trip across the object-type/instance-number space, boundaries included"
+    (doseq [[type inst] [[0 0] [8 3456] [1023 4194303] [1 0] [0 4194303]
+                          [512 2097151] [1023 0] [0 1] [255 65535]]]
+      (let [packed (tags/pack-object-identifier type inst)]
+        (is (= :ok (:status packed)) (str "pack failed for " type "/" inst))
+        (let [unpacked (tags/unpack-object-identifier (:packed packed))]
+          (is (= type (:object-type unpacked)))
+          (is (= inst (:instance-number unpacked))))))))
+
+(deftest object-identifier-value-round-trip
+  (testing "encode-object-identifier-value / decode-object-identifier-value"
+    (doseq [[type inst] [[8 12] [0 0] [1023 4194303] [3 999999]]]
+      (let [enc (tags/encode-object-identifier-value {:object-type type :instance-number inst})]
+        (is (= :ok (:status enc)))
+        (is (= 4 (count (:bytes enc))) "wire encoding is always exactly 4 bytes")
+        (let [dec (tags/decode-object-identifier-value (:bytes enc))]
+          (is (= type (:object-type dec)))
+          (is (= inst (:instance-number dec))))))))
+
+(deftest object-identifier-range-errors
+  (testing "10-bit object-type, 22-bit instance-number are hard limits"
+    (is (= [:error :bacnet/object-type-out-of-range] (tags/pack-object-identifier 1024 0)))
+    (is (= [:error :bacnet/instance-number-out-of-range] (tags/pack-object-identifier 0 4194304)))))
+
+;; This is the constructed worked example from bacnet.tags' own docstring:
+;; object-type 1023 (0x3FF, the maximum) with instance 0 packs to the 32-bit
+;; pattern 0xFFC00000 — bytes FF C0 00 00. Not a published spec vector; hand
+;; -derived from the 10-bit/22-bit packing rule in Clause 20.2.14.
+(deftest object-identifier-worked-example
+  (testing "constructed, not a published spec vector — max object-type, instance 0"
+    (let [enc (tags/encode-object-identifier-value {:object-type 1023 :instance-number 0})]
+      (is (= [0xFF 0xC0 0x00 0x00] (:bytes enc))))))
+
+(deftest application-value-round-trip
+  (testing "every implemented primitive type round-trips through the application tag form"
+    (doseq [[type value] [[:null nil] [:boolean true] [:boolean false]
+                           [:unsigned 0] [:unsigned 1] [:unsigned 255] [:unsigned 4096]
+                           [:unsigned 16777216] [:unsigned 4000000000]
+                           [:signed 0] [:signed 127] [:signed -128] [:signed -1]
+                           [:signed 200] [:signed -200] [:signed 40000] [:signed -40000]
+                           [:enumerated 3] [:enumerated 200]
+                           [:object-identifier {:object-type 8 :instance-number 1234}]]]
+      (let [enc (tags/encode-application-value type value)]
+        (is (not= :error (first enc)) (str "encode failed for " type " " value))
+        (let [dec (tags/decode-application-value enc 0)]
+          (is (= :ok (:status dec)) (str "decode failed for " type " " value))
+          (is (= type (:type dec)))
+          (is (= value (:value dec)) (str type " " value " round-trip"))
+          (is (= (count enc) (:next dec)) "decode must consume the whole encoding"))))))
+
+(deftest boolean-application-vs-context-shapes-differ
+  (testing "application Boolean is 1 byte total; context Boolean is 2"
+    (is (= 1 (count (tags/encode-boolean-application true))))
+    (is (= 2 (count (tags/encode-context-tag 4 [1]))))
+    (is (= [0x11] (tags/encode-boolean-application true))  ; tag 1, class 0, lvt 1
+        "constructed, not a published spec vector")
+    (is (= [0x10] (tags/encode-boolean-application false)))))
+
+(deftest extended-tag-number-round-trip
+  (testing "tag numbers >= 15 use the extended-tag-number escape octet"
+    (let [enc (tags/encode-context-tag 20 [0x01 0x02])
+          hdr (tags/decode-tag-header enc 0)]
+      (is (= :ok (:status hdr)))
+      (is (= 20 (:tag-number hdr)))
+      (is (= true (:context? hdr)))
+      (is (= 2 (:length hdr)))
+      (is (= 2 (:next hdr)) "0xF nibble + one extended-tag-number octet"))))
+
+(deftest extended-length-round-trip
+  (testing "data length >= 5 needs the extended-length escape (lvt=5), across all three widths"
+    (doseq [n [5 253 254 255 300 65535 65536 70000]]
+      (let [data (vec (repeat n 0x42))
+            enc (tags/encode-context-tag 3 data)
+            hdr (tags/decode-tag-header enc 0)]
+        (is (= :ok (:status hdr)) (str "n=" n))
+        (is (= n (:length hdr)) (str "n=" n))
+        (is (= data (subvec (vec enc) (:next hdr) (+ (:next hdr) (:length hdr))))
+            (str "n=" n " data round-trip"))))))
+
+(deftest opening-closing-tag-round-trip
+  (doseq [tag-number [0 1 3 4 14 15 20 254]]
+    (let [open (tags/encode-opening-tag tag-number)
+          close (tags/encode-closing-tag tag-number)
+          open-hdr (tags/decode-tag-header open 0)
+          close-hdr (tags/decode-tag-header close 0)]
+      (is (= true (:opening? open-hdr)) (str "tag " tag-number))
+      (is (= tag-number (:tag-number open-hdr)))
+      (is (= true (:closing? close-hdr)))
+      (is (= tag-number (:tag-number close-hdr))))))
+
+(deftest truncated-tag-errors
+  (is (= [:error :bacnet/truncated-tag] (tags/decode-tag-header [] 0)))
+  (is (= [:error :bacnet/truncated-tag] (tags/decode-tag-header [0xF0] 0))
+      "extended tag number nibble (0xF0) but no following octet")
+  (is (= [:error :bacnet/truncated-tag] (tags/decode-tag-header [0x05] 0))
+      "lvt=5 extended-length escape but no length octet follows"))
+
+(deftest opening-tag-must-be-context-error
+  (testing "lvt=6/7 with the class bit clear is not a legal application encoding"
+    ;; hand-built byte: tag number 2, class bit 0 (application), lvt 6
+    (is (= [:error :bacnet/opening-tag-must-be-context] (tags/decode-tag-header [0x26] 0)))
+    (is (= [:error :bacnet/closing-tag-must-be-context] (tags/decode-tag-header [0x27] 0)))))
+
+(deftest unsigned-negative-rejected
+  (is (= [:error :bacnet/negative-unsigned] (tags/encode-unsigned-value -1))))
+
+(deftest signed-out-of-range-rejected
+  (is (= [:error :bacnet/signed-too-large] (tags/encode-signed-value 9000000))))
+
+;; ══════════════════════════════════════════════════════════════════════
+;; bacnet.npdu
+;; ══════════════════════════════════════════════════════════════════════
+
+(deftest npdu-round-trip-no-addresses
+  (let [enc (npdu/encode {} [0x10 0x00])]
+    (is (= :ok (:status enc)))
+    (let [dec (npdu/decode (:bytes enc))]
+      (is (= :ok (:status dec)))
+      (is (nil? (:destination dec)))
+      (is (nil? (:source dec)))
+      (is (nil? (:hop-count dec)) "no destination means no hop count at all")
+      (is (= [0x10 0x00] (:nsdu dec))))))
+
+(deftest npdu-round-trip-destination-broadcast
+  (let [enc (npdu/encode {:destination {:dnet 5 :dadr []}} [0xAA])]
+    (is (= :ok (:status enc)))
+    (let [dec (npdu/decode (:bytes enc))]
+      (is (= 5 (:dnet (:destination dec))))
+      (is (= [] (:dadr (:destination dec))))
+      (is (= 255 (:hop-count dec)) "default hop count is 255")
+      (is (= [0xAA] (:nsdu dec))))))
+
+(deftest npdu-round-trip-destination-and-source
+  (testing "hop count sits after BOTH address blocks, not right after DADR"
+    (let [enc (npdu/encode {:destination {:dnet 100 :dadr [0x01 0x02]}
+                             :source {:snet 50 :sadr [0x0A]}
+                             :expects-reply? true :priority 2 :hop-count 200}
+                            [0xF0 0xF1])]
+      (is (= :ok (:status enc)))
+      (let [dec (npdu/decode (:bytes enc))]
+        (is (= :ok (:status dec)))
+        (is (= {:dnet 100 :dadr [0x01 0x02]} (:destination dec)))
+        (is (= {:snet 50 :sadr [0x0A]} (:source dec)))
+        (is (= true (:expects-reply? dec)))
+        (is (= 2 (:priority dec)))
+        (is (= 200 (:hop-count dec)))
+        (is (= [0xF0 0xF1] (:nsdu dec)))))))
+
+(deftest npdu-worked-example-bytes
+  (testing "constructed, not a published spec vector — version + control with no addresses, priority urgent"
+    (let [enc (npdu/encode {:priority 1} [0x01])]
+      (is (= [0x01 0x01 0x01] (:bytes enc))
+          "version=1, control=0x01 (priority urgent, no dst/src/reply), nsdu=[0x01]"))))
+
+(deftest npdu-source-present-empty-address-rejected
+  (testing "the source-present bit demands a real address — SLEN 0 is malformed, not 'no source'"
+    (is (= [:error :bacnet/source-address-required] (npdu/encode {:source {:snet 1 :sadr []}} [])))
+    ;; hand-built frame: version=1, control=0x08 (source present), SNET=0x0001, SLEN=0
+    (is (= [:error :bacnet/source-address-required]
+           (npdu/decode [0x01 0x08 0x00 0x01 0x00])))))
+
+(deftest npdu-unsupported-version-error
+  (is (= [:error :bacnet/unsupported-version] (npdu/decode [0x02 0x00]))))
+
+(deftest npdu-frame-too-short-error
+  (is (= [:error :bacnet/frame-too-short] (npdu/decode [0x01]))))
+
+;; ══════════════════════════════════════════════════════════════════════
+;; bacnet.bvlc
+;; ══════════════════════════════════════════════════════════════════════
+
+(deftest bvlc-round-trip-all-functions
+  (doseq [fn-kw [:original-unicast-npdu :original-broadcast-npdu :bvlc-result]]
+    (let [payload (if (= fn-kw :bvlc-result) [0x00 0x00] [0x01 0x02 0x03 0x04 0x05])
+          enc (bvlc/encode fn-kw payload)]
+      (is (= :ok (:status enc)) (str fn-kw))
+      (let [dec (bvlc/decode (:bytes enc))]
+        (is (= :ok (:status dec)))
+        (is (= fn-kw (:function dec)))
+        (is (= payload (:payload dec)))))))
+
+(deftest bvlc-worked-example-bytes
+  (testing "constructed, not a published spec vector — Original-Unicast-NPDU wrapping 2 bytes"
+    (let [enc (bvlc/encode :original-unicast-npdu [0xAA 0xBB])]
+      (is (= [0x81 0x0A 0x00 0x06 0xAA 0xBB] (:bytes enc))
+          "0x81=BVLC type, 0x0A=function, 0x0006=total length (4 header + 2 payload)"))))
+
+(deftest bvlc-length-counts-the-header
+  (testing "the classic mistake: length that counts only the payload, not itself"
+    (let [right (bvlc/encode :original-unicast-npdu [0x01 0x02])
+          wrong (update (vec (:bytes right)) 3 - 4)] ;; pretend length omitted the header
+      (is (= :ok (:status right)))
+      (is (= [:error :bacnet/length-mismatch] (bvlc/decode wrong))))))
+
+(deftest bvlc-not-bacnet-ip-error
+  (is (= [:error :bacnet/not-bacnet-ip] (bvlc/decode [0x82 0x0A 0x00 0x04]))))
+
+(deftest bvlc-unknown-function-error
+  (is (= [:error :bacnet/unknown-bvlc-function] (bvlc/decode [0x81 0x7F 0x00 0x04]))))
+
+(deftest bvlc-frame-too-short-error
+  (is (= [:error :bacnet/frame-too-short] (bvlc/decode [0x81 0x0A 0x00]))))
+
+;; ══════════════════════════════════════════════════════════════════════
+;; bacnet.apdu — PDU types
+;; ══════════════════════════════════════════════════════════════════════
+
+(deftest confirmed-request-round-trip-unsegmented
+  (let [enc (apdu/encode-confirmed-request
+             {:invoke-id 42 :service :read-property
+              :max-segments-accepted 1 :max-apdu-length-accepted 1476}
+             [0xDE 0xAD])]
+    (is (= :ok (:status enc)))
+    (let [dec (apdu/decode (:bytes enc))]
+      (is (= :ok (:status dec)))
+      (is (= :confirmed-request (:pdu-type dec)))
+      (is (= 42 (:invoke-id dec)))
+      (is (= :read-property (:service dec)))
+      (is (= false (:segmented? dec)))
+      (is (= 1476 (:max-apdu-length-accepted dec)))
+      (is (= [0xDE 0xAD] (:params dec))))))
+
+(deftest confirmed-request-round-trip-segmented-header
+  (testing "segmentation header fields round-trip even though this library does not itself segment"
+    (let [enc (apdu/encode-confirmed-request
+               {:invoke-id 7 :service :write-property :segmented? true :more-follows? true
+                :segmented-response-accepted? true :max-segments-accepted 4
+                :max-apdu-length-accepted 480}
+               [0x01])]
+      (let [dec (apdu/decode (:bytes enc))]
+        (is (= true (:segmented? dec)))
+        (is (= true (:more-follows? dec)))
+        (is (= true (:segmented-response-accepted? dec)))
+        (is (= 480 (:max-apdu-length-accepted dec)))
+        (is (some? (:sequence-number dec)))
+        (is (some? (:proposed-window-size dec)))))))
+
+(deftest unconfirmed-request-round-trip
+  (let [enc (apdu/encode-unconfirmed-request {:service :who-is} [])]
+    (let [dec (apdu/decode (:bytes enc))]
+      (is (= :unconfirmed-request (:pdu-type dec)))
+      (is (= :who-is (:service dec)))
+      (is (= [] (:params dec))))))
+
+(deftest simple-ack-round-trip
+  (let [enc (apdu/encode-simple-ack {:invoke-id 9 :service :write-property})]
+    (let [dec (apdu/decode (:bytes enc))]
+      (is (= :simple-ack (:pdu-type dec)))
+      (is (= 9 (:invoke-id dec)))
+      (is (= :write-property (:service dec))))))
+
+(deftest complex-ack-round-trip
+  (let [enc (apdu/encode-complex-ack {:invoke-id 3 :service :read-property} [0x01 0x02 0x03])]
+    (let [dec (apdu/decode (:bytes enc))]
+      (is (= :complex-ack (:pdu-type dec)))
+      (is (= 3 (:invoke-id dec)))
+      (is (= :read-property (:service dec)))
+      (is (= [0x01 0x02 0x03] (:payload dec))))))
+
+(deftest error-round-trip
+  (let [enc (apdu/encode-error {:invoke-id 5 :service :read-property
+                                 :error-class :object :error-code :unknown-object})]
+    (is (= :ok (:status enc)))
+    (let [dec (apdu/decode (:bytes enc))]
+      (is (= :error (:pdu-type dec)))
+      (is (= 5 (:invoke-id dec)))
+      (is (= :read-property (:service dec)))
+      (is (= :object (:error-class dec)))
+      (is (= :unknown-object (:error-code dec))))))
+
+(deftest reject-round-trip
+  (doseq [reason (keys apdu/reject-reason->code)]
+    (let [enc (apdu/encode-reject {:invoke-id 11 :reason reason})
+          dec (apdu/decode (:bytes enc))]
+      (is (= :reject (:pdu-type dec)))
+      (is (= reason (:reason dec)) (str reason)))))
+
+(deftest abort-round-trip
+  (doseq [reason (keys apdu/abort-reason->code)]
+    (doseq [server? [true false]]
+      (let [enc (apdu/encode-abort {:invoke-id 13 :reason reason :server? server?})
+            dec (apdu/decode (:bytes enc))]
+        (is (= :abort (:pdu-type dec)))
+        (is (= reason (:reason dec)))
+        (is (= server? (:server? dec)))))))
+
+(deftest reject-reason-is-a-raw-octet-not-a-tag
+  (testing "constructed, not a published spec vector — Reject's reason at 0x02, not a tag-encoded value"
+    (let [enc (apdu/encode-reject {:invoke-id 1 :reason :inconsistent-parameters})]
+      (is (= [0x60 0x01 0x02] (:bytes enc))))))
+
+(deftest apdu-unknown-pdu-type-error
+  (testing "nibble 0x8 is outside the 0-7 range Table 20-1 defines"
+    (is (= [:error :bacnet/unknown-pdu-type] (apdu/decode [0x80])))))
+
+(deftest apdu-segment-ack-reported-not-implemented
+  (is (= [:error :bacnet/segment-ack-not-implemented] (apdu/decode [0x40 0x01 0x00 0x01]))))
+
+(deftest apdu-unknown-service-error
+  (is (= [:error :bacnet/unknown-service]
+         (apdu/encode-confirmed-request {:invoke-id 1 :service :not-a-real-service} []))))
+
+(deftest apdu-empty-error
+  (is (= [:error :bacnet/empty-apdu] (apdu/decode []))))
+
+;; ══════════════════════════════════════════════════════════════════════
+;; bacnet.services
+;; ══════════════════════════════════════════════════════════════════════
+
+(deftest read-property-request-round-trip
+  (doseq [array-index [nil 3]]
+    (let [enc (services/encode-read-property-request
+               {:object-type 8 :instance-number 12 :property :present-value
+                :array-index array-index})]
+      (is (= :ok (:status enc)))
+      (let [dec (services/decode-read-property-request (:bytes enc))]
+        (is (= :ok (:status dec)))
+        (is (= 8 (:object-type dec)))
+        (is (= 12 (:instance-number dec)))
+        (is (= :present-value (:property dec)))
+        (is (= array-index (:array-index dec)))))))
+
+(deftest read-property-ack-round-trip
+  (doseq [[type value] [[:unsigned 42] [:boolean true] [:boolean false]
+                         [:enumerated 3]
+                         [:object-identifier {:object-type 5 :instance-number 99}]]]
+    (let [enc (services/encode-read-property-ack
+               {:object-type 8 :instance-number 12 :property :present-value
+                :property-value [type value]})]
+      (is (= :ok (:status enc)) (str type " " value))
+      (let [dec (services/decode-read-property-ack (:bytes enc))]
+        (is (= :ok (:status dec)) (str type " " value))
+        (is (= 8 (:object-type dec)))
+        (is (= 12 (:instance-number dec)))
+        (is (= [type value] (:property-value dec)))))))
+
+(deftest write-property-request-round-trip
+  (doseq [priority [nil 8]]
+    (let [enc (services/encode-write-property-request
+               {:object-type 8 :instance-number 12 :property :present-value
+                :property-value [:unsigned 70] :priority priority})]
+      (is (= :ok (:status enc)) (str "priority " priority))
+      (let [dec (services/decode-write-property-request (:bytes enc))]
+        (is (= :ok (:status dec)))
+        (is (= [:unsigned 70] (:property-value dec)))
+        (is (= priority (:priority dec)))))))
+
+(deftest write-property-priority-out-of-range
+  (is (= [:error :bacnet/priority-out-of-range]
+         (services/encode-write-property-request
+          {:object-type 0 :instance-number 0 :property :present-value
+           :property-value [:unsigned 1] :priority 17}))))
+
+(deftest who-is-round-trip
+  (testing "no args"
+    (let [enc (services/encode-who-is-request)
+          dec (services/decode-who-is-request (:bytes enc))]
+      (is (nil? (:low-limit dec)))
+      (is (nil? (:high-limit dec)))))
+  (testing "range"
+    (let [enc (services/encode-who-is-request {:low-limit 100 :high-limit 200})
+          dec (services/decode-who-is-request (:bytes enc))]
+      (is (= 100 (:low-limit dec)))
+      (is (= 200 (:high-limit dec))))))
+
+(deftest who-is-unpaired-limits-rejected
+  (is (= [:error :bacnet/range-limits-must-be-paired]
+         (services/encode-who-is-request {:low-limit 100}))))
+
+(deftest i-am-round-trip
+  (let [enc (services/encode-i-am-request
+             {:object-type 8 :instance-number 1234 :max-apdu-length-accepted 1476
+              :segmentation-supported :no-segmentation :vendor-id 260})]
+    (is (= :ok (:status enc)))
+    (let [dec (services/decode-i-am-request (:bytes enc))]
+      (is (= :ok (:status dec)))
+      (is (= 8 (:object-type dec)))
+      (is (= 1234 (:instance-number dec)))
+      (is (= 1476 (:max-apdu-length-accepted dec)))
+      (is (= :no-segmentation (:segmentation-supported dec)))
+      (is (= 260 (:vendor-id dec))))))
+
+(deftest read-property-tag-number-mismatch
+  (testing "corrupting the object-identifier's context tag number is caught specifically"
+    (let [enc (services/encode-read-property-request
+               {:object-type 8 :instance-number 12 :property :present-value})
+          corrupted (assoc (vec (:bytes enc)) 0 0x1C)] ;; tag number 1 instead of 0, still class=context len=4
+      (is (= [:error :bacnet/tag-number-mismatch]
+             (services/decode-read-property-request corrupted))))))
+
+(deftest unknown-property-rejected
+  (is (= [:error :bacnet/unknown-property]
+         (services/encode-read-property-request
+          {:object-type 0 :instance-number 0 :property :not-a-real-property}))))
+
+;; ══════════════════════════════════════════════════════════════════════
+;; Full stack: BVLC(NPDU(APDU(service))) round trip
+;; ══════════════════════════════════════════════════════════════════════
+
+(deftest full-stack-read-property-request
+  (let [service-bytes (:bytes (services/encode-read-property-request
+                                {:object-type 8 :instance-number 5 :property :object-name}))
+        apdu-bytes (:bytes (apdu/encode-confirmed-request
+                             {:invoke-id 1 :service :read-property
+                              :max-segments-accepted 1 :max-apdu-length-accepted 1476}
+                             service-bytes))
+        npdu-bytes (:bytes (npdu/encode {} apdu-bytes))
+        bvlc-bytes (:bytes (bvlc/encode :original-unicast-npdu npdu-bytes))]
+    (let [outer (bvlc/decode bvlc-bytes)]
+      (is (= :ok (:status outer)))
+      (let [mid (npdu/decode (:payload outer))]
+        (is (= :ok (:status mid)))
+        (let [inner (apdu/decode (:nsdu mid))]
+          (is (= :confirmed-request (:pdu-type inner)))
+          (is (= :read-property (:service inner)))
+          (let [svc (services/decode-read-property-request (:params inner))]
+            (is (= 8 (:object-type svc)))
+            (is (= 5 (:instance-number svc)))
+            (is (= :object-name (:property svc)))))))))
+
+(deftest full-stack-who-is-broadcast
+  (let [service-bytes (:bytes (services/encode-who-is-request))
+        apdu-bytes (:bytes (apdu/encode-unconfirmed-request {:service :who-is} service-bytes))
+        npdu-bytes (:bytes (npdu/encode {} apdu-bytes))
+        bvlc-bytes (:bytes (bvlc/encode :original-broadcast-npdu npdu-bytes))]
+    (let [outer (bvlc/decode bvlc-bytes)
+          mid (npdu/decode (:payload outer))
+          inner (apdu/decode (:nsdu mid))]
+      (is (= :original-broadcast-npdu (:function outer)))
+      (is (= :unconfirmed-request (:pdu-type inner)))
+      (is (= :who-is (:service inner))))))
+
+(deftest full-stack-i-am-response
+  (let [service-bytes (:bytes (services/encode-i-am-request
+                                {:object-type 8 :instance-number 77
+                                 :max-apdu-length-accepted 1024
+                                 :segmentation-supported :segmented-both :vendor-id 15}))
+        apdu-bytes (:bytes (apdu/encode-unconfirmed-request {:service :i-am} service-bytes))
+        npdu-bytes (:bytes (npdu/encode {} apdu-bytes))
+        bvlc-bytes (:bytes (bvlc/encode :original-broadcast-npdu npdu-bytes))]
+    (let [outer (bvlc/decode bvlc-bytes)
+          mid (npdu/decode (:payload outer))
+          inner (apdu/decode (:nsdu mid))
+          svc (services/decode-i-am-request (:params inner))]
+      (is (= :i-am (:service inner)))
+      (is (= 77 (:instance-number svc)))
+      (is (= :segmented-both (:segmentation-supported svc))))))
+
+#?(:cljs nil :default (defn -main [] (run-tests 'bacnet.core-test)))
