@@ -1,0 +1,217 @@
+(ns com-backblaze-secure.server
+  "MCP stdio entrypoint for the Backblaze B2 secure MCP server
+  (ADR-2607152322). Wires `kotoba-lang/mcp` (mcp-clj — portable manifest +
+  pure JSON-RPC dispatcher, `:local/root` dependency, no third-party runtime
+  deps) to two things this repo is actually responsible for:
+
+  1. the MCP stdio wire transport (newline-delimited JSON — the current
+     MCP stdio transport spec, not LSP-style Content-Length framing), the
+     one host-injected port mcp-clj's own README says a host must supply;
+  2. an `mcp.ports/ITool` whose `invoke` ALWAYS checks
+     com-backblaze-secure.config's bucket/capability allowlist before
+     calling com-backblaze-secure.b2-cli, and ALWAYS appends a redacted
+     entry to com-backblaze-secure.audit afterwards.
+
+  No tool response and no audit-log line ever contains raw credential
+  material — see com-backblaze-secure.redact, which every b2-cli return
+  value passes through before it reaches this namespace."
+  (:require [kotoba.lang.edn :as edn]
+            [kotoba.lang.text :as str]
+            [mcp.model :as m]
+            [mcp.execute :as exec]
+            [mcp.ports :as ports]
+            [com-backblaze-secure.config :as config]
+            [com-backblaze-secure.credentials :as creds]
+            [com-backblaze-secure.b2-cli :as b2]
+            [com-backblaze-secure.audit :as audit]
+            [com-backblaze-secure.redact :as redact]))
+
+(def fs (js/require "node:fs"))
+
+;; --- config loading ---
+
+(defn config-path []
+  (or (aget js/process.env "COM_BACKBLAZE_SECURE_CONFIG")
+      "config/com-backblaze-secure.edn"))
+
+(defn load-config []
+  (edn/read-string (.readFileSync fs (config-path) "utf8")))
+
+(defn audit-path [cfg]
+  (or (get-in cfg [:audit :path]) (audit/default-path)))
+
+;; --- manifest built from the config's actual grants ---
+
+(defn build-manifest
+  [cfg]
+  (let [has-cap? (fn [cap] (seq (config/allowed-buckets cfg cap)))]
+    (cond-> (m/server "com-backblaze-secure" "0.1.0")
+
+      (has-cap? :list)
+      (m/add-tool "b2_list_buckets"
+                  {:description "List B2 buckets allowlisted for this server (never includes credential material)."
+                   :input-schema {:type "object" :properties {} :required []}})
+
+      (has-cap? :read)
+      (m/add-tool "b2_list_files"
+                  {:description "List files in one allowlisted bucket (recursive by default). Response is capped at `limit` entries (default 200) — a bucket with more files than that sets :truncated true rather than returning every entry; narrow with `prefix` to page through a large bucket."
+                   :input-schema {:type "object"
+                                  :properties {"bucket" {:type "string"}
+                                               "prefix" {:type "string"}
+                                               "limit" {:type "number"}}
+                                  :required ["bucket"]}})
+
+      (has-cap? :read)
+      (m/add-tool "b2_file_info"
+                  {:description "Get metadata for one file in an allowlisted bucket."
+                   :input-schema {:type "object"
+                                  :properties {"bucket" {:type "string"} "path" {:type "string"}}
+                                  :required ["bucket" "path"]}})
+
+      (has-cap? :read)
+      (m/add-tool "b2_download_file"
+                  {:description "Download one file from an allowlisted bucket to a local path."
+                   :input-schema {:type "object"
+                                  :properties {"bucket" {:type "string"} "path" {:type "string"}
+                                               "local_path" {:type "string"}}
+                                  :required ["bucket" "path" "local_path"]}})
+
+      (has-cap? :write)
+      (m/add-tool "b2_upload_file"
+                  {:description "Upload one local file to an allowlisted bucket (only registered when some bucket grants :write)."
+                   :input-schema {:type "object"
+                                  :properties {"bucket" {:type "string"} "local_path" {:type "string"}
+                                               "remote_name" {:type "string"}}
+                                  :required ["bucket" "local_path" "remote_name"]}})
+
+      (has-cap? :delete)
+      (m/add-tool "b2_delete_file"
+                  {:description "Delete the current version of one file in an allowlisted bucket (only registered when some bucket grants :delete; never recursive/wildcard)."
+                   :input-schema {:type "object"
+                                  :properties {"bucket" {:type "string"} "path" {:type "string"}}
+                                  :required ["bucket" "path"]}}))))
+
+;; --- tool → required capability ---
+
+(def tool->capability
+  {"b2_list_buckets"  :list
+   "b2_list_files"    :read
+   "b2_file_info"     :read
+   "b2_download_file" :read
+   "b2_upload_file"   :write
+   "b2_delete_file"   :delete})
+
+(defn- creds-for [cfg bucket]
+  (creds/resolve-credentials (get-in cfg [:buckets bucket :credentials])))
+
+(defn- audit-and-return! [cfg tool-name bucket capability outcome result]
+  (audit/append! (audit-path cfg)
+                 {:ts (.toISOString (js/Date.))
+                  :tool tool-name :bucket bucket :capability capability :outcome outcome})
+  result)
+
+(defn- call-tool
+  [cfg tool-name args]
+  (let [bucket (get args "bucket")
+        cap    (get tool->capability tool-name)]
+    (cond
+      (nil? cap)
+      {:error (str "unknown tool: " tool-name)}
+
+      ;; b2_list_buckets is not scoped to a single bucket call in the MCP
+      ;; sense, but B2 application keys in this workspace are routinely
+      ;; bucket-restricted — a key scoped to bucket A cannot enumerate
+      ;; bucket B. So this queries each :list-granted bucket with ITS OWN
+      ;; credentials (b2 bucket get) and aggregates, rather than assuming
+      ;; any one key can list every allowlisted bucket.
+      (= tool-name "b2_list_buckets")
+      (let [allowed (config/allowed-buckets cfg :list)]
+        (if (empty? allowed)
+          {:error "no bucket grants :list"}
+          {:buckets (mapv (fn [bucket] (b2/bucket-info (creds-for cfg bucket) bucket)) allowed)}))
+
+      :else
+      (if-let [err (config/require-capability! cfg bucket cap)]
+        {:error err :denied true}
+        (let [creds (creds-for cfg bucket)]
+          (case tool-name
+            "b2_list_files"
+            (let [limit (or (get args "limit") 200)
+                  prefix (get args "prefix")
+                  raw (b2/list-file-names creds bucket prefix true)]
+              (if (vector? raw)
+                (let [total (count raw)]
+                  {:files (if (> total limit) (subvec raw 0 limit) raw)
+                   :returned (min total limit)
+                   :total total
+                   :truncated (> total limit)})
+                raw))
+
+            "b2_file_info"     (b2/file-info creds bucket (get args "path"))
+            "b2_download_file" (b2/download-file creds bucket (get args "path") (get args "local_path"))
+            "b2_upload_file"   (b2/upload-file creds bucket (get args "local_path") (get args "remote_name"))
+            "b2_delete_file"   (b2/delete-file creds bucket (get args "path"))
+            {:error (str "unhandled tool: " tool-name)}))))))
+
+(defn make-tool-port
+  [cfg-atom]
+  (reify ports/ITool
+    (invoke [_ tool-name args]
+      (let [cfg    (deref cfg-atom)
+            bucket (get args "bucket")
+            cap    (get tool->capability tool-name)]
+        (try
+          (let [result  (call-tool cfg tool-name args)
+                outcome (if (:denied result) "denied" (if (:error result) "error" "ok"))
+                ;; every call-tool branch returns a map, but this guard means
+                ;; a future tool that doesn't (e.g. returns a bare vector)
+                ;; degrades to "pass the result through" instead of crashing
+                ;; the whole tool port on `dissoc`.
+                clean   (if (map? result) (dissoc result :denied) result)]
+            (audit-and-return! cfg tool-name bucket cap outcome clean))
+          (catch :default e
+            (audit-and-return! cfg tool-name bucket cap "error"
+                                {:error (redact/redact (.-message e))})))))))
+
+;; --- stdio transport: newline-delimited JSON (MCP stdio wire format) ---
+
+(defn- write! [msg]
+  (.write js/process.stdout (str (.stringify js/JSON (clj->js msg)) "\n")))
+
+(defn- parse-error [id message]
+  {"jsonrpc" "2.0" "id" id "error" {"code" -32700 "message" message}})
+
+(defn start!
+  [cfg]
+  (let [cfg-atom (atom cfg)
+        model    (build-manifest cfg)
+        tool-port (make-tool-port cfg-atom)
+        ports-map {:tool tool-port
+                   :transport (reify ports/ITransport
+                                (call [_ _ _] {:error "no outbound transport configured"}))}
+        buf (atom "")]
+    (.setEncoding js/process.stdin "utf8")
+    (.on js/process.stdin "data"
+         (fn [chunk]
+           (swap! buf str chunk)
+           (loop []
+             (let [s  @buf
+                   nl (.indexOf s "\n")]
+               (when (>= nl 0)
+                 (let [line    (subs s 0 nl)
+                       remainder (subs s (inc nl))]
+                   (reset! buf remainder)
+                   (when-not (str/blank? line)
+                     (try
+                       (let [req  (js->clj (.parse js/JSON line))
+                             resp (exec/handle ports-map model req)]
+                         (write! resp))
+                       (catch :default e
+                         (write! (parse-error nil (str "parse error: " (.-message e)))))))
+                   (recur)))))))
+    (.resume js/process.stdin)))
+
+(defn main []
+  (start! (load-config)))
+
+(main)
