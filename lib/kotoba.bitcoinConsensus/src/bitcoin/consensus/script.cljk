@@ -1,0 +1,1312 @@
+(ns bitcoin.consensus.script
+  "Fail-closed Bitcoin Script evaluator for legacy, P2SH, and SegWit v0."
+  (:require [kotoba.lang.error :as kerror] [bitcoin.consensus.codec :as codec]
+            [bitcoin.consensus.sighash :as sighash]
+            [btc-crypto.core :as bitcoin-crypto]
+            [btc-crypto.ripemd160 :as ripemd160]
+            [btc-crypto.schnorr :as schnorr]
+            [btc-crypto.signature :as signature]
+            [sha256d.core :as sha256d])
+  (:import (java.security MessageDigest)))
+
+(def max-script-size 10000)
+(def max-element-size 520)
+(def max-ops 201)
+(def max-stack-size 1000)
+(def max-block-sigop-cost 80000)
+(def witness-scale-factor 4)
+
+(def op-0 0x00)
+(def op-pushdata1 0x4c)
+(def op-pushdata2 0x4d)
+(def op-pushdata4 0x4e)
+(def op-1negate 0x4f)
+(def op-1 0x51)
+(def op-16 0x60)
+(def op-if 0x63)
+(def op-notif 0x64)
+(def op-else 0x67)
+(def op-endif 0x68)
+(def op-verify 0x69)
+(def op-return 0x6a)
+(def op-toaltstack 0x6b)
+(def op-fromaltstack 0x6c)
+(def op-drop 0x75)
+(def op-dup 0x76)
+(def op-swap 0x7c)
+(def op-size 0x82)
+(def op-equal 0x87)
+(def op-equalverify 0x88)
+(def op-ripemd160 0xa6)
+(def op-sha1 0xa7)
+(def op-sha256 0xa8)
+(def op-hash160 0xa9)
+(def op-hash256 0xaa)
+(def op-codeseparator 0xab)
+(def op-checksig 0xac)
+(def op-checksigverify 0xad)
+(def op-checkmultisig 0xae)
+(def op-checkmultisigverify 0xaf)
+(def op-checklocktimeverify 0xb1)
+(def op-checksequenceverify 0xb2)
+(def op-checksigadd 0xba)
+
+(def disabled-opcodes
+  #{0x7e 0x7f 0x80 0x81 0x83 0x84 0x85 0x86
+    0x8d 0x8e 0x95 0x96 0x97 0x98 0x99})
+
+(defn- op-success? [opcode]
+  (or (contains? #{0x50 0x62} opcode)
+      (<= 0x7e opcode 0x81)
+      (<= 0x83 opcode 0x86)
+      (<= 0x89 opcode 0x8a)
+      (<= 0x8d opcode 0x8e)
+      (<= 0x95 opcode 0x99)
+      (<= 0xbb opcode 0xfe)))
+
+(def default-flags
+  "Current block-consensus flags. Policy-only flags such as CLEANSTACK,
+  MINIMALDATA, LOW_S, NULLFAIL, and WITNESS_PUBKEYTYPE are intentionally
+  excluded."
+  #{:p2sh :witness :dersig :null-dummy :cltv :csv :taproot})
+
+(defn- fail! [type message data]
+  (codec/fail! type message data))
+
+(defn push-data
+  "Canonical script push encoding."
+  [data]
+  (let [data (vec data)
+        size (count data)]
+    (cond
+      (< size op-pushdata1) (vec (concat [size] data))
+      (<= size 0xff) (vec (concat [op-pushdata1 size] data))
+      (<= size 0xffff)
+      (vec (concat [op-pushdata2] (codec/uint-le size 2) data))
+      :else
+      (vec (concat [op-pushdata4] (codec/uint-le size 4) data)))))
+
+(defn parse
+  "Parse script bytes into bounded operations preserving raw byte ranges."
+  ([script] (parse script {}))
+  ([script {:keys [unbounded-script? unbounded-elements?]}]
+   (let [script (vec script)]
+    (when (and (not unbounded-script?)
+               (> (count script) max-script-size))
+      (fail! :bitcoin.consensus/script-size
+             "Script exceeds MAX_SCRIPT_SIZE." {:size (count script)}))
+    (loop [offset 0 result []]
+      (if (= offset (count script))
+        result
+        (let [start offset
+              [opcode offset] (codec/read-uint-le script offset 1)
+              opcode (long opcode)
+              [length offset]
+              (cond
+                (<= 1 opcode 75) [opcode offset]
+                (= opcode op-pushdata1)
+                (codec/read-uint-le script offset 1)
+                (= opcode op-pushdata2)
+                (codec/read-uint-le script offset 2)
+                (= opcode op-pushdata4)
+                (codec/read-uint-le script offset 4)
+                :else [nil offset])
+              [data end]
+              (if length
+                (codec/read-bytes script offset (long length))
+                [nil offset])]
+          (when (and data (not unbounded-elements?)
+                     (> (count data) max-element-size))
+            (fail! :bitcoin.consensus/push-size
+                   "Pushed Script element exceeds 520 bytes."
+                   {:size (count data)}))
+          (recur end
+                 (conj result
+                       {:opcode opcode :data data :start start :end end
+                        :raw (subvec script start end)}))))))))
+
+(defn push-only? [script]
+  (every? #(<= (:opcode %) op-16) (parse script)))
+
+(defn sigop-count
+  "Count signature operations, optionally using accurate multisig keys.
+  Malformed trailing pushes stop scanning, matching CScript::GetSigOpCount."
+  [script accurate?]
+  (let [script (vec script)]
+    (loop [offset 0 previous nil total 0]
+      (if (= offset (count script))
+        total
+        (if-let
+         [{next-offset :offset opcode :opcode}
+          (try
+            (let [[opcode offset] (codec/read-uint-le script offset 1)
+                  opcode (long opcode)
+                  [length offset]
+                  (cond
+                    (<= 1 opcode 75) [opcode offset]
+                    (= opcode op-pushdata1)
+                    (codec/read-uint-le script offset 1)
+                    (= opcode op-pushdata2)
+                    (codec/read-uint-le script offset 2)
+                    (= opcode op-pushdata4)
+                    (codec/read-uint-le script offset 4)
+                    :else [0 offset])
+                  [_ offset] (codec/read-bytes script offset (long length))]
+              {:offset offset :opcode opcode})
+            (catch kerror/ExceptionInfo _ nil))]
+          (recur
+           next-offset opcode
+           (+ total
+              (cond
+                (contains? #{op-checksig op-checksigverify} opcode) 1
+                (contains? #{op-checkmultisig
+                             op-checkmultisigverify} opcode)
+                (if (and accurate? previous
+                         (<= op-1 previous op-16))
+                  (inc (- previous op-1))
+                  20)
+                :else 0)))
+          total)))))
+
+(defn transaction-legacy-sigop-count
+  "Return Core's context-free GetLegacySigOpCount for one transaction."
+  [transaction]
+  (+ (reduce + 0 (map #(sigop-count (:script-sig %) false)
+                      (:inputs transaction)))
+     (reduce + 0 (map #(sigop-count (:script-pubkey %) false)
+                      (:outputs transaction)))))
+
+(defn validate-block-legacy-sigops!
+  "Apply CheckBlock's early legacy sigop bound without requiring prevout data.
+
+  P2SH and witness sigops remain part of the full UTXO connection check."
+  [transactions]
+  (let [count-value
+        (reduce + 0 (map transaction-legacy-sigop-count transactions))
+        limit (quot max-block-sigop-cost witness-scale-factor)]
+    (when (> count-value limit)
+      (codec/fail! :bitcoin.consensus/too-many-sigops
+                   "Block exceeds the legacy signature-operation limit."
+                   {:legacy-count count-value
+                    :legacy-limit limit
+                    :cost (* witness-scale-factor count-value)
+                    :limit max-block-sigop-cost}))
+    count-value))
+
+(defn- false-value? [value]
+  (or (empty? value)
+      (every? zero? value)
+      (and (= 0x80 (bit-and 0xff (peek value)))
+           (every? zero? (butlast value)))))
+
+(defn- truthy? [value] (not (false-value? value)))
+
+(defn- script-number [value require-minimal? max-size]
+  (let [value (vec value)]
+    (when (> (count value) max-size)
+      (fail! :bitcoin.consensus/script-number-overflow
+             "Script number exceeds its byte limit."
+             {:size (count value) :limit max-size}))
+    (when (and require-minimal? (seq value)
+               (zero? (bit-and 0x7f (peek value)))
+               (or (= 1 (count value))
+                   (zero? (bit-and 0x80
+                                   (nth value (- (count value) 2))))))
+      (fail! :bitcoin.consensus/nonminimal-script-number
+             "Script number is not minimally encoded." {}))
+    (if (empty? value)
+      0
+      (let [negative? (not (zero? (bit-and 0x80 (peek value))))
+            magnitude
+            (reduce-kv
+             (fn [result index byte]
+               (+ result
+                  (* (if (= index (dec (count value)))
+                       (bit-and byte 0x7f)
+                       byte)
+                     (bit-shift-left 1 (* 8 index)))))
+             0 value)]
+        (if negative? (- magnitude) magnitude)))))
+
+(defn- encode-number [value]
+  (if (zero? value)
+    []
+    (let [negative? (neg? value)
+          magnitude (abs value)
+          bytes
+          (loop [number magnitude result []]
+            (if (zero? number)
+              result
+              (recur (quot number 256)
+                     (conj result (mod number 256)))))]
+      (cond
+        (not (zero? (bit-and 0x80 (peek bytes))))
+        (conj bytes (if negative? 0x80 0))
+        negative? (update bytes (dec (count bytes)) bit-or 0x80)
+        :else bytes))))
+
+(defn- sha256 [value]
+  (vec (sha256d/sha256-bytes value)))
+
+(defn- hash160 [value]
+  (mapv #(bit-and 0xff %)
+        (bitcoin-crypto/hash160
+         (byte-array (map unchecked-byte value)))))
+
+(defn- ripemd [value]
+  (mapv #(bit-and 0xff %)
+        (ripemd160/ripemd160
+         (byte-array (map unchecked-byte value)))))
+
+(defn- sha1 [value]
+  (mapv #(bit-and 0xff %)
+        (.digest (MessageDigest/getInstance "SHA-1")
+                 (byte-array (map unchecked-byte value)))))
+
+(defn- find-and-delete [script signature-value]
+  (let [target (push-data signature-value)]
+    (vec
+     (mapcat :raw
+             (remove #(= target (:raw %)) (parse script))))))
+
+(defn- compressed-pubkey? [pubkey]
+  (and (= 33 (count pubkey))
+       (contains? #{2 3} (first pubkey))))
+
+(defn- canonical-pubkey? [pubkey]
+  (or (compressed-pubkey? pubkey)
+      (and (= 65 (count pubkey))
+           (= 4 (first pubkey)))))
+
+(defn- normalize-hybrid-pubkey [pubkey]
+  (if (and (= 65 (count pubkey))
+           (contains? #{6 7} (first pubkey))
+           (= (bit-and (first pubkey) 1)
+              (bit-and (peek pubkey) 1)))
+    (assoc (vec pubkey) 0 4)
+    pubkey))
+
+(defn- check-ecdsa-encoding! [signature-value pubkey flags sigversion]
+  (when (seq signature-value)
+    (when (and (some flags #{:dersig :low-s :strict-encoding})
+               (not (signature/strict-der? signature-value)))
+      (fail! :bitcoin.consensus/signature-der
+             "Signature is not strictly DER encoded." {}))
+    (when (and (contains? flags :low-s)
+               (not (signature/low-s? signature-value)))
+      (fail! :bitcoin.consensus/signature-high-s
+             "Signature has a non-canonical high S value." {}))
+    (when (and (contains? flags :strict-encoding)
+               (not (signature/defined-sighash-type?
+                     (peek signature-value))))
+      (fail! :bitcoin.consensus/signature-hash-type
+             "Signature uses an undefined sighash type." {})))
+  (when (and (contains? flags :strict-encoding)
+             (not (canonical-pubkey? pubkey)))
+    (fail! :bitcoin.consensus/pubkey-encoding
+           "Public key is not canonically encoded." {}))
+  (when (and (= sigversion :witness-v0)
+             (contains? flags :compressed-pubkey)
+             (not (compressed-pubkey? pubkey)))
+    (fail! :bitcoin.consensus/witness-pubkey-encoding
+           "SegWit v0 requires a compressed public key." {})))
+
+(defn- check-signature
+  [{:keys [transaction input-index coin sigversion flags script
+           code-separator] :as context} signature-value pubkey]
+  (when (not= sigversion :tapscript)
+    (check-ecdsa-encoding! signature-value pubkey flags sigversion))
+  (when (and (= sigversion :tapscript) (empty? pubkey))
+    (fail! :bitcoin.consensus/tapscript-pubkey
+           "Tapscript public key is empty." {}))
+  (when (and (= sigversion :tapscript)
+             (seq pubkey)
+             (not= 32 (count pubkey))
+             (contains? flags :discourage-upgradable-pubkeytype))
+    (fail! :bitcoin.consensus/discouraged-tapscript-pubkeytype
+           "Upgradable tapscript public-key type is discouraged."
+           {:size (count pubkey)}))
+  (if (empty? signature-value)
+    false
+    (if (= sigversion :tapscript)
+      (let [size (count signature-value)
+            budget (:validation-weight-left context)
+            _ (when budget
+                (let [remaining (- @budget 50)]
+                  (vreset! budget remaining)
+                  (when (neg? remaining)
+                    (fail! :bitcoin.consensus/tapscript-validation-weight
+                           "Tapscript signature budget is exhausted." {}))))
+            _ (when-not (contains? #{64 65} size)
+                (fail! :bitcoin.consensus/taproot-signature-size
+                       "Tapscript signature must be 64 or 65 bytes."
+                       {:size size}))
+            hash-type (if (= size 65)
+                        (bit-and 0xff (peek signature-value)) 0)
+            _ (when (and (= size 65) (zero? hash-type))
+                (fail! :bitcoin.consensus/taproot-hash-type
+                       "Explicit SIGHASH_DEFAULT is invalid." {}))]
+        (cond
+          (empty? pubkey)
+          (fail! :bitcoin.consensus/tapscript-pubkey
+                 "Tapscript public key is empty." {})
+
+          (not= 32 (count pubkey))
+          true
+
+          :else
+          (schnorr/verify
+           (sighash/taproot
+            transaction input-index (:prevout-coins transaction)
+            hash-type
+            {:annex (:annex context)
+             :tapleaf-hash (:tapleaf-hash context)
+             :code-separator-position
+             (or code-separator 0xffffffff)})
+           pubkey (subvec (vec signature-value) 0 64))))
+      (let [hash-type (bit-and 0xff (peek signature-value))
+          pubkey (normalize-hybrid-pubkey pubkey)
+          subscript (subvec (vec script) code-separator)
+          script-code
+          (if (= sigversion :witness-v0)
+            subscript
+            (let [cleaned
+                  (reduce find-and-delete subscript
+                          (or (:delete-signatures context)
+                              [signature-value]))]
+              (when (and (contains? flags :const-scriptcode)
+                         (not= cleaned subscript))
+                (fail! :bitcoin.consensus/non-constant-scriptcode
+                       "Signature was removed from legacy scriptCode." {}))
+              cleaned))
+          digest
+          (if (= sigversion :witness-v0)
+            (sighash/bip143 transaction input-index script-code
+                            (:value coin) hash-type)
+            (sighash/legacy transaction input-index script-code hash-type))]
+      (if (some flags #{:dersig :low-s :strict-encoding})
+             (signature/verify-der
+              digest signature-value
+              (byte-array (map unchecked-byte pubkey))
+              {:low-s? (contains? flags :low-s)
+               :defined-sighash? (contains? flags :strict-encoding)})
+             (signature/verify-lax-der
+              digest signature-value
+              (byte-array (map unchecked-byte pubkey))))))))
+
+(defn- pop-stack [stack opcode]
+  (when (empty? stack)
+    (fail! :bitcoin.consensus/invalid-stack-operation
+           "Opcode requires a stack item." {:opcode opcode}))
+  [(pop stack) (peek stack)])
+
+(defn- require-items! [stack count-value opcode]
+  (when (< (count stack) count-value)
+    (fail! :bitcoin.consensus/invalid-stack-operation
+           "Opcode has too few stack items."
+           {:opcode opcode :required count-value :actual (count stack)})))
+
+(defn- take-stack-items [stack count-value]
+  [(vec (drop-last count-value stack))
+   (vec (take-last count-value stack))])
+
+(defn- check-stack-limits! [stack altstack]
+  (when (> (+ (count stack) (count altstack)) max-stack-size)
+    (fail! :bitcoin.consensus/stack-size
+           "Combined Script stacks exceed 1000 items." {}))
+  (when (some #(> (count %) max-element-size) stack)
+    (fail! :bitcoin.consensus/push-size
+           "Script stack element exceeds 520 bytes." {})))
+
+(defn evaluate
+  "Evaluate one script against an existing stack. Throws typed ex-info on
+  Script failure and returns the resulting stack on success."
+  ([stack script context] (evaluate stack script context nil))
+  ([initial-stack script context _reserved]
+   (let [script (vec script)
+         tapscript? (= (:sigversion context) :tapscript)
+         operations (parse script {:unbounded-script? tapscript?
+                                   :unbounded-elements? tapscript?})
+         minimal? (contains? (:flags context) :minimal-data)]
+     (if-let [success-op
+              (when tapscript?
+                (some #(when (op-success? (:opcode %)) %) operations))]
+       (if (contains? (:flags context) :discourage-op-success)
+         (fail! :bitcoin.consensus/discouraged-op-success
+                "Tapscript OP_SUCCESS is discouraged."
+                {:opcode (:opcode success-op)})
+         [[1]])
+       (do
+         (when (some #(and (:data %) (> (count (:data %)) max-element-size))
+                     operations)
+           (fail! :bitcoin.consensus/push-size
+                  "Tapscript push exceeds 520 bytes." {}))
+         (loop [remaining operations stack (vec initial-stack) altstack []
+            conditions [] op-count 0 code-separator 0]
+       (check-stack-limits! stack altstack)
+       (if-let [{:keys [opcode data start end]} (first remaining)]
+         (let [executing? (every? true? conditions)
+               op-count (if (> opcode op-16) (inc op-count) op-count)]
+           (when (and (not tapscript?) (> op-count max-ops))
+             (fail! :bitcoin.consensus/op-count
+                    "Script exceeds MAX_OPS_PER_SCRIPT." {}))
+           (when (contains? disabled-opcodes opcode)
+             (fail! :bitcoin.consensus/disabled-opcode
+                    "Script contains a disabled opcode." {:opcode opcode}))
+           (when (and (= opcode op-codeseparator)
+                      (= (:sigversion context) :base)
+                      (contains? (:flags context) :const-scriptcode))
+             (fail! :bitcoin.consensus/non-constant-scriptcode
+                    "Legacy OP_CODESEPARATOR violates CONST_SCRIPTCODE."
+                    {:opcode opcode}))
+           (cond
+             data
+             (let [minimal-push?
+                   (or (not minimal?)
+                       (cond
+                         (empty? data) (= opcode op-0)
+                         (and (= 1 (count data))
+                              (<= 1 (first data) 16))
+                         (= opcode (+ op-1 (dec (first data))))
+                         (and (= 1 (count data)) (= 0x81 (first data)))
+                         (= opcode op-1negate)
+                         (< (count data) op-pushdata1)
+                         (= opcode (count data))
+                         (<= (count data) 0xff)
+                         (= opcode op-pushdata1)
+                         (<= (count data) 0xffff)
+                         (= opcode op-pushdata2)
+                         :else (= opcode op-pushdata4)))]
+               (when (and executing? (not minimal-push?))
+                 (fail! :bitcoin.consensus/minimal-data
+                        "Script push is not minimally encoded." {}))
+               (let [stack (if executing? (conj stack data) stack)]
+                 (check-stack-limits! stack altstack)
+                 (recur (rest remaining) stack altstack conditions
+                        op-count code-separator)))
+
+             (= opcode op-if)
+             (if executing?
+               (let [[stack value] (pop-stack stack opcode)
+                     _ (when (and (or tapscript?
+                                      (= (:sigversion context) :witness-v0))
+                                  (or tapscript?
+                                      (contains? (:flags context) :minimal-if))
+                                  (not (contains? #{[] [1]} value)))
+                         (fail! :bitcoin.consensus/minimal-if
+                                "Witness IF argument must be empty or 1." {}))]
+                 (recur (rest remaining) stack altstack
+                        (conj conditions (truthy? value))
+                        op-count code-separator))
+               (recur (rest remaining) stack altstack
+                      (conj conditions false) op-count code-separator))
+
+             (= opcode op-notif)
+             (if executing?
+               (let [[stack value] (pop-stack stack opcode)
+                     _ (when (and (or tapscript?
+                                      (= (:sigversion context)
+                                         :witness-v0))
+                                  (or tapscript?
+                                      (contains? (:flags context)
+                                                 :minimal-if))
+                                  (not (contains? #{[] [1]} value)))
+                         (fail! :bitcoin.consensus/minimal-if
+                                "Witness NOTIF argument must be empty or 1."
+                                {}))]
+                 (recur (rest remaining) stack altstack
+                        (conj conditions (not (truthy? value)))
+                        op-count code-separator))
+               (recur (rest remaining) stack altstack
+                      (conj conditions false) op-count code-separator))
+
+             (= opcode op-else)
+             (do
+               (when (empty? conditions)
+                 (fail! :bitcoin.consensus/unbalanced-conditional
+                        "OP_ELSE has no matching OP_IF." {}))
+               (recur (rest remaining) stack altstack
+                      (conj (pop conditions) (not (peek conditions)))
+                      op-count code-separator))
+
+             (= opcode op-endif)
+             (do
+               (when (empty? conditions)
+                 (fail! :bitcoin.consensus/unbalanced-conditional
+                        "OP_ENDIF has no matching OP_IF." {}))
+               (recur (rest remaining) stack altstack (pop conditions)
+                      op-count code-separator))
+
+             (contains? #{0x65 0x66} opcode)
+             (fail! :bitcoin.consensus/bad-opcode
+                    "OP_VERIF and OP_VERNOTIF are always invalid."
+                    {:opcode opcode})
+
+             (not executing?)
+             (recur (rest remaining) stack altstack conditions
+                    op-count code-separator)
+
+             (= opcode op-0)
+             (recur (rest remaining) (conj stack []) altstack conditions
+                    op-count code-separator)
+
+             (= opcode op-1negate)
+             (recur (rest remaining) (conj stack (encode-number -1))
+                    altstack conditions op-count code-separator)
+
+             (<= op-1 opcode op-16)
+             (recur (rest remaining)
+                    (conj stack (encode-number (inc (- opcode op-1))))
+                    altstack conditions op-count code-separator)
+
+             (or (= opcode 0x61)
+                 (= opcode 0xb0)
+                 (<= 0xb3 opcode 0xb9))
+             (do
+               (when (and (contains? (:flags context)
+                                     :discourage-upgradable-nops)
+                          (not= opcode 0x61))
+                 (fail! :bitcoin.consensus/discouraged-nop
+                        "Executed upgradable NOP is discouraged."
+                        {:opcode opcode}))
+               (recur (rest remaining) stack altstack conditions
+                      op-count code-separator))
+
+             (= opcode op-verify)
+             (let [[stack value] (pop-stack stack opcode)]
+               (when-not (truthy? value)
+                 (fail! :bitcoin.consensus/verify
+                        "OP_VERIFY evaluated false." {}))
+               (recur (rest remaining) stack altstack conditions
+                      op-count code-separator))
+
+             (= opcode op-return)
+             (fail! :bitcoin.consensus/op-return
+                    "Executed OP_RETURN." {})
+
+             (= opcode op-toaltstack)
+             (let [[stack value] (pop-stack stack opcode)]
+               (recur (rest remaining) stack (conj altstack value)
+                      conditions op-count code-separator))
+
+             (= opcode op-fromaltstack)
+             (let [[altstack value] (pop-stack altstack opcode)]
+               (recur (rest remaining) (conj stack value) altstack
+                      conditions op-count code-separator))
+
+             (= opcode 0x6d)
+             (do
+               (require-items! stack 2 opcode)
+               (recur (rest remaining) (vec (drop-last 2 stack))
+                      altstack conditions op-count code-separator))
+
+             (= opcode 0x6e)
+             (do
+               (require-items! stack 2 opcode)
+               (let [values (take-last 2 stack)]
+                 (recur (rest remaining) (into stack values)
+                        altstack conditions op-count code-separator)))
+
+             (= opcode 0x6f)
+             (do
+               (require-items! stack 3 opcode)
+               (recur (rest remaining) (into stack (take-last 3 stack))
+                      altstack conditions op-count code-separator))
+
+             (= opcode 0x70)
+             (do
+               (require-items! stack 4 opcode)
+               (let [start (- (count stack) 4)
+                     values (subvec stack start (+ start 2))]
+                 (recur (rest remaining) (into stack values)
+                        altstack conditions op-count code-separator)))
+
+             (= opcode 0x71)
+             (do
+               (require-items! stack 6 opcode)
+               (let [prefix (vec (drop-last 6 stack))
+                     [a b c d e f] (take-last 6 stack)]
+                 (recur (rest remaining)
+                        (into prefix [c d e f a b])
+                        altstack conditions op-count code-separator)))
+
+             (= opcode 0x72)
+             (do
+               (require-items! stack 4 opcode)
+               (let [prefix (vec (drop-last 4 stack))
+                     [a b c d] (take-last 4 stack)]
+                 (recur (rest remaining)
+                        (into prefix [c d a b])
+                        altstack conditions op-count code-separator)))
+
+             (= opcode 0x73)
+             (let [[_ value] (pop-stack stack opcode)]
+               (recur (rest remaining)
+                      (if (truthy? value) (conj stack value) stack)
+                      altstack conditions op-count code-separator))
+
+             (= opcode 0x74)
+             (recur (rest remaining)
+                    (conj stack (encode-number (count stack)))
+                    altstack conditions op-count code-separator)
+
+             (= opcode op-drop)
+             (let [[stack _] (pop-stack stack opcode)]
+               (recur (rest remaining) stack altstack conditions
+                      op-count code-separator))
+
+             (= opcode op-dup)
+             (let [[_ value] (pop-stack stack opcode)]
+               (recur (rest remaining) (conj stack value) altstack
+                      conditions op-count code-separator))
+
+             (= opcode 0x77)
+             (do
+               (require-items! stack 2 opcode)
+               (let [value (peek stack)]
+                 (recur (rest remaining)
+                        (conj (vec (drop-last 2 stack)) value)
+                        altstack conditions op-count code-separator)))
+
+             (= opcode 0x78)
+             (do
+               (require-items! stack 2 opcode)
+               (recur (rest remaining)
+                      (conj stack (nth stack (- (count stack) 2)))
+                      altstack conditions op-count code-separator))
+
+             (contains? #{0x79 0x7a} opcode)
+             (let [[stack number-bytes] (pop-stack stack opcode)
+                   index (script-number number-bytes minimal? 4)]
+               (when (or (neg? index) (>= index (count stack)))
+                 (fail! :bitcoin.consensus/invalid-stack-operation
+                        "OP_PICK/OP_ROLL index is outside the stack."
+                        {:index index :count (count stack)}))
+               (let [position (- (count stack) index 1)
+                     value (nth stack position)
+                     stack
+                     (if (= opcode 0x7a)
+                       (vec (concat (subvec stack 0 position)
+                                    (subvec stack (inc position))))
+                       stack)]
+                 (recur (rest remaining) (conj stack value)
+                        altstack conditions op-count code-separator)))
+
+             (= opcode 0x7b)
+             (do
+               (require-items! stack 3 opcode)
+               (let [prefix (vec (drop-last 3 stack))
+                     [a b c] (take-last 3 stack)]
+                 (recur (rest remaining) (into prefix [b c a])
+                        altstack conditions op-count code-separator)))
+
+             (= opcode op-swap)
+             (do
+               (when (< (count stack) 2)
+                 (fail! :bitcoin.consensus/invalid-stack-operation
+                        "OP_SWAP requires two items." {}))
+               (let [left (nth stack (- (count stack) 2))
+                     right (peek stack)
+                     stack (-> stack pop pop (conj right left))]
+                 (recur (rest remaining) stack altstack conditions
+                        op-count code-separator)))
+
+             (= opcode 0x7d)
+             (do
+               (require-items! stack 2 opcode)
+               (let [prefix (vec (drop-last 2 stack))
+                     [a b] (take-last 2 stack)]
+                 (recur (rest remaining) (into prefix [b a b])
+                        altstack conditions op-count code-separator)))
+
+             (= opcode op-size)
+             (let [[_ value] (pop-stack stack opcode)]
+               (recur (rest remaining)
+                      (conj stack (encode-number (count value)))
+                      altstack conditions op-count code-separator))
+
+             (contains? #{op-equal op-equalverify} opcode)
+             (do
+               (when (< (count stack) 2)
+                 (fail! :bitcoin.consensus/invalid-stack-operation
+                        "Equality opcode requires two items." {}))
+               (let [right (peek stack)
+                     left (peek (pop stack))
+                     equal? (= left right)
+                     stack (-> stack pop pop)]
+                 (when (and (= opcode op-equalverify) (not equal?))
+                   (fail! :bitcoin.consensus/equalverify
+                          "OP_EQUALVERIFY failed." {}))
+                 (recur (rest remaining)
+                        (if (= opcode op-equal)
+                          (conj stack (if equal? [1] []))
+                          stack)
+                        altstack conditions op-count code-separator)))
+
+             (contains? #{0x8b 0x8c 0x8f 0x90 0x91 0x92} opcode)
+             (let [[stack value] (pop-stack stack opcode)
+                   number (script-number value minimal? 4)
+                   result
+                   (case opcode
+                     0x8b (inc number)
+                     0x8c (dec number)
+                     0x8f (- number)
+                     0x90 (abs number)
+                     0x91 (if (zero? number) 1 0)
+                     0x92 (if (zero? number) 0 1))]
+               (recur (rest remaining)
+                      (conj stack (encode-number result))
+                      altstack conditions op-count code-separator))
+
+             (contains? #{0x93 0x94 0x9a 0x9b 0x9c 0x9d 0x9e
+                          0x9f 0xa0 0xa1 0xa2 0xa3 0xa4} opcode)
+             (do
+               (require-items! stack 2 opcode)
+               (let [right (script-number (peek stack) minimal? 4)
+                     left (script-number (peek (pop stack)) minimal? 4)
+                     stack (-> stack pop pop)
+                     result
+                     (case opcode
+                       0x93 (+ left right)
+                       0x94 (- left right)
+                       0x9a (if (and (not (zero? left))
+                                     (not (zero? right))) 1 0)
+                       0x9b (if (or (not (zero? left))
+                                    (not (zero? right))) 1 0)
+                       0x9c (if (= left right) 1 0)
+                       0x9d (if (= left right) 1 0)
+                       0x9e (if (not= left right) 1 0)
+                       0x9f (if (< left right) 1 0)
+                       0xa0 (if (> left right) 1 0)
+                       0xa1 (if (<= left right) 1 0)
+                       0xa2 (if (>= left right) 1 0)
+                       0xa3 (min left right)
+                       0xa4 (max left right))]
+                 (when (and (= opcode 0x9d) (zero? result))
+                   (fail! :bitcoin.consensus/numequalverify
+                          "OP_NUMEQUALVERIFY failed." {}))
+                 (recur (rest remaining)
+                        (if (= opcode 0x9d)
+                          stack
+                          (conj stack (encode-number result)))
+                        altstack conditions op-count code-separator)))
+
+             (= opcode 0xa5)
+             (do
+               (require-items! stack 3 opcode)
+               (let [maximum (script-number (peek stack) minimal? 4)
+                     minimum (script-number (peek (pop stack)) minimal? 4)
+                     value (script-number (peek (pop (pop stack)))
+                                          minimal? 4)
+                     stack (vec (drop-last 3 stack))]
+                 (recur (rest remaining)
+                        (conj stack
+                              (if (and (<= minimum value)
+                                       (< value maximum))
+                                [1] []))
+                        altstack conditions op-count code-separator)))
+
+             (contains? #{op-ripemd160 op-sha1 op-sha256
+                          op-hash160 op-hash256} opcode)
+             (let [[stack value] (pop-stack stack opcode)
+                   result (case opcode
+                            0xa6 (ripemd value)
+                            0xa7 (sha1 value)
+                            0xa8 (sha256 value)
+                            0xa9 (hash160 value)
+                            0xaa (vec (sha256d/sha256d-bytes value)))]
+               (recur (rest remaining) (conj stack result) altstack
+                      conditions op-count code-separator))
+
+             (= opcode op-checklocktimeverify)
+             (if-not (contains? (:flags context) :cltv)
+               (recur (rest remaining) stack altstack conditions
+                      op-count code-separator)
+               (let [[_ value] (pop-stack stack opcode)
+                     locktime (script-number value minimal? 5)
+                     tx-locktime (get-in context [:transaction :locktime])
+                     sequence
+                     (get-in context
+                             [:transaction :inputs (:input-index context)
+                              :sequence])]
+                 (when (or (neg? locktime)
+                           (not= (< locktime 500000000)
+                                 (< tx-locktime 500000000))
+                           (> locktime tx-locktime)
+                           (= sequence 0xffffffff))
+                   (fail! :bitcoin.consensus/unsatisfied-locktime
+                          "OP_CHECKLOCKTIMEVERIFY is unsatisfied."
+                          {:required locktime :transaction tx-locktime}))
+                 (recur (rest remaining) stack altstack conditions
+                        op-count code-separator)))
+
+             (= opcode op-checksequenceverify)
+             (if-not (contains? (:flags context) :csv)
+               (recur (rest remaining) stack altstack conditions
+                      op-count code-separator)
+               (let [[_ value] (pop-stack stack opcode)
+                     required (script-number value minimal? 5)
+                     disable-flag 0x80000000
+                     type-flag 0x00400000
+                     mask 0x0000ffff
+                     sequence
+                     (get-in context
+                             [:transaction :inputs (:input-index context)
+                              :sequence])]
+                 (when (neg? required)
+                   (fail! :bitcoin.consensus/negative-locktime
+                          "OP_CHECKSEQUENCEVERIFY requires a nonnegative value."
+                          {:required required}))
+                 (when (zero? (bit-and required disable-flag))
+                   (when (or (< (get-in context [:transaction :version]) 2)
+                             (not (zero? (bit-and sequence disable-flag)))
+                             (not=
+                              (bit-and required type-flag)
+                              (bit-and sequence type-flag))
+                             (> (bit-and required (bit-or type-flag mask))
+                                (bit-and sequence
+                                         (bit-or type-flag mask))))
+                     (fail! :bitcoin.consensus/unsatisfied-sequence
+                            "OP_CHECKSEQUENCEVERIFY is unsatisfied."
+                            {:required required :sequence sequence})))
+                 (recur (rest remaining) stack altstack conditions
+                        op-count code-separator)))
+
+             (= opcode op-codeseparator)
+             (recur (rest remaining) stack altstack conditions
+                    op-count (if (= (:sigversion context) :tapscript)
+                               start end))
+
+             (contains? #{op-checksig op-checksigverify} opcode)
+             (do
+               (when (< (count stack) 2)
+                 (fail! :bitcoin.consensus/invalid-stack-operation
+                        "OP_CHECKSIG requires signature and public key." {}))
+               (let [pubkey (peek stack)
+                     signature-value (peek (pop stack))
+                     stack (-> stack pop pop)
+                     valid?
+                     (check-signature
+                      (assoc context :script script
+                             :code-separator code-separator)
+                      signature-value pubkey)]
+                 (when (and (not valid?)
+                            (contains? (:flags context) :nullfail)
+                            (seq signature-value))
+                   (fail! :bitcoin.consensus/signature-nullfail
+                          "Failed CHECKSIG signature must be empty." {}))
+                 (when (and (= opcode op-checksigverify) (not valid?))
+                   (fail! :bitcoin.consensus/checksigverify
+                          "OP_CHECKSIGVERIFY failed." {}))
+                 (recur (rest remaining)
+                        (if (= opcode op-checksig)
+                          (conj stack (if valid? [1] []))
+                          stack)
+                        altstack conditions op-count code-separator)))
+
+             (= opcode op-checksigadd)
+             (do
+               (when-not (= (:sigversion context) :tapscript)
+                 (fail! :bitcoin.consensus/bad-opcode
+                        "OP_CHECKSIGADD is only valid in tapscript." {}))
+               (require-items! stack 3 opcode)
+               (let [[stack pubkey] (pop-stack stack opcode)
+                     [stack number] (pop-stack stack opcode)
+                     [stack signature-value] (pop-stack stack opcode)
+                     number (script-number number minimal? 4)
+                     valid?
+                     (check-signature
+                      (assoc context :script script
+                             :code-separator code-separator)
+                      signature-value pubkey)]
+                 (recur (rest remaining)
+                        (conj stack (encode-number
+                                     (+ number (if valid? 1 0))))
+                        altstack conditions op-count code-separator)))
+
+             (contains? #{op-checkmultisig
+                          op-checkmultisigverify} opcode)
+             (let [_ (when tapscript?
+                       (fail! :bitcoin.consensus/tapscript-checkmultisig
+                              "CHECKMULTISIG is disabled in tapscript." {}))
+                   [stack key-count-bytes] (pop-stack stack opcode)
+                   key-count (script-number key-count-bytes minimal? 4)]
+               (when-not (<= 0 key-count 20)
+                 (fail! :bitcoin.consensus/pubkey-count
+                        "OP_CHECKMULTISIG public-key count is invalid."
+                        {:count key-count}))
+               (let [op-count (+ op-count key-count)]
+                 (when (> op-count max-ops)
+                   (fail! :bitcoin.consensus/op-count
+                          "CHECKMULTISIG exceeds MAX_OPS_PER_SCRIPT." {}))
+                 (require-items! stack (inc key-count) opcode)
+                 (let [[stack pubkeys] (take-stack-items stack key-count)
+                       [stack signature-count-bytes]
+                       (pop-stack stack opcode)
+                       signature-count
+                       (script-number signature-count-bytes minimal? 4)]
+                   (when-not (<= 0 signature-count key-count)
+                     (fail! :bitcoin.consensus/signature-count
+                            "OP_CHECKMULTISIG signature count is invalid."
+                            {:count signature-count
+                             :pubkeys key-count}))
+                   (require-items! stack (inc signature-count) opcode)
+                   (let [[stack signatures]
+                         (take-stack-items stack signature-count)
+                         signatures (vec (reverse signatures))
+                         pubkeys (vec (reverse pubkeys))
+                         [stack dummy] (pop-stack stack opcode)
+                         _ (when (and (contains? (:flags context)
+                                                 :null-dummy)
+                                      (seq dummy))
+                             (fail! :bitcoin.consensus/null-dummy
+                                    "CHECKMULTISIG dummy must be empty." {}))
+                         signature-context
+                         (assoc context :script script
+                                :code-separator code-separator
+                                :delete-signatures signatures)
+                         valid?
+                         (loop [signature-index 0 key-index 0]
+                           (cond
+                             (= signature-index signature-count) true
+                             (> (- signature-count signature-index)
+                                (- key-count key-index)) false
+                             (check-signature
+                              signature-context
+                              (nth signatures signature-index)
+                              (nth pubkeys key-index))
+                             (recur (inc signature-index)
+                                    (inc key-index))
+                             :else
+                             (recur signature-index (inc key-index))))]
+                     (when (and (not valid?)
+                                (contains? (:flags context) :nullfail)
+                                (some seq signatures))
+                       (fail! :bitcoin.consensus/signature-nullfail
+                              "Failed CHECKMULTISIG signatures must be empty."
+                              {}))
+                     (when (and (= opcode op-checkmultisigverify)
+                                (not valid?))
+                       (fail! :bitcoin.consensus/checkmultisigverify
+                              "OP_CHECKMULTISIGVERIFY failed." {}))
+                     (recur
+                      (rest remaining)
+                      (if (= opcode op-checkmultisig)
+                        (conj stack (if valid? [1] []))
+                        stack)
+                      altstack conditions op-count code-separator)))))
+
+             :else
+             (fail! :bitcoin.consensus/bad-opcode
+                    "Unsupported or reserved opcode executed."
+                    {:opcode opcode})))
+         (do
+           (when (seq conditions)
+             (fail! :bitcoin.consensus/unbalanced-conditional
+                    "Script ended inside a conditional." {}))
+           stack))))))))
+
+(defn- p2sh? [script]
+  (and (= 23 (count script))
+       (= [op-hash160 20] (subvec (vec script) 0 2))
+       (= op-equal (peek script))))
+
+(defn- witness-program [script]
+  (let [script (vec script)]
+    (when (and (<= 4 (count script) 42)
+               (or (= op-0 (first script))
+                   (<= op-1 (first script) op-16))
+               (= (second script) (- (count script) 2)))
+      {:version (if (= op-0 (first script))
+                  0 (inc (- (first script) op-1)))
+       :program (subvec script 2)})))
+
+(defn- witness-sigop-count [input coin witness]
+  (let [script-pubkey (vec (:script-pubkey coin))
+        script-sig (vec (:script-sig input))
+        native (witness-program script-pubkey)
+        wrapped
+        (when (and (p2sh? script-pubkey) (push-only? script-sig))
+          (some-> (last (parse script-sig)) :data witness-program))
+        {:keys [version program]} (or native wrapped)]
+    (if (not= version 0)
+      0
+      (case (count program)
+        20 1
+        32 (if-let [witness-script (peek (vec witness))]
+             (sigop-count witness-script true)
+             0)
+        0))))
+
+(defn transaction-sigop-cost
+  "Return BIP141 sigop cost for a transaction and aligned prevout coins."
+  [transaction coins flags]
+  (let [legacy
+        (+ (reduce + 0 (map #(sigop-count (:script-sig %) false)
+                            (:inputs transaction)))
+           (reduce + 0 (map #(sigop-count (:script-pubkey %) false)
+                            (:outputs transaction))))
+        p2sh
+        (if (contains? flags :p2sh)
+          (reduce
+           + 0
+           (map
+            (fn [input coin]
+              (if (and coin (p2sh? (:script-pubkey coin))
+                       (push-only? (:script-sig input)))
+                (if-let [redeem-script
+                         (:data (last (parse (:script-sig input))))]
+                  (sigop-count redeem-script true)
+                  0)
+                0))
+            (:inputs transaction) coins))
+          0)
+        witness
+        (if (contains? flags :witness)
+          (reduce
+           + 0
+           (map witness-sigop-count
+                (:inputs transaction) coins
+                (or (:witnesses transaction)
+                    (repeat (count (:inputs transaction)) []))))
+          0)]
+    (+ (* witness-scale-factor (+ legacy p2sh)) witness)))
+
+(defn- final-stack! [stack cleanstack?]
+  (when (or (empty? stack) (not (truthy? (peek stack))))
+    (fail! :bitcoin.consensus/eval-false
+           "Script evaluated false." {}))
+  (when (and cleanstack? (not= 1 (count stack)))
+    (fail! :bitcoin.consensus/cleanstack
+           "Script left more than one stack item." {:count (count stack)}))
+  true)
+
+(declare verify-witness-program!)
+
+(defn- taproot-annex? [value]
+  (and (seq value) (= 0x50 (bit-and 0xff (first value)))))
+
+(defn- tapleaf-hash [leaf-version tapscript]
+  (schnorr/tagged-hash
+   "TapLeaf"
+   (concat [leaf-version]
+           (codec/compact-size (count tapscript)) tapscript)))
+
+(defn- tapbranch-hash [left right]
+  (let [[left right] (if (neg? (compare (vec left) (vec right)))
+                       [left right] [right left])]
+    (schnorr/tagged-hash "TapBranch" (concat left right))))
+
+(defn- verify-control-block!
+  [public-key tapscript control-block]
+  (let [size (count control-block)]
+    (when-not (and (<= 33 size 4129)
+                   (zero? (mod (- size 33) 32)))
+      (fail! :bitcoin.consensus/taproot-control-size
+             "Taproot control block has an invalid size." {:size size}))
+    (let [header (bit-and 0xff (first control-block))
+          leaf-version (bit-and header 0xfe)
+          internal-key (subvec control-block 1 33)
+          merkle-root
+          (reduce
+           tapbranch-hash
+           (tapleaf-hash leaf-version tapscript)
+           (map vec (partition 32 (subvec control-block 33))))
+          tweaked (schnorr/tweak-public-key internal-key merkle-root)]
+      (when-not (and tweaked
+                     (= public-key (:x tweaked))
+                     (= (bit-and header 1) (:parity tweaked)))
+        (fail! :bitcoin.consensus/taproot-control
+               "Taproot control block does not commit to the output key." {}))
+      {:leaf-version leaf-version
+       :tapleaf-hash (tapleaf-hash leaf-version tapscript)})))
+
+(defn- verify-taproot!
+  [transaction input-index witness public-key flags]
+  (when (empty? witness)
+    (fail! :bitcoin.consensus/taproot-witness-empty
+           "Taproot witness is empty." {}))
+  (let [annex (when (and (<= 2 (count witness))
+                         (taproot-annex? (peek witness)))
+                (peek witness))
+        stack (if annex (pop witness) witness)]
+    (if (= 1 (count stack))
+      (let [signature-value (vec (peek stack))
+          size (count signature-value)
+          _ (when-not (contains? #{64 65} size)
+              (fail! :bitcoin.consensus/taproot-signature-size
+                     "Taproot key-path signature must be 64 or 65 bytes."
+                     {:size size}))
+          hash-type (if (= size 65)
+                      (bit-and 0xff (peek signature-value))
+                      0)
+          _ (when (and (= size 65) (zero? hash-type))
+              (fail! :bitcoin.consensus/taproot-hash-type
+                     "Explicit SIGHASH_DEFAULT is invalid." {}))
+          signature-bytes (subvec signature-value 0 64)
+          digest (sighash/taproot-keypath
+                  transaction input-index (:prevout-coins transaction)
+                  hash-type annex)]
+      (when-not (schnorr/verify digest public-key signature-bytes)
+        (fail! :bitcoin.consensus/taproot-signature
+               "Taproot key-path Schnorr signature failed." {}))
+        true)
+      (do
+        (when (< (count stack) 2)
+          (fail! :bitcoin.consensus/taproot-witness
+                 "Taproot script path is missing script or control block." {}))
+        (let [control-block (vec (peek stack))
+              tapscript (vec (peek (pop stack)))
+              initial-stack (vec (drop-last 2 stack))
+              witness-size
+              (+ (count (codec/compact-size (count witness)))
+                 (reduce
+                  + 0
+                  (map
+                   #(+ (count (codec/compact-size (count %))) (count %))
+                   witness)))
+              validation-weight-left (volatile! (+ 50 witness-size))
+              {:keys [leaf-version tapleaf-hash]}
+              (verify-control-block! public-key tapscript control-block)]
+          ;; Unknown leaf versions are forward-compatible after commitment
+          ;; validation. Leaf 0xc0 executes BIP342 tapscript.
+          (if (not= leaf-version 0xc0)
+            (if (contains? flags :discourage-upgradable-taproot-version)
+              (fail! :bitcoin.consensus/discouraged-taproot-version
+                     "Upgradable Taproot leaf version is discouraged."
+                     {:leaf-version leaf-version})
+              true)
+            (do
+              (when (some #(> (count %) max-element-size) initial-stack)
+                (fail! :bitcoin.consensus/push-size
+                       "Tapscript initial stack element exceeds 520 bytes." {}))
+              (final-stack!
+               (evaluate
+                initial-stack tapscript
+                {:transaction transaction :input-index input-index
+                 :coin (nth (:prevout-coins transaction) input-index)
+                 :sigversion :tapscript :flags flags
+                 :annex annex :tapleaf-hash tapleaf-hash
+                 :validation-weight-left validation-weight-left})
+               true))))))))
+
+(defn- verify-witness-program!
+  [transaction input-index coin witness {:keys [version program]} flags]
+  (cond
+    (and (= version 1) (= 32 (count program))
+         (contains? flags :taproot))
+    (verify-taproot!
+     transaction input-index (vec witness) program flags)
+
+    (not= version 0)
+    ;; Unknown witness versions are anyone-can-spend until a soft fork.
+    (if (contains? flags :discourage-upgradable-witness-program)
+      (fail! :bitcoin.consensus/discouraged-witness-program
+             "Upgradable witness program is discouraged."
+             {:version version})
+      true)
+
+    :else
+    (let [[stack script]
+          (case (count program)
+            20
+            (do
+              (when-not (= 2 (count witness))
+                (fail! :bitcoin.consensus/witness-program-mismatch
+                       "P2WPKH requires two witness elements." {}))
+              [witness
+               (vec (concat [op-dup op-hash160 20]
+                            program [op-equalverify op-checksig]))])
+
+            32
+            (do
+              (when (empty? witness)
+                (fail! :bitcoin.consensus/witness-empty
+                       "P2WSH witness is empty." {}))
+              (let [script (vec (peek witness))]
+                (when-not (= program (sha256 script))
+                  (fail! :bitcoin.consensus/witness-program-mismatch
+                         "P2WSH script hash does not match." {}))
+                [(pop (vec witness)) script]))
+
+            (fail! :bitcoin.consensus/witness-program-length
+                   "Witness v0 program must be 20 or 32 bytes."
+                   {:length (count program)}))
+          _ (when (some #(> (count %) max-element-size) stack)
+              (fail! :bitcoin.consensus/push-size
+                     "Witness stack element exceeds 520 bytes." {}))
+          result
+          (evaluate stack script
+                    {:transaction transaction :input-index input-index
+                     :coin coin :sigversion :witness-v0 :flags flags})]
+      (final-stack! result true))))
+
+(defn verify-input
+  "Consensus Script verification callback for utxo/apply-block.
+
+  This implements legacy execution, P2SH, native/wrapped SegWit v0, strict DER,
+  and clean-stack semantics. It returns exactly true or throws typed ex-info."
+  ([transaction input-index coin]
+   (verify-input transaction input-index coin default-flags))
+  ([transaction input-index coin flags]
+   (let [input (nth (:inputs transaction) input-index)
+         script-sig (vec (:script-sig input))
+         script-pubkey (vec (:script-pubkey coin))
+         witness (vec (or (nth (:witnesses transaction) input-index nil) []))
+         context {:transaction transaction :input-index input-index
+                  :coin coin :sigversion :base :flags flags}
+         _ (when (and (contains? flags :sig-push-only)
+                      (not (push-only? script-sig)))
+             (fail! :bitcoin.consensus/sig-push-only
+                    "scriptSig must contain only push operations." {}))
+         stack-after-sig (evaluate [] script-sig context)
+         saved-stack stack-after-sig
+         stack-after-pubkey
+         (evaluate stack-after-sig script-pubkey context)
+         native-witness (and (contains? flags :witness)
+                             (witness-program script-pubkey))]
+     (final-stack! stack-after-pubkey false)
+     (cond
+       native-witness
+       (do
+         (when (seq script-sig)
+           (fail! :bitcoin.consensus/witness-malleated
+                  "Native witness scriptSig must be empty." {}))
+         (verify-witness-program!
+          transaction input-index coin witness native-witness flags))
+
+       (and (contains? flags :p2sh) (p2sh? script-pubkey))
+       (do
+         (when-not (push-only? script-sig)
+           (fail! :bitcoin.consensus/sig-push-only
+                  "P2SH scriptSig must contain pushes only." {}))
+         (when (empty? saved-stack)
+           (fail! :bitcoin.consensus/eval-false
+                  "P2SH redeemScript is missing." {}))
+         (let [redeem-script (vec (peek saved-stack))
+               redeem-stack (pop saved-stack)
+               wrapped-witness
+               (and (contains? flags :witness)
+                    (witness-program redeem-script))]
+           (if wrapped-witness
+             (do
+               (when-not (= script-sig (push-data redeem-script))
+                 (fail! :bitcoin.consensus/witness-malleated-p2sh
+                        "P2SH witness redeemScript must be the only push." {}))
+               (verify-witness-program!
+                transaction input-index coin witness wrapped-witness
+                flags))
+             (let [result (evaluate redeem-stack redeem-script context)]
+               (when (and (contains? flags :witness)
+                          (seq witness))
+                 (fail! :bitcoin.consensus/unexpected-witness
+                        "Non-witness P2SH input carries witness data." {}))
+               (final-stack! result (contains? flags :cleanstack))))))
+
+       :else
+       (do
+         (when (and (contains? flags :witness) (seq witness))
+           (fail! :bitcoin.consensus/unexpected-witness
+                  "Legacy input carries witness data." {}))
+         (final-stack! stack-after-pubkey
+                       (contains? flags :cleanstack)))))))

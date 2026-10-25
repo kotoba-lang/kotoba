@@ -112,6 +112,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.sftp` | `org.ietf.sftp/src` | `kotobase.sftp.fs`, `kotobase.sftp.transport.sftp-subsystem`, `kotobase.sftp.transport.ssh`, `kotobase.sftp.transport.wire` (an external specification, publisher ietf.org) |
 | `org.ietf.smtp` | `org.ietf.smtp/src` | `smtp.client`, `smtp.protocol`, `smtp.transport` (an external specification, publisher ietf.org) |
 | `org.ietf.webdav` | `org.ietf.webdav/src` | `kotobase.protocols.http`, `kotobase.protocols.webdav` (an external specification, publisher ietf.org) |
+| `kotoba.bitcoinConsensus` | `kotoba.bitcoinConsensus/src` | `bitcoin.consensus.assumeutxo`, `bitcoin.consensus.block`, `bitcoin.consensus.chainstate`, `bitcoin.consensus.codec` (Kotoba project library) |
 | `kotoba.tenken` | `kotoba.tenken/src` | `tenken.eval`, `tenken.model`, `tenken.policy` (Kotoba project library) |
 | `kotoba.techIpfsSpecsUnixfs` | `kotoba.techIpfsSpecsUnixfs/src` | `unixfs.file` (Kotoba project library) |
 | `kotoba.occupation` | `kotoba.occupation/src` | `kotoba.occupation`, `kotoba.occupation.embedded`, `kotoba.occupation.wave` (Kotoba project library) |
