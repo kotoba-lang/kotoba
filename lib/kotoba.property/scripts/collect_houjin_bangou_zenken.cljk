@@ -1,0 +1,269 @@
+(ns collect-houjin-bangou-zenken
+  "Bulk ingest of the National Tax Agency 法人番号 全件データ (every corporate
+   entity Japan has issued a number to, ~5.8M rows) into the portable EDN
+   corpus this workspace queries with Datalog.
+
+   Why the bulk file and not the Web-API: the Web-API
+   (`cloud-itonami-isic-8291`'s `dossier.houjin-bangou`) answers one company at
+   a time and needs an Application ID the NTA issues to a named operator over
+   ~2-4 weeks. The 全件 download is the same authority's ingest path — no
+   account, one POST — and it is the only path that produces a universe.
+
+   Coverage gate: goes through `coverage/assert-collectable!` on the
+   JP/NTA-Houjin-Bangou authority entry, so it fails closed if that entry ever
+   stops being :allow-login-free.
+
+   Output is newline-delimited EDN (one map per line), NOT a single EDN vector:
+   at this record count a whole-file `read-string` is not workable, and the
+   query plane's `slurp-edn-lines` reader already expects this shape.
+
+   The corpus is a cache artifact, not a git artifact (~1.5 GB) — see `--out`
+   default and DATA-GOVERNANCE.md. Commit the *projections* built from it by
+   `scripts/project_houjin_bangou_corpus.cljk`, not the corpus.
+
+   `--skip`/`--limit` make the ingest shardable over disjoint row ranges; only
+   shard 0 writes the manifest line.
+
+   Usage:
+     # download this month's national file, then ingest it
+     kbb --backend sci -cp src scripts/collect_houjin_bangou_zenken.cljk --download
+     # or fetch only, then run N shards over the archive it wrote
+     kbb --backend sci -cp src scripts/collect_houjin_bangou_zenken.cljk --download --download-only
+     # or ingest an archive already on disk
+     kbb --backend sci -cp src scripts/collect_houjin_bangou_zenken.cljk --zip ~/.cache/houjin-bangou/00_zenkoku_all_20260731.zip
+     kbb --backend sci -cp src scripts/collect_houjin_bangou_zenken.cljk --zip <path> --limit 1000 --out /tmp/sample.edn"
+  (:require [kotoba.lang.text :as str]
+            [kotoba.property.coverage-runtime :as coverage]
+            [kotoba.property.houjin-bangou-zenken :as hb]
+            ["child_process" :as cp]
+            ["crypto" :as crypto]
+            ["fs" :as fs]
+            ["path" :as path]
+            ["readline" :as readline]
+            ["stream" :as stream]))
+
+(def cache-dir
+  (.join path (or (.-HOME js/process.env) ".") ".cache" "houjin-bangou"))
+
+(def default-out (.join path cache-dir "houjin-bangou-corpus.edn"))
+
+(def zenken-url "https://www.houjin-bangou.nta.go.jp/download/zenken/index.html")
+(def token-field
+  "jp.go.nta.houjin_bangou.framework.web.common.CNSFWTokenProcessor.request.token")
+
+(defn- arg-value [args option default]
+  (or (second (drop-while #(not= option %) args)) default))
+
+(defn- flag? [args option] (boolean (some #(= option %) args)))
+
+(defn- sha256-file [p]
+  (-> (.createHash crypto "sha256")
+      (.update (.readFileSync fs p))
+      (.digest "hex")))
+
+(defn- zip-entry-name
+  "The archive holds the CSV plus a detached PGP signature (`.csv.asc`); take
+   the CSV."
+  [zip]
+  (let [out (.toString (.execFileSync cp "unzip" #js ["-Z1" zip]))]
+    (->> (str/split-lines out)
+         (map str/trim)
+         (remove str/blank?)
+         (filter #(str/ends-with? % ".csv"))
+         first)))
+
+;; ─────────────────────────── download ───────────────────────────
+;;
+;; The download is a POST of a per-session token plus a file number, and the
+;; file numbers change every month — they are database ids, not stable names.
+;; So the page is read each time and the number is taken from the section the
+;; caller asked for, never hardcoded.
+
+(defn- section-file-no
+  "First `doDownload(N)` after the CSV/Unicode (or Shift_JIS) heading = 全国.
+
+   The page lists 全国 first, then each prefecture, under each of three
+   headings (`csv-sjis`, `csv-unicode`, and XML with no id)."
+  [html section]
+  (let [anchor (case section
+                 "sjis" "id=\"csv-sjis\""
+                 "unicode" "id=\"csv-unicode\""
+                 (throw (ex-info "unknown section" {:section section})))
+        at (str/index-of html anchor)]
+    (when at
+      (some-> (re-find #"doDownload\((\d+)\)" (subs html at)) second))))
+
+(defn- download! [section out-dir]
+  (js/Promise.
+   (fn [resolve* reject*]
+     (-> (js/fetch zenken-url)
+         (.then (fn [res]
+                  (let [cookies (some-> (.-headers res) (.getSetCookie))]
+                    (-> (.text res)
+                        (.then (fn [html] #js {:html html :cookies cookies}))))))
+         (.then
+          (fn [^js page]
+            (let [html (.-html page)
+                  token (second (re-find (re-pattern (str (str/replace token-field "." "\\.")
+                                                          "\" value=\"([^\"]+)\""))
+                                         html))
+                  file-no (section-file-no html section)
+                  cookie (str/join "; " (map #(first (str/split % #";"))
+                                             (or (.-cookies page) [])))]
+              (when-not (and token file-no)
+                (throw (ex-info "could not read the download form"
+                                {:token? (boolean token) :file-no file-no})))
+              (println (str "  form: file-no=" file-no " section=" section))
+              (js/fetch zenken-url
+                        #js {:method "POST"
+                             :headers #js {"Content-Type" "application/x-www-form-urlencoded"
+                                           "Referer" zenken-url
+                                           "Cookie" cookie}
+                             :body (str (js/encodeURIComponent token-field) "=" token
+                                        "&event=download&selDlFileNo=" file-no)}))))
+         (.then
+          (fn [res]
+            (let [disp (.get (.-headers res) "content-disposition")
+                  ;; RFC 5987: `filename*=utf-8'jp'00_zenkoku_all_20260731.zip`
+                  ;; — charset and *language* before the name, and the language
+                  ;; tag is not empty here.
+                  fname (some-> disp (->> (re-find #"filename\*?=(?:[A-Za-z0-9-]+'[^']*')?\"?([^\";]+)")) second str/trim)]
+              (when-not (and fname (str/starts-with? fname "00_zenkoku_all_"))
+                ;; Fail closed rather than ingest a prefecture file as if it
+                ;; were the nation: the file numbers move every month, and a
+                ;; wrong one still returns 200 with a perfectly valid archive.
+                (throw (ex-info (str "unexpected download filename — refusing to ingest: "
+                                     (pr-str fname) " (content-disposition: " disp ")")
+                                {:content-disposition disp :filename fname})))
+              (.mkdirSync fs out-dir #js {:recursive true})
+              (let [dest (.join path out-dir fname)
+                    sink (.createWriteStream fs dest)]
+                (-> (.-Readable stream)
+                    (.fromWeb (.-body res))
+                    (.pipe sink))
+                (.on sink "finish" (fn [] (resolve* dest)))
+                (.on sink "error" reject*)))))
+         (.catch reject*)))))
+
+;; ─────────────────────────── ingest ───────────────────────────
+
+(defn- ingest! [zip out {:keys [limit skip manifest? quiet?]}]
+  (let [entry (zip-entry-name zip)
+        content-sha256 (sha256-file zip)
+        observed-at (.toISOString (js/Date.))
+        publish (hb/publish-id entry)
+        _ (.mkdirSync fs (.dirname path out) #js {:recursive true})
+        tmp (str out ".partial")
+        sink (.createWriteStream fs tmp)
+        ;; `unzip -p` streams the member to stdout; nothing ever materialises
+        ;; the 1.5 GB CSV on disk.
+        proc (.spawn cp "unzip" #js ["-p" zip entry]
+                     #js {:stdio #js ["ignore" "pipe" "inherit"]})
+        rl (.createInterface readline #js {:input (.-stdout proc) :crlfDelay ##Inf})
+        state (atom {:rows 0 :written 0 :malformed 0 :bad-check-digit 0
+                     :mojibake 0 :pending nil})
+        manifest (hb/corpus-manifest {:publish publish
+                                      :content-sha256 content-sha256
+                                      :observed-at observed-at
+                                      :source-archive zip})]
+    (when manifest? (.write sink (str (pr-str manifest) "\n")))
+    (letfn [(emit! [line]
+              (let [rows (:rows @state)]
+                (if (and limit (>= rows (+ skip limit)))
+                  (.close rl)
+                  (if (< rows skip)
+                    ;; A skipped row is counted but never parsed: that is what
+                    ;; makes sharding cheap.
+                    (swap! state update :rows inc)
+                    (let [rec (hb/row->record (hb/parse-line line))]
+                      (swap! state update :rows inc)
+                      (if rec
+                        (do
+                          ;; Two integrity counters. Neither drops a row — the
+                          ;; authority's file is the authority — but a corpus
+                          ;; that reports 0/0 when it cannot read the encoding
+                          ;; would be indistinguishable from a clean one.
+                          (when-not (hb/valid-houjin-bangou? (:company/houjin-bangou rec))
+                            (swap! state update :bad-check-digit inc))
+                          (when (str/includes? (str (:company/legal-name rec)) "�")
+                            (swap! state update :mojibake inc))
+                          (.write sink (str (pr-str rec) "\n"))
+                          (swap! state update :written inc))
+                        (swap! state update :malformed inc))
+                      (when (and (not quiet?) (zero? (mod (:rows @state) 500000)))
+                        (println "  ..." (:rows @state) "rows")))))))]
+      (.on rl "line"
+           (fn [line]
+             ;; A quoted field may contain a newline, so a record is complete
+             ;; only once the *next* record starts.
+             (let [pending (:pending @state)]
+               (cond
+                 (hb/record-start? line)
+                 (do (when pending (emit! pending))
+                     (swap! state assoc :pending line))
+
+                 pending
+                 (swap! state assoc :pending (str pending "\n" line))
+
+                 ;; There is no header row in this file; a line that is neither
+                 ;; a record start nor a continuation is malformed.
+                 :else (swap! state update :malformed inc)))))
+      (.on rl "close"
+           (fn []
+             (when-let [pending (:pending @state)]
+               (swap! state assoc :pending nil)
+               (emit! pending))
+             ;; `--limit` closes the reader early; without killing the producer
+             ;; the process sits until `unzip` has streamed all 1.5 GB.
+             (try (.kill proc) (catch :default _ nil))
+             (.end sink
+                   (fn []
+                     (.renameSync fs tmp out)
+                     (let [{:keys [rows written malformed bad-check-digit mojibake]} @state]
+                       (when (pos? mojibake)
+                         (js/console.error
+                          (str "collect-houjin-bangou-zenken: WARNING " mojibake
+                               " name(s) contain U+FFFD — this is the Shift_JIS file"
+                               " being read as UTF-8. Re-download with --section unicode.")))
+                       (println (pr-str {:corpus out
+                                         :source-archive zip
+                                         :zip-entry entry
+                                         :publish publish
+                                         :content-sha256 content-sha256
+                                         :observed-at observed-at
+                                         :rows rows
+                                         :skip-rows skip
+                                         :written written
+                                         :malformed malformed
+                                         :bad-check-digit bad-check-digit
+                                         :mojibake mojibake
+                                         :bytes (.-size (.statSync fs out))})))))))))
+  nil)
+
+(defn -main []
+  (let [args (vec *command-line-args*)
+        zip (arg-value args "--zip" nil)
+        out (arg-value args "--out" default-out)
+        opts {:limit (when-let [l (arg-value args "--limit" nil)] (js/parseInt l 10))
+              :skip (js/parseInt (arg-value args "--skip" "0") 10)
+              :manifest? (not (flag? args "--no-manifest"))
+              :quiet? (flag? args "--quiet")}]
+    (when-not (or zip (flag? args "--download"))
+      (println "usage: collect_houjin_bangou_zenken.cljs (--download | --zip <00_zenkoku_all_*.zip>) [--out <corpus.edn>] [--limit N] [--skip N]")
+      (.exit js/process 2))
+    (coverage/assert-collectable! hb/source-id)
+    (if zip
+      (ingest! zip out opts)
+      (-> (download! (arg-value args "--section" "unicode") cache-dir)
+          (.then (fn [dest]
+                   (println (str "  downloaded " dest))
+                   ;; `--download-only` exists so a sharded ingest fetches the
+                   ;; archive once and then runs N readers over the same file,
+                   ;; instead of N downloads of 266 MB.
+                   (when-not (flag? args "--download-only")
+                     (ingest! dest out opts))))
+          (.catch (fn [e]
+                    (js/console.error (str "download failed: " (.-message e)))
+                    (.exit js/process 1)))))))
+
+(-main)

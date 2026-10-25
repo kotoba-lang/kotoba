@@ -1,0 +1,321 @@
+(ns collect-eu-contact-points
+  "EU intent プール -> **公開連絡点**（問い合わせフォーム URL・窓口メール・所在地）。
+
+   判断は `kotoba.property.eu-contact` と `kotoba.property.contact-point`
+   （どちらも純 cljc）が持つ。ここは I/O だけ: robots.txt を見て、サイトを
+   取りに行って、EDN を書く。
+
+   ## 日本版と何が違うか（3 つだけ）
+
+   1. **API を 1 回も引かない。** 日本は法人番号から gBizINFO で商号・住所・URL を
+      引き直すが、EU にその API は無い。識別子（VAT / CORDIS organisationID）も
+      住所も URL も **プール TSV の中にしかない** —— この収集器にとって
+      入力ファイルが registry そのものである。よって `--names`（社名解決）も
+      `--discover`（API 歩き）も無い。入口は 1 つ。
+   2. **語彙が多言語。** `eu-contact/vocabulary` を `contact-point` の各関数に渡す。
+      日本語の既定のままだと独語圏の `Kontakt` も `Impressum` も 1 件も拾えない。
+   3. **メールの分類が厳しい。** `eu-contact/classify-email`。GDPR 圏なので
+      `sales.john@` は窓口ではなく個人として落とす。理由は `eu-contact` の docstring。
+
+   ## 測れなかったことを 0 件と書かない
+
+   1 社 1 行、`:lead/status` は 6 値。**失敗した社も行として残す。**
+   最後に `SCANNED<TAB>n` を出し、1 件も歩けなかった run は **exit 2**
+   （0 でも 1 でもない = 「答えられなかった」）で終わる。
+
+   ## 追記できる（--merge-into）
+
+   intent は増える（毎月 CORDIS に新しい採択が載る）。既に台帳に在る
+   organisationID を候補から外し、既存 + 新規を書き出す。全件が既存なら exit 2。
+
+   usage:
+     kbb --backend sci -cp src scripts/collect_eu_contact_points.cljk --out <edn> \\
+       --pool <tsv> [--limit N] [--concurrency 4] [--merge-into <edn>]
+
+   ⚠ `npx --yes nbb` はこのマシンで壊れている。`nbb` を直接呼ぶ。
+
+   出典：CORDIS（欧州委員会）https://cordis.europa.eu/（CC BY 4.0）+ 各社の自己公表ページ。"
+  (:require [kotoba.lang.text :as str]
+            [kotoba.lang.edn :as edn]
+            [kotoba.property.contact-point :as cp]
+            [kotoba.property.site-probe :as probe]
+            [kotoba.property.eu-contact :as eu]
+            [kotoba.property.bulk-csv :as csv]
+            ["fs" :as fs]))
+
+(def argv (vec *command-line-args*))
+(defn- arg [n d] (or (second (drop-while #(not= n %) argv)) d))
+(defn- int-arg [n d] (let [v (arg n nil)] (if v (js/parseInt v 10) d)))
+
+(defn- die!
+  "**`.exit` を使う。** `exitCode` を立てて throw すると、nbb が例外を node の
+   最上位まで運んで **exit 1** にする —— 契約に書いた exit 2 / 3 が出ない
+   （実測 2026-08-25、`Refusing to report a pass` が exit 1 で返った）。
+   『答えられなかった』を 0 でも 1 でもない値で言うのがこの経路の要点なので、
+   その値が出ないなら経路が無いのと同じ。"
+  [code msg]
+  (js/console.error msg)
+  (.exit js/process code))
+
+(def ^{:doc "origin -> robots.txt 本文。プロセス全体で 1 つ。"} robots-cache (atom {}))
+
+(defn- now [] (.toISOString (js/Date.)))
+(defn- sleep [ms] (js/Promise. (fn [res] (js/setTimeout res ms))))
+
+;; ---------------------------------------------------------------------------
+;; fetch — 落ちても例外にしない。1 社のタイムアウトで全体を止めない。
+
+(defn- fetch-text
+  "[status body final-url] を返す。取りに行けなかったときは [nil nil nil]。
+   **status 0 と status 404 を同じ nil に畳まない。**
+
+   `accept-language` を EU 向けにする —— `ja` を送ると、多言語サイトが
+   日本語版を返して語彙が当たらないことがある。"
+  ([url ms] (fetch-text url ms nil))
+  ([url ms headers]
+   (let [ctl (js/AbortController.)
+         t (js/setTimeout #(.abort ctl) ms)]
+     (-> (js/fetch url (clj->js {:signal (.-signal ctl)
+                                 :redirect "follow"
+                                 :headers (merge {"user-agent" cp/user-agent
+                                                  "accept-language" "en;q=1.0,de;q=0.9,fr;q=0.9,es;q=0.9,it;q=0.9"}
+                                                 headers)}))
+         (.then (fn [^js res]
+                  (-> (.text res)
+                      (.then (fn [body] [(.-status res) body (.-url res)]))
+                      (.catch (fn [_] [(.-status res) nil (.-url res)])))))
+         (.catch (fn [_] [nil nil nil]))
+         (.finally (fn [] (js/clearTimeout t)))))))
+
+;; ---------------------------------------------------------------------------
+;; 1 社を観測する
+
+(defn- probe-contact
+  "homepage を起点に連絡点を探す。robots.txt に拒まれたパスには行かない。"
+  [site-url robots-cache delay-ms]
+  ;; ⚠ 以前は**種の origin の robots だけ**で判定し、path を `^org` の str/replace で
+  ;; 切り出していた。cross-origin の候補では replace が効かず **path が URL 丸ごとに
+  ;; なり、どの Disallow にも前方一致しない** —— 判定が常に「許可」に倒れ、別ホストの
+  ;; robots.txt は一度も読まれなかった。**拒否できない検査は、検査していないのと
+  ;; 同じ値を返す。** 判定は `site-probe/blocked?*`（origin ごとに引いてキャッシュ）へ。
+  (let [org (cp/origin site-url)]
+    (-> (probe/blocked?* robots-cache site-url)
+      (.then (fn [seed-blocked?]
+       (if seed-blocked?
+         {:status :robots-disallowed}
+      (-> (fetch-text site-url 20000)
+          (.then
+           (fn [[hstatus home]]
+             (if-not (and hstatus home)
+               {:status :fetch-failed :note (str "homepage status=" (or hstatus "none"))}
+               ;; **fetch の前に順位を決める。** 1 件目が通った時点で止めるので、
+               ;; 順序が精度そのものになる。
+               (let [candidates (->> (concat (cp/discover-contact-links home site-url eu/vocabulary)
+                                             (map #(str org %) eu/common-contact-paths))
+                                     (#(cp/rank-contact-candidates % eu/vocabulary))
+                                     (take 8)
+                                     vec)]
+                 (-> (reduce
+                      (fn [p url]
+                        (.then p (fn [found]
+                                   (if found
+                                     found
+                                     (-> (sleep delay-ms)
+                                         ;; **候補ごとに、その URL のホストの robots で判定する。**
+                                         (.then (fn [] (probe/blocked?* robots-cache url)))
+                                         (.then (fn [blocked?]
+                                                  (if blocked? [nil nil nil] (fetch-text url 20000))))
+                                         (.then (fn [[st body final-url]]
+                                                  (when (and (= 200 st) body
+                                                             (cp/contact-page? body eu/contact-text-re))
+                                                    ;; 応答した URL を一字も変えずに載せる
+                                                    ;; （末尾スラッシュを落とすのが 301 の原因そのもの）。
+                                                    {:contact-url (or (not-empty (str final-url)) url)
+                                                     :html body}))))))))
+                      (js/Promise.resolve nil)
+                      candidates)
+                     (.then (fn [found]
+                              (if found
+                                (assoc found :status :ok :home-html home)
+                                {:status :no-contact-point :home-html home
+                                 :note (str "probed " (count candidates) " candidate path(s)")})))))))))))))))
+
+(defn- observe
+  "法人 -> observation map（`eu-contact/->record` に渡す形）。
+
+   URL が無ければ **1 リクエストも出さずに** `:no-website`。
+   ⚠ EU では母集団の 86.8% がこれになる（実測 2026-08-25: 8,831 のうち
+   `organizationURL` を持つのは 1,166）。**それは『連絡できない』ではなく
+   『郵送のチャネルになる』**であって、住所は 98.8% 取れている。"
+  [org delay-ms]
+  (let [site (cp/normalise-url (:url org))]
+    (if-not site
+      (js/Promise.resolve {:status :no-website :observed-at (now)})
+      ;; robots は `site-probe/blocked?*` が origin ごとに引く。cache を渡すだけ。
+      (-> (probe-contact site robots-cache delay-ms)
+          (.then (fn [{:keys [status contact-url html home-html note]}]
+                   (let [pages (remove nil? [html home-html])
+                         emails (->> pages (mapcat eu/extract-emails) distinct vec)]
+                     (cond-> {:status status :observed-at (now) :note note}
+                       contact-url (assoc :contact-url contact-url)
+                       (seq emails) (assoc :emails emails)
+                       ;; **語彙を渡す。** 既定のままだと EU の断り書きを 1 語も見ない。
+                       html (assoc :solicitation-forbidden?
+                                   (cp/solicitation-forbidden? html eu/solicitation-forbidden-re))))))
+          (.catch (fn [_] {:status :fetch-failed :observed-at (now) :note "probe threw"}))))))
+
+;; ---------------------------------------------------------------------------
+;; プール TSV を読む — この収集器にとって、これが registry である
+
+(def pool-columns
+  "`collect_eu_intent_pool.cljs` が書く列の順序。**位置で読むので、生成器と
+   ここがずれたら黙って別の列を読む。** ヘッダ行のコメントに同じ並びを書いてある。"
+  [:organisation-id :intent-signal :name :street :post-code :city :country
+   :vat :url :contact-form :sme :base :boost :measured :unmeasured])
+
+(defn- read-pool
+  "プール TSV -> 行の map。
+
+   ⚠ **行を `trim` / `trimr` しない。** タブは空白なので、末尾の空フィールドが
+   まるごと消える —— そして消えた行は『列が足りない壊れた行』として捨てられる
+   （実測 2026-08-25、boost シグナルが全部測れた行 = `unmeasured` が空の行が
+   1 件残らず落ちた）。落とすのは CR だけにする。"
+  [file limit]
+  (let [lines (->> (str (fs/readFileSync file "utf8"))
+                   str/split-lines
+                   (map #(str/replace % #"\r$" ""))
+                   (remove str/blank?)
+                   (remove #(str/starts-with? % "#")))]
+    (->> lines
+         (map (fn [line]
+                (let [cells (csv/split-tsv-row line)]
+                  (when (>= (count cells) (count pool-columns))
+                    (let [m (zipmap pool-columns cells)]
+                      (-> m
+                          (update :sme #(case % "true" true "false" false nil))
+                          (assoc :intent-signal (not-empty (str/trim (str (:intent-signal m)))))))))))
+         (remove nil?)
+         (remove #(str/blank? (str (:organisation-id %))))
+         (take limit)
+         vec)))
+
+(defn- ->org
+  "プール行 -> `eu-cordis/organisation` と同じ形。**空文字は nil に畳む**
+   （TSV は nil を書けないので、読む側で戻す）。"
+  [row]
+  (let [nb (fn [k] (let [v (str/trim (str (get row k)))] (when-not (str/blank? v) v)))]
+    {:organisation-id (nb :organisation-id)
+     :name (nb :name) :vat (nb :vat)
+     :street (nb :street) :post-code (nb :post-code)
+     :city (nb :city) :country (nb :country)
+     :url (nb :url) :contact-form (nb :contact-form)
+     :sme (:sme row)}))
+
+;; ---------------------------------------------------------------------------
+
+(defn- process-one [row delay-ms]
+  (let [org (->org row)]
+    (-> (observe org delay-ms)
+        (.then (fn [obs]
+                 (let [rec (eu/->record org (assoc obs :intent-signal (:intent-signal row)))]
+                   (when-not (= :no-website (:lead/status rec))
+                     (js/console.error (str "  " (name (:lead/status rec)) "  "
+                                            (:company/legal-name rec)
+                                            (when-let [u (:contact/form-url rec)] (str "  " u)))))
+                   {:record rec})))
+        (.catch (fn [e]
+                  (js/console.error (str "  worker error on " (:organisation-id org) ": " (.-message e)))
+                  {:skipped true})))))
+
+(defn- process-all [rows delay-ms n]
+  (let [pending (atom (vec rows)) records (atom []) skipped (atom 0) done (atom 0)
+        total (count rows)
+        take-one! (fn [] (let [[h & t] @pending] (when h (reset! pending (vec t)) h)))]
+    (letfn [(worker []
+              (if-let [c (take-one!)]
+                (-> (process-one c delay-ms)
+                    (.then (fn [{:keys [record]}]
+                             (if record (swap! records conj record) (swap! skipped inc))
+                             (let [d (swap! done inc)]
+                               (when (zero? (mod d 200))
+                                 (js/console.error (str "  ... " d "/" total
+                                                        "  records=" (count @records)))))
+                             (worker))))
+                (js/Promise.resolve nil)))]
+      (-> (js/Promise.all (clj->js (vec (repeatedly (max 1 n) worker))))
+          (.then (fn [] {:records @records :skipped @skipped}))))))
+
+(defn -main []
+  (let [out (arg "--out" nil)
+        pool (arg "--pool" nil)
+        delay-ms (int-arg "--delay-ms" 400)
+        limit (int-arg "--limit" 500)
+        concurrency (int-arg "--concurrency" 4)
+        merge-into (arg "--merge-into" nil)
+        existing (when (and merge-into (.existsSync fs merge-into))
+                   (vec (remove :coverage/scanned
+                                (edn/read-string (str (fs/readFileSync merge-into "utf8"))))))
+        already (set (keep :company/cordis-organisation-id existing))]
+    (when-not out (die! 3 "--out is required"))
+    (when-not pool (die! 3 "--pool <tsv> is required (output of collect_eu_intent_pool.cljs)"))
+    (when merge-into
+      (js/console.error (str "merge-into: " (count existing) " existing record(s), "
+                             (count already) " organisation id(s) will be skipped")))
+    (let [rows (read-pool pool limit)]
+      (when (zero? (count rows))
+        (die! 2 (str "Refusing to report a pass: no usable rows in " pool
+                     " (expected " (count pool-columns) " tab-separated columns).")))
+      ;; **既に台帳に在る法人を候補から外す。** 外した分を別の会社で埋めない ——
+      ;; 埋めると『上位 N 件を見た』が嘘になる。
+      (let [rows (vec (remove #(contains? already (:organisation-id %)) rows))]
+        (js/console.error (str "candidates: " (count rows)
+                               (when (seq already) " (after merge-skip)")
+                               "  with-url=" (count (remove #(str/blank? (str (:url %))) rows))
+                               "  concurrency=" concurrency))
+        (when (zero? (count rows))
+          (die! 2 (str "Refusing to report a pass: every candidate was already in "
+                       merge-into ". Nothing new was measured.")))
+        (-> (process-all rows delay-ms concurrency)
+            (.then
+             (fn [{:keys [records skipped]}]
+               (if (zero? (count records))
+                 (die! 2 (str "Refusing to report a pass: 0 organisations scanned"
+                              " (skipped=" skipped "). Nothing was measured."))
+                 (let [new-n (count records)
+                       records (into (vec existing) records)
+                       cov (assoc (eu/coverage records)
+                                  :coverage/skipped-by-error skipped
+                                  :coverage/collected-at (now)
+                                  :source/attribution eu/attribution)]
+                   (fs/writeFileSync out (with-out-str
+                                           (println ";; 生成物。手で編集しない。")
+                                           (println ";; 再生成: kbb --backend sci -cp src scripts/collect_eu_contact_points.cljk")
+                                           (println (str ";; " eu/attribution))
+                                           (prn (into [cov] records))))
+                   (println (str "SCANNED\t" (count records)))
+                   (when merge-into
+                     (println (str "PRE-EXISTING\t" (count existing)))
+                     (println (str "NEW\t" new-n)))
+                   (println (str "CONTACTABLE\t" (:coverage/contactable cov)))
+                   (println (str "BY-STATUS\t" (pr-str (:coverage/by-status cov))))
+                   (println (str "BY-CHANNEL\t" (pr-str (:coverage/by-channel cov))))
+                   (println (str "FORM-URL\t" (:coverage/with-form-url cov)))
+                   (println (str "ROLE-EMAIL\t" (:coverage/with-role-email cov)))
+                   (println (str "PERSONAL-EMAILS-EXCLUDED\t" (:coverage/personal-emails-excluded cov)))
+                   (println (str "FORBIDDEN\t" (:coverage/solicitation-forbidden cov)))
+                   (println (str "SKIPPED\t" skipped))
+                   (println (str "OUT\t" out))
+                   ;; **明示的に終わる。** `fetch`(undici) の connection pool が
+                   ;; 開いたままだと node のイベントループが空にならず、
+                   ;; **書き出しが終わっているのにプロセスが live のまま残る**
+                   ;; （実測 2026-08-25: 3,000 件を書き終えた後も終了しなかった）。
+                   ;; 呼び出し側から見ると『まだ走っている』と区別が付かないので、
+                   ;; loop や cron に載せると次の周が来ない。
+                   ;; `setImmediate` を 1 度挟んで stdout を掃き出してから落とす。
+                   (js/setImmediate #(.exit js/process 0))))))
+            (.catch (fn [e]
+                      (when-not (:exit (ex-data e))
+                        (js/console.error (str "collector failed: " (.-message e)))
+                        (set! (.-exitCode js/process) 2)))))))))
+
+(-main)

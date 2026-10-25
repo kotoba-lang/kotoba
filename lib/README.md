@@ -105,6 +105,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.snmp` | `org.ietf.snmp/src` | `snmp.message`, `snmp.pdu`, `snmp.types` (an external specification, publisher ietf.org) |
 | `org.apache.arrow` | `org.apache.arrow/src` | `arrow.build`, `arrow.decode`, `arrow.flatbuffers`, `arrow.ipc` (an external specification, publisher apache.org) |
 | `org.ietf.oauth2` | `org.ietf.oauth2/src` | `oauth2.core`, `oauth2.pkce` (an external specification, publisher ietf.org) |
+| `kotoba.property` | `kotoba.property/src` | `kotoba.property`, `kotoba.property.audit-runtime`, `kotoba.property.bulk-csv`, `kotoba.property.collector` (Kotoba project library) |
 | `kotoba.paillier` | `kotoba.paillier/src` | `paillier.core` (Kotoba project library) |
 | `kotoba.omise` | `kotoba.omise/src` | `kotoba.omise`, `kotoba.omise.export`, `kotoba.omise.ui` (Kotoba project library) |
 | `kotoba.mst` | `kotoba.mst/src` | `mst.core` (Kotoba project library) |

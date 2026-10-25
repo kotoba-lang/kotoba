@@ -1,0 +1,147 @@
+(ns collect-kanpou-chotatsu
+  "官報 **政府調達版**の落札者等の公示を集める。
+
+   政府調達版は 号外 とは別の版で、URL の issue コードが `c` で始まる
+   （`20260818c00152`）。決算公告の収集器と同じ 90 日窓・同じ front page を使うが、
+   読むのはこの版だけ —— 本紙や号外には落札公示は載らない。
+
+   yield は隠さない: 版ごとに 見出し（項番 1 の出現）と レコード数 を印字する。
+
+   Requires `pdftotext` (poppler).
+
+   Usage:
+     kbb --backend sci -cp src scripts/collect_kanpou_chotatsu.cljk --back 14 --out <repo>/data/kanpou-chotatsu.datoms.edn"
+  (:require [kotoba.lang.text :as str]
+            [kotoba.property.coverage-runtime :as coverage]
+            [kotoba.property.kanpou-chotatsu :as kc]
+            ["child_process" :as cp]
+            ["fs" :as fs]
+            ["path" :as path]
+            ["stream" :as stream]))
+
+(def cache-dir (.join path (or (.-HOME js/process.env) ".") ".cache" "kanpou"))
+(def base "https://kanpou.npb.go.jp")
+
+(defn- arg-value [args option default]
+  (or (second (drop-while #(not= option %) args)) default))
+
+(defn- pdftotext? []
+  (try (.execFileSync cp "pdftotext" #js ["-v"] #js {:stdio "ignore"}) true
+       (catch :default _ false)))
+
+(defn- yyyymmdd [^js d]
+  (str (.getFullYear d)
+       (let [m (inc (.getMonth d))] (str (when (< m 10) "0") m))
+       (let [x (.getDate d)] (str (when (< x 10) "0") x))))
+
+(defn- recent-dates [n]
+  (let [now (js/Date.)]
+    (vec (for [i (range n)]
+           (yyyymmdd (js/Date. (- (.getTime now) (* i 86400000))))))))
+
+(defn- fetch-text [url]
+  (-> (js/fetch url)
+      (.then (fn [res] (if (.-ok res) (.text res) "")))
+      (.catch (fn [_] ""))))
+
+(defn- chotatsu-pdf-urls
+  "その日の**政府調達版**の PDF だけ。issue ディレクトリは 日付+版コードで
+   （`20260818c00152`）、`c` が政府調達版・`h` が本紙・`g` が号外。日付を外した
+   `c00152` で照合しようとすると 1 件も当たらない —— 実測で踏んだ。"
+  [html date]
+  (->> (re-seq #"href=\"\./([0-9]{8})/([0-9]{8}c[0-9a-z]+)/([0-9a-z]+full[0-9]+)f\.html\"" html)
+       (filter (fn [[_ d _ _]] (= d date)))
+       (map (fn [[_ d issue full]] (str base "/" d "/" issue "/pdf/" full ".pdf")))
+       distinct
+       vec))
+
+(defn- download! [url dest]
+  (js/Promise.
+   (fn [resolve* _reject*]
+     (-> (js/fetch url)
+         (.then (fn [res]
+                  (if-not (.-ok res)
+                    (resolve* nil)
+                    (let [sink (.createWriteStream fs dest)]
+                      (-> (.-Readable stream) (.fromWeb (.-body res)) (.pipe sink))
+                      (.on sink "finish" (fn [] (resolve* dest)))
+                      (.on sink "error" (fn [_] (resolve* nil)))))))
+         (.catch (fn [_] (resolve* nil)))))))
+
+(defn- pdf->text [pdf]
+  (try (.toString (.execFileSync cp "pdftotext" #js [pdf "-"]
+                                 #js {:maxBuffer (* 256 1024 1024)}))
+       (catch :default _ "")))
+
+(defn- process-pdf! [state url date-iso]
+  (let [dest (.join path cache-dir (last (str/split url #"/")))]
+    (-> (if (.existsSync fs dest)
+          (js/Promise.resolve dest)
+          (download! url dest))
+        (.then (fn [file]
+                 (when file
+                   (let [text (pdf->text file)
+                         recs (vec (kc/parse-section text date-iso))]
+                     (swap! state #(-> % (update :records into recs) (update :pdfs inc)))
+                     (println (str "    " (last (str/split url #"/")) ": "
+                                   (count recs) " award(s)")))))))))
+
+(defn- process-date! [state front-page date]
+  (let [date-iso (str (subs date 0 4) "-" (subs date 4 6) "-" (subs date 6 8))
+        urls (chotatsu-pdf-urls front-page date)]
+    (when (seq urls) (println (str "  " date ": " (count urls) " procurement issue(s)")))
+    (-> (reduce (fn [q url] (.then q (fn [_] (process-pdf! state url date-iso))))
+                (js/Promise.resolve nil)
+                urls)
+        (.then (fn [_] (swap! state update :issues into (when (seq urls) [date])))))))
+
+(defn- finish! [state out dates]
+  (let [{:keys [records issues pdfs]} @state
+        manifest (kc/corpus-manifest {:observed-at (.toISOString (js/Date.))
+                                      :issues issues
+                                      :record-count (count records)
+                                      :window-days 90})]
+    (.mkdirSync fs (.dirname path out) #js {:recursive true})
+    (.writeFileSync fs out
+                    (str (pr-str manifest) "\n"
+                         (str/join "\n" (map pr-str records))
+                         (when (seq records) "\n"))
+                    "utf8")
+    (println (pr-str {:out out
+                      :dates (count dates)
+                      :issues (count issues)
+                      :pdfs pdfs
+                      :records (count records)
+                      :bytes (.-size (.statSync fs out))}))
+    (when (and (pos? pdfs) (zero? (count records)))
+      (js/console.error "collect-kanpou-chotatsu: procurement issues were read but no award parsed — the layout changed")
+      (.exit js/process 2))))
+
+(defn -main []
+  (let [args (vec *command-line-args*)
+        out (arg-value args "--out" nil)
+        dates (if-let [d (arg-value args "--dates" nil)]
+                (vec (remove str/blank? (map str/trim (str/split d #","))))
+                (recent-dates (js/parseInt (arg-value args "--back" "14") 10)))]
+    (when-not out
+      (println "usage: collect_kanpou_chotatsu.cljs (--dates 20260818,... | --back N) --out <out.edn>")
+      (.exit js/process 2))
+    (when-not (pdftotext?)
+      (println "pdftotext (poppler) is required and was not found — refusing to write an empty file")
+      (.exit js/process 2))
+    (coverage/assert-collectable! kc/source-id)
+    (.mkdirSync fs cache-dir #js {:recursive true})
+    (let [state (atom {:records [] :issues [] :pdfs 0})]
+      (-> (fetch-text (str base "/"))
+          (.then (fn [front-page]
+                   (when (str/blank? front-page)
+                     (throw (ex-info "the front page returned nothing" {})))
+                   (reduce (fn [p date] (.then p (fn [_] (process-date! state front-page date))))
+                           (js/Promise.resolve nil)
+                           dates)))
+          (.then (fn [_] (finish! state out dates)))
+          (.catch (fn [e]
+                    (js/console.error (str "collect-kanpou-chotatsu failed: " (.-message e)))
+                    (.exit js/process 1)))))))
+
+(-main)

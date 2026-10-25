@@ -1,0 +1,187 @@
+(ns kotoba.property.gleif-rr-golden-copy
+  "Portable parsing/normalisation for the GLEIF RR (Level 2) Golden Copy CSV.
+
+   Level 1 (`kotoba.property.gleif-golden-copy`) says who a legal entity is.
+   Level 2 says who owns it. The two files are published together under the
+   same CC0 terms, and only the second one answers 'who ultimately controls
+   this counterparty' — the question a Level 1 projection structurally cannot
+   reach, because an entity record carries no edge.
+
+   Kept free of I/O for the same reason as its Level 1 sibling: the row
+   contract must be testable without a 240 MB download. The CSV mechanics
+   (`row->cells`, `header-index`, `record-start?`) are shared rather than
+   re-implemented — an RR row opens with a 20-character LEI exactly like a
+   LEI2 row, so the same record-start test holds.
+
+   The emitted attribute names are the ones `scripts/query_corporate_parent.cljk`
+   already queries from the paginated-API collector
+   (`:corporate-relation/child-lei`, `-parent-lei`, `-type`). Bulk and API
+   paths must stay interchangeable for the same reason `api-record->record`
+   exists on Level 1: a relationship spelled one way from the bulk file and
+   another way from the API would split into two answers to one question.
+
+   Measured on the 20260803-0000 publish (483,263 relationships):
+
+     IS_FUND-MANAGED_BY            148,759
+     IS_ULTIMATELY_CONSOLIDATED_BY 132,241
+     IS_DIRECTLY_CONSOLIDATED_BY   126,087
+     IS_SUBFUND_OF                  72,849
+     IS_INTERNATIONAL_BRANCH_OF      1,940
+     IS_FEEDER_TO                    1,387"
+  (:require [kotoba.lang.text :as str]
+            [kotoba.property.gleif-golden-copy :as l1]))
+
+(def source-id
+  "Distinct from `gleif-golden-copy` (Level 1 bulk) and `gleif-level-2` (the
+   paginated API collector): three readers of one authority whose audit rows
+   must not overwrite each other."
+  "gleif-rr-golden-copy")
+
+(def authority-id "GLOBAL/GLEIF")
+
+(def dataset
+  "Separate from `gleif-lei` so a plane query can ask for entities and edges
+   independently — loading 483k edges to answer a question about entities is
+   the cost this split avoids."
+  "gleif-relationship")
+
+(def licence "CC0 1.0 (GLEIF)")
+
+(def wanted-columns
+  "The RR columns this ingest keeps, out of 54."
+  ["Relationship.StartNode.NodeID"
+   "Relationship.EndNode.NodeID"
+   "Relationship.RelationshipType"
+   "Relationship.RelationshipStatus"
+   "Relationship.Period.1.startDate"
+   "Relationship.Quantifiers.1.MeasurementMethod"
+   "Relationship.Quantifiers.1.QuantifierAmount"
+   "Relationship.Quantifiers.1.QuantifierUnits"
+   "Registration.RegistrationStatus"
+   "Registration.LastUpdateDate"
+   "Registration.ValidationSources"])
+
+(def ^:private attr-of-column
+  {;; startNode is the *child*: GLEIF reads the edge as "X is consolidated by
+   ;; Y", so the row's first LEI is the owned entity and the second is the owner.
+   "Relationship.StartNode.NodeID" :corporate-relation/child-lei
+   "Relationship.EndNode.NodeID" :corporate-relation/parent-lei
+   "Relationship.RelationshipType" :corporate-relation/type
+   "Relationship.RelationshipStatus" :corporate-relation/status
+   "Relationship.Period.1.startDate" :corporate-relation/period-start
+   "Relationship.Quantifiers.1.MeasurementMethod" :corporate-relation/measurement-method
+   ;; Ownership percentage where the relationship carries one — populated on
+   ;; 51,664 of 483,263 rows in the 20260803 publish, so a consumer must treat
+   ;; its absence as unknown rather than zero.
+   "Relationship.Quantifiers.1.QuantifierAmount" :corporate-relation/quantifier-amount
+   "Relationship.Quantifiers.1.QuantifierUnits" :corporate-relation/quantifier-units
+   "Registration.RegistrationStatus" :corporate-relation/registration-status
+   "Registration.LastUpdateDate" :corporate-relation/last-update
+   ;; The evidence tier behind the edge. FULLY_CORROBORATED means the managing
+   ;; LOU checked the claim against a source; ENTITY_SUPPLIED_ONLY means the
+   ;; company asserted its own parent and nobody verified it. Carrying this is
+   ;; the difference between "we know the owner" and "the owner told us" —
+   ;; 139,111 of 483,263 edges are the latter.
+   "Registration.ValidationSources" :corporate-relation/validation})
+
+(defn selection
+  "Given the parsed header row: the index set to materialise, and the
+   index -> attribute map used to name the values."
+  [header]
+  (let [pairs (keep (fn [c] (when-let [i (get header c)] [i (attr-of-column c)]))
+                    wanted-columns)]
+    {:wanted (into #{} (map first) pairs)
+     :attrs (into {} pairs)
+     :max-col (reduce max -1 (map first pairs))}))
+
+(defn normalize-type
+  "`IS_ULTIMATELY_CONSOLIDATED_BY` -> `:is-ultimately-consolidated-by`, the
+   spelling `kotoba.property.gleif-runtime/normalize-relation` already produces
+   from the API."
+  [s]
+  (when-not (str/blank? s)
+    (-> s str/lower (str/replace "_" "-") keyword)))
+
+(defn relation-id
+  "The Golden Copy carries no relationship id, but (child, type, parent) is
+   unique within a publish and stable across them, so a projection can be
+   rebuilt without renaming its rows."
+  [child type parent]
+  (when (and (not (str/blank? child)) (not (str/blank? parent)))
+    (str child "|" (name (or type :unknown)) "|" parent)))
+
+(defn row->record
+  "One raw CSV line -> one portable corporate relation, or nil if either end is
+   missing (a half-edge cannot be joined and must not become a silent orphan)."
+  [line {:keys [wanted attrs max-col]}]
+  (let [rec (reduce-kv (fn [m i v] (assoc m (get attrs i) v))
+                       {}
+                       (l1/row->cells line wanted max-col))
+        child (:corporate-relation/child-lei rec)
+        parent (:corporate-relation/parent-lei rec)
+        type (normalize-type (:corporate-relation/type rec))]
+    (when-not (or (str/blank? child) (str/blank? parent))
+      (cond-> (assoc rec :corporate-relation/id (relation-id child type parent))
+        type (assoc :corporate-relation/type type)
+        (:corporate-relation/status rec)
+        (update :corporate-relation/status #(-> % str/lower keyword))))))
+
+(defn publish-id
+  "`20260803-0000-gleif-goldencopy-rr-golden-copy.csv` -> the publish stamp."
+  [entry-name]
+  (when entry-name
+    (str/replace (str/replace entry-name #"\.csv$" "") #"-golden-copy$" "")))
+
+(defn corpus-manifest
+  "Line 1 of a corpus file: the provenance every record in it shares."
+  [{:keys [publish content-sha256 observed-at source-archive record-count]}]
+  (cond-> {:corpus/manifest true
+           :corpus/format :edn-lines
+           :source/dataset dataset
+           :source/authority authority-id
+           :source/licence licence
+           :source/publish publish
+           :source/content-sha256 content-sha256
+           :source/observed-at observed-at}
+    source-archive (assoc :source/archive source-archive)
+    record-count (assoc :corpus/record-count record-count)))
+
+(defn matcher
+  "Predicate over parsed relations, for building a bounded projection.
+
+   `:leis` is matched against *either* end: an edge is join-relevant when the
+   plane knows the child (who owns this?) or the parent (what does this own?).
+   Matching only the child would silently drop every subsidiary of a company
+   the plane already holds."
+  [{:keys [leis types validation active-only?]}]
+  (let [lei-set (when (seq leis) (set (map str/upper leis)))
+        type-set (when (seq types) (set (map keyword types)))
+        validation-set (when (seq validation) (set validation))]
+    (fn [rec]
+      (and (or (nil? lei-set)
+               (contains? lei-set (:corporate-relation/child-lei rec))
+               (contains? lei-set (:corporate-relation/parent-lei rec)))
+           (or (nil? type-set) (contains? type-set (:corporate-relation/type rec)))
+           (or (nil? validation-set)
+               (contains? validation-set (:corporate-relation/validation rec)))
+           (or (not active-only?)
+               (= :active (:corporate-relation/status rec)))))))
+
+(defn projection-manifest
+  "Line 1 of a projection: the corpus manifest it came from, plus the criteria
+   that produced it. Same arity and contract as
+   `kotoba.property.gleif-projection/projection-manifest` — a projection that
+   does not say what it excluded reads as if it were the whole universe."
+  [corpus-manifest {:keys [leis types validation active-only?]} record-count]
+  (cond-> (assoc (dissoc corpus-manifest :corpus/record-count)
+                 ;; Set unconditionally, not inherited: a corpus written before
+                 ;; the manifest convention would leave line 1 unmarked, and a
+                 ;; reader would then load the header as if it were a relation.
+                 :corpus/manifest true
+                 :corpus/projection true
+                 :projection/source source-id
+                 :corpus/record-count record-count)
+    (seq leis) (assoc :projection/lei-count (count leis))
+    (seq types) (assoc :projection/types (vec types))
+    (seq validation) (assoc :projection/validation (vec validation))
+    active-only? (assoc :projection/active-only true)))

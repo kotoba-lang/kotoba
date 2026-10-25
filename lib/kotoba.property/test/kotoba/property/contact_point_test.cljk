@@ -1,0 +1,331 @@
+(ns kotoba.property.contact-point-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.property.contact-point :as cp]))
+
+;; ---------------------------------------------------------------------------
+;; URL
+
+(deftest absolutise-forms
+  (is (= "https://a.example.jp/contact" (cp/absolutise "/contact" "https://a.example.jp/x/y")))
+  (is (= "https://a.example.jp/contact" (cp/absolutise "contact" "https://a.example.jp")))
+  (is (= "https://b.example.jp/c" (cp/absolutise "https://b.example.jp/c/" "https://a.example.jp")))
+  (is (= "https://b.example.jp/c" (cp/absolutise "//b.example.jp/c" "https://a.example.jp")))
+  (testing "アンカーと javascript: は連絡点になりえない"
+    (is (nil? (cp/absolutise "#main" "https://a.example.jp")))
+    (is (nil? (cp/absolutise "javascript:void(0)" "https://a.example.jp")))))
+
+;; ---------------------------------------------------------------------------
+;; robots.txt — 両方向
+
+(def robots-blocking
+  "User-agent: *\nDisallow: /contact\n")
+
+(def robots-allowing
+  "User-agent: *\nDisallow: /admin\n")
+
+(def robots-specific
+  "User-agent: *\nDisallow: /\n\nUser-agent: murakumo-lead-collector\nDisallow:\nAllow: /\n")
+
+(deftest robots-both-directions
+  (testing "拒否は拒否として出る"
+    (is (true? (cp/robots-disallows? robots-blocking cp/user-agent "/contact"))))
+  (testing "許可は許可として出る（同じ入力形で false が返せる）"
+    (is (false? (cp/robots-disallows? robots-allowing cp/user-agent "/contact"))))
+  (testing "自分の UA を名指しした group が * より優先する"
+    (is (false? (cp/robots-disallows? robots-specific cp/user-agent "/contact")))
+    (is (true? (cp/robots-disallows? robots-specific "SomeOtherBot" "/contact"))))
+  (testing "robots.txt が空/取れなかったときは許可 (RFC 9309)"
+    (is (false? (cp/robots-disallows? "" cp/user-agent "/contact")))
+    (is (false? (cp/robots-disallows? nil cp/user-agent "/contact"))))
+  (testing "最長一致が勝つ — Allow が短い Disallow を上書きする"
+    (is (false? (cp/robots-disallows? "User-agent: *\nDisallow: /\nAllow: /contact\n"
+                                      cp/user-agent "/contact")))))
+
+;; ---------------------------------------------------------------------------
+;; 連絡点リンクの発見
+
+(def home-html
+  (str "<html><body>"
+       "<a href=\"/company/\">会社概要</a>"
+       "<a href=\"/contact/\">Contact</a>"
+       "<a href=\"/cgi-bin/f.cgi?id=3\">お問い合わせ</a>"
+       "<a href=\"/ir/report.pdf\">IR 資料</a>"
+       "</body></html>"))
+
+(deftest discover-contact-links-uses-href-and-text
+  (let [links (cp/discover-contact-links home-html "https://a.example.jp")]
+    (testing "href から判るもの"
+      (is (some #{"https://a.example.jp/contact"} links)))
+    (testing "href からは判らず、アンカーテキストだけが手掛かりのもの"
+      (is (some #{"https://a.example.jp/cgi-bin/f.cgi?id=3"} links)))
+    (testing "無関係なリンクを連絡点にしない"
+      (is (not (some #{"https://a.example.jp/company"} links))))
+    (testing "PDF を連絡点にしない"
+      (is (not (some #(re-find #"\.pdf$" %) links))))))
+
+(deftest contact-page-discriminates
+  (testing "form があれば連絡点"
+    (is (true? (cp/contact-page? "<html><form action=\"/send\"><input name=\"x\"></form></html>"))))
+  (testing "mailto があれば連絡点"
+    (is (true? (cp/contact-page? "<a href=\"mailto:info@example.jp\">info</a>"))))
+  (testing "200 を返しただけの SPA シェルは連絡点ではない"
+    (is (false? (cp/contact-page? "<html><body><div id=\"root\"></div></body></html>"))))
+  (testing "『お問い合わせ』の語だけで入力欄が無いページも連絡点ではない"
+    (is (false? (cp/contact-page? "<html><body><p>お問い合わせは営業時間内に</p></body></html>")))))
+
+;; ---------------------------------------------------------------------------
+;; メール
+
+(deftest extract-emails-separates-provenance-and-kind
+  (let [html (str "<a href=\"mailto:info@example.jp\">お問い合わせ</a>"
+                  "<p>担当: taro.yamada@example.jp</p>"
+                  "<img src=\"logo@2x.png\">"
+                  "<p>sample: your-email@example.com</p>")
+        out (cp/extract-emails html)
+        by-email (into {} (map (juxt :email identity)) out)]
+    (testing "mailto は mailto として、本文は text として記録する"
+      (is (= :mailto (:via (by-email "info@example.jp"))))
+      (is (= :text (:via (by-email "taro.yamada@example.jp")))))
+    (testing "窓口と個人を分ける"
+      (is (= :role (:kind (by-email "info@example.jp"))))
+      (is (= :personal (:kind (by-email "taro.yamada@example.jp")))))
+    (testing "画像ファイル名とサンプルアドレスを拾わない"
+      (is (nil? (by-email "logo@2x.png")))
+      (is (nil? (by-email "your-email@example.com"))))))
+
+(deftest classify-email-defaults-to-personal
+  (is (= :role (cp/classify-email "info@example.jp")))
+  (is (= :role (cp/classify-email "SALES@example.jp")))
+  (is (= :role (cp/classify-email "contact-jp@example.jp")))
+  (testing "role 語彙に無いものは personal に倒す（窓口を落とす方が安い）"
+    (is (= :personal (cp/classify-email "hanako@example.jp")))
+    (is (= :personal (cp/classify-email "t.suzuki@example.jp")))))
+
+;; ---------------------------------------------------------------------------
+;; 営業お断り — 両方向
+
+(deftest solicitation-forbidden-both-directions
+  (testing "断っているページは true"
+    (is (true? (cp/solicitation-forbidden? "<p>営業目的のお問い合わせはご遠慮ください。</p>")))
+    (is (true? (cp/solicitation-forbidden? "<p>We do not accept sales inquiries here.</p>"))))
+  (testing "普通の問い合わせページは false（同じ入力形で false が返せる）"
+    (is (false? (cp/solicitation-forbidden? "<p>お問い合わせはこちらのフォームから。</p>")))
+    (is (false? (cp/solicitation-forbidden? "<p>営業時間 9:00-18:00</p>")))))
+
+;; ---------------------------------------------------------------------------
+;; 住所
+
+(deftest postal-code-formatting
+  (is (= "107-0062" (cp/format-postal-code "1070062")))
+  (testing "7 桁でないものを 7 桁のふりにしない"
+    (is (= "107" (cp/format-postal-code "107"))))
+  (is (= "107-0062" (cp/extract-site-postal-code "<p>〒107-0062 東京都港区</p>")))
+  (is (= "107-0062" (cp/extract-site-postal-code "<p>〒１０７－００６２ 東京都港区</p>")))
+  (is (nil? (cp/extract-site-postal-code "<p>東京都港区南青山</p>"))))
+
+;; ---------------------------------------------------------------------------
+;; レコード
+
+(def registry-fixture
+  {"corporate_number" "8011801032561"
+   "name" "ストックマーク株式会社"
+   "postal_code" "1070062"
+   "location" "東京都港区南青山１丁目１２番３号"
+   "representative_name" "代表取締役　林　達"
+   "employee_number" 115
+   "company_url" "https://stockmark.co.jp/"
+   "industry" ["G"]})
+
+(deftest record-keeps-registry-and-observation-apart
+  (let [r (cp/->record registry-fixture
+                       {:status :ok
+                        :contact-url "https://stockmark.co.jp/contact/sales"
+                        :emails [{:email "info@stockmark.co.jp" :via :mailto :kind :role}
+                                 {:email "taro@stockmark.co.jp" :via :text :kind :personal}]
+                        :solicitation-forbidden? false
+                        :observed-at "2026-08-25T00:00:00Z"})]
+    (is (= "8011801032561" (:company/houjin-bangou r)))
+    (is (= "代表取締役 林 達" (:company/representative-name r)))
+    (is (= "107-0062" (:company/postal-code r)))
+    (testing "個人アドレスは出力に載らず、件数だけ残る"
+      (is (= ["info@stockmark.co.jp"] (:contact/emails r)))
+      (is (= 1 (:contact/personal-emails-excluded r))))
+    (testing "窓口アドレスの出所が台帳に残る（mailto か text か）"
+      (is (= [{:email "info@stockmark.co.jp" :via "mailto"}] (:contact/emails-via r))))
+    (is (true? (cp/contactable? r)))))
+
+(deftest status-is-closed-and-record-survives-failure
+  (testing "見に行けなかった会社も行として残る"
+    (let [r (cp/->record registry-fixture {:status :fetch-failed :observed-at "2026-08-25T00:00:00Z"})]
+      (is (= :fetch-failed (:lead/status r)))
+      (is (= "8011801032561" (:company/houjin-bangou r)))
+      (is (false? (cp/contactable? r)))))
+  (testing "『取れたが連絡点が無かった』は『見に行けなかった』と別の値"
+    (is (= :no-contact-point (:lead/status (cp/->record registry-fixture {:status :no-contact-point})))))
+  (testing "値域の外は受け付けない"
+    (is (thrown? #?(:clj AssertionError :cljs js/Error)
+                 (cp/->record registry-fixture {:status :probably-fine})))))
+
+(deftest contactable-refuses-for-the-reason-it-names
+  (let [base {:lead/status :ok :contact/form-url "https://x.example.jp/contact"}]
+    (is (true? (cp/contactable? base)))
+    (testing "営業お断りの行は、その理由で落ちる"
+      (is (false? (cp/contactable? (assoc base :contact/solicitation-forbidden? true)))))
+    (testing "連絡点が無い行は、その理由で落ちる"
+      (is (false? (cp/contactable? (dissoc base :contact/form-url)))))
+    (testing "status が ok でない行は、その理由で落ちる"
+      (is (false? (cp/contactable? (assoc base :lead/status :robots-disallowed)))))))
+
+(deftest coverage-counts-the-denominator
+  (let [rs [{:lead/status :ok :contact/form-url "u"}
+            {:lead/status :ok :contact/emails ["info@a.jp"] :contact/solicitation-forbidden? true}
+            {:lead/status :fetch-failed}
+            {:lead/status :no-website}]
+        c (cp/coverage rs)]
+    (is (= 4 (:coverage/scanned c)))
+    (is (= 1 (:coverage/contactable c)))
+    (is (= 1 (:coverage/solicitation-forbidden c)))
+    (is (= {:ok 2 :fetch-failed 1 :no-website 1} (:coverage/by-status c)))))
+
+;; ---------------------------------------------------------------------------
+;; 候補の順位 — 実測した誤りの再現
+
+(deftest ranking-puts-the-real-window-first
+  (testing "『通ったページ』ではなく『窓口らしいページ』を先に試す"
+    (let [ranked (cp/rank-contact-candidates
+                  ["https://stockmark.co.jp/company/information"
+                   "https://stockmark.co.jp/contact/sales"
+                   "https://stockmark.co.jp/news"])]
+      (is (= "https://stockmark.co.jp/contact/sales" (first ranked)))))
+  (testing "会社概要は連絡窓口より下、ただし捨てはしない"
+    (is (< (cp/score-contact-candidate "https://a.jp/company/information")
+           (cp/score-contact-candidate "https://a.jp/contact")))
+    (is (some #{"https://a.jp/company/information"}
+              (cp/rank-contact-candidates ["https://a.jp/company/information"]))))
+  (testing "短いパスが同格の長いパスに勝つ"
+    (is (> (cp/score-contact-candidate "https://a.jp/contact")
+           (cp/score-contact-candidate "https://a.jp/support/contact/form/index.html")))))
+
+;; ---------------------------------------------------------------------------
+;; 社名の突き合わせ — 実測した 2 件の誤解決を pin する
+
+(deftest normalise-company-name-folds-the-noise
+  (is (= "ストックマーク" (cp/normalise-company-name "ストックマーク株式会社")))
+  (testing "長音符を落とさない（ハイフンと間違えると別語が衝突する）"
+    (is (not= (cp/normalise-company-name "コープ") (cp/normalise-company-name "コプ"))))
+  (is (= (cp/normalise-company-name "株式会社PKSHA Technology")
+         (cp/normalise-company-name "株式会社ＰＫＳＨＡ　Ｔｅｃｈｎｏｌｏｇｙ")))
+  (is (= (cp/normalise-company-name "Sakana AI株式会社")
+         (cp/normalise-company-name "Ｓａｋａｎａ　ＡＩ株式会社"))))
+
+(deftest resolve-hit-refuses-for-the-reason-it-names
+  (testing "完全一致は採る"
+    (let [r (cp/resolve-hit "株式会社PKSHA Technology"
+                            [{"name" "株式会社ＰＫＳＨＡ　Ｔｅｃｈｎｏｌｏｇｙ" "corporate_number" "5011101064787"}])]
+      (is (= :exact (:match r)))
+      (is (= "5011101064787" (get (:hit r) "corporate_number")))))
+  (testing "前方一致は採らない — ABEJA が ABEJARI に当たった実測"
+    (let [r (cp/resolve-hit "株式会社ABEJA"
+                            [{"name" "株式会社ＡＢＥＪＡＲＩホールディングス" "corporate_number" "9"}])]
+      (is (nil? (:hit r)))
+      (is (= [:name-mismatch] (mapv :reason (:rejected r))))))
+  (testing "閉鎖済みは採らない — リコーエンタープライズ（閉鎖）の実測"
+    (let [r (cp/resolve-hit "株式会社リコーエンタープライズ"
+                            [{"name" "株式会社リコーエンタープライズ（閉鎖）" "corporate_number" "9"}])]
+      (is (nil? (:hit r)))
+      (is (= [:closed] (mapv :reason (:rejected r))))))
+  (testing "閉鎖済みが 1 件目でも、生きている完全一致が後ろに在れば採る"
+    (let [r (cp/resolve-hit "株式会社テスト"
+                            [{"name" "株式会社テスト（閉鎖）" "corporate_number" "1"}
+                             {"name" "株式会社テスト" "corporate_number" "2"}])]
+      (is (= "2" (get (:hit r) "corporate_number")))))
+  (testing "候補ゼロは、拒否理由も空で返る（『解決できなかった』が空で表せる）"
+    (is (= {:rejected []} (cp/resolve-hit "株式会社なにか" [])))))
+
+;; ---------------------------------------------------------------------------
+;; registry を持たない面（`->site-record` / `site-coverage`）
+
+(deftest absolutise-drops-non-page-schemes
+  (testing "mailto:/tel: はページの住所ではない —— origin に継ぎ足された偽 URL を作らない"
+    ;; 実測 2026-08-26: TKC 会員事務所のページで
+    ;; `https://www.tkcnf.com/mailto:tera3-humming@tkcnf.or.jp?subject=お問合せ`
+    ;; が候補として並び、実在しない URL が候補枠を 1 つ食っていた。
+    (is (nil? (cp/absolutise "mailto:info@example.jp" "https://a.example.jp")))
+    (is (nil? (cp/absolutise "mailto:info@example.jp?subject=x" "https://a.example.jp")))
+    (is (nil? (cp/absolutise "MAILTO:info@example.jp" "https://a.example.jp")))
+    (is (nil? (cp/absolutise "tel:0312345678" "https://a.example.jp")))
+    (is (nil? (cp/absolutise "callto:x" "https://a.example.jp"))))
+  (testing "ただの相対パスは今までどおり絶対化される（緩めすぎていない）"
+    (is (= "https://a.example.jp/mail" (cp/absolutise "mail" "https://a.example.jp")))
+    (is (= "https://a.example.jp/telecom" (cp/absolutise "/telecom" "https://a.example.jp")))))
+
+(def ^:private site-seed
+  {:name "テスト税理士事務所" :url "https://t.example.jp/" :segment "tax-office"
+   :discovery :web-search :query "route-x"})
+
+(deftest site-record-omits-registry-columns
+  (testing "法人番号のキーごと出さない —— 無い列と、空の列は違う"
+    (let [r (cp/->site-record site-seed {:status :ok :observed-at "2026-08-26T00:00:00Z"})]
+      (is (not (contains? r :company/houjin-bangou)))
+      (is (not (contains? r :company/location)))
+      (is (not (contains? r :company/representative-name)))
+      (is (= cp/site-dataset (:source/dataset r)))
+      (is (= "route-x" (:site/discovery-query r)))
+      (is (= "web-search" (:site/discovery r)))
+      ;; 末尾スラッシュだけで別 URL にしない
+      (is (= "https://t.example.jp" (:web/url r))))))
+
+(deftest site-record-keeps-role-drops-personal
+  (let [obs {:status :ok
+             :observed-at "2026-08-26T00:00:00Z"
+             :emails [{:email "info@t.example.jp" :via :mailto :kind :role}
+                      {:email "taro.yamada@t.example.jp" :via :text :kind :personal}
+                      {:email "info@t.example.jp" :via :text :kind :role}]}
+        r (cp/->site-record site-seed obs)]
+    (testing "窓口だけが出力に載り、個人は件数だけ残る"
+      (is (= ["info@t.example.jp"] (:contact/emails r)))
+      (is (= 1 (:contact/personal-emails-excluded r))))
+    (testing "出所（mailto / text）を落とさない。重複は畳む"
+      (is (= [{:email "info@t.example.jp" :via "mailto"}] (:contact/emails-via r))))))
+
+(deftest site-record-refuses-unknown-values
+  (testing "終わり方の値域は閉じている"
+    (is (thrown? #?(:clj AssertionError :cljs js/Error)
+                 (cp/->site-record site-seed {:status :something-new}))))
+  (testing "発見経路の値域も閉じている —— どう見つけたかを自由文字列にしない"
+    (is (thrown? #?(:clj AssertionError :cljs js/Error)
+                 (cp/->site-record (assoc site-seed :discovery :guessed)
+                                   {:status :ok})))))
+
+(deftest site-coverage-separates-measured-from-empty
+  (let [ok-role (cp/->site-record site-seed
+                                  {:status :ok :emails [{:email "info@a.jp" :via :mailto :kind :role}]})
+        ok-personal (cp/->site-record (assoc site-seed :url "https://b.example.jp")
+                                      {:status :ok :emails [{:email "hanako@b.jp" :via :text :kind :personal}]})
+        failed (cp/->site-record (assoc site-seed :url "https://c.example.jp" :segment "it-partner")
+                                 {:status :fetch-failed})
+        empty- (cp/->site-record (assoc site-seed :url "https://d.example.jp")
+                                 {:status :no-contact-point})
+        cov (cp/site-coverage [ok-role ok-personal failed empty-])]
+    (testing "『メールは在ったが個人だった』を『メールが無い』に畳まない"
+      (is (= 1 (:coverage/email-only-personal cov)))
+      (is (= 1 (:coverage/with-role-email cov))))
+    (testing "見に行けなかった行と、見に行けて空だった行は別に数える"
+      (is (= 1 (get (:coverage/by-status cov) :fetch-failed)))
+      (is (= 1 (get (:coverage/by-status cov) :no-contact-point))))
+    (testing "区分ごとに分けたまま数える —— 混ぜると仮説そのものを検証できない"
+      (is (= 3 (get-in cov [:coverage/by-segment "tax-office" :scanned])))
+      (is (= 1 (get-in cov [:coverage/by-segment "tax-office" :with-role-email])))
+      (is (= 1 (get-in cov [:coverage/by-segment "it-partner" :fetch-failed])))
+      (is (= 0 (get-in cov [:coverage/by-segment "it-partner" :with-role-email]))))
+    (testing "送ってよい行は status と営業お断りの両方を見る"
+      (is (= 1 (:coverage/contactable cov))))))
+
+(deftest site-record-honours-solicitation-refusal
+  (let [r (cp/->site-record site-seed
+                            {:status :ok
+                             :solicitation-forbidden? true
+                             :emails [{:email "info@a.jp" :via :mailto :kind :role}]})]
+    (is (true? (:contact/solicitation-forbidden? r)))
+    (testing "窓口が在っても、断っている相手は contactable ではない"
+      (is (false? (cp/contactable? r))))))
