@@ -1,0 +1,323 @@
+;; uniq -- POSIX uniq (IEEE Std 1003.1) for ONE operand.
+;;
+;;   uniq FILE       adjacent duplicate lines collapsed to one
+;;   uniq -c FILE    each run prefixed with its count
+;;
+;; ADJACENT is the whole contract: `a a b a` answers `a b a`, not `a b`.
+;; That is what makes `sort | uniq` a pipeline and not a redundancy.
+;;
+;; ## The -c format, measured at its boundary
+;;
+;; `"%4d %s"`: the count right-aligned in FOUR columns, then a space, then
+;; the line. Measured 2026-09-10 -- 9 prints as `   9 `, 1000 as `1000 `, and
+;; 10000 as `10000 `, so the four is a MINIMUM and the space after it is
+;; unconditional. A fixed five-wide field matches every count below 1000 and
+;; nothing at or above it, which is why the suite has a 1000-line fixture.
+;;
+;; ## uniq adds the newline a last line lacks
+;;
+;; Measured: `a\na` is three bytes in and two out -- one line, printed with a
+;; newline. Same as grep and sort, opposite of head.
+;;
+;; ## The output is written as it goes, or built at the pool's tail
+;;
+;; Until 2026-09-15 the walk built the whole answer by `(string-concat acc
+;; run)`, which copied the accumulator at every run: measured, a 13,000-line
+;; 800 KB file exhausted the pool and trapped. To stdout the answer is now
+;; WRITTEN run by run, and nothing accumulates. To the OUTPUT operand it is
+;; still one value, built with the loader's tail append: `string-concat`
+;; copies only its second operand when the first is the pool's last
+;; allocation, so an accumulator kept at the tail grows by the bytes
+;; appended. Keeping it there is a discipline: only VIEWS are appended (a
+;; line of the input, a literal, one digit at a time -- never a freshly
+;; concatenated piece), and no capability call happens between appends,
+;; since every wire answer is interned in the pool and moves the tail. The
+;; flags are therefore read once into MODE and carried, not re-asked.
+;;
+;; Capabilities: :cli/args (38), :fs/app-data (35), :io/write (37).
+(ns uniq.core (:export [main]))
+
+(defn arg [i :string] :string
+  (typed-cap-call :cli/args :string :string i))
+
+(defn emit [s :string] :string
+  (typed-cap-call :io/write :string :string s))
+
+(defn slurp-file [path :string] :string
+  (typed-cap-call :fs/app-data :string :string path))
+
+(defn emit-error [s :string] :string
+  (typed-cap-call :io/write-error :string :string s))
+
+;; Is PATH a file this command may read? Wire 35's EXISTS form answers "1" or
+;; "0"; a path outside the granted scope answers "0", which is what the read
+;; form would trap on.
+;;
+;; This has to be ASKED. The read form TRAPS on a path it cannot serve, and a
+;; trap cannot be caught, so there is no way to notice afterwards.
+(defn readable? [path :string] :bool
+  (string=? (typed-cap-call :fs/app-data :string :string
+                            (string-concat path "EXISTS_SEP"))
+            "1"))
+
+
+(defn nl [] :string
+  (string-substring "a
+b" 1 2))
+
+(defn digit-text [d :i64] :string
+  (string-substring "0123456789" d (+ d 1)))
+
+(defn decimal-of [n :i64] :string
+  (if (< n 10)
+    (digit-text n)
+    (string-concat (decimal-of (quot n 10))
+                   (digit-text (- n (* 10 (quot n 10)))))))
+
+;; --- appending onto a tail accumulator ------------------------------------
+;; Every helper here takes ACC and answers ACC with more appended, one view
+;; at a time, so the accumulator never leaves the pool's tail.
+(defn digit-count [n :i64] :i64
+  (if (< n 10) 1 (+ 1 (digit-count (quot n 10)))))
+
+(defn append-spaces [acc :string k :i64] :string
+  (if (<= k 0) acc (append-spaces (string-concat acc " ") (- k 1))))
+
+(defn append-digits [acc :string n :i64] :string
+  (if (< n 10)
+    (string-concat acc (digit-text n))
+    (string-concat (append-digits acc (quot n 10))
+                   (digit-text (- n (* 10 (quot n 10)))))))
+
+;; `"%4d "`: the count right-aligned in four columns, then a space.
+(defn append-count [acc :string n :i64] :string
+  (string-concat (append-digits (append-spaces acc (- 4 (digit-count n))) n) " "))
+
+;; This asked whether the argument COUNT was 2 until 2026-09-10, which was
+;; right only while uniq took a single operand: `uniq INPUT OUTPUT` is also
+;; two arguments and would have been read as carrying a `-c`. The question is
+;; about argument 0's shape, so that is what it asks.
+(defn flag [] :string
+  (let [a (arg "0")]
+    (if (= (string-index-of a "-") 0) a "")))
+
+;; --- ASCII case folding, for -i ------------------------------------------
+;; `string-fold-ascii` (context ABI v7) folds A-Z only, over the WHOLE text
+;; once: one byte to one byte, so an offset into the fold is the same
+;; offset into the original -- the comparison reads the fold and the
+;; output the original. Measured: BSD uniq -i folds non-ASCII under this
+;; locale and this does not, which the README names rather than claiming
+;; full folding -- the same boundary org-ieee-grep draws for its own -i.
+;;
+;; The comparison folds; the OUTPUT does not. Measured: `uniq -i` over
+;; `A a B` answers `A` and `B`, the first occurrence of each run verbatim.
+(defn fold [s :string] :string
+  (string-fold-ascii s))
+
+;; The index of the first operand, after the flag if there is one.
+(defn first-operand [] :i64
+  ;; ANY flag, not just -c. Keying this off `counted?` alone made every new
+  ;; flag's operand index wrong -- `-d` was read as the input path, so all
+  ;; thirteen new cases failed identically at exit 1 while `-c` kept working.
+  (if (string=? (flag) "") 0 1))
+
+;; One run: the line, prefixed with its count under -c.
+;;
+;; This BUILDS the text rather than writing it, because uniq's second operand
+;; is an output FILE rather than another input -- so the answer has to exist
+;; as a value before its destination is known. The whole output therefore
+;; lives in one guest string, which is the same bound cat and cp work under.
+;; A run of n copies. -d keeps only runs longer than one and -u only runs of
+;; exactly one; both print ONE copy, not n.
+;; MODE: 0 plain, 1 -c, 2 -d, 3 -u, 4 -i; plus 8 when the answer goes to
+;; the OUTPUT operand rather than stdout; plus 16 when the run's FIRST line
+;; was newline-terminated in the input, which is when the run is written
+;; with a newline. /usr/bin/uniq does not terminate an unterminated last
+;; line (measured 2026-09-15: `a\nb` is three bytes in and three out, with
+;; -c too, where this had answered four), and the fixture `a\na` had hidden
+;; it: that run's first line is terminated, so its newline is real.
+(defn mode-of [] :i64
+  (let [f (flag)]
+    (if (string=? f "-c") 1
+        (if (string=? f "-d") 2
+            (if (string=? f "-u") 3
+                (if (string=? f "-i") 4 0))))))
+
+(defn run-wanted? [n :i64 mode :i64] :bool
+  (if (= mode 2)
+    (> n 1)
+    (if (= mode 3) (= n 1) true)))
+
+;; --- the walk: scalar cursors over the text (2026-09-16) ------------------
+;;
+;; Lines are named by their byte offsets into the ONE text, never cut into
+;; views for the comparison: `string-compare-lines` (context ABI v8) answers
+;; whether the line at PREV and the line at POS are the same in place, and
+;; `string-index-of-from` finds the next newline from an offset without a
+;; view. A run of identical lines therefore costs no handle at all; a run
+;; boundary costs the run's view and its append. Until then every line was
+;; two views, a comparison over views and two or three writes.
+;;
+;; PP packs the cursor, the run's first line and whether that line was
+;; newline-terminated: `pos * 2^31 + prev * 2 + term` (the pool is at most
+;; 1 GiB, so an offset fits 30 bits). NM packs the run length and the
+;; mode: `n * 64 + mode`, MODE as `mode-of` plus 8 when the answer goes to
+;; the OUTPUT operand. A function carries five parameters.
+(defn pp-pos [pp :i64] :i64 (i64-shift-right pp 31))
+(defn pp-prev [pp :i64] :i64 (bit-and (i64-shift-right pp 1) 1073741823))
+(defn pp-term? [pp :i64] :bool (= 1 (bit-and pp 1)))
+(defn pack-pp [pos :i64 prev :i64 term? :bool] :i64
+  (+ (i64-shift-left pos 31) (i64-shift-left prev 1) (if term? 1 0)))
+
+;; Just past the line starting at POS -- past its newline, or the length --
+;; times two, plus one when a newline ended it. A region: the newline
+;; needle is a literal, a handle each time it is evaluated.
+(defn line-end [text :string pos :i64] :i64
+  (let [k (string-find-byte text 10 pos)]
+    (if (< k 0) (* 2 (string-byte-length text)) (+ (* 2 (+ k 1)) 1))))
+
+;; The run's line, from PREV up to and including its newline when TERM.
+;; /usr/bin/uniq does not terminate an unterminated last line (measured
+;; 2026-09-15: `a\nb` is three bytes in and three out, with -c too).
+;; Appended as a RANGE (`string-append-range`, context ABI v10): no view.
+(defn append-run-line [acc :string text :string pp :i64] :string
+  (let [prev (pp-prev pp)
+        e (i64-shift-right (line-end text prev) 1)]
+    (string-append-range acc text prev e)))
+
+;; One run of N copies onto ACC: -c prefixes the count, -d keeps only runs
+;; longer than one and -u only runs of exactly one; both print ONE copy.
+(defn put-run [acc :string text :string pp :i64 nm :i64] :string
+  (let [n (i64-shift-right nm 6)
+        m (bit-and nm 7)]
+    (if (= m 1)
+      (append-run-line (append-count acc n) text pp)
+      (if (run-wanted? n m) (append-run-line acc text pp) acc))))
+
+(defn same-line? [folded :string prev :i64 pos :i64] :bool
+  (= 0 (string-compare-lines folded prev folded pos)))
+
+;; The lines from PP onto ACC. To the OUTPUT operand (mode + 8) the whole
+;; answer is built; to stdout the accumulator is written and released once
+;; a KB of OUTPUT has accumulated AND a run has just ended, so the batch is a
+;; region (arena-scope) whose only state across batches is PP (the cursor
+;; and the new run's first line; its N is 1 by construction). Answers the
+;; PP to continue from, or -1 at the end of the text.
+(defn walk-from [text :string folded :string pp :i64 nm :i64 acc :string] :i64
+  (let [n (string-byte-length text)
+        pos (pp-pos pp)
+        prev (pp-prev pp)
+        to-file? (= 8 (bit-and nm 8))]
+    (if (>= pos n)
+      (do (if to-file? 0 (string-byte-length (emit (put-run acc text pp nm)))) -1)
+      (let [le (line-end text pos)
+            e (i64-shift-right le 1)
+            term? (= 1 (bit-and le 1))]
+        (if (same-line? folded prev pos)
+          (walk-from text folded (pack-pp e prev (pp-term? pp)) (+ nm 64) acc)
+          (let [acc2 (put-run acc text pp nm)
+                next (pack-pp e pos term?)]
+            ;; A batch is bounded by its OUTPUT: handles are spent only on
+            ;; runs that are written (a run's view and its append; a
+            ;; dropped run and every repeated line cost none), so a KB of
+            ;; output bounds the handles under the loader's default 4,096.
+            (if (if to-file? false (>= (string-byte-length acc2) 1024))
+              (do (emit acc2) next)
+              (walk-from text folded next (+ 64 (bit-and nm 63)) acc2))))))))
+
+(defn walk-to-string [text :string folded :string pp :i64 nm :i64 acc :string] :string
+  (let [n (string-byte-length text)
+        pos (pp-pos pp)
+        prev (pp-prev pp)]
+    (if (>= pos n)
+      (put-run acc text pp nm)
+      (let [le (line-end text pos)
+            e (i64-shift-right le 1)
+            term? (= 1 (bit-and le 1))]
+        (if (same-line? folded prev pos)
+          (walk-to-string text folded (pack-pp e prev (pp-term? pp)) (+ nm 64) acc)
+          (walk-to-string text folded (pack-pp e pos term?) (+ 64 (bit-and nm 63))
+                          (put-run acc text pp nm)))))))
+
+(defn walk-batches [text :string folded :string pp :i64 mode :i64] :i64
+  (let [next (arena-scope (walk-from text folded pp (+ 64 mode) ""))]
+    (if (< next 0) 0 (walk-batches text folded next mode))))
+
+(defn spit-file [path :string content :string] :string
+  (typed-cap-call :fs/app-data :string :string
+                  (string-concat (string-concat path "WRITE_SEP") content)))
+
+(defn complain [path :string] :i64
+  (do
+    (emit-error "uniq: ")
+    (emit-error path)
+    (emit-error ": No such file or directory")
+    (emit-error (nl))
+    1))
+
+;; Verbatim from /usr/bin/uniq, measured 2026-09-10. Three or more operands
+;; is a usage error, exit 1.
+(defn usage [] :i64
+  (do
+    (emit-error "usage: uniq [-cdiu] [-D[septype]] [-f fields] [-s chars] [input [output]]")
+    (emit-error (nl))
+    1))
+
+;; --- the second operand is a DESTINATION ---------------------------------
+;;
+;; `uniq INPUT OUTPUT` writes the answer to OUTPUT and puts NOTHING on
+;; stdout, truncating OUTPUT if it exists. Measured 2026-09-10. That makes
+;; uniq the only command here whose extra operand is not another input, and
+;; the reason its walk builds a string instead of writing as it goes.
+;;
+;; A missing INPUT leaves OUTPUT untouched -- it is not created and then
+;; found empty -- because the input is checked before anything is written.
+(defn stdin [n :string] :string
+  (typed-cap-call :io/read :string :string n))
+
+;; Standard input, to stdout. The flag is read BEFORE the input for the same
+;; reason as below: the text is then the pool's last allocation.
+(defn from-stdin [] :i64
+  (let [mode (mode-of)
+        text (stdin "")
+        folded (if (= mode 4) (fold text) text)
+        n (string-byte-length text)]
+    (if (= n 0)
+      0
+      (let [first-le (line-end text 0)
+            pp (pack-pp (i64-shift-right first-le 1) 0 (= 1 (bit-and first-le 1)))]
+        (walk-batches text folded pp mode)))))
+
+(defn main [] :i64
+  (let [total (arg "")
+        start (first-operand)]
+    (if (string=? (decimal-of start) total)
+      ;; No operand: standard input, whole (wire 41, 2026-09-16 -- 99% of
+      ;; uniq's invocations in agent tool use are a later pipeline segment,
+      ;; 1,933 of 1,951 measured). Input past the string pool is refused.
+      (from-stdin)
+      (if (if (string=? (decimal-of (+ start 1)) total)
+            false
+            (if (string=? (decimal-of (+ start 2)) total) false true))
+        (usage)
+        (let [input (arg (decimal-of start))
+              to-file? (string=? (decimal-of (+ start 2)) total)]
+          (if (readable? input)
+            (let [mode (mode-of)
+                  base (+ mode (if to-file? 8 0))
+                  ;; Read AFTER the flag: the text is then the pool's last
+                  ;; allocation until the accumulator's first append.
+                  text (slurp-file input)
+                  folded (if (= mode 4) (fold text) text)
+                  n (string-byte-length text)]
+              (if (= n 0)
+                (if to-file? (do (spit-file (arg (decimal-of (+ start 1))) "") 0) 0)
+                (let [first-le (line-end text 0)
+                      pp (pack-pp (i64-shift-right first-le 1) 0 (= 1 (bit-and first-le 1)))]
+                  (if to-file?
+                    ;; The whole answer as one value, then one write.
+                    (do (spit-file (arg (decimal-of (+ start 1)))
+                                   (walk-to-string text folded pp (+ 64 base) ""))
+                        0)
+                    (walk-batches text folded pp base)))))
+            (complain input)))))))
