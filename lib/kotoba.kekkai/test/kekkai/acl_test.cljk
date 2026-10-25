@@ -1,0 +1,130 @@
+(ns kekkai.acl-test
+  "acl.cljc had no direct unit tests before this file -- only indirect
+  coverage via governor_contract_test.clj's higher-level scenarios
+  (which exercise it through governor.cljc's key-violations/
+  deny-by-default-violations, not directly). This is the zero-trust
+  core of the whole system (deny-by-default, no implicit allow) so it
+  deserves tests that pin its behavior independent of the governor
+  layer built on top of it."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kekkai.acl :as acl]))
+
+;; ── principals ──────────────────────────────────────────────────────────
+
+(deftest principals-is-owner-plus-tags
+  (is (= #{"alice" "tag:laptop" "tag:vip"}
+         (acl/principals {:user "alice" :tags ["tag:laptop" "tag:vip"]}))))
+
+(deftest principals-with-no-tags-is-just-the-owner
+  (is (= #{"alice"} (acl/principals {:user "alice" :tags []}))))
+
+;; ── edge-allowed?: no implicit allow ──────────────────────────────────
+
+(def policy
+  {:grants [{:src ["tag:laptop"] :dst ["tag:server"] :ports [22 443]}
+            {:src ["alice"] :dst ["tag:server" "tag:exit"] :ports ["*"]}]})
+
+(deftest edge-allowed-denies-with-no-matching-grant
+  (is (nil? (acl/edge-allowed? policy
+                               {:user "mallory" :tags ["tag:laptop"]}
+                               {:user "bob" :tags ["tag:desktop"]}))
+      "no grant mentions tag:desktop as a dst -- denied, not an error, just nil"))
+
+(deftest edge-allowed-denies-on-an-empty-policy
+  (is (nil? (acl/edge-allowed? {:grants []}
+                               {:user "alice" :tags []}
+                               {:user "bob" :tags []}))))
+
+(deftest edge-allowed-matches-by-tag-selector
+  (is (= [22 443]
+         (acl/edge-allowed? policy
+                            {:user "carol" :tags ["tag:laptop"]}
+                            {:user "dave" :tags ["tag:server"]}))))
+
+(deftest edge-allowed-matches-by-user-selector-with-wildcard-ports
+  (is (= ["*"]
+         (acl/edge-allowed? policy
+                            {:user "alice" :tags []}
+                            {:user "dave" :tags ["tag:exit"]}))))
+
+(deftest edge-allowed-requires-BOTH-src-and-dst-to-match-the-same-grant
+  (testing "src matches one grant's :src but not that grant's :dst -> no cross-grant mixing"
+    (is (nil? (acl/edge-allowed? policy
+                                 {:user "carol" :tags ["tag:laptop"]}
+                                 {:user "dave" :tags ["tag:exit"]}))
+        "tag:laptop's only grant targets tag:server, not tag:exit -- carol can't reach an exit node
+         just because SOME grant somewhere mentions tag:exit")))
+
+(deftest edge-allowed-is-directional-not-symmetric
+  (testing "a grant permitting laptop->server does not imply server->laptop"
+    (is (some? (acl/edge-allowed? policy
+                                  {:user "carol" :tags ["tag:laptop"]}
+                                  {:user "dave" :tags ["tag:server"]})))
+    (is (nil? (acl/edge-allowed? policy
+                                 {:user "dave" :tags ["tag:server"]}
+                                 {:user "carol" :tags ["tag:laptop"]})))))
+
+;; ── reachable-peers: expiry + status gating on top of edge-allowed? ────
+
+(def now 1750000000)
+
+;; reachable-peers decides over a PLANE ({:policies {tailnet policy} :peerings}),
+;; not a bare policy, because the organization boundary is settled before any
+;; grant is consulted. These nodes carry no :tailnet, so they all resolve to
+;; acl/default-tailnet and exercise exactly the pre-tenant behavior.
+(def plane {:policies {acl/default-tailnet policy} :peerings []})
+
+(defn- node [id user tags status key-expiry]
+  {:id id :user user :tags tags :status status :key-expiry key-expiry})
+
+(deftest reachable-peers-excludes-self
+  (let [me (node "n1" "alice" [] "authorized" (+ now 1000))]
+    (is (empty? (acl/reachable-peers plane me [me] now)))))
+
+(deftest reachable-peers-excludes-unauthorized-status
+  (let [src (node "n1" "carol" ["tag:laptop"] "authorized" (+ now 1000))
+        pending-dst (node "n2" "dave" ["tag:server"] "pending" (+ now 1000))]
+    (is (empty? (acl/reachable-peers plane src [pending-dst] now))
+        "a pending (not-yet-approved) node is never reachable regardless of ACL grants")))
+
+(deftest reachable-peers-excludes-expired-keys
+  (let [src (node "n1" "carol" ["tag:laptop"] "authorized" (+ now 1000))
+        expired-dst (node "n2" "dave" ["tag:server"] "authorized" (- now 1))]
+    (is (empty? (acl/reachable-peers plane src [expired-dst] now)))))
+
+(deftest reachable-peers-excludes-acl-denied-even-when-status-and-key-are-fine
+  (let [src (node "n1" "carol" ["tag:laptop"] "authorized" (+ now 1000))
+        unrelated-dst (node "n2" "eve" ["tag:desktop"] "authorized" (+ now 1000))]
+    (is (empty? (acl/reachable-peers plane src [unrelated-dst] now)))))
+
+(deftest reachable-peers-returns-every-valid-authorized-peer-with-its-ports
+  (let [src (node "n1" "carol" ["tag:laptop"] "authorized" (+ now 1000))
+        good-dst (node "n2" "dave" ["tag:server"] "authorized" (+ now 1000))
+        bad-dst (node "n3" "eve" ["tag:desktop"] "authorized" (+ now 1000))
+        candidates [src good-dst bad-dst]]
+    (is (= [{:peer "n2" :ports [22 443] :via :policy}]
+           (acl/reachable-peers plane src candidates now)))))
+
+;; ── tag-owned? / unowned-tags: no self-escalation ──────────────────────
+
+(def tag-policy {:tag-owners {"tag:server" ["alice"] "tag:laptop" ["alice" "bob"]}})
+
+(deftest tag-owned-checks-the-tag-owners-list
+  (is (true? (acl/tag-owned? tag-policy "alice" "tag:server")))
+  (is (true? (acl/tag-owned? tag-policy "bob" "tag:laptop")))
+  (is (false? (acl/tag-owned? tag-policy "mallory" "tag:server"))))
+
+(deftest tag-owned-on-an-unregistered-tag-is-false-not-an-error
+  (is (false? (acl/tag-owned? tag-policy "alice" "tag:nonexistent"))))
+
+(deftest unowned-tags-returns-only-tags-the-owner-cannot-claim
+  (is (= ["tag:server"] (acl/unowned-tags tag-policy {:user "mallory" :tags ["tag:server"]}))
+      "mallory claims tag:server but only alice is authorized for it"))
+
+(deftest unowned-tags-empty-when-every-claimed-tag-is-authorized
+  (is (empty? (acl/unowned-tags tag-policy {:user "alice" :tags ["tag:server" "tag:laptop"]}))))
+
+(deftest unowned-tags-flags-only-the-specific-unauthorized-tags-not-all
+  (is (= ["tag:server"]
+         (acl/unowned-tags tag-policy {:user "bob" :tags ["tag:laptop" "tag:server"]}))
+      "bob owns tag:laptop but not tag:server -- only the latter is flagged"))

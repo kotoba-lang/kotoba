@@ -1,0 +1,116 @@
+(ns kekkai.heartbeat-http-test
+  (:require [kotoba.test :refer [async deftest is testing]]
+            [ed25519.core :as ed25519]
+            [kekkai.heartbeat :as heartbeat]
+            [kekkai.heartbeat-http :as heartbeat-http]
+            [kekkai.node.endpoint :as endpoint]
+            [kekkai.node.heartbeat :as node-heartbeat]
+            [kekkai.operation :as operation]
+            [kekkai.store :as store]
+            ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:path" :as path]))
+
+(def ^:private seed
+  (ed25519/unhex "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"))
+
+(defn- fixture []
+  (let [st (store/seed-db)
+        node-id "n-server"
+        did (ed25519/did-key-from-seed seed)]
+    (store/record-datom! st {:kind :node :id node-id :value {:did did}})
+    {:store st :actor (operation/build st) :node-id node-id}))
+
+(deftest signed-heartbeat-ingress-accepts-once-and-rejects-replay
+  (let [{:keys [store actor node-id]} (fixture)
+        value (heartbeat/sign node-id 1 (heartbeat/now-seconds)
+                              ["203.0.113.40:41641"] seed)
+        accepted (heartbeat-http/ingest! store actor nil node-id value)
+        recorded (last (store/heartbeats-of store node-id))
+        replay (heartbeat-http/ingest! store actor nil node-id value)]
+    (testing "the enrolled signer records a complete candidate set"
+      (is (= 202 (:status accepted)))
+      (is (= 1 (:heartbeat/sequence recorded)))
+      (is (= ["203.0.113.40:41641"] (:endpoints recorded)))
+      (is (integer? (:last-seen recorded))))
+    (testing "a sequence cannot be accepted twice"
+      (is (= 409 (:status replay)))
+      (is (= 1 (count (store/heartbeats-of store node-id)))))))
+
+(deftest heartbeat-ingress-rolls-back-if-durable-write-fails
+  (let [{:keys [store actor node-id]} (fixture)
+        fail? (atom true)
+        persist! (fn [_]
+                   (when @fail? (throw (ex-info "disk unavailable" {}))))
+        value (heartbeat/sign node-id 1 (heartbeat/now-seconds)
+                              ["203.0.113.40:41641"] seed)
+        failed (heartbeat-http/ingest! store actor persist! node-id value)]
+    (is (= 500 (:status failed)))
+    (is (empty? (store/heartbeats-of store node-id)))
+    (reset! fail? false)
+    (is (= 202 (:status (heartbeat-http/ingest! store actor persist! node-id value))))
+    (is (= 1 (count (store/heartbeats-of store node-id))))))
+
+(deftest heartbeat-http-listener-rejects-public-binds-and-invalid-bodies
+  (let [{:keys [store]} (fixture)
+        failure (try
+                  (heartbeat-http/start! {:store store :host "0.0.0.0" :port 0})
+                  nil
+                  (catch :default error error))]
+    (is (= :kekkai/non-loopback-heartbeat-bind (-> failure ex-data :type)))
+    (is (= 400 (:status (heartbeat-http/ingest! store (operation/build store)
+                                                nil "n-server" {:endpoints []}))))))
+
+(deftest node-heartbeat-http-roundtrip-over-loopback
+  (let [{:keys [store node-id]} (fixture)
+        directory (.mkdtempSync fs (str (.tmpdir os) "/kekkai-heartbeat-http-test-"))
+        sequence-file (.join path directory "heartbeat.seq")
+        captured (atom nil)
+        server* (atom nil)
+        candidates [(endpoint/endpoint :local "127.0.0.1" 41641)]]
+    (async done
+      (.then (heartbeat-http/start! {:store store :host "127.0.0.1" :port 0})
+             (fn [server]
+               (reset! server* server)
+               (let [url (str "http://127.0.0.1:" (:port server)
+                              "/v1/nodes/" node-id "/heartbeat")
+                     client-config {:url (str "http://127.0.0.1:" (:port server))
+                                    :node-id node-id
+                                    :seed seed
+                                    :sequence-file sequence-file
+                                    :timeout-ms 2000
+                                    :fetch-fn (fn [request-url options]
+                                                (reset! captured
+                                                        {:url request-url
+                                                         :body (aget options "body")})
+                                                (js/fetch request-url options))}
+                     chain (-> (node-heartbeat/post! client-config candidates)
+                               (.then (fn [accepted]
+                                        (is (:accepted? accepted))
+                                        (is (= 1 (:sequence accepted)))
+                                        (is (= ["127.0.0.1:41641"]
+                                               (:endpoints (last (store/heartbeats-of
+                                                                  store node-id)))))
+                                        (js/fetch (:url @captured)
+                                                  #js {:method "POST"
+                                                       :headers #js {"content-type" "application/edn"}
+                                                       :body (:body @captured)})))
+                               (.then (fn [replay]
+                                        (is (= 409 (.-status replay)))
+                                        ((:stop server)))))]
+                 (.then chain
+                        (fn []
+                          (.rmSync fs directory #js {:recursive true :force true})
+                          (done))
+                        (fn [error]
+                          (is false (str "loopback heartbeat roundtrip failed: "
+                                         (ex-message error)))
+                          (-> ((:stop server))
+                              (.then (fn []
+                                       (.rmSync fs directory #js {:recursive true :force true})
+                                       (done)))))))
+             (fn [error]
+               (is false (str "loopback heartbeat listener failed: "
+                              (ex-message error)))
+               (.rmSync fs directory #js {:recursive true :force true})
+               (done)))))))

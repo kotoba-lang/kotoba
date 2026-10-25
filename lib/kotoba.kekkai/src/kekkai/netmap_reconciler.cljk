@@ -1,0 +1,588 @@
+(ns kekkai.netmap-reconciler
+  "Node-runtime publisher that reconciles persisted control-plane snapshots
+  into signed, per-node desired-state netmaps.
+
+  Heartbeats contribute candidate addresses only. Admission and ACL decisions
+  remain in the control-plane store and projector. Authorized nodes receive
+  their current projection; revoked nodes receive a narrowed projection so
+  resident watchers can remove stale access."
+  (:require [cljs.reader :as edn]
+            [clojure.string :as string]
+            [ipns.core :as ipns]
+            [kekkai.acl :as acl]
+            [kekkai.netmap :as netmap]
+            [kekkai.store :as store]
+            ["node:crypto" :as crypto]
+            ["node:fs" :as fs]
+            ["node:path" :as path]
+            ["node:child_process" :as child-process]))
+
+(def desired-schema "kekkai.desired-state/v1")
+(def desired-kind :kekkai/netmap)
+(def missing-marker "__KEKKAI_DESIRED_STATE_MISSING__")
+(def max-root-read-bytes (* 16 1024 1024))
+
+(defn- buffer [value encoding]
+  (.from js/Buffer value encoding))
+
+(defn- utf8 [value]
+  (buffer value "utf8"))
+
+(defn- b64 [value]
+  (.toString value "base64"))
+
+(defn- unb64 [value]
+  (buffer value "base64"))
+
+(defn- canonical-compare [a b]
+  (compare (pr-str a) (pr-str b)))
+
+(defn canonical-value
+  "Recursively sort unordered EDN collections while preserving sequence order.
+  This mirrors `kekkai.desired-state/canonical-value` byte for byte."
+  [value]
+  (cond
+    (map? value) (into (sorted-map-by canonical-compare)
+                       (map (fn [[k v]] [(canonical-value k) (canonical-value v)]))
+                       value)
+    (set? value) (into (sorted-set-by canonical-compare) (map canonical-value) value)
+    (vector? value) (mapv canonical-value value)
+    (list? value) (apply list (map canonical-value value))
+    (sequential? value) (doall (map canonical-value value))
+    :else value))
+
+(defn canonical-bytes [value]
+  (binding [*print-namespace-maps* false *print-length* nil *print-level* nil]
+    (utf8 (pr-str (canonical-value value)))))
+
+(defn- base32 [bytes]
+  (let [alphabet "abcdefghijklmnopqrstuvwxyz234567"]
+    (loop [remaining (seq bytes) buffer 0 bits 0 output []]
+      (cond
+        (>= bits 5)
+        (let [left (- bits 5)
+              digit (bit-and (bit-shift-right buffer left) 31)
+              mask (dec (bit-shift-left 1 left))]
+          (recur remaining (bit-and buffer mask) left
+                 (conj output (.charAt alphabet digit))))
+
+        (seq remaining)
+        (recur (next remaining)
+               (bit-or (bit-shift-left buffer 8)
+                       (bit-and (first remaining) 255))
+               (+ bits 8) output)
+
+        (pos? bits)
+        (apply str (conj output
+                         (.charAt alphabet
+                                  (bit-and (bit-shift-left buffer (- 5 bits)) 31))))
+
+        :else (apply str output)))))
+
+(defn cidv1-raw [bytes]
+  (let [digest (.digest (.update (.createHash crypto "sha256") bytes))
+        framed (concat [0x01 0x55 0x12 0x20] (array-seq digest))]
+    (str "b" (base32 framed))))
+
+(defn subject-for-node [node]
+  (str (acl/tailnet-of node) "/" (:id node)))
+
+(defn- regular-file! [file-path type]
+  (when-not (and (string? file-path) (seq file-path) (.existsSync fs file-path))
+    (throw (ex-info "required file is unavailable" {:type type})))
+  (let [stat (.lstatSync fs file-path)]
+    (when (or (.isSymbolicLink stat) (not (.isFile stat)))
+      (throw (ex-info "required path must be a regular, non-symlink file"
+                      {:type type})))
+    {:path file-path :stat stat}))
+
+(defn load-identity!
+  "Load an operator-provisioned Cacao Ed25519 identity from an owner-only file."
+  [identity-file]
+  (let [{:keys [stat]} (regular-file! identity-file :kekkai/missing-reconciler-identity-file)
+        mode (.-mode stat)
+        saved (edn/read-string (.readFileSync fs identity-file "utf8"))]
+    (when-not (zero? (bit-and mode 63))
+      (throw (ex-info "signing identity file permissions must be 0600 or stricter"
+                      {:type :kekkai/insecure-reconciler-identity-file})))
+    (when-not (and (map? saved) (string? (:private-b64 saved))
+                   (string? (:public-b64 saved)))
+      (throw (ex-info "signing identity file is malformed"
+                      {:type :kekkai/invalid-reconciler-identity-file})))
+    (let [private-key (.createPrivateKey
+                       crypto
+                       #js {:key (unb64 (:private-b64 saved))
+                            :format "der" :type "pkcs8"})
+          public-key (.createPublicKey crypto private-key)
+          public-der (.export public-key #js {:format "der" :type "spki"})
+          configured-public (unb64 (:public-b64 saved))]
+      (when-not (and (= (.-length public-der) (.-length configured-public))
+                     (.timingSafeEqual crypto public-der configured-public))
+        (throw (ex-info "signing identity private and public keys do not match"
+                        {:type :kekkai/reconciler-identity-key-mismatch})))
+      (let [raw-public (.subarray public-der (- (.-length public-der) 32))
+            graph (ipns/pubkey->name (vec (array-seq raw-public)))]
+        {:private-key private-key
+         :public-key public-key
+         :private-b64 (:private-b64 saved)
+         :public-b64 (:public-b64 saved)
+         :authority-spki-b64 (b64 public-der)
+         :graph graph}))))
+
+(defn- ed25519-sign [private-key bytes]
+  (.sign crypto nil bytes private-key))
+
+(defn- ed25519-verify? [public-key bytes signature]
+  (.verify crypto nil bytes public-key signature))
+
+(defn seal-netmap [netmap identity]
+  (let [payload (binding [*print-namespace-maps* false
+                          *print-length* nil *print-level* nil]
+                  (utf8 (pr-str netmap)))
+        signature (ed25519-sign (:private-key identity) payload)
+        digest (.digest (.update (.createHash crypto "sha256") payload) "hex")]
+    {:netmap/payload-b64 (b64 payload)
+     :netmap/signature-b64 (b64 signature)
+     :netmap/signer-spki-b64 (:authority-spki-b64 identity)
+     :netmap/sha256 digest}))
+
+(defn verify-netmap-envelope [node-envelope authority-spki-b64]
+  (let [{:netmap/keys [payload-b64 signature-b64 signer-spki-b64 sha256]} node-envelope]
+    (when-not (and (string? payload-b64) (string? signature-b64)
+                   (string? signer-spki-b64) (string? sha256))
+      (throw (ex-info "signed netmap envelope is incomplete"
+                      {:type :kekkai/invalid-netmap-envelope})))
+    (when-not (= authority-spki-b64 signer-spki-b64)
+      (throw (ex-info "netmap signer is not the configured authority"
+                      {:type :kekkai/untrusted-netmap-signer})))
+    (let [payload (unb64 payload-b64)
+          digest (.digest (.update (.createHash crypto "sha256") payload) "hex")]
+      (when-not (= sha256 digest)
+        (throw (ex-info "netmap payload digest mismatch"
+                        {:type :kekkai/netmap-digest-mismatch})))
+      (let [public-key (.createPublicKey
+                        crypto
+                        #js {:key (unb64 signer-spki-b64)
+                             :format "der" :type "spki"})
+            signature (unb64 signature-b64)]
+        (when-not (ed25519-verify? public-key payload signature)
+          (throw (ex-info "netmap signature verification failed"
+                          {:type :kekkai/netmap-signature-invalid})))
+        (edn/read-string (.toString payload "utf8"))))))
+
+(defn- desired-statement [{:keys [kind subject epoch previous-cid payload]} name]
+  (when-not (and (keyword? kind) (string? subject) (seq subject)
+                 (integer? epoch) (pos? epoch)
+                 (or (nil? previous-cid)
+                     (and (string? previous-cid)
+                          (string/starts-with? previous-cid "b"))))
+    (throw (ex-info "invalid desired state statement"
+                    {:type :kekkai/invalid-desired-statement})))
+  (let [payload-bytes (canonical-bytes payload)]
+    {:desired/schema desired-schema
+     :desired/kind kind
+     :desired/subject subject
+     :desired/name name
+     :desired/epoch epoch
+     :desired/previous-cid previous-cid
+     :desired/payload-cid (cidv1-raw payload-bytes)
+     :desired/payload-b64 (b64 payload-bytes)}))
+
+(defn seal-desired [input identity]
+  (let [statement (desired-statement input (:graph identity))
+        bytes (canonical-bytes statement)]
+    {:desired/cid (cidv1-raw bytes)
+     :desired/statement-b64 (b64 bytes)
+     :desired/signature-b64 (b64 (ed25519-sign (:private-key identity) bytes))
+     :desired/signer-spki-b64 (:authority-spki-b64 identity)}))
+
+(defn verify-desired
+  "Verify signer, CID, signature, key-derived name, and payload CID."
+  [desired-envelope identity {:keys [kind subject min-epoch]}]
+  (let [{:desired/keys [cid statement-b64 signature-b64 signer-spki-b64]} desired-envelope]
+    (when-not (every? string? [cid statement-b64 signature-b64 signer-spki-b64])
+      (throw (ex-info "desired state envelope is incomplete"
+                      {:type :kekkai/invalid-desired-envelope})))
+    (when-not (= (:authority-spki-b64 identity) signer-spki-b64)
+      (throw (ex-info "desired state signer is not the configured authority"
+                      {:type :kekkai/untrusted-desired-signer})))
+    (let [bytes (unb64 statement-b64)
+          public-key (:public-key identity)]
+      (when-not (= cid (cidv1-raw bytes))
+        (throw (ex-info "desired state CID mismatch"
+                        {:type :kekkai/desired-cid-mismatch})))
+      (when-not (ed25519-verify? public-key bytes (unb64 signature-b64))
+        (throw (ex-info "desired state signature invalid"
+                        {:type :kekkai/desired-signature-invalid})))
+      (let [statement (edn/read-string (.toString bytes "utf8"))
+            payload-bytes (unb64 (:desired/payload-b64 statement))
+            payload (edn/read-string (.toString payload-bytes "utf8"))]
+        (when-not (= desired-schema (:desired/schema statement))
+          (throw (ex-info "desired state schema mismatch"
+                          {:type :kekkai/desired-schema-mismatch})))
+        (when-not (= (:graph identity) (:desired/name statement))
+          (throw (ex-info "desired state name is not derived from signer"
+                          {:type :kekkai/desired-name-mismatch})))
+        (when-not (= (:desired/payload-cid statement) (cidv1-raw payload-bytes))
+          (throw (ex-info "desired state payload CID mismatch"
+                          {:type :kekkai/desired-payload-cid-mismatch})))
+        (when (and kind (not= kind (:desired/kind statement)))
+          (throw (ex-info "desired state kind mismatch"
+                          {:type :kekkai/desired-kind-mismatch})))
+        (when (and subject (not= subject (:desired/subject statement)))
+          (throw (ex-info "desired state subject mismatch"
+                          {:type :kekkai/desired-subject-mismatch})))
+        (when (and min-epoch (< (:desired/epoch statement) min-epoch))
+          (throw (ex-info "desired state epoch rollback"
+                          {:type :kekkai/desired-epoch-rollback})))
+        (assoc statement :desired/cid cid :desired/payload payload)))))
+
+(defn- subject-key [subject]
+  (cidv1-raw (utf8 subject)))
+
+(defn- remote-root [root]
+  (when (and (string? root) (string/starts-with? root "ssh://"))
+    (let [[_ host remote-path] (re-matches #"ssh://([^/]+)(/.*)" root)]
+      (when-not (and host remote-path
+                     (re-matches #"(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9._-]+" host)
+                     (re-matches #"/[A-Za-z0-9._/-]+" remote-path)
+                     (not (string/includes? remote-path "..")))
+        (throw (ex-info "invalid SSH desired-state root"
+                        {:type :kekkai/invalid-ssh-mirror :root root})))
+      {:host host :path (string/replace remote-path #"/+$" "")})))
+
+(defn- remote-command [host command input]
+  (let [result (.execFileSync child-process "ssh" #js [host command]
+                              #js {:input input :encoding "buffer"
+                                   :maxBuffer max-root-read-bytes})]
+    (.toString result "utf8")))
+
+(defn- read-root [root relative]
+  (if-let [{:keys [host path]} (remote-root root)]
+    (let [target (str path "/" relative)
+          text (remote-command host
+                               (str "if test -f " target "; then cat " target
+                                    "; else printf '" missing-marker "'; fi")
+                               nil)]
+      (when-not (= missing-marker text) text))
+    (let [target (path/join root relative)]
+      (when (.existsSync fs target)
+        (.readFileSync fs target "utf8")))))
+
+(defn- atomic-write-local! [target text]
+  (let [parent (path/dirname target)
+        temp (str target ".tmp-" (.randomUUID crypto))]
+    (.mkdirSync fs parent #js {:recursive true :mode 448})
+    (try
+      (.writeFileSync fs temp text #js {:encoding "utf8" :mode 384 :flag "wx"})
+      (.renameSync fs temp target)
+      target
+      (catch :default error
+        (try (.unlinkSync fs temp) (catch :default _ nil))
+        (throw error)))))
+
+(defn- write-root! [root relative text]
+  (if-let [{:keys [host path]} (remote-root root)]
+    (let [target (str path "/" relative)
+          parent (subs target 0 (string/last-index-of target "/"))
+          temp (str target ".tmp-" (.randomUUID crypto))]
+      (remote-command host
+                      (str "mkdir -p " parent " && cat > " temp " && mv " temp " " target)
+                      text)
+      root)
+    (atomic-write-local! (path/join root relative) text)))
+
+(defn- head-path [subject]
+  (str "heads/" (subject-key subject) ".edn"))
+
+(defn- block-path [cid]
+  (str "blocks/" cid ".edn"))
+
+(defn- read-head [root subject]
+  (some-> (read-root root (head-path subject)) edn/read-string))
+
+(defn- current-publication [roots subject identity]
+  (let [heads (mapv (fn [root]
+                      {:root root :head (read-head root subject)}) roots)
+        available (filterv :head heads)]
+    (when (seq available)
+      (let [epoch (apply max (map #(get-in % [:head :desired/epoch]) available))
+            latest (filterv #(= epoch (get-in % [:head :desired/epoch])) available)
+            cids (set (map #(get-in % [:head :desired/cid]) latest))]
+        (when-not (= 1 (count cids))
+          (throw (ex-info "desired-state mirrors disagree at the same epoch"
+                          {:type :kekkai/desired-split-brain :epoch epoch :cids cids})))
+        (let [cid (first cids)
+              blocks (keep (fn [{:keys [root]}]
+                             (when-let [text (read-root root (block-path cid))]
+                               (try (edn/read-string text) (catch :default _ nil)))) latest)
+              block (first blocks)]
+          (when-not block
+            (throw (ex-info "desired-state head has no readable block"
+                            {:type :kekkai/desired-block-unavailable :cid cid})))
+          (let [statement (verify-desired block identity
+                                          {:kind desired-kind :subject subject
+                                           :min-epoch epoch})]
+            (when-not (= cid (:desired/cid statement))
+              (throw (ex-info "desired-state head CID does not match its block"
+                              {:type :kekkai/desired-head-block-mismatch})))
+            (let [node-envelope (:desired/payload statement)
+                  netmap (verify-netmap-envelope node-envelope
+                                                 (:authority-spki-b64 identity))]
+              (assoc statement :node-envelope node-envelope :netmap netmap
+                               :desired/envelope block))))))))
+
+(defn pull-netmap
+  "Read the highest verified per-node publication from the configured roots."
+  [roots subject identity]
+  (current-publication roots subject identity))
+
+(defn- assert-head-advance! [root subject new-head]
+  (when-let [old-head (read-head root subject)]
+    (let [old-epoch (:desired/epoch old-head)
+          new-epoch (:desired/epoch new-head)]
+      (when (< new-epoch old-epoch)
+        (throw (ex-info "desired-state head rollback refused"
+                        {:type :kekkai/desired-head-rollback})))
+      (when (and (= new-epoch old-epoch)
+                 (not= (:desired/cid old-head) (:desired/cid new-head)))
+        (throw (ex-info "different desired state already occupies this epoch"
+                        {:type :kekkai/desired-head-conflict}))))))
+
+(defn publish-netmap!
+  [roots min-copies subject epoch previous-cid netmap identity]
+  (let [node-envelope (seal-netmap netmap identity)
+        desired-envelope (seal-desired {:kind desired-kind :subject subject
+                                        :epoch epoch :previous-cid previous-cid
+                                        :payload node-envelope}
+                                       identity)
+        block-text (binding [*print-namespace-maps* false
+                             *print-length* nil *print-level* nil]
+                     (pr-str (canonical-value desired-envelope)))
+        head {:desired/cid (:desired/cid desired-envelope)
+              :desired/name (:graph identity)
+              :desired/subject subject :desired/epoch epoch}
+        head-text (binding [*print-namespace-maps* false
+                            *print-length* nil *print-level* nil]
+                    (pr-str (canonical-value head)))
+        results (mapv (fn [root]
+                        (try
+                          (assert-head-advance! root subject head)
+                          (write-root! root (block-path (:desired/cid desired-envelope))
+                                       block-text)
+                          (write-root! root (head-path subject) head-text)
+                          {:root root :ok? true}
+                          (catch :default error
+                            {:root root :ok? false
+                             :reason (or (ex-message error) "mirror write failed")})))
+                      roots)
+        copies (count (filter :ok? results))]
+    (when (< copies min-copies)
+      (throw (ex-info "desired state did not reach mirror quorum"
+                      {:type :kekkai/desired-mirror-quorum
+                       :required min-copies :copies copies :results results})))
+    {:desired/cid (:desired/cid desired-envelope)
+     :desired/epoch epoch :desired/name (:graph identity)
+     :desired/copies copies :desired/results results
+     :node-envelope node-envelope}))
+
+(defn- plan-node [inputs node roots identity]
+  (let [subject (subject-for-node node)]
+    (try
+      (let [current (current-publication roots subject identity)
+            current-version (get-in current [:netmap :netmap/version])
+            _ (when (and current (not (int? current-version)))
+                (throw (ex-info "current netmap has an invalid version"
+                                {:type :kekkai/invalid-current-netmap-version})))
+            projected (netmap/publish (assoc inputs :version 1) (:id node))]
+        {:node node :subject subject :current current :projected projected})
+      (catch :default error
+        {:node node :subject subject :error error}))))
+
+(defn- failed-plan [plan error-type reason]
+  {:node (:id (:node plan)) :subject (:subject plan) :status :failed
+   :error-type error-type :reason reason})
+
+(defn- reconcile-tailnet! [inputs nodes roots min-copies identity]
+  (let [plans (mapv #(plan-node inputs % roots identity) nodes)
+        failed (first (filter :error plans))]
+    (if failed
+      (mapv (fn [plan]
+              (if-let [error (:error plan)]
+                (failed-plan plan (:type (ex-data error))
+                             (or (ex-message error) "netmap preflight failed"))
+                (failed-plan plan :kekkai/netmap-generation-blocked
+                             "tailnet generation blocked by another node's netmap preflight failure")))
+            plans)
+      (let [currents (keep :current plans)
+            versions (mapv #(get-in % [:netmap :netmap/version]) currents)
+            aligned? (and (= (count plans) (count currents))
+                          (= 1 (count (set versions))))
+            content-changed? (some (fn [{:keys [current projected]}]
+                                     (or (nil? current)
+                                         (not= (dissoc projected :netmap/version)
+                                               (dissoc (:netmap current)
+                                                       :netmap/version))))
+                                   plans)
+            publish-generation? (or (not aligned?) content-changed?)
+            latest-version (reduce max 0 versions)
+            version (if publish-generation? (inc latest-version) latest-version)]
+        (mapv (fn [{:keys [node subject current projected]}]
+                (try
+                  (if-not publish-generation?
+                    {:node (:id node) :subject subject :status :unchanged
+                     :netmap/version version
+                     :desired/epoch (:desired/epoch current)
+                     :desired/cid (:desired/cid current)}
+                    (let [epoch (if current (inc (:desired/epoch current)) 1)
+                          publication (publish-netmap!
+                                       roots min-copies subject epoch
+                                       (:desired/cid current)
+                                       (assoc projected :netmap/version version)
+                                       identity)]
+                      (-> publication
+                          (dissoc :node-envelope :desired/results)
+                          (assoc :node (:id node) :subject subject :status :published
+                                 :netmap/version version))))
+                  (catch :default error
+                    (failed-plan {:node node :subject subject}
+                                 (:type (ex-data error))
+                                 (or (ex-message error)
+                                     "netmap publication failed")))))
+              plans)))))
+
+(defn reconcile!
+  "Publish changed signed netmaps for authorized and revoked nodes.
+
+  `:netmap/version` is a tailnet generation because the node's Noise prologue
+  binds it. Any changed projection advances the generation and republishes all
+  eligible nodes in that tailnet at the same version; existing version skew is
+  repaired the same way. Desired-state epochs remain per node.
+
+  Requires the operator's identity, persisted store snapshot, and one or more
+  local/SSH mirror roots. A relay is required by default; deployments that have
+  verified direct underlay reachability can explicitly set
+  `:allow-relayless? true`. Per-node failures are returned independently so a
+  later pass can retry them."
+  [{:keys [store identity roots relays min-copies allow-relayless?]}]
+  (when-not store
+    (throw (ex-info "netmap reconciliation requires a control-plane store"
+                    {:type :kekkai/missing-reconciler-store})))
+  (when-not (and (:private-key identity) (:public-key identity))
+    (throw (ex-info "netmap reconciliation requires a signing identity"
+                    {:type :kekkai/missing-signing-identity})))
+  (when-not (and (vector? roots) (seq roots) (every? string? roots))
+    (throw (ex-info "netmap reconciliation requires one or more mirror roots"
+                    {:type :kekkai/missing-desired-root})))
+  (when-not (and (vector? relays)
+                 (or (seq relays) (true? allow-relayless?)))
+    (throw (ex-info "empty relay config requires explicit :allow-relayless? true"
+                    {:type :kekkai/missing-relay-config})))
+  (let [min-copies (or min-copies (count roots))]
+    (when-not (and (integer? min-copies) (pos? min-copies)
+                   (<= min-copies (count roots)))
+      (throw (ex-info "mirror quorum must be between one and root count"
+                      {:type :kekkai/invalid-mirror-quorum})))
+    (let [inputs (store/netmap-inputs store {:relays relays :version 1})
+          nodes (vec (store/all-nodes store))
+          eligible (filterv #(contains? #{"authorized" "revoked"} (:status %)) nodes)
+          grouped (sort-by key (group-by acl/tailnet-of eligible))
+          published-outcomes
+          (mapcat (fn [[_ tailnet-nodes]]
+                    (try
+                      (reconcile-tailnet! inputs tailnet-nodes roots min-copies identity)
+                      (catch :default error
+                        (mapv #(failed-plan {:node % :subject (subject-for-node %) }
+                                            (:type (ex-data error))
+                                            (or (ex-message error)
+                                                "netmap reconciliation failed"))
+                              tailnet-nodes))))
+                  grouped)
+          skipped-outcomes (mapv (fn [node]
+                                  {:node (:id node) :status :skipped
+                                   :reason :node-not-authorized})
+                                (remove #(contains? #{"authorized" "revoked"}
+                                                     (:status %))
+                                        nodes))
+          outcomes (into (vec published-outcomes) skipped-outcomes)]
+      {:outcomes outcomes
+       :published (count (filter #(= :published (:status %)) outcomes))
+       :unchanged (count (filter #(= :unchanged (:status %)) outcomes))
+       :skipped (count (filter #(= :skipped (:status %)) outcomes))
+       :failed (count (filter #(= :failed (:status %)) outcomes))})))
+
+(defn open-state-store [state-file]
+  (regular-file! state-file :kekkai/missing-reconciler-state-file)
+  (let [data (edn/read-string (.readFileSync fs state-file "utf8"))]
+    (when-not (and (map? data) (map? (:nodes data)))
+      (throw (ex-info "control-plane snapshot must contain an enrolled :nodes map"
+                      {:type :kekkai/invalid-reconciler-state-file})))
+    (store/->MemStore (atom (merge {:ledger [] :assessments {}} data)))))
+
+(defn- read-config! [config-file]
+  (regular-file! config-file :kekkai/missing-reconciler-config-file)
+  (let [config (edn/read-string (.readFileSync fs config-file "utf8"))]
+    (when-not (map? config)
+      (throw (ex-info "netmap reconciler config must be an EDN map"
+                      {:type :kekkai/invalid-reconciler-config})))
+    config))
+
+(defn run-once! [config-file]
+  (let [config (read-config! config-file)
+        identity (load-identity! (:identity-file config))
+        st (open-state-store (:state-file config))]
+    (reconcile! (assoc config :store st :identity identity))))
+
+(defn- state-fingerprint [state-file]
+  (regular-file! state-file :kekkai/missing-reconciler-state-file)
+  (let [stat (.statSync fs state-file)]
+    [(.-dev stat) (.-ino stat) (.-size stat) (.-mtimeMs stat)]))
+
+(defn watch! [config-file]
+  (let [config (read-config! config-file)
+        identity (load-identity! (:identity-file config))
+        poll-ms (or (:poll-ms config) 1000)
+        last-error (atom nil)]
+    (when-not (and (integer? poll-ms) (<= 250 poll-ms 60000))
+      (throw (ex-info "reconciler :poll-ms must be in 250..60000"
+                      {:type :kekkai/invalid-reconciler-poll-interval})))
+    (println (pr-str {:event :netmap-reconciler-started
+                      :state-file (:state-file config) :poll-ms poll-ms}))
+    (loop [last-fingerprint nil]
+      (let [{next-fingerprint :fingerprint stop? :stop?}
+            (try
+              (let [fingerprint (state-fingerprint (:state-file config))]
+                (if (= fingerprint last-fingerprint)
+                  {:fingerprint last-fingerprint}
+                  (let [st (open-state-store (:state-file config))
+                        result (reconcile! (assoc config :store st :identity identity))]
+                    (println (pr-str (assoc result :event :netmap-reconcile-complete)))
+                    (when (zero? (:failed result)) (reset! last-error nil))
+                    (when (pos? (:failed result))
+                      (reset! last-error "one or more node maps failed"))
+                    {:fingerprint (if (zero? (:failed result))
+                                    fingerprint last-fingerprint)})))
+              (catch :default error
+                (let [message (or (ex-message error) "netmap reconciliation failed")]
+                  (when-not (= message @last-error)
+                    (println (pr-str {:event :netmap-reconcile-error :reason message})))
+                  (reset! last-error message)
+                  {:fingerprint last-fingerprint})))]
+        (when-not stop?
+          (js/Atomics.wait (js/Int32Array. (js/SharedArrayBuffer. 4)) 0 0 poll-ms)
+          (recur next-fingerprint))))))
+
+(defn -main [& args]
+  (let [[config-file mode] args]
+    (when-not config-file
+      (throw (ex-info "usage: kekkai.netmap-reconciler CONFIG.edn [--watch]"
+                      {:type :kekkai/invalid-cli-arguments})))
+    (case mode
+      nil (let [result (run-once! config-file)]
+            (println (pr-str (assoc result :event :netmap-reconcile-complete)))
+            (when (pos? (:failed result))
+              (throw (ex-info "one or more netmaps failed to reconcile"
+                              {:type :kekkai/netmap-reconcile-incomplete}))))
+      "--watch" (watch! config-file)
+      (throw (ex-info "usage: kekkai.netmap-reconciler CONFIG.edn [--watch]"
+                      {:type :kekkai/invalid-cli-arguments :mode mode})))))

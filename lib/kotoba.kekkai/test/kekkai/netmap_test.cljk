@@ -1,0 +1,197 @@
+(ns kekkai.netmap-test
+  "The wire netmap projection: what the data plane is told, and what it is not."
+  (:require [kotoba.lang.error :as kerror] [kotoba.test :refer [deftest is testing]]
+            [kekkai.netmap :as nm]
+            [kekkai.store :as store]))
+
+(def demo (store/demo-data))
+
+(defn- inputs
+  ([] (inputs {}))
+  ([overrides]
+   (merge {:nodes (vec (vals (:nodes demo)))
+           :plane {:policies (:policies demo)
+                   :peerings (vec (vals (:peerings demo)))}
+           :heartbeats (:heartbeats demo)
+           :relays [{:name "jp-tyo-1" :region "jp" :host "relay.example"
+                     :port 41642 :key "abcd"}]
+           :version 42}
+          overrides)))
+
+(defn- edge-for [netmap from to]
+  (first (filter #(and (= from (:edge/from %)) (= to (:edge/to %)))
+                 (:netmap/edges netmap))))
+
+(defn- peer-ids [netmap]
+  (set (map :node/id (:netmap/peers netmap))))
+
+(deftest publishes-the-shape-the-node-validates
+  (let [netmap (nm/publish (inputs) "n-laptop")]
+    (testing "the five keys kekkai.node.netmap/validate requires"
+      (is (= 42 (:netmap/version netmap)))
+      (is (= "default" (:netmap/tailnet netmap)))
+      (is (= "n-laptop" (get-in netmap [:netmap/self :node/id])))
+      (is (seq (get-in netmap [:netmap/self :node/key])))
+      (is (sequential? (:netmap/peers netmap))))
+    (testing "every published peer carries the key the data plane dials"
+      (is (every? #(seq (:node/key %)) (:netmap/peers netmap))))
+    (testing "relays pass through under the node's key names"
+      (is (= [{:relay/name "jp-tyo-1" :relay/region "jp" :relay/host "relay.example"
+               :relay/port 41642 :relay/key "abcd"}]
+             (:netmap/relays netmap))))))
+
+(deftest a-peer-with-no-edge-in-either-direction-is-absent-not-denied
+  (let [netmap (nm/publish (inputs) "n-laptop")]
+    (testing "the laptop's grant reaches tag:server, so n-server is published"
+      (is (contains? (peer-ids netmap) "n-server")))
+    (testing "n-pending is alice's own device but no grant names tag:laptop as a
+              destination — absent in both directions"
+      (is (not (contains? (peer-ids netmap) "n-pending")))
+      (is (nil? (edge-for netmap "n-laptop" "n-pending")))
+      (is (nil? (edge-for netmap "n-pending" "n-laptop"))))
+    (testing "and the omission is reportable, not silent"
+      (is (= :no-edge-either-direction
+             (:excluded (first (filter #(= "n-pending" (:node %))
+                                       (nm/excluded (inputs) "n-laptop")))))))
+    (testing "n-gw IS published: it carries tag:exit and alice's own grant names
+              it, so reachability follows the owner, not just the tag pair"
+      (is (contains? (peer-ids netmap) "n-gw")))))
+
+(deftest an-edged-peer-that-is-expired-or-unadmitted-is-published-marked
+  (let [netmap (nm/publish (inputs) "n-laptop")
+        rogue (first (filter #(= "n-rogue" (:node/id %)) (:netmap/peers netmap)))]
+    (testing "n-rogue carries tag:server, so the laptop grant edges it"
+      (is (some? rogue)))
+    (testing "published with the facts that make the node deny it"
+      (is (= "pending" (:node/status rogue)))
+      (is (< (:node/expires-at rogue) store/demo-now))
+      (testing "which is what lets the node say WHY, instead of just failing"
+        (is (not= "authorized" (:node/status rogue)))))))
+
+(deftest capabilities-are-opt-in-per-grant
+  (let [netmap (nm/publish (inputs) "n-laptop")]
+    (testing "the laptop→server grant names :ssh, so the edge carries it"
+      (is (= [:overlay :ssh] (:edge/capabilities (edge-for netmap "n-laptop" "n-server")))))
+    (testing "and its ports survive the crossing"
+      (is (= [22 443] (:edge/ports (edge-for netmap "n-laptop" "n-server")))))))
+
+(deftest the-port-wildcard-is-translated-not-passed-through
+  (testing "\"*\" in a policy grant becomes :any, which is what permitted? tests"
+    (let [netmap (nm/publish (inputs) "n-gw")
+          edge (edge-for netmap "n-gw" "n-server")]
+      ;; n-gw is alice's, and alice's grant is ports ["*"] toward tag:server.
+      (is (some? edge))
+      (is (= [:any] (:edge/ports edge)))
+      (is (not (some #{"*"} (:edge/ports edge)))))))
+
+(deftest cross-tailnet-peers-are-excluded-and-the-reason-is-named
+  (testing "acme nodes never appear in a default-tailnet netmap"
+    (let [netmap (nm/publish (inputs) "n-laptop")]
+      (is (empty? (filter #(#{"a-server" "a-cache"} (:node/id %))
+                          (:netmap/peers netmap))))))
+  (testing "reported as a data-plane limitation, distinct from a missing grant"
+    (let [reasons (into {} (map (juxt :node :excluded))
+                        (nm/excluded (inputs) "n-laptop"))]
+      (is (= :cross-tailnet-not-carriable (get reasons "a-cache")))
+      (is (= :no-edge-either-direction (get reasons "n-pending"))))))
+
+(deftest an-active-peering-is-recorded-as-would-allow-not-as-reachable
+  (testing "the demo peering is one-sided, so nothing would allow it either"
+    (let [entry (first (filter #(= "a-cache" (:node %))
+                               (nm/excluded (inputs) "n-laptop")))]
+      (is (false? (:peering-would-allow? entry)))))
+  (testing "with BOTH approvals the peering allows the edge — and it is still
+            excluded, because the prologue binds the publisher's tailnet"
+    (let [peering (assoc (get-in demo [:peerings "p-alice-acme"])
+                         :approved-by ["acme" "default"])
+          in (inputs {:plane {:policies (:policies demo) :peerings [peering]}})
+          entry (first (filter #(= "a-cache" (:node %)) (nm/excluded in "n-laptop")))]
+      (is (true? (:peering-would-allow? entry)))
+      (is (= :cross-tailnet-not-carriable (:excluded entry)))
+      (is (empty? (filter #(= "a-cache" (:node/id %))
+                          (:netmap/peers (nm/publish in "n-laptop"))))))))
+
+(deftest heartbeat-endpoints-become-reflexive-candidates
+  (let [netmap (nm/publish (inputs) "n-server")
+        laptop (first (filter #(= "n-laptop" (:node/id %)) (:netmap/peers netmap)))]
+    (testing "the laptop's heartbeat endpoint is published as a hint to probe"
+      (is (= [{:kind :reflexive :host "203.0.113.7" :port 41641}]
+             (:node/endpoints laptop))))
+    (testing "a peer with no heartbeat carries no endpoints key at all"
+      (let [n (nm/publish (inputs) "n-laptop")
+            server (first (filter #(= "n-server" (:node/id %)) (:netmap/peers n)))]
+        (is (not (contains? server :node/endpoints)))))))
+
+(deftest only-the-latest-heartbeat-candidate-set-is-published
+  (let [in (inputs {:heartbeats
+                    {"n-laptop" [{:last-seen 10 :endpoint "192.0.2.1:41000"}
+                                 {:last-seen 20
+                                  :endpoints ["203.0.113.8:41642"
+                                              "naphtali.example:41643"
+                                              "[2001:db8::7]:41644"
+                                              "198.51.100.7:0"
+                                              "198.51.100.8:65536"
+                                              "[:::]:41646"
+                                              "[1:::2]:41647"
+                                              "2001:db8::7:41645"]}]}})
+        netmap (nm/publish in "n-server")
+        laptop (first (filter #(= "n-laptop" (:node/id %)) (:netmap/peers netmap)))]
+    (is (= [{:kind :reflexive :host "203.0.113.8" :port 41642}
+            {:kind :reflexive :host "naphtali.example" :port 41643}
+            {:kind :reflexive :host "2001:db8::7" :port 41644}]
+           (:node/endpoints laptop)))))
+
+(deftest an-empty-latest-heartbeat-clears-old-candidates
+  (let [in (inputs {:heartbeats
+                    {"n-laptop" [{:last-seen 10 :endpoint "192.0.2.1:41000"}
+                                 {:last-seen 20 :endpoints []}]}})
+        netmap (nm/publish in "n-server")
+        laptop (first (filter #(= "n-laptop" (:node/id %)) (:netmap/peers netmap)))]
+    (is (not (contains? laptop :node/endpoints)))))
+
+(deftest a-node-without-data-plane-facts-fails-loudly
+  (testing "missing :static-pub is named here, not as :peer-missing-key there"
+    (let [nodes (mapv #(if (= "n-server" (:id %)) (dissoc % :static-pub) %)
+                      (vals (:nodes demo)))
+          ex (try (nm/publish (inputs {:nodes nodes}) "n-laptop") nil
+                  (catch kerror/ExceptionInfo e e))]
+      (is (some? ex))
+      (is (= :kekkai/unpublishable-nodes (:type (ex-data ex))))
+      (is (= [{:problem :missing-static-pub :node "n-server"}]
+             (:problems (ex-data ex))))))
+  (testing "a node that is not published is not required to have them —
+            unpublishable is a property of what this netmap carries, not of the
+            whole control plane, or one un-provisioned device would stop every
+            netmap in the tailnet"
+    (let [nodes (mapv #(if (= "n-pending" (:id %)) (dissoc % :static-pub :overlay-ip) %)
+                      (vals (:nodes demo)))]
+      (is (some? (nm/publish (inputs {:nodes nodes}) "n-laptop"))))))
+
+(deftest version-and-node-identity-are-not-guessed
+  (is (thrown? kerror/ExceptionInfo (nm/publish (inputs) "no-such-node")))
+  (is (thrown? kerror/ExceptionInfo (nm/publish (inputs {:version nil}) "n-laptop")))
+  (is (thrown? kerror/ExceptionInfo (nm/publish (inputs {:version "42"}) "n-laptop"))))
+
+(deftest the-projection-does-not-depend-on-input-order
+  (testing "the netmap is signed as bytes, so ordering is part of the signature:
+            the same facts in a different order must produce the same map"
+    (let [in (inputs)
+          shuffled (assoc in :nodes (vec (reverse (:nodes in))))]
+      (is (= (nm/publish in "n-laptop") (nm/publish shuffled "n-laptop")))
+      (is (= (nm/excluded in "n-laptop") (nm/excluded shuffled "n-laptop")))))
+  (testing "peers and edges are id-ordered, not encounter-ordered"
+    (let [netmap (nm/publish (inputs) "n-laptop")]
+      (is (= (sort (map :node/id (:netmap/peers netmap)))
+             (map :node/id (:netmap/peers netmap))))
+      (is (= (sort-by (juxt :edge/from :edge/to) (:netmap/edges netmap))
+             (:netmap/edges netmap))))))
+
+(deftest store-inputs-match-a-hand-assembled-snapshot
+  (testing "store/netmap-inputs feeds publish the same thing the tests do"
+    (let [s (store/seed-db)
+          from-store (store/netmap-inputs s {:relays [] :version 42})]
+      (is (= (set (map :id (:nodes from-store)))
+             (set (map :id (:nodes (inputs))))))
+      (is (= (:plane (inputs)) (:plane from-store)))
+      (is (= (nm/publish (assoc from-store :relays (:relays (inputs))) "n-laptop")
+             (nm/publish (inputs) "n-laptop"))))))

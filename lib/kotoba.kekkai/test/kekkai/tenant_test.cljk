@@ -1,0 +1,301 @@
+(ns kekkai.tenant-test
+  "The organization boundary (ADR-2608040100).
+
+  Every test here exists because the flat, single-policy model got the case
+  WRONG, not merely unhandled — a tag name two organizations both chose, a
+  private subnet two organizations both use, an approval one organization
+  wrote down on the other's behalf. The boundary is only worth having if it
+  holds in exactly those cases, so they are the cases pinned here."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kekkai.acl :as acl]
+            [kekkai.coordllm :as coordllm]
+            [kekkai.governor :as gov]
+            [kekkai.operation :as op]
+            [kekkai.query :as q]
+            [kekkai.store :as store]
+            [langgraph.graph :as g]))
+
+(def now store/demo-now)
+
+(defn- fresh [] (store/seed-db))
+
+;; ── the collision that motivates the whole thing ────────────────────────
+
+(deftest a-tag-name-two-organizations-both-chose-does-not-join-them
+  (testing "alice grants tag:laptop → tag:server; acme independently named a
+            node tag:server. Under one flat policy that grant matched acme's
+            machine — the grant is real, the match is real, and the edge is
+            still wrong."
+    (let [s (fresh)]
+      (is (q/reachable? s "n-laptop" "n-server")
+          "inside alice's own tailnet the grant means what it says")
+      (is (not (q/reachable? s "n-laptop" "a-server"))
+          "the same grant must not reach acme's identically-tagged machine"))))
+
+(deftest a-cross-organization-denial-is-not-reported-as-a-missing-grant
+  (testing "the two denials call for different actions: one is a policy edit,
+            the other is a negotiation between two organizations"
+    (let [s (fresh)]
+      (is (= :cross-tailnet (:reason (q/reachability s "n-laptop" "a-server"))))
+      (is (= :deny-by-default (:reason (q/reachability s "n-server" "n-laptop")))
+          "same tailnet, no grant in that direction"))))
+
+(deftest an-absent-tailnet-is-a-specific-tailnet-not-a-wildcard
+  (let [orphan {:id "n-x" :user "alice" :tags ["tag:laptop"]}]
+    (is (= acl/default-tailnet (acl/tailnet-of orphan)))
+    (is (not (acl/same-tailnet? orphan {:id "a" :tailnet "acme"}))
+        "unset must not match everything — that is the failure being prevented")
+    (is (acl/same-tailnet? orphan {:id "b"})
+        "two unset nodes are together, so a pre-tenant deployment is unchanged")))
+
+(deftest a-pre-tenant-store-keeps-exactly-its-old-reachability
+  (testing "seeding the single-tenant shorthand :policy, with no :tailnets at
+            all, must not deny every edge on upgrade"
+    (let [s (store/->MemStore
+             (atom {:policy {:grants [{:src ["tag:a"] :dst ["tag:b"] :ports [22]}]}
+                    :nodes {"n1" {:id "n1" :user "u" :tags ["tag:a"] :status "authorized"
+                                  :key-expiry (+ now 100)}
+                            "n2" {:id "n2" :user "u" :tags ["tag:b"] :status "authorized"
+                                  :key-expiry (+ now 100)}}
+                    :assessments {} :ledger []}))]
+      (is (= {acl/default-tailnet {:grants [{:src ["tag:a"] :dst ["tag:b"] :ports [22]}]}}
+             (:policies (store/plane s)))
+          "the legacy policy resolves to the default tailnet, not an orphan key")
+      (is (q/reachable? s "n1" "n2")))))
+
+(deftest the-historical-policy-id-the-resolves-to-the-default-tailnet
+  (is (= acl/default-tailnet (store/policy-key "the")))
+  (is (= acl/default-tailnet (store/policy-key nil)))
+  (is (= "acme" (store/policy-key "acme"))))
+
+;; ── peering: an object, and it takes two signatures ─────────────────────
+
+(deftest a-peering-one-organization-signed-opens-nothing
+  (testing "the demo ships p-alice-acme approved by acme only — the state
+            that must NOT carry traffic"
+    (let [s (fresh)]
+      (is (= ["acme"] (:approved-by (first (q/peerings-of s "acme")))))
+      (is (not (q/reachable? s "n-laptop" "a-cache")))
+      (is (= :cross-tailnet (:reason (q/reachability s "n-laptop" "a-cache")))))))
+
+(deftest both-signatures-open-only-what-the-peering-actually-grants
+  (let [s (fresh)]
+    (store/record-datom! s {:kind :peering :id "p-alice-acme"
+                            :value {:approved-by ["acme" "default"]}})
+    (testing "the granted direction opens"
+      (let [d (q/reachability s "n-laptop" "a-cache")]
+        (is (:allowed? d))
+        (is (= :peering (:via d)))
+        (is (= [443] (:ports d)))))
+    (testing "a peering is not a merger: everything it did not name stays shut"
+      (is (not (q/reachable? s "n-laptop" "a-server"))
+          "a-server carries tag:server, which no peering grant mentions")
+      (is (= :peering-grant-missing (:reason (q/reachability s "n-laptop" "a-server")))
+          "and it is reported as a gap in the signed document, not a missing peering"))
+    (testing "grants are directional — acme did not get a path back"
+      (is (not (q/reachable? s "a-cache" "n-laptop"))))))
+
+(deftest a-revoked-peering-stops-carrying-traffic-despite-both-signatures
+  (let [s (fresh)]
+    (store/record-datom! s {:kind :peering :id "p-alice-acme"
+                            :value {:approved-by ["acme" "default"] :status "revoked"}})
+    (is (not (q/reachable? s "n-laptop" "a-cache")))))
+
+(deftest a-peering-cannot-answer-an-intra-tailnet-question
+  (is (nil? (acl/active-peering [{:id "p" :a "x" :b "x" :status "active"
+                                  :approved-by ["x"]}]
+                                "x" "x"))
+      "a self-peering would be a second, quieter path to a decision the ACL owns"))
+
+(deftest a-grant-with-no-from-is-ignored-rather-than-read-as-bidirectional
+  (let [pr {:id "p" :a "x" :b "y" :status "active" :approved-by ["x" "y"]
+            :grants [{:src ["s"] :dst ["d"] :ports [1]}]}]
+    (is (empty? (acl/peering-grants pr "x")))
+    (is (empty? (acl/peering-grants pr "y")))))
+
+;; ── governor: the boundary is a hard invariant ──────────────────────────
+
+(defn- check [s request proposal] (gov/check request proposal s))
+
+(deftest the-governor-holds-a-proposed-cross-organization-edge
+  (let [s (fresh)
+        v (check s {:op :access/assess :node "n-laptop" :now now}
+                 {:peers [{:peer "a-server" :ports [22]}] :effect :netmap :confidence 0.95})]
+    (is (:hard? v))
+    (is (= [:cross-tailnet] (mapv :rule (:violations v))))
+    (is (not (:ok? v)) "un-overridable: a human cannot approve past it")))
+
+(deftest the-governor-still-allows-the-same-edge-inside-one-organization
+  (let [s (fresh)
+        v (check s {:op :access/assess :node "n-laptop" :now now}
+                 {:peers [{:peer "n-server" :ports [22]}] :effect :netmap :confidence 0.95})]
+    (is (not (:hard? v)))
+    (is (:ok? v))))
+
+(deftest an-identical-private-subnet-in-another-organization-is-not-a-hijack
+  (testing "acme already advertises an APPROVED 10.0.0.0/24 (ra-subnet). A
+            global hijack scan called alice's identical prefix a takeover —
+            and told alice about acme's internal addressing while doing it."
+    (let [s (fresh)
+          v (check s {:op :route/approve :node "n-server" :route "r-subnet" :now now}
+                   {:route "r-subnet" :effect :netmap :confidence 0.9})]
+      (is (not (:hard? v)))
+      (is (empty? (:violations v))))))
+
+(deftest a-takeover-inside-one-organization-is-still-a-hijack
+  (let [s (fresh)]
+    (store/record-datom! s {:kind :route :id "r-dup"
+                            :value {:id "r-dup" :node "n-gw" :cidr "10.0.0.0/24"
+                                    :kind "subnet" :approved? true}})
+    (let [v (check s {:op :route/approve :node "n-server" :route "r-subnet" :now now}
+                   {:route "r-subnet" :effect :netmap :confidence 0.9})]
+      (is (:hard? v))
+      (is (= [:route-hijack] (mapv :rule (:violations v)))))))
+
+;; ── governor: admission is scoped to one organization ───────────────────
+
+(deftest a-machine-cannot-be-enrolled-into-an-organization-its-owner-is-not-in
+  (let [s (fresh)]
+    (store/record-datom! s {:kind :node :id "n-intruder"
+                            :value {:id "n-intruder" :did "did:key:zI" :user "alice"
+                                    :tailnet "acme" :tags [] :status "pending"
+                                    :key-expiry (+ now 1000)}})
+    (let [v (check s {:op :node/admit :node "n-intruder" :now now}
+                   {:effect :netmap :confidence 0.95})]
+      (is (:hard? v))
+      (is (contains? (set (mapv :rule (:violations v))) :owner-tailnet-mismatch)))))
+
+(deftest a-machine-cannot-claim-an-unregistered-organization
+  (let [s (fresh)]
+    (store/record-datom! s {:kind :node :id "n-ghost"
+                            :value {:id "n-ghost" :did "did:key:zG" :user "alice"
+                                    :tailnet "nowhere" :tags [] :status "pending"
+                                    :key-expiry (+ now 1000)}})
+    (let [v (check s {:op :node/admit :node "n-ghost" :now now}
+                   {:effect :netmap :confidence 0.95})]
+      (is (:hard? v))
+      (is (contains? (set (mapv :rule (:violations v))) :no-tailnet)))))
+
+(deftest tag-ownership-is-read-from-the-nodes-own-organizations-policy
+  (testing "bob owns tag:server in acme's policy and owns nothing in alice's.
+            Reading tag-owners from a single global policy would have let
+            alice's ACL decide who may claim a tag inside acme."
+    (let [s (fresh)
+          v (check s {:op :node/admit :node "a-server" :now now}
+                   {:effect :netmap :confidence 0.95})]
+      (is (not (:hard? v)) (str "violations: " (pr-str (:violations v))))
+      (is (:high-stakes? v) "clean, but admission is still a human call"))))
+
+;; ── governor: nobody signs for an organization they are not in ──────────
+
+(deftest a-third-organization-cannot-approve-someone-elses-peering
+  (let [s (fresh)
+        v (check s {:op :peering/approve :node "n-laptop" :peering "p-alice-acme"
+                    :as "somewhere-else" :now now}
+                 {:peering "p-alice-acme" :effect :peering-record :confidence 0.9})]
+    (is (:hard? v))
+    (is (contains? (set (mapv :rule (:violations v))) :not-a-party))))
+
+(deftest an-approving-node-must-belong-to-the-organization-it-signs-for
+  (testing "holding a valid node key is not the same as holding it in the
+            organization being committed"
+    (let [s (fresh)
+          v (check s {:op :peering/approve :node "n-laptop" :peering "p-alice-acme"
+                      :as "acme" :now now}
+                   {:peering "p-alice-acme" :effect :peering-record :confidence 0.9})]
+      (is (:hard? v))
+      (is (contains? (set (mapv :rule (:violations v))) :approver-tailnet-mismatch)))))
+
+(deftest a-peering-carrying-a-third-organizations-grant-is-rejected
+  (let [s (fresh)]
+    (store/record-datom! s {:kind :peering :id "p-alice-acme"
+                            :value {:grants [{:from "elsewhere" :src ["x"] :dst ["y"]
+                                              :ports [1]}]}})
+    (let [v (check s {:op :peering/approve :node "n-laptop" :peering "p-alice-acme"
+                      :as "default" :now now}
+                   {:peering "p-alice-acme" :effect :peering-record :confidence 0.9})]
+      (is (:hard? v))
+      (is (contains? (set (mapv :rule (:violations v))) :foreign-grant)))))
+
+(deftest a-clean-peering-approval-is-still-always-a-human-call
+  (let [s (fresh)
+        v (check s {:op :peering/approve :node "n-laptop" :peering "p-alice-acme"
+                    :as "default" :now now}
+                 {:peering "p-alice-acme" :effect :peering-record :confidence 0.99})]
+    (is (not (:hard? v)) (str "violations: " (pr-str (:violations v))))
+    (is (:high-stakes? v))
+    (is (:escalate? v))
+    (is (not (:ok? v)) "confidence never buys autonomy for a cross-org path")))
+
+(deftest the-governor-refuses-a-peering-approval-that-would-actuate
+  (let [s (fresh)
+        v (check s {:op :peering/approve :node "n-laptop" :peering "p-alice-acme"
+                    :as "default" :now now}
+                 {:peering "p-alice-acme" :effect :netmap :confidence 0.9})]
+    (is (:hard? v))
+    (is (contains? (set (mapv :rule (:violations v))) :no-actuation))))
+
+;; ── the graph: two approvals accumulate rather than overwrite ───────────
+
+(deftest each-organizations-approval-is-added-not-written-over-the-others
+  (testing "the two orgs approve in two separate runs. Writing :approved-by
+            wholesale would let the second erase the first — and since
+            peering-active? demands both, that silently closes a path
+            everyone believes is open."
+    (let [s (fresh)
+          app (op/build s)
+          run (fn [as node]
+                (let [tid (str "peer-" as)
+                      req {:op :peering/approve :node node :peering "p-alice-acme"
+                           :as as :now now}
+                      r1 (g/run* app {:request req :context {:phase 3}} {:thread-id tid})]
+                  (is (= :interrupted (:status r1))
+                      "a cross-org path never commits without a human")
+                  (g/run* app {:approval {:status :approved :by (str as "-admin")}}
+                          {:thread-id tid :resume? true})))]
+      ;; acme already approved in the seed; alice approves through the graph.
+      (run "default" "n-laptop")
+      (let [pr (first (q/peerings-of s "acme"))]
+        (is (= #{"acme" "default"} (set (:approved-by pr))))
+        (is (acl/peering-active? pr)))
+      (is (q/reachable? s "n-laptop" "a-cache")
+          "and only now does the peering carry anything"))))
+
+;; ── the sealed advisor cannot see what it may not reach ─────────────────
+
+(deftest the-advisor-proposes-no-cross-organization-edge-on-its-own
+  (let [s (fresh)
+        p (coordllm/infer s {:op :access/assess :node "n-laptop" :now now})]
+    (is (= #{"n-server" "n-gw"} (set (map :peer (:peers p))))
+        "acme's machines are absent from the proposal entirely")
+    (is (every? #(= :policy (:via %)) (:peers p)))))
+
+(deftest the-advisors-netmap-follows-a-peering-once-both-signed
+  (let [s (fresh)]
+    (store/record-datom! s {:kind :peering :id "p-alice-acme"
+                            :value {:approved-by ["acme" "default"]}})
+    (let [p (coordllm/infer s {:op :access/assess :node "n-laptop" :now now})]
+      (is (contains? (set (map :peer (:peers p))) "a-cache"))
+      (is (= :peering (:via (first (filter #(= "a-cache" (:peer %)) (:peers p)))))))))
+
+;; ── a record has to know its own id ─────────────────────────────────────
+
+(deftest a-peering-recorded-without-an-id-in-its-value-is-still-findable
+  (testing "the id is already the map key, so omitting it from the value is
+            the natural thing to do — and it produced a peering that exists
+            and that nobody can find: every approval rejected as :no-peering.
+            Found by cloud-itonami's round-trip against a real store; every
+            fixture in this repo happened to include :id."
+    (let [s (store/->MemStore (atom {:assessments {} :ledger []}))]
+      (store/record-datom! s {:kind :peering :id "p-x"
+                              :value {:a "one" :b "two" :status "active"
+                                      :approved-by ["one" "two"]}})
+      (is (= "p-x" (:id (first (store/all-peerings s)))))
+      (is (some? (acl/active-peering (store/all-peerings s) "one" "two")))
+      (is (= ["p-x"] (mapv :id (q/peerings-of s "one")))))))
+
+(deftest a-tailnet-recorded-without-an-id-in-its-value-is-still-findable
+  (let [s (store/->MemStore (atom {:assessments {} :ledger []}))]
+    (store/record-datom! s {:kind :tailnet :id "t-x" :value {:org "o" :status "active"}})
+    (is (= "t-x" (:id (store/tailnet s "t-x"))))
+    (is (= ["t-x"] (mapv :id (store/all-tailnets s))))))
