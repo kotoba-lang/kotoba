@@ -1,0 +1,114 @@
+(ns kotoba.protocol.ratelimit-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.protocol.ratelimit :as rl]))
+
+(def ^:private issuer "did:key:z6MkoPd1PVGGf5gTMGy4nZNrBMszzfaeaNmZfSzgAZZNhDWq")
+(def ^:private origin "did:key:z6MkpTHR8VHsExkJxkgDwbwisfb5Tq2mWiwWjcmSKqU2E")
+(def ^:private hex64 (apply str (repeat 64 "a")))
+(def ^:private hex64b (apply str (repeat 64 "b")))
+
+(def ^:private challenge
+  {:issuer issuer :origin origin :epoch 10 :context "gateway" :type :blind-rsa
+   :scope {:operations #{"content.get"}}})
+
+(defn- token [& {:as over}]
+  (merge {:type :blind-rsa :nonce hex64 :challenge-digest hex64b
+          :key-id hex64 :authenticator "c2ln"}
+         over))
+
+(def ^:private ok-verify (constantly true))
+
+(defn- ctx [& {:as over}]
+  (merge {:challenge-digest hex64b :challenge-type :blind-rsa
+          :challenge-epoch 10 :epoch 10 :verify-fn ok-verify}
+         over))
+
+;; ── shapes ──────────────────────────────────────────────────────────────────
+
+(deftest challenge-needs-keys-epoch-and-a-scope
+  (is (= [] (rl/challenge-errors challenge)))
+  (is (= :scope-required (:error (first (rl/challenge-errors (dissoc challenge :scope))))))
+  (is (= :scope-required
+         (:error (first (rl/challenge-errors (assoc-in challenge [:scope :operations] #{}))))))
+  (is (= :not-a-key (:error (first (rl/challenge-errors (assoc challenge :origin "gateway.example"))))))
+  (is (= :malformed (:error (first (rl/challenge-errors (assoc challenge :client "x")))))))
+
+(deftest token-shape
+  (is (= [] (rl/token-errors (token))))
+  (is (= :unknown-token-type (:error (first (rl/token-errors (token :type :hmac))))))
+  (is (= :nonce (:key (first (rl/token-errors (token :nonce "short"))))))
+  (is (= :authenticator (:key (first (rl/token-errors (token :authenticator "")))))))
+
+;; ── separation ──────────────────────────────────────────────────────────────
+
+(deftest issuer-and-origin-must-be-different-parties
+  (is (= [] (rl/separation-errors {:issuer {:did issuer :org "a"} :origin {:did origin :org "b"}})))
+  (is (= :issuer-origin-not-separated
+         (:error (first (rl/separation-errors {:issuer {:did issuer :org "a"}
+                                               :origin {:did issuer :org "b"}})))))
+  (is (= :issuer-origin-not-separated
+         (:error (first (rl/separation-errors {:issuer {:did issuer :org "a"}
+                                               :origin {:did origin :org "a"}}))))
+      "different keys, same organisation, is still one party")
+  (testing "the attester may be the issuer but not the origin"
+    (is (= [] (rl/separation-errors {:attester {:did issuer :org "a"} :issuer {:did issuer :org "a"}
+                                     :origin {:did origin :org "b"}})))
+    (is (= :attester
+           (:role (first (rl/separation-errors {:attester {:did origin :org "x"}
+                                                :issuer {:did issuer :org "a"}
+                                                :origin {:did origin :org "b"}})))))))
+
+;; ── budget ──────────────────────────────────────────────────────────────────
+
+(deftest budget-grants-up-to-the-remainder
+  (is (= {:grant 5} (rl/may-issue {:budget 10 :issued 0 :requested 5})))
+  (is (= {:grant 2} (rl/may-issue {:budget 10 :issued 8 :requested 5})))
+  (is (= :budget-exhausted (:deny (rl/may-issue {:budget 10 :issued 10 :requested 1}))))
+  (is (= :malformed (:deny (rl/may-issue {:budget nil :issued 0 :requested 1}))))
+  (is (= :malformed (:deny (rl/may-issue {:budget 10 :issued 0 :requested 0})))))
+
+;; ── redemption ──────────────────────────────────────────────────────────────
+
+(deftest a-valid-token-is-admitted-once
+  (let [r1 (rl/redeem (rl/spent-set) (token) (ctx))
+        r2 (rl/redeem (:spent r1) (token) (ctx))]
+    (is (true? (:allow r1)))
+    (is (= :double-spend (:deny r2)))
+    (is (= (:spent r1) (:spent r2)) "a denial leaves the spent set alone")))
+
+(deftest the-same-nonce-under-another-key-id-is-a-different-token
+  (let [r1 (rl/redeem (rl/spent-set) (token) (ctx))
+        r2 (rl/redeem (:spent r1) (token :key-id hex64b) (ctx))]
+    (is (true? (:allow r2)))))
+
+(deftest redemption-fails-closed
+  (let [s (rl/spent-set)
+        deny (fn [t c] (:deny (rl/redeem s t c)))]
+    (is (= :malformed (deny (token :nonce "x") (ctx))))
+    (is (= :malformed (deny (token) (ctx :challenge-digest nil))))
+    (is (= :challenge-mismatch (deny (token :challenge-digest hex64) (ctx))))
+    (is (= :epoch-out-of-window (deny (token) (ctx :epoch 12))) "two epochs late, grace is 1")
+    (is (= :epoch-out-of-window (deny (token) (ctx :epoch 9))) "a future challenge")
+    (is (= :verifier-required (deny (token) (ctx :verify-fn nil))))
+    (is (= :bad-authenticator (deny (token) (ctx :verify-fn (constantly false)))))
+    (is (= :bad-authenticator (deny (token) (ctx :verify-fn (constantly :truthy))))
+        "only literal true admits")))
+
+(deftest a-token-is-still-good-inside-the-grace-window
+  (is (true? (:allow (rl/redeem (rl/spent-set) (token) (ctx :epoch 11)))))
+  (is (= :epoch-out-of-window
+         (:deny (rl/redeem (rl/spent-set) (token) (ctx :epoch 11 :grace 0))))))
+
+(deftest pruning-forgets-only-epochs-that-can-no-longer-redeem
+  (let [s (:spent (rl/redeem (rl/spent-set) (token) (ctx)))]
+    (is (contains? (:epochs (rl/prune s 11 1)) 10))
+    (is (not (contains? (:epochs (rl/prune s 12 1)) 10)))))
+
+;; ── unlinkability ───────────────────────────────────────────────────────────
+
+(deftest issuance-and-redemption-logs-share-only-epoch-and-key-id
+  (is (= [] (rl/linkage-errors {:attester-epoch-id "p1" :epoch 10 :key-id hex64 :count 5}
+                               {:nonce hex64 :epoch 10 :key-id hex64})))
+  (is (= [{:error :linkable :fields [:nonce]}]
+         (rl/linkage-errors {:nonce hex64 :epoch 10} {:nonce hex64 :epoch 10}))
+      "logging the nonce at issuance would let the issuer follow the token"))

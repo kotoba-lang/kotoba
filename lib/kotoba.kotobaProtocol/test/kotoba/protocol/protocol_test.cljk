@@ -1,0 +1,1385 @@
+(ns kotoba.protocol.protocol-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.protocol.address :as address]
+            [kotoba.protocol.a2a :as a2a]
+            [kotoba.protocol.app :as app]
+            [kotoba.protocol.bridge]
+            [kotoba.protocol.cid :as cid-ns]
+            [kotoba.protocol.discover :as discover]
+            [kotoba.protocol.graph :as graph]
+            [kotoba.protocol.govern :as govern]
+            [kotoba.protocol.install :as install]
+            [kotoba.protocol.layers :as layers]
+            [kotoba.protocol.mux :as mux]
+            [kotoba.protocol.naming :as naming]
+            [kotoba.protocol.ref :as ref]
+            [kotoba.protocol.route :as route]
+            [kotoba.protocol.sealed :as sealed]
+            [kotoba.protocol.slim :as slim]
+            [kotoba.protocol.surfaces :as surfaces]
+            [kotoba.protocol.transport :as transport]
+            [kotoba.protocol.vocab :as vocab]))
+
+(def cid "bafybeidl5t4ztktqmfcqrfqpio6qf64n6t65a7inkz2pa6jq4tyqwfjfhy")
+(def ipns (str "k51qzi5uqu5d" (apply str (repeat 50 "a"))))
+
+;; ── open agent interoperability ─────────────────────────────────────────────
+
+(deftest a2a-v1-text-task-round-trip
+  (let [card (a2a/agent-card
+              {:name "Research Bot"
+               :description "Bounded research"
+               :url "https://example.test/a2a"
+               :version "1.0.0"
+               :streaming? true
+               :skills [{:id "research" :name "Research"
+                         :description "Research one question"
+                         :inputModes ["text/plain"]
+                         :outputModes ["text/plain"]}]})
+        request {:jsonrpc "2.0" :id 7 :method "SendMessage"
+                 :params {:message {:messageId "message-1"
+                                    :contextId "context-1"
+                                    :role "ROLE_USER"
+                                    :parts [{:text "verify this"
+                                             :mediaType "text/plain"}]}}}
+        admitted (a2a/send-message-request request)
+        task (a2a/task {:id "task-1" :context-id (:context-id admitted)
+                        :state "TASK_STATE_COMPLETED"
+                        :timestamp "2026-08-26T00:00:00Z"
+                        :text "verified"})]
+    (is (= [] (a2a/agent-card-problems card)))
+    (is (= {:streaming true :pushNotifications false}
+           (:capabilities card)))
+    (is (= "verify this" (:text admitted)))
+    (is (= "message-1" (:message-id admitted)))
+    (is (= {:request-id 8 :task-id "task-1"}
+           (a2a/get-task-request
+            {:jsonrpc "2.0" :id 8 :method "GetTask"
+             :params {:id "task-1"}})))
+    (is (true? (a2a/terminal? task)))
+    (is (= task (:result (a2a/json-rpc-result 7 task))))))
+
+(deftest a2a-v1-streaming-admission-matches-unary-admission
+  (let [request {:jsonrpc "2.0" :id "stream-1"
+                 :method "SendStreamingMessage"
+                 :params {:message {:messageId "message-stream-1"
+                                    :contextId "context-stream-1"
+                                    :role "ROLE_USER"
+                                    :parts [{:text "stream this"}]}}}
+        admitted (a2a/send-streaming-message-request request)]
+    (is (= "stream this" (:text admitted)))
+    (is (= "message-stream-1" (:message-id admitted)))
+    (is (= :invalid-request
+           (:error (a2a/send-message-request request))))
+    (is (= :invalid-request
+           (:error (a2a/send-streaming-message-request
+                    (assoc-in request [:params :message :parts]
+                              [{:url "https://private.test"}])))))))
+
+(deftest a2a-admission-is-text-only-and-v1
+  (is (= :invalid-request
+         (:error (a2a/send-message-request
+                  {:jsonrpc "2.0" :id 1 :method "message/send"
+                   :params {:message {:messageId "m" :role "ROLE_USER"
+                                      :parts [{:url "https://private.test"}]}}}))))
+  (is (= :invalid-message
+         (:error (a2a/message-text
+                  {:messageId "m" :role "ROLE_AGENT"
+                   :parts [{:text "pretend to be the user"}]})))))
+
+(deftest slim-envelope-carries-a2a-without-authority
+  (let [ok (slim/envelope
+            {:delivery-id "delivery-1"
+             :from ["cloud-itonami" "owner-a" "bot-a"]
+             :to ["cloud-itonami" "owner-a" "bot-b"]
+             :payload {:jsonrpc "2.0" :id 1 :method "SendMessage"}})]
+    (is (= slim/profile (:profile ok)))
+    (is (= [["cloud-itonami" "owner-a" "bot-a"] "delivery-1"]
+           (slim/delivery-key ok)))
+    (is (true? (slim/authority-free? ok))))
+  (is (= {:error :authority-field-refused :path [:metadata :grant]}
+         (slim/envelope
+          {:delivery-id "delivery-2"
+           :from ["cloud-itonami" "owner-a" "bot-a"]
+           :to ["cloud-itonami" "owner-a" "bot-b"]
+           :payload {:metadata {:grant "never crosses"}}})))
+  (is (= :authority-field-refused
+         (:error
+          (slim/envelope
+           {:delivery-id "delivery-3"
+            :from ["cloud-itonami" "owner-a" "bot-a"]
+            :to ["cloud-itonami" "owner-a" "bot-b"]
+            :payload {"metadata" {"approval_receipt" "never crosses"}}})))))
+
+;; ── layers ───────────────────────────────────────────────────────────────────
+
+(deftest layer-table-is-total
+  (is (= [:l0-address :l1-fact :l2-graph :l3-authority :l4-distribution :l5-application]
+         (mapv :layer layers/layers)))
+  (testing "every concern maps to a declared layer"
+    (doseq [[concern _] layers/concerns]
+      (is (some? (layers/owner-of concern)) (str concern)))))
+
+(deftest ownership-samples
+  (is (= :l3-authority (:layer (layers/owner-of :ipns-naming)))
+      "IPNS 名は authority (鍵由来) の関心事")
+  (is (= :l4-distribution (:layer (layers/owner-of :ipns-publish)))
+      "IPNS の publish/resolve は distribution")
+  (is (= :l5-application (:layer (layers/owner-of :embed-url))))
+  (is (= :l0-address (:layer (layers/owner-of :cid-ref)))
+      "公開 CID は L0 identity")
+  (is (= :l3-authority (:layer (layers/owner-of :ipns-ref)))
+      "鍵由来 IPNS 名は authority")
+  (is (= :l0-address (:layer (layers/owner-of :ipld-link)))
+      "IPLD link は CID をノード内に持つ。URI path ではない")
+  (is (= :l4-distribution (:layer (layers/owner-of :gateway-projection)))
+      "HTTPS gateway は retrieval。identity ではない")
+  (is (= :l0-address (:layer (layers/owner-of :output-address))))
+  (is (= :l1-fact (:layer (layers/owner-of :action-link)))
+      "Holochain CreateLink / datom は親 CID を変えない")
+  (is (= :l4-distribution (:layer (layers/owner-of :ipni)))
+      "IPNI は discovery。identity ではない")
+  (is (= :routing (:plane (layers/owner-plane :peer-lookup)))
+      "GET /peers は routing。discovery ではない")
+  (is (= :naming (:plane (layers/owner-plane :ipns-publish)))
+      "PUT /ipns は naming。discovery ではない")
+  (is (= :naming (:plane (layers/owner-plane :ipns-resolve)))
+      "GET /ipns は naming。routing が代行しても面は naming"))
+
+(deftest planes-are-the-eight-communication-faces
+  (is (= [:identity :naming :routing :discovery :transport :session :authorization :content-protocol]
+         (mapv :plane layers/planes)))
+  (testing "every concern also names a plane"
+    (doseq [[concern _] layers/concerns]
+      (is (some? (layers/owner-plane concern)) (str concern))))
+  (testing "every plane points at a split README"
+    (doseq [p layers/planes]
+      (is (re-find #"^docs/.+\.md$" (:readme p)) (:plane p)))))
+
+(deftest plane-maturity-is-total-and-honest
+  (is (= (set (map :plane layers/planes))
+         (set (keys layers/plane-maturity))))
+  (doseq [[plane m] layers/plane-maturity]
+    (is (#{:ready :pending} (:algebra m)) (str plane " algebra"))
+    (is (#{:ready :pending :n/a :blocked} (:live m)) (str plane " live"))
+    (when (= :ready (:live m))
+      (is (symbol? (:ns m)) (str plane " live ready without a ns")))
+    (when (= :ready (:algebra m))
+      (is (symbol? (:ns m)) (str plane " algebra ready without a ns")))
+    (when (= :blocked (:live m))
+      (is (keyword? (:blocked-until m)) (str plane " blocked without a reason"))))
+  (is (= :ready (get-in layers/plane-maturity [:naming :live]))
+      "tick 1: IPNS GET/PUT is specified; live must not stay pending")
+  (is (= :ready (get-in layers/plane-maturity [:authorization :algebra]))
+      "tick 2: governor deny must be an algebra, not a README")
+  (is (= :ready (get-in layers/plane-maturity [:transport :algebra]))
+      "tick 3: a hop is not identity; tests must go red when it is")
+  (is (= :blocked (get-in layers/plane-maturity [:transport :live]))
+      "this process is not a DHT node")
+  (is (= :dht-node-transport
+         (get-in layers/plane-maturity [:transport :blocked-until])))
+  (is (= :ready (get-in layers/plane-maturity [:session :algebra]))
+      "tick 4: mux alive is not at-head; tests must go red when they collapse")
+  (is (= :blocked (get-in layers/plane-maturity [:session :live]))
+      "session live waits on transport live")
+  (is (= :transport
+         (get-in layers/plane-maturity [:session :blocked-until]))))
+
+(deftest two-link-kinds-are-not-the-same-edge
+  (is (true? (get-in layers/link-kinds [:merkle :mutates-parent?])))
+  (is (false? (get-in layers/link-kinds [:action :mutates-parent?])))
+  (is (= :block (get-in layers/link-kinds [:merkle :stored-in])))
+  (is (= :signed-metadata (get-in layers/link-kinds [:action :stored-in])))
+  (is (= :content-protocol (:plane (layers/owner-plane :merkle-link))))
+  (is (= :content-protocol (:plane (layers/owner-plane :action-link))))
+  (is (= :discovery (:plane (layers/owner-plane :ipni)))
+      "IPNI は CID を書き換えない索引")
+  (is (= :identity (:plane (layers/owner-plane :input-address)))
+      "input-addressed recipe も identity 面。naming ではない")
+  (is (= :content-protocol (:plane (layers/owner-plane :e2ee-session)))
+      "Signal E2EE is an object shape, not the session/mux plane")
+  (is (= :transport (:plane (layers/owner-plane :hop-encryption)))
+      "Noise is hop encryption")
+  (is (= :naming (:plane (layers/owner-plane :prekey-bundle)))
+      "a prekey bundle is discovered by IPNS, not encrypted by it"))
+
+;; ── vocab ────────────────────────────────────────────────────────────────────
+
+(deftest value-predicates
+  (is (vocab/did-key? "did:key:z6MkoPd1PVGGf5gTMGy4nZNrBMszzfaeaNmZfSzgAZZNhDWq"))
+  (is (not (vocab/did-key? "did:web:example.com")))
+  (is (vocab/cid? "bafybeidl5t4ztktqmfcqrfqpio6qf64n6t65a7inkz2pa6jq4tyqwfjfhy"))
+  (is (vocab/cid? "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG"))
+  (is (not (vocab/cid? "not-a-cid")))
+  (is (vocab/ipns-name? (str "k51qzi5uqu5d" (apply str (repeat 50 "a")))))
+  (is (vocab/reverse-dns-id? "net.kotoba.mangaka"))
+  (is (not (vocab/reverse-dns-id? "mangaka")))
+  (is (vocab/app-uri? (str "ipfs://" cid)))
+  (is (vocab/app-uri? (str "ipns://" ipns)))
+  (is (vocab/app-uri? "https://aozora.app/studio"))
+  (is (not (vocab/app-uri? (str "ipfs://" cid "/index.html")))
+      "path after CID is not identity")
+  (is (not (vocab/app-uri? (str "ipfs://" cid "?format=raw"))))
+  (is (not (vocab/app-uri? "ftp://x"))))
+
+(deftest app-cell-composition-references-immutable-dna-cids
+  (let [dna-cid "bafyreifq7onuoxumrs7tnpdtx5lsnnulu5k24cj75y44sz4ot7n5kz4l5u"
+        cells [{:id "net.kotoba.core.membership" :dna-cid dna-cid}
+               {:id "net.kotoba.murakumo.actions" :dna-cid dna-cid}]]
+    (is (true? (vocab/app-cells? cells)))
+    (is (true? (vocab/app-cells? (list (first cells)))))
+    (is (false? (vocab/app-cells? nil)))
+    (is (false? (vocab/app-cells? 7)))
+    (is (false? (vocab/app-cells? [])))
+    (is (false? (vocab/app-cells? [{:id "bad" :dna-cid dna-cid}])))
+    (is (false? (vocab/app-cells? [{:id "net.kotoba.app" :dna-cid "https://example.test/dna"}])))
+    (is (false? (vocab/app-cells? [{:id "net.kotoba.app" :dna-cid cid}])))
+    (is (false? (vocab/app-cells? [{:id "net.kotoba.app" :dna-cid "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG"}])))
+    (is (false? (vocab/app-cells? [{:id "net.kotoba.app" :dna-cid dna-cid}
+                                   {:id "net.kotoba.app" :dna-cid dna-cid}])))))
+
+(deftest entity-validation
+  (is (= [] (vocab/validate-entity
+             {:kotoba.actor/did "did:key:z6MkoPd1PVGGf5gTMGy4nZNrBMszzfaeaNmZfSzgAZZNhDWq"
+              :kotoba.actor/app "net.kotoba.mangaka"
+              :unrelated/attr "ignored"})))
+  (is (= [{:attr :kotoba.app/nonsense :error :unknown-attribute}]
+         (vocab/validate-entity {:kotoba.app/nonsense 1})))
+  (is (= :invalid-value
+         (:error (first (vocab/validate-entity {:kotoba.app/kind "widget"}))))
+      "ActorFrame/widget は語彙に無い — appview | embed | actor のみ"))
+
+;; ── ref: public identity (ADR-2608145100) ────────────────────────────────────
+
+(deftest public-ref-is-cid-or-ipns-only
+  (testing "ipfs://{cidv1} round-trips; no path"
+    (let [uri (str "ipfs://" cid)
+          p (ref/parse uri)]
+      (is (= {:kind :cid :scheme :ipfs :cid cid} p))
+      (is (= uri (ref/emit p)))
+      (is (true? (ref/canonical-ref-uri? uri)))
+      (is (= (str "https://kotobase.net/ipfs/" cid)
+             (ref/gateway-url p "https://kotobase.net")))))
+  (testing "ipns://{k51} round-trips; no path"
+    (let [uri (str "ipns://" ipns)
+          p (ref/parse uri)]
+      (is (= {:kind :ipns :scheme :ipns :name ipns} p))
+      (is (= uri (ref/emit p)))
+      (is (= (str "https://kotobase.net/ipns/" ipns)
+             (ref/gateway-url p "https://kotobase.net")))))
+  (testing "selectors / locations are not identity"
+    (is (= :path-not-identity (:error (ref/parse (str "ipfs://" cid "/index.html")))))
+    (is (= :path-not-identity (:error (ref/parse (str "ipfs://" cid "/")))))
+    (is (= :query-not-identity (:error (ref/parse (str "ipfs://" cid "?format=raw")))))
+    (is (= :fragment-not-identity (:error (ref/parse (str "ipfs://" cid "#checkout")))))
+    (is (= :path-not-identity (:error (ref/parse (str "ipns://" ipns "/latest"))))))
+  (testing "CIDv0 is not a public URI label"
+    (is (= :invalid-cid
+           (:error (ref/parse "ipfs://QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG"))))
+    (is (vocab/cid? "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG")
+        "L0 shape check still accepts historical CIDv0"))
+  (testing "https is not a canonical ref"
+    (is (= :unknown-scheme (:error (ref/parse "https://aozora.app/studio"))))))
+
+;; ── app: embed-url ───────────────────────────────────────────────────────────
+
+(deftest embed-url-parse-and-resolve
+  (is (= {:scheme :https :url "https://aozora.app/studio" :canonical? false}
+         (app/parse-embed-url "https://aozora.app/studio")))
+  (testing "canonical ipfs embed has no path"
+    (let [p (app/parse-embed-url (str "ipfs://" cid))]
+      (is (= {:scheme :ipfs :cid cid :canonical? true} p))
+      (is (nil? (:path p)))
+      (is (= {:url (str "https://kotobase.net/ipfs/" cid)
+              :cid cid :verifiable? true}
+             (app/resolve-embed-url p {:gateway "https://kotobase.net"})))
+      (is (= {:error :gateway-required} (app/resolve-embed-url p {})))))
+  (testing "UnixFS-style path after CID is rejected"
+    (is (= :path-not-identity
+           (:error (app/parse-embed-url (str "ipfs://" cid "/index.html"))))))
+  (testing "https is reachable but not content-verifiable"
+    (is (= {:url "https://aozora.app/studio" :verifiable? false}
+           (app/resolve-embed-url (app/parse-embed-url "https://aozora.app/studio") {}))))
+  (testing "ipns = 署名済み可変ポインタ"
+    (let [p (app/parse-embed-url (str "ipns://" ipns))]
+      (is (true? (:canonical? p)))
+      (is (true? (:verifiable? (app/resolve-embed-url p {:gateway "https://kotobase.net"}))))))
+  (is (= :unknown-scheme (:error (app/parse-embed-url "ftp://x"))))
+  (is (= :invalid-cid (:error (app/parse-embed-url "ipfs://nope")))))
+
+;; ── app: manifest ────────────────────────────────────────────────────────────
+
+(def mangaka-manifest
+  {:kotoba.app/id "net.kotoba.mangaka"
+   :kotoba.app/version "0.1.0"
+   :kotoba.app/kind "embed"
+   :kotoba.app/bundle-cid cid
+   :kotoba.app/entry "index.html"
+   :kotoba.app/embed-url "https://aozora.app/studio"
+   :kotoba.app/caps ["sha256-hex" "graph/query" "llm/complete"]
+   :kotoba.app/latest ipns})
+
+(deftest manifest-validation
+  (is (= [] (app/validate-manifest mangaka-manifest)))
+  (testing "kind requirements"
+    (is (some #(= :one-of-required (:error %))
+              (app/validate-manifest (dissoc mangaka-manifest
+                                             :kotoba.app/bundle-cid
+                                             :kotoba.app/embed-url))))
+    (is (some #(= :missing-for-kind (:error %))
+              (app/validate-manifest (assoc mangaka-manifest
+                                            :kotoba.app/kind "appview"))))
+    (is (= [] (app/validate-manifest
+               (assoc mangaka-manifest
+                      :kotoba.app/kind "appview"
+                      :kotoba.app/appview-of {:graphs ["genko"]})))))
+  (testing "actor kind needs wasm modules"
+    (is (some #(= :missing-for-kind (:error %))
+              (app/validate-manifest {:kotoba.app/id "net.kotoba.x"
+                                      :kotoba.app/version "0.0.1"
+                                      :kotoba.app/kind "actor"})))
+    (is (= [] (app/validate-manifest {:kotoba.app/id "net.kotoba.x"
+                                      :kotoba.app/version "0.0.1"
+                                      :kotoba.app/kind "actor"
+                                      :kotoba.app/wasm [{:cid cid :imports ["sha256-hex"]}]}))))
+  (testing "caps must come from the registry"
+    (is (= [{:cap "fs/read" :error :unknown-cap}]
+           (app/validate-manifest (assoc mangaka-manifest
+                                         :kotoba.app/caps ["fs/read"])))))
+  (testing "multi-cell composition is optional and each role is content addressed"
+    (is (= [] (app/validate-manifest
+               (assoc mangaka-manifest
+                      :kotoba.app/cells [{:id "net.kotoba.core.membership"
+                                          :dna-cid "bafyreifq7onuoxumrs7tnpdtx5lsnnulu5k24cj75y44sz4ot7n5kz4l5u"}
+                                         {:id "net.kotoba.murakumo.actions"
+                                          :dna-cid "bafyreifq7onuoxumrs7tnpdtx5lsnnulu5k24cj75y44sz4ot7n5kz4l5u"}]))))
+    (is (some #(and (= :kotoba.app/cells (:attr %))
+                    (= :invalid-value (:error %)))
+              (app/validate-manifest
+               (assoc mangaka-manifest
+                      :kotoba.app/cells [{:id "net.kotoba.murakumo.actions"
+                                          :dna-cid "https://example.test/dna"}]))))))
+
+;; ── app: manifest 署名 metadata (ADR-2607182600 d1b) ─────────────────────────
+
+(deftest sig-metadata
+  (testing "well-formed sig metadata"
+    (is (vocab/sig-meta? {:suite-id "ed25519+ml-dsa-65" :key-id "kagi:fleet-owner-key" :epoch 0}))
+    (is (vocab/sig-meta? {:suite-id "ed25519" :key-id "k1" :epoch 3})))
+  (testing "malformed sig metadata"
+    (is (not (vocab/sig-meta? nil)))
+    (is (not (vocab/sig-meta? "signed")))
+    (is (not (vocab/sig-meta? {:suite-id "" :key-id "k1" :epoch 0})))
+    (is (not (vocab/sig-meta? {:suite-id "ed25519" :epoch 0})))
+    (is (not (vocab/sig-meta? {:suite-id "ed25519" :key-id "k1" :epoch -1})))
+    (is (not (vocab/sig-meta? {:suite-id "ed25519" :key-id "k1" :epoch "0"}))))
+  (testing "manifest with sig validates; bad sig is reported"
+    (is (= [] (app/validate-manifest
+               (assoc mangaka-manifest
+                      :kotoba.app/sig {:suite-id "ed25519+ml-dsa-65"
+                                       :key-id "kagi:mangaka-actor" :epoch 1}))))
+    (is (= :invalid-value
+           (:error (first (app/validate-manifest
+                           (assoc mangaka-manifest :kotoba.app/sig {:epoch 1}))))))))
+
+;; ── app: bundle-cid / embed-url consistency (ADR-2607071500 Addendum 4) ──────
+
+(def raw-cid "bafkreibm6jg3ux5qumhcn2b3flc3tyu6dmlb4xa7u5bf44yegnrjhc4yeq")
+(def other-raw-cid "bafkreidbwa6hrvssu64krf2fxcstyepdmfswrwstjpctxbzgv7u2oku2eu")
+
+(deftest bundle-cid-consistency
+  (testing "no embed-url at all — vacuously consistent"
+    (is (true? (app/bundle-cid-consistent? {:kotoba.app/bundle-cid raw-cid}))))
+  (testing "https embed-url — bundle-cid can't be cross-checked against it"
+    (is (true? (app/bundle-cid-consistent? {:kotoba.app/bundle-cid raw-cid
+                                            :kotoba.app/embed-url "https://aozora.app/studio"}))))
+  (testing "ipfs embed-url matching bundle-cid"
+    (is (true? (app/bundle-cid-consistent? {:kotoba.app/bundle-cid raw-cid
+                                            :kotoba.app/embed-url (str "ipfs://" raw-cid)}))))
+  (testing "ipfs embed-url NOT matching bundle-cid — desync detected"
+    (is (false? (app/bundle-cid-consistent? {:kotoba.app/bundle-cid raw-cid
+                                             :kotoba.app/embed-url (str "ipfs://" other-raw-cid)}))))
+  (testing "validate-manifest reports the mismatch"
+    (let [m {:kotoba.app/id "net.kotoba.x" :kotoba.app/version "0.0.1" :kotoba.app/kind "embed"
+             :kotoba.app/bundle-cid raw-cid
+             :kotoba.app/embed-url (str "ipfs://" other-raw-cid)}]
+      (is (some #(= :bundle-cid-embed-url-mismatch (:error %)) (app/validate-manifest m)))
+      (is (= [] (app/validate-manifest (assoc m :kotoba.app/embed-url (str "ipfs://" raw-cid))))))))
+
+;; ── cid: digest extraction / verification ────────────────────────────────────
+
+(def sha256-hello
+  [44 242 77 186 95 176 163 14 38 232 59 42 197 185 226 158
+   27 22 30 92 31 167 66 94 115 4 51 98 147 139 152 36])
+
+(deftest cid-digest-roundtrip
+  (is (= sha256-hello (:digest (cid-ns/parse-raw-cid raw-cid))))
+  (is (true? (cid-ns/digest-matches? raw-cid sha256-hello)))
+  (is (false? (cid-ns/digest-matches? raw-cid (assoc sha256-hello 0 0))))
+  (testing "dag-pb (non-raw) CID can't be digest-verified this way — fail-closed, not an exception"
+    (is (= :not-raw-sha256 (:error (cid-ns/parse-raw-cid cid))))
+    (is (false? (cid-ns/digest-matches? cid sha256-hello))))
+  (testing "malformed input degrades to an error map, never throws"
+    (is (= :bad-base32 (:error (cid-ns/parse-raw-cid "bnope"))))
+    (is (= :not-base32-cidv1 (:error (cid-ns/parse-raw-cid "Qm123"))))))
+
+;; ── cid: multicodec-general parsing (ADR-2607071500 Addendum 6 — dag-pb) ─────
+
+(def dag-pb-digest
+  [107 236 249 153 170 112 97 69 8 150 15 67 189 2 251 141
+   244 253 208 125 13 86 116 240 121 48 228 241 11 21 37 62])
+
+(deftest parse-cid-any-codec
+  (testing "raw codec (0x55)"
+    (is (= {:codec :raw :digest sha256-hello} (cid-ns/parse-cid raw-cid))))
+  (testing "dag-pb codec (0x70) — the same `cid` var used elsewhere is already dag-pb"
+    (is (= {:codec :dag-pb :digest dag-pb-digest} (cid-ns/parse-cid cid))))
+  (testing "digest-matches-cid? works across codecs, unlike digest-matches?"
+    (is (true? (cid-ns/digest-matches-cid? raw-cid sha256-hello)))
+    (is (true? (cid-ns/digest-matches-cid? cid dag-pb-digest)))
+    (is (false? (cid-ns/digest-matches? cid dag-pb-digest))
+        "digest-matches? stays raw-only — dag-pb must go through parse-cid/digest-matches-cid?")
+    (is (false? (cid-ns/digest-matches-cid? cid (assoc dag-pb-digest 0 0)))))
+  (testing "malformed input still degrades to an error map"
+    (is (= :bad-base32 (:error (cid-ns/parse-cid "bnope"))))
+    (is (= :not-base32-cidv1 (:error (cid-ns/parse-cid "Qm123"))))))
+
+(deftest base32-round-trip-and-cid-bytes-conversion
+  (testing "base32-encode is the exact inverse of base32-decode"
+    (is (= raw-cid (str "b" (cid-ns/base32-encode (cid-ns/base32-decode (subs raw-cid 1))))))
+    (is (= cid (str "b" (cid-ns/base32-encode (cid-ns/base32-decode (subs cid 1)))))))
+  (testing "parse-cid-bytes / cid-bytes->string mirror parse-cid on raw CID bytes"
+    (let [raw-bytes (cid-ns/base32-decode (subs raw-cid 1))]
+      (is (= {:codec :raw :digest sha256-hello} (cid-ns/parse-cid-bytes raw-bytes)))
+      (is (= raw-cid (cid-ns/cid-bytes->string raw-bytes))))
+    (let [dagpb-bytes (cid-ns/base32-decode (subs cid 1))]
+      (is (= {:codec :dag-pb :digest dag-pb-digest} (cid-ns/parse-cid-bytes dagpb-bytes)))
+      (is (= cid (cid-ns/cid-bytes->string dagpb-bytes))))))
+
+(deftest capability-registry
+  (is (= 8 (count app/actor-host-imports)))
+  (is (contains? app/known-caps "http-post"))
+  (is (contains? app/known-caps "net/http-post")
+      "同期 ABI 制約のため net 系は host bridge 代行 (ADR-2607062400)")
+  (is (contains? app/known-caps "oauth/graph.write")
+      "P2 OAuth 委任 cap (ADR-2607182600 d4 axis 2) — 他の bridge-caps と違い
+      app に実クレデンシャル (scope 限定 CACAO) が渡る")
+  (is (contains? app/known-caps "awai.cell.read")
+      "Itonami host mediates reads from an app's declared Awai cells")
+  (is (contains? app/known-caps "awai.cell.write")
+      "Itonami host mediates signed submissions to an app's declared Awai cells")
+  (is (contains? app/known-caps "awai.policy.evaluate")
+      "Itonami host evaluates only its local, read-only Kotoba policy bundle"))
+
+;; ── bridge ───────────────────────────────────────────────────────────────────
+
+(deftest bridge-grant-is-intersection-in-request-order
+  (is (= ["graph/query" "llm/complete"]
+         (kotoba.protocol.bridge/grant ["graph/query" "fs/read" "llm/complete"]
+                                       ["llm/complete" "graph/query"])))
+  (is (= [] (kotoba.protocol.bridge/grant nil ["graph/query"]))))
+
+;; ── labeler trust (ADR-2607182600 d5/P3) ─────────────────────────────────────
+
+(def a-verified-label {:src "did:web:labeler.aozora.app" :uri "at://did:web:app1/net.kotoba.app.manifest/self" :val "verified"})
+
+(deftest verified-requires-trusted-source-nonnegated-verified-val
+  (is (true? (kotoba.protocol.bridge/verified? [a-verified-label] #{"did:web:labeler.aozora.app"})))
+  (testing "wrong val"
+    (is (false? (kotoba.protocol.bridge/verified? [(assoc a-verified-label :val "spam")]
+                                                  #{"did:web:labeler.aozora.app"}))))
+  (testing "negated"
+    (is (false? (kotoba.protocol.bridge/verified? [(assoc a-verified-label :neg true)]
+                                                  #{"did:web:labeler.aozora.app"}))))
+  (testing "src not trusted by THIS host — a manifest can't self-attest via a colluding labeler"
+    (is (false? (kotoba.protocol.bridge/verified? [(assoc a-verified-label :src "did:web:evil-labeler.example")]
+                                                  #{"did:web:labeler.aozora.app"}))))
+  (testing "no labels at all"
+    (is (false? (kotoba.protocol.bridge/verified? [] #{"did:web:labeler.aozora.app"}))))
+  (testing "no trusted labelers configured — everything is untrusted"
+    (is (false? (kotoba.protocol.bridge/verified? [a-verified-label] #{})))))
+
+(deftest grant-with-trust-gates-only-risky-caps
+  (testing "unverified: cell reads remain available but cell writes require trust"
+    (is (= ["graph/query" "awai.cell.read"]
+           (kotoba.protocol.bridge/grant-with-trust
+            ["graph/query" "awai.cell.read" "awai.cell.write"
+             "graph/transact" "llm/complete" "oauth/graph.write"]
+            ["graph/query" "awai.cell.read" "awai.cell.write"
+             "graph/transact" "llm/complete" "oauth/graph.write"]
+            [] #{"did:web:labeler.aozora.app"}))))
+  (testing "verified: risky caps pass through too, in original request order"
+    (is (= ["graph/query" "awai.cell.read" "awai.cell.write"
+            "graph/transact" "llm/complete" "oauth/graph.write"]
+           (kotoba.protocol.bridge/grant-with-trust
+            ["graph/query" "awai.cell.read" "awai.cell.write"
+             "graph/transact" "llm/complete" "oauth/graph.write"]
+            ["graph/query" "awai.cell.read" "awai.cell.write"
+             "graph/transact" "llm/complete" "oauth/graph.write"]
+            [a-verified-label] #{"did:web:labeler.aozora.app"}))))
+  (testing "still capped by host-supported — verified doesn't grant caps the host never offered"
+    (is (= ["graph/query"]
+           (kotoba.protocol.bridge/grant-with-trust
+            ["graph/query" "graph/transact"] ["graph/query"]
+            [a-verified-label] #{"did:web:labeler.aozora.app"})))))
+
+(deftest bridge-request-validation-is-fail-closed
+  (let [granted ["graph/query"]]
+    (is (= [] (kotoba.protocol.bridge/validate-request
+               (kotoba.protocol.bridge/request "r1" "graph/query" {:nsid "x"})
+               granted)))
+    (is (= [{:error :cap-not-granted :cap "llm/complete"}]
+           (kotoba.protocol.bridge/validate-request
+            (kotoba.protocol.bridge/request "r2" "llm/complete" {})
+            granted)))
+    (is (= [{:error :unknown-cap :cap "fs/read"}]
+           (kotoba.protocol.bridge/validate-request
+            (kotoba.protocol.bridge/request "r3" "fs/read" {})
+            granted)))
+    (is (some #(= :missing-id (:error %))
+              (kotoba.protocol.bridge/validate-request
+               {:kotoba/bridge "request" :cap "graph/query"} granted)))))
+
+(deftest bridge-messages-survive-string-keys
+  (is (= "hello" (kotoba.protocol.bridge/message-type
+                  {"kotoba/bridge" "hello" "v" 1 "granted" []})))
+  (is (nil? (kotoba.protocol.bridge/message-type {:type "unrelated"}))))
+
+(deftest wasm-import-cap-mapping
+  (is (= "sha256_hex" (app/cap->wasm-import "sha256-hex")))
+  (is (= "clock_monotonic" (app/cap->wasm-import "clock-monotonic")))
+  (is (= "sha256-hex" (app/wasm-import->cap "sha256_hex")))
+  (is (= "gen-keypair" (app/wasm-import->cap (app/cap->wasm-import "gen-keypair")))))
+
+(def did "did:key:z6MkoPd1PVGGf5gTMGy4nZNrBMszzfaeaNmZfSzgAZZNhDWq")
+
+;; ── graph: merkle vs action (ADR-2608145200) ─────────────────────────────────
+
+(deftest action-link-does-not-mutate-parent-cid
+  (let [st (-> (graph/store)
+               (graph/put-node {:cid cid :body "A"})
+               (graph/put-node {:cid raw-cid :body "B"}))
+        after (graph/create-link st {:from cid :to raw-cid
+                                     :tag "mentions" :author did})]
+    (is (graph/nodes-unchanged? st after)
+        "CreateLink is DHT metadata. Entry A bytes stay A")
+    (is (= cid (:cid (graph/node after cid))))
+    (is (= #{} (:merkle (graph/neighbors after cid)))
+        "A does not contain B's hash")
+    (is (= #{raw-cid} (:action (graph/neighbors after cid))))
+    (is (= [cid] (graph/walk after cid {:kinds #{:merkle}})))
+    (is (= [cid raw-cid] (graph/walk after cid {:kinds #{:action}})))
+    (is (= (inc (:log-head st)) (:log-head after)))
+    (testing "overlay edges are L1 datoms that validate"
+      (doseq [e (graph/action-datoms after)]
+        (is (= [] (vocab/validate-entity e)))))))
+
+(deftest merkle-link-cannot-reuse-parent-cid
+  (let [st (graph/put-node (graph/store) {:cid cid :body "A"})
+        child (graph/merkle-child (graph/node st cid) raw-cid)]
+    (is (true? (:mutates-parent? child)))
+    (is (false? (:put-under-same-cid? child)))
+    (is (= :cid-mismatch
+           (:error (graph/put-node st (assoc child :cid cid))))
+        "embedding B inside A under the old CID is a CID lie")
+    (let [st2 (graph/put-node st (assoc child :cid other-raw-cid))]
+      (is (= #{raw-cid} (:merkle (graph/neighbors st2 other-raw-cid))))
+      (is (= #{} (:merkle (graph/neighbors st2 cid)))
+          "original A is still A")
+      (is (= [other-raw-cid raw-cid]
+             (graph/walk st2 other-raw-cid {:kinds #{:merkle}}))))))
+
+(deftest both-link-kinds-are-required
+  (is (not= (get-in layers/link-kinds [:merkle :mutates-parent?])
+            (get-in layers/link-kinds [:action :mutates-parent?]))))
+
+;; ── address: input vs output, Holochain kinds ────────────────────────────────
+
+(deftest output-and-input-are-both-identity
+  (is (= {:kind :output :cid cid :plane :identity} (address/output cid)))
+  (is (= {:kind :input :recipe-cid cid :plane :identity} (address/input cid)))
+  (is (= :output (:kind (address/recipe-as-output (address/input cid))))
+      "recipe bytes themselves have an output CID")
+  (is (= :identity (:plane (layers/owner-plane :input-address))))
+  (is (= :identity (:plane (layers/owner-plane :output-address)))))
+
+(deftest holochain-hashes-are-not-names
+  (is (= :identity (:plane (address/holochain-kind :entry-hash))))
+  (is (= :identity (:plane (address/holochain-kind :action-hash))))
+  (is (= :identity (:plane (address/holochain-kind :dna-hash))))
+  (is (= :authorization (:plane (address/holochain-kind :agent-pub-key))))
+  (is (= :action-link (:effect (address/holochain-kind :action-hash)))
+      "ActionHash is the CID of the signed action; the *effect* is overlay")
+  (is (not= :naming (:plane (address/holochain-kind :dna-hash)))
+      "DnaHash is bytes of the definition, not a DNA/role name")
+  (is (= :identity (:plane (layers/owner-plane :entry-hash))))
+  (is (= :authorization (:plane (layers/owner-plane :agent-pub-key)))))
+
+;; ── surfaces: do not smash URL/DNS/HTTP/Git/pkg/RPC into one DAG ─────────────
+
+(deftest surfaces-occupy-declared-planes
+  (is (true? (surfaces/every-plane-declared?)))
+  (is (false? (:identity? (surfaces/project :url))))
+  (is (false? (:identity? (surfaces/project :dns))))
+  (is (false? (:identity? (surfaces/project :http))))
+  (is (true? (:identity? (surfaces/project :git-blob))))
+  (is (= :merkle (:link (surfaces/project :git-tree))))
+  (is (= :action (:link (surfaces/project :git-ref))))
+  (is (= :input (:address (surfaces/project :pkg-drv))))
+  (is (= :output (:address (surfaces/project :pkg-nar))))
+  (is (= :input (:address (surfaces/project :rpc-call))))
+  (is (= :output (:address (surfaces/project :rpc-result))))
+  (is (true? (:rejected (surfaces/project :unixfs-path))))
+  (is (= #{:discovery} (surfaces/planes-of :ipni)))
+  (is (false? (:identity? (surfaces/project :ipni))))
+  (is (= :unknown-surface (:error (surfaces/project :ftp)))))
+
+;; ── discovery: IPNI does not rewrite the CID ─────────────────────────────────
+
+(deftest ipni-record-does-not-mutate-cid
+  (let [rec (discover/record {:cid cid :peer "12D3KooWpeer"
+                              :addrs ["/ip4/127.0.0.1/tcp/4001"]})
+        idx (discover/advertise (discover/index) rec identity)]
+    (is (false? (:mutates-cid? rec)))
+    (is (= :discovery (:plane rec)))
+    (is (= [rec] (discover/lookup idx cid identity)))
+    (is (= [] (discover/lookup idx raw-cid identity)))
+    (is (= :discovery (:plane (layers/owner-plane :ipni))))))
+
+;; ── discovery: what the index is keyed BY is a decision ──────────────────────
+;;
+;; The two CIDs below are the SAME BYTES under two codecs -- they differ in one
+;; character, the codec varint -- and therefore carry one multihash. IPNI keys
+;; providers by that multihash, so a CID-keyed index answers "no providers" for
+;; content it is holding providers for.
+;;
+;; The real extractor is `multiformats.core/cid->multihash`. It is not used
+;; here: this repository declares `:deps {}` and owns declarations, so the
+;; digest arrives injected, exactly as `http-fn`, `hash-fn` and `sign-fn` do.
+;; `digest-of` below is that injection, standing in for one decode.
+
+(def same-content-raw  "bafkreifq7onuoxumrs7tnpdtx5lsnnulu5k24cj75y44sz4ot7n5kz4l5u")
+(def same-content-cbor "bafyreifq7onuoxumrs7tnpdtx5lsnnulu5k24cj75y44sz4ot7n5kz4l5u")
+(def shared-multihash
+  "1220b0fb9b475e8c8cbf36bc73bf5726b68ba755ae093fee39c9678e9fdbd5678bed")
+
+(def digest-of
+  "cid -> content digest. What `multiformats.core/cid->multihash` returns,
+  as a value: a multihash comes back as a byte array, which hashes by
+  identity, so two equal digests would be two keys."
+  {same-content-raw  shared-multihash
+   same-content-cbor shared-multihash
+   cid               "1220-unrelated-a"
+   raw-cid           "1220-unrelated-b"})
+
+(deftest keying-by-cid-misses-the-same-content-under-another-codec
+  (testing "the gap, stated as a test before it is closed"
+    (let [rec (discover/record {:cid same-content-raw :peer "12D3KooWpeer" :addrs []})
+          idx (discover/advertise (discover/index) rec identity)]
+      (is (= [rec] (discover/lookup idx same-content-raw identity)))
+      (is (= [] (discover/lookup idx same-content-cbor identity))
+          "one content, one provider, and this answers nothing"))))
+
+(deftest keying-by-digest-finds-it
+  (let [rec (discover/record {:cid same-content-raw :peer "12D3KooWpeer" :addrs []})
+        idx (discover/advertise (discover/index) rec digest-of)]
+    (is (= [rec] (discover/lookup idx same-content-cbor digest-of))
+        "asked under the dag-cbor CID, answered from the raw advertisement")
+    (is (= same-content-raw (:cid (first (discover/lookup idx same-content-cbor digest-of))))
+        "the record still carries the CID it was advertised under -- the index
+         is a location answer, never an identity")
+    (is (= [] (discover/lookup idx cid digest-of))
+        "an unrelated CID still finds nothing")))
+
+(deftest a-key-fn-is-required-and-an-unkeyable-cid-is-refused
+  (let [rec (discover/record {:cid same-content-raw :peer "p" :addrs []})]
+    (is (= :key-fn-required (:error (discover/advertise (discover/index) rec nil))))
+    (is (= :key-fn-required (:error (discover/lookup {} same-content-raw nil))))
+    (is (= :unkeyable-cid
+           (:error (discover/advertise (discover/index) rec (constantly nil))))
+        "a digest that could not be read is not a key of nil")
+    (is (= :unkeyable-cid (:error (discover/lookup {} same-content-raw (constantly nil)))))))
+
+(deftest advertised-cids-means-the-same-under-either-keying
+  (testing "`cids` read the KEYS, which stop being CIDs the moment the keying
+            changes -- a caller comparing them to a CID would find nothing and
+            believe it"
+    (let [r1 (discover/record {:cid same-content-raw :peer "p1" :addrs []})
+          r2 (discover/record {:cid cid :peer "p2" :addrs []})
+          by-cid (-> (discover/index) (discover/advertise r1 identity)
+                     (discover/advertise r2 identity))
+          by-digest (-> (discover/index) (discover/advertise r1 digest-of)
+                        (discover/advertise r2 digest-of))]
+      (is (= #{same-content-raw cid} (discover/advertised-cids by-cid)))
+      (is (= #{same-content-raw cid} (discover/advertised-cids by-digest)))
+      (is (not= (discover/keys-with-providers by-cid)
+                (discover/keys-with-providers by-digest))
+          "the keys differ; the advertised CIDs do not"))))
+
+(deftest lookup-live-does-not-rewrite-cid
+  (let [finder (fn [_]
+                 {:ok? true
+                  :providers [{:ID "12D3KooWpeer"
+                               :Addrs ["/ip4/127.0.0.1/tcp/4001"]
+                               :cid "bafybeidifferentcidxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"}]})
+        recs (discover/lookup-live cid finder)]
+    (is (vector? recs))
+    (is (= cid (:cid (first recs))))
+    (is (false? (:mutates-cid? (first recs))))
+    (is (= "12D3KooWpeer" (:peer (first recs))))
+    (is (= :discovery (:plane (first recs))))))
+
+(deftest lookup-live-rejects-a-finder-that-returns-a-different-cid
+  (let [finder (constantly
+                [{:plane :discovery :cid raw-cid :peer "12D3KooWpeer"
+                  :addrs [] :mutates-cid? false}])]
+    (is (= :cid-mismatch (:error (discover/lookup-live cid finder))))))
+
+(deftest lookup-live-empty-is-not-an-outage
+  (is (= [] (discover/lookup-live cid (constantly {:ok? true :providers []}))))
+  (is (= :all-routers-failed
+         (:reason (discover/lookup-live cid
+                                        (constantly {:ok? false :reason :all-routers-failed}))))
+      "could not ask is distinct from nobody provides"))
+
+(deftest lookup-live-requires-a-finder
+  (is (= :finder-fn-required (:error (discover/lookup-live cid nil))))
+  (is (= :invalid-cid (:error (discover/lookup-live "not-a-cid" (constantly []))))))
+
+(deftest advertise-live-does-not-rewrite-cid
+  (let [rec (discover/record {:cid cid :peer "12D3KooWpeer" :addrs []})
+        out (discover/advertise-live rec (fn [r] {:ok? true :cid (:cid r) :accepted ["https://r1"]}))]
+    (is (true? (:live? out)))
+    (is (= cid (:cid out)))
+    (is (false? (:mutates-cid? out)))
+    (is (= ["https://r1"] (:accepted out)))))
+
+(deftest advertise-live-rejects-a-putter-that-returns-a-different-cid
+  (let [rec (discover/record {:cid cid :peer "12D3KooWpeer" :addrs []})]
+    (is (= :cid-mismatch
+           (:error (discover/advertise-live rec (constantly {:ok? true :cid raw-cid})))))))
+
+(deftest advertise-live-rejection-is-not-a-pass
+  (let [rec (discover/record {:cid cid :peer "12D3KooWpeer" :addrs []})]
+    (is (= :rejected
+           (:reason (discover/advertise-live rec
+                                             (constantly {:ok? false :reason :rejected})))))
+    (is (= :putter-fn-required (:error (discover/advertise-live rec nil))))))
+
+(def ^:private routing-peer-id "12D3KooWpeer")
+
+(deftest lookup-peer-live-does-not-rewrite-peer-id
+  (let [recs (route/lookup-live routing-peer-id
+                                (constantly {:ok? true
+                                             :peers [{:ID routing-peer-id
+                                                      :Addrs ["/ip4/127.0.0.1/tcp/4001"]
+                                                      :Protocols ["transport-bitswap"]}]}))]
+    (is (vector? recs))
+    (is (= routing-peer-id (:peer (first recs))))
+    (is (= :routing (:plane (first recs))))
+    (is (= ["transport-bitswap"] (:protocols (first recs))))))
+
+(deftest lookup-peer-live-rejects-a-finder-that-returns-a-different-peer
+  (is (= :peer-mismatch
+         (:error (route/lookup-live routing-peer-id
+                                    (constantly [{:plane :routing :peer "12D3KooWother"
+                                                  :addrs [] :protocols []}]))))))
+
+(deftest lookup-peer-live-empty-is-not-an-outage
+  (is (= [] (route/lookup-live routing-peer-id (constantly {:ok? true :peers []}))))
+  (is (= :all-routers-failed
+         (:reason (route/lookup-live routing-peer-id
+                                     (constantly {:ok? false :reason :all-routers-failed}))))))
+
+(deftest lookup-name-live-does-not-rewrite-name
+  (let [out (naming/lookup-live ipns
+                                (constantly {:ok? true
+                                             :record {:seq 1}
+                                             :value cid}))]
+    (is (= ipns (:name out)))
+    (is (= cid (:value out)))
+    (is (= :naming (:plane out)))
+    (is (false? (:mutates-name? out)))))
+
+(deftest lookup-name-live-rejects-a-finder-that-returns-a-different-name
+  (is (= :name-mismatch
+         (:error (naming/lookup-live ipns
+                                     (constantly {:plane :naming
+                                                  :name "k51qzi5uqu5dother"
+                                                  :mutates-name? false}))))))
+
+(deftest lookup-name-not-found-is-not-an-outage
+  (is (= :not-found
+         (:reason (naming/lookup-live ipns
+                                      (constantly {:ok? false :reason :not-found})))))
+  (is (= :all-routers-failed
+         (:reason (naming/lookup-live ipns
+                                      (constantly {:ok? false :reason :all-routers-failed})))))
+  (is (= :finder-fn-required (:error (naming/lookup-live ipns nil))))
+  (is (= :invalid-ipns-name (:error (naming/lookup-live "not-a-name" (constantly {}))))))
+
+(deftest publish-name-live-does-not-rewrite-name
+  (let [rec (naming/record {:name ipns :value cid})
+        out (naming/publish-live rec
+                                 (fn [r] {:ok? true :name (:name r)
+                                          :accepted ["https://r1"]}))]
+    (is (true? (:live? out)))
+    (is (= ipns (:name out)))
+    (is (false? (:mutates-name? out)))))
+
+(deftest publish-name-live-rejects-a-putter-that-returns-a-different-name
+  (let [rec (naming/record {:name ipns :value cid})]
+    (is (= :name-mismatch
+           (:error (naming/publish-live rec
+                                        (constantly {:ok? true :name "k51other"})))))
+    (is (= :rejected
+           (:reason (naming/publish-live rec
+                                         (constantly {:ok? false :reason :rejected})))))
+    (is (= :putter-fn-required (:error (naming/publish-live rec nil))))))
+
+;; ── L2: action log → chain commit CID ────────────────────────────────────────
+
+(defn- recording-commit
+  "Test double for chain.core/commit!. Maps each distinct log-state to the
+  next fixture CID. Same state → same CID (honest hasher). Does not hash."
+  [cids]
+  (let [seen (atom {})]
+    (fn [_prev state]
+      (or (get @seen state)
+          (let [cid (nth cids (count @seen))]
+            (swap! seen assoc state cid)
+            cid)))))
+
+(deftest commit-log-advances-graph-cid-only-for-actions
+  (let [commit (recording-commit [raw-cid other-raw-cid])
+        st (graph/put-node (graph/store) {:cid cid :body "A"})
+        linked (graph/create-link st {:from cid :to raw-cid :author did})
+        sealed (graph/commit-log linked commit)]
+    (is (true? (:log-dirty? linked)))
+    (is (nil? (:graph-cid linked))
+        "seq is not a CID. L2 does not exist until commit-log")
+    (is (false? (:log-dirty? sealed)))
+    (is (= raw-cid (:graph-cid sealed)))
+    (is (graph/nodes-unchanged? linked sealed)
+        "sealing the log is merkle of the log, not of entries")
+    (is (= [] (vocab/validate-entity (graph/snapshot sealed))))
+    (is (= {"seq" 1 "actions" [{"from" cid "to" raw-cid "seq" 1 "author" did}]}
+           (graph/log-state linked)))
+    (testing "idempotent seal does not call a hasher that would change CID"
+      (is (= sealed (graph/commit-log sealed (recording-commit [other-raw-cid])))))
+    (testing "merkle put does not dirty the action log"
+      (let [child (graph/merkle-child (graph/node sealed cid) raw-cid)
+            with-merkle (graph/put-node sealed (assoc child :cid other-raw-cid))]
+        (is (false? (:log-dirty? with-merkle)))
+        (is (= raw-cid (:graph-cid with-merkle)))))
+    (testing "a second overlay write must get a new graph CID"
+      (let [linked2 (graph/create-link sealed {:from cid :to other-raw-cid})
+            sealed2 (graph/commit-log linked2 commit)]
+        (is (true? (:log-dirty? linked2)))
+        (is (= raw-cid (:graph-cid linked2))
+            "dirty snapshot still names the last sealed CID")
+        (is (= other-raw-cid (:graph-cid sealed2)))
+        (is (not= (:graph-cid sealed) (:graph-cid sealed2)))))))
+
+(deftest commit-log-rejects-a-hasher-that-does-not-advance
+  (let [st (-> (graph/store)
+               (graph/put-node {:cid cid :body "A"})
+               (graph/create-link {:from cid :to raw-cid})
+               (graph/commit-log (constantly raw-cid))
+               (graph/create-link {:from cid :to other-raw-cid}))]
+    (is (= :graph-cid-unchanged
+           (:error (graph/commit-log st (constantly raw-cid))))
+        "same CID for a dirty log means the hasher ignored the new actions"))
+  (is (= :commit-fn-required
+         (:error (graph/commit-log
+                  (graph/create-link (graph/store)
+                                     {:from cid :to raw-cid})
+                  nil))))
+  (is (= :invalid-graph-cid
+         (:error (graph/commit-log
+                  (graph/create-link (graph/store)
+                                     {:from cid :to raw-cid})
+                  (constantly "not-a-cid"))))))
+
+(def ^:private other-did "did:key:z6MkpTHR8VHsExkJxkgDwbwisfb5Tq2mWiwWjcmSKqU2E")
+
+(deftest govern-allows-own-graph-self-mint
+  (let [st (graph/put-node (graph/store) {:cid cid :body "A"})
+        intent (govern/intent {:author did :graph-owner did
+                               :from cid :to raw-cid :tag "mentions"})
+        after (govern/write-overlay st intent)]
+    (is (nil? (:error after)))
+    (is (graph/nodes-unchanged? st after))
+    (is (= 1 (count (:actions after))))
+    (is (= did (:author (first (:actions after)))))))
+
+(deftest govern-denied-write-never-reaches-the-log
+  (let [st (graph/put-node (graph/store) {:cid cid :body "A"})
+        intent (govern/intent {:author other-did :graph-owner did
+                               :from cid :to raw-cid})
+        out (govern/write-overlay st intent)]
+    (is (= :governor-denied (:error out)))
+    (is (= :foreign-chain (:reason out)))
+    (is (= (:actions st) (:actions (:store out))))
+    (is (= (:nodes st) (:nodes (:store out))))))
+
+(deftest govern-host-string-is-not-a-key
+  (is (= :not-a-key
+         (:deny (govern/decide (govern/intent {:author "kotobase.net"
+                                               :graph-owner did
+                                               :from cid :to raw-cid}))))))
+
+(deftest govern-nil-governor-is-deny-not-allow
+  (let [st (graph/put-node (graph/store) {:cid cid :body "A"})
+        intent (govern/intent {:author did :graph-owner did
+                               :from cid :to raw-cid})
+        out (govern/write-overlay st intent nil)]
+    (is (= :governor-required (:error out)))
+    (is (zero? (count (:actions (:store out)))))))
+
+(deftest govern-injected-deny-beats-self-mint
+  (let [st (graph/put-node (graph/store) {:cid cid :body "A"})
+        intent (govern/intent {:author did :graph-owner did
+                               :from cid :to raw-cid})
+        out (govern/write-overlay st intent (constantly {:deny :policy}))]
+    (is (= :governor-denied (:error out)))
+    (is (= :policy (:reason out)))
+    (is (= (:actions st) (:actions (:store out))))))
+
+(deftest govern-self-mint-rejects-depth-other-than-one
+  (is (= :depth
+         (:deny (govern/decide
+                 (govern/intent {:author did :graph-owner did
+                                 :from cid :to raw-cid
+                                 :cacao {:depth 2 :resource :own-graph}}))))))
+
+;; ── transport (tick 3) ───────────────────────────────────────────────────────
+
+(def ^:private tcp-addr "/ip4/127.0.0.1/tcp/4001")
+(def ^:private quic-addr "/ip4/1.2.3.4/udp/4001/quic-v1")
+
+(deftest transport-hop-is-not-identity
+  (let [h (transport/hop {:addr tcp-addr :protocols ["/tcp"]})]
+    (is (= :transport (:plane h)))
+    (is (false? (:identity? h)))
+    (is (= tcp-addr (:addr h)))
+    (is (not (ref/canonical-ref-uri? (:addr h))))))
+
+(deftest transport-uri-is-not-a-hop
+  (is (= :not-a-multiaddr (:error (transport/hop {:addr (str "ipfs://" cid)}))))
+  (is (= :not-a-multiaddr (:error (transport/hop {:addr (str "ipns://" ipns)}))))
+  (is (= :not-a-multiaddr
+         (:error (transport/hop {:addr (str "https://ipfs.kotobase.net/ipfs/" cid)})))))
+
+(deftest transport-attach-does-not-rewrite-identity
+  (let [h (transport/hop {:addr quic-addr :protocols ["/quic-v1"]})
+        bound (transport/attach {:cid cid :peer routing-peer-id} h)]
+    (is (= cid (:cid bound)))
+    (is (= routing-peer-id (:peer bound)))
+    (is (false? (:identity? bound)))))
+
+(deftest transport-attach-cid-mismatch
+  (let [h (assoc (transport/hop {:addr tcp-addr}) :cid other-raw-cid)]
+    (is (= :cid-mismatch
+           (:error (transport/attach {:cid cid} h))))))
+
+(deftest transport-attach-peer-mismatch
+  (let [h (assoc (transport/hop {:addr tcp-addr}) :peer "12D3KooWother")]
+    (is (= :peer-mismatch
+           (:error (transport/attach {:peer routing-peer-id} h))))))
+
+(deftest transport-claiming-identity-is-denied
+  (let [h (assoc (transport/hop {:addr tcp-addr}) :identity? true)]
+    (is (= :transport-is-not-identity
+           (:error (transport/attach {:cid cid} h))))))
+
+(deftest transport-gateway-keeps-the-cid
+  (let [g (transport/gateway {:host "https://ipfs.kotobase.net" :cid cid})]
+    (is (= :gateway (:kind g)))
+    (is (false? (:identity? g)))
+    (is (= cid (:cid g)))
+    (is (= (str "https://ipfs.kotobase.net/ipfs/" cid) (:url g)))))
+
+(deftest transport-gateway-keeps-the-name
+  (let [g (transport/gateway {:host "https://ipfs.kotobase.net" :name ipns})]
+    (is (= ipns (:name g)))
+    (is (= (str "https://ipfs.kotobase.net/ipns/" ipns) (:url g)))))
+
+(deftest transport-dial-live-is-not-a-dht-node
+  (let [h (transport/hop {:addr tcp-addr})
+        out (transport/dial-live h)]
+    (is (= :not-a-dht-node (:error out)))
+    (is (= :dht-node-transport (:blocked-until out)))
+    (is (= h (:hop out)))))
+
+;; ── mux / head (tick 4) ──────────────────────────────────────────────────────
+
+(deftest mux-alive-is-not-at-head
+  (let [m (mux/stream {:peer routing-peer-id :stream-id 1 :role :dialer :alive? true})
+        h (mux/head {:agent did :cid other-raw-cid})
+        s (mux/coords m h)]
+    (is (false? (:identity? s)))
+    (is (true? (get-in s [:mux :alive?])))
+    (is (false? (mux/at-head? cid s))
+        "a live stream does not make a stale head current")))
+
+(deftest mux-dead-can-still-be-at-head
+  (let [m (mux/stream {:peer routing-peer-id :stream-id 2 :role :listener :alive? false})
+        h (mux/head {:agent did :cid cid})
+        s (mux/coords m h)]
+    (is (true? (mux/at-head? cid s))
+        "head is independent of whether bytes are flowing")))
+
+(deftest mux-dialer-stream-id-must-be-odd
+  (is (= :stream-parity
+         (:error (mux/stream {:peer routing-peer-id :stream-id 2 :role :dialer})))))
+
+(deftest mux-stream-zero-is-reserved
+  (is (= :reserved-stream
+         (:error (mux/stream {:peer routing-peer-id :stream-id 0 :role :dialer})))))
+
+(deftest mux-attach-does-not-rewrite-peer
+  (let [m (mux/stream {:peer "12D3KooWother" :stream-id 1 :role :dialer})]
+    (is (= :peer-mismatch
+           (:error (mux/attach-peer routing-peer-id m))))))
+
+(deftest mux-place-call-requires-identity-first
+  (let [m (mux/stream {:peer routing-peer-id :stream-id 1 :role :dialer :alive? true})
+        h (mux/head {:agent did :cid cid})
+        s (mux/coords m h)]
+    (is (= :identity-required (:error (mux/place-call {} s))))
+    (is (= cid (:cid (mux/place-call {:cid cid} s))))))
+
+(deftest mux-host-string-is-not-a-head
+  (is (= :not-a-key
+         (:error (mux/head {:agent "kotobase.net" :cid cid})))))
+
+(deftest mux-open-live-is-not-a-dht-node
+  (let [m (mux/stream {:peer routing-peer-id :stream-id 1 :role :dialer :alive? true})
+        h (mux/head {:agent did :cid cid})
+        s (mux/coords m h)
+        out (mux/open-live s)]
+    (is (= :not-a-dht-node (:error out)))
+    (is (= :transport (:blocked-until out)))
+    (is (= s (:session out)))))
+
+;; ── sealed: client-held confidentiality composition (ADR-2608161600) ─────────
+
+(deftest ipfs-core-has-no-storj-shaped-client-encryption
+  (is (false? (sealed/spec-in-ipfs? :object))
+      "envelope is ours; IPFS does not encrypt stored bytes")
+  (is (false? (sealed/spec-in-ipfs? :session))
+      "Signal is not an IPLD spec")
+  (is (true? (sealed/spec-in-ipfs? :ipns))
+      "IPNS is in the IPFS specs, and it is not confidentiality")
+  (is (= :draft-container-only
+         (:spec-in-ipfs? (sealed/protection :dag-jose))))
+  (is (false? (sealed/hop-is-e2ee?)))
+  (is (false? (sealed/dag-jose-is-ratchet?)))
+  (is (false? (sealed/convergent-allowed?)))
+  (is (false? (sealed/opk-once-on-content-addressed?)))
+  (is (true? (sealed/e2ee-is-not-session-plane?)))
+  (is (true? (get-in sealed/constructions [:object :confidential?])))
+  (is (false? (get-in sealed/constructions [:object :forward-secret?])))
+  (is (true? (get-in sealed/constructions [:session :forward-secret?])))
+  (is (false? (get-in sealed/constructions [:ipns :confidential?])))
+  (is (= :adjacent-peer (get-in sealed/constructions [:hop :scope]))))
+
+(deftest sealed-key-roles-must-not-collide
+  (is (:ok? (sealed/key-roles {:ipns "k-ipns" :peer "k-peer" :signal "k-signal"})))
+  (is (= :key-role-collision
+         (:error (sealed/key-roles {:ipns "same" :peer "same" :signal "other"}))))
+  (is (= #{:ipns :peer}
+         (:collided (sealed/key-roles {:ipns "same" :peer "same" :signal "other"}))))
+  (is (= :key-role-collision
+         (:error (sealed/key-roles {:ipns "a" :peer "b" :signal "a"})))))
+
+(deftest sealed-prekey-bundle-is-public
+  (let [b (sealed/prekey-bundle {:identity-pub "ik"
+                                 :signed-prekey {:pub "spk"}
+                                 :signature "sig"})]
+    (is (true? (sealed/bundle? b)))
+    (is (false? (:confidential? b)))
+    (is (nil? (:pq-prekey b))
+        "missing PQ prekey is recorded by absence, not upgraded to hybrid"))
+  (is (= :missing-identity-pub
+         (:error (sealed/prekey-bundle {:signed-prekey {:pub "spk"} :signature "sig"})))))
+
+(deftest sealed-attachment-must-not-carry-plaintext
+  (is (= :plaintext-in-attachment
+         (:error (sealed/attachment {:cid raw-cid :wrapped-key "k" :plaintext "hi"}))))
+  (let [a (sealed/attachment {:cid raw-cid :wrapped-key "wk" :size 12 :digest "h"})]
+    (is (= raw-cid (:cid a)))
+    (is (not (contains? a :plaintext)))))
+
+(deftest sealed-message-is-session-construction
+  (is (= :construction-mismatch
+         (:error (sealed/message {:construction :object
+                                  :header {:n 0}
+                                  :ciphertext "ct"})))
+      "envelope is not a per-message ratchet")
+  (let [msg (sealed/message {:construction :session
+                             :header {:dh-pub "x" :n 0}
+                             :ciphertext "ct"
+                             :attachments [(sealed/attachment {:cid other-raw-cid
+                                                               :wrapped-key "wk"})]})]
+    (is (true? (sealed/message? msg)))
+    (is (= 1 (count (:attachments msg))))
+    (let [stored (sealed/store msg raw-cid)]
+      (is (= :object (:construction stored)))
+      (is (= :session-ciphertext (:body-is stored)))
+      (is (= raw-cid (:cid stored))))))
+
+(deftest sealed-mailbox-is-append-only-and-ipns-is-not-encryption
+  (let [mb0 (sealed/mailbox)
+        mb1 (sealed/append mb0 raw-cid)
+        mb2 (sealed/append mb1 other-raw-cid)]
+    (is (true? (sealed/entries-prefix? mb0 mb1)))
+    (is (true? (sealed/entries-prefix? mb1 mb2)))
+    (is (= [raw-cid other-raw-cid] (:entries mb2)))
+    (is (true? (:dirty? mb2)))
+    (let [sealed-mb (sealed/commit-head mb2 (constantly cid))]
+      (is (= cid (:head sealed-mb)))
+      (is (false? (:dirty? sealed-mb)))
+      (is (= :head-unchanged
+             (:error (sealed/commit-head (assoc mb2 :head cid)
+                                         (constantly cid))))
+          "a dirty mailbox that hashes to the previous head lied")
+      (let [pub (sealed/publish-head ipns (:head sealed-mb))]
+        (is (= :naming (:plane pub)))
+        (is (false? (:confidential? pub)))
+        (is (false? (:mutates-name? pub)))
+        (is (= ipns (:name pub)))
+        (is (= cid (:value pub))))))
+  (is (= :invalid-ipns-name
+         (:error (sealed/publish-head "not-a-name" cid)))))
+
+;; ── sealed: archive object, identity vs location (ADR-2608301039) ────────────
+
+(def ^:private a-wrap
+  {:recipient "did:key:z6MkfakeRecipientForTests" :wrapped-key "d2hhdGV2ZXI="})
+
+(defn- an-archive-object [& {:as overrides}]
+  (sealed/archive-object
+   (merge {:identity raw-cid :location other-raw-cid :wraps [a-wrap] :size 4096}
+          overrides)))
+
+(deftest sealed-archive-object-splits-identity-from-location
+  (let [o (an-archive-object)]
+    (is (true? (sealed/archive-object? o)))
+    (is (= :object (:construction o)))
+    (is (= raw-cid (:identity o)) "identity is the plaintext CID")
+    (is (= other-raw-cid (:location o)) "location is the ciphertext CID")
+    (is (not= (:identity o) (:location o)))
+    (is (= [a-wrap] (:wraps o)))
+    (is (= :xchacha20-poly1305 (:alg o)))))
+
+(deftest sealed-archive-object-rejects-identity-as-location
+  (is (= :identity-is-location
+         (:error (an-archive-object :location raw-cid)))
+      "equal CIDs mean the bytes went out unsealed, or the ciphertext was
+       derived from the plaintext (convergent, ADR-2608070400 D5)"))
+
+(deftest sealed-archive-object-requires-a-recipient
+  (is (= :no-recipients (:error (an-archive-object :wraps [])))
+      "an object nobody can open is not sealed, it is lost")
+  (is (= :missing-recipient
+         (:error (an-archive-object :wraps [{:wrapped-key "k"}]))))
+  (is (= :missing-wrapped-key
+         (:error (an-archive-object :wraps [{:recipient "did:key:z6Mk"}])))))
+
+(deftest sealed-archive-object-refuses-to-carry-secrets
+  (is (= :plaintext-in-archive-object
+         (:error (an-archive-object :plaintext "the bytes"))))
+  (is (= :content-key-in-archive-object
+         (:error (an-archive-object :content-key "the key itself")))))
+
+(deftest sealed-archive-object-is-not-a-session
+  (is (= :construction-mismatch
+         (:error (an-archive-object :construction :session)))
+      "envelope has no ratchet; a session descriptor is `attachment`"))
+
+(deftest sealed-archive-object-rejects-malformed-cids
+  (is (= :invalid-identity-cid (:error (an-archive-object :identity "nope"))))
+  (is (= :invalid-location-cid (:error (an-archive-object :location "nope"))))
+  (is (= :invalid-size (:error (an-archive-object :size -1)))))
+
+(deftest sealed-archive-store-view-hides-identity-and-wraps
+  (let [view (sealed/store-view (an-archive-object))]
+    (is (= #{:cid :size} (set (keys view)))
+        "a provider that logged everything it received still learns only this")
+    (is (= other-raw-cid (:cid view)) "keyed by the ciphertext CID")
+    (is (nil? (:identity view)))
+    (is (nil? (:wraps view)))
+    (is (not (some #{raw-cid} (tree-seq coll? seq view)))
+        "the plaintext CID appears nowhere in what the store receives"))
+  (is (false? (sealed/store-learns-identity?)))
+  (is (= :not-an-archive-object
+         (:error (sealed/store-view {:kind :sealed-message})))))
+
+;; ── app installation / offline launch ───────────────────────────────────────
+
+(def ^:private app-dna-cid
+  "bafyreifq7onuoxumrs7tnpdtx5lsnnulu5k24cj75y44sz4ot7n5kz4l5u")
+(def ^:private app-dna-cid-next
+  (str (subs app-dna-cid 0 10) "a" (subs app-dna-cid 11)))
+
+(defn- sample-install-release
+  ([manifest-overrides] (sample-install-release manifest-overrides {}))
+  ([manifest-overrides release-overrides]
+   (merge {:verified? true
+           :app-id "app.murakumo.cloud"
+           :channel "stable"
+           :publisher-did "did:key:z6MkoPd1PVGGf5gTMGy4nZNrBMszzfaeaNmZfSzgAZZNhDWq"
+           :sequence 1
+           :release-cid cid
+           :manifest-cid cid
+           :manifest (merge {:kotoba.app/id "app.murakumo.cloud"
+                             :kotoba.app/version "1.0.0"
+                             :kotoba.app/kind "appview"
+                             :kotoba.app/appview-of {:routes ["/"]}
+                             :kotoba.app/bundle-cid cid
+                             :kotoba.app/caps ["graph/query"]}
+                            manifest-overrides)}
+          release-overrides)))
+
+(deftest app-install-lock-needs-a-verified-immutable-release
+  (let [created (install/create-install-lock (sample-install-release {}))
+        lock (:ok created)]
+    (is (= install/install-lock-schema (:schema lock)))
+    (is (= "app.murakumo.cloud" (:app-id lock)))
+    (is (= ["graph/query"] (:requested-caps lock)))
+    (is (= [] (install/install-lock-problems lock)))
+    (is (not (contains? lock :domain)))
+    (is (not (contains? lock :locally-approved)))
+    (is (= :release-not-verified
+           (:error (first (:problems
+                           (install/create-install-lock
+                            (assoc (sample-install-release {}) :verified? false)))))))
+    (is (some #(= :invalid-cid (:error %))
+              (:problems (install/create-install-lock
+                          (assoc (sample-install-release {})
+                                 :manifest-cid
+                                 "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG")))))
+    (is (some #(= :immutable-bundle-required (:error %))
+              (:problems (install/create-install-lock
+                          (sample-install-release
+                           {:kotoba.app/bundle-cid nil
+                            :kotoba.app/embed-url "https://example.test/app"})))))))
+
+(deftest app-update-preserves-identity-and-reports-consent-delta
+  (let [current (:ok (install/create-install-lock (sample-install-release {})))
+        candidate (sample-install-release
+                   {:kotoba.app/version "1.1.0"
+                    :kotoba.app/caps ["graph/query" "graph/transact"]}
+                   {:sequence 2
+                    :release-cid app-dna-cid
+                    :manifest-cid app-dna-cid-next})
+        plan (install/plan-update current candidate)
+        next-lock (:lock plan)]
+    (is (= :ready (:decision plan)))
+    (is (= ["graph/transact"] (:consent-required-caps plan)))
+    (is (true? (:capability-expansion? plan)))
+    (is (= ["graph/query"]
+           (install/effective-capabilities next-lock
+                                           ["graph/query" "*"]
+                                           ["graph/query" "graph/transact"])))
+    (is (= ["graph/query" "graph/transact"]
+           (install/effective-capabilities next-lock
+                                           ["graph/query" "graph/transact"]
+                                           ["graph/query" "graph/transact"])))
+    (is (= :stale-release
+           (:error (install/plan-update current
+                                        (sample-install-release
+                                         {:kotoba.app/version "0.9.0"})))))))
+
+(deftest app-update-refuses-publisher-and-cell-identity-changes
+  (let [current (:ok (install/create-install-lock
+                      (sample-install-release
+                       {:kotoba.app/cells [{:id "app.murakumo.state"
+                                            :dna-cid app-dna-cid}]})))
+        publisher-change (install/plan-update
+                          current
+                          (sample-install-release
+                           {:kotoba.app/cells [{:id "app.murakumo.state"
+                                                :dna-cid app-dna-cid}]}
+                           {:sequence 2
+                            :publisher-did "did:key:z6MkpPd1PVGGf5gTMGy4nZNrBMszzfaeaNmZfSzgAZZNhDWq"}))
+        cell-change (install/plan-update
+                     current
+                     (sample-install-release
+                      {:kotoba.app/cells [{:id "app.murakumo.state"
+                                           :dna-cid app-dna-cid-next}]}
+                      {:sequence 2}))]
+    (is (= :publisher-changed (:error publisher-change)))
+    (is (= :requires-cell-migration (:decision cell-change)))
+    (is (= "app.murakumo.state" (get-in cell-change [:changed-cells 0 :cell-id])))))
+
+(deftest app-launch-uses-verified-cache-while-domain-is-offline
+  (let [lock (:ok (install/create-install-lock (sample-install-release {})))
+        required (set (install/required-content-cids lock))
+        launch (install/launch-decision
+                lock {:verified-cids required
+                      :locally-approved ["graph/query" "graph/transact"]
+                      :host-supported ["graph/query" "graph/transact"]
+                      :domain-status :offline})]
+    (is (= :launch (:decision launch)))
+    (is (= :offline (:domain-status launch)))
+    (is (false? (:requires-network? launch)))
+    (is (= ["graph/query"] (:capabilities launch)))
+    (is (= :content-not-verified
+           (:error (install/launch-decision
+                    lock {:verified-cids (disj required (:bundle-cid lock))}))))))
+
+(deftest public-entry-resolution-binds-domain-owner-app-publisher-and-channel
+  (let [owner "did:key:z6MkoPd1PVGGf5gTMGy4nZNrBMszzfaeaNmZfSzgAZZNhDWq"
+        binding {:verified? true
+                 :entry-cid cid
+                 :domain "murakumo.cloud"
+                 :app-id "app.murakumo.cloud"
+                 :publisher-did owner
+                 :channel "stable"
+                 :domain-owner-did owner
+                 :expires-at 4102444800}
+        proof {:verified? true :fresh? true
+               :domain "murakumo.cloud" :binding-cid cid}
+        release (sample-install-release {} {:app-id "app.murakumo.cloud"
+                                            :channel "stable"})
+        resolved (install/resolve-entry "murakumo.cloud" binding proof release
+                                        1792000000)]
+    (is (= :resolved (:decision resolved)))
+    (is (= "app.murakumo.cloud" (:app-id resolved)))
+    (is (= cid (:binding-cid resolved)))
+    (is (= "stable" (:channel resolved)))
+    (is (= "app.murakumo.cloud" (get-in resolved [:install-lock :app-id])))
+    (is (not (contains? (:install-lock resolved) :domain)))
+    (is (= :binding-domain-mismatch
+           (:error (install/resolve-entry "aozora.app" binding proof release
+                                          1792000000))))
+    (is (= :binding-publisher-mismatch
+           (:error (install/resolve-entry
+                    "murakumo.cloud"
+                    (assoc binding :publisher-did
+                           "did:key:z6MkpPd1PVGGf5gTMGy4nZNrBMszzfaeaNmZfSzgAZZNhDWq")
+                    proof release 1792000000))))
+    (is (= :binding-channel-mismatch
+           (:error (install/resolve-entry "murakumo.cloud"
+                                          (assoc binding :channel "preview")
+                                          proof release 1792000000))))
+    (is (= :domain-proof-not-fresh
+           (:error (install/resolve-entry "murakumo.cloud" binding
+                                          (assoc proof :fresh? false) release
+                                          1792000000))))
+    (is (= :domain-proof-binding-mismatch
+           (:error (install/resolve-entry "murakumo.cloud" binding
+                                          (assoc proof :binding-cid app-dna-cid)
+                                          release 1792000000))))
+    (is (= :binding-expired
+           (:error (install/resolve-entry "murakumo.cloud"
+                                          (assoc binding :expires-at 1792000000)
+                                          proof release 1792000000))))
+    (is (false? (install/canonical-domain? "Murakumo.cloud")))
+    (is (false? (install/canonical-domain? "murakumo.cloud.")))
+    (let [long-label (apply str (repeat 63 "a"))]
+      (is (false? (install/canonical-domain?
+                   (apply str (interpose "." (repeat 4 long-label)))))))))
