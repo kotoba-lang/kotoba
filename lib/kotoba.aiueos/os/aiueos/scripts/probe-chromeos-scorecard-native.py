@@ -3,7 +3,8 @@
 
 This is a schema/point-ledger probe with native qualification-release RSA
 verification, referenced serial-log digest checks, and tagged-receipt row
-binding. Legacy receipts without a :row tag remain unbound. It does not
+binding. The A2/I3 admitted anchors require their exact receipt paths and
+row tags; other legacy receipts remain unbound. It does not
 qualify other evidence, freshness, or hardware.
 """
 
@@ -33,12 +34,15 @@ NEGATIVES = {
     'swapped-row-receipt': (
         b'"receipt os/aiueos/qualification/receipts/vm-20261026/a2-display-change/receipt.edn"',
         b'"receipt os/aiueos/qualification/receipts/vm-20261026/i3-display-scaling-external/receipt.edn"'),
+    'swapped-row-legacy-receipt': (
+        b'"receipt os/aiueos/qualification/receipts/vm-20261026/a2-display-change/receipt.edn"',
+        b'"receipt os/aiueos/qualification/receipts/vm-20261024/a1-qmp60/receipt.edn"'),
     'missing-signed-release-reference': (
         b'"receipt os/aiueos/qualification/receipts/vm-20261025/signed-release/receipt.edn"',
         b'"record os/aiueos/qualification/receipts/vm-20261025/signed-release/receipt.edn"'),
 }
 RECEIPT_NEGATIVES = ('missing-receipt-file', 'red-verdict',
-                     'wrong-row-tag',
+                     'wrong-row-tag', 'missing-row-tag',
                      'bad-release-signature-field', 'missing-release-verdict',
                      'tampered-release-json', 'tampered-release-signature',
                      'rehashed-invalid-signature', 'tampered-serial-log',
@@ -244,7 +248,7 @@ def main():
                 ('tampered-i3-scale-log', 'missing-i3-scale-log')
                 else I3_RECEIPT.with_name('scanout-two-run-serial.log') if name in
                 ('tampered-i3-scanout-log', 'missing-i3-scanout-log')
-                else A2_RECEIPT if name == 'wrong-row-tag'
+                else A2_RECEIPT if name in ('wrong-row-tag', 'missing-row-tag')
                 else A1_RECEIPT)
             if name in ('missing-receipt-file', 'missing-serial-log',
                         'missing-secondary-serial-log', 'missing-i3-scale-log',
@@ -271,6 +275,12 @@ def main():
                 if receipt_bytes.count(before) != 1:
                     raise ValueError('A2 row tag anchor missing')
                 target.write_bytes(receipt_bytes.replace(before, b':row :I3', 1))
+            elif name == 'missing-row-tag':
+                receipt_bytes = target.read_bytes()
+                before = b':row :A2'
+                if receipt_bytes.count(before) != 1:
+                    raise ValueError('A2 row tag anchor missing')
+                target.write_bytes(receipt_bytes.replace(before, b':claim-row :A2', 1))
             elif name in ('tampered-release-json', 'tampered-release-signature',
                           'tampered-serial-log', 'tampered-secondary-serial-log',
                           'tampered-i3-scale-log', 'tampered-i3-scanout-log'):
@@ -360,6 +370,7 @@ def main():
               'observations': observations,
               'receiptFieldsVerified': True, 'evidenceArtifactsVerified': False,
               'taggedReceiptRowBindingVerified': True,
+              'admittedA2I3ReceiptAnchorsVerified': True,
               'legacyUntaggedReceiptRowBindingVerified': False,
               'referencedReceiptSerialDigestsVerified': True,
               'signedReleaseReceiptFileDigestsVerified': True,
