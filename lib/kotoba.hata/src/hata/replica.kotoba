@@ -1,0 +1,101 @@
+(ns hata.replica
+  (:export [create load vote commit current])
+  (:require [hata.codec :as c] [hata.seal :as seal] [hata.quorum :as q]
+            [hata.store-io :as io] [ed25519.selfhost :as ed]))
+;; Each replica owns its seed, private filesystem and unchanged lock inode.
+;; Snapshot15 = [1 index seq epoch head4 desc-len cert-len vote-len roster4 ...].
+;; Payload blocks are content-addressed and fsynced BEFORE a vote is issued.
+(defn- file [base :string name :string] :string (string-concat base (string-concat "/" name)))
+(defn- identity? [cfg :vector-i64 identity :vector-i64] :bool
+  (and (= (vector-count identity) 33) (>= (vector-at identity 0) 0) (< (vector-at identity 0) 4)
+       (c/bytes? (c/slice identity 1 32))
+       (arena-scope (c/equal? (ed/public-from-seed (c/slice identity 1 32))
+         (c/slice cfg (+ 8 (* (vector-at identity 0) 32)) 32)))))
+(defn- shape? [s :vector-i64 cfg :vector-i64 index :i64] :bool
+  (and (>= (vector-count s) 15) (= (vector-at s 0) 1) (= (vector-at s 1) index)
+       (>= (vector-at s 2) 0) (>= (vector-at s 3) 0)
+       (or (= (vector-at s 8) 0) (= (vector-at s 8) 85))
+       (or (= (vector-at s 9) 0) (= (vector-at s 9) 197) (= (vector-at s 9) 262))
+       (or (= (vector-at s 10) 0) (= (vector-at s 10) 85))
+       (= (vector-count s) (+ 15 (+ (vector-at s 8) (+ (vector-at s 9) (vector-at s 10)))))
+       (c/equal? (c/slice s 11 4) (q/roster-id cfg))
+       (if (= (vector-at s 2) 0)
+         (and (= (vector-at s 3) 0) (= (vector-at s 8) 0) (= (vector-at s 9) 0)
+              (c/equal? (c/slice s 4 4) (vector-i64 0 0 0 0)))
+         (and (> (vector-at s 3) 0) (= (vector-at s 8) 85) (> (vector-at s 9) 0)))))
+(defn load [base :string cfg :vector-i64 index :i64] :vector-i64
+  (if (and (c/safe-base? base) (q/config? cfg) (>= index 0) (< index 4)
+           (io/exists? (file base "quorum.state")))
+    (let [s (seal/unpack "awai.quorum.replica.v1" (io/read (file base "quorum.state"))
+              (c/slice cfg (+ 8 (* index 32)) 32))]
+      (if (shape? s cfg index) s (vector-i64))) (vector-i64)))
+(defn- persist [base :string s :vector-i64 seed :vector-i64] :bool
+  (seal/persist base "quorum.state" (seal/pack "awai.quorum.replica.v1" s seed)))
+(defn- release [base :string result :vector-i64] :vector-i64
+  (if (io/unlock (file base "quorum.lock")) result (vector-i64 0)))
+(defn create [base :string cfg :vector-i64 identity :vector-i64] :vector-i64
+  (cond (or (not (c/safe-base? base)) (not (q/config? cfg)) (not (identity? cfg identity))) (vector-i64 0)
+        (not (io/lock (file base "quorum.lock"))) (vector-i64 11)
+        :else (release base
+          (if (or (io/exists? (file base "quorum.state")) (io/exists? (file base "quorum.state.pending")))
+            (vector-i64 0)
+            (if (persist base (c/append (vector-i64 1 (vector-at identity 0) 0 0 0 0 0 0 0 0 0)
+                                (q/roster-id cfg)) (c/slice identity 1 32)) (vector-i64 3) (vector-i64 0))))))
+(defn- block-name [desc :vector-i64] :string (string-concat "quorum-value-" (c/hex (c/slice desc 8 4))))
+(defn- value [base :string desc :vector-i64] :vector-i64
+  (if (io/exists? (file base (block-name desc)))
+    (let [v (c/unhex (io/read (file base (block-name desc))))]
+      (if (and (= (vector-count v) (vector-at desc 20))
+               (c/equal? (q/value-hash v) (c/slice desc 8 4))) v (vector-i64))) (vector-i64)))
+(defn- retain [base :string request :vector-i64] :bool
+  (let [desc (q/descriptor request) v (c/slice request 85 (vector-at desc 20))]
+    (if (io/exists? (file base (block-name desc)))
+      (and (c/equal? (value base desc) v) (io/sync (file base (block-name desc))) (io/sync base))
+      (seal/persist base (block-name desc) (c/hex v)))))
+(defn- next? [s :vector-i64 desc :vector-i64] :bool
+  (and (< (vector-at s 2) 256)
+       (= (vector-at desc 1) (+ (vector-at s 2) 1)) (>= (vector-at desc 2) (vector-at s 3))
+       (c/equal? (c/slice desc 4 4) (c/slice s 4 4))))
+(defn- vote-locked [base :string cfg :vector-i64 identity :vector-i64 request :vector-i64] :vector-i64
+  (let [s (load base cfg (vector-at identity 0)) desc (q/descriptor request)]
+    (cond (= (vector-count s) 0) (vector-i64 0)
+          (not (next? s desc)) (vector-i64 12)
+          (and (> (vector-at s 10) 0)
+               (not (c/equal? desc (c/slice s (+ 15 (+ (vector-at s 8) (vector-at s 9))) 85)))) (vector-i64 10)
+          (not (retain base request)) (vector-i64 0)
+          :else
+          (let [prefix (c/slice s 0 (+ 15 (+ (vector-at s 8) (vector-at s 9))))
+                next (c/append (vector-assoc! prefix 10 85) desc)]
+            (if (persist base next (c/slice identity 1 32))
+              (c/append (vector-i64 1) (q/vote cfg desc (vector-at identity 0) (c/slice identity 1 32)))
+              (vector-i64 0))))))
+(defn vote [base :string cfg :vector-i64 identity :vector-i64 request :vector-i64] :vector-i64
+  (cond (or (not (c/safe-base? base)) (not (q/valid? cfg request)) (not (identity? cfg identity))) (vector-i64 0)
+        (not (io/lock (file base "quorum.lock"))) (vector-i64 11)
+        :else (release base (vote-locked base cfg identity request))))
+(defn- commit-locked [base :string cfg :vector-i64 identity :vector-i64 request :vector-i64 certificate :vector-i64] :vector-i64
+  (let [s (load base cfg (vector-at identity 0)) desc (q/descriptor request)]
+    (cond (= (vector-count s) 0) (vector-i64 0)
+          (c/equal? (c/slice s 4 4) (q/entry-id cfg desc))
+            (if (retain base request) (vector-i64 4) (vector-i64 0))
+          (not (next? s desc)) (vector-i64 12)
+          (not (retain base request)) (vector-i64 0)
+          :else
+          (let [head (c/append (vector-i64 1 (vector-at identity 0) (vector-at desc 1) (vector-at desc 2))
+                       (c/append (q/entry-id cfg desc)
+                         (c/append (vector-i64 85 (vector-count certificate) 0) (q/roster-id cfg))))
+                next (c/append head (c/append desc certificate))]
+            (if (persist base next (c/slice identity 1 32)) (vector-i64 2) (vector-i64 0))))))
+(defn commit [base :string cfg :vector-i64 identity :vector-i64 request :vector-i64 certificate :vector-i64] :vector-i64
+  (cond (or (not (c/safe-base? base)) (not (q/certificate? cfg request certificate))
+            (not (identity? cfg identity))) (vector-i64 0)
+        (not (io/lock (file base "quorum.lock"))) (vector-i64 11)
+        :else (release base (commit-locked base cfg identity request certificate))))
+(defn current [base :string cfg :vector-i64 index :i64] :vector-i64
+  (let [s (load base cfg index)]
+    (if (or (= (vector-count s) 0) (= (vector-at s 2) 0)) (vector-i64)
+      (let [desc (c/slice s 15 85) body (value base desc)
+            request (c/append desc body) certificate (c/slice s 100 (vector-at s 9))]
+        (if (q/certificate? cfg request certificate)
+          (c/append (vector-i64 (vector-count request) (vector-count certificate))
+                    (c/append request certificate)) (vector-i64))))))

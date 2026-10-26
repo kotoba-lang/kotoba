@@ -1,0 +1,186 @@
+(ns hata.broker
+  (:export [operation install checkpoint execute abandon object settle])
+  (:require [hata.codec :as c] [hata.authority :as a] [hata.admission :as ad]
+            [hata.store :as store] [hata.store-io :as io] [hata.seal :as seal]
+            [hata.quorum :as q] [kototama.effect-origins :as origins] [ed25519.selfhost :as ed]))
+;; Bounded managed-object provider, not arbitrary HTTP/mail/OS dispatch.
+;; Config (trusted host map): policy, quorum. Call map: entry, certificate,
+;; command (352-word C0 command), body. Origins are trusted host-resolved sets.
+;; Provider state20 = [1 epoch seq head4 domain4 operation4 count roster4].
+;; Row275 = [status principal4 stable-id4 request4 body-hash4 retain-until len body256].
+(defn operation [] :vector-i64 (c/digest (c/message "awai.native.put-object.v1" (vector-i64))))
+(defn- field [m [:map :string :vector-i64] key :string] :vector-i64 (get m key (vector-i64)))
+(defn- file [base :string name :string] :string (string-concat base (string-concat "/" name)))
+(defn- config? [cfg [:map :string :vector-i64] seed :vector-i64] :bool
+  (let [p (field cfg "policy") roster (field cfg "quorum")]
+    (and (a/policy? p) (q/config? roster)
+         (c/equal? (c/slice p 8 4) (c/slice roster 2 4))
+         (c/equal? (c/slice p 12 4) (operation))
+         (c/equal? (c/slice p 80 32) (c/slice roster 136 32))
+         (= (vector-count seed) 32) (c/bytes? seed)
+         (arena-scope (c/equal? (ed/public-from-seed seed) (c/slice p 80 32))))))
+(defn- load [base :string cfg [:map :string :vector-i64]] :vector-i64
+  (let [p (field cfg "policy") roster (field cfg "quorum")]
+    (if (not (io/exists? (file base "broker.state"))) (vector-i64)
+      (let [s (seal/unpack "awai.broker.object.v1" (io/read (file base "broker.state")) (c/slice p 80 32))]
+        (if (and (>= (vector-count s) 20) (= (vector-at s 0) 1)
+                 (> (vector-at s 1) 0) (> (vector-at s 2) 0)
+                 (>= (vector-at s 15) 0) (<= (vector-at s 15) 64)
+                 (= (vector-count s) (+ 20 (* (vector-at s 15) 275)))
+                 (c/equal? (c/slice s 7 4) (c/slice p 8 4))
+                 (c/equal? (c/slice s 11 4) (c/slice p 12 4))
+                 (c/equal? (c/slice s 16 4) (q/roster-id roster))) s (vector-i64))))))
+(defn- persist [base :string s :vector-i64 seed :vector-i64] :bool
+  (seal/persist base "broker.state" (seal/pack "awai.broker.object.v1" s seed)))
+(defn- release [base :string result :vector-i64] :vector-i64
+  (if (io/unlock (file base "broker.lock")) result (vector-i64 0)))
+(defn- certified? [cfg [:map :string :vector-i64] call [:map :string :vector-i64] kind :i64] :bool
+  (let [request (field call "entry") roster (field cfg "quorum") p (field cfg "policy")]
+    (and (q/certificate? roster request (field call "certificate")) (= (vector-at request 3) kind)
+         (= (vector-at request 2) (vector-at p 1))
+         (let [s (store/state (c/slice request 85 (vector-at request 20)))]
+           (and (> (vector-count s) 0) (= (vector-at s 1) (vector-at p 1))
+                (= (vector-at s 2) (vector-at p 2))
+                (c/equal? (c/slice s 9 4) (c/slice p 8 4))
+                (c/equal? (c/slice s 13 4) (operation)))))))
+(defn- next? [s :vector-i64 request :vector-i64] :bool
+  (and (< (vector-at s 2) 9223372036854775807)
+       (= (vector-at request 1) (+ (vector-at s 2) 1))
+       (c/equal? (c/slice request 4 4) (c/slice s 3 4))))
+(defn- head [s :vector-i64 roster :vector-i64 request :vector-i64] :vector-i64
+  (let [copy (vector-assoc! (vector-assoc! (c/slice s 0 (vector-count s)) 1 (vector-at request 2))
+                           2 (vector-at request 1)) hash (q/entry-id roster (q/descriptor request))]
+    (loop [i 0 out copy] (if (= i 4) out
+      (recur (+ i 1) (vector-assoc! out (+ i 3) (vector-at hash i)))))))
+(defn- install-locked [base :string cfg [:map :string :vector-i64] seed :vector-i64 call [:map :string :vector-i64]] :vector-i64
+  (let [p (field cfg "policy") roster (field cfg "quorum") request (field call "entry")
+        current (load base cfg)]
+    (if (= (vector-count current) 0)
+      (if (or (io/exists? (file base "broker.state")) (io/exists? (file base "broker.state.pending"))
+              (not= (vector-at request 1) 1)
+              (not (c/equal? (c/slice request 4 4) (vector-i64 0 0 0 0)))) (vector-i64 0)
+        (let [zero (c/append (vector-i64 1 0 0 0 0 0 0)
+                     (c/append (c/slice p 8 8) (c/append (vector-i64 0) (q/roster-id roster))))]
+          (if (persist base (head zero roster request) seed) (vector-i64 1) (vector-i64 0))))
+      (cond (c/equal? (c/slice current 3 4) (q/entry-id roster (q/descriptor request)))
+              (if (persist base current seed) (vector-i64 2) (vector-i64 0))
+            (or (not (next? current request)) (<= (vector-at request 2) (vector-at current 1))) (vector-i64 0)
+            :else (if (persist base (head current roster request) seed) (vector-i64 1) (vector-i64 0))))))
+(defn install [base :string cfg [:map :string :vector-i64] seed :vector-i64 call [:map :string :vector-i64]] :vector-i64
+  (cond (or (not (c/safe-base? base)) (not (config? cfg seed)) (not (certified? cfg call 2))) (vector-i64 0)
+        (not (io/lock (file base "broker.lock"))) (vector-i64 0)
+        :else (release base (install-locked base cfg seed call))))
+(defn- checkpoint-locked [base :string cfg [:map :string :vector-i64] seed :vector-i64 call [:map :string :vector-i64]] :vector-i64
+  (let [s (load base cfg) request (field call "entry") roster (field cfg "quorum")]
+    (cond (or (= (vector-count s) 0) (not= (vector-at request 2) (vector-at s 1))) (vector-i64 0)
+          (c/equal? (c/slice s 3 4) (q/entry-id roster (q/descriptor request)))
+            (if (persist base s seed) (vector-i64 2) (vector-i64 0))
+          (not (next? s request)) (vector-i64 0)
+          :else (if (persist base (head s roster request) seed) (vector-i64 1) (vector-i64 0)))))
+(defn checkpoint [base :string cfg [:map :string :vector-i64] seed :vector-i64 call [:map :string :vector-i64]] :vector-i64
+  (cond (or (not (c/safe-base? base)) (not (config? cfg seed)) (not (certified? cfg call 1))) (vector-i64 0)
+        (not (io/lock (file base "broker.lock"))) (vector-i64 0)
+        :else (release base (checkpoint-locked base cfg seed call))))
+(defn- origin [facts [:map :string [:set :string]] name :string] [:set :string]
+  (get facts name (typed-set-new [:set :string])))
+(defn- allowed? [facts [:map :string [:set :string]]] :bool
+  (and (typed-set-contains [:set :string] (origin facts "definition-world") "awai.native/v1")
+       (typed-set-contains [:set :string] (origin facts "runtime-world") "awai.native/v1")
+       (origins/eligible? (origin facts "catalog") (origin facts "effects") "awai.native/v1"
+         (origin facts "intents") (origin facts "grants") (origin facts "policy") "awai.native/v1"
+         (origin facts "available") "object-store.put-block" "awai://object")))
+(defn- frame? [cfg [:map :string :vector-i64] call [:map :string :vector-i64]] :bool
+  (let [cmd (field call "command") body (field call "body") p (field cfg "policy")]
+    (and (= (vector-count cmd) 352) (<= (vector-count body) 256)
+         (= (a/verify p (c/slice cmd 5 50) (c/slice cmd 55 297) (vector-at cmd 0)) 0)
+         (a/payload-matches? (c/slice cmd 5 50) (c/slice cmd 55 297) body)
+         (>= (vector-at cmd 45) (vector-count body))
+         (>= (vector-at cmd 46) (+ 32 (vector-count body)))
+         (>= (vector-at cmd 47) (+ 64 (* 8 (vector-count body))))
+         ;; Application storage-byte-seconds; provider journal overhead is a
+         ;; separately provisioned host quota, bounded at 64 records.
+         (let [retention (- (vector-at cmd 14) (vector-at cmd 0)) n (vector-count body)]
+           (and (>= retention 0) (or (= n 0) (<= retention (quot 9223372036854775807 n)))
+                (>= (vector-at cmd 48) (* n retention)))))))
+(defn- reserved? [call [:map :string :vector-i64]] :bool
+  (let [request (field call "entry") blob (c/slice request 85 (vector-at request 20))
+        s (store/state blob) cmd (field call "command") r (c/slice cmd 5 50)
+        proof (c/slice cmd 55 297)]
+    (loop [i 0]
+      (if (= i (vector-at s 6)) false
+        (let [start (+ 24 (* i 57)) record (+ (+ 4 (vector-at blob 1)) (* i 781))]
+          (or (and (= (vector-at s start) 1)
+                   (c/equal? (c/slice s (+ start 7) 50) r)
+                   (c/equal? (c/slice blob (+ record 51) 297) proof))
+              (recur (+ i 1))))))))
+(defn- row [s :vector-i64 cmd :vector-i64] :i64
+  (loop [i 0]
+    (if (= i (vector-at s 15)) -1
+      (let [start (+ 20 (* i 275))]
+        (if (and (c/equal? (c/slice s (+ start 1) 4) (c/slice cmd 31 4))
+                 (c/equal? (c/slice s (+ start 5) 4) (c/slice cmd 56 4))) start (recur (+ i 1)))))))
+(defn- invoke-locked [base :string cfg [:map :string :vector-i64] seed :vector-i64 call [:map :string :vector-i64] abandon :bool] :vector-i64
+  (let [s (load base cfg) request (field call "entry") cmd (field call "command") body (field call "body")
+        roster (field cfg "quorum")]
+    (if (or (= (vector-count s) 0) (not= (vector-at request 2) (vector-at s 1))) (vector-i64 0)
+      (let [found (row s cmd)]
+        (if (>= found 0)
+          (if (and (c/equal? (c/slice s (+ found 9) 4) (c/slice cmd 27 4))
+                   (c/equal? (c/slice s (+ found 13) 4) (c/slice cmd 348 4))
+                   (or (<= (vector-at request 1) (vector-at s 2)) (next? s request))
+                   (persist base (if (next? s request) (head s roster request) s) seed))
+            (vector-i64 (if (= (vector-at s found) 1) 2 3)) (vector-i64 0))
+          (if (or (not (next? s request)) (>= (vector-at s 15) 64)) (vector-i64 0)
+            (let [prefix (vector-assoc! (head s roster request) 15 (+ (vector-at s 15) 1))
+                  record (c/append (vector-i64 (if abandon 2 1))
+                    (c/append (c/slice cmd 31 4) (c/append (c/slice cmd 56 4)
+                      (c/append (c/slice cmd 27 4) (c/append (c/slice cmd 348 4)
+                        (vector-i64 (vector-at cmd 14) (vector-count body)))))))
+                  padded (loop [i 0 out record]
+                           (if (= i 256) out
+                             (recur (+ i 1) (vector-conj out (if (< i (vector-count body)) (vector-at body i) 0)))))
+                  next (c/append prefix padded)]
+              ;; The managed object and its consumption record are one atomic
+              ;; signed snapshot. No separate arbitrary external effect occurs.
+              (if (persist base next seed) (vector-i64 (if abandon 3 1)) (vector-i64 0)))))))))
+(defn- invoke [base :string cfg [:map :string :vector-i64] seed :vector-i64 call [:map :string :vector-i64]
+               facts [:map :string [:set :string]] abandon :bool] :vector-i64
+  (cond (or (not (c/safe-base? base)) (not (config? cfg seed))
+            (if abandon
+              (let [cmd (field call "command") body (field call "body")]
+                (or (not= (vector-count cmd) 352) (> (vector-count body) 256)
+                    (not (a/payload-matches? (c/slice cmd 5 50) (c/slice cmd 55 297) body))))
+              (or (not (allowed? facts)) (not (frame? cfg call))))
+            (not (certified? cfg call 3)) (not (reserved? call))) (vector-i64 0)
+        (not (io/lock (file base "broker.lock"))) (vector-i64 0)
+        :else (release base (invoke-locked base cfg seed call abandon))))
+(defn execute [base :string cfg [:map :string :vector-i64] seed :vector-i64 call [:map :string :vector-i64]
+               facts [:map :string [:set :string]]] :vector-i64 (invoke base cfg seed call facts false))
+(defn abandon [base :string cfg [:map :string :vector-i64] seed :vector-i64 call [:map :string :vector-i64]
+               facts [:map :string [:set :string]]] :vector-i64 (invoke base cfg seed call facts true))
+(defn object [base :string cfg [:map :string :vector-i64] now :i64] :vector-i64
+  (if (or (not (c/safe-base? base)) (< (vector-count (field cfg "policy")) 112)) (vector-i64)
+    (let [s (load base cfg)]
+      (if (= (vector-count s) 0) (vector-i64)
+        (loop [i (- (vector-at s 15) 1)]
+          (if (< i 0) (vector-i64)
+            (let [start (+ 20 (* i 275))]
+              (if (= (vector-at s start) 1)
+                (if (and (< now (vector-at s (+ start 17))) (>= now 0)
+                         (>= (vector-at s (+ start 18)) 0) (<= (vector-at s (+ start 18)) 256))
+                  (c/slice s (+ start 19) (vector-at s (+ start 18))) (vector-i64))
+                (recur (- i 1))))))))))
+(defn settle [base :string cfg [:map :string :vector-i64] seed :vector-i64 command :vector-i64] :string
+  ;; Receipt reconciliation is host-only. UNKNOWN is never rewritten or replayed.
+  (if (or (not (c/safe-base? base)) (not (config? cfg seed)) (not= (vector-count command) 5)) "rejected:broker"
+    (let [s (load base cfg) p (field cfg "policy") blob (store/load base p)]
+      (if (or (= (vector-count s) 0) (= (vector-count blob) 0)
+              (not= (vector-at s 1) (vector-at p 1))) "rejected:broker"
+        (loop [i 0]
+          (if (= i (vector-at s 15)) "rejected:receipt"
+            (let [start (+ 20 (* i 275))]
+              (if (and (= (vector-at s start) 1)
+                       (c/equal? (c/slice s (+ start 9) 4) (c/slice command 1 4)))
+                (store/complete base p seed (c/append (c/append (vector-i64 (vector-at command 0)) (store/token blob))
+                  (c/append (c/slice command 1 4) (c/append (vector-i64 2) (c/slice s (+ start 13) 4)))))
+                (recur (+ i 1))))))))))

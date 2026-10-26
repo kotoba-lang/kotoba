@@ -1,0 +1,83 @@
+(ns hata.quorum
+  (:export [config? roster-id value-hash descriptor entry-id make valid? vote certificate? assemble])
+  (:require [hata.codec :as c] [ed25519.selfhost :as ed]))
+;; Fixed roster: 4 distinct voters, 3 distinct votes. No roster/view change.
+;; Config168 = [1 generation domain4 4 3 voter-keys(128) writer-key(32)].
+;; Descriptor85 = [1 seq epoch kind parent4 value-hash4 domain4 writer-hash4
+;;                 value-length writer-signature64]. Full request appends value.
+(defn- nonzero [v :vector-i64] :bool
+  (not (c/equal? v (vector-i64 0 0 0 0))))
+(defn config? [cfg :vector-i64] :bool
+  (and (= (vector-count cfg) 168) (= (vector-at cfg 0) 1) (> (vector-at cfg 1) 0)
+       (nonzero (c/slice cfg 2 4)) (= (vector-at cfg 6) 4) (= (vector-at cfg 7) 3)
+       (loop [i 0]
+         (if (= i 5) true
+           (let [key (c/slice cfg (+ 8 (* i 32)) 32)]
+             (and (ed/prime-order-key? key)
+               (loop [j 0] (if (= j i) true
+                 (and (not (c/equal? key (c/slice cfg (+ 8 (* j 32)) 32))) (recur (+ j 1)))))
+               (recur (+ i 1))))))))
+(defn value-hash [value :vector-i64] :vector-i64
+  (c/digest (c/message "awai.quorum.value.v1" value)))
+(defn descriptor [request :vector-i64] :vector-i64
+  (if (>= (vector-count request) 85) (c/slice request 0 85) (vector-i64)))
+(defn roster-id [cfg :vector-i64] :vector-i64
+  (c/digest (c/message "awai.quorum.roster.v1" cfg)))
+(defn- writer-message [cfg :vector-i64 desc :vector-i64] :vector-i64
+  (c/message "awai.quorum.proposal.v1" (c/append (roster-id cfg) (c/slice desc 0 21))))
+(defn entry-id [cfg :vector-i64 desc :vector-i64] :vector-i64
+  (c/digest (c/message "awai.quorum.entry.v1" (c/append (roster-id cfg) desc))))
+(defn make [cfg :vector-i64 header :vector-i64 value :vector-i64 seed :vector-i64] :vector-i64
+  (if (or (not (config? cfg)) (not= (vector-count header) 20)
+          (> (vector-count value) 53660) (= (vector-count value) 0)
+          (not= (vector-count seed) 32) (not (c/bytes? seed))) (vector-i64)
+    (let [head (c/append header (vector-i64 (vector-count value))) sig (vector-alloc 64)
+          signed (ed/sign-into sig seed (writer-message cfg head))]
+      (if (not= signed 0) (vector-i64) (c/append (c/append head sig) value)))))
+(defn- descriptor? [cfg :vector-i64 desc :vector-i64] :bool
+  (and (= (vector-count desc) 85) (= (vector-at desc 0) 1)
+       (> (vector-at desc 1) 0) (<= (vector-at desc 1) 256) (> (vector-at desc 2) 0)
+       (>= (vector-at desc 3) 1) (<= (vector-at desc 3) 3)
+       (> (vector-at desc 20) 0) (<= (vector-at desc 20) 53660)
+       (c/equal? (c/slice desc 12 4) (c/slice cfg 2 4))
+       (c/equal? (c/slice desc 16 4) (c/digest (c/slice cfg 136 32)))
+       (c/bytes? (c/slice desc 21 64))
+       (ed/verify? (c/slice cfg 136 32) (writer-message cfg desc) (c/slice desc 21 64))))
+(defn valid? [cfg :vector-i64 request :vector-i64] :bool
+  (arena-scope
+    (and (config? cfg) (>= (vector-count request) 86)
+         (<= (vector-count request) 53745)
+         (let [desc (descriptor request)]
+           (and (descriptor? cfg desc) (= (vector-count request) (+ 85 (vector-at desc 20)))
+                (c/equal? (c/slice desc 8 4) (value-hash (c/slice request 85 (vector-at desc 20)))))))))
+(defn- vote-message [cfg :vector-i64 desc :vector-i64] :vector-i64
+  (c/message "awai.quorum.vote.v1" (entry-id cfg desc)))
+(defn vote [cfg :vector-i64 desc :vector-i64 index :i64 seed :vector-i64] :vector-i64
+  ;; Host replica calls this only after persisting its unique vote and value.
+  (if (or (not (config? cfg)) (< index 0) (> index 3) (not (descriptor? cfg desc))
+          (not= (vector-count seed) 32) (not (c/bytes? seed))
+          (not (arena-scope (c/equal? (ed/public-from-seed seed) (c/slice cfg (+ 8 (* index 32)) 32)))))
+    (vector-i64)
+    (let [sig (vector-alloc 64) signed (ed/sign-into sig seed (vote-message cfg desc))]
+      (if (not= signed 0) (vector-i64) (c/append (vector-i64 index) sig)))))
+(defn certificate? [cfg :vector-i64 request :vector-i64 certificate :vector-i64] :bool
+  (arena-scope
+    (and (valid? cfg request) (>= (vector-count certificate) 197)
+         (= (vector-at certificate 0) 1)
+         (>= (vector-at certificate 1) 3) (<= (vector-at certificate 1) 4)
+         (= (vector-count certificate) (+ 2 (* (vector-at certificate 1) 65)))
+         (loop [i 0 mask 0]
+           (if (= i (vector-at certificate 1)) true
+             (let [start (+ 2 (* i 65)) index (vector-at certificate start)
+                   sig (c/slice certificate (+ start 1) 64)]
+               (and (>= index 0) (< index 4)
+                    (= (bit-and mask (i64-shift-left 1 index)) 0) (c/bytes? sig)
+                    (ed/verify? (c/slice cfg (+ 8 (* index 32)) 32)
+                      (vote-message cfg (descriptor request)) sig)
+                    (recur (+ i 1) (bit-or mask (i64-shift-left 1 index))))))))))
+
+(defn assemble [cfg :vector-i64 request :vector-i64 votes :vector-i64] :vector-i64
+  (if (or (not= (rem (vector-count votes) 65) 0) (< (vector-count votes) 195) (> (vector-count votes) 260))
+    (vector-i64)
+    (let [certificate (c/append (vector-i64 1 (quot (vector-count votes) 65)) votes)]
+      (if (certificate? cfg request certificate) certificate (vector-i64)))))

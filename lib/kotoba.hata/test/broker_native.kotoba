@@ -1,0 +1,113 @@
+(ns hata.broker-native-test
+  (:export [main]) (:capabilities [:cli/args])
+  (:require [hata.codec :as c] [hata.quorum :as q] [hata.replica :as replica]
+            [hata.broker :as broker] [hata.store :as store] [hata.store-io :as io]
+            [hata.authority-fixture :as f] [hata.quorum-fixture :as qf]
+            [hata.broker-fixture :as bf]))
+;; This native guest, not the transport observer, builds and verifies all
+;; protocol messages, quorum certificates, authority and test verdicts.
+(defn- path [base :string name :string] :string (string-concat base (string-concat "/" name)))
+(defn- read [base :string name :string] :vector-i64
+  (if (io/exists? (path base name)) (c/unhex (io/read (path base name))) (vector-i64)))
+(defn- write [base :string name :string value :vector-i64] :bool (io/write (path base name) (c/hex value)))
+(defn- committed? [result :string] :bool (= (string-index-of result "committed:") 0))
+(defn- proposal [base :string cfg :vector-i64 context :vector-i64 blob :vector-i64] :i64
+  (let [request (qf/proposal cfg context blob)]
+    (if (and (q/valid? cfg request) (write base "request" request)) 1 -1)))
+(defn- certificate [base :string cfg :vector-i64] :i64
+  (let [a (read base "vote0") b (read base "vote1") d (read base "vote2")
+        votes (c/append (c/slice a 1 65) (c/append (c/slice b 1 65) (c/slice d 1 65)))
+        cert (q/assemble cfg (read base "request") votes)]
+    (if (and (= (vector-at a 0) 1) (= (vector-at b 0) 1) (= (vector-at d 0) 1)
+             (> (vector-count cert) 0) (write base "certificate" cert)) 1 -2)))
+(defn- call [base :string] [:map :string :vector-i64]
+  {"entry" (read base "request") "certificate" (read base "certificate")
+   "command" (read base "command") "body" (vector-i64 104 101 108 108 111)})
+(defn- result [base :string value :vector-i64] :i64
+  (if (and (> (vector-count value) 0) (write base "response" value)) (vector-at value 0) -3))
+(defn main [] :i64
+  (let [mode (typed-cap-call :cli/args :string :string "0")
+        base (typed-cap-call :cli/args :string :string "1")
+        option (typed-cap-call :cli/args :string :string "2")
+        index (cond (= option "1") 1 (= option "2") 2 (= option "3") 3 :else 0)
+        epoch (if (= option "epoch8") 8 7) p (bf/policy epoch) cfg (qf/config)
+        host {"policy" p "quorum" cfg} seed (f/checkpoint-seed)
+        identity (c/append (vector-i64 index) (qf/seed index))]
+    (cond
+      (= mode "prepare")
+      (if (committed? (store/create base (bf/config) p seed))
+        (proposal base cfg (vector-i64 1 7 2 0 0 0 0) (store/load base p)) -4)
+      (= mode "conflict")
+      (proposal base cfg (vector-i64 1 7 2 0 0 0 0)
+        (f/set-word (store/load base p) 21 63))
+      (= mode "reserve")
+      (let [cmd (bf/command (store/load base p) p) old (read base "request")]
+        (if (and (committed? (store/submit base p seed cmd)) (write base "command" cmd))
+          (proposal base cfg (c/append (vector-i64 2 7 3) (q/entry-id cfg (q/descriptor old)))
+            (store/load base p)) -5))
+      (= mode "certificate") (certificate base cfg)
+      (= mode "reject-two")
+      (if (= (vector-count (q/assemble cfg (read base "request")
+               (c/append (c/slice (read base "vote0") 1 65) (c/slice (read base "vote1") 1 65)))) 0) 1 -6)
+      (= mode "replica-create") (result base (replica/create base cfg identity))
+      (= mode "vote") (result base (replica/vote base cfg identity (read base "request")))
+      (= mode "no-equivocation")
+      (if (= (vector-at (replica/vote base cfg identity (read base "request")) 0) 10) 1 -17)
+      (= mode "vote-hold")
+      (let [v (replica/vote base cfg identity (read base "request")) ack (result base v)]
+        (if (and (= ack 1) (io/write (path base "ready") "ready"))
+          (loop [i 0] (if (= i 9223372036854775807) -15 (recur (+ i 1)))) -16))
+      (= mode "commit") (result base (replica/commit base cfg identity (read base "request") (read base "certificate")))
+      (= mode "current")
+      (let [current (replica/current base cfg index) request (read base "request")]
+        (if (and (> (vector-count current) 2)
+                 (c/equal? (c/slice current 2 (vector-at current 0)) request)) 1 -7))
+      (= mode "corrupt-current") (if (= (vector-count (replica/current base cfg index)) 0) 1 -8)
+      (= mode "install") (result base (broker/install base host seed (call base)))
+      (= mode "checkpoint") (result base (broker/checkpoint base host seed (call base)))
+      (= mode "execute") (result base (broker/execute base host seed (call base) (bf/facts "")))
+      (= mode "race-execute")
+      (let [response (broker/execute base host seed (call base) (bf/facts "")) code (vector-at response 0)]
+        (if (and (or (= code 0) (= code 1) (= code 2)) (write base option response)) 1 -18))
+      (= mode "race-verdict")
+      (let [a (vector-at (read base "race0") 0) b (vector-at (read base "race1") 0)]
+        (if (or (and (= a 1) (or (= b 0) (= b 2)))
+                (and (= b 1) (or (= a 0) (= a 2)))) 1 -19))
+      (= mode "deny-origin") (result base (broker/execute base host seed (call base) (bf/facts option)))
+      (= mode "bad-body")
+      (let [msg (call base) bad {"entry" (get msg "entry" (vector-i64))
+            "certificate" (get msg "certificate" (vector-i64))
+            "command" (get msg "command" (vector-i64)) "body" (vector-i64 120)}]
+        (result base (broker/execute base host seed bad (bf/facts ""))))
+      (= mode "bad-certificate")
+      (let [msg (call base) cert (read base "certificate")
+            bad {"entry" (get msg "entry" (vector-i64))
+                 "certificate" (f/set-word cert 10 (bit-xor (vector-at cert 10) 1))
+                 "command" (get msg "command" (vector-i64)) "body" (get msg "body" (vector-i64))}]
+        (result base (broker/execute base host seed bad (bf/facts ""))))
+      (= mode "abandon-expired")
+      (let [msg (call base) cmd (read base "command")
+            expired {"entry" (get msg "entry" (vector-i64))
+                 "certificate" (get msg "certificate" (vector-i64))
+                 "command" (f/set-word cmd 0 3000) "body" (get msg "body" (vector-i64))}]
+        (result base (broker/abandon base host seed expired (bf/facts "grants"))))
+      (= mode "object") (if (c/equal? (broker/object base host 1001) (vector-i64 104 101 108 108 111)) 1 -9)
+      (= mode "empty-object") (if (= (vector-count (broker/object base host 1001)) 0) 1 -10)
+      (= mode "expired-object") (if (= (vector-count (broker/object base host 2000)) 0) 1 -11)
+      (= mode "settle")
+      (if (committed? (broker/settle base host seed
+                       (c/append (vector-i64 1001) (c/slice (read base "command") 27 4)))) 1 -12)
+      (= mode "completed")
+      (if (= (vector-at (store/state (store/load base p)) 24) 2) 1 -13)
+      (= mode "publish-completion")
+      (let [old (read base "request")]
+        (proposal base cfg (c/append (vector-i64 3 7 1) (q/entry-id cfg (q/descriptor old)))
+          (store/load base p)))
+      (= mode "recover")
+      (let [blob (store/load base p) old (read base "request")]
+        (if (committed? (store/recover base p seed
+              (c/append (c/append (vector-i64 1002) (store/token blob)) (vector-i64 8))))
+          (proposal base cfg (c/append (vector-i64 (+ (vector-at old 1) 1) 8 2) (q/entry-id cfg (q/descriptor old)))
+            (store/load base (bf/policy 8))) -14))
+      (= mode "abandon") (result base (broker/abandon base host seed (call base) (bf/facts "grants")))
+      :else -100)))
