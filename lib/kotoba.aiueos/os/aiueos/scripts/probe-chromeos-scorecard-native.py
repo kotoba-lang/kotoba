@@ -52,13 +52,13 @@ SIGNED_RELEASE_SIGNATURE = SIGNED_RELEASE_RECEIPT.with_name(
     'aiueos-x86_64-build-receipt.sig')
 I3_RECEIPT = Path(
     'os/aiueos/qualification/receipts/vm-20261026/i3-display-scaling-external/receipt.edn')
-# A4 lacks the linked signed-release receipt; I2 lacks admitted serial
-# evidence. The remaining rows also lack evidence this native core can admit.
-UNVERIFIED_ROWS = ('A4', 'A5', 'C9', 'F2', 'G1', 'G3', 'G5', 'H1', 'H2',
+# I2 has synthetic battery input and separate sleep-run evidence. The
+# remaining rows also lack evidence this native core can fully admit.
+UNVERIFIED_ROWS = ('A5', 'C9', 'F2', 'G1', 'G3', 'G5', 'H1', 'H2',
                    'H3', 'I2', 'I6')
 EXPECTED_LEDGER = (
-    b'AIUEOS_SCORE 52\n'
-    b'AIUEOS_CATEGORY boot weight=10 pass=8 gap=2\n'
+    b'AIUEOS_SCORE 53\n'
+    b'AIUEOS_CATEGORY boot weight=10 pass=9 gap=1\n'
     b'AIUEOS_CATEGORY identity weight=6 pass=6 gap=0\n'
     b'AIUEOS_CATEGORY shell weight=15 pass=14 gap=1\n'
     b'AIUEOS_CATEGORY input weight=12 pass=9 gap=3\n'
