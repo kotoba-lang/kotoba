@@ -1,0 +1,5 @@
+(ns kotoba.capability.image.metadata
+  "Importable contract for image/metadata.")
+
+(def manifest
+  {:schema "kotoba.capability.repository.v1", :capability/version 1, :capability/hash-contract-cid "bafkreiflhj3fslsbh7okdas2fzlhmogai64x6p3lkla6gtr7berbp7ftvi", :capability/definition-cid "bafyreiaektr5t3hpmfpiymaixo7eywvbflykeon7bak5szkp6bvtrsv37e", :capability/dependencies #{}, :capability/imports #{:image-metadata}, :authority "kotoba-lang/kotoba-core-contracts", :capability/default-policy :approval-required, :capability/artifact {:format :wasm-component, :digest-required? true, :signature-required? true}, :capability/radicle-rid "rad:z2yi4fmconRcJqtH4qx1yjMyv2RcK", :capability/repository "kotoba-lang/capability-image-metadata", :capability/id "image/metadata", :capability/effects #{:storage-read :personal-data}, :capability/provider-status :contract-only})

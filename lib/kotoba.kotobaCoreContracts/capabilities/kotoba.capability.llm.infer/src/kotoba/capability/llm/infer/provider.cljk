@@ -1,0 +1,195 @@
+(ns kotoba.capability.llm.infer.provider
+  "JVM reference host provider for actor:host field \"llm_infer\".
+
+  The core in `artifacts/provider.core.wasm` returns -3 from every call. This
+  namespace is what an embedder binds over it.
+
+  ## Three things the guest cannot pass
+
+  `provider` closes over all three. The guest hands in a model name and a
+  prompt, and nothing else:
+
+  | | why it is in the closure |
+  |---|---|
+  | the **policy** | a guest that could pass one could widen its own authority |
+  | the **endpoint** | a guest that could pass one could send its prompt anywhere |
+  | the **credential** | a guest that could read one could spend it elsewhere |
+
+  The third is specific to this capability. `http/fetch` reads public URLs;
+  `llm/infer` writes to a metered endpoint under someone's key, and
+  `:capability/effects` says `:data-egress` — the prompt leaves the machine.
+  If the key travelled through the ABI it would be in guest memory, and the
+  capability would be handing out the very thing it exists to hold.
+
+  ## Resolution happens before admission, never after
+
+  `:resolve-endpoint` is a host function from model name to URL. It is called
+  FIRST, and `admission/admit` decides about what it returned. Admitting the
+  alias and then resolving it would be deciding about one thing and acting on
+  another — the redirect hazard, in a different coat.
+
+  There is no default resolver, and that is deliberate. The workspace SSoT is
+  the `murakumo-main` alias (AGENTS.md), but baking that host here would (a)
+  make a network read from inside a capability that was granted a network
+  write, and (b) freeze a value AGENTS.md says repeatedly not to freeze. With
+  no resolver and no explicit endpoint, every call refuses with
+  `:infer/endpoint-unresolved` — one fact, one message, nothing attempted.
+
+  ## The wire shape is not this package's to guess
+
+  `:request-body-fn` is required. An inference request's JSON differs per
+  vendor, and a default would freeze one into an authority package; writing
+  that JSON by hand here would put string escaping in the one file whose whole
+  job is care about what leaves the machine. Its absence refuses with
+  `:infer/no-request-encoder` — the ninth fact, and the only one this namespace
+  adds to `admission`'s eight.
+
+  ## Return codes are the contract
+
+     >= 0  bytes written
+     -1    refused by policy       (a decision was made; see the receipt)
+     -2    transport failed        (a request went out and did not come back)
+     -3    no host provider bound  (nothing was attempted)
+
+  -1 and -2 must not collapse. `bin/itonami` keeps the same two apart in its
+  exit codes and says why: \"'The server said no' is a measurement; 'nothing was
+  listening' is not, and an operator sent to read a refusal that never happened
+  debugs the wrong thing\" (ADR-2608136000)."
+  (:require [kotoba.bytes :as kbytes] [kotoba.capability.llm.infer.admission :as admission])
+  (:import [java.net URI]
+           [java.net.http HttpClient HttpClient$Redirect HttpRequest
+                          HttpRequest$Builder HttpRequest$BodyPublishers
+                          HttpResponse$BodyHandlers]
+           [java.time Duration]))
+
+(def code-refused -1)
+(def code-transport -2)
+(def code-unbound -3)
+
+(def default-limits
+  {:timeout-seconds 120
+   ;; A cap the CALLER cannot raise. Inference is slower than a fetch, so the
+   ;; timeout is longer -- but "longer" is not "absent", and an unbounded wait
+   ;; on a metered endpoint is an unbounded bill.
+   :max-response-bytes (* 4 1024 1024)})
+
+(defn- client ^HttpClient [{:keys [timeout-seconds]}]
+  (-> (HttpClient/newBuilder)
+      (.connectTimeout (Duration/ofSeconds (long (or timeout-seconds 120))))
+      ;; Never followed, for the same reason `capability-http-fetch` never
+      ;; follows them: a 302 would carry the prompt to a host the policy never
+      ;; admitted, with the decision already made about a different one.
+      (.followRedirects HttpClient$Redirect/NEVER)
+      (.build)))
+
+(defn- utf8-bytes ^bytes [s]
+  (kbytes/utf8-bytes (str s)))
+
+(defn- resolve-endpoint
+  "Where `model` is served, per the embedder. nil when nobody says."
+  [{:keys [resolve-endpoint endpoints]} model]
+  (or (when (map? endpoints) (get endpoints (str model)))
+      (when (fn? resolve-endpoint)
+        (try (resolve-endpoint (str model)) (catch Exception _ nil)))))
+
+(defn infer
+  "Send `prompt` to `model` under `policy`, returning a receipt. Never throws.
+
+  The receipt always says which outcome happened, because a caller that cannot
+  tell a refusal from a timeout cannot act on either. On success it also
+  carries `:max-output-tokens` and `:narrowed?` — what was actually asked of
+  the model after the policy's ceiling was applied, which is not always what
+  the caller asked for.
+
+  `:request-body-fn` is REQUIRED and there is no default. The wire shape of an
+  inference request differs per vendor, so a default would freeze one vendor
+  into an authority package — and writing the JSON by hand here would put
+  string escaping, in a package whose entire job is to be careful about what
+  leaves the machine, in the one place nobody would think to audit. Its absence
+  is its own refusal (`:infer/no-request-encoder`) rather than a guess."
+  [policy model prompt & [opts]]
+  (let [limits (merge default-limits opts)
+        ;; Ask about the MODEL before asking where it lives. Resolving is a
+        ;; network read, and a guest naming models the policy rejects must not
+        ;; be able to make the host perform one.
+        model-refusal (admission/refuse-model policy model)
+        endpoint (when-not model-refusal
+                   (or (:endpoint opts)
+                       (resolve-endpoint (merge policy opts) model)))
+        body (utf8-bytes prompt)
+        decision (or model-refusal
+                     (admission/admit policy
+                                      {:model model
+                                       :endpoint endpoint
+                                       :prompt-bytes (alength body)
+                                       :max-output-tokens (:max-output-tokens opts)}))
+        encode (or (:request-body-fn opts) (:request-body-fn policy))]
+    (cond
+      (not (:allowed? decision))
+      {:schema admission/schema :ok? false :code code-refused
+       :reason (:reason decision) :message (:message decision)}
+
+      (not (fn? encode))
+      {:schema admission/schema :ok? false :code code-refused
+       :reason :infer/no-request-encoder
+       :message (str "この provider には :request-body-fn がありません。"
+                     "推論要求の wire 形は endpoint のものであって、"
+                     "authority package が推測してよいものではありません。")}
+
+      :else
+      (try
+        (let [json (encode decision (str prompt))
+              builder (-> (HttpRequest/newBuilder (URI/create (:endpoint decision)))
+                          (.timeout (Duration/ofSeconds (long (:timeout-seconds limits))))
+                          (.header "content-type" "application/json"))
+              ;; Headers come from the CLOSURE. This is where the credential
+              ;; is, and it is the reason it is not in the ABI.
+              builder (reduce-kv (fn [^HttpRequest$Builder acc k v]
+                                   (.header acc (str (if (keyword? k) (name k) k)) (str v)))
+                                 builder
+                                 (or (:headers policy) {}))
+              req (-> ^HttpRequest$Builder builder
+                      (.method "POST" (HttpRequest$BodyPublishers/ofByteArray
+                                       (utf8-bytes json)))
+                      (.build))
+              resp (.send (client limits) req (HttpResponse$BodyHandlers/ofByteArray))
+              out (.body resp)
+              n (alength ^bytes out)]
+          (if (> n (long (:max-response-bytes limits)))
+            {:schema admission/schema :ok? false :code code-refused
+             :reason :infer/response-too-large
+             :message (str "応答が上限を超えました: " n " > " (:max-response-bytes limits))}
+            {:schema admission/schema :ok? true :code n
+             :status (.statusCode resp)
+             :host (:host decision)
+             :model (:model decision)
+             :max-output-tokens (:max-output-tokens decision)
+             :narrowed? (:narrowed? decision)
+             :body out}))
+        (catch Exception e
+          ;; A request that went out and did not come back. NOT -1: nothing
+          ;; refused it.
+          {:schema admission/schema :ok? false :code code-transport
+           :reason :infer/transport-failed
+           :message (str (.getMessage e))})))))
+
+(defn provider
+  "A host provider bound to one `policy`.
+
+  With no policy this still returns a provider — one that refuses every call
+  with `:infer/no-policy`. Refusing to CONSTRUCT would push the failure to
+  startup, where it reads as a broken embedder rather than as an unconfigured
+  capability; refusing to CALL keeps the fact where an operator can see it."
+  [policy]
+  {:schema admission/schema
+   :policy policy
+   :infer (fn [model prompt & [opts]] (infer policy model prompt opts))})
+
+(defn host-export
+  "The actor:host binding an embedder installs over the core's -3."
+  [policy]
+  {:module "kotoba"
+   :field "llm_infer"
+   :params [:i32 :i32 :i32 :i32 :i32 :i32]
+   :result :i32
+   :fn (:infer (provider policy))})
