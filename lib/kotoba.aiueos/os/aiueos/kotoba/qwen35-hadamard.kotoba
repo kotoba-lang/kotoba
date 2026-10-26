@@ -1,0 +1,294 @@
+(ns aiueos.qwen35-hadamard
+  (:export [aiueos-qwen35-hadamard main]))
+
+;; The activation transform around a Prism-folded (Hadamard-latent) weight,
+;; as one kernel object -- ADR-0222 stage A item 2, for the Ternary Bonsai 2
+;; artifact (`contracts/bonsai2-qwen35-runtime-v1.edn` `:hadamard`).
+;;
+;; A folded weight W' = W H S was quantised in a rotated basis, so the
+;; activation has to enter that basis before the matvec and the embedding has
+;; to leave it after the lookup. Prism's llama.cpp
+;; (@9a9394a895b96003ca842a6041cb28ac49a108f7, `build_lora_mm` /
+;; `build_inp_embd` / `ggml_compute_forward_fwht`) does exactly this, and
+;; this object is a port of that path, graded by that engine's own bytes
+;; (`tests/prism_hadamard_oracle.c`):
+;;
+;;   forward  (mode 0, before a folded matvec)
+;;     y[d] = x[src(d)] * sign[d]          permute (ssm_out only), then S
+;;     per 1024-block:  y *= 1/sqrt(1024);  butterflies len = 1, 2, ... 512
+;;   inverse  (mode 1, after the token_embd lookup)
+;;     per 1024-block:  y = x * 1/sqrt(1024);  butterflies
+;;     y[d] *= sign[d]
+;;
+;; H is the normalized Sylvester-Walsh-Hadamard matrix (its own inverse); the
+;; butterfly `u + v`, `u - v` in place, pass after pass, is the C's scalar loop
+;; and every f32 step here has the same operands in the same order. The scale
+;; 1/sqrt(1024) = 2^-5 is exact, so the C's "scale then butterfly" order is
+;; kept without being load-bearing. A sign is +-1 as an INT32 word read from
+;; the model mapping (`prism.hadamard.sign_values`, ADR-0222 stage A item 3):
+;; +1 becomes 1.0f, 0xFFFFFFFF becomes -1.0f, and anything else refuses the
+;; call before a byte is written.
+;;
+;; ## The `ssm_out` permutation
+;;
+;; `prism.hadamard.gdn_v_grouped` = true: before the recurrent layer's `ssm_out`
+;; projection the tiled [hd, nk, rep] feature order becomes grouped
+;; [hd, rep, nk] (`ggml_permute(0, 2, 1, 3)` in the C). Destination d takes
+;; source `h + hd * (nk_i + nk * rep_i)` with h = d mod hd, q = d / hd,
+;; rep_i = q mod rep, nk_i = q / rep. For Bonsai hd = 128, nk = 16, rep = 3
+;; (inner 6144 / dt_rank 48; dt_rank / group_count). `rep <= 1` means no
+;; permutation, and then hd and nk must be zero so a plan cannot carry a
+;; geometry nobody uses.
+;;
+;; ## One arena, one plan
+;;
+;; The same reason as `qwen35-matvec`: `kernel-subregion` requires a BASE to
+;; be a parameter and the ABI admits five, so input, signs and output live in
+;; one arena and a 64-byte plan describes them. Offsets are 64-bit.
+;;
+;;     0   mode: 0 forward, 1 inverse             u32
+;;     4   reserved, must be zero                 u32
+;;     8   width (elements; multiple of 1024)     u64
+;;    16   input offset                           u64   width * 4 bytes of f32
+;;    24   signs offset                           u64   width * 4 bytes of i32
+;;    32   output offset                          u64   width * 4 bytes of f32
+;;    40   perm hd                                u64
+;;    48   perm nk                                u64
+;;    56   perm rep                               u64   <= 1: no permutation
+;;
+;; The output region is the working buffer: the butterflies run in place on
+;; it, so it must not overlap the input or the signs (a forward call reads
+;; the permuted input while writing the output).
+;;
+;; ## Return
+;;
+;; **Zero is the success value.**
+;;
+;;    0    the transformed row was written
+;;   -1    null arena
+;;   -2    null plan
+;;   -3    plan length is not 64
+;;   -4    the reserved slot is non-zero
+;;   -5    mode is not 0 or 1
+;;   -6    width is not a multiple of 1024 in 1024..65536
+;;   -7    permutation geometry: rep > 1 with hd * nk * rep != width or a zero
+;;         factor, or rep <= 1 with a non-zero hd or nk
+;;   -8    a region runs past the arena
+;;   -9    the output overlaps the input or the signs
+;;  -10    a sign word is not +1 or -1 (0x00000001 / 0xFFFFFFFF)
+;;
+;; ## Fuel
+;;
+;; Per element: one permuted load, one sign load, two multiplies, one store,
+;; plus ten butterfly passes of 512 pairs per 1024-block (two loads, an add, a
+;; subtract, two stores each). Bisected in the KIR oracle -- see the contract.
+
+;; ------------------------------------------------------------------ readers
+
+(defn plan-u32 [plan slot]
+  (kernel-load-u32 plan 64 slot))
+
+(defn plan-u64 [plan slot]
+  (+ (kernel-load-u32 plan 64 slot)
+     (* 4294967296 (kernel-load-u32 plan 64 (+ slot 4)))))
+
+(defn u32w [v]
+  (bit-and v 4294967295))
+
+(defn f32w [u]
+  (if (> u 2147483647) (- u 4294967296) u))
+
+(defn ld [arena alen off]
+  ;; the binary32 at byte offset `off` as a signed bit-pattern word
+  (f32w (kernel-load-u32 (kernel-subregion arena alen off 4) 4 0)))
+
+(defn st [arena alen off bits]
+  (kernel-store-u32 (kernel-subregion arena alen off 4) 4 0 (u32w bits)))
+
+;; binary32 constants as bit patterns: 1/32 1023410176, 1.0f 1065353216,
+;; -1.0f -1082130432
+
+(defn sign-word [arena alen plan d]
+  (kernel-load-u32 (kernel-subregion arena alen (+ (plan-u64 plan 24) (* d 4)) 4) 4 0))
+
+(defn sign-bits [arena alen plan d]
+  ;; +-1.0f as a bit pattern; the word was proved +-1 by `signs-ok`
+  (if (= (sign-word arena alen plan d) 1) 1065353216 -1082130432))
+
+;; Every element walk below is chunked per 1024-block -- an inner walk over
+;; the block and an outer walk over the blocks -- rather than one recursion
+;; over the width. The machine code loops either way (a tail self-call is a
+;; jump); the KIR oracle does not, and a 2,048-deep recursion exhausted node's
+;; stack there where 1,024 did not (measured 2026-09-22).
+
+(defn signs-ok-blk [arena alen plan d0 i]
+  (if (>= i 1024)
+    1
+    (let [w (sign-word arena alen plan (+ d0 i))]
+      (if (= w 1)
+        (signs-ok-blk arena alen plan d0 (+ i 1))
+        (if (= w 4294967295)
+          (signs-ok-blk arena alen plan d0 (+ i 1))
+          0)))))
+
+(defn signs-ok [arena alen plan d0]
+  (if (>= d0 (plan-u64 plan 8))
+    1
+    (if (= 0 (signs-ok-blk arena alen plan d0 0))
+      0
+      (signs-ok arena alen plan (+ d0 1024)))))
+
+;; ------------------------------------------------------------- permutation
+
+(defn src-index [plan d]
+  (let [hd (plan-u64 plan 40)
+        nk (plan-u64 plan 48)
+        rep (plan-u64 plan 56)]
+    (if (< rep 2)
+      d
+      (let [h (- d (* hd (quot d hd)))
+            q (quot d hd)
+            r (- q (* rep (quot q rep)))
+            k (quot q rep)]
+        (+ h (* hd (+ k (* nk r))))))))
+
+(defn perm-ok [plan]
+  (let [hd (plan-u64 plan 40)
+        nk (plan-u64 plan 48)
+        rep (plan-u64 plan 56)]
+    (if (< rep 2)
+      (if (= hd 0) (if (= nk 0) 1 0) 0)
+      (if (< hd 1) 0
+        (if (< nk 1) 0
+          (if (= (* hd (* nk rep)) (plan-u64 plan 8)) 1 0))))))
+
+;; --------------------------------------------------------- the two prologues
+
+(defn prep-fwd-el [arena alen plan d]
+  ;; out[d] = (in[src(d)] * sign[d]) * 2^-5
+  (st arena alen (+ (plan-u64 plan 32) (* d 4))
+      (f32-to-bits
+       (f32-mul (f32-mul (f32-from-bits (ld arena alen (+ (plan-u64 plan 16) (* 4 (src-index plan d)))))
+                         (f32-from-bits (sign-bits arena alen plan d)))
+                (f32-from-bits 1023410176)))))
+
+(defn prep-inv-el [arena alen plan d]
+  ;; out[d] = in[d] * 2^-5
+  (st arena alen (+ (plan-u64 plan 32) (* d 4))
+      (f32-to-bits
+       (f32-mul (f32-from-bits (ld arena alen (+ (plan-u64 plan 16) (* d 4))))
+                (f32-from-bits 1023410176)))))
+
+(defn post-inv-el [arena alen plan d]
+  ;; out[d] = out[d] * sign[d]
+  (st arena alen (+ (plan-u64 plan 32) (* d 4))
+      (f32-to-bits
+       (f32-mul (f32-from-bits (ld arena alen (+ (plan-u64 plan 32) (* d 4))))
+                (f32-from-bits (sign-bits arena alen plan d))))))
+
+;; `which`: 0 prep-fwd, 1 prep-inv, 2 post-inv -- one block walk for the three
+;; elementwise passes, so the chunking is written once.
+
+(defn walk-el [arena alen plan which d]
+  (if (= which 0) (prep-fwd-el arena alen plan d)
+    (if (= which 1) (prep-inv-el arena alen plan d)
+      (post-inv-el arena alen plan d))))
+
+(defn walk-blk [arena alen plan which d]
+  ;; d runs over one block: d0 .. d0 + 1023; the block boundary is d mod 1024
+  (do (walk-el arena alen plan which d)
+      (if (= 1023 (- d (* 1024 (quot d 1024))))
+        0
+        (walk-blk arena alen plan which (+ d 1)))))
+
+(defn walk [arena alen plan which d0]
+  (if (>= d0 (plan-u64 plan 8))
+    0
+    (do (walk-blk arena alen plan which d0)
+        (walk arena alen plan which (+ d0 1024)))))
+
+;; -------------------------------------------------------------- butterflies
+;;
+;; All offsets below are BYTE offsets into the arena. `lenb` is the C's `len`
+;; times four; a block is 4096 bytes.
+
+(defn butterfly [arena alen a b]
+  (let [u (ld arena alen a)
+        v (ld arena alen b)]
+    (do (st arena alen a (f32-to-bits (f32-add (f32-from-bits u) (f32-from-bits v))))
+        (st arena alen b (f32-to-bits (f32-sub (f32-from-bits u) (f32-from-bits v)))))))
+
+(defn bfly-j [arena alen a lenb j]
+  ;; for j in 0..len: (a + j, a + len + j)
+  (if (>= j lenb)
+    0
+    (do (butterfly arena alen (+ a j) (+ a (+ lenb j)))
+        (bfly-j arena alen a lenb (+ j 4)))))
+
+(defn bfly-i [arena alen base lenb i]
+  ;; for i in 0..1024 step 2 len
+  (if (>= i 4096)
+    0
+    (do (bfly-j arena alen (+ base i) lenb 0)
+        (bfly-i arena alen base lenb (+ i (* 2 lenb))))))
+
+(defn bfly-len [arena alen base lenb]
+  ;; for len = 1; len < 1024; len <<= 1
+  (if (>= lenb 4096)
+    0
+    (do (bfly-i arena alen base lenb 0)
+        (bfly-len arena alen base (* 2 lenb)))))
+
+(defn blocks [arena alen out-off nblk b]
+  (if (>= b nblk)
+    0
+    (do (bfly-len arena alen (+ out-off (* b 4096)) 4)
+        (blocks arena alen out-off nblk (+ b 1)))))
+
+;; ------------------------------------------------------------------ regions
+
+(defn fits [alen off len]
+  (if (< off 0) 0 (if (< len 0) 0 (if (> (+ off len) alen) 0 1))))
+
+(defn regions-fit [alen plan wb]
+  (if (= 0 (fits alen (plan-u64 plan 16) wb)) 0
+    (if (= 0 (fits alen (plan-u64 plan 24) wb)) 0
+      (fits alen (plan-u64 plan 32) wb))))
+
+(defn disjoint [a b len]
+  ;; 1 when [a, a+len) and [b, b+len) do not overlap
+  (if (< a (+ b len)) (if (< b (+ a len)) 0 1) 1))
+
+(defn output-disjoint [plan wb]
+  (if (= 0 (disjoint (plan-u64 plan 32) (plan-u64 plan 16) wb)) 0
+    (disjoint (plan-u64 plan 32) (plan-u64 plan 24) wb)))
+
+;; ---------------------------------------------------------------- the entry
+
+(defn run [arena alen plan]
+  (if (= (plan-u32 plan 0) 0)
+    (do (walk arena alen plan 0 0)
+        (blocks arena alen (plan-u64 plan 32) (quot (plan-u64 plan 8) 1024) 0))
+    (do (walk arena alen plan 1 0)
+        (blocks arena alen (plan-u64 plan 32) (quot (plan-u64 plan 8) 1024) 0)
+        (walk arena alen plan 2 0))))
+
+(defn checked [arena alen plan width]
+  (if (= 0 (perm-ok plan)) -7
+    (if (= 0 (regions-fit alen plan (* width 4))) -8
+      (if (= 0 (output-disjoint plan (* width 4))) -9
+        (if (= 0 (signs-ok arena alen plan 0)) -10
+          (run arena alen plan))))))
+
+(defn aiueos-qwen35-hadamard [arena arena-length plan plan-length]
+  (if (= arena 0) -1
+    (if (= plan 0) -2
+      (if (not (= plan-length 64)) -3
+        (if (not (= (plan-u32 plan 4) 0)) -4
+          (if (> (plan-u32 plan 0) 1) -5
+            (if (< (plan-u64 plan 8) 1024) -6
+              (if (> (plan-u64 plan 8) 65536) -6
+                (if (not (= 0 (- (plan-u64 plan 8) (* 1024 (quot (plan-u64 plan 8) 1024))))) -6
+                  (checked arena arena-length plan (plan-u64 plan 8)))))))))))
+
+(defn main [] 0)

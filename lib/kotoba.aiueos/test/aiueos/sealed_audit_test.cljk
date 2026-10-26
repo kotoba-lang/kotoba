@@ -1,0 +1,128 @@
+(ns aiueos.sealed-audit-test
+  (:require [kotoba.io :as kio] [grant.audit :as audit]
+            [aiueos.sealed-audit :as sealed]
+            [clojure.edn :as edn]
+            [kotoba.io :as io]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is]]))
+
+(defn- temp-dir []
+  (kio/temp-dir
+    "aiueos-sealed-audit-"))
+
+(defn- failure-kind [f]
+  (try (f) nil (catch Exception error (:kind (ex-data error)))))
+
+(deftest encrypted-round-trip-keeps-key-material-separate
+  (let [dir (temp-dir)
+        path (io/file dir "audit.sealed")
+        key (sealed/generate-key)
+        keyring {:audit/current key}
+        entry (audit/audit-entry :service/auth :deny "classified-detail" 100)]
+    (sealed/append! path keyring :audit/current entry)
+    (is (= [entry] (sealed/read! path keyring)))
+    (let [raw (slurp path)]
+      (is (not (.contains raw "classified-detail")))
+      (is (not (.contains raw (pr-str (vec key))))))
+    (is (= :missing-key
+           (failure-kind #(sealed/read! path {}))))
+    (is (= :authentication-failed
+           (failure-kind
+            #(sealed/read! path {:audit/current (sealed/generate-key)}))))))
+
+(deftest chain-detects-record-tampering-and-reordering
+  (let [dir (temp-dir)
+        path (io/file dir "audit.sealed")
+        keyring {:audit/current (sealed/generate-key)}
+        entries [(audit/audit-entry :app/a :grant "one" 1)
+                 (audit/audit-entry :app/b :deny "two" 2)]]
+    (doseq [entry entries]
+      (sealed/append! path keyring :audit/current entry))
+    (let [records (mapv edn/read-string (line-seq (io/reader path)))
+          tampered (update-in records [0 :ciphertext]
+                              #(str (if (= "A" (subs % 0 1)) "B" "A")
+                                    (subs % 1)))]
+      (spit path (str (str/join "\n" (map pr-str tampered)) "\n"))
+      (is (= :record-hash-mismatch
+             (failure-kind #(sealed/read! path keyring)))))
+    (spit path "")
+    (doseq [entry entries]
+      (sealed/append! path keyring :audit/current entry))
+    (let [records (mapv edn/read-string (line-seq (io/reader path)))]
+      (spit path (str (str/join "\n" (map pr-str (reverse records))) "\n"))
+      (is (= :sequence-break
+             (failure-kind #(sealed/read! path keyring)))))))
+
+(deftest retention-reseals-only-live-records
+  (let [dir (temp-dir)
+        path (io/file dir "audit.sealed")
+        keyring {:audit/old (sealed/generate-key)
+                 :audit/current (sealed/generate-key)}
+        entries [(audit/audit-entry :app/a :run "expired" 99)
+                 (audit/audit-entry :app/a :run "keep-a" 100)
+                 (audit/audit-entry :app/a :run "keep-b" 101)]]
+    (doseq [entry entries]
+      (sealed/append! path keyring :audit/old entry))
+    (is (= {:deleted 1 :retained 2 :cutoff-epoch-secs 100}
+           (sealed/prune! path keyring :audit/current 100)))
+    (is (= (subvec entries 1) (sealed/read! path keyring)))
+    (is (= (subvec entries 1)
+           (sealed/read! path (dissoc keyring :audit/old))))))
+
+(deftest backup-is-encrypted-and-restore-is-verified-before-replacement
+  (let [dir (temp-dir)
+        path (io/file dir "audit.sealed")
+        backup (io/file dir "backup.sealed")
+        keyring {:audit/current (sealed/generate-key)}
+        entry (audit/audit-entry :app/a :reject "restore-me" 200)
+        _ (sealed/append! path keyring :audit/current entry)
+        digest (sealed/backup! path backup)]
+    (is (re-matches #"[0-9a-f]{64}" digest))
+    (spit path "corrupt")
+    (is (= [entry] (sealed/restore! backup path keyring)))
+    (spit backup "corrupt")
+    (is (= :invalid-format
+           (failure-kind #(sealed/restore! backup path keyring))))
+    (is (= [entry] (sealed/read! path keyring)))))
+
+(deftest crypto-erasure-removes-decryption-authority
+  (let [dir (temp-dir)
+        path (io/file dir "audit.sealed")
+        key-id :audit/subject-42
+        keyring (atom {key-id (sealed/generate-key)})]
+    (sealed/append! path @keyring key-id
+                    (audit/audit-entry :subject/id-42 :run "personal-state" 1))
+    (swap! keyring dissoc key-id)
+    (is (= :missing-key
+           (failure-kind #(sealed/read! path @keyring))))))
+
+(deftest externally-signed-chain-head-detects-valid-suffix-truncation
+  (let [dir (temp-dir)
+        path (io/file dir "audit.sealed")
+        keyring {:audit/current (sealed/generate-key)}
+        signing-keys (sealed/generate-head-signing-key-pair)
+        entries [(audit/audit-entry :app/a :run "one" 1)
+                 (audit/audit-entry :app/a :run "two" 2)]]
+    (doseq [entry entries]
+      (sealed/append! path keyring :audit/current entry))
+    (let [signed-head
+          (sealed/sign-chain-head
+           (sealed/chain-head path keyring)
+           (.getPrivate signing-keys))
+          public-key (sealed/head-public-key-base64 signing-keys)]
+      (is (= entries
+             (sealed/read-with-chain-head!
+              path keyring signed-head public-key)))
+      ;; The first line is internally valid by itself. Only the retained
+      ;; signed head proves that the second record was removed.
+      (let [first-line (first (line-seq (io/reader path)))]
+        (spit path (str first-line "\n")))
+      (is (= :chain-head-mismatch
+             (failure-kind
+              #(sealed/read-with-chain-head!
+                path keyring signed-head public-key))))
+      (is (= :invalid-chain-head-signature
+             (failure-kind
+              #(sealed/read-with-chain-head!
+                path keyring (update signed-head :record-count dec)
+                public-key)))))))

@@ -1,0 +1,122 @@
+;; Guest browser desktop frame: kotoba-lang/browser surface state -> retained
+;; draw list, on KERNEL.ELF (ADR-0223).
+;;
+;; WHY THIS IS A KOTOBA OBJECT AND NOT A C TABLE
+;;
+;; kotoba-lang/browser ADR 0002 makes the browser surface the aiueos desktop:
+;; the guest owns windows, z-order, focus and the retained draw list, and a
+;; backend only presents complete frames (`:frame/present`). Which rectangles
+;; a frame holds, in which order and in which colour is that guest decision.
+;; C rasterizes the returned list (mechanism) and never picks an order or a
+;; colour. Hosted `browser.desktop-backend/surface-frame` runs in a JS/JVM
+;; host and does not count here.
+;;
+;; What is mirrored from kotoba-lang/browser, and from where:
+;;   z-order    `:surface/windows` order, later = drawn on top
+;;              (browser.surface/focus-window docstring)
+;;   colours    browser.surface/window-node: focused body #ffffff, unfocused
+;;              #eef1f5; titlebar focused #d8e7ff, unfocused #dde2ea;
+;;              workspace #f5f6f8
+;;   titlebar   browser.input/titlebar-height = 28
+;; What is NOT mirrored: text, the launcher/topbar rows and cssom flow
+;; layout. Windows sit at their `:window/rect`, which is what the hosted WM
+;; and browser.input's hit-test already use. Named leftover
+;; `:no-text-raster` (no font in the kernel yet).
+;;
+;; Temporary native constraint: word types and a bounded u32 state window,
+;; not a surface map, and at most five parameters per function (the
+;; kotoba-sema that aiueos's verify-admissions closure pins still refuses a
+;; sixth) (ADR-2608650000: native maps are a backend gap, not a
+;; language ceiling). Remove this layout when native has maps.
+;;
+;; STATE (u32 LE words, exactly 128 bytes):
+;;   0 abi = 1   1 n (1..4)   2 focus window id   3 viewport w   4 viewport h
+;;   5+5k: id x y w h of window k, k = 0 bottom .. n-1 top
+;; OPS (u32 LE words, 24 bytes per op): kind=1 rect, x, y, w, h, rgb
+;;   op 0 is the workspace; then per window k: body, titlebar.
+;;
+;; ABI: [state state-bytes ops ops-bytes] -> op count (1 + 2n), or
+;;   -1 null region / wrong state size   -2 abi or n out of range
+;;   -3 focus is not a window id         -4 a rect leaves the viewport
+;;   -5 ops region too small
+
+(ns aiueos.browser-frame
+  (:export [aiueos-browser-frame main]))
+
+;; The state size is checked once at the entry (it must be 128), so the
+;; helpers below read with the constant.
+(defn w-at [st i]
+  (kernel-load-u32 (kernel-subregion st 128 (* i 4) 4) 4 0))
+
+(defn opw [r i v]
+  (kernel-store-u32 (kernel-subregion r 24 (* i 4) 4) 4 0 v))
+
+(defn put-geom [r x y w h]
+  (do (opw r 1 x) (opw r 2 y) (opw r 3 w) (opw r 4 h)))
+
+(defn put-kind-rgb [r rgb]
+  (do (opw r 0 1) (opw r 5 rgb)))
+
+(defn has-id [st n k id]
+  (if (>= k n) 0
+    (if (= (w-at st (+ 5 (* k 5))) id) 1
+      (has-id st n (+ k 1) id))))
+
+(defn rect-ok [st k vw vh]
+  (let [b (+ 5 (* k 5))
+        x (w-at st (+ b 1))
+        y (w-at st (+ b 2))
+        w (w-at st (+ b 3))
+        h (w-at st (+ b 4))]
+    (if (< w 1) 0
+      (if (< h 29) 0
+        (if (> (+ x w) vw) 0
+          (if (> (+ y h) vh) 0 1))))))
+
+(defn rects-ok [st n k vw vh]
+  (if (>= k n) 1
+    (if (= (rect-ok st k vw vh) 0) 0
+      (rects-ok st n (+ k 1) vw vh))))
+
+(defn body-rgb [focused] (if (= focused 1) 16777215 15659509))
+(defn title-rgb [focused] (if (= focused 1) 14215167 14541546))
+
+(defn put-window-op [r st b height rgb]
+  (do (put-geom r (w-at st (+ b 1)) (w-at st (+ b 2))
+                (w-at st (+ b 3)) (if (= height 0) (w-at st (+ b 4)) height))
+      (put-kind-rgb r rgb)))
+
+;; Each op's 24-byte region is spelled `kernel-subregion` at the call: the
+;; kernel-memory rule is that a base names a region, so neither a let-bound
+;; region nor one returned by a helper is admitted.
+(defn emit-window [st ops ob k]
+  (let [b (+ 5 (* k 5))
+        f (if (= (w-at st b) (w-at st 2)) 1 0)]
+    (do (put-window-op (kernel-subregion ops ob (* (+ 1 (* 2 k)) 24) 24) st b 0 (body-rgb f))
+        (put-window-op (kernel-subregion ops ob (* (+ 2 (* 2 k)) 24) 24) st b 28 (title-rgb f)))))
+
+(defn emit [st ops ob k]
+  (if (>= k (w-at st 1)) (+ 1 (* 2 (w-at st 1)))
+    (do (emit-window st ops ob k)
+        (emit st ops ob (+ k 1)))))
+
+(defn aiueos-browser-frame [st sb ops ob]
+  (if (= st 0) -1
+    (if (= ops 0) -1
+      (if (not (= sb 128)) -1
+        (let [abi (w-at st 0)
+              n (w-at st 1)
+              focus (w-at st 2)
+              vw (w-at st 3)
+              vh (w-at st 4)]
+          (if (not (= abi 1)) -2
+            (if (< n 1) -2
+              (if (> n 4) -2
+                (if (= (has-id st n 0 focus) 0) -3
+                  (if (= (rects-ok st n 0 vw vh) 0) -4
+                    (if (< ob (* 24 (+ 1 (* 2 n)))) -5
+                      (do (put-geom (kernel-subregion ops ob 0 24) 0 0 vw vh)
+                          (put-kind-rgb (kernel-subregion ops ob 0 24) 16119544)
+                          (emit st ops ob 0)))))))))))))
+
+(defn main [] 0)

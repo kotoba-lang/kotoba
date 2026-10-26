@@ -1,0 +1,180 @@
+#!/usr/bin/env kbb
+;; k16-bus3-sink.cljs -- the Mac end of bus3 (LAN2, en8): a UDP receipt sink
+;; on 0.0.0.0:9000 that cannot hold a dead inode.
+;;
+;; It binds the WILDCARD address, not 10.10.10.1: the board's boot greeting
+;; is sent to the limited broadcast 255.255.255.255 as well as to
+;; 10.10.10.1, and a socket bound to one unicast address never sees the
+;; broadcast one. Binding the wildcard receives both, and receives them
+;; whichever interface the debug NIC turns out to be cabled to -- which is
+;; still unmeasured (2026-09-08).
+;;
+;; Why this exists (ADR-0156, rig-h2). The previous sink was
+;;   socat -u UDP-RECV:9000,reuseaddr OPEN:/tmp/k16-bus3-en8.log,creat,append
+;; On 2026-09-07 its log file was unlinked while it ran. socat had opened the
+;; file ONCE, so its fd kept pointing at the unlinked inode: every bus3 receipt
+;; for hours was appended to a file nobody could open, while `ps` showed a
+;; healthy listener and `lsof` a healthy fd. `k16-rig-check.cljs` now catches
+;; that state (instrument `bus3-sink`: the sink path must exist on disk and a
+;; nonce sent to 10.10.10.1:9000 must appear in it) -- but the sink itself
+;; should not be able to get there.
+;;
+;; So this sink never keeps the file open. Every datagram is written with
+;; open-by-name / append / close (`fs.appendFileSync`): if the path was
+;; unlinked between two datagrams the next one recreates it, and the file that
+;; exists on disk is always the file that receives the receipts. The cost is
+;; one open per datagram, which at bus3's rate (a handful of frames per boot)
+;; is nothing; at 10k datagrams/s it would matter and this is not that sink.
+;;
+;; Every line written to the sink is a receipt (one line per datagram):
+;;   K16_BUS3_RX from=<ip>:<port> bytes=<n> hex=<hex> t=<iso>
+;; plus, so a dead sink and a quiet wire cannot look the same:
+;;   K16_BUS3_SINK_READY listen=<h:p> sink=<path> liveness-s=<s> pid=<pid> t=<iso>
+;;   K16_BUS3_SINK_ALIVE received=<n> write-failures=<f> t=<iso>   (every --liveness-s)
+;;   K16_BUS3_SINK_STOP signal=<sig> received=<n> t=<iso>
+;; READY/ALIVE/STOP also go to stdout. A write failure is printed to stdout as
+;; K16_BUS3_SINK_WRITE_FAIL with the receipt line, and the sink keeps running.
+;;
+;; Refuses to start (exit 2, named reason) when the sink's directory does not
+;; exist or the address cannot be bound:
+;;   K16_BUS3_SINK_REFUSED reason=sink-dir-missing dir=<dir>
+;;   K16_BUS3_SINK_REFUSED reason=bind-failed code=<EADDRINUSE|EADDRNOTAVAIL|...> listen=<h:p>
+;;
+;; Contract with k16-rig-check.cljs (check-bus3-sink): the receiver process is
+;; found in ps by `k16-bus3-sink.cljs` (socat's `UDP-RECV:<port>` form is still
+;; recognised), its sink path is read from `--sink <path>` in argv (default
+;; below), and the control datagram sent to <bus3-ip>:<bus3-port> must appear
+;; in that file. Keep `--sink` and `--listen` as literal argv tokens.
+;;
+;; Usage:
+;;   kbb --backend sci os/aiueos/tools/k16-bus3-sink.cljk [--listen 10.10.10.1:9000]
+;;       [--sink /tmp/k16-bus3-en8.log] [--liveness-s 300]
+;; Prove the whole point on a scratch port:
+;;   kbb --backend sci os/aiueos/tools/k16-bus3-sink.cljk --listen 127.0.0.1:19000 --sink /tmp/x/sink.log
+;;   python3 -c 'import socket;socket.socket(socket.AF_INET,socket.SOCK_DGRAM).sendto(b"one",("127.0.0.1",19000))'
+;;   rm /tmp/x/sink.log
+;;   python3 -c '... sendto(b"two", ...)'   # sink.log exists again and holds "two"
+
+(ns k16-bus3-sink
+  (:require ["node:dgram" :as dgram]
+            ["node:fs" :as fs]
+            ["node:path" :as path]
+            [kotoba.lang.text :as str]))
+
+(def defaults
+  {"listen" "0.0.0.0:9000"
+   "sink" "/tmp/k16-bus3-en8.log"
+   "liveness-s" "300"})
+
+(defn- parse-args [argv]
+  (loop [args argv acc defaults]
+    (if (empty? args)
+      acc
+      (let [[k v & more] args]
+        (cond
+          (= k "--help") (assoc acc "help" "true")
+          (str/starts-with? k "--")
+          (let [key (subs k 2)]
+            (when-not (contains? defaults key)
+              (println (str "UNKNOWN_FLAG\t" k))
+              (js/process.exit 2))
+            (recur more (assoc acc key v)))
+          :else (do (println (str "UNEXPECTED_ARG\t" k)) (js/process.exit 2)))))))
+
+(defn- usage! []
+  (println (str/join "\n"
+                     ["kbb --backend sci k16-bus3-sink.cljk [--flag value ...]"
+                      "flags (defaults in brackets):"
+                      (str/join "\n" (map (fn [[k v]] (str "  --" k " [" v "]")) (sort-by first defaults)))
+                      "exit 2 = refused to start (K16_BUS3_SINK_REFUSED reason=...)"]))
+  (js/process.exit 0))
+
+(defn- host-port [s default-port]
+  (let [[h p] (str/split s #":")]
+    [h (if (and p (not (str/blank? p))) (js/parseInt p 10) default-port)]))
+
+(defn- now [] (.toISOString (js/Date.)))
+
+(defn- say [& parts] (println (str/join " " (map str parts))))
+
+(defn- refuse! [& parts]
+  (apply say "K16_BUS3_SINK_REFUSED" parts)
+  (js/process.exit 2))
+
+(def received (atom 0))
+(def write-failures (atom 0))
+
+(defn- append!
+  "Open the sink BY NAME, append one line, close. This is the whole mechanism:
+   no fd survives between calls, so an unlink between two datagrams costs
+   nothing but the file's history -- the next datagram recreates the path.
+   Returns true when the line is on disk under `sink`."
+  [sink line]
+  (try
+    (fs/appendFileSync sink (str line "\n") #js {:mode 0644})
+    true
+    (catch :default e
+      (swap! write-failures inc)
+      (say "K16_BUS3_SINK_WRITE_FAIL" (str "sink=" sink) (str "code=" (or (.-code e) (.-message e)))
+           (str "failures=" @write-failures) (str "line=" line))
+      false)))
+
+(defn- on-datagram [sink ^js buf ^js rinfo]
+  (swap! received inc)
+  (let [line (str "K16_BUS3_RX from=" (.-address rinfo) ":" (.-port rinfo)
+                  " bytes=" (.-length buf) " hex=" (.toString buf "hex") " t=" (now))]
+    (append! sink line)))
+
+(defn -main [& argv]
+  (let [opts (parse-args argv)
+        _ (when (get opts "help") (usage!))
+        [lh lp] (host-port (get opts "listen") 9000)
+        sink (get opts "sink")
+        liveness-s (js/parseInt (get opts "liveness-s") 10)
+        dir (path/dirname sink)]
+    (when (or (js/isNaN lp) (<= lp 0) (> lp 65535))
+      (refuse! "reason=bad-port" (str "listen=" (get opts "listen"))))
+    (when (or (js/isNaN liveness-s) (<= liveness-s 0))
+      (refuse! "reason=bad-liveness" (str "liveness-s=" (get opts "liveness-s"))))
+    (when-not (try (.isDirectory (fs/statSync dir)) (catch :default _ false))
+      (refuse! "reason=sink-dir-missing" (str "dir=" dir) (str "sink=" sink)))
+    (let [sock (dgram/createSocket #js {:type "udp4" :reuseAddr true})
+          ready (atom false)]
+      (.on sock "error"
+           (fn [e]
+             (if @ready
+               ;; after bind, an error is a receipt, not a death: the netlog
+               ;; receiver's rule (k16-netlog-standalone.py) -- never die on a datagram.
+               (say "K16_BUS3_SINK_SOCKET_ERROR" (str "code=" (or (.-code e) (.-message e))) (str "t=" (now)))
+               (refuse! "reason=bind-failed" (str "code=" (or (.-code e) (.-message e)))
+                        (str "listen=" lh ":" lp)))))
+      (.on sock "message" (fn [buf rinfo] (on-datagram sink buf rinfo)))
+      (.bind sock lp lh
+             (fn []
+               (reset! ready true)
+               (try (.setRecvBufferSize sock (* 8 1024 1024)) (catch :default _ nil))
+               (let [line (str "K16_BUS3_SINK_READY listen=" lh ":" lp " sink=" sink
+                               " liveness-s=" liveness-s " pid=" js/process.pid " t=" (now))]
+                 (say line)
+                 ;; the sink file exists from the first second the socket is
+                 ;; bound, so a reader never has to guess whether "no file" means
+                 ;; "no datagram yet" or "no sink".
+                 (append! sink line))
+               (js/setInterval
+                (fn []
+                  (let [line (str "K16_BUS3_SINK_ALIVE received=" @received
+                                  " write-failures=" @write-failures " t=" (now))]
+                    (say line)
+                    (append! sink line)))
+                (* 1000 liveness-s))))
+      (doseq [sig ["SIGINT" "SIGTERM" "SIGHUP"]]
+        (js/process.on sig
+                       (fn []
+                         (let [line (str "K16_BUS3_SINK_STOP signal=" sig " received=" @received
+                                         " write-failures=" @write-failures " t=" (now))]
+                           (say line)
+                           (append! sink line)
+                           (try (.close sock) (catch :default _ nil))
+                           (js/process.exit 0))))))))
+
+(apply -main *command-line-args*)

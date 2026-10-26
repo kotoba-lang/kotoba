@@ -1,0 +1,813 @@
+(ns native.debug-link
+  ;; Gate: LAN2 (bus3, bar-b) debug console. The K16 has two RTL8125BG;
+  ;; bus2/bar-a carries the PXE stream profile, bus3/bar-b is wired to the
+  ;; Mac's second NIC (en8) as the debug/control plane.
+  ;;
+  ;; This module owns a MINIMAL raw-Ethernet UDP TX on bus3: a fixed
+  ;; 10.10.10.<k16>:9000 log the Mac receives with
+  ;;   socat -u UDP-RECV:9000,reuseaddr -
+  ;;
+  ;; The Mac en8 is static 10.10.10.1 and its MAC is baked in, so OUR Ethernet
+  ;; header is complete without a lookup. The Mac's is not: it will not send a
+  ;; frame to 10.10.10.2 until ARP resolves it, and for a day it could not --
+  ;; `arp -an` said `10.10.10.2 (incomplete)` and every control datagram died
+  ;; in the Mac's own stack (measured 2026-09-07/08). So this module now speaks
+  ;; exactly as much ARP as a two-host debug wire needs: it asks for
+  ;; 10.10.10.1 once at init (a request addressed to the Mac, which is what
+  ;; makes a BSD stack record the sender -- a gratuitous announcement does not
+  ;; create an entry, it only refreshes one) and it answers requests for
+  ;; 10.10.10.2. No cache, no timers, no IP stack beyond the fixed 4-tuple.
+  ;;
+  ;; It deliberately runs as a SINGLE-SHOT send on bus3 per call, using a
+  ;; 16 KiB DMA window the CALLER supplies. That window must be loader-owned:
+  ;; Phase 1 pointed it at kernel pages 14..17, which the Amu loader never
+  ;; allocated (kernel_scratch.pages = 14), so the NIC would have mastered
+  ;; into memory the kernel does not own (ADR-0156). The TX ring is installed
+  ;; once by debug-init, then debug-send reuses it.
+  ;;
+  ;; Every entry point returns a DISTINCT code per outcome. Phase 1 returned
+  ;; 0 both when the frame failed to build and when it was submitted, so the
+  ;; caller could not tell a working send from a dead one.
+  (:require [capability.link.frame :as link]
+            [capability.dma.map :as dma]
+            [capability.mmio.map :as mapped]
+            [native.rtl8125 :as rtl]
+            [native.relay-text :as text]
+            [native.relay-line :as relay]
+            [native.micro-infer :as mi])
+  (:export [debug-init debug-send debug-send-byte debug-poll
+            debug-tick debug-hello debug-mac-byte debug-phy-byte
+            debug-frame-byte]))
+
+;; ── fixed debug 4-tuple ──────────────────────────────────────────────────
+;; K16 bus3 = 10.10.10.2, Mac en8 = 10.10.10.1, UDP 9000 -> 9000.
+;; Written as octets, not as a decimal literal. The literals used to be
+;; 168493058 and 168493057 with `; 0x0A0A0A02` beside them -- and 0x0A0A0A02 is
+;; 168430082. The transposed pair says 10.11.0.2 / 10.11.0.1, so every frame
+;; this plane ever sent carried a source address on a network that does not
+;; exist, while the baked header checksum was computed from the address in the
+;; COMMENT. The Mac received them and dropped every one in ip_input as a bad
+;; header checksum (measured 2026-09-08: exactly two per boot, the two
+;; greetings), and answered no ARP because the request asked for 10.11.0.1.
+;; One wrong digit is the whole history of "bus3 is output-only".
+;; `def` takes a literal, so the octets cannot be written as arithmetic and the
+;; only defence is that these four numbers are checked against each other:
+;;   10.10.10.2 = 0x0A0A0A02 = 168430082
+;;   10.10.10.1 = 0x0A0A0A01 = 168430081
+;; and the two header checksums below are computed FROM these values. If any of
+;; the six changes, all six are re-derived together or the plane goes silent
+;; again in a way every status reports as success.
+(def k16-debug-ip 168430082)    ; 0x0A0A0A02 = 10.10.10.2
+(def mac-debug-ip 168430081)    ; 0x0A0A0A01 = 10.10.10.1
+(def debug-udp-port 9000)
+
+;; Mac en8 NIC MAC (3c:18:a0:d5:82:a8), the fixed debug peer.
+;; The peer MAC was baked in here (3c:18:a0:d5:82:a8, the Mac's en8). Every
+;; frame this module ever sent carried it, and not one was delivered: measured
+;; 2026-09-08, the wire bus3 is actually on does not have that NIC listening
+;; on it, so its own NIC dropped every frame before any IP stack saw it. A
+;; debug plane must not depend on knowing which socket its cable is in.
+;;
+;; Unsolicited frames therefore go to BROADCAST: every NIC on the segment
+;; accepts them, and the Mac's stack delivers a datagram for one of its own
+;; addresses whichever interface it arrived on. Answers go back to the MAC the
+;; request came from, which is better than any constant.
+
+(defn store-mac-at [frame mmio offset index]
+  ;; IDR0..5 at `offset`. Ethernet wants our MAC at 6; an ARP body wants the
+  ;; same six bytes again at 22, which is why this takes the offset.
+  (if (= index 6)
+    1
+    (let [value (kernel-load-u8 mmio 512 index)
+          stored (kernel-store-u8-4k frame 4096 (+ offset index)
+                                     (bit-and value 255))]
+      ;; Read the frame byte back (lang-h13). The earlier form compared the
+      ;; store to its operand and then stored the same byte a second time.
+      (if (= (+ (kernel-load-u8-4k frame 4096 (+ offset index)) (* 0 stored))
+             (bit-and value 255))
+        (store-mac-at frame mmio offset (+ index 1))
+        0))))
+
+(defn store-device-mac [frame mmio index]
+  (store-mac-at frame mmio 6 index))
+
+(defn store-broadcast-mac [frame offset index]
+  (if (= index 6)
+    1
+    (let [stored (kernel-store-u8-4k frame 4096 (+ offset index) 255)]
+      (if (= (+ (kernel-load-u8-4k frame 4096 (+ offset index)) (* 0 stored))
+             255)
+        (store-broadcast-mac frame offset (+ index 1))
+        0))))
+
+(defn copy-frame-bytes [tx rx tx-offset rx-offset count]
+  ;; An ARP reply is mostly the request read back out: the requester's MAC
+  ;; becomes our destination and the reply's target, its IP becomes the
+  ;; target IP. Five parameters is the native ABI cap, and this is at it.
+  (if (= count 0)
+    1
+    (let [value (kernel-load-u8-4k rx 4096 rx-offset)
+          stored (kernel-store-u8-4k tx 4096 tx-offset value)]
+      (if (= (+ (kernel-load-u8-4k tx 4096 tx-offset) (* 0 stored)) value)
+        (copy-frame-bytes tx rx (+ tx-offset 1) (+ rx-offset 1) (- count 1))
+        0))))
+
+(defn store-be16 [frame offset value]
+  (let [hi (kernel-store-u8-4k frame 4096 offset
+                               (bit-and (quot value 256) 255))
+        lo (kernel-store-u8-4k frame 4096 (+ offset 1)
+                               (bit-and value 255))]
+    (if (and (= (kernel-load-u8-4k frame 4096 offset)
+                (bit-and (quot value 256) 255))
+             (= (kernel-load-u8-4k frame 4096 (+ offset 1))
+                (bit-and value 255))
+             (= 0 (* 0 (+ hi lo))))
+      value
+      0)))
+
+(defn store-be32 [frame offset value]
+  (let [b0 (kernel-store-u8-4k frame 4096 offset
+                               (bit-and (quot value 16777216) 255))
+        b1 (kernel-store-u8-4k frame 4096 (+ offset 1)
+                               (bit-and (quot value 65536) 255))
+        b2 (kernel-store-u8-4k frame 4096 (+ offset 2)
+                               (bit-and (quot value 256) 255))
+        b3 (kernel-store-u8-4k frame 4096 (+ offset 3)
+                               (bit-and value 255))
+        ok (and (= (kernel-load-u8-4k frame 4096 offset)
+                   (bit-and (quot value 16777216) 255))
+                (= (kernel-load-u8-4k frame 4096 (+ offset 1))
+                   (bit-and (quot value 65536) 255))
+                (= (kernel-load-u8-4k frame 4096 (+ offset 2))
+                   (bit-and (quot value 256) 255))
+                (= (kernel-load-u8-4k frame 4096 (+ offset 3))
+                   (bit-and value 255))
+                (= 0 (* 0 (+ b0 b1 b2 b3))))]
+    (if ok value 0)))
+
+(defn zero-prefix [frame bytes offset]
+  (if (= offset bytes)
+    1
+    (let [stored (kernel-store-u8-4k frame 4096 offset 0)]
+      (if (= (+ (kernel-load-u8-4k frame 4096 offset) (* 0 stored)) 0)
+        (zero-prefix frame bytes (+ offset 1))
+        0))))
+
+;; payload: short fixed ASCII; a richer kprintf comes later. (placeholder
+;; single byte 'Z'; the stream netlog body is the richer format.)
+
+;; Two lengths that must not be confused. The IPv4 total-length field counts
+;; the IP header and everything after it; the value handed to tx-submit counts
+;; the Ethernet header as well. The first revision of this function wrote the
+;; FRAME length (43) into the IP total-length field, where 29 belongs, and
+;; baked a checksum consistent with that wrong value. The Mac still delivered
+;; it, because the RTL8125 pads every frame to 60 bytes and 43 fits inside the
+;; 46-byte Ethernet payload that arrives -- so ip_input trimmed rather than
+;; rejected. That is luck, not correctness: it stops being true the moment the
+;; payload grows past 17 bytes, and it would have shown up as a debug plane
+;; that works until you ask it to say something.
+(def ip-total-length 29)                       ; 20 ip + 8 udp + 1 payload
+(def frame-total-length 43)                    ; + 14 ethernet
+
+;; Two destinations, because a broadcast Ethernet frame carrying a UNICAST IP
+;; destination is a shape BSD's ip_input rejects, and that may be why the plane
+;; has never been heard: the frames leave the NIC (the engine clears OWN) and
+;; en8's counter moves during a boot, yet nothing is delivered. One boot
+;; discriminates: 'Z' goes to 10.10.10.1 exactly as before, 'B' goes to the
+;; limited broadcast 255.255.255.255, which no stack can call a unicast in a
+;; broadcast frame. Whichever arrives says which rule bit us -- and if neither
+;; does while the interface counter still moves, the frames are on a wire the
+;; Mac is not on, and the answer is cabling rather than code.
+(def limited-broadcast-ip 4294967295)          ; 255.255.255.255
+;; Header checksums: every other field is constant, so each destination has one
+;; constant too. 0x52BA for 10.10.10.1 (see below), and for 255.255.255.255:
+;;   4500 + 001D + 0000 + 0000 + 4011 + 0A0A + 0A02 + FFFF + FFFF = 993A
+;;   ~993A = 66C5.
+(def ip-checksum-to-mac 21178)                 ; 0x52BA -> 10.10.10.1
+(def ip-checksum-broadcast 26309)              ; 0x66C5 -> 255.255.255.255
+
+(defn build-udp-debug-frame-to [frame mmio payload destination checksum]
+  ;; Bytes 0..5 (the Ethernet destination) belong to the CALLER: broadcast for
+  ;; anything we start, the requester's own MAC for an answer. Zeroing starts
+  ;; at 6 so that choice survives.
+  (if (and (= (zero-prefix frame 60 6) 1)
+           (= (store-device-mac frame mmio 0) 1)
+           (= (store-be16 frame 12 2048) 2048)           ; ethertype IPv4
+           (= 0 (* 0 (kernel-store-u8-4k frame 4096 14 69)))  ; v4/IHL
+           (= (kernel-load-u8-4k frame 4096 14) 69)
+           (= 0 (* 0 (kernel-store-u8-4k frame 4096 15 0)))
+           (= (kernel-load-u8-4k frame 4096 15) 0)
+           (= (store-be16 frame 16 ip-total-length) ip-total-length)
+           (= 0 (* 0 (kernel-store-u8-4k frame 4096 22 64)))  ; TTL
+           (= (kernel-load-u8-4k frame 4096 22) 64)
+           (= 0 (* 0 (kernel-store-u8-4k frame 4096 23 17)))  ; UDP proto
+           (= (kernel-load-u8-4k frame 4096 23) 17)
+           ;; IPv4 header checksum. Every other field of this header is a
+           ;; compile-time constant, so the checksum is one too: 0x52BA, the
+           ;; one's complement of
+           ;;   4500 + 001D + 0000 + 0000 + 4011 + 0000 + 0A0A + 0A02
+           ;;        + 0A0A + 0A01 = AD45.
+           ;; Leaving it zero (what zero-prefix leaves) makes the Mac drop the
+           ;; datagram in ip_input before socat ever sees it -- the same reason
+           ;; rtl8125/build-ipv4-udp-header bakes in its own 0x6619. If
+           ;; ip-total-length ever changes, this constant changes with it.
+           (= (store-be16 frame 24 checksum) checksum)
+           (= (store-be32 frame 26 k16-debug-ip) k16-debug-ip)
+           (= (store-be32 frame 30 destination) destination)
+           (= (store-be16 frame 34 debug-udp-port) debug-udp-port)
+           (= (store-be16 frame 36 debug-udp-port) debug-udp-port)
+           (= (store-be16 frame 38 9) 9)                 ; udp len: 8 + 1
+           (= 0 (* 0 (kernel-store-u8-4k frame 4096 42 payload)))
+           (= (kernel-load-u8-4k frame 4096 42) payload)
+           (= (store-be16 frame 40 0) 0))                ; udp checksum 0
+    frame-total-length
+    0))
+
+(defn build-udp-debug-frame [frame mmio payload]
+  (build-udp-debug-frame-to frame mmio payload mac-debug-ip ip-checksum-to-mac))
+
+(defn debug-phy-byte [mmio index]
+  ;; PHYstatus (MMIO 108) as two bytes, so the kernel can put what the PHY
+  ;; actually reports on the bus2 netlog. link-up reads bit 1 of this register
+  ;; and answered "up" on the first look of every boot, immediately after
+  ;; rings-start reset the chip -- which is either true or a latch. The whole
+  ;; register says which: on an RTL8125 it carries the negotiated speed
+  ;; (10/100/1000/2500), full-duplex, and the link bit together, so a link that
+  ;; is up at a speed nothing else on the wire speaks is visible here and
+  ;; nowhere else.
+  (if (= index 0)
+    (bit-and (quot (kernel-load-u16 mmio 512 108) 256) 255)
+    (bit-and (kernel-load-u16 mmio 512 108) 255)))
+
+(defn debug-frame-byte [dma-pages index]
+  ;; One byte of the LAST frame built in the bus3 TX buffer. The Mac counts a
+  ;; bad IPv4 header checksum for exactly two frames per boot -- the two
+  ;; greetings -- so the header it receives is not the header this file thinks
+  ;; it writes, and the only way to settle that is to put the bytes on the wire.
+  (bit-and (kernel-load-u8-4k (kernel-subregion dma-pages 16384 8192 4096)
+                              4096 index)
+           255))
+
+(defn debug-mac-byte [mmio index]
+  ;; One byte of IDR0..5, so the kernel can put bus3's MAC on the bus2 netlog.
+  ;; The Mac needs it: this module answers UDP but not ARP, so nothing on the
+  ;; wire can resolve 10.10.10.2 without being told. An ARP responder here
+  ;; would remove the need, and is the obvious next slice.
+  (bit-and (kernel-load-u8 mmio 512 index) 255))
+
+;; ── ARP on bus3 ──────────────────────────────────────────────────────────
+;; 28-byte ARP body after a 14-byte Ethernet header; the wire frame is padded
+;; to 60 either way, and we send 60 so the padding is ours and deterministic
+;; rather than whatever the NIC leaves in the buffer.
+(def arp-ethertype 2054)                       ; 0x0806
+(def arp-opcode-request 1)
+(def arp-opcode-reply 2)
+(def arp-frame-length 60)
+
+(defn build-arp-common [frame mmio opcode]
+  ;; Everything an ARP frame of ours carries whichever direction it goes:
+  ;; our MAC as the Ethernet source AND as the ARP sender, our IP as the ARP
+  ;; sender IP, and the fixed ethernet/IPv4 shape.
+  (if (and (= (store-mac-at frame mmio 6 0) 1)
+           (= (store-be16 frame 12 arp-ethertype) arp-ethertype)
+           (= (store-be16 frame 14 1) 1)               ; HTYPE ethernet
+           (= (store-be16 frame 16 2048) 2048)         ; PTYPE IPv4
+           (= 0 (* 0 (kernel-store-u8-4k frame 4096 18 6)))
+           (= (kernel-load-u8-4k frame 4096 18) 6)     ; HLEN
+           (= 0 (* 0 (kernel-store-u8-4k frame 4096 19 4)))
+           (= (kernel-load-u8-4k frame 4096 19) 4)     ; PLEN
+           (= (store-be16 frame 20 opcode) opcode)
+           (= (store-mac-at frame mmio 22 0) 1)        ; sender MAC = ours
+           (= (store-be32 frame 28 k16-debug-ip) k16-debug-ip))
+    1
+    0))
+
+(defn build-arp-request-frame [frame mmio]
+  ;; "Who has 10.10.10.1? Tell 10.10.10.2", broadcast. Addressed TO the Mac,
+  ;; because a BSD stack records the sender of an ARP aimed at one of its own
+  ;; addresses; a gratuitous announcement for our own IP would not create the
+  ;; entry that is missing.
+  (if (and (= (zero-prefix frame arp-frame-length 0) 1)
+           (= (store-broadcast-mac frame 0 0) 1)
+           (= (build-arp-common frame mmio arp-opcode-request) 1)
+           (= (store-be32 frame 38 mac-debug-ip) mac-debug-ip))
+    arp-frame-length
+    0))
+
+(defn build-arp-reply-frame [tx rx mmio]
+  ;; Answer the requester with its own address pair reflected back.
+  (if (and (= (zero-prefix tx arp-frame-length 0) 1)
+           (= (copy-frame-bytes tx rx 0 6 6) 1)        ; eth dst = requester
+           (= (build-arp-common tx mmio arp-opcode-reply) 1)
+           (= (copy-frame-bytes tx rx 32 6 6) 1)       ; target MAC
+           (= (copy-frame-bytes tx rx 38 28 4) 1))     ; target IP
+    arp-frame-length
+    0))
+
+(defn arp-request-for-us [frame bytes]
+  ;; Positional, like control-frame-valid: an ARP request whose target
+  ;; protocol address is 10.10.10.2. Anything else on this wire is not ours.
+  (and (>= bytes 42)
+       (= (kernel-load-u8-4k frame 4096 12) 8)         ; 0x0806
+       (= (kernel-load-u8-4k frame 4096 13) 6)
+       (= (kernel-load-u8-4k frame 4096 20) 0)         ; opcode 1 = request
+       (= (kernel-load-u8-4k frame 4096 21) 1)
+       (= (kernel-load-u8-4k frame 4096 38) 10)        ; target 10.10.10.2
+       (= (kernel-load-u8-4k frame 4096 39) 10)
+       (= (kernel-load-u8-4k frame 4096 40) 10)
+       (= (kernel-load-u8-4k frame 4096 41) 2)))
+
+(defn submit-bus3-frame [mmio dma-pages len]
+  ;; The TX half of debug-send-byte, over a frame someone else built. Same
+  ;; status codes, so 0 keeps meaning exactly one thing: bytes left the NIC.
+  (if (= len 0)
+    1
+    (let [tx (kernel-subregion dma-pages 16384 0 4096)
+          tx-frame (kernel-subregion dma-pages 16384 8192 4096)
+          submitted (rtl/tx-submit mmio tx tx-frame len)]
+      (if (= submitted 5)
+        5
+        (if (not (= submitted 0))
+          3
+          (if (= (rtl/wait-tx-complete tx 200000000) 0) 4 0))))))
+
+(defn announce-arp [mmio dma-pages]
+  (let [tx-frame (kernel-subregion dma-pages 16384 8192 4096)]
+    (submit-bus3-frame mmio dma-pages
+                       (build-arp-request-frame tx-frame mmio))))
+
+(defn answer-arp [mmio dma-pages rx-frame]
+  ;; Built and submitted BEFORE the RX descriptor is re-armed: the requester's
+  ;; address pair lives in that buffer, and a re-arm hands it back to the NIC.
+  (let [tx-frame (kernel-subregion dma-pages 16384 8192 4096)]
+    (submit-bus3-frame mmio dma-pages
+                       (build-arp-reply-frame tx-frame rx-frame mmio))))
+
+(defn debug-init [bus mmio dma-pages]
+  ;; Bring bus3 to the same footing `rtl/qualify` gives bus2, then install a
+  ;; single TX ring and leave the engine running. Each refusal has its own
+  ;; code so the kernel's netlog says WHICH prerequisite failed:
+  ;;   0  ready
+  ;;   9  the device would not report MEM-SPACE|BUS-MASTER after the write
+  ;;   7  IDR0..5 is not a plausible unicast MAC
+  ;;   2  ChipCmd revision unreadable (the BAR does not read back)
+  ;;   8  PHY reports no link -- a submit here is owned forever
+  ;;   10+n  rtl/rings-start refused with n (4 fifo, 1 install)
+  ;;   16+n  the ring is up but the ARP request did not go out (n from
+  ;;         submit-bus3-frame). The plane still works in the outbound
+  ;;         direction, so this is not a refusal to start -- but the Mac may
+  ;;         not be able to reach us, and that must not read as ready.
+  (if (= (rtl/arm-bus-master bus) 0)
+    9
+    (if (not (rtl/mac-valid mmio))
+      7
+      (let [revision-id (rtl/revision mmio)]
+        (if (= revision-id 0)
+          2
+          (let [started (rtl/rings-start mmio revision-id dma-pages)]
+            (if (not (= started 0))
+              (+ 10 started)
+              (if (= (rtl/link-up mmio) 0)
+                8
+                (let [announced (announce-arp mmio dma-pages)]
+                  (if (= announced 0) 0 (+ 16 announced)))))))))))
+
+(defn debug-send-byte [mmio dma-pages payload]
+  ;; Single-shot UDP :9000 datagram on bus3, BROADCAST at the Ethernet layer
+  ;; (see the note above store-mac-at). Statuses:
+  ;;   0  the descriptor was submitted AND the engine cleared OWN
+  ;;   1  the frame could not be built
+  ;;   5  the descriptor was still owned, or the wire length was rejected
+  ;;   3  a descriptor store did not read back
+  ;;   4  submitted, but OWN never cleared -- the engine is not consuming
+  ;; 0 must mean exactly one thing: bytes left the NIC.
+  (let [tx-frame (kernel-subregion dma-pages 16384 8192 4096)]
+    (if (= (store-broadcast-mac tx-frame 0 0) 1)
+      (submit-bus3-frame mmio dma-pages
+                         (build-udp-debug-frame tx-frame mmio payload))
+      1)))
+
+(defn answer-byte [mmio dma-pages payload]
+  ;; The reply to a command. debug-poll has already copied the requester's MAC
+  ;; into bytes 0..5 of this frame, from the request, before re-arming the RX
+  ;; descriptor -- so this answers whoever asked rather than a constant.
+  (let [tx-frame (kernel-subregion dma-pages 16384 8192 4096)]
+    (submit-bus3-frame mmio dma-pages
+                       (build-udp-debug-frame tx-frame mmio payload))))
+
+(defn broadcast-byte [mmio dma-pages payload]
+  ;; Ethernet broadcast AND IP limited broadcast: the shape no stack can refuse
+  ;; on the grounds that a unicast address arrived in a broadcast frame.
+  (let [tx-frame (kernel-subregion dma-pages 16384 8192 4096)]
+    (if (= (store-broadcast-mac tx-frame 0 0) 1)
+      (submit-bus3-frame mmio dma-pages
+                         (build-udp-debug-frame-to tx-frame mmio payload
+                                                   limited-broadcast-ip
+                                                   ip-checksum-broadcast))
+      1)))
+
+;; ── does this ring work at all? ──────────────────────────────────────────
+;; Measured 2026-09-08: bus3 reports the ring up, the link up, and every frame
+;; consumed by the engine (OWN cleared), and NOTHING arrives at the Mac in
+;; either direction -- 199 broadcasts on each of the Mac's two wires produced
+;; no receive event across ten boots. Either the cable is not where we think,
+;; or these rings do not work and every status has been a plausible lie.
+;;
+;; MAC loopback (TxConfig bits 17|18, the r8169 driver's TxLoopBack) hands a
+;; transmitted frame straight back to the receiver inside the MAC: no PHY, no
+;; cable, no peer. If the frame comes back, the descriptors, the DMA addresses
+;; and both engines are correct and the fault is outside this board. If it does
+;; not, the fault is ours and no amount of cabling will fix it.
+(def tx-loopback-bits 393216)                  ; (1 << 17) | (1 << 18)
+
+(defn loopback-selftest [mmio-parent mmio-bytes dma-parent dma-bytes]
+  ;; 0  the frame came back -- rings, DMA and both engines work
+  ;; 1  the frame could not be built
+  ;; 2  the transmit did not complete
+  ;; 3  the transmit completed but nothing was received
+  ;; 4  received, but the re-arm for normal operation failed
+  ;; This retained diagnostic has no boot caller. Declare its two region
+  ;; pairs explicitly, then narrow them; an absent call cannot infer sizes.
+  (let [mmio (kernel-subregion mmio-parent mmio-bytes 0 512)
+        dma-pages (kernel-subregion dma-parent dma-bytes 0 16384)
+        rx (kernel-subregion dma-pages 16384 4096 4096)
+        rx-frame (kernel-subregion dma-pages 16384 12288 4096)
+        tx-frame (kernel-subregion dma-pages 16384 8192 4096)
+        saved (kernel-load-u32 mmio 512 64)
+        looped (kernel-store-u32 mmio 512 64 (bit-or saved tx-loopback-bits))
+        fenced (dma/release-fence)
+        built (if (= (store-broadcast-mac tx-frame 0 0) 1)
+                (build-udp-debug-frame-to tx-frame mmio 76      ; 'L'
+                                          limited-broadcast-ip
+                                          ip-checksum-broadcast)
+                0)
+        sent (if (= built 0) 1 (submit-bus3-frame mmio dma-pages built))
+        ;; The frame is handed back inside the MAC, so it is there by the time
+        ;; the transmit completes; a bounded look is still bounded.
+        seen (if (= sent 0) (rtl/wait-rx-command rx 1000000) 0)
+        restored (kernel-store-u32 mmio 512 64 (+ saved (* 0 (+ looped fenced))))
+        settled (dma/release-fence)
+        rearmed (rtl/rx-rearm rx rx-frame)]
+    (if (= built 0)
+      (+ 1 (* 0 (+ restored settled rearmed)))
+      (if (not (= sent 0))
+        (+ 2 (* 0 (+ restored settled rearmed)))
+        (if (= seen 0)
+          (+ 3 (* 0 (+ restored settled rearmed)))
+          (if (= rearmed 0) 4 0))))))
+
+(defn wait-link [mmio remaining]
+  ;; Polls left when the PHY came up, 0 if it never did. rings-start resets the
+  ;; chip, and a gigabit PHY renegotiates in SECONDS -- while this kernel's
+  ;; whole run is about twelve milliseconds. link-up reads PHYstatus once, and
+  ;; a frame submitted into a PHY that has not finished negotiating is dropped
+  ;; by the MAC with the descriptor still completing: exactly the "everything
+  ;; reports success and nothing arrives" this plane has shown all day. The
+  ;; loopback self-test passes through it because loopback never reaches a PHY.
+  (if (= (rtl/link-up mmio) 1)
+    remaining
+    (if (= remaining 0)
+      0
+      (let [paused (kernel-pause)]
+        (+ (wait-link mmio (- remaining 1)) (* 0 paused))))))
+
+(defn link-bucket [mmio]
+  ;; 0 up on the first look · 1 within 1,000 polls · 2 within 200,000
+  ;; · 3 still down after 200,000. One byte, four answers, and the greeting
+  ;; below is sent only after this has looked.
+  (let [left (wait-link mmio 200000)]
+    (if (= left 200000)
+      0
+      (if (= left 0)
+        3
+        (if (> left 199000) 1 2)))))
+
+(defn debug-send [mmio dma-pages]
+  ;; Wait for the PHY, then both greeting shapes, once per boot. Returns
+  ;;   (64 * link-bucket) + (8 * Z-status) + B-status
+  ;; so 0 still means everything worked and the link was already up. The
+  ;; loopback self-test answered its question on 2026-09-08 -- rings, DMA and
+  ;; both engines are correct, 0 on every boot -- so its slot now carries the
+  ;; question that remains.
+  (let [l (link-bucket mmio)
+        z (debug-send-byte mmio dma-pages 90)        ; 'Z' -> 10.10.10.1
+        b (broadcast-byte mmio dma-pages 66)]        ; 'B' -> 255.255.255.255
+    (+ (* 64 l) (* 8 z) b)))
+
+;; ── LAN2 control: receive ────────────────────────────────────────────────
+;; rtl/rings-start already installed and armed ONE RX descriptor on bus3
+;; (ring at dma-pages+4096, buffer at dma-pages+12288, capacity 2048). Until
+;; now nothing read it, which is why bus3 was output-only.
+;;
+;; What follows accepts frames off a wire, so it is written to grant NOTHING
+;; here. The command set is closed, every command is answered with a single
+;; byte, and no code in this module stores anywhere except its own TX frame.
+;; ONE command changes the machine -- 'R' (reboot, owner decision 2026-09-08:
+;; LAN2 carries control so nobody presses the power button) -- and even that
+;; one is not executed here: debug-tick answers 'r' and returns 80+n, and the
+;; caller (tcp-stream/stream-resident, which owns the bus2 netlog) logs DB and
+;; writes 0x06 to 0xCF9, the same write the run end does after DE. Anything
+;; beyond a platform reset needs the admission discipline the rest of this OS
+;; uses, and that is a separate decision, not a bigger switch statement.
+
+(defn debug-frame-valid [frame bytes]
+  ;; eth 14 + ip 20 + udp 8 + at least one payload byte, checked positionally
+  ;; against the fixed debug 4-tuple. A frame that is not exactly this is not
+  ;; ours. Says nothing about the payload's LENGTH -- see control-frame-valid.
+  (and (>= bytes 43)
+       (= (kernel-load-u8-4k frame 4096 12) 8)     ; ethertype 0x0800
+       (= (kernel-load-u8-4k frame 4096 13) 0)
+       (= (kernel-load-u8-4k frame 4096 14) 69)    ; IPv4, IHL 20
+       (= (kernel-load-u8-4k frame 4096 23) 17)    ; UDP
+       (= (kernel-load-u8-4k frame 4096 30) 10)    ; dst 10.10.10.2
+       (= (kernel-load-u8-4k frame 4096 31) 10)
+       (= (kernel-load-u8-4k frame 4096 32) 10)
+       (= (kernel-load-u8-4k frame 4096 33) 2)
+       (= (kernel-load-u8-4k frame 4096 36) 35)    ; dst port 9000 = 0x2328
+       (= (kernel-load-u8-4k frame 4096 37) 40)))
+
+(defn control-frame-valid [frame bytes]
+  ;; A ONE-BYTE command, and exactly that: the UDP length field must read 9
+  ;; (8 header + 1 payload). Without this the plane answered '?' to every
+  ;; multi-byte line on the wire -- measured 2026-09-08, the Mac's own
+  ;; 55-byte AIUEOS_NODE_ACK_V1 came back as a 0x3f on every boot, because
+  ;; the first payload byte of that line is 'A' and 'A' is not P or R. The
+  ;; NIC pads short frames to 60, so the descriptor's byte count cannot tell
+  ;; a one-byte datagram from a 46-byte one; the UDP length field can.
+  (and (debug-frame-valid frame bytes)
+       (= (relay/frame-be16 frame 38) 9)))
+
+(defn debug-poll [mmio dma-pages]
+  ;; ONE non-blocking look (rtl/wait-rx-command with a zero budget reads the
+  ;; descriptor once and returns 0 if the NIC still owns it). The descriptor
+  ;; is re-armed on every path that consumed it, so a frame we ignore does not
+  ;; wedge the ring.
+  ;;   0        nothing arrived
+  ;;   1        a frame arrived, but it is not ours (re-armed, dropped)
+  ;;   2        a frame arrived and the re-arm failed -- the ring is now dead
+  ;;   16+n     an ARP request for 10.10.10.2 was answered (n from
+  ;;            submit-bus3-frame; 16 means the reply left the NIC)
+  ;;   128+cmd  a well-formed control datagram carrying command byte cmd
+  (let [rx (kernel-subregion dma-pages 16384 4096 4096)
+        rx-frame (kernel-subregion dma-pages 16384 12288 4096)
+        command (rtl/wait-rx-command rx 0)]
+    (if (= command 0)
+      0
+      (let [bytes (bit-and command 16383)
+            valid-command (and (= (bit-and command 1048576) 0)
+                               (not (= (bit-and command 33554432) 0))
+                               (not (= (bit-and command 16777216) 0))
+                               (>= bytes 22) (<= bytes 2048))
+            arp (if (and valid-command
+                         (arp-request-for-us rx-frame (- bytes 4)))
+                  1
+                  0)
+            ;; Answered here rather than in debug-tick because the reply is
+            ;; built FROM this buffer and the re-arm below gives it back.
+            answered (if (= arp 1) (answer-arp mmio dma-pages rx-frame) 0)
+            ;; A job request passes control-frame-valid too -- it is the same
+            ;; 4-tuple -- and its first payload byte is 'A', which would have
+            ;; been answered with '?' as an unrecognised one-byte command. So
+            ;; the job shape is tested FIRST and excluded from `payload`.
+            job (if (and valid-command
+                         (= arp 0)
+                         (debug-frame-valid rx-frame (- bytes 4))
+                         (= (relay/template-match rx-frame 42 4 0
+                                                  (text/job-prefix-length)) 1))
+                  1
+                  0)
+            ;; The datagram's own UDP length, not the descriptor's byte count:
+            ;; the NIC pads every frame to 60 and the tail of a short line
+            ;; would otherwise be read as prompt.
+            job-length (if (= job 0)
+                         0
+                         (let [n (- (relay/frame-be16 rx-frame 38) 8)]
+                           (if (< n 2) 0 (if (> n 255) 0 n))))
+            ;; Staged BEFORE the re-arm below hands this buffer to the NIC.
+            staged (if (= job-length 0)
+                     0
+                     (let [tx (kernel-subregion dma-pages 16384 8192 4096)]
+                       (if (and (= (relay/store-byte tx staged-length-offset
+                                                     job-length) 1)
+                                (= (copy-frame-bytes tx rx-frame 0 6 6) 1)
+                                (= (relay/copy-bytes tx rx-frame
+                                                     staged-payload-offset 42
+                                                     job-length) 1))
+                         1
+                         0)))
+            payload (if (and valid-command
+                             (= arp 0)
+                             (= job 0)
+                             (control-frame-valid rx-frame (- bytes 4)))
+                      (bit-and (kernel-load-u8-4k rx-frame 4096 42) 127)
+                      0)
+            ;; The answer goes back to whoever asked. Copied HERE because the
+            ;; re-arm below hands the request's buffer back to the NIC.
+            reply-to (if (= payload 0)
+                       1
+                       (copy-frame-bytes
+                        (kernel-subregion dma-pages 16384 8192 4096)
+                        rx-frame 0 6 6))
+            rearmed (rtl/rx-rearm rx rx-frame)]
+        (if (= rearmed 0)
+          2
+          (if (= arp 1)
+            (+ 16 answered)
+            (if (= job 1)
+              ;; 512 = a job request is staged and ready to be answered.
+              ;; 8 = it was a job request whose staging failed, which is NOT
+              ;; the same as "not ours" and must not be reported as one.
+              (if (= staged 1) 512 8)
+              (if (= payload 0)
+                1
+                (if (= reply-to 1) (+ 128 payload) 1)))))))))
+
+
+;; ── the murakumo relay on bus3 ───────────────────────────────────────────
+;; Everything above this line moves ONE byte. A job request and its answer are
+;; ASCII lines of 91..205 bytes, so they need a datagram whose length is not a
+;; compile-time constant -- which means the IPv4 header checksum is not one
+;; either. `relay/header-checksum` computes it; the two baked constants above
+;; stay for the one-byte plane they were derived for.
+;;
+;; The staged request lives at tx-frame offset 2048, well past the 205 bytes a
+;; frame can occupy, because `debug-poll` must hand the RX buffer back to the
+;; NIC before anything is parsed out of it. Byte 2047 carries the staged
+;; length. The requester's own MAC is copied to bytes 0..5 in the same breath,
+;; so the answer goes back to whoever asked rather than to a constant.
+(def staged-length-offset 2047)
+(def staged-payload-offset 2048)
+;; "AIUEOS_JOB_V1 boot=" (19) + 16 hex + " " + "id=" (3) = 39.
+(def staged-id-offset 2087)
+;; "AIUEOS_NODE_PING_V1 boot=" (25) + 16 hex + " seq=" (5) = 46. Kept for the
+;; PONG slice, which does not fit in the lowered-program budget today.
+(def staged-seq-offset 2094)
+
+(defn build-line-frame [frame mmio payload-length destination]
+  ;; eth 14 + ip 20 + udp 8 + `payload-length`, with the payload ALREADY at
+  ;; offset 42 and the Ethernet destination already at 0..5. Returns the wire
+  ;; length, or 0 if any field did not read back.
+  (if (and (= (zero-prefix frame 42 6) 1)
+           (= (store-device-mac frame mmio 0) 1)
+           (= (store-be16 frame 12 2048) 2048)
+           (= 0 (* 0 (kernel-store-u8-4k frame 4096 14 69)))     ; v4/IHL 20
+           (= (kernel-load-u8-4k frame 4096 14) 69)
+           (= (store-be16 frame 16 (+ 28 payload-length)) (+ 28 payload-length))
+           (= 0 (* 0 (kernel-store-u8-4k frame 4096 22 64)))     ; TTL
+           (= (kernel-load-u8-4k frame 4096 22) 64)
+           (= 0 (* 0 (kernel-store-u8-4k frame 4096 23 17)))     ; UDP
+           (= (kernel-load-u8-4k frame 4096 23) 17)
+           (= (store-be32 frame 26 k16-debug-ip) k16-debug-ip)
+           (= (store-be32 frame 30 destination) destination)
+           (= (store-be16 frame 34 debug-udp-port) debug-udp-port)
+           (= (store-be16 frame 36 debug-udp-port) debug-udp-port)
+           (= (store-be16 frame 38 (+ 8 payload-length)) (+ 8 payload-length)))
+    ;; The checksum is computed LAST, over a header whose own field zero-prefix
+    ;; left at zero. Getting this wrong is invisible from here -- the Mac drops
+    ;; the datagram in ip_input and both ends still read as healthy.
+    (let [sum (relay/header-checksum frame 14)]
+      (if (= (store-be16 frame 24 sum) sum)
+        (+ 42 payload-length)
+        0))
+    0))
+
+(defn send-hello-line [mmio dma-pages boot]
+  ;; AIUEOS_NODE_HELLO_V1, broadcast. This is what starts the relay: the Mac
+  ;; matches it, enrolls the node, and only then enqueues a job.
+  ;;   0  the line left the NIC
+  ;;   1  the line could not be written
+  ;;   2  the header could not be built
+  ;;   3+n  submit refused (n from submit-bus3-frame)
+  (let [tx (kernel-subregion dma-pages 16384 8192 4096)]
+    (if (and (= (store-broadcast-mac tx 0 0) 1)
+             (= (relay/store-template tx 42 0 0 (text/template-length 0)) 1)
+             (= (relay/store-hex tx (+ 42 (text/hello-boot-offset)) boot 16) 1)
+             (= (relay/store-mac-hex tx (+ 42 (text/hello-mac-offset)) mmio 0) 1))
+      (let [len (build-line-frame tx mmio (text/template-length 0)
+                                  limited-broadcast-ip)]
+        (if (= len 0)
+          2
+          (let [sent (submit-bus3-frame mmio dma-pages len)]
+            (if (= sent 0) 0 (+ 3 sent)))))
+      1)))
+
+(defn answer-job-line [mmio dma-pages boot]
+  ;; Read the staged AIUEOS_JOB_V1, run aiueos-char-bigram-v1 over its prompt,
+  ;; and answer AIUEOS_JOB_RESULT_V1 to the MAC the request came from.
+  ;;   0   the answer left the NIC
+  ;;   1   the request is not the shape the relay sends
+  ;;   2   the prompt is empty or carries something outside " a-z"
+  ;;   3   the transition row is empty -- no next token (the C reference's
+  ;;       `!total || !score` refusal)
+  ;;   4   the answer could not be written
+  ;;   5   the header could not be built
+  ;;   6+n submit refused (n from submit-bus3-frame)
+  (let [tx (kernel-subregion dma-pages 16384 8192 4096)
+        total (kernel-load-u8-4k tx 4096 staged-length-offset)
+        id-len (relay/digits-run tx staged-id-offset 20 0)
+        middle-at (+ staged-id-offset id-len)
+        hex-at (+ middle-at (text/job-middle-length))
+        hex-len (- (+ staged-payload-offset total) hex-at)]
+    (if (not (and (> id-len 0)
+                  (>= hex-len 2)
+                  (= (relay/template-match tx middle-at 5 0
+                                           (text/job-middle-length)) 1)))
+      1
+      (let [vocab (relay/prompt-scan tx hex-at hex-len 27)]
+        (if (= vocab 27)
+          2
+          ;; The TSC delta across the reduction is what the contract calls
+          ;; :native-compute :serialized-tsc-cycle-delta. It is the only number
+          ;; in the answer the Mac cannot predict, which is precisely why it is
+          ;; there -- and it is NOT a wall time until the TSC frequency is
+          ;; measured, as the contract also says.
+          (let [started (kernel-rdtsc)
+                row (mi/micro-infer-row vocab)
+                elapsed (- (kernel-rdtsc) started)
+                cycles (if (< elapsed 0)
+                         0
+                         (if (> elapsed 9999999999999999) 9999999999999999 elapsed))]
+            (if (= row 0)
+              3
+              (let [tail-at (+ 42 (+ (text/result-head-length) id-len))
+                    payload-length (+ (text/result-head-length)
+                                      (+ id-len (text/result-tail-length)))]
+                (if (not (and (= (relay/store-template tx 42 1 0
+                                                       (text/result-head-length)) 1)
+                              (= (relay/store-hex tx (+ 42 (text/result-boot-offset))
+                                                  boot 16) 1)
+                              (= (relay/copy-bytes tx tx
+                                                   (+ 42 (text/result-head-length))
+                                                   staged-id-offset id-len) 1)
+                              (= (relay/store-template tx tail-at 2 0
+                                                       (text/result-tail-length)) 1)
+                              (= (relay/store-hex tx (+ tail-at (text/result-token-offset))
+                                                  (mi/micro-infer-token row) 2) 1)
+                              (= (relay/store-dec tx (+ tail-at (text/result-score-offset))
+                                                  (mi/micro-infer-score row) 2) 1)
+                              (= (relay/store-dec tx (+ tail-at (text/result-total-offset))
+                                                  (mi/micro-infer-total row) 2) 1)
+                              (= (relay/store-dec tx (+ tail-at (text/result-cycles-offset))
+                                                  cycles 16) 1)))
+                  4
+                  (let [len (build-line-frame tx mmio payload-length mac-debug-ip)]
+                    (if (= len 0)
+                      5
+                      (let [sent (submit-bus3-frame mmio dma-pages len)]
+                        (if (= sent 0) 0 (+ 6 sent))))))))))))))
+
+(defn debug-hello [dma-pages boot]
+  ;; Resolve bus3's BAR and announce the node once. 3 = the BAR no longer
+  ;; decodes, which must not read as "sent".
+  (let [bar (rtl/bar-for-bus 3)]
+    (if (= bar 0)
+      3
+      (send-hello-line (kernel-pci-mmio 3 0 0 bar 512)
+                       dma-pages boot))))
+
+(defn debug-tick [dma-pages boot]
+  ;; Poll once, answer at most once. Returns what the kernel logs:
+  ;;   0        nothing arrived
+  ;;   1        a frame arrived that was not ours
+  ;;   2        the RX ring is dead (re-arm failed)
+  ;;   16+n     an ARP request for 10.10.10.2 was answered (debug-poll)
+  ;;   64+n     'P' (ping) answered with 'p'; n is the send status
+  ;;   80+n     'R' (reboot) answered with 'r'; n is the send status. The
+  ;;            answer goes out FIRST (debug-send-byte waits for TX completion,
+  ;;            so the Mac holds the 'r' before the board goes away); the reset
+  ;;            itself is the caller's, after its bus2 receipt (DB). This
+  ;;            function has no bus2 handle and must not reset behind it.
+  ;;   96+n     an unrecognised command answered with '?'; n is the send status
+  ;;   8        a job request arrived and could not be staged
+  ;;   (48+n is reserved for the PONG this cannot yet carry: the kernel is at
+  ;;    the native frontend's hard 100,000-node lowered-program budget, and
+  ;;    answer-ping-line put it over. Measured 2026-09-08; the templates and
+  ;;    relay/decimal-value are in place for it.)
+  ;;   112+n    an AIUEOS_JOB_V1 was answered; n is answer-job-line's status,
+  ;;            0..11, so 112 means the result line left the NIC and 113..123
+  ;;            say where it stopped. Deliberately above 103 so it collides
+  ;;            with nothing already on this wire.
+  ;; The three one-byte answered cases are 64..71, 80..87 and 96..103, so no
+  ;; encoding collides (n is 0..5, see debug-send-byte).
+  ;;
+  ;; This resolves its own MMIO rather than taking it: the native ABI caps a
+  ;; function at five parameters, and the resident loop was already at five.
+  ;; Two PCI config reads per cycle is nothing beside a full connect plus a
+  ;; receive window -- and it means the loop carries one bus3 value, not two.
+  ;;   3        bus3's BAR no longer decodes -- this used to return 0, the same
+  ;;            value as "nothing arrived", and that conflation is why a silent
+  ;;            receive path could not be told from an absent one (2026-09-08).
+  (let [bar (rtl/bar-for-bus 3)]
+    (if (= bar 0)
+      3
+      (let [mmio (kernel-pci-mmio 3 0 0 bar 512)
+            seen (debug-poll mmio dma-pages)]
+        (if (= seen 512)
+          (+ 112 (answer-job-line mmio dma-pages boot))
+          (if (< seen 128)
+            seen
+            (if (= (- seen 128) 80)                     ; 'P'
+              (+ 64 (answer-byte mmio dma-pages 112))     ; 'p'
+              (if (= (- seen 128) 82)                   ; 'R'
+                (+ 80 (answer-byte mmio dma-pages 114))   ; 'r'
+                (+ 96 (answer-byte mmio dma-pages 63))))))))))  ; '?'

@@ -1,0 +1,121 @@
+;; Does this CPU support the `syscall`/`sysret` instruction pair?
+;;
+;; The second of the three objects replacing this kernel's six `cpuid` sites --
+;; see `cpu-feature-nx.kotoba` for why there are three of them, why each bakes
+;; in its own leaf and bit rather than taking them as arguments, and why the
+;; max-extended-leaf guard below is duplicated rather than shared.
+;;
+;; SAME LEAF, DIFFERENT BIT
+;;
+;; This object and `cpu-feature-nx` differ in exactly one constant: both query
+;; leaf 0x80000001 behind the same guard, and this one tests EDX bit 11 (SCE,
+;; SYSCALL/SYSRET) where that one tests bit 20 (NX). That is precisely why the
+;; two must not be merged into one object with a "which bit" argument -- the
+;; only thing separating "may this kernel use `syscall`" from "may this kernel
+;; set PTE_NX" would be an integer chosen at a C call site, which is the magic
+;; number these objects exist to delete.
+;;
+;; THE DUPLICATED GUARD
+;;
+;; `(>= (kernel-cpuid-eax 2147483648 0) 2147483649)` appears here and in
+;; `cpu-feature-nx`, character for character, and that is NECESSARY rather than
+;; sloppy: objects in this profile cannot call one another. Each is separately
+;; compiled and separately linked with its own `.data` context and its own fuel
+;; counter, and the subset has no import form, so a shared
+;; `max-extended-leaf` helper would be a fourth object with no way to reach it
+;; from inside these two. Written twice, on purpose.
+;;
+;; Without it, a CPU implementing no extended leaves answers leaf 0x80000001
+;; with the highest BASIC leaf's data -- not zeroes, not a fault -- and bit 11
+;; of that unrelated EDX would decide whether this kernel installs a syscall
+;; transport. The nesting keeps it a real branch: when the guard fails, the
+;; second `cpuid` is not executed.
+;;
+;; SIGNEDNESS
+;;
+;; Identical to `cpu-feature-nx`, and the reasoning is reproduced here rather
+;; than referenced because it is the thing most likely to be got wrong by
+;; someone editing one of these files without the other open:
+;;
+;;   `(>= eax 2147483649)` is a SIGNED i64 comparison; the C it replaces
+;;   compared two `uint32_t` UNSIGNED. They agree because a `cpuid` result
+;;   cannot be negative as an i64: `cpuid` writes 32-bit registers, a 32-bit
+;;   destination write zeroes bits 63:32, and the backend's result move is a
+;;   32-bit `mov` that re-establishes the same property. Every
+;;   `kernel-cpuid-*` value therefore arrives in [0, 2^32), non-negative, with
+;;   no mask needed. And 2147483649 = 0x80000001 is positive as an i64 only
+;;   because it is read with a known-zero upper half -- as a 32-bit SIGNED
+;;   value the same pattern is -2147483647 and the comparison inverts.
+;;
+;; An inverted comparison here fails differently from the NX one, and worse in
+;; one respect: a CPU that DOES support SYSCALL would be told it does not, and
+;; `syscall_transport_initialize` returns 0, `aiueos_process_initialize`
+;; returns 0x20, and main.c exits AIUEOS_RING3_FAIL. That is loud. The inverse
+;; -- a CPU without SYSCALL told that it has it -- would set SCE in EFER on a
+;; machine where that bit is reserved and take a #GP inside the MSR write. Also
+;; loud, but from the wrong place. Neither is subtle, which is luck rather than
+;; design; the NX failure mode in the sibling object is not so kind.
+;;
+;; No arithmetic is done on the result: the guard compares it, the test
+;; `bit-and`s it. `bit-and` is bit-exact and sign-agnostic.
+;;
+;; Measured against the C predicate, not merely reasoned: the emitted object was
+;; loaded, its `cpuid` neutralised, and chosen register values fed in through the
+;; immediates it already contains. 56 (max-leaf, EDX) pairs agree, including
+;; every case with bit 31 set in either register -- among them EDX = 0x80100000,
+;; which has bit 31 AND bit 20 but NOT bit 11, where a sloppy test could confuse
+;; this object with its NX sibling. Both answer their own bit.
+;;
+;; WHAT "NO" MEANS
+;;
+;; 0 means this CPU does not support SYSCALL, and process.c refuses to install
+;; the transport: `syscall_transport_initialize` returns 0 at its first line
+;; and `aiueos_process_initialize` returns 0x20. Same behaviour as the C. As in
+;; the sibling object there is no refusal path distinct from a negative answer,
+;; because there is no argument to refuse -- both answers are legitimate
+;; machine states and 0 is not overloaded.
+;;
+;; FUEL -- 1 per call, 1 call per boot
+;;
+;; Deliberately absent from `bounded-memory?` in kotoba-native's elf64.clj: no
+;; replenish, and 512 from its own `.data` context for the whole boot. Per
+;; object, not shared -- the `.o` path relocates each object's `lea ...,%r9`
+;; against its own `.data` symbol, so this counter is untouched by the other
+;; two cpu objects, which have their own.
+;;
+;; Measured from the emitted object: exactly TWO fuel-charge sequences
+;; (`cmpq $0,0x8(%r9)` / `jne` / `ud2` / `decq 0x8(%r9)`), at 0x15 -- this
+;; function's entry -- and at 0xe5, `main`'s, which the kernel never calls. The
+;; wrapper at 0x0 carries no `mov qword [r9+8], N` between its `lea` and its
+;; `sub`, which is where a `bounded-memory?` object's replenish sits.
+;;
+;; Fuel is charged per FUNCTION ENTRY; `cpuid` is emitted INLINE (`0f a2`, at
+;; 0x3d and 0x7c) and charges nothing, as `kernel-out-u8` does not -- checked in
+;; this object's own disassembly rather than carried over from that precedent.
+;; Both `cpuid` executions cost ONE unit between them, and the refused-guard
+;; path costs the same one, since the charge at 0x1e precedes the branch at
+;; 0x5c.
+;;
+;; The call count is ONE per boot:
+;;
+;;   process.c:122  syscall_transport_initialize  <- aiueos_process_initialize
+;;                                                  process.c:286
+;;                                               <- main.c:753                1 call
+;;
+;; `aiueos_kernel_main` is straight-line with no loop around that initialiser,
+;; and `aiueos_process_initialize` has exactly one caller. The AP path does not
+;; multiply it: `aiueos_ap_entry` in smp.c does not initialise processes. The
+;; per-CPU EFER work on the AP trampoline is its own assembly and does not come
+;; through here. 1 of 512.
+
+(defn aiueos-cpu-feature-syscall []
+  ;; Leaf 0x80000000 -> EAX = highest extended leaf. Same guard as
+  ;; `cpu-feature-nx`, duplicated because objects cannot call one another.
+  (if (>= (kernel-cpuid-eax 2147483648 0) 2147483649)
+    ;; Leaf 0x80000001, subleaf 0. EDX bit 11 = 2048 is SCE -- whether
+    ;; `syscall` decodes at all once EFER.SCE is set.
+    (if (= (bit-and (kernel-cpuid-edx 2147483649 0) 2048) 0) 0 1)
+    ;; No extended leaves: no SYSCALL.
+    0))
+
+(defn main [] 0)

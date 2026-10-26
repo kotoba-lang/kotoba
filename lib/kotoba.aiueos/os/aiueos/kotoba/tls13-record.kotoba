@@ -1,0 +1,216 @@
+(ns aiueos.tls13-record
+  (:require [aiueos.lib.aes128-gcm-core :as gcm])
+  (:export [aiueos-tls13-record main]))
+
+;; The TLS 1.3 record layer (RFC 8446 5.2) for the freestanding aiueos kernel.
+;;
+;;   (aiueos-tls13-record ctx ctx-len rec rec-len mode)
+;;
+;; This replaces `protect` and `unprotect` in `kernel/tls13.c` (:311 and :335)
+;; together with the AEAD underneath them.  ADR-0132 moved the AEAD itself into
+;; `aes128-gcm.kotoba`; what stayed in C around it was the framing -- and the
+;; framing is where a record layer gets exploited.  The 5-byte header is the
+;; ADDITIONAL AUTHENTICATED DATA, so a length field taken from the wrong place
+;; is a forgery the AEAD would happily accept; the sequence number is XORed
+;; into the nonce, so a reused sequence is a reused keystream; and the inner
+;; content type is the last non-zero byte of the plaintext, so a padding strip
+;; that stops one byte early hands the caller the wrong record type.
+;;
+;; ---------------------------------------------------------------------------
+;; NOT A BOOLEAN.  ZERO IS THE SUCCESS VALUE.
+;; ---------------------------------------------------------------------------
+;;     0   done
+;;     1   ctx-len below the 1280 bytes this object requires
+;;     2   mode is neither 0 (open) nor 1 (seal)
+;;     3   rec-len outside 22..12310
+;;     4   SEAL: the plaintext does not fit the record buffer
+;;     5   OPEN: the record's own length field disagrees with rec-len, or the
+;;         body is outside 17..12304
+;;     6   OPEN: the tag did not match, and nothing was decrypted
+;;     7   OPEN: the inner plaintext is all zeros, so it carries no content type
+;;
+;; ---------------------------------------------------------------------------
+;; ONE RECORD BUFFER, TRANSFORMED IN PLACE
+;; ---------------------------------------------------------------------------
+;; SEAL expects the plaintext already at `rec+5` and its length in ctx; it
+;; appends the content type, encrypts in place, writes the header and appends
+;; the tag.  OPEN takes the whole record and decrypts in place.  The C used
+;; separate `out` and `decrypt_plain` buffers -- 12 KiB of `.high_bss` for the
+;; second one -- and in-place is exact rather than a shortcut because CTR mode
+;; is an XOR.
+;;
+;;   ctx offset  bytes  what
+;;   ----------  -----  ----------------------------------------------------
+;;        0        16   traffic key
+;;       16        12   traffic IV, the BASE -- never modified
+;;       28         1   aad length; the object writes 5
+;;       32        16   tag scratch
+;;       48         8   sequence number, big-endian
+;;       56         1   inner content type: SEAL reads it, OPEN writes it
+;;       57         1   reserved
+;;       58         2   plaintext length, big-endian: SEAL reads, OPEN writes
+;;       60         2   whole record length, big-endian: SEAL writes
+;;       62         2   reserved
+;;       64        64   aad; the 5-byte record header occupies 64..69
+;;      128      1152   the AEAD's round keys, GHASH state and derived tables,
+;;                      laid out exactly as `aes128-gcm.kotoba` documents, with
+;;                      one addition: 480..492 is the PER-RECORD NONCE
+;;     1280             end -- ctx-len must be at least this
+;;
+;; The base IV is not modified, and that is the point of the extra slot.  The
+;; nonce is `iv XOR seq` and a caller sends many records under one key; an
+;; object that XORed in place would corrupt the IV on the second record, and
+;; the corruption would look like a peer that stopped decrypting.
+;;
+;; ---------------------------------------------------------------------------
+;; THE AEAD IS `aiueos/lib/aes128_gcm_core.kotoba`, IMPORTED
+;; ---------------------------------------------------------------------------
+;; It used to be COPIED, and the comment that stood here said why: a namespace
+;; declaring `(:require ...)` could not be packaged for this target at all
+;; (`:kotoba.error/namespace-require-needs-project`, measured 2026-09-02
+;; against amu b1fdaad2), so a kernel object could not import anything. amu#742
+;; removed that refusal and `aiueos/lib/sha256_core.kotoba` was the first
+;; import it bought; this is the second and the larger one -- 399 lines that
+;; used to be maintained in two places, including an S-box, a key schedule and
+;; a tag comparison whose divergence would be a silent break in TLS
+;; confidentiality rather than a compile error.
+;;
+;; The old comment also stated the two ways the copy differed and offered a
+;; diff a reader could run to check the claim. Both are gone AS CLAIMS, because
+;; there is nothing left to diff: `data`/`body` was a rename with no meaning,
+;; and the nonce offset -- 480 here, 16 for the bare AEAD entry -- is the one
+;; real difference, so it is now an ARGUMENT. This file calls
+;; `(gcm/gcm-prepare ctx 480)`; `aes128-gcm.kotoba` calls
+;; `(gcm/gcm-prepare ctx 16)`. Drift between the two AEADs is no longer
+;; something a comment has to be trusted about; it is not expressible.
+;;
+;; What this file still owns is the RECORD: framing, the nonce derivation
+;; (`iv XOR seq`, written to 480 before `gcm-prepare` reads it), the additional
+;; data, and where the tag lives. `gcm/cl` and `gcm/cs` are the same 1280-byte
+;; context accessors the AEAD uses, so both halves address one region.
+
+;; --- the record buffer -----------------------------------------------------
+;; Every store into `rec` narrows to ONE BYTE through `kernel-subregion` first.
+;; The store window stops at 4096 and a record may be 12,310 bytes, so the
+;; narrowing has to happen; making it one byte wide means the header write, the
+;; content-type write and the tag write all take the identical checked path,
+;; and none of them can be the one that was reasoned about wrongly.
+
+(defn store-one [base value] (kernel-store-u8-4k base 1 0 value))
+
+(defn rs [rec rec-len index value]
+  (let [sub (kernel-subregion rec rec-len index 1)]
+    (store-one sub value)))
+
+(defn rl [rec rec-len index] (kernel-load-u8-16k rec rec-len index))
+
+(defn body-byte [body body-len index] (kernel-load-u8-16k body body-len index))
+
+;; RFC 8446 5.3: the per-record nonce is the write IV with the 64-bit sequence
+;; number XORed into its LAST EIGHT bytes, left-padded. The first four bytes of
+;; a 12-byte IV are therefore untouched.
+(defn derive-nonce [ctx i]
+  (if (= i 12) 1
+    (let [b (gcm/cl ctx (+ 16 i))
+          v (if (< i 4) b (bit-xor b (gcm/cl ctx (+ 48 (- i 4)))))
+          s (gcm/cs ctx (+ 480 i) v)]
+      (derive-nonce ctx (+ i 1 (* 0 s))))))
+
+;; The header IS the additional authenticated data. Writing it into the AAD
+;; slot and into the record from the same three arguments is what stops the two
+;; from ever disagreeing -- a record whose header says one length and whose AAD
+;; says another is a record the peer will reject for reasons nobody can find.
+(defn write-aad-header [ctx outer len-hi len-lo]
+  (let [a0 (gcm/cs ctx 64 outer) a1 (gcm/cs ctx 65 3) a2 (gcm/cs ctx 66 3)
+        a3 (gcm/cs ctx 67 len-hi) a4 (gcm/cs ctx 68 len-lo)
+        n (gcm/cs ctx 28 5)]
+    (+ 1 (* 0 (+ a0 (+ a1 (+ a2 (+ a3 (+ a4 n)))))))))
+
+(defn header-to-record [ctx rec rec-len i]
+  (if (= i 5) 1
+    (let [s (rs rec rec-len i (gcm/cl ctx (+ 64 i)))]
+      (header-to-record ctx rec rec-len (+ i 1 (* 0 s))))))
+
+;; OPEN takes the AAD from the WIRE, not from what the caller believes the
+;; header to be. Those differ exactly when someone has rewritten the header,
+;; which is the case the AEAD exists to catch.
+(defn copy-header-in [ctx rec rec-len i]
+  (if (= i 5) (gcm/cs ctx 28 5)
+    (let [s (gcm/cs ctx (+ 64 i) (rl rec rec-len i))]
+      (copy-header-in ctx rec rec-len (+ i 1 (* 0 s))))))
+
+(defn tag-to-record [ctx rec rec-len at i]
+  (if (= i 16) 1
+    (let [s (rs rec rec-len (+ at i) (gcm/cl ctx (+ 32 i)))]
+      (tag-to-record ctx rec rec-len at (+ i 1 (* 0 s))))))
+
+(defn tag-from-record [ctx rec rec-len at i]
+  (if (= i 16) 1
+    (let [s (gcm/cs ctx (+ 32 i) (rl rec rec-len (+ at i)))]
+      (tag-from-record ctx rec rec-len at (+ i 1 (* 0 s))))))
+
+;; RFC 8446 5.4: strip trailing zeros, and the last byte of what remains is the
+;; content type. Scanning from the end is the only way to do this; a record
+;; whose plaintext is entirely zeros has no content type at all and is reason 7
+;; rather than a record of type zero.
+(defn content-length [body body-len n]
+  (if (= n 0) 0
+    (if (= (body-byte body body-len (- n 1)) 0)
+      (content-length body body-len (- n 1))
+      n)))
+
+(defn seal-record [ctx rec rec-len pt-len]
+  (let [body-len (+ pt-len 1)
+        wire (+ body-len 16)
+        typed (rs rec rec-len (+ 5 pt-len) (gcm/cl ctx 56))
+        hdr (write-aad-header ctx 23 (quot wire 256) (bit-and wire 255))
+        put (header-to-record ctx rec rec-len 0)
+        non (derive-nonce ctx 0)
+        pre (gcm/gcm-prepare ctx 480)
+        body (kernel-subregion rec rec-len 5 body-len)
+        r (gcm/gcm-seal ctx body body-len 5)
+        tg (tag-to-record ctx rec rec-len (+ 5 body-len) 0)
+        o0 (gcm/cs ctx 60 (quot (+ 5 wire) 256))
+        o1 (gcm/cs ctx 61 (bit-and (+ 5 wire) 255))]
+    (* 0 (+ typed (+ hdr (+ put (+ non (+ pre (+ r (+ tg (+ o0 o1)))))))))))
+
+(defn open-record [ctx rec rec-len body-len]
+  (let [hdr (copy-header-in ctx rec rec-len 0)
+        tg (tag-from-record ctx rec rec-len (+ 5 body-len) 0)
+        non (derive-nonce ctx 0)
+        pre (gcm/gcm-prepare ctx 480)
+        body (kernel-subregion rec rec-len 5 body-len)
+        r (gcm/gcm-open ctx body body-len 5)
+        prefix (* 0 (+ hdr (+ tg (+ non pre))))]
+    (if (= r 0)
+      (let [n (content-length body body-len body-len)]
+        (if (= n 0) (+ 7 prefix)
+          (let [t (gcm/cs ctx 56 (body-byte body body-len (- n 1)))
+                l0 (gcm/cs ctx 58 (quot (- n 1) 256))
+                l1 (gcm/cs ctx 59 (bit-and (- n 1) 255))]
+            (* 0 (+ t (+ l0 (+ l1 prefix)))))))
+      (+ 6 prefix))))
+
+;; 12310 is 5 + 12288 + 1 + 16: the largest record whose BODY still fits the
+;; AEAD's own 12288 bound. It is below the 16384 load window and below RFC
+;; 8446's 2^14 + 256 ceiling, so a conforming peer can still send a record this
+;; object refuses -- reason 3 says which, rather than trapping.
+(defn aiueos-tls13-record [ctx ctx-len rec rec-len mode]
+  (if (< ctx-len 1280) 1
+    (if (> mode 1) 2
+      (if (< mode 0) 2
+        (if (< rec-len 22) 3
+          (if (> rec-len 12310) 3
+            (if (= mode 1)
+              (let [pt-len (+ (* (gcm/cl ctx 58) 256) (gcm/cl ctx 59))]
+                (if (> pt-len 12287) 4
+                  (if (> (+ 22 pt-len) rec-len) 4
+                    (seal-record ctx rec rec-len pt-len))))
+              (let [clen (+ (* (rl rec rec-len 3) 256) (rl rec rec-len 4))]
+                (if (> (+ clen 5) rec-len) 5
+                  (if (< (+ clen 5) rec-len) 5
+                    (if (< clen 17) 5
+                      (if (> (- clen 16) 12288) 5
+                        (open-record ctx rec rec-len (- clen 16))))))))))))))
+
+(defn main [] 0)

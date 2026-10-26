@@ -1,0 +1,175 @@
+;; Guest browser desktop damage: the previous frame's draw list and this one's
+;; -> the one rectangle a present has to send, on KERNEL.ELF (ADR-0242).
+;;
+;; WHY THIS IS A KOTOBA OBJECT AND NOT A C LOOP
+;;
+;; Which part of the screen a frame changed is a decision about the retained
+;; draw list, and the list is the guest's (kotoba-lang/browser ADR 0002: the
+;; guest owns the draw list, a backend presents frames). C transfers and
+;; flushes the rectangle this object answers (virtio-gpu TRANSFER_TO_HOST_2D
+;; and RESOURCE_FLUSH, mechanism) and never looks at an op or a pixel.
+;;
+;; THE RULE. The desktop paints a list in order, later over earlier
+;; (aiueos_desktop_present_ops2): a pixel ends the colour of the last op that
+;; covers it. Compare the two lists slot by slot. If slot j holds the same six
+;; words in both, the op covers the same pixels in both. A pixel outside the
+;; box of every slot that differs -- its op in either list, and a slot only
+;; one list has -- is covered by the same ops in the same order in both
+;; lists, so it ends the same colour: only the union of those boxes can have
+;; changed. A rect's box is x y w h; a glyph's is x y width 16 (it sets only
+;; bits inside it). Slot by slot is not the smallest answer -- an op that
+;; moved one slot down counts as changed -- and it is never too small.
+;;
+;; No previous frame (word 0 is 0) is the whole viewport: what was on the
+;; screen before the first list is not a list.
+;;
+;; Temporary native constraint: word types and u32 words, at most five
+;; parameters, no `and`, no map (ADR-2608650000: backend gaps, not the
+;; language's ceiling). The box is accumulated in shadow words, not threaded
+;; through the recursion, for the five-parameter limit.
+;;
+;; OPS: the current list, 24 bytes per op (kind x y a b rgb), as
+;;   browser-frame2.kotoba writes it at surface word 480; kind 1 rect
+;;   (a b = w h), kind 2 glyph (a = glyph index, b = width 8 | 16).
+;; SHADOW (u32 LE words, exactly 8192 bytes, the caller's between frames):
+;;   0 previous op count P (0: no previous frame)
+;;   1..4 answer: damage x y w h (0 0 0 0 when nothing differs)
+;;   5 viewport w   6 viewport h   (the caller's, once)
+;;   8 + 6j + k: word k of the previous list's op j (j < 261)
+;;   2000 current count, 2001 any-yet, 2002..2005 box x0 y0 x1 y1 (scratch)
+;;
+;; ABI: [ops ops-bytes shadow shadow-bytes count] -> how many slots differ
+;;   (the box written to words 1..4, this list copied over the previous
+;;   one, word 0 set to count), or
+;;   -1 null region / shadow not 8192 bytes
+;;   -2 count outside 1..261, or ops-bytes under count * 24
+;;   -3 the shadow's viewport is 0, or its previous count is past 261
+;;   -4 an op of a kind other than 1 or 2, in either list
+;; A refusal leaves words 0 and 5..1573 as they were.
+
+(ns aiueos.browser-damage
+  (:export [aiueos-browser-damage main]))
+
+(defn hw [h i]
+  (kernel-load-u32 (kernel-subregion h 8192 (* i 4) 4) 4 0))
+
+(defn hput [h i v]
+  (kernel-store-u32 (kernel-subregion h 8192 (* i 4) 4) 4 0 v))
+
+(defn ow [o ob j k]
+  (kernel-load-u32 (kernel-subregion o ob (* (+ (* j 6) k) 4) 4) 4 0))
+
+(defn pw [h j k] (hw h (+ 8 (+ (* j 6) k))))
+
+(defn kind-ok [kd] (if (= kd 1) 1 (if (= kd 2) 1 0)))
+
+(defn cur-kinds-ok [o ob j n]
+  (if (>= j n) 1
+    (if (= (kind-ok (ow o ob j 0)) 0) 0
+      (cur-kinds-ok o ob (+ j 1) n))))
+
+(defn prev-kinds-ok [h j n]
+  (if (>= j n) 1
+    (if (= (kind-ok (pw h j 0)) 0) 0
+      (prev-kinds-ok h (+ j 1) n))))
+
+(defn same-from [o ob h j k]
+  (if (>= k 6) 1
+    (if (not (= (ow o ob j k) (pw h j k))) 0
+      (same-from o ob h j (+ k 1)))))
+
+(defn lo [a b] (if (< a b) a b))
+(defn hi [a b] (if (> a b) a b))
+
+;; grow the box by [x0 y0 x1 y1): the first box sets it
+(defn grow-x [h x0 x1]
+  (if (= (hw h 2001) 0)
+    (do (hput h 2002 x0) (hput h 2004 x1))
+    (do (hput h 2002 (lo (hw h 2002) x0)) (hput h 2004 (hi (hw h 2004) x1)))))
+
+(defn grow-y [h y0 y1]
+  (if (= (hw h 2001) 0)
+    (do (hput h 2003 y0) (hput h 2005 y1) (hput h 2001 1))
+    (do (hput h 2003 (lo (hw h 2003) y0)) (hput h 2005 (hi (hw h 2005) y1)))))
+
+(defn grow [h x y w ht]
+  (do (grow-x h x (+ x w))
+      (grow-y h y (+ y ht))))
+
+;; an op's box: a rect's w h, a glyph's width and 16 rows
+(defn op-w [kd a b] (if (= kd 1) a b))
+(defn op-h [kd b] (if (= kd 1) b 16))
+
+(defn grow-cur [o ob h j]
+  (let [kd (ow o ob j 0)]
+    (grow h (ow o ob j 1) (ow o ob j 2) (op-w kd (ow o ob j 3) (ow o ob j 4)) (op-h kd (ow o ob j 4)))))
+
+(defn grow-prev [h j]
+  (let [kd (pw h j 0)]
+    (grow h (pw h j 1) (pw h j 2) (op-w kd (pw h j 3) (pw h j 4)) (op-h kd (pw h j 4)))))
+
+;; slot j of max(count, previous): 1 when it differs (its boxes grown), else 0
+(defn slot [o ob h j]
+  (let [n (hw h 2000)
+        p (hw h 0)]
+    (if (< j n)
+      (if (< j p)
+        (if (= (same-from o ob h j 0) 1) 0
+          (do (grow-cur o ob h j) (grow-prev h j) 1))
+        (do (grow-cur o ob h j) 1))
+      (do (grow-prev h j) 1))))
+
+(defn scan [o ob h j d]
+  (if (>= j (hi (hw h 2000) (hw h 0))) d
+    (scan o ob h (+ j 1) (+ d (slot o ob h j)))))
+
+(defn copy-op [o ob h j k]
+  (if (>= k 6) 0
+    (do (hput h (+ 8 (+ (* j 6) k)) (ow o ob j k))
+        (copy-op o ob h j (+ k 1)))))
+
+(defn copy [o ob h j n]
+  (if (>= j n) 0
+    (do (copy-op o ob h j 0)
+        (copy o ob h (+ j 1) n))))
+
+(defn answer [h x y w ht]
+  (do (hput h 1 x) (hput h 2 y) (hput h 3 w) (hput h 4 ht)))
+
+;; the box cut at the viewport, as x y w h
+(defn answer-box [h vw vh]
+  (let [x0 (lo (hw h 2002) vw)
+        y0 (lo (hw h 2003) vh)
+        x1 (lo (hw h 2004) vw)
+        y1 (lo (hw h 2005) vh)]
+    (answer h x0 y0 (- x1 x0) (- y1 y0))))
+
+(defn decide [o ob h n]
+  (if (= (hw h 0) 0)
+    (do (answer h 0 0 (hw h 5) (hw h 6))
+        (copy o ob h 0 n)
+        (hput h 0 n)
+        n)
+    (let [d (scan o ob h 0 0)]
+      (do (if (= d 0) (answer h 0 0 0 0) (answer-box h (hw h 5) (hw h 6)))
+          (copy o ob h 0 n)
+          (hput h 0 n)
+          d))))
+
+(defn aiueos-browser-damage [o ob h hb n]
+  (if (= o 0) -1
+    (if (= h 0) -1
+      (if (not (= hb 8192)) -1
+        (if (< n 1) -2
+          (if (> n 261) -2
+            (if (< ob (* n 24)) -2
+              (if (= (hw h 5) 0) -3
+                (if (= (hw h 6) 0) -3
+                  (if (> (hw h 0) 261) -3
+                    (if (= (cur-kinds-ok o ob 0 n) 0) -4
+                      (if (= (prev-kinds-ok h 0 (hw h 0)) 0) -4
+                        (do (hput h 2000 n)
+                            (hput h 2001 0)
+                            (decide o ob h n))))))))))))))
+
+(defn main [] 0)

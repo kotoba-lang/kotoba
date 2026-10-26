@@ -1,0 +1,139 @@
+(ns aiueos.model-channel-test
+  (:require [aiueos.model-channel :as channel]
+            [kotoba.test :refer [deftest is testing]]))
+
+(def c0 (str "bafkrei" (apply str (repeat 52 "a"))))
+(def c1 (str "bafkrei" (apply str (repeat 52 "b"))))
+(def m0 (str "bafkrei" (apply str (repeat 52 "d"))))
+(def m1 (str "bafkrei" (apply str (repeat 52 "e"))))
+(def revision (str "bafyrei" (apply str (repeat 52 "c"))))
+(def ipns "k51qzi5uqu5dgxdm1x95y3dk2nzj9xnz7ntyv08jbrzfacpj53mncoebqe3m92")
+
+(def context
+  {:channel "qwen3.8-27b-k16"
+   :ipns-name ipns
+   :architecture "x86_64"
+   :machine "gmktec-k16"
+   :aiueos-abi 4})
+
+(defn fixture
+  [{:keys [sequence previous manifest-cid artifact-sha blocks]
+    :or {sequence 1 manifest-cid m0
+         artifact-sha (apply str (repeat 64 "a"))
+         blocks [{:cid c0 :bytes 10}]}}]
+  {:head {:name ipns :cid manifest-cid :sequence sequence
+          :signature-verified? true :valid? true}
+   :manifest {:schema channel/schema
+              :channel "qwen3.8-27b-k16"
+              :sequence sequence
+              :previous previous
+              :published_at "2026-08-29T00:00:00Z"
+              :target {:architecture "x86_64" :machine "gmktec-k16"
+                       :min_aiueos_abi 4}
+              :artifact {:name "Qwen3.8-27B.gguf"
+                         :bytes (reduce + (map :bytes blocks))
+                         :sha256 artifact-sha
+                         :format "gguf-v3"
+                         :revision_cid revision}
+              :blocks blocks}})
+
+(deftest first-install-downloads-only-missing-cids
+  (let [{:keys [head manifest]} (fixture {:blocks [{:cid c0 :bytes 10}
+                                                   {:cid c1 :bytes 20}]})
+        result (channel/plan-update
+                {:context context
+                 :state {:cached-block-cids #{c0}}
+                 :head head :manifest manifest})]
+    (is (= :download (:status result)))
+    (is (= [c1] (mapv :cid (:download result))))
+    (is (= :atomic-after-full-verification
+           (get-in result [:activation :commit])))
+    (is (= :last-known-good (:fallback result)))))
+
+(deftest complete-cache-activates-without-network-redownload
+  (let [{:keys [head manifest]} (fixture {})
+        result (channel/plan-update
+                {:context context
+                 :state {:cached-block-cids #{c0}}
+                 :head head :manifest manifest})]
+    (is (= :activate (:status result)))
+    (is (empty? (:download result)))))
+
+(deftest same-artifact-advances-head-without-reloading-weights
+  (let [sha (apply str (repeat 64 "d"))
+        {:keys [head manifest]} (fixture {:sequence 2 :previous m0
+                                         :manifest-cid m1 :artifact-sha sha})
+        result (channel/plan-update
+                {:context context
+                 :state {:last-sequence 1 :manifest-cid m0
+                         :artifact {:sha256 sha}}
+                 :head head :manifest manifest})]
+    (is (= :current (:status result)))
+    (is (empty? (:download result)))
+    (is (= 2 (get-in result [:commit-state :last-sequence])))))
+
+(deftest rollback-equivocation-and-broken-history-fail-closed
+  (testing "older signed records still cannot roll a node back"
+    (let [{:keys [head manifest]} (fixture {})
+          result (channel/plan-update
+                  {:context context
+                   :state {:last-sequence 2 :manifest-cid m1}
+                   :head head :manifest manifest})]
+      (is (= :refused (:status result)))
+      (is (some #{:rollback} (:errors result)))))
+  (testing "one sequence cannot name two manifests"
+    (let [{:keys [head manifest]} (fixture {:sequence 2 :manifest-cid m1})
+          result (channel/plan-update
+                  {:context context
+                   :state {:last-sequence 2 :manifest-cid m0}
+                   :head head :manifest manifest})]
+      (is (some #{:sequence-equivocation} (:errors result)))))
+  (testing "a fast-forward must name the locally committed parent"
+    (let [{:keys [head manifest]} (fixture {:sequence 2 :manifest-cid m1})
+          result (channel/plan-update
+                  {:context context
+                   :state {:last-sequence 1 :manifest-cid m0}
+                   :head head :manifest manifest})]
+      (is (some #{:broken-history} (:errors result))))))
+
+(deftest signature-compatibility-and-byte-shape-are-admission-not-hints
+  (let [{:keys [head manifest]} (fixture {})]
+    (is (some #{:ipns-signature}
+              (:errors (channel/plan-update
+                        {:context context :state {}
+                         :head (assoc head :signature-verified? false)
+                         :manifest manifest}))))
+    (is (some #{:incompatible-machine}
+              (:errors (channel/plan-update
+                        {:context (assoc context :machine "some-other-machine")
+                         :state {} :head head :manifest manifest}))))
+    (is (some #{:artifact-block-size-mismatch}
+              (channel/manifest-errors
+               (assoc-in manifest [:artifact :bytes] 11))))))
+
+(deftest offline-or-refused-uses-last-known-good-and-never-a-partial-slot
+  (let [old {:name "old.gguf" :sha256 (apply str (repeat 64 "e"))}
+        decision (channel/boot-decision
+                  {:update-plan {:status :refused :errors [:ipns-signature]}
+                   :state {:artifact old}})]
+    (is (= :last-known-good (:boot decision)))
+    (is (= old (:artifact decision))))
+  (testing "a planned download cannot replace the committed slot"
+    (let [old {:name "old.gguf" :sha256 (apply str (repeat 64 "e"))}
+          new {:name "new.gguf" :sha256 (apply str (repeat 64 "f"))}
+          decision (channel/boot-decision
+                    {:update-plan {:status :download :artifact new}
+                     :state {:artifact old}})]
+      (is (= :last-known-good (:boot decision)))
+      (is (= old (:artifact decision)))))
+  (testing "the device may switch only after the atomic commit"
+    (let [new {:name "new.gguf" :sha256 (apply str (repeat 64 "f"))}
+          decision (channel/boot-decision
+                    {:update-plan {:status :activate
+                                   :activation-committed? true
+                                   :artifact new}
+                     :state {}})]
+      (is (= :admitted-channel (:boot decision)))
+      (is (= new (:artifact decision)))))
+  (is (= :without-model
+         (:boot (channel/boot-decision {:update-plan nil :state {}})))))

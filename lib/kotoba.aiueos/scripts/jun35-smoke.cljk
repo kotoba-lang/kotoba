@@ -1,0 +1,119 @@
+;; jun35-smoke.cljk — JUN-35 per-service bounded smoke tasks（手順の正本は
+;; docs/jun35-smoke-task-runbook.md。ここはその machine entry point）
+;;
+;;   kbb --backend sci scripts/jun35-smoke.cljk plan                  ;; offline: 手順・bounds・readback 基準を印字
+;;   kbb --backend sci scripts/jun35-smoke.cljk probe                 ;; 読取専用: endpoint 実測（参加証明ではない）
+;;   kbb --backend sci scripts/jun35-smoke.cljk run --service murakumo ;; 実行は OCI node + credential 必須（無ければ exit 2）
+;;
+;; 設計（2026-10-23）:
+;; - probe は「手順が現実の endpoint と一致するか」の検証のみ。UI ウィンドウ・
+;;   プロセス起動・ローカル QEMU・resource 作成と同じく **サービス参加に数えない**。
+;; - run は fail-closed: node endpoint と credential が揃わなければ何も送信しない
+;;   （exit 2）。秘密は stdout / receipt に出さない。
+;; - bounds: 1 step 1 attempt、HTTP 30s、prompt は 4 bytes "ping"、blob は
+;;   1024 bytes 0x00。receipt に payload・credential を書かない。
+
+(ns jun35-smoke
+  (:require ["node:child_process" :as cp]
+            [clojure.string :as str]))
+
+(defn sh-out [cmd]
+  (try (.execSync cp cmd #js {:encoding "utf8" :stdio #js ["ignore" "pipe" "pipe"] :timeout 30000})
+       (catch :default e (str "ERR " (or (.-message e) e)))))
+
+(defn now-iso [] (str (js/Date.)))
+
+(def stale-ms 60000) ;; readiness.cljk default-stale-ms
+
+(defn http-get [url]
+  ;; 読取専用 GET。body と status を返す（redirect 追従は read 側のみ許可 = curl 既定）
+  (let [out (sh-out (str "curl -sS --max-time 20 -w '\\n__STATUS__:%{http_code}' " (pr-str url)))
+        idx (str/last-index-of out "__STATUS__:")]
+    (if idx
+      {:body (subs out 0 idx) :status (str/trim (subs out (+ idx 11)))}
+      {:body out :status "ERR"})))
+
+(defn dns-a [host]
+  (let [out (sh-out (str "curl -sS --max-time 15 -H 'accept: application/dns-json' "
+                         "'https://cloudflare-dns.com/dns-query?name=" host "&type=A'"))]
+    (try
+      (let [d (js->clj (js/JSON.parse out))
+            ans (get d "Answer")]
+        (if (seq ans)
+          (str "A:" (str/join "," (map #(get % "data") ans)))
+          (str "NODATA (Status " (get d "Status") ")")))
+      (catch :default _ (str "ERR " out)))))
+
+;; ---------- plan ----------
+
+(def plan-lines
+  ["JUN-35 bounded smoke tasks (runbook: docs/jun35-smoke-task-runbook.md)"
+   "bounds: 1 attempt/step, HTTP 30s, task budget 5min, prompt \"ping\", blob 1024x0x00"
+   "receipt fields: timestamp, service, step, host+path, http status, readback value (no payload/credential)"
+   ""
+   "murakumo:"
+   "  0. GET /health            -> ok:true (precondition)"
+   "  1. PUT /nodes/oci-<id>    -> descriptor (inventory only, NOT readiness)"
+   "  2. POST /events           -> one hwmetrics observation"
+   "  3. POST /infer/runs       -> one run, prompt \"ping\""
+   "  4. GET /infer/runs?since= -> run listed"
+   "  5. GET /nodes             -> reachable:true AND age-ms <= 60000 (= live-node?)"
+   "  evidence: run listed + live-node? from a fresh observation at readback"
+   "itonami:"
+   "  none possible — tsukasa (node registration/LCM) unimplemented; row stays 'unsupported'"
+   "yataverse:"
+   "  1. put fixed 1KiB zero blob -> CID"
+   "  2. verify: read CID back, recompute multihash -> recomputed CID == CID"
+   "  3. (separate) store/audit readback with :failure-domain/:independence declared"
+   "  blocked today: default endpoints have no public A record (see probe)"
+   "kura:"
+   "  1. node descriptor declaring :failure-domain AND :independence (no default)"
+   "  2. store/audit -> effective domains + :survivable?"
+   "  coordinated with JUN-23; row not claimed until that lands"])
+
+;; ---------- probe ----------
+
+(defn probe []
+  (println (str "jun35-smoke probe " (now-iso) " (read-only; NOT participation)"))
+  (let [h (http-get "https://api.murakumo.cloud/health")]
+    (println (str "murakumo GET /health -> " (:status h) " " (str/trim (:body h)))))
+  (let [n (http-get "https://api.murakumo.cloud/nodes")]
+    (if (= "200" (:status n))
+      (try
+        (let [rows (js->clj (js/JSON.parse (:body n)))
+              live (count (filter (fn [r]
+                                    (and (= true (get r "reachable"))
+                                         (<= (long (or (get r "age-ms") 1e9)) stale-ms)))
+                                  rows))]
+          (println (str "murakumo GET /nodes -> 200 rows=" (count rows)
+                        " expected-fleet-size=11 live-node?=" live " (age-ms <= " stale-ms ")")))
+        (catch :default e (println (str "murakumo GET /nodes -> parse ERR " e))))
+      (println (str "murakumo GET /nodes -> " (:status n)))))
+  (doseq [host ["ipfs.yataverse.com" "kotobase.net"]]
+    (println (str "dns " host " -> " (dns-a host))))
+  (println "probe done (procedure validation only; see runbook §6)"))
+
+;; ---------- run (fail-closed) ----------
+
+(defn run-service [svc]
+  (let [node (.. js/process -env -AIUEOS_SMOKE_NODE)
+        cred (.. js/process -env -AIUEOS_SMOKE_CACAO)]
+    (if (or (str/blank? node) (str/blank? cred))
+      (do
+        (println (str "run " svc ": refused (fail-closed) — AIUEOS_SMOKE_NODE / AIUEOS_SMOKE_CACAO が未設定。"))
+        (println "OCI node の boot と node identity/credential の用意が先。手順は plan / runbook §2-§5。")
+        (.exit js/process 2))
+      (do
+        (println (str "run " svc ": credential は使用した時点で破棄。receipt には status と readback 値のみ。"))
+        (println "実装は OCI boot 後に、runbook §2-§5 の手順を 1 attempt/step で実行する。")
+        (println "（本 tick 時点では OCI auth FAIL で node が存在しないため到達しない）")
+        (.exit js/process 2)))))
+
+(let [args (drop 3 (vec (js/Array.from (.-argv js/process))))
+      [cmd & rest] args]
+  (case cmd
+    "plan" (doseq [l plan-lines] (println l))
+    "probe" (probe)
+    "run" (let [svc (second (drop-while #(not= % "--service") rest))]
+            (if svc (run-service svc) (do (println "usage: run --service murakumo|yataverse|kura|itonami") (.exit js/process 2))))
+    (do (println "usage: plan | probe | run --service <s>") (.exit js/process 2))))

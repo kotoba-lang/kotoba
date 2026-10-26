@@ -1,0 +1,745 @@
+;; The three tokenizer objects against a transcription of llama.cpp's
+;; `llm_tokenizer_bpe`, and the pre-tokenizer against a real regex engine.
+;;
+;; ## What the oracle is, and what it is not
+;;
+;; THE ACCEPTANCE ORACLE FOR THIS FAMILY IS llama.cpp, AND IT WAS NOT
+;; AVAILABLE. Measured 2026-09-02 on the workstation this ran on: no
+;; `llama-tokenize` on PATH, no llama.cpp under Homebrew (`brew --prefix
+;; llama.cpp` names a directory that does not exist), no `.gguf` over 10 MB
+;; anywhere under `/Users` or `/Volumes`, and no ollama blobs. So there are no
+;; golden token ids from the reference implementation, for this or any other
+;; Qwen vocabulary, and this file does not pretend otherwise.
+;;
+;; What it has instead, in descending order of independence:
+;;
+;;   1. THE PRE-TOKENIZER AGAINST java.util.regex. The byte state machine in
+;;      `qwen35-tokenize.kotoba` is checked against the qwen2 regex run through
+;;      a real regex engine with real Unicode property support. That is a
+;;      genuinely independent implementation of the hardest and most
+;;      error-prone stage, and it is where a hand-written splitter goes wrong.
+;;   2. THE CHARACTER CLASSES AGAINST java.util.regex, exhaustively. Every
+;;      codepoint of the 24 blocks the object declares is classified by the
+;;      object and by `\p{L}` / `\p{N}` and the two are compared -- at every
+;;      codepoint where Java's answer CHANGES, at the codepoint either side of
+;;      it, and on a stride through each block. The test also counts the
+;;      codepoints OUTSIDE those blocks that Java calls a letter or a number,
+;;      so the size of the object's blind spot is printed rather than hoped
+;;      about.
+;;   3. THE MERGE LOOP AND THE ID LOOKUP AGAINST A TRANSCRIPTION. `oracle-ids`
+;;      below is llama.cpp's algorithm rewritten in Clojure over maps and
+;;      vectors. It shares no code with the object, but it does share an
+;;      author, so it catches a coding mistake and not a misreading.
+;;   4. ROUND TRIP. `detokenize(tokenize(s)) = s` for every vector, which
+;;      needs no oracle at all and is the property a chat loop depends on.
+;;
+;; The two portable tokenizers in this workspace (`torch.tokenizer` and
+;; `kotodama.inference.tokenizer`) were read and are NOT used: both implement
+;; SentencePiece-flavoured BPE -- a `U+2581` word-boundary marker and
+;; `<0xHH>` byte-fallback tokens -- with no GPT-2 byte-to-unicode alphabet and
+;; no pre-tokenizer split at all. Against a `gpt2` vocabulary they are a
+;; different algorithm, not a second opinion.
+;;
+;; ## The fixture
+;;
+;; A mini vocabulary, built here: the 256 byte-alphabet characters, then the
+;; result of every merge rule a small BPE trainer produced from the vector
+;; corpus itself, then three special tokens with `token_type` set. That keeps
+;; the invariant `vocab-index-build` refuses without (`-13`/`-14`): every merge
+;; side is a vocabulary token, because every merge side is either one of the
+;; 256 or an earlier merge's result.
+;;
+;; The real 248,320-entry vocabulary is NOT exercised, because there is no
+;; GGUF on this machine to read it from. The objects derive every table size
+;; from the workspace header rather than from the contract's counts, so the
+;; same code serves both; that is a property of the source, not a measurement.
+;;
+;; ## What this does NOT execute
+;;
+;; The emitted x86-64. This workstation is aarch64 and the objects compile to
+;; ET_REL kernel objects. `kotoba.kir` models the same window checks the
+;; backends emit, so this is an oracle for the bounds as well as the
+;; arithmetic -- but it is not the machine.
+
+(ns aiueos.qwen35-tokenizer-parity-test
+  (:require [kotoba.bytes :as kbytes] [kotoba.io :as io]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is]]
+            [kotoba.kir :as ir]
+            [kotoba.sema :as sema]))
+
+(def ^:private object-names
+  ["qwen35-vocab-index-build" "qwen35-tokenize" "qwen35-detokenize"])
+
+(defn- source-file [n] (io/file "os" "aiueos" "kotoba" (str n ".kotoba")))
+
+(defn- sources-available? []
+  (every? true? (for [n object-names]
+                  (let [f (source-file n)
+                        present? (io/exists? f)]
+                    (is present? (str "kotoba object not found at " f))
+                    present?))))
+
+(def ^:private kir
+  (delay (into {} (for [n object-names]
+                    [n (-> (slurp (source-file n)) sema/analyze ir/lower)]))))
+
+;; ------------------------------------------------- the byte-level alphabet
+
+(defn- byte->cp [b]
+  (cond (<= 33 b 126) b
+        (<= 161 b 172) b
+        (<= 174 b 255) b
+        (<= 0 b 32) (+ 256 b)
+        (<= 127 b 160) (+ 162 b)
+        (= b 173) 323))
+
+(def ^:private byte->char (mapv #(String. (Character/toChars (byte->cp %))) (range 256)))
+
+(defn- utf8 ^bytes [^String s] (kbytes/utf8-bytes s))
+(defn- ubytes [^String s] (mapv #(bit-and % 255) (utf8 s)))
+(defn- from-utf8 [bs] (kbytes/utf8-string (byte-array (map unchecked-byte bs))))
+
+(defn- byte-encode
+  "`unicode_byte_encoding_process`: rebuild the text from its codepoints (so an
+  invalid byte has already become U+FFFD), then map every BYTE of that into the
+  alphabet."
+  [^String s]
+  (str/join (map byte->char (ubytes s))))
+
+;; ------------------------------------------------------ character classes
+;;
+;; llama.cpp's `unicode_vec_whitespace`, which is Python's `str.isspace()` set
+;; and NOT Java's `\s` -- the two differ on U+001C..U+001F.
+
+(def ^:private whitespace-cps
+  (into (sorted-set 0x85 0xA0 0x1680 0x2028 0x2029 0x202F 0x205F 0x3000)
+        (concat (range 0x09 0x0E) (range 0x1C 0x21) (range 0x2000 0x200B))))
+
+(def ^:private letter-pattern (java.util.regex.Pattern/compile "\\p{L}"))
+(def ^:private number-pattern (java.util.regex.Pattern/compile "\\p{N}"))
+
+(defn- java-class
+  "1 letter, 2 number, 3 whitespace, 0 other -- the classification the object's
+  table was generated from, re-derived here so the table cannot drift away
+  from it unnoticed."
+  [cp]
+  (let [s (String. (Character/toChars cp))]
+    (cond (contains? whitespace-cps cp) 3
+          (.matches (.matcher number-pattern s)) 2
+          (.matches (.matcher letter-pattern s)) 1
+          :else 0)))
+
+(def ^:private declared-blocks
+  "The 24 blocks `qwen35-tokenize.kotoba` says its 122-range table covers."
+  [[0x0000 0x02FF] [0x0370 0x058F] [0x0590 0x06FF] [0x0E00 0x0E7F]
+   [0x1E00 0x1FFF] [0x2000 0x209F] [0x2150 0x218F] [0x2460 0x24FF]
+   [0x2E80 0x2FDF] [0x3000 0x30FF] [0x3100 0x318F] [0x31F0 0x31FF]
+   [0x3200 0x33FF] [0x3400 0x4DBF] [0x4E00 0x9FFF] [0xAC00 0xD7AF]
+   [0xF900 0xFAFF] [0xFE30 0xFE4F] [0xFF00 0xFFEF]
+   [0x1D7CE 0x1D7FF] [0x1F300 0x1FAFF]
+   [0x20000 0x2A6DF] [0x2A700 0x2EBEF] [0x2F800 0x2FA1F]])
+
+;; ------------------------------------------- the reference pre-tokenizer
+;;
+;; `unicode_regex_split_custom_llama3`, transcribed. llama.cpp dispatches the
+;; qwen2 regex to this function -- so the reference behaviour for a `qwen35`
+;; pre-tokenizer is `\p{N}{1,3}`, not the `\p{N}` its own metadata spells.
+
+(defn- cpts [^String s] (vec (.toArray (.codePoints s))))
+
+(defn- llama3-split
+  "Codepoint vector -> vector of chunk lengths in codepoints."
+  [cs]
+  (let [n (count cs)
+        cp (fn [i] (if (< -1 i n) (nth cs i) -1))
+        cl (fn [i] (if (< -1 i n) (java-class (nth cs i)) -1))
+        low (fn [c] (if (<= 65 c 90) (+ c 32) c))]
+    (loop [pos 0 out []]
+      (if (>= pos n)
+        out
+        (let [c (cp pos)
+              end
+              (or
+               ;; 1: (?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])
+               (when (and (= c 39) (< (inc pos) n))
+                 (let [c1 (low (cp (inc pos)))]
+                   (cond (#{115 116 109 100} c1) (+ pos 2)
+                         (and (< (+ pos 2) n)
+                              (let [c2 (low (cp (+ pos 2)))]
+                                (or (and (= c1 114) (= c2 101))
+                                    (and (= c1 118) (= c2 101))
+                                    (and (= c1 108) (= c2 108)))))
+                         (+ pos 3))))
+               ;; 2: [^\r\n\p{L}\p{N}]?\p{L}+
+               (when (and (not (#{13 10} c)) (not= 2 (cl pos))
+                          (or (= 1 (cl pos)) (= 1 (cl (inc pos)))))
+                 (loop [p (inc pos)] (if (= 1 (cl p)) (recur (inc p)) p)))
+               ;; 3: \p{N}{1,3}
+               (when (= 2 (cl pos))
+                 (loop [p pos k 3] (if (and (pos? k) (= 2 (cl p))) (recur (inc p) (dec k)) p)))
+               ;; 4: ` ?[^\s\p{L}\p{N}]+[\r\n]*`
+               (let [q (if (= c 32) (inc pos) pos)]
+                 (when (= 0 (cl q))
+                   (let [p (loop [p q] (if (= 0 (cl p)) (recur (inc p)) p))]
+                     (loop [p p] (if (#{13 10} (cp p)) (recur (inc p)) p)))))
+               ;; 5, 6, 7: one whitespace scan, three outcomes
+               (let [nws (loop [k 0] (if (= 3 (cl (+ pos k))) (recur (inc k)) k))
+                     last-rn (loop [k 0 last 0]
+                               (if (= 3 (cl (+ pos k)))
+                                 (recur (inc k) (if (#{13 10} (cp (+ pos k))) (+ pos k 1) last))
+                                 last))]
+                 (cond (pos? last-rn) last-rn
+                       (and (> nws 1) (not= -1 (cp (+ pos nws)))) (+ pos (dec nws))
+                       (pos? nws) (+ pos nws)
+                       :else (inc pos))))]
+          (recur end (conj out (- end pos))))))))
+
+(defn- llama3-chunks [^String s]
+  (let [cs (cpts s)]
+    (loop [start 0 lens (llama3-split cs) out []]
+      (if (empty? lens)
+        out
+        (recur (+ start (first lens)) (rest lens)
+               (conj out (str/join (map #(String. (Character/toChars %))
+                                        (subvec cs start (+ start (first lens)))))))))))
+
+;; The same split, by a regex engine. `\p{N}{1,3}` is the spelling of the
+;; handler llama.cpp dispatches the qwen2 pattern to; UNICODE_CHARACTER_CLASS
+;; is what makes `\p{L}` mean the general category rather than ASCII.
+(def ^:private qwen-regex
+  (java.util.regex.Pattern/compile
+   (str "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])"
+        "|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}"
+        "| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+")
+   java.util.regex.Pattern/UNICODE_CHARACTER_CLASS))
+
+(defn- regex-chunks [^String s]
+  (let [m (.matcher qwen-regex s)]
+    (loop [out []] (if (.find m) (recur (conj out (.group m))) out))))
+
+;; ------------------------------------------------- the reference BPE loop
+
+(defn- bpe-merge
+  "llama.cpp's priority queue, as its own invariant: repeatedly take the live
+  adjacent pair with the lowest rank, leftmost on a tie."
+  [ranks syms]
+  (loop [syms syms]
+    (let [pairs (map-indexed (fn [i [a b]] [(get ranks [a b]) i]) (map vector syms (rest syms)))
+          live (remove #(nil? (first %)) pairs)]
+      (if (empty? live)
+        syms
+        (let [[_ i] (first (sort live))]
+          (recur (into (subvec syms 0 i)
+                       (cons (str (nth syms i) (nth syms (inc i)))
+                             (subvec syms (+ i 2))))))))))
+
+(defn- oracle-ids [token->id ranks ^String text]
+  (vec (mapcat (fn [chunk]
+                 (let [encoded (byte-encode chunk)
+                       syms (mapv #(String. (Character/toChars %)) (cpts encoded))]
+                   (map (fn [s]
+                          (or (token->id s)
+                              (throw (ex-info "oracle: symbol not in vocabulary" {:symbol s}))))
+                        (bpe-merge ranks syms))))
+               (llama3-chunks text))))
+
+;; ------------------------------------------------------ the mini fixture
+
+(def ^:private corpus
+  ["Hello, world!" "the quick brown fox jumps over the lazy dog"
+   "don't stop, it's the one I'll take" "It's 2026." "a" " " "  "
+   "trailing   " "   leading" "a  b" "a\t\tb" "a \n b" "\n" "\n\n" "  \n  "
+   "def f(x):\n    return x * 2\n" "let y = a[0] + b;" "// comment\r\nnext"
+   "2026" "1" "12" "123" "1234" "007" "3.14159"
+   "こんにちは" "日本語のテキストです。" "東京都渋谷区" "ひらがなとカタカナ"
+   "Hello, 世界!" "APIキーを設定する" "「引用」" "…" "—"
+   "café" "café" "naïve" "Grüße" "Привет, мир" "Ελλάδα"
+   "🙂" "a🙂b" "1+1=2" "x<=y" "https://example.com/a?b=1"])
+
+(def ^:private vectors
+  "The strings whose ids the object and the oracle must agree on. Every one is
+  also round-tripped through detokenize."
+  (into corpus
+        ["" "The Quick Brown Fox" "IT'S" "I'LL" "he'd" "we've" "we're"
+         "\r\n" "a\r\nb" "  \n\n  " "x   " "   x" "     "
+         "日本" "カタカナ" "漢字とかな" "１２３" "ＡＢＣ"
+         "tab\there" "null byte" ""]))
+
+(defn- train-merges
+  "A small BPE trainer over the corpus: repeatedly merge the most frequent
+  adjacent symbol pair. Frequency ties break on the pair itself, so the table
+  is deterministic. Only the ORDER matters to the objects -- rank is index."
+  [n]
+  (let [words (frequencies (mapcat (fn [s] (map (fn [c] (mapv #(String. (Character/toChars %))
+                                                              (cpts (byte-encode c))))
+                                                (llama3-chunks s)))
+                                   corpus))]
+    (loop [words words merges []]
+      (if (= (count merges) n)
+        merges
+        (let [freq (reduce (fn [m [w c]]
+                             (reduce (fn [m p] (update m p (fnil + 0) c)) m
+                                     (map vector w (rest w))))
+                           {} words)]
+          (if (empty? freq)
+            merges
+            (let [pair (first (sort-by (fn [[p c]] [(- c) (str/join p)]) freq))
+                  [l r] (first pair)
+                  apply1 (fn [w]
+                           (loop [i 0 out []]
+                             (cond (>= i (count w)) out
+                                   (and (< (inc i) (count w))
+                                        (= l (nth w i)) (= r (nth w (inc i))))
+                                   (recur (+ i 2) (conj out (str l r)))
+                                   :else (recur (inc i) (conj out (nth w i))))))]
+              (recur (into {} (map (fn [[w c]] [(apply1 w) c])) words)
+                     (conj merges [l r])))))))))
+
+(def ^:private fixture
+  (delay
+    (let [merges (train-merges 600)
+          base (vec byte->char)
+          merged (reduce (fn [acc [l r]]
+                           (let [s (str l r)] (if (some #{s} acc) acc (conj acc s))))
+                         base merges)
+          ;; three added tokens, to exercise detokenize's token_type arm
+          specials ["<|endoftext|>" "<|im_start|>" "<|unused|>"]
+          tokens (into merged specials)
+          types (into (vec (repeat (count merged) 1)) [3 4 5])]
+      {:tokens tokens
+       :merges merges
+       :types types
+       :token->id (into {} (map-indexed (fn [i t] [t i])) tokens)
+       :ranks (into {} (map-indexed (fn [i p] [(vec p) i])) merges)})))
+
+;; --------------------------------------------------------- the GGUF image
+
+(defn- le [v n] (mapv #(bit-and (bit-shift-right (long v) (* 8 %)) 255) (range n)))
+(defn- str-elem [bs] (into (le (count bs) 8) bs))
+
+(def ^:private image-base 0x100000)
+(def ^:private work-bytes (* 2 1024 1024))
+(def ^:private input-off 1048576)
+(def ^:private output-off 1310720)
+(def ^:private scratch-off 1441792)
+(def ^:private scratch-bytes 16384)
+(def ^:private ids-off 1572864)
+(def ^:private text-off 1703936)
+
+(def ^:private model
+  (delay
+    (let [{:keys [tokens merges types]} @fixture
+          pad 24
+          tok (vec (mapcat #(str-elem (ubytes %)) tokens))
+          typ (vec (mapcat #(le % 4) types))
+          mrg (vec (mapcat (fn [[l r]] (str-elem (ubytes (str l " " r)))) merges))]
+      {:bytes (vec (concat (repeat pad 0) tok typ mrg))
+       :tokens-at pad
+       :types-at (+ pad (count tok))
+       :merges-at (+ pad (count tok) (count typ))})))
+
+(defn- fresh-image []
+  (volatile! (into (vector-of :long)
+                   (concat (:bytes @model) (repeat work-bytes 0)))))
+
+(defn- wb [] (+ image-base (count (:bytes @model))))
+
+(defn- put32! [image off v]
+  (dotimes [i 4] (vswap! image assoc (+ (count (:bytes @model)) off i)
+                         (bit-and (bit-shift-right (long v) (* 8 i)) 255))))
+
+(defn- get32 [image off]
+  (let [b @image o (+ (count (:bytes @model)) off)]
+    (+ (nth b o) (* 256 (nth b (+ o 1)))
+       (* 65536 (nth b (+ o 2))) (* 16777216 (nth b (+ o 3))))))
+
+(defn- put-bytes! [image off bs]
+  (let [base (count (:bytes @model))]
+    (doseq [[i b] (map-indexed vector bs)] (vswap! image assoc (+ base off i) b))))
+
+(defn- on-big-stack [f]
+  (let [result (promise)
+        t (Thread. nil #(deliver result (try {:ok (f)} (catch Throwable e {:err e})))
+                   "qwen35-tokenizer" (* 1024 1024 1024))]
+    (.start t) (.join t)
+    (let [{:keys [ok err]} @result] (if err (throw err) ok))))
+
+(defn- call
+  ([object entry image] (call object entry image 400000000 nil))
+  ([object entry image fuel args]
+   (on-big-stack
+    #(ir/execute (get @kir object) entry
+                 (or args [image-base (count (:bytes @model)) (wb) work-bytes])
+                 {:fuel fuel :memory {:base image-base :bytes image}}))))
+
+(defn- header! [image]
+  (let [{:keys [tokens merges]} @fixture
+        {:keys [tokens-at merges-at types-at]} @model]
+    (put32! image 4 (count tokens))
+    (put32! image 8 (count merges))
+    (put32! image 12 tokens-at)
+    (put32! image 16 merges-at)
+    (put32! image 44 types-at)
+    (put32! image 48 input-off)
+    (put32! image 56 output-off)
+    (put32! image 60 32768)
+    (put32! image 68 scratch-off)
+    (put32! image 72 scratch-bytes)
+    (put32! image 76 ids-off)
+    (put32! image 84 text-off)
+    (put32! image 88 65536)))
+
+(def ^:private built
+  "One image with the index built, reused by every read-only case. The build
+  is the expensive half and nothing that follows changes the tables."
+  (delay
+    (let [image (fresh-image)]
+      (header! image)
+      (let [verdict (call "qwen35-vocab-index-build" 'aiueos-qwen35-vocab-index-build image)]
+        (when-not (zero? verdict)
+          (throw (ex-info "the fixture index did not build" {:verdict verdict})))
+        image))))
+
+(defn- tokenize! [image ^String s]
+  (let [bs (ubytes s)]
+    (put-bytes! image input-off bs)
+    (put32! image 52 (count bs))
+    (let [verdict (call "qwen35-tokenize" 'aiueos-qwen35-tokenize image)]
+      (if (zero? verdict)
+        (mapv #(get32 image (+ output-off (* 4 %))) (range (get32 image 64)))
+        verdict))))
+
+(defn- detokenize! [image ids]
+  (doseq [[i id] (map-indexed vector ids)]
+    (put-bytes! image (+ ids-off (* 4 i)) (le id 4)))
+  (put32! image 80 (count ids))
+  (let [verdict (call "qwen35-detokenize" 'aiueos-qwen35-detokenize image)]
+    (if (zero? verdict)
+      (from-utf8 (let [b @image base (count (:bytes @model))]
+                   (mapv #(nth b (+ base text-off %)) (range (get32 image 92)))))
+      verdict)))
+
+;; ------------------------------------------------------------------ tests
+
+(deftest kotoba-objects-are-present
+  (sources-available?))
+
+(deftest the-index-builds-and-derives-its-own-layout
+  (when (sources-available?)
+    (let [image @built
+          {:keys [tokens merges]} @fixture
+          c1 (get32 image 28) c2 (get32 image 36)]
+      (println "SCANNED" (count tokens) "tokens and" (count merges) "merges; C1" c1 "C2" c2
+               "index end" (get32 image 40))
+      (is (= 0x4B544F4B (get32 image 0)) "the KTOK magic is written last")
+      (is (= 128 (get32 image 20)) "the token offset table follows the header")
+      (is (and (>= c1 (* 2 (count tokens))) (zero? (bit-and c1 (dec c1))))
+          "the token hash capacity is a power of two at or above 2V")
+      (is (and (>= c2 (* 2 (count merges))) (zero? (bit-and c2 (dec c2))))
+          "the merge table capacity is a power of two at or above 2M")
+      (is (= (get32 image 40) (+ (get32 image 32) (* 12 c2)))
+          "the index ends where the merge table does"))))
+
+(deftest the-two-pre-tokenizers-agree
+  ;; The regex engine against the transcription, before either is compared to
+  ;; the object -- so a disagreement here is not blamed on the Kotoba.
+  ;; U+001C..U+001F are excluded: llama.cpp counts them as whitespace and
+  ;; Unicode's White_Space property does not, so the two are known to differ
+  ;; there and this test does not pretend otherwise.
+  (let [comparable (remove #(re-find #"[-]" %) vectors)
+        disagreeing (remove #(= (llama3-chunks %) (regex-chunks %)) comparable)]
+    (println "SCANNED" (count comparable) "vectors through both pre-tokenizers,"
+             (count disagreeing) "disagree")
+    (is (pos? (count comparable)) "evidence floor: an empty vector set is not a pass")
+    (is (empty? disagreeing)
+        (str "the hand splitter and java.util.regex disagree on "
+             (pr-str (take 3 (map (juxt identity llama3-chunks regex-chunks) disagreeing)))))))
+
+(def ^:private class-probes
+  "Every codepoint at which Java's classification CHANGES inside the declared
+  blocks, plus the codepoint either side of it, plus a strided sample.
+
+  Not every codepoint of the blocks. One `ir/execute` call costs ~9 ms --
+  the interpreter revalidates all 48 lowered functions per call -- so the
+  106,546 of them would be about sixteen minutes, and this suite already
+  spends minutes on the fuel measurement. The transitions are where a range
+  table is wrong: an off-by-one at either end of a run is the failure mode a
+  generated table has, and it cannot hide from a probe on both sides of every
+  boundary. The stride catches a range dropped whole."
+  (delay
+    (let [transitions (for [[lo hi] declared-blocks
+                            cp (range lo (inc hi))
+                            :when (or (= cp lo) (not= (java-class cp) (java-class (dec cp))))
+                            probe [(dec cp) cp (inc cp)]
+                            :when (<= lo probe hi)]
+                        probe)
+          strided (for [[lo hi] declared-blocks
+                        cp (range lo (inc hi) 97)]
+                    cp)]
+      (vec (sort (distinct (concat transitions strided)))))))
+
+(deftest the-object-classifies-the-declared-codepoints-the-way-java-does
+  ;; A UNICODE VERSION APPEARS IN THIS COMPARISON TWICE and the two need not be
+  ;; the same one. The object's 122-range table was generated from a JDK's
+  ;; `\p{L}` / `\p{N}`; this test re-derives the classes from whichever JDK is
+  ;; running it. Measured 2026-09-02: JDK 26 and JDK 24 disagree about 18 of
+  ;; these codepoints, all of them CJK extension characters that JDK 26 has and
+  ;; JDK 24 calls UNASSIGNED.
+  ;;
+  ;; So a disagreement is admitted ONLY in that direction -- the object
+  ;; classifies a codepoint this JDK does not assign at all. The other
+  ;; direction (this JDK assigns a letter or a number the table calls "other")
+  ;; is a real gap: the table predates the running Unicode and has to be
+  ;; regenerated. Failing on it is the point, not an accident.
+  (when (sources-available?)
+    (let [obj (get @kir "qwen35-tokenize")
+          probes @class-probes
+          skew (volatile! [])
+          wrong (volatile! [])]
+      (on-big-stack
+       #(doseq [cp probes]
+          (let [got (ir/execute obj 'cp-class [cp] {:fuel 1000})
+                want (java-class cp)]
+            (when (not= got want)
+              (if (zero? (Character/getType cp))
+                (vswap! skew conj (format "U+%04X" cp))
+                (vswap! wrong conj [(format "U+%04X" cp) :object got :java want]))))))
+      (println "SCANNED" (count probes) "class probes on JDK"
+               (System/getProperty "java.version") "--" (count @wrong) "misclassified,"
+               (count @skew) "unassigned here and classified by the table")
+      (is (> (count probes) 1000)
+          "evidence floor: a probe set this small would not cover 122 ranges")
+      (is (empty? @wrong)
+          (str "the table is older than this JDK's Unicode; regenerate it. "
+               "First disagreements: " (pr-str (take 5 @wrong)))))))
+
+(deftest the-blind-spot-outside-the-declared-blocks-is-measured
+  ;; Not a pass/fail about correctness -- a number. Every codepoint of the BMP
+  ;; that Java calls a letter or a number and the object's table does not cover
+  ;; is one the pre-tokenizer will treat as punctuation.
+  (let [declared (into #{} (mapcat (fn [[lo hi]] (range lo (inc hi)))) declared-blocks)
+        outside (for [cp (range 0x10000)
+                      :when (not (contains? declared cp))
+                      :when (pos? (java-class cp))]
+                  cp)]
+    (println "SCANNED 65536 BMP codepoints;" (count outside)
+             "are letters/numbers/whitespace outside the declared blocks"
+             "(first:" (format "U+%04X" (or (first outside) 0)) ")")
+    (is (< (count outside) 20000)
+        "the declared blocks must still cover the majority of assigned letters")))
+
+(deftest every-vector-agrees-with-the-oracle
+  (when (sources-available?)
+    (let [image @built
+          {:keys [token->id ranks]} @fixture
+          results (doall (for [v vectors]
+                           (let [got (tokenize! image v)
+                                 want (oracle-ids token->id ranks v)]
+                             [v got want])))
+          bad (remove (fn [[_ got want]] (= got want)) results)]
+      (println "SCANNED" (count results) "vectors against the oracle," (count bad) "disagree")
+      (is (pos? (count results)) "evidence floor")
+      (is (empty? bad)
+          (str "first disagreements: "
+               (pr-str (take 3 (map (fn [[v g w]] {:text v :object g :oracle w}) bad))))))))
+
+(deftest every-vector-round-trips
+  (when (sources-available?)
+    (let [image @built
+          results (doall (for [v vectors]
+                           (let [ids (tokenize! image v)]
+                             [v ids (if (vector? ids) (detokenize! image ids) ids)])))
+          bad (remove (fn [[v _ back]] (= v back)) results)]
+      (println "SCANNED" (count results) "round trips," (count bad) "lost bytes")
+      (is (empty? bad)
+          (str "first losses: " (pr-str (take 3 (map (fn [[v _ b]] [v b]) bad))))))))
+
+(deftest invalid-utf8-becomes-the-replacement-character-not-itself
+  ;; llama.cpp rebuilds each pre-token from the codepoint vector, and an
+  ;; invalid byte has already become U+FFFD there -- so the token stream
+  ;; carries EF BF BD, not the byte that arrived. Round-tripping such an input
+  ;; therefore does NOT return it, and this pins that rather than hiding it.
+  (when (sources-available?)
+    (let [image @built
+          {:keys [token->id ranks]} @fixture
+          raw [0x61 0xC3 0x28 0x62]                ; "a", a truncated 2-byte lead, "(", "b"
+          _ (put-bytes! image input-off raw)
+          _ (put32! image 52 (count raw))
+          verdict (call "qwen35-tokenize" 'aiueos-qwen35-tokenize image)
+          got (mapv #(get32 image (+ output-off (* 4 %))) (range (get32 image 64)))
+          want (oracle-ids token->id ranks (from-utf8 raw))]
+      (println "SCANNED 1 invalid-UTF-8 vector, verdict" verdict)
+      (is (= 0 verdict))
+      (is (= want got) "the object and the oracle agree on the replaced bytes")
+      (is (= "a�(b" (detokenize! image got))
+          "the replacement character is what comes back, not 0xC3"))))
+
+(deftest control-and-unused-tokens-render-as-nothing
+  (when (sources-available?)
+    (let [image @built
+          {:keys [tokens]} @fixture
+          eot (- (count tokens) 3)                  ; <|endoftext|>, token_type 3
+          im (- (count tokens) 2)                   ; <|im_start|>,  token_type 4
+          unused (- (count tokens) 1)               ; <|unused|>,    token_type 5
+          hi (tokenize! image "hi")]
+      (is (vector? hi))
+      (is (= "hi" (detokenize! image (into [eot] (conj (vec hi) unused))))
+          "a control token and an unused token contribute no bytes")
+      (is (= "<|im_start|>hi" (detokenize! image (into [im] hi)))
+          "a user-defined token is copied verbatim, not byte-decoded"))))
+
+;; --------------------------------------------------------------- refusals
+
+(def ^:private index-refusals
+  [{:code -1 :why "null model base" :args [0 100 nil nil]}
+   {:code -2 :why "null workspace base" :args [image-base 100 0 nil]}
+   {:code -3 :why "workspace below the header" :args [image-base 100 nil 127]}
+   {:code -4 :why "zero vocabulary" :header {4 0}}
+   {:code -4 :why "vocabulary above 1,048,576" :header {4 1048577}}
+   {:code -5 :why "merges above 1,048,576" :header {8 1048577}}
+   {:code -6 :why "token array outside the model window" :header {12 999999999}}
+   {:code -7 :why "merge array outside the model window" :header {16 999999999}}
+   {:code -8 :why "the index does not fit" :args [image-base nil nil 4096]}
+   ;; The token array starts inside the window and runs past it. The merge
+   ;; count is zeroed so the -7 clause, which would fire first, does not.
+   {:code -9 :why "a token string runs past the window" :header {8 0}
+    :args [image-base :short nil nil]}])
+
+(deftest every-index-clause-refuses-with-its-own-code
+  (when (sources-available?)
+    (let [observed
+          (doall
+           (for [{:keys [code why args header also]} index-refusals]
+             (let [image (fresh-image)
+                   _ (header! image)
+                   _ (doseq [[off v] (merge header also)] (put32! image off v))
+                   [mb ml b l] (or args [nil nil nil nil])
+                   verdict (call "qwen35-vocab-index-build" 'aiueos-qwen35-vocab-index-build
+                                 image 400000000
+                                 [(if (some? mb) mb image-base)
+                                  (cond (= :short ml) (+ (:tokens-at @model) 40)
+                                        (some? ml) ml
+                                        :else (count (:bytes @model)))
+                                  (if (some? b) b (wb))
+                                  (if (some? l) l work-bytes)])]
+               (is (= code verdict) (str "clause " code " (" why ")"))
+               verdict)))]
+      (println "SCANNED" (count index-refusals) "index refusals, distinct codes:"
+               (count (set observed))))))
+
+(def ^:private tokenize-refusals
+  [{:code -1 :why "null model base" :args [0 nil nil nil]}
+   {:code -2 :why "null workspace base" :args [nil nil 0 nil]}
+   {:code -3 :why "workspace below the header" :args [nil nil nil 127]}
+   {:code -5 :why "model window above 16 MiB" :args [nil 16777217 nil nil]}
+   {:code -6 :why "input above 32,768 bytes" :header {52 32769}}
+   {:code -7 :why "the input leaves the workspace" :header {48 (- work-bytes 4) 52 64}}
+   {:code -8 :why "the output leaves the workspace" :header {56 (- work-bytes 4) 60 64}}
+   {:code -9 :why "scratch below 13,312 bytes" :header {72 13311}}
+   {:code -9 :why "scratch leaves the workspace" :header {68 (- work-bytes 4)}}
+   {:code -26 :why "output capacity exhausted" :header {60 1} :text "hello world"}])
+
+(deftest every-tokenize-clause-refuses-with-its-own-code
+  (when (sources-available?)
+    (doseq [{:keys [code why args header text]} tokenize-refusals]
+      (let [image @built
+            saved (into {} (for [[off _] header] [off (get32 image off)]))]
+        (try
+          (header! image)
+          (let [bs (ubytes (or text "hi"))]
+            (put-bytes! image input-off bs)
+            (put32! image 52 (count bs)))
+          (doseq [[off v] header] (put32! image off v))
+          (let [[mb ml b l] (or args [nil nil nil nil])
+                verdict (call "qwen35-tokenize" 'aiueos-qwen35-tokenize image 400000000
+                              [(if (some? mb) mb image-base)
+                               (if (some? ml) ml (count (:bytes @model)))
+                               (if (some? b) b (wb))
+                               (if (some? l) l work-bytes)])]
+            (is (= code verdict) (str "clause " code " (" why ")")))
+          (finally
+            (header! image)
+            (doseq [[off v] saved] (put32! image off v))))))
+    (println "SCANNED" (count tokenize-refusals) "tokenize refusals")))
+
+(deftest a-chunk-above-512-symbols-is-refused
+  ;; The bound that makes the quadratic merge loop finite. 513 letters with no
+  ;; break in them is one chunk; 512 is the largest this admits.
+  (when (sources-available?)
+    (let [image @built]
+      (is (vector? (tokenize! image (apply str (repeat 512 \a))))
+          "512 byte-symbols is admitted")
+      (is (= -24 (tokenize! image (apply str (repeat 513 \a))))
+          "513 is refused, and named")
+      (println "SCANNED the 512/513 boundary: admitted then refused"))))
+
+(def ^:private detokenize-refusals
+  [{:code -31 :why "id at the vocabulary count" :ids [999999]}
+   {:code -34 :why "text capacity exhausted" :ids [104 105 106] :header {88 1}}
+   {:code -6 :why "more than 32,768 ids" :header {80 32769}}])
+
+(deftest every-detokenize-clause-refuses-with-its-own-code
+  (when (sources-available?)
+    (doseq [{:keys [code why ids header]} detokenize-refusals]
+      (let [image @built]
+        (header! image)
+        (when ids
+          (doseq [[i id] (map-indexed vector ids)]
+            (put-bytes! image (+ ids-off (* 4 i)) (le id 4)))
+          (put32! image 80 (count ids)))
+        (doseq [[off v] header] (put32! image off v))
+        (let [verdict (call "qwen35-detokenize" 'aiueos-qwen35-detokenize image)]
+          (is (= code verdict) (str "clause " code " (" why ")")))
+        (header! image)))
+    (println "SCANNED" (count detokenize-refusals) "detokenize refusals")))
+
+;; ------------------------------------------------------------------ fuel
+;;
+;; A BRACKET, NOT A SEARCH. The numbers below came from a bisection run once,
+;; offline; repeating it here would cost most of an hour, because a probe that
+;; FAILS burns its entire budget before trapping and the search spends more on
+;; the attempts that fail than on the one that succeeds. Two runs is what it
+;; takes to be discriminating: one below the bound and one at it.
+
+(def ^:private one-kib-traps-at 222208)
+(def ^:private one-kib-completes-at 225280)
+(def ^:private kotoba-native-tier 250000000)
+
+(defn- fuel-ok? [image ^String text fuel]
+  (let [bs (ubytes text)]
+    (put-bytes! image input-off bs)
+    (put32! image 52 (count bs))
+    (try (zero? (call "qwen35-tokenize" 'aiueos-qwen35-tokenize image fuel nil))
+         (catch Throwable _ false))))
+
+(defn- prose [n]
+  (let [t (apply str (repeat 1000 "the quick brown fox jumps over the lazy dog. "))]
+    (subs t 0 n)))
+
+(deftest fuel-is-bracketed-at-one-kibibyte-and-projected-at-thirty-two
+  (when (sources-available?)
+    (let [image @built
+          t0 (System/nanoTime)
+          below (fuel-ok? image (prose 1024) one-kib-traps-at)
+          at (fuel-ok? image (prose 1024) one-kib-completes-at)
+          per-byte (/ (double one-kib-completes-at) 1024)
+          projected (long (* per-byte 32768))]
+      (println "FUEL 1 KiB: traps at" one-kib-traps-at ", completes at"
+               one-kib-completes-at "->" (format "%.0f" per-byte)
+               "per input byte; 32 KiB projects to" projected
+               "against the" kotoba-native-tier "tier ("
+               (quot (- (System/nanoTime) t0) 1000000000) "s )")
+      (is (false? below)
+          "a bound the object clears at every budget is not a bound")
+      (is (true? at) "the object must complete 1 KiB inside its measured bound")
+      ;; The 32 KiB figure is ARITHMETIC, not a run, and is labelled as such.
+      ;; One 32 KiB tokenisation costs about forty minutes in this interpreter
+      ;; on this workstation at load ~200, which is not a per-suite price. The
+      ;; projection is linear because the merge loop's quadratic term is in one
+      ;; CHUNK and prose chunks are words: the cost per byte does not move with
+      ;; the length of the input, only with the length of the longest unbroken
+      ;; run of letters, which -24 bounds at 512.
+      (is (< projected (quot kotoba-native-tier 10))
+          (str "the projected 32 KiB cost " projected " must sit an order of "
+               "magnitude inside the tier kotoba-native gives this object")))))

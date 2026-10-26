@@ -1,0 +1,101 @@
+#!/usr/bin/env kbb
+;; ADR-0014 V0+V1 smoke gate for `aiueos.hvt` (issue #110).
+;;
+;; Runs the JVM/FFM self-owned-VMM boot spike (`kbb -M:hvt …`, which needs a
+;; real /dev/kvm) and asserts its EDN run receipt: the guest must emit the
+;; expected serial string via MMIO traps AND halt. Two cases:
+;;   - default: the raw-word guest (`kbb -M:hvt`)               -- V0
+;;   - elf:     direct-load the aarch64 ELF fixture and boot it     -- V1 loader
+;; The KVM syscalls are JVM-FFM (nbb has no FFM), so this harness orchestrates
+;; the spike and checks the evidence rather than making the ioctls itself.
+;;
+;; Run inside the Linux/KVM VM (needs kvm-group access):
+;;   kbb --backend sci scripts/hvt-smoke.cljk
+
+(ns hvt-smoke
+  (:require ["child_process" :as cp]
+            [clojure.edn :as edn]
+            [kotoba.lang.text :as str]))
+
+(def expected-serial "HI\n")
+(def elf-fixture "resources/hvt/guest-aarch64.elf")
+(def virtio-fixture "resources/hvt/guest-virtio-aarch64.elf")
+(def virtqueue-fixture "resources/hvt/guest-virtqueue-aarch64.elf")
+(def virtqueue-rx-fixture "resources/hvt/guest-virtqueue-rx-aarch64.elf")
+(def kotoba-fixture "resources/hvt/guest-serial.elf")   ; written in Kotoba, not asm/C
+(def kotoba-virtio-fixture "resources/hvt/guest-virtio-probe.elf")  ; Kotoba + u32 MMIO virtio probe
+(def kotoba-handshake-fixture "resources/hvt/guest-virtio-handshake.elf")  ; Kotoba full transport handshake (do-sequenced)
+(def kotoba-tx-fixture "resources/hvt/guest-virtqueue-tx.elf")  ; Kotoba virtqueue transmit (guest->device)
+(def kotoba-rx-fixture "resources/hvt/guest-virtqueue-rx.elf")  ; Kotoba virtqueue receive (device->guest)
+
+(defn run-spike [argv]
+  (let [res (cp/spawnSync "clojure" (clj->js (into ["-M:hvt"] argv))
+                          #js {:encoding "utf8" :cwd (js/process.cwd)})]
+    {:status (.-status res)
+     :stdout (or (.-stdout res) "")
+     :stderr (or (.-stderr res) "")}))
+
+(defn last-edn-line
+  "The receipt is the last non-blank stdout line (clojure deps resolution may
+  print earlier noise on first run)."
+  [stdout]
+  (->> (str/split-lines stdout)
+       (map str/trim)
+       (remove str/blank?)
+       (filter #(str/starts-with? % "{"))
+       last))
+
+(defn check-case
+  "Run one spike case; return true iff it met the gate. `require-console?` also
+  asserts the receipt's :console (the virtio-console output the tender pulled
+  from the virtqueue) equals the expected string."
+  [label argv require-console?]
+  (println (str "[hvt-smoke] " label ": kbb -M:hvt " (str/join " " argv) " ..."))
+  (let [{:keys [status stdout stderr]} (run-spike argv)
+        line (last-edn-line stdout)
+        receipt (when line (try (edn/read-string line) (catch :default _ nil)))]
+    (when (seq (str/trim stderr))
+      (println "[hvt-smoke]   stderr:")
+      (doseq [l (str/split-lines (str/trim stderr))] (println "   " l)))
+    (if-not receipt
+      (do (println "[hvt-smoke]   FAIL: no EDN receipt on stdout (KVM unavailable?).")
+          (println stdout)
+          false)
+      (let [{:keys [serial serial-ok? shutdown? steps exits console]} receipt
+            console-ok? (or (not require-console?) (= console expected-serial))
+            ok? (and (= serial expected-serial) serial-ok? shutdown? console-ok? (zero? status))]
+        (println (str "[hvt-smoke]   receipt: serial=" (pr-str serial)
+                      " console=" (pr-str console)
+                      " shutdown?=" shutdown?
+                      " steps=" steps
+                      " mmio-exits=" (count (filter #(= :mmio (:reason %)) exits))
+                      " notify-exits=" (count (filter #(= :virtio-notify (:reason %)) exits))))
+        (println (str "[hvt-smoke]   " (if ok? "PASS" "FAIL") " -- " label))
+        ok?))))
+
+(defn -main []
+  (let [v0 (check-case "V0 raw-word guest (MMIO poweroff halt)" [] false)
+        v1 (check-case "V1 ELF direct-load (guest-aarch64.elf)" ["elf" elf-fixture] false)
+        v1v (check-case "V1 virtio-mmio transport handshake (guest-virtio-aarch64.elf)"
+                        ["elf" virtio-fixture] false)
+        v1q (check-case "V1 virtqueue transmit (guest-virtqueue-aarch64.elf, :console via virtqueue)"
+                        ["elf" virtqueue-fixture] true)
+        v1rx (check-case "V1 virtqueue receive (guest-virtqueue-rx-aarch64.elf, device->guest into serial)"
+                         ["elf" virtqueue-rx-fixture] false)
+        v1kt (check-case "V1 kotoba-first guest (guest-serial.elf: .kotoba -> aarch64 kernel ELF)"
+                         ["elf" kotoba-fixture] false)
+        v1ktv (check-case "V1 kotoba virtio probe (guest-virtio-probe.elf: .kotoba u32 MMIO vs the virtio device)"
+                          ["elf" kotoba-virtio-fixture] false)
+        v1kth (check-case "V1 kotoba virtio handshake (guest-virtio-handshake.elf: full transport handshake in Kotoba via do)"
+                          ["elf" kotoba-handshake-fixture] false)
+        v1ktx (check-case "V1 kotoba virtqueue transmit (guest-virtqueue-tx.elf: guest->device into :console)"
+                          ["elf" kotoba-tx-fixture] true)
+        v1krx (check-case "V1 kotoba virtqueue receive (guest-virtqueue-rx.elf: device->guest, echoed to serial)"
+                          ["elf" kotoba-rx-fixture] false)]
+    (if (and v0 v1 v1v v1q v1rx v1kt v1ktv v1kth v1ktx v1krx)
+      (do (println "[hvt-smoke] PASS -- self-owned VMM boots a raw guest, a direct-loaded ELF, the original asm/C virtio transport + virtqueue tx/rx (kept as a cross-check), and the FULL kotoba-first guest path: serial, u32 MMIO probe, transport handshake (DRIVER_OK), and virtqueue transmit + receive -- all in the Kotoba language; all halt cleanly.")
+          (js/process.exit 0))
+      (do (println "[hvt-smoke] FAIL -- one or more cases did not meet the gate.")
+          (js/process.exit 1)))))
+
+(-main)

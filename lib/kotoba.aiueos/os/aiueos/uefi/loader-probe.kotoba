@@ -1,0 +1,405 @@
+(ns aiueos.uefi-loader-probe
+  (:require [aiueos.uefi.console :as console]
+            [aiueos.uefi.elf :as elf]
+            [aiueos.uefi.memory :as memory]
+            [aiueos.uefi.fs :as fs]
+            [aiueos.uefi.exit :as exit]
+            [aiueos.uefi.integrity :as integrity])
+  (:export [efi-main main mark-when present verdict window-verdict
+            digest-verdict fs-reason both equals at-most]))
+
+;; A BOOTX64.EFI, written in Kotoba, that says what it decided.
+;;
+;; This composes the first two loader modules -- `aiueos.uefi.console` and
+;; `aiueos.uefi.elf` -- into one image, and it is the evidence that the PT_LOAD
+;; admission contract runs as x86-64 machine code on a real firmware rather
+;; than only inside an interpreter.
+;;
+;; ---------------------------------------------------------------------------
+;; THE FIXTURE IS A REAL KERNEL, NOT A HAND-BUILT HEADER
+;; ---------------------------------------------------------------------------
+;; The 176 bytes below are the ELF header and both program headers of a kernel
+;; that amu itself produced:
+;;
+;;   amu compile testkernel.kotoba --target x86_64-aiueos-kernel-v1 \
+;;       --artifact image --fuel 32768 --output TESTKERN.ELF
+;;   110,872 bytes,
+;;   sha256 e4a5c9dc3ca03e310d9b8a0924e9e2ce510fb9678335bd2fe6496b7e9c182f1e
+;;
+;;   e_entry 1052672  e_phoff 64  e_phentsize 56  e_phnum 2
+;;   seg0  PT_LOAD flags 5  offset  4096  paddr 1052672  filesz=memsz    160
+;;   seg1  PT_LOAD flags 6  offset 32768  paddr 1081344  filesz=memsz  77824
+;;
+;; A header invented to pass would only prove that the rules agree with
+;; themselves. This one proves the loader admits what the packager emits.
+;;
+;; ---------------------------------------------------------------------------
+;; FIVE REFUSALS, EACH NAMING ITS OWN CLAUSE
+;; ---------------------------------------------------------------------------
+;; Five copies of those same 176 bytes follow, each with ONE field changed, and
+;; each is expected to answer one specific reason. A verdict that merely went
+;; non-zero would not distinguish "the file is wrong" from "the reader is".
+;;
+;;   magic    e_ident[1] 45 -> 46      reason  2
+;;   machine  e_machine  62 -> 40      reason  5
+;;   paddr0   seg0 p_paddr -> 0x8000   reason 24  (segment 0, clause 4)
+;;   memsz0   seg0 p_memsz 160 -> 192  reason 23  (segment 0, clause 3)
+;;   flags1   seg1 p_flags 6 -> 7      reason 41
+;;
+;; ---------------------------------------------------------------------------
+;; THE DEBUG CONSOLE
+;; ---------------------------------------------------------------------------
+;;   K  the image entry ran
+;;   H  RCX (ImageHandle) survived the entry shim
+;;   S  RDX (SystemTable) survived it
+;;   C  ConOut is at SystemTable+0x40 and is not null
+;;   N  ClearScreen, SetAttribute and OutputString all returned EFI_SUCCESS
+;;   A  the real kernel's headers were ADMITTED (reason 0)
+;;   b c d e f  each mutation was refused with ITS OWN reason
+;;   P  a page the FIRMWARE allocated was WRITTEN and read back
+;;   W  the 4 GiB - 64 GiB placement rule answered all five of its clauses
+;;   g  those same 176 bytes hashed -- by SHA-256 running as x86-64 machine
+;;      code, with its 512-byte state in `kernel-scratch-region` -- to the
+;;      digest `shasum -a 256` computes for them off this machine
+;;   h  a digest one nibble different was refused, and refused with reason 4
+;;      rather than merely refused
+;;   Z  kernel-system-table still answers, so R9 survived every call
+;;
+;; then `out 0xf4, 16`, so QEMU leaves with (16 << 1) | 1 = 33.
+;;
+;; ---------------------------------------------------------------------------
+;; P AND W -- THE THIRD MODULE
+;; ---------------------------------------------------------------------------
+;; `aiueos.uefi.memory` is the placement half of `main.c`'s
+;; `load_verified_model` (:684-712). It could not be written before
+;; `kernel-uefi-alloc-region`: `AllocatePages`' answer arrives through a load,
+;; and a base that came from a load is refused, so a loader could allocate a
+;; page and could not put a byte in it.
+;;
+;;   P  `(kernel-uefi-alloc-region bs 40 0 2 1 0)` -- AllocateAnyPages,
+;;      EfiLoaderData, one page -- answers with the page's BASE, and
+;;      `kernel-store-u64-4k` then `kernel-load-u64-4k` carry a pattern
+;;      through the CHECKED family, so the declared window and its emitted
+;;      bounds check are in the path. 81985529216486895 is 0x0123456789ABCDEF;
+;;      firmware memory does not arrive holding it.
+;;
+;;   W  five placements, printed on the firmware console beside the ELF
+;;      verdicts and each expected to name ITS OWN clause:
+;;
+;;        0  4 GiB, 32 MiB allocated, 16 MiB wanted        admitted
+;;        4  1 MiB aligned up to 2 MiB                     below 4 GiB
+;;        3  the firmware answered zero                    not allocated
+;;        6  64 GiB - 2 MiB, 16 MiB wanted                 ends above 64 GiB
+;;        7  4 GiB + 4 KiB, allocated EXACTLY 16 MiB       ends past the pages
+;;
+;;      The last is the clause the 511 pages of slack exist for, and the one a
+;;      loader gets wrong: aligning the base up to 2 MiB moves the END of the
+;;      block up by the same amount, so a request sized to the mapped bytes
+;;      alone lands past its own allocation.
+
+(defn mark-when [flag byte]
+  (if (= flag 1) (kernel-out-u8 233 byte) 0))
+
+(defn present [word]
+  (if (= word 0) 0 1))
+
+;; Prints the reason on the firmware console and marks the debug console only
+;; when it is the reason this variant is supposed to produce.
+(defn verdict [out base image-len expected marker]
+  (let [r (elf/admit base 176 image-len)
+        sp (console/put out (ucs2 " "))
+        n (console/put-number out r)
+        m (mark-when (if (= r expected) 1 0) marker)]
+    (+ r (* 0 (+ sp (+ n m))))))
+
+;; Prints one placement verdict beside the ELF ones and answers 1 when it is
+;; the clause this placement is supposed to produce.
+(defn window-verdict [out raw-base raw-pages want expected]
+  (let [r (memory/window-reason raw-base raw-pages want)
+        sp (console/put out (ucs2 " "))
+        n (console/put-number out r)]
+    (if (= r expected) (+ 1 (* 0 (+ sp n))) 0)))
+
+;; SHA-256 needs 512 bytes of state that survives between blocks, and
+;; `kernel-scratch-region` (boot-scratch) is where it lives. 16,384 is the
+;; reserved size; the library reads it through a 512-byte window.
+;;
+;; These two verdicts were written before they could run. Measured 2026-09-02,
+;; a UEFI image ran on a fixed budget of 512 whatever `--fuel` said -- `--fuel
+;; 512` and `--fuel 1048576` produced BYTE-IDENTICAL artifacts -- and one
+;; 64-byte SHA block costs about 1,772, so `sha-block` trapped at its own fuel
+;; guard. amu#764 made the declared budget reach the image.
+(defn digest-verdict [out src expected marker]
+  (let [r (integrity/verify (kernel-scratch-region) 16384 src 176 expected)
+        sp (console/put out (ucs2 " "))
+        n (console/put-number out r)
+        m (mark-when (if (= r (if (= marker 103) 0 4)) 1 0) marker)]
+    (+ r (* 0 (+ sp (+ n m))))))
+
+;; Prints one fs-stage reason beside the ELF verdicts, so the serial line
+;; carries the same "named clause" evidence the marks carry. Answers the
+;; reason so the caller can fold it if it wants to.
+(defn fs-reason [out r]
+  (let [sp (console/put out (ucs2 " "))
+        n (console/put-number out r)]
+    (+ r (* 0 (+ sp n)))))
+
+;; The fallback exit's one diagnostic: reached only when ExitBootServices
+;; REFUSED (a successful exit leaves no console to print on), so the firmware
+;; is still alive here and the refusal's own status can name the clause --
+;; printed as `xstat <status> <map-refresh status>` on its own serial line
+;; before the run ends through isa-debug-exit.
+(defn exit-fallback [out xstat restat]
+  (let [nl (console/put out (ucs2 "\r\nxstat"))
+        n0 (fs-reason out xstat)
+        n1 (fs-reason out restat)
+        e (kernel-out-u32 244 16)]
+    0))
+
+;; The boot stage's flags each stand on four or more separate facts, and a
+;; five-deep `if` nest is where one of them gets dropped without anyone
+;; noticing (the same reason `examples/aiueos-uefi-scratch.kotoba` folds its
+;; markers this way).
+(defn both [a b]
+  (if (= a 1) (if (= b 1) 1 0) 0))
+
+(defn equals [a b]
+  (if (= a b) 1 0))
+
+(defn at-most [v ceiling]
+  (if (> v ceiling) 0 1))
+
+(defn efi-main [image-handle system-table]
+  (let [out (console/con-out system-table)
+        cleared (console/clear-screen out)
+        attr (console/set-attribute out 15)
+        banner (console/put out (ucs2 "AIUEOS KOTOBA LOADER\r\n"))
+        m0 (kernel-out-u8 233 75)
+        m1 (mark-when (present image-handle) 72)
+        m2 (mark-when (present system-table) 83)
+        m3 (mark-when (present out) 67)
+        m4 (mark-when (if (= cleared 0) (if (= attr 0) (if (= banner 0) 1 0) 0) 0) 78)
+        lh (console/put out (ucs2 "entry  "))
+        eh (console/put-hex64 out (elf/entry-point (bytes-literal "7f454c4602010100000000000000000002003e00010000000010100000000000400000000000000018b0010000000000000000004000380002004000040003000100000005000000001000000000000000101000000000000010100000000000a000000000000000a00000000000000000100000000000000100000006000000008000000000000000801000000000000080100000000000003001000000000000300100000000000010000000000000") 176)
+                              1152921504606846976)
+        nl0 (console/put out (ucs2 "\r\nverdict"))
+        v0 (verdict out (bytes-literal "7f454c4602010100000000000000000002003e00010000000010100000000000400000000000000018b0010000000000000000004000380002004000040003000100000005000000001000000000000000101000000000000010100000000000a000000000000000a00000000000000000100000000000000100000006000000008000000000000000801000000000000080100000000000003001000000000000300100000000000010000000000000")    110872 0  65)
+        v1 (verdict out (bytes-literal "7f464c4602010100000000000000000002003e00010000000010100000000000400000000000000018b0010000000000000000004000380002004000040003000100000005000000001000000000000000101000000000000010100000000000a000000000000000a00000000000000000100000000000000100000006000000008000000000000000801000000000000080100000000000003001000000000000300100000000000010000000000000")   110872 2  98)
+        v2 (verdict out (bytes-literal "7f454c4602010100000000000000000002002800010000000010100000000000400000000000000018b0010000000000000000004000380002004000040003000100000005000000001000000000000000101000000000000010100000000000a000000000000000a00000000000000000100000000000000100000006000000008000000000000000801000000000000080100000000000003001000000000000300100000000000010000000000000") 110872 5  99)
+        v3 (verdict out (bytes-literal "7f454c4602010100000000000000000002003e00010000000010100000000000400000000000000018b0010000000000000000004000380002004000040003000100000005000000001000000000000000101000000000000080000000000000a000000000000000a00000000000000000100000000000000100000006000000008000000000000000801000000000000080100000000000003001000000000000300100000000000010000000000000")  110872 24 100)
+        v4 (verdict out (bytes-literal "7f454c4602010100000000000000000002003e00010000000010100000000000400000000000000018b0010000000000000000004000380002004000040003000100000005000000001000000000000000101000000000000010100000000000a000000000000000c00000000000000000100000000000000100000006000000008000000000000000801000000000000080100000000000003001000000000000300100000000000010000000000000")  110872 23 101)
+        v5 (verdict out (bytes-literal "7f454c4602010100000000000000000002003e00010000000010100000000000400000000000000018b0010000000000000000004000380002004000040003000100000005000000001000000000000000101000000000000010100000000000a000000000000000a00000000000000000100000000000000100000007000000008000000000000000801000000000000080100000000000003001000000000000300100000000000010000000000000")  110872 41 102)
+        nl1 (console/put out (ucs2 "\r\n"))
+
+        ;; P -- the page the firmware allocated is one this image may WRITE.
+        bs (console/boot-services system-table)
+        page (kernel-uefi-alloc-region bs 40 0 2 1 0)
+        stored (kernel-store-u64-4k page 4096 0 81985529216486895)
+        m6 (mark-when
+             (if (= (kernel-load-u64-4k page 4096 0) 81985529216486895) 1 0)
+             80)
+
+        ;; W -- and the placement rule says where such pages are allowed to be.
+        lw (console/put out (ucs2 "window"))
+        w0 (window-verdict out 4294967296 8192 16777216 0)
+        w1 (window-verdict out 1048576 8192 16777216 4)
+        w2 (window-verdict out 0 8192 16777216 3)
+        w3 (window-verdict out 68717379584 8192 16777216 6)
+        w4 (window-verdict out 4294971392 4096 16777216 7)
+        m7 (mark-when (if (= (+ w0 (+ w1 (+ w2 (+ w3 w4)))) 5) 1 0) 87)
+        nl2 (console/put out (ucs2 "\r\ndigest"))
+
+        ;; g / h -- the loader's central security decision, running as machine
+        ;; code: does this image hash to the digest we expected? The second
+        ;; call is what makes the first mean anything, and it asserts the
+        ;; REASON (4) rather than merely "non-zero", so a comparison that
+        ;; refused everything would not pass.
+        d0 (digest-verdict out (bytes-literal "7f454c4602010100000000000000000002003e00010000000010100000000000400000000000000018b0010000000000000000004000380002004000040003000100000005000000001000000000000000101000000000000010100000000000a000000000000000a00000000000000000100000000000000100000006000000008000000000000000801000000000000080100000000000003001000000000000300100000000000010000000000000")
+                           (bytes-literal "db5502b1e112b394008f0fa17a7a4cfe891411d3e79a537874c025187f1825e1")
+                           103)
+        d1 (digest-verdict out (bytes-literal "7f454c4602010100000000000000000002003e00010000000010100000000000400000000000000018b0010000000000000000004000380002004000040003000100000005000000001000000000000000101000000000000010100000000000a000000000000000a00000000000000000100000000000000100000006000000008000000000000000801000000000000080100000000000003001000000000000300100000000000010000000000000")
+                           (bytes-literal "db5502b1e112b394008f0fa17a7a4cfe891411d3e79a537874c025187f1825e2")
+                           104)
+        nl3 (console/put out (ucs2 "\r\n"))
+
+        ;; fs -- the loader's read half, on a real volume. The smoke puts a
+        ;; kernel on the ESP at \EFI\AIUEOS\KERNEL.ELF (main.c's path), and
+        ;; the stage reads it through EFI_SIMPLE_FILE_SYSTEM into a page this
+        ;; image may write, then admits THOSE bytes -- not a literal pool.
+        ;; Two pages are spelled here because the allocation FORM belongs at
+        ;; the site that declares the window: one holds the stage's out-slots,
+        ;; one holds the file bytes. Six marks, in stage order:
+        ;;
+        ;;   v  the device has a loaded-image handle to read from
+        ;;   o  the volume opened
+        ;;   n  a name that is NOT on the volume is refused with the open
+        ;;      clause's own reason (3) -- the negative that makes v/o/k mean
+        ;;      something
+        ;;   k  the kernel file opened
+        ;;   r  the read returned exactly the 176 bytes asked for
+        ;;   x  the bytes read off the disk are ADMITTED (reason 0) by the
+        ;;      same elf stage that admitted the literal fixtures -- against
+        ;;      the file length MEASURED by `fs/file-size`, not the 176 bytes
+        ;;      this stage read: `elf/admit`'s clause 8 compares each
+        ;;      segment's `p_offset + p_filesz` to the whole image, so a
+        ;;      length of 176 could only admit a header invented to fit in
+        ;;      176 bytes (the literal fixtures' own segments end at 110,592).
+        fslots (kernel-uefi-alloc-region bs 40 0 2 1 0)
+        fbuf (kernel-uefi-alloc-region bs 40 0 2 1 0)
+        fdev (fs/device-handle bs image-handle fslots)
+        froot (fs/open-volume bs fdev fslots)
+        m8 (mark-when (if (= (fs/device-reason fdev) 0) 1 0) 118)
+        m9 (mark-when (if (= (fs/volume-reason froot) 0) 1 0) 111)
+        fmiss (fs/open-read froot (ucs2 "\\EFI\\AIUEOS\\MISSING.ELF") fslots)
+        m10 (mark-when (if (= (fs/open-reason fmiss) 3) 1 0) 110)
+        ffile (fs/open-read froot (fs/kernel-path) fslots)
+        m11 (mark-when (if (= (fs/open-reason ffile) 0) 1 0) 107)
+        flen (fs/file-size ffile fslots)
+        fstat (fs/read-into ffile fbuf 176 fslots)
+        fgot (fs/read-count fslots)
+        m12 (mark-when (if (= (fs/read-reason fstat 176 fgot) 0) 1 0) 114)
+        fclose (fs/close-file ffile)
+        fadmit (elf/admit fbuf 4096 flen)
+        m13 (mark-when (if (= fadmit 0) 1 0) 120)
+        nl4 (console/put out (ucs2 "\r\nesp"))
+        q0 (fs-reason out (fs/device-reason fdev))
+        q1 (fs-reason out (fs/volume-reason froot))
+        q2 (fs-reason out (fs/open-reason fmiss))
+        q3 (fs-reason out (fs/open-reason ffile))
+        q4 (fs-reason out (fs/read-reason fstat 176 fgot))
+        q5 (fs-reason out fadmit)
+
+        ;; ------------------------------------------------------------------
+        ;; boot -- the last of ADR-0180's modules: place the admitted kernel,
+        ;; take the machine from the firmware, and go to the entry it was
+        ;; admitted with. `main.c`'s `load_verified_model` loop (:1120-1138)
+        ;; does exactly this per segment -- AllocatePages(AllocateAddress,
+        ;; EfiLoaderData, pages, &paddr), assert the answer is the p_paddr the
+        ;; headers claim, CopyMem the bytes -- and so does this stage, from
+        ;; the same admitted headers. Four marks, in stage order:
+        ;;
+        ;;   T  the placement facts parsed from the headers already admitted
+        ;;      in fbuf agree with the literals the pages are asked for: seg0
+        ;;      at 4096 into the file goes to 0x101000, seg1 at 32768 to
+        ;;      0x108000, the entry is seg0's address, filesz == memsz on both,
+        ;;      and each memsz fits the pages asked for
+        ;;   U  the whole file read off the ESP (count == the measured length,
+        ;;      length inside the 28-page buffer), both segments PLACED at
+        ;;      their p_paddr (AllocateAddress answered the hint), and both
+        ;;      CopyMem calls answered their destination (CopyMem's convention
+        ;;      is RETURN Destination, not a status -- measured 2026-10-24:
+        ;;      c0 == s0 == 0x101000, c1 == s1 == 0x108000)
+        ;;   M  GetMemoryMap answered a map this loader may hand a kernel
+        ;;      (`aiueos.uefi.exit/map-reason` = 0)
+        ;;   X  ExitBootServices returned EFI_SUCCESS. After this the firmware
+        ;;      console is gone -- only port I/O survives, which is why every
+        ;;      line above was printed before it
+        ;;
+        ;; and then `kernel-jump-to` to the parsed entry. The KERNEL writes B
+        ;; and ends the run with its own `out 0xf4, 21` (QEMU status 43), so a
+        ;; run that reaches 43 left through the jump target and nowhere else:
+        ;; the loader's fallback exit is 33 and is reachable only when a mark
+        ;; above failed.
+
+        ;; T -- placement facts out of the headers the fs stage admitted.
+        s0off (elf/segment-field fbuf 4096 64 2)
+        s0addr (elf/segment-field fbuf 4096 64 3)
+        s0size (elf/segment-field fbuf 4096 64 4)
+        s0mem (elf/segment-field fbuf 4096 64 5)
+        s1off (elf/segment-field fbuf 4096 120 2)
+        s1addr (elf/segment-field fbuf 4096 120 3)
+        s1size (elf/segment-field fbuf 4096 120 4)
+        s1mem (elf/segment-field fbuf 4096 120 5)
+        kentry (elf/entry-point fbuf 4096)
+        tfacts (both (both (equals s0off 4096) (equals s1off 32768))
+                     (both (equals kentry s0addr)
+                           (both (both (equals s0size s0mem)
+                                       (equals s1size s1mem))
+                                 (both (at-most s0mem 4096)
+                                       (at-most s1mem 77824)))))
+        m15 (mark-when tfacts 84)
+
+        ;; U -- the file, whole, and the two segments placed under their
+        ;; p_paddr. The page counts are the compile-time literals the region
+        ;; windows are made of (1 page for seg0's 144-208 bytes, 19 pages for
+        ;; seg1's 77,824); T already refused to go on unless the parsed memsz
+        ;; fits inside them.
+        kbuf (kernel-uefi-alloc-region bs 40 0 2 28 0)
+        kfile (fs/open-read froot (fs/kernel-path) fslots)
+        klen (fs/file-size kfile fslots)
+        kstat (fs/read-into kfile kbuf klen fslots)
+        kgot (fs/read-count fslots)
+        kclose (fs/close-file kfile)
+        s0 (kernel-uefi-alloc-region bs 40 2 2 1 s0addr)
+        s1 (kernel-uefi-alloc-region bs 40 2 2 19 s1addr)
+        c0 (memory/copy-mem bs s0 (+ kbuf s0off) s0size)
+        c1 (memory/copy-mem bs s1 (+ kbuf s1off) s1size)
+        uflags (both (both (equals kstat 0)
+                           (both (equals kgot klen) (at-most klen 114688)))
+                     (both (both (equals s0 s0addr) (equals s1 s1addr))
+                           (both (equals c0 s0) (equals c1 s1))))
+        m16 (mark-when uflags 85)
+        nl5 (console/put out (ucs2 "\r\nboot"))
+        b0 (fs-reason out tfacts)
+        b1 (fs-reason out uflags)
+        b2 (fs-reason out kstat)
+        b3 (fs-reason out kgot)
+        b4 (fs-reason out klen)
+        b5 (fs-reason out s0)
+        b6 (fs-reason out s1)
+        b7 (fs-reason out c0)
+        b8 (fs-reason out c1)
+
+        ;; M / X -- the memory map, then the machine. The map buffer is its own
+        ;; 32-page allocation (131,072 bytes, the size the call is offered);
+        ;; the four scalar out-words live in their own page so the map cannot
+        ;; overwrite the key that is about to be spent.
+        mslots (kernel-uefi-alloc-region bs 40 0 2 1 0)
+        mmap (kernel-uefi-alloc-region bs 40 0 2 32 0)
+        minit (kernel-store-u64-4k mslots 4096 0 131072)
+        mstat (exit/get-memory-map bs
+                                   (kernel-subregion mslots 4096 0 8)
+                                   mmap
+                                   (kernel-subregion mslots 4096 8 8)
+                                   (kernel-subregion mslots 4096 16 8)
+                                   (kernel-subregion mslots 4096 24 8))
+        msize (kernel-load-u64-4k mslots 4096 0)
+        mkey (kernel-load-u64-4k mslots 4096 8)
+        mdesc (kernel-load-u64-4k mslots 4096 16)
+        mreason (exit/map-reason mstat msize mdesc)
+        nl6 (console/put out (ucs2 "\r\nmap"))
+        q6 (fs-reason out mreason)
+        q7 (fs-reason out msize)
+        q8 (fs-reason out mdesc)
+        m17 (mark-when (if (= mreason 0) 1 0) 77)
+        ;; The map key is spent by the FIRST boot-service call after the map
+        ;; is taken -- the firmware invalidates it whenever the map changes,
+        ;; and printing the map line above is such a call. Measured 2026-10-24:
+        ;; with the line between the two calls, xstat != 0 (debugcon
+        ;; "...rxTMZ", exit 33) while map-reason itself was 0. main.c:1209-1221
+        ;; takes the map and exits back to back with nothing in between; this
+        ;; composition keeps the printed evidence AND that shape by taking the
+        ;; map twice -- the first answers the `map` line, the second's key is
+        ;; the one spent here, with nothing but a pure load in between.
+        restat (exit/get-memory-map bs
+                                    (kernel-subregion mslots 4096 0 8)
+                                    mmap
+                                    (kernel-subregion mslots 4096 8 8)
+                                    (kernel-subregion mslots 4096 16 8)
+                                    (kernel-subregion mslots 4096 24 8))
+        rekey (kernel-load-u64-4k mslots 4096 8)
+        xstat (exit/exit-boot-services bs image-handle rekey)
+        m18 (mark-when (if (= xstat 0) 1 0) 88)
+
+        parked (kernel-system-table)
+        m5 (mark-when (if (= parked system-table) 1 0) 90)
+        bootall (+ tfacts (+ uflags (+ (if (= mreason 0) 1 0)
+                                       (if (= xstat 0) 1 0))))
+        done (if (= bootall 4)
+               (kernel-jump-to kentry image-handle)
+               (if (= xstat 0)
+                 (kernel-out-u32 244 16)
+                 (exit-fallback out xstat restat)))]
+    0))
+
+(defn main [] 0)

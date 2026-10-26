@@ -1,0 +1,148 @@
+;; Admission for a TCP segment, from the Ethernet header up.
+;;
+;; The driver in `kernel/pci.c` owns the mechanism -- it built the segments,
+;; posted the buffers, rang the doorbells and spun. It does NOT decide whether
+;; the bytes that came back belong to the connection it opened. That decision is
+;; here, the same split every other admission path in this OS uses (ADR-0015).
+;;
+;; It re-checks the IPv4 envelope from scratch rather than trusting that
+;; something else already did. Nothing calls this after
+;; `aiueos-ipv4-icmp-reply-valid` -- an ICMP admission would have rejected a TCP
+;; datagram at the protocol byte -- so an envelope assumed rather than checked
+;; would be an envelope nobody checked at all, and the sequence and flag fields
+;; below would be read at offsets computed from a header that might not be one.
+;;
+;; The checksum helpers duplicate `tcp-checksum-ok.kotoba`, and the IPv4 header
+;; sum duplicates `ipv4-checksum.kotoba`. A kernel object is compiled with host
+;; imports disabled and exports exactly one symbol, so one object cannot call
+;; another; the duplication is the price of that isolation and is paid rather
+;; than moving the arithmetic into C, where it would stop being reviewable as a
+;; decision. The copy differs from the one in `tcp-checksum-ok.kotoba` in one
+;; way that matters: the pseudo-header addresses are LOADED from the datagram
+;; instead of being stated by the caller. That is the receive-side computation --
+;; a peer computes over the addresses it wrote, so a verifier has to use the same
+;; ones -- and it is why the source address is checked separately below rather
+;; than being bound by the checksum.
+;;
+;; Offsets, from the frame's first byte:
+;;    0..5   destination MAC       14      version and IHL       34..35  source port
+;;    6..11  source MAC            16..17  IPv4 total length     36..37  destination port
+;;   12..13  EtherType             23      protocol              38..41  sequence
+;;                                 24..25  header checksum       42..45  acknowledgement
+;;                                 26..29  source address        46      data offset
+;;                                 30..33  destination address   47      flags
+;;                                                               48..49  window
+;;                                                               50..51  checksum
+;;
+;; `expected-flags` is compared for EQUALITY, not masked. A mask would make
+;; SYN-ACK and SYN-ACK-PSH the same event, and they are not: the caller is
+;; opening a connection in one step and reading its echo in another, and a probe
+;; that cannot tell those apart cannot claim either happened. The cost is that
+;; the caller has to know what a conforming peer will send, which is the point --
+;; it states an expectation instead of accepting whatever arrives.
+;;
+;; `expected-ack` is what ties a segment to THIS connection. A well-formed
+;; segment from the right peer carrying the right flags is still not evidence
+;; that the byte this OS sent was received; the acknowledgement number is the
+;; only field that says so.
+;;
+;; What is deliberately NOT checked, because the arity is spent: the destination
+;; address, and both port numbers. Under SLIRP nothing else is delivered to this
+;; guest, so the gap costs nothing here; on a real network it would mean a
+;; segment addressed to another host on the same wire could be admitted if its
+;; acknowledgement and flags happened to match. Binding those would need either
+;; more parameters or a second object.
+;;
+;; The peer's data offset is NOT constrained to 5. A SYN-ACK from SLIRP carries
+;; an MSS option and so has a header of 24 bytes; every field read below is in
+;; the fixed 20, and the checksum covers whatever length the IPv4 header claims,
+;; so options are tolerated on the way in even though none are ever sent out.
+
+(defn aiueos-tcpseg-u16 [frame offset]
+  (+ (* (kernel-load-u8-4k frame 2048 offset) 256)
+     (kernel-load-u8-4k frame 2048 (+ offset 1))))
+
+(defn aiueos-tcpseg-u32 [frame offset]
+  (+ (* (kernel-load-u8-4k frame 2048 offset) 16777216)
+     (+ (* (kernel-load-u8-4k frame 2048 (+ offset 1)) 65536)
+        (+ (* (kernel-load-u8-4k frame 2048 (+ offset 2)) 256)
+           (kernel-load-u8-4k frame 2048 (+ offset 3))))))
+
+(defn aiueos-tcpseg-word [frame base length offset]
+  ;; RFC 1071 pads a trailing odd byte on the right, so it is the high half.
+  (if (>= (+ offset 1) length)
+    (* (kernel-load-u8-4k frame 2048 (+ base offset)) 256)
+    (+ (* (kernel-load-u8-4k frame 2048 (+ base offset)) 256)
+       (kernel-load-u8-4k frame 2048 (+ base offset 1)))))
+
+(defn aiueos-tcpseg-sum [frame base length offset total]
+  (if (>= offset length) total
+    (aiueos-tcpseg-sum frame base length (+ offset 2)
+                       (+ total (aiueos-tcpseg-word frame base length offset)))))
+
+(defn aiueos-tcpseg-fold [total]
+  (if (< total 65536) total
+    (aiueos-tcpseg-fold (+ (bit-and total 65535) (quot total 65536)))))
+
+(defn aiueos-tcpseg-checksum [frame base length seed]
+  ;; The region is always the FRAME; `base` is how far into it this particular
+  ;; header starts (14 for IPv4, 34 for TCP). The compiler requires a kernel
+  ;; memory base to NAME a region rather than compute one -- passing
+  ;; `(+ frame 14)` is rejected outright -- which is the rule that keeps a
+  ;; bounded load bounded, since a computed base could put the 2048 trap bound
+  ;; anywhere. `seed` is the pseudo-header, pre-summed because it is not in the
+  ;; region at all; the IPv4 header, which has no pseudo-header, passes 0.
+  (if (or (< length 0) (> (+ base length) 2048)) 65535
+    (- 65535 (aiueos-tcpseg-fold (aiueos-tcpseg-sum frame base length 0 seed)))))
+
+(defn aiueos-tcpseg-pseudo [frame tcp-length]
+  ;; Source and destination as two 16-bit words each, then the zero byte and
+  ;; protocol 6 as one word -- the padding byte is the HIGH half, so the word is
+  ;; 6 and not 1536 -- then the TCP length, which is derived and never on the
+  ;; wire.
+  (+ (+ (aiueos-tcpseg-u16 frame 26) (aiueos-tcpseg-u16 frame 28))
+     (+ (+ (aiueos-tcpseg-u16 frame 30) (aiueos-tcpseg-u16 frame 32))
+        (+ 6 tcp-length))))
+
+(defn aiueos-tcpseg-checksum-zero [frame tcp-length]
+  ;; Split out only so the call site reads as one check rather than four nested
+  ;; ones; the pseudo-header has to be summed before the segment is, and doing
+  ;; that inline made the short-circuit order impossible to see.
+  (= (aiueos-tcpseg-checksum frame 34 tcp-length
+                             (aiueos-tcpseg-pseudo frame tcp-length))
+     0))
+
+(defn aiueos-tcpseg-envelope-valid [frame length expected-src]
+  (and ;; EtherType 0x0800 = IPv4.
+       (= (aiueos-tcpseg-u16 frame 12) 2048)
+       ;; Version 4, IHL 5. Rejecting IPv4 options rather than parsing them is
+       ;; what makes every offset above a constant; note this is the IPv4 header
+       ;; and not the TCP one, whose options ARE tolerated.
+       (= (kernel-load-u8-4k frame 2048 14) 69)
+       ;; 20 bytes of IPv4 plus at least the fixed 20 of TCP, and the whole
+       ;; datagram has to fit the frame. It may be SHORTER than the frame --
+       ;; Ethernet pads to its own minimum, and every segment without a payload
+       ;; is under that minimum -- but never longer.
+       (>= (aiueos-tcpseg-u16 frame 16) 40)
+       (<= (+ (aiueos-tcpseg-u16 frame 16) 14) length)
+       ;; Protocol 6 = TCP.
+       (= (kernel-load-u8-4k frame 2048 23) 6)
+       ;; Summing a header that carries a correct checksum leaves 0, so the
+       ;; field is verified without ever being read on its own.
+       (= (aiueos-tcpseg-checksum frame 14 20 0) 0)
+       ;; The segment has to come from the peer the connection was opened to.
+       (= (aiueos-tcpseg-u32 frame 26) expected-src)))
+
+(defn aiueos-tcp-segment-valid [frame length expected-src expected-ack expected-flags]
+  (and ;; 14 Ethernet + 20 IPv4 + 20 TCP is the smallest thing that could be one.
+       (>= length 54)
+       (<= length 2048)
+       (aiueos-tcpseg-envelope-valid frame length expected-src)
+       ;; `and` short-circuits, so by the time the total length is subtracted
+       ;; from here it is already known to be at least 40 and to fit the frame,
+       ;; which is what bounds the sum below without a second range check.
+       (aiueos-tcpseg-checksum-zero frame (- (aiueos-tcpseg-u16 frame 16) 20))
+       (= (aiueos-tcpseg-u32 frame 42) expected-ack)
+       (= (kernel-load-u8-4k frame 2048 47) expected-flags)))
+
+(defn main [] 0)

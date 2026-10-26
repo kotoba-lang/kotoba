@@ -1,0 +1,124 @@
+;; oci-auth.cljk — OCI 認証の自動化（JUN-33 / JUN-34 / JUN-77 の運用手）
+;;
+;;   kbb --backend sci scripts/oci-auth.cljk status
+;;   kbb --backend sci scripts/oci-auth.cljk login            ;; ← 人間の browser ログイン 1 回のみ
+;;   kbb --backend sci scripts/oci-auth.cljk provision-key    ;; login 成功後に自動 chain される
+;;   kbb --backend sci scripts/oci-auth.cljk verify
+;;   kbb --backend sci scripts/oci-auth.cljk rotate           ;; 以降は無人で回る（鍵ローテーション）
+;;
+;; 設計（2026-10-19・実測に基づく）:
+;; - `oci session authenticate` は browser ログイン必須で失効する。この 1 回だけが
+;;   人間の仕事（安全床: 認証情報のフォーム入力を agent がしない）。
+;; - その session で **durable API key** を発行・登録すると、以降は署名がローカルで
+;;   完結し再認証不要。rotate も鍵だけで回る。
+;; - 秘密は ~/.oci/ 配下（0600）にのみ置く。本ファイルは秘密を stdout に出さない。
+;; - 新規 tooling は kbb-first（AGENTS.md）。.sh / 生 JS は書かない。
+
+(ns oci-auth
+  (:require ["node:child_process" :as cp]
+            ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:path" :as path]
+            [clojure.string :as str]))
+
+(def HOME (os/homedir))
+(def OCI-DIR (path/join HOME ".oci"))
+(def SESSION-PROFILE (or (aget (.-env js/process) "OCI_SESSION_PROFILE") "JunSession"))
+(def DURABLE-PROFILE (or (aget (.-env js/process) "OCI_DURABLE_PROFILE") "JunDurable"))
+(def DURABLE-CONFIG (path/join OCI-DIR "config-jun-durable"))
+(def REGION (or (aget (.-env js/process) "OCI_REGION") "ap-tokyo-1"))
+(def OCI-BIN (or (aget (.-env js/process) "OCI_BIN") "oci"))
+
+(defn sh! [cmd]
+  (try
+    (.execSync cp cmd #js {:encoding "utf8" :stdio #js ["ignore" "pipe" "pipe"]})
+    (catch :default e
+      (throw (js/Error. (str "command failed: " cmd "\n" (ex-message e)))))))
+
+(defn sh-out [cmd]
+  (try (.execSync cp cmd #js {:encoding "utf8" :stdio #js ["ignore" "pipe" "pipe"]})
+       (catch :default e (str "ERR:" (ex-message e)))))
+
+(defn argv []
+  (drop 3 (vec (js/Array.from (.-argv js/process)))))
+
+(defn token-user
+  "session token の JWT payload から sub（user OCID、識別子）を読む。token 本体は出さない。"
+  []
+  (let [tok (str/trim (fs/readFileSync (path/join OCI-DIR "sessions" SESSION-PROFILE "token") "utf8"))
+        payload (nth (str/split tok #"\.") 1)
+        pad (apply str (repeat (mod (- 4 (mod (count payload) 4)) 4) "="))
+        json (.toString (.from js/Buffer payload "base64url") "utf8")
+        claims (js->clj (js/JSON.parse json))]
+    (get claims "sub")))
+
+(defn probe [label cmd]
+  (let [out (sh-out cmd)]
+    (if (str/starts-with? out "ERR:")
+      (println (str "  " label ": FAIL — " (first (str/split-lines out))))
+      (println (str "  " label ": OK")))
+    (not (str/starts-with? out "ERR:"))))
+
+(defn cmd-status []
+  (println "OCI auth status (no secrets printed):")
+  (probe "session-token  " (str OCI-BIN " --profile " SESSION-PROFILE " --auth security_token iam region list --query 'data[0].name' --output table"))
+  (probe "durable-api-key" (str OCI-BIN " --config-file " DURABLE-CONFIG " --profile " DURABLE-PROFILE " iam region list --query 'data[0].name' --output table")))
+
+(defn provision-key! []
+  (let [user (token-user)
+        ts (.now js/Date)
+        base (path/join OCI-DIR (str "agent-key-" ts))
+        priv (str base ".pem")
+        pub (str base ".pem.pub")]
+    (sh! (str "openssl genrsa -out " priv " 2048"))
+    (sh! (str "openssl rsa -in " priv " -pubout -out " pub))
+    (.chmodSync fs priv 384)
+    (println "generated keypair:" priv "(private, 0600)")
+    (let [fp (-> (sh! (str "openssl rsa -pubout -outform DER -in " priv " | openssl md5"))
+                 (str/trim) (str/split #"=") last str/trim)]
+      (sh! (str OCI-BIN " --profile " SESSION-PROFILE " --auth security_token iam user api-key upload"
+                " --user-id " user " --key-file " pub " --output json"))
+      (spit DURABLE-CONFIG
+            (str "[DEFAULT]\n"
+                 "user=" user "\n"
+                 "fingerprint=" fp "\n"
+                 "key_file=" priv "\n"
+                 "region=" REGION "\n"))
+      (.chmodSync fs DURABLE-CONFIG 384)
+      (println "durable profile written:" DURABLE-CONFIG)
+      (cmd-status))))
+
+(defn cmd-rotate []
+  (let [user (token-user)
+        ts (.now js/Date)
+        base (path/join OCI-DIR (str "agent-key-" ts))
+        priv (str base ".pem")
+        pub (str base ".pem.pub")]
+    (sh! (str "openssl genrsa -out " priv " 2048"))
+    (sh! (str "openssl rsa -in " priv " -pubout -out " pub))
+    (.chmodSync fs priv 384)
+    (let [fp (-> (sh! (str "openssl rsa -pubout -outform DER -in " priv " | openssl md5"))
+                 (str/trim) (str/split #"=") last str/trim)]
+      (sh! (str OCI-BIN " --config-file " DURABLE-CONFIG " --profile " DURABLE-PROFILE
+                " iam user api-key upload --user-id " user " --key-file " pub " --output json"))
+      (let [old (-> (str/split (slurp DURABLE-CONFIG) #"key_file=") second str/split-lines first str/trim)]
+        (spit (str DURABLE-CONFIG ".prev") (slurp DURABLE-CONFIG))
+        (spit DURABLE-CONFIG
+              (str "[DEFAULT]\nuser=" user "\nfingerprint=" fp "\nkey_file=" priv "\nregion=" REGION "\n"))
+        (println "rotated. old key kept for rollback:" old)
+        (cmd-status)))))
+
+(defn -main []
+  (let [[c & _] (argv)]
+    (case c
+      "status" (cmd-status)
+      "login" (do (sh! (str OCI-BIN " session authenticate --profile " SESSION-PROFILE " --region " REGION))
+                  (println "session established — provisioning durable key…")
+                  (provision-key!))
+      "provision-key" (provision-key!)
+      "verify" (cmd-status)
+      "rotate" (cmd-rotate)
+      (do (println "usage: oci-auth.cljk status|login|provision-key|verify|rotate")
+          (js/process.exit 2)))))
+
+(-main)

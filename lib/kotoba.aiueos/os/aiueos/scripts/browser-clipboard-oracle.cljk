@@ -1,0 +1,298 @@
+#!/usr/bin/env kbb
+;; The expected answers of os/aiueos/contracts/browser-ime-v2.edn's clipboard
+;; vectors (ADR-0241), taken from kotoba-lang/browser itself: whether a
+;; request gets a completion is browser.desktop-backend `request` with the
+;; vector's broker decision (a deny produces no effect, so no completion); a
+;; write completion is the selection's text as browser.text-edit keeps it
+;; (the value between the normalized selection's ends); a read completion is
+;; browser.text-edit insert-text of the clipboard's text. Neither
+;; browser-ime.kotoba nor the kernel's C is consulted.
+;;
+;;   kbb --backend sci --classpath <kotoba-lang/browser>/src:os/aiueos/scripts \
+;;     os/aiueos/scripts/browser-clipboard-oracle.cljk          ; print the vectors
+;;   ... browser-clipboard-oracle.cljk --check os/aiueos/contracts/browser-ime-v2.edn
+;;
+;; Which key is which request is the kernel's rule, written here apart from
+;; the object (browser.input has no copy / paste mapping; browser.compat's
+;; navigator.clipboard writeText / readText are the :clipboard/write /
+;; :clipboard/read capabilities desktop-backend brokers):
+;;   Ctrl (29 or 97) press / release    word 2038 1 / 0; repeat changes nothing
+;;   C (46) press, Ctrl held            :clipboard/write, answer 512, when the
+;;                                      focused body has a selection and
+;;                                      nothing is composed; else 0
+;;   V (47) press, Ctrl held            :clipboard/read, answer 513, when
+;;                                      nothing is composed; else 0
+;;   any other press, Ctrl held         nothing (`:no-other-ctrl-shortcuts`)
+;;   a request the broker allows        followed by its completion: the same
+;;                                      code with value 3 and the clipboard
+;;                                      (260 bytes: length, 64 code points) in
+;;                                      place of the dictionary
+;;   write completion                   clipboard := the selection's text;
+;;                                      answer its length; nothing selected: 0
+;;   read completion                    insert-text of the clipboard's text;
+;;                                      answer its length; an empty clipboard
+;;                                      changes nothing; a body that would pass
+;;                                      64 changes nothing and answers -5
+;; The completion refusals (-7: a null clipboard, one not 260 bytes, a length
+;; word past 64) and the 64-code-point body are the object's own bounds; the
+;; vectors that take them are written from this rule, not from text-edit.
+;; Shift, Left and Backspace are the selection oracle's rules
+;; (browser-selection-oracle.cljk), repeated here for the sequences that
+;; select before they copy.
+;;
+;; --check: exit 0 every generated vector equals the contract's vector of the
+;; same name; 1 one differs or is missing; 2 could not run. It prints
+;; COMPARED<TAB>n; n = 0 is exit 2.
+(ns browser-clipboard-oracle
+  (:require [browser.text-edit :as te]
+            [browser.desktop-backend :as backend]
+            [clojure.edn :as edn]
+            [clojure.string :as str]
+            ["node:fs" :as fs]))
+
+(defn- die [code msg] (.error js/console msg) (.exit js/process code))
+
+(def ^:private base-words
+  ;; the seed every browser-ime-v2 vector uses: window 2 on top and focused
+  {0 1 1 2 2 2 3 1280 4 800
+   5 1 6 32 7 32 8 720 9 540
+   10 2 11 96 12 72 13 640 14 480})
+
+(defn- cps [s] (vec (map #(.codePointAt % 0) (js/Array.from s))))
+(defn- from-cps [v] (apply str (map #(js/String.fromCodePoint %) v)))
+(defn- body-word [id] (+ 160 (* 64 (dec id))))
+
+(defn- hex-words [words]
+  (let [buf (js/Buffer.alloc (* 4 (count words)))]
+    (doseq [[i v] (map-indexed vector words)] (.writeUInt32LE buf v (* 4 i)))
+    (.toString buf "hex")))
+
+(defn- surface-hex [m] (hex-words (map #(get m % 0) (range 2048))))
+(defn- clip-hex [c] (hex-words (map #(get c % 0) (range 65))))
+
+;; --- the focused body as a text-edit state (as the selection oracle) ---------------
+
+(defn- text-state [m]
+  (let [id (get m 2)
+        b (body-word id)
+        body (vec (take-while pos? (map #(get m (+ b %) 0) (range 64))))
+        n (count body)
+        k (if (= (get m 2036 0) id) (min (get m 2037 0) n) 0)]
+    (te/select (assoc (te/empty-state) :text/value (from-cps body)) n (- n k))))
+
+(defn- encode-text [m st]
+  (let [st (te/normalize-selection st)
+        v (cps (:text/value st))
+        n (count v)
+        [s e] (:text/selection st)
+        id (get m 2)
+        b (body-word id)]
+    (when (or (not= e n) (not= (:text/caret st) s))
+      (die 2 (str "COULD-NOT-RUN text-edit answered a state the object cannot hold: " (pr-str st))))
+    (let [k (- n s)
+          m (reduce (fn [m i] (assoc m (+ b i) (get v i 0))) m (range 64))]
+      (cond
+        (pos? k) (assoc m 2036 id 2037 k)
+        (= (get m 2036 0) id) (assoc m 2036 0 2037 0)
+        :else m))))
+
+(defn- selected-text [st]
+  (let [st (te/normalize-selection st)
+        [s e] (:text/selection st)]
+    (subs (:text/value st) s e)))
+
+(defn- composing? [m]
+  (or (pos? (get m 433 0)) (pos? (get m 445 0)) (= 1 (get m 442 0))))
+
+;; --- one step ------------------------------------------------------------------
+
+(defn- request [code]
+  ;; desktop-backend decides nothing here: the capability a key asks for
+  (if (= code 46) :clipboard/write :clipboard/read))
+
+(defn- complete
+  "An admitted request's completion over world [m clip] -> [m clip answer]."
+  [m clip code]
+  (let [st (text-state m)]
+    (if (= code 46)
+      (let [t (cps (selected-text st))]
+        (if (empty? t)
+          [m clip 0]
+          [m (into {0 (count t)} (map-indexed (fn [i c] [(inc i) c]) t)) (count t)]))
+      (let [n (get clip 0 0)
+            t (from-cps (map #(get clip % 0) (range 1 (inc n))))
+            after (te/insert-text st t)]
+        (cond
+          (zero? n) [m clip 0]
+          (> (count (cps (:text/value after))) 64) [m clip -5]
+          :else [(encode-text m after) clip n])))))
+
+(defn- key-step
+  "One key press / release [code value] -> [m answer]."
+  [m [code value]]
+  (cond
+    (#{29 97} code) [(case value 1 (assoc m 2038 1) 0 (assoc m 2038 0) m) 0]
+    (#{42 54} code) [(case value 1 (assoc m 2035 1) 0 (assoc m 2035 0) m) 0]
+    (not= value 1) [m 0]
+    (= 1 (get m 2038 0))
+    (cond
+      (composing? m) [m 0]
+      (= code 46) [m (if (seq (selected-text (text-state m))) 512 0)]
+      (= code 47) [m 513]
+      :else [m 0])
+    (#{105 106} code)
+    (if (or (zero? (get m 2035 0)) (composing? m))
+      [m 0]
+      [(encode-text m (te/move-caret (text-state m) (if (= code 105) -1 1) {:extend? true})) 0])
+    (= code 14) [(encode-text m (te/delete-backward (text-state m))) 0]
+    ;; k with the IME on: insert-text "" over a selection (the composition
+    ;; starts over the emptied place), then k waits in the romaji buffer
+    (= code 37) (let [st (text-state m)
+                      [s e] (:text/selection (te/normalize-selection st))
+                      m (if (< s e) (encode-text m (te/insert-text st "")) m)]
+                  [(assoc m 433 (inc (get m 433 0)) (+ 434 (get m 433 0)) 107) 0])
+    :else (die 2 (str "COULD-NOT-RUN no rule for key " code))))
+
+(defn- run-spec
+  "Steps are keys [code value] or explicit completions {:args [...]}; a key
+  answered 512 / 513 is followed by its completion when desktop-backend
+  `request` with the vector's decision produces an effect."
+  [{:keys [steps grant]} m0 clip0]
+  (reduce
+   (fn [{:keys [m clip out]} st]
+     (if (map? st)
+       ;; an explicit completion whose clipboard the object must refuse
+       {:m m :clip clip :out (conj out [(:args st) -7 m clip])}
+       (let [[m' r] (key-step m st)
+             out (conj out [st r m' clip])]
+         (if (#{512 513} r)
+           (let [{:keys [effects]} (backend/request (backend/empty-desktop)
+                                                    {:capability (request (first st)) :origin "aiueos"}
+                                                    {:permission/decision (or grant :allow)})]
+             (if (seq effects)
+               (let [[m2 clip2 r2] (complete m' clip (first st))]
+                 {:m m2 :clip clip2
+                  :out (conj out [[:surface 8192 :clipboard 260 (first st) 3] r2 m2 clip2])})
+               {:m m' :clip clip :out out}))
+           {:m m' :clip clip :out out}))))
+   {:m m0 :clip clip0 :out []}
+   steps))
+
+;; --- the vectors ------------------------------------------------------------------
+
+(defn- seed [{:keys [body ime ctrl selection romaji body1]}]
+  (cond-> (merge base-words {432 (if (= ime :off) 0 1)})
+    body (into (map-indexed (fn [i c] [(+ 224 i) c]) (cps body)))
+    body1 (into (map-indexed (fn [i c] [(+ 160 i) c]) (cps body1)))
+    ctrl (assoc 2038 1)
+    selection (assoc 2036 (first selection) 2037 (second selection))
+    romaji (into (concat [[433 (count romaji)]]
+                         (map-indexed (fn [i c] [(+ 434 i) (.charCodeAt c 0)]) romaji)))))
+
+(defn- clip-seed [{:keys [text length]}]
+  (let [v (cps (or text ""))]
+    (into {0 (or length (count v))} (map-indexed (fn [i c] [(inc i) c]) v))))
+
+(def ^:private clip-offset (+ 8192 189892))
+
+(defn- memory [m clip romaji?]
+  (cond-> [{:label :body :offset 896 :hex (hex-words (map #(get m (+ 224 %) 0) (range 64)))}
+           {:label :selection-and-ctrl :offset 8140 :hex (hex-words (map #(get m % 0) [2035 2036 2037 2038]))}
+           {:label :clipboard :offset clip-offset :hex (clip-hex clip)}]
+    romaji? (conj {:label :romaji :offset 1732
+                   :hex (hex-words (map #(get m % 0) (range 433 442)))})))
+
+(def ^:private a62 (apply str (repeat 62 "a")))
+(def ^:private a63 (apply str (repeat 63 "a")))
+(def ^:private b64 (apply str (repeat 64 "b")))
+
+(def ^:private specs
+  [{:name :ctrl-press-holds-ctrl :keys "Ctrl" :seed {:body "日本"} :steps [[29 1]]}
+   {:name :right-ctrl-holds-ctrl-too :keys "RightCtrl" :seed {:body "日本"} :steps [[97 1]]}
+   {:name :ctrl-release-lets-go :keys "(Ctrl held)|Ctrl(release)" :seed {:body "日本" :ctrl true}
+    :steps [[29 0]]}
+   {:name :ctrl-repeat-changes-nothing :keys "(Ctrl held)|Ctrl(repeat)" :seed {:body "日本" :ctrl true}
+    :steps [[29 2]]}
+   {:name :ctrl-c-over-a-selection-asks-to-write-and-a-deny-copies-nothing
+    :keys "Shift|Left|Left|Shift(release)|Ctrl|C (denied)" :seed {:body "日本語"} :clip {:text "xy"}
+    :grant :deny :steps [[42 1] [105 1] [105 1] [42 0] [29 1] [46 1]]}
+   {:name :ctrl-c-admitted-copies-the-selection
+    :keys "Shift|Left|Left|Shift(release)|Ctrl|C (admitted)" :seed {:body "日本語"} :clip {:text "xy"}
+    :steps [[42 1] [105 1] [105 1] [42 0] [29 1] [46 1]]}
+   {:name :ctrl-c-with-nothing-selected-asks-nothing :keys "Ctrl|C" :seed {:body "日本語"}
+    :clip {:text "xy"} :steps [[29 1] [46 1]]}
+   {:name :ctrl-c-of-another-windows-selection-asks-nothing :keys "(window 1's selection)|Ctrl|C"
+    :seed {:body "日本語" :body1 "ab" :selection [1 1]} :clip {:text "xy"} :steps [[29 1] [46 1]]}
+   {:name :ctrl-v-asks-to-read-and-a-deny-pastes-nothing :keys "Ctrl|V (denied)" :seed {:body "日本"}
+    :clip {:text "ab"} :grant :deny :steps [[29 1] [47 1]]}
+   {:name :ctrl-v-admitted-pastes-at-the-end :keys "Ctrl|V (admitted)" :seed {:body "日本"}
+    :clip {:text "ab"} :steps [[29 1] [47 1]]}
+   {:name :ctrl-v-admitted-replaces-the-selection :keys "Shift|Left|Shift(release)|Ctrl|V (admitted)"
+    :seed {:body "日本語"} :clip {:text "ab"} :steps [[42 1] [105 1] [42 0] [29 1] [47 1]]}
+   {:name :a-denied-paste-keeps-the-selection :keys "Shift|Left|Shift(release)|Ctrl|V (denied)"
+    :seed {:body "日本語"} :clip {:text "ab"} :grant :deny :steps [[42 1] [105 1] [42 0] [29 1] [47 1]]}
+   {:name :copy-delete-paste-paste
+    :keys "Shift|Left|Left|Shift(release)|Ctrl|C|Ctrl(release)|Backspace|Ctrl|V|V (admitted)"
+    :seed {:body "日本語"} :steps [[42 1] [105 1] [105 1] [42 0] [29 1] [46 1] [46 0] [29 0]
+                                  [14 1] [29 1] [47 1] [47 0] [47 1]]}
+   {:name :ime-off-ctrl-v-pastes-too :keys "(IME off)|Ctrl|V (admitted)" :seed {:body "abc" :ime :off}
+    :clip {:text "de"} :steps [[29 1] [47 1]]}
+   {:name :an-empty-clipboard-pastes-nothing :keys "Shift|Left|Shift(release)|Ctrl|V (admitted, empty)"
+    :seed {:body "日本"} :steps [[42 1] [105 1] [42 0] [29 1] [47 1]]}
+   {:name :a-paste-to-exactly-64-is-taken :keys "(62 code points)|Ctrl|V (admitted, 2)"
+    :seed {:body a62 :ime :off} :clip {:text "xy"} :steps [[29 1] [47 1]]}
+   {:name :a-paste-past-64-is-refused-whole :keys "(63 code points)|Ctrl|V (admitted, 2)"
+    :seed {:body a63 :ime :off} :clip {:text "xy"} :steps [[29 1] [47 1]]}
+   {:name :a-64-code-point-clipboard-fills-an-empty-body :keys "(empty)|Ctrl|V (admitted, 64)"
+    :seed {} :clip {:text b64} :steps [[29 1] [47 1]]}
+   {:name :a-paste-replaces-the-selection-before-it-is-measured :keys "(63 code points)|Shift|Left|Shift(release)|Ctrl|V (admitted, 2)"
+    :seed {:body a63 :ime :off} :clip {:text "yz"} :steps [[42 1] [105 1] [42 0] [29 1] [47 1]]}
+   {:name :ctrl-with-another-letter-types-nothing :keys "(IME off)|Ctrl|Backspace"
+    :seed {:body "abc" :ime :off} :steps [[29 1] [14 1]]}
+   {:name :ctrl-shift-left-selects-nothing :keys "Ctrl|Shift|Left" :seed {:body "日本"}
+    :steps [[29 1] [42 1] [105 1]]}
+   {:name :ctrl-c-while-composing-asks-nothing :keys "(selection 1, romaji k)|Ctrl|C"
+    :seed {:body "日本語" :selection [2 1] :romaji "k"} :clip {:text "xy"} :steps [[29 1] [46 1]] :romaji? true}
+   {:name :ctrl-v-while-composing-asks-nothing :keys "k|Ctrl|V" :seed {:body "日本"} :clip {:text "xy"}
+    :steps [[37 1] [29 1] [47 1]] :romaji? true}
+   {:name :a-completion-with-a-null-clipboard-is-refused :keys "(completion, null clipboard)"
+    :seed {:body "日本"} :clip {:text "ab"} :steps [{:args [:surface 8192 0 260 47 3]}]}
+   {:name :a-completion-with-a-clipboard-not-260-bytes-is-refused :keys "(completion, 256 bytes)"
+    :seed {:body "日本"} :clip {:text "ab"} :steps [{:args [:surface 8192 :clipboard 256 47 3]}]}
+   {:name :a-completion-with-a-length-past-64-is-refused :keys "(completion, length 65)"
+    :seed {:body "日本"} :clip {:text "ab" :length 65} :steps [{:args [:surface 8192 :clipboard 260 47 3]}]}])
+
+(defn vectors []
+  (for [{:keys [name keys steps romaji? clip] s :seed :as spec} specs
+        :let [m0 (seed s)
+              c0 (clip-seed clip)
+              out (:out (run-spec spec m0 c0))]]
+    {:name name :keys keys
+     :seed [{:offset 0 :hex (surface-hex m0)}]
+     :clipboard (clip-hex c0)
+     :steps (vec (map-indexed (fn [i [k r m c]]
+                                (cond-> {:args k :expected r}
+                                  (= i (dec (count out))) (assoc :expect-memory (memory m c romaji?))))
+                              out))}))
+
+(defn- edn-str [x] (str/replace (pr-str x) ", :" " :"))
+
+(defn- print-vector [{:keys [name keys seed clipboard steps]}]
+  (println (str "  {:name " name))
+  (println (str "   :keys " (pr-str keys)))
+  (println (str "   :seed " (edn-str seed)))
+  (println (str "   :clipboard " (pr-str clipboard)))
+  (println (str "   :steps [" (str/join "\n    " (map edn-str steps)) "]}")))
+
+(let [args (vec (remove #(= "--" %) *command-line-args*))]
+  (if (= "--check" (first args))
+    (let [contract (try (edn/read-string (str (.readFileSync fs (get args 1))))
+                        (catch :default e (die 2 (str "COULD-NOT-RUN " e))))
+          have (into {} (map (juxt :name identity) (:vectors contract)))
+          gen (vectors)
+          ks [:name :keys :seed :clipboard :steps]
+          bad (remove (fn [v] (= (select-keys v ks) (select-keys (have (:name v)) ks))) gen)]
+      (println (str "COMPARED\t" (count gen)))
+      (doseq [v bad] (println "DIFFERS" (:name v)))
+      (.exit js/process (cond (zero? (count gen)) 2 (seq bad) 1 :else 0)))
+    (doseq [v (vectors)] (print-vector v))))

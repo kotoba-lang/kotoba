@@ -1,0 +1,268 @@
+#!/usr/bin/env kbb
+;; The Kotoba BOOTX64.EFI loader modules, executed on a firmware.
+;;
+;; `os/aiueos/uefi/loader-probe.kotoba` composes `aiueos.uefi.console` and
+;; `aiueos.uefi.elf` into one UEFI application through the PROJECT route
+;; (`--source-path`), so they are modules of one program rather than the
+;; separate objects a kernel `.o` would have to be -- a kernel object exports
+;; one symbol and cannot call another, and a loader that cannot call a
+;; subroutine is not a loader.
+;;
+;; What this measures that a compiler suite cannot: that the PT_LOAD admission
+;; contract answers the same verdicts when it is x86-64 machine code being run
+;; by OVMF as it does when it is a data structure being walked by an
+;; interpreter, and that the console module's output is bytes a real firmware
+;; console driver rendered.
+;;
+;; Usage: kbb --backend sci os/aiueos/scripts/smoke-qemu-uefi-loader.cljk /path/to/amu
+;;        [--expect-markers STR] [--expect-verdicts STR] [--expect-esp STR]
+;;
+;; The three --expect flags exist so a deliberately broken variant can say WHICH
+;; different answer it expects. A break that merely fails is not a
+;; demonstration that this script discriminates.
+(ns smoke-qemu-uefi-loader
+  (:require ["child_process" :as cp]
+            ["fs" :as fs]
+            ["os" :as os]
+            ["path" :as path]
+            [kotoba.lang.text :as str]))
+
+(def repo "/Users/junkawasaki/github/wt/hermes/jun31-image-route-node-free-20261022")
+(def aiueos (path/join repo "os" "aiueos"))
+(def source (path/join aiueos "uefi" "loader-probe.kotoba"))
+(def source-path (path/join aiueos "kotoba"))
+
+;; K entry ran; H ImageHandle survived; S SystemTable survived; C ConOut found;
+;; N ClearScreen+SetAttribute+OutputString all returned EFI_SUCCESS; A the real
+;; kernel's headers were admitted; b..f each mutation refused with ITS OWN
+;; reason; P a firmware-allocated page was written and read back; W the
+;; placement rule answered all five clauses; g the fixture's bytes hashed to
+;; the digest shasum computes; h a one-nibble-different digest refused with
+;; reason 4; v the device has a loaded-image handle to read from; o the ESP
+;; volume opened; n the missing file was refused with the open clause's own
+;; reason (3); k \EFI\AIUEOS\KERNEL.ELF opened; r the read answered the 176
+;; bytes asked for; x the bytes read off the DISK were admitted (reason 0) by
+;; the same elf stage; T the parsed placement facts agree with the literals
+;; the pages are asked for; U the whole file was read and both segments were
+;; PLACED at their p_paddr and copied; M GetMemoryMap answered a usable map
+;; (this is the last mark the firmware console also reports, on the `map`
+;; line); X ExitBootServices returned EFI_SUCCESS; Z kernel-system-table still
+;; answers, so R9 survived every call; then the jump, and B is written by the
+;; KERNEL's own entry -- the run ends with the kernel's `out 0xf4, 21`, so the
+;; process leaves with (21 << 1) | 1 = 43 and never through the loader's own
+;; fallback exit (33). The PWgh half was lost from loader-probe.kotoba by the
+;; 8e58e52 cleanup (2026-09-05) and restored from 2c34fd7 on 2026-10-24; see
+;; docs/evidence/aiueos-jun31-kotoba-loader-reachability-20261024/.
+(def default-markers "KHSCNAbcdefPWghvonkrxTUMXZB")
+
+;; The reasons `aiueos.uefi.elf/admit` gives for the six headers, in order.
+;; Not "all non-zero": each names one clause, and swapping two of these
+;; mutations would leave a "some refusal happened" check green.
+(def default-verdicts "0 2 5 24 23 41")
+
+;; The `aiueos.uefi.fs` stage's own reasons, in stage order: device, volume,
+;; the MISSING file's open (3 = the open clause, and the negative that makes
+;; the stage mean something), the kernel file's open, the read, and the
+;; admission of the bytes that came off the ESP -- admitted against the file
+;; length the probe MEASURED (`fs/file-size`), which is why a genuine
+;; amu-produced kernel image answers 0 here and a truncated or invented
+;; header does not.
+(def default-esp "0 0 3 0 0 0")
+
+(def expected-entry "0000000000101000")
+;; The kernel's exit code, not the loader's: `boot-fixture.kotoba` ends the run
+;; with `out 0xf4, 21`, and the loader's own fallback exit (16 -> 33) is what
+;; a run that did NOT jump leaves through. 43 here therefore asserts the jump
+;; arrived; 33 is a named failure of one of the T/U/M/X marks.
+(def expected-status 43)
+
+(def ovmf-candidates
+  ["/opt/homebrew/share/qemu/edk2-x86_64-code.fd"
+   "/usr/share/OVMF/OVMF_CODE_4M.fd"
+   "/usr/share/OVMF/OVMF_CODE.fd"
+   "/usr/share/edk2/x64/OVMF_CODE.fd"])
+
+(defn die [message]
+  (js/console.error (str "error: " message))
+  (js/process.exit 1))
+
+(defn run! [command args options]
+  (let [result (cp/spawnSync command (clj->js args)
+                             (clj->js (merge {:encoding "utf8"} options)))]
+    {:status (.-status result)
+     :stdout (or (.-stdout result) "")
+     :stderr (or (.-stderr result) "")}))
+
+(defn firmware []
+  (or (some #(when (and % (fs/existsSync %)) %)
+            (cons (.. js/process -env -OVMF_CODE) ovmf-candidates))
+      (die (str "OVMF firmware not found. Looked at: "
+                (str/join ", " ovmf-candidates)))))
+
+(defn flag [args name fallback]
+  (let [i (.indexOf (clj->js args) name)]
+    (if (neg? i) fallback (nth args (inc i) fallback))))
+
+(defn build! [compiler out]
+  (let [efi (path/join out "esp" "EFI" "BOOT" "BOOTX64.EFI")
+        ;; The kernel the fs stage reads off the volume -- and the boot stage
+        ;; JUMPS to. It is a real kernel image amu itself produced
+        ;; (`--artifact image`, the route that produced the probe's 176-byte
+        ;; literal fixture), staged at main.c's one path \EFI\AIUEOS\KERNEL.ELF.
+        ;; Since the boot stage this is `os/aiueos/uefi/boot-fixture.kotoba`
+        ;; rather than amu's i64-semantics example: the boot evidence is the
+        ;; KERNEL answering on the debug console and ending the run with its
+        ;; own exit code, and a fixture whose `main` returns 0 would leave
+        ;; through `ret` with no return address instead. The admission
+        ;; verdicts' 176 bytes stay the frozen i64-semantics literal inside
+        ;; the probe. MISSING.ELF is deliberately never created; the probe's n
+        ;; mark is the refusal of that name. The probe measures this file's
+        ;; length and admits its headers FROM THE DISK BYTES, so the smoke's
+        ;; job is to put a genuine amu-built kernel there, not to hand-build
+        ;; anything the admit rules would accept.
+        swap (.. js/process -env -AIUEOS_SWAP_KERNEL)
+        kernel-source (path/join aiueos "uefi" "boot-fixture.kotoba")
+        kernel (path/join out "KERNEL.ELF")
+        esp-kernel (path/join out "esp" "EFI" "AIUEOS" "KERNEL.ELF")]
+    (fs/mkdirSync (path/dirname efi) #js {:recursive true})
+    (let [compiled (run! (path/join compiler "bin" "amu")
+                         ["compile" source
+                          "--source-path" source-path
+                          "--target" "x86_64-aiueos-uefi-v1"
+                          "--artifact" "image"
+                          ;; The digest path hashes 176 bytes as x86-64 with a
+                          ;; 512-byte state, and amu meters fuel by default:
+                          ;; with the default budget the probe stops dead after
+                          ;; marker P/W and never reaches isa-debug-exit
+                          ;; (measured 2026-10-24, debugcon "KHSCNAbcdefPW",
+                          ;; QEMU exit 0). 8,000,000 completes the digest path
+                          ;; (debugcon "KHSCNAbcdefPWghZ", exit 33) but not the
+                          ;; fs stage on top of it (debugcon "KHSCNAbcdefPWghvo"
+                          ;; -- stops inside the first open-read). 200,000,000
+                          ;; is a discrimination budget, not a floor: with it
+                          ;; the remaining stop is either the fuel or the
+                          ;; open-read's call6, and nothing else.
+                          "--fuel" "200000000"
+                          "--output" efi
+                          "--jvm-free"]
+                         {})]
+      (when-not (zero? (:status compiled))
+        (die (str "compile failed:\n" (:stdout compiled) (:stderr compiled)))))
+    (when-not swap
+      (let [kernel-compiled (run! (path/join compiler "bin" "amu")
+                                ["compile" kernel-source
+                                 "--target" "x86_64-aiueos-kernel-v1"
+                                 "--artifact" "image"
+                                 "--fuel" "32768"
+                                 "--output" kernel
+                                 "--jvm-free"]
+                                {})]
+        (when-not (zero? (:status kernel-compiled))
+          (die (str "kernel fixture compile failed:\n" (:stdout kernel-compiled) (:stderr kernel-compiled))))))
+    (when swap (fs/copyFileSync swap kernel))
+    (fs/mkdirSync (path/dirname esp-kernel) #js {:recursive true})
+    (fs/copyFileSync kernel esp-kernel)
+    ;; The same floor the pure-Kotoba kernel build keeps. A loader that
+    ;; quietly linked a C object would prove nothing about a Kotoba loader.
+    (doseq [entry (fs/readdirSync out #js {:recursive true})]
+      (when (re-find #"\.(c|S|o|obj|a|so)$" entry)
+        (die (str "foreign/C artifact entered the loader output: " entry))))
+    {:efi efi
+     :bytes (.-size (fs/statSync efi))
+     :kernel-bytes (.-size (fs/statSync esp-kernel))}))
+
+(defn observe [out code]
+  (let [debug (path/join out "debug.log")
+        serial (path/join out "serial.log")]
+    (let [result (run! (or (.. js/process -env -QEMU_SYSTEM_X86_64)
+                           "qemu-system-x86_64")
+                       ["-machine" "q35,accel=tcg" "-cpu" "max" "-m" "256M"
+                        "-drive" (str "if=pflash,format=raw,readonly=on,file=" code)
+                        "-drive" (str "format=raw,file=fat:rw:" (path/join out "esp"))
+                        "-device" "isa-debugcon,iobase=0xe9,chardev=dbg"
+                        "-chardev" (str "file,id=dbg,path=" debug)
+                        "-device" "isa-debug-exit,iobase=0xf4,iosize=0x04"
+                        "-display" "none" "-no-reboot"
+                        "-serial" (str "file:" serial)]
+                       ;; 300s was measured too short under host load
+                       ;; (2026-10-24: two runs both cut mid-fs-stage at the
+                       ;; 300s wall with the whole budget ahead of them); the
+                       ;; run itself is fuel-bounded, so the wall only has to
+                       ;; be generous.
+                       {:timeout 180000})]
+      {:status (:status result)
+       :debug (if (fs/existsSync debug) (fs/readFileSync debug "utf8") "")
+       :serial (if (fs/existsSync serial)
+                 (str/replace (fs/readFileSync serial "utf8") #"\r" "")
+                 "")})))
+
+(defn -main [& args]
+  (let [compiler (or (first (remove #(str/starts-with? % "--") args))
+                     (die "usage: smoke-qemu-uefi-loader.cljk /path/to/amu"))
+        want-markers (flag args "--expect-markers" default-markers)
+        want-verdicts (flag args "--expect-verdicts" default-verdicts)
+        want-esp (flag args "--expect-esp" default-esp)
+        out (fs/mkdtempSync (path/join (os/tmpdir) "aiueos-uefi-loader-"))
+        built (build! compiler out)
+        seen (observe out (firmware))
+        _ (println "=== RUN 1 (as built) ===")
+        status (:status seen)
+        debug (:debug seen)
+        serial (:serial seen)
+        ;; The firmware's own console driver rendered these, so the serial log
+        ;; is a second and independent observation of the same decisions the
+        ;; debug console marked.
+        verdicts (second (re-find #"verdict ([0-9 ]+)" serial))
+        entry (second (re-find #"entry\s+([0-9A-F]{16})" serial))
+        esp (second (re-find #"(?:^|\n)esp ([0-9 ]+)" serial))
+        ;; the map line the exit stage printed before ExitBootServices:
+        ;; reason, map size, descriptor size -- the second independent
+        ;; observation of the M mark's decision.
+        mmap (second (re-find #"(?:^|\n)map ([0-9 ]+)" serial))
+        ;; the boot line's nine words, the U mark's breakdown:
+        ;; tfacts uflags kstat kgot klen s0 s1 c0 c1
+        bootline (second (re-find #"(?:^|\n)boot ([0-9 ]+)" serial))]
+    (println (str "BOOTX64.EFI " (:bytes built) " bytes"
+                  " KERNEL.ELF " (:kernel-bytes built) " bytes"))
+    (println (str "exit=" status " debugcon=" (pr-str debug)))
+    (println (str "entry=" (pr-str entry) " verdicts=" (pr-str verdicts)
+                  " esp=" (pr-str esp) " map=" (pr-str mmap)
+                  " boot=" (pr-str bootline)))
+    (when-not (= expected-status status)
+      (println (str "NOTE: QEMU exited " status ", expected " expected-status
+                (if (= status 33)
+                  " -- 33 is the loader's own fallback exit: the jump did not happen and one of the T/U/M/X marks failed (debugcon above names which stage stopped)"
+                  " -- neither the kernel's exit nor the loader's fallback ran"))))
+    (when-not (= want-markers debug)
+      (println (str "NOTE markers differ: seen=" (pr-str debug) " want=" (pr-str want-markers)))
+      (println (str "debug console was " (pr-str debug) ", expected "
+                (pr-str want-markers))))
+    (when-not (= want-verdicts verdicts)
+      (println (str "NOTE verdicts differ"))
+      (println (str "the firmware console reported verdicts " (pr-str verdicts)
+                ", expected " (pr-str want-verdicts))))
+    ;; The fs stage's own six reasons on the firmware console: device, volume,
+    ;; the MISSING file's refused open (3), the kernel file's open, the read,
+    ;; and the admission of the DISK bytes against the measured file length.
+    (when-not (= want-esp esp)
+      (println (str "NOTE esp differ"))
+      (println (str "the firmware console reported esp " (pr-str esp)
+                ", expected " (pr-str want-esp))))
+    ;; e_entry of the fixture kernel, read out of the literal pool by
+    ;; `aiueos.uefi.elf/entry-point` and printed by `aiueos.uefi.console`.
+    (when-not (= expected-entry entry)
+      (println (str "NOTE entry differ"))
+      (println (str "e_entry printed as " (pr-str entry)
+                ", expected " expected-entry)))
+    ;; The map the exit stage would have handed the kernel, from the firmware
+    ;; console's own line: reason 0, then a non-zero map size and a descriptor
+    ;; size -- asserted here independently of the M mark on the debug console.
+    (when-not (re-find #"^0 [0-9]+ [0-9]+" (or mmap ""))
+      (println (str "the firmware console reported map " (pr-str mmap)
+                ", expected \"0 <map-size> <descriptor-size>\"")))
+    (println (str "AIUEOS_UEFI_LOADER_OK markers=" debug
+                  " verdicts=" (str/replace want-verdicts " " ",")
+                  " entry=" entry
+                  " esp=" (str/replace want-esp " " ",")))))
+
+(apply -main (drop 3 (js->clj js/process.argv)))

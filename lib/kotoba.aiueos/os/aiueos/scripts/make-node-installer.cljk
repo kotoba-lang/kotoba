@@ -1,0 +1,273 @@
+#!/usr/bin/env kbb
+;; Build the node install stick for ONE NAMED BOX, from the registry rather
+;; than from memory.
+;;
+;; `make-node-autoinstall-iso.cljk` is already machine-agnostic -- it is Ubuntu
+;; Server plus an autoinstall plus the agent bundle, and nothing in it is CPU-
+;; or NIC-specific. What was missing when the second box arrived was not code.
+;; It was the ARGUMENTS: which hostname, which disk may be erased, which
+;; console door, which tailnet. Those lived in one session's shell history, so
+;; this is the part that gets written down (contracts/node-machines-v1.edn).
+;;
+;;   kbb --backend sci os/aiueos/scripts/make-node-installer.cljk \
+;;     --machine amd-6600hs \
+;;     --iso ubuntu-24.04.4-live-server-amd64.iso \
+;;     --ssh-key ~/.ssh/id_ed25519.pub
+;;
+;; Storage is INTERACTIVE unless the box's disk serial has been measured. That
+;; is the one field that changes the product rather than the record: with it the
+;; stick installs unattended, without it the stick stops and asks a person which
+;; disk to erase. `--unattended` demands the measured field and refuses when it
+;; is absent -- it does not fall back to "the only NVMe", because install-v1
+;; already refuses "largest disk" and "first NVMe" for the reason it refuses
+;; them: the wrong answer erases the wrong machine.
+;;
+;; Exit codes: 0 built (or planned, under --dry-run) / 2 refused, by a named
+;; reason / 3 could-not-answer. 3 is neither 0 nor 1 on purpose: a run that
+;; could not read its own registry must not look like one that read it and
+;; found nothing to object to.
+
+(require '[kotoba.lang.text :as str]
+         '[cljs.reader :as reader]
+         '["node:fs" :as fs]
+         '["node:path" :as path]
+         '["node:child_process" :as cp])
+
+(def argv (vec *command-line-args*))
+(defn- opt [f d] (let [i (.indexOf argv f)] (if (neg? i) d (nth argv (inc i)))))
+(defn- flag? [f] (not (neg? (.indexOf argv f))))
+
+(defn- say [& m] (println (str "make-node-installer: " (str/join " " m))))
+(defn- refuse [& m]
+  (binding [*print-fn* #(.error js/console %)] (apply say (cons "REFUSING:" m)))
+  (js/process.exit 2))
+(defn- cannot-answer [& m]
+  (binding [*print-fn* #(.error js/console %)] (apply say (cons "COULD NOT ANSWER:" m)))
+  (js/process.exit 3))
+
+;; ── the registry ──────────────────────────────────────────────────────────
+;;
+;; Read with a reader, never a regex: a regex over an EDN contract in this repo
+;; once matched 8 of 18 entries and reported a clean "(none)" for the thing
+;; being audited. And the count of what was scanned is printed, because a zero
+;; from an incomplete scan and a zero from a complete one look identical.
+
+(def registry-path
+  (opt "--registry" (path/join "os" "aiueos" "contracts" "node-machines-v1.edn")))
+
+(def registry
+  (let [raw (try (fs/readFileSync registry-path "utf8")
+                 (catch :default e
+                   (cannot-answer "cannot read the registry at" registry-path
+                                  (str "(" (.-message e) ")"))))
+        doc (try (reader/read-string raw)
+                 (catch :default e
+                   (cannot-answer "the registry is not readable EDN:" (.-message e))))]
+    ;; Typed, not merely parsed. `reader/read-string` returns a value for plenty
+    ;; of files that are damaged in ways that matter -- a string that closed
+    ;; early still reads, and the keys after it read as keys. So the shape is
+    ;; asserted before anything is spent on it.
+    (when-not (map? doc)
+      (cannot-answer "the registry did not read as a map"))
+    (when-not (= :aiueos.node-machines/v1 (:format doc))
+      (cannot-answer "the registry is not :aiueos.node-machines/v1; it says"
+                     (pr-str (:format doc))))
+    (when-not (map? (:machines doc))
+      (cannot-answer "the registry has no :machines map"))
+    doc))
+
+(def machines (:machines registry))
+(def vocabulary (:provenance registry))
+(def defaults (:defaults registry))
+
+(def known (sort (map name (keys machines))))
+
+(def machine-id (opt "--machine" nil))
+(when-not machine-id
+  (refuse "no --machine. This builds a stick for one named box, and which box"
+          "is not a thing to infer.\n  known:" (str/join ", " known)))
+
+(def machine
+  (or (get machines (keyword machine-id))
+      (refuse "no machine" (str "`" machine-id "`") "in" registry-path
+              "\n  known:" (str/join ", " known)
+              "\n  A new box is an entry in that file, with its provenance, before it is a stick.")))
+
+(def facts (:facts machine))
+
+;; Fail closed on the registry itself. A provenance word outside the
+;; vocabulary is not a typo to tolerate: the whole point of this file is that
+;; the reader can tell a measurement from a guess, and an unrecognised word
+;; means the reader cannot.
+(doseq [[k v] facts]
+  (when-not (map? v)
+    (cannot-answer "fact" (str k) "is not a map"))
+  (when-not (contains? vocabulary (:provenance v))
+    (cannot-answer "fact" (str k) "carries provenance" (pr-str (:provenance v))
+                   "which is not in the registry's vocabulary"
+                   (str "(" (str/join ", " (map str (keys vocabulary))) ")"))))
+
+(defn- fact [k] (get facts k))
+(defn- measured?
+  "Measured means both: somebody read it off the machine, AND there is a value.
+  Either half alone is how an unverified field gets spent as a measured one."
+  [k]
+  (let [f (fact k)]
+    (and (= :measured (:provenance f)) (some? (:value f)))))
+
+;; ── what the stick will be ────────────────────────────────────────────────
+
+(def unattended? (flag? "--unattended"))
+(def hostname (or (opt "--hostname" nil) (:hostname machine)))
+(when-not (string? hostname)
+  (cannot-answer "machine" machine-id "has no :hostname string"))
+
+(def endpoint (or (opt "--endpoint" nil) (:endpoint machine) (:endpoint defaults)))
+(def username (or (opt "--username" nil) (:username machine) (:username defaults)))
+(def codename (or (opt "--ubuntu-codename" nil)
+                  (:ubuntu-codename machine) (:ubuntu-codename defaults)))
+
+(def iso (opt "--iso" nil))
+(def bundle (opt "--bundle" (path/join "build" "aiueos" "aiueos-node-agent.tar.gz")))
+(def output (opt "--output" (path/join "build" "aiueos"
+                                       (str "aiueos-node-autoinstall-" machine-id ".iso"))))
+(def ssh-key (opt "--ssh-key" nil))
+(def no-ssh? (flag? "--no-ssh"))
+(def dry-run? (flag? "--dry-run"))
+
+;; These are checked HERE, before the 3 GB of work, rather than being left to
+;; the builder. The builder's refusals are right and are not duplicated -- what
+;; is duplicated is only the timing, so that an argument mistake is not reported
+;; after a repack has already spent ten minutes.
+(when (and (not ssh-key) (not no-ssh?))
+  (refuse (str "no --ssh-key. After this install nobody can reach " hostname ".")
+          "\n  Pass a public key, or --no-ssh to choose that deliberately."))
+(when (and ssh-key no-ssh?)
+  (refuse "--ssh-key and --no-ssh are both given. One of them is not what you meant."))
+
+;; ── the one field that changes the product ────────────────────────────────
+
+(def serial-fact (fact :disk-serial))
+
+(when (and unattended? (not (measured? :disk-serial)))
+  (refuse "--unattended needs a MEASURED disk serial for" machine-id
+          "and the registry says" (pr-str (:provenance serial-fact))
+          (str "(value " (pr-str (:value serial-fact)) ").")
+          "\n  An unattended stick erases the disk that matches, so the match has to"
+          "\n  be a measurement rather than a plausible string. Measure it at the box:"
+          (str "\n    " (or (:measure-by serial-fact)
+                            "lsblk -dno NAME,SERIAL,MODEL,SIZE"))
+          "\n  then record it:"
+          (str "\n    kbb --backend sci os/aiueos/scripts/record-node-machine-probe.cljk"
+               " --machine " machine-id " --probe <file>")
+          "\n  Without --unattended this builds the stick that ASKS, which is the"
+          "\n  right product for a box nobody has measured."))
+
+(def target-serial (when unattended? (:value serial-fact)))
+
+;; ── say what is known and what is not, before building ────────────────────
+;;
+;; Printed rather than assumed read: "the stick built" must never be read as
+;; "these facts about the box are right". Most of them, for a new box, are not
+;; facts at all.
+
+(println (str "machine   " machine-id))
+(println (str "hostname  " hostname))
+(println (str "endpoint  " endpoint))
+(println (str "storage   "
+              (if target-serial
+                (str "unattended, serial " target-serial " (measured)")
+                "INTERACTIVE -- a person picks the disk at the box")))
+(println "facts:")
+(doseq [k (sort (keys facts))]
+  (let [f (fact k)
+        v (:value f)
+        p (:provenance f)]
+    (println (str "  " (str/pad-left (name k) 13 " ") "  "
+                  (case p
+                    :measured     (str (pr-str v) "  [measured"
+                                       (when (:on f) (str " " (:on f))) "]")
+                    :owner-stated (str (pr-str v) "  [OWNER-STATED -- not read off the box]")
+                    :unverified   "UNVERIFIED -- nobody has looked"
+                    (str (pr-str v) "  [" p "]"))))))
+(println (str "scanned   " (count facts) " facts for " machine-id
+              ", " (count (filter measured? (keys facts))) " measured"))
+
+;; ── prerequisites ─────────────────────────────────────────────────────────
+
+(doseq [[p what hint]
+        [[iso "the Ubuntu Server ISO (--iso)"
+          "download ubuntu-24.04.x-live-server-amd64.iso from releases.ubuntu.com"]
+         [bundle "the node agent bundle (--bundle)"
+          (str "kbb --backend sci os/aiueos/scripts/make-node-agent-bundle.cljk --output " bundle)]]]
+  (when-not (and p (fs/existsSync p))
+    (cannot-answer "missing" what (str "(" (pr-str p) ")") "\n  hint:" hint)))
+
+;; ── hand over ─────────────────────────────────────────────────────────────
+;;
+;; The builder is invoked rather than reimplemented. Its refusals, its boot
+;; record checks on the way in and out, its move-not-copy and its chunked
+;; digest are all load-bearing and all already measured; a second copy of any
+;; of them would be a second thing to keep true.
+
+(def builder (path/join "os" "aiueos" "scripts" "make-node-autoinstall-iso.cljk"))
+(when-not (fs/existsSync builder)
+  (cannot-answer "the builder is missing at" builder))
+
+(def passthrough
+  ;; Forwarded verbatim, never re-derived. A console password and a tailnet key
+  ;; are decisions the builder already documents; this script must not quietly
+  ;; acquire an opinion about either, and must not put either in argv itself --
+  ;; both are taken as FILES there for exactly that reason.
+  (vec (mapcat (fn [f] (let [i (.indexOf argv f)]
+                         (cond
+                           (neg? i) []
+                           (str/ends-with? f "-file") [f (nth argv (inc i))]
+                           :else [f])))
+               ["--console-password-file" "--no-console-password"
+                "--tailscale-authkey-file" "--no-tailscale"
+                "--no-hw-record"])))
+
+(def builder-args
+  (vec (concat [builder
+                "--iso" iso
+                "--bundle" bundle
+                "--output" output
+                "--endpoint" endpoint
+                "--hostname" hostname
+                "--username" username
+                "--ubuntu-codename" codename]
+               (if no-ssh? ["--no-ssh"] ["--ssh-key" ssh-key])
+               (when target-serial ["--target-serial" target-serial])
+               passthrough)))
+
+(println (str "builder   nbb " (str/join " " builder-args)))
+
+(when dry-run?
+  (say "DRY RUN -- nothing was built.")
+  (js/process.exit 0))
+
+(let [r (.spawnSync cp "nbb" (clj->js builder-args)
+                    #js {:encoding "utf8" :stdio "inherit"})
+      ;; spawnSync reports status nil when the child never ran at all. Letting
+      ;; that fall through is how "the builder is not installed" becomes exit 0.
+      code (or (.-status r) (when (.-error r) :spawn-failed))]
+  (cond
+    (= :spawn-failed code)
+    (cannot-answer "could not run nbb:" (some-> (.-error r) .-message))
+
+    (not (zero? code))
+    (do (binding [*print-fn* #(.error js/console %)]
+          (say "the builder refused or failed; exit" code))
+        (js/process.exit code))
+
+    :else
+    (do (say "built" output)
+        (when-not target-serial
+          (say "This stick ASKS which disk to erase. It installs nothing without"
+               "a person at the machine."))
+        (say "After the first boot, collect the hardware record and fill in"
+             (str machine-id "'s") "unverified facts:")
+        (say "  scp" (str username "@" hostname ":/var/log/aiueos-node-hwprobe.txt") ".")
+        (say "  kbb --backend sci os/aiueos/scripts/record-node-machine-probe.cljk --machine"
+             machine-id "--probe aiueos-node-hwprobe.txt"))))

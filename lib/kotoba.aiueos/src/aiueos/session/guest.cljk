@@ -1,0 +1,189 @@
+(ns aiueos.session.guest
+  "P3: one grant-limited Kotoba guest visible in the hosted daily shell.
+
+  Identity is `examples/apps/notes.edn` (`:app/notes`). Grant decides;
+  `aiueos.execute` runs Wasm only after `:grant`. POSIX `:fs/open` in the
+  on-disk fixture is the named deny (no fs provider in this shell — local
+  disk write is P3 red). The hosted allow path drops that import and keeps
+  kernel `:log/write`, which Chicory can actually link.
+
+  Kotobase round-trip is the session process, not a guest-local file.
+  A write that the authority answers 401 is `:write-unauthorized`, never
+  a successful store.
+
+  JVM-only for execute + sockets (`#?(:clj …)`), same as `aiueos.execute`."
+  (:require [kotoba.bytes :as kbytes] [kotoba.lang.text :as str]
+            #?(:clj [aiueos.cloud-live :as cloud-live])
+            #?(:clj [aiueos.execute :as execute])
+            #?(:clj [aiueos.provider.cloud :as provider])
+            #?(:clj [aiueos.session.live :as session-live])
+            #?(:clj [clojure.edn :as edn])
+            #?(:clj [kotoba.io :as io])
+            #?(:clj [grant.graph :as graph])
+            #?(:clj [grant.policy :as policy])))
+
+(def notes-edn-path "examples/apps/notes.edn")
+
+(def component-id :app/notes)
+
+;; Same log_write module as `aiueos.execute-test` (WAT in examples/apps/notes.wat).
+;; `(import "kotoba" "log_write")` then `main` writes "hi". Not a second JS runtime.
+(def ^:private notes-wasm-b64
+  "AGFzbQEAAAABCwJgAn9/AX9gAAF/AhQBBmtvdG9iYQlsb2dfd3JpdGUAAAMCAQEFAwEAAQcRAgRtYWluAAEGbWVtb3J5AgAKCgEIAEEAQQIQAAsLCAEAQQALAmhp")
+
+#?(:clj
+   (defn notes-wasm
+     []
+     (kbytes/base64-decode-bytes notes-wasm-b64)))
+
+#?(:clj
+   (defn load-notes-edn
+     "The fixture ADR-2608221625 names. Missing file is a named error, not an
+     invented guest."
+     []
+     (let [f (io/file notes-edn-path)]
+       (when-not (io/file? f)
+         (throw (ex-info "examples/apps/notes.edn missing"
+                         {:aiueos.session.guest/reason :manifest-missing
+                          :path notes-edn-path})))
+       (edn/read-string (slurp f)))))
+
+(defn hosted-manifest
+  "Allow path: same `:app/notes` identity, kernel `:log/write` only.
+  `:fs/open` would be POSIX disk — P3 red if that were the store."
+  [raw]
+  (-> raw
+      (assoc :aiueos/component component-id
+             :aiueos/kind :app)
+      (update :aiueos/imports (fn [imps]
+                                (-> (or imps #{})
+                                    (disj :fs/open :fs/read :fs/write)
+                                    (conj :log/write))))))
+
+(defn deny-manifest
+  "On-disk notes.edn as written. `:fs/open` has no provider here, so grant
+  refuses with `:unresolved-capability` — that is the deny path's red."
+  [raw]
+  (assoc raw :aiueos/component component-id :aiueos/kind :app))
+
+(defn parse-grant-mode
+  "Unknown grant strings refuse rather than 500."
+  [x]
+  (let [s (str/lower (str (or x "")))]
+    (if (contains? #{"allow" ":allow" "grant"} s) :allow :deny)))
+
+#?(:clj (def empty-graph (graph/build [])))
+
+#?(:clj (def default-policy policy/default-policy))
+
+(defn violation-kind
+  [decision]
+  (some-> (:aiueos/violations decision) first :aiueos/kind))
+
+#?(:clj
+   (defn admit-and-run
+     "Grant first. `:allow` overlays the hosted imports and executes Wasm.
+     `:deny` uses the fixture imports so `:fs/open` is unresolved. Neither
+     path is a generic 500: the broker's decision is the product."
+     [mode]
+     (let [raw (load-notes-edn)
+           m (case mode
+               :allow (hosted-manifest raw)
+               :deny (deny-manifest raw)
+               (throw (ex-info "grant mode must be :allow or :deny"
+                               {:aiueos.session.guest/reason :unknown-grant-mode
+                                :mode mode})))
+           wasm (notes-wasm)
+           decision (execute/execute m empty-graph default-policy wasm)
+           granted? (= :grant (:aiueos/decision decision))
+           reason (when-not granted?
+                    (or (violation-kind decision)
+                        (:aiueos/decision decision)
+                        :denied))]
+       {:mode mode
+        :component component-id
+        :decision (:aiueos/decision decision)
+        :visible (boolean granted?)
+        :reason reason
+        :result (:aiueos.execute/result decision)
+        :log (:aiueos.execute/log decision)
+        :via "grant"
+        :violations (mapv (fn [v]
+                            {:kind (name (:aiueos/kind v))
+                             :message (:aiueos/message v)})
+                          (:aiueos/violations decision))
+        :receipt-status (some-> (:aiueos/run-receipt decision) :aiueos/status name)})))
+
+#?(:clj (def ^:private hello-world-bytes (kbytes/utf8-bytes "hello world")))
+
+(def hello-world-raw-cid
+  "bafkreifzjut3te2nhyekklss27nh3k72ysco7y32koao5eei66wof36n5e")
+
+#?(:clj
+   (defn- storage-leg
+     "Kotobase from the session process after a grant. Write is attempted
+     without a credential so a 401 is `:write-unauthorized`, not a stored note."
+     []
+     (let [read (session-live/read-cid)
+           write (try
+                   (let [policy (cloud-live/with-clock (cloud-live/read-policy))
+                         v (provider/write-block! policy hello-world-raw-cid hello-world-bytes)]
+                     {:outcome (name (cloud-live/outcome-of v))
+                      :reason (some-> (:aiueos.cloud/reason v) name)
+                      :status (:aiueos.cloud/status v)})
+                   (catch Exception e
+                     {:outcome "unmeasured"
+                      :reason "response-unmeasured"
+                      :fault (.getMessage e)}))]
+       {:storage_read (:outcome read)
+        :storage_read_reason (:reason read)
+        :storage_write (:outcome write)
+        :storage_write_reason (:reason write)
+        :storage_write_status (:status write)
+        :via_process "session-process"})))
+
+#?(:clj
+   (defn run
+     "HTTP/smoke entry. Storage legs run only on `:allow` so a deny is about
+     grant, not kotobase."
+     [mode]
+     (let [exec (admit-and-run mode)]
+       (if (and (= :allow mode) (:visible exec))
+         (merge exec (storage-leg))
+         exec))))
+
+(defn public-snapshot
+  [state]
+  (when state
+    (let [visible? (boolean (:visible state))
+          decision (name (or (:decision state) :deny))
+          reason (some-> (:reason state) name)]
+      (cond-> {:component (str/replace (str (:component state component-id)) #"^:" "")
+               :decision decision
+               :visible visible?
+               :via (or (:via state) "grant")
+               :via_process (or (:via_process state) "session-process")}
+        reason (assoc :reason reason)
+        (some? (:result state)) (assoc :result (:result state))
+        (seq (:log state)) (assoc :log (str/join " " (:log state)))
+        (:storage_read state) (assoc :storage_read (:storage_read state)
+                                     :storage_write (:storage_write state)
+                                     :storage_write_reason (:storage_write_reason state))
+        (seq (:violations state)) (assoc :violations (:violations state))))))
+
+(defn public-list
+  "SPA/API shape. Running guests only appear under `:guests`. A deny is
+  `:refused` with the grant kind, never omitted as a 500."
+  [state]
+  (let [snap (public-snapshot state)]
+    (cond
+      (nil? snap) {:guests [] :refused [] :count 0}
+      (:visible snap) {:guests [snap] :refused [] :count 1}
+      :else {:guests [] :refused [snap] :count 1})))
+
+(defn http-code
+  [state]
+  (cond
+    (nil? state) 200
+    (:visible state) 200
+    :else 403))

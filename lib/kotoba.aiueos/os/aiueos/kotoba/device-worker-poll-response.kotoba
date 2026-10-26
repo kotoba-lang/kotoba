@@ -1,0 +1,181 @@
+;; What the murakumo device-worker poll response tells this node to do.
+;;
+;; Retires the decision of `kernel/device_worker_protocol.c`'s
+;; `aiueos_device_worker_poll_response` (ADR-0219): an HTTP response is
+;; admitted only if it is a 2xx whose body carries `"accepted":true` and
+;; `"operation":"poll"`, and then says at most ONE of: a control action
+;; (reboot-pxe / restart-runtime, each with a non-zero command id), a job
+;; (non-zero id plus a bos token that fits u32), or `"job":null`. Every
+;; search scans the WHOLE response from byte 0, as the C's `find_text` did
+;; (its `at` was an output, not a cursor -- measured: the C admits
+;; `"operation"` before `"accepted"`, and `"bos"` before `"job-id"`); only
+;; the decimal parse begins where the search that found its key ended.
+;;
+;; The C filled an out-struct; here the answer is WRITTEN INTO A CALLER-OWNED
+;; 32-BYTE RECORD and the verdict is the return:
+;;
+;;   aiueos-device-worker-poll-record/v1, 32 bytes
+;;     0  u64 job_id
+;;     8  u64 control_id
+;;    16  u32 bos_token
+;;    20  u8  ready
+;;    21  u8  has_job
+;;    22  u8  reboot_pxe
+;;    23  u8  restart_runtime
+;;    24  8 bytes zero
+;;
+;; The record is zeroed before any search that can write it, as the C zeroed
+;; its struct after the three admission checks and before the rest -- a
+;; refused response that passed those three leaves zeros, one that failed
+;; them leaves the record untouched. Decimal fields are parsed as the C
+;; parsed them: at most 20 digits, refusing past UINT64_MAX with the unsigned
+;; compare spelled over signed words (bit 63 flipped on both sides).
+;;
+;; RETURNS 1 when the response is understood, else 0.
+
+(ns aiueos.device-worker-poll-response
+  (:export [aiueos-device-worker-poll-response main]))
+
+(defn lit-length [kind]
+  (if (= kind 0) 10          ; HTTP/1.1 2
+    (if (= kind 1) 15        ; "accepted":true
+      (if (= kind 2) 18      ; "operation":"poll"
+        (if (= kind 3) 12    ; "ready":true
+          (if (= kind 4) 47  ; "control":{"action":"reboot-pxe","command-id":"
+            (if (= kind 5) 52 ; "control":{"action":"restart-runtime","command-id":"
+              (if (= kind 6) 10 ; "job-id":"
+                (if (= kind 7) 10 ; "job":null
+                  6)))))))))      ; "bos":
+
+(defn lit-char [kind index]
+  (if (= kind 0) (string-code-point-at "HTTP/1.1 2" index)
+    (if (= kind 1) (string-code-point-at "\"accepted\":true" index)
+      (if (= kind 2) (string-code-point-at "\"operation\":\"poll\"" index)
+        (if (= kind 3) (string-code-point-at "\"ready\":true" index)
+          (if (= kind 4) (string-code-point-at "\"control\":{\"action\":\"reboot-pxe\",\"command-id\":\"" index)
+            (if (= kind 5) (string-code-point-at "\"control\":{\"action\":\"restart-runtime\",\"command-id\":\"" index)
+              (if (= kind 6) (string-code-point-at "\"job-id\":\"" index)
+                (if (= kind 7) (string-code-point-at "\"job\":null" index)
+                  (string-code-point-at "\"bos\":" index))))))))))
+
+(defn starts-at [http length at kind i]
+  ;; 1 when literal `kind` is at `at`, reading only inside `length`.
+  (if (>= i (lit-length kind))
+    1
+    (if (>= (+ at i) length)
+      0
+      (if (= (kernel-load-u8 http length (+ at i)) (lit-char kind i))
+        (starts-at http length at kind (+ i 1))
+        0))))
+
+(defn find-from [http length kind at]
+  (if (>= at length)
+    -1
+    (if (= (starts-at http length at kind 0) 1)
+      (+ at (lit-length kind))
+      (find-from http length kind (+ at 1)))))
+
+(defn find-text [http length kind]
+  ;; The index just past the first occurrence anywhere in the response, or
+  ;; -1. Always from byte 0, as the C searched.
+  (find-from http length kind 0))
+
+(defn top-bit [] (i64-shift-left 1 63))
+(defn ugt [a b] (if (> (bit-xor a (top-bit)) (bit-xor b (top-bit))) 1 0))
+
+(defn digit-at [http length at]
+  (if (>= at length)
+    -1
+    (let [c (kernel-load-u8 http length at)]
+      (if (and (>= c 48) (<= c 57)) (- c 48) -1))))
+
+(defn decimal-end [http length at digits]
+  ;; where the digit run starting at `at` ends
+  (if (< (digit-at http length at) 0)
+    at
+    (decimal-end http length (+ at 1) (+ digits 1))))
+
+(defn decimal-value [http length at end acc]
+  ;; The C's overflow rule: refuse when parsed * 10 + digit would pass
+  ;; UINT64_MAX (parsed > UINT64_MAX/10, or equal and digit > 5). -2 is the
+  ;; refusal; a legal value is a bit pattern and may be negative here.
+  (if (>= at end)
+    acc
+    (let [d (digit-at http length at)]
+      (if (or (= (ugt acc 1844674407370955161) 1)
+              (and (= acc 1844674407370955161) (> d 5)))
+        -2
+        (decimal-value http length (+ at 1) end (+ (* acc 10) d))))))
+
+(defn parse-u64 [http length at]
+  ;; -2 refuses: no digits, a 21st digit (the C refused on reaching it,
+  ;; whatever the value), or overflow. Any other word is the value's bit
+  ;; pattern -- including -1, which is UINT64_MAX and legal.
+  (let [end (decimal-end http length at 0)]
+    (if (or (= end at) (> (- end at) 20))
+      -2
+      (decimal-value http length at end 0))))
+
+(defn quote-after [http length at]
+  ;; the C's `at < length && http[at] == '"'`
+  (if (>= at length) 0 (if (= (kernel-load-u8 http length at) 34) 1 0)))
+
+(defn store-u64 [out at v]
+  (+ (kernel-store-u32 out 32 at (bit-and v 4294967295))
+     (kernel-store-u32 out 32 (+ at 4)
+                       (bit-and (i64-shift-right v 32) 4294967295))))
+
+(defn zero-record [out i]
+  (if (= i 32) 0 (+ (kernel-store-u8 out 32 i 0) (* 0 (zero-record out (+ i 1))))))
+
+(defn control [http length out at flag]
+  ;; a control action: id must parse, be followed by a quote, and be non-zero
+  (let [id (parse-u64 http length at)]
+    (if (= id -2)
+      0
+      (let [end (decimal-end http length at 0)]
+        (if (or (= (quote-after http length end) 0) (= id 0))
+          0
+          (+ 1 (* 0 (+ (store-u64 out 8 id) (kernel-store-u8 out 32 flag 1)))))))))
+
+(defn job [http length out at]
+  (let [id (parse-u64 http length at)]
+    (if (= id -2)
+      0
+      (let [end (decimal-end http length at 0)]
+        (if (or (= (quote-after http length end) 0) (= id 0))
+          0
+          (let [b (find-text http length 8)]
+            (if (< b 0)
+              0
+              (let [bos (parse-u64 http length b)]
+                (if (or (= bos -2) (< bos 0) (> bos 4294967295))
+                  0
+                  (+ 1 (* 0 (+ (store-u64 out 0 id)
+                               (kernel-store-u32 out 32 16 bos)
+                               (kernel-store-u8 out 32 21 1)))))))))))))
+
+(defn after-admission [http length out]
+  (let [r (find-text http length 3)
+        stored (if (< r 0) 0 (kernel-store-u8 out 32 20 1))
+        c4 (find-text http length 4)]
+    (if (>= c4 0)
+      (+ (control http length out c4 22) (* 0 stored))
+      (let [c5 (find-text http length 5)]
+        (if (>= c5 0)
+          (control http length out c5 23)
+          (let [j (find-text http length 6)]
+            (if (< j 0)
+              (if (< (find-text http length 7) 0) 0 1)
+              (job http length out j))))))))
+
+(defn aiueos-device-worker-poll-response [http length out]
+  (if (or (< length 12) (= (starts-at http length 0 0 0) 0))
+    0
+    (if (or (< (find-text http length 1) 0) (< (find-text http length 2) 0))
+      0
+      ;; zeroed FIRST, in a binding, so the stores below land after it
+      (let [zeroed (zero-record out 0)]
+        (+ (after-admission http length out) (* 0 zeroed))))))
+
+(defn main [] 0)

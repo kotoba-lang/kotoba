@@ -1,0 +1,290 @@
+#!/usr/bin/env kbb
+;; aiueos AArch64 UEFI + kernel boot evidence gate (ADR-2608080600 tracks a1/a2).
+;;
+;; The x86_64 counterpart is `os/aiueos/scripts/smoke-qemu-uefi.sh`. This one is
+;; nbb per the 2026-07-14 owner rule (new harnesses are `.cljs`, never `.sh`).
+;;
+;; Builds the AArch64 UEFI loader and the AArch64 kernel, stages both on a FAT32
+;; ESP, boots under real AAVMF firmware, and requires every evidence marker to
+;; appear on PL011 serial.
+;;
+;; The gate judges SUBSTANCE, not marker presence: it parses SCTLR_EL1 to confirm
+;; the MMU bit is actually set, requires the translation tables to have come from
+;; the physical page allocator, and requires both W^X probes to report the exact
+;; ESR exception class and a level-3 permission fault. A kernel that enables the
+;; MMU but maps everything RWX still prints `AIUEOS_MMU_OK` and
+;; `AIUEOS_AARCH64_KERNEL_OK` — `--expect-fail` builds exactly that kernel, plus
+;; one whose memory-admission judgement trusts the firmware map, and requires
+;; this gate to reject both.
+;;
+;;   kbb --backend sci smoke-qemu-aarch64-uefi.cljk                  # boot evidence gate
+;;   kbb --backend sci smoke-qemu-aarch64-uefi.cljk --display-matrix  # GOP probe across devices
+;;   kbb --backend sci smoke-qemu-aarch64-uefi.cljk --expect-fail     # three negative controls
+
+(ns smoke-qemu-aarch64-uefi
+  (:require ["node:child_process" :as cp]
+            ["node:fs" :as fs]
+            ["node:path" :as path]
+            [kotoba.lang.text :as str]))
+
+;; nbb does not expose `import.meta.url`; `*file*` is the script path and
+;; process.argv is [node, nbb, script, ...user args].
+(def here (path/resolve (path/dirname (str *file*))))
+
+(def aavmf-code "/usr/share/AAVMF/AAVMF_CODE.fd")
+(def aavmf-vars "/usr/share/AAVMF/AAVMF_VARS.fd")
+
+;; --------------------------------------------------------------------------
+;; Evidence contract. `:line` checks scope the predicate to the marker's own
+;; line, so a substring appearing anywhere else in the transcript cannot
+;; satisfy it.
+
+(def required-markers
+  ["AIUEOS_AARCH64_UEFI_ENTRY"
+   "AIUEOS_UEFI_REVISION"
+   "AIUEOS_KERNEL_FILE_OK"
+   "AIUEOS_KERNEL_ELF_OK"
+   "AIUEOS_MEMMAP_OK"
+   "AIUEOS_EXIT_BOOT_SERVICES_OK"
+   "AIUEOS_CURRENT_EL 1"
+   "AIUEOS_KERNEL_HANDOFF"
+   "AIUEOS_KERNEL_ENTRY"
+   "AIUEOS_BOOTINFO_OK"
+   "AIUEOS_KERNEL_IMAGE"
+   "AIUEOS_PMM_OK"
+   "AIUEOS_PMM_RESERVED_OK"
+   "AIUEOS_PMM_DISTINCT_OK"
+   "AIUEOS_PMM_EXHAUSTION_OK"
+   "AIUEOS_PAGETABLES_BUILT"
+   "AIUEOS_MMU_OK"
+   "AIUEOS_AARCH64_KERNEL_OK"])
+
+(defn- line-for [serial marker]
+  (first (filter #(str/includes? % marker) (str/split-lines serial))))
+
+(defn- mmu-enabled?
+  "SCTLR_EL1.M (bit 0) must actually be set — not merely reported."
+  [serial]
+  (when-let [l (line-for serial "AIUEOS_MMU_OK")]
+    (when-let [m (re-find #"sctlr=0x([0-9a-fA-F]+)" l)]
+      (odd? (js/parseInt (second m) 16)))))
+
+(defn- wx-probe-ok?
+  "A W^X probe passes only with the exact ESR exception class and a level-3
+   permission fault. EC 0x25 = data abort at the current EL, 0x21 = instruction
+   abort at the current EL."
+  [serial marker expected-ec]
+  (when-let [l (line-for serial marker)]
+    (and (str/includes? l (str "ec=0x" (.padStart (.toString expected-ec 16) 16 "0")))
+         (str/includes? l "fsc=permission-l3")
+         (str/includes? l "expected-ec")
+         (not (str/includes? l "NO_FAULT")))))
+
+(defn- tables-from-allocator?
+  "The translation tables must come from the physical page allocator, not from
+   .bss. Without this the allocator could exist and be entirely unused."
+  [serial]
+  (when-let [l (line-for serial "AIUEOS_PAGETABLES_BUILT")]
+    (str/includes? l "from=allocator")))
+
+(defn- pmm-found-memory?
+  "A plausible amount of usable memory. Zero regions would still print
+   AIUEOS_PMM_OK-shaped output in a broken allocator."
+  [serial]
+  (when-let [l (line-for serial "AIUEOS_PMM_OK")]
+    (and (not (str/includes? l "TRUNCATED"))
+         (when-let [m (re-find #"regions=(\d+) pages=(\d+)" l)]
+           (and (pos? (js/parseInt (nth m 1) 10))
+                (pos? (js/parseInt (nth m 2) 10)))))))
+
+(defn evidence-failures
+  "Every unmet requirement, as human-readable strings. Empty means the gate passes."
+  [serial]
+  (concat
+   (map #(str "missing marker: " %) (remove #(str/includes? serial %) required-markers))
+   (when-not (mmu-enabled? serial) ["SCTLR_EL1.M not set (MMU not actually enabled)"])
+   (when-not (pmm-found-memory? serial)
+     ["physical allocator reported no usable regions/pages (or truncated the map)"])
+   (when-not (tables-from-allocator? serial)
+     ["translation tables did not come from the physical page allocator"])
+   (when-not (wx-probe-ok? serial "AIUEOS_WX_WRITE_TEXT" 0x25)
+     ["W^X probe 1 (store into .text) did not take a level-3 permission data abort"])
+   (when-not (wx-probe-ok? serial "AIUEOS_WX_EXEC_RODATA" 0x21)
+     ["W^X probe 2 (execute .rodata) did not take a level-3 permission instruction abort"])))
+
+;; --------------------------------------------------------------------------
+
+(defn- run! [cmd args]
+  (let [r (cp/spawnSync cmd (clj->js args)
+                        (clj->js {:encoding "utf8" :stdio "pipe"}))]
+    {:status (.-status r) :stdout (or (.-stdout r) "") :stderr (or (.-stderr r) "")}))
+
+(defn- must! [cmd args]
+  (let [{:keys [status stdout stderr]} (run! cmd args)]
+    (when-not (zero? status)
+      (println (str "error: " cmd " " (str/join " " args) " failed (" status ")"))
+      (println stderr) (println stdout)
+      (js/process.exit 1))
+    stdout))
+
+(defn- need-tool! [tool]
+  (when-not (zero? (:status (run! "sh" ["-c" (str "command -v " tool)])))
+    (println (str "error: required tool missing: " tool))
+    (js/process.exit 1)))
+
+(defn build-efi!
+  "Compile + link the AArch64 PE32+ UEFI loader. AArch64 UEFI uses AAPCS64, so
+   there is no ms_abi attribute — the largest source-level difference from the
+   x86_64 loader."
+  [out-dir]
+  (let [obj (path/join out-dir "boot.obj")
+        efi (path/join out-dir "BOOTAA64.EFI")]
+    (must! "clang" ["--target=aarch64-unknown-windows" "-ffreestanding" "-fshort-wchar"
+                    "-fno-stack-protector" "-mgeneral-regs-only" "-O1"
+                    "-I" here "-c" "-o" obj (path/join here "boot.c")])
+    (must! "lld-link" ["-subsystem:efi_application" "-entry:efi_main"
+                       "-nodefaultlib" (str "-out:" efi) obj])
+    efi))
+
+(defn build-kernel!
+  "Compile + link the freestanding AArch64 kernel ELF. `break` selects a
+   negative control: :wx maps every kernel page writable AND executable, :pmm
+   makes the physical-memory admission judgement trust the firmware map."
+  [out-dir break]
+  (let [kobj (path/join out-dir (str "kernel" (when break (str "_" (name break))) ".o"))
+        eobj (path/join out-dir "kentry.o")
+        elf (path/join out-dir "KERNEL.ELF")]
+    (must! "clang" (concat ["--target=aarch64-unknown-none-elf" "-ffreestanding"
+                            "-fno-stack-protector" "-mgeneral-regs-only" "-O1"
+                            "-I" here]
+                           (case break
+                             :wx ["-DAIUEOS_BREAK_WX"]
+                             :pmm ["-DAIUEOS_BREAK_PMM"]
+                             nil)
+                           ["-c" "-o" kobj (path/join here "kernel.c")]))
+    (must! "clang" ["--target=aarch64-unknown-none-elf" "-ffreestanding"
+                    "-I" here "-c" "-o" eobj (path/join here "kentry.S")])
+    (must! "ld.lld" ["-T" (path/join here "kernel.ld") "-o" elf eobj kobj])
+    elf))
+
+(defn build-esp!
+  "Stage the loader at the removable-media fallback path and the kernel where
+   the loader looks for it."
+  [out-dir efi elf]
+  (let [esp (path/join out-dir "esp.img")]
+    (must! "dd" ["if=/dev/zero" (str "of=" esp) "bs=1M" "count=64" "status=none"])
+    (must! "mkfs.vfat" ["-F" "32" "-n" "AIUEOS" esp])
+    (must! "mmd" ["-i" esp "::/EFI" "::/EFI/BOOT" "::/EFI/AIUEOS"])
+    (when efi (must! "mcopy" ["-i" esp efi "::/EFI/BOOT/BOOTAA64.EFI"]))
+    (when elf (must! "mcopy" ["-i" esp elf "::/EFI/AIUEOS/KERNEL.ELF"]))
+    esp))
+
+(defn boot!
+  "Boot the ESP under AAVMF and return the PL011 serial transcript."
+  [out-dir esp display-device tag]
+  (let [vars (path/join out-dir (str "vars-" tag ".fd"))
+        serial (path/join out-dir (str "serial-" tag ".log"))]
+    (fs/copyFileSync aavmf-vars vars)
+    (when (fs/existsSync serial) (fs/unlinkSync serial))
+    (let [args (concat
+                ["-machine" "virt" "-cpu" "cortex-a72" "-m" "512M" "-smp" "2"
+                 "-L" "/usr/share/seabios"
+                 "-drive" (str "if=pflash,format=raw,readonly=on,file=" aavmf-code)
+                 "-drive" (str "if=pflash,format=raw,file=" vars)
+                 "-drive" (str "if=none,id=esp,format=raw,file=" esp)
+                 "-device" "virtio-blk-pci,drive=esp"]
+                (when display-device ["-device" display-device])
+                ["-display" "none" "-serial" (str "file:" serial)
+                 "-monitor" "none" "-no-reboot"])
+          {:keys [status stderr]} (run! "timeout" (cons "90" (cons "qemu-system-aarch64" args)))]
+      {:qemu-status status
+       :qemu-stderr stderr
+       :serial (if (fs/existsSync serial) (str (fs/readFileSync serial "utf8")) "")})))
+
+(defn- print-transcript [serial]
+  (doseq [l (str/split-lines serial)
+          :when (str/starts-with? (str/trim l) "AIUEOS_")]
+    (println (str "  " (str/trim l)))))
+
+(defn display-matrix!
+  "Probe which aarch64 `virt` display devices expose a GOP linear framebuffer
+   aperture. The x86_64 desktop-surface bootstrap depends on that aperture, so
+   this table decides whether it ports as-is."
+  [out-dir esp]
+  (println "\n=== AArch64 `virt` GOP display matrix (AAVMF) ===")
+  (doseq [dev ["virtio-gpu-pci" "ramfb" "VGA" "bochs-display" "virtio-vga"]]
+    (let [{:keys [serial qemu-status qemu-stderr]} (boot! out-dir esp dev (str "gop-" dev))
+          line (line-for serial "AIUEOS_GOP_")]
+      (println (str (.padEnd dev 16) " "
+                    (cond
+                      line (str/trim line)
+                      (str/includes? qemu-stderr "not a valid device model")
+                      "DEVICE NOT AVAILABLE ON AARCH64"
+                      (not (zero? qemu-status))
+                      (str "qemu failed: " (first (str/split-lines qemu-stderr)))
+                      :else "no GOP line")))))
+  (println))
+
+(defn- negative-control!
+  "Run one deliberately-broken configuration and require the gate to reject it.
+   Returns true when the gate correctly rejected."
+  [out-dir label esp]
+  (println (str "\n--- negative control: " label " ---"))
+  (let [{:keys [serial]} (boot! out-dir esp "virtio-gpu-pci" label)
+        failures (evidence-failures serial)]
+    (print-transcript serial)
+    (if (seq failures)
+      (do (println (str "  correctly rejected — " (count failures) " unmet requirement(s):"))
+          (doseq [f failures] (println (str "    - " f)))
+          true)
+      (do (println "  NOT REJECTED — the gate passed a build it must refuse") false))))
+
+(defn -main [& args]
+  (let [args (set args)]
+    (doseq [t ["clang" "lld-link" "ld.lld" "qemu-system-aarch64" "mkfs.vfat" "mcopy" "mmd"]]
+      (need-tool! t))
+    (doseq [f [aavmf-code aavmf-vars]]
+      (when-not (fs/existsSync f)
+        (println (str "error: AAVMF firmware not found: " f)) (js/process.exit 1)))
+
+    (let [out-dir (fs/mkdtempSync "/tmp/aiueos-aa64-")
+          efi (build-efi! out-dir)
+          elf (build-kernel! out-dir nil)
+          esp (build-esp! out-dir efi elf)]
+      (println (str "built " (path/basename efi) " (" (.-size (fs/statSync efi)) " bytes), "
+                    (path/basename elf) " (" (.-size (fs/statSync elf)) " bytes)"))
+
+      (cond
+        (contains? args "--display-matrix")
+        (display-matrix! out-dir esp)
+
+        (contains? args "--expect-fail")
+        ;; Three independent ways the gate must refuse: nothing to boot at all;
+        ;; a kernel that boots and enables the MMU but does not enforce W^X; and
+        ;; a physical-memory admission judgement that trusts the firmware map.
+        (let [empty-esp (build-esp! (fs/mkdtempSync "/tmp/aiueos-aa64-empty-") nil nil)
+              wx-dir (fs/mkdtempSync "/tmp/aiueos-aa64-badwx-")
+              wx-esp (build-esp! wx-dir efi (build-kernel! wx-dir :wx))
+              pmm-dir (fs/mkdtempSync "/tmp/aiueos-aa64-badpmm-")
+              pmm-esp (build-esp! pmm-dir efi (build-kernel! pmm-dir :pmm))
+              results [(negative-control! out-dir "no-loader" empty-esp)
+                       (negative-control! wx-dir "wx-not-enforced" wx-esp)
+                       (negative-control! pmm-dir "pmm-admission-trusts-map" pmm-esp)]]
+          (if (every? true? results)
+            (do (println "\nPASS: gate rejected all three negative controls") (js/process.exit 0))
+            (do (println "\nFAIL: a negative control was not rejected") (js/process.exit 1))))
+
+        :else
+        (let [{:keys [serial qemu-status]} (boot! out-dir esp "virtio-gpu-pci" "main")
+              failures (evidence-failures serial)]
+          (println (str "qemu exit=" qemu-status))
+          (print-transcript serial)
+          (if (seq failures)
+            (do (println "\nFAIL:")
+                (doseq [f failures] (println (str "  - " f)))
+                (js/process.exit 1))
+            (do (println "\nPASS: AArch64 UEFI + kernel boot evidence complete")
+                (println "      (MMU enabled on kernel-built TTBR0; both W^X directions fault)")
+                (js/process.exit 0))))))))
+
+(apply -main (js->clj (.slice js/process.argv 3)))

@@ -1,0 +1,149 @@
+;; `qwen35-gguf-header-valid.kotoba` against the GGUF v3 container header the
+;; Qwen3.8-27B artifact actually carries.
+;;
+;; The object is a port of the opening of `kernel/qwen35_runtime.c`'s
+;; `aiueos_qwen35_model_parse` -- the null/length/artifact guards and the four
+;; header fields read before `parse_metadata`. That C is exercised on the host
+;; by `scripts/smoke-qwen35-runtime.sh`, which builds an 10,996,640-byte
+;; fixture with `tests/make_qwen35_header_fixture.py` and runs
+;; `tests/qwen35_runtime_model.c` against it. This drives the Kotoba object
+;; through the KIR interpreter instead, over the same 24 header bytes.
+;;
+;; Those 24 bytes are pinned here as a literal rather than read from the
+;; fixture: the fixture is 10.9 MB of generated output, and a test that needs
+;; it present is a test that reports green when it is absent. They are
+;; transcribed from `od -N 24` over a fixture the C gate accepted, and
+;; `the-header-is-the-artifact-s-own` re-derives them from the contract
+;; constants so that a transcription error fails rather than propagates.
+;;
+;; Why the KIR interpreter and not the machine: the object compiles to an
+;; x86-64 ET_REL kernel object and this workstation is aarch64, so nothing here
+;; executes the emitted bytes. `kotoba.kir` models the same three window checks
+;; the backends emit (`kernel-window-check!`), which is what makes it an oracle
+;; for the bounds and not only for the arithmetic.
+
+(ns aiueos.qwen35-gguf-header-parity-test
+  (:require [kotoba.io :as io]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.kir :as ir]
+            [kotoba.sema :as sema]))
+
+(def ^:private source-file
+  (io/file "os" "aiueos" "kotoba" "qwen35-gguf-header-valid.kotoba"))
+
+(defn- source-available?
+  "Fails rather than skips, for the reason
+  `aiueos.tcp-seq-acceptable-parity-test` gives: a `when`-guard here reports
+  green on a checkout without the object, which is a skip wearing a pass."
+  []
+  (let [present? (io/exists? source-file)]
+    (is present? (str "kotoba object not found at " source-file))
+    present?))
+
+(def ^:private kir
+  (delay (-> (slurp source-file) sema/analyze ir/lower)))
+
+;; contracts/qwen38-qwen35-runtime-v1.edn :artifact
+(def ^:private artifact-bytes 10934860704)
+(def ^:private tensor-count 866)
+(def ^:private metadata-count 50)
+
+(def ^:private pinned-header
+  "The first 24 bytes of a fixture `scripts/smoke-qwen35-runtime.sh` accepted."
+  [0x47 0x47 0x55 0x46
+   0x03 0x00 0x00 0x00
+   0x62 0x03 0x00 0x00 0x00 0x00 0x00 0x00
+   0x32 0x00 0x00 0x00 0x00 0x00 0x00 0x00])
+
+(defn- le [value width]
+  (mapv #(bit-and (bit-shift-right value (* 8 %)) 255) (range width)))
+
+(def ^:private image-base 0x100000)
+
+(defn- verdict
+  "The object's reason code over HEADER, with ACCESSIBLE and ARTIFACT as the C
+  passes them. A 64-byte image: the object reads offsets 0..23 and the window
+  checks are driven by `accessible`, not by the image, so a short image proves
+  that nothing beyond the header is touched -- a read past 24 would trap
+  `:kernel-memory-outside-image` rather than return a code."
+  ([header] (verdict header artifact-bytes artifact-bytes image-base))
+  ([header accessible artifact] (verdict header accessible artifact image-base))
+  ([header accessible artifact base]
+   (let [image (volatile! (into (vec header) (repeat (- 64 (count header)) 0)))]
+     (ir/execute @kir 'aiueos-qwen35-gguf-header-valid
+                 [base accessible artifact]
+                 {:fuel 4096 :memory {:base image-base :bytes image}}))))
+
+(deftest kotoba-object-is-present
+  (source-available?))
+
+(deftest the-header-is-the-artifact-s-own
+  (testing "the pinned bytes are what the contract's own numbers encode"
+    (is (= pinned-header
+           (vec (concat (mapv int "GGUF")
+                        (le 3 4)
+                        (le tensor-count 8)
+                        (le metadata-count 8))))
+        "transcription from the generated fixture, re-derived from the contract")))
+
+(deftest the-admitted-header-is-admitted
+  (when (source-available?)
+    (is (= 0 (verdict pinned-header))
+        "zero is the success value, not one")
+    (testing "a host gate may hold only the 10.9 MB prefix"
+      (is (= 0 (verdict pinned-header 10996640 artifact-bytes))
+          "parsing a prefix is what tests/qwen35_runtime_model.c does"))))
+
+(def ^:private refusals
+  "One mutation per clause, and the code that clause is the only producer of.
+  A mutation that could be refused by two clauses would not discriminate, so
+  each changes exactly the field its clause reads and nothing earlier."
+  [{:code -1 :why "null base"        :base 0}
+   {:code -2 :why "window below 24"  :accessible 23}
+   {:code -3 :why "wrong artifact"   :artifact (dec artifact-bytes)}
+   {:code -4 :why "window past artifact"
+    :accessible (inc artifact-bytes) :artifact artifact-bytes}
+   {:code -5 :why "magic"            :at 0 :to 0x48}
+   {:code -6 :why "version 2"        :at 4 :to 0x02}
+   {:code -7 :why "865 tensors"      :at 8 :to 0x61}
+   {:code -8 :why "49 metadata"      :at 16 :to 0x31}])
+
+(deftest every-clause-refuses-with-its-own-code
+  (when (source-available?)
+    (doseq [{:keys [code why at to base accessible artifact]} refusals]
+      (let [header (if at (assoc (vec pinned-header) at to) pinned-header)]
+        (is (= code (verdict header
+                             (or accessible artifact-bytes)
+                             (or artifact artifact-bytes)
+                             (if (some? base) base image-base)))
+            (str "clause " code " (" why ")"))))))
+
+(deftest the-codes-are-all-distinct-and-all-reached
+  ;; Evidence floor. Without this the suite passes while one mutation produces
+  ;; another clause's code and the two are never told apart, which is exactly
+  ;; the failure a single `(is (not= 0 ...))` per case would hide.
+  (when (source-available?)
+    (let [observed (into #{(verdict pinned-header)}
+                         (for [{:keys [at to base accessible artifact]} refusals]
+                           (verdict (if at (assoc (vec pinned-header) at to) pinned-header)
+                                    (or accessible artifact-bytes)
+                                    (or artifact artifact-bytes)
+                                    (if (some? base) base image-base))))]
+      (println "SCANNED" (inc (count refusals)) "verdicts, distinct:" (count observed))
+      (is (= 9 (count observed))
+          "one admission and eight refusals, no two sharing a code")
+      (is (= (into #{0} (map :code refusals)) observed)))))
+
+(deftest the-object-does-not-read-past-the-header
+  ;; The window ceiling is what makes this object expressible at all: the
+  ;; region is 10,934,860,704 bytes and `kernel-load-u32` refuses a declared
+  ;; length above 512, so a read that skipped `kernel-subregion` would trap on
+  ;; the length check. This asserts the complement -- that the narrowing it
+  ;; does perform stays inside the 24 bytes -- by handing it an image that ends
+  ;; there. A 25th byte read reaches `:kernel-memory-outside-image`.
+  (when (source-available?)
+    (let [image (volatile! (vec pinned-header))]
+      (is (= 0 (ir/execute @kir 'aiueos-qwen35-gguf-header-valid
+                           [image-base artifact-bytes artifact-bytes]
+                           {:fuel 4096 :memory {:base image-base :bytes image}}))
+          "24 bytes of image is enough, so 24 bytes is all it reads"))))

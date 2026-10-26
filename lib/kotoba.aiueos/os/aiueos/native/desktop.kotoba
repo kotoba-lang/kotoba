@@ -1,0 +1,569 @@
+(ns aiueos.native.desktop
+  (:require [aiueos.browser-frame2 :as browser-frame]
+            [aiueos.session.app-catalog :as app-catalog])
+  (:export [main]))
+
+;; Guest-specific desktop adapter. The hosted AIUEOS session uses the actual
+;; browser.surface + cssom.layout pipeline; this module currently consumes the
+;; separate aiueos.browser-frame2 behavior mirror because the Amu selfhost
+;; module graph cannot yet link Browser's cssom.layout dependency. It supplies
+;; the framebuffer raster pass and input loop in Kotoba.
+
+(defn load64-boot [boot offset]
+  (+ (kernel-load-u8 boot 160 offset)
+     (* (kernel-load-u8 boot 160 (+ offset 1)) 256)
+     (* (kernel-load-u8 boot 160 (+ offset 2)) 65536)
+     (* (kernel-load-u8 boot 160 (+ offset 3)) 16777216)
+     (* (kernel-load-u8 boot 160 (+ offset 4)) 4294967296)
+     (* (kernel-load-u8 boot 160 (+ offset 5)) 1099511627776)
+     (* (kernel-load-u8 boot 160 (+ offset 6)) 281474976710656)
+     (* (kernel-load-u8 boot 160 (+ offset 7)) 72057594037927936)))
+
+(defn load32-boot [boot offset]
+  (+ (kernel-load-u8 boot 160 offset)
+     (* (kernel-load-u8 boot 160 (+ offset 1)) 256)
+     (* (kernel-load-u8 boot 160 (+ offset 2)) 65536)
+     (* (kernel-load-u8 boot 160 (+ offset 3)) 16777216)))
+
+(defn word [region i]
+  (kernel-load-u32 (kernel-subregion region 8192 (* i 4) 4) 4 0))
+
+(defn put-word [region i value]
+  (kernel-store-u32 (kernel-subregion region 8192 (* i 4) 4) 4 0 value))
+
+(defn clear-surface [s index]
+  (if (>= index 2048)
+    0
+    (do (put-word s index 0)
+        (clear-surface s (+ index 1)))))
+
+(defn font-u16 [font font-bytes offset]
+  (let [chunk-offset (* (quot offset 16384) 16384)
+        chunk-length 16384]
+    (kernel-load-u16-16k
+     (kernel-subregion font 524288 chunk-offset chunk-length)
+     chunk-length (- offset chunk-offset))))
+
+(defn framebuffer-pixel [fb fb-bytes offset ctx]
+  (let [page (kernel-framebuffer-page (quot offset 4096))]
+    (kernel-store-u32-4k page 4096 (mod offset 4096) (word ctx 6))))
+
+(defn gop-color [ctx rgb]
+  ;; GOP format 0 stores R,G,B bytes; frame2 colours are 0xRRGGBB. Format 1
+  ;; stores B,G,R and uses that word directly on little-endian x86.
+  (if (= (word ctx 43) 0)
+    (+ (bit-and (quot rgb 65536) 255)
+       (* (bit-and (quot rgb 256) 255) 256)
+       (* (bit-and rgb 255) 65536))
+    rgb))
+
+(defn glyph-mask-start [width]
+  ;; The font stores 8-pixel glyph rows in the low byte and 16-pixel rows
+  ;; across the whole word. Start at the matching most-significant glyph bit.
+  (if (= width 8) 128 32768))
+
+;; Work words in the renderer context:
+;;   0..9 rectangle cursor/bounds, 10..11 glyph row and mask
+;;   30 current op, 31 op count, 32..37 saved op, 40..45 GOP metadata
+(defn fill-row [s fb fb-bytes ctx offset]
+  (if (>= offset (word ctx 8))
+    0
+    (do (framebuffer-pixel fb fb-bytes offset ctx)
+        (fill-row s fb fb-bytes ctx (+ offset 4)))))
+
+(defn fill-rect [s fb fb-bytes ctx row]
+  (if (>= row (word ctx 9))
+    0
+    (do (put-word ctx 0 row)
+        (put-word ctx 8
+                  (* (+ (* row (word ctx 42))
+                        (word ctx 2) (word ctx 4)) 4))
+        (fill-row s fb fb-bytes ctx
+                  (* (+ (* row (word ctx 42)) (word ctx 2)) 4))
+        (fill-rect s fb fb-bytes ctx (+ row 1)))))
+
+(defn paint-glyph-pixels [s font fb fb-bytes ctx]
+  (if (>= (word ctx 4) 16)
+    0
+    (do (if (= (word ctx 5) 0)
+          (do (put-word ctx 10
+                        (font-u16 font (word ctx 45)
+                                  (+ (word ctx 38) (* (word ctx 4) 2))))
+              (put-word ctx 11 (glyph-mask-start (word ctx 34))))
+          0)
+        (if (= (bit-and (quot (word ctx 10) (word ctx 11)) 1) 1)
+          (framebuffer-pixel
+           fb fb-bytes
+           (* (+ (* (+ (word ctx 33) (word ctx 4)) (word ctx 42))
+                 (word ctx 32) (word ctx 5)) 4)
+           ctx)
+          0)
+        (if (>= (+ (word ctx 5) 1) (word ctx 34))
+          (do (put-word ctx 4 (+ (word ctx 4) 1))
+              (put-word ctx 5 0)
+              (paint-glyph-pixels s font fb fb-bytes ctx))
+          (do (put-word ctx 5 (+ (word ctx 5) 1))
+              (put-word ctx 11 (quot (word ctx 11) 2))
+              (paint-glyph-pixels s font fb fb-bytes ctx))))))
+
+(defn present-ops [s font fb fb-bytes ctx]
+  (if (>= (word ctx 30) (word ctx 31))
+    0
+    (let [slot (+ 480 (* 6 (word ctx 30)))
+          kind (word s slot)
+          x (word s (+ slot 1))
+          y (word s (+ slot 2))
+          a (word s (+ slot 3))
+          b (word s (+ slot 4))
+          rgb (word s (+ slot 5))]
+      (do (put-word ctx 32 x)
+          (put-word ctx 33 y)
+          (put-word ctx 34 a)
+          (put-word ctx 35 b)
+          (put-word ctx 36 (gop-color ctx rgb))
+          (if (= kind 1)
+            (do (put-word ctx 2 x)
+                (put-word ctx 3 y)
+                (put-word ctx 4 a)
+                (put-word ctx 5 b)
+                (put-word ctx 6 (word ctx 36))
+                (put-word ctx 9 (+ y b))
+                (fill-rect s fb fb-bytes ctx y))
+            (do (put-word ctx 32 x)
+                (put-word ctx 33 y)
+                (put-word ctx 34 b)
+                (put-word ctx 38 (+ 16 (* 4 (word s 424)) (* 32 a)))
+                (put-word ctx 4 0)
+                (put-word ctx 5 0)
+                (put-word ctx 6 (word ctx 36))
+                (put-word ctx 11 (glyph-mask-start (word ctx 34)))
+                (paint-glyph-pixels s font fb fb-bytes ctx)))
+          (put-word ctx 30 (+ (word ctx 30) 1))
+          (present-ops s font fb fb-bytes ctx)))))
+
+(defn present-frame [s font fb fb-bytes ctx]
+  (put-word ctx 78 (+ (word ctx 78) 1))
+  (put-word ctx 30 0)
+  (put-word ctx 31
+            (browser-frame/aiueos-browser-frame2
+             s 8192 font (word ctx 45)))
+  (let [result (if (< (word ctx 31) 0) 0 (present-ops s font fb fb-bytes ctx))]
+    (do (put-word ctx 79 (+ (word ctx 79) 1)) result)))
+
+(defn seed-app-label [s id index]
+  (let [slot (+ 32 (* 32 (- id 1)))
+        label-length (app-catalog/app-title-length id)]
+    (if (>= index label-length)
+      (put-word s (+ slot index) 0)
+      (do (put-word s (+ slot index)
+                    (app-catalog/app-title-codepoint id index))
+          (seed-app-label s id (+ index 1))))))
+
+(defn seed-app-labels [s id]
+  (if (> id (app-catalog/app-count))
+    0
+    (do (seed-app-label s id 0)
+        (seed-app-labels s (+ id 1)))))
+
+(defn seed-app-body [s id index]
+  (let [slot (+ 160 (* 64 (- id 1)))
+        body-length (app-catalog/app-body-length id)]
+    (if (>= index body-length)
+      (put-word s (+ slot index) 0)
+      (do (put-word s (+ slot index)
+                    (app-catalog/app-body-codepoint id index))
+          (seed-app-body s id (+ index 1))))))
+
+(defn seed-app-bodies [s id]
+  (if (> id (app-catalog/app-count))
+    0
+    (do (seed-app-body s id 0)
+        (seed-app-bodies s (+ id 1)))))
+
+(defn seed-desktop [s width height]
+  (do (put-word s 0 1)
+      (put-word s 1 0)
+      (put-word s 2 0)
+      (put-word s 3 width)
+      (put-word s 4 height)
+      (put-word s 31 15)
+      (seed-app-labels s 1)
+      (seed-app-bodies s 1)
+      (put-word s 2038 (app-catalog/app-body-length 2))
+      (put-word s 2046 41)
+      (put-word s 2047 40)))
+
+(defn window-open? [s id index]
+  (if (>= index (word s 1))
+    0
+    (if (= (word s (+ 5 (* index 5))) id)
+      1
+      (window-open? s id (+ index 1)))))
+
+(defn window-index [s id index]
+  (if (>= index (word s 1))
+    -1
+    (if (= (word s (+ 5 (* index 5))) id)
+      index
+      (window-index s id (+ index 1)))))
+
+(defn shift-window-left [s current end]
+  (if (>= current end)
+    0
+    (let [slot (+ 5 (* current 5))
+          next (+ slot 5)]
+      (do (put-word s slot (word s next))
+          (put-word s (+ slot 1) (word s (+ next 1)))
+          (put-word s (+ slot 2) (word s (+ next 2)))
+          (put-word s (+ slot 3) (word s (+ next 3)))
+          (put-word s (+ slot 4) (word s (+ next 4)))
+          (shift-window-left s (+ current 1) end)))))
+
+(defn focus-window [s index]
+  (if (< index 0)
+    0
+    (let [count (word s 1)
+          slot (+ 5 (* index 5))
+          id (word s slot)
+          x (word s (+ slot 1))
+          y (word s (+ slot 2))
+          width (word s (+ slot 3))
+          height (word s (+ slot 4))
+          last-index (- count 1)
+          last-slot (+ 5 (* last-index 5))]
+      (do (put-word s 2 id)
+          (if (< index last-index)
+            (do (shift-window-left s index last-index)
+                (put-word s last-slot id)
+                (put-word s (+ last-slot 1) x)
+                (put-word s (+ last-slot 2) y)
+                (put-word s (+ last-slot 3) width)
+                (put-word s (+ last-slot 4) height))
+            0)
+          1))))
+
+(defn remove-window-at [s index current count id]
+  (if (>= (+ current 1) count)
+    (let [new-count (- count 1)
+          fallback (if (= new-count 0)
+                     0
+                     (word s (+ 5 (* (- new-count 1) 5))))]
+      (do (put-word s 1 new-count)
+          (if (= (word s 2) id)
+            (put-word s 2 fallback)
+            0)
+          (put-word s (+ 5 (* current 5)) 0)
+          (put-word s (+ 6 (* current 5)) 0)
+          (put-word s (+ 7 (* current 5)) 0)
+          (put-word s (+ 8 (* current 5)) 0)
+          (put-word s (+ 9 (* current 5)) 0)
+          1))
+    (let [slot (+ 5 (* current 5))
+          next (+ slot 5)]
+      (do (put-word s slot (word s next))
+          (put-word s (+ slot 1) (word s (+ next 1)))
+          (put-word s (+ slot 2) (word s (+ next 2)))
+          (put-word s (+ slot 3) (word s (+ next 3)))
+          (put-word s (+ slot 4) (word s (+ next 4)))
+          (remove-window-at s index (+ current 1) count id)))))
+
+(defn close-app [s id]
+  (let [index (window-index s id 0)]
+    (if (< index 0)
+      0
+      (remove-window-at s index index (word s 1) id))))
+
+(defn cycle-window [s]
+  (let [count (word s 1)
+        current (window-index s (word s 2) 0)]
+    (if (= count 0)
+      0
+      (focus-window s (if (>= current (- count 1)) 0 (+ current 1))))))
+
+(defn launch-app [s id width height]
+  (if (= (window-open? s id 0) 1)
+    (focus-window s (window-index s id 0))
+    (if (>= (word s 1) 4)
+      0
+      (let [index (word s 1)
+            slot (+ 5 (* index 5))
+            window-width (if (> width 896) 880 (- width 16))
+            window-height (if (> height 600) 560 (- height 72))
+            room-x (- width window-width)
+            room-y (- height window-height)
+            cascade-x (if (> room-x 60) 18 (quot room-x 4))
+            cascade-y (if (> (- room-y 46) 54) 18 (quot (- room-y 46) 4))
+            base-x (quot (- room-x (* 3 cascade-x)) 2)
+            base-y (if (> height 620) 44 36)
+            x (+ base-x (* index cascade-x))
+            y (+ base-y (* index cascade-y))]
+        (do (put-word s 1 (+ index 1))
+            (put-word s 2 id)
+            (put-word s slot id)
+            (put-word s (+ slot 1) x)
+            (put-word s (+ slot 2) y)
+            (put-word s (+ slot 3) window-width)
+            (put-word s (+ slot 4) window-height))))))
+
+(defn goal-codepoint [code]
+  ;; PS/2 set-1 make codes. The native goal draft accepts lowercase ASCII and
+  ;; spaces only; no host text service, model call, or implicit network access.
+  (case code
+    16 113 17 119 18 101 19 114 20 116 21 121 22 117 23 105 24 111 25 112
+    30 97 31 115 32 100 33 102 34 103 35 104 36 106 37 107 38 108
+    44 122 45 120 46 99 47 118 48 98 49 110 50 109 57 32 0))
+
+(defn edit-itonami-goal [s code]
+  (let [length (word s 2038)
+        slot (+ 224 length)
+        cp (goal-codepoint code)]
+    (if (= code 14)
+      (if (> length 12)
+        (do (put-word s (- slot 1) 0)
+            (put-word s 2038 (- length 1))
+            1)
+        0)
+      (if (and (> cp 0) (< length 63))
+        (do (put-word s slot cp)
+            (put-word s (+ slot 1) 0)
+            (put-word s 2038 (+ length 1))
+            1)
+        0))))
+
+(defn reduce-key [s code ctx]
+  (if (and (= (word s 2) 2)
+           (or (= code 14) (> (goal-codepoint code) 0)))
+    (edit-itonami-goal s code)
+  (if (= code 1)
+    (close-app s (word s 2))
+    (if (= code 15)
+      (cycle-window s)
+      (if (= code 2) (launch-app s 1 (word ctx 40) (word ctx 41))
+        (if (= code 3) (launch-app s 2 (word ctx 40) (word ctx 41))
+          (if (= code 4) (launch-app s 3 (word ctx 40) (word ctx 41))
+            (if (= code 5) (launch-app s 4 (word ctx 40) (word ctx 41)) 0))))))))
+
+(defn clamp-coordinate [value extent]
+  (if (< value 0) 0
+    (if (>= value extent) (- extent 1) value)))
+
+(defn hit-launcher [x id]
+  (let [left (+ 6 (* 102 (- id 1)))]
+    (if (and (>= x left) (< x (+ left 96)))
+      id
+      (if (>= id 4) 0 (hit-launcher x (+ id 1))))))
+
+(defn hit-dock [x y width height id]
+  (let [panel-left (quot (- width 184) 2)
+        icon-left (+ panel-left 8 (* 44 (- id 1)))
+        icon-top (- height 46)]
+    (if (and (>= x icon-left) (< x (+ icon-left 36))
+             (>= y icon-top) (< y (- height 10)))
+      id
+      (if (>= id 4) 0 (hit-dock x y width height (+ id 1))))))
+
+(defn hit-window-index [s x y index]
+  (if (< index 0)
+    -1
+    (let [slot (+ 5 (* index 5))
+          wx (word s (+ slot 1))
+          wy (word s (+ slot 2))
+          ww (word s (+ slot 3))
+          wh (word s (+ slot 4))]
+      (if (and (>= x wx) (< x (+ wx ww))
+               (>= y wy) (< y (+ wy wh)))
+        index
+        (hit-window-index s x y (- index 1))))))
+
+(defn titlebar-drag-id [s x y width height]
+  (if (or (< y 28) (>= y (- height 52)))
+    0
+    (let [index (hit-window-index s x y (- (word s 1) 1))]
+      (if (< index 0)
+        0
+        (let [slot (+ 5 (* index 5))
+              id (word s slot)
+              wx (word s (+ slot 1))
+              wy (word s (+ slot 2))
+              ww (word s (+ slot 3))]
+          (if (and (< y (+ wy 28))
+                   (not (and (> ww 40)
+                             (>= x (+ wx (- ww 24)))
+                             (< x (+ wx (- ww 8)))
+                             (>= y (+ wy 6))
+                             (< y (+ wy 22)))))
+            id
+            0))))))
+
+(defn clamp-between [value minimum maximum]
+  (if (< value minimum) minimum
+    (if (> value maximum) maximum value)))
+
+(defn move-window-id [s id dx dy width height]
+  (let [index (window-index s id 0)]
+    (if (< index 0)
+      0
+      (let [slot (+ 5 (* index 5))
+            x (word s (+ slot 1))
+            y (word s (+ slot 2))
+            window-width (word s (+ slot 3))
+            window-height (word s (+ slot 4))]
+        (do (put-word s (+ slot 1)
+                      (clamp-between (+ x dx) 0 (- width window-width)))
+            (put-word s (+ slot 2)
+                      (clamp-between (+ y dy) 28 (- height window-height)))
+            1)))))
+
+(defn click-window [s ctx]
+  (let [index (hit-window-index s (word ctx 50) (word ctx 51)
+                                (- (word s 1) 1))]
+    (if (< index 0)
+      0
+      (let [slot (+ 5 (* index 5))
+            id (word s slot)
+            x (word ctx 50)
+            y (word ctx 51)
+            wx (word s (+ slot 1))
+            wy (word s (+ slot 2))
+            ww (word s (+ slot 3))]
+        (if (and (> ww 40)
+                 (>= x (+ wx (- ww 24)))
+                 (< x (+ wx (- ww 8)))
+                 (>= y (+ wy 6))
+                 (< y (+ wy 22)))
+          (close-app s id)
+          (focus-window s index))))))
+
+(defn click-launcher [s ctx]
+  (if (< (word ctx 51) 28)
+    (let [id (hit-launcher (word ctx 50) 1)]
+      (if (> id 0)
+        (launch-app s id (word ctx 40) (word ctx 41))
+        0))
+    (if (>= (word ctx 51) (- (word ctx 41) 52))
+      (let [id (hit-dock (word ctx 50) (word ctx 51)
+                         (word ctx 40) (word ctx 41) 1)]
+        (if (> id 0)
+          (launch-app s id (word ctx 40) (word ctx 41))
+          (click-window s ctx)))
+      (click-window s ctx))))
+
+(defn apply-mouse-packet [s ctx]
+  (let [raw-x (word ctx 65)
+        raw-y (word ctx 66)
+        dx (if (>= raw-x 128) (- raw-x 256) raw-x)
+        dy (if (>= raw-y 128) (- raw-y 256) raw-y)
+        old-x (word ctx 50)
+        old-y (word ctx 51)
+        x (clamp-coordinate (+ old-x dx) (word ctx 40))
+        y (clamp-coordinate (- old-y dy) (word ctx 41))
+        left (bit-and (word ctx 64) 1)]
+    (do (put-word ctx 75 (+ (word ctx 75) 1))
+        (put-word ctx 50 x)
+        (put-word ctx 51 y)
+        (put-word s 2046 (+ x 1))
+        (put-word s 2047 y)
+        (if (and (= left 1) (= (word ctx 67) 0))
+          (let [drag-id (titlebar-drag-id s x y (word ctx 40) (word ctx 41))]
+            (do (put-word ctx 76 (+ (word ctx 76) 1))
+              (click-launcher s ctx)
+              (put-word ctx 71
+                        drag-id)))
+          (if (and (= left 1) (> (word ctx 71) 0))
+            (move-window-id s (word ctx 71) (- x old-x) (- y old-y)
+                            (word ctx 40) (word ctx 41))
+            (if (= left 0) (put-word ctx 71 0) 0)))
+        (put-word ctx 67 left)
+        1)))
+
+(defn consume-mouse-byte [s ctx byte]
+  (if (= byte 250)
+    0
+    (if (= (word ctx 63) 0)
+      (if (= (bit-and byte 8) 8)
+        (do (put-word ctx 64 byte)
+            (put-word ctx 63 1)
+            0)
+        0)
+    (if (= (word ctx 63) 1)
+      (do (put-word ctx 65 byte)
+          (put-word ctx 63 2)
+          0)
+      (do (put-word ctx 66 byte)
+          (put-word ctx 63 0)
+          (apply-mouse-packet s ctx))))))
+
+(defn poll-input [s ctx]
+  (do (put-word ctx 68 (kernel-in-u8 100))
+      (if (= (bit-and (word ctx 68) 1) 0)
+        0
+        (do (put-word ctx 69 (kernel-in-u8 96))
+            (if (= (bit-and (word ctx 68) 32) 32)
+              (consume-mouse-byte s ctx (word ctx 69))
+              (if (or (= (word ctx 69) 0) (>= (word ctx 69) 128))
+                0
+                (do (put-word ctx 73 (+ (word ctx 73) 1))
+                    (put-word ctx 77 (word ctx 69))
+                    (reduce-key s (word ctx 69) ctx) 1)))))))
+
+(defn wait-controller [remaining]
+  (if (= (bit-and (kernel-in-u8 100) 2) 0)
+    1
+    (if (= remaining 0)
+      0
+      (wait-controller (- remaining 1)))))
+
+(defn enable-mouse []
+  (do (wait-controller 4096)
+      (kernel-out-u8 100 168)
+      (wait-controller 4096)
+      (kernel-out-u8 100 212)
+      (wait-controller 4096)
+      (kernel-out-u8 96 244)
+      0))
+
+(defn desktop-loop [s font fb fb-bytes ctx]
+  (do (put-word ctx 70 (poll-input s ctx))
+      (if (> (word ctx 70) 0)
+        (present-frame s font fb fb-bytes ctx)
+        0)
+      (kernel-pause)
+      (desktop-loop s font fb fb-bytes ctx)))
+
+(defn main []
+  (let [boot (kernel-boot-info)
+        prefix (kernel-subregion boot 16544 0 160)
+        width (kernel-framebuffer-width)
+        height (kernel-framebuffer-height)
+        stride (kernel-framebuffer-stride)
+        pixel-format (kernel-framebuffer-format)
+        fb-bytes (* (* stride height) 4)
+        font-bytes 524288]
+    (if (and (= (load64-boot prefix 8) 6)
+             (= (load32-boot prefix 128) width) (> (kernel-read-cr3) 0))
+      (let [surface (kernel-browser-surface)
+            context (kernel-browser-context)
+            font (kernel-native-font)]
+        (do (put-word context 40 width)
+            (put-word context 41 height)
+            (put-word context 42 stride)
+            (put-word context 43 pixel-format)
+            (put-word context 45 font-bytes)
+            (put-word context 50 40)
+            (put-word context 51 40)
+            (put-word context 63 0)
+            (put-word context 67 0)
+            (put-word context 71 0)
+            (put-word context 72 0x31545844)
+            (put-word context 73 0)
+            (put-word context 75 0)
+            (put-word context 76 0)
+            (put-word context 77 0)
+            (put-word context 78 0)
+            (put-word context 79 0)
+            (enable-mouse)
+            (clear-surface surface 0)
+            (seed-desktop surface width height)
+            (present-frame surface font 0 fb-bytes context)
+            (desktop-loop surface font 0 fb-bytes context)))
+      (kernel-hlt))))

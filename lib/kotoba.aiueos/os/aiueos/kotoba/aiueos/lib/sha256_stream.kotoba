@@ -1,0 +1,323 @@
+(ns aiueos.lib.sha256-stream
+  (:export [sl ss load32 store32 sha-init sha-absorb sha-block sha-blocks
+            sha-final]))
+
+;; STREAMING SHA-256 for the freestanding aiueos kernel.
+;;
+;; The two SHA-256 implementations this repository already had are both
+;; WHOLE-MESSAGE primitives with a small hard cap, and both caps are reached by
+;; work that is now in flight:
+;;
+;;   `sha256.kotoba`                    refuses an input above 12,288 bytes
+;;   `aiueos/lib/sha256_core.kotoba`    hashes at most 192 bytes, from a fixed
+;;                                      offset inside the caller's own 800-byte
+;;                                      context
+;;
+;; The Murakumo device-P256 worker's `input-sha256` is taken over
+;; `4*(count+2)` bytes and the protocol admits 32,768 tokens, so its widest
+;; canonical input is 131,080 bytes -- ten times the first cap and six hundred
+;; times the second. The UEFI loader has the same shape one order of magnitude
+;; further out. Neither caller can be served by raising a constant: a
+;; whole-message primitive has to see the whole message through ONE region
+;; window, and the widest bounded-memory window this backend has is 65,536
+;; bytes (kotoba-native `kir-kernel-memory-ops`).
+;;
+;; So the split here is not stylistic. It is the only shape that reaches past
+;; a window: the caller keeps the message wherever it is, narrows one 64-byte
+;; view at a time with `kernel-subregion` -- which has NO ceiling, only the
+;; relation `offset + sublen <= length` -- and hands each view to `sha-block`.
+;; The state that survives between views is 512 bytes the caller owns.
+;;
+;; ---------------------------------------------------------------------------
+;; THE STATE REGION. 512 BYTES, AND THE 512 IS A LITERAL
+;; ---------------------------------------------------------------------------
+;;   offset  bytes  words   what
+;;   ------  -----  ------  ----------------------------------------------
+;;        0    256    0-63  W[0..63], the message schedule
+;;      256     32   64-71  H[0..7], the chaining state
+;;      288     32   72-79  a..h, the working variables
+;;      320     32   80-87  the round's shifted copy
+;;      352      8   88,89  message length in BYTES, high word then low
+;;      360     64          block assembly buffer (the tail; and, for a
+;;                          caller that synthesises its bytes, any block)
+;;      424     32 106-113  the digest, RAW, big-endian, 32 bytes
+;;      456      4     114  token count      (device-worker-digest only)
+;;      460      4     115  max-tokens       (device-worker-digest only)
+;;      464     48          reserved
+;;      512                 end
+;;
+;; The 512 is a LITERAL in `sl`/`ss` rather than a parameter, exactly as
+;; `sha256_core.kotoba`'s 800 is, and for the same reason: the ABI admits five
+;; arguments and threading a length through every helper spends one of them
+;; forever. The consequence is stated rather than hidden -- a caller with a
+;; differently sized state region cannot share this module, and an entry that
+;; wants to check the caller's length has to do it itself, which all three
+;; objects here do (`st-len < 512` is their first refusal).
+;;
+;; 512 is also the CHEAPEST tier: `kernel-load-u8` / `kernel-store-u8` at
+;; window 512 are the base memwidth ops, and the state fits in them exactly.
+;;
+;; ---------------------------------------------------------------------------
+;; EVERY LOOP THAT CAN BE A JUMP IS A JUMP
+;; ---------------------------------------------------------------------------
+;; kotoba-native turns a self-call in tail position into a jump ONLY when the
+;; call sits at the function's own frame baseline -- `emit-call`'s
+;; `(and tail? (= op function-name) (zero? temp-depth))`, x86_64.cljc. A
+;; self-call written from inside a `let` body is still in tail position but is
+;; no longer at that baseline, so it emits an ordinary CALL and the native
+;; stack grows once per iteration.
+;;
+;; Every existing SHA-256 here is written that way, and it is why they are
+;; capped: `sha256.kotoba` at 12,288 bytes recurses 192 frames deep in
+;; `process-blocks` alone. A million-byte region would be 16,384 frames.
+;;
+;; So each loop below is split in two: a `-step` function that holds the
+;; bindings, and a loop whose only body is `(if done 1 (loop ... (+ i 1 (* 0
+;; (step ...)))))` with no `let` around it. That is the baseline shape, so it
+;; is a jump, and the native stack cost of hashing a megabyte is the SAME as
+;; hashing 64 bytes: one `-step` frame at a time.
+;;
+;; The `(* 0 ...)` is the ordering idiom the shipped objects use, and the
+;; STOREFIX audit (kotoba-native ADR 0049) classified `sha256`, `rsa2048` and
+;; `x25519` as ORDERING-ONLY users of it -- they thread a store's answer
+;; through `(* 0 ...)` and never let it decide anything, which is why those
+;; three were correct even while the backend answered a store with the wrong
+;; register. Nothing here decides on a store's answer either.
+;;
+;; ---------------------------------------------------------------------------
+;; ROTATIONS ARE `quot` AND `*`, NOT SHIFTS
+;; ---------------------------------------------------------------------------
+;; Same reason `sha256_core.kotoba` gives: measured 2026-09-02,
+;; `i64-shift-left` and `u64-shift-right` are refused on the JVM-FREE route
+;; ("runtime KIR i64 shift count rejected") because `kotoba.verifier` tests the
+;; literal count with `integer?` and ClojureScript lowers KIR literals to
+;; BigInt. A shift here would compile on one route and not the other.
+
+(defn sl [st i] (kernel-load-u8 st 512 i))
+(defn ss [st i v] (kernel-store-u8 st 512 i v))
+
+(defn u32 [x] (bit-and x 4294967295))
+(defn bxor3 [a b c] (bit-xor (bit-xor a b) c))
+(defn rotr2 [x] (u32 (+ (quot x 4) (* (bit-and x 3) 1073741824))))
+(defn rotr6 [x] (u32 (+ (quot x 64) (* (bit-and x 63) 67108864))))
+(defn rotr7 [x] (u32 (+ (quot x 128) (* (bit-and x 127) 33554432))))
+(defn rotr11 [x] (u32 (+ (quot x 2048) (* (bit-and x 2047) 2097152))))
+(defn rotr13 [x] (u32 (+ (quot x 8192) (* (bit-and x 8191) 524288))))
+(defn rotr17 [x] (u32 (+ (quot x 131072) (* (bit-and x 131071) 32768))))
+(defn rotr18 [x] (u32 (+ (quot x 262144) (* (bit-and x 262143) 16384))))
+(defn rotr19 [x] (u32 (+ (quot x 524288) (* (bit-and x 524287) 8192))))
+(defn rotr22 [x] (u32 (+ (quot x 4194304) (* (bit-and x 4194303) 1024))))
+(defn rotr25 [x] (u32 (+ (quot x 33554432) (* (bit-and x 33554431) 128))))
+(defn shr3 [x] (quot x 8))
+(defn shr10 [x] (quot x 1024))
+
+;; A 32-bit big-endian word at word index `w` of the state region.
+(defn load32 [st w]
+  (let [o (* w 4)]
+    (+ (* (sl st o) 16777216)
+       (+ (* (sl st (+ o 1)) 65536)
+          (+ (* (sl st (+ o 2)) 256)
+             (sl st (+ o 3)))))))
+
+(defn store32 [st w v]
+  (let [o (* w 4)
+        s0 (ss st o (bit-and (quot v 16777216) 255))
+        s1 (ss st (+ o 1) (bit-and (quot v 65536) 255))
+        s2 (ss st (+ o 2) (bit-and (quot v 256) 255))]
+    (+ (ss st (+ o 3) (bit-and v 255))
+       (* 0 (+ s0 (+ s1 s2))))))
+
+(defn round-k [i]
+  (if (= i 0) 1116352408 (if (= i 1) 1899447441 (if (= i 2) 3049323471 (if (= i 3) 3921009573
+  (if (= i 4) 961987163 (if (= i 5) 1508970993 (if (= i 6) 2453635748 (if (= i 7) 2870763221
+  (if (= i 8) 3624381080 (if (= i 9) 310598401 (if (= i 10) 607225278 (if (= i 11) 1426881987
+  (if (= i 12) 1925078388 (if (= i 13) 2162078206 (if (= i 14) 2614888103 (if (= i 15) 3248222580
+  (if (= i 16) 3835390401 (if (= i 17) 4022224774 (if (= i 18) 264347078 (if (= i 19) 604807628
+  (if (= i 20) 770255983 (if (= i 21) 1249150122 (if (= i 22) 1555081692 (if (= i 23) 1996064986
+  (if (= i 24) 2554220882 (if (= i 25) 2821834349 (if (= i 26) 2952996808 (if (= i 27) 3210313671
+  (if (= i 28) 3336571891 (if (= i 29) 3584528711 (if (= i 30) 113926993 (if (= i 31) 338241895
+  (if (= i 32) 666307205 (if (= i 33) 773529912 (if (= i 34) 1294757372 (if (= i 35) 1396182291
+  (if (= i 36) 1695183700 (if (= i 37) 1986661051 (if (= i 38) 2177026350 (if (= i 39) 2456956037
+  (if (= i 40) 2730485921 (if (= i 41) 2820302411 (if (= i 42) 3259730800 (if (= i 43) 3345764771
+  (if (= i 44) 3516065817 (if (= i 45) 3600352804 (if (= i 46) 4094571909 (if (= i 47) 275423344
+  (if (= i 48) 430227734 (if (= i 49) 506948616 (if (= i 50) 659060556 (if (= i 51) 883997877
+  (if (= i 52) 958139571 (if (= i 53) 1322822218 (if (= i 54) 1537002063 (if (= i 55) 1747873779
+  (if (= i 56) 1955562222 (if (= i 57) 2024104815 (if (= i 58) 2227730452 (if (= i 59) 2361852424
+  (if (= i 60) 2428436474 (if (= i 61) 2756734187 (if (= i 62) 3204031479 3329325298
+  ))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))
+
+;; --- the message schedule --------------------------------------------------
+;; `blk` is a 64-byte region. Nothing here knows or cares where it came from:
+;; `sha-blocks` narrows it out of the caller's message, and the objects that
+;; synthesise their bytes narrow it out of the state's own assembly buffer.
+
+(defn bb [blk i] (kernel-load-u8 blk 64 i))
+
+(defn prepare-step [st blk i]
+  (let [j (* i 4)]
+    (store32 st i
+             (+ (* (bb blk j) 16777216)
+                (+ (* (bb blk (+ j 1)) 65536)
+                   (+ (* (bb blk (+ j 2)) 256)
+                      (bb blk (+ j 3))))))))
+
+(defn prepare [st blk i]
+  (if (= i 16) 1
+    (prepare st blk (+ i 1 (* 0 (prepare-step st blk i))))))
+
+(defn extend-step [st i]
+  (let [x (load32 st (- i 15))
+        y (load32 st (- i 2))
+        s0 (bxor3 (rotr7 x) (rotr18 x) (shr3 x))
+        s1 (bxor3 (rotr17 y) (rotr19 y) (shr10 y))]
+    (store32 st i (u32 (+ (load32 st (- i 16))
+                          (+ s0 (+ (load32 st (- i 7)) s1)))))))
+
+(defn extend [st i]
+  (if (= i 64) 1
+    (extend st (+ i 1 (* 0 (extend-step st i))))))
+
+(defn copy-working [st i]
+  (if (= i 8) 1
+    (copy-working st (+ i 1 (* 0 (store32 st (+ 72 i) (load32 st (+ 64 i))))))))
+
+(defn copy-round [st i]
+  (if (= i 8) 1
+    (copy-round st (+ i 1 (* 0 (store32 st (+ 72 i) (load32 st (+ 80 i))))))))
+
+(defn round-step [st i]
+  (let [a (load32 st 72) b (load32 st 73)
+        c (load32 st 74) d (load32 st 75)
+        e (load32 st 76) f (load32 st 77)
+        g (load32 st 78) h (load32 st 79)
+        sum1 (bxor3 (rotr6 e) (rotr11 e) (rotr25 e))
+        choice (bit-xor (bit-and e f) (bit-and (bit-xor e 4294967295) g))
+        temp1 (u32 (+ h (+ sum1 (+ choice (+ (round-k i) (load32 st i))))))
+        sum0 (bxor3 (rotr2 a) (rotr13 a) (rotr22 a))
+        majority (bxor3 (bit-and a b) (bit-and a c) (bit-and b c))
+        temp2 (u32 (+ sum0 majority))
+        s7 (store32 st 87 g) s6 (store32 st 86 f)
+        s5 (store32 st 85 e) s4 (store32 st 84 (u32 (+ d temp1)))
+        s3 (store32 st 83 c) s2 (store32 st 82 b)
+        s1 (store32 st 81 a) s0 (store32 st 80 (u32 (+ temp1 temp2)))]
+    (+ 1 (* 0 (+ (copy-round st 0)
+                 (+ s7 (+ s6 (+ s5 (+ s4 (+ s3 (+ s2 (+ s1 s0))))))))))))
+
+(defn round-block [st i]
+  (if (= i 64) 1
+    (round-block st (+ i 1 (* 0 (round-step st i))))))
+
+(defn add-state [st i]
+  (if (= i 8) 1
+    (add-state st (+ i 1 (* 0 (store32 st (+ 64 i)
+                                       (u32 (+ (load32 st (+ 64 i))
+                                               (load32 st (+ 72 i))))))))))
+
+;; --- the length counter ----------------------------------------------------
+;; Bytes, not bits, and split across two 32-bit words so that neither half
+;; needs a shift. The bit count is formed once, in `sha-final`.
+
+(defn get-len [st] (+ (* (load32 st 88) 4294967296) (load32 st 89)))
+
+(defn set-len [st n]
+  (+ 1 (* 0 (+ (store32 st 88 (quot n 4294967296))
+               (store32 st 89 (bit-and n 4294967295))))))
+
+;; --- the three public operations -------------------------------------------
+
+;; `sha-init` -- the eight FIPS 180-4 initial words and a zero length.
+(defn sha-init [st]
+  (let [s0 (store32 st 64 1779033703) s1 (store32 st 65 3144134277)
+        s2 (store32 st 66 1013904242) s3 (store32 st 67 2773480762)
+        s4 (store32 st 68 1359893119) s5 (store32 st 69 2600822924)
+        s6 (store32 st 70 528734635) s7 (store32 st 71 1541459225)]
+    (+ 1 (* 0 (+ (set-len st 0)
+                 (+ s0 (+ s1 (+ s2 (+ s3 (+ s4 (+ s5 (+ s6 s7))))))))))))
+
+;; `sha-block` -- one compression of one 64-byte view. It does NOT advance the
+;; length counter, because `sha-final` compresses one or two blocks that are
+;; NOT message bytes (the padding and the length field) and must not count
+;; them. `sha-absorb` is the pairing that does count.
+(defn sha-block [st blk]
+  (+ 1 (* 0 (+ (prepare st blk 0)
+               (+ (extend st 16)
+                  (+ (copy-working st 0)
+                     (+ (round-block st 0)
+                        (add-state st 0))))))))
+
+(defn sha-absorb [st blk]
+  (+ 1 (* 0 (+ (sha-block st blk)
+               (set-len st (+ (get-len st) 64))))))
+
+;; `sha-blocks` -- `full` consecutive 64-byte views out of one caller region.
+;; THE LOOP BOUND IS `full`, DERIVED FROM THE CALLER'S OWN LENGTH, and the
+;; entry objects refuse a length above their stated ceiling before reaching
+;; here. There is no unbounded loop in this module.
+;;
+;; The self-call is the whole body of the `if`, with no `let` between it and
+;; the function's baseline, so it is the jump described at the top of this
+;; file and 16,384 iterations cost one frame, not 16,384.
+(defn sha-blocks [st src src-len i full]
+  (if (= i full) 1
+    (sha-blocks st src src-len
+                (+ i 1 (* 0 (sha-absorb st (kernel-subregion src src-len (* i 64) 64))))
+                full)))
+
+;; --- padding and the final block(s) ----------------------------------------
+
+(defn zero-from [st i]
+  (if (= i 64) 1
+    (zero-from st (+ i 1 (* 0 (ss st (+ 360 i) 0))))))
+
+(defn copy-tail [st src src-len i]
+  (if (= i src-len) 1
+    (copy-tail st src src-len
+               (+ i 1 (* 0 (ss st (+ 360 i) (kernel-load-u8 src src-len i)))))))
+
+(defn length-byte [bits p]
+  (if (= p 0) (bit-and (quot bits 72057594037927936) 255)
+  (if (= p 1) (bit-and (quot bits 281474976710656) 255)
+  (if (= p 2) (bit-and (quot bits 1099511627776) 255)
+  (if (= p 3) (bit-and (quot bits 4294967296) 255)
+  (if (= p 4) (bit-and (quot bits 16777216) 255)
+  (if (= p 5) (bit-and (quot bits 65536) 255)
+  (if (= p 6) (bit-and (quot bits 256) 255)
+    (bit-and bits 255)))))))))
+
+(defn put-len [st bits i]
+  (if (= i 8) 1
+    (put-len st bits (+ i 1 (* 0 (ss st (+ 416 i) (length-byte bits i)))))))
+
+;; Under 56 tail bytes the 0x80, the zeros and the 8-byte length all fit in one
+;; block. At 56 or more they do not, and the length field goes into a SECOND
+;; block that is 56 zeros followed by it -- FIPS 180-4 section 5.1.1. Two arms
+;; rather than one arithmetic expression, because the second arm compresses
+;; twice and the first once, and a reader should be able to see that.
+(defn final-short [st bits]
+  (+ 1 (* 0 (+ (put-len st bits 0)
+               (sha-block st (kernel-subregion st 512 360 64))))))
+
+(defn final-long [st bits]
+  (let [b1 (sha-block st (kernel-subregion st 512 360 64))
+        z (zero-from st 0)
+        l (put-len st bits 0)]
+    (+ 1 (* 0 (+ b1 (+ z (+ l (sha-block st (kernel-subregion st 512 360 64)))))))))
+
+;; `sha-final` -- pad, append the length, compress, and write 32 raw
+;; big-endian bytes of digest to the state region at offset 424.
+;;
+;; `src` is the 0..63 bytes that did not fill a block. It MAY be the state's
+;; own assembly buffer: the copy below is then a byte-for-byte self-copy, which
+;; is what lets a caller that synthesises its bytes (device-worker-digest) hand
+;; its own buffer straight back.
+(defn emit-digest [st i]
+  (if (= i 8) 1
+    (emit-digest st (+ i 1 (* 0 (store32 st (+ 106 i) (load32 st (+ 64 i))))))))
+
+(defn sha-final [st src src-len]
+  (let [bits (* (+ (get-len st) src-len) 8)
+        c (copy-tail st src src-len 0)
+        z (zero-from st src-len)
+        m (ss st (+ 360 src-len) 128)
+        r (if (< src-len 56) (final-short st bits) (final-long st bits))]
+    (+ 1 (* 0 (+ c (+ z (+ m (+ r (emit-digest st 0)))))))))

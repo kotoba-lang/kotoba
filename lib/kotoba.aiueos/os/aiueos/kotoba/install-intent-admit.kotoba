@@ -1,0 +1,202 @@
+(ns aiueos.install-intent-admit
+  (:require [aiueos.sha256 :as sha])
+  (:export [aiueos-install-intent-admit main]))
+
+;; Decides whether a live inspection report satisfies an install intent --
+;; the admission of `os/aiueos/scripts/install-intent.cljk verify-intent`,
+;; ported to a freestanding Kotoba object (install-v1.edn decision 2).
+;;
+;; The cljk program keeps its job: reading JSON, printing named refusals,
+;; computing the OpenSSH fingerprint. This object owns the DECISION, so the
+;; same verdict can be reached where no nbb exists. Every window is derived
+;; through `kernel-subregion` (the checked narrowing), never bare `+` --
+;; that is the rootedness rule, and it is what makes this object safe to
+;; hand a caller-owned page.
+;;
+;; NOT A BOOLEAN. Zero admits; every other value names the clause that
+;; refused, numbered in the order the cljk program checks. The literals live
+;; beside their clauses in the contract file.
+
+;; ---------------------------------------------------------------- ABI
+;;
+;; One caller-owned memory image of exactly 832 bytes:
+;;
+;;    0 expires-ms                 i64 LE
+;;    8 now-ms                     i64 LE
+;;   16 intent-release-disk-sha256 32B
+;;   48 report-image-sha256        32B
+;;   80 intent-model slot    (len i64 + 48B)
+;;  136 report-model  slot    (len i64 + 48B)
+;;  192 intent-transport slot (len i64 + 16B)
+;;  216 report-transport slot (len i64 + 16B)
+;;  240 report-target-bytes      i64
+;;  248 intent-min-bytes         i64
+;;  256 intent-max-bytes         i64
+;;  264 flags                    i64  bit0 = intent binds a serial digest,
+;;                                    bit1 = a serial was probed
+;;  272 intent-serial-digest     32B
+;;  304 serial input             96B  [salt 16B][':' 1B][padded serial 64B]
+;;                                      (17 spare bytes keep the region
+;;                                       16-aligned in the contract's maps)
+;;  400 scratch                 416B  [digest out 32B][sha256 workspace 352B]
+;;
+;; A slot is DERIVED BY ITS LENGTH FIELD: the slot base names the length, the
+;; bytes start 8 bytes in. A missing string is a zero length, a missing
+;; number is zero, a missing serial digest is flag bit0 clear -- the same
+;; absent-is-refusal reading the JSON program gives its nils.
+
+(def image-bytes 832)
+(def serial-input-offset 304)
+(def scratch-offset 400)
+(def intent-digest-offset 272)
+(def serial-region-bytes 96)
+(def serial-slot-bytes 64)
+(def serial-prefix-bytes 17)       ; 16-byte salt + ':'
+
+;; ---------------------------------------------------------------- reading
+
+(defn u8 [base length offset]
+  (kernel-load-u8-16k base length offset))
+
+;; Little-endian, 8 bytes. Millisecond timestamps and byte counts sit far
+;; below 2^53, so this never leaves the exact-integer range.
+(defn load-i64 [base length offset]
+  (+ (u8 base length offset)
+     (+ (* (u8 base length (+ offset 1)) 256)
+        (+ (* (u8 base length (+ offset 2)) 65536)
+           (+ (* (u8 base length (+ offset 3)) 16777216)
+              (+ (* (u8 base length (+ offset 4)) 4294967296)
+                 (+ (* (u8 base length (+ offset 5)) 1099511627776)
+                    (+ (* (u8 base length (+ offset 6)) 281474976710656)
+                       (* (u8 base length (+ offset 7)) 72057594037927936)))))))))
+
+;; ---------------------------------------------------------------- strings
+;;
+;; `verify-intent` compares models with (str/includes? (str/lower got)
+;; (str/lower want)), transports with case-insensitive equality, and trims
+;; the probed serial before digesting it -- sysfs pads serials, and a digest
+;; over the padded form refuses the very disk the intent names.
+
+(defn lower-byte [c]
+  (if (and (>= c 65) (<= c 90)) (+ c 32) c))
+
+;; A slot's byte count; the slot base names its length field. The slot
+;; window is the 56 bytes the layout gives it (8 length + 48 body).
+(defn slot-len [slot]
+  (load-i64 slot 56 0))
+
+;; The ABI admits five parameters, so the substring test walks one report
+;; position per call and re-reads both lengths from the slots' own headers.
+(defn match-at [got want s j]
+  (let [got-len (slot-len got)
+        want-len (slot-len want)]
+    (if (= j want-len) 1
+      (if (>= (+ s j) got-len) 0
+        (if (= (lower-byte (u8 got 56 (+ 8 (+ s j))))
+               (lower-byte (u8 want 56 (+ 8 j))))
+          (match-at got want s (+ j 1))
+          0)))))
+
+(defn contains-lower [got want s]
+  (let [got-len (slot-len got)
+        want-len (slot-len want)]
+    (if (= want-len 0) 0
+      (if (> (+ s want-len) got-len) 0
+        (if (= (match-at got want s 0) 1) 1
+          (contains-lower got want (+ s 1)))))))
+
+;; Case-folded equality of two slots, one position per call.
+(defn transport-equal [a b i]
+  (let [alen (slot-len a)
+        blen (slot-len b)]
+    (if (not= alen blen) 0
+      (if (= i alen) 1
+        (if (= (lower-byte (u8 a 24 (+ 8 i)))
+               (lower-byte (u8 b 24 (+ 8 i))))
+          (transport-equal a b (+ i 1))
+          0)))))
+
+;; The serial bytes occupy region offsets serial-prefix-bytes..
+;; (+ serial-prefix-bytes serial-slot-bytes). Trailing spaces are padding,
+;; so the length is the distance from the END to the last non-space. All
+;; space is a zero-length serial: still measured, just empty -- the JSON
+;; program would have hashed the empty string too.
+(defn trimmed-length [serial i]
+  (if (>= i serial-slot-bytes) 0
+    (let [c (u8 serial 96
+                (+ serial-prefix-bytes (- serial-slot-bytes 1 i)))]
+      (if (= c 32) (trimmed-length serial (+ i 1))
+        (- serial-slot-bytes i)))))
+
+;; ---------------------------------------------------------------- digests
+
+;; 32-byte XOR difference of the release digest at offset 16 and the report
+;; digest at offset 48, both read through the image base -- the two regions
+;; are FIXED layout offsets, so the loop needs only the image and an index.
+(defn digest-difference [image length i acc]
+  (if (= i 32) acc
+    (digest-difference image length (+ i 1)
+                       (+ acc (bit-xor (u8 image length (+ 16 i))
+                                       (u8 image length (+ 48 i)))))))
+
+;; sha256(salt + ":" + trimmed-serial) into the scratch output, then the
+;; 32-byte difference of THAT output (bytes 400..431 of the image) against
+;; the intent's digest (bytes 272..303). Comparing the scratch output
+;; against the intent digest is the check; the release/report comparison
+;; lives in `digest-difference` and must not be repeated here.
+;; 32-byte difference of the scratch digest output (image bytes 400..431)
+;; against the intent's serial digest (bytes 272..303). `output` is
+;; scratch+0 per the layout, so image[400+i] is output byte i.
+(defn scratch-digest-difference [image length i acc]
+  (if (= i 32) acc
+    (scratch-digest-difference image length (+ i 1)
+                               (+ acc (bit-xor (u8 image length (+ scratch-offset i))
+                                               (u8 image length (+ intent-digest-offset i)))))))
+
+(defn serial-digest-mismatch [image length scratch serial-region intent-digest]
+  (let [trimmed (trimmed-length serial-region 0)
+        scratch-len (+ scratch-offset 416)
+        output (kernel-subregion scratch scratch-len 0 32)
+        workspace (kernel-subregion scratch scratch-len 64 352)
+        hashed (sha/aiueos-sha256 serial-region
+                                  (+ serial-prefix-bytes trimmed)
+                                  output workspace 352)]
+    (if (= hashed 0) 1
+      (if (= (scratch-digest-difference image length 0 0) 0) 0 1))))
+
+;; ---------------------------------------------------------------- decision
+
+(defn aiueos-install-intent-admit
+  [image :i64 length :i64] :i64
+  (if (not= length image-bytes) 9
+    (if (< (load-i64 image length 0) (load-i64 image length 8)) 1
+      (let [intent-digest (kernel-subregion image length 16 32)
+            report-digest (kernel-subregion image length 48 32)
+            intent-model (kernel-subregion image length 80 56)
+            report-model (kernel-subregion image length 136 56)
+            intent-transport (kernel-subregion image length 192 24)
+            report-transport (kernel-subregion image length 216 24)
+            intent-serial-digest (kernel-subregion image length 272 32)
+            serial-region (kernel-subregion image length serial-input-offset
+                                            serial-region-bytes)
+            scratch (kernel-subregion image length scratch-offset 416)]
+        (if (not= (digest-difference image length 0 0) 0) 2
+          (if (or (= (slot-len intent-model) 0)
+                  (= (contains-lower report-model intent-model 0) 0)) 3
+            (let [bytes (load-i64 image length 240)
+                  min-bytes (load-i64 image length 248)
+                  max-bytes (load-i64 image length 256)]
+              (if (or (< bytes min-bytes) (> bytes max-bytes)) 4
+                (if (= (slot-len report-transport) 0) 5
+                  (if (not= (transport-equal intent-transport
+                                             report-transport 0) 1) 6
+                    (let [flags (load-i64 image length 264)]
+                      (if (= (bit-and flags 1) 1)
+                        (if (= (bit-and flags 2) 0) 7
+                          (if (= (serial-digest-mismatch image length scratch
+                                                         serial-region
+                                                         intent-serial-digest) 1)
+                            8 0))
+                        0))))))))))))
+
+(defn main [] :i64 0)

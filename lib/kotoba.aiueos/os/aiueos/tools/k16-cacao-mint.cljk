@@ -1,0 +1,82 @@
+#!/usr/bin/env kbb
+;; Mint one CACAO with the K16 node's own did:key, for one murakumo route.
+;;
+;; WHY THIS EXISTS. The relay authenticated to api.murakumo.cloud with the
+;; shared MURAKUMO_SERVICE_TOKEN -- an operator secret that is not in kagi
+;; (`no such item`, measured 2026-08-15 and again 2026-09-08), is write-only on
+;; the Worker, and is shared by `operator-authorized?` and `write-authorized!`,
+;; so re-issuing it 401s every other caller. The K16 therefore could not talk
+;; to murakumo at all.
+;;
+;; It does not need to. Measured 2026-09-08 against the LIVE server: every
+;; route the relay uses -- POST /infer/nodes, /infer/queue, /infer/queue/:id/
+;; claim, /infer/queue/:id/result, /infer/nodes/:name/heartbeat -- accepts
+;; "Authorization: CACAO <base64>" whose `:iss` equals the `:did` the body
+;; claims. The node holds that key. No shared secret is involved.
+;;
+;; WHY A SUBPROCESS AND NOT PYTHON. A CACAO's signature covers a SIWE plaintext
+;; that mint and verify must agree on byte-for-byte; the workspace already has
+;; that agreement in `cacao.edge.mint` / `cacao.edge.verify`. A second
+;; implementation in Python would be a second chance to be silently wrong, and
+;; ADR-2607320000 is the record of exactly that failure -- an identifier that
+;; looked right and could not sign. So the relay shells out to the authority.
+;; (nbb rather than kbb: this reuses a .cljs library that needs WebCrypto.)
+;;
+;; Usage:
+;;   kbb --backend sci os/aiueos/tools/k16-cacao-mint.cljk --key <pem> --did <did-file>
+;;       --aud <url> [--ttl-s 600]
+;; Prints the base64 CACAO on stdout, nothing else. Exit 2 = REFUSED.
+;;
+;; The blob is verified LOCALLY before it is printed. A mint that cannot pass
+;; the workspace's own verifier must not reach the wire, where the same failure
+;; would arrive as a 401 and read as a credential problem.
+(ns k16-cacao-mint
+  (:require [cacao.edge.mint :as mint]
+            [cacao.edge.verify :as verify]
+            [kotoba.lang.text :as str]
+            ["node:crypto" :as ncrypto]
+            ["fs" :as fs]))
+
+(defn arg [f d] (let [a (vec *command-line-args*) i (.indexOf a f)] (if (>= i 0) (nth a (inc i) d) d)))
+(defn refuse [& parts]
+  (binding [*print-fn* *print-err-fn*] (println "K16_CACAO_REFUSED" (apply str parts)))
+  (js/process.exit 2))
+
+(def key-path (or (arg "--key" nil) (refuse "missing --key")))
+(def did-path (or (arg "--did" nil) (refuse "missing --did")))
+(def aud (or (arg "--aud" nil) (refuse "missing --aud")))
+(def ttl (js/parseInt (arg "--ttl-s" "600") 10))
+
+(def did (str/trim (fs/readFileSync did-path "utf8")))
+(def node-key
+  (try (.createPrivateKey ncrypto (fs/readFileSync key-path "utf8"))
+       (catch :default e (refuse "cannot read the node key: " (or (.-message e) (str e))))))
+
+(defn utc [secs] (str/replace (.toISOString (js/Date. (* 1000 secs))) #"\.\d{3}Z$" "Z"))
+
+;; node:crypto signs Ed25519 with a null algorithm over the raw message, which
+;; is what the SIWE plaintext is.
+(defn sign-fn [msg-bytes]
+  (js/Promise.resolve
+   (.-buffer (js/Uint8Array.from (.sign ncrypto nil (js/Buffer.from msg-bytes) node-key)))))
+
+(def now (js/Math.floor (/ (js/Date.now) 1000)))
+
+(-> (mint/mint did sign-fn
+               {:aud aud
+                :domain "api.murakumo.cloud"
+                :version "1"
+                :nonce (.toString (.randomBytes ncrypto 16) "hex")
+                :iat (utc now)
+                :exp (utc (+ now ttl))})
+    (.then (fn [minted]
+             (let [blob (:cacao-b64 minted)]
+               (.then (verify/verify blob)
+                      (fn [r]
+                        (let [m (js->clj r :keywordize-keys true)]
+                          (cond
+                            (not (:valid m)) (refuse "the minted CACAO does not verify: "
+                                                     (or (:error m) "invalid"))
+                            (not= (:iss m) did) (refuse "iss " (:iss m) " != node did " did)
+                            :else (println blob))))))))
+    (.catch (fn [e] (refuse (or (.-message e) (str e))))))

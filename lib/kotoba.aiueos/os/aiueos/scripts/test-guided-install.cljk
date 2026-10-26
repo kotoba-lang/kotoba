@@ -1,0 +1,541 @@
+#!/usr/bin/env kbb
+;; Offline proof of the guided installer (install-v1.edn :guided, aiueos
+;; ADR-0208). Fake probe fixtures and temp files only; never opens a block
+;; device and never writes to one.
+;;
+;; Discipline, taken from test-install-chain.cljs and from root ADR
+;; adr-2608136000:
+;;
+;;   * every refusal pins the NAMED reason literal (question 6). A refusal
+;;     that fired for a different reason than the one under test is a test
+;;     bug, not a pass.
+;;   * the admit cases exist so the refusals are non-vacuous: a program that
+;;     could not produce an intent at all would make every refusal green.
+;;   * the capacity comparison is exercised ON ITS BOUNDARY (question 5): a
+;;     disk of exactly the derived minimum and exactly the derived maximum is
+;;     admitted, one byte past the maximum is refused. Without the boundary,
+;;     flipping `<=` to `<` would leave this suite green.
+;;   * the artifact is EXECUTED, not merely built (question 8): the intent the
+;;     guided run writes is handed to the existing install-intent.cljs verify,
+;;     which is the program that will admit it on the target machine. "The
+;;     file was written" is not "the file is an intent".
+;;   * the ordering claim -- answers are validated BEFORE anything is probed
+;;     -- is measured by pointing the probe at a path that does not exist and
+;;     requiring the named validation refusal anyway. If the probe ran first
+;;     the run would die differently, and the case would fail.
+;;
+;; Output: one AIUEOS_GUIDED_TEST_* line per case, then a summary with an
+;; exact expected count. Exit 0 only when every case held AND the count
+;; matches -- a harness that silently ran fewer cases must not look like one
+;; that ran them all.
+
+(require '[kotoba.lang.text :as str]
+         '[aiueos.installer.guided :as g])
+
+(def fs (js/require "node:fs"))
+(def path (js/require "node:path"))
+(def cp (js/require "node:child_process"))
+(def os-mod (js/require "node:os"))
+(def crypto (js/require "node:crypto"))
+
+(def repo-root (.resolve path (.dirname path *file*) ".." ".." ".."))
+(def guided-script (.join path repo-root "os/aiueos/installer/live/guided-install.cljk"))
+(def intent-script (.join path repo-root "os/aiueos/scripts/install-intent.cljk"))
+(def tmp (.mkdtempSync fs (.join path (.tmpdir os-mod) "aiueos-guided-")))
+
+(def results (atom []))
+(defn- record! [name ok detail]
+  (swap! results conj {:name name :ok ok :detail detail})
+  (println (if ok "AIUEOS_GUIDED_TEST_OK  " "AIUEOS_GUIDED_TEST_FAIL") name detail))
+
+(defn- check! [name expected actual]
+  (record! name (= expected actual)
+           (if (= expected actual)
+             (str "= " (pr-str expected))
+             (str "expected " (pr-str expected) " got " (pr-str actual)))))
+
+(defn- json! [p m]
+  (.writeFileSync fs p (str (.stringify js/JSON (clj->js m) nil 2) "\n")))
+
+(defn- read-json [p]
+  (js->clj (.parse js/JSON (.readFileSync fs p "utf8")) :keywordize-keys true))
+
+(defn- sha256-hex [buf]
+  (-> (.createHash crypto "sha256") (.update buf) (.digest "hex")))
+
+;; ---------------------------------------------------------------- fixtures
+
+(def image-bytes (* 64 1024 1024))
+(def release-receipt (.join path tmp "release-receipt.json"))
+(json! release-receipt
+       {:schema "aiueos.build-receipt.v1"
+        :disk {:bytes image-bytes
+               :sha256 (sha256-hex (js/Buffer.alloc image-bytes))}})
+
+;; A real ssh-ed25519 authorized_keys line: the fingerprint the guided runner
+;; computes has to be the fingerprint install-intent.cljs would compute, and a
+;; random blob would not exercise the base64 decode at all.
+(defn- ssh-string [buf]
+  (let [len (js/Buffer.alloc 4)]
+    (.writeUInt32BE len (.-length buf) 0)
+    (js/Buffer.concat #js [len buf])))
+(def keypair (.generateKeyPairSync crypto "ed25519"))
+(def raw-pub
+  (let [spki (.export (.-publicKey keypair) #js {:format "der" :type "spki"})]
+    (.subarray spki (- (.-length spki) 32))))
+(def pubkey-line
+  (str "ssh-ed25519 "
+       (.toString (js/Buffer.concat #js [(ssh-string (js/Buffer.from "ssh-ed25519" "utf8"))
+                                         (ssh-string raw-pub)])
+                  "base64")
+       " owner@test"))
+
+(def target-bytes (* 500 1000 1000 1000)) ; a 500 GB NVMe
+(def probe-file (.join path tmp "probe.json"))
+(json! probe-file
+       {:blockdevices
+        [{:path "/dev/sda" :type "disk" :size (* 32 1000 1000 1000)
+          :model "SanDisk Ultra" :tran "usb" :serial "USB123" :rm true}
+         {:path "/dev/nvme0n1" :type "disk" :size target-bytes
+          :model "PNY CS2241 500GB" :tran "nvme" :serial "PNY-SER-0001  " :rm false}
+         {:path "/dev/nvme0n1p1" :type "part" :size (* 1 1000 1000 1000)
+          :model nil :tran nil :serial nil :rm false}]})
+
+(def probe-only-boot (.join path tmp "probe-boot-only.json"))
+(json! probe-only-boot
+       {:blockdevices
+        [{:path "/dev/sda" :type "disk" :size (* 32 1000 1000 1000)
+          :model "SanDisk Ultra" :tran "usb" :serial "USB123" :rm false}]})
+
+(def good-answers
+  {:schema g/answers-schema
+   :mode "unattended"
+   :expires-days 30
+   :network {:policy "wired-dhcp"}
+   :storage {:model "PNY CS2241 500GB" :transport "nvme" :min-gb 450 :max-gb 550}
+   :identity {:hostname "aiueos-b850m" :machine-model "ASRock B850M Pro RS"}
+   :ssh {:principal "aiueos" :public-key pubkey-line}
+   :confirm {:hostname "aiueos-b850m"}})
+
+;; ------------------------------------------------------- pure: validation
+
+(defn- reasons-of [answers] (set (:reasons (g/validate-answers answers))))
+
+(check! "validate-admit" true (:ok (g/validate-answers good-answers)))
+
+(check! "refuse-schema-unknown" true
+        (contains? (reasons-of (assoc good-answers :schema "autoinstall.v1"))
+                   "answers-schema-unknown"))
+
+(check! "refuse-hostname-invalid" true
+        (contains? (reasons-of (assoc-in good-answers [:identity :hostname] "AIUEOS_B850M"))
+                   "answers-hostname-invalid"))
+
+(check! "refuse-ssh-key-not-openssh" true
+        (contains? (reasons-of (assoc-in good-answers [:ssh :public-key] "hunter2"))
+                   "answers-ssh-key-not-openssh"))
+
+(check! "refuse-capacity-bounds-inverted" true
+        (contains? (reasons-of (-> good-answers
+                                   (assoc-in [:storage :min-gb] 600)
+                                   (assoc-in [:storage :max-gb] 500)))
+                   "answers-capacity-bounds-inverted"))
+
+(check! "refuse-network-policy-unsupported" true
+        (contains? (reasons-of (assoc good-answers :network {:policy "wifi-wpa2"}))
+                   "answers-network-policy-unsupported"))
+
+(check! "refuse-confirm-mismatch" true
+        (contains? (reasons-of (assoc good-answers :confirm {:hostname "aiueos-other"}))
+                   "answers-confirm-mismatch"))
+
+(check! "refuse-interactive-section-unknown" true
+        (contains? (reasons-of (assoc good-answers :interactive-sections ["keyboard"]))
+                   "answers-interactive-section-unknown"))
+
+(check! "refuse-mode-invalid" true
+        (contains? (reasons-of (assoc good-answers :mode "semi"))
+                   "answers-mode-invalid"))
+
+;; A hostname that is invalid must not ALSO be reported as a confirm mismatch:
+;; two reasons for one defect send the reader to the wrong screen.
+(check! "one-defect-one-reason" #{"answers-hostname-invalid"}
+        (reasons-of (-> good-answers
+                        (assoc-in [:identity :hostname] "Bad_Host")
+                        (assoc-in [:confirm :hostname] "Bad_Host"))))
+
+;; ------------------------------------------------------------ pure: the walk
+
+(defn- pending-ids [answers] (mapv :id (g/pending-steps answers)))
+
+(check! "walk-nothing-answered" ["network" "storage" "identity" "ssh" "confirm"]
+        (pending-ids {:schema g/answers-schema :mode "interactive"}))
+
+;; Partial answers ask for the gap -- and for the confirmation, because a
+;; person answered something in this run. A confirmation carried in from the
+;; file cannot confirm a key chosen a minute ago.
+(check! "walk-partial-asks-the-gap-and-reconfirms" ["ssh" "confirm"]
+        (pending-ids (dissoc good-answers :ssh)))
+
+(check! "walk-interactive-section-reasked" ["storage" "confirm"]
+        (pending-ids (-> good-answers
+                         (assoc :mode "interactive")
+                         (assoc :interactive-sections ["storage"]))))
+
+(check! "walk-star-reasks-everything" ["network" "storage" "identity" "ssh" "confirm"]
+        (pending-ids (-> good-answers
+                         (assoc :mode "interactive")
+                         (assoc :interactive-sections ["*"]))))
+
+(check! "walk-complete-answer-file-asks-nothing" []
+        (pending-ids good-answers))
+
+;; The authoring mode is not the install mode. An operator sitting at the
+;; machine authoring an intent that will later install unattended must still
+;; be asked every screen; keying the walk off :mode made that run ask nothing
+;; and write an empty intent.
+(check! "walk-mode-does-not-decide-who-is-asked"
+        (pending-ids (assoc good-answers :mode "interactive"))
+        (pending-ids (assoc good-answers :mode "unattended")))
+
+;; A section that is PRESENT but malformed is asked again rather than skipped
+;; silently -- the difference between "answered" and "has a key".
+(check! "walk-malformed-section-reasked" ["storage" "confirm"]
+        (pending-ids (-> good-answers
+                         (assoc :mode "interactive")
+                         (assoc-in [:storage :transport] ""))))
+
+;; ------------------------------------------------- pure: the date rendering
+
+(check! "iso8601-epoch" "1970-01-01T00:00:00.000Z" (g/epoch-ms->iso8601 0))
+(check! "iso8601-leap-day" "2024-02-29T12:34:56.789Z"
+        (g/epoch-ms->iso8601 (.getTime (js/Date. "2024-02-29T12:34:56.789Z"))))
+
+;; The oracle: 2000 random instants over the next century must render exactly
+;; as the host would render them. A hand-written civil-from-days that is wrong
+;; on one month boundary would pass a single vector and fail here.
+(let [bad (atom nil)]
+  (dotimes [_ 2000]
+    (when-not @bad
+      (let [ms (js/Math.floor (* (js/Math.random) 4102444800000))]
+        (when-not (= (.toISOString (js/Date. ms)) (g/epoch-ms->iso8601 ms))
+          (reset! bad ms)))))
+  (record! "iso8601-matches-host-oracle" (nil? @bad)
+           (if @bad (str "diverged at epoch-ms " @bad) "2000/2000 instants agree")))
+
+;; ------------------------------------------------------- pure: derived match
+
+(def probed-disk {:path "/dev/nvme0n1" :type "disk" :size target-bytes
+                  :model "PNY CS2241 500GB" :tran "nvme" :serial "PNY-SER-0001  "})
+(def derived (g/disk->match probed-disk))
+
+(check! "match-drops-device-path" nil (:path derived))
+(check! "match-trims-serial" "PNY-SER-0001" (:serial derived))
+(check! "match-lowercases-transport" "nvme" (:transport derived))
+(record! "match-brackets-probed-size"
+         (<= (* (:min-gb derived) 1000 1000 1000)
+             target-bytes
+             (* (:max-gb derived) 1000 1000 1000))
+         (str (:min-gb derived) " GB <= " target-bytes " <= " (:max-gb derived) " GB"))
+
+(check! "candidates-exclude-boot-removable-and-parts" ["/dev/nvme0n1"]
+        (mapv :path (g/candidate-disks (:blockdevices (read-json probe-file))
+                                       {:boot-disk "/dev/sda" :image-bytes image-bytes})))
+
+;; ------------------------------------------------------ pure: the round trip
+
+(def rendered-intent
+  (g/answers->intent {:answers good-answers
+                      :release {:receipt-sha256 (apply str (repeat 64 "a"))
+                                :disk {:bytes image-bytes :sha256 (apply str (repeat 64 "b"))}}
+                      :ssh-fingerprint "SHA256:test"
+                      :serial-sha256 (apply str (repeat 64 "c"))
+                      :serial-salt "deadbeef"
+                      :now-ms 1757462400000}))
+
+(check! "render-binds-hostname" "aiueos-b850m" (:hostname rendered-intent))
+(check! "render-binds-capacity" [(* 450 1000 1000 1000) (* 550 1000 1000 1000)]
+        [(get-in rendered-intent [:targetDisk :minBytes])
+         (get-in rendered-intent [:targetDisk :maxBytes])])
+(check! "render-expires-30-days" "2025-10-10T00:00:00.000Z" (:expires rendered-intent))
+
+;; A replay must bind the SAME disk. The answer file never carries the serial,
+;; only its digest, so a round trip that dropped the digest would silently
+;; widen the intent to any disk of that model.
+(def replayed (g/answers->intent
+               {:answers (g/intent->answers rendered-intent)
+                :release {:receipt-sha256 (apply str (repeat 64 "a"))
+                          :disk {:bytes image-bytes :sha256 (apply str (repeat 64 "b"))}}
+                :ssh-fingerprint "SHA256:test"
+                :now-ms 1757462400000}))
+(check! "replay-preserves-serial-digest"
+        [(get-in rendered-intent [:targetDisk :serialSha256])
+         (get-in rendered-intent [:targetDisk :serialSalt])]
+        [(get-in replayed [:targetDisk :serialSha256])
+         (get-in replayed [:targetDisk :serialSalt])])
+(check! "replay-is-identical-on-bound-fields" true (= rendered-intent replayed))
+
+;; --------------------------------------------------- subprocess: the program
+
+(defn- run-guided [{:keys [stdin args env]}]
+  (let [r (.spawnSync cp "nbb" (to-array (cons guided-script args))
+                      #js {:encoding "utf8" :shell false :cwd repo-root
+                           :input (or stdin "")
+                           :env (js/Object.assign
+                                 #js {} (.-env js/process)
+                                 (clj->js (merge {"NODE_ENV" "test"
+                                                  "AIUEOS_GUIDED_ALLOW_FAKE_PROBE" "1"}
+                                                 env)))})]
+    {:status (if (nil? (.-status r)) 3 (.-status r))
+     :out (or (.-stdout r) "") :err (or (.-stderr r) "")}))
+
+(def e2e-intent (.join path tmp "e2e-intent.json"))
+(def e2e-answers (.join path tmp "e2e-answers.json"))
+
+;; The scripted operator. Subiquity drives its own TUI in CI from answer
+;; scripts exactly like this; the point is that the program under test is the
+;; program, not a test-only branch of it.
+(def operator-script
+  (str/join "\n" ["wired-dhcp"                 ; network policy
+                  "1"                          ; the one candidate disk
+                  "y"                          ; bind the serial digest
+                  "y"                          ; accept the derived match
+                  "aiueos-b850m"               ; hostname
+                  "ASRock B850M Pro RS"        ; machine model
+                  pubkey-line                  ; ssh key
+                  "aiueos"                     ; principal
+                  "aiueos-b850m"               ; confirm: repeat the hostname
+                  ""]))
+
+(def e2e
+  (run-guided {:stdin operator-script
+               :args ["--release-receipt" release-receipt
+                      "--probe-file" probe-file
+                      "--boot-disk" "/dev/sda"
+                      "--mode" "unattended"
+                      "--out-intent" e2e-intent
+                      "--out-answers" e2e-answers]}))
+
+(record! "guided-e2e-exit-0" (zero? (:status e2e))
+         (str "status=" (:status e2e)
+              (when-not (zero? (:status e2e)) (str " err=" (str/trim (:err e2e))))))
+(record! "guided-e2e-asked-every-screen"
+         (str/includes? (:out e2e) "pending=5")
+         (str/trim (or (first (filter #(str/includes? % "AIUEOS_GUIDED_START")
+                                      (str/split-lines (:out e2e)))) "no start line")))
+
+(def written (when (.existsSync fs e2e-intent) (read-json e2e-intent)))
+
+(check! "guided-writes-intent-schema" "aiueos.install-intent.v1" (:schema written))
+(check! "guided-records-match-not-path"
+        ["PNY CS2241 500GB" "nvme"]
+        [(get-in written [:targetDisk :model]) (get-in written [:targetDisk :transport])])
+(check! "guided-marks-authorship" "guided" (:authoredBy written))
+(record! "guided-never-writes-a-device-path"
+         (and (.existsSync fs e2e-intent)
+              (not (str/includes? (.readFileSync fs e2e-intent "utf8") "/dev/")))
+         "no /dev/ path anywhere in the intent")
+
+;; The fingerprint must be the one install-intent.cljs would have computed for
+;; the same key: two programs producing two fingerprints for one key would
+;; make an intent unverifiable by the other half of the chain.
+(def expected-fp
+  (str "SHA256:"
+       (-> (.createHash crypto "sha256")
+           (.update (js/Buffer.from (nth (str/split (str/trim pubkey-line) #"\s+") 1) "base64"))
+           (.digest "base64")
+           (str/replace #"=+$" ""))))
+(check! "guided-fingerprint-matches-install-intent" expected-fp
+        (get-in written [:ssh :fingerprint]))
+
+;; ------------------------------- subprocess: the intent is actually admitted
+
+(defn- report-for [bytes]
+  {:target {:path "/dev/nvme0n1" :bytes bytes
+            :model "PNY CS2241 500GB" :transport "nvme"}
+   :image {:bytes image-bytes :sha256 (sha256-hex (js/Buffer.alloc image-bytes))}})
+
+(defn- verify-intent! [intent-path bytes serial]
+  (let [rp (.join path tmp (str "report-" bytes ".json"))]
+    (json! rp (report-for bytes))
+    (let [r (.spawnSync cp "nbb"
+                        (to-array (concat [intent-script "verify"
+                                           "--intent" intent-path "--report" rp]
+                                          (when serial ["--serial" serial])))
+                        #js {:encoding "utf8" :shell false :cwd repo-root})]
+      {:status (if (nil? (.-status r)) 3 (.-status r))
+       :out (or (.-stdout r) "") :err (or (.-stderr r) "")})))
+
+(def min-bytes (get-in written [:targetDisk :minBytes]))
+(def max-bytes (get-in written [:targetDisk :maxBytes]))
+
+(let [r (verify-intent! e2e-intent target-bytes "PNY-SER-0001")]
+  (record! "verify-admits-the-probed-disk"
+           (and (zero? (:status r)) (str/includes? (:out r) "AIUEOS_INSTALL_INTENT_ADMIT"))
+           (str "status=" (:status r) " " (str/trim (:out r)))))
+
+;; The boundary, both ends. `<=` flipped to `<` in verify-intent turns these
+;; two cases red and nothing else in this suite notices.
+(let [r (verify-intent! e2e-intent min-bytes "PNY-SER-0001")]
+  (record! "verify-admits-exactly-min-bytes" (zero? (:status r))
+           (str min-bytes " -> status=" (:status r))))
+(let [r (verify-intent! e2e-intent max-bytes "PNY-SER-0001")]
+  (record! "verify-admits-exactly-max-bytes" (zero? (:status r))
+           (str max-bytes " -> status=" (:status r))))
+(let [r (verify-intent! e2e-intent (inc max-bytes) "PNY-SER-0001")]
+  (record! "verify-refuses-one-byte-over-max"
+           (and (= 2 (:status r))
+                (str/includes? (:out r) "AIUEOS_INSTALL_INTENT_REFUSE target-capacity-out-of-bounds"))
+           (str (inc max-bytes) " -> status=" (:status r) " " (str/trim (:out r)))))
+
+;; The serial the guided run bound is the TRIMMED serial: sysfs pads them, and
+;; a digest over the padded form refuses the very disk the operator picked.
+(let [r (verify-intent! e2e-intent target-bytes "PNY-SER-0001  ")]
+  (record! "verify-admits-padded-serial-from-sysfs" (zero? (:status r))
+           (str "status=" (:status r))))
+(let [r (verify-intent! e2e-intent target-bytes "PNY-SER-9999")]
+  (record! "verify-refuses-a-different-serial"
+           (and (= 2 (:status r))
+                (str/includes? (:out r) "AIUEOS_INSTALL_INTENT_REFUSE target-serial-mismatch"))
+           (str "status=" (:status r) " " (str/trim (:out r)))))
+
+;; ------------------------------------------ subprocess: ordering and refusals
+
+;; Validation must happen before the probe. The probe path here does not
+;; exist: if it were read first the run would die on the missing file, so a
+;; named validation refusal is the evidence for the ordering claim.
+(def bad-answers-file (.join path tmp "bad-answers.json"))
+;; The storage section is left OUT deliberately: that makes the storage screen
+;; pending, so this run WOULD probe if validation did not come first. With the
+;; gate the run never reaches the missing probe file; without it the run dies
+;; on ENOENT instead, and this case turns red. That asymmetry is the evidence
+;; for the ordering claim -- a bad answer file alone would only prove that
+;; validation happens, not that it happens first.
+(json! bad-answers-file (-> good-answers
+                            (assoc-in [:identity :hostname] "NOT_A_HOSTNAME")
+                            (dissoc :storage)))
+(let [r (run-guided {:args ["--release-receipt" release-receipt
+                            "--answers" bad-answers-file
+                            "--probe-file" (.join path tmp "no-such-probe.json")
+                            "--out-intent" (.join path tmp "never.json")]})]
+  (record! "guided-validates-before-probing"
+           (and (= 2 (:status r))
+                (str/includes? (:out r) "AIUEOS_GUIDED_REFUSE answers-hostname-invalid"))
+           (str "status=" (:status r) " " (str/trim (:out r))))
+  (record! "guided-wrote-nothing-when-refused"
+           (not (.existsSync fs (.join path tmp "never.json")))
+           "no intent file"))
+
+;; Stdin that ends mid-question is could-not-answer (3), never a default
+;; nobody typed and never a silent 0.
+(let [r (run-guided {:stdin "wired-dhcp\n"
+                     :args ["--release-receipt" release-receipt
+                            "--probe-file" probe-file
+                            "--boot-disk" "/dev/sda"
+                            "--out-intent" (.join path tmp "truncated.json")]})]
+  (record! "guided-eof-mid-question-is-3" (= 3 (:status r))
+           (str "status=" (:status r) " " (str/trim (:err r)))))
+
+;; Nothing to offer is a named refusal, not an empty menu.
+(let [r (run-guided {:stdin "wired-dhcp\n"
+                     :args ["--release-receipt" release-receipt
+                            "--probe-file" probe-only-boot
+                            "--boot-disk" "/dev/sda"
+                            "--out-intent" (.join path tmp "nocand.json")]})]
+  (record! "guided-no-candidates-refused"
+           (and (= 2 (:status r))
+                (str/includes? (:out r) "AIUEOS_GUIDED_REFUSE no-candidate-disks"))
+           (str "status=" (:status r) " " (str/trim (:out r)))))
+
+;; The fake probe is gated: without the two keys the fixture is ignored and
+;; the run falls through to the real lsblk, which on this host is either
+;; absent or reports this machine's disks -- either way it must not read the
+;; fixture. Measured by the fixture's disk NOT appearing.
+(let [r (run-guided {:stdin "wired-dhcp\n1\ny\ny\n"
+                     :env {"AIUEOS_GUIDED_ALLOW_FAKE_PROBE" "0"}
+                     :args ["--release-receipt" release-receipt
+                            "--probe-file" probe-file
+                            "--boot-disk" "/dev/sda"
+                            "--out-intent" (.join path tmp "ungated.json")]})]
+  (record! "guided-fake-probe-is-gated"
+           (not (str/includes? (:out r) "AIUEOS_GUIDED_PROBE fake"))
+           (str "status=" (:status r) " no fake-probe line")))
+
+;; -------------------------------------------- subprocess: the unattended replay
+
+(def replay-intent (.join path tmp "replay-intent.json"))
+(let [r (run-guided {:stdin ""
+                     :args ["--release-receipt" release-receipt
+                            "--answers" e2e-answers
+                            "--mode" "unattended"
+                            "--out-intent" replay-intent]})]
+  (record! "replay-exit-0" (zero? (:status r))
+           (str "status=" (:status r) (when-not (zero? (:status r))
+                                        (str " err=" (str/trim (:err r))))))
+  (record! "replay-asks-nothing-and-probes-nothing"
+           (and (str/includes? (:out r) "pending=0")
+                (not (str/includes? (:out r) "AIUEOS_GUIDED_PROBE")))
+           "pending=0, no probe line"))
+
+(when (.existsSync fs replay-intent)
+  (let [a written b (read-json replay-intent)]
+    (check! "replay-binds-the-same-disk"
+            (select-keys (:targetDisk a) [:model :transport :minBytes :maxBytes
+                                          :serialSha256 :serialSalt])
+            (select-keys (:targetDisk b) [:model :transport :minBytes :maxBytes
+                                          :serialSha256 :serialSalt]))
+    (check! "replay-binds-the-same-host-and-key"
+            [(:hostname a) (get-in a [:ssh :fingerprint]) (get-in a [:ssh :authorizedPrincipal])]
+            [(:hostname b) (get-in b [:ssh :fingerprint]) (get-in b [:ssh :authorizedPrincipal])])))
+
+;; And the replayed intent is admitted by the same verify, so the reproduction
+;; is a working intent rather than a file that merely looks like one.
+(when (.existsSync fs replay-intent)
+  (let [r (verify-intent! replay-intent target-bytes "PNY-SER-0001")]
+    (record! "replay-intent-is-admitted" (zero? (:status r))
+             (str "status=" (:status r) " " (str/trim (:out r))))))
+
+;; ---------------------------------------------------------------- summary
+
+;; ------------------------------------------ the account flow's model (ADR-0239)
+;; The identity screen's free text is what the kotoba.cloud flow binds; the
+;; slug must be stable, bounded, and refuse to name "unspecified" as a model.
+(check! "account-model-slugs-free-text" "gmktec-k16" (g/account-model "  GMKtec K16 "))
+(check! "account-model-unspecified-is-no-model" nil (g/account-model "unspecified"))
+(check! "account-model-bounded-at-63"
+        63 (count (g/account-model (apply str (repeat 70 "a")))))
+
+;; ------------------------------------------------ defaults (ADR-0240)
+;; Enter picks the one EMPTY disk among several, never one that has data, and
+;; offers nothing when two are empty -- a default between them is a guess.
+(def d-used {:path "/dev/nvme0n1" :pttype "gpt" :fstype nil :signatures-measured? true})
+(def d-fs {:path "/dev/nvme2n1" :pttype nil :fstype "ext4" :signatures-measured? true})
+(def d-empty {:path "/dev/nvme1n1" :pttype nil :fstype nil :signatures-measured? true})
+;; what lsblk alone reports without udev: fields empty, nothing measured
+(def d-unmeasured {:path "/dev/nvme3n1" :pttype nil :fstype nil})
+(check! "default-target-is-the-one-empty-disk" 2 (g/default-target [d-used d-empty d-fs]))
+(check! "default-target-none-when-two-are-empty" nil (g/default-target [d-empty d-used d-empty]))
+(check! "default-target-none-when-all-have-data" nil (g/default-target [d-used d-fs]))
+(check! "default-target-single-candidate-is-it" 1 (g/default-target [d-used]))
+(check! "unmeasured-disk-is-never-empty" false (g/blank-disk? d-unmeasured))
+(check! "default-target-ignores-unmeasured" 2 (g/default-target [d-unmeasured d-empty]))
+(check! "default-hostname-from-dmi-model" "gmktec-k16" (g/default-hostname "GMKtec K16"))
+(check! "default-hostname-without-model" "aiueos" (g/default-hostname nil))
+
+(def expected-cases 64)
+(def total (count @results))
+(def failed (filterv (complement :ok) @results))
+
+(println)
+(println "AIUEOS_GUIDED_TEST_SUMMARY"
+         (str "ran=" total)
+         (str "expected=" expected-cases)
+         (str "failed=" (count failed)))
+
+(when (seq failed)
+  (doseq [f failed] (println "  FAILED" (:name f) (:detail f))))
+
+(when (not= total expected-cases)
+  (println "  COUNT MISMATCH: a run that executed fewer cases is not a clean run"))
+
+(.exit js/process (if (and (empty? failed) (= total expected-cases)) 0 1))

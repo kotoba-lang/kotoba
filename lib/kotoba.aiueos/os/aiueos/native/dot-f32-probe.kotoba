@@ -1,0 +1,261 @@
+(ns aiueos.native.dot-f32-probe
+  ;; A TEST VARIANT of the pure-Kotoba kernel, not a second production kernel.
+  ;; It boots the same way `kernel.kotoba` does -- UEFI hands the compiler's
+  ;; loader a boot-info prefix and a memory map, the loader identity-maps the
+  ;; first GiB -- and then does one thing: fill two f32 regions with known bit
+  ;; patterns, fold them with `kernel-dot-f32`, and write the answer to the
+  ;; debug console as eight hex digits.
+  ;;
+  ;; It exists because a green compiler suite is encodings and not behaviour.
+  ;; `kernel-dot-f32` selects one of two instruction sequences at run time
+  ;; from a `cpuid`/`xgetbv` guard, and the claim that both compute the same
+  ;; number is a claim about a machine. This workstation is an Apple M4 and
+  ;; Rosetta exposes no AVX, so the machine has to be QEMU TCG: `-cpu max`
+  ;; takes the AVX2 arm and `-cpu qemu64` takes the scalar one, and the
+  ;; experiment is that the eight digits are the SAME.
+  (:export [main]))
+
+;; ---------------------------------------------------------------------------
+;; Boot-info and memory-map reading. Same shapes as `kernel.kotoba`, because
+;; the boot contract is the same one; copied rather than shared because that
+;; kernel is the shipping artifact and this must not be able to move it.
+;; ---------------------------------------------------------------------------
+
+(defn load64-boot [base offset]
+  (+ (kernel-load-u8 base 64 offset)
+     (* (kernel-load-u8 base 64 (+ offset 1)) 256)
+     (* (kernel-load-u8 base 64 (+ offset 2)) 65536)
+     (* (kernel-load-u8 base 64 (+ offset 3)) 16777216)
+     (* (kernel-load-u8 base 64 (+ offset 4)) 4294967296)
+     (* (kernel-load-u8 base 64 (+ offset 5)) 1099511627776)
+     (* (kernel-load-u8 base 64 (+ offset 6)) 281474976710656)
+     (* (kernel-load-u8 base 64 (+ offset 7)) 72057594037927936)))
+
+(defn load64 [base length offset]
+  (+ (kernel-load-u8-16k base length offset)
+     (* (kernel-load-u8-16k base length (+ offset 1)) 256)
+     (* (kernel-load-u8-16k base length (+ offset 2)) 65536)
+     (* (kernel-load-u8-16k base length (+ offset 3)) 16777216)
+     (* (kernel-load-u8-16k base length (+ offset 4)) 4294967296)
+     (* (kernel-load-u8-16k base length (+ offset 5)) 1099511627776)
+     (* (kernel-load-u8-16k base length (+ offset 6)) 281474976710656)
+     (* (kernel-load-u8-16k base length (+ offset 7)) 72057594037927936)))
+
+(defn load32 [base length offset]
+  (+ (kernel-load-u8-16k base length offset)
+     (* (kernel-load-u8-16k base length (+ offset 1)) 256)
+     (* (kernel-load-u8-16k base length (+ offset 2)) 65536)
+     (* (kernel-load-u8-16k base length (+ offset 3)) 16777216)))
+
+;; UEFI type 7 is EfiConventionalMemory, and the loader identity-maps the
+;; first GiB, so one aligned eight-page extent inside [2 MiB, 1 GiB) is a page
+;; this probe may write. Eight pages rather than the one it needs, so the
+;; admitted extent is the same one `kernel.kotoba` admits.
+(defn find-page [memory-map map-size descriptor-size offset remaining]
+  (if (or (= remaining 0)
+          (> (+ offset descriptor-size) map-size))
+    0
+    (let [memory-type (load32 memory-map map-size offset)
+          physical-start (load64 memory-map map-size (+ offset 8))
+          pages (load64 memory-map map-size (+ offset 24))]
+      (if (and (= memory-type 7)
+               (> pages 7)
+               (>= physical-start 2097152)
+               (< physical-start 1073717248)
+               (= (bit-and physical-start 4095) 0))
+        physical-start
+        (find-page memory-map map-size descriptor-size
+                   (+ offset descriptor-size) (- remaining 1))))))
+
+;; ---------------------------------------------------------------------------
+;; The vector.
+;;
+;; A = [2^24, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]   (twelve elements)
+;; B = [ 1,   1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+;;
+;; Twelve, so one eight-element block runs and a four-element tail follows it.
+;; 2^24 is the largest integer after which binary32 spacing becomes 2, so each
+;; 1 added to it in isolation rounds away and each pair of 1s does not. That
+;; is what makes the ANSWER name the tree:
+;;
+;;   0x4B800004  four lanes, lower before upper, (s0+s1)+(s2+s3), scalar tail
+;;   0x4B800000  a straight left-to-right sum -- every 1 lost into the gap
+;;
+;; So the digits below are not merely "a plausible dot product": a sequence
+;; that summed in a different order prints different ones.
+;; ---------------------------------------------------------------------------
+
+(defn fill-ones [page offset remaining]
+  (if (= remaining 0)
+    1
+    (let [written (kernel-store-u32-4k page 4096 offset 1065353216)]
+      (fill-ones page (+ offset 4) (- remaining 1)))))
+
+;; `kernel-dot-f32` in a function of its own, because `main` calls other
+;; functions and therefore leaves the machine-IR pilot path -- and this
+;; operation lives only on that path. Both bases arrive as PARAMETERS, which
+;; is what makes the caller responsible for their provenance (kotoba-sema
+;; ADR 0006: the second base is checked at position 2, not merely position 0).
+(defn dot12 [a-base b-base]
+  (kernel-dot-f32 a-base 48 b-base 48 12))
+
+;; ---------------------------------------------------------------------------
+;; The control.
+;;
+;; "Both machines printed the same digits" says nothing unless the two machines
+;; DIFFER in the bit the guard tests. If QEMU exposed AVX2 under both models,
+;; both runs would take the vector arm and the agreement would be between a
+;; sequence and itself.
+;;
+;; So the probe reports what the guard reports about, as one hex nibble:
+;;
+;;   bit 0  leaf 1 ECX[27]  OSXSAVE   -- the OS has enabled XSAVE
+;;   bit 1  leaf 1 ECX[28]  AVX
+;;   bit 2  leaf 7 EBX[5]   AVX2
+;;   bit 3  XCR0 & 6 == 6             -- the OS saves SSE and YMM state
+;;
+;; The two `cpuid` orderings the guard depends on are kept here, because they
+;; are properties of the SEQUENCE and no single operator can enforce them:
+;; leaf 7 is read only when leaf 0 says it exists, and `xgetbv` is reached only
+;; when OSXSAVE is set -- it raises #UD otherwise, which in a kernel is a
+;; self-inflicted fault in the middle of feature detection.
+(defn cpu-features []
+  (let [max-leaf (kernel-cpuid-eax 0 0)
+        ecx1 (kernel-cpuid-ecx 1 0)
+        osxsave (if (= (bit-and ecx1 134217728) 0) 0 1)
+        avx (if (= (bit-and ecx1 268435456) 0) 0 1)
+        avx2 (if (< max-leaf 7)
+               0
+               (if (= (bit-and (kernel-cpuid-ebx 7 0) 32) 0) 0 1))
+        xcr-ok (if (= osxsave 0)
+                 0
+                 (if (= (bit-and (kernel-xgetbv 0) 6) 6) 1 0))]
+    (+ osxsave (* 2 avx) (* 4 avx2) (* 8 xcr-ok))))
+
+;; ---------------------------------------------------------------------------
+;; xsave: enabling the state the guard asks about.
+;;
+;; The block below is the whole reason this probe was rewritten. Measured
+;; 2026-09-02, the first version of it: under `-cpu max` the CPU reports AVX and
+;; AVX2 and `CR4.OSXSAVE` is CLEAR, because nothing in a pure-Kotoba kernel
+;; could set it -- so the guard refused the vector arm on a machine that has
+;; AVX2, correctly, and the probe compared the scalar arm against itself.
+;;
+;; Three ordered steps, and every one of them faults if taken out of order:
+;;
+;;   1. `cpuid` leaf 1 ECX bit 26 (XSAVE, 0x4000000). Setting CR4.OSXSAVE on a
+;;      CPU without XSAVE raises #GP.
+;;   2. CR4 |= OSFXSR (9) | OSXMMEXCPT (10) | OSXSAVE (18) = 0x40600 = 263680.
+;;   3. XCR0 |= SSE (1) | YMM (2) = 6. Bit 0 (x87) is always set and cannot be
+;;      cleared, so the register reads back 7. `xsetbv` raises #UD while
+;;      CR4.OSXSAVE is clear, which is why step 2 comes first.
+;;
+;; BOTH writes are read-modify-write, and that is not style. CR4 already holds
+;; bits the UEFI loader set -- PAE, PGE, possibly SMEP -- and XCR0 already holds
+;; whatever the firmware left. `(kernel-write-cr4 263680)` compiles, runs, and
+;; clears all of them without faulting anywhere near the instruction that did
+;; it. This is the same reason kotoba-kir refuses to model either register.
+;;
+;; The answer is 1 when the state was enabled and 0 when the CPU has no XSAVE
+;; at all. Zero is not an error: `-cpu qemu64` is a plain x86-64 with SSE2 and
+;; that is exactly what the control run needs it to be.
+(defn enable-extended-state []
+  (if (= (bit-and (kernel-cpuid-ecx 1 0) 67108864) 0)
+    0
+    (let [cr4 (kernel-write-cr4 (bit-or (kernel-read-cr4) 263680))]
+      (let [xcr0 (kernel-xsetbv 0 (bit-or (kernel-xgetbv 0) 6))]
+        1))))
+
+(defn hex-digit [value]
+  (if (< value 10) (+ 48 value) (+ 55 value)))
+
+(defn emit-digit [value divisor]
+  (kernel-out-u8 233 (hex-digit (bit-and (quot value divisor) 15))))
+
+(defn emit-u32 [value]
+  (let [d7 (emit-digit value 268435456)
+        d6 (emit-digit value 16777216)
+        d5 (emit-digit value 1048576)
+        d4 (emit-digit value 65536)
+        d3 (emit-digit value 4096)
+        d2 (emit-digit value 256)
+        d1 (emit-digit value 16)
+        d0 (emit-digit value 1)]
+    1))
+
+(defn main []
+  (let [boot (kernel-boot-info)
+        map-size (load64-boot boot 24)
+        descriptor-size (load64-boot boot 32)
+        memory-map (kernel-subregion boot 16448 64 16384)]
+    (if (and (> boot 0)
+             (= (kernel-load-u8 boot 64 0) 65)
+             (= (kernel-load-u8 boot 64 1) 73)
+             (= (kernel-load-u8 boot 64 2) 85)
+             (= (kernel-load-u8 boot 64 3) 69)
+             (> descriptor-size 0)
+             (> map-size descriptor-size))
+      (let [physical-start (find-page memory-map map-size descriptor-size 0 410)]
+        (if (> physical-start 0)
+          ;; The literal parent names the loader's identity-mapped physical
+          ;; window, exactly as `kernel.kotoba` does; the offset is checked.
+          (let [page (kernel-subregion 4096 1073737728 (- physical-start 4096) 4096)
+                ;; A at offset 0, B at offset 64. B's base is a CHECKED
+                ;; narrowing rather than `(+ page 64)`, which the provenance
+                ;; rule refuses.
+                b-page (kernel-subregion page 4096 64 48)
+                head (kernel-store-u32-4k page 4096 0 1266679808)
+                a-tail (fill-ones page 4 11)
+                b-all (fill-ones page 64 12)
+                ;; Read two of the words back rather than trusting what a
+                ;; store LEAVES IN A REGISTER. That is a property of the
+                ;; lowering and not of the memory: measured 2026-09-02, this
+                ;; probe's first version asserted the store's own result and
+                ;; exited 43 while printing the right digits. What the check
+                ;; is for is that the region really holds the pattern the
+                ;; answer was computed from, and a read-back says that.
+                check-a0 (kernel-load-u32-4k page 4096 0)
+                check-b0 (kernel-load-u32-4k page 4096 64)
+                ;; xsave: enable BEFORE the fold, because the guard inside
+                ;; `kernel-dot-f32` reads CR4 and XCR0 at the moment it runs.
+                enabled (enable-extended-state)
+                sum (dot12 page b-page)
+                ;; Two nibbles, and the first one is new. `enabled` says
+                ;; whether this run TRIED to turn the state on; `cpu-features`
+                ;; says what the machine reports AFTERWARDS. Reporting only
+                ;; the second would leave "the enable ran and did nothing"
+                ;; and "the CPU has no XSAVE" printing the same digit.
+                enabled-digit (emit-digit enabled 1)
+                features (emit-digit (cpu-features) 1)
+                printed (emit-u32 (bit-and sum 4294967295))
+                m0 (kernel-out-u8 233 68)
+                m1 (kernel-out-u8 233 79)
+                m2 (kernel-out-u8 233 84)]
+            ;; One exit value per check, so a mismatch names itself rather
+            ;; than collapsing into a single "something was wrong". QEMU's
+            ;; isa-debug-exit reports (value << 1) | 1, so 16 -> 33.
+            (kernel-out-u32 244
+                            (if (and (= check-a0 1266679808)
+                                     (= check-b0 1065353216))
+                              (if (= a-tail 1)
+                                (if (= b-all 1)
+                                  (if (= printed 1)
+                                    (if (and (= m0 68) (= m1 79) (= m2 84)
+                                             ;; `emit-digit` answers with the
+                                             ;; ASCII byte it wrote, so this
+                                             ;; is "a hex digit reached the
+                                             ;; console", 0-9 or A-F.
+                                             (> features 47)
+                                             (< features 71)
+                                             ;; xsave: the enable answered 0
+                                             ;; or 1 -- ASCII 48 or 49 -- and
+                                             ;; nothing else.
+                                             (> enabled-digit 47)
+                                             (< enabled-digit 50))
+                                      16 25)
+                                    24)
+                                  23)
+                                22)
+                              21)))
+          (kernel-out-u32 244 18)))
+      (kernel-out-u32 244 19))))

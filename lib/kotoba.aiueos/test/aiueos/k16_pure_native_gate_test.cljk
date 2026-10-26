@@ -1,0 +1,324 @@
+(ns aiueos.k16-pure-native-gate-test
+  "The K16 pure-native gate, shown in both directions (ADR-0131).
+
+  Every negative here pins the REASON LITERAL, not just the exit code. A gate
+  that goes red for a different cause than the one under test has not
+  discriminated anything -- root ADR-2608136000's sixth question -- and this
+  namespace is where that claim is kept honest: `object-sha256-mismatch` and
+  `sections` are both exit 3, and confusing them would hide the difference
+  between a swapped object and a C object."
+  (:require [kotoba.io :as kio] [clojure.edn :as edn]
+            [clojure.java.io :as io]
+            [clojure.java.shell :as shell]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]])
+  (:import (java.nio ByteBuffer ByteOrder)
+           (java.security MessageDigest)))
+
+(def repo (System/getProperty "user.dir"))
+(def kotoba-dir (io/file repo "os" "aiueos" "kotoba"))
+(def gate (str (io/file repo "os" "aiueos" "scripts" "k16-pure-native-gate.cljk")))
+(def amu-sha "9cf3a0ac07a1fb0d735a460230a7e5e9c97bc6a7")
+(def target "x86_64-aiueos-kernel-v1")
+
+;; --- running the gate ------------------------------------------------------
+
+(defn- on-path? [tool]
+  (some (fn [d] (let [f (io/file d tool)] (and (.isFile f) (.canExecute f))))
+        (str/split (or (System/getenv "PATH") "") #":")))
+
+(def nbb? (on-path? "nbb"))
+(def zig? (on-path? "zig"))
+
+(defn- run-gate
+  "Returns {:exit n :out s}. `nbb` absent is NOT a pass: every deftest below
+  asserts `nbb?` first, so a machine without it reports an unrun check rather
+  than a clean one."
+  [& args]
+  (let [r (apply shell/sh "nbb" gate (concat args ["--root" repo]))]
+    {:exit (:exit r) :out (str (:out r) (:err r))}))
+
+(defn- sha256 [^bytes b]
+  (->> (.digest (MessageDigest/getInstance "SHA-256") b)
+       (map #(format "%02x" %))
+       (apply str)))
+
+(defn- bytes-of [f] (kio/read-all-bytes (io/file f)))
+
+(defn- tmpdir [] (kio/temp-dir "aiueos-k16-gate"))
+
+(defn- spit-list [dir paths]
+  (let [f (io/file dir "link-list.txt")]
+    (spit f (str/join "\n" paths))
+    (str f)))
+
+(defn- spit-manifest [dir entries]
+  (let [f (io/file dir "provenance.edn")]
+    (spit f (pr-str {:format :aiueos.kotoba-object-provenance/v1
+                     :target target
+                     :objects entries}))
+    (str f)))
+
+;; --- committed objects and their synthesized receipts ----------------------
+
+(def committed-objects
+  (->> (.listFiles kotoba-dir)
+       (filter #(str/ends-with? (.getName %) ".o"))
+       (sort-by #(.getName %))
+       vec))
+
+;; `ecdsa-p256-public.o` has no sibling source and is not sourceless:
+;; `ecdsa-p256-sign.kotoba` defines both exports (ADR-0129).
+;; `sha256.o`/`digest-equal.o` kept their names but their sources MOVED to
+;; `aiueos/sha256.kotoba` / `aiueos/digest_equal.kotoba` (bd8908b, ADR-0141);
+;; the stem-derived defaults no longer exist on disk, which is the
+;; NoSuchFileException this gate errored with in CI.
+(def source-overrides {"ecdsa-p256-public.o" "ecdsa-p256-sign.kotoba"
+                       "sha256.o" "aiueos/sha256.kotoba"
+                       "digest-equal.o" "aiueos/digest_equal.kotoba"})
+
+(defn- synthesized-receipt
+  "What a fully attested object's receipt looks like: a Kotoba source, both
+  digests, and a compiler revision. Synthesized here rather than read from
+  the committed manifest on purpose -- the positive case must answer 'does a
+  correct receipt admit a committed object', which is a different question
+  from 'is every committed object attested today' (it is not: see
+  `the-committed-manifest-refuses-the-objects-whose-producer-is-unrecorded`)."
+  [^java.io.File o]
+  (let [stem (subs (.getName o) 0 (- (count (.getName o)) 2))
+        src-name (get source-overrides (.getName o) (str stem ".kotoba"))
+        src (io/file kotoba-dir src-name)]
+    {:source (str "lib/kotoba.aiueos/os/aiueos/kotoba/" src-name)
+     :source-sha256 (sha256 (bytes-of src))
+     :object-sha256 (sha256 (bytes-of o))
+     :target target
+     :compiler {:repo "kotoba-lang/amu" :sha amu-sha}}))
+
+(defn- synthesized-manifest []
+  (into {} (map (juxt #(.getName %) synthesized-receipt) committed-objects)))
+
+;; --- minimal ELF surgery, for the negatives that need a specific defect ----
+;;
+;; Only what a single mutation needs: the section table, and the symbol table
+;; inside it. Deliberately NOT a second copy of the gate's parser -- if this
+;; grew into one, a bug shared by both would read as agreement.
+
+(defn- section-table [^bytes b]
+  (let [bb (doto (ByteBuffer/wrap b) (.order ByteOrder/LITTLE_ENDIAN))
+        shoff (.getLong bb 40)
+        shnum (.getShort bb 60)]
+    (mapv (fn [i]
+            (let [o (+ shoff (* i 64))]
+              {:index i
+               :name-off (.getInt bb (int o))
+               :type (.getInt bb (int (+ o 4)))
+               :offset (.getLong bb (int (+ o 24)))
+               :size (.getLong bb (int (+ o 32)))
+               :entsize (.getLong bb (int (+ o 56)))
+               :header-offset o}))
+          (range shnum))))
+
+(defn- shstrtab-offset [^bytes b]
+  (let [bb (doto (ByteBuffer/wrap b) (.order ByteOrder/LITTLE_ENDIAN))
+        idx (.getShort bb 62)]
+    (:offset (nth (section-table b) idx))))
+
+(defn- section-named [^bytes b nm]
+  (let [base (shstrtab-offset b)]
+    (first (filter (fn [s]
+                     (let [start (+ base (:name-off s))
+                           end (loop [i start] (if (zero? (aget b i)) i (recur (inc i))))]
+                       (= nm (String. b (int start) (int (- end start)) "US-ASCII"))))
+                   (section-table b)))))
+
+(defn- rename-data-section
+  "Replace the section name `.data` with `.xdata`-shaped garbage of the same
+  length. One byte changes; the section SET is what the gate must object to."
+  [^bytes b]
+  (let [copy (java.util.Arrays/copyOf b (alength b))
+        s (section-named b ".data")
+        at (+ (shstrtab-offset b) (:name-off s))]
+    (aset-byte copy (int (inc at)) (byte (int \x)))   ; ".data" -> ".xata"
+    copy))
+
+(defn- patch-export-to-undef [^bytes b]
+  (let [copy (java.util.Arrays/copyOf b (alength b))
+        bb (doto (ByteBuffer/wrap copy) (.order ByteOrder/LITTLE_ENDIAN))
+        symtab (first (filter #(= 2 (:type %)) (section-table b)))
+        n (quot (:size symtab) 24)
+        ;; the single GLOBAL FUNC entry (st_info 0x12)
+        i (first (filter (fn [i] (= 0x12 (bit-and 0xff (aget copy (int (+ (:offset symtab) (* i 24) 4))))))
+                         (range n)))]
+    (when i
+      (.putShort bb (int (+ (:offset symtab) (* i 24) 6)) (short 0)))
+    (when-not i (throw (ex-info "no GLOBAL FUNC symbol to undefine" {})))
+    copy))
+
+(defn- write-object [dir nm ^bytes b]
+  (let [f (io/file dir nm)]
+    (io/copy b f)
+    (str f)))
+
+;; --- the assertions --------------------------------------------------------
+
+(deftest the-committed-kotoba-objects-are-admitted-with-correct-receipts
+  (is nbb? "nbb must be on PATH; a gate that could not run is not a gate that passed")
+  (when nbb?
+    (let [dir (tmpdir)
+          n (count committed-objects)
+          list-file (spit-list dir (map #(str "lib/kotoba.aiueos/os/aiueos/kotoba/" (.getName %)) committed-objects))
+          manifest (spit-manifest dir (synthesized-manifest))
+          {:keys [exit out]} (run-gate "--link-list" list-file "--provenance" manifest)]
+      (is (pos? n) "SCANNED 0 is never a pass")
+      (is (zero? exit) out)
+      (is (str/includes? out (str "AIUEOS_K16_PURE_NATIVE_OK scanned=" n))
+          (str "expected all " n " committed objects admitted\n" out))
+      (is (str/includes? out "foreign=0 unattested=0") out)
+      (is (str/includes? out (str "SCANNED\t" n)) out))))
+
+(deftest an-empty-link-list-is-unanswered-not-clean
+  (is nbb?)
+  (when nbb?
+    (let [dir (tmpdir)
+          list-file (spit-list dir [])
+          manifest (spit-manifest dir {})
+          {:keys [exit out]} (run-gate "--link-list" list-file "--provenance" manifest)]
+      (is (= 2 exit) (str "empty input must be exit 2, not 0 or 3\n" out))
+      (is (str/includes? out "UNANSWERED nothing-to-gate reason=empty-link-list") out))))
+
+(deftest a-link-input-that-is-not-on-disk-is-unanswered
+  (is nbb?)
+  (when nbb?
+    (let [dir (tmpdir)
+          list-file (spit-list dir ["os/aiueos/kotoba/there-is-no-such.o"])
+          manifest (spit-manifest dir {})
+          {:keys [exit out]} (run-gate "--link-list" list-file "--provenance" manifest)]
+      (is (= 2 exit) out)
+      (is (str/includes? out "reason=link-input-absent") out))))
+
+(deftest an-object-with-no-receipt-is-refused
+  (is nbb?)
+  (when nbb?
+    (let [dir (tmpdir)
+          o (first committed-objects)
+          list-file (spit-list dir [(str "lib/kotoba.aiueos/os/aiueos/kotoba/" (.getName o))])
+          manifest (spit-manifest dir {})
+          {:keys [exit out]} (run-gate "--link-list" list-file "--provenance" manifest)]
+      (is (= 3 exit) out)
+      (is (str/includes? out "reason=receipt-missing") out)
+      (is (str/includes? out "foreign=1") out))))
+
+(deftest an-object-whose-digest-does-not-match-its-receipt-is-refused
+  (is nbb?)
+  (when nbb?
+    (let [dir (tmpdir)
+          o (first committed-objects)
+          receipt (assoc (synthesized-receipt o) :object-sha256 (apply str (repeat 64 "0")))
+          list-file (spit-list dir [(str "lib/kotoba.aiueos/os/aiueos/kotoba/" (.getName o))])
+          manifest (spit-manifest dir {(.getName o) receipt})
+          {:keys [exit out]} (run-gate "--link-list" list-file "--provenance" manifest)]
+      (is (= 3 exit) out)
+      (is (str/includes? out "reason=object-sha256-mismatch")
+          (str "a swapped object must not read as a section-set violation\n" out)))))
+
+(deftest an-object-with-an-undefined-symbol-is-refused
+  (is nbb?)
+  (when nbb?
+    (let [dir (tmpdir)
+          o (io/file kotoba-dir "kernel-probe.o")
+          patched (patch-export-to-undef (bytes-of o))
+          p (write-object dir "kernel-probe.o" patched)
+          receipt (assoc (synthesized-receipt o) :object-sha256 (sha256 patched))
+          list-file (spit-list dir [p])
+          manifest (spit-manifest dir {"kernel-probe.o" receipt})
+          {:keys [exit out]} (run-gate "--link-list" list-file "--provenance" manifest)]
+      (is (not= (seq (bytes-of o)) (seq patched)) "the fixture must actually differ")
+      (is (= 3 exit) out)
+      (is (str/includes? out "reason=undefined-symbol")
+          (str "one st_shndx set to SHN_UNDEF must be reported as an import\n" out)))))
+
+(deftest an-object-whose-section-set-is-wrong-is-refused
+  (is nbb?)
+  (when nbb?
+    (let [dir (tmpdir)
+          o (io/file kotoba-dir "kernel-probe.o")
+          patched (rename-data-section (bytes-of o))
+          p (write-object dir "kernel-probe.o" patched)
+          receipt (assoc (synthesized-receipt o) :object-sha256 (sha256 patched))
+          list-file (spit-list dir [p])
+          manifest (spit-manifest dir {"kernel-probe.o" receipt})
+          {:keys [exit out]} (run-gate "--link-list" list-file "--provenance" manifest)]
+      (is (not= (seq (bytes-of o)) (seq patched)) "the fixture must actually differ")
+      (is (= 3 exit) out)
+      (is (str/includes? out "reason=sections") out))))
+
+(deftest an-object-compiled-from-c-is-refused
+  ;; The case the profile exists for. Compiling a fixture is allowed -- what
+  ;; the profile forbids is SHIPPING one -- and this uses a C file the repo
+  ;; already carries rather than adding one.
+  (is nbb?)
+  (is zig? "zig must be on PATH; the real-C negative cannot be measured without it")
+  (when (and nbb? zig?)
+    (let [dir (tmpdir)
+          obj (str (io/file dir "framebuffer.o"))
+          c (str (io/file repo "os" "aiueos" "kernel" "framebuffer.c"))
+          r (shell/sh "zig" "cc" "-target" "x86_64-freestanding-none" "-std=c11" "-O2"
+                      "-ffreestanding" "-fno-stack-protector" "-mno-red-zone"
+                      "-c" "-o" obj c)]
+      (is (zero? (:exit r)) (str "zig cc failed: " (:err r)))
+      (when (zero? (:exit r))
+        (let [b (bytes-of obj)
+              sha (sha256 b)
+              list-file (spit-list dir [obj])]
+          (testing "a receipt that names the .c refuses on the source"
+            (let [manifest (spit-manifest
+                            dir {"framebuffer.o"
+                                 {:source "lib/kotoba.aiueos/os/aiueos/kernel/framebuffer.c"
+                                  :source-sha256 (sha256 (bytes-of c))
+                                  :object-sha256 sha
+                                  :target target
+                                  :compiler {:repo "kotoba-lang/amu" :sha amu-sha}}})
+                  {:keys [exit out]} (run-gate "--link-list" list-file "--provenance" manifest)]
+              (is (= 3 exit) out)
+              (is (str/includes? out "reason=c-source") out)
+              (is (str/includes? out "REFUSED foreign-code: ") out)))
+          (testing "a receipt that LIES and claims a .kotoba source still refuses"
+            ;; The threat model. Provenance alone cannot be trusted, so the
+            ;; ELF must be read: a C object carries sections a Kotoba kernel
+            ;; object never has.
+            (let [src (io/file kotoba-dir "kernel-probe.kotoba")
+                  manifest (spit-manifest
+                            dir {"framebuffer.o"
+                                 {:source "lib/kotoba.aiueos/os/aiueos/kotoba/kernel-probe.kotoba"
+                                  :source-sha256 (sha256 (bytes-of src))
+                                  :object-sha256 sha
+                                  :target target
+                                  :compiler {:repo "kotoba-lang/amu" :sha amu-sha}}})
+                  {:keys [exit out]} (run-gate "--link-list" list-file "--provenance" manifest)]
+              (is (= 3 exit) out)
+              (is (str/includes? out "reason=sections")
+                  (str "a lying receipt must be caught by the section set\n" out)))))))))
+
+(deftest the-committed-manifest-refuses-the-objects-whose-producer-is-unrecorded
+  ;; Measured, not asserted at a number typed here: the manifest states which
+  ;; objects it cannot attribute, and the gate must refuse exactly those.
+  (is nbb?)
+  (when nbb?
+    (let [dir (tmpdir)
+          manifest-path (str (io/file kotoba-dir "provenance.edn"))
+          manifest (edn/read-string (slurp manifest-path))
+          unrecorded (set (:unrecorded manifest))
+          list-file (spit-list dir (map #(str "lib/kotoba.aiueos/os/aiueos/kotoba/" (.getName %)) committed-objects))
+          receipt-out (str (io/file dir "receipt.edn"))
+          {:keys [exit out]} (run-gate "--link-list" list-file "--provenance" manifest-path
+                                       "--receipt-out" receipt-out)
+          receipt (edn/read-string (slurp receipt-out))]
+      (is (= (count committed-objects) (:scanned receipt)) out)
+      (is (zero? (:foreign receipt))
+          (str "no committed Kotoba object is C-derived or malformed\n" out))
+      (is (= (count unrecorded) (:unattested receipt))
+          (str "the manifest and the gate must agree on which objects are unattested\n" out))
+      (is (= (if (seq unrecorded) 3 0) exit) out)
+      (is (= {:c-sources [] :foreign-objects [] :imports [] :dynamic-dependencies []}
+             (:foreign-code-receipt receipt))
+          "the foreign-code receipt shape mirrors kotoba-lang lang/value-runtime-native.edn"))))

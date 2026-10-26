@@ -1,0 +1,515 @@
+(ns aiueos.qwen35-attention
+  (:export [aiueos-qwen35-attention main]))
+
+;; The arithmetic of `full_attention` (`kernel/qwen35_infer.c:684`) as one
+;; kernel object: the query/gate de-interleave (:707), the **fused softmax**
+;; over the KV cache (:733-780), and the position-zero reduction (:791-802).
+;;
+;; ## What is here and what is NOT
+;;
+;; | `full_attention` does | where it lives |
+;; |---|---|
+;; | `rms_norm`, `rms_norm_heads_weighted` | `aiueos-qwen35-norm` (ADR-0148) |
+;; | four `matvec` calls | `aiueos-qwen35-matvec` (ADR-0147) |
+;; | de-interleave, softmax, position-zero reduction | **here** |
+;; | `rope_heads` | stays in C -- `local_sincos` is the x87 `fsincos` |
+;; | the KV cache write, its FNV hash, `resolved_cached_key` | stays in C |
+;;
+;; `rope_heads` is not a schedule item: on x86-64 the C's sine and cosine come
+;; from the **`fsincos` instruction**, Amu emits no x87, and there is no
+;; polynomial to transcribe because the C is not using one. A Kotoba rope could
+;; not be bit-compatible by construction (ADR-0148).
+;;
+;; The cache is left in C for a different reason: `resolved_cached_key` (:542)
+;; is custody, not arithmetic -- an FNV hash, a shadow copy and a repair. This
+;; object reads the cache the C has already resolved, which is what
+;; `resolved_cached_key` returns on every path that does not fail.
+;;
+;; ## Modes
+;;
+;;   0  de-interleave       out[h*D + i] = qg[h*2D + i]
+;;   1  cached softmax      the whole `if (decode->position)` head loop
+;;   2  position zero       out[h*D + i] = value[vh*D + i] * sigmoid(gate)
+;;
+;; One object rather than three because all three walk the same interleaved
+;; `[query gate]` buffer with the same head geometry, and because the low
+;; region of the K16 image cannot hold an object per loop.
+;;
+;; ## One arena, one plan
+;;
+;; Six regions and a head geometry against a five-argument ABI, and
+;; `kernel-subregion` requires its BASE to be a parameter, a literal or
+;; `kernel-boot-info`. So the caller places everything in one region and
+;; describes it in a 96-byte plan. Offsets are 64-bit: the decode workspace sits
+;; above the model mapping and a u32 slot would truncate silently.
+;;
+;;     0   mode, 0..2                              u32
+;;     4   reserved, must be zero                  u32
+;;     8   heads                                   u64  1..64
+;;    16   head dimension, must be 256             u64
+;;    24   output base (`scratch_c`)               u64  modes 0 and 2
+;;    32   query/gate base (`scratch_a`)           u64  all modes
+;;    40   mode 1: key cache / mode 2: values      u64
+;;    48   mode 1: value cache                     u64
+;;    56   mode 1: query base (`scratch_c`)        u64
+;;    64   kv width, must be 1024 in mode 1        u64
+;;    72   heads per kv head                       u64  modes 1 and 2
+;;    80   position, 1..7 in mode 1                u64
+;;    88   scratch base, 128 bytes, mode 1         u64
+;;
+;; The two cache regions are `(position + 1) * kv-width * 4` bytes -- exactly
+;; the causal prefix this call reads. `decode->full_key` reserves eight
+;; positions per slot; a bound that named eight would admit a plan whose slot
+;; does not have them.
+;;
+;; A slot a mode does not use must be zero, so a plan built for one mode cannot
+;; be handed to another and quietly address something.
+;;
+;; ### Why the head dimension and the KV width are FIXED
+;;
+;; 256 and 1024 are not defaults, they are requirements. The de-interleave
+;; stride is `2 * head-dim`, the gate of head `h` sits at `h*2D + D`, the
+;; four-accumulator score has no tail when `D` is a multiple of four, and a
+;; cache row is `kv-width * 4` bytes. Admitting other values would mean
+;; writing four paths this object has no vector for. The tail loop of
+;; `stable_attention_score` (:126) is therefore NOT ported: at `D = 256` it
+;; runs zero times.
+;;
+;; ## Return
+;;
+;; **Zero is the success value.**
+;;
+;;    0    every head was written
+;;   -1    null arena
+;;   -2    null plan
+;;   -3    plan length is not 96
+;;   -4    a slot this mode does not use is non-zero
+;;   -5    mode outside 0..2
+;;   -6    heads outside 1..64
+;;   -7    head dimension is not 256
+;;   -8    kv width is not 1024, or heads-per-kv-head outside 1..heads
+;;   -9    position outside 1..7
+;;  -10    a region runs past the arena
+;;  -11    a query was non-finite            (`FULL_QUERY`, :737)
+;;  -12    a key or a score was non-finite   (`FULL_SOFTMAX`, :748)
+;;  -13    the denominator was not positive, or not finite (:761)
+;;
+;; ## THE SCORE ACCUMULATES IN f64 AND IN FOUR LANES
+;;
+;; `stable_attention_score` (:115) widens each binary32 factor to binary64 and
+;; reduces in four accumulators, `(sum0 + sum1) + (sum2 + sum3)`. That is
+;; `dot_scalar`'s tree, not `dot_avx2`'s left-to-right one -- the same choice
+;; ADR-0147 had to make for `aiueos-qwen35-dot-f32`, and the C has two answers
+;; here as well. The softmax exponent is then computed in binary32 and the
+;; denominator accumulates in binary32.
+;;
+;; ## The gate temporary is NOT ported, and that is a proof rather than a guess
+;;
+;; The C copies each head's gate into `scratch_b[FULL_GATE_TEMP_OFFSET..]`
+;; before writing the output, "in case" the output overwrites it. It cannot:
+;; head `h`'s output occupies `[h*D, (h+1)*D)` and its gate begins at
+;; `h*2D + D`, and `h*2D + D >= (h+1)*D` for every `h >= 0` with equality only
+;; at `h = 0`. Every gate is therefore still intact when it is read, and the
+;; copy moves a float without rounding it. The object reads the gate in place.
+
+;; --------------------------------------------------------------- word helpers
+
+(defn f32w [u]
+  (if (> u 2147483647) (- u 4294967296) u))
+
+(defn u32w [v]
+  (bit-and v 4294967295))
+
+(defn plan-u32 [plan slot]
+  (kernel-load-u32 plan 96 slot))
+
+(defn plan-u64 [plan slot]
+  (+ (kernel-load-u32 plan 96 slot)
+     (* 4294967296 (kernel-load-u32 plan 96 (+ slot 4)))))
+
+;; `finite_float` (:92): the exponent field is not all ones.
+(defn nonfinite [bits]
+  (if (= (bit-and (u32w bits) 2139095040) 2139095040) 1 0))
+
+;; A 256-element binary32 vector, addressed four bytes at a time so every load
+;; stays inside the 512-byte window tier whatever the parent region's size.
+(defn vec-at [r i]
+  (f32w (kernel-load-u32 (kernel-subregion r 1024 (* i 4) 4) 4 0)))
+
+(defn vec-put [r i bits]
+  (kernel-store-u32 (kernel-subregion r 1024 (* i 4) 4) 4 0 (u32w bits)))
+
+(defn any-nonfinite [r i]
+  (if (>= i 256)
+    0
+    (if (= 1 (nonfinite (vec-at r i)))
+      1
+      (any-nonfinite r (+ i 1)))))
+
+;; -------------------------------------------------------------- `local_exp`
+
+(defn pow2 [k]
+  (if (= k 0) 1 (if (= k 1) 2 (if (= k 2) 4 (if (= k 3) 8 (if (= k 4) 16
+  (if (= k 5) 32 (if (= k 6) 64 (if (= k 7) 128 (if (= k 8) 256
+  (if (= k 9) 512 (if (= k 10) 1024 (if (= k 11) 2048 (if (= k 12) 4096
+  (if (= k 13) 8192 (if (= k 14) 16384 (if (= k 15) 32768 (if (= k 16) 65536
+  (if (= k 17) 131072 (if (= k 18) 262144 (if (= k 19) 524288
+  (if (= k 20) 1048576 (if (= k 21) 2097152 (if (= k 22) 4194304
+  (if (= k 23) 8388608 0)))))))))))))))))))))))))
+
+(defn trunc-magnitude [b]
+  (let [e (- (bit-and (quot b 8388608) 255) 127)]
+    (if (< e 0) 0
+      (if (> e 23) 0
+        (quot (bit-or (bit-and b 8388607) 8388608) (pow2 (- 23 e)))))))
+
+(defn trunc-f32 [bits]
+  (let [b (bit-and bits 4294967295)]
+    (if (>= b 2147483648)
+      (- 0 (trunc-magnitude (- b 2147483648)))
+      (trunc-magnitude b))))
+
+(defn exp-poly [r]
+  (f32-to-bits
+   (f32-add
+    (f32-add (f32-from-bits 1065353216) (f32-from-bits r))
+    (f32-mul (f32-mul (f32-from-bits r) (f32-from-bits r))
+             (f32-add (f32-from-bits 1056964608)
+                      (f32-mul (f32-from-bits r)
+                               (f32-add (f32-from-bits 1042983595)
+                                        (f32-mul (f32-from-bits r)
+                                                 (f32-add (f32-from-bits 1026206379)
+                                                          (f32-mul (f32-from-bits r)
+                                                                   (f32-add (f32-from-bits 1007192198)
+                                                                            (f32-mul (f32-from-bits r)
+                                                                                     (f32-from-bits 985009044)))))))))))))
+
+(defn exp-from [x e]
+  (f32-to-bits
+   (f32-mul (f32-from-bits (exp-poly (f32-to-bits
+                                      (f32-sub (f32-from-bits x)
+                                               (f32-mul (i64-to-f32-rounded e)
+                                                        (f32-from-bits 1060205080))))))
+            (f32-from-bits (f32w (u32w (* (+ e 127) 8388608)))))))
+
+(defn exp-clamped [x]
+  (exp-from x
+            (let [s (f32-to-bits (f32-mul (f32-from-bits x) (f32-from-bits 1069066811)))]
+              (if (f32-ge (f32-from-bits s) (f32-from-bits 0))
+                (trunc-f32 (f32-to-bits (f32-add (f32-from-bits s) (f32-from-bits 1056964608))))
+                (trunc-f32 (f32-to-bits (f32-sub (f32-from-bits s) (f32-from-bits 1056964608))))))))
+
+(defn local-exp [x]
+  (if (f32-le (f32-from-bits x) (f32-from-bits -1028784128))
+    0
+    (if (f32-ge (f32-from-bits x) (f32-from-bits 1118830592))
+      (exp-clamped 1118830592)
+      (exp-clamped x))))
+
+(defn sigmoid [x]
+  (if (f32-ge (f32-from-bits x) (f32-from-bits 0))
+    (f32-to-bits (f32-div (f32-from-bits 1065353216)
+                          (f32-add (f32-from-bits 1065353216)
+                                   (f32-from-bits (local-exp (f32-to-bits (f32-neg (f32-from-bits x))))))))
+    (f32-to-bits (f32-div (f32-from-bits (local-exp x))
+                          (f32-add (f32-from-bits 1065353216) (f32-from-bits (local-exp x)))))))
+
+;; --------------------------------------------------------------- the scratch
+;;
+;;     0..63    eight binary64 attention scores
+;;    64..95    eight binary32 softmax weights
+;;    96..103   the running maximum, binary64
+;;   104..107   the denominator, binary32
+;;   108..127   reserved
+
+(defn scr-score [scr prior]
+  (kernel-load-u64 (kernel-subregion scr 128 (* prior 8) 8) 8 0))
+
+(defn scr-score-put [scr prior bits]
+  (kernel-store-u64 (kernel-subregion scr 128 (* prior 8) 8) 8 0 bits))
+
+(defn scr-beta [scr prior]
+  (f32w (kernel-load-u32 (kernel-subregion scr 128 (+ 64 (* prior 4)) 4) 4 0)))
+
+(defn scr-beta-put [scr prior bits]
+  (kernel-store-u32 (kernel-subregion scr 128 (+ 64 (* prior 4)) 4) 4 0 (u32w bits)))
+
+(defn scr-max [scr]
+  (kernel-load-u64 (kernel-subregion scr 128 96 8) 8 0))
+
+(defn scr-max-put [scr bits]
+  (kernel-store-u64 (kernel-subregion scr 128 96 8) 8 0 bits))
+
+(defn scr-denominator [scr]
+  (f32w (kernel-load-u32 (kernel-subregion scr 128 104 4) 4 0)))
+
+(defn scr-denominator-put [scr bits]
+  (kernel-store-u32 (kernel-subregion scr 128 104 4) 4 0 (u32w bits)))
+
+;; ----------------------------------------------------- `stable_attention_score`
+
+;; One of the four accumulators. Lane `l` folds indices `l, l+4, l+8, ...`,
+;; which is the subsequence `sum<l>` receives in the C's single interleaved
+;; loop, in the same order.
+(defn score-lane [qr kr i acc]
+  (if (>= i 256)
+    acc
+    (score-lane qr kr (+ i 4)
+                (f64-to-bits
+                 (f64-add (f64-from-bits acc)
+                          (f64-mul (f32-to-f64-exact (f32-from-bits (vec-at qr i)))
+                                   (f32-to-f64-exact (f32-from-bits (vec-at kr i)))))))))
+
+;; `(sum0 + sum1) + (sum2 + sum3)`, then `* (double)INV_SQRT_HEAD_DIM`.
+;; 0.0625f widens to 0.0625 exactly, whose binary64 pattern is the literal.
+(defn score-bits [qr kr]
+  (f64-to-bits
+   (f64-mul (f64-add (f64-add (f64-from-bits (score-lane qr kr 0 0))
+                              (f64-from-bits (score-lane qr kr 1 0)))
+                     (f64-add (f64-from-bits (score-lane qr kr 2 0))
+                              (f64-from-bits (score-lane qr kr 3 0))))
+            (f64-from-bits 4589168020290535424))))
+
+;; `*score == *score && *score <= DBL_MAX && *score >= -DBL_MAX` (:131).
+(defn score-finite [s]
+  (if (f64-eq (f64-from-bits s) (f64-from-bits s))
+    (if (f64-le (f64-from-bits s) (f64-from-bits 9218868437227405311))
+      (if (f64-ge (f64-from-bits s) (f64-from-bits -4503599627370497)) 1 0)
+      0)
+    0))
+
+;; ------------------------------------------------------------ the three passes
+;;
+;; `pe` packs the prior index and the exclusive end (`position + 1`) into one
+;; word, `prior * 16 + end`, because both are below 16 and because a fifth
+;; parameter is the last one this dialect admits.
+
+(defn score-pass [qr kslot scr kvh pe]
+  (if (>= (quot pe 16) (- pe (* 16 (quot pe 16))))
+    0
+    (let [kr (kernel-subregion kslot (* 4096 (- pe (* 16 (quot pe 16))))
+                               (+ (* 4096 (quot pe 16)) (* 1024 kvh)) 1024)]
+      (if (= 1 (any-nonfinite kr 0))
+        -12
+        (let [s (score-bits qr kr)]
+          (if (= 0 (score-finite s))
+            -12
+            (do (scr-score-put scr (quot pe 16) s)
+                (if (f64-gt (f64-from-bits s) (f64-from-bits (scr-max scr)))
+                  (scr-max-put scr s)
+                  0)
+                (score-pass qr kslot scr kvh (+ pe 16)))))))))
+
+;; `difference <= -87.0 ? -87.0f : difference >= 0.0 ? 0.0f : (float)difference`
+;; -- the comparison is binary64 and the result binary32.
+(defn shifted [d]
+  (if (f64-le (f64-from-bits d) (f64-from-bits -4587549539174449152))
+    -1028784128
+    (if (f64-ge (f64-from-bits d) (f64-from-bits 0))
+      0
+      (f32-to-bits (f64-to-f32-rounded (f64-from-bits d))))))
+
+(defn weight-pass [scr pe]
+  (if (>= (quot pe 16) (- pe (* 16 (quot pe 16))))
+    0
+    (do (scr-beta-put scr (quot pe 16)
+                      (local-exp (shifted (f64-to-bits
+                                           (f64-sub (f64-from-bits (scr-score scr (quot pe 16)))
+                                                    (f64-from-bits (scr-max scr)))))))
+        (scr-denominator-put scr
+                             (f32-to-bits
+                              (f32-add (f32-from-bits (scr-denominator scr))
+                                       (f32-from-bits (scr-beta scr (quot pe 16))))))
+        (weight-pass scr (+ pe 16)))))
+
+(defn zero-out [outr i]
+  (if (>= i 256)
+    0
+    (do (vec-put outr i 0)
+        (zero-out outr (+ i 1)))))
+
+(defn accumulate-row [outr vr w i]
+  (if (>= i 256)
+    0
+    (do (vec-put outr i
+                 (f32-to-bits
+                  (f32-add (f32-from-bits (vec-at outr i))
+                           (f32-mul (f32-from-bits (vec-at vr i))
+                                    (f32-from-bits w)))))
+        (accumulate-row outr vr w (+ i 1)))))
+
+(defn accumulate-pass [outr vslot scr kvh pe]
+  (if (>= (quot pe 16) (- pe (* 16 (quot pe 16))))
+    0
+    (do (accumulate-row outr
+                        (kernel-subregion vslot (* 4096 (- pe (* 16 (quot pe 16))))
+                                          (+ (* 4096 (quot pe 16)) (* 1024 kvh)) 1024)
+                        (f32-to-bits (f32-div (f32-from-bits (scr-beta scr (quot pe 16)))
+                                              (f32-from-bits (scr-denominator scr))))
+                        0)
+        (accumulate-pass outr vslot scr kvh (+ pe 16)))))
+
+(defn gate-row [outr gr i]
+  (if (>= i 256)
+    0
+    (do (vec-put outr i
+                 (f32-to-bits (f32-mul (f32-from-bits (vec-at outr i))
+                                       (f32-from-bits (sigmoid (vec-at gr i))))))
+        (gate-row outr gr (+ i 1)))))
+
+;; ------------------------------------------------------------------ mode 1
+
+(defn head-softmax [arena alen plan head]
+  (let [heads (plan-u64 plan 8)
+        qg (kernel-subregion arena alen (plan-u64 plan 32) (* heads 2048))
+        qr (kernel-subregion arena alen (+ (plan-u64 plan 56) (* head 1024)) 1024)
+        kslot (kernel-subregion arena alen (plan-u64 plan 40)
+                                (* 4096 (+ 1 (plan-u64 plan 80))))
+        vslot (kernel-subregion arena alen (plan-u64 plan 48)
+                                (* 4096 (+ 1 (plan-u64 plan 80))))
+        scr (kernel-subregion arena alen (plan-u64 plan 88) 128)
+        outr (kernel-subregion qg (* heads 2048) (* head 1024) 1024)
+        gr (kernel-subregion qg (* heads 2048) (+ (* head 2048) 1024) 1024)
+        kvh (quot head (plan-u64 plan 72))
+        pe (+ 1 (plan-u64 plan 80))]
+    (if (= 1 (any-nonfinite qr 0))
+      -11
+      (do (scr-max-put scr -4503599627370497)
+          (scr-denominator-put scr 0)
+          (let [v (score-pass qr kslot scr kvh pe)]
+            (if (not (= v 0))
+              v
+              (do (weight-pass scr pe)
+                  (if (f32-gt (f32-from-bits (scr-denominator scr)) (f32-from-bits 0))
+                    (if (= 1 (nonfinite (scr-denominator scr)))
+                      -13
+                      (do (zero-out outr 0)
+                          (accumulate-pass outr vslot scr kvh pe)
+                          (gate-row outr gr 0)
+                          0))
+                    -13))))))))
+
+(defn softmax-heads [arena alen plan head]
+  (if (>= head (plan-u64 plan 8))
+    0
+    (let [v (head-softmax arena alen plan head)]
+      (if (not (= v 0))
+        v
+        (softmax-heads arena alen plan (+ head 1))))))
+
+;; ------------------------------------------------------------------ mode 0
+
+(defn copy-row [src dst i]
+  (if (>= i 256)
+    0
+    (do (vec-put dst i (vec-at src i))
+        (copy-row src dst (+ i 1)))))
+
+(defn deinterleave-heads [arena alen plan head]
+  (if (>= head (plan-u64 plan 8))
+    0
+    (let [heads (plan-u64 plan 8)
+          qg (kernel-subregion arena alen (plan-u64 plan 32) (* heads 2048))
+          out (kernel-subregion arena alen (plan-u64 plan 24) (* heads 1024))]
+      (do (copy-row (kernel-subregion qg (* heads 2048) (* head 2048) 1024)
+                    (kernel-subregion out (* heads 1024) (* head 1024) 1024)
+                    0)
+          (deinterleave-heads arena alen plan (+ head 1))))))
+
+;; ------------------------------------------------------------------ mode 2
+
+(defn zero-row [vr gr dst i]
+  (if (>= i 256)
+    0
+    (do (vec-put dst i
+                 (f32-to-bits (f32-mul (f32-from-bits (vec-at vr i))
+                                       (f32-from-bits (sigmoid (vec-at gr i))))))
+        (zero-row vr gr dst (+ i 1)))))
+
+(defn zero-position-heads [arena alen plan head]
+  (if (>= head (plan-u64 plan 8))
+    0
+    (let [heads (plan-u64 plan 8)
+          kvheads (quot (+ heads (- (plan-u64 plan 72) 1)) (plan-u64 plan 72))
+          qg (kernel-subregion arena alen (plan-u64 plan 32) (* heads 2048))
+          out (kernel-subregion arena alen (plan-u64 plan 24) (* heads 1024))
+          val (kernel-subregion arena alen (plan-u64 plan 40) (* kvheads 1024))]
+      (do (zero-row (kernel-subregion val (* kvheads 1024)
+                                      (* (quot head (plan-u64 plan 72)) 1024) 1024)
+                    (kernel-subregion qg (* heads 2048) (+ (* head 2048) 1024) 1024)
+                    (kernel-subregion out (* heads 1024) (* head 1024) 1024)
+                    0)
+          (zero-position-heads arena alen plan (+ head 1))))))
+
+;; ------------------------------------------------------------------- the walk
+
+(defn fits [alen off len]
+  (if (< off 0) 0 (if (< len 0) 0 (if (> (+ off len) alen) 0 1))))
+
+(defn regions-fit [alen plan]
+  (if (= 0 (fits alen (plan-u64 plan 32) (* (plan-u64 plan 8) 2048))) 0
+    (if (= (plan-u32 plan 0) 1)
+      (if (= 0 (fits alen (plan-u64 plan 56) (* (plan-u64 plan 8) 1024))) 0
+        (if (= 0 (fits alen (plan-u64 plan 40) (* 4096 (+ 1 (plan-u64 plan 80))))) 0
+          (if (= 0 (fits alen (plan-u64 plan 48) (* 4096 (+ 1 (plan-u64 plan 80))))) 0
+            (fits alen (plan-u64 plan 88) 128))))
+      (if (= 0 (fits alen (plan-u64 plan 24) (* (plan-u64 plan 8) 1024))) 0
+        (if (= (plan-u32 plan 0) 0)
+          1
+          (fits alen (plan-u64 plan 40)
+                (* (quot (+ (plan-u64 plan 8) (- (plan-u64 plan 72) 1)) (plan-u64 plan 72))
+                   1024)))))))
+
+;; A slot this mode does not use must be zero: a plan built for one mode is
+;; then refused by another instead of quietly addressing something.
+(defn unused-zero [plan]
+  (if (= (plan-u32 plan 0) 1)
+    (if (not (= (plan-u64 plan 24) 0)) 0 1)
+    (if (not (= (plan-u64 plan 48) 0)) 0
+      (if (not (= (plan-u64 plan 56) 0)) 0
+        (if (not (= (plan-u64 plan 64) 0)) 0
+          (if (not (= (plan-u64 plan 80) 0)) 0
+            (if (not (= (plan-u64 plan 88) 0)) 0
+              (if (= (plan-u32 plan 0) 2)
+                1
+                (if (not (= (plan-u64 plan 40) 0)) 0
+                  (if (not (= (plan-u64 plan 72) 0)) 0 1))))))))))
+
+(defn dispatch [arena alen plan]
+  (if (= (plan-u32 plan 0) 0)
+    (deinterleave-heads arena alen plan 0)
+    (if (= (plan-u32 plan 0) 1)
+      (softmax-heads arena alen plan 0)
+      (zero-position-heads arena alen plan 0))))
+
+(defn geometry-checked [arena alen plan]
+  (if (= 0 (unused-zero plan)) -4
+    (if (= 0 (regions-fit alen plan)) -10
+      (dispatch arena alen plan))))
+
+(defn mode-checked [arena alen plan]
+  (if (= (plan-u32 plan 0) 1)
+    (if (not (= (plan-u64 plan 64) 1024)) -8
+      (if (< (plan-u64 plan 80) 1) -9
+        (if (> (plan-u64 plan 80) 7) -9
+          (if (< (plan-u64 plan 72) 1) -8
+            (if (> (plan-u64 plan 72) (plan-u64 plan 8)) -8
+              (geometry-checked arena alen plan))))))
+    (if (= (plan-u32 plan 0) 2)
+      (if (< (plan-u64 plan 72) 1) -8
+        (if (> (plan-u64 plan 72) (plan-u64 plan 8)) -8
+          (geometry-checked arena alen plan)))
+      (geometry-checked arena alen plan))))
+
+(defn aiueos-qwen35-attention [arena arena-length plan plan-length]
+  (if (= arena 0) -1
+    (if (= plan 0) -2
+      (if (not (= plan-length 96)) -3
+        (if (not (= (plan-u32 plan 4) 0)) -4
+          (if (> (plan-u32 plan 0) 2) -5
+            (if (< (plan-u64 plan 8) 1) -6
+              (if (> (plan-u64 plan 8) 64) -6
+                (if (not (= (plan-u64 plan 16) 256)) -7
+                  (mode-checked arena arena-length plan))))))))))
+
+(defn main [] 0)

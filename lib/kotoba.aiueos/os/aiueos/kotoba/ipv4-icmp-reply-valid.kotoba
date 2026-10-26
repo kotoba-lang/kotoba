@@ -1,0 +1,105 @@
+;; Admission for the first IPv4 datagram aiueos ever receives.
+;;
+;; The driver in `kernel/pci.c` owns the mechanism -- it addressed the request
+;; with the MAC the ARP exchange produced, posted the buffers, rang the
+;; doorbells and spun. It does NOT decide whether the bytes that came back are
+;; the reply it asked for. That decision is here, the same split every other
+;; admission path in this OS uses (ADR-0015).
+;;
+;; The checksum helpers below duplicate `ipv4-checksum.kotoba`. That is not an
+;; oversight: a kernel object is compiled with host imports disabled and exports
+;; exactly one symbol, so one object cannot call another. The duplication is the
+;; price of that isolation, and it is paid rather than moving the arithmetic
+;; into C, where it would stop being reviewable as a decision.
+;;
+;; Offsets, from the frame's first byte:
+;;    0..5   destination MAC       14      version and IHL       34      ICMP type
+;;    6..11  source MAC            16..17  IPv4 total length     35      ICMP code
+;;   12..13  EtherType             23      protocol              36..37  ICMP checksum
+;;                                 24..25  header checksum       38..39  identifier
+;;                                 26..29  source address        40..41  sequence
+;;                                 30..33  destination address
+;;
+;; `expected-src`, `ident` and `seq` are what make an admitted reply OURS. A
+;; well-formed echo reply addressed to somebody else, or answering an earlier
+;; request, is a real datagram and still not evidence that this exchange
+;; completed. Requiring type 0 rather than 8 matters for the same reason the ARP
+;; object insists on opcode 2: 8 is what was SENT, and a device model that
+;; looped the request back must not pass.
+
+(defn aiueos-icmp-u16 [frame offset]
+  (+ (* (kernel-load-u8-4k frame 2048 offset) 256)
+     (kernel-load-u8-4k frame 2048 (+ offset 1))))
+
+(defn aiueos-icmp-u32 [frame offset]
+  (+ (* (kernel-load-u8-4k frame 2048 offset) 16777216)
+     (+ (* (kernel-load-u8-4k frame 2048 (+ offset 1)) 65536)
+        (+ (* (kernel-load-u8-4k frame 2048 (+ offset 2)) 256)
+           (kernel-load-u8-4k frame 2048 (+ offset 3))))))
+
+(defn aiueos-icmp-word [frame base length offset]
+  ;; RFC 1071 pads a trailing odd byte on the right, so it is the high half.
+  (if (>= (+ offset 1) length)
+    (* (kernel-load-u8-4k frame 2048 (+ base offset)) 256)
+    (+ (* (kernel-load-u8-4k frame 2048 (+ base offset)) 256)
+       (kernel-load-u8-4k frame 2048 (+ base offset 1)))))
+
+(defn aiueos-icmp-sum [frame base length offset total]
+  (if (>= offset length) total
+    (aiueos-icmp-sum frame base length (+ offset 2)
+                     (+ total (aiueos-icmp-word frame base length offset)))))
+
+(defn aiueos-icmp-fold [total]
+  (if (< total 65536) total
+    (aiueos-icmp-fold (+ (bit-and total 65535) (quot total 65536)))))
+
+(defn aiueos-icmp-checksum [frame base length]
+  ;; The region is always the FRAME itself; `base` is how far into it this
+  ;; particular header starts (14 for IPv4, 34 for ICMP). The compiler requires
+  ;; a kernel memory base to NAME a region rather than compute one -- passing
+  ;; `(+ frame 14)` is rejected outright -- which is the rule that keeps a
+  ;; bounded load bounded, since a computed base could put the 2048 trap bound
+  ;; anywhere. Carrying the offset separately is how a sub-range is summed
+  ;; without ever synthesising a pointer.
+  (if (or (< length 0) (> length 2048)) 65535
+    (- 65535 (aiueos-icmp-fold (aiueos-icmp-sum frame base length 0 0)))))
+
+(defn aiueos-ipv4-header-valid [frame length expected-src]
+  (and ;; EtherType 0x0800 = IPv4.
+       (= (aiueos-icmp-u16 frame 12) 2048)
+       ;; Version 4, IHL 5. Rejecting options rather than parsing them is what
+       ;; makes every offset below a constant; a datagram carrying them is not
+       ;; wrong, it is simply outside what this admission can reason about.
+       (= (kernel-load-u8-4k frame 2048 14) 69)
+       ;; 20 bytes of IPv4 plus at least the 8-byte ICMP header, and the whole
+       ;; datagram has to fit the frame. It may be SHORTER than the frame --
+       ;; Ethernet pads to its own minimum -- but never longer.
+       (>= (aiueos-icmp-u16 frame 16) 28)
+       (<= (+ (aiueos-icmp-u16 frame 16) 14) length)
+       ;; Protocol 1 = ICMP.
+       (= (kernel-load-u8-4k frame 2048 23) 1)
+       ;; Summing a header that carries a correct checksum leaves 0, so the
+       ;; field is verified without ever being read on its own.
+       (= (aiueos-icmp-checksum frame 14 20) 0)
+       ;; The reply has to come from the peer that was asked.
+       (= (aiueos-icmp-u32 frame 26) expected-src)))
+
+(defn aiueos-icmp-echo-reply-valid [frame icmp-length ident seq]
+  (and ;; Type 0 = echo REPLY, code 0. Type 8 is what was sent.
+       (= (kernel-load-u8-4k frame 2048 34) 0)
+       (= (kernel-load-u8-4k frame 2048 35) 0)
+       (= (aiueos-icmp-checksum frame 34 icmp-length) 0)
+       ;; Both are echoed by the peer unchanged, which is what ties this reply
+       ;; to the request this boot sent rather than to any echo on the wire.
+       (= (aiueos-icmp-u16 frame 38) ident)
+       (= (aiueos-icmp-u16 frame 40) seq)))
+
+(defn aiueos-ipv4-icmp-reply-valid [frame length expected-src ident seq]
+  (and (>= length 42)
+       (<= length 2048)
+       (aiueos-ipv4-header-valid frame length expected-src)
+       ;; `and` short-circuits, so by the time the total length is subtracted
+       ;; from here it is already known to be at least 28 and to fit the frame.
+       (aiueos-icmp-echo-reply-valid frame (- (aiueos-icmp-u16 frame 16) 20) ident seq)))
+
+(defn main [] 0)

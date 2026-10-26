@@ -1,0 +1,205 @@
+#!/usr/bin/env kbb
+;; node-boot against a plane that verifies the way the control plane does.
+;;
+;; Everything the booted stick does after the network is up, minus the boot:
+;; read its config, mint an identity, say what it is, and answer a challenge.
+;; Run here rather than only inside QEMU because a boot costs minutes per
+;; attempt and this costs seconds -- the QEMU run then has one thing left to
+;; prove, which is that it also works from a stick.
+;;
+;; Two directions. The plane that holds the node's own key must claim it; a
+;; plane that holds a different key must refuse, and the node must say
+;; SIGNATURE_REFUSED rather than blaming the network.
+;;
+;;   kbb --backend sci --classpath <grant>/src:<text>/src:<sekisho>/src \
+;;     os/aiueos/scripts/node-boot-test.cljk --bundle <staged-bundle-dir>
+
+(require '[grant.device-attest :as attest]
+         '[sekisho.didkey :as didkey]
+         '[kotoba.lang.text :as str]
+         '["node:crypto" :as crypto]
+         '["node:http" :as http]
+         '["node:fs" :as fs]
+         '["node:os" :as os]
+         '["node:path" :as path]
+         '["node:child_process" :as cp])
+
+(def argv (vec *command-line-args*))
+(defn- opt [f d] (let [i (.indexOf argv f)] (if (neg? i) d (nth argv (inc i)))))
+(def bundle (opt "--bundle" "/tmp/claude-501/node-stage"))
+
+(def subtle (.-subtle (.-webcrypto crypto)))
+(def results (atom []))
+(defn- check! [name ok detail]
+  (swap! results conj [name ok])
+  (println (if ok "NODEBOOT_OK  " "NODEBOOT_FAIL") name (if ok "" (str "-- " detail))))
+
+(def nonce "node-boot-nonce-3c81")
+
+;; Run 1's did, captured where run 3 can see it. Reading it out of `out` inside
+;; run 3 takes run TWO's output -- a different state dir, so a different did,
+;; and a failure that looks like the key was not reused when it was.
+(def run1-did (atom nil))
+
+(defn- raw-of-did [d] (js/Buffer.from (clj->js (didkey/public-key-of d))))
+
+;; the plane's check, over grant's rule -- the node's did is whatever it minted
+(defn- verify [expect-raw endpoint did signature-b64url]
+  (let [message (attest/signing-input {:did did :endpoint endpoint :nonce nonce})]
+    (if-not (string? message)
+      (js/Promise.resolve false)
+      (-> (.importKey subtle "raw" expect-raw #js {:name "Ed25519"} false #js ["verify"])
+          (.then (fn [k] (.verify subtle #js {:name "Ed25519"} k
+                                  (js/Buffer.from signature-b64url "base64url")
+                                  (.encode (js/TextEncoder.) message))))
+          (.then (fn [ok] (true? ok)))
+          (.catch (fn [_] false))))))
+
+(defn- start-plane
+  "`expect` is :node (accept whatever did the node presents, verifying against
+  the key that did names) or a raw public key that will not match."
+  [expect seen]
+  (js/Promise.
+   (fn [resolve _]
+     (let [port (atom nil)
+           server
+           (http/createServer
+            (fn [req res]
+              (let [url (.-url req)
+                    did (second (re-find #"/api/devices/([^/]+)/" url))
+                    did (when did (js/decodeURIComponent did))]
+                (cond
+                  (str/ends-with? url "/challenge")
+                  (do (.writeHead res 200 #js {"content-type" "application/json"})
+                      (.end res (js/JSON.stringify
+                                 #js {"challenge" "c-node" "nonce" nonce
+                                      "expiresAtMs" (+ (js/Date.now) 300000)})))
+                  (str/ends-with? url "/attest")
+                  (let [chunks (atom "")]
+                    (.on req "data" (fn [d] (swap! chunks str d)))
+                    (.on req "end"
+                         (fn []
+                           (let [body (js->clj (js/JSON.parse @chunks))
+                                 ;; the endpoint the node signed is the one it
+                                 ;; was configured with, which is this server
+                                 endpoint (str "http://127.0.0.1:" @port)
+                                 expect-raw (if (= :node expect) (raw-of-did did) expect)]
+                             (-> (verify expect-raw endpoint did (get body "signature"))
+                                 (.then (fn [ok]
+                                          (swap! seen conj {:did did :verified ok})
+                                          (.writeHead res (if ok 200 400)
+                                                      #js {"content-type" "application/json"})
+                                          (.end res (js/JSON.stringify (clj->js {"verified" ok}))))))))))
+                  :else (do (.writeHead res 404) (.end res "{}"))))))]
+       (.listen server 0 "127.0.0.1"
+                (fn [] (reset! port (.-port (.address server))) (resolve server)))))))
+
+(defn- run-node-boot [port state-dir]
+  (js/Promise.
+   (fn [resolve _]
+     (let [cfg (path/join (fs/mkdtempSync (path/join (os/tmpdir) "node-cfg-")) "NODE.JSN")]
+       (fs/writeFileSync cfg (js/JSON.stringify
+                              (clj->js {"endpoint" (str "http://127.0.0.1:" port)
+                                        "intervalSeconds" 2})))
+       (let [child (cp/spawn "nbb"
+                             (clj->js ["--classpath" (path/join bundle "cp")
+                                       (path/join bundle "node-boot.cljk") cfg])
+                             #js {:stdio "pipe"
+                                  :env (js/Object.assign
+                                        #js {} js/process.env
+                                        #js {"AIUEOS_NODE_STATE_DIR" state-dir
+                                             "AIUEOS_NODE_BUNDLE" bundle})})
+             out (atom "")]
+         (.on (.-stdout child) "data" (fn [d] (swap! out str d)))
+         (.on (.-stderr child) "data" (fn [d] (swap! out str d)))
+         (.on child "close" (fn [code] (resolve {:code code :out @out}))))))))
+
+(defn- finish []
+  (let [total (count @results) failed (remove second @results)]
+    (println)
+    (println (str "checks=" total " failed=" (count failed)))
+    (when (seq failed) (println (str "failed: " (str/join ", " (map first failed)))))
+    (println (if (empty? failed) "AIUEOS_NODE_BOOT_OK" "AIUEOS_NODE_BOOT_FAIL"))
+    (js/process.exit (if (empty? failed) 0 1))))
+
+;; ── run 1: the plane verifies against the did the node presents ───────────
+(let [seen (atom []) sd (fs/mkdtempSync (path/join (os/tmpdir) "node-state-"))]
+  (-> (start-plane :node seen)
+      (.then
+       (fn [server]
+         (-> (run-node-boot (.-port (.address server)) sd)
+             (.then
+              (fn [{:keys [code out]}]
+                (.close server)
+                (reset! run1-did (second (re-find #"AIUEOS_NODE_DID (\S+)" out)))
+                (check! "the-node-mints-a-did"
+                        (some? (re-find #"AIUEOS_NODE_DID did:key:z6Mk" out))
+                        (str/trim out))
+                (check! "the-did-round-trips-through-sekisho"
+                        (let [d (second (re-find #"AIUEOS_NODE_DID (\S+)" out))]
+                          (and d (didkey/valid? d)))
+                        (str/trim out))
+                (check! "it-says-where-the-key-lives"
+                        (some? (re-find #"AIUEOS_NODE_KEY minted durable " out))
+                        "the first boot with a state dir should mint a durable key")
+                (check! "the-plane-claimed-it" (true? (:verified (first @seen)))
+                        (pr-str @seen))
+                (check! "the-did-the-plane-saw-is-the-one-it-announced"
+                        (= (second (re-find #"AIUEOS_NODE_DID (\S+)" out))
+                           (:did (first @seen)))
+                        (pr-str @seen))
+                (check! "it-reports-claimable" (str/includes? out "AIUEOS_NODE_CLAIMABLE")
+                        (str/trim out))
+                (check! "and-exits-zero" (= 0 code) (str "exit " code))
+                ;; ── run 2: a plane holding a key that is not this node's ──
+                (let [seen2 (atom [])
+                      sd2 (fs/mkdtempSync (path/join (os/tmpdir) "node-state-"))
+                      other (js/Buffer.from
+                             (.-x (.export (.-publicKey (crypto/generateKeyPairSync "ed25519"))
+                                           #js {:format "jwk"}))
+                             "base64url")]
+                  (-> (start-plane other seen2)
+                      (.then
+                       (fn [server2]
+                         (-> (run-node-boot (.-port (.address server2)) sd2)
+                             (.then
+                              (fn [{:keys [code out]}]
+                                (.close server2)
+                                (check! "a-refused-signature-is-named-as-such"
+                                        (and (str/includes? out "AIUEOS_NODE_SIGNATURE_REFUSED")
+                                             (= 1 code))
+                                        (str "exit " code ": " (str/trim out)))
+                                ;; Requiring the ABSENCE of a marker is
+                                ;; satisfied by a run that printed nothing at
+                                ;; all -- which is how this passed while the
+                                ;; script was failing to parse. So it also has
+                                ;; to have got far enough to announce a did.
+                                (check! "and-is-not-blamed-on-the-network"
+                                        (and (str/includes? out "AIUEOS_NODE_DID")
+                                             (not (str/includes? out "PLANE_UNREACHABLE")))
+                                        (str/trim out))
+                                (check! "the-plane-recorded-the-attempt"
+                                        (false? (:verified (first @seen2)))
+                                        (pr-str @seen2))
+                                ;; ── run 3: the SAME state dir again. ──────
+                                ;; The property a claim depends on: an
+                                ;; identity that survives the boot that made
+                                ;; it. Without this, every reboot mints a new
+                                ;; did and the claim it was granted is for a
+                                ;; device that no longer exists.
+                                (let [seen3 (atom [])]
+                                  (-> (start-plane :node seen3)
+                                      (.then
+                                       (fn [server3]
+                                         (-> (run-node-boot (.-port (.address server3)) sd)
+                                             (.then
+                                              (fn [{:keys [out]}]
+                                                (.close server3)
+                                                (check! "a-second-boot-reuses-the-key"
+                                                        (some? (re-find #"AIUEOS_NODE_KEY reused durable " out))
+                                                        (str/trim out))
+                                                (check! "and-keeps-the-same-did"
+                                                        (= @run1-did
+                                                           (second (re-find #"AIUEOS_NODE_DID (\S+)" out)))
+                                                        (str "run 1 was " @run1-did))
+                                                (finish))))))))))))))))))))))

@@ -1,0 +1,875 @@
+;; Guest browser desktop input method: one key press -> the hosted IME's
+;; decision -> text committed into the focused window's body, on KERNEL.ELF
+;; (ADR-0225).
+;;
+;; WHY THIS IS A KOTOBA OBJECT AND NOT A C TABLE
+;;
+;; C reads Linux key codes off the virtio-keyboard ring (mechanism). Which
+;; character a key is, how romaji becomes kana, when a reading becomes a
+;; kanji and where committed text goes are input-method and browser
+;; decisions (browser.input `:text/input` goes to the focused window).
+;;
+;; THE ORACLE is src/aiueos/compositor/ime.cljk, and this object mirrors its
+;; `handle-key` branch by branch, quirks included:
+;;   letter     appended to the romaji buffer, then `convert-buf`: greedy
+;;              longest mora (3, 2, 1 bytes) from the start, sokuon (a doubled
+;;              k s t p c g z d b j) emits small tsu; what does not convert
+;;              stays in the buffer
+;;   Backspace  cancels a conversion, else drops the last romaji byte, else the
+;;              last preedit code point, else -- nothing is being composed --
+;;              deletes the code point before the caret in the focused body
+;;              (browser.text-edit delete-backward; ADR-0232). Here the
+;;              object leaves its oracle on purpose: the hosted `handle-key`
+;;              consumes that Backspace and does nothing, but browser.input
+;;              maps Backspace to :text/edit :delete-backward, and a key the
+;;              IME has no use for belongs to the page.
+;;   Escape     cancels a conversion (preedit back to its reading), else
+;;              clears buffer and preedit
+;;   Space      flushes (a lone "n" becomes "nn"), then converts the whole
+;;              preedit -- a reading of any length -- that the dictionary
+;;              knows to its first candidate, or cycles the candidates;
+;;              otherwise commits the preedit (ADR-0235)
+;;   Enter      flushes and commits the preedit
+;;   other keys ignored ("-", "," and "." are in the oracle's table but its
+;;              letter test never lets them in, so they are ignored here too)
+;;   IME off    a letter goes straight to the window as latin, Backspace
+;;              deletes as above (ADR-0232); the rest is ignored
+;;   Toggle     Hankaku/Zenkaku (evdev 41), in either state: the IME turns off
+;;              if on, on if off, and whatever was being composed -- romaji,
+;;              preedit, a conversion -- is discarded, not committed. The
+;;              hosted `handle-key` has no toggle key; this is
+;;              aiueos.compositor.desktop `set-ime`, which the hosted desktop
+;;              calls with the flipped state (ADR-0228).
+;;   Alt+Tab    the window manager's, not the page's (ADR-0237). Alt (evdev 56)
+;;              is held from its press to its release in word 431; a Tab
+;;              (evdev 15) press while it is held answers 256 + the id of the
+;;              window at the BOTTOM of the stack (word 5) and touches nothing
+;;              else -- no body, no composition, no IME word. C hands that id
+;;              to browser-reduce.kotoba as a :window/focus (kind 5), which
+;;              raises it: raising the bottom rotates the stack, so n presses
+;;              visit every window once and come back to the first. The hosted
+;;              desktop has the host's window manager and browser.input no
+;;              shortcut, so the rule is the kernel's (no oracle). Alt itself
+;;              and a Tab without Alt reach the IME as before (it ignores both);
+;;              every other key with Alt held is typed as without it.
+;;   Selection  (ADR-0240) Shift (evdev 42 or 54) is held in word 2035 from its
+;;              press to its release, as Alt is in 431. Shift+Left (105) and
+;;              Shift+Right (106) are browser.text-edit move-caret -1 / +1
+;;              with :extend? on the focused body, whose caret is at its end
+;;              until a selection moves it: the anchor stays at the end, the
+;;              caret moves, so the selection is always the last k code
+;;              points [n - k, n) and the caret sits at n - k. k is word 2037,
+;;              the window it belongs to word 2036 (0 and 0: none); a
+;;              selection of another window reads as none and is replaced by
+;;              the first Shift+Left here (`:one-selection-at-a-time`). k is
+;;              clamped to the body (normalize-selection); at 0 or at n the
+;;              key changes nothing. While something is composed the arrows
+;;              are the composition's and do nothing (`:no-arrows-in-a-
+;;              composition`). Backspace with a selection is delete-backward's
+;;              first branch: insert-text "" over it -- the k code points go
+;;              and the caret is at the end again. A letter with a selection
+;;              first does the same (insert-text replaces the selection; with
+;;              the IME on, the composition starts over the emptied place, as a
+;;              platform IME's compositionstart deletes the selection), then
+;;              goes on as before. Plain Left / Right, Home, End are still not
+;;              taken (`:caret-only-at-the-end` holds outside a selection), and
+;;              Shift does not case a letter (`:shift-does-not-case-letters`).
+;;   Clipboard  (ADR-0241) Ctrl (evdev 29 or 97) is held in word 2038 from its
+;;              press to its release, as Shift is in 2035. With Ctrl held a
+;;              C (46) press over a selection, nothing composed, is a
+;;              :clipboard/write request and a V (47) press, nothing composed,
+;;              a :clipboard/read request -- browser.desktop-backend `request`:
+;;              the key answers 512 (write) or 513 (read) and changes nothing,
+;;              because whether the host's clipboard may be touched is the
+;;              permission broker's (broker-admit.kotoba, ADR-0096), not the
+;;              page's. Only when the broker admits :clipboard does C hand the
+;;              object the completion: the same code with value 3 (a device
+;;              never sends 3; the keyboard ring passes 0..2 only) and, in
+;;              place of the dictionary, the clipboard -- 260 bytes, word 0 its
+;;              length L (0..64), words 1..L its code points. A write
+;;              completion copies the selected code points into it (the
+;;              selection's text, as browser.text-edit keeps it); a read
+;;              completion is insert-text of its text: the selection goes and
+;;              the text is appended at the caret, which is the end of the
+;;              body -- whole or not at all (-5). A refused request has no
+;;              completion, so nothing is copied or pasted (fail-closed, as
+;;              desktop-backend `request` produces no effect on a deny).
+;;              Every other press with Ctrl held changes nothing
+;;              (`:no-other-ctrl-shortcuts`: Ctrl+A select-all is not taken);
+;;              C with nothing selected, or C / V while something is composed,
+;;              asks for nothing (`:no-clipboard-in-a-composition`).
+;; THE DICTIONARY is os/aiueos/ime/aiueos-kanji.dic (aiueos-dict/v1, written
+;; by os/aiueos/scripts/gen-ime-dictionary.cljk from Unicode Unihan; the
+;; format is described in that script's header), handed in by C from the
+;; initramfs as it hands the font. The oracle reads the same file. A reading
+;; is found by binary search over the sorted records; while it is being
+;; converted, word 444 holds its record's word offset, so Escape and
+;; Backspace put the reading back from the dictionary, as the oracle puts
+;; back `:reading`. With no dictionary (a null region or 0 bytes) nothing
+;; converts and Space commits kana, as the oracle does with `:kanji? false`.
+;; The romaji table between the GENERATED markers is written from the
+;; oracle's own `mora` by os/aiueos/scripts/gen-ime-mora.cljk (--check).
+;;
+;; Temporary native constraints (ADR-0223's removal condition): word types,
+;; at most five parameters, and bounded buffers the oracle does not have --
+;; 8 romaji bytes, 32 preedit code points, the window body's 64. A letter
+;; into a full romaji buffer and a commit into a body without room are
+;; refused with the state unchanged; kana past the 32nd preedit code point
+;; are dropped and the key answers -8.
+;;
+;; STATE, in the browser-frame2 surface (u32 words, 8192 bytes):
+;;   0..31 browser state (focus at 2)   160 + 64(id-1) body of window id
+;;   432 IME on   433 romaji length   434..441 romaji bytes
+;;   442 converting   443 candidate index   444 word offset of the reading's
+;;   dictionary record   445 preedit length   446..477 preedit code points
+;;   431 Alt held (ADR-0237; 1 held, else not -- the word frame2's scratch
+;;   left unused, 416..430)
+;;   478 overflow flag   479 the dictionary's bytes (written on every call,
+;;   so a read of the dictionary is bounded by it, as frame2 keeps the
+;;   font's at 423)
+;;   2035 Shift held (ADR-0240; 1 held, else not)   2036 the window id the
+;;   selection belongs to (0 none)   2037 its length, the code points before
+;;   the end of that window's body that are selected -- three of the words
+;;   freed by cutting frame2's op capacity from 260 to 259
+;;   2038 Ctrl held (ADR-0241; 1 held, else not). The clipboard is not in
+;;   the surface: it is the host's, handed in only with an admitted
+;;   completion. 2039 was the surface's last unassigned word; ADR-0247 took it
+;;   (the high-contrast palette, F10).
+;;
+;; ABI: [surface surface-bytes dictionary dictionary-bytes key] where key is
+;; the evdev key code * 4 + its value (0 release, 1 press, 2 repeat) -- five
+;; parameters is the native ceiling, so code and value share one -- ->
+;; code points committed to the focused window by this key (0 for most
+;; keys; at most 64, a body's size), or 256 + a window id for Alt+Tab (a
+;; :window/focus for browser-reduce, ADR-0237), or 512 / 513 for Ctrl+C /
+;; Ctrl+V (a :clipboard/write / :clipboard/read request for the broker,
+;; ADR-0241); for a completion (value 3, the clipboard in place of the
+;; dictionary) the code points copied into the clipboard or pasted into the
+;; body; or
+;;   -1 null region / surface not 8192 bytes   -2 abi or n outside 1..4
+;;   -3 focus is not a window id 1..4          -5 the body would pass 64
+;;   -6 a dictionary is given and is not aiueos-dict/v1 (header), or the
+;;      record a conversion needs is out of its bounds
+;;   -7 a completion's clipboard is a null region, not 260 bytes, or its
+;;      length word is past 64
+;;   -8 the romaji buffer is full, or the preedit overflowed
+;; A release or repeat (value != 1) changes nothing and returns 0, except
+;; Alt's release, which lets go of word 431, Shift's, of word 2035, and
+;; Ctrl's, of word 2038. A header
+;; refusal changes nothing; a record refusal on Space comes after the flush,
+;; so the romaji is in the preedit and nothing is committed or converted.
+
+(ns aiueos.browser-ime
+  (:export [aiueos-browser-key main]))
+
+(defn w [s i]
+  (kernel-load-u32 (kernel-subregion s 8192 (* i 4) 4) 4 0))
+
+(defn wp [s i v]
+  (kernel-store-u32 (kernel-subregion s 8192 (* i 4) 4) 4 0 v))
+
+;; BEGIN GENERATED MORA
+;; 113 entries from aiueos.compositor.ime/mora.
+;; k is the key's bytes packed big-endian: a, a*256+b, a*65536+b*256+c.
+(defn mora1 [k]
+  (if (= k 44) 805371904
+    (if (= k 45) 821821440
+    (if (= k 46) 805437440
+    (if (= k 97) 809631744
+    (if (= k 101) 810024960
+    (if (= k 105) 809762816
+    (if (= k 111) 810156032
+    (if (= k 117) 809893888
+    0)))))))))
+
+(defn mora2 [k]
+  (if (= k 25185) 812646400
+    (if (= k 25189) 813236224
+    (if (= k 25193) 812843008
+    (if (= k 25199) 813432832
+    (if (= k 25205) 813039616
+    (if (= k 25697) 811597824
+    (if (= k 25701) 812056576
+    (if (= k 25705) 811728896
+    (if (= k 25711) 812187648
+    (if (= k 25717) 811925504
+    (if (= k 26229) 812974080
+    (if (= k 26465) 810287104
+    (if (= k 26469) 810680320
+    (if (= k 26473) 810418176
+    (if (= k 26479) 810811392
+    (if (= k 26485) 810549248
+    (if (= k 26721) 812580864
+    (if (= k 26725) 813170688
+    (if (= k 26729) 812777472
+    (if (= k 26735) 813367296
+    (if (= k 26741) 812974080
+    (if (= k 27233) 811085955
+    (if (= k 27241) 811073536
+    (if (= k 27247) 811085959
+    (if (= k 27253) 811085957
+    (if (= k 27489) 810221568
+    (if (= k 27493) 810614784
+    (if (= k 27497) 810352640
+    (if (= k 27503) 810745856
+    (if (= k 27509) 810483712
+    (if (= k 28001) 813563904
+    (if (= k 28005) 813760512
+    (if (= k 28009) 813629440
+    (if (= k 28015) 813826048
+    (if (= k 28021) 813694976
+    (if (= k 28199) 814940160
+    (if (= k 28257) 812253184
+    (if (= k 28261) 812449792
+    (if (= k 28265) 812318720
+    (if (= k 28270) 814940160
+    (if (= k 28271) 812515328
+    (if (= k 28277) 812384256
+    (if (= k 28769) 812711936
+    (if (= k 28773) 813301760
+    (if (= k 28777) 812908544
+    (if (= k 28783) 813498368
+    (if (= k 28789) 813105152
+    (if (= k 29281) 814284800
+    (if (= k 29285) 814481408
+    (if (= k 29289) 814350336
+    (if (= k 29295) 814546944
+    (if (= k 29301) 814415872
+    (if (= k 29537) 810876928
+    (if (= k 29541) 811270144
+    (if (= k 29545) 811008000
+    (if (= k 29551) 811401216
+    (if (= k 29557) 811139072
+    (if (= k 29793) 811532288
+    (if (= k 29797) 811991040
+    (if (= k 29801) 811663360
+    (if (= k 29807) 812122112
+    (if (= k 29813) 811859968
+    (if (= k 30561) 814678016
+    (if (= k 30575) 814874624
+    (if (= k 31073) 813957120
+    (if (= k 31087) 814219264
+    (if (= k 31093) 814088192
+    (if (= k 31329) 810942464
+    (if (= k 31333) 811335680
+    (if (= k 31337) 811073536
+    (if (= k 31343) 811466752
+    (if (= k 31349) 811204608
+    0)))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))
+
+(defn mora3 [k]
+  (if (= k 6453601) 812855427
+    (if (= k 6453615) 812855431
+    (if (= k 6453621) 812855429
+    (if (= k 6514785) 811675779
+    (if (= k 6514793) 811663360
+    (if (= k 6514799) 811675783
+    (if (= k 6514805) 811675781
+    (if (= k 6781281) 810430595
+    (if (= k 6781295) 810430599
+    (if (= k 6781301) 810430597
+    (if (= k 6846817) 812789891
+    (if (= k 6846831) 812789895
+    (if (= k 6846837) 812789893
+    (if (= k 7043425) 810365059
+    (if (= k 7043439) 810365063
+    (if (= k 7043445) 810365061
+    (if (= k 7174497) 813641859
+    (if (= k 7174511) 813641863
+    (if (= k 7174517) 813641861
+    (if (= k 7240033) 812331139
+    (if (= k 7240047) 812331143
+    (if (= k 7240053) 812331141
+    (if (= k 7371105) 812920963
+    (if (= k 7371119) 812920967
+    (if (= k 7371125) 812920965
+    (if (= k 7502177) 814362755
+    (if (= k 7502191) 814362759
+    (if (= k 7502197) 814362757
+    (if (= k 7563361) 811020419
+    (if (= k 7563369) 811008000
+    (if (= k 7563375) 811020423
+    (if (= k 7563381) 811020421
+    (if (= k 7631733) 811859968
+    0))))))))))))))))))))))))))))))))))
+;; END GENERATED MORA
+
+;; --- keys -------------------------------------------------------------------
+
+(defn letter-of [code]
+  ;; Linux evdev key codes, US layout, lower case. 0 for everything else.
+  (if (= code 30) 97 (if (= code 48) 98 (if (= code 46) 99 (if (= code 32) 100
+  (if (= code 18) 101 (if (= code 33) 102 (if (= code 34) 103 (if (= code 35) 104
+  (if (= code 23) 105 (if (= code 36) 106 (if (= code 37) 107 (if (= code 38) 108
+  (if (= code 50) 109 (if (= code 49) 110 (if (= code 24) 111 (if (= code 25) 112
+  (if (= code 16) 113 (if (= code 19) 114 (if (= code 31) 115 (if (= code 20) 116
+  (if (= code 22) 117 (if (= code 47) 118 (if (= code 17) 119 (if (= code 45) 120
+  (if (= code 21) 121 (if (= code 44) 122 0)))))))))))))))))))))))))))
+
+;; --- the focused window's body -----------------------------------------------
+
+(defn body-base [s]
+  (+ 160 (* 64 (- (w s 2) 1))))
+
+(defn body-len [s base i]
+  (if (>= i 64) 64
+    (if (= (w s (+ base i)) 0) i
+      (body-len s base (+ i 1)))))
+
+(defn copy-preedit [s base at i n]
+  (if (>= i n) 0
+    (do (wp s (+ base (+ at i)) (w s (+ 446 i)))
+        (copy-preedit s base at (+ i 1) n))))
+
+(defn clear-state [s]
+  (do (wp s 433 0) (wp s 445 0) (wp s 442 0) (wp s 443 0) (wp s 444 0) 0))
+
+(defn commit [s]
+  ;; The preedit onto the end of the focused body, whole or not at all.
+  (let [base (body-base s)
+        at (body-len s base 0)
+        n (w s 445)]
+    (if (> (+ at n) 64) -5
+      (do (copy-preedit s base at 0 n)
+          (clear-state s)
+          n))))
+
+;; --- preedit and romaji buffers ----------------------------------------------
+
+(defn pre-push [s cp]
+  (let [n (w s 445)]
+    (if (>= n 32) (do (wp s 478 1) 0)
+      (do (wp s (+ 446 n) cp) (wp s 445 (+ n 1)) 0))))
+
+(defn emit-kana [s r]
+  (do (pre-push s (quot r 65536))
+      (if (> (bit-and r 65535) 0) (pre-push s (bit-and r 65535)) 0)))
+
+(defn sokuon-letter [c]
+  (if (= c 107) 1 (if (= c 115) 1 (if (= c 116) 1 (if (= c 112) 1 (if (= c 99) 1
+  (if (= c 103) 1 (if (= c 122) 1 (if (= c 100) 1 (if (= c 98) 1 (if (= c 106) 1 0)))))))))))
+
+(defn b-at [s i] (w s (+ 434 i)))
+
+(defn sokuon-at [s p n]
+  (if (< n 2) 0
+    (if (not (= (b-at s p) (b-at s (+ p 1)))) 0
+      (sokuon-letter (b-at s p)))))
+
+(defn compact [s p i n]
+  ;; Move buffer bytes p.. down to 0.., n of them.
+  (if (>= i n) (wp s 433 n)
+    (do (wp s (+ 434 i) (b-at s (+ p i)))
+        (compact s p (+ i 1) n))))
+
+(defn convert-buf [s p]
+  (let [n (- (w s 433) p)]
+    (if (= n 0) (wp s 433 0)
+      (if (= (sokuon-at s p n) 1)
+        (do (pre-push s 12387) (convert-buf s (+ p 1)))
+        (let [r3 (if (>= n 3)
+                   (mora3 (+ (* (b-at s p) 65536) (* (b-at s (+ p 1)) 256) (b-at s (+ p 2))))
+                   0)]
+          (if (> r3 0) (do (emit-kana s r3) (convert-buf s (+ p 3)))
+            (let [r2 (if (>= n 2) (mora2 (+ (* (b-at s p) 256) (b-at s (+ p 1)))) 0)]
+              (if (> r2 0) (do (emit-kana s r2) (convert-buf s (+ p 2)))
+                (let [r1 (mora1 (b-at s p))]
+                  (if (> r1 0) (do (emit-kana s r1) (convert-buf s (+ p 1)))
+                    (compact s p 0 n)))))))))))
+
+(defn push-leftover [s i n]
+  (if (>= i n) 0
+    (do (pre-push s (b-at s i)) (push-leftover s (+ i 1) n))))
+
+(defn flush-preedit [s]
+  ;; A lone "n" is "nn"; convert; whatever is left goes in as latin.
+  (do (if (= (w s 433) 1)
+        (if (= (b-at s 0) 110) (do (wp s 435 110) (wp s 433 2)) 0)
+        0)
+      (convert-buf s 0)
+      (push-leftover s 0 (w s 433))
+      (wp s 433 0)))
+
+;; --- the dictionary -----------------------------------------------------------
+
+(defn dw [s d i]
+  (kernel-load-u32 (kernel-subregion d (w s 479) (* i 4) 4) 4 0))
+
+(defn dict-there [s d]
+  (if (= d 0) 0 (if (= (w s 479) 0) 0 1)))
+
+(defn dict-ok [s d]
+  ;; the aiueos-dict/v1 header: magic "AIUD", version 1, N index words
+  ;; inside W, W words inside the bytes handed in
+  (if (< (w s 479) 16) 0
+    (if (not (= (dw s d 0) 1146440001)) 0
+      (if (not (= (dw s d 1) 1)) 0
+        (if (> (* (dw s d 3) 4) (w s 479)) 0
+          (if (> (+ 4 (dw s d 2)) (dw s d 3)) 0 1))))))
+
+(defn rec-ok [s d o]
+  ;; record o: L (1..32) reading code points, C (>= 1) candidates, all
+  ;; inside W
+  (if (= (dict-there s d) 0) 0
+    (if (>= (+ o 1) (dw s d 3)) 0
+      (if (< (dw s d o) 1) 0
+        (if (> (dw s d o) 32) 0
+          (if (> (+ (+ o 2) (dw s d o)) (dw s d 3)) 0
+            (if (< (dw s d (+ (+ o 1) (dw s d o))) 1) 0
+              (if (> (+ (+ (+ o 2) (dw s d o)) (dw s d (+ (+ o 1) (dw s d o)))) (dw s d 3)) 0
+                1))))))))
+
+(defn rec-cmp [s d o i]
+  ;; record o's reading against the preedit, from code point i: <0 the
+  ;; record sorts first, 0 equal, >0 the preedit sorts first
+  (if (>= i (dw s d o)) (if (>= i (w s 445)) 0 -1)
+    (if (>= i (w s 445)) 1
+      (if (< (dw s d (+ (+ o 1) i)) (w s (+ 446 i))) -1
+        (if (> (dw s d (+ (+ o 1) i)) (w s (+ 446 i))) 1
+          (rec-cmp s d o (+ i 1)))))))
+
+(defn search [s d lo hi]
+  ;; the record whose reading is the preedit: its word offset, 0 none,
+  ;; -1 a record out of bounds
+  (if (>= lo hi) 0
+    (let [mid (quot (+ lo hi) 2)
+          o (dw s d (+ 4 mid))]
+      (if (= (rec-ok s d o) 0) -1
+        (let [c (rec-cmp s d o 0)]
+          (if (= c 0) o
+            (if (< c 0) (search s d (+ mid 1) hi)
+              (search s d lo mid))))))))
+
+(defn lookup [s d]
+  (if (= (dict-there s d) 0) 0
+    (if (= (w s 445) 0) 0
+      (search s d 0 (dw s d 2)))))
+
+(defn cand-count [s d o]
+  (dw s d (+ (+ o 1) (dw s d o))))
+
+(defn cand-at [s d o i]
+  (dw s d (+ (+ (+ o 2) (dw s d o)) i)))
+
+(defn set-preedit-one [s cp]
+  (do (wp s 446 cp) (wp s 445 1) 0))
+
+(defn put-reading [s d o i]
+  ;; the record's reading back into the preedit
+  (if (>= i (dw s d o)) (wp s 445 i)
+    (do (wp s (+ 446 i) (dw s d (+ (+ o 1) i)))
+        (put-reading s d o (+ i 1)))))
+
+;; --- keys ---------------------------------------------------------------------
+
+(defn cycle [s d o]
+  (if (= (rec-ok s d o) 0) -6
+    (let [n (cand-count s d o)
+          idx (- (+ (w s 443) 1) (* n (quot (+ (w s 443) 1) n)))]
+      (do (wp s 443 idx) (set-preedit-one s (cand-at s d o idx))))))
+
+(defn on-space [s d]
+  (if (= (w s 442) 1) (cycle s d (w s 444))
+    (do (flush-preedit s)
+        (let [o (lookup s d)]
+          (if (< o 0) -6
+            (if (> o 0)
+              (do (wp s 442 1) (wp s 444 o) (wp s 443 0)
+                  (set-preedit-one s (cand-at s d o 0)))
+              (commit s)))))))
+
+(defn on-enter [s]
+  (do (if (= (w s 442) 0) (flush-preedit s) 0)
+      (commit s)))
+
+(defn cancel [s d]
+  (if (= (w s 442) 1)
+    (if (= (rec-ok s d (w s 444)) 0) -6
+      (do (put-reading s d (w s 444) 0)
+          (wp s 442 0) (wp s 443 0) (wp s 444 0) 0))
+    (do (wp s 433 0) (wp s 445 0) 0)))
+
+;; --- the selection (ADR-0240) --------------------------------------------------
+
+(defn sel-len [s]
+  ;; the focused body's selection, clamped to the body as normalize-selection
+  ;; clamps it; 0 when there is none or it is another window's
+  (if (= (w s 2036) (w s 2))
+    (let [n (body-len s (body-base s) 0)]
+      (if (> (w s 2037) n) n (w s 2037)))
+    0))
+
+(defn set-sel [s k]
+  (if (= k 0) (do (wp s 2036 0) (wp s 2037 0) 0)
+    (do (wp s 2036 (w s 2)) (wp s 2037 k) 0)))
+
+(defn clear-from [s base i n]
+  (if (>= i n) 0
+    (do (wp s (+ base i) 0) (clear-from s base (+ i 1) n))))
+
+(defn drop-selection [s]
+  ;; insert-text "" over [n - k, n): the selected code points go, the caret
+  ;; is at the end of the body again
+  (let [base (body-base s)
+        n (body-len s base 0)]
+    (do (clear-from s base (- n (sel-len s)) n)
+        (set-sel s 0))))
+
+(defn replace-selection [s]
+  (if (> (sel-len s) 0) (drop-selection s) 0))
+
+(defn composing [s]
+  (if (> (w s 433) 0) 1 (if (> (w s 445) 0) 1 (if (= (w s 442) 1) 1 0))))
+
+(defn extend-left [s]
+  ;; move-caret -1 :extend? -- one more code point before the end selected,
+  ;; none past the start of the body
+  (let [k (sel-len s)]
+    (if (< k (body-len s (body-base s) 0)) (set-sel s (+ k 1)) 0)))
+
+(defn extend-right [s]
+  ;; move-caret +1 :extend? -- the caret back toward the anchor at the end
+  (let [k (sel-len s)]
+    (if (> k 0) (set-sel s (- k 1)) 0)))
+
+(defn shift-arrow [s left]
+  (if (= (w s 2035) 0) 0
+    (if (= (composing s) 1) 0
+      (if (= left 1) (extend-left s) (extend-right s)))))
+
+(defn delete-backward [s]
+  ;; browser.text-edit delete-backward. With a selection (ADR-0240) the
+  ;; selection goes. Without one the caret is at the end of the body (where
+  ;; insert-text leaves it): the last code point goes. Bodies hold code
+  ;; points, so there is no surrogate pair to keep whole.
+  (if (> (sel-len s) 0) (drop-selection s)
+    (let [base (body-base s)
+          at (body-len s base 0)]
+      (if (> at 0) (do (wp s (+ base (- at 1)) 0) 0) 0))))
+
+(defn on-backspace [s d]
+  (if (= (w s 442) 1) (cancel s d)
+    (if (> (w s 433) 0) (do (wp s 433 (- (w s 433) 1)) 0)
+      (if (> (w s 445) 0) (do (wp s 445 (- (w s 445) 1)) 0)
+        (delete-backward s)))))
+
+(defn on-letter [s c]
+  (if (>= (w s 433) 8) -8
+    (do (replace-selection s)
+        (wp s (+ 434 (w s 433)) c)
+        (wp s 433 (+ (w s 433) 1))
+        (convert-buf s 0)
+        0)))
+
+(defn put-latin [s c]
+  (let [base (body-base s)
+        at (body-len s base 0)]
+    (if (>= at 64) -5
+      (do (wp s (+ base at) c) 1))))
+
+(defn off-letter [s c]
+  (do (replace-selection s)
+      (put-latin s c)))
+
+;; --- the clipboard (ADR-0241) --------------------------------------------------
+
+(defn cw [d i]
+  (kernel-load-u32 (kernel-subregion d 260 (* i 4) 4) 4 0))
+
+(defn cwp [d i v]
+  (kernel-store-u32 (kernel-subregion d 260 (* i 4) 4) 4 0 v))
+
+(defn ctrl-key [s code]
+  ;; with Ctrl held: C over a selection asks to write the clipboard, V asks
+  ;; to read it; nothing while composing, and no other shortcut
+  (if (= (composing s) 1) 0
+    (if (= code 46) (if (> (sel-len s) 0) 512 0)
+      (if (= code 47) 513 0))))
+
+(defn copy-out [s d from i k]
+  ;; from: the surface word of the first selected code point
+  (if (>= i k) (do (cwp d 0 k) k)
+    (do (cwp d (+ i 1) (w s (+ from i)))
+        (copy-out s d from (+ i 1) k))))
+
+(defn copy-sel [s d]
+  ;; the selection's text into the clipboard: the last k code points
+  (let [k (sel-len s)
+        base (body-base s)]
+    (if (= k 0) 0
+      (copy-out s d (+ base (- (body-len s base 0) k)) 0 k))))
+
+(defn paste-in [s d to i n]
+  ;; to: the surface word the first pasted code point goes to
+  (if (>= i n) n
+    (do (wp s (+ to i) (cw d (+ i 1)))
+        (paste-in s d to (+ i 1) n))))
+
+(defn paste [s d]
+  ;; insert-text of the clipboard's text: the selection goes, the text is
+  ;; appended at the caret (the end of the body), whole or not at all
+  (let [n (cw d 0)
+        base (body-base s)
+        k (sel-len s)
+        at (body-len s base 0)]
+    (if (= n 0) 0
+      (if (> (+ (- at k) n) 64) -5
+        (do (replace-selection s)
+            (paste-in s d (+ base (- at k)) 0 n))))))
+
+(defn complete [s d db code]
+  ;; an admitted request's completion; the clipboard in place of the
+  ;; dictionary
+  (if (= d 0) -7
+    (if (not (= db 260)) -7
+      (if (> (cw d 0) 64) -7
+        (if (= (composing s) 1) 0
+          (if (= code 46) (copy-sel s d)
+            (if (= code 47) (paste s d) 0)))))))
+
+(defn toggle [s]
+  (do (wp s 432 (if (= (w s 432) 0) 1 0))
+      (clear-state s)))
+
+(defn key [s d code]
+  (let [c (letter-of code)]
+    (if (= code 41) (toggle s)
+    (if (= code 105) (shift-arrow s 1)
+    (if (= code 106) (shift-arrow s 0)
+    (if (= (w s 432) 0)
+      (if (> c 0) (off-letter s c)
+        (if (= code 14) (delete-backward s) 0))
+      (if (> c 0) (on-letter s c)
+        (if (= code 57) (on-space s d)
+          (if (= code 28) (on-enter s)
+            (if (= code 14) (on-backspace s d)
+              (if (= code 1) (cancel s d) 0)))))))))))
+
+;; --- admission ----------------------------------------------------------------
+
+(defn has-id [s n k id]
+  (if (>= k n) 0
+    (if (= (w s (+ 5 (* k 5))) id) 1
+      (has-id s n (+ k 1) id))))
+
+(defn hold-alt [s value]
+  (do (if (= value 1) (wp s 431 1) (if (= value 0) (wp s 431 0) 0))
+      0))
+
+(defn hold-shift [s value]
+  (do (if (= value 1) (wp s 2035 1) (if (= value 0) (wp s 2035 0) 0))
+      0))
+
+(defn hold-ctrl [s value]
+  (do (if (= value 1) (wp s 2038 1) (if (= value 0) (wp s 2038 0) 0))
+      0))
+
+(defn ctrl-code [code]
+  (if (= code 29) 1 (if (= code 97) 1 0)))
+
+(defn shift-code [code]
+  (if (= code 42) 1 (if (= code 54) 1 0)))
+
+;; ADR-0254: Alt+Tab raises the bottom-most window that is not minimized (word 31 bits 4..7).
+(defn mbit [id]
+  (if (= id 1) 16 (if (= id 2) 32 (if (= id 3) 64 (if (= id 4) 128 0))))) 
+
+(defn first-vis [s n k]
+  (if (>= k n) (w s 5)
+    (let [id (w s (+ 5 (* k 5)))]
+      (if (= (bit-and (w s 31) (mbit id)) 0) id (first-vis s n (+ k 1))))))
+
+(defn wm-key [s code]
+  (if (= code 15) (if (= (w s 431) 1) 1 0) 0))
+
+;; ADR-0247: F10 (evdev 68) flips the high-contrast palette, word 2039,
+;; browser-frame2.kotoba's. It is no text and no window action: the answer is 0.
+;; ADR-0248: the keyboard focus ring and keyboard activation. Word 2032 is the
+;; ring (browser-frame2.kotoba draws it): 0 none, 1..4 launcher button k when
+;; app k is registered, 5 the focused window's close control when the window is
+;; at least 40 wide and there is an app register. F6 moves it forward through
+;; the targets that exist and then off; Shift+F6 backward. Enter or Space on a
+;; ring target, and Escape for the focused window's close control, do what a
+;; pointer press at the control's centre does -- the answer is that press,
+;; 65536 + 2048 x + y, for C to hand to browser-reduce as a pointer/down, so
+;; the keyboard and the pointer are one action path. Enter and Space with a
+;; composition are the input method's, as before.
+(defn kbit [k] (if (= k 1) 1 (if (= k 2) 2 (if (= k 3) 4 8))))
+
+(defn idx [s n k id]
+  (if (>= k n) -1
+    (if (= (w s (+ 5 (* k 5))) id) k
+      (idx s n (+ k 1) id))))
+
+(defn close-ok [s]
+  (if (= (w s 31) 0) 0
+    (let [i (idx s (w s 1) 0 (w s 2))]
+      (if (< i 0) 0
+        (if (< (w s (+ 8 (* i 5))) 40) 0 1)))))
+
+(defn target-ok [s t]
+  (if (< t 1) 0
+    (if (< t 5)
+      (if (= (bit-and (w s 31) (kbit t)) 0) 0 1)
+      (if (= t 5) (close-ok s) 0))))
+
+(defn next-from [s t]
+  (if (> t 5) 0
+    (if (= (target-ok s t) 1) t
+      (next-from s (+ t 1)))))
+
+(defn prev-from [s t]
+  (if (< t 1) 0
+    (if (= (target-ok s t) 1) t
+      (prev-from s (- t 1)))))
+
+(defn ring-move [s]
+  (do (wp s 2032
+          (if (= (w s 2035) 1)
+            (prev-from s (if (= (w s 2032) 0) 5 (- (w s 2032) 1)))
+            (next-from s (+ (w s 2032) 1))))
+      0))
+
+(defn press-at [px py] (+ 65536 (+ (* px 2048) py)))
+
+(defn close-press [s]
+  (let [i (idx s (w s 1) 0 (w s 2))
+        b (+ 5 (* i 5))]
+    (press-at (- (+ (w s (+ b 1)) (w s (+ b 3))) 16) (+ (w s (+ b 2)) 14))))
+
+(defn ring-press [s]
+  (let [t (w s 2032)]
+    (if (= (target-ok s t) 0) 0
+      (if (= t 5) (close-press s)
+        (press-at (+ 54 (* 102 (- t 1))) 14)))))
+
+(defn hc-toggle [s]
+  (do (wp s 2039 (if (= (w s 2039) 0) 1 0))
+      0))
+
+(defn max-key-ok [s]
+  (if (= (w s 31) 0) 0
+    (let [i (idx s (w s 1) 0 (w s 2))]
+      (if (< i 0) 0
+        (if (< (w s (+ 8 (* i 5))) 160) 0 1)))))
+
+;; ADR-0251: F11 (evdev 87) presses the focused window's maximize control, as a
+;; pointer press at its centre (x + w - 36, y + 14), through browser-reduce.
+(defn max-key-press [s]
+  (let [i (idx s (w s 1) 0 (w s 2))
+        b (+ 5 (* i 5))]
+    (press-at (- (+ (w s (+ b 1)) (w s (+ b 3))) 36) (+ (w s (+ b 2)) 14))))
+
+;; ADR-0256: Alt+- (evdev 12) presses the focused window's minimize control as a pointer press at
+;; its centre (x + w - 56, y + 14) through browser-reduce, when the control exists: a window at
+;; least 200 wide with a launcher while two or more windows are visible.
+(defn vis-n [s n k]
+  (if (>= k n) 0
+    (+ (if (= (bit-and (w s 31) (mbit (w s (+ 5 (* k 5))))) 0) 1 0)
+       (vis-n s n (+ k 1)))))
+
+(defn min-key-ok [s]
+  (if (= (w s 431) 0) 0
+    (if (= (w s 31) 0) 0
+      (let [i (idx s (w s 1) 0 (w s 2))]
+        (if (< i 0) 0
+          (if (< (w s (+ 8 (* i 5))) 200) 0
+            (if (< (vis-n s (w s 1) 0) 2) 0 1)))))))
+
+(defn min-key-press [s]
+  (let [i (idx s (w s 1) 0 (w s 2))
+        b (+ 5 (* i 5))]
+    (press-at (- (+ (w s (+ b 1)) (w s (+ b 3))) 56) (+ (w s (+ b 2)) 14))))
+
+(defn kbd-act [s code]
+  (if (= (composing s) 1) 0
+    (if (= code 28) (if (= (target-ok s (w s 2032)) 1) 1 0)
+      (if (= code 57) (if (= (target-ok s (w s 2032)) 1) 1 0)
+        (if (= code 1) (close-ok s) 0)))))
+
+(defn kbd-answer [s code]
+  (if (= code 1) (close-press s) (ring-press s)))
+
+;; ADR-0258: the screen lock. Ctrl+Alt+L (evdev 38) sets word 2030; while it is 1 the only keys
+;; taken are the PIN's: digits (evdev 2..11) fill word 2031 (7 bits: count in bits 0..2, the number in
+;; the rest), Backspace takes one back, Enter with four digits answers 1000000 + the number for C to
+;; check against the PIN's hash and send back as a verdict event (value 2, code 1 accepted, 2 refused).
+;; Everything else, the shell actions and typing included, is swallowed. Word 2026 is 1 after a refusal
+;; until the next digit.
+(defn lock-chord [s code]
+  (if (= code 38) (if (= (w s 2038) 1) (if (= (w s 431) 1) 1 0) 0) 0))
+
+(defn lock-now [s]
+  (do (wp s 2030 1) (wp s 2031 0) (wp s 2026 0) (wp s 2032 0)
+      (wp s 25 0) (wp s 26 0) (wp s 27 0) (wp s 28 0) (wp s 29 0) (wp s 30 0)
+      (clear-state s)
+      0))
+
+(defn pin-digit [code]
+  (if (< code 2) -1 (if (> code 11) -1 (if (= code 11) 0 (- code 1)))))
+
+(defn pin-count [s] (bit-and (w s 2031) 7))
+
+(defn pin-add [s dg]
+  (if (< (pin-count s) 4)
+    (do (wp s 2031 (+ (* (+ (* (quot (w s 2031) 8) 10) dg) 8) (+ (pin-count s) 1)))
+        (wp s 2026 0)
+        0)
+    0))
+
+(defn pin-back [s]
+  (if (= (pin-count s) 0) 0
+    (do (wp s 2031 (+ (* (quot (quot (w s 2031) 8) 10) 8) (- (pin-count s) 1)))
+        0)))
+
+(defn locked-key [s code]
+  (if (> (pin-digit code) -1) (pin-add s (pin-digit code))
+    (if (= code 14) (pin-back s)
+      (if (= code 28) (if (= (pin-count s) 4) (+ 1000000 (quot (w s 2031) 8)) 0) 0))))
+
+(defn verdict [s code]
+  (if (= (w s 2030) 0) 0
+    (do (wp s 2031 0)
+        (if (= code 1) (do (wp s 2030 0) (wp s 2026 0)) (wp s 2026 1))
+        0)))
+
+(defn press [s d ev]
+  (if (= (bit-and ev 3) 2) (verdict s (quot ev 4))
+  (if (= (quot ev 4) 56) (hold-alt s (bit-and ev 3))
+    (if (= (shift-code (quot ev 4)) 1) (hold-shift s (bit-and ev 3))
+    (if (= (ctrl-code (quot ev 4)) 1) (hold-ctrl s (bit-and ev 3))
+    (if (not (= (bit-and ev 3) 1)) 0
+      (if (= (w s 2030) 1) (locked-key s (quot ev 4))
+      (if (= (lock-chord s (quot ev 4)) 1) (lock-now s)
+      (if (= (quot ev 4) 68) (hc-toggle s)
+      (if (= (quot ev 4) 64) (ring-move s)
+      (if (= (quot ev 4) 87) (if (= (max-key-ok s) 1) (max-key-press s) 0)
+      (if (= (if (= (quot ev 4) 12) (min-key-ok s) 0) 1) (min-key-press s)
+      (if (= (kbd-act s (quot ev 4)) 1) (kbd-answer s (quot ev 4))
+      (if (= (wm-key s (quot ev 4)) 1) (+ 256 (first-vis s (w s 1) 0))
+        (if (= (w s 2038) 1) (ctrl-key s (quot ev 4))
+          (do (wp s 478 0)
+              (let [r (key s d (quot ev 4))]
+                (if (= (w s 478) 1) -8 r))))))))))))))))))
+
+(defn admitted [s d ev]
+  ;; after the surface checks: a dictionary that is there must be
+  ;; aiueos-dict/v1 before any key is taken
+  (if (= (dict-there s d) 1)
+    (if (= (dict-ok s d) 0) -6 (press s d ev))
+    (press s d ev)))
+
+(defn aiueos-browser-key [s sb d db ev]
+  (if (= s 0) -1
+    (if (not (= sb 8192)) -1
+      (if (not (= (w s 0) 1)) -2
+        (if (< (w s 1) 1) -2
+          (if (> (w s 1) 4) -2
+            (if (< (w s 2) 1) -3
+              (if (> (w s 2) 4) -3
+                (if (= (has-id s (w s 1) 0 (w s 2)) 0) -3
+                  (if (= (bit-and ev 3) 3) (complete s d db (quot ev 4))
+                    (do (wp s 479 (if (= d 0) 0 db))
+                        (admitted s d ev))))))))))))
+
+(defn main [] 0)

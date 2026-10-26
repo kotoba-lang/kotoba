@@ -1,0 +1,926 @@
+(ns native.rtl8125
+  ;; K16-specific, firmware-handoff RTL8125 provider.  UEFI PXE has already
+  ;; powered and calibrated the PHY; this module owns PCI discovery, the
+  ;; uncached/NX BAR mapping, one TX/RX DMA descriptor, and the first admitted
+  ;; ARP exchange after ExitBootServices.
+  (:require [capability.link.frame :as link]
+            [capability.dma.map :as dma]
+            [capability.mmio.map :as mapped]
+            [capability.net.transport :as transport])
+  (:export [bar-for-bus install-bar-page install-directory qualify quiesce
+            rings-start tx-submit wait-tx-complete wait-rx-command rx-rearm
+            revision mac-valid bus-probe arm-bus-master link-up]))
+
+(defn pci-address [bus offset]
+  (bit-or 2147483648
+          (bit-or (* bus 65536) (bit-and offset 252))))
+
+(defn pci-read [bus offset]
+  (let [addressed (kernel-out-u32 3320 (pci-address bus offset))]
+    (+ (kernel-in-u32 3324) (* 0 addressed))))
+
+(defn pci-write [bus offset value]
+  (let [addressed (kernel-out-u32 3320 (pci-address bus offset))
+        written (kernel-out-u32 3324 value)]
+    (+ written (* 0 addressed))))
+
+(defn decode-memory-bar [bus offset]
+  (let [low (pci-read bus offset)
+        kind (bit-and (quot low 2) 3)
+        low-address (bit-and low 4294967280)
+        value (if (= kind 2)
+                (+ low-address (* (pci-read bus (+ offset 4)) 4294967296))
+                (if (= kind 0) low-address 0))]
+    (if (and (> value 0)
+             (not (= value 4294967280))
+             (>= value 1073741824)
+             (<= value 549755809792))
+      value
+      0)))
+
+(defn bar-for-bus [bus]
+  (if (and (>= bus 0) (<= bus 255)
+           (= (pci-read bus 0) 2166690028))
+    (let [bar2 (decode-memory-bar bus 24)]
+      (if (> bar2 0) bar2 (decode-memory-bar bus 20)))
+    0))
+
+(defn load64-page [page offset]
+  (+ (kernel-load-u8-4k page 4096 offset)
+     (* (kernel-load-u8-4k page 4096 (+ offset 1)) 256)
+     (* (kernel-load-u8-4k page 4096 (+ offset 2)) 65536)
+     (* (kernel-load-u8-4k page 4096 (+ offset 3)) 16777216)
+     (* (kernel-load-u8-4k page 4096 (+ offset 4)) 4294967296)
+     (* (kernel-load-u8-4k page 4096 (+ offset 5)) 1099511627776)
+     (* (kernel-load-u8-4k page 4096 (+ offset 6)) 281474976710656)
+     (* (kernel-load-u8-4k page 4096 (+ offset 7)) 72057594037927936)))
+
+(defn store64-page [page offset value]
+  (let [s0 (kernel-store-u8-4k page 4096 offset (bit-and value 255))
+        s1 (kernel-store-u8-4k page 4096 (+ offset 1) (bit-and (quot value 256) 255))
+        s2 (kernel-store-u8-4k page 4096 (+ offset 2) (bit-and (quot value 65536) 255))
+        s3 (kernel-store-u8-4k page 4096 (+ offset 3) (bit-and (quot value 16777216) 255))
+        s4 (kernel-store-u8-4k page 4096 (+ offset 4) (bit-and (quot value 4294967296) 255))
+        s5 (kernel-store-u8-4k page 4096 (+ offset 5) (bit-and (quot value 1099511627776) 255))
+        s6 (kernel-store-u8-4k page 4096 (+ offset 6) (bit-and (quot value 281474976710656) 255))
+        s7 (kernel-store-u8-4k page 4096 (+ offset 7) (bit-and (quot value 72057594037927936) 255))]
+    (if (= (load64-page page offset) value)
+      (+ 1 (* 0 (+ s0 s1 s2 s3 s4 s5 s6 s7)))
+      0)))
+
+(defn store64-nx-page [page offset value]
+  (if (and (= (store64-page page offset value) 1)
+           (= 0 (* 0 (kernel-store-u8-4k page 4096 (+ offset 7) 128)))
+           (= (kernel-load-u8-4k page 4096 (+ offset 7)) 128))
+    1
+    0))
+
+(defn install-bar-page [directory bar]
+  (let [physical (* (quot bar 2097152) 2097152)
+        index (bit-and (quot bar 2097152) 511)]
+    ;; present | writable | write-through | cache-disable | huge | NX
+    (store64-nx-page directory (* index 8) (+ physical 155))))
+
+(defn install-directory [pdpt directory bar]
+  (let [pdpt-index (quot bar 1073741824)]
+    (if (and (> pdpt-index 0) (< pdpt-index 512)
+             (= (store64-page pdpt (* pdpt-index 8) (+ directory 3)) 1))
+      (install-bar-page directory bar)
+      0)))
+
+(defn mmio-window [bus bar]
+  ;; Exact PCI identity accompanies the request. Only a validated private
+  ;; v6 resource catalog can grant the bounded window; integers alone cannot.
+  (kernel-pci-mmio bus 0 0 bar 512))
+
+(defn mmio-load-u8 [mmio offset]
+  (do (assert (= (mapped/access-valid 512 offset 1) 1))
+      (kernel-load-u8 mmio 512 offset)))
+
+(defn mmio-load-u16 [mmio offset]
+  (do (assert (= (mapped/access-valid 512 offset 2) 1))
+      (kernel-load-u16 mmio 512 offset)))
+
+(defn mmio-load-u32 [mmio offset]
+  (do (assert (= (mapped/access-valid 512 offset 4) 1))
+      (kernel-load-u32 mmio 512 offset)))
+
+(defn mmio-store-u8 [mmio offset value]
+  (do (assert (= (mapped/access-valid 512 offset 1) 1))
+      (kernel-store-u8 mmio 512 offset value)))
+
+(defn mmio-store-u16 [mmio offset value]
+  (do (assert (= (mapped/access-valid 512 offset 2) 1))
+      (kernel-store-u16 mmio 512 offset value)))
+
+(defn mmio-store-u32 [mmio offset value]
+  (do (assert (= (mapped/access-valid 512 offset 4) 1))
+      (kernel-store-u32 mmio 512 offset value)))
+
+(defn zero-prefix [page bytes offset]
+  (if (= offset bytes)
+    1
+    (let [stored (kernel-store-u8-4k page 4096 offset 0)]
+      (if (= (+ (kernel-load-u8-4k page 4096 offset) (* 0 stored)) 0)
+        (zero-prefix page bytes (+ offset 1))
+        0))))
+
+(defn revision [mmio]
+  (let [masked (bit-and (mmio-load-u32 mmio 64) 2096103424)]
+    (if (= masked 1620049920) 1
+      (if (= masked 1678770176) 2
+        (if (= masked 1753219072) 3
+          (if (= masked 1754267648) 4 0))))))
+
+(defn receive-config [revision-id]
+  (if (= revision-id 1) 1090520832
+    (if (= revision-id 2) 1090522112 1092619264)))
+
+(defn mac-valid [mmio]
+  (let [mac0 (mmio-load-u32 mmio 0)
+        mac4 (mmio-load-u16 mmio 4)]
+    (and (not (= (bit-or mac0 mac4) 0))
+         (not (and (= mac0 4294967295) (= mac4 65535)))
+         (= (bit-and mac0 1) 0))))
+
+;; Read-only bus census. Touches nothing: no PCI write, no MMIO write, no DMA,
+;; no ring. Returns one byte the caller can put on the bus2 netlog, so the
+;; state of a NIC that has never been qualified is observable without giving
+;; it a DMA window first.
+;;   bit0  1 = 10EC:8125 answers config space at <bus>:00.0
+;;   bit1  2 = a memory BAR decoded inside the admitted window
+;;   bit2  4 = PCI command MEMORY-SPACE-ENABLE set
+;;   bit3  8 = PCI command BUS-MASTER-ENABLE set
+;;   bit4 16 = ChipCmd revision recognised (i.e. the BAR really reads back)
+;;   bit5 32 = IDR0..5 holds a plausible unicast MAC
+;;   bit6 64 = PHYstatus (MMIO 108) reports LinkStatus
+;; A qualified NIC reads 0x7F. Bits 4..6 are only meaningful when bit2 is set;
+;; an undecoded window returns all-ones and would otherwise fake bit6.
+(defn bus-probe [bus]
+  (if (not (= (pci-read bus 0) 2166690028))
+    0
+    (let [bar (bar-for-bus bus)
+          command (pci-read bus 4)
+          space (if (= (bit-and command 2) 0) 0 4)
+          master (if (= (bit-and command 4) 0) 0 8)]
+      (if (= bar 0)
+        (+ 1 space master)
+        (let [mmio (kernel-pci-mmio bus 0 0 bar 512)
+              revision-bit (if (= (revision mmio) 0) 0 16)
+              mac-bit (if (mac-valid mmio) 32 0)
+              link-bit (if (= (bit-and (mmio-load-u16 mmio 108) 2) 0) 0 64)]
+          (+ 1 2 space master revision-bit mac-bit link-bit))))))
+
+;; The two prerequisites `qualify` performs inline, named so a second bus can
+;; ask for them without going through the whole ARP qualification.
+(defn arm-bus-master [bus]
+  ;; MEMORY-SPACE-ENABLE | BUS-MASTER-ENABLE, then read the register back.
+  ;; Returns 1 only when the device itself reports both bits set. Idempotent:
+  ;; bus3's census already read 7F (bits 2 and 3 set), so on this board it
+  ;; normally changes nothing -- it exists so a DMA submit never depends on
+  ;; firmware having left them on.
+  (let [command (pci-read bus 4)
+        written (pci-write bus 4 (bit-or (bit-and command 65535) 6))
+        readback (pci-read bus 4)]
+    (if (= (bit-and (+ readback (* 0 written)) 6) 6) 1 0)))
+
+(defn link-up [mmio]
+  ;; PHYstatus (MMIO 108) LinkStatus. 1 = up. Submitting into a down PHY
+  ;; leaves the descriptor owned forever, which is indistinguishable from a
+  ;; ring fault unless the gate runs first.
+  (if (= (bit-and (mmio-load-u16 mmio 108) 2) 0) 0 1))
+
+(defn wait-fifo-empty [mmio remaining]
+  (if (= (bit-and (mmio-load-u8 mmio 211) 48) 48)
+    1
+    (if (= remaining 0)
+      0
+      (let [paused (kernel-pause)]
+        (+ (wait-fifo-empty mmio (- remaining 1)) (* 0 paused))))))
+
+(defn rings-start [mmio revision-id dma-base]
+  (let [tx (kernel-subregion dma-base 16384 0 4096)
+        rx (kernel-subregion dma-base 16384 4096 4096)
+        tx-frame (kernel-subregion dma-base 16384 8192 4096)
+        rx-frame (kernel-subregion dma-base 16384 12288 4096)
+        stopped (mmio-store-u8 mmio 55
+                                (bit-or (mmio-load-u8 mmio 55) 128))
+        fifo-empty (wait-fifo-empty mmio 300000)
+        ;; A sticky firmware FIFO flag must not hide the physical failure
+        ;; stage.  Disable the engine and install our bounded rings anyway;
+        ;; status 4 remains visible and qualify uses those rings only to emit
+        ;; the fixed-MAC diagnostic receipt.
+        disabled (mmio-store-u8 mmio 55 0)
+        tx-zero (zero-prefix tx 32 0)
+        rx-zero (zero-prefix rx 32 0)
+        tx-address (store64-page tx 8 tx-frame)
+        rx-address (store64-page rx 16 rx-frame)
+        tx-command (kernel-store-u32-4k tx 4096 0 1073741824)
+        rx-extension (kernel-store-u32-4k rx 4096 24 0)
+        ;; Read back BEFORE the OWN word hands the descriptor to the NIC; after
+        ;; that the engine may rewrite +24 on a completion.
+        rx-extension-read (kernel-load-u32-4k rx 4096 24)
+        rx-command (kernel-store-u32-4k rx 4096 28 (dma/rx-command 2048))
+        fenced (dma/release-fence)
+        imr (mmio-store-u32 mmio 56 0)
+        isr (mmio-store-u32 mmio 60 4294967295)
+        tx-lo (mmio-store-u32 mmio 32 (bit-and tx 4294967295))
+        tx-hi (mmio-store-u32 mmio 36 (quot tx 4294967296))
+        rx-lo (mmio-store-u32 mmio 228 (bit-and rx 4294967295))
+        rx-hi (mmio-store-u32 mmio 232 (quot rx 4294967296))
+        rx-max (mmio-store-u16 mmio 218 2048)
+        tx-config (mmio-store-u32 mmio 64 50333440)
+        rx-config (mmio-store-u32 mmio 68
+                                  (bit-or (receive-config revision-id) 10))
+        started (mmio-store-u8 mmio 55 12)]
+    ;; A kernel store returns its operand, so `(= tx-command 1073741824)` and
+    ;; its neighbours could not fail (lang-h13). The TX word carries no OWN
+    ;; bit, so it reads back safely even after RE|TE; the RX extension was read
+    ;; back above, before OWN; the RX OWN word is only sequenced -- once the
+    ;; engine runs it may clear OWN on a completion, and a read-back that lost
+    ;; that race would refuse a working ring.
+    (if (and (= tx-zero 1) (= rx-zero 1)
+             (= tx-address 1) (= rx-address 1)
+             (= (kernel-load-u32-4k tx 4096 0) 1073741824)
+             (= rx-extension-read 0)
+             (= fenced 1) (= started 12))
+      (+ (if (= fifo-empty 1) 0 4)
+         (* 0 (+ stopped disabled imr isr tx-lo tx-hi rx-lo rx-hi
+                 rx-max tx-config rx-config tx-command rx-extension
+                 rx-command)))
+      1)))
+
+(defn frame-store-be16 [frame offset value]
+  (let [high (kernel-store-u8-4k frame 4096 offset
+                                  (bit-and (quot value 256) 255))
+        low (kernel-store-u8-4k frame 4096 (+ offset 1)
+                                 (bit-and value 255))]
+    (+ low (* high 256))))
+
+(defn frame-store-be32 [frame offset value]
+  (let [b0 (kernel-store-u8-4k frame 4096 offset
+                                (bit-and (quot value 16777216) 255))
+        b1 (kernel-store-u8-4k frame 4096 (+ offset 1)
+                                (bit-and (quot value 65536) 255))
+        b2 (kernel-store-u8-4k frame 4096 (+ offset 2)
+                                (bit-and (quot value 256) 255))
+        b3 (kernel-store-u8-4k frame 4096 (+ offset 3)
+                                (bit-and value 255))]
+    (+ b3 (* b2 256) (* b1 65536) (* b0 16777216))))
+
+(defn fill-byte [frame offset remaining value]
+  (if (= remaining 0)
+    1
+    (let [stored (kernel-store-u8-4k frame 4096 offset value)]
+      (if (= (+ (kernel-load-u8-4k frame 4096 offset) (* 0 stored)) value)
+        (fill-byte frame (+ offset 1) (- remaining 1) value)
+        0))))
+
+(defn copy-device-mac [frame frame-offset mmio index]
+  (if (= index 6)
+    1
+    (let [value (mmio-load-u8 mmio index)
+          stored (kernel-store-u8-4k frame 4096 (+ frame-offset index) value)]
+      (if (= (+ (kernel-load-u8-4k frame 4096 (+ frame-offset index))
+                (* 0 stored))
+             value)
+        (copy-device-mac frame frame-offset mmio (+ index 1))
+        0))))
+
+(defn build-arp-request [frame mmio]
+  (if (and (= (zero-prefix frame 60 0) 1)
+           (= (fill-byte frame 0 6 255) 1)
+           (= (copy-device-mac frame 6 mmio 0) 1)
+           (= (frame-store-be16 frame 12 2054) 2054)
+           (= (frame-store-be16 frame 14 1) 1)
+           (= (frame-store-be16 frame 16 2048) 2048)
+           (= 0 (* 0 (kernel-store-u8-4k frame 4096 18 6)))
+           (= (kernel-load-u8-4k frame 4096 18) 6)
+           (= 0 (* 0 (kernel-store-u8-4k frame 4096 19 4)))
+           (= (kernel-load-u8-4k frame 4096 19) 4)
+           (= (frame-store-be16 frame 20 1) 1)
+           (= (copy-device-mac frame 22 mmio 0) 1)
+           (= (fill-byte frame 32 6 0) 1)
+           (= (frame-store-be32 frame 28 172818442) 172818442)
+           (= (frame-store-be32 frame 38 172818433) 172818433))
+    42
+    0))
+
+(defn tx-submit [mmio tx tx-frame frame-length]
+  (let [wire-length (link/tx-wire-length frame-length)]
+    (if (or (= wire-length 0)
+            (not (= (bit-and (kernel-load-u32-4k tx 4096 0) 2147483648) 0)))
+      5
+      (let [extension (kernel-store-u32-4k tx 4096 4 0)
+          ;; read back before the OWN word is written (lang-h13)
+          extension-read (kernel-load-u32-4k tx 4096 4)
+          address (store64-page tx 8 tx-frame)
+          before (dma/release-fence)
+          command (kernel-store-u32-4k tx 4096 0
+                                    (dma/tx-command wire-length))
+          after (dma/release-fence)
+          kicked (mmio-store-u16 mmio 144 1)]
+        ;; The OWN word is sequenced, not read back: after the kick the engine
+        ;; clears OWN, and a read-back that lost that race would report a
+        ;; successful submit as a failure.
+        (if (and (= extension-read 0) (= address 1) (= before 1)
+                 (= after 1) (= kicked 1)
+                 (= 0 (* 0 (+ extension command))))
+          0
+          1)))))
+
+(defn wait-tx-complete [tx remaining]
+  ;; x86 TSO already gives the descriptor load acquire ordering needed here;
+  ;; a serialising CPUID in every polling iteration would make the bounded
+  ;; 200M budget unusably slow on the physical K16.
+  (if (= (bit-and (kernel-load-u32-4k tx 4096 0) 2147483648) 0)
+    1
+    (if (= remaining 0)
+      0
+      (let [paused (kernel-pause)]
+        (+ (wait-tx-complete tx (- remaining 1)) (* 0 paused))))))
+
+(defn wait-rx-command [rx remaining]
+  (let [command (kernel-load-u32-4k rx 4096 28)]
+    (if (= (bit-and command 2147483648) 0)
+      command
+      (if (= remaining 0)
+        0
+        (let [paused (kernel-pause)]
+          (+ (wait-rx-command rx (- remaining 1)) (* 0 paused)))))))
+
+(defn quiesce [bus bar]
+  (let [mmio (kernel-pci-mmio bus 0 0 bar 512)
+        stopped (mmio-store-u8 mmio 55
+                                (bit-or (mmio-load-u8 mmio 55) 128))]
+    (if (= (wait-fifo-empty mmio 300000) 1)
+      (let [disabled (mmio-store-u8 mmio 55 0)]
+        (if (= disabled 0) (+ 1 (* 0 stopped)) 0))
+      0)))
+
+(defn frame-be16 [frame offset]
+  (+ (* (kernel-load-u8-4k frame 4096 offset) 256)
+     (kernel-load-u8-4k frame 4096 (+ offset 1))))
+
+(defn frame-be32 [frame offset]
+  (+ (* (kernel-load-u8-4k frame 4096 offset) 16777216)
+     (* (kernel-load-u8-4k frame 4096 (+ offset 1)) 65536)
+     (* (kernel-load-u8-4k frame 4096 (+ offset 2)) 256)
+     (kernel-load-u8-4k frame 4096 (+ offset 3))))
+
+(defn frame-mac-matches-device [frame frame-offset mmio index]
+  (if (= index 6)
+    1
+    (if (= (kernel-load-u8-4k frame 4096 (+ frame-offset index))
+           (mmio-load-u8 mmio index))
+      (frame-mac-matches-device frame frame-offset mmio (+ index 1))
+      0)))
+
+(defn frame-macs-match [frame left-offset right-offset index]
+  (if (= index 6)
+    1
+    (if (= (kernel-load-u8-4k frame 4096 (+ left-offset index))
+           (kernel-load-u8-4k frame 4096 (+ right-offset index)))
+      (frame-macs-match frame left-offset right-offset (+ index 1))
+      0)))
+
+(defn arp-reply-valid [frame length mmio]
+  (and (>= length 42) (<= length 2048)
+       (= (frame-mac-matches-device frame 0 mmio 0) 1)
+       (= (frame-macs-match frame 6 22 0) 1)
+       (= (frame-be16 frame 12) 2054)
+       (= (frame-be16 frame 14) 1)
+       (= (frame-be16 frame 16) 2048)
+       (= (kernel-load-u8-4k frame 4096 18) 6)
+       (= (kernel-load-u8-4k frame 4096 19) 4)
+       (= (frame-be16 frame 20) 2)
+       (= (frame-be32 frame 28) 172818433)
+       (= (frame-be32 frame 38) 172818442)
+       (= (frame-mac-matches-device frame 32 mmio 0) 1)))
+
+;; The physical qualification receipt is emitted by this provider itself,
+;; after the ARP reply has been admitted.  The Mac's existing UDP/7777 logger
+;; can therefore distinguish "UEFI downloaded the image" from "the pure
+;; Kotoba RTL8125 driver transmitted, received and used an ARP reply" without
+;; privileged packet capture or a host-side ARP-cache guess.
+(defn receipt-byte [index]
+  (if (= index 0) 65
+    (if (= index 1) 73
+      (if (= index 2) 85
+        (if (= index 3) 69
+          (if (= index 4) 79
+            (if (= index 5) 83
+              (if (= index 6) 95
+                (if (= index 7) 78
+                  (if (= index 8) 65
+                    (if (= index 9) 84
+                      (if (= index 10) 73
+                        (if (= index 11) 86
+                          (if (= index 12) 69
+                            (if (= index 13) 95
+                              (if (= index 14) 65
+                                (if (= index 15) 82
+                                  (if (= index 16) 80
+                                    (if (= index 17) 95
+                                      (if (= index 18) 79
+                                        (if (= index 19) 75 0)))))))))))))))))))))
+
+(defn store-receipt [frame offset index]
+  (if (= index 20)
+    1
+    (let [value (receipt-byte index)
+          stored (kernel-store-u8-4k frame 4096 (+ offset index) value)]
+      (if (= (+ (kernel-load-u8-4k frame 4096 (+ offset index)) (* 0 stored))
+             value)
+        (store-receipt frame offset (+ index 1))
+        0))))
+
+(defn copy-frame-mac [destination destination-offset source source-offset index]
+  (if (= index 6)
+    1
+    (let [value (kernel-load-u8-4k source 4096 (+ source-offset index))
+          stored (kernel-store-u8-4k destination 4096
+                                      (+ destination-offset index) value)]
+      (if (= (+ (kernel-load-u8-4k destination 4096
+                                   (+ destination-offset index))
+                (* 0 stored))
+             value)
+        (copy-frame-mac destination destination-offset
+                        source source-offset (+ index 1))
+        0))))
+
+(defn build-ipv4-udp-header [frame]
+  (if (and (= 0 (* 0 (kernel-store-u8-4k frame 4096 14 69)))
+           (= (kernel-load-u8-4k frame 4096 14) 69)
+           (= 0 (* 0 (kernel-store-u8-4k frame 4096 15 0)))
+           (= (kernel-load-u8-4k frame 4096 15) 0)
+           (= (frame-store-be16 frame 16 48) 48)
+           (= (frame-store-be16 frame 18 0) 0)
+           (= (frame-store-be16 frame 20 0) 0)
+           (= 0 (* 0 (kernel-store-u8-4k frame 4096 22 64)))
+           (= (kernel-load-u8-4k frame 4096 22) 64)
+           (= 0 (* 0 (kernel-store-u8-4k frame 4096 23 17)))
+           (= (kernel-load-u8-4k frame 4096 23) 17)
+           (= (frame-store-be16 frame 24 26137) 26137)
+           (= (frame-store-be32 frame 26 172818442) 172818442)
+           (= (frame-store-be32 frame 30 172818433) 172818433)
+           (= (frame-store-be16 frame 34 7779) 7779)
+           (= (frame-store-be16 frame 36 7777) 7777)
+           (= (frame-store-be16 frame 38 28) 28)
+           (= (frame-store-be16 frame 40 0) 0))
+    1
+    0))
+
+(defn build-native-arp-receipt [frame arp-reply mmio]
+  ;; Ethernet + IPv4 + UDP + "AIUEOS_NATIVE_ARP_OK".  The fixed IPv4 header
+  ;; checksum 0x6619 covers total length 48, TTL 64, UDP, 10.77.0.10 ->
+  ;; 10.77.0.1.  IPv4 permits a zero UDP checksum.
+  (if (and (= (zero-prefix frame 62 0) 1)
+           (= (copy-frame-mac frame 0 arp-reply 6 0) 1)
+           (= (copy-device-mac frame 6 mmio 0) 1)
+           (= (frame-store-be16 frame 12 2048) 2048)
+           (= (build-ipv4-udp-header frame) 1)
+           (= (store-receipt frame 42 0) 1))
+    62
+    0))
+
+(defn send-native-arp-receipt [mmio tx tx-frame arp-reply]
+  (let [frame-length (build-native-arp-receipt tx-frame arp-reply mmio)]
+    (if (= frame-length 0)
+      26
+      (let [submitted (tx-submit mmio tx tx-frame frame-length)]
+        (if (not (= submitted 0))
+          27
+          (if (= (wait-tx-complete tx 200000000) 1) 0 28))))))
+
+(defn hex-digit [value]
+  (if (< value 10) (+ value 48) (+ value 55)))
+
+(defn diagnostic-byte [index status]
+  ;; ASCII payload: AIUEOS_NATIVE_NIC_XX, with a two-digit hexadecimal status.
+  (if (= index 0) 65
+    (if (= index 1) 73
+      (if (= index 2) 85
+        (if (= index 3) 69
+          (if (= index 4) 79
+            (if (= index 5) 83
+              (if (= index 6) 95
+                (if (= index 7) 78
+                  (if (= index 8) 65
+                    (if (= index 9) 84
+                      (if (= index 10) 73
+                        (if (= index 11) 86
+                          (if (= index 12) 69
+                            (if (= index 13) 95
+                              (if (= index 14) 78
+                                (if (= index 15) 73
+                                  (if (= index 16) 67
+                                    (if (= index 17) 95
+                                      (if (= index 18)
+                                        (hex-digit (bit-and (quot status 16) 15))
+                                        (hex-digit (bit-and status 15))))))))))))))))))))))
+
+(defn store-diagnostic [frame offset index status]
+  (if (= index 20)
+    1
+    (let [value (diagnostic-byte index status)
+          stored (kernel-store-u8-4k frame 4096 (+ offset index) value)]
+      (if (= (+ (kernel-load-u8-4k frame 4096 (+ offset index)) (* 0 stored))
+             value)
+        (store-diagnostic frame offset (+ index 1) status)
+        0))))
+
+(defn store-server-mac [frame]
+  (let [s0 (kernel-store-u8-4k frame 4096 0 128)
+        s1 (kernel-store-u8-4k frame 4096 1 105)
+        s2 (kernel-store-u8-4k frame 4096 2 26)
+        s3 (kernel-store-u8-4k frame 4096 3 23)
+        s4 (kernel-store-u8-4k frame 4096 4 79)
+        s5 (kernel-store-u8-4k frame 4096 5 21)]
+    ;; read-back, not operand echo (lang-h13)
+    (if (and (= (kernel-load-u8-4k frame 4096 0) 128)
+             (= (kernel-load-u8-4k frame 4096 1) 105)
+             (= (kernel-load-u8-4k frame 4096 2) 26)
+             (= (kernel-load-u8-4k frame 4096 3) 23)
+             (= (kernel-load-u8-4k frame 4096 4) 79)
+             (= (kernel-load-u8-4k frame 4096 5) 21)
+             (= 0 (* 0 (+ s0 s1 s2 s3 s4 s5))))
+      1
+      0)))
+
+(defn build-native-nic-diagnostic [frame mmio status]
+  (if (and (= (zero-prefix frame 62 0) 1)
+           (= (store-server-mac frame) 1)
+           (= (copy-device-mac frame 6 mmio 0) 1)
+           (= (frame-store-be16 frame 12 2048) 2048)
+           (= (build-ipv4-udp-header frame) 1)
+           (= (store-diagnostic frame 42 0 status) 1))
+    62
+    0))
+
+(defn send-native-nic-diagnostic [mmio dma-base status]
+  (let [tx (kernel-subregion dma-base 16384 0 4096)
+        tx-frame (kernel-subregion dma-base 16384 8192 4096)
+        frame-length (build-native-nic-diagnostic tx-frame mmio status)]
+    (if (= frame-length 0)
+      0
+      (if (= (tx-submit mmio tx tx-frame frame-length) 0)
+        (wait-tx-complete tx 200000000)
+        0))))
+
+(defn diagnose-network-status [mmio dma-base status]
+  ;; Preserve the provider's status as the return value.  On failure, also
+  ;; make one best-effort Ethernet/IPv4/UDP report directly to the PXE Mac's
+  ;; known link-layer address, so diagnosis does not itself depend on ARP.
+  (if (= status 0)
+    0
+    (let [reported (send-native-nic-diagnostic mmio dma-base status)]
+      (+ status (* 0 reported)))))
+
+(defn rx-rearm [rx rx-frame]
+  (let [extension (kernel-store-u32-4k rx 4096 24 0)
+        ;; read back before the OWN word is written (lang-h13)
+        extension-read (kernel-load-u32-4k rx 4096 24)
+        address (store64-page rx 16 rx-frame)
+        fenced (dma/release-fence)
+        command (kernel-store-u32-4k rx 4096 28 (dma/rx-command 2048))
+        after (dma/release-fence)]
+    ;; The OWN word is sequenced, not read back: it hands the descriptor to a
+    ;; running engine, which may clear OWN before the load returns.
+    (if (and (= extension-read 0) (= address 1) (= fenced 1)
+             (= after 1) (= 0 (* 0 (+ extension command))))
+      1
+      0)))
+
+;; The HTTPS path starts with one deliberately narrow TCP handshake to the
+;; Mac's byte-for-byte TLS passthrough at 10.77.0.1:8443.  The Mac does not
+;; terminate TLS; it only forwards the stream to api.murakumo.cloud:443.  This
+;; stage therefore proves the pure Kotoba frame/checksum/sequence path without
+;; confusing it with the later TLS or HTTP admission gates.
+(defn checksum-word [frame base length offset]
+  (if (>= offset length)
+    0
+    (+ (* (kernel-load-u8-4k frame 4096 (+ base offset)) 256)
+       (if (< (+ offset 1) length)
+         (kernel-load-u8-4k frame 4096 (+ base offset 1))
+         0))))
+
+(defn checksum-sum [frame base length offset total]
+  (if (>= offset length)
+    total
+    (checksum-sum frame base length (+ offset 2)
+                  (+ total (checksum-word frame base length offset)))))
+
+(defn checksum-fold [total]
+  (if (<= total 65535)
+    total
+    (checksum-fold (+ (bit-and total 65535) (quot total 65536)))))
+
+(defn internet-checksum [frame base length seed]
+  (- 65535 (checksum-fold (checksum-sum frame base length 0 seed))))
+
+(defn ipv4-checksum-valid [frame base length]
+  ;; The sender stores 65535 - fold(sum) into the checksum field, so the
+  ;; folded sum over the header INCLUDING that field is 0xFFFF and recomputing
+  ;; the same primitive over the received bytes yields exactly zero.  One
+  ;; primitive for both directions; verified on the host against a synthetic
+  ;; header (valid -> 0, single-bit corruption -> nonzero) before this gate.
+  ;; Returns the subset-language integer 1/0, not a boolean: the caller
+  ;; compares against 0 and the subset rejects mixed-type equality.
+  (if (= (- 65535 (checksum-fold (checksum-sum frame base length 0 0))) 0)
+    1
+    0))
+
+(defn tcp-pseudo-sum [src dst tcp-length]
+  (+ (+ (quot src 65536) (bit-and src 65535))
+     (+ (+ (quot dst 65536) (bit-and dst 65535))
+        (+ 6 tcp-length))))
+
+(defn build-tcp-segment [frame peer-frame peer-mac-offset mmio mode]
+  (let [src 172818442
+        dst 172818433
+        tcp-length 20
+        total-length 40
+        sequence (if (= mode 0) 2715820032 2715820033)
+        acknowledgement (if (= mode 0)
+                          0
+                          (+ (frame-be32 peer-frame 38) 1))
+        flags (if (= mode 0) 2 (if (= mode 1) 16 20))]
+    ;; link/frame owns the pre-FCS Ethernet bound. Do not depend on RTL8125
+    ;; descriptor-side padding: the first physical candidate published 54 and
+    ;; could be discarded as a runt despite descriptor completion.
+    (if (and (= (zero-prefix frame 60 0) 1)
+             (= (copy-frame-mac frame 0 peer-frame peer-mac-offset 0) 1)
+             (= (copy-device-mac frame 6 mmio 0) 1)
+             (= (frame-store-be16 frame 12 2048) 2048)
+             (= 0 (* 0 (kernel-store-u8-4k frame 4096 14 69)))
+             (= (kernel-load-u8-4k frame 4096 14) 69)
+             (= 0 (* 0 (kernel-store-u8-4k frame 4096 15 0)))
+             (= (kernel-load-u8-4k frame 4096 15) 0)
+             (= (frame-store-be16 frame 16 total-length) total-length)
+             (= (frame-store-be16 frame 18 1) 1)
+             (= (frame-store-be16 frame 20 16384) 16384)
+             (= 0 (* 0 (kernel-store-u8-4k frame 4096 22 64)))
+             (= (kernel-load-u8-4k frame 4096 22) 64)
+             (= 0 (* 0 (kernel-store-u8-4k frame 4096 23 6)))
+             (= (kernel-load-u8-4k frame 4096 23) 6)
+             (= (frame-store-be16 frame 24 0) 0)
+             (= (frame-store-be32 frame 26 src) src)
+             (= (frame-store-be32 frame 30 dst) dst)
+             (= (frame-store-be16 frame 24
+                                   (internet-checksum frame 14 20 0))
+                (frame-be16 frame 24))
+             (= (frame-store-be16 frame 34 49155) 49155)
+             (= (frame-store-be16 frame 36 8443) 8443)
+             (= (frame-store-be32 frame 38 sequence) sequence)
+             (= (frame-store-be32 frame 42 acknowledgement) acknowledgement)
+             (= 0 (* 0 (kernel-store-u8-4k frame 4096 46 80)))
+             (= (kernel-load-u8-4k frame 4096 46) 80)
+             (= 0 (* 0 (kernel-store-u8-4k frame 4096 47 flags)))
+             (= (kernel-load-u8-4k frame 4096 47) flags)
+             (= (frame-store-be16 frame 48 256) 256)
+             (= (frame-store-be16 frame 50 0) 0)
+             (= (frame-store-be16 frame 52 0) 0)
+             (= (frame-store-be16
+                  frame 50
+                  (internet-checksum frame 34 tcp-length
+                                     (tcp-pseudo-sum src dst tcp-length)))
+                (frame-be16 frame 50)))
+      (link/tx-wire-length (+ 14 total-length))
+      0)))
+
+(defn tcp-syn-ack-header-status [frame length mmio]
+  (let [src 172818433
+        dst 172818442
+        total (if (>= length 18) (frame-be16 frame 16) 0)
+        tcp-header (if (>= length 47)
+                     (transport/tcp-header-length
+                      (kernel-load-u8-4k frame 4096 46))
+                     0)]
+    ;; Keep this first physical classifier deliberately small.  The caller
+    ;; reports RX arrival before entering here, so a malformed peer frame or
+    ;; compiler defect cannot be confused with an empty RX ring.  Full IP/TCP
+    ;; checksum admission follows only after this header-only path is proven
+    ;; on the K16.
+    (if (not (and (>= length 54) (<= length 2048)
+                  (= (frame-mac-matches-device frame 0 mmio 0) 1)
+                  (= (frame-be16 frame 12) 2048)))
+      145
+      (if (not (and (= (kernel-load-u8-4k frame 4096 14) 69)
+                    (= (kernel-load-u8-4k frame 4096 23) 6)
+                    (<= (+ 14 total) length)
+                    (= (frame-be32 frame 26) src)
+                    (= (frame-be32 frame 30) dst)))
+        146
+        (if (not (and (= (frame-be16 frame 34) 8443)
+                      (= (frame-be16 frame 36) 49155)
+                      (= (frame-be32 frame 42) 2715820033)))
+          148
+          ;; Gate N1, tranche one: IPv4 checksum admission (reserved status
+          ;; 93).  The header spans bytes 14..33 of the received frame and the
+          ;; peer's checksum was computed over exactly those 20 bytes.
+          (if (= (ipv4-checksum-valid frame 14 20) 0)
+            93
+            ;; Gate N1, tranche two: TCP checksum admission (reserved status
+            ;; 96).  Same zero-fold admission as the IPv4 gate, over the
+            ;; received TCP header (frame bytes 34..53): the peer stored
+            ;; 65535 - fold(sum) computed with the pseudo-header seed, so
+            ;; folding the same primitives over those bytes INCLUDING the
+            ;; checksum field with the same seed yields exactly zero for a
+            ;; valid segment and nonzero after any single corruption.  The
+            ;; seed uses the addresses as seen ON THE WIRE: frame 26..29 is
+            ;; the source (gateway 172818433), frame 30..33 the destination
+            ;; (K16 172818442); the pseudo-header is symmetric, so the
+            ;; sender's mirrored pair folds the same sum -- verified on the
+            ;; host against a synthetic SYN-ACK (valid -> zero fold, corrupt
+            ;; window byte -> nonzero) before this gate.  Returns integer 1/0
+            ;; (the subset rejects mixed-type equality).
+            (if (= (- 65535
+                      (checksum-fold
+                       (checksum-sum frame 34 20 0 (tcp-pseudo-sum src dst 20))))
+                   0)
+              96
+              (if (= (transport/syn-ack-shape
+                      total tcp-header
+                      (kernel-load-u8-4k frame 4096 47)) 1)
+                69
+                149))))))))
+
+(defn tcp-receipt-byte [index]
+  ;; ASCII payload: AIUEOS_NATIVE_TCP_OK.
+  (if (= index 0) 65
+    (if (= index 1) 73
+      (if (= index 2) 85
+        (if (= index 3) 69
+          (if (= index 4) 79
+            (if (= index 5) 83
+              (if (= index 6) 95
+                (if (= index 7) 78
+                  (if (= index 8) 65
+                    (if (= index 9) 84
+                      (if (= index 10) 73
+                        (if (= index 11) 86
+                          (if (= index 12) 69
+                            (if (= index 13) 95
+                              (if (= index 14) 84
+                                (if (= index 15) 67
+                                  (if (= index 16) 80
+                                    (if (= index 17) 95
+                                      (if (= index 18) 79
+                                        (if (= index 19) 75 0)))))))))))))))))))))
+
+(defn store-tcp-receipt [frame offset index]
+  (if (= index 20)
+    1
+    (let [value (tcp-receipt-byte index)
+          stored (kernel-store-u8-4k frame 4096 (+ offset index) value)]
+      (if (= (+ (kernel-load-u8-4k frame 4096 (+ offset index)) (* 0 stored))
+             value)
+        (store-tcp-receipt frame offset (+ index 1))
+        0))))
+
+(defn build-native-tcp-receipt [frame peer-frame mmio]
+  (if (and (= (zero-prefix frame 62 0) 1)
+           (= (copy-frame-mac frame 0 peer-frame 6 0) 1)
+           (= (copy-device-mac frame 6 mmio 0) 1)
+           (= (frame-store-be16 frame 12 2048) 2048)
+           (= (build-ipv4-udp-header frame) 1)
+           (= (store-tcp-receipt frame 42 0) 1))
+    62
+    0))
+
+(defn send-native-tcp-receipt [mmio tx tx-frame peer-frame]
+  (let [frame-length (build-native-tcp-receipt tx-frame peer-frame mmio)]
+    (if (= frame-length 0)
+      36
+      (let [submitted (tx-submit mmio tx tx-frame frame-length)]
+        (if (not (= submitted 0))
+          36
+          (if (= (wait-tx-complete tx 200000000) 1) 0 36))))))
+
+(defn tcp-ack-reset-and-receipt [mmio tx tx-frame peer-frame]
+  ;; Complete the three-way handshake before the bounded RST cleanup.  The
+  ;; earlier candidate jumped straight from SYN-ACK to RST|ACK, which proved a
+  ;; peer response but did not establish the connection it claimed to test.
+  (let [ack-length (build-tcp-segment tx-frame peer-frame 6 mmio 1)]
+    (if (or (= ack-length 0)
+            (not (= (tx-submit mmio tx tx-frame ack-length) 0))
+            (not (= (wait-tx-complete tx 200000000) 1)))
+      35
+      (let [reset-length (build-tcp-segment tx-frame peer-frame 6 mmio 2)]
+        (if (or (= reset-length 0)
+                (not (= (tx-submit mmio tx tx-frame reset-length) 0))
+                (not (= (wait-tx-complete tx 200000000) 1)))
+          35
+          (send-native-tcp-receipt mmio tx tx-frame peer-frame))))))
+
+(defn receive-tcp-syn-ack [mmio dma-base frames]
+  (let [tx (kernel-subregion dma-base 16384 0 4096)
+        rx (kernel-subregion dma-base 16384 4096 4096)
+        tx-frame (kernel-subregion dma-base 16384 8192 4096)
+        rx-frame (kernel-subregion dma-base 16384 12288 4096)]
+    (if (= frames 0)
+      34
+      ;; This is a physical diagnostic gate, not an unbounded runtime poll.
+      ;; Four short windows restore a visible screen result in seconds while
+      ;; the UDP stage receipts identify whether any peer frame arrived.
+      (let [command (wait-rx-command rx 250000)]
+        (if (= command 0)
+          (if (= frames 1)
+            33
+            (receive-tcp-syn-ack mmio dma-base (- frames 1)))
+          (let [bytes (bit-and command 16383)
+                valid-command (and (= (bit-and command 1048576) 0)
+                                   (not (= (bit-and command 33554432) 0))
+                                   (not (= (bit-and command 16777216) 0))
+                                   (>= bytes 58) (<= bytes 2048))
+                ;; Report descriptor arrival before parsing.  The compact
+                ;; classifier no longer reads tx-frame, which this report
+                ;; deliberately reuses.
+                arrived (send-native-nic-diagnostic mmio dma-base 68)
+                inspection (if valid-command
+                             (tcp-syn-ack-header-status
+                              rx-frame (- bytes 4) mmio)
+                             144)
+                classified (send-native-nic-diagnostic
+                            mmio dma-base inspection)]
+            (if (= inspection 69)
+              (let [admitted classified]
+                (+ (tcp-ack-reset-and-receipt mmio tx tx-frame rx-frame)
+                   (* 0 admitted)))
+              (if (= (rx-rearm rx rx-frame) 1)
+                (+ (receive-tcp-syn-ack mmio dma-base (- frames 1))
+                   (* 0 (+ arrived classified)))
+                30))))))))
+
+(defn probe-tcp-after-arp [mmio dma-base arp-reply]
+  (let [tx (kernel-subregion dma-base 16384 0 4096)
+        rx (kernel-subregion dma-base 16384 4096 4096)
+        tx-frame (kernel-subregion dma-base 16384 8192 4096)
+        rx-frame (kernel-subregion dma-base 16384 12288 4096)
+        entered (send-native-nic-diagnostic mmio dma-base 64)
+        syn-length (build-tcp-segment tx-frame arp-reply 6 mmio 0)]
+    (if (= syn-length 0)
+      (+ 29 (* 0 entered))
+      (if (not (= (rx-rearm rx rx-frame) 1))
+        (+ 30 (* 0 entered))
+        (if (not (= (tx-submit mmio tx tx-frame syn-length) 0))
+          (+ 31 (* 0 entered))
+          (if (not (= (wait-tx-complete tx 8000000) 1))
+            (+ 32 (* 0 entered))
+            (let [transmitted (send-native-nic-diagnostic mmio dma-base 67)]
+              (+ (receive-tcp-syn-ack mmio dma-base 4)
+                 (* 0 (+ entered transmitted))))))))))
+
+(defn receive-arp [mmio dma-base frames]
+  (let [tx (kernel-subregion dma-base 16384 0 4096)
+        rx (kernel-subregion dma-base 16384 4096 4096)
+        tx-frame (kernel-subregion dma-base 16384 8192 4096)
+        rx-frame (kernel-subregion dma-base 16384 12288 4096)]
+    (if (= frames 0)
+      25
+      (let [command (wait-rx-command rx 200000000)]
+        (if (= command 0)
+          23
+          (let [bytes (bit-and command 16383)
+                valid-command (and (= (bit-and command 1048576) 0)
+                                   (not (= (bit-and command 33554432) 0))
+                                   (not (= (bit-and command 16777216) 0))
+                                   (>= bytes 18) (<= bytes 2048))]
+            (if (and valid-command (arp-reply-valid rx-frame (- bytes 4) mmio))
+              (let [arp-receipt
+                    (send-native-arp-receipt mmio tx tx-frame rx-frame)]
+                (if (= arp-receipt 0)
+                  (probe-tcp-after-arp mmio dma-base rx-frame)
+                  arp-receipt))
+              (if (= (rx-rearm rx rx-frame) 1)
+                (receive-arp mmio dma-base (- frames 1))
+                24))))))))
+
+(defn qualify [bus bar dma-base]
+  (let [tx (kernel-subregion dma-base 16384 0 4096)
+        rx (kernel-subregion dma-base 16384 4096 4096)
+        tx-frame (kernel-subregion dma-base 16384 8192 4096)
+        rx-frame (kernel-subregion dma-base 16384 12288 4096)
+        mmio (kernel-pci-mmio bus 0 0 bar 512)
+        flushed (kernel-invlpg bar)
+        command (pci-read bus 4)
+        enabled (pci-write bus 4 (bit-or (bit-and command 65535) 6))
+        revision-id (revision mmio)]
+    (if (= revision-id 0)
+      (+ 2 (* 0 (+ flushed enabled)))
+      (if (not (mac-valid mmio))
+        3
+        (let [started (rings-start mmio revision-id dma-base)]
+          (if (not (= started 0))
+            (diagnose-network-status mmio dma-base (+ 10 started))
+            (if (= (bit-and (mmio-load-u16 mmio 108) 2) 0)
+              (diagnose-network-status mmio dma-base 20)
+              (let [arp-bytes (build-arp-request tx-frame mmio)
+                    submitted (tx-submit mmio tx tx-frame arp-bytes)]
+                (if (or (= arp-bytes 0) (not (= submitted 0)))
+                  (diagnose-network-status mmio dma-base 21)
+                  (if (= (wait-tx-complete tx 200000000) 0)
+                    (diagnose-network-status mmio dma-base 22)
+                    (diagnose-network-status mmio dma-base
+                                             (receive-arp mmio dma-base 8))))))))))))

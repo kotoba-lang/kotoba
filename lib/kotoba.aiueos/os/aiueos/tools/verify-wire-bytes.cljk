@@ -1,0 +1,191 @@
+#!/usr/bin/env kbb
+(ns verify-wire-bytes
+  "The kernel's single-byte trace values against the one registry (lang-h9).
+
+  os/aiueos/native/wire-bytes.edn is where a trace byte's uniqueness is
+  decided. This script holds the sources to it in both directions:
+
+    duplicate       two registry entries on one channel claim overlapping
+                    values ([value, value+span)) or the same :name
+    hex-mismatch    an entry's :hex does not render its :value (doc rot)
+    unregistered    a source emits a literal byte the registry does not carry
+    range-on-scalar a source emits (+ base dynamic) but the registry entry at
+                    base has no :span -- the base claims more than one value
+    never-emitted   a registry entry that no scanned source emits (dead row,
+                    or the emission moved without the registry following)
+    emitter-drift   an entry's :emitter names a file that does not emit it
+
+  Emissions are found by READING THE FORMS, not the lines: kernel.kotoba
+  spreads one stream-log call over four lines, and a line scanner reported it
+  as nothing. The byte argument is classified as
+    exact    an integer literal, or (+ N (* 0 ...)) which is N with a
+             sequencing trick, or every branch of an (if ...) of literals
+    range    (+ N <dynamic> ...) -- N is the base of a range
+    dynamic  anything else (a symbol, bit-and, a load) -- DATA on the wire,
+             counted, never matched (see :data-followers in the registry)
+
+  Refusals (exit 2, never a pass): registry unreadable or without :entries,
+  an emitter file missing or unparseable, or zero emissions found. A scan that
+  could not run must not return the value of a scan that ran and found nothing.
+
+  Usage: kbb --backend sci os/aiueos/tools/verify-wire-bytes.cljk [<repo-root>]
+                [--registry <path>] [--findings]
+  Exit 0 clean / 1 findings / 2 refused. Evidence lines: SCANNED<TAB>n."
+  (:require ["fs" :as fs] ["path" :as p]
+            [kotoba.lang.text :as str]
+            [cljs.reader :as reader]
+            [edamame.core :as e]))
+
+;; nbb: process.argv = [node, nbb, <this script>, args...]; take what follows the
+;; script path itself, wherever it sits (measured: (drop 2) left the script in).
+(def argv (let [all (vec (.-argv js/process))
+                me (p/basename (or (nth all 2 nil) ""))
+                i (first (keep-indexed (fn [i a] (when (and (seq me) (str/ends-with? a (str "/" me))) i)) all))]
+            (vec (if (nil? i) (drop 3 all) (drop (inc i) all)))))
+(defn flag [n] (some #{n} argv))
+(defn opt [n d] (let [i (.indexOf argv n)] (if (neg? i) d (get argv (inc i) d))))
+;; positional <repo-root>: the first argument that is neither a flag nor the
+;; value of --registry (order-independent, so `--registry x .` and `. --registry x`
+;; both work -- the argv-order trap in AGENTS.md "赤い gate を直す前に" item 2).
+(def root (or (first (remove #(or (str/starts-with? % "--") (= % (opt "--registry" nil))) argv))
+              "."))
+(def registry-path (opt "--registry" (p/join root "os/aiueos/native/wire-bytes.edn")))
+(def show-findings? (flag "--findings"))
+
+(defn slurp* [f] (try (.readFileSync fs f "utf8") (catch :default _ nil)))
+(defn refuse! [& msg] (println (str "REFUSED\t" (str/join " " msg))) (.exit js/process 2))
+
+;; ── registry ───────────────────────────────────────────────────────────────
+(def registry
+  (let [src (slurp* registry-path)]
+    (when-not src (refuse! "registry unreadable:" registry-path))
+    (let [v (try (reader/read-string src) (catch :default ex (refuse! "registry does not parse:" (ex-message ex))))]
+      (when-not (map? v) (refuse! "registry is not a map"))
+      (when-not (seq (:entries v)) (refuse! "registry has no :entries"))
+      (doseq [en (:entries v)]
+        (when-not (and (keyword? (:channel en)) (integer? (:value en)) (keyword? (:name en)))
+          (refuse! "entry without :channel/:value/:name:" (pr-str en))))
+      v)))
+
+(def entries (vec (:entries registry)))
+(defn span [en] (or (:span en) 1))
+(defn hex2 [n] (str/upper (.padStart (.toString n 16) 2 "0")))
+
+;; ── source scanning ────────────────────────────────────────────────────────
+(def primitives (:primitives registry))
+(defn head-name [form]
+  (when (and (seq? form) (symbol? (first form))) (name (first form))))
+
+(defn classify
+  "Byte-argument expression -> seq of {:kind :exact|:range|:dynamic :value n}."
+  [x]
+  (cond
+    (integer? x) [{:kind :exact :value x}]
+    (and (seq? x) (= 'if (first x)))
+    (concat (classify (nth x 2 nil)) (classify (nth x 3 nil)))
+    (and (seq? x) (= '+ (first x)))
+    (let [args (rest x)
+          lits (filter integer? args)
+          others (remove integer? args)
+          zeroed? (fn [a] (and (seq? a) (= '* (first a)) (some #(= 0 %) (rest a))))]
+      (cond
+        (empty? lits) [{:kind :dynamic}]
+        (every? zeroed? others) [{:kind :exact :value (reduce + lits)}]
+        :else [{:kind :range :value (reduce + lits)}]))
+    :else [{:kind :dynamic}]))
+
+(defn emissions-in
+  "Walk every form; for each list whose head is a registered primitive, yield
+   {:channel :kind :value :file :line :form}."
+  [file forms]
+  (let [acc (atom [])]
+    (letfn [(walk [form]
+              (when (or (seq? form) (vector? form) (map? form))
+                (when-let [h (head-name form)]
+                  (when-let [prim (get primitives (symbol h))]
+                    (let [args (vec form)
+                          ch (if-let [pa (:port-arg prim)]
+                               (get (:ports prim) (get args pa) :unknown-port)
+                               (:channel prim))
+                          bx (get args (:byte-arg prim))
+                          line (:row (meta form))]
+                      (doseq [c (classify bx)]
+                        (swap! acc conj (assoc c :channel ch :file file :line line
+                                               :form (pr-str (take 5 form))))))))
+                (doseq [x (if (map? form) (mapcat identity form) form)] (walk x))))]
+      (doseq [f forms] (walk f)))
+    @acc))
+
+(def emitter-files (vec (:emitters registry)))
+(when (empty? emitter-files) (refuse! "registry has no :emitters"))
+
+(def emissions
+  (vec (mapcat (fn [rel]
+                 (let [f (p/join root rel) src (slurp* f)]
+                   (when-not src (refuse! "emitter file missing:" f))
+                   (let [forms (try (e/parse-string-all src {:all true})
+                                    (catch :default ex (refuse! "emitter does not parse:" f (ex-message ex))))]
+                     (emissions-in rel forms))))
+               emitter-files)))
+
+(def literal-emissions (vec (remove #(= :dynamic (:kind %)) emissions)))
+(def dynamic-count (count (filter #(= :dynamic (:kind %)) emissions)))
+
+(println (str "SCANNED\t" (count emitter-files) "\temitter files"))
+(println (str "SCANNED\t" (count emissions) "\temissions (" (count literal-emissions)
+              " literal, " dynamic-count " dynamic)"))
+(println (str "REGISTRY\t" (count entries) "\tentries in " registry-path))
+(when (zero? (count emissions)) (refuse! "zero emissions found -- the primitives table or the sources are not what this expects"))
+
+;; ── checks ─────────────────────────────────────────────────────────────────
+(def findings (atom []))
+(defn finding! [kind & msg] (swap! findings conj (str "FINDING\t" (name kind) "\t" (str/join " " msg))))
+
+;; (a) registry self-consistency
+(doseq [[ch ens] (group-by :channel entries)]
+  (let [sorted (sort-by :value ens)]
+    (doseq [[a b] (partition 2 1 sorted)]
+      (when (< (:value b) (+ (:value a) (span a)))
+        (finding! :duplicate (name ch) (str "0x" (hex2 (:value a)) " " (:name a) " [" (:value a) "," (+ (:value a) (span a)) ")")
+                  "overlaps" (str "0x" (hex2 (:value b)) " " (:name b) " [" (:value b) "," (+ (:value b) (span b)) ")"))))
+    (doseq [[nm xs] (group-by :name ens) :when (> (count xs) 1)]
+      (finding! :duplicate (name ch) "name" nm "used by" (count xs) "entries"))))
+(doseq [en entries :when (and (:hex en) (not= (str/upper (:hex en)) (hex2 (:value en))))]
+  (finding! :hex-mismatch (name (:channel en)) (:name en) ":hex" (:hex en) "but :value" (:value en) "=" (hex2 (:value en))))
+
+;; (b) sources -> registry
+(defn entry-for [ch v]
+  (or (some #(when (and (= ch (:channel %)) (= v (:value %))) %) entries)
+      (some #(when (and (= ch (:channel %)) (<= (:value %) v) (< v (+ (:value %) (span %)))) %) entries)))
+
+(def matched (atom {}))   ; entry-name -> set of files that emit it
+(doseq [em literal-emissions]
+  (let [en (entry-for (:channel em) (:value em))
+        where (str (:file em) ":" (:line em))]
+    (cond
+      (= :unknown-port (:channel em))
+      (finding! :unregistered where "kernel-out-u8 to a port the registry does not map:" (:form em))
+      (nil? en)
+      (finding! :unregistered where (name (:channel em)) (str "0x" (hex2 (:value em)) " (" (:value em) ")") (:form em))
+      (and (= :range (:kind em)) (not (:span en)))
+      (finding! :range-on-scalar where (name (:channel em)) (str "0x" (hex2 (:value em))) (:name en) "is emitted as (+ base dynamic) but has no :span")
+      :else
+      (swap! matched update [(:channel en) (:name en)] (fnil conj #{}) (:file em)))))
+
+;; (c) registry -> sources
+(doseq [en entries]
+  (let [files (get @matched [(:channel en) (:name en)])]
+    (cond
+      (nil? files)
+      (finding! :never-emitted (name (:channel en)) (str "0x" (hex2 (:value en))) (:name en) "is registered but no scanned source emits it")
+      (and (:emitter en) (not (contains? files (:emitter en))))
+      (finding! :emitter-drift (name (:channel en)) (str "0x" (hex2 (:value en))) (:name en) ":emitter" (:emitter en) "but emitted from" (str/join "," (sort files))))))
+
+;; ── verdict ────────────────────────────────────────────────────────────────
+(let [fs* @findings]
+  (println (str "FINDINGS\t" (count fs*)))
+  (when (or show-findings? (seq fs*)) (doseq [l fs*] (println l)))
+  (when (and show-findings? (empty? fs*))
+    (doseq [em (sort-by (juxt :channel :value) literal-emissions)]
+      (println (str "OK\t" (name (:channel em)) "\t0x" (hex2 (:value em)) "\t" (:file em) ":" (:line em)))))
+  (.exit js/process (if (seq fs*) 1 0)))

@@ -1,0 +1,145 @@
+(ns aiueos.value-runtime-dispatch
+  (:require [aiueos.value-handle-arena :as arena]
+            [aiueos.value-runtime-provider-transport :as provider])
+  (:export [aiueos-value-runtime-dispatch main]))
+
+;; C-free normalized typed-syscall dispatcher for ValueRuntime.
+;;
+;; Arguments:
+;;   arena         process-owned RW/NX Handle page
+;;   profile       packed trusted transport profile
+;;   request       fixed 96-byte normalized request
+;;   cap-table     bounded 4 KiB capability table
+;;   cap-handle    presented aiueos capability handle, or zero for local ops
+;;
+;; PROFILE packs arena-length=4096, request-length=96, cap-table-length=4096,
+;; and the trusted current domain in four u16 lanes. The request does not get
+;; to assert its own caller identity.
+
+(defn load-u16 [base :i64 length :i64 index :i64] :i64
+  (+ (kernel-load-u8 base length index)
+     (* (kernel-load-u8 base length (+ index 1)) 256)))
+
+(defn load-u32 [base :i64 length :i64 index :i64] :i64
+  (+ (load-u16 base length index)
+     (* (load-u16 base length (+ index 2)) 65536)))
+
+(defn zero-range? [base :i64 length :i64 index :i64 end :i64] :bool
+  (if (= index end)
+    true
+    (if (= (kernel-load-u8 base length index) 0)
+      (zero-range? base length (+ index 1) end)
+      false)))
+
+(defn profile-lane [profile :i64 divisor :i64] :i64
+  (bit-and (quot profile divisor) 65535))
+
+(defn profile-valid? [profile :i64] :bool
+  (and (> profile 0)
+       (= (profile-lane profile 1) 4096)
+       (= (profile-lane profile 65536) 96)
+       (= (profile-lane profile 4294967296) 4096)
+       (> (profile-lane profile 281474976710656) 0)
+       (<= (profile-lane profile 281474976710656) 32767)))
+
+(defn request-valid? [request :i64] :bool
+  (and (= (load-u32 request 96 0) 1364350539)
+       (= (kernel-load-u8 request 96 4) 1)
+       (> (kernel-load-u8 request 96 5) 0)
+       (<= (kernel-load-u8 request 96 5) 5)
+       (<= (kernel-load-u8 request 96 6) 1)
+       (= (kernel-load-u8 request 96 7) 0)
+       (= (load-u32 request 96 12) 0)
+       (zero-range? request 96 56 96)))
+
+(defn descriptor-word [request :i64] :i64
+  (+ (load-u32 request 96 16)
+     (* (load-u32 request 96 20) 4294967296)))
+
+(defn capability-admitted-locked?
+  [table :i64 handle :i64 requester :i64 required-rights :i64] :bool
+  (let [slot (bit-and handle 65535)]
+    (if (and (> slot 0) (< slot 256) (> handle 0))
+      (let [entry (kernel-subregion table 4096 (* slot 16) 16)
+            generation (load-u16 entry 16 0)
+            type (load-u16 entry 16 2)
+            state-rights (load-u32 entry 16 4)
+            rights (bit-and state-rights 65535)
+            active (bit-and state-rights 65536)
+            owner (load-u16 entry 16 8)
+            provider-generation (load-u16 entry 16 10)
+            provider-status (kernel-value-provider-status)
+            current-provider-generation (bit-and provider-status 65535)
+            provider-active (bit-and provider-status 65536)
+            expected (+ slot
+                        (* generation 65536)
+                        (* type 4294967296)
+                        (* rights 281474976710656))]
+        (and (> generation 0)
+             (= type 2)
+             (= active 65536)
+             (= owner requester)
+             (= provider-active 65536)
+             (> provider-generation 0)
+             (= provider-generation current-provider-generation)
+             (> rights 0)
+             (<= rights 7)
+             (= (bit-and rights required-rights) required-rights)
+             (= expected handle)))
+      false)))
+
+(defn capability-admitted?
+  [table :i64 handle :i64 requester :i64 required-rights :i64] :bool
+  (if (= (kernel-try-lock-u32 table 4096 0) 1)
+    (let [admitted (capability-admitted-locked?
+                    table handle requester required-rights)
+          released (kernel-unlock-u32 table 4096 0)]
+      (and (= released 1) admitted))
+    false))
+
+(defn tagged [tag :i64 value :i64] :i64
+  (if (and (> value 0) (<= value 4294967295))
+    (+ (* tag 72057594037927936) value)
+    0))
+
+(defn local-dispatch [arena :i64 operation :i64 handle :i64] :i64
+  (let [arena-operation (if (= operation 3) 2 (if (= operation 4) 3 4))
+        result (arena/aiueos-value-handle-arena arena 4096 arena-operation handle 0)]
+    (tagged 1 result)))
+
+(defn persistence-dispatch
+  [arena :i64 profile :i64 request :i64 table :i64 cap-handle :i64] :i64
+  (let [operation (kernel-load-u8 request 96 5)
+        phase (kernel-load-u8 request 96 6)
+        descriptor (descriptor-word request)
+        requester (profile-lane profile 281474976710656)
+        required-rights (if (= operation 1) 4 1)]
+    (if (capability-admitted? table cap-handle requester required-rights)
+      (if (= phase 0)
+        (if (= descriptor 0)
+          (tagged 2 (provider/aiueos-value-runtime-provider-submit
+                     (if (= operation 1) 15 14) requester cap-handle
+                     (kernel-subregion request 96 24 32)))
+          0)
+        0)
+      0)))
+
+(defn aiueos-value-runtime-dispatch
+  [arena :i64 profile :i64 request :i64 cap-table :i64 cap-handle :i64] :i64
+  (if (and (profile-valid? profile) (request-valid? request))
+    (let [operation (kernel-load-u8 request 96 5)
+          phase (kernel-load-u8 request 96 6)
+          handle (load-u32 request 96 8)
+          descriptor (descriptor-word request)]
+      (if (or (= operation 1) (= operation 2))
+        (if (= handle 0)
+          (persistence-dispatch arena profile request cap-table cap-handle)
+          0)
+        (if (and (= phase 0) (= descriptor 0) (= cap-handle 0)
+                 (zero-range? request 96 24 56)
+                 (> handle 0))
+          (local-dispatch arena operation handle)
+          0)))
+    0))
+
+(defn main [] :i64 0)

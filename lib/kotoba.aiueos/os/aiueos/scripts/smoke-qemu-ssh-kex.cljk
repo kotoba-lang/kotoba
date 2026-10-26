@@ -1,0 +1,91 @@
+#!/usr/bin/env kbb
+;; Gate for the SSH curve25519-sha256 exchange hash H (ssh-v1.edn / ADR-0106):
+;; the kernel assembles the RFC 5656 §4 transcript and SHA-256s it, and the H it
+;; emits must equal the H that ssh.transport computes for the SAME fixed inputs.
+;;
+;; This is the IMPORT WITH TEETH. ssh.transport is the shared wire-rule core in
+;; kotoba-lang/org-ietf-ssh; this gate REQUIRES it (so it must be on the
+;; classpath) and recomputes the reference H here. The kernel bakes that same H
+;; as its self-check want[], but the authority is the core: if org-ietf-ssh's
+;; transcript order or encoding ever changes, the recomputed H moves, the
+;; kernel's emitted hex (still equal to the stale baked want) no longer matches,
+;; and this gate goes red -- even though the kernel self-reports OK. A gate that
+;; only trusted the kernel's own AIUEOS_SSH_KEX_OK would be a self-report.
+;;
+;; Run from the superproject root so the west checkout of org-ietf-ssh is on the
+;; classpath:
+;;   kbb --backend sci --classpath orgs/kotoba-lang/org-ietf-ssh/src \
+;;       orgs/kotoba-lang/aiueos/os/aiueos/scripts/smoke-qemu-ssh-kex.cljk
+;; Build the kernel with AIUEOS_SSH_LISTEN=1 first (the KEX KAT rides under it).
+
+(require '[kotoba.lang.text :as str]
+         '[ssh.transport :as t])   ; <- imported from kotoba-lang/org-ietf-ssh
+
+(def fs (js/require "node:fs"))
+(def path (js/require "node:path"))
+(def cp (js/require "node:child_process"))
+(def crypto (js/require "node:crypto"))
+
+(def aiueos (.resolve path (.dirname path *file*) ".."))
+(def repo (.resolve path aiueos ".." ".."))
+(def out (or (.-AIUEOS_OUT js/process.env) (.join path repo "build" "aiueos")))
+(def kernel (.join path out "esp" "EFI" "AIUEOS" "KERNEL.ELF"))
+(def serial-log (.join path out "kernel-serial.log"))
+
+(defn- die [& msg]
+  (binding [*out* *err*] (apply println (cons "error:" msg)))
+  (.exit js/process 1))
+
+;; ── the reference H, computed by the shared org-ietf-ssh core ────────────────
+;; These are exactly the fixed inputs the kernel's aiueos_ssh_kex_h() bakes.
+(defn- sha256 [bytes]
+  (vec (.digest (.update (.createHash crypto "sha256") (js/Uint8Array. (clj->js bytes))))))
+(defn- hex [bytes]
+  (str/join (map #(.padStart (.toString % 16) 2 "0") bytes)))
+
+(def kat-inputs
+  {:v-c "SSH-2.0-C"
+   :v-s "SSH-2.0-aiueos"
+   :i-c [0x14 0x01 0x02 0x03]
+   :i-s [0x14 0x0a 0x0b 0x0c 0x0d]
+   :k-s (t/str->bytes "hostkey-blob")
+   :q-c (vec (range 32))
+   :q-s (vec (map #(bit-and (+ % 100) 255) (range 32)))
+   :k   (into [0x80] (vec (range 31)))})
+
+(def core-h (hex (t/exchange-hash sha256 kat-inputs)))
+(println "AIUEOS_SSH_KEX_GATE org-ietf-ssh reference H =" core-h)
+
+(when-not (.existsSync fs kernel)
+  (die "kernel not built with the listener/KEX KAT:"
+       "\nhint: AIUEOS_SSH_LISTEN=1 sh os/aiueos/scripts/build-release-image.sh"))
+(when-not (str/includes? (.toString (.readFileSync fs kernel)) "AIUEOS_SSH_KEX")
+  (die "the built kernel has no SSH KEX KAT string; rebuild with AIUEOS_SSH_LISTEN=1"))
+
+(def env (doto (js/Object.assign #js {} js/process.env)
+           (aset "AIUEOS_SSH_LISTEN" "1")
+           (aset "AIUEOS_TEST_NET" "1")))
+(println "AIUEOS_SSH_KEX_GATE booting via smoke-qemu-uefi.sh")
+(let [_ (.spawnSync cp (.join path aiueos "scripts" "smoke-qemu-uefi.sh")
+                    #js [] #js {:stdio "inherit" :env env})
+      serial (if (.existsSync fs serial-log)
+               (str/replace (.readFileSync fs serial-log "utf8") "\r" "") "")
+      ok? (str/includes? serial "AIUEOS_SSH_KEX_OK")
+      fail? (str/includes? serial "AIUEOS_SSH_KEX_FAIL")
+      m (re-find #"AIUEOS_SSH_KEX_H ([0-9a-f]{64})" serial)
+      emitted (when m (second m))]
+  (cond
+    fail?
+    (die "the kernel assembled the transcript but H did not match its baked want")
+    (nil? emitted)
+    (die "the AIUEOS_SSH_KEX_H line is absent; the boot did not reach the KEX KAT")
+    (not= emitted core-h)
+    (die (str "kernel H does NOT match the org-ietf-ssh core H.\n"
+              "  kernel: " emitted "\n"
+              "  core:   " core-h "\n"
+              "the shared transcript definition drifted from the kernel port"))
+    (not ok?)
+    (die "kernel emitted H but not AIUEOS_SSH_KEX_OK (self-check baked-want mismatch)")
+    :else
+    (println (str "AIUEOS_SSH_KEX_SMOKE_OK kernel H == org-ietf-ssh core H == "
+                  emitted " (curve25519-sha256 exchange hash, real kernel boot)"))))

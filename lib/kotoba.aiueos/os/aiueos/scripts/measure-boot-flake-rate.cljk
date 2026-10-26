@@ -1,0 +1,186 @@
+#!/usr/bin/env kbb
+;; measure-boot-flake-rate.cljs -- boot ONE already-built image N times and say
+;; what actually happened, run by run (ADR-0200).
+;;
+;; Why this exists. `smoke-qemu-uefi.sh` retried any timeout and called it
+;; "known flake kotoba-lang/aiueos#108", three attempts at ten minutes each.
+;; Nobody had measured the rate that retry was budgeted for, and the issue it
+;; names records "never reproduced locally (macOS, QEMU 10, faster host)" --
+;; which is this host. A retry budget nobody measured is not a measurement, so
+;; this is the thing that measures it.
+;;
+;; It rebuilds nothing on purpose: the question is how often the SAME bytes
+;; boot differently, and a rebuild between runs would make a compiler change
+;; and a flake look alike. Point it at an AIUEOS_OUT that `build-uefi.sh` has
+;; already filled.
+;;
+;;   kbb --backend sci os/aiueos/scripts/measure-boot-flake-rate.cljk \
+;;       --out build/aiueos --runs 12 [--timeout 180]
+;;
+;; Exit codes, and they mean three different things:
+;;   0  every run reached the same verdict; the distribution and the flake rate
+;;      are printed with n
+;;   1  at least one run disagreed with the others -- a real finding, not a
+;;      failure of this script
+;;   3  COULD-NOT-RUN: no image, no qemu, no OVMF, or --runs below the floor.
+;;      Never a pass. A rate computed from zero boots is not a low rate.
+
+(require '["node:child_process" :as cp]
+         '["node:fs" :as fs]
+         '["node:path" :as path]
+         '[kotoba.lang.text :as str])
+
+(def argv (vec (drop 2 (js->clj (.-argv js/process)))))
+
+(defn- opt [name fallback]
+  (let [i (.indexOf argv name)]
+    (if (neg? i) fallback (nth argv (inc i) fallback))))
+
+(def out-dir (opt "--out" nil))
+(def runs (js/parseInt (opt "--runs" "12") 10))
+(def timeout-s (js/parseInt (opt "--timeout" "180") 10))
+
+;; A rate from one boot is not a rate. Four is still small, but it is the point
+;; below which the arithmetic stops meaning anything at all, so it is a refusal
+;; rather than a warning.
+(def min-runs 4)
+
+(defn die [code & msg]
+  (binding [*print-fn* *print-err-fn*] (apply println msg))
+  (.exit js/process code))
+
+(defn- which [cmd]
+  (let [r (.spawnSync cp "sh" #js ["-c" (str "command -v " cmd)] #js {:encoding "utf8"})]
+    (when (zero? (.-status r)) (str/trim (.-stdout r)))))
+
+(defn- ovmf []
+  (or (some-> (.-OVMF_CODE (.-env js/process)) not-empty)
+      (first (filter #(.existsSync fs %)
+                     ["/opt/homebrew/share/qemu/edk2-x86_64-code.fd"
+                      "/usr/share/OVMF/OVMF_CODE_4M.fd"
+                      "/usr/share/OVMF/OVMF_CODE.fd"
+                      "/usr/share/edk2/x64/OVMF_CODE.fd"]))))
+
+(when-not out-dir (die 3 "COULD-NOT-RUN no-out: --out <AIUEOS_OUT directory> is required"))
+(when (or (js/isNaN runs) (< runs min-runs))
+  (die 3 (str "COULD-NOT-RUN too-few-runs: --runs " runs " is below the floor of " min-runs)))
+(def esp (path/join out-dir "esp"))
+(when-not (.existsSync fs (path/join esp "EFI" "BOOT" "BOOTX64.EFI"))
+  (die 3 (str "COULD-NOT-RUN no-image: " esp "/EFI/BOOT/BOOTX64.EFI is not there; run build-uefi.sh first")))
+(def qemu (or (some-> (.-QEMU_SYSTEM_X86_64 (.-env js/process)) not-empty)
+              (which "qemu-system-x86_64")))
+(when-not qemu (die 3 "COULD-NOT-RUN qemu-missing: qemu-system-x86_64 is required"))
+(def firmware (ovmf))
+(when-not firmware (die 3 "COULD-NOT-RUN ovmf-missing: OVMF firmware not found; set OVMF_CODE"))
+
+(def blk (path/join out-dir "virtio-blk-smoke.img"))
+(def blk-pristine (path/join out-dir "virtio-blk-flake.pristine"))
+(when (.existsSync fs blk) (.copyFileSync fs blk blk-pristine))
+
+;; The flake this is looking for. Named, because a retry that cannot say what
+;; it is retrying for will swallow anything -- which is the whole reason this
+;; file exists (kotoba-lang/aiueos#108: the ring-3 process phase loses a wakeup
+;; and the serial log stops here).
+(def flake-signature "AIUEOS_KOTOBA_ELF_PROCESS_OK")
+;; isa-debug-exit maps a written value v to (v << 1) | 1. 0x30 -> 97 is the
+;; end-of-boot #UD probe; 0x7d -> 251 is a fatal CPU exception.
+(def status-pass 97)
+(def status-fatal 251)
+
+(defn- last-line [file]
+  (when (.existsSync fs file)
+    (->> (str/split (str (.readFileSync fs file "utf8")) #"\n")
+         (map #(str/replace % #"\r$" ""))
+         (remove str/blank?)
+         last)))
+
+(defn- boot! [i]
+  (let [dbg (path/join out-dir (str "flake-debug-" i ".log"))
+        ser (path/join out-dir (str "flake-serial-" i ".log"))]
+    ;; Both logs, every run. A run that inherits the previous run's debugcon
+    ;; log reports a guest that never wrote as one that wrote long ago.
+    (doseq [f [dbg ser]] (when (.existsSync fs f) (.unlinkSync fs f)))
+    (when (.existsSync fs blk-pristine) (.copyFileSync fs blk-pristine blk))
+    (let [args (concat ["-machine" "q35,accel=tcg" "-cpu" "max" "-m" "128M" "-smp" "2"
+                        "-drive" (str "if=pflash,format=raw,readonly=on,file=" firmware)
+                        "-drive" (str "format=raw,file=fat:rw:" esp)
+                        "-device" "isa-debugcon,iobase=0xe9,chardev=debug"
+                        "-chardev" (str "file,id=debug,path=" dbg)
+                        "-device" "isa-debug-exit,iobase=0xf4,iosize=0x04"
+                        "-device" "virtio-rng-pci"]
+                       (when (.existsSync fs blk)
+                         ["-drive" (str "if=none,id=aiueosblk,format=raw,file=" blk)
+                          "-device" "virtio-blk-pci,drive=aiueosblk,disable-legacy=on"])
+                       ["-device" "virtio-keyboard-pci,disable-legacy=on"
+                        "-device" "virtio-vga,disable-legacy=on,max_outputs=2"
+                        "-display" "none" "-serial" (str "file:" ser)
+                        "-monitor" "none" "-no-reboot"])
+          started (.now js/Date)
+          r (.spawnSync cp "timeout" (clj->js (concat [(str timeout-s) qemu] args))
+                        #js {:encoding "utf8" :stdio "ignore"})
+          elapsed (/ (- (.now js/Date) started) 1000.0)
+          status (.-status r)
+          ser-last (last-line ser)
+          dbg-last (last-line dbg)
+          fatal? (and (.existsSync fs ser)
+                      (str/includes? (str (.readFileSync fs ser "utf8")) "AIUEOS_FATAL_EXCEPTION"))
+          verdict (cond
+                    (= status status-pass) :pass
+                    (or fatal? (= status status-fatal)) :guest-died
+                    (not= status 124) :other-exit
+                    (and ser-last (str/starts-with? ser-last flake-signature)) :flake-108
+                    (or ser-last dbg-last) :guest-no-exit
+                    :else :host-no-output)]
+      {:run i :status status :elapsed elapsed :verdict verdict
+       :last-serial (or ser-last "<none>")})))
+
+(defn- load1 []
+  (let [r (.spawnSync cp "sysctl" #js ["-n" "vm.loadavg"] #js {:encoding "utf8"})]
+    (if (zero? (.-status r))
+      (second (str/split (str/trim (str (.-stdout r))) #" "))
+      "?")))
+
+(println (str "measure-boot-flake-rate: " runs " boots of " esp
+              " timeout=" timeout-s "s"))
+(def results
+  (doall (for [i (range 1 (inc runs))]
+           (let [before (load1)
+                 r (boot! i)]
+             ;; The load next to the number, because this workstation runs
+             ;; many concurrent agents and a wall clock read without it is not
+             ;; comparable with one read at a different hour.
+             (println (str "  run " i "/" runs " verdict=" (name (:verdict r))
+                           " status=" (:status r)
+                           " elapsed=" (.toFixed (:elapsed r) 1) "s"
+                           " load1=" before
+                           (when (not= :pass (:verdict r))
+                             (str " last-serial=" (:last-serial r)))))
+             (flush)
+             r))))
+
+(let [n (count results)
+      by (frequencies (map :verdict results))
+      passes (filter #(= :pass (:verdict %)) results)
+      times (sort (map :elapsed passes))
+      pct (fn [p] (when (seq times)
+                    (nth times (min (dec (count times))
+                                    (int (js/Math.floor (* p (count times))))))))
+      flakes (+ (get by :flake-108 0) (get by :host-no-output 0))
+      deaths (+ (get by :guest-died 0) (get by :guest-no-exit 0) (get by :other-exit 0))]
+  (println)
+  (println (str "SCANNED " n))
+  (doseq [[k v] (sort-by (comp name key) by)] (println (str "  " (name k) " " v)))
+  (if (seq times)
+    (println (str "PASS-BOOT-SECONDS n=" (count times)
+                  " min=" (.toFixed (first times) 1)
+                  " p50=" (.toFixed (pct 0.5) 1)
+                  " p90=" (.toFixed (pct 0.9) 1)
+                  " max=" (.toFixed (last times) 1)))
+    (println "PASS-BOOT-SECONDS n=0 (no run passed: the distribution below is UNMEASURED)"))
+  (println (str "FLAKE-RATE " flakes "/" n
+                " (retryable: the #108 signature, or no guest output at all)"))
+  (println (str "DEAD-OR-BROKEN " deaths "/" n))
+  (when (pos? deaths)
+    (println "  a guest that produced output and then stopped is NOT a flake; see ADR-0200"))
+  (doseq [f [blk-pristine]] (when (.existsSync fs f) (.unlinkSync fs f)))
+  (.exit js/process (if (= n (get by :pass 0)) 0 1)))

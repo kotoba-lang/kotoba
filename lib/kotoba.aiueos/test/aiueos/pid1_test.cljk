@@ -1,0 +1,210 @@
+(ns aiueos.pid1-test
+  "`power-off!`/`restart!`/`halt!` are NEVER called here (they'd invoke the
+  real Linux `reboot(2)` syscall) -- `boot!` is tested with a fake
+  `poweroff-fn`. `reap-one-zombie!`/`reap-all-zombies!` and
+  `install-shutdown-handler!` ARE real (no fakes needed): the former is a
+  read-only `waitpid(WNOHANG)` against this test JVM's own (empty) child
+  list, and the latter only replaces this JVM's own SIGTERM/SIGINT
+  disposition, which is safe to exercise (and IS exercised, via `boot!`'s own
+  shutdown below, since `Signal.raise` is how the test triggers shutdown)."
+  (:require [kotoba.ffi :as ffi] [aiueos.pid1 :as pid1]
+            #?(:clj [grant.anchors :as anchors])
+            #?(:clj [grant.cloud :as cloud])
+            [kotoba.test :refer [deftest is testing]]))
+
+(deftest pid1-argv0-detection
+  (is (true? (pid1/pid1-argv0? "/init")))
+  (is (true? (pid1/pid1-argv0? "init")))
+  (is (false? (pid1/pid1-argv0? "/bin/bash")))
+  (is (false? (pid1/pid1-argv0? nil))))
+
+#?(:clj
+   (deftest pid1-mode-requires-both-argv0-and-boot-file
+     (let [tmp (java.io.File/createTempFile "aiueos-boot" ".edn")]
+       (try
+         (.delete tmp)
+         (testing "argv0 is init but boot file absent -> false"
+           (is (false? (pid1/pid1-mode? "/init" (.getPath tmp)))))
+         (spit tmp "{:aiueos/system \"/etc/aiueos/system\"}")
+         (testing "both conditions met -> true"
+           (is (true? (pid1/pid1-mode? "/init" (.getPath tmp)))))
+         (testing "argv0 is not init, even with boot file present -> false"
+           (is (false? (pid1/pid1-mode? "/bin/bash" (.getPath tmp)))))
+         (finally (.delete tmp))))))
+
+#?(:clj
+   (deftest load-boot-config-round-trips
+     (let [tmp (java.io.File/createTempFile "aiueos-boot" ".edn")]
+       (try
+         (spit tmp (pr-str {:aiueos/system "/etc/aiueos/system" :aiueos/policy "/etc/aiueos/policy.edn"}))
+         (is (= {:aiueos/system "/etc/aiueos/system"
+                 :aiueos/policy "/etc/aiueos/policy.edn"
+                 ;; A boot config always answers the anchors question, even
+                 ;; when the answer is "this image carries none" (ADR-0048).
+                 :aiueos.anchors/present? false
+                 :aiueos/deployment-profile :research}
+                (pid1/load-boot-config (.getPath tmp))))
+         (finally (.delete tmp))))))
+
+#?(:clj
+   (deftest load-boot-config-requires-system
+     (let [tmp (java.io.File/createTempFile "aiueos-boot" ".edn")]
+       (try
+         (spit tmp (pr-str {:aiueos/policy "/etc/aiueos/policy.edn"}))
+         (is (thrown? Exception (pid1/load-boot-config (.getPath tmp))))
+         (finally (.delete tmp))))))
+
+#?(:clj
+   (deftest reap-zombie-calls-are-safe-with-no-children
+     (with-open [arena (ffi/confined-arena)]
+       (is (nil? (pid1/reap-one-zombie! arena)))
+       (is (= 0 (pid1/reap-all-zombies! arena))))))
+
+#?(:clj
+   (deftest boot-runs-up-fn-then-reaps-until-shutdown-then-powers-off
+     (let [up-calls (atom [])
+           poweroff-calls (atom 0)
+           boot-config {:aiueos/system "/etc/aiueos/system" :aiueos/policy nil}]
+       (with-open [arena (ffi/confined-arena)]
+         (future
+           (Thread/sleep 50)
+           (sun.misc.Signal/raise (sun.misc.Signal. "TERM")))
+         (pid1/boot! boot-config
+                     (fn [system-path policy-path] (swap! up-calls conj [system-path policy-path]))
+                     (fn [] (swap! poweroff-calls inc))
+                     arena
+                     10))
+       (is (= [["/etc/aiueos/system" nil]] @up-calls))
+       (is (= 1 @poweroff-calls)))))
+
+#?(:clj
+   (deftest boot-smoke-mode-powers-off-immediately-after-success
+     (let [poweroff-calls (atom 0)]
+       (with-open [arena (ffi/confined-arena)]
+         (is (= :shutdown-after-boot
+                (pid1/boot! {:aiueos/system "/system"
+                             :aiueos/shutdown-after-boot? true}
+                            (fn [_ _] {:aiueos.cli/ok? true})
+                            (fn [] (swap! poweroff-calls inc)) arena 1))))
+       (is (= 1 @poweroff-calls)))))
+
+#?(:clj
+(deftest boot-refuses-failed-component-graph
+     (with-open [arena (ffi/confined-arena)]
+       (is (thrown? Exception
+                    (pid1/boot! {:aiueos/system "/system"}
+                                (fn [_ _] {:aiueos.cli/ok? false})
+                                (fn [] nil) arena 1))))))
+
+#?(:clj
+   (deftest boot-refuses-incomplete-production-profile-before-up
+     (let [up-called? (atom false)
+           failure (with-open [arena (ffi/confined-arena)]
+                     (try
+                       (pid1/boot!
+                        {:aiueos/system "/system"
+                         :aiueos/deployment-profile :sensitive-local
+                         :aiueos/profile-evidence {:profile/version 1}}
+                        (fn [_ _] (reset! up-called? true))
+                        (fn [] nil) arena 1)
+                       nil
+                       (catch Exception error (ex-data error))))]
+       (is (false? @up-called?))
+       (is (= :deployment-profile-admission-failed (:type failure)))
+       (is (some #{:deny-by-default?} (:violations failure))))))
+
+;; ── the anchors the image booted with ─────────────────────────────────────
+
+#?(:clj
+   (defn- boot-file! [config]
+     (let [tmp (java.io.File/createTempFile "aiueos-boot" ".edn")]
+       (.deleteOnExit tmp)
+       (spit tmp (pr-str config))
+       tmp)))
+
+#?(:clj
+   (defn- anchors-file! [doc]
+     (let [tmp (java.io.File/createTempFile "aiueos-anchors" ".edn")]
+       (.deleteOnExit tmp)
+       (spit tmp (pr-str doc))
+       tmp)))
+
+(def pin-a (apply str (repeat 64 "a")))
+(def pin-b (apply str (repeat 64 "b")))
+
+#?(:clj
+   (deftest an-image-that-carries-anchors-boots-knowing-who-it-may-talk-to
+     (let [doc (anchors/document {:release-id "release-42" :sequence 7
+                                  :anchors #{pin-a pin-b}})
+           af (anchors-file! doc)
+           bf (boot-file! {:aiueos/system "/etc/aiueos/system/system.edn"
+                           :aiueos/anchors (.getPath af)})
+           config (pid1/load-boot-config (.getPath bf))]
+       (is (true? (:aiueos.anchors/present? config)))
+       (is (= #{pin-a pin-b} (:aiueos.cloud/trust-anchors config)))
+       (is (= "release-42" (:aiueos.anchors/release-id config)))
+       (is (= :image (:aiueos.anchors/provenance config))
+           "the image is the authority, and the boot state says so")
+       (testing "and the pins are the ones grant.cloud checks against"
+         (is (cloud/allowed? (cloud/admit-peer config {:spki-sha256 pin-a})))
+         (is (= :peer-not-pinned
+                (:aiueos.cloud/reason
+                 (cloud/admit-peer config {:spki-sha256 (apply str (repeat 64 "c"))}))))))))
+
+#?(:clj
+   (deftest an-image-that-carries-none-boots-and-says-so
+     (let [bf (boot-file! {:aiueos/system "/etc/aiueos/system/system.edn"})
+           config (pid1/load-boot-config (.getPath bf))]
+       (is (false? (:aiueos.anchors/present? config))
+           "absent is recorded, not inferred from an empty pin set")
+       (is (nil? (:aiueos.cloud/trust-anchors config)))
+       (is (= :no-trust-anchors
+              (:aiueos.cloud/reason (cloud/admit-peer config {:spki-sha256 pin-a})))
+           "so it reaches nothing, which is the safe half of the answer"))))
+
+#?(:clj
+   (deftest a-named-anchor-file-that-is-not-there-refuses-the-boot
+     (let [bf (boot-file! {:aiueos/system "/etc/aiueos/system/system.edn"
+                           :aiueos/anchors "/nonexistent/anchors.edn"})]
+       (is (thrown-with-msg? Exception #"not there"
+                             (pid1/load-boot-config (.getPath bf)))
+           "booting anyway would be a machine that reaches nothing and looks fine"))))
+
+#?(:clj
+   (deftest an-anchor-file-that-is-not-edn-refuses-the-boot
+     (let [af (java.io.File/createTempFile "aiueos-anchors" ".edn")
+           _ (.deleteOnExit af)
+           _ (spit af "{:anchors/version 1 :anchors/anchors [")
+           bf (boot-file! {:aiueos/system "/etc/aiueos/system/system.edn"
+                           :aiueos/anchors (.getPath af)})]
+       (is (thrown-with-msg? Exception #"not readable EDN"
+                             (pid1/load-boot-config (.getPath bf)))))))
+
+#?(:clj
+   (deftest an-anchor-file-the-reader-refuses-refuses-the-boot
+     (doseq [[label doc] [["a malformed pin"
+                           (anchors/document {:release-id "r" :sequence 1
+                                              :anchors #{"deadbeef"}})]
+                          ["a future version"
+                           (assoc (anchors/document {:release-id "r" :sequence 1
+                                                     :anchors #{pin-a}})
+                                  :anchors/version 99)]]]
+       (testing label
+         (let [af (anchors-file! doc)
+               bf (boot-file! {:aiueos/system "/etc/aiueos/system/system.edn"
+                               :aiueos/anchors (.getPath af)})]
+           (is (thrown-with-msg? Exception #"anchor set refused"
+                                 (pid1/load-boot-config (.getPath bf)))))))))
+
+#?(:clj
+   (deftest the-host-claim-is-read-out-of-the-command-line
+     (is (= "release-42"
+            (pid1/host-verification-claim
+             "console=ttyS0 panic=0 rdinit=/init aiueos.boot.verified=release-42")))
+     (is (= "release-42"
+            (pid1/host-verification-claim "aiueos.boot.verified=release-42 quiet"))
+         "first token on the line, which a naive space-prefixed pattern misses")
+     (is (nil? (pid1/host-verification-claim "console=ttyS0 rdinit=/init")))
+     (is (nil? (pid1/host-verification-claim
+                "console=ttyS0 not-aiueos.boot.verified=release-42"))
+         "a suffix match would have accepted this")))

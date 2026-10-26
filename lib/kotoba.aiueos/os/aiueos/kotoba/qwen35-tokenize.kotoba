@@ -1,0 +1,985 @@
+(ns aiueos.qwen35-tokenize
+  ;; `cp-class` is exported so the parity test can classify a codepoint
+  ;; directly instead of inferring the table from where a chunk broke. It is
+  ;; not an `aiueos-*` name, so kotoba-native's allowlist neither claims it nor
+  ;; refuses it, and `package-kernel-object` packages the entry it is asked for.
+  (:export [aiueos-qwen35-tokenize cp-class main]))
+
+;; Text -> Qwen3.5 token ids, over the GGUF vocabulary where it lies.
+;;
+;; This is llama.cpp's `llm_tokenizer_bpe` for a `gpt2` model with the `qwen2`
+;; family pre-tokenizer, which is what `tokenizer.ggml.model` = "gpt2" and
+;; `tokenizer.ggml.pre` = "qwen35" name in
+;; `contracts/qwen38-qwen35-runtime-v1.edn`. Four stages, in this order:
+;;
+;;   1. decode the input to codepoints (invalid UTF-8 -> U+FFFD, advance one
+;;      byte), which is `unicode_cpts_from_utf8`
+;;   2. split into pre-tokens by the qwen2 regex, run as an explicit byte
+;;      state machine (see the rule table below)
+;;   3. re-encode each pre-token canonically and map every BYTE through the
+;;      GPT-2 byte-to-unicode alphabet, which is `unicode_byte_encoding_process`
+;;   4. merge greedily by rank until no adjacent pair has one, then look each
+;;      surviving symbol up in the vocabulary
+;;
+;; `aiueos-qwen35-vocab-index-build` has already put a string->id table and a
+;; (left id, right id)->rank table in the workspace; this object reads them and
+;; the token STRINGS, which stay in the model mapping. Nothing is copied.
+;;
+;; ## Return
+;;
+;; **Zero is the success value**, and this object does NOT return a count --
+;; the count goes to workspace header slot 64, so that a caller cannot read a
+;; refusal as "three tokens". Non-zero is a reason code:
+;;
+;;      0   tokenized; the id count is in header slot 64
+;;     -1   null model base
+;;     -2   null workspace base
+;;     -3   workspace shorter than the 128-byte header
+;;     -4   the workspace carries no index (the KTOK magic is absent)
+;;     -5   model window above 16,777,216 bytes
+;;     -6   input longer than 32,768 bytes
+;;     -7   the input does not lie inside the workspace
+;;     -8   the token id output does not lie inside the workspace
+;;     -9   the symbol scratch does not lie inside the workspace, or is
+;;          smaller than 13,312 bytes
+;;    -10   the index tables do not lie inside the workspace
+;;    -21   a codepoint above U+10FFFF
+;;    -24   a pre-tokenizer chunk above 512 byte-symbols
+;;    -25   a surviving symbol is not a vocabulary token
+;;    -26   the token id output capacity was exhausted
+;;    -27   the pre-tokenizer did not advance
+;;
+;; ## Where this is narrower than llama.cpp, deliberately
+;;
+;; -21, -24 and -25 are all refusals llama.cpp does not make.
+;;
+;; -21: `unicode_cpt_to_utf8` throws on a codepoint above U+10FFFF, and
+;; `unicode_regex_split` does not catch it, so llama.cpp aborts the process.
+;; The four-byte decoder admits up to U+1FFFFF because llama.cpp's does (it
+;; checks continuation bytes and nothing else -- no overlong, surrogate or
+;; range check), so this is reachable from a five-byte-lead F7 sequence.
+;; Refusing names it.
+;;
+;; -24: the merge loop rescans one chunk's symbol list to find the lowest-rank
+;; adjacent pair, and there are as many merges as symbols, so the loop is
+;; QUADRATIC IN ONE CHUNK. A finite fuel bound needs a bound on the chunk.
+;; 512 byte-symbols is 512 ASCII letters, or about 170 kana or kanji, with no
+;; space, digit or punctuation anywhere in the run -- the pre-tokenizer breaks
+;; a chunk at any of those. llama.cpp has no such bound and would tokenize what
+;; this refuses.
+;;
+;; -25: llama.cpp falls back to looking up each single BYTE of an unresolvable
+;; symbol as a one-character string, and SILENTLY DROPS the bytes that are not
+;; in the vocabulary -- for a byte-level vocabulary those are exactly the
+;; continuation bytes, so its fallback emits nothing and the text disappears
+;; from the token stream. It cannot trigger on a vocabulary whose merge sides
+;; are all tokens (which `vocab-index-build` checks), so refusing costs
+;; nothing and losing text silently costs everything.
+;;
+;; Two more divergences that are not refusals:
+;;
+;; `unicode_tolower` is ASCII-only here, in the contraction rule. The rule
+;; compares against `s t m d r v l e`, and no non-ASCII codepoint lowercases
+;; to one of those in the Unicode data llama.cpp generates its tables from.
+;;
+;; The character classes come from a 122-range table generated from Java's
+;; `\p{L}` and `\p{N}` over 24 declared blocks (`cp-class` below); llama.cpp's
+;; come from a table generated from Python's `unicodedata` over ALL of
+;; Unicode. Inside the declared blocks the two agree and the parity test
+;; checks every codepoint of them one at a time. OUTSIDE them this object
+;; calls every codepoint "other", which is the same bucket as punctuation,
+;; symbols, marks and control characters -- so the divergence is confined to
+;; letters and digits of undeclared scripts, where it changes where a chunk
+;; breaks and therefore which ids come out. The blocks cover Latin, Greek,
+;; Cyrillic, Armenian, Hebrew, Arabic, Thai, the Latin/Greek extended
+;; additions, super- and subscripts, number forms, enclosed alphanumerics, the
+;; CJK radicals, Hiragana, Katakana, Bopomofo, Hangul (Jamo, compatibility
+;; Jamo and syllables), the enclosed and compatibility CJK blocks, CJK
+;; Unified Ideographs and extensions A through F, the compatibility
+;; ideographs, halfwidth and fullwidth forms, mathematical digits and the
+;; emoji blocks. The parity test prints how many codepoints of the rest of
+;; the BMP it therefore gets wrong, so the size of the blind spot is a
+;; measured number rather than a hope.
+;;
+;; ## The pre-tokenizer rule table
+;;
+;; The qwen2 regex, as `tokenizer.ggml.pre` names it, is
+;;
+;;   (?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])
+;;   |[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*
+;;   |\s*[\r\n]+|\s+(?!\S)|\s+
+;;
+;; but llama.cpp does NOT run it through a regex engine. `unicode_regex_split`
+;; matches that string against a table of preset patterns and dispatches the
+;; qwen2 one to `unicode_regex_split_custom_llama3`, the same hand-written
+;; splitter llama3 uses -- whose number rule is `\p{N}{1,3}`. So the reference
+;; implementation consumes UP TO THREE digits where the metadata's regex says
+;; one. This object follows the reference implementation, because that is what
+;; produced the ids the model was trained against, and says so here because
+;; the two readings disagree on "2026" (["202" "6"] against ["2" "0" "2" "6"]).
+;;
+;; | # | regex fragment                    | function        |
+;; |---|-----------------------------------|-----------------|
+;; | 1 | `(?:'[sS]\|'[tT]\|'[rR][eE]\|'[vV][eE]\|'[mM]\|'[lL][lL]\|'[dD])` | `contraction-end` |
+;; | 2 | `[^\r\n\p{L}\p{N}]?\p{L}+`        | `letters-end`   |
+;; | 3 | `\p{N}{1,3}`                      | `digits-run`    |
+;; | 4 | ` ?[^\s\p{L}\p{N}]+[\r\n]*`       | `other-end`     |
+;; | 5 | `\s*[\r\n]+`                      | `ws-scan` + slot 96 |
+;; | 6 | `\s+(?!\S)`                       | `ws-scan` + slot 120 |
+;; | 7 | `\s+`                             | `ws-scan`       |
+;; | 8 | (no rule matched: one codepoint)  | `chunk-end` tail |
+;;
+;; Rules 5-7 share one scan because the reference does: it counts the
+;; whitespace run once and then decides which of the three it was. Rule 6 is
+;; the lookahead -- a run of two or more whitespace codepoints that is NOT at
+;; the end of the input gives up its last codepoint, so the next chunk starts
+;; with it and rule 4's leading-space clause can pick it up.
+;;
+;; ## Scratch (workspace header slots 96..124, this object's use)
+;;
+;;    96  A  needle byte offset (vocabulary lookup) / last CR-LF end (rule 5)
+;;   100  B  needle length      (vocabulary lookup) / whitespace count
+;;   104  C  chunk start, an input byte offset
+;;   108  D  chunk end,   an input byte offset
+;;   112  E  symbol count in the current chunk
+;;   116  F  write cursor into the encoded-byte buffer
+;;   120  G  byte offset of the last whitespace codepoint (rule 6)
+;;   124  H  reserved
+;;
+;; A and B carry two things because the two never overlap: the whitespace scan
+;; runs in `chunk-end`, which finishes before `do-chunk` looks a symbol up.
+;;
+;; ## Symbol scratch
+;;
+;; 512 records of 24 bytes, then a 1,024-byte encoded-byte buffer: 13,312.
+;;
+;;    +0  offset into the encoded buffer
+;;    +4  length in bytes (0 = merged away)
+;;    +8  next symbol index, or 65535
+;;   +12  previous symbol index, or 65535
+;;   +16  vocabulary id, or 4294967295
+;;   +20  rank of the pair (this, next), or 2147483647
+;;
+;; The rank is CACHED rather than recomputed, which is what keeps the merge
+;; loop's inner scan to one load per symbol. A merge changes exactly two
+;; ranks, the merged symbol's and its predecessor's, and both are rewritten.
+;; Without the cache the scan would do a hash probe per pair and the quadratic
+;; term would be ~15x larger.
+
+;; ----------------------------------------------------------------- readers
+
+(defn u32-at [base length off]
+  (kernel-load-u32 (kernel-subregion base length off 4) 4 0))
+
+(defn put-u32 [base length off v]
+  (kernel-store-u32 (kernel-subregion base length off 4) 4 0 v))
+
+(defn put-u8 [base length off v]
+  (kernel-store-u8 (kernel-subregion base length off 1) 1 0 v))
+
+(defn fnv-bytes [reg len i h]
+  (if (= i len) h
+    (fnv-bytes reg len (+ i 1)
+      (bit-and (* (bit-xor h (kernel-load-u8 (kernel-subregion reg len i 1) 1 0))
+                  16777619)
+               4294967295))))
+
+(defn fnv-step [h b]
+  (bit-and (* (bit-xor h b) 16777619) 4294967295))
+
+(defn fnv-u32 [h v]
+  (fnv-step (fnv-step (fnv-step (fnv-step h (bit-and v 255))
+                                (bit-and (quot v 256) 255))
+                      (bit-and (quot v 65536) 255))
+            (bit-and (quot v 16777216) 255)))
+
+(defn bytes-eq [a b len i]
+  (if (= i len) 1
+    (if (= (kernel-load-u8 (kernel-subregion a len i 1) 1 0)
+           (kernel-load-u8 (kernel-subregion b len i 1) 1 0))
+      (bytes-eq a b len (+ i 1))
+      0)))
+
+;; ------------------------------------------------------- character classes
+;;
+;; 1 letter (\p{L}), 2 number (\p{N}), 3 whitespace, 0 everything else.
+;; A balanced search over 122 ranges: seven comparisons, not 122.
+;;
+;; The whitespace set is llama.cpp's explicit `unicode_vec_whitespace`
+;; (TAB..CR, 1C..20, 85, A0, 1680, 2000..200A, 2028, 2029, 202F, 205F, 3000),
+;; not Java's `\s`, and it takes priority over the general category -- U+00A0
+;; is a separator AND whitespace, and the state machine asks about whitespace.
+(defn cp-class [cp]
+  (if (< cp 8126)
+      (if (< cp 1162)
+        (if (< cp 248)
+          (if (< cp 170)
+            (if (< cp 65)
+              (if (< cp 28)
+                (if (< cp 9)
+                  0
+                  (if (<= cp 13) 3
+                    0))
+                (if (<= cp 32) 3
+                  (if (< cp 48)
+                  0
+                  (if (<= cp 57) 2
+                    0))))
+              (if (<= cp 90) 1
+                (if (< cp 133)
+                (if (< cp 97)
+                  0
+                  (if (<= cp 122) 1
+                    0))
+                (if (<= cp 133) 3
+                  (if (< cp 160)
+                  0
+                  (if (<= cp 160) 3
+                    0))))))
+            (if (<= cp 170) 1
+              (if (< cp 186)
+              (if (< cp 181)
+                (if (< cp 178)
+                  0
+                  (if (<= cp 179) 2
+                    0))
+                (if (<= cp 181) 1
+                  (if (< cp 185)
+                  0
+                  (if (<= cp 185) 2
+                    0))))
+              (if (<= cp 186) 1
+                (if (< cp 192)
+                (if (< cp 188)
+                  0
+                  (if (<= cp 190) 2
+                    0))
+                (if (<= cp 214) 1
+                  (if (< cp 216)
+                  0
+                  (if (<= cp 246) 1
+                    0))))))))
+          (if (<= cp 705) 1
+            (if (< cp 895)
+            (if (< cp 750)
+              (if (< cp 736)
+                (if (< cp 710)
+                  0
+                  (if (<= cp 721) 1
+                    0))
+                (if (<= cp 740) 1
+                  (if (< cp 748)
+                  0
+                  (if (<= cp 748) 1
+                    0))))
+              (if (<= cp 750) 1
+                (if (< cp 886)
+                (if (< cp 880)
+                  0
+                  (if (<= cp 884) 1
+                    0))
+                (if (<= cp 887) 1
+                  (if (< cp 890)
+                  0
+                  (if (<= cp 893) 1
+                    0))))))
+            (if (<= cp 895) 1
+              (if (< cp 910)
+              (if (< cp 904)
+                (if (< cp 902)
+                  0
+                  (if (<= cp 902) 1
+                    0))
+                (if (<= cp 906) 1
+                  (if (< cp 908)
+                  0
+                  (if (<= cp 908) 1
+                    0))))
+              (if (<= cp 929) 1
+                (if (< cp 1015)
+                (if (< cp 931)
+                  0
+                  (if (<= cp 1013) 1
+                    0))
+                (if (<= cp 1153) 1
+                  0))))))))
+        (if (<= cp 1327) 1
+          (if (< cp 3585)
+          (if (< cp 1646)
+            (if (< cp 1488)
+              (if (< cp 1369)
+                (if (< cp 1329)
+                  0
+                  (if (<= cp 1366) 1
+                    0))
+                (if (<= cp 1369) 1
+                  (if (< cp 1376)
+                  0
+                  (if (<= cp 1416) 1
+                    0))))
+              (if (<= cp 1514) 1
+                (if (< cp 1568)
+                (if (< cp 1519)
+                  0
+                  (if (<= cp 1522) 1
+                    0))
+                (if (<= cp 1610) 1
+                  (if (< cp 1632)
+                  0
+                  (if (<= cp 1641) 2
+                    0))))))
+            (if (<= cp 1647) 1
+              (if (< cp 1774)
+              (if (< cp 1749)
+                (if (< cp 1649)
+                  0
+                  (if (<= cp 1747) 1
+                    0))
+                (if (<= cp 1749) 1
+                  (if (< cp 1765)
+                  0
+                  (if (<= cp 1766) 1
+                    0))))
+              (if (<= cp 1775) 1
+                (if (< cp 1786)
+                (if (< cp 1776)
+                  0
+                  (if (<= cp 1785) 2
+                    0))
+                (if (<= cp 1788) 1
+                  (if (< cp 1791)
+                  0
+                  (if (<= cp 1791) 1
+                    0))))))))
+          (if (<= cp 3632) 1
+            (if (< cp 8016)
+            (if (< cp 7680)
+              (if (< cp 3648)
+                (if (< cp 3634)
+                  0
+                  (if (<= cp 3635) 1
+                    0))
+                (if (<= cp 3654) 1
+                  (if (< cp 3664)
+                  0
+                  (if (<= cp 3673) 2
+                    0))))
+              (if (<= cp 7957) 1
+                (if (< cp 7968)
+                (if (< cp 7960)
+                  0
+                  (if (<= cp 7965) 1
+                    0))
+                (if (<= cp 8005) 1
+                  (if (< cp 8008)
+                  0
+                  (if (<= cp 8013) 1
+                    0))))))
+            (if (<= cp 8023) 1
+              (if (< cp 8031)
+              (if (< cp 8027)
+                (if (< cp 8025)
+                  0
+                  (if (<= cp 8025) 1
+                    0))
+                (if (<= cp 8027) 1
+                  (if (< cp 8029)
+                  0
+                  (if (<= cp 8029) 1
+                    0))))
+              (if (<= cp 8061) 1
+                (if (< cp 8118)
+                (if (< cp 8064)
+                  0
+                  (if (<= cp 8116) 1
+                    0))
+                (if (<= cp 8124) 1
+                  0))))))))))
+      (if (<= cp 8126) 1
+        (if (< cp 12445)
+        (if (< cp 8320)
+          (if (< cp 8192)
+            (if (< cp 8150)
+              (if (< cp 8134)
+                (if (< cp 8130)
+                  0
+                  (if (<= cp 8132) 1
+                    0))
+                (if (<= cp 8140) 1
+                  (if (< cp 8144)
+                  0
+                  (if (<= cp 8147) 1
+                    0))))
+              (if (<= cp 8155) 1
+                (if (< cp 8178)
+                (if (< cp 8160)
+                  0
+                  (if (<= cp 8172) 1
+                    0))
+                (if (<= cp 8180) 1
+                  (if (< cp 8182)
+                  0
+                  (if (<= cp 8188) 1
+                    0))))))
+            (if (<= cp 8202) 3
+              (if (< cp 8304)
+              (if (< cp 8239)
+                (if (< cp 8232)
+                  0
+                  (if (<= cp 8233) 3
+                    0))
+                (if (<= cp 8239) 3
+                  (if (< cp 8287)
+                  0
+                  (if (<= cp 8287) 3
+                    0))))
+              (if (<= cp 8304) 2
+                (if (< cp 8308)
+                (if (< cp 8305)
+                  0
+                  (if (<= cp 8305) 1
+                    0))
+                (if (<= cp 8313) 2
+                  (if (< cp 8319)
+                  0
+                  (if (<= cp 8319) 1
+                    0))))))))
+          (if (<= cp 8329) 2
+            (if (< cp 12293)
+            (if (< cp 8581)
+              (if (< cp 8528)
+                (if (< cp 8336)
+                  0
+                  (if (<= cp 8348) 1
+                    0))
+                (if (<= cp 8578) 2
+                  (if (< cp 8579)
+                  0
+                  (if (<= cp 8580) 1
+                    0))))
+              (if (<= cp 8585) 2
+                (if (< cp 9450)
+                (if (< cp 9312)
+                  0
+                  (if (<= cp 9371) 2
+                    0))
+                (if (<= cp 9471) 2
+                  (if (< cp 12288)
+                  0
+                  (if (<= cp 12288) 3
+                    0))))))
+            (if (<= cp 12294) 1
+              (if (< cp 12344)
+              (if (< cp 12321)
+                (if (< cp 12295)
+                  0
+                  (if (<= cp 12295) 2
+                    0))
+                (if (<= cp 12329) 2
+                  (if (< cp 12337)
+                  0
+                  (if (<= cp 12341) 1
+                    0))))
+              (if (<= cp 12346) 2
+                (if (< cp 12353)
+                (if (< cp 12347)
+                  0
+                  (if (<= cp 12348) 1
+                    0))
+                (if (<= cp 12438) 1
+                  0))))))))
+        (if (<= cp 12447) 1
+          (if (< cp 64112)
+          (if (< cp 12881)
+            (if (< cp 12593)
+              (if (< cp 12540)
+                (if (< cp 12449)
+                  0
+                  (if (<= cp 12538) 1
+                    0))
+                (if (<= cp 12543) 1
+                  (if (< cp 12549)
+                  0
+                  (if (<= cp 12591) 1
+                    0))))
+              (if (<= cp 12686) 1
+                (if (< cp 12832)
+                (if (< cp 12784)
+                  0
+                  (if (<= cp 12799) 1
+                    0))
+                (if (<= cp 12841) 2
+                  (if (< cp 12872)
+                  0
+                  (if (<= cp 12879) 2
+                    0))))))
+            (if (<= cp 12895) 2
+              (if (< cp 19968)
+              (if (< cp 12977)
+                (if (< cp 12928)
+                  0
+                  (if (<= cp 12937) 2
+                    0))
+                (if (<= cp 12991) 2
+                  (if (< cp 13312)
+                  0
+                  (if (<= cp 19903) 1
+                    0))))
+              (if (<= cp 40959) 1
+                (if (< cp 63744)
+                (if (< cp 44032)
+                  0
+                  (if (<= cp 55203) 1
+                    0))
+                (if (<= cp 64109) 1
+                  0))))))
+          (if (<= cp 64217) 1
+            (if (< cp 65498)
+            (if (< cp 65382)
+              (if (< cp 65313)
+                (if (< cp 65296)
+                  0
+                  (if (<= cp 65305) 2
+                    0))
+                (if (<= cp 65338) 1
+                  (if (< cp 65345)
+                  0
+                  (if (<= cp 65370) 1
+                    0))))
+              (if (<= cp 65470) 1
+                (if (< cp 65482)
+                (if (< cp 65474)
+                  0
+                  (if (<= cp 65479) 1
+                    0))
+                (if (<= cp 65487) 1
+                  (if (< cp 65490)
+                  0
+                  (if (<= cp 65495) 1
+                    0))))))
+            (if (<= cp 65500) 1
+              (if (< cp 178208)
+              (if (< cp 131072)
+                (if (< cp 120782)
+                  0
+                  (if (<= cp 120831) 2
+                    0))
+                (if (<= cp 173791) 1
+                  (if (< cp 173824)
+                  0
+                  (if (<= cp 178205) 1
+                    0))))
+              (if (<= cp 183981) 1
+                (if (< cp 194560)
+                (if (< cp 183984)
+                  0
+                  (if (<= cp 191456) 1
+                    0))
+                (if (<= cp 195101) 1
+                  0)))))))))))))
+
+;; ---------------------------------------------------------- UTF-8 decoding
+;;
+;; `unicode_cpt_from_utf8`, including what it does NOT check: no overlong
+;; form, no surrogate and no range check, only the continuation bytes. A
+;; sequence it rejects becomes U+FFFD and advances ONE byte, which is what
+;; `unicode_cpts_from_utf8` does with the exception it would otherwise throw.
+;;
+;; The result is packed as `length * 2097152 + codepoint` so that one call
+;; answers both questions; a codepoint is at most 0x1FFFFF = 2097151, so the
+;; two never collide, and 0 means "past the end" because a real decode always
+;; carries a length of at least one.
+
+(defn cont-ok [reg len p]
+  (if (>= p len) 0
+    (if (= 128 (bit-and (kernel-load-u8 (kernel-subregion reg len p 1) 1 0) 192)) 1 0)))
+
+(defn cp-dec [reg len p]
+  (if (>= p len) 0
+    (let [b0 (kernel-load-u8 (kernel-subregion reg len p 1) 1 0)]
+      (if (< b0 128) (+ 2097152 b0)
+        (if (< b0 192) 2162685
+          (if (< b0 224)
+            (if (= 0 (cont-ok reg len (+ p 1))) 2162685
+              (+ 4194304 (+ (* (bit-and b0 31) 64)
+                            (bit-and (kernel-load-u8 (kernel-subregion reg len (+ p 1) 1) 1 0) 63))))
+            (if (< b0 240)
+              (if (= 0 (if (= 0 (cont-ok reg len (+ p 1))) 0 (cont-ok reg len (+ p 2)))) 2162685
+                (+ 6291456 (+ (* (bit-and b0 15) 4096)
+                              (+ (* (bit-and (kernel-load-u8 (kernel-subregion reg len (+ p 1) 1) 1 0) 63) 64)
+                                 (bit-and (kernel-load-u8 (kernel-subregion reg len (+ p 2) 1) 1 0) 63)))))
+              (if (< b0 248)
+                (if (= 0 (if (= 0 (cont-ok reg len (+ p 1))) 0
+                           (if (= 0 (cont-ok reg len (+ p 2))) 0
+                             (cont-ok reg len (+ p 3))))) 2162685
+                  (+ 8388608 (+ (* (bit-and b0 7) 262144)
+                                (+ (* (bit-and (kernel-load-u8 (kernel-subregion reg len (+ p 1) 1) 1 0) 63) 4096)
+                                   (+ (* (bit-and (kernel-load-u8 (kernel-subregion reg len (+ p 2) 1) 1 0) 63) 64)
+                                      (bit-and (kernel-load-u8 (kernel-subregion reg len (+ p 3) 1) 1 0) 63))))))
+                2162685))))))))
+
+;; 2162685 = 2097152 + 65533: one byte, U+FFFD.
+
+(defn cp-only [reg len p] (bit-and (cp-dec reg len p) 2097151))
+
+(defn next-p [reg len p]
+  (let [d (cp-dec reg len p)]
+    (if (= d 0) (+ p 1) (+ p (quot d 2097152)))))
+
+;; -1 past the end, which is llama.cpp's all-zero flags: not whitespace, not a
+;; letter, not a number, and `as_uint()` false.
+(defn cls-at [reg len p]
+  (let [d (cp-dec reg len p)]
+    (if (= d 0) -1 (cp-class (bit-and d 2097151)))))
+
+;; ------------------------------------------------------- the pre-tokenizer
+;;
+;; Every function returns the byte offset just past the chunk it matched, or 0
+;; for "this rule did not match". Zero is safe as a sentinel because a match
+;; always ends strictly after the position it started at.
+
+(defn lower-ascii [c] (if (>= c 65) (if (<= c 90) (+ c 32) c) c))
+
+;; Rule 1: (?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])
+(defn contraction-end [reg len p]
+  (if (not (= 39 (cp-only reg len p))) 0
+    (let [d1 (cp-dec reg len (+ p 1))]
+      (if (= d1 0) 0
+        (let [c1 (lower-ascii (bit-and d1 2097151))]
+          (if (if (= c1 115) true (if (= c1 116) true (if (= c1 109) true (= c1 100))))
+            (+ (+ p 1) (quot d1 2097152))
+            (let [q (+ (+ p 1) (quot d1 2097152))]
+              (let [d2 (cp-dec reg len q)]
+                (if (= d2 0) 0
+                  (let [c2 (lower-ascii (bit-and d2 2097151))]
+                    (if (if (= c2 101)
+                          (if (= c1 114) true (= c1 118))
+                          (if (= c1 108) (= c2 108) false))
+                      (+ q (quot d2 2097152))
+                      0)))))))))))
+
+;; Rule 2: [^\r\n\p{L}\p{N}]?\p{L}+
+(defn letters-run [reg len p]
+  (if (= 1 (cls-at reg len p)) (letters-run reg len (next-p reg len p)) p))
+
+(defn letters-end [reg len p]
+  (let [cp (cp-only reg len p)]
+    (if (if (= cp 13) true (if (= cp 10) true (= 2 (cls-at reg len p)))) 0
+      (let [q (next-p reg len p)]
+        (if (if (= 1 (cls-at reg len p)) true (= 1 (cls-at reg len q)))
+          (letters-run reg len q)
+          0)))))
+
+;; Rule 3: \p{N}{1,3}
+(defn digits-run [reg len p n]
+  (if (= n 0) p
+    (if (= 2 (cls-at reg len p)) (digits-run reg len (next-p reg len p) (- n 1)) p)))
+
+;; Rule 4: ` ?[^\s\p{L}\p{N}]+[\r\n]*`
+(defn other-run [reg len p]
+  (if (= 0 (cls-at reg len p)) (other-run reg len (next-p reg len p)) p))
+
+(defn crlf-run [reg len p]
+  (let [c (cp-only reg len p)]
+    (if (if (= c 13) true (= c 10)) (crlf-run reg len (next-p reg len p)) p)))
+
+(defn other-end [reg len p]
+  (let [q (if (= 32 (cp-only reg len p)) (next-p reg len p) p)]
+    (if (not (= 0 (cls-at reg len q))) 0
+      (crlf-run reg len (other-run reg len q)))))
+
+;; Rules 5-7 share one scan: slot 96 keeps the end of the last CR or LF in the
+;; run, slot 100 the codepoint count and slot 120 the start of the last
+;; whitespace codepoint. The scan returns the end of the run.
+(defn ws-scan [reg len wb wl p]
+  (if (not (= 3 (cls-at reg len p))) p
+    (do (put-u32 wb wl 100 (+ (u32-at wb wl 100) 1))
+        (put-u32 wb wl 120 p)
+        (if (if (= 13 (cp-only reg len p)) true (= 10 (cp-only reg len p)))
+          (put-u32 wb wl 96 (next-p reg len p))
+          0)
+        (ws-scan reg len wb wl (next-p reg len p)))))
+
+(defn ws-end [reg len wb wl p]
+  (do (put-u32 wb wl 96 0)
+      (put-u32 wb wl 100 0)
+      (put-u32 wb wl 120 0)
+      (let [we (ws-scan reg len wb wl p)]
+        (if (> (u32-at wb wl 96) 0) (u32-at wb wl 96)
+          (if (if (> (u32-at wb wl 100) 1) (< we len) false)
+            (u32-at wb wl 120)
+            (if (> (u32-at wb wl 100) 0) we
+              (next-p reg len p)))))))
+
+(defn chunk-end [reg len wb wl p]
+  (let [c1 (contraction-end reg len p)]
+    (if (> c1 0) c1
+      (let [c2 (letters-end reg len p)]
+        (if (> c2 0) c2
+          (if (= 2 (cls-at reg len p)) (digits-run reg len p 3)
+            (let [c4 (other-end reg len p)]
+              (if (> c4 0) c4
+                (ws-end reg len wb wl p)))))))))
+
+;; ---------------------------------------------------- the byte-level alphabet
+;;
+;; `unicode_byte_to_utf8`: 33..126, 161..172 and 174..255 stand for themselves
+;; and everything else moves above U+0100, in ascending byte order --
+;; 0x00..0x20 to U+0100..U+0120, 0x7F..0xA0 to U+0121..U+0142, 0xAD to U+0143.
+;; That is what makes a space print as `Ġ` in a GPT-2 vocabulary.
+
+(defn byte-cp [b]
+  (if (< b 33) (+ 256 b)
+    (if (< b 127) b
+      (if (< b 161) (+ 162 b)
+        (if (< b 173) b
+          (if (= b 173) 323 b))))))
+
+;; --------------------------------------------------------------- symbols
+
+(defn sym-get [wb wl i f]
+  (u32-at wb wl (+ (u32-at wb wl 68) (+ (* i 24) f))))
+
+(defn sym-put [wb wl i f v]
+  (put-u32 wb wl (+ (u32-at wb wl 68) (+ (* i 24) f)) v))
+
+;; One raw byte becomes one symbol whose bytes are that byte's place in the
+;; alphabet, encoded as UTF-8. Every mapped codepoint is below U+0800, so the
+;; encoding is one byte or two and a symbol is never longer than two.
+(defn push-byte [wb wl b]
+  (let [e (byte-cp b)]
+    (let [n (u32-at wb wl 112)]
+      (if (>= n 512) -24
+        (let [ec (u32-at wb wl 116)]
+          (let [encb (+ (u32-at wb wl 68) 12288)]
+            (do (if (< e 128)
+                  (put-u8 wb wl (+ encb ec) e)
+                  (do (put-u8 wb wl (+ encb ec) (+ 192 (quot e 64)))
+                      (put-u8 wb wl (+ encb (+ ec 1)) (+ 128 (bit-and e 63)))))
+                (sym-put wb wl n 0 ec)
+                (sym-put wb wl n 4 (if (< e 128) 1 2))
+                (sym-put wb wl n 8 (+ n 1))
+                (sym-put wb wl n 12 (if (= n 0) 65535 (- n 1)))
+                (sym-put wb wl n 16 4294967295)
+                (sym-put wb wl n 20 2147483647)
+                (put-u32 wb wl 112 (+ n 1))
+                (put-u32 wb wl 116 (+ ec (if (< e 128) 1 2)))
+                0)))))))
+
+;; A codepoint contributes the bytes of its CANONICAL encoding, not the bytes
+;; it arrived as. That is `unicode_regex_split` rebuilding each word from the
+;; codepoint vector before byte-encoding it, and it is why an invalid input
+;; byte turns into the three bytes of U+FFFD rather than into itself.
+(defn push-cp [wb wl cp]
+  (if (< cp 128) (push-byte wb wl cp)
+    (if (< cp 2048)
+      (let [r (push-byte wb wl (+ 192 (quot cp 64)))]
+        (if (< r 0) r (push-byte wb wl (+ 128 (bit-and cp 63)))))
+      (if (< cp 65536)
+        (let [r (push-byte wb wl (+ 224 (quot cp 4096)))]
+          (if (< r 0) r
+            (let [s (push-byte wb wl (+ 128 (bit-and (quot cp 64) 63)))]
+              (if (< s 0) s (push-byte wb wl (+ 128 (bit-and cp 63)))))))
+        (if (> cp 1114111) -21
+          (let [r (push-byte wb wl (+ 240 (quot cp 262144)))]
+            (if (< r 0) r
+              (let [s (push-byte wb wl (+ 128 (bit-and (quot cp 4096) 63)))]
+                (if (< s 0) s
+                  (let [t (push-byte wb wl (+ 128 (bit-and (quot cp 64) 63)))]
+                    (if (< t 0) t
+                      (push-byte wb wl (+ 128 (bit-and cp 63))))))))))))))
+
+(defn encode-chunk [reg len wb wl p]
+  (if (>= p (u32-at wb wl 108)) 0
+    (let [d (cp-dec reg len p)]
+      (if (= d 0) 0
+        (let [r (push-cp wb wl (bit-and d 2097151))]
+          (if (< r 0) r
+            (encode-chunk reg len wb wl (+ p (quot d 2097152)))))))))
+
+;; -------------------------------------------------------- vocabulary lookup
+;;
+;; The needle is in the WORKSPACE (the encoded buffer) and the candidate in the
+;; MODEL, so the two comparands come from different regions -- which the byte
+;; comparison does not care about, because both arrive as parameters.
+
+(defn tok-slot-eq [mb ml wb wl e]
+  (let [pos (u32-at wb wl (+ (u32-at wb wl 20) (* (- e 1) 4)))]
+    (let [n (u32-at mb ml pos)]
+      (if (not (= n (u32-at wb wl 100))) 0
+        (if (= n 0) 1
+          (bytes-eq (kernel-subregion mb ml (+ pos 8) n)
+                    (kernel-subregion wb wl (u32-at wb wl 96) n)
+                    n 0))))))
+
+(defn tok-probe [mb ml wb wl st]
+  (if (< st 4194304) -1
+    (let [e (u32-at wb wl (+ (u32-at wb wl 24) (* (bit-and st 4194303) 4)))]
+      (if (= e 0) -1
+        (if (= 1 (tok-slot-eq mb ml wb wl e)) (- e 1)
+          (tok-probe mb ml wb wl
+                     (+ (* (- (quot st 4194304) 1) 4194304)
+                        (bit-and (+ (bit-and st 4194303) 1)
+                                 (- (u32-at wb wl 28) 1)))))))))
+
+(defn needle-st [wb wl]
+  (+ (* (u32-at wb wl 28) 4194304)
+     (bit-and (fnv-bytes (kernel-subregion wb wl (u32-at wb wl 96) (u32-at wb wl 100))
+                         (u32-at wb wl 100) 0 2166136261)
+              (- (u32-at wb wl 28) 1))))
+
+(defn sym-id [mb ml wb wl i]
+  (do (put-u32 wb wl 96 (+ (+ (u32-at wb wl 68) 12288) (sym-get wb wl i 0)))
+      (put-u32 wb wl 100 (sym-get wb wl i 4))
+      (tok-probe mb ml wb wl (needle-st wb wl))))
+
+;; -------------------------------------------------------------- merge rank
+
+(defn merge-probe [wb wl l r st]
+  (if (< st 4194304) 2147483647
+    (let [cell (+ (u32-at wb wl 32) (* (bit-and st 4194303) 12))]
+      (if (= 0 (u32-at wb wl cell)) 2147483647
+        (if (if (= (u32-at wb wl cell) (+ l 1))
+              (= (u32-at wb wl (+ cell 4)) r)
+              false)
+          (u32-at wb wl (+ cell 8))
+          (merge-probe wb wl l r
+                       (+ (* (- (quot st 4194304) 1) 4194304)
+                          (bit-and (+ (bit-and st 4194303) 1)
+                                   (- (u32-at wb wl 36) 1)))))))))
+
+(defn merge-st [wb wl l r]
+  (+ (* (u32-at wb wl 36) 4194304)
+     (bit-and (fnv-u32 (fnv-u32 2166136261 l) r) (- (u32-at wb wl 36) 1))))
+
+(defn pair-rank [wb wl i]
+  (let [j (sym-get wb wl i 8)]
+    (if (= j 65535) 2147483647
+      (let [l (sym-get wb wl i 16)]
+        (if (= l 4294967295) 2147483647
+          (let [r (sym-get wb wl j 16)]
+            (if (= r 4294967295) 2147483647
+              (merge-probe wb wl l r (merge-st wb wl l r)))))))))
+
+;; ------------------------------------------------------------ the BPE loop
+;;
+;; llama.cpp keeps a priority queue of bigrams ordered by (rank, left index)
+;; and skips the entries a merge invalidated. That is the same sequence of
+;; merges as "repeatedly take the live adjacent pair with the lowest rank,
+;; leftmost on a tie", which is what this does -- the queue's only other
+;; effect is to make each step cheaper, and the cache in slot +20 buys that
+;; back without a heap.
+
+(defn best-scan [wb wl i best brank]
+  (if (= i 65535) best
+    (let [r (sym-get wb wl i 20)]
+      (if (< r brank)
+        (best-scan wb wl (sym-get wb wl i 8) i r)
+        (best-scan wb wl (sym-get wb wl i 8) best brank)))))
+
+(defn bpe-step [mb ml wb wl n]
+  (if (= n 0) 0
+    (let [i (best-scan wb wl 0 65535 2147483647)]
+      (if (= i 65535) 0
+        (let [j (sym-get wb wl i 8)]
+          (do (sym-put wb wl i 4 (+ (sym-get wb wl i 4) (sym-get wb wl j 4)))
+              (sym-put wb wl i 8 (sym-get wb wl j 8))
+              (sym-put wb wl j 4 0)
+              (if (= (sym-get wb wl i 8) 65535) 0
+                (sym-put wb wl (sym-get wb wl i 8) 12 i))
+              (let [id (sym-id mb ml wb wl i)]
+                (do (sym-put wb wl i 16 (if (< id 0) 4294967295 id))
+                    (sym-put wb wl i 20 (pair-rank wb wl i))
+                    (if (= (sym-get wb wl i 12) 65535) 0
+                      (sym-put wb wl (sym-get wb wl i 12) 20
+                               (pair-rank wb wl (sym-get wb wl i 12))))
+                    (bpe-step mb ml wb wl (- n 1))))))))))
+
+;; ------------------------------------------------------------------ emit
+
+(defn emit [wb wl i k]
+  (if (= i 65535) k
+    (let [id (sym-get wb wl i 16)]
+      (if (= id 4294967295) -25
+        (if (>= k (u32-at wb wl 60)) -26
+          (do (put-u32 wb wl (+ (u32-at wb wl 56) (* k 4)) id)
+              (emit wb wl (sym-get wb wl i 8) (+ k 1))))))))
+
+(defn assign-ids [mb ml wb wl i]
+  (if (>= i (u32-at wb wl 112)) 0
+    (let [id (sym-id mb ml wb wl i)]
+      (if (< id 0) -25
+        (do (sym-put wb wl i 16 id)
+            (assign-ids mb ml wb wl (+ i 1)))))))
+
+(defn assign-ranks [wb wl i]
+  (if (>= i (u32-at wb wl 112)) 0
+    (do (sym-put wb wl i 20 (pair-rank wb wl i))
+        (assign-ranks wb wl (+ i 1)))))
+
+(defn do-chunk [mb ml wb wl]
+  (do (put-u32 wb wl 112 0)
+      (put-u32 wb wl 116 0)
+      (let [r (encode-chunk (kernel-subregion wb wl (u32-at wb wl 48) (u32-at wb wl 52))
+                            (u32-at wb wl 52) wb wl (u32-at wb wl 104))]
+        (if (< r 0) r
+          (let [n (u32-at wb wl 112)]
+            (if (= n 0) 0
+              (do (sym-put wb wl (- n 1) 8 65535)
+                  (let [a (assign-ids mb ml wb wl 0)]
+                    (if (< a 0) a
+                      (do (assign-ranks wb wl 0)
+                          (bpe-step mb ml wb wl n)
+                          (let [k (emit wb wl 0 (u32-at wb wl 64))]
+                            (if (< k 0) k
+                              (do (put-u32 wb wl 64 k) 0)))))))))))))
+
+;; ------------------------------------------------------------- the walk
+;;
+;; Two levels, because the KIR oracle recurses on its host stack: a 32,768-byte
+;; input can hold 32,768 chunks and the interpreter would need that many host
+;; frames even though the backends turn a self tail call into a jump.
+
+(defn split-n [mb ml wb wl n]
+  (if (= n 0) 0
+    (let [p (u32-at wb wl 104)]
+      (if (>= p (u32-at wb wl 52)) 0
+        (let [e (chunk-end (kernel-subregion wb wl (u32-at wb wl 48) (u32-at wb wl 52))
+                           (u32-at wb wl 52) wb wl p)]
+          (if (<= e p) -27
+            (do (put-u32 wb wl 104 p)
+                (put-u32 wb wl 108 e)
+                (let [r (do-chunk mb ml wb wl)]
+                  (if (< r 0) r
+                    (do (put-u32 wb wl 104 e)
+                        (split-n mb ml wb wl (- n 1))))))))))))
+
+(defn split-loop [mb ml wb wl remaining]
+  (if (= remaining 0) 0
+    (if (>= (u32-at wb wl 104) (u32-at wb wl 52)) 0
+      (let [c (if (> remaining 256) 256 remaining)]
+        (let [r (split-n mb ml wb wl c)]
+          (if (< r 0) r (split-loop mb ml wb wl (- remaining c))))))))
+
+;; -------------------------------------------------------------- the entry
+
+(defn run-tokenize [mb ml wb wl]
+  (do (put-u32 wb wl 64 0)
+      (put-u32 wb wl 104 0)
+      (split-loop mb ml wb wl (u32-at wb wl 52))))
+
+(defn aiueos-qwen35-tokenize [mb ml wb wl]
+  (if (= mb 0) -1
+    (if (= wb 0) -2
+      (if (< wl 128) -3
+        (if (not (= (u32-at wb wl 0) 1263816523)) -4
+          (if (> ml 16777216) -5
+            (if (> (u32-at wb wl 52) 32768) -6
+              (if (> (+ (u32-at wb wl 48) (u32-at wb wl 52)) wl) -7
+                (if (> (+ (u32-at wb wl 56) (* 4 (u32-at wb wl 60))) wl) -8
+                  (if (if (< (u32-at wb wl 72) 13312) true
+                        (> (+ (u32-at wb wl 68) (u32-at wb wl 72)) wl)) -9
+                    (if (> (u32-at wb wl 40) wl) -10
+                      (run-tokenize mb ml wb wl))))))))))))
+
+(defn main [] 0)

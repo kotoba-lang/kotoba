@@ -1,0 +1,179 @@
+#!/usr/bin/env kbb
+;; Compile every committed kernel object with a given compiler and say, for
+;; each one, whether the bytes come back identical.
+;;
+;;   kbb --backend sci os/aiueos/scripts/measure-object-producer.cljk --compiler /path/to/amu [--jvm-free]
+;;
+;; WHY THIS EXISTS. `reproduce-kotoba-kernel-object.sh` pins amu 9cf3a0a and
+;; its comment records why that pin has not moved: five objects were compiled
+;; at the tip and compared against the committed bytes, and all five differed,
+;; so taking the advance means regenerating every object and every pinned
+;; digest in `build-uefi.sh` -- a change to the shipped kernel.
+;;
+;; Five is a sample. The decision that was deferred on it needs the whole
+;; inventory: which objects reproduce, which differ, which no longer compile at
+;; all, and for the ones that differ, by how much. This measures that and
+;; writes a receipt. It does NOT take the advance, move a pin, or touch a
+;; committed object.
+;;
+;; The receipt names the compiler it measured, because a reproduction count
+;; without one is a number with no closure.
+(ns measure-object-producer
+  (:require [kotoba.lang.text :as str]
+            ["fs" :as fs]
+            ["path" :as path]
+            ["os" :as os]
+            ["child_process" :as cp]))
+
+(def ^:private target "x86_64-aiueos-kernel-v1")
+
+(defn- fail! [message data]
+  (throw (ex-info message (assoc data :phase :measure-object-producer))))
+
+(defn- sh [cmd args opts]
+  (let [r (.spawnSync cp cmd (clj->js args)
+                      (clj->js (merge {:encoding "utf8" :maxBuffer (* 8 1024 1024)} opts)))]
+    {:status (.-status r) :stdout (or (.-stdout r) "") :stderr (or (.-stderr r) "")}))
+
+(defn- compiler-sha [compiler]
+  (let [r (sh "git" ["-C" compiler "rev-parse" "HEAD"] {})]
+    (when-not (zero? (:status r))
+      (fail! "REFUSING TO REPORT A MEASUREMENT: the compiler path is not a git checkout, so the receipt could not name what it measured"
+             {:compiler compiler}))
+    (str/trim (:stdout r))))
+
+(defn- first-difference [a b]
+  (let [n (min (.-length a) (.-length b))]
+    (loop [i 0]
+      (cond (= i n) (when (not= (.-length a) (.-length b)) n)
+            (not= (aget a i) (aget b i)) i
+            :else (recur (inc i))))))
+
+(def ^:private could-not-run
+  "Messages that mean the toolchain did not run, as against the compiler
+  refusing the object. Measured 2026-08-31: `ipv4-checksum` was recorded as
+  FAILED by a run whose message was `Execution error (FileNotFoundException) at
+  kotoba.compiler.frontend/eval271$loading` -- the frontend namespace failing to
+  LOAD, under a machine at load average 76. The object compiles on retry. A
+  measurement that reports `could not answer` as `answered no` is the defect
+  this tool exists to find, so these are retried and, if they persist, reported
+  under their own verdict."
+  [#"FileNotFoundException" #"MODULE_NOT_FOUND" #"could not resolve the dependency closure"
+   #"ClassNotFoundException" #"Could not locate"])
+
+;; `--jvm-free` is opt-in rather than the default because this tool is pointed
+;; at ARBITRARY compiler checkouts, including ones older than the JDK-free
+;; native driver's packaging step -- against those the flag is a refusal, not a
+;; route. What it must never be is silent: the receipt records which route
+;; produced the bytes, because "the committed object differs" and "the
+;; committed object differs under a route we did not name" are different
+;; claims.
+(def jvm-free? (some #(= "--jvm-free" %) (vec *command-line-args*)))
+
+(defn- attempt [compiler root source out]
+  (sh (path/join compiler "bin/amu")
+      (cond-> ["compile" source "--target" target "--output" out]
+        jvm-free? (conj "--jvm-free"))
+      {:cwd root}))
+
+(defn- measure-one [compiler root name]
+  (let [source (path/join root "os/aiueos/kotoba" (str name ".kotoba"))
+        committed (path/join root "os/aiueos/kotoba" (str name ".o"))
+        out (path/join (os/tmpdir) (str "aiueos-measure-" name "-" js/process.pid ".o"))
+        first-try (attempt compiler root source out)
+        transient? (fn [r] (let [text (str (:stdout r) (:stderr r))]
+                             (boolean (some #(re-find % text) could-not-run))))
+        retried? (and (not (zero? (:status first-try))) (transient? first-try))
+        r (if retried? (attempt compiler root source out) first-try)]
+    (try
+      (if-not (zero? (:status r))
+        (let [text (str (:stdout r) (:stderr r))
+              line (first (remove str/blank? (str/split-lines text)))]
+          {:object name
+           ;; `:could-not-run` is not `:failed`. One says the toolchain never
+           ;; started; the other says the compiler read the object and refused.
+           :verdict (if (transient? r) :could-not-run :failed)
+           :exit (:status r) :retried retried?
+           :message (some-> line str/trim (subs 0 (min 200 (count (str/trim line)))))})
+        (let [produced (fs/readFileSync out)
+              expected (fs/readFileSync committed)
+              at (first-difference produced expected)]
+          (if (nil? at)
+            {:object name :verdict :reproduced :bytes (.-length expected) :retried retried?}
+            {:object name :verdict :differs :retried retried?
+             :committed-bytes (.-length expected) :produced-bytes (.-length produced)
+             :first-difference-at at})))
+      (finally (try (fs/unlinkSync out) (catch :default _ nil))))))
+
+(defn -main [& args]
+  (let [compiler (or (some #(when (str/starts-with? % "--compiler=") (subs % 11)) args)
+                     (second (drop-while #(not= "--compiler" %) args)))
+        root (or (some #(when (str/starts-with? % "--root=") (subs % 7)) args) ".")
+        only (or (some #(when (str/starts-with? % "--only=") (subs % 7)) args)
+                   (second (drop-while #(not= "--only" %) args)))]
+    (when-not compiler
+      (fail! "usage: --compiler <path to an amu checkout> [--root <aiueos>] [--only <name>] [--jvm-free]" {}))
+    (let [sha (compiler-sha compiler)
+          dir (path/join root "os/aiueos/kotoba")
+          committed (->> (fs/readdirSync dir)
+                         (filter #(str/ends-with? % ".o"))
+                         (map #(subs % 0 (- (count %) 2)))
+                         sort vec)
+          sourced? #(fs/existsSync (path/join dir (str % ".kotoba")))
+          ;; Objects with no sibling source cannot be measured by this
+          ;; command, and they are REPORTED rather than filtered away. The
+          ;; first version dropped them silently: 67 committed objects went in,
+          ;; 66 came out, and the receipt said 66 with nothing to say the
+          ;; difference existed. `ecdsa-p256-public` is the one -- not
+          ;; sourceless, but a second packaging of `ecdsa-p256-sign.kotoba`,
+          ;; which defines both entries and whose recipe writes both `.o`
+          ;; files. Measuring it needs that recipe, not this command.
+          skipped (mapv (fn [n] {:object n :reason :no-sibling-source})
+                        (remove sourced? committed))
+          objects (filterv sourced? committed)
+          objects (if only (filterv #(= only %) objects) objects)]
+      ;; Evidence floor: a scan that found no objects has not found no
+      ;; differences.
+      (when (empty? objects)
+        (fail! "REFUSING TO REPORT A MEASUREMENT: no committed object has a sibling source"
+               {:dir dir :only only}))
+      (println (str "COMPILER\t" sha))
+      (println (str "COMMITTED\t" (count committed)
+                    "\tMEASURED\t" (count objects)
+                    "\tSKIPPED\t" (count skipped)))
+      (doseq [s skipped] (println (str "  skipped: " (:object s) " (" (name (:reason s)) ")")))
+      (let [results (vec (for [n objects]
+                           (let [r (measure-one compiler root n)]
+                             (println (str n (apply str (repeat (max 1 (- 40 (count n))) " ")) (name (:verdict r))))
+                             r)))
+            by (group-by :verdict results)
+            receipt {:format :aiueos.object-producer-measurement/v1
+                     :measured-at (subs (.toISOString (js/Date.)) 0 10)
+                     :compiler-sha sha
+                     :route (if jvm-free? :jvm-free :default)
+                     :target (keyword target)
+                     :committed (count committed)
+                     :objects (count results)
+                     :skipped skipped
+                     :reproduced (count (:reproduced by))
+                     :differs (count (:differs by))
+                     :failed (count (:failed by))
+                     :could-not-run (count (:could-not-run by))
+                     :retried (count (filter :retried results))
+                     :results results}]
+        (fs/writeFileSync (path/join root "qualification/object-producer-measurement.edn")
+                          (str (pr-str receipt) "\n"))
+        (println (str "REPRODUCED\t" (count (:reproduced by))
+                      "\tDIFFERS\t" (count (:differs by))
+                      "\tFAILED\t" (count (:failed by))
+                      "\tCOULD-NOT-RUN\t" (count (:could-not-run by))
+                      "\tRETRIED\t" (count (filter :retried results))))
+        (println "-> qualification/object-producer-measurement.edn")))))
+
+(try (apply -main *command-line-args*)
+     (catch :default e
+       (println "FAILED:" (ex-message e))
+       (println "  " (pr-str (ex-data e)))
+       (println (first (str/split-lines (or (.-stack e) ""))))
+       (doseq [l (take 5 (rest (str/split-lines (or (.-stack e) ""))))] (println "   " l))
+       (set! (.-exitCode js/process) 1)))

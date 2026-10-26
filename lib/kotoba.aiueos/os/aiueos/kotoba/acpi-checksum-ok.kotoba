@@ -1,0 +1,166 @@
+;; The ACPI table checksum: do these `length` bytes sum to zero, mod 256?
+;;
+;; `checksum_ok` in kernel/acpi.c was the whole of it --
+;;
+;;   static int checksum_ok(const void *table, uint32_t length) {
+;;     const uint8_t *bytes = table; uint8_t sum = 0;
+;;     for (uint32_t i = 0; i < length; i++) sum = (uint8_t)(sum + bytes[i]);
+;;     return sum == 0;
+;;   }
+;;
+;; -- and it is the only thing standing between firmware's claim about a table
+;; and the kernel believing it. acpi.c was the largest file in the kernel with
+;; no decision moved out of it at all: every checksum and every bound was still
+;; C, over bytes the kernel did not write and cannot re-derive. That is the
+;; whole argument for moving it. The page tables at least describe memory this
+;; kernel allocated; an ACPI table describes memory somebody else filled in.
+;;
+;; Four call sites use it and they do not agree on a length: the RSDP at a fixed
+;; 20, the ACPI 2.0 extended RSDP at its own declared `length`, and every SDT
+;; (XSDT/RSDT, MADT, DMAR) at the length in its header. All four now arrive
+;; here, so all four get the same arithmetic and the same bound.
+;;
+;; THE WRAP -- why a wider accumulator is not merely different
+;;
+;; The C accumulates in a `uint8_t`. The sum wraps at 256 and the test is
+;; `sum == 0`, so what is actually being asked is "sum == 0 (mod 256)". An
+;; implementation that accumulates in a wide integer and then asks `total == 0`
+;; answers a STRICTLY STRONGER question, and every table whose bytes sum to
+;; 256, or 512, or 0x100 * anything -- which is every valid ACPI table with at
+;; least one non-zero byte, i.e. all of them -- gets rejected. The mirror-image
+;; mistake, comparing a wide total to zero after summing a table that is
+;; genuinely corrupt, cannot happen; the danger is entirely in the other
+;; direction and the failure would be total rather than subtle.
+;;
+;; This object accumulates in i64 and masks ONCE, at the end:
+;;
+;;   (= (bit-and total 255) 0)
+;;
+;; That is exactly the C, not an approximation of it. Addition is a
+;; homomorphism onto Z/256: masking after every add and masking after the last
+;; add agree for every input, because ((a + b) mod 256) = ((a mod 256) + b) mod
+;; 256. Masking once is chosen over masking per step only because it is one
+;; operation instead of 16384 of them, and the per-step mask would have to be
+;; re-argued every time the step shape changes. The accumulator cannot overflow
+;; on the way there: 16384 bytes of 0xff is 4,177,920, which is 41 bits short
+;; of where i64 stops being exact.
+;;
+;; THE BOUND -- 16 KiB, and it is a ceiling this subset imposes, not a choice
+;;
+;; `kernel-memory-operations` in the compiler frontend offers exactly three
+;; widths of bounded byte load: `kernel-load-u8` (512), `kernel-load-u8-4k`
+;; (4096) and `kernel-load-u8-16k` (16384). There is no 64 KiB form. 16384 is
+;; therefore the largest table this object can be made to walk at all, and the
+;; C it replaces admitted up to ACPI_MAX_TABLE_SIZE = 1 MiB. That narrowing is
+;; real and is called out in the handoff rather than hidden here.
+;;
+;; It is not a narrowing that bites anything acpi.c actually parses. The tables
+;; that reach this object are the RSDP (20 or 36 bytes), the XSDT/RSDT (36 plus
+;; eight bytes per table the firmware publishes -- tens of entries, not
+;; thousands), the MADT (44 plus one entry per interrupt controller, and this
+;; kernel stops recording at 256 CPUs) and the DMAR (36 plus a DRHD per IOMMU).
+;; A 16 KiB MADT is on the order of a thousand x2APIC entries. The DSDT, the one
+;; ACPI table that is routinely megabytes, is never touched here -- acpi.c does
+;; not walk it.
+;;
+;; The bound is enforced BEFORE the first load, and that ordering is the whole
+;; point. `kernel-load-u8-16k` does not return an error when its declared length
+;; exceeds 16384: it reaches `ud2`, and `ud2` in this kernel is a halt, not a
+;; rejected table. A firmware-declared length of 100000 has to be turned into a
+;; 0 by this object's own guard or it becomes a boot that stops with an
+;; unexpected-vector exception.
+;;
+;; FUEL -- 8 bytes per step, because the tier is 4096 and the walk is 16384
+;;
+;; `emit-function` charges one fuel unit per function entry, and a tail-self
+;; call re-enters through the same charge. A one-byte-per-step walk therefore
+;; costs one unit per byte, and this object's registered tier
+;; (`bounded-memory?` in kotoba-native's elf64.clj) is 4096: a 4096-byte table
+;; would spend 4098 and hit the prologue `ud2`, and a 16 KiB table would be four
+;; times over. The tier is not this repository's to change, so the step is.
+;;
+;; Eight loads per step divides the count by eight and leaves the remainder to
+;; single-byte steps, in the SAME function so the whole walk stays tail-self and
+;; the native stack does not grow. Measured, not estimated:
+;;
+;;   16384 bytes -> 2048 eight-byte steps + 1 terminating entry  = 2049
+;;   16383 bytes -> 2047 eight-byte steps + 7 single + 1         = 2055
+;;   plus one entry for `aiueos-acpi-checksum-ok` itself         =   +1
+;;
+;; so 2056 units is the worst case over the whole admitted range, against a
+;; 4096 replenish -- a factor of two of headroom, which is what stops this from
+;; being the size-dependent trap the network checksums nearly were. Four bytes
+;; per step would NOT have been enough: 4096 steps + 1 + 1 is 4098.
+;;
+;; SIGNEDNESS -- the C is unsigned, this object is signed i64
+;;
+;; `length` reaches the C as a `uint32_t` and this object as an i64, so every
+;; value the C could see is non-negative here and the two arithmetics agree on
+;; all of them. The guards are still written to be total over i64 rather than
+;; over what the current call sites happen to pass:
+;;
+;;   * `(<= length 0)` rather than `(= length 0)`. A negative length would pass
+;;     `(< length 16384)` in signed arithmetic while the C's unsigned form saw a
+;;     value near 2^64 and rejected it. The load's own bound check is unsigned
+;;     (`cmp rcx,maximum` / `ja`), so a negative length would trap rather than
+;;     return -- one clause has to catch it first, and `<= 0` catches the zero
+;;     case and the negative case together.
+;;   * `(<= table 0)` for the base. A pointer at or above 2^63 arrives negative;
+;;     the C never checked the pointer here at all (its callers did, through
+;;     `bounded_address`), and a null or negative base reaching the load is a
+;;     trap. Guarding it here makes the object total on its own signature
+;;     instead of on its callers' discipline.
+;;
+;; LENGTH 0 -- a deliberate divergence, fail-closed
+;;
+;; The C returns 1 for a zero length: the loop does not execute, `sum` stays 0,
+;; and 0 == 0. That is vacuously true and was harmless only because every one of
+;; the four call sites had already established a length of at least 20. This
+;; object returns 0 instead. A checksum over no bytes is not a checksum that
+;; passed, and an object that answers "verified" to a caller that has verified
+;; nothing is the wrong thing to leave lying around in a kernel. The divergence
+;; is unreachable from acpi.c as it stands today; it exists so that it stays
+;; unreachable from whatever calls this next.
+
+(defn aiueos-acpi-checksum-step [table length offset total]
+  ;; Three arms: done, fewer than eight bytes left, a full eight. The
+  ;; eight-load arm and the one-load arm are both tail-self calls into this
+  ;; same function, so the remainder costs a branch rather than a second
+  ;; function (which would have cost a fuel unit per remaining byte on top of
+  ;; the step's own).
+  ;;
+  ;; Every load names `table` as its region and adds the offset inside the
+  ;; index, because the compiler rejects a computed base outright -- "kernel
+  ;; memory base must name a region, not compute one". `length` is the region
+  ;; length, so the load's own index check is against the table's real end
+  ;; rather than against a constant 16384 the caller may not own.
+  (if (>= offset length)
+    total
+    (if (> (+ offset 8) length)
+      (aiueos-acpi-checksum-step table length (+ offset 1)
+        (+ total (kernel-load-u8-16k table length offset)))
+      (aiueos-acpi-checksum-step table length (+ offset 8)
+        (+ total
+           (+ (+ (+ (kernel-load-u8-16k table length offset)
+                    (kernel-load-u8-16k table length (+ offset 1)))
+                 (+ (kernel-load-u8-16k table length (+ offset 2))
+                    (kernel-load-u8-16k table length (+ offset 3))))
+              (+ (+ (kernel-load-u8-16k table length (+ offset 4))
+                    (kernel-load-u8-16k table length (+ offset 5)))
+                 (+ (kernel-load-u8-16k table length (+ offset 6))
+                    (kernel-load-u8-16k table length (+ offset 7))))))))))
+
+(defn aiueos-acpi-checksum-ok [table length]
+  ;; `and` and `or` desugar to nested `let`/`if` and short-circuit, so the walk
+  ;; below is not reached -- and no load is issued -- unless every guard has
+  ;; already held.
+  ;; The verdict is spelled as a nested `if` rather than as the comparison's
+  ;; own result because `if` branches must agree on a value type, and a literal
+  ;; 0 is an i64 where a comparison is a bool.
+  (if (or (<= table 0) (<= length 0) (> length 16384))
+    0
+    (if (= (bit-and (aiueos-acpi-checksum-step table length 0 0) 255) 0)
+      1
+      0)))
+
+(defn main [] 0)

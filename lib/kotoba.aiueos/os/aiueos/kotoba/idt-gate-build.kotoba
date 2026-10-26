@@ -1,0 +1,268 @@
+;; Interrupt descriptor construction.
+;;
+;; The C this replaces, main.c:221 --
+;;
+;;   static void set_idt_gate(uint8_t vector, void (*handler)(void)) {
+;;     uint64_t address = (uint64_t)(uintptr_t)handler;
+;;     idt[vector].offset_low    = (uint16_t)address;
+;;     idt[vector].selector      = 0x08;
+;;     idt[vector].ist           = 0;
+;;     idt[vector].attributes    = 0x8e;
+;;     idt[vector].offset_middle = (uint16_t)(address >> 16);
+;;     idt[vector].offset_high   = (uint32_t)(address >> 32);
+;;     idt[vector].reserved      = 0;
+;;   }
+;;
+;; -- is not a decision at first glance; it is field assignment. It is here
+;; because of what a wrong assignment DOES. A miscomputed offset field does not
+;; fault and does not return an error: it produces a well-formed, present gate
+;; that points somewhere else. The CPU then transfers control there, in ring 0,
+;; with interrupts already disabled by the gate type. The failure mode of
+;; getting this packing wrong is not a crash, it is an attacker-chosen jump
+;; target, and that is why the packing belongs on this side.
+;;
+;; WHAT IT WRITES -- 16 bytes, little-endian, into a caller-owned region
+;;
+;;   0..1    offset_low      bits 15:0  of handler
+;;   2..3    selector
+;;   4       ist
+;;   5       attributes
+;;   6..7    offset_middle   bits 31:16 of handler
+;;   8..11   offset_high     bits 63:32 of handler
+;;   12..15  reserved        zero
+;;
+;; The region is the caller's, exactly as in `aiueos-user-context-build`: C
+;; owns the 256-entry table and passes `&idt[vector]`, this owns what the
+;; sixteen bytes at that address say. The declared length is 16 -- one
+;; descriptor -- so the bounded-store primitive traps on any index outside the
+;; single entry rather than reaching a neighbouring vector.
+;;
+;; WHAT IT REFUSES, AND WHY THOSE DOMAINS
+;;
+;; Returns 1 written, 0 refused. A refused call writes NOTHING: every store
+;; is inside the admitted arm of the `if`, so there is no path that leaves a
+;; half-built descriptor. That ordering is deliberate -- a partially written
+;; gate is strictly worse than an absent one, because an absent one has P=0
+;; and raises #GP on delivery, while a half-built one is present and points at
+;; whatever the surviving fields describe.
+;;
+;;   selector = 8, and nothing else.
+;;
+;;     On delivery the CPU loads this selector into CS. The architecture
+;;     requires it to designate a 64-bit code segment; for a kernel handler it
+;;     must additionally have DPL 0, because the handler runs at the DPL of the
+;;     segment it names. entry.S:314 defines this kernel's GDT and it has
+;;     exactly one descriptor that qualifies:
+;;
+;;       0x00  null
+;;       0x08  0x00af9a000000ffff  L=1, type 0xa code, DPL 0   <-- the only one
+;;       0x10  0x00cf92000000ffff  data, DPL 0
+;;       0x18  0x00cff2000000ffff  ring 3 data
+;;       0x20  0x00affa000000ffff  ring 3 code, DPL 3
+;;       0x28  TSS (16 bytes, occupying 0x28 and 0x30)
+;;
+;;     0x10 and 0x18 are data segments and 0x28 is a system descriptor: each
+;;     #GPs on delivery, which is loud. 0x20 is the dangerous one -- it is a
+;;     valid 64-bit code segment, so a gate naming it is well-formed and the
+;;     handler runs at CPL 3 with the kernel's own entry point address. That is
+;;     the case an "is it a code segment?" test would admit and this list does
+;;     not. Admitting one value rather than a predicate follows `msr-write`:
+;;     the reviewable artefact is the set of things the kernel may reach, and
+;;     here that set has one member.
+;;
+;;   ist = 0, and nothing else.
+;;
+;;     Bits 2:0 of this byte select TSS.IST1..IST7; 0 means "no IST", use the
+;;     legacy stack-switch rules. Bits 7:3 are reserved and must be zero, so a
+;;     byte-wide parameter is already wider than the field. More decisively,
+;;     process.c:69 declares `static struct tss64 tss;` and process.c:283-285
+;;     writes only `rsp0` and `iomap` -- `tss.ist[0..6]` are never assigned and
+;;     stay zero. A gate with ist=n therefore loads RSP=0 on delivery and
+;;     faults immediately, inside the fault delivery that was already in
+;;     progress: #DF, and then a triple fault with no diagnostic at all. The
+;;     domain is 0 because the table backing every other value is empty.
+;;
+;;   attributes = 142 (0x8e), and nothing else.
+;;
+;;     The byte is P(7) DPL(6:5) 0(4) type(3:0). 0x8e is present, DPL 0, type
+;;     0xe = 64-bit interrupt gate, and it is what all seven call sites pass.
+;;     Two nearby values are deliberately NOT admitted:
+;;
+;;       0x8f  trap gate -- identical except that it does not clear IF. No call
+;;             site wants one, and admitting it would let a caller silently turn
+;;             a re-entrancy-free handler into a re-entrant one.
+;;       0xee  DPL 3 interrupt gate -- the value that makes a vector invocable
+;;             from user code with `int`. This kernel enters the kernel through
+;;             `syscall`/LSTAR (process.c:133), not through a software gate, so
+;;             nothing needs it; and it is precisely the exploitable direction,
+;;             since it converts any vector into a user-callable ring-0 entry.
+;;
+;;     A structural predicate -- P set, bit 4 clear, type in {0xe,0xf} -- was
+;;     considered and rejected for admitting exactly those two.
+;;
+;;   handler must be non-zero and CANONICAL.
+;;
+;;     Zero is never an intended handler and is what an uninitialised or
+;;     failed-to-link function pointer looks like. Canonicality is the
+;;     architectural requirement on the assembled 64-bit offset: bits 63:47
+;;     must all equal bit 47, and a gate holding a non-canonical target raises
+;;     #GP(0) *during delivery* -- so the observable symptom is a general
+;;     protection fault whose error code points at the IDT, arriving instead of
+;;     the interrupt that was actually raised. Refusing at construction turns
+;;     that into a refusal at the call site, which the caller can report.
+;;
+;;     This is also the one check that is CHEAPER in this language than in the
+;;     C it replaces, and the reason is in the next section.
+;;
+;; SIGNEDNESS -- the crux, and where the last three iterations went wrong
+;;
+;; `(uint64_t)(uintptr_t)handler` is unsigned in C. Here it is a signed i64, so
+;; a handler with bit 63 set -- any kernel mapped in the upper half -- arrives
+;; NEGATIVE. Two consequences, one helpful and one a trap.
+;;
+;;   * Helpful: the canonical test is a signed range test and nothing more.
+;;     "bits 63:47 all equal bit 47" is exactly "the value, read as a signed
+;;     64-bit integer, lies in [-2^47, 2^47)". So
+;;
+;;       (>= handler -140737488355328)  (< handler 140737488355328)
+;;
+;;     is the whole check, and it is correct BECAUSE the comparison is signed:
+;;     0xffffffff80100000 arrives as -2146435072 and passes, while
+;;     0x8000000000001234 -- bit 63 set but bits 62:47 clear, the classic
+;;     non-canonical address -- arrives as -9223372036854771148 and fails. An
+;;     unsigned language needs two disjoint interval tests here; this needs one
+;;     interval. Note what this means for the differential against the C: the C
+;;     writes that non-canonical address without complaint and this refuses it.
+;;     That divergence is intended and is the only one.
+;;
+;;   * The trap: `quot` truncates toward zero, where C's `>>` on an unsigned
+;;     value shifts in zeros. On a NEGATIVE value the two disagree, and they
+;;     disagree quietly. `(quot handler 4294967296)` for handler = -1 yields 0,
+;;     where `(uint64_t)-1 >> 32` yields 0xffffffff -- a zero offset_high, i.e.
+;;     a gate pointing into the low 4 GiB instead of at the handler. This is
+;;     the recurring bug in this tree.
+;;
+;;     It is avoided by never dividing a value whose sign is in doubt:
+;;
+;;       low  = (bit-and handler 4294967295)
+;;
+;;     `bit-and` is a bit operation, not an arithmetic one, so it is correct on
+;;     a two's-complement negative and its result is non-negative by
+;;     construction. Every division of the low half is a division of `low`.
+;;
+;;       high = (bit-and (quot (- handler low) 4294967296) 4294967295)
+;;
+;;     `(- handler low)` is `handler` with its low 32 bits cleared, still
+;;     negative when bit 63 is set -- but it is an exact multiple of 2^32, so
+;;     the division has remainder zero and truncation direction cannot matter.
+;;     -2^32 divided by 2^32 is -1 whether you floor it or truncate it. The
+;;     `bit-and` then reads the low 32 bits of that signed quotient, which are
+;;     the handler's bits 63:32. Worked through for 0xffffffff80100000:
+;;     low = 0x80100000, handler-low = 0xffffffff00000000 = -4294967296,
+;;     quotient = -1, and (bit-and -1 4294967295) = 4294967295 = 0xffffffff.
+;;     The C's `(uint32_t)(address >> 32)` gives the same 0xffffffff.
+;;
+;;     Both divisions in the admitted arm are therefore of a non-negative
+;;     value or exact. Order matters and is the rule the vtd-admit object had
+;;     to be rewritten around: mask first, divide second.
+;;
+;;   * The three domain parameters are compared only with `=` against positive
+;;     literals, never masked or divided, so those tests are exact bit equality
+;;     and sign-agnostic. A negative `selector`, `ist` or `attributes` --
+;;     reachable over this object's i64 signature though no caller produces one
+;;     -- matches nothing and is refused.
+;;
+;;   * Because the canonical test runs BEFORE the arithmetic, `handler` is
+;;     known to lie in [-2^47, 2^47) by the time `(- handler low)` evaluates,
+;;     so that subtraction cannot underflow.
+;;
+;; FUEL -- 1 per call, 7 calls per boot, no replenish tier
+;;
+;; Deliberately absent from `bounded-memory?` in kotoba-native's elf64.clj, so
+;; the object gets no replenish and spends from the 512 its own `.data` context
+;; starts with -- per object, not shared. Measured from the emitted object:
+;; exactly two `decq 0x8(%r9)` sites, one at this function's entry and one at
+;; `main`'s, which the kernel never calls. This is written as ONE function with
+;; no helpers for that reason: fuel is charged per function entry, so a helper
+;; called sixteen times would cost seventeen units per gate instead of one.
+;; `let` is sequencing and costs nothing; `kernel-store-u8` is emitted inline
+;; and is not a call.
+;;
+;; Seven call sites, all in main.c:317-323, all one-shot BSP initialisation
+;; between `aiueos_load_gdt()` and `aiueos_load_idt()`:
+;;
+;;   vector   6  aiueos_isr_invalid_opcode
+;;   vector  14  aiueos_isr_page_fault
+;;   vector  32  aiueos_isr_apic_timer
+;;   vector  33  aiueos_isr_external_timer
+;;   vector  34  aiueos_isr_virtio_rng
+;;   vector  35  aiueos_isr_virtio_blk
+;;   vector 128  aiueos_isr_syscall
+;;
+;; 7 of 512, a factor of 73 in hand -- measured, not predicted: the emitted
+;; object was executed with each of the seven real handler addresses and the
+;; fuel word at context+8 read 511 afterwards every time. Nothing re-enters
+;; this: the IDT is built once and `lidt` is issued once, and the AP path does
+;; not build one -- `aiueos_ap_entry` (smp.c:40) reads an APIC ID and halts,
+;; and smp.c contains no `lidt` at all.
+;;
+;; NOT converted, and the fuel is why: multiboot/main.c:55 carries a second,
+;; textually identical copy of this packing for its own 256-entry table. That
+;; path is a separate link that does not include kernel/main.c, so it does not
+;; break by omission -- but it calls its `set_gate` 257 times per boot
+;; (`install_idt_and_time_lapic`, 256 defaults plus vector 32), and 257 of an
+;; unreplenished 512 is a different safety story from 7. Moving it belongs with
+;; a decision about this object's fuel tier, which lives in kotoba-native.
+
+(defn aiueos-idt-gate-build [handler selector ist attributes out]
+  (if (and (= selector 8)
+           (= ist 0)
+           (= attributes 142)
+           (not (= handler 0))
+           (>= handler -140737488355328)
+           (< handler 140737488355328))
+    ;; Admitted. `let` here is sequencing: every binding is evaluated exactly
+    ;; once, in order, before the body -- so the sixteen stores happen, and
+    ;; their returns are summed rather than discarded so that "the descriptor
+    ;; was written" is a value the body tests rather than an assumption. The
+    ;; bounded-store primitive returns the byte it stored and traps before
+    ;; touching memory otherwise, so an equal sum is evidence that all sixteen
+    ;; landed.
+    (let [low (bit-and handler 4294967295)
+          high (bit-and (quot (- handler low) 4294967296) 4294967295)
+          b0 (bit-and low 255)
+          b1 (bit-and (quot low 256) 255)
+          b2 (bit-and selector 255)
+          b3 (bit-and (quot selector 256) 255)
+          b6 (bit-and (quot low 65536) 255)
+          b7 (bit-and (quot low 16777216) 255)
+          b8 (bit-and high 255)
+          b9 (bit-and (quot high 256) 255)
+          b10 (bit-and (quot high 65536) 255)
+          b11 (bit-and (quot high 16777216) 255)
+          s0 (kernel-store-u8 out 16 0 b0)
+          s1 (kernel-store-u8 out 16 1 b1)
+          s2 (kernel-store-u8 out 16 2 b2)
+          s3 (kernel-store-u8 out 16 3 b3)
+          s4 (kernel-store-u8 out 16 4 ist)
+          s5 (kernel-store-u8 out 16 5 attributes)
+          s6 (kernel-store-u8 out 16 6 b6)
+          s7 (kernel-store-u8 out 16 7 b7)
+          s8 (kernel-store-u8 out 16 8 b8)
+          s9 (kernel-store-u8 out 16 9 b9)
+          s10 (kernel-store-u8 out 16 10 b10)
+          s11 (kernel-store-u8 out 16 11 b11)
+          s12 (kernel-store-u8 out 16 12 0)
+          s13 (kernel-store-u8 out 16 13 0)
+          s14 (kernel-store-u8 out 16 14 0)
+          s15 (kernel-store-u8 out 16 15 0)
+          low-sum (+ s0 (+ s1 (+ s2 (+ s3 (+ s4 (+ s5 (+ s6 s7)))))))
+          high-sum (+ s8 (+ s9 (+ s10 (+ s11 (+ s12 (+ s13 (+ s14 s15)))))))
+          written (+ low-sum high-sum)
+          expected (+ b0 (+ b1 (+ b2 (+ b3 (+ ist (+ attributes
+                   (+ b6 (+ b7 (+ b8 (+ b9 (+ b10 b11)))))))))))]
+      (if (= written expected) 1 0))
+    ;; Refused: not one byte of `out` has been touched.
+    0))
+
+(defn main [] 0)

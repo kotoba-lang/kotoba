@@ -1,0 +1,637 @@
+(ns aiueos.compositor-test
+  "Discriminating tests for the compositor process.
+
+  `kbb -M:test` of this ns is not the Mac QEMU gate. Hosted surfaces
+  are `kbb -M:compositor smoke`. Guest 2D is `kbb -M:compositor gpu`.
+  These tests name the reds so HTTP-only `#session` cannot stand in for a
+  display session, a wiped desktop cannot count as restore, and query-pci
+  cannot stand in for CREATE+FLUSH."
+  (:require [aiueos.compositor :as comp]
+            [aiueos.compositor.desktop :as desktop]
+            [aiueos.compositor.guest :as guest]
+            [aiueos.phone-bind :as pb]
+            [clojure.java.io :as io]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]))
+
+(deftest boot-desktop-owns-surfaces
+  (let [d (desktop/boot-desktop)]
+    (is (desktop/restore-admitted? d))
+    (is (= 2 (count (:windows d))))
+    (is (= "#session" (:session-fragment d)))
+    (is (some (fn [[_ w]]
+                (= "aiueos.session" (get-in w [:component :app-id])))
+              (:windows d)))
+    (is (some (fn [[_ w]]
+                (= :kami (first (get-in w [:component :content]))))
+              (:windows d))
+        "guest surface is a kami content window, not CSS")))
+
+(deftest wiped-state-is-the-named-red
+  (testing "restore of a missing file must not be admitted"
+    (let [wiped (desktop/empty-desktop)]
+      (is (not (desktop/restore-admitted? wiped)))
+      (is (true? (:wiped? wiped)))
+      (is (empty? (:windows wiped)))))
+  (testing "persist then delete then load is refused, not an empty success"
+    (let [dir (io/file (str (System/getProperty "java.io.tmpdir")
+                            "/aiueos-comp-wipe-" (System/nanoTime)))
+          _ (comp/persist! dir (desktop/boot-desktop))
+          restored (comp/load-persisted dir)
+          _ (.delete (comp/desktop-file dir))
+          wiped (comp/load-persisted dir)]
+      (is (desktop/restore-admitted? restored)
+          "live persist must restore windows")
+      (is (= "#session" (:session-fragment restored)))
+      (is (not (desktop/restore-admitted? wiped))
+          "gate is red if restore of wiped state is treated as success"))))
+
+(deftest http-only-session-is-not-compositor
+  (is (not (comp/html-has-desktop-face?
+            "<html>href=\"#session\" dads-button jp-go-dds</html>"))
+      "P1 SPA without #desktop / kami viewport is not this gate"))
+
+(deftest gpu-argv-keeps-headless-bind
+  (let [argv (comp/gpu-argv {:qemu "qemu-system-aarch64"
+                             :firmware "/fw.fd"
+                             :qmp "/tmp/q.qmp"
+                             :serial "/tmp/s.log"
+                             :accel "hvf"})]
+    (is (comp/gpu-argv? argv))
+    (is (pb/headless-argv? argv)
+        "compositor QEMU must not require a local keyboard/cocoa console")
+    (is (= "none" (second (drop-while #(not= % "-display") argv))))
+    (is (some #{"virtio-gpu-pci"} argv))
+    (is (not (some #{"cocoa" "gtk" "sdl"} argv)))))
+
+(deftest pci-probe-requires-the-device-name
+  (is (not (comp/pci-names-gpu? "{\"return\":[]}")))
+  (is (not (comp/pci-names-gpu? "{\"class_info\":{\"desc\":\"Ethernet controller\"}}")))
+  (is (comp/pci-names-gpu? "{\"return\":[{\"devices\":[{\"id\":\"virtio-gpu-pci\"}]}]}"))
+  (is (comp/pci-names-gpu?
+       "{\"class_info\": {\"class\": 896, \"desc\": \"Display controller\"}, \"id\": {\"device\": 4176}}")
+      "QEMU query-pci names a Display controller, not the qdev string"))
+
+(deftest generated-spa-is-the-desktop-face
+  (is (comp/html-has-desktop-face? (pb/session-html))
+      "gate is red until apps/session/index.html is regenerated with #desktop"))
+
+(deftest p1b-default-argv-stays-without-gpu
+  (let [argv (pb/chassis-argv-shape {:qemu "qemu-system-aarch64"
+                                     :firmware "/fw.fd"
+                                     :qmp "/tmp/q.qmp"
+                                     :serial "/tmp/s.log"
+                                     :accel "hvf"})]
+    (is (pb/headless-argv? argv))
+    (is (not (some #{"virtio-gpu-pci"} argv))
+        "phone-bind default must not require a GPU device")))
+
+(deftest guest-2d-serial-is-the-gpu-gate
+  (testing "CREATE+FLUSH serial is green"
+    (is (comp/guest-2d-create+flush?
+         (str "AIUEOS_VIRTIO_GPU_OK modern-pci controlq display-info bounded\n"
+              "AIUEOS_VIRTIO_GPU_CREATE result=ok resource=1 format=2 w=32 h=32\n"
+              "AIUEOS_VIRTIO_GPU_FLUSH result=ok resource=1\n")))
+    (is (:green? (comp/gpu-2d-result
+                  {:serial (str "AIUEOS_VIRTIO_GPU_CREATE result=ok resource=1 format=2 w=32 h=32\n"
+                                "AIUEOS_VIRTIO_GPU_FLUSH result=ok resource=1\n")}))))
+  (testing "display-info without create/flush is the named leftover"
+    (is (not (comp/guest-2d-create+flush?
+              "AIUEOS_VIRTIO_GPU_OK modern-pci controlq display-info bounded\n")))
+    (let [r (comp/gpu-2d-result
+             {:serial (str "AIUEOS_VIRTIO_GPU_OK modern-pci controlq display-info bounded\n"
+                           "AIUEOS_VIRTIO_GPU_CREATE result=absent\n"
+                           "AIUEOS_VIRTIO_GPU_FLUSH result=absent\n")})]
+      (is (not (:green? r)))
+      (is (= 1 (:exit r)))
+      (is (= :gpu-2d-create-flush-absent (:reason r)))))
+  (testing "query-pci listing is not guest 2D"
+    (let [r (comp/gpu-2d-result {:pci-only? true :serial ""})]
+      (is (not (:green? r)))
+      (is (= :pci-device-listed-does-not-count (:reason r)))))
+  (testing "unmeasured is exit 3, not a silent pass"
+    (let [r (comp/gpu-2d-result {:qemu-unmeasured? true})]
+      (is (= 3 (:exit r)))
+      (is (= :unmeasured (:reason r))))))
+
+(deftest guest-ime-serial-is-the-guest-ime-gate
+  (testing "KERNEL.ELF u+304b without latin leak is green"
+    (is (comp/guest-ime-ok?
+         "AIUEOS_GUEST_IME_OK committed=u+304b latin-leak=0\n"))
+    (is (:green? (comp/guest-ime-result
+                  {:serial "AIUEOS_GUEST_IME_OK committed=u+304b latin-leak=0\n"}))))
+  (testing "latin echo is leftover latin-leak"
+    (let [r (comp/guest-ime-result
+             {:serial "AIUEOS_GUEST_IME leftover=latin-leak\n"})]
+      (is (not (:green? r)))
+      (is (= 1 (:exit r)))
+      (is (= :latin-leak (:reason r)))))
+  (testing "wrong codepoint is leftover vector-miss"
+    (let [r (comp/guest-ime-result
+             {:serial "AIUEOS_GUEST_IME leftover=vector-miss\n"})]
+      (is (not (:green? r)))
+      (is (= 1 (:exit r)))
+      (is (= :vector-miss (:reason r)))))
+  (testing "hosted JVM IME serial does not count"
+    (let [r (comp/guest-ime-result
+             {:serial "AIUEOS_COMPOSITOR_IME_OK\n"})]
+      (is (not (:green? r)))
+      (is (= :hosted-ime-does-not-count (:reason r))))
+    (let [r (comp/guest-ime-result {:hosted-ime? true :serial ""})]
+      (is (= :hosted-ime-does-not-count (:reason r)))))
+  (testing "unmeasured is exit 3, not a silent pass"
+    (let [r (comp/guest-ime-result {:qemu-unmeasured? true})]
+      (is (= 3 (:exit r)))
+      (is (= :unmeasured (:reason r))))))
+
+(deftest guest-wm-serial-is-the-guest-wm-gate
+  (testing "KERNEL.ELF four-vector z-hit is green"
+    (is (comp/guest-wm-ok?
+         "AIUEOS_GUEST_WM_OK two-surfaces z-hit=2 miss-front=1 raise=1 one-surface=0\n"))
+    (is (:green? (comp/guest-wm-result
+                  {:serial "AIUEOS_GUEST_WM_OK two-surfaces z-hit=2 miss-front=1 raise=1 one-surface=0\n"}))))
+  (testing "key-order hit is leftover z-order-ignored"
+    (let [r (comp/guest-wm-result
+             {:serial "AIUEOS_GUEST_WM leftover=z-order-ignored\n"})]
+      (is (not (:green? r)))
+      (is (= 1 (:exit r)))
+      (is (= :z-order-ignored (:reason r)))))
+  (testing "always-front skip of geometry is leftover always-front"
+    (let [r (comp/guest-wm-result
+             {:serial "AIUEOS_GUEST_WM leftover=always-front\n"})]
+      (is (not (:green? r)))
+      (is (= :always-front (:reason r)))))
+  (testing "one-surface ignore is leftover"
+    (let [r (comp/guest-wm-result
+             {:serial "AIUEOS_GUEST_WM leftover=one-surface-ignored\n"})]
+      (is (= :one-surface-ignored (:reason r)))))
+  (testing "raise no-op is leftover"
+    (let [r (comp/guest-wm-result
+             {:serial "AIUEOS_GUEST_WM leftover=raise-is-noop\n"})]
+      (is (= :raise-is-noop (:reason r)))))
+  (testing "hosted JVM WM serial does not count"
+    (let [r (comp/guest-wm-result
+             {:serial "AIUEOS_COMPOSITOR_WM_OK\n"})]
+      (is (not (:green? r)))
+      (is (= :hosted-wm-does-not-count (:reason r))))
+    (let [r (comp/guest-wm-result {:hosted-wm? true :serial ""})]
+      (is (= :hosted-wm-does-not-count (:reason r)))))
+  (testing "unmeasured is exit 3, not a silent pass"
+    (let [r (comp/guest-wm-result {:qemu-unmeasured? true})]
+      (is (= 3 (:exit r)))
+      (is (= :unmeasured (:reason r))))))
+
+(deftest wm-requires-two-stacked-surfaces
+  (testing "boot desktop is admitted; one notes iframe is the named red"
+    (let [d (desktop/boot-desktop)
+          one (desktop/one-surface-desktop)]
+      (is (desktop/wm-admitted? d))
+      (is (nil? (desktop/wm-refuse-reason d)))
+      (is (not (desktop/wm-admitted? one)))
+      (is (= :one-surface (desktop/wm-refuse-reason one)))))
+  (testing "IME leftover on a boot desktop is native compositor, not ime-absent"
+    (let [st (desktop/ime-leftover (desktop/boot-desktop))]
+      (is (true? (:ime? st)))
+      (is (= :native-compositor-absent (:leftover st))))))
+
+(deftest wm-hit-prefers-z-stack-not-key-order
+  (let [d (desktop/boot-desktop)
+        px (:x desktop/overlap-point)
+        py (:y desktop/overlap-point)
+        hit (desktop/hit-window d px py)
+        keys (desktop/key-order-hit d px py)
+        front (desktop/z-front d)]
+    (is (= 2 (count (:windows d))))
+    (is (= front hit) "overlap must hit the front surface")
+    (is (not= hit keys)
+        "gate is red if hit-window ignores z-order and scans map keys")
+    (is (= 2 hit) "last opened window is front at boot")))
+
+(deftest wm-raise-changes-front-and-input-target
+  (let [d (desktop/boot-desktop)
+        px (:x desktop/overlap-point)
+        py (:y desktop/overlap-point)
+        front (desktop/z-front d)
+        back (desktop/z-back d)
+        raised (desktop/raise d back)
+        [_ ev] (desktop/route-pointer raised px py)]
+    (is (not= front back))
+    (is (= back (desktop/z-front raised))
+        "raising the back window must change who is front")
+    (is (not= front (desktop/z-front raised)))
+    (is (= back (desktop/hit-window raised px py)))
+    (is (desktop/occluded-at? raised front px py)
+        "the old front still contains the point but is occluded")
+    (is (= back (:hit ev)))
+    (is (= [:panel back] (:input-target ev))
+        "clicks route to the focused guest; fails if z-order is ignored")
+    (is (= :native-compositor-absent (:leftover (desktop/ime-leftover raised)))
+        "WM green does not require conversion; leftover is native compositor")))
+
+(deftest generated-spa-is-the-wm-face
+  (is (comp/html-has-wm-face? (pb/session-html))
+      "gate is red until #desktop has two DADS-decorated stacked windows")
+  (is (not (comp/html-has-wm-face?
+            (str "<html>href=\"#session\" href=\"#setup\" href=\"#desktop\" "
+                 "dads-button jp-go-dds id=\"kami-viewport\" kami.webgpu "
+                 "window.__aiueosSessionAlive "
+                 "<pre id=\"compositor-out\">{surfaces:1}</pre></html>")))
+      "a JSON dump of one surface is not a window manager"))
+
+(deftest ime-on-consumes-latin-and-commits-kana
+  (let [d (desktop/boot-desktop)
+        [d1 e1] (desktop/route-key d "k")
+        [d2 e2] (desktop/route-key d1 "a")
+        [d3 e3] (desktop/route-key d2 "Enter")]
+    (is (true? (:consumed? e1)))
+    (is (= "" (:guest-text e1)))
+    (is (false? (:latin-leaked? e1)))
+    (is (true? (:consumed? e2)))
+    (is (= "" (:guest-text e2)))
+    (is (= "か" (:preedit e2)))
+    (is (= "か" (:guest-text e3)))
+    (is (desktop/ime-admitted? d3))
+    (is (not (re-find #"[a-zA-Z]" (str (get-in d3 [:ime :guest-log])))))))
+
+(deftest ime-off-is-the-named-red
+  (let [d (desktop/set-ime (desktop/boot-desktop) false)
+        [d1 e1] (desktop/route-key d "k")
+        [d2 e2] (desktop/route-key d1 "a")]
+    (is (false? (:consumed? e1)))
+    (is (= :ime-bypass (:reason e1)))
+    (is (= "k" (:guest-text e1)))
+    (is (= "a" (:guest-text e2)))
+    (is (str/includes? (str (get-in d2 [:ime :guest-log])) "ka"))
+    (is (not (desktop/ime-admitted? d2)))))
+
+(deftest generated-spa-is-the-ime-face
+  (is (comp/html-has-ime-face? (pb/session-html))
+      "gate is red until #desktop has the DADS IME candidate bar")
+  (is (not (comp/html-has-ime-face?
+            (str "<html>href=\"#session\" href=\"#setup\" href=\"#desktop\" "
+                 "dads-button jp-go-dds id=\"kami-viewport\" kami.webgpu "
+                 "window.__aiueosSessionAlive id=\"wm-stage\" "
+                 "class=\"wm-window\" class=\"wm-window\" wm-titlebar "
+                 "dads-chip-label data-raise dads-heading</html>")))
+      "WM decorations without #ime-bar are not the IME gate"))
+
+(deftest kanji-space-converts-ka-and-enter-commits
+  (let [d (desktop/boot-desktop)
+        [d1 _] (desktop/route-key d "k")
+        [d2 e2] (desktop/route-key d1 "a")
+        [d3 e3] (desktop/route-key d2 "Space")
+        [d4 e4] (desktop/route-key d3 "Enter")]
+    (is (= "か" (:preedit e2)))
+    (is (= :convert (:reason e3)))
+    (is (= "下" (:preedit e3)))
+    (is (= "" (:guest-text e3)))
+    (is (= "下" (:guest-text e4)))
+    (is (desktop/kanji-admitted? d4))
+    (is (= :native-compositor-absent (:leftover (desktop/ime-leftover d4))))
+    (is (not (re-find #"[a-zA-Z]" (str (get-in d4 [:ime :guest-log])))))))
+
+(deftest kanji-absent-space-commits-kana-is-the-named-red
+  (let [d (desktop/kana-only-desktop)
+        d1 (first (desktop/route-key d "k"))
+        d2 (first (desktop/route-key d1 "a"))
+        [d3 e3] (desktop/route-key d2 "Space")]
+    (is (= :kanji-absent (:reason e3)))
+    (is (= "か" (:guest-text e3)))
+    (is (not (desktop/kanji-admitted? d3)))
+    (is (= :kanji-absent (:leftover (desktop/ime-leftover d3))))))
+
+(deftest generated-spa-is-the-kanji-face
+  (is (comp/html-has-kanji-face? (pb/session-html))
+      "gate is red until #desktop names #ime-candidates")
+  (is (not (comp/html-has-kanji-face?
+            (str "<html>href=\"#session\" href=\"#desktop\" "
+                 "id=\"ime-bar\" id=\"ime-preedit\" id=\"ime-toggle\" "
+                 "data-ime id=\"wm-stage\" class=\"wm-window\" "
+                 "class=\"wm-window\" wm-titlebar dads-chip-label "
+                 "data-raise dads-heading kami.webgpu</html>")))
+      "IME bar without #ime-candidates is not the kanji gate"))
+
+(deftest kami-ir-constructors-admit-instances
+  (testing "render-ir with an instance is green; sky-only is the named red"
+    (is (desktop/kami-admitted? desktop/kami-session-ir))
+    (is (>= (count (:instances desktop/kami-session-ir)) 1))
+    (is (not (desktop/kami-admitted? desktop/clear-only-ir)))
+    (is (zero? (count (:instances desktop/clear-only-ir))))))
+
+(deftest generated-spa-is-the-kami-face
+  (is (comp/html-has-kami-face? (pb/session-html))
+      "gate is red until index.html loads /kami-presenter.js and names the clear-only red")
+  (is (not (comp/html-has-kami-face?
+            (str "<html>href=\"#session\" href=\"#setup\" href=\"#desktop\" "
+                 "dads-button jp-go-dds id=\"kami-viewport\" kami.webgpu "
+                 "window.__aiueosSessionAlive</html>")))
+      "desktop face without presenter src is not the kami gate")
+  (is (not (comp/html-has-kami-face?
+            (str (pb/session-html)
+                 " requesting WebGPU for kami.webgpu.ir")))
+      "the old sky-clear presentKami string is the named red"))
+
+(deftest generated-spa-is-the-guest-ime-face
+  (is (comp/html-has-guest-ime-face? (pb/session-html))
+      "gate is red until #desktop names kbb --backend sci --classpath src scripts/compositor-guest.cljk guest-ime")
+  (is (not (comp/html-has-guest-ime-face?
+            (str "<html>href=\"#session\" href=\"#desktop\" "
+                 "id=\"ime-bar\" id=\"ime-preedit\" id=\"ime-toggle\" "
+                 "data-ime id=\"ime-candidates\" id=\"wm-stage\" "
+                 "class=\"wm-window\" class=\"wm-window\" wm-titlebar "
+                 "dads-chip-label data-raise dads-heading kami.webgpu</html>")))
+      "kanji bar without the guest-ime command is not the guest IME face"))
+
+(deftest generated-spa-is-the-guest-wm-face
+  (is (comp/html-has-guest-wm-face? (pb/session-html))
+      "gate is red until #desktop names kbb --backend sci --classpath src scripts/compositor-guest.cljk guest-wm")
+  (is (not (comp/html-has-guest-wm-face?
+            (str "<html>href=\"#session\" href=\"#desktop\" "
+                 "id=\"ime-bar\" id=\"ime-preedit\" id=\"ime-toggle\" "
+                 "data-ime id=\"ime-candidates\" id=\"wm-stage\" "
+                 "class=\"wm-window\" class=\"wm-window\" wm-titlebar "
+                 "dads-chip-label data-raise dads-heading kami.webgpu "
+                 "kbb --backend sci --classpath src scripts/compositor-guest.cljk guest-ime native compositor</html>")))
+      "guest-ime lede without the guest-wm command is not the guest WM face"))
+
+(deftest guest-paint-serial-is-the-guest-paint-gate
+  (testing "KERNEL.ELF z-order overlap pixel is green"
+    (is (comp/guest-paint-ok?
+         "AIUEOS_GUEST_PAINT_OK boot-overlap=2 raised-overlap=1 key-order=0\n"))
+    (is (:green? (comp/guest-paint-result
+                  {:serial "AIUEOS_GUEST_PAINT_OK boot-overlap=2 raised-overlap=1 key-order=0\n"}))))
+  (testing "key-order paint is leftover"
+    (let [r (comp/guest-paint-result
+             {:serial "AIUEOS_GUEST_PAINT leftover=key-order-paint\n"})]
+      (is (not (:green? r)))
+      (is (= 1 (:exit r)))
+      (is (= :key-order-paint (:reason r)))))
+  (testing "always-front paint is leftover"
+    (let [r (comp/guest-paint-result
+             {:serial "AIUEOS_GUEST_PAINT leftover=always-front-paint\n"})]
+      (is (not (:green? r)))
+      (is (= :always-front-paint (:reason r)))))
+  (testing "one-scanout refuse is leftover"
+    (let [r (comp/guest-paint-result
+             {:serial "AIUEOS_GUEST_PAINT leftover=one-guest-scanout\n"})]
+      (is (= :one-guest-scanout (:reason r)))))
+  (testing "hosted JVM WM serial does not count"
+    (let [r (comp/guest-paint-result
+             {:serial "AIUEOS_COMPOSITOR_WM_OK\n"})]
+      (is (not (:green? r)))
+      (is (= :hosted-wm-does-not-count (:reason r))))
+    (let [r (comp/guest-paint-result {:hosted-wm? true :serial ""})]
+      (is (= :hosted-wm-does-not-count (:reason r)))))
+  (testing "unmeasured is exit 3, not a silent pass"
+    (let [r (comp/guest-paint-result {:qemu-unmeasured? true})]
+      (is (= 3 (:exit r)))
+      (is (= :unmeasured (:reason r))))))
+
+(deftest generated-spa-is-the-guest-paint-face
+  (is (comp/html-has-guest-paint-face? (pb/session-html))
+      "gate is red until #desktop names kbb --backend sci --classpath src scripts/compositor-guest.cljk guest-paint")
+  (is (not (comp/html-has-guest-paint-face?
+            (str "<html>href=\"#session\" href=\"#desktop\" "
+                 "id=\"ime-bar\" id=\"ime-preedit\" id=\"ime-toggle\" "
+                 "data-ime id=\"ime-candidates\" id=\"wm-stage\" "
+                 "class=\"wm-window\" class=\"wm-window\" wm-titlebar "
+                 "dads-chip-label data-raise dads-heading kami.webgpu "
+                 "kbb --backend sci --classpath src scripts/compositor-guest.cljk guest-ime "
+                 "kbb --backend sci --classpath src scripts/compositor-guest.cljk guest-wm native compositor</html>")))
+      "guest-wm lede without the guest-paint command is not the guest paint face"))
+
+(deftest guest-input-serial-is-the-guest-input-gate
+  (testing "KERNEL.ELF used-ring event is green"
+    (is (comp/guest-input-ok?
+         "AIUEOS_GUEST_INPUT_OK eventq-used=1 synthetic=0\n"))
+    (is (:green? (comp/guest-input-result
+                  {:serial "AIUEOS_GUEST_INPUT_OK eventq-used=1 synthetic=0\n"}))))
+  (testing "C synthetic fill is leftover"
+    (let [r (comp/guest-input-result
+             {:serial "AIUEOS_GUEST_INPUT leftover=synthetic-smoke\n"})]
+      (is (not (:green? r)))
+      (is (= 1 (:exit r)))
+      (is (= :synthetic-smoke (:reason r)))))
+  (testing "hosted JVM WM serial does not count"
+    (let [r (comp/guest-input-result
+             {:serial "AIUEOS_COMPOSITOR_WM_OK\n"})]
+      (is (not (:green? r)))
+      (is (= :hosted-wm-does-not-count (:reason r))))
+    (let [r (comp/guest-input-result {:hosted-wm? true :serial ""})]
+      (is (= :hosted-wm-does-not-count (:reason r)))))
+  (testing "unmeasured is exit 3, not a silent pass"
+    (let [r (comp/guest-input-result {:qemu-unmeasured? true})]
+      (is (= 3 (:exit r)))
+      (is (= :unmeasured (:reason r)))))
+  (testing "used-ring never advances is leftover"
+    (let [r (comp/guest-input-result
+             {:serial "AIUEOS_GUEST_INPUT leftover=eventq-empty\n"})]
+      (is (not (:green? r)))
+      (is (= 1 (:exit r)))
+      (is (= :eventq-empty (:reason r))))))
+
+(deftest generated-spa-is-the-guest-input-face
+  (is (comp/html-has-guest-input-face? (pb/session-html))
+      "gate is red until #desktop names kbb --backend sci --classpath src scripts/compositor-guest.cljk guest-input")
+  (is (not (comp/html-has-guest-input-face?
+            (str "<html>href=\"#session\" href=\"#desktop\" "
+                 "id=\"ime-bar\" id=\"ime-preedit\" id=\"ime-toggle\" "
+                 "data-ime id=\"ime-candidates\" id=\"wm-stage\" "
+                 "class=\"wm-window\" class=\"wm-window\" wm-titlebar "
+                 "dads-chip-label data-raise dads-heading kami.webgpu "
+                 "kbb --backend sci --classpath src scripts/compositor-guest.cljk guest-ime "
+                 "kbb --backend sci --classpath src scripts/compositor-guest.cljk guest-wm "
+                 "kbb --backend sci --classpath src scripts/compositor-guest.cljk guest-paint native compositor</html>")))
+      "guest-paint lede without the guest-input command is not the guest input face"))
+
+(deftest guest-gpu-two-serial-is-the-guest-gpu-two-gate
+  (testing "KERNEL.ELF two resources flushed is green"
+    (is (comp/guest-gpu-two-ok?
+         "AIUEOS_GUEST_GPU_TWO_OK resources=2 flush=2 kotoba-n=2\n"))
+    (is (:green? (comp/guest-gpu-two-result
+                  {:serial "AIUEOS_GUEST_GPU_TWO_OK resources=2 flush=2 kotoba-n=2\n"}))))
+  (testing "one resource when Kotoba admits two is leftover"
+    (let [r (comp/guest-gpu-two-result
+             {:serial "AIUEOS_GUEST_GPU_TWO leftover=one-resource\n"})]
+      (is (not (:green? r)))
+      (is (= 1 (:exit r)))
+      (is (= :one-resource (:reason r)))))
+  (testing "hosted JVM WM serial does not count"
+    (let [r (comp/guest-gpu-two-result
+             {:serial "AIUEOS_COMPOSITOR_WM_OK\n"})]
+      (is (not (:green? r)))
+      (is (= :hosted-wm-does-not-count (:reason r))))
+    (let [r (comp/guest-gpu-two-result {:hosted-wm? true :serial ""})]
+      (is (= :hosted-wm-does-not-count (:reason r)))))
+  (testing "unmeasured is exit 3, not a silent pass"
+    (let [r (comp/guest-gpu-two-result {:qemu-unmeasured? true})]
+      (is (= 3 (:exit r)))
+      (is (= :unmeasured (:reason r))))))
+
+(deftest generated-spa-is-the-guest-gpu-two-face
+  (is (comp/html-has-guest-gpu-two-face? (pb/session-html))
+      "gate is red until #desktop names kbb --backend sci --classpath src scripts/compositor-guest.cljk guest-gpu-two")
+  (is (not (comp/html-has-guest-gpu-two-face?
+            (str "<html>href=\"#session\" href=\"#desktop\" "
+                 "id=\"ime-bar\" id=\"ime-preedit\" id=\"ime-toggle\" "
+                 "data-ime id=\"ime-candidates\" id=\"wm-stage\" "
+                 "class=\"wm-window\" class=\"wm-window\" wm-titlebar "
+                 "dads-chip-label data-raise dads-heading kami.webgpu "
+                 "kbb --backend sci --classpath src scripts/compositor-guest.cljk guest-ime "
+                 "kbb --backend sci --classpath src scripts/compositor-guest.cljk guest-wm "
+                 "kbb --backend sci --classpath src scripts/compositor-guest.cljk guest-paint "
+                 "kbb --backend sci --classpath src scripts/compositor-guest.cljk guest-input native compositor</html>")))
+      "guest-input lede without the guest-gpu-two command is not the guest gpu-two face"))
+
+(deftest guest-scanout-two-serial-is-the-guest-scanout-two-gate
+  (testing "KERNEL.ELF two scanouts bound is green"
+    (is (comp/guest-scanout-two-ok?
+         "AIUEOS_GUEST_SCANOUT_TWO_OK scanouts=2 resource-0=1 resource-1=2 kotoba-n=2\n"))
+    (is (:green? (comp/guest-scanout-two-result
+                  {:serial "AIUEOS_GUEST_SCANOUT_TWO_OK scanouts=2 resource-0=1 resource-1=2 kotoba-n=2\n"}))))
+  (testing "one scanout when Kotoba admits two is leftover"
+    (let [r (comp/guest-scanout-two-result
+             {:serial "AIUEOS_GUEST_SCANOUT_TWO leftover=one-scanout\n"})]
+      (is (not (:green? r)))
+      (is (= 1 (:exit r)))
+      (is (= :one-scanout (:reason r)))))
+  (testing "hosted JVM WM serial does not count"
+    (let [r (comp/guest-scanout-two-result
+             {:serial "AIUEOS_COMPOSITOR_WM_OK\n"})]
+      (is (not (:green? r)))
+      (is (= :hosted-wm-does-not-count (:reason r))))
+    (let [r (comp/guest-scanout-two-result {:hosted-wm? true :serial ""})]
+      (is (= :hosted-wm-does-not-count (:reason r)))))
+  (testing "unmeasured is exit 3, not a silent pass"
+    (let [r (comp/guest-scanout-two-result {:qemu-unmeasured? true})]
+      (is (= 3 (:exit r)))
+      (is (= :unmeasured (:reason r))))))
+
+(deftest generated-spa-is-the-guest-scanout-two-face
+  (is (comp/html-has-guest-scanout-two-face? (pb/session-html))
+      "gate is red until #desktop names kbb --backend sci --classpath src scripts/compositor-guest.cljk guest-scanout-two")
+  (is (not (comp/html-has-guest-scanout-two-face?
+            (str "<html>href=\"#session\" href=\"#desktop\" "
+                 "id=\"ime-bar\" id=\"ime-preedit\" id=\"ime-toggle\" "
+                 "data-ime id=\"ime-candidates\" id=\"wm-stage\" "
+                 "class=\"wm-window\" class=\"wm-window\" wm-titlebar "
+                 "dads-chip-label data-raise dads-heading kami.webgpu "
+                 "kbb --backend sci --classpath src scripts/compositor-guest.cljk guest-ime "
+                 "kbb --backend sci --classpath src scripts/compositor-guest.cljk guest-wm "
+                 "kbb --backend sci --classpath src scripts/compositor-guest.cljk guest-paint "
+                 "kbb --backend sci --classpath src scripts/compositor-guest.cljk guest-input "
+                 "kbb --backend sci --classpath src scripts/compositor-guest.cljk guest-gpu-two native compositor</html>")))
+      "guest-gpu-two lede without the guest-scanout-two command is not the guest scanout-two face"))
+
+(deftest guest-broker-serial-is-the-guest-broker-gate
+  (testing "KERNEL.ELF clipboard-only admit is green"
+    (is (comp/guest-broker-ok?
+         "AIUEOS_GUEST_BROKER_OK clipboard=1 picker=0 kotoba-clip=1 kotoba-pick=0\n"))
+    (is (:green? (comp/guest-broker-result
+                  {:serial "AIUEOS_GUEST_BROKER_OK clipboard=1 picker=0 kotoba-clip=1 kotoba-pick=0\n"}))))
+  (testing "picker admitted on clipboard-only grant is leftover"
+    (let [r (comp/guest-broker-result
+             {:serial "AIUEOS_GUEST_BROKER leftover=always-grant\n"})]
+      (is (not (:green? r)))
+      (is (= 1 (:exit r)))
+      (is (= :always-grant (:reason r)))))
+  (testing "clipboard refused is leftover"
+    (let [r (comp/guest-broker-result
+             {:serial "AIUEOS_GUEST_BROKER leftover=deny-all\n"})]
+      (is (not (:green? r)))
+      (is (= :deny-all (:reason r)))))
+  (testing "hosted JVM WM serial does not count"
+    (let [r (comp/guest-broker-result
+             {:serial "AIUEOS_COMPOSITOR_WM_OK\n"})]
+      (is (not (:green? r)))
+      (is (= :hosted-wm-does-not-count (:reason r))))
+    (let [r (comp/guest-broker-result {:hosted-wm? true :serial ""})]
+      (is (= :hosted-wm-does-not-count (:reason r)))))
+  (testing "unmeasured is exit 3, not a silent pass"
+    (let [r (comp/guest-broker-result {:qemu-unmeasured? true})]
+      (is (= 3 (:exit r)))
+      (is (= :unmeasured (:reason r))))))
+
+(deftest generated-spa-is-the-guest-broker-face
+  (is (comp/html-has-guest-broker-face? (pb/session-html))
+      "gate is red until #desktop names kbb --backend sci --classpath src scripts/compositor-guest.cljk guest-broker")
+  (is (not (comp/html-has-guest-broker-face?
+            (str "<html>href=\"#session\" href=\"#desktop\" "
+                 "id=\"ime-bar\" id=\"ime-preedit\" id=\"ime-toggle\" "
+                 "data-ime id=\"ime-candidates\" id=\"wm-stage\" "
+                 "class=\"wm-window\" class=\"wm-window\" wm-titlebar "
+                 "dads-chip-label data-raise dads-heading kami.webgpu "
+                 "kbb --backend sci --classpath src scripts/compositor-guest.cljk guest-ime "
+                 "kbb --backend sci --classpath src scripts/compositor-guest.cljk guest-wm "
+                 "kbb --backend sci --classpath src scripts/compositor-guest.cljk guest-paint "
+                 "kbb --backend sci --classpath src scripts/compositor-guest.cljk guest-input "
+                 "kbb --backend sci --classpath src scripts/compositor-guest.cljk guest-gpu-two "
+                 "kbb --backend sci --classpath src scripts/compositor-guest.cljk guest-scanout-two native compositor</html>")))
+      "guest-scanout-two lede without the guest-broker command is not the guest broker face"))
+
+(deftest guest-session-serial-is-the-guest-session-gate
+  (testing "KERNEL.ELF packed front 2 restore is green"
+    (is (comp/guest-session-ok?
+         "AIUEOS_GUEST_SESSION_OK restored-front=2 packed=2 kotoba-front=2 hit=2\n"))
+    (is (:green? (comp/guest-session-result
+                  {:serial "AIUEOS_GUEST_SESSION_OK restored-front=2 packed=2 kotoba-front=2 hit=2\n"}))))
+  (testing "restore that always returns 2 is leftover"
+    (let [r (comp/guest-session-result
+             {:serial "AIUEOS_GUEST_SESSION leftover=always-front\n"})]
+      (is (not (:green? r)))
+      (is (= 1 (:exit r)))
+      (is (= :always-front (:reason r)))))
+  (testing "empty packed session is leftover"
+    (let [r (comp/guest-session-result
+             {:serial "AIUEOS_GUEST_SESSION leftover=empty-session\n"})]
+      (is (not (:green? r)))
+      (is (= :empty-session (:reason r)))))
+  (testing "unknown surface restore is leftover"
+    (let [r (comp/guest-session-result
+             {:serial "AIUEOS_GUEST_SESSION leftover=unknown-surface\n"})]
+      (is (not (:green? r)))
+      (is (= :unknown-surface (:reason r)))))
+  (testing "wm-hit ignoring restored front is leftover"
+    (let [r (comp/guest-session-result
+             {:serial "AIUEOS_GUEST_SESSION leftover=restore-ignored\n"})]
+      (is (not (:green? r)))
+      (is (= :restore-ignored (:reason r)))))
+  (testing "hosted JVM WM serial does not count"
+    (let [r (comp/guest-session-result
+             {:serial "AIUEOS_COMPOSITOR_WM_OK\n"})]
+      (is (not (:green? r)))
+      (is (= :hosted-wm-does-not-count (:reason r))))
+    (let [r (comp/guest-session-result {:hosted-wm? true :serial ""})]
+      (is (= :hosted-wm-does-not-count (:reason r)))))
+  (testing "unmeasured is exit 3, not a silent pass"
+    (let [r (comp/guest-session-result {:qemu-unmeasured? true})]
+      (is (= 3 (:exit r)))
+      (is (= :unmeasured (:reason r))))))
+
+(deftest generated-spa-is-the-guest-session-face
+  (is (comp/html-has-guest-session-face? (pb/session-html))
+      "gate is red until #desktop names kbb --backend sci --classpath src scripts/compositor-guest.cljk guest-session")
+  (is (not (str/includes? (pb/session-html) "clojure -M:compositor guest-session"))
+      "SPA must not name the JVM guest-session alias as evidence")
+  (is (not (comp/html-has-guest-session-face?
+            (str "<html>href=\"#session\" href=\"#desktop\" "
+                 "id=\"ime-bar\" id=\"ime-preedit\" id=\"ime-toggle\" "
+                 "data-ime id=\"ime-candidates\" id=\"wm-stage\" "
+                 "class=\"wm-window\" class=\"wm-window\" wm-titlebar "
+                 "dads-chip-label data-raise dads-heading kami.webgpu "
+                 "kbb --backend sci --classpath src scripts/compositor-guest.cljk guest-ime "
+                 "kbb --backend sci --classpath src scripts/compositor-guest.cljk guest-wm "
+                 "kbb --backend sci --classpath src scripts/compositor-guest.cljk guest-paint "
+                 "kbb --backend sci --classpath src scripts/compositor-guest.cljk guest-input "
+                 "kbb --backend sci --classpath src scripts/compositor-guest.cljk guest-gpu-two "
+                 "kbb --backend sci --classpath src scripts/compositor-guest.cljk guest-scanout-two "
+                 "kbb --backend sci --classpath src scripts/compositor-guest.cljk guest-broker native compositor</html>")))
+      "guest-broker lede without the guest-session command is not the guest session face"))
+
+(deftest presenter-bundle-is-kami-webgpu
+  (let [f (io/file "apps/session/kami-presenter.js")]
+    (is (.isFile f) "compile :kami-presenter before this gate")
+    (is (comp/presenter-is-kami-webgpu? (slurp f)))
+    (is (not (comp/presenter-is-kami-webgpu? "aiueosKamiPresent admitted"))
+        "a stub that names the export without init!/draw! is red")))
+

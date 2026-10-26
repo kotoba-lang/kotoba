@@ -1,0 +1,197 @@
+(ns aiueos.uefi.fs
+  (:export [kernel-path page-window max-kernel-bytes mode-read
+            device-handle open-volume open-read read-into read-count close-file
+            file-size device-reason volume-reason open-reason read-reason]))
+
+;; EFI file access, for a BOOTX64.EFI written in Kotoba.
+;;
+;; This is the fourth of the loader modules that replace
+;; `os/aiueos/uefi/main.c`, after `aiueos.uefi.console`, `aiueos.uefi.elf` and
+;; `aiueos.uefi.memory`. It stands in for that file's `read_verified_kernel`
+;; (:593) and `read_verified_file` (:555) -- the path from a device handle to
+;; kernel bytes in a buffer -- and it is the module ADR-0180 listed as BLOCKED
+;; behind fwstore: `HandleProtocol`, `OpenVolume` and `Read` all answer through
+;; out-pointers, and `Read` writes a BUFFER the caller must be able to hand
+;; over and later read. `(kernel-uefi-alloc-region …)` at the call site gives
+;; both (kotoba-gmir ADR-0030, kotoba-sema ADR-0030, ADR-0197).
+;;
+;; ---------------------------------------------------------------------------
+;; THE LAYOUT THIS MODULE READS IS THE ONE MAIN.C BOOTS WITH
+;; ---------------------------------------------------------------------------
+;; EFI_LOADED_IMAGE_PROTOCOL's DeviceHandle is at +0x18, and this is measured
+;; rather than assumed: `os/aiueos/uefi/main.c` (:115) lays the struct out with
+;; ParentHandle at +8, SystemTable at +16, DeviceHandle at +0x18 and ImageBase
+;; at +0x40, and that loader opens the volume on that field and reads the
+;; kernel on real machines; `aiueos.uefi.netlog` reaches the PXE NIC through
+;; the same +0x18 on real hardware. The EFI_FILE_PROTOCOL slots are
+;; Revision +0, Open +8, Close +16, Delete +24, Read +32, Write +40; the
+;; EFI_SIMPLE_FILE_SYSTEM_PROTOCOL is Revision +0, OpenVolume +8.
+;; HandleProtocol is EFI_BOOT_SERVICES slot +152.
+;;
+;; ---------------------------------------------------------------------------
+;; THE ONE PATH
+;; ---------------------------------------------------------------------------
+;; `kernel-path` is `main.c`'s `kernel_path` (:1005) byte for byte:
+;; `\EFI\AIUEOS\KERNEL.ELF`. A loader that opens whatever it is told is not
+;; deciding anything; the decision half of this module is that there is ONE
+;; path, and `open-reason` refuses every other name the same way it refuses a
+;; missing file.
+;;
+;; ---------------------------------------------------------------------------
+;; ZERO IS THE SUCCESS VALUE
+;; ---------------------------------------------------------------------------
+;; `device-reason`, `volume-reason`, `open-reason` and `read-reason` follow
+;; `aiueos.uefi.elf` and `aiueos.uefi.memory`: zero is admitted and every
+;; non-zero value NAMES the clause that refused. The four EFI_STATUS returns
+;; the mechanism wrappers forward also use zero for EFI_SUCCESS, so the two
+;; conventions agree.
+;;
+;;    1  the device has no loaded-image handle to read from
+;;    2  the volume did not open
+;;    3  the file did not open (the name is not on this volume)
+;;    4  the read was refused
+;;    5  the read request is empty
+;;    6  the read request is over the one-page window
+;;    7  the read was short
+;;
+;; ---------------------------------------------------------------------------
+;; ONE PAGE, ONE READ
+;; ---------------------------------------------------------------------------
+;; `read-into` reads through the checked -4k family, so its window is one
+;; page (4096) and the file bytes land where `elf/admit` can read them back
+;; with the same bounds check in the path. The whole file may be larger --
+;; `max-kernel-bytes` is `main.c`'s KERNEL_BUFFER_SIZE, 1 MiB -- and a loader
+;; that streams the rest does it with more windows of this kind, not with a
+;; bigger one.
+;;
+;; ---------------------------------------------------------------------------
+;; THE FOURTH WORD OF A THREE-OPERAND CALL
+;; ---------------------------------------------------------------------------
+;; `Read` takes (This, BufferSize*, Buffer) and `OpenVolume` takes
+;; (This, NewHandle*). The wide calls pass four register operands
+;; (kotoba-gmir ADR-0011), so the last slot is an explicit zero -- or the
+;; sequencing of an earlier store, which is what `(* 0 c)` is for. A stale R9
+;; is worse than a dummy (see `aiueos.uefi.memory`).
+
+;; main.c :1005. Spelled here so the path exists once in the module that
+;; decides it and not at every call site.
+(defn kernel-path [] (ucs2 "\\EFI\\AIUEOS\\KERNEL.ELF"))
+
+(defn page-window [] 4096)
+
+;; main.c :217, KERNEL_BUFFER_SIZE: the bound the C loader reads a kernel
+;; under. This module reads one page at a time; the file-level bound is
+;; exported so a streaming loader checks the sum against the same number.
+(defn max-kernel-bytes [] 1048576)
+
+;; EFI_FILE_MODE_READ. main.c :602 passes 1 for OpenMode and 0 for
+;; Attributes; a loader that may write the volume it booted from is not the
+;; loader this module is the decision half of.
+(defn mode-read [] 1)
+
+;; ── the verdicts ──────────────────────────────────────────────────────────
+
+(defn device-reason [device]
+  (if (= device 0) 1 0))
+
+(defn volume-reason [root]
+  (if (= root 0) 2 0))
+
+(defn open-reason [file]
+  (if (= file 0) 3 0))
+
+(defn read-reason [status asked got]
+  (if (= status 0)
+    (if (= asked 0) 5
+      (if (> asked (page-window)) 6
+        (if (= got asked) 0 7)))
+    4))
+
+;; ── the mechanism ─────────────────────────────────────────────────────────
+;;
+;; Each stage answers through an out-slot in the caller's region and hands
+;; back the word the next stage needs. The slots are fixed offsets of that
+;; region: 0 the loaded-image interface, 8 the simple file system, 16 the
+;; volume root, 24 the file handle, 32 the read size, 40 the file length.
+;; The caller supplies the
+;; region because the allocation FORM must be spelled at the site that
+;; declares the window over it (see `aiueos.uefi.memory`'s note) -- a
+;; function that PRODUCED the region could not hand its caller a writable
+;; root.
+
+;; HandleProtocol(ImageHandle, &LoadedImage, ...) then LoadedImage's
+;; DeviceHandle at +0x18. Answers the device handle, or zero.
+(defn device-handle [bs image-handle slots]
+  (let [c (kernel-store-u64-4k slots 4096 0 0)
+        h (kernel-uefi-call4 bs 152 image-handle
+                             (guid "5B1B31A1-9562-11D2-8E3F-00A0C969723B")
+                             (kernel-subregion slots 4096 0 8)
+                             (* 0 c))
+        loaded (kernel-load-u64-4k slots 4096 0)]
+    (if (= loaded 0) 0 (kernel-load-ptr loaded 24))))
+
+;; HandleProtocol(DeviceHandle, &SimpleFileSystem) then OpenVolume. Answers
+;; the volume root, or zero. main.c :600-604 refuses on either step, and so
+;; does this: there is no third answer.
+(defn open-volume [bs device slots]
+  (let [c (kernel-store-u64-4k slots 4096 8 0)
+        h (kernel-uefi-call4 bs 152 device
+                             (guid "964E5B22-6459-11D2-8E39-00A0C969723B")
+                             (kernel-subregion slots 4096 8 8)
+                             (* 0 c))
+        sfs (kernel-load-u64-4k slots 4096 8)]
+    (if (= sfs 0) 0
+      (let [c2 (kernel-store-u64-4k slots 4096 16 0)
+            v (kernel-uefi-call4 sfs 8 sfs
+                                 (kernel-subregion slots 4096 16 8)
+                                 (* 0 c2) 0)]
+        (kernel-load-u64-4k slots 4096 16)))))
+
+;; Open(Root, &File, Name, Read, 0). Answers the file handle, or zero.
+(defn open-read [root path slots]
+  (let [c (kernel-store-u64-4k slots 4096 24 0)
+        o (kernel-uefi-call6 root 8 root
+                             (kernel-subregion slots 4096 24 8)
+                             path (mode-read) 0
+                             (* 0 c))]
+    (kernel-load-u64-4k slots 4096 24)))
+
+;; Read(File, &Size, Buffer) with Size already set to ASKED. Answers the
+;; EFI_STATUS; `read-count` reads the size the firmware wrote back, so a
+;; refused call and a short read stay distinguishable (a refused Read may
+;; leave the IN OUT size untouched, which is why the count alone is not the
+;; answer).
+(defn read-into [file buffer asked slots]
+  (let [c (kernel-store-u64-4k slots 4096 32 asked)]
+    (kernel-uefi-call4 file 32 file
+                       (kernel-subregion slots 4096 32 8)
+                       buffer
+                       (* 0 c))))
+
+(defn read-count [slots]
+  (kernel-load-u64-4k slots 4096 32))
+
+;; The length of the WHOLE file -- the `image-len` `aiueos.uefi.elf/admit`
+;; makes its clause-8 "the segments claim to extend past the image" check
+;; against. `main.c` knows it because `read_verified_kernel` read the whole
+;; file before admitting it; this module reads one page at a time, so it
+;; MEASURES it instead: SetPosition to EFI's end-of-file sentinel
+;; (0xFFFFFFFFFFFFFFFF), GetPosition answers where that landed, and
+;; SetPosition back to zero so the read that follows starts at the first byte.
+;; GetPosition and SetPosition are EFI_FILE_PROTOCOL slots +48 and +56. A
+;; measurement that does not answer leaves the slot zero, and `elf/admit` then
+;; refuses a zero-length image (its reason 1) rather than admitting the bytes
+;; against an unmeasured claim.
+(defn file-size [file slots]
+  (let [e (kernel-uefi-call2 file 56 file -1)
+        c (kernel-store-u64-4k slots 4096 40 0)
+        g (kernel-uefi-call4 file 48 file
+                             (kernel-subregion slots 4096 40 8)
+                             (* 0 c) 0)
+        z (kernel-uefi-call2 file 56 file 0)]
+    (kernel-load-u64-4k slots 4096 40)))
+
+;; Close(File). One operand, so the second rides in RDX and the firmware
+;; ignores it -- `aiueos.uefi.console/clear-screen` is the same call.
+(defn close-file [file]
+  (kernel-uefi-call2 file 16 file 0))

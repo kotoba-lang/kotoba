@@ -1,0 +1,130 @@
+;; murakumo.cloud participation decisions, as a freestanding Kotoba object.
+;;
+;; Mirrors `murakumo.infer.join` (kotoba-lang/murakumo `kotoba/infer_join_core.kotoba`)
+;; so an aiueos node decides its own fleet participation without a Node or JVM
+;; host present: which work kinds it may accept, how much model residency it
+;; may claim, and whether it must reach the mesh through a relay.
+;;
+;; The upstream core expresses these over typed records, `[:option :i64]` and
+;; `:string` work-kind names. The aiueos kernel object ABI is scalar i64 only,
+;; so the shapes are flattened here:
+;;
+;;   - records          -> positional i64 arguments
+;;   - `[:option :i64]` -> a `present` flag plus the value (never a sentinel,
+;;                         matching upstream's explicit "no -1 sentinel")
+;;   - `:string` kind   -> a small integer code
+;;
+;; Work-kind codes are the shared wire between the two representations and are
+;; NOT free to renumber: `contracts/murakumo-node-v1.edn` is their authority and
+;; `test/murakumo_join_plan_parity_test.cljc` checks every code against the
+;; upstream string names. Codes 1-4 are the swarm kinds, 5-8 the native kinds.
+;;
+;; Upstream semantics preserved exactly, including the part that reads as a
+;; surprise: a native-tier node answers `can?` from the NATIVE kind set only,
+;; so it does not accept swarm kinds such as media-postproc. That is upstream's
+;; behaviour (`(if (< tier 2) (swarm-can? kind) (native-can? kind))`), not a
+;; simplification introduced here.
+
+(defn aiueos-murakumo-tier-max-resident [tier]
+  ;; cljc tiers :max-resident-bytes -- 0 browser | 1 wasm | 2 native.
+  ;; Unknown tiers resolve to native, matching upstream's `tier-code` default.
+  (if (= tier 0)
+    2147483648
+    (if (= tier 1)
+      4294967296
+      13958643712)))
+
+(defn aiueos-murakumo-needs-relay [tier inbound]
+  ;; browser/wasm always relay; native relays only when not inbound-reachable.
+  (if (< tier 2)
+    1
+    (if (> inbound 0) 0 1)))
+
+(defn aiueos-murakumo-swarm-can [kind]
+  ;; 1 media-postproc | 2 small-shard | 3 embarrassingly-parallel | 4 prompt-eval
+  (if (and (>= kind 1) (<= kind 4)) 1 0))
+
+(defn aiueos-murakumo-native-can [kind]
+  ;; 5 host-large-model | 6 low-latency-pipeline | 7 media-generate | 8 full-shard
+  (if (and (>= kind 5) (<= kind 8)) 1 0))
+
+(defn aiueos-murakumo-can [tier kind]
+  (if (< tier 2)
+    (aiueos-murakumo-swarm-can kind)
+    (aiueos-murakumo-native-can kind)))
+
+(defn aiueos-murakumo-clamp-resident [mem-present mem tier-max]
+  ;; cljc enrollment: (min (or mem-bytes tier-max) tier-max)
+  (if (> mem-present 0)
+    (if (< mem tier-max) mem tier-max)
+    tier-max))
+
+(defn aiueos-murakumo-eligible-for-work [can-kind max-res resident]
+  ;; cljc: (and can? (<= resident max-resident-bytes))
+  (if (> can-kind 0)
+    (if (< max-res resident) 0 1)
+    0))
+
+(defn aiueos-murakumo-join-plan [node kind mem-request resident]
+  ;; The whole participation decision as one packed value, so a caller commits
+  ;; to a single admitted plan rather than recombining parts that were decided
+  ;; against different inputs.
+  ;;
+  ;; The kernel object ABI admits at most five parameters, so the two pairs
+  ;; that always travel together are packed rather than split across calls:
+  ;;
+  ;;   node        bits 0-1  tier (0 browser | 1 wasm | 2 native)
+  ;;               bit  2    inbound-reachable
+  ;;   mem-request bit  0    declared-memory present
+  ;;               bits 1..  declared memory bytes, shifted left 1
+  ;;
+  ;; Packing `present` INTO the request keeps upstream's "no -1 sentinel"
+  ;; property: absent memory is a cleared flag, never a magic byte count, so a
+  ;; genuine declaration of 0 bytes stays distinguishable from no declaration.
+  ;;
+  ;; Result:
+  ;;   bit 0       eligible for this work kind at this residency
+  ;;   bit 1       must reach the mesh through a relay
+  ;;   bits 2..    clamped resident bytes, shifted left 2
+  (let [tier (bit-and node 3)
+        inbound (bit-and (quot node 4) 1)
+        mem-present (bit-and mem-request 1)
+        mem (quot mem-request 2)
+        tier-max (aiueos-murakumo-tier-max-resident tier)
+        clamped (aiueos-murakumo-clamp-resident mem-present mem tier-max)
+        can (aiueos-murakumo-can tier kind)
+        eligible (aiueos-murakumo-eligible-for-work can clamped resident)
+        relay (aiueos-murakumo-needs-relay tier inbound)]
+    (+ eligible
+       (* relay 2)
+       (* clamped 4))))
+
+(defn main []
+  ;; Self-verifying parity vectors. Running this object IS the check that the
+  ;; flattened aiueos encoding still agrees with upstream `murakumo.infer.join`;
+  ;; the expected values below are computed from the upstream definitions and
+  ;; are re-derived independently by
+  ;; `test/murakumo/aiueos_join_plan_parity_test.clj` in kotoba-lang/murakumo,
+  ;; so a drift on either side fails on both sides rather than silently here.
+  ;;
+  ;; Returns 42 when every vector agrees, matching the result the kernel's
+  ;; Kotoba admission gate already expects from an admitted object; 0 otherwise.
+  (let [;; browser tier, no declared memory, swarm kind: relays, full tier max.
+        browser-postproc (aiueos-murakumo-join-plan 0 1 0 1000)
+        ;; native tier, inbound-reachable, media-generate: no relay, native max.
+        native-generate (aiueos-murakumo-join-plan 6 7 0 1000)
+        ;; native tier is answered from the NATIVE kind set only, so a swarm
+        ;; kind is refused here. This is upstream's behaviour, pinned on purpose.
+        native-postproc (aiueos-murakumo-join-plan 6 1 0 1000)
+        ;; declared memory below the tier ceiling clamps down to the declaration.
+        browser-clamped (aiueos-murakumo-join-plan 0 1 2147483649 1000)
+        ;; residency above the clamped ceiling is not eligible, even for a kind
+        ;; the tier can serve.
+        native-oversized (aiueos-murakumo-join-plan 6 7 0 13958643713)]
+    (if (and (= browser-postproc 8589934595)
+             (= native-generate 55834574849)
+             (= native-postproc 55834574848)
+             (= browser-clamped 4294967299)
+             (= native-oversized 55834574848))
+      42
+      0)))

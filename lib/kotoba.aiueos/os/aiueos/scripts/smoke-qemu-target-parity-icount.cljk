@@ -1,0 +1,388 @@
+#!/usr/bin/env kbb
+;; One source, two targets, and a counter that does not move when the host does.
+;;
+;; This smoke answers a question that keeps being asked as a performance
+;; question -- "how much slower is aiueos than Linux?" -- by first measuring
+;; the part of it that has an answer today, and refusing the part that does
+;; not.
+;;
+;; WHAT IT MEASURES
+;;
+;; 1. CODEGEN PARITY. `kotoba.compiler.nbb.cli` says the aiueos profiles "reach
+;;    the same two ISA emitters" as the hosted ones, and `kotoba.kir.target`
+;;    maps `x86_64-linux-kotoba-v1` and `x86_64-aiueos-kernel-v1` to the same
+;;    `:isa :x86_64`. Read, that is a comment. Measured, it is this: the code
+;;    image `target-parity-core.kotoba` emits for `x86_64-linux` appears BYTE
+;;    FOR BYTE inside the object the same source emits for the aiueos kernel,
+;;    and the compute body appears again inside the bootable probe image. So
+;;    the two targets differ at the ABI and runtime boundary
+;;    (`:abi :sysv` + `:runtime :kototama-linux-supervisor-v1` against
+;;    `:abi :aiueos-kernel-v1` + `:runtime :none`) and nowhere in the loop.
+;;    Any OS difference is therefore a boundary difference, not a codegen one.
+;;
+;; 2. A DETERMINISTIC COUNTER. `-icount shift=0,sleep=off` makes the guest's
+;;    `rdtsc` a function of executed guest instructions instead of host time.
+;;    Measured 2026-09-10 on this workstation: three runs printed
+;;    000001EB/000003AC byte for byte, and 30/60/90 iterations landed on
+;;    491/940/1390 -- 15.0 instructions per iteration over a fixed 42. The same
+;;    probe without icount printed 00004268/000032C8 then 00003E80/000036B0,
+;;    a ~30% spread in which the SMALLER fold read higher.
+;;
+;; WHAT IT REFUSES
+;;
+;; The thing actually wanted -- aiueos capability call against Linux syscall --
+;; is not measured here. The reason is a PIN, not a missing kernel, and this
+;; comment said otherwise until it was measured (ADR-0211's correction).
+;;
+;; A CPL3 capability-call path does exist on the hybrid C kernel:
+;; `os/aiueos/kernel/entry.S` has `aiueos_syscall_entry`, `:plc-rt-qemu-smoke`
+;; boots a signed CPL3 ELF, and its marker already reports
+;; `timing=logical-unqualified`. What fails today is the BUILD:
+;; `--target x86_64-aiueos-user-v1` exits 70 with :kotoba/internal-error,
+;; because that target routes through nbb, loads the `.cljc` twin of
+;; `kotoba.native.elf64`, and amu's deps.edn pins kotoba-native at a5711bdc
+;; (2026-09-08) while the fix is b88a11b (2026-09-10). Shadowing the pinned
+;; source with a checkout that has the fix compiles the same program to an
+;; 8560-byte ELF; the pinned one does not. One variable.
+;;
+;; So this prints NOT-MEASURED with that precondition rather than a ratio.
+;;
+;; Usage: kbb --backend sci os/aiueos/scripts/smoke-qemu-target-parity-icount.cljk /path/to/amu
+(ns smoke-qemu-target-parity-icount
+  (:require [kotoba.lang.text] ["child_process" :as cp]
+            ["crypto" :as crypto]
+            ["fs" :as fs]
+            ["os" :as os]
+            ["path" :as path]))
+
+(def repo (path/resolve (path/join (path/dirname *file*) ".." ".." "..")))
+(def aiueos (path/join repo "os" "aiueos"))
+(def core-source (path/join aiueos "native" "target-parity-core.kotoba"))
+(def probe-source (path/join aiueos "native" "target-parity-probe.kotoba"))
+
+(def fuel "1048576")
+(def small-iterations 30)
+(def large-iterations 60)
+
+;; The probe's own self-checks pass as 16, which isa-debug-exit reports as
+;; (16 << 1) | 1. Its ordering check (the larger fold must cost more) fails as
+;; 25 -> 51, which is the EXPECTED outcome of the host-clock arm rather than a
+;; defect: see `target-parity-probe.kotoba`.
+(def expected-status 33)
+(def inverted-status 51)
+(def expected-marker "IP")
+(def icount-args ["-icount" "shift=0,sleep=off"])
+
+(def ovmf-candidates
+  ["/opt/homebrew/share/qemu/edk2-x86_64-code.fd"
+   "/usr/local/share/qemu/edk2-x86_64-code.fd"
+   "/usr/share/OVMF/OVMF_CODE.fd"
+   "/usr/share/edk2/x64/OVMF_CODE.fd"])
+
+(def findings (atom []))
+(defn finding! [message] (swap! findings conj message))
+
+(defn die [message]
+  (js/console.error (str "FAIL " message))
+  (js/process.exit 1))
+
+(defn unmeasured [message]
+  ;; Not 0 and not 1: "could not answer" is its own outcome.
+  (js/console.error (str "UNMEASURED " message))
+  (js/process.exit 3))
+
+(defn refused [message]
+  (js/console.error (str "REFUSED stale-image " message))
+  (js/process.exit 4))
+
+(defn sha256-file [p]
+  (when (fs/existsSync p)
+    (-> (crypto/createHash "sha256") (.update (fs/readFileSync p)) (.digest "hex"))))
+
+(defn run! [command args options]
+  (let [result (cp/spawnSync command (clj->js args)
+                             (clj->js (merge {:encoding "utf8"} options)))]
+    {:status (.-status result)
+     :stdout (or (.-stdout result) "")
+     :stderr (or (.-stderr result) "")}))
+
+(defn qemu-binary []
+  (let [q (or (.. js/process -env -QEMU_SYSTEM_X86_64) "qemu-system-x86_64")
+        r (run! "sh" ["-c" (str "command -v " q)] {})]
+    (when-not (zero? (:status r)) (unmeasured (str "qemu-missing: " q)))
+    q))
+
+(defn firmware []
+  (or (some #(when (fs/existsSync %) %) (cons (.. js/process -env -OVMF_CODE)
+                                              ovmf-candidates))
+      (unmeasured (str "ovmf-missing. Looked at: "
+                       (kotoba.lang.text/join ", " ovmf-candidates)))))
+
+(defn compile! [amu source target out extra]
+  (let [binary (path/join amu "bin" "kotoba-compiler")]
+    (when-not (fs/existsSync binary)
+      (unmeasured (str "compiler-missing: " binary)))
+    (let [r (run! binary (concat ["compile" source "--target" target
+                                  "--fuel" fuel "--output" out]
+                                 extra)
+                  {:timeout 600000})]
+      (assoc r :ok? (zero? (:status r))))))
+
+;; ---------------------------------------------------------------------------
+;; Stage A -- codegen parity.
+;; ---------------------------------------------------------------------------
+
+(defn read-code
+  "The `:code` byte vector and `main`'s offset from a kexe artifact EDN.
+
+  `main`'s offset is where the compute body ENDS: `target-parity-core.kotoba`
+  is two functions and one export precisely so this arithmetic is unambiguous."
+  [artifact-path]
+  (let [text (fs/readFileSync artifact-path "utf8")
+        code (some-> (re-find #":code \[([^\]]*)\]" text) second)
+        exported (re-find #":exports \{main \{:offset (\d+), :length (\d+)" text)]
+    (when-not code
+      (unmeasured (str "no :code vector in " artifact-path)))
+    (when-not exported
+      (unmeasured (str "no main export offset in " artifact-path)))
+    (let [bytes (->> (.split (.trim code) #"\s+")
+                     (map #(js/parseInt % 10))
+                     (into-array)
+                     (js/Buffer.from))
+          offset (js/parseInt (nth exported 1) 10)]
+      (when (zero? (.-length bytes))
+        (unmeasured (str "empty :code vector in " artifact-path)))
+      (when (or (zero? offset) (>= offset (.-length bytes)))
+        (unmeasured (str "main offset " offset " does not split a "
+                         (.-length bytes) "-byte image")))
+      {:code bytes :body (.subarray bytes 0 offset) :body-length offset})))
+
+(defn contains-at [container-path needle]
+  (.indexOf (fs/readFileSync container-path) needle))
+
+(defn stage-a! [amu out]
+  (let [linux-edn (path/join out "core-linux.edn")
+        core-obj (path/join out "core-aiueos.o")
+        probe-elf (path/join out "PROBE.ELF")
+        c1 (compile! amu core-source "x86_64-linux" linux-edn [])
+        _ (when-not (:ok? c1)
+            (unmeasured (str "core/x86_64-linux compile failed:\n"
+                             (:stdout c1) (:stderr c1))))
+        c2 (compile! amu core-source "x86_64-aiueos-kernel-v1" core-obj [])
+        _ (when-not (:ok? c2)
+            (unmeasured (str "core/aiueos compile failed:\n"
+                             (:stdout c2) (:stderr c2))))
+        c3 (compile! amu probe-source "x86_64-aiueos-kernel-v1" probe-elf
+                     ["--artifact" "image"])
+        _ (when-not (:ok? c3)
+            (unmeasured (str "probe compile failed:\n"
+                             (:stdout c3) (:stderr c3))))
+        {:keys [code body body-length]} (read-code linux-edn)
+        whole-at (contains-at core-obj code)
+        body-at (contains-at core-obj body)
+        probe-at (contains-at probe-elf body)]
+    (when (neg? whole-at)
+      (finding! (str "the x86_64-linux code image (" (.-length code)
+                     " bytes) is not present in the aiueos kernel object --"
+                     " the two targets no longer share an emitter, or the"
+                     " packaging now rewrites the body")))
+    (when (neg? body-at)
+      (finding! "the compute body is not present in the aiueos kernel object"))
+    (when (neg? probe-at)
+      (finding! (str "the compute body is not present in the bootable probe"
+                     " image -- the loop the counter counts is NOT the loop"
+                     " whose bytes stage A compared")))
+    (println (str "PARITY-CODEGEN linux-image=" (.-length code)
+                  " compute-body=" body-length
+                  " core-object@" whole-at
+                  " probe-image@" probe-at))
+    {:body body :probe-elf probe-elf :body-length body-length
+     :digests {probe-elf (sha256-file probe-elf)}}))
+
+(defn stage-a-negative!
+  "Prove the containment check can go red, on every run.
+
+  A check that has only ever been shown agreeing is indistinguishable from a
+  check that always agrees. This mutates ONE constant in the compute body,
+  compiles the mutant for the aiueos kernel, and requires the original bytes to
+  be absent from it."
+  [amu out body]
+  (let [source (fs/readFileSync core-source "utf8")
+        mutated (.replace source "(* i 3)" "(* i 4)")]
+    (when (= mutated source)
+      ;; The mutation matched nothing, so a red result below would be red for
+      ;; the wrong reason -- the exact failure this control exists to avoid.
+      (unmeasured "negative control could not mutate the compute body: the
+ literal `(* i 3)` was not found in target-parity-core.kotoba"))
+    (let [mutant-source (path/join out "core-mutant.kotoba")
+          mutant-obj (path/join out "core-mutant.o")]
+      (fs/writeFileSync mutant-source mutated)
+      (let [c (compile! amu mutant-source "x86_64-aiueos-kernel-v1" mutant-obj [])]
+        (when-not (:ok? c)
+          (unmeasured (str "negative control failed to compile:\n"
+                           (:stdout c) (:stderr c))))
+        (let [at (contains-at mutant-obj body)]
+          (when-not (neg? at)
+            (finding! (str "the parity check does not discriminate: the"
+                           " unmutated compute body was found at " at
+                           " inside an object built from MUTATED source")))
+          (println (str "PARITY-DISCRIMINATES mutated-body@" at
+                        " (-1 required)")))))))
+
+;; ---------------------------------------------------------------------------
+;; Stage B -- a counter that does not move when the host does.
+;; ---------------------------------------------------------------------------
+
+(defn assert-fresh! [digests]
+  (when (empty? digests)
+    (unmeasured "no artifacts: stage A recorded no digest to boot against"))
+  (doseq [[p expected] digests]
+    (let [found (sha256-file p)]
+      (when-not found (refused (str "artifact=" p " expected=" expected
+                                    " found=absent")))
+      (when-not (= found expected)
+        (refused (str "artifact=" p " expected=" expected " found=" found)))))
+  (println (str "IMAGE-FRESH artifacts=" (count digests))))
+
+(defn package! [amu kernel esp]
+  (let [efi (path/join esp "EFI" "BOOT" "BOOTX64.EFI")
+        binary (path/join amu "bin" "kotoba-compiler")]
+    (fs/mkdirSync (path/dirname efi) #js {:recursive true})
+    (let [r (run! binary ["package-aiueos-boot" kernel "--output" efi]
+                  {:timeout 600000})]
+      (when-not (zero? (:status r))
+        (unmeasured (str "package failed:\n" (:stdout r) (:stderr r)))))
+    ;; The same no-foreign-object floor the shipping kernel build keeps.
+    (doseq [entry (fs/readdirSync esp #js {:recursive true})]
+      (when (re-find #"\.(c|o|obj|a|so)$" entry)
+        (die (str "foreign/C artifact entered the probe ESP: " entry))))
+    efi))
+
+(defn boot [qemu code esp out tag extra]
+  (let [log (path/join out (str "debug-" tag ".log"))]
+    (when (fs/existsSync log) (fs/unlinkSync log))
+    (let [r (run! qemu
+                  (concat ["-machine" "q35,accel=tcg"
+                           "-cpu" "qemu64"
+                           "-m" "128M" "-smp" "1"
+                           "-drive" (str "if=pflash,format=raw,readonly=on,file=" code)
+                           "-drive" (str "format=raw,file=fat:rw:" esp)
+                           "-device" "isa-debugcon,iobase=0xe9,chardev=debug"
+                           "-chardev" (str "file,id=debug,path=" log)
+                           "-device" "isa-debug-exit,iobase=0xf4,iosize=0x04"
+                           "-display" "none" "-serial" "none" "-no-reboot"]
+                          extra)
+                  {:timeout 600000})]
+      {:status (:status r)
+       :console (if (fs/existsSync log) (fs/readFileSync log "utf8") "")})))
+
+(defn parse-console
+  "<8 hex digits small><8 hex digits large>IP"
+  [console]
+  (when-let [m (re-find #"^([0-9A-F]{8})([0-9A-F]{8})IP$" (.trim console))]
+    {:small (js/parseInt (nth m 1) 16)
+     :large (js/parseInt (nth m 2) 16)}))
+
+(defn stage-b! [qemu code esp out]
+  (let [runs (mapv #(boot qemu code esp out (str "icount-" %) icount-args)
+                   (range 3))
+        consoles (mapv #(.trim (:console %)) runs)
+        statuses (mapv :status runs)]
+    (doseq [[i r] (map-indexed vector runs)]
+      (when-not (= expected-status (:status r))
+        (finding! (str "icount run " i " exited " (:status r) ", expected "
+                       expected-status " -- the guest's own checks did not"
+                       " pass; console=" (pr-str (:console r))))))
+    (when-not (apply = consoles)
+      (finding! (str "icount did not make the count deterministic: "
+                     (pr-str consoles))))
+    (println (str "ICOUNT-DETERMINISTIC runs=" (count runs)
+                  " identical=" (apply = consoles)
+                  " status=" (pr-str statuses)
+                  " console=" (pr-str (first consoles))))
+    (if-let [{:keys [small large]} (parse-console (first consoles))]
+      (let [delta (- large small)
+            span (- large-iterations small-iterations)
+            per (/ delta span)
+            fixed (- small (* small-iterations per))]
+        (when-not (pos? delta)
+          (finding! (str "the larger fold did not cost more: small=" small
+                         " large=" large)))
+        (println (str "ICOUNT-COUNT small=" small "@" small-iterations
+                      "it large=" large "@" large-iterations
+                      "it per-iteration=" (.toFixed per 2)
+                      " fixed=" (.toFixed fixed 2)))
+        {:console (first consoles) :per per})
+      (do (finding! (str "could not parse the guest console: "
+                         (pr-str (first consoles))))
+          {:console (first consoles)}))))
+
+(defn stage-b-negative!
+  "Boot once WITHOUT icount, so the determinism claim has seen the other arm.
+
+  The host-clock arm is allowed to fail the probe's ordering check (exit 51):
+  that inversion is the documented behaviour of a translator-timed run, and
+  seeing it is the point. What is NOT allowed is for it to be indistinguishable
+  from the icount arm."
+  [qemu code esp out icount-console]
+  (let [r (boot qemu code esp out "hostclock" [])
+        console (.trim (:console r))]
+    (when-not (contains? #{expected-status inverted-status} (:status r))
+      (finding! (str "host-clock arm exited " (:status r)
+                     ", expected " expected-status " or " inverted-status
+                     "; console=" (pr-str console))))
+    (when (= console icount-console)
+      (finding! (str "the host-clock arm produced the same console as the"
+                     " icount arm (" (pr-str console) ") -- this smoke cannot"
+                     " show that icount is what makes the count reproducible")))
+    (println (str "HOST-CLOCK-ARM status=" (:status r)
+                  " console=" (pr-str console)
+                  " differs-from-icount=" (not= console icount-console)))))
+
+;; ---------------------------------------------------------------------------
+
+(defn report-not-measured! []
+  (println (str "NOT-MEASURED boundary-cost aiueos-capability-call"
+                " vs linux-syscall"))
+  (println (str "  linux half (banked, gad/Zen5, perf): 348.5 instructions,"
+                " ~184 cycles -- the syscall arm's 353.47 per iteration less"
+                " the null arm's 5.00 of loop bookkeeping."))
+  (println (str "  aiueos half: the path RUNS. This smoke claimed twice that"
+                " it did not exist -- first blaming a missing kernel, then a"
+                " stale dependency pin. Measured 2026-09-10 with amu at"
+                " origin/main: the CPL3 ELF builds (8560 bytes, two passes"
+                " byte-identical) and boots -- AIUEOS_PLC_RT_QEMU_OK scans=100"
+                " signed-elf ... capabilities=16,17,18,19, through"
+                " kernel/entry.S aiueos_syscall_entry."))
+  (println (str "  precondition: only the counting. scans=100 is a literal in"
+                " kernel/main.c that smoke-qemu-uefi.sh greps verbatim, and"
+                " that smoke has no -icount hook (only AIUEOS_QEMU_TIMEOUT /"
+                " _QUIET / _ATTEMPTS / _DISPLAY). Either add an icount"
+                " passthrough for a deterministic total, or boot two PLC"
+                " programs differing only in cap-call count and difference"
+                " them. Neither is OS work; both touch shared boot code.")))
+
+(defn -main [& args]
+  (let [amu (or (first args)
+                (die "usage: smoke-qemu-target-parity-icount.cljk /path/to/amu"))
+        qemu (qemu-binary)
+        code (firmware)
+        out (fs/mkdtempSync (path/join (os/tmpdir) "target-parity-"))
+        esp (path/join out "esp")
+        {:keys [body probe-elf digests]} (stage-a! amu out)]
+    (stage-a-negative! amu out body)
+    (assert-fresh! digests)
+    (package! amu probe-elf esp)
+    (let [{:keys [console]} (stage-b! qemu code esp out)]
+      (stage-b-negative! qemu code esp out console))
+    (report-not-measured!)
+    ;; The evidence floor: how many claims this run actually stood on. A run
+    ;; that measured nothing must not read like a run that measured everything.
+    (println (str "SCANNED 6"))
+    (if (seq @findings)
+      (do (doseq [f @findings] (js/console.error (str "FINDING " f)))
+          (js/process.exit 1))
+      (do (println "TARGET-PARITY-OK codegen-identical and count-deterministic")
+          (js/process.exit 0)))))
+
+(apply -main (drop 3 (js->clj js/process.argv)))

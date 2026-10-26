@@ -1,0 +1,159 @@
+;; aiueos.topic -- the topic bus as a pure Kotoba guest (ADR-0002, ADR-2607022200)
+;; (oracle: src/aiueos/topic.cljk).
+;;
+;; The oracle's design is already the guest's shape: the bus is an
+;; immutable value and every operation is a pure (f bus ...) -> bus'. The
+;; kotoba-only port changes only the representation:
+;;
+;;   bus        :document with :latest / :counts / :queues / :tick fields
+;;   per-topic  :latest and :counts are :document maps keyed by topic id
+;;   queue      :document vector; FIFO by shifting one element off the front
+;;
+;; MEASURED BOUND, stated: :container-items is 32, so a per-topic queue
+;; holds at most 32 samples and the bus map holds at most 32 topics. The
+;; oracle's maps are unbounded; a guest producer that publishes a 33rd
+;; sample to one topic traps document-vector-too-large -- a visible,
+;; fail-closed ceiling, not a silent drop. Phase-0 keeps the oracle's
+;; latest-value semantics (last write wins) and numeric topic ids.
+;;
+;; The oracle's take-sample returns [bus' value]; a guest returns one
+;; :document, so the popped value rides ON the bus (:aiueos.topic/sampled)
+;; -- the caller reads it there, the next publish or take clears it.
+;;
+;; Compile (single file, JVM-free):
+;;   kotoba compile aiueos/topic.kotoba --target wasm32-browser --output topic.wasm
+
+(ns aiueos.topic
+  (:export [empty-bus publish latest take-sample pending topic-count
+            tick advance]))
+
+;; --- accessors ---------------------------------------------------------------
+
+(defn- dg [d k :keyword] :document
+  (option-value-of [:option :document] (document-get d k) (document-null)))
+
+(defn- di [d k :keyword] :i64
+  (option-value-of [:option :i64] (document-i64-value (dg d k)) 0))
+
+(defn- dv [d k :keyword] :document
+  (option-value-of [:option :document] (document-get d k) (document-map)))
+
+;; topic id lookup in a map-shaped :document: keys are the topic ids as
+;; i64-cast keywords is not expressible, so per-topic state is a PAIRED
+;; VECTOR of [id value] entries scanned by position (topics are few; the
+;; 32-item bound bounds the scan).
+
+(defn- pair-key [entry :document] :i64
+  (option-value-of [:option :i64]
+    (document-i64-value (option-value-of [:option :document] (document-vector-at entry 0) (document-i64 0)))
+    0))
+
+(defn- pair-val [entry :document] :document
+  (option-value-of [:option :document] (document-vector-at entry 1) (document-null)))
+
+(defn- entries-get [entries :document topic :i64] :document
+  (entries-get-loop entries topic 0))
+
+(defn- entries-get-loop [entries :document topic :i64 i :i64] :document
+  (if (>= i (document-count entries))
+    (document-null)
+    (let [entry (option-value-of [:option :document] (document-vector-at entries i) (document-null))]
+      (if (= (pair-key entry) topic)
+        (pair-val entry)
+        (entries-get-loop entries topic (+ i 1))))))
+
+(defn- entries-set [entries :document topic :i64 value :document] :document
+  (entries-set-loop entries topic value 0 (document-vector)))
+
+(defn- entries-set-loop [entries :document topic :i64 value :document i :i64 acc :document] :document
+  (if (>= i (document-count entries))
+    (document-vector-conj acc (document-vector (document-i64 topic) value))
+    (let [entry (option-value-of [:option :document] (document-vector-at entries i) (document-null))]
+      (entries-set-loop entries topic value (+ i 1)
+                        (document-vector-conj acc
+                          (if (= (pair-key entry) topic)
+                            (document-vector (document-i64 topic) value)
+                            entry))))))
+
+;; --- empty-bus ---------------------------------------------------------------
+
+(defn empty-bus [] :document
+  (document-map
+   :latest (document-vector)
+   :counts (document-vector)
+   :queues (document-vector)
+   :tick (document-i64 0)))
+
+;; --- publish -----------------------------------------------------------------
+;; Update latest, bump the publish count, enqueue FIFO. Returns the new bus.
+;; The 33rd sample to one topic traps document-vector-too-large (measured
+;; bound, fail-closed) -- the oracle's maps are unbounded and this is the
+;; one honest difference.
+
+(defn- bump-count [counts :document topic :i64] :document
+  (let [cur (option-value-of [:option :i64]
+              (document-i64-value (entries-get counts topic)) 0)]
+    (entries-set counts topic (document-i64 (+ cur 1)))))
+
+(defn- enqueue [queues :document topic :i64 value :document] :document
+  (let [q (entries-get queues topic)]
+    (entries-set queues topic
+                 (document-vector-conj
+                  (if (= (document-count q) 0) (document-vector) q)
+                  value))))
+
+(defn publish [bus :document topic :i64 value :document] :document
+  (document-map
+   :latest (entries-set (dv bus :latest) topic value)
+   :counts (bump-count (dv bus :counts) topic)
+   :queues (enqueue (dv bus :queues) topic value)
+   :tick (dg bus :tick)))
+
+;; --- latest ------------------------------------------------------------------
+
+(defn latest [bus :document topic :i64] :document
+  (entries-get (dv bus :latest) topic))
+
+;; --- take-sample -------------------------------------------------------------
+;; FIFO pop. The popped value rides on the bus (:aiueos.topic/sampled) --
+;; a guest returns one value; the caller reads it there. A drained queue
+;; leaves :aiueos.topic/sampled null.
+
+(defn- dequeue [q :document] :document
+  ;; shift one element off the front
+  (shift-loop q 1 (document-vector)))
+
+(defn- shift-loop [q :document i :i64 acc :document] :document
+  (if (>= i (document-count q))
+    acc
+    (shift-loop q (+ i 1)
+                (document-vector-conj acc
+                  (option-value-of [:option :document]
+                                   (document-vector-at q i) (document-null))))))
+
+(defn- first-of [q :document] :document
+  (option-value-of [:option :document] (document-vector-at q 0) (document-null)))
+
+(defn take-sample [bus :document topic :i64] :document
+  (let [q (entries-get (dv bus :queues) topic)]
+    (if (= (document-count q) 0)
+      (document-assoc bus :aiueos.topic/sampled (document-null))
+      (document-assoc
+       (document-assoc bus :queues (entries-set (dv bus :queues) topic (dequeue q)))
+       :aiueos.topic/sampled (first-of q)))))
+
+;; --- pending / topic-count / tick / advance ----------------------------------
+
+(defn pending [bus :document topic :i64] :i64
+  (let [q (entries-get (dv bus :queues) topic)]
+    (document-count q)))
+
+(defn topic-count [bus :document topic :i64] :i64
+  (option-value-of [:option :i64]
+    (document-i64-value (entries-get (dv bus :counts) topic)) 0))
+
+(defn tick [bus :document] :i64
+  (di bus :tick))
+
+(defn advance [bus :document] :document
+  (document-assoc bus :tick (document-i64 (+ (di bus :tick) 1))))
