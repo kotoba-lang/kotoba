@@ -174,6 +174,18 @@ Manual reconciliation needs a separately designed evidence-bearing transition.
 0 if absent, -1 on invalid header/digest length. It is not a public query endpoint.
 `admission-status(state)` returns the last decision or 10 for malformed state.
 
+### Stable request IDs at the integration boundary
+
+The four-limb request commitment identifies the complete authenticated envelope,
+including coupon and epoch. It is not a stable logical request ID. The adapter's
+durable journal must separately bind `(domain, responsible principal, request ID)`
+to the accepted request commitment and original outcome before admission. Reusing
+that ID with changed bytes, a fresh coupon, actor key or epoch must return the
+original outcome or a conflict, never dispatch again. UNKNOWN remains uncertain.
+This module's digest/coupon indexes alone cannot enforce that cross-envelope
+identity. The future signed-envelope/checkpoint profile must carry and retain the
+stable ID explicitly; new coupons or regenerated digests must not reset it.
+
 ### Persistence, fencing and recovery
 
 The returned reservation is **not permission to dispatch**. The conductor must
