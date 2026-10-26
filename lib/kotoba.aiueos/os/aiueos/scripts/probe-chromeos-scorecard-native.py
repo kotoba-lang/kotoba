@@ -4,7 +4,8 @@
 This is a schema/point-ledger probe with native qualification-release RSA
 verification, referenced serial-log digest checks, and tagged-receipt row
 binding. The A2/I3 admitted anchors require their exact receipt paths and
-row tags; other legacy receipts remain unbound. It does not
+row tags, with source-pinned SHA-256 for the exact receipt bytes. Other
+legacy receipts remain unbound. It does not
 qualify other evidence, freshness, or hardware.
 """
 
@@ -43,6 +44,7 @@ NEGATIVES = {
 }
 RECEIPT_NEGATIVES = ('missing-receipt-file', 'red-verdict',
                      'wrong-row-tag', 'missing-row-tag',
+                     'mutated-a2-claim', 'mutated-i3-claim',
                      'bad-release-signature-field', 'missing-release-verdict',
                      'tampered-release-json', 'tampered-release-signature',
                      'rehashed-invalid-signature', 'tampered-serial-log',
@@ -264,7 +266,9 @@ def main():
                 ('tampered-i3-scale-log', 'missing-i3-scale-log')
                 else I3_RECEIPT.with_name('scanout-two-run-serial.log') if name in
                 ('tampered-i3-scanout-log', 'missing-i3-scanout-log')
-                else A2_RECEIPT if name in ('wrong-row-tag', 'missing-row-tag')
+                else A2_RECEIPT if name in
+                ('wrong-row-tag', 'missing-row-tag', 'mutated-a2-claim')
+                else I3_RECEIPT if name == 'mutated-i3-claim'
                 else A1_RECEIPT)
             if name in ('missing-receipt-file', 'missing-serial-log',
                         'missing-secondary-serial-log', 'missing-i3-scale-log',
@@ -297,6 +301,13 @@ def main():
                 if receipt_bytes.count(before) != 1:
                     raise ValueError('A2 row tag anchor missing')
                 target.write_bytes(receipt_bytes.replace(before, b':claim-row :A2', 1))
+            elif name in ('mutated-a2-claim', 'mutated-i3-claim'):
+                receipt_bytes = target.read_bytes()
+                before = (b'Desktop survives a display change' if name ==
+                          'mutated-a2-claim' else b'Display scaling and external displays')
+                if receipt_bytes.count(before) != 1:
+                    raise ValueError(f'receipt claim anchor missing: {name}')
+                target.write_bytes(receipt_bytes.replace(before, b'Unverified claim', 1))
             elif name in ('tampered-release-json', 'tampered-release-signature',
                           'tampered-serial-log', 'tampered-secondary-serial-log',
                           'tampered-i3-scale-log', 'tampered-i3-scanout-log'):
@@ -387,6 +398,7 @@ def main():
               'receiptFieldsVerified': True, 'evidenceArtifactsVerified': False,
               'taggedReceiptRowBindingVerified': True,
               'admittedA2I3ReceiptAnchorsVerified': True,
+              'admittedA2I3ReceiptDigestsVerified': True,
               'syntheticI2RefusedWithBoundSerialLog': True,
               'legacyUntaggedReceiptRowBindingVerified': False,
               'referencedReceiptSerialDigestsVerified': True,
