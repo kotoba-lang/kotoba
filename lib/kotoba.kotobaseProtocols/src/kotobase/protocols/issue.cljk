@@ -1,0 +1,265 @@
+(ns kotobase.protocols.issue
+  "issues.kotobase.net (v0.1 prototype) — a GitHub Issues/PR-shaped
+  activity surface over kotobase, so a repo's day-to-day work (bug
+  reports, feature proposals, code review, merge decisions) can be
+  driven from this stack instead of github.com.
+
+  This is the HTTP-API gap the `kotoba-issue` library was designed to
+  fill but never got wired to a network surface for (see
+  `90-docs/adr/2607061600-kotoba-issue-ledger-shared-libs.edn` in the
+  com-junkawasaki/root superproject — its cloud-itonami `/effects` API
+  phase was explicitly descoped as too risky to ship untested; this
+  namespace is the same vocabulary, built test-first, as a fresh v0.1).
+  It does not depend on `kotoba-issue` itself (that library isn't
+  cljs-portable-verified here yet) — it's a self-contained
+  reimplementation of the same issue → proposal(=PR) → review → merge →
+  audit vocabulary, over the same `kotobase.store/IStore` seam every
+  other surface in this repo uses.
+
+  WIRE FORMAT IS EDN, NOT JSON. Every other surface here (s3/atproto/
+  git/pinning) speaks JSON because an external spec forces it
+  (AT-Proto XRPC, the Pinning Service API). This surface has no such
+  constraint — it is internal-only, Clojure-shaped data (`:issue/*`
+  keys) all the way down to the IStore docs, so the wire format stays
+  EDN rather than round-tripping through a JSON string-key convention.
+  `pr-str`/`clojure.edn/read-string` (already the convention this
+  workspace's other JSONL-adjacent code uses for embedded blobs, e.g.
+  `local-manimani`'s `manimani.issue-store`) — no separate codec
+  namespace needed the way `kotobase.protocols.json` exists for XRPC.
+  Request/response bodies are `pr-str`'d maps with keyword keys;
+  content-type is `application/edn`.
+
+  Mapping (one doc per entity, IStore doc space):
+    issue     → [:kotobase.issue/issues repo] id → {:issue/id :issue/title
+                :issue/body :issue/status \"open\"|\"closed\" :issue/author
+                :issue/created}
+    proposal  → [:kotobase.issue/proposals repo] id → {:proposal/id
+                :proposal/issue-id :proposal/rationale :proposal/risk
+                :proposal/status \"open\"|\"merged\"|\"rejected\"
+                :proposal/author :proposal/created}
+    review    → [:kotobase.issue/reviews repo] id → {:review/id
+                :review/proposal-id :review/verdict
+                \"approve\"|\"reject\"|\"request-changes\" :review/comment
+                :review/reviewer :review/created}
+  IDs come from `-append`-ing a throwaway event to a per-repo
+  `[:kotobase.issue/id-seq repo]` stream and reading back its stamped
+  `:seq` — the same monotonic-counter-via-IStore trick
+  `kotobase.protocols.ipfs-pinning` already uses, so this stays a pure
+  function of the injected store (no local mutable counter state).
+
+  Endpoints (repo = first 2 path segments, org/repo):
+    POST /{org}/{repo}/issues                    create — body {:title :body? :author?}
+    GET  /{org}/{repo}/issues                     list (status= filter)
+    GET  /{org}/{repo}/issues/{id}                one issue + its proposal ids
+    POST /{org}/{repo}/issues/{id}/proposals      propose — body {:rationale :risk? :author?}
+    GET  /{org}/{repo}/proposals/{id}             one proposal + its reviews
+    POST /{org}/{repo}/proposals/{id}/reviews      review — body {:verdict :comment? :reviewer?}
+    POST /{org}/{repo}/proposals/{id}/merge        merge — requires >=1 approve review
+
+  v0.1 HONESTY NOTE — deliberately out of scope (documented, not
+  silently dropped): no risk-tiered auto-merge (every merge needs an
+  explicit approve review, cf. kotoba-issue's read-only-auto-merge
+  tiers), no delegate/signer-quorum authorization (that's nekko's job,
+  not wired here — see the superproject investigation this ADR-less
+  prototype came out of), no issue↔proposal auto-close, no pagination.
+  Write auth is the deploy shell's job same as every other surface in
+  this repo (CACAO/Bearer/SigV4 — see kotobase-protocols-worker's
+  README, `Auth` section)."
+  (:require [kotoba.lang.edn :as edn]
+            [kotoba.lang.text :as str]
+            [kotobase.protocols.http :as http]
+            [kotobase.store :as st]))
+
+;; ------------------------------------------------------------- colls
+
+(defn- issues-coll [repo] [:kotobase.issue/issues repo])
+(defn- proposals-coll [repo] [:kotobase.issue/proposals repo])
+(defn- reviews-coll [repo] [:kotobase.issue/reviews repo])
+
+(def ^:private valid-verdicts #{"approve" "reject" "request-changes"})
+
+;; ------------------------------------------------------------- helpers
+
+(defn- edn-response [status m]
+  (http/response status {"content-type" "application/edn"} (pr-str m)))
+
+(defn- issue-error [status reason] (edn-response status {:error reason}))
+
+(defn- audit! [store repo op id]
+  (st/-append store :kotobase.protocols/audit
+              {:surface :issue :op op :repo repo :id id}))
+
+(defn- next-id!
+  "Monotonic id, scoped per-repo, via the same append-a-throwaway-event
+  trick `kotobase.protocols.ipfs-pinning/next-seq!` uses — keeps this
+  namespace a pure function of the injected store, no local counter
+  state to lose across Worker invocations."
+  [store repo]
+  (str (:seq (st/-append store [:kotobase.issue/id-seq repo] {}))))
+
+(defn- parse-body [req]
+  (try (edn/read-string (or (:body req) "{}"))
+       (catch #?(:clj Exception :cljs :default) _ nil)))
+
+(defn- issue->edn [{:issue/keys [id title body status author created]}]
+  (cond-> {:id id :title title :status status :created created}
+    body (assoc :body body)
+    author (assoc :author author)))
+
+(defn- proposal->edn [{:proposal/keys [id issue-id rationale risk status author created]}]
+  (cond-> {:id id :issue-id issue-id :rationale rationale :status status :created created}
+    risk (assoc :risk risk)
+    author (assoc :author author)))
+
+(defn- review->edn [{:review/keys [id proposal-id verdict comment reviewer created]}]
+  (cond-> {:id id :proposal-id proposal-id :verdict verdict :created created}
+    comment (assoc :comment comment)
+    reviewer (assoc :reviewer reviewer)))
+
+(defn- list-coll [store coll]
+  (->> (st/-list store coll)
+       sort
+       (keep (fn [id] (when-let [d (st/-get store coll id)] [id d])))))
+
+;; ---------------------------------------------------------- issues
+
+(defn- create-issue [store now repo body]
+  (let [{title :title body-text :body author :author} body]
+    (if-not (string? title)
+      (issue-error 400 "title is required")
+      (let [id (next-id! store repo)
+            doc {:issue/id id :issue/title title :issue/body body-text
+                 :issue/status "open" :issue/author author :issue/created now}]
+        (st/-put store (issues-coll repo) id doc)
+        (audit! store repo :create-issue id)
+        (edn-response 201 (issue->edn doc))))))
+
+(defn- get-issue [store repo id]
+  (if-let [doc (st/-get store (issues-coll repo) id)]
+    (let [proposal-ids (->> (list-coll store (proposals-coll repo))
+                            (filter (fn [[_ p]] (= id (:proposal/issue-id p))))
+                            (map first))]
+      (edn-response 200 (assoc (issue->edn doc) :proposal-ids (vec proposal-ids))))
+    (issue-error 404 "issue not found")))
+
+(defn- list-issues [store repo req]
+  (let [status-filter (http/query-param req "status")
+        entries (cond->> (list-coll store (issues-coll repo))
+                  status-filter (filter (fn [[_ d]] (= status-filter (:issue/status d)))))]
+    (edn-response 200 {:count (count entries)
+                       :results (mapv (fn [[_ d]] (issue->edn d)) entries)})))
+
+;; ------------------------------------------------------- proposals
+
+(defn- create-proposal [store now repo issue-id body]
+  (if-not (st/-get store (issues-coll repo) issue-id)
+    (issue-error 404 "issue not found")
+    (let [{:keys [rationale risk author]} body]
+      (if-not (string? rationale)
+        (issue-error 400 "rationale is required")
+        (let [id (next-id! store repo)
+              doc {:proposal/id id :proposal/issue-id issue-id
+                   :proposal/rationale rationale :proposal/risk risk
+                   :proposal/status "open" :proposal/author author
+                   :proposal/created now}]
+          (st/-put store (proposals-coll repo) id doc)
+          (audit! store repo :propose id)
+          (edn-response 201 (proposal->edn doc)))))))
+
+(defn- get-proposal [store repo id]
+  (if-let [doc (st/-get store (proposals-coll repo) id)]
+    (let [reviews (->> (list-coll store (reviews-coll repo))
+                       (filter (fn [[_ r]] (= id (:review/proposal-id r))))
+                       (map (fn [[_ r]] (review->edn r))))]
+      (edn-response 200 (assoc (proposal->edn doc) :reviews (vec reviews))))
+    (issue-error 404 "proposal not found")))
+
+;; --------------------------------------------------------- reviews
+
+(defn- create-review [store now repo proposal-id body]
+  (cond
+    (not (st/-get store (proposals-coll repo) proposal-id))
+    (issue-error 404 "proposal not found")
+
+    :else
+    (let [{:keys [verdict comment reviewer]} body]
+      (if-not (contains? valid-verdicts verdict)
+        (issue-error 400 (str "verdict must be one of " (str/join ", " (sort valid-verdicts))))
+        (let [id (next-id! store repo)
+              doc {:review/id id :review/proposal-id proposal-id :review/verdict verdict
+                   :review/comment comment :review/reviewer reviewer :review/created now}]
+          (st/-put store (reviews-coll repo) id doc)
+          (audit! store repo :review id)
+          (edn-response 201 (review->edn doc)))))))
+
+;; ----------------------------------------------------------- merge
+
+(defn- approved? [store repo proposal-id]
+  (->> (list-coll store (reviews-coll repo))
+       (some (fn [[_ r]] (and (= proposal-id (:review/proposal-id r))
+                              (= "approve" (:review/verdict r)))))
+       some?))
+
+(defn- merge-proposal [store repo proposal-id]
+  (let [doc (st/-get store (proposals-coll repo) proposal-id)]
+    (cond
+      (nil? doc) (issue-error 404 "proposal not found")
+      (not= "open" (:proposal/status doc))
+      (issue-error 409 (str "proposal already " (:proposal/status doc)))
+      (not (approved? store repo proposal-id))
+      (issue-error 409 "no approving review yet")
+      :else
+      (let [merged (assoc doc :proposal/status "merged")]
+        (st/-put store (proposals-coll repo) proposal-id merged)
+        (audit! store repo :merge proposal-id)
+        (edn-response 200 (proposal->edn merged))))))
+
+;; ---------------------------------------------------------- routing
+
+(defn- repo+rest
+  "First 2 segments joined as \"org/repo\", remaining segments as a
+  vector — mirrors the org/repo convention every product repo in this
+  workspace already uses (gftdcojp/local-manimani etc), simpler than
+  git.cljc's variable-depth scan since issue tracking has no nested-path
+  use case to support."
+  [segs]
+  (when (>= (count segs) 3)
+    [(str/join "/" (subvec segs 0 2)) (subvec segs 2)]))
+
+(defn handle
+  "ctx: {:store IStore :now ISO-string}."
+  [{:keys [store now]} req]
+  (let [segs (http/segments (:path req))
+        method (:method req)]
+    (if-let [[repo rest] (repo+rest segs)]
+      (let [n (count rest)]
+        (cond
+          (and (= 1 n) (= "issues" (first rest)) (= :post method))
+          (let [body (parse-body req)]
+            (if (nil? body) (issue-error 400 "malformed EDN body")
+                (create-issue store now repo body)))
+
+          (and (= 1 n) (= "issues" (first rest)) (= :get method))
+          (list-issues store repo req)
+
+          (and (= 2 n) (= "issues" (first rest)) (= :get method))
+          (get-issue store repo (second rest))
+
+          (and (= 3 n) (= "issues" (first rest)) (= "proposals" (nth rest 2)) (= :post method))
+          (let [body (parse-body req)]
+            (if (nil? body) (issue-error 400 "malformed EDN body")
+                (create-proposal store now repo (second rest) body)))
+
+          (and (= 2 n) (= "proposals" (first rest)) (= :get method))
+          (get-proposal store repo (second rest))
+
+          (and (= 3 n) (= "proposals" (first rest)) (= "reviews" (nth rest 2)) (= :post method))
+          (let [body (parse-body req)]
+            (if (nil? body) (issue-error 400 "malformed EDN body")
+                (create-review store now repo (second rest) body)))
+
+          (and (= 3 n) (= "proposals" (first rest)) (= "merge" (nth rest 2)) (= :post method))
+          (merge-proposal store repo (second rest))
+
+          :else (http/not-found)))
+      (http/not-found "org/repo path required, e.g. /gftdcojp/local-manimani/issues"))))
