@@ -1,0 +1,469 @@
+(ns browser.compat.quickjs-runner
+  "Real QuickJS-backed `:browser.session/script-runner`.
+
+  `browser.session/run-page-scripts!` discovers `<script>` tags and calls an
+  INJECTED `:browser.session/script-runner` function for each one, then again
+  for the `DOMContentLoaded`/`load` lifecycle dispatches. Historically every
+  caller supplied a test-double runner. This namespace supplies a real one: it
+  evaluates the script's actual JS source through a live QuickJS WASM engine
+  (`browser.compat.quickjs-wasm/engine-from-session!`), lets
+  `browser.compat.quickjs-execution` turn the engine's capability requests
+  into real mutations of the session's document via `browser.dom-bridge`, and
+  commits the result back into `browser.session` state via
+  `browser.session/commit-script-state!`.
+
+  ## What's real vs. stubbed right now
+
+  This runner does not add capability handling of its own -- it wires up the
+  engine + document + commit path so that whatever
+  `browser.compat.quickjs-execution/apply-capability` already implements runs
+  for real instead of never being reached. As of this writing that already
+  covers real handling for: `:dom/query`, `:dom/mutate`, `:event/listen`,
+  `:event/remove`, `:event/dispatch`, `:console/log`, `:storage/get|put|delete`,
+  `:cookie/get|set`, `:clipboard/read|write`, `:window/open`,
+  `:location/assign|replace|reload`, `:permissions/query`,
+  `:geolocation/read`, `:notification/request-permission|show`,
+  `:fullscreen/request|exit`, `:media/capture`, `:websocket/connect|send|close`,
+  `:crypto/random-values|random-uuid`, `:worker/create|post-message|terminate`,
+  `:broadcast/open|post-message|close`, `:beacon/send`,
+  `:history/push-state|replace-state|traverse`, and
+  `:timer/schedule|cancel|microtask`. Anything else falls through to
+  `apply-capability`'s `:quickjs/unsupported-capability` error response (see
+  that namespace for the authoritative, current list -- this docstring
+  summarizes it but that `case` is the source of truth).
+
+  Genuinely proven end-to-end (see `test-cljs/browser/compat/
+  quickjs_script_runner_smoke_test.cljs`): a `<script>` that assigns
+  `document.title = \"...\"` runs as real JavaScript in the real QuickJS VM,
+  produces a real `{:capability :dom/mutate :dom/op :set-title ...}` capability
+  request, and that request is applied against the session's actual
+  `browser.dom-bridge` document and lands in the committed page's
+  `:browser/title` -- not a mock, not an inlined stub.
+
+  ## Runtime state threading across a page's scripts
+
+  Every script / lifecycle-event invocation still builds a fresh
+  `quickjs-execution/new-state` map, but it is no longer *empty* apart from
+  `:document`: `run-script!` now rehydrates the page-lifetime slice of that
+  state (see `persistent-execution-keys`) from whatever the *previous*
+  script/lifecycle invocation within the same page load left behind --
+  `:storage` (the script-local `storage/get|put|delete` capability; distinct
+  from `browser.session`'s persistent script-source cache), `:clipboard`,
+  `:geolocation`, `:dom/client-ids`, `:websocket/connections`,
+  `:worker/instances`, `:broadcast/channels`, and `:history/entries` /
+  `:history/index`, `:global/listeners`. A script that calls
+  `localStorage.setItem(...)` (or opens a WebSocket, or registers a
+  `document.addEventListener`) in one `<script>` tag is visible to a later
+  `<script>` tag and to the `DOMContentLoaded`/`load` lifecycle dispatch
+  within the same page load.
+
+  `:geolocation`'s ultimate source is now real, too: `run-script!` threads
+  `:browser.session/geolocation` (see `browser.session/new-session`'s
+  docstring -- a host-owned atom a real embedding application supplies and
+  updates externally, e.g. from a real GPS driver) into every
+  `quickjs-execution/new-state` call, so a real host-supplied position is
+  what `geolocation-snapshot` reads, not `new-state`'s own zeroed
+  `{:latitude 0.0 :longitude 0.0 :accuracy 0.0}` default (which still
+  applies, unchanged, for a session built without a `:geolocation` option).
+
+  The persisted slice is stored on the session under
+  `:browser.session/quickjs-runtime-state`, tagged with the
+  `:browser.session/page-generation` it belongs to (mirroring how
+  `browser.script-engine`'s pending-start tracking tags its handles with a
+  generation to detect staleness -- see `pending-matches?` there). `run-script!`
+  only reuses the persisted state when its generation still matches the
+  current page generation; `browser.session/commit-page!` bumps the
+  generation on every real navigation/reload, which makes the previous
+  generation's entry unreachable and the next script starts from a fresh
+  `quickjs-execution/new-state` again. The `:document` key is deliberately
+  NOT part of the persisted slice -- it keeps using its existing, separate
+  threading path (each call re-reads `:browser.session/page :browser/document`,
+  which already reflects every prior script's committed mutations).
+
+  As of this writing, `:storage`, `:clipboard`, AND `:geolocation` reads also
+  round-trip back into the VM itself, not just the host-side view:
+  `evaluate!`/`load-module!` (`browser.compat.quickjs-execution`) pass the
+  current `:storage` snapshot, plus host-computed `:clipboard` permission-
+  decisions (read AND write, independently gated -- `quickjs-execution/
+  clipboard-snapshot`) + text and `:geolocation` permission-decision +
+  position snapshots (`quickjs-execution/geolocation-snapshot`), alongside
+  the document snapshot into every `quickjs-wasm` invocation
+  (`:document/snapshot`, `:storage/snapshot`, `:clipboard/snapshot`,
+  `:geolocation/snapshot` on the request map), and `quickjs-wasm` installs
+  all four as VM globals (`globalThis.__kotobaSnapshot` /
+  `globalThis.__kotobaStorageSnapshot` / `globalThis.__kotobaClipboardSnapshot`
+  / `globalThis.__kotobaGeolocationSnapshot`) before each eval, the same way
+  it already did for `document.*`. So `localStorage.getItem` genuinely
+  returns the real, current value synchronously -- a script that calls
+  `localStorage.setItem('probe', 'x')` in one `<script>` tag makes a LATER
+  `<script>` tag's `localStorage.getItem('probe')` observably return `x`
+  to JS (proven via `document.title` in
+  `test-cljs/browser/compat/quickjs_runtime_state_threading_smoke_test.cljk`,
+  not just a host-side `:capability/results` log entry). The snapshot is
+  frozen at eval start, so a script that does
+  `setItem('x', 'y'); getItem('x')` within the SAME `<script>` tag still
+  will not see its own write -- `setItem` only queues a `storage/put`
+  request that the host applies via `apply-capability` *after* the script
+  finishes, and the next fresh snapshot isn't installed until the next
+  `<script>` tag's `eval-dispose!`. `setItem`/`removeItem` and the
+  `storage/get`/`clipboard/read`/`clipboard/write`/`geolocation/read`
+  requests `getItem`/`readText`/`writeText`/`getCurrentPosition` still queue
+  alongside the synchronous snapshot read/resolve are otherwise unchanged
+  from before -- they keep landing in `:capability/results` for the audit
+  trail. `getCurrentPosition`'s `success`/`error` callback and
+  `readText`/`writeText`'s returned promise are both settled SYNCHRONOUSLY
+  (this engine evaluates a whole script synchronously in one pass, so there
+  is no realistic way to defer either the way a real, async/
+  permission-prompted browser would): `getCurrentPosition`'s `success` fires
+  with the real position if permission is granted and the host ever
+  injected one, `error` fires (with a `GeolocationPositionError`-shaped
+  `{code, message}`) if permission is denied or no real position was ever
+  injected -- see `quickjs-execution/geolocation-snapshot`. `readText`/
+  `writeText` resolve with the real clipboard text / `undefined` if their
+  respective permission (`:clipboard/read`/`:clipboard/write`) is granted,
+  or reject with a `{name, message}` error otherwise -- see
+  `quickjs-execution/clipboard-snapshot`.
+
+  ## Real WebSocket I/O (opt-in via `:browser.session/websocket-fn`)
+
+  `:websocket/connect|send|close` are fabricated (host-side-only, no real
+  socket) UNLESS the session was built with a real `:websocket-fn` (see
+  `browser.net.websocket/websocket-fn` -- a real `java.net.http.HttpClient`-
+  backed client on the JVM, a real host-runtime-global-`WebSocket`-backed
+  client in ClojureScript). When one is supplied, `run-script!` threads it
+  into every `quickjs-execution/new-state` call, and `apply-capability`
+  opens a REAL connection, sends REAL bytes, and (via
+  `quickjs-execution/websocket-snapshot`, the WebSocket analogue of
+  `geolocation-snapshot` -- computed the same way, before each script runs)
+  drains whatever real text has genuinely arrived on that real socket.
+
+  The one thing this CANNOT do is deliver a real inbound message to a
+  script's `ws.onmessage` mid-script, for the same reason
+  `getCurrentPosition`'s callback can't be deferred: this engine evaluates a
+  whole script synchronously in one pass, and a real message arriving on a
+  real socket at some future wall-clock moment cannot interrupt that pass.
+  What IS genuinely provable, proven end to end in
+  `test-cljs/browser/compat/quickjs_websocket_smoke_test.cljk`: the SAME
+  QuickJS `vm`/context object is reused across every script tag on a page
+  (see `quickjs-wasm/ensure-context!`), so a `WebSocket` instance -- and its
+  `.onmessage` property -- that a `<script>` tag created really is still
+  the same live JS object a LATER `<script>` tag can see (via a small
+  persisted registry, `globalThis.__kotobaWebSockets`, that survives across
+  evals the same way `globalThis.__kotobaSnapshot` already did). So: script
+  1 opens a connection, registers `ws.onmessage`, and sends real data;
+  real wall-clock time then has to pass (a real `<script>` tag boundary, or
+  in the smoke test's case a real `await`/`setTimeout` between two
+  evaluations); script 2's snapshot install drains whatever really echoed
+  back by then and invokes that SAME, still-registered `onmessage`
+  SYNCHRONOUSLY, before script 2's own source runs -- a real round trip
+  provable ACROSS two `<script>` tags, never claimed to be same-tick async
+  delivery the way a real browser's event loop would do it.
+
+  ## Real Worker execution (auto-derived from the engine + `:fetch-fn`)
+
+  `:worker/create|post-message|terminate` are fabricated (host-side-only,
+  no real second JS engine) UNLESS TWO things are both true: the session
+  has a real `:fetch-fn` (the SAME opt-in `:browser.session/fetch-fn`
+  `:net/fetch` already uses -- a worker script is just another URL, see
+  `quickjs-execution/worker-create-result`), AND the engine is a genuine
+  `:cljs` `quickjs-wasm` engine (i.e. `(quickjs-wasm/worker-fn engine)` is
+  non-nil -- the JVM `:clj` engine stub has no real second-context
+  capability to offer at all, and any hand-rolled test-double `:engine` fn
+  never has one either). Unlike WebSocket, there is no separate
+  `:browser.session/worker-fn` opt-in flag REQUIRED for this: running more
+  real JS inside a second, real, sandboxed QuickJS context has no external
+  side effect the way opening a real socket does, so `run-script!` derives
+  it automatically from whatever engine is already running (a caller can
+  still override it via `:browser.session/worker-fn`, e.g. a test wanting
+  a fake worker-fn double). `:worker/create` really fetches the worker's
+  script over `:fetch-fn` and really evaluates it in a brand-new, real,
+  independent QuickJS context (`quickjs-wasm/create-worker-context`) --
+  NOT the page's own context -- with its own minimal `self`/`postMessage`/
+  `onmessage` global scope (`quickjs-wasm/worker-global-scope-source`),
+  kept alive across script tags (via `:worker/handles`, see
+  `persistent-execution-keys`) until a real `:worker/terminate` disposes it.
+
+  Message delivery is NOT symmetric with WebSocket, and genuinely does not
+  need to be: `:worker/post-message` (main thread -> worker) delivers
+  SYNCHRONOUSLY, immediately, as part of `apply-capability` processing that
+  very request -- not deferred to a later script tag -- because unlike a
+  real WebSocket's remote peer, the worker's context already exists,
+  in-process, completely idle (the sending script has already finished its
+  own synchronous pass by the time `apply-capability` runs), so evaluating
+  a message into it right then does not interrupt anything running. Any
+  reply the worker's script synchronously `self.postMessage`s back is
+  captured the same instant. What IS still deferred, exactly like
+  WebSocket: delivering that reply into the MAIN thread's
+  `worker.onmessage` waits for the NEXT script tag's snapshot install
+  (`quickjs-execution/worker-snapshot`) -- a real `postMessage` is
+  asynchronous even when computationally instant, so this repo never
+  claims same-tick delivery into the sending script's own `onmessage`
+  either, mirroring the WebSocket precedent's discipline even though
+  nothing here is genuinely waiting on real wall-clock time.
+
+  ## Real fetch() response delivery (auto-derived from a real :fetch-fn)
+
+  `globalThis.fetch` always returns a spec-shaped, `.then()`-chainable
+  thenable (see `quickjs-wasm/webapi-shim-source`'s `__kotobaMakeDeferred`),
+  but that thenable only ever settles for real when the session was built
+  with a real `:browser.session/fetch-fn` (the SAME opt-in capability
+  `:worker/create` already reuses to fetch a worker's script -- see
+  `quickjs-execution/worker-create-result`). Without one, the thenable is
+  registered but never resolved or rejected -- exactly as real, un-echoed
+  WebSocket sends and un-replied Worker messages already behave today, and
+  a script that never calls `.then()` on it (or reads its synchronous
+  `.ok`/`.status`/`.capability` fields, unchanged from before this feature)
+  is completely unaffected.
+
+  With a real `:fetch-fn` injected, `:net/fetch` really performs the HTTP
+  call (`quickjs-execution/apply-capability`'s `:net/fetch` case, via
+  `browser.net/fetch-resource` when a `:net/context` is present, else the
+  bare `:fetch-fn`). A real HTTP client call is itself synchronous/blocking
+  (`java.net.http.HttpClient` on the JVM), so unlike WebSocket's genuinely
+  unpredictable-arrival-time inbound bytes, there is nothing to wait for:
+  the real response (status/headers/body) already exists in full the
+  instant `apply-capability` finishes processing that `:net/fetch` request
+  -- mirroring `worker-create-result`'s eager-capture reasoning exactly.
+  It is captured then, keyed by the fetch call's own `:request/id` (assigned
+  by the JS shim when it queues the request), into `:net/fetch-responses`
+  (see `persistent-execution-keys`), and `quickjs-execution/fetch-snapshot`
+  computes the JSON-safe snapshot the same way `worker-snapshot` does.
+
+  What is NOT delivered same-tick, exactly like Worker's reply and
+  WebSocket's echo: resolving/rejecting the calling script's fetch()
+  promise waits for the NEXT script tag's webapi shim install (see
+  `quickjs-wasm/webapi-shim-source`'s fetch delivery IIFE, which looks up
+  each id present in the fetch snapshot against `__kotobaFetchPending` --
+  the still-registered pending thenable a PREVIOUS script's `fetch()` call
+  created). A real `fetch()` response is asynchronous even when
+  computationally instant, so this repo never claims same-tick delivery
+  into the calling script's own `.then()` either.
+
+  Response body support is deliberately minimal: `.text()` returns an
+  already-resolved thenable of the real fetched body (a real string, not a
+  stream), and `.json()` is a thin `JSON.parse` wrapper over it. `.headers`/
+  streaming bodies are NOT implemented -- documented follow-ups, not silent
+  gaps, should a caller need them.
+
+  ## Known limitations of this first pass
+
+  - The QuickJS engine must already be started and `:ready`
+    (i.e. the promise returned by `browser.session/ensure-script-engine!` has
+    resolved) before `run-page-scripts!` runs. Starting the engine is
+    asynchronous in ClojureScript (the WASM module load is a Promise) while
+    `run-page-scripts!` is a synchronous reducer, so this runner does not --
+    and structurally cannot -- lazily start the engine mid-reduce. If the
+    engine isn't ready yet, scripts are recorded as skipped
+    (history event `{:event :script/skipped :reason :script/engine-not-ready}`)
+    rather than silently dropped or thrown. Callers must
+    `(session/ensure-script-engine! session)` (and, in ClojureScript, await
+    the resulting promise) before navigating / loading HTML."
+  (:require [browser.compat.quickjs :as quickjs]
+            [browser.compat.quickjs-binding :as binding]
+            [browser.compat.quickjs-execution :as execution]
+            [browser.compat.quickjs-wasm :as quickjs-wasm]
+            [browser.session :as session]))
+
+(defn- script-adapter
+  [session]
+  (quickjs/new-adapter
+   {:origin (get-in session [:browser.session/page :browser/url])
+    :profile-id (get-in session [:browser.session/profile :profile/id])}))
+
+(defn- script-payload
+  [script]
+  (cond-> {:source (:script/source script)
+           :url (:script/url script)
+           :module? (= :module (:script/type script))}
+    (:script/node-id script)
+    (assoc :script/node-id (:script/node-id script))))
+
+(defn- skip-event
+  [script reason]
+  {:event :script/skipped
+   :reason reason
+   :script/type (:script/type script)
+   :script/url (:script/url script)
+   :script/lifecycle-event (:script/lifecycle-event script)})
+
+(def persistent-execution-keys
+  "`quickjs-execution/new-state` keys that model page-lifetime runtime state
+  (per this namespace's docstring): the script-local storage/clipboard/
+  geolocation capabilities, plus the host-side capability registries a script
+  can build up over a page load (open DOM client-id mappings, WebSocket/
+  Worker/BroadcastChannel handles, the session-history navigation stack, and
+  registered global event listeners). `:websocket/handles` carries the REAL,
+  opaque per-connection objects a real `:websocket-fn` (see
+  `browser.net.websocket`) hands back from `:websocket/connect` -- kept
+  separate from the JSON-safe, audit-visible `:websocket/connections` map so
+  a later script's `websocket-snapshot` (`quickjs-execution`) can still
+  drain a connection a PREVIOUS script tag opened. `:worker/handles` is the
+  Worker analogue: the REAL, opaque per-worker QuickJS context objects a
+  real `:worker-fn` (see `browser.compat.quickjs-wasm/worker-fn`) hands back
+  from `:worker/create`. `:worker/outbox` carries real reply messages a
+  worker's own script already, genuinely produced (see
+  `quickjs-execution/worker-create-result`'s docstring for why this is
+  captured eagerly, unlike `:websocket/handles`) but not yet delivered into
+  the main thread's `worker.onmessage` -- persisting it here is what lets a
+  LATER script tag's `worker-snapshot` still deliver a message a PREVIOUS
+  script tag's `postMessage` already produced a reply for. `:net/fetch-responses`
+  is the `fetch()` analogue of `:worker/outbox`: real, eagerly-captured
+  `:net/fetch` responses (see `quickjs-execution/fetch-snapshot`'s
+  docstring for why capturing this eagerly is safe, mirroring
+  `worker-create-result`) not yet delivered into the calling script's
+  pending `fetch()` `.then()` chain -- persisting it here is what lets a
+  LATER script tag's `fetch-snapshot` still deliver a response a PREVIOUS
+  script tag's `fetch()` call already produced. `:document` is deliberately
+  excluded -- it has its own, already-working threading path (re-read from
+  `:browser.session/page` on every call). `:history-length` (note: NOT the
+  same thing as the `:history/entries`/`:history/index` sandboxed pushState
+  model below, which IS persisted here) is also deliberately excluded --
+  `run-script!` recomputes it fresh, directly from the session's real
+  `:browser.session/navigation` entry count, on every call, which already
+  gives the identical answer within one page generation (a session's
+  navigation depth cannot change without a navigation, and a navigation
+  always bumps the generation -- see `runtime-state-for-generation`).
+  `:broadcast/outbox` is the BroadcastChannel analogue of `:worker/outbox`:
+  real messages a same-name channel already, genuinely fanned out to (see
+  `quickjs-execution`'s `:broadcast/post-message` case) but not yet
+  delivered into the receiving channel's own `onmessage` -- persisting it
+  here is what lets a LATER script tag's `broadcast-snapshot` still
+  deliver a message a PREVIOUS script tag's `postMessage` already fanned
+  out to it. `:websocket/opened` is a dedup set of connection ids that
+  have ALREADY had `ws.onopen` delivered (see `quickjs-execution/take-
+  websocket-opened-ids`) -- without persisting it here, a connection a
+  PREVIOUS script tag opened would look newly-opened again to every
+  SUBSEQUENT script tag's snapshot (nothing else ever removes an id from
+  `:websocket/handles`), firing `onopen` repeatedly instead of exactly
+  once. `:websocket/errored` is the exact same one-time-delivery dedup
+  pattern for `ws.onerror` (see `quickjs-execution/websocket-snapshot`) --
+  a real captured error, once delivered, must not fire again on every
+  later script tag just because the underlying real error atom never
+  resets. `:websocket/closed` is the same pattern again for `ws.onclose`
+  -- the underlying `closed?` atom (`browser.net.websocket/drain-
+  messages!`) is a terminal flag that never resets once true, so without
+  this dedup a peer-initiated close would re-fire `onclose` on every
+  later script tag forever instead of exactly once."
+  [:storage :clipboard :geolocation
+   :dom/client-ids :websocket/connections :websocket/handles :websocket/opened
+   :websocket/errored :websocket/closed
+   :worker/instances :worker/handles :worker/outbox
+   :net/fetch-responses
+   :broadcast/channels :broadcast/outbox :history/entries :history/index
+   :global/listeners
+   ;; console.* output accumulates across scripts within a page generation so
+   ;; the L1 DevTools console panel (browser.devtools) can inspect it from the
+   ;; session without re-running scripts; a navigation bumps the generation and
+   ;; drops the log, matching real browser console lifetime.
+   :console/messages])
+
+(defn- script-generation
+  [session script]
+  (:script/generation script (:browser.session/page-generation session)))
+
+(defn- runtime-state-for-generation
+  "Previously persisted page-lifetime `quickjs-execution` state for
+  `generation`, or nil if there isn't any yet, or what's persisted belongs to
+  a stale generation (i.e. a navigation happened since)."
+  [session generation]
+  (let [entry (:browser.session/quickjs-runtime-state session)]
+    (when (= generation (:quickjs-runtime/generation entry))
+      (:quickjs-runtime/state entry))))
+
+(defn- remember-runtime-state!
+  "Persist the page-lifetime slice of `state` (`persistent-execution-keys`)
+  on `session`, tagged with `generation`. A later call at the same
+  `generation` (the next script tag or lifecycle dispatch within the same
+  page load) picks this back up via `runtime-state-for-generation`; a
+  navigation bumps `:browser.session/page-generation`, which makes this
+  entry's generation stale and therefore unreachable -- the next script then
+  starts from a fresh `quickjs-execution/new-state`."
+  [session generation state]
+  (assoc session :browser.session/quickjs-runtime-state
+         {:quickjs-runtime/generation generation
+          :quickjs-runtime/state (select-keys state persistent-execution-keys)}))
+
+(defn run-script!
+  "Real `:browser.session/script-runner`.
+
+  Evaluates `script`'s real JS source through the session's already-ready
+  QuickJS engine (see the `:script-engine/engine` under
+  `:browser.session/script-engine`) and commits any resulting document
+  mutation back into `session` via `browser.session/commit-script-state!`.
+  Also folds any `quickjs-execution` audit events into the session's real
+  audit log (`:browser.session/audit`) before committing, so QuickJS
+  evaluations show up in the same append-only ledger as page commits and
+  permission decisions.
+
+  Rehydrates the page-lifetime slice of `quickjs-execution` runtime state
+  (`persistent-execution-keys`) left behind by the previous script/lifecycle
+  invocation at the same page generation, and persists the (possibly
+  updated) slice back via `remember-runtime-state!` so the *next* invocation
+  sees it too -- see the namespace docstring for the full picture, including
+  which capability answers (`:storage`, `:clipboard`, `:geolocation`) now
+  round-trip back into the QuickJS VM itself as real JS return values /
+  callback invocations, and how a real `fetch()` response round-trips back
+  into a script's `.then()` chain (see the \"Real fetch() response
+  delivery\" section below).
+
+  Also threads the real, current `(count (:entries (:browser.session/
+  navigation session)))` into `quickjs-execution/new-state` as
+  `:history-length`, a plain integer, point-in-time snapshot (NOT persisted
+  across script tags like `:geolocation` is -- a session's navigation depth
+  cannot change within a single page generation, so recomputing it fresh
+  every call already gives the same answer) of how many real navigations
+  have actually happened in the session so far. `quickjs-execution/
+  history-length-snapshot` reads it and threads it into `quickjs-wasm` as
+  `:history/snapshot`, so `globalThis.history.length`'s STARTING value
+  reflects real session navigation depth instead of always being `0`.
+
+  Returns `session` unchanged (plus a `:script/skipped` history entry) if the
+  engine isn't ready yet -- see the namespace docstring."
+  [session script]
+  (let [engine (get-in session [:browser.session/script-engine :script-engine/engine])]
+    (if-not (execution/engine-ready? engine)
+      (update session :browser.session/history conj
+              (skip-event script :script/engine-not-ready))
+      (let [document (get-in session [:browser.session/page :browser/document])
+            generation (script-generation session script)
+            persisted (runtime-state-for-generation session generation)
+            state (merge (execution/new-state
+                          {:binding (binding/empty-binding (script-adapter session))
+                           :document document
+                           :engine engine
+                           :audit (:browser.session/audit session)
+                           :net-context (session/net-context session)
+                           :websocket-fn (:browser.session/websocket-fn session)
+                           :worker-fn (or (:browser.session/worker-fn session)
+                                          (quickjs-wasm/worker-fn engine))
+                           :fetch-fn (:browser.session/fetch-fn session)
+                           :geolocation (:browser.session/geolocation session)
+                           :history-length (count (:entries (:browser.session/navigation session)))})
+                         persisted)
+            result (execution/evaluate! state (script-payload script))]
+        (-> session
+            (cond-> (:audit result) (assoc :browser.session/audit (:audit result)))
+            (session/commit-script-state! result)
+            (remember-runtime-state! generation result)
+            (update :browser.session/history conj
+                    {:event :script/quickjs-run
+                     :script/type (:script/type script)
+                     :script/url (:script/url script)
+                     :script/lifecycle-event (:script/lifecycle-event script)
+                     :result (:result result)
+                     :error (:last-error result)
+                     :capability/results (:capability/results result)}))))))
+
+(defn quickjs-session-opts
+  "Merge the `browser.session/new-session` options needed to run page scripts
+  through a real QuickJS engine into `opts`.
+
+  Adds `:script-runner` (`run-script!`) and `:engine-factory`
+  (`browser.compat.quickjs-wasm/engine-from-session!`). Any `:script-runner`
+  or `:engine-factory` already present in `opts` wins over these defaults, so
+  callers can still override either half independently (e.g. to swap in a
+  fake engine-factory for a JVM test while keeping the real runner logic)."
+  [opts]
+  (merge {:script-runner run-script!
+          :engine-factory quickjs-wasm/engine-from-session!}
+         opts))

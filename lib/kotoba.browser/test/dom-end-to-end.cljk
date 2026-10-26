@@ -1,0 +1,154 @@
+(ns dom-end-to-end
+  "The whole loop, once: a real document, the real engine, the real host half.
+
+      document ──snapshot──> ecma262.wasm/mjs ──effect log──> apply ──> document'
+
+  The two halves are tested apart for good reasons -- `test/runtime-
+  differential.cljs` checks that the ENGINE emits what a real engine would do,
+  and `test/browser/ecma262_test.cljk` checks that the HOST applies a log
+  correctly -- but apart is exactly where a format drift hides: change the log
+  format on one side and both suites stay green while nothing works. This
+  joins them, so the wire format is measured rather than assumed.
+
+  Run:  kbb --backend sci --classpath \"src:../htmldom/src:../cssom/src:../dom-gpu/src:../org-w3-aria/src\" \\
+          test/dom-end-to-end.cljk [path/to/ecma262.mjs]
+
+  Exit codes: 0 pass, 1 a mismatch, 2 the harness could not answer."
+  (:require [browser.compat.ecma262 :as ecma262]
+            [browser.dom-bridge :as dom-bridge]
+            [htmldom.core :as html]
+            ["node:fs" :as fs]
+            ["node:path" :as path]))
+
+(def page
+  (str "<html><body>"
+       "<div id=\"ws-proof\">pending</div>"
+       "<div id=\"out\">before</div>"
+       "<button id=\"btn\">go</button>"
+       "</body></html>"))
+
+(defn- refuse! [msg]
+  (println (str "REFUSED\t" msg))
+  (println "This is not a pass. Exit 2.")
+  (js/process.exit 2))
+
+(defn- text-of [document id]
+  (:text-content (dom-bridge/node-snapshot document (dom-bridge/get-element-by-id document id))))
+
+(def failures (atom []))
+(def checks (atom 0))
+
+(defn- check [label expected actual]
+  (swap! checks inc)
+  (if (= expected actual)
+    (println (str "  ok   " label))
+    (do (println (str "  FAIL " label "\n         expected " (pr-str expected)
+                      "\n         actual   " (pr-str actual)))
+        (swap! failures conj label))))
+
+(defn- run [m]
+  (let [doc (html/parse-into-document page)
+        snap (ecma262/snapshot doc)]
+
+    ;; 1. a write, all the way through
+    (let [log ((aget m "eval-dom")
+               "document.getElementById('ws-proof').textContent = 'done';" snap)
+          {:keys [document unknown]} (ecma262/apply-effects doc (ecma262/parse-effects log))]
+      (check "a write reaches the real document" "done" (text-of document "ws-proof"))
+      (check "and nothing was left unapplied" [] unknown)
+      (check "and it did not touch its neighbour" "before" (text-of document "out")))
+
+    ;; 2. the snapshot the host built is what the guest reads back
+    (let [v ((aget m "eval-dom-value") "document.getElementById('out').textContent" snap)]
+      (check "the guest reads the host's snapshot" "before" v))
+
+    ;; 3. `+=` composes against the injected value
+    (let [log ((aget m "eval-dom") "document.getElementById('out').textContent += '!';" snap)
+          {:keys [document]} (ecma262/apply-effects doc (ecma262/parse-effects log))]
+      (check "+= composes against the snapshot" "before!" (text-of document "out")))
+
+    ;; 4. a registration, then firing it
+    (let [src (str "var r = document.getElementById('out');"
+                   "document.getElementById('btn').addEventListener('click', function () {"
+                   "  r.textContent = 'fired'; });")
+          reg (ecma262/parse-effects ((aget m "eval-dom") src snap))
+          {:keys [document listeners]} (ecma262/apply-effects doc reg)]
+      (check "registering is one listener" 1 (count listeners))
+      (check "and it names the event" "click" (:event/type (first listeners)))
+      (check "and registering changes nothing" "before" (text-of document "out"))
+      (let [n (:handler/n (first listeners))
+            fired ((aget m "eval-dom-event") src snap (js/BigInt n))
+            {:keys [document]} (ecma262/apply-effects doc (ecma262/parse-effects fired))]
+        (check "firing it reaches the document" "fired" (text-of document "out"))))
+
+    ;; 5. attributes, both directions
+    (let [d2 (html/parse-into-document
+              "<html><body><div id=\"a\" title=\"hi\">t</div></body></html>")
+          snap2 (ecma262/snapshot d2)]
+      (check "the guest reads a real attribute" "hi"
+             ((aget m "eval-dom-value")
+              "document.getElementById('a').getAttribute('title')" snap2))
+      (check "a missing attribute is null" "null"
+             ((aget m "eval-dom-value")
+              "document.getElementById('a').getAttribute('nope')" snap2))
+      (let [log ((aget m "eval-dom")
+                 "document.getElementById('a').setAttribute('class', 'on');" snap2)
+            {:keys [document unknown]} (ecma262/apply-effects d2 (ecma262/parse-effects log))]
+        (check "a setAttribute reaches the real document" "on"
+               (get-in (dom-bridge/node-snapshot
+                        document (dom-bridge/get-element-by-id document "a"))
+                       [:attrs :class]))
+        (check "and nothing was left unapplied" [] unknown)))
+
+    ;; 6. the page itself and the log -- neither is an element
+    (let [log ((aget m "eval-dom") "document.title = 'Kotoba'; console.log('hello');" snap)
+          {:keys [document logs unknown]} (ecma262/apply-effects doc (ecma262/parse-effects log))]
+      (check "a title write reaches the real document" "Kotoba"
+             (dom-bridge/document-title document))
+      (check "a console.log is collected" ["hello"] logs)
+      (check "and neither was reported unknown" [] unknown))
+
+    ;; 7. a request: registered here, performed by the host, then fired back
+    ;;    with the response -- the loop the whole effect model exists for
+    (let [src (str "var r = document.getElementById('out');"
+                   "fetch('/api/data').then(function (body) { r.textContent = body; });")
+          {:keys [requests document unknown]}
+          (ecma262/apply-effects doc (ecma262/parse-effects ((aget m "eval-dom") src snap)))]
+      (check "a fetch is one collected request" 1 (count requests))
+      (check "and it carries the url" "/api/data" (:request/url (first requests)))
+      (check "and registering it changes nothing" "before" (text-of document "out"))
+      ;; The host would really fetch here. What matters is that the response
+      ;; reaches the handler the guest registered.
+      (let [n (:handler/n (first requests))
+            fired ((aget m "eval-dom-event-arg") src snap (js/BigInt n) "the body")
+            {:keys [document]} (ecma262/apply-effects doc (ecma262/parse-effects fired))]
+        (check "and the response reaches the document" "the body"
+               (text-of document "out"))))
+
+    ;; 8. an element the snapshot never named is not addressable
+    (let [v ((aget m "eval-dom-value") "document.getElementById('nope') ? 'found' : 'missing'" snap)]
+      (check "an element with no id is not reachable" "missing" v))))
+
+(defn -main [& args]
+  (let [default (path/resolve (js/process.cwd) ".." "org-ecma-international-262"
+                              "target" "ecma262.mjs")
+        artifact (or (first args) default)]
+    (when-not (fs/existsSync artifact)
+      (refuse! (str "no ecma262 artifact at " artifact)))
+    (-> (js/import (str "file://" artifact))
+        (.then (fn [mod]
+                 (let [m ((.-instantiateKotoba mod) #js {})]
+                   (run m)
+                   ;; The count is what actually ran, not a number written
+                   ;; here: a check that stopped being reached must not keep
+                   ;; being counted.
+                   (println (str "SCANNED\t" @checks "\tchecks"))
+                   (when (zero? @checks) (refuse! "no check ran"))
+                   (if (seq @failures)
+                     (do (println (str (count @failures) " failed"))
+                         (js/process.exit 1))
+                     (do (println "the engine and the host agree end to end")
+                         (js/process.exit 0))))))
+        (.catch (fn [e] (refuse! (str "could not drive the engine: " (.-message e))))))))
+
+(-main)

@@ -1,0 +1,274 @@
+(ns browser.input-test
+  (:require [browser.input :as input]
+            [browser.surface :as surface]
+            [kotoba.test :refer [deftest is]]))
+
+(defn- window
+  [surface window-id]
+  (first (filter #(= (:window/id %) window-id) (:surface/windows surface))))
+
+(deftest pointer-click-focuses-topmost-window
+  (let [s (-> (surface/empty-surface)
+              (surface/open-window {:app-id "a" :title "A" :rect [0 0 100 100]})
+              (surface/open-window {:app-id "b" :title "B" :rect [20 20 100 100]}))
+        first-id (-> s :surface/windows first :window/id)
+        result (input/reduce-event s (input/empty-state)
+                                   {:event/type :pointer/click :x 10 :y 10})]
+    (is (= first-id (get-in result [:surface :surface/focus])))
+    (is (= [{:action :window/focus :window-id first-id}]
+           (:actions result)))))
+
+(deftest clicking-a-window-raises-it-so-it-wins-the-overlap-region-next-time
+  ;; This codebase's own z-order convention: window-node renders windows in
+  ;; :surface/windows order (later = drawn on top), and window-at's hit-test
+  ;; walks that same order in reverse. Focusing a window must ALSO raise it
+  ;; to the end of that order -- otherwise, once two windows genuinely
+  ;; overlap, whichever was opened later permanently wins the overlap
+  ;; region's hit-test forever, even after the user clicks to focus the
+  ;; other one, since focus alone never changed which window renders on top.
+  (let [s (-> (surface/empty-surface)
+              (surface/open-window {:app-id "a" :title "A" :rect [0 0 200 200]})
+              (surface/open-window {:app-id "b" :title "B" :rect [50 50 200 200]}))
+        a-id (-> s :surface/windows first :window/id)
+        ;; (10,10) is inside A only (outside B's [50,50,200,200] rect) --
+        ;; focuses A without yet exercising the overlap region.
+        after-focus-a (:surface (input/reduce-event s (input/empty-state)
+                                                    {:event/type :pointer/click :x 10 :y 10}))]
+    (is (= a-id (:surface/focus after-focus-a)))
+    (is (= a-id (:window/id (peek (:surface/windows after-focus-a))))
+        "focusing A must raise it to the end of :surface/windows (topmost)")
+    ;; (100,100) is inside BOTH A and B's rects -- before this fix, this
+    ;; would always resolve to B (still array-last despite A being
+    ;; focused); with A now correctly raised, it must resolve to A.
+    (let [after-overlap-click (:surface (input/reduce-event after-focus-a (input/empty-state)
+                                                            {:event/type :pointer/click :x 100 :y 100}))]
+      (is (= a-id (:surface/focus after-overlap-click))
+          "clicking the overlap region after A was raised must still hit A, not B"))))
+
+(deftest pointer-drag-moves-window-by-titlebar
+  (let [s (-> (surface/empty-surface)
+              (surface/open-window {:app-id "notes"
+                                    :title "Notes"
+                                    :rect [40 50 420 300]}))
+        window-id (:surface/focus s)
+        result (input/reduce-events
+                s
+                [{:event/type :pointer/down :x 60 :y 60}
+                 {:event/type :pointer/move :x 100 :y 120}
+                 {:event/type :pointer/up :x 100 :y 120}])]
+    (is (= [80 110 420 300]
+           (:window/rect (window (:surface result) window-id))))
+    (is (= [:window/focus :window/move]
+           (mapv :action (:actions result))))))
+
+(deftest pointer-drag-resizes-window-from-corner
+  (let [s (-> (surface/empty-surface)
+              (surface/open-window {:app-id "term"
+                                    :title "Terminal"
+                                    :rect [10 10 200 120]}))
+        window-id (:surface/focus s)
+        result (input/reduce-events
+                s
+                [{:event/type :pointer/down :x 205 :y 125}
+                 {:event/type :pointer/move :x 245 :y 165}
+                 {:event/type :pointer/up :x 245 :y 165}])]
+    (is (= [10 10 240 160]
+           (:window/rect (window (:surface result) window-id))))
+    (is (= [:window/focus :window/resize]
+           (mapv :action (:actions result))))))
+
+;; ---- pointer/cancel must release :pointer/capture exactly like pointer/up
+;; -- previously entirely absent from the reducer's case, so it silently
+;; fell through to the default no-op clause and left capture untouched.
+;; Confirmed via direct REPL reproduction before touching source: down ->
+;; cancel -> an unrelated move to a far-away point still relocated the
+;; window as if the drag were still live. ----
+
+(deftest pointer-cancel-releases-drag-capture-so-a-later-unrelated-move-is-ignored
+  (let [s (-> (surface/empty-surface)
+              (surface/open-window {:app-id "notes"
+                                    :title "Notes"
+                                    :rect [40 50 420 300]}))
+        window-id (:surface/focus s)
+        result (input/reduce-events
+                s
+                [{:event/type :pointer/down :x 60 :y 60}
+                 {:event/type :pointer/cancel :x 60 :y 60}
+                 {:event/type :pointer/move :x 400 :y 400}])]
+    (is (= [40 50 420 300]
+           (:window/rect (window (:surface result) window-id)))
+        "a canceled drag must not relocate the window on a later, unrelated move")
+    (is (nil? (get-in result [:input :pointer/capture]))
+        "pointer/cancel must clear :pointer/capture, mirroring pointer/up")))
+
+(deftest pointer-cancel-releases-resize-capture-too
+  (let [s (-> (surface/empty-surface)
+              (surface/open-window {:app-id "term"
+                                    :title "Terminal"
+                                    :rect [10 10 200 120]}))
+        window-id (:surface/focus s)
+        result (input/reduce-events
+                s
+                [{:event/type :pointer/down :x 205 :y 125}
+                 {:event/type :pointer/cancel :x 205 :y 125}
+                 {:event/type :pointer/move :x 500 :y 500}])]
+    (is (= [10 10 200 120]
+           (:window/rect (window (:surface result) window-id)))
+        "a canceled resize must not resize the window on a later, unrelated move")))
+
+(deftest keyboard-and-text-input-target-focused-window
+  (let [s (-> (surface/empty-surface)
+              (surface/open-window {:app-id "editor" :title "Editor"}))
+        window-id (:surface/focus s)
+        result (input/reduce-events
+                s
+                [{:capability "keyboard/key" :key "Enter"}
+                 {:capability "keyboard/type" :text "hello"}])
+        focused (window (:surface result) window-id)]
+    (is (= "hello" (:window/text-buffer focused)))
+    (is (= [{:event :keyboard/key :window-id window-id :key "Enter"}
+            {:event :text/input :window-id window-id :text "hello"}]
+           (get-in result [:surface :surface/input-log])))))
+
+(deftest pointer-wheel-scrolls-window-under-pointer
+  (let [s (-> (surface/empty-surface)
+              (surface/open-window {:app-id "a" :title "A" :rect [0 0 100 100]})
+              (surface/open-window {:app-id "b" :title "B" :rect [120 0 100 100]}))
+        first-id (-> s :surface/windows first :window/id)
+        second-id (-> s :surface/windows second :window/id)
+        result (input/reduce-events
+                s
+                [{:capability "pointer/wheel" :x 10 :y 10 :delta-y 24}
+                 {:event/type :pointer/wheel :x 125 :y 5 :delta-x 3 :delta-y 7}])]
+    (is (= [0 24] (:window/scroll (window (:surface result) first-id))))
+    (is (= [3 7] (:window/scroll (window (:surface result) second-id))))
+    (is (= [{:action :window/scroll :window-id first-id :delta-x 0 :delta-y 24 :x 10 :y 10}
+            {:action :window/scroll :window-id second-id :delta-x 3 :delta-y 7 :x 125 :y 5}]
+           (:actions result)))
+    (is (= [{:event :window/scroll :window-id first-id :delta-x 0 :delta-y 24}
+            {:event :window/scroll :window-id second-id :delta-x 3 :delta-y 7}]
+           (get-in result [:surface :surface/input-log])))))
+
+(deftest keyboard-editing-keys-drive-focused-text-model
+  (let [s (-> (surface/empty-surface)
+              (surface/open-window {:app-id "editor" :title "Editor"}))
+        window-id (:surface/focus s)
+        result (input/reduce-events
+                s
+                [{:capability "keyboard/type" :text "abc"}
+                 {:capability "keyboard/key" :key "ArrowLeft"}
+                 {:capability "keyboard/key" :key "Backspace"}
+                 {:capability "keyboard/type" :text "Z"}])
+        focused (window (:surface result) window-id)]
+    (is (= "aZc" (:window/text-buffer focused)))
+    (is (= 2 (get-in focused [:window/text :text/caret])))
+    (is (= [:text/input :keyboard/key :text/edit :keyboard/key :text/edit :text/input]
+           (mapv :action (:actions result))))))
+
+(deftest keyboard-selection-delete-home-end-and-select-all-drive-focused-text-model
+  (let [s (-> (surface/empty-surface)
+              (surface/open-window {:app-id "editor" :title "Editor"}))
+        window-id (:surface/focus s)
+        result (input/reduce-events
+                s
+                [{:capability "keyboard/type" :text "abcdef"}
+                 {:capability "keyboard/key" :key "Home"}
+                 {:capability "keyboard/key" :key "ArrowRight" :shift? true}
+                 {:capability "keyboard/key" :key "ArrowRight" :shift? true}
+                 {:capability "keyboard/key" :key "Delete"}
+                 {:capability "keyboard/key" :key "End" :shift? true}
+                 {:capability "keyboard/type" :text "Z"}
+                 {:capability "keyboard/key" :key "a" :ctrl? true}
+                 {:capability "keyboard/type" :text "done"}])
+        focused (window (:surface result) window-id)]
+    (is (= "done" (:window/text-buffer focused)))
+    (is (= [4 4] (get-in focused [:window/text :text/selection])))
+    (is (some #(and (= :text/edit (:action %))
+                    (= :select-all (:text/op %)))
+              (:actions result)))))
+
+(deftest dom-and-aiueos-events-normalize-to-same-vocabulary
+  (is (= {:event/type :pointer/click :x 4 :y 5}
+         (input/normalize-event {:event/type :dom/click :x 4 :y 5})))
+  (is (= {:event/type :text/input :text "aiueos"}
+         (input/normalize-event {:event/type :dom/input :value "aiueos"})))
+  (is (= {:event/type :pointer/move :x 7 :y 8}
+         (input/normalize-event {:aiueos/capability "pointer/move" :x 7 :y 8})))
+  (is (= {:event/type :pointer/down
+          :x 7
+          :y 8
+          :button 1
+          :pointerId 9
+          :pointerType "pen"
+          :isPrimary true
+          :pressure 0.5}
+         (input/normalize-event {:aiueos/capability "pointer/down"
+                                 :x 7
+                                 :y 8
+                                 :button 1
+                                 :pointerId 9
+                                 :pointerType "pen"
+                                 :isPrimary true
+                                 :pressure 0.5})))
+  (is (= {:event/type :pointer/up
+          :x 7
+          :y 8
+          :button 0
+          :pointer-id 3
+          :pointer-type "touch"
+          :is-primary? false}
+         (input/normalize-event {:capability "pointer/up"
+                                 :x 7
+                                 :y 8
+                                 :pointer-id 3
+                                 :pointer-type "touch"
+                                 :is-primary? false})))
+  (is (= {:event/type :pointer/cancel
+          :x 9
+          :y 10
+          :pointerId 12
+          :pointerType "touch"
+          :isPrimary true}
+         (input/normalize-event {:capability "pointer/cancel"
+                                 :x 9
+                                 :y 10
+                                 :pointerId 12
+                                 :pointerType "touch"
+                                 :isPrimary true})))
+  (is (= {:event/type :pointer/wheel :x 7 :y 8 :delta-x 0 :delta-y 12}
+         (input/normalize-event {:aiueos/capability "pointer/wheel"
+                                 :x 7
+                                 :y 8
+                                 :delta-y 12})))
+  (is (= {:event/type :key/down :key "ArrowRight" :shift? true :ctrl? true}
+         (input/normalize-event {:capability "keyboard/key"
+                                 :key "ArrowRight"
+                                 :shift? true
+                                 :ctrl? true}))))
+
+;; ---- normalize-event's "keyboard/key" branch must forward :alt?/:repeat?
+;; too, not just :shift?/:ctrl?/:meta? ----
+;;
+;; Real bug this guards: document-input's own key-event builder already
+;; fully supports :alt?/:repeat? (checks (contains? event :alt?)/:repeat?
+;; to set a dispatched KeyboardEvent's real altKey/repeat fields), but
+;; this branch silently dropped both -- a real Alt-modified keypress or a
+;; real OS-level key-repeat (a held-down key) reached a page's own
+;; addEventListener('keydown', ...) listener with altKey/repeat always
+;; false, regardless of what the host actually reported. Confirmed via
+;; direct REPL reproduction before touching source.
+
+(deftest normalize-event-keyboard-key-forwards-alt-and-repeat
+  (is (= {:event/type :key/down :key "a" :alt? true}
+         (input/normalize-event {:capability "keyboard/key" :key "a" :alt? true})))
+  (is (= {:event/type :key/down :key "a" :repeat? true}
+         (input/normalize-event {:capability "keyboard/key" :key "a" :repeat? true})))
+  (is (= {:event/type :key/down :key "a" :shift? true :ctrl? true :meta? true
+          :alt? true :repeat? true}
+         (input/normalize-event {:capability "keyboard/key" :key "a"
+                                 :shift? true :ctrl? true :meta? true
+                                 :alt? true :repeat? true}))
+      "all five modifiers/repeat must compose together")
+  (is (= {:event/type :key/down :key "a"}
+         (input/normalize-event {:capability "keyboard/key" :key "a" :alt? false :repeat? false}))
+      "regression guard: an explicit false must NOT be forwarded, mirroring shift?/ctrl?/meta?'s existing convention"))

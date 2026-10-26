@@ -1,0 +1,247 @@
+(ns browser.compat.quickjs-worker-smoke-test
+  "Real, dual-context Worker execution proof: `new Worker(url)` in a page's
+  real `<script>` tag causes `url`'s real script source to be REALLY
+  EXECUTED inside a SECOND, real, independent QuickJS context (NOT the
+  page's own context -- see `browser.compat.quickjs-wasm/create-worker-context`),
+  with a real bidirectional `postMessage` round trip proven by a real,
+  committed `document.title`.
+
+  ## Why this needed a JVM/CLJS split (see `test/browser/net_worker_test.cljk`)
+
+  Real Worker execution has two real halves: (1) really fetching the
+  worker's script source (an ordinary `:fetch-fn` HTTP capability, no
+  QuickJS engine involved at all), and (2) really running that source
+  inside a second, real QuickJS VM (needs a real engine). This repo's real,
+  synchronous `:fetch-fn` only exists on the JVM
+  (`browser.net.http/fetch-fn`); this repo's real QuickJS engine only runs
+  in `:cljs` (`browser.compat.quickjs-wasm/engine!` -- the JVM `:clj`
+  branch is a stub with `:invoke nil`, no real second context to offer at
+  all). Neither platform has BOTH halves for real at once. `net_worker_test.clj`
+  proves half (1) for real (a real local HTTP server, real fetched bytes)
+  plus the WIRING into `apply-capability`, using a fake `:worker-fn` test
+  double standing in for half (2) (exactly the way `net_websocket_test.clj`
+  already uses a fake `:engine` to prove real socket wiring without a real
+  QuickJS VM). THIS test proves half (2) for real -- the genuinely novel,
+  hard part: a worker's script really executing in a real, second,
+  independent QuickJS context, with real `self`/`postMessage`/`onmessage`.
+
+  For fetching the worker script's real bytes here, this test starts a
+  REAL local Node `http` server (mirroring `quickjs_websocket_smoke_test.cljs`'s
+  real Node `net`+`crypto` server) and performs a REAL `http.get` against
+  it -- genuine loopback TCP, genuine HTTP response. That fetch is
+  necessarily done ASYNCHRONOUSLY, ahead of running the page script (this
+  repo's `:fetch-fn` contract is synchronous end-to-end -- see
+  `browser.net.http`'s own `:cljs` branch docstring for why a real,
+  synchronous CLJS HTTP client does not exist in this repo yet): the
+  `:fetch-fn` this test injects is a thin synchronous wrapper around that
+  ALREADY-real-fetched response, not a second, separate fabrication. The
+  real network fetch this test's OWN worker script goes through is exactly
+  as real as `net_worker_test.clj`'s -- only the synchronous/async bridging
+  differs, for the reason above.
+
+  ## What is genuinely real here
+
+  - `worker-echo-server` is a REAL Node `http` server serving REAL bytes
+    for a real minimal worker script
+    (`self.onmessage = function(e) { self.postMessage(e.data * 2); };`).
+  - `new Worker(url)` really fetches (see above) and really evaluates that
+    real source in a brand-new, real, independent QuickJS context
+    (`quickjs-wasm/create-worker-context` -- its own `newRuntime`/
+    `newContext`, NOT the page's `context-atom`), with a real, minimal
+    `self`/`postMessage`/`onmessage` global scope
+    (`quickjs-wasm/worker-global-scope-source`), auto-derived onto the
+    session with zero extra wiring by this test
+    (`quickjs-wasm/worker-fn engine` -- see `quickjs-runner/run-script!`).
+  - `w.postMessage(21)` on the MAIN thread genuinely, synchronously invokes
+    the worker's real, still-registered `self.onmessage` inside the SECOND
+    context as part of `apply-capability` processing that very request (no
+    real wall-clock wait needed, unlike WebSocket -- see
+    `quickjs-execution/worker-create-result`'s docstring for exactly why);
+    the worker script's own `self.postMessage(e.data * 2)` call is real
+    execution producing a real `42`.
+  - Delivering that real `42` into the MAIN thread's `w.onmessage` is
+    deliberately deferred to the NEXT script tag's snapshot install
+    (`quickjs-execution/worker-snapshot`), mirroring WebSocket's
+    never-same-tick delivery discipline -- this test asserts
+    `document.title` is STILL unset immediately after script 1 (proving
+    delivery genuinely did not happen synchronously within that script's
+    own run) and only becomes `\"42\"` after script 2."
+  (:require ["http" :as http]
+            [cljs.test :refer [deftest is async]]
+            [browser.compat.quickjs-runner :as quickjs-runner]
+            [browser.compat.quickjs-wasm :as quickjs-wasm]
+            [browser.origin :as origin]
+            [browser.profile :as profile]
+            [browser.session :as session]
+            [kotoba.wasm.host :as host]))
+
+;; ---------------------------------------------------------------------
+;; A REAL, minimal local HTTP server (Node's built-in `http`, no new
+;; dependency) serving a REAL, minimal worker script.
+;; ---------------------------------------------------------------------
+
+(def worker-script-source
+  "self.onmessage = function(e) { self.postMessage(e.data * 2); };")
+
+(defn- start-server!
+  "Start a real HTTP server bound to loopback on an OS-assigned port.
+   Returns a Promise of {:server server :url \"http://...\"}."
+  []
+  (js/Promise.
+   (fn [resolve _reject]
+     (let [server (.createServer http
+                                  (fn [_req ^js res]
+                                    (.writeHead res 200 #js {"Content-Type" "text/javascript"})
+                                    (.end res worker-script-source)))]
+       (.listen server 0 "127.0.0.1"
+                (fn []
+                  (let [port (.-port (.address server))]
+                    (resolve {:server server
+                              :url (str "http://127.0.0.1:" port "/worker.js")}))))))))
+
+(defn- stop-server!
+  [{:keys [server]}]
+  (.close server))
+
+(defn- real-http-get!
+  "A REAL `http.get` (Node's own built-in client, real loopback TCP)
+   against `url`. Returns a Promise of a browser.net-shaped response map
+   ({:status :body})."
+  [url]
+  (js/Promise.
+   (fn [resolve reject]
+     (-> (.get http url
+               (fn [^js res]
+                 (let [chunks (atom [])]
+                   (.on res "data" (fn [chunk] (swap! chunks conj chunk)))
+                   (.on res "end"
+                        (fn []
+                          (resolve {:status (.-statusCode res)
+                                    :body (.toString (js/Buffer.concat (clj->js @chunks)))}))))))
+         (.on "error" reject)))))
+
+;; ---------------------------------------------------------------------
+;; Real two-script round trip
+;; ---------------------------------------------------------------------
+
+(defn- dispose-engine!
+  [session]
+  (when-let [engine (get-in session [:browser.session/script-engine :script-engine/engine])]
+    (when-let [dispose (:quickjs.engine/dispose engine)]
+      (dispose engine))))
+
+(defn- build-session
+  "Build a session granting `:worker/create` at `url`'s origin, injecting a
+  synchronous `:fetch-fn` that always returns `pre-fetched` (the REAL
+  response this test already fetched for real over a real socket -- see
+  namespace docstring for why the real network fetch has to happen ahead
+  of time here). Deliberately does NOT inject `:browser.session/worker-fn`
+  -- real worker execution here is entirely auto-derived from the real
+  engine once it's ready (see `quickjs-runner/run-script!`), proving that
+  auto-derivation path for real, not just the explicit-override path."
+  [url pre-fetched]
+  (let [profile (-> (profile/new-profile {:id "worker-allowed"})
+                    (profile/grant-permission (origin/origin url) :worker/create))
+        h (host/recording-host)]
+    (session/new-session
+     (quickjs-runner/quickjs-session-opts
+      {:host h
+       :profile profile
+       :fetch-fn (fn [_request] pre-fetched)}))))
+
+(defn- run-script1!
+  "Run the FIRST real <script> tag: create a real Worker (real fetch +
+  real second-context execution), register a real `onmessage`, and really
+  `postMessage` to it. Returns `{:session ... :generation ...}`."
+  [ready-session url]
+  (let [page-session (session/load-html!
+                      ready-session
+                      {:url "kotoba://quickjs-runner/worker-round-trip"
+                       :html "<main></main>"})
+        generation (:browser.session/page-generation page-session)
+        script1 {:script/type :classic
+                 :script/url "kotoba://quickjs-runner/worker-round-trip/script1.js"
+                 :script/generation generation
+                 :script/source
+                 (str "var w = new Worker(" (pr-str url) ");"
+                      "w.onmessage = function(e) { document.title = String(e.data); };"
+                      "w.postMessage(21);")}]
+    {:session (quickjs-runner/run-script! page-session script1)
+     :generation generation}))
+
+(defn- run-script2!
+  "Run the SECOND real <script> tag. Its own source does nothing at all --
+  the real reply the worker's script already, genuinely computed
+  (`21 * 2 = 42`) is delivered into `w`'s real, still-registered
+  `onmessage` automatically while installing THIS eval's snapshot, before
+  script 2's own (empty) source runs."
+  [session generation]
+  (quickjs-runner/run-script!
+   session
+   {:script/type :classic
+    :script/url "kotoba://quickjs-runner/worker-round-trip/script2.js"
+    :script/generation generation
+    :script/source "void 0;"}))
+
+(deftest quickjs-worker-real-second-context-round-trip-across-two-script-tags-test
+  (async done
+    (let [server-atom (atom nil)
+          session-atom (atom nil)
+          fail! (fn [err]
+                  (is false (str "QuickJS WASM engine initialization / worker round trip failed: "
+                                 (or (.-message err) err))))
+          cleanup! (fn []
+                     (dispose-engine! @session-atom)
+                     (when-let [server @server-atom] (stop-server! server))
+                     (done))]
+      (-> (start-server!)
+          (.then (fn [server]
+                   (reset! server-atom server)
+                   (real-http-get! (:url server))))
+          (.then (fn [pre-fetched]
+                   ;; The real worker script's real bytes, fetched for
+                   ;; real over a real loopback socket, before the page
+                   ;; even starts -- see namespace docstring.
+                   (is (= 200 (:status pre-fetched)))
+                   (is (= worker-script-source (:body pre-fetched))
+                       "expected the real HTTP server's real response body")
+                   (let [base-session (build-session (:url @server-atom) pre-fetched)]
+                     (reset! session-atom base-session)
+                     (session/ensure-script-engine! base-session))))
+          (.then (fn [ready-session]
+                   (reset! session-atom ready-session)
+                   (is (= :ready (get-in ready-session [:browser.session/script-engine
+                                                         :script-engine/status]))
+                       "engine should be ready before running page scripts")
+                   (is (fn? (quickjs-wasm/worker-fn
+                             (get-in ready-session [:browser.session/script-engine
+                                                     :script-engine/engine])))
+                       "a real quickjs-wasm engine should auto-expose a real :worker-fn")
+                   (run-script1! ready-session (:url @server-atom))))
+          (.then (fn [{:keys [session generation]}]
+                   (reset! session-atom session)
+                   ;; Real, synchronous, same-evaluate!-call delivery: the
+                   ;; worker's real reply (42) is already computed and
+                   ;; queued host-side by now (no real wall-clock wait
+                   ;; needed, unlike WebSocket) -- but genuinely NOT yet
+                   ;; delivered into the main thread's w.onmessage, proving
+                   ;; the never-same-tick delivery discipline this
+                   ;; namespace's docstring claims.
+                   (let [title (get-in session [:browser.session/page :browser/title])]
+                     (println "worker round-trip: document.title immediately after script 1 ->"
+                              (pr-str title))
+                     (is (not= "42" title)
+                         (str "expected w.onmessage's delivery to still be deferred to script 2's "
+                              "snapshot install -- got the real reply's title already: " (pr-str title))))
+                   (run-script2! session generation)))
+          (.then (fn [final-session]
+                   (reset! session-atom final-session)
+                   (let [title (get-in final-session [:browser.session/page :browser/title])]
+                     (println "worker round-trip: real committed document.title ->" (pr-str title))
+                     (is (= "42" title)
+                         (str "expected script 2's snapshot install to synchronously invoke "
+                              "the real worker's still-registered w.onmessage with the REAL "
+                              "value (21 * 2) the real worker script computed, committing it "
+                              "into document.title -- got " (pr-str title))))))
+          (.catch fail!)
+          (.finally cleanup!)))))
