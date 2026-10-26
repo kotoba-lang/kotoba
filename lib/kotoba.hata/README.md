@@ -2,6 +2,9 @@
 
 2026-10-23 の統合状態: **CLJC の移行入力。canonical Kotoba / Amu selfhost による
 conductor の native closure は未認定**。
+[受付状態機械の Kotoba 実装と残る接続条件](docs/accountable-admission.md)
+（AWAI-95）を追加した。署名・責任資格検証の後段に置く内部 component であり、
+本人確認、通信、永続化、dispatch の完成とは区別する。
 [mon / Cell の区別、全 public API と下から通す gate](docs/native-cell-integration.md) を参照。
 Awai Network 全体では、hata は Itonami node 上または利用者 device 上の conductor を担う。
 mon は網の定義、Cell は mon CID × agent 公開鍵 identity。OCI や配置 node は別の軸。
