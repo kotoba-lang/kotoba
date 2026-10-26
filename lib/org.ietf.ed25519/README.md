@@ -252,3 +252,13 @@ The ClojureScript run takes about four minutes: 768 verifications at roughly
 two scalar multiplications each, and a scalar multiplication is ~150 ms there.
 The JVM suite is seconds. That is the same not-constant-time, not-fast
 reference implementation the note above describes.
+
+## Native authority key profile (AWAI-96)
+
+The monorepo adds `ed25519.selfhost/prime-order-key?`: a 32-byte canonical
+Ed25519 encoding, nonidentity, on-curve and in the prime-order subgroup.
+It reuses the existing native point arithmetic and leaves `verify?` unchanged.
+The [C0 authority gate](../kotoba.hata/docs/authority-and-store.md) exercises
+this profile and the existing five SHA-512/RFC 8032 native test entrypoints,
+plus real signed requests and signature-bypass controls. Public test seeds
+are fixtures only. This extension is not a constant-time or full-audit claim.

@@ -50,7 +50,10 @@ flowchart LR
     L[LLM proposal] --> V
 ```
 
-Only A is implemented here. P's length/queue predicate is available, but no
+The original module implements only A. A subsequent internal C0 verifier and
+single-filesystem store are described in [authority and store](authority-and-store.md);
+their exact qualification and remaining compiler/integration gates are separate.
+Only A is implemented by `hata.admission`. P's length/queue predicate is available, but no
 decoder or listener is installed. V, C, E, receipt signing, issuer federation,
 credential opening and independent-node qualification remain integration gates.
 The LLM cannot change the state machine's rules; prompt filtering is not an

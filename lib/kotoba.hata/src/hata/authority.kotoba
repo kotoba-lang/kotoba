@@ -1,0 +1,110 @@
+(ns hata.authority
+  (:export [verify admit credential-message grant-message coupon-message
+            request-message request-digest grant-digest policy? payload-matches?])
+  (:require [hata.codec :as c] [hata.admission :as ad]
+            [ed25519.selfhost :as ed]))
+
+;; C0 v1 internal fixed frames; exact layout and trust assumptions are in
+;; docs/authority-and-store.md. No issuer key, signature verdict or privilege
+;; is accepted from the application/LLM. Policy is trusted host configuration.
+(defn- same [a :vector-i64 ai :i64 b :vector-i64 bi :i64] :bool
+  (c/equal? (c/slice a ai 4) (c/slice b bi 4)))
+(defn- nonzero [v :vector-i64 i :i64] :bool
+  (not (c/equal? (c/slice v i 4) (vector-i64 0 0 0 0))))
+(defn policy? [p :vector-i64] :bool
+  (and (>= (vector-count p) 112) (= (vector-at p 0) 1)
+       (> (vector-at p 1) 0) (> (vector-at p 2) 0)
+       (>= (vector-at p 3) 0) (> (vector-at p 4) (vector-at p 3))
+       (<= (- (vector-at p 4) (vector-at p 3)) 3600)
+       (>= (vector-at p 5) 0)
+       (or (= (vector-at p 6) 0) (= (vector-at p 6) 1))
+       (>= (vector-at p 7) 0) (<= (vector-at p 7) 64)
+       (= (vector-count p) (+ 112 (* (vector-at p 7) 5)))
+       (nonzero p 8) (nonzero p 12)
+       (ed/prime-order-key? (c/slice p 16 32))
+       (ed/prime-order-key? (c/slice p 48 32))
+       (ed/prime-order-key? (c/slice p 80 32))
+       (not (c/equal? (c/slice p 16 32) (c/slice p 48 32)))
+       (not (c/equal? (c/slice p 16 32) (c/slice p 80 32)))
+       (not (c/equal? (c/slice p 48 32) (c/slice p 80 32)))
+       (loop [i 0] (if (= i (vector-at p 7)) true
+         (let [start (+ 112 (* i 5)) kind (vector-at p start)]
+           (and (>= kind 1) (<= kind 4) (nonzero p (+ start 1)) (recur (+ i 1))))))))
+
+(defn credential-message [p :vector-i64 r :vector-i64] :vector-i64
+  (c/message "awai.c0.credential.v1"
+    (c/append (vector-i64 (vector-at p 5) (vector-at r 2) (vector-at r 4)
+                         (vector-at r 5) (vector-at r 6) (vector-at r 7))
+      (c/append (c/slice r 10 4) (c/slice r 26 8)))))
+(defn grant-message [p :vector-i64 r :vector-i64] :vector-i64
+  (c/message "awai.c0.grant.v1"
+    (c/append (vector-i64 (vector-at p 5))
+      (c/append (c/slice r 1 7)
+        (c/append (c/slice r 10 8) (c/append (c/slice r 26 8) (c/slice r 44 6)))))))
+(defn grant-digest [p :vector-i64 r :vector-i64] :vector-i64
+  (c/digest (grant-message p r)))
+(defn request-digest [r :vector-i64 stable-id :vector-i64 payload-digest :vector-i64] :vector-i64
+  (c/digest (c/message "awai.c0.request-commitment.v1"
+    (c/append stable-id (c/append (c/slice r 0 22)
+      (c/append (c/slice r 26 24) payload-digest))))))
+(defn coupon-message [r :vector-i64 stable-id :vector-i64] :vector-i64
+  (c/message "awai.c0.coupon.v1" (c/append stable-id r)))
+(defn request-message [r :vector-i64 stable-id :vector-i64] :vector-i64
+  (c/message "awai.c0.request-signature.v1" (c/append stable-id r)))
+
+(defn- revoked? [p :vector-i64 r :vector-i64] :bool
+  (loop [i 0]
+    (if (= i (vector-at p 7)) false
+      (let [start (+ 112 (* i 5)) kind (vector-at p start)
+            ri (case kind 1 26 2 30 3 34 18)]
+        (or (same p (+ start 1) r ri) (recur (+ i 1)))))))
+
+(defn- verify-raw [p :vector-i64 r :vector-i64 auth :vector-i64 now :i64] :i64
+  (cond
+    (or (not= (vector-count r) 50) (not= (vector-count auth) 297)
+        (not= (vector-at r 0) 1) (not= (vector-at auth 0) 1)
+        (< (vector-at r 8) 0) (> (vector-at r 8) 1048576)
+        (< (vector-at r 39) 2776)
+        (> (vector-at r 8) (- (vector-at r 39) 2776))
+        (not (nonzero auth 1)) (not (nonzero auth 293)) (not (c/bytes? (c/slice auth 5 288)))) 30
+    (not (policy? p)) 31
+    (or (< now (vector-at p 3)) (>= now (vector-at p 4))
+        (not= (vector-at p 1) (vector-at r 1))
+        (not= (vector-at p 2) (vector-at r 5))
+        (not (same p 8 r 10)) (not (same p 12 r 14))
+        (not (or (= (vector-at r 6) 1)
+                 (and (= (vector-at r 6) 2) (= (vector-at p 6) 1))))
+        (< now (vector-at r 2)) (>= now (vector-at r 3))
+        (>= now (vector-at r 4)) (>= now (vector-at r 7))) 32
+    (revoked? p r) 33
+    :else
+    (let [id (c/slice auth 1 4) pk (c/slice auth 5 32)]
+      (cond
+        (or (not (ed/prime-order-key? pk))
+            (not (c/equal? (c/digest pk) (c/slice r 30 4)))) 34
+        (not (c/equal? (grant-digest p r) (c/slice r 34 4))) 35
+        (not (c/equal? (request-digest r id (c/slice auth 293 4)) (c/slice r 22 4))) 36
+        (not (ed/verify? (c/slice p 16 32) (credential-message p r) (c/slice auth 37 64))) 37
+        (not (ed/verify? (c/slice p 48 32) (grant-message p r) (c/slice auth 101 64))) 38
+        (not (ed/verify? (c/slice p 48 32) (coupon-message r id) (c/slice auth 165 64))) 39
+        (not (ed/verify? pk (request-message r id) (c/slice auth 229 64))) 40
+        :else 0))))
+
+(defn verify [p :vector-i64 r :vector-i64 auth :vector-i64 now :i64] :i64
+  (arena-scope (verify-raw p r auth now)))
+
+;; The effect broker must call this on the actual bounded canonical body before
+;; dispatch. The admission frame commits to its digest; it carries no body.
+(defn payload-matches? [r :vector-i64 auth :vector-i64 body :vector-i64] :bool
+  (and (= (vector-count r) 50) (= (vector-count auth) 297)
+       (>= (vector-at r 8) 0) (<= (vector-at r 8) 1048576)
+       (= (vector-count body) (vector-at r 8)) (c/bytes? body)
+       (arena-scope (c/equal? (c/digest body) (c/slice auth 293 4)))))
+
+(defn admit [s :vector-i64 r :vector-i64 p :vector-i64 auth :vector-i64
+             context :vector-i64] :vector-i64
+  (if (or (= (ad/admission-status s) 10) (not= (vector-count context) 3)) (vector-i64)
+    (let [decision (verify p r auth (vector-at context 0))]
+      (if (= decision 0)
+        (ad/admission-submit s r (vector-at context 0) (vector-at context 1) (vector-at context 2))
+        (vector-assoc! (vector-assoc! (c/slice s 0 (vector-count s)) 7 decision) 8 -1)))))

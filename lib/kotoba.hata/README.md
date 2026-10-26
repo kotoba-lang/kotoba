@@ -5,6 +5,9 @@ conductor の native closure は未認定**。
 [受付状態機械の Kotoba 実装と残る接続条件](docs/accountable-admission.md)
 （AWAI-95）を追加した。署名・責任資格検証の後段に置く内部 component であり、
 本人確認、通信、永続化、dispatch の完成とは区別する。
+[C0 の Native 署名・責任資格検証と署名付き永続化](docs/authority-and-store.md)
+（AWAI-96/97）を後続として追加した。CI は既存 compiler で authority を検証し、
+別の固定ソースから生成する capability project 対応候補で永続化も検証する。
 [mon / Cell の区別、全 public API と下から通す gate](docs/native-cell-integration.md) を参照。
 Awai Network 全体では、hata は Itonami node 上または利用者 device 上の conductor を担う。
 mon は網の定義、Cell は mon CID × agent 公開鍵 identity。OCI や配置 node は別の軸。
