@@ -1,0 +1,203 @@
+#!/usr/bin/env kbb
+;; Gate for the REAL curve25519-sha256 handshake (ssh-v1.edn / ADR-0107). An
+;; independent real-crypto client connects to the kernel over QEMU's inbound
+;; hostfwd, exchanges identification strings and KEXINIT, sends KEX_ECDH_INIT
+;; (Q_C), receives the kernel's KEX_ECDH_REPLY (K_S, Q_S, signature), and then --
+;; the whole point -- re-derives the shared secret and the exchange hash H from
+;; the wire and VERIFIES the ecdsa-sha2-nistp256 host-key signature over H with
+;; Node's own ECDSA. If a different implementation accepts the kernel's reply,
+;; the kernel's kex is real.
+;;
+;; Green iff BOTH: the serial shows AIUEOS_SSH_KEX_REPLY_OK (the kernel reached
+;; reply+newkeys) AND this client verified the signature over H against the
+;; PINNED host key. The marker alone could be a self-report; the client
+;; verification alone could be against any key -- both, against a pinned key, is
+;; the real handshake.
+;;
+;; The client cooperates on segmentation only (the guest RX holds one buffer):
+;; it is receive-driven where it can be, and inserts a short gap between its
+;; KEXINIT and KEX_ECDH_INIT so the guest can post a buffer between them. The
+;; crypto and byte formats are real.
+
+(require '[kotoba.lang.text :as str]
+         '[ssh.transport :as t])
+
+(def fs (js/require "node:fs"))
+(def path (js/require "node:path"))
+(def cp (js/require "node:child_process"))
+(def net (js/require "node:net"))
+(def crypto (js/require "node:crypto"))
+
+(def aiueos (.resolve path (.dirname path *file*) ".."))
+(def repo (.resolve path aiueos ".." ".."))
+(def out (or (.-AIUEOS_OUT js/process.env) (.join path repo "build" "aiueos")))
+(def kernel (.join path out "esp" "EFI" "AIUEOS" "KERNEL.ELF"))
+(def serial-log (.join path out "kernel-serial.log"))
+(def host-port 8022)
+(def client-id "SSH-2.0-realgate")
+
+;; The kernel's PINNED ecdsa-sha2-nistp256 host key public point (net_ssh_kex).
+(def host-x "32b002b8fe6254c0894d2c082429992bd28c0d53b45186ab7906df4118515e35")
+(def host-y "d21a8d3906329b624a31cce2ef7352935a3ed88f5f093e5709572057646eb29f")
+
+(defn- die [& msg] (binding [*out* *err*] (apply println (cons "error:" msg))) (.exit js/process 1))
+(defn- ->buf [v] (js/Buffer.from (js/Uint8Array. (clj->js v))))
+(defn- ->vec [buf] (vec (js/Array.from buf)))
+(defn- hexbuf [h] (js/Buffer.from h "hex"))
+(defn- b64url [v] (.toString (->buf v) "base64url"))
+(defn- sha256 [bytes] (->vec (.digest (.update (.createHash crypto "sha256") (->buf bytes)))))
+
+;; client X25519 ephemeral
+(defn- x25519-keypair []
+  (let [kp (.generateKeyPairSync crypto "x25519")
+        pub (->vec (.subarray (.export (.-publicKey kp) #js {:type "spki" :format "der"}) 12))]
+    {:ko kp :pub pub}))
+(defn- x25519-shared [my-ko peer32]
+  (let [peer (.createPublicKey crypto
+               #js {:key (js/Buffer.concat
+                          (clj->js [(js/Buffer.from #js [0x30 0x2a 0x30 0x05 0x06 0x03 0x2b 0x65 0x6e 0x03 0x21 0x00])
+                                    (->buf peer32)]))
+                    :format "der" :type "spki"})]
+    (->vec (.diffieHellman crypto #js {:privateKey (.-privateKey my-ko) :publicKey peer}))))
+(defn- verify-over-h [x y r s h]
+  (let [pub (.createPublicKey crypto #js {:key #js {:kty "EC" :crv "P-256" :x (b64url x) :y (b64url y)} :format "jwk"})]
+    (.verify crypto "sha256" (->buf h) #js {:key pub :dsaEncoding "ieee-p1363"} (->buf (into r s)))))
+
+;; ── binary packet framing on the wire ────────────────────────────────────────
+(defn- be32 [b o] (+ (* 16777216 (nth b o)) (* 65536 (nth b (+ o 1))) (* 256 (nth b (+ o 2))) (nth b (+ o 3))))
+(defn- wrap-packet [payload]
+  ;; block 8, zero padding (pre-NEWKEYS)
+  (let [plen (count payload)
+        pad (let [p (- 8 (mod (+ 5 plen) 8))] (if (< p 4) (+ p 8) p))
+        pl (+ 1 plen pad)]
+    (->buf (-> (t/u32 pl) (conj pad) (into payload) (into (vec (repeat pad 0)))))))
+(defn- take-string [b] (let [n (be32 b 0)] [(subvec b 4 (+ 4 n)) (subvec b (+ 4 n))]))
+(defn- take-mpint [b] (let [n (be32 b 0) raw (subvec b 4 (+ 4 n))
+                            stripped (vec (drop-while zero? raw))
+                            padded (into (vec (repeat (- 32 (count stripped)) 0)) stripped)]
+                        [padded (subvec b (+ 4 n))]))
+
+;; our client KEXINIT (any valid one; the guest uses the bytes it receives)
+(defn- client-kexinit []
+  (->vec (->buf (t/kexinit-payload (->vec (.randomBytes crypto 16))))))
+(defn- kex-ecdh-init [q-c] (into [30] (t/string-bytes q-c)))
+
+;; ── the pool of overlapping connections (catch the listener's boot window) ───
+(def result (atom {:done false :verified nil :reason nil :banner nil}))
+(def cli-eph (x25519-keypair))
+(def open-sockets (atom []))
+
+(defn- drive [sock]
+  (let [rxbin (atom [])          ; accumulated binary bytes (after the id line)
+        i-c (atom nil)
+        i-s (atom nil)
+        phase (atom :banner)]
+    (.setNoDelay sock true)
+    (letfn [(packets! []
+              ;; pull complete binary packets out of rxbin, return seq of payloads
+              (loop [acc []]
+                (let [b @rxbin]
+                  (if (< (count b) 6) acc
+                    (let [pl (be32 b 0) padl (nth b 4)]
+                      (if (< (count b) (+ 4 pl)) acc
+                        (let [payload (subvec b 5 (+ 5 (- pl padl 1)))]
+                          (reset! rxbin (subvec b (+ 4 pl)))
+                          (recur (conj acc payload)))))))))
+            (on-reply [payload]
+              (when (and (not (:done @result)) (= 31 (first payload)))
+                (let [buf (vec (rest payload))
+                      [k-s r1] (take-string buf)
+                      [q-s r2] (take-string r1)
+                      [sig _] (take-string r2)
+                      [_algo ra] (take-string k-s)
+                      [_curve rb] (take-string ra)
+                      [point _] (take-string rb)
+                      px (subvec point 1 33) py (subvec point 33 65)
+                      [_salgo sa] (take-string sig)
+                      [inner _] (take-string sa)
+                      [rv ia] (take-mpint inner)
+                      [sv _] (take-mpint ia)
+                      k (x25519-shared (:ko cli-eph) q-s)
+                      h (t/exchange-hash sha256
+                          {:v-c client-id :v-s "SSH-2.0-aiueos_0.1"
+                           :i-c @i-c :i-s @i-s :k-s k-s :q-c (:pub cli-eph) :q-s q-s :k k})
+                      pinned (and (= px (->vec (hexbuf host-x))) (= py (->vec (hexbuf host-y))))
+                      ok (verify-over-h px py rv sv h)]
+                  (swap! result assoc :done true
+                         :verified (boolean (and ok pinned))
+                         :reason (cond (not pinned) "host key point does not match the pinned key"
+                                       (not ok) "signature did not verify over H"
+                                       :else "verified"))
+                  (js/setTimeout (fn [] (doseq [s @open-sockets] (try (.destroy s) (catch :default _ nil)))) 400))))
+            (on-binary []
+              (doseq [p (packets!)]
+                (case @phase
+                  :kexinit (when (= 20 (first p))
+                             (reset! i-s p)
+                             (reset! phase :reply)
+                             (.write sock (wrap-packet @i-c))
+                             ;; Gap so the guest (one-buffer RX) can consume I_C,
+                             ;; ACK it, and re-post a buffer before KEX_ECDH_INIT
+                             ;; arrives. Generous for slow TCG under load.
+                             (js/setTimeout
+                              (fn [] (.write sock (wrap-packet (kex-ecdh-init (:pub cli-eph))))) 600))
+                  :reply (on-reply p)
+                  nil)))]
+      (.on sock "data"
+           (fn [d]
+             (cond
+               (= :banner @phase)
+               (let [s (.toString d "utf8")]
+                 (when (str/includes? s "\n")
+                   (let [line (first (str/split s #"\r?\n"))]
+                     (swap! result assoc :banner line)
+                     (reset! i-c (client-kexinit))
+                     (reset! phase :kexinit)
+                     (.write sock (str client-id "\r\n"))
+                     ;; any bytes after the id line are binary (rare); keep them
+                     (let [nl (.indexOf (.toString d "latin1") "\n")
+                           rest-bytes (when (>= nl 0) (->vec (.subarray d (inc nl))))]
+                       (when (seq rest-bytes) (swap! rxbin into rest-bytes) (on-binary))))))
+               :else
+               (do (swap! rxbin into (->vec d)) (on-binary)))))
+      (.on sock "error" (fn [_] (try (.destroy sock) (catch :default _ nil))))
+      (.on sock "timeout" (fn [] (try (.destroy sock) (catch :default _ nil)))))))
+
+(defn- open-one []
+  (when-not (:done @result)
+    (let [sock (.connect net #js {:host "127.0.0.1" :port host-port})]
+      (swap! open-sockets conj sock)
+      (.setTimeout sock 120000)
+      (drive sock))))
+(defn- pool-tick [] (when-not (:done @result) (open-one) (js/setTimeout pool-tick 4000)))
+
+(when-not (.existsSync fs kernel) (die "kernel not built; AIUEOS_SSH_LISTEN=1 build first"))
+(when-not (str/includes? (.toString (.readFileSync fs kernel)) "AIUEOS_SSH_KEX_REPLY_OK")
+  (die "kernel has no real-kex marker; rebuild with AIUEOS_SSH_LISTEN=1"))
+
+(js/setTimeout pool-tick 5000)
+(println "AIUEOS_SSH_REAL_GATE booting; client verifies the kex over" host-port)
+;; smoke-qemu-uefi.sh ALWAYS rebuilds the kernel (build-uefi.sh), inheriting this
+;; env -- so AIUEOS_SSH_LISTEN=1 MUST be here or the rebuild drops net_ssh_kex and
+;; the boot runs a non-SSH kernel (measured: every SSH marker absent).
+(def env (doto (js/Object.assign #js {} js/process.env)
+           (aset "AIUEOS_SSH_LISTEN" "1")
+           (aset "AIUEOS_TEST_NET" "1")
+           (aset "AIUEOS_SSH_HOSTFWD" (str host-port))))
+(def child (.spawn cp (.join path aiueos "scripts" "smoke-qemu-uefi.sh") #js [] #js {:stdio "inherit" :env env}))
+(.on child "exit"
+     (fn [code _]
+       (let [serial (if (.existsSync fs serial-log) (str/replace (.readFileSync fs serial-log "utf8") "\r" "") "")
+             kernel-ok (str/includes? serial "AIUEOS_SSH_KEX_REPLY_OK")
+             {:keys [verified reason banner]} @result]
+         (println "AIUEOS_SSH_REAL_GATE boot-exit code=" code)
+         (println "AIUEOS_SSH_REAL_GATE kernel-marker=" (if kernel-ok "AIUEOS_SSH_KEX_REPLY_OK" "absent"))
+         (println "AIUEOS_SSH_REAL_GATE client-banner=" (pr-str banner))
+         (println "AIUEOS_SSH_REAL_GATE client-verified=" (pr-str verified) "reason=" (pr-str reason))
+         (when-not kernel-ok
+           (println "AIUEOS_SSH_REAL_GATE kex-line="
+                    (pr-str (->> (str/split-lines serial) (filter #(str/includes? % "AIUEOS_SSH_KEX")) last))))
+         (if (and kernel-ok verified)
+           (println "AIUEOS_SSH_REAL_SMOKE_OK an independent client verified the kernel's ecdsa-sha2-nistp256 signature over H (real curve25519-sha256 handshake)")
+           (do (println "AIUEOS_SSH_REAL_SMOKE_FAIL kernel-ok=" kernel-ok "verified=" verified "reason=" reason)
+               (.exit js/process 1))))))

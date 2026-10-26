@@ -1,0 +1,190 @@
+#!/usr/bin/env kbb
+;; Build the desktop IME's kana-kanji dictionary (ADR-0235) from Unicode's
+;; Unihan readings, for every kanji the desktop font carries.
+;;
+;;   kbb --backend sci os/aiueos/scripts/gen-ime-dictionary.cljk <Unihan-dir> <font.fnt> <out.dic>
+;;   kbb --backend sci os/aiueos/scripts/gen-ime-dictionary.cljk --check <Unihan-dir> <font.fnt> <out.dic>
+;;
+;; <Unihan-dir> is Unihan.zip of Unicode 17.0.0 unpacked
+;; (https://www.unicode.org/Public/17.0.0/ucd/Unihan.zip); two of its files
+;; are read.
+;;
+;; SOURCE: the `kJapanese` field of Unihan_Readings.txt (Unicode 17.0,
+;; Unicode License v3): each kanji's Japanese readings in kana, on readings in
+;; katakana and kun readings in hiragana, in the order Unihan lists them.
+;; `kJapaneseOn` / `kJapaneseKun` carry the same readings in romaji and fewer
+;; of them (U+4E0B: kJapanese has 14, the two romaji fields 5); kana needs no
+;; romanisation to undo, so this reads kJapanese. `kJoyoKanji` and
+;; `kJinmeiyoKanji` of Unihan_OtherMappings.txt (same license) name the
+;; Jouyou and Jinmeiyou kanji for the candidate order.
+;;
+;; WHICH KANJI: every code point of the font (os/aiueos/fonts/aiueos-16.fnt)
+;; that JIS X 0208 places in rows 16..84 -- the kanji the desktop can draw.
+;;
+;; READINGS: katakana folds to hiragana (U+30A1..U+30F6 minus 0x60), because
+;; the IME composes hiragana. A reading that is not all hiragana after the
+;; fold is left out and counted. Unihan does not mark where a kun reading's
+;; okurigana starts, so a kun reading is a whole word (くわえる) and its
+;; candidate is the kanji alone.
+;;
+;; CANDIDATE ORDER, the rule, for one reading:
+;;   1. the kanji's tier: Jouyou (kJoyoKanji), then Jinmeiyou
+;;      (kJinmeiyoKanji), then the rest of JIS X 0208 level 1 (rows 16..47),
+;;      then level 2 (rows 48..84);
+;;   2. where the reading stands in the kanji's own kJapanese list (the
+;;      reading Unihan lists first is the kanji's first reading);
+;;   3. code point.
+;; JIS row/cell is not a tiebreak: level 1 is ordered by each kanji's
+;; representative reading, so for か it put 渦 (うず) first.
+;; A kanji whose on and kun readings fold to the same kana is one candidate,
+;; at its earlier position.
+;;
+;; FORMAT `aiueos-dict/v1`, little-endian u32 words:
+;;   0  magic 0x44554941 ("AIUD")   1  version 1   2  readings N   3  words W
+;;   4 + i   word offset of reading i's record; records sorted by reading
+;;           (code point by code point, a prefix before what it prefixes), so
+;;           a reader can binary-search them
+;;   record  L, L reading code points, C, C candidate code points
+;;
+;; Exit 0 wrote (or --check: the file on disk is byte-identical to what this
+;; would write), 1 --check differs, 2 could not run (unreadable input, no
+;; kJapanese line, an empty dictionary).
+(ns gen-ime-dictionary
+  (:require [kotoba.lang.text :as str]
+            ["node:fs" :as fs]))
+
+(defn- die [code msg]
+  (.error js/console msg)
+  (.exit js/process code))
+
+(def ^:private args
+  (let [a (vec *command-line-args*)] (if (= "--" (first a)) (subvec a 1) a)))
+(def ^:private check? (= "--check" (first args)))
+(def ^:private paths (if check? (subvec args 1) args))
+(def ^:private unihan-path (get paths 0))
+(def ^:private font-path (get paths 1))
+(def ^:private out-path (get paths 2))
+
+(when-not (and unihan-path font-path out-path)
+  (die 2 "usage: gen-ime-dictionary.cljk [--check] <Unihan-dir> <font.fnt> <out.dic>"))
+
+(defn- read-or-die [path what]
+  (try (.readFileSync fs path)
+       (catch :default e (die 2 (str "COULD-NOT-RUN " what " " path ": " e)))))
+
+(defn- kanji-kuten
+  "code point -> [row cell] for JIS X 0208 rows 16..84, decoded with the
+  host's own EUC-JP decoder (make-font.cljk does the same, so no hand table)."
+  []
+  (let [dec (js/TextDecoder. "euc-jp" #js {:fatal true})]
+    (into {}
+          (for [row (range 16 85)
+                cell (range 1 95)
+                :let [s (try (.decode dec (js/Uint8Array. #js [(+ row 0xa0) (+ cell 0xa0)]))
+                             (catch :default _ nil))]
+                :when (and s (= 1 (count (js/Array.from s))))]
+            [(.codePointAt s 0) [row cell]]))))
+
+(defn- font-code-points [buf]
+  (when (or (< (.-length buf) 16) (not= 0x46554941 (.readUInt32LE buf 0)))
+    (die 2 (str "COULD-NOT-RUN font " font-path ": not aiueos-font/v1")))
+  (let [n (.readUInt32LE buf 8)]
+    (set (for [i (range n)] (bit-and (.readUInt32LE buf (+ 16 (* 4 i))) 16777215)))))
+
+(defn- cps [s] (mapv #(.codePointAt % 0) (js/Array.from s)))
+
+(defn- fold [cp] (if (<= 0x30a1 cp 0x30f6) (- cp 0x60) cp))
+
+(defn- hiragana? [cp] (<= 0x3041 cp 0x3096))
+
+(def ^:private kuten (kanji-kuten))
+(def ^:private in-font (font-code-points (read-or-die font-path "font")))
+
+(def ^:private kanji
+  ;; code point -> kuten, the kanji the dictionary may name
+  (into {} (filter (fn [[cp _]] (contains? in-font cp)) kuten)))
+
+(def ^:private unihan-text (str (read-or-die (str unihan-path "/Unihan_Readings.txt") "Unihan")))
+
+(def ^:private tier-of
+  ;; code point -> 0 Jouyou, 1 Jinmeiyou (the rest fall to 2 / 3 by JIS level)
+  (reduce (fn [m line]
+            (let [[u field] (str/split line #"\t")
+                  cp (when (str/starts-with? (str u) "U+") (js/parseInt (subs u 2) 16))]
+              (cond (= field "kJoyoKanji") (assoc m cp 0)
+                    (and (= field "kJinmeiyoKanji") (not (contains? m cp))) (assoc m cp 1)
+                    :else m)))
+          {}
+          (str/split-lines (str (read-or-die (str unihan-path "/Unihan_OtherMappings.txt") "Unihan")))))
+
+(def ^:private kjapanese
+  ;; code point -> readings in Unihan's order
+  (into {}
+        (for [line (str/split-lines unihan-text)
+              :let [[u field value] (str/split line #"\t")]
+              :when (= field "kJapanese")
+              :let [cp (js/parseInt (subs u 2) 16)]
+              :when (contains? kanji cp)]
+          [cp (str/split value #" ")])))
+
+(when (empty? kjapanese)
+  (die 2 (str "COULD-NOT-RUN " unihan-path ": no kJapanese line for a font kanji")))
+
+(def ^:private dropped (atom 0))
+
+(def ^:private entries
+  ;; reading (vector of code points) -> sorted candidate code points
+  (let [pairs (for [[cp readings] kjapanese
+                    [pos r] (map-indexed vector readings)
+                    :let [k (mapv fold (cps r))]
+                    :when (or (every? hiragana? k) (do (swap! dropped inc) false))]
+                [k cp pos])
+        by-reading (group-by first pairs)]
+    (into (sorted-map-by (fn [a b] (compare (vec a) (vec b))))
+          (for [[k ps] by-reading
+                :let [best (reduce (fn [m [_ cp pos]] (update m cp #(min (or % pos) pos))) {} ps)
+                      order (sort-by (fn [[cp pos]]
+                                       (let [[row _] (kanji cp)]
+                                         [(or (tier-of cp) (if (<= row 47) 2 3)) pos cp]))
+                                     best)]]
+            [k (mapv first order)]))))
+
+(defn- lex [a b]
+  ;; code point by code point, a prefix before what it prefixes
+  (let [n (min (count a) (count b))
+        d (first (remove zero? (map compare (subvec a 0 n) (subvec b 0 n))))]
+    (or d (compare (count a) (count b)))))
+
+(def ^:private sorted-entries (sort (fn [[a _] [b _]] (lex a b)) entries))
+
+(def ^:private words
+  (let [n (count sorted-entries)
+        records (map (fn [[k cands]] (vec (concat [(count k)] k [(count cands)] cands))) sorted-entries)
+        offsets (reductions + (+ 4 n) (map count records))
+        body (vec (concat (take n offsets) (apply concat records)))
+        total (+ 4 (count body))]
+    (vec (concat [0x44554941 1 n total] body))))
+
+(when (< (count words) 5) (die 2 "COULD-NOT-RUN the dictionary is empty"))
+
+(def ^:private out
+  (let [buf (js/Buffer.alloc (* 4 (count words)))]
+    (doseq [[i v] (map-indexed vector words)] (.writeUInt32LE buf v (* 4 i)))
+    buf))
+
+(def ^:private summary
+  (str "kanji=" (count kanji) " with-readings=" (count kjapanese)
+       " readings=" (count sorted-entries)
+       " pairs=" (reduce + (map (comp count second) sorted-entries))
+       " dropped-readings=" @dropped
+       " longest-reading=" (apply max (map (comp count first) sorted-entries))
+       " most-candidates=" (apply max (map (comp count second) sorted-entries))
+       " bytes=" (.-length out)))
+
+(if check?
+  (let [have (try (.readFileSync fs out-path) (catch :default _ nil))]
+    (if (and have (zero? (.compare out have)))
+      (do (println (str "OK " out-path " " summary)) (.exit js/process 0))
+      (do (println (str "DIFFERS " out-path " " summary)) (.exit js/process 1))))
+  (do (.writeFileSync fs out-path out)
+      (println (str "WROTE " out-path " " summary))))

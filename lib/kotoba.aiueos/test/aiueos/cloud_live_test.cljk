@@ -1,0 +1,293 @@
+(ns aiueos.cloud-live-test
+  "The gate's decision rule, and the policy it ships with.
+
+  Nothing here touches the network. A gate whose exit code can only be
+  exercised by running it against the internet is a gate whose exit code is not
+  checked -- and the exit code is the whole product: it is what a person or a
+  script reads to decide whether something is wrong."
+  (:require [kotoba.bytes :as kbytes] [grant.cloud :as cloud]
+            [aiueos.cloud-live :as live]
+            [aiueos.provider.cloud :as provider]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]))
+
+;; -- three values, and the order they take precedence in -------------------
+
+(deftest a-check-that-could-not-run-does-not-return-the-value-of-one-that-did
+  (is (= 0 (live/exit-code [{:leg :a :outcome :admitted} {:leg :b :outcome :admitted}])))
+  (is (= 3 (live/exit-code [{:leg :a :outcome :admitted} {:leg :b :outcome :unmeasured}]))
+      "one leg with no answer is not a pass")
+  (is (= 1 (live/exit-code [{:leg :a :outcome :admitted} {:leg :b :outcome :refused}])))
+  (is (= 3 (live/exit-code []))
+      "a gate that ran nothing has not passed"))
+
+(deftest a-refusal-is-never-hidden-behind-a-leg-that-was-skipped
+  (is (= 1 (live/exit-code [{:leg :a :outcome :unmeasured} {:leg :b :outcome :refused}]))
+      "if both happen, the one that says something is wrong wins"))
+
+;; -- what counts as which ------------------------------------------------
+
+(deftest a-rejected-pin-is-a-refusal-even-though-it-arrives-as-a-fault
+  (is (= :refused (live/outcome-of {:aiueos/decision :deny
+                                    :aiueos.cloud/reason :peer-not-pinned
+                                    :aiueos.provider.cloud/error :peer-not-pinned}))
+      "a failed handshake is an I/O exception; reporting the single most
+       important negative this repository has as could-not-answer would be a
+       shrug")
+  (is (= :refused (live/outcome-of {:aiueos/decision :deny
+                                    :aiueos.cloud/reason :response-unmeasured
+                                    :aiueos.provider.cloud/error :peer-not-pinned}))
+      "and this is the shape the inference leg actually produces: the handshake
+       failed, so the decision layer never saw a status and said
+       :response-unmeasured, while the provider knew the peer was refused.
+       Reading the reason first made the gate exit 3 for a bad pin -- measured
+       2026-08-22, and the reason this assertion exists")
+  (is (= :unmeasured (live/outcome-of {:aiueos/decision :deny
+                                       :aiueos.provider.cloud/error :request-failed}))
+      "a timeout really is could-not-answer")
+  (is (= :unmeasured (live/outcome-of {:aiueos/decision :deny
+                                       :aiueos.cloud/reason :response-unmeasured})))
+  (is (= :admitted (live/outcome-of {:aiueos/decision :allow})))
+  (is (= :refused (live/outcome-of {:aiueos/decision :deny
+                                    :aiueos.cloud/reason :digest-mismatch}))))
+
+(deftest a-bad-minute-at-the-authority-is-not-the-same-event-as-bad-bytes
+  ;; ADR-0073 left this open and it fired for real: a transient 5xx exited 1,
+  ;; the same code as a digest mismatch, so a caller reading exit 1 as
+  ;; "investigate the pins" occasionally investigated the weather.
+  (let [flaky {:aiueos/decision :deny :aiueos.cloud/reason :response-upstream-fault
+               :aiueos.cloud/status 503}
+        mismatch {:aiueos/decision :deny :aiueos.cloud/reason :digest-mismatch}
+        unauthorized {:aiueos/decision :deny :aiueos.cloud/reason :response-not-ok
+                      :aiueos.cloud/status 401}]
+    (is (= :unmeasured (live/outcome-of flaky))
+        "the request completed and the answer was that the peer could not
+         answer; nothing has been shown to be wrong")
+    (is (= :refused (live/outcome-of mismatch))
+        "while the bytes not being what the CID promised is never retryable")
+    (is (= :refused (live/outcome-of unauthorized))
+        "and a 401 is still the authority saying no, with or without a token")
+    (is (= 3 (live/exit-code [{:leg :a :outcome (live/outcome-of flaky)}])))
+    (is (= 1 (live/exit-code [{:leg :a :outcome (live/outcome-of flaky)}
+                              {:leg :b :outcome (live/outcome-of mismatch)}]))
+        "and a real refusal on another leg is still never hidden behind it")))
+
+(deftest which-refusals-are-unanswerable-is-read-from-the-decision-plane
+  (is (= cloud/unmeasurable-reasons #{:response-unmeasured :response-upstream-fault}))
+  (doseq [r cloud/unmeasurable-reasons]
+    (is (= :unmeasured (live/outcome-of {:aiueos/decision :deny :aiueos.cloud/reason r}))
+        (str r " is declared unanswerable by grant.cloud and must classify as
+             one here; this gate keeps no second list, because two lists drift
+             and the way they drift is that a 503 stays a refusal")))
+  (is (= :refused (live/outcome-of {:aiueos/decision :deny
+                                    :aiueos.cloud/reason :peer-pinned-to-other-host}))
+      "and a host presenting somebody else's key is the opposite of retryable"))
+
+(deftest the-receipt-line-says-which-of-the-two-happened
+  (let [flaky (live/leg-line {:leg :storage-read :outcome :unmeasured
+                              :reason :response-upstream-fault
+                              :measured {:status 503}})
+        mismatch (live/leg-line {:leg :storage-read :outcome :refused
+                                 :reason :digest-mismatch})]
+    (is (str/includes? flaky "UNMEASURED"))
+    (is (str/includes? flaky ":response-upstream-fault")
+        "a person reading the line can tell a bad minute from bad bytes without
+         opening the EDN below it")
+    (is (str/includes? mismatch "REFUSED"))
+    (is (str/includes? mismatch ":digest-mismatch"))
+    (is (not= flaky mismatch))))
+
+(deftest a-negative-leg-passes-only-on-the-refusal-it-expected
+  (let [refused {:aiueos/decision :deny :aiueos.cloud/reason :response-not-ok
+                 :aiueos.cloud/status 404}]
+    (is (= :admitted (live/negative-outcome-of refused :response-not-ok 404)))
+    (is (= :refused (live/negative-outcome-of refused :response-not-ok 410))
+        "a different status is a different fact")
+    (is (= :refused (live/negative-outcome-of {:aiueos/decision :allow} :response-not-ok 404))
+        "if the absent CID is served, the negative leg has to fail -- a negative
+         that cannot fail is decoration")
+    (is (= :unmeasured (live/negative-outcome-of
+                        {:aiueos/decision :deny :aiueos.provider.cloud/error :request-failed}
+                        :response-not-ok 404)))))
+
+;; -- the receipt has to say which happened, in words ----------------------
+
+(deftest a-skipped-leg-and-a-passed-leg-are-distinguishable-in-the-text
+  (let [passed (live/leg-line {:leg :storage-read :outcome :admitted :measured {:status 200}})
+        skipped (live/leg-line {:leg :inference :outcome :unmeasured
+                                :why "no credential: AIUEOS_MURAKUMO_TOKEN is unset"})
+        refused (live/leg-line {:leg :storage-read :outcome :refused
+                                :reason :peer-not-pinned})
+        faulted (live/leg-line {:leg :inference :outcome :refused
+                                :reason :response-unmeasured
+                                :fault :peer-not-pinned})]
+    (is (str/includes? passed "ADMITTED"))
+    (is (str/includes? skipped "UNMEASURED"))
+    (is (str/includes? skipped "no credential"))
+    (is (str/includes? refused "REFUSED"))
+    (is (str/includes? refused ":peer-not-pinned"))
+    (is (str/includes? faulted ":peer-not-pinned")
+        "a refused pin leads with the fault; REFUSED :response-unmeasured would
+         contradict its own first word")
+    (is (not (str/starts-with? (str/trim (subs faulted 24)) ":response-unmeasured")))
+    (is (not= passed skipped))))
+
+;; -- the shipped policy ---------------------------------------------------
+
+(deftest the-live-policy-is-loadable-and-says-what-it-must
+  (let [live (live/read-policy)]
+    (is (map? live) "resources/aiueos/cloud_live.edn is on the classpath")
+    (is (= 1 (:aiueos.cloud-live/version live)))
+    (is (true? (cloud/anchors-declared? live))
+        "a pinning client with no pins is a client that cannot connect")
+    (is (every? #(re-matches #"[0-9a-f]{64}" %) (cloud/trust-anchors live))
+        "a malformed pin can never match a measured key, so it would be a set
+         that partly cannot work while looking entirely valid")
+    (is (false? (:aiueos.cloud/endpoint-from-origin? live))
+        "the fallback exists and is off; turning it on is a decision in the file")))
+
+;; -- the pins are bound to the hosts they were measured from --------------
+
+(deftest the-shipped-policy-cannot-regress-to-a-flat-pin-set
+  (let [live (live/read-policy)
+        bindings (cloud/anchor-bindings live)]
+    (is (= :host-bound (:shape bindings))
+        "a flat set accepts any pinned key from any allowed host; with three
+         hosts in one policy that is an attacker who can answer for one of them
+         answering for all three")
+    (is (true? (:aiueos.cloud/require-host-bound-anchors? live))
+        "and the deployment says so, so an edit that flattened this file would
+         be refused rather than silently weaker")
+    (is (= [] (:malformed bindings)))
+    (testing "every host the gate may reach has pins, and every pin has a host"
+      (doseq [host (:aiueos.policy/net-allow live)]
+        (is (seq (:pins (get (:by-host bindings) host)))
+            (str host " is allowed by the allowlist and has no pin, so the gate"
+                 " would refuse it with :host-not-pinned")))
+      (is (= (set (:aiueos.policy/net-allow live)) (set (keys (:by-host bindings))))
+          "the two lists are the same three hosts, in both directions"))
+    (testing "each binding carries the date it was measured"
+      (doseq [[host b] (:aiueos.cloud/trust-anchors live)]
+        (is (= "2026-08-21" (:measured b)) (str host " has no measurement date"))))))
+
+(deftest one-authoritys-key-is-refused-from-another
+  ;; The whole point of the shape, asserted against the shipped pins rather
+  ;; than invented ones: this is the real key of a real host, offered by a
+  ;; different real host.
+  (let [live (live/read-policy)
+        pins-of (fn [h] (get-in live [:aiueos.cloud/trust-anchors h :pins]))
+        v (cloud/admit-peer live {:spki-sha256 (first (pins-of "api.murakumo.cloud"))
+                                  :host "kotobase.net"})]
+    (is (= :peer-pinned-to-other-host (:aiueos.cloud/reason v)))
+    (is (= ["api.murakumo.cloud"] (:aiueos.cloud/pinned-for v))
+        "and it names whose key it is, which is what makes the refusal
+         actionable rather than merely correct")
+    (is (cloud/allowed? (cloud/admit-peer live {:spki-sha256 (first (pins-of "kotobase.net"))
+                                                :host "kotobase.net"}))
+        "while the right key from the right host is admitted")))
+
+(deftest the-receipt-says-what-it-will-accept-from-whom
+  (let [live (live/read-policy)
+        summary (live/anchor-summary live 1000)]
+    (is (= :host-bound (:shape summary)))
+    (is (= 3 (:pins summary)))
+    (is (= 3 (count (:hosts summary))))
+    (doseq [[host h] (:hosts summary)]
+      (is (= 1 (:pins h)) (str host))
+      (is (= 1 (:usable-now h)) (str host))
+      (is (= :none (:window h))
+          (str host " -- no rotation is in progress, and a receipt that could"
+               " not say so would hide a key that works only because a deadline"
+               " has not passed yet")))
+    (testing "a rotation shows in the summary, and closes by the clock"
+      (let [rotating (assoc-in live [:aiueos.cloud/trust-anchors "kotobase.net"]
+                               {:pins #{(apply str (repeat 64 "b"))}
+                                :previous (get-in live [:aiueos.cloud/trust-anchors
+                                                        "kotobase.net" :pins])
+                                :accept-previous-until-ms 5000})]
+        (is (= :open (get-in (live/anchor-summary rotating 4999) [:hosts "kotobase.net" :window])))
+        (is (= 2 (get-in (live/anchor-summary rotating 4999) [:hosts "kotobase.net" :usable-now])))
+        (is (= :closed (get-in (live/anchor-summary rotating 5001) [:hosts "kotobase.net" :window])))
+        (is (= 1 (get-in (live/anchor-summary rotating 5001) [:hosts "kotobase.net" :usable-now])))
+        (is (= :unevaluated (get-in (live/anchor-summary rotating nil)
+                                    [:hosts "kotobase.net" :window]))
+            "no clock is not the same fact as a window that closed")))))
+
+(deftest the-cids-the-gate-asks-for-are-cids
+  (let [live (live/read-policy)]
+    (doseq [k [:aiueos.cloud-live/read-cid :aiueos.cloud-live/absent-cid
+               :aiueos.cloud-live/write-cid]]
+      (is (some? (cloud/cid-info (get live k))) (str k " does not decode")))
+    (is (= "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+           (:digest-hex (cloud/cid-info (:aiueos.cloud-live/read-cid live))))
+        "the read CID is the empty byte string: the gateway returns 200 with
+         zero bytes and admit-block still has to hash what arrived")
+    (is (= :raw (:codec-name (cloud/cid-info (:aiueos.cloud-live/write-cid live))))
+        "PUT /ipfs/:cid takes raw CIDv1 only")))
+
+(deftest the-write-target-cid-matches-the-bytes-the-gate-would-send
+  (let [live (live/read-policy)
+        digest (:digest-hex (cloud/cid-info (:aiueos.cloud-live/write-cid live)))
+        plan (cloud/plan-block-write live (:aiueos.cloud-live/write-cid live))]
+    (is (cloud/allowed? plan))
+    (is (cloud/allowed?
+         (cloud/admit-write-payload
+          plan
+          (provider/sha256-hex
+           (kbytes/utf8-bytes ^String (:aiueos.cloud-live/write-text live)))))
+        "otherwise the store answers 422 and the operator gets to work out why")
+    (is (= digest (provider/sha256-hex
+                   (kbytes/utf8-bytes ^String (:aiueos.cloud-live/write-text live)))))))
+
+(deftest the-inference-leg-is-configured-so-it-can-actually-answer
+  ;; Three deployment values that each turned a working leg into a false
+  ;; UNMEASURED or a false refusal when they were wrong, all measured
+  ;; 2026-08-22. They are asserted here because the failures they cause are
+  ;; indistinguishable, from the receipt, from the authority being broken.
+  (let [live (live/read-policy)]
+    (is (<= 256 (:aiueos.cloud-live/max-tokens live))
+        "at max_tokens 8 this model spends the whole budget in reasoning_content
+         and returns a 200 carrying content \"\" -- a completion-empty refusal
+         caused by the gate's own request")
+    (is (< 15000 (:aiueos.cloud-live/inference-timeout-ms live))
+        "the provider default is 15s; the same request measured 23s and 56s on a
+         busy fleet, and a timeout that trips on a healthy authority reports
+         UNMEASURED, which reads exactly like an endpoint that is gone")
+    (is (contains? (:aiueos.policy/net-allow live) "infer.murakumo.cloud")
+        "the alias resolves onto a third host and the leg POSTs to it; without
+         the entry there is no admitted endpoint to ask")
+    (is (= #{"014bccd86fa34b2a9dbc410b5d27e60e46fb938cc9c9b77058c567cc4b997038"}
+           (get-in live [:aiueos.cloud/trust-anchors "infer.murakumo.cloud" :pins]))
+        "and its key is pinned like the other two, bound to it and to nothing
+         else, with the date beside it")
+    (is (some? (get-in live [:aiueos.cloud-live/credentials :inference :env]))
+        "the leg attaches a credential when one is present; the variable is
+         named so a receipt can say which one is unset")))
+
+(deftest the-storage-plan-the-gate-would-make-is-allowed-by-the-shipped-policy
+  (let [live (live/read-policy)]
+    (is (cloud/allowed? (cloud/plan-block-read live (:aiueos.cloud-live/read-cid live))))
+    (is (cloud/allowed? (cloud/plan-model-resolve live)))
+    (is (cloud/allowed? (cloud/plan-liveness live)))
+    (testing "and https is not optional in it"
+      (is (nil? (:aiueos.cloud/allow-insecure-origins live))
+          "the loopback exemption belongs to tests, not to the live policy"))))
+
+(deftest a-leg-with-no-credential-reports-the-variable-and-not-a-value
+  ;; A variable nothing sets, rather than the real one: if this test read the
+  ;; real name and someone ran the suite on a machine that had the token, it
+  ;; would open a socket and write a block. A test that behaves differently
+  ;; depending on the operator's environment is not a test.
+  (let [live (assoc (live/read-policy)
+                    :aiueos.cloud-live/credentials
+                    {:write {:env "AIUEOS_TEST_CREDENTIAL_NEVER_SET"
+                             :header "authorization" :prefix "Bearer "}})
+        receipt (live/run-write live)
+        leg (first (:legs receipt))]
+    (is (= 3 (:exit receipt)) "no credential is could-not-answer, never a pass")
+    (is (= :unmeasured (:outcome leg)))
+    (is (str/includes? (:why leg) "AIUEOS_TEST_CREDENTIAL_NEVER_SET")
+        "the receipt names the variable to set, and never a value")
+    (is (= :absent (:credential (:measured leg))))
+    (is (nil? (System/getenv "AIUEOS_TEST_CREDENTIAL_NEVER_SET"))
+        "and the premise of this test is checked rather than assumed")))

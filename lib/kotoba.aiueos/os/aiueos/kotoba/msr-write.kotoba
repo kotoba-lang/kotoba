@@ -1,0 +1,130 @@
+;; Model-specific register, write half.
+;;
+;; The companion to `msr-read`, and the more consequential half: `wrmsr` on the
+;; wrong index is not a wrong answer, it is a changed machine. The three copies
+;; of the assembly this replaces --
+;;
+;;   static void write_msr(uint32_t msr, uint64_t value) {
+;;     __asm__ volatile("wrmsr" : : "c"(msr), "a"((uint32_t)value),
+;;                      "d"((uint32_t)(value >> 32)));
+;;   }
+;;
+;; in apic.c, paging.c and process.c -- would each write any of 2^32 registers.
+;; The admitted set is the SAME five as `msr-read`, and it is repeated here in
+;; full rather than shared, because these are two separately compiled objects
+;; with no way to call each other; the duplication is in the source, and the
+;; list below is the one a reviewer of a write must read.
+;;
+;;   27          0x1b        IA32_APIC_BASE   apic.c:37 -- OR in bit 11, the
+;;                                            xAPIC global enable.
+;;   3221225600  0xc0000080  IA32_EFER        paging.c:140 ORs in bit 11 (NXE);
+;;                                            process.c:127 ORs in bit 0 (SCE).
+;;   3221225601  0xc0000081  IA32_STAR        process.c:128 -- selector pair.
+;;   3221225602  0xc0000082  IA32_LSTAR       process.c:129 -- entry point.
+;;   3221225604  0xc0000084  IA32_FMASK       process.c:130 -- RFLAGS mask.
+;;
+;; 0xc0000083 IA32_CSTAR is again absent from between two admitted neighbours:
+;; nothing in this kernel programs the compatibility-mode syscall target, and a
+;; list derived from "the SYSCALL block" rather than from the call sites would
+;; have let a write to it through. multiboot/entry.S:84 and
+;; ap_trampoline.S:33 keep their own `wrmsr`; both run in 32-bit protected mode
+;; performing the long-mode transition, where there is no 64-bit frame to call
+;; this from.
+;;
+;; WHAT THIS RETURNS -- a status, which is the difference from the read half
+;;
+;; 1 admitted and written, 0 refused and NOT written. A refused index executes
+;; no `wrmsr` at all: the instruction is inside the admitted arm.
+;;
+;; Unlike `msr-read`, this can say no honestly. Its return is a STATUS rather
+;; than a register value, so there is no legal hardware pattern it collides
+;; with -- the value that was written is discarded rather than returned. That
+;; asymmetry is why the read half documents at length that it cannot signal and
+;; this half does not need to: a caller that wants to know whether the machine
+;; was actually changed should call this and test, and every caller in this
+;; tree now does.
+;;
+;; WHY ONLY THE INDEX IS JUDGED, AND NOT THE VALUE
+;;
+;; It would be possible to go further -- to refuse an EFER write that clears
+;; LME, say, since that would triple-fault the machine on the next instruction
+;; fetch. It is not done here, for two reasons.
+;;
+;; The first is scope: the decision this object is meant to carry is "which
+;; registers may this kernel reach", and that is a property of the index. A
+;; per-register value predicate is five different decisions wearing one name,
+;; and each would want its own review.
+;;
+;; The second is the signedness hazard, which is the recurring bug in this
+;; tree and is worth being explicit about. A value predicate means arithmetic
+;; on `value`, and `value` is the one operand whose bit 63 the CALLER (and
+;; ultimately the hardware, since every write here is a read-modify-write of
+;; something `msr-read` returned) controls. `bit-and` against a positive mask
+;; would in fact be safe -- it yields a non-negative result whatever the sign
+;; bit did -- but `quot` would not, and the difference is exactly the trap
+;; `vtd-admit` had to be written around. Declining the whole category is
+;; cheaper than getting each instance right.
+;;
+;; SIGNEDNESS -- why this object is safe for a bit-63 value
+;;
+;;   * THE VALUE IS NEVER EXAMINED. It is bound and passed straight to
+;;     `kernel-write-msr`. No comparison, no mask, no division, no arithmetic
+;;     of any kind touches it, so there is no operation whose behaviour could
+;;     differ between the signed i64 this language has and the `uint64_t` the C
+;;     had. The backend takes it apart with `mov rdx,rax; shr rdx,32` -- a
+;;     LOGICAL shift, so bit 63 lands in bit 31 of the high half rather than
+;;     smearing -- and `wrmsr` reads only `eax`, so the low half needs no
+;;     isolating. A value with bit 63 set, which arrives here as a negative
+;;     i64, is written to the register bit for bit.
+;;
+;;     This matters at every one of the five: IA32_APIC_BASE carries reserved
+;;     bits above the 4 GiB line on large machines, IA32_LSTAR is a full
+;;     canonical 64-bit address whose bit 63 is SET for any kernel mapped in
+;;     the upper half, and EFER and STAR have live high halves. The C reached
+;;     all of them through `(uint32_t)(value >> 32)`; this reaches them through
+;;     an untouched i64.
+;;
+;;   * THE INDEX is compared only with `=` against positive literals, never
+;;     masked or shifted, so the comparison is exact bit equality and
+;;     sign-agnostic. The C passes `uint32_t`, which zero-extends
+;;     non-negative; a negative index -- reachable over this object's i64
+;;     signature though no current caller produces one -- matches none of the
+;;     five and is refused without a `wrmsr`.
+;;
+;; FUEL -- 1 per call, 6 calls per boot, no replenish tier needed
+;;
+;; Deliberately absent from `bounded-memory?` in kotoba-native's elf64.clj, so
+;; no replenish is emitted and it spends from the 512 its own `.data` context
+;; starts with. Measured from the emitted object: exactly two `decq 0x8(%r9)`
+;; sites, one at this function's entry and one at `main`'s, which the kernel
+;; never calls. No helper `defn`, no recursion, no walk -- ONE unit per
+;; invocation on every path, refused included, since the `decq` precedes the
+;; comparison. The `let` costs nothing: it is sequencing, not a call.
+;;
+;; Six calls, on every boot, all from one-shot BSP initialisers:
+;;
+;;   paging.c:140    aiueos_paging_initialize      main.c:331    1 write (NXE)
+;;   apic.c:37       aiueos_apic_timer_initialize  main.c:430    1 write (enable)
+;;   process.c:127-130  syscall_transport_initialize  main.c:709 4 writes
+;;
+;; 6 of 512, a factor of 85 in hand. The SMP path does not multiply it:
+;; `aiueos_ap_entry` in smp.c reads an APIC ID over MMIO and halts, and never
+;; calls `aiueos_apic_timer_initialize`; the AP's own EFER write is the
+;; trampoline's assembly and does not come through here.
+
+(defn aiueos-msr-write [index value]
+  (if (or (= index 27)
+          (= index 3221225600)
+          (= index 3221225601)
+          (= index 3221225602)
+          (= index 3221225604))
+    ;; `let` here is sequencing, not naming: the binding is evaluated exactly
+    ;; once, before the body, so the `wrmsr` happens and its result -- the
+    ;; value the backend leaves in rax -- is deliberately discarded in favour
+    ;; of a status the caller can test.
+    (let [written (kernel-write-msr index value)]
+      1)
+    ;; Refused: no `wrmsr` is executed, and the caller is told so.
+    0))
+
+(defn main [] 0)

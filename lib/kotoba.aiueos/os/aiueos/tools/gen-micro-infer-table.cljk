@@ -1,0 +1,227 @@
+;; Generate os/aiueos/native/micro_infer.kotoba from the frozen transition
+;; matrix in os/aiueos/contracts/micro-infer-transitions-v1.edn.
+;;
+;; The EDN file is the SOURCE OF TRUTH for the model (ADR-0220; it was
+;; kernel/micro_infer.c's C array until that file's decision moved to Kotoba):
+;; it is what the corpus whose SHA-256 is 6433aead... was reduced to, and what
+;; the Mac relay's MURAKUMO_MICRO_INFER_ROWS was derived from.  The Kotoba
+;; kernel cannot hold a 27x27 array -- `def` takes literals only and there is
+;; no array type in the native word-typed subset -- so each row is packed into
+;; two i64 literals of 4-bit nibbles (every count in the matrix is <= 5, so a
+;; nibble is exact and the packing is lossless, which this generator asserts).
+;;
+;;   lo  cells 0..14   (15 nibbles, bits 0..59  -- never touches the sign bit)
+;;   hi  cells 15..26  (12 nibbles, bits 0..47)
+;;
+;; Run with `--check` to verify the committed .kotoba still matches the EDN
+;; matrix.  Exit 0 = identical, 1 = drifted, 2 = could not answer.
+(ns gen-micro-infer-table
+  (:require ["fs" :as fs] ["path" :as path] [kotoba.lang.text :as str]
+            [clojure.edn :as edn]))
+
+(def root (or (first (filter #(not (str/starts-with? % "--")) *command-line-args*)) "."))
+(def check? (some #(= % "--check") *command-line-args*))
+(def matrix-path (path/join root "os/aiueos/contracts/micro-infer-transitions-v1.edn"))
+(def out-path (path/join root "os/aiueos/native/micro_infer.kotoba"))
+(def check-path (path/join root "os/aiueos/native/micro_infer_check.kotoba"))
+
+(defn refuse [msg] (binding [*print-fn* *print-err-fn*] (println "REFUSED" msg)) (js/process.exit 2))
+
+(when-not (fs/existsSync matrix-path) (refuse (str "no matrix at " matrix-path)))
+
+;; ---- read the 27x27 matrix with a reader, not a regex -------------------
+(def matrix
+  (let [m (edn/read-string (fs/readFileSync matrix-path "utf8"))]
+    (when-not (= :aiueos.micro-infer-transitions/v1 (:format m))
+      (refuse (str "unexpected :format " (pr-str (:format m)))))
+    (vec (map vec (:rows m)))))
+
+(when-not (= 27 (count matrix)) (refuse (str "parsed " (count matrix) " rows, want 27")))
+(doseq [[i r] (map-indexed vector matrix)]
+  (when-not (= 27 (count r)) (refuse (str "row " i " has " (count r) " cells, want 27"))))
+(doseq [[i r] (map-indexed vector matrix)]
+  (doseq [[j c] (map-indexed vector r)]
+    (when (or (neg? c) (> c 15)) (refuse (str "cell [" i "][" j "]=" c " does not fit a nibble")))))
+
+;; ---- pack ---------------------------------------------------------------
+;; BigInt throughout: 15 nibbles is 60 bits and a JS double carries 53, so
+;; Math.pow silently loses the top cells.  The first draft of this generator
+;; did exactly that and its own round-trip assertion caught it.
+(defn bpow [n] (reduce (fn [a _] (* a (js/BigInt 16))) (js/BigInt 1) (range n)))
+(defn pack [cells]
+  (reduce (fn [acc [i c]] (+ acc (* (js/BigInt c) (bpow i))))
+          (js/BigInt 0) (map-indexed vector cells)))
+(defn row-lo [r] (pack (subvec r 0 15)))
+(defn row-hi [r] (pack (subvec r 15 27)))
+
+;; ---- the reduction the board will perform, run here as an oracle --------
+(defn reduce-row [r]
+  (loop [i 0 best 0 score 0 total 0]
+    (if (= i 27)
+      {:best best :score score :total total}
+      (let [c (nth r i)]
+        (recur (inc i) (if (> c score) i best) (if (> c score) c score) (+ total c))))))
+
+(defn vocab-char [i] (if (zero? i) " " (char (+ 97 (dec i)))))
+
+;; cljs `quot`/`rem` do not accept BigInt, so unpack through the hex rendering:
+;; nibble k is hex digit k counted from the RIGHT.
+(defn nibbles [word n]
+  (let [h (.toString word 16)
+        pad (str (apply str (repeat (max 0 (- n (count h))) "0")) h)]
+    (vec (reverse (map #(js/parseInt % 16) (take-last n pad))))))
+
+;; The packing must be lossless: unpacking lo/hi has to reproduce the row.
+(doseq [[i r] (map-indexed vector matrix)]
+  (let [lo (row-lo r) hi (row-hi r)
+        back (vec (concat (nibbles lo 15) (nibbles hi 12)))]
+    (when-not (= back r) (refuse (str "row " i " does not survive the nibble packing")))))
+
+;; ---- emit ---------------------------------------------------------------
+(defn branch [f rows]
+  (str/join "\n"
+    (concat
+      (for [i (range 26)]
+        (str "    " (apply str (repeat i " ")) "(if (= input " i ") " (f (nth matrix i))))
+      [(str "    " (apply str (repeat 26 " ")) (f (nth matrix 26)) (apply str (repeat 26 ")")))])))
+
+(def header
+"(ns native.micro-infer
+  ;; aiueos-char-bigram-v1 -- the frozen character bigram of
+  ;; os/aiueos/contracts/micro-inference-qualification-v1.edn, reduced from the
+  ;; corpus whose SHA-256 is
+  ;;   6433aeadc179877f103fdc87672d967d5c68d3f531f8b2bf156e377ad84058cb
+  ;; and held here in exactly the form the source of truth
+  ;; os/aiueos/contracts/micro-infer-transitions-v1.edn holds it: 27 rows of 27 transition counts,
+  ;; vocabulary index 0 = space and 1..26 = a..z.
+  ;;
+  ;; GENERATED by os/aiueos/tools/gen-micro-infer-table.cljk -- do not edit by
+  ;; hand.  `--check` re-derives this file from the C matrix and fails if the
+  ;; two have drifted; that check is the only thing that keeps the board's
+  ;; answers and the Mac relay's expectations the same model.
+  ;;
+  ;; WHY NIBBLES.  The native word-typed subset has no arrays and `def` takes
+  ;; literals only, so a 729-entry table cannot be written as data.  Every
+  ;; count in the matrix is at most 5, so each row packs losslessly into two
+  ;; i64 literals of 4-bit fields -- 15 cells in `lo` (bits 0..59, clear of the
+  ;; sign bit) and 12 in `hi`.  The board UNPACKS and reduces them at run time;
+  ;; the argmax is deliberately NOT precomputed, because a precomputed argmax
+  ;; would make this a lookup table and the point of the qualification is that
+  ;; the physical K16 performed the reduction.
+  ;; The SELF-CHECK lives in native/micro_infer_check.kotoba, not here. The
+  ;; native target has a hard 100,000-node lowered-program budget shared by the
+  ;; whole kernel, and 27 rows of expected values plus their walk is weight the
+  ;; board would carry for a function it never calls.
+  (:export [vocab-index vocab-value micro-infer-row micro-infer-token
+            micro-infer-score micro-infer-total micro-infer-index]))
+
+;; Vocabulary: 0 = space, 1..26 = a..z.  -1 (returned as 27) is \"not in the
+;; vocabulary\", which the caller must treat as a refusal rather than a token.
+(defn vocab-index [value]
+  (if (= value 32)
+    0
+    (if (and (>= value 97) (<= value 122))
+      (+ (- value 97) 1)
+      27)))
+
+(defn vocab-value [index]
+  (if (= index 0) 32 (+ 96 index)))
+")
+
+(def body
+(str "
+;; Cells 0..14 of the transition row for `input`.
+(defn row-lo [input]
+" (branch row-lo matrix) ")
+
+;; Cells 15..26.
+(defn row-hi [input]
+" (branch row-hi matrix) ")
+
+;; Scan `cells` 4-bit fields out of `word`, lowest first, starting at
+;; vocabulary index `index`.  The accumulator is packed so this stays inside
+;; the five-parameter native ABI cap:
+;;   acc = best * 65536 + score * 256 + total
+;; best <= 26, score <= 5 and total <= 13, so no field can carry into the next.
+;; Ties keep the LOWEST vocabulary index (`:tie-break :lowest-vocabulary-index`
+;; in the contract), which is what a strict `>` gives when the scan runs
+;; upwards from 0.
+(defn scan-nibbles [word cells index acc]
+  (if (= cells 0)
+    acc
+    (let [cell (bit-and word 15)
+          score (bit-and (quot acc 256) 255)
+          keep-best (bit-and acc 16776960)
+          next-best (if (> cell score) (+ (* 65536 index) (* 256 cell)) keep-best)]
+      (scan-nibbles (quot word 16) (- cells 1) (+ index 1)
+                    (+ next-best (+ (bit-and acc 255) cell))))))
+
+;; (best << 16) | (score << 8) | total for the row of vocabulary index `input`.
+;; 0 means the row is empty -- the C reference refuses on `!total || !score`
+;; and so does every caller here, because a zero row has no next token.
+(defn micro-infer-row [input]
+  (if (>= input 27)
+    0
+    (scan-nibbles (row-hi input) 12 15
+                  (scan-nibbles (row-lo input) 15 0 0))))
+
+(defn micro-infer-index [row] (bit-and (quot row 65536) 255))
+(defn micro-infer-score [row] (bit-and (quot row 256) 255))
+(defn micro-infer-total [row] (bit-and row 255))
+(defn micro-infer-token [row] (vocab-value (micro-infer-index row)))
+"))
+
+(def check-file
+(str
+"(ns native.micro-infer-check
+  ;; The self-check for native/micro_infer.kotoba, kept OUT of that module so
+  ;; the kernel does not carry it: the native target has a hard 100,000-node
+  ;; lowered-program budget for the WHOLE program, and this file is weight for
+  ;; a function the board never calls.
+  ;;
+  ;; GENERATED by os/aiueos/tools/gen-micro-infer-table.cljk -- do not edit.
+  (:require [native.micro-infer :as mi])
+  (:export [expected-row self-check]))
+
+;; The same 27 answers, as literals, so the board checks its own unpack-and-
+;; reduce against the value this generator computed from the C matrix rather
+;; than against itself.  Declared before its caller: the native frontend
+;; resolves names in order.
+(defn expected-row [input]
+" (branch (fn [r] (let [{:keys [best score total]} (reduce-row r)]
+                    (str (+ (* 65536 best) (* 256 score) total)))) matrix) ")
+
+;; Self-check: the number of rows whose reduction disagrees with the expected
+;; value.  A COUNT, not a boolean -- a boolean cannot tell one drifted row from
+;; a table that failed to load at all.  0 is the only passing value.
+(defn check-row [input failures]
+  (if (= input 27)
+    failures
+    (check-row (+ input 1)
+               (+ failures (if (= (mi/micro-infer-row input) (expected-row input)) 0 1)))))
+
+(defn self-check [] (check-row 0 0))
+"))
+
+
+(def rendered (str header body))
+
+(if check?
+  (let [current (when (fs/existsSync out-path) (fs/readFileSync out-path "utf8"))
+        current-check (when (fs/existsSync check-path) (fs/readFileSync check-path "utf8"))]
+    (if (and (= current rendered) (= current-check check-file))
+      (do (println (str "MICRO_INFER_TABLE_OK rows=27 path=" out-path
+                        " check=" check-path))
+          (js/process.exit 0))
+      (do (println (str "MICRO_INFER_TABLE_DRIFT path="
+                        (if (= current rendered) check-path out-path)))
+          (js/process.exit 1))))
+  (do (fs/writeFileSync out-path rendered)
+      (fs/writeFileSync check-path check-file)
+      (println (str "MICRO_INFER_TABLE_WROTE rows=27 path=" out-path
+                    " check=" check-path))
+      (doseq [[i r] (map-indexed vector matrix)]
+        (let [{:keys [best score total]} (reduce-row r)]
+          (when (pos? total)
+            (println (str "ROW \"" (vocab-char i) "\" -> (\"" (vocab-char best) "\" "
+                          score " " total ")")))))))

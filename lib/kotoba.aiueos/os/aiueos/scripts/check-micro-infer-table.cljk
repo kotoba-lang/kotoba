@@ -1,0 +1,173 @@
+;; Gate: the board's aiueos-char-bigram-v1 answers ARE the model the Mac relay
+;; expects, measured by executing the Kotoba module rather than by reading it.
+;;
+;; Four things can drift independently and three of them are silent:
+;;   1. native/micro_infer.kotoba vs contracts/micro-infer-transitions-v1.edn (the frozen matrix)
+;;   2. the board's unpack-and-reduce vs the reduction itself
+;;   3. the board's answers vs MURAKUMO_MICRO_INFER_ROWS     (the relay)
+;;   4. the board's answer for "murakum" vs the contract's :known-answer
+;; Reading the files catches only 1. This gate executes the module.
+;;
+;; The compile-time KIR oracle folds an effect-free i64 `main`, so
+;;   (quot 1 (- 1 (self-check)))
+;; compiles when every row reduces to its expected value and refuses with
+;; `division-by-zero` when exactly one has drifted. That is the discriminator,
+;; and this gate DEMONSTRATES it in both directions every run: it mutates one
+;; row of a COPY and requires that copy to fail. A gate that has only ever been
+;; green cannot be told from a gate that cannot go red.
+;;
+;; Exit 0 = clean, 1 = findings, 2 = REFUSED (could not answer).
+(ns check-micro-infer-table
+  (:require ["fs" :as fs] ["os" :as os] ["path" :as path]
+            ["child_process" :as cp] [kotoba.lang.text :as str]))
+
+(defn arg [flag] (let [a (vec *command-line-args*) i (.indexOf a flag)]
+                   (when (>= i 0) (nth a (inc i) nil))))
+(def root (or (arg "--root")
+              (first (remove #(str/starts-with? % "--") *command-line-args*))
+              "."))
+;; The pinned compiler lives beside this worktree, not inside it.
+(def amu (or (arg "--amu")
+             (path/join (path/resolve root) ".." "amu-k16" "bin" "amu")))
+
+(def findings (atom []))
+(defn finding! [& parts] (swap! findings conj (str/join " " parts)))
+(defn refuse! [& parts]
+  (println (str "REFUSED " (str/join " " parts)))
+  (js/process.exit 2))
+
+(when-not (fs/existsSync amu) (refuse! (str "no amu CLI at " amu)))
+
+(def aiueos (path/join root "os/aiueos"))
+(def table (path/join aiueos "native/micro_infer.kotoba"))
+;; The expected values -- and therefore the control -- live in the check
+;; module, which the KERNEL deliberately does not carry.
+(def check-table (path/join aiueos "native/micro_infer_check.kotoba"))
+(def relay (path/join aiueos "tools/k16-pxe-server.py"))
+(def contract (path/join aiueos "contracts/micro-inference-qualification-v1.edn"))
+(doseq [p [table check-table relay contract]]
+  (when-not (fs/existsSync p) (refuse! (str "missing input " p))))
+
+(def work (fs/mkdtempSync (path/join (os/tmpdir) "micro-infer-gate-")))
+(defn run [cmd args]
+  (let [r (cp/spawnSync cmd (clj->js args) #js {:encoding "utf8"})]
+    {:code (.-status r) :out (str (.-stdout r)) :err (str (.-stderr r))}))
+
+;; ---- 1. the committed table still re-derives from the EDN matrix ---------
+(let [r (run "kbb" ["--backend" "sci" (path/join aiueos "tools/gen-micro-infer-table.cljk") root "--check"])]
+  (case (:code r)
+    0 nil
+    1 (finding! "table-drift native/micro_infer.kotoba no longer re-derives from contracts/micro-infer-transitions-v1.edn")
+    (refuse! "generator --check could not answer:" (str/trim (str (:out r) (:err r))))))
+
+;; ---- 2. every row reduces to its expected value (oracle folds main) ------
+(def probe-src
+  (str "(ns gate.rows (:require [native.micro-infer-check :as mic]) (:export [main]))\n"
+       "(defn main [] (quot 1 (- 1 (mic/self-check))))\n"))
+(def probe-path (path/join work "gate_rows.kotoba"))
+(fs/writeFileSync probe-path probe-src)
+
+(defn compile-probe [source-path out]
+  (run amu ["compile" probe-path "--source-path" source-path "--unpinned" "--jvm-free"
+            "--target" "x86_64-macos" "--fuel" "1048576" "--output" out]))
+
+;; Whether the base is green decides whether the control below MEANS anything:
+;; the control asserts that base+1 rows drifting refuses, and (quot 1 (- 1 2))
+;; is a legal -1. So a red base must SKIP the control rather than report it,
+;; or a broken table produces a third finding that says the opposite of the truth.
+(def base-green?
+  (let [r (compile-probe aiueos (path/join work "gate.kexe"))
+        text (str/trim (str (:out r) " " (:err r)))]
+    (if (zero? (:code r))
+      true
+      (do (finding! "row-reduction self-check is non-zero:"
+                    (subs text 0 (min 400 (count text))))
+          false))))
+
+;; ---- 3. the control: a mutated copy MUST fail ---------------------------
+;; Row 13 is 'm', the contract's known-answer row, so the control breaks the
+;; one row the qualification actually names.
+(def mirror (path/join work "mirror"))
+(fs/mkdirSync (path/join mirror "native") #js {:recursive true})
+(let [text (fs/readFileSync check-table "utf8")
+      head (subs text 0 (str/index-of text "(defn expected-row [input]"))
+      tail (subs text (str/index-of text "(defn expected-row [input]"))
+      needle "(if (= input 13) 983557"]
+  (if-not (str/includes? tail needle)
+    (refuse! "control anchor missing: expected-row has no literal 983557 for row 13"
+             "(the contract's known answer is token o score 2 total 5 = 15*65536+2*256+5)")
+    (do (fs/copyFileSync table (path/join mirror "native/micro_infer.kotoba"))
+        (fs/writeFileSync (path/join mirror "native/micro_infer_check.kotoba")
+                          (str head (str/replace-first tail needle
+                                                       "(if (= input 13) 983558"))))))
+(if-not base-green?
+  (println "MICRO_INFER_CONTROL skipped reason=base-table-already-red")
+  (let [r (compile-probe mirror (path/join work "gate_bad.kexe"))
+        text (str (:out r) " " (:err r))]
+    (cond
+      (zero? (:code r))
+      (finding! "control-passed a mutated row 13 still compiles -- this gate cannot go red")
+      (not (str/includes? text "division-by-zero"))
+      (finding! "control-failed-for-the-wrong-reason the mutated copy was rejected, but not by"
+                "division-by-zero:" (str/trim (subs text 0 (min 300 (count text)))))
+      :else (println "MICRO_INFER_CONTROL discriminated reason=division-by-zero row=13"))))
+
+;; ---- 4. the executed answer for the contract's known-answer prompt -------
+(def answer-src
+  (str "(ns gate.answer (:require [native.micro-infer :as mi]) (:export [main]))\n"
+       "(defn main []\n"
+       "  (let [row (mi/micro-infer-row (mi/vocab-index 109))]\n"
+       "    (+ (* 1000000 (mi/micro-infer-token row))\n"
+       "       (+ (* 1000 (mi/micro-infer-score row)) (mi/micro-infer-total row)))))\n"))
+(def answer-path (path/join work "gate_answer.kotoba"))
+(fs/writeFileSync answer-path answer-src)
+(def answer-mjs (path/join work "gate_answer.mjs"))
+(let [r (run amu ["compile" answer-path "--source-path" aiueos "--unpinned" "--jvm-free"
+                  "--target" "js" "--output" answer-mjs])]
+  (when-not (zero? (:code r))
+    (refuse! "could not build the JS oracle:" (str/trim (subs (:out r) 0 (min 300 (count (:out r))))))))
+(fs/writeFileSync (path/join work "run.mjs")
+                  (str "import { instantiateKotoba } from \"./gate_answer.mjs\";\n"
+                       "console.log(String(instantiateKotoba({}).main()));\n"))
+(def executed
+  (let [r (run "node" [(path/join work "run.mjs")])]
+    (if (zero? (:code r))
+      (js/parseInt (str/trim (:out r)) 10)
+      (refuse! "the JS oracle would not run:" (str/trim (subs (:err r) 0 (min 300 (count (:err r)))))))))
+(let [token (js/Math.floor (/ executed 1000000))
+      score (js/Math.floor (/ (mod executed 1000000) 1000))
+      total (mod executed 1000)]
+  (println (str "MICRO_INFER_EXECUTED prompt=murakum token=" token
+                " char=" (char token) " score=" score " total=" total))
+  (when-not (and (= token 111) (= score 2) (= total 5))
+    (finding! "known-answer the executed module returns" (str "token=" token " score=" score " total=" total)
+              "but the contract's :known-answer is token=o score=2 row-total=5")))
+
+;; ---- 5. every row agrees with the Mac relay's expectation table ----------
+(def oracle-rows
+  (let [r (run "kbb" ["--backend" "sci" (path/join aiueos "tools/gen-micro-infer-table.cljk") root])]
+    (when-not (zero? (:code r)) (refuse! "generator would not print its oracle"))
+    (into {} (for [[_ k t s n] (re-seq #"ROW \"(.)\" -> \(\"(.)\" (\d+) (\d+)\)" (:out r))]
+               [k [t (js/parseInt s 10) (js/parseInt n 10)]]))))
+(def relay-rows
+  (let [text (fs/readFileSync relay "utf8")
+        block (second (re-find #"(?s)MURAKUMO_MICRO_INFER_ROWS = \{(.*?)\n\}" text))]
+    (when-not block (refuse! "MURAKUMO_MICRO_INFER_ROWS not found in the relay"))
+    (into {} (for [[_ k t s n] (re-seq #"\"(.)\": \(\"(.)\", (\d+), (\d+)\)" block)]
+               [k [t (js/parseInt s 10) (js/parseInt n 10)]]))))
+(when (or (empty? oracle-rows) (empty? relay-rows))
+  (refuse! "one of the two row tables parsed empty -- an empty comparison is not a clean one"))
+(doseq [k (sort (into (set (keys oracle-rows)) (keys relay-rows)))]
+  (when-not (= (get oracle-rows k) (get relay-rows k))
+    (finding! "row-mismatch" (pr-str k) "board:" (pr-str (get oracle-rows k))
+              "relay:" (pr-str (get relay-rows k)))))
+
+;; ---- report --------------------------------------------------------------
+(println (str "SCANNED\t" (+ (count oracle-rows) 27)))
+(println (str "MICRO_INFER_ROWS board=" (count oracle-rows) " relay=" (count relay-rows)
+              " reduced-rows=27"))
+(if (seq @findings)
+  (do (doseq [f @findings] (println (str "FINDING " f)))
+      (println (str "FINDINGS " (count @findings)))
+      (js/process.exit 1))
+  (do (println "FINDINGS 0") (js/process.exit 0)))

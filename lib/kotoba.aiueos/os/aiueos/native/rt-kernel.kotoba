@@ -1,0 +1,299 @@
+(ns aiueos.native.rt-kernel
+  (:export [main]))
+
+;; This is the hard real-time vertical slice. The source owns the interrupt
+;; table, APIC setup, fixed-priority dispatcher, periodic release, and PLC
+;; scan. Amu contributes instruction lowering and the sealed vector-32 entry;
+;; no C ABI or hosted runtime is present in the produced image.
+
+(defn load64-page [page offset]
+  (+ (kernel-load-u8-4k page 4096 offset)
+     (* (kernel-load-u8-4k page 4096 (+ offset 1)) 256)
+     (* (kernel-load-u8-4k page 4096 (+ offset 2)) 65536)
+     (* (kernel-load-u8-4k page 4096 (+ offset 3)) 16777216)
+     (* (kernel-load-u8-4k page 4096 (+ offset 4)) 4294967296)
+     (* (kernel-load-u8-4k page 4096 (+ offset 5)) 1099511627776)
+     (* (kernel-load-u8-4k page 4096 (+ offset 6)) 281474976710656)
+     (* (kernel-load-u8-4k page 4096 (+ offset 7)) 72057594037927936)))
+
+(defn store64-page [page offset value]
+  (let [s0 (kernel-store-u8-4k page 4096 offset (bit-and value 255))
+        s1 (kernel-store-u8-4k page 4096 (+ offset 1) (bit-and (quot value 256) 255))
+        s2 (kernel-store-u8-4k page 4096 (+ offset 2) (bit-and (quot value 65536) 255))
+        s3 (kernel-store-u8-4k page 4096 (+ offset 3) (bit-and (quot value 16777216) 255))
+        s4 (kernel-store-u8-4k page 4096 (+ offset 4) (bit-and (quot value 4294967296) 255))
+        s5 (kernel-store-u8-4k page 4096 (+ offset 5) (bit-and (quot value 1099511627776) 255))
+        s6 (kernel-store-u8-4k page 4096 (+ offset 6) (bit-and (quot value 281474976710656) 255))
+        s7 (kernel-store-u8-4k page 4096 (+ offset 7) (bit-and (quot value 72057594037927936) 255))]
+    (if (= (load64-page page offset) value)
+      (+ 1 (* 0 (+ s0 s1 s2 s3 s4 s5 s6 s7)))
+      0)))
+
+;; Vector 32 begins at byte 512 of the IDT. The table starts at byte 2560 of
+;; Amu's fixed RW page. Bytes 512..2559 remain a 2048-byte cryptographic
+;; workspace for the signed external PLC admission root.
+(defn install-rt-idt [state]
+  (let [handler (kernel-rt-timer-handler-address)
+        selector (kernel-read-cs)
+        gate-offset 3072
+        descriptor-offset 3584
+        handler-low (bit-and handler 65535)
+        handler-mid (bit-and (quot handler 65536) 65535)
+        handler-high (bit-and (quot handler 4294967296) 4294967295)
+        gate-low (+ handler-low
+                    (* selector 65536)
+                    (* 142 1099511627776)
+                    (* handler-mid 281474976710656))]
+    (let [gate0 (store64-page state gate-offset gate-low)
+          gate1 (store64-page state (+ gate-offset 8) handler-high)
+          limit0 (kernel-store-u8-4k state 4096 descriptor-offset 15)
+          limit1 (kernel-store-u8-4k state 4096 (+ descriptor-offset 1) 2)
+          base (store64-page state (+ descriptor-offset 2) (+ state 2560))
+          loaded (kernel-load-idt
+                  (kernel-subregion state 4096 descriptor-offset 10) 10)]
+      (+ loaded (* 0 (+ gate0 gate1 limit0 limit1 base handler selector))))))
+
+(defn configure-local-apic []
+  (let [apic-msr (kernel-read-msr 27)
+        enabled-msr (bit-or apic-msr 2048)
+        written-msr (kernel-write-msr 27 enabled-msr)
+        base-window 4276092928
+        timer-window (kernel-subregion base-window 4096 768 512)
+        svr (kernel-store-u32 base-window 512 240 511)
+        divide (kernel-store-u32 timer-window 512 224 3)
+        lvt (kernel-store-u32 timer-window 512 32 131104)
+        initial (kernel-store-u32 timer-window 512 128 1000000)
+        readback (kernel-read-msr 27)]
+    (if (= (* 0 (+ written-msr enabled-msr svr divide lvt initial readback)) 0)
+      true false)))
+
+;; Priority 1 is the periodic PLC task; priority 10 is the always-ready
+;; background task. A lower numeric value is more urgent.
+(defn select-fixed-priority [plc-ready background-ready]
+  (if (= plc-ready 1)
+    1
+    (if (= background-ready 1) 10 0)))
+
+;; Vendor-neutral PLC device classes. A signed deployment profile maps a
+;; concrete model to one bounded protocol family; model names never enter the
+;; RT scheduler. 1=MMIO, 2=Modbus RTU, 3=Modbus TCP, 4=EtherCAT,
+;; 5=PROFINET IRT, 6=EtherNet/IP CIP Sync, 7=CANopen,
+;; 8=CC-Link IE TSN, 9=OPC UA PubSub/TSN. Unknown and proprietary transports
+;; fail closed until an adapter supplies the same latch/stage/commit ABI.
+(defn plc-protocol-class [protocol]
+  (if (= protocol 1) 1
+    (if (= protocol 2) 2
+      (if (= protocol 3) 2
+        (if (= protocol 4) 1
+          (if (= protocol 5) 1
+            (if (= protocol 6) 1
+              (if (= protocol 7) 1
+                (if (= protocol 8) 1
+                  (if (= protocol 9) 1 0))))))))))
+
+(defn plc-device-profile-valid [protocol cycle-us watchdog-us channels]
+  (let [class (plc-protocol-class protocol)]
+    (and (> class 0)
+         (>= cycle-us 50) (<= cycle-us 1000000)
+         (> watchdog-us 0) (<= watchdog-us cycle-us)
+         (> channels 0) (<= channels 256))))
+
+(defn plc-device-profile-selftest []
+  (and (plc-device-profile-valid 1 1000 800 32)
+       (plc-device-profile-valid 2 10000 8000 16)
+       (plc-device-profile-valid 3 10000 8000 16)
+       (plc-device-profile-valid 4 250 200 128)
+       (plc-device-profile-valid 5 250 200 128)
+       (plc-device-profile-valid 6 1000 800 128)
+       (plc-device-profile-valid 7 1000 800 64)
+       (plc-device-profile-valid 8 250 200 128)
+       (plc-device-profile-valid 9 1000 800 128)
+       (not (plc-device-profile-valid 0 1000 800 32))
+       (not (plc-device-profile-valid 10 1000 800 32))
+       (not (plc-device-profile-valid 4 10 8 32))
+       (not (plc-device-profile-valid 4 1000 1200 32))
+       (not (plc-device-profile-valid 4 1000 800 257))))
+
+;; One static priority-ceiling mutex. The owner is boosted to the resource
+;; ceiling while holding it; recursive lock and foreign unlock fail closed.
+(defn ceiling-lock [state current-owner owner base-priority ceiling]
+  ;; The caller reads current-owner with interrupts disabled. Passing that
+  ;; observation explicitly keeps the effect visible to Kotoba substitution.
+  (if (= current-owner 0)
+    (let [o (kernel-store-u32 state 512 120 owner)
+          c (kernel-store-u32 state 512 124 ceiling)
+          effective (if (< ceiling base-priority) ceiling base-priority)
+          e (kernel-store-u32 state 512 128 effective)]
+      (+ effective (* 0 (+ o c e))))
+    0))
+
+(defn ceiling-unlock [state owner]
+  (if (= (kernel-load-u32 state 512 120) owner)
+    (let [o (kernel-store-u32 state 512 120 0)
+          c (kernel-store-u32 state 512 124 0)
+          e (kernel-store-u32 state 512 128 0)]
+      (+ 1 (* 0 (+ o c e))))
+    0))
+
+(defn ceiling-mutex-selftest [state]
+  ;; Kotoba let bindings are expression substitutions. Keep each effectful
+  ;; lock/unlock result single-use so a proof check cannot repeat an operation.
+  (let [effective (ceiling-lock state (kernel-load-u32 state 512 120) 10 10 1)]
+    (if (= effective 1)
+      (let [owner (kernel-load-u32 state 512 120)]
+        (if (= owner 10)
+          (let [observed (kernel-load-u32 state 512 128)]
+            (if (= observed 1)
+              (let [recursive (ceiling-lock state
+                                            (kernel-load-u32 state 512 120)
+                                            10 11 1)]
+                (if (= recursive 0)
+                  (let [foreign (ceiling-unlock state 1)]
+                    (if (= foreign 0)
+                      (let [released (ceiling-unlock state 10)]
+                        (if (= released 1)
+                          (if (= (kernel-load-u32 state 512 120) 0) 1 7)
+                          6))
+                      5))
+                  4))
+              3))
+          2))
+      8)))
+
+;; Bounded two-input/two-output PLC driver ABI. The driver latches the complete
+;; input image before execution, stages outputs in a shadow image, requires one
+;; watchdog checkpoint, and publishes both outputs in one commit operation.
+(defn plc-driver-latch [state tick]
+  (let [i0 (kernel-store-u32 state 512 80 (bit-and (quot tick 2) 1))
+        i1 (kernel-store-u32 state 512 84 (bit-and tick 127))
+        mask (kernel-store-u32 state 512 112 0)
+        watchdog (kernel-store-u32 state 512 116 0)]
+    (+ 1 (* 0 (+ i0 i1 mask watchdog)))))
+
+(defn plc-driver-stage0 [state current-mask value]
+  (let [stored (kernel-store-u32 state 512 88 value)
+        staged (kernel-store-u32 state 512 112 (bit-or current-mask 1))]
+    (+ 1 (* 0 (+ stored staged)))))
+
+(defn plc-driver-stage1 [state current-mask value]
+  (let [stored (kernel-store-u32 state 512 92 value)
+        staged (kernel-store-u32 state 512 112 (bit-or current-mask 2))]
+    (+ 1 (* 0 (+ stored staged)))))
+
+(defn plc-driver-watchdog [state]
+  (+ 1 (* 0 (kernel-store-u32 state 512 116 1))))
+
+(defn plc-driver-commit [state current-mask current-watchdog]
+  (if (and (= current-mask 3) (= current-watchdog 1))
+    (let [o0 (kernel-store-u32 state 512 100
+                               (kernel-load-u32 state 512 88))
+          o1 (kernel-store-u32 state 512 104
+                               (kernel-load-u32 state 512 92))
+          mask (kernel-store-u32 state 512 112 0)
+          watchdog (kernel-store-u32 state 512 116 0)]
+      (+ 1 (* 0 (+ o0 o1 mask watchdog))))
+    0))
+
+;; The PLC image is currently part of this Kotoba module. The external signed
+;; ELF path uses the same provider ABI but remains a separate admission step.
+(defn plc-scan [input-snapshot]
+  (if (= input-snapshot 0) 1 0))
+
+(defn run-plc-transaction [state tick]
+  (let [latched (plc-driver-latch state tick)]
+    (if (= latched 1)
+      (let [input0 (kernel-load-u32 state 512 80)
+            stage0 (plc-driver-stage0 state
+                                      (kernel-load-u32 state 512 112)
+                                      (plc-scan input0))]
+        (if (= stage0 1)
+          (let [input1 (kernel-load-u32 state 512 84)
+                stage1 (plc-driver-stage1 state
+                                          (kernel-load-u32 state 512 112)
+                                          (+ input1 1))]
+            (if (= stage1 1)
+              (let [watchdog (plc-driver-watchdog state)]
+                (if (= watchdog 1)
+                  (let [committed (plc-driver-commit
+                                   state
+                                   (kernel-load-u32 state 512 112)
+                                   (kernel-load-u32 state 512 116))]
+                    (if (= committed 1) 1 6))
+                  5))
+              4))
+          3))
+      2)))
+
+(defn wait-next-tick [state previous]
+  (let [halted (kernel-hlt)
+        now (kernel-load-u32 state 512 0)]
+    (if (> (+ now (* 0 halted)) previous)
+      now
+      (wait-next-tick state previous))))
+
+(defn dispatch-until-100-scans [state previous scans low-dispatches]
+  (if (= scans 100)
+    (+ 1 (* 0 (+ (kernel-load-u32 state 512 0) low-dispatches)))
+    (let [tick (wait-next-tick state previous)
+          plc-ready (if (= (bit-and tick 1) 0) 1 0)
+          selected (select-fixed-priority plc-ready 1)]
+      (if (= selected 1)
+        (let [transaction (run-plc-transaction state tick)
+              next-scans (+ scans 1)
+              committed-scans (kernel-store-u32 state 512 108 next-scans)]
+          (if (= transaction 1)
+            (+ (dispatch-until-100-scans state tick next-scans low-dispatches)
+               (* 0 committed-scans))
+            0))
+        (let [next-low (+ low-dispatches 1)
+              committed-low (kernel-store-u32 state 512 12 next-low)]
+          (+ (dispatch-until-100-scans state tick scans next-low)
+             (* 0 committed-low)))))))
+
+(defn main []
+  (let [kernel-page 1114112
+        state 1114624
+        disabled (kernel-cli)
+        tick-low (kernel-store-u32 state 512 0 0)
+        tick-high (kernel-store-u32 state 512 4 0)
+        output (kernel-store-u32 state 512 100 0)
+        low-dispatches (kernel-store-u32 state 512 12 0)
+        mutex-owner (kernel-store-u32 state 512 120 0)
+        mutex-ceiling (kernel-store-u32 state 512 124 0)
+        mutex-effective (kernel-store-u32 state 512 128 0)
+        pic-master (kernel-out-u8 33 255)
+        pic-slave (kernel-out-u8 161 255)]
+    (if (= (* 0 (+ disabled tick-low tick-high output low-dispatches
+                    mutex-owner mutex-ceiling mutex-effective
+                    pic-master pic-slave)) 0)
+      (let [installed (install-rt-idt kernel-page)]
+        (if (= installed 1)
+          (let [idt-marker (kernel-out-u8 233 73)
+                profile-ok (plc-device-profile-selftest)
+                mutex-code (ceiling-mutex-selftest state)
+                driver-code (run-plc-transaction state 0)
+                configured (configure-local-apic)]
+            (if (and profile-ok (= mutex-code 1) (= driver-code 1) configured)
+              (let [profile-marker (kernel-out-u8 233 80)
+                    mutex-marker (kernel-out-u8 233 77)
+                    driver-marker (kernel-out-u8 233 68)
+                    apic-marker (kernel-out-u8 233 65)
+                    start-marker (kernel-out-u8 233 75)
+                    enabled (kernel-sti)
+                    passed (dispatch-until-100-scans state 0 0 0)
+                    stopped (kernel-cli)
+                    r-marker (kernel-out-u8 233 82)
+                    t-marker (kernel-out-u8 233 84)
+                    s-marker (kernel-out-u8 233 83)]
+                (kernel-out-u32 244
+                                (if (and (= passed 1)
+                                         (= idt-marker 73) (= apic-marker 65)
+                                         (= profile-marker 80)
+                                         (= mutex-marker 77) (= driver-marker 68)
+                                         (= start-marker 75)
+                                         (= (+ enabled stopped) 0)
+                                         (= r-marker 82) (= t-marker 84) (= s-marker 83))
+                                  16 17)))
+              (kernel-out-u32 244 (+ 29 driver-code))))
+          (kernel-out-u32 244 18)))
+      (kernel-out-u32 244 20))))

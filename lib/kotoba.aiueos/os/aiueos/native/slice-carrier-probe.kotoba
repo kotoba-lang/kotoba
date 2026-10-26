@@ -1,0 +1,182 @@
+(ns aiueos.native.slice-carrier-probe
+  ;; A TEST VARIANT of the pure-Kotoba kernel, not a second production kernel.
+  ;; It boots the same way `kernel.kotoba` does -- UEFI hands the compiler's
+  ;; loader a boot-info prefix and a memory map, the loader identity-maps the
+  ;; first GiB -- and then does one thing: build a `[:slice :u8]` over a real
+  ;; page, PASS IT AS A FUNCTION PARAMETER, write a pattern through it, sum it
+  ;; back, narrow it, sum the narrowing, and write both answers to the debug
+  ;; console as hex.
+  ;;
+  ;; It exists because everything else about the ADR 0285 carrier is a claim
+  ;; about bytes. The compiler suites can show that a carried traversal and a
+  ;; hand-written one compile to identical objects; they cannot show that the
+  ;; object addresses the memory it says it does. That is a claim about a
+  ;; machine, and this is the machine answering.
+  ;;
+  ;; The whole point is `s`. `sum-slice`, `fill-slice` and `sum-tail` each take
+  ;; ONE parameter for the region -- a `[:slice :u8]` -- where every kernel
+  ;; object shipped today takes two, `base` and `length`, and re-proves the
+  ;; base's provenance at each call site. Nothing here reconstructs the slice
+  ;; from two i64s: `main` builds it once with `slice-of-u8` and hands the
+  ;; value on.
+  (:export [main]))
+
+;; ---------------------------------------------------------------------------
+;; Boot-info and memory-map reading. Same shapes as `kernel.kotoba` and
+;; `dot-f32-probe.kotoba`, because the boot contract is the same one; copied
+;; rather than shared because that kernel is the shipping artifact and this
+;; must not be able to move it.
+;; ---------------------------------------------------------------------------
+
+(defn load64-boot [base offset]
+  (+ (kernel-load-u8 base 64 offset)
+     (* (kernel-load-u8 base 64 (+ offset 1)) 256)
+     (* (kernel-load-u8 base 64 (+ offset 2)) 65536)
+     (* (kernel-load-u8 base 64 (+ offset 3)) 16777216)
+     (* (kernel-load-u8 base 64 (+ offset 4)) 4294967296)
+     (* (kernel-load-u8 base 64 (+ offset 5)) 1099511627776)
+     (* (kernel-load-u8 base 64 (+ offset 6)) 281474976710656)
+     (* (kernel-load-u8 base 64 (+ offset 7)) 72057594037927936)))
+
+(defn load64 [base length offset]
+  (+ (kernel-load-u8-16k base length offset)
+     (* (kernel-load-u8-16k base length (+ offset 1)) 256)
+     (* (kernel-load-u8-16k base length (+ offset 2)) 65536)
+     (* (kernel-load-u8-16k base length (+ offset 3)) 16777216)
+     (* (kernel-load-u8-16k base length (+ offset 4)) 4294967296)
+     (* (kernel-load-u8-16k base length (+ offset 5)) 1099511627776)
+     (* (kernel-load-u8-16k base length (+ offset 6)) 281474976710656)
+     (* (kernel-load-u8-16k base length (+ offset 7)) 72057594037927936)))
+
+(defn load32 [base length offset]
+  (+ (kernel-load-u8-16k base length offset)
+     (* (kernel-load-u8-16k base length (+ offset 1)) 256)
+     (* (kernel-load-u8-16k base length (+ offset 2)) 65536)
+     (* (kernel-load-u8-16k base length (+ offset 3)) 16777216)))
+
+;; UEFI type 7 is EfiConventionalMemory, and the loader identity-maps the
+;; first GiB, so one aligned eight-page extent inside [2 MiB, 1 GiB) is a page
+;; this probe may write.
+(defn find-page [memory-map map-size descriptor-size offset remaining]
+  (if (or (= remaining 0)
+          (> (+ offset descriptor-size) map-size))
+    0
+    (let [memory-type (load32 memory-map map-size offset)
+          physical-start (load64 memory-map map-size (+ offset 8))
+          pages (load64 memory-map map-size (+ offset 24))]
+      (if (and (= memory-type 7)
+               (> pages 7)
+               (>= physical-start 2097152)
+               (< physical-start 1073717248)
+               (= (bit-and physical-start 4095) 0))
+        physical-start
+        (find-page memory-map map-size descriptor-size
+                   (+ offset descriptor-size) (- remaining 1))))))
+
+;; ---------------------------------------------------------------------------
+;; The carrier.
+;;
+;; Sixty-four elements, element i holding i+1. Two sums name the traversal:
+;;
+;;   the whole slice        1 + 2 + ... + 64   = 2080  = 0x00000820
+;;   (slice-sub s 16 32)   17 + 18 + ... + 48  = 1040  = 0x00000410
+;;
+;; The second is what makes the narrowing readable rather than plausible. A
+;; `slice-sub` that ignored its OFFSET would sum 1..32 = 528 = 0x210; one that
+;; ignored its COUNT would sum 17..64 = 1944 = 0x798; one that did neither
+;; would print 0x820 twice. So the four digits distinguish four different
+;; wrong answers from the right one.
+;;
+;; Every one of these takes the region as ONE parameter.
+;; ---------------------------------------------------------------------------
+
+(defn fill-slice [s [:slice :u8] index :i64 remaining :i64]
+  (if (= remaining 0)
+    1
+    (let [written (slice-set! s index (+ index 1))]
+      (fill-slice s (+ index 1) (- remaining 1)))))
+
+(defn sum-slice [s [:slice :u8] index :i64 total :i64]
+  (if (< index (slice-length s))
+    (sum-slice s (+ index 1) (+ total (slice-get s index)))
+    total))
+
+;; A CHECKED narrowing, and a slice value crossing one more call boundary:
+;; `sum-tail` receives the parent and hands `sum-slice` the child.
+(defn sum-tail [s [:slice :u8]]
+  (sum-slice (slice-sub s 16 32) 0 0))
+
+;; ---------------------------------------------------------------------------
+;; Console.
+;; ---------------------------------------------------------------------------
+
+(defn hex-digit [value]
+  (if (< value 10) (+ 48 value) (+ 55 value)))
+
+(defn emit-digit [value divisor]
+  (kernel-out-u8 233 (hex-digit (bit-and (quot value divisor) 15))))
+
+(defn emit-u32 [value]
+  (let [d7 (emit-digit value 268435456)
+        d6 (emit-digit value 16777216)
+        d5 (emit-digit value 1048576)
+        d4 (emit-digit value 65536)
+        d3 (emit-digit value 4096)
+        d2 (emit-digit value 256)
+        d1 (emit-digit value 16)
+        d0 (emit-digit value 1)]
+    1))
+
+(defn main []
+  (let [boot (kernel-boot-info)
+        map-size (load64-boot boot 24)
+        descriptor-size (load64-boot boot 32)
+        memory-map (kernel-subregion boot 16448 64 16384)]
+    (if (and (> boot 0)
+             (= (kernel-load-u8 boot 64 0) 65)
+             (= (kernel-load-u8 boot 64 1) 73)
+             (= (kernel-load-u8 boot 64 2) 85)
+             (= (kernel-load-u8 boot 64 3) 69)
+             (> descriptor-size 0)
+             (> map-size descriptor-size))
+      (let [physical-start (find-page memory-map map-size descriptor-size 0 410)]
+        (if (> physical-start 0)
+          ;; The literal parent names the loader's identity-mapped physical
+          ;; window, exactly as `kernel.kotoba` does; the offset is checked.
+          (let [page (kernel-subregion 4096 1073737728 (- physical-start 4096) 4096)
+                ;; ONE value from here on. `page` is a region root the
+                ;; provenance rule admits (a checked narrowing of a literal),
+                ;; and `slice-of-u8` is where it stops being two words to the
+                ;; author and starts being one.
+                s (slice-of-u8 page 64)
+                filled (fill-slice s 0 64)
+                whole (sum-slice s 0 0)
+                tail (sum-tail s)
+                ;; Read one element back through the WINDOW family rather than
+                ;; the carrier, so the check does not ask the same machinery
+                ;; whether it worked. Element 63 holds 64.
+                check (kernel-load-u8-4k page 4096 63)
+                p0 (emit-u32 (bit-and whole 4294967295))
+                p1 (emit-u32 (bit-and tail 4294967295))
+                m0 (kernel-out-u8 233 83)
+                m1 (kernel-out-u8 233 76)
+                m2 (kernel-out-u8 233 67)]
+            ;; One exit value per check, so a mismatch names itself rather
+            ;; than collapsing into a single "something was wrong". QEMU's
+            ;; isa-debug-exit reports (value << 1) | 1, so 16 -> 33.
+            (kernel-out-u32 244
+                            (if (= filled 1)
+                              (if (= check 64)
+                                (if (= whole 2080)
+                                  (if (= tail 1040)
+                                    (if (and (= p0 1) (= p1 1))
+                                      (if (and (= m0 83) (= m1 76) (= m2 67))
+                                        16
+                                        15)
+                                      14)
+                                    13)
+                                  12)
+                                11)
+                              10)))
+          (kernel-out-u32 244 9)))
+      (kernel-out-u32 244 8))))

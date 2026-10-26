@@ -1,0 +1,105 @@
+(ns aiueos.allocator-plan
+  (:export [aiueos-allocator-plan main]))
+
+;; C-free decision slice for the boot physical-page allocator.
+;;
+;; The mechanism of allocation (advancing `next_page` over the best
+;; EFI_CONVENTIONAL_MEMORY run, writing the free-list head into the freed
+;; page, taking the allocator lock) stays in C, in `kernel/memory.c`.  What
+;; this object owns is the record-table decision that guards it:
+;;
+;;   * which allocation record to claim for a fresh page, and
+;;   * whether a page being freed is the one a live record names -- so a
+;;     double free, an unknown page, or an already-inactive record is refused
+;;     before C dereferences or re-links anything.
+;;
+;; The in-memory record layout matches `struct allocation_record` in
+;; `kernel/memory.c`:
+;;
+;;   struct allocation_record { void *page; uint8_t active; };
+;;
+;;   page   at offset 0  -- 8 bytes, little-endian u64
+;;   active at offset 8  -- 1 byte, 0 = free, 1 = owned
+;;   padding at offset 9..15
+;;   stride 16
+;;
+;; This mirrors the `task-slot-plan` / `service-task-transition` pattern: C
+;; places the array in memory, Kotoba reads it with bounded loads, and C acts
+;; only on the admitted scalar the object returns.  A table this object has
+;; not admitted is not touched.
+
+;; Bounded little-endian u64 read.  The table is pinned in the first 4 GiB by
+;; the allocator's IDENTITY_LIMIT, but the object is given an explicit length
+;; and bounds every access against it rather than trusting a caller-supplied
+;; address arithmetic.
+(defn load64 [table length offset]
+  (if (and (> length 0) (>= length (+ offset 8)) (> table 0))
+    (+ (kernel-load-u8-4k table 4096 offset)
+       (* (kernel-load-u8-4k table 4096 (+ offset 1)) 256)
+       (* (kernel-load-u8-4k table 4096 (+ offset 2)) 65536)
+       (* (kernel-load-u8-4k table 4096 (+ offset 3)) 16777216)
+       (* (kernel-load-u8-4k table 4096 (+ offset 4)) 4294967296)
+       (* (kernel-load-u8-4k table 4096 (+ offset 5)) 1099511627776)
+       (* (kernel-load-u8-4k table 4096 (+ offset 6)) 281474976710656)
+       (* (kernel-load-u8-4k table 4096 (+ offset 7)) 72057594037927936))
+    0))
+
+;; The record table lives in the kernel's bss and is bounded at
+;; ALLOCATION_RECORDS (256) records of stride 16.  The object requires exactly
+;; that shape: an unknown length, count or stride is refused rather than
+;; guessed, the same way `task-slot-plan` refuses any layout other than its
+;; own.
+(defn layout-valid [length count stride]
+  (if (and (= length 4096) (= count 256) (= stride 16)) 1 0))
+
+;; scan for the first record with no owner page (page == 0).  Return the
+;; one-based slot index, or 0 if the table is full.  A record with page == 0
+;; is structurally free regardless of its stale active byte, because the
+;; allocator clears the page field when it releases a record; the object still
+;; reads active so a record can never be handed out twice.
+(defn claim-scan [table length index stride count]
+  (if (> index count)
+    0
+    (let [base (* (- index 1) stride)
+          page (load64 table length base)
+          active (kernel-load-u8-4k table 4096 (+ base 8))]
+      (if (and (= page 0) (= active 0))
+        index
+        (claim-scan table length (+ index 1) stride count)))))
+
+;; A page is freeable only when the record the caller names is live (active==1)
+;; and that record's page field equals the address being freed.  A dead record,
+;; a wrong record index, or an address that names no live record is refused:
+;; the allocator must not retire a NULL LISTEN or re-link an address that was
+;; never a live allocation.  Returns 1 on a single valid free, 0 otherwise.
+(defn release-record [table length stride page slot]
+  (let [base (* (- slot 1) stride)
+        record-page (load64 table length base)
+        active (kernel-load-u8-4k table 4096 (+ base 8))]
+    (if (and (not (= record-page 0)) (= record-page page) (= active 1))
+      1 0)))
+
+;; Decision entry point, mirroring kotoba_aiueos_task_slot_plan:
+;;
+;;   request == 0  : claim -- return the one-based index of a free record, or
+;;                  0 if the table is full or the layout is unexpected.
+;;   request != 0  : treat LOW 16 bits as the record index to release, HIGH 32
+;;                  bits as the page address.  Return 1 only when that live
+;;                  record names that page (i.e. it is a valid, single free),
+;;                  0 on double free / unknown / mismatch.
+;;
+;; The claim path returns a scalar slot; C then writes the new page and active
+;; byte under the lock.  The release path returns a pure admission decision;
+;; C performs the actual active=0 + free-list link only after this returns 1.
+(defn aiueos-allocator-plan [table length count stride request]
+  (if (not (= (layout-valid length count stride) 1))
+    0
+    (if (= request 0)
+      (claim-scan table length 1 stride count)
+      (let [page (quot request 4294967296)
+            slot (bit-and request 65535)]
+        (if (and (> slot 0) (<= slot count) (> page 0))
+          (release-record table length stride page slot)
+          0)))))
+
+(defn main [] 0)

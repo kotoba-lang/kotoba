@@ -1,0 +1,442 @@
+(ns aiueos.lib.aes128-gcm-core
+  (:export [cl cs gcm-prepare gcm-seal gcm-open]))
+
+;; AES-128-GCM (FIPS 197 + SP 800-38D) over a caller-owned 1280-byte context
+;; region, for the freestanding aiueos kernel.
+;;
+;; This file exists because `aes128-gcm.kotoba` and `tls13-record.kotoba` both
+;; CONTAINED it. Measured 2026-09-02, 56 of their function definitions had the
+;; same name in both files and 48 of those were byte-identical; of the eight
+;; that were not, seven differed only in a parameter name (`data` versus
+;; `body`) or a trailing comment. One differed for a REASON, and it is the
+;; reason this module takes an argument it did not used to take:
+;;
+;;   `set-j0` reads the 12-byte nonce from ctx+16 for the AEAD entry and from
+;;   ctx+480 for the record layer, so the offset is now a parameter and
+;;   `gcm-prepare` passes it through. Nothing else about the two copies
+;;   differed, which is why nothing else here is parameterised: a knob that no
+;;   caller turns is a claim that two shapes exist when only one does.
+;;
+;; Both copies were written before amu#742, when a namespace declaring
+;; `(:require ...)` could not be packaged for `x86_64-aiueos-kernel-v1` at all
+;; (`:kotoba.error/namespace-require-needs-project`), so every helper had to be
+;; copied into every source that needed it. `aiueos/lib/sha256_core.kotoba`
+;; was the first import that refusal's removal bought; this is the second, and
+;; it is the larger one -- 399 lines of AES, GHASH and CTR that used to be
+;; maintained twice, including an S-box, a key schedule and a tag comparison
+;; whose divergence would be a silent break in TLS confidentiality rather than
+;; a compile error.
+;;
+;; THE WINDOW LENGTH IS THE LITERAL 1280, not a parameter, and it was already
+;; the same literal in both copies. A caller with a differently sized context
+;; cannot share this module; widening it to take the length is a separate
+;; change with its own admission vectors, exactly as `sha256_core` says about
+;; its own 800.
+;;
+;; The exported surface is measured rather than chosen: `cl`, `cs`,
+;; `gcm-prepare`, `gcm-seal` and `gcm-open` are the only five of these 57
+;; functions that either caller still names. The other 52 stay private here.
+;;
+;; NOT A BOOLEAN. `gcm-seal` returns 0; `gcm-open` returns 0 on an authentic
+;; record and 5 when the tag does not match. Those values are the callers'
+;; reason codes and are documented at the two entries.
+
+;; --- one-region accessors --------------------------------------------------
+;; 1280 is written as a literal at every access rather than derived from
+;; `ctx-len`: the entry checks `ctx-len` once and then the bound the machine
+;; enforces is a constant, so a caller that passes a larger region cannot widen
+;; what this object may touch.
+
+(defn cl [ctx i] (kernel-load-u8-4k ctx 1280 i))
+(defn cs [ctx i v] (kernel-store-u8-4k ctx 1280 i v))
+
+;; --- GF(2^8) ---------------------------------------------------------------
+
+(defn xtime [x]
+  (bit-and (bit-xor (* x 2)
+                    (* (bit-and (quot x 128) 1) 27))
+           255))
+
+(defn rotl8-1 [x] (bit-and (bit-or (* x 2) (quot x 128)) 255))
+(defn rotl8-2 [x] (bit-and (bit-or (* x 4) (quot x 64)) 255))
+(defn rotl8-3 [x] (bit-and (bit-or (* x 8) (quot x 32)) 255))
+(defn rotl8-4 [x] (bit-and (bit-or (* x 16) (quot x 16)) 255))
+
+;; alog[i] = 3^i and log[3^i] = i, for i in 0..254.  The generator 3 is
+;; `p ^ xtime(p)`, i.e. p*2 + p in GF(2^8).
+(defn build-log-tables [ctx i p]
+  (if (= i 255) 1
+    (let [a (cs ctx (+ 512 i) p)
+          l (cs ctx (+ 768 p) i)]
+      (build-log-tables ctx (+ i 1 (* 0 (+ a l))) (bit-xor p (xtime p))))))
+
+;; alog[255] = alog[0] = 1, so that x = 1 (whose log is 0) reaches a written
+;; slot through `alog[255 - log[x]]` rather than reading uninitialised memory.
+(defn build-tables [ctx]
+  (let [b (build-log-tables ctx 0 1)
+        e (cs ctx 767 1)]
+    (+ 1 (* 0 (+ b e)))))
+
+(defn inv-of [ctx x]
+  (if (= x 0) 0
+    (cl ctx (+ 512 (- 255 (cl ctx (+ 768 x)))))))
+
+;; FIPS 197 5.1.1: b ^ rotl(b,1) ^ rotl(b,2) ^ rotl(b,3) ^ rotl(b,4) ^ 0x63.
+(defn sbox-value [ctx x]
+  (let [b (inv-of ctx x)]
+    (bit-and (bit-xor (bit-xor (bit-xor b (rotl8-1 b))
+                               (bit-xor (rotl8-2 b) (rotl8-3 b)))
+                      (bit-xor (rotl8-4 b) 99))
+             255)))
+
+(defn build-sbox [ctx i]
+  (if (= i 256) 1
+    (let [s (cs ctx (+ 1024 i) (sbox-value ctx i))]
+      (build-sbox ctx (+ i 1 (* 0 s))))))
+
+(defn sbox [ctx x] (cl ctx (+ 1024 x)))
+
+;; --- key schedule ----------------------------------------------------------
+
+(defn rcon [i]
+  (if (= i 1) 1 (if (= i 2) 2 (if (= i 3) 4 (if (= i 4) 8
+  (if (= i 5) 16 (if (= i 6) 32 (if (= i 7) 64 (if (= i 8) 128
+  (if (= i 9) 27 54))))))))))
+
+(defn key-expand-copy [ctx i]
+  (if (= i 16) 1
+    (let [s (cs ctx (+ 128 i) (cl ctx i))]
+      (key-expand-copy ctx (+ i 1 (* 0 s))))))
+
+(defn key-expand-word [ctx i]
+  (let [t0 (cl ctx (+ 128 (- i 4)))
+        t1 (cl ctx (+ 128 (- i 3)))
+        t2 (cl ctx (+ 128 (- i 2)))
+        t3 (cl ctx (+ 128 (- i 1)))
+        turn (= (bit-and i 15) 0)
+        u0 (if turn (bit-xor (sbox ctx t1) (rcon (quot i 16))) t0)
+        u1 (if turn (sbox ctx t2) t1)
+        u2 (if turn (sbox ctx t3) t2)
+        u3 (if turn (sbox ctx t0) t3)
+        s0 (cs ctx (+ 128 i) (bit-xor (cl ctx (+ 128 (- i 16))) u0))
+        s1 (cs ctx (+ 128 (+ i 1)) (bit-xor (cl ctx (+ 128 (- i 15))) u1))
+        s2 (cs ctx (+ 128 (+ i 2)) (bit-xor (cl ctx (+ 128 (- i 14))) u2))
+        s3 (cs ctx (+ 128 (+ i 3)) (bit-xor (cl ctx (+ 128 (- i 13))) u3))]
+    (+ 1 (* 0 (+ s0 (+ s1 (+ s2 s3)))))))
+
+(defn key-expand-loop [ctx i]
+  (if (= i 176) 1
+    (let [w (key-expand-word ctx i)]
+      (key-expand-loop ctx (+ i 4 (* 0 w))))))
+
+(defn key-expand [ctx]
+  (let [c (key-expand-copy ctx 0)
+        e (key-expand-loop ctx 16)]
+    (+ 1 (* 0 (+ c e)))))
+
+;; --- AES-128 block encryption ----------------------------------------------
+
+(defn aes-load-state [ctx in-off i]
+  (if (= i 16) 1
+    (let [s (cs ctx (+ 432 i) (bit-xor (cl ctx (+ in-off i)) (cl ctx (+ 128 i))))]
+      (aes-load-state ctx in-off (+ i 1 (* 0 s))))))
+
+(defn aes-sub-to-t [ctx i]
+  (if (= i 16) 1
+    (let [s (cs ctx (+ 416 i) (sbox ctx (cl ctx (+ 432 i))))]
+      (aes-sub-to-t ctx (+ i 1 (* 0 s))))))
+
+;; ShiftRows as a permutation of the SubBytes output, column-major, exactly the
+;; sixteen assignments the C wrote out by hand.
+(defn shift-src [i]
+  (if (= i 0) 0 (if (= i 1) 5 (if (= i 2) 10 (if (= i 3) 15
+  (if (= i 4) 4 (if (= i 5) 9 (if (= i 6) 14 (if (= i 7) 3
+  (if (= i 8) 8 (if (= i 9) 13 (if (= i 10) 2 (if (= i 11) 7
+  (if (= i 12) 12 (if (= i 13) 1 (if (= i 14) 6 11))))))))))))))))
+
+(defn aes-shift-rows [ctx i]
+  (if (= i 16) 1
+    (let [s (cs ctx (+ 432 i) (cl ctx (+ 416 (shift-src i))))]
+      (aes-shift-rows ctx (+ i 1 (* 0 s))))))
+
+(defn aes-mix-col [ctx i]
+  (let [a (cl ctx (+ 432 i))
+        b (cl ctx (+ 432 (+ i 1)))
+        c (cl ctx (+ 432 (+ i 2)))
+        d (cl ctx (+ 432 (+ i 3)))
+        s0 (cs ctx (+ 432 i)
+               (bit-and (bit-xor (bit-xor (xtime a) (xtime b))
+                                 (bit-xor b (bit-xor c d))) 255))
+        s1 (cs ctx (+ 432 (+ i 1))
+               (bit-and (bit-xor (bit-xor a (xtime b))
+                                 (bit-xor (xtime c) (bit-xor c d))) 255))
+        s2 (cs ctx (+ 432 (+ i 2))
+               (bit-and (bit-xor (bit-xor a b)
+                                 (bit-xor (xtime c) (bit-xor (xtime d) d))) 255))
+        s3 (cs ctx (+ 432 (+ i 3))
+               (bit-and (bit-xor (bit-xor (xtime a) a)
+                                 (bit-xor b (bit-xor c (xtime d)))) 255))]
+    (+ 1 (* 0 (+ s0 (+ s1 (+ s2 s3)))))))
+
+(defn aes-mix [ctx i]
+  (if (= i 16) 1
+    (let [m (aes-mix-col ctx i)]
+      (aes-mix ctx (+ i 4 (* 0 m))))))
+
+(defn aes-add-round-key [ctx round i]
+  (if (= i 16) 1
+    (let [s (cs ctx (+ 432 i)
+                (bit-xor (cl ctx (+ 432 i))
+                         (cl ctx (+ 128 (+ (* round 16) i)))))]
+      (aes-add-round-key ctx round (+ i 1 (* 0 s))))))
+
+(defn aes-round [ctx round]
+  (let [a (aes-sub-to-t ctx 0)
+        b (aes-shift-rows ctx 0)
+        c (aes-mix ctx 0)
+        d (aes-add-round-key ctx round 0)]
+    (+ 1 (* 0 (+ a (+ b (+ c d)))))))
+
+(defn aes-rounds [ctx round]
+  (if (= round 10) 1
+    (let [r (aes-round ctx round)]
+      (aes-rounds ctx (+ round 1 (* 0 r))))))
+
+(defn aes-final [ctx out-off i]
+  (if (= i 16) 1
+    (let [s (cs ctx (+ out-off i)
+                (bit-xor (cl ctx (+ 432 i)) (cl ctx (+ 128 (+ 160 i)))))]
+      (aes-final ctx out-off (+ i 1 (* 0 s))))))
+
+;; `in-off` and `out-off` may be the same offset: the state lives at 432, so an
+;; in-place block (H = E_K(0)) is exact rather than a special case.
+(defn aes-encrypt-block [ctx in-off out-off]
+  (let [a (aes-load-state ctx in-off 0)
+        b (aes-rounds ctx 1)
+        c (aes-sub-to-t ctx 0)
+        d (aes-shift-rows ctx 0)
+        e (aes-final ctx out-off 0)]
+    (+ 1 (* 0 (+ a (+ b (+ c (+ d e))))))))
+
+;; --- GHASH -----------------------------------------------------------------
+;; Y := Y * H in GF(2^128) with the SP 800-38D bit order: bit 0 of the field
+;; element is the MOST significant bit of byte 0, and the reduction polynomial
+;; appears as 0xe1 in the top byte after a right shift.
+
+(defn gh-zero-z [ctx i]
+  (if (= i 16) 1
+    (let [s (cs ctx (+ 384 i) 0)] (gh-zero-z ctx (+ i 1 (* 0 s))))))
+
+(defn gh-copy-h-to-v [ctx i]
+  (if (= i 16) 1
+    (let [s (cs ctx (+ 400 i) (cl ctx (+ 304 i)))]
+      (gh-copy-h-to-v ctx (+ i 1 (* 0 s))))))
+
+(defn gh-xor-v-into-z [ctx i]
+  (if (= i 16) 1
+    (let [s (cs ctx (+ 384 i) (bit-xor (cl ctx (+ 384 i)) (cl ctx (+ 400 i))))]
+      (gh-xor-v-into-z ctx (+ i 1 (* 0 s))))))
+
+;; V >>= 1 across all 128 bits, most significant byte first.
+(defn gh-shift-v [ctx k]
+  (if (= k 0)
+    (cs ctx 400 (quot (cl ctx 400) 2))
+    (let [s (cs ctx (+ 400 k)
+                (bit-and (bit-or (quot (cl ctx (+ 400 k)) 2)
+                                 (* (bit-and (cl ctx (+ 400 (- k 1))) 1) 128))
+                         255))]
+      (gh-shift-v ctx (- k 1 (* 0 s))))))
+
+(defn gh-bit [ctx bit]
+  (let [lsb (bit-and (cl ctx 415) 1)
+        x (if (= bit 1) (gh-xor-v-into-z ctx 0) 0)
+        s (gh-shift-v ctx 15)
+        r (if (= lsb 1) (cs ctx 400 (bit-xor (cl ctx 400) 225)) 0)]
+    (+ 1 (* 0 (+ x (+ s r))))))
+
+;; The bit index is walked by shifting the byte left, not by a shift whose
+;; count depends on the loop counter: this subset admits only literal shift
+;; counts, so `(x >> (7 - j))` has no spelling here.
+(defn gh-byte-bits [ctx b j]
+  (if (= j 8) 1
+    (let [r (gh-bit ctx (bit-and (quot b 128) 1))]
+      (gh-byte-bits ctx (bit-and (* b 2) 255) (+ j 1 (* 0 r))))))
+
+(defn gh-mult-bytes [ctx i]
+  (if (= i 16) 1
+    (let [r (gh-byte-bits ctx (cl ctx (+ 352 i)) 0)]
+      (gh-mult-bytes ctx (+ i 1 (* 0 r))))))
+
+(defn gh-copy-z-to-y [ctx i]
+  (if (= i 16) 1
+    (let [s (cs ctx (+ 352 i) (cl ctx (+ 384 i)))]
+      (gh-copy-z-to-y ctx (+ i 1 (* 0 s))))))
+
+(defn gh-mult [ctx]
+  (let [a (gh-zero-z ctx 0)
+        b (gh-copy-h-to-v ctx 0)
+        c (gh-mult-bytes ctx 0)
+        d (gh-copy-z-to-y ctx 0)]
+    (+ 1 (* 0 (+ a (+ b (+ c d)))))))
+
+;; --- GHASH over the AAD (inside ctx) and the data (a separate region) -------
+
+(defn gh-xor-aad-block [ctx off i limit]
+  (if (= i 16) 1
+    (let [byte (if (< i limit) (cl ctx (+ 64 (+ off i))) 0)
+          s (cs ctx (+ 352 i) (bit-xor (cl ctx (+ 352 i)) byte))]
+      (gh-xor-aad-block ctx off (+ i 1 (* 0 s)) limit))))
+
+(defn gh-aad [ctx off aad-len]
+  (if (>= off aad-len) 1
+    (let [rem (- aad-len off)
+          limit (if (> rem 16) 16 rem)
+          x (gh-xor-aad-block ctx off 0 limit)
+          m (gh-mult ctx)]
+      (gh-aad ctx (+ off 16 (* 0 (+ x m))) aad-len))))
+
+;; Reads use the 16 KiB window directly: 12288 is inside it, so the data side
+;; of GHASH needs no chunking.  Only the STORES in `crypt-all` do, because the
+;; store window stops at 4096.
+(defn gh-xor-data-block [ctx data data-len off i]
+  (if (= i 16) 1
+    (let [idx (+ off i)
+          byte (if (< idx data-len) (kernel-load-u8-16k data data-len idx) 0)
+          s (cs ctx (+ 352 i) (bit-xor (cl ctx (+ 352 i)) byte))]
+      (gh-xor-data-block ctx data data-len off (+ i 1 (* 0 s))))))
+
+(defn gh-data [ctx data data-len off]
+  (if (>= off data-len) 1
+    (let [x (gh-xor-data-block ctx data data-len off 0)
+          m (gh-mult ctx)]
+      (gh-data ctx data data-len (+ off 16 (* 0 (+ x m)))))))
+
+;; Least significant byte first, so the eight-byte field is written without
+;; any literal above 256 -- and therefore without a shift count at all (see the
+;; header note on why this object contains no `i64-shift-*`).
+(defn be64-tail [ctx off i value]
+  (if (= i 8) 1
+    (let [s (cs ctx (+ off (- 7 i)) (bit-and value 255))]
+      (be64-tail ctx off (+ i 1 (* 0 s)) (quot value 256)))))
+
+(defn be64-into [ctx off value] (be64-tail ctx off 0 value))
+
+(defn gh-xor-lenblk [ctx i]
+  (if (= i 16) 1
+    (let [s (cs ctx (+ 352 i) (bit-xor (cl ctx (+ 352 i)) (cl ctx (+ 464 i))))]
+      (gh-xor-lenblk ctx (+ i 1 (* 0 s))))))
+
+(defn gh-final [ctx aad-len data-len]
+  (let [a (be64-into ctx 464 (* aad-len 8))
+        b (be64-into ctx 472 (* data-len 8))
+        x (gh-xor-lenblk ctx 0)
+        m (gh-mult ctx)]
+    (+ 1 (* 0 (+ a (+ b (+ x m)))))))
+
+;; --- CTR -------------------------------------------------------------------
+
+(defn set-j0 [ctx nonce-off i]
+  (if (= i 16) 1
+    (let [v (if (< i 12) (cl ctx (+ nonce-off i)) (if (= i 15) 1 0))
+          s (cs ctx (+ 320 i) v)]
+      (set-j0 ctx nonce-off (+ i 1 (* 0 s))))))
+
+(defn copy-j0-to-ctr [ctx i]
+  (if (= i 16) 1
+    (let [s (cs ctx (+ 336 i) (cl ctx (+ 320 i)))]
+      (copy-j0-to-ctr ctx (+ i 1 (* 0 s))))))
+
+;; inc32 on the last four bytes of the counter block, modulo 2^32 as SP 800-38D
+;; specifies -- not modulo 2^128.
+(defn inc32 [ctx]
+  (let [n (+ (* (cl ctx 348) 16777216)
+             (+ (* (cl ctx 349) 65536)
+                (+ (* (cl ctx 350) 256) (cl ctx 351))))
+        m (bit-and (+ n 1) 4294967295)
+        s0 (cs ctx 348 (bit-and (quot m 16777216) 255))
+        s1 (cs ctx 349 (bit-and (quot m 65536) 255))
+        s2 (cs ctx 350 (bit-and (quot m 256) 255))
+        s3 (cs ctx 351 (bit-and m 255))]
+    (+ 1 (* 0 (+ s0 (+ s1 (+ s2 s3)))))))
+
+(defn crypt-block [ctx sub sublen index]
+  (if (>= index sublen) 1
+    (let [k (cl ctx (+ 448 index))
+          c (kernel-load-u8-4k sub sublen index)
+          s (kernel-store-u8-4k sub sublen index (bit-xor c k))]
+      (crypt-block ctx sub sublen (+ index 1 (* 0 s))))))
+
+;; The store window stops at 4096 and a record may be 12288, so the buffer has
+;; to be narrowed through `kernel-subregion` before anything is written to it.
+;; The narrowing is ONE CIPHER BLOCK WIDE rather than one 4096-byte chunk, and
+;; that is the whole point: with a 4096-wide chunk there is a boundary at 4096
+;; that nothing below 4 KiB of plaintext ever crosses, so every cheap vector
+;; would exercise a path the real records do not.  At 16 bytes the first block
+;; of a 32-byte record takes the identical path as the 768th block of a 12 KiB
+;; one, and the last partial block takes the same path a 60-byte record's does.
+;;
+;; The cost is one bounds-checked narrowing per block instead of per 4096
+;; bytes -- 768 extra operations on a full record, against the ~4M the object
+;; already spends there.  The keystream index becomes the block-local `index`
+;; rather than `index & 15`, so the alignment assumption disappears too.
+(defn crypt-all [ctx data data-len off]
+  (if (>= off data-len) 1
+    (let [rem (- data-len off)
+          sublen (if (> rem 16) 16 rem)
+          a (inc32 ctx)
+          b (aes-encrypt-block ctx 336 448)
+          sub (kernel-subregion data data-len off sublen)
+          c (crypt-block ctx sub sublen 0)]
+      (crypt-all ctx data data-len (+ off 16 (* 0 (+ a (+ b c))))))))
+
+;; --- tag -------------------------------------------------------------------
+
+(defn tag-out [ctx i]
+  (if (= i 16) 1
+    (let [s (cs ctx (+ 32 i) (bit-xor (cl ctx (+ 368 i)) (cl ctx (+ 352 i))))]
+      (tag-out ctx (+ i 1 (* 0 s))))))
+
+;; Accumulates every byte's difference before deciding, so the comparison does
+;; not return early on the first mismatching byte.
+(defn tag-diff [ctx i acc]
+  (if (= i 16) acc
+    (tag-diff ctx (+ i 1)
+              (bit-or acc
+                      (bit-xor (bit-xor (cl ctx (+ 368 i)) (cl ctx (+ 352 i)))
+                               (cl ctx (+ 32 i)))))))
+
+(defn zero-region [ctx off i]
+  (if (= i 16) 1
+    (let [s (cs ctx (+ off i) 0)] (zero-region ctx off (+ i 1 (* 0 s))))))
+
+;; --- the two directions ----------------------------------------------------
+
+(defn gcm-seal [ctx data data-len aad-len]
+  (let [c (crypt-all ctx data data-len 0)
+        a (gh-aad ctx 0 aad-len)
+        d (gh-data ctx data data-len 0)
+        l (gh-final ctx aad-len data-len)
+        t (tag-out ctx 0)]
+    (* 0 (+ c (+ a (+ d (+ l t)))))))
+
+(defn gcm-open [ctx data data-len aad-len]
+  (let [a (gh-aad ctx 0 aad-len)
+        d (gh-data ctx data data-len 0)
+        l (gh-final ctx aad-len data-len)
+        diff (tag-diff ctx 0 0)
+        prefix (* 0 (+ a (+ d l)))]
+    (if (= diff 0)
+      (let [c (crypt-all ctx data data-len 0)] (* 0 (+ c prefix)))
+      (+ 5 prefix))))
+
+(defn gcm-prepare [ctx nonce-off]
+  (let [bt (build-tables ctx)
+        bs (build-sbox ctx 0)
+        ke (key-expand ctx)
+        zh (zero-region ctx 304 0)
+        h (aes-encrypt-block ctx 304 304)
+        j (set-j0 ctx nonce-off 0)
+        ek (aes-encrypt-block ctx 320 368)
+        cc (copy-j0-to-ctr ctx 0)
+        zy (zero-region ctx 352 0)]
+    (+ 1 (* 0 (+ bt (+ bs (+ ke (+ zh (+ h (+ j (+ ek (+ cc zy))))))))))))

@@ -1,0 +1,273 @@
+(ns aiueos.qwen35-recurrent-step
+  (:export [aiueos-qwen35-recurrent-step main]))
+
+;; `recurrent_step` (`kernel/qwen35_infer.c:493`) as one kernel object: the
+;; gated DeltaNet update of ONE linear-attention head's recurrent state.
+;;
+;;     S <- decay * S
+;;     delta <- beta * (v - S^T k)
+;;     S <- S + k (x) delta
+;;     y <- (S^T q) / sqrt(d)
+;;
+;; Rows of `S` are the KEY dimension and columns the VALUE dimension, which is
+;; why every cell read below is `state[key * d + value]` and never the
+;; transpose.
+;;
+;; ## One arena, one plan
+;;
+;; The C takes eight arguments (`head_state`, `key`, `query`, `value`, `decay`,
+;; `beta`, `correction`, `output`) and this dialect admits five, of which one
+;; is the arena and one the plan. `kernel-subregion` also requires its BASE to
+;; be a parameter, a literal or `kernel-boot-info` (amu's
+;; `kernel_region_provenance_test`), so six regions could not arrive as six
+;; bases in any case. They arrive as OFFSETS into one region instead, which a
+;; plan may compute.
+;;
+;; The offsets are 64-bit because `decode->recurrent` is **150,994,944 bytes**
+;; (48 linear slots x 48 heads x 128 x 128 x 4) and sits above the model
+;; mapping: a u32 slot would truncate silently.
+;;
+;;     0   reserved, must be zero                  u32
+;;     4   reserved, must be zero                  u32
+;;     8   dimension, 1..128                       u64
+;;    16   state offset within the arena           u64
+;;    24   key offset                              u64
+;;    32   query offset                            u64
+;;    40   value offset                            u64
+;;    48   correction (scratch) offset             u64
+;;    56   output offset                           u64
+;;    64   decay, a binary32 bit pattern           u64  (high word zero)
+;;    72   beta, a binary32 bit pattern            u64  (high word zero)
+;;    80   reserved, must be zero                  u64
+;;    88   reserved, must be zero                  u64
+;;
+;; Region LENGTHS are DERIVED from the dimension -- `d*d*4` for the state and
+;; `d*4` for each vector -- rather than carried, so the plan cannot state a
+;; length that disagrees with the dimension it also states.
+;;
+;; ### Why the dimension is a field and not the constant 128
+;;
+;; `LINEAR_HEAD_DIM` is 128 and K16 will never call this with anything else.
+;; The field exists so the object can be RUN in the `kotoba.kir` interpreter,
+;; which recurses once per Kotoba call and has no tail-call elimination: the
+;; 16,384-cell decay walk at d=128 exhausts node's stack, while d=8 is 64
+;; cells and executes. The same reason `contracts/qwen35-norm-v1.edn` verifies
+;; a width of 32 rather than 5,120. The dimension changes no arithmetic --
+;; every loop below is bounded by it and by nothing else.
+;;
+;; ## Return
+;;
+;; **Zero is the success value.**
+;;
+;;    0    the state and the output were written
+;;   -1    null arena
+;;   -2    null plan
+;;   -3    plan length is not 96
+;;   -4    a reserved slot is non-zero
+;;   -5    the dimension is outside 1..128
+;;   -6    decay or beta is non-finite
+;;   -7    a region runs past the arena
+;;
+;; `-6` is a refusal `recurrent_step` does not itself make -- its CALLER does,
+;; at `linear_attention:704`
+;; (`if (!finite_float(decay) || !finite_float(beta)) return fail_at(...)`).
+;; It is here because the two are one composite in the C and because a
+;; non-finite decay poisons 65,536 bytes of state that nothing downstream reads
+;; back as an error.
+;;
+;; ## THE DECAY MULTIPLY IS HOISTED, AND THAT IS NOT A REASSOCIATION
+;;
+;; The C decays a cell inside the `remembered` accumulation:
+;;
+;;     for (v) { for (k) { cell = S + k*d + v; *cell *= decay;
+;;                         remembered += *cell * key[k]; } ... }
+;;
+;; Over the whole `v` loop every cell `(k, v)` is reached exactly once, so the
+;; multiply is applied to each cell exactly once and always BEFORE that cell is
+;; read. Doing all `d*d` multiplies first is therefore the same sequence of
+;; roundings over the same values -- a loop split, not a reordering of any
+;; arithmetic expression. It is done because `[state r v k acc]` already spends
+;; five parameters and `decay` would be a sixth.
+;;
+;; `remembered` is likewise split out and written to the correction slot before
+;; `(value[v] - remembered) * beta` narrows it. `remembered` is a `float` in
+;; the C, so the round trip through memory is exact.
+;;
+;; ## The reduction is SEQUENTIAL, not the four-accumulator tree
+;;
+;; `dot_scalar` (:234) and `stable_attention_score` (:115) both reduce in four
+;; accumulators. `recurrent_step` does NOT: both of its inner products
+;; accumulate one element at a time, left to right, in binary32. Using the tree
+;; here would disagree with the C on most inputs.
+;;
+;; ## The two inner loops walk a FLAT cell index, and that is a repair
+;;
+;; Both of them need a row and a column, which is six parameters against the
+;; five this dialect admits, so the first draft packed them as `v * 128 + k`
+;; with the dimension ceiling as the radix. At `d = 128` -- the only dimension
+;; K16 ever passes -- the decoded `k` is `vk mod 128`, which is never 128, so
+;; the termination test `k >= d` never fired: an infinite loop, `ud2` at the
+;; fuel guard, and `AIUEOS_EXCEPTION_FAIL unexpected-vector vector=6` under
+;; QEMU. Every interpreter vector passed, because the interpreter cannot run
+;; `d = 128` (see above) and every dimension below the ceiling terminates.
+;;
+;; The repair removes the radix rather than widening it. A column walk starts
+;; at `v` and steps by `d`, so `c >= d*d` is the end and `k` is `c / d`; the
+;; rank-one update touches every cell exactly once, so it is one flat loop over
+;; `c` with `k = c / d` and `v = c - k*d`. Neither depends on a ceiling.
+
+(defn f32w [u]
+  (if (> u 2147483647) (- u 4294967296) u))
+
+(defn u32w [v]
+  (bit-and v 4294967295))
+
+(defn plan-u32 [plan slot]
+  (kernel-load-u32 plan 96 slot))
+
+(defn plan-u64 [plan slot]
+  (+ (kernel-load-u32 plan 96 slot)
+     (* 4294967296 (kernel-load-u32 plan 96 (+ slot 4)))))
+
+;; `finite_float` (:92): the exponent field is not all ones.
+(defn nonfinite [bits]
+  (if (= (bit-and (u32w bits) 2139095040) 2139095040) 1 0))
+
+;; ------------------------------------------------------------- the two shapes
+
+;; A cell by its FLAT index, so the caller owns the `key * d + value` layout
+;; and this reader owns no geometry.
+(defn cell-at [state dim c]
+  (f32w (kernel-load-u32 (kernel-subregion state (* dim (* dim 4)) (* c 4) 4) 4 0)))
+
+(defn cell-put [state dim c bits]
+  (kernel-store-u32 (kernel-subregion state (* dim (* dim 4)) (* c 4) 4) 4 0
+                    (u32w bits)))
+
+(defn vec-at [r dim i]
+  (f32w (kernel-load-u32 (kernel-subregion r (* dim 4) (* i 4) 4) 4 0)))
+
+(defn vec-put [r dim i bits]
+  (kernel-store-u32 (kernel-subregion r (* dim 4) (* i 4) 4) 4 0 (u32w bits)))
+
+;; --------------------------------------------------------------------- passes
+
+;; `*cell *= decay` for every cell. See the note above on why this is a loop
+;; split rather than a reassociation.
+(defn scale-state [state dim decay c]
+  (if (>= c (* dim dim))
+    0
+    (do (cell-put state dim c
+                  (f32-to-bits (f32-mul (f32-from-bits (cell-at state dim c))
+                                        (f32-from-bits decay))))
+        (scale-state state dim decay (+ c 1)))))
+
+;; `sum over k of state[k*d + v] * r[k]`, binary32, left to right. Serves both
+;; `remembered` (r = key) and `value_out` (r = query): the C spells them
+;; separately but they are the same reduction down the same column.
+(defn dot-col [state r dim c acc]
+  (if (>= c (* dim dim))
+    acc
+    (dot-col state r dim (+ c dim)
+             (f32-to-bits
+              (f32-add (f32-from-bits acc)
+                       (f32-mul (f32-from-bits (cell-at state dim c))
+                                (f32-from-bits (vec-at r dim (quot c dim)))))))))
+
+(defn remembered-pass [state keyr corr dim v]
+  (if (>= v dim)
+    0
+    (do (vec-put corr dim v (dot-col state keyr dim v 0))
+        (remembered-pass state keyr corr dim (+ v 1)))))
+
+;; `correction[v] = (value[v] - remembered) * beta`
+(defn correction-pass [valr corr beta dim v]
+  (if (>= v dim)
+    0
+    (do (vec-put corr dim v
+                 (f32-to-bits
+                  (f32-mul (f32-sub (f32-from-bits (vec-at valr dim v))
+                                    (f32-from-bits (vec-at corr dim v)))
+                           (f32-from-bits beta))))
+        (correction-pass valr corr beta dim (+ v 1)))))
+
+;; `row[v] += k * correction[v]`, over every cell in row-major order -- which
+;; is the order the C's nested loops visit them in, and every cell is touched
+;; exactly once either way. The key element is re-read per column rather than
+;; hoisted, which loads the same four bytes `d` times and changes no
+;; arithmetic.
+(defn rank1-pass [state keyr corr dim c]
+  (if (>= c (* dim dim))
+    0
+    (do (cell-put state dim c
+                  (f32-to-bits
+                   (f32-add (f32-from-bits (cell-at state dim c))
+                            (f32-mul (f32-from-bits (vec-at keyr dim (quot c dim)))
+                                     (f32-from-bits
+                                      (vec-at corr dim (- c (* dim (quot c dim)))))))))
+        (rank1-pass state keyr corr dim (+ c 1)))))
+
+;; `output[v] = value_out * INV_SQRT_LINEAR_HEAD_DIM`. The constant is
+;; 0.08838834764831845f = 1/sqrt(128), and it is the CONSTANT the C multiplies
+;; by, not a function of the dimension field: `INV_SQRT_LINEAR_HEAD_DIM` is a
+;; `#define` and does not move when this object is verified at another width.
+(defn output-pass [state qryr outr dim v]
+  (if (>= v dim)
+    0
+    (do (vec-put outr dim v
+                 (f32-to-bits
+                  (f32-mul (f32-from-bits (dot-col state qryr dim v 0))
+                           (f32-from-bits 1035273459))))
+        (output-pass state qryr outr dim (+ v 1)))))
+
+;; ------------------------------------------------------------------- the walk
+
+;; The six region bounds, checked here rather than left to `kernel-subregion`:
+;; a subregion that runs past its parent TRAPS (`ud2`), and a trap is a triple
+;; fault with no reason code, where this object's whole convention is that a
+;; caller is told what was wrong. The subregion checks still run underneath and
+;; are the belt to this suspenders.
+(defn fits [alen off len]
+  (if (< off 0) 0 (if (< len 0) 0 (if (> (+ off len) alen) 0 1))))
+
+(defn regions-fit [alen plan]
+  (if (= 0 (fits alen (plan-u64 plan 16)
+                 (* (plan-u64 plan 8) (* (plan-u64 plan 8) 4)))) 0
+    (if (= 0 (fits alen (plan-u64 plan 24) (* (plan-u64 plan 8) 4))) 0
+      (if (= 0 (fits alen (plan-u64 plan 32) (* (plan-u64 plan 8) 4))) 0
+        (if (= 0 (fits alen (plan-u64 plan 40) (* (plan-u64 plan 8) 4))) 0
+          (if (= 0 (fits alen (plan-u64 plan 48) (* (plan-u64 plan 8) 4))) 0
+            (fits alen (plan-u64 plan 56) (* (plan-u64 plan 8) 4))))))))
+
+(defn run [arena alen plan]
+  (let [dim (plan-u64 plan 8)
+        state (kernel-subregion arena alen (plan-u64 plan 16) (* dim (* dim 4)))
+        keyr (kernel-subregion arena alen (plan-u64 plan 24) (* dim 4))
+        qryr (kernel-subregion arena alen (plan-u64 plan 32) (* dim 4))
+        valr (kernel-subregion arena alen (plan-u64 plan 40) (* dim 4))
+        corr (kernel-subregion arena alen (plan-u64 plan 48) (* dim 4))
+        outr (kernel-subregion arena alen (plan-u64 plan 56) (* dim 4))]
+    (do (scale-state state dim (f32w (plan-u32 plan 64)) 0)
+        (remembered-pass state keyr corr dim 0)
+        (correction-pass valr corr (f32w (plan-u32 plan 72)) dim 0)
+        (rank1-pass state keyr corr dim 0)
+        (output-pass state qryr outr dim 0))))
+
+(defn aiueos-qwen35-recurrent-step [arena arena-length plan plan-length]
+  (if (= arena 0) -1
+    (if (= plan 0) -2
+      (if (not (= plan-length 96)) -3
+        (if (not (= (plan-u32 plan 0) 0)) -4
+          (if (not (= (plan-u32 plan 4) 0)) -4
+            (if (not (= (plan-u32 plan 68) 0)) -4
+              (if (not (= (plan-u32 plan 76) 0)) -4
+                (if (not (= (plan-u64 plan 80) 0)) -4
+                  (if (not (= (plan-u64 plan 88) 0)) -4
+                    (if (< (plan-u64 plan 8) 1) -5
+                      (if (> (plan-u64 plan 8) 128) -5
+                        (if (= 1 (nonfinite (plan-u32 plan 64))) -6
+                          (if (= 1 (nonfinite (plan-u32 plan 72))) -6
+                            (if (= 0 (regions-fit arena-length plan)) -7
+                              (run arena arena-length plan))))))))))))))))
+
+(defn main [] 0)

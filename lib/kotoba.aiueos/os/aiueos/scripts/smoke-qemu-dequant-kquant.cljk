@@ -1,0 +1,283 @@
+#!/usr/bin/env kbb
+;; The two K-quant fused dequantize-and-dot instructions, executed.
+;;
+;; `kernel-dequant-dot-q4-k` and `kernel-dequant-dot-q6-k` (kotoba-native ADR
+;; 0074) each select ONE OF TWO instruction sequences at run time, from the
+;; `cpuid`/`xgetbv` guard `kernel-dot-f32` uses: eight lanes of AVX2 where the
+;; machine has it, and legacy scalar SSE where it does not. Both arms are
+;; unrolled thirty-two times, because a K-quant block's dequantization
+;; parameters change part-way through it and its groups are therefore not a
+;; loop. The compiler's suites can assert the bytes of all four arms. They
+;; cannot assert that the two arms of a pair compute the same number, because
+;; that is a claim about a machine.
+;;
+;; So this runs it on two machines. `-cpu max` under TCG exposes AVX2 and
+;; takes the vector arms; `-cpu qemu64` does not and takes the legacy ones.
+;; The experiment is that the eight hex digits are IDENTICAL, and that both
+;; equal the answer `kotoba.kir`'s reference interpreter gives for the same
+;; bytes.
+;;
+;; Usage: kbb --backend sci os/aiueos/scripts/smoke-qemu-dequant-kquant.cljk /path/to/compiler
+(ns smoke-qemu-dequant-kquant
+  (:require ["child_process" :as cp]
+            ["crypto" :as crypto]
+            ["fs" :as fs]
+            ["os" :as os]
+            ["path" :as path]
+            [kotoba.lang.text :as str]))
+
+(def repo (path/resolve (path/join (path/dirname *file*) ".." ".." "..")))
+(def aiueos (path/join repo "os" "aiueos"))
+(def source (path/join aiueos "native" "dequant-kquant-probe.kotoba"))
+
+;; What `kotoba.kir` answers for the bytes the probe writes, measured
+;; 2026-09-03 by driving the oracle with the same synthesised image.
+;;
+;; These constants do not merely say "a dot product happened". Each was chosen
+;; against the two nearest wrong answers, and the probe's fixture was changed
+;; until all three separated:
+;;
+;;   Q4_K  4FE700BC  the contract      4FE700BD  upper half of each group first
+;;                                     4FE700B8  a straight left-to-right sum
+;;   Q6_K  CF4602C5  the contract      CF4602C3  upper half first
+;;                                     CF4602C0  left to right
+;;
+;; and against two GEOMETRY mistakes, which a fixture of equal weights cannot
+;; see at all because every wrong answer is also 1.0:
+;;
+;;   Q4_K  4FEA00CF  the nibble halves swapped
+;;         4FC600BD  the neighbouring (scale, min) pair
+;;   Q6_K  CF448238  the nibble halves swapped
+;;         CF3BE1C6  the neighbouring scale index
+(def expected-q4 "4FE700BC")
+(def expected-q6 "CF4602C5")
+(def near-misses
+  {"4FE700BD" "Q4_K with the upper half of each group added first"
+   "4FE700B8" "Q4_K summed left to right"
+   "4FEA00CF" "Q4_K with the nibble halves swapped"
+   "4FC600BD" "Q4_K taking the neighbouring (scale, min) pair"
+   "CF4602C3" "Q6_K with the upper half of each group added first"
+   "CF4602C0" "Q6_K summed left to right"
+   "CF448238" "Q6_K with the nibble halves swapped"
+   "CF3BE1C6" "Q6_K taking the neighbouring scale index"})
+
+(def expected-marker "KQ")
+(def expected-status 33)
+
+;; The console is <enable-nibble><feature-nibble><eight Q4_K digits>
+;; <eight Q6_K digits>"KQ".
+;;
+;; The FEATURE nibble is what the guard tests, reported by the guest:
+;;
+;;   bit 0  leaf 1 ECX[27]  OSXSAVE
+;;   bit 1  leaf 1 ECX[28]  AVX
+;;   bit 2  leaf 7 EBX[5]   AVX2
+;;   bit 3  XCR0 & 6 == 6
+;;
+;; It is the CONTROL. "Both machines printed the same digits" says nothing
+;; unless the two machines differ in what the guard branches on, and it is
+;; also the only way to know WHICH ARM each run took -- the guard's answer is
+;; internal to one MC instruction and leaves no other trace.
+;;
+;; The ENABLE nibble is the second control: `1` means the guest ran
+;; `enable-extended-state` to completion, `0` means `cpuid` leaf 1 ECX bit 26
+;; said the CPU has no XSAVE at all, so the enable correctly did nothing.
+(def feature-bits [[1 "osxsave"] [2 "avx"] [4 "avx2"] [8 "xcr0-ymm"]])
+
+(defn decode-features [digit]
+  (let [value (js/parseInt digit 16)]
+    {:value value
+     :named (mapv second (filter (fn [[bit _]] (pos? (bit-and value bit)))
+                                 feature-bits))
+     :arm (if (= 15 value) "avx2" "scalar")}))
+
+(def cpu-models ["max" "qemu64"])
+
+(def ovmf-candidates
+  ["/opt/homebrew/share/qemu/edk2-x86_64-code.fd"
+   "/usr/share/OVMF/OVMF_CODE_4M.fd"
+   "/usr/share/OVMF/OVMF_CODE.fd"
+   "/usr/share/edk2/x64/OVMF_CODE.fd"])
+
+(defn die [message]
+  (js/console.error (str "error: " message))
+  (js/process.exit 1))
+
+;; Three outcomes, not two (ADR-0155). `die` is a real disagreement -- an arm
+;; answered something other than the oracle. `unmeasured` is "this machine
+;; could not ask": no compiler, no OVMF, no QEMU.
+(defn unmeasured [message]
+  (js/console.error (str "COULD-NOT-RUN " message))
+  (js/process.exit 3))
+
+(defn refused [message]
+  (js/console.error (str "REFUSED stale-image " message))
+  (js/process.exit 4))
+
+(defn sha256-file [p]
+  (when (fs/existsSync p)
+    (-> (crypto/createHash "sha256") (.update (fs/readFileSync p)) (.digest "hex"))))
+
+(defn run! [command args options]
+  (let [result (cp/spawnSync command (clj->js args)
+                             (clj->js (merge {:encoding "utf8"} options)))]
+    {:status (.-status result)
+     :stdout (or (.-stdout result) "")
+     :stderr (or (.-stderr result) "")}))
+
+(defn qemu-binary []
+  (let [q (or (.. js/process -env -QEMU_SYSTEM_X86_64) "qemu-system-x86_64")
+        r (run! "sh" ["-c" (str "command -v " q)] {})]
+    (when-not (zero? (:status r)) (unmeasured (str "qemu-missing: " q)))
+    q))
+
+(defn firmware []
+  (or (some #(when (fs/existsSync %) %) (cons (.. js/process -env -OVMF_CODE)
+                                              ovmf-candidates))
+      (unmeasured (str "ovmf-missing. Looked at: "
+                       (str/join ", " ovmf-candidates)))))
+
+(defn build! [compiler out]
+  (let [kernel (path/join out "KERNEL.ELF")
+        efi (path/join out "esp" "EFI" "BOOT" "BOOTX64.EFI")
+        binary (path/join compiler "bin" "kotoba-compiler")]
+    (fs/mkdirSync (path/dirname efi) #js {:recursive true})
+    (let [compiled (run! binary ["compile" source
+                                 "--target" "x86_64-aiueos-kernel-v1"
+                                 "--artifact" "image"
+                                 "--fuel" "1048576"
+                                 "--output" kernel]
+                         {})]
+      (when-not (zero? (:status compiled))
+        (unmeasured (str "compile-failed:\n" (:stdout compiled) (:stderr compiled)))))
+    (let [packaged (run! binary ["package-aiueos-boot" kernel "--output" efi] {})]
+      (when-not (zero? (:status packaged))
+        (unmeasured (str "package-failed:\n" (:stdout packaged) (:stderr packaged)))))
+    ;; The same no-foreign-object floor the shipping kernel's build script
+    ;; keeps. A test variant that quietly linked a C object would prove
+    ;; nothing about a pure-Kotoba kernel.
+    (doseq [entry (fs/readdirSync out #js {:recursive true})]
+      (when (re-find #"\.(c|o|obj|a|so)$" entry)
+        (die (str "foreign/C artifact entered the probe output: " entry))))
+    {:kernel kernel :efi efi
+     :digests {kernel (sha256-file kernel) efi (sha256-file efi)}}))
+
+(defn assert-fresh!
+  "Refuse to boot an artifact whose bytes are not the ones `build!` produced."
+  [{:keys [digests]}]
+  (when (empty? digests)
+    (unmeasured "no-artifacts: build! recorded no digest to compare against"))
+  (doseq [[p expected] digests]
+    (let [found (sha256-file p)]
+      (when-not found
+        (refused (str "artifact=" p " expected=" expected " found=absent")))
+      (when-not (= found expected)
+        (refused (str "artifact=" p " expected=" expected " found=" found)))))
+  (println (str "IMAGE-FRESH artifacts=" (count digests)))
+  (println (str "SCANNED " (count digests))))
+
+(defn observe [out cpu code]
+  (let [log (path/join out (str "debug-" cpu ".log"))]
+    (when (fs/existsSync log) (fs/unlinkSync log))
+    (let [result (run! (or (.. js/process -env -QEMU_SYSTEM_X86_64)
+                           "qemu-system-x86_64")
+                       ["-machine" "q35,accel=tcg"
+                        "-cpu" cpu
+                        "-m" "128M" "-smp" "2"
+                        "-drive" (str "if=pflash,format=raw,readonly=on,file=" code)
+                        "-drive" (str "format=raw,file=fat:rw:" (path/join out "esp"))
+                        "-device" "isa-debugcon,iobase=0xe9,chardev=debug"
+                        "-chardev" (str "file,id=debug,path=" log)
+                        "-device" "isa-debug-exit,iobase=0xf4,iosize=0x04"
+                        "-display" "none" "-serial" "none" "-no-reboot"]
+                       {:timeout 600000})
+          console (if (fs/existsSync log) (fs/readFileSync log "utf8") "")]
+      {:cpu cpu :status (:status result) :console console})))
+
+(defn explain [digits expected]
+  (str digits ", and kotoba.kir answers " expected
+       (if-let [named (get near-misses digits)]
+         (str " -- that is " named)
+         "")))
+
+(defn -main [& args]
+  (let [compiler (or (first args)
+                     (die "usage: smoke-qemu-dequant-kquant.cljk /path/to/compiler"))
+        out (fs/mkdtempSync (path/join (os/tmpdir) "aiueos-dequant-kquant-"))
+        code (firmware)
+        _ (qemu-binary)
+        built (build! compiler out)
+        observations (mapv (fn [cpu]
+                             ;; before EVERY boot: two boots share one
+                             ;; artifact, and the claim under test is that
+                             ;; they ran the SAME bytes on two machines.
+                             (assert-fresh! built)
+                             (observe out cpu code))
+                           cpu-models)]
+    (doseq [{:keys [cpu status console]} observations]
+      (println (str "-cpu " cpu ": exit=" status " console=" (pr-str console))))
+    (doseq [{:keys [cpu status console]} observations]
+      (when-not (= expected-status status)
+        (die (str "-cpu " cpu " exited " status ", expected " expected-status
+                  " -- the probe's own checks failed inside the guest")))
+      (when-not (re-find #"^[01][0-9A-F][0-9A-F]{8}[0-9A-F]{8}KQ$" console)
+        (die (str "-cpu " cpu " printed " (pr-str console)
+                  ", which is not <enable-nibble><feature-nibble>"
+                  "<eight Q4_K digits><eight Q6_K digits>KQ"))))
+    (let [decoded (mapv (fn [{:keys [cpu console]}]
+                          (assoc (decode-features (subs console 1 2))
+                                 :cpu cpu
+                                 :enabled (js/parseInt (subs console 0 1) 10)
+                                 :q4 (subs console 2 10)
+                                 :q6 (subs console 10 18)))
+                        observations)]
+      (doseq [{:keys [cpu value named arm q4 q6 enabled]} decoded]
+        (println (str "  " cpu ": enable=" enabled " features=" value " "
+                      (pr-str named) " arm=" arm " q4-k=" q4 " q6-k=" q6)))
+      ;; The enable and the machine must agree. A run that reports `enable=1`
+      ;; and no OSXSAVE means CR4 was written and did not take.
+      (doseq [{:keys [cpu enabled value]} decoded]
+        (when (and (= 1 enabled) (zero? (bit-and value 1)))
+          (die (str "-cpu " cpu " ran the extended-state enable and still"
+                    " reports CR4.OSXSAVE clear")))
+        (when (and (= 0 enabled) (pos? (bit-and value 1)))
+          (die (str "-cpu " cpu " reports CR4.OSXSAVE set without having run"
+                    " the enable"))))
+      ;; Every run must agree with the reference interpreter. This is the
+      ;; assertion that fails if an arm computes something else, and it names
+      ;; the wrong answer when the wrong answer is one of the eight this
+      ;; fixture was built to separate.
+      (doseq [{:keys [cpu q4 q6]} decoded]
+        (when-not (= expected-q4 q4)
+          (die (str "-cpu " cpu " answered Q4_K " (explain q4 expected-q4))))
+        (when-not (= expected-q6 q6)
+          (die (str "-cpu " cpu " answered Q6_K " (explain q6 expected-q6)))))
+      ;; The two models must actually have been different machines, or an
+      ;; agreement between them is an agreement between one sequence and
+      ;; itself.
+      (when-not (= 2 (count (set (map :value decoded))))
+        (die (str "both models reported the same CPU features "
+                  (pr-str (mapv :value decoded))
+                  " -- the two runs saw the same machine, so nothing here "
+                  "distinguishes the arms")))
+      (let [arms (set (map :arm decoded))]
+        (println (str "AIUEOS_DEQUANT_KQUANT_QEMU q4-k=" expected-q4
+                      " q6-k=" expected-q6
+                      " arms-exercised=" (str/join "," (sort arms))
+                      " models=" (str/join "," cpu-models)))
+        (if (contains? arms "avx2")
+          (do (println (str "AIUEOS_DEQUANT_KQUANT_QEMU_OK both-arms-executed"
+                            " and-agree-with-kotoba-kir exit=" expected-status))
+              (js/process.exit 0))
+          ;; NOT a pass, and NOT a failure. The legacy arms ran on two machines
+          ;; and answered what the oracle answers; the AVX2 arms did not run at
+          ;; all, so nothing here says anything about them.
+          (do (js/console.error
+               (str "AIUEOS_DEQUANT_KQUANT_QEMU_AVX2_ARM_NOT_EXERCISED"
+                    " enable=" (str/join "," (map #(str (:cpu %) ":" (:enabled %))
+                                                  decoded))
+                    " features=" (str/join "," (map #(str (:cpu %) ":" (:value %))
+                                                    decoded))))
+              (js/process.exit 2)))))))
+
+(apply -main (drop 3 (js->clj js/process.argv)))

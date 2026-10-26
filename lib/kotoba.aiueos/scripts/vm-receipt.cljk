@@ -1,0 +1,83 @@
+#!/usr/bin/env kbb
+;; Write the receipt of a run in the reference VM (the owner's Mac, scorecard v1): the serial log, the
+;; classifier's verdict for each named profile, the host, the commit, and a hash of every screenshot the
+;; run left. A scorecard row may name the receipt as evidence; the checker reads it back.
+;;
+;;   kbb --backend sci --classpath src scripts/vm-receipt.cljk --serial F --out DIR --profiles a,b,c [--shots DIR]
+;;       [--serial1 F]               the first boot's serial for a two-boot gate (guest-browser-settings keeps it as :serial1)
+;;       [--suspend DIR]             the directory holding suspend-{before,during,after}.ppm and suspend-timing.txt (guest-browser-suspend): hashed, tested
+;;                                   for black and handed to the classifier; the receipt keeps the hashes and the timing (not the 3 MB dumps)
+;;       [--wav F]                   the WAV the sound card wrote (guest-browser-audio): passed to the classifier and kept beside the serial
+;;       [--extra F]                 a second text (a gate's own output) that --require regexes also search; kept beside the serial
+;;       [--require name=REGEX ...]  a verdict that is green when REGEX matches a line of the serial (for a gate that is
+;;                                   not a compositor profile, e.g. the DHCP lease marker); --profiles may then be empty
+;; Exit 0 when every named profile is green on the serial, 1 otherwise.
+
+(ns vm-receipt
+  (:require [aiueos.compositor.guest :as g]
+            [clojure.string :as str]
+            ["node:fs" :as fs]
+            ["node:path" :as path]
+            ["node:crypto" :as crypto]
+            ["node:child_process" :as cp]))
+
+(def ^:private args (vec *command-line-args*))
+(defn- opt [f] (let [i (.indexOf args f)] (when-not (neg? i) (nth args (inc i) nil))))
+(defn- sh [cmd] (str/trim (str (.execSync cp cmd #js {:encoding "utf8" :stdio #js ["ignore" "pipe" "ignore"]}))))
+(defn- sha [buf] (-> (.createHash crypto "sha256") (.update buf) (.digest "hex")))
+
+(let [serial-path (opt "--serial") out (opt "--out")
+      profiles (remove str/blank? (str/split (or (opt "--profiles") "") #","))
+      requires (for [i (range (count args)) :when (= "--require" (nth args i))
+                     :let [kv (nth args (inc i))
+                           [k re] (let [j (.indexOf kv "=")] [(subs kv 0 j) (subs kv (inc j))])]]
+                 [k re])
+      shots (opt "--shots")
+      serial (str (.readFileSync fs serial-path "utf8"))
+      suspend-dir (opt "--suspend")
+      suspend-ev (when suspend-dir
+                   (let [rd (fn [n] (let [f (.join path suspend-dir n)] (when (.existsSync fs f) (.readFileSync fs f))))
+                         shaf (fn [b] (when b (sha b)))
+                         off (fn [^js b] (loop [o 0 nl 0] (cond (>= o (.-length b)) o (= 10 (aget b o)) (if (= nl 2) (inc o) (recur (inc o) (inc nl))) :else (recur (inc o) nl))))
+                         black? (fn [b] (when b (let [o (off b)] (loop [i o] (cond (>= i (.-length b)) true (not= 0 (aget b i)) false :else (recur (inc i)))))))
+                         b (rd "suspend-before.ppm") d (rd "suspend-during.ppm") a (rd "suspend-after.ppm")
+                         t (when-let [m (re-find #"resume_ms=(\d+)" (str (or (some-> (rd "suspend-timing.txt") (.toString "utf8")) "")))] (second m))]
+                     {:before-sha (shaf b) :during-sha (shaf d) :after-sha (shaf a) :during-black? (black? d) :before-black? (black? b)
+                      :resume-ms (some-> t parse-long)}))
+      wav-path (opt "--wav")
+      wav (when wav-path (.readFileSync fs wav-path))
+      extra-path (opt "--extra")
+      extra (when extra-path (str (.readFileSync fs extra-path "utf8")))
+      serial1-path (opt "--serial1")
+      serial1 (when serial1-path (str (.readFileSync fs serial1-path "utf8")))
+      verdicts (into (into {} (for [p profiles]
+                                (let [r (g/classify p (cond-> {:serial serial} serial1 (assoc :serial1 serial1) wav (assoc :wav wav) suspend-ev (assoc :suspend suspend-ev)))]
+                                  [p {:green? (boolean (:green? r)) :reason (:reason r)}])))
+                     (for [[k re] requires]
+                       [k {:green? (boolean (re-find (re-pattern (str "(?m)^" re)) (str serial "\n" extra))) :reason :marker :marker re}]))
+      shot-hashes (when shots
+                    (into (sorted-map)
+                          (for [f (sort (js->clj (.readdirSync fs shots)))
+                                :when (str/ends-with? f ".ppm")]
+                            [f (sha (.readFileSync fs (.join path shots f)))])))
+      receipt {:date (sh "date -u +%Y-%m-%dT%H:%M:%SZ")
+               :commit (sh "git rev-parse HEAD")
+               :host {:model (sh "sysctl -n hw.model") :cpu (sh "sysctl -n machdep.cpu.brand_string")
+                      :os (sh "uname -srm") :qemu (sh "qemu-system-x86_64 --version | head -1")}
+               :serial-sha256 (sha (.readFileSync fs serial-path))
+               :wav-sha256 (when wav-path (sha wav))
+               :suspend suspend-ev
+               :serial1-sha256 (when serial1-path (sha (.readFileSync fs serial1-path)))
+               :verdicts verdicts
+               :screenshots-sha256 shot-hashes}]
+  (.mkdirSync fs out #js {:recursive true})
+  (.writeFileSync fs (.join path out "kernel-serial.log") serial)
+  (when wav (.writeFileSync fs (.join path out "audio.wav") wav))
+  (when suspend-dir
+    (doseq [n ["suspend-timing.txt"]]   ; the screendumps are 3 MB each: their hashes are in the receipt
+      (let [f (.join path suspend-dir n)] (when (.existsSync fs f) (.copyFileSync fs f (.join path out n))))))
+  (when extra (.writeFileSync fs (.join path out "gate-output.log") extra))
+  (when serial1 (.writeFileSync fs (.join path out "kernel-serial.log.boot1") serial1))
+  (.writeFileSync fs (.join path out "receipt.edn") (str (pr-str receipt) "\n"))
+  (println (str "RECEIPT " out " profiles=" (+ (count profiles) (count requires)) " green=" (count (filter :green? (vals verdicts)))))
+  (when-not (every? :green? (vals verdicts)) (.exit js/process 1)))

@@ -1,0 +1,117 @@
+#!/usr/bin/env kbb
+;; Build the kernel desktop font (ADR-0224) from a GNU Unifont BDF.
+;;
+;;   kbb --backend sci os/aiueos/scripts/make-font.cljk <unifont_jp.bdf> <out.fnt>
+;;   kbb --backend sci os/aiueos/scripts/make-font.cljk --check <unifont_jp.bdf> <out.fnt>
+;;
+;; The subset is every code point JIS X 0208 can name (enumerated by decoding
+;; each EUC-JP row/cell pair with the host's own decoder, so no hand table),
+;; printable ASCII, U+3000 and U+FFFD. Unifont is dual licensed; the glyphs are
+;; used under the SIL OFL 1.1 (os/aiueos/fonts/OFL-1.1.txt).
+;;
+;; FORMAT `aiueos-font/v1`, little-endian u32 words:
+;;   0  magic 0x46554941 ("AIUF")   4  version 1   8  count N   12  0
+;;   16 + 4i   code point of glyph i, bit 24 set when it is 16 px wide;
+;;             sorted by code point, so a reader can binary-search it
+;;   16 + 4N + 32i  glyph i: 16 rows x 2 bytes, MSB = leftmost pixel; an
+;;             8 px glyph uses the first byte of each row
+;;
+;; Exit 0 wrote (or --check: the file on disk is byte-identical to what this
+;; would write), 1 --check differs, 2 could not run (unreadable BDF, a glyph
+;; that is not 16 rows, an empty subset).
+(ns make-font
+  (:require [kotoba.lang.text :as str]
+            ["node:fs" :as fs]))
+
+(defn- die [code msg]
+  (.error js/console msg)
+  (.exit js/process code))
+
+(def ^:private args
+  (let [a (vec *command-line-args*)] (if (= "--" (first a)) (subvec a 1) a)))
+(def ^:private check? (= "--check" (first args)))
+(def ^:private paths (if check? (subvec args 1) args))
+(def ^:private bdf-path (first paths))
+(def ^:private out-path (second paths))
+
+(when-not (and bdf-path out-path)
+  (die 2 "usage: make-font.cljk [--check] <unifont_jp.bdf> <out.fnt>"))
+
+(defn- jis0208-code-points []
+  (let [dec (js/TextDecoder. "euc-jp" #js {:fatal true})]
+    (set
+     (for [row (range 0xa1 0xff)
+           cell (range 0xa1 0xff)
+           :let [s (try (.decode dec (js/Uint8Array. #js [row cell]))
+                        (catch :default _ nil))]
+           :when (and s (= 1 (count (js/Array.from s))))]
+       (.codePointAt s 0)))))
+
+(def ^:private wanted
+  (into (jis0208-code-points)
+        (concat (range 0x20 0x7f) [0x3000 0xfffd])))
+
+(defn- parse-bdf [text]
+  ;; -> {cp {:wide? bool :rows [16 ints, left-aligned to 16 bits]}}
+  (loop [lines (str/split-lines text) cur nil acc {}]
+    (if-let [l (first lines)]
+      (let [l (str/trim l)]
+        (cond
+          (str/starts-with? l "ENCODING ")
+          (recur (rest lines) {:cp (js/parseInt (subs l 9) 10)} acc)
+
+          (str/starts-with? l "DWIDTH ")
+          (recur (rest lines) (assoc cur :w (js/parseInt (second (str/split l #" ")) 10)) acc)
+
+          (= l "BITMAP")
+          (recur (rest lines) (assoc cur :rows []) acc)
+
+          (= l "ENDCHAR")
+          (let [{:keys [cp w rows]} cur]
+            (recur (rest lines) nil
+                   (if (contains? wanted cp)
+                     (do (when-not (= 16 (count rows))
+                           (die 2 (str "COULD-NOT-RUN glyph U+" (.toString cp 16) " has "
+                                       (count rows) " rows, not 16")))
+                         (assoc acc cp {:wide? (= w 16) :rows rows}))
+                     acc)))
+
+          (and cur (:rows cur))
+          (let [v (js/parseInt l 16)
+                v (if (= 2 (count l)) (* v 256) v)]
+            (recur (rest lines) (update cur :rows conj v) acc))
+
+          :else (recur (rest lines) cur acc)))
+      acc)))
+
+(defn- u32! [^js buf off v] (.writeUInt32LE buf (bit-and v 0xffffffff) off))
+
+(defn- encode [glyphs]
+  (let [cps (sort (keys glyphs))
+        n (count cps)
+        buf (js/Buffer.alloc (+ 16 (* 4 n) (* 32 n)))]
+    (u32! buf 0 0x46554941) (u32! buf 4 1) (u32! buf 8 n) (u32! buf 12 0)
+    (doseq [[i cp] (map-indexed vector cps)
+            :let [{:keys [wide? rows]} (get glyphs cp)
+                  base (+ 16 (* 4 n) (* 32 i))]]
+      (u32! buf (+ 16 (* 4 i)) (bit-or cp (if wide? 0x1000000 0)))
+      (doseq [[r v] (map-indexed vector rows)]
+        (.writeUInt8 buf (bit-and (bit-shift-right v 8) 0xff) (+ base (* 2 r)))
+        (.writeUInt8 buf (bit-and v 0xff) (+ base (* 2 r) 1))))
+    [buf n]))
+
+(let [text (try (.readFileSync fs bdf-path "utf8")
+                (catch :default e (die 2 (str "COULD-NOT-RUN unreadable BDF " bdf-path ": " (ex-message e)))))
+      glyphs (parse-bdf text)
+      missing (remove #(contains? glyphs %) (sort wanted))
+      _ (when (empty? glyphs) (die 2 "COULD-NOT-RUN the subset is empty"))
+      [buf n] (encode glyphs)]
+  (println (str "FONT glyphs=" n " wanted=" (count wanted) " missing=" (count missing)
+                " bytes=" (.-length buf)))
+  (if check?
+    (let [on-disk (try (.readFileSync fs out-path) (catch :default _ nil))]
+      (if (and on-disk (.equals buf on-disk))
+        (println "FONT-CHECK identical")
+        (die 1 "FONT-CHECK differs")))
+    (do (.writeFileSync fs out-path buf)
+        (println (str "FONT-WRITTEN " out-path)))))

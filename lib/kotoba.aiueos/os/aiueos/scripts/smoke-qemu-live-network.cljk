@@ -1,0 +1,115 @@
+#!/usr/bin/env kbb
+;; Does the live installer come up with a network?
+;;
+;; A box that is going to become a murakumo node has to answer its own
+;; enrolment challenge, and that starts with a DHCP lease in the live
+;; environment. This boots the UKI under OVMF and reads the serial for the
+;; markers /init prints.
+;;
+;; Two runs, because one marker proves nothing about the others. With a NIC
+;; the gate requires a LEASE; with `-nic none` it requires NO_INTERFACE. If
+;; both runs printed the same thing, the check could not tell a box that is
+;; offline from a box whose NIC driver never shipped -- and a module that
+;; failed to build is silently absent, so that is exactly the confusion this
+;; has to rule out.
+;;
+;; It does not need an install USB: /init brings the network up before it looks
+;; for the payload, so the run ends at AIUEOS_LIVE_PAYLOAD_ABSENT either way.
+;;
+;;   kbb --backend sci os/aiueos/scripts/smoke-qemu-live-network.cljk \
+;;     --live build/aiueos/live-net
+
+(require '["node:child_process" :as cp]
+         '["node:fs" :as fs]
+         '["node:os" :as os]
+         '["node:path" :as path]
+         '[kotoba.lang.text :as str])
+
+(def argv (vec *command-line-args*))
+(defn- opt [f d] (let [i (.indexOf argv f)] (if (neg? i) d (nth argv (inc i)))))
+
+(def live-dir (opt "--live" "build/aiueos/live-net"))
+(def qemu (or (.-QEMU_SYSTEM_X86_64 js/process.env) "qemu-system-x86_64"))
+
+(defn- die [& m] (println (str "smoke-live-network: " (str/join " " m))) (js/process.exit 2))
+
+(defn- first-existing [paths what]
+  (or (some #(when (fs/existsSync %) %) paths) (die "could not find" what)))
+
+(def ovmf (or (.-OVMF_CODE js/process.env)
+              (first-existing ["/opt/homebrew/share/qemu/edk2-x86_64-code.fd"
+                               "/usr/share/OVMF/OVMF_CODE_4M.fd"
+                               "/usr/share/OVMF/OVMF_CODE.fd"] "OVMF code")))
+(def ovmf-vars-template
+  (or (.-OVMF_VARS js/process.env)
+      (first-existing ["/opt/homebrew/share/qemu/edk2-i386-vars.fd"
+                       "/usr/share/OVMF/OVMF_VARS_4M.fd"
+                       "/usr/share/OVMF/OVMF_VARS.fd"] "OVMF vars")))
+
+(def uki (path/join live-dir "uki.efi"))
+(when-not (fs/existsSync uki)
+  (die "no uki.efi at" uki "— run make-live-installer.py build --output-dir" live-dir))
+
+;; QEMU synthesises a FAT filesystem from a directory, so the ESP needs no
+;; loopback mount and no mtools -- which macOS does not have.
+(def esp (fs/mkdtempSync (path/join (os/tmpdir) "aiueos-live-esp-")))
+(fs/mkdirSync (path/join esp "EFI" "BOOT") #js {:recursive true})
+(fs/copyFileSync uki (path/join esp "EFI" "BOOT" "BOOTX64.EFI"))
+
+(defn- boot [label net-args]
+  (let [vars (path/join (fs/mkdtempSync (path/join (os/tmpdir) "aiueos-vars-")) "VARS.fd")]
+    (fs/copyFileSync ovmf-vars-template vars)
+    (let [r (.spawnSync
+             cp qemu
+             (to-array
+              (concat ["-machine" "q35,accel=tcg" "-m" "1024" "-smp" "2"
+                       "-drive" (str "if=pflash,format=raw,readonly=on,file=" ovmf)
+                       "-drive" (str "if=pflash,format=raw,file=" vars)
+                       "-drive" (str "file=fat:rw:" esp ",format=raw,if=none,id=esp")
+                       "-device" "virtio-blk-pci,drive=esp"
+                       "-display" "none" "-serial" "stdio" "-no-reboot"]
+                      net-args))
+             #js {:encoding "utf8" :timeout 300000 :maxBuffer 64000000})
+          out (str (.-stdout r) (.-stderr r))]
+      (println (str "  [" label "] qemu exited, " (count out) " bytes of serial"))
+      out)))
+
+(def results (atom []))
+(defn- check! [name ok detail]
+  (swap! results conj [name ok])
+  (println (if ok "LIVENET_OK  " "LIVENET_FAIL") name (if ok "" (str "-- " detail))))
+
+(println "booting with a virtio NIC…")
+(def with-nic (boot "nic" ["-netdev" "user,id=n0" "-device" "virtio-net-pci,netdev=n0"]))
+
+(println "booting with no NIC at all…")
+(def no-nic (boot "no-nic" ["-nic" "none"]))
+
+(defn- marker [out m] (str/includes? out m))
+
+(check! "init-ran" (marker with-nic "AIUEOS_LIVE_INIT start")
+        "the live init never started; this is not a network result")
+(check! "an-interface-appears" (marker with-nic "AIUEOS_LIVE_NET_INTERFACES")
+        "no interface was enumerated with a virtio NIC attached — the NIC module did not ship")
+(check! "a-lease-is-taken" (marker with-nic "AIUEOS_LIVE_NET_LEASE")
+        (str "no DHCP lease. serial tail: "
+             (str/join "\n" (take-last 12 (str/split-lines with-nic)))))
+(check! "the-lease-is-a-real-address"
+        (some? (re-find #"AIUEOS_LIVE_NET_LEASE \S+ 10\.0\.2\.\d+" with-nic))
+        "the lease marker printed without an address in QEMU's user network")
+
+;; the discriminating half
+(check! "no-nic-says-no-interface" (marker no-nic "AIUEOS_LIVE_NET_NO_INTERFACE")
+        "a box with no NIC did not say so")
+(check! "no-nic-does-not-claim-a-lease" (not (marker no-nic "AIUEOS_LIVE_NET_LEASE"))
+        "a box with no NIC reported a lease")
+(check! "the-two-runs-differ" (not= (marker with-nic "AIUEOS_LIVE_NET_LEASE")
+                                    (marker no-nic "AIUEOS_LIVE_NET_LEASE"))
+        "both runs said the same thing, so this gate discriminates nothing")
+
+(let [total (count @results) failed (remove second @results)]
+  (println)
+  (println (str "checks=" total " failed=" (count failed)))
+  (when (seq failed) (println (str "failed: " (str/join ", " (map first failed)))))
+  (println (if (empty? failed) "AIUEOS_LIVE_NETWORK_OK" "AIUEOS_LIVE_NETWORK_FAIL"))
+  (js/process.exit (if (empty? failed) 0 1)))

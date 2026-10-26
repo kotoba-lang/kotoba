@@ -1,0 +1,144 @@
+#!/usr/bin/env kbb
+;; The hosted engine's answer for the guest desktop's body layout (ADR-0234):
+;; for each scene, the glyphs kotoba-lang/browser's browser.surface +
+;; cssom.layout draw in each window's body, as the kernel would name them.
+;; Neither browser-frame2.kotoba, the kernel's C nor browser-frame-model.cljk is
+;; consulted.
+;;
+;;   CP="$(cd ../browser && kbb -Spath | ...absolute...)"
+;;   kbb --backend sci --classpath "$CP" os/aiueos/scripts/browser-flow-oracle.cljk \
+;;     --write <scenes.edn> os/aiueos/fonts/aiueos-16.fnt > os/aiueos/contracts/browser-flow-parity-v1.edn
+;;   ... browser-flow-oracle.cljk --check os/aiueos/contracts/browser-flow-parity-v1.edn
+;;
+;; A scene is browser-frame-model's shape ({:vw :vh :focus :stack [{:id :x :y
+;; :w :h :title :body}]}, stack bottom first). It becomes a browser.surface
+;; surface with the same windows in the same order, each window's document the
+;; body text -- code points up to the first 0 or the 64th, each 10 a [:br] --
+;; and default-theme with one addition: `:measure-text`, the committed font's
+;; advance (8 or 16 per code point, U+FFFD's for one the font lacks), which is
+;; cssom's own hook for a host that knows its font.
+;;
+;; What is written per window is every glyph of the body's :text draw ops,
+;; expanded at the font's advance from the op's x, as [dx dy glyph width]
+;; relative to the window body's box -- the `<main class="window-body">` rect
+;; in the hosted engine, (x, y + 28) in the kernel -- after the kernel's two
+;; clips, which the hosted engine does not have: a glyph whose foot passes the
+;; body's bottom inset (dy + 16 > h - 36) or whose right edge passes the
+;; viewport (x + dx + width > vw) is dropped. Where the hosted engine puts the
+;; windows (its workspace stacks them in block flow; the kernel keeps
+;; :window/rect) and how tall its titlebar is (44 against browser.input's 28)
+;; are not compared: this is the body's layout.
+;;
+;; --check: exit 0 every scene's hosted glyphs equal the file's; 1 one
+;; differs (the first differing glyph is printed); 2 could not run. It prints
+;; COMPARED<TAB>n windows; n = 0 is exit 2.
+(ns browser-flow-oracle
+  (:require [browser.surface :as surface]
+            [clojure.edn :as edn]
+            [kotoba.pprint :as pp]
+            ["node:fs" :as fs]))
+
+(defn- die [code msg] (.error js/console msg) (.exit js/process code))
+
+(def ^:private args (vec *command-line-args*))
+
+(defn- read-edn [path]
+  (try (edn/read-string (str (.readFileSync fs path)))
+       (catch :default e (die 2 (str "COULD-NOT-RUN " path ": " e)))))
+
+(defn- font-index [path]
+  (let [buf (try (.readFileSync fs path) (catch :default e (die 2 (str "COULD-NOT-RUN font " path ": " e))))
+        u32 (fn [i] (.readUInt32LE buf (* 4 i)))]
+    (into {} (for [i (range (u32 2)) :let [e (u32 (+ 4 i))]]
+               [(bit-and e 16777215) [i (if (> e 16777215) 16 8)]]))))
+
+(defn- cps [s] (map #(.codePointAt % 0) (js/Array.from s)))
+
+(defn- hosted-bodies
+  "{window-id [[dx dy glyph width] ...]} for one scene."
+  [index {:keys [vw vh focus stack]}]
+  (let [glyph (fn [cp] (or (index cp) (index 65533)))
+        adv (fn [text _ _ _ _] (reduce + (map (comp second glyph) (cps (str text)))))
+        text (fn [cs] (apply str (map #(js/String.fromCodePoint %) cs)))
+        doc (fn [body]
+              (let [body (take-while pos? (take 64 body))]
+                (if (some #{10} body)
+                  (apply list (interpose [:br] (map text (loop [cs body cur [] out []]
+                                                           (if-let [c (first cs)]
+                                                             (if (= c 10) (recur (rest cs) [] (conj out cur))
+                                                                 (recur (rest cs) (conj cur c) out))
+                                                             (conj out cur))))))
+                  (text body))))
+        s {:surface/id "aiueos" :surface/title "aiueos" :surface/apps []
+           :surface/viewport [vw vh]
+           :surface/theme (assoc surface/default-theme :measure-text adv)
+           :surface/windows (mapv (fn [{:keys [id x y w h title body]}]
+                                    {:window/id id :window/title (text (take-while pos? title))
+                                     :window/rect [x y w h] :window/document (doc body)})
+                                  stack)
+           :surface/focus focus}
+        ops (:draw-ops (surface/render-surface s))
+        ;; each window body's <main> rect, in stack order, then its text ops up
+        ;; to the window's <footer>
+        spans (loop [ops ops cur nil out []]
+                (if-let [op (first ops)]
+                  (cond
+                    (and (= :rect (:draw/op op)) (= :main (:tag op)) (= "#ffffff" (:color op)))
+                    (recur (rest ops) {:main op :texts []} (if cur (conj out cur) out))
+                    (and cur (= :rect (:draw/op op)) (= :footer (:tag op)))
+                    (recur (rest ops) nil (conj out cur))
+                    (and cur (= :text (:draw/op op)))
+                    (recur (rest ops) (update cur :texts conj op) out)
+                    :else (recur (rest ops) cur out))
+                  (if cur (conj out cur) out)))]
+    (when-not (= (count spans) (count stack))
+      (die 2 (str "COULD-NOT-RUN the hosted engine drew " (count spans) " window bodies for "
+                  (count stack) " windows")))
+    (into (sorted-map)
+          (map (fn [{:keys [id x y w h]} {:keys [main texts]}]
+                 [id (vec (for [{tx :x ty :y t :text} texts
+                                :let [dy (- ty (:y main))]
+                                [dx cp] (map vector
+                                             (reductions + (- tx (:x main)) (map (comp second glyph) (cps t)))
+                                             (cps t))
+                                :let [[gi gw] (glyph cp)]
+                                :when (<= (+ dy 16) (- h 36))
+                                :when (<= (+ x dx gw) vw)]
+                            [dx dy gi gw]))])
+               stack spans))))
+
+(defn- run [font scenes]
+  (let [index (font-index font)]
+    (mapv (fn [{:keys [name scene]}]
+            {:name name :scene scene :bodies (hosted-bodies index scene)})
+          scenes)))
+
+(case (first args)
+  "--write"
+  (let [[_ scenes-path font] args
+        out (run font (read-edn scenes-path))]
+    (println ";; The hosted engine's body glyphs for the guest desktop's scenes (ADR-0234),")
+    (println ";; written by os/aiueos/scripts/browser-flow-oracle.cljk --write from")
+    (println ";; kotoba-lang/browser browser.surface + cssom.layout. Do not edit: --check")
+    (println ";; recomputes every body from :scene and compares. Per window id, each glyph as")
+    (println ";; [dx dy glyph-index width] from the window body's box, after the kernel's")
+    (println ";; clips (bottom inset, viewport edge). Consumers: browser-frame-model.cljk")
+    (println ";; --parity (the model), the guest-browser-flow-parity gate (the kernel).")
+    (pp/pprint {:format :aiueos.browser-flow-parity/v1 :font font :scenes out}))
+
+  "--check"
+  (let [contract (read-edn (second args))
+        fresh (run (:font contract) (:scenes contract))
+        diffs (for [[want got] (map vector (:scenes contract) fresh)
+                    [id glyphs] (:bodies got)
+                    :let [old (get-in want [:bodies id])]
+                    :when (not= old glyphs)]
+                (let [i (count (take-while true? (map = old glyphs)))]
+                  (str (:name want) " window " id " glyph " i ": file " (pr-str (get old i))
+                       " hosted " (pr-str (get glyphs i)))))
+        n (reduce + (map (comp count :bodies) fresh))]
+    (println (str "COMPARED\t" n))
+    (doseq [d diffs] (println "DIFFERS" d))
+    (.exit js/process (cond (zero? n) 2 (seq diffs) 1 :else 0)))
+
+  (die 2 "usage: browser-flow-oracle.cljk --write <scenes.edn> <font> | --check <contract>"))

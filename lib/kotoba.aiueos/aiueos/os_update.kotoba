@@ -1,0 +1,140 @@
+;; aiueos.os-update -- local A/B update decisions as a pure Kotoba guest
+;; (oracle: src/aiueos/os_update.cljk).
+;;
+;; The oracle decides when a signed update may be pulled, staged, tried and
+;; committed; network and block I/O are provider mechanisms. The guest owns
+;; the LOCAL decisions -- the faults visible without a regex or a publisher
+;; closure and the slot selection rule:
+;;
+;;   health-status          collapse the required physical signals WITHOUT
+;;                          treating absence as success (three-valued:
+;;                          pass / fail / unknown);
+;;   boot-selection         choose a slot without letting an unconfirmed
+;;                          candidate become permanent;
+;;   manifest-local-errors  schema, sequence, target and artifact-set
+;;                          faults. The sha256 / immutable-url regexes stay
+;;                          in the host -- the grant.publisher admission
+;;                          owns them, and a pattern that can match the wire
+;;                          shape can match a great deal else.
+;;
+;; grant.ota/admit, grant.update/rollback-required? and grant.update/advance
+;; are host closures over publisher state and clocks -- mechanism -- and
+;; remain in the oracle.
+;;
+;; Values arrive as :document fields (keywords for statuses, i64 codes for
+;; counters and booleans); :container-items 32 bounds every vector the
+;; guest touches (3 artifacts, 6 flags, 5 health signals).
+;;
+;; Compile (single file, JVM-free):
+;;   kotoba compile aiueos/os_update.kotoba --target wasm32-browser --output os_update.wasm
+
+(ns aiueos.os-update
+  (:export [health-status boot-selection manifest-local-errors
+            artifact-set-error?]))
+
+;; --- element access ----------------------------------------------------------
+
+(defn- at [v :document i :i64] :i64
+  (option-value-of [:option :i64]
+    (document-i64-value (option-value-of [:option :document] (document-vector-at v i) (document-i64 0)))
+    0))
+
+;; --- health-status -----------------------------------------------------------
+;; The oracle: (some false?) -> :fail, (every? true?) -> :pass, :else :unknown.
+;; Absence is never success, so an unknown signal stops at :unknown.
+;; signals: i64 codes, 0 = false, 1 = true, 2 = absent/unknown.
+
+(defn- scan-signals [signals :document i :i64] :keyword
+  (if (>= i 5)
+    :pass
+    (let [v (at signals i)]
+      (if (= v 0)
+        :fail
+        (if (= v 1)
+          (scan-signals signals (+ i 1))
+          :unknown)))))
+
+(defn health-status [signals :document] :keyword
+  (scan-signals signals 0))
+
+;; --- boot-selection ----------------------------------------------------------
+;; (=:committed step)                     -> candidate slot, committed
+;; (=:staged step, zero attempts)         -> candidate slot, trial once
+;; (#{:staged :rolled-back :refused} s)   -> previous slot, last-known-good
+;; :else                                  -> previous slot, current
+
+(defn- sel [slot :keyword mode :keyword] :document
+  (document-map
+   :boot (document-keyword slot)
+   :mode (document-keyword mode)))
+
+(defn boot-selection [step :keyword trial-attempts :i64] :document
+  (if (= step :committed)
+    (sel :candidate :committed)
+    (if (if (= step :staged) (= trial-attempts 0) false)
+      (document-assoc (sel :candidate :trial) :next-trial-attempts (document-i64 1))
+      (if (if (= step :staged) true (= step :rolled-back))
+        (sel :previous :last-known-good)
+        (if (= step :refused)
+          (sel :previous :last-known-good)
+          (sel :previous :current))))))
+
+;; --- manifest-local-errors ---------------------------------------------------
+;; Non-regex faults of the oracle's manifest-errors, same vocabulary:
+;;   :schema :sequence :target-architecture :target-machine
+;;   :incompatible-architecture :incompatible-machine :incompatible-aiueos-abi
+;;   :artifact-set :duplicate-artifact-kind
+;;
+;; flags: 0 schema-ok, 1 target-arch-ok (x86_64), 2 target-machine-ok
+;; (gmktec-k16), 3 arch-eq, 4 machine-eq, 5 abi-ok (1 = true, 0 = false).
+;; artifact-kinds: 0 loader, 1 kernel, 2 initramfs, 3+ unknown.
+
+(defn- push-error [errs :document kw :keyword] :document
+  (document-vector-conj errs (document-keyword kw)))
+
+(defn- flags-at [flags :document i :i64] :bool
+  (= (at flags i) 1))
+
+(defn- kinds-include [kinds :document want :i64 i :i64] :bool
+  (if (>= i (document-count kinds))
+    false
+    (if (= (at kinds i) want)
+      true
+      (kinds-include kinds want (+ i 1)))))
+
+(defn- kinds-contain-all [kinds :document i :i64] :bool
+  (if (>= i 3)
+    true
+    (if (kinds-include kinds i 0)
+      (kinds-contain-all kinds (+ i 1))
+      false)))
+
+(defn- kinds-distinct [kinds :document i :i64 j :i64] :bool
+  (if (>= i (document-count kinds))
+    true
+    (if (>= j (document-count kinds))
+      (kinds-distinct kinds (+ i 1) 0)
+      (if (if (= i j) false (= (at kinds i) (at kinds j)))
+        false
+        (kinds-distinct kinds i (+ j 1))))))
+
+(defn manifest-local-errors
+  [flags :document sequence :i64 artifact-kinds :document] :document
+  (let [errs (document-vector)
+        e1 (if (flags-at flags 0) errs (push-error errs :schema))
+        e2 (if (> sequence 0) e1 (push-error e1 :sequence))
+        e3 (if (flags-at flags 1) e2 (push-error e2 :target-architecture))
+        e4 (if (flags-at flags 2) e3 (push-error e3 :target-machine))
+        e5 (if (flags-at flags 3) e4 (push-error e4 :incompatible-architecture))
+        e6 (if (flags-at flags 4) e5 (push-error e5 :incompatible-machine))
+        e7 (if (flags-at flags 5) e6 (push-error e6 :incompatible-aiueos-abi))
+        e8 (if (kinds-contain-all artifact-kinds 0) e7 (push-error e7 :artifact-set))
+        e9 (if (kinds-distinct artifact-kinds 0 1) e8 (push-error e8 :duplicate-artifact-kind))]
+    e9))
+
+(defn artifact-set-error? [artifact-kinds :document] :bool
+  (if (kinds-contain-all artifact-kinds 0)
+    (if (kinds-distinct artifact-kinds 0 1)
+      false
+      true)
+    true))

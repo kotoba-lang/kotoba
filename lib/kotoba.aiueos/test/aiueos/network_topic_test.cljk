@@ -1,0 +1,104 @@
+(ns aiueos.network-topic-test
+  (:require [aiueos.network-topic :as network]
+            [aiueos.topic :as topic]
+            [kotoba.test :refer [deftest is]]))
+
+(defn- fixture []
+  (let [keys (network/generate-key-pair)
+        publisher :node/sensor-a
+        registry {publisher
+                  {:public-key (network/public-key-base64 keys)
+                   :status :active
+                   :topics #{7}}}]
+    {:keys keys
+     :publisher publisher
+     :registry registry
+     :sender (network/sender-state :channel/plant-1 publisher)
+     :receiver (network/receiver-state :channel/plant-1)}))
+
+(deftest signed-publisher-identity-is-admitted
+  (let [{:keys [keys registry sender receiver]} (fixture)
+        [_ envelope] (network/emit sender (.getPrivate keys) 7 42 1000)
+        result (network/receive registry receiver envelope)]
+    (is (true? (:ok? result)))
+    (is (= 42 (topic/latest (get-in result [:state :bus]) 7)))
+    (is (= 1 (get-in result
+                     [:state :last-sequences [:node/sensor-a 7]])))))
+
+(deftest bounded-wire-round-trip-preserves-signature
+  (let [{:keys [keys registry sender receiver]} (fixture)
+        [_ envelope] (network/emit sender (.getPrivate keys) 7 42 1000)
+        decoded (network/decode-envelope (network/encode-envelope envelope))]
+    (is (= envelope decoded))
+    (is (true? (:ok? (network/receive registry receiver decoded))))
+    (is (= :invalid-network-topic-wire-shape
+           (try
+             (network/decode-envelope (.getBytes "{:unexpected true}"))
+             nil
+             (catch Exception error (:type (ex-data error))))))
+    (is (= :network-topic-wire-too-large
+           (try
+             (network/decode-envelope
+              (byte-array (inc network/max-wire-bytes)))
+             nil
+             (catch Exception error (:type (ex-data error))))))))
+
+(deftest forgery-cross-channel-and-unauthorized-topic-fail-closed
+  (let [{:keys [keys registry sender receiver]} (fixture)
+        attacker (network/generate-key-pair)
+        [_ valid] (network/emit sender (.getPrivate keys) 7 42 1000)
+        [_ forged] (network/emit sender (.getPrivate attacker) 7 42 1000)
+        [_ unauthorized] (network/emit sender (.getPrivate keys) 8 42 1000)]
+    (is (= :bad-signature
+           (:reason (network/receive registry receiver forged))))
+    (is (= :wrong-channel
+           (:reason
+            (network/receive registry receiver
+                             (assoc valid :channel-id :channel/other)))))
+    (is (= :topic-unauthorized
+           (:reason (network/receive registry receiver unauthorized))))
+    (is (= topic/empty-bus
+           (:bus (:state (network/receive registry receiver forged)))))))
+
+(deftest replay-and-sequence-gap-are-rejected
+  (let [{:keys [keys registry sender receiver]} (fixture)
+        [sender e1] (network/emit sender (.getPrivate keys) 7 10 1000)
+        [_ e2] (network/emit sender (.getPrivate keys) 7 20 1001)
+        accepted (network/receive registry receiver e1)]
+    (is (= :replay
+           (:reason (network/receive registry (:state accepted) e1))))
+    (is (= :sequence-gap
+           (:reason (network/receive registry receiver e2))))
+    (is (= 10 (topic/latest (get-in accepted [:state :bus]) 7)))
+    (let [restored (network/receiver-state
+                    :channel/plant-1
+                    (network/checkpoint (:state accepted)))]
+      (is (= :replay
+             (:reason (network/receive registry restored e1))))
+      (is (true? (:ok? (network/receive registry restored e2)))))))
+
+(deftest partition-rejoin-applies-contiguous-backlog-atomically
+  (let [{:keys [keys registry sender receiver]} (fixture)
+        [sender e1] (network/emit sender (.getPrivate keys) 7 10 1000)
+        [_ e2] (network/emit sender (.getPrivate keys) 7 20 1001)
+        partitioned (network/partition receiver)]
+    (is (= :partitioned
+           (:reason (network/receive registry partitioned e1))))
+    (let [rejoined (network/rejoin registry partitioned [e1 e2])]
+      (is (true? (:ok? rejoined)))
+      (is (true? (get-in rejoined [:state :connected?])))
+      (is (= 20 (topic/latest (get-in rejoined [:state :bus]) 7)))
+      (is (= 2 (topic/topic-count (get-in rejoined [:state :bus]) 7))))
+    (let [failed (network/rejoin registry partitioned [e2])]
+      (is (false? (:ok? failed)))
+      (is (= :sequence-gap (:reason failed)))
+      (is (false? (get-in failed [:state :connected?])))
+      (is (= topic/empty-bus (get-in failed [:state :bus]))))))
+
+(deftest revoked-publisher-is-denied
+  (let [{:keys [keys registry sender receiver publisher]} (fixture)
+        [_ envelope] (network/emit sender (.getPrivate keys) 7 42 1000)]
+    (is (= :publisher-inactive
+           (:reason
+            (network/receive (assoc-in registry [publisher :status] :revoked)
+                             receiver envelope))))))

@@ -1,0 +1,186 @@
+(ns aiueos.uefi.memory
+  (:export [page-size huge-page-size model-min-address model-max-address
+            model-limit mapped-bytes slack-pages aligned-up
+            window-reason
+            allocate-pages free-pages allocate-pool free-pool copy-mem]))
+
+;; EFI_BOOT_SERVICES memory, for a BOOTX64.EFI written in Kotoba.
+;;
+;; This is the third of the loader modules that replace
+;; `os/aiueos/uefi/main.c`, after `aiueos.uefi.console` and `aiueos.uefi.elf`.
+;; It stands in for that file's `load_verified_model` placement rule (:684-712)
+;; and for the four boot services the loader calls to get memory at all.
+;;
+;; ---------------------------------------------------------------------------
+;; WHY THIS MODULE COULD NOT BE WRITTEN BEFORE fwstore
+;; ---------------------------------------------------------------------------
+;; `AllocatePages` writes the base it chose through an OUT-POINTER, and until
+;; kotoba-gmir ADR-0013 a Kotoba UEFI application had no address it was allowed
+;; to write. That got the answer INTO the image. It did not make the answer
+;; usable: the page is at an address the firmware chose, so it arrives through
+;; a load, and kotoba-sema's region-provenance rule refuses a base that came
+;; from one. A loader could allocate a page and could not put a byte in it.
+;;
+;; `(kernel-uefi-alloc-region base slot allocate-type memory-type page-count
+;; address-hint)` closes that (kotoba-gmir ADR-0030, kotoba-sema ADR-0030). It
+;; makes the ALLOCATION the producer of the address, so the pages it answers
+;; with are a provenance root and the checked `kernel-store-*` family takes
+;; them.
+;;
+;; ---------------------------------------------------------------------------
+;; WHY THE HEAD IS NOT WRAPPED HERE, AND THAT IS NOT AN OVERSIGHT
+;; ---------------------------------------------------------------------------
+;; There is no `(defn allocate-region [bs pages] ...)` below, and there cannot
+;; be one, for TWO independent reasons -- either alone would be enough.
+;;
+;;   * The page count must be a compile-time LITERAL, because the length of
+;;     the region is `page-count * 4096` and that is the number kotoba-sema
+;;     compares a declared window against. A parameter has no value at compile
+;;     time, so a wrapper could not carry the bound that makes the root worth
+;;     having.
+;;   * A function RESULT is not a provenance root. `traceable-base?` admits a
+;;     literal, `kernel-boot-info`, `kernel-scratch-region`, a
+;;     `kernel-subregion`, a rodata literal, a parameter and the allocation
+;;     FORM -- never a call result. A wrapper would hand its caller a number
+;;     that could not be written to, which is the state this stream started in.
+;;
+;; So the head is spelled at the site that declares the window over it, and
+;; what lives here is the DECISION half: where the pages are allowed to land,
+;; and how big the request has to be to make room for the alignment. That is
+;; the same boundary ADR-0015 draws for the rest of the loader -- C owns
+;; mechanism, Kotoba owns what is allowed.
+;;
+;; A region DOES cross a function boundary as a PARAMETER (kotoba-sema's suite
+;; asserts it), so a helper that takes the pages and writes them is expressible
+;; and a helper that produces them is not.
+;;
+;; ---------------------------------------------------------------------------
+;; THE FOURTH WORD OF A THREE-ARGUMENT CALL
+;; ---------------------------------------------------------------------------
+;; `AllocatePool` and `CopyMem` take three arguments and the narrowest wide
+;; call this language has takes four. The fourth is passed as an explicit zero.
+;;
+;; kotoba-gmir ADR-0011 says the count of arguments is the caller's business
+;; and "the extra words are ignored" is a property of the callee -- which is
+;; why `:uefi-call4` exists beside `:uefi-call6` at all. The reason a third
+;; arity was not added for these two is measured rather than chosen:
+;; `x86-uefi-call-wide` loads RCX, RDX, R8 and R9 from its staging slots
+;; unconditionally, so an action that wrote only three of them would pass R9's
+;; STALE CONTENTS as the fourth word. An explicit zero is strictly better than
+;; that, and it is what the caller owns the frame to be able to do.
+;;
+;; ---------------------------------------------------------------------------
+;; ZERO IS THE SUCCESS VALUE
+;; ---------------------------------------------------------------------------
+;; `window-reason` follows `aiueos.uefi.elf`: zero is admitted and every
+;; non-zero value NAMES the clause that refused. The four boot services return
+;; EFI_STATUS, where zero is EFI_SUCCESS, so the two conventions agree.
+
+;; ── the numbers the placement rule is made of ──────────────────────────────
+;;
+;; `model-min-address` and `model-max-address` are `AIUEOS_MODEL_MIN_ADDRESS`
+;; and `AIUEOS_MODEL_MAX_ADDRESS`, whose defaults `build-uefi.sh` sets at :446
+;; to 4294967296 and 68719476735 -- 4 GiB and 64 GiB - 1. The kernel maps the
+;; model with 2 MiB pages, which is why `huge-page-size` is the alignment the
+;; base has to reach and not merely the page size.
+
+(defn page-size [] 4096)
+
+(defn huge-page-size [] 2097152)
+
+(defn model-min-address [] 4294967296)
+
+(defn model-max-address [] 68719476735)
+
+;; One past the top of the window. Written as its own function because every
+;; comparison below wants the exclusive bound, and `(+ (model-max-address) 1)`
+;; at four call sites is four places to get the fencepost wrong.
+(defn model-limit [] 68719476736)
+
+;; The size actually mapped: the request rounded up to a whole number of 2 MiB
+;; pages, because the kernel's page tables map the model in 2 MiB units and a
+;; partial one at the end would map bytes the loader never wrote.
+(defn mapped-bytes [want]
+  (* 2097152 (quot (+ want 2097151) 2097152)))
+
+;; How many 4 KiB pages to ASK the firmware for, given the mapped size. The
+;; firmware answers with a 4 KiB-aligned base and the loader then aligns that
+;; up to 2 MiB, so up to 2 MiB - 4 KiB of the allocation is consumed by the
+;; alignment: 511 pages of slack. `load_verified_model` computes exactly this
+;; (`raw_pages = pages + MODEL_HUGE_PAGE_SIZE / PAGE_SIZE - 1`).
+(defn slack-pages [mapped]
+  (+ (quot mapped 4096) 511))
+
+;; The 2 MiB-aligned base at or above ADDRESS.
+(defn aligned-up [address]
+  (* 2097152 (quot (+ address 2097151) 2097152)))
+
+;; ── the placement rule ─────────────────────────────────────────────────────
+;;
+;; Zero when the aligned block is somewhere the kernel may map it, and
+;; otherwise the clause that refused:
+;;
+;;   1  the request is empty
+;;   2  the mapped size does not fit under 64 GiB at all
+;;   3  the firmware did not allocate -- the base is zero
+;;   4  the aligned base is below 4 GiB
+;;   5  aligning moved the base DOWN, so the arithmetic wrapped
+;;   6  the aligned block ends above 64 GiB
+;;   7  the aligned block ends past the pages the firmware actually gave
+;;
+;; Clause 7 is the one the 511-page slack exists for, and the one a loader
+;; gets wrong: aligning the base up moves the END of the block up by the same
+;; amount, so a request sized to the mapped bytes alone lands past its own
+;; allocation whenever the firmware's base was not already 2 MiB aligned.
+;;
+;; The order matters. Clause 3 is ahead of clause 4 because a zero base is
+;; also below 4 GiB, and "the firmware refused" is the useful sentence.
+(defn window-reason [raw-base raw-pages want]
+  (let [mapped (mapped-bytes want)
+        base (aligned-up raw-base)]
+    (if (= want 0)
+      1
+      (if (> mapped 68719476736)
+        2
+        (if (= raw-base 0)
+          3
+          (if (< base 4294967296)
+            4
+            (if (< base raw-base)
+              5
+              (if (> (+ base mapped) 68719476736)
+                6
+                (if (> (+ base mapped) (+ raw-base (* raw-pages 4096)))
+                  7
+                  0)))))))))
+
+;; ── the boot services ──────────────────────────────────────────────────────
+;;
+;; EFI_BOOT_SERVICES, past the 24-byte table header:
+;;   +0x28 AllocatePages   +0x30 FreePages   +0x38 GetMemoryMap
+;;   +0x40 AllocatePool    +0x48 FreePool    +0x160 CopyMem
+;;
+;; `AllocatePages` here is the STATUS-returning spelling, and it is the one to
+;; use when the page count is computed rather than written: it takes an
+;; out-pointer the caller supplies (a `kernel-subregion` of the scratch
+;; region), exactly as `main.c` passes `&base`. What it hands back cannot be
+;; written to -- see the note at the top of this file -- so a loader that must
+;; PLACE bytes uses `kernel-uefi-alloc-region` at the site that declares the
+;; window instead.
+
+(defn allocate-pages [bs allocate-type memory-type pages out]
+  (kernel-uefi-call4 bs 40 allocate-type memory-type pages out))
+
+(defn free-pages [bs base pages]
+  (kernel-uefi-call2 bs 48 base pages))
+
+(defn allocate-pool [bs pool-type size out]
+  (kernel-uefi-call4 bs 64 pool-type size out 0))
+
+;; FreePool takes only the buffer. The second operand rides in RDX and the
+;; firmware ignores it, exactly as it does for `console/clear-screen`.
+(defn free-pool [bs buffer]
+  (kernel-uefi-call2 bs 72 buffer 0))
+
+(defn copy-mem [bs destination source length]
+  (kernel-uefi-call4 bs 352 destination source length 0))

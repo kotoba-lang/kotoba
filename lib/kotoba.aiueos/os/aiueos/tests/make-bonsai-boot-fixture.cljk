@@ -1,0 +1,501 @@
+#!/usr/bin/env kbb
+;; The Bonsai boot fixture -- ADR-0222 stage A, the floor after the C
+;; translation.
+;;
+;;   kbb --backend sci os/aiueos/tests/make-bonsai-boot-fixture.cljk <output>
+;;     [--header <prefix>] [--receipt <edn>] [--no-controls]
+;;
+;; The QEMU admission smoke (`smoke-qemu-qwen35-admission.cljk`) hands the
+;; kernel the 10,996,640-byte Qwen3.8 metadata + tensor-table prefix that
+;; `tests/make_qwen35_header_fixture.py` SYNTHESISES. The Bonsai profile has
+;; no such fixture, which is why it has never been on a CPU. This builds one.
+;;
+;; It is not synthesised. The Bonsai prefix is 11,120,992 bytes and is
+;; fetchable by HTTP range, sha256-pinned, by `run-task.cljk
+;; bonsai-admission-fixture` -- and the three admission objects were graded in
+;; the KIR oracle over exactly those bytes. Synthesising a second Bonsai
+;; header would put the boot on bytes nothing else has read (ADR-0165: two
+;; arms that agree on the wrong fixture agree about nothing). So the fixture
+;; IS the real prefix, and what this file adds is the second arm: an
+;; independent walk of it that derives, from the bytes, every number the boot
+;; gate will assert -- and refuses, by named reason, when the bytes do not
+;; carry them.
+;;
+;; Nothing here is typed twice. The expectations come from
+;; `contracts/bonsai2-qwen35-runtime-v1.edn`; the sign array's file offset and
+;; count are cross-checked against slots 128/132 of the 144-byte workspace the
+;; kv-scan OBJECT produced (`contracts/qwen35-gguf-kv-scan-v1.edn`
+;; `:expect-plan-hex`), so the walk and the object have to agree about where
+;; the INT32 signs live.
+;;
+;; Exit 3 (not 1) when the question could not be asked -- no prefix on this
+;; machine. "Could not measure" and "measured and refused" are different
+;; answers (ADR-0155).
+;;
+;; This writes a fixture and a receipt. It does NOT boot anything: the Bonsai
+;; profile on a CPU is the next floor.
+
+(require '[clojure.edn :as edn])
+
+(def fs (js/require "node:fs"))
+(def path (js/require "node:path"))
+(def crypto (js/require "node:crypto"))
+
+(def aiueos (.resolve path (.dirname path *file*) ".."))
+
+(defn- die [& msg]
+  (binding [*out* *err*] (apply println (cons "error:" msg)))
+  (.exit js/process 1))
+
+(defn- unmeasured [& msg]
+  (binding [*out* *err*] (apply println (cons "unmeasured:" msg)))
+  (.exit js/process 3))
+
+;; --------------------------------------------------------------- arguments
+
+(def opts
+  (loop [args (vec *command-line-args*) acc {:positional [] :controls? true}]
+    (if (empty? args)
+      acc
+      (let [a (first args)]
+        (cond
+          (= a "--header") (recur (drop 2 args) (assoc acc :header (second args)))
+          (= a "--receipt") (recur (drop 2 args) (assoc acc :receipt (second args)))
+          (= a "--no-controls") (recur (rest args) (assoc acc :controls? false))
+          :else (recur (rest args) (update acc :positional conj a)))))))
+
+(def output
+  (or (first (:positional opts))
+      (.join path aiueos "tests" "fixtures" "large" "bonsai2-boot-fixture.gguf")))
+(def receipt-file (or (:receipt opts) (str output ".receipt.edn")))
+(def header-file
+  (or (:header opts)
+      (.join path aiueos "tests" "fixtures" "large"
+             "bonsai2-ptq1-header-11120992.bin")))
+
+;; --------------------------------------------------------------- contracts
+
+(defn- contract [name]
+  (let [file (.join path aiueos "contracts" name)]
+    (when-not (.existsSync fs file) (unmeasured "no contract" file))
+    (edn/read-string (.readFileSync fs file "utf8"))))
+
+(def graph (contract "bonsai2-qwen35-runtime-v1.edn"))
+(def artifact (:artifact graph))
+(def architecture (:architecture graph))
+(def codecs (:codecs graph))
+(def roles (:tensor-roles graph))
+(def prefix-pin (:header-prefix artifact))
+
+(when-not (map? prefix-pin)
+  (unmeasured "the graph contract carries no :artifact :header-prefix;"
+              "this gate reads the prefix's length and digest from there"))
+
+;; GGML type number -> the contract's codec key. 0 is GGML's own numbering for
+;; F32 and is a property of the format, not of this artifact; 30 and 143 are
+;; read from the contract because they are.
+(def type-of-number
+  (reduce (fn [m [k v]] (if-let [t (:ggml-type v)] (assoc m t k) m))
+          {0 :f32} codecs))
+
+(def block-elements (get-in codecs [:ptq1-0 :block-elements]))
+(def block-bytes (get-in codecs [:ptq1-0 :block-bytes]))
+
+;; The sign array's file offset and count as the kv-scan OBJECT recorded them:
+;; slots 128 and 132 of its 144-byte workspace (ADR-0222 stage A item 3).
+(def object-signs
+  (let [c (contract "qwen35-gguf-kv-scan-v1.edn")
+        carrying (filter :expect-plan-hex (:vectors c))]
+    (when-not (= 1 (count carrying))
+      (unmeasured "qwen35-gguf-kv-scan-v1.edn carries" (count carrying)
+                  "workspaces; this gate needs exactly one"))
+    (let [b (js/Buffer.from (:expect-plan-hex (first carrying)) "hex")]
+      (when (< (.-length b) 136)
+        (unmeasured "the kv-scan workspace is" (.-length b)
+                    "bytes; slots 128/132 are not in it"))
+      {:offset (.readUInt32LE b 128) :count (.readUInt32LE b 132)})))
+
+;; ------------------------------------------------------------- the refusals
+
+(defn- refuse [reason & detail]
+  (throw (ex-info "refused" {:reason reason :detail (vec detail)})))
+
+(defn- u32 [buf at] (.readUInt32LE buf at))
+(defn- i32 [buf at] (.readInt32LE buf at))
+(defn- u64 [buf at] (js/Number (.readBigUInt64LE buf at)))
+
+(def scalar-size {0 1, 1 1, 2 2, 3 2, 4 4, 5 4, 6 4, 7 1, 10 8, 11 8, 12 8})
+
+(defn- align-up [n a] (* a (js/Math.ceil (/ n a))))
+
+;; ------------------------------------------------------------ the metadata
+;;
+;; 49 keys, of which two arrays hold 495,907 length-prefixed strings; the walk
+;; visits every one of them because that is the only way the section's end is
+;; derived rather than believed.
+
+(defn- skip-value
+  "[end strings-walked] for the value that starts at `at`."
+  [buf at vtype]
+  (cond
+    (= vtype 8) [(+ at 8 (u64 buf at)) 0]
+    (= vtype 9)
+    (let [et (u32 buf at)
+          n (u64 buf (+ at 4))
+          start (+ at 12)]
+      (if (= et 8)
+        [(loop [i 0 p start] (if (= i n) p (recur (inc i) (+ p 8 (u64 buf p))))) n]
+        [(+ start (* n (or (scalar-size et)
+                           (refuse :unknown-array-element-type et)))) 0]))
+    :else [(+ at (or (scalar-size vtype) (refuse :unknown-value-type vtype))) 0]))
+
+(defn- scan-metadata [buf metadata-count]
+  (loop [i 0 at 24 strings 0 signs nil]
+    (if (= i metadata-count)
+      {:end at :strings strings :signs signs}
+      (let [klen (u64 buf at)
+            key (.toString buf "utf8" (+ at 8) (+ at 8 klen))
+            vtype (u32 buf (+ at 8 klen))
+            vat (+ at 8 klen 4)
+            [end walked] (skip-value buf vat vtype)]
+        (recur (inc i) end (+ strings walked)
+               (if (= key "prism.hadamard.sign_values")
+                 (let [declared (get-in graph [:hadamard :sign-values])
+                       [want-array want-element] (:gguf-type declared)
+                       et (u32 buf vat)
+                       n (u64 buf (+ vat 4))
+                       elements-at (+ vat 12)]
+                   (when-not (= vtype want-array)
+                     (refuse :sign-values-gguf-type vtype))
+                   (when-not (= et want-element)
+                     (refuse :sign-values-element-type et))
+                   (when-not (= n (:count declared))
+                     (refuse :sign-values-count n))
+                   ;; Read as INT32. Stream A's first full Bonsai run produced
+                   ;; non-finite activations because -1 was read unsigned
+                   ;; (ADR-0222 stage A item 3); a fixture whose signs are not
+                   ;; {-1, 1} must not reach a boot.
+                   (loop [j 0]
+                     (when (< j n)
+                       (let [v (i32 buf (+ elements-at (* 4 j)))]
+                         (when-not (or (= v 1) (= v -1))
+                           (refuse :sign-value-not-unit j v))
+                         (recur (inc j)))))
+                   {:offset elements-at :count n})
+                 signs))))))
+
+;; -------------------------------------------------------- the tensor table
+
+(defn- scan-tensors [buf at tensor-count]
+  (loop [i 0 p at rows []]
+    (if (= i tensor-count)
+      {:end p :rows rows}
+      (let [nlen (u64 buf p)
+            name (.toString buf "utf8" (+ p 8) (+ p 8 nlen))
+            dims-count (u32 buf (+ p 8 nlen))
+            dims (mapv #(u64 buf (+ p 8 nlen 4 (* 8 %))) (range dims-count))
+            tat (+ p 8 nlen 4 (* 8 dims-count))
+            number (u32 buf tat)
+            offset (u64 buf (+ tat 4))]
+        (recur (inc i) (+ tat 12)
+               (conj rows {:name name :dims dims :number number :offset offset}))))))
+
+(defn- role-of [name]
+  (if (= 0 (.indexOf name "blk."))
+    (let [tail (.slice name 4)
+          dot (.indexOf tail ".")]
+      (when (neg? dot) (refuse :unknown-role name))
+      [(js/parseInt (.slice tail 0 dot) 10) (.slice tail (inc dot))])
+    [nil name]))
+
+(defn- storage [kind elements]
+  (case kind
+    :ptq1-0 (do (when-not (zero? (mod elements block-elements))
+                  (refuse :ptq1-0-elements-not-block-aligned elements))
+                (* (/ elements block-elements) block-bytes))
+    :f32 (* 4 elements)
+    :bf16 (* 2 elements)
+    (refuse :unsupported-type kind)))
+
+;; ------------------------------------------------------------- the analysis
+
+(defn- analyse
+  "Every number the boot gate needs, derived from `buf` alone. Throws ex-info
+  with a `:reason` for anything the graph contract does not admit."
+  [buf]
+  (when-not (= (:bytes prefix-pin) (.-length buf))
+    (refuse :header-prefix-bytes (.-length buf)))
+  (when-not (= "GGUF" (.toString buf "utf8" 0 4))
+    (refuse :not-gguf (.toString buf "hex" 0 4)))
+  (when-not (= (:gguf-version artifact) (u32 buf 4))
+    (refuse :gguf-version (u32 buf 4)))
+  (let [tensor-count (u64 buf 8)
+        metadata-count (u64 buf 16)]
+    (when-not (= (:tensor-count artifact) tensor-count)
+      (refuse :tensor-count tensor-count))
+    (when-not (= (:metadata-count artifact) metadata-count)
+      (refuse :metadata-count metadata-count))
+    (let [{metadata-end :end :keys [strings signs]} (scan-metadata buf metadata-count)]
+      (when-not (= (:metadata-end artifact) metadata-end)
+        (refuse :metadata-end metadata-end))
+      (when-not signs (refuse :sign-values-absent))
+      (when-not (= (:offset object-signs) (:offset signs))
+        (refuse :sign-values-not-where-the-object-recorded
+                (:offset signs) (:offset object-signs)))
+      (when-not (= (:count object-signs) (:count signs))
+        (refuse :sign-values-count-not-the-objects
+                (:count signs) (:count object-signs)))
+      (let [{table-end :end rows :rows} (scan-tensors buf metadata-end tensor-count)
+            _ (when-not (= (:tensor-info-end artifact) table-end)
+                (refuse :tensor-info-end table-end))
+            data-offset (align-up table-end (:alignment artifact))
+            _ (when-not (= (:data-offset artifact) data-offset)
+                (refuse :data-offset data-offset))
+            _ (loop [p table-end]
+                (when (< p data-offset)
+                  (when-not (zero? (.readUInt8 buf p)) (refuse :padding-not-zero p))
+                  (recur (inc p))))
+            ;; roles: shape AND identity, against the contract's four tables.
+            interval (:full-attention-interval architecture)
+            resolved
+            (mapv (fn [{:keys [name dims number offset]}]
+                    (let [[layer role] (role-of name)
+                          kind (get type-of-number number)
+                          table (cond
+                                  (nil? layer) :non-block
+                                  (contains? (:every-layer roles) role) :every-layer
+                                  (contains? (:linear-attention-layer roles) role) :linear-attention-layer
+                                  (contains? (:full-attention-layer roles) role) :full-attention-layer
+                                  :else (refuse :unknown-role name))
+                          declared (get-in roles [table role])]
+                      (when-not declared (refuse :unknown-role name))
+                      (when-not (= (first declared) dims)
+                        (refuse :role-dimensions name dims (first declared)))
+                      (when-not (= (second declared) kind)
+                        (refuse :role-type name number (second declared)))
+                      {:name name :layer layer :role role :table table
+                       :kind kind :number number :dims dims :offset offset
+                       :bytes (storage kind (reduce * 1 dims))}))
+                  rows)
+            by-layer (group-by :layer resolved)
+            layers (sort (remove nil? (keys by-layer)))
+            layer-kind (fn [index]
+                         (let [tables (set (map :table (get by-layer index)))]
+                           (cond (contains? tables :full-attention-layer) :full
+                                 (contains? tables :linear-attention-layer) :linear
+                                 :else (refuse :layer-has-no-mixer index))))
+            kinds (into {} (map (fn [i] [i (layer-kind i)]) layers))
+            full (sort (keep (fn [[i k]] (when (= k :full) i)) kinds))
+            linear (sort (keep (fn [[i k]] (when (= k :linear) i)) kinds))]
+        (when-not (= (:trunk-layers architecture) (count layers))
+          (refuse :trunk-layers (count layers)))
+        (when-not (= (range (count layers)) (seq layers))
+          (refuse :layer-indices-not-contiguous (first layers) (last layers)))
+        (when-not (= (:full-attention-layers architecture) (count full))
+          (refuse :full-attention-layer-count (count full)))
+        (when-not (= (:linear-attention-layers architecture) (count linear))
+          (refuse :linear-attention-layer-count (count linear)))
+        ;; the schedule the C derives from `full_attention_interval` has to be
+        ;; the schedule the role masks make, or the mixer union is read as the
+        ;; wrong arm and nothing else says so (ADR-0222, reason -111).
+        (when-not (= (filter #(zero? (mod (inc %) interval)) layers) full)
+          (refuse :schedule-disagrees-with-interval interval (first full)))
+        (let [histogram (reduce (fn [m r] (update m (:kind r) (fnil inc 0))) {} resolved)]
+          (when-not (= (:tensor-types graph) histogram)
+            (refuse :tensor-type-histogram histogram)))
+        ;; extents: sorted by offset they tile the file with no gap, no
+        ;; overlap, and the last one ends at the declared artifact length.
+        (let [sorted (sort-by :offset resolved)
+              last-row (last sorted)
+              end (reduce (fn [cursor r]
+                            (when-not (= cursor (:offset r))
+                              (refuse :extent-not-contiguous (:name r) (:offset r) cursor))
+                            (align-up (+ (:offset r) (:bytes r)) (:alignment artifact)))
+                          0 sorted)]
+          (when-not (= (+ data-offset end) (:bytes artifact))
+            (refuse :extents-do-not-tile-artifact (+ data-offset end)))
+          (when-not (= (get-in artifact [:last-tensor :name]) (:name last-row))
+            (refuse :last-tensor-name (:name last-row)))
+          (when-not (= (get-in artifact [:last-tensor :offset]) (:offset last-row))
+            (refuse :last-tensor-offset (:offset last-row)))
+          (let [named (fn [n] (or (first (filter #(= n (:name %)) resolved))
+                                  (refuse :tensor-absent n)))
+                embd (named "token_embd.weight")
+                qkv (named "blk.0.attn_qkv.weight")]
+            {:metadata {:count metadata-count :strings strings}
+             :metadata-end metadata-end
+             :signs signs
+             :tensors {:count tensor-count :info-end table-end :data-offset data-offset}
+             :schedule {:trunk (count layers) :linear (count linear) :full (count full)
+                        :interval interval}
+             :types (reduce (fn [m r] (update m (:kind r) (fnil inc 0))) {} resolved)
+             :representative
+             {:token-embd {:offset (:offset embd) :bytes (:bytes embd) :type (:number embd)}
+              :attn-qkv-0 {:offset (:offset qkv) :bytes (:bytes qkv) :type (:number qkv)}
+              :last {:name (:name last-row) :offset (:offset last-row)
+                     :end (+ (:offset last-row) (:bytes last-row))}}
+             :tiling {:last-extent-end end :artifact-bytes (+ data-offset end)}}))))))
+
+(defn- attempt [buf]
+  (try {:ok (analyse buf)}
+       (catch :default e
+         (if-let [reason (:reason (ex-data e))]
+           {:refused reason :detail (:detail (ex-data e))}
+           (throw e)))))
+
+;; ------------------------------------------------------------------- input
+
+(when-not (.existsSync fs header-file)
+  (unmeasured "no Bonsai header prefix at" header-file
+              "-- run `kbb --backend sci scripts/run-task.cljk bonsai-admission-fixture`"))
+
+(def header (.readFileSync fs header-file))
+(def header-sha
+  (-> (.createHash crypto "sha256") (.update header) (.digest "hex")))
+(when-not (= (:sha256 prefix-pin) header-sha)
+  (die "the prefix at" header-file "is sha256" header-sha
+       "and the contract pins" (:sha256 prefix-pin)))
+(println "PREFIX" header-file (.-length header) "bytes sha256=" header-sha)
+
+;; ---------------------------------------------------------------- the walk
+
+(def measured
+  (let [{:keys [ok refused detail]} (attempt header)]
+    (when refused
+      (die "the pinned prefix was refused:" refused (pr-str detail)))
+    ok))
+
+(println "SCANNED\t" (get-in measured [:metadata :count]) "metadata entries,"
+         (get-in measured [:metadata :strings]) "length-prefixed strings walked")
+(println "SCANNED\t" (get-in measured [:signs :count]) "INT32 sign values at file offset"
+         (get-in measured [:signs :offset])
+         "(the kv-scan object's workspace says" (:offset object-signs) ")")
+(println "SCANNED\t" (get-in measured [:tensors :count]) "tensor records,"
+         "extents tile to" (get-in measured [:tiling :artifact-bytes]) "bytes")
+
+;; --------------------------------------------------------------- controls
+;;
+;; A walk that cannot go red is not a check. Each control mutates ONE field of
+;; a copy and asserts the reason literal, because a negative test that only
+;; asserts "it failed" counts runs that failed for another reason.
+
+(defn- mutated [f]
+  (let [copy (js/Buffer.from header)] (f copy) copy))
+
+(def controls
+  (when (:controls? opts)
+    (let [signs-at (get-in measured [:signs :offset])
+          ;; Located by name so a change to the file moves these with it -- and
+          ;; searched from the TENSOR TABLE, not from byte 0: every tensor name
+          ;; also appears, length-prefixed the same way, inside the metadata's
+          ;; `prism.hadamard.weight_names` array. Searching from 0 mutated a
+          ;; metadata string nothing checks, and the control was admitted
+          ;; (measured 2026-09-22, which is why this line reads like this).
+          table-at (:metadata-end measured)
+          table-end (get-in measured [:tensors :info-end])
+          find-record (fn [name]
+                        (let [needle (js/Buffer.concat
+                                      #js [(doto (js/Buffer.alloc 8)
+                                             (.writeUInt32LE (.-length (js/Buffer.from name "utf8")) 0))
+                                           (js/Buffer.from name "utf8")])
+                              at (.indexOf header needle table-at)]
+                          (when (neg? at) (die name "is not in the tensor table"))
+                          (when-not (< at table-end)
+                            (die name "was found past the tensor table at" at))
+                          {:at at :name-bytes (.-length (js/Buffer.from name "utf8"))}))
+          embd (find-record "token_embd.weight")
+          qkv (find-record "blk.0.attn_qkv.weight")
+          ffn (find-record "blk.0.ffn_up.weight")
+          ;; u64 len | name | u32 dims | u64 x dims | u32 type | u64 offset
+          field (fn [{:keys [at name-bytes]} dims]
+                  {:dims-at (+ at 8 name-bytes)
+                   :dim0-at (+ at 8 name-bytes 4)
+                   :type-at (+ at 8 name-bytes 4 (* 8 dims))
+                   :offset-at (+ at 8 name-bytes 4 (* 8 dims) 4)})
+          embd-f (field embd 2)
+          qkv-f (field qkv 2)
+          ffn-f (field ffn 2)]
+      [[:not-gguf (mutated (fn [b] (.write b "GGUX" 0 "utf8")))]
+       [:gguf-version (mutated (fn [b] (.writeUInt32LE b 4 4)))]
+       [:tensor-count (mutated (fn [b] (.writeBigUInt64LE b (js/BigInt 850) 8)))]
+       [:metadata-count (mutated (fn [b] (.writeBigUInt64LE b (js/BigInt 48) 16)))]
+       [:sign-value-not-unit (mutated (fn [b] (.writeInt32LE b 2 signs-at)))]
+       [:sign-values-count (mutated (fn [b] (.writeBigUInt64LE b (js/BigInt 28671)
+                                                               (- signs-at 8))))]
+       [:unknown-role (mutated (fn [b] (.write b "q" (+ (:at ffn) 8 12) "utf8")))]
+       [:role-dimensions (mutated (fn [b] (.writeBigUInt64LE b (js/BigInt 10241)
+                                                             (+ (:dim0-at qkv-f) 8))))]
+       ;; a type change is caught by the ROLE table before the histogram --
+       ;; the histogram check below it is a second count, and no single-field
+       ;; mutation can reach it while the role tables hold.
+       [:role-type (mutated (fn [b] (.writeUInt32LE b 30 (:type-at embd-f))))]
+       [:extent-not-contiguous (mutated (fn [b] (.writeBigUInt64LE b (js/BigInt 32)
+                                                                   (:offset-at embd-f))))]])))
+
+(def control-results
+  (mapv (fn [[expected buf]]
+          (let [{:keys [refused detail]} (attempt buf)]
+            (when-not (= expected refused)
+              (die "control" expected "was answered" (or refused :admitted)
+                   (pr-str detail)))
+            {:control expected :detail detail}))
+        (or controls [])))
+
+(if (:controls? opts)
+  (println "CONTROLS\t" (count control-results) "mutations, each refused by its own reason:"
+           (pr-str (mapv :control control-results)))
+  (println "CONTROLS\t 0 (--no-controls)"))
+
+;; ----------------------------------------------------------- the artefacts
+
+(.mkdirSync fs (.dirname path output) #js {:recursive true})
+(.writeFileSync fs output header)
+(def written (.readFileSync fs output))
+(def written-sha
+  (-> (.createHash crypto "sha256") (.update written) (.digest "hex")))
+(when-not (= header-sha written-sha)
+  (die "the fixture that was written is sha256" written-sha "not" header-sha))
+
+(def receipt
+  {:format :aiueos.bonsai-boot-fixture/v1
+   :generated-by "os/aiueos/tests/make-bonsai-boot-fixture.cljk"
+   :source {:prefix (.basename path header-file)
+            :bytes (.-length header)
+            :sha256 header-sha
+            :provenance :range-fetched-public-artifact-not-synthesised}
+   :fixture {:file (.basename path output) :bytes (.-length written) :sha256 written-sha}
+   :handoff {:artifact-bytes (:bytes artifact)
+             :data-offset (get-in measured [:tensors :data-offset])
+             :note :the-prefix-is-not-the-artifact-the-length-handed-in-is-the-contracts}
+   :admission {:tensors (get-in measured [:tensors :count])
+               :metadata (get-in measured [:metadata :count])
+               :metadata-end (:metadata-end measured)
+               :tensor-info-end (get-in measured [:tensors :info-end])
+               :linear (get-in measured [:schedule :linear])
+               :full (get-in measured [:schedule :full])
+               :interval (get-in measured [:schedule :interval])
+               :types (:types measured)
+               :sign-values (:signs measured)
+               :representative (:representative measured)}
+   :derived-by :an-independent-walk-of-the-prefix-not-the-objects
+   :controls (mapv :control control-results)
+   :proves [:the-fixture-is-the-graph-the-contract-describes]
+   :does-not-prove [:any-boot :any-cpu :any-token
+                    :that-the-objects-admit-it-on-a-processor]})
+
+(.writeFileSync fs receipt-file (str ";; generated by "
+                                     "os/aiueos/tests/make-bonsai-boot-fixture.cljk"
+                                     " -- do not edit\n"
+                                     (with-out-str (pr receipt)) "\n"))
+
+(println "AIUEOS_BONSAI_BOOT_FIXTURE_OK"
+         "bytes=" (.-length written)
+         "tensors=" (get-in measured [:tensors :count])
+         "linear=" (get-in measured [:schedule :linear])
+         "full=" (get-in measured [:schedule :full])
+         "data-offset=" (get-in measured [:tensors :data-offset])
+         "artifact=" (:bytes artifact)
+         "signs=" (get-in measured [:signs :count])
+         "controls=" (count control-results)
+         "sha256=" written-sha)
+(println "RECEIPT" receipt-file)

@@ -1,0 +1,501 @@
+#!/usr/bin/env kbb
+;; The install USB bundle, EXECUTED rather than merely built (aiueos ADR-0209,
+;; root ADR adr-2608136000 question 8).
+;;
+;; What this exists to catch, stated as the failure it was written after:
+;;
+;;   On 2026-09-09 this repository's .cljs tooling moved from clojure.string to
+;;   kotoba.lang.text. The fix -- where that namespace lives -- was written
+;;   into nbb.edn. nbb.edn is not on the USB. Measured 2026-09-10 on main: the
+;;   live installer's /init extracts the bundle, hands over to
+;;   install-live.cljs, and it dies with `Could not find namespace:
+;;   kotoba.lang.text` before doing anything at all. So did install-to-disk,
+;;   install-intent and make-provision-record -- the whole chain.
+;;
+;;   Nothing was red. `install-usb-build` built a USB whose receipt chain
+;;   verified, `installer-test` and `install-chain-test` ran the same scripts
+;;   from the REPOSITORY, where nbb.edn resolves, and stayed green. The QEMU
+;;   install gate (I3) was measured 2026-08-25, two weeks before the move, and
+;;   its green was about a tree that no longer existed.
+;;
+;; So the assertion here is deliberately not "the bundle was produced" and not
+;; "the tar contains N files". It assembles the bundle the builder produces,
+;; extracts it, and RUNS each bundled entry point from inside it -- exactly
+;; where /init runs them, with only what the stick carries. A script is allowed
+;; to refuse for its own named reason (no device, no arguments); it is not
+;; allowed to fail to load.
+;;
+;; The control is the other half: the same assembly WITHOUT the classpath must
+;; produce the namespace error. A detector that cannot see the defect it was
+;; written for is not a detector, and this one has been shown both ways.
+;;
+;; Exit 0 only when every case held and the count matches.
+
+(require '[kotoba.lang.text :as str])
+
+(def fs (js/require "node:fs"))
+(def path (js/require "node:path"))
+(def cp (js/require "node:child_process"))
+(def os-mod (js/require "node:os"))
+
+(def scripts-dir (.dirname path *file*))
+(def repo (.resolve path scripts-dir ".." ".." ".."))
+(def builder (.join path scripts-dir "make-install-usb-image.py"))
+(def live-builder (.join path scripts-dir "make-live-installer.py"))
+(def tmp (.mkdtempSync fs (.join path (.tmpdir os-mod) "aiueos-bundle-")))
+
+(def results (atom []))
+(defn- record! [name ok detail]
+  (swap! results conj {:name name :ok ok :detail detail})
+  (println (if ok "AIUEOS_BUNDLE_TEST_OK  " "AIUEOS_BUNDLE_TEST_FAIL") name detail))
+
+(defn- run [cmd args opts]
+  (let [r (.spawnSync cp cmd (to-array args)
+                      (js/Object.assign #js {:encoding "utf8" :shell false}
+                                        (clj->js (or opts {}))))]
+    {:status (if (nil? (.-status r)) 3 (.-status r))
+     :out (or (.-stdout r) "") :err (or (.-stderr r) "")}))
+
+;; --------------------------------------------------------------- assemble
+
+(def intent-path (.join path tmp "install-intent.json"))
+(.writeFileSync fs intent-path
+                (.stringify js/JSON
+                            #js {"schema" "aiueos.install-intent.v1"
+                                 "mode" "interactive"
+                                 "hostname" "aiueos-bundle-test"}))
+(def receipt-path (.join path tmp "release-receipt.json"))
+;; With a real disk block: the guided installer binds the release digest into
+;; the intent it writes, so a receipt without one is a receipt it refuses.
+(.writeFileSync fs receipt-path
+                (.stringify js/JSON
+                            #js {"schema" "aiueos.build-receipt.v1"
+                                 "disk" #js {"bytes" 67108864
+                                             "sha256" (apply str (repeat 64 "b"))}}))
+
+(defn- assemble!
+  "Build the bundle tar through the REAL builder function and extract it.
+
+  The builder module is imported and `make_bundle_tgz` is called directly:
+  building a whole USB image would need a release image, a Linux node binary
+  and an nbb tree, none of which an offline test has, and none of which change
+  what is being measured -- whether the files the bundle carries can load."
+  [label classpath-dirs intent]
+  (let [tgz (.join path tmp (str label ".tgz"))
+        dest (.join path tmp label)
+        py (str "import sys, pathlib; sys.path.insert(0, " (pr-str scripts-dir) ");\n"
+                "import importlib.util;\n"
+                "spec = importlib.util.spec_from_file_location('mk', " (pr-str builder) ");\n"
+                "mk = importlib.util.module_from_spec(spec); spec.loader.exec_module(mk);\n"
+                "data = mk.make_bundle_tgz(" (pr-str (.join path repo "os/aiueos/installer")) ",\n"
+                "  " (pr-str scripts-dir) ",\n"
+                (if intent
+                  (str "  pathlib.Path(" (pr-str intent) ").read_bytes(),\n")
+                  "  None,\n")
+                "  pathlib.Path(" (pr-str receipt-path) ").read_bytes(),\n"
+                ;; JSON, not pr-str. A Clojure vector prints as ["a" "b"], and
+                ;; Python reads adjacent string literals as ONE concatenated
+                ;; string -- so two roots silently became a single path that
+                ;; does not exist, the builder produced a clean bundle with no
+                ;; cp/ in it, and nothing said so. That is what put the
+                ;; empty-root refusal in the builder.
+                "  None, None, classpath_dirs="
+                (.stringify js/JSON (clj->js (vec classpath-dirs))) ");\n"
+                "pathlib.Path(" (pr-str tgz) ").write_bytes(data)\n")
+        r (run "python3" ["-c" py] {})]
+    (when-not (zero? (:status r))
+      (println "  builder stderr:" (str/trim (:err r))))
+    (.mkdirSync fs dest #js {:recursive true})
+    (let [x (run "tar" ["xzf" tgz "-C" dest] {})]
+      {:ok (and (zero? (:status r)) (zero? (:status x)))
+       :dir (.join path dest "aiueos-installer")
+       :err (str (:err r) (:err x))})))
+
+(def text-src (.resolve path repo ".." "text" "src"))
+(def aiueos-src (.join path repo "src"))
+(def security-src (.resolve path repo ".." "security" "src"))
+
+(record! "west-sibling-text-src-exists" (.existsSync fs text-src) text-src)
+(record! "west-sibling-security-src-exists" (.existsSync fs security-src) security-src)
+
+(def with-cp (assemble! "with-cp" [text-src aiueos-src security-src] intent-path))
+(def without-cp (assemble! "without-cp" [] intent-path))
+;; The stick that asks (ADR-0210): the same bundle with no intent in it.
+(def guided-bundle (assemble! "guided" [text-src aiueos-src security-src] nil))
+;; A second copy, so the abort case starts from a stick that has not already
+;; been answered: the first run writes an intent into its own tmpfs.
+(def guided-abort-bundle (assemble! "guided-abort" [text-src aiueos-src security-src] nil))
+
+(record! "bundle-assembles-with-classpath" (:ok with-cp) (:dir with-cp))
+(record! "bundle-assembles-without-classpath" (:ok without-cp) (:dir without-cp))
+(record! "guided-bundle-assembles" (:ok guided-bundle) (:dir guided-bundle))
+
+;; ------------------------------------------ the stick that asks (ADR-0210)
+
+;; The whole difference between the two products is this one file. If the
+;; bundle carried an intent anyway, install-live.cljs would find one in the
+;; tmpfs and never ask -- the stick would silently be the other product.
+(record! "guided-bundle-carries-no-intent"
+         (not (.existsSync fs (.join path (:dir guided-bundle) "install-intent.json")))
+         "no install-intent.json in the bundle")
+(record! "intent-bundle-still-carries-its-intent"
+         (.existsSync fs (.join path (:dir with-cp) "install-intent.json"))
+         "install-intent.json present when one was given")
+
+;; ------------------------------------------------------- what it carries
+
+(record! "bundle-carries-kotoba-lang-text"
+         (.existsSync fs (.join path (:dir with-cp) "cp/kotoba/lang/text.cljk"))
+         "cp/kotoba/lang/text.cljk")
+(record! "bundle-carries-the-guided-decision-core"
+         (.existsSync fs (.join path (:dir with-cp) "cp/aiueos/installer/guided.cljk"))
+         "cp/aiueos/installer/guided.cljk")
+(record! "bundle-carries-the-guided-program"
+         (.existsSync fs (.join path (:dir with-cp) "guided-install.cljk"))
+         "guided-install.cljk (flattened from installer/live/)")
+
+;; ---------------------------------------------------- the entry points run
+
+(def entry-points
+  ["install-live.cljk"        ; what /init hands over to
+   "install-to-disk.cljk"     ; what install-live spawns
+   "install-intent.cljk"      ; the admission
+   "make-provision-record.cljk"
+   "guided-install.cljk"      ; ADR-0208
+   "account-sync.cljk"])      ; ADR-0239: device-auth + qr from the bundle
+
+(defn- load-check
+  "Run one bundled script from inside the bundle, with only what the stick
+  carries. Returns whether it LOADED -- the script is free to refuse for its
+  own reason once running."
+  [dir script classpath]
+  (let [r (run "nbb" (concat (when classpath ["--classpath" classpath]) [script])
+               {:cwd dir
+                :env (js/Object.assign #js {} (.-env js/process)
+                                       #js {"AIUEOS_LIVE_PAYLOAD_DEV" "/dev/aiueos-test-absent"})})
+        text (str (:out r) (:err r))]
+    {:loaded (not (str/includes? text "Could not find namespace"))
+     :status (:status r)
+     :missing (second (str/re-find #"Could not find namespace: (\S+)" text))}))
+
+(doseq [script entry-points]
+  (let [{:keys [loaded status missing]}
+        (load-check (:dir with-cp) script (.join path (:dir with-cp) "cp"))]
+    (record! (str "loads-from-bundle:" script) loaded
+             (if loaded
+               (str "loaded; refused on its own terms, status=" status)
+               (str "COULD NOT LOAD: " missing)))))
+
+;; The control. Without the classpath every one of them must fail to load --
+;; that is the state main was in on 2026-09-10, and a green control here would
+;; mean this test cannot see the defect it exists for.
+(let [broken (mapv (fn [script]
+                     [script (:loaded (load-check (:dir without-cp) script nil))])
+                   entry-points)]
+  (record! "control-without-classpath-nothing-loads"
+           (every? (comp false? second) broken)
+           (str/join " " (map (fn [[s l]] (str s "=" (if l "LOADED" "no-namespace"))) broken))))
+
+;; ------------------------------- the product path: a stick that asks, run
+
+;; install-live.cljs finding no intent must START THE GUIDED INSTALLER, and
+;; the intent it writes must be the one everything below it then verifies.
+;; This runs the real chain from inside the real bundle -- the only pieces
+;; that are not real are the disk probe (a fixture, two-key gated) and the
+;; operator (a piped answer script, which takes the same fd-0 path a terminal
+;; does).
+
+(def probe-fixture (.join path tmp "probe.json"))
+(.writeFileSync fs probe-fixture
+                (.stringify js/JSON
+                            #js {"blockdevices"
+                                 #js [#js {"path" "/dev/sda" "type" "disk"
+                                           "size" 32000000000 "model" "SanDisk Ultra"
+                                           "tran" "usb" "serial" "USB1" "rm" true}
+                                      #js {"path" "/dev/nvme0n1" "type" "disk"
+                                           "size" 500000000000 "model" "PNY CS2241 500GB"
+                                           "tran" "nvme" "serial" "PNY-1" "rm" false}]}))
+
+(def pubkey
+  "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJ8s0Kx0M0pDVLB0jjjjjjjjjjjjjjjjjjjjjjjjjjjj owner@test")
+
+(def operator-script
+  (str/join "\n" ["wired-dhcp" "1" "y" "y" "aiueos-asked" "test-box"
+                   pubkey "aiueos" "aiueos-asked" ""]))
+
+(defn- shim!
+  "The bundled bin/nbb, reproduced. In a real bundle the builder emits this
+  shim and it is what carries the classpath to the SECOND hop: install-live
+  spawns `kbb --backend sci guided-install.cljk` by name. A test that let hop 2 resolve
+  through the host's nbb.edn would be testing something the stick does not
+  have."
+  [dir]
+  (let [bin (.join path dir "bin")
+        ;; By ABSOLUTE path. The real shim execs the bundled
+        ;; node-linux-x64 and can never re-enter itself; a test shim that
+        ;; execs `nbb` by name while sitting first on PATH calls ITSELF,
+        ;; appending one --classpath per hop, forever. Measured: it did.
+        host-nbb (str/trim (:out (run "sh" ["-c" "command -v nbb"] {})))]
+    (when (str/blank? host-nbb)
+      (println "AIUEOS_BUNDLE_TEST_REFUSED cannot locate nbb for the shim")
+      (.exit js/process 2))
+    (.mkdirSync fs bin #js {:recursive true})
+    (.writeFileSync fs (.join path bin "nbb")
+                    (str "#!/bin/sh\nexec " host-nbb " --classpath "
+                         (.join path dir "cp") " \"$@\"\n")
+                    #js {:mode 493})  ; 0755; ClojureScript has no octal literal
+    bin))
+
+(defn- run-live [dir extra-env]
+  (run "nbb" ["--classpath" (.join path dir "cp") "install-live.cljk"]
+       {:cwd dir
+        :input operator-script
+        :env (js/Object.assign
+              #js {} (.-env js/process)
+              (clj->js (merge {"PATH" (str (shim! dir) ":" (.-PATH js/process.env))
+                               "NODE_ENV" "test"
+                               "AIUEOS_GUIDED_ALLOW_FAKE_PROBE" "1"
+                               "AIUEOS_GUIDED_PROBE_FILE" probe-fixture
+                               "AIUEOS_LIVE_PAYLOAD_DEV" "/dev/aiueos-test-absent"
+                               "AIUEOS_LIVE_MEDIA" dir}
+                              extra-env)))}))
+
+(def asked (run-live (:dir guided-bundle) {}))
+(def asked-out (str (:out asked) (:err asked)))
+
+(record! "live-with-no-intent-says-the-stick-asks"
+         (str/includes? asked-out "AIUEOS_LIVE_NO_INTENT")
+         "AIUEOS_LIVE_NO_INTENT")
+(record! "live-with-no-intent-runs-the-guided-installer"
+         (str/includes? asked-out "AIUEOS_GUIDED_START")
+         "guided screens reached the console")
+(record! "guided-wrote-the-intent-into-the-tmpfs"
+         (.existsSync fs (.join path (:dir guided-bundle) "install-intent.json"))
+         "install-intent.json")
+
+(when (.existsSync fs (.join path (:dir guided-bundle) "install-intent.json"))
+  (let [i (js->clj (.parse js/JSON (.readFileSync fs (.join path (:dir guided-bundle)
+                                                            "install-intent.json") "utf8"))
+                   :keywordize-keys true)]
+    (record! "the-authored-intent-is-the-one-the-operator-answered"
+             (and (= "aiueos.install-intent.v1" (:schema i))
+                  (= "aiueos-asked" (:hostname i))
+                  (= "PNY CS2241 500GB" (get-in i [:targetDisk :model])))
+             (str "hostname=" (:hostname i)
+                  " model=" (get-in i [:targetDisk :model])))
+    ;; The chain does not stop at the guided program: install-live goes on to
+    ;; select a target with lsblk. On this host there is no lsblk and no such
+    ;; disk, so it refuses on ITS OWN terms -- which is the evidence that the
+    ;; handover happened rather than the run ending at the guided step.
+    (record! "live-continues-past-the-guided-step"
+             (or (str/includes? asked-out "AIUEOS_LIVE_DISKS")
+                 (str/includes? asked-out "lsblk"))
+             (str "status=" (:status asked)))))
+
+;; An operator who walks away is not an install. The guided program exits 3
+;; (could-not-answer) when stdin ends mid-question, and install-live keeps
+;; that code rather than flattening it to "failed" -- 2 is a named refusal and
+;; 3 is nobody answered, and they send the operator to different places.
+(let [r (run "nbb" ["--classpath" (.join path (:dir guided-abort-bundle) "cp") "install-live.cljk"]
+             {:cwd (:dir guided-abort-bundle)
+              :input ""
+              :env (js/Object.assign
+                    #js {} (.-env js/process)
+                    (clj->js {"PATH" (str (shim! (:dir guided-abort-bundle)) ":"
+                                          (.-PATH js/process.env))
+                              "NODE_ENV" "test"
+                              "AIUEOS_GUIDED_ALLOW_FAKE_PROBE" "1"
+                              "AIUEOS_GUIDED_PROBE_FILE" probe-fixture
+                              "AIUEOS_LIVE_PAYLOAD_DEV" "/dev/aiueos-test-absent"
+                              "AIUEOS_LIVE_MEDIA" (:dir guided-abort-bundle)}))})
+      out (str (:out r) (:err r))]
+  (record! "unanswered-guided-run-propagates-could-not-answer"
+           (and (str/includes? out "AIUEOS_LIVE_GUIDED_ABORTED status=3")
+                (= 3 (:status r)))
+           (str "status=" (:status r)))
+  (record! "unanswered-guided-run-writes-no-intent"
+           (not (.existsSync fs (.join path (:dir guided-abort-bundle) "install-intent.json")))
+           "no install-intent.json"))
+
+;; The control: a stick that DOES carry an intent must not ask. Otherwise the
+;; unattended product would stop at a prompt nobody is standing at.
+(def not-asked (run-live (:dir with-cp) {}))
+(record! "live-with-an-intent-never-asks"
+         (not (str/includes? (str (:out not-asked) (:err not-asked)) "AIUEOS_GUIDED_START"))
+         "guided installer not started")
+
+;; ---------------------------------------- the builder refuses the in-between
+
+(defn- build-args [& extra]
+  (run "python3" (concat [builder "build"
+                          "--release-image" "/nonexistent-release.img"
+                          "--release-receipt" "/nonexistent-receipt.json"
+                          "--installer-dir" (.join path repo "os/aiueos/installer")
+                          "--output" "/dev/null" "--receipt" "/dev/null"]
+                         extra)
+       {}))
+
+;; Both flags, and neither, are argument errors -- and they are reported
+;; BEFORE the release image is opened, so a missing image cannot mask them.
+(let [r (build-args "--guided" "--intent" "/tmp/x.json")]
+  (record! "builder-refuses-guided-and-intent-together"
+           (str/includes? (:err r) "two different products")
+           (str/trim (last (str/split-lines (:err r))))))
+(let [r (build-args)]
+  (record! "builder-refuses-neither-guided-nor-intent"
+           (str/includes? (:err r) "or --guided for a stick that asks")
+           (str/trim (last (str/split-lines (:err r))))))
+
+;; A payload between the two products is refused by name. Tested on the
+;; function rather than on an image: the decision is the same one, and an
+;; image would need a real 64 MiB release with a real GPT to reach it.
+(defn- consistency [py-files]
+  (run "python3"
+       ["-c" (str "import importlib.util, hashlib;\n"
+                  "spec = importlib.util.spec_from_file_location('mk', " (pr-str builder) ");\n"
+                  "mk = importlib.util.module_from_spec(spec); spec.loader.exec_module(mk);\n"
+                  py-files
+                  "try:\n"
+                  "  print('GUIDED' if mk.check_payload_consistency(files) else 'INTENT')\n"
+                  "except ValueError as e:\n"
+                  "  print('REFUSED', e)\n")]
+       {}))
+
+(def py-common
+  (str "def sha(b): return hashlib.sha256(b).hexdigest()\n"
+       "rel, rec, tgz, ins = b'R', b'C', b'T', b'I'\n"))
+
+(let [r (consistency (str py-common
+                          "files = {'RELEASE.IMG': rel, 'RECEIPT.JSN': rec, 'INSTALL.TGZ': tgz,\n"
+                          "  'README.TXT': b'x'}\n"
+                          "files['SHA256S.TXT'] = ''.join('%s  %s\\n' % (sha(files[n]), n)\n"
+                          "  for n in ['RELEASE.IMG','RECEIPT.JSN','INSTALL.TGZ']).encode()\n"))]
+  (record! "consistent-guided-payload-reads-as-guided"
+           (str/includes? (:out r) "GUIDED") (str/trim (str (:out r) (:err r)))))
+
+(let [r (consistency (str py-common
+                          "files = {'RELEASE.IMG': rel, 'RECEIPT.JSN': rec, 'INSTALL.TGZ': tgz,\n"
+                          "  'INTENT.JSN': ins, 'README.TXT': b'x'}\n"
+                          "files['SHA256S.TXT'] = ''.join('%s  %s\\n' % (sha(files[n]), n)\n"
+                          "  for n in ['RELEASE.IMG','RECEIPT.JSN','INTENT.JSN','INSTALL.TGZ']).encode()\n"))]
+  (record! "consistent-intent-payload-reads-as-intent"
+           (str/includes? (:out r) "INTENT") (str/trim (str (:out r) (:err r)))))
+
+;; Carries an intent, digests only the guided set: the stick would verify as
+;; "asks" while an intent sits on it.
+(let [r (consistency (str py-common
+                          "files = {'RELEASE.IMG': rel, 'RECEIPT.JSN': rec, 'INSTALL.TGZ': tgz,\n"
+                          "  'INTENT.JSN': ins, 'README.TXT': b'x'}\n"
+                          "files['SHA256S.TXT'] = ''.join('%s  %s\\n' % (sha(files[n]), n)\n"
+                          "  for n in ['RELEASE.IMG','RECEIPT.JSN','INSTALL.TGZ']).encode()\n"))]
+  (record! "undigested-intent-refuses"
+           (str/includes? (:out r) "REFUSED payload carries files SHA256S.TXT does not list: INTENT.JSN")
+           (str/trim (str (:out r) (:err r)))))
+
+;; Digests an intent it does not carry.
+(let [r (consistency (str py-common
+                          "files = {'RELEASE.IMG': rel, 'RECEIPT.JSN': rec, 'INSTALL.TGZ': tgz,\n"
+                          "  'README.TXT': b'x'}\n"
+                          "files['SHA256S.TXT'] = (''.join('%s  %s\\n' % (sha(files[n]), n)\n"
+                          "  for n in ['RELEASE.IMG','RECEIPT.JSN','INSTALL.TGZ'])\n"
+                          "  + '%s  INTENT.JSN\\n' % sha(ins)).encode()\n"))]
+  (record! "digested-but-absent-intent-refuses"
+           (str/includes? (:out r) "REFUSED SHA256S.TXT lists a file the payload does not carry: INTENT.JSN")
+           (str/trim (str (:out r) (:err r)))))
+
+;; ------------------------------------------------- the two halves must agree
+
+;; The bundle can carry cp/ and /init can still fail to pass it. That is a
+;; drift between two files, so it is asserted between two files.
+(def init-text (.readFileSync fs live-builder "utf8"))
+(record! "init-passes-the-classpath-on-the-install-handover"
+         (str/includes? init-text
+                        "--classpath /run/aiueos-installer/cp install-live.cljk")
+         "make-live-installer.py /init")
+
+;; install-live.cljs spawns `nbb` BY NAME for the second hop, so the shim on
+;; the stick is where that hop gets its classpath. The shim is only emitted
+;; with an nbb tree, so this reads the builder source rather than a bundle
+;; assembled without one.
+(def builder-text (.readFileSync fs builder "utf8"))
+(record! "nbb-shim-carries-the-classpath"
+         (str/includes? builder-text "--classpath \"$DIR/cp\" ")
+         "bin/nbb shim in make_bundle_tgz")
+
+;; Two source roots merge into one cp/. A shared relative path would let one
+;; file silently replace the other, and which one survives depends on argument
+;; order -- so it refuses instead.
+(let [r (run "python3"
+             ["-c" (str "import sys, importlib.util, pathlib;\n"
+                        "spec = importlib.util.spec_from_file_location('mk', " (pr-str builder) ");\n"
+                        "mk = importlib.util.module_from_spec(spec); spec.loader.exec_module(mk);\n"
+                        "try:\n"
+                        "  mk.make_bundle_tgz(" (pr-str (.join path repo "os/aiueos/installer")) ",\n"
+                        "    " (pr-str scripts-dir) ", b'{}', b'{}', None, None,\n"
+                        "    classpath_dirs=[" (pr-str text-src) ", " (pr-str text-src) "])\n"
+                        "  print('NO_REFUSAL')\n"
+                        "except ValueError as e:\n"
+                        "  print('REFUSED' if 'written twice' in str(e) else 'WRONG_REFUSAL', e)\n")]
+             {})]
+  ;; The same root twice is byte-identical, so it must NOT refuse -- the check
+  ;; is on differing bytes, not on a repeated name. This case pins that the
+  ;; refusal is about content, not about tidiness.
+  (record! "identical-duplicate-roots-are-not-a-conflict"
+           (str/includes? (:out r) "NO_REFUSAL")
+           (str/trim (str (:out r) (:err r)))))
+
+;; A root that exists but carries nothing is refused too: "asked for a root and
+;; got no files" must not be reportable as "no root was asked for".
+(let [empty-root (.join path tmp "empty-root")]
+  (.mkdirSync fs empty-root #js {:recursive true})
+  (let [r (run "python3"
+               ["-c" (str "import importlib.util;\n"
+                          "spec = importlib.util.spec_from_file_location('mk', " (pr-str builder) ");\n"
+                          "mk = importlib.util.module_from_spec(spec); spec.loader.exec_module(mk);\n"
+                          "try:\n"
+                          "  mk.make_bundle_tgz(" (pr-str (.join path repo "os/aiueos/installer")) ",\n"
+                          "    " (pr-str scripts-dir) ", b'{}', b'{}', None, None,\n"
+                          "    classpath_dirs=[" (pr-str empty-root) "])\n"
+                          "  print('NO_REFUSAL')\n"
+                          "except ValueError as e:\n"
+                          "  print('REFUSED' if 'carries no' in str(e) else 'WRONG_REFUSAL', e)\n")]
+               {})]
+    (record! "empty-classpath-root-refuses"
+             (str/includes? (:out r) "REFUSED")
+             (str/trim (str (:out r) (:err r))))))
+
+(let [fake (.join path tmp "fake-root/kotoba/lang")]
+  (.mkdirSync fs fake #js {:recursive true})
+  (.writeFileSync fs (.join path fake "text.cljk") "(ns kotoba.lang.text) ;; imposter\n")
+  (let [r (run "python3"
+               ["-c" (str "import sys, importlib.util;\n"
+                          "spec = importlib.util.spec_from_file_location('mk', " (pr-str builder) ");\n"
+                          "mk = importlib.util.module_from_spec(spec); spec.loader.exec_module(mk);\n"
+                          "try:\n"
+                          "  mk.make_bundle_tgz(" (pr-str (.join path repo "os/aiueos/installer")) ",\n"
+                          "    " (pr-str scripts-dir) ", b'{}', b'{}', None, None,\n"
+                          "    classpath_dirs=[" (pr-str text-src) ", "
+                          (pr-str (.join path tmp "fake-root")) "])\n"
+                          "  print('NO_REFUSAL')\n"
+                          "except ValueError as e:\n"
+                          "  print('REFUSED' if 'written twice' in str(e) else 'WRONG_REFUSAL', e)\n")]
+               {})]
+    (record! "colliding-roots-refuse-rather-than-overwrite"
+             (str/includes? (:out r) "REFUSED")
+             (str/trim (str (:out r) (:err r))))))
+
+;; ------------------------------------------------------------------ summary
+
+(def expected-cases 36)
+(def total (count @results))
+(def failed (filterv (complement :ok) @results))
+
+(println)
+(println "AIUEOS_BUNDLE_TEST_SUMMARY"
+         (str "ran=" total) (str "expected=" expected-cases)
+         (str "failed=" (count failed)))
+(doseq [f failed] (println "  FAILED" (:name f) (:detail f)))
+(when (not= total expected-cases)
+  (println "  COUNT MISMATCH: a run that executed fewer cases is not a clean run"))
+
+(.exit js/process (if (and (empty? failed) (= total expected-cases)) 0 1))

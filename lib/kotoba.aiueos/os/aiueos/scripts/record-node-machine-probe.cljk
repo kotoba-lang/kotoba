@@ -1,0 +1,390 @@
+#!/usr/bin/env kbb
+;; Turn the hardware record a box wrote about itself into MEASURED fields in
+;; contracts/node-machines-v1.edn.
+;;
+;; The install writes /var/log/aiueos-node-hwprobe.txt on the box (the
+;; `--no-hw-record` switch of make-node-autoinstall-iso.cljk turns it off).
+;; Bring that file here and this reads it:
+;;
+;;   kbb --backend sci os/aiueos/scripts/record-node-machine-probe.cljk \
+;;     --machine amd-6600hs --probe aiueos-node-hwprobe.txt
+;;
+;; The rule this exists to enforce: a field becomes :measured only if the probe
+;; text actually contains it. Anything missing stays :unverified -- it is never
+;; written as a measured nil, because a nil that claims to be measured stops the
+;; next reader from asking, which is worse than an honest blank. If the probe
+;; contains none of the fields at all, the whole file is refused rather than
+;; producing an entry that looks updated.
+;;
+;; Exit codes: 0 recorded / 2 refused, by a named reason / 3 could-not-answer.
+
+(require '[kotoba.lang.text :as str]
+         '[cljs.reader :as reader]
+         '["node:fs" :as fs]
+         '["node:path" :as path]
+         '["node:crypto" :as crypto])
+
+(def argv (vec *command-line-args*))
+(defn- opt [f d] (let [i (.indexOf argv f)] (if (neg? i) d (nth argv (inc i)))))
+(defn- flag? [f] (not (neg? (.indexOf argv f))))
+
+(defn- say [& m] (println (str "record-node-machine-probe: " (str/join " " m))))
+(defn- refuse [& m]
+  (binding [*print-fn* #(.error js/console %)] (apply say (cons "REFUSING:" m)))
+  (js/process.exit 2))
+(defn- cannot-answer [& m]
+  (binding [*print-fn* #(.error js/console %)] (apply say (cons "COULD NOT ANSWER:" m)))
+  (js/process.exit 3))
+
+(def registry-path
+  (opt "--registry" (path/join "os" "aiueos" "contracts" "node-machines-v1.edn")))
+(def machine-id (or (opt "--machine" nil)
+                    (refuse "no --machine. Which box this probe came from is not"
+                            "a thing to infer from its contents.")))
+(def probe-path (or (opt "--probe" nil)
+                    (refuse "no --probe. Nothing to read.")))
+(def dry-run? (flag? "--dry-run"))
+
+(def probe
+  (try (fs/readFileSync probe-path "utf8")
+       (catch :default e (cannot-answer "cannot read the probe at" probe-path
+                                        (str "(" (.-message e) ")")))))
+
+(when-not (str/includes? probe "AIUEOS_NODE_HWPROBE_V1")
+  (refuse "that file does not carry the AIUEOS_NODE_HWPROBE_V1 marker, so it is"
+          "not a record this knows how to read. Refusing rather than pattern"
+          "matching whatever it does contain: a probe from something else that"
+          "happens to mention a serial would be written down as a measurement."))
+
+;; ── read the probe ────────────────────────────────────────────────────────
+;;
+;; Sectioned, not globally grepped. `model=` appears under both --cpu and (as
+;; MODEL=) under --disk, and a global search would settle that by line order,
+;; which is how a disk model becomes a CPU.
+
+(def lines (str/split-lines probe))
+
+(defn- section
+  "The lines under `--- <name>`, up to the next `--- ` heading."
+  [name]
+  (->> lines
+       (drop-while #(not= (str "--- " name) (str/trim %)))
+       rest
+       (take-while #(not (str/starts-with? (str/trim %) "--- ")))
+       (map str/trim)
+       (remove str/blank?)
+       vec))
+
+(defn- kv
+  "value of key=... in a line set, or nil. Trailing empties (`board_name=`) read
+  as nil, which is the point: the probe ran and the box had nothing to say."
+  [ls k]
+  (some (fn [l]
+          (when (str/starts-with? l (str k "="))
+            (let [v (str/trim (subs l (inc (count k))))]
+              (when-not (str/blank? v) v))))
+        ls))
+
+(def dmi (section "dmi"))
+(def cpu (section "cpu"))
+(def net (section "net"))
+(def disk (section "disk"))
+
+(def probed-board
+  (let [vendor (kv dmi "sys_vendor")
+        product (kv dmi "product_name")]
+    (cond (and vendor product) (str vendor " " product)
+          product product
+          :else nil)))
+
+(def probed-cpu (kv cpu "model"))
+
+(def nics
+  ;; Every non-loopback interface the box reported, with its driver. `lo` is
+  ;; already excluded at the box; excluded again here because a probe from
+  ;; somewhere else may not have been.
+  (->> net
+       (keep (fn [l]
+               (let [f (into {} (for [tok (str/split l #"\s+")
+                                      :let [i (.indexOf tok "=")]
+                                      :when (pos? i)]
+                                  [(subs tok 0 i) (subs tok (inc i))]))]
+                 (when (and (get f "iface") (not= "lo" (get f "iface"))
+                            (not (str/blank? (str (get f "driver")))))
+                   f))))
+       vec))
+
+(defn- pci-id
+  "vendor:device, or nil unless BOTH halves are there. Composed here rather than
+  at the box: a single `pci=%s:%s` printf emits a bare `:` when a NIC has no PCI
+  parent at all (measured in a container, where a veth has none), and `:` reads
+  as a PCI id to anything that only checks for non-blank."
+  [f]
+  (let [v (get f "pcivendor") d (get f "pcidevice")]
+    (when-not (or (str/blank? (str v)) (str/blank? (str d)))
+      (str v ":" d))))
+
+(def probed-nic
+  (when (seq nics)
+    (str/join ", " (map (fn [f] (str (get f "driver")
+                                     (when-let [p (pci-id f)] (str " [" p "]"))))
+                        nics))))
+
+(def disks
+  ;; lsblk -P pairs: NAME="x" TYPE="disk" RM="0" HOTPLUG="0" SERIAL="y" ...
+  (->> disk
+       (keep (fn [l]
+               (let [f (into {} (for [[_ k v] (re-seq #"([A-Z]+)=\"([^\"]*)\"" l)] [k v]))]
+                 (when (= "disk" (get f "TYPE")) f))))
+       vec))
+
+(def virtual-device?
+  ;; Not disks, whatever lsblk calls them. zram in particular is TYPE=disk,
+  ;; RM=0 and HOTPLUG=0, so the removable test alone admits it -- measured in a
+  ;; container, where it was the only thing that passed.
+  #(re-find #"^(zram|loop|ram|nbd|dm-|sr|fd|md)" (str %)))
+
+(def internal-disks
+  ;; The install target is an internal whole disk, and "internal" is ASKED
+  ;; (lsblk RM/HOTPLUG) rather than inferred from the name. A name rule keyed on
+  ;; nvme* would mean a box with a SATA SSD could never have its serial
+  ;; measured, and the install USB -- itself a disk with a serial -- has to stay
+  ;; out of the answer, or an unattended stick would be pointed at itself.
+  (filterv (fn [f]
+             (and (= "0" (get f "RM"))
+                  (= "0" (get f "HOTPLUG"))
+                  (not (virtual-device? (get f "NAME")))))
+           disks))
+
+(def probed-disk
+  (cond
+    (= 1 (count internal-disks)) (first internal-disks)
+    (zero? (count internal-disks)) nil
+    :else ::ambiguous))
+
+;; ── the registry ──────────────────────────────────────────────────────────
+
+(def registry-raw
+  (try (fs/readFileSync registry-path "utf8")
+       (catch :default e (cannot-answer "cannot read the registry:" (.-message e)))))
+(def registry
+  (let [doc (try (reader/read-string registry-raw)
+                 (catch :default e (cannot-answer "the registry is not readable EDN:"
+                                                  (.-message e))))]
+    (when-not (and (map? doc) (= :aiueos.node-machines/v1 (:format doc)))
+      (cannot-answer "the registry is not :aiueos.node-machines/v1"))
+    doc))
+(when-not (get (:machines registry) (keyword machine-id))
+  (refuse "no machine" (str "`" machine-id "`") "in" registry-path
+          "\n  known:" (str/join ", " (sort (map name (keys (:machines registry)))))))
+
+(def probe-sha (-> (.createHash crypto "sha256") (.update probe) (.digest "hex")))
+(def today (-> (js/Date.) .toISOString (subs 0 10)))
+
+(def found
+  (cond-> {}
+    probed-board (assoc :board probed-board)
+    probed-cpu   (assoc :cpu probed-cpu)
+    probed-nic   (assoc :nic probed-nic)
+    (seq nics)   (assoc :nic-count (count nics))
+    (map? probed-disk) (assoc :disk-model (get probed-disk "MODEL")
+                              :disk-serial (get probed-disk "SERIAL"))))
+
+;; Blank-stripped AFTER collection, so "the probe ran and the field was empty"
+;; and "the probe has no such field" reach the same place -- unverified -- by
+;; one rule rather than two.
+(def measured (into {} (remove (fn [[_ v]] (or (nil? v) (and (string? v) (str/blank? v)))) found)))
+
+(println (str "probe     " probe-path))
+(println (str "sha256    " probe-sha))
+(println (str "scanned   " (count lines) " lines: dmi " (count dmi) ", cpu " (count cpu)
+              ", net " (count net) ", disk " (count disk)))
+(doseq [k [:board :cpu :nic :nic-count :disk-model :disk-serial]]
+  (println (str "  " (str/pad-left (name k) 13 " ") "  "
+                (if (contains? measured k) (pr-str (get measured k)) "-- not in this probe"))))
+(when (= ::ambiguous probed-disk)
+  (println (str "  note          " (count internal-disks)
+                " internal disks; no target serial recorded."
+                " An unattended stick needs exactly one named disk, and which"
+                " one is the owner's statement, not this script's guess.")))
+
+(when (empty? measured)
+  (refuse "the probe carries the marker but none of the fields this records."
+          "Nothing was written. A run that updates a machine entry with no new"
+          "measurement would leave it looking measured."))
+
+;; ── write ─────────────────────────────────────────────────────────────────
+;;
+;; Textual, one fact at a time, rather than re-printing the whole EDN. The file
+;; is a contract whose commentary IS its content -- every :unverified carries
+;; the note that says how to measure it, and pr-str of a parsed map would throw
+;; all of that away while reporting success.
+
+(defn- skip-to-matching-brace
+  "Index of the `}` that closes the `{` at `open`, or nil.
+  Comments and string literals are skipped, because this file's content IS its
+  commentary: a brace inside a note (or inside a path like /sys/class/{dmi,net})
+  would otherwise shift the close, and a rewrite that lands on the wrong brace
+  produces a file that still PARSES -- into something smaller. That is the exact
+  failure this workspace keeps recording, so the cheap fix goes here and the
+  read-back below stays as the thing that refuses."
+  [text open]
+  (loop [i (inc open) depth 1]
+    (if (>= i (count text))
+      nil
+      (let [c (subs text i (inc i))]
+        (cond
+          (= ";" c) (let [nl (.indexOf text "\n" i)]
+                      (if (neg? nl) nil (recur (inc nl) depth)))
+          (= "\"" c) (let [close (loop [j (inc i)]
+                                  (cond (>= j (count text)) nil
+                                        (= "\\" (subs text j (inc j))) (recur (+ j 2))
+                                        (= "\"" (subs text j (inc j))) j
+                                        :else (recur (inc j))))]
+                       (if (nil? close) nil (recur (inc close) depth)))
+          (= "{" c) (recur (inc i) (inc depth))
+          (= "}" c) (if (= 1 depth) i (recur (inc i) (dec depth)))
+          :else (recur (inc i) depth))))))
+
+(defn- token-brace
+  "[open close] of the map that follows the token `:name` in `text`, searching
+  from `from`, or nil. A regex rather than indexOf of \":name {\": the entries in
+  this contract are column-aligned, so the gap before the brace is one space in
+  some and seven in others -- and a single-space search fails SILENTLY, which is
+  how this script first reported that the key did not exist."
+  [text name from]
+  (let [re (js/RegExp. (str ":" name "\\s*\\{") "")
+        m (.exec re (subs text from))]
+    (when m
+      (let [open (+ from (.-index m) (dec (count (aget m 0))))]
+        (when-let [close (skip-to-matching-brace text open)]
+          [open close])))))
+
+(def ^:private fact-head
+  ;; Every fact in this contract opens `:value <form> :provenance <keyword>` and
+  ;; may then carry anything: a :measure-by that says how to read the field off a
+  ;; box, a :same-silicon-as, and the commentary that is the reason the contract
+  ;; is a file rather than a table. Only the head is rewritten; the tail is
+  ;; copied through byte for byte.
+  ;;
+  ;; This replaced a version that rewrote the WHOLE fact map, which measured
+  ;; correctly and silently deleted all of that -- including the note saying how
+  ;; to measure the field again. It was green at the time: the test checked for
+  ;; a string in the file's header, which survived.
+  ;; `:on` and `:by` are consumed IF present, so a re-measurement replaces them
+  ;; instead of adding a second copy. That is not a hypothetical: the first
+  ;; version stopped at :provenance, and the 6600HS entry already carried an
+  ;; :on from when the owner stated its CPU -- the rewrite produced
+  ;; "Map literal contains duplicate key: :on". Nothing was written, because the
+  ;; read-back below refused it. A head that fails to consume them in some other
+  ;; layout lands in the same place, which is why that check is the net and this
+  ;; regex is only the cheap path.
+  (js/RegExp. (str "^\\s*:value\\s+(nil|\"[^\"]*\"|-?[0-9]+|:[A-Za-z0-9_.:/+-]+)"
+                   "\\s+:provenance\\s+:[a-z-]+"
+                   "(\\s+:on\\s+\"[^\"]*\")?"
+                   "(\\s+:by\\s+\"[^\"]*\")?")
+              ""))
+
+(defn- skip-to-matching-brace
+  "Index of the `}` that closes the `{` at `open`, or nil.
+  Comments and string literals are skipped, because this file's content IS its
+  commentary: a brace inside a note (or inside a path like /sys/class/{dmi,net})
+  would otherwise shift the close, and a rewrite that lands on the wrong brace
+  produces a file that still PARSES -- into something smaller. That is the exact
+  failure this workspace keeps recording, so the cheap fix goes here and the
+  read-back below stays as the thing that refuses."
+  [text open]
+  (loop [i (inc open) depth 1]
+    (if (>= i (count text))
+      nil
+      (let [c (subs text i (inc i))]
+        (cond
+          (= ";" c) (let [nl (.indexOf text "\n" i)]
+                      (if (neg? nl) nil (recur (inc nl) depth)))
+          (= "\"" c) (let [close (loop [j (inc i)]
+                                  (cond (>= j (count text)) nil
+                                        (= "\\" (subs text j (inc j))) (recur (+ j 2))
+                                        (= "\"" (subs text j (inc j))) j
+                                        :else (recur (inc j))))]
+                       (if (nil? close) nil (recur (inc close) depth)))
+          (= "{" c) (recur (inc i) (inc depth))
+          (= "}" c) (if (= 1 depth) i (recur (inc i) (dec depth)))
+          :else (recur (inc i) depth))))))
+
+(defn- token-brace
+  "[open close] of the map that follows the token `:name` in `text`, searching
+  from `from`, or nil. A regex rather than indexOf of \":name {\": the entries in
+  this contract are column-aligned, so the gap before the brace is one space in
+  some and seven in others -- and a single-space search fails SILENTLY, which is
+  how this script first reported that the key did not exist."
+  [text name from]
+  (let [re (js/RegExp. (str ":" name "\\s*\\{") "")
+        m (.exec re (subs text from))]
+    (when m
+      (let [open (+ from (.-index m) (dec (count (aget m 0))))]
+        (when-let [close (skip-to-matching-brace text open)]
+          [open close])))))
+
+(defn- replace-fact
+  "Rewrite the head of one fact of the named machine, keeping everything else in
+  it. Returns nil when the machine, the fact, or the expected head cannot be
+  located, so the caller refuses rather than recording nothing.
+
+  The machine's own block is brace-matched first: both machines in this registry
+  carry a :board and a :nic, and an unbounded search would write this box's
+  measurement into the other one's entry."
+  [text k value]
+  (when-let [[mopen mclose] (token-brace text machine-id 0)]
+    (when-let [[open close] (token-brace (subs text 0 mclose) (name k) mopen)]
+      (let [body (subs text (inc open) close)
+            m (.exec fact-head body)]
+        (when m
+          (str (subs text 0 (inc open))
+               ":value " (pr-str value)
+               " :provenance :measured"
+               " :on " (pr-str today)
+               " :by " (pr-str (str "aiueos-node-hwprobe sha256:" (subs probe-sha 0 12)))
+               (subs body (count (aget m 0)))
+               (subs text close)))))))
+
+(def updated
+  (reduce (fn [text [k v]]
+            (or (replace-fact text k v)
+                (refuse "machine" machine-id "has no" (str ":" (name k))
+                        "fact to rewrite in" registry-path
+                        "\n  Add the key (with :provenance :unverified) before measuring it:"
+                        "\n  a field that is not declared is not a field this box is missing.")))
+          registry-raw
+          measured))
+
+;; Read back what was produced, with a reader, before it is written. A rewrite
+;; that damaged the EDN would otherwise be discovered by the next reader -- and
+;; the most likely damage here (a brace counted wrong) leaves a file that still
+;; parses into something smaller, which is exactly the failure this workspace
+;; keeps recording.
+(let [doc (try (reader/read-string updated)
+               (catch :default e
+                 (cannot-answer "the rewrite did not read back as EDN:" (.-message e)
+                                "-- nothing was written")))
+      before (reader/read-string registry-raw)]
+  (when-not (= (set (keys (:machines doc))) (set (keys (:machines before))))
+    (cannot-answer "the rewrite changed the set of machines -- nothing was written"))
+  (doseq [[id m] (:machines doc)]
+    (when-not (= (set (keys (:facts m)))
+                 (set (keys (:facts (get (:machines before) id)))))
+      (cannot-answer "the rewrite changed" (str id) "'s fact keys -- nothing was written")))
+  (doseq [[k v] measured]
+    (let [f (get-in doc [:machines (keyword machine-id) :facts k])]
+      (when-not (and (= :measured (:provenance f)) (= v (:value f)))
+        (cannot-answer "the rewrite did not land" (str k)
+                       "-- read back" (pr-str f) "-- nothing was written")))))
+
+(if dry-run?
+  (do (say "DRY RUN --" (count measured) "fields would be recorded; the registry is unchanged.")
+      (js/process.exit 0))
+  (do (fs/writeFileSync registry-path updated)
+      (say "recorded" (count measured) "measured fields for" machine-id "in" registry-path)
+      (when (contains? measured :disk-serial)
+        (say "This box now has a measured disk serial, so"
+             (str "`make-node-installer.cljk --machine " machine-id " --unattended`")
+             "will build the stick that installs without a person."))))

@@ -1,0 +1,566 @@
+(ns aiueos.qwen35-tensor-table-bind
+  (:export [aiueos-qwen35-tensor-table-bind main]))
+
+;; The 866-record GGUF tensor table of the Qwen3.8-27B artifact, against the
+;; exact graph in `contracts/qwen38-qwen35-runtime-v1.edn`. A port of the
+;; tensor half of `kernel/qwen35_runtime.c` -- the record loop inside
+;; `aiueos_qwen35_model_parse`, `tensor_storage`, `type_layout`,
+;; `parse_layer_name`, `assign_tensor`, `assign_layer_tensor`, `tensor_set`,
+;; `dimensions_are`, `expected_type_counts`, and the layer-shape half of
+;; `exact_contract_valid`.
+;;
+;; It also does what `aiueos_qwen35_model_bind` does, and for the reason that
+;; function exists: the C splits parse from bind so that reading an 11 MB
+;; prefix cannot fabricate pointers into bytes nobody mapped. This object
+;; produces FILE OFFSETS, never addresses, so the distinction is structural
+;; rather than a rule -- a caller adds its own mapping base, and an object that
+;; never saw the mapping cannot invent a pointer into it.
+;;
+;; ## Arguments
+;;
+;;   table         base of the tensor table -- the model mapping narrowed to
+;;                 its metadata end. The caller has already been told where
+;;                 that is: it is workspace slot 0 of `aiueos-qwen35-gguf-kv-scan`.
+;;   limit         bytes readable from `table` onward
+;;   metadata-end  file offset of `table`, so file offsets can be derived
+;;   plan          caller-owned workspace
+;;   plan-length   must be 28160
+;;
+;; ## Return
+;;
+;; **Zero is the success value**, the convention of the two objects it follows.
+;;
+;;      0   admitted
+;;     -1   null table base
+;;     -2   null workspace
+;;     -3   workspace is not 28160 bytes
+;;     -4   metadata-end is not the contract's 10,945,379
+;;     -5   fewer readable bytes than the smallest possible table
+;;    -10   a record ran past the readable window
+;;    -11   dimension count outside 1..4
+;;    -12   a dimension is zero or the element product is out of bounds
+;;    -13   ggml type has no admitted block layout
+;;    -14   element count is not a multiple of the type's block
+;;    -15   storage bytes are zero or exceed the artifact
+;;    -16   the tensor offset is not the 32-aligned end of the previous one
+;;    -17   the tensor extent runs past the artifact
+;;    -18   the tensor name names no role in the graph
+;;    -19   that role was already filled for that layer
+;;    -20   the dimensions disagree with the role's shape
+;;    -21   a model-level tensor carries the wrong ggml type
+;;    -22   the table did not end at 10,996,621
+;;    -23   the extents do not fill the artifact exactly
+;;    -24   the ggml type histogram disagrees with the contract
+;;    -25   a layer's role set is not the one its position requires
+;;
+;; For -10 .. -21 the workspace records WHICH record refused, at byte 28148.
+;; A code alone would say a table of 866 records is wrong and nothing more.
+;;
+;; ## Workspace (28160 bytes, u32 little-endian)
+;;
+;;       0  tensor records admitted                          866
+;;       4  data-section file offset, low word          10996640
+;;       8  data-section file offset, high word                0
+;;      12  alignment                                         32
+;;      16  tensor-info-end file offset, low word       10996621
+;;      20  tensor-info-end file offset, high word              0
+;;      24  linear-attention layer count                       48
+;;      28  full-attention layer count                         16
+;;      32  866 binding slots of 32 bytes, in table order:
+;;            +0  role id 1..27          +4  layer 0..64, or 65 for the three
+;;            +8  ggml type                  model-level tensors
+;;           +12  dimensions[0]         +16  dimensions[1], 0 when 1-D
+;;           +20  data file offset, low word
+;;           +24  data file offset, high word
+;;           +28  storage bytes
+;;   27744  32 ggml type counters, indexed by type
+;;   27872  role presence masks: word 0 model-level, words 1..65 layers 0..64
+;;   28136  walk cursor: next expected tensor offset (low, high)
+;;   28144  metadata-end, echoed from the argument
+;;   28148  index of the record that refused, 866 when none did
+;;   28152  two reserved words, zero
+;;
+;; A slot's data file offset is written as 10,996,640 + the record's own
+;; offset, which is the contract's data-section start used as a literal. The
+;; walk does not take that on trust: `finish` DERIVES the same number as
+;; align32 of where the table actually ended and refuses with -22 unless the
+;; two agree, so a zero verdict is the only state in which those offsets are
+;; published. On a refusal the workspace holds a partial walk and means
+;; nothing but the record index at 28148.
+;;
+;; The slot is 32 bytes because a data file offset does not fit in one: the
+;; artifact is 10,934,860,704 bytes and the store primitive writes 32 bits, so
+;; the offset is a low/high pair. `storage bytes` fits in one word -- the
+;; largest tensor here is `token_embd.weight` at 417,177,600 bytes.
+;;
+;; ## Role ids
+;;
+;;   common         1 attn_norm            2 post_attention_norm
+;;                  3 ffn_down             4 ffn_gate            5 ffn_up
+;;   linear mixer   6 attn_gate            7 attn_qkv            8 ssm_a
+;;                  9 ssm_alpha           10 ssm_beta           11 ssm_conv1d
+;;                 12 ssm_dt.bias         13 ssm_norm           14 ssm_out
+;;   full mixer    15 attn_k              16 attn_k_norm        17 attn_output
+;;                 18 attn_q              19 attn_q_norm        20 attn_v
+;;   nextn head    21 nextn.eh_proj       22 nextn.enorm        23 nextn.hnorm
+;;                 24 nextn.shared_head_norm
+;;   model-level   25 token_embd          26 output_norm        27 output
+;;
+;; The id is the presence bit plus one: a zero role id in a slot means the slot
+;; was never written, which a role id of zero could not distinguish.
+;;
+;; ## Where this is deliberately narrower than the C
+;;
+;; `tensor_storage` guards its multiplications against `UINT64_MAX`. This
+;; guards them against 17,592,186,044,416 elements and against the artifact's
+;; own 10,934,860,704 bytes, because an i64 has no unsigned half to compare in
+;; and a wrapped product would compare small. Nothing that survives the C's
+;; guard and fails this one could also survive the C's very next test, which is
+;; that the extent fits inside the artifact.
+
+;; ---------------------------------------------------------------- readers
+
+(defn u8-at [base length off]
+  (kernel-load-u8 (kernel-subregion base length off 1) 1 0))
+
+(defn u32-at [base length off]
+  (kernel-load-u32 (kernel-subregion base length off 4) 4 0))
+
+(defn u64-at [base length off]
+  (+ (u32-at base length off)
+     (* (u32-at base length (+ off 4)) 4294967296)))
+
+;; The workspace is 28,160 bytes and the store primitive's window ceiling is
+;; 512, so every access narrows first. 28160 is a literal rather than the
+;; parameter because the entry refuses any other length before reaching here,
+;; and the ABI's fifth parameter is spent.
+(defn pput [plan off v]
+  (kernel-store-u32 (kernel-subregion plan 28160 off 4) 4 0 v))
+
+(defn pget [plan off]
+  (kernel-load-u32 (kernel-subregion plan 28160 off 4) 4 0))
+
+;; ----------------------------------------------------------------- profile
+;;
+;; Which artifact this table belongs to (ADR-0222 stage A). The entry decides
+;; it from `metadata-end`, which the caller already has to pass and which the
+;; kv-scan object derived: 10,945,379 is Qwen3.8-27B (profile 0, 866 records),
+;; 11,070,652 is Ternary Bonsai 2 27B PTQ1_0 (profile 1, 851), anything else
+;; is -4 as before. It is echoed into slot 28144 before the walk starts, so
+;; every function below reads the profile from the workspace rather than
+;; needing a sixth parameter the ABI does not have.
+(defn profile [plan]
+  (if (= (pget plan 28144) 11070652) 1 0))
+
+(defn records [plan] (if (= (profile plan) 1) 851 866))
+(defn artifact-bytes [plan] (if (= (profile plan) 1) 5946648928 10934860704))
+(defn data-offset [plan] (if (= (profile plan) 1) 11120992 10996640))
+(defn table-end [plan] (if (= (profile plan) 1) 11120982 10996621))
+(defn trunk-layers [plan] (if (= (profile plan) 1) 64 65))
+
+;; --------------------------------------------------------- literal tables
+
+(defn role-length [i]
+  (if (= i 0) 16 (if (= i 1) 26 (if (= i 2) 15 (if (= i 3) 15 (if (= i 4) 13
+  (if (= i 5) 16 (if (= i 6) 15 (if (= i 7) 5 (if (= i 8) 16 (if (= i 9) 15
+  (if (= i 10) 17 (if (= i 11) 11 (if (= i 12) 15 (if (= i 13) 14 (if (= i
+  14) 13 (if (= i 15) 18 (if (= i 16) 18 (if (= i 17) 13 (if (= i 18) 18 (if
+  (= i 19) 13 (if (= i 20) 20 (if (= i 21) 18 (if (= i 22) 18 (if (= i 23)
+  29 (if (= i 24) 17 (if (= i 25) 18 (if (= i 26) 13
+  0))))))))))))))))))))))))))))
+
+(defn role-word [i]
+  (if (= i 0) 8245930798892741729 (if (= i 1) 8388068008349085293 (if (= i
+  4) 8391439068301586288 (if (= i 5) 7953196891749248613 (if (= i 6)
+  7451598621015634543 (if (= i 7) 29800 (if (= i 8) 7959953343289124454 (if
+  (= i 9) 32765890657613614 (if (= i 12) 7310575191739754086 (if (= i 13)
+  32765890657613614 (if (= i 16) 8587925188856669798 (if (= i 17)
+  499967813989 (if (= i 20) 8386097640713253985 (if (= i 21)
+  8388068008349085285 (if (= i 24) 8533038573672494177 (if (= i 25)
+  32765890657613614 (if (= i 28) 418212836211 (if (= i 32)
+  7525634142804734835 (if (= i 33) 8388068008349085281 (if (= i 36)
+  7022349192159654771 (if (= i 37) 32765890657613614 (if (= i 40)
+  8533880816507122547 (if (= i 41) 7523097587057845297 (if (= i 42) 116 (if
+  (= i 44) 7074720039092188019 (if (= i 45) 7561577 (if (= i 48)
+  7886488417317254003 (if (= i 49) 32765890657613614 (if (= i 52)
+  3347429544245949299 (if (= i 53) 127991760381303 (if (= i 56)
+  8587919597061305441 (if (= i 57) 499967813989 (if (= i 60)
+  7953193524578776161 (if (= i 61) 7451598621015634543 (if (= i 62) 29800
+  (if (= i 64) 8391735936340489313 (if (= i 65) 7451598621016094064 (if (= i
+  66) 29800 (if (= i 68) 8587926194131072097 (if (= i 69) 499967813989 (if
+  (= i 72) 7953200121648542817 (if (= i 73) 7451598621015634543 (if (= i 74)
+  29800 (if (= i 76) 8587931691689210977 (if (= i 77) 499967813989 (if (= i
+  80) 7522469804527609198 (if (= i 81) 7311363554730471519 (if (= i 82)
+  1952999273 (if (= i 84) 7954815368755176814 (if (= i 85)
+  7451598621015634543 (if (= i 86) 29800 (if (= i 88) 7955659793685308782
+  (if (= i 89) 7451598621015634543 (if (= i 90) 29800 (if (= i 92)
+  7526410454201558382 (if (= i 93) 7018130353242337889 (if (= i 94)
+  8587921877705318244 (if (= i 95) 499967813989 (if (= i 96)
+  7882811650534502260 (if (= i 97) 7523097587057845346 (if (= i 98) 116 (if
+  (= i 100) 7953203514706261359 (if (= i 101) 7451598621015634543 (if (= i
+  102) 29800 (if (= i 104) 8587929587188790639 (if (= i 105) 499967813989
+  0)))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))
+
+(defn pow256 [r]
+  (if (= r 0) 1 (if (= r 1) 256 (if (= r 2) 65536 (if (= r 3) 16777216
+  (if (= r 4) 4294967296 (if (= r 5) 1099511627776
+  (if (= r 6) 281474976710656 (if (= r 7) 72057594037927936 0)))))))))
+
+(defn pow2 [k]
+  (if (= k 0) 1 (if (= k 1) 2 (if (= k 2) 4 (if (= k 3) 8 (if (= k 4) 16
+  (if (= k 5) 32 (if (= k 6) 64 (if (= k 7) 128 (if (= k 8) 256
+  (if (= k 9) 512 (if (= k 10) 1024 (if (= k 11) 2048 (if (= k 12) 4096
+  (if (= k 13) 8192 (if (= k 14) 16384 (if (= k 15) 32768 (if (= k 16) 65536
+  (if (= k 17) 131072 (if (= k 18) 262144 (if (= k 19) 524288
+  (if (= k 20) 1048576 (if (= k 21) 2097152 (if (= k 22) 4194304
+  (if (= k 23) 8388608 0)))))))))))))))))))))))))
+
+(defn role-byte [r i]
+  (bit-and (quot (role-word (+ (* r 4) (quot i 8)))
+                 (pow256 (- i (* 8 (quot i 8)))))
+           255))
+
+(defn role-eq-from [base limit off r i]
+  (if (= i (role-length r)) 1
+    (if (= (u8-at base limit (+ off i)) (role-byte r i))
+      (role-eq-from base limit off r (+ i 1))
+      0)))
+
+;; The 24 per-layer roles. 24 means "none of them", which is
+;; `assign_layer_tensor` falling off its last comparison and returning 0.
+(defn role-index-from [base limit roff rlen r]
+  (if (= r 24) 24
+    (if (= rlen (role-length r))
+      (if (= (role-eq-from base limit roff r 0) 1) r
+        (role-index-from base limit roff rlen (+ r 1)))
+      (role-index-from base limit roff rlen (+ r 1)))))
+
+;; The three whole-model names. 27 means "none of them".
+(defn model-index-from [base limit noff nlen r]
+  (if (= r 27) 27
+    (if (= nlen (role-length r))
+      (if (= (role-eq-from base limit noff r 0) 1) r
+        (model-index-from base limit noff nlen (+ r 1)))
+      (model-index-from base limit noff nlen (+ r 1)))))
+
+;; ---------------------------------------------- the C's parse_layer_name
+;;
+;; State is `value * 8 + digits`, because the caller needs both the layer
+;; number and how many characters it took, and a Kotoba function returns one
+;; word. Digits cannot reach 8: the loop refuses once `value` exceeds 100, so
+;; the fifth digit is the last one that can be read and it is refused for
+;; being at least 65 anyway.
+(defn blk-digits [base limit noff nlen state]
+  (let [digits (- state (* 8 (quot state 8)))
+        value (quot state 8)
+        p (+ 4 digits)]
+    (if (>= p nlen) state
+      (let [c (u8-at base limit (+ noff p))]
+        (if (< c 48) state
+          (if (> c 57) state
+            (if (> value 100) -1
+              (blk-digits base limit noff nlen
+                          (+ (* (+ (* value 10) (- c 48)) 8)
+                             (+ digits 1))))))))))
+
+(defn blk-packed [base limit noff nlen]
+  (if (< nlen 6) -1
+    (if (not (= (u8-at base limit noff) 98)) -1
+      (if (not (= (u8-at base limit (+ noff 1)) 108)) -1
+        (if (not (= (u8-at base limit (+ noff 2)) 107)) -1
+          (if (not (= (u8-at base limit (+ noff 3)) 46)) -1
+            (let [st (blk-digits base limit noff nlen 0)]
+              (if (< st 0) -1
+                (let [digits (- st (* 8 (quot st 8)))
+                      value (quot st 8)]
+                  (if (= digits 0) -1
+                    (if (>= value 65) -1
+                      (if (>= (+ 4 digits) nlen) -1
+                        (if (not (= (u8-at base limit (+ noff (+ 4 digits))) 46)) -1
+                          (if (>= (+ 5 digits) nlen) -1
+                            st))))))))))))))
+
+;; `role * 128 + layer`, layer 65 for a model-level tensor, or -1 for a name
+;; the graph does not have. 128 rather than 65 so the split is a shift-free
+;; `quot`/remainder pair on values this dialect can express exactly.
+(defn resolve-role [base limit noff nlen]
+  (let [m (model-index-from base limit noff nlen 24)]
+    (if (< m 27) (+ (* m 128) 65)
+      (let [st (blk-packed base limit noff nlen)]
+        (if (< st 0) -1
+          (let [digits (- st (* 8 (quot st 8)))
+                layer (quot st 8)
+                roff (+ noff (+ 5 digits))
+                rlen (- nlen (+ 5 digits))
+                r (role-index-from base limit roff rlen 0)]
+            (if (= r 24) -1 (+ (* r 128) layer))))))))
+
+;; ------------------------------------------------------------ the contract
+
+(defn role-ndims [r]
+  (if (= r 0) 1 (if (= r 1) 1 (if (= r 7) 1 (if (= r 11) 1 (if (= r 12) 1
+  (if (= r 15) 1 (if (= r 18) 1 (if (= r 21) 1 (if (= r 22) 1 (if (= r 23) 1
+  (if (= r 25) 1 2))))))))))))
+
+(defn role-d0 [r]
+  (if (= r 0) 5120 (if (= r 1) 5120 (if (= r 2) 17408 (if (= r 3) 5120
+  (if (= r 4) 5120 (if (= r 5) 5120 (if (= r 6) 5120 (if (= r 7) 48
+  (if (= r 8) 5120 (if (= r 9) 5120 (if (= r 10) 4 (if (= r 11) 48
+  (if (= r 12) 128 (if (= r 13) 6144 (if (= r 14) 5120 (if (= r 15) 256
+  (if (= r 16) 6144 (if (= r 17) 5120 (if (= r 18) 256 (if (= r 19) 5120
+  (if (= r 20) 10240 (if (= r 21) 5120 (if (= r 22) 5120 (if (= r 23) 5120
+  (if (= r 24) 5120 (if (= r 25) 5120 (if (= r 26) 5120
+  -1))))))))))))))))))))))))))))
+
+(defn role-d1 [r]
+  (if (= r 2) 5120 (if (= r 3) 17408 (if (= r 4) 17408 (if (= r 5) 6144
+  (if (= r 6) 10240 (if (= r 8) 48 (if (= r 9) 48 (if (= r 10) 10240
+  (if (= r 13) 5120 (if (= r 14) 1024 (if (= r 16) 5120 (if (= r 17) 12288
+  (if (= r 19) 1024 (if (= r 20) 5120 (if (= r 24) 248320 (if (= r 26) 248320
+  0)))))))))))))))))
+
+;; Only the three model-level tensors have their ggml type fixed by
+;; `exact_contract_valid`. Everything else is constrained by the histogram.
+;; Bonsai's embedding and output head are PTQ1_0 where Qwen3.8's are Q2_K and
+;; Q4_K; `output_norm` is f32 in both.
+(defn role-type [plan r]
+  (if (= r 24) (if (= (profile plan) 1) 143 10)
+    (if (= r 25) 0
+      (if (= r 26) (if (= (profile plan) 1) 143 12) -1))))
+
+(defn type-block [t]
+  (if (= t 30) 1 (if (= t 143) 128
+  (if (= t 0) 1 (if (= t 8) 32
+  (if (= t 10) 256 (if (= t 11) 256 (if (= t 12) 256 (if (= t 13) 256
+  (if (= t 14) 256 (if (= t 16) 256 (if (= t 17) 256 (if (= t 18) 256
+  (if (= t 19) 256 (if (= t 21) 256 (if (= t 22) 256 (if (= t 23) 256
+  (if (= t 29) 256 0))))))))))))))))))
+
+(defn type-bytes [t]
+  (if (= t 30) 2 (if (= t 143) 28
+  (if (= t 0) 4 (if (= t 8) 34
+  (if (= t 10) 84 (if (= t 11) 110 (if (= t 12) 144 (if (= t 13) 176
+  (if (= t 14) 210 (if (= t 16) 66 (if (= t 17) 74 (if (= t 18) 98
+  (if (= t 19) 50 (if (= t 21) 110 (if (= t 22) 82 (if (= t 23) 136
+  (if (= t 29) 56 0))))))))))))))))))
+
+;; Type counter slot. The 32 counters are indexed by ggml type; PTQ1_0 is type
+;; 143 and would run off the end, so it takes slot 31, which no Qwen type
+;; uses (the artifact's 15 types are all below 30).
+(defn type-slot [t] (if (= t 143) 31 t))
+
+(defn expect-count-qwen [t]
+  (if (= t 0) 360 (if (= t 8) 98
+  (if (= t 10) 10 (if (= t 11) 6 (if (= t 12) 26 (if (= t 13) 7
+  (if (= t 14) 6 (if (= t 16) 24 (if (= t 17) 12 (if (= t 18) 120
+  (if (= t 19) 8 (if (= t 21) 106 (if (= t 22) 35 (if (= t 23) 45
+  (if (= t 29) 3 0))))))))))))))))
+
+;; Bonsai carries three types: F32 353, BF16 96, PTQ1_0 402 (slot 31).
+(defn expect-count-bonsai [t]
+  (if (= t 0) 353 (if (= t 30) 96 (if (= t 31) 402 0))))
+
+(defn expect-count [plan t]
+  (if (= (profile plan) 1) (expect-count-bonsai t) (expect-count-qwen t)))
+
+;; The hybrid schedule: every fourth trunk layer is full attention, the other
+;; 48 are gated DeltaNet, and layer 64 is the MTP head, which carries a full
+;; mixer AND the four nextn tensors. 16383 = roles 0..13, 1032223 = roles 0..4
+;; and 14..19, 16760863 = that plus 20..23.
+(defn layer-mask [plan l]
+  (if (if (= l 64) (= (profile plan) 0) false) 16760863
+    (if (= (- (+ l 1) (* 4 (quot (+ l 1) 4))) 0) 1032223 16383)))
+
+(defn mask-offset [layer]
+  (if (= layer 65) 27872 (+ 27876 (* 4 layer))))
+
+;; ------------------------------------------------------------- the record
+
+(defn elements-of [base limit dimsoff n acc]
+  (if (= n 0) acc
+    (let [d (u64-at base limit dimsoff)]
+      (if (< d 1) -1
+        (if (> acc (quot 17592186044416 d)) -1
+          (elements-of base limit (+ dimsoff 8) (- n 1) (* acc d)))))))
+
+(defn tensor-record [base limit plan pos index]
+  (if (> (+ pos 8) limit) -10
+    (let [nlen (u64-at base limit pos)]
+      (if (< nlen 0) -10
+        (if (> nlen (- limit (+ pos 8))) -10
+          (let [noff (+ pos 8)
+                p (+ noff nlen)]
+            (if (> (+ p 4) limit) -10
+              (let [ndims (u32-at base limit p)]
+                (if (< ndims 1) -11
+                  (if (> ndims 4) -11
+                    (let [dimsoff (+ p 4)
+                          after (+ dimsoff (* 8 ndims))]
+                      (if (> (+ after 12) limit) -10
+                        (let [elements (elements-of base limit dimsoff ndims 1)]
+                          (if (< elements 0) -12
+                            (let [t (u32-at base limit after)
+                                  offset (u64-at base limit (+ after 4))
+                                  block (type-block t)
+                                  tbytes (type-bytes t)]
+                              (if (if (= t 143) false (>= t 31)) -13
+                                (if (= block 0) -13
+                                  (if (not (= 0 (- elements (* block (quot elements block))))) -14
+                                    (let [blocks (quot elements block)]
+                                      (if (= blocks 0) -15
+                                        (if (> blocks (quot (artifact-bytes plan) tbytes)) -15
+                                          (let [storage (* blocks tbytes)
+                                                expected (+ (pget plan 28136)
+                                                            (* (pget plan 28140) 4294967296))]
+                                            (if (= storage 0) -15
+                                              (if (< offset 0) -16
+                                                (if (not (= offset expected)) -16
+                                                  (if (> offset (artifact-bytes plan)) -17
+                                                    (if (> storage (- (artifact-bytes plan) offset)) -17
+                                                      (let [packed (resolve-role base limit noff nlen)]
+                                                        (if (< packed 0) -18
+                                                          (let [role (quot packed 128)
+                                                                layer (- packed (* 128 (quot packed 128)))
+                                                                moff (mask-offset layer)
+                                                                bit (if (>= role 24) (pow2 (- role 24)) (pow2 role))
+                                                                seen (pget plan moff)
+                                                                dfile (+ (data-offset plan) offset)]
+                                                            (if (= bit (bit-and seen bit)) -19
+                                                              (if (not (= ndims (role-ndims role))) -20
+                                                                (if (not (= (u64-at base limit dimsoff) (role-d0 role))) -20
+                                                                  (if (if (= ndims 1) false
+                                                                        (not (= (u64-at base limit (+ dimsoff 8))
+                                                                                (role-d1 role)))) -20
+                                                                    (if (if (< (role-type plan role) 0) false
+                                                                          (not (= t (role-type plan role)))) -21
+                                                                      (do
+                                                                        (pput plan (+ 32 (* 32 index)) (+ role 1))
+                                                                        (pput plan (+ 36 (* 32 index)) layer)
+                                                                        (pput plan (+ 40 (* 32 index)) t)
+                                                                        (pput plan (+ 44 (* 32 index)) (u64-at base limit dimsoff))
+                                                                        (pput plan (+ 48 (* 32 index))
+                                                                              (if (= ndims 1) 0 (u64-at base limit (+ dimsoff 8))))
+                                                                        (pput plan (+ 52 (* 32 index))
+                                                                              (- dfile (* 4294967296 (quot dfile 4294967296))))
+                                                                        (pput plan (+ 56 (* 32 index)) (quot dfile 4294967296))
+                                                                        (pput plan (+ 60 (* 32 index)) storage)
+                                                                        (pput plan moff (bit-or seen bit))
+                                                                        (pput plan (+ 27744 (* 4 (type-slot t)))
+                                                                              (+ 1 (pget plan (+ 27744 (* 4 (type-slot t))))))
+                                                                        ;; The `do` is load-bearing. A `let` whose body has two
+                                                                        ;; forms compiles with `:ok true` and KEEPS ONLY THE
+                                                                        ;; FIRST -- measured against amu b1fdaad2. Without it
+                                                                        ;; the high word of the cursor was never written, and
+                                                                        ;; the walk refused with -16 at record 338, the first
+                                                                        ;; tensor whose offset passes 2^32.
+                                                                        (let [nextoff (* 32 (quot (+ (+ offset storage) 31) 32))]
+                                                                          (do
+                                                                            (pput plan 28136
+                                                                                  (- nextoff (* 4294967296 (quot nextoff 4294967296))))
+                                                                            (pput plan 28140 (quot nextoff 4294967296))))
+                                                                        (+ after 12)))))))))))))))))))))))))))))))))))))
+
+;; ------------------------------------------------------------ final checks
+
+(defn types-ok [plan t]
+  (if (= t 32) 0
+    (if (= (pget plan (+ 27744 (* 4 t))) (expect-count plan t))
+      (types-ok plan (+ t 1))
+      -24)))
+
+(defn layers-ok [plan l]
+  (if (= l (trunk-layers plan)) 0
+    (if (= (pget plan (+ 27876 (* 4 l))) (layer-mask plan l))
+      (layers-ok plan (+ l 1))
+      -25)))
+
+;; Under profile 1 the 64 trunk layers are all there is; under profile 0 the
+;; 65th is the MTP head and is not a trunk layer.
+(defn count-linear [plan l acc]
+  (if (= l 64) acc
+    (count-linear plan (+ l 1)
+      (+ acc (if (= (pget plan (+ 27876 (* 4 l))) 16383) 1 0)))))
+
+(defn finish [plan pos]
+  (let [tie (+ (pget plan 28144) pos)
+        dofs (* 32 (quot (+ tie 31) 32))
+        nextoff (+ (pget plan 28136) (* (pget plan 28140) 4294967296))]
+    (if (not (= tie (table-end plan))) -22
+      (if (not (= dofs (data-offset plan))) -22
+        (if (not (= nextoff (- (artifact-bytes plan) dofs))) -23
+          (let [tk (types-ok plan 0)]
+            (if (< tk 0) tk
+              (let [lk (layers-ok plan 0)]
+                (if (< lk 0) lk
+                  (if (not (= (pget plan 27872) 7)) -25
+                    (do (pput plan 0 (records plan))
+                        (pput plan 4 (- dofs (* 4294967296 (quot dofs 4294967296))))
+                        (pput plan 8 (quot dofs 4294967296))
+                        (pput plan 12 32)
+                        (pput plan 16 (- tie (* 4294967296 (quot tie 4294967296))))
+                        (pput plan 20 (quot tie 4294967296))
+                        (pput plan 24 (count-linear plan 0 0))
+                        (pput plan 28 (- 64 (count-linear plan 0 0)))
+                        0)))))))))))
+
+;; Both walks below are CHUNKED -- an inner loop of at most 64 steps under an
+;; outer loop over the chunks -- for the reason `qwen35-gguf-kv-scan`'s
+;; `skip-strings` gives: the machine turns a self tail call into a jump and
+;; does not care, but the KIR interpreter recurses on its host stack, so a
+;; 7,040-deep clear or an 851-deep record walk is a host stack overflow there
+;; rather than a verdict. Chunking makes the deepest host stack ~2 x sqrt(n).
+;; Measured 2026-09-22: unchunked, the oracle could not execute this object at
+;; all on node (--stack-size=60000); chunked, the whole 851-record walk runs.
+
+(defn plan-clear-chunk [plan off stop]
+  (if (>= off stop) 0
+    (do (pput plan off 0)
+        (plan-clear-chunk plan (+ off 4) stop))))
+
+(defn plan-clear [plan off]
+  (if (>= off 28160) 0
+    (let [stop (if (> (+ off 256) 28160) 28160 (+ off 256))]
+      (do (plan-clear-chunk plan off stop)
+          (plan-clear plan stop)))))
+
+;; A file offset is positive and every verdict is negative, so one word
+;; carries both: the chunk answers where it stopped, or why it refused.
+;; The chunk boundary is DERIVED from the index rather than carried: the ABI
+;; admits five parameters and a sixth would have been one too many. Every
+;; index inside one 64-block answers the same end, so the inner walk can ask
+;; for it itself.
+(defn chunk-end [plan index]
+  (let [e (* 64 (+ 1 (quot index 64)))]
+    (if (> e (records plan)) (records plan) e)))
+
+(defn walk-chunk [base limit plan pos index]
+  (let [nxt (tensor-record base limit plan pos index)]
+    (if (< nxt 0)
+      (do (pput plan 28148 index) nxt)
+      (if (>= (+ index 1) (chunk-end plan index))
+        nxt
+        (walk-chunk base limit plan nxt (+ index 1))))))
+
+(defn walk [base limit plan pos index]
+  (if (= index (records plan)) (finish plan pos)
+    (let [nxt (walk-chunk base limit plan pos index)]
+      (if (< nxt 0) nxt (walk base limit plan nxt (chunk-end plan index))))))
+
+;; The smallest table each profile can have: 866 records of the shortest
+;; admissible shape, and 851 of it. Derived from `metadata-end` rather than
+;; from the workspace, because this check runs before the walk writes it.
+(defn table-floor [metadata-end]
+  (if (= metadata-end 11070652) 50330 51242))
+
+(defn aiueos-qwen35-tensor-table-bind [table limit metadata-end plan plan-length]
+  (if (= table 0) -1
+    (if (= plan 0) -2
+      (if (not (= plan-length 28160)) -3
+        (if (if (= metadata-end 10945379) false (not (= metadata-end 11070652))) -4
+          (if (< limit (table-floor metadata-end)) -5
+            (do (plan-clear plan 0)
+                (pput plan 28144 metadata-end)
+                (pput plan 28148 (records plan))
+                (walk table limit plan 0 0))))))))
+
+(defn main [] 0)

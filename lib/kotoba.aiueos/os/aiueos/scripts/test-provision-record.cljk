@@ -1,0 +1,156 @@
+#!/usr/bin/env kbb
+;; Standalone proof of the provisioning record generator (ssh-v1.edn,
+;; make-provision-record.cljs). No devices, no install -- just the record.
+;;
+;; Every case pins a literal: the host key derived from a fixed seed must equal
+;; the RFC 8032 test-vector-1 public key (so "we generated an ed25519 key" is
+;; not standing in for "we generated the RIGHT key"); a non-ed25519 authorized
+;; key must be refused with its own reason; an intent whose stored fingerprint
+;; disagrees with its key must be refused. A generator that produced a
+;; plausible-but-wrong key would pass a shape check and fail this vector.
+
+(require '[kotoba.lang.text :as str])
+
+(def fs (js/require "node:fs"))
+(def path (js/require "node:path"))
+(def cp (js/require "node:child_process"))
+(def crypto (js/require "node:crypto"))
+(def os-mod (js/require "node:os"))
+
+(def scripts-dir (.dirname path *file*))
+(def tmp (.mkdtempSync fs (.join path (.tmpdir os-mod) "aiueos-provision-test-")))
+(def results (atom []))
+(defn- record! [name ok detail]
+  (swap! results conj ok)
+  (println (if ok "AIUEOS_PROVISION_TEST_OK " "AIUEOS_PROVISION_TEST_FAIL") name detail))
+
+(defn- run [args env]
+  (let [r (.spawnSync cp "nbb" (to-array args)
+                      #js {:encoding "utf8" :shell false
+                           :env (js/Object.assign #js {} (.-env js/process) (clj->js env))})]
+    {:status (or (.-status r) 1) :out (or (.-stdout r) "") :err (or (.-stderr r) "")}))
+
+(defn- ssh-string [buf]
+  (let [len (js/Buffer.alloc 4)] (.writeUInt32BE len (.-length buf) 0)
+    (js/Buffer.concat #js [len buf])))
+(defn- ed25519-blob [raw]
+  (js/Buffer.concat #js [(ssh-string (js/Buffer.from "ssh-ed25519" "utf8")) (ssh-string raw)]))
+(defn- fp [blob]
+  (str "SHA256:" (-> (.createHash crypto "sha256") (.update blob) (.digest "base64")
+                     (str/replace #"=+$" ""))))
+(defn- sha256-hex [buf] (-> (.createHash crypto "sha256") (.update buf) (.digest "hex")))
+
+;; An intent carrying a REAL ed25519 authorized key.
+(def owner (.generateKeyPairSync crypto "ed25519"))
+(def owner-raw
+  (let [spki (.export (.-publicKey owner) #js {:format "der" :type "spki"})]
+    (.subarray spki (- (.-length spki) 32))))
+(def owner-blob (ed25519-blob owner-raw))
+(defn- write-intent! [p ssh-map]
+  (.writeFileSync fs p (.stringify js/JSON
+    (clj->js {:schema "aiueos.install-intent.v1" :hostname "aiueos-prov"
+              :release {:disk {:sha256 (str/join (repeat 64 "a"))}}
+              :ssh ssh-map}) nil 2)))
+
+(def intent (.join path tmp "intent.json"))
+(write-intent! intent {:authorizedPrincipal "aiueos"
+                       :publicKey (str "ssh-ed25519 " (.toString owner-blob "base64") " owner")
+                       :fingerprint (fp owner-blob)})
+
+;; 1. host key from RFC 8032 vector-1 seed == the vector's public key.
+(def out1 (.join path tmp "p1.json"))
+(let [{:keys [status]} (run [(.join path scripts-dir "make-provision-record.cljk")
+                             "--intent" intent "--out" out1
+                             "--host-seed" "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"]
+                            {:NODE_ENV "test"})
+      rec (when (zero? status)
+            (js->clj (.parse js/JSON (.readFileSync fs out1 "utf8")) :keywordize-keys true))]
+  (record! "host-key-rfc8032-vector1"
+           (= "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+              (get-in rec [:sshHostKey :public]))
+           (str "got=" (get-in rec [:sshHostKey :public]))))
+
+;; 2. authorized key is the owner's, fingerprint agrees with the intent.
+(let [rec (js->clj (.parse js/JSON (.readFileSync fs out1 "utf8")) :keywordize-keys true)]
+  (record! "authorized-is-owner"
+           (and (= (.toString owner-raw "hex") (get-in rec [:authorizedKeys 0 :public]))
+                (= (fp owner-blob) (get-in rec [:authorizedKeys 0 :fingerprint])))
+           "")
+  ;; 3. the seed is present in the record (the kernel needs it to sign) and
+  ;; its digest matches -- but the tool printed only the public halves.
+  (record! "seed-present-and-digested"
+           (= (sha256-hex (js/Buffer.from (get-in rec [:sshHostKey :seed]) "hex"))
+              (get-in rec [:sshHostKey :seedSha256]))
+           ""))
+
+;; 4. --host-seed refused without NODE_ENV=test (a production run must not take
+;;    an injected seed).
+(let [{:keys [status]} (run [(.join path scripts-dir "make-provision-record.cljk")
+                             "--intent" intent "--out" (.join path tmp "p-refuse.json")
+                             "--host-seed" "00"] {:NODE_ENV "production"})]
+  (record! "injected-seed-refused-in-production" (= 3 status) (str "status=" status)))
+
+;; 5. a non-ed25519 authorized key is refused with its own reason.
+(def intent-rsa (.join path tmp "intent-rsa.json"))
+(write-intent! intent-rsa {:authorizedPrincipal "aiueos"
+                           :publicKey "ssh-rsa AAAAB3NzaC1yc2E owner"
+                           :fingerprint "SHA256:whatever"})
+(let [{:keys [status out]} (run [(.join path scripts-dir "make-provision-record.cljk")
+                                 "--intent" intent-rsa "--out" (.join path tmp "p-rsa.json")] {})]
+  (record! "non-ed25519-authorized-refused"
+           (and (= 2 status) (str/includes? out "ssh-ed25519 only"))
+           (str "status=" status)))
+
+;; 6. an intent whose stored fingerprint disagrees with its key is refused --
+;;    the generator will not silently trust a tampered intent.
+(def intent-bad (.join path tmp "intent-bad.json"))
+(write-intent! intent-bad {:authorizedPrincipal "aiueos"
+                           :publicKey (str "ssh-ed25519 " (.toString owner-blob "base64") " owner")
+                           :fingerprint "SHA256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdead"})
+(let [{:keys [status out]} (run [(.join path scripts-dir "make-provision-record.cljk")
+                                 "--intent" intent-bad "--out" (.join path tmp "p-bad.json")] {})]
+  (record! "inconsistent-intent-fingerprint-refused"
+           (and (= 3 status) (str/includes? out "inconsistent")) (str "status=" status)))
+
+;; 7-9. the kotoba.cloud account link (ADR-0239): carried whole when given,
+;;      refused by name when it is not an account-sync record, absent otherwise.
+(def b64-32 "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+(def account-ok (.join path tmp "account.json"))
+(.writeFileSync fs account-ok
+  (.stringify js/JSON
+    (clj->js {:schema "aiueos.account-sync.v1"
+              :authority "https://auth.kotoba.cloud"
+              :accountDid "did:key:z6MkAccount"
+              :deviceDid "did:aiueos:gmktec-k16:00112233445566778899aabbccddeeff"
+              :deviceKeys {:signingAlgo "ed25519" :signingSeed b64-32 :signingPublic b64-32
+                           :encryptionAlgo "x25519" :encryptionPrivate b64-32
+                           :encryptionPublic b64-32}})))
+(let [out (.join path tmp "p-account.json")
+      {:keys [status]} (run [(.join path scripts-dir "make-provision-record.cljk")
+                             "--intent" intent "--out" out "--account-record" account-ok] {})
+      rec (when (zero? status)
+            (js->clj (.parse js/JSON (.readFileSync fs out "utf8")) :keywordize-keys true))]
+  (record! "account-record-carried-into-provision"
+           (and (= "did:key:z6MkAccount" (get-in rec [:account :accountDid]))
+                (= b64-32 (get-in rec [:account :deviceKeys :signingSeed])))
+           (str "status=" status " account=" (get-in rec [:account :accountDid]))))
+
+(def account-bad (.join path tmp "account-bad.json"))
+(.writeFileSync fs account-bad
+  (.stringify js/JSON (clj->js {:schema "aiueos.account-sync.v0"
+                                :authority "https://auth.kotoba.cloud"})))
+(let [{:keys [status out err]} (run [(.join path scripts-dir "make-provision-record.cljk")
+                                     "--intent" intent "--out" (.join path tmp "p-account-bad.json")
+                                     "--account-record" account-bad] {})]
+  (record! "malformed-account-record-refused"
+           (and (= 3 status) (str/includes? (str out err) "not an aiueos.account-sync.v1 record"))
+           (str "status=" status)))
+
+(let [rec (js->clj (.parse js/JSON (.readFileSync fs out1 "utf8")) :keywordize-keys true)]
+  (record! "no-account-record-no-account" (nil? (:account rec))
+           (str "account=" (pr-str (:account rec)))))
+
+(let [expected 9 ran (count @results) failed (count (remove identity @results))]
+  (println (str "AIUEOS_PROVISION_TEST_SUMMARY ran=" ran " expected=" expected " failed=" failed))
+  (.rmSync fs tmp #js {:recursive true :force true})
+  (when (or (not= ran expected) (pos? failed)) (.exit js/process 1)))

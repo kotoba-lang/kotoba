@@ -1,0 +1,365 @@
+(ns aiueos.virtio-test
+  (:require [aiueos.virtio :as virtio]
+            [kotoba.test :refer [deftest is testing]]))
+
+;; ---------------------------------------------------------------------------
+;; Features / negotiation
+
+(deftest features-negotiation
+  (testing "required bits missing from offered -> throws"
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (virtio/negotiate-features 0 virtio/features-version-1 0))))
+  (testing "wanted bits accepted only when offered"
+    ;; `features-union`, not `bit-or`: these are u64 values and cljs `bit-or`
+    ;; coerces to int32, which silently drops every bit at 32 or above. This
+    ;; test used `bit-or` until 2026-08-25 and so negotiated with an `offered`
+    ;; that had VERSION_1 missing on that runtime -- and still passed, because
+    ;; the constant was 1 there too.
+    (let [offered (virtio/features-union virtio/features-version-1
+                                         virtio/features-ring-event-idx)
+          negotiated (virtio/negotiate-features offered virtio/features-version-1
+                                                 (virtio/features-union
+                                                  virtio/features-ring-event-idx
+                                                  virtio/features-ring-indirect-desc))]
+      (is (virtio/features-contains? negotiated virtio/features-version-1))
+      (is (virtio/features-contains? negotiated virtio/features-ring-event-idx))
+      (is (not (virtio/features-contains? negotiated virtio/features-ring-indirect-desc))
+          "not offered, so not accepted even though wanted"))))
+
+;; ---------------------------------------------------------------------------
+;; QueueSize
+
+(deftest queue-size-validation
+  (is (= 256 (virtio/queue-size 256)))
+  (is (thrown? #?(:clj Exception :cljs js/Error) (virtio/queue-size 0)))
+  (is (thrown? #?(:clj Exception :cljs js/Error) (virtio/queue-size 3)) "not a power of two")
+  (is (thrown? #?(:clj Exception :cljs js/Error) (virtio/queue-size 65536)) "exceeds 32768"))
+
+;; ---------------------------------------------------------------------------
+;; IRQ subscription
+
+(deftest irq-subscription-lifecycle
+  (let [[controller' sub] (virtio/subscribe-virtio-irq virtio/empty-irq-controller 5 :block)]
+    (is (= 5 (:line sub)))
+    (is (= sub (virtio/irq-subscription controller' 5)))
+    (testing "double subscription on the same line throws"
+      (is (thrown? #?(:clj Exception :cljs js/Error)
+                   (virtio/subscribe-virtio-irq controller' 5 :console))))))
+
+(deftest irq-line-must-be-non-zero
+  (is (thrown? #?(:clj Exception :cljs js/Error) (virtio/irq-line 0))))
+
+;; ---------------------------------------------------------------------------
+;; DeviceType
+
+(deftest device-type-round-trip
+  (is (= :block (virtio/device-type-from-id 2)))
+  (is (= "block/read" (virtio/device-type-capability :block)))
+  (is (thrown? #?(:clj Exception :cljs js/Error) (virtio/device-type-from-id 99))))
+
+;; ---------------------------------------------------------------------------
+;; DMA / IOMMU
+
+(deftest dma-range-contains
+  (let [r (virtio/dma-range 0x1000 0x1000 virtio/dma-perm-read-write)]
+    (is (virtio/dma-range-contains? r 0x1000 0x100 (:device-read virtio/dma-perm)))
+    (is (not (virtio/dma-range-contains? r 0x2000 0x100 (:device-read virtio/dma-perm)))
+        "outside range")
+    (is (not (virtio/dma-range-contains? r 0x1f00 0x200 (:device-read virtio/dma-perm)))
+        "extends past range end")))
+
+(deftest checked-iommu-map-unmap
+  (let [iommu (virtio/make-checked-iommu 0x1000 0x10000)
+        alloc (virtio/dma-allocation 0x2000 0x1000 virtio/dma-perm-read-write)
+        iommu' (virtio/iommu-map-dma iommu alloc)]
+    (testing "mapped allocation is reflected in the derived dma-map"
+      (is (virtio/dma-map-allows? (virtio/checked-iommu-dma-map iommu') 0x2000 0x100
+                                   (:device-read virtio/dma-perm))))
+    (testing "outside the aperture -> throws"
+      (is (thrown? #?(:clj Exception :cljs js/Error)
+                   (virtio/iommu-map-dma iommu (virtio/dma-allocation 0x100 0x10 virtio/dma-perm-read-write)))))
+    (testing "overlapping mapping -> throws"
+      (is (thrown? #?(:clj Exception :cljs js/Error)
+                   (virtio/iommu-map-dma iommu' (virtio/dma-allocation 0x2500 0x100 virtio/dma-perm-read-write)))))
+    (testing "unmap removes the mapping"
+      (let [iommu'' (virtio/iommu-unmap-dma iommu' alloc)]
+        (is (not (virtio/dma-map-allows? (virtio/checked-iommu-dma-map iommu'') 0x2000 0x100
+                                          (:device-read virtio/dma-perm))))))
+    (testing "unmap of an unknown mapping -> throws"
+      (is (thrown? #?(:clj Exception :cljs js/Error)
+                   (virtio/iommu-unmap-dma iommu (virtio/dma-allocation 0x2000 0x1000 virtio/dma-perm-read-write)))))))
+
+(deftest bump-dma-allocator
+  (let [allocator (virtio/make-bump-dma-allocator 0x1000 0x2000)
+        [allocator' alloc1] (virtio/bump-allocate-dma allocator 0x100 0x10 virtio/dma-perm-read-write)]
+    (is (= 0x1000 (:guest-phys alloc1)))
+    (let [[allocator'' alloc2] (virtio/bump-allocate-dma allocator' 0x100 0x10 virtio/dma-perm-read-write)]
+      (is (= 0x1100 (:guest-phys alloc2)))
+      (testing "exhausted aperture throws"
+        (is (thrown? #?(:clj Exception :cljs js/Error)
+                     (virtio/bump-allocate-dma allocator'' 0x10000 0x10 virtio/dma-perm-read-write)))))))
+
+(deftest dma-map-rejects-overlap
+  (is (thrown? #?(:clj Exception :cljs js/Error)
+               (virtio/dma-map [(virtio/dma-range 0 0x100 virtio/dma-perm-read-write)
+                                 (virtio/dma-range 0x50 0x100 virtio/dma-perm-read-write)]))))
+
+;; ---------------------------------------------------------------------------
+;; Descriptor chains
+
+(deftest descriptor-chain-validation
+  (let [table [(virtio/desc-with-next (virtio/desc-read 0x1000 16) 1)
+               (virtio/desc-with-next (virtio/desc-read 0x2000 512) 2)
+               (virtio/desc-write 0x3000 1)
+               (virtio/desc-read 0 1)]
+        chain (virtio/validate-descriptor-chain 4 table 0)]
+    (is (= [0 1 2] (:descriptors chain)))
+    (is (= (+ 16 512) (:readable-bytes chain)))
+    (is (= 1 (:writable-bytes chain)))))
+
+(deftest descriptor-chain-rejects-loop
+  (let [table [(virtio/desc-with-next (virtio/desc-read 0x1000 16) 0)]]
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (virtio/validate-descriptor-chain 1 table 0)))))
+
+(deftest descriptor-chain-rejects-zero-length
+  (let [table [(virtio/desc-read 0x1000 0)]]
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (virtio/validate-descriptor-chain 1 table 0)))))
+
+(deftest descriptor-chain-for-dma-checks-coverage
+  (let [table [(virtio/desc-read 0x1000 16)]
+        dma (virtio/dma-map [(virtio/dma-range 0x1000 16 (:device-read virtio/dma-perm))])]
+    (is (some? (virtio/validate-descriptor-chain-for-dma 1 table 0 0 dma)))
+    (let [uncovered-dma (virtio/dma-map [(virtio/dma-range 0x5000 16 (:device-read virtio/dma-perm))])]
+      (is (thrown? #?(:clj Exception :cljs js/Error)
+                   (virtio/validate-descriptor-chain-for-dma 1 table 0 0 uncovered-dma))))))
+
+;; ---------------------------------------------------------------------------
+;; Split-queue layout
+
+(deftest split-queue-layout-shapes
+  (let [layout (virtio/split-queue-layout 0 256 4096)]
+    (is (= 0 (:descriptor-table layout)))
+    (is (= (* 256 16) (:available-ring layout)))
+    (is (zero? (mod (:used-ring layout) 4096)) "used ring aligned to page size")))
+
+(deftest validate-queue-layout-dma-checks-coverage
+  (let [layout (virtio/split-queue-layout 0x10000 8 4096)
+        dma (virtio/dma-map [(virtio/dma-range 0x10000 0x2000 virtio/dma-perm-read-write)])]
+    (is (nil? (virtio/validate-queue-layout-dma layout 8 dma)))
+    (let [too-small-dma (virtio/dma-map [(virtio/dma-range 0x10000 8 virtio/dma-perm-read-write)])]
+      (is (thrown? #?(:clj Exception :cljs js/Error)
+                   (virtio/validate-queue-layout-dma layout 8 too-small-dma))))))
+
+;; ---------------------------------------------------------------------------
+;; AvailRing / UsedRing
+
+(deftest avail-used-ring-round-trip
+  (let [ring (virtio/make-avail-ring 4)
+        [ring' slot] (virtio/avail-ring-push ring 2)]
+    (is (= 0 slot))
+    (is (= 1 (virtio/avail-ring-idx ring'))))
+  (let [ring (virtio/make-used-ring 4)
+        [ring' slot] (virtio/used-ring-push ring 3 512)]
+    (is (= 0 slot))
+    (is (= {:id 3 :len 512} (virtio/used-ring-get ring' slot)))))
+
+;; ---------------------------------------------------------------------------
+;; MMIO transport handshake (in-memory register fake)
+
+(deftest mmio-magic-and-version-checked
+  (let [regs {:read32 (fn [offset]
+                         (cond (= offset (:magic-value virtio/mmio-reg)) 0xdeadbeef
+                               (= offset (:version virtio/mmio-reg)) virtio/mmio-version-2
+                               :else 0))
+              :write32 (fn [_ _] nil)}]
+    (is (thrown? #?(:clj Exception :cljs js/Error) (virtio/mmio-transport regs)))))
+
+(defn- make-fake-block-mmio
+  "An atom-backed in-memory register file for a virtio-blk device that always
+  offers `offered-features` and accepts any FEATURES_OK (mirrors the old
+  `MemTransport` test double)."
+  [offered-features]
+  (let [regmap (atom {(:magic-value virtio/mmio-reg) virtio/mmio-magic
+                       (:version virtio/mmio-reg) virtio/mmio-version-2
+                       (:device-id virtio/mmio-reg) (:block virtio/device-type-id)
+                       (:status virtio/mmio-reg) 0})
+        features-sel (atom 0)]
+    {:read32 (fn [offset]
+               (cond
+                 (= offset (:device-features virtio/mmio-reg))
+                 (if (zero? @features-sel)
+                   (virtio/u64-low offered-features)
+                   (virtio/u64-high offered-features))
+                 :else (get @regmap offset 0)))
+     :write32 (fn [offset value]
+                (cond
+                  (= offset (:device-features-sel virtio/mmio-reg)) (reset! features-sel value)
+                  :else (swap! regmap assoc offset value)))}))
+
+(deftest initialize-mmio-transport-handshake
+  (let [regs (make-fake-block-mmio virtio/features-version-1)
+        result (virtio/initialize-mmio-transport regs :block virtio/features-version-1 0)]
+    (is (= virtio/features-version-1 (:negotiated-features result)))
+    (is (= (bit-or (:acknowledge virtio/device-status-bit) (:driver virtio/device-status-bit)
+                   (:features-ok virtio/device-status-bit) (:driver-ok virtio/device-status-bit))
+           ((:read32 regs) (:status virtio/mmio-reg))))))
+
+(deftest initialize-mmio-transport-rejects-device-type-mismatch
+  (let [regs (make-fake-block-mmio virtio/features-version-1)]
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (virtio/initialize-mmio-transport regs :console virtio/features-version-1 0)))))
+
+(deftest initialize-mmio-transport-rejects-missing-required-feature
+  (let [regs (make-fake-block-mmio 0)]
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (virtio/initialize-mmio-transport regs :block virtio/features-version-1 0)))))
+
+;; ---------------------------------------------------------------------------
+;; virtio-blk
+
+(deftest plan-block-read-shape
+  (let [dma (virtio/dma-map [(virtio/dma-range 0x1000 16 (:device-read virtio/dma-perm))
+                              (virtio/dma-range 0x2000 512 (:device-write virtio/dma-perm))
+                              (virtio/dma-range 0x3000 1 (:device-write virtio/dma-perm))])
+        plan (virtio/plan-block-read 8 0 0x1000 0x2000 512 0x3000 42 dma)]
+    (is (= 42 (:sector (:header plan))))
+    (is (= 512 (:data-len plan)))
+    (is (= 3 (count (:descriptors (virtio/block-plan-chain plan 8 dma)))))))
+
+(deftest plan-block-request-rejects-bad-data-len
+  (let [dma (virtio/dma-map [])]
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (virtio/plan-block-read 8 0 0x1000 0x2000 500 0x3000 0 dma)))))
+
+(deftest decode-block-status-cases
+  (is (nil? (virtio/decode-block-status (:ok virtio/block-status))))
+  (is (thrown? #?(:clj Exception :cljs js/Error) (virtio/decode-block-status (:ioerr virtio/block-status))))
+  (is (thrown? #?(:clj Exception :cljs js/Error) (virtio/decode-block-status (:unsupp virtio/block-status))))
+  (is (thrown? #?(:clj Exception :cljs js/Error) (virtio/decode-block-status 99))))
+
+(deftest blk-service-submit-and-complete
+  (let [dma (virtio/dma-map [(virtio/dma-range 0x1000 16 (:device-read virtio/dma-perm))
+                              (virtio/dma-range 0x2000 512 (:device-write virtio/dma-perm))
+                              (virtio/dma-range 0x3000 1 (:device-write virtio/dma-perm))])
+        svc (virtio/make-blk-service 8)
+        [svc' _plan] (virtio/blk-service-submit-read svc 0 0x1000 0x2000 512 0x3000 7 dma)]
+    (is (= 1 (virtio/blk-service-pending-len svc')))
+    (is (= 1 (virtio/blk-service-available-idx svc')))
+    (testing "duplicate head while pending throws"
+      (is (thrown? #?(:clj Exception :cljs js/Error)
+                   (virtio/blk-service-submit-read svc' 0 0x1000 0x2000 512 0x3000 7 dma))))
+    (let [[svc'' completed] (virtio/blk-service-complete-used-element
+                              svc' 0 {:id 0 :len 512} (:ok virtio/block-status))]
+      (is (= 0 (virtio/blk-service-pending-len svc'')))
+      (is (= 1 (virtio/blk-service-last-used-idx svc'')))
+      (is (= 7 (:sector (:request completed)))))))
+
+;; ---------------------------------------------------------------------------
+;; virtio-console
+
+(deftest plan-console-receive-and-transmit-shapes
+  (let [dma (virtio/dma-map [(virtio/dma-range 0x4000 64 virtio/dma-perm-read-write)])
+        rx (virtio/plan-console-receive 4 0 0x4000 64 dma)
+        tx (virtio/plan-console-transmit 4 1 0x4000 64 dma)]
+    (is (= :receive (:kind rx)))
+    (is (= :transmit (:kind tx)))
+    (is (= 1 (count (:descriptors (virtio/console-plan-chain rx 4 dma)))))
+    (is (= 1 (count (:descriptors (virtio/console-plan-chain tx 4 dma)))))))
+
+(deftest plan-console-request-rejects-zero-length
+  (let [dma (virtio/dma-map [])]
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (virtio/plan-console-receive 4 0 0x4000 0 dma)))))
+
+(deftest console-service-submit-and-complete
+  (let [dma (virtio/dma-map [(virtio/dma-range 0x4000 64 virtio/dma-perm-read-write)])
+        svc (virtio/make-console-service 4)
+        [svc' _plan] (virtio/console-service-submit-receive svc 0 0x4000 64 dma)]
+    (is (= 1 (virtio/console-service-pending-len svc')))
+    (is (= 1 (virtio/console-service-available-idx svc')))
+    (testing "duplicate head while pending throws"
+      (is (thrown? #?(:clj Exception :cljs js/Error)
+                   (virtio/console-service-submit-receive svc' 0 0x4000 64 dma))))
+    (let [[svc'' completed] (virtio/console-service-complete-used-element svc' 0 {:id 0 :len 12})]
+      (is (= 0 (virtio/console-service-pending-len svc'')))
+      (is (= 1 (virtio/console-service-last-used-idx svc'')))
+      (is (= 0x4000 (:data-addr (:request completed))))
+      (is (= 12 (:len (:used completed)))))))
+
+(deftest console-service-completion-rejects-overlong-length
+  (let [dma (virtio/dma-map [(virtio/dma-range 0x4000 64 virtio/dma-perm-read-write)])
+        svc (virtio/make-console-service 4)
+        [svc' _plan] (virtio/console-service-submit-receive svc 0 0x4000 64 dma)]
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (virtio/console-service-complete-used-element svc' 0 {:id 0 :len 65})))))
+
+;; ---------------------------------------------------------------------------
+;; u64, above bit 31.
+;;
+;; `features-negotiation` above has always passed on both runtimes. It could
+;; not have done otherwise: it names `virtio/features-version-1` on both sides
+;; of every assertion, so it stays true whatever that constant is. Measured
+;; 2026-08-25, the constant was 4294967296 on the JVM and 1 on nbb -- where
+;; VIRTIO_F_VERSION_1, the bit that separates a modern virtio device from a
+;; legacy one, collided with feature bit 0.
+;;
+;; These pin the NUMBERS. A test written against the symbol cannot see a wrong
+;; symbol.
+;; ---------------------------------------------------------------------------
+
+(deftest feature-constants-are-the-bits-the-spec-names
+  (is (= 4294967296 virtio/features-version-1) "VIRTIO_F_VERSION_1 is bit 32")
+  (is (= 536870912 virtio/features-ring-event-idx) "VIRTIO_RING_F_EVENT_IDX is bit 29")
+  (is (= 268435456 virtio/features-ring-indirect-desc) "VIRTIO_RING_F_INDIRECT_DESC is bit 28"))
+
+(deftest version-1-does-not-collide-with-bit-zero
+  (testing "a device offering only feature bit 0 does not appear to offer VERSION_1"
+    (is (not (virtio/features-contains? 1 virtio/features-version-1))))
+  (testing "and a device offering only VERSION_1 does not appear to offer bit 0"
+    (is (not (virtio/features-contains? virtio/features-version-1 1)))))
+
+(deftest u64-halves-round-trip-across-the-boundary
+  (is (= 0 (virtio/u64-high 4294967295)) "the largest value with no high word")
+  (is (= 4294967295 (virtio/u64-low 4294967295)))
+  (is (= 1 (virtio/u64-high 4294967296)) "one past it is entirely high word")
+  (is (= 0 (virtio/u64-low 4294967296)))
+  (is (= 4294967296 (virtio/u64-join 1 0)))
+  (is (= 4294967297 (virtio/u64-join 1 1)))
+  (testing "a low half above 2^31, where a signed int32 would come back negative"
+    ;; The high word is kept small on purpose. `u64-join 0x12345678 0xdeadbeef`
+    ;; is about 1.3e18, past 2^53, where a ClojureScript number cannot hold it
+    ;; exactly -- that limit is the runtime's and is documented on these fns.
+    ;; A test that ignores it measures the float, not the code.
+    (let [v (virtio/u64-join 0x1f 0xdeadbeef)]
+      (is (= 0x1f (virtio/u64-high v)))
+      (is (= 0xdeadbeef (virtio/u64-low v)))
+      (is (= 136879914735 v)))))
+
+(deftest u64-logic-reaches-the-high-word
+  ;; High words are kept to 16 bits so every value here stays under 2^53, where
+  ;; a ClojureScript number is exact. Wider fixtures measure the float, not the
+  ;; function -- a first draft of this test used 32-bit high words and failed on
+  ;; both runtimes for that reason.
+  (let [a (virtio/u64-join 0x0f0f 0x0000ffff)
+        b (virtio/u64-join 0xff00 0xffff0000)]
+    (is (= 16492674416640 (virtio/u64-and a b)))
+    (is (= 280444184559615 (virtio/u64-or a b)))
+    (is (= 64424574975 (virtio/u64-and-not a b)))
+    (testing "the high word really is participating"
+      (is (= 0x0f00 (virtio/u64-high (virtio/u64-and a b))))
+      (is (= 0xff0f (virtio/u64-high (virtio/u64-or a b))))
+      (is (= 0x000f (virtio/u64-high (virtio/u64-and-not a b))))))
+  (testing "and-not on the high word alone -- what negotiate-features reports"
+    (is (= virtio/features-version-1
+           (virtio/u64-and-not virtio/features-version-1 1)))))
+
+(deftest negotiation-carries-a-high-word-bit-through-mmio
+  ;; The existing round trip uses features-version-1 symbolically. This one
+  ;; checks the value that comes back out.
+  (let [regs (make-fake-block-mmio (virtio/features-union virtio/features-version-1
+                                                          virtio/features-ring-event-idx))
+        result (virtio/initialize-mmio-transport regs :block virtio/features-version-1 0)]
+    (is (= 4294967296 (:negotiated-features result))
+        "the high-word bit survives the two 32-bit MMIO windows")))

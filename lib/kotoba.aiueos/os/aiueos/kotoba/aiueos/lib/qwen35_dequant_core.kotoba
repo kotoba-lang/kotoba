@@ -1,0 +1,701 @@
+;; The dequantisers of every tensor type the admitted Qwen artifact holds --
+;; fifteen, from F32 to the codebook IQ families -- plus the two the Ternary
+;; Bonsai 2 artifact adds (PTQ1_0, BF16; ADR-0222), as one shared module.
+;;
+;; Ports of `kernel/qwen35_quant.c` (whose equations and grids are adapted
+;; from ggml-org/llama.cpp @3173a564, MIT). Four types (F32, Q8_0, Q4_K, Q6_K)
+;; were `qwen35-dequant-row.kotoba`'s since ADR-0147, inlined a second time
+;; in `qwen35-matvec.kotoba`; both objects now require THIS module instead,
+;; so the arithmetic exists once. The other eleven -- Q2_K, Q3_K, Q5_K,
+;; IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ1_S, IQ1_M, IQ4_XS -- were the
+;; reason the K16 model still ran its dominant matvecs in C: they decode
+;; through codebook grids, and when ADR-0147 was written this dialect had no
+;; rodata. It has one now (`bytes-literal`, the boot-lit facility the UEFI
+;; loader modules use), so the grids are literals below, byte for byte the
+;; tables `qwen35_quant_tables.inc` holds, dumped from the compiled C in
+;; memory order (ADR-0221).
+;;
+;; ## Rounding
+;;
+;; Every arithmetic step is binary32 in the same order and with the same
+;; operands as the C, so the bytes written are the bytes the C writes. Where
+;; the C folds a scale (`db = d * (0.5f + s) * 0.25f`) the fold is written in
+;; the C's left-to-right order. The sign of a codebook value is applied by
+;; MULTIPLYING by +-1.0f, as the C does, so a zero keeps the sign the C gives
+;; it. An `int8_t` grid value crosses to float through `i64-to-f32-rounded`,
+;; exact for every value a byte can hold.
+;;
+;; Scales are re-read per element rather than hoisted (the ABI admits five
+;; arguments and a hoisted value would be a sixth). That is fuel, not
+;; correctness: measured per element in ADR-0221.
+
+(ns aiueos.lib.qwen35-dequant-core
+  (:require [aiueos.lib.qwen35-grids :as g])
+  (:export [u8-at s8-at u16-at u32-at f32w u32w fp16-bits
+            row-bytes supported dequant-run]))
+
+;; ------------------------------------------------------------------ readers
+
+(defn u8-at [base len off]
+  (kernel-load-u8 (kernel-subregion base len off 1) 1 0))
+
+(defn s8-at [base len off]
+  (let [v (u8-at base len off)]
+    (if (> v 127) (- v 256) v)))
+
+(defn u16-at [base len off]
+  (+ (u8-at base len off) (* 256 (u8-at base len (+ off 1)))))
+
+(defn u32-at [base len off]
+  (+ (u16-at base len off) (* 65536 (u16-at base len (+ off 2)))))
+
+(defn f32w [u]
+  (if (> u 2147483647) (- u 4294967296) u))
+
+(defn u32w [v]
+  (bit-and v 4294967295))
+
+;; A function on this target returns a WORD, never a float value, so every
+;; helper below that computes a binary32 hands back its bit pattern
+;; (`f32-to-bits`) and the caller re-enters float arithmetic with
+;; `(f32-from-bits (f32w bits))`. `i2f` is the one exception: it is an
+;; operation used inline, not a function.
+;;
+;; binary32 constants as bit patterns:
+;;   0.5f 1056964608, 0.25f 1048576000, 1.0f 1065353216, -1.0f -1082130432,
+;;   0.125f 1040187392, -0.125f -1107296256
+
+;; --------------------------------------------------- fp16 -> binary32 pattern
+
+(defn fp16-sub [sign m u]
+  (if (= (bit-and m 1024) 0)
+    (fp16-sub sign (* m 2) (- u 1))
+    (bit-or sign (bit-or (* (+ u 127) 8388608) (* (bit-and m 1023) 8192)))))
+
+(defn fp16-bits [h]
+  (let [sign (* (bit-and h 32768) 65536)
+        e (bit-and (quot h 1024) 31)
+        m (bit-and h 1023)]
+    (if (= e 0)
+      (if (= m 0) sign (fp16-sub sign m -14))
+      (if (= e 31)
+        (bit-or sign (bit-or 2139095040 (* m 8192)))
+        (bit-or sign (bit-or (* (+ e 112) 8388608) (* m 8192)))))))
+
+(defn fp16-at [src slen off]
+  ;; the fp16 at `off` as a binary32 BIT PATTERN (signed word)
+  (f32w (fp16-bits (u16-at src slen off))))
+
+;; ------------------------------------------------------------ small tables
+;;
+;; `1 << k` for the shift counts the decoders use; this subset admits only
+;; literal-count shifts, so a runtime count is a table lookup.
+
+(defn pow2-hi [k]
+  (if (= k 16) 65536 (if (= k 17) 131072 (if (= k 18) 262144 (if (= k 19) 524288
+    (if (= k 20) 1048576 (if (= k 21) 2097152 (if (= k 22) 4194304 (if (= k 23) 8388608
+      (if (= k 24) 16777216 (if (= k 25) 33554432 (if (= k 26) 67108864 (if (= k 27) 134217728
+        (if (= k 28) 268435456 (if (= k 29) 536870912 (if (= k 30) 1073741824 2147483648))))))))))))))))
+
+(defn pow2 [k]
+  ;; 1 << k for k in 0..31 (the widest shift here is `aux32 >> 28`)
+  (if (> k 15)
+    (pow2-hi k)
+    (if (= k 0) 1 (if (= k 1) 2 (if (= k 2) 4 (if (= k 3) 8
+      (if (= k 4) 16 (if (= k 5) 32 (if (= k 6) 64 (if (= k 7) 128
+        (if (= k 8) 256 (if (= k 9) 512 (if (= k 10) 1024 (if (= k 11) 2048
+          (if (= k 12) 4096 (if (= k 13) 8192 (if (= k 14) 16384 32768)))))))))))))))))
+
+(defn shr [v k] (quot v (pow2 k)))
+(defn shl [v k] (* v (pow2 k)))
+
+;; ------------------------------------------------------- the codebook grids
+;;
+;; In `aiueos.lib.qwen35-grids`, packed (a program's literals are capped at
+;; 64 KiB of UTF-8 and the raw tables' hex is ~70 KiB; every IQ grid byte is
+;; one of three or eight values).
+
+;; `(signs & kmask[j]) ? -1.f : 1.f`
+(defn sign-of [signs j]
+  ;; +1.0f or -1.0f as a bit pattern
+  (if (= (bit-and signs (g/kmask-at j)) 0) 1065353216 -1082130432))
+
+;; --------------------------------------------------------------- F32 (copy)
+
+(defn f32-el [src slen dst count i]
+  (if (>= i count)
+    0
+    (do (kernel-store-u32 (kernel-subregion dst (* count 4) (* i 4) 4) 4 0
+                          (kernel-load-u32 (kernel-subregion src slen (* i 4) 4) 4 0))
+        (f32-el src slen dst count (+ i 1)))))
+
+;; ---------------------------------------------------- Q8_0 (34-byte blocks)
+
+(defn q80-value [src slen base j]
+  (f32-to-bits
+   (f32-mul (i64-to-f32-rounded (s8-at src slen (+ base (+ 2 j))))
+            (f32-from-bits (fp16-at src slen base)))))
+
+(defn q80-el [src slen dst count i]
+  (if (>= i count)
+    0
+    (do (kernel-store-u32
+         (kernel-subregion dst (* count 4) (* i 4) 4) 4 0
+         (u32w (q80-value src slen (* 34 (quot i 32)) (- i (* 32 (quot i 32))))))
+        (q80-el src slen dst count (+ i 1)))))
+
+;; ---------------------------------------------------- Q2_K (84-byte blocks)
+;;
+;; scales[16] @0, qs[64] @16, d @80, dmin @82. Element r: group n = r/128,
+;; t = r%128, j = t/32 (shift 2j), sub = (t%32)/16, l = t%16;
+;; is = 8n + 2j + sub, q = qs[32n + 16sub + l];
+;; y = (d * (sc & 0xF)) * ((q >> shift) & 3) - (min * (sc >> 4)).
+
+(defn q2k-value [src slen base r]
+  (let [n (quot r 128)
+        t (- r (* 128 n))
+        j (quot t 32)
+        sub (quot (- t (* 32 j)) 16)
+        l (- t (* 16 (quot t 16)))
+        sc (u8-at src slen (+ base (+ (* 8 n) (+ (* 2 j) sub))))
+        q (u8-at src slen (+ base (+ 16 (+ (* 32 n) (+ (* 16 sub) l)))))
+        v (bit-and (shr q (* 2 j)) 3)]
+    (f32-to-bits
+     (f32-sub (f32-mul (f32-mul (f32-from-bits (fp16-at src slen (+ base 80))) (i64-to-f32-rounded (bit-and sc 15)))
+                       (i64-to-f32-rounded v))
+              (f32-mul (f32-from-bits (fp16-at src slen (+ base 82))) (i64-to-f32-rounded (quot sc 16)))))))
+
+(defn q2k-el [src slen dst count i]
+  (if (>= i count)
+    0
+    (do (kernel-store-u32
+         (kernel-subregion dst (* count 4) (* i 4) 4) 4 0
+         (u32w (q2k-value src slen (* 84 (quot i 256)) (- i (* 256 (quot i 256))))))
+        (q2k-el src slen dst count (+ i 1)))))
+
+;; --------------------------------------------------- Q3_K (110-byte blocks)
+;;
+;; hmask[32] @0, qs[64] @32, scales[12] @96, d @108. The C unpacks the twelve
+;; scale bytes into sixteen int8 scales through four u32 lane operations;
+;; per byte `is` (word w = is/4, lane b = is%4) that is:
+;;   w0: (s[b]   & 0xf) | ((s[8+b]      & 3) << 4)
+;;   w1: (s[4+b] & 0xf) | (((s[8+b] >> 2) & 3) << 4)
+;;   w2: (s[b]   >> 4)  | (((s[8+b] >> 4) & 3) << 4)
+;;   w3: (s[4+b] >> 4)  | (((s[8+b] >> 6) & 3) << 4)
+;; then `scales[is] - 32` as int8 (the unpacked byte is < 64, so signed and
+;; unsigned agree).
+
+(defn q3k-scale [src slen sbase is]
+  (let [w (quot is 4)
+        b (- is (* 4 w))
+        lo (if (= w 0) (bit-and (u8-at src slen (+ sbase b)) 15)
+             (if (= w 1) (bit-and (u8-at src slen (+ sbase (+ 4 b))) 15)
+               (if (= w 2) (quot (u8-at src slen (+ sbase b)) 16)
+                 (quot (u8-at src slen (+ sbase (+ 4 b))) 16))))
+        hi (bit-and (shr (u8-at src slen (+ sbase (+ 8 b))) (* 2 w)) 3)]
+    (- (bit-or lo (* 16 hi)) 32)))
+
+(defn q3k-value [src slen base r]
+  (let [n (quot r 128)
+        t (- r (* 128 n))
+        j (quot t 32)
+        sub (quot (- t (* 32 j)) 16)
+        l (- t (* 16 (quot t 16)))
+        is (+ (* 8 n) (+ (* 2 j) sub))
+        q (u8-at src slen (+ base (+ 32 (+ (* 32 n) (+ (* 16 sub) l)))))
+        hm (u8-at src slen (+ base (+ (* 16 sub) l)))
+        mbit (pow2 (+ (* 4 n) j))
+        v (- (bit-and (shr q (* 2 j)) 3) (if (= (bit-and hm mbit) 0) 4 0))]
+    (f32-to-bits
+     (f32-mul (f32-mul (f32-from-bits (fp16-at src slen (+ base 108))) (i64-to-f32-rounded (q3k-scale src slen (+ base 96) is)))
+              (i64-to-f32-rounded v)))))
+
+(defn q3k-el [src slen dst count i]
+  (if (>= i count)
+    0
+    (do (kernel-store-u32
+         (kernel-subregion dst (* count 4) (* i 4) 4) 4 0
+         (u32w (q3k-value src slen (* 110 (quot i 256)) (- i (* 256 (quot i 256))))))
+        (q3k-el src slen dst count (+ i 1)))))
+
+;; --------------------------------------------------- Q4_K (144-byte blocks)
+
+(defn k4-scale [src slen sbase j]
+  (if (< j 4)
+    (bit-and (u8-at src slen (+ sbase j)) 63)
+    (bit-or (bit-and (u8-at src slen (+ sbase (+ j 4))) 15)
+            (* 16 (quot (u8-at src slen (+ sbase (- j 4))) 64)))))
+
+(defn k4-min [src slen sbase j]
+  (if (< j 4)
+    (bit-and (u8-at src slen (+ sbase (+ j 4))) 63)
+    (bit-or (quot (u8-at src slen (+ sbase (+ j 4))) 16)
+            (* 16 (quot (u8-at src slen (+ sbase j)) 64)))))
+
+(defn q4k-value [src slen base r]
+  (let [step (quot r 64)
+        inner (- r (* 64 step))
+        low (< inner 32)
+        j (+ (* 2 step) (if low 0 1))
+        l (if low inner (- inner 32))
+        q (u8-at src slen (+ base (+ 16 (+ (* 32 step) l))))
+        v (if low (bit-and q 15) (quot q 16))]
+    (f32-to-bits
+     (f32-sub (f32-mul (f32-mul (f32-from-bits (fp16-at src slen base))
+                                (i64-to-f32-rounded (k4-scale src slen (+ base 4) j)))
+                       (i64-to-f32-rounded v))
+              (f32-mul (f32-from-bits (fp16-at src slen (+ base 2)))
+                       (i64-to-f32-rounded (k4-min src slen (+ base 4) j)))))))
+
+(defn q4k-el [src slen dst count i]
+  (if (>= i count)
+    0
+    (do (kernel-store-u32
+         (kernel-subregion dst (* count 4) (* i 4) 4) 4 0
+         (u32w (q4k-value src slen (* 144 (quot i 256)) (- i (* 256 (quot i 256))))))
+        (q4k-el src slen dst count (+ i 1)))))
+
+;; --------------------------------------------------- Q5_K (176-byte blocks)
+;;
+;; d @0, dmin @2, scales[12] @4, qh[32] @16, qs[128] @48. Q4_K's shape plus
+;; one high bit per element from qh[l], bit 2*step (low half) or 2*step+1.
+
+(defn q5k-value [src slen base r]
+  (let [step (quot r 64)
+        inner (- r (* 64 step))
+        low (< inner 32)
+        j (+ (* 2 step) (if low 0 1))
+        l (if low inner (- inner 32))
+        q (u8-at src slen (+ base (+ 48 (+ (* 32 step) l))))
+        h (u8-at src slen (+ base (+ 16 l)))
+        hbit (pow2 (+ (* 2 step) (if low 0 1)))
+        v (+ (if low (bit-and q 15) (quot q 16)) (if (= (bit-and h hbit) 0) 0 16))]
+    (f32-to-bits
+     (f32-sub (f32-mul (f32-mul (f32-from-bits (fp16-at src slen base))
+                                (i64-to-f32-rounded (k4-scale src slen (+ base 4) j)))
+                       (i64-to-f32-rounded v))
+              (f32-mul (f32-from-bits (fp16-at src slen (+ base 2)))
+                       (i64-to-f32-rounded (k4-min src slen (+ base 4) j)))))))
+
+(defn q5k-el [src slen dst count i]
+  (if (>= i count)
+    0
+    (do (kernel-store-u32
+         (kernel-subregion dst (* count 4) (* i 4) 4) 4 0
+         (u32w (q5k-value src slen (* 176 (quot i 256)) (- i (* 256 (quot i 256))))))
+        (q5k-el src slen dst count (+ i 1)))))
+
+;; --------------------------------------------------- Q6_K (210-byte blocks)
+
+(defn pow4 [g]
+  (if (= g 0) 1 (if (= g 1) 4 (if (= g 2) 16 64))))
+
+(defn q6k-value [src slen base r]
+  (let [half (quot r 128)
+        t (- r (* 128 half))
+        grp (quot t 32)
+        l (- t (* 32 grp))
+        odd (- grp (* 2 (quot grp 2)))
+        qv (u8-at src slen (+ base (+ (* 64 half) (+ l (* 32 odd)))))
+        nib (if (< grp 2) (bit-and qv 15) (quot qv 16))
+        hi (bit-and (quot (u8-at src slen (+ base (+ 128 (+ (* 32 half) l)))) (pow4 grp)) 3)
+        q (- (bit-or nib (* 16 hi)) 32)
+        sc (s8-at src slen (+ base (+ 192 (+ (* 8 half) (+ (quot l 16) (* 2 grp))))))]
+    (f32-to-bits
+     (f32-mul (f32-mul (f32-from-bits (fp16-at src slen (+ base 208)))
+                       (i64-to-f32-rounded sc))
+              (i64-to-f32-rounded q)))))
+
+(defn q6k-el [src slen dst count i]
+  (if (>= i count)
+    0
+    (do (kernel-store-u32
+         (kernel-subregion dst (* count 4) (* i 4) 4) 4 0
+         (u32w (q6k-value src slen (* 210 (quot i 256)) (- i (* 256 (quot i 256))))))
+        (q6k-el src slen dst count (+ i 1)))))
+
+;; ------------------------------------------------ IQ2_XXS (66-byte blocks)
+;;
+;; d @0, qs[32] u16 @2. Per 32 elements ib32: aux32[0] = u32 at 2 + 8 ib32
+;; (its four bytes are the four grid entries), aux32[1] the next u32 (the
+;; scale in its top nibble, seven sign bits per l);
+;; db = d * (0.5f + (aux32[1] >> 28)) * 0.25f;
+;; y = db * grid[j] * sign, grid = iq2xxs_grid[aux8[l]], signs = ksigns[(aux1 >> 7l) & 127].
+
+(defn iq2xxs-db [src slen base ib32]
+  (let [aux1 (u32-at src slen (+ base (+ 2 (+ (* 8 ib32) 4))))]
+    (f32-to-bits
+     (f32-mul (f32-mul (f32-from-bits (fp16-at src slen base))
+                      (f32-add (f32-from-bits 1056964608) (i64-to-f32-rounded (shr aux1 28))))
+             (f32-from-bits 1048576000)))))
+
+(defn iq2xxs-value [src slen base r]
+  (let [ib32 (quot r 32)
+        t (- r (* 32 ib32))
+        l (quot t 8)
+        j (- t (* 8 l))
+        entry (u8-at src slen (+ base (+ 2 (+ (* 8 ib32) l))))
+        aux1 (u32-at src slen (+ base (+ 2 (+ (* 8 ib32) 4))))
+        signs (g/ksigns-at (bit-and (shr aux1 (* 7 l)) 127))]
+    (f32-to-bits
+     (f32-mul (f32-mul (f32-from-bits (iq2xxs-db src slen base ib32))
+                       (i64-to-f32-rounded (g/iq2xxs-grid-at entry j)))
+              (f32-from-bits (sign-of signs j))))))
+
+(defn iq2xxs-el [src slen dst count i]
+  (if (>= i count)
+    0
+    (do (kernel-store-u32
+         (kernel-subregion dst (* count 4) (* i 4) 4) 4 0
+         (u32w (iq2xxs-value src slen (* 66 (quot i 256)) (- i (* 256 (quot i 256))))))
+        (iq2xxs-el src slen dst count (+ i 1)))))
+
+;; ------------------------------------------------- IQ2_XS (74-byte blocks)
+;;
+;; d @0, qs[32] u16 @2, scales[8] @66. q = qs[4 ib32 + l]: grid entry
+;; q & 511, signs ksigns[q >> 9]; db = d * (0.5f + nibble) * 0.25f with the
+;; low nibble of scales[ib32] for l < 2 and the high one for l >= 2.
+
+(defn iq2xs-db [src slen base r]
+  (let [ib32 (quot r 32)
+        l (quot (- r (* 32 ib32)) 8)
+        sc (u8-at src slen (+ base (+ 66 ib32)))
+        nib (if (< l 2) (bit-and sc 15) (quot sc 16))]
+    (f32-to-bits
+     (f32-mul (f32-mul (f32-from-bits (fp16-at src slen base))
+                      (f32-add (f32-from-bits 1056964608) (i64-to-f32-rounded nib)))
+             (f32-from-bits 1048576000)))))
+
+(defn iq2xs-value [src slen base r]
+  (let [ib32 (quot r 32)
+        t (- r (* 32 ib32))
+        l (quot t 8)
+        j (- t (* 8 l))
+        q (u16-at src slen (+ base (+ 2 (* 2 (+ (* 4 ib32) l)))))
+        signs (g/ksigns-at (quot q 512))]
+    (f32-to-bits
+     (f32-mul (f32-mul (f32-from-bits (iq2xs-db src slen base r))
+                       (i64-to-f32-rounded (g/iq2xs-grid-at (bit-and q 511) j)))
+              (f32-from-bits (sign-of signs j))))))
+
+(defn iq2xs-el [src slen dst count i]
+  (if (>= i count)
+    0
+    (do (kernel-store-u32
+         (kernel-subregion dst (* count 4) (* i 4) 4) 4 0
+         (u32w (iq2xs-value src slen (* 74 (quot i 256)) (- i (* 256 (quot i 256))))))
+        (iq2xs-el src slen dst count (+ i 1)))))
+
+;; -------------------------------------------------- IQ2_S (82-byte blocks)
+;;
+;; d @0, qs[64] @2 (the first 32 are grid bytes, the next 32 the signs),
+;; qh[8] @66, scales[8] @74. Grid entry qs[4 ib32 + l] | ((qh[ib32] << (8 - 2l)) & 0x300);
+;; signs byte = qs[32 + 4 ib32 + l]; db as IQ2_XS from scales[ib32].
+
+(defn iq2s-db [src slen base r]
+  (let [ib32 (quot r 32)
+        l (quot (- r (* 32 ib32)) 8)
+        sc (u8-at src slen (+ base (+ 74 ib32)))
+        nib (if (< l 2) (bit-and sc 15) (quot sc 16))]
+    (f32-to-bits
+     (f32-mul (f32-mul (f32-from-bits (fp16-at src slen base))
+                      (f32-add (f32-from-bits 1056964608) (i64-to-f32-rounded nib)))
+             (f32-from-bits 1048576000)))))
+
+(defn iq2s-value [src slen base r]
+  (let [ib32 (quot r 32)
+        t (- r (* 32 ib32))
+        l (quot t 8)
+        j (- t (* 8 l))
+        q (u8-at src slen (+ base (+ 2 (+ (* 4 ib32) l))))
+        qh (u8-at src slen (+ base (+ 66 ib32)))
+        entry (bit-or q (bit-and (shl qh (- 8 (* 2 l))) 768))
+        signs (u8-at src slen (+ base (+ 34 (+ (* 4 ib32) l))))]
+    (f32-to-bits
+     (f32-mul (f32-mul (f32-from-bits (iq2s-db src slen base r))
+                       (i64-to-f32-rounded (g/iq2s-grid-at entry j)))
+              (f32-from-bits (sign-of signs j))))))
+
+(defn iq2s-el [src slen dst count i]
+  (if (>= i count)
+    0
+    (do (kernel-store-u32
+         (kernel-subregion dst (* count 4) (* i 4) 4) 4 0
+         (u32w (iq2s-value src slen (* 82 (quot i 256)) (- i (* 256 (quot i 256))))))
+        (iq2s-el src slen dst count (+ i 1)))))
+
+;; ------------------------------------------------ IQ3_XXS (98-byte blocks)
+;;
+;; d @0, qs[64] @2, scales_and_signs[32] @66 as u32 per ib32. Per l two grid
+;; entries qs[8 ib32 + 2l] (elements 0..3) and qs[8 ib32 + 2l + 1] (4..7),
+;; four bytes each from iq3xxs_grid; db = d * (0.5f + (aux32 >> 28)) * 0.5f;
+;; signs ksigns[(aux32 >> 7l) & 127], bit j for the first entry, 4 + j for the second.
+
+(defn iq3xxs-value [src slen base r]
+  (let [ib32 (quot r 32)
+        t (- r (* 32 ib32))
+        l (quot t 8)
+        e (- t (* 8 l))
+        half (quot e 4)
+        j (- e (* 4 half))
+        aux (u32-at src slen (+ base (+ 66 (* 4 ib32))))
+        entry (u8-at src slen (+ base (+ 2 (+ (* 8 ib32) (+ (* 2 l) half)))))
+        signs (g/ksigns-at (bit-and (shr aux (* 7 l)) 127))
+        db (f32-mul (f32-mul (f32-from-bits (fp16-at src slen base))
+                             (f32-add (f32-from-bits 1056964608) (i64-to-f32-rounded (shr aux 28))))
+                    (f32-from-bits 1056964608))]
+    (f32-to-bits
+     (f32-mul (f32-mul db (i64-to-f32-rounded (g/iq3xxs-grid-at entry j)))
+              (f32-from-bits (sign-of signs (+ j (* 4 half))))))))
+
+(defn iq3xxs-el [src slen dst count i]
+  (if (>= i count)
+    0
+    (do (kernel-store-u32
+         (kernel-subregion dst (* count 4) (* i 4) 4) 4 0
+         (u32w (iq3xxs-value src slen (* 98 (quot i 256)) (- i (* 256 (quot i 256))))))
+        (iq3xxs-el src slen dst count (+ i 1)))))
+
+;; -------------------------------------------------- IQ3_S (110-byte blocks)
+;;
+;; d @0, qs[64] @2, qh[8] @66, signs[32] @74, scales[4] @106. Sub-blocks come
+;; in pairs: scales[ib32/2]'s low nibble for the even sub-block, high for the
+;; odd, db = d * (1 + 2 nibble). Grid entry qs[8 ib32 + 2l + half] |
+;; ((qh[ib32] << (8 - 2l - half)) & 256); signs byte = signs[4 ib32 + l],
+;; bit j (first entry) or 4 + j (second).
+
+(defn iq3s-value [src slen base r]
+  (let [ib32 (quot r 32)
+        t (- r (* 32 ib32))
+        l (quot t 8)
+        e (- t (* 8 l))
+        half (quot e 4)
+        j (- e (* 4 half))
+        pair (quot ib32 2)
+        odd (- ib32 (* 2 pair))
+        sc (u8-at src slen (+ base (+ 106 pair)))
+        nib (if (= odd 0) (bit-and sc 15) (quot sc 16))
+        db (f32-mul (f32-from-bits (fp16-at src slen base)) (i64-to-f32-rounded (+ 1 (* 2 nib))))
+        q (u8-at src slen (+ base (+ 2 (+ (* 8 ib32) (+ (* 2 l) half)))))
+        qh (u8-at src slen (+ base (+ 66 ib32)))
+        entry (bit-or q (bit-and (shl qh (- (- 8 (* 2 l)) half)) 256))
+        signs (u8-at src slen (+ base (+ 74 (+ (* 4 ib32) l))))]
+    (f32-to-bits
+     (f32-mul (f32-mul db (i64-to-f32-rounded (g/iq3s-grid-at entry j)))
+              (f32-from-bits (sign-of signs (+ j (* 4 half))))))))
+
+(defn iq3s-el [src slen dst count i]
+  (if (>= i count)
+    0
+    (do (kernel-store-u32
+         (kernel-subregion dst (* count 4) (* i 4) 4) 4 0
+         (u32w (iq3s-value src slen (* 110 (quot i 256)) (- i (* 256 (quot i 256))))))
+        (iq3s-el src slen dst count (+ i 1)))))
+
+;; -------------------------------------------------- IQ1_S (50-byte blocks)
+;;
+;; d @0, qs[32] @2, qh[8] u16 @34. dl = d * (2 ((qh >> 12) & 7) + 1);
+;; delta = +-0.125f by bit 15 of qh; entry qs[4 ib + l] | (((qh >> 3l) & 7) << 8);
+;; y = dl * (grid[j] + delta) with the grid read as int8.
+
+(defn iq1s-value [src slen base r]
+  (let [ib (quot r 32)
+        t (- r (* 32 ib))
+        l (quot t 8)
+        j (- t (* 8 l))
+        qh (u16-at src slen (+ base (+ 34 (* 2 ib))))
+        dl (f32-mul (f32-from-bits (fp16-at src slen base)) (i64-to-f32-rounded (+ 1 (* 2 (bit-and (shr qh 12) 7)))))
+        delta (if (= (bit-and qh 32768) 0) 1040187392 -1107296256)
+        entry (bit-or (u8-at src slen (+ base (+ 2 (+ (* 4 ib) l))))
+                      (* 256 (bit-and (shr qh (* 3 l)) 7)))]
+    (f32-to-bits
+     (f32-mul dl (f32-add (i64-to-f32-rounded (g/iq1s-grid-at entry j)) (f32-from-bits delta))))))
+
+(defn iq1s-el [src slen dst count i]
+  (if (>= i count)
+    0
+    (do (kernel-store-u32
+         (kernel-subregion dst (* count 4) (* i 4) 4) 4 0
+         (u32w (iq1s-value src slen (* 50 (quot i 256)) (- i (* 256 (quot i 256))))))
+        (iq1s-el src slen dst count (+ i 1)))))
+
+;; -------------------------------------------------- IQ1_M (56-byte blocks)
+;;
+;; qs[32] @0, qh[16] @32, scales[8] @48 read as four u16 sc[0..3]. The block
+;; scale is an fp16 assembled from the top nibbles of the four:
+;; (sc0 >> 12) | ((sc1 >> 8) & 0xf0) | ((sc2 >> 4) & 0xf00) | (sc3 & 0xf000).
+;; Per ib: dl1 = d (2 ((sc[ib/2] >> (6 (ib%2))) & 7) + 1) for l < 2,
+;; dl2 with the shift + 3 for l >= 2; entries and deltas from qs[4 ib + l] and
+;; qh[2 ib + l/2] (bits 8..10 or 4..6 of the entry; bit 3 or 7 for the delta).
+
+(defn iq1m-d [src slen base]
+  (let [s0 (u16-at src slen (+ base 48))
+        s1 (u16-at src slen (+ base 50))
+        s2 (u16-at src slen (+ base 52))
+        s3 (u16-at src slen (+ base 54))]
+    (f32-to-bits
+     (f32-from-bits (f32w (fp16-bits (bit-or (shr s0 12)
+                                            (bit-or (bit-and (shr s1 8) 240)
+                                                    (bit-or (bit-and (shr s2 4) 3840)
+                                                            (bit-and s3 61440))))))))))
+
+(defn iq1m-value [src slen base r]
+  (let [ib (quot r 32)
+        t (- r (* 32 ib))
+        l (quot t 8)
+        j (- t (* 8 l))
+        sc (u16-at src slen (+ base (+ 48 (* 2 (quot ib 2)))))
+        odd (- ib (* 2 (quot ib 2)))
+        shift (+ (* 6 odd) (if (< l 2) 0 3))
+        dl (f32-mul (f32-from-bits (iq1m-d src slen base)) (i64-to-f32-rounded (+ 1 (* 2 (bit-and (shr sc shift) 7)))))
+        q (u8-at src slen (+ base (+ (* 4 ib) l)))
+        qh (u8-at src slen (+ base (+ 32 (+ (* 2 ib) (quot l 2)))))
+        lowhalf (= (- l (* 2 (quot l 2))) 0)
+        entry (bit-or q (bit-and (if lowhalf (shl qh 8) (shl qh 4)) 1792))
+        delta (if (= (bit-and qh (if lowhalf 8 128)) 0) 1040187392 -1107296256)]
+    (f32-to-bits
+     (f32-mul dl (f32-add (i64-to-f32-rounded (g/iq1s-grid-at entry j)) (f32-from-bits delta))))))
+
+(defn iq1m-el [src slen dst count i]
+  (if (>= i count)
+    0
+    (do (kernel-store-u32
+         (kernel-subregion dst (* count 4) (* i 4) 4) 4 0
+         (u32w (iq1m-value src slen (* 56 (quot i 256)) (- i (* 256 (quot i 256))))))
+        (iq1m-el src slen dst count (+ i 1)))))
+
+;; ------------------------------------------------- IQ4_XS (136-byte blocks)
+;;
+;; d @0, scales_h u16 @2, scales_l[4] @4, qs[128] @8. ls = (scales_l[ib/2]
+;; nibble by ib%2) | (((scales_h >> 2 ib) & 3) << 4); dl = d (ls - 32);
+;; y = dl * kvalues_iq4nl[nibble of qs[16 ib + j%16]] (low nibble for j < 16).
+
+(defn iq4xs-value [src slen base r]
+  (let [ib (quot r 32)
+        j (- r (* 32 ib))
+        sl (u8-at src slen (+ base (+ 4 (quot ib 2))))
+        odd (- ib (* 2 (quot ib 2)))
+        lo (if (= odd 0) (bit-and sl 15) (quot sl 16))
+        sh (u16-at src slen (+ base 2))
+        ls (bit-or lo (* 16 (bit-and (shr sh (* 2 ib)) 3)))
+        dl (f32-mul (f32-from-bits (fp16-at src slen base)) (i64-to-f32-rounded (- ls 32)))
+        q (u8-at src slen (+ base (+ 8 (+ (* 16 ib) (if (< j 16) j (- j 16))))))
+        kv (g/iq4nl-at (if (< j 16) (bit-and q 15) (quot q 16)))]
+    (f32-to-bits (f32-mul dl (i64-to-f32-rounded kv)))))
+
+(defn iq4xs-el [src slen dst count i]
+  (if (>= i count)
+    0
+    (do (kernel-store-u32
+         (kernel-subregion dst (* count 4) (* i 4) 4) 4 0
+         (u32w (iq4xs-value src slen (* 136 (quot i 256)) (- i (* 256 (quot i 256))))))
+        (iq4xs-el src slen dst count (+ i 1)))))
+
+;; ------------------------------------------------ PTQ1_0 (28-byte blocks)
+;;
+;; Prism's group-128 ternary (ggml type 143; ADR-0222 stage A). qs[24] @0
+;; (5 trits per byte, 120 values), qh[2] @24 (4 trits per byte, 8 values),
+;; d fp16 @26. Same base-3 packing as upstream TQ1_0 with one scale per 128.
+;; Port of `dequantize_row_ptq1_0`, PrismML-Eng/llama.cpp
+;; @9a9394a895b96003ca842a6041cb28ac49a108f7 (`ggml/src/ggml-quants.c:2255`,
+;; MIT), whose element order is: stage 16 -- qs[m] for n 0..4, m 0..15 (80
+;; values); stage 8 -- qs[16 + m] for n 0..4, m 0..7 (40); then qh[h] for
+;; n 0..3, h 0..1 (8). A trit is `((uint8)(byte * 3^n) * 3) >> 8` in 0..2 and
+;; the value is `(float)(trit - 1) * d` -- one multiply by -1, 0 or +1, so
+;; the C's operand order is the only order and the result is exact.
+;;
+;; Element e of a block: e < 80 -> byte qs[e mod 16], n = e / 16;
+;; 80 <= e < 120 -> q = e - 80, byte qs[16 + q mod 8], n = q / 8;
+;; e >= 120 -> q = e - 120, byte qh[q mod 2], n = q / 2.
+
+(defn pow3 [n]
+  (if (= n 0) 1 (if (= n 1) 3 (if (= n 2) 9 (if (= n 3) 27 81)))))
+
+(defn ptq10-trit [byte n]
+  ;; ((uint8_t)(byte * pow3[n]) * 3) >> 8
+  (quot (* (bit-and (* byte (pow3 n)) 255) 3) 256))
+
+(defn ptq10-value [src slen base e]
+  (let [b (if (< e 80)
+               (u8-at src slen (+ base (- e (* 16 (quot e 16)))))
+               (if (< e 120)
+                 (u8-at src slen (+ base (+ 16 (- (- e 80) (* 8 (quot (- e 80) 8))))))
+                 (u8-at src slen (+ base (+ 24 (- (- e 120) (* 2 (quot (- e 120) 2))))))))
+        n (if (< e 80) (quot e 16) (if (< e 120) (quot (- e 80) 8) (quot (- e 120) 2)))]
+    (f32-to-bits
+     (f32-mul (i64-to-f32-rounded (- (ptq10-trit b n) 1))
+              (f32-from-bits (fp16-at src slen (+ base 26)))))))
+
+(defn ptq10-el [src slen dst count i]
+  (if (>= i count)
+    0
+    (do (kernel-store-u32
+         (kernel-subregion dst (* count 4) (* i 4) 4) 4 0
+         (u32w (ptq10-value src slen (* 28 (quot i 128)) (- i (* 128 (quot i 128))))))
+        (ptq10-el src slen dst count (+ i 1)))))
+
+;; --------------------------------------------------------- BF16 (2 bytes)
+;;
+;; ggml type 30: the upper half of a binary32. y = bits << 16, no arithmetic
+;; (ggml `ggml_bf16_to_fp32`). Bonsai's `ssm_alpha` / `ssm_beta` projections.
+
+(defn bf16-el [src slen dst count i]
+  (if (>= i count)
+    0
+    (do (kernel-store-u32
+         (kernel-subregion dst (* count 4) (* i 4) 4) 4 0
+         (* 65536 (u16-at src slen (* i 2))))
+        (bf16-el src slen dst count (+ i 1)))))
+
+;; ------------------------------------------------------------------ the row
+;;
+;; `aiueos_qwen35_quant_row_bytes` for all fifteen Qwen3.8 types plus the two
+;; Bonsai adds (ADR-0222); -1 for a type not decoded here or a count that is
+;; not a multiple of the block, which cannot collide with a real byte count.
+;; ggml type ids: F32 0, Q8_0 8, Q2_K 10, Q3_K 11, Q4_K 12, Q5_K 13, Q6_K 14,
+;; IQ2_XXS 16, IQ2_XS 17, IQ3_XXS 18, IQ1_S 19, IQ3_S 21, IQ2_S 22, IQ4_XS 23,
+;; IQ1_M 29, BF16 30, PTQ1_0 143. The 256-element block table below does not
+;; hold BF16 (per element) or PTQ1_0 (128-element blocks); `row-bytes` names
+;; them first.
+
+(defn block-bytes [qtype]
+  (if (= qtype 10) 84 (if (= qtype 11) 110 (if (= qtype 12) 144 (if (= qtype 13) 176
+    (if (= qtype 14) 210 (if (= qtype 16) 66 (if (= qtype 17) 74 (if (= qtype 18) 98
+      (if (= qtype 19) 50 (if (= qtype 21) 110 (if (= qtype 22) 82 (if (= qtype 23) 136
+        (if (= qtype 29) 56 -1))))))))))))))
+
+(defn row-bytes [qtype count]
+  (if (= qtype 0) (* count 4)
+   (if (= qtype 30) (* count 2)
+   (if (= qtype 143)
+     (if (= 0 (- count (* 128 (quot count 128)))) (* 28 (quot count 128)) -1)
+    (if (= qtype 8)
+      (if (= 0 (- count (* 32 (quot count 32)))) (* 34 (quot count 32)) -1)
+      (if (< (block-bytes qtype) 0)
+        -1
+        (if (= 0 (- count (* 256 (quot count 256))))
+          (* (block-bytes qtype) (quot count 256))
+          -1)))))))
+
+(defn supported [qtype]
+  (if (= qtype 0) 1 (if (= qtype 8) 1 (if (= qtype 30) 1 (if (= qtype 143) 1
+    (if (< (block-bytes qtype) 0) 0 1))))))
+
+(defn dequant-run [qtype src slen dst count]
+  (if (= qtype 0) (f32-el src slen dst count 0)
+   (if (= qtype 30) (bf16-el src slen dst count 0)
+   (if (= qtype 143) (ptq10-el src slen dst count 0)
+    (if (= qtype 8) (q80-el src slen dst count 0)
+      (if (= qtype 10) (q2k-el src slen dst count 0)
+        (if (= qtype 11) (q3k-el src slen dst count 0)
+          (if (= qtype 12) (q4k-el src slen dst count 0)
+            (if (= qtype 13) (q5k-el src slen dst count 0)
+              (if (= qtype 14) (q6k-el src slen dst count 0)
+                (if (= qtype 16) (iq2xxs-el src slen dst count 0)
+                  (if (= qtype 17) (iq2xs-el src slen dst count 0)
+                    (if (= qtype 18) (iq3xxs-el src slen dst count 0)
+                      (if (= qtype 19) (iq1s-el src slen dst count 0)
+                        (if (= qtype 21) (iq3s-el src slen dst count 0)
+                          (if (= qtype 22) (iq2s-el src slen dst count 0)
+                            (if (= qtype 23) (iq4xs-el src slen dst count 0)
+                              (iq1m-el src slen dst count 0))))))))))))))))))

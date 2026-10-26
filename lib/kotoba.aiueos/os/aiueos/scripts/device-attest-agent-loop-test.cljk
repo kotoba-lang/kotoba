@@ -1,0 +1,161 @@
+#!/usr/bin/env kbb
+;; The whole loop, against a server that verifies the way the control plane
+;; does: issue a nonce, let the agent poll it, sign it and post it back, and
+;; check the signature with WebCrypto over `grant.device-attest/signing-input`.
+;;
+;; The agent runs as a real child process, so what is exercised is the thing
+;; that would run on a device -- argument parsing, the key file, fetch, the
+;; encoding, and the exit code -- not a function called from a test.
+;;
+;; Two directions, because a loop that only ever succeeds proves nothing about
+;; a device with the wrong key: the second run points the server at a
+;; different public key and requires the agent to exit `rejected` rather than
+;; retrying or reporting a transport problem.
+;;
+;; The classpath is passed twice on purpose: once for this script, and once
+;; as an argument, because the child agent is a separate nbb process that
+;; needs the same one.
+;;
+;;   kbb --backend sci --classpath ../grant/src:../text/src \
+;;     os/aiueos/scripts/device-attest-agent-loop-test.cljk ../grant/src:../text/src
+
+(require '[grant.device-attest :as attest]
+         '[kotoba.lang.text :as str]
+         '["node:crypto" :as crypto]
+         '["node:http" :as http]
+         '["node:fs" :as fs]
+         '["node:os" :as os]
+         '["node:path" :as path]
+         '["node:child_process" :as cp])
+
+(def subtle (.-subtle (.-webcrypto crypto)))
+(def results (atom []))
+(defn- check! [name ok detail]
+  (swap! results conj [name ok])
+  (println (if ok "LOOP_OK  " "LOOP_FAIL") name (if ok "" (str "-- " detail))))
+
+(def did "did:key:z6MkLoopTestDevice")
+(def nonce "loop-test-nonce-9f2a")
+
+(def tmp (fs/mkdtempSync (path/join (os/tmpdir) "attest-loop-")))
+(def key-path (path/join tmp "device.pem"))
+
+(def kp (crypto/generateKeyPairSync "ed25519"))
+(fs/writeFileSync key-path (.export (.-privateKey kp) #js {:format "pem" :type "pkcs8"}))
+
+(def other-kp (crypto/generateKeyPairSync "ed25519"))
+
+(defn- raw-public [pub]
+  (js/Buffer.from (.-x (.export pub #js {:format "jwk"})) "base64url"))
+
+;; the plane's check, byte for byte
+(defn- verify [expect-public endpoint signature-b64url]
+  (let [message (attest/signing-input {:did did :endpoint endpoint :nonce nonce})]
+    (if-not (string? message)
+      (js/Promise.resolve false)
+      (-> (.importKey subtle "raw" (raw-public expect-public) #js {:name "Ed25519"} false #js ["verify"])
+          (.then (fn [k] (.verify subtle #js {:name "Ed25519"} k
+                                  (js/Buffer.from signature-b64url "base64url")
+                                  (.encode (js/TextEncoder.) message))))
+          (.then (fn [ok] (true? ok)))
+          (.catch (fn [_] false))))))
+
+(defn- start-server [expect-public seen]
+  (js/Promise.
+   (fn [resolve _]
+     ;; The handler needs the port to rebuild the endpoint the device signed,
+     ;; and the port is not known until listen(). An atom, not a self-reference
+     ;; inside the binding that creates the server.
+     (let [port (atom nil)
+           server
+           (http/createServer
+            (fn [req res]
+              (let [url (.-url req)]
+                (cond
+                  (str/ends-with? url "/challenge")
+                  (do (.writeHead res 200 #js {"content-type" "application/json"})
+                      (.end res (js/JSON.stringify
+                                 #js {"challenge" "c-loop" "nonce" nonce
+                                      "expiresAtMs" (+ (js/Date.now) 300000)})))
+
+                  (str/ends-with? url "/attest")
+                  (let [chunks (atom "")]
+                    (.on req "data" (fn [d] (swap! chunks str d)))
+                    (.on req "end"
+                         (fn []
+                           (let [body (js->clj (js/JSON.parse @chunks))
+                                 endpoint (str "http://127.0.0.1:" @port)]
+                             (-> (verify expect-public endpoint (get body "signature"))
+                                 (.then (fn [ok]
+                                          (swap! seen conj {:signature (get body "signature")
+                                                            :verified ok})
+                                          (.writeHead res (if ok 200 400)
+                                                      #js {"content-type" "application/json"})
+                                          (.end res (js/JSON.stringify (clj->js {"verified" ok}))))))))))
+
+                  :else (do (.writeHead res 404) (.end res "{}"))))))]
+       (.listen server 0 "127.0.0.1"
+                (fn [] (reset! port (.-port (.address server))) (resolve server)))))))
+
+(defn- run-agent [port]
+  (js/Promise.
+   (fn [resolve _]
+     (let [child (cp/spawn "nbb"
+                           (clj->js ["--classpath" (str/join ":" (vec *command-line-args*))
+                                     "os/aiueos/scripts/device-attest-agent.cljk"
+                                     "--did" did
+                                     "--endpoint" (str "http://127.0.0.1:" port)
+                                     "--key" key-path])
+                           #js {:stdio "pipe"})
+           out (atom "")]
+       (.on (.-stdout child) "data" (fn [d] (swap! out str d)))
+       (.on (.-stderr child) "data" (fn [d] (swap! out str d)))
+       (.on child "close" (fn [code] (resolve {:code code :out @out})))))))
+
+(defn- finish []
+  (let [total (count @results) failed (remove second @results)]
+    (println)
+    (println (str "checks=" total " failed=" (count failed)))
+    (when (seq failed) (println (str "failed: " (str/join ", " (map first failed)))))
+    (println (if (empty? failed) "DEVICE_ATTEST_LOOP_OK" "DEVICE_ATTEST_LOOP_FAIL"))
+    (js/process.exit (if (empty? failed) 0 1))))
+
+;; ── run 1: the device's own key. The plane must accept it. ────────────────
+(let [seen (atom [])]
+  (-> (start-server (.-publicKey kp) seen)
+      (.then
+       (fn [server]
+         (-> (run-agent (.-port (.address server)))
+             (.then
+              (fn [{:keys [code out]}]
+                (.close server)
+                (check! "the-agent-proves-possession" (= 0 code)
+                        (str "exit " code ": " (str/trim out)))
+                (check! "and-says-so" (str/includes? out "proved") (str/trim out))
+                (check! "the-plane-verified-the-signature"
+                        (true? (:verified (first @seen)))
+                        (pr-str @seen))
+                ;; ── run 2: the plane expects a different key. ─────────────
+                (let [seen2 (atom [])]
+                  (-> (start-server (.-publicKey other-kp) seen2)
+                      (.then
+                       (fn [server2]
+                         (-> (run-agent (.-port (.address server2)))
+                             (.then
+                              (fn [{:keys [code out]}]
+                                (.close server2)
+                                ;; The exit code alone is not enough: an agent
+                                ;; that failed to start also exits 1, and this
+                                ;; check passed that way once. Require the
+                                ;; outcome it names, too.
+                                (check! "a-wrong-key-is-rejected-not-retried"
+                                        (and (= (attest/exit-codes :rejected) code)
+                                             (str/includes? out "rejected"))
+                                        (str "exit " code ": " (str/trim out)))
+                                (check! "and-is-not-reported-as-a-transport-problem"
+                                        (not (str/includes? out "unreachable"))
+                                        (str/trim out))
+                                (check! "the-plane-recorded-the-failed-attempt"
+                                        (false? (:verified (first @seen2)))
+                                        (pr-str @seen2))
+                                (finish)))))))))))))))

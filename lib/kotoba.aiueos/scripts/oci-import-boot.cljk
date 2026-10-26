@@ -1,0 +1,372 @@
+;; oci-import-boot.cljk — JUN-34: OCI への image import と Free Tier instance boot readback
+;;
+;;   kbb --backend sci scripts/oci-import-boot.cljk plan       ;; offline: artifact hash + 実行計画
+;;   kbb --backend sci scripts/oci-import-boot.cljk preflight  ;; auth: limits/shape readback → shape 決定
+;;   kbb --backend sci scripts/oci-import-boot.cljk upload     ;; auth: bucket 確保 + qcow2 object put（readback 付き）
+;;   kbb --backend sci scripts/oci-import-boot.cljk import     ;; auth: compute image import from-object (QCOW2)
+;;   kbb --backend sci scripts/oci-import-boot.cljk net        ;; auth: VCN/subnet 確保（課金 resource なし）
+;;   kbb --backend sci scripts/oci-import-boot.cljk boot       ;; auth: 空 block volume 作成 + Free Tier instance launch
+;;                                                            ;;      + paravirtualized attach + reset + console readback matrix
+;;
+;; 設計（2026-10-22・JUN-33/JUN-34 の実測に基づく）:
+;; - 認証は durable API key（~/.oci/config-jun-durable）があればそれ、無ければ JunSession。
+;;   どちらも無い/失効なら owner の一回だけ `scripts/oci-auth.cljk login` を要求して停止する。
+;; - コストガード（fail-closed）: 許可 shape は VM.Standard.E2.1.Micro（x86_64、always-free）のみ。
+;;   A1.Flex（aarch64）しか容量が無い場合は AArch64 port blocker として import も boot も行わない。
+;;   paid upgrade / 課金 resource の作成はこのスクリプトに実装しない（人承認の領域）。
+;; - data volume は「空の 50GiB block volume」でよい（PR #453 / runD 実測: sector 0 が zero なら
+;;   guest が first boot でその場に provision する、AIUEOS_OBJECT_STORE_FORMAT_OK）。OCI は image から
+;;   block volume を作れないため、この route (b) が helper-VM runbook (route a) より優先。
+;;   attach は launch 後にしかできないので first boot は blk gate で止まる（run1/run2 実測）→
+;;   attach後に instance reset して 2 回目の boot で volume を認識させる。
+;; - 受け入れは console history の readback matrix（boot / data-volume / desktop / input の 4 群、
+;;   marker は実測で到達した名前だけ）で、構成しただけで成功としない。
+;;   firmware は測定どおり LaunchOptions.firmware（SDK 3.95.0 の enum は BIOS|UEFI_64、image の
+;;   launch-mode enum には UEFI_64 が無い）なので、import は PARAVIRTUALIZED、UEFI は boot 時に指定する。
+;; - 秘密は stdout に出さない。OCID・hash は receipt としてローカルにのみ記録する。
+;; - kbb/SCI 既知罠（PR #429 済み）: env は aget、octal リテラル禁止（0600 = 384）。
+
+(ns oci-import-boot
+  (:require ["node:child_process" :as cp]
+            ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:path" :as path]
+            [clojure.string :as str]))
+
+(def HOME (os/homedir))
+(def OCI-DIR (path/join HOME ".oci"))
+(def SESSION-PROFILE (or (aget (.-env js/process) "OCI_SESSION_PROFILE") "JunSession"))
+(def DURABLE-PROFILE (or (aget (.-env js/process) "OCI_DURABLE_PROFILE") "JunDurable"))
+(def DURABLE-CONFIG (path/join OCI-DIR "config-jun-durable"))
+(def SESSION-CONFIG (path/join OCI-DIR "config"))
+(def REGION (or (aget (.-env js/process) "OCI_REGION") "ap-tokyo-1"))
+;; payload は JUN-31 acceptance pin（selfhost-proven image）の pack を既定にする。
+;; 旧 20261023 pack（qcow2 591b7c76…）は selfhost 証明前で compiler-lineage が無いので
+;; 既定から外す（2026-10-25 payload refresh の finding）。明示する場合は JUN34_ARTIFACT_DIR。
+(def ARTIFACT-DIR (or (aget (.-env js/process) "JUN34_ARTIFACT_DIR")
+                      (path/join HOME "github/workspaces/hermes/jun34-selfhost-payload-20261025")))
+(def QCOW2 (path/join ARTIFACT-DIR "aiueos-oci-boot.qcow2"))
+;; receipt は pack ごとに名前が違う（旧: jun34-oci-artifact-receipt.json /
+;; selfhost pack: jun34-selfhost-payload-receipt.json）。無い側は読まない。
+(def RECEIPT (let [primary (path/join ARTIFACT-DIR "jun34-oci-artifact-receipt.json")
+                   alt (path/join ARTIFACT-DIR "jun34-selfhost-payload-receipt.json")]
+               (cond
+                 (.existsSync fs primary) primary
+                 (.existsSync fs alt) alt
+                 :else primary)))
+(def STATE (path/join ARTIFACT-DIR "jun34-oci-state.json"))
+(def BOOT-LOG (path/join ARTIFACT-DIR "oci-boot-console-history.txt"))
+
+(def BUCKET "aiueos-jun34")
+(def OBJECT "aiueos-oci-boot.qcow2")
+(def IMAGE-NAME "aiueos-selfhost-jun34")
+(def INSTANCE-NAME "aiueos-jun34-node")
+(def VCN-NAME "jun34-vcn")
+(def SUBNET-NAME "jun34-subnet")
+(def FREE-TIER-SHAPE "VM.Standard.E2.1.Micro")   ;; x86_64、always-free 2 instance
+(def A1-SHAPE "VM.Standard.A1.Flex")             ;; aarch64 → port blocker
+(def DATA-VOLUME-NAME "jun34-data")
+(def DATA-VOLUME-GB 50)                          ;; OCI block volume 最小サイズ（runD で互換実測）
+(def MAX-FREE-BLOCK-GB 200)                      ;; Always Free block storage 合計（boot+data=100GB 以内）
+(def MAX-FREE-OBJECT-BYTES (* 20 1024 1024 1024))
+;; 受け入れ marker は実測で到達した名前だけを使う（runB/runD/runE の marker 集合）。
+;; 勝手な名前を作らない。readback matrix は 4 群（boot / data-volume / desktop / input）。
+(def READBACK-MATRIX
+  {:boot        ["AIUEOS_LOADER_OK" "AIUEOS_FRAMEBUFFER_OK" "AIUEOS_VIRTIO_BLK_OK"]
+   :data-volume ["AIUEOS_OBJECT_STORE_FORMAT_OK" "AIUEOS_OBJECT_STORE_OK" "AIUEOS_KOTOBA_APP_ADMISSION_OK"]
+   :desktop     ["AIUEOS_DESKTOP_LOOP_OK" "AIUEOS_DESKTOP_SURFACE_OK"]
+   :input       ["AIUEOS_VIRTIO_INPUT_OK" "AIUEOS_DESKTOP_INPUT_OK" "AIUEOS_GUEST_INPUT_OK"]})
+(def BOOT-MARKERS (vec (mapcat val READBACK-MATRIX)))
+
+(defn sh-out [cmd]
+  (try (.execSync cp cmd #js {:encoding "utf8" :stdio #js ["ignore" "pipe" "pipe"]})
+       (catch :default e (str "ERR:" (ex-message e)))))
+
+(defn sh! [cmd]
+  (let [out (sh-out cmd)]
+    (when (str/starts-with? out "ERR:")
+      (throw (js/Error. (str "command failed: " cmd "\n" out))))
+    out))
+
+(defn argv [] (drop 3 (vec (js/Array.from (.-argv js/process)))))
+(defn durable? [] (.existsSync fs DURABLE-CONFIG))
+
+(defn oci
+  "認証 profile の選択。durable key があれば無人経路、無ければ session 経路。"
+  []
+  (if (durable?)
+    (str "oci --config-file " DURABLE-CONFIG " --profile " DURABLE-PROFILE)
+    (str "oci --config-file " SESSION-CONFIG " --profile " SESSION-PROFILE " --auth security_token")))
+
+(defn tenancy
+  "~/.oci/config の tenancy 行（識別子。秘密ではない）"
+  []
+  (if (.existsSync fs SESSION-CONFIG)
+    (->> (str/split-lines (fs/readFileSync SESSION-CONFIG "utf8"))
+         (some (fn [l] (when (str/starts-with? l "tenancy=") (str/trim (subs l 8))))))
+    nil))
+
+(defn state-read []
+  (if (.existsSync fs STATE)
+    (js->clj (js/JSON.parse (fs/readFileSync STATE "utf8")) :keywordize-keys true)
+    {}))
+
+(defn state-write! [m]
+  (fs/writeFileSync STATE (js/JSON.stringify (clj->js m) nil 2))
+  (println "state written:" STATE))
+
+(defn sha256-file [p]
+  (-> (sh! (str "shasum -a 256 " p)) (str/split #"\s+") first str/trim))
+
+(defn file-bytes [p] (.-size (fs/statSync p)))
+
+(defn probe-auth!
+  "認証が通るかだけを測る。失敗したら owner の一回だけの手順を出して exit 2。"
+  []
+  (let [out (sh-out (str (oci) " iam region list --query 'data[0].name' --output table"))]
+    (when (str/starts-with? out "ERR:")
+      (println "AUTH FAIL — OCI API に到達できない（測定: " (first (str/split-lines out)) "）")
+      (println "owner の一回だけの作業: kbb --backend sci " (path/join HOME "github/kotoba-lang/aiueos/scripts/oci-auth.cljk") " login")
+      (js/process.exit 2))))
+
+(defn json-of [s]
+  (js->clj (js/JSON.parse (str/trim s)) :keywordize-keys true))
+
+(defn sleep-s! [n] (.execSync cp (str "sleep " n)))
+
+;; ---------------------------------------------------------------- plan（offline）
+
+(defn cmd-plan []
+  (println "JUN-34 OCI import/boot 実行計画（offline・resource 作成なし）")
+  (println "  auth route:" (if (durable?) "durable api key (JunDurable)" "session token (JunSession, 1h TTL)"))
+  (println "  artifact dir:" ARTIFACT-DIR)
+  (if-not (.existsSync fs QCOW2)
+    (do (println "  qcow2: MISSING —" QCOW2) (js/process.exit 1))
+    (let [h (sha256-file QCOW2)
+          receipt (js->clj (js/JSON.parse (fs/readFileSync RECEIPT "utf8")) :keywordize-keys true)
+          want (or (get-in receipt [:blank-volume-format-route :payload-format-route (keyword "aiueos-oci-boot.qcow2") :sha256])
+                   (get-in receipt [:disk-images (keyword "aiueos-oci-boot.qcow2") :sha256]))
+          ok (= h want)]
+      (println "  qcow2 sha256:" h (if ok "(receipt MATCH)" (str "(receipt MISMATCH want=" want ")")))
+      (println "  qcow2 bytes:" (file-bytes QCOW2))
+      (when-not ok (js/process.exit 1))))
+  (println "  shape decision (fail-closed):" FREE-TIER-SHAPE "x86_64 のみ許可。"
+           A1-SHAPE "(aarch64) しか容量が無い場合は AArch64 port blocker として import/boot しない。")
+  (println "  markers (console history readback matrix の受け入れ、4 群):")
+  (doseq [k [:boot :data-volume :desktop :input]]
+    (println "   " (name k) ":" (str/join " " (get READBACK-MATRIX k))))
+  (println "  data volume:" DATA-VOLUME-GB "GiB 空 block volume（guest が first boot で provision、PR #453 route b）")
+  (println "  block storage 見込み: boot 50GB + data" DATA-VOLUME-GB "GB = 100GB ≤ Always Free" MAX-FREE-BLOCK-GB "GB")
+  (println)
+  (println "実行順（各 step は auth 後）:")
+  (println "  1. preflight — iam region list / availability-domain list / compute shape list")
+  (println "  2. upload    — os ns get → bucket ensure → object put → object head で readback")
+  (println "  3. import    — compute image import from-object --source-image-type QCOW2 --launch-mode PARAVIRTUALIZED")
+  (println "                 → image lifecycle-state AVAILABLE まで poll")
+  (println "  4. net       — vcn/subnet/internet-gateway/route-table 確保（課金 resource なし）")
+  (println "  5. boot      — bv volume create（空 " DATA-VOLUME-GB "GiB）→ instance launch --shape VM.Standard.E2.1.Micro")
+  (println "                 --launch-options '{\"firmware\":\"UEFI_64\",\"bootVolumeType\":\"PARAVIRTUALIZED\",\"networkType\":\"PARAVIRTUALIZED\",\"remoteDataVolumeType\":\"PARAVIRTUALIZED\"}'")
+  (println "                 → volume-attachment attach --type paravirtualized → instance action reset")
+  (println "                 （launch 後 attach のため first boot は blk gate で止まる。reset 後の 2 回目で認識）")
+  (println "                 → capture-console-history → get-content → readback matrix 判定")
+  (println "  境界: paid upgrade / 課金 resource は作らない（USD 100/月 hard ceiling、人承認まで停止）"))
+
+;; ---------------------------------------------------------------- preflight（auth）
+
+(defn cmd-preflight []
+  (probe-auth!)
+  (let [t (tenancy)
+        ads (sh! (str (oci) " iam availability-domain list --query 'data[].name' --output json"))
+        shapes (sh! (str (oci) " compute shape list --compartment-id " t " --query 'data[].name' --output json"))
+        names (js->clj (js/JSON.parse shapes))]
+    (println "region:" REGION)
+    (println "availability domains:" (str/trim ads))
+    (println "shapes:" (str/join ", " names))
+    (cond
+      (some #(= FREE-TIER-SHAPE %) names)
+      (do (println "shape decision:" FREE-TIER-SHAPE "(x86_64 — guest artifact と一致、arch 変更不要)")
+          (state-write! {:shape FREE-TIER-SHAPE :tenancy t :region REGION
+                         :ad (first (js->clj (js/JSON.parse ads)))}))
+      (some #(= A1-SHAPE %) names)
+      (do (println "PORT BLOCKER:" A1-SHAPE "(aarch64) のみ。x86-64 guest では起動不可。")
+          (println "  AArch64 aiueos target（JUN-30 範囲外作業）が必須。import/boot は行わない。")
+          (js/process.exit 3))
+      :else
+      (do (println "UNEXPECTED — 許可 shape が無い。何も作らない。") (js/process.exit 3)))))
+
+;; ---------------------------------------------------------------- upload（auth）
+
+(defn cmd-upload []
+  (probe-auth!)
+  (when-not (.existsSync fs QCOW2) (println "qcow2 missing:" QCOW2) (js/process.exit 1))
+  (let [sz (file-bytes QCOW2)]
+    (when (> sz MAX-FREE-OBJECT-BYTES)
+      (println "guard: object が Free Tier object storage (20GiB) を超える。作らない。")
+      (js/process.exit 3)))
+  (let [sz (file-bytes QCOW2)
+        ns (str/trim (sh! (str (oci) " os ns get --query data --output text")))
+        t (tenancy)
+        buckets (sh! (str (oci) " os bucket list -ns " ns " --compartment-id " t " --query 'data[].name' --output json"))
+        names (js->clj (js/JSON.parse buckets))]
+    (when-not (some #(= BUCKET %) names)
+      (println "bucket create:" BUCKET)
+      (sh! (str (oci) " os bucket create -ns " ns " --compartment-id " t " --name " BUCKET
+                " --public-access-type NoPublicAccess --storage-tier Standard")))
+    (println "object put:" OBJECT "(" sz " bytes )")
+    (sh! (str (oci) " os object put -ns " ns " --bucket-name " BUCKET " --name " OBJECT
+              " --file " QCOW2 " --force --no-multipart --opc-checksum-algorithm SHA256"))
+    ;; readback: object head で size を照合（put が通っただけで成功にしない）
+    (let [head (sh! (str (oci) " os object head -ns " ns " --bucket-name " BUCKET " --name " OBJECT
+                         " --query 'data.content-length' --output text"))]
+      (println "readback content-length:" (str/trim head) "local:" sz
+               (if (= (str/trim head) (str sz)) "MATCH" "MISMATCH"))
+      (when-not (= (str/trim head) (str sz)) (js/process.exit 1)))
+    (state-write! (merge (state-read) {:ns ns :bucket BUCKET :object OBJECT :object-bytes sz}))))
+
+;; ---------------------------------------------------------------- import（auth）
+
+(defn cmd-import []
+  (probe-auth!)
+  (let [st (state-read)
+        ns (or (:ns st) (do (println "upload が未実行（ns が無い）") (js/process.exit 1)))
+        t (tenancy)
+        out (sh! (str (oci) " compute image import from-object -c " t
+                      " -ns " ns " --bucket-name " BUCKET " --name " OBJECT
+                      " --source-image-type QCOW2 --launch-mode PARAVIRTUALIZED"
+                      " --display-name " IMAGE-NAME
+                      " --operating-system Custom --operating-system-version selfhost"
+                      " --output json"))
+        img (:id (:data (json-of out)))]
+    (println "image import started:" img)
+    (loop [i 0]
+      (let [stt (str/trim (sh! (str (oci) " compute image get --image-id " img
+                                    " --query 'data.\"lifecycle-state\"' --output text")))]
+        (println "  lifecycle-state:" stt)
+        (cond
+          (= stt "AVAILABLE") (do (println "image AVAILABLE:" img)
+                                  (state-write! (merge st {:image-id img})))
+          (or (= stt "IMPORTING") (= stt "PROVISIONING"))
+          (do (sleep-s! 30) (recur (inc i)))
+          :else (do (println "IMPORT FAILED — state:" stt) (js/process.exit 1)))))))
+
+;; ---------------------------------------------------------------- net（auth・課金 resource なし）
+
+(defn cmd-net []
+  (probe-auth!)
+  (let [t (tenancy)
+        vcns (js->clj (js/JSON.parse (sh! (str (oci) " network vcn list --compartment-id " t
+                                               " --query 'data[?\"display-name\"==`" VCN-NAME "`].id' --output json"))))
+        vcn (or (first vcns)
+                (let [c (json-of (sh! (str (oci) " network vcn create --compartment-id " t
+                                           " --display-name " VCN-NAME " --dns-label jun34"
+                                           " --cidr-blocks '[\"10.0.0.0/16\"]' --output json")))]
+                  (println "vcn created:" (get-in c [:data :id]))
+                  (get-in c [:data :id])))]
+    (let [igws (js->clj (js/JSON.parse (sh! (str (oci) " network internet-gateway list --compartment-id " t " --vcn-id " vcn
+                                                 " --query 'data[].id' --output json"))))
+          igw (or (first igws)
+                  (let [c (json-of (sh! (str (oci) " network internet-gateway create --compartment-id " t " --vcn-id " vcn
+                                             " --display-name jun34-igw --is-enabled true --output json")))]
+                    (println "igw created:" (get-in c [:data :id]))
+                    (get-in c [:data :id])))
+          rts (js->clj (js/JSON.parse (sh! (str (oci) " network route-table list --compartment-id " t " --vcn-id " vcn
+                                                " --query 'data[0].id' --output json"))))
+          rt (first rts)]
+      (sh! (str (oci) " network route-table update --rt-id " rt " --force --output json"
+                " --route-rules '[{\"destination\":\"0.0.0.0/0\",\"destinationType\":\"CIDR_BLOCK\",\"networkEntityId\":\"" igw "\"}]'"))
+      (let [subs (js->clj (js/JSON.parse (sh! (str (oci) " network subnet list --compartment-id " t " --vcn-id " vcn
+                                                  " --query 'data[?\"display-name\"==`" SUBNET-NAME "`].id' --output json"))))
+            sub (or (first subs)
+                    (let [c (json-of (sh! (str (oci) " network subnet create --compartment-id " t " --vcn-id " vcn
+                                               " --display-name " SUBNET-NAME " --dns-label jun34sub"
+                                               " --cidr-block 10.0.1.0/24 --prohibit-public-ip-on-vnic false --output json")))]
+                      (println "subnet created:" (get-in c [:data :id]))
+                      (get-in c [:data :id])))]
+        (println "net readback: vcn=" vcn "subnet=" sub "igw=" igw)
+        (state-write! (merge (state-read) {:vcn-id vcn :subnet-id sub :igw-id igw}))))))
+
+;; ---------------------------------------------------------------- boot（auth・Free Tier のみ）
+;;
+;; 空 block volume（route b, PR #453）: launch 後 attach のため first boot は
+;; AIUEOS_VIRTIO_BLK_FAIL で止まる（run1/run2 実測）→ attach 後に instance reset して
+;; 2 回目の boot で volume を認識させる（runD: 50GiB zeroed disk がその場で provision される）。
+
+(defn cmd-boot []
+  (probe-auth!)
+  (let [st (state-read)]
+    (when-not (and (:image-id st) (:subnet-id st) (:ad st))
+      (println "state 不足 — preflight / import / net が必要") (js/process.exit 1))
+    (when-not (= FREE-TIER-SHAPE (:shape st))
+      (println "guard: shape が " FREE-TIER-SHAPE " でない。課金リスクのため boot しない。")
+      (js/process.exit 3))
+    (let [t (tenancy)
+          vol-out (sh! (str (oci) " bv volume create --compartment-id " t
+                            " --availability-domain " (:ad st)
+                            " --size-in-gbs " DATA-VOLUME-GB
+                            " --display-name " DATA-VOLUME-NAME
+                            " --wait-for-state AVAILABLE --output json"))
+          vol (get-in (json-of vol-out) [:data :id])]
+      (println "data volume created:" vol "(" DATA-VOLUME-GB "GiB blank )")
+      ;; readback: volume の size を照合（create が通っただけで成功にしない）
+      (let [vol-size (str/trim (sh! (str (oci) " bv volume get --volume-id " vol
+                                         " --query 'data.\"size-in-gbs\"' --output text")))]
+        (println "volume readback size-in-gbs:" vol-size
+                 (if (= vol-size (str DATA-VOLUME-GB)) "MATCH" "MISMATCH"))
+        (when-not (= vol-size (str DATA-VOLUME-GB)) (js/process.exit 1)))
+      (let [out (sh! (str (oci) " compute instance launch --compartment-id " t
+                        " --availability-domain " (:ad st)
+                        " --image-id " (:image-id st)
+                        " --shape " FREE-TIER-SHAPE
+                        " --subnet-id " (:subnet-id st)
+                        " --display-name " INSTANCE-NAME
+                        " --create-vnic-details '{\"assignPublicIp\":true}'"
+                        " --launch-options '{\"firmware\":\"UEFI_64\",\"bootVolumeType\":\"PARAVIRTUALIZED\",\"networkType\":\"PARAVIRTUALIZED\",\"remoteDataVolumeType\":\"PARAVIRTUALIZED\"}'"
+                        " --wait-for-state RUNNING --max-wait-seconds 900 --output json"))
+          inst (get-in (json-of out) [:data :id])]
+      (println "instance RUNNING:" inst)
+        (let [att (json-of (sh! (str (oci) " compute volume-attachment attach --type paravirtualized"
+                                     " --instance-id " inst " --volume-id " vol
+                                     " --wait-for-state ATTACHED --output json")))]
+          (println "volume attachment:" (get-in att [:data :id]) (get-in att [:data :lifecycle-state])))
+        (sh! (str (oci) " compute instance action --instance-id " inst " --action reset --force"
+                  " --wait-for-state RUNNING --max-wait-seconds 600"))
+        (println "instance reset — 2 回目の boot で blank volume を認識する")
+        (sleep-s! 30)
+        (let [hist (get-in (json-of (sh! (str (oci) " compute instance capture-console-history --instance-id " inst " --output json"))) [:data :id])]
+        (println "console history:" hist)
+        (let [content (sh! (str (oci) " compute instance console-history get-content --console-history-id " hist " --output text"))]
+          (fs/writeFileSync BOOT-LOG content)
+          (println "console saved:" BOOT-LOG)
+          (let [found (set (filterv #(str/includes? content %) BOOT-MARKERS))
+                row (fn [k]
+                      (str (name k) ": "
+                           (str/join " " (map #(str % (if (contains? found %) "=OK" "=MISS"))
+                                              (get READBACK-MATRIX k)))))
+                loader? (contains? found "AIUEOS_LOADER_OK")
+                loop? (contains? found "AIUEOS_DESKTOP_LOOP_OK")
+                data-any? (some #(contains? found %) (:data-volume READBACK-MATRIX))]
+            (doseq [k [:boot :data-volume :desktop :input]]
+              (println "  readback" (row k)))
+            (if (and loader? loop? data-any?)
+              (do (println "VERDICT: AIUEOS runtime が OCI instance に到達（loader + object store + desktop loop）")
+                  (state-write! (merge st {:instance-id inst :volume-id vol
+                                           :console-history-id hist :markers (vec found)})))
+              (do (println "VERDICT: FAIL — readback matrix 未達。console 抜粋:")
+                  (println (subs content 0 (min 2000 (count content))))
+                  (state-write! (merge st {:instance-id inst :volume-id vol
+                                           :console-history-id hist :markers (vec found)}))
+                  (js/process.exit 1))))))))))
+
+(defn -main []
+  (let [[c & _] (argv)]
+    (case c
+      "plan" (cmd-plan)
+      "preflight" (cmd-preflight)
+      "upload" (cmd-upload)
+      "import" (cmd-import)
+      "net" (cmd-net)
+      "boot" (cmd-boot)
+      (do (println "usage: oci-import-boot.cljk plan|preflight|upload|import|net|boot")
+          (js/process.exit 2)))))
+
+(-main)

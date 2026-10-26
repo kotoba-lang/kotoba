@@ -1,0 +1,538 @@
+(ns aiueos.x25519)
+
+;; X25519 scalar multiplication (RFC 7748 sec. 5) for the freestanding aiueos
+;; kernel.  Exported entry: `aiueos-x25519 [scalar point output workspace]`.
+;;
+;;   scalar    -- 32-byte little-endian scalar (clamped here, never mutated)
+;;   point     -- 32-byte little-endian u-coordinate (bit 255 masked off here)
+;;   output    -- 32 bytes written with the little-endian u-coordinate result
+;;   workspace -- caller-owned scratch, EXACTLY 646 BYTES REQUIRED
+;;
+;;   returns 1 on success, 0 on refusal.
+;;
+;; ---------------------------------------------------------------------------
+;; THIS OBJECT CONSUMES A SECRET.  READ THIS BEFORE TRUSTING IT.
+;; ---------------------------------------------------------------------------
+;; Every other Kotoba object in this OS decides about PUBLIC bytes.  rsa2048.o
+;; is signature *verification*: a timing leak there costs nothing, because an
+;; attacker already has the signature.  This one is different -- `scalar` is a
+;; private key.  A branch or a memory address that depends on a scalar bit is a
+;; real side channel, not a style problem.
+;;
+;; What is branch-free BY CONSTRUCTION here:
+;;   * the ladder's conditional swap (`x-cswap-loop`) is arithmetic --
+;;     `p + s*(q - p)` / `q + s*(p - q)` with s in {0,1}.  There is no `if` on
+;;     a scalar bit anywhere in this file.
+;;   * every ladder iteration executes the identical 18 field operations
+;;     regardless of the scalar; the loop count is the fixed 255 of RFC 7748.
+;;   * the final canonical reduction (`x-freeze-select-all`) selects between
+;;     v and v-p arithmetically, never by branching on the comparison.
+;;   * every memory offset in this file is derived from a loop counter or a
+;;     literal slot base.  No index is ever computed from secret data, so the
+;;     access pattern is identical for all scalars.
+;;   * scalar clamping is applied on the fly in `x-clamped-byte`; the `if`
+;;     there tests the BYTE INDEX, which is a public loop counter.
+;;   * the inversion (`x-invert-step`) does branch, on `x-inv-bit` -- but that
+;;     is the fixed public exponent p-2 = 2^255-21, identical for every call.
+;;
+;; What is NOT guaranteed, and cannot be from inside this subset:
+;;   * CONSTANT TIME IS NOT CLAIMED.  This file does not control its own
+;;     lowering.  `quot` by a literal power of two is written where a shift is
+;;     meant, and nothing here forces the backend to emit a shift rather than a
+;;     division instruction -- x86-64 `idiv` latency is operand-dependent.
+;;     `bit-and`, `*` and `if` are likewise at the backend's discretion.
+;;   * no control over caches, prefetch, speculation, or the fuel meter.  A
+;;     fuel exhaustion trap partway through a ladder is itself observable.
+;;   * the workspace is NOT zeroed on exit.  Intermediate field elements,
+;;     including z2 and every ladder temporary, remain in the caller's buffer
+;;     after this returns.  The caller must wipe it if that matters.
+;;   * the ABI has no workspace-length parameter (unlike rsa2048.o, which
+;;     receives one and refuses below 1284).  This object therefore CANNOT
+;;     verify the caller's allocation.  The bounded `kernel-load-u8-4k ws 646`
+;;     primitive traps rather than returns if an offset escapes 646 bytes, so a
+;;     short workspace is a trap, not a wrong answer -- but the caller, not
+;;     this object, is what keeps that from happening.
+;;   * the only refusal this object can actually detect is an all-zero result
+;;     (RFC 7748 sec. 6.1): a small-order input point.  `output` is written
+;;     BEFORE that check, so a refused call still leaves 32 zero bytes there.
+;;
+;; ---------------------------------------------------------------------------
+;; BUILD STATUS -- THIS OBJECT IS NOT YET REACHABLE FROM C.
+;; ---------------------------------------------------------------------------
+;; Measured 2026-08-05 against kotoba-lang/compiler `91c943e`, which resolves
+;; kotoba-lang/kotoba-native `9b33db54`:
+;;
+;;   * `kotoba-compiler check` admits this file, and
+;;     `compile --target x86_64-aiueos-kernel-v1` succeeds.
+;;   * BUT `aiueos-x25519` is absent from `kernel-object-entries` in
+;;     kotoba-native `src/kotoba/native/elf64.clj` -- absent from the pinned
+;;     copy AND from that repo's default branch.  `package-kernel-object`
+;;     selects the first allow-listed symbol it finds, finds none, falls back
+;;     to `source-entry` (= `main`, arity 0) and its default contract, and
+;;     emits an object exporting `kotoba_aiueos_probe`.
+;;   * So the object produced from this file today is a PROBE WRAPPING `main`.
+;;     It links, it returns 0, and it never calls any of the code below.  The
+;;     control that establishes this: the same compiler on the unmodified
+;;     rsa2048.kotoba emits `kotoba_aiueos_rsa2048_sha256_verify`.
+;;
+;; To make this reachable, kotoba-native's `kernel-object-entries` needs
+;;     'aiueos-x25519 {:arity 4 :symbol "kotoba_aiueos_x25519"}
+;; and a fuel class beside `rsa-fuel?`.  One call executes 4,815,405 bounded
+;; memory operations (4,050,403 loads, 765,002 stores; counted by running the
+;; transcription of this file over the base-point vector), so the object also
+;; has to be admitted to `bounded-memory?`.  The fuel figure itself is NOT
+;; verified -- nothing here has run on the target.
+;;
+;; ---------------------------------------------------------------------------
+;; FIELD REPRESENTATION -- 17 LIMBS OF 15 BITS.
+;; ---------------------------------------------------------------------------
+;; A field element is 17 limbs, limb j holding bits [15j, 15j+15) of the value,
+;; stored as 17 little-endian u16 pairs = 34 bytes.
+;;
+;; Why 15 bits and not the 25.5/26 that ref10 and donna use.  Those exist to
+;; fit a 255-bit element into a 32-bit machine word's multiply while keeping
+;; 10 limbs; the constraint here is different in two ways.  First, 15*17 = 255
+;; EXACTLY, so the wrap-around factor is exactly 19 (2^255 = 19 mod p) instead
+;; of the 608 a uniform 26-bit/10-limb layout would produce, and every limb has
+;; the same width -- no mixed radix, no doubling correction on odd*odd partial
+;; products, which matters when the multiply is one index-generic tail
+;; recursion rather than 100 unrolled lines.  Second, a 15-bit limb plus its
+;; carry slack still fits in TWO BYTES, halving every load and store against a
+;; 26-bit limb's four; storage traffic, not multiply width, is what this
+;; subset actually pays for.
+;;
+;; Overflow argument for the i64 accumulator (the reason a 32-bit limb would be
+;; silently wrong): the stored invariant below gives limb < 2^15 + 19 < 2^15.001.
+;; A partial product is then < 2^30.002.  One output limb of the multiply sums
+;; 17 such products plus 19 times 17 more (the wrapped half), i.e. at most
+;; 20 * 17 * 2^30.002 < 2^38.4, plus an incoming carry < 2^23.4.  That is 24
+;; bits of headroom below 2^63.  A 32-bit limb would give partial products of
+;; 2^64 and corrupt on the first multiply-accumulate.
+;;
+;; STORED INVARIANT, maintained by every operation in this file:
+;;   limb[0] < 2^15 + 19  and  limb[1..16] < 2^15,  so every stored limb fits
+;;   in the two bytes it occupies, and the represented value is < 2^255 + 19,
+;;   which is < 2p -- exactly what the single conditional subtraction in
+;;   `x-freeze` needs to produce a canonical result.
+;;
+;; ---------------------------------------------------------------------------
+;; WORKSPACE LAYOUT -- 19 slots of 34 bytes = 646 bytes.
+;; ---------------------------------------------------------------------------
+;;   0  MA  0    multiply/add/sub left operand   (private staging)
+;;   1  MB  34   multiply/add/sub right operand  (private staging)
+;;   2  X1  68   the decoded input u-coordinate
+;;   3  X2  102  ladder accumulator
+;;   4  Z2  136
+;;   5  X3  170
+;;   6  Z3  204
+;;   7  A   238  ladder temporaries, named as in RFC 7748 sec. 5
+;;   8  AA  272
+;;   9  B   306
+;;  10  BB  340
+;;  11  E   374
+;;  12  C   408
+;;  13  D   442
+;;  14  DA  476
+;;  15  CB  510
+;;  16  T1  544
+;;  17  T2  578
+;;  18  FR  612  freeze scratch (holds v+19 truncated to 255 bits)
+;;
+;; Every binary operation COPIES its two operands into MA/MB before touching
+;; its destination.  That is two 17-limb copies of overhead per operation, and
+;; it buys two things: every helper stays inside the five-parameter limit
+;; (`x-mul-pass` needs only ws/dst/index/carry), and the destination may alias
+;; either source without a special case -- `x2 = x2 * z2` and `t2 = t2 * t2`
+;; are both written directly.
+;;
+;; ---------------------------------------------------------------------------
+;; EVALUATION-ORDER DISCIPLINE (same reason rsa2048.kotoba stages explicitly).
+;; ---------------------------------------------------------------------------
+;; `let` normalization SUBSTITUTES a binding's expression at each use rather
+;; than retaining a value, so a name bound to a load and read after a store to
+;; that same address would observe the NEW bytes.  Two rules keep every
+;; sequence in this file correct under substitution and under ordinary
+;; call-by-value alike:
+;;   1. an effectful binding is referenced EXACTLY ONCE, and the references are
+;;      chained left-to-right (`(+ r1 (+ r2 (+ r3 ...)))`) so the chain fixes
+;;      the order;
+;;   2. inside any expression that stores, every read of the address being
+;;      stored appears to the LEFT of the store -- see `x-carry-emit`, where
+;;      `(quot v 32768)` precedes the `x-put` that overwrites the limb `v` was
+;;      read from.
+;; Function ARGUMENTS are ordinary values, so passing a stage's result as the
+;; next stage's parameter is the strongest sequencing available here, and the
+;; entry point uses it throughout.
+;;
+;; Rule 1 assumes arguments and `+` operands are evaluated LEFT TO RIGHT.  That
+;; is not asserted from taste: rsa2048.kotoba's `subtract-modulus` tail-calls
+;; itself with `(+ i 1 (* 0 stored))` in argument 3 and `(load-word workspace
+;; 320 0)` in argument 4, where the staged borrow that argument 4 reads is
+;; written during argument 3.  Right-to-left evaluation would make that object
+;; read the previous iteration's borrow, and rsa2048.o is a pinned, checked-in
+;; artifact on the live admission path.  This file inherits that guarantee; if
+;; it is ever weakened, rsa2048 breaks first and louder.
+
+;; --- slot bases (byte offsets into the workspace) ---------------------------
+
+(defn x-s-ma [] 0)
+(defn x-s-mb [] 34)
+(defn x-s-x1 [] 68)
+(defn x-s-x2 [] 102)
+(defn x-s-z2 [] 136)
+(defn x-s-x3 [] 170)
+(defn x-s-z3 [] 204)
+(defn x-s-a [] 238)
+(defn x-s-aa [] 272)
+(defn x-s-b [] 306)
+(defn x-s-bb [] 340)
+(defn x-s-e [] 374)
+(defn x-s-c [] 408)
+(defn x-s-d [] 442)
+(defn x-s-da [] 476)
+(defn x-s-cb [] 510)
+(defn x-s-t1 [] 544)
+(defn x-s-t2 [] 578)
+(defn x-s-fr [] 612)
+
+;; --- limb access ------------------------------------------------------------
+
+(defn x-pow2 [n] (if (<= n 0) 1 (* 2 (x-pow2 (- n 1)))))
+
+(defn x-limb [ws slot i]
+  (+ (kernel-load-u8-4k ws 646 (+ slot (* 2 i)))
+     (* 256 (kernel-load-u8-4k ws 646 (+ slot (+ (* 2 i) 1))))))
+
+;; A limb index past the end reads as zero.  Only `x-encode-byte` needs it: the
+;; top output byte straddles limb 16 and a limb 17 that does not exist.
+(defn x-limb-or-zero [ws slot i]
+  (if (>= i 17) 0 (x-limb ws slot i)))
+
+(defn x-put [ws slot i v]
+  (+ (kernel-store-u8-4k ws 646 (+ slot (* 2 i)) (bit-and v 255))
+     (* 0 (kernel-store-u8-4k ws 646 (+ slot (+ (* 2 i) 1))
+                              (bit-and (quot v 256) 255)))))
+
+(defn x-copy [ws dst src i]
+  (if (= i 17) 1
+    (x-copy ws dst src (+ i 1 (* 0 (x-put ws dst i (x-limb ws src i)))))))
+
+(defn x-zero [ws slot i]
+  (if (= i 17) 1
+    (x-zero ws slot (+ i 1 (* 0 (x-put ws slot i 0))))))
+
+(defn x-set-one [ws slot gate]
+  ;; zero first, then limb 0 := 1.  The zeroing runs while the `x-put` value
+  ;; argument is being evaluated, which is before the put itself stores.
+  (+ 1 (* 0 (x-put ws slot 0 (+ 1 (* 0 (x-zero ws slot (* 0 gate))))))))
+
+;; Stage both operands into the private MA/MB slots.  Callers never pass MA or
+;; MB as an operand, so the two copies cannot alias each other.
+(defn x-load-pair [ws f g]
+  (+ (x-copy ws (x-s-ma) f 0) (* 0 (x-copy ws (x-s-mb) g 0))))
+
+;; --- carry machinery --------------------------------------------------------
+
+;; Store the low 15 bits of V at slot[i] and return the carry out.  The `quot`
+;; sits LEFT of the store on purpose: under let-substitution V may re-expand to
+;; a load of the very limb being written, and both of its uses must therefore
+;; be evaluated before the store lands.
+(defn x-carry-emit [ws slot i v]
+  (+ (quot v 32768) (* 0 (x-put ws slot i (bit-and v 32767)))))
+
+;; One carry pass over the 17 stored limbs, folding ADDEND in at limb 0 and
+;; returning the carry that falls off limb 16 (i.e. the coefficient of 2^255).
+(defn x-carry-pass [ws slot i addend]
+  (if (= i 17) addend
+    (x-carry-pass ws slot (+ i 1)
+                  (x-carry-emit ws slot i (+ addend (x-limb ws slot i))))))
+
+(defn x-limb0-add [ws slot delta]
+  (+ 1 (* 0 (x-put ws slot 0 (+ delta (x-limb ws slot 0))))))
+
+;; Fold the 2^255 overflow back in as 19 and re-normalize.  C1 is the carry a
+;; producer left above bit 255.  After one more pass the residual carry is at
+;; most 1, so the final 19*c2 <= 19 lands inside limb 0's slack and no third
+;; pass can be needed -- that is the whole reason the invariant admits
+;; limb[0] < 2^15 + 19 rather than < 2^15.
+(defn x-finish [ws slot c1]
+  (x-limb0-add ws slot (* 19 (x-carry-pass ws slot 0 (* 19 c1)))))
+
+;; --- field addition and subtraction ----------------------------------------
+
+(defn x-add-pass [ws dst i carry]
+  (if (= i 17) carry
+    (x-add-pass ws dst (+ i 1)
+                (x-carry-emit ws dst i
+                              (+ carry (+ (x-limb ws (x-s-ma) i)
+                                          (x-limb ws (x-s-mb) i)))))))
+
+(defn x-add [ws dst f g]
+  (x-finish ws dst (x-add-pass ws dst 0 (* 0 (x-load-pair ws f g)))))
+
+;; 2p = 2^256 - 38 in this representation: limb 0 is 2^16-38, the rest 2^16-2.
+;; Adding it before subtracting keeps every intermediate non-negative, so there
+;; is no borrow to propagate and no signed limb to store.
+(defn x-2p-limb [i] (if (= i 0) 65498 65534))
+
+(defn x-sub-pass [ws dst i carry]
+  (if (= i 17) carry
+    (x-sub-pass ws dst (+ i 1)
+                (x-carry-emit ws dst i
+                              (+ carry (+ (x-limb ws (x-s-ma) i)
+                                          (- (x-2p-limb i)
+                                             (x-limb ws (x-s-mb) i))))))))
+
+(defn x-sub [ws dst f g]
+  (x-finish ws dst (x-sub-pass ws dst 0 (* 0 (x-load-pair ws f g)))))
+
+;; --- field multiplication ---------------------------------------------------
+
+;; MA[i] * MB[j], or 0 when j is outside the 17 limbs.  Both guards fire on
+;; PUBLIC loop indices, never on data.
+(defn x-mul-term [ws i j]
+  (if (or (< j 0) (> j 16)) 0
+    (* (x-limb ws (x-s-ma) i) (x-limb ws (x-s-mb) j))))
+
+;; Output limb k of MA*MB reduced mod 2^255-19.  The full product has
+;; coefficients c_0..c_32; for m >= 17, 2^(15m) = 19 * 2^(15(m-17)) mod p, so
+;; h_k = c_k + 19*c_(k+17).  For a given i exactly one of j = k-i and
+;; j = k+17-i is in range, which is why both terms can be added unconditionally.
+(defn x-mul-sum [ws k i acc]
+  (if (= i 17) acc
+    (x-mul-sum ws k (+ i 1)
+               (+ acc (+ (x-mul-term ws i (- k i))
+                         (* 19 (x-mul-term ws i (- (+ k 17) i))))))))
+
+(defn x-mul-pass [ws dst k carry]
+  (if (= k 17) carry
+    (x-mul-pass ws dst (+ k 1)
+                (x-carry-emit ws dst k (+ carry (x-mul-sum ws k 0 0))))))
+
+(defn x-mul [ws dst a b]
+  (x-finish ws dst (x-mul-pass ws dst 0 (* 0 (x-load-pair ws a b)))))
+
+;; a24 = 121665.  A limb is < 2^15 + 19, so 121665 * limb < 2^32 and the
+;; running carry stays under 2^17 -- no staging area needed.
+(defn x-mul121665-pass [ws dst i carry]
+  (if (= i 17) carry
+    (x-mul121665-pass ws dst (+ i 1)
+                      (x-carry-emit ws dst i
+                                    (+ carry (* 121665 (x-limb ws (x-s-ma) i)))))))
+
+(defn x-mul121665 [ws dst f]
+  (x-finish ws dst
+            (x-mul121665-pass ws dst 0 (* 0 (x-copy ws (x-s-ma) f 0)))))
+
+;; --- constant-time conditional swap ----------------------------------------
+
+;; S is a scalar bit.  There is no branch on it: both destinations are written
+;; every time, with `p + s*(q-p)` and `q + s*(p-q)`.  Reading the originals out
+;; of MA/MB rather than out of p/q is what makes that safe -- MA/MB are not
+;; written by this loop, so neither store can be observed by the other's read.
+(defn x-cswap-loop [ws p q i s]
+  (if (= i 17) 1
+    (x-cswap-loop
+      ws p q
+      (+ i 1 (* 0 (+ (x-put ws p i
+                            (+ (x-limb ws (x-s-ma) i)
+                               (* s (- (x-limb ws (x-s-mb) i)
+                                       (x-limb ws (x-s-ma) i)))))
+                     (* 0 (x-put ws q i
+                                 (+ (x-limb ws (x-s-mb) i)
+                                    (* s (- (x-limb ws (x-s-ma) i)
+                                            (x-limb ws (x-s-mb) i)))))))))
+      s)))
+
+(defn x-cswap [ws p q s]
+  (x-cswap-loop ws p q (* 0 (x-load-pair ws p q)) s))
+
+(defn x-cswap-pair [ws s]
+  (+ (x-cswap ws (x-s-x2) (x-s-x3) s)
+     (* 0 (x-cswap ws (x-s-z2) (x-s-z3) s))))
+
+;; --- the Montgomery ladder --------------------------------------------------
+
+;; RFC 7748 clamping, applied on the fly so the caller's scalar buffer is never
+;; written: clear bits 0,1,2 of byte 0; clear bit 7 and set bit 6 of byte 31.
+;; The `if` tests the byte index, a public loop counter.
+(defn x-clamped-byte [scalar i]
+  (if (= i 0) (bit-and (kernel-load-u8-4k scalar 32 0) 248)
+    (if (= i 31) (bit-or (bit-and (kernel-load-u8-4k scalar 32 31) 127) 64)
+      (kernel-load-u8-4k scalar 32 i))))
+
+(defn x-scalar-bit [scalar t]
+  (bit-and (quot (x-clamped-byte scalar (quot t 8))
+                 (x-pow2 (- t (* (quot t 8) 8))))
+           1))
+
+;; One ladder step, exactly the thirteen assignments of RFC 7748 sec. 5 with
+;; two temporaries.  The `(+ r1 (+ r2 ...))` chain is what fixes their order.
+(defn x-step [ws s]
+  (let [c0 (x-cswap-pair ws s)
+        r1 (x-add ws (x-s-a) (x-s-x2) (x-s-z2))
+        r2 (x-mul ws (x-s-aa) (x-s-a) (x-s-a))
+        r3 (x-sub ws (x-s-b) (x-s-x2) (x-s-z2))
+        r4 (x-mul ws (x-s-bb) (x-s-b) (x-s-b))
+        r5 (x-sub ws (x-s-e) (x-s-aa) (x-s-bb))
+        r6 (x-add ws (x-s-c) (x-s-x3) (x-s-z3))
+        r7 (x-sub ws (x-s-d) (x-s-x3) (x-s-z3))
+        r8 (x-mul ws (x-s-da) (x-s-d) (x-s-a))
+        r9 (x-mul ws (x-s-cb) (x-s-c) (x-s-b))
+        r10 (x-add ws (x-s-t1) (x-s-da) (x-s-cb))
+        r11 (x-sub ws (x-s-t2) (x-s-da) (x-s-cb))
+        r12 (x-mul ws (x-s-x3) (x-s-t1) (x-s-t1))
+        r13 (x-mul ws (x-s-t2) (x-s-t2) (x-s-t2))
+        r14 (x-mul ws (x-s-z3) (x-s-x1) (x-s-t2))
+        r15 (x-mul ws (x-s-x2) (x-s-aa) (x-s-bb))
+        r16 (x-mul121665 ws (x-s-t1) (x-s-e))
+        r17 (x-add ws (x-s-t1) (x-s-aa) (x-s-t1))
+        r18 (x-mul ws (x-s-z2) (x-s-e) (x-s-t1))]
+    (+ 1 (* 0 (+ c0 (+ r1 (+ r2 (+ r3 (+ r4 (+ r5 (+ r6 (+ r7 (+ r8
+      (+ r9 (+ r10 (+ r11 (+ r12 (+ r13 (+ r14 (+ r15 (+ r16 (+ r17 r18)
+      )))))))))))))))))))))
+
+;; swap := k_t; the cswap is driven by (k_t xor previous swap).
+(defn x-ladder-step [ws kt swap]
+  (+ kt (* 0 (x-step ws (bit-xor kt swap)))))
+
+(defn x-ladder [ws scalar t swap]
+  (if (< t 0) swap
+    (x-ladder ws scalar (- t 1)
+              (x-ladder-step ws (x-scalar-bit scalar t) swap))))
+
+;; --- inversion: z^(p-2) by square-and-multiply over a PUBLIC exponent -------
+
+;; p-2 = 2^255 - 21 = 2^255 - 32 + 11, so bits 5..254 are set, bits 0,1,3 are
+;; set, and bits 2 and 4 are the only zeros.  This exponent is a compile-time
+;; constant identical for every call, so branching on it leaks nothing about
+;; the scalar.  It costs ~253 multiplies where ref10's addition chain costs 11;
+;; that is roughly 8% of the total and buys an inversion that can be checked by
+;; reading one line instead of a 25-step chain.
+(defn x-inv-bit [t] (if (= t 2) 0 (if (= t 4) 0 1)))
+
+(defn x-invert-step [ws t]
+  (let [sq (x-mul ws (x-s-t1) (x-s-t1) (x-s-t1))
+        mu (if (= (x-inv-bit t) 1)
+             (x-mul ws (x-s-t1) (x-s-t1) (x-s-t2))
+             0)]
+    (+ 1 (* 0 (+ sq mu)))))
+
+(defn x-invert-loop [ws t]
+  (if (< t 0) 1
+    (x-invert-loop ws (- t (+ 1 (* 0 (x-invert-step ws t)))))))
+
+(defn x-invert [ws src dst gate]
+  (let [base (x-copy ws (x-s-t2) src (* 0 gate))
+        one (x-set-one ws (x-s-t1) (* 0 base))
+        run (x-invert-loop ws (+ 254 (* 0 one)))
+        back (x-copy ws dst (x-s-t1) (* 0 run))]
+    (+ 1 (* 0 back))))
+
+;; --- canonical reduction ----------------------------------------------------
+
+;; FR := (v + 19) mod 2^255, returning the carry out of bit 255.  The invariant
+;; gives v < 2^255 + 19 < 2p, so that carry is 1 exactly when v >= p, and then
+;; FR = v + 19 - 2^255 = v - p.
+(defn x-freeze-pass [ws src i carry]
+  (if (= i 17) carry
+    (x-freeze-pass ws src (+ i 1)
+                   (x-carry-emit ws (x-s-fr) i (+ carry (x-limb ws src i))))))
+
+;; Arithmetic select, not a branch: slot[i] := v + c*(w - v).
+(defn x-freeze-select-all [ws slot i c]
+  (if (= i 17) 1
+    (x-freeze-select-all
+      ws slot
+      (+ i 1 (* 0 (x-put ws slot i
+                         (+ (x-limb ws slot i)
+                            (* c (- (x-limb ws (x-s-fr) i)
+                                    (x-limb ws slot i)))))))
+      c)))
+
+(defn x-freeze [ws slot gate]
+  (x-freeze-select-all ws slot 0
+                       (x-freeze-pass ws slot 0 (+ 19 (* 0 gate)))))
+
+;; --- decoding and encoding --------------------------------------------------
+
+;; RFC 7748 sec. 5: the most significant bit of the final byte of a u-coordinate
+;; is masked off before decoding.  Indices at or past 32 read as zero so that
+;; the three-byte window of the top limb does not run off the buffer.
+(defn x-point-byte [point i]
+  (if (>= i 32) 0
+    (if (= i 31) (bit-and (kernel-load-u8-4k point 32 31) 127)
+      (kernel-load-u8-4k point 32 i))))
+
+;; Limb j is bits [15j, 15j+15), which straddles at most three bytes.
+(defn x-decode-limb [point j]
+  (let [q (quot (* j 15) 8)
+        r (- (* j 15) (* (quot (* j 15) 8) 8))]
+    (bit-and (+ (quot (x-point-byte point q) (x-pow2 r))
+                (+ (* (x-point-byte point (+ q 1)) (x-pow2 (- 8 r)))
+                   (* (x-point-byte point (+ q 2)) (x-pow2 (- 16 r)))))
+             32767)))
+
+(defn x-decode-loop [ws point j]
+  (if (= j 17) 1
+    (x-decode-loop ws point
+                   (+ j 1 (* 0 (x-put ws (x-s-x1) j (x-decode-limb point j)))))))
+
+(defn x-decode [ws point gate]
+  (x-decode-loop ws point (* 0 gate)))
+
+;; Output byte i is bits [8i, 8i+8), which straddles at most two limbs: a third
+;; limb would start at bit 30-r >= 16, outside the eight bits being kept.
+(defn x-encode-byte [ws slot i]
+  (let [q (quot (* i 8) 15)
+        r (- (* i 8) (* (quot (* i 8) 15) 15))]
+    (bit-and (+ (quot (x-limb ws slot q) (x-pow2 r))
+                (* (x-limb-or-zero ws slot (+ q 1)) (x-pow2 (- 15 r))))
+             255)))
+
+(defn x-encode-loop [ws slot output i]
+  (if (= i 32) 1
+    (x-encode-loop ws slot output
+                   (+ i 1 (* 0 (kernel-store-u8-4k output 32 i
+                                                   (x-encode-byte ws slot i)))))))
+
+(defn x-encode [ws slot output gate]
+  (x-encode-loop ws slot output (* 0 gate)))
+
+;; RFC 7748 sec. 6.1 contributory check.  All 32 bytes are always read and
+;; folded together before anything is decided, so the scan itself is uniform;
+;; only the single aggregate comparison distinguishes the two return values,
+;; and that distinction is the public API contract.
+(defn x-or-bytes [output i acc]
+  (if (= i 32) acc
+    (x-or-bytes output (+ i 1) (bit-or acc (kernel-load-u8-4k output 32 i)))))
+
+;; --- entry ------------------------------------------------------------------
+
+;; x_2 = 1, z_2 = 0, x_3 = u, z_3 = 1.
+(defn x-init-state [ws gate]
+  (let [a (x-set-one ws (x-s-x2) (* 0 gate))
+        b (x-zero ws (x-s-z2) (* 0 a))
+        c (x-copy ws (x-s-x3) (x-s-x1) (* 0 b))
+        d (x-set-one ws (x-s-z3) (* 0 c))]
+    (+ 1 (* 0 d))))
+
+;; Each stage's result is threaded into the next stage's argument list, which
+;; is the one sequencing mechanism that does not depend on how `let` normalizes.
+;;
+;; No helper in this file is named `aiueos-x25519` -- they all carry the `x-`
+;; prefix -- so once the entry is added to kotoba-native's
+;; `kernel-object-entries` (see BUILD STATUS at the top of this file), there is
+;; exactly one symbol the packager can match, and it is this one at arity 4.
+(defn aiueos-x25519 [scalar point output workspace]
+  (let [decoded (x-decode workspace point 0)
+        started (x-init-state workspace (* 0 decoded))
+        swapped (x-ladder workspace scalar (+ 254 (* 0 started)) 0)
+        settled (x-cswap-pair workspace swapped)
+        inverted (x-invert workspace (x-s-z2) (x-s-z2) (* 0 settled))
+        product (x-mul workspace (x-s-x2) (x-s-x2) (x-s-z2))
+        frozen (x-freeze workspace (x-s-x2) (* 0 (+ inverted product)))
+        emitted (x-encode workspace (x-s-x2) output (* 0 frozen))]
+    (if (= (x-or-bytes output 0 (* 0 emitted)) 0) 0 1)))
+
+(defn main [] 0)

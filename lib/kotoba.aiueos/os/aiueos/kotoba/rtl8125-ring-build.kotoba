@@ -1,0 +1,102 @@
+(ns aiueos.rtl8125-ring-build
+  (:require [aiueos.lib.rtl8125-regs :as reg])
+  (:export [aiueos-rtl8125-ring-build main]))
+
+;; One RTL8125 DMA descriptor, built in a caller-owned region.
+;;
+;;   (aiueos-rtl8125-ring-build desc-base desc-length frame-physical kind capacity)
+;;
+;; This is the descriptor half of `rings_restart` (kernel/rtl8125.c:181-188) and
+;; the whole of `aiueos_rtl8125_rx_rearm` (:298-306). One object serves both
+;; because they write the same bytes: rearm is a ring-build of the receive
+;; descriptor, and the C only spells them separately because one of them also
+;; zeroes the status words the hardware wrote.
+;;
+;;   kind 0  transmit descriptor    kind 1  receive descriptor
+;;
+;; ZERO IS SUCCESS. 1 is AIUEOS_RTL8125_INVALID, and on that path NO STORE IS
+;; PERFORMED -- an object that refused its arguments halfway through would leave
+;; a descriptor the hardware may still own in a state neither side agrees on.
+;;
+;; THE TWO LAYOUTS ARE NOT THE SAME, which is the reason `kind` exists rather
+;; than a caller-supplied offset. From `rtl8125.h`:32-45, both are 32 bytes:
+;;
+;;   transmit                          receive
+;;     0  u32  command                   0  u64  low0    (hardware status)
+;;     4  u32  extension                 8  u64  low1    (hardware status)
+;;     8  u64  address                  16  u64  address
+;;    16  u32[4] reserved               24  u32  extension
+;;                                      28  u32  command
+;;
+;; The command word carries both flags and the length, and the flag bits sit in
+;; the top nibbles (rtl8125.c:38-45):
+;;
+;;   0x80000000 OWN   the hardware owns this descriptor
+;;   0x40000000 EOR   end of ring; with one descriptor per ring it is always set
+;;   0x20000000 SOF / 0x10000000 EOF   transmit only, set by `tx_submit`
+;;
+;; A built TRANSMIT descriptor is EOR alone: not owned, so the engine skips it
+;; until `tx-submit` sets OWN. A built RECEIVE descriptor is OWN|EOR|capacity:
+;; handed to the hardware immediately, because a receive ring with nothing in it
+;; drops every frame.
+;;
+;; THE FENCES, and why they are not where the C's are.
+;;
+;; `rings_restart` builds both descriptors and then issues one
+;; `__atomic_thread_fence(__ATOMIC_RELEASE)` (:188). `rx_rearm` issues two, one
+;; before setting OWN and one after (:302, :305). This object always does what
+;; rx_rearm does, for both kinds:
+;;
+;;   zero -> write address -> sfence -> write command -> sfence
+;;
+;; The second fence is the one that matters and the first is the one that is
+;; easy to lose: the address must be visible to the device BEFORE the OWN bit
+;; that tells it to use the address. Without the first fence a store buffer may
+;; publish OWN first and the engine DMAs a frame to whatever the address field
+;; held a moment ago, which on a restart is the previous connection's buffer.
+;;
+;; It is stricter than `rings_restart` and identical in outcome: a fence writes
+;; no memory, so the bytes this leaves behind are the bytes the C leaves behind.
+;; Being stricter on the takeover path costs two store fences per boot.
+;;
+;; ZEROING. The C's `bytes_zero(device->rx, sizeof(*device->rx))` clears the two
+;; hardware status words; `rx_rearm` does not. Doing it always is safe -- the
+;; device overwrites them as soon as OWN is set -- and makes the two paths one
+;; object. The transmit descriptor's four reserved words are cleared for the
+;; same reason the C clears them: they are reserved, so the only defensible
+;; value is zero.
+
+(defn aiueos-rtl8125-ring-build [desc-base desc-length frame-physical kind capacity]
+  (if (or (= 0 (reg/desc-ok desc-base))
+          (not (= desc-length 32))
+          (<= frame-physical 0)
+          (< kind 0)
+          (> kind 1)
+          (< capacity 1)
+          (> capacity 2048))
+    1
+    ;; Four u64 stores rather than thirty-two u8 stores: same bytes, and the
+    ;; charge is the same either way because bounded stores are inlined rather
+    ;; than counted. Written wide because a descriptor is naturally aligned to
+    ;; 256 (`desc-ok`), so every one of these is a single aligned store.
+    (let [z0 (kernel-store-u64 desc-base desc-length 0 0)]
+      (let [z1 (kernel-store-u64 desc-base desc-length 8 0)]
+        (let [z2 (kernel-store-u64 desc-base desc-length 16 0)]
+          (let [z3 (kernel-store-u64 desc-base desc-length 24 0)]
+            (if (= kind 0)
+              ;; TRANSMIT: address at 8, command at 0, RGE_DESC_EOR only.
+              (let [a (kernel-store-u64 desc-base desc-length 8 frame-physical)]
+                (let [f1 (kernel-fence-store)]
+                  (let [c (kernel-store-u32 desc-base desc-length 0 1073741824)] ; 0x40000000
+                    (let [f2 (kernel-fence-store)]
+                      0))))
+              ;; RECEIVE: address at 16, command at 28,
+              ;; RGE_DESC_OWN|RGE_DESC_EOR (0xc0000000) | capacity.
+              (let [a (kernel-store-u64 desc-base desc-length 16 frame-physical)]
+                (let [f1 (kernel-fence-store)]
+                  (let [c (kernel-store-u32 desc-base desc-length 28
+                                            (bit-or 3221225472 capacity))]
+                    (let [f2 (kernel-fence-store)]
+                      0)))))))))))
+
+(defn main [] 0)

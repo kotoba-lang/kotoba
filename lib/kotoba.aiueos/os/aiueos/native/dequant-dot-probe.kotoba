@@ -1,0 +1,315 @@
+(ns aiueos.native.dequant-dot-probe
+  ;; A TEST VARIANT of the pure-Kotoba kernel, not a second production kernel,
+  ;; and a sibling of `dot-f32-probe.kotoba` -- same boot contract, same debug
+  ;; console, same two-nibble control prefix.
+  ;;
+  ;; What it measures is `kernel-dequant-dot-q8-0`: one MC instruction that
+  ;; widens a packed Q8_0 weight row into f32 INSIDE the register file and
+  ;; folds it against an activation vector, choosing between an AVX2 sequence
+  ;; and a legacy-SSE one from a `cpuid`/`xgetbv` guard. The compiler's suites
+  ;; can assert the bytes of both arms. They cannot assert that the two
+  ;; compute the same number, because that is a claim about a machine -- and
+  ;; this workstation is an Apple M4 whose Rosetta exposes no AVX, so the
+  ;; machine has to be QEMU: `-cpu max` takes the vector arm and `-cpu qemu64`
+  ;; takes the scalar one, and the experiment is that the digits are the SAME.
+  ;;
+  ;; It also TIMES both arms, with `kernel-rdtsc` around a 128-block fold.
+  ;; TCG is not silicon and the number is not a cycle count; what it is good
+  ;; for is the RATIO between two runs of the same code on the same emulator.
+  (:export [main]))
+
+;; ---------------------------------------------------------------------------
+;; Boot-info and memory-map reading. Same shapes as `kernel.kotoba`, copied
+;; from `dot-f32-probe.kotoba` rather than shared, because that kernel is the
+;; shipping artifact and neither probe may be able to move it.
+;; ---------------------------------------------------------------------------
+
+(defn load64-boot [base offset]
+  (+ (kernel-load-u8 base 64 offset)
+     (* (kernel-load-u8 base 64 (+ offset 1)) 256)
+     (* (kernel-load-u8 base 64 (+ offset 2)) 65536)
+     (* (kernel-load-u8 base 64 (+ offset 3)) 16777216)
+     (* (kernel-load-u8 base 64 (+ offset 4)) 4294967296)
+     (* (kernel-load-u8 base 64 (+ offset 5)) 1099511627776)
+     (* (kernel-load-u8 base 64 (+ offset 6)) 281474976710656)
+     (* (kernel-load-u8 base 64 (+ offset 7)) 72057594037927936)))
+
+(defn load64 [base length offset]
+  (+ (kernel-load-u8-16k base length offset)
+     (* (kernel-load-u8-16k base length (+ offset 1)) 256)
+     (* (kernel-load-u8-16k base length (+ offset 2)) 65536)
+     (* (kernel-load-u8-16k base length (+ offset 3)) 16777216)
+     (* (kernel-load-u8-16k base length (+ offset 4)) 4294967296)
+     (* (kernel-load-u8-16k base length (+ offset 5)) 1099511627776)
+     (* (kernel-load-u8-16k base length (+ offset 6)) 281474976710656)
+     (* (kernel-load-u8-16k base length (+ offset 7)) 72057594037927936)))
+
+(defn load32 [base length offset]
+  (+ (kernel-load-u8-16k base length offset)
+     (* (kernel-load-u8-16k base length (+ offset 1)) 256)
+     (* (kernel-load-u8-16k base length (+ offset 2)) 65536)
+     (* (kernel-load-u8-16k base length (+ offset 3)) 16777216)))
+
+;; UEFI type 7 is EfiConventionalMemory, and the loader identity-maps the
+;; first GiB. Eight pages is what `dot-f32-probe` asks for; this probe asks
+;; for the same extent and uses more of it -- 4352 bytes of packed codes and
+;; 16384 bytes of activations, which is 128 blocks of Q8_0.
+(defn find-page [memory-map map-size descriptor-size offset remaining]
+  (if (or (= remaining 0)
+          (> (+ offset descriptor-size) map-size))
+    0
+    (let [memory-type (load32 memory-map map-size offset)
+          physical-start (load64 memory-map map-size (+ offset 8))
+          pages (load64 memory-map map-size (+ offset 24))]
+      (if (and (= memory-type 7)
+               (> pages 7)
+               (>= physical-start 2097152)
+               (< physical-start 1073717248)
+               (= (bit-and physical-start 4095) 0))
+        physical-start
+        (find-page memory-map map-size descriptor-size
+                   (+ offset descriptor-size) (- remaining 1))))))
+
+;; ---------------------------------------------------------------------------
+;; xsave: enabling the state the guard asks about.
+;;
+;; Three ordered steps, and every one of them faults if taken out of order.
+;; Verbatim from `dot-f32-probe.kotoba`, where the ordering is explained; it
+;; is the sequence `prepare_bsp_extended_state()` runs in C.
+;; ---------------------------------------------------------------------------
+
+(defn enable-extended-state []
+  (if (= (bit-and (kernel-cpuid-ecx 1 0) 67108864) 0)
+    0
+    (let [cr4 (kernel-write-cr4 (bit-or (kernel-read-cr4) 263680))]
+      (let [xcr0 (kernel-xsetbv 0 (bit-or (kernel-xgetbv 0) 6))]
+        1))))
+
+(defn cpu-features []
+  (let [max-leaf (kernel-cpuid-eax 0 0)
+        ecx1 (kernel-cpuid-ecx 1 0)
+        osxsave (if (= (bit-and ecx1 134217728) 0) 0 1)
+        avx (if (= (bit-and ecx1 268435456) 0) 0 1)
+        avx2 (if (< max-leaf 7)
+               0
+               (if (= (bit-and (kernel-cpuid-ebx 7 0) 32) 0) 0 1))
+        xcr-ok (if (= osxsave 0)
+                 0
+                 (if (= (bit-and (kernel-xgetbv 0) 6) 6) 1 0))]
+    (+ osxsave (* 2 avx) (* 4 avx2) (* 8 xcr-ok))))
+
+;; ---------------------------------------------------------------------------
+;; The fixture.
+;;
+;; The weights are 128 Q8_0 blocks, every one a binary16 scale of 1.0 (0x3C00)
+;; followed by thirty-two codes of 1, so every product IS its activation and
+;; the answer is a pure statement about the order of summation.
+;;
+;; The activations repeat an eight-element pattern:
+;;
+;;   [2^24, 2, 3, 4, 5, 6, 7, 8]
+;;
+;; and that pattern is not decoration. Above 2^24 the binary32 spacing is 2,
+;; so what survives an addition depends on what the accumulator already holds,
+;; and the three orders of summation this operation could plausibly use give
+;; three DIFFERENT answers for one block:
+;;
+;;   0x4C800012   four lanes, the lower half of each group before its upper,
+;;                (s0+s1)+(s2+s3)                       <- the contract
+;;   0x4C800011   the same four lanes, upper half first
+;;   0x4C800010   a straight left-to-right sum
+;;
+;; Measured 2026-09-02, and the middle one is why this pattern exists. The
+;; probe's first fixture was `[2^24, 1, 1, ... 1]`, which separates the
+;; contract from a left-to-right sum and does NOT separate it from its own
+;; upper-half-first twin: with the accumulator at zero and both halves equal,
+;; `(0+a)+b` and `(0+b)+a` are the same number. An emitter with the two
+;; `vaddps` swapped was compiled, booted and printed the expected digits.
+;;
+;; The timed folds use the same pattern, so their answers are:
+;;
+;;   8 blocks    0x4E000010      128 blocks   0x5000000F
+;;
+(defn fill-u8 [page limit offset remaining value]
+  (if (= remaining 0)
+    1
+    (let [written (kernel-store-u8-16k page limit offset value)]
+      (fill-u8 page limit (+ offset 1) (- remaining 1) value))))
+
+;; Eight words per iteration -- the repeating activation pattern above, as
+;; binary32 bit patterns. 2^24 is 0x4B800000; 2.0 through 8.0 are 0x40000000,
+;; 0x40400000, 0x40800000, 0x40A00000, 0x40C00000, 0x40E00000, 0x41000000.
+(defn fill-pattern [region limit offset remaining]
+  (if (= remaining 0)
+    1
+    (let [a (kernel-store-u32-16k region limit offset 1266679808)
+          b (kernel-store-u32-16k region limit (+ offset 4) 1073741824)
+          c (kernel-store-u32-16k region limit (+ offset 8) 1077936128)
+          d (kernel-store-u32-16k region limit (+ offset 12) 1082130432)
+          e (kernel-store-u32-16k region limit (+ offset 16) 1084227584)
+          f (kernel-store-u32-16k region limit (+ offset 20) 1086324736)
+          g (kernel-store-u32-16k region limit (+ offset 24) 1088421888)
+          h (kernel-store-u32-16k region limit (+ offset 28) 1090519040)]
+      (fill-pattern region limit (+ offset 32) (- remaining 1)))))
+
+;; The 128 block headers: a binary16 1.0 is 0x3C00, written as its two
+;; little-endian bytes. Two u8 stores rather than one u16 store because a
+;; block header lands at a 34-byte stride, and every odd-numbered one of
+;; those is an ODD address -- which the two-byte window family refuses.
+(defn fill-scales [weights offset remaining]
+  (if (= remaining 0)
+    1
+    (let [lo (kernel-store-u8-16k weights 4352 offset 0)
+          hi (kernel-store-u8-16k weights 4352 (+ offset 1) 60)]
+      (fill-scales weights (+ offset 34) (- remaining 1)))))
+
+;; `kernel-dequant-dot-q8-0` in a function of its own, because `main` calls
+;; other functions and therefore leaves the machine-IR pilot path -- and this
+;; operation lives only on that path. Both bases arrive as PARAMETERS, which
+;; is what makes the caller responsible for their provenance (kotoba-sema
+;; ADR 0006: the second base is checked at position 2, not merely position 0).
+(defn dequant-one [w-base x-base]
+  (kernel-dequant-dot-q8-0 w-base 34 x-base 128 1))
+
+;; The same operation over 8 and over 128 blocks -- 256 and 4096 elements,
+;; the second of which is one row of a realistic projection. Both are timed,
+;; and the DIFFERENCE between them is what carries information: the guard runs
+;; once per call and costs the same in both, so subtracting the small fold
+;; from the large one removes the constant and leaves 3840 elements of loop.
+;;
+;; The small fold runs FIRST, so the large one is not paying to translate the
+;; loop body it is being timed on.
+(defn dequant-small [w-base x-base]
+  (kernel-dequant-dot-q8-0 w-base 272 x-base 1024 8))
+
+(defn dequant-row [w-base x-base]
+  (kernel-dequant-dot-q8-0 w-base 4352 x-base 16384 128))
+
+(defn hex-digit [value]
+  (if (< value 10) (+ 48 value) (+ 55 value)))
+
+(defn emit-digit [value divisor]
+  (kernel-out-u8 233 (hex-digit (bit-and (quot value divisor) 15))))
+
+(defn emit-u32 [value]
+  (let [d7 (emit-digit value 268435456)
+        d6 (emit-digit value 16777216)
+        d5 (emit-digit value 1048576)
+        d4 (emit-digit value 65536)
+        d3 (emit-digit value 4096)
+        d2 (emit-digit value 256)
+        d1 (emit-digit value 16)
+        d0 (emit-digit value 1)]
+    1))
+
+;; ---------------------------------------------------------------------------
+;; The layout inside the admitted extent (32 KiB, eight pages):
+;;
+;;   0      .. 4351    128 Q8_0 blocks (34 bytes each)
+;;   8192   .. 24575   4096 binary32 activations
+;;
+;; The single-block fold reads the first 34 bytes and the first 128 bytes of
+;; activations, so the two folds share their fixture rather than needing two.
+;; ---------------------------------------------------------------------------
+
+(defn main []
+  (let [boot (kernel-boot-info)
+        map-size (load64-boot boot 24)
+        descriptor-size (load64-boot boot 32)
+        memory-map (kernel-subregion boot 16448 64 16384)]
+    (if (and (> boot 0)
+             (= (kernel-load-u8 boot 64 0) 65)
+             (= (kernel-load-u8 boot 64 1) 73)
+             (= (kernel-load-u8 boot 64 2) 85)
+             (= (kernel-load-u8 boot 64 3) 69)
+             (> descriptor-size 0)
+             (> map-size descriptor-size))
+      (let [physical-start (find-page memory-map map-size descriptor-size 0 410)]
+        (if (> physical-start 0)
+          ;; The literal parent names the loader's identity-mapped physical
+          ;; window, exactly as `kernel.kotoba` does; the offset is checked.
+          (let [arena (kernel-subregion 4096 1073737728 (- physical-start 4096) 32768)
+                ;; Both bases are CHECKED narrowings rather than `(+ arena k)`,
+                ;; which the provenance rule refuses.
+                weights (kernel-subregion arena 32768 0 4352)
+                activations (kernel-subregion arena 32768 8192 16384)
+                ;; 128 blocks, each a 0x3C00 scale then thirty-two 1s. The
+                ;; scale is written as two bytes rather than one u16 store so
+                ;; that a block header lands at 34-byte stride, which is odd:
+                ;; a two-byte store there would be unaligned.
+                scales (fill-u8 weights 4352 0 4352 1)
+                headers (fill-scales weights 0 128)
+                ;; 4096 activations: 512 copies of the eight-word pattern.
+                ones (fill-pattern activations 16384 0 512)
+                ;; Read two words back rather than trusting what a store
+                ;; LEAVES IN A REGISTER -- that is a property of the lowering
+                ;; and not of the memory.
+                check-x0 (kernel-load-u32-16k activations 16384 0)
+                check-w0 (kernel-load-u8-16k weights 4352 0)
+                check-w1 (kernel-load-u8-16k weights 4352 1)
+                ;; xsave: enable BEFORE either fold, because the guard inside
+                ;; the instruction reads CR4 and XCR0 at the moment it runs.
+                enabled (enable-extended-state)
+                sum (dequant-one weights activations)
+                ;; The timed fold, bracketed by two TSC reads. Under TCG this
+                ;; is not a cycle count; the two runs of this same code on the
+                ;; same emulator are what it is for.
+                ;; A THROWAWAY fold before either timed one. Measured
+                ;; 2026-09-02 without it, `-cpu max`: the 256-element fold
+                ;; reported 788,000 ticks and the 4096-element one 279,000 --
+                ;; the first call through a sequence pays for QEMU to
+                ;; TRANSLATE it, and that cost is larger than the whole loop.
+                ;; A difference taken across a cold call measures the
+                ;; translator, not the code.
+                warm (dequant-small weights activations)
+                small-before (kernel-rdtsc)
+                small (dequant-small weights activations)
+                small-after (kernel-rdtsc)
+                before (kernel-rdtsc)
+                row (dequant-row weights activations)
+                after (kernel-rdtsc)
+                small-elapsed (- small-after small-before)
+                elapsed (- after before)
+                enabled-digit (emit-digit enabled 1)
+                features (emit-digit (cpu-features) 1)
+                printed (emit-u32 (bit-and sum 4294967295))
+                timed-small (emit-u32 (bit-and small-elapsed 4294967295))
+                timed (emit-u32 (bit-and elapsed 4294967295))
+                m0 (kernel-out-u8 233 68)
+                m1 (kernel-out-u8 233 81)]
+            ;; One exit value per check, so a mismatch names itself rather
+            ;; than collapsing into a single "something was wrong". QEMU's
+            ;; isa-debug-exit reports (value << 1) | 1, so 16 -> 33.
+            (kernel-out-u32 244
+                            (if (and (= check-x0 1266679808)
+                                     (= check-w0 0)
+                                     (= check-w1 60))
+                              (if (= scales 1)
+                                (if (= headers 1)
+                                  (if (= ones 1)
+                                    (if (and (= printed 1) (= timed 1)
+                                             (= timed-small 1))
+                                      (if (and (= m0 68) (= m1 81)
+                                               (> features 47)
+                                               (< features 71)
+                                               (> enabled-digit 47)
+                                               (< enabled-digit 50)
+                                               ;; Both timed folds must have
+                                               ;; taken a positive amount of
+                                               ;; time, or the difference the
+                                               ;; smoke takes measures nothing.
+                                               (> elapsed 0)
+                                               (> small-elapsed 0)
+                                               ;; 8 blocks and 128 blocks
+                                               ;; under the same pattern.
+                                               (= small 1308622864)
+                                               (= warm 1308622864)
+                                               (= row 1342177295))
+                                        16 25)
+                                      24)
+                                    23)
+                                  22)
+                                21)
+                              20)))
+          (kernel-out-u32 244 18)))
+      (kernel-out-u32 244 19))))

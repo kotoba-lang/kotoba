@@ -1,0 +1,294 @@
+;; Gate N2 host-side integration scaffold (ADR-0134, branch n2-design-only).
+;;
+;; The kernel's reassembly will import `tcp.seq-core` and
+;; `tcp.reassemble-core` from kotoba-lang/org-ietf-tcp — the same objects,
+;; at the same commit the `:test` alias pins (d8c15e23b6c169a4ed044cd7764923
+;; ecbb789be4) — and the runtime profile's correctness rests on three
+;; properties the ADR names:
+;;
+;;   P1  out-of-order segments are ordered by FORWARD DISTANCE from rcv-nxt,
+;;       not by raw sequence number — across the 2^32 wrap the raw numbers
+;;       sort backwards;
+;;   P2  the held-queue bound is charged on what STAYS HELD, not on what
+;;       arrives — in-order data is delivered and never occupies the queue;
+;;   P3  delivery is contiguous: bytes leave in stream order in one delivered
+;;       run per accept, and rcv-nxt advances across the wrap.
+;;
+;; This file drives the pinned kotoba objects through the KIR interpreter —
+;; the same route the kernel's objects will take — and requires them to agree
+;; with the `tcp.reassemble` reference on the SAME fixtures the org-ietf-tcp
+;; parity suite uses: points straddling the wrap (0, 4294967286, 4294967295,
+;; the 2^31 antipode), lengths 0/1/10/100, and max-bytes at and around the
+;; bound. A uniform sample of a 2^32 space lands on none of the values where
+;; this namespace has historically gone wrong (reassemble_core.kotoba's own
+;; header documents two such bugs).
+;;
+;; This is a skeleton by design: the kernel source is NOT modified on this
+;; branch. What is pinned here is the contract the import integration (see
+;; scripts/k16-n2-import-integration-sketch.patch) must satisfy before
+;; `native/tcp-stream.kotoba` links the cores.
+
+(ns ^:ci-anon aiueos.tcp-stream-integration-test
+  (:require [clojure.java.io :as io]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is]]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]
+            [tcp.seq :as s]
+            [tcp.reassemble :as ra]))
+
+(def ^:private pinned-commit "d8c15e23b6c169a4ed044cd7764923ecbb789be4")
+
+(defn- tcp-source-root
+  "Directory holding `tcp/seq_core.kotoba` and `tcp/reassemble_core.kotoba`.
+  First existing candidate wins:
+    1. $AIUEOS_ORG_IETF_TCP_SOURCE_PATH — an exact checkout, the same
+       discipline as the four AIUEOS_*_SOURCE_PATH variables the native build
+       uses (ADR-2609031030: temporary paths must not be assumed to exist);
+    2. a sibling checkout org-ietf-tcp/kotoba, where the native build
+       script's default resolves the same commit;
+    3. the gitlibs cache the :test alias itself materializes for the pinned
+       commit — usable wherever `kbb -M:test` has already resolved deps."
+  []
+  (letfn [(kotoba-dir [root] (io/file root "tcp"))]
+    (or (when-let [env (System/getenv "AIUEOS_ORG_IETF_TCP_SOURCE_PATH")]
+          (let [d (kotoba-dir (io/file env))]
+            (when (.isDirectory d) d)))
+        (let [d (kotoba-dir (io/file ".." "org-ietf-tcp" "kotoba"))]
+          (when (.isDirectory d) d))
+        (let [d (kotoba-dir (io/file (System/getProperty "user.home")
+                                     ".gitlibs" "libs" "io.github.kotoba-lang"
+                                     "org-ietf-tcp" pinned-commit "kotoba"))]
+          (when (.isDirectory d) d)))))
+
+(defn- source-available?
+  "Fails rather than skips. A `when`-guard here reports green on a checkout
+  without the objects, which is a skip wearing a pass."
+  []
+  (let [root (tcp-source-root)]
+    (is (some? root)
+        (str "org-ietf-tcp kotoba sources not found; set "
+             "AIUEOS_ORG_IETF_TCP_SOURCE_PATH to a checkout at " pinned-commit))
+    (is (and root (.exists (io/file root "seq_core.kotoba"))
+             (.exists (io/file root "reassemble_core.kotoba")))
+        "tcp/seq_core.kotoba and tcp/reassemble_core.kotoba must both exist")
+    (some? root)))
+
+(def ^:private kir
+  "The closed two-module graph, compiled the way the native kernel's closed
+  linkage compiles it: no ambient lookup, the require edges stated."
+  (delay (:kir (compiler/compile-project
+                {'tcp.seq-core (slurp (io/file (tcp-source-root) "seq_core.kotoba"))
+                 'tcp.reassemble-core (slurp (io/file (tcp-source-root) "reassemble_core.kotoba"))}
+                'tcp.reassemble-core :wasm32-kotoba-v1 {}))))
+
+(def ^:private seq-kir
+  "seq-core alone. Only the ROOT namespace's exports are executable in one
+  KIR, so the envelope arithmetic (segment-end, acceptable?, wrap) needs its
+  own compilation rooted there."
+  (delay (:kir (compiler/compile-source
+                (slurp (io/file (tcp-source-root) "seq_core.kotoba"))
+                :wasm32-kotoba-v1 {}))))
+
+(defn- call [f & args] (ir/execute @kir f (vec args)))
+(defn- call-seq [f & args] (ir/execute @seq-kir f (vec args)))
+
+;; ── fixtures: the same points/lengths the org-ietf-tcp parity suite uses ──
+
+(defn- sg [seq* len] {:seq seq* :data (vec (repeat len 0))})
+
+(def ^:private points
+  "Around zero and around the wrap, where the forward-distance bug lives."
+  [0 1 100 1000 2147483647 2147483648 4294967286 4294967295])
+(def ^:private lens [0 1 10 100])
+(def ^:private max-bytes-cases [100 65535])
+
+;; ── presence ──────────────────────────────────────────────────────────────
+
+(deftest kotoba-objects-are-present
+  (source-available?))
+
+;; ── P1: ordering is by forward distance from rcv-nxt, across the wrap ─────
+
+(deftest held-order-key-is-the-forward-distance
+  (when (source-available?)
+    (doseq [p points, rcv-nxt points]
+      (is (= (s/-seq p rcv-nxt) (call 'held-order-key p rcv-nxt))
+          (str "held-order-key " p " rcv-nxt " rcv-nxt
+               " -- ordering by raw sequence number sorts backwards across "
+               "the wrap; the forward distance is what the held queue sorts "
+               "by")))))
+
+(deftest out-of-order-arrivals-across-the-wrap-are-held-then-delivered
+  (when (source-available?)
+    ;; rcv-nxt at 2^32-10, the exact shape that produced the first bug: a
+    ;; segment whose raw sequence (0) is numerically BELOW rcv-nxt but is the
+    ;; next data the stream needs.
+    (let [rcv-nxt 4294967286
+          r (ra/reassembler {:rcv-nxt rcv-nxt :max-bytes 65535})
+          first-arrival (ra/accept r (sg rcv-nxt 10))]
+      (is (nil? (:dropped first-arrival)) "the in-order piece is delivered")
+      (is (= 10 (count (:delivered first-arrival))))
+      (is (= 0 (s/wrap (get-in first-arrival [:reassembler :tcp.ra/rcv-nxt])))
+          "rcv-nxt wrapped past 2^32")
+      (let [second-arrival (ra/accept (:reassembler first-arrival) (sg 0 10))]
+        (is (nil? (:dropped second-arrival))
+            "the post-wrap segment is NOT a duplicate and NOT discarded: the
+            forward distance (~2^32) read as a byte count drops every
+            out-of-order arrival -- the case this core exists for")
+        (is (= 10 (count (:delivered second-arrival))))
+        (is (empty? (get-in second-arrival [:reassembler :tcp.ra/held]))
+            "nothing stays held: the gap was exactly the wrapped piece")
+        (is (= 10 (get-in second-arrival [:reassembler :tcp.ra/rcv-nxt])))
+        ;; and the arithmetic that steered it: the key for the wrapped piece
+        ;; is 10, not nearly 2^32.
+        (is (= 10 (call 'held-order-key 0 rcv-nxt))
+            "forward distance from rcv-nxt to seq 0 across the wrap is 10")))))
+
+(deftest held-queue-stays-sorted-by-forward-distance
+  (when (source-available?)
+    ;; Two out-of-order arrivals above rcv-nxt: the reference keeps them
+    ;; sorted by forward distance, so the FIRST held entry is the one the
+    ;; next in-order advance will join -- not the numerically smallest.
+    (let [r (ra/reassembler {:rcv-nxt 1000 :max-bytes 65535})
+          a (ra/accept r (sg 1010 10))
+          b (ra/accept (:reassembler a) (sg 1020 10))
+          held (get-in b [:reassembler :tcp.ra/held])]
+      (is (empty? (:delivered a)) "first out-of-order piece delivers nothing")
+      (is (empty? (:delivered b)) "nothing is delivered while the gap at 1000 remains")
+      (is (= :duplicate (:dropped (ra/accept (:reassembler b) (sg 1020 10))))
+          "a re-send of a held segment is refused without duplicating it")
+      (is (= [1010 1020] (mapv :seq held))
+          "held entries sit in forward-distance order")
+      (is (= 20 (get-in b [:reassembler :tcp.ra/held-bytes])))
+      ;; the near-2^32 guard: neither piece reads as a skip
+      (is (= 0 (call 'trim-skip 1000 1010))
+          "a segment starting AFTER `at` skips nothing")
+      (is (= 0 (call 'trim-skip 1000 1000))
+          "a segment starting AT rcv-nxt skips nothing -- its bytes are all
+          at or above `at`; skip counts only what lies below"))))
+
+;; ── P2: the bound is on what stays HELD, not on what arrives ──────────────
+
+(deftest queue-bound-refuses-only-what-stays-held
+  (when (source-available?)
+    (doseq [max-bytes max-bytes-cases]
+      ;; the object's own boundary, at and around the bound
+      (is (false? (call 'queue-full? 0 max-bytes))
+          "nothing held means the queue is not full")
+      (is (true? (call 'queue-full? (inc max-bytes) max-bytes))
+          "held above the bound is full")
+      (is (false? (call 'queue-full? max-bytes max-bytes))
+          "exactly at the bound is NOT full: a `>=` here would refuse a
+          boundary case the reference accepts, and nothing else in this
+          suite would notice"))
+    (doseq [max-bytes max-bytes-cases
+            len [max-bytes (inc max-bytes) (* 2 max-bytes)]]
+      ;; a large perfectly IN-ORDER segment is delivered and never occupies
+      ;; the queue: charging arrivals would refuse it
+      (let [r (ra/reassembler {:rcv-nxt 1000 :max-bytes max-bytes})
+            {:keys [dropped delivered]} (ra/accept r (sg 1000 len))]
+        (is (nil? dropped)
+            (str "in-order segment of " len " with max " max-bytes
+                 " must not be refused -- it never occupies the queue"))
+        (is (= len (count delivered)) "all of it is delivered")))
+    (doseq [max-bytes max-bytes-cases]
+      ;; out-of-order data beyond the bound is refused WHOLE
+      (let [r (ra/reassembler {:rcv-nxt 1000 :max-bytes max-bytes})
+            {:keys [dropped delivered]} (ra/accept r (sg 2000 (inc max-bytes)))]
+        (is (= :queue-full dropped)
+            (str "out-of-order " (inc max-bytes) " with max " max-bytes))
+        (is (empty? delivered) "a refused segment delivers nothing")))
+    ;; the KIR arithmetic agrees with the reference's accept verdict at the
+    ;; boundary shapes
+    (doseq [max-bytes max-bytes-cases
+            held [0 max-bytes (inc max-bytes)]]
+      (is (= (> held max-bytes)
+             (boolean (call 'queue-full? held max-bytes)))
+          (str "queue-full? " held "/" max-bytes
+               " agrees with the reference's refusal boundary")))))
+
+;; ── P3: delivery is contiguous, and rcv-nxt advances across the wrap ──────
+
+(deftest gap-fill-delivers-one-contiguous-run
+  (when (source-available?)
+    (let [r (ra/reassembler {:rcv-nxt 1000 :max-bytes 65535})
+          first (ra/accept r (sg 1000 10))
+          second (ra/accept (:reassembler first) (sg 1010 10))
+          third (ra/accept (:reassembler second) (sg 1020 10))]
+      (is (= 10 (count (:delivered first))))
+      (is (= 10 (count (:delivered second))) "each accept advances one run")
+      (is (= 10 (count (:delivered third))))
+      (is (= 30 (reduce + 0 (map count
+                                [(:delivered first) (:delivered second)
+                                 (:delivered third)]))))
+      (is (= 1030 (get-in third [:reassembler :tcp.ra/rcv-nxt]))
+          "rcv-nxt advanced over everything delivered")
+      (is (empty? (get-in third [:reassembler :tcp.ra/held]))
+          "a fully joined stream holds nothing"))
+    ;; arrival order must not change the delivered byte stream: the gap-first
+    ;; order and the in-order order deliver the same bytes
+    (let [walk (fn [r sgs]
+                 (reduce (fn [acc sg]
+                           (let [res (ra/accept (:reassembler acc) sg)]
+                             (-> acc
+                                 (update :bytes into (:delivered res))
+                                 (assoc :reassembler (:reassembler res)))))
+                         {:reassembler r :bytes []} sgs))
+          in-order (ra/reassembler {:rcv-nxt 1000 :max-bytes 65535})
+          gap-first (ra/reassembler {:rcv-nxt 1000 :max-bytes 65535})
+          a (:bytes (walk in-order [(sg 1000 10) (sg 1010 10) (sg 1020 10)]))
+          b (:bytes (walk gap-first [(sg 1010 10) (sg 1020 10) (sg 1000 10)]))]
+      (is (= a b) "delivered bytes are order-independent")
+      (is (= 30 (count a))))
+    ;; contiguity across the wrap, decided by the object's own predicate
+    (is (true? (boolean (call 'contiguous? 4294967295 4294967295)))
+        "a held range starting exactly at rcv-nxt is contiguous")
+    (is (= 24 (call 'seg-end 4294967290 30))
+        "seg-end wraps: 2^32-6 + 30 lands at 24, not at 2^32+30")))
+
+(deftest delivery-crossing-the-wrap-advances-rcv-nxt-past-zero
+  (when (source-available?)
+    (let [rcv-nxt 4294967286
+          r (ra/reassembler {:rcv-nxt rcv-nxt :max-bytes 65535})
+          a (ra/accept r (sg 4294967286 10))
+          b (ra/accept (:reassembler a) (sg 0 10))
+          c (ra/accept (:reassembler b) (sg 10 10))]
+      (is (nil? (:dropped a)) "the at-rcv-nxt piece is accepted")
+      (is (nil? (:dropped b)) "the wrapped piece is accepted")
+      (is (nil? (:dropped c)) "the last piece is accepted")
+      (is (= 30 (reduce + 0 (map count
+                                [(:delivered a) (:delivered b) (:delivered c)])))
+          "all 30 bytes leave contiguously despite the wrap")
+      (is (= 20 (get-in c [:reassembler :tcp.ra/rcv-nxt]))
+          "rcv-nxt is 2^32-10 + 30 wrapped = 20")
+      (is (empty? (get-in c [:reassembler :tcp.ra/held])))
+      ;; and the object's own arithmetic predicted the same end
+      (is (= 20 (call 'seg-end rcv-nxt 30))
+          "the kernel-side end computation matches the delivered advance"))))
+
+;; ── the segment envelope the reassembler sits behind (seq-core) ───────────
+
+(deftest seq-core-window-and-end-arithmetic-hold
+  (when (source-available?)
+    ;; The reassembler only ever sees in-window segments: admission is
+    ;; seq-core's acceptable?, and FIN/SYN each occupy one sequence number --
+    ;; the off-by-one ADR-0134 section 4 names.
+    (is (= 110 (call-seq 'segment-end 100 10 false false))
+        "data end is seq + len")
+    (is (= 111 (call-seq 'segment-end 100 10 false true))
+        "FIN occupies the sequence number after the data")
+    (is (= 111 (call-seq 'segment-end 100 10 true false))
+        "SYN occupies the sequence number before the data")
+    (is (= 112 (call-seq 'segment-end 100 10 true true))
+        "SYN and FIN each take one")
+    (is (true? (boolean (call-seq 'acceptable? 1000 10 1000 100)))
+        "an in-window segment is admitted")
+    (is (false? (boolean (call-seq 'acceptable? 1200 10 1000 100)))
+        "an out-of-window segment is refused before reassembly sees it")
+    (is (false? (boolean (call-seq 'acceptable? 1000 10 1000 0)))
+        "a zero window admits no data")
+    (doseq [p points]
+      (is (= p (call-seq 'wrap p)) "wrap is identity inside the range")
+      (is (= (s/wrap p) (call-seq 'wrap p))
+          (str "wrap " p " agrees with the reference")))))

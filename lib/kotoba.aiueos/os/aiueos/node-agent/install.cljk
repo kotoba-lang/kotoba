@@ -1,0 +1,215 @@
+#!/usr/bin/env kbb
+;; Make this machine a murakumo node, on a Linux that already boots.
+;;
+;; The bespoke initramfs this replaces spent its time on hardware the
+;; distributions solved years ago: an RTL8125 whose optional firmware does not
+;; exist upstream at all, an ACPI table the BIOS gets wrong, a UEFI that would
+;; not start a hand-built UKI. None of that is the product. A machine that
+;; already boots Linux is the shortest line to a node.
+;;
+;; So this installs onto whatever is running: unpack beside a runtime, put the
+;; key somewhere that survives a reboot, and let the init system own the
+;; restarting. It is deliberately distribution-shaped -- systemd unit, /opt,
+;; /var/lib -- because the point of standing on a distribution is to use its
+;; answers rather than to carry your own.
+;;
+;; Run it with the runtime the bundle carries, so it works before any package
+;; is installed:
+;;
+;;   ./node-linux-x64 nbb-bundle/node_modules/nbb/cli.js install.cljk \
+;;     --endpoint https://murakumo.cloud [--prefix /opt/aiueos-node] [--dry-run]
+
+(require '[kotoba.lang.text :as str]
+         '["node:fs" :as fs]
+         '["node:path" :as path]
+         '["node:child_process" :as cp])
+
+(def argv (vec *command-line-args*))
+(defn- opt [f d] (let [i (.indexOf argv f)] (if (neg? i) d (nth argv (inc i)))))
+(defn- flag? [f] (not (neg? (.indexOf argv f))))
+
+(def prefix-rel (opt "--prefix" "/opt/aiueos-node"))
+(def state-rel (opt "--state" "/var/lib/aiueos-node"))
+(def endpoint (str/replace (opt "--endpoint" "https://murakumo.cloud") #"/+$" ""))
+(def interval (opt "--interval" "60"))
+(def dry-run? (flag? "--dry-run"))
+;; Installing INTO a target filesystem that is not running: the case an
+;; autoinstall late-command is. systemd is not up in a curtin chroot, so the
+;; unit is enabled offline (`systemctl --root`) and not started -- and the
+;; marker says which of the two happened, because "enabled" and "running" are
+;; different claims and only one of them means the node is answering.
+(def target-root (opt "--root" nil))
+(def offline? (some? target-root))
+(defn- under [& parts] (apply path/join (if offline? (cons target-root parts) parts)))
+(def here (js/process.cwd))
+
+(defn- say [& parts] (println (str "aiueos-node-install: " (str/join " " parts))))
+
+(defn- die! [code & parts]
+  (binding [*print-fn* #(.error js/console %)] (apply say parts))
+  (js/process.exit code))
+
+;; ── what this machine is ──────────────────────────────────────────────────
+;;
+;; Refused rather than guessed: an installer that quietly does the wrong thing
+;; on an unexpected init system is worse than one that says it will not.
+
+(def has-systemd? (fs/existsSync "/run/systemd/system"))
+(def unit-dir "/etc/systemd/system")
+
+(def prefix (under prefix-rel))
+(def state-dir (under state-rel))
+(def unit-dir* (under unit-dir))
+
+(def blocker
+  (cond
+    (not= "linux" (.-platform js/process))
+    (str "this installs a systemd service; the platform here is " (.-platform js/process))
+    ;; Offline installs are the one case where a missing /run/systemd is
+    ;; expected rather than disqualifying: the target is not running yet.
+    (and (not offline?) (not has-systemd?))
+    "no systemd (/run/systemd/system is absent) -- the unit would sit there doing nothing and look installed"
+    (and offline? (not (fs/existsSync target-root)))
+    (str "--root " target-root " does not exist")))
+
+;; A dry run is an INSPECTION, so it answers even where the install would be
+;; refused: refusing to say what you would do is not the same as refusing to
+;; do it, and a bundle you cannot inspect off the target is one you have to
+;; run to understand.
+(when (and dry-run? blocker)
+  (say "would refuse here:" blocker)
+  (say "plan:" (str/join ", " ["node-boot.cljk" "device-attest-agent.cljk"
+                               "cp/" "nbb-bundle/" "node-linux-x64"])
+       "->" prefix "; key and config ->" state-dir
+       "; units -> " unit-dir)
+  (js/process.exit 0))
+
+(when blocker (die! 2 blocker "Nothing was written."))
+
+;; ── the unit ──────────────────────────────────────────────────────────────
+;;
+;; Restart=always with a delay rather than a timer: the agent's own exit codes
+;; already separate "nothing to prove" from "could not reach the plane" from
+;; "the plane refused my signature", and a service that restarts through the
+;; first two and stops on the third is that distinction expressed to the init
+;; system. RestartPreventExitStatus is the one the agent means as final.
+
+(def unit
+  (str "[Unit]\n"
+       "Description=aiueos murakumo node agent\n"
+       "Documentation=https://github.com/kotoba-lang/aiueos\n"
+       "After=network-online.target\n"
+       "Wants=network-online.target\n"
+       "\n[Service]\n"
+       "Type=oneshot\n"
+       "WorkingDirectory=" prefix-rel "\n"
+       "Environment=AIUEOS_NODE_STATE_DIR=" state-rel "\n"
+       "Environment=AIUEOS_NODE_BUNDLE=" prefix-rel "\n"
+       "ExecStart=" prefix-rel "/node-linux-x64 "
+       prefix-rel "/nbb-bundle/node_modules/nbb/cli.js --classpath " prefix-rel "/cp "
+       prefix-rel "/node-boot.cljk " state-rel "/node.json\n"
+       ;; 1 is `rejected`: the plane read a signature this machine produced and
+       ;; refused it. Retrying cannot fix a key, and a service that kept trying
+       ;; would turn a key fault into a quiet busy wait.
+       "RestartPreventExitStatus=1\n"
+       "Restart=on-failure\n"
+       "RestartSec=" interval "\n"
+       "\n[Install]\n"
+       "WantedBy=multi-user.target\n"))
+
+(def timer
+  (str "[Unit]\n"
+       "Description=re-check whether this node has a challenge to answer\n"
+       "\n[Timer]\n"
+       "OnBootSec=30\n"
+       "OnUnitInactiveSec=" interval "\n"
+       "\n[Install]\n"
+       "WantedBy=timers.target\n"))
+
+(def node-config
+  ;; `attempts` is 1, not 3, and the reason is the console's own clock.
+  ;;
+  ;; Each run polls for a challenge `attempts` times at `intervalSeconds`, and
+  ;; only then reports its heartbeat -- so three attempts made one cycle about
+  ;; 252 s while `cloud-murakumo.devices/default-thresholds` calls a device
+  ;; stale at 180 s. Measured 2026-09-10: the box was working perfectly and the
+  ;; console showed it degraded, for ever. With one attempt the cycle is ~81 s.
+  ;;
+  ;; Nothing is lost by polling once: the systemd timer already provides the
+  ;; repetition, so three attempts inside a run was the same question asked
+  ;; three times before answering the other one.
+  (str (js/JSON.stringify
+        (clj->js {"schema" "aiueos.node-config.v1"
+                  "endpoint" endpoint
+                  "intervalSeconds" (js/parseInt interval 10)
+                  "attempts" 1})
+        nil 2)
+       "\n"))
+
+;; ── copy ──────────────────────────────────────────────────────────────────
+
+(def payload
+  ["node-boot.cljk" "device-attest-agent.cljk" "node-linux-x64" "cp" "nbb-bundle" "bin"])
+
+(defn- copy! [name]
+  (let [src (path/join here name) dst (path/join prefix name)]
+    (when-not (fs/existsSync src)
+      (die! 2 "the bundle is missing" name "-- run this from inside the unpacked bundle"))
+    (fs/rmSync dst #js {:recursive true :force true})
+    (fs/cpSync src dst #js {:recursive true})
+    (say "installed" dst)))
+
+(defn- run! [& args]
+  (let [r (.spawnSync cp (first args) (clj->js (rest args)) #js {:encoding "utf8"})]
+    (when-not (zero? (.-status r))
+      (die! 2 (str/join " " args) "failed:" (str/trim (str (.-stderr r)))))
+    (str (.-stdout r))))
+
+(say "endpoint" endpoint)
+(say "prefix" prefix "state" state-dir)
+
+(when dry-run?
+  (say "dry run: nothing written. Would install"
+       (str/join ", " payload) "and aiueos-node.service/.timer")
+  (js/process.exit 0))
+
+(fs/mkdirSync prefix #js {:recursive true})
+(fs/mkdirSync state-dir #js {:recursive true :mode 0700})
+(doseq [n payload] (copy! n))
+(.chmodSync fs (path/join prefix "node-linux-x64") 0755)
+
+;; The config lives with the STATE, not with the code: reinstalling the agent
+;; must not silently repoint a node at a different control plane.
+(let [cfg (path/join state-dir "node.json")]
+  (if (fs/existsSync cfg)
+    (say "keeping the existing" cfg "-- reinstalling must not repoint a node")
+    (do (fs/writeFileSync cfg node-config) (say "wrote" cfg))))
+
+(fs/mkdirSync unit-dir* #js {:recursive true})
+(fs/writeFileSync (path/join unit-dir* "aiueos-node.service") unit)
+(fs/writeFileSync (path/join unit-dir* "aiueos-node.timer") timer)
+(say "wrote" (str unit-dir* "/aiueos-node.service") "and .timer")
+
+(if offline?
+  (do (run! "systemctl" (str "--root=" target-root) "enable" "aiueos-node.timer")
+      (say "AIUEOS_NODE_AGENT_ENABLED_OFFLINE" target-root)
+      (say "not started: this target is not running. It answers on its first boot.")
+      (say "AIUEOS_NODE_AGENT_INSTALLED")
+      (js/process.exit 0))
+  (do (run! "systemctl" "daemon-reload")
+      (run! "systemctl" "enable" "aiueos-node.timer")
+      (say "enabled aiueos-node.timer")))
+
+;; Run it once now, so the install ends with an ANSWER rather than a promise.
+;; A unit that is enabled and has never run is indistinguishable from one that
+;; runs and fails.
+(let [r (.spawnSync cp "systemctl" #js ["start" "aiueos-node.service"]
+                    #js {:encoding "utf8"})
+      status (str/trim (str (:out (try {:out (run! "systemctl" "is-active" "aiueos-node.service")}
+                                       (catch :default _ {:out "failed"})))))]
+  (say "first run exited" (or (.-status r) "?") "unit is" status)
+  (say "what it decided:")
+  (print (try (run! "journalctl" "-u" "aiueos-node.service" "-n" "20" "--no-pager")
+              (catch :default _ "(journalctl unavailable)"))))
+
+(say "AIUEOS_NODE_AGENT_INSTALLED")

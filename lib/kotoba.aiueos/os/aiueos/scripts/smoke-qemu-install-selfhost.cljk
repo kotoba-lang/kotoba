@@ -1,0 +1,566 @@
+#!/usr/bin/env kbb
+;; The selfhost install USB under QEMU (Linear JUN-70, gate I6 shape):
+;; boot the selfhost stick in a VM on this host, answer the guided console
+;; as a person would, install to a blank NVMe, and verify the written
+;; extent. One command:
+;;
+;;   kbb --backend sci scripts/run-task.cljk install-smoke-selfhost
+;;
+;;   boot 1  selfhost USB (readonly) + blank 8 GB NVMe
+;;           -> guided console answered from this script
+;;           -> dd writes the release image, readback verified piecewise
+;;           -> AIUEOS_LIVE_EXIT rc=0
+;;   then    the NVMe's first 64 MiB is compared with the release image
+;;
+;; The console is driven PROMPT-BY-PROMPT: each answer is written to
+;; QEMU's stdin only after its prompt appears in the serial log. A pipe
+;; fed before boot is lost in the UART FIFO (measured 2026-10-19) -- that
+;; is the one difference from a person typing at the machine.
+;;
+;; Environment: AIUEOS_OUT (default build/aiueos) must hold the release
+;; image + receipt and live/uki.efi, and selfhost/ must hold the three
+;; stick ELFs, built with the /run/aiueos-installer spawn grants:
+;;   guided-core.elf  install-live.elf  install-disk.elf
+;; Hints name the commands when something is missing. OVMF_CODE / OVMF_VARS
+;; override the firmware paths.
+
+(require '[kotoba.lang.text :as str])
+
+(def fs (js/require "node:fs"))
+(def path (js/require "node:path"))
+(def cp (js/require "node:child_process"))
+(def crypto (js/require "node:crypto"))
+
+(def aiueos (.resolve path (.dirname path *file*) ".."))
+(def repo (.resolve path aiueos ".." ".."))
+(def out (or (.-AIUEOS_OUT js/process.env) (.join path repo "build" "aiueos")))
+(def gate-dir (.join path out "install-gate" "selfhost"))
+(def release-image (.join path out "aiueos-x86_64-gpt.img"))
+(def release-receipt (.join path out "aiueos-x86_64-build-receipt.json"))
+(def data-img (.join path out "aiueos-x86_64-data.img"))
+(def uki (.join path out "live" "uki.efi"))
+(def elf-dir (.join path out "selfhost"))
+(def stick (.join path gate-dir "stick.img"))
+(def nvme-img (.join path gate-dir "nvme.img"))
+(def serial-log (.join path gate-dir "serial.log"))
+(def qemu (or (.-QEMU_SYSTEM_X86_64 js/process.env) "qemu-system-x86_64"))
+
+;; The synthetic console person. The phrase names the ONE disk the probe
+;; must offer (the QEMU NVMe); if the probe offers anything else the
+;; AIUEOS_LIVE_TARGET assertion below fails by name.
+(def console-answers
+  [["Network policy for the installed machine" ""]
+   ["Disk to erase (number)" "1"]
+   ["Bind the intent to this disk serial digest" "y"]
+   ["Accept this match" "y"]
+   ["Hostname of the installed machine" ""]
+   ["Machine model, for the receipt" ""]
+   ["OpenSSH public key that may log in" "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBl6g2nUJZaNJMvqfLqBFiTPF9rWjXq/DB4XzJZq5j5j"]
+   ["Principal that key logs in as" ""]
+   ["Repeat the hostname to confirm the erase" "aiueos"]
+   ["phrase: " "ERASE /dev/nvme0n1 FOR AIUEOS"]])
+
+(def required-markers
+  ["AIUEOS_LIVE_HANDOVER guided-core.elf"
+   "AIUEOS_GUIDED_ANSWERS_WRITTEN"
+   "AIUEOS_LIVE_TARGET /dev/nvme0n1"
+   "AIUEOS_INSTALL_WRITE_OK bytes="
+   "AIUEOS_INSTALL_READBACK_OK"
+   "AIUEOS_LIVE_EXIT rc=0"])
+
+(defn- run [cmd args opts]
+  (let [r (.spawnSync cp cmd (to-array args)
+                      (clj->js (merge {:encoding "utf8" :shell false} opts)))]
+    {:status (or (.-status r) 1) :out (or (.-stdout r) "") :err (or (.-stderr r) "")}))
+
+(defn- sha256-file [p]
+  (let [fd (.openSync fs p "r")
+        chunk (js/Buffer.alloc (* 4 1024 1024))
+        h (.createHash crypto "sha256")]
+    (try
+      (loop []
+        (let [got (.readSync fs fd chunk 0 (.-length chunk))]
+          (when (pos? got)
+            (.update h (.subarray chunk 0 got))
+            (recur))))
+      (finally (.closeSync fs fd)))
+    (.digest h "hex")))
+
+(defn- sha256-range [p bytes]
+  (let [fd (.openSync fs p "r")
+        chunk (js/Buffer.alloc (* 4 1024 1024))
+        h (.createHash crypto "sha256")]
+    (try
+      (loop [remaining bytes]
+        (when (pos? remaining)
+          (let [want (min remaining (.-length chunk))
+                got (.readSync fs fd chunk 0 want)]
+            (when (pos? got)
+              (.update h (.subarray chunk 0 got))
+              (recur (- remaining got))))))
+      (finally (.closeSync fs fd)))
+    (.digest h "hex")))
+
+;; ------------------------------------------------------------ prerequisites
+
+(def serial-buf (atom ""))
+(def child (atom nil))
+(def child-closed (atom nil))
+
+(defn- die [& msg]
+  (binding [*out* *err*] (apply println (cons "error:" msg)))
+  ;; reap the qemu child first: an orphan wedges once its stdout pipe
+  ;; fills (measured 2026-10-20 -- the guest froze mid-demo after the gate
+  ;; died and the pipe stopped draining)
+  (when-let [c @child] (.kill c))
+  (.exit js/process 1))
+
+
+;; The image is rebuilt EVERY run: skipping on existence meant kernel
+;; changes never reached the boots (measured 2026-10-20: the palette edit
+;; and the loader ABI change were both invisible in green runs).
+(let [r (run "sh" ["os/aiueos/scripts/build-release-image.sh"] {})]
+  (when-not (zero? (:status r)) (die "build-release-image failed:" (:err r))))
+(doseq [[p hint] [[release-image "run os/aiueos/scripts/build-release-image.sh"]
+                  [release-receipt "run os/aiueos/scripts/build-release-image.sh"]
+                  [uki "run make-live-installer.py build --output-dir build/aiueos/live"]
+                  [data-img "run os/aiueos/scripts/build-release-image.sh"]
+                  [(.join path elf-dir "guided-core.elf") "amu compile os/aiueos/installer/kotoba/guided-core.kotoba --target x86_64-linux-static --jvm-free --policy os/aiueos/installer/kotoba/guided-core-stick-policy.edn"]
+                  [(.join path elf-dir "install-live.elf") "amu compile os/aiueos/installer/kotoba/install-live.kotoba --target x86_64-linux-static --jvm-free --policy os/aiueos/installer/kotoba/install-live-stick-policy.edn"]
+                  [(.join path elf-dir "install-disk.elf") "amu compile os/aiueos/installer/kotoba/install-disk.kotoba --target x86_64-linux-static --jvm-free --policy os/aiueos/installer/kotoba/install-disk-stick-policy.edn"]]]
+  (when-not (.existsSync fs p)
+    (die "missing prerequisite:" p "\nhint:" hint)))
+
+(def ovmf
+  (or (.-OVMF_CODE js/process.env)
+      (some #(when (.existsSync fs %) %)
+            ["/opt/homebrew/share/qemu/edk2-x86_64-code.fd"
+             "/usr/share/OVMF/OVMF_CODE_4M.fd"
+             "/usr/share/OVMF/OVMF_CODE.fd"])
+      (die "OVMF firmware not found; set OVMF_CODE")))
+
+;; A writable VARS pflash per boot, as in smoke-qemu-install.cljk: EDK2
+;; persists EFI variables, and a shared template would carry them across
+;; runs.
+(def ovmf-vars-template
+  (or (.-OVMF_VARS js/process.env)
+      (some #(when (.existsSync fs %) %)
+            ["/opt/homebrew/share/qemu/edk2-i386-vars.fd"
+             "/usr/share/OVMF/OVMF_VARS_4M.fd"
+             "/usr/share/OVMF/OVMF_VARS.fd"])
+      (die "OVMF VARS template not found; set OVMF_VARS")))
+
+(.mkdirSync fs gate-dir #js {:recursive true})
+
+;; ---------------------------------------------------------------- the stick
+
+(let [r (run "python3" [(.join path aiueos "scripts" "make-install-usb-image.py")
+                        "build"
+                        "--release-image" release-image
+                        "--release-receipt" release-receipt
+                        "--guided"
+                        "--installer-dir" (.join path aiueos "installer")
+                        "--classpath" (.resolve path repo ".." "text" "src")
+                        "--classpath" (.join path repo "src")
+                        "--classpath" (.resolve path repo ".." "security" "src")
+                        "--live-uki" uki
+                        "--selfhost-elf" (.join path elf-dir "guided-core.elf")
+                        "--selfhost-elf" (.join path elf-dir "install-live.elf")
+                        "--selfhost-elf" (.join path elf-dir "install-disk.elf")
+                        "--output" stick
+                        "--receipt" (.join path gate-dir "stick-receipt.json")]
+                       {})]
+  (when-not (zero? (:status r))
+    (die "selfhost stick build failed:" (:err r) (:out r)))
+  (when-not (str/includes? (:out r) "runtime=selfhost")
+    (die "the stick did not verify as the selfhost product:" (:out r)))
+  (println "AIUEOS_GATE_STICK" stick))
+
+(.copyFileSync fs ovmf-vars-template (.join path gate-dir "vars.fd"))
+;; AIUEOS_GATE_BOOT3_ONLY=1 runs just the screen boot -- for flake
+;; hunting (JUN-142) the install boots are already proven. It must NOT
+;; wipe the installed disk: the unconditional rm deleted nvme.img and the
+;; screen boot fell to the UEFI shell (measured 2026-10-20).
+(def boot3-only (= "1" (aget (.-env js/process) "AIUEOS_GATE_BOOT3_ONLY")))
+(when (and (not boot3-only) (.existsSync fs nvme-img)) (.rmSync fs nvme-img))
+(when-not boot3-only
+  ;; An unconditional create wipes the installed disk: boot3-only booted
+  ;; to the UEFI shell on a fresh empty image (measured 2026-10-20).
+  (let [r (run "qemu-img" ["create" "-f" "raw" nvme-img "8G"] {})]
+    (when-not (zero? (:status r)) (die "qemu-img failed:" (:err r)))))
+(when (.existsSync fs serial-log) (.rmSync fs serial-log))
+
+;; ------------------------------------------------------------ the VM run --
+;; serial to a file, answers to stdin when each prompt appears.
+
+(defn- qemu-args [vars-file]
+  ["-machine" "q35" "-m" "2048" "-smp" "2"
+   "-drive" (str "if=pflash,format=raw,readonly=on,file=" ovmf)
+   "-drive" (str "if=pflash,format=raw,file=" vars-file)
+   "-drive" (str "if=none,id=stick,file=" stick ",format=raw,readonly=on")
+   "-device" "qemu-xhci" "-device" "usb-storage,drive=stick"
+   "-drive" (str "if=none,id=nvme0,file=" nvme-img ",format=raw")
+   "-device" "nvme,drive=nvme0,serial=AIUEOSGATE1"
+   "-display" "none" "-serial" "stdio" "-no-reboot"])
+
+(defn- start-vm! [vars-file]
+  (.copyFileSync fs ovmf-vars-template vars-file)
+  (reset! serial-buf "")
+  (let [c (.spawn cp qemu (to-array (qemu-args vars-file))
+                  (clj->js {:stdio ["pipe" "pipe" "pipe"]}))]
+    (reset! child c)
+    ;; stderr goes to its own log: a QEMU that dies at startup (e.g. the
+    ;; image locked by a still-exiting previous boot) says why only there,
+    ;; and the gate was blind to it (measured 2026-10-20).
+    (.on (.-stderr c) "data"
+         (fn [d] (.appendFileSync fs (str serial-log ".stderr") d)))
+    (.on (.-stdout c) "data"
+         (fn [d] (swap! serial-buf str d) (.appendFileSync fs serial-log d)))
+    ;; The close promise: the NEXT boot must not start until this process
+    ;; is really gone, or it loses the image-lock race (measured 2026-10-20:
+    ;; boot2's qemu died at startup while boot1 was still exiting).
+    (reset! child-closed (js/Promise. (fn [res] (.on c "close" (fn [] (res true)))))))
+  true)
+
+(defn- serial-text [] @serial-buf)
+
+(defn- ensure-boot-started
+  "QEMU occasionally wedges at startup with NO serial output (measured
+  2026-10-20 twice, including on the virtio-vga boot; the second launch
+  works). Watch for the first byte; if none lands in 30s, kill and
+  relaunch once."
+  [vars-file relaunch!]
+  (js/Promise.
+    (fn [resolve]
+      (letfn [(check [n]
+                (cond
+                  (pos? (count (serial-text))) (resolve true)
+                  (zero? n) (do (.kill @child)
+                                (relaunch!)
+                                (js/setTimeout (fn [] (resolve true)) 1000))
+                  :else (js/setTimeout (fn [] (check (- n 1))) 1000)))]
+        (check 30)))))
+
+(def deadline (atom 0))
+
+(defn- await-prompt [needle]
+  ;; Everything after spawn is ASYNC: a synchronous sleep blocks Node's
+  ;; event loop, the stdout handler can never run, the pipe fills, and
+  ;; QEMU wedges at ~0% CPU with no output (all measured 2026-10-19).
+  (js/Promise.
+    (fn [resolve reject]
+      (letfn [(tick []
+                (let [t (serial-text)]
+                  (cond
+                    (str/includes? t "AIUEOS_GATE_QEMU_EXITED_EARLY")
+                    (reject (js/Error. (str "qemu exited early (" needle " never appeared)")))
+                    (str/includes? t "UEFI Interactive Shell")
+                    (reject (js/Error. (str "boot dropped to the UEFI shell (wanting: " needle ")")))
+                    ;; an evidence stop means the run FAILED; the machine
+                    ;; now idles instead of exiting, so reject at once
+                    (str/includes? t "AIUEOS_EVIDENCE_STOP")
+                    (reject (js/Error. (str "evidence stop (wanting: " needle ")")))
+                    (str/includes? t needle) (resolve true)
+                    (> (.now js/Date) @deadline)
+                    (reject (js/Error.
+                              (str "timed out waiting for prompt: " needle "\n"
+                                   (str/join "\n" (take-last 8 (str/split-lines t))))))
+                    :else (js/setTimeout tick 250))))]
+        (tick)))))
+
+(defn- feed [prompt answer]
+  (.then (await-prompt prompt)
+         (fn [] (.write (.-stdin @child) (str answer "\n")) true)))
+
+(defn- feed-all [answers]
+  (reduce (fn [p pair] (.then p (fn [] (feed (first pair) (second pair)))))
+          (js/Promise.resolve true) answers))
+
+(defn- assert-markers [markers label]
+  (let [t (serial-text)]
+    (doseq [m markers]
+      (when-not (str/includes? t m)
+        (throw (js/Error.
+                 (str label " serial log lacks required marker: " m "\n"
+                      (str/join "\n" (take-last 8 (str/split-lines t))))))))))
+
+(defn- boot! [vars-file]
+  (reset! deadline (+ (.now js/Date) (* 900 1000)))
+  (start-vm! vars-file)
+  (-> (ensure-boot-started vars-file (fn [] (start-vm! vars-file)))
+      (.then (fn [] (feed-all console-answers)))
+      (.then (fn [] (await-prompt "AIUEOS_LIVE_EXIT")))
+      (.then (fn [] @child-closed))))
+
+;; ---- the SCREEN check (owner direction 2026-10-20: 画面の確認も loop に) --
+;; The serial markers say the guest DREW text; this says the visible FRAME
+;; shows it. screendump through the QEMU human monitor, then a colour
+;; census of the PPM: a uniform frame (the blue failure state of
+;; AIUEOS_VIRTIO_GPU_FAIL display-info-or-surface-binding) has one colour,
+;; the desktop with text has hundreds.
+(defn- monitor-send [sock-path cmd]
+  (js/Promise.
+    (fn [resolve reject]
+      (let [net (js/require "node:net")
+            c (.connect net sock-path)]
+        (.on c "connect" (fn [] (.write c (str cmd "\n"))))
+        (.on c "data" (fn [_] (.end c) (resolve true)))
+        (.on c "error" (fn [e] (reject e)))))))
+
+(defn- screendump [sock-path out-ppm]
+  ;; monitor-send resolves on the FIRST data chunk -- the "(qemu) " banner
+  ;; -- not on the command's completion, so the census below read the ppm
+  ;; before QEMU wrote it (measured 2026-10-20: ENOENT). Poll for the file.
+  (-> (monitor-send sock-path (str "screendump " out-ppm))
+      (.then (fn []
+               (js/Promise.
+                 (fn [resolve reject]
+                   (letfn [(poll [n]
+                             (cond
+                               (.existsSync fs out-ppm) (resolve true)
+                               (< n 0) (reject (js/Error. (str "screendump never appeared: " out-ppm)))
+                               :else (js/setTimeout (fn [] (poll (- n 1))) 250)))]
+                     (poll 60))))))))
+
+(defn- colour-census [ppm-path]
+  ;; P6 PPM as QEMU writes it: "P6\n<w> <h>\n255\n" then RGB triples.
+  ;; Distinct colours, dark pixels (text ink), and an FNV-1a over dark
+  ;; pixel POSITIONS -- the same measure the guest census keeps, so a
+  ;; caret that moves is seen even when counts hold still.
+  (let [buf (.readFileSync fs ppm-path)
+        s (.toString buf "latin1")
+        n1 (.indexOf s "\n")
+        n2 (.indexOf s "\n" (+ n1 1))
+        n3 (.indexOf s "\n" (+ n2 1))
+        header-end (+ n3 1)
+        colors (js/Set.)
+        dark (atom 0)
+        hash (atom 2166136261)
+        px-count 1280]
+    (loop [i header-end]
+      (when (< i (- (.-length buf) 2))
+        (let [r (aget buf i) g (aget buf (+ i 1)) bl (aget buf (+ i 2))]
+          (.add colors (+ (* 65536 r) (* 256 g) bl))
+          (when (and (< r 80) (< g 80) (< bl 80))
+            (swap! dark inc)
+            (let [idx (quot (- i header-end) 3)
+                  px (mod idx px-count)
+                  py (quot idx px-count)
+                  pos (+ (* py 65536) px)]
+              (dotimes [b 4]
+                (swap! hash (fn [h] (js/Math.imul (bit-xor h (bit-and (unsigned-bit-shift-right pos (* 8 b)) 255)) 16777619)))))))
+        (recur (+ i 3))))
+    {:colours (.-size colors) :dark @dark :hash (bit-and @hash 0xffffffff)}))
+
+(defn- assert-screen [ppm-path label]
+  (let [{:keys [colours dark]} (colour-census ppm-path)]
+    (when (or (< colours 4) (< dark 50))
+      (throw (js/Error. (str label " screen looks blank: colours=" colours
+                             " dark-px=" dark
+                             " (a uniform frame is the virtio-gpu binding failure;"
+                             " text ink is the proof)"))))
+    (println "AIUEOS_SCREEN_OK" label
+             (str "colours=" colours) (str "text-px=" dark))))
+
+;; boot3: the INSTALLED system boots from the NVMe (USB detached) to the
+;; guest desktop, and the screen itself is verified -- the node gate's
+;; boot2 shape plus the frame check.
+(def boot3-markers
+  ["AIUEOS_GUEST_BROWSER_FLOW_OK"])
+
+(def boot1-markers
+  ["AIUEOS_LIVE_HANDOVER guided-core.elf"
+   "AIUEOS_GUIDED_ANSWERS_WRITTEN"
+   "AIUEOS_LIVE_TARGET /dev/nvme0n1"
+   "AIUEOS_INSTALL_WRITE_OK bytes="
+   "AIUEOS_INSTALL_READBACK_OK"
+   "AIUEOS_INSTALL_RECEIPT_OK"
+   "AIUEOS_LIVE_EXIT rc=0"])
+
+;; boot2 is the repeat-erase shape of the node gate's boot4: the same stick
+;; against its own installed target must refuse and leave the disk alone.
+(def boot2-markers
+  ["AIUEOS_LIVE_HANDOVER guided-core.elf"
+   "AIUEOS_INSTALL_REFUSE existing-install"
+   "AIUEOS_LIVE_EXIT"])
+
+(defn- rel-sha [] (sha256-file release-image))
+
+(defn- assert-extent []
+  (let [rel (.statSync fs release-image)
+        rs (rel-sha)
+        nvme-sha (sha256-range nvme-img (.-size rel))]
+    (when-not (= rs nvme-sha)
+      (throw (js/Error.
+               (str "the NVMe extent does not match the release image\nrelease: "
+                    rs "\nnvme:    " nvme-sha))))
+    rs))
+
+(defn- start-vm-boot3! [vars sock]
+  (.copyFileSync fs ovmf-vars-template vars)
+  (when (.existsSync fs sock) (.rmSync fs sock))
+  (reset! serial-buf "")
+  (let [args ["-machine" "q35" "-m" "2048" "-smp" "2"
+              "-drive" (str "if=pflash,format=raw,readonly=on,file=" ovmf)
+              "-drive" (str "if=pflash,format=raw,file=" vars)
+              "-drive" (str "if=none,id=gatenvme,format=raw,file=" nvme-img)
+              "-device" "nvme,drive=gatenvme,serial=AIUEOSGATE1,bootindex=0"
+              "-device" "virtio-rng-pci"
+              "-drive" (str "if=none,id=aiueosblk,format=raw,file=" data-img)
+              "-device" "virtio-blk-pci,drive=aiueosblk,disable-legacy=on"
+              "-device" "virtio-keyboard-pci"
+              "-device" "virtio-vga,disable-legacy=on,max_outputs=2"
+              "-display" "none"
+              "-serial" "stdio"
+              "-monitor" (str "unix:" sock ",server,nowait")
+              "-no-reboot"]
+        c (.spawn cp qemu (to-array args) (clj->js {:stdio ["pipe" "pipe" "pipe"]}))]
+    (reset! child c)
+    (.on (.-stderr c) "data"
+         (fn [d] (.appendFileSync fs (str serial-log ".stderr") d)))
+    (.on (.-stdout c) "data"
+         (fn [d] (swap! serial-buf str d) (.appendFileSync fs serial-log d)))
+    (reset! child-closed (js/Promise. (fn [res] (.on c "close" (fn [] (res true)))))))
+  true)
+
+(defn- boot-desktop! []
+  (let [vars (.join path gate-dir "vars-boot3.fd")
+        sock (.join path gate-dir "mon-boot3.sock")
+        ppm (.join path gate-dir "desktop.ppm")]
+    ;; A STALE ppm from a previous run passes the size poll before this
+    ;; run's screendump lands, and the census then reads a mid-write
+    ;; truncate (measured 2026-10-20: colours=0). Start clean.
+    (when (.existsSync fs ppm) (.rmSync fs ppm))
+    ;; the second frame too: a stale -after passes its size poll and the
+    ;; comparison then reads two frames from an EARLIER run (measured
+    ;; 2026-10-20: the ink assertion fired on stale files while the real
+    ;; pair sat unwritten).
+    (when (.existsSync fs (str ppm "-after")) (.rmSync fs (str ppm "-after")))
+    (reset! deadline (+ (.now js/Date) (* 1200 1000)))
+    (start-vm-boot3! vars sock)
+    ;; The guest demo advances on input events. Feed keys EVERY 3 s until
+    ;; the run's own end marker -- a fixed-size window missed the input
+    ;; stage when the host was busy (measured 2026-10-20).
+    (js/setTimeout
+      (fn []
+        (letfn [(feed []
+                  (if (str/includes? (serial-text) "AIUEOS_GUEST_BROWSER_FLOW_OK")
+                    true
+                    (-> (monitor-send sock "sendkey a")
+                        (.catch (fn [_] nil))
+                        (.then (fn [] (js/Promise.
+                                        (fn [res] (js/setTimeout (fn [] (res (feed))) 3000))))))))]
+          (feed)))
+      30000)
+    (-> (ensure-boot-started vars (fn [] (start-vm-boot3! vars sock)))
+        (.then (fn [] (await-prompt "AIUEOS_GUEST_BROWSER_FLOW_OK")))
+        (.then (fn [] (monitor-send sock (str "screendump " ppm))))
+        (.then (fn []
+               (js/Promise.
+                 (fn [resolve reject]
+                   (let [expect (* 1280 800 3)]
+                     (letfn [(poll [n]
+                               (cond
+                                 (and (.existsSync fs ppm) (>= (.-size (.statSync fs ppm)) expect))
+                                 (resolve true)
+                                 (< n 0) (reject (js/Error. "screendump never filled"))
+                                 :else (js/setTimeout (fn [] (poll (- n 1))) 500)))]
+                       (poll 60)))))))
+        (.then (fn [] (assert-screen ppm "boot3")))
+        ;; S1/S4 proof: the persistent desktop must RESPOND. The
+        ;; persistent loop only starts after the evidence job's last
+        ;; marker (measured 2026-10-20: a key sent at FLOW time was eaten
+        ;; by a stage and the frames stayed identical) -- wait for the
+        ;; job to end first.
+        (.then (fn [] (await-prompt "AIUEOS_DESKTOP_LOOP_OK")))
+        (.then (fn [] (js/Promise. (fn [res] (js/setTimeout (fn [] (res true)) 3000)))))
+        ;; Five presses, not one: a caret blink alone can differ between
+        ;; frames (measured 2026-10-20 -- one run 'responded', the next
+        ;; did not). Glyphs GROW ink; a blink cannot.
+        (.then (fn [] (monitor-send sock "sendkey a")))
+        (.then (fn [] (js/Promise. (fn [res] (js/setTimeout (fn [] (res true)) 600)))))
+        (.then (fn [] (monitor-send sock "sendkey a")))
+        (.then (fn [] (js/Promise. (fn [res] (js/setTimeout (fn [] (res true)) 600)))))
+        (.then (fn [] (monitor-send sock "sendkey a")))
+        (.then (fn [] (js/Promise. (fn [res] (js/setTimeout (fn [] (res true)) 600)))))
+        (.then (fn [] (monitor-send sock "sendkey a")))
+        (.then (fn [] (js/Promise. (fn [res] (js/setTimeout (fn [] (res true)) 600)))))
+        ;; a pointer click too (JUN-144): a press on the desktop raises a
+        ;; window -- the frame's ink POSITIONS move even when typing does
+        ;; not grow ink.
+        (.then (fn [] (monitor-send sock "mouse_move 200 200")))
+        (.then (fn [] (js/Promise. (fn [res] (js/setTimeout (fn [] (res true)) 300)))))
+        (.then (fn [] (monitor-send sock "mouse_button 1")))
+        (.then (fn [] (js/Promise. (fn [res] (js/setTimeout (fn [] (res true)) 300)))))
+        (.then (fn [] (monitor-send sock "mouse_button 0")))
+        (.then (fn [] (js/Promise. (fn [res] (js/setTimeout (fn [] (res true)) 3000)))))
+        (.then (fn [] (monitor-send sock (str "screendump " ppm "-after"))))
+        (.then (fn []
+                 (js/Promise.
+                   (fn [resolve reject]
+                     (let [expect (* 1280 800 3)]
+                       (letfn [(poll [n]
+                                 (cond
+                                   (and (.existsSync fs (str ppm "-after"))
+                                        (>= (.-size (.statSync fs (str ppm "-after"))) expect))
+                                   (resolve true)
+                                   (< n 0) (reject (js/Error. "second screendump never filled"))
+                                   :else (js/setTimeout (fn [] (poll (- n 1))) 500)))]
+                         (poll 60)))))))
+        (.then (fn []
+                 (let [a (.toString (.readFileSync fs ppm) "latin1")
+                       b (.toString (.readFileSync fs (str ppm "-after")) "latin1")]
+                   (if (= a b)
+                     (throw (js/Error. "the desktop did not respond to a keypress (frames identical)"))
+                     (let [before (colour-census ppm)
+                           after (colour-census (str ppm "-after"))]
+                       ;; Ink must GROW, not merely change: the key draws a
+                       ;; glyph or preedit (IME path), which is the proof
+                       ;; the text pipeline is live in the persistent loop.
+                       (when-not (or (> (:dark after) (:dark before))
+                                     (not= (:hash after) (:hash before)))
+                         (throw (js/Error.
+                                  (str "neither typing nor a click moved the desktop ("
+                                       (:dark before) "/" (:hash before) " -> "
+                                       (:dark after) "/" (:hash after) ")"))))
+                       (println "AIUEOS_DESKTOP_INPUT_OK ink-grew"
+                                (str "ink=" (:dark before) "->" (:dark after))
+                                (str "hash=" (:hash before) "->" (:hash after))))))))
+        ;; Tear the QEMU down on the SUCCESS path too: a surviving boot3
+        ;; holds the image lock and the next cycle's qemu-img refuses to
+        ;; start (measured 2026-10-20: all boot3-only cycles died on
+        ;; 'Failed to get write lock').
+        (.then (fn [] (do (when-let [c @child] (.kill c)) @child-closed))))))
+
+(def boot1-sha (atom nil))
+
+
+(-> (if boot3-only
+      (js/Promise.resolve true)
+      (-> (boot! (.join path gate-dir "vars-boot1.fd"))
+          (.then (fn []
+                   (assert-markers boot1-markers "boot1")
+                   (reset! boot1-sha (sha256-file nvme-img))
+                   (assert-extent)))
+          (.then (fn [] (boot! (.join path gate-dir "vars-boot2.fd"))))
+          (.then (fn [] (assert-markers boot2-markers "boot2")))))
+    (.then (fn [] (boot-desktop!)))
+    (.then (fn [] (assert-markers boot3-markers "boot3")))
+    (.then (fn []
+             (if boot3-only
+               ;; the screen boot asserts the SCREEN only; the disk check
+               ;; belongs to the install boots (boot1-sha is nil here and
+               ;; tripped it -- measured 2026-10-20)
+               (do (println "AIUEOS_SCREEN_HUNT_OK boot3")
+                   (js/process.exit 0))
+               (let [after (sha256-file nvme-img)]
+                 (when-not (= @boot1-sha after)
+                   (throw (js/Error.
+                            (str "the NVMe changed across boot2\nbefore: " @boot1-sha
+                                 "\nafter:  " after))))
+                 (println "AIUEOS_INSTALL_SMOKE_OK selfhost-usb-live-install"
+                          "nvme-written readback-verified repeat-refused"
+                          "extent-identical disk-untouched"
+                          (str "sha256=" (rel-sha)))
+                 (js/process.exit 0)))))
+    (.catch (fn [e] (die (str e)))))

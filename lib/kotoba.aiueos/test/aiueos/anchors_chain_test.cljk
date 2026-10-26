@@ -1,0 +1,221 @@
+(ns aiueos.anchors-chain-test
+  "The chain, end to end and with real bytes: an anchor set staged into an
+  image, its digest named by a release manifest, the staged file read back and
+  re-measured, admitted as this device's first set, and then used by
+  `grant.cloud/admit-peer` to accept one key and refuse another.
+
+  Every earlier test in this series checked one link. This one checks that the
+  links are the same links."
+  (:require [grant.anchors :as anchors]
+            [grant.cloud :as cloud]
+            [aiueos.image :as image]
+            [grant.key-lifecycle :as kl]
+            [clojure.edn :as edn]
+            [clojure.java.io :as io]
+            [kotoba.process :as shell]
+            [kotoba.test :refer [deftest is testing]])
+  (:import [java.io File]))
+
+(def pin-a (apply str (repeat 64 "a")))
+(def pin-b (apply str (repeat 64 "b")))
+(def pin-c (apply str (repeat 64 "c")))
+
+(def root {:keys #{"k1" "k2" "k3"} :threshold 2})
+(def sigs [{:key-id "k1" :verified? true :status-index 0}
+           {:key-id "k2" :verified? true :status-index 1}])
+
+(defn- temp-dir! []
+  (let [f (File/createTempFile "aiueos-anchors-chain" "")]
+    (.delete f) (.mkdirs f) f))
+
+(defn- delete-tree! [^File f]
+  (when (.isDirectory f) (doseq [c (.listFiles f)] (delete-tree! c)))
+  (.delete f))
+
+(defn- staged-anchor-file
+  "Build a plan, stage just the anchors file the way `build-initramfs!` does,
+  and return the plan plus the file. Packaging the whole initramfs needs a JRE
+  and a Linux runtime root; the bytes under test are the same either way, and
+  `aiueos.image-test` covers the packaging."
+  [dir spec]
+  (let [system (io/file dir "system.edn")
+        _ (spit system (pr-str {:aiueos/components []}))
+        p (image/plan {:system (.getPath system) :anchors spec})
+        f (io/file dir "anchors.edn")]
+    (with-open [out (io/output-stream f)]
+      (.write out ^bytes (:anchors-bytes p)))
+    [p f]))
+
+;; ── the bytes that are staged are the bytes that were digested ────────────
+
+(deftest the-staged-file-re-measures-to-the-digest-the-plan-reported
+  (let [dir (temp-dir!)]
+    (try
+      (let [[p f] (staged-anchor-file dir {:release-id "release-42" :sequence 7
+                                           :anchors #{pin-b pin-a}})
+            re-read (edn/read-string (slurp f))]
+        (is (= (:anchors-digest p)
+               (kl/document-digest re-read anchors/document-signature-key))
+            "reading the file back and canonicalising it gives the same digest")
+        (is (= [pin-a pin-b] (:anchors/anchors re-read)))
+        (is (= "/etc/aiueos/anchors.edn" (:guest-anchors p)))
+        (is (= {:kind :anchors :sha256 (:anchors-digest p)} (image/anchors-artifact p))))
+      (finally (delete-tree! dir)))))
+
+(deftest an-image-without-an-anchor-set-names-no-artifact
+  (let [dir (temp-dir!)]
+    (try
+      (let [system (io/file dir "system.edn")
+            _ (spit system (pr-str {:aiueos/components []}))
+            p (image/plan {:system (.getPath system)})]
+        (is (nil? (image/anchors-artifact p)))
+        (is (nil? (:guest-anchors p)))
+        (is (nil? (:anchors-bytes p))))
+      (finally (delete-tree! dir)))))
+
+(deftest the-same-pins-in-any-order-are-the-same-document
+  (testing "a set has no order and a digest does"
+    (let [d1 (anchors/document {:release-id "r" :sequence 1 :anchors [pin-a pin-b]})
+          d2 (anchors/document {:release-id "r" :sequence 1 :anchors [pin-b pin-a]})]
+      (is (= d1 d2))
+      (is (= (kl/document-digest d1 anchors/document-signature-key)
+             (kl/document-digest d2 anchors/document-signature-key))
+          "otherwise the digest a manifest names depends on how the builder
+           happened to iterate, and the device re-measures a different one"))))
+
+;; ── the real packaged image carries the real bytes ────────────────────────
+
+(defn- boot-plan
+  "The fixture `aiueos.image-test` uses: a fake ELF `bin/java`, a fake jar and
+  an empty runtime root, which is enough for `build-initramfs!` to package."
+  [^File dir out anchors]
+  (let [jre (io/file dir "jre")
+        java (io/file jre "bin" "java")
+        jar (io/file dir "aiueos.jar")
+        runtime-root (io/file dir "runtime-root")]
+    (.mkdirs (.getParentFile java))
+    (with-open [o (java.io.FileOutputStream. java)]
+      (.write o (byte-array [(byte 0x7f) (byte (int \E)) (byte (int \L)) (byte (int \F))])))
+    (.setExecutable java true false)
+    (spit jar "fake-jar")
+    (.mkdirs runtime-root)
+    (image/plan {:system (.getPath (io/file dir "system.edn"))
+                 :jre-dir (.getPath jre) :jar (.getPath jar)
+                 :runtime-root (.getPath runtime-root)
+                 :anchors anchors
+                 :deployment-profile :regulated
+                 :out (.getPath out)})))
+
+(deftest the-packaged-initramfs-contains-the-bytes-the-manifest-names
+  (let [dir (temp-dir!)]
+    (try
+      (spit (io/file dir "system.edn") "{:aiueos/components []}")
+      (let [out (io/file dir "out.initramfs.cpio.gz")
+            p (boot-plan dir out {:release-id "release-42" :sequence 7
+                                  :anchors #{pin-a pin-b}})
+            _ (image/build-initramfs! p)
+            extract (doto (io/file dir "extract") (.mkdirs))
+            {:keys [exit]} (shell/sh "sh" "-c"
+                                     (str "cd " (pr-str (.getPath extract))
+                                          " && gzip -dc " (pr-str (.getPath out))
+                                          " | cpio -id 2>/dev/null"))
+            staged (io/file extract "etc" "aiueos" "anchors.edn")]
+        (is (zero? exit))
+        (is (.exists staged) "the image carries the anchor set")
+        (is (= (:anchors-digest p)
+               (kl/document-digest (edn/read-string (slurp staged))
+                                   anchors/document-signature-key))
+            "unpacked from the real image, it still measures to the digest the
+             release manifest names")
+        (let [boot (edn/read-string (slurp (io/file extract "etc" "aiueos" "boot.edn")))]
+          (is (= "/etc/aiueos/anchors.edn" (:aiueos/anchors boot))
+              "and boot.edn tells the guest where to find it")
+          ;; The plan carrying a profile is not the image declaring one: the
+          ;; guest reads this file, and asserting on the plan would pass with
+          ;; nothing written here at all (ADR-0071).
+          (is (= :regulated (:aiueos/deployment-profile boot))
+              "the packaged image declares the profile it was built for")))
+      (finally (delete-tree! dir)))))
+
+;; ── release signature → artifact digest → document → key → connection ─────
+
+(deftest a-fresh-device-boots-an-image-and-ends-up-able-to-judge-a-peer
+  (let [dir (temp-dir!)]
+    (try
+      (let [[p f] (staged-anchor-file dir {:release-id "release-42" :sequence 7
+                                           :anchors #{pin-a pin-b}})
+            digest (:anchors-digest p)
+            ;; what the publisher signs
+            release {:manifest-id "release-42" :sequence 42 :signatures sigs
+                     :timestamp-ms 1000
+                     :artifacts [{:kind :anchors :sha256 digest}]}
+            ;; what the device does at first boot: read the staged file,
+            ;; measure it, and decide
+            read-verdict (anchors/read-document (edn/read-string (slurp f)))
+            carried (:aiueos.anchors/carried read-verdict)
+            observed {:anchors (kl/document-digest (edn/read-string (slurp f))
+                                                   anchors/document-signature-key)}
+            device {:installed-anchor-sequence nil :now-ms 1000 :root root
+                    :revocation-bits [0 0 0 0] :current-anchors #{}}
+            admitted (anchors/admit-from-release release carried observed device)
+            state (anchors/apply-set device admitted)
+            policy {:aiueos.cloud/trust-anchors (anchors/usable-anchors state)}]
+        (is (anchors/admitted? read-verdict))
+        (is (anchors/admitted? admitted))
+        (is (true? (:aiueos.anchors/bootstrap? admitted)))
+        (is (= #{pin-a pin-b} (:current-anchors state)))
+        (testing "and the machine can now judge who answers"
+          (is (cloud/allowed? (cloud/admit-peer policy {:spki-sha256 pin-a})))
+          (is (= :peer-not-pinned
+                 (:aiueos.cloud/reason (cloud/admit-peer policy {:spki-sha256 pin-c}))))))
+      (finally (delete-tree! dir)))))
+
+(deftest an-image-whose-bytes-were-changed-after-signing-is-refused
+  (let [dir (temp-dir!)]
+    (try
+      (let [[p f] (staged-anchor-file dir {:release-id "release-42" :sequence 7
+                                           :anchors #{pin-a}})
+            release {:manifest-id "release-42" :sequence 42 :signatures sigs
+                     :timestamp-ms 1000
+                     :artifacts [{:kind :anchors :sha256 (:anchors-digest p)}]}
+            ;; someone edits the staged file to add their own key
+            tampered (assoc (edn/read-string (slurp f)) :anchors/anchors [pin-a pin-c])
+            _ (spit f (pr-str tampered))
+            carried (:aiueos.anchors/carried (anchors/read-document (edn/read-string (slurp f))))
+            observed {:anchors (kl/document-digest (edn/read-string (slurp f))
+                                                   anchors/document-signature-key)}
+            device {:installed-anchor-sequence nil :now-ms 1000 :root root
+                    :revocation-bits [0 0 0 0] :current-anchors #{}}
+            v (anchors/admit-from-release release carried observed device)]
+        (is (= :anchors-digest-mismatch (:aiueos.anchors/reason v))
+            "the manifest names the digest of what was signed, and this is not it")
+        (is (= (:anchors-digest p) (:aiueos.anchors/expected v))))
+      (finally (delete-tree! dir)))))
+
+;; ── the reader is fail-closed ─────────────────────────────────────────────
+
+(deftest a-pin-that-cannot-match-anything-is-refused-at-the-door
+  (testing "a truncated or upper-case pin can never equal a measured key"
+    (is (= :document-pin-malformed
+           (:aiueos.anchors/reason
+            (anchors/read-document (anchors/document {:release-id "r" :sequence 1
+                                                      :anchors #{"deadbeef"}})))))
+    (is (= :document-pin-malformed
+           (:aiueos.anchors/reason
+            (anchors/read-document (anchors/document {:release-id "r" :sequence 1
+                                                      :anchors #{(.toUpperCase ^String pin-a)}})))))))
+
+(deftest a-document-from-a-future-version-is-refused-not-guessed
+  (is (= :document-version-unknown
+         (:aiueos.anchors/reason
+          (anchors/read-document (assoc (anchors/document {:release-id "r" :sequence 1
+                                                           :anchors #{pin-a}})
+                                        :anchors/version 2))))))
+
+(deftest a-document-missing-what-binds-it-is-refused
+  (is (= :document-malformed
+         (:aiueos.anchors/reason
+          (anchors/read-document (dissoc (anchors/document {:release-id "r" :sequence 1
+                                                            :anchors #{pin-a}})
+                                         :anchors/release-id)))))
+  (is (= :document-malformed (:aiueos.anchors/reason (anchors/read-document "not a map")))))

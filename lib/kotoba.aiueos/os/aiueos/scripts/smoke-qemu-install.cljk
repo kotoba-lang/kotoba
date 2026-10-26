@@ -1,0 +1,305 @@
+#!/usr/bin/env kbb
+;; Gate I3 + I5 of install-v1.edn (root ADR adr-2608251418), measured under
+;; QEMU/OVMF: one continuous chain from a USB-booted live installer to an
+;; internal disk that boots aiueos on its own and refuses to be erased twice.
+;;
+;;   boot 1  install USB (removable, xHCI) + blank NVMe          -> installed
+;;   boot 2  NVMe alone, USB detached                            -> aiueos up
+;;   boot 3  NVMe alone again                                    -> still up
+;;   boot 4  USB re-inserted, boot order back to USB             -> refused,
+;;           and the NVMe image is byte-identical before and after
+;;
+;; The four boots are asserted TOGETHER: an installer that installs but does
+;; not survive USB removal, or survives but re-erases on re-insertion, fails
+;; the gate as a whole. Between boots the gate also verifies the NVMe image
+;; offline -- the first 64 MiB must equal the release image (digest from its
+;; build receipt), and the install target receipt must sit in the last MiB --
+;; so "aiueos booted" is never standing in for "the installer wrote what it
+;; claimed".
+;;
+;; Environment: AIUEOS_OUT (default build/aiueos) must already hold the
+;; release image + receipt, live/uki.efi (make-live-installer.py), the pinned
+;; Linux node binary, and an npm nbb tree; this gate builds its own
+;; unattended intent and its own gate USB image so nothing here can touch the
+;; owner's install-intent.json.
+;;   AIUEOS_NODE_LINUX  path to node-linux-x64   (default $out/node-linux-x64)
+;;   AIUEOS_NBB_DIR     path to node_modules dir (default $out/nbb-bundle/node_modules)
+;;
+;; Like smoke-qemu-usb-boot.cljs, the aiueos boots do not hardcode a passing
+;; exit status for the shared suite; boot 2/3 are green on the aiueos boot
+;; markers and an evidence floor, with the terminal status recorded.
+
+(require '[kotoba.lang.text :as str])
+
+(def fs (js/require "node:fs"))
+(def path (js/require "node:path"))
+(def cp (js/require "node:child_process"))
+(def crypto (js/require "node:crypto"))
+
+(def aiueos (.resolve path (.dirname path *file*) ".."))
+(def repo (.resolve path aiueos ".." ".."))
+(def out (or (.-AIUEOS_OUT js/process.env) (.join path repo "build" "aiueos")))
+(def gate-dir (.join path out "install-gate"))
+(def release-image (.join path out "aiueos-x86_64-gpt.img"))
+(def release-receipt (.join path out "aiueos-x86_64-build-receipt.json"))
+(def data-image (.join path out "aiueos-x86_64-data.img"))
+(def uki (.join path out "live" "uki.efi"))
+(def node-linux (or (.-AIUEOS_NODE_LINUX js/process.env) (.join path out "node-linux-x64")))
+(def nbb-dir (or (.-AIUEOS_NBB_DIR js/process.env) (.join path out "nbb-bundle" "node_modules")))
+(def qemu (or (.-QEMU_SYSTEM_X86_64 js/process.env) "qemu-system-x86_64"))
+(def nvme-serial "AIUEOSGATE1")
+(def nvme-bytes (* 8 1024 1024 1024))
+
+(defn- die [& msg]
+  (binding [*out* *err*] (apply println (cons "error:" msg)))
+  (.exit js/process 1))
+
+(doseq [[p hint] [[release-image "run os/aiueos/scripts/build-release-image.sh"]
+                  [release-receipt "run os/aiueos/scripts/build-release-image.sh"]
+                  [data-image "run os/aiueos/scripts/build-release-image.sh"]
+                  [uki "run make-live-installer.py build --output-dir build/aiueos/live"]
+                  [node-linux "download the pinned linux-x64 node binary (see installer README)"]
+                  [nbb-dir "npm install nbb --prefix build/aiueos/nbb-bundle"]]]
+  (when-not (.existsSync fs p)
+    (die "missing prerequisite:" p "\nhint:" hint)))
+
+(def ovmf
+  (or (.-OVMF_CODE js/process.env)
+      (some #(when (.existsSync fs %) %)
+            ["/opt/homebrew/share/qemu/edk2-x86_64-code.fd"
+             "/usr/share/OVMF/OVMF_CODE_4M.fd"
+             "/usr/share/OVMF/OVMF_CODE.fd"])
+      (die "OVMF firmware not found; set OVMF_CODE")))
+
+;; A writable VARS pflash is load-bearing for THIS gate specifically: without
+;; one, EDK2 persists its EFI variables as an NVVARS file on the first
+;; writable ESP it finds -- which is the freshly installed target. Measured:
+;; boot4's refusal was correct, yet the disk digest changed, because the
+;; FIRMWARE wrote 24 sectors of boot variables into the nvme ESP. Real
+;; hardware keeps NVRAM in flash and never touches the disk; a fresh VARS
+;; copy per boot restores that property here.
+(def ovmf-vars-template
+  (or (.-OVMF_VARS js/process.env)
+      (some #(when (.existsSync fs %) %)
+            ["/opt/homebrew/share/qemu/edk2-i386-vars.fd"
+             "/usr/share/OVMF/OVMF_VARS_4M.fd"
+             "/usr/share/OVMF/OVMF_VARS.fd"])
+      (die "OVMF VARS template not found; set OVMF_VARS")))
+
+(defn- run [cmd args opts]
+  (let [r (.spawnSync cp cmd (to-array args)
+                      (clj->js (merge {:encoding "utf8" :shell false} opts)))]
+    {:status (or (.-status r) 1) :out (or (.-stdout r) "") :err (or (.-stderr r) "")}))
+
+(defn- sha256-file [p]
+  (let [fd (.openSync fs p "r")
+        chunk (js/Buffer.alloc (* 4 1024 1024))
+        h (.createHash crypto "sha256")]
+    (try
+      (loop []
+        (let [got (.readSync fs fd chunk 0 (.-length chunk))]
+          (when (pos? got)
+            (.update h (.subarray chunk 0 got))
+            (recur))))
+      (finally (.closeSync fs fd)))
+    (.digest h "hex")))
+
+(defn- sha256-range [p bytes]
+  (let [fd (.openSync fs p "r")
+        chunk (js/Buffer.alloc (* 4 1024 1024))
+        h (.createHash crypto "sha256")]
+    (try
+      (loop [remaining bytes]
+        (when (pos? remaining)
+          (let [want (min remaining (.-length chunk))
+                got (.readSync fs fd chunk 0 want)]
+            (when (pos? got)
+              (.update h (.subarray chunk 0 got))
+              (recur (- remaining got))))))
+      (finally (.closeSync fs fd)))
+    (.digest h "hex")))
+
+;; --------------------------------------------------------------- gate build
+
+(.mkdirSync fs gate-dir #js {:recursive true})
+(def gate-intent (.join path gate-dir "gate-intent.json"))
+(def gate-usb (.join path gate-dir "gate-usb.img"))
+(def gate-key (.join path gate-dir "gate-key.pub"))
+
+;; A throwaway but REAL ed25519 key: I3 proves the install chain, not SSH
+;; login, yet provisioning now parses this key and derives its fingerprint, so
+;; a random blob would fail the intent-fingerprint consistency check.
+(let [kp (.generateKeyPairSync crypto "ed25519")
+      spki (.export (.-publicKey kp) #js {:format "der" :type "spki"})
+      raw (.subarray spki (- (.-length spki) 32))
+      ssh-str (fn [b] (let [l (js/Buffer.alloc 4)] (.writeUInt32BE l (.-length b) 0)
+                        (js/Buffer.concat #js [l b])))
+      blob (js/Buffer.concat #js [(ssh-str (js/Buffer.from "ssh-ed25519" "utf8"))
+                                  (ssh-str raw)])]
+  (.writeFileSync fs gate-key
+                  (str "ssh-ed25519 " (.toString blob "base64") " install-gate\n")))
+
+(let [{:keys [status err]}
+      (run "nbb" [(.join path aiueos "scripts" "install-intent.cljk") "create"
+                  "--receipt" release-receipt
+                  "--hostname" "aiueos-gate" "--confirm-create" "aiueos-gate"
+                  "--machine-model" "QEMU q35 gate"
+                  "--target-model" "QEMU NVMe" "--target-transport" "nvme"
+                  "--target-min-gb" "4" "--target-max-gb" "32"
+                  "--target-serial" nvme-serial
+                  "--ssh-public-key-file" gate-key
+                  "--mode" "unattended" "--expires-days" "1"
+                  "--out" gate-intent] {})]
+  (when-not (zero? status) (die "gate intent creation failed:" (str/trim err))))
+
+(let [{:keys [status err out*]} (run "nbb" [(.join path aiueos "scripts" "run-install-usb-build.cljk")
+                                            "--intent" gate-intent
+                                            "--node-binary" node-linux
+                                            "--nbb-dir" nbb-dir
+                                            "--live-uki" uki
+                                            "--output" gate-usb
+                                            "--receipt" (.join path gate-dir "gate-usb-receipt.json")]
+                                    {})]
+  (when-not (zero? status) (die "gate USB build failed:" (str/trim err))))
+(println "AIUEOS_INSTALL_GATE_USB built" gate-usb)
+
+(def nvme-img (.join path gate-dir "nvme.img"))
+(when (.existsSync fs nvme-img) (.rmSync fs nvme-img))
+(let [fd (.openSync fs nvme-img "w")]
+  (.ftruncateSync fs fd nvme-bytes)
+  (.closeSync fs fd))
+
+;; ---------------------------------------------------------------- qemu runs
+
+(defn- qemu-run
+  "One boot. USB? attaches the gate USB first in boot order; the NVMe and the
+  aiueos data disk ride along on every boot. MEM matters: the aiueos boots
+  run at the canonical 128M every other aiueos gate uses -- at 2048M the
+  kernel stopped mid-evidence (measured: 14 markers, halting after the crypto
+  self-tests) -- while the Linux+node live boot needs the larger allocation.
+  Returns {:status :serial}."
+  [label usb? timeout-s mem]
+  (let [serial-log (.join path gate-dir (str label "-serial.log"))
+        debug-log (.join path gate-dir (str label "-debug.log"))
+        blk (.join path gate-dir (str label "-data.img"))]
+    (.copyFileSync fs data-image blk)
+    (let [vars (.join path gate-dir (str label "-vars.fd"))
+          _ (.copyFileSync fs ovmf-vars-template vars)
+          args (concat
+                ["-machine" "q35,accel=tcg" "-cpu" "max" "-m" mem "-smp" "2"
+                 "-drive" (str "if=pflash,format=raw,readonly=on,file=" ovmf)
+                 "-drive" (str "if=pflash,format=raw,file=" vars)]
+                (when usb?
+                  ["-drive" (str "if=none,id=gateusb,format=raw,snapshot=on,file=" gate-usb)
+                   "-device" "qemu-xhci,id=xhci"
+                   "-device" "usb-storage,bus=xhci.0,drive=gateusb,removable=on,bootindex=0"])
+                ["-drive" (str "if=none,id=gatenvme,format=raw,file=" nvme-img)
+                 "-device" (str "nvme,drive=gatenvme,serial=" nvme-serial
+                                (if usb? "" ",bootindex=0"))
+                 "-device" "isa-debugcon,iobase=0xe9,chardev=debug"
+                 "-chardev" (str "file,id=debug,path=" debug-log)
+                 "-device" "isa-debug-exit,iobase=0xf4,iosize=0x04"
+                 "-device" "virtio-rng-pci"
+                 "-drive" (str "if=none,id=aiueosblk,format=raw,file=" blk)
+                 "-device" "virtio-blk-pci,drive=aiueosblk,disable-legacy=on"
+                 "-device" "virtio-keyboard-pci"
+                 "-device" "virtio-vga,disable-legacy=on,max_outputs=2"
+                 "-display" "none" "-serial" (str "file:" serial-log)
+                 "-monitor" "none" "-no-reboot"])
+          {:keys [status]} (run "timeout" (concat [(str timeout-s)] [qemu] args) {})]
+      (when (= 124 status) (die label "timed out after" timeout-s "s"))
+      {:status status
+       :serial (if (.existsSync fs serial-log)
+                 (str/replace (.readFileSync fs serial-log "utf8") "\r" "")
+                 "")})))
+
+(defn- require-markers [label serial markers]
+  (doseq [m markers]
+    (when-not (str/includes? serial m)
+      (die label "serial log lacks required marker:" m)))
+  (println "AIUEOS_INSTALL_GATE" label "markers ok:" (str/join " " markers)))
+
+(defn- aiueos-floor [label serial]
+  (let [n (count (filter #(str/includes? % "AIUEOS_") (str/split-lines serial)))]
+    (when (< n 25)
+      (die label "evidence floor: only" n "AIUEOS_ markers (need 25)"))
+    n))
+
+;; boot 1: install
+(println "AIUEOS_INSTALL_GATE boot1 usb-live install starting (TCG; this is slow)")
+(let [{:keys [serial]} (qemu-run "boot1" true 1800 "2048M")]
+  (require-markers "boot1" serial
+                   ["AIUEOS_LIVE_INIT" "AIUEOS_LIVE_PAYLOAD" "AIUEOS_LIVE_TARGET"
+                    "AIUEOS_INSTALL_INTENT_ADMIT" "AIUEOS_INSTALL_OK"]))
+
+;; offline: the installer wrote what it claimed
+(def release-sha
+  (get-in (js->clj (.parse js/JSON (.readFileSync fs release-receipt "utf8"))
+                   :keywordize-keys true)
+          [:disk :sha256]))
+(def release-bytes
+  (get-in (js->clj (.parse js/JSON (.readFileSync fs release-receipt "utf8"))
+                   :keywordize-keys true)
+          [:disk :bytes]))
+(let [written (sha256-range nvme-img release-bytes)]
+  (when-not (= written release-sha)
+    (die "nvme first" release-bytes "bytes are" written "but the release receipt says" release-sha))
+  (println "AIUEOS_INSTALL_GATE nvme-image-extent verified sha256=" written))
+(def receipt-offset (* (quot (- nvme-bytes (* 1024 1024)) 4096) 4096))
+(let [fd (.openSync fs nvme-img "r")
+      buf (js/Buffer.alloc 25)]
+  (.readSync fs fd buf 0 25 receipt-offset)
+  (.closeSync fs fd)
+  (when-not (= "AIUEOS-INSTALL-RECEIPT-V1" (.toString buf "utf8"))
+    (die "target receipt missing at" receipt-offset))
+  (println "AIUEOS_INSTALL_GATE target-receipt present at" receipt-offset))
+
+;; The live installer provisioned an SSH identity onto the target (ssh-v1.edn
+;; decision 4): the record landed in its reserved zone with a valid ed25519
+;; host key and the intent's authorized key, and the target receipt binds its
+;; digest. This is the provisioning half of I4, measured in the live path --
+;; not the served handshake (that is still red).
+(let [prov-offset (- receipt-offset 16384)
+      fd (.openSync fs nvme-img "r")
+      block (js/Buffer.alloc 16384)]
+  (.readSync fs fd block 0 16384 prov-offset)
+  (.closeSync fs fd)
+  (let [text (.toString block "utf8")
+        magic "AIUEOS-PROVISION-V1\n"]
+    (when-not (str/starts-with? text magic)
+      (die "provision record missing at" prov-offset))
+    (let [start (count magic)
+          json (subs text start (str/index-of text "\n" start))
+          rec (js->clj (.parse js/JSON json) :keywordize-keys true)
+          host (get-in rec [:sshHostKey :public])]
+      (when-not (and (= "aiueos.provision.v1" (:schema rec))
+                     (string? host) (re-matches #"[0-9a-f]{64}" host)
+                     (seq (get-in rec [:authorizedKeys 0 :public])))
+        (die "provision record present but malformed:" json))
+      (println "AIUEOS_INSTALL_GATE provision record present"
+               (str "host-key=" (get-in rec [:sshHostKey :fingerprint]))
+               (str "authorized=" (get-in rec [:authorizedKeys 0 :fingerprint]))))))
+
+;; boot 2 + 3: the installed disk boots aiueos on its own, twice
+(doseq [label ["boot2" "boot3"]]
+  (let [{:keys [status serial]} (qemu-run label false 900 "128M")
+        n (aiueos-floor label serial)]
+    (require-markers label serial ["AIUEOS_ACPI_OK" "AIUEOS_SMP_OK"])
+    (println "AIUEOS_INSTALL_GATE" label "aiueos booted from nvme, usb absent,"
+             "markers=" n "status=" status)))
+
+;; boot 4: the same USB must refuse to erase the installed target
+(def nvme-sha-before (sha256-file nvme-img))
+(let [{:keys [serial]} (qemu-run "boot4" true 1800 "2048M")]
+  (require-markers "boot4" serial ["AIUEOS_INSTALL_REFUSED existing-install"])
+  (when (str/includes? serial "AIUEOS_INSTALL_OK")
+    (die "boot4 reports AIUEOS_INSTALL_OK: the repeat run installed again")))
+(def nvme-sha-after (sha256-file nvme-img))
+(when-not (= nvme-sha-before nvme-sha-after)
+  (die "boot4 modified the installed disk:" nvme-sha-before "->" nvme-sha-after))
+(let [extent (sha256-range nvme-img release-bytes)]
+  (when-not (= extent release-sha)
+    (die "installed extent drifted from the release image across the boots:" extent)))
+
+(println (str "AIUEOS_INSTALL_SMOKE_OK usb-live-install nvme-boot-twice"
+              " repeat-refused disk-untouched sha256=" nvme-sha-after))

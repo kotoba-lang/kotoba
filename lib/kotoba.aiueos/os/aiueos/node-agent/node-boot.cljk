@@ -1,0 +1,224 @@
+#!/usr/bin/env kbb
+;; What a booted node USB does after the network is up: hold an identity, say
+;; what it is, and answer its enrolment challenge.
+;;
+;; This is the payload entry `/init` hands over to when the stick carries a
+;; NODE.JSN. It is not the installer -- an install USB writes a system to a
+;; disk and stops; this one boots a box that is trying to become a node.
+;;
+;; It composes rather than reimplements:
+;;   sekisho.didkey        the one definition of what a did:key is
+;;   grant.device-attest   the one definition of what a device signs
+;;   device-attest-agent   the loop itself, spawned as its own process
+;;
+;; The key lives on the stick's own writable state partition, so the did
+;; survives a reboot and a claim can outlive the boot that made it. The stick
+;; is the device boundary: the key is minted on the box and never leaves the
+;; stick -- and equally, whoever holds the stick holds the identity, so a
+;; cloned stick is a cloned node.
+;;
+;; Without that partition it falls back to tmpfs, which is a node for exactly
+;; one boot. The marker says which of the two this boot had rather than
+;; leaving a reader to assume the good one.
+
+(require '[sekisho.didkey :as didkey]
+         '[grant.device-attest :as attest]
+         '[kotoba.lang.text :as str]
+         '["node:os" :as os]
+         '["node:crypto" :as crypto]
+         '["node:fs" :as fs]
+         '["node:path" :as path]
+         '["node:child_process" :as cp])
+
+(def state-dir
+  ;; /init sets this to a mounted state partition when the stick has one.
+  ;; Falling back to /run is a tmpfs, which is a working node for exactly one
+  ;; boot -- so the fallback is reported, not hidden.
+  (or (.-AIUEOS_NODE_STATE_DIR js/process.env) "/run/aiueos-node"))
+
+(def durable?
+  "A key under a mounted partition survives the reboot a claim has to survive.
+  A key in tmpfs does not, and a node that reported the two the same way would
+  look like it had kept an identity while minting a new one every boot."
+  (some? (.-AIUEOS_NODE_STATE_DIR js/process.env)))
+(def key-path (path/join state-dir "device.pem"))
+(def config-path
+  (or (first *command-line-args*)
+      (str (or (.-AIUEOS_LIVE_MEDIA js/process.env) "/payload") "/NODE.JSN")))
+
+(defn- say [& parts] (println (str/join " " parts)))
+
+(defn- die! [code marker detail]
+  (say marker detail)
+  (js/process.exit code))
+
+;; ── the node's own configuration ──────────────────────────────────────────
+
+(def config
+  (try
+    (js->clj (js/JSON.parse (fs/readFileSync config-path "utf8")))
+    (catch :default e
+      (die! 2 "AIUEOS_NODE_CONFIG_UNREADABLE" (str config-path ": " (.-message e))))))
+
+(def endpoint (str/replace (str (get config "endpoint" "")) #"/+$" ""))
+(when (str/blank? endpoint)
+  (die! 2 "AIUEOS_NODE_CONFIG_NO_ENDPOINT" config-path))
+
+;; ── identity ──────────────────────────────────────────────────────────────
+
+(defn- load-or-generate []
+  (fs/mkdirSync state-dir #js {:recursive true})
+  (if (fs/existsSync key-path)
+    {:key (crypto/createPrivateKey (fs/readFileSync key-path "utf8")) :fresh? false}
+    (let [kp (crypto/generateKeyPairSync "ed25519")]
+      (fs/writeFileSync key-path (.export (.-privateKey kp) #js {:format "pem" :type "pkcs8"})
+                        #js {:mode 0600})   ; 0o600 is JS octal; the Clojure reader wants a leading zero
+      {:key (.-privateKey kp) :fresh? true})))
+
+(def loaded (load-or-generate))
+
+(def raw-public
+  ;; JWK `x` is the raw 32-byte Ed25519 public key, which is what a did:key
+  ;; wraps. Going through the JWK rather than slicing DER keeps this from
+  ;; being a second opinion about key encoding.
+  (-> (crypto/createPublicKey (:key loaded))
+      (.export #js {:format "jwk"})
+      (.-x)
+      (js/Buffer.from "base64url")
+      (js/Array.from)
+      vec))
+
+(def did (didkey/from-public-key raw-public))
+
+(when-not (didkey/valid? did)
+  (die! 2 "AIUEOS_NODE_DID_INVALID" (str did)))
+
+(say "AIUEOS_NODE_KEY"
+     (if (:fresh? loaded) "minted" "reused")
+     (if durable? "durable" "ephemeral")
+     state-dir)
+(say "AIUEOS_NODE_DID" did)
+(say "AIUEOS_NODE_ENDPOINT" endpoint)
+
+;; ── answer the challenge ──────────────────────────────────────────────────
+;;
+;; Spawned rather than required: the agent owns its own exit codes, and a node
+;; that reports "the plane refused my signature" differently from "I could not
+;; reach the plane" is the whole point of having them.
+
+(def here
+  ;; /init `cd`s into the extracted bundle before handing over, so the bundle
+  ;; root is the working directory. Resolving it from the script's own module
+  ;; path would be a second answer to the same question, and one that depends
+  ;; on how nbb was invoked.
+  (or (.-AIUEOS_NODE_BUNDLE js/process.env) (js/process.cwd)))
+
+(def outcome-path (path/join state-dir "last-outcome"))
+
+(defn- run-agent []
+  ;; stdio is INHERITED, not piped. Piping it and printing after the child
+  ;; exits means a child that does not exit prints nothing at all -- which is
+  ;; exactly what a boot looks like when it is stuck, and is how this first
+  ;; failed: fifteen minutes of serial that ended at the endpoint line.
+  (say "AIUEOS_NODE_ATTEST_START")
+  (let [r (.spawnSync cp (path/join here "bin" "nbb")
+                      (clj->js ["--classpath" (path/join here "cp")
+                                (path/join here "device-attest-agent.cljk")
+                                "--did" did
+                                "--endpoint" endpoint
+                                "--key" key-path
+                                "--watch"
+                                "--interval" (str (get config "intervalSeconds" 5))
+                                ;; bounded: a boot has to end with an answer
+                                "--attempts" (str (get config "attempts" 10))
+                                "--outcome-file" outcome-path])
+                      #js {:encoding "utf8" :stdio "inherit"})]
+    ;; spawnSync reports status nil when the child never ran at all -- a
+    ;; missing binary, a bad path. Letting that fall through produced exit 0:
+    ;; an agent that never started, reported as one that ran and found nothing
+    ;; to do.
+    {:code (or (.-status r) (when (.-error r) :spawn-failed))
+     :error (some-> (.-error r) .-message)}))
+
+;; ── report for itself ─────────────────────────────────────────────────────
+;;
+;; The console's other telemetry path is an operator collector holding one
+;; shared token and an ssh route to every box. That is right for machines the
+;; operator owns and can reach; it is wrong as the only path, because this box
+;; may sit on a network nobody here runs, and a token every box holds is worth
+;; what the leakiest box is worth. The key is already here and already proves
+;; who this is, so it signs the report too.
+;;
+;; What is signed is the SHA-256 of the body AS SENT -- not a re-encoding of a
+;; map, because the two sides would then have to agree about print order, and
+;; this workspace has already recorded that breaking silently past eight keys.
+
+(defn- load1
+  "The 1-minute load, or nil. nil rather than 0: `load 0` on a wedged box is a
+  claim, and the wrong one -- the same rule the fleet's collector states."
+  []
+  (let [[a] (js/Array.from (os/loadavg))]
+    (when (number? a) a)))
+
+(defn- heartbeat-body []
+  (js/JSON.stringify
+   (clj->js (cond-> {"observed-at-ms" (.now js/Date)
+                     "metrics" (cond-> {"uptimeSeconds" (js/Math.round (os/uptime))}
+                                 (some? (load1)) (assoc "load1" (load1)))}))))
+
+(defn- sign-b64url [message]
+  (-> (crypto/sign nil (js/Buffer.from message "utf8") (:key loaded))
+      (.toString "base64url")))
+
+(defn- send-heartbeat!
+  "Promise<nil>. Reports what happened and never throws: a node that could not
+  reach its plane and one whose report was refused must not print the same
+  thing, and neither may look like one that was stored."
+  []
+  (let [body (heartbeat-body)
+        digest (-> (.createHash crypto "sha256") (.update body) (.digest "hex"))
+        message (attest/heartbeat-signing-input
+                 {:did did :endpoint endpoint :body-sha256 digest})]
+    (if-not (string? message)
+      (do (say "AIUEOS_NODE_HEARTBEAT_UNSIGNABLE" (str (:error message)))
+          (js/Promise.resolve nil))
+      (-> (js/fetch (str endpoint "/api/devices/" (js/encodeURIComponent did) "/heartbeat")
+                    #js {:method "POST"
+                         :headers #js {"content-type" "application/json"
+                                       "x-aiueos-signature" (sign-b64url message)}
+                         :body body})
+          (.then (fn [^js r]
+                   (-> (.text r)
+                       (.then (fn [t]
+                                (say (if (= 202 (.-status r))
+                                       "AIUEOS_NODE_HEARTBEAT_STORED"
+                                       "AIUEOS_NODE_HEARTBEAT_REFUSED")
+                                     (str "status=" (.-status r)) (str/trim t))
+                                nil)))))
+          (.catch (fn [e]
+                    (say "AIUEOS_NODE_HEARTBEAT_UNREACHABLE" (str (.-message e)))
+                    nil))))))
+
+(let [{:keys [code error]} (run-agent)
+      _ (when (or (= :spawn-failed code) (nil? code))
+          (say "AIUEOS_NODE_ATTEST_NOT_RUN" (or error "the agent process did not start"))
+          (js/process.exit 2))
+      ;; The OUTCOME, not the code. Exit 0 covers both `proved` and `idle`, and
+      ;; reporting them with one marker said a box was claimed when it had only
+      ;; been told there was nothing to answer.
+      outcome (try (str/trim (fs/readFileSync outcome-path "utf8"))
+                   (catch :default _ "unknown"))]
+  (say "AIUEOS_NODE_ATTEST_EXIT" (str code) outcome)
+  (say (case outcome
+         "proved"      "AIUEOS_NODE_CLAIMED"
+         "idle"        "AIUEOS_NODE_NO_CHALLENGE"
+         "rejected"    "AIUEOS_NODE_SIGNATURE_REFUSED"
+         "unreachable" "AIUEOS_NODE_PLANE_UNREACHABLE"
+         "skipped"     "AIUEOS_NODE_SKIPPED"
+         "AIUEOS_NODE_ATTEST_OTHER")
+       (str "exit=" code))
+  ;; The heartbeat runs whatever the enrolment outcome was: a claimed box that
+  ;; has nothing to answer is exactly the box whose liveness matters, and its
+  ;; every tick reports `idle`.
+  (-> (send-heartbeat!)
+      (.then (fn [_] (js/process.exit (if (= 0 code) 0 code))))))

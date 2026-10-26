@@ -1,0 +1,138 @@
+(ns aiueos.value-runtime-provider-transport
+  (:require [aiueos.value-handle-arena :as arena]
+            [aiueos.value-runtime-cas-verify :as cas])
+  (:export [aiueos-value-runtime-provider-submit
+            aiueos-value-runtime-provider-claim
+            aiueos-value-runtime-provider-complete main]))
+
+;; Image-private 512-byte transport queue. Seven 64-byte slots retain the
+;; request-originated expected SHA-256 digest. No user pointer enters the queue.
+
+(defn q-load16 [q index]
+  (+ (kernel-load-u8 q 512 index)
+     (* (kernel-load-u8 q 512 (+ index 1)) 256)))
+(defn q-load32 [q index]
+  (+ (q-load16 q index) (* (q-load16 q (+ index 2)) 65536)))
+(defn q-store16 [q index value]
+  (if (= (kernel-store-u8 q 512 index (bit-and value 255))
+         (bit-and value 255))
+    (if (= (kernel-store-u8 q 512 (+ index 1)
+                            (bit-and (quot value 256) 255))
+           (bit-and (quot value 256) 255)) 1 0) 0))
+(defn q-store32 [q index value]
+  (if (= (q-store16 q index (bit-and value 65535)) 1)
+    (q-store16 q (+ index 2) (bit-and (quot value 65536) 65535)) 0))
+(defn q-store64 [q index value]
+  (if (= (q-store32 q index (bit-and value 4294967295)) 1)
+    (q-store32 q (+ index 4) (quot value 4294967296)) 0))
+
+(defn q-copy-digest [q base digest index]
+  (if (= index 32) 1
+    (let [byte (kernel-load-u8 digest 32 index)]
+      (if (= (kernel-store-u8 q 512 (+ base index) byte) byte)
+        (q-copy-digest q base digest (+ index 1)) 0))))
+(defn q-slot-offset [slot] (+ 32 (* slot 64)))
+(defn q-find-free [q slot]
+  (if (= slot 7) 7
+    (if (= (kernel-load-u8 q 512 (+ (q-slot-offset slot) 4)) 0)
+      slot (q-find-free q (+ slot 1)))))
+(defn q-find-state [q state slot]
+  (if (= slot 7) 7
+    (if (= (kernel-load-u8 q 512 (+ (q-slot-offset slot) 4)) state)
+      slot (q-find-state q state (+ slot 1)))))
+(defn q-find-ticket [q ticket state slot]
+  (if (= slot 7) 7
+    (let [base (q-slot-offset slot)]
+      (if (and (= (kernel-load-u8 q 512 (+ base 4)) state)
+               (= (q-load32 q base) ticket))
+        slot (q-find-ticket q ticket state (+ slot 1))))))
+
+(defn submit-locked [q route domain cap-handle digest]
+  (let [current (q-load32 q 4)
+        ticket (if (= current 0) 1
+                 (if (= current 4294967295) 0 (+ current 1)))
+        slot (q-find-free q 0)]
+    (if (and (or (= route 14) (= route 15))
+             (> domain 0) (<= domain 32767) (> cap-handle 0)
+             (> ticket 0)
+             (> digest 0) (< slot 7))
+      (let [base (q-slot-offset slot)]
+        (if (and (= (q-store32 q base ticket) 1)
+                 (= (kernel-store-u8 q 512 (+ base 5) route) route)
+                 (= (q-store16 q (+ base 6) domain) 1)
+                 (= (q-store64 q (+ base 8) cap-handle) 1)
+                 (= (q-copy-digest q (+ base 16) digest 0) 1)
+                 (= (q-store64 q (+ base 48) 0) 1)
+                 (= (q-store64 q (+ base 56) 0) 1)
+                 (= (kernel-store-u8 q 512 (+ base 4) 1) 1)
+                 (= (q-store32 q 4 ticket) 1))
+          ticket 0))
+      0)))
+
+(defn aiueos-value-runtime-provider-submit
+  [route :i64 domain :i64 cap-handle :i64 digest :i64] :i64
+  (let [q (kernel-value-provider-queue)]
+    (if (and (> (kernel-value-runtime-arena domain) 0)
+             (= (kernel-try-lock-u32 q 512 0) 1))
+      (let [result (submit-locked q route domain cap-handle digest)
+            released (kernel-unlock-u32 q 512 0)]
+        (if (= released 1) result 0)) 0)))
+
+(defn claim-locked [q]
+  (let [slot (q-find-state q 1 0)]
+    (if (< slot 7)
+      (let [base (q-slot-offset slot)
+            ticket (q-load32 q base)
+            route (kernel-load-u8 q 512 (+ base 5))
+            domain (q-load16 q (+ base 6))]
+        (if (= (kernel-store-u8 q 512 (+ base 4) 2) 2)
+          (+ ticket (* route 4294967296) (* domain 1099511627776))
+          0))
+      0)))
+
+(defn aiueos-value-runtime-provider-claim [] :i64
+  (let [q (kernel-value-provider-queue)]
+    (if (= (kernel-try-lock-u32 q 512 0) 1)
+      (let [result (claim-locked q)
+            released (kernel-unlock-u32 q 512 0)]
+        (if (= released 1) result 0)) 0)))
+
+(defn complete-locked [ticket route-domain block block-length descriptor]
+  (let [q (kernel-value-provider-queue)
+        route (bit-and route-domain 255)
+        domain (bit-and (quot route-domain 256) 65535)
+        slot (q-find-ticket q ticket 2 0)]
+    (if (and (< slot 7) (> domain 0) (<= domain 32767)
+             (= route-domain (+ route (* domain 256))))
+      (let [base (q-slot-offset slot)]
+        (if (and (> block 0) (> descriptor 0)
+                 (> block-length 0) (<= block-length 12288)
+                 (= (kernel-load-u8 q 512 (+ base 5)) route)
+                 (= (q-load16 q (+ base 6)) domain))
+          (let [page (kernel-value-runtime-arena domain)
+                scratch (kernel-value-runtime-cas-scratch)
+                output (kernel-subregion scratch 384 0 32)
+                workspace (kernel-subregion scratch 384 32 352)
+                expected (kernel-subregion q 512 (+ base 16) 32)
+                verified (cas/aiueos-value-runtime-cas-verify
+                          block block-length expected output workspace)]
+            (if (and (= verified 1) (> page 0))
+              (let [handle (arena/aiueos-value-handle-arena
+                            page 4096 1 0 descriptor)]
+                (if (> handle 0)
+                  (if (= (kernel-store-u8 q 512 (+ base 4) 0) 0) handle 0)
+                  0))
+              0))
+          0))
+      0)))
+
+(defn aiueos-value-runtime-provider-complete
+  [ticket :i64 route-domain :i64 block :i64
+   block-length :i64 descriptor :i64] :i64
+  (let [q (kernel-value-provider-queue)]
+    (if (= (kernel-try-lock-u32 q 512 0) 1)
+      (let [result (complete-locked ticket route-domain block block-length descriptor)
+            released (kernel-unlock-u32 q 512 0)]
+        (if (= released 1) result 0)) 0)))
+
+(defn main [] :i64 0)

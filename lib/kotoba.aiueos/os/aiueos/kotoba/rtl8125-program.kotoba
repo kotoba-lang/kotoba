@@ -1,0 +1,157 @@
+(ns aiueos.rtl8125-program
+  (:require [aiueos.lib.rtl8125-regs :as reg])
+  (:export [aiueos-rtl8125-program main]))
+
+;; The RTL8125 register sequence: stop the engine, then point it at new rings
+;; and start it again.
+;;
+;;   (aiueos-rtl8125-program mmio-base mmio-length tx-desc-physical
+;;                           rx-desc-physical revision)
+;;
+;; This is the MMIO half of `rings_restart` (kernel/rtl8125.c:160-204) --
+;; everything in that function except the descriptor stores, which
+;; `rtl8125-ring-build` owns.
+;;
+;; ---------------------------------------------------------------------------
+;; THE LAST ARGUMENT IS A PHASE AND A REVISION AT THE SAME TIME
+;; ---------------------------------------------------------------------------
+;;   revision 0     STOP PHASE. Set RGE_CMD_STOP, wait for the transmit FIFO to
+;;                  drain, clear RGE_CMD. `tx-desc-physical` and
+;;                  `rx-desc-physical` are not read.
+;;   revision 1..4  PROGRAM PHASE. Publish the descriptors, load the ring
+;;                  addresses, set the receive filter for that silicon
+;;                  revision, and enable transmit and receive.
+;;
+;; That is not an economy, it is the C's own ordering made expressible. The C
+;; runs stop -> drain -> clear -> BUILD THE DESCRIPTORS -> program -> enable, in
+;; one function, because it can call `bytes_zero` in the middle. A Kotoba object
+;; cannot call another object, so the caller has to be the one that interleaves,
+;; and to interleave it needs two entries. Two entries need either two symbols
+;; or one argument that says which -- and the argument that says which was
+;; already there, because the program phase needs the revision and the stop
+;; phase does not. Zero is not a revision `revision-of` ever returns.
+;;
+;; Building the rings BEFORE the stop, to avoid the two-phase call, is not the
+;; same program. On a restart the ring registers still point at these very
+;; descriptors and the engine may still be running: rewriting a descriptor's
+;; address while the hardware owns it is how a frame lands in a buffer the
+;; kernel has already handed on. The C stops first for that reason and so does
+;; this.
+;;
+;; ZERO IS SUCCESS. Non-zero is `enum aiueos_rtl8125_result` unchanged:
+;;   1  AIUEOS_RTL8125_INVALID       arguments; no MMIO access was performed
+;;   4  AIUEOS_RTL8125_FIFO_TIMEOUT  the transmit FIFO never reported empty
+;;
+;; ---------------------------------------------------------------------------
+;; THE DRAIN, AND WHY IT HAS TWO BOUNDS
+;; ---------------------------------------------------------------------------
+;; The C spins a literal 300,000 times reading RGE_MCUCMD (0xd3) until both
+;; RGE_FIFO_EMPTY bits (0x30) are set (:171-178). A spin count is not a timeout:
+;; how long 300,000 register reads take depends on the machine, and an MMIO read
+;; from a device that has stopped answering is not the same cost as one from a
+;; device that is merely busy.
+;;
+;; So this keeps the C's literal budget AND adds a `kernel-rdtsc` deadline. The
+;; budget is what makes the object's cost closed-form -- 300,020 charged calls
+;; at the worst shape, which is what its fuel tier is computed from -- and the
+;; deadline is what makes the WALL TIME bounded. The deadline can only make the
+;; loop end earlier, so it does not move the fuel bound.
+;;
+;; 2,000,000,000 TSC ticks is between half a second and a second on the machines
+;; this kernel runs on, and the constant is deliberately generous: it exists to
+;; stop a boot hanging on a wedged device, not to be a tight timing gate. On any
+;; machine where 300,000 register reads take less than that, the two bounds
+;; agree with the C exactly and the deadline is never the reason the loop ends.
+;;
+;; A VALUE-SCALED loop -- one whose iteration count came from an argument --
+;; would make the fuel bound a function of the caller, and a fuel bound that
+;; depends on the caller is not a bound. Both of these are literals.
+
+;; RGE_MCUCMD 0xd3 = 211, RGE_FIFO_EMPTY 0x30 = 48. Returns 0 when the FIFO
+;; reported empty and 4 (FIFO_TIMEOUT) when either bound ran out.
+(defn drain [mmio-base mmio-length deadline budget]
+  (if (= 48 (bit-and (kernel-load-u8-4k mmio-base mmio-length 211) 48))
+    0
+    (if (<= budget 0)
+      4
+      (if (> (kernel-rdtsc) deadline)
+        4
+        (drain mmio-base mmio-length deadline (- budget 1))))))
+
+;; rtl8125.c:169-179. RGE_CMD 0x37 = 55, RGE_CMD_STOP 0x80 = 128.
+;;
+;; The C sets its `device->ready = 0` on the timeout path; that field belongs to
+;; the caller's struct and the reason code is what tells it to.
+(defn stop-and-drain [mmio-base mmio-length]
+  (let [stop (kernel-store-u8-4k mmio-base mmio-length 55
+                                 (bit-or (kernel-load-u8-4k mmio-base mmio-length 55)
+                                         128))]
+    (let [drained (drain mmio-base mmio-length
+                         (+ (kernel-rdtsc) 2000000000)
+                         300000)]
+      (if (> drained 0)
+        drained
+        (let [clear (kernel-store-u8-4k mmio-base mmio-length 55 0)]
+          0)))))
+
+;; rtl8125.c:190-202, in the C's order. The order is the program: the interrupt
+;; mask goes to zero before anything else so a half-installed ring cannot raise
+;; one, the ring addresses are loaded while the engine is stopped, and RGE_CMD
+;; is written LAST because that is the write that starts the hardware reading
+;; the descriptors every preceding write described.
+;;
+;;   0x38 = 56  RGE_IMR        0            mask every interrupt
+;;   0x3c = 60  RGE_ISR        0xffffffff   acknowledge everything pending
+;;   0x20 = 32  RGE_TXDESC_LO  low 32 bits of the transmit ring
+;;   0x24 = 36  RGE_TXDESC_HI  high 32 bits
+;;   0xe4 = 228 RGE_RXDESC_LO  low 32 bits of the receive ring
+;;   0xe8 = 232 RGE_RXDESC_HI  high 32 bits
+;;   0xda = 218 RGE_RXMAXSIZE  2048 = AIUEOS_RTL8125_FRAME_CAPACITY (u16)
+;;   0x40 = 64  RGE_TXCFG      0x03000700 = RGE_TXCFG_CONFIG
+;;   0x44 = 68  RGE_RXCFG      revision word | individual | broadcast
+;;   0x37 = 55  RGE_CMD        0x0c = RGE_CMD_TX | RGE_CMD_RX
+;;
+;; `quot` by 2^32 rather than a shift for the high halves: the address is
+;; non-negative (`desc-ok`), so truncating and flooring agree, and this file
+;; does not depend on the shift operators being admitted on every route.
+;;
+;; The leading store fence is not in the C at this point -- the C issues its
+;; release fence at the end of the descriptor stores, which in this split
+;; happened in a different object and a different call. Publishing again here
+;; costs one instruction and makes the ordering a property of THIS object
+;; rather than of the caller's sequencing.
+(defn program-registers [mmio-base mmio-length tx-phys rx-phys revision]
+  (let [f (kernel-fence-store)]
+    (let [imr (kernel-store-u32-4k mmio-base mmio-length 56 0)]
+      (let [isr (kernel-store-u32-4k mmio-base mmio-length 60 4294967295)]
+        (let [txlo (kernel-store-u32-4k mmio-base mmio-length 32
+                                        (bit-and tx-phys 4294967295))]
+          (let [txhi (kernel-store-u32-4k mmio-base mmio-length 36
+                                          (quot tx-phys 4294967296))]
+            (let [rxlo (kernel-store-u32-4k mmio-base mmio-length 228
+                                            (bit-and rx-phys 4294967295))]
+              (let [rxhi (kernel-store-u32-4k mmio-base mmio-length 232
+                                              (quot rx-phys 4294967296))]
+                (let [maxs (kernel-store-u16-4k mmio-base mmio-length 218 2048)]
+                  (let [txcfg (kernel-store-u32-4k mmio-base mmio-length 64 50333440)]
+                    (let [rxcfg (kernel-store-u32-4k mmio-base mmio-length 68
+                                                     (reg/receive-config revision))]
+                      (let [cmd (kernel-store-u8-4k mmio-base mmio-length 55 12)]
+                        0))))))))))))
+
+(defn aiueos-rtl8125-program [mmio-base mmio-length tx-phys rx-phys revision]
+  (if (or (= 0 (reg/mmio-ok mmio-base mmio-length))
+          (< revision 0)
+          (> revision 4))
+    1
+    (if (= revision 0)
+      (stop-and-drain mmio-base mmio-length)
+      ;; The descriptor addresses are checked only on the phase that uses them,
+      ;; so the stop phase does not require a caller to have allocated rings it
+      ;; is about to rebuild.
+      (if (or (= 0 (reg/desc-ok tx-phys))
+              (= 0 (reg/desc-ok rx-phys)))
+        1
+        (program-registers mmio-base mmio-length tx-phys rx-phys revision)))))
+
+(defn main [] 0)

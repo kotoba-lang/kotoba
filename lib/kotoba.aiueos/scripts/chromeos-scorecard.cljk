@@ -1,0 +1,106 @@
+#!/usr/bin/env kbb
+;; Validate and score the ChromeOS-grade scorecard (JUN-90).
+;;
+;;   kbb --backend sci scripts/chromeos-scorecard.cljk [--file F] [--min PCT] [--markdown]
+;;
+;; Reads os/aiueos/qualification/chromeos-scorecard-v1.edn and
+;;   1. checks it is well formed: the required rows' weights sum to 100, optional rows weigh 0,
+;;      ids are unique, levels and categories are known, a :pass row names evidence, and NO row is
+;;      :pass while the reference machine is not confirmed by the owner;
+;;   2. checks every evidence link it can: an ADR number has its file, a gate is a profile of
+;;      aiueos.compositor.guest, a path exists;
+;;   3. prints the SCORE (weight of the :pass rows over 100: the only number that means "N% of
+;;      ChromeOS"), and, beside it and never added to it, the QEMU-level progress.
+;; Exit 0 well formed (and, with --min, score >= PCT); 1 not well formed or below --min.
+
+(ns chromeos-scorecard
+  (:require [clojure.edn :as edn]
+            [kotoba.lang.text :as str]
+            ["node:fs" :as fs]
+            ["node:path" :as path]))
+
+(def ^:private args (vec *command-line-args*))
+(defn- opt [f] (let [i (.indexOf args f)] (when-not (neg? i) (nth args (inc i) nil))))
+(def ^:private root (.resolve path (.dirname path *file*) ".."))
+(def ^:private file (or (opt "--file") (.join path root "os" "aiueos" "qualification" "chromeos-scorecard-v1.edn")))
+
+(def ^:private data (edn/read-string (str (.readFileSync fs file "utf8"))))
+(def ^:private rows (:rows data))
+(def ^:private levels (:levels data))
+(def ^:private guest-text (.readFileSync fs (.join path root "src" "aiueos" "compositor" "guest.cljk") "utf8"))
+(def ^:private adr-files (set (map #(subs % 0 4) (filter #(re-find #"^\d{4}-" %) (.readdirSync fs (.join path root "90-docs" "adr"))))))
+
+(defn- exists? [& parts] (.existsSync fs (apply (.-join path) root parts)))
+
+(defn- evidence-problem [e]
+  (let [tok (first (str/split e #"\s+"))]
+    (cond
+      (re-find #"^ADR-\d{4}$" tok) (when-not (contains? adr-files (subs tok 4)) (str "no ADR file for " e))
+      (= tok "task") (let [g (second (str/split e #"\s+"))]
+                       (when-not (.includes (.readFileSync fs (.join path root "scripts" "tasks.edn") "utf8") (str ":" g))
+                         (str "no task " g)))
+      (= tok "gate") (let [g (second (str/split e #"\s+"))]
+                       (when-not (.includes guest-text (str "\"" g "\"")) (str "no guest profile " g)))
+      (= tok "receipt") (let [f (second (str/split e #"\s+"))]
+                          (if-not (exists? f)
+                            (str "no receipt " f)
+                            (let [r (edn/read-string (str (.readFileSync fs (.join path root f) "utf8")))
+                                  bad (remove #(:green? (val %)) (:verdicts r))]
+                              (cond (not (re-find #"^[0-9a-f]{40}$" (str (:commit r)))) (str "receipt " f " names no commit")
+                                    (empty? (:verdicts r)) (str "receipt " f " names no verdict")
+                                    (seq bad) (str "receipt " f " has a red verdict " (key (first bad)))))))
+      (re-find #"\.(md|sh|edn)$" tok)
+      (when-not (or (exists? tok) (exists? "os" "aiueos" "scripts" tok) (exists? "docs" tok))
+        (str "no file " tok))
+      :else nil)))
+
+(defn- problems []
+  (let [ids (map :id rows)
+        req (filter :required rows)
+        opt-rows (remove :required rows)
+        confirmed? (get-in data [:reference-machine :confirmed-by-owner])]
+    (concat
+     (when-not (= 100 (reduce + (map :weight req))) [(str "required weights sum to " (reduce + (map :weight req)) ", not 100")])
+     (when-not (every? zero? (map :weight opt-rows)) ["an optional row has a weight"])
+     (when-not (= (count ids) (count (set ids))) ["duplicate row ids"])
+     (for [r rows :when (not (some #{(:required-level r)} levels))] (str (:id r) ": unknown required-level"))
+     (for [r rows :when (not (contains? (:categories data) (:category r)))] (str (:id r) ": unknown category"))
+     (for [r rows :when (not (#{:pass :unachieved} (:status r)))] (str (:id r) ": status must be :pass or :unachieved"))
+     (for [r rows :when (not (#{:pass :partial :none} (:qemu-progress r)))] (str (:id r) ": unknown qemu-progress"))
+     (for [r rows :when (and (= :pass (:status r)) (empty? (:evidence r)))] (str (:id r) ": :pass without evidence"))
+     (for [r rows :when (and (= :pass (:status r)) (not-any? #(str/starts-with? % "receipt ") (:evidence r)))]
+       (str (:id r) ": :pass without a receipt of a run"))
+     (for [r rows :when (and (= :pass (:status r)) (#{:release :user} (:required-level r))
+                             (not (get-in data [:reference-machine :release-receipt-ok])))]
+       (str (:id r) ": :pass at " (name (:required-level r)) " level on a VM receipt alone"))
+     (for [r rows :when (and (= :pass (:status r)) (not confirmed?))]
+       (str (:id r) ": :pass while the reference machine is not confirmed by the owner"))
+     (for [r rows e (:evidence r) :let [p (evidence-problem e)] :when p] (str (:id r) ": " p)))))
+
+(defn- pct [x] (str (/ (js/Math.round (* 1000 x)) 10) "%"))
+
+(let [ps (vec (problems))
+      req (filter :required rows)
+      score (/ (reduce + (map :weight (filter #(= :pass (:status %)) req))) 100.0)
+      prog (/ (reduce + (map #(* (:weight %) ({:pass 1.0 :partial 0.5 :none 0.0} (:qemu-progress %))) req)) 100.0)
+      by-cat (group-by :category req)
+      min-pct (when-let [m (opt "--min")] (/ (parse-double m) 100.0))]
+  (doseq [p ps] (println "PROBLEM" p))
+  (println (str "rows=" (count rows) " required=" (count req) " optional=" (- (count rows) (count req))
+                " reference-machine-confirmed=" (boolean (get-in data [:reference-machine :confirmed-by-owner]))))
+  (doseq [[c title] (:categories data)]
+    (let [rs (get by-cat c)
+          w (reduce + (map :weight rs))
+          p (reduce + (map :weight (filter #(= :pass (:status %)) rs)))
+          q (reduce + (map #(* (:weight %) ({:pass 1.0 :partial 0.5 :none 0.0} (:qemu-progress %))) rs))]
+      (println (str "  " (name c) " (" title "): weight " w ", pass " p ", qemu-progress " (/ (js/Math.round (* 10 q)) 10)))))
+  (println (str "SCORE " (pct score) "   (weight of :pass rows over 100; a :pass needs a receipt of a run in the reference VM; design and hosted evidence do not count)"))
+  (println (str "QEMU-PROGRESS " (pct prog) "   (not part of the score: pass = 1, partial = 1/2, none = 0, by weight)"))
+  (when (get args 0)
+    (when (some #{"--markdown"} args)
+      (println "\n| id | row | weight | needs | qemu |\n|---|---|---|---|---|")
+      (doseq [r req]
+        (println (str "| " (name (:id r)) " | " (:title r) " | " (:weight r) " | " (name (:required-level r)) " | " (name (:qemu-progress r)) " |")))))
+  (if (and (empty? ps) (or (nil? min-pct) (>= score min-pct)))
+    (println "AIUEOS_CHROMEOS_SCORECARD_OK")
+    (do (println "AIUEOS_CHROMEOS_SCORECARD_FAIL") (.exit js/process 1))))

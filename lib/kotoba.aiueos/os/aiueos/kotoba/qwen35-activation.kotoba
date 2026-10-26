@@ -1,0 +1,278 @@
+(ns aiueos.qwen35-activation
+  (:export [aiueos-qwen35-activation main]))
+
+;; The scalar activations of the Qwen3.5 forward pass, applied elementwise over
+;; a caller-owned binary32 vector. Ports of `local_exp` (:156),
+;; `local_log1p` (:176), `softplus` (:193), `sigmoid` (:211) and `silu` (:222)
+;; in `kernel/qwen35_infer.c`.
+;;
+;; ## Modes
+;;
+;;   0  silu           a[i] = a[i] * sigmoid(a[i])
+;;   1  sigmoid        a[i] = sigmoid(a[i])
+;;   2  softplus       a[i] = softplus(a[i])
+;;   3  exp            a[i] = local_exp(a[i])
+;;   4  silu-gate      a[i] = silu(a[i]) * b[i]      -- `ffn`'s inner loop
+;;   5  conv4-first    a[i] = a[i] * b[4i+3]          -- `linear_attention`'s
+;;   6  conv4-next     a[i] = a[i] * b[4i+3]             kernel-4 depthwise conv
+;;                            + (h[3i]*b[4i] + h[3i+1]*b[4i+1]) + h[3i+2]*b[4i+2]
+;;
+;; Modes 5 and 6 are the causal depthwise convolution of the linear-attention
+;; layers (ADR-0175 named it as what stays C in `linear_attention`; aiueos
+;; ADR-0222 moved it here). `b` is the conv1d tensor, four f32 per channel,
+;; oldest tap first; `spare` is the channel's three-entry history, oldest
+;; first, or zero when there is no decode cache (mode 5 only). Mode 5 is the
+;; token at position 0 or without a cache, whose history the C does not read;
+;; mode 6 is every later token, and adds the three history taps as ONE
+;; right-hand side -- the C's `mixed += h0*k0 + h1*k1 + h2*k2` evaluates the
+;; whole sum before the add, so the object does too. Adding three zero taps in
+;; mode 5 instead of skipping them would NOT be the same value: a -0 product
+;; plus +0 is +0. With a history, both modes then shift it (h0 <- h1,
+;; h1 <- h2, h2 <- the channel's input BEFORE the conv).
+;;
+;; They are here rather than a new object because the conv is per channel
+;; like every mode above, fits the five-argument ABI (the history is `spare`,
+;; which modes 0..4 ignore), and a new export is a row in kotoba-native's
+;; closed allowlist plus a fuel tier. The tier this object already has
+;; (16,777,216) still covers the conv at the 65,536 ceiling: in the KIR
+;; oracle the contract's 24-channel mode-6 vector passes at fuel 1,024 and
+;; traps at 512 (the limit rounds up to a power of two), so at most 43 per
+;; channel, 2.8M at the ceiling, 6x under the tier. `linear_attention` asks
+;; for 10,240 channels.
+;;
+;; Mode 4 is here rather than left to the caller because it is one statement in
+;; the C (`scratch_a[i] = silu(scratch_a[i]) * scratch_b[i]`) and splitting it
+;; would mean writing the intermediate back to memory, which rounds nothing
+;; extra but doubles the traffic over 17,408 elements.
+;;
+;; ## Return
+;;
+;; **Zero is the success value.**
+;;
+;;    0    the vector was written
+;;   -1    null a
+;;   -2    mode outside 0..6
+;;   -3    count outside 1..65536
+;;   -4    mode 4, 5 or 6 with a null b
+;;   -5    mode 6 with a null history (a later token has to have one)
+;;
+;; ## The integer truncation the C gets from a cast
+;;
+;; `local_exp` computes `(int32_t)(scaled + 0.5f)`, and this dialect has no
+;; float-to-int operation: `f32-to-i64-truncating` and `f32-to-i64-checked` are
+;; both REFUSED for native (kotoba-kir's float admission list -- x86 yields
+;; INT64_MIN out of domain, AArch64 saturates and the oracle traps, so there is
+;; no one answer to admit). `trunc-f32` below does it from the bit pattern
+;; instead, which is exact for the only range that reaches it: the C clamps
+;; `value` to [-87, 88] first, so `scaled + 0.5` is inside (-127, 128) and the
+;; binary32 exponent is at most 6.
+
+(defn f32w [u]
+  (if (> u 2147483647) (- u 4294967296) u))
+
+(defn u32w [v]
+  (bit-and v 4294967295))
+
+(defn f32-at [base n4 i]
+  (f32w (kernel-load-u32 (kernel-subregion base n4 (* i 4) 4) 4 0)))
+
+(defn pow2 [k]
+  (if (= k 0) 1 (if (= k 1) 2 (if (= k 2) 4 (if (= k 3) 8 (if (= k 4) 16
+  (if (= k 5) 32 (if (= k 6) 64 (if (= k 7) 128 (if (= k 8) 256
+  (if (= k 9) 512 (if (= k 10) 1024 (if (= k 11) 2048 (if (= k 12) 4096
+  (if (= k 13) 8192 (if (= k 14) 16384 (if (= k 15) 32768 (if (= k 16) 65536
+  (if (= k 17) 131072 (if (= k 18) 262144 (if (= k 19) 524288
+  (if (= k 20) 1048576 (if (= k 21) 2097152 (if (= k 22) 4194304
+  (if (= k 23) 8388608 0)))))))))))))))))))))))))
+
+;; `(int32_t)x`, truncating toward zero, from the binary32 pattern. Only the
+;; magnitudes `local_exp` can produce reach here (below 128), so the exponent
+;; is at most 6 and the shift never runs off the mantissa.
+(defn trunc-magnitude [b]
+  (let [e (- (bit-and (quot b 8388608) 255) 127)]
+    (if (< e 0) 0
+      (if (> e 23) 0
+        (quot (bit-or (bit-and b 8388607) 8388608) (pow2 (- 23 e)))))))
+
+(defn trunc-f32 [bits]
+  (let [b (bit-and bits 4294967295)]
+    (if (>= b 2147483648)
+      (- 0 (trunc-magnitude (- b 2147483648)))
+      (trunc-magnitude b))))
+
+;; `local_exp`. The clamps, the range reduction and the degree-5 Taylor
+;; polynomial, in the C's order: every `+` and `*` below is the C's, so the
+;; roundings are the C's.
+(defn exp-poly [r]
+  (f32-to-bits
+   (f32-add
+    (f32-add (f32-from-bits 1065353216) (f32-from-bits r))
+    (f32-mul (f32-mul (f32-from-bits r) (f32-from-bits r))
+             (f32-add (f32-from-bits 1056964608)
+                      (f32-mul (f32-from-bits r)
+                               (f32-add (f32-from-bits 1042983595)
+                                        (f32-mul (f32-from-bits r)
+                                                 (f32-add (f32-from-bits 1026206379)
+                                                          (f32-mul (f32-from-bits r)
+                                                                   (f32-add (f32-from-bits 1007192198)
+                                                                            (f32-mul (f32-from-bits r)
+                                                                                     (f32-from-bits 985009044)))))))))))))
+
+(defn exp-from [x e]
+  (f32-to-bits
+   (f32-mul (f32-from-bits (exp-poly (f32-to-bits
+                       (f32-sub (f32-from-bits x)
+                                (f32-mul (i64-to-f32-rounded e)
+                                         (f32-from-bits 1060205080))))))
+            (f32-from-bits (f32w (u32w (* (+ e 127) 8388608)))))))
+
+(defn exp-clamped [x]
+  (exp-from x
+            (let [s (f32-to-bits (f32-mul (f32-from-bits x) (f32-from-bits 1069066811)))]
+              (if (f32-ge (f32-from-bits s) (f32-from-bits 0))
+                (trunc-f32 (f32-to-bits (f32-add (f32-from-bits s) (f32-from-bits 1056964608))))
+                (trunc-f32 (f32-to-bits (f32-sub (f32-from-bits s) (f32-from-bits 1056964608))))))))
+
+(defn local-exp [x]
+  (if (f32-le (f32-from-bits x) (f32-from-bits -1028784128))
+    0
+    (if (f32-ge (f32-from-bits x) (f32-from-bits 1118830592))
+      (exp-clamped 1118830592)
+      (exp-clamped x))))
+
+;; `local_log1p`: 2 * atanh(x/(2+x)) as an odd series to the 13th power, terms
+;; added in the C's order.
+(defn log1p-terms [z2 term sum k]
+  (if (> k 13)
+    sum
+    (let [t (f32-to-bits (f32-mul (f32-from-bits term) (f32-from-bits z2)))
+          r (if (= k 3) 1051372203
+              (if (= k 5) 1045220557
+                (if (= k 7) 1041385765
+                  (if (= k 9) 1038323257
+                    (if (= k 11) 1035611788 1033734617)))))]
+      (log1p-terms z2 t
+                   (f32-to-bits (f32-add (f32-from-bits sum)
+                                         (f32-mul (f32-from-bits t) (f32-from-bits r))))
+                   (+ k 2)))))
+
+(defn local-log1p [x]
+  (let [z (f32-to-bits (f32-div (f32-from-bits x)
+                                (f32-add (f32-from-bits 1073741824) (f32-from-bits x))))]
+    (f32-to-bits
+     (f32-mul (f32-from-bits 1073741824)
+              (f32-from-bits (log1p-terms (f32-to-bits (f32-mul (f32-from-bits z) (f32-from-bits z)))
+                                          z z 3))))))
+
+(defn softplus [x]
+  (if (f32-ge (f32-from-bits x) (f32-from-bits 1101004800))
+    x
+    (if (f32-le (f32-from-bits x) (f32-from-bits -1046478848))
+      (local-exp x)
+      (if (f32-ge (f32-from-bits x) (f32-from-bits 0))
+        (f32-to-bits (f32-add (f32-from-bits x)
+                              (f32-from-bits (local-log1p (local-exp (f32-to-bits (f32-neg (f32-from-bits x))))))))
+        (local-log1p (local-exp x))))))
+
+(defn sigmoid [x]
+  (if (f32-ge (f32-from-bits x) (f32-from-bits 0))
+    (f32-to-bits (f32-div (f32-from-bits 1065353216)
+                          (f32-add (f32-from-bits 1065353216)
+                                   (f32-from-bits (local-exp (f32-to-bits (f32-neg (f32-from-bits x))))))))
+    (f32-to-bits (f32-div (f32-from-bits (local-exp x))
+                          (f32-add (f32-from-bits 1065353216) (f32-from-bits (local-exp x)))))))
+
+(defn silu [x]
+  (f32-to-bits (f32-mul (f32-from-bits x) (f32-from-bits (sigmoid x)))))
+
+(defn apply-one [mode x]
+  (if (= mode 0) (silu x)
+    (if (= mode 1) (sigmoid x)
+      (if (= mode 2) (softplus x)
+        (local-exp x)))))
+
+(defn walk [mode a count i]
+  (if (>= i count)
+    0
+    (do (kernel-store-u32 (kernel-subregion a (* count 4) (* i 4) 4) 4 0
+                          (u32w (apply-one mode (f32-at a (* count 4) i))))
+        (walk mode a count (+ i 1)))))
+
+;; `ffn`'s `scratch_a[i] = silu(scratch_a[i]) * scratch_b[i]`, one statement.
+(defn walk-gate [a b count i]
+  (if (>= i count)
+    0
+    (do (kernel-store-u32
+         (kernel-subregion a (* count 4) (* i 4) 4) 4 0
+         (u32w (f32-to-bits
+                (f32-mul (f32-from-bits (silu (f32-at a (* count 4) i)))
+                         (f32-from-bits (f32-at b (* count 4) i))))))
+        (walk-gate a b count (+ i 1)))))
+
+;; --- modes 5 and 6: `linear_attention`'s kernel-4 depthwise conv -----------
+
+(defn store-f32 [base n4 i bits]
+  (kernel-store-u32 (kernel-subregion base n4 (* i 4) 4) 4 0 (u32w bits)))
+
+;; `history[0] * kernel[4c] + history[1] * kernel[4c+1] + history[2] * kernel[4c+2]`,
+;; left to right: the first two products are added, then the third.
+(defn conv-history [b h count c]
+  (f32-to-bits
+   (f32-add (f32-add (f32-mul (f32-from-bits (f32-at h (* count 12) (* c 3)))
+                              (f32-from-bits (f32-at b (* count 16) (* c 4))))
+                     (f32-mul (f32-from-bits (f32-at h (* count 12) (+ (* c 3) 1)))
+                              (f32-from-bits (f32-at b (* count 16) (+ (* c 4) 1)))))
+            (f32-mul (f32-from-bits (f32-at h (* count 12) (+ (* c 3) 2)))
+                     (f32-from-bits (f32-at b (* count 16) (+ (* c 4) 2)))))))
+
+;; `current * kernel[4c+3]`: mode 5's whole value and mode 6's first term.
+(defn conv-tap3 [a b count c]
+  (f32-to-bits (f32-mul (f32-from-bits (f32-at a (* count 4) c))
+                        (f32-from-bits (f32-at b (* count 16) (+ (* c 4) 3))))))
+
+;; history[0] = history[1]; history[1] = history[2]; history[2] = current.
+(defn conv-shift [h count c current]
+  (do (store-f32 h (* count 12) (* c 3) (f32-at h (* count 12) (+ (* c 3) 1)))
+      (store-f32 h (* count 12) (+ (* c 3) 1) (f32-at h (* count 12) (+ (* c 3) 2)))
+      (store-f32 h (* count 12) (+ (* c 3) 2) current)))
+
+;; Two walks rather than one with a mode argument: the ABI stops at five
+;; parameters, and a walk needs a b h count c. In both, the mixed value is
+;; computed from the OLD history before the shift writes the new one, and from
+;; the input before the store overwrites it -- the C's order, where `current`
+;; is read once at the top of the channel.
+(defn conv-walk-first [a b h count c]
+  (if (>= c count)
+    0
+    (let [current (f32-at a (* count 4) c)
+          mixed (conv-tap3 a b count c)]
+      (do (if (= h 0) 0 (conv-shift h count c current))
+          (store-f32 a (* count 4) c mixed)
+          (conv-walk-first a b h count (+ c 1))))))
+
+(defn conv-walk-next [a b h count c]
+  (if (>= c count)
+    0
+    (let [current (f32-at a (* count 4) c)
+          mixed (f32-to-bits (f32-add (f32-from-bits (conv-tap3 a b count c))
+                                      (f32-from-bits (conv-history b h count c))))]
+      (do (conv-shift h count c current)
+          (store-f32 a (* count 4) c mixed)
+          (conv-walk-next a b h count (+ c 1))))))
+
+(defn aiueos-qwen35-activation [mode a b count spare]
+  (if (= a 0) -1
+    (if (< mode 0) -2
+      (if (> mode 6) -2
+        (if (< count 1) -3
+          (if (> count 65536) -3
+            (if (< mode 4)
+              (walk mode a count 0)
+              (if (= b 0) -4
+                (if (= mode 4)
+                  (walk-gate a b count 0)
+                  (if (= mode 5)
+                    (conv-walk-first a b spare count 0)
+                    (if (= spare 0) -5 (conv-walk-next a b spare count 0))))))))))))
+
+(defn main [] 0)

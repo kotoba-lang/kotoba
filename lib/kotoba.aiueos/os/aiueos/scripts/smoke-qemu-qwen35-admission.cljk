@@ -1,0 +1,376 @@
+#!/usr/bin/env kbb
+;; The GGUF admission (ADR-0145) EXECUTED on a CPU.
+;;
+;; ADR-0145 moved the whole of `kernel/qwen35_runtime.c`'s parser into three
+;; Kotoba objects and made the C delegate to them. Nothing ran that: the
+;; objects passed a KIR-interpreter oracle, the image linked, and this
+;; workstation is aarch64, so the emitted x86-64 had never been on a processor.
+;;
+;; This boots a real image under OVMF and hands it the 10,996,640-byte
+;; metadata + tensor-table prefix `tests/make_qwen35_header_fixture.py` builds
+;; -- the same fixture `scripts/smoke-qwen35-runtime.sh` feeds to the C
+;; reference parser on the host -- through the model-handoff path, and requires
+;; the kernel to print the numbers the objects derived.
+;;
+;;   kbb --backend sci os/aiueos/scripts/smoke-qemu-qwen35-admission.cljk
+;;     the fixture is admitted; the kernel prints QWEN-ADMIT reason=0 stage=0
+;;     and the four representative tensor offsets the host gate asserts.
+;;
+;;   AIUEOS_QWEN35_ADMISSION_MUTATE=1 nbb …
+;;     one byte of one tensor record -- the `type` field of
+;;     `token_embd.weight`, Q2_K -> Q4_K -- is changed, and the kernel must
+;;     refuse with QWEN-ADMIT reason=-21 stage=3.
+;;
+;; -21 is clause 21 of `kotoba/qwen35-tensor-table-bind.kotoba` ("token_embd
+;; retyped, which the contract forbids"), and stage 3 names that object. The C
+;; in this image cannot produce either number: under
+;; -DAIUEOS_QWEN35_KOTOBA_ADMISSION `aiueos_qwen35_model_parse` returns 0 or 1
+;; and every negative value it can report was written in a .kotoba file. That
+;; is the discrimination this gate provides. It is NOT a claim that the C
+;; reference parser would admit the mutated fixture -- it refuses it too, by
+;; design, which is what `aiueos.qwen35-tensor-table-parity-test` exists to
+;; keep true.
+;;
+;;   AIUEOS_QWEN35_ADMISSION_BONSAI=1 kbb --backend sci …
+;;     the SAME image is handed the Bonsai profile's prefix instead (ADR-0222):
+;;     the real 11,120,992 bytes of Ternary-Bonsai-2-27B-PTQ1_0.gguf that
+;;     `bonsai-admission-fixture` range-fetches, turned into a fixture and a
+;;     receipt by `tests/make-bonsai-boot-fixture.cljk`. Every number the
+;;     kernel must print is read from that receipt -- an independent walk of
+;;     the bytes, not the objects -- so none is typed here. With
+;;     AIUEOS_QWEN35_ADMISSION_MUTATE=1 as well, `token_embd.weight`'s type
+;;     PTQ1_0 (143) becomes BF16 (30) and the kernel must refuse with
+;;     reason=-21 stage=3, the same clause under the other profile. No prefix
+;;     on this machine is exit 3.
+
+(require '[kotoba.lang.text :as str])
+(require '[clojure.edn :as edn])
+(def fs (js/require "node:fs"))
+(def os (js/require "node:os"))
+(def path (js/require "node:path"))
+(def cp (js/require "node:child_process"))
+(def crypto (js/require "node:crypto"))
+
+(def aiueos (.resolve path (.dirname path *file*) ".."))
+(def mutate? (= "1" (.-AIUEOS_QWEN35_ADMISSION_MUTATE js/process.env)))
+(def bonsai? (= "1" (.-AIUEOS_QWEN35_ADMISSION_BONSAI js/process.env)))
+
+(defn- die [& msg]
+  (binding [*out* *err*] (apply println (cons "error:" msg)))
+  (.exit js/process 1))
+
+(defn- unmeasured [& msg]
+  ;; Exit 3, not 1: "this machine could not ask the question" is a different
+  ;; answer from "the kernel refused", and a gate that returns the same value
+  ;; for both reports a pass it never measured.
+  (binding [*out* *err*] (apply println (cons "unmeasured:" msg)))
+  (.exit js/process 3))
+
+(def qemu (or (.-QEMU_SYSTEM_X86_64 js/process.env) "qemu-system-x86_64"))
+
+(defn- which [program]
+  (let [r (.spawnSync cp "sh" #js ["-c" (str "command -v " program)]
+                      #js {:encoding "utf8"})]
+    (when (zero? (.-status r)) (str/trim (.-stdout r)))))
+
+(when-not (which qemu) (unmeasured "qemu-system-x86_64 is required"))
+(def timeout-cmd (or (which "timeout") (which "gtimeout")))
+(when-not timeout-cmd (unmeasured "timeout or gtimeout is required"))
+
+(def ovmf-code
+  (or (.-OVMF_CODE js/process.env)
+      (first (filter #(.existsSync fs %)
+                     ["/opt/homebrew/share/qemu/edk2-x86_64-code.fd"
+                      "/usr/share/OVMF/OVMF_CODE_4M.fd"
+                      "/usr/share/OVMF/OVMF_CODE.fd"]))))
+(def ovmf-vars
+  (or (.-OVMF_VARS js/process.env)
+      (first (filter #(.existsSync fs %)
+                     ["/opt/homebrew/share/qemu/edk2-i386-vars.fd"
+                      "/usr/share/OVMF/OVMF_VARS_4M.fd"
+                      "/usr/share/OVMF/OVMF_VARS.fd"]))))
+(when-not ovmf-code (unmeasured "OVMF code not found; set OVMF_CODE"))
+(when-not ovmf-vars (unmeasured "OVMF vars not found; set OVMF_VARS"))
+
+(def work (.mkdtempSync fs (.join path (.tmpdir os) "aiueos-qwen35-admission-")))
+(def esp (.join path work "esp"))
+(.mkdirSync fs (.join path esp "EFI" "BOOT") #js {:recursive true})
+(.mkdirSync fs (.join path esp "EFI" "AIUEOS") #js {:recursive true})
+
+;; ------------------------------------------------------------- the fixture
+
+(def fixture (.join path work "header.gguf"))
+
+;; Both mutations change ONE u32: the ggml type of the `token_embd.weight`
+;; record. The record is located by its length-prefixed name, searched from
+;; `from` -- for Bonsai that is metadata-end, because every tensor name also
+;; appears, length-prefixed the same way, inside the metadata's
+;; `prism.hadamard.weight_names` array, and a search from byte 0 mutates a
+;; string nothing checks (measured by make-bonsai-boot-fixture, 2026-09-22).
+;;   u64 name-length | name | u32 dimension-count | u64 x 2 | u32 type
+;; puts the type field 8 + 17 + 4 + 16 = 45 bytes past the record start.
+(defn- retype-token-embd! [buf from before after]
+  (let [needle (js/Buffer.concat
+                #js [(doto (js/Buffer.alloc 8) (.writeUInt32LE 17 0))
+                     (js/Buffer.from "token_embd.weight" "utf8")])
+        at (.indexOf buf needle from)]
+    (when (neg? at) (die "token_embd.weight is not in the fixture past" from))
+    (let [type-at (+ at 45)
+          found (.readUInt32LE buf type-at)]
+      (when-not (= before found)
+        (die "expected token_embd.weight to be ggml type" before "found" found))
+      (.writeUInt32LE buf after type-at)
+      (println "MUTATED token_embd.weight type" before "->"
+               (.readUInt32LE buf type-at) "at file offset" type-at))))
+
+;; What the kernel must print when it admits, and the length the prefix is.
+;; Qwen3.8's numbers are the host C reference's (tests/qwen35_runtime_model.c);
+;; Bonsai's come from the fixture generator's receipt.
+(def expectation
+  (if bonsai?
+    (let [header (or (.-AIUEOS_BONSAI_HEADER js/process.env)
+                     (.join path aiueos "tests" "fixtures" "large"
+                            "bonsai2-ptq1-header-11120992.bin"))
+          receipt-file (str fixture ".receipt.edn")
+          r (.spawnSync cp "kbb"
+                        #js ["--backend" "sci"
+                             (.join path aiueos "tests" "make-bonsai-boot-fixture.cljk")
+                             fixture "--header" header "--receipt" receipt-file
+                             "--no-controls"]
+                        #js {:stdio "inherit"})]
+      (case (.-status r)
+        0 nil
+        3 (unmeasured "no Bonsai prefix on this machine; run"
+                      "`kbb --backend sci scripts/run-task.cljk bonsai-admission-fixture`")
+        (die "the Bonsai boot fixture generator refused, status" (.-status r)))
+      (let [receipt (edn/read-string (.readFileSync fs receipt-file "utf8"))
+            {:keys [admission handoff fixture]} receipt
+            rep (:representative admission)]
+        {:profile "bonsai2"
+         :bytes (:bytes fixture)
+         :mutate-from (:metadata-end admission)
+         :mutate-types [(get-in rep [:token-embd :type]) 30]
+         :ok (str "AIUEOS_QWEN35_ADMISSION_OK tensors=" (:tensors admission)
+                  " linear=" (:linear admission) " full=" (:full admission)
+                  " data-offset=" (:data-offset handoff)
+                  " embd=" (get-in rep [:token-embd :offset])
+                  " qkv=" (get-in rep [:attn-qkv-0 :offset])
+                  " tail=" (get-in rep [:last :offset])
+                  " artifact=" (:artifact-bytes handoff))}))
+    (let [r (.spawnSync cp "python3"
+                        #js [(.join path aiueos "tests" "make_qwen35_header_fixture.py")
+                             fixture]
+                        #js {:stdio "inherit"})]
+      (when-not (zero? (.-status r)) (die "the header fixture generator failed"))
+      {:profile "qwen38"
+       :bytes 10996640
+       :mutate-from 0
+       :mutate-types [10 12]
+       :ok (str "AIUEOS_QWEN35_ADMISSION_OK tensors=866 linear=48 full=16 "
+                "data-offset=10996640 embd=715182080 qkv=1149091840 "
+                "tail=10923843584 artifact=10934860704")})))
+
+(def fixture-bytes (.readFileSync fs fixture))
+(when-not (= (:bytes expectation) (.-length fixture-bytes))
+  (die "the fixture is" (.-length fixture-bytes) "bytes, not the contract's"
+       (:bytes expectation)))
+
+(when mutate?
+  (let [[before after] (:mutate-types expectation)]
+    (retype-token-embd! fixture-bytes (:mutate-from expectation) before after))
+  (.writeFileSync fs fixture fixture-bytes))
+
+(def part-lengths [4000000 4000000 (- (.-length fixture-bytes) 8000000)])
+(doseq [[index length] (map-indexed vector part-lengths)]
+  (let [start (reduce + 0 (take index part-lengths))]
+    (.writeFileSync fs (.join path esp "EFI" "AIUEOS" (str "Q38P" index ".BIN"))
+                    (.subarray fixture-bytes start (+ start length)))))
+(def fixture-sha
+  (-> (.createHash crypto "sha256") (.update fixture-bytes) (.digest "hex")))
+(println "FIXTURE bytes=" (.-length fixture-bytes) "sha256=" fixture-sha
+         "parts=" (str/join "/" part-lengths))
+
+;; --------------------------------------------------------------- the image
+
+(def build-env
+  (doto (js/Object.assign #js {} js/process.env)
+    (aset "AIUEOS_OUT" (.join path work "release"))
+    (aset "AIUEOS_ALLOW_DIRTY_QUALIFICATION_BUILD" "1")
+    (aset "AIUEOS_QWEN38_MODEL_HANDOFF" "1")
+    (aset "AIUEOS_MODEL_TEST_FIXTURE" "1")
+    (aset "AIUEOS_MODEL_TOTAL_BYTES" (str (.-length fixture-bytes)))
+    (aset "AIUEOS_MODEL_PART0_BYTES" (str (nth part-lengths 0)))
+    (aset "AIUEOS_MODEL_PART1_BYTES" (str (nth part-lengths 1)))
+    (aset "AIUEOS_MODEL_PART2_BYTES" (str (nth part-lengths 2)))
+    (aset "AIUEOS_MODEL_SHA256" fixture-sha)
+    (aset "AIUEOS_MODEL_MIN_ADDRESS" "1073741824")
+    (aset "AIUEOS_MODEL_MAX_ADDRESS" "2147483647")
+    (aset "AIUEOS_PERSISTENT_BOOT" "1")
+    (aset "SOURCE_DATE_EPOCH" "0")))
+
+(println "BUILDING the qualification image with the Kotoba admission linked")
+(let [r (.spawnSync cp (.join path aiueos "scripts" "build-physical-qualification-pxe.sh")
+                    #js [] #js {:stdio "inherit" :env build-env})]
+  ;; A build that did not run is `unmeasured`, not `die`. Exit 1 here would be
+  ;; indistinguishable from "the kernel refused the fixture", which is the one
+  ;; verdict this gate exists to report (ADR-0155).
+  (when-not (zero? (.-status r))
+    (unmeasured "the image build failed with status" (.-status r))))
+
+;; --- freshness floor (ADR-0155) --------------------------------------------
+;;
+;; The build above writes a receipt beside its artifacts naming their sha256
+;; and the state of the `os/aiueos` subtree they came from. Asserting it here
+;; is what makes `AIUEOS_QWEN35_ADMISSION_OK` a statement about the tree in
+;; front of us rather than about whatever bytes were in the output directory.
+(when-not (which "nbb")
+  (unmeasured "nbb is required to check the image freshness receipt"))
+(let [r (.spawnSync cp "nbb"
+                    #js [(.join path aiueos "scripts" "image-freshness.cljk")
+                         "assert"
+                         ;; build-physical-qualification-pxe.sh runs build-uefi.sh
+                         ;; with AIUEOS_OUT=<out>/core and copies the result up,
+                         ;; so the receipt is one level down from the PXE image.
+                         "--receipt" (.join path work "release" "core"
+                                            "image-receipt.edn")
+                         "--root" (.resolve path aiueos ".." "..")]
+                    #js {:stdio "inherit"})]
+  (when-not (zero? (.-status r)) (.exit js/process (.-status r))))
+
+;; The receipt covers what `build-uefi.sh` produced. What BOOTS is the PXE
+;; wrapper the qualification build derives from it, copied into the ESP -- so
+;; the copy is checked too. "The build was fresh" and "the fresh bytes are the
+;; ones QEMU opened" are two claims, and only the second is about this file.
+(def pxe-efi (.join path work "release" "aiueos-k16-native-pxe.efi"))
+(def booted-efi (.join path esp "EFI" "BOOT" "BOOTX64.EFI"))
+(.copyFileSync fs pxe-efi booted-efi)
+(let [digest (fn [f] (-> (.createHash crypto "sha256")
+                         (.update (.readFileSync fs f))
+                         (.digest "hex")))
+      produced (digest pxe-efi)
+      booted (digest booted-efi)]
+  (when-not (= produced booted)
+    (binding [*out* *err*]
+      (println "REFUSED stale-image artifact=" booted-efi
+               "expected=" produced "found=" booted))
+    (.exit js/process 4))
+  (println "IMAGE-FRESH pxe-efi sha256=" produced))
+(.copyFileSync fs ovmf-vars (.join path work "vars.fd"))
+
+;; ------------------------------------- the image holds no C GGUF parser
+;;
+;; The console alone cannot tell you WHO decided: a C parser that agreed with
+;; the objects would print the same numbers. This reads the object the image
+;; actually links. Under -DAIUEOS_QWEN35_KOTOBA_ADMISSION the three entries are
+;; UNDEFINED -- the image does not link without them -- and none of the
+;; reference parser's functions is present, not even as a local symbol.
+(let [object (.join path work "release" "core" "kernel-qwen35-runtime.o")
+      r (.spawnSync cp "nm" #js [object] #js {:encoding "utf8"})
+      symbols (or (.-stdout r) "")
+      lines (remove str/blank? (str/split-lines symbols))
+      defined (into #{} (keep (fn [line]
+                                (let [parts (str/split (str/trim line) #"\s+")]
+                                  (when (and (= 3 (count parts))
+                                             (not= "U" (second parts)))
+                                    (nth parts 2))))
+                              lines))
+      undefined (into #{} (keep (fn [line]
+                                  (let [parts (str/split (str/trim line) #"\s+")]
+                                    (when (and (= 2 (count parts))
+                                               (= "U" (first parts)))
+                                      (second parts))))
+                                lines))
+      entries ["kotoba_aiueos_qwen35_gguf_header_valid"
+               "kotoba_aiueos_qwen35_gguf_kv_scan"
+               "kotoba_aiueos_qwen35_tensor_table_bind"]
+      c-parser ["parse_metadata" "exact_contract_valid" "tensor_storage"
+                "read_expected_u32" "assign_tensor" "type_layout"]]
+  (when-not (zero? (.-status r)) (unmeasured "nm could not read" object))
+  (when (empty? lines) (unmeasured "nm reported no symbols for" object))
+  (when-not (contains? defined "aiueos_qwen35_model_parse")
+    (die "nm read something, but not this object: no aiueos_qwen35_model_parse"))
+  (doseq [e entries]
+    (when-not (contains? undefined e)
+      (die "the image does not import" e "-- it is not delegating")))
+  (doseq [f c-parser]
+    (when (contains? defined f)
+      (die "the C reference parser is IN the image:" f)))
+  (println "LINK scanned=" (count lines) "imports=" (count entries)
+           "c-parser-symbols=0 defined=" (str/join "," (sort defined))))
+
+;; ---------------------------------------------------------------- the boot
+
+(def serial-log (.join path work "native.serial"))
+(def debug-log (.join path work "native.debug"))
+(def seconds (or (.-AIUEOS_QWEN35_ADMISSION_SECONDS js/process.env) "180"))
+
+(println "BOOTING" qemu "for at most" seconds "s")
+(def run
+  (.spawnSync cp timeout-cmd
+              (clj->js
+               [seconds qemu "-machine" "q35,accel=tcg" "-cpu" "max"
+                "-m" "1536M" "-smp" "2"
+                "-drive" (str "if=pflash,format=raw,readonly=on,file=" ovmf-code)
+                "-drive" (str "if=pflash,format=raw,file=" (.join path work "vars.fd"))
+                "-drive" (str "format=raw,file=fat:rw:" esp)
+                "-device" "isa-debug-exit,iobase=0xf4,iosize=0x04"
+                "-display" "none"
+                "-serial" (str "file:" serial-log)
+                "-debugcon" (str "file:" debug-log)
+                "-global" "isa-debugcon.iobase=0xe9"
+                "-monitor" "none" "-no-reboot"])
+              #js {:stdio "ignore"}))
+
+(defn- log [file]
+  (if (.existsSync fs file)
+    (str/replace (.readFileSync fs file "utf8") "\r" "")
+    ""))
+(def serial (log serial-log))
+(def debug (log debug-log))
+(def status (.-status run))
+
+(defn- line-with [text needle]
+  (first (filter #(str/includes? % needle) (str/split-lines text))))
+
+(when-not (str/includes? serial "AIUEOS_PHYSICAL_ALLOCATOR_OK")
+  (binding [*out* *err*]
+    (println (str/join "\n" (take-last 40 (str/split-lines serial)))))
+  (unmeasured "the guest never reached the physical allocator; nothing was asked"
+              "(qemu status" status ")"))
+
+(def admit-line (line-with serial "QWEN-ADMIT"))
+(when-not admit-line
+  (binding [*out* *err*]
+    (println (str/join "\n" (take-last 40 (str/split-lines serial)))))
+  (die "the kernel printed no QWEN-ADMIT line; the admission never ran"))
+(println admit-line)
+
+(if mutate?
+  (do
+    (when-not (str/includes? admit-line "reason=-21 stage=3 admitted=0")
+      (die "expected the tensor-table object's clause 21, got:" admit-line))
+    (when-not (str/includes? serial "AIUEOS_QWEN35_ADMISSION_REFUSED")
+      (die "the refusal marker is absent"))
+    (when (str/includes? serial "AIUEOS_QWEN35_ADMISSION_OK")
+      (die "the mutated fixture was ALSO admitted"))
+    (println (line-with serial "AIUEOS_QWEN35_ADMISSION_REFUSED"))
+    (println (if bonsai? "AIUEOS_BONSAI_ADMISSION_QEMU_REFUSAL_OK"
+                 "AIUEOS_QWEN35_ADMISSION_QEMU_REFUSAL_OK")
+             "profile=" (:profile expectation)
+             "reason=-21 object=qwen35-tensor-table-bind clause=token-embd-retyped"))
+  (let [ok-line (line-with serial "AIUEOS_QWEN35_ADMISSION_OK")
+        expected (:ok expectation)]
+    (when-not (str/includes? admit-line "reason=0 stage=0 admitted=1")
+      (die "the objects refused the exact-contract fixture:" admit-line))
+    (when-not (str/includes? serial "AIUEOS_QWEN35_GRAPH_FIXTURE_DEFERRED")
+      (die "the earlier fixture line still claims the transport fixture"))
+    (when-not (and ok-line (str/includes? ok-line expected))
+      (die "the derived numbers are not the host gate's. expected:\n  " expected
+           "\ngot:\n  " (or ok-line "<absent>")))
+    (println ok-line)
+    (when-not (str/includes? debug "AIUEOS_QWEN35_ADMISSION_OK")
+      (die "the debugcon copy of the marker is absent"))
+    (println (if bonsai? "AIUEOS_BONSAI_ADMISSION_QEMU_OK" "AIUEOS_QWEN35_ADMISSION_QEMU_OK")
+             "profile=" (:profile expectation)
+             "objects=3 translation=in-image"
+             (if bonsai? "offsets=match-fixture-receipt" "offsets=match-host-reference"))))

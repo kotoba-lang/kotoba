@@ -1,0 +1,130 @@
+;; `contracts/bonsai2-qwen35-runtime-v1.edn` (ADR-0222 stage A, item 4) is a
+;; document of numbers read from the artifact's header. A document can be typed
+;; wrong, and a number typed twice can be typed wrong once. This test holds the
+;; contract to the identities its own numbers must satisfy, so that a slip in
+;; one field fails against another instead of propagating into the admission
+;; objects that will take their constants from it.
+;;
+;; It reads the contract only. It does not open the artifact (5.9 GB, not in
+;; the tree), does not touch the B70, and proves nothing about a token -- the
+;; contract says so itself (`:execution`, `:does-not-prove`), and this test
+;; checks that it still says so: a later edit that fills `:execution` without
+;; a K16 receipt should have to change this file too.
+
+(ns aiueos.bonsai2-qwen35-contract-test
+  (:require [clojure.edn :as edn]
+            [kotoba.test :refer [deftest is]]
+            #?(:clj [kotoba.io :as io]
+               :cljs ["fs" :as fs])))
+
+;; Portable on purpose: `kbb -M:test` on a JVM-free workstation substitutes the
+;; nbb runner, and a `clojure.java.io` require there is "Could not find
+;; namespace" before the first assertion (measured 2026-09-22). The same file
+;; runs under the JVM suite the fleet gate executes.
+(def ^:private contract-path
+  "lib/kotoba.aiueos/os/aiueos/contracts/bonsai2-qwen35-runtime-v1.edn")
+
+(defn- contract-exists? []
+  #?(:clj (io/exists? (io/file contract-path))
+     :cljs (fs/existsSync contract-path)))
+
+(defn- contract []
+  ;; Fails rather than skips when the file is absent (AGENTS.md: a `when`
+  ;; guard reports green on a checkout without the file).
+  (is (contract-exists?) (str "contract not found at " contract-path))
+  (edn/read-string #?(:clj (slurp contract-path)
+                      :cljs (fs/readFileSync contract-path "utf8"))))
+
+(def ^:private role-type->block-bytes
+  {:f32 4 :bf16 2})
+
+(defn- tensor-bytes [[dims t] codecs]
+  (let [n (reduce * 1 dims)]
+    (case t
+      :ptq1-0 (let [{:keys [block-elements block-bytes]} (get codecs :ptq1-0)]
+                (is (zero? (mod n block-elements)) (str "PTQ1_0 tensor not a whole number of blocks: " dims))
+                (* (quot n block-elements) block-bytes))
+      (* n (role-type->block-bytes t)))))
+
+(deftest the-tensor-count-is-the-role-table-times-the-layer-kinds
+  (let [c (contract)
+        {:keys [linear-attention-layer full-attention-layer every-layer non-block]} (:tensor-roles c)
+        {:keys [trunk-layers linear-attention-layers full-attention-layers]} (:architecture c)]
+    (is (= trunk-layers (+ linear-attention-layers full-attention-layers)))
+    (is (= (get-in c [:artifact :tensor-count])
+           (+ (* linear-attention-layers (count linear-attention-layer))
+              (* full-attention-layers (count full-attention-layer))
+              (* trunk-layers (count every-layer))
+              (count non-block)))
+        "48 * linear roles + 16 * full roles + 64 * shared roles + 3 must be the tensor count")))
+
+(deftest the-type-histogram-is-the-role-table-counted-by-type
+  (let [c (contract)
+        {:keys [linear-attention-layer full-attention-layer every-layer non-block]} (:tensor-roles c)
+        {:keys [trunk-layers linear-attention-layers full-attention-layers]} (:architecture c)
+        weighted (concat (for [[_ [_ t]] linear-attention-layer] [t linear-attention-layers])
+                         (for [[_ [_ t]] full-attention-layer] [t full-attention-layers])
+                         (for [[_ [_ t]] every-layer] [t trunk-layers])
+                         (for [[_ [_ t]] non-block] [t 1]))
+        counted (reduce (fn [m [t n]] (update m t (fnil + 0) n)) {} weighted)]
+    (is (= (:tensor-types c) counted))
+    (is (= (get-in c [:artifact :tensor-count]) (reduce + (vals (:tensor-types c)))))))
+
+(deftest the-extents-tile-the-declared-size-under-the-28-byte-block
+  ;; The one identity that pins the PTQ1_0 block size: with 28 bytes per 128
+  ;; elements the 851 extents, each padded to the alignment, end exactly at
+  ;; the file's last byte. Any other block size does not tile.
+  (let [c (contract)
+        {:keys [linear-attention-layer full-attention-layer every-layer non-block]} (:tensor-roles c)
+        {:keys [trunk-layers linear-attention-layers full-attention-layers]} (:architecture c)
+        {:keys [alignment data-offset bytes]} (:artifact c)
+        codecs (:codecs c)
+        pad (fn [n] (* alignment (quot (+ n (dec alignment)) alignment)))
+        sum-roles (fn [roles k] (reduce + 0 (for [[_ r] roles] (* k (pad (tensor-bytes r codecs))))))
+        padded-total (+ (sum-roles linear-attention-layer linear-attention-layers)
+                        (sum-roles full-attention-layer full-attention-layers)
+                        (sum-roles every-layer trunk-layers)
+                        (sum-roles non-block 1))
+        ;; every tensor here is a multiple of 32 bytes already, so the padded
+        ;; sum IS the unpadded end; assert that rather than assume it
+        last-end (get-in c [:artifact :last-tensor :end])]
+    (is (= 28 (get-in codecs [:ptq1-0 :block-bytes])))
+    (is (= 128 (get-in codecs [:ptq1-0 :block-elements])))
+    (is (= last-end padded-total) "the padded extents must end where the contract's last tensor ends")
+    (is (= bytes (+ data-offset last-end)) "data-offset + last end must be the declared byte count")
+    (is (= data-offset (pad (get-in c [:artifact :tensor-info-end]))))))
+
+(deftest the-hadamard-sign-array-is-the-sum-of-its-widths-and-is-int32
+  (let [c (contract)
+        h (:hadamard c)]
+    (is (= (get-in h [:sign-values :count]) (reduce + (get-in h [:sign-widths :values]))))
+    (is (= (get-in h [:sign-values :bytes]) (* 4 (get-in h [:sign-values :count]))))
+    (is (= [9 5] (get-in h [:sign-values :gguf-type])) "sign_values is an ARRAY (9) of INT32 (5)")
+    (is (some neg? (get-in h [:sign-values :distinct])) "the array holds -1; a u32 read would turn it into 4294967295")
+    (is (= [5120 6144 17408] (get-in h [:sign-widths :values])))
+    (is (= (set (get-in h [:sign-widths :values]))
+           #{(get-in c [:architecture :embedding])
+             (get-in c [:architecture :linear-attention :inner-size])
+             (get-in c [:architecture :feed-forward])})
+        "the three sign widths are the three input widths of the folded projections")))
+
+(deftest the-linear-attention-shapes-agree-with-the-role-table
+  (let [c (contract)
+        la (get-in c [:architecture :linear-attention])
+        roles (get-in c [:tensor-roles :linear-attention-layer])
+        [[_ qkv-cols]] [(first (get roles "attn_qkv.weight"))]
+        [conv-k conv-cols] (first (get roles "ssm_conv1d.weight"))]
+    (is (= (:inner-size la) (* (:key-heads la) (* 3 (:head-dimension la)))) "inner = 16 heads * 3 * 128")
+    (is (= (:inner-size la) (first (first (get roles "ssm_out.weight")))))
+    (is (= conv-k (:convolution-kernel la)))
+    (is (= conv-cols qkv-cols) "conv1d spans the concatenated q,k,v the qkv projection produces")
+    (is (= (:state-size la) (first (first (get roles "ssm_norm.weight")))))
+    (is (= (get-in c [:architecture :attention :head-dimension])
+           (first (first (get-in c [:tensor-roles :full-attention-layer "attn_q_norm.weight"])))))))
+
+(deftest the-contract-still-claims-nothing-executed
+  (let [c (contract)]
+    (is (= :nothing-has-executed-against-this-contract (:execution c)))
+    (is (contains? (set (:does-not-prove c)) :any-token))
+    (is (= :not-done (get-in c [:evidence :sha256-recomputed-by-this-repository])))
+    (is (= 0 (get-in c [:architecture :nextn-layers])) "no nextn key and no MTP tensors in this artifact")))

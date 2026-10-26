@@ -1,0 +1,174 @@
+#!/usr/bin/env kbb
+;; Generate the per-device SSH provisioning record (ssh-v1.edn, install-v1.edn
+;; decision 4). Run at install time on the target, never at USB-build time:
+;; the host-key seed is a secret and the secret floor forbids it ever touching
+;; the install USB, a log, or a reused stick. The authorized key is copied
+;; from the install intent, never invented.
+;;
+;;   kbb --backend sci make-provision-record.cljk \
+;;     --intent install-intent.json --out /path/provision.json
+;;     [--host-seed <64-hex>]     ; TEST ONLY -- inject a fixed seed for vectors
+;;     [--account-record <file>]  ; account-sync.cljk output (ADR-0239)
+;;
+;; Output record (aiueos.provision.v1):
+;;   {hostname, deviceClaim?, installIntentSha256, createdAt,
+;;    sshHostKey: {algo, seedSha256, public, openssh, fingerprint},
+;;    authorizedKeys: [{principal, algo, public, openssh, fingerprint}],
+;;    account?: aiueos.account-sync.v1 (with --account-record, ADR-0239)}
+;;
+;; Only the PUBLIC halves are printed. The record file itself carries the seed
+;; (the record is written to the target's private provision region, which is
+;; where the seed must live for the kernel to sign with the host key); the
+;; file is created 0600 and the seed is never echoed. `--emit-seed` is refused
+;; outside NODE_ENV=test.
+
+(require '[kotoba.lang.text :as str])
+
+(def fs (js/require "node:fs"))
+(def crypto (js/require "node:crypto"))
+
+(defn- die [code & msg]
+  (binding [*out* *err*] (apply println (cons "error:" msg)))
+  (.exit js/process code))
+
+(def args (vec *command-line-args*))
+(defn- arg [flag]
+  (let [i (.indexOf (to-array args) flag)]
+    (when (>= i 0) (nth args (inc i) nil))))
+
+(defn- b64 [buf] (.toString buf "base64"))
+(defn- sha256-hex [buf]
+  (-> (.createHash crypto "sha256") (.update buf) (.digest "hex")))
+
+;; ---------------------------------------------------------- ssh wire format
+
+(defn- ssh-string
+  "SSH wire string: uint32 big-endian length prefix then the bytes."
+  [buf]
+  (let [len (js/Buffer.alloc 4)]
+    (.writeUInt32BE len (.-length buf) 0)
+    (js/Buffer.concat #js [len buf])))
+
+(defn- ssh-ed25519-blob
+  "The SSH public-key blob for an ed25519 key: string 'ssh-ed25519' then the
+  32-byte raw public key, each length-prefixed. This is the exact byte string
+  an authorized_keys line base64-encodes and the fingerprint digests."
+  [raw-pub]
+  (js/Buffer.concat #js [(ssh-string (js/Buffer.from "ssh-ed25519" "utf8"))
+                         (ssh-string raw-pub)]))
+
+(defn- ssh-fingerprint [blob]
+  (str "SHA256:"
+       (-> (.createHash crypto "sha256") (.update blob) (.digest "base64")
+           (str/replace #"=+$" ""))))
+
+(defn- authorized-line [comment blob]
+  (str "ssh-ed25519 " (b64 blob) (when comment (str " " comment))))
+
+;; -------------------------------------------------------- host key material
+
+(defn- ed25519-from-seed
+  "Given a 32-byte seed, return {:raw-pub Buffer :seed Buffer}. node derives
+  the public half; we round-trip through the raw PKCS8 wrapper so a fixed test
+  seed produces a fixed, checkable public key."
+  [seed]
+  (let [pkcs8 (js/Buffer.concat
+               #js [(js/Buffer.from "302e020100300506032b657004220420" "hex") seed])
+        key (.createPrivateKey crypto #js {:key pkcs8 :format "der" :type "pkcs8"})
+        spki (.export (.createPublicKey crypto key) #js {:format "der" :type "spki"})
+        raw-pub (.subarray spki (- (.-length spki) 32))]
+    {:raw-pub raw-pub :seed seed}))
+
+(defn- parse-authorized
+  "Parse one ssh-ed25519 authorized_keys line from the intent into its raw
+  public key + fingerprint. Refuses anything but ed25519: the intent may name
+  ssh-rsa/ecdsa, but the R0 userauth algorithm is ssh-ed25519 (ssh-v1.edn)."
+  [line]
+  (let [fields (str/split (str/trim line) #"\s+")]
+    (when-not (= "ssh-ed25519" (first fields))
+      (die 2 "authorized key is" (first fields) "-- R0 userauth is ssh-ed25519 only"))
+    (let [blob (js/Buffer.from (nth fields 1) "base64")]
+      {:blob blob :raw (.subarray blob (- (.-length blob) 32))
+       :comment (nth fields 2 nil)})))
+
+;; --------------------------------------------------------------------- main
+
+(def intent-path (or (arg "--intent") (die 3 "--intent is required")))
+(def out (or (arg "--out") (die 3 "--out is required")))
+(when-not (.existsSync fs intent-path) (die 3 "intent not found:" intent-path))
+
+(def intent
+  (try (js->clj (.parse js/JSON (.readFileSync fs intent-path "utf8")) :keywordize-keys true)
+       (catch :default e (die 3 "cannot read intent:" (.-message e)))))
+(when-not (= "aiueos.install-intent.v1" (:schema intent))
+  (die 3 "not an aiueos.install-intent.v1 intent"))
+
+(def seed
+  (if-let [hex (arg "--host-seed")]
+    (do (when-not (= "test" (.-NODE_ENV js/process.env))
+          (die 3 "--host-seed is TEST ONLY (set NODE_ENV=test)"))
+        (when-not (re-matches #"[0-9a-fA-F]{64}" hex)
+          (die 3 "--host-seed must be 64 hex chars"))
+        (js/Buffer.from hex "hex"))
+    (.randomBytes crypto 32)))
+
+(def host (ed25519-from-seed seed))
+(def host-blob (ssh-ed25519-blob (:raw-pub host)))
+(def auth (parse-authorized (get-in intent [:ssh :publicKey])))
+(def auth-blob (ssh-ed25519-blob (:raw auth)))
+
+;; The intent already computed a fingerprint over the whole offered blob; the
+;; record must agree, or the two views of "which key is authorized" disagree.
+(when-not (= (get-in intent [:ssh :fingerprint]) (ssh-fingerprint auth-blob))
+  (die 3 "recomputed authorized-key fingerprint does not match the intent's;"
+       "the intent's ssh.publicKey and ssh.fingerprint are inconsistent"))
+
+;; Optional (aiueos ADR-0239): the kotoba.cloud account link made at the
+;; installer console by account-sync.cljk. It carries the device's signing and
+;; encryption private keys, so it is admitted here by shape and then lives only
+;; where the SSH host seed lives. A record that does not have the shape is a
+;; refusal, not an install without an account: the person asked for the link.
+(def account
+  (when-let [p (arg "--account-record")]
+    (let [a (try (js->clj (.parse js/JSON (.readFileSync fs p "utf8")) :keywordize-keys true)
+                 (catch :default e (die 3 "cannot read --account-record:" (.-message e))))
+          b64url-32? (fn [v] (and (string? v) (= 43 (count v))
+                                  (boolean (re-matches #"[A-Za-z0-9_-]+" v))))]
+      (when-not (and (= "aiueos.account-sync.v1" (:schema a))
+                     (= "https://auth.kotoba.cloud" (:authority a))
+                     (string? (:accountDid a))
+                     (string? (:deviceDid a))
+                     (b64url-32? (get-in a [:deviceKeys :signingSeed]))
+                     (b64url-32? (get-in a [:deviceKeys :signingPublic]))
+                     (b64url-32? (get-in a [:deviceKeys :encryptionPrivate]))
+                     (b64url-32? (get-in a [:deviceKeys :encryptionPublic])))
+        (die 3 "--account-record is not an aiueos.account-sync.v1 record"))
+      a)))
+
+(def record
+  {:schema "aiueos.provision.v1"
+   :hostname (:hostname intent)
+   :deviceClaim (:deviceClaim intent)
+   :installIntentSha256 (sha256-hex (.readFileSync fs intent-path))
+   :createdAt (.toISOString (js/Date.))
+   :sshHostKey {:algo "ssh-ed25519"
+                :seed (.toString seed "hex")   ; written to the target's private region only
+                :seedSha256 (sha256-hex seed)
+                :public (.toString (:raw-pub host) "hex")
+                :openssh (authorized-line (str (:hostname intent) " host key") host-blob)
+                :fingerprint (ssh-fingerprint host-blob)}
+   :authorizedKeys [{:principal (get-in intent [:ssh :authorizedPrincipal])
+                     :algo "ssh-ed25519"
+                     :public (.toString (:raw auth) "hex")
+                     :openssh (authorized-line (:comment auth) auth-blob)
+                     :fingerprint (ssh-fingerprint auth-blob)}]
+   :account account})
+
+;; Compact (single line): the installer embeds this between a magic line and a
+;; trailing newline, so the record must not carry newlines of its own.
+(.writeFileSync fs out (str (.stringify js/JSON (clj->js record)) "\n") #js {:mode 0600})
+(println "AIUEOS_PROVISION_RECORD_OK" out
+         (str "hostname=" (:hostname intent))
+         (str "host-key=" (get-in record [:sshHostKey :fingerprint]))
+         (str "authorized=" (get-in record [:authorizedKeys 0 :fingerprint]))
+         (str "principal=" (get-in record [:authorizedKeys 0 :principal])))

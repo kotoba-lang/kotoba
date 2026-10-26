@@ -1,0 +1,143 @@
+(ns aiueos.device-worker-digest
+  (:require [aiueos.lib.sha256-stream :as sha])
+  (:export [aiueos-device-worker-digest main]))
+
+;; `input-sha256` and `output-sha256` of the Murakumo device-P256 worker
+;; protocol 3, for the freestanding aiueos kernel.
+;;
+;;   (aiueos-device-worker-digest st st-len tok tok-count)
+;;
+;; ---------------------------------------------------------------------------
+;; WHY THIS OBJECT EXISTS
+;; ---------------------------------------------------------------------------
+;; These two digests are what the device SIGNS about the work it did. The
+;; server refuses a result whose `output-sha256` does not hash the token array
+;; that came with it, and refuses a settle whose `input-sha256` does not name
+;; the job (`docs/device-worker-v3.md`, network-awai/cloud-murakumo-api). A
+;; device that got the byte form wrong would sign a claim about a different
+;; computation and be refused while the verifier named the wrong cause --
+;; the only thing a verifier can say about bytes it did not reconstruct is
+;; that the signature failed.
+;;
+;; Deciding what a device asserts about itself is not mechanism, and ADR-0015
+;; draws the C boundary at mechanism. `aiueos-device-worker-canonical`
+;; (ADR-0137) already owns the surrounding signed text; this owns the two
+;; fields inside it that are hashes rather than transcriptions, and it is the
+;; object that stream reserved and could not write, because every SHA-256 in
+;; this repository was capped far below 131,080 bytes.
+;;
+;; ---------------------------------------------------------------------------
+;; THE CANONICAL BYTE FORMS, VERBATIM FROM THE SERVER'S SPEC
+;; ---------------------------------------------------------------------------
+;;   input-canonical-bytes(tokens, max-tokens)
+;;     := be32(count) || be32(t_0) || ... || be32(t_{n-1}) || be32(max-tokens)
+;;   output-canonical-bytes(tokens)
+;;     := be32(count) || be32(t_0) || ... || be32(t_{m-1})
+;;
+;; `be32` is four bytes, unsigned, big-endian, no padding and no separators.
+;; The leading count is what makes the encoding prefix-free.
+;;
+;; ---------------------------------------------------------------------------
+;; NOT A BOOLEAN, AND ZERO IS NEVER RETURNED
+;; ---------------------------------------------------------------------------
+;; The `aiueos-device-worker-*` convention rather than the `aiueos-sha256-*`
+;; one, because this object joins that family and its useful answer is a
+;; NUMBER: how many canonical bytes it hashed. A length and a reason code
+;; cannot share a non-negative value space, so reasons are negative.
+;;
+;;     >0  the canonical byte count (4 .. 131,080); the 32 raw digest bytes
+;;         are in `st` at offset 424
+;;     -1  st-len below the 512 bytes the state region requires
+;;     -2  tok-count outside 0..32768
+;;     -3  the max-tokens word in `st` is above 4096
+;;
+;; The smallest possible answer is 4 (an empty output array), so zero is not
+;; in the value space at all.
+;;
+;; ---------------------------------------------------------------------------
+;; THE MODE IS `max-tokens`, AND IT IS READ FROM THE STATE REGION
+;; ---------------------------------------------------------------------------
+;; The ABI admits five arguments; this uses four, and the fifth would have been
+;; `max-tokens`. It lives in `st` at offset 460 instead, as a big-endian u32,
+;; and ZERO MEANS OUTPUT DIGEST -- not because zero is a convenient spare, but
+;; because the protocol's own bound is `1 <= max-tokens <= 4096`, so zero is
+;; not a value an input digest can legitimately carry. `tok-count` is copied
+;; into `st` at offset 456 by this object so that `cb` can read it without
+;; spending an argument.
+;;
+;; This leaves the fifth argument free. `device-worker-body` will need it.
+;;
+;; ---------------------------------------------------------------------------
+;; THE TOKEN REGION IS ALREADY be32
+;; ---------------------------------------------------------------------------
+;; `tok` is `4 * tok-count` bytes of big-endian u32 -- the middle of the
+;; canonical form, verbatim. The count prefix and the max-tokens suffix are
+;; SYNTHESISED, never read from the caller, so a device cannot sign a count
+;; that disagrees with the array it hashed.
+;;
+;; Every canonical byte therefore goes through `cb`, including the 4*n that
+;; could have been read straight out of `tok`. That costs about 190 fuel per
+;; block over the direct route (measured: 1,962 against 1,772 for
+;; `aiueos-sha256-region`) and it buys one thing -- the block assembly does not
+;; have to know that blocks 1..k happen to be a contiguous slice of `tok` at
+;; offset `64b-4` while block 0 and the last one are not. Narrowing those two
+;; cases into direct `kernel-subregion` reads is a measured optimisation, not
+;; done here, and named in the contract as not done.
+
+(defn be-byte [v i]
+  (if (= i 0) (bit-and (quot v 16777216) 255)
+  (if (= i 1) (bit-and (quot v 65536) 255)
+  (if (= i 2) (bit-and (quot v 256) 255)
+    (bit-and v 255)))))
+
+;; The canonical byte at global index `g`. The token count is in `st` at word
+;; 114 and max-tokens at word 115; both are read here rather than passed.
+(defn cb [st tok g]
+  (let [n (sha/load32 st 114)
+        tb (* 4 n)]
+    (if (< g 4) (be-byte n g)
+      (if (< g (+ 4 tb))
+        (kernel-load-u8 (kernel-subregion tok tb (- g 4) 1) 1 0)
+        (be-byte (sha/load32 st 115) (- g (+ 4 tb)))))))
+
+;; A whole 64-byte block, and then a partial one, assembled into the state's
+;; own buffer at offset 360. Both loops are the baseline self-call shape, so
+;; both are jumps rather than frames.
+(defn fill [st tok base i]
+  (if (= i 64) 1
+    (fill st tok base
+          (+ i 1 (* 0 (sha/ss st (+ 360 i) (cb st tok (+ base i))))))))
+
+(defn fill-tail [st tok base i rem]
+  (if (= i rem) 1
+    (fill-tail st tok base
+               (+ i 1 (* 0 (sha/ss st (+ 360 i) (cb st tok (+ base i)))))
+               rem)))
+
+;; `fill` is the LEFT operand of the `+` so that it is emitted, and therefore
+;; runs, before the compression that reads what it wrote.
+(defn digest-blocks [st tok i full]
+  (if (= i full) 1
+    (digest-blocks st tok
+                   (+ i 1 (* 0 (+ (fill st tok (* i 64) 0)
+                                  (sha/sha-absorb st (kernel-subregion st 512 360 64)))))
+                   full)))
+
+(defn aiueos-device-worker-digest [st st-len tok tok-count]
+  (if (< st-len 512) -1
+    (if (< tok-count 0) -2
+      (if (> tok-count 32768) -2
+        (if (> (sha/load32 st 115) 4096) -3
+          (let [c (sha/store32 st 114 tok-count)
+                total (+ 4 (+ (* 4 tok-count)
+                              (if (= (sha/load32 st 115) 0) 0 4)))
+                full (quot total 64)
+                rem (- total (* full 64))
+                i (sha/sha-init st)
+                b (digest-blocks st tok 0 full)
+                t (fill-tail st tok (* full 64) 0 rem)]
+            (+ total (* 0 (+ c (+ i (+ b (+ t (sha/sha-final st
+                                                             (kernel-subregion st 512 360 rem)
+                                                             rem)))))))))))))
+
+(defn main [] 0)

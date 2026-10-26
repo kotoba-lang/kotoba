@@ -1,0 +1,168 @@
+(ns aiueos.value-handle-arena
+  (:export [aiueos-value-handle-arena main]))
+
+;; C-free, process-owned Value Handle arena mechanism.
+;;
+;; The arena is exactly one RW/NX 4 KiB process page. Offset 0 is an atomic
+;; u32 lock; the remaining header and 63 fixed-size slots are mutated only
+;; while that lock is held. Logical handles still increase monotonically to
+;; 4096 and are never reused. Released physical slots may be recycled because
+;; every lookup compares the stored logical handle before returning a token.
+;;
+;; Entry ABI:
+;;   (arena arena-length operation handle descriptor) -> i64
+;;
+;; Operations:
+;;   0 initialize (zeroed page -> versioned arena; idempotent)
+;;   1 install descriptor -> fresh logical handle
+;;   2 resolve handle -> value token
+;;   3 cid-of handle -> CID token
+;;   4 release handle -> 1
+;;
+;; DESCRIPTOR packs value-token in bits 0..31 and CID-token in bits 32..62.
+;; Both are provider-local scalar descriptor IDs, never physical pointers and
+;; never authority. VR5c binds those IDs to verified canonical bytes/CIDs.
+
+(defn read-u32 [arena index]
+  (+ (kernel-load-u8-4k arena 4096 index)
+     (* (kernel-load-u8-4k arena 4096 (+ index 1)) 256)
+     (* (kernel-load-u8-4k arena 4096 (+ index 2)) 65536)
+     (* (kernel-load-u8-4k arena 4096 (+ index 3)) 16777216)))
+
+;; Integer write status must be compared explicitly; 0 is not a boolean.
+(defn write-u32 [arena index value]
+  (let [b0 (bit-and value 255)
+        b1 (bit-and (quot value 256) 255)
+        b2 (bit-and (quot value 65536) 255)
+        b3 (bit-and (quot value 16777216) 255)]
+    (if (= (kernel-store-u8-4k arena 4096 index b0) b0)
+      (if (= (kernel-store-u8-4k arena 4096 (+ index 1) b1) b1)
+        (if (= (kernel-store-u8-4k arena 4096 (+ index 2) b2) b2)
+          (if (= (kernel-store-u8-4k arena 4096 (+ index 3) b3) b3) 1 0)
+          0)
+        0)
+      0)))
+
+(defn slot-offset [slot] (+ 64 (* slot 64)))
+
+(defn slot-live? [arena slot]
+  (= (kernel-load-u8-4k arena 4096 (+ (slot-offset slot) 4)) 1))
+
+(defn find-free-slot [arena slot]
+  (if (= slot 63)
+    63
+    (if (slot-live? arena slot)
+      (find-free-slot arena (+ slot 1))
+      slot)))
+
+(defn find-handle-slot [arena handle slot]
+  (if (= slot 63)
+    63
+    (let [offset (slot-offset slot)]
+      (if (and (slot-live? arena slot)
+               (= (read-u32 arena offset) handle))
+        slot
+        (find-handle-slot arena handle (+ slot 1))))))
+
+(defn header-valid? [arena]
+  (and (= (read-u32 arena 4) 1095259723)
+       (= (read-u32 arena 20) 1)
+       (> (read-u32 arena 8) 0)
+       (<= (read-u32 arena 8) 4097)
+       (<= (read-u32 arena 12) 63)))
+
+(defn initialize-locked [arena]
+  (let [magic (read-u32 arena 4)]
+    (if (= magic 1095259723)
+      (if (header-valid? arena) 1 0)
+      (if (= magic 0)
+        (if (= (write-u32 arena 8 1) 1)
+          (if (= (write-u32 arena 12 0) 1)
+            (if (= (write-u32 arena 16 0) 1)
+              (if (= (write-u32 arena 20 1) 1)
+                (write-u32 arena 4 1095259723)
+                0)
+              0)
+            0)
+          0)
+        0))))
+
+(defn install-locked [arena descriptor]
+  (let [next-handle (read-u32 arena 8)
+        live-count (read-u32 arena 12)
+        value-token (bit-and descriptor 4294967295)
+        cid-token (quot descriptor 4294967296)]
+    (if (and (header-valid? arena)
+             (> descriptor 0)
+             (> value-token 0)
+             (> cid-token 0)
+             (<= cid-token 2147483647)
+             (<= next-handle 4096)
+             (< live-count 63))
+      (let [slot (find-free-slot arena 0)]
+        (if (= slot 63)
+          0
+          (let [offset (slot-offset slot)]
+            (if (= (write-u32 arena offset next-handle) 1)
+              (if (= (write-u32 arena (+ offset 8) value-token) 1)
+                (if (= (write-u32 arena (+ offset 12) cid-token) 1)
+                  (if (= (kernel-store-u8-4k arena 4096 (+ offset 4) 1) 1)
+                    (if (= (write-u32 arena 8 (+ next-handle 1)) 1)
+                      (if (= (write-u32 arena 12 (+ live-count 1)) 1)
+                        next-handle
+                        0)
+                      0)
+                    0)
+                  0)
+                0)
+              0))))
+      0)))
+
+(defn resolve-locked [arena operation handle]
+  (if (and (header-valid? arena) (> handle 0) (<= handle 4096))
+    (let [slot (find-handle-slot arena handle 0)]
+      (if (= slot 63)
+        0
+        (read-u32 arena (+ (slot-offset slot) (if (= operation 2) 8 12)))))
+    0))
+
+(defn release-locked [arena handle]
+  (if (and (header-valid? arena) (> handle 0) (<= handle 4096))
+    (let [slot (find-handle-slot arena handle 0)]
+      (if (= slot 63)
+        0
+        (let [offset (slot-offset slot)
+              live-count (read-u32 arena 12)]
+          (if (and (> live-count 0)
+                   (= (kernel-store-u8-4k arena 4096 (+ offset 4) 0) 0))
+            (if (= (write-u32 arena offset 0) 1)
+              (if (= (write-u32 arena (+ offset 8) 0) 1)
+                (if (= (write-u32 arena (+ offset 12) 0) 1)
+                  (if (= (write-u32 arena 12 (- live-count 1)) 1) 1 0)
+                  0)
+                0)
+              0)
+            0))))
+    0))
+
+(defn dispatch-locked [arena operation handle descriptor]
+  (if (= operation 0)
+    (initialize-locked arena)
+    (if (= operation 1)
+      (install-locked arena descriptor)
+      (if (or (= operation 2) (= operation 3))
+        (resolve-locked arena operation handle)
+        (if (= operation 4) (release-locked arena handle) 0)))))
+
+(defn aiueos-value-handle-arena
+  [arena arena-length operation handle descriptor]
+  (if (and (= arena-length 4096)
+           (<= 0 operation)
+           (<= operation 4)
+           (= (kernel-try-lock-u32 arena arena-length 0) 1))
+    (let [result (dispatch-locked arena operation handle descriptor)
+          released (kernel-unlock-u32 arena arena-length 0)]
+      (if (= released 1) result 0))
+    0))
+
+(defn main [] 0)

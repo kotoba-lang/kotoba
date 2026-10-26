@@ -1,0 +1,200 @@
+(ns aiueos.hkdf-sha256
+  (:require [aiueos.lib.sha256-core :as sha])
+  (:export [aiueos-hkdf-sha256 main]))
+
+;; HMAC-SHA256 and HKDF-Expand-Label (RFC 5869 + RFC 8446 7.1) for the
+;; freestanding aiueos kernel.
+;;
+;;   (aiueos-hkdf-sha256 ctx ctx-len mode)
+;;
+;; This replaces the four static functions `kernel/tls13.c` used to derive
+;; every TLS 1.3 key from the X25519 shared secret: `hmac_sha256`,
+;; `hkdf_extract`, `hkdf_expand_label` and the HMAC half of `finish_check`.
+;; ADR-0015 draws the C boundary at MECHANISM. Which bytes become the traffic
+;; key -- and therefore who can read the connection -- is not mechanism.
+;;
+;; ---------------------------------------------------------------------------
+;; NOT A BOOLEAN. ZERO IS THE SUCCESS VALUE.
+;; ---------------------------------------------------------------------------
+;;     0   done, the output is in ctx at offset 64
+;;     1   ctx-len below the 800 bytes this object requires
+;;     2   mode is neither 0 (HMAC) nor 1 (Expand-Label)
+;;     3   key-len above 64
+;;     4   context-len above 64
+;;     5   label-len above 16
+;;     6   EXPAND-LABEL ONLY: out-len outside 1..32
+;;
+;; ---------------------------------------------------------------------------
+;; TWO MODES, AND HKDF-EXTRACT IS NOT ONE OF THEM
+;; ---------------------------------------------------------------------------
+;; RFC 5869's Extract is `HMAC(salt, ikm)` with the salt as the KEY. That is
+;; mode 0 with the salt in the key slot, so it needs no arm of its own -- and
+;; the "empty salt means 32 zero bytes" rule the C implements by substituting a
+;; buffer is not a rule at all here: HMAC pads its key to the 64-byte block, so
+;; a zero-length salt and a 32-zero salt produce THE SAME padded block and
+;; therefore the same output. The contract asserts that with a vector rather
+;; than asserting it in prose.
+;;
+;;   mode 0  HMAC-SHA256(key[0..key-len), context[0..context-len))
+;;           -> 32 bytes at ctx+64.  This is Extract, and it is also the
+;;              Finished MAC: HMAC(finished_key, transcript_hash).
+;;   mode 1  HKDF-Expand-Label(secret, label, context, out-len)
+;;           -> out-len bytes at ctx+64, REST ZEROED (see below).
+;;
+;; ---------------------------------------------------------------------------
+;; ONE REGION, BECAUSE THE ABI ADMITS FIVE PARAMETERS -- AND THIS USES THREE
+;; ---------------------------------------------------------------------------
+;;   ctx offset  bytes  what
+;;   ----------  -----  ----------------------------------------------------
+;;        0        64   key material.  key-len bytes are used; HMAC pads the
+;;                      rest of the 64-byte block with zeros
+;;       64        32   output
+;;       96         1   key-len, 0..64
+;;       97         1   label-len, 0..16 (the label WITHOUT "tls13 ")
+;;       98         1   context-len, 0..64
+;;       99         1   out-len, 1..32 -- mode 1 only
+;;      100        12   reserved
+;;      112        16   label bytes
+;;      128        64   context bytes (the ikm, the transcript hash, or the
+;;                      message being MACed)
+;;      192       192   message buffer: the 64-byte padded key block followed
+;;                      by the payload
+;;      384        32   inner hash
+;;      416        32   reserved
+;;      448       352   SHA-256 workspace
+;;      800             end -- ctx-len must be at least this
+;;
+;; ---------------------------------------------------------------------------
+;; THE OUTPUT IS EXACTLY out-len BYTES. THE C RETURNED 32 AND TRUSTED CALLERS.
+;; ---------------------------------------------------------------------------
+;; `hkdf_expand_label` in C wrote a 32-byte `full` and copied `out_len` of it
+;; to the caller, leaving the other 20 bytes of a 12-byte IV derivation live in
+;; its own stack frame. Here bytes at and beyond out-len are ZEROED before
+;; return, so a caller that reads the whole 32-byte slot cannot come away with
+;; key stream it did not ask for -- and a contract vector can assert the whole
+;; slot instead of asserting a prefix and shrugging at the rest.
+;;
+;; ---------------------------------------------------------------------------
+;; A KEY LONGER THAN THE BLOCK IS REFUSED, NOT HASHED
+;; ---------------------------------------------------------------------------
+;; RFC 2104 says a key longer than the block is replaced by its own hash, and
+;; the C implemented that branch. No TLS 1.3 derivation reaches it: every key
+;; here is a 32-byte secret or a 32-byte finished key. An unreachable branch in
+;; a MAC is a second code path that nothing tests, so this object refuses
+;; (reason 3) rather than carrying it.
+;;
+;; SHA-256 is INLINED rather than required from `aiueos.sha256`. Measured
+;; 2026-09-02 against amu b1fdaad2: a namespace that declares `(:require ...)`
+;; is a multi-module project, and `amu compile` refuses to package one for
+;; `x86_64-aiueos-kernel-v1` at all (`:kotoba.error/namespace-require-needs-
+;; project`, and `--unpinned` does not change it). That is why
+;; `cid-v1-admit.kotoba` has no committed `.o` beside it. The duplication is
+;; the one ADR-0021 already pays for between `ipv4-checksum` and
+;; `ipv4-icmp-reply-valid`, and this copy is bounded at 192 message bytes
+;; rather than the 12,288 `sha256.kotoba` admits, because HMAC only ever hashes
+;; a padded key block plus an info string.
+
+;; --- SHA-256 ---------------------------------------------------------------
+;; REQUIRED, not inlined. It used to be copied in here, and this file said
+;; why: a namespace declaring `(:require ...)` could not be packaged for
+;; `x86_64-aiueos-kernel-v1` at all. amu#742 removed that refusal, so the
+;; core moved to `aiueos.lib.sha256-core` and `cl`/`cs`/`sha-run` are
+;; imported. The bytes of this object change; the admission vectors do not.
+
+
+;; --- HMAC ------------------------------------------------------------------
+
+;; RFC 2104: the key is zero-padded to the 64-byte block and XORed with the
+;; pad byte. A key shorter than the block and a key of zeros are therefore the
+;; same block, which is why HKDF-Extract needs no zero-salt buffer here.
+(defn write-pad-block [ctx key-len padbyte i]
+  (if (= i 64) 1
+    (let [b (if (< i key-len) (sha/cl ctx i) 0)
+          s (sha/cs ctx (+ 192 i) (bit-xor b padbyte))]
+      (write-pad-block ctx key-len padbyte (+ i 1 (* 0 s))))))
+
+(defn copy-into-msg [ctx src-off n i]
+  (if (= i n) 1
+    (let [s (sha/cs ctx (+ 256 i) (sha/cl ctx (+ src-off i)))]
+      (copy-into-msg ctx src-off n (+ i 1 (* 0 s))))))
+
+;; --- HKDF-Expand-Label info string (RFC 8446 7.1) --------------------------
+;; struct { uint16 length; opaque label<7..255>; opaque context<0..255>; }
+;; with the label prefixed by "tls13 ", followed by the single counter byte
+;; 0x01 because a 32-byte output needs exactly one HMAC round.
+
+(defn prefix-byte [i]
+  (if (= i 0) 116 (if (= i 1) 108 (if (= i 2) 115
+  (if (= i 3) 49 (if (= i 4) 51 32))))))
+
+(defn write-label-prefix [ctx i]
+  (if (= i 6) 1
+    (let [s (sha/cs ctx (+ 259 i) (prefix-byte i))]
+      (write-label-prefix ctx (+ i 1 (* 0 s))))))
+
+(defn write-label [ctx label-len i]
+  (if (= i label-len) 1
+    (let [s (sha/cs ctx (+ 265 i) (sha/cl ctx (+ 112 i)))]
+      (write-label ctx label-len (+ i 1 (* 0 s))))))
+
+(defn write-context [ctx base context-len i]
+  (if (= i context-len) 1
+    (let [s (sha/cs ctx (+ base i) (sha/cl ctx (+ 128 i)))]
+      (write-context ctx base context-len (+ i 1 (* 0 s))))))
+
+;; The info string starts at 256 -- the message buffer at 192 plus the 64-byte
+;; padded key block that precedes it.
+(defn build-info [ctx label-len context-len out-len]
+  (let [h0 (sha/cs ctx 256 0)
+        h1 (sha/cs ctx 257 out-len)
+        h2 (sha/cs ctx 258 (+ 6 label-len))
+        p (write-label-prefix ctx 0)
+        l (write-label ctx label-len 0)
+        c0 (sha/cs ctx (+ 265 label-len) context-len)
+        c (write-context ctx (+ 266 label-len) context-len 0)
+        t (sha/cs ctx (+ 266 (+ label-len context-len)) 1)]
+    (+ 1 (* 0 (+ h0 (+ h1 (+ h2 (+ p (+ l (+ c0 (+ c t)))))))))))
+
+(defn zero-tail [ctx i out-len]
+  (if (= i 32) 1
+    (let [s (if (>= i out-len) (sha/cs ctx (+ 64 i) 0) 0)]
+      (zero-tail ctx (+ i 1 (* 0 s)) out-len))))
+
+(defn hmac-mode [ctx key-len context-len]
+  (let [a (write-pad-block ctx key-len 54 0)
+        b (copy-into-msg ctx 128 context-len 0)
+        c (sha/sha-run ctx (+ 64 context-len) 384)
+        d (write-pad-block ctx key-len 92 0)
+        e (copy-into-msg ctx 384 32 0)
+        f (sha/sha-run ctx 96 64)]
+    (+ 1 (* 0 (+ a (+ b (+ c (+ d (+ e f)))))))))
+
+(defn expand-label-mode [ctx key-len label-len context-len]
+  (let [out-len (sha/cl ctx 99)
+        a (write-pad-block ctx key-len 54 0)
+        b (build-info ctx label-len context-len out-len)
+        c (sha/sha-run ctx (+ 75 (+ label-len context-len)) 384)
+        d (write-pad-block ctx key-len 92 0)
+        e (copy-into-msg ctx 384 32 0)
+        f (sha/sha-run ctx 96 64)
+        g (zero-tail ctx 0 out-len)]
+    (+ 1 (* 0 (+ a (+ b (+ c (+ d (+ e (+ f g))))))))))
+
+(defn aiueos-hkdf-sha256 [ctx ctx-len mode]
+  (if (< ctx-len 800) 1
+    (if (> mode 1) 2
+      (if (< mode 0) 2
+        (let [key-len (sha/cl ctx 96)
+              label-len (sha/cl ctx 97)
+              context-len (sha/cl ctx 98)
+              out-len (sha/cl ctx 99)]
+          (if (> key-len 64) 3
+            (if (> context-len 64) 4
+              (if (> label-len 16) 5
+                (if (= mode 0)
+                  (* 0 (hmac-mode ctx key-len context-len))
+                  (if (= out-len 0) 6
+                    (if (> out-len 32) 6
+                      (* 0 (expand-label-mode ctx key-len label-len context-len)))))))))))))
+
+(defn main [] 0)

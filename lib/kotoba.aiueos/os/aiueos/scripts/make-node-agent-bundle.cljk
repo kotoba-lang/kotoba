@@ -1,0 +1,133 @@
+#!/usr/bin/env kbb
+;; Pack the node agent so it can be installed onto a Linux that already boots.
+;;
+;; This is the half of the node USB worth keeping. The other half -- a hand
+;; built initramfs with hand-picked drivers -- was solving hardware bring-up,
+;; which distributions have solved: the same board that would not start the
+;; bespoke UKI runs Ubuntu (root ADR adr-2608251418 records it). So the agent
+;; goes to the distribution rather than the distribution being rebuilt around
+;; the agent.
+;;
+;; What travels is exactly what decides something, plus a runtime to decide it
+;; with. The decisions themselves are not copied here, they are carried:
+;; `grant.device-attest` is the one definition of what a device signs and
+;; `sekisho.didkey` the one definition of what a did:key is.
+;;
+;;   kbb --backend sci os/aiueos/scripts/make-node-agent-bundle.cljk \
+;;     --orgs ../.. --node build/aiueos/node-linux-x64 \
+;;     --nbb build/aiueos/nbb-bundle/node_modules \
+;;     --output build/aiueos/aiueos-node-agent.tar.gz
+
+(require '[kotoba.lang.text :as str]
+         '["node:fs" :as fs]
+         '["node:os" :as os]
+         '["node:path" :as path]
+         '["node:crypto" :as crypto]
+         '["node:child_process" :as cp]
+         '["node:zlib" :as zlib])
+
+(def argv (vec *command-line-args*))
+(defn- opt [f d] (let [i (.indexOf argv f)] (if (neg? i) d (nth argv (inc i)))))
+
+(def repo (.resolve path (js/process.cwd)))
+(def orgs (.resolve path (opt "--orgs" (path/join repo ".." ".."))))
+(def node-bin (opt "--node" "build/aiueos/node-linux-x64"))
+(def nbb-dir (opt "--nbb" "build/aiueos/nbb-bundle/node_modules"))
+(def output (opt "--output" "build/aiueos/aiueos-node-agent.tar.gz"))
+
+(defn- die [& m] (println (str "make-node-agent-bundle: " (str/join " " m)))
+  (js/process.exit 2))
+
+(defn- need [p what] (when-not (fs/existsSync p) (die "missing" what "at" p)) p)
+
+(def sources
+  ;; source root -> where it lands on the classpath. Copied, not re-stated: two
+  ;; implementations of "what a did:key is" is how a device becomes unclaimable.
+  [[(path/join orgs "kotoba-lang" "grant" "src" "grant" "device_attest.cljc") "cp/grant/device_attest.cljc"]
+   [(path/join orgs "kotoba-lang" "sekisho" "src" "sekisho" "didkey.cljc") "cp/sekisho/didkey.cljc"]
+   [(path/join orgs "kotoba-lang" "text" "src" "kotoba" "lang" "text.cljc") "cp/kotoba/lang/text.cljc"]])
+
+(def agent-dir (path/join repo "os" "aiueos" "node-agent"))
+(def entries
+  (concat
+   (for [n ["node-boot.cljk" "device-attest-agent.cljk" "install.cljk"]]
+     [(need (path/join agent-dir n) n) n])
+   (for [[src dst] sources] [(need src dst) dst])))
+
+(def staging (fs/mkdtempSync (path/join (os/tmpdir) "aiueos-node-agent-")))
+(def root (path/join staging "aiueos-node-agent"))
+
+(doseq [[src dst] entries]
+  (let [target (path/join root dst)]
+    (fs/mkdirSync (path/dirname target) #js {:recursive true})
+    (fs/copyFileSync src target)))
+
+(fs/copyFileSync (need node-bin "the linux node binary")
+                 (path/join root "node-linux-x64"))
+(.chmodSync fs (path/join root "node-linux-x64") 0755)
+(fs/cpSync (need nbb-dir "the nbb bundle")
+           (path/join root "nbb-bundle" "node_modules") #js {:recursive true})
+
+;; The shims node-boot spawns by name. Without them the agent never starts,
+;; and until node-boot was taught to notice, that looked like a run that found
+;; nothing to do.
+(doseq [[n body]
+        [["bin/node" "#!/bin/sh\nDIR=$(dirname \"$(readlink -f \"$0\")\")/..\nexec \"$DIR/node-linux-x64\" \"$@\"\n"]
+         ["bin/nbb" "#!/bin/sh\nDIR=$(dirname \"$(readlink -f \"$0\")\")/..\nexec \"$DIR/node-linux-x64\" \"$DIR/nbb-bundle/node_modules/nbb/cli.js\" \"$@\"\n"]]]
+  (let [t (path/join root n)]
+    (fs/mkdirSync (path/dirname t) #js {:recursive true})
+    (fs/writeFileSync t body)
+    (.chmodSync fs t 0755)))
+
+(fs/writeFileSync
+ (path/join root "README.txt")
+ (str "aiueos murakumo node agent\n\n"
+      "Installs onto a Linux that already boots. From inside this directory:\n\n"
+      "  sudo ./node-linux-x64 nbb-bundle/node_modules/nbb/cli.js install.cljk \\\n"
+      "    --endpoint https://murakumo.cloud\n\n"
+      "The device key is minted on this machine into /var/lib/aiueos-node and\n"
+      "never leaves it. The node's identity is the did:key that names it; it\n"
+      "survives reboots because the key does.\n"))
+
+;; Deterministic because the STAGED FILES are stamped, not because tar was
+;; asked to stamp them: the bsdtar macOS ships has no --mtime, and asking for a
+;; flag it silently lacks would have produced a bundle whose digest changed
+;; every build while the comment claimed otherwise.
+(let [names (->> (fs/readdirSync root #js {:recursive true})
+                 (map str) sort vec)]
+  (doseq [n names]
+    (let [p (path/join root n)]
+      (try (fs/utimesSync p 0 0) (catch :default _ nil))))
+  (try (fs/utimesSync root 0 0) (catch :default _ nil))
+  (fs/mkdirSync (path/dirname output) #js {:recursive true})
+  ;; tar UNCOMPRESSED, then gzip here. `tar -z` shells out to a gzip that
+  ;; stamps the current time into the header, so two builds of identical
+  ;; content produced different digests -- measured, twice. node's zlib writes
+  ;; no timestamp, which is the difference between a receipt that pins
+  ;; something and one that pins the clock.
+  (let [tarball (str (.resolve path output) ".tar")
+        r (.spawnSync cp "tar"
+                      (clj->js ["--format=ustar" "--numeric-owner"
+                                "--uid" "0" "--gid" "0"
+                                "-cf" tarball
+                                "-C" staging "aiueos-node-agent"])
+                      #js {:encoding "utf8"})]
+    (when-not (zero? (.-status r)) (die "tar failed:" (.-stderr r)))
+    (fs/writeFileSync (.resolve path output)
+                      (zlib/gzipSync (fs/readFileSync tarball) #js {:level 9}))
+    (fs/rmSync tarball))
+  (let [bytes (.-size (fs/statSync output))
+        digest (-> (.createHash crypto "sha256")
+                   (.update (fs/readFileSync output))
+                   (.digest "hex"))
+        receipt {:schema "aiueos.node-agent-bundle.v1"
+                 :bytes bytes
+                 :sha256 digest
+                 :files (count names)
+                 :carries (mapv second sources)}]
+    (fs/writeFileSync (str output ".receipt.json")
+                      (str (js/JSON.stringify (clj->js receipt) nil 2) "\n"))
+    (println (str "bundle  " output))
+    (println (str "bytes   " bytes))
+    (println (str "sha256  " digest))
+    (println (str "carries " (str/join ", " (map second sources))))))

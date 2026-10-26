@@ -1,0 +1,221 @@
+(ns aiueos.qwen35-rope
+  (:export [aiueos-qwen35-rope main]))
+
+;; The rotary position embedding of Qwen3.5's full-attention heads as one
+;; kernel object (ADR-0222 stage B item 6, the rope stage of ADR-0220's
+;; cutover). It replaces `rope_heads` (`kernel/qwen35_infer.c:690`), and it is
+;; NOT a port of it.
+;;
+;; ## Why the reference is Prism llama.cpp and not the C
+;;
+;; `rope_heads` takes its sine and cosine from the x87 `fsincos` instruction
+;; (`local_sincos`, :199). amu emits no x87, so no Kotoba object can be
+;; bit-identical to it, and "within a few ulp of fsincos" would be a reference
+;; nobody can reproduce off an x86 host. The floor this stage serves is
+;; stream A's eight greedy tokens from Prism llama.cpp, so the object follows
+;; Prism's own CPU rope instead -- PrismML-Eng/llama.cpp 9a9394a,
+;; `ggml_rope_cache_init` + `rotate_pairs` in ggml-cpu/ops.cpp:
+;;
+;;     theta_0 = (float) position
+;;     theta_{i+1} = theta_i * theta_scale            binary32
+;;     theta_scale = powf(10000000, -2/64) = 0x3f1ab32b
+;;     x0' = x0 * cos - x1 * sin
+;;     x1' = x0 * sin + x1 * cos                      binary32, unfused
+;;
+;; over the first 64 of each head's 256 dimensions, pair `i` being dimensions
+;; `i` and `i + 32` (NEOX layout). The other 192 are not touched. For a text
+;; token the model's imrope sections [11 11 10 0] reduce to exactly this: the
+;; three sections in use start at the same position and step by the same
+;; theta_scale, and the fourth is empty.
+;;
+;; The C's frequency is `local_exp(-ln(1e7) * i / 32)` instead of the
+;; iterated product, so the object and `rope_heads` differ in the angle as
+;; well as in the sine. That is intended; `tests/prism_rope_oracle.c` is the
+;; reference and the C is not consulted.
+;;
+;; ## The one substitution: cosf / sinf
+;;
+;; Prism calls the host's `cosf` / `sinf`. This object evaluates
+;; `f64-cos-bounded` / `f64-sin-bounded` (amu ADR 0009, osaho's kotoba.kir
+;; :1280-1343) on the binary32 angle widened exactly, and rounds the binary64
+;; answer to binary32. The algorithm is WRITTEN OUT below rather than called,
+;; because x86_64-aiueos-kernel-v1 rejects the intrinsic (measured 2026-09-23
+;; with amu 8412d88: "typed values currently require ... qualified native
+;; ... features", exit 70) -- it exists in the KIR interpreter, restricted JS
+;; and Wasm, not in kotoba-native. The transcription keeps the intrinsic's
+;; constants, its reduction and its Horner order, so every step is the same
+;; binary64 operation and the answer is the intrinsic's.
+;;
+;; Over the whole admitted domain (positions 0..25,735 x 32 pairs, 823,552
+;; angles) the rounded answer differs from `(float) sin((double) theta)` at 5
+;; angles and from `(float) cos(...)` at 7 -- `prism_rope_oracle --measure`.
+;; Against glibc's `cosf` / `sinf`, which Prism on Linux actually calls: not
+;; measured.
+;;
+;; ## Arguments and return
+;;
+;;     [values values-bytes heads position]
+;;
+;; `values` is `heads` consecutive 256-float heads, rotated in place;
+;; `values-bytes` must be exactly `heads * 1024`.
+;;
+;; **Zero is the success value.**
+;;
+;;    0    the heads were rotated
+;;   -1    null values
+;;   -2    heads outside 1..64
+;;   -3    values-bytes is not heads * 1024
+;;   -4    position outside 0..25735
+;;
+;; `-4` is the bounded domain, not a model limit. The largest angle is pair
+;; 0's, which is the position itself, and the intrinsic is defined on
+;; |x| <= 8192*pi = 25,735.927; past it the reduction's two-part pi/2 is no
+;; longer exact enough, and the intrinsic traps. The kernel's decode today
+;; stops at position 7 (`AIUEOS_QWEN35_GENERATION_TOKENS`); the model's
+;; context is 262,144. A longer context needs a wider reduction, and the
+;; refusal is what says so rather than a wrong angle.
+;;
+;; Position zero is computed, not skipped: theta is 0, cos 1, sin 0, and for
+;; finite values the rotation is the identity. `rope_heads` returns early.
+;;
+;; ## Heads outer, pairs inner
+;;
+;; The cosine and sine of a pair are recomputed per head rather than cached:
+;; carrying both across the head loop would be a sixth parameter, and this
+;; dialect admits five. Recomputing is the same operations on the same angle,
+;; so every head sees the same bits. At the live 24 query heads that is 768
+;; evaluations of each per call.
+
+(defn f32w [u]
+  (if (> u 2147483647) (- u 4294967296) u))
+
+(defn u32w [v]
+  (bit-and v 4294967295))
+
+(defn f32-at [head i]
+  (f32w (kernel-load-u32 (kernel-subregion head 1024 (* i 4) 4) 4 0)))
+
+(defn f32-put [head i bits]
+  (kernel-store-u32 (kernel-subregion head 1024 (* i 4) 4) 4 0 (u32w bits)))
+
+(defn d [bits] (f64-from-bits bits))
+
+;; ------------------------------------------------ the bounded sine and cosine
+
+;; `f64-sin-quarter-turn`. Zero returns itself, which keeps the sign of -0.
+(defn sin-qt [r]
+  (if (f64-eq (d r) (d 0))
+    r
+    (let [z (f64-mul (d r) (d r))
+          p1 (f64-add (d -4797767418267846625) (f64-mul z (d 4389130328383466826)))
+          p2 (f64-add (d 4460272573143870729) (f64-mul z p1))
+          p3 (f64-add (d -4730215272828025628) (f64-mul z p2))
+          p4 (f64-add (d 4523617214285662004) (f64-mul z p3))
+          p5 (f64-add (d -4671919876300759014) (f64-mul z p4))
+          p6 (f64-add (d 4575957461383581969) (f64-mul z p5))
+          p7 (f64-add (d -4628199217061079723) (f64-mul z p6))]
+      (f64-to-bits (f64-add (d r) (f64-mul (f64-mul (d r) z) p7))))))
+
+;; `f64-cos-quarter-turn`.
+(defn cos-qt [r]
+  (let [z (f64-mul (d r) (d r))
+        p1 (f64-add (d -4780226356266894179) (f64-mul z (d 4407590220077447199)))
+        p2 (f64-add (d 4477122120089393304) (f64-mul z p1))
+        p3 (f64-add (d -4714566979057836196) (f64-mul z p2))
+        p4 (f64-add (d 4537941361671905306) (f64-mul z p3))
+        p5 (f64-add (d -4659324094485795817) (f64-mul z p4))
+        p6 (f64-add (d 4586165620538955093) (f64-mul z p5))
+        p7 (f64-add (d -4620693217682128896) (f64-mul z p6))]
+    (f64-to-bits (f64-add (d 4607182418800017408) (f64-mul z p7)))))
+
+(defn pow2 [k]
+  (if (= k 0) 1 (* 2 (pow2 (- k 1)))))
+
+;; `floor` of a NON-NEGATIVE binary64, from its bit pattern: the fraction
+;; bits below the binary point are cleared. This dialect has no float-to-int
+;; for native (see qwen35-activation's note), and the intrinsic's
+;; round-half-away `nearest` is `floor(x + 0.5)` for the non-negative angles
+;; that reach it -- a position is non-negative and theta_scale positive.
+(defn floor-bits [bits]
+  (let [e (- (bit-and (quot bits 4503599627370496) 2047) 1023)]
+    (if (< e 0) 0
+      (if (> e 51) bits
+        (- bits (bit-and bits (- (pow2 (- 52 e)) 1)))))))
+
+;; The integer a floored pattern holds, mod 4 -- the quadrant. `nearest` is at
+;; most 16,384 here (25,735.927 * 2/pi), so the exponent is at most 14.
+(defn quadrant-of [fbits]
+  (let [e (- (bit-and (quot fbits 4503599627370496) 2047) 1023)]
+    (if (< e 0) 0
+      (let [n (quot (bit-or (bit-and fbits 4503599627370495) 4503599627370496)
+                    (pow2 (- 52 e)))]
+        (- n (* 4 (quot n 4)))))))
+
+;; `reduce-bounded-angle`: value - nearest * pi/2 in two parts, in that order.
+(defn reduced-of [x nearest]
+  (f64-to-bits
+   (f64-sub (f64-sub (d x) (f64-mul (d nearest) (d 4609753056924675352)))
+            (f64-mul (d nearest) (d 4364452196894661639)))))
+
+(defn nearest-of [x]
+  (floor-bits (f64-to-bits (f64-add (f64-mul (d x) (d 4603909380684499075))
+                                    (d 4602678819172646912)))))
+
+(defn neg [bits] (f64-to-bits (f64-neg (d bits))))
+
+(defn sin-by [r q]
+  (if (= q 0) (sin-qt r) (if (= q 1) (cos-qt r) (if (= q 2) (neg (sin-qt r)) (neg (cos-qt r))))))
+
+(defn cos-by [r q]
+  (if (= q 0) (cos-qt r) (if (= q 1) (neg (sin-qt r)) (if (= q 2) (neg (cos-qt r)) (sin-qt r)))))
+
+;; binary32 angle in, binary32 answer out.
+(defn f32-sin [theta]
+  (let [x (f64-to-bits (f32-to-f64-exact (f32-from-bits theta)))
+        n (nearest-of x)]
+    (f32-to-bits (f64-to-f32-rounded (d (sin-by (reduced-of x n) (quadrant-of n)))))))
+
+(defn f32-cos [theta]
+  (let [x (f64-to-bits (f32-to-f64-exact (f32-from-bits theta)))
+        n (nearest-of x)]
+    (f32-to-bits (f64-to-f32-rounded (d (cos-by (reduced-of x n) (quadrant-of n)))))))
+
+;; ------------------------------------------------------------------ rotation
+
+;; `rotate_pairs`, one pair: x0 = head[i], x1 = head[i + 32].
+(defn rotate-pair [head i c s]
+  (let [x0 (f32-from-bits (f32-at head i))
+        x1 (f32-from-bits (f32-at head (+ i 32)))]
+    (do (f32-put head i
+                 (f32-to-bits (f32-sub (f32-mul x0 (f32-from-bits c))
+                                       (f32-mul x1 (f32-from-bits s)))))
+        (f32-put head (+ i 32)
+                 (f32-to-bits (f32-add (f32-mul x0 (f32-from-bits s))
+                                       (f32-mul x1 (f32-from-bits c))))))))
+
+;; `theta *= theta_scale` after each pair, theta_scale = 0x3f1ab32b.
+(defn rotate-head [head i theta]
+  (if (>= i 32)
+    0
+    (do (rotate-pair head i (f32w (f32-cos theta)) (f32w (f32-sin theta)))
+        (rotate-head head (+ i 1)
+                     (f32w (f32-to-bits (f32-mul (f32-from-bits theta)
+                                                 (f32-from-bits 1058714411))))))))
+
+(defn walk [values vbytes heads h theta0]
+  (if (>= h heads)
+    0
+    (do (rotate-head (kernel-subregion values vbytes (* h 1024) 1024) 0 theta0)
+        (walk values vbytes heads (+ h 1) theta0))))
+
+(defn aiueos-qwen35-rope [values values-bytes heads position]
+  (if (= values 0) -1
+    (if (< heads 1) -2
+      (if (> heads 64) -2
+        (if (not (= values-bytes (* heads 1024))) -3
+          (if (< position 0) -4
+            (if (> position 25735) -4
+              (walk values values-bytes heads 0
+                    (f32w (f32-to-bits (i64-to-f32-rounded position)))))))))))
+
+(defn main [] 0)

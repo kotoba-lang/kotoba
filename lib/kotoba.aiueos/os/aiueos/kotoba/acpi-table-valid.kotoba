@@ -1,0 +1,148 @@
+;; Is this firmware-supplied SDT the table the kernel asked for, and does it
+;; describe itself coherently?
+;;
+;; kernel/acpi.c had this decision spread across three places that had to be
+;; read together to see it:
+;;
+;;   static int bounded_address(uint64_t address, uint32_t length) {
+;;     return address != 0 && length != 0 && address < BOOTSTRAP_IDENTITY_LIMIT &&
+;;            length <= ACPI_MAX_TABLE_SIZE && address <= BOOTSTRAP_IDENTITY_LIMIT - length;
+;;   }
+;;   static int valid_sdt(const struct sdt_header *header) {
+;;     uint64_t address = (uint64_t)(uintptr_t)header;
+;;     return bounded_address(address, sizeof(*header)) &&
+;;            header->length >= sizeof(*header) &&
+;;            bounded_address(address, header->length) && checksum_ok(header, header->length);
+;;   }
+;;
+;; plus, at each of the four call sites and never inside `valid_sdt`, a separate
+;; `bytes_equal(candidate->signature, "APIC", 4)`. Splitting the identity check
+;; from the shape check is what let the two drift: `valid_sdt` could pass on a
+;; table whose four leading bytes said something else entirely, and the caller
+;; that forgot the second half would never know.
+;;
+;; WHAT THIS OBJECT OWNS
+;;
+;;   signature       The four leading ASCII bytes, re-read from the table by
+;;                   this object and compared against what the caller says it
+;;                   expects. The caller passes it as a big-endian i64 --
+;;                   'APIC' is 0x41504943, first byte most significant -- so the
+;;                   expectation is a value, not a pointer into a region this
+;;                   object would then have to bound as well.
+;;   declared length The header's own `length` field at bytes 4..7, little
+;;                   endian, must EQUAL the `length` the caller passed. The C
+;;                   read that field and then used it; nothing checked that what
+;;                   it read was what it used. Re-deriving it here is what makes
+;;                   a truncating, mis-offset or wrong-endian read on the C side
+;;                   a rejection instead of a shorter checksum over a longer
+;;                   table.
+;;   at least 36     `sizeof(struct sdt_header)`. A table shorter than its own
+;;                   header does not have the fields the rest of acpi.c reads.
+;;                   This subsumes the C's `length != 0` clause inside
+;;                   `bounded_address` -- 0 fails `>= 36` first -- so zero is
+;;                   rejected exactly as before, by one clause instead of two.
+;;   at most         The caller's ceiling. acpi.c passes ACPI_MAX_TABLE_SIZE;
+;;   max-length      a caller with a tighter one (the extended RSDP's 4096) can
+;;                   say so without this object growing a table-kind argument.
+;;   at most 16 KiB  This object's own ceiling, and NOT a policy choice -- see
+;;                   THE BOUND below.
+;;   addressable     `table > 0`, `table < 1 GiB`, and `table + length <= 1 GiB`.
+;;                   The bootstrap identity map covers the first gigabyte and
+;;                   nothing above it, so a table that starts inside and ends
+;;                   outside is not a table this kernel can read. The C spelled
+;;                   the last clause `address <= LIMIT - length` to avoid an
+;;                   unsigned wrap; here the two preceding clauses cap both
+;;                   operands, so the sum is exact and the direct form is used.
+;;
+;; WHAT THIS OBJECT DOES NOT OWN, AND WHY -- THE CHECKSUM
+;;
+;; The checksum is NOT verified here. It lives in `acpi-checksum-ok.kotoba` and
+;; the C composes the two. Three reasons, in order of how hard they are to
+;; argue with:
+;;
+;;   1. A kernel object is compiled with host imports disabled and exports
+;;      exactly one symbol, so one object cannot call another. Verifying the
+;;      checksum here would mean a second, byte-for-byte copy of the walk --
+;;      duplicating the exact arithmetic the move was meant to give one home to.
+;;   2. Fuel is per object. This object's registered tier (`bounded-memory?` in
+;;      kotoba-native's elf64.clj) is 1024 and the checksum object's is 4096,
+;;      because one walks a 16 KiB table and this one reads eight bytes. A
+;;      duplicated walk under a 1024 replenish would clear a small table and
+;;      reach `ud2` on a large one -- a size-dependent halt that reads like a
+;;      firmware bug. The tiers are correct for the split as built; they would
+;;      be wrong for a merged object, and elf64.clj is not this repository's.
+;;   3. Both are called from the same place, `valid_sdt`, and the conjunction
+;;      there is a conjunction of two verdicts, not a decision C is making on
+;;      its own behalf.
+;;
+;; THE BOUND -- 16 KiB, imposed by the subset
+;;
+;; This object reads bytes 0..7 through `kernel-load-u8-16k`, whose region
+;; length is the caller's `length`. The load traps -- `ud2`, a halt -- when that
+;; declared length exceeds 16384, and 16384 is the widest bounded byte load the
+;; frontend offers (`kernel-load-u8` 512, `-4k` 4096, `-16k` 16384; there is no
+;; 64 KiB form). So `length <= 16384` is checked before the first load, and it
+;; is checked here rather than left to the checksum object so that the two admit
+;; exactly the same set of tables -- a table this object accepted and the
+;; checksum object then rejected on its bound would be a boot failure whose
+;; cause is in neither object's clauses.
+;;
+;; The C admitted up to 1 MiB. Tables between 16 KiB and 1 MiB are now rejected
+;; rather than parsed. Nothing acpi.c walks is anywhere near that: it reads the
+;; RSDP, the XSDT/RSDT, the MADT and the DMAR, and never the DSDT.
+;;
+;; SIGNEDNESS -- the C is unsigned, this object is signed i64
+;;
+;;   * `(> table 0)` is load-bearing and is not in the C. A `uint64_t` at or
+;;     above 2^63 arrives here as a NEGATIVE i64, and `(< table 1073741824)`
+;;     accepts every negative value. The C's unsigned `address < 0x40000000`
+;;     rejected the same pointer. Without this clause the pair of clauses that
+;;     look like a faithful transcription of `bounded_address` would admit
+;;     precisely the addresses it was written to exclude. It also subsumes the
+;;     C's `address != 0`.
+;;   * `length` reaches the C as a `uint32_t`, so no negative value can arrive
+;;     from acpi.c; `(>= length 36)` rejects one anyway, before any load, since
+;;     the load's own bound check is unsigned and would trap rather than return.
+;;   * `max-length` is caller-supplied and unconstrained. A negative one fails
+;;     `(<= length max-length)` against a `length` already known to be >= 36, so
+;;     it rejects rather than admits.
+;;   * `(+ table length)` cannot overflow: `table` is below 2^30 and `length` is
+;;     at most 2^14 by the time that clause is evaluated, so the sum is below
+;;     2^31 -- thirty-two bits clear of where i64 wraps.
+;;   * `expected-signature` is compared for equality only. The value derived
+;;     from memory is a sum of four zero-extended bytes and is in 0..2^32-1, so
+;;     a negative or oversized expectation simply fails to match.
+;;
+;; `and` desugars to nested `let`/`if` and short-circuits left to right, so the
+;; two loads below are unreachable until `table`, `length` and the 16 KiB
+;; ceiling have all held. The clause order is load-bearing for that reason and
+;; not merely for readability.
+
+(defn aiueos-acpi-table-signature [table length]
+  ;; Bytes 0..3, most significant first, so 'A','P','I','C' is 0x41504943 and
+  ;; the caller can write the expectation the way the ACPI tables spell it.
+  ;; There is no shift in this subset; the byte positions are multiplications
+  ;; by powers of two.
+  (+ (+ (* (kernel-load-u8-16k table length 0) 16777216)
+        (* (kernel-load-u8-16k table length 1) 65536))
+     (+ (* (kernel-load-u8-16k table length 2) 256)
+        (kernel-load-u8-16k table length 3))))
+
+(defn aiueos-acpi-table-declared-length [table length]
+  ;; Bytes 4..7, little endian -- the header's own account of how long it is.
+  (+ (+ (kernel-load-u8-16k table length 4)
+        (* (kernel-load-u8-16k table length 5) 256))
+     (+ (* (kernel-load-u8-16k table length 6) 65536)
+        (* (kernel-load-u8-16k table length 7) 16777216))))
+
+(defn aiueos-acpi-table-valid [table length expected-signature max-length]
+  (and (> table 0)
+       (< table 1073741824)
+       (>= length 36)
+       (<= length max-length)
+       (<= length 16384)
+       (<= (+ table length) 1073741824)
+       (= (aiueos-acpi-table-declared-length table length) length)
+       (= (aiueos-acpi-table-signature table length) expected-signature)))
+
+(defn main [] 0)

@@ -1,0 +1,264 @@
+#!/usr/bin/env kbb
+;; fuel64: a fuel budget past 2^31, spent on a CPU.
+;;
+;; kotoba-native ADR 0078 widened the object replenish from an imm32 to a
+;; 64-bit immediate, and kotoba-kir ADR 0268 put the ceiling at 2^53-1. Byte
+;; goldens on two runtimes say the right bytes come out; a KIR test says the
+;; oracle carries a budget past 2^31 rather than truncating it. Neither is a
+;; claim about a machine, and "the ceiling is higher now" is worth nothing
+;; until something has walked past the old one.
+;;
+;; So: `os/aiueos/native/fuel-wide-probe.kotoba` spends 2,200,000,013 fuel out
+;; of a sealed 2,500,000,000 and returns. Under the ceilings that stood on
+;; 2026-09-02, `kotoba.verifier` admitted at most 1,048,576 -- that budget
+;; could not be compiled, let alone spent.
+;;
+;; TWO IMAGES, AND THE SECOND IS THE POINT. The same source is compiled at
+;;
+;;   2,500,000,000  enough   -> console `F1234O`, exit 33
+;;   2,000,000,000  not      -> console `F123`, then vector 6 at the prologue
+;;                              `ud2`, and NOT the `4`
+;;
+;; A run that only ever finishes is equally consistent with a guard that never
+;; fires, and a fuel bound whose guard never fires is not a bound. The short
+;; budget is also deliberately BELOW 2^31, so the pair separates "the counter
+;; works past 2^31" from "the counter stopped working somewhere and nothing
+;; noticed".
+;;
+;; THE MARKERS ARE ALSO THE RATE. QEMU appends to the debug log as the guest
+;; writes, so a run that is still going can be watched, and the wall-clock
+;; between markers is the charge rate on this host. That matters because this
+;; workstation is an Apple M4: there is no x86-64 here except TCG, and TCG is
+;; slow enough that the honest answer to "did it spend 2^31" may be "here is
+;; how far it got and here is the measured rate". `--stages` reports the split.
+;;
+;; Usage: kbb --backend sci os/aiueos/scripts/smoke-qemu-fuel64.cljk /path/to/amu [--stages]
+(ns smoke-qemu-fuel64
+  (:require ["child_process" :as cp]
+            ["crypto" :as crypto]
+            ["fs" :as fs]
+            ["os" :as os]
+            ["path" :as path]
+            [kotoba.lang.text :as str]))
+
+(def repo (path/resolve (path/join (path/dirname *file*) ".." ".." "..")))
+(def aiueos (path/join repo "os" "aiueos"))
+(def source (path/join aiueos "native" "fuel-wide-probe.kotoba"))
+
+;; What the probe spends, stage by stage, including its own entry charges.
+;; `main` costs 1, each `burn` costs its argument plus one for the entry.
+(def stage-cost [100000001 400000001 1000000001 700000001])
+(def total-cost (+ 1 (reduce + stage-cost)))     ; 2,200,000,005
+
+(def enough-fuel 2500000000)
+(def short-fuel 2000000000)
+(def two-to-the-31 2147483648)
+
+(def expected-status 33)
+(def enough-console "F1234O")
+;; The short run must stop after the third marker. Three burns cost
+;; 1,500,000,003 + 1 for main, which fits 2,000,000,000; the fourth needs
+;; 700,000,001 more and 2,000,000,000 - 1,500,000,004 = 499,999,996 is not
+;; enough, so the guard fires INSIDE the fourth burn.
+(def short-console "F123")
+
+(def ovmf-candidates
+  ["/opt/homebrew/share/qemu/edk2-x86_64-code.fd"
+   "/usr/share/OVMF/OVMF_CODE_4M.fd"
+   "/usr/share/OVMF/OVMF_CODE.fd"
+   "/usr/share/edk2/x64/OVMF_CODE.fd"])
+
+(defn die [message]
+  (js/console.error (str "error: " message))
+  (js/process.exit 1))
+
+;; Three outcomes, not two (ADR-0155). `unmeasured` is "this machine could not
+;; ask" -- no amu, no OVMF, no QEMU, or a run that did not finish inside the
+;; deadline. That last one matters here more than anywhere else in this
+;; directory: a 2.2-billion-charge countdown under TCG is the one probe in the
+;; tree that can legitimately run out of wall clock, and reporting that as a
+;; failure would be a lie in the other direction.
+(defn unmeasured [message]
+  (js/console.error (str "COULD-NOT-RUN " message))
+  (js/process.exit 3))
+
+(defn refused [message]
+  (js/console.error (str "REFUSED stale-image " message))
+  (js/process.exit 4))
+
+(defn run! [command args options]
+  (let [result (cp/spawnSync command (clj->js args)
+                             (clj->js (merge {:encoding "utf8"} options)))]
+    {:status (.-status result)
+     :stdout (or (.-stdout result) "")
+     :stderr (or (.-stderr result) "")}))
+
+(defn sha256-file [p]
+  (when (fs/existsSync p)
+    (-> (crypto/createHash "sha256") (.update (fs/readFileSync p)) (.digest "hex"))))
+
+(defn qemu-binary []
+  (let [q (or (.. js/process -env -QEMU_SYSTEM_X86_64) "qemu-system-x86_64")
+        r (cp/spawnSync "sh" #js ["-c" (str "command -v " q)] #js {:encoding "utf8"})]
+    (when-not (zero? (.-status r)) (unmeasured (str "qemu-missing: " q)))
+    q))
+
+(defn firmware []
+  (or (some #(when (fs/existsSync %) %) (cons (.. js/process -env -OVMF_CODE)
+                                              ovmf-candidates))
+      (unmeasured (str "ovmf-missing. Looked at: " (str/join ", " ovmf-candidates)))))
+
+(defn build!
+  "Compile the probe at `fuel` into its own esp, and record the bytes."
+  [amu out label fuel]
+  (let [dir (path/join out label)
+        kernel (path/join dir "KERNEL.ELF")
+        efi (path/join dir "esp" "EFI" "BOOT" "BOOTX64.EFI")
+        binary (path/join amu "bin" "amu")]
+    (fs/mkdirSync (path/dirname efi) #js {:recursive true})
+    (let [compiled (run! binary ["compile" source
+                                 "--target" "x86_64-aiueos-kernel-v1"
+                                 "--artifact" "image"
+                                 "--fuel" (str fuel)
+                                 "--output" kernel]
+                         {})]
+      (when-not (zero? (:status compiled))
+        (unmeasured (str "compile-failed at fuel=" fuel ":\n"
+                         (:stdout compiled) (:stderr compiled)))))
+    (let [packaged (run! binary ["package-aiueos-boot" kernel "--output" efi] {})]
+      (when-not (zero? (:status packaged))
+        (unmeasured (str "package-failed at fuel=" fuel ":\n"
+                         (:stdout packaged) (:stderr packaged)))))
+    ;; The same no-foreign-object floor the shipping build keeps.
+    (doseq [entry (fs/readdirSync dir #js {:recursive true})]
+      (when (re-find #"\.(c|o|obj|a|so)$" entry)
+        (die (str "foreign/C artifact entered the probe output: " entry))))
+    {:label label :fuel fuel :dir dir :kernel kernel :efi efi
+     :digests {kernel (sha256-file kernel) efi (sha256-file efi)}}))
+
+(defn assert-fresh! [{:keys [digests label]}]
+  (when (empty? digests)
+    (unmeasured (str "no-artifacts: " label " recorded no digest")))
+  (doseq [[p expected] digests]
+    (let [found (sha256-file p)]
+      (when-not found
+        (refused (str "artifact=" p " expected=" expected " found=absent")))
+      (when-not (= found expected)
+        (refused (str "artifact=" p " expected=" expected " found=" found)))))
+  (println (str "IMAGE-FRESH " label " artifacts=" (count digests)))
+  (println (str "SCANNED " (count digests))))
+
+;; The two images must not be the same bytes. They differ only in the sealed
+;; fuel word, so if the compiler ignored `--fuel` they would be identical and
+;; the control would be running the experiment a second time.
+(defn assert-distinct! [a b]
+  (let [da (sha256-file (:kernel a)) db (sha256-file (:kernel b))]
+    (when (= da db)
+      (die (str "both images have the same kernel bytes (" da
+                ") -- --fuel did not reach the sealed budget, so the short-budget"
+                " run is not a control")))
+    (println (str "IMAGES-DISTINCT " (:label a) "=" (subs da 0 12)
+                  " " (:label b) "=" (subs db 0 12)))))
+
+(defn observe [{:keys [label dir]} code timeout-ms]
+  (let [log (path/join dir "debug.log")]
+    (when (fs/existsSync log) (fs/unlinkSync log))
+    (let [started (js/Date.now)
+          result (run! (or (.. js/process -env -QEMU_SYSTEM_X86_64)
+                           "qemu-system-x86_64")
+                       ["-machine" "q35,accel=tcg"
+                        "-cpu" "max"
+                        "-m" "128M" "-smp" "1"
+                        "-drive" (str "if=pflash,format=raw,readonly=on,file=" code)
+                        "-drive" (str "format=raw,file=fat:rw:" (path/join dir "esp"))
+                        "-device" "isa-debugcon,iobase=0xe9,chardev=debug"
+                        "-chardev" (str "file,id=debug,path=" log)
+                        "-device" "isa-debug-exit,iobase=0xf4,iosize=0x04"
+                        "-display" "none" "-serial" "none" "-no-reboot"]
+                       {:timeout timeout-ms})
+          elapsed (- (js/Date.now) started)
+          console (if (fs/existsSync log) (fs/readFileSync log "utf8") "")]
+      {:label label :status (:status result) :console console
+       :elapsed-ms elapsed :log log})))
+
+;; What the console got to, in fuel. Reported rather than asserted, so a run
+;; that is cut short by the deadline still says something true.
+(defn spent [console]
+  (let [reached (count (filter #(str/includes? console (str %)) [1 2 3 4]))]
+    (+ 1 (reduce + (take reached stage-cost)))))
+
+(defn -main [& args]
+  (let [amu (or (first args) (die "usage: smoke-qemu-fuel64.cljk /path/to/amu [--stages]"))
+        deadline (js/parseInt (or (.. js/process -env -FUEL64_TIMEOUT_MS) "3600000") 10)
+        out (fs/mkdtempSync (path/join (os/tmpdir) "aiueos-fuel64-"))
+        code (firmware)
+        _ (qemu-binary)
+        _ (println (str "PROBE total-cost=" total-cost
+                        " enough=" enough-fuel " short=" short-fuel
+                        " 2^31=" two-to-the-31
+                        " deadline-ms=" deadline))
+        _ (when-not (> total-cost two-to-the-31)
+            (die (str "the probe spends " total-cost
+                      ", which is not past 2^31 -- this experiment tests nothing")))
+        _ (when-not (< short-fuel two-to-the-31)
+            (die "the control budget must be below 2^31 as well as below the cost"))
+        enough (build! amu out "enough" enough-fuel)
+        short (build! amu out "short" short-fuel)
+        _ (assert-distinct! enough short)
+        _ (assert-fresh! enough)
+        run-enough (observe enough code deadline)
+        _ (assert-fresh! short)
+        run-short (observe short code deadline)]
+    (doseq [{:keys [label status console elapsed-ms]} [run-enough run-short]]
+      (println (str label ": exit=" status " console=" (pr-str console)
+                    " elapsed-ms=" elapsed-ms
+                    " reached-fuel=" (spent console)
+                    " charges-per-second="
+                    (if (pos? elapsed-ms)
+                      (js/Math.round (/ (* 1000 (spent console)) elapsed-ms))
+                      "unknown"))))
+    ;; A run that hit the deadline is UNMEASURED, not failed. `spawnSync` with
+    ;; a timeout returns a null status, and the console still says how far the
+    ;; guest got, which is the number worth reporting.
+    (doseq [{:keys [label status console elapsed-ms]} [run-enough run-short]]
+      (when (nil? status)
+        (unmeasured (str label " hit the " deadline "ms deadline after "
+                         elapsed-ms "ms. Console " (pr-str console)
+                         " -- reached " (spent console) " fuel, so the measured"
+                         " rate is " (js/Math.round (/ (* 1000 (spent console))
+                                                       (max 1 elapsed-ms)))
+                         " charges/second on this host."))))
+    (when-not (= expected-status (:status run-enough))
+      (die (str "the sufficient budget exited " (:status run-enough)
+                ", expected " expected-status " -- console "
+                (pr-str (:console run-enough)))))
+    (when-not (= enough-console (:console run-enough))
+      (die (str "the sufficient budget printed " (pr-str (:console run-enough))
+                ", expected " (pr-str enough-console))))
+    ;; The control. It must stop, and it must stop WHERE the arithmetic says.
+    (when (= expected-status (:status run-short))
+      (die (str "the short budget exited " expected-status " -- it completed a"
+                " run it could not afford, so the fuel guard did not fire and"
+                " nothing here is a bound. Console "
+                (pr-str (:console run-short)))))
+    ;; The exit is 0 rather than 33, and that IS the `ud2` signature under
+    ;; `-no-reboot`: the prologue traps, there is no IDT to take vector 6, the
+    ;; CPU triple-faults and QEMU exits on the reset it was told not to
+    ;; perform. What identifies it as a FUEL trap rather than any other stop is
+    ;; not the status -- it is that the two images are the same source, the
+    ;; same compiler and the same flags except the budget (`IMAGES-DISTINCT`
+    ;; above proves they differ, and proves --fuel reached the seal), and that
+    ;; the console stops exactly where the arithmetic says it runs out.
+    (when-not (= short-console (:console run-short))
+      (die (str "the short budget printed " (pr-str (:console run-short))
+                ", expected " (pr-str short-console)
+                " -- it stopped, but not where " short-fuel
+                " runs out, so the trap is something other than fuel")))
+    (println (str "AIUEOS_FUEL64_QEMU_OK spent=" total-cost
+                  " past-2^31-by=" (- total-cost two-to-the-31)
+                  " budget=" enough-fuel
+                  " control-stopped-at=" (spent (:console run-short))
+                  " of=" short-fuel))
+    (js/process.exit 0)))
+
+(apply -main (drop 3 (js->clj js/process.argv)))

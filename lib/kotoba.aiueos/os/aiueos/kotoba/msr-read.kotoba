@@ -1,0 +1,173 @@
+;; Model-specific register, read half.
+;;
+;; This is MECHANISM leaving C, like `pci-config-read` and unlike everything
+;; before it -- but it does not leave empty-handed. Three kernel files each
+;; carried their own private copy of the same four lines:
+;;
+;;   static uint64_t read_msr(uint32_t msr) {
+;;     uint32_t lo, hi; __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
+;;     return ((uint64_t)hi << 32) | lo;
+;;   }
+;;
+;; apic.c, paging.c and process.c. Three copies of an instruction that can read
+;; any of 2^32 registers, each reachable by whatever its caller computed. What
+;; moves here is the instruction; what is ADDED is that the set of registers it
+;; can reach is now a reviewed list, enforced by compiler-emitted code, rather
+;; than the argument.
+;;
+;; THE ADMITTED SET -- derived from the callers, not from the architecture
+;;
+;; Every index below is one this kernel has an actual, present reason to read.
+;; The list was built by reading the three files, not by transcribing the SDM:
+;;
+;;   27          0x1b        IA32_APIC_BASE   apic.c:35,37 -- read to check the
+;;                                            xAPIC window is where the page
+;;                                            tables put it, then written back
+;;                                            with the global enable bit.
+;;   3221225600  0xc0000080  IA32_EFER        paging.c:140 sets NXE (bit 11) so
+;;                                            the PTE_NX this file writes into
+;;                                            every entry is not reserved;
+;;                                            process.c:127 sets SCE (bit 0) so
+;;                                            `syscall` decodes at all, and
+;;                                            :132 reads it back as evidence.
+;;   3221225601  0xc0000081  IA32_STAR        process.c:128,133 -- the CS/SS
+;;                                            selector pair for syscall/sysret.
+;;   3221225602  0xc0000082  IA32_LSTAR       process.c:129,134 -- the 64-bit
+;;                                            syscall entry point.
+;;   3221225604  0xc0000084  IA32_FMASK       process.c:130,135 -- the RFLAGS
+;;                                            bits cleared on entry.
+;;
+;; Five. Note what is NOT here, because the gaps are the point:
+;;
+;;   * 0xc0000083 IA32_CSTAR is absent, and it sits BETWEEN two admitted
+;;     indices. It is the compatibility-mode syscall target; this kernel enters
+;;     user mode in 64-bit mode only and never programs it. An admission list
+;;     derived from "the SYSCALL MSRs" as a range would have included it. This
+;;     one was derived from grep, so it does not.
+;;   * 0xc0000100/0101/0102 (FS_BASE, GS_BASE, KERNEL_GS_BASE) are absent.
+;;     There is no `swapgs` anywhere in this tree and no per-CPU base is ever
+;;     programmed -- smp.c reads the AP's identity from the APIC ID register
+;;     over MMIO instead. If per-CPU state ever arrives, these get added HERE,
+;;     with the same review, rather than appearing at a call site.
+;;   * 0x10 (TSC), 0x1a0 (MISC_ENABLE), 0x277 (PAT), 0x3a (FEATURE_CONTROL)
+;;     and the rest of the architectural set are absent for the same reason:
+;;     nothing in this kernel reads them today.
+;;
+;; TWO CALLERS THAT DO NOT MOVE
+;;
+;; multiboot/entry.S:82 and kernel/ap_trampoline.S:31 also execute `rdmsr`, on
+;; EFER, and they STAY as assembly. Both run in 32-bit protected mode, before
+;; the long-mode transition they are themselves performing -- there is no
+;; 64-bit SysV frame there to call a Kotoba object from, and the object is
+;; 64-bit code. The AP trampoline's copy is genuinely per-CPU; this object's
+;; callers are not (see FUEL).
+;;
+;; WHAT A REFUSED READ RETURNS, AND WHY IT IS NOT A SENTINEL
+;;
+;; A refused index performs NO `rdmsr`. That is the whole guarantee, and it is
+;; the part that is worth having: an index this kernel has no reason to read is
+;; not read, so it cannot fault (a reserved MSR raises #GP, and at paging-init
+;; time the kernel's own IDT is installed and would take it), and no register
+;; this kernel has not reviewed reaches a caller.
+;;
+;; The RETURN VALUE cannot carry that news. 0 is a perfectly legal MSR value --
+;; IA32_FMASK is 0 at reset, IA32_EFER is 0 on a machine that has not yet
+;; enabled long mode, and IA32_STAR is 0 until something writes it. So is -1.
+;; So is every other 64-bit pattern. There is no value to reserve, and
+;; inventing one would be worse than admitting this, because a caller that
+;; tested for it would be testing for a value the hardware can also produce.
+;;
+;; So: this object returns 0 on refusal and DOES NOT SIGNAL. A caller cannot
+;; distinguish "refused" from "the register holds zero" and must not try. What
+;; a caller must do instead is one of:
+;;
+;;   * pass only admitted indices -- which every caller in this kernel does,
+;;     because the list above was derived from them, so the refusal path is
+;;     unreachable from the current tree; or
+;;   * for a write, use `aiueos-msr-write`, whose return IS a status rather
+;;     than a value (1 admitted, 0 refused) and therefore CAN say no.
+;;
+;; 0 is chosen over -1 because of what the two call sites that actually
+;; EXAMINE a read do with it. Both fail closed on zero and only on zero:
+;;
+;;   apic.c:  (base & 0xfffff000) != 0xfee00000  -- 0 fails, boot stage refuses
+;;   process.c: read back == the value just written -- 0 fails all four
+;;
+;; whereas -1 passes neither but also masks to 0xfffff000 in the first, which
+;; is a wrong address rather than an obviously absent one. paging.c is the one
+;; site that does not examine its read -- it ORs NXE in and writes back -- and
+;; a refusal there would clear LME and SCE. That is exactly why EFER is on the
+;; admitted list and why the list is reviewed here rather than trusted there.
+;;
+;; SIGNEDNESS -- i64 is signed, the C is unsigned, and here that is free
+;;
+;; The recurring bug in this tree is arithmetic on a value whose bit 63 the
+;; hardware controls. This object is arranged so that there is none:
+;;
+;;   * THE INDEX is only ever compared with `=`, against positive literals,
+;;     and is never masked, divided or shifted. `=` on i64 is exact bit
+;;     equality, so it is sign-agnostic by construction. The C passes a
+;;     `uint32_t`, which zero-extends into a non-negative i64, so no admitted
+;;     index can arrive negative; and an index that IS negative -- reachable
+;;     over this object's own i64 signature even though no current caller can
+;;     produce one -- equals none of the five literals and is refused. The
+;;     largest literal, 3221225604 = 0xc0000084, is well under 2^63 and is
+;;     positive as an i64.
+;;
+;;   * THE VALUE IS NEVER TOUCHED. `(kernel-read-msr index)` is returned
+;;     directly: no comparison, no mask, no `quot`. This is deliberate and is
+;;     the reason nothing here needs the mask-before-divide care that
+;;     `vtd-admit` needs. The backend assembles the result as
+;;     `(rdx << 32) | rax` over two 32-bit destination writes, each of which
+;;     zeroes the upper half of its 64-bit register, so the i64 that comes out
+;;     is the hardware's 64 bits EXACTLY. An MSR with bit 63 set -- and
+;;     IA32_APIC_BASE has bit 63 (the x2APIC-era reserved/extended range) on
+;;     machines with more than 4 GiB of physical address space, while EFER and
+;;     the SYSCALL MSRs are 64-bit registers whose high halves are live --
+;;     arrives as a NEGATIVE i64. That negative number is the correct answer:
+;;     the bit pattern is right, and `:i64` is signed. Returning it unexamined
+;;     is what keeps it right; the C receives it back into a `uint64_t` and
+;;     the pattern is unchanged.
+;;
+;; FUEL -- 1 per call, 7 calls per boot, no replenish tier needed
+;;
+;; This object is deliberately absent from `bounded-memory?` in kotoba-native's
+;; elf64.clj, so its wrapper emits no `mov qword [r9+8], N` replenish and it
+;; spends from the 512 its own `.data` context is initialised with. Measured
+;; from the emitted object rather than estimated: the disassembly contains
+;; exactly two `decq 0x8(%r9)` sites, one at the entry of this function and one
+;; at the entry of `main`, which the kernel never calls. There is no helper
+;; `defn`, no recursion and no walk, so every invocation costs exactly ONE unit
+;; on every path -- admitted and refused alike, since the `decq` precedes the
+;; comparison.
+;;
+;; The call count is seven, and it is seven on every boot because all three
+;; callers are one-shot BSP initialisers reached from kernel/main.c:
+;;
+;;   paging.c:140    aiueos_paging_initialize      main.c:331     1 read
+;;   apic.c:35       aiueos_apic_timer_initialize  main.c:430     1 read
+;;   process.c:127   syscall_transport_initialize  main.c:709     1 read
+;;   process.c:132-135  ... the same function's evidence check    4 reads
+;;
+;; 7 of 512, a factor of 73 in hand. Adding a helper `defn` would cost one more
+;; unit per call and still fit; a walk would need a tier, and this has neither.
+;;
+;; The SMP path was checked specifically and does NOT multiply this.
+;; `aiueos_ap_entry` in smp.c reads the AP's APIC ID from MMIO
+;; (`aiueos_apic_mmio_base[0x20/4]`) and then halts -- it never calls
+;; `aiueos_apic_timer_initialize`, which main.c invokes once, before
+;; `aiueos_smp_start_application_processor`, on the BSP. The only per-CPU MSR
+;; access in this tree is the trampoline's own assembly, which does not come
+;; through here.
+
+(defn aiueos-msr-read [index]
+  (if (or (= index 27)
+          (= index 3221225600)
+          (= index 3221225601)
+          (= index 3221225602)
+          (= index 3221225604))
+    (kernel-read-msr index)
+    ;; Refused: no `rdmsr` is executed. 0 is not a sentinel -- see above.
+    0))
+
+(defn main [] 0)

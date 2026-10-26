@@ -1,0 +1,249 @@
+(ns aiueos.vm
+  "`aiueos vm boot` -- ports the retired Rust `QemuBootPlan` (`bin/aiueos.rs`,
+  ADR-0008) to CLJC per ADR-0011: build a QEMU argv and (optionally) run it.
+  Same device-flag shape as the retired binary (`--graphics virtio-gpu`,
+  `--block`, `--console virtio-console`); the `aiueos.vfio` VFIO-backed real
+  raw-MMIO/DMA/PCI/IRQ access this ADR adds happens INSIDE the booted guest
+  (the tender doing VFIO ioctls against a device QEMU exposes), not in this
+  namespace, which only launches QEMU itself.
+
+  JVM-only (`#?(:clj ...)` throughout) -- process I/O, same as
+  `aiueos.image`/`aiueos.launcher`."
+  (:require [kotoba.io :as kio] [kotoba.lang.text :as str]
+            #?(:clj [grant.deployment-profile :as deployment-profile])
+            #?(:clj [grant.boot-admission :as boot-admission])
+            #?(:clj [grant.signing :as signing])))
+
+(def known-graphics #{"none" "virtio-gpu"})
+(def known-console #{"pl011" "virtio-console"})
+(def known-architectures #{"aarch64" "x86_64"})
+
+(defn- default-qemu [arch]
+  (str "qemu-system-" arch))
+
+(defn plan
+  "Pure planning step: validate and default every QEMU flag. `opts`:
+  `:kernel`/`:initramfs` (required, host paths), `:memory` (default
+  `\"1024M\"`), `:cpus` (default `\"2\"`), `:cmdline` (default
+  `\"console=ttyAMA0 panic=0 rdinit=/init\"`), `:graphics` (`\"none\"` or
+  `\"virtio-gpu\"`, default `\"none\"`), `:display` (default `\"cocoa\"` when
+  `:graphics` is `virtio-gpu`, else `\"none\"`), `:block` (optional raw disk
+  image path -> `virtio-blk-pci`), `:console` (`\"pl011\"` or
+  `\"virtio-console\"`, default `\"pl011\"`), `:console-socket` (default
+  `\"aiueos-console.sock\"`, only used when `:console` is `virtio-console`),
+  `:qemu-binary` (default `\"qemu-system-aarch64\"` -- override to
+  `\"qemu-system-x86_64\"` for an x86_64 host/guest)."
+  [opts]
+  (when-not (:kernel opts) (throw (ex-info "vm boot needs :kernel" {:opts opts})))
+  (when-not (:initramfs opts) (throw (ex-info "vm boot needs :initramfs" {:opts opts})))
+  (let [arch (or (:arch opts) "aarch64")
+        _ (when-not (contains? known-architectures arch)
+            (throw (ex-info (str "unknown architecture " arch) {:arch arch})))
+        accel (or (:accel opts) "auto")
+        graphics (or (:graphics opts) "none")
+        _ (when-not (contains? known-graphics graphics)
+            (throw (ex-info (str "unknown :graphics `" graphics "` (known: " known-graphics ")") {:graphics graphics})))
+        display (or (:display opts) (if (= graphics "virtio-gpu") "cocoa" "none"))
+        _ (when (and (= graphics "none") (not= display "none"))
+            (throw (ex-info "`:display` requires `:graphics \"virtio-gpu\"`" {:display display})))
+        console (or (:console opts) "pl011")
+        _ (when-not (contains? known-console console)
+            (throw (ex-info (str "unknown :console `" console "` (known: " known-console ")") {:console console})))]
+    {:kernel (:kernel opts)
+     :initramfs (:initramfs opts)
+     ;; The signed manifest these artifacts must match, and the publisher state
+     ;; to judge it against. Absent means unverified, and `verify-artifacts!`
+     ;; records that rather than implying it.
+     :release (:release opts)
+     :publisher-state (:publisher-state opts)
+     ;; The profile THIS LAUNCHER is running under, not the one the guest will
+     ;; declare for itself. See `verify-artifacts!` (ADR-0069).
+     :deployment-profile (:deployment-profile opts)
+     ;; What the image says about itself, when the caller knows it. The
+     ;; launcher does not read the initramfs, so this is supplied rather than
+     ;; discovered (ADR-0071).
+     :image-profile (:image-profile opts)
+     :arch arch
+     :accel accel
+     :memory (or (:memory opts) "1024M")
+     :cpus (or (:cpus opts) "2")
+     :cmdline (or (:cmdline opts) (if (= arch "x86_64")
+                                    "console=ttyS0 panic=0 rdinit=/init"
+                                    "console=ttyAMA0 panic=0 rdinit=/init"))
+     :graphics graphics
+     :display display
+     :block (:block opts)
+     :console console
+     :console-socket (or (:console-socket opts) "aiueos-console.sock")
+     :qemu-binary (or (:qemu-binary opts) (default-qemu arch))}))
+
+(def production-profiles
+  "Profiles for which an unverified artifact is a refusal rather than a note.
+
+  ADR-0049 recorded `:aiueos.boot/verified? false` and said no profile turned it
+  into a requirement; ADR-0065 did the anchors half inside the guest and left
+  this one, because the fact lives on the launcher's plan and
+  `grant.deployment-profile` judges a boot config from inside the guest — the
+  two never meet.
+
+  They still do not. **What this adds is the host declaring its own intent**:
+  a launcher told it is starting a production machine refuses to boot artifacts
+  it could not check. It says nothing about whether the guest's own
+  `boot.edn` agrees, because the launcher does not read the guest's config, and
+  a rule that claimed agreement it never checked would be worse than the note it
+  replaced (ADR-0069)."
+  #{:sensitive-local :regulated})
+
+(defn- accel-name
+  "The QEMU `accel=` value for `p`.
+
+  `\"auto\"` is resolved from the host OS on the JVM. On ClojureScript there is
+  no detection and it falls through to `\"tcg\"` -- deliberately, because this
+  namespace only shapes an argv and the process that would run it is started
+  by a JVM caller. It is written down because the two runtimes therefore
+  disagree about what `\"auto\"` means, and a test that leaves `:accel` at
+  `\"auto\"` is asserting about the machine it happens to run on."
+  [p]
+  (if (= "auto" (:accel p))
+    (case #?(:clj (System/getProperty "os.name") :cljs "other")
+      "Mac OS X" "hvf"
+      "Linux" "kvm:tcg"
+      "tcg")
+    (:accel p)))
+
+#?(:clj
+   (defn measure-artifacts
+     "`{kind digest}` for the artifacts this plan would boot.
+
+     Reads each file whole. A launcher can afford that once; the alternative is
+     a third copy of \"SHA-256 of some bytes\" and `grant.signing/sha256-hex`
+     already declares itself the canonical one."
+     [p]
+     (into {}
+           (map (fn [[kind path]]
+                  [kind (signing/sha256-hex
+                         (kio/read-all-bytes
+                          (java.io.File. ^String path)))]))
+           [[:kernel (:kernel p)] [:initramfs (:initramfs p)]])))
+
+#?(:clj
+   (defn verify-artifacts!
+     "Refuse to boot artifacts a signed release manifest does not name.
+
+     Called with no `:release`, this records `:aiueos.boot/verified? false` and
+     proceeds — every existing local workflow boots a kernel and an initramfs
+     it just built, and breaking that would be a way of not being used. But the
+     difference between *checked* and *not checked* is written into the plan
+     rather than left to be inferred from the absence of a complaint, so a
+     receipt, a profile rule, or a reader can tell them apart."
+     [p]
+     (when (and (contains? production-profiles (:deployment-profile p))
+                (not (:release p)))
+       (throw (ex-info (str "refusing to boot: " (name (:deployment-profile p))
+                            " requires a signed release to verify against")
+                       {:type :boot-admission-failed
+                        :profile (:deployment-profile p)
+                        :reason :no-release})))
+     (when (and (:image-profile p)
+                (not (deployment-profile/at-least-as-strict?
+                      (:deployment-profile p) (:image-profile p))))
+       (throw (ex-info (str "refusing to boot: the image declares "
+                            (name (:image-profile p))
+                            " and this launcher is running "
+                            (pr-str (:deployment-profile p)))
+                       {:type :boot-admission-failed
+                        :reason :launcher-weaker-than-image
+                        :image-profile (:image-profile p)
+                        :launcher-profile (:deployment-profile p)})))
+     (if-let [release (:release p)]
+       (let [observed (measure-artifacts p)
+             verdict (boot-admission/admit-boot release observed (:publisher-state p))]
+         (when-not (boot-admission/admitted? verdict)
+           (throw (ex-info (str "refusing to boot: "
+                                (name (or (:aiueos.boot/reason verdict)
+                                          (:aiueos.publisher/reason verdict))))
+                           {:type :boot-admission-failed :verdict verdict})))
+         (assoc p :aiueos.boot/verified? true
+                  :aiueos.boot/release-id (:aiueos.boot/release-id verdict)
+                  :aiueos.boot/observed observed))
+       (assoc p :aiueos.boot/verified? false))))
+
+#?(:clj
+   (defn validate-boot-inputs! [p]
+     (doseq [[kind path] [[:kernel (:kernel p)] [:initramfs (:initramfs p)]]]
+       (when-not (.isFile (java.io.File. ^String path))
+         (throw (ex-info (str "missing VM boot input " (name kind)) {:kind kind :path path}))))
+     (verify-artifacts! p)))
+
+(def verified-cmdline-key
+  "The kernel command-line token a launcher uses to tell the guest it checked
+  the artifacts before starting it.
+
+  **This is not a security control and must not be read as one.** The command
+  line is supplied by the same host that would be lying, so a compromised
+  launcher can claim a verification it never did. What it catches is
+  *misconfiguration*: a production guest started by a launcher that does not
+  even claim to have verified it — which, before this, the guest had no way to
+  notice at all (ADR-0072).
+
+  Writing the evidence into the image was the other option and is impossible:
+  the image's digest is the thing being verified, so mutating it invalidates
+  the claim being recorded."
+  "aiueos.boot.verified")
+
+(defn cmdline-with-evidence
+  "P's `:cmdline` plus the host's claim, when there is one to make."
+  [p]
+  (cond-> (:cmdline p)
+    (:aiueos.boot/release-id p)
+    (str " " verified-cmdline-key "=" (:aiueos.boot/release-id p))))
+
+(defn argv
+  "The full QEMU argv (a vector of strings) for `p` (from `plan`)."
+  [p]
+  (vec
+   (concat
+    [(:qemu-binary p) "-machine" (str (if (= "x86_64" (:arch p)) "q35" "virt")
+                                        ",accel=" (accel-name p))
+     ;; `host` passes the physical CPU through, which only a hardware
+     ;; accelerator can do; under pure emulation QEMU rejects it, so ask for
+     ;; the fullest model TCG implements. (This was written as a nested `if`
+     ;; on `:arch` whose two branches were both "max" -- it read as an
+     ;; architecture distinction and was not one.)
+     "-cpu" (if (= "tcg" (accel-name p)) "max" "host")
+     "-smp" (:cpus p) "-m" (:memory p)]
+    (if (= (:graphics p) "virtio-gpu")
+      ["-display" (:display p) "-device" "virtio-gpu-pci"]
+      ["-nographic"])
+    (when-let [block (:block p)]
+      ["-drive" (str "file=" block ",if=none,format=raw,id=aiueosblk")
+       "-device" "virtio-blk-pci,drive=aiueosblk"])
+    (when (= (:console p) "virtio-console")
+      ["-device" "virtio-serial-pci"
+       "-chardev" (str "socket,id=aiueoscon,path=" (:console-socket p) ",server=on,wait=off")
+       "-device" "virtconsole,chardev=aiueoscon,name=aiueos.console.0"])
+    ["-kernel" (str (:kernel p)) "-initrd" (str (:initramfs p))
+     "-append" (cmdline-with-evidence p)])))
+
+(defn command-line
+  "`argv` joined into one shell-quotable-ish string, for `--dry-run`/logging
+  display only (never actually shelled out to -- `boot!` execs `argv`
+  directly, avoiding a shell entirely)."
+  [p]
+  (str/join " " (map #(if (re-find #"\s" %) (pr-str %) %) (argv p))))
+
+#?(:clj
+   (defn boot!
+     "Exec QEMU with `p`'s argv via `ProcessBuilder` (inherits this process's
+     stdio -- `-nographic`'s serial console reads/writes the calling
+     terminal directly, matching the retired Rust's `std::process::Command`
+     use). Blocks until QEMU exits; throws if it exits non-zero."
+     [p]
+     (validate-boot-inputs! p)
+     (let [pb (ProcessBuilder. ^java.util.List (argv p))
+           _ (.inheritIO pb)
+           process (.start pb)
+           exit-code (.waitFor process)]
+       (when-not (zero? exit-code)
+         (throw (ex-info (str (:qemu-binary p) " exited with code " exit-code) {:exit-code exit-code})))
+       nil)))

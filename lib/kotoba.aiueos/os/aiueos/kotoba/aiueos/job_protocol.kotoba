@@ -1,0 +1,532 @@
+;; WIRED (ADR-0220). Landed unwired in native/ as ADR-0212's conversion
+;; coefficient evidence; moved here as the shared module behind the kernel
+;; object `job-protocol-dispatch.kotoba`, which is what kernel/job_protocol.c
+;; now calls. The C keeps the struct packing (a 48-byte input record and the
+;; out-struct unpacking) and no decision.
+;;
+;; Note the shape the ABI forced: `aiueos_job_request_parse` fills an
+;; out-struct in C, and there is no out-parameter here and no returning a
+;; record across the boundary, so it is THREE functions -- `job-request-verdict`,
+;; `job-request-id` and `job-request-prompt`. Expect that split wherever the C
+;; returns through a pointer.
+;;
+(ns aiueos.job-protocol
+  ;; The JUDGMENT half of kernel/job_protocol.c: the four AIUEOS wire lines
+  ;; (AIUEOS_JOB_V1 request, AIUEOS_JOB_RESULT_V1 answer, AIUEOS_JOB_COMMIT_V1
+  ;; receipt, AIUEOS_NODE_PING_V1 / _PONG_V1 liveness) as decisions over flat
+  ;; (base, length) byte spans.
+  ;;
+  ;; "C marshals, Kotoba judges."  Nothing here walks a C struct.  The caller
+  ;; hands over:
+  ;;   * a payload span as (base, length) -- the bytes off the wire, and
+  ;;   * a 48-byte INPUT RECORD `in` whose layout is the whole marshalling
+  ;;     contract with the C side.  The record is a fixed 48 bytes on purpose:
+  ;;     the x86-64 fuel ABI takes at most FIVE integer parameters, and a
+  ;;     region carried as a (base, length) pair costs two of them.  Freezing
+  ;;     the length to a literal buys back a slot in every signature that
+  ;;     touches it.
+  ;;
+  ;;   in[ 0.. 3]  boot nonce, low  32 bits, low byte first
+  ;;   in[ 4.. 7]  boot nonce, high 32 bits, low byte first
+  ;;   in[ 8..11]  inference cycles, low  32 bits
+  ;;   in[12..15]  inference cycles, high 32 bits
+  ;;   in[16..17]  score  (uint16)
+  ;;   in[18..19]  total  (uint16)
+  ;;   in[20]      token  (uint8)
+  ;;   in[21]      job id length (0..20)
+  ;;   in[22..23]  reserved
+  ;;   in[24..27]  liveness sequence (uint32)
+  ;;   in[28..47]  job id bytes
+  ;;
+  ;; The 64-bit nonce and the 64-bit cycle count are carried as TWO 32-bit
+  ;; halves rather than one i64 because this subset's `quot` is signed: a
+  ;; nonce with bit 63 set would make every hex digit walk the wrong way.
+  ;; Splitting at 32 keeps both halves non-negative and makes the comparison
+  ;; and the rendering exact for the full uint64 range, which is what the C
+  ;; does.  (native/relay_line.kotoba solves the same problem by masking the
+  ;; nonce to 60 bits at the point it is drawn; that loses four bits, this
+  ;; does not.)
+  ;;
+  ;; EVERY store is checked by a READ-BACK, the same way relay_line.kotoba
+  ;; does it: `kernel-store-u8` returns its operand, so comparing against
+  ;; that operand is a tautology.  The `(* 0 stored)` term keeps the store in
+  ;; the dependency graph without letting its value into the comparison.
+  ;;
+  ;; Overflow of an output buffer is modelled exactly as the C models it:
+  ;; every append returns `capacity + 1` as a poison value, every later
+  ;; append propagates it, and the entry point converts a poisoned length
+  ;; into 0.
+  (:export [main
+            job-request-verdict job-request-id job-request-prompt
+            job-result-write job-commit-valid
+            node-ping-verdict node-pong-write]))
+
+;; ── the literal table ────────────────────────────────────────────────────
+;; The ASCII skeletons, one `kind` per literal.  relay_text.kotoba keeps the
+;; same strings packed eight bytes to an i64 because a generator emits it;
+;; written by hand, `string-code-point-at` over a literal is the form that
+;; cannot drift from what it says.
+
+(defn lit-length [kind]
+  (if (= kind 0) 19
+    (if (= kind 1) 4
+      (if (= kind 2) 32
+        (if (= kind 3) 26
+          (if (= kind 4) 35
+            (if (= kind 5) 7
+              (if (= kind 6) 7
+                (if (= kind 7) 8
+                  (if (= kind 8) 26
+                    (if (= kind 9) 15
+                      (if (= kind 10) 25
+                        (if (= kind 11) 5
+                          (if (= kind 12) 25
+                            (if (= kind 13) 12 0)))))))))))))))
+
+(defn lit-char [kind index]
+  (if (= kind 0) (string-code-point-at "AIUEOS_JOB_V1 boot=" index)
+    (if (= kind 1) (string-code-point-at " id=" index)
+      (if (= kind 2) (string-code-point-at " kind=aiueos-micro-infer prompt=" index)
+        (if (= kind 3) (string-code-point-at "AIUEOS_JOB_RESULT_V1 boot=" index)
+          (if (= kind 4) (string-code-point-at " model=aiueos-char-bigram-v1 token=" index)
+            (if (= kind 5) (string-code-point-at " score=" index)
+              (if (= kind 6) (string-code-point-at " total=" index)
+                (if (= kind 7) (string-code-point-at " cycles=" index)
+                  (if (= kind 8) (string-code-point-at "AIUEOS_JOB_COMMIT_V1 boot=" index)
+                    (if (= kind 9) (string-code-point-at " state=recorded" index)
+                      (if (= kind 10) (string-code-point-at "AIUEOS_NODE_PING_V1 boot=" index)
+                        (if (= kind 11) (string-code-point-at " seq=" index)
+                          (if (= kind 12) (string-code-point-at "AIUEOS_NODE_PONG_V1 boot=" index)
+                            (if (= kind 13) (string-code-point-at " state=ready" index) 0)))))))))))))))
+
+(defn pow16 [n]
+  (if (= n 0) 1
+    (if (= n 1) 16
+      (if (= n 2) 256
+        (if (= n 3) 4096
+          (if (= n 4) 65536
+            (if (= n 5) 1048576
+              (if (= n 6) 16777216 268435456))))))))
+
+(defn hex-char [value]
+  ;; lowercase: hex_digit() in the C accepts [0-9a-f] and nothing else.
+  (if (< value 10) (+ 48 value) (+ 87 value)))
+
+(defn hex-digit [c]
+  ;; The C's hex_digit(): -1 for anything outside [0-9a-f].
+  (if (and (>= c 48) (<= c 57))
+    (- c 48)
+    (if (and (>= c 97) (<= c 102)) (- c 87) (- 0 1))))
+
+;; ── the input record ─────────────────────────────────────────────────────
+
+(defn rec-u32 [in at]
+  (+ (kernel-load-u8 in 48 at)
+     (+ (* (kernel-load-u8 in 48 (+ at 1)) 256)
+        (+ (* (kernel-load-u8 in 48 (+ at 2)) 65536)
+           (* (kernel-load-u8 in 48 (+ at 3)) 16777216)))))
+
+(defn rec-u16 [in at]
+  (+ (kernel-load-u8 in 48 at) (* (kernel-load-u8 in 48 (+ at 1)) 256)))
+
+;; ── reading a payload ────────────────────────────────────────────────────
+
+(defn take-lit [payload length at kind i]
+  ;; The C's take_text(): the new offset past literal `kind`, or 0 when the
+  ;; bytes do not match.  0 is safe as the refusal because every literal in
+  ;; the table is non-empty, so a match always returns at least 4.
+  (if (>= i (lit-length kind))
+    at
+    (if (>= at length)
+      0
+      (if (= (kernel-load-u8 payload length at) (lit-char kind i))
+        (take-lit payload length (+ at 1) kind (+ i 1))
+        0))))
+
+(defn take-hex8 [payload length at i acc]
+  ;; Eight lowercase hex digits as a non-negative i64, or -1.  Two of these
+  ;; back to back are the C's take_hex64().
+  (if (= i 8)
+    acc
+    (if (>= at length)
+      (- 0 1)
+      (let [d (hex-digit (kernel-load-u8 payload length at))]
+        (if (< d 0)
+          (- 0 1)
+          (take-hex8 payload length (+ at 1) (+ i 1) (+ (* acc 16) d)))))))
+
+(defn digits-run [payload length at count limit]
+  (if (>= count limit)
+    count
+    (if (>= (+ at count) length)
+      count
+      (let [c (kernel-load-u8 payload length (+ at count))]
+        (if (and (>= c 48) (<= c 57))
+          (digits-run payload length at (+ count 1) limit)
+          count)))))
+
+(defn hex-run-ok [payload length at remaining]
+  ;; Every remaining byte is one of an even number of [0-9a-f] characters.
+  ;; This is the C's prompt loop with the store removed: `at+2U>length` is
+  ;; the odd-length refusal and `hex_digit(...)<0` the vocabulary one.
+  (if (= remaining 0)
+    1
+    (if (< remaining 2)
+      0
+      (if (< (hex-digit (kernel-load-u8 payload length at)) 0)
+        0
+        (if (< (hex-digit (kernel-load-u8 payload length (+ at 1))) 0)
+          0
+          (hex-run-ok payload length (+ at 2) (- remaining 2)))))))
+
+;; ── AIUEOS_JOB_V1: the request ───────────────────────────────────────────
+
+(defn job-request-verdict [payload length boot-hi boot-lo]
+  ;; aiueos_job_request_parse()'s decision, with the two struct stores taken
+  ;; out.  0 refuses.  On acceptance the answer carries both spans the caller
+  ;; needs in one word: `id-length * 256 + prompt-length`, and prompt-length
+  ;; is at most 64, so the two never collide.
+  ;;
+  ;; The id starts at a fixed 39 (19 + 16 + 4) and the prompt at 71 + id
+  ;; length; job-request-prompt below re-derives both rather than being told,
+  ;; because the ABI has no room to pass them.
+  (if (or (= length 0) (> length 256))
+    0
+    (let [a1 (take-lit payload length 0 0 0)]
+      (if (= a1 0)
+        0
+        (if (not (and (= (take-hex8 payload length a1 0 0) boot-hi)
+                      (= (take-hex8 payload length (+ a1 8) 0 0) boot-lo)))
+          0
+          (let [a2 (take-lit payload length (+ a1 16) 1 0)]
+            (if (= a2 0)
+              0
+              (let [idn (digits-run payload length a2 0 21)]
+                ;; 21 digits is the C hitting `id_length>=AIUEOS_JOB_ID_MAX`
+                ;; on the twenty-first, which refuses.
+                (if (or (= idn 0) (> idn 20))
+                  0
+                  (let [a3 (take-lit payload length (+ a2 idn) 2 0)]
+                    (if (= a3 0)
+                      0
+                      (let [rest (- length a3)]
+                        (if (or (< rest 2) (> rest 128))
+                          0
+                          (if (not (= (* 2 (quot rest 2)) rest))
+                            0
+                            (if (= (hex-run-ok payload length a3 rest) 1)
+                              (+ (* idn 256) (quot rest 2))
+                              0)))))))))))))))
+
+(defn decode-hex [hex out capacity i n]
+  ;; `n` bytes out of 2n hex characters.  `hex` is a kernel-subregion of the
+  ;; payload narrowed to exactly the prompt field, which is what lets its
+  ;; length be spelled `(* n 2)` instead of costing a parameter.
+  (if (>= i n)
+    n
+    (let [hi (hex-digit (kernel-load-u8 hex (* n 2) (* i 2)))
+          lo (hex-digit (kernel-load-u8 hex (* n 2) (+ (* i 2) 1)))]
+      (if (or (< hi 0) (< lo 0))
+        0
+        (let [value (+ (* hi 16) lo)
+              stored (kernel-store-u8 out capacity i value)]
+          (if (= (+ (kernel-load-u8 out capacity i) (* 0 stored)) value)
+            (decode-hex hex out capacity (+ i 1) n)
+            0))))))
+
+(defn job-request-prompt [payload length out capacity]
+  ;; The decoded prompt, written into the caller's span.  Returns the number
+  ;; of bytes, or 0.  Call only after job-request-verdict has accepted --
+  ;; this repeats the shape derivation but not the boot check, exactly as
+  ;; the C's single pass would have had it.
+  (let [idn (digits-run payload length 39 0 21)]
+    (if (or (= idn 0) (> idn 20))
+      0
+      (let [at (+ 71 idn)]
+        (if (>= at length)
+          0
+          (let [rest (- length at)]
+            (if (or (< rest 2) (> rest 128))
+              0
+              (if (not (= (* 2 (quot rest 2)) rest))
+                0
+                (if (> (quot rest 2) capacity)
+                  0
+                  (decode-hex (kernel-subregion payload length at rest)
+                              out capacity 0 (quot rest 2)))))))))))
+
+(defn copy-id-bytes [payload length out capacity i]
+  ;; the id digits, payload[39 .. 39+idn) -> out[0 .. idn)
+  (if (>= i capacity)
+    i
+    (let [stored (kernel-store-u8 out capacity i (kernel-load-u8 payload length (+ 39 i)))]
+      (copy-id-bytes payload length out capacity (+ (+ i 1) (* 0 stored))))))
+
+(defn job-request-id [payload length out capacity]
+  ;; The job id digits, written into the caller's span. Returns the id length
+  ;; (1..20), or 0. Call only after job-request-verdict has accepted; like
+  ;; job-request-prompt it re-derives the id run at the fixed offset 39.
+  (let [idn (digits-run payload length 39 0 21)]
+    (if (or (= idn 0) (> idn 20) (> idn capacity))
+      0
+      (copy-id-bytes payload length out idn 0))))
+
+;; ── writing a line ───────────────────────────────────────────────────────
+
+(defn put-lit [out capacity at kind i]
+  ;; The C's append_text(): `capacity + 1` the moment the write would leave
+  ;; the buffer, and that poison survives every later append.
+  (if (>= i (lit-length kind))
+    at
+    (if (>= at capacity)
+      (+ capacity 1)
+      (let [c (lit-char kind i)
+            stored (kernel-store-u8 out capacity at c)]
+        (if (= (+ (kernel-load-u8 out capacity at) (* 0 stored)) c)
+          (put-lit out capacity (+ at 1) kind (+ i 1))
+          (+ capacity 1))))))
+
+(defn append-lit [out capacity at kind]
+  (put-lit out capacity at kind 0))
+
+(defn put-hex8w [out capacity at value i]
+  ;; Eight hex digits of a 32-bit value, most significant first, with the
+  ;; C's per-character bound check.
+  (if (= i 8)
+    at
+    (if (>= at capacity)
+      (+ capacity 1)
+      (let [c (hex-char (bit-and (quot value (pow16 (- 7 i))) 15))
+            stored (kernel-store-u8 out capacity at c)]
+        (if (= (+ (kernel-load-u8 out capacity at) (* 0 stored)) c)
+          (put-hex8w out capacity (+ at 1) value (+ i 1))
+          (+ capacity 1))))))
+
+(defn append-hex64 [out capacity at in]
+  ;; The C's append_hex64() over the record's nonce: high half then low.
+  (put-hex8w out capacity
+             (put-hex8w out capacity at (rec-u32 in 4) 0)
+             (rec-u32 in 0) 0))
+
+(defn append-hex-byte [out capacity at value]
+  ;; The C's append_hex8(): both characters or neither.
+  (if (> (+ at 2) capacity)
+    (+ capacity 1)
+    (let [h (hex-char (quot value 16))
+          l (hex-char (bit-and value 15))
+          s1 (kernel-store-u8 out capacity at h)
+          s2 (kernel-store-u8 out capacity (+ at 1) l)]
+      (if (and (= (+ (kernel-load-u8 out capacity at) (* 0 s1)) h)
+               (= (+ (kernel-load-u8 out capacity (+ at 1)) (* 0 s2)) l))
+        (+ at 2)
+        (+ capacity 1)))))
+
+(defn dec-digits32 [value n]
+  (if (< value 10) (+ n 1) (dec-digits32 (quot value 10) (+ n 1))))
+
+(defn put-dec32-rev [out capacity end value i]
+  ;; Digits peeled least-significant first and written at descending
+  ;; offsets -- the same trick relay_line/store-dec uses, and the same shape
+  ;; as the C's digits[] scratch array emptied backwards.  Returns the offset
+  ;; of the most significant digit, which the caller compares against where
+  ;; it asked the run to start.
+  (if (= i 0)
+    end
+    (let [c (+ 48 (- value (* 10 (quot value 10))))
+          at (- end 1)
+          stored (kernel-store-u8 out capacity at c)]
+      (if (= (+ (kernel-load-u8 out capacity at) (* 0 stored)) c)
+        (put-dec32-rev out capacity at (quot value 10) (- i 1))
+        (+ capacity 1)))))
+
+(defn append-dec32 [out capacity at value]
+  ;; The C's append_decimal(): VARIABLE width, one bound check for the whole
+  ;; run.  (relay_text.kotoba's skeletons pad these fields to a fixed width
+  ;; instead; that is a different line and would not compare equal here.)
+  (let [d (dec-digits32 value 0)]
+    (if (> (+ at d) capacity)
+      (+ capacity 1)
+      (if (= (put-dec32-rev out capacity (+ at d) value d) at)
+        (+ at d)
+        (+ capacity 1)))))
+
+;; A uint64 as a pair of non-negative 32-bit halves.  `t` is at most
+;; 9 * 2^32 + (2^32 - 1) < 2^36, so the intermediate never reaches the sign
+;; bit and the division is the true unsigned one.
+
+(defn d64-t [hi lo]
+  (+ (* (- hi (* 10 (quot hi 10))) 4294967296) lo))
+
+(defn d64-digit [hi lo]
+  (let [t (d64-t hi lo)] (- t (* 10 (quot t 10)))))
+
+(defn d64-next-lo [hi lo] (quot (d64-t hi lo) 10))
+
+(defn dec-digits64 [hi lo n]
+  (if (and (= hi 0) (< lo 10))
+    (+ n 1)
+    (dec-digits64 (quot hi 10) (d64-next-lo hi lo) (+ n 1))))
+
+(defn put-dec64-rev [out capacity end hi lo]
+  (let [c (+ 48 (d64-digit hi lo))
+        at (- end 1)
+        stored (kernel-store-u8 out capacity at c)]
+    (if (= (+ (kernel-load-u8 out capacity at) (* 0 stored)) c)
+      (if (and (= (quot hi 10) 0) (= (d64-next-lo hi lo) 0))
+        at
+        (put-dec64-rev out capacity at (quot hi 10) (d64-next-lo hi lo)))
+      (+ capacity 1))))
+
+(defn append-dec64 [out capacity at hi lo]
+  ;; The C's append_decimal64().
+  (let [d (dec-digits64 hi lo 0)]
+    (if (> (+ at d) capacity)
+      (+ capacity 1)
+      (if (= (put-dec64-rev out capacity (+ at d) hi lo) at)
+        (+ at d)
+        (+ capacity 1)))))
+
+(defn copy-id [out capacity at in i]
+  (if (>= i (kernel-load-u8 in 48 21))
+    (+ at i)
+    (let [c (kernel-load-u8 in 48 (+ 28 i))
+          stored (kernel-store-u8 out capacity (+ at i) c)]
+      (if (= (+ (kernel-load-u8 out capacity (+ at i)) (* 0 stored)) c)
+        (copy-id out capacity at in (+ i 1))
+        (+ capacity 1)))))
+
+(defn append-id [out capacity at in]
+  ;; The C's append_bytes(): one `at+n>capacity` check for the whole run.
+  (let [n (kernel-load-u8 in 48 21)]
+    (if (> (+ at n) capacity)
+      (+ capacity 1)
+      (copy-id out capacity at in 0))))
+
+(defn id-digits-ok [in i]
+  ;; aiueos_job_result_payload() refuses an id that is not all digits.  Note
+  ;; that aiueos_job_commit_valid() does NOT make this check, and neither
+  ;; does job-commit-valid below.
+  (if (>= i (kernel-load-u8 in 48 21))
+    1
+    (let [c (kernel-load-u8 in 48 (+ 28 i))]
+      (if (and (>= c 48) (<= c 57)) (id-digits-ok in (+ i 1)) 0))))
+
+;; ── AIUEOS_JOB_RESULT_V1: the answer ─────────────────────────────────────
+
+(defn job-result-write [out capacity in]
+  ;; aiueos_job_result_payload().  Returns the line length, or 0.
+  (let [idn (kernel-load-u8 in 48 21)]
+    (if (or (= capacity 0) (= idn 0))
+      0
+      (if (or (> idn 20) (= (id-digits-ok in 0) 0))
+        0
+        (let [n1 (append-lit out capacity 0 3)
+              n2 (append-hex64 out capacity n1 in)
+              n3 (append-lit out capacity n2 1)
+              n4 (append-id out capacity n3 in)
+              n5 (append-lit out capacity n4 4)
+              n6 (append-hex-byte out capacity n5 (kernel-load-u8 in 48 20))
+              n7 (append-lit out capacity n6 5)
+              n8 (append-dec32 out capacity n7 (rec-u16 in 16))
+              n9 (append-lit out capacity n8 6)
+              n10 (append-dec32 out capacity n9 (rec-u16 in 18))
+              n11 (append-lit out capacity n10 7)
+              n12 (append-dec64 out capacity n11 (rec-u32 in 12) (rec-u32 in 8))]
+          (if (<= n12 capacity) n12 0))))))
+
+;; ── AIUEOS_JOB_COMMIT_V1: the receipt ────────────────────────────────────
+
+(defn hex-run-match [payload length at value i]
+  (if (= i 8)
+    1
+    (if (>= at length)
+      0
+      (if (= (kernel-load-u8 payload length at)
+             (hex-char (bit-and (quot value (pow16 (- 7 i))) 15)))
+        (hex-run-match payload length (+ at 1) value (+ i 1))
+        0))))
+
+(defn id-match [payload length at in i]
+  (if (>= i (kernel-load-u8 in 48 21))
+    1
+    (if (>= (+ at i) length)
+      0
+      (if (= (kernel-load-u8 payload length (+ at i))
+             (kernel-load-u8 in 48 (+ 28 i)))
+        (id-match payload length at in (+ i 1))
+        0))))
+
+(defn job-commit-valid [payload length in]
+  ;; aiueos_job_commit_valid().  The C builds the expected line into a
+  ;; 128-byte stack buffer and memcmp()s it; this matches in place against
+  ;; the same table it would have been built from.  The two agree on every
+  ;; input: the expected length is 26 + 16 + 4 + id + 15 = 61 + id, at most
+  ;; 81, so the C's `n>sizeof(expected)` arm is unreachable and `n!=length`
+  ;; is the whole of its length test.
+  (let [idn (kernel-load-u8 in 48 21)]
+    (if (or (= idn 0) (> idn 20))
+      0
+      (if (not (= length (+ 61 idn)))
+        0
+        (if (and (= (take-lit payload length 0 8 0) 26)
+                 (and (= (hex-run-match payload length 26 (rec-u32 in 4) 0) 1)
+                      (= (hex-run-match payload length 34 (rec-u32 in 0) 0) 1))
+                 (and (= (take-lit payload length 42 1 0) 46)
+                      (= (id-match payload length 46 in 0) 1))
+                 (= (take-lit payload length (+ 46 idn) 9 0) (+ 61 idn)))
+          1
+          0)))))
+
+;; ── AIUEOS_NODE_PING_V1 / _PONG_V1: liveness ─────────────────────────────
+
+(defn seq-scan [payload length at value digits]
+  ;; aiueos_node_ping_parse()'s digit loop.  -1 refuses; the accepted range
+  ;; is the full uint32, so no legal sequence collides with the refusal.
+  ;; The overflow guard is tested on the PRE-multiply accumulator, which is
+  ;; what makes 4294967295 accepted and 4294967296 refused.
+  (if (>= at length)
+    (if (= digits 0) (- 0 1) value)
+    (let [c (kernel-load-u8 payload length at)]
+      (if (or (< c 48) (> c 57))
+        (- 0 1)
+        (let [d (- c 48)]
+          (if (or (>= digits 10)
+                  (or (> value 429496729)
+                      (and (= value 429496729) (> d 5))))
+            (- 0 1)
+            (seq-scan payload length (+ at 1) (+ (* value 10) d)
+                      (+ digits 1))))))))
+
+(defn node-ping-verdict [payload length boot-hi boot-lo]
+  ;; The sequence number, or -1.
+  (if (or (= length 0) (> length 128))
+    (- 0 1)
+    (let [a1 (take-lit payload length 0 10 0)]
+      (if (= a1 0)
+        (- 0 1)
+        (if (not (and (= (take-hex8 payload length a1 0 0) boot-hi)
+                      (= (take-hex8 payload length (+ a1 8) 0 0) boot-lo)))
+          (- 0 1)
+          (let [a2 (take-lit payload length (+ a1 16) 11 0)]
+            (if (= a2 0)
+              (- 0 1)
+              (seq-scan payload length a2 0 0))))))))
+
+(defn node-pong-write [out capacity in]
+  ;; aiueos_node_pong_payload().  Returns the line length, or 0.
+  (if (= capacity 0)
+    0
+    (let [n1 (append-lit out capacity 0 12)
+          n2 (append-hex64 out capacity n1 in)
+          n3 (append-lit out capacity n2 11)
+          n4 (append-dec32 out capacity n3 (rec-u32 in 24))
+          n5 (append-lit out capacity n4 13)]
+      (if (<= n5 capacity) n5 0))))
+
+;; ── entry ────────────────────────────────────────────────────────────────
+;; As a shared module this file has no entry: the kernel object is
+;; `job-protocol-dispatch.kotoba`, whose mode word reaches every export. (The
+;; single-object `main` this file carried while unwired used a literal region
+;; base the KIR oracle refuses; it went with the wiring.)
+
+(defn main [] 0)
