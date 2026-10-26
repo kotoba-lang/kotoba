@@ -1,0 +1,101 @@
+(ns ecc.ecdsa
+  "ECDSA over the NIST prime curves — FIPS 186-4 §6, with DER-encoded
+  signatures as [RFC 8446](https://www.rfc-editor.org/rfc/rfc8446) §4.2.3 and
+  RFC 9420 §5.1.2 require.
+
+  ## Verification is the interesting direction
+
+  A signature is checked far more often than it is made, by parties who did
+  not choose its bytes — so `verify` is where an implementation meets input it
+  does not control, and where nearly every ECDSA vulnerability has lived.
+  Wycheproof agrees: of its 1,530 cases across these three curves, **930 are
+  invalid**, and most of those are malformed DER rather than bad arithmetic.
+
+  ## Signing takes its nonce as a parameter
+
+  `k` is not generated here. Randomness is a capability and this is a leaf —
+  the same rule `hpke.dhkem/encap` follows for its ephemeral. It matters more
+  here than there: **a repeated `k` under one key reveals the private key**
+  outright, from two signatures, by elementary algebra. Taking it rather than
+  making it means a caller who repeats one is doing so visibly.
+
+  RFC 6979's deterministic derivation is not implemented. It would remove the
+  hazard rather than expose it, and it is a specification of its own."
+  (:require [ecc.bignum :as b]
+            [ecc.curve :as curve]
+            [ecc.der :as der]
+            [ecc.result :as r :refer [ok error]]))
+
+(defn- e-of
+  "FIPS 186-4 §6.4: the leftmost `bitlen(n)` bits of the digest.
+
+  When the hash is longer than the order this truncates; when it is shorter it
+  does not pad. P-521 with SHA-512 is the case that catches an implementation
+  which assumed the hash always fits: 512 is **less** than 521, so nothing is
+  dropped and a shift the wrong way would corrupt every signature."
+  [c digest]
+  (let [bits (b/bit-length (:n c))
+        excess (- (* 8 (count digest)) bits)]
+    (if (pos? excess)
+      (b/shr (b/of-bytes digest) excess)
+      (b/of-bytes digest))))
+
+(defn- in-range? [c x] (and (not (b/zero? x)) (b/lt? x (:n c))))
+
+(defn verify
+  "Check a DER signature over `digest` with the serialised public point.
+
+  Returns `{:ecc/valid? true}` or an error naming what failed. Not a boolean:
+  `false` and `could not parse the key` are different answers, and a caller
+  that cannot tell them apart will log one as the other."
+  [c public-point digest signature]
+  (r/let-ok [sig (der/parse-signature signature)]
+    (let [{:ecc/keys [r s]} sig
+          p (curve/bytes->point c public-point)]
+      (cond
+        (not= :ok (:status p)) (error :bad-public-key {:ecc/detail (:reason p)})
+        (not (in-range? c r)) (error :r-out-of-range)
+        (not (in-range? c s)) (error :s-out-of-range)
+        :else
+        (let [n (:n c)
+              e (e-of c digest)
+              w (b/inv-mod s n)
+              u1 (b/mod (b/mul e w) n)
+              u2 (b/mod (b/mul r w) n)
+              g [(:gx c) (:gy c)]
+              pt (:point p)
+              sum (curve/add-points c
+                                    (curve/scalar-mult c u1 g)
+                                    (curve/scalar-mult c u2 pt))]
+          (if (curve/infinity? sum)
+            (error :point-at-infinity)
+            (let [[x _] (curve/->affine c sum)]
+              (if (b/eq? r (b/mod x n))
+                (ok {:ecc/valid? true})
+                (error :signature-mismatch)))))))))
+
+(defn sign
+  "Sign `digest` with private scalar `d` and nonce `k`.
+
+  Both `r` and `s` must come out non-zero; the RFC says to pick another `k` if
+  either does, and this refuses instead — choosing a new one would need the
+  randomness this deliberately does not have, and silently returning a
+  malformed signature is worse than saying so."
+  [c d k digest]
+  (cond
+    (not (in-range? c d)) (error :private-key-out-of-range)
+    (not (in-range? c k)) (error :nonce-out-of-range)
+    :else
+    (let [n (:n c)
+          jp (curve/scalar-mult c k [(:gx c) (:gy c)])]
+      (if (curve/infinity? jp)
+        (error :nonce-gives-infinity)
+        (let [[x _] (curve/->affine c jp)
+              rr (b/mod x n)
+              e (e-of c digest)
+              s- (b/mod (b/mul (b/inv-mod k n) (b/add e (b/mul rr d))) n)]
+          (cond
+            (b/zero? rr) (error :r-is-zero)
+            (b/zero? s-) (error :s-is-zero)
+            :else (r/let-ok [sig (der/encode-signature rr s-)]
+                    (ok {:ecc/bytes sig :ecc/r rr :ecc/s s-}))))))))

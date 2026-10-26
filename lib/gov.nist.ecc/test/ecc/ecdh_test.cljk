@@ -1,0 +1,176 @@
+(ns ecc.ecdh-test
+  "ECDH on P-256, P-384 and P-521 against the complete Wycheproof corpus.
+
+  1,806 cases, no sampling. What they cover that a handful of known answers
+  would not:
+
+    EdgeCaseDoubling      1,399 cases where the Jacobian addition must notice
+                          that it is really a doubling. This is the branch
+                          `ecc.bignum` exists to protect: it is chosen by a
+                          `zero?` on the discriminant, and ClojureScript's
+                          `zero?` answers **false** for a `BigInt` zero.
+    InvalidCurveAttack       48 points that are not on the curve. If they are
+                          multiplied anyway, the arithmetic happens in a group
+                          the attacker chose, and a small one recovers the
+                          private scalar.
+    EdgeCaseSharedSecret    142 secrets with extreme representations.
+    AdditionChain            44 scalars that stress the ladder.
+
+  Every rejection is asserted **by reason**, and the reasons were measured
+  rather than guessed: the compressed and wrong-curve points are all refused
+  on length, because a compressed point is half a point plus a byte and the
+  length check runs first."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [ecc.bignum :as b]
+            [ecc.curve :as curve]
+            [ecc.ecdh :as ecdh]
+            [ecc.wycheproof-ecdh :as wp]))
+
+(defn- hx->bytes [s]
+  (mapv #(#?(:clj Integer/parseInt :cljs js/parseInt) (apply str %) 16) (partition 2 s)))
+
+(defn- hx [bs]
+  (apply str (map (fn [x] (let [x (bit-and (int x) 0xFF)
+                                s #?(:clj (Integer/toString x 16) :cljs (.toString x 16))]
+                            (if (= 1 (count s)) (str "0" s) s)))
+                  bs)))
+
+(deftest the-corpus-is-whole
+  (is (= 3 (count wp/by-curve)))
+  (is (= wp/total-declared (reduce + (map #(count (:cases %)) (vals wp/by-curve)))))
+  (is (= 1806 wp/total-declared))
+  (doseq [[k data] wp/by-curve]
+    (is (= (:declared data) (count (:cases data))) (str (name k) " count")))
+  (testing "and it carries the cases that make it worth running"
+    (let [all (mapcat :cases (vals wp/by-curve))
+          flag (fn [f] (count (filter #(contains? (:flags %) f) all)))]
+      (is (= 48 (flag :InvalidCurveAttack)) "invalid-curve points")
+      (is (= 1399 (flag :EdgeCaseDoubling)) "doubling-in-disguise additions")
+      (is (< 0 (flag :EdgeCaseSharedSecret))))))
+
+(deftest valid-cases-agree-with-the-corpus
+  (doseq [[k data] wp/by-curve]
+    (let [c (get curve/curves k)]
+      (doseq [t (:cases data) :when (= :valid (:result t))]
+        (let [r (ecdh/ecdh c (b/of-hex (:private t)) (hx->bytes (:public t)))]
+          (is (= :ok (:status r)) (str (name k) " tc " (:id t)))
+          (is (= (:shared t) (hx (:bytes r)))
+              (str (name k) " tc " (:id t) " " (pr-str (:flags t)))))))))
+
+(deftest invalid-cases-are-rejected-for-the-reason-they-name
+  (doseq [[k data] wp/by-curve]
+    (let [c (get curve/curves k)]
+      (doseq [t (:cases data) :when (not= :valid (:result t))]
+        (let [r (ecdh/ecdh c (b/of-hex (:private t)) (hx->bytes (:public t)))
+              expected (if (contains? (:flags t) :InvalidCurveAttack)
+                         :point-not-on-curve
+                         :bad-point-length)]
+          (is (= :error (:status r)) (str (name k) " tc " (:id t)))
+          (is (= expected (:reason r))
+              (str (name k) " tc " (:id t) " " (pr-str (:flags t))
+                   " — rejected, but not for the reason this case is about")))))))
+
+(deftest compressed-points-are-refused-as-a-policy-and-not-by-accident
+  ;; Wycheproof marks a compressed public key `acceptable`: an implementation
+  ;; may take it or leave it. This one leaves it, because RFC 9180 §7.1.1
+  ;; serialises uncompressed and a peer cannot have sent anything else.
+  ;;
+  ;; In the corpus that refusal lands on the length check, since a compressed
+  ;; point is shorter. So the prefix check needs a case of its own, or it is
+  ;; a branch nothing reaches.
+  (doseq [[k _] wp/by-curve]
+    (let [c (get curve/curves k)
+          n (:byte-len c)
+          right-length-wrong-prefix (into [0x02] (repeat (* 2 n) 0))]
+      (is (= :not-uncompressed
+             (:reason (curve/bytes->point c right-length-wrong-prefix)))
+          (str (name k) ": a full-length point with a compressed prefix")))))
+
+(deftest the-curve-parameters-hold
+  ;; The constants were read out of the JVM's tables rather than typed from a
+  ;; document. These three properties are what makes that safe: no wrong
+  ;; constant survives all of them.
+  (doseq [[k c] curve/curves]
+    (testing (name k)
+      (is (curve/on-curve? c (:gx c) (:gy c)) "G is on the curve")
+      (is (curve/infinity? (curve/scalar-mult c (:n c) [(:gx c) (:gy c)]))
+          "n * G is the point at infinity")
+      (is (b/eq? (:a c) (b/sub (:p c) b/three)) "a = p - 3")
+      (is (= (:byte-len c) (quot (+ 7 (b/bit-length (:p c))) 8))
+          "the field length matches p"))))
+
+(deftest the-base-point-is-exercised-somewhere
+  ;; Wycheproof supplies both parties' keys, so it never multiplies G. If
+  ;; nothing else did, gx and gy could both be wrong and every test above
+  ;; would still pass.
+  (doseq [[k c] curve/curves]
+    (testing (name k)
+      (let [one-g (ecdh/public-key c b/one)
+            two-g (ecdh/public-key c b/two)]
+        (is (= :ok (:status one-g)))
+        (is (= (curve/point->bytes c [(:gx c) (:gy c)]) (:bytes one-g))
+            "1 * G serialises to G")
+        (is (= :ok (:status two-g)))
+        (is (not= (:bytes one-g) (:bytes two-g)))
+        (testing "and a shared secret computes the same from either side"
+          (let [ka (b/of-int 987654321)
+                kb (b/of-int 123456789)
+                pa (:bytes (ecdh/public-key c ka))
+                pb (:bytes (ecdh/public-key c kb))]
+            (is (= (:bytes (ecdh/ecdh c ka pb))
+                   (:bytes (ecdh/ecdh c kb pa))))))))))
+
+(deftest scalars-outside-the-range-are-refused
+  (doseq [[k c] curve/curves]
+    (testing (name k)
+      (is (= :scalar-out-of-range (:reason (ecdh/public-key c b/zero))))
+      (is (= :scalar-out-of-range (:reason (ecdh/public-key c (:n c))))
+          "n itself is out of range — it multiplies to infinity")
+      (is (= :scalar-out-of-range (:reason (ecdh/public-key c (b/add (:n c) b/one))))
+          "and n+1 is a different key than the caller thinks they hold")
+      (is (= :ok (:status (ecdh/public-key c (b/sub (:n c) b/one))))
+          "n-1 is the largest legal one"))))
+
+;; ── the branches, directly ───────────────────────────────────────────────────
+
+(deftest the-addition-branches-are-all-reachable
+  ;; `scalar-mult` reaches three of the four branches in `add-points`. It
+  ;; never reaches the fourth — adding a point to itself — because
+  ;; left-to-right double-and-add adds P to a multiple of P that is never P.
+  ;;
+  ;; That was measured: forcing that branch to `false` left the whole suite
+  ;; green. A branch nothing reaches is a branch nothing checks, so it is
+  ;; reached here.
+  (doseq [[k c] curve/curves]
+    (testing (name k)
+      (let [g [(:gx c) (:gy c)]
+            jg [(:gx c) (:gy c) b/one]
+            two-g (curve/double-point c jg)]
+
+        (testing "P + P takes the tangent and equals 2P"
+          (is (= (curve/->affine c two-g)
+                 (curve/->affine c (curve/add-points c jg jg)))))
+
+        (testing "P + (-P) is the point at infinity"
+          (let [neg-g [(:gx c) (b/sub (:p c) (:gy c)) b/one]]
+            (is (curve/infinity? (curve/add-points c jg neg-g)))))
+
+        (testing "infinity is the identity on both sides"
+          (is (= (curve/->affine c jg) (curve/->affine c (curve/add-points c curve/infinity jg))))
+          (is (= (curve/->affine c jg) (curve/->affine c (curve/add-points c jg curve/infinity)))))
+
+        (testing "and P + 2P is 3P, the ordinary case"
+          (is (= (curve/->affine c (curve/scalar-mult c (b/of-int 3) g))
+                 (curve/->affine c (curve/add-points c jg two-g)))))))))
+
+(deftest an-always-false-zero-would-be-caught
+  ;; `ecc.bignum` shadows `zero?` because ClojureScript's answers `false` for
+  ;; a BigInt zero. This asserts the consequence rather than the cause: with
+  ;; that answer, the representation of the point at infinity stops being
+  ;; recognisable.
+  (doseq [[k c] curve/curves]
+    (testing (name k)
+      (is (curve/infinity? curve/infinity))
+      (is (not (curve/infinity? [(:gx c) (:gy c) b/one])))
+      (is (b/zero? (nth curve/infinity 2))
+          "infinity is Z = 0, and something has to be able to see that"))))
