@@ -1,0 +1,506 @@
+(ns tls.provider-test
+  "Verification of the crypto seam against published test vectors.
+
+  Two disciplines shape this namespace.
+
+  **Published vectors, not self-consistency.** Every positive assertion compares
+  against a value from a standards document, named in `:cite` alongside the
+  vector in `test/tls/vectors.edn`. Nothing is compared against output this
+  implementation produced. Where a primitive is exercised both ways -- sealing
+  to a published ciphertext and opening that published ciphertext back to the
+  published plaintext -- both directions are counted.
+
+  **A check that could not run must not look like a check that passed**
+  (root ADR-2608136000). The vector registry is data, the run is counted, and
+  the `:once` fixture below fails the suite if the registry is empty or if the
+  number of vectors executed does not equal the number registered. A missing or
+  truncated `vectors.edn` therefore turns the suite red rather than quietly
+  reducing it to nothing."
+  (:require [kotoba.bytes :as kbytes] [kotoba.test :refer [deftest testing is use-fixtures]]
+            [kotoba.lang.edn :as edn]
+            [kotoba.io :as io]
+            [kotoba.lang.text :as str]
+            [tls.provider :as p]
+            [tls.provider.jvm :as jvm])
+  (:import [java.security KeyFactory AlgorithmParameters]
+           [java.security.spec ECPublicKeySpec ECPoint ECParameterSpec
+            ECGenParameterSpec RSAPublicKeySpec]
+           [java.math BigInteger]
+           [java.util Arrays]))
+
+;; ---------------------------------------------------------------------------
+;; Byte / encoding helpers
+;; ---------------------------------------------------------------------------
+
+(defn- hex->bytes ^bytes [s]
+  (let [s (str/replace (or s "") #"\s" "")]
+    (byte-array (map (fn [[a b]] (unchecked-byte (Integer/parseInt (str a b) 16)))
+                     (partition 2 s)))))
+
+(defn- bytes->hex [b]
+  (apply str (map #(format "%02x" (bit-and % 0xff)) b)))
+
+(defn- utf8 ^bytes [s] (kbytes/utf8-bytes ^String s))
+
+(defn- flip-byte
+  "A copy of `b` with one bit of byte `i` inverted."
+  ^bytes [^bytes b i]
+  (let [c (Arrays/copyOf b (alength b))]
+    (aset-byte c i (unchecked-byte (bit-xor (aget c i) 1)))
+    c))
+
+(def ^:private ed25519-spki-prefix
+  "The fixed 12-byte SubjectPublicKeyInfo header for id-Ed25519 (RFC 8410 s4):
+  SEQUENCE { SEQUENCE { OID 1.3.101.112 }, BIT STRING (32 bytes) }."
+  (hex->bytes "302a300506032b6570032100"))
+
+(defn- ed25519-spki ^bytes [raw]
+  (byte-array (concat ed25519-spki-prefix raw)))
+
+(defn- p256-spki
+  "SubjectPublicKeyInfo for an uncompressed P-256 point, built by the JDK from
+  the published affine coordinates."
+  ^bytes [^BigInteger x ^BigInteger y]
+  (let [ap (doto (AlgorithmParameters/getInstance "EC")
+             (.init (ECGenParameterSpec. "secp256r1")))
+        ps (.getParameterSpec ap ECParameterSpec)]
+    (.getEncoded (.generatePublic (KeyFactory/getInstance "EC")
+                                  (ECPublicKeySpec. (ECPoint. x y) ps)))))
+
+(defn- rsa-spki ^bytes [^BigInteger n ^BigInteger e]
+  (.getEncoded (.generatePublic (KeyFactory/getInstance "RSA")
+                                (RSAPublicKeySpec. n e))))
+
+(defn- der-int [^BigInteger v]
+  (let [b (.toByteArray v)]
+    (byte-array (concat [(unchecked-byte 0x02) (unchecked-byte (alength b))] b))))
+
+(defn- der-ecdsa-sig
+  "DER SEQUENCE { INTEGER r, INTEGER s } -- the encoding TLS 1.3 carries for
+  the ecdsa_* schemes and the one the JDK expects."
+  ^bytes [^BigInteger r ^BigInteger s]
+  (let [body (byte-array (concat (der-int r) (der-int s)))]
+    (byte-array (concat [(unchecked-byte 0x30) (unchecked-byte (alength body))] body))))
+
+(defn- big [hex] (BigInteger. ^String hex 16))
+
+;; ---------------------------------------------------------------------------
+;; The provider under test
+;; ---------------------------------------------------------------------------
+
+(def P (jvm/provider))
+
+(def sha256 (get-in P [:hash :sha256]))
+(def sha384 (get-in P [:hash :sha384]))
+(def hmac   (:hmac P))
+(def dh     (get-in P [:x25519 :dh]))
+(def keypair (get-in P [:x25519 :keypair]))
+(def verify (get-in P [:signature :verify]))
+(def rand-bytes (:random P))
+(defn- sealf [suite] (get-in P [:aead suite :seal]))
+(defn- openf [suite] (get-in P [:aead suite :open]))
+
+;; ---------------------------------------------------------------------------
+;; Vector registry + evidence floor
+;; ---------------------------------------------------------------------------
+
+(def vectors
+  "Published vectors, read from `test/tls/vectors.edn` on the classpath.
+
+  If the resource is absent this is empty, and the `:once` fixture fails the
+  suite -- an unreadable registry must not present as a clean run."
+  (if-let [r (io/resource "tls/vectors.edn")]
+    (vec (edn/read-string (slurp r)))
+    []))
+
+(def ^:private executed (atom []))
+(def ^:private observed-reasons (atom #{}))
+
+(defn- record-reason! [r]
+  (when (keyword? r) (swap! observed-reasons conj r))
+  r)
+
+(defn- reason-of
+  "The reason keyword from an `[:error reason]` result, or the result itself."
+  [result]
+  (if (and (vector? result) (= :error (first result)))
+    (record-reason! (second result))
+    result))
+
+;; ---------------------------------------------------------------------------
+;; Exercising one vector
+;; ---------------------------------------------------------------------------
+
+(defn- msg-bytes [v]
+  (cond (contains? v :msg-utf8) (utf8 (:msg-utf8 v))
+        (contains? v :msg)      (hex->bytes (:msg v))
+        :else                   (byte-array 0)))
+
+(defmulti ^:private run-vector :cat)
+
+(defmethod run-vector :hash [v]
+  (let [f (case (:alg v) :sha256 sha256 :sha384 sha384)]
+    (is (= (:out v) (bytes->hex (f (msg-bytes v)))) (:cite v))))
+
+(defmethod run-vector :hmac [v]
+  (let [k (if (contains? v :key-utf8) (utf8 (:key-utf8 v)) (hex->bytes (:key v)))
+        d (if (contains? v :data-utf8) (utf8 (:data-utf8 v)) (hex->bytes (:data v)))]
+    (is (= (:out v) (bytes->hex (hmac (:alg v) k d))) (:cite v))))
+
+(defmethod run-vector :x25519 [v]
+  (let [r (dh (hex->bytes (:scalar v)) (hex->bytes (:u v)))]
+    (is (not (vector? r)) (str "X25519 refused a valid vector: " (pr-str r)))
+    (when-not (vector? r)
+      (is (= (:out v) (bytes->hex r)) (:cite v)))))
+
+(defmethod run-vector :aead [v]
+  ;; Both directions from one published vector: seal must reproduce the
+  ;; published ciphertext, and open must recover the published plaintext from
+  ;; that same published ciphertext.
+  (let [suite (:suite v)
+        k (hex->bytes (:key v))
+        n (hex->bytes (:nonce v))
+        a (hex->bytes (:aad v))
+        pt (if (contains? v :pt-utf8) (utf8 (:pt-utf8 v)) (hex->bytes (:pt v)))
+        ct (hex->bytes (:ct v))]
+    (testing "seal reproduces the published ciphertext"
+      (is (= (:ct v) (bytes->hex ((sealf suite) k n a pt))) (:cite v)))
+    (testing "open recovers the published plaintext"
+      (is (= [:ok (bytes->hex pt)]
+             (let [r ((openf suite) k n a ct)]
+               (if (= :ok (first r)) [:ok (bytes->hex (second r))] r)))
+          (:cite v)))))
+
+(defmethod run-vector :signature [v]
+  (let [scheme (:scheme v)
+        spki (cond
+               (contains? v :spki-raw) (ed25519-spki (hex->bytes (:spki-raw v)))
+               (contains? v :ec-x)     (p256-spki (big (:ec-x v)) (big (:ec-y v)))
+               (contains? v :rsa-n)    (rsa-spki (big (:rsa-n v)) (big (:rsa-e v))))
+        sig (if (contains? v :ec-r)
+              (der-ecdsa-sig (big (:ec-r v)) (big (:ec-s v)))
+              (hex->bytes (:sig v)))]
+    (is (= [:ok true] (verify scheme spki (msg-bytes v) sig)) (:cite v))))
+
+(defn- exercise! [v]
+  (swap! executed conj (:id v))
+  (run-vector v))
+
+(deftest published-vectors
+  (doseq [v vectors]
+    (testing (str (name (:cat v)) " / " (:id v) " -- " (:cite v))
+      (exercise! v))))
+
+;; ---------------------------------------------------------------------------
+;; Negative tests: a verifier that has never rejected anything proves nothing
+;; ---------------------------------------------------------------------------
+
+(defn- sig-vector [id] (first (filter #(= id (:id %)) vectors)))
+
+(defn- spki-of [v]
+  (cond (contains? v :spki-raw) (ed25519-spki (hex->bytes (:spki-raw v)))
+        (contains? v :ec-x)     (p256-spki (big (:ec-x v)) (big (:ec-y v)))
+        (contains? v :rsa-n)    (rsa-spki (big (:rsa-n v)) (big (:rsa-e v)))))
+
+(defn- sig-of [v]
+  (if (contains? v :ec-r)
+    (der-ecdsa-sig (big (:ec-r v)) (big (:ec-s v)))
+    (hex->bytes (:sig v))))
+
+(def ^:private negative-executed (atom []))
+
+(defn- neg!
+  "Run one negative case and return the reason keyword it produced."
+  [id f]
+  (swap! negative-executed conj id)
+  (f))
+
+(deftest signature-refusals
+  (testing "every signature scheme rejects a signature with one byte flipped"
+    (doseq [id [:ed25519-rfc8032-7.1-test3
+                :ecdsa-p256-rfc6979-a.2.5-sample
+                :rsa-pss-sha256-cavp-pass
+                :rsa-pss-sha384-cavp-pass]]
+      (let [v (sig-vector id)]
+        (is (some? v) (str "vector " id " must exist for its negative case"))
+        (when v
+          (testing (str id " / flipped signature byte")
+            (let [sig (sig-of v)
+                  bad (flip-byte sig (quot (alength sig) 2))
+                  r (neg! (keyword (str (name id) "-flipped-sig"))
+                          #(verify (:scheme v) (spki-of v) (msg-bytes v) bad))]
+              (is (= [:error :signature/bad-signature] r)
+                  (str "expected a named refusal, got " (pr-str r)))
+              (reason-of r)))
+          (testing (str id " / flipped message byte")
+            (let [m (msg-bytes v)]
+              (when (pos? (alength m))
+                (let [r (neg! (keyword (str (name id) "-flipped-msg"))
+                              #(verify (:scheme v) (spki-of v) (flip-byte m 0) (sig-of v)))]
+                  (is (= [:error :signature/bad-signature] r)
+                      (str "expected a named refusal, got " (pr-str r)))
+                  (reason-of r))))))))))
+
+(deftest rsa-pss-published-negative-vector
+  (testing "NIST CAVP SigVerPSS_186-3.rsp [mod=2048] SHA-256, Result = F (3 - Signature changed)"
+    ;; A published vector whose expected outcome is rejection -- the strongest
+    ;; form of negative evidence available, since the failure is the document's
+    ;; claim rather than ours.
+    (let [n (big (:rsa-n (sig-vector :rsa-pss-sha256-cavp-pass)))
+          e (big "10e43f")
+          msg (hex->bytes (str "e1c46c309b6366fb4d56ac08c9393cee9a7c95bbe7b7c0e79a3d9187c0f42bc3"
+                               "3364c28a770da585e3fe7b4901a3ccd037dfc42aa65a3470521ddafa835ce2d1"
+                               "6c92ac670bd4d086505e608781736dc4dd64cc5080ee19e586c8fd1d737dade5"
+                               "d378b32f1d5df1e8dda0e32a125024b2d53334943c18782d7e69825a580093e7"))
+          sig (hex->bytes (str "8ed1f28fd16d45d416a21554e104c006fd7868e5895e8b99831ae0938135b543"
+                               "610df64a8c3574d08118bfe396f9a5609a8dbda21b9a8530ff0ba90e629d6abe"
+                               "30d2c1b590600db971fcda80e6eaa84017e209b9bd3b641f3c81d5d27f842bec"
+                               "8019790ed99a0e5db4aedc1c070b047c19410cbc56e9a0ff12d8f6e5d7371b10"
+                               "11ecfecf7be7a74f94403590a52f95238dd69e0b5f4c1fcde97ecfdb1acc3803"
+                               "e59ad8b3088b2bc509e3dd12d40d875625dc8362c579176799c75e4fadcdb392"
+                               "c68f401f68d854e46377f084c081f9d83743039f6934722e30ef3f0226bc841d"
+                               "79a4eb68c5cccbb6ae0e9200444e50ff0d0953047ef955d2d39a70c3b837c5f4"))
+          r (neg! :rsa-pss-cavp-published-negative
+                  #(verify :rsa-pss-rsae-sha256 (rsa-spki n e) msg sig))]
+      (is (= [:error :signature/bad-signature] r))
+      (reason-of r))))
+
+(deftest aead-tag-refusals
+  (testing "every AEAD refuses a flipped ciphertext byte and a flipped AAD byte"
+    (doseq [id [:aes-128-gcm-case4 :chacha20-poly1305-rfc8439-2.8.2]]
+      (let [v (first (filter #(= id (:id %)) vectors))
+            suite (:suite v)
+            k (hex->bytes (:key v)) n (hex->bytes (:nonce v))
+            a (hex->bytes (:aad v)) ct (hex->bytes (:ct v))]
+        (is (some? v))
+        (testing (str id " / flipped ciphertext byte")
+          (let [r (neg! (keyword (str (name id) "-flipped-ct"))
+                        #((openf suite) k n a (flip-byte ct 0)))]
+            ;; Equality against the whole result, not just the tag: this asserts
+            ;; that no plaintext accompanies the refusal.
+            (is (= [:error :aead/bad-tag] r)
+                (str "tampered ciphertext must yield exactly [:error :aead/bad-tag], got " (pr-str r)))
+            (reason-of r)))
+        (testing (str id " / flipped tag byte")
+          (let [r (neg! (keyword (str (name id) "-flipped-tag"))
+                        #((openf suite) k n a (flip-byte ct (dec (alength ct)))))]
+            (is (= [:error :aead/bad-tag] r))
+            (reason-of r)))
+        (testing (str id " / flipped AAD byte")
+          (let [r (neg! (keyword (str (name id) "-flipped-aad"))
+                        #((openf suite) k n (flip-byte a 0) ct))]
+            (is (= [:error :aead/bad-tag] r))
+            (reason-of r)))
+        (testing (str id " / truncated ciphertext")
+          (let [r (neg! (keyword (str (name id) "-truncated"))
+                        #((openf suite) k n a (Arrays/copyOf ct (dec (alength ct)))))]
+            (is (= [:error :aead/bad-tag] r))
+            (reason-of r)))
+        (testing (str id " / wrong key")
+          (let [r (neg! (keyword (str (name id) "-wrong-key"))
+                        #((openf suite) (flip-byte k 0) n a ct))]
+            (is (= [:error :aead/bad-tag] r))
+            (reason-of r)))))))
+
+(deftest aead-tag-failure-is-positionally-uniform
+  (testing "flipping any byte of the ciphertext yields the identical refusal"
+    ;; If the reason varied with position, an attacker could binary-search the
+    ;; frame. Every offset must be indistinguishable in the return value.
+    (let [v (first (filter #(= :aes-128-gcm-case4 (:id %)) vectors))
+          k (hex->bytes (:key v)) n (hex->bytes (:nonce v))
+          a (hex->bytes (:aad v)) ct (hex->bytes (:ct v))
+          results (set (for [i (range (alength ct))]
+                         ((openf :aes-128-gcm) k n a (flip-byte ct i))))]
+      (neg! :aead-positional-uniformity (constantly nil))
+      (is (= #{[:error :aead/bad-tag]} results)
+          (str "expected one indistinguishable refusal across all "
+               (alength ct) " offsets, got " (pr-str results))))))
+
+(deftest length-refusals
+  (testing "key and nonce lengths are refused by name before the cipher runs"
+    (doseq [[suite key-len nonce-len] [[:aes-128-gcm 16 12] [:chacha20-poly1305 32 12]]]
+      (let [k (byte-array key-len) n (byte-array nonce-len) a (byte-array 0) pt (byte-array 4)]
+        (testing (str suite " / short key")
+          (let [r (neg! (keyword (str (name suite) "-short-key"))
+                        #((sealf suite) (byte-array (dec key-len)) n a pt))]
+            (is (= [:error :aead/bad-key-length] r)) (reason-of r)))
+        (testing (str suite " / long key")
+          (let [r (neg! (keyword (str (name suite) "-long-key"))
+                        #((sealf suite) (byte-array (inc key-len)) n a pt))]
+            (is (= [:error :aead/bad-key-length] r)) (reason-of r)))
+        (testing (str suite " / short nonce")
+          ;; Measured: the JDK accepts an 11-byte GCM nonce without complaint,
+          ;; so this refusal exists only because this seam performs it.
+          (let [r (neg! (keyword (str (name suite) "-short-nonce"))
+                        #((sealf suite) k (byte-array (dec nonce-len)) a pt))]
+            (is (= [:error :aead/bad-nonce-length] r)) (reason-of r)))
+        (testing (str suite " / long nonce")
+          (let [r (neg! (keyword (str (name suite) "-long-nonce"))
+                        #((sealf suite) k (byte-array (inc nonce-len)) a pt))]
+            (is (= [:error :aead/bad-nonce-length] r)) (reason-of r)))
+        (testing (str suite " / open refuses bad nonce length too")
+          (let [r (neg! (keyword (str (name suite) "-open-short-nonce"))
+                        #((openf suite) k (byte-array (dec nonce-len)) a (byte-array 16)))]
+            (is (= [:error :aead/bad-nonce-length] r)) (reason-of r)))))))
+
+(deftest unknown-selector-refusals
+  (testing "an unknown AEAD suite is refused by name"
+    (let [r (neg! :aead-unknown-suite
+                  #(#'tls.provider.jvm/seal :aes-256-siv (byte-array 32) (byte-array 12)
+                                            (byte-array 0) (byte-array 0)))]
+      (is (= [:error :aead/unknown-suite] r)) (reason-of r)))
+  (testing "an unknown signature scheme is refused by name"
+    (let [r (neg! :signature-unknown-scheme
+                  #(verify :rsa-pkcs1-sha1 (byte-array 8) (byte-array 4) (byte-array 4)))]
+      (is (= [:error :signature/unknown-scheme] r)) (reason-of r)))
+  (testing "an unparseable SubjectPublicKeyInfo is refused by name"
+    (let [r (neg! :signature-bad-spki
+                  #(verify :ed25519 (hex->bytes "deadbeef") (byte-array 4) (byte-array 64)))]
+      (is (= [:error :signature/bad-public-key] r)) (reason-of r)))
+  (testing "a key of the wrong type for the scheme is refused as a bad key, not a bad signature"
+    (let [v (sig-vector :rsa-pss-sha256-cavp-pass)
+          r (neg! :signature-key-type-mismatch
+                  #(verify :ed25519 (rsa-spki (big (:rsa-n v)) (big "10e43f"))
+                           (byte-array 4) (byte-array 64)))]
+      (is (= [:error :signature/bad-public-key] r)) (reason-of r)))
+  (testing "a negative random length is refused by name"
+    (let [r (neg! :random-bad-length #(rand-bytes -1))]
+      (is (= [:error :random/bad-length] r)) (reason-of r)))
+  (testing "an unknown HMAC hash is refused by name"
+    (let [r (neg! :hmac-unknown-hash #(hmac :md5 (byte-array 4) (byte-array 4)))]
+      (is (= [:error :hmac/unknown-hash] r)) (reason-of r))))
+
+(deftest x25519-refusals
+  (testing "a small-order peer key is refused, per RFC 8446 s7.4.2"
+    ;; An all-zero u is the canonical small-order point; agreeing with it would
+    ;; produce an all-zero shared secret, which the handshake must never accept.
+    (doseq [[label u] [["all-zero u" (byte-array 32)]
+                       ["u = 1" (hex->bytes "0100000000000000000000000000000000000000000000000000000000000000")]]]
+      (testing label
+        (let [r (neg! (keyword (str "x25519-small-order-" (str/replace label #"\W+" "-")))
+                      #(dh (:private (keypair)) u))]
+          (is (= [:error :x25519/small-order-point] r)
+              (str "expected small-order refusal, got " (pr-str r)))
+          (reason-of r)))))
+  (testing "wrong scalar length is refused by name"
+    (let [r (neg! :x25519-short-scalar #(dh (byte-array 31) (byte-array 32)))]
+      (is (= [:error :x25519/bad-private-key-length] r)) (reason-of r)))
+  (testing "wrong peer key length is refused by name"
+    (let [r (neg! :x25519-short-peer #(dh (byte-array 32) (byte-array 31)))]
+      (is (= [:error :x25519/bad-peer-key-length] r)) (reason-of r))))
+
+;; ---------------------------------------------------------------------------
+;; The validator
+;; ---------------------------------------------------------------------------
+
+(deftest contract-is-not-empty
+  (testing "the contract itself must be non-empty, or validation is inoperative"
+    (is (pos? (count p/contract)))))
+
+(deftest validator-cannot-pass-an-empty-map
+  (testing "{} is rejected, listing every contract leaf as missing"
+    (let [[tag info] (p/validate {})]
+      (is (= :error tag))
+      (is (= :provider-incomplete (:reason info)))
+      (is (= (count p/contract) (count (:missing info))))
+      (is (false? (p/valid? {}))))))
+
+(deftest validator-rejects-non-maps
+  (doseq [x [nil [] "provider" 42 (fn [])]]
+    (testing (str "non-map " (pr-str x))
+      (let [[tag info] (p/validate x)]
+        (is (= :error tag))
+        (is (= :provider-not-a-map (:reason info)))))))
+
+(deftest validator-names-the-missing-suite
+  (testing "a provider missing one AEAD suite fails at construction, by key path"
+    (let [broken (update-in P [:aead] dissoc :chacha20-poly1305)
+          [tag info] (p/validate broken)]
+      (is (= :error tag))
+      (is (= #{[:aead :chacha20-poly1305 :seal] [:aead :chacha20-poly1305 :open]}
+             (set (:missing info))))
+      (is (str/includes? (p/explain [tag info]) "aead.chacha20-poly1305.seal")))))
+
+(deftest validator-catches-uncallable-leaves
+  (testing "a leaf that is present but not callable is reported separately"
+    (let [broken (assoc-in P [:signature :verify] "not a function")
+          [tag info] (p/validate broken)]
+      (is (= :error tag))
+      (is (= [[:signature :verify]] (:not-callable info)))
+      (is (empty? (:missing info))))))
+
+(deftest jvm-provider-satisfies-the-contract
+  (is (= :ok (first (p/validate P))))
+  (is (p/valid? P))
+  (is (str/includes? (p/explain (p/validate P)) "ok")))
+
+;; ---------------------------------------------------------------------------
+;; Properties that are not vectors (labelled as such)
+;; ---------------------------------------------------------------------------
+
+(deftest x25519-round-trip-agrees
+  (testing "ROUND-TRIP (not a vector): two fresh keypairs agree on one secret"
+    (let [a (keypair) b (keypair)
+          s1 (dh (:private a) (:public b))
+          s2 (dh (:private b) (:public a))]
+      (is (= 32 (alength ^bytes (:private a)) (alength ^bytes (:public a))))
+      (is (not (vector? s1)))
+      (is (not (vector? s2)))
+      (is (= (bytes->hex s1) (bytes->hex s2))))))
+
+(deftest hmac-empty-key-equals-zero-padded-key
+  (testing "PROPERTY (not a vector): RFC 2104 zero-pads the key to the block size,
+            so an empty key and an all-zero key of block length agree"
+    (doseq [alg [:sha256 :sha384]]
+      (let [block (get-in p/hash-params [alg :block])
+            d (utf8 "message")]
+        (is (= (bytes->hex (hmac alg (byte-array 0) d))
+               (bytes->hex (hmac alg (byte-array block) d)))
+            (str alg " empty key must equal a block of zeroes"))))))
+
+(deftest random-returns-requested-length
+  (testing "PROPERTY (not a vector): :random honours its length and varies"
+    (is (= 0 (alength ^bytes (rand-bytes 0))))
+    (is (= 32 (alength ^bytes (rand-bytes 32))))
+    (is (not= (bytes->hex (rand-bytes 32)) (bytes->hex (rand-bytes 32))))))
+
+(deftest jdk-capabilities-are-measured
+  (testing "every algorithm this provider depends on is present on this JVM"
+    (let [caps (jvm/capabilities)
+          absent (remove (comp true? val) caps)]
+      (println (format "jvm=%s %s" (System/getProperty "java.version")
+                       (System/getProperty "java.vendor")))
+      (is (empty? absent) (str "unavailable JDK algorithms: " (pr-str absent))))))
+
+;; ---------------------------------------------------------------------------
+;; Evidence floor -- runs after every test in this namespace
+;; ---------------------------------------------------------------------------
+
+(use-fixtures :once
+  (fn [f]
+    (reset! executed [])
+    (reset! negative-executed [])
+    (reset! observed-reasons #{})
+    (f)
+    (let [registered (count vectors)
+          ran (count @executed)
+          neg (count @negative-executed)]
+      (println (format "vectors=%d executed=%d negatives=%d reasons=%d"
+                       registered ran neg (count @observed-reasons)))
+      (println (format "  by category: %s"
+                       (pr-str (into (sorted-map) (frequencies (map :cat vectors))))))
+      (is (pos? registered)
+          "zero published vectors registered -- a suite that verified nothing must not pass")
+      (is (= registered ran)
+          (format "registered %d vectors but executed %d" registered ran))
+      (is (pos? neg)
+          "zero negative cases executed -- a verifier that never rejected anything proves nothing")
+      ;; Checked here rather than in a deftest: the reason set is only complete
+      ;; once every negative case has run, and clojure.test does not order test
+      ;; vars. An earlier revision of this check sat in its own deftest and
+      ;; passed vacuously on an empty set whenever it happened to run first.
+      (is (pos? (count @observed-reasons))
+          "no refusal reasons observed -- negative coverage did not run")
+      (is (empty? (remove p/known-reasons @observed-reasons))
+          (str "undeclared refusal reasons: "
+               (pr-str (remove p/known-reasons @observed-reasons)))))))

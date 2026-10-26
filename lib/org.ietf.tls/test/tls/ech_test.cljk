@@ -1,0 +1,499 @@
+(ns tls.ech-test
+  "ECH — draft-ietf-tls-esni-25 — with the three kinds of evidence kept apart.
+
+  **The draft is not an RFC and publishes no test vectors.** Measured: the
+  datatracker gives `draft-ietf-tls-esni` no RFC number at revision 25, and
+  the text contains no test-vector section. So nothing below is a known-answer
+  test, and none of it is labelled as though it were.
+
+  What there is instead:
+
+  1. **live configurations** — `ECHConfigList` values pulled from real HTTPS
+     resource records. Parsing bytes that are actually deployed is the only
+     part of this that is not self-consistency.
+  2. **two-sided round-trip** — every client operation has a server-side
+     counterpart in `tls.ech`, and both run.
+  3. **the aborts** — §5.1 names four conditions under which a server MUST
+     abort, and each is asserted by its own reason. These matter more than
+     they look: three of them exist to stop a small ClientHelloOuter
+     decompressing into a huge ClientHelloInner (§10.12.4)."
+  (:require [kotoba.bytes :as kbytes] [kotoba.test :refer [deftest is testing]]
+            [tls.codec :as c]
+            [tls.ech :as ech]
+            [tls.ech-configs :as live]
+            [tls.extension :as ext]
+            [tls.handshake :as hs]
+            [tls.result :as r]
+            [tls.schedule :as sched]
+            [hpke.dhkem :as dhkem]
+            [sha2.core :as sha2]))
+
+(def portable-provider
+  "A provider built from `org-nist-sha2`, which HPKE already brings.
+
+  The repository's usual test provider is `tls.harness`, and it is JVM-only.
+  ECH's confirmation derivation is portable, so the test that checks it should
+  be too — otherwise the ClojureScript path would carry the parser and the
+  reconstruction and quietly skip the one piece of key schedule ECH adds."
+  {:hash {:sha256 (fn [bs] (vec (sha2/sha256 (vec bs))))}
+   :hmac (fn [_ k m] (vec (sha2/hmac-sha256 (vec k) (vec m))))})
+
+(defn- b64->bytes [s]
+  #?(:clj (mapv #(bit-and (int %) 0xff) (kbytes/base64-decode-bytes ^String s))
+     :cljs (let [b (js/Buffer.from s "base64")] (mapv #(bit-and % 0xff) (array-seq b)))))
+
+(defn- ascii-of [bs] (apply str (map char bs)))
+
+;; ── 1. live configurations ──────────────────────────────────────────────────
+
+(deftest live-ech-configs-parse
+  (is (seq live/live) "the fixture carries at least one host")
+  (doseq [{:keys [host ech]} live/live]
+    (testing host
+      (let [res (ech/parse-config-list (b64->bytes ech))]
+        (is (r/ok? res) (str host ": " (pr-str (r/err res))))
+        (when (r/ok? res)
+          (let [{:keys [configs skipped]} (r/val res)]
+            (is (seq configs) "at least one config of a version we know")
+            (is (zero? skipped) "and none skipped, at the time of the fixture")
+            (doseq [cfg configs]
+              (is (pos? (count (:public-key cfg))))
+              (is (seq (:cipher-suites cfg)))
+              (is (seq (:public-name cfg)))
+              (is (<= 0 (:maximum-name-length cfg) 255))
+              (is (seq (ech/runnable-suites cfg))
+                  (str "this build can run " (ascii-of (:public-name cfg))
+                       "'s suite " (pr-str (:cipher-suites cfg)))))))))))
+
+(deftest a-list-with-several-configs-is-in-there
+  ;; defo.ie publishes three. A one-config fixture would never exercise the
+  ;; loop, and `choose` would be a function that has only ever seen one input.
+  (let [counts (for [{:keys [ech]} live/live
+                     :let [res (ech/parse-config-list (b64->bytes ech))]
+                     :when (r/ok? res)]
+                 (count (:configs (r/val res))))]
+    (is (some #(> % 1) counts)
+        "at least one fixture host publishes more than one ECHConfig")))
+
+(deftest configs-re-encode-to-the-same-bytes
+  ;; The HPKE `info` is the serialized ECHConfig, so a parse that loses
+  ;; anything produces a context the server cannot match. `:raw` is kept for
+  ;; exactly that reason; this checks the parsed form could have produced it.
+  (doseq [{:keys [host ech]} live/live]
+    (testing host
+      (let [res (ech/parse-config-list (b64->bytes ech))]
+        (when (r/ok? res)
+          (doseq [cfg (:configs (r/val res))]
+            (let [again (ech/encode-config cfg)]
+              (is (r/ok? again))
+              (is (= (:raw cfg) (r/val again))))))))))
+
+(deftest unknown-versions-are-skipped-not-rejected
+  (let [cfg (first (:configs (r/val (ech/parse-config-list
+                                     (b64->bytes (:ech (first live/live)))))))
+        known (r/val (ech/encode-config cfg))
+        future- (vec (concat (c/u16 0xfe99) (c/u16 3) [1 2 3]))
+        both (r/val (c/write-vector 2 1 65535 :ECHConfigList (vec (concat future- known))))]
+    (let [res (ech/parse-config-list both)]
+      (is (r/ok? res))
+      (is (= 1 (count (:configs (r/val res)))))
+      (is (= 1 (:skipped (r/val res))))
+      (is (= (:config-id cfg) (:config-id (first (:configs (r/val res)))))))))
+
+;; ── the two halves of an exchange ───────────────────────────────────────────
+
+(def ^:private kem dhkem/x25519-hkdf-sha256)
+
+(defn- server-config
+  "A config this test controls both ends of."
+  [config-id]
+  (let [kp (dhkem/derive-key-pair! kem (vec (repeat 32 4)))
+        contents {:config-id config-id
+                  :kem-id (:kem-id kem)
+                  :public-key (:public kp)
+                  :cipher-suites [{:kdf-id 0x0001 :aead-id 0x0001}]
+                  :maximum-name-length 64
+                  :public-name (vec (c/ascii "public.example"))
+                  :extensions []}]
+    {:key-pair kp
+     :config (assoc contents :raw (r/val (ech/encode-config contents)))
+     :cipher-suite {:kdf-id 0x0001 :aead-id 0x0001}}))
+
+(defn- hello-body
+  [{:keys [session-id sni extra]}]
+  (r/val (ech/hello-body
+          {:random (vec (repeat 32 9))
+           :session-id session-id
+           :cipher-suites [0x1301]
+           :extensions (into [(ext/->ext :server_name (r/val (ext/server-name sni)))
+                              (ext/->ext :supported_versions
+                                         (r/val (ext/supported-versions-client)))
+                              (ext/->ext :supported_groups
+                                         (r/val (ext/supported-groups [:x25519])))]
+                             extra)})))
+
+(defn- with-ech-placeholder
+  "A ClientHelloOuter carrying an `encrypted_client_hello` whose payload is
+  `n` zeros — §6.1.1's partial ClientHelloOuterAAD."
+  [outer-fields cs config-id enc n]
+  (let [placeholder (r/val (ech/encode-outer-ech
+                            {:cipher-suite cs :config-id config-id
+                             :enc enc :payload (vec (repeat n 0))}))]
+    (hello-body (update outer-fields :extra (fnil conj [])
+                        (ext/->ext :encrypted_client_hello
+                                   (r/val (ext/extension :encrypted_client_hello placeholder)))))))
+
+;; ── 2. two-sided round-trip ─────────────────────────────────────────────────
+
+(deftest an-inner-hello-survives-the-round-trip
+  (doseq [pad [0 33 100]]
+    (testing (str "padding " pad)
+      (let [{:keys [config cipher-suite key-pair]} (server-config 7)
+            inner (hello-body {:session-id (vec (repeat 32 1)) :sni "secret.example"
+                               :extra [(ext/->ext :encrypted_client_hello
+                                                  (r/val (ext/extension :encrypted_client_hello
+                                                                        ech/encoded-inner-ech)))]})
+            encoded (r/val (ech/encode-inner inner [] pad))
+            eph (dhkem/derive-key-pair! kem (vec (repeat 32 5)))
+            n (+ (count encoded) 16)
+            outer (with-ech-placeholder {:session-id (vec (repeat 32 1)) :sni "public.example"}
+                    cipher-suite 7 (:public eph) n)
+            sealed (ech/seal config cipher-suite outer encoded eph)]
+        (is (r/ok? sealed) (pr-str (r/err sealed)))
+        (let [outer' (:tls/outer (r/val sealed))
+              opened (ech/open config cipher-suite key-pair outer')]
+          (is (r/ok? opened) (pr-str (r/err opened)))
+          (is (= encoded (:tls/encoded-inner (r/val opened))))
+          (let [rebuilt (ech/reconstruct-inner (:tls/encoded-inner (r/val opened)) outer')]
+            (is (r/ok? rebuilt) (pr-str (r/err rebuilt)))
+            (is (= inner (r/val rebuilt))
+                "the reconstructed inner is byte-identical to the one the client composed")))))))
+
+(deftest compressed-extensions-survive-the-round-trip
+  ;; The point of `ech_outer_extensions`: the inner hello names extensions
+  ;; instead of repeating them, and the server puts the outer's copies back.
+  (let [{:keys [config cipher-suite key-pair]} (server-config 7)
+        sid (vec (repeat 32 1))
+        shared [(ext/->ext :supported_versions (r/val (ext/supported-versions-client)))
+                (ext/->ext :supported_groups (r/val (ext/supported-groups [:x25519])))]
+        inner (r/val (ech/hello-body
+                      {:random (vec (repeat 32 9)) :session-id sid :cipher-suites [0x1301]
+                       :extensions (into [(ext/->ext :server_name (r/val (ext/server-name "secret.example")))]
+                                         (conj shared
+                                               (ext/->ext :encrypted_client_hello
+                                                          (r/val (ext/extension :encrypted_client_hello
+                                                                                ech/encoded-inner-ech)))))}))
+        encoded (r/val (ech/encode-inner inner [:supported_versions :supported_groups] 0))
+        eph (dhkem/derive-key-pair! kem (vec (repeat 32 5)))
+        n (+ (count encoded) 16)
+        placeholder (r/val (ech/encode-outer-ech {:cipher-suite cipher-suite :config-id 7
+                                                  :enc (:public eph) :payload (vec (repeat n 0))}))
+        outer (r/val (ech/hello-body
+                      {:random (vec (repeat 32 9)) :session-id sid :cipher-suites [0x1301]
+                       :extensions (into [(ext/->ext :server_name (r/val (ext/server-name "public.example")))]
+                                         (conj shared
+                                               (ext/->ext :encrypted_client_hello
+                                                          (r/val (ext/extension :encrypted_client_hello
+                                                                                placeholder)))))}))]
+    (testing "compression actually shrinks it"
+      (is (< (count encoded) (count inner))))
+    (let [sealed (ech/seal config cipher-suite outer encoded eph)]
+      (is (r/ok? sealed) (pr-str (r/err sealed)))
+      (let [outer' (:tls/outer (r/val sealed))
+            opened (ech/open config cipher-suite key-pair outer')
+            rebuilt (ech/reconstruct-inner (:tls/encoded-inner (r/val opened)) outer')]
+        (is (r/ok? rebuilt) (pr-str (r/err rebuilt)))
+        (is (= inner (r/val rebuilt))
+            "decompression restores the inner exactly, including extension order")))))
+
+(deftest the-outer-aad-binds-the-outer
+  ;; Without ClientHelloOuterAAD, an attacker could rewrite the outer -- its
+  ;; SNI, its key share -- and leave the encrypted inner alone (§10.12.3).
+  (let [{:keys [config cipher-suite key-pair]} (server-config 7)
+        inner (hello-body {:session-id (vec (repeat 32 1)) :sni "secret.example"
+                           :extra [(ext/->ext :encrypted_client_hello
+                                              (r/val (ext/extension :encrypted_client_hello
+                                                                    ech/encoded-inner-ech)))]})
+        encoded (r/val (ech/encode-inner inner [] 0))
+        eph (dhkem/derive-key-pair! kem (vec (repeat 32 5)))
+        n (+ (count encoded) 16)
+        outer (with-ech-placeholder {:session-id (vec (repeat 32 1)) :sni "public.example"}
+                cipher-suite 7 (:public eph) n)
+        outer' (:tls/outer (r/val (ech/seal config cipher-suite outer encoded eph)))]
+
+    (testing "unmodified, it opens"
+      (is (r/ok? (ech/open config cipher-suite key-pair outer'))))
+
+    (testing "with the outer SNI rewritten, it does not"
+      (let [parsed (r/val (ech/parse-hello-body outer'))
+            exts (:tls/extensions parsed)
+            i (first (keep-indexed (fn [i e] (when (= :server_name (:tls/type e)) i)) exts))
+            swapped (assoc exts i (ext/->ext :server_name
+                                             (r/val (ext/server-name "attacker.example"))))
+            ;; same length, so nothing else shifts
+            rebuilt (r/val (#'tls.ech/reassemble parsed (:tls/session-id parsed) swapped))
+            opened (ech/open config cipher-suite key-pair rebuilt)]
+        (is (r/error? opened))
+        (is (= :ech-open-failed (r/reason opened)))))))
+
+;; ── 3. the aborts §5.1 names ────────────────────────────────────────────────
+
+(deftest reconstruction-aborts-by-reason
+  (let [sid (vec (repeat 32 1))
+        outer (hello-body {:session-id sid :sni "public.example"})
+        inner (hello-body {:session-id sid :sni "secret.example"})
+        with-refs (fn [codes]
+                    (let [parsed (r/val (ech/parse-hello-body inner))
+                          oe (r/val (ech/outer-extensions-payload codes))
+                          marker (ext/->ext :ech_outer_extensions
+                                            (r/val (ext/extension :ech_outer_extensions oe)))]
+                      (r/val (#'tls.ech/reassemble parsed [] [marker]))))]
+
+    (testing "non-zero padding"
+      (let [encoded (conj (vec (r/val (ech/encode-inner inner [] 4))) 1)]
+        (is (= :non-zero-padding (r/reason (ech/reconstruct-inner encoded outer))))))
+
+    (testing "a referenced extension missing from the outer"
+      (is (= :outer-extension-missing
+             (r/reason (ech/reconstruct-inner (with-refs [0x0033 0x002b]) outer)))))
+
+    (testing "one referenced twice"
+      (is (= :duplicate-outer-extension
+             (r/reason (ech/reconstruct-inner (with-refs [0x000a 0x000a]) outer)))))
+
+    (testing "encrypted_client_hello referenced"
+      (is (= :ech-referenced-in-outer-extensions
+             (r/reason (ech/reconstruct-inner (with-refs [0x000a 0xfe0d]) outer)))))
+
+    (testing "the outer's order does not match"
+      ;; The outer has server_name(0), supported_versions(43), supported_groups(10)
+      ;; in that order; asking for [10 43] is the same set in the wrong order.
+      (is (= :outer-extensions-out-of-order
+             (r/reason (ech/reconstruct-inner (with-refs [0x000a 0x002b]) outer)))))
+
+    (testing "and the same set in the right order works"
+      (is (r/ok? (ech/reconstruct-inner (with-refs [0x002b 0x000a]) outer))))))
+
+(deftest the-inner-session-id-comes-from-the-outer
+  ;; §5.1: the client empties legacy_session_id before encrypting and the
+  ;; server copies the outer's back in. If it did not, TLS 1.3's compatibility
+  ;; mode would echo the wrong id.
+  (let [outer-sid (vec (repeat 32 0xAB))
+        outer (hello-body {:session-id outer-sid :sni "public.example"})
+        inner (hello-body {:session-id (vec (repeat 32 0xCD)) :sni "secret.example"})
+        encoded (r/val (ech/encode-inner inner [] 0))
+        rebuilt (r/val (ech/reconstruct-inner encoded outer))]
+    (is (= outer-sid (:tls/session-id (r/val (ech/parse-hello-body rebuilt))))
+        "the reconstructed inner carries the OUTER's session id")
+    (is (zero? (nth encoded 34))
+        "and the encoded inner carried a zero-length session id")
+    (is (= 0xCD (nth inner 35))
+        "while the ClientHelloInner the client composed had a 32-byte one")))
+
+;; ── acceptance confirmation ─────────────────────────────────────────────────
+
+(deftest acceptance-confirmation-is-eight-bytes-of-the-inner-transcript
+  (let [h (r/val (sched/hashes portable-provider :sha256))
+        inner-random (vec (range 32))
+        transcript (vec (repeat 32 0xEE))
+        expected (sched/hkdf-expand-label h (sched/hkdf-extract h [] inner-random)
+                                          "ech accept confirmation" transcript 8)
+        got (ech/accept-confirmation h inner-random transcript)]
+    (is (r/ok? got))
+    (is (= (r/val expected) (r/val got)))
+    (is (= 8 (count (r/val got))))
+
+    (testing "the salt is Hash.length zeros, not an empty HMAC key"
+      ;; HKDF-Extract(0, ...) where 0 is Hash.length zero bytes. An empty HMAC
+      ;; key is a different function, and RFC 8446's own key schedule depends
+      ;; on the distinction.
+      (is (= (sched/hkdf-extract h [] inner-random)
+             (sched/hkdf-extract h (vec (repeat 32 0)) inner-random))))
+
+    (testing "hrr uses a different label, so the two cannot be confused"
+      (is (not= (r/val got)
+                (r/val (ech/hrr-accept-confirmation h inner-random transcript)))))
+
+    (testing "and it is a function of both inputs"
+      (is (not= (r/val got)
+                (r/val (ech/accept-confirmation h (assoc inner-random 0 99) transcript))))
+      (is (not= (r/val got)
+                (r/val (ech/accept-confirmation h inner-random (assoc transcript 0 99))))))
+
+    (testing "accepted? compares the tail of ServerHello.random"
+      (let [conf (r/val got)]
+        (is (ech/accepted? (vec (concat (repeat 24 0) conf)) conf))
+        (is (not (ech/accepted? (vec (concat (repeat 24 0)
+                                             (assoc (vec conf) 0 (bit-xor 1 (first conf)))))
+                                conf)))
+        (is (not (ech/accepted? (vec (repeat 32 0)) conf)))
+        (is (not (ech/accepted? (vec (repeat 32 0)) (vec (repeat 4 0))))
+            "a confirmation of the wrong length is not accepted either")))))
+
+(deftest recommended-padding-covers-the-no-sni-case
+  ;; §6.1.3 rule 2 is the easy one to drop: a hello with no server_name still
+  ;; pads, by L + 9. Skipping it makes connecting to an IP address
+  ;; distinguishable from connecting to a host.
+  (testing "with an SNI shorter than the maximum"
+    (is (= (+ (- 64 14) (- 31 (mod (dec (+ 100 (- 64 14))) 32)))
+           (ech/recommended-padding 64 14 100))))
+  (testing "with an SNI at or over the maximum, no name padding"
+    (is (= (- 31 (mod (dec 100) 32)) (ech/recommended-padding 64 64 100)))
+    (is (= (- 31 (mod (dec 100) 32)) (ech/recommended-padding 64 200 100))))
+  (testing "with no SNI at all, L + 9"
+    (is (= (+ 73 (- 31 (mod (dec (+ 100 73)) 32)))
+           (ech/recommended-padding 64 nil 100))))
+  (testing "the result always lands on a multiple of 32"
+    (doseq [l (range 1 200) d [nil 0 14 64]]
+      (is (zero? (mod (+ l (ech/recommended-padding 64 d l)) 32))
+          (str "L=" l " D=" d)))))
+
+;; ── the value that a round-trip cannot check ────────────────────────────────
+
+(deftest the-hpke-info-is-pinned-to-the-draft-not-to-the-other-half
+  ;; Both halves of ECH live in `tls.ech`, so a *symmetric* change to the HPKE
+  ;; info leaves every round-trip test green -- it is only wrong against a
+  ;; peer. Measured: replacing the info with just its prefix broke nothing
+  ;; until this test existed.
+  ;;
+  ;; So the expected value is built here from the draft's text -- the ASCII
+  ;; "tls ech", a zero byte, and the ECHConfig exactly as it arrived on the
+  ;; wire -- rather than from anything in `tls.ech`.
+  ;;
+  ;; The seven bytes are written out rather than computed with `(map int
+  ;; "tls ech")`. That expression is code points on the JVM and a vector of
+  ;; ZEROS under ClojureScript -- the trap `hpke.kdf/ascii` documents, which
+  ;; this test walked into on its first ClojureScript run. `(map char ...)`
+  ;; back to the string is the cross-check, and it works on both.
+  (doseq [{:keys [host ech]} live/live]
+    (testing host
+      (let [res (ech/parse-config-list (b64->bytes ech))]
+        (when (r/ok? res)
+          (doseq [cfg (:configs (r/val res))]
+            (let [tls-ech [0x74 0x6c 0x73 0x20 0x65 0x63 0x68]
+                  expected (vec (concat tls-ech [0x00] (:raw cfg)))]
+              (is (= "tls ech" (apply str (map char tls-ech)))
+                  "the literal really is those seven characters")
+              (is (= expected (ech/config-info cfg)))
+              (is (= "tls ech" (apply str (map char (take 7 (ech/config-info cfg))))))
+              (is (zero? (nth (ech/config-info cfg) 7)))
+              (testing "and the tail is the whole ECHConfig, version and length included"
+                (is (= [0xfe 0x0d] (vec (take 2 (drop 8 (ech/config-info cfg))))))
+                (is (= (count (:raw cfg)) (- (count (ech/config-info cfg)) 8)))))))))))
+
+;; ── §6.1.7's rule on public_name ────────────────────────────────────────────
+
+(deftest a-public-name-must-be-a-host-name
+  ;; §6.1.7. This is applied to configurations, not to certificates, because
+  ;; the draft says a client that checks here need not repeat it later.
+  ;;
+  ;; It nearly shipped inverted. The first version split labels on the regex
+  ;; `\.` written with one escape too many, which matches a backslash followed
+  ;; by anything -- so no name ever split, every name was one label containing
+  ;; dots, and **every valid public name was rejected**. No test here noticed,
+  ;; because there was no test here. The live handshake noticed, on the first
+  ;; run after the check landed.
+  ;; `c/ascii` and not `(map int s)`. The latter is code points on the JVM and
+  ;; a vector of zeros under ClojureScript -- and this test walked into that
+  ;; on its first ClojureScript run, which is the third time in one afternoon.
+  ;; The check under test now compares bytes to byte constants and never sees
+  ;; a character at all; the test has to hand it bytes the same way.
+  (let [ok? (fn [s] (ech/valid-public-name? (c/ascii s)))]
+    (testing "ordinary host names"
+      (doseq [n ["cloudflare-ech.com" "example.com" "a" "public.example"
+                 "a-b.example.org" "x.12a" "xn--kgbechtv.example"]]
+        (is (ok? n) n)))
+
+    (testing "the final label must not read as a number"
+      ;; A name whose last label is all digits, or 0x-and-hex, is one that
+      ;; some resolvers and URL parsers take for an IPv4 literal. A client
+      ;; that authenticated a certificate for it would be authenticating
+      ;; something other than a host.
+      (doseq [n ["1.2.3.4" "example.123" "example.0x1f" "example.0X" "example.0xdeadbeef"
+                 "192.168.0.1" "0x7f000001"]]
+        (is (not (ok? n)) n)))
+
+    (testing "shape"
+      (doseq [n ["" "." ".x" "x." "a..b" "-a.com" "a-.com" "a_b.com" "a b.com"]]
+        (is (not (ok? n)) (pr-str n)))
+      (testing "and a non-ASCII byte, handed in directly"
+        ;; `c/ascii` refuses to build this, which is its job -- so the bytes
+        ;; are written out. A name arriving from a server's config is bytes,
+        ;; not a string, and this is what one of those looks like.
+        (is (not (ech/valid-public-name? [0x61 0xC3 0xA9 0x2E 0x63 0x6F 0x6D])))))
+
+    (testing "a label may be 63 octets and not 64"
+      (is (ok? (str (apply str (repeat 63 "a")) ".com")))
+      (is (not (ok? (str (apply str (repeat 64 "a")) ".com")))))
+
+    (testing "and the live configurations all pass, which is the point"
+      (doseq [{:keys [host ech]} live/live]
+        (let [res (ech/parse-config-list (b64->bytes ech))]
+          (when (r/ok? res)
+            (doseq [cfg (:configs (r/val res))]
+              (is (ech/valid-public-name? (:public-name cfg))
+                  (str host " publishes "
+                       (apply str (map char (:public-name cfg))))))))))))
+
+(deftest choose-skips-a-config-whose-public-name-is-not-a-host
+  (let [good (first (:configs (r/val (ech/parse-config-list
+                                      (b64->bytes (:ech (first live/live)))))))
+        bad (let [c (assoc good :public-name (vec (c/ascii "10.0.0.1")))]
+              (assoc c :raw (r/val (ech/encode-config c))))]
+    (is (some? (ech/choose [good])))
+    (is (nil? (ech/choose [bad]))
+        "runnable suite, unusable name")
+    (is (= (:config-id good) (:config-id (:config (ech/choose [bad good]))))
+        "and a list containing both picks the usable one")))
+
+;; ── retry configs ───────────────────────────────────────────────────────────
+
+(deftest retry-configs-are-an-ech-config-list
+  (let [cfg (first (:configs (r/val (ech/parse-config-list
+                                     (b64->bytes (:ech (first live/live)))))))
+        lst (r/val (c/write-vector 2 1 65535 :ECHConfigList (:raw cfg)))]
+    (testing "a valid list parses to the configs it carries"
+      (let [got (ech/parse-retry-configs lst)]
+        (is (r/ok? got))
+        (is (= 1 (count (r/val got))))
+        (is (= (:config-id cfg) (:config-id (first (r/val got)))))))
+    (testing "and a malformed one is an error, not an empty list"
+      ;; §6.1.6 says the client MUST abort with decode_error if this is not
+      ;; syntactically valid. Returning nothing would be a client that reads a
+      ;; corrupt retry config as "the server sent none" and disables ECH.
+      (is (r/error? (ech/parse-retry-configs (subvec (vec lst) 0 (- (count lst) 3)))))
+      (is (r/error? (ech/parse-retry-configs [])))
+      (is (r/error? (ech/parse-retry-configs (conj (vec lst) 0)))))))
+
+(deftest what-an-ech-extension-in-encrypted-extensions-means
+  ;; The first branch here cannot be reached by any test in this repository:
+  ;; it needs a server that accepts ECH and then violates §5 in the same
+  ;; handshake. So the decision is a named function and it is called directly.
+  (let [cfg (first (:configs (r/val (ech/parse-config-list
+                                     (b64->bytes (:ech (first live/live)))))))
+        lst (r/val (c/write-vector 2 1 65535 :ECHConfigList (:raw cfg)))
+        ext- {:tls/type :encrypted_client_hello :tls/data lst}]
+
+    (testing "absent — nothing to retry, and that is not an error"
+      (is (= {:tls/retry-configs nil}
+             (r/val (ech/encrypted-extensions-response false nil))))
+      (is (= {:tls/retry-configs nil}
+             (r/val (ech/encrypted-extensions-response true nil)))))
+
+    (testing "present after a rejection — the retry configs"
+      (let [got (ech/encrypted-extensions-response false ext-)]
+        (is (r/ok? got))
+        (is (= 1 (count (:tls/retry-configs (r/val got)))))
+        (is (= (:config-id cfg) (:config-id (first (:tls/retry-configs (r/val got))))))))
+
+    (testing "present after an acceptance — §5 says unsupported_extension"
+      (let [got (ech/encrypted-extensions-response true ext-)]
+        (is (r/error? got))
+        (is (= :ech-extension-after-acceptance (r/reason got)))
+        (is (= :unsupported_extension (r/alert got)))))
+
+    (testing "present but malformed — §6.1.6 says decode_error, not silence"
+      (let [got (ech/encrypted-extensions-response
+                 false (assoc ext- :tls/data (subvec (vec lst) 0 4)))]
+        (is (r/error? got))
+        (is (not= :ech-extension-after-acceptance (r/reason got)))))))

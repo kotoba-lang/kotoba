@@ -1,0 +1,251 @@
+;; The two comparisons `authenticate-peer` makes after the provider has
+;; done its work, as a Kotoba application (ADR-2608261100) -- RFC 6125
+;; §6.4.3 and RFC 5280 §4.1.2.5.
+;;
+;;   normalised-instant? (s)                              -> bool
+;;   validity-problem    (not-before, not-after, now)     -> keyword
+;;   name-match          (presented, wanted)              -> keyword
+;;
+;; ## What is left once the provider has hashed and verified
+;;
+;; `tls.cert/authenticate-peer` gets a digest from the provider and a parsed
+;; certificate from `x509.core`, and what it does with them is compare: is
+;; this digest in the pin set, is this instant inside that period, does this
+;; dNSName match the host we asked for. No key, no clock, no socket.
+;;
+;;   the guest owns   whether an instant is inside a validity period, and
+;;                    whether a presented name matches a wanted one
+;;   the host owns    SHA-256, the DER, the socket, and the clock
+;;
+;; ## An expired certificate authenticates, measured
+;;
+;; `authenticate-peer` compares the caller's `:tls/now` against the
+;; certificate's validity with `compare` -- byte order. The certificate's
+;; two ends come from `asn1/time-value` and are always
+;; `YYYY-MM-DDTHH:MM:SSZ`; the caller's instant is whatever the caller
+;; wrote. Against this repo's own `p256-expired-leaf.der`, which expired
+;; `2020-04-01T00:00:00Z`:
+;;
+;;     :tls/now "2020-04-01T00:00:00-05:00"  =>  [:ok …]
+;;
+;; That instant is 05:00Z, five hours after the certificate expired, and
+;; `'-'` is 0x2D against `'Z'` at 0x5A. The same moment written
+;; `"2020-04-01T05:00:00Z"` is refused, so it is the spelling and not the
+;; moment -- and the `[:ok …]` carries `:validity` in `:tls/checked`, so the
+;; result says the check ran.
+;;
+;; The fix is not a calendar: byte order IS right inside the normalised
+;; form, so what was missing is requiring the form. `:now-not-normalised`
+;; costs a caller one call to whatever already made the string.
+;;
+;; ⚠ This is the SECOND repository to need this twenty-character shape check
+;; -- `org-ietf-x509`'s `kotoba/x509/validity.kotoba` has the same one, for
+;; the same reason, because `x509.core/valid-at?` has the same defect and
+;; `authenticate-peer` inlines its own copy of the comparison rather than
+;; calling it. A guest compiled on the JVM-free route is ONE FILE and cannot
+;; reach a shared module (ADR-2608302100, where `--prelude` was measured to
+;; be silently ignored). The shared home is `x509.validity` and the two
+;; should become one when the project route runs JVM-free. Until then this
+;; duplication is a cost of the toolchain, written down rather than hidden.
+;;
+;; ## The name match, and three names it should not match
+;;
+;; `server-name-matches?` is careful about the wildcard itself -- entire
+;; leftmost label, at least three labels, no partial wildcards -- and its
+;; first clause is `(= p w)`, which runs before any of that. Measured:
+;;
+;;     "*.example.com" vs "*.example.com"  =>  true
+;;     "*.example.com" vs ".example.com"   =>  true
+;;     "*..com"        vs "a..com"         =>  true
+;;
+;; The first is a caller asking for a wildcard and being told it has one: a
+;; name a client WANTS must be a name, not a pattern, or a configuration
+;; that carries a pattern through by accident authenticates anything under
+;; it. The other two are names with empty labels, which no host has, matched
+;; because `str/split` produces the empty string and empty strings compare
+;; equal.
+;;
+;; `*.co.uk` matching `victim.co.uk` is NOT listed as a defect here. RFC
+;; 6125 does not mandate a public-suffix check and the three-label rule is
+;; what it gives; refusing it needs a list this guest has no way to hold.
+;;
+;; `.cljc` stays the oracle for the chain parsing, the pin and the provider
+;; seam, and is not required from here (require-graph). It did not grow a
+;; second copy of either comparison (ADR-2608261100).
+
+(ns tls.peer
+  (:export [main normalised-instant? validity-problem name-match]))
+
+;; --- bytes ------------------------------------------------------------------------
+
+(defn- cp [s :string i :i64] :i64 (string-code-point-at s i))
+
+(defn- dot [] :i64 46)
+(defn- star [] :i64 42)
+
+;; DNS labels are case-insensitive over ASCII only (RFC 4343), which is the
+;; same rule RFC 5280 §7.2 gives for a dNSName.
+(defn- fold [c :i64] :i64
+  (if (>= c 65) (if (<= c 90) (+ c 32) c) c))
+
+;; The walk stops AT the first non-ASCII byte and never steps into a
+;; continuation byte. A host name on the wire is an A-label, so anything
+;; else is refused rather than guessed at.
+(defn- first-non-ascii [s :string i :i64] :i64
+  (if (>= i (string-length s)) -1
+      (if (> (cp s i) 127) i (first-non-ascii s (+ i 1)))))
+
+;; --- names ------------------------------------------------------------------------
+
+(defn- root-trimmed [s :string] :i64
+  (let [n (string-length s)]
+    (if (= n 0) 0
+        (if (= (cp s (- n 1)) (dot)) (- n 1) n))))
+
+(defn- next-dot [s :string i :i64 end :i64] :i64
+  (if (>= i end) end (if (= (cp s i) (dot)) i (next-dot s (+ i 1) end))))
+
+(defn- count-labels [s :string i :i64 end :i64] :i64
+  (if (>= i end) 0 (+ 1 (count-labels s (+ (next-dot s i end) 1) end))))
+
+(defn- empty-label? [s :string i :i64 end :i64] :bool
+  (if (>= i end) false
+      (let [d (next-dot s i end)]
+        (if (= d i) true (empty-label? s (+ d 1) end)))))
+
+(defn- has-char? [s :string i :i64 c :i64] :bool
+  (if (>= i (string-length s)) false
+      (if (= (cp s i) c) true (has-char? s (+ i 1) c))))
+
+;; Folded, length-bounded octet equality over [ia, ea) and [ib, eb).
+(defn- same-range? [a :string b :string ia :i64 ib :i64] :bool
+  (let [ea (root-trimmed a) eb (root-trimmed b)]
+    (if (= (- ea ia) (- eb ib))
+      (if (>= ia ea) true
+          (if (= (fold (cp a ia)) (fold (cp b ib)))
+            (same-range? a b (+ ia 1) (+ ib 1))
+            false))
+      false)))
+
+(defn name-match [presented :string wanted :string] :keyword
+  (let [pe (root-trimmed presented)
+        we (root-trimmed wanted)]
+    (cond
+      (>= (first-non-ascii presented 0) 0) :non-ascii-name
+      (>= (first-non-ascii wanted 0) 0) :non-ascii-name
+
+      (= pe 0) :empty-name
+      (= we 0) :empty-name
+
+      ;; A name a client WANTS must be a name. `(= p w)` runs before the
+      ;; wildcard rules, so a wanted name carrying a `*` is told it matches
+      ;; the pattern it is.
+      (has-char? wanted 0 (star)) :wanted-is-a-wildcard
+
+      ;; No host has one, and `str/split` makes them compare equal.
+      (empty-label? presented 0 pe) :empty-label
+      (empty-label? wanted 0 we) :empty-label
+
+      (same-range? presented wanted 0 0) :match
+
+      ;; §6.4.3: no wildcard, and it was not an exact match.
+      (if (has-char? presented 0 (star)) false true) :no-match
+
+      ;; The wildcard must be the ENTIRE leftmost label. A partial one
+      ;; (`w*.example.com`) was never interoperable, and a client that
+      ;; honours it turns one compromised label into a range.
+      (if (= (cp presented 0) (star))
+        (if (= (next-dot presented 0 pe) 1) false true)
+        true)
+      :partial-wildcard
+
+      ;; At least three labels, so `*.com` names no host.
+      (< (count-labels presented 0 pe) 3) :wildcard-too-shallow
+
+      ;; Everything right of the wildcard, folded. One wildcard consumes
+      ;; exactly ONE label, and that follows: if these ranges are equal then
+      ;; `presented` is `*.` + X and `wanted` is one label + `.` + X, so the
+      ;; label counts cannot differ. An explicit count comparison stood here
+      ;; until the discrimination pass showed it could be broken without
+      ;; reddening any test.
+      (same-range? presented wanted 2 (+ (next-dot wanted 0 we) 1)) :match
+
+      :else :no-match)))
+
+;; --- the validity window ---------------------------------------------------------------
+
+(defn- digits? [s :string a :i64 b :i64] :bool
+  (if (>= a b) true
+      (if (>= (cp s a) 48)
+        (if (<= (cp s a) 57) (digits? s (+ a 1) b) false)
+        false)))
+
+(defn- ch? [s :string i :i64 c :i64] :bool (if (= (cp s i) c) true false))
+
+(defn normalised-instant? [s :string] :bool
+  (if (= (string-length s) 20)
+    (if (digits? s 0 4)
+      (if (ch? s 4 45)
+        (if (digits? s 5 7)
+          (if (ch? s 7 45)
+            (if (digits? s 8 10)
+              (if (ch? s 10 84)
+                (if (digits? s 11 13)
+                  (if (ch? s 13 58)
+                    (if (digits? s 14 16)
+                      (if (ch? s 16 58)
+                        (if (digits? s 17 19) (if (ch? s 19 90) true false) false)
+                        false)
+                      false)
+                    false)
+                  false)
+                false)
+              false)
+            false)
+          false)
+        false)
+      false)
+    false))
+
+(defn- cmp [a :string b :string i :i64] :i64
+  (if (>= i 20) 0
+      (let [x (cp a i) y (cp b i)]
+        (if (< x y) -1 (if (> x y) 1 (cmp a b (+ i 1)))))))
+
+(defn validity-problem [not-before :string not-after :string now :string] :keyword
+  (cond
+    (if (normalised-instant? not-before) false true) :validity-unreadable
+    (if (normalised-instant? not-after) false true) :validity-unreadable
+
+    ;; The one `authenticate-peer` never asks. `:tls/now` is the caller's
+    ;; string and nothing normalises it.
+    (if (normalised-instant? now) false true) :now-not-normalised
+
+    (> (cmp not-before not-after 0) 0) :validity-inverted
+    (< (cmp now not-before 0) 0) :certificate-not-yet-valid
+    (> (cmp now not-after 0) 0) :certificate-expired
+    :else :none))
+
+;; --- the artifact's own conformance check ------------------------------------------
+;;
+;; `main` is the browser profile's entry point -- `runtime/browser-host.mjs`
+;; refuses to instantiate a module without one -- and it is not a stub. It
+;; runs the two findings back through the decisions above and answers 0 only
+;; when each still decides the way this object was built to decide, so a
+;; COMPILED artifact can be asked whether it is itself by a host that knows
+;; nothing about TLS.
+;;
+;; Two, and the names are three labels of one letter, because a module's
+;; fuel is a private global baked in at compile time and the default is 512
+;; -- spent over the life of an INSTANCE, so `main`'s calls share one
+;; budget. Measured: the two findings written with realistic names is
+;; `unreachable`, while each of them called on its own from a fresh
+;; instance is fine. The native backends put a second bound on the same
+;; function, evaluating it as a compile-time oracle. The wider check lives
+;; in the suite, which has neither limit.
+
+(defn main [] :i64
+  (cond
+    (if (= (name-match "*.a.b" "*.a.b") :wanted-is-a-wildcard) false true) 1
+    (if (= (name-match "*.a.b" "c.a.b") :match) false true) 2
+    :else 0))

@@ -1,0 +1,199 @@
+(ns tls.ech-client-test
+  "The client's ECH wiring: the two hellos it builds, and how it judges
+  acceptance.
+
+  A `.clj` rather than `.cljc` because `tls.client` takes an injected provider
+  and the one that exists is the JVM's. `tls.ech`'s own tests run on both
+  runtimes; this one exercises the part that cannot.
+
+  There is no TLS server here. What is checked instead is the property that
+  matters and that a server would check: **the outer this client sends can be
+  opened by a client-facing server holding the config's private key, and
+  reconstructs to exactly the inner hello the client composed.** That is the
+  server's whole job in §5.1, run against the client's real output rather than
+  against a hand-built fixture."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [tls.client :as client]
+            [tls.codec :as c]
+            [tls.ech :as ech]
+            [tls.extension :as ext]
+            [tls.handshake :as hs]
+            [tls.harness :as harness]
+            [tls.provider.vectors :as pv]
+            [tls.result :as r]
+            [tls.schedule :as sch]
+            [tls.suite :as suite]
+            [tls.transcript :as tr]
+            [hpke.dhkem :as dhkem]))
+
+(def provider (r/val (pv/adapt @harness/provider)))
+(def ^:private kem dhkem/x25519-hkdf-sha256)
+
+(defn- a-config
+  "A config whose private key this test holds."
+  [public-name]
+  (let [kp (dhkem/derive-key-pair! kem (vec (repeat 32 21)))
+        contents {:config-id 42 :kem-id (:kem-id kem) :public-key (:public kp)
+                  :cipher-suites [{:kdf-id 0x0001 :aead-id 0x0001}]
+                  :maximum-name-length 64
+                  :public-name (vec (c/ascii public-name))
+                  :extensions []}
+        cfg (assoc contents :raw (r/val (ech/encode-config contents)))]
+    {:key-pair kp :config cfg :cipher-suite {:kdf-id 0x0001 :aead-id 0x0001}
+     :config-list (r/val (c/write-vector 2 1 65535 :ECHConfigList (:raw cfg)))}))
+
+(defn- hellos [server-name public-name]
+  (let [{:keys [config cipher-suite key-pair config-list]} (a-config public-name)
+        share ((get-in provider [:x25519 :keypair]))
+        built (#'client/build-ech-hellos
+               provider
+               {:server-name server-name :suites (suite/negotiable provider)}
+               share
+               {:config config :cipher-suite cipher-suite})]
+    (is (r/ok? built) (pr-str (r/err built)))
+    (assoc (r/val built) :config config :cipher-suite cipher-suite
+           :key-pair key-pair :config-list config-list)))
+
+;; ── what the client sends ───────────────────────────────────────────────────
+
+(deftest the-outer-names-the-public-name-and-the-inner-names-the-real-one
+  (let [{:keys [tls/message tls/inner-message]} (hellos "secret.example" "public.example")
+        names (fn [msg]
+                (let [b (vec (subvec (vec msg) 4))
+                      parsed (r/val (ech/parse-hello-body b))
+                      sni (ext/find-ext (:tls/extensions parsed) :server_name)]
+                  (apply str (map char (drop 5 (:tls/data sni))))))]
+    (is (= "public.example" (names message)))
+    (is (= "secret.example" (names inner-message)))
+    (testing "and the outer carries an outer-variant ECH extension"
+      (let [parsed (r/val (ech/parse-hello-body (vec (subvec (vec message) 4))))
+            e (ext/find-ext (:tls/extensions parsed) :encrypted_client_hello)]
+        (is (some? e))
+        (is (= :outer (:type (r/val (ech/parse-ech-extension (:tls/data e))))))))
+    (testing "and the inner carries the inner variant, which is one byte"
+      (let [parsed (r/val (ech/parse-hello-body (vec (subvec (vec inner-message) 4))))
+            e (ext/find-ext (:tls/extensions parsed) :encrypted_client_hello)]
+        (is (= :inner (:type (r/val (ech/parse-ech-extension (:tls/data e))))))
+        (is (= [1] (vec (:tls/data e))))))))
+
+(deftest the-two-hellos-share-a-session-id
+  ;; §6.1: the outer copies legacy_session_id from the inner. If they differed
+  ;; the ServerHello's echo could only match one of them, and the client would
+  ;; reject its own handshake exactly when ECH was accepted.
+  (let [{:keys [tls/message tls/inner-message tls/session-id]}
+        (hellos "secret.example" "public.example")
+        sid-of (fn [msg] (:tls/session-id (r/val (ech/parse-hello-body (vec (subvec (vec msg) 4))))))]
+    (is (= 32 (count session-id)))
+    (is (= (vec session-id) (sid-of message)))
+    (is (= (vec session-id) (sid-of inner-message)))))
+
+(deftest a-server-can-open-what-this-client-sends
+  ;; The property a real client-facing server checks, run against the client's
+  ;; actual output.
+  (doseq [name- ["a.example" "much.longer.secret.name.example" "x"]]
+    (testing name-
+      (let [{:keys [tls/message tls/inner-message config cipher-suite key-pair]}
+            (hellos name- "public.example")
+            outer-body (vec (subvec (vec message) 4))
+            opened (ech/open config cipher-suite key-pair outer-body)]
+        (is (r/ok? opened) (pr-str (r/err opened)))
+        (let [rebuilt (ech/reconstruct-inner (:tls/encoded-inner (r/val opened)) outer-body)]
+          (is (r/ok? rebuilt) (pr-str (r/err rebuilt)))
+          (is (= (vec (subvec (vec inner-message) 4)) (r/val rebuilt))
+              "reconstructs to exactly the inner hello the client composed"))))))
+
+(deftest the-payload-length-does-not-track-the-inner-name-length
+  ;; The point of §6.1.3. Without padding the ciphertext length tracks the
+  ;; inner SNI length, which is the one thing ECH exists to hide -- so a
+  ;; client that offered ECH without padding would be advertising the length
+  ;; of the name it was hiding.
+  (let [payload-len (fn [n]
+                      (let [{:keys [tls/message]} (hellos n "public.example")
+                            parsed (r/val (ech/parse-hello-body (vec (subvec (vec message) 4))))
+                            e (ext/find-ext (:tls/extensions parsed) :encrypted_client_hello)]
+                        (count (:payload (r/val (ech/parse-ech-extension (:tls/data e)))))))
+        lens (map payload-len ["a.example" "bb.example" "ccc.example" "dddd.example"])]
+    (is (= 1 (count (set lens)))
+        (str "four names of different lengths, one payload length: " (pr-str lens)))))
+
+;; ── how the client judges acceptance ────────────────────────────────────────
+
+(defn- backend-server-hello
+  "What a backend server sends when it accepts ECH — §7.2.
+
+  Computed here the way the draft describes it, from the server's side, so
+  the client's judgement is checked against an independent construction rather
+  than against itself."
+  [h ech-built session-id accept?]
+  (let [ste (suite/suite provider :TLS_AES_128_GCM_SHA256)
+        base-random (vec (repeat 32 0x5A))
+        sh-of (fn [rnd]
+                (r/let-ok [ks (ext/key-share-client [[:x25519 (vec (repeat 32 3))]])
+                           sv (ext/supported-versions-server)
+                           exts (ext/encode-block 6 [(ext/->ext :supported_versions sv)
+                                                     (ext/->ext :key_share ks)])
+                           sid (c/write-vector 1 0 32 :legacy_session_id_echo (vec session-id))]
+                  (hs/message :server_hello
+                              (vec (concat [0x03 0x03] rnd sid
+                                           (c/u16 0x1301) [0x00] exts)))))
+        zeroed-msg (r/val (sh-of (vec (concat (take 24 base-random) (repeat 8 0)))))
+        t (-> (tr/transcript) (tr/add (:tls/inner-message ech-built)) (tr/add zeroed-msg))
+        conf (r/val (ech/accept-confirmation h (:tls/inner-random ech-built)
+                                             (tr/digest t (:hash h))))]
+    (is (some? ste))
+    (r/val (sh-of (vec (concat (take 24 base-random)
+                               (if accept? conf (repeat 8 0xFF))))))))
+
+(deftest acceptance-is-recognised-and-rejection-is-not-mistaken-for-it
+  (let [built (hellos "secret.example" "public.example")
+        h (r/val (sch/hashes provider :sha256))]
+    (testing "a ServerHello carrying the confirmation is accepted"
+      (let [sh (backend-server-hello h built (:tls/session-id built) true)]
+        (is (true? (r/val (#'client/ech-accepted? h built sh))))))
+
+    (testing "one that does not is not"
+      (let [sh (backend-server-hello h built (:tls/session-id built) false)]
+        (is (false? (r/val (#'client/ech-accepted? h built sh))))))
+
+    (testing "and neither is one computed over a different inner hello"
+      ;; The confirmation binds the inner transcript. A server that accepted
+      ;; someone else's ECH cannot make this client think it accepted its own.
+      (let [other (hellos "other.example" "public.example")
+            sh (backend-server-hello h other (:tls/session-id other) true)]
+        (is (false? (r/val (#'client/ech-accepted? h built sh))))))))
+
+(deftest a-config-list-with-nothing-runnable-is-refused-before-anything-is-sent
+  (let [{:keys [config]} (a-config "public.example")
+        unusable (assoc config :cipher-suites [{:kdf-id 0x9999 :aead-id 0x9999}])
+        raw (r/val (ech/encode-config unusable))
+        lst (r/val (c/write-vector 2 1 65535 :ECHConfigList raw))
+        sent (atom [])
+        transport {:send (fn [bs] (swap! sent conj bs)) :recv (fn [_] [])}
+        res (client/handshake @harness/provider transport
+                              {:server-name "secret.example"
+                               :insecure-skip-peer-auth true
+                               :ech {:config-list lst}})]
+    (is (r/error? res))
+    (is (= :no-usable-ech-config (r/reason res)))
+    (is (empty? @sent)
+        "and nothing went on the wire -- an unusable config is not a reason to
+         leak the real name in a plaintext ClientHello")))
+
+(deftest the-transcript-starts-with-the-hello-the-server-used
+  ;; Invisible to any test that does not complete a handshake: getting this
+  ;; wrong gives a client that builds both hellos correctly, encrypts
+  ;; correctly, judges acceptance correctly, and then derives its keys from
+  ;; the wrong transcript. Measured -- forcing it to always pick the outer
+  ;; left the whole unit suite green, and only the live handshake noticed.
+  (let [built (hellos "secret.example" "public.example")]
+    (is (= (:tls/inner-message built) (#'client/transcript-first-message true built)))
+    (is (= (:tls/message built) (#'client/transcript-first-message false built)))
+    (is (not= (:tls/inner-message built) (:tls/message built))
+        "and the two really are different messages, or this asserts nothing")
+    (testing "with no ECH offered at all, there is no inner and the outer is used"
+      (let [plain {:tls/message [1 2 3]}]
+        (is (= [1 2 3] (#'client/transcript-first-message false plain)))
+        (is (nil? (#'client/transcript-first-message true plain))
+            "a true here would be a caller bug -- acceptance cannot be true
+             without an inner hello, and this returns nothing rather than
+             quietly substituting the outer")))))

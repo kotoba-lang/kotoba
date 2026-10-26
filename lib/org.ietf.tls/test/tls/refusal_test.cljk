@@ -1,0 +1,355 @@
+(ns tls.refusal-test
+  "Both directions.
+
+  A verifier that has never rejected anything is not evidence. Every admission
+  path in this library has an entry here, and each asserts the *exact* refusal
+  -- the `:tls/reason` keyword and the `:tls/alert` a peer would receive --
+  not merely that something went wrong. Asserting only `(r/error? ...)` would
+  pass if the code refused for the wrong reason, which is how a check that has
+  quietly stopped working keeps looking healthy.
+
+  Each test also names what it broke, so that `the break and the report agree`
+  is checkable by a reader rather than assumed."
+  (:require [kotoba.lang.text] [kotoba.test :refer [deftest testing is]]
+            [tls.cert :as cert]
+            [tls.client :as client]
+            [tls.codec :as c]
+            [tls.extension :as ext]
+            [tls.handshake :as hs]
+            [tls.harness :as harness]
+            [tls.record :as rec]
+            [tls.result :as r]
+            [tls.schedule :as sch]
+            [tls.suite :as suite]
+            [tls.vectors :as v]))
+
+(def provider @harness/provider)
+(def h (r/val (sch/hashes provider :sha256)))
+(def aes128 (r/val (suite/suite provider :TLS_AES_128_GCM_SHA256)))
+
+(def refusals (atom 0))
+(defn refused
+  "Assert a specific refusal. Returns the error map so a test can inspect it."
+  [label result expected-reason expected-alert]
+  (swap! refusals inc)
+  (is (r/error? result) (str label ": expected a refusal, got " (pr-str result)))
+  (is (= expected-reason (r/reason result)) (str label ": wrong reason"))
+  (is (= expected-alert (r/alert result)) (str label ": wrong alert"))
+  (r/err result))
+
+;; ------------------------------------------------------------------- HKDF
+
+(deftest hkdf-bounds
+  (testing "RFC 5869 section 2.3: L must not exceed 255*HashLen"
+    ;; Broken: asked for one byte more than 255 blocks. Without the check the
+    ;; one-byte counter wraps to 0 and the output begins REPEATING block 1.
+    (refused "hkdf-expand over-length"
+             (sch/hkdf-expand h (vec (repeat 32 1)) [1 2 3] (inc (* 255 32)))
+             :hkdf-expand-too-long :internal_error)
+    (is (r/ok? (sch/hkdf-expand h (vec (repeat 32 1)) [1 2 3] (* 255 32)))
+        "exactly 255 blocks is legal -- the bound is off-by-one sensitive"))
+  (testing "RFC 8446 section 7.1: HkdfLabel bounds"
+    ;; Broken: an empty label. "tls13 " is six bytes and the vector is <7..255>.
+    (refused "empty label" (sch/hkdf-label 32 "" []) :vector-underflow :internal_error)
+    ;; Broken: a 250-byte label, so "tls13 "+label overflows the one-byte prefix.
+    (refused "over-long label"
+             (sch/hkdf-label 32 (apply str (repeat 250 "x")) []) :vector-overflow :internal_error)
+    ;; Broken: a 256-byte context.
+    (refused "over-long context"
+             (sch/hkdf-label 32 "key" (vec (repeat 256 0))) :vector-overflow :internal_error)))
+
+;; ----------------------------------------------------------- record layer
+
+(def s-hs-keys
+  {:tls/key (v/nth-of {:actor :server :step "derive write traffic keys for handshake"
+                       :label "key expanded"} 0)
+   :tls/iv (v/nth-of {:actor :server :step "derive write traffic keys for handshake"
+                      :label "iv expanded"} 0)})
+
+(def real-record
+  (nth (map :bytes (v/find-all {:actor :server :step "send handshake record"
+                                :label "complete record"})) 1))
+
+(deftest record-refusals
+  (testing "section 5.1/5.2: length bounds are checked from the header"
+    ;; Broken: a fragment one byte over 2^14.
+    (refused "plaintext over 2^14"
+             (rec/plaintext-record :handshake (vec (repeat (inc rec/max-plaintext) 0)))
+             :plaintext-too-long :record_overflow)
+    ;; Broken: a header claiming 2^14+257 bytes. Refused BEFORE the body is
+    ;; read, which is what bounds the allocation a hostile peer can cause.
+    (refused "declared length over 2^14+256"
+             (rec/parse-record (vec (concat [23 3 3] (c/u16 (inc rec/max-ciphertext)) [])))
+             :record-too-long :record_overflow))
+
+  (testing "section 5.3: the sequence number must stay exact"
+    ;; Broken: a sequence number past 2^53-1, where a JS number rounds. A
+    ;; rounded sequence number is a REPEATED AEAD nonce.
+    (refused "sequence number beyond exact integers"
+             (rec/nonce (vec (repeat 12 0)) (inc c/max-exact-integer))
+             :sequence-number-not-exact :internal_error))
+
+  (testing "AEAD failure yields no plaintext, anywhere"
+    ;; Broken: one bit of the AEAD tag (the final byte of the record).
+    (let [tampered (assoc real-record (dec (count real-record))
+                          (bit-xor 1 (last real-record)))
+          e (refused "flipped tag bit" (rec/open aes128 s-hs-keys 0 tampered)
+                     :aead-authentication-failed :bad_record_mac)]
+      (is (= #{:tls/alert :tls/reason} (set (keys e)))
+          "the error must carry no plaintext, no key and no nonce"))
+    ;; Broken: one bit of the ciphertext body rather than the tag -- a
+    ;; different attack, and it must produce the SAME answer. A distinguisher
+    ;; between "tag wrong" and "content wrong" is an oracle.
+    (let [tampered (assoc real-record 20 (bit-xor 1 (nth real-record 20)))]
+      (refused "flipped ciphertext bit" (rec/open aes128 s-hs-keys 0 tampered)
+               :aead-authentication-failed :bad_record_mac))
+    ;; Broken: the right record under the wrong sequence number.
+    (refused "wrong sequence number" (rec/open aes128 s-hs-keys 1 real-record)
+             :aead-authentication-failed :bad_record_mac))
+
+  (testing "section 5.2: a protected record's outer type is always 23"
+    ;; Broken: opaque_type set to 22 (handshake).
+    (refused "protected record with opaque_type 22"
+             (rec/open aes128 s-hs-keys 0 (assoc real-record 0 22))
+             :protected-record-wrong-opaque-type :unexpected_message))
+
+  (testing "section 5.4: the inner content type"
+    ;; Broken: an inner plaintext that is all zeros, so there is no content
+    ;; type byte at all. The tempting shortcut is to default to
+    ;; application_data; the RFC says unexpected_message.
+    (refused "all-zero inner plaintext" (rec/strip-padding [0 0 0 0])
+             :all-zero-inner-plaintext :unexpected_message)
+    ;; Broken: change_cipher_spec smuggled inside the protected stream.
+    (refused "encrypted change_cipher_spec" (rec/strip-padding [1 2 3 20])
+             :encrypted-change-cipher-spec :unexpected_message)
+    ;; Broken: a content type that is not assigned.
+    (refused "unknown inner content type" (rec/strip-padding [1 2 3 99])
+             :unknown-content-type :unexpected_message))
+
+  (testing "padding is stripped, and only zeros are padding"
+    (let [sealed (r/val (rec/seal aes128 s-hs-keys 5 :application_data [1 2 3] 17))
+          opened (r/val (rec/open aes128 s-hs-keys 5 sealed))]
+      (is (= :application_data (:tls/content-type opened)))
+      (is (= [1 2 3] (:tls/content opened)) "17 bytes of padding must not appear as content"))))
+
+;; ------------------------------------------------------ handshake parsing
+
+(def client-hello (v/one {:actor :client :label "ClientHello"}))
+(def server-hello-msg (v/one {:actor :server :label "ServerHello"}))
+
+(deftest client-hello-refusals
+  (let [body (:tls/body (r/val (hs/split client-hello)))]
+    (testing "truncation is refused where it is short"
+      ;; Broken: the last twenty bytes removed.
+      (refused "truncated ClientHello"
+               (hs/parse-client-hello (subvec body 0 (- (count body) 20)))
+               :truncated :decode_error))
+    (testing "section 4.1.2: a message is exactly as long as it says"
+      ;; Broken: four extra bytes appended inside the message body.
+      (refused "trailing bytes"
+               (hs/parse-client-hello (into body [0 0 0 0]))
+               :trailing-data :decode_error))
+    (testing "section 4.1.2: legacy_compression_methods MUST be a single zero"
+      ;; Broken: offer compression method 1. Compression in TLS is CRIME.
+      (let [i (+ 2 32 1 2 (* 2 3))            ; version, random, sid len, cs len, suites
+            with-comp (assoc body (+ i 1) 1)]
+        (refused "compression offered" (hs/parse-client-hello with-comp)
+                 :compression-offered :illegal_parameter)))
+    (testing "section 4.1.2: legacy_session_id is <0..32>"
+      ;; Broken: a session id length byte of 33. Encodable, and only the
+      ;; declared bound rejects it.
+      (let [b (assoc body 34 33)]
+        (refused "33-byte session id" (hs/parse-client-hello b)
+                 :vector-overflow :decode_error)))))
+
+(deftest extension-refusals
+  (testing "section 4.2: no duplicate extension types"
+    ;; Broken: the supported_versions extension appended a second time. A
+    ;; parser that keeps the last one lets an attacker overwrite the
+    ;; negotiated version by appending.
+    (let [sv (r/val (ext/supported-versions-client))]
+      (refused "duplicate extension on parse"
+               (ext/parse-block (vec (concat sv sv)) :generic)
+               :duplicate-extension :illegal_parameter)
+      (refused "duplicate extension on encode"
+               (ext/encode-block 0 [(ext/->ext :supported_versions sv)
+                                    (ext/->ext :supported_versions sv)])
+               :duplicate-extension :illegal_parameter))))
+
+(deftest server-hello-refusals
+  (let [sh (r/val (hs/parse-server-hello (:tls/body (r/val (hs/split server-hello-msg)))))
+        ch (r/val (hs/parse-client-hello (:tls/body (r/val (hs/split client-hello)))))
+        base {:session-id (:tls/session-id ch)
+              :offered-suites (:tls/cipher-suites ch)
+              :offered-groups [:x25519]}
+        without (fn [t] (update sh :tls/extensions (fn [es] (remove #(= t (:tls/type %)) es))))]
+    (testing "section 4.1.3: TLS 1.3 is decided by supported_versions"
+      ;; Broken: supported_versions removed. legacy_version still says 0x0303,
+      ;; so a client that trusted it would proceed -- and be downgradeable.
+      (refused "no supported_versions" (hs/check-server-hello (without :supported_versions) base)
+               :no-supported-versions :missing_extension)
+      ;; Broken: supported_versions says 0x0303 (TLS 1.2).
+      (let [tls12 (update sh :tls/extensions
+                          (fn [es] (map #(if (= :supported_versions (:tls/type %))
+                                           (assoc % :tls/value {:tls/version 0x0303}) %) es)))]
+        (refused "supported_versions is not 1.3" (hs/check-server-hello tls12 base)
+                 :not-tls13 :protocol_version)))
+    (testing "section 4.1.3: the echoed session id must match"
+      ;; Broken: the client's recorded session id changed by one byte.
+      (refused "session id echo mismatch"
+               (hs/check-server-hello sh (assoc base :session-id [1 2 3]))
+               :session-id-echo-mismatch :illegal_parameter))
+    (testing "section 4.1.3: the selected suite must have been offered"
+      ;; Broken: the client's offered list no longer contains what the server chose.
+      (refused "cipher suite not offered"
+               (hs/check-server-hello sh (assoc base :offered-suites [0x1303]))
+               :cipher-suite-not-offered :illegal_parameter))
+    (testing "the key_share group must have been offered"
+      ;; Broken: the client claims it offered only P-256.
+      (refused "key share group not offered"
+               (hs/check-server-hello sh (assoc base :offered-groups [:secp256r1]))
+               :key-share-group-not-offered :illegal_parameter))
+    (testing "section 4.1.3: a HelloRetryRequest is a ServerHello with a fixed random"
+      ;; Broken: the random replaced by SHA-256("HelloRetryRequest"). This is
+      ;; not a different message type; an implementation that does not compare
+      ;; the constant derives secrets from a key share that does not exist.
+      ;; A HelloRetryRequest is built here rather than patched into the real
+      ;; ServerHello, because its key_share carries only the two-byte group --
+      ;; not a share. Patching only the random would have produced a message
+      ;; the parser rejects for the wrong reason, which is the "the break and
+      ;; the report disagree" failure this suite is meant to avoid.
+      (let [sv (r/val (ext/supported-versions-server))
+            ks (r/val (ext/extension :key_share (c/u16 (get ext/groups :secp256r1))))
+            exts (r/val (c/write-vector 2 6 65535 :extensions (vec (concat ks sv))))
+            hrr-body (vec (concat [3 3] hs/hello-retry-request-random
+                                  (r/val (c/write-vector 1 0 32 :sid (:tls/session-id ch)))
+                                  (c/u16 0x1301) [0] exts))
+            parsed (hs/parse-server-hello hrr-body)]
+        (is (r/ok? parsed))
+        (is (true? (:tls/hello-retry-request (r/val parsed)))
+            "the constant must be recognised")
+        (refused "HelloRetryRequest" (hs/check-server-hello (r/val parsed) base)
+                 :hello-retry-request-not-implemented :handshake_failure)))))
+
+(deftest certificate-refusals
+  (testing "section 4.4.2: an unsolicited certificate_request_context"
+    ;; Broken: a one-byte context in a server Certificate, which section 4.4.2
+    ;; says SHALL be zero length unless answering a CertificateRequest.
+    (refused "non-empty certificate context"
+             (hs/parse-certificate (vec (concat [1 0xaa] (c/u24 0))))
+             :unsolicited-certificate-context :illegal_parameter))
+  (testing "an empty certificate_list"
+    (refused "empty certificate list"
+             (hs/parse-certificate (vec (concat [0] (c/u24 0))))
+             :empty-certificate-list :decode_error)))
+
+(deftest key-update-refusals
+  (testing "section 4.6.3: update_requested is 0 or 1"
+    ;; Broken: the value 2.
+    (refused "bad key_update value" (hs/parse-key-update [2]) :bad-key-update :illegal_parameter)
+    (refused "over-long key_update" (hs/parse-key-update [0 0]) :bad-key-update :illegal_parameter)))
+
+(deftest finished-refusals
+  (testing "section 4.4.4"
+    (let [th (vec (repeat 32 7))
+          good (r/val (sch/verify-data h (vec (repeat 32 3)) th))]
+      (is (r/ok? (sch/check-finished h (vec (repeat 32 3)) th good)))
+      ;; Broken: one bit of verify_data.
+      (refused "flipped verify_data bit"
+               (sch/check-finished h (vec (repeat 32 3)) th (assoc good 0 (bit-xor 1 (first good))))
+               :finished-mismatch :decrypt_error)
+      ;; Broken: the right verify_data over a different transcript.
+      (refused "wrong transcript"
+               (sch/check-finished h (vec (repeat 32 3)) (vec (repeat 32 8)) good)
+               :finished-mismatch :decrypt_error))))
+
+;; ---------------------------------------------------- suite and provider
+
+(deftest suite-refusals
+  (testing "a suite is refused at construction, not at the first record"
+    ;; Broken: a provider with no AES-GCM. Without this check the failure
+    ;; surfaces as a bad_record_mac on the PEER, which is unfixable from here.
+    (refused "provider without the AEAD"
+             (suite/suite (update provider :aead dissoc :aes-128-gcm) :TLS_AES_128_GCM_SHA256)
+             :provider-missing-aead :insufficient_security)
+    ;; Broken: a provider with no SHA-384, asked for a SHA-384 suite.
+    (refused "provider without the hash"
+             (suite/suite (update provider :hash dissoc :sha384) :TLS_AES_256_GCM_SHA384)
+             :provider-missing-hash :insufficient_security)
+    (refused "unknown suite" (suite/suite provider :TLS_MADE_UP)
+             :unknown-cipher-suite :illegal_parameter))
+  (testing "negotiable is computed from the provider, not declared"
+    (is (= [:TLS_AES_128_GCM_SHA256] (suite/negotiable (update provider :aead dissoc :chacha20-poly1305)))
+        "a suite the provider cannot run must not be offered on its behalf")
+    (is (empty? (suite/negotiable {:hash {} :aead {}})))))
+
+(deftest schedule-provider-refusals
+  (refused "provider without the hash" (sch/hashes {:hash {} :hmac (fn [& _])} :sha256)
+           :provider-missing-hash :internal_error)
+  (refused "provider without hmac" (sch/hashes {:hash {:sha256 (fn [_])}} :sha256)
+           :provider-missing-hmac :internal_error)
+  (refused "unknown hash" (sch/hashes provider :md5) :unknown-hash :internal_error))
+
+;; ------------------------------------------------- peer authentication
+
+(deftest peer-authentication-refusals
+  ;; `tls.client/authenticate-peer` no longer decides anything itself: it
+  ;; delegates to `tls.cert` and lifts that namespace's refusal into an alert.
+  ;; So these assert the LIFTING as much as the decision -- a refusal that
+  ;; arrives without an alert is not wire behaviour, and `lift` mapping a
+  ;; reason to `:internal_error` by default would be a plausible-looking pass.
+  (let [auth #'client/authenticate-peer
+        entries (:tls/entries (r/val (cert/parse-certificate-message
+                                      (:tls/body (r/val (hs/split
+                                                         (v/one {:actor :server :label "Certificate"})))))))
+        leaf (:tls/certificate (first entries))
+        real-pin (second (cert/spki-sha256-hex @harness/array-provider leaf))]
+    (testing "no configured way to authenticate is a refusal, not a default"
+      ;; The most important refusal in the library. A client with no pin, no
+      ;; chain verifier and no explicit opt-out has an UNAUTHENTICATED
+      ;; connection, and returning success is how that becomes invisible.
+      (refused "no peer authentication configured"
+               (auth @harness/array-provider {} leaf entries nil)
+               :no-peer-authentication-configured :certificate_required))
+    (testing "a wrong pin is refused, and the error names what was there"
+      (let [e (refused "pin mismatch"
+                       (auth @harness/array-provider
+                             {:pin-spki-sha256 (apply str (repeat 64 "0"))} leaf entries nil)
+                       :peer-not-pinned :bad_certificate)]
+        (is (= real-pin (:observed (:tls/cert e)))
+            "tls.cert's detail must survive the lift, not be flattened away")))
+    (testing "the right pin is accepted"
+      (let [res (auth @harness/array-provider {:pin-spki-sha256 real-pin} leaf entries nil)]
+        (is (r/ok? res) (str "refused: " (pr-str (r/err res))))
+        (is (= :spki-pin (:tls/authenticated-by (r/val res))))
+        (is (contains? (:tls/not-checked (r/val res)) :chain-to-trust-anchor)
+            "an [:ok ...] must carry what it does NOT mean")))
+    (testing "an upper-case pin is the same pin"
+      (is (r/ok? (auth @harness/array-provider
+                       {:pin-spki-sha256 (kotoba.lang.text/upper real-pin)}
+                       leaf entries nil))))
+    (testing "the explicit opt-out says so in its result"
+      (let [ok (r/val (auth @harness/array-provider {:insecure-skip-peer-auth true} leaf entries nil))]
+        (is (= :none (:tls/authenticated-by ok)))
+        (is (string? (:tls/warning ok)))
+        (is (contains? (:tls/not-checked ok) :spki-pin))))))
+
+(deftest every-cert-refusal-has-an-alert
+  ;; `lift` maps `tls.cert` reasons to alerts from a table with no default. A
+  ;; reason added to `tls.cert` and not to the table would otherwise become a
+  ;; silent `:internal_error`, which reads like our bug rather than the peer's.
+  (testing "the alert table covers tls.cert's documented refusals"
+    (let [missing (remove #(contains? client/cert-alerts %) (keys cert/refusals))]
+      (is (empty? missing)
+          (str "tls.cert refusals with no alert mapping: " (pr-str (vec missing))))))
+  (testing "an unmapped reason is loud, not plausible"
+    (let [lifted (#'client/lift [:error {:reason :a-reason-nobody-mapped}])]
+      (is (= :internal_error (r/alert lifted)))
+      (is (= :a-reason-nobody-mapped (:tls/unmapped-cert-reason (r/err lifted)))))))
+
+(deftest the-suite-actually-refused-things
+  ;; The count is printed by `tls.report`, not here: a mid-suite print reports
+  ;; however many deftests clojure.test happened to have reached, and two
+  ;; different numbers for the same quantity is worse than none.
+  (testing "a negative suite that refused nothing is not evidence"
+    (is (pos? @refusals))))
