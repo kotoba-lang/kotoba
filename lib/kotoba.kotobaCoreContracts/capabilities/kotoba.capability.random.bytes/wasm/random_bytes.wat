@@ -1,0 +1,28 @@
+(module
+  (memory (export "memory") 1)
+  (global $state (mut i32) (i32.const 0x12345678))
+  (func $next (result i32)
+    (local $x i32)
+    (local.set $x (global.get $state))
+    ;; xorshift32
+    (local.set $x (i32.xor (local.get $x) (i32.shl (local.get $x) (i32.const 13))))
+    (local.set $x (i32.xor (local.get $x) (i32.shr_u (local.get $x) (i32.const 17))))
+    (local.set $x (i32.xor (local.get $x) (i32.shl (local.get $x) (i32.const 5))))
+    (global.set $state (local.get $x))
+    (local.get $x))
+  (func (export "random_bytes") (param $ptr i32) (param $len i32) (result i32)
+    (local $i i32)
+    (local $b i32)
+    (if (i32.lt_s (local.get $len) (i32.const 0))
+      (then (return (i32.const -1))))
+    (if (i32.gt_u (i32.add (local.get $ptr) (local.get $len)) (i32.const 65536))
+      (then (return (i32.const -1))))
+    (local.set $i (i32.const 0))
+    (block $done
+      (loop $L
+        (br_if $done (i32.ge_u (local.get $i) (local.get $len)))
+        (local.set $b (call $next))
+        (i32.store8 (i32.add (local.get $ptr) (local.get $i)) (local.get $b))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $L)))
+    (local.get $len)))

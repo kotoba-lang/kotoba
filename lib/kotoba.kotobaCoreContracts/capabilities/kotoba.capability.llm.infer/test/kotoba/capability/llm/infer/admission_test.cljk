@@ -1,0 +1,150 @@
+(ns kotoba.capability.llm.infer.admission-test
+  "Every refusal, with its reason pinned.
+
+  This capability's content is which requests it declines, so a test that
+  asserted only `(not allowed?)` would count a refusal for ANY cause as the one
+  it meant to exercise — ADR-2608136000 §6. Each assertion below names the
+  reason, so a change that starts refusing for a different cause fails here."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.capability.llm.infer.admission :as a]))
+
+(def ^:private p
+  {:allow-endpoints #{"api.murakumo.cloud"}
+   :allow-models #{"murakumo-main"}
+   :max-prompt-bytes 1024
+   :max-output-tokens 4096})
+
+(def ^:private req
+  {:model "murakumo-main"
+   :endpoint "https://api.murakumo.cloud/v1/messages"
+   :prompt-bytes 100})
+
+(deftest an-allowed-model-at-an-allowed-endpoint-is-admitted
+  (let [r (a/admit p req)]
+    (is (:allowed? r))
+    (is (= "api.murakumo.cloud" (:host r)))
+    (is (= "murakumo-main" (:model r)))
+    (is (= 4096 (:max-output-tokens r)))
+    (is (false? (:narrowed? r)))))
+
+(deftest no-policy-is-not-permission
+  (doseq [empty-policy [nil {} {:allow-endpoints #{}} {:allow-models #{}}
+                        {:allow-models #{"murakumo-main"}
+                         :max-prompt-bytes 1 :max-output-tokens 1}]]
+    (let [r (a/admit empty-policy req)]
+      (is (= :infer/no-policy (:reason r)) (pr-str empty-policy))))
+  (testing "and it names WHICH allowlist is missing, because they are fixed separately"
+    (is (= #{:allow-endpoints}
+           (:missing (a/admit (assoc p :allow-endpoints #{}) req))))
+    (is (= #{:allow-models}
+           (:missing (a/admit (assoc p :allow-models #{}) req)))))
+  (is (not= :infer/endpoint-not-allowed (:reason (a/admit {} req)))
+      "an unconfigured provider must not look like a configured one that said no"))
+
+(deftest an-absent-ceiling-is-not-an-infinite-ceiling
+  ;; The floor this capability adds over `http/fetch`. `:llm-inference` is a
+  ;; metered effect: a grant with no ceiling is authority over someone's money
+  ;; that nobody bounded. It must refuse, and it must NOT say `no-policy` --
+  ;; the operator who wrote allowlists and forgot a ceiling is somewhere else.
+  (doseq [[k missing] [[:max-output-tokens #{:max-output-tokens}]
+                       [:max-prompt-bytes #{:max-prompt-bytes}]]]
+    (let [r (a/admit (dissoc p k) req)]
+      (is (= :infer/unbounded (:reason r)) (str k))
+      (is (= missing (:missing r)) (str k))))
+  (is (= #{:max-prompt-bytes :max-output-tokens}
+         (:missing (a/admit (dissoc p :max-prompt-bytes :max-output-tokens) req))))
+  (testing "zero and negative are not ceilings either"
+    (is (= :infer/unbounded (:reason (a/admit (assoc p :max-output-tokens 0) req))))
+    (is (= :infer/unbounded (:reason (a/admit (assoc p :max-prompt-bytes -1) req)))))
+  (testing "unbounded? counts it without deciding anything"
+    (is (a/unbounded? (dissoc p :max-output-tokens)))
+    (is (not (a/unbounded? p)))
+    (is (not (a/unbounded? {})) "nothing configured is no-policy, not unbounded")))
+
+(deftest an-alias-is-not-an-endpoint
+  ;; The trap this capability exists to avoid: a policy written about a name
+  ;; that resolves elsewhere decides about one thing and acts on another.
+  (testing "nobody said where the model is served"
+    (doseq [e [nil "" "   "]]
+      (let [r (a/admit p (assoc req :endpoint e))]
+        (is (= :infer/endpoint-unresolved (:reason r)) (pr-str e)))))
+  (testing "an alias passed as an endpoint is refused, not resolved"
+    (is (= :infer/unparsable-endpoint
+           (:reason (a/admit p (assoc req :endpoint "murakumo-main")))))
+    (is (= :infer/unparsable-endpoint
+           (:reason (a/admit p (assoc req :endpoint "api.murakumo.cloud")))))))
+
+(deftest only-https
+  (is (= :infer/scheme-not-allowed
+         (:reason (a/admit p (assoc req :endpoint "http://api.murakumo.cloud/v1")))))
+  (testing "a policy may widen the scheme set explicitly, and only explicitly"
+    (is (:allowed? (a/admit (assoc p :schemes #{"http"})
+                            (assoc req :endpoint "http://api.murakumo.cloud/v1"))))))
+
+(deftest an-endpoint-outside-the-allowlist-is-refused-by-name
+  (let [r (a/admit p (assoc req :endpoint "https://evil.example/v1"))]
+    (is (= :infer/endpoint-not-allowed (:reason r)))
+    (is (= "evil.example" (:host r)))))
+
+(deftest userinfo-cannot-carry-an-allowed-name
+  ;; `https://api.murakumo.cloud@evil.example/` has host `evil.example`. The
+  ;; prompt would go there with the allowlist apparently satisfied.
+  (let [r (a/admit p (assoc req :endpoint "https://api.murakumo.cloud@evil.example/v1"))]
+    (is (= :infer/endpoint-not-allowed (:reason r)))
+    (is (= "evil.example" (:host r)))))
+
+(deftest a-suffix-is-not-a-match
+  (doseq [h ["api.murakumo.cloud.evil.example" "notapi.murakumo.cloud"
+             "api.murakumo.cloudx"]]
+    (is (= :infer/endpoint-not-allowed
+           (:reason (a/admit p (assoc req :endpoint (str "https://" h "/v1")))))
+        h)))
+
+(deftest the-port-and-the-case-do-not-defeat-the-allowlist
+  (is (:allowed? (a/admit p (assoc req :endpoint "https://api.murakumo.cloud:443/v1"))))
+  (is (:allowed? (a/admit p (assoc req :endpoint "HTTPS://API.MURAKUMO.CLOUD/v1")))))
+
+(deftest a-model-outside-the-allowlist-is-refused-by-name
+  (let [r (a/admit p (assoc req :model "some-other-model"))]
+    (is (= :infer/model-not-allowed (:reason r)))
+    (is (= "some-other-model" (:model r))))
+  (testing "and it is a different fact from the endpoint being wrong"
+    (is (not= (:reason (a/admit p (assoc req :model "x")))
+              (:reason (a/admit p (assoc req :endpoint "https://evil.example/")))))))
+
+(deftest a-prompt-over-the-egress-bound-is-refused-not-truncated
+  ;; Truncating would send a DIFFERENT prompt than the caller wrote and report
+  ;; success. `:data-egress` is the effect where that is exactly wrong.
+  (let [r (a/admit p (assoc req :prompt-bytes 1025))]
+    (is (= :infer/prompt-too-large (:reason r)))
+    (is (= 1025 (:prompt-bytes r)))
+    (is (= 1024 (:max-prompt-bytes r))))
+  (is (:allowed? (a/admit p (assoc req :prompt-bytes 1024))) "the bound is inclusive"))
+
+(deftest the-output-ceiling-narrows-and-never-raises
+  ;; `bot-bounds/cap`'s rule, restated where the grant is made: a caller asking
+  ;; for more gets less and is TOLD, rather than getting less silently.
+  (let [r (a/admit p (assoc req :max-output-tokens 999999))]
+    (is (:allowed? r))
+    (is (= 4096 (:max-output-tokens r)))
+    (is (true? (:narrowed? r))))
+  (testing "asking for less is honoured, not raised to the ceiling"
+    (let [r (a/admit p (assoc req :max-output-tokens 10))]
+      (is (= 10 (:max-output-tokens r)))
+      (is (false? (:narrowed? r)))))
+  (testing "asking for nothing takes the ceiling"
+    (is (= 4096 (:max-output-tokens (a/admit p req))))))
+
+(deftest the-eight-reasons-are-eight
+  ;; A floor on the set itself. Collapsing two of these would still pass every
+  ;; test above that names only one of them.
+  (let [reasons (set (keep #(:reason (a/admit (first %) (second %)))
+                           [[{} req]
+                            [(dissoc p :max-output-tokens) req]
+                            [p (assoc req :endpoint nil)]
+                            [p (assoc req :endpoint "murakumo-main")]
+                            [p (assoc req :endpoint "http://api.murakumo.cloud/")]
+                            [p (assoc req :endpoint "https://evil.example/")]
+                            [p (assoc req :model "x")]
+                            [p (assoc req :prompt-bytes 99999)]]))]
+    (is (= 8 (count reasons)) (pr-str reasons))))

@@ -1,0 +1,145 @@
+(ns kotoba.capability.llm.infer.provider-test
+  "The host provider, and the core it is bound over.
+
+  Nothing here opens a socket. Every assertion is about a request that was
+  refused before one could be opened, which is the part of this capability that
+  is the capability."
+  (:require [kotoba.io :as io]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.capability.llm.infer.provider :as provider]))
+
+(def ^:private p
+  {:allow-endpoints #{"api.murakumo.cloud"}
+   :allow-models #{"murakumo-main"}
+   :max-prompt-bytes 1024
+   :max-output-tokens 4096
+   :endpoints {"murakumo-main" "https://api.murakumo.cloud/v1/messages"}
+   :request-body-fn (fn [_decision prompt] (str "{\"p\":" (pr-str prompt) "}"))})
+
+(deftest the-three-negative-codes-are-distinct
+  ;; -1 refused, -2 transport, -3 unbound. If any two were equal, an operator
+  ;; could not tell "policy said no" from "nothing was listening" from "nobody
+  ;; bound a provider" — three different things to go and fix.
+  (is (= 3 (count (distinct [provider/code-refused
+                             provider/code-transport
+                             provider/code-unbound]))))
+  (is (every? neg? [provider/code-refused provider/code-transport
+                    provider/code-unbound])))
+
+(deftest a-provider-without-a-policy-refuses-every-call
+  (let [r ((:infer (provider/provider nil)) "murakumo-main" "hello")]
+    (is (false? (:ok? r)))
+    (is (= provider/code-refused (:code r)))
+    (is (= :infer/no-policy (:reason r)))))
+
+(deftest a-provider-with-no-resolver-and-no-endpoint-attempts-nothing
+  ;; There is no default endpoint on purpose: baking the workspace's alias host
+  ;; in here would make a network READ from a capability granted a network
+  ;; WRITE, and freeze a value AGENTS.md says not to freeze.
+  (let [r ((:infer (provider/provider (dissoc p :endpoints)))
+           "murakumo-main" "hello")]
+    (is (= :infer/endpoint-unresolved (:reason r)))
+    (is (= provider/code-refused (:code r)))))
+
+(deftest a-resolver-is-consulted-before-the-policy-decides
+  ;; Resolve, THEN admit. If it were the other way round the policy would have
+  ;; approved an alias and the request would go wherever it resolved.
+  (testing "a resolver pointing outside the allowlist is caught"
+    (let [pol (assoc (dissoc p :endpoints)
+                     :resolve-endpoint (constantly "https://evil.example/v1"))
+          r ((:infer (provider/provider pol)) "murakumo-main" "hello")]
+      (is (= :infer/endpoint-not-allowed (:reason r)))))
+  (testing "a resolver that knows nothing is not an endpoint"
+    (let [pol (assoc (dissoc p :endpoints) :resolve-endpoint (constantly nil))
+          r ((:infer (provider/provider pol)) "murakumo-main" "hello")]
+      (is (= :infer/endpoint-unresolved (:reason r)))))
+  (testing "a resolver that throws does not become a transport failure"
+    ;; -2 would say a request went out. None did.
+    (let [pol (assoc (dissoc p :endpoints)
+                     :resolve-endpoint (fn [_] (throw (ex-info "boom" {}))))
+          r ((:infer (provider/provider pol)) "murakumo-main" "hello")]
+      (is (= :infer/endpoint-unresolved (:reason r)))
+      (is (= provider/code-refused (:code r))))))
+
+(deftest a-model-outside-the-policy-is-refused-without-a-socket
+  (let [r ((:infer (provider/provider p)) "some-other-model" "hello")]
+    (is (= :infer/model-not-allowed (:reason r)))))
+
+(deftest an-oversized-prompt-is-refused-without-a-socket
+  (let [r ((:infer (provider/provider p)) "murakumo-main" (apply str (repeat 2000 "x")))]
+    (is (= :infer/prompt-too-large (:reason r)))))
+
+(deftest the-prompt-is-measured-in-bytes-not-characters
+  ;; `:data-egress` is about what leaves the machine. 400 kana are 1,200 UTF-8
+  ;; bytes, and a policy measured in characters would let three times its
+  ;; stated bound out.
+  (let [r ((:infer (provider/provider p)) "murakumo-main" (apply str (repeat 400 "あ")))]
+    (is (= :infer/prompt-too-large (:reason r))
+        "400 characters is under 1024, but 1200 bytes is not")))
+
+(deftest without-a-request-encoder-nothing-is-sent
+  (let [r ((:infer (provider/provider (dissoc p :request-body-fn)))
+           "murakumo-main" "hello")]
+    (is (= :infer/no-request-encoder (:reason r)))
+    (is (= provider/code-refused (:code r))))
+  (testing "and it is a different fact from the policy saying no"
+    (is (not= :infer/no-policy
+              (:reason ((:infer (provider/provider (dissoc p :request-body-fn)))
+                        "murakumo-main" "hello"))))))
+
+(deftest the-host-export-is-the-actor-host-shape
+  (let [x (provider/host-export p)]
+    (is (= "kotoba" (:module x)))
+    (is (= "llm_infer" (:field x)))
+    (is (= [:i32 :i32 :i32 :i32 :i32 :i32] (:params x)))
+    (is (= :i32 (:result x)))
+    (is (fn? (:fn x)))))
+
+(deftest the-policy-the-endpoint-and-the-credential-are-closed-over
+  ;; The guest passes a model and a prompt. There is no parameter through which
+  ;; it could widen its authority, redirect its prompt, or read the key.
+  (let [x (provider/host-export p)]
+    (is (= 6 (count (:params x))))
+    (is (every? #{:i32} (:params x))
+        "an i32 ABI can carry no policy, no endpoint and no credential"))
+  (let [a (provider/provider {:allow-endpoints #{"a.example"}})]
+    (is (= #{"a.example"} (:allow-endpoints (:policy a))))
+    (testing "and a second provider does not inherit the first's"
+      (is (= :infer/no-policy
+             (:reason ((:infer (provider/provider {})) "murakumo-main" "x")))))))
+
+(deftest the-core-artifact-fails-closed
+  ;; The shipped wasm returns -3 from every call. An embedder that links it and
+  ;; forgets to bind a host implementation must get "no provider" — never an
+  ;; empty completion, which is a thing a real model does.
+  (let [f (io/file "artifacts/provider.core.wasm")]
+    (is (io/exists? f) "the core artifact is not built; run the command in README")
+    (is (pos? (io/length f)))
+    ;; -3 as a signed LEB128 immediate of i32.const is 0x7d. Asserting the byte
+    ;; is cruder than running the module and more honest than asserting nothing:
+    ;; this file has no wasm runtime, and a test that claimed to check the
+    ;; behaviour without one would be claiming more than it did.
+    (let [bs (byte-array (io/length f))]
+      (with-open [in (io/input-stream f)] (.read in bs))
+      (is (some #(= (unchecked-byte 0x7d) %) (seq bs))
+          "the core does not contain the -3 constant it is supposed to return"))))
+
+(deftest a-rejected-model-never-reaches-the-resolver
+  ;; Resolving is a network read. A guest that could make the host resolve
+  ;; arbitrary names would be exercising an authority this grant does not
+  ;; carry — small, but it is the same shape as every other amplification.
+  (let [calls (atom [])
+        pol (assoc (dissoc p :endpoints)
+                   :resolve-endpoint (fn [m] (swap! calls conj m)
+                                       "https://api.murakumo.cloud/v1"))
+        r ((:infer (provider/provider pol)) "some-other-model" "hello")]
+    (is (= :infer/model-not-allowed (:reason r)))
+    (is (= [] @calls) "the resolver was called for a model the policy rejects"))
+  (testing "and an admitted model does reach it"
+    (let [calls (atom [])
+          pol (assoc (dissoc p :endpoints :request-body-fn)
+                     :resolve-endpoint (fn [m] (swap! calls conj m)
+                                         "https://api.murakumo.cloud/v1"))]
+      (is (= :infer/no-request-encoder
+             (:reason ((:infer (provider/provider pol)) "murakumo-main" "hello"))))
+      (is (= ["murakumo-main"] @calls)))))

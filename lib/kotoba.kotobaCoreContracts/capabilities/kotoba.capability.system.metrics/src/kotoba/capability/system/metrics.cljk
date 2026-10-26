@@ -1,0 +1,5 @@
+(ns kotoba.capability.system.metrics
+  "Importable contract for system/metrics.")
+
+(def manifest
+  {:schema "kotoba.capability.repository.v1", :capability/version 1, :capability/hash-contract-cid "bafkreiflhj3fslsbh7okdas2fzlhmogai64x6p3lkla6gtr7berbp7ftvi", :capability/definition-cid "bafyreiekxo23beylwworwhhe7l3mqyca5kqxltycim44ekv7efwddn5ib4", :capability/dependencies #{}, :capability/imports #{:system-metrics}, :authority "kotoba-lang/kotoba-core-contracts", :capability/default-policy :autonomous, :capability/artifact {:format :wasm-component, :digest-required? true, :signature-required? true}, :capability/radicle-rid "rad:z2NHGfJUuENSHs1Pa6RUJG7VgqKKc", :capability/repository "kotoba-lang/capability-system-metrics", :capability/id "system/metrics", :capability/effects #{:system-read}, :capability/provider-status :contract-only})

@@ -1,0 +1,10 @@
+(ns kotoba.capability.social.publish-test
+  (:require [clojure.test :refer [deftest is]]
+            [kotoba.capability.social.publish :as capability]
+            [kotoba.core.capability-repository :as repository]
+            [kotoba.core.contracts :as contracts]))
+
+(deftest manifest-conforms
+  (is (= [] (repository/validate-manifest
+             (contracts/capability-contract)
+             capability/manifest))))

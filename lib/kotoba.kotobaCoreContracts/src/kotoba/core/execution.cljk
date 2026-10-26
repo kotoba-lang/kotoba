@@ -1,0 +1,578 @@
+(ns kotoba.core.execution
+  "Target-independent bounded execution descriptors. Pure data; no target or host imports."
+  {:kotoba/export [stream-contract valid-stream-limits? ability-keys valid-ability? plan-keys policy-decision-keys approval-keys cid? valid-plan? valid-policy-decision? valid-approval? execution-identity-keys valid-execution-identity? capability-lease-keys valid-capability-lease? execution-intent-keys valid-execution-intent?]})
+
+;; R6QW3: the Kotoba reading (W3: the selfbuild scan refused this module E1005 at the
+;; \b char literal in cid?). The host reading of every form is kept byte-for-byte as
+;; :default. Port decisions:
+;; - The exported constants are 0-argument functions (the export surface names
+;;   functions only); the key sets are typed-set-new and stream-contract is a
+;;   typed-map-new over :document values (mixed keyword/set/bool values).
+;; - base32-value (an into-map over the alphabet) is a string-index-of lookup.
+;; - base32-decode / read-varint / the byte walks are :vector-i64 walks; cid?'s
+;;   \b multibase prefix is the code point 98.
+;; - The valid-*? validators keep the oracle's exact shape: a map? check, an
+;;   exact key-set check and the per-field predicates; the result is :bool.
+#?(:kotoba
+   (defn- dgk [d :document k :keyword] :document
+     (option-value-of [:option :document] (document-get d k) (document-null))))
+#?(:kotoba
+   (defn- none? [d :document] :bool
+     (document-equal? d (document-null))))
+;; true when d is a map document with exactly the key set ks (a typed keyword set)
+#?(:kotoba
+   (defn- keys-exact? [d :document ks [:set :keyword]] :bool
+     (and (= (document-kind d) :map)
+          (= (document-count d) (typed-set-count [:set :keyword] ks))
+          (keys-walk d 0 (document-count d) ks))))
+#?(:kotoba
+   (defn- keys-walk [d :document i :i64 n :i64 ks [:set :keyword]] :bool
+     (if (>= i n)
+       true
+       (if (typed-set-contains [:set :keyword] ks
+                               (option-value-of [:option :keyword]
+                                                (document-keyword-value
+                                                 (option-value-of [:option :document] (document-list-at d i) (document-null)))
+                                                :none))
+         (keys-walk d (+ i 1) n ks)
+         false))))
+;; the items of a document collection as a membership check (scalar = singleton, null = empty)
+#?(:kotoba
+   (defn- has-item? [d :document x :document] :bool
+     (cond (none? d) false
+           (or (= (document-kind d) :list) (= (document-kind d) :vector) (= (document-kind d) :set))
+           (items-eq? d x 0 (document-count d))
+           :else (document-equal? d x))))
+#?(:kotoba
+   (defn- items-eq? [d :document x :document i :i64 n :i64] :bool
+     (if (>= i n)
+       false
+       (if (document-equal? (option-value-of [:option :document] (document-list-at d i) (document-null)) x)
+         true
+         (items-eq? d x (+ i 1) n)))))
+;; the base32 alphabet value of one character (RFC 4648 lowercase unpadded), -1 otherwise
+#?(:kotoba
+   (defn- b32-val [c :i64] :i64
+     ;; the RFC 4648 alphabet is two contiguous runs: a-z is 0..25, 2-7 is 26..31
+     (cond (and (>= c 97) (<= c 122)) (- c 97)
+           (and (>= c 50) (<= c 55)) (- c 24)
+           :else -1)))
+;; true when every item of d is in the keyword set ks
+#?(:kotoba
+   (defn- all-in? [d :document ks [:set :keyword]] :bool
+     (cond (none? d) true
+           (or (= (document-kind d) :list) (= (document-kind d) :vector) (= (document-kind d) :set))
+           (all-in-walk d ks 0 (document-count d))
+           :else (in-kset? ks d))))
+#?(:kotoba
+   (defn- all-in-walk [d :document ks [:set :keyword] i :i64 n :i64] :bool
+     (if (>= i n)
+       true
+       (if (in-kset? ks (option-value-of [:option :document] (document-list-at d i) (document-null)))
+         (all-in-walk d ks (+ i 1) n)
+         false))))
+#?(:kotoba
+   (defn- in-kset? [ks [:set :keyword] x :document] :bool
+     (typed-set-contains [:set :keyword] ks
+                         (option-value-of [:option :keyword] (document-keyword-value x) :none))))
+;; the count of a collection document (scalar = 1, null = 0)
+#?(:kotoba
+   (defn- items-n [d :document] :i64
+     (cond (none? d) 0
+           (or (= (document-kind d) :list) (= (document-kind d) :vector) (= (document-kind d) :set))
+           (document-count d)
+           :else 1)))
+
+;; the RFC 4648 base32 decode as a bit accumulator walk (the oracle's loop over the map).
+;; The bytes answer a :document vector of byte i64s, (document-null) for a bad character
+;; (the oracle's nil: [:option [:vector-i64]] is not annotatable).
+#?(:kotoba
+   (defn- b32-walk [s :string i :i64 n :i64 acc :i64 bits :i64 out :document] :document
+     (if (>= i n)
+       out
+       (let [v (b32-val (string-code-point-at s i))]
+         (if (< v 0)
+           (document-null)
+           (let [acc2 (+ (* acc 32) v)
+                 bits2 (+ bits 5)]
+             (if (>= bits2 8)
+               (let [bb (- bits2 8)]
+                 (b32-walk s (+ i 1) n (mod acc2 (pow2 bb)) bb
+                           (document-vector-conj out (document-i64 (mod (quot acc2 (pow2 bb)) 256)))))
+               (b32-walk s (+ i 1) n acc2 bits2 out))))))))
+#?(:kotoba
+   (defn- pow2 [e :i64] :i64
+     (if (<= e 0) 1 (* 2 (pow2 (- e 1))))))
+
+;; the unsigned LEB128 read as a walk (the oracle's loop); the pair answers a 2-item
+;; :document vector [value next-offset], (document-null) when the bytes run out.
+#?(:kotoba
+   (defn- varint-walk [bs :document offset :i64 value :i64 shift :i64] :document
+     (if (>= offset (document-count bs))
+       (document-null)
+       (let [b (mod (option-value-of [:option :i64] (document-i64-value (option-value-of [:option :document] (document-list-at bs offset) (document-null))) 0) 256)]
+         (if (< b 128)
+           (document-vector (document-i64 (+ value (* b (pow2 shift)))) (document-i64 (+ offset 1)))
+           (if (< shift 56)
+             (varint-walk bs (+ offset 1) (+ value (* (mod b 127) (pow2 shift))) (+ shift 7))
+             (document-null)))))))
+
+;; the CIDv1 structural check (the oracle's cid?): the b multibase prefix is the
+;; code point 98 (backslash-b), then base32, then the varint chain and the multihash shape.
+;; The varint pair is a 2-item :document vector.
+#?(:kotoba
+   (defn- cid-decode [s :string] :bool
+     (let [bs (b32-walk s 1 (string-byte-length s) 0 0 (document-vector))]
+       (if (none? bs)
+         false
+         (cid-vars bs 0)))))
+#?(:kotoba
+   (defn- vpair [p :document i :i64] :i64
+     (option-value-of [:option :i64] (document-i64-value (option-value-of [:option :document] (document-list-at p i) (document-null))) -1)))
+#?(:kotoba
+   (defn- cid-vars [bs :document off :i64] :bool
+     (let [v (varint-walk bs off 0 0)]
+       (if (none? v)
+         false
+         (let [version (vpair v 0)
+               off1 (vpair v 1)
+               c (varint-walk bs off1 0 0)]
+           (if (none? c)
+             false
+             (let [codec (vpair c 0)
+                   off2 (vpair c 1)
+                   hf (varint-walk bs off2 0 0)]
+               (if (none? hf)
+                 false
+                 (let [hash-fn (vpair hf 0)
+                       off3 (vpair hf 1)
+                       hl (varint-walk bs off3 0 0)]
+                   (if (none? hl)
+                     false
+                     (let [hash-len (vpair hl 0)
+                           off4 (vpair hl 1)]
+                       (and (= 1 version) (< 0 codec) (< 0 hash-fn) (< 0 hash-len)
+                            (= hash-len (- (document-count bs) off4))))))))))))))
+
+;; (pos-int? (get limits %)) over a document: a positive integer document
+#?(:kotoba
+   (defn- posint? [d :document] :bool
+     (and (= (document-kind d) :i64) (< 0 (option-value-of [:option :i64] (document-i64-value d) 0)))))
+#?(:kotoba
+   (defn- items-all-posint? [d :document] :bool
+     (cond (none? d) false
+           (or (= (document-kind d) :list) (= (document-kind d) :vector) (= (document-kind d) :set))
+           (pos-walk d 0 (document-count d))
+           :else (posint? d))))
+#?(:kotoba
+   (defn- pos-walk [d :document i :i64 n :i64] :bool
+     (if (>= i n)
+       true
+       (if (posint? (option-value-of [:option :document] (document-list-at d i) (document-null)))
+         (pos-walk d (+ i 1) n)
+         false))))
+
+;; the cid vector checks (the oracle's every? cid? + distinct count)
+#?(:kotoba
+   (defn- cvec-walk [v :document i :i64 n :i64] :bool
+     (if (>= i n)
+       true
+       (if (cid? (option-value-of [:option :document] (document-list-at v i) (document-null)))
+         (cvec-walk v (+ i 1) n)
+         false))))
+#?(:kotoba
+   (defn- cvec-uniq [v :document i :i64 n :i64] :bool
+     (if (>= i n)
+       true
+       (if (cvec-has v (option-value-of [:option :document] (document-list-at v i) (document-null)) (+ i 1) n)
+         false
+         (cvec-uniq v (+ i 1) n)))))
+#?(:kotoba
+   (defn- cvec-has [v :document x :document j :i64 n :i64] :bool
+     (if (>= j n)
+       false
+       (if (document-equal? x (option-value-of [:option :document] (document-list-at v j) (document-null)))
+         true
+         (cvec-has v x (+ j 1) n)))))
+
+;; the coll/set/kind predicates of the validators (the oracle's set?/coll?/pos-int?/nat-int?)
+#?(:kotoba
+   (defn- coll-kind? [d :document] :bool
+     (or (= (document-kind d) :list) (= (document-kind d) :vector) (= (document-kind d) :set))))
+#?(:kotoba
+   (defn- natint? [d :document] :bool
+     (and (= (document-kind d) :i64) (<= 0 (option-value-of [:option :i64] (document-i64-value d) -1)))))
+
+#?(:kotoba
+   (defn- stream-limits-keys [] [:set :keyword]
+     (typed-set-new [:set :keyword] :deadline-ms :max-items :max-bytes)))
+
+;; the document map updates of valid-execution-intent? (assoc/dissoc over the key documents)
+#?(:kotoba
+   (defn- document-set-default [m :document k :document v :document] :document
+     (document-assoc m k v)))
+#?(:kotoba
+   (defn stream-contract [] [:map :keyword :document]
+     (typed-map-new [:map :keyword :document]
+                    :format (document-keyword :kotoba.stream/bytes-v1)
+                    :task (document-keyword :poll-cancel)
+                    :stream (document-keyword :pull-cancel)
+                    :required-limits (document-set (document-keyword :deadline-ms) (document-keyword :max-items) (document-keyword :max-bytes))
+                    :zero-copy? (document-bool false)
+                    :ambient-executor? (document-bool false)))
+   :default
+(def stream-contract
+  {:format :kotoba.stream/bytes-v1
+   :task :poll-cancel
+   :stream :pull-cancel
+   :required-limits #{:deadline-ms :max-items :max-bytes}
+   :zero-copy? false
+   :ambient-executor? false}))
+#?(:kotoba
+   (defn valid-stream-limits? [limits :document] :bool
+     (and (keys-exact? limits (stream-limits-keys))
+          (posint? (dgk limits :deadline-ms))
+          (posint? (dgk limits :max-items))
+          (posint? (dgk limits :max-bytes))))
+   :default
+(defn valid-stream-limits?
+  [limits]
+  (and (map? limits)
+       (= #{:deadline-ms :max-items :max-bytes} (set (keys limits)))
+       (every? #(pos-int? (get limits %))
+               [:deadline-ms :max-items :max-bytes]))))
+#?(:kotoba
+   (defn ability-keys [] [:set :keyword]
+     (typed-set-new [:set :keyword] :target :operation :max-bytes :max-items :deadline-ms :audit-id))
+   :default
+(def ability-keys
+  #{:target :operation :max-bytes :max-items :deadline-ms :audit-id}))
+#?(:kotoba
+   (defn valid-ability? [ability :document] :bool
+     (and (keys-exact? ability (ability-keys))
+          (= (document-kind (dgk ability :target)) :string)
+          (< 0 (items-n (dgk ability :target)))
+          (= (document-kind (dgk ability :operation)) :keyword)
+          (= (document-kind (dgk ability :audit-id)) :string)
+          (< 0 (items-n (dgk ability :audit-id)))
+          (posint? (dgk ability :max-bytes))
+          (posint? (dgk ability :max-items))
+          (posint? (dgk ability :deadline-ms))))
+   :default
+(defn valid-ability?
+  "Validate an exact, bounded semantic ability descriptor. :target names a
+  resource, not a compiler target. This is data validation; a host must enforce the
+  resulting limits at every host boundary."
+  [ability]
+  (and (map? ability)
+       (= ability-keys (set (keys ability)))
+       (string? (:target ability)) (seq (:target ability))
+       (keyword? (:operation ability))
+       (string? (:audit-id ability)) (seq (:audit-id ability))
+       (every? #(pos-int? (get ability %))
+               [:max-bytes :max-items :deadline-ms]))))
+#?(:kotoba
+   (defn plan-keys [] [:set :keyword]
+     (typed-set-new [:set :keyword] :format :plan-cid :code-closure-cid :artifact-cid :compiler-contract :requested-effects :requested-resources :input-cid :budget))
+   :default
+(def plan-keys
+  #{:format :plan-cid :code-closure-cid :artifact-cid :compiler-contract
+    :requested-effects :requested-resources :input-cid :budget}))
+#?(:kotoba
+   (defn policy-decision-keys [] [:set :keyword]
+     (typed-set-new [:set :keyword] :format :decision-cid :plan-cid :policy-cid :db-basis :result :reasons :issued-at :expires-at))
+   :default
+(def policy-decision-keys
+  #{:format :decision-cid :plan-cid :policy-cid :db-basis :result :reasons
+    :issued-at :expires-at}))
+#?(:kotoba
+   (defn approval-keys [] [:set :keyword]
+     (typed-set-new [:set :keyword] :format :approval-cid :plan-cid :policy-cid :db-basis :resources :input-cid :approver-cid :issued-at :expires-at))
+   :default
+(def approval-keys
+  #{:format :approval-cid :plan-cid :policy-cid :db-basis :resources
+    :input-cid :approver-cid :issued-at :expires-at}))
+#?(:kotoba
+   (def ^:private base32-value
+     "the alphabet lookup is b32-val in the Kotoba reading (the oracle builds the map)")
+   :default
+(def ^:private base32-value
+  "RFC 4648 base32, lowercase, unpadded — the `b` multibase alphabet. A map
+  rather than `.indexOf` so the decode stays interop-free and portable."
+  (into {} (map-indexed (fn [i c] [c i]) "abcdefghijklmnopqrstuvwxyz234567"))))
+#?(:kotoba
+   (defn- base32-decode [s :string] :document
+     (b32-walk s 0 (string-byte-length s) 0 0 (document-vector)))
+   :default
+(defn- base32-decode
+  "Returns a vector of byte values, or nil if any character is outside the
+  alphabet."
+  [s]
+  (loop [cs (seq s) acc 0 bits 0 out []]
+    (if-let [c (first cs)]
+      (if-let [v (base32-value c)]
+        (let [acc (bit-or (bit-shift-left acc 5) v)
+              bits (+ bits 5)]
+          (if (>= bits 8)
+            (let [bits' (- bits 8)]
+              (recur (rest cs)
+                     (bit-and acc (dec (bit-shift-left 1 bits')))
+                     bits'
+                     (conj out (bit-and 0xff (bit-shift-right acc bits')))))
+            (recur (rest cs) acc bits out)))
+        nil)
+      out))))
+#?(:kotoba
+   (defn- read-varint [bs :document offset :i64] :document
+     (varint-walk bs offset 0 0))
+   :default
+(defn- read-varint
+  "Unsigned LEB128 at `offset`. Returns [value next-offset], or nil if the
+  bytes run out before the continuation bit clears."
+  [bs offset]
+  (loop [offset offset value 0 shift 0]
+    (when (< offset (count bs))
+      (let [b (bit-and (nth bs offset) 0xff)]
+        (if (< b 0x80)
+          [(bit-or value (bit-shift-left b shift)) (inc offset)]
+          (when (< shift 56)
+            (recur (inc offset)
+                   (bit-or value (bit-shift-left (bit-and b 0x7f) shift))
+                   (+ shift 7)))))))))
+#?(:kotoba
+   (defn cid? [value :document] :bool
+     (if (not (= (document-kind value) :string))
+       false
+       (let [s (option-value-of [:option :string] (document-string-value value) "")]
+         (and (< 1 (string-byte-length s))
+              (= 98 (string-code-point-at s 0))
+              (cid-decode s)))))
+   :default
+(defn cid?
+  "True only for a fully decodable CIDv1 with a well-formed multihash.
+
+  Deliberately structural and not semantic: it proves the string is a content
+  identifier, not that the content exists or matches. Same shape as
+  `kototama.component-platform`'s check, so the portable contract and the
+  admission boundary agree."
+  [value]
+  (boolean
+   (and (string? value)
+        (< 1 (count value))
+        (= \b (first value))
+        (when-let [bs (base32-decode (subs value 1))]
+          (when-let [[version off1] (read-varint bs 0)]
+            (when-let [[codec off2] (read-varint bs off1)]
+              (when-let [[hash-fn off3] (read-varint bs off2)]
+                (when-let [[hash-len off4] (read-varint bs off3)]
+                  (and (= 1 version)
+                       (pos? codec)
+                       (pos? hash-fn)
+                       (pos? hash-len)
+                       (= hash-len (- (count bs) off4))))))))))))
+#?(:kotoba
+   (defn- cid-vector? [value :document] :bool
+     (and (or (= (document-kind value) :list) (= (document-kind value) :vector))
+          (cvec-walk value 0 (document-count value))
+          (cvec-uniq value 0 (document-count value))))
+   :default
+(defn- cid-vector? [value]
+  (and (vector? value) (every? cid? value) (= (count value) (count (distinct value))))))
+#?(:kotoba
+   (defn valid-plan? [plan :document] :bool
+     (and (keys-exact? plan (plan-keys))
+          (document-equal? (dgk plan :format) (document-keyword :kotoba.plan/v1))
+          (cid? (dgk plan :plan-cid))
+          (cid? (dgk plan :code-closure-cid))
+          (cid? (dgk plan :artifact-cid))
+          (cid? (dgk plan :compiler-contract))
+          (cid? (dgk plan :input-cid))
+          (coll-kind? (dgk plan :requested-effects))
+          (coll-kind? (dgk plan :requested-resources))
+          (= (document-kind (dgk plan :budget)) :map)))
+   :default
+(defn valid-plan?
+  "Validate the portable, bounded plan descriptor. Policy evaluation is a
+  host concern; this contract only prevents shape drift before that boundary."
+  [plan]
+  (and (map? plan)
+       (= plan-keys (set (keys plan)))
+       (= :kotoba.plan/v1 (:format plan))
+       (every? cid? ((juxt :plan-cid :code-closure-cid :artifact-cid
+                            :compiler-contract :input-cid) plan))
+       (set? (:requested-effects plan))
+       (set? (:requested-resources plan))
+       (map? (:budget plan)))))
+#?(:kotoba
+   (defn valid-policy-decision? [decision :document] :bool
+     (and (keys-exact? decision (policy-decision-keys))
+          (document-equal? (dgk decision :format) (document-keyword :kotoba.policy-decision/v1))
+          (cid? (dgk decision :decision-cid))
+          (cid? (dgk decision :plan-cid))
+          (cid? (dgk decision :policy-cid))
+          (cid? (dgk decision :db-basis))
+          (or (document-equal? (dgk decision :result) (document-keyword :permit))
+              (document-equal? (dgk decision :result) (document-keyword :deny)))
+          (or (= (document-kind (dgk decision :reasons)) :list)
+              (= (document-kind (dgk decision :reasons)) :vector))
+          (= (document-kind (dgk decision :issued-at)) :string)
+          (= (document-kind (dgk decision :expires-at)) :string)))
+   :default
+(defn valid-policy-decision?
+  "Validate a deterministic, basis-bound policy decision. A `:permit` is not
+  authority by itself: the host must still issue and enforce scoped leases."
+  [decision]
+  (and (map? decision)
+       (= policy-decision-keys (set (keys decision)))
+       (= :kotoba.policy-decision/v1 (:format decision))
+       (every? cid? ((juxt :decision-cid :plan-cid :policy-cid :db-basis) decision))
+       (contains? #{:permit :deny} (:result decision))
+       (vector? (:reasons decision))
+       (string? (:issued-at decision))
+       (string? (:expires-at decision)))))
+#?(:kotoba
+   (defn valid-approval? [approval :document] :bool
+     (and (keys-exact? approval (approval-keys))
+          (document-equal? (dgk approval :format) (document-keyword :kotoba.approval/v1))
+          (cid? (dgk approval :approval-cid))
+          (cid? (dgk approval :plan-cid))
+          (cid? (dgk approval :policy-cid))
+          (cid? (dgk approval :db-basis))
+          (cid? (dgk approval :input-cid))
+          (cid? (dgk approval :approver-cid))
+          (or (= (document-kind (dgk approval :resources)) :list)
+              (= (document-kind (dgk approval :resources)) :set)
+              (= (document-kind (dgk approval :resources)) :vector))
+          (< 0 (items-n (dgk approval :resources)))
+          (= (document-kind (dgk approval :issued-at)) :string)
+          (= (document-kind (dgk approval :expires-at)) :string)))
+   :default
+(defn valid-approval?
+  "Validate an immutable human/organizational approval witness. An approval is
+  authority only for the exact plan, policy, basis, input and resource set it
+  names; a host must additionally verify its CID, signer and expiry."
+  [approval]
+  (and (map? approval)
+       (= approval-keys (set (keys approval)))
+       (= :kotoba.approval/v1 (:format approval))
+       (every? cid? ((juxt :approval-cid :plan-cid :policy-cid :db-basis
+                            :input-cid :approver-cid) approval))
+       (set? (:resources approval))
+       (seq (:resources approval))
+       (string? (:issued-at approval))
+       (string? (:expires-at approval)))))
+#?(:kotoba
+   (defn execution-identity-keys [] [:set :keyword]
+     (typed-set-new [:set :keyword] :format :plan-cid :code-closure-cid :artifact-cid :compiler-contract :profile-binding-cid :package-lock-cid :policy-cid :policy-decision-cid :db-basis :grant-cids :approval-cids :runtime-identity :input-cid :outcome-cid :host-receipt-cids))
+   :default
+(def execution-identity-keys
+  #{:format :plan-cid :code-closure-cid :artifact-cid :compiler-contract
+    :profile-binding-cid :package-lock-cid :policy-cid :policy-decision-cid
+    :db-basis :grant-cids :approval-cids :runtime-identity :input-cid
+    :outcome-cid :host-receipt-cids}))
+#?(:kotoba
+   (defn valid-execution-identity? [identity :document] :bool
+     (and (keys-exact? identity (execution-identity-keys))
+          (document-equal? (dgk identity :format) (document-keyword :kotoba.execution-identity/v2))
+          (cid? (dgk identity :code-closure-cid))
+          (cid? (dgk identity :artifact-cid))
+          (cid? (dgk identity :compiler-contract))
+          (cid? (dgk identity :profile-binding-cid))
+          (cid? (dgk identity :package-lock-cid))
+          (cid? (dgk identity :policy-cid))
+          (cid? (dgk identity :policy-decision-cid))
+          (cid? (dgk identity :db-basis))
+          (cid? (dgk identity :runtime-identity))
+          (cid? (dgk identity :input-cid))
+          (cid? (dgk identity :outcome-cid))
+          (or (cid? (dgk identity :plan-cid)) (none? (dgk identity :plan-cid)))
+          (cid-vector? (dgk identity :grant-cids))
+          (cid-vector? (dgk identity :approval-cids))
+          (cid-vector? (dgk identity :host-receipt-cids))))
+   :default
+(defn valid-execution-identity?
+  "Closed target-neutral v2 identity. Rejects v1 and physical target fields.
+  The binding CID is mandatory; no unspecified target or ambient fallback."
+  [identity]
+  (and (map? identity)
+       (= execution-identity-keys (set (keys identity)))
+       (= :kotoba.execution-identity/v2 (:format identity))
+       (every? cid? ((juxt :code-closure-cid :artifact-cid :compiler-contract
+                           :profile-binding-cid :package-lock-cid :policy-cid
+                           :policy-decision-cid :db-basis :runtime-identity
+                           :input-cid :outcome-cid) identity))
+       (or (cid? (:plan-cid identity)) (nil? (:plan-cid identity)))
+       (every? cid-vector? ((juxt :grant-cids :approval-cids :host-receipt-cids) identity)))))
+#?(:kotoba
+   (defn capability-lease-keys [] [:set :keyword]
+     (typed-set-new [:set :keyword] :format :capability-cid :execution-identity-cid :artifact-cid :profile-binding-cid :resource-cid :purpose :expires-at :uses :transfer :delegation-depth))
+   :default
+(def capability-lease-keys
+  #{:format :capability-cid :execution-identity-cid :artifact-cid
+    :profile-binding-cid :resource-cid :purpose :expires-at :uses :transfer
+    :delegation-depth}))
+#?(:kotoba
+   (defn valid-capability-lease? [lease :document] :bool
+     (and (keys-exact? lease (capability-lease-keys))
+          (document-equal? (dgk lease :format) (document-keyword :kotoba.capability-lease/v2))
+          (cid? (dgk lease :capability-cid))
+          (cid? (dgk lease :execution-identity-cid))
+          (cid? (dgk lease :artifact-cid))
+          (cid? (dgk lease :profile-binding-cid))
+          (cid? (dgk lease :resource-cid))
+          (= (document-kind (dgk lease :purpose)) :keyword)
+          (= (document-kind (dgk lease :expires-at)) :string)
+          (posint? (dgk lease :uses))
+          (or (document-equal? (dgk lease :transfer) (document-keyword :non-transferable))
+              (document-equal? (dgk lease :transfer) (document-keyword :same-artifact)))
+          (natint? (dgk lease :delegation-depth))))
+   :default
+(defn valid-capability-lease?
+  "Non-bearer v2 audit descriptor bound to an artifact and target binding.
+  Hosts verify identity/binding/CIDs, expiry, revocation and actual authority."
+  [lease]
+  (and (map? lease)
+       (= capability-lease-keys (set (keys lease)))
+       (= :kotoba.capability-lease/v2 (:format lease))
+       (every? cid? ((juxt :capability-cid :execution-identity-cid :artifact-cid
+                           :profile-binding-cid :resource-cid) lease))
+       (keyword? (:purpose lease))
+       (string? (:expires-at lease))
+       (pos-int? (:uses lease))
+       (contains? #{:non-transferable :same-artifact} (:transfer lease))
+       (nat-int? (:delegation-depth lease)))))
+#?(:kotoba
+   (defn execution-intent-keys [] [:set :keyword]
+     (typed-set-new [:set :keyword] :format :plan-cid :code-closure-cid :artifact-cid
+                    :compiler-contract :profile-binding-cid :package-lock-cid :policy-cid
+                    :policy-decision-cid :db-basis :grant-cids :approval-cids :runtime-identity
+                    :input-cid :outcome-cid :invocation-cid))
+   :default
+(def execution-intent-keys
+  (conj (disj execution-identity-keys :outcome-cid :host-receipt-cids) :invocation-cid)))
+#?(:kotoba
+   (defn valid-execution-intent? [intent :document] :bool
+     (and (keys-exact? intent (execution-intent-keys))
+          (document-equal? (dgk intent :format) (document-keyword :kotoba.execution-intent/v2))
+          (cid? (dgk intent :invocation-cid))
+          (valid-execution-identity?
+           (document-set-default
+            (document-set-default
+             (document-set-default
+              (document-set-default (document-dissoc intent (document-keyword :invocation-cid))
+                                    (document-keyword :format) (document-keyword :kotoba.execution-identity/v2))
+              (document-keyword :outcome-cid) (dgk intent :input-cid))
+             (document-keyword :host-receipt-cids) (document-vector))
+            (document-keyword :plan-cid) (dgk intent :plan-cid)))))
+   :default
+(defn valid-execution-intent?
+  "Closed pre-execution v2 identity. Completion adds measured outcome/receipts
+  and produces a different CID; it never mutates or readdresses this intent."
+  [intent]
+  (and (map? intent)
+       (= execution-intent-keys (set (keys intent)))
+       (= :kotoba.execution-intent/v2 (:format intent))
+       (cid? (:invocation-cid intent))
+       (valid-execution-identity?
+        (assoc (dissoc intent :invocation-cid) :format :kotoba.execution-identity/v2
+               :outcome-cid (:input-cid intent) :host-receipt-cids [])))))
