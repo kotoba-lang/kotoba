@@ -1,0 +1,363 @@
+(ns tee-core
+  (:export [tdx-cpu-leaf snp-cpu-leaf
+            tdx-cpuid-adapter-bit page-size-4k
+            tdx-refuse tdx-admit tdx-cvm-bit tdx-tdvf-bit
+            snp-refuse snp-admit snp-cvm-bit snp-fw-bit snp-ovmf-bit
+            snp-policy-abi-minor-mask snp-policy-abi-major-mask
+            snp-policy-smt-bit snp-policy-reserved-one-bit
+            snp-policy-migrate-ma-bit snp-policy-debug-bit
+            snp-policy-single-socket-bit snp-policy-cxl-allow-bit
+            snp-policy-mem-aes-256-xts-bit snp-policy-rapl-dis-bit
+            snp-policy-ciphertext-hiding-dram-bit
+            snp-policy-page-swap-disable-bit snp-policy-known-mask
+            quote-min-bytes tdx-report-min-bytes snp-report-min-bytes
+            align-4k page-aligned? tdvf-range-base tdvf-range-size in-tdvf-range?
+            snp-secrets-gpa snp-cpuid-gpa
+            tdx-tdvmcall-vgpi tdx-tdvmcall-vgpi-res
+            tdx-tdvmcall-map-gpa snp-psc-op
+            psc-err-name tdx-page-type
+            tdvmcall-action admit-tdx-guest admit-snp-guest launch-variant
+            snp-get-report-req portio-verdict snp-policy-bounds]))
+
+;; Whether this guest is a TDX or SEV-SNP confidential VM, as decisions.
+;;
+;; Source of truth for the rules:
+;;
+;;   * Intel TDX: the TDX module 1.5 base spec (332836), TDVF (OVMF TDX)
+;;     section on TDVMCALL, and the Linux x86 cc (CoCo) guest code
+;;     `arch/x86/coco/tdx/tdx.c`, which I read this session for the exact
+;;     TDG.VP.VMCALL operands and the CPUID indirect-leaf adapter bit.
+;;   * AMD SEV-SNP policy: AMD 56860 Rev. 1.59 (Guest Policy Structure);
+;;     AMD 24593 Rev. 3.44 and the Linux guest code `arch/x86/coco/sev-guest.c`
+;;     and `arch/x86/mm/sev.c` (snp_msg_req,
+;;     GHCB page-assignment (PSC), and the SNP CPUID page), and OVMF's
+;;     AmdSev platform profile.
+;;
+;; The monitor asks; this answers. The two questions a TEE-capable monitor
+;; faces before it may run a confidential guest:
+;;
+;;   1. IS the guest TEE-shaped at all? Detection is NOT reading a magic
+;;      field: a TDX guest discovers itself through CPUID leaf 0x21
+;;      ("Intel TDX Guest" in EBX..ECX: "Intel", "TDX   " packed) and an
+;;      adapter bit in leaf 0x1 EDX; an SNP guest discovers itself through
+;;      CPUID leaf 0x8000001F EAX bit 1 (SEV) and bit 2 (SEV-ES) plus
+;;      EBX 0x2/0x4 (SNP). The VMM must VIRTUALISE these leaves, so what
+;;      the monitor needs to decide is which leaves to fabricate for which
+;;      profile -- that is `tdx-cpu-leaf` / `snp-cpu-leaf` and the admit
+;;      functions, not a probe.
+;;   2. MAY the launch proceed? Platform capabilities (KVM_TDX_CAPABILITIES,
+;;      SNP_LAUNCH_START policy) and the firmware image (TDVF vs AmdSev
+;;      OVMF) have to agree with the profile, or the guest would boot into
+;;      firmware that performs its first TDVMCALL / #VC into a monitor
+;;      that cannot answer.
+;;
+;; Page-I/O rule (the one that changes the guest's own behaviour, so it
+;; lives here and not in the mechanism): inside a TDX VM, IN/OUT are not
+;; executable instructions against real hardware; they raise a #VE and the
+;; guest must ask the VMM through TDG.VP.VMCALL<INSTRUCTION.IO>. An SNP
+;; guest IOIOs through the GHCB. `portio-verdict` returns that verdict.
+;;
+;; Errors are values -- `[:result T E]` with pinned reason literals, never
+;; a throw. Packing follows the vtd-admit shape: one value, bit fields,
+;; refusal on bit 0 clear.
+;;
+;; Host call path: vmm.tee/tdx-launch, vmm.tee/snp-launch,
+;; vmm.tee/tdvmcall, vmm.tee/portio.
+;; Gate: test/vmm/tee_test.cljk
+
+;; ---------------------------------------------------------------------------
+;; Detection leaves and bits
+
+(defn tdx-cpu-leaf [] :i64 33)          ;; 0x21: "Intel TDX Guest"
+(defn snp-cpu-leaf [] :i64 2147483655)  ;; 0x8000001F: SEV capabilities
+
+(defn tdx-cpuid-adapter-bit [] :i64 4194304) ;; 0x1 EDX bit 22: CPUID indirect
+(defn page-size-4k [] :i64 4096)
+
+;; ---------------------------------------------------------------------------
+;; Refuse / admit verdict bit positions -- one packed value per launch
+
+(defn tdx-refuse [] :i64 0)
+(defn tdx-admit [] :i64 1)
+(defn tdx-cvm-bit [] :i64 1)            ;; bit 0: launch may proceed
+(defn tdx-tdvf-bit [] :i64 2)           ;; bit 1: TDVF (OVMF-TDX) present
+
+(defn snp-refuse [] :i64 0)
+(defn snp-admit [] :i64 1)
+(defn snp-cvm-bit [] :i64 1)            ;; bit 0: launch may proceed
+(defn snp-fw-bit [] :i64 2)             ;; bit 1: AmdSev OVMF present
+(defn snp-ovmf-bit [] :i64 2)           ;; alias of snp-fw-bit for callers
+
+;; SNP_LAUNCH_START Guest Policy (AMD 56860 Rev. 1.59, Table 12). KVM
+;; carries the policy word to firmware, which enforces the requested ABI
+;; version and feature policy. Bits 63:26 are reserved MBZ; bit 17 is
+;; reserved but must be one.
+(defn snp-policy-abi-minor-mask [] :i64 255) ;; bits 7:0, ABI_MINOR
+(defn snp-policy-abi-major-mask [] :i64 65280) ;; bits 15:8, ABI_MAJOR
+(defn snp-policy-smt-bit [] :i64 65536) ;; bit 16
+(defn snp-policy-reserved-one-bit [] :i64 131072) ;; bit 17, must be one
+(defn snp-policy-migrate-ma-bit [] :i64 262144) ;; bit 18
+(defn snp-policy-debug-bit [] :i64 524288) ;; bit 19
+(defn snp-policy-single-socket-bit [] :i64 1048576) ;; bit 20
+(defn snp-policy-cxl-allow-bit [] :i64 2097152) ;; bit 21
+(defn snp-policy-mem-aes-256-xts-bit [] :i64 4194304) ;; bit 22
+(defn snp-policy-rapl-dis-bit [] :i64 8388608) ;; bit 23
+(defn snp-policy-ciphertext-hiding-dram-bit [] :i64 16777216) ;; bit 24
+(defn snp-policy-page-swap-disable-bit [] :i64 33554432) ;; bit 25
+(defn snp-policy-known-mask [] :i64 67108863) ;; bits 25:0
+
+;; ---------------------------------------------------------------------------
+;; Attestation sizes -- the monitor refuses an unmeasurable quote path
+
+(defn quote-min-bytes [] :i64 4096)         ;; TDX attest quote lower bound
+(defn tdx-report-min-bytes [] :i64 584)     ;; TDREPORT: 256 MAC + 224 TINFO+
+                                            ;; MAC'd state + 104 TDINFO
+(defn snp-report-min-bytes [] :i64 400)     ;; SNP report: 96 header + 304
+                                            ;; body (measured 1184 field incl.
+                                            ;; guest/msgs but refuse under the
+                                            ;; documented fixed body size)
+
+;; ---------------------------------------------------------------------------
+;; Firmware placement. TDVF loads at the top of the 4 GiB guest-physical
+;; space in an 8 MiB window OVMF's TDX profile reserves; the monitor maps
+;; it there and the TDVFs first TDVMCALL arrives with those GPAs.
+
+(defn tdvf-range-base [] :i64 4273995776) ;; 0xFEC0_0000 region under 4G-64M
+(defn tdvf-range-size [] :i64 8388608)    ;; 8 MiB TDVF flash window
+
+(defn page-aligned? [gpa :i64] :i64
+  ;; Written as quot/multiply because `rem` has no admitted lowering on
+  ;; this target -- the arithmetic is the same, the admission is not.
+  ;; Returns 1/0: the KIR comparison ops produce i64, and a :bool result
+  ;; type would make this fn trap under the cljs interpreter (measured;
+  ;; see snp-policy-bounds).
+  (if (= gpa (* (quot gpa (page-size-4k)) (page-size-4k))) 1 0))
+
+(defn align-4k [gpa :i64] :i64
+  (* (quot (+ gpa (- (page-size-4k) 1)) (page-size-4k)) (page-size-4k)))
+
+(defn in-tdvf-range? [gpa :i64] :i64
+  ;; 1/0 answer for the same runtime-parity reason as page-aligned?.
+  (if (< gpa (tdvf-range-base))
+    0
+    (if (< gpa (+ (tdvf-range-base) (tdvf-range-size))) 1 0)))
+
+;; SEV-SNP guest pages the firmware sets aside (GHCB-backed pages the
+;; firmware itself needs, fixed by the AmdSev OVMF layout):
+(defn snp-secrets-gpa [] :i64 1657655296)  ;; 0x62C9_D000 SNP secrets page
+(defn snp-cpuid-gpa [] :i64 1657655304)    ;; 0x62C9_D008 SNP CPUID page
+
+;; ---------------------------------------------------------------------------
+;; TDG.VP.VMCALL<MAP_GPA> operands. A TDX guest requests shared<->private
+;; conversion by its own guest-physical address; the VMM decides whether
+;; the range is convertible (conv bits already reserved in the S-EPT).
+
+(defn tdx-tdvmcall-vgpi [gpa :i64] :i64
+  ;; The value the guest writes in R11: bit 48 set means "make shared".
+  gpa)
+
+(defn tdx-tdvmcall-vgpi-res [gpa :i64] [:result :i64 :string]
+  (cond
+    (= (page-aligned? gpa) 0)
+    (result-err-of [:result :i64 :string] "tdvmcall/map-gpa-unaligned")
+
+    :else
+    (result-ok-of [:result :i64 :string] (tdx-tdvmcall-vgpi gpa))))
+
+(defn tdx-tdvmcall-map-gpa [gpa :i64 size :i64] [:result :i64 :string]
+  (cond
+    (= (page-aligned? gpa) 0)
+    (result-err-of [:result :i64 :string] "tdvmcall/map-gpa-unaligned")
+
+    (= (page-aligned? size) 0)
+    (result-err-of [:result :i64 :string] "tdvmcall/map-gpa-size-unaligned")
+
+    (<= size 0)
+    (result-err-of [:result :i64 :string] "tdvmcall/map-gpa-empty")
+
+    :else
+    ;; Ok payload: the shared-bit-half the monitor must convert. Bit 48
+    ;; distinguishes; strip it for the shared verdict so the mechanism
+    ;; never re-derives the same mask.
+    (if (> (bit-and gpa 281474976710656) 0)
+      (result-ok-of [:result :i64 :string] 2)
+      (result-ok-of [:result :i64 :string] 1))))
+
+;; ---------------------------------------------------------------------------
+;; SNP page-state change (PSC) operations, and their reason names.
+
+(defn snp-psc-op [] :i64
+  ;; Private = 1, Shared = 2 -- the encodings the GHCB PSC entry carries.
+  1)
+
+(defn psc-err-name [err :i64] [:result :i64 :string]
+  ;; Firmware/PSC error codes (AMD 24593 table 65): refuse by name, never
+  ;; by falling back to a generic failure that hides which clause broke.
+  (cond
+    (= err 0)
+    (result-ok-of [:result :i64 :string] 0)
+
+    (= err 1)  ;; PSC_NOT_HOST
+    (result-err-of [:result :i64 :string] "snp/psc-not-host")
+
+    (= err 2)  ;; PSC_NOT_PAGE_ALIGNED
+    (result-err-of [:result :i64 :string] "snp/psc-not-page-aligned")
+
+    (= err 3)  ;; PSC_NOT_IN_CLOSURE
+    (result-err-of [:result :i64 :string] "snp/psc-not-in-closure")
+
+    (= err 4)  ;; PSC_NOT_PRIVATE
+    (result-err-of [:result :i64 :string] "snp/psc-not-private")
+
+    (= err 5)  ;; PSC_NOT_SHARED
+    (result-err-of [:result :i64 :string] "snp/psc-not-shared")
+
+    (= err 6)  ;; PSC_PAGE_OWNED_BY_OTHERS
+    (result-err-of [:result :i64 :string] "snp/psc-page-owned-by-others")
+
+    (= err 7)  ;; PSC_PAGE_NOT_OWNED
+    (result-err-of [:result :i64 :string] "snp/psc-page-not-owned")
+
+    (= err 8)  ;; PSC_PAGE_NOT_GUEST
+    (result-err-of [:result :i64 :string] "snp/psc-page-not-guest")
+
+    (= err 16) ;; PSC_NO_ENCRYPT / decommissioned state
+    (result-err-of [:result :i64 :string] "snp/psc-not-guest-encrypted")
+
+    :else
+    (result-err-of [:result :i64 :string] "snp/psc-unknown-code")))
+
+(defn tdx-page-type [kind :i64] [:result :i64 :string]
+  ;; GPCM page kinds the TDH.MEM.* operates on; a caller passing a kind
+  ;; this monitor does not model is refused by name.
+  (cond
+    (= kind 1)
+    (result-ok-of [:result :i64 :string] 1)   ;; private, encrypted
+    (= kind 2)
+    (result-ok-of [:result :i64 :string] 2)   ;; shared
+    :else
+    (result-err-of [:result :i64 :string] "tdvmcall/unknown-page-kind")))
+
+;; ---------------------------------------------------------------------------
+;; TDVMCALL / VMGEXIT dispatch. The monitor maps the exit reason to an
+;; action id; the mechanism then reads kvm_run for the operands. Unknown
+;; reason is refused, never guessed.
+
+(defn tdvmcall-action [reason :i64] [:result :i64 :string]
+  (cond
+    (= reason 1)
+    (result-ok-of [:result :i64 :string] 1)   ;; map-gpa
+    (= reason 2)
+    (result-ok-of [:result :i64 :string] 2)   ;; io (IN/OUT via TDVMCALL)
+    (= reason 3)
+    (result-ok-of [:result :i64 :string] 3)   ;; get-quote
+    (= reason 4)
+    (result-ok-of [:result :i64 :string] 4)   ;; setup-event-notify
+    :else
+    (result-err-of [:result :i64 :string] "tdvmcall/unknown-reason")))
+
+;; ---------------------------------------------------------------------------
+;; Port-I/O. Inside a TDX or SNP VM the guest's IN/OUT become a hypercall;
+;; the monitor's decision is whether the port is a device it will emulate
+;; or a trap-and-replay it will refuse. Serial and virtio-mmio/pci are the
+;; devices the arm64 tender already models; PM timer ports are refused so
+;; a mis-planned guest fails loudly rather than reading a fake timer.
+
+(defn portio-verdict [port :i64 len :i64] [:result :i64 :string]
+  (cond
+    (not (or (= len 1) (= len 2) (= len 4)))
+    (result-err-of [:result :i64 :string] "portio/bad-width")
+
+    (and (>= port 1013) (<= port 1015))   ;; 0x3F5..0x3F7 floppy/fd ctrl
+    (result-err-of [:result :i64 :string] "portio/unmodeled-device")
+
+    (and (>= port 1016) (<= port 1023))   ;; 0x3F8..0x3FF serial
+    (result-ok-of [:result :i64 :string] 1)
+
+    (and (>= port 0x5000) (< port (+ 0x5000 4096)))
+    (result-ok-of [:result :i64 :string] 2)  ;; virtio-pci modern BAR
+
+    :else
+    (result-err-of [:result :i64 :string] "portio/unmodeled-device")))
+
+;; ---------------------------------------------------------------------------
+;; LAUNCH ADMISSION. One packed value; bit 0 clear means refuse.
+
+(defn admit-tdx-guest [kvm-tdx-ok :i64 tdvf-present :i64 cpu-leaf-21 :i64
+                       adapter-bit :i64]
+  [:result :i64 :string]
+  (cond
+    (not (= kvm-tdx-ok 1))
+    (result-err-of [:result :i64 :string] "tdx/kvm-capabilities-absent")
+
+    (not (= tdvf-present 1))
+    (result-err-of [:result :i64 :string] "tdx/tdvf-image-absent")
+
+    (not (= cpu-leaf-21 1))
+    (result-err-of [:result :i64 :string] "tdx/cpuid-leaf-21-not-virtualised")
+
+    (not (= adapter-bit 1))
+    (result-err-of [:result :i64 :string] "tdx/cpuid-indirect-adapter-absent")
+
+    :else
+    (result-ok-of [:result :i64 :string]
+                  (+ (tdx-admit) (tdx-tdvf-bit)))))
+
+(defn snp-policy-bounds [policy :i64] :i64
+  ;; Accept every field defined by AMD 56860 Rev. 1.59 (bits 25:0),
+  ;; reject reserved bits 63:26, and require reserved bit 17 to be one.
+  ;; Firmware remains responsible for enforcing the requested ABI version
+  ;; and feature support; this gate only validates the word's shape.
+  ;;
+  ;; Return 1/0, not a :bool: KIR comparison ops return i64 and the caller
+  ;; consumes the same integer verdict on every supported runtime.
+  (let [known (snp-policy-known-mask)
+        required-one (snp-policy-reserved-one-bit)]
+    (if (= policy (bit-and policy known))
+      (if (= (bit-and policy required-one) required-one) 1 0)
+      0)))
+
+(defn admit-snp-guest [kvm-snp-ok :i64 ovmf-present :i64 cpu-sev-bit :i64
+                       snp-bit :i64 policy :i64]
+  [:result :i64 :string]
+  (cond
+    (not (= kvm-snp-ok 1))
+    (result-err-of [:result :i64 :string] "snp/kvm-capabilities-absent")
+
+    (not (= ovmf-present 1))
+    (result-err-of [:result :i64 :string] "snp/ovmf-amdsev-absent")
+
+    (not (= cpu-sev-bit 1))
+    (result-err-of [:result :i64 :string] "snp/cpuid-sev-bit-not-virtualised")
+
+    (not (= snp-bit 1))
+    (result-err-of [:result :i64 :string] "snp/cpuid-snp-bit-not-virtualised")
+
+    (not (= (snp-policy-bounds policy) 1))
+    (result-err-of [:result :i64 :string] "snp/policy-bits-outside-mask")
+
+    :else
+    (result-ok-of [:result :i64 :string]
+                  (+ (snp-admit) (snp-fw-bit)))))
+
+;; Which profile a booted guest self-reports as: the monitor derives it
+;; from the leaves it virtualised plus the firmware image it mapped.
+(defn launch-variant [profile :i64] [:result :i64 :string]
+  (cond
+    (= profile 1)
+    (result-ok-of [:result :i64 :string] 1)   ;; TDX
+    (= profile 2)
+    (result-ok-of [:result :i64 :string] 2)   ;; SEV-SNP
+    :else
+    (result-err-of [:result :i64 :string] "launch/unknown-variant")))
+
+;; The SNP guest-request message the monitor must expect on the report
+;; path: the GHCB supplies an SNP_..._REPORT request with the message
+;; version and request type pinned; the monitor refuses a request whose
+;; declared size does not match the fixed body.
+(defn snp-get-report-req [declared-size :i64] [:result :i64 :string]
+  (cond
+    (< declared-size (snp-report-min-bytes))
+    (result-err-of [:result :i64 :string] "snp/report-size-below-minimum")
+    :else
+    (result-ok-of [:result :i64 :string] declared-size)))

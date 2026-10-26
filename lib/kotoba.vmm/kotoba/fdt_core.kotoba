@@ -1,0 +1,305 @@
+(ns fdt-core
+  (:export [fdt-magic fdt-version fdt-last-comp
+            fdt-header-bytes fdt-rsvmap-bytes off-mem-rsvmap off-dt-struct
+            size-dt-strings
+            str-address-cells str-size-cells str-device-type str-reg
+            str-bootargs str-initrd-start str-initrd-end str-compatible
+            str-enable-method str-method str-interrupt-cells
+            str-interrupt-controller            str-phandle str-interrupts
+            str-always-on str-redistributor-regions
+            str-interrupt-parent str-clocks str-clock-names
+            str-clock-frequency str-clock-cells str-stdout-path
+            struct-words-pl031
+            hex-digits name-words
+            struct-words-root struct-words-chosen struct-words-memory
+            struct-words-cpus struct-words-cpu struct-words-psci
+            struct-words-intc struct-words-timer struct-words-pl011
+            struct-words-virtio struct-words-end
+            struct-words size-dt-struct off-dt-strings totalsize
+            max-blob-bytes
+            admit-bootargs admit-virtio-names admit-ram-name
+            admit-blob]))
+
+;; Devicetree (FDT) construction for the arm64 Linux guest, as decisions.
+;;
+;; Source of truth for the rules: the DevTreeBlob Format Specification
+;; (DTSpec) v0.4 -- the 40-byte header (magic 0xd00dfeed at word 0,
+;; `totalsize`, `off_dt_struct`, `off_dt_strings`, `off_mem_rsvmap`,
+;; version 17 / last_comp_version 16), the 8-byte-aligned memory reservation
+;; block, the token stream of the structure block (FDT_BEGIN_NODE 1,
+;; FDT_END_NODE 2, FDT_PROP 3, FDT_NOP 4, FDT_END 9; u32 big-endian), and
+;; the NUL-terminated strings block. The 2 MiB ceiling on the blob is the
+;; arm64 boot protocol (booting.rst), the same rule arm64-boot enforces on
+;; the other side.
+;;
+;; This file decides the LAYOUT: every size, offset, alignment and name
+;; offset of one fixed template -- root, chosen, memory, cpus/cpu, psci,
+;; intc (GICv3), timer, pl011 and N virtio_mmio nodes over the QEMU `virt`
+;; map (the map `exit-core` classifies against; the call path passes those
+;; addresses in, so the two cores never hold two copies of the map). The
+;; host call path (`vmm.fdt/build`) marshals: it writes the tokens of that
+;; template at the offsets computed here and formats hex unit-addresses.
+;; It decides nothing.
+;;
+;; Errors are values -- `[:result T E]` with a pinned reason literal, never
+;; a throw (root AGENTS.md; same contract as the other cores).
+;;
+;; Host call path: vmm.fdt/build.
+;; Gate: test/vmm/fdt_test.cljk (builds a blob and parses it back).
+
+;; ---------------------------------------------------------------------------
+;; Header and block constants (DTSpec table 5.1)
+
+(defn fdt-magic [] :i64 3490578157)     ;; 0xd00dfeed, big-endian on the wire
+(defn fdt-version [] :i64 17)
+(defn fdt-last-comp [] :i64 16)
+(defn fdt-header-bytes [] :i64 40)
+(defn fdt-rsvmap-bytes [] :i64 16)      ;; one all-zero terminator pair
+
+(defn off-mem-rsvmap [] :i64
+  ;; Right after the header; 40 is 8-aligned, which the block requires.
+  (fdt-header-bytes))
+
+(defn off-dt-struct [] :i64
+  (+ (off-mem-rsvmap) (fdt-rsvmap-bytes)))
+
+(defn max-blob-bytes [] :i64 2097152)   ;; booting.rst: DTB <= 2 MiB
+
+;; ---------------------------------------------------------------------------
+;; The strings block. Offsets are data pinned here, one copy only.
+
+(defn str-address-cells [] :i64 0)      ;; "#address-cells\0"      15 bytes
+(defn str-size-cells [] :i64 15)        ;; "#size-cells\0"         12 bytes
+(defn str-device-type [] :i64 27)       ;; "device_type\0"         12 bytes
+(defn str-reg [] :i64 39)               ;; "reg\0"                  4 bytes
+(defn str-bootargs [] :i64 43)          ;; "bootargs\0"             9 bytes
+(defn str-initrd-start [] :i64 52)      ;; "linux,initrd-start\0"  19 bytes
+(defn str-initrd-end [] :i64 71)        ;; "linux,initrd-end\0"    17 bytes
+(defn str-compatible [] :i64 88)        ;; "compatible\0"          11 bytes
+(defn str-enable-method [] :i64 99)     ;; "enable-method\0"       14 bytes
+(defn str-method [] :i64 113)           ;; "method\0"               7 bytes
+(defn str-interrupt-cells [] :i64 120)  ;; "#interrupt-cells\0"    17 bytes
+(defn str-interrupt-controller [] :i64 137) ;; "interrupt-controller\0" 21 bytes
+(defn str-phandle [] :i64 158)          ;; "phandle\0"              8 bytes
+(defn str-interrupts [] :i64 166)       ;; "interrupts\0"          11 bytes
+(defn str-always-on [] :i64 177)        ;; "always-on\0"           10 bytes
+(defn str-redistributor-regions [] :i64 187) ;; "#redistributor-regions\0" 23 bytes
+(defn str-interrupt-parent [] :i64 210)  ;; "interrupt-parent\0"     17 bytes
+(defn str-clocks [] :i64 227)           ;; "clocks\0"                7 bytes
+(defn str-clock-names [] :i64 234)      ;; "clock-names\0"          12 bytes
+(defn str-clock-frequency [] :i64 246)  ;; "clock-frequency\0"      16 bytes
+(defn str-clock-cells [] :i64 262)      ;; "#clock-cells\0"         13 bytes
+(defn str-stdout-path [] :i64 275)      ;; "stdout-path\0"          12 bytes
+
+(defn size-dt-strings [] :i64 287)
+
+;; ---------------------------------------------------------------------------
+;; Name widths. A node name is NUL-terminated and padded to 4 bytes.
+
+(defn name-words [chars :i64] :i64
+  ;; Words for one FDT_BEGIN_NODE: the token word plus the NUL-terminated
+  ;; name padded to 4 bytes. `chars` excludes the NUL.
+  (+ 1 (quot (+ chars 4) 4)))
+
+(defn hex-digits [x :i64] :i64
+  ;; Minimum hex digits for a non-negative address -- the width of the
+  ;; unit-address the host formats into a node name. n digits cover
+  ;; x < 16^n, so the boundaries are powers of 2^4. Written as nested
+  ;; halves because this target admits only i64 arithmetic (no log).
+  ;;
+  ;; 0 means "wider than this core emits": the shipped artifact is EDN and
+  ;; `kotoba.lang.edn` refuses any integer literal outside +/-2^53
+  ;; ("EDN number would not mean the same on every host", measured
+  ;; 2026-10-19), so no constant above 2^48 may appear here, and an
+  ;; address at or past 2^48 is refused by the admissions rather than
+  ;; mis-sized. 48-bit guest-physical is what the boot plan works with.
+  (if (< x 4294967296)                     ;; < 2^32 -> digits 1..8
+    (if (< x 65536)                        ;; < 2^16 -> digits 1..4
+      (if (< x 256)                        ;; < 2^8 -> digits 1..2
+        (if (< x 16) 1 2)                  ;; < 2^4
+        (if (< x 4096) 3 4))               ;; < 2^12
+      (if (< x 16777216)                   ;; < 2^24 -> digits 5..6
+        (if (< x 1048576) 5 6)             ;; < 2^20
+        (if (< x 268435456) 7 8)))         ;; < 2^28
+    (if (< x 281474976710656)              ;; < 2^48 -> digits 9..12
+      (if (< x 1099511627776)              ;; < 2^40 -> digits 9..10
+        (if (< x 68719476736) 9 10)        ;; < 2^36
+        (if (< x 17592186044416) 11 12))   ;; < 2^44
+      0)))
+
+;; ---------------------------------------------------------------------------
+;; Structure-block word counts, one function per template region.
+;; Every value below is the template: root, chosen, memory, cpus, cpu, psci,
+;; intc, timer, pl011, then `virtio-count` virtio_mmio nodes, then FDT_END.
+
+(defn words-bootargs [bootargs-bytes :i64] :i64
+  ;; FDT_PROP value, NUL included by the caller, padded to 4 bytes.
+  (quot (+ bootargs-bytes 3) 4))
+
+(defn struct-words-root [] :i64
+  ;; BEGIN_NODE "" (2) + #address-cells prop (4) + #size-cells prop (4)
+  ;; + interrupt-parent prop (4) + the root's END_NODE (1). The
+  ;; interrupt-parent property is what resolves the timer's PPIs (measured
+  ;; 2026-10-19: without it `arch_timer: No interrupt available` and the
+  ;; guest loses its tick source).
+  15)
+
+(defn struct-words-chosen [bootargs-bytes :i64] :i64
+  ;; BEGIN_NODE "chosen" (3) + bootargs prop (3 + value) + initrd-start
+  ;; (5) + initrd-end (5) + stdout-path prop (7 bytes -> 2 value words -> 5)
+  ;; + END_NODE (1).
+  (+ 22 (words-bootargs bootargs-bytes)))
+
+(defn struct-words-memory [ram-base :i64] :i64
+  ;; BEGIN_NODE "memory@<hex ram-base>": token + 7 + digits chars + NUL,
+  ;; padded; device_type="memory" (2 value words -> 5) + reg of two u64 (7)
+  ;; + END_NODE (1).
+  (+ (name-words (+ 7 (hex-digits ram-base))) 13))
+
+(defn struct-words-cpus [] :i64
+  ;; BEGIN_NODE "cpus" (3) + #address-cells (4) + #size-cells (4)
+  ;; + END_NODE (1).
+  12)
+
+(defn struct-words-cpu [] :i64
+  ;; BEGIN_NODE "cpu" (2) + device_type="cpu" (4)
+  ;; + compatible="arm,arm-v8" (6) + reg=<0> (4) + enable-method="psci" (5)
+  ;; + END_NODE (1).
+  22)
+
+(defn struct-words-psci [] :i64
+  ;; BEGIN_NODE "psci" (3) + compatible="arm,psci-1.0" (7)
+  ;; + method="hvc" (4) + END_NODE (1).
+  15)
+
+(defn struct-words-intc [] :i64
+  ;; BEGIN_NODE "intc" (3) + compatible="arm,gic-v3" (6)
+  ;; + #interrupt-cells (4) + interrupt-controller empty (3)
+  ;; + reg of four u64 (11) + phandle (4) + #redistributor-regions (4)
+  ;; + END_NODE (1). The redistributor-regions property is what makes the
+  ;; kernel walk GICR frames (measured 2026-10-19: without it CPU0 reports
+  ;; "has no re-distributor" and the guest panics at the idle task).
+  36)
+
+(defn struct-words-timer [] :i64
+  ;; BEGIN_NODE "timer" (3) + compatible="arm,armv8-timer\0arm,armv7-timer\0"
+  ;; (8 value words -> 11) + always-on (3) + interrupts of 4 PPIs, 3 cells
+  ;; each (15) + END_NODE (1). The double string is QEMU `virt`'s own
+  ;; compatible list (dumpdtb-measured 2026-10-19).
+  33)
+
+(defn struct-words-apb-pclk [] :i64
+  ;; BEGIN_NODE "apb-pclk" (4) + compatible="fixed-clock" (6)
+  ;; + #clock-cells (4) + clock-frequency (4) + phandle (4) + END_NODE (1).
+  ;; The clock node is what lets the pl011 driver probe (measured
+  ;; 2026-10-19: without a clock provider -- or with its phandle undeclared,
+  ;; which is the same thing to the driver -- the console never binds and
+  ;; init's output vanishes).
+  23)
+
+(defn struct-words-pl011 [] :i64
+  ;; BEGIN_NODE "pl011" (3) + compatible="arm,pl011\0arm,primecell\0" (9)
+  ;; + clock-names (17 bytes -> 5 value words -> 8) + clocks of two
+  ;; phandles (8 bytes -> 2 -> 5) + reg of two u64 (7) + interrupts (6)
+  ;; + END_NODE (1).
+  39)
+
+(defn struct-words-pl031 [ram-ignored :i64] :i64
+  ;; BEGIN_NODE "pl031@9010000" (13 chars -> token + 4 words = 5)
+  ;; + compatible="arm,pl031\0arm,primecell\0" (24 bytes -> 6 -> 9)
+  ;; + clocks of one phandle (4) + clock-names "apb_pclk\0" (9 bytes -> 3
+  ;; -> 6) + reg of two u64 (7) + interrupts (6) + END_NODE (1).
+  ;; The RTC is what gives the guest a clock: without it TLS validates
+  ;; against epoch and dies with 'certificate is not yet valid'
+  ;; (measured 2026-10-19 on the murakumo fetch probe).
+  38)
+
+(defn struct-words-virtio [virtio-name-digits :i64] :i64
+  ;; BEGIN_NODE "virtio_mmio@<hex>": token + 12 + digits chars + NUL,
+  ;; padded; compatible="virtio,mmio" (6) + reg of two u64 (7)
+  ;; + interrupts (6) + END_NODE (1).
+  (+ (name-words (+ 12 virtio-name-digits)) 20))
+
+(defn struct-words-end [] :i64 1)        ;; FDT_END
+
+(defn struct-words [bootargs-bytes :i64 ram-base :i64
+                    virtio-name-digits :i64 virtio-count :i64] :i64
+  (+ (struct-words-root)
+     (struct-words-chosen bootargs-bytes)
+     (struct-words-memory ram-base)
+     (struct-words-cpus)
+     (struct-words-cpu)
+     (struct-words-psci)
+     (struct-words-intc)
+     (struct-words-timer)
+     (struct-words-apb-pclk)
+     (struct-words-pl011)
+     (struct-words-pl031 0)
+     (* virtio-count (struct-words-virtio virtio-name-digits))
+     (struct-words-end)))
+
+(defn size-dt-struct [bootargs-bytes :i64 ram-base :i64
+                      virtio-name-digits :i64 virtio-count :i64] :i64
+  (* 4 (struct-words bootargs-bytes ram-base virtio-name-digits
+                     virtio-count)))
+
+(defn off-dt-strings [bootargs-bytes :i64 ram-base :i64
+                      virtio-name-digits :i64 virtio-count :i64] :i64
+  (+ (off-dt-struct)
+     (size-dt-struct bootargs-bytes ram-base virtio-name-digits
+                     virtio-count)))
+
+(defn totalsize [bootargs-bytes :i64 ram-base :i64
+                 virtio-name-digits :i64 virtio-count :i64] :i64
+  (+ (off-dt-strings bootargs-bytes ram-base virtio-name-digits
+                     virtio-count)
+     (size-dt-strings)))
+
+;; ---------------------------------------------------------------------------
+;; Admissions. Each refusal names itself; the gate pins the literals.
+
+(defn admit-bootargs [bootargs-bytes :i64] [:result :i64 :string]
+  ;; The value length the layout is computed with. Zero would compile to a
+  ;; zero-length property and a guest with no console.
+  (if (< bootargs-bytes 2)
+    (result-err-of [:result :i64 :string] "fdt/bootargs-empty")
+    (result-ok-of [:result :i64 :string] bootargs-bytes)))
+
+(defn admit-virtio-names [first-addr :i64 last-addr :i64 virtio-count :i64]
+  [:result :i64 :string]
+  ;; Node names carry a hex unit-address, so their byte width feeds every
+  ;; offset after them. The layout arithmetic is closed-form only when all
+  ;; addresses in the range render at the same width -- a range crossing a
+  ;; power-of-16 boundary is refused rather than mis-sized. Ok payload is
+  ;; that uniform digit count.
+  (cond
+    (< virtio-count 0)
+    (result-err-of [:result :i64 :string] "fdt/virtio-count-negative")
+
+    (= virtio-count 0)
+    (result-ok-of [:result :i64 :string] 0)
+
+    (not (= (hex-digits first-addr) (hex-digits last-addr)))
+    (result-err-of [:result :i64 :string] "fdt/virtio-name-width-varies")
+
+    (= (hex-digits first-addr) 0)
+    (result-err-of [:result :i64 :string] "fdt/virtio-address-too-wide")
+
+    :else
+    (result-ok-of [:result :i64 :string] (hex-digits first-addr))))
+
+(defn admit-ram-name [ram-base :i64] [:result :i64 :string]
+  ;; The memory node is named "memory@<hex ram-base>"; an address this core
+  ;; cannot render (hex-digits returns 0) is refused, never truncated.
+  (if (= (hex-digits ram-base) 0)
+    (result-err-of [:result :i64 :string] "fdt/ram-address-too-wide")
+    (result-ok-of [:result :i64 :string] ram-base)))
+
+(defn admit-blob [blob-bytes :i64] [:result :i64 :string]
+  ;; booting.rst's 2 MiB ceiling, applied to what was actually planned.
+  (cond
+    (> blob-bytes (max-blob-bytes))
+    (result-err-of [:result :i64 :string] "fdt/blob-too-large")
+
+    :else
+    (result-ok-of [:result :i64 :string] blob-bytes)))
