@@ -230,6 +230,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.x448` | `org.ietf.x448/src` | `x448.core`, `x448.fp` (an external specification, publisher ietf.org) |
 | `gov.nist.aes` | `gov.nist.aes/src` | `aes.core`, `aes.gcm`, `aes.gcm-siv` (Kotoba project library) |
 | `gov.nist.ecc` | `gov.nist.ecc/src` | `ecc.bignum`, `ecc.curve`, `ecc.der`, `ecc.ecdh` (Kotoba project library) |
+| `kotoba.kotobaseProtocolGit` | `kotoba.kotobaseProtocolGit/src` | `kotobase.protocols.git` (Kotoba project library) |
 | `kotoba.kotobaseProtocolAtproto` | `kotoba.kotobaseProtocolAtproto/src` | `kotobase.protocols.atproto` (Kotoba project library) |
 | `kotoba.libp2p` | `kotoba.libp2p/src` | `` (Kotoba project library) |
 | `kotoba.kotobaTopology` | `kotoba.kotobaTopology/src` | `` (Kotoba project library) |
