@@ -230,6 +230,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.x448` | `org.ietf.x448/src` | `x448.core`, `x448.fp` (an external specification, publisher ietf.org) |
 | `gov.nist.aes` | `gov.nist.aes/src` | `aes.core`, `aes.gcm`, `aes.gcm-siv` (Kotoba project library) |
 | `gov.nist.ecc` | `gov.nist.ecc/src` | `ecc.bignum`, `ecc.curve`, `ecc.der`, `ecc.ecdh` (Kotoba project library) |
+| `kotoba.kotobaseProtocolPinning` | `kotoba.kotobaseProtocolPinning/src` | `kotobase.protocols.ipfs-pinning` (Kotoba project library) |
 | `kotoba.kotobaseProtocolIssues` | `kotoba.kotobaseProtocolIssues/src` | `kotobase.protocols.issue` (Kotoba project library) |
 | `kotoba.kotobaseProtocolIpfs` | `kotoba.kotobaseProtocolIpfs/src` | `kotobase.protocols.ipfs` (Kotoba project library) |
 | `kotoba.kotobaseProtocolGit` | `kotoba.kotobaseProtocolGit/src` | `kotobase.protocols.git` (Kotoba project library) |
