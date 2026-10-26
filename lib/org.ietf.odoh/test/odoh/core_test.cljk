@@ -1,0 +1,217 @@
+(ns odoh.core-test
+  "ODoH against Cloudflare's `odoh-go` vectors, and against itself.
+
+  **RFC 9230 publishes no test vectors.** What is here is a reference
+  implementation's corpus, and the distinction is kept visible: the tests that
+  use it are named for what they are.
+
+  What the corpus is good for is the strongest evidence available. It carries
+  16 `obliviousQuery` and `obliviousResponse` values that **another
+  implementation sealed**, and this one opens every one of them. That beats
+  two implementations agreeing on bytes they both computed the same wrong way.
+
+  It cannot be run the other direction: the ephemeral key is not published, so
+  the ciphertexts are not reproducible byte-for-byte. Sealing is covered by
+  round-trip instead, and that is said rather than glossed."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [hpke.core :as hpke]
+            [odoh.core :as odoh]
+            [odoh.vectors :as v]
+            [odoh.wire :as wire]))
+
+(defn- h [s] (wire/unhex s))
+(defn- x [bs] (wire/hex bs))
+
+(def ^:private vec1 (first v/vectors))
+
+(defn- configs-of [vv]
+  (let [d (wire/decode-configs (h (:odohconfigs vv)))]
+    (is (= :ok (:status d)) "the configs parse")
+    (first (:value d))))
+
+(deftest the-corpus-is-whole
+  (is (= 1 (count v/vectors)))
+  (is (= 16 v/transaction-count))
+  (is (= v/transaction-count (reduce + (map #(count (:transactions %)) v/vectors)))))
+
+(deftest configs-decode-to-what-the-vector-declares
+  (let [c (configs-of vec1)]
+    (is (= (:kem-id vec1) (:kem-id c)))
+    (is (= (:kdf-id vec1) (:kdf-id c)))
+    (is (= (:aead-id vec1) (:aead-id c)))
+    (is (some? (odoh/suite-of c)) "and this build can run that suite")
+    (testing "and re-encode to the same bytes"
+      (is (= (:odohconfigs vec1) (x (wire/encode-configs [c])))))))
+
+(deftest the-key-id-matches
+  ;; Expand(Extract("", config), "odoh key id", Nh) -- plain HKDF, not HPKE's
+  ;; labeled forms. Reaching for labeled-extract here because the neighbouring
+  ;; code uses it produces an identifier no other implementation computes, and
+  ;; the peer silently fails to find its key.
+  (let [c (configs-of vec1)
+        k (odoh/key-id c)]
+    (is (= :ok (:status k)))
+    (is (= (:key-id vec1) (x (:bytes k))))))
+
+(deftest the-seed-derives-the-published-public-key
+  (let [c (configs-of vec1)
+        kp (odoh/derive-target-key-pair (:kem-id c) (h (:public-key-seed vec1)))]
+    (is (= :ok (:status kp)))
+    (is (= (x (:public-key c)) (x (:public kp))))))
+
+(deftest this-opens-what-cloudflare-sealed
+  ;; Sixteen queries and sixteen responses, none of them produced here.
+  (let [c (configs-of vec1)
+        kp (odoh/derive-target-key-pair (:kem-id c) (h (:public-key-seed vec1)))]
+    (doseq [[i t] (map-indexed vector (:transactions vec1))]
+      (testing (str "transaction " i)
+        (let [q (odoh/decrypt-query c kp (h (:oblivious-query t)))]
+          (is (= :ok (:status q)) "the query opens")
+          (is (= (:query t) (x (:dns-message q))) "and is the published query")
+          (is (= (:query-padding t) (:padding-length q)) "with the published padding")
+          (is (= (:key-id vec1) (x (:key-id q))) "addressed to this config")
+
+          (let [r (odoh/decrypt-response c (:context q) (:query-plaintext q)
+                                         (h (:oblivious-response t)))]
+            (is (= :ok (:status r)) "the response opens")
+            (is (= (:response t) (x (:dns-message r))) "and is the published response")
+            (is (= (:response-padding t) (:padding-length r)))))))))
+
+(deftest the-response-is-bound-to-its-own-query
+  ;; The response key is derived from the query plaintext. So a response
+  ;; prepared for one query cannot be attached to another -- which is a
+  ;; property of the construction, and this is what it looks like from
+  ;; outside.
+  (let [c (configs-of vec1)
+        kp (odoh/derive-target-key-pair (:kem-id c) (h (:public-key-seed vec1)))
+        [t0 t1] (:transactions vec1)
+        q0 (odoh/decrypt-query c kp (h (:oblivious-query t0)))
+        q1 (odoh/decrypt-query c kp (h (:oblivious-query t1)))]
+    (is (= :ok (:status q0)))
+    (is (= :ok (:status q1)))
+    (testing "the matching pair opens"
+      (is (= :ok (:status (odoh/decrypt-response c (:context q0) (:query-plaintext q0)
+                                                 (h (:oblivious-response t0)))))))
+    (testing "the other query's plaintext does not"
+      (is (= :authentication-failed
+             (:reason (odoh/decrypt-response c (:context q0) (:query-plaintext q1)
+                                             (h (:oblivious-response t0)))))))
+    (testing "nor does the other query's context"
+      (is (= :authentication-failed
+             (:reason (odoh/decrypt-response c (:context q1) (:query-plaintext q0)
+                                             (h (:oblivious-response t0)))))))))
+
+;; ── round-trip, which is what covers sealing ────────────────────────────────
+
+(deftest a-full-exchange-round-trips
+  (let [c (configs-of vec1)
+        kp (odoh/derive-target-key-pair (:kem-id c) (h (:public-key-seed vec1)))
+        s (odoh/suite-of c)
+        eph (odoh/derive-target-key-pair (:kem-id c) (vec (repeat 32 7)))
+        dns-q (h "abcdef0123456789")
+        dns-r (h "fedcba9876543210aa")
+        resp-nonce (vec (repeat (max (:nn s) (:nk s)) 3))]
+    (doseq [qpad [0 32 96] rpad [0 64 404]]
+      (testing (str "padding " qpad "/" rpad)
+        (let [sent (odoh/encrypt-query c dns-q qpad eph)]
+          (is (= :ok (:status sent)))
+          (let [got (odoh/decrypt-query c kp (:bytes sent))]
+            (is (= :ok (:status got)))
+            (is (= dns-q (:dns-message got)))
+            (is (= qpad (:padding-length got)))
+            (let [rep (odoh/encrypt-response c (:context got) (:query-plaintext got)
+                                             dns-r rpad resp-nonce)]
+              (is (= :ok (:status rep)))
+              (let [opened (odoh/decrypt-response c (:context sent) (:query-plaintext sent)
+                                                  (:bytes rep))]
+                (is (= :ok (:status opened)))
+                (is (= dns-r (:dns-message opened)))
+                (is (= rpad (:padding-length opened)))))))))))
+
+(deftest the-two-sides-derive-the-same-response-key
+  ;; The client keeps the context and the query plaintext; the target
+  ;; recomputes both from what it received. If they diverged, the round-trip
+  ;; above would fail -- so this asserts the reason directly rather than
+  ;; leaving it implied.
+  (let [c (configs-of vec1)
+        kp (odoh/derive-target-key-pair (:kem-id c) (h (:public-key-seed vec1)))
+        eph (odoh/derive-target-key-pair (:kem-id c) (vec (repeat 32 11)))
+        sent (odoh/encrypt-query c (h "1122") 8 eph)
+        got (odoh/decrypt-query c kp (:bytes sent))]
+    (is (= (:query-plaintext sent) (:query-plaintext got))
+        "the target reconstructs the exact plaintext the client encoded")
+    (is (= (x (hpke/export (:context sent) odoh/response-label 16))
+           (x (hpke/export (:context got) odoh/response-label 16)))
+        "and exports the same secret from its side of the HPKE context")))
+
+;; ── refusals ────────────────────────────────────────────────────────────────
+
+(deftest malformed-input-is-refused-by-reason
+  (let [c (configs-of vec1)
+        kp (odoh/derive-target-key-pair (:kem-id c) (h (:public-key-seed vec1)))
+        t (first (:transactions vec1))
+        q (h (:oblivious-query t))]
+
+    (testing "a response where a query is expected"
+      (is (= :not-a-query
+             (:reason (odoh/decrypt-query c kp (h (:oblivious-response t)))))))
+
+    (testing "an unknown message type"
+      (is (= :unknown-message-type
+             (:reason (odoh/decrypt-query c kp (assoc (vec q) 0 0x09))))))
+
+    (testing "a tampered ciphertext"
+      (let [broken (assoc (vec q) (dec (count q)) (bit-xor 1 (last q)))]
+        (is (= :authentication-failed (:reason (odoh/decrypt-query c kp broken))))))
+
+    (testing "a truncated message"
+      (is (= :length-past-end (:reason (odoh/decrypt-query c kp (subvec (vec q) 0 40))))))
+
+    (testing "trailing bytes after a complete message"
+      (is (= :trailing-bytes (:reason (odoh/decrypt-query c kp (conj (vec q) 0))))))
+
+    (testing "an encrypted_message too short to hold an encapsulation"
+      (let [short-msg (wire/encode-message {:message-type wire/query-type
+                                            :key-id (h (:key-id vec1))
+                                            :encrypted-message (vec (repeat 8 0))})]
+        (is (= :encrypted-message-too-short (:reason (odoh/decrypt-query c kp short-msg))))))
+
+    (testing "a config naming a suite this build cannot run"
+      (is (= :unsupported-suite
+             (:reason (odoh/decrypt-query (assoc c :aead-id 0x9999) kp q)))))
+
+    (testing "a response nonce of the wrong length"
+      (let [got (odoh/decrypt-query c kp q)]
+        (is (= :bad-response-nonce-length
+               (:reason (odoh/encrypt-response c (:context got) (:query-plaintext got)
+                                               (h "aabb") 0 (vec (repeat 15 0))))))))))
+
+(deftest padding-must-be-zero
+  ;; RFC 9230 §6.1 says it MUST be. A decoder that does not check turns the
+  ;; padding into a covert channel a target could vary per client.
+  (is (= :non-zero-padding
+         (:reason (wire/decode-plaintext
+                   (vec (concat (wire/opaque16! [1 2 3]) [0 2 0 1]))))))
+  (is (= :ok (:status (wire/decode-plaintext
+                       (vec (concat (wire/opaque16! [1 2 3]) [0 2 0 0])))))))
+
+(deftest configs-with-an-unknown-version-are-skipped-not-rejected
+  ;; RFC 9230 §5: a client MUST ignore a config with a version it does not
+  ;; support. Refusing the whole list would make offering a future version a
+  ;; breaking change -- so the count of skipped ones is reported instead, and
+  ;; a client that finds nothing usable can say which case it is in.
+  (let [c (configs-of vec1)
+        good (wire/encode-config c)
+        future- (vec (concat (wire/u16 0x0099) (wire/u16 3) [1 2 3]))
+        both (wire/opaque16! (vec (concat future- good)))]
+    (let [d (wire/decode-configs both)]
+      (is (= :ok (:status d)))
+      (is (= 1 (count (:value d))))
+      (is (= 1 (:skipped d)))
+      (is (= (:public-key c) (:public-key (first (:value d))))))
+    (testing "and a list of only unknown versions is not an error either"
+      (let [only-future (wire/opaque16! future-)
+            d (wire/decode-configs only-future)]
+        (is (= :ok (:status d)))
+        (is (empty? (:value d)))
+        (is (= 1 (:skipped d)))))))
