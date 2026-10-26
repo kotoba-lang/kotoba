@@ -1,0 +1,851 @@
+(ns kotoba.kir.interp-corpus
+  "Shared by interp_diff and interp_lower_diff: EDN of a host value, the host oracle
+  outcome of a module, and the corpus (sema test strings, generated programs,
+  hand-written probes). Run with the test directory on the classpath."
+  (:require ["node:fs" :as fs]
+            [cljs.reader]
+            [clojure.string :as str]
+            [kotoba.sema :as sema]
+            [kotoba.kir :as kir]))
+
+(defn ->edn [x]
+  (cond
+    (nil? x) "nil"
+    (boolean? x) (str x)
+    (integer? x) (str x)
+    (and (exists? js/BigInt) (= js/BigInt (.-constructor x))) (str x)
+    (string? x) (pr-str x)
+    (keyword? x) (str x)
+    (symbol? x) (str x)
+    (seq? x) (str "(" (str/join " " (map ->edn x)) ")")
+    (vector? x) (str "[" (str/join " " (map ->edn x)) "]")
+    (set? x) (str "#{" (str/join " " (map ->edn x)) "}")
+    (map? x) (str "{" (str/join " " (mapcat (fn [[k v]] [(->edn k) (->edn v)]) x)) "}")
+    :else (throw (ex-info "no-edn" {:x (pr-str x)}))))
+
+;; ---- host side ----
+
+(defn trap-name [e]
+  (loop [x e]
+    (when x
+      (let [t (:trap (ex-data x))]
+        (cond t (subs (str t) 1)
+              :else (recur (.-cause x)))))))
+
+(defn fmt-value
+  "V:<hi>:<lo> (arithmetic high word, unsigned low word): the Kotoba route cannot
+  print an i64 minimum with string-from-i64, so values are compared in halves."
+  [v]
+  (if (boolean? v)
+    (str "B:" v)
+    (let [b (js/BigInt v)
+          lo (js/BigInt.asUintN 32 b)
+          hi (/ (- b lo) (js/BigInt 4294967296))]
+      (str "V:" hi ":" lo))))
+
+(defn host-outcome
+  "V:/B:/T: for a module host `lower` oracles, nil when it does not (or rejects).
+  X when the oracle run itself throws an error that names no trap (a value check
+  of kotoba.kir.value): `lower` refuses the module, so the Kotoba side must answer
+  a non-resource trap (or N), never a value."
+  [hir fuel frames]
+  (try
+    (let [r (kir/lower hir {:oracle-fuel fuel :oracle-frames frames})]
+      (cond (some? (:oracle-value r)) (fmt-value (:oracle-value r))
+            (:oracle-inconclusive r) (str "T:" (subs (str (:oracle-inconclusive r)) 1))
+            :else nil))
+    (catch :default e
+      (if-let [t (trap-name e)]
+        (str "T:" t)
+        ;; a value check of the run (kotoba.kir.value throws {:phase :value})
+        (when (loop [x e] (cond (nil? x) false (= :value (:phase (ex-data x))) true :else (recur (.-cause x))))
+          "X")))))
+
+(def resource-traps #{"T:budget/fuel" "T:budget/cells" "T:budget/bytes" "T:budget/frames" "T:host/stack-exhausted"})
+
+(defn agree?
+  "The Kotoba outcome GOT answers the host outcome EXP."
+  [exp got]
+  (or (= exp got)
+      (and (= exp "X") (string? got) (str/starts-with? got "T:") (not (resource-traps got)))))
+
+(def ported-ops
+  '#{let if do arena-scope bool-not + - * quot bit-xor bit-and bit-or min max = < > <= >=
+     bit-not i64-shift-left i64-shift-right u64-shift-right i32-wrap u32-wrap i32-wrapping-add
+     i32-wrapping-mul i32-xor i32-shift-left i32-shift-right u32-shift-right xorshift32
+     string-byte-length string-length string-concat string=? string-substring string-code-point-at
+     string-from-i64 string-contains? string-index-of string-replace-all string-split-count
+     string-compare string-fold-ascii string-index-of-from
+     option-some-of option-none-of option-some?-of option-value-of option-match result-ok-of
+     result-err-of result-ok?-of result-value-of result-error-of result-match-of typed-list-new
+     typed-list-conj typed-list-nth vector-new vector-count vector-at vector-get vector-drop
+     vector-take vector-alloc vector-assoc vector-assoc! vector-conj option-some option-none
+     option-some? option-value result-ok result-err result-ok? result-value result-error
+     bytes-empty bytes-count bytes-at bytes-slice bytes-concat bytes-from-vector-i64 vector-i64-from-bytes
+     f64-from-bits f64-to-bits f64-add f64-sub f64-mul f64-div f64-min f64-max f64-neg f64-abs f64-sqrt f64-eq f64-lt f64-le f64-gt f64-ge f64-unordered f32-from-bits f32-to-bits f32-add f32-sub f32-mul f32-div f32-min f32-max f32-neg f32-abs f32-sqrt f32-eq f32-lt f32-le f32-gt f32-ge f32-unordered i64-to-f64-checked i64-to-f64-rounded f64-to-i64-checked f64-to-i64-truncating f64-to-f32-rounded f32-to-f64-exact i64-to-f32-checked i64-to-f32-rounded f32-to-i64-checked f32-to-i64-truncating
+     document-null document-bool document-i64 document-f64 document-string document-keyword document-vector document-list document-map document-count document-kind document-vector-at document-list-at document-vector-assoc document-vector-conj document-vector-drop document-vector-remove document-map-entry-at document-equal? document-contains document-get document-assoc document-dissoc document-merge document-string-value document-keyword-value document-bool-value document-i64-value document-f64-value
+     pair pair-first pair-second record-new record-get variant-new variant-match hetero-vector-new hetero-vector-at hetero-vector-assoc
+     typed-set-new typed-set-count vector-f64-new vector-f64-count vector-f64-get vector-f64-at vector-f64-drop
+     vector-f64-take vector-f64-assoc vector-f64-conj string-from-utf8 string-compare-lines string-find-byte
+     string-append-range string-find-blank string-skip-blank})
+
+(defn heads [body]
+  (->> (tree-seq coll? seq body)
+       (filter #(and (seq? %) (symbol? (first %))))
+       (map first)))
+
+(defn unported-heads [hir]
+  (let [fns (set (map :name (:functions hir)))]
+    (->> (:functions hir) (mapcat (comp heads :body))
+         (remove #(or (ported-ops %) (fns %))))))
+
+(defn slim
+  "Only what the interpreter reads: the entry and each function's name, parameters,
+  types, result, body and refinements (a smaller text to parse on the Kotoba side)."
+  [hir]
+  (cond-> {:entry (:entry hir)
+           :functions (mapv #(select-keys % [:name :params :param-types :result :body :closure-param-indexes
+                                             :i64-pair-chain-param-indexes :closure-result?])
+                            (:functions hir))}
+    (seq (:schemas hir)) (assoc :schemas (:schemas hir))))
+
+(defn oracle-module? [hir]
+  (and (:entry hir) (contains? #{:i64 :bool} (:result hir)) (every? #{:state :abort} (:effects hir))))
+
+;; ---- corpus ----
+
+(defn strings-in [file]
+  (let [text (.readFileSync fs file "utf8")]
+    (keep (fn [m] (try (js/JSON.parse (str "\"" (second m) "\"")) (catch :default _ nil)))
+          (re-seq #"\"((?:[^\"\\\\]|\\\\.)*)\"" text))))
+
+(defn try-analyze [s]
+  (or (try (sema/analyze s) (catch :default _ nil))
+      (try (sema/analyze (str s "\n(defn main [] :i64 0)")) (catch :default _ nil))))
+
+(defn corpus-hirs [dirs]
+  (let [files (mapcat (fn [d] (->> (.readdirSync fs d)
+                                   (filter #(str/ends-with? % ".cljk"))
+                                   (map #(str d "/" %))))
+                      dirs)
+        cands (->> files (mapcat strings-in)
+                   (filter #(and (str/starts-with? (str/triml %) "(") (re-find #"\(defn?\b" %)))
+                   distinct)]
+    (keep try-analyze cands)))
+
+;; ---- generated programs ----
+
+(defn make-rng [seed]
+  (let [s (atom (bit-or 1 (js/Math.abs (or seed 1))))]
+    (fn [n] ;; xorshift on 31 bits, plenty for a fuzzer
+      (let [x @s
+            x (bit-and (bit-xor x (bit-shift-left x 13)) 0x7fffffff)
+            x (bit-xor x (bit-shift-right x 17))
+            x (bit-and (bit-xor x (bit-shift-left x 5)) 0x7fffffff)]
+        (reset! s (if (zero? x) 12345 x))
+        (mod @s n)))))
+
+(def lits ["0" "1" "2" "3" "7" "10" "31" "32" "63" "64" "-1" "-2" "100" "255" "4294967295" "4294967296"
+           "9223372036854775807" "-9223372036854775807" "1000003"])
+
+(def str-lits ["" "a" "abc" "abcabc" "Hello, World" "h\u00e9llo w\u00f6rld" "\ud834\udd1e" "\ud834\udd1eab" "\u65e5\u672c\u8a9e" "aXbXc" "-" "  x  " "ABCxyz"])
+
+(declare gen-expr)
+
+(defn gen-str [rnd depth vars fns]
+  (let [pick (fn [xs] (nth xs (rnd (count xs))))
+        lit (fn [] (pr-str (pick str-lits)))]
+    (if (<= depth 0)
+      (lit)
+      (let [ss #(gen-str rnd (dec depth) vars fns)
+            ii #(if (< (rnd 3) 2) (str (rnd 12)) (gen-expr rnd (dec depth) vars fns))]
+        (case (rnd 9)
+          (0 1) (lit)
+          2 (str "(string-concat " (ss) " " (ss) ")")
+          3 (str "(string-substring " (ss) " " (ii) " " (ii) ")")
+          4 (str "(string-from-i64 " (ii) ")")
+          5 (str "(string-replace-all " (ss) " " (ss) " " (ss) ")")
+          6 (str "(string-fold-ascii " (ss) ")")
+          7 (str "(let [sv " (ss) "] (string-concat sv sv))")
+          8 (str "(if (string=? " (ss) " " (ss) ") " (ss) " " (ss) ")"))))))
+
+(defn gen-str-int [rnd depth vars fns]
+  (let [pick (fn [xs] (nth xs (rnd (count xs))))
+        ss #(gen-str rnd (max 0 (dec depth)) vars fns)
+        ii #(if (< (rnd 3) 2) (str (rnd 12)) (gen-expr rnd (dec depth) vars fns))]
+    (case (rnd 9)
+      0 (str "(string-byte-length " (ss) ")")
+      1 (str "(string-code-point-at " (ss) " " (ii) ")")
+      2 (str "(string-index-of " (ss) " " (ss) ")")
+      3 (str "(string-compare " (ss) " " (ss) ")")
+      4 (str "(if (string=? " (ss) " " (ss) ") " (ii) " " (ii) ")")
+      5 (str "(if (string-contains? " (ss) " " (ss) ") " (ii) " " (ii) ")")
+      6 (str "(string-index-of-from " (ss) " " (ss) " " (ii) ")")
+      7 (str "(string-split-count " (ss) " " (ss) ")")
+      8 (str "(string-length " (ss) ")"))))
+
+(defn gen-agg-int [rnd depth vars fns]
+  (let [ii #(if (< (rnd 3) 2) (str (- (rnd 8) 1)) (gen-expr rnd (max 0 (dec depth)) vars fns))
+        vec3 #(str "(vector-new " (ii) " " (ii) " " (ii) ")")
+        OI "[:option :i64]" RI "[:result :i64 :i64]" LI "[:list :i64]"
+        opt #(if (zero? (rnd 2)) (str "(option-some-of " OI " " (ii) ")") (str "(option-none-of " OI ")"))
+        res #(if (zero? (rnd 2)) (str "(result-ok-of " RI " " (ii) ")") (str "(result-err-of " RI " " (ii) ")"))]
+    (case (rnd 14)
+      0 (str "(vector-at " (vec3) " " (ii) ")")
+      1 (str "(vector-count (vector-conj " (vec3) " " (ii) "))")
+      2 (str "(vector-get " (vec3) " " (ii) " " (ii) ")")
+      3 (str "(vector-at (vector-assoc " (vec3) " " (ii) " " (ii) ") " (ii) ")")
+      4 (str "(vector-count (vector-drop " (vec3) " " (ii) "))")
+      5 (str "(vector-count (vector-take " (vec3) " " (ii) "))")
+      6 (str "(typed-list-nth " LI " (typed-list-conj " LI " (typed-list-new " LI " " (ii) " " (ii) ") " (ii) ") " (ii) ")")
+      7 (str "(option-value-of " OI " " (opt) " " (ii) ")")
+      8 (str "(option-match " OI " " (opt) " " (ii) " x (+ x " (ii) "))")
+      9 (str "(result-value-of " RI " " (res) " " (ii) ")")
+      10 (str "(result-error-of " RI " " (res) " " (ii) ")")
+      11 (str "(result-match-of " RI " " (res) " a (+ a " (ii) ") b (* b " (ii) "))")
+      12 (str "(if (option-some?-of " OI " " (opt) ") " (ii) " " (ii) ")")
+      13 (str "(if (result-ok?-of " RI " " (res) ") " (ii) " " (ii) ")"))))
+
+(defn gen-expr [rnd depth vars fns]
+  (let [pick (fn [xs] (nth xs (rnd (count xs))))
+        atom-expr (fn [] (if (and (seq vars) (< (rnd 10) 7)) (pick vars) (pick lits)))]
+    (if (<= depth 0)
+      (atom-expr)
+      (let [sub #(gen-expr rnd (dec depth) vars fns)
+            c (rnd 37)]
+        (case c
+          (0 1 2) (str "(" (pick ["+" "-" "*"]) " " (sub) " " (sub) ")")
+          3 (str "(" (pick ["bit-and" "bit-or" "bit-xor" "min" "max"]) " " (sub) " " (sub) ")")
+          4 (str "(quot " (sub) " " (sub) ")")
+          5 (str "(rem " (sub) " " (sub) ")")
+          6 (str "(" (pick ["i64-shift-left" "i64-shift-right" "u64-shift-right"]) " " (sub) " "
+                 (if (< (rnd 4) 3) (str (rnd 64)) (sub)) ")")
+          7 (str "(if " (str "(" (pick ["<" ">" "<=" ">=" "="]) " " (sub) " " (sub) ")") " " (sub) " " (sub) ")")
+          8 (let [v (str "v" (rnd 3))]
+              (str "(let [" v " " (sub) "] " (gen-expr rnd (dec depth) (conj vars v) fns) ")"))
+          9 (str "(bit-not " (sub) ")")
+          10 (if (seq fns)
+               (let [[f n] (pick fns)]
+                 (str "(" f " " (str/join " " (repeatedly n sub)) ")"))
+               (atom-expr))
+          11 (str "(when-not (< " (sub) " " (sub) ") " (sub) ")")
+          12 (str "(cond (< " (sub) " " (sub) ") " (sub) " (> " (sub) " 5) " (sub) " :else " (sub) ")")
+          13 (str "(mod " (sub) " " (sub) ")")
+          14 (str "(inc " (sub) ")")
+          15 (str "(dec " (sub) ")")
+          16 (str "(if (zero? " (sub) ") " (sub) " " (sub) ")")
+          17 (str "(if (and (< " (sub) " " (sub) ") (> " (sub) " 0)) " (sub) " " (sub) ")")
+          18 (str "(if (or (< " (sub) " 3) (even? " (sub) ")) " (sub) " " (sub) ")")
+          19 (str "(loop [i 0 acc " (sub) "] (if (< i " (inc (rnd 6)) ") (recur (inc i) (+ acc (* i " (sub) "))) acc))")
+          20 (str "(" (pick ["i32-wrap" "u32-wrap" "xorshift32"]) " " (sub) ")")
+          21 (str "(" (pick ["i32-wrapping-add" "i32-wrapping-mul" "i32-xor" "i32-shift-left" "i32-shift-right" "u32-shift-right"]) " "
+                  (sub) " " (if (< (rnd 3) 2) (str (rnd 32)) (sub)) ")")
+          (22 23 24 25 26 27 28 29) (gen-str-int rnd depth vars fns)
+          (30 31 32 33 34 35 36) (gen-agg-int rnd depth vars fns))))))
+
+(defn gen-program [rnd]
+  (let [nf (inc (rnd 4))
+        defs (loop [i 0 fns [] out []]
+               (if (= i nf)
+                 [fns out]
+                 (let [arity (inc (rnd 3))
+                       ps (mapv #(str "p" %) (range arity))
+                       body (gen-expr rnd (+ 1 (rnd 4)) ps fns)
+                       name (str "f" i)]
+                   (recur (inc i) (conj fns [name arity])
+                          (conj out (str "(defn " name " [" (str/join " " (map #(str % " :i64") ps)) "] :i64 " body ")"))))))
+        [fns out] defs
+        bool? (zero? (rnd 5))
+        call (fn [] (let [[f n] (nth fns (rnd (count fns)))]
+                      (str "(" f " " (str/join " " (repeatedly n #(nth lits (rnd (count lits))))) ")")))
+        main (if bool?
+               (str "(defn main [] :bool (" (nth ["<" ">" "=" "<=" ">="] (rnd 5)) " " (call) " " (call) "))")
+               (str "(defn main [] :i64 " (if (zero? (rnd 3)) (str "(+ " (call) " " (call) ")") (call)) ")"))]
+    (str (str/join "\n" out) "\n" main)))
+
+(def hand-src
+  ["(defn main [] :i64 (+ 1 2))"
+   "(defn main [] :i64 (quot 7 0))"
+   "(defn main [] :i64 (quot -9223372036854775808 -1))"
+   "(defn main [] :i64 (rem 9 0))"
+   "(defn main [] :i64 (i64-shift-left 1 64))"
+   "(defn main [] :i64 (i64-shift-right -8 1))"
+   "(defn main [] :i64 (u64-shift-right -8 1))"
+   "(defn main [] :i64 (i64-shift-left 1 -1))"
+   "(defn main [] :i64 (i32-shift-left 1 32))"
+   "(defn main [] :i64 (i32-shift-left 1 31))"
+   "(defn main [] :i64 (u32-shift-right -1 4))"
+   "(defn main [] :i64 (xorshift32 2463534242))"
+   "(defn main [] :i64 (i32-wrapping-mul 65536 65536))"
+   "(defn main [] :i64 (i32-wrapping-add 2147483647 1))"
+   "(defn main [] :i64 (* 9223372036854775807 9223372036854775807))"
+   "(defn main [] :i64 (+ 9223372036854775807 1))"
+   "(defn main [] :i64 (- -9223372036854775807 2))"
+   "(defn main [] :i64 (string-byte-length \"h\u00e9llo\"))"
+   "(defn main [] :i64 (string-byte-length (string-concat \"ab\" \"cd\")))"
+   "(defn main [] :i64 (string-code-point-at \"h\u00e9llo\" 1))"
+   "(defn main [] :i64 (string-code-point-at \"h\u00e9llo\" 2))"
+   "(defn main [] :i64 (string-code-point-at \"abc\" 3))"
+   "(defn main [] :i64 (string-byte-length (string-substring \"abcdef\" 2 4)))"
+   "(defn main [] :i64 (string-byte-length (string-substring \"abcdef\" 4 2)))"
+   "(defn main [] :i64 (string-byte-length (string-substring \"h\u00e9llo\" 2 4)))"
+   "(defn main [] :bool (string=? (string-from-i64 -42) \"-42\"))"
+   "(defn main [] :bool (string=? (string-from-i64 -9223372036854775808) \"-9223372036854775808\"))"
+   "(defn main [] :i64 (string-index-of \"h\u00e9llo w\u00f6rld\" \"w\u00f6\"))"
+   "(defn main [] :i64 (string-index-of \"abc\" \"\"))"
+   "(defn main [] :bool (string-contains? \"abc\" \"bc\"))"
+   "(defn main [] :bool (string-contains? \"abc\" \"\"))"
+   "(defn main [] :i64 (string-split-count \"a,b,c\" \",\"))"
+   "(defn main [] :i64 (string-split-count \"a,b,c\" \"\"))"
+   "(defn main [] :bool (string=? (string-replace-all \"a-b-c\" \"-\" \"++\") \"a++b++c\"))"
+   "(defn main [] :i64 (string-byte-length (string-replace-all \"abc\" \"\" \"x\")))"
+   "(defn main [] :i64 (string-compare \"abc\" \"abd\"))"
+   "(defn main [] :i64 (string-compare \"b\" \"abd\"))"
+   "(defn main [] :bool (string=? (string-fold-ascii \"ABCxyz\\u00c9\") \"abcxyz\\u00c9\"))"
+   "(defn rep [s :string n :i64] :string (if (<= n 0) s (rep (string-concat s s) (- n 1))))\n(defn main [] :i64 (string-byte-length (rep \"abcd\" 12)))"
+   "(defn rep [s :string n :i64] :string (if (<= n 0) s (rep (string-concat s s) (- n 1))))\n(defn main [] :i64 (string-byte-length (rep \"abcd\" 20)))"
+   "(defn f [s :string] :i64 (string-byte-length s))\n(defn main [] :i64 (f \"hello\"))"
+   "(defn f [s :string i :i64] :string (string-substring s i (+ i 1)))\n(defn main [] :bool (string=? (f \"hello\" 1) \"e\"))"
+   "(defn count-a [s :string] :i64 (loop [i 0 n 0] (if (>= i (string-byte-length s)) n (recur (+ i 1) (if (= (string-code-point-at s i) 97) (+ n 1) n)))))\n(defn main [] :i64 (count-a \"banana bandana\"))"
+   "(defn main [] :i64 (let [o (option-some-of [:option :i64] 5)] (if (option-some?-of [:option :i64] o) (option-value-of [:option :i64] o 0) 1)))"
+   "(defn main [] :i64 (option-value-of [:option :i64] (option-none-of [:option :i64]) 77))"
+   "(defn main [] :i64 (option-match [:option :i64] (option-some-of [:option :i64] 5) 0 x (+ x 100)))"
+   "(defn main [] :i64 (option-match [:option :i64] (option-none-of [:option :i64]) 9 x (+ x 100)))"
+   "(defn main [] :i64 (result-value-of [:result :i64 :i64] (result-ok-of [:result :i64 :i64] 4) 0))"
+   "(defn main [] :i64 (result-error-of [:result :i64 :i64] (result-err-of [:result :i64 :i64] 4) 0))"
+   "(defn main [] :i64 (result-value-of [:result :i64 :i64] (result-err-of [:result :i64 :i64] 4) 55))"
+   "(defn main [] :bool (result-ok?-of [:result :i64 :i64] (result-err-of [:result :i64 :i64] 4)))"
+   "(defn main [] :i64 (result-match-of [:result :i64 :i64] (result-err-of [:result :i64 :i64] 4) v (+ v 1) e (* e 10)))"
+   "(defn main [] :i64 (typed-list-nth [:list :i64] (typed-list-conj [:list :i64] (typed-list-new [:list :i64] 1 2 3) 9) 3))"
+   "(defn main [] :i64 (typed-list-nth [:list :i64] (typed-list-new [:list :i64] 1 2 3) 3))"
+   "(defn main [] :i64 (vector-count (typed-list-new [:list :string] \"a\" \"b\")))"
+   "(defn main [] :i64 (let [v (vector-new 1 2 3)] (+ (vector-count v) (vector-at (vector-conj v 7) 3))))"
+   "(defn main [] :i64 (vector-at (vector-new 1 2 3) 3))"
+   "(defn main [] :i64 (vector-get (vector-new 1 2 3) 5 -1))"
+   "(defn main [] :i64 (vector-get (vector-new 1 2 3) 2 -1))"
+   "(defn main [] :i64 (vector-count (vector-drop (vector-new 1 2 3) 1)))"
+   "(defn main [] :i64 (vector-at (vector-take (vector-new 1 2 3) 2) 1))"
+   "(defn main [] :i64 (vector-count (vector-take (vector-new 1 2 3) 4)))"
+   "(defn main [] :i64 (vector-at (vector-assoc (vector-new 1 2 3) 1 50) 1))"
+   "(defn main [] :i64 (vector-at (vector-alloc 4) 3))"
+   "(defn main [] :i64 (vector-count (vector-alloc -1)))"
+   "(defn main [] :i64 (let [o (option-some 5)] (if (option-some? o) (option-value o 0) 1)))"
+   "(defn main [] :i64 (let [r (result-err 6)] (if (result-ok? r) (result-value r 0) (result-error r 0))))"
+   "(defn sum [v :vector-i64] :i64 (loop [i 0 acc 0] (if (>= i (vector-count v)) acc (recur (+ i 1) (+ acc (vector-at v i))))))\n(defn main [] :i64 (sum (vector-new 4 5 6 7)))"
+   "(defn build [n :i64] :vector-i64 (loop [i 0 v (vector-new)] (if (>= i n) v (recur (+ i 1) (vector-conj v (* i i))))))\n(defn main [] :i64 (vector-at (build 10) 9))"
+   "(defn find [v :vector-i64 x :i64] [:option :i64] (loop [i 0] (if (>= i (vector-count v)) (option-none-of [:option :i64]) (if (= (vector-at v i) x) (option-some-of [:option :i64] i) (recur (+ i 1))))))\n(defn main [] :i64 (option-value-of [:option :i64] (find (vector-new 5 6 7) 7) -1))"
+   "(defn safe-div [a :i64 b :i64] [:result :i64 :i64] (if (= b 0) (result-err-of [:result :i64 :i64] -1) (result-ok-of [:result :i64 :i64] (quot a b))))\n(defn main [] :i64 (result-value-of [:result :i64 :i64] (safe-div 10 0) 99))"
+   "(defn lazy [] :i64 (quot 1 0))\n(defn main [] :i64 (option-value-of [:option :i64] (option-some-of [:option :i64] 3) (lazy)))"
+   "(defn lazy [] :i64 (quot 1 0))\n(defn main [] :i64 (option-value-of [:option :i64] (option-none-of [:option :i64]) (lazy)))"
+   "(defn names [] [:list :string] (typed-list-new [:list :string] \"a\" \"bb\" \"ccc\"))\n(defn main [] :i64 (string-byte-length (typed-list-nth [:list :string] (names) 2)))"
+   "(defn main [] :i64 (let [o (option-some-of [:option :string] \"hey\")] (option-match [:option :string] o 0 s (string-byte-length s))))"
+   "(defn main [] :i64 (- 5))"
+   "(defn main [] :i64 (min 3 -4))"
+   "(defn main [] :bool (< 1 2))"
+   "(defn main [] :bool (= 1 1))"
+   "(defn main [] :bool true)"
+   "(defn main [] :bool (not true))"
+   "(defn f [n :i64] :i64 (if (<= n 0) 0 (+ 1 (f (- n 1)))))\n(defn main [] :i64 (f 20))"
+   "(defn f [n :i64] :i64 (if (<= n 0) 0 (+ 1 (f (- n 1)))))\n(defn main [] :i64 (f 200))"
+   "(defn f [n :i64] :i64 (+ 1 (f (+ n 1))))\n(defn main [] :i64 (f 0))"
+   "(defn f [n :i64] :i64 (if (<= n 0) 0 (+ 1 (g (- n 1)))))\n(defn g [n :i64] :i64 (f n))\n(defn main [] :i64 (f 12))"
+   "(defn sum [n :i64] :i64 (loop [i 0 acc 0] (if (> i n) acc (recur (+ i 1) (+ acc i)))))\n(defn main [] :i64 (sum 100))"
+   "(defn sum [n :i64] :i64 (loop [i 0 acc 0] (if (> i n) acc (recur (+ i 1) (+ acc i)))))\n(defn main [] :i64 (sum 1500))"
+   "(defn sum [n :i64] :i64 (loop [i 0 acc 0] (if (> i n) acc (recur (+ i 1) (+ acc i)))))\n(defn main [] :i64 (+ (sum 30) (sum 40)))"
+   "(defn spin [n :i64] :i64 (loop [i 0] (if (< i n) (recur (+ i 1)) i)))\n(defn main [] :i64 (spin 2000))"
+   "(defn fib [n :i64] :i64 (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))\n(defn main [] :i64 (fib 12))"
+   "(defn even2 [n :i64] :bool (if (= n 0) true (odd2 (- n 1))))\n(defn odd2 [n :i64] :bool (if (= n 0) false (even2 (- n 1))))\n(defn main [] :bool (even2 10))"
+   "(defn p [a :i64] :bool (> a 3))\n(defn main [] :i64 (if (p 5) 1 2))"
+   "(defn p [a :i64] :bool (> a 3))\n(defn main [] :bool (p 2))"
+   "(defn main [] :i64 (let [a 1 b (+ a 1) a (* b 10)] (+ a b)))"
+   "(defn main [] :i64 (let [x 5] (do (+ x 1) (* x 2))))"
+   "(defn gcd [a :i64 b :i64] :i64 (if (= b 0) a (gcd b (rem a b))))\n(defn main [] :i64 (gcd 1071 462))"
+   "(defn main [] :i64 (bytes-count (bytes-empty)))"
+   "(defn b [] :bytes (bytes-from-vector-i64 (vector-new 9 8 7 255 0)))\n(defn main [] :i64 (bytes-count (b)))"
+   "(defn b [] :bytes (bytes-from-vector-i64 (vector-new 9 8 7 255 0)))\n(defn main [] :i64 (bytes-at (b) 3))"
+   "(defn b [] :bytes (bytes-from-vector-i64 (vector-new 9 8 7 255 0)))\n(defn main [] :i64 (bytes-at (b) 5))"
+   "(defn b [] :bytes (bytes-from-vector-i64 (vector-new 9 8 7 255 0)))\n(defn main [] :i64 (bytes-at (b) -1))"
+   "(defn b [] :bytes (bytes-from-vector-i64 (vector-new 9 8 7 255 0)))\n(defn main [] :i64 (bytes-at (bytes-slice (b) 1 3) 1))"
+   "(defn b [] :bytes (bytes-from-vector-i64 (vector-new 9 8 7 255 0)))\n(defn main [] :i64 (bytes-count (bytes-slice (b) 2 2)))"
+   "(defn b [] :bytes (bytes-from-vector-i64 (vector-new 9 8 7 255 0)))\n(defn main [] :i64 (bytes-count (bytes-slice (b) 3 2)))"
+   "(defn b [] :bytes (bytes-from-vector-i64 (vector-new 9 8 7 255 0)))\n(defn main [] :i64 (bytes-count (bytes-slice (b) 0 6)))"
+   "(defn b [] :bytes (bytes-from-vector-i64 (vector-new 9 8 7 255 0)))\n(defn main [] :i64 (bytes-count (bytes-slice (b) -1 2)))"
+   "(defn b [] :bytes (bytes-from-vector-i64 (vector-new 9 8 7 255 0)))\n(defn main [] :i64 (bytes-at (bytes-concat (b) (b)) 7))"
+   "(defn b [] :bytes (bytes-from-vector-i64 (vector-new 9 8 7 255 0)))\n(defn main [] :i64 (bytes-count (bytes-concat (b) (bytes-empty))))"
+   "(defn main [] :i64 (bytes-count (bytes-from-vector-i64 (vector-new 1 256))))"
+   "(defn main [] :i64 (bytes-count (bytes-from-vector-i64 (vector-new 1 -1))))"
+   "(defn main [] :i64 (bytes-count (bytes-from-vector-i64 (vector-new))))"
+   "(defn main [] :i64 (vector-at (vector-i64-from-bytes (bytes-from-vector-i64 (vector-new 4 5 6))) 2))"
+   "(defn main [] :i64 (vector-count (vector-i64-from-bytes (bytes-from-vector-i64 (vector-new 4 5 6)))))"
+   "(defn main [] :i64 (vector-count (vector-i64-from-bytes (bytes-empty))))"
+   "(defn sum [b :bytes] :i64 (loop [i 0 acc 0] (if (>= i (bytes-count b)) acc (recur (+ i 1) (+ acc (bytes-at b i))))))\n(defn main [] :i64 (sum (bytes-from-vector-i64 (vector-new 10 20 30 40))))"
+   "(defn rev [b :bytes] :bytes (loop [i (- (bytes-count b) 1) acc (bytes-empty)] (if (< i 0) acc (recur (- i 1) (bytes-concat acc (bytes-slice b i (+ i 1)))))))\n(defn main [] :i64 (bytes-at (rev (bytes-from-vector-i64 (vector-new 1 2 3))) 0))"
+   "(defn main [] :i64 (bytes-count 5))"
+   "(defn main [] :i64 (f64-to-bits (f64-add (f64-from-bits 4609434218613702656) (f64-from-bits 4611686018427387904))))"
+   "(defn main [] :i64 (f64-to-bits (f64-add (f64-from-bits -9223372036854775808) (f64-from-bits 0))))"
+   "(defn main [] :i64 (f64-to-bits (f64-add (f64-from-bits 0) (f64-from-bits -9223372036854775808))))"
+   "(defn main [] :i64 (f64-to-bits (f64-add (f64-from-bits 4607182418800017408) (f64-from-bits 0))))"
+   "(defn main [] :i64 (f64-to-bits (f64-add (f64-from-bits 0) (f64-from-bits 0))))"
+   "(defn main [] :i64 (f64-to-bits (f64-add (f64-from-bits 9221120237041090560) (f64-from-bits 4607182418800017408))))"
+   "(defn main [] :i64 (f64-to-bits (f64-add (f64-from-bits 9214871658872686752) (f64-from-bits 9214871658872686752))))"
+   "(defn main [] :i64 (f64-to-bits (f64-add (f64-from-bits -4610560118520545280) (f64-from-bits 4616189618054758400))))"
+   "(defn main [] :i64 (f64-to-bits (f64-sub (f64-from-bits 4609434218613702656) (f64-from-bits 4611686018427387904))))"
+   "(defn main [] :i64 (f64-to-bits (f64-sub (f64-from-bits -9223372036854775808) (f64-from-bits 0))))"
+   "(defn main [] :i64 (f64-to-bits (f64-sub (f64-from-bits 0) (f64-from-bits -9223372036854775808))))"
+   "(defn main [] :i64 (f64-to-bits (f64-sub (f64-from-bits 4607182418800017408) (f64-from-bits 0))))"
+   "(defn main [] :i64 (f64-to-bits (f64-sub (f64-from-bits 0) (f64-from-bits 0))))"
+   "(defn main [] :i64 (f64-to-bits (f64-sub (f64-from-bits 9221120237041090560) (f64-from-bits 4607182418800017408))))"
+   "(defn main [] :i64 (f64-to-bits (f64-sub (f64-from-bits 9214871658872686752) (f64-from-bits 9214871658872686752))))"
+   "(defn main [] :i64 (f64-to-bits (f64-sub (f64-from-bits -4610560118520545280) (f64-from-bits 4616189618054758400))))"
+   "(defn main [] :i64 (f64-to-bits (f64-mul (f64-from-bits 4609434218613702656) (f64-from-bits 4611686018427387904))))"
+   "(defn main [] :i64 (f64-to-bits (f64-mul (f64-from-bits -9223372036854775808) (f64-from-bits 0))))"
+   "(defn main [] :i64 (f64-to-bits (f64-mul (f64-from-bits 0) (f64-from-bits -9223372036854775808))))"
+   "(defn main [] :i64 (f64-to-bits (f64-mul (f64-from-bits 4607182418800017408) (f64-from-bits 0))))"
+   "(defn main [] :i64 (f64-to-bits (f64-mul (f64-from-bits 0) (f64-from-bits 0))))"
+   "(defn main [] :i64 (f64-to-bits (f64-mul (f64-from-bits 9221120237041090560) (f64-from-bits 4607182418800017408))))"
+   "(defn main [] :i64 (f64-to-bits (f64-mul (f64-from-bits 9214871658872686752) (f64-from-bits 9214871658872686752))))"
+   "(defn main [] :i64 (f64-to-bits (f64-mul (f64-from-bits -4610560118520545280) (f64-from-bits 4616189618054758400))))"
+   "(defn main [] :i64 (f64-to-bits (f64-div (f64-from-bits 4609434218613702656) (f64-from-bits 4611686018427387904))))"
+   "(defn main [] :i64 (f64-to-bits (f64-div (f64-from-bits -9223372036854775808) (f64-from-bits 0))))"
+   "(defn main [] :i64 (f64-to-bits (f64-div (f64-from-bits 0) (f64-from-bits -9223372036854775808))))"
+   "(defn main [] :i64 (f64-to-bits (f64-div (f64-from-bits 4607182418800017408) (f64-from-bits 0))))"
+   "(defn main [] :i64 (f64-to-bits (f64-div (f64-from-bits 0) (f64-from-bits 0))))"
+   "(defn main [] :i64 (f64-to-bits (f64-div (f64-from-bits 9221120237041090560) (f64-from-bits 4607182418800017408))))"
+   "(defn main [] :i64 (f64-to-bits (f64-div (f64-from-bits 9214871658872686752) (f64-from-bits 9214871658872686752))))"
+   "(defn main [] :i64 (f64-to-bits (f64-div (f64-from-bits -4610560118520545280) (f64-from-bits 4616189618054758400))))"
+   "(defn main [] :i64 (f64-to-bits (f64-min (f64-from-bits 4609434218613702656) (f64-from-bits 4611686018427387904))))"
+   "(defn main [] :i64 (f64-to-bits (f64-min (f64-from-bits -9223372036854775808) (f64-from-bits 0))))"
+   "(defn main [] :i64 (f64-to-bits (f64-min (f64-from-bits 0) (f64-from-bits -9223372036854775808))))"
+   "(defn main [] :i64 (f64-to-bits (f64-min (f64-from-bits 4607182418800017408) (f64-from-bits 0))))"
+   "(defn main [] :i64 (f64-to-bits (f64-min (f64-from-bits 0) (f64-from-bits 0))))"
+   "(defn main [] :i64 (f64-to-bits (f64-min (f64-from-bits 9221120237041090560) (f64-from-bits 4607182418800017408))))"
+   "(defn main [] :i64 (f64-to-bits (f64-min (f64-from-bits 9214871658872686752) (f64-from-bits 9214871658872686752))))"
+   "(defn main [] :i64 (f64-to-bits (f64-min (f64-from-bits -4610560118520545280) (f64-from-bits 4616189618054758400))))"
+   "(defn main [] :i64 (f64-to-bits (f64-max (f64-from-bits 4609434218613702656) (f64-from-bits 4611686018427387904))))"
+   "(defn main [] :i64 (f64-to-bits (f64-max (f64-from-bits -9223372036854775808) (f64-from-bits 0))))"
+   "(defn main [] :i64 (f64-to-bits (f64-max (f64-from-bits 0) (f64-from-bits -9223372036854775808))))"
+   "(defn main [] :i64 (f64-to-bits (f64-max (f64-from-bits 4607182418800017408) (f64-from-bits 0))))"
+   "(defn main [] :i64 (f64-to-bits (f64-max (f64-from-bits 0) (f64-from-bits 0))))"
+   "(defn main [] :i64 (f64-to-bits (f64-max (f64-from-bits 9221120237041090560) (f64-from-bits 4607182418800017408))))"
+   "(defn main [] :i64 (f64-to-bits (f64-max (f64-from-bits 9214871658872686752) (f64-from-bits 9214871658872686752))))"
+   "(defn main [] :i64 (f64-to-bits (f64-max (f64-from-bits -4610560118520545280) (f64-from-bits 4616189618054758400))))"
+   "(defn main [] :i64 (f64-to-bits (f64-neg (f64-from-bits 4611686018427387904))))"
+   "(defn main [] :i64 (f64-to-bits (f64-neg (f64-from-bits -4611686018427387904))))"
+   "(defn main [] :i64 (f64-to-bits (f64-neg (f64-from-bits 0))))"
+   "(defn main [] :i64 (f64-to-bits (f64-neg (f64-from-bits -9223372036854775808))))"
+   "(defn main [] :i64 (f64-to-bits (f64-neg (f64-from-bits -4616189618054758400))))"
+   "(defn main [] :i64 (f64-to-bits (f64-neg (f64-from-bits 9218868437227405312))))"
+   "(defn main [] :i64 (f64-to-bits (f64-abs (f64-from-bits 4611686018427387904))))"
+   "(defn main [] :i64 (f64-to-bits (f64-abs (f64-from-bits -4611686018427387904))))"
+   "(defn main [] :i64 (f64-to-bits (f64-abs (f64-from-bits 0))))"
+   "(defn main [] :i64 (f64-to-bits (f64-abs (f64-from-bits -9223372036854775808))))"
+   "(defn main [] :i64 (f64-to-bits (f64-abs (f64-from-bits -4616189618054758400))))"
+   "(defn main [] :i64 (f64-to-bits (f64-abs (f64-from-bits 9218868437227405312))))"
+   "(defn main [] :i64 (f64-to-bits (f64-sqrt (f64-from-bits 4611686018427387904))))"
+   "(defn main [] :i64 (f64-to-bits (f64-sqrt (f64-from-bits -4611686018427387904))))"
+   "(defn main [] :i64 (f64-to-bits (f64-sqrt (f64-from-bits 0))))"
+   "(defn main [] :i64 (f64-to-bits (f64-sqrt (f64-from-bits -9223372036854775808))))"
+   "(defn main [] :i64 (f64-to-bits (f64-sqrt (f64-from-bits -4616189618054758400))))"
+   "(defn main [] :i64 (f64-to-bits (f64-sqrt (f64-from-bits 9218868437227405312))))"
+   "(defn main [] :bool (f64-eq (f64-from-bits 4609434218613702656) (f64-from-bits 4611686018427387904)))"
+   "(defn main [] :bool (f64-eq (f64-from-bits 4611686018427387904) (f64-from-bits 4611686018427387904)))"
+   "(defn main [] :bool (f64-eq (f64-from-bits 0) (f64-from-bits -9223372036854775808)))"
+   "(defn main [] :bool (f64-eq (f64-from-bits 9221120237041090560) (f64-from-bits 9221120237041090560)))"
+   "(defn main [] :bool (f64-eq (f64-from-bits 9221120237041090560) (f64-from-bits 4607182418800017408)))"
+   "(defn main [] :bool (f64-eq (f64-from-bits 4613937818241073152) (f64-from-bits 4607182418800017408)))"
+   "(defn main [] :bool (f64-lt (f64-from-bits 4609434218613702656) (f64-from-bits 4611686018427387904)))"
+   "(defn main [] :bool (f64-lt (f64-from-bits 4611686018427387904) (f64-from-bits 4611686018427387904)))"
+   "(defn main [] :bool (f64-lt (f64-from-bits 0) (f64-from-bits -9223372036854775808)))"
+   "(defn main [] :bool (f64-lt (f64-from-bits 9221120237041090560) (f64-from-bits 9221120237041090560)))"
+   "(defn main [] :bool (f64-lt (f64-from-bits 9221120237041090560) (f64-from-bits 4607182418800017408)))"
+   "(defn main [] :bool (f64-lt (f64-from-bits 4613937818241073152) (f64-from-bits 4607182418800017408)))"
+   "(defn main [] :bool (f64-le (f64-from-bits 4609434218613702656) (f64-from-bits 4611686018427387904)))"
+   "(defn main [] :bool (f64-le (f64-from-bits 4611686018427387904) (f64-from-bits 4611686018427387904)))"
+   "(defn main [] :bool (f64-le (f64-from-bits 0) (f64-from-bits -9223372036854775808)))"
+   "(defn main [] :bool (f64-le (f64-from-bits 9221120237041090560) (f64-from-bits 9221120237041090560)))"
+   "(defn main [] :bool (f64-le (f64-from-bits 9221120237041090560) (f64-from-bits 4607182418800017408)))"
+   "(defn main [] :bool (f64-le (f64-from-bits 4613937818241073152) (f64-from-bits 4607182418800017408)))"
+   "(defn main [] :bool (f64-gt (f64-from-bits 4609434218613702656) (f64-from-bits 4611686018427387904)))"
+   "(defn main [] :bool (f64-gt (f64-from-bits 4611686018427387904) (f64-from-bits 4611686018427387904)))"
+   "(defn main [] :bool (f64-gt (f64-from-bits 0) (f64-from-bits -9223372036854775808)))"
+   "(defn main [] :bool (f64-gt (f64-from-bits 9221120237041090560) (f64-from-bits 9221120237041090560)))"
+   "(defn main [] :bool (f64-gt (f64-from-bits 9221120237041090560) (f64-from-bits 4607182418800017408)))"
+   "(defn main [] :bool (f64-gt (f64-from-bits 4613937818241073152) (f64-from-bits 4607182418800017408)))"
+   "(defn main [] :bool (f64-ge (f64-from-bits 4609434218613702656) (f64-from-bits 4611686018427387904)))"
+   "(defn main [] :bool (f64-ge (f64-from-bits 4611686018427387904) (f64-from-bits 4611686018427387904)))"
+   "(defn main [] :bool (f64-ge (f64-from-bits 0) (f64-from-bits -9223372036854775808)))"
+   "(defn main [] :bool (f64-ge (f64-from-bits 9221120237041090560) (f64-from-bits 9221120237041090560)))"
+   "(defn main [] :bool (f64-ge (f64-from-bits 9221120237041090560) (f64-from-bits 4607182418800017408)))"
+   "(defn main [] :bool (f64-ge (f64-from-bits 4613937818241073152) (f64-from-bits 4607182418800017408)))"
+   "(defn main [] :bool (f64-unordered (f64-from-bits 4609434218613702656) (f64-from-bits 4611686018427387904)))"
+   "(defn main [] :bool (f64-unordered (f64-from-bits 4611686018427387904) (f64-from-bits 4611686018427387904)))"
+   "(defn main [] :bool (f64-unordered (f64-from-bits 0) (f64-from-bits -9223372036854775808)))"
+   "(defn main [] :bool (f64-unordered (f64-from-bits 9221120237041090560) (f64-from-bits 9221120237041090560)))"
+   "(defn main [] :bool (f64-unordered (f64-from-bits 9221120237041090560) (f64-from-bits 4607182418800017408)))"
+   "(defn main [] :bool (f64-unordered (f64-from-bits 4613937818241073152) (f64-from-bits 4607182418800017408)))"
+   "(defn main [] :i64 (f64-to-bits (f64-from-bits 4609434218613702656)))"
+   "(defn main [] :i64 (f64-to-bits (f64-from-bits -1)))"
+   "(defn main [] :i64 (f32-to-bits (f32-add (f32-from-bits 1069547520) (f32-from-bits 1073741824))))"
+   "(defn main [] :i64 (f32-to-bits (f32-add (f32-from-bits -2147483648) (f32-from-bits 0))))"
+   "(defn main [] :i64 (f32-to-bits (f32-add (f32-from-bits 1065353216) (f32-from-bits 0))))"
+   "(defn main [] :i64 (f32-to-bits (f32-add (f32-from-bits 1036831949) (f32-from-bits 1045220557))))"
+   "(defn main [] :i64 (f32-to-bits (f32-add (f32-from-bits 2139081118) (f32-from-bits 2139081118))))"
+   "(defn main [] :i64 (f32-to-bits (f32-add (f32-from-bits 2143289344) (f32-from-bits 1065353216))))"
+   "(defn main [] :i64 (f32-to-bits (f32-sub (f32-from-bits 1069547520) (f32-from-bits 1073741824))))"
+   "(defn main [] :i64 (f32-to-bits (f32-sub (f32-from-bits -2147483648) (f32-from-bits 0))))"
+   "(defn main [] :i64 (f32-to-bits (f32-sub (f32-from-bits 1065353216) (f32-from-bits 0))))"
+   "(defn main [] :i64 (f32-to-bits (f32-sub (f32-from-bits 1036831949) (f32-from-bits 1045220557))))"
+   "(defn main [] :i64 (f32-to-bits (f32-sub (f32-from-bits 2139081118) (f32-from-bits 2139081118))))"
+   "(defn main [] :i64 (f32-to-bits (f32-sub (f32-from-bits 2143289344) (f32-from-bits 1065353216))))"
+   "(defn main [] :i64 (f32-to-bits (f32-mul (f32-from-bits 1069547520) (f32-from-bits 1073741824))))"
+   "(defn main [] :i64 (f32-to-bits (f32-mul (f32-from-bits -2147483648) (f32-from-bits 0))))"
+   "(defn main [] :i64 (f32-to-bits (f32-mul (f32-from-bits 1065353216) (f32-from-bits 0))))"
+   "(defn main [] :i64 (f32-to-bits (f32-mul (f32-from-bits 1036831949) (f32-from-bits 1045220557))))"
+   "(defn main [] :i64 (f32-to-bits (f32-mul (f32-from-bits 2139081118) (f32-from-bits 2139081118))))"
+   "(defn main [] :i64 (f32-to-bits (f32-mul (f32-from-bits 2143289344) (f32-from-bits 1065353216))))"
+   "(defn main [] :i64 (f32-to-bits (f32-div (f32-from-bits 1069547520) (f32-from-bits 1073741824))))"
+   "(defn main [] :i64 (f32-to-bits (f32-div (f32-from-bits -2147483648) (f32-from-bits 0))))"
+   "(defn main [] :i64 (f32-to-bits (f32-div (f32-from-bits 1065353216) (f32-from-bits 0))))"
+   "(defn main [] :i64 (f32-to-bits (f32-div (f32-from-bits 1036831949) (f32-from-bits 1045220557))))"
+   "(defn main [] :i64 (f32-to-bits (f32-div (f32-from-bits 2139081118) (f32-from-bits 2139081118))))"
+   "(defn main [] :i64 (f32-to-bits (f32-div (f32-from-bits 2143289344) (f32-from-bits 1065353216))))"
+   "(defn main [] :i64 (f32-to-bits (f32-min (f32-from-bits 1069547520) (f32-from-bits 1073741824))))"
+   "(defn main [] :i64 (f32-to-bits (f32-min (f32-from-bits -2147483648) (f32-from-bits 0))))"
+   "(defn main [] :i64 (f32-to-bits (f32-min (f32-from-bits 1065353216) (f32-from-bits 0))))"
+   "(defn main [] :i64 (f32-to-bits (f32-min (f32-from-bits 1036831949) (f32-from-bits 1045220557))))"
+   "(defn main [] :i64 (f32-to-bits (f32-min (f32-from-bits 2139081118) (f32-from-bits 2139081118))))"
+   "(defn main [] :i64 (f32-to-bits (f32-min (f32-from-bits 2143289344) (f32-from-bits 1065353216))))"
+   "(defn main [] :i64 (f32-to-bits (f32-max (f32-from-bits 1069547520) (f32-from-bits 1073741824))))"
+   "(defn main [] :i64 (f32-to-bits (f32-max (f32-from-bits -2147483648) (f32-from-bits 0))))"
+   "(defn main [] :i64 (f32-to-bits (f32-max (f32-from-bits 1065353216) (f32-from-bits 0))))"
+   "(defn main [] :i64 (f32-to-bits (f32-max (f32-from-bits 1036831949) (f32-from-bits 1045220557))))"
+   "(defn main [] :i64 (f32-to-bits (f32-max (f32-from-bits 2139081118) (f32-from-bits 2139081118))))"
+   "(defn main [] :i64 (f32-to-bits (f32-max (f32-from-bits 2143289344) (f32-from-bits 1065353216))))"
+   "(defn main [] :i64 (f32-to-bits (f32-neg (f32-from-bits 1073741824))))"
+   "(defn main [] :i64 (f32-to-bits (f32-neg (f32-from-bits -1073741824))))"
+   "(defn main [] :i64 (f32-to-bits (f32-neg (f32-from-bits 0))))"
+   "(defn main [] :i64 (f32-to-bits (f32-neg (f32-from-bits -1082130432))))"
+   "(defn main [] :i64 (f32-to-bits (f32-abs (f32-from-bits 1073741824))))"
+   "(defn main [] :i64 (f32-to-bits (f32-abs (f32-from-bits -1073741824))))"
+   "(defn main [] :i64 (f32-to-bits (f32-abs (f32-from-bits 0))))"
+   "(defn main [] :i64 (f32-to-bits (f32-abs (f32-from-bits -1082130432))))"
+   "(defn main [] :i64 (f32-to-bits (f32-sqrt (f32-from-bits 1073741824))))"
+   "(defn main [] :i64 (f32-to-bits (f32-sqrt (f32-from-bits -1073741824))))"
+   "(defn main [] :i64 (f32-to-bits (f32-sqrt (f32-from-bits 0))))"
+   "(defn main [] :i64 (f32-to-bits (f32-sqrt (f32-from-bits -1082130432))))"
+   "(defn main [] :bool (f32-eq (f32-from-bits 1069547520) (f32-from-bits 1073741824)))"
+   "(defn main [] :bool (f32-eq (f32-from-bits 1073741824) (f32-from-bits 1073741824)))"
+   "(defn main [] :bool (f32-eq (f32-from-bits 2143289344) (f32-from-bits 1065353216)))"
+   "(defn main [] :bool (f32-lt (f32-from-bits 1069547520) (f32-from-bits 1073741824)))"
+   "(defn main [] :bool (f32-lt (f32-from-bits 1073741824) (f32-from-bits 1073741824)))"
+   "(defn main [] :bool (f32-lt (f32-from-bits 2143289344) (f32-from-bits 1065353216)))"
+   "(defn main [] :bool (f32-le (f32-from-bits 1069547520) (f32-from-bits 1073741824)))"
+   "(defn main [] :bool (f32-le (f32-from-bits 1073741824) (f32-from-bits 1073741824)))"
+   "(defn main [] :bool (f32-le (f32-from-bits 2143289344) (f32-from-bits 1065353216)))"
+   "(defn main [] :bool (f32-gt (f32-from-bits 1069547520) (f32-from-bits 1073741824)))"
+   "(defn main [] :bool (f32-gt (f32-from-bits 1073741824) (f32-from-bits 1073741824)))"
+   "(defn main [] :bool (f32-gt (f32-from-bits 2143289344) (f32-from-bits 1065353216)))"
+   "(defn main [] :bool (f32-ge (f32-from-bits 1069547520) (f32-from-bits 1073741824)))"
+   "(defn main [] :bool (f32-ge (f32-from-bits 1073741824) (f32-from-bits 1073741824)))"
+   "(defn main [] :bool (f32-ge (f32-from-bits 2143289344) (f32-from-bits 1065353216)))"
+   "(defn main [] :bool (f32-unordered (f32-from-bits 1069547520) (f32-from-bits 1073741824)))"
+   "(defn main [] :bool (f32-unordered (f32-from-bits 1073741824) (f32-from-bits 1073741824)))"
+   "(defn main [] :bool (f32-unordered (f32-from-bits 2143289344) (f32-from-bits 1065353216)))"
+   "(defn main [] :i64 (f64-to-i64-truncating (f64-from-bits 4611686018427387904)))"
+   "(defn main [] :i64 (f64-to-i64-checked (f64-from-bits 4611686018427387904)))"
+   "(defn main [] :i64 (f64-to-i64-truncating (f64-from-bits -4613937818241073152)))"
+   "(defn main [] :i64 (f64-to-i64-checked (f64-from-bits -4613937818241073152)))"
+   "(defn main [] :i64 (f64-to-i64-truncating (f64-from-bits 4609434218613702656)))"
+   "(defn main [] :i64 (f64-to-i64-checked (f64-from-bits 4609434218613702656)))"
+   "(defn main [] :i64 (f64-to-i64-truncating (f64-from-bits 0)))"
+   "(defn main [] :i64 (f64-to-i64-checked (f64-from-bits 0)))"
+   "(defn main [] :i64 (f64-to-i64-truncating (f64-from-bits -9223372036854775808)))"
+   "(defn main [] :i64 (f64-to-i64-checked (f64-from-bits -9223372036854775808)))"
+   "(defn main [] :i64 (f64-to-i64-truncating (f64-from-bits 4876203697187506176)))"
+   "(defn main [] :i64 (f64-to-i64-checked (f64-from-bits 4876203697187506176)))"
+   "(defn main [] :i64 (f64-to-i64-truncating (f64-from-bits 4890946611321988160)))"
+   "(defn main [] :i64 (f64-to-i64-checked (f64-from-bits 4890946611321988160)))"
+   "(defn main [] :i64 (f64-to-i64-truncating (f64-from-bits 9221120237041090560)))"
+   "(defn main [] :i64 (f64-to-i64-checked (f64-from-bits 9221120237041090560)))"
+   "(defn main [] :i64 (f64-to-i64-truncating (f64-from-bits 9218868437227405312)))"
+   "(defn main [] :i64 (f64-to-i64-checked (f64-from-bits 9218868437227405312)))"
+   "(defn main [] :i64 (f64-to-i64-truncating (f64-from-bits -4332462841530417152)))"
+   "(defn main [] :i64 (f64-to-i64-checked (f64-from-bits -4332462841530417152)))"
+   "(defn main [] :i64 (f32-to-i64-truncating (f32-from-bits 1073741824)))"
+   "(defn main [] :i64 (f32-to-i64-checked (f32-from-bits 1073741824)))"
+   "(defn main [] :i64 (f32-to-i64-truncating (f32-from-bits -1077936128)))"
+   "(defn main [] :i64 (f32-to-i64-checked (f32-from-bits -1077936128)))"
+   "(defn main [] :i64 (f32-to-i64-truncating (f32-from-bits 1069547520)))"
+   "(defn main [] :i64 (f32-to-i64-checked (f32-from-bits 1069547520)))"
+   "(defn main [] :i64 (f32-to-i64-truncating (f32-from-bits 1266679808)))"
+   "(defn main [] :i64 (f32-to-i64-checked (f32-from-bits 1266679808)))"
+   "(defn main [] :i64 (f32-to-i64-truncating (f32-from-bits 1328730206)))"
+   "(defn main [] :i64 (f32-to-i64-checked (f32-from-bits 1328730206)))"
+   "(defn main [] :i64 (f64-to-bits (i64-to-f64-rounded 0)))"
+   "(defn main [] :i64 (f64-to-bits (i64-to-f64-checked 0)))"
+   "(defn main [] :i64 (f32-to-bits (i64-to-f32-rounded 0)))"
+   "(defn main [] :i64 (f32-to-bits (i64-to-f32-checked 0)))"
+   "(defn main [] :i64 (f64-to-bits (i64-to-f64-rounded 5)))"
+   "(defn main [] :i64 (f64-to-bits (i64-to-f64-checked 5)))"
+   "(defn main [] :i64 (f32-to-bits (i64-to-f32-rounded 5)))"
+   "(defn main [] :i64 (f32-to-bits (i64-to-f32-checked 5)))"
+   "(defn main [] :i64 (f64-to-bits (i64-to-f64-rounded -7)))"
+   "(defn main [] :i64 (f64-to-bits (i64-to-f64-checked -7)))"
+   "(defn main [] :i64 (f32-to-bits (i64-to-f32-rounded -7)))"
+   "(defn main [] :i64 (f32-to-bits (i64-to-f32-checked -7)))"
+   "(defn main [] :i64 (f64-to-bits (i64-to-f64-rounded 9007199254740992)))"
+   "(defn main [] :i64 (f64-to-bits (i64-to-f64-checked 9007199254740992)))"
+   "(defn main [] :i64 (f32-to-bits (i64-to-f32-rounded 9007199254740992)))"
+   "(defn main [] :i64 (f32-to-bits (i64-to-f32-checked 9007199254740992)))"
+   "(defn main [] :i64 (f64-to-bits (i64-to-f64-rounded 9007199254740993)))"
+   "(defn main [] :i64 (f64-to-bits (i64-to-f64-checked 9007199254740993)))"
+   "(defn main [] :i64 (f32-to-bits (i64-to-f32-rounded 9007199254740993)))"
+   "(defn main [] :i64 (f32-to-bits (i64-to-f32-checked 9007199254740993)))"
+   "(defn main [] :i64 (f64-to-bits (i64-to-f64-rounded 9223372036854775807)))"
+   "(defn main [] :i64 (f64-to-bits (i64-to-f64-checked 9223372036854775807)))"
+   "(defn main [] :i64 (f32-to-bits (i64-to-f32-rounded 9223372036854775807)))"
+   "(defn main [] :i64 (f32-to-bits (i64-to-f32-checked 9223372036854775807)))"
+   "(defn main [] :i64 (f64-to-bits (i64-to-f64-rounded -9223372036854775808)))"
+   "(defn main [] :i64 (f64-to-bits (i64-to-f64-checked -9223372036854775808)))"
+   "(defn main [] :i64 (f32-to-bits (i64-to-f32-rounded -9223372036854775808)))"
+   "(defn main [] :i64 (f32-to-bits (i64-to-f32-checked -9223372036854775808)))"
+   "(defn main [] :i64 (f32-to-bits (f64-to-f32-rounded (f64-from-bits 4609434218613702656))))"
+   "(defn main [] :i64 (f32-to-bits (f64-to-f32-rounded (f64-from-bits 4591870180066957722))))"
+   "(defn main [] :i64 (f32-to-bits (f64-to-f32-rounded (f64-from-bits 9094988921128908188))))"
+   "(defn main [] :i64 (f32-to-bits (f64-to-f32-rounded (f64-from-bits -4610560118520545280))))"
+   "(defn main [] :i64 (f32-to-bits (f64-to-f32-rounded (f64-from-bits 9221120237041090560))))"
+   "(defn main [] :i64 (f64-to-bits (f32-to-f64-exact (f32-from-bits 1069547520))))"
+   "(defn main [] :i64 (f64-to-bits (f32-to-f64-exact (f32-from-bits 1036831949))))"
+   "(defn main [] :i64 (f64-to-bits (f32-to-f64-exact (f32-from-bits -1071644672))))"
+   "(defn main [] :i64 (f32-to-bits (f32-from-bits 4294967296)))"
+   "(defn half [x :f64] :f64 (f64-div x (f64-from-bits 4611686018427387904)))\n(defn main [] :i64 (f64-to-i64-truncating (half (f64-from-bits 4616189618054758400))))"
+   "(defn sum [n :i64] :f64 (loop [i 0 acc (f64-from-bits 0)] (if (>= i n) acc (recur (+ i 1) (f64-add acc (i64-to-f64-rounded i))))))\n(defn main [] :i64 (f64-to-i64-truncating (sum 10)))"
+   "(defn main [] :i64 (f64-to-bits 5))"
+   "(defn main [] :i64 (f64-to-bits (f64-add (f64-from-bits 0) 1)))"
+   "(defn main [] :i64 (document-count (document-vector (document-i64 10) (document-i64 20) (document-string \"s\"))))"
+   "(defn main [] :i64 (document-count (document-list (document-i64 10) (document-i64 20))))"
+   "(defn main [] :i64 (document-count (document-map :b (document-i64 2) :a (document-i64 1) :c (document-null))))"
+   "(defn main [] :i64 (document-count (document-vector)))"
+   "(defn main [] :i64 (document-count (document-map)))"
+   "(defn main [] :i64 (document-count (document-null)))"
+   "(defn main [] :i64 (document-count (document-i64 1)))"
+   "(defn main [] :i64 (option-value-of [:option :i64] (document-i64-value (option-value-of [:option :document] (document-vector-at (document-vector (document-i64 10) (document-i64 20) (document-string \"s\")) 0) (document-null))) -1))"
+   "(defn main [] :i64 (option-value-of [:option :i64] (document-i64-value (option-value-of [:option :document] (document-vector-at (document-vector (document-i64 10) (document-i64 20) (document-string \"s\")) 1) (document-null))) -1))"
+   "(defn main [] :i64 (option-value-of [:option :i64] (document-i64-value (option-value-of [:option :document] (document-vector-at (document-vector (document-i64 10) (document-i64 20) (document-string \"s\")) 2) (document-null))) -1))"
+   "(defn main [] :i64 (option-value-of [:option :i64] (document-i64-value (option-value-of [:option :document] (document-vector-at (document-vector (document-i64 10) (document-i64 20) (document-string \"s\")) 3) (document-null))) -1))"
+   "(defn main [] :i64 (option-value-of [:option :i64] (document-i64-value (option-value-of [:option :document] (document-vector-at (document-vector (document-i64 10) (document-i64 20) (document-string \"s\")) -1) (document-null))) -1))"
+   "(defn main [] :i64 (option-value-of [:option :i64] (document-i64-value (option-value-of [:option :document] (document-list-at (document-list (document-i64 10) (document-i64 20)) 1) (document-null))) -1))"
+   "(defn main [] :i64 (option-value-of [:option :i64] (document-i64-value (option-value-of [:option :document] (document-list-at (document-vector (document-i64 10) (document-i64 20) (document-string \"s\")) 1) (document-null))) -1))"
+   "(defn main [] :i64 (option-value-of [:option :i64] (document-i64-value (option-value-of [:option :document] (document-vector-at (document-list (document-i64 10) (document-i64 20)) 0) (document-null))) -1))"
+   "(defn main [] :i64 (if (= (document-kind (document-null)) :null) 1 0))"
+   "(defn main [] :i64 (if (= (document-kind (document-null)) :i64) 1 0))"
+   "(defn main [] :i64 (if (= (document-kind (document-bool true)) :bool) 1 0))"
+   "(defn main [] :i64 (if (= (document-kind (document-bool true)) :i64) 1 0))"
+   "(defn main [] :i64 (if (= (document-kind (document-i64 3)) :i64) 1 0))"
+   "(defn main [] :i64 (if (= (document-kind (document-i64 3)) :i64) 1 0))"
+   "(defn main [] :i64 (if (= (document-kind (document-string \"x\")) :string) 1 0))"
+   "(defn main [] :i64 (if (= (document-kind (document-string \"x\")) :i64) 1 0))"
+   "(defn main [] :i64 (if (= (document-kind (document-keyword :k)) :keyword) 1 0))"
+   "(defn main [] :i64 (if (= (document-kind (document-keyword :k)) :i64) 1 0))"
+   "(defn main [] :i64 (if (= (document-kind (document-vector (document-i64 10) (document-i64 20) (document-string \"s\"))) :vector) 1 0))"
+   "(defn main [] :i64 (if (= (document-kind (document-vector (document-i64 10) (document-i64 20) (document-string \"s\"))) :i64) 1 0))"
+   "(defn main [] :i64 (if (= (document-kind (document-list (document-i64 10) (document-i64 20))) :list) 1 0))"
+   "(defn main [] :i64 (if (= (document-kind (document-list (document-i64 10) (document-i64 20))) :i64) 1 0))"
+   "(defn main [] :i64 (if (= (document-kind (document-map :b (document-i64 2) :a (document-i64 1) :c (document-null))) :map) 1 0))"
+   "(defn main [] :i64 (if (= (document-kind (document-map :b (document-i64 2) :a (document-i64 1) :c (document-null))) :i64) 1 0))"
+   "(defn main [] :i64 (option-value-of [:option :i64] (document-i64-value (option-value-of [:option :document] (document-vector-at (document-vector-assoc (document-vector (document-i64 10) (document-i64 20) (document-string \"s\")) 1 (document-i64 99)) 1) (document-null))) -1))"
+   "(defn main [] :i64 (document-count (document-vector-assoc (document-vector (document-i64 10) (document-i64 20) (document-string \"s\")) 3 (document-i64 99))))"
+   "(defn main [] :i64 (document-count (document-vector-assoc (document-vector (document-i64 10) (document-i64 20) (document-string \"s\")) -1 (document-i64 99))))"
+   "(defn main [] :i64 (document-count (document-vector-assoc (document-list (document-i64 10) (document-i64 20)) 0 (document-i64 99))))"
+   "(defn main [] :i64 (document-count (document-vector-conj (document-vector (document-i64 10) (document-i64 20) (document-string \"s\")) (document-null))))"
+   "(defn main [] :i64 (document-count (document-vector-conj (document-list (document-i64 10) (document-i64 20)) (document-null))))"
+   "(defn main [] :i64 (document-count (document-vector-drop (document-vector (document-i64 10) (document-i64 20) (document-string \"s\")) 0)))"
+   "(defn main [] :i64 (document-count (document-vector-drop (document-vector (document-i64 10) (document-i64 20) (document-string \"s\")) 1)))"
+   "(defn main [] :i64 (document-count (document-vector-drop (document-vector (document-i64 10) (document-i64 20) (document-string \"s\")) 3)))"
+   "(defn main [] :i64 (document-count (document-vector-drop (document-vector (document-i64 10) (document-i64 20) (document-string \"s\")) 4)))"
+   "(defn main [] :i64 (document-count (document-vector-drop (document-vector (document-i64 10) (document-i64 20) (document-string \"s\")) -1)))"
+   "(defn main [] :i64 (document-count (document-vector-remove (document-vector (document-i64 10) (document-i64 20) (document-string \"s\")) 0)))"
+   "(defn main [] :i64 (document-count (document-vector-remove (document-vector (document-i64 10) (document-i64 20) (document-string \"s\")) 2)))"
+   "(defn main [] :i64 (document-count (document-vector-remove (document-vector (document-i64 10) (document-i64 20) (document-string \"s\")) 3)))"
+   "(defn main [] :i64 (document-count (document-vector-remove (document-vector (document-i64 10) (document-i64 20) (document-string \"s\")) -1)))"
+   "(defn main [] :i64 (option-value-of [:option :i64] (document-i64-value (option-value-of [:option :document] (document-vector-at (document-vector-remove (document-vector (document-i64 10) (document-i64 20) (document-string \"s\")) 0) 0) (document-null))) -1))"
+   "(defn main [] :i64 (document-count (option-value-of [:option :document] (document-map-entry-at (document-map :b (document-i64 2) :a (document-i64 1) :c (document-null)) 0) (document-null))))"
+   "(defn main [] :i64 (document-count (option-value-of [:option :document] (document-map-entry-at (document-map :b (document-i64 2) :a (document-i64 1) :c (document-null)) 1) (document-null))))"
+   "(defn main [] :i64 (document-count (option-value-of [:option :document] (document-map-entry-at (document-map :b (document-i64 2) :a (document-i64 1) :c (document-null)) 2) (document-null))))"
+   "(defn main [] :i64 (document-count (option-value-of [:option :document] (document-map-entry-at (document-map :b (document-i64 2) :a (document-i64 1) :c (document-null)) 3) (document-null))))"
+   "(defn main [] :i64 (document-count (option-value-of [:option :document] (document-map-entry-at (document-map :b (document-i64 2) :a (document-i64 1) :c (document-null)) -1) (document-null))))"
+   "(defn main [] :i64 (if (= (document-kind (option-value-of [:option :document] (document-vector-at (option-value-of [:option :document] (document-map-entry-at (document-map :b (document-i64 2) :a (document-i64 1) :c (document-null)) 0) (document-null)) 0) (document-null))) :keyword) 1 0))"
+   "(defn main [] :i64 (option-value-of [:option :i64] (document-i64-value (option-value-of [:option :document] (document-vector-at (option-value-of [:option :document] (document-map-entry-at (document-map :b (document-i64 2) :a (document-i64 1) :c (document-null)) 1) (document-null)) 1) (document-null))) -1))"
+   "(defn main [] :i64 (option-value-of [:option :i64] (document-i64-value (option-value-of [:option :document] (document-vector-at (option-value-of [:option :document] (document-map-entry-at (document-map :b (document-i64 2) :a (document-i64 1) :c (document-null)) 0) (document-null)) 1) (document-null))) -1))"
+   "(defn main [] :i64 (document-count (option-value-of [:option :document] (document-map-entry-at (document-vector (document-i64 10) (document-i64 20) (document-string \"s\")) 0) (document-null))))"
+   "(defn main [] :i64 (option-value-of [:option :i64] (document-i64-value (option-value-of [:option :document] (document-get (document-map :b (document-i64 2) :a (document-i64 1) :c (document-null)) :a) (document-null))) -1))"
+   "(defn main [] :bool (document-contains (document-map :b (document-i64 2) :a (document-i64 1) :c (document-null)) :a))"
+   "(defn main [] :i64 (option-value-of [:option :i64] (document-i64-value (option-value-of [:option :document] (document-get (document-map :b (document-i64 2) :a (document-i64 1) :c (document-null)) :b) (document-null))) -1))"
+   "(defn main [] :bool (document-contains (document-map :b (document-i64 2) :a (document-i64 1) :c (document-null)) :b))"
+   "(defn main [] :i64 (option-value-of [:option :i64] (document-i64-value (option-value-of [:option :document] (document-get (document-map :b (document-i64 2) :a (document-i64 1) :c (document-null)) :zz) (document-null))) -1))"
+   "(defn main [] :bool (document-contains (document-map :b (document-i64 2) :a (document-i64 1) :c (document-null)) :zz))"
+   "(defn main [] :i64 (option-value-of [:option :i64] (document-i64-value (option-value-of [:option :document] (document-get (document-assoc (document-map :b (document-i64 2) :a (document-i64 1) :c (document-null)) :a (document-i64 7)) :a) (document-null))) -1))"
+   "(defn main [] :i64 (option-value-of [:option :i64] (document-i64-value (option-value-of [:option :document] (document-get (document-assoc (document-map :b (document-i64 2) :a (document-i64 1) :c (document-null)) :aa (document-i64 7)) :aa) (document-null))) -1))"
+   "(defn main [] :i64 (document-count (document-assoc (document-map :b (document-i64 2) :a (document-i64 1) :c (document-null)) :aa (document-i64 7))))"
+   "(defn main [] :i64 (document-count (document-dissoc (document-map :b (document-i64 2) :a (document-i64 1) :c (document-null)) :b)))"
+   "(defn main [] :i64 (document-count (document-dissoc (document-map :b (document-i64 2) :a (document-i64 1) :c (document-null)) :zz)))"
+   "(defn main [] :i64 (document-count (document-merge (document-map :b (document-i64 2) :a (document-i64 1) :c (document-null)) (document-map :z (document-i64 1) :a (document-i64 5)))))"
+   "(defn main [] :i64 (option-value-of [:option :i64] (document-i64-value (option-value-of [:option :document] (document-get (document-merge (document-map :b (document-i64 2) :a (document-i64 1) :c (document-null)) (document-map :z (document-i64 1) :a (document-i64 5))) :a) (document-null))) -1))"
+   "(defn main [] :i64 (document-count (document-merge)))"
+   "(defn main [] :i64 (document-count (document-merge (document-map :b (document-i64 2) :a (document-i64 1) :c (document-null)) (document-vector (document-i64 10) (document-i64 20) (document-string \"s\")))))"
+   "(defn main [] :i64 (option-value-of [:option :i64] (document-i64-value (option-value-of [:option :document] (document-get (document-vector (document-i64 10) (document-i64 20) (document-string \"s\")) :a) (document-null))) -1))"
+   "(defn main [] :bool (document-equal? (document-vector (document-i64 10) (document-i64 20) (document-string \"s\")) (document-vector (document-i64 10) (document-i64 20) (document-string \"s\"))))"
+   "(defn main [] :bool (document-equal? (document-vector (document-i64 10) (document-i64 20) (document-string \"s\")) (document-list (document-i64 10) (document-i64 20))))"
+   "(defn main [] :bool (document-equal? (document-map :b (document-i64 2) :a (document-i64 1) :c (document-null)) (document-map :a (document-i64 1) :c (document-null) :b (document-i64 2))))"
+   "(defn main [] :bool (document-equal? (document-i64 1) (document-i64 2)))"
+   "(defn main [] :bool (document-equal? (document-null) (document-null)))"
+   "(defn main [] :i64 (string-byte-length (option-value-of [:option :string] (document-string-value (document-string \"hello\")) \"\")))"
+   "(defn main [] :i64 (string-byte-length (option-value-of [:option :string] (document-string-value (document-i64 1)) \"none\")))"
+   "(defn main [] :i64 (if (option-value-of [:option :bool] (document-bool-value (document-bool true)) false) 1 0))"
+   "(defn main [] :i64 (if (= (option-value-of [:option :keyword] (document-keyword-value (document-keyword :q)) :none) :q) 1 0))"
+   "(defn main [] :i64 (f64-to-bits (option-value-of [:option :f64] (document-f64-value (document-f64 (f64-from-bits 4609434218613702656))) (f64-from-bits 0))))"
+   "(defn main [] :i64 (f64-to-bits (option-value-of [:option :f64] (document-f64-value (document-i64 1)) (f64-from-bits 0))))"
+   "(defn main [] :i64 (option-value-of [:option :i64] (document-i64-value (document-i64 -5)) -1))"
+   "(defn main [] :i64 (option-match [:option :document] (document-vector-at (document-vector (document-i64 10) (document-i64 20) (document-string \"s\")) 0) 0 d 1))"
+   "(defn main [] :i64 (option-match [:option :document] (document-vector-at (document-vector (document-i64 10) (document-i64 20) (document-string \"s\")) 9) 0 d 1))"
+   "(defn total [d :document] :i64 (loop [i 0 acc 0] (if (>= i (document-count d)) acc (recur (+ i 1) (+ acc (option-value-of [:option :i64] (document-i64-value (option-value-of [:option :document] (document-vector-at d i) (document-null))) 0))))))\n(defn main [] :i64 (total (document-vector (document-i64 10) (document-i64 20) (document-string \"s\"))))"
+   "(defn grow [n :i64] :document (loop [i 0 d (document-vector)] (if (>= i n) d (recur (+ i 1) (document-vector-conj d (document-i64 i))))))\n(defn main [] :i64 (document-count (grow 20)))"
+   "(defn grow [n :i64] :document (loop [i 0 d (document-vector)] (if (>= i n) d (recur (+ i 1) (document-vector-conj d (document-i64 i))))))\n(defn main [] :i64 (document-count (grow 40)))"
+   "(defn main [] :i64 (document-count (document-vector (document-vector (document-null)) (document-list))))"
+   "(defn main [] :i64 (document-count (document-i64 (quot 1 0))))"
+   "(defn main [] :i64 (document-count 5))"
+   "(defn collatz [n :i64] :i64 (loop [x n steps 0] (if (= x 1) steps (recur (if (= (rem x 2) 0) (quot x 2) (+ (* 3 x) 1)) (+ steps 1)))))\n(defn main [] :i64 (collatz 27))"
+   "(defn main [] :i64 (+ (pair-first (pair 20 99)) (pair-second (pair 1 22))))"
+   "(defn main [] :i64 (pair 7 8))"
+   "(defn main [] :i64 (+ (pair 1 2) (pair 3 4)))"
+   "(defn main [] :i64 (pair-first 0))"
+   "(defn main [] :i64 (pair-second 5))"
+   "(defn main [] :i64 (pair-first (+ (pair 1 2) 1)))"
+   "(defn main [] :i64 (loop [i 0 h 0] (if (< i 5000) (recur (+ i 1) (pair i h)) (pair-first h))))"
+   "(defn main [] :i64 (loop [i 0 h 0] (if (< i 4095) (recur (+ i 1) (pair i h)) (pair-first h))))"
+   "(defn sum [l :i64] :i64 (if (= l 0) 0 (+ (pair-first l) (sum (pair-second l)))))
+(defn main [] :i64 (sum (pair 1 (pair 2 (pair 3 0)))))"
+   "(defn main [] :bool (= (pair 1 2) 1))"
+   "(defn mk [n :i64] :i64 (fn [x :i64] :i64 (+ x n)))
+(defn main [] :i64 ((mk 5) 7))"
+   "(defn twice [f :i64 x :i64] :i64 (f (f x)))
+(defn main [] :i64 (twice (fn [x :i64] :i64 (* x 3)) 2))"
+   "(defn mk [a :i64 b :i64 c :i64 d :i64 e :i64 f :i64] :i64 (fn [x :i64] :i64 (+ x a b c d e f)))
+(defn main [] :i64 ((mk 1 2 3 4 5 6) 7))"
+   "(defn main [] :i64 (record-get [:record :t/p [[:x :i64] [:y :i64]]] (record-new [:record :t/p [[:x :i64] [:y :i64]]] 3 4) :y))"
+   "(defn mk [a :i64] [:record :t/p [[:x :i64] [:y :i64]]] (record-new [:record :t/p [[:x :i64] [:y :i64]]] a (* a 2)))
+(defn main [] :i64 (+ (record-get [:record :t/p [[:x :i64] [:y :i64]]] (mk 5) :x) (record-get [:record :t/p [[:x :i64] [:y :i64]]] (mk 5) :y)))"
+   "(defn main [] :i64 (string-length (record-get [:record :t/b [[:ok :bool] [:s :string]]] (record-new [:record :t/b [[:ok :bool] [:s :string]]] true \"abc\") :s)))"
+   "(defn main [] :i64 (string-length (record-get [:record :t/b [[:ok :bool] [:s :string]]] (record-new [:record :t/b [[:ok :bool] [:s :string]]] (< 1 2) \"abc\") :s)))"
+   "(defn main [] :bool (= (record-new [:record :t/p [[:x :i64] [:y :i64]]] 1 2) (record-new [:record :t/p [[:x :i64] [:y :i64]]] 1 2)))"
+   "(defn main [] :bool (= (record-new [:record :t/p [[:x :i64] [:y :i64]]] 1 2) (record-new [:record :t/p [[:x :i64] [:y :i64]]] 1 3)))"
+   "(defrecord Reading [label :string ok :bool value :i64])
+(defn main [] :i64 (let [r (->Reading \"sensor\" true 7)] (+ (string-length (:label r)) (if (:ok r) (:value r) 0))))"
+   "(defn loopy [n :i64] [:record :t/p [[:x :i64] [:y :i64]]] (loop [i 0 r (record-new [:record :t/p [[:x :i64] [:y :i64]]] 0 0)] (if (< i n) (recur (+ i 1) (record-new [:record :t/p [[:x :i64] [:y :i64]]] (+ (record-get [:record :t/p [[:x :i64] [:y :i64]]] r :x) i) i)) r)))
+(defn main [] :i64 (record-get [:record :t/p [[:x :i64] [:y :i64]]] (loopy 100) :x))"
+   "(defn main [] :i64 (match-variant (variant-new [:variant :t/v [[:a :i64] [:b :string]]] :b \"xyz\") [:variant :t/v [[:a :i64] [:b :string]]] (:a n n) (:b s (string-length s))))"
+   "(defn main [] :i64 (match-variant (variant-new [:variant :t/v [[:a :i64] [:b :string]]] :a 41) [:variant :t/v [[:a :i64] [:b :string]]] (:a n (+ n 1)) (:b s (string-length s))))"
+   "(defn main [] :bool (= (variant-new [:variant :t/v [[:a :i64] [:b :string]]] :a 1) (variant-new [:variant :t/v [[:a :i64] [:b :string]]] :a 1)))"
+   "(defn main [] :i64 (string-length (nth (hetero-vector [:vector [:i64 :string :bool]] 7 \"Ada\" true) 1)))"
+   "(defn main [] :i64 (nth (hetero-vector [:vector [:i64 :string]] 7 \"Ada\") 0))"
+   "(def kinds #{:blue :red :green})
+(defn main [] :i64 (typed-set-count [:set :keyword] kinds))"
+   "(def ns #{3 1 2 -5})
+(defn main [] :i64 (typed-set-count [:set :i64] ns))"
+   "(defn main [] :i64 (f64-to-bits (vector-f64-at (vector-f64-drop (vector-f64-conj (vector-f64 1.5 2.5) 3.5) 1) 1)))"
+   "(defn main [] :i64 (vector-f64-count (vector-f64-take (vector-f64 1.5 2.5 3.25) 2)))"
+   "(defn main [] :i64 (f64-to-bits (vector-f64-at (vector-f64 1.5) 3)))"
+   "(defn main [] :i64 (vector-f64-count (vector-f64-drop (vector-f64 1.5) 2)))"
+   "(defn main [] :i64 (f64-to-bits (vector-f64-at (vector-f64-assoc (vector-f64 1.5 2.5) 1 0.25) 1)))"
+   "(defn main [] :i64 (f64-to-bits (vector-f64-get (vector-f64 1.5 2.5) 7 0.75)))"
+   "(defn main [] :i64 (f64-to-bits (vector-f64-get (vector-f64 1.5 2.5) 1 0.75)))"
+   "(defn main [] :i64 (+ (* 100 (+ (string-compare-lines \"ab\\nabc\\n\" 0 \"ab\\nabc\\n\" 3) 2)) (* 10 (+ (string-compare-lines \"a\\tb\\n\" 0 \"a\\n\" 0) 2)) (+ (string-compare-lines \"ab\\n\" 0 \"ab\" 0) 2)))"
+   "(defn main [] :i64 (string-compare-lines \"ab\" 2 \"\" 0))"
+   "(defn main [] :i64 (string-compare-lines \"ab\" 3 \"\" 0))"
+   "(defn main [] :i64 (string-compare-lines \"h\\u00e9\" 2 \"\" 0))"
+   "(defn main [] :i64 (+ (* 100 (string-find-blank \"ab\\tc d\" 3)) (* 10 (string-skip-blank \"  \\n x\" 0)) (+ (string-find-blank \"abc\" 3) 2)))"
+   "(defn main [] :i64 (string-find-blank \"abc\" 4))"
+   "(defn main [] :i64 (string-skip-blank \"   \" 1))"
+   "(defn main [] :i64 (string-skip-blank \"h\\u00e9 x\" 2))"
+   "(defn main [] :i64 (+ (* 100000 (string-find-byte \"a\\nb\\n\" 10 2)) (* 10000 (+ (string-find-byte \"abc\" 99 3) 2)) (* 1000 (string-find-byte \"\\u65e5\\u672c\\u8a9e a\" 32 3))))"
+   "(defn main [] :i64 (string-find-byte \"abc\" 200 0))"
+   "(defn main [] :i64 (string-find-byte \"abc\" 97 7))"
+   "(defn main [] :i64 (let [acc (string-append-range \"x\" \"abc\" 1 3)] (+ (string-byte-length acc) (string-byte-length (string-append-range acc acc 1 3)))))"
+   "(defn main [] :i64 (string-byte-length (string-append-range \"x\" \"abc\" 2 1)))"
+   "(defn main [] :i64 (string-byte-length (string-append-range \"x\" \"h\\u00e9\" 0 2)))"
+   "(defn main [] :i64 (string-byte-length (string-from-utf8 (bytes-from-vector-i64 (vector-i64 227 129 130 240 159 152 128)))))"
+   "(defn main [] :i64 (string-byte-length (string-from-utf8 (bytes-from-vector-i64 (vector-i64 192 128)))))"
+   "(defn main [] :i64 (string-byte-length (string-from-utf8 (bytes-from-vector-i64 (vector-i64 237 160 128)))))"
+   "(defn main [] :i64 (string-byte-length (string-from-utf8 (bytes-from-vector-i64 (vector-i64 104 128)))))"
+   "(defn main [] :i64 (string-byte-length (string-from-utf8 (bytes-from-vector-i64 (vector-i64 226 130)))))"
+   "(defn main [] :i64 (string-byte-length (string-from-utf8 (bytes-from-vector-i64 (vector-i64 244 144 128 128)))))"
+   "(defn main [] :i64 (string-byte-length (string-from-utf8 (bytes-from-vector-i64 (vector-i64 248)))))"
+   "(defn main [] :i64 (string-byte-length (string-from-utf8 (bytes-from-vector-i64 (vector-i64 224 128 128)))))"
+   "(defn main [] :i64 (nth (hetero-vector-assoc [:vector [:i64 :string]] (hetero-vector [:vector [:i64 :string]] 1 \"a\") 0 7) 0))"
+   "(defn main [] :i64 (string-length (nth (hetero-vector-assoc [:vector [:i64 :string]] (hetero-vector [:vector [:i64 :string]] 1 \"a\") 1 \"xyz\") 1)))"
+   "(defn main [] :i64 (nth (hetero-vector-assoc [:vector [:i64 :string]] (hetero-vector [:vector [:i64 :string]] 1 \"a\") 2 5) 0))"
+   "(defn main [] :bool (= (hetero-vector-assoc [:vector [:i64 :string]] (hetero-vector [:vector [:i64 :string]] 1 \"a\") 0 1) (hetero-vector [:vector [:i64 :string]] 1 \"a\")))"
+   "(ns t.tree (:schemas {:t/n [:variant :t/n [[:leaf :i64] [:branch [:vector [[:ref :t/n] [:ref :t/n]]]]]]}))
+(defn leaf [n :i64] [:variant :t/n [[:leaf :i64] [:branch [:vector [[:ref :t/n] [:ref :t/n]]]]]] (variant-new [:variant :t/n [[:leaf :i64] [:branch [:vector [[:ref :t/n] [:ref :t/n]]]]]] :leaf n))
+(defn sum [n [:variant :t/n [[:leaf :i64] [:branch [:vector [[:ref :t/n] [:ref :t/n]]]]]]] :i64 (match-variant n [:variant :t/n [[:leaf :i64] [:branch [:vector [[:ref :t/n] [:ref :t/n]]]]]] (:leaf x x) (:branch p (+ (sum (hetero-vector-at [:vector [[:ref :t/n] [:ref :t/n]]] p 0)) (sum (hetero-vector-at [:vector [[:ref :t/n] [:ref :t/n]]] p 1))))))
+(defn main [] :i64 (sum (match-variant (variant-new [:variant :t/n [[:leaf :i64] [:branch [:vector [[:ref :t/n] [:ref :t/n]]]]]] :branch (hetero-vector [:vector [[:ref :t/n] [:ref :t/n]]] (leaf 1) (leaf 2))) [:variant :t/n [[:leaf :i64] [:branch [:vector [[:ref :t/n] [:ref :t/n]]]]]] (:leaf x (leaf x)) (:branch p (variant-new [:variant :t/n [[:leaf :i64] [:branch [:vector [[:ref :t/n] [:ref :t/n]]]]]] :branch (hetero-vector-assoc [:vector [[:ref :t/n] [:ref :t/n]]] p 1 (leaf 9)))))))"
+   "(defn main [] :i64 (document-count (document-map (document-keyword :a) (document-i64 1) :b (document-i64 2))))"
+   "(defn main [] :i64 (document-count (document-map :a (document-i64 1) (document-keyword :a) (document-i64 2))))"
+   "(defn main [] :i64 (option-value-of [:option :i64] (document-i64-value (option-value-of [:option :document] (document-get (document-map :a (document-i64 5)) (document-keyword :a)) (document-null))) -1))"
+   "(defn main [] :bool (document-contains (document-map :a (document-i64 5)) (document-keyword :b)))"
+   "(defn main [] :i64 (document-count (document-assoc (document-map :a (document-i64 5)) (document-keyword :b) (document-i64 6))))"
+   "(defn main [] :i64 (document-count (document-dissoc (document-map :a (document-i64 5)) (document-keyword :a))))"
+   "(defn main [] :bool (document-contains (document-map :a (document-i64 5)) (document-string \"a\")))"
+   "(defn main [] :i64 (document-count (document-map (document-string \"k\") (document-i64 1))))"
+   "(defn main [] :bool (document-contains (document-i64 1) (if (= (quot 1 0) 0) (document-keyword :a) (document-keyword :b))))"
+   "(defn main [] :bool (document-contains (document-map :a (document-i64 5)) (if (= (quot 1 0) 0) (document-keyword :a) (document-keyword :b))))"
+   "(defn ex-info2 [msg :string data :document] :document (document-map (document-keyword :message) (document-string msg) (document-keyword :data) data))
+(defn main [] :i64 (string-byte-length (option-value-of [:option :string] (document-string-value (option-value-of [:option :document] (document-get (ex-info2 \"empty input\" (document-map (document-keyword :input) (document-string \"\"))) (document-keyword :message)) (document-null))) \"\")))"])
+
+(defn hirs-of-sources [srcs]
+  (keep try-analyze srcs))
+
+(defn file-hirs
+  "DIFF_FILES=<list file>: one program path per line, relative to DIFF_FILES_ROOT
+  (default the list file's directory) unless absolute."
+  []
+  (if-let [lf (.-DIFF_FILES js/process.env)]
+    (let [root (or (.-DIFF_FILES_ROOT js/process.env) (subs lf 0 (str/last-index-of lf "/")))]
+      (vec (keep (fn [f]
+                   (let [p (if (str/starts-with? f "/") f (str root "/" f))]
+                     (try (sema/analyze (.readFileSync fs p "utf8")) (catch :default _ nil))))
+                 (remove empty? (str/split-lines (.readFileSync fs lf "utf8"))))))
+    []))
+
+
+(defn candidates
+  "The deterministic list of (module, budget) cases: sema corpus, generated, hand."
+  [dirs]
+  (let [corpus (vec (if (= dirs ["none"]) [] (corpus-hirs dirs)))
+        rnd (make-rng (js/parseInt (or (.-DIFF_SEED js/process.env) "20260930")))
+        gen-srcs (vec (repeatedly (js/parseInt (or (.-DIFF_GEN js/process.env) "400")) #(gen-program rnd)))
+        gen (vec (hirs-of-sources gen-srcs))
+        hand (vec (hirs-of-sources hand-src))
+        files (file-hirs)
+        _ (println "corpus" (count corpus) "generated" (count gen) "/" (count gen-srcs) "hand" (count hand) "/" (count hand-src) "files" (count files))
+        groups [["sema" corpus] ["gen" gen] ["hand" hand] ["files" files]]
+        budgets (if-let [f (.-DIFF_FUEL js/process.env)] [[(js/parseInt f) 32] [60 5] [50 32]] [[100000 32] [60 5] [50 32]])
+        ;; DIFF_BUDGETS=<n>: only the first n budgets; DIFF_FILTER=<text>: only modules whose EDN contains it
+        budgets (vec (take (js/parseInt (or (.-DIFF_BUDGETS js/process.env) "3")) budgets))
+        flt (.-DIFF_FILTER js/process.env)]
+    (vec (for [[g hs] groups
+               h hs
+               :when (oracle-module? h)
+               :let [edn (try (->edn (slim h)) (catch :default _ nil))]
+               :when (and edn (< (count edn) (if (= g "files") 200000 12000)) (or (not flt) (some #(str/includes? edn %) (str/split flt #"[|]"))))
+               [fuel frames] budgets]
+           {:group g :fuel fuel :frames frames :edn edn :hir h}))))
+
+
+(defn stalled-edns
+  "The EDN of every candidate whose host outcome stalled (a :begin row with no result)
+  in the cache tools/interp_diff.sh wrote; a module with such a case is excluded."
+  [cands cache]
+  (let [rows (->> (str/split-lines (.readFileSync fs cache "utf8")) (remove empty?) (map cljs.reader/read-string))
+        done (set (keep (fn [[i v]] (when-not (= v :begin) i)) rows))]
+    (set (keep (fn [[i v]] (when (and (= v :begin) (not (done i))) (:edn (nth cands i)))) rows))))

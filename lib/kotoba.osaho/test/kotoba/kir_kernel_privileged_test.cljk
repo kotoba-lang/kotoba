@@ -1,0 +1,160 @@
+(ns kotoba.kir-kernel-privileged-test
+  "What this interpreter must REFUSE to answer, and what `lower` must therefore
+  never start folding.
+
+  Every operation asserted here names machine or kernel state that this process
+  is not running on. The interpreter cannot invent a value for one, and the
+  danger is not that it would invent a wrong number -- it is that every real
+  call site BRANCHES on the number. `kernel-cpuid-edx` answered at compile time
+  is \"this CPU supports NX\" decided by a compiler that has never seen the CPU.
+
+  Two separate sets carry that, and missing either one is a different failure:
+
+  - `eval-expr` must trap, so no oracle can succeed with an invention;
+  - `lower`'s `kernel-operations` must contain the operation, so the constant
+    oracle is never started at all. Every real call site passes literals (leaf
+    `0x80000001` subleaf `0`; XCR index `0`), so a folder has every structural
+    reason to try. The trap makes that failure loud rather than silent -- but
+    loud is still wrong: it aborts the compile of a valid program.
+
+  `kernel-xgetbv` is the operation this namespace was added for. The `cpuid`,
+  MSR and port rows beside it are not decoration: they pin the class it joins,
+  so a change that quietly starts ANSWERING one of them fails here rather than
+  in a kernel."
+  (:require [kotoba.test :refer [deftest is]]
+            [kotoba.kir :as kir]
+            [kotoba.test-hir :as test-hir]))
+
+(defn- module [body]
+  (test-hir/module
+   {:format :kotoba.hir/v3 :entry 'main :exports ['main] :result :i64
+    :functions [{:name 'main :params [] :param-types [] :result :i64
+                 :body body}]}))
+
+;; The i64 an oracle seals is a host BigInt on ClojureScript and a long on the
+;; JVM -- the same convention `kir_kernel_memory_test` already carries. Only
+;; the folded control below compares a number at all; the rows that matter
+;; compare `nil`, which needs no narrowing.
+(defn- w [x] #?(:clj x :cljs (js/Number x)))
+
+(defn- trapped [thunk]
+  (try (thunk) nil
+       (catch :default e (ex-data e))))
+
+;; ---------------------------------------------------------------------------
+;; The interpreter refuses
+;; ---------------------------------------------------------------------------
+
+;; `xgetbv` reads XCR[ecx] into edx:eax, so `kernel-xgetbv` takes exactly the
+;; XCR index and returns the two halves as one i64. Arity is the whole of what
+;; the frontend verifies for a privileged operation, and it is stated in three
+;; repositories -- `kotoba-sema`'s `kernel-privileged-operations`,
+;; `kotoba-gmir`'s `x86-privileged-action-arities`, and `kotoba-native`'s
+;; emitter -- with no mechanism keeping them equal but review.
+;;
+;; NOTE for anyone extending this: `kernel-cpuid-*` ALREADY take (leaf,
+;; subleaf). All four are arity 2. A `kernel-cpuid-subleaf-*` family would be a
+;; duplicate; leaf 7 subleaf 0 is spelled `(kernel-cpuid-ebx 7 0)`.
+(def ^:private refusals
+  ['(kernel-xgetbv 0)
+   ;; xsave: the write half. CR4 and XCR0 are firmware-initialised machine
+   ;; state, so "model them as cells starting at zero" would answer confidently
+   ;; with a value from a machine that does not exist -- and the caller's next
+   ;; act is `(kernel-xsetbv 0 (bit-or (kernel-xgetbv 0) 6))`, a
+   ;; read-modify-write that would then silently CLEAR whatever the firmware set.
+   '(kernel-read-cr4)
+   '(kernel-write-cr4 262144)
+   '(kernel-xsetbv 0 7)
+   '(kernel-cpuid-eax 1 0)
+   '(kernel-cpuid-ebx 7 0)
+   '(kernel-cpuid-ecx 1 0)
+   '(kernel-cpuid-edx 2147483649 0)
+   '(kernel-read-msr 192)
+   '(kernel-in-u8 1016)
+   ;; amu-h7: the canned #UD handler's address, beside
+   ;; `kernel-double-fault-handler-address`. An ADDRESS in the image's text,
+   ;; which only the backend that lays the text can answer.
+   '(kernel-undefined-opcode-handler-address)])
+
+(deftest machine-state-is-not-invented
+  (doseq [body refusals]
+    (let [data (trapped #(kir/execute (kir/lower (module body)) 'main []
+                                      {:fuel 10000}))]
+      (is (= :kernel-privileged-unavailable (:trap data))
+          (str body " must refuse rather than answer"))
+      (is (= (first body) (:operation data))
+          (str body " must name itself in the trap"))))
+  ;; An empty table is not a green suite.
+  (is (= 11 (count refusals)) "SCANNED refusals"))
+
+;; ---------------------------------------------------------------------------
+;; `lower` does not start an oracle it cannot finish
+;; ---------------------------------------------------------------------------
+
+;; This is the assertion that fails if `kernel-xgetbv` is absent from `lower`'s
+;; `kernel-operations`. The module has no parameters, no effects and an `:i64`
+;; result, which is exactly the shape `lower` folds -- so without the
+;; membership it calls `execute`, the trap above fires, and `lower` itself
+;; throws.
+(deftest xgetbv-marks-a-module-kernel-native
+  (let [lowered (kir/lower (module '(kernel-xgetbv 0)))]
+    (is (nil? (:oracle-value lowered))
+        "an XCR0 read has no compile-time value")
+    (is (= [] (:blocks lowered))
+        "and therefore no folded constant block"))
+  ;; The control. Without this row, a `lower` that had stopped folding
+  ;; EVERYTHING would pass the assertions above.
+  (is (= 7 (w (:oracle-value (kir/lower (module '(bit-or 6 1))))))
+      "a pure expression over literals still folds")
+  ;; And the mixed case, which is the one that actually reaches a kernel: one
+  ;; XCR0 read anywhere in the module suppresses folding for the module. The
+  ;; `(bit-and ... 6)` around it is exactly the AVX2 guard's XCR0 test.
+  (is (nil? (:oracle-value (kir/lower (module '(bit-and (kernel-xgetbv 0) 6)))))
+      "one privileged read anywhere suppresses the module's oracle"))
+
+;; ---------------------------------------------------------------------------
+;; xsave: the extended-state enable marks a module kernel-native too
+;; ---------------------------------------------------------------------------
+
+;; The same two-set discipline as `kernel-xgetbv`, and the membership matters
+;; more here than for anything above it. `(kernel-read-cr4)` is ZERO-arity and
+;; `(kernel-xsetbv 0 7)` is two literals -- there is nothing in either shape to
+;; suggest an effect -- so a constant folder has every structural reason to
+;; evaluate them, and without the membership `lower` itself throws on a
+;; perfectly valid kernel.
+(deftest the-extended-state-enable-marks-a-module-kernel-native
+  (doseq [body ['(kernel-read-cr4)
+                '(kernel-write-cr4 262144)
+                '(kernel-xsetbv 0 7)
+                ;; The spelling a kernel actually writes: read, set two bits,
+                ;; write back. Both halves are privileged and the folder must
+                ;; not start on either.
+                '(kernel-xsetbv 0 (bit-or (kernel-xgetbv 0) 6))]]
+    (let [lowered (kir/lower (module body))]
+      (is (nil? (:oracle-value lowered))
+          (str body " has no compile-time value"))
+      (is (= [] (:blocks lowered))
+          (str body " leaves no folded constant block"))))
+  ;; The control, repeated here rather than borrowed: without it, a `lower`
+  ;; that had stopped folding EVERYTHING would pass the four rows above.
+  (is (= 262150 (w (:oracle-value (kir/lower (module '(bit-or 262144 6))))))
+      "a pure expression over the same literals still folds"))
+
+;; ---------------------------------------------------------------------------
+;; amu-h7: the #UD handler address marks a module kernel-native too
+;; ---------------------------------------------------------------------------
+
+;; Mirrors `kernel-double-fault-handler-address`. ZERO-arity and an address --
+;; nothing in the shape suggests an effect, so a constant folder has every
+;; structural reason to evaluate it, and the answer is a text address only the
+;; backend that lays the text can give. Without the membership `lower` itself
+;; throws on a kernel that merely asks where its vector 6 gate should point.
+(deftest the-undefined-opcode-handler-address-marks-a-module-kernel-native
+  (let [lowered (kir/lower (module '(kernel-undefined-opcode-handler-address)))]
+    (is (nil? (:oracle-value lowered))
+        "a handler address has no compile-time value")
+    (is (= [] (:blocks lowered))
+        "and therefore no folded constant block"))
+  ;; The control, repeated here rather than borrowed.
+  (is (= 6 (w (:oracle-value (kir/lower (module '(bit-or 4 2))))))
+      "a pure expression over literals still folds"))

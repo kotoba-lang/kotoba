@@ -1,0 +1,239 @@
+;; Differential test: `kotoba.kir.lowering` (Kotoba route, run here by the host
+;; KIR interpreter through the project route) against the host `kotoba.kir/lower`.
+;;
+;;   KROOTS=<src roots, colon separated> node --stack-size=8192 nbb/cli.js \
+;;     --classpath <cp> test/kotoba/kir/lowering_diff.cljk (env DIFF_DIRS=dir:dir, default kotoba-sema test/kotoba/compiler)
+;;
+;; Corpus: every string literal in the given kotoba-sema test directories that
+;; analyses (raw, or with a `main` appended) as a program; plus hand-built HIR
+;; modules exercising each refusal; plus one module per kernel operation head.
+;; For each HIR the host outcome is classified and the Kotoba line must agree:
+;;   R:<message>   host rejects before the interpreter (message equal)
+;;   K:O<eq>       host sealed (or tried to seal) an oracle; Kotoba wants one and
+;;                 its structural module equals the host's minus the oracle
+;;   K:-<eq>       host sealed nothing; the whole module must equal the host's
+(ns kotoba.kir.lowering-diff
+  (:require ["node:fs" :as fs]
+            [clojure.string :as str]
+            [kotoba.sema :as sema]
+            [kotoba.kir :as kir]
+            [kotoba.compiler.project :as project]
+            [kotoba.compiler.project-files :as pf]))
+
+(def roots (vec (str/split (.-KROOTS js/process.env) #":")))
+
+(defn ->edn [x]
+  (cond
+    (nil? x) "nil"
+    (boolean? x) (str x)
+    (integer? x) (str x)
+    (and (exists? js/BigInt) (= js/BigInt (.-constructor x))) (str x)
+    (string? x) (pr-str x)
+    (keyword? x) (str x)
+    (symbol? x) (str x)
+    (seq? x) (str "(" (str/join " " (map ->edn x)) ")")
+    (vector? x) (str "[" (str/join " " (map ->edn x)) "]")
+    (set? x) (str "#{" (str/join " " (map ->edn x)) "}")
+    (map? x) (str "{" (str/join " " (mapcat (fn [[k v]] [(->edn k) (->edn v)]) x)) "}")
+    :else (throw (ex-info "no-edn" {:x (pr-str x)}))))
+
+(defn host-outcome [hir]
+  (try
+    (let [r (kir/lower hir {:oracle-fuel 1 :oracle-frames 8})
+          oracle? (or (some? (:oracle-value r)) (some? (:oracle-inconclusive r)))
+          base (assoc (dissoc r :oracle-inconclusive) :oracle-value nil :blocks [])]
+      {:kind (if oracle? :oracle :plain) :base base})
+    (catch :default e
+      (let [d (ex-data e)]
+        (if (or (:problem d) (:rejected d)
+                (re-find #"indexes are malformed|refinement is malformed" (str (ex-message e))))
+          {:kind :reject :message (ex-message e)}
+          {:kind :trap :message (ex-message e)})))))
+
+(defn expected-line [o]
+  (case (:kind o)
+    :reject (str "R:" (:message o))
+    :oracle "K:O="
+    :plain "K:-="
+    :trap "K:O*"))
+
+(def header
+  (str "(ns probe.low-main\n  {:kotoba/export [main]}\n"
+       "  (:require [kotoba.form :as form] [kotoba.kir.lowering :as lw])\n"
+       "  (:schemas {:form/r [:record :form/r [[:tag :i64] [:s :string] [:n :i64] [:k :keyword] [:kids [:list [:ref :form/r]]] [:span :i64] [:data :bytes]]]}))\n"
+       "(defn line [text :string expected :string] :string\n"
+       "  (let [hir (form/edn-form text)\n"
+       "        p (lw/lower-problem hir)]\n"
+       "    (if (not (= :ok (lw/problem-of p)))\n"
+       "      (str \"R:\" (lw/problem-message p) \"|\")\n"
+       "      (str \"K:\" (if (lw/oracle-wanted? hir) \"O\" \"-\")\n"
+       "           (if (form/eq (lw/lower-base hir) (form/edn-form expected)) \"=\" \"!\") \"|\"))))\n"))
+
+(defn main-src [cases]
+  (str header "(defn main [] :string\n  (str "
+       (str/join "\n       " (map (fn [{:keys [edn exp]}] (str "(line " (pr-str edn) " " (pr-str exp) ")")) cases))
+       "))\n"))
+
+(defn run-batch [cases]
+  (let [root "/private/tmp/scratch/probe_low_main.cljk"]
+    (.writeFileSync fs root (main-src cases))
+    (let [graph (pf/load-closed-graph root roots)
+          linked (project/link-source (:sources graph) (:root graph))
+          hir (sema/analyze (:source linked) {:admit-linked-synthetics? true})
+          out (kir/execute (kir/lower hir) 'main [] {:fuel 2000000000 :frames 100000 :cells 200000000 :bytes 200000000})]
+      (vec (butlast (str/split out #"\|"))))))
+
+(defn agrees? [exp got]
+  (cond
+    (= exp "K:O*") (str/starts-with? got "K:O")
+    (str/starts-with? exp "R:") (= got exp)
+    :else (= got exp)))
+
+;; ---- corpus ----
+
+(defn strings-in [file]
+  (let [text (.readFileSync fs file "utf8")]
+    (keep (fn [m] (try (js/JSON.parse (str "\"" (second m) "\"")) (catch :default _ nil)))
+          (re-seq #"\"((?:[^\"\\\\]|\\\\.)*)\"" text))))
+
+(defn try-analyze [s]
+  (or (try (sema/analyze s) (catch :default _ nil))
+      (try (sema/analyze (str s "\n(defn main [] :i64 0)")) (catch :default _ nil))))
+
+(defn corpus-hirs [dirs]
+  (let [files (mapcat (fn [d] (->> (.readdirSync fs d)
+                                   (filter #(str/ends-with? % ".cljk"))
+                                   (map #(str d "/" %))))
+                      dirs)
+        cands (->> files (mapcat strings-in)
+                   (filter #(and (str/starts-with? (str/triml %) "(") (re-find #"\(defn?\b" %)))
+                   distinct)]
+    (keep try-analyze cands)))
+
+;; ---- hand-built HIR ----
+
+(def base-fn {:name 'main :source-name 'main :params [] :result :i64 :result-inferred? true
+              :effects #{} :body 1})
+(def base-hir {:format :kotoba.hir/v2 :namespace 'example.core :schemas {} :schema-identities {}
+               :entry 'main :exports ['main] :result :i64 :effects #{} :named-operations #{}
+               :language-profile nil :functions [base-fn]})
+(defn with-body [body] (assoc-in base-hir [:functions 0 :body] body))
+(defn with-fn [f] (assoc base-hir :functions [(merge base-fn f)]))
+(def typed-fn {:name 'f :params ['a 'b 'c] :param-types [:i64 :string :i64] :result :i64 :effects #{} :body 'a})
+(defn typed [& kvs]
+  {:format :kotoba.hir/v3 :namespace 'example.lib :schemas {} :schema-identities {} :entry nil
+   :exports ['f] :result nil :effects #{} :named-operations #{} :language-profile :pure-product
+   :functions [(apply assoc typed-fn kvs)]})
+
+(def hand
+  (concat
+   [base-hir
+    (with-body '(let [x 1 y 2] (+ x y)))
+    (with-body '(let [x 1] 1 2))
+    (with-body '(let [x 1]))
+    (with-body '(let))
+    (with-body '(if 1 2))
+    (with-body '(if 1 2 3 4))
+    (with-body '(do))
+    (with-body '(do 1 2))
+    (with-body '(+ 1 (let [x 1] 1 2)))
+    (with-body '(let [x (if 1 2)] x))
+    (with-body '(let [x 1] (do)))
+    (with-body '(quote (let [x 1] 1 2)))
+    (assoc base-hir :exports [])
+    (assoc base-hir :result :bool)
+    (assoc base-hir :effects #{:state})
+    (assoc-in base-hir [:functions 0 :effects] #{:state})
+    (assoc base-hir :compiler/private true)
+    (assoc base-hir :entry nil :exports ['main] :result nil)
+    (assoc base-hir :entry nil :exports ['main] :result :i64)
+    (assoc base-hir :functions [])
+    (assoc-in base-hir [:functions 0 :effects] #{:abort})
+    (-> base-hir (assoc :effects #{:abort}) (assoc-in [:functions 0 :effects] #{:abort}))
+    (-> base-hir (assoc :result :bool) (assoc-in [:functions 0 :result] :bool) (assoc-in [:functions 0 :body] '(< 1 2)))
+    (-> base-hir (assoc :result :string) (assoc-in [:functions 0 :result] :string) (assoc-in [:functions 0 :body] "s"))
+    (-> base-hir (assoc :effects #{[:cap/call 7]}) (assoc-in [:functions 0 :effects] #{[:cap/call 7]}))
+    ;; loop helpers
+    (assoc base-hir :functions
+           [base-fn {:name '__kotoba_loop_1 :params ['n] :result :i64 :effects #{}
+                     :body '(if (<= n 0) 0 (__kotoba_loop_1 (- n 1)))}])
+    (assoc base-hir :functions
+           [base-fn {:name '__kotoba_loop_1 :params ['n] :result :i64 :effects #{}
+                     :body '(if (<= n 0) 0 (+ 1 (__kotoba_loop_1 (- n 1))))}])
+    (assoc base-hir :functions
+           [base-fn {:name '__kotoba_loop_7 :params ['n] :result :i64 :effects #{}
+                     :body '(let [x (__kotoba_loop_7 n)] (__kotoba_loop_7 (- n 1)))}])
+    (assoc base-hir :functions
+           [base-fn {:name '__kotoba_loop_7 :params ['n] :result :i64 :effects #{}
+                     :body '(do (__kotoba_loop_7 n) (__kotoba_loop_7 (- n 1)))}])
+    (assoc base-hir :functions
+           [base-fn {:name '__kotoba_loop_x :params ['n] :result :i64 :effects #{}
+                     :body '(+ 1 (__kotoba_loop_x n))}])
+    (assoc base-hir :functions
+           [base-fn {:name '__kotoba_loop_ :params ['n] :result :i64 :effects #{}
+                     :body '(+ 1 (__kotoba_loop_ n))}])
+    ;; descriptors
+    (typed)
+    (typed :closure-param-indexes [0])
+    (typed :closure-param-indexes [0 2])
+    (typed :closure-param-indexes [2 0])
+    (typed :closure-param-indexes [0 0])
+    (typed :closure-param-indexes [1])
+    (typed :closure-param-indexes [3])
+    (typed :closure-param-indexes [-1])
+    (typed :closure-param-indexes [])
+    (typed :closure-param-indexes nil)
+    (typed :closure-param-indexes '(0))
+    (typed :closure-param-indexes #{0})
+    (typed :i64-pair-chain-param-indexes [2])
+    (typed :i64-pair-chain-param-indexes [0] :closure-param-indexes [0])
+    (typed :i64-pair-chain-param-indexes [2] :closure-param-indexes [0])
+    (typed :i64-pair-chain-param-indexes [1])
+    (typed :i64-pair-chain-param-indexes [1 0])
+    (typed :closure-result? true)
+    (typed :closure-result? false)
+    (typed :closure-result? nil)
+    (typed :closure-result? true :result :string)
+    (typed :closure-param-indexes [1] :closure-result? false)]
+   ;; kernel-native modules: one per operation head
+   (for [op (str/split-lines (.readFileSync fs (or (.-DIFF_OPS js/process.env) "/private/tmp/wt-D-osaho/test/kotoba/kir/kernel_operations.txt") "utf8"))]
+     (with-body (list (symbol op))))
+   [(with-body '(+ 1 (kernel-cli)))
+    (with-body '(let [x {:a (kernel-hlt)}] 1))
+    (with-body '(let [x [(kernel-hlt)]] 1))
+    (with-body '(quote (kernel-hlt)))
+    (with-body '(kernel-hlt-not 1))]))
+
+(defn main! [dirs]
+  (let [corpus (vec (corpus-hirs dirs))
+        all (vec (concat corpus hand))
+        _ (println "corpus" (count corpus) "hand" (count hand))
+        cases (vec (keep (fn [h]
+                           (try (let [e (->edn h) o (host-outcome h)]
+                                  (when (< (count e) 20000)
+                                    {:edn e
+                                     :exp (expected-line o)
+                                     :expected-base (when (#{:plain :oracle} (:kind o)) (->edn (:base o)))}))
+                                (catch :default e (println "skip" (ex-message e)) nil)))
+                         all))
+        cases (mapv (fn [c] (assoc c :exp-line (:exp c) :exp (or (:expected-base c) "nil"))) cases)
+        batches (partition-all (js/parseInt (or (.-DIFF_BATCH js/process.env) "8")) (take (js/parseInt (or (.-DIFF_LIMIT js/process.env) "100000")) cases))
+        results (mapcat (fn [b]
+                          (let [t0 (js/Date.now)
+                                got (run-batch (map #(select-keys % [:edn :exp]) b))]
+                            (println "batch" (count b) "cases" (- (js/Date.now) t0) "ms" (count (apply str (map :edn b))) "chars")
+                            (map (fn [c g] [c g]) b got)))
+                        batches)
+        bad (remove (fn [[c g]] (agrees? (:exp-line c) g)) results)]
+    (println "corpus programs:" (count corpus) "hand modules:" (count hand)
+             "cases run:" (count cases) "disagreements:" (count bad))
+    (println "by expected outcome:" (into (sorted-map) (map (fn [[k v]] [(if (str/starts-with? k "R:") "R:*" k) (count v)])
+                                                           (group-by identity (map (comp :exp-line first) results)))))
+    (println "rejections:" (into (sorted-map) (frequencies (filter #(str/starts-with? % "R:") (map (comp :exp-line first) results)))))
+    (doseq [[c g] (take 10 bad)]
+      (println "DISAGREE expected" (:exp-line c) "got" g "\n   " (subs (:edn c) 0 (min 300 (count (:edn c))))))
+    (js/process.exit (if (seq bad) 1 0))))
+
+(main! (if-let [d (.-DIFF_DIRS js/process.env)]
+         (str/split d #":")
+         ["/Users/junkawasaki/github/kotoba-lang/kotoba-sema/test/kotoba/compiler"]))

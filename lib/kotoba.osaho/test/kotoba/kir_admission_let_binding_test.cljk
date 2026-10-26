@@ -1,0 +1,228 @@
+(ns kotoba.kir-admission-let-binding-test
+  "The two target-admission predicates must see through `let` bindings.
+
+  Both walked a form's `args` generically, and for `let` the first arg is the
+  binding VECTOR. A Clojure vector is not `seq?`, so the walk fell straight to
+  its terminal case -- `true` in the native predicate, and an explicit
+  `(vector? form) true` in the CLJS one, written for sealed type descriptors --
+  and the binding VALUES were never inspected.
+
+  The consequence was that the identical operation was gated when written
+  directly and admitted when bound by a `let`, which is how `xorshift32`
+  reached a native backend while the `u32-wrap` it desugars into was rejected."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.kir :as kir]
+            [kotoba.test-hir :as test-hir]))
+
+(defn- hir [body]
+  {:format :kotoba.hir/v3
+   :functions [{:name 'main :params [] :param-types [] :result :i64 :body body}]})
+
+;; One representative per typed family the native gate is meant to exclude.
+;; `string-*` is deliberately absent: the native backend implements a qualified
+;; string slice, so those are admitted by design and would prove nothing here.
+(def ^:private excluded
+  ['(map-new)
+   '(document-null)])
+
+;; Admitted on native, still excluded on cljs. They stay in
+;; `non-string-typed-ops`, which both gates share, so the native predicate
+;; makes the exception for itself -- measured 2026-08-03: 1/9 of these compile
+;; for cljs-kotoba-v1 against 9/9 for wasm32 and js.
+(def ^:private native-only
+  ['(u32-wrap 1)
+   '(i32-wrap 1)
+   '(i32-xor 1 2)
+   '(i32-shift-left 1 2)
+   '(i32-wrapping-add 1 2)
+   '(u32-shift-right 1 2)
+   ;; Keyword operations. Admitted on native since both backends gained a
+   ;; general substring and a concatenation over a runtime handle; they were
+   ;; listed as excluded here until then, and this list was not moved when the
+   ;; admission landed.
+   '(keyword-from-string "k")
+   '(keyword-name :k)
+   ;; vector-i64 / vector-f64 (ADR-2608030300). Native carries a vector as a
+   ;; one-word handle into a host table, so it needs no representation the
+   ;; one-word slice above does not already have; cljs still does not
+   ;; implement them and must keep rejecting them.
+   ;;
+   ;; `vector-new` is deliberately absent: unlike every other operation in
+   ;; either family it is NOT in `non-string-typed-ops`, so the cljs gate
+   ;; admits it. That set can build a vector cljs cannot then read, which is
+   ;; incoherent but is a property of the shared set rather than of this
+   ;; predicate -- recorded rather than silently repaired here, because
+   ;; adding it would narrow a different target in a change about native.
+   '(vector-count (vector-new 1))
+   '(vector-at (vector-new 1) 0)
+   '(vector-get (vector-new 1) 0 7)
+   '(vector-assoc (vector-new 1) 0 2)
+   '(vector-conj (vector-new 1) 2)
+   '(vector-drop (vector-new 1) 1)
+   '(vector-f64-new 1)
+   '(vector-f64-count (vector-f64-new 1))
+   '(vector-f64-at (vector-f64-new 1) 0)
+   '(vector-f64-get (vector-f64-new 1) 0 7)
+   '(vector-f64-assoc (vector-f64-new 1) 0 2)
+   '(vector-f64-conj (vector-f64-new 1) 2)
+   '(vector-f64-drop (vector-f64-new 1) 1)])
+
+;; `vector-new` alone is admitted by BOTH gates, because it is the one
+;; operation in either vector family that is missing from
+;; `non-string-typed-ops`. Pinned as its own case rather than folded into
+;; `native-only` so that the asymmetry is stated instead of hidden: a set that
+;; lets cljs build a vector it cannot then count is incoherent, and if it is
+;; ever repaired this test should fail and be moved, not quietly pass.
+(def ^:private admitted-by-both
+  ['(vector-new)
+   '(vector-new 1 2)])
+
+(deftest a-let-binding-does-not-launder-an-excluded-operation
+  (doseq [form excluded]
+    (testing (str form)
+      (is (false? (kir/only-native-word-typed-features? (hir form)))
+          "written directly, the operation must be excluded")
+      (is (false? (kir/only-native-word-typed-features? (hir (list 'let ['a form] 'a))))
+          "binding it to a let must not change that")
+      (is (false? (kir/only-native-word-typed-features?
+                   (hir (list 'let ['a 1 'b form] 'a))))
+          "nor must burying it in a later binding")
+      (is (false? (kir/only-native-word-typed-features?
+                   (hir (list 'let ['a (list 'let ['b form] 'b)] 'a))))
+          "nor nesting the let"))))
+
+(deftest i32-operations-are-admitted-on-native-but-not-on-cljs
+  ;; The asymmetry is deliberate and lives in the native predicate rather than
+  ;; in the shared set, so widening native cannot silently widen cljs.
+  (doseq [form native-only]
+    (testing (str form)
+      (is (true? (kir/only-native-word-typed-features? (hir form))))
+      (is (true? (kir/only-native-word-typed-features? (hir (list 'let ['a form] 'a))))
+          "and a let binding must not change that either")
+      (is (false? (kir/only-cljs-provider-typed-features? (hir form)))
+          "cljs does not implement these and must keep rejecting them")))) 
+
+(deftest vector-new-is-admitted-by-both-gates-unlike-the-rest-of-its-family
+  (doseq [form admitted-by-both]
+    (testing (str form)
+      (is (true? (kir/only-native-word-typed-features? (hir form))))
+      (is (true? (kir/only-native-word-typed-features? (hir (list 'let ['a form] 'a)))))
+      (is (true? (kir/only-cljs-provider-typed-features? (hir form)))
+          "not because cljs implements vectors, but because this one operation
+           is missing from the shared excluded set"))))
+
+(deftest the-cljs-predicate-has-the-same-property
+  (doseq [form excluded]
+    (testing (str form)
+      (is (false? (kir/only-cljs-provider-typed-features? (hir form))))
+      (is (false? (kir/only-cljs-provider-typed-features? (hir (list 'let ['a form] 'a))))))))
+
+(deftest ordinary-let-bound-word-values-are-still-admitted
+  ;; Tightening the walk must not start rejecting the one-word slice the native
+  ;; backends genuinely implement -- otherwise the fix trades a hole for an
+  ;; outage.
+  (doseq [form ['(let [a 1] a)
+                '(let [a 1 b 2] (+ a b))
+                '(let [a (+ 1 2)] (* a 3))
+                '(let [a true] a)
+                '(let [a "s"] (string-byte-length a))
+                '(let [a (let [b 2] b)] a)]]
+    (testing (str form)
+      (is (true? (kir/only-native-word-typed-features? (hir form)))))))
+
+(deftest a-malformed-let-is-rejected-rather-than-walked-past
+  ;; An odd binding count or a non-symbol binder cannot come from the frontend,
+  ;; but this predicate also runs over KIR the verifier treats as hostile, so
+  ;; it must not silently admit a shape it cannot reason about.
+  (doseq [form ['(let [a] a)
+                '(let [a 1 b] b)
+                '(let ["a" 1] 1)
+                '(let (a 1) a)]]
+    (testing (str form)
+      (is (false? (kir/only-native-word-typed-features? (hir form)))))))
+
+;; ---------------------------------------------------------------------------
+;; A pure predicate entry gets a sealed oracle
+;; ---------------------------------------------------------------------------
+
+(defn- lowered [result body]
+  (kir/lower
+   (test-hir/module
+    {:format :kotoba.hir/v2 :entry 'main :exports ['main]
+     :result result
+     :functions [{:name 'main :params [] :result result :body body}]})))
+
+(deftest a-pure-bool-entry-is-folded-and-sealed
+  ;; Excluding :bool left a predicate entry with no sealed oracle at all, and
+  ;; because native is the only path that seals and re-checks one, that alone
+  ;; stopped `(defn main [] (< a b))` from compiling there while it compiled
+  ;; for wasm32, js and cljs.
+  (is (true? (:oracle-value (lowered :bool '(= 1 1)))))
+  (is (false? (:oracle-value (lowered :bool '(= 1 2)))))
+  (is (= 2 (:oracle-value (lowered :i64 '(+ 1 1))))
+      "the i64 path is unchanged"))
+
+(deftest the-sealed-value-is-boxed-and-the-block-is-the-word
+  ;; The boundary convention (see `box-bool` in `execute`): :bool is a 0/1 word
+  ;; INSIDE a module, but the value that LEAVES a target is a host boolean. So
+  ;; the sealed oracle is the boolean -- directly comparable to what a verifier
+  ;; re-executing through `execute` gets -- while :blocks, the internal
+  ;; representation, carries the word `:const.i64` can hold.
+  (doseq [[body boxed word] [['(= 1 1) true 1] ['(= 1 2) false 0]]]
+    (let [k (lowered :bool body)]
+      (is (= boxed (:oracle-value k)))
+      (is (= [[:const.i64 word] [:return]]
+             (:instructions (first (:blocks k))))))))
+
+(deftest a-false-oracle-is-not-mistaken-for-no-oracle
+  ;; `false` is a foldable value now, so the guard on :blocks must be `some?`
+  ;; and not truthiness -- otherwise a predicate that folds to false would look
+  ;; exactly like an entry that could not be folded at all.
+  (is (seq (:blocks (lowered :bool '(= 1 2)))))
+  (is (empty? (:blocks
+               (kir/lower
+                (test-hir/module
+                 {:format :kotoba.hir/v2 :entry 'main :exports ['main]
+                  :result :i64
+                  :functions [{:name 'main :params [] :result :i64
+                               :effects #{[:cap/call 1]}
+                               :body '(cap-call 1 0)}]}))))
+      "an effectful entry still gets no oracle"))
+
+;; ---------------------------------------------------------------------------
+;; bool-not decodes the 0/1 word, not Clojure truthiness
+;; ---------------------------------------------------------------------------
+
+(defn- run [body]
+  (kir/execute (kir/lower
+                (test-hir/module
+                 {:format :kotoba.hir/v2 :entry 'main :exports ['main]
+                  :result :i64
+                  :functions [{:name 'main :params []
+                               :result :i64 :body body}]}))
+               'main []))
+
+(deftest bool-not-inverts-a-comparison
+  ;; It used to be `(not value)`. Comparisons evaluate to the WORD 0/1, and 0 is
+  ;; truthy in Clojure, so `(not 0)` and `(not 1)` were both false -- bool-not
+  ;; returned false for EVERY input, making `(bool-not (= a b))` constantly
+  ;; false. This interpreter is the oracle the other targets are checked
+  ;; against, so that was the language's definition of the operation.
+  (is (= 1 (run '(if (bool-not (= 1 2)) 1 0))) "not(1 = 2) must be true")
+  (is (= 0 (run '(if (bool-not (= 1 1)) 1 0))) "not(1 = 1) must be false")
+  (is (= 1 (run '(if (bool-not (< 2 1)) 1 0))))
+  (is (= 0 (run '(if (bool-not (< 1 2)) 1 0)))))
+
+(deftest bool-not-accepts-both-internal-bool-representations
+  ;; 38d1bd0 leaves both the 0/1 word and a host boolean acceptable inside a
+  ;; module, so the decoding must handle each. `option-some?` yields a real
+  ;; boolean while a comparison yields a word.
+  (is (= 0 (run '(if (bool-not (option-some? (option-some 1))) 1 0))))
+  (is (= 1 (run '(if (bool-not (option-some? (option-none))) 1 0)))))
+
+(deftest bool-not-is-an-involution
+  ;; The property that fails loudest under the old behaviour: double negation
+  ;; used to collapse to a constant instead of returning the original truth.
+  (doseq [[inner expected] [['(= 1 1) 1] ['(= 1 2) 0]]]
+    (is (= expected (run (list 'if (list 'bool-not (list 'bool-not inner)) 1 0)))
+        (str "bool-not twice over " inner " must round-trip"))))

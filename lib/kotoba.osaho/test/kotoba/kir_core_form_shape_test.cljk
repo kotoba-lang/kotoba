@@ -1,0 +1,151 @@
+(ns kotoba.kir-core-form-shape-test
+  "A core `let` takes ONE body form and a core `if` takes THREE parts. A module
+  that says otherwise is refused, not quietly shortened.
+
+  Why this is here and not only in the frontend. `kotoba.hir/v3` is an accepted
+  input surface -- `hir/validate!` checks the module envelope, not the shape of
+  an expression -- so a `let` carrying several body forms reached the
+  interpreter, which destructured `[bindings body]` and ran the FIRST one. The
+  frontend had exactly this hole on the way in, and it cost:
+
+    (defn run [n :i64] :i64 (let [x (+ n 1)] (+ x 10) (+ x 100)))
+
+  compiled with :ok true and answered 16 instead of 106, dropping the second
+  form without a word (measured 2026-09-02, amu b1fdaad2). The same shape
+  applied to `if` let a four-argument `if` compile and answer its `then`.
+
+  Refusing is right rather than making it work: several body forms on a head
+  that takes one did not come from the frontend, which collapses them into a
+  `do`, and the interpreter has no obligation to guess which of them the author
+  meant. Same reasoning as `reject-loop-helper-self-calls-off-tail!` next door.
+
+  The positive cases are the other half. A checker that refused everything
+  would also make the truncation go away, so the sequencing that a `do` inside
+  a `let` body must actually perform is executed here, effects and all."
+  (:require #?(:clj  [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing] :include-macros true])
+            [kotoba.kir :as ir]
+            [kotoba.test-hir :as test-hir]))
+
+(defn- module
+  "A module whose `main` is zero-arity and calls `run` with ARGS.
+
+  `main` takes no parameters on purpose: `lower` evaluates the entry through
+  the constant oracle, and an entry with parameters is refused there with
+  `arguments do not match function arity` before any of this suite's subject
+  matter is reached."
+  [params body]
+  (test-hir/module
+   {:format :kotoba.hir/v3
+    :entry 'main
+    :exports '[main run]
+    :result :i64
+    :schemas {}
+    :schema-identities {}
+    :functions [{:name 'main :params [] :param-types [] :result :i64
+                 :body (list* 'run (repeat (count params) 1))}
+                {:name 'run :params params
+                 :param-types (vec (repeat (count params) :i64))
+                 :result :i64 :body body}]}))
+
+(defn- image [base bytes] {:base base :bytes (volatile! bytes)})
+
+(defn- run
+  ([m args] (run m args {}))
+  ([m args opts] (ir/execute (ir/lower m) 'run args opts)))
+
+(defn- refusal [thunk]
+  (try (do (thunk) nil)
+       (catch :default e
+         (merge {:message (ex-message e)} (ex-data e)))))
+
+(defn- w [x] #?(:clj x :cljs (js/Number x)))
+
+;; --- the sequencing a let body relies on -----------------------------------
+
+(deftest a-do-in-a-let-body-performs-every-effect-in-order
+  ;; This is the lowered shape of `(let [n 3] (kernel-store-u8 ...)
+  ;; (kernel-store-u8 ...))` after the frontend collapses the body. Both stores
+  ;; must land: a lowering that dropped the non-final one -- because its value
+  ;; is unused -- would write 66 and not 65.
+  (let [mem (image 4096 [0 0 0])
+        m (module '[base]
+                  '(let [n 3]
+                     (do (kernel-store-u8 base 3 0 65)
+                         (kernel-store-u8 base 3 1 66))))]
+    (run m [4096] {:memory mem})
+    (is (= [65 66 0] (mapv w @(:bytes mem)))
+        "SCANNED 2 stores; both landed, in order")))
+
+(deftest the-value-of-a-let-whose-body-is-a-do-is-the-last-form
+  (is (= 106 (w (run (module '[n] '(let [x (+ n 1)] (do (+ x 10) (+ x 100)))) [5])))))
+
+(deftest three-effects-nested-under-a-let-all-run
+  (let [mem (image 4096 [0 0 0])
+        m (module '[base]
+                  '(let [n 3]
+                     (do (kernel-store-u8 base 3 0 7)
+                         (kernel-store-u8 base 3 1 8)
+                         (kernel-store-u8 base 3 2 9))))]
+    (run m [4096] {:memory mem})
+    (is (= [7 8 9] (mapv w @(:bytes mem))) "SCANNED 3 stores; none dropped")))
+
+;; --- and the shapes that are refused ---------------------------------------
+
+(deftest a-let-with-several-body-forms-is-refused-by-lower
+  (let [m (module '[n] '(let [x (+ n 1)] (+ x 10) (+ x 100)))
+        {:keys [rejected function body-forms message]} (refusal #(ir/lower m))]
+    (is (= :let-body-not-one-form rejected)
+        "refused; a truncating lowering would have answered 16")
+    (is (= 'run function))
+    (is (= 2 body-forms))
+    (is (re-find #"one body form" message))))
+
+(deftest a-let-with-several-body-forms-is-refused-by-execute
+  ;; `execute` takes KIR directly -- callers do not have to come through
+  ;; `lower`, and the oracle suites in this repo build modules by hand. The
+  ;; contract has to hold at both doors.
+  (let [m (module '[n] '(let [x (+ n 1)] (+ x 10) (+ x 100)))
+        {:keys [rejected]} (refusal #(ir/execute m 'run [5]))]
+    (is (= :let-body-not-one-form rejected))))
+
+(deftest a-let-with-no-body-form-is-refused
+  (is (= :let-body-not-one-form
+         (:rejected (refusal #(ir/lower (module '[n] '(let [x n]))))))))
+
+(deftest an-if-that-is-not-ternary-is-refused
+  (testing "four arguments"
+    (let [{:keys [rejected arity]}
+          (refusal #(ir/lower (module '[n] '(if (< 0 n) (+ n 10) (+ n 100) (+ n 1000)))))]
+      (is (= :if-not-ternary rejected))
+      (is (= 4 arity))))
+  (testing "two arguments"
+    (is (= :if-not-ternary
+           (:rejected (refusal #(ir/lower (module '[n] '(if (< 0 n) (+ n 10))))))))))
+
+(deftest the-refusal-is-found-wherever-the-form-sits
+  ;; A walk that only looked at the body's head would miss every real case.
+  (testing "inside a binding value"
+    (is (= :let-body-not-one-form
+           (:rejected (refusal #(ir/lower (module '[n] '(let [x (let [y n] y n)] x))))))))
+  (testing "inside an if branch"
+    (is (= :let-body-not-one-form
+           (:rejected (refusal #(ir/lower (module '[n] '(if (< 0 n) (let [y n] y n) 0))))))))
+  (testing "inside a do"
+    (is (= :if-not-ternary
+           (:rejected (refusal #(ir/lower (module '[n] '(do (if (< 0 n) 1 2 3) n)))))))))
+
+;; --- the shapes that must keep working --------------------------------------
+
+(deftest well-shaped-modules-are-untouched
+  ;; A checker that refuses everything makes the truncation go away too.
+  (testing "a one-form let body"
+    (is (= 16 (w (run (module '[n] '(let [x (+ n 1)] (+ x 10))) [5])))))
+  (testing "nested lets"
+    (is (= 8 (w (run (module '[n] '(let [x (+ n 1)] (let [y (+ x 2)] y))) [5])))))
+  (testing "a ternary if"
+    (is (= 15 (w (run (module '[n] '(if (< 0 n) (+ n 10) (+ n 100))) [5])))))
+  (testing "a one-form do"
+    (is (= 15 (w (run (module '[n] '(do (+ n 10))) [5])))))
+  (testing "a let binding vector is not walked as if it were a form"
+    (is (= 6 (w (run (module '[n] '(let [x (+ n 1)] x)) [5]))))))

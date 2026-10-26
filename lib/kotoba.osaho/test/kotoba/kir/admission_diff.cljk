@@ -1,0 +1,291 @@
+;; Differential test: `kotoba.kir.admission/check`, the Kotoba reading (over `:form/r`
+;; values) on the seed route, against the host reading (Clojure data) on the same HIR
+;; effect rows and policies. The Kotoba side is test/kotoba/kir/admission_diff_probe.cljk,
+;; compiled by the seed against the image's frontend objects and run by the loader (the host
+;; KIR route cannot compile kotoba.form v2 or kotoba.security's Kotoba arms).
+;;
+;;   tools/admission_diff.sh [corpus-list]   (host phase, seed build and runs, compare phase)
+;;   env ADM_GEN=<n>     random cases (default 400), ADM_SEED=<n> (default 20261010)
+;;       ADM_CORPUS=<file of .kotoba paths>  rows from those programs (host sema/analyze)
+;;       ADM_BATCH=<n>   cases per Kotoba run (default 40)
+;;       ADM_MODE=host|compare, ADM_SCRATCH=<dir>
+;;
+;; Corpus: (1) grant counts 0, 1, 31, 32, 33, 42 and 200 (wire grants, random ids), each
+;; admitted, denied and malformed; (2) named grants ([:cap/call :io/write], which the
+;; host refuses as malformed: capability-names wires them first); (3) the 42-grant
+;; checkfull catalog policy, wired; (4) every policy key the host admits -- :abac,
+;; :attributes, :information-flow, :crypto-*, :hardware-signing-* -- and the shapes it
+;; refuses (unknown key, :allow not a set, non-map policy, malformed grants); (5) the
+;; effect rows of the corpus programs (ADM_CORPUS) under the default 4-grant policy, the
+;; 42-grant policy and no policy; (6) random combinations of the above.
+;;
+;; Outcomes: OK:<answer> or THROW:<phase> <message>. A host error without :phase is
+;; THROW::internal (its message is the host's own and is not compared). An answer is
+;; compared as data, exactly, except inside the evaluator answers (:abac, :crypto,
+;; :hardware-signing, :information-flow), where a host SET may come back as a vector
+;; (they are documents, and a set in a document tree is a vector without duplicates).
+(ns kotoba.kir.admission-diff
+  (:require ["node:fs" :as fs]
+            [cljs.reader]
+            [clojure.string :as str]
+            [kotoba.sema :as sema]
+            [kotoba.kir.admission :as admission]
+            [kotoba.kir.interp-corpus :refer [->edn]]))
+
+(def t0 (js/Date.now))
+(defn tick [& xs] (apply println (str "[" (js/Math.round (/ (- (js/Date.now) t0) 1000)) "s]") xs))
+
+(def scratch (or (.-ADM_SCRATCH js/process.env) "/private/tmp/scratch/admission-diff"))
+
+;; ---- host side ----
+
+(defn host-outcome [{:keys [hir policy]}]
+  (try (str "OK:" (->edn (admission/check hir policy)))
+       (catch :default e
+         (let [p (:phase (ex-data e))]
+           (str "THROW:" (if p (str p) ":internal") " " (if p (ex-message e) ""))))))
+
+;; ---- comparison ----
+
+(def evaluator-keys #{:abac :crypto :hardware-signing :information-flow})
+
+(defn- like?
+  "KOT is HOST, a host set allowed to come back as a vector of the same distinct items."
+  [host kot]
+  (cond
+    (and (set? host) (vector? kot)) (and (= (count host) (count kot)) (= host (set kot)))
+    (and (map? host) (map? kot)) (and (= (set (keys host)) (set (keys kot)))
+                                      (every? (fn [k] (like? (get host k) (get kot k))) (keys host)))
+    (and (sequential? host) (sequential? kot)) (and (= (count host) (count kot)) (every? true? (map like? host kot)))
+    :else (= host kot)))
+
+(defn agree? [exp got]
+  (cond
+    (and (str/starts-with? exp "OK:") (str/starts-with? got "OK:"))
+    (let [h (cljs.reader/read-string (subs exp 3))
+          k (cljs.reader/read-string (subs got 3))]
+      (and (map? h) (map? k)
+           (= (set (keys h)) (set (keys k)))
+           (every? (fn [key] (if (evaluator-keys key) (like? (get h key) (get k key)) (= (get h key) (get k key))))
+                   (keys h))))
+    (and (str/starts-with? exp "THROW::internal") (str/starts-with? got "THROW:")) (str/starts-with? got "THROW::internal")
+    :else (= exp got)))
+
+;; ---- corpus ----
+
+(def ^:dynamic *rng* (atom 1))
+;; Park-Miller (16807 * s mod 2^31-1): the product stays below 2^53, exact in a JS number
+(defn rnd [n] (let [s (swap! *rng* (fn [s] (mod (* s 16807) 2147483647)))] (mod (quot s 8) n)))
+(defn pick [xs] (nth xs (rnd (count xs))))
+(defn shuffle* [xs] (reduce (fn [v i] (let [j (+ i (rnd (- (count v) i)))] (assoc v i (nth v j) j (nth v i)))) (vec xs) (range (count xs))))
+
+(defn grant [id] [:cap/call id])
+(defn ids [n] (take n (shuffle* (range 256))))
+
+(def named-catalog
+  (vec (sort (map name (keys sema/capability-registry)))))
+
+(defn catalog-id [nm] (let [v (get sema/capability-registry nm)] (if (number? v) v (js/Number v))))
+
+(def checkfull-42
+  [:identity/sign :identity/verify :hash/sha256 :http/post :log/read :log/append :clock/now :state/transact :ui/commit
+   :ui/next-event :llm/generate :storage/transact :http/get-stream :object/get-stream :object/put-block
+   :object/compare-and-set-ref :http/accept :http/reply :fs/transact :process/spawn :secret/get :git/run :entropy/draw
+   :dataspace/transact :stream/accept :stream/send :net/datagram :link/frame :can/frame :code/eval :screen/observe
+   :screen/act :env/read :fs/browse :fs/app-data :fs/browse-dir :io/write :cli/args :io/write-error :sys/cwd :io/read
+   :gpu/compute])
+
+(def wired-42 (set (map (fn [nm] (grant (catalog-id nm))) checkfull-42)))
+(def default-4 #{[:cap/call 35] [:cap/call 37] [:cap/call 38] [:cap/call 39]})
+
+(defn hir-of [row] {:effects (set row)})
+
+(def abac-variants
+  [{:abac {:policy/id "p1" :subject/ids #{"alice"}} :attributes {:subject {:id "alice"}}}
+   {:abac {:policy/id "p1" :subject/ids #{"alice"}} :attributes {:subject {:id "bob"}}}
+   {:abac {:policy/id "p2" :action/ids #{:compiler/admit}}}
+   {:abac {:policy/id "p3" :action/ids #{:compiler/other}}}
+   {:abac {:tenant/isolation? true} :attributes {:subject {:tenant "t1"} :resource {:tenant "t1"}}}
+   {:abac {:tenant/isolation? true} :attributes {:subject {:tenant "t1"} :resource {:tenant "t2"}}}
+   {:abac {:valid/expires-at "2026-12-31"} :attributes {:environment {:now "2026-10-10"}}}
+   {:abac {:valid/expires-at "2026-01-01"} :attributes {:environment {:now "2026-10-10"}}}
+   {:abac {:valid/not-before "2026-01-01"}}
+   {:abac {:disclosure/max-bytes 100} :attributes {:disclosure-bytes 50}}
+   {:abac {:disclosure/max-bytes 100} :attributes {:disclosure-bytes 500}}
+   {:abac {:environment/require-device-trust? true} :attributes {:environment {:device-trusted? true}}}
+   {:abac {:environment/require-device-trust? true}}
+   {:attributes {:subject {:clearance :internal} :resource {:classification :secret}}}
+   {:attributes {:subject {:clearance :secret} :resource {:classification :internal}}}
+   {:attributes {:subject {:role :admin} :purpose :audit}}
+   {:abac {:subject/roles [:admin :ops]} :attributes {:subject {:role :ops}}}
+   {:abac {:purpose/allowed #{:audit}} :attributes {:purpose :audit}}
+   {:abac {:purpose/allowed #{:audit}} :attributes {:purpose :sales}}])
+
+(defn abac-effects-variant [row]
+  [{:abac {:resource/effects (set row)}}
+   {:abac {:resource/effects #{}}}
+   {:abac {:action/capabilities (set row)}}])
+
+(def attribute-shapes
+  [{:attributes nil} {:attributes {}} {:attributes {:resource nil}} {:attributes {:resource {:id "r"}}}
+   {:attributes {:resource [:id "r"]}} {:attributes {:action {:id :other}}} {:attributes {:action [:k 1]}}
+   {:attributes {:resource "x"}} {:attributes {:action 7}} {:attributes [1 2]} {:attributes "x"}
+   {:attributes {:resource {:effects #{[:cap/call 1]}}}}])
+
+(def flow-variants
+  [{:information-flow {:input-classifications [:public] :output-classification :public}}
+   {:information-flow {:input-classifications [:secret] :output-classification :public}}
+   {:information-flow {:input-classifications [:internal :public] :output-classification :internal}}
+   {:information-flow {:input-classifications [:secret] :output-classification :public
+                       :declassification-grant {:id "g1" :from :secret :to :public :expires-at "2027-01-01"}}
+    :attributes {:environment {:now "2026-10-10"}}}
+   {:information-flow nil} {:information-flow false} {:information-flow true} {:information-flow [:a 1]}])
+
+(def crypto-variants
+  [{:crypto-required? true} {:crypto-required? false} {:crypto-required? nil} {:crypto-required? "yes"}
+   {:crypto-envelope {:kem :x25519}} {:crypto-required? true :crypto-policy {} :crypto-envelope {}}])
+
+(def hardware-variants
+  [{:hardware-signing-required? true}
+   {:hardware-signing-required? true
+    :hardware-signing-evidence {:provider-id "se" :hardware-backed? true :provider-origin-verified? true
+                                :private-exported? false :sign-verified? true :unavailable-failed-closed? true}}
+   {:hardware-signing-evidence {:provider-id "se" :hardware-backed? false}}
+   {:hardware-signing-required? false}])
+
+(def shape-cases
+  (let [row [[:cap/call 3]]]
+    (for [p [nil [] "x" {} {:allow #{}} {:allow nil} {:allow [[:cap/call 3]]} {:allow '([:cap/call 3])}
+             {:allow #{[:cap/call 3]} :unknown 1} {:allow #{[:cap/call 3]} :linux-static true}
+             {:allow #{[:cap/call 3]}} {:allow #{[:cap/call 256]}} {:allow #{[:cap/call -1]}} {:allow #{[:cap/call "3"]}}
+             {:allow #{[:cap/foo 3]}} {:allow #{[:cap/call 3 4]}} {:allow #{[:cap/call]}} {:allow #{'(:cap/call 3)}}
+             {:allow #{:x [:cap/call 3]}} {:allow #{[:cap/call :io/write] [:cap/call 3]}} {:allow #{[:cap/call 255] [:cap/call 0] [:cap/call 3]}}]
+          r [row [] [[:cap/call 255]] ['(:cap/call 3)] [:abort [:cap/call 3]]]]
+      {:hir (hir-of r) :policy p :group "shape"})))
+
+(defn effects-shape-cases []
+  (for [e [nil [] [[:cap/call 3]] '([:cap/call 3]) #{} [[:cap/call 3] '(:cap/call 3)] {:k 1} "s"]]
+    {:hir {:effects e} :policy {:allow #{[:cap/call 3]}} :group "shape"}))
+
+(defn size-cases []
+  (for [n [0 1 31 32 33 42 200]
+        variant [:cover :missing :malformed :named :abac :attrs :flow :crypto :hardware :subset]
+        rep (range 2)]
+    (let [gs (map grant (ids n))
+          k (min n (rnd 6))
+          row (take k (shuffle* gs))
+          extra (grant (+ 1000 (rnd 10)))
+          allow (set gs)
+          base {:allow allow}
+          [row policy]
+          (case variant
+            :cover [row base]
+            :missing [(conj (vec row) (grant (pick (remove (set (map second gs)) (range 256))))) base]
+            :malformed [row (assoc base :allow (conj allow (pick [[:cap/call 256] [:cap/call -3] [:other 1] extra [:cap/call 1 2]])))]
+            :named [(take 2 (map (fn [nm] (grant (keyword nm))) (shuffle* named-catalog)))
+                    (assoc base :allow (into allow (map (fn [nm] (grant (keyword nm))) (take (max 1 (quot n 4)) (shuffle* named-catalog)))))]
+            :abac [row (merge base (pick abac-variants))]
+            :attrs [row (merge base (pick attribute-shapes))]
+            :flow [row (merge base (pick flow-variants))]
+            :crypto [row (merge base (pick crypto-variants))]
+            :hardware [row (merge base (pick hardware-variants))]
+            :subset [row (merge base (pick (abac-effects-variant (if (= rep 0) row (take 1 row)))))])]
+      {:hir (hir-of row) :policy policy :group (str "n" n)})))
+
+(defn catalog-cases []
+  (concat
+   (for [k [0 1 2 5 42]]
+     (let [row (take k (shuffle* (vec wired-42)))]
+       {:hir (hir-of row) :policy {:allow wired-42} :group "catalog42"}))
+   [{:hir (hir-of [[:cap/call 38]]) :policy {:allow (set (map grant checkfull-42))} :group "catalog42"}]))
+
+(defn random-cases [n]
+  (for [_ (range n)]
+    (let [size (pick [0 1 2 5 31 32 33 42 64 200])
+          gs (map grant (ids size))
+          row (concat (take (rnd 5) (shuffle* gs)) (when (= 0 (rnd 6)) [(grant (rnd 256))]) (when (= 0 (rnd 12)) [:abort]))
+          features (take (rnd 4) (shuffle* [:abac :attrs :flow :crypto :hardware :subset]))
+          policy (reduce (fn [p f]
+                           (merge p (case f
+                                      :abac (pick abac-variants)
+                                      :attrs (pick attribute-shapes)
+                                      :flow (pick flow-variants)
+                                      :crypto (pick crypto-variants)
+                                      :hardware (pick hardware-variants)
+                                      :subset (pick (abac-effects-variant row)))))
+                         {:allow (set gs)} features)]
+      {:hir (hir-of row) :policy policy :group "random"})))
+
+(defn- num [x] (if (= js/BigInt (some-> x .-constructor)) (js/Number x) x))
+(defn- denum [v]
+  (cond (vector? v) (mapv denum v) (set? v) (set (map denum v)) (map? v) (into {} (map (fn [[k x]] [(denum k) (denum x)]) v))
+        (seq? v) (map denum v) :else (num v)))
+
+(defn corpus-rows [file]
+  (let [paths (remove empty? (str/split-lines (.readFileSync fs file "utf8")))
+        rows (keep (fn [p]
+                     (try (let [hir (sema/analyze (.readFileSync fs p "utf8"))]
+                            (vec (remove #{:abort :state} (denum (:effects hir)))))
+                          (catch :default _ nil)))
+                   paths)]
+    (tick "corpus programs" (count paths) "analysed" (count rows) "with a non-empty row" (count (filter seq rows)))
+    (vec (distinct (map set rows)))))
+
+(defn corpus-cases [rows]
+  (for [row rows p [default-4 wired-42 nil]]
+    {:hir (hir-of row) :policy (if p {:allow p} {}) :group "corpus"}))
+
+(defn host-phase []
+  (reset! *rng* (js/parseInt (or (.-ADM_SEED js/process.env) "20261010")))
+  (let [rows (let [f (.-ADM_CORPUS js/process.env)] (if (seq f) (corpus-rows f) []))
+        _ (tick "corpus rows" (count rows) "by size" (into (sorted-map) (frequencies (map count rows))))
+        cases (vec (concat shape-cases (effects-shape-cases) (size-cases) (catalog-cases) (corpus-cases rows)
+                           (random-cases (js/parseInt (or (.-ADM_GEN js/process.env) "400")))))
+        cases (mapv #(assoc % :exp (host-outcome %)) cases)
+        batch (js/parseInt (or (.-ADM_BATCH js/process.env) "40"))
+        batches (partition-all batch cases)]
+    (.mkdirSync fs (str scratch "/batches") #js {:recursive true})
+    (doseq [[i b] (map-indexed vector batches)]
+      (let [one (fn [{:keys [hir policy]}] (str "[" (->edn hir) " " (->edn policy) "]"))]
+        (.writeFileSync fs (str scratch "/batches/" (+ 1000 i) ".edn") (str "[" (str/join "\n " (map one b)) "]\n"))
+        ;; the same cases one per file: a batch whose run traps is rerun case by case
+        (.mkdirSync fs (str scratch "/batches/" (+ 1000 i)) #js {:recursive true})
+        (doseq [[j c] (map-indexed vector b)]
+          (.writeFileSync fs (str scratch "/batches/" (+ 1000 i) "/" (+ 1000 j) ".edn") (str "[" (one c) "]\n")))))
+    (.writeFileSync fs (str scratch "/expected.edn") (pr-str (mapv #(select-keys % [:group :exp :hir :policy]) cases)))
+    (tick "host outcomes" (count cases) "batches" (count batches))))
+
+(defn compare-phase []
+  (let [expected (cljs.reader/read-string (.readFileSync fs (str scratch "/expected.edn") "utf8"))
+        files (sort (filter #(str/ends-with? % ".out") (.readdirSync fs (str scratch "/batches"))))
+        got (vec (mapcat (fn [f] (vec (remove empty? (map str/trim (str/split (.readFileSync fs (str scratch "/batches/" f) "utf8") #"\n\|~\|\n?")))))
+                         files))
+        _ (when (not= (count got) (count expected)) (println "COUNT MISMATCH expected" (count expected) "got" (count got)))
+        results (mapv (fn [c g] (assoc c :got g)) expected (concat got (repeat "MISSING")))
+        ;; a run that traps on a row of more than 32 grants: the row crosses into kotoba.security.abac as
+        ;; a document (its attributes' :effects / :capabilities), which holds at most 32 items
+        row-trap? (fn [c] (and (str/starts-with? (:got c) "TRAP") (> (count (:effects (:hir c))) 32)))
+        _ (println "TRAP on a row of more than 32 grants (kotoba.security.abac reads documents):" (count (filter row-trap? results)))
+        results (vec (remove row-trap? results))
+        bad (remove #(agree? (:exp %) (:got %)) results)
+        kind (fn [o] (cond (str/starts-with? o "OK:") "admit"
+                           (str/starts-with? o "THROW:") (let [s (subs o 6)] (subs s 0 (or (str/index-of s " ") (count s))))
+                           :else o))]
+    (doseq [[g rs] (sort-by key (group-by :group results))]
+      (println (str g ": cases " (count rs) " agree " (count (filter #(agree? (:exp %) (:got %)) rs))
+                    " host outcomes " (into (sorted-map) (frequencies (map (comp kind :exp) rs))))))
+    (println "host refusals" (into (sorted-map) (frequencies (keep #(when (str/starts-with? (:exp %) "THROW:") (:exp %)) results))))
+    (println "grant counts" (into (sorted-map) (frequencies (map #(count (:allow (:policy %))) (filter #(map? (:policy %)) results)))))
+    (println "TOTAL cases" (count results) "agree" (- (count results) (count bad)) "DISAGREE" (count bad))
+    (doseq [c bad]
+      (when (and (str/starts-with? (:exp c) "OK:") (str/starts-with? (:got c) "OK:"))
+        (let [h (cljs.reader/read-string (subs (:exp c) 3)) k (cljs.reader/read-string (subs (:got c) 3))]
+          (println "DIFF-KEYS" (vec (for [key (distinct (concat (keys h) (keys k)))
+                                          :when (not (if (evaluator-keys key) (like? (get h key) (get k key)) (= (get h key) (get k key))))]
+                                      [key (get h key) (get k key)]))))))
+    (doseq [c (take 10 bad)]
+      (println "DISAGREE\n  exp" (subs (:exp c) 0 (min 600 (count (:exp c)))) "\n  got" (subs (:got c) 0 (min 600 (count (:got c))))
+               "\n  hir" (->edn (:hir c)) "\n  policy" (let [s (->edn (:policy c))] (subs s 0 (min 400 (count s))))))
+    (js/process.exit (if (seq bad) 1 0))))
+
+(if (= "compare" (.-ADM_MODE js/process.env)) (compare-phase) (host-phase))

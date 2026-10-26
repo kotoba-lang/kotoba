@@ -1,0 +1,417 @@
+(ns kotoba.kir-kernel-dequant-dot-test
+  "The oracle for the fused dequantize-and-dot family.
+
+  Two claims are under test and they are separate claims.
+
+  THE DEQUANTIZATION. Each format's codes become f32 values by an equation
+  vendored from llama.cpp @3173a564 into `os/aiueos/kernel/qwen35_quant.c`.
+  The reference below is an INDEPENDENT port of that C -- written with the
+  C's own `y++`/`q += 32` pointer walk and its own index arithmetic, not with
+  the oracle's `mapcat` -- so an off-by-one in one of them is not an
+  off-by-one in the other. It is compared with the oracle ELEMENT BY ELEMENT,
+  which the fold makes possible: an activation vector that is 1.0 at one
+  position and 0.0 everywhere else answers with exactly that element's
+  dequantized value, because +0.0 is the additive identity and every other
+  product is a zero.
+
+  THE ACCUMULATION TREE. `dot_scalar` (`qwen35_infer.c:234`), the same tree
+  `kernel-dot-f32` folds with:
+
+    four lane accumulators, all +0.0
+    for each eight-element group:
+        lane k += w[i+k]   * x[i+k]      for k = 0..3   (lower half)
+        lane k += w[i+4+k] * x[i+4+k]    for k = 0..3   (upper half)
+    sum = (lane0 + lane1) + (lane2 + lane3)
+
+  There is no tail: 32, 256 and 256 are all multiples of eight. One test below
+  is written so that a DIFFERENT tree gives a DIFFERENT answer, and asserts
+  both halves of that -- the answer the contract produces and the answer a
+  straight left-to-right sum produces. Without it this suite would pass for
+  anything that adds the right products.
+
+  NO REAL MODEL BYTES. This host carries no GGUF: `mdfind -name .gguf`
+  returned nothing, a depth-6 `find` over /Volumes and $HOME returned nothing,
+  and no file above 2 GiB exists under $HOME while the whole volume holds
+  17 GiB. So every block below is SYNTHESISED, and the cross-check is against
+  the port of the C rather than against the model. Measured 2026-09-02."
+  (:require #?(:clj  [kotoba.test :refer [deftest is testing]]
+            :cljs [cljs.test :refer [deftest is testing] :include-macros true])
+            [kotoba.kir :as kir]
+            [kotoba.kir.value :as value]))
+
+;; ---------------------------------------------------------------------------
+;; host arithmetic, at binary32
+;; ---------------------------------------------------------------------------
+
+(defn- f32 [x] #?(:clj (float x) :cljs (js/Math.fround x)))
+(defn- fadd [x y] #?(:clj (float (+ (float x) (float y))) :cljs (js/Math.fround (+ x y))))
+(defn- fmul [x y] #?(:clj (float (* (float x) (float y))) :cljs (js/Math.fround (* x y))))
+(defn- fsub [x y] #?(:clj (float (- (float x) (float y))) :cljs (js/Math.fround (- x y))))
+
+(defn- bits [x]
+  #?(:clj (long (value/f32-to-i64-bits (f32 x)))
+     :cljs (js/Number (value/f32-to-i64-bits (f32 x)))))
+
+(defn- f32-le-bytes [x]
+  (let [b (bits x)]
+    (mapv #(bit-and (bit-shift-right b (* 8 %)) 255) (range 4))))
+
+(defn- w [x] #?(:clj x :cljs (js/Number x)))
+
+;; ---------------------------------------------------------------------------
+;; half precision, as a TABLE of hand-checked patterns
+;;
+;; The oracle transcribes the C's `fp16_to_f32`; a second transcription here
+;; would agree with it for the same reason a copy agrees with its original.
+;; These twelve are written out instead: each pattern's value was derived from
+;; the IEEE-754 binary16 definition by hand and covers a branch the C has.
+;; ---------------------------------------------------------------------------
+
+(def ^:private halves
+  {:one          [0x3C00 1.0]
+   :two          [0x4000 2.0]
+   :half         [0x3800 0.5]
+   :quarter      [0x3400 0.25]
+   :minus-one    [0xBC00 -1.0]
+   :minus-half   [0xB800 -0.5]
+   :zero         [0x0000 0.0]
+   :minus-zero   [0x8000 -0.0]
+   ;; the smallest subnormal, 2^-24 -- the C reaches it through a normalising
+   ;; loop and the machine reaches it by scaling an f32 subnormal
+   :tiny         [0x0001 5.9604644775390625e-8]
+   ;; the largest subnormal, 1023 * 2^-24
+   :big-subnormal [0x03FF 6.097555160522461e-5]
+   ;; the smallest normal, 2^-14
+   :small-normal [0x0400 6.103515625e-5]
+   ;; the largest finite half
+   :largest      [0x7BFF 65504.0]})
+
+(defn- half-bits [key] (first (get halves key)))
+(defn- half-value [key] (f32 (second (get halves key))))
+
+(defn- le16 [value] [(bit-and value 255) (bit-and (bit-shift-right value 8) 255)])
+
+;; ---------------------------------------------------------------------------
+;; the reference: an independent port of `dequantize_row_*`
+;;
+;; Written with the C's pointer walk. `out` is `y`, `cursor` is `y++`, and the
+;; `q += 32` / `ql += 64` advances are spelled out. HALF is passed in from the
+;; table above rather than computed, so the reference does not carry a second
+;; copy of `fp16_to_f32`.
+;; ---------------------------------------------------------------------------
+
+(defn- reference-q8-0
+  "`for (j = 0; j < 32; ++j) y[j] = x.qs[j] * d;`"
+  [d codes]
+  (loop [j 0 out []]
+    (if (= j 32) out (recur (inc j) (conj out (fmul (nth codes j) d))))))
+
+(defn- reference-scale-min-k4
+  "`get_scale_min_k4`, statement for statement."
+  [j scales]
+  (if (< j 4)
+    [(bit-and (nth scales j) 63) (bit-and (nth scales (+ j 4)) 63)]
+    [(bit-or (bit-and (nth scales (+ j 4)) 0xF)
+             (bit-shift-left (bit-shift-right (nth scales (- j 4)) 6) 4))
+     (bit-or (bit-shift-right (nth scales (+ j 4)) 4)
+             (bit-shift-left (bit-shift-right (nth scales j) 6) 4))]))
+
+(defn- reference-q4-k
+  "`dequantize_row_q4_K`'s body for one block, with `q` and `y++` explicit."
+  [d dmin scales qs]
+  (loop [j 0 is 0 q 0 out []]
+    (if (= j 256)
+      out
+      (let [[sc0 m0] (reference-scale-min-k4 is scales)
+            [sc1 m1] (reference-scale-min-k4 (inc is) scales)
+            d1 (fmul d sc0) m1f (fmul dmin m0)
+            d2 (fmul d sc1) m2f (fmul dmin m1)
+            low (loop [l 0 acc out]
+                  (if (= l 32)
+                    acc
+                    (recur (inc l)
+                           (conj acc (fsub (fmul d1 (bit-and (nth qs (+ q l)) 0xF))
+                                           m1f)))))
+            high (loop [l 0 acc low]
+                   (if (= l 32)
+                     acc
+                     (recur (inc l)
+                            (conj acc (fsub (fmul d2 (bit-shift-right (nth qs (+ q l)) 4))
+                                            m2f)))))]
+        (recur (+ j 64) (+ is 2) (+ q 32) high)))))
+
+(defn- reference-q6-k
+  "`dequantize_row_q6_K`'s body for one block. `y[l + 0]`, `y[l + 32]`,
+  `y[l + 64]` and `y[l + 96]` are written at their own offsets, and `y`, `ql`,
+  `qh` and `sc` advance by 128, 64, 32 and 8 at the end of each half."
+  [d ql qh scales]
+  (let [out (volatile! (vec (repeat 256 (f32 0.0))))]
+    (doseq [n [0 1]]
+      (let [y (* 128 n) qlp (* 64 n) qhp (* 32 n) scp (* 8 n)]
+        (doseq [l (range 32)]
+          (let [is (quot l 16)
+                q1 (- (bit-or (bit-and (nth ql (+ qlp l)) 0xF)
+                              (bit-shift-left
+                               (bit-and (bit-shift-right (nth qh (+ qhp l)) 0) 3) 4))
+                      32)
+                q2 (- (bit-or (bit-and (nth ql (+ qlp l 32)) 0xF)
+                              (bit-shift-left
+                               (bit-and (bit-shift-right (nth qh (+ qhp l)) 2) 3) 4))
+                      32)
+                q3 (- (bit-or (bit-shift-right (nth ql (+ qlp l)) 4)
+                              (bit-shift-left
+                               (bit-and (bit-shift-right (nth qh (+ qhp l)) 4) 3) 4))
+                      32)
+                q4 (- (bit-or (bit-shift-right (nth ql (+ qlp l 32)) 4)
+                              (bit-shift-left
+                               (bit-and (bit-shift-right (nth qh (+ qhp l)) 6) 3) 4))
+                      32)]
+            (vswap! out assoc
+                    (+ y l 0) (fmul (fmul d (nth scales (+ scp is 0))) q1)
+                    (+ y l 32) (fmul (fmul d (nth scales (+ scp is 2))) q2)
+                    (+ y l 64) (fmul (fmul d (nth scales (+ scp is 4))) q3)
+                    (+ y l 96) (fmul (fmul d (nth scales (+ scp is 6))) q4))))))
+    @out))
+
+;; ---------------------------------------------------------------------------
+;; the modules under test
+;; ---------------------------------------------------------------------------
+
+(defn- module [head]
+  {:format :kotoba.kir/v4
+   :entry 'main
+   :effects #{}
+   :functions [{:name 'main
+                :params '[w-base w-length x-base x-length blocks]
+                :param-types [:i64 :i64 :i64 :i64 :i64]
+                :result :i64 :effects #{}
+                :body (list head 'w-base 'w-length 'x-base 'x-length 'blocks)}]})
+
+(def ^:private image-base 4096)
+
+(defn- run
+  "Fold PACKED (a vector of bytes) against ACTIVATIONS (a vector of host f32
+  values), declaring each region's exact byte length unless overridden."
+  ([head packed activations blocks] (run head packed activations blocks {}))
+  ([head packed activations blocks opts]
+   (let [image {:base image-base
+                :bytes (volatile! (vec (concat packed
+                                               (mapcat f32-le-bytes activations))))}
+         arguments [image-base (count packed)
+                    (+ image-base (count packed)) (* 4 (count activations))
+                    blocks]]
+     (w (kir/execute (module head) 'main
+                     (if-let [override (:arguments opts)] (override arguments) arguments)
+                     (merge {:memory image :fuel 4000000}
+                            (dissoc opts :arguments)))))))
+
+(defn- one-hot [n i] (mapv (fn [j] (if (= i j) (f32 1.0) (f32 0.0))) (range n)))
+
+(defn- signless-zero
+  "The one thing the one-hot probe cannot see. `+0.0 + -0.0` is `+0.0` under
+  round-to-nearest, so a dequantized element of -0.0 comes back as +0.0 and
+  no fold can tell the two apart. Both sides are normalised here, and
+  `zeros-are-a-minority` below keeps that from quietly excusing an
+  implementation that answers zero for everything."
+  [x]
+  (if (zero? (bits x)) (f32 0.0) (if (= -2147483648 (bits x)) (f32 0.0) x)))
+
+(defn- element-values
+  "Every element of ONE block, read back one at a time. This is the fold used
+  as a probe: with a one-hot activation vector the answer IS the element."
+  [head packed elements]
+  (mapv (fn [i]
+          (value/i64-bits-to-f32
+           #?(:clj (run head packed (one-hot elements i) 1)
+              :cljs (js/BigInt (run head packed (one-hot elements i) 1)))))
+        (range elements)))
+
+(defn- trapped [thunk]
+  (try (thunk) nil
+       (catch :default e (ex-data e))))
+
+;; ---------------------------------------------------------------------------
+;; Q8_0: 34 bytes carry 32 elements
+;; ---------------------------------------------------------------------------
+
+(defn- q8-0-block [half codes]
+  (vec (concat (le16 half) (mapv #(bit-and % 255) codes))))
+
+(deftest q8-0-dequantizes-what-the-c-dequantizes
+  (doseq [key [:one :half :minus-one :quarter :tiny :largest :zero :minus-half]]
+    (let [codes (mapv (fn [j] (- (mod (* 37 (inc j)) 256) 128)) (range 32))
+          packed (q8-0-block (half-bits key) codes)
+          expected (reference-q8-0 (half-value key) codes)
+          observed (element-values 'kernel-dequant-dot-q8-0 packed 32)]
+      (is (= 32 (count expected)))
+      (doseq [j (range 32)]
+        (is (= (bits (signless-zero (nth expected j)))
+               (bits (signless-zero (nth observed j))))
+            (str "scale " (name key) " element " j)))
+      ;; Evidence floor: a probe that answered zero everywhere would satisfy
+      ;; every assertion above once the zeros are normalised.
+      (when-not (contains? #{:zero} key)
+        (is (< (count (filter #(zero? (bits (signless-zero %))) expected)) 32)
+            (str "scale " (name key) " has non-zero elements to compare"))))))
+
+(deftest q8-0-codes-are-signed
+  ;; 0x80 is -128 and not 128. A reading that took the byte unsigned would
+  ;; answer +128 here and every weight in the model would be wrong by 256
+  ;; scales at exactly the codes that matter most.
+  (let [packed (q8-0-block (half-bits :one) (concat [-128 -1 0 1 127] (repeat 27 0)))
+        observed (element-values 'kernel-dequant-dot-q8-0 packed 32)]
+    (is (= (bits -128.0) (bits (nth observed 0))))
+    (is (= (bits -1.0) (bits (nth observed 1))))
+    (is (= (bits 0.0) (bits (nth observed 2))))
+    (is (= (bits 1.0) (bits (nth observed 3))))
+    (is (= (bits 127.0) (bits (nth observed 4))))))
+
+(deftest q8-0-sums-exactly-when-the-sum-is-exact
+  ;; Every product is a small integer, so no tree can disagree. This is the
+  ;; plumbing test: it says the operation reads the right bytes at all.
+  (let [codes (mapv inc (range 32))
+        packed (q8-0-block (half-bits :one) codes)]
+    (is (= (bits 528.0)
+           (run 'kernel-dequant-dot-q8-0 packed (vec (repeat 32 (f32 1.0))) 1))
+        "1 + 2 + ... + 32")))
+
+(deftest q8-0-folds-with-the-contract-tree-and-no-other
+  ;; One product is 2^24 and the other thirty-one are 1.0. Above 2^24 the
+  ;; binary32 spacing is 2, so a 1 added in isolation rounds away and a pair
+  ;; of them does not: the answer NAMES the order of summation.
+  ;;
+  ;;   contract: lane0 = 2^24 (its seven 1s all round away), lanes 1..3 = 8
+  ;;             (2^24 + 8) + (8 + 8) = 2^24 + 24
+  ;;   left to right: 2^24, and every one of the thirty-one 1s is lost
+  (let [packed (q8-0-block (half-bits :one) (vec (repeat 32 1)))
+        activations (assoc (vec (repeat 32 (f32 1.0))) 0 (f32 16777216.0))
+        answer (run 'kernel-dequant-dot-q8-0 packed activations 1)]
+    (is (= (bits 16777240.0) answer) "(s0+s1)+(s2+s3) over four lanes")
+    (is (not= (bits 16777216.0) answer) "a left-to-right sum answers 2^24")
+    (is (= 0x4B80000C answer) "the pattern, as the console prints it")))
+
+(deftest q8-0-spans-both-regions
+  (let [packed (vec (concat (q8-0-block (half-bits :one) (vec (repeat 32 1)))
+                            (q8-0-block (half-bits :two) (vec (repeat 32 1)))))
+        activations (vec (repeat 64 (f32 1.0)))]
+    (is (= (bits 32.0) (run 'kernel-dequant-dot-q8-0 packed activations 1))
+        "one block reads 32 codes at scale 1")
+    (is (= (bits 96.0) (run 'kernel-dequant-dot-q8-0 packed activations 2))
+        "two blocks add 32 more at scale 2")))
+
+(deftest a-block-count-of-zero-is-positive-zero
+  (let [packed (q8-0-block (half-bits :one) (vec (repeat 32 7)))]
+    (is (zero? (run 'kernel-dequant-dot-q8-0 packed (vec (repeat 32 (f32 1.0))) 0)))))
+
+;; ---------------------------------------------------------------------------
+;; Q4_K: 144 bytes carry 256 elements
+;; ---------------------------------------------------------------------------
+
+(defn- q4-k-block [d dmin scales qs]
+  (vec (concat (le16 d) (le16 dmin) scales qs)))
+
+(deftest q4-k-dequantizes-what-the-c-dequantizes
+  (let [scales (mapv (fn [i] (mod (* 53 (inc i)) 256)) (range 12))
+        qs (mapv (fn [i] (mod (* 29 (inc i)) 256)) (range 128))
+        packed (q4-k-block (half-bits :half) (half-bits :quarter) scales qs)
+        expected (reference-q4-k (half-value :half) (half-value :quarter) scales qs)
+        observed (element-values 'kernel-dequant-dot-q4-k packed 256)]
+    (is (= 256 (count expected)))
+    (doseq [j (range 256)]
+      (is (= (bits (signless-zero (nth expected j)))
+             (bits (signless-zero (nth observed j))))
+          (str "q4-k element " j)))
+    (is (< (count (filter #(zero? (bits (signless-zero %))) expected)) 256)
+        "the fixture has non-zero elements to compare")))
+
+(deftest q4-k-reads-the-second-scale-group-through-the-packed-form
+  ;; `get_scale_min_k4` splits at j = 4: the first four scales are six-bit
+  ;; fields of their own byte, and the last four are assembled from the low
+  ;; nibble of one byte and the top two bits of another. Elements 128..255
+  ;; are the only ones that see the second form, so a reading that used the
+  ;; first form everywhere would be right for exactly half the block.
+  (let [scales (mapv (fn [i] (mod (* 53 (inc i)) 256)) (range 12))
+        [sc m] (reference-scale-min-k4 5 scales)]
+    (is (not= sc (bit-and (nth scales 5) 63))
+        "the fixture is chosen so the two forms disagree")
+    (is (not= m (bit-and (nth scales 9) 63)))))
+
+;; ---------------------------------------------------------------------------
+;; Q6_K: 210 bytes carry 256 elements
+;; ---------------------------------------------------------------------------
+
+(defn- q6-k-block [ql qh scales d]
+  (vec (concat ql qh (mapv #(bit-and % 255) scales) (le16 d))))
+
+(deftest q6-k-dequantizes-what-the-c-dequantizes
+  (let [ql (mapv (fn [i] (mod (* 31 (inc i)) 256)) (range 128))
+        qh (mapv (fn [i] (mod (* 71 (inc i)) 256)) (range 64))
+        scales (mapv (fn [i] (- (mod (* 43 (inc i)) 256) 128)) (range 16))
+        packed (q6-k-block ql qh scales (half-bits :quarter))
+        expected (reference-q6-k (half-value :quarter) ql qh scales)
+        observed (element-values 'kernel-dequant-dot-q6-k packed 256)]
+    (is (= 256 (count expected)))
+    (doseq [j (range 256)]
+      (is (= (bits (signless-zero (nth expected j)))
+             (bits (signless-zero (nth observed j))))
+          (str "q6-k element " j)))
+    (is (< (count (filter #(zero? (bits (signless-zero %))) expected)) 256)
+        "the fixture has non-zero elements to compare")))
+
+(deftest q6-k-scale-index-changes-every-sixteen-elements
+  ;; `is = l/16` inside a loop over 32. A fixture whose scales are all equal
+  ;; would pass with `is` computed any way at all, so this asserts the
+  ;; reference itself distinguishes the two halves.
+  (let [scales (mapv (fn [i] (- (mod (* 43 (inc i)) 256) 128)) (range 16))]
+    (is (not= (nth scales 0) (nth scales 1))
+        "the fixture's first two scales differ, so l<16 and l>=16 differ")))
+
+;; ---------------------------------------------------------------------------
+;; the checks, in the emitter's order
+;; ---------------------------------------------------------------------------
+
+(deftest every-check-traps-with-its-own-reason
+  (let [packed (q8-0-block (half-bits :one) (vec (repeat 32 1)))
+        activations (vec (repeat 32 (f32 1.0)))
+        at (fn [f] (run 'kernel-dequant-dot-q8-0 packed activations 1 {:arguments f}))]
+    (testing "a declared window above the ceiling"
+      (is (= :length-above-profile-maximum
+             (:check (trapped #(at (fn [[b _ c d e]] [b 65537 c d e]))))))
+      (is (= :second-length-above-profile-maximum
+             (:check (trapped #(at (fn [[b l c _ e]] [b l c 65537 e])))))))
+    (testing "a null base, either of them"
+      (is (= :null-base (:check (trapped #(at (fn [[_ l c d e]] [0 l c d e]))))))
+      (is (= :null-second-base
+             (:check (trapped #(at (fn [[b l _ d e]] [b l 0 d e])))))))
+    (testing "a block count above what the ceiling admits"
+      (is (= :block-count-above-limit
+             (:check (trapped #(at (fn [[b l c d _]] [b l c d 513])))))))
+    (testing "and a count whose span leaves its window"
+      (is (= :blocks-outside-window
+             (:check (trapped #(at (fn [[b _ c d _]] [b 34 c d 2]))))))
+      (is (= :blocks-outside-second-window
+             (:check (trapped #(at (fn [[b _ c _ _]] [b 68 c 128 2])))))))))
+
+(deftest the-block-limit-is-512-for-q8-0-and-64-for-the-k-quants
+  ;; 512 * 34 = 17408 bytes of codes and 512 * 128 = 65536 bytes of
+  ;; activations: the f32 side is what binds, which is why all three formats
+  ;; admit exactly 16384 elements.
+  (let [packed (q8-0-block (half-bits :one) (vec (repeat 32 1)))
+        activations (vec (repeat 32 (f32 1.0)))]
+    (is (= :block-count-above-limit
+           (:check (trapped #(run 'kernel-dequant-dot-q8-0 packed activations 1
+                                  {:arguments (fn [[b l c d _]] [b l c d 513])})))))
+    (is (= :blocks-outside-window
+           (:check (trapped #(run 'kernel-dequant-dot-q8-0 packed activations 1
+                                  {:arguments (fn [[b l c d _]] [b l c d 512])}))))
+        "512 is admitted by the limit and then refused by the window")))
+
+(deftest fuel-is-charged-per-element-not-per-block
+  ;; A per-block charge would let a 256-element fold run inside the fuel two
+  ;; additions are given.
+  (let [packed (q8-0-block (half-bits :one) (vec (repeat 32 1)))
+        activations (vec (repeat 32 (f32 1.0)))]
+    (is (= :budget/fuel
+           (:trap
+            (trapped #(run 'kernel-dequant-dot-q8-0 packed activations 1 {:fuel 8}))))
+        "eight units cannot cover thirty-two elements")))

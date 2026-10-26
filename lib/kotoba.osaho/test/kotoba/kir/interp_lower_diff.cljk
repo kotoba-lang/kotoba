@@ -1,0 +1,220 @@
+;; Differential test of the guest twin `kotoba.kir` (lang/compat/kotoba/kir.kotoba, run
+;; here on the project route by the host KIR interpreter) against the host module,
+;; for the three functions the interpreter now backs:
+;;
+;;   lower      the twin's `lower` result Form must equal the host `lower` result
+;;              (`:oracle-value`, `:blocks`, `:oracle-inconclusive` and all) for every
+;;              module the twin does not refuse; a non-resource trap is a refusal
+;;              carrying the host's trap name; `oracle-unavailable` counts as N
+;;   execute    value / trap of the twin `execute` against the host `execute`
+;;   eval-expr  value / trap of the twin `eval-expr` against the host `eval-expr`
+;;
+;;   KROOTS=<src roots> node --stack-size=40000 nbb/cli.js --classpath <cp>:<osaho test> \
+;;     test/kotoba/kir/interp_lower_diff.cljk
+;;   env DIFF_DIRS, DIFF_GEN, DIFF_SEED, DIFF_BATCH as in interp_diff.cljk
+(ns kotoba.kir.interp-lower-diff
+  (:require ["node:fs" :as fs]
+            [clojure.string :as str]
+            [kotoba.sema :as sema]
+            [kotoba.kir :as kir]
+            [kotoba.kir.interp-corpus :as c :refer [->edn fmt-value trap-name slim oracle-module? make-rng gen-expr
+                                                     candidates stalled-edns]]
+            [kotoba.compiler.project :as project]
+            [kotoba.compiler.project-files :as pf]))
+
+(def t0 (js/Date.now))
+(defn tick [& xs] (apply println (str "[" (js/Math.round (/ (- (js/Date.now) t0) 1000)) "s]") xs))
+
+(def roots (vec (str/split (.-KROOTS js/process.env) #":")))
+
+(def kotoba-src
+  "(ns probe.twin-main
+  {:kotoba/export [main run-cases]}
+  (:require [kotoba.form :as form] [kotoba.kir :as kir])
+  (:schemas {:form/r [:record :form/r [[:tag :i64] [:s :string] [:n :i64] [:k :keyword] [:kids [:list [:ref :form/r]]] [:span :i64] [:data :bytes]]]}))
+
+(defn shown [v [:ref :form/r]] :string
+  (if (form/is-bool? v)
+    (if (form/bool-value v) \"B:true\" \"B:false\")
+    (let [n (form/int-value v)]
+      (string-concat \"V:\" (string-concat (string-from-i64 (i64-shift-right n 32)) (string-concat \":\" (string-from-i64 (bit-and n 4294967295))))))))
+
+(defn shown-run [r [:ref :kotoba.kir/run]] :string
+  (if (kir/run-ok? r)
+    (shown (kir/run-value r))
+    (if (string=? (kir/run-trap r) \"kotoba.kir/interpreter-unavailable\")
+      \"N\"
+      (string-concat \"T:\" (kir/run-message r)))))
+
+(defn lower-case [c [:ref :form/r]] :string
+  (let [hir (form/nth-of c 1)
+        expected (form/nth-of c 2)
+        r (kir/lower hir)]
+    (if (kir/run-ok? r)
+      (if (form/eq (kir/run-value r) expected) \"=\" \"!\")
+      (let [tr (kir/run-trap r)]
+        (cond
+          (string=? tr \"kotoba.kir/oracle-unavailable\") \"N\"
+          (string=? tr \"kotoba.kir/oracle-trap:interpreter-limit\") \"N\"
+          (form/is-string? expected)
+          (if (string=? (string-concat \"T:\" (kir/run-message r)) (form/string-value expected)) \"=\" \"!\")
+          :else \"!\")))))
+
+(defn execute-case [c [:ref :form/r]] :string
+  (let [k (form/nth-of c 1)
+        entry (form/symbol-value (form/form-get k (form/keyword-form :entry)))
+        opts (form/nth-of c 2)]
+    (shown-run (kir/execute k entry (form/no-forms) opts))))
+
+(defn eval-case [c [:ref :form/r]] :string
+  (shown-run (kir/eval-expr (form/nth-of c 1))))
+
+(defn one [c [:ref :form/r]] :string
+  (let [kind (form/symbol-value (form/nth-of c 0))]
+    (cond
+      (string=? kind \"lower\") (lower-case c)
+      (string=? kind \"execute\") (execute-case c)
+      :else (eval-case c))))
+
+(defn each [cs [:ref :form/r] i :i64 acc :string] :string
+  (if (>= i (form/count-of cs))
+    acc
+    (each cs (+ i 1) (string-concat acc (string-concat (one (form/nth-of cs i)) \"|\")))))
+
+(defn run-cases [text :string] :string
+  (each (form/edn-form text) 0 \"\"))
+
+(defn main [] :string \"\")
+")
+
+(defn compile-kotoba []
+  (let [dir (or (.-DIFF_SCRATCH js/process.env) "/private/tmp/scratch")
+        _ (.mkdirSync fs dir #js {:recursive true})
+        root (str dir "/probe_twin_main.cljk")]
+    (.writeFileSync fs root kotoba-src)
+    (let [graph (pf/load-closed-graph root roots)
+          linked (project/link-source (:sources graph) (:root graph))
+          hir (sema/analyze (:source linked) {:admit-linked-synthetics? true})]
+      (kir/lower hir))))
+
+(defn run-batch* [prog cases]
+  (let [text (str "[" (str/join "\n " (map :line cases)) "]")
+        out (kir/execute prog 'run-cases [text] {:fuel 2000000000 :frames 100000 :cells 200000000 :bytes 200000000})]
+    (vec (remove empty? (str/split out #"\|")))))
+
+(defn run-batch [prog cases]
+  (try (run-batch* prog cases)
+       (catch :default e
+         (println "batch raised:" (ex-message e) "-- rerunning singly")
+         (mapv (fn [c]
+                 (try (first (run-batch* prog [c]))
+                      (catch :default e2
+                        (println "RAISED" (ex-message e2) "on" (subs (:line c) 0 (min 300 (count (:line c)))))
+                        (str "ERR:" (ex-message e2)))))
+               cases))))
+
+;; ---- host outcomes ----
+
+(defn lower-expected
+  "The host lower result as EDN (a map), \"T:<trap>\" for a trap, nil when the host
+  rejects the module before the interpreter."
+  [hir]
+  (try (->edn (kir/lower hir))
+       (catch :default e
+         (when-let [t (trap-name e)] (pr-str (str "T:" t))))))
+
+(defn exec-outcome [k fuel frames]
+  (try (fmt-value (kir/execute k (:entry k) [] {:fuel fuel :frames frames}))
+       (catch :default e
+         (if-let [t (trap-name e)] (str "T:" t) nil))))
+
+(def heap-of (fn [] {:cells (volatile! []) :capacity 4096 :datoms (volatile! []) :kgraph-capacity 4096}))
+
+(defn eval-outcome [form fuel]
+  (try (fmt-value (kir/eval-expr form {} {} (volatile! fuel) (heap-of) [] nil))
+       (catch :default e
+         (if-let [t (trap-name e)] (str "T:" t) nil))))
+
+(defn modules
+  "The distinct oracle modules of the shared corpus, minus those whose host oracle
+  stalled (see tools/interp_diff.sh; DIFF_CACHE names its cache file)."
+  [dirs]
+  (let [cands (candidates dirs)
+        stalled (if-let [cache (.-DIFF_CACHE js/process.env)] (stalled-edns cands cache) #{})]
+    (loop [cs cands seen #{} out []]
+      (if-let [c (first cs)]
+        (if (or (seen (:edn c)) (stalled (:edn c)))
+          (recur (rest cs) seen out)
+          (recur (rest cs) (conj seen (:edn c)) (conj out c)))
+        out))))
+
+(defn main! [dirs]
+  (let [mods (modules dirs)
+        rnd (make-rng (js/parseInt (or (.-DIFF_SEED js/process.env) "20260930")))
+        groups (mapv (fn [g] [g (mapv :hir (filter #(= g (:group %)) mods))]) ["sema" "gen" "hand" "files"])
+        lstride (js/parseInt (or (.-DIFF_LSTRIDE js/process.env) "1"))
+        lower-cases (vec (for [[g hs] groups
+                               [n h] (map-indexed vector hs)
+                               :when (or (= g "sema") (zero? (mod n lstride)))
+                               :when (oracle-module? h)
+                               :let [edn (try (->edn h) (catch :default _ nil))]
+                               :when (and edn (< (count edn) (if (= g "files") 200000 12000)))
+                               :let [exp (lower-expected h)]
+                               :when exp]
+                           {:kind :lower :group g :exp exp :hir h
+                            :line (str "[lower " edn " " exp "]")}))
+        stride (js/parseInt (or (.-DIFF_STRIDE js/process.env) "1"))
+        exec-cases (vec (for [[g hs] groups
+                              [n h] (map-indexed vector hs)
+                              :when (zero? (mod n stride))
+                              :when (:entry h)
+                              :let [k (slim h)
+                                    edn (try (->edn k) (catch :default _ nil))]
+                              :when (and edn (< (count edn) (if (= g "files") 200000 12000)))
+                              [fuel frames] [[512 32] [40 4]]
+                              :let [exp (exec-outcome k fuel frames)]
+                              :when exp]
+                          {:kind :execute :group g :exp exp :hir h
+                           :line (str "[execute " edn " {:fuel " fuel " :frames " frames "}]")}))
+        eval-cases (vec (for [src (repeatedly (js/parseInt (or (.-DIFF_EVAL js/process.env) "120"))
+                                              #(str "(defn main [] :i64 " (gen-expr rnd (+ 1 (rnd 3)) [] []) ")"))
+                              :let [h (try (sema/analyze src) (catch :default _ nil))]
+                              :when (and h (= 1 (count (:functions h))))
+                              :let [form (:body (first (:functions h)))
+                                    edn (try (->edn form) (catch :default _ nil))
+                                    exp (when edn (eval-outcome form 512))]
+                              :when exp]
+                          {:kind :eval :group "eval" :exp exp :hir h
+                           :line (str "[eval " edn "]")}))
+        cases (vec (concat lower-cases exec-cases eval-cases))
+        _ (tick "host outcomes done; lower" (count lower-cases) "execute" (count exec-cases) "eval" (count eval-cases))
+        prog (compile-kotoba)
+        _ (tick "twin program compiled")
+        batch-size (js/parseInt (or (.-DIFF_BATCH js/process.env) "20"))
+        results (vec (mapcat (fn [b]
+                               (let [got (do (tick "batch" (count b)) (run-batch prog b))]
+                                 (when (not= (count got) (count b)) (println "BATCH MISMATCH" (count got) (count b)))
+                                 (map (fn [c g] (assoc c :got g)) b got)))
+                             (partition-all batch-size cases)))
+        ok? (fn [c] (case (:kind c)
+                      :lower (= (:got c) "=")
+                      (= (:got c) (:exp c))))
+        ;; N: not ported; T:interpreter-limit: refused at run time (a value the
+        ;; interpreter does not represent, e.g. a non-keyword document map key)
+        not-ported? (fn [c] (contains? #{"N" "T:interpreter-limit"} (:got c)))]
+    (doseq [k [:lower :execute :eval]]
+      (let [rs (filter #(= k (:kind %)) results)
+            np (filter not-ported? rs)
+            ran (remove not-ported? rs)]
+        (println (str (name k) ": cases " (count rs) " not-ported(N) " (count np) " ran " (count ran)
+                      " agree " (count (filter ok? ran)) " DISAGREE " (count (remove ok? ran))))))
+    (let [bad (remove #(or (not-ported? %) (ok? %)) results)]
+      (println "TOTAL DISAGREE" (count bad))
+      (doseq [c (take 10 bad)]
+        (println "DISAGREE" (name (:kind c)) "exp" (subs (str (:exp c)) 0 (min 200 (count (str (:exp c))))) "got" (:got c) "\n   "
+                 (subs (:line c) 0 (min 400 (count (:line c))))))
+      (js/process.exit (if (seq bad) 1 0)))))
+
+(main! (if-let [d (.-DIFF_DIRS js/process.env)]
+         (str/split d #":")
+         ["/Users/junkawasaki/github/kotoba-lang/kotoba-sema/test/kotoba/compiler"]))

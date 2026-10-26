@@ -1,0 +1,219 @@
+(ns kotoba.kir-host-stack-trap-test
+  "Unbounded non-helper recursion aborts `lower` with a Kotoba trap, on BOTH
+  runtimes.
+
+  `lower`'s own comment about the constant oracle says such a program \"still
+  traps (fuel or host-stack) and aborts lower -- intentional\". Until
+  2026-08-24 that was true on the JVM only: the `StackOverflowError` catch was
+  inside `#?(:clj ...)` with nothing on the `:cljs` side, so ClojureScript let
+  a raw `RangeError: Maximum call stack size exceeded` out of the compiler.
+
+  WHICH limit is reached first is a property of the host, not of the program,
+  and that is the whole reason this went unseen: on nbb 1.4.210 amu's
+  `lazy-sequence` fixture lowers fine and on nbb 1.5.212 it raises. Every test
+  in this repository was `.clj`, and the fleet gate is `:jvm-test`, so the
+  `:cljs` branch had never been executed at all.
+
+  So this asserts the INVARIANT and not the limit: whatever runs out first,
+  what comes out is a named resource trap (`:budget/fuel`, `:budget/frames`
+  or `:host/stack-exhausted`, reported by `lower` as `:oracle-inconclusive`), and never a host
+  error object."
+  (:require #?(:clj  [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing] :include-macros true])
+            [kotoba.kir :as ir]
+            [kotoba.test-hir :as test-hir]))
+
+(defn- unbounded-recursion-hir
+  "`(defn f [n] (if (<= n 0) 0 (+ 1 (f (- n 1)))))` called with `n`.
+
+  NOT a self-tail call: the recursive call sits under `+`, so the loop-helper
+  trampoline cannot flatten it and the interpreter really does nest. That is
+  the point -- `kir_oracle_fuel_test` already covers the trampolined shape,
+  which is exactly why it never reached this path."
+  [n]
+  (test-hir/module
+   {:format :kotoba.hir/v3
+    :entry 'main
+    :exports ['main]
+    :result :i64
+    :schemas {}
+    :schema-identities {}
+    :functions
+    [{:name 'main :params [] :param-types [] :result :i64
+      :body (list 'deep n)}
+     {:name 'deep :params ['n] :param-types [:i64] :result :i64
+      :body (list 'if (list '<= 'n 0)
+                  0
+                  (list '+ 1 (list 'deep (list '- 'n 1))))}]}))
+
+(defn- trap-data
+  "The trap `e` carries, looked for down the whole cause chain.
+
+   Reading `(ex-data e)` one link deep is not enough on ClojureScript: SCI
+   wraps a throw that crosses its own boundary in an error whose ex-data is
+   `{:type :sci/error :line .. :column ..}` -- non-nil, and WITHOUT `:trap`.
+   A classifier that stops at the first link therefore sees `:trap nil` and
+   reports a Kotoba trap as an unclassified failure. Measured here at depth 16
+   on nbb 1.4.210: the same program reports `:trap :budget/fuel` when
+   `lower` is called directly and `:trap nil` when it is called from inside a
+   `deftest`, because the wrapping depends on what is between the two.
+
+   This is the defect scripts/fleet-ci/gates.edn already records against
+   kotobase-server (root ADR-2608200100): `nbb/SCI wraps a throw that crosses
+   an async continuation, so classifiers reading (ex-data e) one link deep
+   lost the marker that selects the outcome`."
+  [e]
+  (loop [x e]
+    (when x
+      (let [data (ex-data x)]
+        (if (:trap data)
+          data
+          (recur #?(:clj (.getCause ^Throwable x) :cljs (.-cause x))))))))
+
+(defn- lower-outcome
+  "`:folded`, or the trap that aborted `lower`, or -- if there is no trap
+   anywhere in the chain -- the host error that escaped."
+  [n]
+  ;; Since P4 of adr-2609242100 a RESOURCE trap no longer aborts `lower`: the
+  ;; oracle is inconclusive (`:oracle-inconclusive <trap>`), which is neither
+  ;; a folded value nor a refusal. It is reported here as the trap it was.
+  (try (let [kir (ir/lower (unbounded-recursion-hir n))]
+         (if-let [trap (:oracle-inconclusive kir)]
+           {:trap trap :phase :ir :oracle :inconclusive}
+           :folded))
+       (catch #?(:clj Throwable :cljs :default) e
+         (or (trap-data e)
+             {:host-error-escaped (str (ex-message e))}))))
+
+(deftest unbounded-recursion-aborts-lower-with-a-kotoba-trap
+  (testing "the compiler refuses, and refuses in its own vocabulary"
+    (let [outcome (lower-outcome 1000000)]
+      (is (not= :folded outcome)
+          "a program the oracle cannot finish must not fold")
+      (is (nil? (:host-error-escaped outcome))
+          (str "a host error escaped the language boundary: "
+               (pr-str (:host-error-escaped outcome))))
+      (is (= :ir (:phase outcome)))
+      ;; Since P2 of adr-2609242100 the three limits have three names: fuel,
+      ;; the deterministic call-depth budget, and the host's own stack. Which
+      ;; one a million-deep recursion reaches first is the host's business;
+      ;; that it is one of these three, by name, is the invariant.
+      (is (contains? #{:budget/fuel :budget/frames :host/stack-exhausted}
+                     (:trap outcome))
+          (str "not a named resource trap: " (pr-str outcome))))))
+
+(deftest a-shallow-program-still-folds
+  (testing "the guard did not turn a working oracle into a trap"
+    ;; Depth 3, because the oracle's real ceiling is a property of the HOST and
+    ;; not of the compiler -- and it is not even a stable property of one host.
+    ;; Measured 2026-08-24 on the same source, called directly: nbb 1.4.210
+    ;; folds 12 and traps at 16; nbb 1.5.212 folds 4 and traps at 8. Called
+    ;; from inside `deftest` both ceilings drop again, because cljs.test's own
+    ;; frames are already on the stack. Each interpreter spends a different
+    ;; amount of JS stack per interpreted call, and so does each caller.
+    ;;
+    ;; Writing any of those numbers here would pin the test to one runtime on
+    ;; one call path. 3 is under every ceiling seen, and
+    ;; `crossing-the-ceiling-is-a-trap-not-a-host-error` below covers the
+    ;; interesting part without naming a depth at all.
+    ;;
+    ;; `str` rather than `=`: the oracle hands back a host i64, which is a Long
+    ;; on the JVM and a BigInt on ClojureScript, and `(= 3 #object[BigInt 3])`
+    ;; is false.
+    (is (= "3" (str (:oracle-value (ir/lower (unbounded-recursion-hir 3))))))))
+
+(deftest crossing-the-ceiling-is-a-trap-not-a-host-error
+  (testing "whatever this host's limit is, going past it stays inside the language"
+    ;; Self-calibrating on purpose. The ceiling moved 12 -> 4 between two nbb
+    ;; releases and moves again with the caller's own stack, so a test that
+    ;; names a depth tests the release.
+    ;;
+    ;; The outcome is KEPT from the probing call, not re-measured at the depth
+    ;; the probe returned. The first version of this test did re-measure, and
+    ;; failed: on nbb 1.4.210 depth 16 aborted while searching and FOLDED when
+    ;; called again a moment later, because the two calls do not start from the
+    ;; same stack. `(:trap :folded)` is nil, so the failure read as `no trap`
+    ;; when what actually happened was `no abort`. The ceiling is not a stable
+    ;; property of a host -- it is a property of a call.
+    (let [[depth outcome]
+          (first (keep (fn [n]
+                         (let [o (lower-outcome n)]
+                           (when (not= :folded o) [n o])))
+                       (take 24 (iterate #(* 2 %) 1))))]
+      (is (some? depth)
+          "no depth up to 2^23 aborted lower -- the oracle cannot be unbounded")
+      (is (nil? (:host-error-escaped outcome))
+          (str "at depth " depth " a host error escaped: "
+               (pr-str (:host-error-escaped outcome))))
+      (is (contains? #{:budget/fuel :budget/frames :host/stack-exhausted}
+                     (:trap outcome))
+          (str "at depth " depth)))))
+
+(deftest a-real-trap-is-not-swallowed-by-the-host-stack-guard
+  (testing "the guard's negative branch -- which was unreachable on the JVM"
+    ;; `host-stack-exhausted?` decides whether to normalise or re-throw. Until
+    ;; 2026-08-24 the JVM catch was narrowed to `StackOverflowError`, so
+    ;; nothing else could arrive and the re-throw could never be taken there:
+    ;; half the guard was untestable on the runtime that had had it longest.
+    ;; Both runtimes now catch everything the oracle can throw, which makes
+    ;; this test possible at all.
+    (let [division-by-zero
+          (test-hir/module
+           {:format :kotoba.hir/v3 :entry 'main :exports ['main] :result :i64
+            :schemas {} :schema-identities {}
+            :functions [{:name 'main :params [] :param-types [] :result :i64
+                         :body (list 'quot 1 0)}]})
+          outcome (try (do (ir/lower division-by-zero) :lowered)
+                       (catch #?(:clj Throwable :cljs :default) e
+                         (or (trap-data e) {:host-error-escaped (str (ex-message e))})))]
+      (is (= :division-by-zero (:trap outcome))
+          (str "a Kotoba trap must pass through the host-stack guard unchanged, got "
+               (pr-str outcome))))))
+
+#?(:cljs
+   (deftest host-capability-exceptions-bypass-the-interpreter-resource-classifier
+     (let [classifications (atom 0)
+           classify ir/host-stack-exhausted?
+           throw-factory (js/Function. "value" "return function(){throw value;}")
+           values [(js/RangeError. "Maximum call stack size exceeded")
+                   (js/RangeError. "host range") (js/Error. "host error")
+                   #js {} nil js/undefined false true 0 (- 0.0) js/NaN
+                   "host string" (js/Symbol "host") (js/BigInt "7")]
+           typed {:format :kotoba.kir/v3 :entry nil :exports ['keep]
+                  :functions [{:name 'keep :params ['v] :param-types [:js-value]
+                               :result :js-value
+                               :body '(typed-cap-call 7 :js-value :js-value v)}]}
+           untyped {:format :kotoba.kir/v3 :entry nil :exports ['keep]
+                    :functions [{:name 'keep :params [] :param-types [] :result :i64
+                                 :body '(cap-call 7 0)}]}]
+       (with-redefs [ir/host-stack-exhausted?
+                     (fn [e] (swap! classifications inc) (classify e))]
+         (doseq [value values
+                 [program args option] [[typed [js/undefined] :typed-cap-call]
+                                        [untyped [] :cap-call]]]
+           (let [caught (volatile! [])]
+             (try (ir/execute program 'keep args {option (throw-factory value)})
+                  (catch :default e (vreset! caught [e])))
+             (is (= 1 (count @caught)))
+             (is (js/Object.is (first @caught) value))))
+         (is (zero? @classifications))))))
+
+#?(:cljs
+   (deftest host-exception-provenance-is-local-to-one-execution
+     (let [classifications (atom 0)
+           classify ir/host-stack-exhausted?
+           error (js/RangeError. "Maximum call stack size exceeded")
+           program {:format :kotoba.kir/v3 :entry nil :exports ['keep]
+                    :functions [{:name 'keep :params [] :param-types [] :result :i64
+                                 :body '(quot (cap-call 7 0) 0)}]}
+           throwing ((js/Function. "e" "return function(){throw e;}") error)]
+       (with-redefs [ir/host-stack-exhausted?
+                     (fn [e] (swap! classifications inc) (classify e))]
+         (let [caught (try (ir/execute program 'keep [] {:cap-call throwing})
+                           nil (catch :default e e))]
+           (is (js/Object.is caught error)))
+         (is (= 0 @classifications))
+         (let [caught (try (ir/execute program 'keep [] {:cap-call (fn [& _] 7)})
+                           nil (catch :default e e))]
+           (is (= :division-by-zero (:trap (ex-data caught)))))
+         (is (= 1 @classifications))))))

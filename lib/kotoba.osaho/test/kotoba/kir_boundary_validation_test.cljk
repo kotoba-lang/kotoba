@@ -1,0 +1,125 @@
+(ns kotoba.kir-boundary-validation-test
+  "P2 of superproject adr-2609242100-kotoba-safety-is-language-resource-is-
+  target-profile: a typed value is validated in full ONCE, where it crosses a
+  trust boundary, against a traversal budget; values built inside a program
+  are never re-walked, so they carry no structural limit.
+
+  Both directions, each refusal pinned to its trap name:
+    * an INTERNAL 10,000-cell list is admitted (it was refused at 6 cells by
+      the per-value adt-node-limit 512 / adt-depth-limit 64);
+    * a BOUNDARY input over the traversal budget is refused as
+      :budget/boundary-nodes, and the same input under a larger budget is
+      admitted -- without overflowing the host stack at 40,000 levels deep;
+    * a capability result is a boundary too;
+    * a constructor still refuses an operand of the wrong type;
+    * call depth has its own deterministic budget, :budget/frames."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.kir :as kir]
+            [kotoba.kir.value :as value]))
+
+(def lst [:variant :app/list [[:empty :i64] [:cons [:ref :app/cell]]]])
+(def cell [:record :app/cell [[:head :i64] [:tail [:ref :app/list]]]])
+(def schemas {:app/list lst :app/cell cell})
+
+(defn- trap-of
+  "The `:trap` of the first ex-data in the cause chain that has one."
+  [thunk]
+  (try (thunk) :no-trap
+       (catch #?(:clj Throwable :cljs :default) e
+         (loop [x e]
+           (if-let [t (:trap (ex-data x))]
+             t
+             (if-let [c (ex-cause x)] (recur c) [:untrapped (ex-message e)]))))))
+
+(def ^:private total-fn
+  ;; A loop helper, so the trampoline keeps the host stack flat and what is
+  ;; measured is value handling, not interpreter recursion.
+  {:name '__kotoba_loop_2 :params ['l 'acc] :param-types [[:ref :app/list] :i64] :result :i64
+   :body (list 'variant-match lst 'l
+               [[:empty '_ 'acc]
+                [:cons 'c (list '__kotoba_loop_2 (list 'record-get cell 'c :tail)
+                                (list '+ 'acc (list 'record-get cell 'c :head)))]])})
+
+(defn- build-and-sum [n]
+  {:format :kotoba.kir/v4 :entry 'main :exports ['main] :schemas schemas
+   :functions
+   [{:name 'kons :params ['h 't] :param-types [:i64 [:ref :app/list]] :result [:ref :app/list]
+     :body (list 'variant-new lst :cons (list 'record-new cell 'h 't))}
+    {:name '__kotoba_loop_1 :params ['n 'acc] :param-types [:i64 [:ref :app/list]]
+     :result [:ref :app/list]
+     :body (list 'if (list '= 'n 0) 'acc
+                 (list '__kotoba_loop_1 (list '- 'n 1) (list 'kons 'n 'acc)))}
+    total-fn
+    {:name 'main :params [] :param-types [] :result :i64
+     :body (list '__kotoba_loop_2 (list '__kotoba_loop_1 n (list 'variant-new lst :empty 0)) 0)}]})
+
+(def ^:private sum-input
+  {:format :kotoba.kir/v4 :entry 'main :exports ['main] :schemas schemas
+   :functions [total-fn
+               {:name 'main :params ['l] :param-types [[:ref :app/list]] :result :i64
+                :body (list '__kotoba_loop_2 'l 0)}]})
+
+(defn- host-list
+  "A list of `n` cells built by the HOST, i.e. an untrusted input: 3 nodes per
+  cell (variant, record, head) plus the empty tail."
+  [n]
+  (loop [i n acc [lst :empty (#?(:clj long :cljs js/BigInt) 0)]]
+    (if (zero? i)
+      acc
+      (recur (dec i) [lst :cons [cell (#?(:clj long :cljs js/BigInt) i) acc]]))))
+
+(deftest an-internal-ten-thousand-cell-list-is-admitted
+  (is (= "50005000" (str (kir/execute (build-and-sum 10000) 'main [] {:fuel 100000}))))
+  (is (= "15" (str (kir/execute (build-and-sum 5) 'main [])))))
+
+(deftest a-boundary-input-is-validated-once-against-the-traversal-budget
+  (let [deep (host-list 40000)]
+    (testing "over the default 65,536-node budget: refused, by name"
+      (is (= :budget/boundary-nodes (trap-of #(kir/execute sum-input 'main [deep])))))
+    (testing "the same 40,000-deep input under a larger budget: admitted, no host stack overflow"
+      (is (= "800020000"
+             (str (kir/execute sum-input 'main [deep]
+                               {:boundary-budget {:nodes 200000} :fuel 1000})))))
+    (testing "a small input under the default budget"
+      (is (= "6" (str (kir/execute sum-input 'main [(host-list 3)])))))))
+
+(deftest a-capability-result-is-a-boundary
+  (let [module {:format :kotoba.kir/v4 :entry 'main :exports ['main] :schemas schemas
+                :effects #{:app/fetch}
+                :functions [total-fn
+                            {:name 'main :params [] :param-types [] :result :i64
+                             :effects #{:app/fetch}
+                             :body (list '__kotoba_loop_2
+                                         (list 'typed-cap-call 7 :i64 [:ref :app/list] 0)
+                                         0)}]}
+        run (fn [n budget]
+              (kir/execute module 'main []
+                           {:typed-cap-call (fn [_ _ _ _] (host-list n))
+                            :boundary-budget budget}))]
+    (is (= "55" (str (run 10 nil))))
+    (is (= :budget/boundary-nodes (trap-of #(run 10 {:nodes 20}))))))
+
+(deftest a-constructor-still-checks-its-operands
+  (let [module {:format :kotoba.kir/v4 :entry 'main :exports ['main] :schemas schemas
+                :functions [{:name 'main :params [] :param-types [] :result :i64
+                             :body (list 'variant-match lst
+                                         (list 'variant-new lst :cons (list 'variant-new lst :empty 0))
+                                         [[:empty '_ 0] [:cons '_ 1]])}]}]
+    (is (thrown-with-msg? #?(:clj Exception :cljs :default)
+                          #"operand does not carry its declared type"
+                          (kir/execute module 'main []))))
+  (is (thrown-with-msg? #?(:clj Exception :cljs :default) #"signed i64"
+                        (value/shallow-typed-value! cell [cell "x" [lst :empty 0]]))))
+
+(deftest call-depth-is-a-deterministic-budget
+  (let [module {:format :kotoba.kir/v4 :entry 'main :exports ['main]
+                :functions [{:name 'main :params [] :param-types [] :result :i64
+                             :body (list 'deep 100)}
+                            {:name 'deep :params ['n] :param-types [:i64] :result :i64
+                             :body (list 'if (list '<= 'n 0) 0
+                                         (list '+ 1 (list 'deep (list '- 'n 1))))}]}]
+    (is (= :budget/frames (trap-of #(kir/execute module 'main [] {:frames 3}))))
+    (is (= 32 kir/default-frames) "lang/limits.edn :profile/reference :frames (P4)")
+    (testing "a frames budget outside the admitted range is refused before running"
+      (is (thrown? #?(:clj Exception :cljs :default)
+                   (kir/execute module 'main [] {:frames 0}))))))
