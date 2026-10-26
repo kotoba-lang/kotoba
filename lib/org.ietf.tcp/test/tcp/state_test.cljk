@@ -1,0 +1,132 @@
+(ns tcp.state-test
+  (:require [tcp.state :as t]
+            [tcp.seq :as s]
+            [kotoba.test :refer [deftest is testing]]))
+
+(defn- c [& {:as over}] (merge (t/connection {:iss 1000}) over))
+(defn- sg [& {:keys [seq ack flags len] :or {len 0}}]
+  (cond-> {:tcp/seq seq :tcp/flags (set flags) :tcp/len len} ack (assoc :tcp/ack ack)))
+(defn- st [r] (:tcp/state (:tcp/connection r)))
+(defn- sent [r] (:tcp/send r))
+
+;; ── the handshake ─────────────────────────────────────────────────────────
+
+(deftest an-active-open-sends-a-syn
+  (let [r (t/step (c) {:kind :connect})]
+    (is (= :syn-sent (st r)))
+    (is (= #{:syn} (:tcp/flags (first (sent r)))))
+    (is (= 1000 (:tcp/seq (first (sent r)))))))
+
+(deftest a-syn-ack-completes-the-open
+  (let [opened (:tcp/connection (t/step (c) {:kind :connect}))
+        r (t/step opened {:kind :segment :segment (sg :seq 5000 :ack 1001 :flags [:syn :ack]) :now-ms 0})]
+    (is (= :established (st r)))
+    (is (= 5001 (:tcp/rcv-nxt (:tcp/connection r))) "our rcv-nxt is their ISN+1")
+    (is (= #{:ack} (:tcp/flags (first (sent r)))))))
+
+(deftest a-passive-open-answers-a-syn-with-syn-ack
+  (let [listening (:tcp/connection (t/step (c) {:kind :listen}))
+        r (t/step listening {:kind :segment :segment (sg :seq 7000 :flags [:syn]) :now-ms 0})]
+    (is (= :syn-received (st r)))
+    (is (= #{:syn :ack} (:tcp/flags (first (sent r)))))
+    (is (= 7001 (:tcp/ack (first (sent r)))))))
+
+(deftest simultaneous-open-is-in-the-table
+  (testing "SYN-SENT receiving a bare SYN goes to SYN-RECEIVED, not to the floor"
+    (let [opened (:tcp/connection (t/step (c) {:kind :connect}))
+          r (t/step opened {:kind :segment :segment (sg :seq 9000 :flags [:syn]) :now-ms 0})]
+      (is (= :syn-received (st r)))
+      (is (= #{:syn :ack} (:tcp/flags (first (sent r))))))))
+
+(deftest a-syn-ack-with-the-wrong-ack-is-reset-not-accepted
+  (let [opened (:tcp/connection (t/step (c) {:kind :connect}))
+        r (t/step opened {:kind :segment :segment (sg :seq 5000 :ack 999 :flags [:ack]) :now-ms 0})]
+    (is (= :bad-ack (:tcp/dropped r)))
+    (is (= #{:rst} (:tcp/flags (first (sent r)))))))
+
+;; ── RST handling ──────────────────────────────────────────────────────────
+
+(deftest a-rst-in-syn-sent-is-believed-only-when-it-acks-our-syn
+  (let [opened (:tcp/connection (t/step (c) {:kind :connect}))]
+    (is (= :closed (st (t/step opened {:kind :segment
+                                       :segment (sg :seq 0 :ack 1001 :flags [:rst :ack]) :now-ms 0}))))
+    (is (= :syn-sent (st (t/step opened {:kind :segment
+                                         :segment (sg :seq 0 :flags [:rst]) :now-ms 0})))
+        "an unacknowledged RST does not tear down a connection")))
+
+(deftest an-out-of-window-rst-is-refused-in-established
+  (let [e (c :tcp/state :established :tcp/rcv-nxt 5000 :tcp/snd-nxt 1001 :tcp/snd-una 1001)
+        r (t/step e {:kind :segment :segment (sg :seq 99999 :flags [:rst]) :now-ms 0})]
+    (is (= :established (st r)))
+    (is (= :rst-out-of-window (:tcp/dropped r))
+        "a RST outside the window is how a blind attacker kills connections")))
+
+;; ── acceptability in a synchronised state ────────────────────────────────
+
+(deftest an-unacceptable-segment-is-answered-with-an-ack-not-silence
+  (let [e (c :tcp/state :established :tcp/rcv-nxt 5000 :tcp/rcv-wnd 100
+             :tcp/snd-nxt 1001 :tcp/snd-una 1001)
+        r (t/step e {:kind :segment :segment (sg :seq 9000 :ack 1001 :flags [:ack] :len 5) :now-ms 0})]
+    (is (= :unacceptable-sequence (:tcp/dropped r)))
+    (is (= #{:ack} (:tcp/flags (first (sent r)))) "the peer has to learn our window")))
+
+(deftest in-window-data-advances-rcv-nxt-and-is-acked
+  (let [e (c :tcp/state :established :tcp/rcv-nxt 5000 :tcp/snd-nxt 1001 :tcp/snd-una 1001)
+        r (t/step e {:kind :segment :segment (sg :seq 5000 :ack 1001 :flags [:ack] :len 10) :now-ms 0})]
+    (is (= 5010 (:tcp/rcv-nxt (:tcp/connection r))))
+    (is (= 1 (count (sent r))))))
+
+;; ── the close sequence, all four ways ────────────────────────────────────
+
+(deftest we-close-first-and-they-ack-then-fin
+  (let [e (c :tcp/state :established :tcp/rcv-nxt 5000 :tcp/snd-nxt 1001 :tcp/snd-una 1001)
+        r1 (t/step e {:kind :close})
+        _ (is (= :fin-wait-1 (st r1)))
+        _ (is (= #{:fin :ack} (:tcp/flags (first (sent r1)))))
+        r2 (t/step (:tcp/connection r1) {:kind :segment :segment (sg :seq 5000 :ack 1002 :flags [:ack]) :now-ms 0})
+        _ (is (= :fin-wait-2 (st r2)) "our FIN was acked")
+        r3 (t/step (:tcp/connection r2) {:kind :segment :segment (sg :seq 5000 :ack 1002 :flags [:fin :ack]) :now-ms 100})]
+    (is (= :time-wait (st r3)))
+    (is (= 100 (:tcp/time-wait-started-ms (:tcp/connection r3))))))
+
+(deftest they-close-first-and-we-follow
+  (let [e (c :tcp/state :established :tcp/rcv-nxt 5000 :tcp/snd-nxt 1001 :tcp/snd-una 1001)
+        r1 (t/step e {:kind :segment :segment (sg :seq 5000 :ack 1001 :flags [:fin :ack]) :now-ms 0})
+        _ (is (= :close-wait (st r1)))
+        r2 (t/step (:tcp/connection r1) {:kind :close})
+        _ (is (= :last-ack (st r2)))
+        r3 (t/step (:tcp/connection r2) {:kind :segment :segment (sg :seq 5001 :ack 1002 :flags [:ack]) :now-ms 0})]
+    (is (= :closed (st r3)))))
+
+(deftest simultaneous-close-goes-through-closing
+  (let [e (c :tcp/state :established :tcp/rcv-nxt 5000 :tcp/snd-nxt 1001 :tcp/snd-una 1001)
+        r1 (t/step e {:kind :close})
+        r2 (t/step (:tcp/connection r1) {:kind :segment :segment (sg :seq 5000 :ack 1001 :flags [:fin :ack]) :now-ms 0})
+        _ (is (= :closing (st r2)) "their FIN arrived before our FIN was acked")
+        r3 (t/step (:tcp/connection r2) {:kind :segment :segment (sg :seq 5001 :ack 1002 :flags [:ack]) :now-ms 50})]
+    (is (= :time-wait (st r3)))))
+
+(deftest time-wait-ends-after-two-msl-and-not-before
+  (let [tw (c :tcp/state :time-wait :tcp/time-wait-started-ms 0 :tcp/msl-ms 30000)]
+    (is (= :time-wait (st (t/step tw {:kind :tick :now-ms 59999}))))
+    (is (= :closed (st (t/step tw {:kind :tick :now-ms 60000}))))))
+
+;; ── closed ────────────────────────────────────────────────────────────────
+
+(deftest a-segment-to-a-closed-connection-is-reset
+  (let [r (t/step (c) {:kind :segment :segment (sg :seq 1 :ack 2 :flags [:ack]) :now-ms 0})]
+    (is (= :closed (:tcp/dropped r)))
+    (is (= #{:rst :ack} (:tcp/flags (first (sent r)))))))
+
+(deftest a-rst-to-a-closed-connection-is-not-answered
+  (testing "answering a RST with a RST is how two closed peers loop forever"
+    (let [r (t/step (c) {:kind :segment :segment (sg :seq 1 :flags [:rst]) :now-ms 0})]
+      (is (empty? (sent r))))))
+
+(deftest every-drop-reason-is-declared
+  (doseq [r [(t/step (c) {:kind :segment :segment (sg :seq 1 :ack 2 :flags [:ack]) :now-ms 0})
+             (t/step (c :tcp/state :established :tcp/rcv-nxt 5000)
+                     {:kind :segment :segment (sg :seq 99999 :ack 1 :flags [:ack] :len 5) :now-ms 0})
+             (t/step (c :tcp/state :established) {:kind :close :now-ms 0})]]
+    (when-let [d (:tcp/dropped r)]
+      (is (contains? t/drop-reasons d) (str "undeclared: " d)))))

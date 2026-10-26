@@ -1,0 +1,162 @@
+;; `kotoba/tcp/send_core.kotoba` against `tcp.send`.
+;;
+;; Four modules: send calls pmtu, pacing and congestion. Nothing is restated,
+;; which is the point -- a scheduler that recomputed the effective MSS or the
+;; window room would be a second place for each to live.
+;;
+;; The fact worth checking hardest is the flight size. It is `tcp.sack/pipe` --
+;; bytes sent minus bytes SACKed -- and not the retransmission queue's byte
+;; count. SACKed data has left the network and the receiver has said so;
+;; counting it as in flight under-sends for the rest of the recovery. Neither
+;; tcp.sack's tests nor tcp.congestion's can catch that, because neither
+;; composes the two. So the queues below have SACKed entries in them, and the
+;; two numbers deliberately differ.
+
+(ns tcp.send-kotoba-parity-test
+  (:require [kotoba.io :as io]
+            [kotoba.test :refer [deftest is]]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]
+            [tcp.congestion :as cc]
+            [tcp.pacing :as pace]
+            [tcp.pmtu :as pmtu]
+            [tcp.retransmit :as rtx]
+            [tcp.sack :as sack]
+            [tcp.send :as snd]))
+
+(def ^:private files
+  {'tcp.pmtu-core "pmtu_core.kotoba"
+   'tcp.pacing-core "pacing_core.kotoba"
+   'tcp.congestion-core "congestion_core.kotoba"
+   'tcp.send-core "send_core.kotoba"})
+
+(defn- path [f] (io/file (System/getProperty "user.dir") "kotoba" "tcp" f))
+
+(defn- source-available? []
+  (let [present? (every? #(io/exists? (path %)) (vals files))]
+    (is present? (str "kotoba objects not found under kotoba/tcp: "
+                      (pr-str (remove #(io/exists? (path %)) (vals files)))))
+    present?))
+
+(def ^:private kir
+  (delay (:kir (compiler/compile-project
+                (into {} (map (fn [[ns f]] [ns (slurp (path f))])) files)
+                'tcp.send-core :wasm32-kotoba-v1 {}))))
+
+(defn- call [f & args] (ir/execute @kir f (vec args)))
+
+(def ^:private action-code {:send-new 0 :retransmit 1 :wait 2})
+(def ^:private by-code
+  {:congestion-window 0 :receiver-window 1 :path-mtu 2 :application-data 3
+   :nagle 4 :nothing-to-send 5 :retransmission 6})
+
+(defn- queue-with
+  "A queue holding `n` entries of `len`, the first `sacked` of them SACKed.
+  pipe and the raw byte count differ whenever `sacked` is positive."
+  [n len sacked]
+  (let [q (reduce (fn [q i] (rtx/push q {:seq (+ 1000 (* i len)) :len len
+                                         :now-ms 0}))
+                  (rtx/queue) (range n))]
+    (if (pos? sacked)
+      (sack/apply-blocks q [[1000 (+ 1000 (* sacked len))]])
+      q)))
+
+(deftest kotoba-objects-are-present
+  (source-available?))
+
+(deftest flight-is-pipe-not-queue-bytes
+  (when (source-available?)
+    (doseq [n [1 3 8], len [100 1460], sacked [0 1 2]
+            :when (<= sacked n)]
+      (let [q (queue-with n len sacked)
+            raw (reduce + 0 (map :len (rtx/in-flight q)))]
+        (is (= (* (- n sacked) len) (sack/pipe q))
+            (str "pipe with " n " entries, " sacked " SACKed"))
+        (when (pos? sacked)
+          (is (not= raw (sack/pipe q))
+              "the two numbers must differ, or this suite proves nothing"))))))
+
+(deftest effective-mss-agrees
+  (when (source-available?)
+    (doseq [mtu [1200 1400 1500 9000], header [20 40 60], peer [536 1460 65535]]
+      (let [d (assoc (pmtu/discoverer {}) :tcp.pmtu/current mtu)]
+        (is (= (min (pmtu/mss-for d header) peer)
+               (call 'effective-mss mtu header peer))
+            (str "effective-mss mtu " mtu " header " header " peer " peer))))))
+
+(deftest room-agrees
+  (when (source-available?)
+    (doseq [cwnd [0 1460 14600], flight [0 1460 20000], rwnd [0 1460 65535]]
+      (is (= (max 0 (- rwnd flight)) (call 'rwnd-room rwnd flight))
+          (str "rwnd-room rwnd " rwnd " flight " flight))
+      (is (= (min (cc/may-send {:tcp.cc/cwnd cwnd} flight)
+                  (max 0 (- rwnd flight)))
+             (call 'room cwnd flight rwnd))
+          (str "room cwnd " cwnd " flight " flight " rwnd " rwnd)))))
+
+(def ^:private code->action {0 :send-new 1 :retransmit 2 :wait})
+
+(defn- check-one
+  "One decision, compared field by field.
+
+  Extracted from the doseq because the JVM caps a method at 64 KB and the
+  cross product inlined into one body exceeded it -- `Method code too large!`,
+  which is a fact about the compiler and not about the test."
+  [n len sacked cwnd rwnd available in-recovery? nodelay? now-ms]
+  (let [q (queue-with n len sacked)
+        flight (sack/pipe q)
+        controller (assoc (cc/controller {:mss 1460}) :tcp.cc/cwnd cwnd)
+        ctx {:congestion controller
+             :queue q
+             :sender (pace/sender {:mss 1460 :nodelay? nodelay?})
+             :discoverer (assoc (pmtu/discoverer {}) :tcp.pmtu/current 1500)
+             :receiver-window rwnd :peer-mss 1460 :header-bytes 40
+             :bytes-available available :now-ms now-ms
+             :in-recovery? in-recovery? :rto-ms 1000}
+        actual (snd/decide ctx)
+        mss (call 'effective-mss 1500 40 1460)
+        room (call 'room cwnd flight rwnd)
+        timed-out? (boolean (seq (rtx/due q 1000 now-ms)))
+        holes? (and in-recovery? (boolean (seq (sack/holes q))))
+        act (call 'action-code timed-out? holes? room mss available)
+        label (str "cwnd " cwnd " rwnd " rwnd " avail " available
+                   " flight " flight " recovery " in-recovery?
+                   " nodelay " nodelay? " now " now-ms
+                   " timed-out " timed-out?)
+        ;; the object stops at the scheduler's answer; Nagle is asked
+        ;; afterwards about the size the scheduler picked, so this composes
+        ;; them the way a caller would.
+        expected (if (= act 0)
+                   (let [bytes (call 'send-bytes available room mss)
+                         reason (call 'nagle-reason bytes 1460 flight nodelay?)]
+                     (if (call 'nagle-permits? reason) :send-new :wait))
+                   (code->action act))]
+    (is (= (:action actual) expected) (str "action " label))
+    (when (= :send-new (:action actual))
+      (is (= (:bytes actual) (call 'send-bytes available room mss))
+          (str "bytes " label))
+      (is (= (by-code (:limited-by actual))
+             (call 'limited-by-code (:bytes actual) available mss
+                   (cc/may-send controller flight)))
+          (str "limited-by " label)))))
+
+(def ^:private cases
+  "Built as data rather than nested inside the deftest: eight `doseq`
+  dimensions inline exceed the JVM's 64 KB method limit, and the failure is
+  `Method code too large!` at compile time -- a fact about the compiler, not
+  about the cross product."
+  (vec (for [n [1 4], sacked [0 2] :when (<= sacked n)
+             cwnd [1460 14600], rwnd [1460 65535]
+             available [0 100 1460 100000]
+             in-recovery? [false true], nodelay? [false true]
+             ;; 10 is inside the RTO and 2000 is past it. Without the second,
+             ;; no case here ever has a fired timer, and the rule that a timer
+             ;; outranks the congestion window is never exercised -- removing
+             ;; it left every assertion green.
+             now-ms [10 2000]]
+         [n 1460 sacked cwnd rwnd available in-recovery? nodelay? now-ms])))
+
+(deftest decide-agrees
+  (when (source-available?)
+    (is (pos? (count cases)) "the cross product must not be empty")
+    (doseq [c cases] (apply check-one c))))

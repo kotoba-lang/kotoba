@@ -1,0 +1,121 @@
+(ns tcp.congestion-test
+  (:require [tcp.congestion :as cc]
+            [kotoba.test :refer [deftest is testing]]))
+
+(def mss 1000)
+(defn- c [& {:as over}] (merge (cc/controller {:mss mss}) over))
+
+(deftest a-new-connection-starts-in-slow-start-with-no-belief-about-capacity
+  (let [x (c)]
+    (is (= :slow-start (cc/phase x)))
+    (is (= 4000 (:tcp.cc/cwnd x)) "min(4*1000, max(2*1000, 4380)) = 4000")
+    (is (= cc/unbounded-ssthresh (:tcp.cc/ssthresh x))
+        "no loss has happened, so no capacity is believed yet")))
+
+(deftest the-initial-window-follows-5681-not-6928
+  (is (= 4380 (:tcp.cc/cwnd (cc/controller {:mss 1460}))))
+  (is (= 14600 (cc/initial-window-10 1460))
+      "the larger burst is available and is the caller's decision"))
+
+;; ── growth ───────────────────────────────────────────────────────────────
+
+(deftest slow-start-adds-a-segment-per-acknowledged-segment
+  (let [x (cc/on-ack (c) mss)]
+    (is (= 5000 (:tcp.cc/cwnd x)))
+    (is (= :slow-start (cc/phase x)))))
+
+(deftest slow-start-never-adds-more-than-one-segment-per-ack
+  (testing "a stretch ACK covering 10 segments still grows by one"
+    (is (= 5000 (:tcp.cc/cwnd (cc/on-ack (c) (* 10 mss)))))))
+
+(deftest slow-start-doubles-in-a-round-trip
+  (let [start (c)
+        ;; four segments in flight -> four ACKs
+        after (reduce (fn [x _] (cc/on-ack x mss)) start (range 4))]
+    (is (= 8000 (:tcp.cc/cwnd after)) "4000 -> 8000")))
+
+(deftest congestion-avoidance-adds-about-one-segment-per-round-trip
+  (let [x (c :tcp.cc/cwnd 10000 :tcp.cc/ssthresh 8000 :tcp.cc/state :congestion-avoidance)
+        one (cc/on-ack x mss)]
+    (is (= :congestion-avoidance (cc/phase one)))
+    (is (= 10100 (:tcp.cc/cwnd one)) "MSS^2/cwnd = 1000000/10000 = 100")
+    (let [rtt (reduce (fn [a _] (cc/on-ack a mss)) x (range 10))]
+      (is (<= 10900 (:tcp.cc/cwnd rtt) 11100)
+          "ten ACKs in a window of ten segments adds roughly one segment"))))
+
+(deftest the-phase-is-derived-so-it-cannot-disagree-with-the-numbers
+  (is (= :slow-start (cc/phase (c :tcp.cc/cwnd 100 :tcp.cc/ssthresh 200))))
+  (is (= :congestion-avoidance (cc/phase (c :tcp.cc/cwnd 300 :tcp.cc/ssthresh 200)))))
+
+;; ── loss: duplicate ACKs ────────────────────────────────────────────────
+
+(deftest fewer-than-three-duplicates-only-count
+  (let [x (-> (c) (cc/on-duplicate-ack 8000) (cc/on-duplicate-ack 8000))]
+    (is (= 2 (:tcp.cc/dup-acks x)))
+    (is (= 4000 (:tcp.cc/cwnd x)) "the window has not moved")
+    (is (false? (:tcp.cc/retransmit? x)))
+    (is (= :slow-start (cc/phase x)))))
+
+(deftest the-third-duplicate-halves-and-enters-fast-recovery
+  (let [x (reduce (fn [a _] (cc/on-duplicate-ack a 8000)) (c) (range 3))]
+    (is (true? (:tcp.cc/retransmit? x)) "fast retransmit, without waiting for the timer")
+    (is (= 4000 (:tcp.cc/ssthresh x)) "half of the 8000 in flight")
+    (is (= 7000 (:tcp.cc/cwnd x)) "ssthresh + 3*MSS: the three that left the network")
+    (is (= :fast-recovery (cc/phase x)))))
+
+(deftest each-further-duplicate-inflates-by-one-segment
+  (let [x (reduce (fn [a _] (cc/on-duplicate-ack a 8000)) (c) (range 5))]
+    (is (= 9000 (:tcp.cc/cwnd x)) "7000 + 2 more duplicates")
+    (is (= :fast-recovery (cc/phase x)))))
+
+(deftest ssthresh-never-falls-below-two-segments
+  (let [x (reduce (fn [a _] (cc/on-duplicate-ack a 100)) (c) (range 3))]
+    (is (= 2000 (:tcp.cc/ssthresh x)) "max(50, 2*MSS)")))
+
+(deftest leaving-fast-recovery-deflates-the-window
+  (testing "a sender that forgets to deflate keeps a window it never earned"
+    (let [inflated (reduce (fn [a _] (cc/on-duplicate-ack a 8000)) (c) (range 5))
+          recovered (cc/on-ack inflated mss)]
+      (is (= 4000 (:tcp.cc/cwnd recovered)) "back to ssthresh, not 9000")
+      (is (= :congestion-avoidance (cc/phase recovered)))
+      (is (zero? (:tcp.cc/dup-acks recovered))))))
+
+;; ── loss: timeout ───────────────────────────────────────────────────────
+
+(deftest a-timeout-drops-to-one-segment
+  (let [x (cc/on-timeout (c :tcp.cc/cwnd 20000) 20000)]
+    (is (= mss (:tcp.cc/cwnd x)) "one segment, not ssthresh")
+    (is (= 10000 (:tcp.cc/ssthresh x)))
+    (is (= :slow-start (cc/phase x)))
+    (is (true? (:tcp.cc/retransmit? x)))))
+
+(deftest a-timeout-is-harsher-than-duplicate-acks-because-the-evidence-is
+  (let [flight 20000
+        dup (reduce (fn [a _] (cc/on-duplicate-ack a flight)) (c :tcp.cc/cwnd 20000) (range 3))
+        to (cc/on-timeout (c :tcp.cc/cwnd 20000) flight)]
+    (is (= (:tcp.cc/ssthresh dup) (:tcp.cc/ssthresh to)) "both halve the threshold")
+    (is (> (:tcp.cc/cwnd dup) (:tcp.cc/cwnd to))
+        "duplicates mean the receiver is still hearing something; a timeout does not")))
+
+(deftest a-timeout-clears-any-duplicate-count
+  (let [x (-> (c) (cc/on-duplicate-ack 8000) (cc/on-duplicate-ack 8000)
+              (cc/on-timeout 8000))]
+    (is (zero? (:tcp.cc/dup-acks x)))))
+
+;; ── what may go ─────────────────────────────────────────────────────────
+
+(deftest may-send-is-the-window-minus-what-is-already-out
+  (is (= 4000 (cc/may-send (c) 0)))
+  (is (= 1000 (cc/may-send (c) 3000)))
+  (is (= 0 (cc/may-send (c) 4000)))
+  (is (= 0 (cc/may-send (c) 99999)) "never negative"))
+
+(deftest a-full-cycle-halves-and-climbs-back
+  (let [start (c :tcp.cc/cwnd 16000 :tcp.cc/ssthresh 16000 :tcp.cc/state :congestion-avoidance)
+        lost (reduce (fn [a _] (cc/on-duplicate-ack a 16000)) start (range 3))
+        recovered (cc/on-ack lost mss)
+        climbing (reduce (fn [a _] (cc/on-ack a mss)) recovered (range 8))]
+    (is (= 8000 (:tcp.cc/ssthresh lost)))
+    (is (= 8000 (:tcp.cc/cwnd recovered)))
+    (is (< 8000 (:tcp.cc/cwnd climbing) 9000)
+        "additive increase, not another doubling")))

@@ -1,0 +1,103 @@
+(ns tcp.sack-test
+  (:require [tcp.sack :as sack]
+            [tcp.retransmit :as rtx]
+            [tcp.reassemble :as ra]
+            [kotoba.test :refer [deftest is testing]]))
+
+;; ── the option is small ──────────────────────────────────────────────────
+
+(deftest four-blocks-fit-and-three-do-when-timestamps-are-on
+  (is (= 4 (sack/max-blocks false)))
+  (is (= 3 (sack/max-blocks true))
+      "a stack that always emits four overruns the option space on every timestamped connection"))
+
+(deftest sack-needs-both-sides
+  (is (true? (sack/permitted? {:sack-permitted true} {:sack-permitted true})))
+  (is (false? (sack/permitted? {:sack-permitted true} {})))
+  (is (false? (sack/permitted? {} {:sack-permitted true}))))
+
+;; ── receiver: what to report ─────────────────────────────────────────────
+
+(defn- held [& pairs]
+  (mapv (fn [[s n]] {:seq s :data (vec (repeat n 0))}) (partition 2 pairs)))
+
+(deftest blocks-are-the-ranges-held-not-the-gaps
+  (is (= [[1005 1008] [1020 1025]]
+         (sack/blocks-from-held (held 1005 3 1020 5)))))
+
+(deftest touching-ranges-are-coalesced
+  (testing "spending an option slot on a seam wastes a report the sender needed"
+    (is (= [[1000 1010]] (sack/blocks-from-held (held 1000 5 1005 5))))))
+
+(deftest the-newest-block-is-reported-first
+  (testing "RFC 2018 section 4 -- otherwise the newest information is the first lost to truncation"
+    (let [h (held 1000 5 2000 5 3000 5)]
+      (is (= [2000 2005] (first (sack/report h 2002)))))))
+
+(deftest previous-blocks-are-repeated-so-a-lost-ack-does-not-lose-the-picture
+  (let [h (held 1000 5 2000 5 3000 5)
+        r (sack/report h 3002 [[1000 1005]] false)]
+    (is (= [3000 3005] (first r)) "newest first")
+    (is (= [1000 1005] (second r)) "then what was reported before")))
+
+(deftest the-report-is-bounded-by-the-option-space
+  (let [h (apply held (mapcat (fn [i] [(* i 1000) 5]) (range 1 8)))]
+    (is (= 4 (count (sack/report h 1002))))
+    (is (= 3 (count (sack/report h 1002 [] true))))))
+
+(deftest the-reassembler-and-the-reporter-agree
+  (let [r (-> (ra/reassembler {:rcv-nxt 1000})
+              (ra/accept {:seq 1005 :data [1 2 3]}) :reassembler
+              (ra/accept {:seq 1020 :data [4 5]}) :reassembler)]
+    (is (= [[1000 1005] [1008 1020]] (ra/gaps r)) "the holes")
+    (is (= [[1005 1008] [1020 1022]] (sack/blocks-from-held (:tcp.ra/held r)))
+        "and their inverse, which is what SACK reports")))
+
+;; ── sender: what to do with them ─────────────────────────────────────────
+
+(defn- q4 []
+  (-> (rtx/queue)
+      (rtx/push {:seq 1000 :len 100 :now-ms 0})
+      (rtx/push {:seq 1100 :len 100 :now-ms 0})
+      (rtx/push {:seq 1200 :len 100 :now-ms 0})
+      (rtx/push {:seq 1300 :len 100 :now-ms 0})))
+
+(deftest a-sack-marks-the-entries-it-covers
+  (let [q (sack/apply-blocks (q4) [[1100 1200] [1300 1400]])]
+    (is (= [false true false true] (mapv sack/sacked? (rtx/in-flight q))))))
+
+(deftest a-sack-does-not-retire-anything
+  (testing "a receiver may renege; only the cumulative ACK is a promise"
+    (let [q (sack/apply-blocks (q4) [[1100 1200] [1300 1400]])]
+      (is (= 4 (count (rtx/in-flight q)))
+          "freeing SACKed data loses bytes a reneging receiver will never see again"))))
+
+(deftest a-partially-covered-entry-is-not-marked
+  (testing "half a segment acknowledged is not the segment acknowledged"
+    (let [q (sack/apply-blocks (q4) [[1100 1150]])]
+      (is (every? false? (mapv sack/sacked? (rtx/in-flight q)))))))
+
+(deftest holes-are-what-actually-needs-resending
+  (let [q (sack/apply-blocks (q4) [[1100 1200] [1300 1400]])]
+    (is (= [1000 1200] (mapv :seq (sack/holes q))))
+    (is (= 1000 (:seq (sack/next-to-retransmit q))) "oldest first, one at a time")))
+
+(deftest without-sack-the-sender-would-resend-everything-after-the-hole
+  (testing "the cost the option removes"
+    (let [plain (q4)
+          sacked (sack/apply-blocks (q4) [[1100 1200] [1300 1400]])]
+      (is (= 4 (count (rtx/in-flight plain))))
+      (is (= 2 (count (sack/holes sacked)))
+          "two segments instead of four -- the other two are already there"))))
+
+(deftest pipe-counts-only-what-is-really-still-out
+  (let [q (sack/apply-blocks (q4) [[1100 1200] [1300 1400]])]
+    (is (= 400 (sack/pipe (q4))) "nothing SACKed yet")
+    (is (= 200 (sack/pipe q))
+        "counting SACKed data as in flight under-sends for the rest of the recovery")))
+
+(deftest the-cumulative-ack-still-does-the-retiring
+  (let [q (sack/apply-blocks (q4) [[1100 1200]])
+        {:keys [queue retired]} (rtx/ack q 1200 10)]
+    (is (= 2 (count retired)) "1000 and 1100, by the cumulative ack")
+    (is (= 2 (count (rtx/in-flight queue))))))

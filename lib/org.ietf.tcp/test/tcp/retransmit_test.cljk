@@ -1,0 +1,109 @@
+(ns tcp.retransmit-test
+  (:require [tcp.retransmit :as rtx]
+            [tcp.rto :as rto]
+            [tcp.seq :as s]
+            [kotoba.test :refer [deftest is testing]]))
+
+(defn- q3 []
+  (-> (rtx/queue)
+      (rtx/push {:seq 1000 :len 100 :now-ms 0})
+      (rtx/push {:seq 1100 :len 100 :now-ms 10})
+      (rtx/push {:seq 1200 :len 100 :now-ms 20})))
+
+(deftest a-cumulative-ack-retires-a-prefix
+  (let [{:keys [queue retired]} (rtx/ack (q3) 1200 50)]
+    (is (= 2 (count retired)))
+    (is (= 1 (count (rtx/in-flight queue))))
+    (is (= 1200 (:seq (first (rtx/in-flight queue)))))))
+
+(deftest a-segment-straddling-the-ack-is-not-retired
+  (testing "the peer has some of it; resending the whole thing is right, resending nothing loses the tail"
+    (let [{:keys [queue retired]} (rtx/ack (q3) 1050 50)]
+      (is (empty? retired))
+      (is (= 3 (count (rtx/in-flight queue)))))))
+
+(deftest syn-and-fin-each-occupy-a-sequence-number
+  (let [q (-> (rtx/queue) (rtx/push {:seq 500 :len 0 :syn? true :now-ms 0}))]
+    (is (empty? (:retired (rtx/ack q 500 1))) "the SYN is not acked by its own number")
+    (is (= 1 (count (:retired (rtx/ack q 501 1)))))))
+
+(deftest acks-retire-across-a-sequence-wrap
+  (let [q (-> (rtx/queue) (rtx/push {:seq 4294967290 :len 10 :now-ms 0}))
+        {:keys [retired queue]} (rtx/ack q 4 5)]
+    (is (= 1 (count retired)) "4294967290 + 10 wraps to 4")
+    (is (rtx/empty-queue? queue))))
+
+;; ── the sample this ACK is entitled to ───────────────────────────────────
+
+(deftest a-clean-ack-yields-a-round-trip
+  (let [{:keys [sample-ms ambiguous?]} (rtx/ack (q3) 1200 130)]
+    (is (= 120 sample-ms) "measured from the newest clean entry's first send")
+    (is (false? ambiguous?))))
+
+(deftest an-ack-of-only-retransmitted-segments-is-ambiguous
+  (let [q (-> (q3) (rtx/mark-retransmitted 1000 40) (rtx/mark-retransmitted 1100 40))
+        {:keys [sample-ms ambiguous?]} (rtx/ack q 1200 130)]
+    (is (nil? sample-ms))
+    (is (true? ambiguous?) "Karn's case, reported rather than guessed")))
+
+(deftest a-mixed-ack-still-yields-the-clean-sample
+  (let [q (rtx/mark-retransmitted (q3) 1000 40)
+        {:keys [sample-ms ambiguous?]} (rtx/ack q 1200 130)]
+    (is (= 120 sample-ms) "1100 was never retransmitted, so it can be timed")
+    (is (false? ambiguous?))))
+
+(deftest karns-flag-survives-until-the-entry-is-retired
+  (let [q (rtx/mark-retransmitted (q3) 1000 40)]
+    (is (true? (:retransmitted? (rtx/oldest-unacked q))))
+    (is (= 2 (:transmissions (rtx/oldest-unacked q))))))
+
+;; ── timers ───────────────────────────────────────────────────────────────
+
+(deftest only-the-oldest-expired-entry-is-returned
+  (testing "flushing the queue on one timer turns one loss into a burst"
+    (let [due (rtx/due (q3) 100 1000)]
+      (is (= 1 (count due)))
+      (is (= 1000 (:seq (first due)))))))
+
+(deftest nothing-is-due-before-the-timeout
+  (is (nil? (rtx/due (q3) 1000 500)))
+  (is (some? (rtx/due (q3) 1000 1000)) "at the timeout exactly, it is due"))
+
+(deftest retransmitting-restarts-that-entrys-timer
+  ;; One entry, so nothing else can be due and the property is the only thing
+  ;; the assertion can be measuring.
+  (let [q (-> (rtx/queue) (rtx/push {:seq 1000 :len 100 :now-ms 0}))]
+    (is (some? (rtx/due q 100 1000)) "outstanding 1000ms against a 100ms timeout")
+    (let [q' (rtx/mark-retransmitted q 1000 1000)]
+      (is (nil? (rtx/due q' 100 1050)) "the resend restarted its timer")
+      (is (some? (rtx/due q' 100 1100)) "and it expires again one timeout later"))))
+
+(deftest the-oldest-expired-entry-is-the-one-returned
+  (let [q (rtx/mark-retransmitted (q3) 1000 1000)]
+    (is (= 1100 (:seq (first (rtx/due q 100 1050))))
+        "1000's timer restarted, so the oldest still-expired entry is 1100")
+    (is (= 1000 (:seq (first (rtx/due q 100 1200))))
+        "once 1000 expires again it is first in queue order")))
+
+(deftest a-connection-gives-up-eventually
+  (let [q (reduce (fn [q n] (rtx/mark-retransmitted q 1000 (* n 100))) (q3) (range 1 7))]
+    (is (true? (rtx/give-up? (rtx/oldest-unacked q))))
+    (is (false? (rtx/give-up? (second (rtx/in-flight q)))))))
+
+;; ── the two halves together ──────────────────────────────────────────────
+
+(deftest a-loss-and-a-recovery-move-the-timeout-the-way-the-rfc-says
+  (let [est (rto/sample (rto/estimator) 400)
+        q (-> (rtx/queue) (rtx/push {:seq 1 :len 10 :now-ms 0}))
+        ;; nothing arrives: back off and resend
+        due (rtx/due q (:tcp.rto/rto-ms est) 1300)
+        est' (rto/backoff est)
+        q' (rtx/mark-retransmitted q 1 1300)
+        ;; the ACK that finally arrives is ambiguous
+        {:keys [sample-ms ambiguous?]} (rtx/ack q' 11 1500)
+        est'' (if ambiguous? (rto/sample est' sample-ms true) (rto/sample est' sample-ms))]
+    (is (some? due))
+    (is (= 2400 (:tcp.rto/rto-ms est')) "backed off")
+    (is (true? ambiguous?))
+    (is (= :karn (:tcp.rto/last-ignored est'')) "the ambiguous ACK did not move the estimate")
+    (is (= 2400 (:tcp.rto/rto-ms est'')) "still backed off -- only a clean sample recovers it")))

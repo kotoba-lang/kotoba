@@ -1,0 +1,115 @@
+;; `kotoba/tcp/retransmit_core.kotoba` against `tcp.retransmit`.
+;;
+;; Three of the four decisions here are one comparison each, and each of those
+;; comparisons has a wrong version that is not obviously wrong:
+;;
+;;   retiring on the entry's START rather than its end drops data the receiver
+;;   never acknowledged, and that data is never sent again;
+;;
+;;   timing the round trip from `sent-ms` rather than `first-sent-ms` reports a
+;;   shorter trip than happened and pulls the RTO toward a value the path
+;;   cannot meet;
+;;
+;;   `>` instead of `>=` on the timer leaves an entry one millisecond short of
+;;   due forever if the clock only ever lands on the boundary.
+;;
+;; So the inputs sit on the boundaries: an ACK exactly at the entry's end and
+;; one byte either side, an elapsed time exactly equal to the RTO, and a
+;; transmission count exactly at the limit.
+
+(ns tcp.retransmit-kotoba-parity-test
+  (:require [kotoba.io :as io]
+            [kotoba.test :refer [deftest is]]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]
+            [tcp.seq :as s]
+            [tcp.retransmit :as rtx]))
+
+(def ^:private source-file
+  (io/file (System/getProperty "user.dir") "kotoba" "tcp" "retransmit_core.kotoba"))
+
+(def ^:private dep-file
+  (io/file (System/getProperty "user.dir") "kotoba" "tcp" "seq_core.kotoba"))
+
+(defn- source-available? []
+  (let [present? (and (io/exists? source-file) (io/exists? dep-file))]
+    (is present? (str "kotoba objects not found: " source-file " / " dep-file))
+    present?))
+
+(def ^:private kir
+  (delay (:kir (compiler/compile-project
+                {'tcp.seq-core (slurp dep-file)
+                 'tcp.retransmit-core (slurp source-file)}
+                'tcp.retransmit-core :wasm32-kotoba-v1 {}))))
+
+(defn- call [f & args] (ir/execute @kir f (vec args)))
+
+(def ^:private seqs [0 1 1000 2147483648 4294967290 4294967295])
+
+(deftest kotoba-objects-are-present
+  (source-available?))
+
+;; `segment-end` lives in tcp.seq-core and is checked there. Only the project
+;; ROOT's exports are reachable through the KIR, which is right: a dependency's
+;; surface is not this module's ABI.
+
+(deftest retired-agrees
+  (when (source-available?)
+    (doseq [sq [1000 4294967290], len [0 1 100], syn? [false true], fin? [false true]
+            :let [end (s/segment-end {:seq sq :len len :syn? syn? :fin? fin?})]
+            ack [(s/-seq end 1) end (s/+seq end 1) sq (s/-seq sq 1)]]
+      ;; `ack` walks the queue; asking it about one entry is what the object
+      ;; decides, so drive it with a queue of exactly that entry.
+      (let [q (rtx/push (rtx/queue) {:seq sq :len len :syn? syn? :fin? fin?
+                                     :now-ms 0})
+            {:keys [retired]} (rtx/ack q ack 100)]
+        (is (= (= 1 (count retired)) (call 'retired? sq len syn? fin? ack))
+            (str "retired? entry [" sq "," end ") ack " ack
+                 " -- an ACK one byte short of the end retires nothing"))))))
+
+(deftest due-agrees
+  (when (source-available?)
+    (doseq [sent [0 1000 50000]
+            rto [1 200 3000]
+            elapsed [0 (dec rto) rto (inc rto) (* 2 rto)]]
+      (let [now (+ sent elapsed)
+            q (rtx/push (rtx/queue) {:seq 1 :len 10 :now-ms sent})]
+        (is (= (boolean (seq (rtx/due q rto now)))
+               (call 'due? sent rto now))
+            (str "due? sent " sent " rto " rto " elapsed " elapsed
+                 " -- elapsed exactly equal to the RTO is due"))))))
+
+(deftest give-up-agrees
+  (when (source-available?)
+    (doseq [transmissions [1 2 4 5 6 20], limit [1 3 5 10]]
+      (is (= (rtx/give-up? {:transmissions transmissions} limit)
+             (call 'give-up? transmissions limit))
+          (str "give-up? transmissions " transmissions " limit " limit
+               " -- exactly at the limit is not past it")))))
+
+(deftest rtt-sample-agrees
+  (when (source-available?)
+    (doseq [first-sent [0 1000 50000]
+            resent-after [0 50 400]
+            rtt [1 37 1200]]
+      ;; The entry goes out, is retransmitted, and is then acknowledged. The
+      ;; sample must measure from the FIRST send. tcp.retransmit reports nil
+      ;; here -- Karn -- so the .cljc side reads first-sent-ms directly; what
+      ;; is being checked is the arithmetic, not the ambiguity rule.
+      (let [now (+ first-sent resent-after rtt)]
+        (is (= (- now first-sent) (call 'rtt-sample now first-sent))
+            (str "rtt-sample first-sent " first-sent " now " now
+                 " -- timing from the retransmission reports a shorter trip "
+                 "than happened"))))))
+
+(deftest clean-sample-comes-from-the-first-send
+  (when (source-available?)
+    ;; The whole reason rtt-sample takes first-sent-ms: an entry sent once and
+    ;; acknowledged must measure the real trip, and tcp.retransmit is the
+    ;; oracle for which entry is eligible at all.
+    (doseq [sent [0 1000], rtt [1 250]]
+      (let [q (rtx/push (rtx/queue) {:seq 1 :len 10 :now-ms sent})
+            {:keys [sample-ms ambiguous?]} (rtx/ack q 11 (+ sent rtt))]
+        (is (false? (boolean ambiguous?)) "a single clean entry is not ambiguous")
+        (is (= sample-ms (call 'rtt-sample (+ sent rtt) sent))
+            (str "clean sample sent " sent " rtt " rtt))))))

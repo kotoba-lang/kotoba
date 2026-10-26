@@ -1,0 +1,135 @@
+;; Does `seq_core.kotoba` RUN, and does it answer correctly?
+;;
+;; Every other suite here answers one of two smaller questions: does it
+;; compile, and does the KIR interpreter agree with the .cljc. This one signs
+;; the artifact, measures the runtime, builds a loader and executes real
+;; machine code on this CPU, then compares the number that comes back with what
+;; `tcp.seq` says.
+;;
+;; It FAILS rather than skips when it cannot run. A native-execution test that
+;; passes on a machine where nothing was executed is worse than no test: it
+;; reports the strongest claim in this repository on the strength of having
+;; done nothing.
+;;
+;; ── two things this has to work around, both filed upstream ──────────────
+;;
+;; The probe is a flattened copy of seq_core rather than a `:require` of it.
+;; Process and ISA targets do not link multi-module projects (amu#612), so an
+;; entry point calling into another module cannot be built. `probe-source`
+;; derives the copy from the real file every run, so the two cannot drift.
+;;
+;; The packing uses `+` and not `bit-or`. bit-or is in the same admission set
+;; as the shifts, seq_core has `:bool` parameters, and the native target
+;; refuses that pair (amu#611). The five values are disjoint powers of two, so
+;; the two operations are the same function here.
+;;
+;; And `loader-source-dir` is found by walking up from a classpath resource
+;; belonging to the compiler, because `tools/kexe_loader.c` is not itself on
+;; the classpath (amu#614). That works because git dependencies are exploded
+;; directories; it would stop working if amu were ever consumed as a jar, and
+;; it fails loudly rather than quietly when it stops.
+
+(ns tcp.seq-native-execution-test
+  (:require [clojure.java.io :as io]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is]]
+            [kotoba.compiler.atomic-output :as atomic-output]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.artifact.runtime-identity :as runtime-identity]
+            [kotoba.verifier.signing :as signing]
+            [kototama.native.executor :as executor]
+            [tcp.seq :as s]))
+
+(def ^:private source-file
+  (io/file (System/getProperty "user.dir") "kotoba" "tcp" "seq_core.kotoba"))
+
+(defn- loader-source-dir
+  "Where the reviewed loader source lives, or nil.
+
+  `tools/kexe_loader.c` sits in the compiler's repository and is not exposed on
+  the classpath, so this locates the repository through a resource that IS
+  exposed and walks up to it."
+  []
+  (when-let [r (io/resource "kotoba/compiler/core.clj")]
+    (when (= "file" (.getProtocol r))
+      (let [root (->> (io/file (.getPath r))
+                      (iterate #(.getParentFile ^java.io.File %))
+                      (take 5) last)
+            dir (io/file root "tools")]
+        (when (.isFile (io/file dir "kexe_loader.c")) (.getPath dir))))))
+
+(def ^:private entry
+  "The five questions, packed into one i64 so a single execution covers them
+  all. Every one straddles the 2^32 wrap, which is where a sequence
+  implementation is wrong when it is wrong."
+  (str "\n(defn main [] :i64\n"
+       "  (+ (if (acceptable? 4294967290 10 4294967295 100) 1 0)\n"
+       "     (+ (if (lt? 4294967295 0) 2 0)\n"
+       "        (+ (if (lt? 0 4294967295) 4 0)\n"
+       "           (+ (if (ordered? 0 2147483648) 8 0)\n"
+       "              (if (= (wrap -1) 4294967295) 16 0))))))\n"))
+
+(defn- oracle []
+  (+ (if (s/acceptable? 4294967290 10 4294967295 100) 1 0)
+     (if (s/lt? 4294967295 0) 2 0)
+     (if (s/lt? 0 4294967295) 4 0)
+     (if (s/ordered? 0 2147483648) 8 0)
+     (if (= (s/wrap -1) 4294967295) 16 0)))
+
+(defn- probe-source
+  "seq_core with its ns form replaced by one exporting `main`.
+
+  Derived from the real file every run rather than kept as a second copy: if
+  seq_core's ns form changes shape the replacement fails to match and this goes
+  red, instead of testing an older flattening."
+  []
+  (let [src (slurp source-file)
+        open (str/index-of src "(ns tcp.seq-core")
+        close (str/index-of src "]))" open)]
+    (is (and open close)
+        "seq_core.kotoba's ns form is not in the shape this test flattens")
+    (str (subs src 0 open) "(ns probe (:export [main]))" (subs src (+ close 3))
+         entry)))
+
+(def ^:private target
+  (if (contains? #{"aarch64" "arm64"} (.toLowerCase (System/getProperty "os.arch")))
+    :aarch64-kotoba-v1
+    :x86_64-kotoba-v1))
+
+(deftest seq-core-runs-as-machine-code-and-agrees
+  (is (.exists source-file) (str "kotoba object not found at " source-file))
+  (let [dir (loader-source-dir)]
+    (is dir (str "the reviewed loader source was not found. It lives in the "
+                 "compiler's repository under tools/ and is not on the "
+                 "classpath (amu#614); this test locates it by walking up from "
+                 "a compiler resource, which needs the dependency to be an "
+                 "exploded git checkout."))
+    (when (and dir (.exists source-file))
+      (let [artifact (:artifact (compiler/compile-source (probe-source) target
+                                                         {:allow #{}}))
+            k (signing/generate-keypair)
+            envelope (signing/sign artifact k {:not-before 1000 :expires 2000})
+            measured (executor/measure-runtime {:loader-source-dir dir})
+            loader (doto (java.io.File/createTempFile "kotoba-loader-" "")
+                     (.deleteOnExit))
+            _ (atomic-output/write-bytes! (.getPath loader) (:loader-bytes measured)
+                                          {:executable? true})
+            trust {:format :kotoba.trust/v1
+                   :trusted-signers #{(:signer k)}
+                   :revoked-signers #{} :revoked-artifacts #{}
+                   :trusted-runtime-sha256
+                   #{(runtime-identity/identity-sha256 (:runtime measured))}}
+            {:keys [evidence]} (executor/execute envelope trust {:allow #{}}
+                                                 {:args []}
+                                                 {:now 1500 :entry 'main
+                                                  :runtime (:runtime measured)
+                                                  :loader-path (.getPath loader)})]
+        ;; Asserted, not assumed: a run that fell back to an interpreter would
+        ;; produce the right number and prove nothing this test exists for.
+        (is (= :native (get-in evidence [:runtime :target-profile :execution]))
+            "the artifact must have executed as machine code, not been interpreted")
+        (is (= :ok (:status evidence))
+            (str "native execution did not succeed: " (pr-str (:status evidence))))
+        (is (= (oracle) (:result evidence))
+            (str "machine code returned " (:result evidence)
+                 " and tcp.seq says " (oracle)))))))

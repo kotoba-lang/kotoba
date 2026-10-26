@@ -1,0 +1,144 @@
+;; `kotoba/tcp/pacing_core.kotoba` against `tcp.pacing`.
+;;
+;; Both algorithms here are famous for a failure that looks like nothing.
+;;
+;; Nagle without its fourth clause -- "everything sent so far is acknowledged,
+;; so there is nothing to coalesce with" -- holds the FIRST byte of a
+;; connection until something else arrives to combine it with, which on a
+;; request/response protocol is never.
+;;
+;; A delayed ACK on an out-of-order segment defers the duplicate that fast
+;; retransmit counts, which defers the retransmission by the whole delay timer,
+;; on exactly the path that has just lost a segment.
+;;
+;; And the two together are the classic stall: the sender waits for an ACK, the
+;; receiver waits for more data, and nothing moves until the timer fires. So
+;; `deadlock?` is asserted here rather than assumed, over the whole cross
+;; product of both decisions.
+
+(ns tcp.pacing-kotoba-parity-test
+  (:require [kotoba.io :as io]
+            [kotoba.test :refer [deftest is]]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]
+            [tcp.pacing :as pace]))
+
+(def ^:private source-file
+  (io/file (System/getProperty "user.dir") "kotoba" "tcp" "pacing_core.kotoba"))
+
+(defn- source-available? []
+  (let [present? (io/exists? source-file)]
+    (is present? (str "kotoba object not found at " source-file))
+    present?))
+
+(def ^:private kir
+  (delay (:kir (compiler/compile-source (slurp source-file) :wasm32-kotoba-v1 {}))))
+
+(defn- call [f & args] (ir/execute @kir f (vec args)))
+
+(def ^:private send-code
+  {:nothing-to-send 0 :nodelay 1 :full-segment 2 :nothing-outstanding 3
+   :small-and-unacked-outstanding 4})
+
+(def ^:private ack-code
+  {:out-of-order 0 :closing 1 :window-update 2 :second-full-segment 3
+   :delayed 4})
+
+(def ^:private msses [1 536 1460])
+
+(deftest kotoba-object-is-present
+  (source-available?))
+
+(deftest clamped-delay-agrees
+  (when (source-available?)
+    (doseq [d [0 1 199 200 499 500 501 100000]]
+      (is (= (:tcp.pace/delay-ms (pace/receiver {:mss 1460 :delay-ms d}))
+             (call 'clamped-delay d))
+          (str "delay " d " -- 500 ms is the RFC 1122 ceiling, and exceeding "
+               "it is a violation rather than tuning")))))
+
+(deftest may-send-agrees
+  (when (source-available?)
+    (doseq [mss msses
+            available [0 1 (dec mss) mss (inc mss)]
+            unacked [0 1 mss]
+            nodelay? [false true]]
+      (let [d (pace/may-send? (pace/sender {:mss mss :nodelay? nodelay?})
+                              available unacked)
+            reason (call 'may-send-reason available mss unacked nodelay?)]
+        (is (= (send-code (:reason d)) reason)
+            (str "may-send reason avail " available " mss " mss
+                 " unacked " unacked " nodelay " nodelay?))
+        (is (= (:send? d) (call 'may-send? reason))
+            (str "may-send? avail " available " unacked " unacked
+                 " -- unacked 0 is the clause whose absence holds the first "
+                 "byte of a connection forever"))))))
+
+(deftest ack-decision-agrees
+  (when (source-available?)
+    (doseq [mss msses
+            len [0 1 (dec mss) mss (inc mss)]
+            unacked-before [0 1 2 5]
+            in-order? [true false]
+            window-opened? [false true]
+            fin? [false true]]
+      (let [rcv (assoc (pace/receiver {:mss mss})
+                       :tcp.pace/unacked-segments unacked-before
+                       :tcp.pace/first-unacked-ms (when (pos? unacked-before) 0))
+            actual (pace/on-segment rcv {:len len :in-order? in-order?
+                                         :window-opened? window-opened?
+                                         :fin? fin? :now-ms 10})
+            second-full? (call 'second-full-segment? len mss unacked-before)
+            reason (call 'ack-reason second-full? in-order? window-opened? fin?)]
+        (is (= (ack-code (:reason actual)) reason)
+            (str "ack reason len " len " mss " mss " n " unacked-before
+                 " in-order " in-order? " window " window-opened?
+                 " fin " fin?))
+        (is (= (:ack-now? actual) (call 'ack-now? reason))
+            (str "ack-now? " (:reason actual)))))))
+
+(deftest tick-agrees
+  (when (source-available?)
+    (doseq [delay-ms [1 200 500]
+            started [0 1000]
+            elapsed [0 (dec delay-ms) delay-ms (inc delay-ms)]
+            pending? [false true]]
+      (let [rcv (assoc (pace/receiver {:mss 1460 :delay-ms delay-ms})
+                       :tcp.pace/first-unacked-ms (when pending? started)
+                       :tcp.pace/unacked-segments (if pending? 1 0))
+            now (+ started elapsed)
+            actual (pace/on-tick rcv now)]
+        (is (= (:ack-now? actual) (call 'tick-expired? pending? started delay-ms now))
+            (str "tick pending " pending? " delay " delay-ms " elapsed " elapsed
+                 " -- elapsed exactly equal to the delay has expired"))))))
+
+(deftest deadlock-agrees
+  (when (source-available?)
+    ;; The whole cross product, because the stall is the interaction and not a
+    ;; property of either side alone.
+    (doseq [mss msses
+            available [0 1 (dec mss) mss]
+            unacked [0 1 mss]
+            nodelay? [false true]
+            pending? [false true]]
+      (let [snd (pace/may-send? (pace/sender {:mss mss :nodelay? nodelay?})
+                                available unacked)
+            rcv (assoc (pace/receiver {:mss mss})
+                       :tcp.pace/first-unacked-ms (when pending? 0)
+                       :tcp.pace/unacked-segments (if pending? 1 0))
+            reason (call 'may-send-reason available mss unacked nodelay?)]
+        (is (= (pace/deadlock? snd rcv) (call 'deadlock? reason pending?))
+            (str "deadlock? avail " available " unacked " unacked
+                 " nodelay " nodelay? " ack-pending " pending?))))))
+
+(deftest stall-ms-agrees
+  (when (source-available?)
+    (doseq [delay-ms [1 200 500]
+            started [0 1000]
+            elapsed [0 (quot delay-ms 2) delay-ms (* 2 delay-ms)]]
+      (let [rcv (assoc (pace/receiver {:mss 1460 :delay-ms delay-ms})
+                       :tcp.pace/first-unacked-ms started)]
+        (is (= (pace/stall-ms rcv (+ started elapsed))
+               (call 'stall-ms delay-ms started (+ started elapsed)))
+            (str "stall-ms delay " delay-ms " elapsed " elapsed
+                 " -- past the deadline it is zero, not negative"))))))

@@ -1,0 +1,122 @@
+(ns tcp.options-test
+  (:require [tcp.options :as o]
+            [tcp.rto :as rto]
+            [kotoba.test :refer [deftest is testing]]))
+
+;; ── parsing ──────────────────────────────────────────────────────────────
+
+(deftest a-syn-with-mss-scale-and-timestamps-parses
+  (let [bs (o/render {:mss 1460 :window-shift 7
+                      :timestamps {:tsval 1000 :tsecr 0}})
+        p (o/parse bs)]
+    (is (= 1460 (:mss p)))
+    (is (= 7 (:window-shift p)))
+    (is (= {:tsval 1000 :tsecr 0} (:timestamps p)))))
+
+(deftest rendering-pads-to-a-four-byte-boundary
+  (is (zero? (mod (count (o/render {:mss 1460})) 4)))
+  (is (zero? (mod (count (o/render {:mss 1460 :window-shift 7})) 4)))
+  (is (zero? (mod (count (o/render {:window-shift 7 :timestamps {:tsval 1 :tsecr 2}})) 4))))
+
+(deftest nops-are-skipped-and-eol-ends-the-list
+  (is (= {:mss 512} (o/parse [o/kind-nop o/kind-nop o/kind-mss 4 2 0 o/kind-eol 9 9]))))
+
+(deftest an-option-running-past-the-end-is-refused-not-clamped
+  (is (= :option-overruns (:tcp.opt/error (o/parse [o/kind-mss 40 1 2]))))
+  (is (= :option-overruns (:tcp.opt/error (o/parse [o/kind-mss])))))
+
+(deftest a-length-below-two-is-refused
+  (is (= :bad-length (:tcp.opt/error (o/parse [o/kind-mss 1])))))
+
+(deftest a-shift-above-fourteen-is-refused
+  (testing "a larger shift can push the window past what the sequence space allows"
+    (is (= :shift-too-large (:tcp.opt/error (o/parse [o/kind-window-scale 3 15]))))
+    (is (= 14 (:window-shift (o/parse [o/kind-window-scale 3 14]))))))
+
+(deftest an-unknown-option-is-skipped-by-its-length
+  (is (= {:mss 1460} (o/parse (into [99 6 1 2 3 4] (o/render {:mss 1460}))))))
+
+;; ── negotiation ──────────────────────────────────────────────────────────
+
+(deftest scaling-needs-both-sides
+  (let [both (o/negotiate {:window-shift 7} {:window-shift 3})
+        ours-only (o/negotiate {:window-shift 7} {})
+        theirs-only (o/negotiate {} {:window-shift 3})]
+    (is (true? (:tcp.opt/window-scaling? both)))
+    (is (false? (:tcp.opt/window-scaling? ours-only))
+        "half-applied scaling is a window wrong by 2^N")
+    (is (false? (:tcp.opt/window-scaling? theirs-only)))
+    (is (zero? (:tcp.opt/send-shift ours-only)))))
+
+(deftest the-two-shifts-are-not-interchangeable
+  (testing "swapping them only shows on asymmetric shifts, which is why it survives testing elsewhere"
+    (let [n (o/negotiate {:window-shift 7} {:window-shift 3})]
+      (is (= 7 (:tcp.opt/send-shift n)) "we shift our own advertisements by what we offered")
+      (is (= 3 (:tcp.opt/recv-shift n)) "and read theirs by what they offered"))))
+
+(deftest timestamps-need-both-sides-too
+  (is (true? (:tcp.opt/timestamps? (o/negotiate {:timestamps {:tsval 1}} {:timestamps {:tsval 2}}))))
+  (is (false? (:tcp.opt/timestamps? (o/negotiate {:timestamps {:tsval 1}} {})))))
+
+;; ── applying the scale ───────────────────────────────────────────────────
+
+(deftest a-syns-window-is-never-scaled
+  (testing "the option agreeing the scale travels in that very segment"
+    (is (= 65535 (o/apply-scale 65535 7 true)))
+    (is (= 8388480 (o/apply-scale 65535 7 false)))))
+
+(deftest advertising-refuses-a-window-it-cannot-express
+  (is (= 511 (o/advertise 65535 7 false)) "65535 >> 7")
+  (is (= 65535 (o/advertise 65535 0 false)))
+  (is (nil? (o/advertise 70000 0 false))
+      "silently truncating would advertise a smaller window and stall throughput with no error"))
+
+(deftest scaling-round-trips
+  (doseq [shift [0 1 7 14]]
+    (let [real (bit-shift-left 1000 shift)]
+      (is (= real (o/apply-scale (o/advertise real shift false) shift false))))))
+
+;; ── PAWS ─────────────────────────────────────────────────────────────────
+
+(deftest without-a-recorded-timestamp-everything-is-acceptable
+  (is (true? (o/paws-acceptable? nil 1))))
+
+(deftest an-older-timestamp-is-an-old-duplicate
+  (is (false? (o/paws-acceptable? 1000 999)))
+  (is (true? (o/paws-acceptable? 1000 1000)) "equal is not older")
+  (is (true? (o/paws-acceptable? 1000 1001))))
+
+(deftest paws-comparison-is-modular
+  (testing "the timestamp clock wraps too; a raw compare rejects everything after it"
+    (is (true? (o/paws-acceptable? 4294967290 5)))
+    (is (false? (o/paws-acceptable? 5 4294967290)))))
+
+(deftest a-long-idle-connection-suspends-the-check
+  (is (false? (o/paws-acceptable? 1000 500 0 1000)) "recent enough, still checked")
+  (is (true? (o/paws-acceptable? 1000 500 0 (inc o/paws-idle-ms)))
+      "past 24 days an older-looking timestamp can be legitimate"))
+
+(deftest only-an-in-sequence-segment-updates-the-record
+  (let [st {}
+        in-seq (o/record-timestamp st {:tsval 500 :seg-seq 1000 :rcv-nxt 1000 :now-ms 1})
+        out-of-seq (o/record-timestamp st {:tsval 500 :seg-seq 2000 :rcv-nxt 1000 :now-ms 1})]
+    (is (= 500 (:tcp.opt/recent-tsval in-seq)))
+    (is (nil? (:tcp.opt/recent-tsval out-of-seq))
+        "a reordered old segment must not raise the bar against the ones behind it")))
+
+;; ── the echo lifts Karn ──────────────────────────────────────────────────
+
+(deftest a-timestamp-echo-names-the-transmission-so-the-sample-is-usable
+  (let [sample (o/rtt-sample {:tsecr 1000} 1250)]
+    (is (= 250 sample))
+    (let [karned (rto/sample (rto/estimator) sample true)
+          timestamped (rto/sample (rto/estimator) sample)]
+      (is (= :karn (:tcp.rto/last-ignored karned))
+          "without timestamps this measurement would be refused as ambiguous")
+      (is (= 250.0 (:tcp.rto/srtt-ms timestamped))
+          "with the echo it is not ambiguous, and the estimator can use it"))))
+
+(deftest an-echo-of-zero-or-from-the-future-is-not-a-measurement
+  (is (nil? (o/rtt-sample {:tsecr 0} 100)))
+  (is (nil? (o/rtt-sample {:tsecr 200} 100)))
+  (is (nil? (o/rtt-sample {} 100))))
