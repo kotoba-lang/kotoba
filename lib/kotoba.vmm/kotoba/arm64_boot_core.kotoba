@@ -1,0 +1,133 @@
+(ns arm64-boot-core
+  (:export [image-magic mib-2 mib-512 max-dtb-bytes
+            align-up ram-end kernel-base kernel-gpa kernel-end
+            dtb-gpa dtb-end initrd-gpa initrd-end x0-value pc-value
+            admit-image admit-kernel admit-dtb admit-initrd]))
+
+;; The arm64 Linux boot protocol, as decisions.
+;;
+;; Source of truth for the rules: Linux `Documentation/arch/arm64/booting.rst`
+;; -- the 64-byte Image header (magic at offset 56, `image_size`,
+;; `text_offset`, `flags` bit 0 = endianness), the 2 MiB-aligned base, the
+;; 8-byte-aligned DTB no larger than 2 MiB placed within 512 MiB of the kernel
+;; base, and the entry contract (x0 = DTB address, x1..x3 = 0, PC = image
+;; start).
+;;
+;; This file decides. It never reads a file, maps memory, or calls an ioctl:
+;; the monitor does that and asks here. Errors are values -- `[:result T E]`
+;; with a pinned reason literal, never a throw (root AGENTS.md, aiueos
+;; ADR-0015's decision-free-mechanism split applied to the tender).
+;;
+;; Host call path: vmm.arm64-boot/plan (executes the shipped KIR).
+;; Gate: test/vmm/arm64_boot_test.cljk
+
+(defn image-magic [] :i64
+  ;; "ARM\x64" read as a little-endian u32 == 0x644D5241.
+  1682788929)
+
+(defn mib-2 [] :i64 2097152)
+(defn mib-512 [] :i64 536870912)
+
+(defn max-dtb-bytes [] :i64
+  ;; booting.rst: the devicetree blob must be no larger than 2 MiB.
+  2097152)
+
+(defn align-up [x :i64 a :i64] :i64
+  (* (quot (+ x (- a 1)) a) a))
+
+(defn ram-end [ram-base :i64 ram-size :i64] :i64
+  (+ ram-base ram-size))
+
+(defn kernel-base [ram-base :i64] :i64
+  ;; The 2 MiB-aligned base the image is placed relative to.
+  (align-up ram-base (mib-2)))
+
+(defn kernel-gpa [ram-base :i64 text-offset :i64] :i64
+  (+ (kernel-base ram-base) text-offset))
+
+(defn kernel-end [ram-base :i64 text-offset :i64 image-size :i64] :i64
+  (+ (kernel-gpa ram-base text-offset) image-size))
+
+(defn dtb-gpa [ram-base :i64 text-offset :i64 image-size :i64] :i64
+  ;; 2 MiB alignment satisfies the 8-byte requirement and keeps the blob off
+  ;; the kernel's own pages.
+  (align-up (kernel-end ram-base text-offset image-size) (mib-2)))
+
+(defn dtb-end [ram-base :i64 text-offset :i64 image-size :i64 dtb-size :i64] :i64
+  (+ (dtb-gpa ram-base text-offset image-size) dtb-size))
+
+(defn initrd-gpa [ram-base :i64 text-offset :i64 image-size :i64 dtb-size :i64] :i64
+  (align-up (dtb-end ram-base text-offset image-size dtb-size) (mib-2)))
+
+(defn initrd-end [ram-base :i64 text-offset :i64 image-size :i64
+                  dtb-size :i64 initrd-size :i64] :i64
+  (+ (initrd-gpa ram-base text-offset image-size dtb-size) initrd-size))
+
+(defn x0-value [ram-base :i64 text-offset :i64 image-size :i64] :i64
+  ;; x0 holds the DTB physical address; x1..x3 are zero.
+  (dtb-gpa ram-base text-offset image-size))
+
+(defn pc-value [ram-base :i64 text-offset :i64] :i64
+  (kernel-gpa ram-base text-offset))
+
+(defn admit-image [magic :i64 image-size :i64 flags :i64] [:result :i64 :string]
+  ;; The header alone, before any address is computed. Ok payload is the
+  ;; image size the rest of the plan is allowed to use.
+  ;;
+  ;; Every rejection names itself, and the gate pins the literal: an upstream
+  ;; rename fails the test instead of silently widening what is admitted.
+  (cond
+    (not (= magic (image-magic)))
+    (result-err-of [:result :i64 :string] "arm64-boot/bad-magic")
+
+    (= (bit-and flags 1) 1)
+    (result-err-of [:result :i64 :string] "arm64-boot/big-endian")
+
+    (= image-size 0)
+    (result-err-of [:result :i64 :string] "arm64-boot/unknown-image-size")
+
+    :else
+    (result-ok-of [:result :i64 :string] image-size)))
+
+(defn admit-kernel [ram-base :i64 ram-size :i64 text-offset :i64 image-size :i64]
+  [:result :i64 :string]
+  ;; Where the image lands, and whether it fits. Ok payload is the entry PC.
+  (cond
+    (< ram-size 1)
+    (result-err-of [:result :i64 :string] "arm64-boot/empty-ram")
+
+    (> (kernel-end ram-base text-offset image-size) (ram-end ram-base ram-size))
+    (result-err-of [:result :i64 :string] "arm64-boot/kernel-overflows-ram")
+
+    :else
+    (result-ok-of [:result :i64 :string] (pc-value ram-base text-offset))))
+
+(defn admit-dtb [ram-base :i64 ram-size :i64 text-offset :i64
+                 image-size :i64 dtb-size :i64]
+  [:result :i64 :string]
+  ;; booting.rst puts two separate limits on the blob: no larger than 2 MiB,
+  ;; and within 512 MiB of the kernel base -- a guest whose DTB is outside
+  ;; that window boots into a kernel that cannot read its own devicetree.
+  ;; Ok payload is the DTB address, which is also the value of x0.
+  (cond
+    (> dtb-size (max-dtb-bytes))
+    (result-err-of [:result :i64 :string] "arm64-boot/dtb-too-large")
+
+    (> (dtb-end ram-base text-offset image-size dtb-size)
+       (ram-end ram-base ram-size))
+    (result-err-of [:result :i64 :string] "arm64-boot/dtb-overflows-ram")
+
+    (>= (- (dtb-gpa ram-base text-offset image-size) (kernel-base ram-base))
+        (mib-512))
+    (result-err-of [:result :i64 :string] "arm64-boot/dtb-out-of-kernel-window")
+
+    :else
+    (result-ok-of [:result :i64 :string]
+      (dtb-gpa ram-base text-offset image-size))))
+
+(defn admit-initrd [gpa :i64 size :i64 ram-limit :i64] [:result :i64 :string]
+  ;; Takes the placement rather than recomputing it, so the value checked is
+  ;; the value the monitor will load at. Ok payload is the end address.
+  (if (> (+ gpa size) ram-limit)
+    (result-err-of [:result :i64 :string] "arm64-boot/initrd-overflows-ram")
+    (result-ok-of [:result :i64 :string] (+ gpa size))))

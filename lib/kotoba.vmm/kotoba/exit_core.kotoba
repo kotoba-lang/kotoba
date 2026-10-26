@@ -1,0 +1,138 @@
+(ns exit-core
+  (:export [uart-base uart-size virtio-base virtio-stride virtio-count
+            virtio-window device-uart device-virtio
+            psci-version-fid psci-cpu-on-32-fid psci-cpu-on-64-fid
+            psci-system-off-fid psci-system-reset-fid
+            action-version action-cpu-on action-system-off action-system-reset
+            access-size-ok? in-uart? in-virtio? virtio-offset
+            classify device-offset virtio-index psci-action]))
+
+;; What a VM exit means, as decisions.
+;;
+;; The monitor gets a guest-physical address, a length and a direction out of
+;; `kvm_run`, and a PSCI function id out of an HVC exit. Which device that is,
+;; whether the access is even well-formed, and which PSCI call it is are
+;; decisions -- they are here. Reading `kvm_run`, moving the bytes and
+;; injecting the answer are mechanism and stay in the host.
+;;
+;; The address map is the QEMU `virt` one, because that is the map the
+;; devicetree we hand a foreign Linux guest describes. It is data, not a
+;; discovery: nothing here probes hardware.
+;;
+;; Host call path: vmm.exit/classify-mmio, vmm.exit/psci-action.
+;; Gate: test/vmm/exit_test.cljk
+
+(defn uart-base [] :i64 150994944)      ;; 0x0900_0000, PL011
+(defn uart-size [] :i64 4096)           ;; 0x1000
+
+(defn virtio-base [] :i64 167772160)    ;; 0x0a00_0000
+(defn virtio-stride [] :i64 512)        ;; 0x200 per device
+(defn virtio-count [] :i64 32)
+
+(defn virtio-window [] :i64
+  (* (virtio-stride) (virtio-count)))
+
+(defn device-uart [] :i64 1)
+(defn device-virtio [] :i64 2)
+
+(defn psci-version-fid [] :i64 2214592512)      ;; 0x8400_0000
+(defn psci-cpu-on-32-fid [] :i64 2214592515)    ;; 0x8400_0003
+(defn psci-cpu-on-64-fid [] :i64 3288334339)    ;; 0xC400_0003
+(defn psci-system-off-fid [] :i64 2214592520)   ;; 0x8400_0008
+(defn psci-system-reset-fid [] :i64 2214592521) ;; 0x8400_0009
+
+(defn action-version [] :i64 1)
+(defn action-cpu-on [] :i64 2)
+(defn action-system-off [] :i64 3)
+(defn action-system-reset [] :i64 4)
+
+(defn access-size-ok? [len :i64] :bool
+  ;; A KVM MMIO exit carries 1, 2, 4 or 8 bytes. Anything else is a monitor
+  ;; bug or a malformed guest access, and is refused rather than truncated.
+  (cond
+    (= len 1) true
+    (= len 2) true
+    (= len 4) true
+    (= len 8) true
+    :else false))
+
+(defn in-uart? [gpa :i64] :bool
+  (if (< gpa (uart-base))
+    false
+    (< gpa (+ (uart-base) (uart-size)))))
+
+(defn in-virtio? [gpa :i64] :bool
+  (if (< gpa (virtio-base))
+    false
+    (< gpa (+ (virtio-base) (virtio-window)))))
+
+(defn virtio-offset [gpa :i64] :i64
+  ;; Offset inside one virtio-mmio device window. Written as quot/multiply
+  ;; because `rem` has no admitted lowering on this target -- the arithmetic
+  ;; is the same, the admission is not.
+  (let [d (- gpa (virtio-base))]
+    (- d (* (quot d (virtio-stride)) (virtio-stride)))))
+
+(defn classify [gpa :i64 len :i64] [:result :i64 :string]
+  (cond
+    (not (access-size-ok? len))
+    (result-err-of [:result :i64 :string] "mmio/bad-access-size")
+
+    (in-uart? gpa)
+    (if (> (+ (- gpa (uart-base)) len)
+           (uart-size))
+      (result-err-of [:result :i64 :string] "mmio/straddles-window")
+      (result-ok-of [:result :i64 :string] (device-uart)))
+
+    (in-virtio? gpa)
+    (if (> (+ (virtio-offset gpa) len)
+           (virtio-stride))
+      (result-err-of [:result :i64 :string] "mmio/straddles-window")
+      (result-ok-of [:result :i64 :string] (device-virtio)))
+
+    :else
+    (result-err-of [:result :i64 :string] "mmio/unmapped")))
+
+(defn device-offset [gpa :i64 len :i64] [:result :i64 :string]
+  ;; Offset inside the device's own register window -- the number a device
+  ;; model indexes with. Refuses for exactly the reasons classify refuses.
+  (cond
+    (not (access-size-ok? len))
+    (result-err-of [:result :i64 :string] "mmio/bad-access-size")
+
+    (in-uart? gpa)
+    (result-ok-of [:result :i64 :string] (- gpa (uart-base)))
+
+    (in-virtio? gpa)
+    (result-ok-of [:result :i64 :string] (virtio-offset gpa))
+
+    :else
+    (result-err-of [:result :i64 :string] "mmio/unmapped")))
+
+(defn virtio-index [gpa :i64] [:result :i64 :string]
+  (if (in-virtio? gpa)
+    (result-ok-of [:result :i64 :string]
+      (quot (- gpa (virtio-base)) (virtio-stride)))
+    (result-err-of [:result :i64 :string] "mmio/not-virtio")))
+
+(defn psci-action [fid :i64] [:result :i64 :string]
+  ;; An unknown function id is refused by name. The monitor turns that into
+  ;; PSCI_RET_NOT_SUPPORTED -- it does not guess an action.
+  (cond
+    (= fid (psci-system-off-fid))
+    (result-ok-of [:result :i64 :string] (action-system-off))
+
+    (= fid (psci-system-reset-fid))
+    (result-ok-of [:result :i64 :string] (action-system-reset))
+
+    (= fid (psci-version-fid))
+    (result-ok-of [:result :i64 :string] (action-version))
+
+    (= fid (psci-cpu-on-32-fid))
+    (result-ok-of [:result :i64 :string] (action-cpu-on))
+
+    (= fid (psci-cpu-on-64-fid))
+    (result-ok-of [:result :i64 :string] (action-cpu-on))
+
+    :else
+    (result-err-of [:result :i64 :string] "psci/not-supported")))

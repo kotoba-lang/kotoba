@@ -231,6 +231,7 @@ The bundled standard libraries live in this repository:
 | `gov.nist.aes` | `gov.nist.aes/src` | `aes.core`, `aes.gcm`, `aes.gcm-siv` (Kotoba project library) |
 | `gov.nist.ecc` | `gov.nist.ecc/src` | `ecc.bignum`, `ecc.curve`, `ecc.der`, `ecc.ecdh` (Kotoba project library) |
 | `org.ietf.mls` | `org.ietf.mls/src` | `mls.crypto`, `mls.framing`, `mls.group-context`, `mls.key-schedule` (an external specification, publisher ietf.org) |
+| `kotoba.vmm` | `kotoba.vmm/src` | `vmm.arm64-boot`, `vmm.exit`, `vmm.fdt`, `vmm.oracle` (Kotoba project library) |
 | `kotoba.kuro` | `kotoba.kuro/src` | `kuro.ansi`, `kuro.browser-base`, `kuro.checkpoint`, `kuro.fs` (Kotoba project library) |
 | `kotoba.kotobaseProtocolS3` | `kotoba.kotobaseProtocolS3/src` | `kotobase.protocols.s3` (Kotoba project library) |
 | `kotoba.kotobaseProtocolPinning` | `kotoba.kotobaseProtocolPinning/src` | `kotobase.protocols.ipfs-pinning` (Kotoba project library) |

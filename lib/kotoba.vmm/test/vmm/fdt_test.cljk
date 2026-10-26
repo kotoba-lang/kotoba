@@ -1,0 +1,171 @@
+(ns vmm.fdt-test
+  "The gate for devicetree construction: build a blob through the call path
+  and parse it back with an independent reader. The oracle decides the
+  layout numbers; this test proves the bytes that came out actually say
+  what the template says -- magic, block offsets, node order, property
+  names, and the values the guest will boot with."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [vmm.fdt :as fdt]))
+
+(def plan-map
+  {:bootargs "console=ttyAMA0 earlycon=pl011,0x09000000"
+   :ram-base 1073741824      ;; 0x40000000
+   :ram-size 536870912       ;; 512 MiB
+   :initrd-start 1140850688  ;; 0x44000000
+   :initrd-end 1149239296    ;; + 8 MiB
+   :uart-base 150994944      ;; 0x09000000, exit-core's PL011
+   :uart-size 4096
+   :gicd-base 134217728      ;; 0x08000000
+   :gicd-size 65536
+   :gicr-base 134873088      ;; 0x080a0000
+   :gicr-size 16121856       ;; 0xf60000, QEMU virt redistributor window
+   :virtio-base 167772160    ;; 0x0a000000, exit-core's virtio window
+   :virtio-stride 512
+   :virtio-count 32})
+
+;; ---------------------------------------------------------------------------
+;; An independent DTB reader. It knows DTSpec's wire format and nothing
+;; about how the builder works -- if both agree on the bytes, the layout
+;; decisions and the marshaling agree.
+
+(defn- u32 [bs i]
+  (+ (* (nth bs i) 16777216)
+     (* (nth bs (+ i 1)) 65536)
+     (* (nth bs (+ i 2)) 256)
+     (nth bs (+ i 3))))
+
+(defn- u64 [bs i]
+  (+ (* (u32 bs i) 4294967296) (u32 bs (+ i 4))))
+
+(defn- cstr [bs i]
+  (apply str (map #?(:clj char :cljs #(js/String.fromCharCode %))
+                  (take-while #(not= 0 %) (drop i bs)))))
+
+(defn- hex [n] #?(:clj (Long/toString (long n) 16)
+                  :cljs (.toString n 16)))
+
+(defn- decode-struct [bs start end]
+  ;; Walk the token stream; return events as
+  ;; [:begin name] [:prop name-from-strings value-len] [:end] [:done].
+  (let [strings-of (fn [off] (cstr bs (+ (u32 bs 12) off)))]
+    (loop [i start acc []]
+      (let [tok (u32 bs i)]
+        (cond
+          (= tok 1)
+          (let [nm (cstr bs (+ i 4))
+                w (* 4 (quot (+ (count nm) 4) 4))]
+            (recur (+ i 4 w) (conj acc [:begin nm])))
+
+          (= tok 2) (recur (+ i 4) (conj acc [:end]))
+
+          (= tok 3)
+          (let [len (u32 bs (+ i 4))
+                nameoff (u32 bs (+ i 8))
+                w (* 4 (quot (+ len 3) 4))]
+            (recur (+ i 12 w)
+                   (conj acc [:prop (strings-of nameoff) len])))
+
+          (= tok 9) acc
+
+          :else [:bad-token tok i])))))
+
+(deftest builds-a-blob-with-the-planned-header
+  (let [{:keys [ok? bytes plan] :as out} (fdt/build plan-map)]
+    (is ok?)
+    (is (= (:totalsize plan) (count bytes)))
+    (testing "header words are DTSpec's"
+      (is (= 3490578157 (u32 bytes 0)))          ;; magic 0xd00dfeed
+      (is (= (count bytes) (u32 bytes 4)))        ;; totalsize
+      (is (= (:off-dt-struct plan) (u32 bytes 8)))
+      (is (= (:off-dt-strings plan) (u32 bytes 12)))
+      (is (= 40 (u32 bytes 16)))                  ;; off_mem_rsvmap
+      (is (= 17 (u32 bytes 20)))                  ;; version
+      (is (= 16 (u32 bytes 24)))                  ;; last_comp_version
+      (is (= 0 (u32 bytes 28)))                   ;; boot_cpuid_phys
+      (is (= (:size-dt-strings plan) (u32 bytes 32)))
+      (is (= (:size-dt-struct plan) (u32 bytes 36))))
+    (testing "the memory reservation block is one zero terminator"
+      (is (every? zero? (take 16 (drop 40 bytes)))))
+    (testing "the strings block sits exactly where the header says"
+      (is (= "#address-cells" (cstr bytes (:off-dt-strings plan))))
+      (is (= (:size-dt-strings plan)
+             (- (count bytes) (:off-dt-strings plan)))))))
+
+(deftest builds-the-template-the-plan-describes
+  (let [{:keys [bytes]} (fdt/build plan-map)
+        off (u32 bytes 8)
+        end (u32 bytes 12)
+        events (decode-struct bytes off end)
+        begins (keep (fn [[k nm]] (when (= k :begin) nm)) events)
+        props (keep (fn [[k nm len]] (when (= k :prop) [nm len])) events)
+        virtio-names (map #(str "virtio_mmio@" (hex %))
+                          (map #(+ 167772160 (* % 512)) (range 32)))]
+    (is (=        (into ["" "chosen" "memory@40000000" "cpus" "cpu" "psci" "intc"
+                  "timer" "apb-pclk" "pl011" "pl031@9010000"]
+                 virtio-names)
+           (vec begins))
+        "node order and unit-addresses follow the template")
+    (is (= (concat [["#address-cells" 4] ["#size-cells" 4]
+                    ["interrupt-parent" 4]
+                    ["bootargs" (+ 1 (count (:bootargs plan-map)))]
+                    ["linux,initrd-start" 8] ["linux,initrd-end" 8]
+                    ["stdout-path" 7]
+                    ["device_type" 7] ["reg" 16]
+                    ["#address-cells" 4] ["#size-cells" 4]
+                    ["device_type" 4] ["compatible" 11] ["reg" 4]
+                    ["enable-method" 5]
+                    ["compatible" 13] ["method" 4]
+                    ["compatible" 11] ["#interrupt-cells" 4]
+                    ["interrupt-controller" 0] ["reg" 32] ["phandle" 4]
+                    ["#redistributor-regions" 4]
+                    ["compatible" 32] ["always-on" 0] ["interrupts" 48]
+                    ["compatible" 12] ["#clock-cells" 4] ["clock-frequency" 4]
+                    ["phandle" 4]
+                    ["compatible" 24] ["clock-names" 17] ["clocks" 8]
+                    ["reg" 16] ["interrupts" 12]
+                    ["compatible" 24] ["clocks" 4] ["clock-names" 9]
+                    ["reg" 16] ["interrupts" 12]]
+                   (apply concat
+                          (repeat 32 [["compatible" 12] ["reg" 16]
+                                      ["interrupts" 12]])))
+           (vec props))
+        "every property name resolves in the strings block with the planned width")
+    (testing "the values a guest boots from"
+      ;; chosen starts after root's 8 name bytes and three 16-byte props;
+      ;; inside it: 12 name bytes, then each prop's 12-byte header.
+      (let [cs (+ off 56)]
+        (is (= (:bootargs plan-map)
+               (cstr bytes (+ cs 24))))
+        (is (= 1140850688 (u64 bytes (+ cs 80))))
+        (is (= 1149239296 (u64 bytes (+ cs 100))))))))
+
+(deftest refusals-name-themselves
+  (testing "an empty bootargs leaves the guest without a console"
+    (is (= "fdt/bootargs-empty"
+           (:reason (fdt/plan (assoc plan-map :bootargs ""))))))
+  (testing "a virtio range whose hex unit-addresses change width"
+    (is (= "fdt/virtio-name-width-varies"
+           (:reason (fdt/plan (assoc plan-map
+                                     :virtio-base 16776960   ;; 0xffff00
+                                     :virtio-stride 512
+                                     :virtio-count 2))))))
+  (testing "negative device counts are refused, not clamped"
+    (is (= "fdt/virtio-count-negative"
+           (:reason (fdt/plan (assoc plan-map :virtio-count -1))))))
+  (testing "addresses past 48-bit guest-physical are refused, never truncated"
+    (is (= "fdt/ram-address-too-wide"
+           (:reason (fdt/plan (assoc plan-map :ram-base 281474976710656)))))
+    (is (= "fdt/virtio-address-too-wide"
+           (:reason (fdt/plan (assoc plan-map
+                                     :virtio-base 281474976710656
+                                     :virtio-stride 512
+                                     :virtio-count 2))))))
+  (testing "a blob past booting.rst's 2 MiB ceiling"
+    (is (= "fdt/blob-too-large"
+           (:reason (fdt/plan (assoc plan-map
+                                     :bootargs (apply str (repeat 2100000 "a")))))))))
+
+(deftest zero-virtio-devices-is-a-declared-shape
+  (let [p (fdt/plan (assoc plan-map :virtio-count 0))]
+    (is (:ok? p))
+    (is (= 0 (:virtio-name-digits p)))))
