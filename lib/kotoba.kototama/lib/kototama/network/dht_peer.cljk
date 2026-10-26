@@ -1,0 +1,205 @@
+(ns kototama.dht-peer
+  "Kademlia Distributed Hash Table peer discovery and k-bucket management.
+
+  Wave 5 peer discovery layer:
+  - Peer ID = CID (content-addressed identity)
+  - Distance metric = XOR (Kademlia)
+  - K-buckets = sorted lists of peers at each distance band
+  - Peer table = 160-bucket arrangement (for 256-bit IDs)
+
+  This namespace handles peer insertion, removal, and k-closest-peers lookup.
+  It does NOT handle network I/O or PING/PONG (see dht_reachability).
+
+  References:
+  - Kademlia paper (Maymounkov & Mazières)
+  - IPFS DHT (kubo/go-ipfs implementation)
+  - RFC 6962 (Certificate Transparency DHT analog)"
+  (:require [kotoba.bytes :as kbytes]))
+
+(def ^:const DEFAULT-K 20)  ;; peers per bucket (standard Kademlia)
+(def ^:const ID-BITS 256)   ;; CID as 256-bit integer (for distance)
+
+;; Peer record: identity + network address + metadata
+(defrecord Peer
+  [peer-id               ;; CID string
+   host                  ;; hostname or IP address
+   port                  ;; u16 port number
+   last-seen             ;; milliseconds since epoch
+   trusted?              ;; boolean, has verified Signal signature
+   ])
+
+;; K-bucket: list of peers at distance d
+(defrecord KBucket
+  [distance              ;; distance band (0..255, for 256-bit IDs)
+   peers                 ;; vec of Peer records, sorted by last-seen (descending)
+   max-size              ;; max peers in this bucket (default K)
+   ])
+
+;; Peer table: 256 buckets indexed by distance
+(defrecord PeerTable
+  [local-id              ;; this peer's CID
+   buckets               ;; vec of KBucket, length 256
+   ])
+
+;; Helper: convert CID string to 256-bit integer
+;;
+;; Input:  cid-string (e.g., "bafyreihc3nnxbsxxj5b2gpwb3tvsruuya6vfj4f64qg2uqkzq7r7yz6oe")
+;; Output: BigInteger (256-bit)
+;;
+;; Implementation: hash CID with SHA256, interpret as integer
+(defn cid-to-integer
+  [cid-string]
+  {:pre [(string? cid-string)]}
+  (let [digest (java.security.MessageDigest/getInstance "SHA-256")
+        hash-bytes (.digest digest (kbytes/utf8-bytes cid-string))
+        ;; Interpret 32 bytes as big-endian integer
+        big-int (BigInteger. 1 hash-bytes)]
+    big-int))
+
+;; Kademlia XOR distance metric
+;;
+;; Input:  peer-id-a (string CID)
+;;         peer-id-b (string CID)
+;; Output: distance (integer, 0..2^256-1)
+;;
+;; The XOR distance is the basis of Kademlia peer ordering.
+;; Closer peers (lower XOR distance) are more relevant for DHT lookups.
+(defn peer-distance
+  [peer-id-a peer-id-b]
+  {:pre [(string? peer-id-a)
+         (string? peer-id-b)]}
+  (let [int-a (cid-to-integer peer-id-a)
+        int-b (cid-to-integer peer-id-b)]
+    (.xor int-a int-b)))
+
+;; Distance band: which bucket should this peer be in?
+;;
+;; Input:  distance (BigInteger)
+;; Output: bucket-index (0..255)
+;;
+;; The bucket index is the bit position of the most significant bit in distance.
+;; If distance = 0, bucket 0. If distance >= 2^255, bucket 255.
+(defn distance-band
+  [distance]
+  {:pre [(instance? BigInteger distance)]}
+  (if (zero? distance)
+    0
+    (dec (.bitLength distance))))
+
+;; Create a new peer table
+(defn new-peer-table
+  [local-id]
+  {:pre [(string? local-id)]}
+  (->PeerTable
+   local-id
+   (vec (for [i (range ID-BITS)]
+          (->KBucket i [] DEFAULT-K)))))
+
+;; Insert or update a peer in the table
+;;
+;; If peer already exists, update its last-seen timestamp and move to head.
+;; If bucket is full, evict the least-recently-seen peer (tail).
+;; If peer is not in bucket and bucket is full, don't insert (split bucket logic deferred).
+;;
+;; Input:  table (PeerTable)
+;;         peer (Peer record)
+;; Output: updated-table (PeerTable)
+(defn insert-peer
+  [table peer]
+  {:pre [(some? table)
+         (some? peer)]}
+  (let [distance (peer-distance (:local-id table) (:peer-id peer))
+        bucket-idx (distance-band distance)
+        bucket (nth (:buckets table) bucket-idx)
+        existing-peer (first (filter #(= (:peer-id %) (:peer-id peer))
+                                     (:peers bucket)))]
+    (if existing-peer
+      ;; Peer already in bucket: update and move to front
+      (let [updated-peer (assoc peer :last-seen (System/currentTimeMillis))
+            remaining-peers (filter #(not= (:peer-id %) (:peer-id peer))
+                                    (:peers bucket))
+            new-peers (vec (cons updated-peer remaining-peers))]
+        (update table :buckets
+                (fn [buckets]
+                  (assoc buckets bucket-idx
+                         (assoc bucket :peers new-peers)))))
+      ;; Peer not in bucket
+      (if (< (count (:peers bucket)) (:max-size bucket))
+        ;; Bucket not full: add to front
+        (let [updated-peer (assoc peer :last-seen (System/currentTimeMillis))
+              new-peers (vec (cons updated-peer (:peers bucket)))]
+          (update table :buckets
+                  (fn [buckets]
+                    (assoc buckets bucket-idx
+                           (assoc bucket :peers new-peers)))))
+        ;; Bucket full: don't insert (split logic deferred)
+        table))))
+
+;; Remove a peer from the table
+(defn remove-peer
+  [table peer-id]
+  {:pre [(string? peer-id)]}
+  (update table :buckets
+          (fn [buckets]
+            (mapv (fn [bucket]
+                    (update bucket :peers
+                            (fn [peers]
+                              (vec (filter #(not= (:peer-id %) peer-id)
+                                           peers)))))
+                  buckets))))
+
+;; Find k closest peers to target ID
+;;
+;; Input:  table (PeerTable)
+;;         target-id (string CID)
+;;         k (number, default DEFAULT-K)
+;; Output: [peer, ...] sorted by distance (ascending)
+;;
+;; Algorithm: collect all peers, sort by XOR distance to target, return top k
+(defn k-closest
+  ([table target-id]
+   (k-closest table target-id DEFAULT-K))
+  ([table target-id k]
+   {:pre [(some? table)
+          (string? target-id)
+          (pos? k)]}
+   (let [all-peers (apply concat (map :peers (:buckets table)))
+         sorted-by-distance (sort-by (fn [peer]
+                                       (peer-distance target-id (:peer-id peer)))
+                                     all-peers)]
+     (vec (take k sorted-by-distance)))))
+
+;; Peer count in table
+(defn peer-count
+  [table]
+  (apply + (map (comp count :peers) (:buckets table))))
+
+;; Buckets with peers (for status reporting)
+(defn occupied-buckets
+  [table]
+  (vec (filter (comp seq :peers) (:buckets table))))
+
+;; Test: XOR distance metric
+(comment
+  ;; Kademlia property: XOR is symmetric and satisfies triangle inequality
+  (let [a "peer-a"
+        b "peer-b"
+        c "peer-c"]
+    ;; Symmetric
+    (= (peer-distance a b) (peer-distance b a))
+    ;; Triangle inequality: d(a,c) <= d(a,b) + d(b,c)
+    ))
+
+;; Test: k-bucket insertion and eviction
+(comment
+  (let [table (new-peer-table "my-peer")
+        peer1 (->Peer "peer-1" "10.0.0.1" 9000 (System/currentTimeMillis) false)
+        peer2 (->Peer "peer-2" "10.0.0.2" 9001 (System/currentTimeMillis) false)
+
+        ;; Insert peers
+        t1 (insert-peer table peer1)
+        t2 (insert-peer t1 peer2)
+
+        ;; Find 2 closest
+        closest (k-closest t2 "target-peer" 2)]
+    (= (count closest) 2)))

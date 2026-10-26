@@ -1,0 +1,108 @@
+(ns kototama.execution-ledger
+  "Node host durable use ledger. Explicit private storage, atomic lock and
+  fsync-before-effect; an abandoned lock or corrupt journal fails closed."
+  {:kotoba/export [open-ledger!]}
+  #?(:cljs (:require ["node:fs" :as fs] ["node:path" :as path] ["node:crypto" :as crypto])))
+
+(defn- reject! [reason]
+  (throw (ex-info "execution ledger denied" {:phase :execution-ledger :reason reason})))
+
+#?(:cljs
+   (do
+     (defn- closed? [keys value] (and (map? value) (= keys (set (clojure.core/keys value)))))
+     (defn- lease? [lease]
+       (and (closed? #{:cid :uses :expires} lease) (string? (:cid lease))
+            (nat-int? (:uses lease)) (nat-int? (:expires lease))))
+     (defn- entry? [entry]
+       (and (closed? #{:intent-cid :invocation-cid :ticket :epoch :expires :leases} entry)
+            (string? (:intent-cid entry)) (string? (:invocation-cid entry)) (string? (:ticket entry))
+            (nat-int? (:epoch entry)) (nat-int? (:expires entry))
+            (vector? (:leases entry)) (<= (count (:leases entry)) 256)
+            (every? lease? (:leases entry))
+            (= (count (:leases entry)) (count (distinct (map :cid (:leases entry)))))))
+     (defn- state! [state]
+       (when-not (and (closed? #{:version :epoch :now :entries} state)
+                      (= 2 (:version state)) (nat-int? (:epoch state)) (nat-int? (:now state))
+                      (vector? (:entries state)) (<= (count (:entries state)) 10000)
+                      (every? entry? (:entries state))
+                      (= (count (:entries state)) (count (distinct (map :intent-cid (:entries state)))))
+                      (= (count (:entries state)) (count (distinct (map :invocation-cid (:entries state))))))
+         (reject! :corrupt-state))
+       state)
+     (defn- private-directory! [directory]
+       (let [s (fs/lstatSync directory)]
+         (when-not (and (.isDirectory s) (not (.isSymbolicLink s))
+                        (zero? (bit-and (.-mode s) 63)) (= (.-uid s) (js/process.getuid)))
+           (reject! :storage-not-private))))
+     (defn- load! [file]
+       (if (fs/existsSync file)
+         (let [s (fs/lstatSync file)]
+           (when-not (and (.isFile s) (not (.isSymbolicLink s))
+                          (zero? (bit-and (.-mode s) 63)) (<= (.-size s) 4194304))
+             (reject! :invalid-journal))
+           (state! (js->clj (js/JSON.parse (fs/readFileSync file "utf8")) :keywordize-keys true)))
+         {:version 2 :epoch 0 :now 0 :entries []}))
+     (defn- commit! [directory file state]
+       (state! state)
+       (let [text (js/JSON.stringify (clj->js state))
+             temporary (str file "." (crypto/randomUUID) ".pending")]
+         (when (> (js/Buffer.byteLength text "utf8") 4194304) (reject! :journal-full))
+         (let [fd (fs/openSync temporary "wx" 384)]
+           (try (fs/writeFileSync fd text "utf8") (fs/fsyncSync fd)
+                (finally (fs/closeSync fd))))
+         (fs/renameSync temporary file)
+         (let [fd (fs/openSync directory "r")]
+           (try (fs/fsyncSync fd) (finally (fs/closeSync fd))))))
+     (defn- transition [state operation request]
+       (when-not (and (nat-int? (:epoch request)) (nat-int? (:now request))
+                      (>= (:epoch request) (:epoch state)) (>= (:now request) (:now state))) (reject! :stale-epoch))
+       (case operation
+         :begin
+         (let [{:keys [intent-cid invocation-cid epoch now expires leases]} request
+               ticket (crypto/randomUUID)
+               stored (mapv #(select-keys % [:cid :uses :expires]) leases)]
+           (when-not (and (closed? #{:intent-cid :invocation-cid :epoch :now :expires :leases} request)
+                          (string? intent-cid) (string? invocation-cid) (nat-int? expires) (< now expires)
+                          (vector? leases) (every? lease? stored)
+                          (every? #(and (pos? (:uses %)) (< now (:expires %))) stored)
+                          (not-any? #(or (= intent-cid (:intent-cid %)) (= invocation-cid (:invocation-cid %))) (:entries state)))
+             (reject! :intent-replay-or-invalid-budget))
+           [(-> state (assoc :epoch epoch :now now)
+                (update :entries conj {:intent-cid intent-cid :invocation-cid invocation-cid :ticket ticket :epoch epoch
+                                       :expires expires :leases stored})) ticket])
+         :reserve
+         (let [{:keys [ticket intent-cid lease-cid epoch now]} request
+               index (first (keep-indexed #(when (= intent-cid (:intent-cid %2)) %1) (:entries state)))
+               entry (when (some? index) (get (:entries state) index))
+               lease-index (first (keep-indexed #(when (= lease-cid (:cid %2)) %1) (:leases entry)))
+               lease (when (some? lease-index) (get (:leases entry) lease-index))]
+           (when-not (and (closed? #{:ticket :intent-cid :lease-cid :epoch :now} request)
+                          entry lease (= ticket (:ticket entry)) (= epoch (:epoch entry))
+                          (< now (:expires entry)) (< now (:expires lease)) (pos? (:uses lease)))
+             (reject! :exhausted-expired-or-replayed-lease))
+           [(-> state (assoc :epoch epoch :now now)
+                (update-in [:entries index :leases lease-index :uses] dec)) true])
+         (reject! :unknown-operation)))))
+
+(defn open-ledger!
+  "DIRECTORY must already exist, be owned by this UID and mode 0700. Keep it
+  across restarts. Crash locks require operator recovery, never automatic reset.
+  Trusted storage and a monotone host epoch are required; this is not a defense
+  against privileged disk rollback or a distributed consensus implementation."
+  [directory]
+  #?(:clj (reject! :unsupported-ledger-host)
+     :cljs
+     (do
+       (when-not (and (string? directory) (path/isAbsolute directory))
+         (reject! :explicit-absolute-storage-required))
+       (private-directory! directory)
+       (let [file (path/join directory "execution-v2.json") lock (path/join directory "execution-v2.lock")]
+         (fn [operation request]
+           (private-directory! directory)
+           ;; mkdir is the inter-process compare-and-set. No wait or stale-lock deletion.
+           (fs/mkdirSync lock #js {:mode 448})
+           (try
+             (let [[next-state result] (transition (load! file) operation request)]
+               (commit! directory file next-state)
+               result)
+             (finally (fs/rmdirSync lock))))))))

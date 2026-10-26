@@ -1,0 +1,908 @@
+(ns kototama.postgresql-interop
+  (:require [kotoba.bytes :as kbytes] [kotoba.lang.edn :as edn]
+            [clojure.java.shell :as shell]
+            [kotoba.runtime :as kotoba-runtime]
+            [kototama.contract :as contract]
+            [kototama.linker :as linker]
+            [kototama.postgresql-pool-provider :as pool-provider]
+            [kototama.tender :as tender]
+            [kototama.transport-provider :as transport-provider])
+  (:import (java.io FileInputStream)
+           (java.nio.file Files Path)
+           (java.security KeyStore)
+           (java.security.cert CertificateFactory)
+           (javax.net.ssl SSLContext TrustManagerFactory)))
+
+(defn- sh! [& args]
+  (let [result (apply shell/sh args)]
+    (when-not (zero? (:exit result))
+      (throw (ex-info "PostgreSQL qualification command failed"
+                      {:args args :exit (:exit result)
+                       :out (:out result) :err (:err result)})))
+    result))
+
+(defn- compile-provider [source policy-path]
+  (let [forms (kotoba-runtime/read-file source :kotoba)
+        policy (edn/read-string (slurp policy-path))
+        wasm (kotoba-runtime/wasm-binary forms policy)]
+    (when-not (:kotoba.wasm/ok? wasm)
+      (throw (ex-info "Kotoba provider compilation failed"
+                      {:source source :problems (:kotoba.wasm/problems wasm)})))
+    (:kotoba.wasm/binary wasm)))
+
+(defn- trust-context [certificate-path]
+  (let [factory (CertificateFactory/getInstance "X.509")
+        certificate (with-open [in (FileInputStream. certificate-path)]
+                      (.generateCertificate factory in))
+        store (KeyStore/getInstance (KeyStore/getDefaultType))
+        managers (TrustManagerFactory/getInstance
+                  (TrustManagerFactory/getDefaultAlgorithm))
+        context (SSLContext/getInstance "TLS")]
+    (.load store nil nil)
+    (.setCertificateEntry store "postgresql" certificate)
+    (.init managers store)
+    (.init context nil (.getTrustManagers managers) nil)
+    context))
+
+(defn- postgresql-tls-probe [^javax.net.ssl.SSLSocketFactory factory port]
+  (try
+    (with-open [socket (java.net.Socket. "localhost" (int port))]
+      (doto (.getOutputStream socket)
+        (.write (byte-array [0 0 0 8 4 -46 22 47]))
+        (.flush))
+      (when-not (= 83 (.read (.getInputStream socket)))
+        (throw (ex-info "PostgreSQL refused TLS probe" {})))
+      (with-open [tls ^javax.net.ssl.SSLSocket
+                  (.createSocket factory socket "localhost" (int port) true)]
+        (let [params (doto (.getSSLParameters tls)
+                       (.setEndpointIdentificationAlgorithm "HTTPS"))]
+          (.setSSLParameters tls params)
+          (.startHandshake tls)
+          true)))
+    (catch Exception _ false)))
+
+(defn- available-port []
+  (with-open [socket (java.net.ServerSocket. 0 1
+                                                  (java.net.InetAddress/getLoopbackAddress))]
+    (.getLocalPort socket)))
+
+(defn- start-fault-proxy [target-port]
+  (let [listener (java.net.ServerSocket. 0 16
+                                         (java.net.InetAddress/getLoopbackAddress))
+        paused? (atom false)
+        closed? (atom false)
+        sockets (atom #{})
+        pump (fn [in out gate?]
+               (future
+                 (let [buffer (byte-array 8192)]
+                   (try
+                     (loop []
+                       (let [n (.read in buffer)]
+                         (when (pos? n)
+                           (while (and gate? @paused? (not @closed?))
+                             (Thread/sleep 5))
+                           (when-not @closed?
+                             (.write out buffer 0 n)
+                             (.flush out)
+                             (recur)))))
+                     (catch Exception _ nil)))))
+        acceptor
+        (future
+          (try
+            (while (not @closed?)
+              (let [client (.accept listener)
+                    upstream (java.net.Socket. "127.0.0.1" (int target-port))]
+                (swap! sockets into [client upstream])
+                (pump (.getInputStream client) (.getOutputStream upstream) false)
+                (pump (.getInputStream upstream) (.getOutputStream client) true)))
+            (catch Exception _ nil)))]
+    {:port (.getLocalPort listener)
+     :pause! #(reset! paused? true)
+     :resume! #(reset! paused? false)
+     :close! (fn []
+               (reset! closed? true)
+               (reset! paused? false)
+               (try (.close listener) (catch Exception _ nil))
+               (doseq [socket @sockets]
+                 (try (.close socket) (catch Exception _ nil)))
+               (deref acceptor 500 nil))}))
+
+(defn- delete-tree! [^Path root]
+  (when (Files/exists root (make-array java.nio.file.LinkOption 0))
+    (with-open [paths (Files/walk root (make-array java.nio.file.FileVisitOption 0))]
+      (doseq [path (reverse (iterator-seq (.iterator paths)))]
+        (Files/deleteIfExists path)))))
+
+(defn -main [& _]
+  (let [root (Files/createTempDirectory "kotoba-postgresql-interop-"
+                                        (make-array java.nio.file.attribute.FileAttribute 0))
+        data (.resolve root "data")
+        password (.resolve root "password")
+        certificate (.resolve root "server.crt")
+        key (.resolve root "server.key")
+        log (.resolve root "postgres.log")
+        port (available-port)
+        fault-proxy (start-fault-proxy port)
+        soak-operations-per-worker
+        (Long/parseLong (or (System/getenv "KOTOTAMA_POOL_SOAK_OPS") "30"))
+        soak-fuel-limit (+ 5000000 (* soak-operations-per-worker 10000))
+        started? (atom false)]
+    (try
+      (spit (.toFile password) "pencil\n")
+      (sh! "initdb" "-D" (str data) "--no-locale" "-E" "UTF8"
+            "-U" "kotoba" "--pwfile" (str password)
+            "--auth-local=trust" "--auth-host=scram-sha-256")
+      (sh! "openssl" "req" "-x509" "-newkey" "rsa:2048" "-nodes"
+            "-keyout" (str key) "-out" (str certificate)
+            "-subj" "/CN=localhost"
+            "-addext" "subjectAltName=DNS:localhost,IP:127.0.0.1"
+            "-days" "1")
+      (sh! "chmod" "600" (str key))
+      (sh! "pg_ctl" "-D" (str data) "-l" (str log)
+            "-o" (str "-h 127.0.0.1 -p " port
+                      " -c ssl=on -c ssl_cert_file=" certificate
+                      " -c ssl_key_file=" key
+                      " -c password_encryption=scram-sha-256")
+            "-w" "start")
+      (reset! started? true)
+      (let [created (shell/sh "createdb" "-h" "127.0.0.1" "-p" (str port)
+                              "-U" "kotoba" "kotoba"
+                              :env (assoc (into {} (System/getenv)) "PGPASSWORD" "pencil"))]
+        (when-not (zero? (:exit created))
+          (throw (ex-info "createdb failed" created))))
+      (let [lower [:transport-connect :tls-open :tls-server-end-point
+                   :transport-write :transport-read
+                   :transport-close :scram-sha256 :pg-cancel-register
+                   :pg-cancel :random-bytes]
+            lower-caps
+            (contract/host-caps
+             {:grants lower
+              :limits {:max-transport-connections 100
+                       :max-transport-connect-ms 5000
+                       :max-transport-read-ms 2000
+                       :max-transport-read-bytes 67108864
+                       :max-transport-write-bytes 67108864
+                       :max-scram-proofs 100
+                       :max-pg-cancel-handles 1
+                       :max-pg-cancel-requests 1
+                       :max-random-bytes 2100
+                       :allow-secret-imports? true
+                       :allow-write-imports? true
+                       :scram-credential-allowlist #{"db/primary"}
+                       :transport-endpoint-allowlist
+                       #{(str "localhost:" port)
+                         (str "localhost:" (:port fault-proxy))}}})
+            ssl-context (trust-context (.toFile certificate))
+            credentials (atom {"db/primary" (.toCharArray "pencil")})
+            ssl-factory (atom (.getSocketFactory ssl-context))
+            reads (atom [])
+            writes (atom [])
+            sleep-started (promise)
+            pool-race-started (promise)
+            native (transport-provider/native-provider
+                    lower-caps {:ssl-socket-factory-fn #(deref ssl-factory)
+                                :trace-read! #(swap! reads conj (vec %))
+                                :trace-write!
+                                #(do (swap! writes conj (vec %))
+                                     (when (= "select pg_sleep(10)"
+                                              (kbytes/utf8-string ^bytes %))
+                                       (deliver sleep-started true))
+                                     (when (= "select pg_sleep(0.6)"
+                                              (kbytes/utf8-string ^bytes %))
+                                       (deliver pool-race-started true)))})]
+        (try
+          (let [scram-provider
+                (tender/open-session
+                 (compile-provider "../kotoba/providers/pg_scram.kotoba"
+                                   "../kotoba/providers/pg_scram_policy.edn")
+                 lower lower-caps
+                 {:scram-credentials credentials
+                  :provider-host-functions (:host-functions native)})
+                query-provider-wasm
+                (compile-provider "../kotoba/providers/db_transport.kotoba"
+                                  "../kotoba/providers/transport_policy.edn")
+                query-session-fn
+                #(tender/open-session
+                  query-provider-wasm
+                  [:transport-connect :tls-open :transport-write :transport-read
+                   :transport-close]
+                  lower-caps
+                  {:fuel soak-fuel-limit
+                   :provider-host-functions (:host-functions native)})
+                query-provider (query-session-fn)
+                high [:pg-query-state :pg-open-scram-random :pg-close-scram]
+                consumer
+                (tender/open-session
+                 (compile-provider "../kotoba/providers/pg_transaction_consumer.kotoba"
+                                   "../kotoba/providers/db_component_policy.edn")
+                 high
+                 (contract/host-caps
+                  {:grants high
+                   :limits {:allow-secret-imports? true
+                            :allow-write-imports? true}})
+                 {:provider-host-functions
+                  (merge (linker/link-provider query-provider linker/db-links)
+                         (linker/link-provider scram-provider linker/scram-links))})
+                result (aget ^longs
+                             (.apply (.export (:instance consumer) "run")
+                                     (long-array [port])) 0)]
+            (when-not (= 1 result)
+              (throw (ex-info "released PostgreSQL SCRAM transaction recovery failed"
+                              {:result result
+                               :usage @(get-in native [:state :usage])
+                               :reads @reads
+                               :handles (keys @(get-in native [:state :handles]))
+                               :postgres-log (when (Files/exists log (make-array java.nio.file.LinkOption 0))
+                                               (slurp (.toFile log)))})))
+            (when-not (empty? @(get-in native [:state :handles]))
+              (throw (ex-info "transport handle leaked" {})))
+            (when-not (some #(= "SCRAM-SHA-256-PLUS"
+                                (kbytes/utf8-string (byte-array (take 18 (drop 5 %)))))
+                            (filter #(>= (count %) 23) @writes))
+              (throw (ex-info "released PostgreSQL did not use SCRAM-SHA-256-PLUS"
+                              {:writes (mapv count @writes)})))
+            (let [query-high [:pg-query-state :pg-open-scram-cancellable-random
+                              :pg-close-scram]
+                  query-consumer
+                  (tender/open-session
+                   (compile-provider
+                    "../kotoba/providers/pg_cancellable_query_consumer.kotoba"
+                    "../kotoba/providers/db_component_policy.edn")
+                   query-high
+                   (contract/host-caps
+                    {:grants query-high
+                     :limits {:allow-secret-imports? true
+                              :allow-write-imports? true}})
+                   {:provider-host-functions
+                    (merge (linker/link-provider query-provider linker/db-links)
+                           (linker/link-provider scram-provider linker/scram-links))})
+                  cancel-high [:pg-cancel-authority-use]
+                  cancel-consumer
+                  (tender/open-session
+                   (compile-provider "../kotoba/providers/pg_cancel_consumer.kotoba"
+                                     "../kotoba/providers/db_component_policy.edn")
+                   cancel-high
+                   (contract/host-caps
+                    {:grants cancel-high
+                     :limits {:allow-secret-imports? true
+                              :allow-write-imports? true}})
+                   {:provider-host-functions
+                    (linker/link-provider scram-provider linker/scram-links)})
+                  query-instance (:instance query-consumer)
+                  channel (aget ^longs
+                                (.apply (.export query-instance "open")
+                                        (long-array [port 2048 4])) 0)
+                  token (.getInt (java.nio.ByteBuffer/wrap
+                                  (.readBytes (.memory query-instance) 2048 4)))
+                  pending (future
+                            (aget ^longs
+                                  (.apply (.export query-instance "sleep-query")
+                                          (long-array [channel])) 0))]
+              (when-not (= true (deref sleep-started 3000 false))
+                (throw (ex-info "long PostgreSQL query did not start" {})))
+              ;; The trace fires after the client write but before a remote/cold
+              ;; server necessarily dispatches the query. Bound the settle so
+              ;; cancellation qualifies an executing statement on every OS.
+              (Thread/sleep 100)
+              (let [cancelled
+                    (aget ^longs
+                          (.apply (.export (:instance cancel-consumer) "run")
+                                  (long-array [token])) 0)
+                    query-result (deref pending 5000 :timeout)
+                    closed (aget ^longs
+                                 (.apply (.export query-instance "close")
+                                         (long-array [channel])) 0)]
+                (when-not (and (= 0 cancelled) (= 1 query-result) (= 0 closed))
+                  (throw (ex-info "PostgreSQL opaque cancellation failed"
+                                  {:cancelled cancelled :query query-result
+                                   :closed closed})))
+                (when-not (= -1
+                             (aget ^longs
+                                   (.apply (.export (:instance cancel-consumer) "run")
+                                           (long-array [token])) 0))
+                  (throw (ex-info "cancel authority was not one-shot" {})))))
+            (when-not (empty? @(get-in native [:state :handles]))
+              (throw (ex-info "cancellation transport handle leaked" {})))
+            (let [prepared-high [:pg-prepare :pg-execute-params2
+                                 :pg-close-statement :pg-open-scram-random
+                                 :pg-close-scram]
+                  prepared-consumer
+                  (tender/open-session
+                   (compile-provider "../kotoba/providers/pg_prepared_consumer.kotoba"
+                                     "../kotoba/providers/db_component_policy.edn")
+                   prepared-high
+                   (contract/host-caps
+                    {:grants prepared-high
+                     :limits {:allow-secret-imports? true
+                              :allow-write-imports? true}})
+                   {:provider-host-functions
+                    (merge (linker/link-provider query-provider linker/db-links)
+                           (linker/link-provider scram-provider linker/scram-links))})
+                  prepared-result
+                  (aget ^longs
+                        (.apply (.export (:instance prepared-consumer) "run")
+                                (long-array [port])) 0)]
+              (when-not (= 1 prepared-result)
+                (throw (ex-info "PostgreSQL prepared statement flow failed"
+                                {:result prepared-result
+                                 :usage @(get-in native [:state :usage])
+                                 :postgres-log
+                                 (when (Files/exists log
+                                                     (make-array java.nio.file.LinkOption 0))
+                                   (slurp (.toFile log)))}))))
+            (when-not (empty? @(get-in native [:state :handles]))
+              (throw (ex-info "prepared statement transport handle leaked" {})))
+            (let [typed-high [:pg-prepare-typed :pg-execute-params
+                              :pg-close-statement :pg-open-scram-random
+                              :pg-close-scram]
+                  typed-consumer
+                  (tender/open-session
+                   (compile-provider
+                    "../kotoba/providers/pg_typed_prepared_consumer.kotoba"
+                    "../kotoba/providers/db_component_policy.edn")
+                   typed-high
+                   (contract/host-caps
+                    {:grants typed-high
+                     :limits {:allow-secret-imports? true
+                              :allow-write-imports? true}})
+                   {:provider-host-functions
+                    (merge (linker/link-provider query-provider linker/db-links)
+                           (linker/link-provider scram-provider linker/scram-links))})
+                  typed-result
+                  (aget ^longs
+                        (.apply (.export (:instance typed-consumer) "run")
+                                (long-array [port])) 0)]
+              (when-not (= 1 typed-result)
+                (throw (ex-info "PostgreSQL typed variable parameter flow failed"
+                                {:result typed-result
+                                 :usage @(get-in native [:state :usage])
+                                 :postgres-log
+                                 (when (Files/exists log
+                                                     (make-array java.nio.file.LinkOption 0))
+                                   (slurp (.toFile log)))}))))
+            (when-not (empty? @(get-in native [:state :handles]))
+              (throw (ex-info "typed prepared transport handle leaked" {})))
+            (let [portal-high [:pg-query-state :pg-prepare :pg-bind-portal
+                               :pg-fetch-portal :pg-close-portal
+                               :pg-close-statement :pg-open-scram-random
+                               :pg-close-scram]
+                  portal-consumer
+                  (tender/open-session
+                   (compile-provider "../kotoba/providers/pg_portal_consumer.kotoba"
+                                     "../kotoba/providers/db_component_policy.edn")
+                   portal-high
+                   (contract/host-caps
+                    {:grants portal-high
+                     :limits {:allow-secret-imports? true
+                              :allow-write-imports? true}})
+                   {:provider-host-functions
+                    (merge (linker/link-provider query-provider linker/db-links)
+                           (linker/link-provider scram-provider linker/scram-links))})
+                  portal-result
+                  (aget ^longs
+                        (.apply (.export (:instance portal-consumer) "run")
+                                (long-array [port])) 0)]
+              (when-not (= 1 portal-result)
+                (throw (ex-info "PostgreSQL named portal flow failed"
+                                {:result portal-result
+                                 :usage @(get-in native [:state :usage])
+                                 :postgres-log
+                                 (when (Files/exists log
+                                                     (make-array java.nio.file.LinkOption 0))
+                                   (slurp (.toFile log)))}))))
+            (when-not (empty? @(get-in native [:state :handles]))
+              (throw (ex-info "portal transport handle leaked" {})))
+            (let [copy-high [:pg-query-state :pg-copy-out :pg-copy-in
+                             :pg-open-scram-random :pg-close-scram]
+                  copy-consumer
+                  (tender/open-session
+                   (compile-provider "../kotoba/providers/pg_copy_consumer.kotoba"
+                                     "../kotoba/providers/db_component_policy.edn")
+                   copy-high
+                   (contract/host-caps
+                    {:grants copy-high
+                     :limits {:allow-secret-imports? true
+                              :allow-write-imports? true}})
+                   {:provider-host-functions
+                    (merge (linker/link-provider query-provider linker/db-links)
+                           (linker/link-provider scram-provider linker/scram-links))})
+                  copy-result
+                  (aget ^longs
+                        (.apply (.export (:instance copy-consumer) "run")
+                                (long-array [port])) 0)]
+              (when-not (= 1 copy-result)
+                (throw (ex-info "PostgreSQL bounded COPY flow failed"
+                                {:result copy-result
+                                 :usage @(get-in native [:state :usage])
+                                 :postgres-log
+                                 (when (Files/exists log
+                                                     (make-array java.nio.file.LinkOption 0))
+                                   (slurp (.toFile log)))}))))
+            (when-not (empty? @(get-in native [:state :handles]))
+              (throw (ex-info "COPY transport handle leaked" {})))
+            (let [batch-high [:pg-prepare :pg-execute-batch
+                              :pg-close-statement :pg-open-scram-random
+                              :pg-close-scram]
+                  batch-consumer
+                  (tender/open-session
+                   (compile-provider "../kotoba/providers/pg_batch_consumer.kotoba"
+                                     "../kotoba/providers/db_component_policy.edn")
+                   batch-high
+                   (contract/host-caps
+                    {:grants batch-high
+                     :limits {:allow-secret-imports? true
+                              :allow-write-imports? true}})
+                   {:provider-host-functions
+                    (merge (linker/link-provider query-provider linker/db-links)
+                           (linker/link-provider scram-provider linker/scram-links))})
+                  batch-result
+                  (aget ^longs
+                        (.apply (.export (:instance batch-consumer) "run")
+                                (long-array [port])) 0)]
+              (when-not (= 1 batch-result)
+                (throw (ex-info "PostgreSQL bounded batch pipeline failed"
+                                {:result batch-result
+                                 :usage @(get-in native [:state :usage])
+                                 :postgres-log
+                                 (when (Files/exists log
+                                                     (make-array java.nio.file.LinkOption 0))
+                                   (slurp (.toFile log)))}))))
+            (when-not (empty? @(get-in native [:state :handles]))
+              (throw (ex-info "batch transport handle leaked" {})))
+            (let [reset-high [:pg-query-state :pg-prepare :pg-execute-params
+                              :pg-session-reset :pg-open-scram-random
+                              :pg-close-scram]
+                  reset-consumer
+                  (tender/open-session
+                   (compile-provider
+                    "../kotoba/providers/pg_pool_reset_consumer.kotoba"
+                    "../kotoba/providers/db_component_policy.edn")
+                   reset-high
+                   (contract/host-caps
+                    {:grants reset-high
+                     :limits {:allow-secret-imports? true
+                              :allow-write-imports? true}})
+                   {:provider-host-functions
+                    (merge (linker/link-provider query-provider linker/db-links)
+                           (linker/link-provider scram-provider linker/scram-links))})
+                  reset-result
+                  (aget ^longs
+                        (.apply (.export (:instance reset-consumer) "run")
+                                (long-array [port])) 0)]
+              (when-not (= 1 reset-result)
+                (throw (ex-info "PostgreSQL pool-return reset failed"
+                                {:result reset-result
+                                 :usage @(get-in native [:state :usage])
+                                 :postgres-log
+                                 (when (Files/exists log
+                                                     (make-array java.nio.file.LinkOption 0))
+                                   (slurp (.toFile log)))}))))
+            (when-not (empty? @(get-in native [:state :handles]))
+              (throw (ex-info "pool reset transport handle leaked" {})))
+            (let [pool-clock (atom 0)
+                  pool-native (pool-provider/pool-provider
+                               {:scram-session scram-provider
+                                :query-session query-provider
+                                :query-session-fn query-session-fn
+                                :max-pools 1 :max-leases 2
+                                :max-connections-per-pool 2
+                                :acquire-wait-ms 1000
+                                :drain-wait-ms 1000
+                                :idle-timeout-ms 15
+                                :max-lifetime-ms 20
+                                :clock-ms #(long @pool-clock)})]
+              (try
+                (let [pool-high [:pg-pool-open :pg-pool-acquire :pg-pool-query
+                                 :pg-pool-release :pg-pool-stats :pg-pool-health
+                                 :pg-pool-drain :pg-pool-close]
+                      pool-consumer
+                      (tender/open-session
+                       (compile-provider "../kotoba/providers/pg_pool_consumer.kotoba"
+                                         "../kotoba/providers/db_component_policy.edn")
+                       pool-high
+                       (contract/host-caps
+                        {:grants pool-high
+                         :limits {:allow-secret-imports? true
+                                  :allow-write-imports? true}})
+                       {:provider-host-functions (:host-functions pool-native)})
+                      pool-result
+                      (aget ^longs
+                            (.apply (.export (:instance pool-consumer) "run")
+                                    (long-array [port])) 0)]
+                  (when-not (= 1 pool-result)
+                    (throw (ex-info "PostgreSQL opaque pool lease flow failed"
+                                    {:result pool-result
+                                     :pool-state @(:state pool-native)
+                                     :usage @(get-in native [:state :usage])
+                                     :postgres-log
+                                     (when (Files/exists log
+                                                         (make-array java.nio.file.LinkOption 0))
+                                       (slurp (.toFile log)))})))
+                  (let [multi-consumer
+                        (tender/open-session
+                         (compile-provider
+                          "../kotoba/providers/pg_pool_multi_consumer.kotoba"
+                          "../kotoba/providers/db_component_policy.edn")
+                         pool-high
+                         (contract/host-caps
+                          {:grants pool-high
+                           :limits {:allow-secret-imports? true
+                                    :allow-write-imports? true}})
+                         {:fuel soak-fuel-limit
+                          :provider-host-functions (:host-functions pool-native)})
+                        parallel-consumer
+                        (tender/open-session
+                         (compile-provider
+                          "../kotoba/providers/pg_pool_multi_consumer.kotoba"
+                          "../kotoba/providers/db_component_policy.edn")
+                         pool-high
+                         (contract/host-caps
+                          {:grants pool-high
+                           :limits {:allow-secret-imports? true
+                                    :allow-write-imports? true}})
+                         {:fuel soak-fuel-limit
+                          :provider-host-functions (:host-functions pool-native)})
+                        waiter-consumer
+                        (tender/open-session
+                         (compile-provider
+                          "../kotoba/providers/pg_pool_multi_consumer.kotoba"
+                          "../kotoba/providers/db_component_policy.edn")
+                         pool-high
+                         (contract/host-caps
+                          {:grants pool-high
+                           :limits {:allow-secret-imports? true
+                                    :allow-write-imports? true}})
+                         {:fuel soak-fuel-limit
+                          :provider-host-functions (:host-functions pool-native)})
+                        multi-result
+                        (aget ^longs
+                              (.apply (.export (:instance multi-consumer) "run")
+                                      (long-array [port])) 0)]
+                    (when-not (= 1 multi-result)
+                      (throw (ex-info "PostgreSQL bounded multi-connection pool failed"
+                                      {:result multi-result
+                                       :pool-state @(:state pool-native)})))
+                    (let [instance (:instance multi-consumer)
+                          call #(aget ^longs (.apply (.export instance %1)
+                                                    (long-array [%2])) 0)
+                          eviction-pool (call "open-pool" port)
+                          _ (call "acquire-release" eviction-pool)
+                          first-id (first (keys (get-in @(:state pool-native)
+                                                       [:pools eviction-pool :connections])))
+                          _ (reset! pool-clock 9)
+                          _ (call "acquire-release" eviction-pool)
+                          _ (reset! pool-clock 21)
+                          _ (call "acquire-release" eviction-pool)
+                          lifetime-id (first (keys (get-in @(:state pool-native)
+                                                          [:pools eviction-pool :connections])))
+                          _ (reset! pool-clock 37)
+                          _ (call "acquire-release" eviction-pool)
+                          idle-id (first (keys (get-in @(:state pool-native)
+                                                      [:pools eviction-pool :connections])))]
+                      (when-not (and first-id lifetime-id idle-id
+                                     (not= first-id lifetime-id)
+                                     (not= lifetime-id idle-id)
+                                     (= 0 (call "close-pool" eviction-pool)))
+                        (throw (ex-info "PostgreSQL pool eviction failed"
+                                        {:first first-id :lifetime lifetime-id
+                                         :idle idle-id
+                                         :pool-state @(:state pool-native)}))))
+                    (let [instance-a (:instance multi-consumer)
+                          instance-b (:instance parallel-consumer)
+                          call-a #(aget ^longs (.apply (.export instance-a %1)
+                                                      (long-array [%2])) 0)
+                          call-b #(aget ^longs (.apply (.export instance-b %1)
+                                                      (long-array [%2])) 0)
+                          parallel-pool (call-a "open-pool" port)
+                          lease-a (call-a "acquire" parallel-pool)
+                          lease-b (call-b "acquire" parallel-pool)
+                          started (System/nanoTime)
+                          result-a (future (call-a "query-sleep" lease-a))
+                          result-b (future (call-b "query-sleep" lease-b))
+                          query-a @result-a query-b @result-b
+                          elapsed-ms (/ (- (System/nanoTime) started) 1000000.0)]
+                      (when-not (and (pos? query-a) (pos? query-b)
+                                     (< elapsed-ms 650.0)
+                                     (= 0 (call-a "release" lease-a))
+                                     (= 0 (call-b "release" lease-b))
+                                     (= 0 (call-a "close-pool" parallel-pool)))
+                        (throw (ex-info "PostgreSQL pool queries did not execute concurrently"
+                                        {:lease-a lease-a :lease-b lease-b
+                                         :query-a query-a :query-b query-b
+                                         :elapsed-ms elapsed-ms
+                                         :pool-state @(:state pool-native)}))))
+                    (let [instance-a (:instance multi-consumer)
+                          instance-b (:instance parallel-consumer)
+                          instance-c (:instance waiter-consumer)
+                          call #(aget ^longs (.apply (.export %1 %2)
+                                                    (long-array [%3])) 0)
+                          fairness-pool (call instance-a "open-pool" port)
+                          held-a (call instance-a "acquire" fairness-pool)
+                          held-b (call instance-b "acquire" fairness-pool)
+                          wait-a (future (call instance-b "acquire" fairness-pool))
+                          await-queue
+                          (fn [n]
+                            (loop [attempt 0]
+                              (cond
+                                (= n (count (get-in @(:state pool-native)
+                                                    [:waiters fairness-pool]))) true
+                                (>= attempt 100) false
+                                :else (do (Thread/sleep 5) (recur (inc attempt))))))
+                          queued-a (await-queue 1)
+                          wait-b (future (call instance-c "acquire" fairness-pool))
+                          queued-b (await-queue 2)
+                          _ (call instance-a "release" held-a)
+                          acquired-a (deref wait-a 500 -1)
+                          second-still-waiting (not (realized? wait-b))
+                          _ (call instance-a "release" acquired-a)
+                          acquired-b (deref wait-b 500 -1)]
+                      (when-not (and queued-a queued-b (> acquired-a 0)
+                                     second-still-waiting (> acquired-b 0)
+                                     (= 0 (call instance-a "release" held-b))
+                                     (= 0 (call instance-a "release" acquired-b))
+                                     (= 0 (call instance-a "close-pool" fairness-pool)))
+                        (throw (ex-info "PostgreSQL pool FIFO waiter qualification failed"
+                                        {:queued-a queued-a :queued-b queued-b
+                                         :acquired-a acquired-a :acquired-b acquired-b
+                                         :second-still-waiting second-still-waiting
+                                         :pool-state @(:state pool-native)}))))
+                    (let [instance-a (:instance multi-consumer)
+                          instance-b (:instance parallel-consumer)
+                          call #(aget ^longs (.apply (.export %1 %2)
+                                                    (long-array [%3])) 0)
+                          race-pool (call instance-a "open-pool" port)
+                          race-lease (call instance-a "acquire" race-pool)
+                          in-flight (future
+                                      (call instance-b "query-release-race" race-lease))
+                          started? (deref pool-race-started 500 false)
+                          release-result (call instance-a "release" race-lease)
+                          query-result (deref in-flight 1000 -1)
+                          stale-result (call instance-a "query-sleep" race-lease)]
+                      (when-not (and started? (pos? query-result)
+                                     (= 0 release-result) (= -1 stale-result)
+                                     (= 0 (call instance-a "close-pool" race-pool)))
+                        (throw (ex-info "PostgreSQL pool query/release race failed"
+                                        {:started started? :query query-result
+                                         :release release-result :stale stale-result
+                                         :pool-state @(:state pool-native)}))))
+                    (let [instance (:instance multi-consumer)
+                          call #(aget ^longs (.apply (.export instance %1)
+                                                    (long-array [%2])) 0)
+                          restart-pool (call "open-pool" port)
+                          broken-lease (call "acquire" restart-pool)
+                          _ (sh! "pg_ctl" "-D" (str data) "-m" "immediate" "-w" "stop")
+                          broken-query (call "query-one" broken-lease)
+                          broken-release (call "release" broken-lease)
+                          _ (sh! "pg_ctl" "-D" (str data) "-l" (str log)
+                                 "-o" (str "-h 127.0.0.1 -p " port
+                                           " -c ssl=on -c ssl_cert_file=" certificate
+                                           " -c ssl_key_file=" key
+                                           " -c password_encryption=scram-sha-256")
+                                 "-w" "start")
+                          recovered-lease (call "acquire" restart-pool)
+                          recovered-query (call "query-one" recovered-lease)]
+                      (when-not (and (= -1 broken-query) (= -1 broken-release)
+                                     (> recovered-lease 0) (> recovered-query 0)
+                                     (= 0 (call "release" recovered-lease))
+                                     (= 0 (call "close-pool" restart-pool)))
+                        (throw (ex-info "PostgreSQL pool restart recovery failed"
+                                        {:broken-query broken-query
+                                         :broken-release broken-release
+                                         :recovered-lease recovered-lease
+                                         :recovered-query recovered-query
+                                         :pool-state @(:state pool-native)}))))
+                    (let [instance (:instance multi-consumer)
+                          call #(aget ^longs (.apply (.export instance %1)
+                                                    (long-array [%2])) 0)
+                          proxy-pool (call "open-pool" (:port fault-proxy))
+                          proxy-lease (call "acquire" proxy-pool)
+                          _ ((:pause! fault-proxy))
+                          started (System/nanoTime)
+                          timeout-query (call "query-one" proxy-lease)
+                          timeout-release (call "release" proxy-lease)
+                          elapsed-ms (/ (- (System/nanoTime) started) 1000000.0)
+                          _ ((:resume! fault-proxy))
+                          recovered-lease (call "acquire" proxy-pool)
+                          recovered-query (call "query-one" recovered-lease)]
+                      (when-not (and (= -1 timeout-query) (= -1 timeout-release)
+                                     ;; query plus the two-step reset each retain the
+                                     ;; host's 2s read bound; the composite is <= 3x.
+                                     (< elapsed-ms 7000.0)
+                                     (> recovered-lease 0) (> recovered-query 0)
+                                     (= 0 (call "release" recovered-lease))
+                                     (= 0 (call "close-pool" proxy-pool)))
+                        (throw (ex-info "PostgreSQL pool half-open recovery failed"
+                                        {:timeout-query timeout-query
+                                         :timeout-release timeout-release
+                                         :elapsed-ms elapsed-ms
+                                         :recovered-lease recovered-lease
+                                         :recovered-query recovered-query
+                                         :pool-state @(:state pool-native)}))))
+                    (let [instances (mapv :instance
+                                          [multi-consumer parallel-consumer
+                                           waiter-consumer])
+                          call #(aget ^longs (.apply (.export %1 %2)
+                                                    (long-array [%3])) 0)
+                          soak-pool (call (first instances) "open-pool" port)
+                          worker (fn [instance]
+                                   (loop [remaining soak-operations-per-worker completed 0]
+                                     (if (zero? remaining)
+                                       completed
+                                       (let [lease (call instance "acquire" soak-pool)
+                                             query-result (call instance "query-one" lease)
+                                             release-result (call instance "release" lease)]
+                                         (if (and (pos? lease) (pos? query-result)
+                                                  (= 0 release-result))
+                                           (recur (dec remaining) (inc completed))
+                                           completed)))))
+                          results (mapv deref (mapv #(future (worker %)) instances))
+                          pool-state (get-in @(:state pool-native) [:pools soak-pool])]
+                      (when-not (and (= (vec (repeat 3 soak-operations-per-worker)) results)
+                                     (= 2 (count (:connections pool-state)))
+                                     (empty? (:leases @(:state pool-native)))
+                                     (empty? (get-in @(:state pool-native)
+                                                     [:waiters soak-pool]))
+                                     (= 0 (call (first instances) "close-pool" soak-pool)))
+                        (throw (ex-info "PostgreSQL bounded contention soak failed"
+                                        {:results results
+                                         :pool-state @(:state pool-native)}))))
+                    (let [instance-a (:instance multi-consumer)
+                          instance-b (:instance parallel-consumer)
+                          call #(aget ^longs (.apply (.export %1 %2)
+                                                    (long-array [%3])) 0)
+                          drain-pool (call instance-a "open-pool" port)
+                          initial-stats (call instance-a "stats" drain-pool)
+                          healthy (call instance-a "health" drain-pool)
+                          held (call instance-a "acquire" drain-pool)
+                          draining (future (call instance-b "drain" drain-pool))
+                          drain-started
+                          (loop [attempt 0]
+                            (cond
+                              (= :draining (get-in @(:state pool-native)
+                                                   [:pools drain-pool :status])) true
+                              (>= attempt 100) false
+                              :else (do (Thread/sleep 2) (recur (inc attempt)))))
+                          denied-during-drain (call instance-a "acquire" drain-pool)
+                          released (call instance-a "release" held)
+                          drained (deref draining 1500 -1)
+                          closed-stats (call instance-a "stats" drain-pool)
+                          forced-pool (call instance-a "open-pool" port)
+                          forced-lease (call instance-a "acquire" forced-pool)
+                          forced (call instance-b "drain" forced-pool)
+                          forced-stale (call instance-a "release" forced-lease)]
+                      (when-not (and (= 32 initial-stats) (= 1 healthy)
+                                     drain-started (= -1 denied-during-drain)
+                                     (= 0 released) (= 0 drained) (= -1 closed-stats)
+                                     (= 1 forced) (= -1 forced-stale))
+                        (throw (ex-info "PostgreSQL pool stats/health/drain failed"
+                                        {:initial-stats initial-stats :healthy healthy
+                                         :drain-started drain-started
+                                         :denied denied-during-drain :released released
+                                         :drained drained :closed-stats closed-stats
+                                         :forced forced :forced-stale forced-stale
+                                         :pool-state @(:state pool-native)}))))
+                    (let [instance (:instance multi-consumer)
+                          call #(aget ^longs (.apply (.export instance %1)
+                                                    (long-array [%2])) 0)
+                          health-pool (call "open-pool" (:port fault-proxy))
+                          _ ((:pause! fault-proxy))
+                          unhealthy (call "health" health-pool)
+                          evictions (get-in @(:state pool-native)
+                                            [:pools health-pool :metrics :evictions])
+                          _ ((:resume! fault-proxy))
+                          recovered (call "acquire" health-pool)
+                          query-result (call "query-one" recovered)]
+                      (when-not (and (= 0 unhealthy) (= 1 evictions)
+                                     (> recovered 0) (> query-result 0)
+                                     (= 0 (call "release" recovered))
+                                     (= 0 (call "close-pool" health-pool)))
+                        (throw (ex-info "PostgreSQL pool health eviction failed"
+                                        {:unhealthy unhealthy :evictions evictions
+                                         :recovered recovered :query query-result
+                                         :pool-state @(:state pool-native)}))))))
+                (finally ((:close! pool-native)))))
+            (when-not (empty? @(get-in native [:state :handles]))
+              (throw (ex-info "opaque pool transport handle leaked" {})))
+            (let [rotation-high [:pg-query :pg-open-scram-random :pg-close-scram]
+                  rotation-consumer
+                  (tender/open-session
+                   (compile-provider "../kotoba/providers/pg_scram_consumer.kotoba"
+                                     "../kotoba/providers/db_component_policy.edn")
+                   rotation-high
+                   (contract/host-caps
+                    {:grants rotation-high
+                     :limits {:allow-secret-imports? true
+                              :allow-write-imports? true}})
+                   {:provider-host-functions
+                    (merge (linker/link-provider query-provider linker/db-links)
+                           (linker/link-provider scram-provider linker/scram-links))})
+                  rotation-instance (:instance rotation-consumer)
+                  run-rotation #(aget ^longs
+                                      (.apply (.export rotation-instance "run")
+                                              (long-array [port])) 0)
+                  altered (shell/sh
+                           "psql" "-h" "127.0.0.1" "-p" (str port)
+                           "-U" "kotoba" "-d" "kotoba" "-c"
+                           "alter role kotoba password 'brush'"
+                           :env (assoc (into {} (System/getenv))
+                                       "PGPASSWORD" "pencil"))]
+              (when-not (zero? (:exit altered))
+                (throw (ex-info "PostgreSQL password rotation failed" altered)))
+              (when-not (neg? (run-rotation))
+                (throw (ex-info "stale PostgreSQL credential was accepted" {})))
+              (let [old-secret (get @credentials "db/primary")]
+                (reset! credentials {"db/primary" (.toCharArray "brush")})
+                (java.util.Arrays/fill ^chars old-secret (char 0)))
+              (when-not (pos? (run-rotation))
+                (throw (ex-info "fresh PostgreSQL credential was not resolved"
+                                {:usage @(get-in native [:state :usage])
+                                 :handles @(get-in native [:state :handles])
+                                 :postgres-log (slurp (.toFile log))})))
+              (let [old-factory @ssl-factory]
+                (when-not (postgresql-tls-probe old-factory port)
+                  (throw (ex-info "baseline PostgreSQL trust probe failed" {})))
+                (sh! "openssl" "req" "-x509" "-newkey" "rsa:2048" "-nodes"
+                     "-keyout" (str key) "-out" (str certificate)
+                     "-subj" "/CN=localhost"
+                     "-addext" "subjectAltName=DNS:localhost,IP:127.0.0.1"
+                     "-days" "1")
+                (sh! "chmod" "600" (str key))
+                (sh! "pg_ctl" "-D" (str data) "reload")
+                (Thread/sleep 500)
+                (when (postgresql-tls-probe old-factory port)
+                  (throw (ex-info "stale PostgreSQL trust generation was accepted" {})))
+                (when-not (neg? (run-rotation))
+                  (throw (ex-info "stale tender TLS trust connected after rotation" {})))
+                (let [new-factory
+                      (.getSocketFactory (trust-context (.toFile certificate)))]
+                  (when-not (postgresql-tls-probe new-factory port)
+                    (throw (ex-info "rotated PostgreSQL trust probe failed" {})))
+                  (reset! ssl-factory new-factory))
+                (when-not (pos? (run-rotation))
+                  (throw (ex-info "rotated PostgreSQL trust generation failed" {})))))
+            (when-not (empty? @(get-in native [:state :handles]))
+              (throw (ex-info "rotation transport handle leaked" {})))
+            (println "released PostgreSQL TLS/SCRAM/query interoperability: ok"
+                     {:mechanism "SCRAM-SHA-256-PLUS"
+                      :transaction-states ["T" "E" "I"]
+                      :sqlstate "22012" :cancel-sqlstate "57014"
+                      :cancel-authority :opaque-one-shot
+                      :prepared {:name "sum2" :executions 2 :row "42"
+                                 :separation-sqlstate "22P02" :closed true}
+                      :typed-parameters {:count 3 :oid 23 :formats [:text :null :binary]
+                                         :row "42" :reused true}
+                      :portal {:name "page" :fetches [2 1]
+                               :suspended true :completed true :closed true}
+                      :copy {:in-rows 3 :out-chunks 3 :sum 6 :bounded true}
+                      :batch {:max-items 8 :single-sync true :success-items 2
+                              :error-sqlstate "22012" :recovered true}
+                      :pool-reset {:rollback true :discard-all true
+                                   :settings-cleared true :temp-cleared true
+                                   :statements-deallocated true :reused true}
+                      :pool {:opaque-lease true :token-rotated true
+                             :double-release-denied true :stale-query-denied true
+                             :close-while-leased-denied true :reused true
+                             :max-connections 2 :bounded-wait true
+                             :saturation-denied true
+                             :idle-eviction true :lifetime-eviction true
+                             :parallel-query true :fifo-waiters true
+                             :query-release-race-safe true
+                             :database-restart-recovery true
+                             :half-open-timeout-recovery true
+                             :stats-bytes 32 :health-eviction true
+                             :graceful-drain true :forced-drain true
+                             :contention-soak-operations
+                             (* 3 soak-operations-per-worker)}
+                      :rotation {:credential-fresh-resolve true
+                                 :old-password-denied true
+                                 :trust-fresh-resolve true
+                                 :old-certificate-denied true}
+                      :port port}))
+          (finally
+            ((:close! native)))))
+      (finally
+        (when @started?
+          (shell/sh "pg_ctl" "-D" (str data) "-m" "fast" "-w" "stop"))
+        ((:close! fault-proxy))
+        (delete-tree! root)
+        (shutdown-agents)))))
