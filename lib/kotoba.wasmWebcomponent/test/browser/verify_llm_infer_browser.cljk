@@ -1,0 +1,156 @@
+(ns verify-llm-infer-browser
+  "Real-browser (headless Chromium via Playwright) end-to-end verification
+  that `llm-infer` works in an ACTUAL browser tab -- not just Node inject
+  (`test/verify-http-post.mjs`'s inject-path coverage never exercised
+  llm-infer at all) -- via the SAME SharedArrayBuffer+Atomics.wait bridge
+  `http-post` already proved out (`test/browser/verify_http_post_browser.cljk`).
+
+  `src/actor-host.js`'s `llm_infer` reuses the identical bridge shape as
+  `http_post` (`opts.llmInferBridge` + `opts.llmInferUrl`, POSTing the raw
+  prompt bytes and reading the raw completion text back) --
+  `kotoba-wasm-worker-host.js` passes the SAME already-constructed bridge
+  instance for both capabilities, so this is 'generalize/reuse the SAB
+  bridge', not a second bridge implementation.
+
+  This test's local server stands in for a developer-controlled LLM proxy
+  (never a real LLM provider called directly from the browser with an
+  embedded API key -- see kotoba-wasm-worker-host.js's namespace comment).
+
+  Run from this repo's root: `kbb --backend sci -cp test/browser
+  test/browser/verify_llm_infer_browser.cljk`
+
+  The guest fixture bakes the prompt string in at build time (unlike
+  http-post's fixture, llm-infer's target URL is never guest-controlled --
+  it comes from the host-supplied `llm-infer-url` attribute -- so nothing
+  server-dependent needs to be baked into the WAT, and a checked-in
+  approach would work too; generated fresh here anyway for consistency with
+  the http-post fixture and to keep both e2e tests self-contained)."
+  (:require ["node:http" :as http]
+            ["node:child_process" :as child-process]
+            ["node:fs/promises" :as fsp]
+            ["node:path" :as path]
+            [lib.browser-harness :as harness]))
+
+(def repo-root (.cwd js/process))
+(def tmp-dir (.join path repo-root "test" "browser" ".tmp"))
+
+(defn- report! [m]
+  (println (js/JSON.stringify (clj->js m) nil 2)))
+
+(defn- start-proxy-server
+  "A real local HTTP server standing in for a developer-controlled LLM
+  proxy: replies `REPLY:<body>` to any POST. Deliberately a DIFFERENT
+  origin than the static server (different port), exercising the same
+  cross-origin COOP/COEP + CORS-preflight path
+  `verify_http_post_browser.cljs`'s echo server already proved out.
+  Returns a Promise of `{:baseUrl :close}`."
+  []
+  (js/Promise.
+   (fn [resolve reject]
+     (let [server (http/createServer
+                   (fn [req res]
+                     (if (= (.-method req) "OPTIONS")
+                       (do (.writeHead res 204 #js {"Access-Control-Allow-Origin" "*"
+                                                    "Access-Control-Allow-Methods" "POST"
+                                                    "Access-Control-Allow-Headers" "content-type"
+                                                    "Cross-Origin-Resource-Policy" "cross-origin"})
+                           (.end res))
+                       (let [chunks (array)]
+                         (.on req "data" (fn [c] (.push chunks c)))
+                         (.on req "end"
+                              (fn []
+                                (let [body-text (.toString (js/Buffer.concat chunks) "utf-8")]
+                                  (.writeHead res 200 #js {"content-type" "text/plain"
+                                                           "Access-Control-Allow-Origin" "*"
+                                                           "Cross-Origin-Resource-Policy" "cross-origin"})
+                                  (.end res (str "REPLY:" body-text)))))))))]
+       (.on server "error" reject)
+       (.listen server 0 "127.0.0.1"
+                (fn []
+                  (let [port (.-port (.address server))]
+                    (resolve #js {:baseUrl (str "http://127.0.0.1:" port)
+                                  :close (fn [] (js/Promise. (fn [r] (.close server r))))}))))))))
+
+(defn- compile-llm-infer-fixture!
+  "Writes a small WAT module calling `llm_infer` with PROMPT baked in at
+  offset 0, response written at offset 128 with a 256-byte capacity,
+  compiles it via the `wasm-tools` CLI, and returns the OUTPUT `.wasm`
+  path."
+  [prompt]
+  (-> (.mkdir fsp tmp-dir #js {:recursive true})
+      (.then (fn []
+               (let [wat (str "(module\n"
+                              "  (import \"kotoba\" \"llm_infer\"\n"
+                              "    (func $llm_infer (param i32 i32 i32 i32) (result i32)))\n"
+                              "  (memory (export \"memory\") 1)\n"
+                              "  (data (i32.const 0) " (js/JSON.stringify prompt) ")\n"
+                              "  (func (export \"main\") (result i64)\n"
+                              "    (i64.extend_i32_s\n"
+                              "      (call $llm_infer\n"
+                              "        (i32.const 0) (i32.const " (.-length prompt) ")\n"
+                              "        (i32.const 128) (i32.const 256)))))\n")
+                     wat-path (.join path tmp-dir "llm-infer-e2e.wat")
+                     wasm-path (.join path tmp-dir "llm-infer-e2e.wasm")]
+                 (-> (.writeFile fsp wat-path wat)
+                     (.then (fn []
+                              (let [result (.spawnSync child-process "wasm-tools"
+                                                       #js ["parse" wat-path "-o" wasm-path])]
+                                (when (not= 0 (.-status result))
+                                  (throw (js/Error. (str "wasm-tools parse failed: "
+                                                          (or (some-> result .-stderr (.toString))
+                                                              (.-error result))))))
+                                wasm-path)))))))))
+
+(defn- check-page [page url]
+  (-> (.goto page url #js {:waitUntil "load"})
+      (.then (fn [] (.evaluate page "(() => self.crossOriginIsolated)()")))
+      (.then (fn [isolated]
+               (-> (harness/wait-for-shadow-text page "worker-llm-infer-demo")
+                   (.then (fn [text] #js [isolated text])))))))
+
+(defn- run-page-check [server wasm-path proxy-url]
+  (let [rel-src (str "/" (.relative path repo-root wasm-path))
+        url (str (.-baseUrl server) "/examples/actor-host/worker-llm-infer.html"
+                  "?src=" (js/encodeURIComponent rel-src)
+                  "&llm-infer-url=" (js/encodeURIComponent proxy-url))]
+    (harness/with-headless-browser
+     (fn [browser]
+       (-> (.newPage browser)
+           (.then (fn [page] (check-page page url))))))))
+
+(def expected-reply-byte-count
+  ;; "REPLY:" (6 bytes) + the baked-in prompt "what-is-2-plus-2" (16 bytes),
+  ;; the proxy's own echo shape -- see start-proxy-server. Asserting the
+  ;; exact count (not just "not -1") proves the guest received the REAL
+  ;; reply from the real local server through the real bridge, not some
+  ;; other value that merely happens to be non-negative.
+  (+ (.-length "REPLY:") (.-length "what-is-2-plus-2")))
+
+(defn- evaluate-result! [result]
+  (let [isolated (aget result 0)
+        text (aget result 1)
+        ok? (and (true? isolated)
+                 (not (.startsWith text "ERROR"))
+                 (.includes text (str "llm_infer result: " expected-reply-byte-count)))]
+    (report! {:name "worker-llm-infer-demo"
+              :cross-origin-isolated isolated
+              :ok ok?
+              :text text})
+    (when-not ok? (set! (.-exitCode js/process) 1))))
+
+(defn- run-with-servers [proxy server]
+  (-> (compile-llm-infer-fixture! "what-is-2-plus-2")
+      (.then (fn [wasm-path] (run-page-check server wasm-path (str (.-baseUrl proxy) "/infer"))))
+      (.then evaluate-result!)
+      (.finally (fn []
+                  (js/Promise.all #js [((.-close proxy)) ((.-close server))])))))
+
+(defn -main []
+  (-> (js/Promise.all #js [(start-proxy-server)
+                           (harness/start-static-server repo-root {:cross-origin-isolated? true})])
+      (.then (fn [pair] (run-with-servers (aget pair 0) (aget pair 1))))
+      (.catch (fn [e]
+                (js/console.error e)
+                (set! (.-exitCode js/process) 1)))))
+
+(-main)
