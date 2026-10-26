@@ -1,0 +1,160 @@
+;; `kotoba/tcp/options_core.kotoba` and `options_wire_core.kotoba` against
+;; `tcp.options`.
+;;
+;; Two objects because amu#611 refuses a module holding both an i64 shift and a
+;; `:bool` parameter, and TCP options need both -- the wire format shifts and
+;; the negotiation is boolean. The seam is real, but it was drawn there by the
+;; compiler.
+;;
+;; Two of tcp.options' functions have no object at all. `apply-scale` and
+;; `advertise` shift by an amount RFC 7323 negotiates during the handshake, and
+;; an i64 shift count must be a literal in [0,63]. This suite asserts their
+;; absence rather than leaving it to be noticed, so that adding them later is a
+;; deliberate act.
+;;
+;; The negotiation asymmetry is checked with different shifts on each side,
+;; because send-shift and recv-shift can be swapped and every symmetric test
+;; passes anyway. That is the classic bug and it needs asymmetric inputs to
+;; show.
+
+(ns tcp.options-kotoba-parity-test
+  (:require [kotoba.lang.error :as kerror] [kotoba.io :as io]
+            [kotoba.test :refer [deftest is]]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]
+            [tcp.options :as opt]))
+
+(defn- path [f] (io/file (System/getProperty "user.dir") "kotoba" "tcp" f))
+
+(def ^:private needed
+  ["options_core.kotoba" "options_wire_core.kotoba" "seq_core.kotoba"])
+
+(defn- source-available? []
+  (let [missing (remove #(io/exists? (path %)) needed)]
+    (is (empty? missing) (str "kotoba objects not found: " (pr-str missing)))
+    (empty? missing)))
+
+(def ^:private wire-kir
+  (delay (:kir (compiler/compile-project
+                {'tcp.options-wire-core (slurp (path "options_wire_core.kotoba"))}
+                'tcp.options-wire-core :wasm32-kotoba-v1 {}))))
+
+(def ^:private core-kir
+  (delay (:kir (compiler/compile-project
+                {'tcp.seq-core (slurp (path "seq_core.kotoba"))
+                 'tcp.options-core (slurp (path "options_core.kotoba"))}
+                'tcp.options-core :wasm32-kotoba-v1 {}))))
+
+(defn- wire [f & args] (ir/execute @wire-kir f (vec args)))
+(defn- core [f & args] (ir/execute @core-kir f (vec args)))
+
+(def ^:private cljc-u32 (var-get #'tcp.options/u32))
+(def ^:private cljc->u32 (var-get #'tcp.options/->u32))
+
+(deftest kotoba-objects-are-present
+  (source-available?))
+
+(deftest u32-round-trips
+  (when (source-available?)
+    (doseq [n [0 1 255 256 65535 65536 16777215 16777216 4294967295 2147483648]]
+      (let [bytes (cljc->u32 n)]
+        (doseq [i (range 4)]
+          (is (= (nth bytes i) (wire 'u32-byte n i))
+              (str "u32-byte " n " [" i "] -- the shift counts are literals in "
+                   "each branch because a computed one does not compile")))
+        (is (= n (apply wire 'u32-from-bytes bytes))
+            (str "u32-from-bytes round trip " n))
+        (is (= n (cljc-u32 (vec bytes) 0)) "the .cljc reader agrees too")))))
+
+(deftest mss-bytes-agree
+  (when (source-available?)
+    (doseq [mss [0 1 536 1460 9000 65535]]
+      (let [rendered (opt/render {:mss mss})
+            hi (nth rendered 2) lo (nth rendered 3)]
+        (is (= hi (wire 'mss-hi mss)) (str "mss-hi " mss))
+        (is (= lo (wire 'mss-lo mss)) (str "mss-lo " mss))
+        (is (= mss (wire 'mss-from-bytes hi lo)) (str "mss round trip " mss))
+        (is (= mss (:mss (opt/parse rendered))) "the .cljc parser agrees too")))))
+
+(deftest shift-validity-agrees
+  (when (source-available?)
+    (doseq [shift [0 1 13 14 15 20 255]]
+      (let [bs [3 3 shift]
+            parsed (opt/parse bs)]
+        (is (= (not= :shift-too-large (:tcp.opt/error parsed))
+               (core 'shift-valid? shift))
+            (str "shift-valid? " shift
+                 " -- RFC 7323 caps it at 14; accepting more lets a peer push "
+                 "the window past the 2^30 the sequence space allows"))))))
+
+(deftest negotiation-agrees
+  (when (source-available?)
+    ;; Asymmetric on purpose: send-shift and recv-shift can be swapped and
+    ;; every symmetric case still passes.
+    (doseq [ours [nil 0 3 7 14], theirs [nil 0 5 9 14]
+            ours-ts [nil {:tsval 1}], theirs-ts [nil {:tsval 2}]]
+      (let [o (cond-> {} ours (assoc :window-shift ours)
+                        ours-ts (assoc :timestamps ours-ts))
+            t (cond-> {} theirs (assoc :window-shift theirs)
+                        theirs-ts (assoc :timestamps theirs-ts))
+            n (opt/negotiate o t)
+            in-use? (core 'window-scaling? (some? ours) (some? theirs))]
+        (is (= (:tcp.opt/window-scaling? n) in-use?)
+            (str "scaling? ours " ours " theirs " theirs))
+        (is (= (:tcp.opt/send-shift n) (core 'send-shift in-use? (or ours 0)))
+            (str "send-shift ours " ours " theirs " theirs
+                 " -- we shift what WE send by what WE offered"))
+        (is (= (:tcp.opt/recv-shift n) (core 'recv-shift in-use? (or theirs 0)))
+            (str "recv-shift ours " ours " theirs " theirs
+                 " -- and what THEY send by what THEY offered"))
+        (is (= (:tcp.opt/timestamps? n)
+               (core 'timestamps? (some? ours-ts) (some? theirs-ts)))
+            "timestamps? needs both sides too")))))
+
+(deftest paws-agrees
+  (when (source-available?)
+    (doseq [recent [nil 0 1000 2147483647 4294967290]
+            tsval [0 999 1000 1001 2147483648 4294967295]]
+      (is (= (opt/paws-acceptable? recent tsval)
+             (core 'paws-acceptable? (some? recent) false (or recent 0) tsval))
+          (str "paws recent " recent " tsval " tsval
+               " -- the comparison is modular; raw integers reject every "
+               "segment for a while after the clock wraps")))
+    ;; The idle suspension, which is the only thing that overrides a stale
+    ;; timestamp.
+    (doseq [elapsed [0 2073600000 2073600001 (* 2 2073600000)]]
+      (let [expired? (core 'paws-idle-expired? 0 elapsed)]
+        (is (= (opt/paws-acceptable? 1000 999 0 elapsed)
+               (core 'paws-acceptable? true expired? 1000 999))
+            (str "paws idle elapsed " elapsed
+                 " -- 24 days is when an older-looking timestamp becomes "
+                 "legitimate again"))))))
+
+(deftest record-and-rtt-agree
+  (when (source-available?)
+    (doseq [tsval [nil 0 500], seg-seq [1000 1001 4294967295], rcv-nxt [1000 4294967295]]
+      (let [before {}
+            after (opt/record-timestamp before {:tsval tsval :seg-seq seg-seq
+                                                :rcv-nxt rcv-nxt :now-ms 7})]
+        (is (= (not= before after)
+               (core 'record-timestamp? (some? tsval) seg-seq rcv-nxt))
+            (str "record? tsval " tsval " seq " seg-seq " rcv-nxt " rcv-nxt))))
+    (doseq [tsecr [nil 0 1 500], now [0 499 500 501]]
+      (let [s (opt/rtt-sample {:tsecr tsecr} now)]
+        (is (= (some? s) (core 'rtt-sample-valid? (some? tsecr) (or tsecr 0) now))
+            (str "rtt valid? tsecr " tsecr " now " now))
+        (when s
+          (is (= s (core 'rtt-sample tsecr now))
+              (str "rtt sample tsecr " tsecr " now " now)))))))
+
+(deftest scaling-functions-have-no-object
+  (when (source-available?)
+    ;; Asserted rather than left implicit. apply-scale and advertise shift by a
+    ;; negotiated amount and an i64 shift count must be a literal in [0,63], so
+    ;; a port cannot express them. If someone adds them, this fails and they
+    ;; have to say so here.
+    (doseq [f '[apply-scale advertise]]
+      (is (thrown? kerror/ExceptionInfo (ir/execute @core-kir f [1 1]))
+          (str f " must not exist as an object: RFC 7323 negotiates the shift, "
+               "so it is a variable, and a variable shift count does not "
+               "compile")))))

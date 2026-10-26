@@ -1,0 +1,131 @@
+;; `kotoba/seq_core.kotoba` against `tcp.seq`.
+;;
+;; The .kotoba object exists so sequence arithmetic can run on a machine with
+;; neither a JVM nor Node -- an aiueos node bringing up its own TCP. It cannot
+;; call `tcp.seq`, so the two can drift apart with nothing noticing. This is
+;; the only thing that notices.
+;;
+;; Two of the rewrites are the whole reason to check rather than assert:
+;;
+;;   `mod` is not in the safe-Kotoba surface, so wrapping is `bit-and` with
+;;   2^32-1. That is exact for negative inputs too, and `sub-seq` produces
+;;   negative inputs on every wrap, so "exact" is load-bearing rather than
+;;   incidental. If it were wrong it would be wrong only across the wrap,
+;;   which is where hand-written stacks go wrong anyway.
+;;
+;;   `max` is not there either, so `(max 0 (dec len))` is an `if`. This suite
+;;   does NOT verify that rewrite, and cannot: `max 0` differs from `dec` only
+;;   at len 0, which takes a branch of `acceptable?` where the value is
+;;   discarded. Breaking it to a bare `(- len 1)` was tried and left every
+;;   assertion green. The guard is dead in both implementations. Saying so
+;;   here is the point -- a reader who sees 26,091 green assertions would
+;;   otherwise conclude both rewrites were checked, and only one was.
+;;
+;; The inputs are chosen around the boundaries rather than uniformly: 0, the
+;; 2^31 antipode where TCP's comparison is undefined, and 2^32-1. A uniform
+;; sample over a 2^32 space essentially never lands on any of them.
+
+(ns tcp.seq-kotoba-parity-test
+  (:require [kotoba.io :as io]
+            [kotoba.test :refer [deftest is]]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]
+            [tcp.seq :as s]))
+
+(def ^:private source-file
+  (io/file (System/getProperty "user.dir") "kotoba" "tcp" "seq_core.kotoba"))
+
+(defn- source-available?
+  "Fails rather than skips when the object is missing.
+
+  A `(when (.exists f) ...)` around the assertions would be a skip wearing a
+  pass: on a checkout without the file every test here reports green while
+  asserting nothing, and a reader counting green tests is told the two
+  implementations agree when nobody asked them."
+  []
+  (let [present? (io/exists? source-file)]
+    (is present? (str "kotoba object not found at " source-file))
+    present?))
+
+(def ^:private kir
+  (delay (:kir (compiler/compile-source (slurp source-file) :wasm32-kotoba-v1 {}))))
+
+(defn- call [f & args] (ir/execute @kir f (vec args)))
+
+;; `:bool` comes back as a Clojure boolean, not as 0/1. This wrapper existed as
+;; `(= 1 (apply call ...))` for one run, and that version did not fail loudly:
+;; every `false` case still matched, so a third of the suite stayed green while
+;; every `true` case failed. Half a suite going red is easy to read as a parity
+;; problem in the object rather than a decoding bug in the harness, which is
+;; what it was.
+(defn- call? [f & args]
+  (let [v (apply call f args)]
+    (if (boolean? v) v (throw (ex-info "expected :bool" {:fn f :got v})))))
+
+(def ^:private modulus 4294967296)
+(def ^:private half 2147483648)
+
+(def ^:private points
+  "Boundaries first, then a fixed pseudo-random spread. Deterministic: a
+  parity failure that only reproduces on some runs is not reportable."
+  (concat [0 1 2 (dec half) half (inc half) (- modulus 2) (dec modulus)
+           (- modulus 100) 100 (+ half 100) (- half 100)]
+          (take 40 (iterate #(mod (+ (* % 1103515245) 12345) modulus) 7))))
+
+(def ^:private pairs
+  (for [a points b points] [a b]))
+
+(deftest kotoba-object-is-present
+  (source-available?))
+
+(deftest wrap-agrees
+  (when (source-available?)
+    (doseq [n (concat points (map - points) [-1 (- half) (- modulus)])]
+      (is (= (s/wrap n) (call 'wrap n))
+          (str "wrap " n " -- bit-and vs mod disagree, which means the "
+               "negative case the sub-seq path depends on is wrong")))))
+
+(deftest add-and-sub-agree
+  (when (source-available?)
+    (doseq [[a b] pairs]
+      (is (= (s/+seq a b) (call 'add-seq a b)) (str "+seq " a " " b))
+      (is (= (s/-seq b a) (call 'sub-seq b a)) (str "-seq " b " " a)))))
+
+(deftest comparisons-agree
+  (when (source-available?)
+    (doseq [[a b] pairs]
+      (is (= (s/lt? a b) (call? 'lt? a b)) (str "lt? " a " " b))
+      (is (= (s/leq? a b) (call? 'leq? a b)) (str "leq? " a " " b))
+      (is (= (s/gt? a b) (call? 'gt? a b)) (str "gt? " a " " b))
+      (is (= (s/geq? a b) (call? 'geq? a b)) (str "geq? " a " " b))
+      (is (= (s/ordered? a b) (call? 'ordered? a b))
+          (str "ordered? " a " " b " -- the 2^31 antipode is the only input "
+               "that makes this false and it is in `points` on purpose")))))
+
+(deftest between-agrees
+  (when (source-available?)
+    (doseq [x (take 14 points), lo (take 14 points), hi (take 14 points)]
+      (is (= (s/between? x lo hi) (call? 'between? x lo hi))
+          (str "between? " x " " lo " " hi)))))
+
+(deftest segment-end-agrees
+  (when (source-available?)
+    (doseq [sq (take 14 points), len [0 1 1460], syn? [false true], fin? [false true]]
+      (is (= (s/segment-end {:seq sq :len len :syn? syn? :fin? fin?})
+             (call 'segment-end sq len syn? fin?))
+          (str "segment-end " sq " len " len " syn " syn? " fin " fin?
+               " -- SYN and FIN each occupy a sequence number of their own. "
+               "tcp.sack and tcp.retransmit each carried a private, textually "
+               "identical copy of this until it moved here.")))))
+
+(deftest acceptability-agrees
+  (when (source-available?)
+    (doseq [seg-seq (take 14 points)
+            seg-len [0 1 2 1460 65535]
+            rcv-nxt (take 14 points)
+            rcv-wnd [0 1 1460 65535]]
+      (is (= (s/acceptable? seg-seq seg-len rcv-nxt rcv-wnd)
+             (call? 'acceptable? seg-seq seg-len rcv-nxt rcv-wnd))
+          (str "acceptable? " seg-seq " " seg-len " " rcv-nxt " " rcv-wnd
+               " -- RFC 9293 3.10.7.4, and the zero-length/zero-window cases "
+               "are the ones hand-written stacks drop")))))

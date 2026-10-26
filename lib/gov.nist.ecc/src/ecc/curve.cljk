@@ -1,0 +1,207 @@
+(ns ecc.curve
+  "The NIST prime curves — **P-256, P-384 and P-521** — over `Fp`, in portable
+  `.cljc`.
+
+  One implementation, three parameter sets. All three are short Weierstrass
+  with `a = p - 3`, which is why the doubling formula below can be the one
+  specialised for `a = -3`: it is not an optimisation chosen for these curves,
+  it is the reason these curves were chosen to have that `a`.
+
+  ## What the corpus does not cover, and what does
+
+  Wycheproof supplies **both** parties' keys, so nothing in it multiplies the
+  base point: `gx` and `gy` could both be wrong and all 1,806 cases would
+  still pass. Measured — changing one digit of P-256's `gy` leaves the whole
+  corpus green and turns only the parameter invariants and the
+  `java.security` oracle red. That is why both of those exist.
+
+  ## The parameters are asserted, not trusted
+
+  They were read out of the JVM's own tables (see
+  `scripts/extract_curve_params.cljk`) rather than typed from a document, and
+  then they are **checked**, in `ecc.curve-test`, against three properties
+  that no wrong constant survives:
+
+    G is on the curve            catches a wrong b, gx or gy
+    n * G is the point at infinity   catches a wrong n
+    a = p - 3                    catches a wrong a, and pins the form
+
+  Behaviourally they are checked much harder: 1,806 Project Wycheproof ECDH
+  cases, and — for P-256 and P-521 — RFC 9180's own `DeriveKeyPair` vectors,
+  which are the only thing here that exercises the **base point**. Wycheproof
+  supplies both parties' keys, so it never multiplies G.
+
+  ## Not constant-time
+
+  `scalar-mult` is double-and-add and branches on the bits of the scalar.
+  See the README."
+  (:require [ecc.bignum :as b]))
+
+;; ── parameter sets ───────────────────────────────────────────────────────────
+
+(defn- curve [nm byte-len p a bb gx gy n]
+  {:name nm :byte-len byte-len
+   :p (b/of-dec p) :a (b/of-dec a) :b (b/of-dec bb)
+   :gx (b/of-dec gx) :gy (b/of-dec gy) :n (b/of-dec n)})
+
+(def p256
+  (curve :p256 32
+         "115792089210356248762697446949407573530086143415290314195533631308867097853951"
+         "115792089210356248762697446949407573530086143415290314195533631308867097853948"
+         "41058363725152142129326129780047268409114441015993725554835256314039467401291"
+         "48439561293906451759052585252797914202762949526041747995844080717082404635286"
+         "36134250956749795798585127919587881956611106672985015071877198253568414405109"
+         "115792089210356248762697446949407573529996955224135760342422259061068512044369"))
+
+(def p384
+  (curve :p384 48
+         "39402006196394479212279040100143613805079739270465446667948293404245721771496870329047266088258938001861606973112319"
+         "39402006196394479212279040100143613805079739270465446667948293404245721771496870329047266088258938001861606973112316"
+         "27580193559959705877849011840389048093056905856361568521428707301988689241309860865136260764883745107765439761230575"
+         "26247035095799689268623156744566981891852923491109213387815615900925518854738050089022388053975719786650872476732087"
+         "8325710961489029985546751289520108179287853048861315594709205902480503199884419224438643760392947333078086511627871"
+         "39402006196394479212279040100143613805079739270465446667946905279627659399113263569398956308152294913554433653942643"))
+
+(def p521
+  (curve :p521 66
+         "6864797660130609714981900799081393217269435300143305409394463459185543183397656052122559640661454554977296311391480858037121987999716643812574028291115057151"
+         "6864797660130609714981900799081393217269435300143305409394463459185543183397656052122559640661454554977296311391480858037121987999716643812574028291115057148"
+         "1093849038073734274511112390766805569936207598951683748994586394495953116150735016013708737573759623248592132296706313309438452531591012912142327488478985984"
+         "2661740802050217063228768716723360960729859168756973147706671368418802944996427808491545080627771902352094241225065558662157113545570916814161637315895999846"
+         "3757180025770020463545507224491183603594455134769762486694567779615544477440556316691234405012945539562144444537289428522585666729196580810124344277578376784"
+         "6864797660130609714981900799081393217269435300143305409394463459185543183397655394245057746333217197532963996371363321113864768612440380340372808892707005449"))
+
+(def curves {:p256 p256 :p384 p384 :p521 p521})
+
+;; ── field helpers ────────────────────────────────────────────────────────────
+
+(defn- f+ [c x y] (b/mod (b/add x y) (:p c)))
+(defn- f- [c x y] (b/mod (b/sub x y) (:p c)))
+(defn- f* [c x y] (b/mod (b/mul x y) (:p c)))
+(defn- fsq [c x] (f* c x x))
+(defn- fk [c k x] (f* c (b/of-int k) x))
+
+;; ── Jacobian points ──────────────────────────────────────────────────────────
+;;
+;; `[X Y Z]` with `x = X/Z^2` and `y = Y/Z^3`. Z = 0 is the point at
+;; infinity. Affine coordinates would need one modular inversion per group
+;; operation and a scalar multiplication does hundreds of them; here there is
+;; exactly one, at the end.
+
+(def infinity [b/zero b/one b/zero])
+
+(defn infinity? [[_ _ z]] (b/zero? z))
+
+(defn double-point
+  "Doubling, in the form specialised for `a = -3` (dbl-2001-b).
+
+  Public because `add-points` has a branch that `scalar-mult` never reaches,
+  and a branch no test can reach is a branch no test is checking. See
+  `ecc.curve-test/the-addition-branches-are-all-reachable`."
+  [c [x y z]]
+  (if (b/zero? z)
+    infinity
+    (let [delta (fsq c z)
+          gamma (fsq c y)
+          beta (f* c x gamma)
+          alpha (fk c 3 (f* c (f- c x delta) (f+ c x delta)))
+          x3 (f- c (fsq c alpha) (fk c 8 beta))
+          z3 (f- c (f- c (fsq c (f+ c y z)) gamma) delta)
+          y3 (f- c (f* c alpha (f- c (fk c 4 beta) x3))
+                 (fk c 8 (fsq c gamma)))]
+      [x3 y3 z3])))
+
+(defn add-points
+  [c [x1 y1 z1 :as pp] [x2 y2 z2 :as q]]
+  (cond
+    (b/zero? z1) q
+    (b/zero? z2) pp
+    :else
+    (let [z1z1 (fsq c z1) z2z2 (fsq c z2)
+          u1 (f* c x1 z2z2) u2 (f* c x2 z1z1)
+          s1 (f* c y1 (f* c z2 z2z2))
+          s2 (f* c y2 (f* c z1 z1z1))
+          h (f- c u2 u1)
+          r (fk c 2 (f- c s2 s1))]
+      (if (b/zero? h)
+        ;; Same x. Either the same point -- in which case the chord is a
+        ;; tangent and this is a doubling -- or two points that sum to
+        ;; infinity.
+        ;;
+        ;; **`scalar-mult` never reaches this.** Left-to-right double-and-add
+        ;; adds P to a multiple of P that is never P itself, so h is never
+        ;; zero there. It was measured: forcing this branch to `false` left
+        ;; the entire suite green, which is what a branch nothing checks looks
+        ;; like. It is kept because `add-points` is a group operation and a
+        ;; partial one is a trap for the next caller -- and it is now reached
+        ;; directly from a test.
+        (if (b/zero? r) (double-point c pp) infinity)
+        (let [i (fsq c (fk c 2 h))
+              j (f* c h i)
+              v (f* c u1 i)
+              x3 (f- c (f- c (fsq c r) j) (fk c 2 v))
+              y3 (f- c (f* c r (f- c v x3)) (fk c 2 (f* c s1 j)))
+              z3 (f* c (f- c (f- c (fsq c (f+ c z1 z2)) z1z1) z2z2) h)]
+          [x3 y3 z3])))))
+
+(defn ->affine
+  [c [x y z]]
+  (when-not (b/zero? z)
+    (let [zi (b/inv-mod z (:p c))
+          zi2 (fsq c zi)]
+      [(f* c x zi2) (f* c y (f* c zi zi2))])))
+
+(defn scalar-mult
+  "`k * P`, double-and-add from the top bit.
+
+  Returns a Jacobian point; `infinity?` it before using the result. Not
+  constant-time — see the README."
+  [c k [px py]]
+  (loop [i (dec (b/bit-length k)) acc infinity]
+    (if (neg? i)
+      acc
+      (recur (dec i)
+             (let [d (double-point c acc)]
+               (if (b/test-bit k i) (add-points c d [px py b/one]) d))))))
+
+(defn on-curve?
+  [c x y]
+  (and (b/lt? x (:p c)) (b/lt? y (:p c))
+       (b/eq? (fsq c y)
+              (f+ c (f+ c (f* c x (fsq c x)) (f* c (:a c) x)) (:b c)))))
+
+;; ── SEC1 encoding ────────────────────────────────────────────────────────────
+;;
+;; RFC 9180 §7.1.1 says SerializePublicKey for these curves is SEC1's
+;; uncompressed form: 0x04 || X || Y, each coordinate padded to the field
+;; length. Compressed points are not accepted -- HPKE never produces one, and
+;; accepting an encoding a peer cannot have sent is surface for nothing.
+
+(defn point->bytes
+  [c [x y]]
+  (into [0x04] (concat (b/to-bytes x (:byte-len c)) (b/to-bytes y (:byte-len c)))))
+
+(defn bytes->point
+  "Parse and **validate**. Returns `{:status :ok :point [x y]}`.
+
+  Validation is not optional here. An unchecked point lets a peer hand over
+  something that is not on the curve at all, and the scalar multiplication
+  then happens in a group the attacker chose -- one that can be small enough
+  to recover the private scalar from the result. The cofactor is 1 on all
+  three curves, so on-curve and not-infinity is the whole check."
+  [c bs]
+  (let [n (:byte-len c)
+        bs (mapv #(bit-and (int %) 0xFF) (seq bs))]
+    (cond
+      (not= (inc (* 2 n)) (count bs))
+      {:status :error :reason :bad-point-length :length (count bs)}
+
+      (not= 0x04 (first bs))
+      {:status :error :reason :not-uncompressed :prefix (first bs)}
+
+      :else
+      (let [x (b/of-bytes (subvec bs 1 (inc n)))
+            y (b/of-bytes (subvec bs (inc n)))]
+        (if-not (on-curve? c x y)
+          {:status :error :reason :point-not-on-curve}
+          {:status :ok :point [x y]})))))

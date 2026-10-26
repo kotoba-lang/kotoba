@@ -1,0 +1,165 @@
+;; `kotoba/tcp/state_core.kotoba` against `tcp.state/step`.
+;;
+;; The object is the decision core, not a port: `tcp.state` builds connection
+;; maps and segment vectors, and that stays in .cljc. What the object owns is
+;; the transition -- where we go, what we send, why we dropped it -- which is
+;; the part a hand-written stack gets wrong and only finds out about in
+;; production, months later, on one peer's stack.
+;;
+;; This drives the whole cross product: eleven states by every combination of
+;; FIN/SYN/RST/ACK/data, with the ACK and acceptability facts set both ways.
+;; The .cljc is the oracle; the object has to agree on all three fields it
+;; packs.
+;;
+;; The two spellings of every state only ever meet here, so the mapping below
+;; is part of the test rather than of either implementation.
+
+(ns tcp.state-kotoba-parity-test
+  (:require [kotoba.io :as io]
+            [kotoba.test :refer [deftest is]]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]
+            [tcp.state :as st]))
+
+(def ^:private source-file
+  (io/file (System/getProperty "user.dir") "kotoba" "tcp" "state_core.kotoba"))
+
+(def ^:private dep-file
+  (io/file (System/getProperty "user.dir") "kotoba" "tcp" "seq_core.kotoba"))
+
+(defn- source-available?
+  "Fails rather than skips. A `(when (.exists f) ...)` guard around the
+  assertions reports green on a checkout without the object, which is a skip
+  wearing a pass."
+  []
+  (let [present? (and (io/exists? source-file) (io/exists? dep-file))]
+    (is present? (str "kotoba objects not found: " source-file " / " dep-file))
+    present?))
+
+;; `compile-project` rather than `compile-source`, because this module has a
+;; dependency and `compile-source` refuses a `:require` clause outright ("only
+;; a bounded :export vector is admitted in namespace clauses"). It takes a
+;; closed namespace -> source map with no filesystem walk and no source path,
+;; which is what a test wants anyway.
+;;
+;; This object briefly inlined its own wrap to stay single-module, on the
+;; belief that a JVM harness could not drive a dependency at all. It can.
+(def ^:private kir
+  (delay (:kir (compiler/compile-project
+                {'tcp.seq-core (slurp dep-file)
+                 'tcp.state-core (slurp source-file)}
+                'tcp.state-core :wasm32-kotoba-v1 {}))))
+
+(defn- decide [state flags acceptable? ack-ok? fin-acked?]
+  (let [d (ir/execute @kir 'segment-decision
+                      [state flags acceptable? ack-ok? fin-acked?])]
+    {:state (ir/execute @kir 'decision-state [d])
+     :action (ir/execute @kir 'decision-action [d])
+     :drop (ir/execute @kir 'decision-drop [d])}))
+
+;; Wire codes. state_core.kotoba is the other half of this mapping.
+(def ^:private state-code
+  {:closed 0 :listen 1 :syn-sent 2 :syn-received 3 :established 4
+   :fin-wait-1 5 :fin-wait-2 6 :close-wait 7 :closing 8 :last-ack 9
+   :time-wait 10})
+
+(def ^:private action-code
+  {:none 0 :send-ack 1 :send-syn-ack 2 :send-rst 3 :send-rst-with-ack 4})
+
+(def ^:private drop-code
+  {nil 0 :unacceptable-sequence 1 :bad-ack 2 :rst-out-of-window 3
+   :closed 4 :no-listener 5 :wrong-state-for-flag 6})
+
+(def ^:private flag-bit {:fin 1 :syn 2 :rst 4 :ack 8})
+
+(defn- flags->bits [fs data?]
+  (+ (reduce + 0 (map flag-bit fs)) (if data? 16 0)))
+
+(defn- classify-action
+  "What the .cljc emitted, as one of the object's action codes. The object
+  names the shape of the reply; the .cljc builds the actual segment."
+  [segs]
+  (if (empty? segs)
+    :none
+    (let [f (:tcp/flags (first segs))]
+      (cond
+        (and (contains? f :syn) (contains? f :ack)) :send-syn-ack
+        (and (contains? f :rst) (contains? f :ack)) :send-rst-with-ack
+        (contains? f :rst) :send-rst
+        :else :send-ack))))
+
+(def ^:private all-flag-sets
+  (for [fin [nil :fin] syn [nil :syn] rst [nil :rst] ack [nil :ack]]
+    (remove nil? [fin syn rst ack])))
+
+(def ^:private iss 1000)
+
+(defn- conn [state snd-nxt rcv-nxt]
+  (assoc (st/connection {:iss iss}) :tcp/state state
+         :tcp/snd-nxt snd-nxt :tcp/rcv-nxt rcv-nxt :tcp/snd-una iss))
+
+(deftest kotoba-object-is-present
+  (source-available?))
+
+(deftest transitions-agree
+  (when (source-available?)
+    (doseq [[state code] state-code
+            fs all-flag-sets
+            data? [false true]
+            ack-ok? [false true]
+            :let [;; rcv-nxt 5000, window 65535, so a segment at 5000 is
+                  ;; acceptable and one a long way outside it is not.
+                  c (conn state (inc iss) 5000)
+                  seg-seq 5000
+                  seg-len (if data? 100 0)
+                  ;; ack-ok means "acknowledges our SYN", which is ISS+1 in
+                  ;; the handshake states and SND.NXT in the synchronised ones
+                  ;; (where it also means our FIN is acked).
+                  ack (if ack-ok? (inc iss) 777)
+                  ;; `step` takes the internal segment shape, not the
+                  ;; constructor's. Passing {:seq ..} instead of {:tcp/seq ..}
+                  ;; reads fine and makes every field nil.
+                  sg (cond-> {:tcp/seq seg-seq :tcp/flags (set fs) :tcp/len seg-len}
+                       (some #{:ack} fs) (assoc :tcp/ack ack))
+                  actual (st/step c {:kind :segment :segment sg :now-ms 0})
+                  fin-acked? (and ack-ok? (contains? #{5 8 9} code))
+                  expected (decide code (flags->bits fs data?) true ack-ok? fin-acked?)]]
+      (is (= (state-code (:tcp/state (:tcp/connection actual))) (:state expected))
+          (str "state " state " flags " (vec fs) " data " data? " ack-ok " ack-ok?))
+      (is (= (action-code (classify-action (:tcp/send actual))) (:action expected))
+          (str "action " state " flags " (vec fs) " data " data? " ack-ok " ack-ok?))
+      (is (= (drop-code (:tcp/dropped actual)) (:drop expected))
+          (str "drop " state " flags " (vec fs) " data " data? " ack-ok " ack-ok?)))))
+
+(deftest unacceptable-segments-agree
+  (when (source-available?)
+    (doseq [[state code] state-code
+            :when (contains? #{4 5 6 7 8 9 10} code)
+            fs all-flag-sets]
+      (let [c (conn state (inc iss) 5000)
+            ;; 2^31 away: outside any window, and on the far side of the
+            ;; antipode where sequence comparison is undefined.
+            sg (cond-> {:tcp/seq 2147488648 :tcp/flags (set fs) :tcp/len 0}
+                 (some #{:ack} fs) (assoc :tcp/ack (inc iss)))
+            actual (st/step c {:kind :segment :segment sg :now-ms 0})
+            expected (decide code (flags->bits fs false) false false false)]
+        (is (= (state-code (:tcp/state (:tcp/connection actual))) (:state expected))
+            (str "unacceptable state " state " flags " (vec fs)))
+        (is (= (drop-code (:tcp/dropped actual)) (:drop expected))
+            (str "unacceptable drop " state " flags " (vec fs)))
+        ;; The reply, not just the verdict. Without this assertion, changing
+        ;; the unacceptable-sequence path from "answer with an ACK" to "drop
+        ;; in silence" left the whole suite green -- and a stack that drops
+        ;; silently never tells the peer what window it has, so the connection
+        ;; stalls instead of failing.
+        (is (= (action-code (classify-action (:tcp/send actual))) (:action expected))
+            (str "unacceptable action " state " flags " (vec fs)))))))
+
+(deftest fin-consumes-a-sequence-number
+  (when (source-available?)
+    (doseq [seg-seq [0 1 4294967295 2147483648 5000]
+            seg-len [0 1 1460]
+            fin? [false true]]
+      (is (= (mod (+ seg-seq seg-len (if fin? 1 0)) 4294967296)
+             (ir/execute @kir 'next-rcv-nxt [seg-seq seg-len fin?]))
+          (str "next-rcv-nxt " seg-seq " " seg-len " fin " fin?)))))

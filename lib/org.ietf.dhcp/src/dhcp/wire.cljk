@@ -1,0 +1,198 @@
+(ns dhcp.wire
+  "RFC 2131 §2 message format and RFC 2132 options, as a portable codec.
+
+  Bytes in, map out; map in, bytes out. No sockets, no clock, no randomness —
+  a caller supplies the transaction id and the hardware address, and
+  `dhcp.client` supplies the state machine. Keeping the codec free of those
+  makes the whole of it testable without a network, which is the only way this
+  layer gets tested at all on a machine that has no DHCP server on it.
+
+  ## Why this exists
+
+  aiueos reaches IPv4 and one TCP connection under QEMU with the address pair
+  10.0.2.15/10.0.2.2 written into the driver — SLIRP's fixed topology. A
+  machine with a hardcoded address does not join a customer's LAN, so \"power
+  it on and plug it in\" stops at the first switch. Nothing in kotoba-lang
+  implemented DHCP before this (searched 2026-08-15 across all 4,178 west
+  projects: `com-tcp-ip` is a CRUD actor over TCP *records*, not a stack, and
+  no dhcp repo existed).
+
+  ## What a decoder must refuse
+
+  A DHCP client takes its address from an unauthenticated broadcast, so the
+  decoder is the whole of its input validation. Every length here is checked
+  against the buffer before it is used, an option that runs past the end is a
+  refusal rather than a truncation, and a packet that is not a reply to the
+  transaction we sent is not our packet. `decode` returns either a message map
+  or `{:dhcp/error <reason>}`; it never returns a half-filled map, because a
+  caller cannot tell a missing field from a field that was never sent."
+  (:require [kotoba.lang.text :as str]))
+
+;; ── constants (RFC 2131 §3, RFC 2132) ──────────────────────────────────────
+
+(def op-bootrequest 1)
+(def op-bootreply 2)
+(def htype-ethernet 1)
+(def hlen-ethernet 6)
+(def magic-cookie [99 130 83 99])        ; 0x63825363, RFC 2132 §2
+(def header-bytes 236)                    ; up to and including sname/file
+(def min-message-bytes (+ header-bytes 4))
+
+(def message-types
+  {1 :discover 2 :offer 3 :request 4 :decline
+   5 :ack 6 :nak 7 :release 8 :inform})
+(def message-type-codes (into {} (map (fn [[k v]] [v k])) message-types))
+
+(def options
+  "The option codes this codec names. Anything else decodes into
+  `:dhcp/unknown-options` rather than being dropped — an option we do not
+  understand is still evidence about what the server said."
+  {1 :subnet-mask 3 :router 6 :dns 12 :host-name 15 :domain-name
+   50 :requested-ip 51 :lease-time 53 :message-type 54 :server-id
+   55 :parameter-request-list 57 :max-message-size 58 :renewal-time
+   59 :rebinding-time 61 :client-id 255 :end})
+(def option-codes (into {} (map (fn [[k v]] [v k])) options))
+
+;; ── byte helpers (portable: seqs of 0..255 ints) ────────────────────────────
+
+(defn- u8 [b i] (bit-and (nth b i) 0xff))
+(defn- u16 [b i] (+ (bit-shift-left (u8 b i) 8) (u8 b (inc i))))
+(defn- u32 [b i]
+  (+ (* (u8 b i) 16777216) (* (u8 b (inc i)) 65536)
+     (* (u8 b (+ i 2)) 256) (u8 b (+ i 3))))
+(defn- ->u32 [n] [(bit-and (bit-shift-right n 24) 0xff)
+                  (bit-and (bit-shift-right n 16) 0xff)
+                  (bit-and (bit-shift-right n 8) 0xff)
+                  (bit-and n 0xff)])
+(defn- ->u16 [n] [(bit-and (bit-shift-right n 8) 0xff) (bit-and n 0xff)])
+
+(defn ipv4->string [quad] (str/join "." quad))
+(defn string->ipv4 [s] (mapv #(#?(:clj Integer/parseInt :cljs js/parseInt) %) (str/split s #"\.")))
+
+;; ── options ────────────────────────────────────────────────────────────────
+
+(defn- decode-options
+  "Walk the option area. Returns `{:options {} :unknown {} }` or an error map.
+
+  A length that would read past the end of the buffer is `:option-overruns` —
+  refused, not clamped. Clamping would let a truncated packet decode into a
+  shorter but plausible option, which is the shape a decoder should never
+  produce from input it did not fully receive."
+  [b start]
+  (let [n (count b)]
+    (loop [i start acc {} unknown {}]
+      (cond
+        (>= i n) {:dhcp/error :missing-end-option}
+        (= 255 (u8 b i)) {:options acc :unknown unknown}
+        (= 0 (u8 b i)) (recur (inc i) acc unknown)      ; pad, RFC 2132 §3.1
+        :else
+        (let [code (u8 b i)]
+          (if (>= (inc i) n)
+            {:dhcp/error :option-truncated}
+            (let [len (u8 b (inc i))
+                  from (+ i 2)
+                  to (+ from len)]
+              (if (> to n)
+                {:dhcp/error :option-overruns}
+                (let [val (subvec (vec b) from to)
+                      k (get options code)]
+                  (recur to
+                         (if k (assoc acc k val) acc)
+                         (if k unknown (assoc unknown code val))))))))))))
+
+(defn- encode-option [code bytes*]
+  (into [code (count bytes*)] bytes*))
+
+;; ── decode ─────────────────────────────────────────────────────────────────
+
+(def decode-errors
+  #{:too-short :bad-magic-cookie :not-a-reply :missing-end-option
+    :option-truncated :option-overruns :no-message-type :unknown-message-type})
+
+(defn decode
+  "Bytes -> message map, or `{:dhcp/error <reason>}`.
+
+  `:dhcp/message-type` is required: a BOOTP reply carrying no DHCP message type
+  is not a DHCP message, and guessing one from context is how a client ends up
+  treating an OFFER as an ACK."
+  [b]
+  (let [n (count b)]
+    (cond
+      (< n min-message-bytes) {:dhcp/error :too-short}
+      (not= magic-cookie (mapv #(u8 b (+ header-bytes %)) (range 4)))
+      {:dhcp/error :bad-magic-cookie}
+      :else
+      (let [opts (decode-options b (+ header-bytes 4))]
+        (if (:dhcp/error opts)
+          opts
+          (let [mt-bytes (get-in opts [:options :message-type])
+                mt (when (seq mt-bytes) (get message-types (first mt-bytes)))]
+            (cond
+              (nil? mt-bytes) {:dhcp/error :no-message-type}
+              (nil? mt) {:dhcp/error :unknown-message-type}
+              :else
+              {:dhcp/op (u8 b 0)
+               :dhcp/htype (u8 b 1)
+               :dhcp/hlen (u8 b 2)
+               :dhcp/xid (u32 b 4)
+               :dhcp/secs (u16 b 8)
+               :dhcp/flags (u16 b 10)
+               :dhcp/ciaddr (mapv #(u8 b (+ 12 %)) (range 4))
+               :dhcp/yiaddr (mapv #(u8 b (+ 16 %)) (range 4))
+               :dhcp/siaddr (mapv #(u8 b (+ 20 %)) (range 4))
+               :dhcp/giaddr (mapv #(u8 b (+ 24 %)) (range 4))
+               :dhcp/chaddr (mapv #(u8 b (+ 28 %)) (range (u8 b 2)))
+               :dhcp/message-type mt
+               :dhcp/options (:options opts)
+               :dhcp/unknown-options (:unknown opts)})))))))
+
+;; ── encode ─────────────────────────────────────────────────────────────────
+
+(defn encode
+  "Message map -> bytes. The caller owns `:xid` and `:chaddr`; this namespace
+  has no randomness and no interface list, and inventing either here would put
+  a source of entropy inside a codec."
+  [{:keys [message-type xid chaddr ciaddr requested-ip server-id
+           parameter-request-list broadcast? secs]
+    :or {ciaddr [0 0 0 0] secs 0 broadcast? true}}]
+  (let [flags (if broadcast? 0x8000 0)
+        chaddr (vec chaddr)
+        head (concat
+              [op-bootrequest htype-ethernet (count chaddr) 0]
+              (->u32 (or xid 0))
+              (->u16 secs)
+              (->u16 flags)
+              ciaddr [0 0 0 0] [0 0 0 0] [0 0 0 0]
+              chaddr (repeat (- 16 (count chaddr)) 0)
+              (repeat 64 0)                       ; sname
+              (repeat 128 0)                      ; file
+              magic-cookie)
+        opts (concat
+              (encode-option (option-codes :message-type)
+                             [(message-type-codes message-type)])
+              (when requested-ip (encode-option (option-codes :requested-ip) requested-ip))
+              (when server-id (encode-option (option-codes :server-id) server-id))
+              (when (seq parameter-request-list)
+                (encode-option (option-codes :parameter-request-list)
+                               (mapv option-codes parameter-request-list)))
+              [(option-codes :end)])]
+    (vec (concat head opts))))
+
+;; ── reading what a server offered ──────────────────────────────────────────
+
+(defn lease
+  "The parts of an OFFER/ACK a client acts on. Returns nil when the message
+  carries no address — an ACK without a yiaddr is not a lease, and returning a
+  map with a nil address would let a caller configure an interface with it."
+  [msg]
+  (let [y (:dhcp/yiaddr msg)
+        o (:dhcp/options msg)]
+    (when (and y (not= [0 0 0 0] y))
+      {:dhcp/address y
+       :dhcp/subnet-mask (:subnet-mask o)
+       :dhcp/router (when-let [r (:router o)] (vec (take 4 r)))
+       :dhcp/dns (when-let [d (:dns o)] (mapv vec (partition 4 d)))
+       :dhcp/server-id (:server-id o)
+       :dhcp/lease-seconds (when-let [l (:lease-time o)] (u32 l 0))
+       :dhcp/renewal-seconds (when-let [t (:renewal-time o)] (u32 t 0))
+       :dhcp/rebinding-seconds (when-let [t (:rebinding-time o)] (u32 t 0))})))

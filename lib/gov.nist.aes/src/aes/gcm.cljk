@@ -1,0 +1,231 @@
+(ns aes.gcm
+  "AES-GCM — [NIST SP 800-38D](https://doi.org/10.6028/NIST.SP.800-38D) — in
+  portable `.cljc`.
+
+  `seal` and `open` mirror `chacha20.aead` exactly, so a caller that holds an
+  AEAD as a value can hold either one. That is the whole reason this file has
+  the shape it has: RFC 9180 names three AEADs, and an HPKE suite should be a
+  parameter rather than a rewrite.
+
+  ## Two places GCM is easy to get wrong, and both are exercised
+
+  **A 96-bit IV is a special case, not the general one.** With twelve bytes,
+  `J0` is the IV with a counter of 1 appended. With any other length, `J0` is
+  a GHASH of the IV — a different code path that almost nothing exercises,
+  because almost every protocol uses twelve bytes. The Wycheproof corpus this
+  is tested against spans IVs from 8 bits to 2056.
+
+  **The counter is 32 bits wide inside a 128-bit block.** It wraps
+  independently of the other twelve bytes, so a long message increments past
+  0xFFFFFFFF and continues from zero without touching the nonce. Incrementing
+  the whole block instead is a change no short message can detect; the corpus
+  flags thirty-six cases as `CounterWrap`.
+
+  ## What authenticates what
+
+  GHASH is not a MAC. It is a keyed hash whose key `H` is `E(K, 0^128)`, and
+  it is only unforgeable because its output is masked by `E(K, J0)`. This
+  matters for one reason a caller can act on: **a nonce reused under one key
+  loses the authentication, not merely the confidentiality.** Two ciphertexts
+  under the same `J0` let an attacker solve for `H`, after which tags can be
+  forged. The stream-cipher failure is the visible one; this is the one that
+  ends the security of the key."
+  (:require [aes.core :as aes]))
+
+(def tag-bytes 16)
+(def key-sizes aes/key-sizes)
+
+(def ^:private zero-block (vec (repeat 16 0)))
+
+;; ── GHASH ────────────────────────────────────────────────────────────────────
+
+(defn- shr1
+  "Shift a 128-bit big-endian value right by one bit."
+  [v]
+  (first
+   (reduce (fn [[out carry] b]
+             [(conj out (bit-or (bit-shift-right b 1) carry))
+              (if (odd? b) 0x80 0)])
+           [[] 0]
+           v)))
+
+(defn block-mul
+  "Multiplication in GF(2^128) with GCM's bit ordering — SP 800-38D §6.3.
+
+  Written as the specification's shift-and-add loop rather than with a
+  precomputed table. A table is four kilobytes per key and, in the usual
+  form, indexed by secret data; the loop is slower and does not have that
+  property. Speed here is bounded by `aes.core` anyway."
+  [x y]
+  (loop [i 0 z zero-block v y]
+    (if (= i 128)
+      z
+      (let [bit (bit-and (bit-shift-right (nth x (quot i 8)) (- 7 (mod i 8))) 1)
+            z (if (= 1 bit) (mapv bit-xor z v) z)
+            lsb (bit-and (nth v 15) 1)
+            v (shr1 v)
+            v (if (= 1 lsb) (update v 0 bit-xor 0xE1) v)]
+        (recur (inc i) z v)))))
+
+(defn- ghash
+  "GHASH_H over a byte sequence whose length is a multiple of 16."
+  [h data]
+  (reduce (fn [y block] (block-mul (mapv bit-xor y block) h))
+          zero-block
+          (map vec (partition 16 data))))
+
+(defn- pad16 [n] (if (zero? (rem n 16)) [] (repeat (- 16 (rem n 16)) 0)))
+
+(defn- u64be
+  "A bit count as eight big-endian bytes.
+
+  Built by repeated division rather than against powers of 256: `256^7` is
+  2^56, which is not an exact ClojureScript integer, and the obvious form
+  would be wrong for lengths no test would reach and right for every length
+  one would."
+  [n]
+  (vec (loop [v n out () k 0]
+         (if (= k 8) out (recur (quot v 256) (conj out (bit-and v 0xFF)) (inc k))))))
+
+;; ── counter mode ─────────────────────────────────────────────────────────────
+
+(defn- inc32
+  "Increment the low 32 bits of a counter block, leaving the other twelve
+  bytes alone."
+  [blk]
+  (loop [i 15 blk blk]
+    (if (< i 12)
+      blk
+      (let [b (inc (nth blk i))]
+        (if (< b 0x100)
+          (assoc blk i b)
+          (recur (dec i) (assoc blk i 0)))))))
+
+(defn- gctr
+  [schedule icb data]
+  (if (empty? data)
+    []
+    (loop [cb icb chunks (partition-all 16 data) out (transient [])]
+      (if-let [c (first chunks)]
+        (let [ks (aes/encrypt-block schedule cb)]
+          (recur (inc32 cb) (next chunks)
+                 (reduce conj! out (map bit-xor c ks))))
+        (persistent! out)))))
+
+;; ── the two entry points ─────────────────────────────────────────────────────
+
+(defn- ->bytes [x] (mapv #(bit-and (int %) 0xFF) (seq x)))
+
+(defn- j0
+  [h iv]
+  (if (= 12 (count iv))
+    (into (vec iv) [0 0 0 1])
+    (ghash h (concat iv (pad16 (count iv)) (u64be 0) (u64be (* 8 (count iv)))))))
+
+(defn- check-params [key iv]
+  (cond
+    (not (contains? key-sizes (count key)))
+    {:status :error :reason :bad-key-length :length (count key)}
+
+    ;; SP 800-38D §5.2.1.1: 1 <= len(IV) <= 2^64 - 1. An empty IV makes J0 a
+    ;; constant, so every message under the key shares a keystream -- it is
+    ;; not a degenerate case to tolerate, it is total loss.
+    (zero? (count iv))
+    {:status :error :reason :empty-iv}))
+
+(defn seal
+  "Encrypt and authenticate. Returns `{:status :ok :bytes (ciphertext ++ tag)}`,
+  with `:ciphertext` and `:tag` also present separately.
+
+  The same shape as `chacha20.aead/seal`, deliberately."
+  [key iv aad pt]
+  (let [key (->bytes key) iv (->bytes iv) aad (->bytes aad) pt (->bytes pt)]
+    (or (check-params key iv)
+        (let [sched (aes/expand-key! key)
+              h (aes/encrypt-block sched zero-block)
+              jj (j0 h iv)
+              ct (gctr sched (inc32 jj) pt)
+              s (ghash h (concat aad (pad16 (count aad))
+                                 ct (pad16 (count ct))
+                                 (u64be (* 8 (count aad))) (u64be (* 8 (count ct)))))
+              tag (mapv bit-xor s (aes/encrypt-block sched jj))]
+          {:status :ok :bytes (into (vec ct) tag) :ciphertext (vec ct) :tag tag}))))
+
+(defn- constant-time=
+  "Compare without an early exit. A tag check that returns as soon as it sees
+  a difference tells an attacker how many leading bytes were right, which is
+  enough to forge one byte at a time."
+  [a b]
+  (and (= (count a) (count b))
+       (zero? (reduce bit-or 0 (map bit-xor a b)))))
+
+(defn open
+  "Verify and decrypt. Returns `{:status :ok :bytes plaintext}` or
+  `{:status :error :reason :authentication-failed}`.
+
+  Nothing is returned before the tag is checked. A `open` that decrypted
+  first and verified afterwards would hand a caller plaintext it must not
+  act on, and callers act on what they are handed."
+  [key iv aad sealed]
+  (let [key (->bytes key) iv (->bytes iv) aad (->bytes aad) sealed (->bytes sealed)]
+    (or (check-params key iv)
+        (if (< (count sealed) tag-bytes)
+          {:status :error :reason :too-short-for-a-tag :length (count sealed)}
+          (let [n (- (count sealed) tag-bytes)
+                ct (subvec sealed 0 n)
+                tag (subvec sealed n)
+                sched (aes/expand-key! key)
+                h (aes/encrypt-block sched zero-block)
+                jj (j0 h iv)
+                s (ghash h (concat aad (pad16 (count aad))
+                                   ct (pad16 (count ct))
+                                   (u64be (* 8 (count aad))) (u64be (* 8 (count ct)))))
+                expected (mapv bit-xor s (aes/encrypt-block sched jj))]
+            (if (constant-time= tag expected)
+              {:status :ok :bytes (vec (gctr sched (inc32 jj) ct))}
+              {:status :error :reason :authentication-failed}))))))
+
+(defn seal!
+  [key iv aad pt]
+  (let [r (seal key iv aad pt)]
+    (if (= :ok (:status r)) (:bytes r)
+        (throw (ex-info (str "aes-gcm: " (name (:reason r))) r)))))
+
+(defn open!
+  [key iv aad sealed]
+  (let [r (open key iv aad sealed)]
+    (if (= :ok (:status r)) (:bytes r)
+        (throw (ex-info (str "aes-gcm: " (name (:reason r))) r)))))
+
+#?(:cljs
+   (do
+     (defn- coerce-bytes [x]
+       (cond
+         (instance? js/Uint8Array x) (vec (array-seq x))
+         (sequential? x) (vec (map #(bit-and (int %) 0xFF) x))
+         :else (throw (ex-info "aes-gcm: expected Uint8Array or sequential bytes" {}))))
+
+     (defn- bytes->u8 [xs]
+       (js/Uint8Array.from (clojure.core/into-array (map #(bit-and (int %) 0xFF) xs))))
+
+     (defn gcm
+       "Noble-compatible factory: `(gcm key nonce)` or `(gcm key nonce aad)` returns
+       `#js {:encrypt fn :decrypt fn}` operating on `Uint8Array` values."
+       [key nonce & [aad]]
+       (let [aad-bytes (when aad (coerce-bytes aad))]
+         #js {:encrypt (fn [pt]
+                         (bytes->u8 (seal! (coerce-bytes key) (coerce-bytes nonce)
+                                           (or aad-bytes []) (coerce-bytes pt))))
+              :decrypt (fn [ct]
+                         (bytes->u8 (open! (coerce-bytes key) (coerce-bytes nonce)
+                                           (or aad-bytes []) (coerce-bytes ct))))}))))
+
+(defn hex [bs]
+  (apply str (map (fn [b] (let [b (bit-and (int b) 0xFF)
+                                s #?(:clj (Integer/toString b 16) :cljs (.toString b 16))]
+                            (if (= 1 (count s)) (str "0" s) s)))
+                  bs)))
+
+(defn unhex [s]
+  (mapv #(#?(:clj Integer/parseInt :cljs js/parseInt) (apply str %) 16)
+        (partition 2 s)))

@@ -1,0 +1,104 @@
+;; RFC 896 Nagle and RFC 1122 delayed ACK, as safe Kotoba.
+;;
+;; The decision core of `tcp.pacing`: may this segment go now, does this ACK go
+;; now, has the delay timer expired, and are the two sides deadlocked. The
+;; sender and receiver maps stay in .cljc.
+;;
+;; Each decision returns ONE code rather than a flag plus a reason. The flag is
+;; derivable from the code -- `send?` is exactly "the reason is one of the
+;; three that permit" -- and returning both would be two derivations that can
+;; disagree. The .cljc returns a map with both because a map is what a caller
+;; there wants; here the caller reconstructs it from the code.
+;;
+;; No shifts, so `:bool` parameters are free (amu#611 refuses the pair, not
+;; either half).
+;;
+;; Checked against `tcp.pacing` in test/tcp/pacing_kotoba_parity_test.cljk.
+
+(ns tcp.pacing-core
+  (:export [clamped-delay may-send-reason may-send?
+            second-full-segment? ack-reason ack-now?
+            tick-expired? deadlock? stall-ms]))
+
+;; RFC 1122 §4.2.3.2: an ACK may be delayed, but not by more than 500 ms. The
+;; RFC's ceiling rather than the customary 200, because exceeding it is a
+;; violation while choosing less is tuning.
+(def max-delay-ms 500)
+
+(def send-nothing-to-send 0)
+(def send-nodelay 1)
+(def send-full-segment 2)
+(def send-nothing-outstanding 3)
+(def send-small-and-unacked-outstanding 4)
+
+(def ack-out-of-order 0)
+(def ack-closing 1)
+(def ack-window-update 2)
+(def ack-second-full-segment 3)
+(def ack-delayed 4)
+
+(defn- imax [a :i64 b :i64] :i64 (if (> a b) a b))
+(defn- imin [a :i64 b :i64] :i64 (if (< a b) a b))
+
+(defn clamped-delay [delay-ms :i64] :i64 (imin delay-ms max-delay-ms))
+
+;; Four ways to be allowed, and the fourth is the one people forget: when
+;; everything sent so far has been acknowledged there is nothing to coalesce
+;; with, so a small segment goes immediately. Without that clause Nagle holds
+;; the FIRST byte of a connection forever.
+(defn may-send-reason
+  [bytes-available :i64 mss :i64 unacked-bytes :i64 nodelay? :bool] :i64
+  (if (= bytes-available 0) send-nothing-to-send
+      (if nodelay? send-nodelay
+          (if (>= bytes-available mss) send-full-segment
+              (if (= unacked-bytes 0) send-nothing-outstanding
+                  send-small-and-unacked-outstanding)))))
+
+(defn may-send? [reason :i64] :bool
+  (or (= reason send-nodelay)
+      (or (= reason send-full-segment) (= reason send-nothing-outstanding))))
+
+;; RFC 1122's "two full-sized segments". Split out because the ABI takes five
+;; parameters and the ordering rule plus this threshold needs six. It is split
+;; rather than pushed onto the caller: a threshold the caller computes is a
+;; second place for the rule to live, and this one is exactly the rule.
+(defn second-full-segment? [len :i64 mss :i64 unacked-before :i64] :bool
+  (and (>= len mss) (>= (+ unacked-before 1) 2)))
+
+;; `in-order?` false is the duplicate ACK that fast retransmit counts, and it
+;; is first for that reason rather than for symmetry: delaying it delays the
+;; third duplicate, and so the retransmission, by the whole delay timer -- on
+;; exactly the path that has just lost a segment.
+(defn ack-reason
+  [second-full? :bool in-order? :bool window-opened? :bool fin? :bool] :i64
+  (if (not in-order?) ack-out-of-order
+      (if fin? ack-closing
+          (if window-opened? ack-window-update
+              (if second-full? ack-second-full-segment ack-delayed)))))
+
+(defn ack-now? [reason :i64] :bool (not (= reason ack-delayed)))
+
+;; The timer starts at the FIRST unacknowledged segment, not the most recent.
+;; Restarting it on each arrival would let a steady trickle of small segments
+;; defer the ACK indefinitely.
+;;
+;; `pending?` carries what the .cljc reads as a non-nil `first-unacked-ms`;
+;; safe Kotoba has no nil, and a sentinel timestamp would be a second thing
+;; that means "no timer" and could disagree with this one.
+(defn tick-expired?
+  [pending? :bool first-unacked-ms :i64 delay-ms :i64 now-ms :i64] :bool
+  (and pending? (>= (- now-ms first-unacked-ms) delay-ms)))
+
+;; The sender is holding a small segment because earlier data is unacknowledged
+;; and the receiver is holding the acknowledgement waiting for more data.
+;; Neither moves until the receiver's timer fires.
+;;
+;; Named so it can be asserted against. Nothing here resolves it by disabling
+;; one side: which one belongs to the application, and a library choosing
+;; silently is how a setting becomes impossible to find.
+(defn deadlock? [send-reason :i64 ack-pending? :bool] :bool
+  (and (= send-reason send-small-and-unacked-outstanding) ack-pending?))
+
+;; Whatever remains of the receiver's timer.
+(defn stall-ms [delay-ms :i64 started-ms :i64 now-ms :i64] :i64
+  (imax 0 (- delay-ms (- now-ms started-ms))))

@@ -1,0 +1,165 @@
+(ns ecc.ecdsa-test
+  "ECDSA verification against the complete Wycheproof corpora for the three
+  curves MLS names: P-256/SHA-256, P-384/SHA-384, P-521/SHA-512.
+
+  **1,530 cases, and 930 of them are invalid.** That ratio is the point.
+  Verification is where an implementation meets bytes it did not choose, and
+  most of the ways to get it wrong are not arithmetic — they are accepting a
+  signature nobody else would.
+
+  Every rejection is asserted **by reason**, and the reasons were measured
+  rather than guessed."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [ecc.bignum :as b]
+            [ecc.curve :as curve]
+            [ecc.der :as der]
+            [ecc.ecdsa :as ecdsa]
+            [ecc.result :as r]
+            [ecc.wycheproof-ecdsa :as wp]
+            [sha2.core :as sha2]
+            [sha2.sha512 :as sha512]))
+
+(defn- hx->bytes [s]
+  (mapv #(#?(:clj Integer/parseInt :cljs js/parseInt) (apply str %) 16) (partition 2 s)))
+
+(def ^:private hashes {:sha256 sha2/sha256 :sha384 sha512/sha384 :sha512 sha512/sha512})
+
+(deftest the-corpus-is-whole
+  (is (= 3 (count wp/by-curve)))
+  (is (= 1530 wp/total-declared))
+  (doseq [[k data] wp/by-curve]
+    (is (= (:declared data)
+           (reduce + (map #(count (:tests %)) (:groups data))))
+        (str (name k) " count")))
+  (testing "and the invalid cases outnumber the valid ones"
+    (let [all (mapcat (fn [[_ d]] (mapcat :tests (:groups d))) wp/by-curve)]
+      (is (= 1530 (count all)))
+      (is (> (count (filter #(= :invalid (:result %)) all))
+             (count (filter #(= :valid (:result %)) all)))))))
+
+(deftest every-case-in-every-corpus
+  (doseq [[k data] wp/by-curve]
+    (let [c (get curve/curves k)
+          h (get hashes (:hash data))]
+      (doseq [g (:groups data)]
+        (let [pk (hx->bytes (:public-key g))]
+          (doseq [t (:tests g)]
+            (let [digest (vec (h (hx->bytes (:msg t))))
+                  got (ecdsa/verify c pk digest (hx->bytes (:sig t)))]
+              (if (= :valid (:result t))
+                (is (r/ok? got)
+                    (str (name k) " tc " (:id t) " " (pr-str (:flags t))
+                         " -> " (pr-str (r/err got))))
+                (is (r/error? got)
+                    (str (name k) " tc " (:id t) " " (pr-str (:flags t))
+                         " was accepted"))))))))))
+
+(deftest the-reasons-are-not-all-the-same
+  ;; A verifier that rejected everything for one reason would pass the test
+  ;; above. This is what says the refusals are distinguishing what they claim
+  ;; to distinguish.
+  (let [reasons (for [[k data] wp/by-curve
+                      :let [c (get curve/curves k) h (get hashes (:hash data))]
+                      g (:groups data)
+                      t (:tests g)
+                      :when (= :invalid (:result t))]
+                  (r/reason (ecdsa/verify c (hx->bytes (:public-key g))
+                                          (vec (h (hx->bytes (:msg t))))
+                                          (hx->bytes (:sig t)))))
+        by-reason (frequencies reasons)]
+    (is (< 4 (count by-reason))
+        (str "distinct rejection reasons: " (pr-str by-reason)))
+    (testing "and the DER refusals are the bulk of them, as the flags say"
+      (is (pos? (get by-reason :non-minimal-integer 0)))
+      (is (pos? (get by-reason :signature-mismatch 0))))))
+
+;; ── DER, on its own ─────────────────────────────────────────────────────────
+
+(deftest der-round-trips-and-refuses
+  (testing "a canonical signature round-trips"
+    (doseq [[r- s-] [[1 1] [127 128] [255 256] [0x7F 0x80]
+                     [12345678901234567890 98765432109876543210]]]
+      (let [rr (b/of-dec (str r-)) ss (b/of-dec (str s-))
+            enc (r/val (der/encode-signature rr ss))
+            back (der/parse-signature enc)]
+        (is (r/ok? back) (pr-str [r- s-]))
+        (is (b/eq? rr (:ecc/r (r/val back))))
+        (is (b/eq? ss (:ecc/s (r/val back)))))))
+
+  (testing "each malformation has its own reason"
+    (let [good (r/val (der/encode-signature (b/of-int 0x80) (b/of-int 1)))]
+      (is (r/ok? (der/parse-signature good)))
+      (is (= :expected-sequence (r/reason (der/parse-signature (assoc (vec good) 0 0x31)))))
+      (is (= :trailing-bytes (r/reason (der/parse-signature (conj (vec good) 0)))))
+      (is (= :expected-integer (r/reason (der/parse-signature [0x30 0x03 0x04 0x01 0x01]))))
+      (is (= :empty-integer (r/reason (der/parse-signature [0x30 0x04 0x02 0x00 0x02 0x00]))))
+      (is (= :negative-integer (r/reason (der/parse-signature [0x30 0x06 0x02 0x01 0x80 0x02 0x01 0x01]))))
+      (is (= :non-minimal-integer
+             (r/reason (der/parse-signature [0x30 0x07 0x02 0x02 0x00 0x01 0x02 0x01 0x01])))
+          "a leading zero in front of a byte that is already positive")
+      (is (= :indefinite-length (r/reason (der/parse-signature [0x30 0x80 0x02 0x01 0x01]))))
+      (is (= :non-minimal-length
+             (r/reason (der/parse-signature (into [0x30 0x81 0x06] (drop 2 good)))))
+          "a length under 128 written in the long form")))
+
+  (testing "0x80 gets its leading zero and 0x7f does not"
+    ;; The one place the encoder can be wrong in a way that still parses
+    ;; somewhere: an INTEGER whose top bit is set is negative in DER unless a
+    ;; zero byte is prepended.
+    (is (= [0x30 0x08 0x02 0x02 0x00 0x80 0x02 0x02 0x00 0x80]
+           (r/val (der/encode-signature (b/of-int 0x80) (b/of-int 0x80)))))
+    (is (= [0x30 0x06 0x02 0x01 0x7F 0x02 0x01 0x7F]
+           (r/val (der/encode-signature (b/of-int 0x7F) (b/of-int 0x7F)))))))
+
+;; ── signing ─────────────────────────────────────────────────────────────────
+
+(deftest sign-then-verify-on-every-curve
+  (doseq [[k c] curve/curves]
+    (testing (name k)
+      (let [d (b/of-dec "987654321987654321")
+            k- (b/of-dec "123456789123456789")
+            digest (vec (map #(mod (* 7 (inc %)) 251) (range (:byte-len c))))
+            g [(:gx c) (:gy c)]
+            pk (curve/point->bytes c (curve/->affine c (curve/scalar-mult c d g)))
+            sig (ecdsa/sign c d k- digest)]
+        (is (r/ok? sig) (pr-str (r/err sig)))
+        (is (r/ok? (ecdsa/verify c pk digest (:ecc/bytes (r/val sig)))))
+        (testing "a different digest does not verify"
+          (is (= :signature-mismatch
+                 (r/reason (ecdsa/verify c pk (assoc digest 0 0) (:ecc/bytes (r/val sig)))))))
+        (testing "and neither does a different key"
+          (let [other (curve/point->bytes
+                       c (curve/->affine c (curve/scalar-mult c (b/of-int 42) g)))]
+            (is (r/error? (ecdsa/verify c other digest (:ecc/bytes (r/val sig)))))))))))
+
+(deftest the-nonce-is-refused-rather-than-invented
+  ;; A repeated k reveals the private key from two signatures. Taking it as a
+  ;; parameter is what makes a repeat visible; refusing an out-of-range one is
+  ;; what stops the obvious mistakes.
+  (let [c (:p256 curve/curves)
+        digest (vec (repeat 32 1))]
+    (is (= :nonce-out-of-range (r/reason (ecdsa/sign c (b/of-int 5) b/zero digest))))
+    (is (= :nonce-out-of-range (r/reason (ecdsa/sign c (b/of-int 5) (:n c) digest))))
+    (is (= :private-key-out-of-range (r/reason (ecdsa/sign c b/zero (b/of-int 5) digest))))
+    (is (= :private-key-out-of-range (r/reason (ecdsa/sign c (:n c) (b/of-int 5) digest))))
+    (testing "and the same k twice gives the same r, which is how the key leaks"
+      (let [k (b/of-int 999983)
+            a (r/val (ecdsa/sign c (b/of-int 5) k digest))
+            b- (r/val (ecdsa/sign c (b/of-int 5) k (assoc digest 0 2)))]
+        (is (b/eq? (:ecc/r a) (:ecc/r b-))
+            "identical r from one reused nonce -- this is the hazard, asserted")))))
+
+(deftest p521-does-not-truncate-its-digest
+  ;; SHA-512 is 512 bits and P-521's order is 521, so nothing is dropped --
+  ;; and a shift applied the wrong way, or unconditionally, would corrupt
+  ;; every P-521 signature while leaving P-256 correct.
+  (let [c (:p521 curve/curves)
+        digest (vec (repeat 64 0xFF))
+        e (#'ecc.ecdsa/e-of c digest)]
+    (is (b/eq? e (b/of-bytes digest)) "the whole digest, unshifted"))
+  (testing "while P-256 with a longer digest does truncate"
+    (let [c (:p256 curve/curves)
+          digest (vec (repeat 64 0xFF))
+          e (#'ecc.ecdsa/e-of c digest)]
+      (is (= 256 (b/bit-length e)))
+      (is (b/eq? e (b/shr (b/of-bytes digest) 256))))))

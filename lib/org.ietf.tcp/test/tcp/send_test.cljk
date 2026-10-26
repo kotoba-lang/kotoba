@@ -1,0 +1,140 @@
+(ns tcp.send-test
+  (:require [tcp.send :as snd]
+            [tcp.congestion :as cc]
+            [tcp.sack :as sack]
+            [tcp.retransmit :as rtx]
+            [tcp.pacing :as pace]
+            [tcp.pmtu :as pmtu]
+            [kotoba.test :refer [deftest is testing]]))
+
+(def mss 1160)  ; 1200 base MTU - 40 header
+
+(defn- ctx [& {:as over}]
+  (merge {:congestion (cc/controller {:mss mss :initial-cwnd 10000})
+          :queue (rtx/queue)
+          :sender (pace/sender {:mss mss})
+          :discoverer (pmtu/discoverer {:link-mtu 1500})
+          :receiver-window 65535
+          :bytes-available 100000
+          :now-ms 0}
+         over))
+
+;; ── the binding limit is reported ────────────────────────────────────────
+
+(deftest a-send-says-what-limited-it
+  (let [d (snd/decide (ctx))]
+    (is (= :send-new (:action d)))
+    (is (= mss (:bytes d)))
+    (is (= :path-mtu (:limited-by d)) "a full window and plenty of data: the packet size binds")))
+
+(deftest the-congestion-window-can-be-the-limit
+  (let [d (snd/decide (ctx :congestion (cc/controller {:mss mss :initial-cwnd 500})))]
+    (is (= 500 (:bytes d)))
+    (is (= :congestion-window (:limited-by d)))
+    (is (= :the-network (snd/why-slow d)))))
+
+(deftest the-receiver-can-be-the-limit
+  (let [d (snd/decide (ctx :receiver-window 300))]
+    (is (= 300 (:bytes d)))
+    (is (= :receiver-window (:limited-by d)))
+    (is (= :the-peer (snd/why-slow d))
+        "tells an operator to look at the application on the other end")))
+
+(deftest the-application-can-be-the-limit
+  (let [d (snd/decide (ctx :bytes-available 50))]
+    (is (= 50 (:bytes d)))
+    (is (= :application-data (:limited-by d)))
+    (is (= :nothing-more-to-send (snd/why-slow d)))))
+
+(deftest a-closed-receiver-window-stops-everything
+  (let [d (snd/decide (ctx :receiver-window 0))]
+    (is (= :wait (:action d)))
+    (is (= :receiver-window (:limited-by d)))))
+
+(deftest with-nothing-to-send-the-answer-is-idle
+  (is (= :idle (snd/why-slow (snd/decide (ctx :bytes-available 0))))))
+
+;; ── flight size is un-SACKed bytes ───────────────────────────────────────
+
+(defn- q-with [& sacked]
+  (let [q (reduce (fn [q i] (rtx/push q {:seq (* i 1000) :len 1000 :now-ms 0}))
+                  (rtx/queue) (range 1 6))]
+    (sack/apply-blocks q (vec sacked))))
+
+(deftest sacked-data-is-not-in-flight
+  (testing "counting it as in flight holds the sender back by exactly what the receiver already has"
+    (let [none (snd/decide (ctx :queue (q-with) :congestion (cc/controller {:mss mss :initial-cwnd 5000})))
+          three (snd/decide (ctx :queue (q-with [2000 3000] [3000 4000] [4000 5000])
+                                 :congestion (cc/controller {:mss mss :initial-cwnd 5000})))]
+      (is (= :wait (:action none)) "5000 bytes out against a 5000 window")
+      (is (= :send-new (:action three))
+          "three segments SACKed means 3000 of those bytes have left the network")
+      (is (= 2000 (sack/pipe (q-with [2000 3000] [3000 4000] [4000 5000])))
+          "two un-SACKed segments are what the window has to cover"))))
+
+(deftest the-raw-queue-size-would-give-the-wrong-answer
+  (testing "the bug no single-namespace test can catch, because both are individually correct"
+    (let [q (q-with [2000 3000] [3000 4000] [4000 5000])
+          raw (reduce + 0 (map :len (rtx/in-flight q)))]
+      (is (= 5000 raw) "what the queue holds")
+      (is (= 2000 (sack/pipe q)) "what is actually in the network")
+      (is (not= raw (sack/pipe q))))))
+
+;; ── precedence ───────────────────────────────────────────────────────────
+
+(deftest a-timed-out-segment-outranks-new-data
+  (let [q (rtx/push (rtx/queue) {:seq 1000 :len 500 :now-ms 0})
+        d (snd/decide (ctx :queue q :rto-ms 100 :now-ms 1000))]
+    (is (= :retransmit (:action d)))
+    (is (= 1000 (:seq (:segment d))))
+    (is (= :recovering (snd/why-slow d)))))
+
+(deftest a-timed-out-segment-goes-even-with-a-collapsed-window
+  (testing "RFC 5681 permits one loss-recovery segment when cwnd has collapsed"
+    (let [q (rtx/push (rtx/queue) {:seq 1000 :len 500 :now-ms 0})
+          d (snd/decide (ctx :queue q :rto-ms 100 :now-ms 1000
+                             :congestion (cc/controller {:mss mss :initial-cwnd 1})))]
+      (is (= :retransmit (:action d))))))
+
+(deftest in-recovery-the-holes-go-before-anything-new
+  (let [q (q-with [2000 3000] [4000 5000])
+        d (snd/decide (ctx :queue q :in-recovery? true :rto-ms 999999))]
+    (is (= :retransmit (:action d)))
+    (is (= 1000 (:seq (:segment d))) "the oldest un-SACKed hole")))
+
+(deftest out-of-recovery-new-data-goes-instead
+  (let [q (q-with [2000 3000] [4000 5000])
+        d (snd/decide (ctx :queue q :in-recovery? false :rto-ms 999999))]
+    (is (= :send-new (:action d)))))
+
+;; ── Nagle in the composition ─────────────────────────────────────────────
+
+(deftest nagle-holds-a-small-write-while-data-is-outstanding
+  (let [q (rtx/push (rtx/queue) {:seq 1000 :len 500 :now-ms 0})
+        d (snd/decide (ctx :queue q :bytes-available 50 :rto-ms 999999))]
+    (is (= :wait (:action d)))
+    (is (= :nagle (:limited-by d)))
+    (is (= :held-for-coalescing (snd/why-slow d)))))
+
+(deftest nagle-lets-the-first-write-out
+  (let [d (snd/decide (ctx :bytes-available 50))]
+    (is (= :send-new (:action d)) "nothing outstanding, so nothing to coalesce with")))
+
+;; ── the path bounds the segment ──────────────────────────────────────────
+
+(deftest a-larger-path-mtu-makes-larger-segments
+  (let [small (snd/decide (ctx))
+        big (snd/decide (ctx :discoverer (-> (pmtu/discoverer {:link-mtu 9000})
+                                             (assoc :tcp.pmtu/current 9000))))]
+    (is (= 1160 (:bytes small)))
+    (is (= 8960 (:bytes big)) "jumbo frames, once a probe has confirmed them")))
+
+(deftest the-peers-mss-option-also-bounds-it
+  (let [d (snd/decide (ctx :peer-mss 512))]
+    (is (= 512 (:bytes d)) "the peer said it does not want more")))
+
+(deftest every-limit-reported-is-declared
+  (doseq [d [(snd/decide (ctx)) (snd/decide (ctx :bytes-available 0))
+             (snd/decide (ctx :receiver-window 0)) (snd/decide (ctx :bytes-available 50))]]
+    (is (contains? snd/limits (:limited-by d)) (str "undeclared: " (:limited-by d)))
+    (is (contains? snd/actions (:action d)))))

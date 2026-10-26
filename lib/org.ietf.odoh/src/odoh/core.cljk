@@ -1,0 +1,216 @@
+(ns odoh.core
+  "Oblivious DNS over HTTPS — [RFC 9230](https://www.rfc-editor.org/rfc/rfc9230)
+  — in portable `.cljc`.
+
+  A client encrypts a DNS query to a **target**'s public key and sends it
+  through a **proxy**. The proxy sees who is asking but not what; the target
+  sees what is asked but not who. Neither alone can link a client to a query,
+  and the guarantee holds exactly as long as the two do not collude.
+
+  This is the crypto and the wire format. The HTTP hop is not here — see
+  \"Not here\" in the README.
+
+  ## The response is not a second encapsulation
+
+  A query is HPKE base mode: `SetupBaseS(pkR, \"odoh query\")`. The **response**
+  is not. The target derives an AEAD key from the *same* HPKE context with
+  `Export`, salted with the query plaintext and a fresh `resp_nonce`, and
+  encrypts with that key directly.
+
+  Two consequences a caller can act on:
+
+  - **the client must keep the query plaintext** to open the response. It is
+    an input to the key derivation, so a client that discarded it after
+    sending has thrown away the ability to read the answer.
+  - **the response is bound to its query.** Not merely to the session — to
+    those exact bytes. A target cannot take a response it prepared for one
+    query and attach it to another.
+
+  ## The `resp_nonce` travels in the `key_id` field
+
+  RFC 9230 §6.1 gives both message types the same structure, and a response
+  has no key to identify — so the field carries the nonce instead. It is
+  `max(Nn, Nk)` bytes, and it is *also* in the AAD, so a proxy that rewrites
+  it breaks the tag rather than silently changing the key derivation."
+  (:require [hpke.core :as hpke]
+            [hpke.dhkem :as dhkem]
+            [hpke.kdf :as kdf]
+            [odoh.wire :as wire]))
+
+(def query-label (kdf/ascii "odoh query"))
+(def response-label (kdf/ascii "odoh response"))
+
+(defn suite-of
+  "The HPKE suite a config names. `nil` when this build cannot run it.
+
+  RFC 9230 §5 says a client MUST ignore a config whose KEM, KDF or AEAD it
+  does not support — so an unknown identifier is a `nil` to skip past, not an
+  error to propagate."
+  [{:keys [kem-id kdf-id aead-id]}]
+  (let [kem (get dhkem/kems kem-id)
+        k (get kdf/kdfs kdf-id)
+        aead (get hpke/aeads aead-id)]
+    (when (and kem k aead (pos? (:nk aead)))
+      (hpke/suite kem k aead))))
+
+(defn key-id
+  "RFC 9230 §6.1: `Expand(Extract(\"\", config), \"odoh key id\", Nh)`.
+
+  Plain HKDF over the encoded `ObliviousDoHConfigContents` — **not** the
+  labeled Extract/Expand that HPKE §4 uses. Reaching for `labeled-extract`
+  here because everything else in the neighbourhood uses it produces an
+  identifier no other implementation computes."
+  [contents]
+  (let [k (get kdf/kdfs (:kdf-id contents))]
+    (if-not k
+      {:status :error :reason :unsupported-kdf :kdf-id (:kdf-id contents)}
+      (let [encoded (wire/encode-config-contents contents)
+            prk (kdf/extract k [] encoded)]
+        {:status :ok :bytes (kdf/expand! k prk (kdf/ascii "odoh key id") (:nh k))}))))
+
+(defn- aad [message-type id]
+  (vec (concat [message-type] (wire/opaque16! id))))
+
+;; ── the client's half ────────────────────────────────────────────────────────
+
+(defn encrypt-query
+  "RFC 9230 §6.2 `encrypt_query_body`, plus the message framing.
+
+  `eph` is the ephemeral key pair — randomness is a capability and this is a
+  leaf. Returns the wire message **and the context and plaintext**, both of
+  which the client needs to open the response.
+
+  A fresh `eph` per query is mandatory, and here it is doubly so: reusing one
+  reuses the HPKE context, and the response key is exported from it."
+  [contents dns-message padding-length eph]
+  (let [s (suite-of contents)]
+    (if-not s
+      {:status :error :reason :unsupported-suite
+       :kem-id (:kem-id contents) :kdf-id (:kdf-id contents) :aead-id (:aead-id contents)}
+      (let [kid (key-id contents)]
+        (if (not= :ok (:status kid))
+          kid
+          (let [q-plain (wire/encode-plaintext dns-message padding-length)
+                setup (hpke/setup-base-sender s (:public-key contents) query-label eph)]
+            (if (not= :ok (:status setup))
+              setup
+              (let [sealed (hpke/seal (:context setup) (aad wire/query-type (:bytes kid)) q-plain)]
+                (if (not= :ok (:status sealed))
+                  sealed
+                  {:status :ok
+                   :bytes (wire/encode-message
+                           {:message-type wire/query-type
+                            :key-id (:bytes kid)
+                            :encrypted-message (vec (concat (:enc setup) (:bytes sealed)))})
+                   :context (:context setup)
+                   :query-plaintext q-plain})))))))))
+
+(defn- derive-response-secrets
+  "RFC 9230 §6.2 `derive_secrets`.
+
+  `secret = Export(\"odoh response\", Nk)`, then an ordinary HKDF over
+  `Q_plain || len(resp_nonce) || resp_nonce` as the **salt** — the export is
+  the keying material and the query is the salt, not the other way round."
+  [s ctx q-plain resp-nonce]
+  (let [k (:kdf s)
+        secret (hpke/export ctx response-label (:nk s))
+        salt (vec (concat q-plain (wire/opaque16! resp-nonce)))
+        prk (kdf/extract k salt secret)]
+    {:key (kdf/expand! k prk (kdf/ascii "odoh key") (:nk s))
+     :nonce (kdf/expand! k prk (kdf/ascii "odoh nonce") (:nn s))}))
+
+(defn decrypt-response
+  "Open a response with the context and plaintext `encrypt-query` returned."
+  [contents ctx q-plain wire-bytes]
+  (let [s (suite-of contents)]
+    (if-not s
+      {:status :error :reason :unsupported-suite}
+      (let [m (wire/decode-message wire-bytes)]
+        (if (not= :ok (:status m))
+          m
+          (let [{:keys [message-type key-id encrypted-message]} (:value m)]
+            (if (not= wire/response-type message-type)
+              {:status :error :reason :not-a-response :message-type message-type}
+              (let [{:keys [key nonce]} (derive-response-secrets s ctx q-plain key-id)
+                    opened ((:open (:aead s)) key nonce
+                            (aad wire/response-type key-id) encrypted-message)]
+                (if (not= :ok (:status opened))
+                  opened
+                  (wire/decode-plaintext (:bytes opened)))))))))))
+
+;; ── the target's half ────────────────────────────────────────────────────────
+
+(defn decrypt-query
+  "RFC 9230 §6.2 `setup_query_context` and `decrypt_query_body`.
+
+  Returns the DNS message **and the context and plaintext**, which the target
+  needs to encrypt its response."
+  [contents kp-r wire-bytes]
+  (let [s (suite-of contents)]
+    (if-not s
+      {:status :error :reason :unsupported-suite}
+      (let [m (wire/decode-message wire-bytes)]
+        (if (not= :ok (:status m))
+          m
+          (let [{:keys [message-type key-id encrypted-message]} (:value m)
+                nenc (:nenc (:kem s))]
+            (cond
+              (not= wire/query-type message-type)
+              {:status :error :reason :not-a-query :message-type message-type}
+
+              (< (count encrypted-message) nenc)
+              {:status :error :reason :encrypted-message-too-short
+               :length (count encrypted-message) :need nenc}
+
+              :else
+              (let [enc (subvec (vec encrypted-message) 0 nenc)
+                    ct (subvec (vec encrypted-message) nenc)
+                    setup (hpke/setup-base-recipient s enc kp-r query-label)]
+                (if (not= :ok (:status setup))
+                  setup
+                  (let [opened (hpke/open (:context setup) (aad wire/query-type key-id) ct)]
+                    (if (not= :ok (:status opened))
+                      opened
+                      (let [p (wire/decode-plaintext (:bytes opened))]
+                        (if (not= :ok (:status p))
+                          p
+                          (assoc p :context (:context setup)
+                                 :query-plaintext (:bytes opened)
+                                 :key-id key-id))))))))))))))
+
+(defn encrypt-response
+  "RFC 9230 §6.2 `encrypt_response_body`, plus the framing.
+
+  `resp-nonce` is a parameter for the same reason `eph` is: randomness is a
+  capability. It must be `max(Nn, Nk)` bytes and fresh per response — it salts
+  the key derivation, so repeating one under the same query repeats the AEAD
+  key and nonce together."
+  [contents ctx q-plain dns-message padding-length resp-nonce]
+  (let [s (suite-of contents)]
+    (if-not s
+      {:status :error :reason :unsupported-suite}
+      (let [want (max (:nn s) (:nk s))]
+        (if (not= want (count resp-nonce))
+          {:status :error :reason :bad-response-nonce-length
+           :length (count resp-nonce) :need want}
+          (let [{:keys [key nonce]} (derive-response-secrets s ctx q-plain resp-nonce)
+                r-plain (wire/encode-plaintext dns-message padding-length)
+                sealed ((:seal (:aead s)) key nonce
+                        (aad wire/response-type resp-nonce) r-plain)]
+            (if (not= :ok (:status sealed))
+              sealed
+              {:status :ok
+               :bytes (wire/encode-message
+                       {:message-type wire/response-type
+                        :key-id resp-nonce
+                        :encrypted-message (:bytes sealed)})})))))))
+
+(defn derive-target-key-pair
+  "The target's key pair from a seed, via the KEM's `DeriveKeyPair`.
+
+  Deterministic in the seed, which is what makes a test vector possible; a
+  real target's seed comes from a capability this leaf does not have."
+  [kem-id seed]
+  (if-let [kem (get dhkem/kems kem-id)]
+    (dhkem/derive-key-pair kem seed)
+    {:status :error :reason :unsupported-kem :kem-id kem-id}))

@@ -224,6 +224,18 @@ The bundled standard libraries live in this repository:
 | `org.ietf.hpke` | `org.ietf.hpke/src` | `hpke.core`, `hpke.dhkem`, `hpke.kdf` (an external specification, publisher ietf.org) |
 | `org.ietf.srtp` | `org.ietf.srtp/src` | `srtp.aes-cm`, `srtp.index`, `srtp.kdf`, `srtp.packet` (an external specification, publisher ietf.org) |
 | `org.ietf.tls` | `org.ietf.tls/src` | `tls.alert`, `tls.cert`, `tls.client`, `tls.codec` (an external specification, publisher ietf.org) |
+| `org.ietf.dhcp` | `org.ietf.dhcp/src` | `dhcp.client`, `dhcp.wire` (an external specification, publisher ietf.org) |
+| `org.ietf.odoh` | `org.ietf.odoh/src` | `odoh.core`, `odoh.wire` (an external specification, publisher ietf.org) |
+| `org.ietf.tcp` | `org.ietf.tcp/src` | `tcp.congestion`, `tcp.options`, `tcp.pacing`, `tcp.pmtu` (an external specification, publisher ietf.org) |
+| `org.ietf.x448` | `org.ietf.x448/src` | `x448.core`, `x448.fp` (an external specification, publisher ietf.org) |
+| `gov.nist.aes` | `gov.nist.aes/src` | `aes.core`, `aes.gcm`, `aes.gcm-siv` (Kotoba project library) |
+| `gov.nist.ecc` | `gov.nist.ecc/src` | `ecc.bignum`, `ecc.curve`, `ecc.der`, `ecc.ecdh` (Kotoba project library) |
+| `kotoba.kotobaseProtocolS3` | `kotoba.kotobaseProtocolS3/src` | `kotobase.protocols.s3` (Kotoba project library) |
+| `kotoba.kotobaseProtocolPinning` | `kotoba.kotobaseProtocolPinning/src` | `kotobase.protocols.ipfs-pinning` (Kotoba project library) |
+| `kotoba.kotobaseProtocolIssues` | `kotoba.kotobaseProtocolIssues/src` | `kotobase.protocols.issue` (Kotoba project library) |
+| `kotoba.kotobaseProtocolIpfs` | `kotoba.kotobaseProtocolIpfs/src` | `kotobase.protocols.ipfs` (Kotoba project library) |
+| `kotoba.kotobaseProtocolGit` | `kotoba.kotobaseProtocolGit/src` | `kotobase.protocols.git` (Kotoba project library) |
+| `kotoba.kotobaseProtocolAtproto` | `kotoba.kotobaseProtocolAtproto/src` | `kotobase.protocols.atproto` (Kotoba project library) |
 | `kotoba.libp2p` | `kotoba.libp2p/src` | `` (Kotoba project library) |
 | `kotoba.kotobaTopology` | `kotoba.kotobaTopology/src` | `` (Kotoba project library) |
 | `kotoba.x402Sdk` | `kotoba.x402Sdk/src` | `` (Kotoba project library) |

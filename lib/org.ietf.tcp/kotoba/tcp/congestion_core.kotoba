@@ -1,0 +1,119 @@
+;; RFC 5681 congestion control arithmetic, as safe Kotoba.
+;;
+;; The decision core of `tcp.congestion`: the window arithmetic, with the
+;; controller map left in .cljc. Every function here is integer-only, takes at
+;; most five scalars, and returns one number. Nothing packs, so nothing shifts,
+;; which is why this object reaches the native ISA and `state_core.kotoba` does
+;; not (kotoba-lang/amu#611 refuses any module holding both a shift and a
+;; `:bool` parameter).
+;;
+;; One rewrite runs through the whole file: `max` and `min` are not in the safe
+;; Kotoba surface -- the frontend has f32-min/f32-max and f64-min/f64-max and
+;; nothing for i64 -- so each is an `if`. That is a rewrite of these calls, not
+;; a definition of max.
+;;
+;; The .cljc treats a missing `bytes-acked` or `flight-size` as "use MSS" and
+;; "use cwnd". Resolving nil is the caller's job here: a scalar ABI has no nil
+;; to resolve, and inventing a sentinel would put a second spelling of the
+;; default in a second place.
+;;
+;; Checked against `tcp.congestion` in test/tcp/congestion_kotoba_parity_test.cljk.
+
+(ns tcp.congestion-core
+  (:export [phase on-ack-cwnd on-ack-state
+            on-dup-ack-cwnd on-dup-ack-ssthresh on-dup-ack-state
+            on-dup-ack-retransmit? on-timeout-ssthresh on-timeout-cwnd
+            loss-window initial-window may-send]))
+
+(def st-slow-start 0)
+(def st-congestion-avoidance 1)
+(def st-fast-recovery 2)
+
+(def dup-ack-threshold 3)
+
+(defn- imax [a :i64 b :i64] :i64 (if (> a b) a b))
+(defn- imin [a :i64 b :i64] :i64 (if (< a b) a b))
+
+;; §3.1: min(4*MSS, max(2*MSS, 4380)).
+(defn initial-window [mss :i64] :i64
+  (imin (* 4 mss) (imax (* 2 mss) 4380)))
+
+;; A timeout restarts from one segment, not from ssthresh.
+(defn loss-window [mss :i64] :i64 mss)
+
+;; Derived rather than stored, so it cannot disagree with the numbers it is
+;; derived from.
+(defn phase [cwnd :i64 ssthresh :i64 state :i64] :i64
+  (if (= state st-fast-recovery) st-fast-recovery
+      (if (< cwnd ssthresh) st-slow-start st-congestion-avoidance)))
+
+;; §3.2 step 6 for fast recovery: deflate to what the halving decided, not to
+;; what the inflation grew it to. Otherwise slow start adds one segment per
+;; acknowledged segment and congestion avoidance adds MSS^2/cwnd per ACK.
+(defn on-ack-cwnd
+  [state :i64 cwnd :i64 ssthresh :i64 mss :i64 bytes-acked :i64] :i64
+  (if (= state st-fast-recovery) ssthresh
+      (if (< cwnd ssthresh)
+        (+ cwnd (imin bytes-acked mss))
+        (+ cwnd (imax 1 (quot (* mss mss) cwnd))))))
+
+(defn on-ack-state [state :i64 cwnd :i64 ssthresh :i64] :i64
+  (if (= state st-fast-recovery) st-congestion-avoidance
+      (if (< cwnd ssthresh) st-slow-start st-congestion-avoidance)))
+
+;; The halved window, floored at two segments. Shared by fast retransmit and
+;; timeout because §3.1 and §3.2 specify the same value; one definition so the
+;; two cannot drift.
+(defn- halved [flight-size :i64 mss :i64] :i64
+  (imax (quot flight-size 2) (* 2 mss)))
+
+;; Below the threshold a duplicate only counts. At the threshold cwnd becomes
+;; ssthresh + 3*MSS, the three standing for the segments that have left the
+;; network -- which is what the duplicates told us. Past it, one more segment
+;; per duplicate, for the same reason.
+(defn on-dup-ack-cwnd
+  [state :i64 cwnd :i64 mss :i64 n :i64 flight-size :i64] :i64
+  (if (= state st-fast-recovery) (+ cwnd mss)
+      (if (< n dup-ack-threshold) cwnd
+          (+ (halved flight-size mss) (* dup-ack-threshold mss)))))
+
+(defn on-dup-ack-ssthresh
+  [state :i64 ssthresh :i64 mss :i64 n :i64 flight-size :i64] :i64
+  (if (= state st-fast-recovery) ssthresh
+      (if (< n dup-ack-threshold) ssthresh
+          (halved flight-size mss))))
+
+(defn on-dup-ack-state [state :i64 n :i64] :i64
+  (if (= state st-fast-recovery) st-fast-recovery
+      (if (< n dup-ack-threshold) state st-fast-recovery)))
+
+;; So a caller knows to resend without comparing counters itself.
+;;
+;; `>=` rather than `=`, which is not what the .cljc's docstring says and is
+;; what its code does. In a real sequence the two never differ: reaching the
+;; threshold moves the state to fast-recovery, so a fourth duplicate arrives
+;; with the state already changed and takes the inflate branch instead. The
+;; parity suite reaches the difference only because it constructs a controller
+;; with three duplicates already counted and the state still slow-start, which
+;; no sequence of calls produces.
+;;
+;; Matching the oracle rather than the docstring is deliberate. The alternative
+;; is an object that agrees with tcp.congestion on every input the machine can
+;; reach and disagrees on the ones it cannot, which is exactly the kind of
+;; difference that survives a test suite and surfaces once someone rebuilds
+;; state from a checkpoint.
+(defn on-dup-ack-retransmit? [state :i64 n :i64] :bool
+  (and (not (= state st-fast-recovery)) (>= n dup-ack-threshold)))
+
+;; §3.1: ssthresh halves as it does for a fast retransmit, but cwnd goes to one
+;; segment. A timeout means the receiver stopped hearing anything, which is
+;; stronger evidence than duplicates.
+(defn on-timeout-ssthresh [mss :i64 flight-size :i64] :i64
+  (halved flight-size mss))
+
+(defn on-timeout-cwnd [mss :i64] :i64 (loss-window mss))
+
+;; What the network will take. The receiver's advertised window is the other
+;; limit and belongs to the caller.
+(defn may-send [cwnd :i64 flight-size :i64] :i64
+  (imax 0 (- cwnd flight-size)))

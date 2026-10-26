@@ -1,0 +1,110 @@
+;; The send scheduler's decision, as safe Kotoba.
+;;
+;; The decision core of `tcp.send`, and the first object here with more than
+;; one dependency: it calls `tcp.pmtu-core`, `tcp.pacing-core` and
+;; `tcp.congestion-core`. Nothing is restated -- the effective MSS is pmtu's
+;; answer bounded by the peer's, the window room is congestion's, and the small
+;; segment question is Nagle's.
+;;
+;; Three facts come from the caller because they are properties of collections
+;; the .cljc owns: how much is really in flight, whether a timer has fired, and
+;; whether recovery has holes to fill. Each is a fold over the retransmission
+;; queue.
+;;
+;; The flight size is the one worth naming. It is `tcp.sack/pipe` -- bytes sent
+;; minus bytes SACKed -- and NOT the queue's byte count. SACKed data has left
+;; the network and the receiver has said so; counting it as still in flight
+;; under-sends for the rest of the recovery. That mistake is invisible to
+;; either namespace's own tests, because neither of them composes the two.
+;;
+;; Checked against `tcp.send` in test/tcp/send_kotoba_parity_test.cljk.
+
+(ns tcp.send-core
+  (:require [tcp.pmtu-core :as pmtu]
+            [tcp.pacing-core :as pace]
+            [tcp.congestion-core :as cc])
+  (:export [effective-mss rwnd-room room binding-code
+            action-code send-bytes limited-by-code
+            nagle-reason nagle-permits?]))
+
+(def act-send-new 0)
+(def act-retransmit 1)
+(def act-wait 2)
+
+(def by-congestion-window 0)
+(def by-receiver-window 1)
+(def by-path-mtu 2)
+(def by-application-data 3)
+(def by-nagle 4)
+(def by-nothing-to-send 5)
+(def by-retransmission 6)
+
+(defn- imax [a :i64 b :i64] :i64 (if (> a b) a b))
+(defn- imin [a :i64 b :i64] :i64 (if (< a b) a b))
+
+;; The peer's MSS option is an upper bound on what it wants; the path is an
+;; upper bound on what will arrive. Both apply.
+(defn effective-mss [current-mtu :i64 header-bytes :i64 peer-mss :i64] :i64
+  (imin (pmtu/mss-for current-mtu header-bytes) peer-mss))
+
+;; Never negative: more in flight than the receiver advertised means no room,
+;; not negative room.
+(defn rwnd-room [receiver-window :i64 flight :i64] :i64
+  (imax 0 (- receiver-window flight)))
+
+(defn room [cwnd :i64 flight :i64 receiver-window :i64] :i64
+  (imin (cc/may-send cwnd flight) (rwnd-room receiver-window flight)))
+
+;; Which limit is doing the binding, for an operator asking why a connection is
+;; not going faster.
+(defn binding-code [cwnd-room :i64 rwnd :i64 mss :i64] :i64
+  (if (and (<= cwnd-room rwnd) (< cwnd-room mss)) by-congestion-window
+      (if (< rwnd mss) by-receiver-window by-path-mtu)))
+
+;; The order is the decision.
+;;
+;; A fired timer outranks everything including the congestion window, because
+;; RFC 5681 permits one loss-recovery segment when cwnd has collapsed to it.
+;; Then RFC 6675's named holes, before anything new. Only after both does new
+;; data get considered.
+;;
+;; `recovery-holes?` is the caller's conjunction of "in recovery" and "the
+;; queue has un-SACKed entries" -- both folds over the queue, and neither a
+;; decision.
+(defn action-code
+  [timed-out? :bool recovery-holes? :bool
+   room :i64 mss :i64 bytes-available :i64] :i64
+  (if timed-out? act-retransmit
+      (if recovery-holes?
+        (if (>= room mss) act-retransmit act-wait)
+        (if (= bytes-available 0) act-wait
+            (if (= room 0) act-wait act-send-new)))))
+
+;; `action-code` answers the scheduler's question and stops there. Nagle is a
+;; separate call -- `pacing-core/may-send-reason` on the size this returns --
+;; because it is a question about a size that does not exist until the
+;; scheduler has picked one. A caller that gets `send-new` asks Nagle next and
+;; may still end up waiting.
+(defn send-bytes [bytes-available :i64 room :i64 mss :i64] :i64
+  (imin bytes-available (imin room mss)))
+
+;; Re-exported rather than left to the caller to fetch from pacing-core. Only
+;; a project ROOT's exports are reachable through a compiled artifact, so a
+;; caller holding this object and needing the Nagle step would otherwise have
+;; to hold a second artifact rooted at pacing-core -- and then the two could be
+;; built from different sources. The delegation is one line; the alternative is
+;; a versioning problem.
+(defn nagle-reason
+  [bytes :i64 mss :i64 flight :i64 nodelay? :bool] :i64
+  (pace/may-send-reason bytes mss flight nodelay?))
+
+(defn nagle-permits? [reason :i64] :bool (pace/may-send? reason))
+
+;; Reported for a send, and the order matters: the application having nothing
+;; more to give is a different answer from the path being full, even when the
+;; two numbers coincide.
+(defn limited-by-code
+  [n :i64 bytes-available :i64 mss :i64 cwnd-room :i64] :i64
+  (if (= n bytes-available) by-application-data
+      (if (= n mss) by-path-mtu
+          (if (= n cwnd-room) by-congestion-window by-receiver-window))))

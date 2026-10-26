@@ -1,0 +1,168 @@
+(ns kotobase.protocols.ipfs-pinning-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotobase.local :as local]
+            [kotobase.protocols.blocks :as blocks]
+            [kotobase.protocols.ipfs-pinning :as pinning]
+            [kotobase.protocols.json :as json]
+            [kotobase.store :as st]))
+
+(def cid "bafyreigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi")
+(def missing-cid "bafyreidoesnotexistanywhereatall0000000000000000000000000")
+
+(defn- ctx [] {:store (local/local-store) :now "2026-07-17T00:00:00Z"})
+
+(defn- create! [c body]
+  (pinning/handle c {:method :post :path "/pins" :body (json/encode body)}))
+
+(deftest create-pin-for-existing-block-succeeds
+  (let [{:keys [store] :as c} (ctx)]
+    (blocks/put-block! store cid {:bytes "hello" :content-type "text/plain"})
+    (let [res (create! c {"cid" cid "name" "my-pin" "origins" ["/ip4/1.2.3.4/tcp/4001"]})
+          body (json/parse (:body res))]
+      (is (= 202 (:status res)))
+      (is (= "pinned" (get body "status")))
+      (is (string? (get body "requestid")))
+      (is (= cid (get-in body ["pin" "cid"])))
+      (is (= "my-pin" (get-in body ["pin" "name"])))
+      (is (= ["/ip4/1.2.3.4/tcp/4001"] (get-in body ["pin" "origins"])))
+      (is (nil? (get body "info")) "no failure info on a successful pin"))))
+
+(deftest create-pin-for-missing-block-fails-with-a-reason
+  (let [c (ctx)
+        res (create! c {"cid" missing-cid})
+        body (json/parse (:body res))]
+    (is (= 202 (:status res))
+        "the HTTP request to create a PIN REQUEST still succeeds — it's the
+        pin's status, not the API call, that fails")
+    (is (= "failed" (get body "status")))
+    (is (string? (get-in body ["info" "reason"])))
+    (is (not= "queued" (get body "status"))
+        "v0.1 has no daemon, so a missing block must never be reported as queued")))
+
+(deftest create-pin-requires-cid
+  (let [c (ctx)
+        res (create! c {"name" "no-cid-here"})]
+    (is (= 400 (:status res)))
+    (is (= "cid is required" (get (json/parse (:body res)) "error")))))
+
+(deftest get-pin-by-id
+  (let [{:keys [store] :as c} (ctx)]
+    (blocks/put-block! store cid {:bytes "hello" :content-type "text/plain"})
+    (let [requestid (get (json/parse (:body (create! c {"cid" cid}))) "requestid")
+          res (pinning/handle c {:method :get :path (str "/pins/" requestid)})]
+      (is (= 200 (:status res)))
+      (is (= requestid (get (json/parse (:body res)) "requestid"))))
+    (testing "unknown id → 404"
+      (let [res (pinning/handle c {:method :get :path "/pins/does-not-exist"})]
+        (is (= 404 (:status res)))))))
+
+(deftest list-pins-with-cid-and-status-filters
+  (let [{:keys [store] :as c} (ctx)]
+    (blocks/put-block! store cid {:bytes "hello" :content-type "text/plain"})
+    (create! c {"cid" cid})
+    (create! c {"cid" cid})
+    (create! c {"cid" missing-cid})
+    (testing "unfiltered list sees all three"
+      (let [res (pinning/handle c {:method :get :path "/pins"})
+            body (json/parse (:body res))]
+        (is (= 200 (:status res)))
+        (is (= 3 (get body "count")))
+        (is (= 3 (count (get body "results"))))))
+    (testing "cid= filter"
+      (let [body (json/parse (:body (pinning/handle c {:method :get :path "/pins"
+                                                        :query {"cid" cid}})))]
+        (is (= 2 (get body "count")))
+        (is (every? #(= cid (get-in % ["pin" "cid"])) (get body "results")))))
+    (testing "status= filter"
+      (let [body (json/parse (:body (pinning/handle c {:method :get :path "/pins"
+                                                        :query {"status" "failed"}})))]
+        (is (= 1 (get body "count")))
+        (is (= missing-cid (get-in (first (get body "results")) ["pin" "cid"])))))
+    (testing "combined cid= and status= filter narrows to zero"
+      (let [body (json/parse (:body (pinning/handle c {:method :get :path "/pins"
+                                                        :query {"cid" cid "status" "failed"}})))]
+        (is (= 0 (get body "count")))))))
+
+(deftest delete-pin-request-leaves-block-intact
+  (let [{:keys [store] :as c} (ctx)]
+    (blocks/put-block! store cid {:bytes "hello" :content-type "text/plain"})
+    (let [requestid (get (json/parse (:body (create! c {"cid" cid}))) "requestid")]
+      (is (= 202 (:status (pinning/handle c {:method :delete :path (str "/pins/" requestid)}))))
+      (testing "GET after DELETE is 404"
+        (is (= 404 (:status (pinning/handle c {:method :get :path (str "/pins/" requestid)})))))
+      (testing "the underlying block is untouched — pins and blocks are different lifecycles"
+        (is (some? (blocks/get-block store cid))))
+      (testing "DELETE of an unknown/already-deleted request id is 404"
+        (is (= 404 (:status (pinning/handle c {:method :delete :path (str "/pins/" requestid)}))))))))
+
+(deftest two-pins-of-the-same-cid-at-the-same-instant-get-distinct-ids
+  (let [{:keys [store] :as c} (ctx)]
+    (blocks/put-block! store cid {:bytes "hello" :content-type "text/plain"})
+    (let [id1 (get (json/parse (:body (create! c {"cid" cid}))) "requestid")
+          id2 (get (json/parse (:body (create! c {"cid" cid}))) "requestid")]
+      (is (not= id1 id2)))))
+
+(deftest audit-trail
+  (let [{:keys [store] :as c} (ctx)]
+    (blocks/put-block! store cid {:bytes "hello" :content-type "text/plain"})
+    (let [requestid (get (json/parse (:body (create! c {"cid" cid}))) "requestid")]
+      (pinning/handle c {:method :delete :path (str "/pins/" requestid)})
+      (let [events (->> (st/-read store :kotobase.protocols/audit 0)
+                        (filter #(= :ipfs-pinning (:surface %))))]
+        (is (= [:create-pin :delete-pin] (map :op events)))
+        (is (every? #(= cid (:cid %)) events))))))
+
+(deftest malformed-body-and-wrong-method
+  (let [c (ctx)]
+    (testing "malformed JSON body → 400"
+      (is (= 400 (:status (pinning/handle c {:method :post :path "/pins" :body "{oops"})))))
+    (testing "PUT /pins is not a defined method"
+      (is (= 405 (:status (pinning/handle c {:method :put :path "/pins"})))))
+    (testing "unrelated path → 404"
+      (is (= 404 (:status (pinning/handle c {:method :get :path "/not-pins"})))))))
+
+(deftest advertise-hook-fires-once-per-cid-and-removes-on-last-delete
+  (let [seen (atom [])
+        {:keys [store] :as base} (ctx)
+        c (assoc base :advertise (fn [event] (swap! seen conj event) {:ok? true}))]
+    (blocks/put-block! store cid {:bytes "hello" :content-type "text/plain"})
+    (let [id1 (get (json/parse (:body (create! c {"cid" cid}))) "requestid")
+          id2 (get (json/parse (:body (create! c {"cid" cid}))) "requestid")]
+      (is (= 1 (count @seen)) "second pin of the same CID does not re-announce")
+      (is (= cid (:cid (first @seen))))
+      (is (= :advertise (:op (first @seen))))
+      (is (false? (:mutates-cid? (first @seen))))
+      (is (= id1 (:context-id (first @seen))))
+      (testing "failed pin never advertises"
+        (create! c {"cid" missing-cid})
+        (is (= 1 (count @seen))))
+      (testing "deleting one of two pinned requests is not IsRm"
+        (is (= 202 (:status (pinning/handle c {:method :delete :path (str "/pins/" id1)}))))
+        (is (= 1 (count @seen))))
+      (testing "deleting the last pinned request is :remove of the content CID"
+        (is (= 202 (:status (pinning/handle c {:method :delete :path (str "/pins/" id2)}))))
+        (is (= 2 (count @seen)))
+        (is (= {:cid cid :op :remove :requestid id2 :context-id id2 :mutates-cid? false}
+               (second @seen))))
+      (testing "the block is still there — advertise is discovery, not storage"
+        (is (some? (blocks/get-block store cid)))))))
+
+(deftest missing-advertise-hook-does-not-fail-pin
+  (let [{:keys [store] :as c} (ctx)]
+    (blocks/put-block! store cid {:bytes "hello" :content-type "text/plain"})
+    (let [res (create! c {"cid" cid})]
+      (is (= 202 (:status res)))
+      (is (= "pinned" (get (json/parse (:body res)) "status"))))))
+
+(deftest advertise-hook-failure-does-not-un-pin
+  (let [{:keys [store] :as base} (ctx)
+        c (assoc base :advertise (fn [_] (throw (ex-info "indexer down" {}))))]
+    (blocks/put-block! store cid {:bytes "hello" :content-type "text/plain"})
+    (let [res (create! c {"cid" cid})
+          body (json/parse (:body res))]
+      (is (= 202 (:status res)))
+      (is (= "pinned" (get body "status")))
+      (let [events (->> (st/-read store :kotobase.protocols/audit 0)
+                        (filter #(= :advertise-error (:op %))))]
+        (is (= 1 (count events)))
+        (is (= cid (:cid (first events))))))))

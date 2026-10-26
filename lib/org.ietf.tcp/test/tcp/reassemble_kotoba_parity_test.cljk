@@ -1,0 +1,165 @@
+;; `kotoba/tcp/reassemble_core.kotoba` against `tcp.reassemble`.
+;;
+;; This namespace has gone wrong twice, and neither mistake announced itself.
+;;
+;; `-seq` is a forward distance and cannot be negative, so asking it how far
+;; `at` is from a segment that begins after `at` returns nearly 2^32. Read as a
+;; byte count that means "drop the whole segment", and every out-of-order
+;; arrival is silently discarded -- the entire case the namespace exists for.
+;; The connection still works; it just stops recovering from reordering, and
+;; the sender pays for it in retransmissions nobody attributes here.
+;;
+;; The queue bound was charged against arrivals rather than against what stays
+;; held. In-order data is delivered immediately and never occupies the queue,
+;; so a large perfectly-ordered segment was refused for exhausting a queue it
+;; was never going to enter.
+;;
+;; The inputs below straddle the wrap deliberately: 2^32-10 with a length that
+;; carries it past zero is the shape that produced the first bug, and a
+;; uniform sample of a 2^32 space never lands there.
+
+(ns tcp.reassemble-kotoba-parity-test
+  (:require [kotoba.io :as io]
+            [kotoba.test :refer [deftest is]]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]
+            [tcp.seq :as s]
+            [tcp.reassemble :as ra]))
+
+(def ^:private source-file
+  (io/file (System/getProperty "user.dir") "kotoba" "tcp" "reassemble_core.kotoba"))
+
+(def ^:private dep-file
+  (io/file (System/getProperty "user.dir") "kotoba" "tcp" "seq_core.kotoba"))
+
+(defn- source-available? []
+  (let [present? (and (io/exists? source-file) (io/exists? dep-file))]
+    (is present? (str "kotoba objects not found: " source-file " / " dep-file))
+    present?))
+
+(def ^:private kir
+  (delay (:kir (compiler/compile-project
+                {'tcp.seq-core (slurp dep-file)
+                 'tcp.reassemble-core (slurp source-file)}
+                'tcp.reassemble-core :wasm32-kotoba-v1 {}))))
+
+(defn- call [f & args] (ir/execute @kir f (vec args)))
+
+;; The private range arithmetic is what the object holds, so the test reaches
+;; it by var rather than restating it.
+(def ^:private cljc-seg-end (var-get #'tcp.reassemble/seg-end))
+(def ^:private cljc-trim-front (var-get #'tcp.reassemble/trim-front))
+(def ^:private cljc-overlaps? (var-get #'tcp.reassemble/overlaps?))
+(def ^:private cljc-subtract-held (var-get #'tcp.reassemble/subtract-held))
+
+(defn- sg [seq* len] {:seq seq* :data (vec (repeat len 0))})
+
+;; Around zero and around the wrap, where the forward-distance bug lives.
+(def ^:private points [0 1 100 1000 2147483647 2147483648 4294967286 4294967295])
+(def ^:private lens [0 1 10 100])
+
+(deftest kotoba-objects-are-present
+  (source-available?))
+
+(deftest seg-end-agrees
+  (when (source-available?)
+    (doseq [p points, len lens]
+      (is (= (cljc-seg-end (sg p len)) (call 'seg-end p len))
+          (str "seg-end " p " len " len)))))
+
+(deftest duplicate-agrees
+  (when (source-available?)
+    (doseq [p points, len (rest lens), rcv-nxt points]
+      (let [r (ra/reassembler {:rcv-nxt rcv-nxt})
+            {:keys [dropped]} (ra/accept r (sg p len))]
+        (is (= (= :duplicate dropped)
+               ;; the .cljc reports :duplicate for two distinct situations --
+               ;; wholly below rcv-nxt, and nothing new after subtracting what
+               ;; is held. With an empty queue only the first can occur.
+               (call 'duplicate? p len rcv-nxt))
+            (str "duplicate? seq " p " len " len " rcv-nxt " rcv-nxt))))))
+
+(deftest trim-agrees
+  (when (source-available?)
+    (doseq [at points, p points, len (rest lens)]
+      (let [trimmed (cljc-trim-front (sg p len) at)]
+        (is (= (nil? trimmed) (call 'trimmed-away? at p len))
+            (str "trimmed-away? at " at " seq " p " len " len))
+        (when trimmed
+          ;; the skip is the difference between what went in and what came out
+          (is (= (- len (count (:data trimmed))) (call 'trim-skip at p))
+              (str "trim-skip at " at " seq " p " len " len
+                   " -- a segment starting AFTER `at` must skip nothing; a "
+                   "forward distance there is nearly 2^32")))))))
+
+(deftest overlaps-agrees
+  (when (source-available?)
+    (doseq [a points, alen (rest lens), b points, blen (rest lens)]
+      (is (= (cljc-overlaps? (sg a alen) (sg b blen))
+             (call 'overlaps? a alen b blen))
+          (str "overlaps? [" a "+" alen ") [" b "+" blen ")")))))
+
+(deftest prefix-len-agrees
+  (when (source-available?)
+    ;; The .cljc computes the prefix inline inside `subtract-held`, so the
+    ;; oracle is what that function leaves in front of a held range. Without
+    ;; this deftest, removing the bounds check from prefix-len left every
+    ;; assertion in this suite green -- the export was never called.
+    (doseq [p [1000 4294967286]
+            plen [1 10 100]
+            offset [-5 0 1 (quot plen 2) plen (inc plen)]
+            :let [h-seq (s/+seq p offset)
+                  pieces (cljc-subtract-held (sg p plen) [(sg h-seq 4)])
+                  ;; a surviving piece that starts where the arrival did is the
+                  ;; prefix; anything else means there was none.
+                  pre (first (filter #(= (s/wrap (:seq %)) (s/wrap p)) pieces))
+                  expected (if (and pre (not= (count (:data pre)) plen))
+                             (count (:data pre))
+                             0)]]
+      (is (= expected (call 'prefix-len h-seq p plen))
+          (str "prefix-len held " h-seq " piece [" p "+" plen ")"
+               " -- a held range at or before the piece leaves no prefix, and "
+               "one at or after its end leaves the piece whole")))))
+
+(deftest contiguous-and-order-key-agree
+  (when (source-available?)
+    (doseq [p points, at points]
+      (is (= (= (s/wrap p) (s/wrap at)) (call 'contiguous? p at))
+          (str "contiguous? " p " " at))
+      (is (= (s/-seq p at) (call 'held-order-key p at))
+          (str "held-order-key " p " rcv-nxt " at
+               " -- ordering by raw sequence number sorts backwards across "
+               "the wrap")))))
+
+(deftest queue-bound-is-on-what-stays-held
+  (when (source-available?)
+    ;; A large, perfectly in-order segment must NOT be refused: it is delivered
+    ;; and never enters the queue. Charging arrivals rejects it.
+    (doseq [max-bytes [100 65535]
+            len [max-bytes (inc max-bytes) (* 2 max-bytes)]]
+      (let [r (ra/reassembler {:rcv-nxt 1000 :max-bytes max-bytes})
+            {:keys [dropped delivered]} (ra/accept r (sg 1000 len))]
+        (is (nil? dropped)
+            (str "in-order segment of " len " with max " max-bytes
+                 " must not be refused -- it never occupies the queue"))
+        (is (= len (count delivered)) "all of it is delivered")
+        (is (false? (call 'queue-full? 0 max-bytes))
+            "nothing held means the queue is not full")))
+    ;; And out-of-order data beyond the bound must be refused whole.
+    (doseq [max-bytes [100 65535]]
+      (let [r (ra/reassembler {:rcv-nxt 1000 :max-bytes max-bytes})
+            {:keys [dropped]} (ra/accept r (sg 2000 (inc max-bytes)))]
+        (is (= :queue-full dropped)
+            (str "out-of-order " (inc max-bytes) " with max " max-bytes))
+        (is (true? (call 'queue-full? (inc max-bytes) max-bytes))
+            "held above the bound is full")
+        ;; Exactly at the bound is NOT full. Without this the `>` could be a
+        ;; `>=` and nothing in this suite would notice.
+        (is (false? (call 'queue-full? max-bytes max-bytes))
+            "exactly at the bound is not full")))
+    (doseq [max-bytes [100 65535]]
+      (let [r (ra/reassembler {:rcv-nxt 1000 :max-bytes max-bytes})
+            {:keys [dropped]} (ra/accept r (sg 2000 max-bytes))]
+        (is (nil? dropped)
+            (str "out-of-order of exactly " max-bytes " with max " max-bytes
+                 " fits -- the bound is a maximum, not a limit one below"))))))

@@ -1,0 +1,200 @@
+(ns dhcp.client
+  "RFC 2131 §4.4 client state machine, as a pure step function.
+
+  `step` takes the current state and one event and returns the next state plus
+  the packets to send and the timers to arm. It never sends anything itself and
+  never reads a clock: the caller passes `:now-ms` on every event, which is what
+  makes lease expiry testable without waiting out a lease.
+
+  ## The states, and what each one is afraid of
+
+      :init -> :selecting -> :requesting -> :bound -> :renewing -> :rebinding
+                                                          |            |
+                                                          +-- :bound <-+
+
+  `:selecting` collects OFFERs. `:requesting` has committed to one and is
+  waiting for the ACK that makes it real. `:bound` holds a lease with two
+  alarms on it: T1 (renew, to the server that granted it) and T2 (rebind,
+  broadcast to anyone). Past the lease end the address is **given up** — the
+  client returns to `:init` and stops using the address, because a lease that
+  expired is an address someone else may now hold.
+
+  ## What it refuses
+
+  A reply whose `xid` is not the one this client sent is discarded
+  (`:foreign-xid`). Without that check any broadcast on the segment can move a
+  client's state machine, which on a shared LAN is every DHCP conversation
+  happening near it.
+
+  A NAK returns to `:init` and drops the lease, in every state that can receive
+  one. The alternative — keeping the address after being told it is not ours —
+  is the case where two hosts hold the same address and neither knows."
+  (:require [dhcp.wire :as wire]))
+
+(def states #{:init :selecting :requesting :bound :renewing :rebinding})
+
+(def default-config
+  "RFC 2131 §4.1 retransmission: 4 s, doubled each time, capped at 64 s, with
+  randomisation the caller applies (this namespace has no randomness). T1/T2
+  default to 0.5 and 0.875 of the lease when the server names neither."
+  {:initial-backoff-ms 4000
+   :max-backoff-ms 64000
+   :t1-fraction 0.5
+   :t2-fraction 0.875
+   :max-discover-attempts 6})
+
+(defn init
+  "A client that has an interface and nothing else."
+  [{:keys [chaddr xid]}]
+  {:dhcp/state :init
+   :dhcp/chaddr (vec chaddr)
+   :dhcp/xid xid
+   :dhcp/offers []
+   :dhcp/backoff-ms (:initial-backoff-ms default-config)
+   :dhcp/attempts 0})
+
+(defn- backoff [config ms]
+  (min (* 2 (or ms (:initial-backoff-ms config))) (:max-backoff-ms config)))
+
+(defn- discover-packet [st]
+  (wire/encode {:message-type :discover
+                :xid (:dhcp/xid st)
+                :chaddr (:dhcp/chaddr st)
+                :parameter-request-list [:subnet-mask :router :dns :domain-name
+                                         :lease-time :renewal-time :rebinding-time]}))
+
+(defn- request-packet [st lease & {:keys [unicast?] :or {unicast? false}}]
+  (wire/encode {:message-type :request
+                :xid (:dhcp/xid st)
+                :chaddr (:dhcp/chaddr st)
+                :ciaddr (if unicast? (:dhcp/address lease) [0 0 0 0])
+                :requested-ip (when-not unicast? (:dhcp/address lease))
+                :server-id (when-not unicast? (:dhcp/server-id lease))
+                :broadcast? (not unicast?)}))
+
+(defn- t1-ms [lease config]
+  (or (some-> (:dhcp/renewal-seconds lease) (* 1000))
+      (some-> (:dhcp/lease-seconds lease) (* 1000 (:t1-fraction config)) long)))
+
+(defn- t2-ms [lease config]
+  (or (some-> (:dhcp/rebinding-seconds lease) (* 1000))
+      (some-> (:dhcp/lease-seconds lease) (* 1000 (:t2-fraction config)) long)))
+
+(defn- bind [st lease now config]
+  (let [ttl (some-> (:dhcp/lease-seconds lease) (* 1000))]
+    (assoc st
+           :dhcp/state :bound
+           :dhcp/lease lease
+           :dhcp/bound-ms now
+           :dhcp/t1-at (some->> (t1-ms lease config) (+ now))
+           :dhcp/t2-at (some->> (t2-ms lease config) (+ now))
+           :dhcp/expires-at (some->> ttl (+ now))
+           :dhcp/offers []
+           :dhcp/attempts 0
+           :dhcp/backoff-ms (:initial-backoff-ms config))))
+
+(def event-kinds #{:start :receive :timeout :release})
+
+(def ignore-reasons
+  "Why a received message changed nothing. Reported rather than swallowed: a
+  client that silently drops packets cannot be debugged from its own state."
+  #{:foreign-xid :undecodable :wrong-type-for-state :no-address-in-message})
+
+(defn step
+  "One event -> `{:state <next> :send [packets] :arm-ms <timer> :ignored <reason>}`.
+
+  `event` is `{:kind :start|:receive|:timeout|:release :bytes [..] :now-ms n}`."
+  ([st event] (step st event default-config))
+  ([st {:keys [kind bytes now-ms] :as event} config]
+   (let [config (merge default-config config)
+         s (:dhcp/state st)]
+     (case kind
+       :start
+       (let [next (assoc st :dhcp/state :selecting :dhcp/attempts 1
+                         :dhcp/started-ms now-ms)]
+         {:state next :send [(discover-packet next)]
+          :arm-ms (:dhcp/backoff-ms next)})
+
+       :release
+       {:state (assoc (init st) :dhcp/xid (:dhcp/xid st))
+        :send (when-let [l (:dhcp/lease st)]
+                [(wire/encode {:message-type :release :xid (:dhcp/xid st)
+                               :chaddr (:dhcp/chaddr st)
+                               :ciaddr (:dhcp/address l)
+                               :server-id (:dhcp/server-id l)
+                               :broadcast? false})])
+        :arm-ms nil}
+
+       :receive
+       (let [msg (wire/decode bytes)]
+         (cond
+           (:dhcp/error msg)
+           {:state st :ignored :undecodable :dhcp/error (:dhcp/error msg)}
+
+           (not= (:dhcp/xid msg) (:dhcp/xid st))
+           {:state st :ignored :foreign-xid}
+
+           (= :nak (:dhcp/message-type msg))
+           {:state (assoc (init st) :dhcp/xid (:dhcp/xid st))
+            :send nil :arm-ms nil :dhcp/naked? true}
+
+           (and (= :selecting s) (= :offer (:dhcp/message-type msg)))
+           (if-let [l (wire/lease msg)]
+             (let [next (assoc st :dhcp/state :requesting
+                               :dhcp/offers (conj (:dhcp/offers st) l)
+                               :dhcp/selected l)]
+               {:state next :send [(request-packet next l)]
+                :arm-ms (:dhcp/backoff-ms next)})
+             {:state st :ignored :no-address-in-message})
+
+           (and (#{:requesting :renewing :rebinding} s)
+                (= :ack (:dhcp/message-type msg)))
+           (if-let [l (wire/lease msg)]
+             {:state (bind st l now-ms config) :send nil
+              :arm-ms (t1-ms l config)}
+             {:state st :ignored :no-address-in-message})
+
+           :else {:state st :ignored :wrong-type-for-state}))
+
+       :timeout
+       (cond
+         ;; the lease outlived its own end: give up the address.
+         (and (:dhcp/expires-at st) (>= now-ms (:dhcp/expires-at st)))
+         {:state (assoc (init st) :dhcp/xid (:dhcp/xid st))
+          :send nil :arm-ms nil :dhcp/expired? true}
+
+         (and (= :bound s) (:dhcp/t1-at st) (>= now-ms (:dhcp/t1-at st)))
+         (let [next (assoc st :dhcp/state :renewing)]
+           {:state next :send [(request-packet next (:dhcp/lease st) :unicast? true)]
+            :arm-ms (:dhcp/backoff-ms next)})
+
+         (and (= :renewing s) (:dhcp/t2-at st) (>= now-ms (:dhcp/t2-at st)))
+         (let [next (assoc st :dhcp/state :rebinding)]
+           {:state next :send [(request-packet next (:dhcp/lease st))]
+            :arm-ms (:dhcp/backoff-ms next)})
+
+         (= :selecting s)
+         (if (>= (:dhcp/attempts st) (:max-discover-attempts config))
+           {:state (assoc st :dhcp/state :init) :send nil :arm-ms nil
+            :dhcp/gave-up? true}
+           (let [next (-> st (update :dhcp/attempts inc)
+                          (update :dhcp/backoff-ms #(backoff config %)))]
+             {:state next :send [(discover-packet next)]
+              :arm-ms (:dhcp/backoff-ms next)}))
+
+         (#{:requesting :renewing :rebinding} s)
+         (let [next (update st :dhcp/backoff-ms #(backoff config %))]
+           {:state next
+            :send [(request-packet next (or (:dhcp/selected st) (:dhcp/lease st))
+                                   :unicast? (= :renewing s))]
+            :arm-ms (:dhcp/backoff-ms next)})
+
+         :else {:state st :send nil :arm-ms nil})
+
+       {:state st :ignored :wrong-type-for-state}))))
+
+(defn bound-address
+  "The address a caller may configure, or nil. nil in every state but `:bound`
+  — an address obtained in `:requesting` is not yours until the ACK."
+  [st]
+  (when (= :bound (:dhcp/state st)) (:dhcp/address (:dhcp/lease st))))

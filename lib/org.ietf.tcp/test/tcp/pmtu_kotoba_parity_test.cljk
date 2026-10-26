@@ -1,0 +1,142 @@
+;; `kotoba/tcp/pmtu_core.kotoba` against `tcp.pmtu`.
+;;
+;; Two of the four things this object decides were written wrong the first
+;; time, in this repository, and both were caught by reading rather than by a
+;; test:
+;;
+;;   the ICMP news was measured against `current` instead of `ceiling`, which
+;;   silently discards a router's report whenever a probe has already confirmed
+;;   a smaller size -- the search just stops narrowing;
+;;
+;;   `:probes` was read as a count of losses rather than of attempts, which
+;;   gives up one attempt short of MAX_PROBES and lowers the ceiling on a size
+;;   the path would have carried.
+;;
+;; Neither failure is loud. The first costs round trips, the second costs
+;; bytes per segment for the life of the connection. So the inputs here sit on
+;; the comparisons that decide those two: claimed exactly at the ceiling, at
+;; current, one below each, and probes exactly at and around MAX_PROBES.
+
+(ns tcp.pmtu-kotoba-parity-test
+  (:require [kotoba.io :as io]
+            [kotoba.test :refer [deftest is]]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]
+            [tcp.pmtu :as pmtu]))
+
+(def ^:private source-file
+  (io/file (System/getProperty "user.dir") "kotoba" "tcp" "pmtu_core.kotoba"))
+
+(defn- source-available?
+  "Fails rather than skips; a `when`-guard reports green on a checkout without
+  the object, which is a skip wearing a pass."
+  []
+  (let [present? (io/exists? source-file)]
+    (is present? (str "kotoba object not found at " source-file))
+    present?))
+
+(def ^:private kir
+  (delay (:kir (compiler/compile-source (slurp source-file) :wasm32-kotoba-v1 {}))))
+
+(defn- call [f & args] (ir/execute @kir f (vec args)))
+
+(def ^:private state-code
+  {:base 0 :searching 1 :search-complete 2 :error 3})
+
+(def ^:private icmp-code
+  {nil 0 :not-quoting-our-packet 1 :no-size 2 :below-floor 3
+   :not-smaller 4 :contradicts-confirmed 5})
+
+(defn- disc [state current floor ceiling probe-size probes]
+  {:tcp.pmtu/state state :tcp.pmtu/current current :tcp.pmtu/floor floor
+   :tcp.pmtu/ceiling ceiling :tcp.pmtu/probe-size probe-size
+   :tcp.pmtu/probes probes})
+
+(def ^:private mtus [1200 1201 1208 1209 1280 1400 1492 1500 4000 9000])
+
+(deftest kotoba-object-is-present
+  (source-available?))
+
+(deftest next-probe-agrees
+  (when (source-available?)
+    (doseq [state [:base :searching :search-complete]
+            floor mtus
+            ceiling mtus
+            :when (<= floor ceiling)]
+      (let [d (disc state floor floor ceiling nil 0)]
+        ;; nil on one side, 0 on the other: safe Kotoba has no nil, and 0 is
+        ;; not a probe size, so it cannot be confused with an answer.
+        (is (= (or (pmtu/next-probe d) 0)
+               (call 'next-probe (state-code state) floor ceiling))
+            (str "next-probe " state " floor " floor " ceiling " ceiling
+                 " -- the gap-of-8 cutoff is where the search stops"))))))
+
+(deftest probe-acked-agrees
+  (when (source-available?)
+    (doseq [current mtus, size mtus]
+      (let [d (pmtu/on-probe-acked (disc :searching current current 9000 size 1) size)]
+        (is (= (:tcp.pmtu/current d) (call 'on-probe-acked-current current size))
+            (str "acked current " current " size " size))
+        (is (= (:tcp.pmtu/floor d) (call 'on-probe-acked-floor current size))
+            (str "acked floor " current " size " size))))))
+
+(deftest probe-loss-agrees
+  (when (source-available?)
+    ;; The whole point: `probes` counts attempts, and start-probe already set it
+    ;; to 1. Reading it as losses gives up at two attempts.
+    (doseq [probes [0 1 2 3 4 5]
+            probe-size [1300 1400 1500]]
+      (let [before (disc :searching 1200 1200 1500 probe-size probes)
+            after (pmtu/on-probe-lost before)
+            gave-up? (not= (:tcp.pmtu/ceiling before) (:tcp.pmtu/ceiling after))]
+        (is (= gave-up? (call 'probe-loss-exhausts? probes))
+            (str "probes " probes " -- MAX_PROBES is 3 attempts, so the "
+                 "ceiling must not move until the third loss"))
+        (when gave-up?
+          (is (= (:tcp.pmtu/ceiling after) (call 'on-probe-lost-ceiling probe-size))
+              (str "ceiling after giving up on " probe-size)))))))
+
+(deftest icmp-verdict-agrees
+  (when (source-available?)
+    (doseq [ceiling [1400 1500 9000]
+            current [1200 1350 1400]
+            claimed [0 1199 1200 1201 1349 1350 1351
+                     (dec ceiling) ceiling (inc ceiling)]
+            quote? [false true]]
+      (let [d (disc :searching current 1200 ceiling 1400 0)
+            after (pmtu/on-icmp d {:claimed (when (pos? claimed) claimed)
+                                   :quote-matches? quote?})
+            expected (call 'icmp-verdict claimed ceiling current quote?)]
+        (is (= (icmp-code (:tcp.pmtu/icmp-rejected after)) expected)
+            (str "icmp claimed " claimed " ceiling " ceiling " current " current
+                 " quote " quote?
+                 " -- news is measured against the CEILING; comparing against "
+                 "current discards a router's report once a probe has "
+                 "confirmed anything smaller"))
+        ;; An accepted message must actually move the ceiling, not merely fail
+        ;; to be rejected.
+        (when (zero? expected)
+          (is (= claimed (:tcp.pmtu/ceiling after))
+              (str "accepted icmp must lower the ceiling to " claimed)))))))
+
+(deftest black-hole-agrees
+  (when (source-available?)
+    (doseq [timeouts [0 1 2 3]
+            current [1200 1400 1500]]
+      (let [d (disc :searching current 1200 1500 nil 0)
+            after (pmtu/on-retransmission-timeout
+                   (assoc d :tcp.pmtu/data-timeouts timeouts))]
+        (is (= (boolean (:tcp.pmtu/black-hole? after))
+               (call 'black-hole? timeouts current))
+            (str "black-hole? timeouts " timeouts " current " current
+                 " -- at the base MTU there is nothing left to fall back to, "
+                 "so it is not a black hole no matter how many timeouts"))))))
+
+(deftest mss-for-agrees
+  (when (source-available?)
+    (doseq [current mtus, header [20 40 60 1199 1200 2000]]
+      (is (= (pmtu/mss-for (disc :base current 1200 1500 nil 0) header)
+             (call 'mss-for current header))
+          (str "mss-for current " current " header " header
+               " -- headers larger than the MTU are the case that would go "
+               "negative")))))

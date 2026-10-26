@@ -1,0 +1,150 @@
+;; `kotoba/tcp/congestion_core.kotoba` against `tcp.congestion`.
+;;
+;; The object is the window arithmetic; the controller map stays in .cljc.
+;; It exists so a bare-metal sender computes its own cwnd with neither a JVM
+;; nor Node present, and it cannot call this namespace, so nothing but this
+;; would notice the two drifting apart.
+;;
+;; Congestion control is where the drift would be expensive and silent. A cwnd
+;; that grows a little too fast does not fail; it takes more of the path than
+;; it earned, and only the other flows notice. So the inputs run over the
+;; boundaries that decide which rule applies -- cwnd exactly at ssthresh, the
+;; third duplicate ACK, a flight size small enough that the two-segment floor
+;; wins over the halving -- rather than over a comfortable middle.
+;;
+;; `max` and `min` are absent from safe Kotoba, so the object spells them as
+;; `if`. Every assertion here is over integers where that rewrite has to hold.
+
+(ns tcp.congestion-kotoba-parity-test
+  (:require [kotoba.io :as io]
+            [kotoba.test :refer [deftest is]]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]
+            [tcp.congestion :as cc]))
+
+(def ^:private source-file
+  (io/file (System/getProperty "user.dir") "kotoba" "tcp" "congestion_core.kotoba"))
+
+(defn- source-available?
+  "Fails rather than skips. A `when`-guard here reports green on a checkout
+  without the object, which is a skip wearing a pass."
+  []
+  (let [present? (io/exists? source-file)]
+    (is present? (str "kotoba object not found at " source-file))
+    present?))
+
+(def ^:private kir
+  (delay (:kir (compiler/compile-source (slurp source-file) :wasm32-kotoba-v1 {}))))
+
+(defn- call [f & args] (ir/execute @kir f (vec args)))
+
+(def ^:private state-code
+  {:slow-start 0 :congestion-avoidance 1 :fast-recovery 2})
+
+(defn- controller [mss cwnd ssthresh state dup-acks]
+  {:tcp.cc/mss mss :tcp.cc/cwnd cwnd :tcp.cc/ssthresh ssthresh
+   :tcp.cc/state state :tcp.cc/dup-acks dup-acks})
+
+(def ^:private msses [536 1460 9000])
+(def ^:private states [:slow-start :congestion-avoidance :fast-recovery])
+
+(defn- cwnds-for
+  "cwnd values around the slow-start boundary, which is the only place the
+  growth rule changes -- plus two above MSS^2.
+
+  The last two are not decoration. Congestion avoidance adds
+  `max(1, MSS^2/cwnd)`, and the `max 1` only does anything once cwnd exceeds
+  MSS^2, where the quotient floors to zero and the window would otherwise stop
+  growing entirely. Without them, deleting the floor left every assertion
+  green: a long-lived connection on a fat path is exactly where it matters and
+  exactly what a table of modest cwnds never reaches."
+  [ssthresh mss]
+  [mss (* 2 mss) (dec ssthresh) ssthresh (inc ssthresh) (* 4 ssthresh)
+   (inc (* mss mss)) (* 4 mss mss)])
+
+(def ^:private ssthreshes [2920 14600 65535])
+
+(deftest kotoba-object-is-present
+  (source-available?))
+
+(deftest initial-window-and-loss-window-agree
+  (when (source-available?)
+    (doseq [mss (concat msses [1 2 1095 1096 2190 2191 4380])]
+      (is (= (cc/initial-window mss) (call 'initial-window mss))
+          (str "initial-window " mss " -- min(4*MSS, max(2*MSS, 4380)) has two "
+               "crossings and both are in this list"))
+      (is (= mss (call 'loss-window mss)) (str "loss-window " mss)))))
+
+(deftest phase-agrees
+  (when (source-available?)
+    (doseq [mss msses, ssthresh ssthreshes, state states
+            cwnd (cwnds-for ssthresh mss)]
+      (is (= (state-code (cc/phase (controller mss cwnd ssthresh state 0)))
+             (call 'phase cwnd ssthresh (state-code state)))
+          (str "phase cwnd " cwnd " ssthresh " ssthresh " state " state)))))
+
+(deftest on-ack-agrees
+  (when (source-available?)
+    (doseq [mss msses, ssthresh ssthreshes, state states
+            cwnd (cwnds-for ssthresh mss)
+            bytes-acked [1 (quot mss 2) mss (* 2 mss)]]
+      (let [after (cc/on-ack (controller mss cwnd ssthresh state 0) bytes-acked)]
+        (is (= (:tcp.cc/cwnd after)
+               (call 'on-ack-cwnd (state-code state) cwnd ssthresh mss bytes-acked))
+            (str "on-ack cwnd " cwnd "/" ssthresh " state " state
+                 " acked " bytes-acked))
+        (is (= (state-code (:tcp.cc/state after))
+               (call 'on-ack-state (state-code state) cwnd ssthresh))
+            (str "on-ack state " cwnd "/" ssthresh " state " state))))))
+
+(deftest on-duplicate-ack-agrees
+  (when (source-available?)
+    (doseq [mss msses, ssthresh ssthreshes, state states
+            cwnd [(* 2 mss) (* 10 mss)]
+            ;; dup-acks BEFORE the call; the .cljc increments, so n = prior + 1
+            ;; and the threshold crossing sits at prior 2.
+            prior [0 1 2 3 7]
+            ;; small enough that the two-segment floor wins, and large enough
+            ;; that the halving does
+            flight-size [mss (* 3 mss) (* 20 mss)]]
+      (let [after (cc/on-duplicate-ack (controller mss cwnd ssthresh state prior)
+                                       flight-size)
+            n (inc prior)
+            s (state-code state)]
+        (is (= (:tcp.cc/cwnd after)
+               (call 'on-dup-ack-cwnd s cwnd mss n flight-size))
+            (str "dup cwnd state " state " n " n " flight " flight-size))
+        (is (= (:tcp.cc/ssthresh after)
+               (call 'on-dup-ack-ssthresh s ssthresh mss n flight-size))
+            (str "dup ssthresh state " state " n " n " flight " flight-size))
+        (is (= (state-code (:tcp.cc/state after))
+               (call 'on-dup-ack-state s n))
+            (str "dup state " state " n " n))
+        (is (= (boolean (:tcp.cc/retransmit? after))
+               (call 'on-dup-ack-retransmit? s n))
+            (str "dup retransmit? state " state " n " n
+                 " -- true on the transition only, so a caller does not have "
+                 "to compare counters itself"))))))
+
+(deftest on-timeout-agrees
+  (when (source-available?)
+    (doseq [mss msses, ssthresh ssthreshes
+            cwnd [(* 2 mss) (* 10 mss)]
+            flight-size [0 mss (* 3 mss) (* 20 mss)]]
+      (let [after (cc/on-timeout (controller mss cwnd ssthresh :slow-start 0)
+                                 flight-size)]
+        (is (= (:tcp.cc/ssthresh after) (call 'on-timeout-ssthresh mss flight-size))
+            (str "timeout ssthresh mss " mss " flight " flight-size))
+        (is (= (:tcp.cc/cwnd after) (call 'on-timeout-cwnd mss))
+            (str "timeout cwnd mss " mss))))))
+
+(deftest may-send-agrees
+  (when (source-available?)
+    (doseq [mss msses
+            cwnd [0 mss (* 10 mss)]
+            flight-size [0 1 mss (* 10 mss) (* 100 mss)]]
+      (is (= (cc/may-send (controller mss cwnd 65535 :slow-start 0) flight-size)
+             (call 'may-send cwnd flight-size))
+          (str "may-send cwnd " cwnd " flight " flight-size
+               " -- never negative, and flight above cwnd is the case that "
+               "would go negative")))))

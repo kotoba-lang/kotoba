@@ -1,0 +1,112 @@
+(ns tcp.pmtu-test
+  (:require [tcp.pmtu :as m]
+            [kotoba.test :refer [deftest is testing]]))
+
+(defn- d [& {:as over}] (merge (m/discoverer {:link-mtu 1500}) over))
+
+(deftest before-probing-the-base-mtu-is-assumed
+  (let [x (d)]
+    (is (= 1200 (m/current-mtu x)))
+    (is (= :base (:tcp.pmtu/state x)))))
+
+;; ── the search ───────────────────────────────────────────────────────────
+
+(deftest probing-searches-between-what-works-and-what-does-not
+  (let [x (m/start-probe (d))]
+    (is (= :searching (:tcp.pmtu/state x)))
+    (is (= 1350 (:tcp.pmtu/probe-size x)) "midpoint of 1200 and 1500")))
+
+(deftest an-acknowledged-probe-is-proof-without-any-icmp
+  (testing "the transport's own ack is the confirmation the classic method waits on a router for"
+    (let [x (-> (d) m/start-probe (m/on-probe-acked 1350))]
+      (is (= 1350 (m/current-mtu x)))
+      (is (= 1425 (:tcp.pmtu/probe-size x)) "now searching upward from 1350"))))
+
+(deftest the-search-converges-and-stops
+  (let [x (reduce (fn [x _]
+                    (if-let [s (:tcp.pmtu/probe-size x)] (m/on-probe-acked x s) x))
+                  (m/start-probe (d)) (range 10))]
+    (is (= :search-complete (:tcp.pmtu/state x)))
+    (is (<= 1492 (m/current-mtu x) 1500) "within a few bytes of the link MTU")
+    (is (nil? (m/next-probe x)) "probing for the last few bytes costs more than it gains")))
+
+(deftest one-lost-probe-is-ordinary
+  (let [x (-> (d) m/start-probe m/on-probe-lost)]
+    (is (= 2 (:tcp.pmtu/probes x)) "attempts, not losses -- start-probe was the first")
+    (is (= 1350 (:tcp.pmtu/probe-size x)) "same size, tried again")
+    (is (= 1500 (:tcp.pmtu/ceiling x)) "and nothing has been concluded")))
+
+(deftest the-size-is-tried-max-probes-times-before-it-is-given-up
+  (let [two (-> (d) m/start-probe m/on-probe-lost m/on-probe-lost)]
+    (is (= 1350 (:tcp.pmtu/probe-size two)) "still the same size after two losses")
+    (is (= 1500 (:tcp.pmtu/ceiling two)))))
+
+(deftest three-lost-probes-lower-the-ceiling
+  (let [x (reduce (fn [x _] (m/on-probe-lost x)) (m/start-probe (d)) (range 3))]
+    (is (= 1349 (:tcp.pmtu/ceiling x)))
+    (is (= 1274 (:tcp.pmtu/probe-size x)) "midpoint of 1200 and 1349")
+    (is (= 1200 (m/current-mtu x)) "and the answer has not moved -- nothing was confirmed")))
+
+;; ── ICMP is a hint, not an authority ─────────────────────────────────────
+
+(deftest an-icmp-that-does-not-quote-our-packet-is-refused
+  (testing "otherwise anyone who can send ICMP shrinks this connection to the floor"
+    (let [x (m/on-icmp (d) {:claimed 1300 :quote-matches? false})]
+      (is (= :not-quoting-our-packet (:tcp.pmtu/icmp-rejected x)))
+      (is (= 1500 (:tcp.pmtu/ceiling x)) "the search did not move"))))
+
+(deftest an-icmp-claiming-less-than-the-floor-is-refused-not-clamped
+  (let [x (m/on-icmp (d) {:claimed 68 :quote-matches? true})]
+    (is (= :below-floor (:tcp.pmtu/icmp-rejected x)))
+    (is (= 1200 (m/current-mtu x)))))
+
+(deftest an-icmp-that-is-not-news-is-refused
+  (is (= :not-smaller (:tcp.pmtu/icmp-rejected (m/on-icmp (d) {:claimed 1500 :quote-matches? true})))
+      "at or above the ceiling it tells us nothing we did not believe")
+  (is (= :no-size (:tcp.pmtu/icmp-rejected (m/on-icmp (d) {:quote-matches? true})))))
+
+(deftest an-icmp-contradicting-a-confirmed-probe-is-refused
+  (testing "a changed path and a forgery are indistinguishable from here, so evidence wins"
+    (let [confirmed (-> (d) m/start-probe (m/on-probe-acked 1350))
+          x (m/on-icmp confirmed {:claimed 1250 :quote-matches? true})]
+      (is (= :contradicts-confirmed (:tcp.pmtu/icmp-rejected x)))
+      (is (= 1350 (m/current-mtu x)) "the probe that carried 1350 stands"))))
+
+(deftest a-valid-icmp-shortens-the-search-without-setting-the-answer
+  (let [confirmed (-> (d) m/start-probe (m/on-probe-acked 1350))
+        x (m/on-icmp confirmed {:claimed 1400 :quote-matches? true})]
+    (is (= 1400 (:tcp.pmtu/ceiling x)) "the ceiling came down")
+    (is (= 1350 (m/current-mtu x)) "but the answer is still what a probe confirmed")
+    (is (= 1375 (:tcp.pmtu/probe-size x)) "and the search resumed inside the new range")))
+
+;; ── black holes ──────────────────────────────────────────────────────────
+
+(deftest one-timeout-on-data-is-ordinary-loss
+  (let [x (m/on-retransmission-timeout (d :tcp.pmtu/current 1500))]
+    (is (= 1 (:tcp.pmtu/data-timeouts x)))
+    (is (= 1500 (m/current-mtu x)))))
+
+(deftest repeated-timeouts-at-a-size-that-worked-are-a-black-hole
+  (testing "the failure the ICMP-based method cannot see at all"
+    (let [x (-> (d :tcp.pmtu/current 1500)
+                m/on-retransmission-timeout
+                m/on-retransmission-timeout)]
+      (is (true? (:tcp.pmtu/black-hole? x)))
+      (is (= 1200 (m/current-mtu x)) "back to base -- a slow connection is one somebody can debug")
+      (is (= 1500 (:tcp.pmtu/ceiling x)) "and the size that failed is now the ceiling"))))
+
+(deftest at-the-base-mtu-there-is-nowhere-to-fall-back-to
+  (let [x (-> (d) m/on-retransmission-timeout m/on-retransmission-timeout
+              m/on-retransmission-timeout)]
+    (is (nil? (:tcp.pmtu/black-hole? x)) "already at base; the timeouts are something else")))
+
+(deftest data-getting-through-clears-the-suspicion
+  (let [x (-> (d :tcp.pmtu/current 1500) m/on-retransmission-timeout m/on-data-acked)]
+    (is (zero? (:tcp.pmtu/data-timeouts x)))
+    (is (= 1500 (m/current-mtu x)))))
+
+;; ── mss ──────────────────────────────────────────────────────────────────
+
+(deftest the-mss-is-the-mtu-minus-the-headers-the-caller-knows-about
+  (is (= 1160 (m/mss-for (d))))
+  (is (= 1140 (m/mss-for (d) 60)) "with options"))

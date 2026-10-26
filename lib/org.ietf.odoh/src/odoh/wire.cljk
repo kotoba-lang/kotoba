@@ -1,0 +1,191 @@
+(ns odoh.wire
+  "TLS-style encoding — [RFC 8446](https://www.rfc-editor.org/rfc/rfc8446) §3 —
+  for the structures [RFC 9230](https://www.rfc-editor.org/rfc/rfc9230) §5 and
+  §6 define.
+
+  Every variable-length field here is `opaque x<..2^16-1>`: a two-byte
+  big-endian length followed by that many bytes. Nothing is self-delimiting
+  and nothing is optional.
+
+  ## Decoding refuses rather than repairs
+
+  A short buffer, a length that runs past the end, or trailing bytes after a
+  complete structure are all errors with their own reason. The alternative —
+  taking what is there and carrying on — turns a truncated message into a
+  successfully parsed different message, and the caller cannot tell."
+  (:require [kotoba.lang.text :as str]))
+
+(defn- ->bytes [x] (mapv #(bit-and (int %) 0xFF) (seq x)))
+
+(defn u16 [n] [(bit-and (quot n 256) 0xFF) (bit-and n 0xFF)])
+
+(defn opaque16
+  "`opaque x<0..2^16-1>` — a two-byte length, then the bytes."
+  [bs]
+  (let [bs (->bytes bs)]
+    (if (> (count bs) 0xFFFF)
+      {:status :error :reason :field-too-long :length (count bs)}
+      {:status :ok :bytes (into (u16 (count bs)) bs)})))
+
+(defn opaque16!
+  [bs]
+  (let [r (opaque16 bs)]
+    (if (= :ok (:status r)) (:bytes r)
+        (throw (ex-info (str "odoh: " (name (:reason r))) r)))))
+
+(defn read-u16 [bs off]
+  (if (> (+ off 2) (count bs))
+    {:status :error :reason :truncated :at off :need 2}
+    {:status :ok :value (+ (* 256 (nth bs off)) (nth bs (inc off))) :next (+ off 2)}))
+
+(defn read-opaque16 [bs off]
+  (let [n (read-u16 bs off)]
+    (if (not= :ok (:status n))
+      n
+      (let [len (:value n) start (:next n) end (+ start len)]
+        (if (> end (count bs))
+          {:status :error :reason :length-past-end :declared len :available (- (count bs) start)}
+          {:status :ok :value (subvec (vec bs) start end) :next end})))))
+
+;; ── ObliviousDoHConfigContents, RFC 9230 §5 ──────────────────────────────────
+
+(defn encode-config-contents
+  [{:keys [kem-id kdf-id aead-id public-key]}]
+  (vec (concat (u16 kem-id) (u16 kdf-id) (u16 aead-id) (opaque16! public-key))))
+
+(defn decode-config-contents
+  [bs]
+  (let [bs (->bytes bs)]
+    (loop [off 0 acc {} ks [:kem-id :kdf-id :aead-id]]
+      (if-let [k (first ks)]
+        (let [r (read-u16 bs off)]
+          (if (not= :ok (:status r)) r (recur (:next r) (assoc acc k (:value r)) (next ks))))
+        (let [pk (read-opaque16 bs off)]
+          (cond
+            (not= :ok (:status pk)) pk
+            (empty? (:value pk)) {:status :error :reason :empty-public-key}
+            (not= (count bs) (:next pk))
+            {:status :error :reason :trailing-bytes :after (:next pk) :total (count bs)}
+            :else {:status :ok :value (assoc acc :public-key (:value pk))}))))))
+
+;; ── ObliviousDoHConfig / ObliviousDoHConfigs ─────────────────────────────────
+
+(def version
+  "0x0001 — the only version RFC 9230 defines.
+
+  A client MUST ignore a config with a version it does not support, which is
+  why `decode-configs` skips rather than fails on one: a server offering a
+  future version alongside this one is doing the right thing, and refusing the
+  whole list would make that a breaking change."
+  0x0001)
+
+(defn encode-config
+  [contents]
+  (let [c (encode-config-contents contents)]
+    (vec (concat (u16 version) (u16 (count c)) c))))
+
+(defn encode-configs
+  [contents-seq]
+  (let [body (vec (mapcat encode-config contents-seq))]
+    (opaque16! body)))
+
+(defn decode-configs
+  "Returns `{:status :ok :value [contents …] :skipped n}`.
+
+  `:skipped` counts configs whose version this does not know. It is reported
+  rather than dropped silently — a client that finds no usable config should
+  be able to say whether the server offered none or offered only ones from the
+  future."
+  [bs]
+  (let [bs (->bytes bs)
+        outer (read-opaque16 bs 0)]
+    (cond
+      (not= :ok (:status outer)) outer
+      (not= (count bs) (:next outer))
+      {:status :error :reason :trailing-bytes :after (:next outer) :total (count bs)}
+      :else
+      (let [body (:value outer)]
+        (loop [off 0 out [] skipped 0]
+          (if (= off (count body))
+            (if (and (empty? out) (zero? skipped))
+              {:status :error :reason :no-configs}
+              {:status :ok :value out :skipped skipped})
+            (let [v (read-u16 body off)]
+              (if (not= :ok (:status v))
+                v
+                (let [c (read-opaque16 body (:next v))]
+                  (if (not= :ok (:status c))
+                    c
+                    (if (= version (:value v))
+                      (let [d (decode-config-contents (:value c))]
+                        (if (not= :ok (:status d))
+                          d
+                          (recur (:next c) (conj out (:value d)) skipped)))
+                      (recur (:next c) out (inc skipped)))))))))))))
+
+;; ── ObliviousDoHMessage, RFC 9230 §6.1 ───────────────────────────────────────
+
+(def query-type 0x01)
+(def response-type 0x02)
+
+(defn encode-message
+  [{:keys [message-type key-id encrypted-message]}]
+  (vec (concat [message-type] (opaque16! key-id) (opaque16! encrypted-message))))
+
+(defn decode-message
+  [bs]
+  (let [bs (->bytes bs)]
+    (if (empty? bs)
+      {:status :error :reason :truncated :at 0 :need 1}
+      (let [t (first bs)]
+        (if-not (contains? #{query-type response-type} t)
+          {:status :error :reason :unknown-message-type :message-type t}
+          (let [k (read-opaque16 bs 1)]
+            (if (not= :ok (:status k))
+              k
+              (let [m (read-opaque16 bs (:next k))]
+                (cond
+                  (not= :ok (:status m)) m
+                  (empty? (:value m)) {:status :error :reason :empty-encrypted-message}
+                  (not= (count bs) (:next m))
+                  {:status :error :reason :trailing-bytes :after (:next m) :total (count bs)}
+                  :else {:status :ok
+                         :value {:message-type t
+                                 :key-id (:value k)
+                                 :encrypted-message (:value m)}})))))))))
+
+;; ── ObliviousDoHMessagePlaintext, RFC 9230 §6.1 ──────────────────────────────
+
+(defn encode-plaintext
+  [dns-message padding-length]
+  (vec (concat (opaque16! dns-message) (opaque16! (repeat padding-length 0)))))
+
+(defn decode-plaintext
+  "Returns `{:status :ok :dns-message … :padding-length n}`.
+
+  **The padding must be all zeroes.** RFC 9230 §6.1 says it MUST be, and a
+  decoder that does not check turns the padding into a covert channel: a
+  target could vary it per client and the client would never notice."
+  [bs]
+  (let [bs (->bytes bs)
+        m (read-opaque16 bs 0)]
+    (if (not= :ok (:status m))
+      m
+      (let [p (read-opaque16 bs (:next m))]
+        (cond
+          (not= :ok (:status p)) p
+          (empty? (:value m)) {:status :error :reason :empty-dns-message}
+          (not (every? zero? (:value p))) {:status :error :reason :non-zero-padding}
+          (not= (count bs) (:next p))
+          {:status :error :reason :trailing-bytes :after (:next p) :total (count bs)}
+          :else {:status :ok :dns-message (:value m) :padding-length (count (:value p))})))))
+
+(defn hex [bs]
+  (apply str (map (fn [b] (let [b (bit-and (int b) 0xFF)
+                                s #?(:clj (Integer/toString b 16) :cljs (.toString b 16))]
+                            (if (= 1 (count s)) (str "0" s) s)))
+                  bs)))
+
+(defn unhex [s]
+  (mapv #(#?(:clj Integer/parseInt :cljs js/parseInt) (apply str %) 16)
+        (partition 2 (str/replace s #"\s" ""))))

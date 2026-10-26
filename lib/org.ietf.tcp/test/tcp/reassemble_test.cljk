@@ -1,0 +1,119 @@
+(ns tcp.reassemble-test
+  (:require [tcp.reassemble :as ra]
+            [kotoba.test :refer [deftest is testing]]))
+
+(defn- r [& {:as over}] (merge (ra/reassembler {:rcv-nxt 1000}) over))
+(defn- sg [n & bs] {:seq n :data (vec bs)})
+(defn- take* [r & sgs]
+  (reduce (fn [{:keys [reassembler delivered]} s]
+            (let [x (ra/accept reassembler s)]
+              {:reassembler (:reassembler x)
+               :delivered (into delivered (:delivered x))
+               :dropped (:dropped x)}))
+          {:reassembler r :delivered []} sgs))
+
+(deftest in-order-data-is-delivered-immediately
+  (let [x (ra/accept (r) (sg 1000 1 2 3))]
+    (is (= [1 2 3] (:delivered x)))
+    (is (= 1003 (ra/rcv-nxt (:reassembler x))))
+    (is (zero? (ra/held-bytes (:reassembler x))))))
+
+(deftest a-gap-holds-the-later-data-instead-of-discarding-it
+  (testing "discarding turns one loss into a window of retransmissions"
+    (let [x (ra/accept (r) (sg 1005 6 7 8))]
+      (is (empty? (:delivered x)))
+      (is (= 1000 (ra/rcv-nxt (:reassembler x))) "the stream has not advanced")
+      (is (= 3 (ra/held-bytes (:reassembler x)))))))
+
+(deftest filling-the-gap-delivers-everything-that-became-contiguous
+  (let [{:keys [reassembler delivered]} (take* (r) (sg 1005 6 7 8) (sg 1000 1 2 3 4 5))]
+    (is (= [1 2 3 4 5 6 7 8] delivered))
+    (is (= 1008 (ra/rcv-nxt reassembler)))
+    (is (zero? (ra/held-bytes reassembler)))))
+
+(deftest several-gaps-close-in-any-order
+  (let [{:keys [reassembler delivered]}
+        (take* (r) (sg 1006 7 8) (sg 1002 3 4) (sg 1004 5 6) (sg 1000 1 2))]
+    (is (= [1 2 3 4 5 6 7 8] delivered))
+    (is (= 1008 (ra/rcv-nxt reassembler)))))
+
+;; ── duplicates ───────────────────────────────────────────────────────────
+
+(deftest data-entirely-below-rcv-nxt-is-a-duplicate
+  (let [x (ra/accept (r :tcp.ra/rcv-nxt 2000) (sg 1990 1 2 3))]
+    (is (= :duplicate (:dropped x)))
+    (is (= 2000 (ra/rcv-nxt (:reassembler x))))))
+
+(deftest a-segment-already-fully-held-is-a-duplicate
+  (let [{:keys [reassembler]} (take* (r) (sg 1005 6 7 8))
+        x (ra/accept reassembler (sg 1005 6 7 8))]
+    (is (= :duplicate (:dropped x)))
+    (is (= 3 (ra/held-bytes (:reassembler x))) "nothing was stored twice")))
+
+(deftest a-partial-retransmit-contributes-only-its-new-bytes
+  (let [{:keys [reassembler delivered]} (take* (r) (sg 1000 1 2 3) (sg 1002 3 4 5))]
+    (is (= [1 2 3 4 5] delivered) "byte at 1002 was already delivered")
+    (is (= 1005 (ra/rcv-nxt reassembler)))))
+
+;; ── overlap policy ───────────────────────────────────────────────────────
+
+(deftest overlapping-bytes-that-disagree-keep-the-first-arrival
+  (testing "two receivers resolving overlap differently see two different streams"
+    (let [{:keys [reassembler delivered]}
+          (take* (r) (sg 1004 5 5 5) (sg 1000 1 2 3 4 9 9 9))]
+      ;; 1004..1006 arrived first as 5 5 5; the later segment claims 9 9 9 there
+      (is (= [1 2 3 4 5 5 5] delivered)
+          "the injected rewrite of already-received bytes did not take")
+      (is (= 1007 (ra/rcv-nxt reassembler))))))
+
+(deftest a-segment-straddling-held-data-contributes-both-sides
+  (let [{:keys [reassembler]} (take* (r) (sg 1004 5 5))
+        x (ra/accept (:reassembler {:reassembler reassembler}) (sg 1002 3 4 9 9 7 8))]
+    ;; 1002..1003 new, 1004..1005 held, 1006..1007 new
+    (is (= 6 (ra/held-bytes (:reassembler x))) "2 + 2 held + 2")
+    (is (empty? (:delivered x)) "still a gap at 1000")))
+
+;; ── bounds ───────────────────────────────────────────────────────────────
+
+(deftest the-out-of-order-queue-is-bounded
+  (testing "unbounded holding is a memory-exhaustion primitive"
+    (let [small (ra/reassembler {:rcv-nxt 1000 :max-bytes 4})
+          {:keys [reassembler]} (take* small (sg 1010 1 2 3 4))
+          x (ra/accept reassembler (sg 1020 5 6))]
+      (is (= :queue-full (:dropped x)))
+      (is (= 4 (ra/held-bytes (:reassembler x)))))))
+
+(deftest an-oversized-segment-is-refused-whole-not-trimmed
+  (testing "a trimmed fragment can never be completed -- a leak with extra steps"
+    (let [small (ra/reassembler {:rcv-nxt 1000 :max-bytes 4})
+          x (ra/accept small (sg 1010 1 2 3 4 5 6))]
+      (is (= :queue-full (:dropped x)))
+      (is (zero? (ra/held-bytes (:reassembler x)))))))
+
+(deftest in-order-data-is-not-charged-against-the-bound
+  (testing "it is delivered, not held"
+    (let [small (ra/reassembler {:rcv-nxt 1000 :max-bytes 4})
+          x (ra/accept small (sg 1000 1 2 3 4 5 6 7 8))]
+      (is (= 8 (count (:delivered x))))
+      (is (zero? (ra/held-bytes (:reassembler x)))))))
+
+;; ── wrap ─────────────────────────────────────────────────────────────────
+
+(deftest reassembly-survives-the-sequence-wrap
+  (let [w (ra/reassembler {:rcv-nxt 4294967294})
+        {:keys [reassembler delivered]} (take* w (sg 0 3 4) (sg 4294967294 1 2))]
+    (is (= [1 2 3 4] delivered))
+    (is (= 2 (ra/rcv-nxt reassembler)) "wrapped past zero")))
+
+;; ── gaps ─────────────────────────────────────────────────────────────────
+
+(deftest gaps-report-what-is-missing
+  (let [{:keys [reassembler]} (take* (r) (sg 1005 6) (sg 1010 11))]
+    (is (= [[1000 1005] [1006 1010]] (ra/gaps reassembler))))
+  (is (empty? (ra/gaps (r))) "no held data, no gaps"))
+
+(deftest every-drop-reason-is-declared
+  (doseq [d [(:dropped (ra/accept (r) {:seq 1000 :data []}))
+             (:dropped (ra/accept (r :tcp.ra/rcv-nxt 2000) (sg 1990 1)))
+             (:dropped (ra/accept (ra/reassembler {:rcv-nxt 1000 :max-bytes 1}) (sg 1010 1 2)))]]
+    (when d (is (contains? ra/drop-reasons d) (str "undeclared: " d)))))

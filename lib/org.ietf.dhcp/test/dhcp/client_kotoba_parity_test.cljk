@@ -1,0 +1,176 @@
+;; `kotoba/dhcp/client_core.kotoba` against `dhcp.client`.
+;;
+;; The object exists so a machine bringing up its own interface can decide its
+;; own DHCP state with neither a JVM nor Node present. It cannot call this
+;; namespace, so nothing but this notices the two drifting apart.
+;;
+;; Two things are checked harder than the rest.
+;;
+;; The transaction-id check, because without it any broadcast on the segment
+;; moves this client's state machine -- which on a shared LAN is every DHCP
+;; conversation happening nearby. It is asserted for every state and every
+;; message type, not just the ones where it is convenient.
+;;
+;; And the lease fractions. The .cljc computes T1 and T2 by multiplying by 0.5
+;; and 0.875 as doubles and truncating; the object uses `(quot ms 2)` and
+;; `(quot (* ms 7) 8)`. Both RFC 2131 fractions are dyadic, so the two agree
+;; exactly rather than approximately -- but "agrees exactly" is a claim, and
+;; this drives it over leases from one second to a year.
+
+(ns dhcp.client-kotoba-parity-test
+  (:require [kotoba.io :as io]
+            [kotoba.test :refer [deftest is]]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]
+            [dhcp.client :as client]
+            [dhcp.wire :as wire]))
+
+;; `wire/encode` is the CLIENT's encoder -- it emits BOOTREQUEST and has no
+;; yiaddr, because a client never sends one. Server replies are built by hand,
+;; the same way dhcp.client's own tests build them.
+
+(def ^:private source-file
+  (io/file (System/getProperty "user.dir") "kotoba" "dhcp" "client_core.kotoba"))
+
+(defn- source-available? []
+  (let [present? (io/exists? source-file)]
+    (is present? (str "kotoba object not found at " source-file))
+    present?))
+
+(def ^:private kir
+  (delay (:kir (compiler/compile-source (slurp source-file) :wasm32-kotoba-v1 {}))))
+
+(defn- call [f & args] (ir/execute @kir f (vec args)))
+
+(def ^:private state-code
+  {:init 0 :selecting 1 :requesting 2 :bound 3 :renewing 4 :rebinding 5})
+
+(def ^:private cfg client/default-config)
+(def ^:private xid 305419896)
+(def ^:private chaddr [0 1 2 3 4 5])
+
+(defn- st [state] (assoc (client/init {:chaddr chaddr :xid xid}) :dhcp/state state))
+
+(def ^:private xid-bytes [0x12 0x34 0x56 0x78])   ; = xid
+
+(defn- reply
+  "A server reply of `type`. `address?` false omits yiaddr, which is what makes
+  wire/lease return nil -- an ACK without an address is not a lease."
+  [type xid-bs address? lease-secs]
+  (vec (concat [2 1 6 0] xid-bs [0 0] [0 0]
+               [0 0 0 0] (if address? [10 0 0 5] [0 0 0 0]) [0 0 0 0] [0 0 0 0]
+               chaddr (repeat 10 0) (repeat 64 0) (repeat 128 0)
+               wire/magic-cookie
+               [53 1 (wire/message-type-codes type)]
+               [54 4 10 0 0 1]
+               [51 4 (bit-and (bit-shift-right lease-secs 24) 0xff)
+                (bit-and (bit-shift-right lease-secs 16) 0xff)
+                (bit-and (bit-shift-right lease-secs 8) 0xff)
+                (bit-and lease-secs 0xff)]
+               [255])))
+
+(deftest kotoba-object-is-present
+  (source-available?))
+
+(deftest backoff-agrees
+  (when (source-available?)
+    ;; walked from the initial value the way a real retry sequence does, so the
+    ;; cap is reached rather than assumed.
+    (let [cljc-backoff (var-get #'dhcp.client/backoff)]
+      (loop [ms (:initial-backoff-ms cfg), n 0]
+        (when (< n 10)
+          (let [expected (cljc-backoff cfg ms)]
+            (is (= expected (call 'backoff ms (:initial-backoff-ms cfg)
+                                  (:max-backoff-ms cfg)))
+                (str "backoff step " n " from " ms))
+            (recur expected (inc n)))))
+      ;; and the nil case, which the .cljc treats as "start from the initial"
+      (is (= (cljc-backoff cfg nil) (call 'backoff 0 (:initial-backoff-ms cfg)
+                                          (:max-backoff-ms cfg)))
+          "0 stands in for the .cljc's nil"))))
+
+(deftest lease-timers-agree
+  (when (source-available?)
+    (let [t1 (var-get #'dhcp.client/t1-ms)
+          t2 (var-get #'dhcp.client/t2-ms)]
+      (doseq [lease [0 1 2 3 7 8 9 60 3600 86400 604800 31536000 2147483]
+              renewal [0 30 1800]
+              rebinding [0 45 3000]]
+        (let [l (cond-> {}
+                  (pos? lease) (assoc :dhcp/lease-seconds lease)
+                  (pos? renewal) (assoc :dhcp/renewal-seconds renewal)
+                  (pos? rebinding) (assoc :dhcp/rebinding-seconds rebinding))]
+          (is (= (or (t1 l cfg) 0) (call 't1-ms renewal lease))
+              (str "T1 lease " lease " renewal " renewal
+                   " -- 0.5 as a double and (quot ms 2) must agree exactly"))
+          (is (= (or (t2 l cfg) 0) (call 't2-ms rebinding lease))
+              (str "T2 lease " lease " rebinding " rebinding
+                   " -- 0.875 is seven eighths and dyadic, so (quot (* ms 7) 8) "
+                   "is the same integer, not a near one")))))))
+
+(deftest foreign-xid-is-refused-everywhere
+  (when (source-available?)
+    (doseq [state (keys state-code)
+            mtype [:offer :ack :nak]]
+      (let [bytes (reply mtype [0x12 0x34 0x56 0x79] true 3600)
+            r (client/step (st state) {:kind :receive :bytes bytes :now-ms 0})]
+        (is (= :foreign-xid (:ignored r))
+            (str "a foreign xid must be refused in " state " for " mtype))
+        (is (= 1 (call 'receive-verdict (state-code state)
+                       ({:offer 2 :ack 5 :nak 6} mtype) true false true))
+            (str "and the object agrees for " state "/" mtype))))))
+
+(deftest receive-verdict-agrees
+  (when (source-available?)
+    (doseq [state (keys state-code)
+            mtype [:offer :ack :nak :request :inform]
+            with-address? [true false]]
+      (let [bytes (reply mtype xid-bytes with-address? 3600)
+            r (client/step (st state) {:kind :receive :bytes bytes :now-ms 0})
+            code (call 'receive-verdict (state-code state)
+                       ({:offer 2 :ack 5 :nak 6 :request 3 :inform 8} mtype)
+                       true true with-address?)
+            label (str state "/" mtype " address " with-address?)]
+        (cond
+          (= 2 code) (is (:dhcp/naked? r) (str "NAK returns to init: " label))
+          (= 3 code) (is (= :requesting (:dhcp/state (:state r)))
+                         (str "offer accepted: " label))
+          (= 4 code) (is (= :bound (:dhcp/state (:state r)))
+                         (str "ack binds: " label))
+          (= 5 code) (is (= :no-address-in-message (:ignored r))
+                         (str "no address: " label))
+          (= 6 code) (is (= :wrong-type-for-state (:ignored r))
+                         (str "wrong type: " label))
+          :else (is false (str "unexpected verdict " code " for " label)))))))
+
+(deftest timeout-verdict-agrees
+  (when (source-available?)
+    (doseq [state (keys state-code)
+            expired? [false true]
+            past-t1? [false true]
+            past-t2? [false true]
+            attempts [1 (:max-discover-attempts cfg)]]
+      (let [now 1000000
+            lease {:dhcp/address [10 0 0 5] :dhcp/server-id [10 0 0 1]
+                   :dhcp/lease-seconds 3600}
+            s (cond-> (assoc (st state) :dhcp/lease lease :dhcp/selected lease
+                             :dhcp/attempts attempts)
+                expired? (assoc :dhcp/expires-at (dec now))
+                past-t1? (assoc :dhcp/t1-at (dec now))
+                past-t2? (assoc :dhcp/t2-at (dec now)))
+            r (client/step s {:kind :timeout :now-ms now})
+            code (call 'timeout-verdict (state-code state) expired?
+                       past-t1? past-t2?
+                       (call 'attempts-exhausted? attempts
+                             (:max-discover-attempts cfg)))
+            label (str state " expired " expired? " t1 " past-t1?
+                       " t2 " past-t2? " attempts " attempts)]
+        (cond
+          (= 0 code) (is (:dhcp/expired? r) (str "expiry outranks all: " label))
+          (= 1 code) (is (= :renewing (:dhcp/state (:state r))) (str "renew: " label))
+          (= 2 code) (is (= :rebinding (:dhcp/state (:state r))) (str "rebind: " label))
+          (= 3 code) (is (:dhcp/gave-up? r) (str "gave up: " label))
+          (= 4 code) (is (= :selecting (:dhcp/state (:state r))) (str "retry discover: " label))
+          (= 5 code) (is (seq (:send r)) (str "retry request: " label))
+          (= 6 code) (is (nil? (:send r)) (str "nothing to do: " label))
+          :else (is false (str "unexpected verdict " code " for " label)))))))

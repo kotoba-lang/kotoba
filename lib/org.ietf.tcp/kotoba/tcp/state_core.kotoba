@@ -1,0 +1,178 @@
+;; RFC 9293 §3.3.2 state transitions, as safe Kotoba.
+;;
+;; This is the DECISION core of `tcp.state`, not a port of it. `tcp.state`
+;; assembles connection maps, segment maps and vectors of outgoing segments;
+;; that assembly stays in .cljc. What moves here is the part where a
+;; hand-written stack gets a state wrong: given where we are and what arrived,
+;; where do we go, what do we send, and why did we drop it.
+;;
+;; The split follows kotoba-lang/murakumo's `*_core.kotoba` objects, whose 33
+;; files reached the native ISA by extracting decisions rather than by porting
+;; namespaces. See ADR-2608650000.
+;;
+;; The caller supplies the three facts it already has to compute anyway:
+;; whether the segment is acceptable (tcp.seq answers that), whether the ACK
+;; matches ISS+1, and whether it acknowledges our own FIN. Recomputing them
+;; here would mean passing four more sequence numbers.
+;;
+;; Checked against `tcp.state/step` over every state x flag combination in
+;; test/tcp/state_kotoba_parity_test.cljk.
+;;
+;; TARGETS: `wasm32-kotoba-v1` only, for now. Both native ISAs reject this
+;; module, and not for anything it does -- kotoba-lang/amu#611. A module that
+;; contains any i64 shift AND exports a function with a `:bool` parameter is
+;; refused by the native target; either alone compiles, and the shift does not
+;; have to be reachable. This module has both because packing three fields into
+;; one i64 needs shifts and the transition takes three boolean facts. Sibling
+;; `seq_core.kotoba` has no bool parameters and does reach the native ISA, so
+;; the boundary is the compiler's, not this file's.
+
+(ns tcp.state-core
+  (:require [tcp.seq-core :as s])
+  (:export [segment-decision next-rcv-nxt
+            decision-state decision-action decision-drop]))
+
+;; ── the codes ─────────────────────────────────────────────────────────────
+;; Wire values. The .cljc keyword <-> code mapping lives in the parity test,
+;; which is the only place both spellings are in scope at once.
+
+(def st-closed 0)
+(def st-listen 1)
+(def st-syn-sent 2)
+(def st-syn-received 3)
+(def st-established 4)
+(def st-fin-wait-1 5)
+(def st-fin-wait-2 6)
+(def st-close-wait 7)
+(def st-closing 8)
+(def st-last-ack 9)
+(def st-time-wait 10)
+
+(def flag-fin 1)
+(def flag-syn 2)
+(def flag-rst 4)
+(def flag-ack 8)
+(def flag-data 16)                              ; len > 0
+
+(def act-none 0)
+(def act-send-ack 1)
+(def act-send-syn-ack 2)
+(def act-send-rst 3)
+(def act-send-rst-with-ack 4)
+
+(def drop-none 0)
+(def drop-unacceptable-sequence 1)
+(def drop-bad-ack 2)
+(def drop-rst-out-of-window 3)
+(def drop-closed 4)
+(def drop-wrong-state-for-flag 6)
+
+;; ── packing ───────────────────────────────────────────────────────────────
+;; One i64 out, three fields in it. Three separate entry points would have to
+;; re-derive the whole transition three times and could disagree.
+
+(defn- pack [state :i64 action :i64 why :i64] :i64
+  (bit-or state (bit-or (i64-shift-left action 4) (i64-shift-left why 8))))
+
+(defn decision-state [d :i64] :i64 (bit-and d 15))
+(defn decision-action [d :i64] :i64 (bit-and (u64-shift-right d 4) 15))
+(defn decision-drop [d :i64] :i64 (bit-and (u64-shift-right d 8) 15))
+
+(defn- has? [flags :i64 f :i64] :bool
+  (= (bit-and flags f) f))
+
+;; `ack-ok` is "the ACK field equals ISS+1", which is only a question at all
+;; when the segment carries an ACK. Conjoining here rather than trusting the
+;; caller is deliberate: a caller that passes ack-ok for a bare RST would
+;; otherwise close the connection on an unauthenticated reset, which is the
+;; exact attack RFC 9293 3.10.7.3 exists to prevent. The .cljc computes the
+;; conjunction inside `on-syn-sent`; if the object took the caller's word for
+;; it, the two would agree on every input a test happened to construct
+;; correctly and disagree on the one that matters.
+(defn- ack-valid? [flags :i64 ack-ok :bool] :bool
+  (and (has? flags flag-ack) ack-ok))
+
+;; ── per-state transitions ─────────────────────────────────────────────────
+
+;; §3.10.7.1. A closed port answers with RST unless the arrival was itself one.
+(defn- on-closed [flags :i64] :i64
+  (if (has? flags flag-rst)
+    (pack st-closed act-none drop-closed)
+    (pack st-closed act-send-rst-with-ack drop-closed)))
+
+;; §3.10.7.2. Order matters: RST before ACK before SYN.
+(defn- on-listen [flags :i64] :i64
+  (if (has? flags flag-rst)
+    (pack st-listen act-none drop-rst-out-of-window)
+    (if (has? flags flag-ack)
+      (pack st-listen act-send-rst drop-bad-ack)
+      (if (has? flags flag-syn)
+        (pack st-syn-received act-send-syn-ack drop-none)
+        (pack st-listen act-none drop-wrong-state-for-flag)))))
+
+;; §3.10.7.3. A RST is believed only when it acknowledges our SYN.
+(defn- on-syn-sent [flags :i64 ack-ok :bool] :i64
+  (if (has? flags flag-rst)
+    (if (ack-valid? flags ack-ok)
+      (pack st-closed act-none drop-none)
+      (pack st-syn-sent act-none drop-rst-out-of-window))
+    (if (and (has? flags flag-syn) (ack-valid? flags ack-ok))
+      (pack st-established act-send-ack drop-none)
+      ;; simultaneous open: a SYN with no ACK
+      (if (and (has? flags flag-syn) (not (has? flags flag-ack)))
+        (pack st-syn-received act-send-syn-ack drop-none)
+        (if (has? flags flag-ack)
+          (pack st-syn-sent act-send-rst drop-bad-ack)
+          (pack st-syn-sent act-none drop-wrong-state-for-flag))))))
+
+(defn- on-syn-received [flags :i64 ack-ok :bool] :i64
+  (if (has? flags flag-rst)
+    (pack st-closed act-none drop-none)
+    (if (ack-valid? flags ack-ok)
+      (pack st-established act-none drop-none)
+      (pack st-syn-received act-none drop-bad-ack))))
+
+;; The close sequence: where a FIN moves us depends on where we already are.
+(defn- advance-on-fin [state :i64] :i64
+  (if (= state st-established) st-close-wait
+      (if (= state st-fin-wait-1) st-closing
+          (if (= state st-fin-wait-2) st-time-wait
+              state))))
+
+;; Our own FIN being acknowledged moves us on before the arriving FIN is
+;; considered, which is what makes simultaneous close reach TIME-WAIT.
+(defn- advance-on-fin-acked [state :i64] :i64
+  (if (= state st-fin-wait-1) st-fin-wait-2
+      (if (= state st-closing) st-time-wait
+          (if (= state st-last-ack) st-closed
+              state))))
+
+;; §3.10.7.4. An unacceptable segment is answered with an ACK rather than
+;; silence -- the peer has to learn our window. RST is the one exception.
+(defn- on-synchronised [state :i64 flags :i64 acceptable :bool fin-acked :bool] :i64
+  (if (not acceptable)
+    (if (has? flags flag-rst)
+      (pack state act-none drop-rst-out-of-window)
+      (pack state act-send-ack drop-unacceptable-sequence))
+    (if (has? flags flag-rst)
+      (pack st-closed act-none drop-none)
+      (if (not (has? flags flag-ack))
+        (pack state act-none drop-wrong-state-for-flag)
+        (let [after-ack (if fin-acked (advance-on-fin-acked state) state)]
+          (if (has? flags flag-fin)
+            (pack (advance-on-fin after-ack) act-send-ack drop-none)
+            (if (has? flags flag-data)
+              (pack after-ack act-send-ack drop-none)
+              (pack after-ack act-none drop-none))))))))
+
+(defn segment-decision
+  [state :i64 flags :i64 acceptable :bool ack-ok :bool fin-acked :bool] :i64
+  (if (= state st-closed) (on-closed flags)
+      (if (= state st-listen) (on-listen flags)
+          (if (= state st-syn-sent) (on-syn-sent flags ack-ok)
+              (if (= state st-syn-received) (on-syn-received flags ack-ok)
+                  (on-synchronised state flags acceptable fin-acked))))))
+
+;; A FIN consumes one sequence number beyond the data it carries.
+(defn next-rcv-nxt [seg-seq :i64 seg-len :i64 fin :bool] :i64
+  (s/add-seq seg-seq (if fin (+ seg-len 1) seg-len)))

@@ -1,0 +1,114 @@
+(ns tcp.pacing-test
+  (:require [tcp.pacing :as p]
+            [tcp.congestion :as cc]
+            [kotoba.test :refer [deftest is testing]]))
+
+(def mss 1000)
+(defn- snd [& {:as over}] (merge (p/sender {:mss mss}) over))
+(defn- rcv [& {:as over}] (merge (p/receiver {:mss mss}) over))
+
+;; ── Nagle ────────────────────────────────────────────────────────────────
+
+(deftest a-full-segment-always-goes
+  (is (:send? (p/may-send? (snd) mss 500)))
+  (is (= :full-segment (:reason (p/may-send? (snd) 2000 500)))))
+
+(deftest a-small-segment-goes-when-nothing-is-outstanding
+  (testing "without this clause Nagle holds the first byte of a connection forever"
+    (let [d (p/may-send? (snd) 1 0)]
+      (is (true? (:send? d)))
+      (is (= :nothing-outstanding (:reason d))))))
+
+(deftest a-small-segment-waits-while-small-data-is-unacknowledged
+  (let [d (p/may-send? (snd) 1 500)]
+    (is (false? (:send? d)))
+    (is (= :small-and-unacked-outstanding (:reason d)))))
+
+(deftest nodelay-turns-it-off
+  (is (true? (:send? (p/may-send? (snd :tcp.pace/nodelay? true) 1 500)))))
+
+(deftest nothing-to-send-is-not-a-hold
+  (is (= :nothing-to-send (:reason (p/may-send? (snd) 0 0)))))
+
+;; ── delayed ACK ──────────────────────────────────────────────────────────
+
+(deftest one-small-segment-is-acknowledged-late
+  (let [{:keys [ack-now? receiver]} (p/on-segment (rcv) {:len 100 :in-order? true :now-ms 0})]
+    (is (false? ack-now?))
+    (is (true? (p/ack-pending? receiver)))))
+
+(deftest the-second-full-segment-is-acknowledged-at-once
+  (let [r1 (:receiver (p/on-segment (rcv) {:len mss :in-order? true :now-ms 0}))
+        {:keys [ack-now? reason]} (p/on-segment r1 {:len mss :in-order? true :now-ms 1})]
+    (is (true? ack-now?))
+    (is (= :second-full-segment reason))))
+
+(deftest two-small-segments-do-not-trigger-the-full-segment-rule
+  (let [r1 (:receiver (p/on-segment (rcv) {:len 10 :in-order? true :now-ms 0}))
+        {:keys [ack-now?]} (p/on-segment r1 {:len 10 :in-order? true :now-ms 1})]
+    (is (false? ack-now?) "the rule is about full-sized segments, not about counting two")))
+
+(deftest an-out-of-order-segment-is-acknowledged-immediately
+  (testing "these duplicate ACKs are what fast retransmit counts"
+    (let [{:keys [ack-now? reason]} (p/on-segment (rcv) {:len 100 :in-order? false :now-ms 0})]
+      (is (true? ack-now?))
+      (is (= :out-of-order reason)))))
+
+(deftest delaying-an-out-of-order-ack-would-delay-loss-recovery
+  (testing "three duplicates drive fast retransmit; each delayed one adds the timer"
+    (let [dups (reduce (fn [{:keys [r n]} _]
+                         (let [{:keys [receiver ack-now?]}
+                               (p/on-segment r {:len 100 :in-order? false :now-ms 0})]
+                           {:r receiver :n (if ack-now? (inc n) n)}))
+                       {:r (rcv) :n 0} (range 3))
+          controller (reduce (fn [c _] (cc/on-duplicate-ack c 8000))
+                             (cc/controller {:mss mss}) (range (:n dups)))]
+      (is (= 3 (:n dups)) "all three went immediately")
+      (is (true? (:tcp.cc/retransmit? controller))
+          "so the sender retransmits now rather than a delay-timer later"))))
+
+(deftest a-fin-and-a-window-update-are-immediate
+  (is (= :closing (:reason (p/on-segment (rcv) {:len 0 :in-order? true :fin? true :now-ms 0}))))
+  (is (= :window-update (:reason (p/on-segment (rcv) {:len 10 :in-order? true
+                                                      :window-opened? true :now-ms 0})))))
+
+(deftest the-timer-runs-from-the-first-unacknowledged-segment
+  (testing "restarting it on each arrival lets a trickle defer the ACK forever"
+    (let [r (reduce (fn [r i] (:receiver (p/on-segment r {:len 10 :in-order? true :now-ms (* i 50)})))
+                    (rcv) (range 1 5))]
+      (is (true? (:ack-now? (p/on-tick r 250)))
+          "first segment arrived at 50, so the 200ms delay is up at 250")
+      (is (false? (:ack-now? (p/on-tick r 200)))))))
+
+(deftest the-delay-is-capped-by-the-rfc
+  (is (= p/max-delay-ms (:tcp.pace/delay-ms (p/receiver {:mss mss :delay-ms 10000}))))
+  (is (= 40 (:tcp.pace/delay-ms (p/receiver {:mss mss :delay-ms 40})))))
+
+;; ── the interaction ──────────────────────────────────────────────────────
+
+(deftest the-two-algorithms-deadlock
+  (testing "the sender holds a partial segment; the receiver holds the ack it needs"
+    (let [r (:receiver (p/on-segment (rcv) {:len 100 :in-order? true :now-ms 0}))
+          d (p/may-send? (snd) 50 100)]
+      (is (true? (p/deadlock? d r)))
+      (is (= 200 (p/stall-ms r 0)) "and it lasts the receiver's whole timer")
+      (is (= 50 (p/stall-ms r 150))))))
+
+(deftest the-timer-is-what-breaks-it
+  (let [r (:receiver (p/on-segment (rcv) {:len 100 :in-order? true :now-ms 0}))
+        {:keys [ack-now? receiver]} (p/on-tick r 200)]
+    (is (true? ack-now?))
+    (is (false? (p/deadlock? (p/may-send? (snd) 50 100) receiver))
+        "with the ack sent, the sender's data is no longer unacknowledged")))
+
+(deftest turning-either-one-off-avoids-it
+  (let [r (:receiver (p/on-segment (rcv) {:len 100 :in-order? true :now-ms 0}))]
+    (is (false? (p/deadlock? (p/may-send? (snd :tcp.pace/nodelay? true) 50 100) r))
+        "nodelay on the sender")
+    (is (false? (p/deadlock? (p/may-send? (snd) 50 100) (rcv)))
+        "or no ack pending on the receiver")))
+
+(deftest a-full-segment-never-deadlocks
+  (let [r (:receiver (p/on-segment (rcv) {:len 100 :in-order? true :now-ms 0}))]
+    (is (false? (p/deadlock? (p/may-send? (snd) mss 100) r))
+        "Nagle only holds partial segments")))
