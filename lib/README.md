@@ -223,6 +223,7 @@ The bundled standard libraries live in this repository:
 | `org.ethereum.jsonrpc` | `org.ethereum.jsonrpc/src` | `kotobase.ethereum.client`, `kotobase.ethereum.rpc` (an external specification, publisher ethereum.org) |
 | `org.ietf.hpke` | `org.ietf.hpke/src` | `hpke.core`, `hpke.dhkem`, `hpke.kdf` (an external specification, publisher ietf.org) |
 | `org.ietf.srtp` | `org.ietf.srtp/src` | `srtp.aes-cm`, `srtp.index`, `srtp.kdf`, `srtp.packet` (an external specification, publisher ietf.org) |
+| `kotoba.kotobaVm` | `kotoba.kotobaVm/src` | `kotoba.vm`, `kotoba.vm.evm.calls`, `kotoba.vm.evm.core`, `kotoba.vm.evm.env` (Kotoba project library) |
 | `kotoba.kotobaCoreContracts` | `kotoba.kotobaCoreContracts/src` | `kotoba.core.actor-capability`, `kotoba.core.capability-repository`, `kotoba.core.contracts`, `kotoba.core.execution` (Kotoba project library) |
 | `kotoba.osaho` | `kotoba.osaho/src` | `kotoba.kir`, `kotoba.kir.admission`, `kotoba.kir.alpha-normalization`, `kotoba.kir.cljs-i64` (Kotoba project library) |
 | `kotoba.kotobaProtocol` | `kotoba.kotobaProtocol/src` | `kotoba.protocol.a2a`, `kotoba.protocol.accountability`, `kotoba.protocol.address`, `kotoba.protocol.app` (Kotoba project library) |

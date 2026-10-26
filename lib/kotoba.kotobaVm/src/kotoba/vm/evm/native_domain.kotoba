@@ -1,0 +1,189 @@
+;; AWAI-81 bounded integration candidate. One explicitly admitted Cell and
+;; one pinned program/storage instance. This is NOT Ethereum transaction,
+;; account, block, MPT, or node-service compatibility.
+(ns kotoba.vm.evm.native-domain
+  (:require [kotoba.vm.evm.native-core :as e]
+            [kotoba.vm.evm.native-word :as w]
+            [inga.native-prefix :as n]
+            [sha2.core :as sha]
+            [ed25519.selfhost :as ed])
+  (:export [state-commitment request-cid replay replay-after]))
+
+;; Context fields (|): domain, chain, trusted-genesis, authority public key,
+;; Cell id, Cell signing public key, program hex, genesis storage hex.
+;; Storage is ascending nonzero (key64hex,value64hex)*, exactly as core.
+;; Request fields (|): domain, Cell id, domain nonce, before commitment,
+;; gas, calldata hex, authority's grant signature, Cell's request signature.
+;; Catalog is newline separated requests. A block names raw CIDv1s of the
+;; COMPLETE request bytes (including both signatures). No network/provider.
+;; This fixed context is an input capability; untrusted proofs cannot set it.
+(defn- nd-ascii? [s :string] :bool
+  ;; This wire profile is ASCII. Refuse unsupported text encoding instead
+  ;; of treating Unicode code points as bytes in a CID or signature payload.
+  (loop [i 0]
+    (if (= i (string-length s)) true
+      (let [c (string-code-point-at s i)]
+        (if (or (= c 10) (and (>= c 32) (<= c 126))) (recur (+ i 1)) false)))))
+
+(defn- nd-hex? [s :string] :bool
+  (and (= (rem (string-length s) 2) 0)
+    (loop [i 0]
+      (if (= i (string-length s)) true
+        (let [c (string-code-point-at s i)]
+          (if (or (and (>= c 48) (<= c 57)) (and (>= c 97) (<= c 102)))
+            (recur (+ i 1)) false))))))
+
+(defn- nd-bytes [s :string] :vector-i64
+  (let [v (vector-alloc (string-length s))]
+    (loop [i 0]
+      (if (= i (string-length s)) v
+        (let [z (vector-assoc! v i (string-code-point-at s i))] (recur (+ i 1)))))))
+
+(defn- nd-append [a :vector-i64 b :vector-i64] :vector-i64
+  (loop [i 0 out a]
+    (if (= i (vector-count b)) out (recur (+ i 1) (vector-conj out (vector-at b i))))))
+
+(defn- nd-base32 [bytes :vector-i64] :string
+  (let [alphabet "abcdefghijklmnopqrstuvwxyz234567"]
+    (loop [i 0 acc 0 bits 0 out "b"]
+      (if (>= bits 5)
+        (let [remain (- bits 5) idx (bit-and (i64-shift-right acc remain) 31)]
+          (recur i (bit-and acc (- (i64-shift-left 1 remain) 1)) remain
+            (string-concat out (string-substring alphabet idx (+ idx 1)))))
+        (if (= i (vector-count bytes))
+          (if (= bits 0) out
+            (let [idx (bit-and (i64-shift-left acc (- 5 bits)) 31)]
+              (string-concat out (string-substring alphabet idx (+ idx 1)))))
+          (recur (+ i 1) (+ (* acc 256) (vector-at bytes i)) (+ bits 8) out))))))
+
+(defn request-cid [request :string] :string
+  ;; CIDv1 / raw / sha2-256. Hash bytes without re-encoding the request.
+  (if (not (nd-ascii? request)) ""
+    (nd-base32 (nd-append (vector-i64 1 85 18 32) (sha/sha256 (nd-bytes request))))))
+
+(defn state-commitment [context :string nonce :i64 store :string] :string
+  ;; Private domain commitment, deliberately NOT an Ethereum stateRoot.
+  (sha/sha256-hex (nd-bytes
+    (string-concat "awai.evm-state.v1\n"
+      (string-concat context (string-concat "\n" (string-concat (str nonce) (string-concat "\n" store))))))))
+
+(defn- nd-store [s :string] :vector-i64
+  (loop [i 0 out (vector-i64)]
+    (if (= i (string-length s)) out
+      (recur (+ i 64) (nd-append out (w/from-hex (string-substring s i (+ i 64))))))))
+
+(defn- nd-store-text [store :vector-i64] :string
+  (loop [i 0 out ""]
+    (if (= i (vector-count store)) out
+      (let [word (loop [j 0 v (vector-i64)]
+                   (if (= j 16) v (recur (+ j 1) (vector-conj v (vector-at store (+ i j))))))]
+        (recur (+ i 16) (string-concat out (w/to-hex word)))))))
+
+(defn- nd-context? [ctx :string] :bool
+  (and (nd-ascii? ctx) (= (n/fields ctx 124) 8)
+       (> (string-length (n/field ctx 124 0)) 0)
+       (> (string-length (n/field ctx 124 4)) 0)
+       (nd-hex? (n/field ctx 124 3)) (= (string-length (n/field ctx 124 3)) 64)
+       (nd-hex? (n/field ctx 124 5)) (= (string-length (n/field ctx 124 5)) 64)
+       (nd-hex? (n/field ctx 124 6)) (<= (string-length (n/field ctx 124 6)) 49152)
+       (nd-hex? (n/field ctx 124 7)) (= (rem (string-length (n/field ctx 124 7)) 128) 0)
+       (<= (string-length (n/field ctx 124 7)) 131072)))
+
+(defn- nd-grant [ctx :string] :string
+  (string-concat "awai.evm-grant.v1\n"
+    (string-concat (n/field ctx 124 0)
+      (string-concat "\n" (string-concat (n/field ctx 124 4)
+        (string-concat "\n" (string-concat (n/field ctx 124 5)
+          (string-concat "\n" (sha/sha256-hex (ed/hex-bytes (n/field ctx 124 6)))))))))))
+
+(defn- nd-request-body [request :string] :string
+  (loop [i 0 out "awai.evm-request.v1"]
+    (if (= i 7) out
+      (recur (+ i 1) (string-concat out (string-concat "\n" (n/field request 124 i)))))))
+
+(defn- nd-authorized? [ctx :string request :string] :bool
+  (and (= (n/fields request 124) 8)
+       (= (n/field request 124 0) (n/field ctx 124 0))
+       (= (n/field request 124 1) (n/field ctx 124 4))
+       (>= (n/number (n/field request 124 2)) 0)
+       (nd-hex? (n/field request 124 3)) (= (string-length (n/field request 124 3)) 64)
+       (> (n/number (n/field request 124 4)) 0) (<= (n/number (n/field request 124 4)) 30000000)
+       (nd-hex? (n/field request 124 5)) (<= (string-length (n/field request 124 5)) 131072)
+       (nd-hex? (n/field request 124 6)) (= (string-length (n/field request 124 6)) 128)
+       (nd-hex? (n/field request 124 7)) (= (string-length (n/field request 124 7)) 128)
+       (ed/verify? (ed/hex-bytes (n/field ctx 124 3)) (nd-bytes (nd-grant ctx))
+                   (ed/hex-bytes (n/field request 124 6)))
+       (ed/verify? (ed/hex-bytes (n/field ctx 124 5)) (nd-bytes (nd-request-body request))
+                   (ed/hex-bytes (n/field request 124 7)))))
+
+(defn- nd-find [catalog :string cid :string] :string
+  (loop [i 0]
+    (if (= i (n/fields catalog 10)) ""
+      (let [r (n/field catalog 10 i)]
+        (if (= (request-cid r) cid) r (recur (+ i 1)))))))
+
+(defn- nd-seen? [seen :string cid :string] :bool
+  (loop [i 0]
+    (if (= i (n/fields seen 44)) false
+      (if (= (n/field seen 44 i) cid) true (recur (+ i 1))))))
+
+(defn replay [ctx :string validators :string quorum :i64 prefix :string tip-qc :string
+              catalog :string] :string
+  ;; Entire genesis-to-tip proof is verified BEFORE any transition. Return
+  ;; ok|finalized-height|nonce|commitment|storage|receipt-list, or rejected.
+  ;; Receipts: CID,status,before,after,gas-left; statuses 20 authorization,
+  ;; 21 nonce, 22 stale state. Repeated identical CID yields one receipt.
+  ;; Deterministic replay is NOT durable exactly-once delivery qualification.
+  (cond
+    (or (not (nd-context? ctx)) (not (nd-ascii? catalog)) (> (string-length catalog) 1048576)
+        (> (n/fields catalog 10) 16)) "rejected:context-or-bounds"
+    :else
+    (let [height (n/verify-prefix (n/field ctx 124 1) (n/field ctx 124 2)
+                                 validators quorum prefix tip-qc)]
+      (if (< height 0) "rejected:proof"
+        (let [code (ed/hex-bytes (n/field ctx 124 6)) initial (n/field ctx 124 7)
+              checked (e/run (vector-i64 0) (vector-i64) (nd-store initial) (vector-i64) 1 false)]
+          (if (not (= (e/status checked) 1)) "rejected:genesis-storage"
+            (loop [block 1 proposal 0 count 0 nonce 0 store initial seen "" receipts ""]
+              (if (> block height)
+                (string-concat "ok|" (string-concat (str height)
+                  (string-concat "|" (string-concat (str nonce)
+                    (string-concat "|" (string-concat (state-commitment ctx nonce store)
+                      (string-concat "|" (string-concat store (string-concat "|" receipts)))))))))
+                (let [entries (n/field (n/field prefix 10 block) 124 2)]
+                  (if (= proposal (n/fields entries 44))
+                    (recur (+ block 1) 0 count nonce store seen receipts)
+                    (if (>= count 16) "rejected:execution-bound"
+                      (let [cid (n/field entries 44 proposal) request (nd-find catalog cid)]
+                        (if (nd-seen? seen cid)
+                          (recur block (+ proposal 1) count nonce store seen receipts)
+                          (if (= request "") "rejected:missing-request"
+                            (let [before (state-commitment ctx nonce store)
+                                  reason (cond (not (nd-authorized? ctx request)) 20
+                                               (not (= (n/number (n/field request 124 2)) nonce)) 21
+                                               (not (= (n/field request 124 3) before)) 22 :else 0)
+                                  m (e/run (if (= reason 0) code (vector-i64 0))
+                                      (if (= reason 0) (ed/hex-bytes (n/field request 124 5)) (vector-i64))
+                                      (nd-store store) (vector-i64)
+                                      (if (= reason 0) (n/number (n/field request 124 4)) 1) false)
+                                  state (if (= reason 0) (e/status m) reason)
+                                  executable (or (= state 1) (= state 2) (and (>= state 3) (<= state 7)) (= state 9))
+                                  next-nonce (+ nonce (if executable 1 0))
+                                  next-store (if (= state 1) (nd-store-text (e/storage m)) store)
+                                  after (state-commitment ctx next-nonce next-store)
+                                  receipt (string-concat cid (string-concat "," (string-concat (str state)
+                                    (string-concat "," (string-concat before (string-concat "," (string-concat after
+                                      (string-concat "," (str (if (= reason 0) (e/gas-left m) 0))))))))))]
+                              (if (or (= state 8) (= state 10) (= state 11)) "rejected:execution-profile"
+                                (recur block (+ proposal 1) (+ count 1) next-nonce next-store
+                                  (if (= seen "") cid (string-concat seen (string-concat "," cid)))
+                                  (if (= receipts "") receipt (string-concat receipts (string-concat ";" receipt))))))))))))))))))))
+
+(defn replay-after [ctx :string validators :string quorum :i64 prefix :string tip-qc :string
+                    catalog :string checkpoint :string] :string
+  ;; Only a host's separately trusted durable checkpoint is meaningful.
+  ;; This operation does not write or recover that checkpoint itself.
+  (if (< (n/verify-extension (n/field ctx 124 1) (n/field ctx 124 2)
+                             validators quorum prefix tip-qc checkpoint) 0)
+    "rejected:checkpoint"
+    (replay ctx validators quorum prefix tip-qc catalog)))

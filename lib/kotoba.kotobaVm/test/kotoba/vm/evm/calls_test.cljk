@@ -1,0 +1,259 @@
+(ns kotoba.vm.evm.calls-test
+  "Vectors for the evm-calls slice: CALL/STATICCALL/DELEGATECALL,
+  CREATE/CREATE2 (mock EAM), CALLCODE rejection, and LOG0..4.
+
+  Code is built from hex strings as byte vectors; every value past 2^53
+  rides the u256 hex-string surface, so the same file passes on :clj
+  and :cljs.
+
+  Call-stack note: the operand pushed FIRST sits deepest. For CALL the
+  test pushes (bottom→top) ret-size, ret-off, in-size, in-off, value,
+  callee, gas — gas is the TOP operand, pushed last."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.vm.evm.core :as core]
+            [kotoba.vm.evm.calls :as calls]
+            [kotoba.vm.evm.env :as env]
+            [kotoba.vm.evm.u256 :as u256]))
+
+(defn- hex-bytes
+  [& ss]
+  (mapv (fn [pair]
+          #?(:clj (Integer/parseInt pair 16)
+             :cljs (js/parseInt pair 16)))
+        (re-seq #".." (apply str ss))))
+
+(defn- code
+  [& parts]
+  (vec (mapcat (fn [p] (if (string? p) (hex-bytes p) [p])) parts)))
+
+(defn- push-word
+  "PUSHn (n = 1..32) for a u256 value: minimal immediate width."
+  [x]
+  (let [hx (u256/to-hex-string x)
+        trimmed (apply str (drop-while #(= \0 %) hx))
+        trimmed (if (empty? trimmed) "0" trimmed)
+        n' (max 1 (quot (+ (count trimmed) 1) 2))]
+    (into [(+ 0x5f n')]
+          (hex-bytes (subs hx (- 64 (* 2 n')))))))
+
+(defn- w [n] (u256/from-long n))
+(defn- word-hex [x] (u256/to-hex-string x))
+
+(def zero64 "0000000000000000000000000000000000000000000000000000000000000000")
+(def one64  "0000000000000000000000000000000000000000000000000000000000000001")
+
+(def callee-addr
+  (u256/from-hex-string "0xabababababababababababababababababababab"))
+
+(def callee-code
+  ;; PUSH1 0x2a, PUSH1 0x00, MSTORE, PUSH1 0x01, PUSH1 0x1f, RETURN
+  (code "602a5f526001601ff3"))
+
+(defn- run-with-code
+  ([code-vec] (core/run (core/make-machine code-vec)))
+  ([code-vec e] (core/run (core/make-machine code-vec 1000000 [] {} e))))
+
+(defn- env-code-for
+  "Env with a :code-for map entry."
+  [addr code-vec]
+  (assoc env/default-env :code-for {(word-hex addr) (vec code-vec)}))
+
+(defn- call-op
+  "A CALL/STATICCALL/DELEGATECALL invocation:
+  (call-op 0xf1 callee ret-size value) pushes, bottom→top:
+  ret-size, ret-off(0), in-size(0), in-off(0), [value], callee, gas(10000),
+  then the call opcode."
+  [op callee ret-size value]
+  (let [base [(push-word ret-size)   ; ret-size
+              (code "5f")            ; ret-off 0
+              (code "5f")            ; in-size 0
+              (code "5f")]           ; in-off 0
+        base (if value (into base [(push-word value)]) base)
+        base (into base [(push-word callee)
+                         (push-word (w 10000))
+                         [op]])]
+    (vec (apply concat base))))
+
+;; ---- LOG0..4 -----------------------------------------------------------------
+
+(deftest log0-appends-entry
+  (testing "LOG0 records address + data from memory"
+    ;; MSTORE(0, 0x2a) then LOG0(offset 31, size 1)
+    (let [m (run-with-code (code "602a5f52601f6001a0"))]
+      (is (= :stopped (:status m)))
+      (is (= 1 (count (:logs m))))
+      (is (= [0x2a] (vec (:data (first (:logs m))))))
+      (is (= zero64 (word-hex (:address (first (:logs m)))))))))
+
+(deftest log-with-topics
+  (testing "LOG1 carries one topic word"
+    ;; topic = 7; LOG1(offset 0, size 0, topic)
+    (let [m (run-with-code (vec (concat (push-word (w 7))
+                                        (code "5f5fa1"))))]
+      (is (= [(word-hex (w 7))] (mapv word-hex (:topics (first (:logs m))))))))
+  (testing "LOG3 carries three topics (deepest pushed first)"
+    (let [m (run-with-code (vec (concat (push-word (w 1))
+                                        (push-word (w 2))
+                                        (push-word (w 3))
+                                        (code "5f5fa3"))))]
+      (is (= [(word-hex (w 1)) (word-hex (w 2)) (word-hex (w 3))]
+             (mapv word-hex (:topics (first (:logs m)))))))))
+
+(deftest log-underflow-and-static
+  (testing "LOG0 with too few stack items is :invalid"
+    (is (= :invalid (:status (run-with-code (code "5fa0"))))))
+  (testing "LOG in a static context is an exceptional halt"
+    (let [m (core/run (core/make-machine (code "5f5fa0") 1000000 [] {}
+                                         nil {:static true}))]
+      (is (= :invalid (:status m)))
+      (is (= "static context violation (LOG)" (:invalid-reason m))))))
+
+(deftest log-gas-is-charged
+  (testing "LOG0 costs base + 375 + 8*size on top of the surrounding ops"
+    (let [m-log (run-with-code (code "602a5f52601f6001a0"))
+          m-no-log (run-with-code (code "602a5f52601f6001"))]
+      (is (= (- (:gas m-no-log) 385) (:gas m-log)))))) ;; 2 static + 375 + 8
+
+;; ---- CALL ----------------------------------------------------------------------
+
+(deftest call-runs-callee-and-returns
+  (testing "CALL executes callee code; child RETURN lands in :returndata"
+    (let [m (run-with-code (call-op 0xf1 callee-addr (w 0) (w 0))
+                           (env-code-for callee-addr callee-code))]
+      (is (= :stopped (:status m)))
+      (is (= one64 (word-hex (last (:stack m)))))
+      (is (= [0x2a] (vec (:returndata m)))))))
+
+(deftest call-copies-returndata-to-memory
+  (testing "CALL copies child output to retOffset"
+    (let [m (run-with-code (call-op 0xf1 callee-addr (w 1) (w 0))
+                           (env-code-for callee-addr callee-code))]
+      (is (= one64 (word-hex (last (:stack m)))))
+      (is (= 0x2a (first (:memory m))) "copy lands at ret-offset 0")
+      (is (= [0x2a] (vec (:returndata m)))))))
+
+(deftest call-to-empty-address-pushes-zero
+  (testing "CALL into an empty account succeeds (pushes 1, empty returndata)"
+    (let [m (run-with-code (call-op 0xf1 callee-addr (w 0) (w 0)))]
+      (is (= one64 (word-hex (last (:stack m)))))
+      (is (= :stopped (:status m)))
+      (is (= [] (vec (:returndata m)))))))
+
+(deftest callcode-is-undefined-opcode
+  (testing "CALLCODE (0xf2) is rejected as undefined opcode 0xf2"
+    (let [m (run-with-code (call-op 0xf2 callee-addr (w 0) (w 0))
+                           (env-code-for callee-addr callee-code))]
+      (is (= :invalid (:status m)))
+      (is (= "invalid opcode 0xf2" (:invalid-reason m))))))
+
+;; ---- STATICCALL ------------------------------------------------------------------
+
+(deftest staticcall-runs-callee
+  (testing "STATICCALL executes callee code (no value operand)"
+    (let [m (run-with-code (call-op 0xfa callee-addr (w 0) nil)
+                           (env-code-for callee-addr callee-code))]
+      (is (= :stopped (:status m)))
+      (is (= one64 (word-hex (last (:stack m)))))
+      (is (= [0x2a] (vec (:returndata m)))))))
+
+(deftest staticcall-child-sstore-halts
+  (testing "SSTORE inside a STATICCALL child halts the child; parent pushes 0"
+    (let [m (run-with-code (call-op 0xfa callee-addr (w 0) nil)
+                           (env-code-for callee-addr (code "60015f55")))]
+      (is (= :stopped (:status m)))
+      (is (= zero64 (word-hex (last (:stack m))))))))
+
+(deftest call-in-static-context-halts
+  (testing "plain CALL inside a static frame is an exceptional halt"
+    (let [m (core/run (core/make-machine (call-op 0xf1 callee-addr (w 0) (w 0))
+                                         1000000 [] {}
+                                         (env-code-for callee-addr callee-code)
+                                         {:static true}))]
+      (is (= :invalid (:status m)))
+      (is (= "static context violation (call)" (:invalid-reason m))))))
+
+;; ---- DELEGATECALL ------------------------------------------------------------------
+
+(deftest delegatecall-sees-parent-storage
+  (testing "DELEGATECALL child reads the PARENT's storage"
+    (let [m0 (core/make-machine (call-op 0xf4 callee-addr (w 32) nil)
+                                1000000 [] {}
+                                (env-code-for callee-addr
+                                              (code "5f545f5260205ff3")))
+          ;; SLOAD(0), PUSH1 32, PUSH0, RETURN — reads parent's slot 0
+          m0 (assoc m0 :storage {u256/zero-hex (w 42)})
+          m (core/run m0)]
+      (is (= :stopped (:status m)))
+      (is (= one64 (word-hex (last (:stack m)))))
+      (is (= (word-hex (w 42))
+             (word-hex (u256/from-hex-string
+                        (apply str
+                               (map (fn [b]
+                                      #?(:clj (format "%02x" b)
+                                         :cljs (let [s (.toString (js/Number b) 16)]
+                                                 (if (< b 16) (str "0" s) s))))
+                                    (take 32 (:returndata m)))))))))))
+
+;; ---- CREATE / CREATE2 --------------------------------------------------------------
+
+(defn- mem-write-code
+  "MSTORE8 each byte of `bs` at offset 0, 1, 2, ... (code shape)."
+  [bs]
+  (vec (apply concat (map (fn [i b]
+                            [(+ 0x5f 1) b   ; PUSH1 b
+                             (+ 0x5f 1) i   ; PUSH1 i (offset)
+                             0x53])         ; MSTORE8
+                          (range) bs))))
+
+(defn- create-op
+  "CREATE (or CREATE2 with salt) over init code previously written to
+  memory offset 0 with `mem-write-code`. Pushes: value, offset 0,
+  size, [salt], CREATE."
+  [init-bytes salt]
+  (let [base [(push-word (w 0))                     ; value
+              (code "5f")                           ; offset 0
+              (push-word (w (count init-bytes)))]   ; size
+        base (if salt (into base [(push-word salt)]) base)
+        base (into base [[0xf0]])]
+    (vec (apply concat base))))
+
+(def ^:private init-code
+  ;; PUSH1 0x2a, PUSH1 0x00, MSTORE8, PUSH1 0x01, PUSH1 0x00, RETURN
+  (hex-bytes "602a60005360016000f3"))
+
+(deftest create-deploys-returned-code
+  (testing "CREATE runs init code; RETURN payload becomes deployed code"
+    (let [m (run-with-code (vec (concat (mem-write-code init-code)
+                                        (create-op init-code nil))))]
+      (is (= :stopped (:status m)))
+      (let [addr (last (:stack m))]
+        (is (not= zero64 (word-hex addr)))
+        ;; the mock EAM records the RETURN payload (runtime code) —
+        ;; init returned 1 byte: 0x2a
+        (is (= [0x2a] (get-in m [:env :code-for (word-hex addr)])))))))
+
+(deftest create2-address-is-deterministic
+  (testing "CREATE2 with the same inputs yields the same mock address"
+    (is (= (calls/create-address-word (w 1) (w 9) true)
+           (calls/create-address-word (w 1) (w 9) true)))
+    (testing "different salt → different address"
+      (is (not= (calls/create-address-word (w 1) (w 9) true)
+                (calls/create-address-word (w 1) (w 10) true))))
+    (testing "CREATE (nonce-based) vs CREATE2 differ at the same value"
+      (is (not= (calls/create-address-word (w 1) (w 9) false)
+                (calls/create-address-word (w 1) (w 9) true))))
+    (testing "address is 20 bytes (top 12 bytes zero)"
+      (is (= "000000000000000000000000"
+             (subs (word-hex (calls/create-address-word (w 1) (w 9) true))
+                   0 24))))))
+
+(deftest create-in-static-context-halts
+  (testing "CREATE inside a static frame is an exceptional halt"
+    (let [m (core/run (core/make-machine (code "5f5f5ff0") 1000000 [] {}
+                                         nil {:static true}))]
+      (is (= :invalid (:status m)))
+      (is (= "static context violation (CREATE)" (:invalid-reason m))))
+    (testing "CREATE2 likewise"
+      (let [m (core/run (core/make-machine (code "5f5f5f5ff5") 1000000 [] {}
+                                           nil {:static true}))]
+        (is (= :invalid (:status m)))))))

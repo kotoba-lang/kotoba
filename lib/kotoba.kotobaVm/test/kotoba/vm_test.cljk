@@ -1,0 +1,268 @@
+(ns kotoba.vm-test
+  (:require #?(:clj [kotoba.test :refer [deftest is]]
+               :cljs [cljs.test :refer [deftest is] :include-macros true])
+            [ipld.core :as ipld]
+            [kotoba.vm :as vm]
+            [kotoba.vm.kernel :as k]))
+
+(def inc-ops
+  [["self" "s"]
+   ["open" "s" "h"]
+   ["node" "h" "n"]
+   ["get" "n" "count" "c"]
+   ["inc" "c" "c"]
+   ["put" "n" "count" "c" "n"]
+   ["write-node" "n" "s"]
+   ["set-state" "s"]
+   ["return" "c"]])
+
+(def poke-ops
+  (into inc-ops
+        [["args" "a"]
+         ["nth" "a" 0 "t"]
+         ["const" "e" []]
+         ["call" "t" "inc" "e" "r"]]))
+
+(def burn-ops
+  ;; Write 99, then an unknown op so the invocation aborts AFTER the
+  ;; write. The kernel must drop that write and leave the caller running.
+  [["self" "s"]
+   ["open" "s" "h"]
+   ["node" "h" "n"]
+   ["const" "c" 99]
+   ["put" "n" "count" "c" "n"]
+   ["write-node" "n" "s"]
+   ["set-state" "s"]
+   ["nope"]])
+
+(defn guest-node
+  ([] (guest-node {"inc" inc-ops "poke" poke-ops "burn" burn-ops}))
+  ([methods]
+   {"kotoba.vm/guest" 1
+    "methods" methods}))
+
+(defn seed!
+  "Put code + zero state. Returns {:code :state :store :machine}."
+  ([] (seed! nil))
+  ([put-log]
+   (let [store (vm/memory-store)
+         put! (if put-log
+                (fn [cid bytes]
+                  (swap! put-log conj cid)
+                  ((:put! store) cid bytes))
+                (:put! store))
+         get-fn (:get-fn store)
+         machine {:get-fn get-fn :put! put!}
+         code (vm/put-code! put! (guest-node))
+         state (ipld/put-node! put! {"count" 0})]
+     {:store store
+      :machine machine
+      :code code
+      :state state
+      :put-log put-log})))
+
+(defn actor [code state]
+  {:code code :state state :nonce 0 :balance 0})
+
+(defn count-at [store cid]
+  (get (ipld/get-node (:get-fn store) cid) "count"))
+
+(deftest two-machines-agree-on-the-next-state
+  (let [a (seed!)
+        b (seed!)
+        msg (fn [s]
+              {:actors {"alice" (actor (:code s) (:state s))}
+               :from "bob" :to "alice" :method "inc" :args [] :fuel 10000})
+        ra (vm/apply-message (:machine a) (msg a))
+        rb (vm/apply-message (:machine b) (msg b))]
+    (is (:ok? ra))
+    (is (:ok? rb))
+    (is (= (get-in ra [:actors "alice" :state])
+           (get-in rb [:actors "alice" :state])))
+    (is (= 1 (count-at (:store a) (get-in ra [:actors "alice" :state]))))
+    (is (= 1 (count-at (:store b) (get-in rb [:actors "alice" :state]))))))
+
+(deftest fuel-exhaustion-is-a-value-and-does-not-move-state
+  (let [{:keys [machine store code state]} (seed!)
+        actors {"alice" (actor code state)}
+        r (vm/apply-message machine
+                            {:actors actors :from "bob" :to "alice"
+                             :method "inc" :args [] :fuel 5})]
+    (is (not (:ok? r)))
+    (is (= :fuel-exhausted (get-in r [:receipt :exit])))
+    (is (pos? (get-in r [:receipt :fuel-used])))
+    (is (= actors (:actors r)))
+    (is (= 0 (count-at store state)))
+    (is (= state (get-in r [:actors "alice" :state])))))
+
+(deftest ipld-write-link-open-read-roundtrip
+  (let [store (vm/memory-store)
+        ctx {:get-fn (:get-fn store)
+             :put! (:put! store)
+             :overlay {}
+             :handles {}
+             :next-handle 1
+             :spent 0
+             :budget 10000
+             :exhausted? false
+             :aborted? false
+             :crossings 0
+             :copied-bytes 0
+             :actors {}
+             :self-state nil}
+        ctx (k/write-node ctx {"k" "v" "n" 1})
+        cid (:result ctx)
+        ctx (k/flush! ctx)
+        ctx (k/ipld-open ctx cid)
+        h (:result ctx)
+        ctx (k/ipld-node ctx h)
+        node (:result ctx)
+        ctx (k/ipld-stat ctx h)]
+    (is (string? cid))
+    (is (= \b (first cid)))
+    (is (= "v" (get node "k")))
+    (is (= 1 (get node "n")))
+    (is (= cid (:cid (:result ctx))))
+    (is (pos? (:size (:result ctx))))
+    (is (= cid (ipld/cid ((:get-fn store) cid))))))
+
+(deftest cross-actor-call-updates-both
+  (let [{:keys [machine store code state]} (seed!)
+        actors {"alice" (actor code state)
+                "bob" (actor code (ipld/put-node! (:put! machine) {"count" 0}))}
+        r (vm/apply-message machine
+                            {:actors actors :from "carol" :to "alice"
+                             :method "poke" :args ["bob"] :fuel 10000})]
+    (is (:ok? r) (pr-str (:receipt r)))
+    (is (= 1 (count-at store (get-in r [:actors "alice" :state]))))
+    (is (= 1 (count-at store (get-in r [:actors "bob" :state]))))
+    (is (not= (get-in actors ["bob" :state])
+              (get-in r [:actors "bob" :state])))))
+
+(deftest nested-exhaustion-reverts-the-whole-message
+  ;; poke = alice inc (48) + call (100) + bob inc (48) ≈ 200.
+  ;; 160 lets alice write and enter the call, then bob runs out.
+  ;; Shared tank: parent is exhausted too, so nothing flushes.
+  (let [{:keys [machine store code state]} (seed!)
+        bob-state (ipld/put-node! (:put! machine) {"count" 0})
+        actors {"alice" (actor code state)
+                "bob" (actor code bob-state)}
+        r (vm/apply-message machine
+                            {:actors actors :from "carol" :to "alice"
+                             :method "poke" :args ["bob"] :fuel 160})]
+    (is (not (:ok? r)))
+    (is (= :fuel-exhausted (get-in r [:receipt :exit])))
+    (is (= actors (:actors r)))
+    (is (= 0 (count-at store state)))
+    (is (= 0 (count-at store bob-state)))))
+
+(deftest nested-revert-keeps-parent-overlay-when-parent-lands
+  ;; A dedicated method: write self, call burn, return. burn writes 99
+  ;; then wastes fuel. Parent should land count=1; bob stays 0.
+  (let [methods {"inc" inc-ops
+                 "burn" burn-ops
+                 "then-burn" (into inc-ops
+                                   [["args" "a"]
+                                    ["nth" "a" 0 "t"]
+                                    ["const" "e" []]
+                                    ["call" "t" "burn" "e" "r"]])}
+        store (vm/memory-store)
+        machine {:get-fn (:get-fn store) :put! (:put! store)}
+        code (vm/put-code! (:put! machine) (guest-node methods))
+        alice-state (ipld/put-node! (:put! machine) {"count" 0})
+        bob-state (ipld/put-node! (:put! machine) {"count" 0})
+        actors {"alice" (actor code alice-state)
+                "bob" (actor code bob-state)}
+        r (vm/apply-message machine
+                            {:actors actors :from "carol" :to "alice"
+                             :method "then-burn" :args ["bob"] :fuel 10000})]
+    (is (:ok? r) (pr-str (:receipt r)))
+    (is (= 1 (count-at store (get-in r [:actors "alice" :state]))))
+    (is (= bob-state (get-in r [:actors "bob" :state])))
+    (is (= 0 (count-at store bob-state)))
+    (is (not-any? (fn [bytes]
+                    (= 99 (get (ipld/decode bytes) "count")))
+                  (vals @(:blocks store))))))
+
+(deftest guest-cannot-put-except-through-syscall-flush
+  (let [puts (atom [])
+        {:keys [machine code state]} (seed! puts)
+        before (count @puts)
+        exhausted (vm/apply-message machine
+                                    {:actors {"alice" (actor code state)}
+                                     :from "bob" :to "alice"
+                                     :method "inc" :args [] :fuel 5})]
+    (is (not (:ok? exhausted)))
+    (is (= before (count @puts))
+        "exhaustion must not flush overlay into the store")
+    (let [ok (vm/apply-message machine
+                               {:actors {"alice" (actor code state)}
+                                :from "bob" :to "alice"
+                                :method "inc" :args [] :fuel 10000})]
+      (is (:ok? ok))
+      (is (> (count @puts) before)))))
+
+(deftest host-guest-syscalls-hide-the-store
+  (let [seen (atom nil)
+        host (fn [sys _msg]
+               (reset! seen (set (keys sys)))
+               (let [root ((:self-root sys))
+                     h ((:open sys) root)
+                     node ((:node sys) h)
+                     n (inc (or (get node "count") 0))
+                     cid ((:write-node sys) (assoc node "count" n))]
+                 ((:set-state sys) cid)
+                 ((:return sys) n)
+                 {:state cid :return n}))
+        store (vm/memory-store)
+        machine {:get-fn (:get-fn store)
+                 :put! (:put! store)
+                 :host-guests {"counter" host}}
+        code (vm/put-code! (:put! machine) {"kotoba.vm/guest" 1 "host" "counter"})
+        state (ipld/put-node! (:put! machine) {"count" 3})
+        r (vm/apply-message machine
+                            {:actors {"alice" (actor code state)}
+                             :from "bob" :to "alice"
+                             :method "inc" :args [] :fuel 10000})]
+    (is (:ok? r) (pr-str (:receipt r)))
+    (is (= 4 (count-at store (get-in r [:actors "alice" :state]))))
+    (is (contains? @seen :open))
+    (is (not (contains? @seen :get-fn)))
+    (is (not (contains? @seen :put!)))
+    (is (not (contains? @seen :overlay)))))
+
+(deftest crossings-are-counted
+  (let [{:keys [machine code state]} (seed!)
+        r (vm/apply-message machine
+                            {:actors {"alice" (actor code state)}
+                             :from "bob" :to "alice"
+                             :method "inc" :args [] :fuel 10000})]
+    (is (:ok? r))
+    (is (pos? (get-in r [:receipt :crossings])))
+    (is (pos? (get-in r [:receipt :copied-bytes])))))
+
+(deftest invoke-fn-matches-inga-shape
+  (let [{:keys [machine code state]} (seed!)
+        f (vm/invoke-fn machine)
+        ok (f {:address "alice" :caller "bob" :code code :state state
+               :method "inc" :args [] :fuel 10000})
+        no (f {:address "alice" :caller "bob" :code code :state state
+               :method "missing" :args [] :fuel 10000})
+        dry (f {:address "alice" :caller "bob" :code code :state state
+                :method "inc" :args [] :fuel 5})]
+    (is (string? (:state ok)))
+    (is (not= state (:state ok)))
+    (is (= :not-callable (:refused no)))
+    (is (= :fuel-exhausted (:refused dry)))))
+
+(deftest corrupt-store-throws-not-refused
+  (let [{:keys [machine code state store]} (seed!)
+        ;; Swap the code CID's bytes for some other block.
+        other (ipld/encode {"not" "code"})
+        _ (swap! (:blocks store) assoc code other)
+        f (vm/invoke-fn machine)]
+    (is (thrown-with-msg?
+         js/Error
+         #"CID mismatch"
+         (f {:address "alice" :caller "bob" :code code :state state
+             :method "inc" :args [] :fuel 10000})))))

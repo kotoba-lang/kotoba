@@ -1,0 +1,87 @@
+;; EIP-198 arithmetic with EIP-2565 gas. Variable-width little-endian
+;; base-65536 limbs support both odd and even moduli, without host BigInt.
+(ns kotoba.vm.evm.native-modexp
+ (:require [kotoba.vm.evm.native-word :as w]
+           [kotoba.vm.evm.native-bytes :as b]))
+(defn length [input :vector-i64 offset :i64] :i64
+ (w/bounded-long (w/from-bytes input offset 32) 1000000000))
+(defn cost [input :vector-i64] :i64
+ (let [bl (w/bounded-long (w/from-bytes input 0 32) 68719476736)
+       ew (w/from-bytes input 32 32)
+       ml (w/bounded-long (w/from-bytes input 64 32) 68719476736)
+       mx (if (> bl ml) bl ml) words (quot (+ mx 7) 8)]
+  (if (= words 0) 200
+   (if (or (>= mx 68719476736) (not (w/less-word ew (w/from-hex "10000000000000000")))) -1
+    (let [el (w/bounded-long ew 32)
+         head (w/from-bytes input (+ 96 bl) el)
+         bits (loop [i 255] (if (< i 0) 0 (if (= (w/bit-at head i) 1) i (recur (- i 1)))))
+         iterations (w/add-word (if (w/less-word (w/from-long 32) ew)
+                                 (w/multiply-word (w/subtract-word ew (w/from-long 32)) (w/from-long 8))
+                                 (w/zero-word)) (w/from-long bits))
+         rounds (if (w/zero? iterations) (w/from-long 1) iterations)
+         square (w/multiply-word (w/from-long words) (w/from-long words))
+         gas (w/divide-word (w/multiply-word square rounds) (w/from-long 3))]
+     (if (w/less-word (w/from-hex "7fffffffffffffff") gas) -1
+      (let [value (w/bounded-long gas 9223372036854775807)] (if (< value 200) 200 value))))))))
+(defn- nm-copy [out :vector-i64 in :vector-i64] :i64
+ (loop [i 0] (if (= i (vector-count out)) 0 (let [a (vector-assoc! out i (vector-at in i))] (recur (+ i 1))))))
+(defn- nm-zero [out :vector-i64] :i64
+ (loop [i 0] (if (= i (vector-count out)) 0 (let [a (vector-assoc! out i 0)] (recur (+ i 1))))))
+(defn- nm-less [a :vector-i64 b :vector-i64] :bool
+ (loop [i (- (vector-count a) 1)]
+  (if (< i 0) false (cond (< (vector-at a i) (vector-at b i)) true
+                         (> (vector-at a i) (vector-at b i)) false :else (recur (- i 1))))))
+(defn- nm-subtract [out :vector-i64 p :vector-i64] :i64
+ (loop [i 0 borrow 0]
+  (if (= i (vector-count out)) 0
+   (let [x (- (vector-at out i) (vector-at p i) borrow)
+         a (vector-assoc! out i (bit-and x 65535))] (recur (+ i 1) (if (< x 0) 1 0))))))
+(defn- nm-add [out :vector-i64 a :vector-i64 b :vector-i64 p :vector-i64 bit :i64] :i64
+ ;; Inputs are reduced; out may alias either input. The carry is retained
+ ;; outside the fixed-width sum so moduli near a limb boundary stay exact.
+ (let [carry (loop [i 0 c bit]
+              (if (= i (vector-count out)) c
+               (let [x (+ (vector-at a i) (vector-at b i) c)
+                     z (vector-assoc! out i (bit-and x 65535))] (recur (+ i 1) (quot x 65536)))))]
+  (if (or (> carry 0) (not (nm-less out p))) (nm-subtract out p) 0)))
+(defn- nm-reduce [out :vector-i64 input :vector-i64 offset :i64 size :i64 p :vector-i64] :i64
+ (loop [i 0]
+  (if (= i (* size 8)) 0
+   (let [position (+ offset (quot i 8)) byte (if (< position (vector-count input)) (vector-at input position) 0)
+         bit (bit-and (i64-shift-right byte (- 7 (rem i 8))) 1)
+         z (nm-add out out out p bit)] (recur (+ i 1))))))
+(defn- nm-multiply [out :vector-i64 a :vector-i64 b :vector-i64 p :vector-i64] :i64
+ (arena-scope
+  (let [n (vector-count out) acc (vector-alloc n) current (vector-alloc n)
+        copied (nm-copy current a)
+        bits (loop [i (- (* n 16) 1)] (if (< i 0) 0
+                (if (= (bit-and (i64-shift-right (vector-at b (quot i 16)) (rem i 16)) 1) 1) (+ i 1) (recur (- i 1)))))
+        done (loop [i 0]
+         (if (= i bits) 0
+          (let [add (if (= (bit-and (i64-shift-right (vector-at b (quot i 16)) (rem i 16)) 1) 1) (nm-add acc acc current p 0) 0)
+                doubled (nm-add current current current p 0)] (recur (+ i 1)))))]
+   (nm-copy out acc))))
+(defn execute [input :vector-i64] :vector-i64
+ ;; Caller must first charge cost and enforce the native resource policy.
+ (let [bl (length input 0) el (length input 32) ml (length input 64) n (quot (+ ml 1) 2)
+       p (vector-alloc n)
+       loaded (loop [i 0] (if (= i ml) 0
+                (let [off (+ 96 bl el i) byte (if (< off (vector-count input)) (vector-at input off) 0)
+                      pos (- ml i 1) limb (quot pos 2)
+                      z (vector-assoc! p limb (bit-or (vector-at p limb) (i64-shift-left byte (* (rem pos 2) 8))))] (recur (+ i 1)))))
+       zero? (loop [i 0] (if (= i n) true (if (= (vector-at p i) 0) (recur (+ i 1)) false)))
+       out (vector-alloc ml)]
+  (if (or (= ml 0) zero?) out
+   (let [acc (vector-alloc n) base (vector-alloc n) one (vector-alloc n)
+         setone (vector-assoc! one 0 1)
+         initial (if (nm-less one p) (nm-copy acc one) 0)
+         reduced (nm-reduce base input 96 bl p)
+         powered (loop [i 0 started false]
+          (if (= i (* el 8)) 0
+           (let [off (+ 96 bl (quot i 8)) byte (if (< off (vector-count input)) (vector-at input off) 0)
+                 bit (bit-and (i64-shift-right byte (- 7 (rem i 8))) 1)
+                 square (if started (nm-multiply acc acc acc p) 0)
+                 product (if (= bit 1) (nm-multiply acc acc base p) 0)]
+            (recur (+ i 1) (or started (= bit 1))))))
+         written (loop [i 0] (if (= i ml) 0
+                   (let [pos (- ml i 1) z (vector-assoc! out i (bit-and (i64-shift-right (vector-at acc (quot pos 2)) (* (rem pos 2) 8)) 255))] (recur (+ i 1)))))] out))))

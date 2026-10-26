@@ -1,0 +1,369 @@
+(ns kotoba.vm.kototama.interpreter
+  "Small, closed evaluator for canonical Kototama i64/v1 program artifacts.
+
+  The evaluator never reads source or calls host eval. Each expression consumes
+  guest fuel; unsupported tags and builtins fail closed."
+  (:require [kotoba.vm.kernel :as kernel]
+            [kotoba.vm.syscall :as syscall]
+            [kotoba.vm.kototama.datalog :as datalog]))
+
+(defrecord RecurFlow [values])
+
+(def ^:private min-i64-text "-9223372036854775808")
+(def ^:private max-i64-text "9223372036854775807")
+
+(defn- invalid! [reason data]
+  (throw (ex-info "Kototama program cannot be evaluated by the selected data profile"
+                  (merge {:type :kototama.vm/not-callable :reason reason} data))))
+
+(defn- halted? [ctx]
+  (or (:exhausted? ctx) (:aborted? ctx)))
+
+(defn- charge [ctx]
+  (kernel/charge ctx (syscall/costs :guest/op)))
+
+(defn- parse-i64 [value]
+  (when-not (and (string? value)
+                 (re-matches #"-?(0|[1-9][0-9]*)" value))
+    (invalid! :invalid-i64-literal {:value value}))
+  #?(:clj (try (Long/parseLong value)
+               (catch NumberFormatException _
+                 (invalid! :i64-literal-out-of-range {:value value})))
+     :cljs (try
+             (let [parsed (js/BigInt value)]
+               (when (or (< parsed (js/BigInt min-i64-text))
+                         (> parsed (js/BigInt max-i64-text)))
+                 (invalid! :i64-literal-out-of-range {:value value}))
+               parsed)
+             (catch :default _
+               (invalid! :i64-literal-out-of-range {:value value})))
+     :default (invalid! :unsupported-runtime {})))
+
+(defn- i64? [value]
+  #?(:clj (integer? value)
+     :cljs (identical? js/BigInt (type value))
+     :default false))
+
+(defn- argument-i64 [value]
+  #?(:clj (if (integer? value) (parse-i64 (str value))
+              (invalid! :argument-is-not-i64 {:value value}))
+     :cljs (cond
+             (identical? js/BigInt (type value)) (parse-i64 (.toString value))
+             (and (number? value) (js/Number.isSafeInteger value))
+             (parse-i64 (str value))
+             :else (invalid! :argument-is-not-i64 {:value value}))
+     :default (invalid! :unsupported-runtime {})))
+
+(defn- zero-i64? [value]
+  #?(:clj (zero? (long value))
+     :cljs (= (js/BigInt 0) value)
+     :default false))
+
+(defn- wrap-add [a b]
+  #?(:clj (unchecked-add (long a) (long b))
+     :cljs (js/BigInt.asIntN 64 (+ a b))
+     :default 0))
+(defn- wrap-sub [a b]
+  #?(:clj (unchecked-subtract (long a) (long b))
+     :cljs (js/BigInt.asIntN 64 (- a b))
+     :default 0))
+(defn- wrap-mul [a b]
+  #?(:clj (unchecked-multiply (long a) (long b))
+     :cljs (js/BigInt.asIntN 64 (* a b))
+     :default 0))
+
+(defn- less? [a b]
+  #?(:clj (< (long a) (long b))
+     :cljs (< a b)
+     :default false))
+(defn- equal-i64? [a b]
+  #?(:clj (= (long a) (long b))
+     :cljs (= a b)
+     :default false))
+
+(defn- decode-value [value]
+  (if (and (vector? value) (= "integer" (first value)) (= 2 (count value)))
+    (parse-i64 (second value))
+    (cond
+      (or (nil? value) (boolean? value) (string? value)) value
+      (vector? value) (mapv decode-value value)
+      (map? value) (reduce-kv (fn [out key val]
+                                (assoc out (decode-value key) (decode-value val)))
+                              {} value)
+      :else (invalid! :unsupported-constant {:value value}))))
+
+(defn- value-profile? [ctx]
+  (= "kototama.data-i64/v1" (::value-profile ctx)))
+
+(defn- argument-value [value]
+  (cond
+    (nil? value) nil
+    (boolean? value) value
+    (string? value) value
+    (i64? value) (parse-i64 (str value))
+    #?(:cljs (and (number? value) (js/Number.isSafeInteger value)) :clj false)
+    (parse-i64 (str value))
+    (vector? value) (mapv argument-value value)
+    (map? value) (reduce-kv (fn [out key val]
+                              (assoc out (argument-value key) (argument-value val)))
+                            {} value)
+    :else (invalid! :argument-is-not-a-portable-value {:value value})))
+
+(defn- truthy? [ctx value]
+  (if (value-profile? ctx)
+    (not (or (nil? value) (false? value)))
+    (not (zero-i64? value))))
+
+(declare eval-expression invoke-method)
+
+(defn- authorize-method [ctx name method args]
+  (let [effects (get method "effects")
+        facts-fn (:authority-facts-fn ctx)]
+    (if (empty? effects)
+      ctx
+      (if-not (ifn? facts-fn)
+        (kernel/abort ctx :unauthorized)
+        (loop [ctx ctx, remaining (seq effects)]
+          (if (or (halted? ctx) (nil? remaining))
+            ctx
+            (let [effect (first remaining)
+                  proof (try
+                          (facts-fn {:actor (:to ctx)
+                                     :caller (:from ctx)
+                                     :program (get-in ctx [:actors (:to ctx) :code])
+                                     :actor-state (:self-state ctx)
+                                     :method name
+                                     :effect effect
+                                     :args args
+                                     :authority-proof (:authority-proof ctx)
+                                     :depth (:depth ctx 0)})
+                          (catch #?(:clj Exception :cljs :default) _ nil))
+                  result (when (map? proof)
+                           (datalog/authorize (:origin-facts proof)
+                                              (:to ctx) effect (:resource proof)
+                                              (:datalog-budget ctx)))
+                  fuel-cost (* (long (or (:fuel-used result) 0))
+                               (long (syscall/costs :guest/op)))
+                  ctx (kernel/charge ctx fuel-cost)]
+              (cond
+                (halted? ctx) ctx
+                (= :resource-exhaustion (:decision result))
+                (assoc ctx :exhausted? true :last-error :fuel-exhausted)
+                (= :allow (:decision result))
+                (recur (update ctx :authority-decisions (fnil conj [])
+                               {:method name :effect effect
+                                :resource (:resource proof)})
+                       (next remaining))
+                :else (kernel/abort ctx :unauthorized)))))))))
+
+(defn- eval-many [ctx expressions env methods depth]
+  (loop [ctx ctx, remaining (seq expressions), values []]
+    (cond
+      (halted? ctx) [ctx values]
+      (nil? remaining) [ctx values]
+      :else (let [[ctx value] (eval-expression ctx (first remaining) env methods depth)]
+              (recur ctx (next remaining) (conj values value))))))
+
+(defn- arithmetic [op values]
+  (let [values (mapv #(parse-i64 (str %)) values)]
+    (case op
+      "add" (reduce wrap-add #?(:clj 0 :cljs (js/BigInt 0)) values)
+      "sub" (do
+              (when (empty? values) (invalid! :invalid-arithmetic-arity {:op op}))
+              (if (= 1 (count values)) (wrap-sub 0 (first values))
+                  (reduce wrap-sub values)))
+      "mul" (reduce wrap-mul #?(:clj 1 :cljs (js/BigInt 1)) values)
+      "div" (do
+              (when-not (= 2 (count values))
+                (invalid! :invalid-arithmetic-arity {:op op}))
+              (let [[a b] values]
+                (when (zero-i64? b) (invalid! :division-by-zero {}))
+                (when (and (= min-i64-text (str a)) (equal-i64? b -1))
+                  (invalid! :signed-division-overflow {}))
+                #?(:clj (quot a b)
+                   :cljs (/ a b)
+                   :default 0)))
+      "quot" (arithmetic "div" values)
+      "mod" (do
+              (when-not (= 2 (count values))
+                (invalid! :invalid-arithmetic-arity {:op op}))
+              (let [[a b] values]
+                (when (zero-i64? b) (invalid! :division-by-zero {}))
+                #?(:clj (rem a b)
+                   :cljs (- a (* b (/ a b)))
+                   :default 0)))
+      (invalid! :unknown-arithmetic-op {:op op}))))
+
+(defn- comparison [ctx op values]
+  (let [n (count values)
+        pairs (partition 2 1 values)
+        _ (when (and (value-profile? ctx)
+                     (not= "=" op)
+                     (not-every? i64? values))
+            (invalid! :ordered-comparison-requires-i64 {:op op}))
+        result (case op
+                 "=" (if (value-profile? ctx)
+                       (every? (fn [[a b]] (= a b)) pairs)
+                       (every? (fn [[a b]] (equal-i64? a b)) pairs))
+                 "<" (every? (fn [[a b]] (less? a b)) pairs)
+                 ">" (every? (fn [[a b]] (less? b a)) pairs)
+                 "<=" (every? (fn [[a b]] (or (less? a b) (equal-i64? a b))) pairs)
+                 ">=" (every? (fn [[a b]] (or (less? b a) (equal-i64? a b))) pairs)
+                 (invalid! :unknown-comparison-op {:op op}))]
+    (when (< n 2) (invalid! :invalid-comparison-arity {:op op :arity n}))
+    (if (value-profile? ctx)
+      result
+      (if result #?(:clj 1 :cljs (js/BigInt 1) :default 1)
+          #?(:clj 0 :cljs (js/BigInt 0) :default 0)))))
+
+(defn- eval-expression [ctx expression env methods depth]
+  (let [ctx (charge ctx)]
+    (if (halted? ctx)
+      [ctx nil]
+      (let [[tag a b c] expression]
+        (case tag
+          "const" [ctx (decode-value a)]
+          "var" (if (contains? env a) [ctx (get env a)]
+                    (invalid! :unbound-variable {:name a}))
+          "if" (let [[ctx test-value] (eval-expression ctx a env methods depth)]
+                 (if (or (halted? ctx) (instance? RecurFlow test-value))
+                   [ctx test-value]
+                   (eval-expression ctx (if (truthy? ctx test-value) b c) env methods depth)))
+          "do" (loop [ctx ctx, forms (seq a), value nil]
+                 (if (or (halted? ctx) (nil? forms) (instance? RecurFlow value))
+                   [ctx value]
+                   (let [[ctx value] (eval-expression ctx (first forms) env methods depth)]
+                     (recur ctx (next forms) value))))
+          "let" (let [[ctx env*]
+                      (loop [ctx ctx, bindings (seq a), env* env]
+                        (if (or (halted? ctx) (nil? bindings)) [ctx env*]
+                            (let [[name value-expr] (first bindings)
+                                  [ctx value] (eval-expression ctx value-expr env* methods depth)]
+                              (recur ctx (next bindings) (assoc env* name value)))))]
+                  (eval-expression ctx b env* methods depth))
+          "loop" (let [[ctx initial]
+                       (loop [ctx ctx, bindings (seq a), values {}]
+                         (if (or (halted? ctx) (nil? bindings)) [ctx values]
+                             (let [[name value-expr] (first bindings)
+                                   [ctx value] (eval-expression ctx value-expr env methods depth)]
+                               (recur ctx (next bindings) (assoc values name value)))))]
+                   (loop [ctx ctx, values initial]
+                     (let [[ctx value] (eval-expression ctx b (merge env values) methods depth)]
+                       (if (instance? RecurFlow value)
+                         (let [next-values (:values value)]
+                           (when-not (= (count next-values) (count a))
+                             (invalid! :recur-arity {:expected (count a) :actual (count next-values)}))
+                           (recur ctx (zipmap (map first a) next-values)))
+                         [ctx value]))))
+          "recur" (let [[ctx values] (eval-many ctx a env methods depth)]
+                    [ctx (->RecurFlow values)])
+          "call" (let [[ctx args] (eval-many ctx b env methods depth)]
+                   (if (halted? ctx) [ctx nil]
+                       (invoke-method ctx a args methods (inc depth))))
+          "effect" (let [[ctx args] (eval-many ctx b env methods depth)]
+                     (if (halted? ctx)
+                       [ctx nil]
+                       (let [capability (first args)
+                             capability-wire (cond
+                                               (and (vector? capability)
+                                                    (= "keyword" (first capability)))
+                                               capability
+                                               (i64? capability)
+                                               ["integer" (str capability)])
+                             declared-effect (when (and (= a "invoke-capability")
+                                                        capability-wire)
+                                               [["keyword" "cap/call"] capability-wire])
+                             effect-fn (:effect-fn ctx)]
+                         (if-not (and declared-effect
+                                      (some #{declared-effect} (::declared-effects ctx)))
+                           [(kernel/abort ctx :unauthorized) nil]
+                           (if-not (ifn? effect-fn)
+                             [(kernel/abort ctx :not-callable) nil]
+                             (let [response (try
+                                              (effect-fn {:actor (:to ctx)
+                                                          :caller (:from ctx)
+                                                          :program (get-in ctx [:actors (:to ctx) :code])
+                                                          :actor-state (:self-state ctx)
+                                                          :method (::method ctx)
+                                                          :operation a
+                                                          :effect declared-effect
+                                                          :args args
+                                                          :authority-proof (:authority-proof ctx)
+                                                          :depth (:depth ctx 0)})
+                                              (catch #?(:clj Exception :cljs :default) _ nil))]
+                               (if (and (map? response) (:ok? response))
+                                 [ctx (if (value-profile? ctx)
+                                        (argument-value (:value response))
+                                        (argument-i64 (:value response)))]
+                                 [(kernel/abort ctx :unauthorized) nil])))))))
+          "arith" (let [[ctx values] (eval-many ctx b env methods depth)]
+                    [ctx (when-not (halted? ctx) (arithmetic a values))])
+          "compare" (let [[ctx values] (eval-many ctx b env methods depth)]
+                      [ctx (when-not (halted? ctx) (comparison ctx a values))])
+          "vector" (eval-many ctx a env methods depth)
+          "list" (let [[ctx values] (eval-many ctx a env methods depth)] [ctx (apply list values)])
+          "map" (loop [ctx ctx, pairs (seq a), result {}]
+                  (if (or (halted? ctx) (nil? pairs)) [ctx result]
+                      (let [[[key-expr value-expr] & remaining] pairs
+                            [ctx key] (eval-expression ctx key-expr env methods depth)
+                            [ctx value] (eval-expression ctx value-expr env methods depth)]
+                        (recur ctx remaining (assoc result key value)))))
+          "set" (let [[ctx values] (eval-many ctx a env methods depth)] [ctx (set values)])
+          "get" (let [[ctx coll] (eval-expression ctx a env methods depth)
+                      [ctx key] (eval-expression ctx b env methods depth)]
+                  [ctx (get coll key)])
+          "assoc" (let [[ctx coll] (eval-expression ctx a env methods depth)
+                        [ctx key] (eval-expression ctx b env methods depth)
+                        [ctx value] (eval-expression ctx c env methods depth)]
+                    [ctx (assoc coll key value)])
+          "dissoc" (let [[ctx coll] (eval-expression ctx a env methods depth)
+                         [ctx key] (eval-expression ctx b env methods depth)]
+                     [ctx (dissoc coll key)])
+          (invalid! :unsupported-expression-tag {:tag tag}))))))
+
+(defn- invoke-method [ctx name args methods depth]
+  (when (> depth 512)
+    (invalid! :call-depth-exceeded {:depth depth}))
+  (let [method (get methods name)]
+    (when-not method (invalid! :unknown-method {:name name}))
+    (let [caller-scope (select-keys ctx [::method ::declared-effects])
+          ctx (authorize-method ctx name method args)
+          ctx (assoc ctx ::method name ::declared-effects (get method "effects"))
+          params (get method "params")]
+      (if (halted? ctx)
+        [ctx nil]
+        (do
+      (when-not (= (count params) (count args))
+        (invalid! :argument-count {:method name :expected (count params) :actual (count args)}))
+      (let [[ctx value] (eval-expression ctx (get method "body")
+                                         (zipmap params
+                                                 (mapv (if (value-profile? ctx)
+                                                         argument-value argument-i64)
+                                                       args))
+                                         methods depth)]
+        (let [ctx (merge (dissoc ctx ::method ::declared-effects) caller-scope)]
+        (when (instance? RecurFlow value)
+          (invalid! :recur-outside-loop {:method name}))
+        (when-not (or (halted? ctx) (value-profile? ctx) (i64? value))
+          (invalid! :method-result-is-not-i64 {:method name :value value}))
+        [ctx value])))))))
+
+(defn invoke
+  "Evaluate one canonical Kototama program method in the current actor call.
+  Actor/state/effect forms are refused until this engine profile implements
+  their host contracts."
+  [ctx program]
+  (try
+    (let [ctx (assoc ctx ::value-profile (get program "value-profile"))
+          methods (get program "methods")
+          exports (set (or (get program "exports") (keys methods)))
+          method (or (:method ctx) (get program "entry"))]
+      (when-not (string? method) (invalid! :missing-entry-method {}))
+      (when-not (contains? exports method)
+        (invalid! :method-not-exported {:method method}))
+      (let [[ctx result] (invoke-method ctx method (:args ctx) methods 0)]
+        (if (halted? ctx) ctx (assoc ctx :return result))))
+    (catch :default error
+      (if (= :kototama.vm/not-callable (:type (ex-data error)))
+        (kernel/abort ctx :not-callable)
+        (throw error)))))

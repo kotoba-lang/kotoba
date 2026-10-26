@@ -1,0 +1,690 @@
+;; Native Paris account/frame manager. Experimental until the complete
+;; official/differential/resource/transaction corpus is qualified.
+(ns kotoba.vm.evm.native-execution
+  (:require [kotoba.vm.evm.native-core :as e]
+            [kotoba.vm.evm.native-state :as s]
+            [kotoba.vm.evm.native-bytes :as b]
+            [kotoba.vm.evm.native-word :as w]
+            [kotoba.vm.evm.native-keccak :as k]
+            [kotoba.vm.evm.native-precompile :as p])
+  (:schemas {:evm.native/frame-buffer [:record :evm.native/frame-buffer [[:words :vector-i64] [:meta :vector-i64] [:trial :vector-i64]]]
+             :evm.native/execution
+    [:record :evm.native/execution
+      [[:machine [:ref :evm.native/machine]] [:world :string] [:snapshot :string]
+       [:original :string] [:message :string] [:block :string]
+       [:warm-accounts :string] [:warm-storage :string] [:logs :string]
+       [:deleted :string] [:created :string] [:touched :string]
+       [:return-data :vector-i64] [:buffer [:ref :evm.native/frame-buffer]]]]}))
+
+;; Message: address|caller|origin|value64|gasprice64|depth|static(0/1)|code-address.
+;; Block: chainid64|coinbase40|timestamp64|number64|prevrandao64|gaslimit64|
+;;        basefee64|recent hashes (number64:hash64 CSV).
+;; These are explicit inputs, not calls to a host chain or public RPC.
+(defn make-message [address :string caller :string origin :string value :vector-i64
+                     gasprice :vector-i64 depth :i64 static :bool code-address :string] :string
+  (let [a (string-concat address (string-concat "|" caller))
+        c (string-concat a (string-concat "|" origin))
+        d (string-concat c (string-concat "|" (w/to-hex value)))
+        f (string-concat d (string-concat "|" (w/to-hex gasprice)))
+        g (string-concat f (string-concat "|" (str depth)))]
+    (string-concat g (string-concat (if static "|1|" "|0|") code-address))))
+
+(defn machine [x [:ref :evm.native/execution]] [:ref :evm.native/machine]
+  (record-get [:ref :evm.native/execution] x :machine))
+(defn status [x [:ref :evm.native/execution]] :i64 (e/status (machine x)))
+(defn world [x [:ref :evm.native/execution]] :string
+  (if (= (status x) 1) (record-get [:ref :evm.native/execution] x :world)
+    (record-get [:ref :evm.native/execution] x :snapshot)))
+(defn output [x [:ref :evm.native/execution]] :vector-i64 (e/output (machine x)))
+(defn gas-left [x [:ref :evm.native/execution]] :i64 (e/gas-left (machine x)))
+(defn- nx-msg [x [:ref :evm.native/execution] index :i64] :string
+  (b/field (record-get [:ref :evm.native/execution] x :message) 124 index))
+(defn- nx-block [x [:ref :evm.native/execution] index :i64] :string
+  (b/field (record-get [:ref :evm.native/execution] x :block) 124 index))
+(defn- nx-m [x [:ref :evm.native/execution] m [:ref :evm.native/machine]] [:ref :evm.native/execution]
+  (record-assoc [:ref :evm.native/execution] x :machine m))
+(defn- nx-halt [x [:ref :evm.native/execution] reason :i64] [:ref :evm.native/execution]
+  (nx-m x (e/frame-halt (machine x) reason)))
+(defn- nx-member? [csv :string key :string] :bool
+  (let [width (string-length key) length (string-length csv)]
+   (if (or (= width 0) (not (= (rem (+ length 1) (+ width 1)) 0))) false
+    (loop [offset 0]
+     (if (>= offset length) false
+      (if (= (string-substring csv offset (+ offset width)) key) true
+       (recur (+ offset width 1))))))))
+(defn- nx-add [csv :string key :string] :string
+  (if (nx-member? csv key) csv
+    (if (= csv "") key (string-concat csv (string-concat "," key)))))
+(defn- nx-touch [x [:ref :evm.native/execution] address :string] [:ref :evm.native/execution]
+  (record-assoc [:ref :evm.native/execution] x :touched
+    (nx-add (record-get [:ref :evm.native/execution] x :touched) address)))
+(defn- nx-access [x [:ref :evm.native/execution] address :string] [:ref :evm.native/execution]
+  (let [warm (record-get [:ref :evm.native/execution] x :warm-accounts)
+        cost (if (nx-member? warm address) 100 2600)]
+    (record-assoc [:ref :evm.native/execution] (nx-m x (e/frame-charge (machine x) cost))
+      :warm-accounts (nx-add warm address))))
+(defn- nx-warm-for [warm :string address :string] :vector-i64
+  (loop [i 0 out (vector-i64)]
+    (if (= i (b/fields warm 44)) out
+      (let [key (b/field warm 44 i)]
+        (recur (+ i 1)
+          (if (= (string-substring key 0 40) address)
+            (b/concat out (w/from-hex (string-substring key 40 104))) out))))))
+(defn- nx-sync [x [:ref :evm.native/execution] previous [:ref :evm.native/machine]] [:ref :evm.native/execution]
+  (let [m (machine x) address (nx-msg x 0) state (record-get [:ref :evm.native/execution] x :world)
+        updated-state (if (= (record-get [:ref :evm.native/machine] m :storage-version)
+                            (record-get [:ref :evm.native/machine] previous :storage-version)) state
+                        (s/set-storage state address (record-get [:ref :evm.native/machine] m :storage)))
+        slots (record-get [:ref :evm.native/machine] m :warm)
+        warmed (loop [i (vector-count (record-get [:ref :evm.native/machine] previous :warm))
+                      out (record-get [:ref :evm.native/execution] x :warm-storage)]
+                 (if (= i (vector-count slots)) out
+                  (let [word (b/slice slots i 16)]
+                   (recur (+ i 16) (nx-add out (string-concat address (w/to-hex word)))))))]
+    (record-assoc [:ref :evm.native/execution]
+      (record-assoc [:ref :evm.native/execution] x :world updated-state) :warm-storage warmed)))
+
+(defn- nx-push [x [:ref :evm.native/execution] value :vector-i64 cost :i64] [:ref :evm.native/execution]
+  (nx-m x (e/frame-push (e/frame-charge (machine x) cost) value)))
+(defn- nx-finish-op [x [:ref :evm.native/execution]] [:ref :evm.native/execution]
+  (let [m (machine x)]
+    (if (not (= (e/status m) 0)) x
+      (nx-m x (record-assoc [:ref :evm.native/machine]
+        (record-assoc [:ref :evm.native/machine] m :pc (+ 1 (record-get [:ref :evm.native/machine] m :pc)))
+        :steps (+ 1 (record-get [:ref :evm.native/machine] m :steps)))))))
+
+(defn- nx-environment [x [:ref :evm.native/execution] op :i64] [:ref :evm.native/execution]
+  (let [state (record-get [:ref :evm.native/execution] x :world) m (machine x)]
+    (cond
+      (= op 48) (nx-push x (s/address-word (nx-msg x 0)) 2)
+      (= op 50) (nx-push x (s/address-word (nx-msg x 2)) 2)
+      (= op 51) (nx-push x (s/address-word (nx-msg x 1)) 2)
+      (= op 52) (nx-push x (w/from-hex (nx-msg x 3)) 2)
+      (= op 58) (nx-push x (w/from-hex (nx-msg x 4)) 2)
+      (= op 65) (nx-push x (s/address-word (nx-block x 1)) 2)
+      (= op 66) (nx-push x (w/from-hex (nx-block x 2)) 2)
+      (= op 67) (nx-push x (w/from-hex (nx-block x 3)) 2)
+      (= op 68) (nx-push x (w/from-hex (nx-block x 4)) 2)
+      (= op 69) (nx-push x (w/from-hex (nx-block x 5)) 2)
+      (= op 70) (nx-push x (w/from-hex (nx-block x 0)) 2)
+      (= op 71) (nx-push x (s/balance state (nx-msg x 0)) 5)
+      (= op 72) (nx-push x (w/from-hex (nx-block x 6)) 2)
+      (= op 61) (nx-push x (w/from-long (vector-count (record-get [:ref :evm.native/execution] x :return-data))) 2)
+      :else
+      (let [address (s/address (e/stack-word m 0)) accessed (nx-access x address)
+            popped (nx-m accessed (e/frame-drop (machine accessed) 1))]
+        (cond
+          (= op 49) (nx-push popped (s/balance state address) 0)
+          (= op 59) (nx-push popped (w/from-long (vector-count (s/code state address))) 0)
+          (= op 63) (nx-push popped (if (s/alive? state address)
+                                  (w/from-bytes (k/digest (s/code state address)) 0 32) (w/zero-word)) 0)
+          :else (nx-halt x 8))))))
+
+(defn- nx-return-copy [x [:ref :evm.native/execution]] [:ref :evm.native/execution]
+  (let [m (machine x) data (record-get [:ref :evm.native/execution] x :return-data)
+        offset (w/bounded-long (e/stack-word m 0) 2199023255552)
+        source (w/bounded-long (e/stack-word m 1) 2199023255552)
+        length (w/bounded-long (e/stack-word m 2) 2199023255552)]
+    (if (> (+ source length) (vector-count data)) (nx-halt x 3)
+      (let [ready (e/frame-expand (e/frame-charge m (+ 3 (* 3 (quot (+ length 31) 32)))) offset length)]
+        (if (not (= (e/status ready) 0)) (nx-m x ready)
+         (nx-m x (e/frame-write-memory (e/frame-drop ready 3) offset (b/slice data source length))))))))
+
+(defn- nx-external-copy [x [:ref :evm.native/execution]] [:ref :evm.native/execution]
+  (let [m (machine x) address (s/address (e/stack-word m 0)) accessed (nx-access x address)
+        offset (w/bounded-long (e/stack-word m 1) 2199023255552)
+        source (w/bounded-long (e/stack-word m 2) 9223372036854775807)
+        length (w/bounded-long (e/stack-word m 3) 2199023255552)
+        code (s/code (record-get [:ref :evm.native/execution] x :world) address)
+        ready (e/frame-expand (e/frame-charge (machine accessed) (* 3 (quot (+ length 31) 32))) offset length)]
+    (if (not (= (e/status ready) 0)) (nx-m accessed ready)
+     (let [bytes (if (>= source (vector-count code)) (b/slice (vector-i64) 0 length) (b/slice code source length))]
+      (nx-m accessed (e/frame-write-memory (e/frame-drop ready 4) offset bytes))))))
+
+(defn- nx-log [x [:ref :evm.native/execution] op :i64] [:ref :evm.native/execution]
+  (let [m (machine x) topics (- op 160) offset (w/bounded-long (e/stack-word m 0) 2199023255552)
+        length (w/bounded-long (e/stack-word m 1) 2199023255552)]
+    (if (record-get [:ref :evm.native/machine] m :static) (nx-halt x 9)
+      (let [ready (e/frame-expand (e/frame-charge m (+ 375 (* 375 topics) (* 8 length))) offset length)]
+        (if (not (= (e/status ready) 0)) (nx-m x ready)
+          (let [ts (loop [i 0 out ""]
+                     (if (= i topics) out
+                       (recur (+ i 1) (string-concat out (string-concat (if (= i 0) "" ",")
+                         (w/to-hex (e/stack-word m (+ i 2))))))))
+                log (string-concat (nx-msg x 0) (string-concat ":" (string-concat ts
+                      (string-concat ":" (b/to-hex (b/slice (e/frame-memory ready) offset length))))))
+                before (record-get [:ref :evm.native/execution] x :logs)]
+            (record-assoc [:ref :evm.native/execution] (nx-m x (e/frame-drop ready (+ topics 2)))
+              :logs (if (= before "") log (string-concat before (string-concat "|" log))))))))))
+
+(defn- nx-number [text :string] :i64
+  (loop [i 0 n 0]
+    (if (= i (string-length text)) n
+      (let [c (string-code-point-at text i)]
+        (if (or (< c 48) (> c 57) (> n 1024)) 1025
+          (recur (+ i 1) (+ (* n 10) (- c 48))))))))
+
+(defn- nx-blockhash [x [:ref :evm.native/execution]] [:ref :evm.native/execution]
+  (let [m (machine x) number (e/stack-word m 0) current (w/from-hex (nx-block x 3))
+        recent (nx-block x 7)
+        found (if (or (not (w/less-word number current))
+                      (> (w/bounded-long (w/subtract-word current number) 257) 256)) (w/zero-word)
+                (let [key (w/to-hex number) count (quot (+ (string-length recent) 1) 130)]
+                 (loop [low 0 high count]
+                  (if (= low high) (w/zero-word)
+                   (let [mid (quot (+ low high) 2) offset (* mid 130)
+                         candidate (string-substring recent offset (+ offset 64))
+                         order (string-compare key candidate)]
+                    (cond (= order 0) (w/from-hex (string-substring recent (+ offset 65) (+ offset 129)))
+                          (< order 0) (recur low mid)
+                          :else (recur (+ mid 1) high)))))))]
+    (nx-push (nx-m x (e/frame-drop m 1)) found 20)))
+
+(defn- nx-child-seed [parent [:ref :evm.native/execution] state :string message :string] [:ref :evm.native/execution]
+  (let [buffer (record-get [:ref :evm.native/execution] parent :buffer)
+        owned (if (<= (nx-number (b/field message 124 5)) 3)
+                (record-new [:ref :evm.native/frame-buffer]
+                  (vector-alloc (vector-count (record-get [:ref :evm.native/frame-buffer] buffer :words)))
+                  (vector-alloc 21) (vector-alloc 21)) buffer)
+        child (record-assoc [:ref :evm.native/execution]
+                (record-assoc [:ref :evm.native/execution]
+                  (record-assoc [:ref :evm.native/execution]
+                    (record-assoc [:ref :evm.native/execution]
+                      (record-assoc [:ref :evm.native/execution] parent :world state) :snapshot state)
+                    :message message) :logs "") :return-data (vector-i64))]
+   (record-assoc [:ref :evm.native/execution] child :buffer owned)))
+
+(defn- nx-incorporate [parent [:ref :evm.native/execution] child [:ref :evm.native/execution]] [:ref :evm.native/execution]
+  (let [state (status child) m (machine parent)
+        gas (+ (e/gas-left m) (if (or (= state 1) (= state 2)) (gas-left child) 0))
+        parent (nx-m parent (record-assoc [:ref :evm.native/machine] m :gas gas))]
+    (if (or (= state 8) (= state 10) (= state 11) (= state 12)) (nx-halt parent state)
+      ;; Exceptional child failure discards return data. Only success and
+      ;; REVERT expose bytes to the caller; code-deposit OOG must not leak the
+      ;; init frame's prior RETURN output into RETURNDATASIZE.
+      (let [returned (if (or (= state 1) (= state 2)) (output child) (vector-i64))
+            result (record-assoc [:ref :evm.native/execution] parent :return-data returned)]
+        (if (not (= state 1)) result
+          (let [state (world child) address (nx-msg parent 0)
+                frame (record-assoc [:ref :evm.native/machine]
+                        (record-assoc [:ref :evm.native/machine]
+                          (record-assoc [:ref :evm.native/machine] (machine result) :storage (s/storage state address))
+                          :warm (nx-warm-for (record-get [:ref :evm.native/execution] child :warm-storage) address))
+                        :refund (+ (record-get [:ref :evm.native/machine] m :refund)
+                                   (record-get [:ref :evm.native/machine] (machine child) :refund)))
+                old-logs (record-get [:ref :evm.native/execution] parent :logs)
+                child-logs (record-get [:ref :evm.native/execution] child :logs)
+                logs (if (= old-logs "") child-logs
+                       (if (= child-logs "") old-logs (string-concat old-logs (string-concat "|" child-logs))))]
+            (record-assoc [:ref :evm.native/execution]
+              (record-assoc [:ref :evm.native/execution]
+                (record-assoc [:ref :evm.native/execution]
+                  (record-assoc [:ref :evm.native/execution]
+                    (record-assoc [:ref :evm.native/execution]
+                      (record-assoc [:ref :evm.native/execution]
+                        (record-assoc [:ref :evm.native/execution] (nx-m result frame) :world state)
+                        :warm-accounts (record-get [:ref :evm.native/execution] child :warm-accounts))
+                      :warm-storage (record-get [:ref :evm.native/execution] child :warm-storage))
+                    :deleted (record-get [:ref :evm.native/execution] child :deleted))
+                  :created (record-get [:ref :evm.native/execution] child :created))
+                :touched (record-get [:ref :evm.native/execution] child :touched)) :logs logs)))))))
+
+(defn- nx-precompile-address? [address :string] :bool
+ (and (= (string-substring address 0 39) "000000000000000000000000000000000000000")
+      (>= (string-index-of "123456789" (string-substring address 39 40)) 0)))
+
+(defn- nx-call [x [:ref :evm.native/execution] op :i64] [:ref :evm.native/execution]
+  (let [m (machine x) valued (or (= op 241) (= op 242)) n (if valued 7 6)
+        target (s/address (e/stack-word m 1)) value (if valued (e/stack-word m 2) (w/zero-word))
+        base (if valued 3 2)
+        input-offset (w/bounded-long (e/stack-word m base) 2199023255552)
+        input-length (w/bounded-long (e/stack-word m (+ base 1)) 2199023255552)
+        output-offset (w/bounded-long (e/stack-word m (+ base 2)) 2199023255552)
+        output-length (w/bounded-long (e/stack-word m (+ base 3)) 2199023255552)
+        account-state (record-get [:ref :evm.native/execution] x :world)
+        extra (+ (if (w/zero? value) 0 9000)
+                 (if (and (= op 241) (not (w/zero? value)) (not (s/alive? account-state target))) 25000 0))
+        accessed (nx-access x target)
+        expanded (e/frame-expand (e/frame-expand (e/frame-charge (machine accessed) extra)
+                                   input-offset input-length) output-offset output-length)]
+    (cond
+      (not (= (e/status expanded) 0)) (nx-m accessed expanded)
+      (and (record-get [:ref :evm.native/machine] m :static) (= op 241) (not (w/zero? value))) (nx-halt accessed 9)
+      :else
+      (let [available (e/gas-left expanded) cap (- available (quot available 64))
+            requested (w/bounded-long (e/stack-word m 0) 9223372036854775807)
+            forwarded (if (< requested cap) requested cap)
+            stipend (if (w/zero? value) 0 2300) subgas (+ forwarded stipend)
+            charged (e/frame-drop (e/frame-charge expanded forwarded) n)
+            parent (record-assoc [:ref :evm.native/execution] (nx-m accessed charged) :return-data (vector-i64))
+            caller (nx-msg x 0) depth (+ (nx-number (nx-msg x 5)) 1)]
+        (if (or (> depth 1024) (and valued (w/less-word (s/balance account-state caller) value)))
+          (nx-m parent (e/frame-push
+            (record-assoc [:ref :evm.native/machine] charged :gas (+ (e/gas-left charged) subgas)) (w/zero-word)))
+          (let [context (if (or (= op 242) (= op 244)) caller target)
+                sender (if (= op 244) (nx-msg x 1) caller)
+                child-value (if (= op 244) (w/from-hex (nx-msg x 3)) value)
+                message (make-message context sender (nx-msg x 2) child-value (w/from-hex (nx-msg x 4))
+                          depth (or (= op 250) (record-get [:ref :evm.native/machine] m :static)) target)
+                state (if (= op 241) (s/transfer account-state caller target value) account-state)
+                physical (e/frame-memory-physical expanded)
+                remaining (- (vector-count physical) input-offset)
+                kept (if (<= remaining 0) 0 (if (< remaining input-length) remaining input-length))
+                precompiled (nx-precompile-address? target)
+                child-input (if precompiled (b/slice (e/frame-memory expanded) input-offset input-length)
+                              (b/slice physical input-offset kept))
+                child (nx-execute (nx-child-seed (nx-touch parent context) state message)
+                                  (s/code account-state target) child-input input-length subgas)
+                result (nx-incorporate parent child)]
+            (if (not (= (status result) 0)) result
+              (let [out (record-get [:ref :evm.native/execution] result :return-data)
+                    length (if (< (vector-count out) output-length) (vector-count out) output-length)]
+                (nx-m result (e/frame-push
+                  (e/frame-write-memory (machine result) output-offset (b/slice out 0 length))
+                  (w/from-long (if (= (status child) 1) 1 0))))))))))))
+
+(defn- nx-create [x [:ref :evm.native/execution] op :i64] [:ref :evm.native/execution]
+  (let [m (machine x) value (e/stack-word m 0)
+        offset (w/bounded-long (e/stack-word m 1) 2199023255552)
+        length (w/bounded-long (e/stack-word m 2) 2199023255552)
+        ready (e/frame-expand (e/frame-charge m (+ 32000 (if (= op 245) (* 6 (quot (+ length 31) 32)) 0))) offset length)
+        source (nx-msg x 0) state (record-get [:ref :evm.native/execution] x :world)]
+    (cond
+      (record-get [:ref :evm.native/machine] m :static) (nx-halt x 9)
+      (not (= (e/status ready) 0)) (nx-m x ready)
+      :else
+      (let [subgas (- (e/gas-left ready) (quot (e/gas-left ready) 64))
+            charged (e/frame-drop (e/frame-charge ready subgas) (if (= op 245) 4 3))
+            parent (record-assoc [:ref :evm.native/execution] (nx-m x charged) :return-data (vector-i64))
+            depth (+ (nx-number (nx-msg x 5)) 1) nonce (s/nonce state source)]
+        (if (or (> depth 1024) (w/less-word (s/balance state source) value)
+                (w/equal-word nonce (w/from-hex "ffffffffffffffff")))
+          (nx-m parent (e/frame-push (record-assoc [:ref :evm.native/machine] charged :gas
+                                      (+ (e/gas-left charged) subgas)) (w/zero-word)))
+          (let [init (b/slice (e/frame-memory ready) offset length)
+                target (if (= op 245) (s/create2-address source (e/stack-word m 3) init) (s/create-address source nonce))
+                advanced (s/set-nonce state source (w/add-word nonce (w/from-long 1)))
+                parent (record-assoc [:ref :evm.native/execution]
+                         (record-assoc [:ref :evm.native/execution] parent :world advanced)
+                         :warm-accounts (nx-add (record-get [:ref :evm.native/execution] parent :warm-accounts) target))]
+            (if (not (s/deployable? state target)) (nx-m parent (e/frame-push (machine parent) (w/zero-word)))
+              (let [new-world (s/set-storage (s/set-code (s/set-nonce advanced target (w/from-long 1))
+                                                          target (vector-i64)) target (vector-i64))
+                    funded-world (s/transfer new-world source target value)
+                    message (make-message target source (nx-msg x 2) value (w/from-hex (nx-msg x 4)) depth false "")
+                    seed (record-assoc [:ref :evm.native/execution] (nx-child-seed (nx-touch parent target) funded-world message)
+                           :created (nx-add (record-get [:ref :evm.native/execution] parent :created) target))
+                    child (nx-execute seed init (vector-i64) 0 subgas)
+                    deployed-code (output child)
+                    checked-child (if (and (= (status child) 1)
+                                   (or (> (vector-count deployed-code) 24576)
+                                       (and (> (vector-count deployed-code) 0) (= (vector-at deployed-code 0) 239))))
+                            (nx-halt child 4) child)
+                    charged-child (if (= (status checked-child) 1)
+                            (let [deposit (* 200 (vector-count deployed-code)) remaining (gas-left checked-child)]
+                             (if (> deposit remaining) (nx-halt checked-child 3)
+                              (nx-m checked-child (record-assoc [:ref :evm.native/machine] (machine checked-child) :gas (- remaining deposit))))) checked-child)
+                    final-child (if (= (status charged-child) 1)
+                            (record-assoc [:ref :evm.native/execution] charged-child :world (s/set-code (world charged-child) target deployed-code)) charged-child)
+                    merged (nx-incorporate parent final-child)
+                    result (if (= (status final-child) 1)
+                             (record-assoc [:ref :evm.native/execution] merged :return-data (vector-i64)) merged)]
+                (if (not (= (status result) 0)) result
+                  (nx-m result (e/frame-push (machine result)
+                    (if (= (status final-child) 1) (s/address-word target) (w/zero-word)))))))))))))
+
+(defn- nx-selfdestruct [x [:ref :evm.native/execution]] [:ref :evm.native/execution]
+  (let [m (machine x) sender (nx-msg x 0) beneficiary (s/address (e/stack-word m 0))
+        state (record-get [:ref :evm.native/execution] x :world) value (s/balance state sender)
+        warm (record-get [:ref :evm.native/execution] x :warm-accounts)
+        cost (+ 5000 (if (nx-member? warm beneficiary) 0 2600)
+                     (if (and (not (w/zero? value)) (not (s/alive? state beneficiary))) 25000 0))
+        charged (e/frame-charge m cost)]
+    (cond
+      (record-get [:ref :evm.native/machine] m :static) (nx-halt x 9)
+      (not (= (e/status charged) 0)) (nx-m x charged)
+      :else
+      (let [state (s/set-balance (s/transfer state sender beneficiary value) sender (w/zero-word))]
+        (record-assoc [:ref :evm.native/execution]
+          (record-assoc [:ref :evm.native/execution]
+            (record-assoc [:ref :evm.native/execution] (nx-m (nx-touch x beneficiary) (e/frame-halt charged 1)) :world state)
+            :warm-accounts (nx-add warm beneficiary))
+          :deleted (nx-add (record-get [:ref :evm.native/execution] x :deleted) sender))))))
+
+(defn- nx-required [op :i64] :i64
+  (cond (or (= op 241) (= op 242)) 7 (or (= op 244) (= op 250)) 6
+        (= op 240) 3 (= op 245) 4 (= op 60) 4 (= op 62) 3
+        (and (>= op 160) (<= op 164)) (+ 2 (- op 160))
+        (or (= op 49) (= op 59) (= op 63) (= op 64) (= op 255)) 1 :else 0))
+
+(defn- nx-dispatch [x [:ref :evm.native/execution] op :i64] [:ref :evm.native/execution]
+  (let [handled (or (and (>= op 48) (<= op 52)) (= op 58) (= op 59) (= op 60) (= op 61)
+                   (= op 62) (= op 63) (and (>= op 64) (<= op 72))
+                   (and (>= op 160) (<= op 164)) (= op 240) (= op 241) (= op 242)
+                   (= op 244) (= op 245) (= op 250) (= op 255))]
+    (if (not handled)
+      (let [previous (machine x) next (nx-m x (e/run-chunk previous))]
+       (nx-sync next previous))
+      (cond
+        (>= (record-get [:ref :evm.native/machine] (machine x) :steps) 100000000) (nx-halt x 10)
+        (< (e/frame-stack-size (machine x)) (nx-required op)) (nx-halt x 5)
+        :else
+        (nx-finish-op
+          (cond (or (= op 241) (= op 242) (= op 244) (= op 250)) (nx-call x op)
+                (or (= op 240) (= op 245)) (nx-create x op)
+                (= op 255) (nx-selfdestruct x)
+                (= op 60) (nx-external-copy x)
+                (= op 62) (nx-return-copy x)
+                (= op 64) (nx-blockhash x)
+                (and (>= op 160) (<= op 164)) (nx-log x op)
+                :else (nx-environment x op)))))))
+
+;; Each frame periodically copies only owned bytes/limbs out of a scalar
+;; temporary region. Child frames use the same boundary, so repeated calls do
+;; not retain their transient heaps. Capacity retries have no external effects.
+(defn- nx-pack-vector [out :vector-i64 offset :i64 input :vector-i64] :i64
+ (loop [i 0] (if (= i (vector-count input)) (+ offset i)
+              (let [z (vector-assoc! out (+ offset i) (vector-at input i))] (recur (+ i 1))))))
+(defn- nx-pack-text [out :vector-i64 offset :i64 input :string] :i64
+ (loop [i 0] (if (= i (string-length input)) (+ offset i)
+              (let [z (vector-assoc! out (+ offset i) (string-code-point-at input i))] (recur (+ i 1))))))
+(defn- nx-pack [x [:ref :evm.native/execution] buffer [:ref :evm.native/frame-buffer]] :i64
+ (let [m (machine x) meta (record-get [:ref :evm.native/frame-buffer] buffer :trial)
+       out (record-get [:ref :evm.native/frame-buffer] buffer :words)
+       scalar0 (vector-assoc! meta 0 (record-get [:ref :evm.native/machine] m :pc))
+       scalar1 (vector-assoc! meta 1 (record-get [:ref :evm.native/machine] m :gas))
+       scalar2 (vector-assoc! meta 2 (record-get [:ref :evm.native/machine] m :status))
+       scalar3 (vector-assoc! meta 3 (record-get [:ref :evm.native/machine] m :refund))
+       scalar4 (vector-assoc! meta 4 (record-get [:ref :evm.native/machine] m :steps))
+       scalar5 (vector-assoc! meta 5 (record-get [:ref :evm.native/machine] m :storage-version))
+       size0 (vector-assoc! meta 6 (vector-count (record-get [:ref :evm.native/machine] m :stack)))
+       size1 (vector-assoc! meta 7 (vector-count (record-get [:ref :evm.native/machine] m :memory)))
+       size2 (vector-assoc! meta 8 (vector-count (record-get [:ref :evm.native/machine] m :storage)))
+       size3 (vector-assoc! meta 9 (vector-count (record-get [:ref :evm.native/machine] m :warm)))
+       size4 (vector-assoc! meta 10 (vector-count (record-get [:ref :evm.native/machine] m :output)))
+       size5 (vector-assoc! meta 11 (vector-count (record-get [:ref :evm.native/execution] x :return-data)))
+       text0 (vector-assoc! meta 12 (string-length (record-get [:ref :evm.native/execution] x :world)))
+       text1 (vector-assoc! meta 13 (string-length (record-get [:ref :evm.native/execution] x :warm-accounts)))
+       text2 (vector-assoc! meta 14 (string-length (record-get [:ref :evm.native/execution] x :warm-storage)))
+       text3 (vector-assoc! meta 15 (string-length (record-get [:ref :evm.native/execution] x :logs)))
+       text4 (vector-assoc! meta 16 (string-length (record-get [:ref :evm.native/execution] x :deleted)))
+       text5 (vector-assoc! meta 17 (string-length (record-get [:ref :evm.native/execution] x :created)))
+       text6 (vector-assoc! meta 18 (string-length (record-get [:ref :evm.native/execution] x :touched)))
+       total (loop [i 6 n 0] (if (= i 19) n (recur (+ i 1) (+ n (vector-at meta i)))))
+       needed (vector-assoc! meta 19 total)
+       logical-memory (vector-assoc! meta 20 (e/frame-memory-size m))]
+  (if (or (> total 33554432) (> (vector-at meta 12) 16777216)
+          (loop [i 13] (if (= i 19) false (or (> (vector-at meta i) (if (= i 15) 33554432 8388608)) (recur (+ i 1)))))) -1
+   (if (> total (vector-count out)) 0
+    (let [at0 0
+          at1 (nx-pack-vector out at0 (record-get [:ref :evm.native/machine] m :stack))
+          at2 (nx-pack-vector out at1 (record-get [:ref :evm.native/machine] m :memory))
+          at3 (nx-pack-vector out at2 (record-get [:ref :evm.native/machine] m :storage))
+          at4 (nx-pack-vector out at3 (record-get [:ref :evm.native/machine] m :warm))
+          at5 (nx-pack-vector out at4 (record-get [:ref :evm.native/machine] m :output))
+          at6 (nx-pack-vector out at5 (record-get [:ref :evm.native/execution] x :return-data))
+          at7 (nx-pack-text out at6 (record-get [:ref :evm.native/execution] x :world))
+          at8 (nx-pack-text out at7 (record-get [:ref :evm.native/execution] x :warm-accounts))
+          at9 (nx-pack-text out at8 (record-get [:ref :evm.native/execution] x :warm-storage))
+          at10 (nx-pack-text out at9 (record-get [:ref :evm.native/execution] x :logs))
+          at11 (nx-pack-text out at10 (record-get [:ref :evm.native/execution] x :deleted))
+          at12 (nx-pack-text out at11 (record-get [:ref :evm.native/execution] x :created))
+          at13 (nx-pack-text out at12 (record-get [:ref :evm.native/execution] x :touched))
+            committed (record-get [:ref :evm.native/frame-buffer] buffer :meta)
+          saved (loop [i 0] (if (= i 21) 0 (let [z (vector-assoc! committed i (vector-at meta i))] (recur (+ i 1)))))
+         ] 1)))))
+(defn- nx-unpack [previous [:ref :evm.native/execution] buffer [:ref :evm.native/frame-buffer]] [:ref :evm.native/execution]
+ (let [meta (record-get [:ref :evm.native/frame-buffer] buffer :meta)
+       data (record-get [:ref :evm.native/frame-buffer] buffer :words)
+       old (machine previous) at0 0
+       v0 (b/slice data at0 (vector-at meta 6)) at1 (+ at0 (vector-at meta 6))
+       v1 (b/slice data at1 (vector-at meta 7)) at2 (+ at1 (vector-at meta 7))
+       v2 (b/slice data at2 (vector-at meta 8)) at3 (+ at2 (vector-at meta 8))
+       v3 (b/slice data at3 (vector-at meta 9)) at4 (+ at3 (vector-at meta 9))
+       v4 (b/slice data at4 (vector-at meta 10)) at5 (+ at4 (vector-at meta 10))
+       v5 (b/slice data at5 (vector-at meta 11)) at6 (+ at5 (vector-at meta 11))
+       t0 (b/ascii-text data at6 (vector-at meta 12)) at7 (+ at6 (vector-at meta 12))
+       t1 (b/ascii-text data at7 (vector-at meta 13)) at8 (+ at7 (vector-at meta 13))
+       t2 (b/ascii-text data at8 (vector-at meta 14)) at9 (+ at8 (vector-at meta 14))
+       t3 (b/ascii-text data at9 (vector-at meta 15)) at10 (+ at9 (vector-at meta 15))
+       t4 (b/ascii-text data at10 (vector-at meta 16)) at11 (+ at10 (vector-at meta 16))
+       t5 (b/ascii-text data at11 (vector-at meta 17)) at12 (+ at11 (vector-at meta 17))
+       t6 (b/ascii-text data at12 (vector-at meta 18)) at13 (+ at12 (vector-at meta 18))
+       m (record-new [:ref :evm.native/machine]
+          (record-get [:ref :evm.native/machine] old :code) (record-get [:ref :evm.native/machine] old :calldata)
+          v0 v1 v2 (record-get [:ref :evm.native/machine] old :original) v3 v4
+          (vector-at meta 0) (vector-at meta 1) (vector-at meta 2) (vector-at meta 3) (vector-at meta 4)
+          (record-get [:ref :evm.native/machine] old :static) 0 (vector-at meta 5)
+          (record-get [:ref :evm.native/machine] old :workspace)
+          (vector-at meta 20) (record-get [:ref :evm.native/machine] old :calldata-size))]
+  (record-new [:ref :evm.native/execution] m t0
+   (record-get [:ref :evm.native/execution] previous :snapshot) (record-get [:ref :evm.native/execution] previous :original)
+   (record-get [:ref :evm.native/execution] previous :message) (record-get [:ref :evm.native/execution] previous :block)
+   t1 t2 t3 t4 t5 t6 v5 (record-get [:ref :evm.native/execution] previous :buffer))))
+(defn- nx-precompile-call? [m [:ref :evm.native/machine] op :i64] :bool
+ (and (or (= op 241) (= op 242) (= op 244) (= op 250)) (>= (e/frame-stack-size m) 2)
+      (nx-precompile-address? (s/address (e/stack-word m 1)))))
+(defn- nx-segment [start [:ref :evm.native/execution]] [:ref :evm.native/execution]
+ (loop [x start count 0 moved 0]
+  (if (or (not (= (status x) 0)) (= count 4096) (>= moved 1048576)) x
+   (let [m (machine x) code (record-get [:ref :evm.native/machine] m :code)
+         op (vector-get code (record-get [:ref :evm.native/machine] m :pc) 0)
+         precompile-call (nx-precompile-call? m op)
+         next (nx-dispatch x op)
+         words (+ (e/frame-memory-size (machine next)) (string-length (record-get [:ref :evm.native/execution] next :world))
+                  (string-length (record-get [:ref :evm.native/execution] next :logs)))]
+    (if precompile-call next (recur next (+ count 1) (+ moved words)))))))
+(defn- nx-grow-buffer [buffer [:ref :evm.native/frame-buffer]] [:ref :evm.native/frame-buffer]
+ (let [words (record-get [:ref :evm.native/frame-buffer] buffer :words)
+       trial (record-get [:ref :evm.native/frame-buffer] buffer :trial)
+       need (vector-at trial 19)
+       capacity (loop [size (* 2 (vector-count words))]
+                  (cond (>= size 33554432) 33554432
+                        (> size need) size
+                        :else (recur (* size 2))))]
+  (record-new [:ref :evm.native/frame-buffer] (vector-alloc capacity)
+   (record-get [:ref :evm.native/frame-buffer] buffer :meta) trial)))
+(defn- nx-region-root [start [:ref :evm.native/execution] buffer [:ref :evm.native/frame-buffer]] [:ref :evm.native/execution]
+ (if (not (= (status start) 0)) start
+  (let [seeded (nx-pack start buffer)]
+   (cond (< seeded 0) (nx-halt start 10)
+         (= seeded 0) (nx-halt start 12)
+         :else
+         ;; The buffer is the only state carried between regions. Reconstruct
+         ;; each region from the original immutable context inside its arena;
+         ;; recursive region calls retained every previous decoded world.
+         (loop [round 0]
+          (let [outcome
+                (arena-scope
+                 (loop [x (nx-unpack start buffer) segments 0 moved 0]
+                  (cond (not (= (status x) 0)) 3
+                        (or (= segments 64) (>= moved 1048576)) 0
+                        :else
+                        (let [accepted
+                              (arena-scope
+                               (let [next (nx-segment x)]
+                                (if (= (status next) 12) 2
+                                 (let [packed (nx-pack next buffer)] (if (= packed 0) 2 packed)))))]
+                         (if (not (= accepted 1)) (if (= accepted 2) 2 -1)
+                          (let [next (nx-unpack x buffer)
+                                size (vector-at (record-get [:ref :evm.native/frame-buffer] buffer :meta) 19)]
+                           (recur next (+ segments 1) (+ moved size))))))))]
+           (cond (< outcome 0) (nx-halt start 10)
+                 (= outcome 2) (nx-halt start 12)
+                 (= outcome 3) (nx-unpack start buffer)
+                 :else (recur (+ round 1)))))))))
+(defn- nx-region-nested [start [:ref :evm.native/execution] buffer [:ref :evm.native/frame-buffer]] [:ref :evm.native/execution]
+ ;; A nested frame's parent retains its own region. Keep the proven recursive
+ ;; unwinding path here; root-only buffer cycling avoids retaining a long
+ ;; sequence of growing worlds without multiplying deep CREATE frame state.
+ (if (not (= (status start) 0)) start
+  (let [seeded (nx-pack start buffer)]
+   (cond (< seeded 0) (nx-halt start 10)
+         (= seeded 0) (nx-halt start 12)
+         :else
+         (let [outcome
+               (arena-scope
+                (loop [x start segments 0 moved 0]
+                 (if (or (not (= (status x) 0)) (= segments 64) (>= moved 1048576)) 0
+                  (let [accepted
+                        (arena-scope
+                         (let [next (nx-segment x)]
+                          (if (= (status next) 12) 2
+                           (let [packed (nx-pack next buffer)] (if (= packed 0) 2 packed)))))]
+                   (if (not (= accepted 1)) (if (= accepted 2) 2 -1)
+                    (let [next (nx-unpack x buffer)
+                          size (vector-at (record-get [:ref :evm.native/frame-buffer] buffer :meta) 19)]
+                     (recur next (+ segments 1) (+ moved size))))))))]
+          (cond (< outcome 0) (nx-halt start 10)
+                (= outcome 2) (nx-halt start 12)
+                :else (nx-region-nested (nx-unpack start buffer) buffer)))))))
+
+(defn- nx-initial [seed [:ref :evm.native/execution] code :vector-i64 input :vector-i64 input-size :i64 gas :i64] [:ref :evm.native/execution]
+ (let [address (nx-msg seed 0) state (record-get [:ref :evm.native/execution] seed :world)
+       original (record-get [:ref :evm.native/execution] seed :original)
+       warm (nx-warm-for (record-get [:ref :evm.native/execution] seed :warm-storage) address)
+       initial (e/make-machine code input (s/storage state address) warm gas (= (nx-msg seed 6) "1"))
+       frame (record-assoc [:ref :evm.native/machine]
+               (record-assoc [:ref :evm.native/machine] initial :original
+                 (if (nx-member? (record-get [:ref :evm.native/execution] seed :created) address)
+                  (vector-i64) (s/storage original address))) :calldata-size input-size)]
+  (nx-m seed frame)))
+(defn- nx-evaluate [start [:ref :evm.native/execution]] [:ref :evm.native/execution]
+ (let [frame (machine start) gas (e/gas-left frame)
+       input (record-get [:ref :evm.native/machine] frame :calldata)
+       precompile (if (= (nx-msg start 7) "")
+                    (record-new [:ref :evm.native/precompile] 0 gas (vector-i64))
+                    (p/execute (nx-msg start 7) input gas))
+       ps (record-get [:ref :evm.native/precompile] precompile :status)]
+  (if (not (= ps 0))
+   (nx-m start (e/frame-halt
+     (record-assoc [:ref :evm.native/machine]
+      (record-assoc [:ref :evm.native/machine] frame :gas (record-get [:ref :evm.native/precompile] precompile :gas))
+      :output (record-get [:ref :evm.native/precompile] precompile :output)) ps))
+   (if (<= (nx-number (nx-msg start 5)) 3)
+    (nx-region-root start (record-get [:ref :evm.native/execution] start :buffer))
+    (nx-region-nested start (record-get [:ref :evm.native/execution] start :buffer))))))
+(defn- nx-execute [seed [:ref :evm.native/execution] code :vector-i64 input :vector-i64 input-size :i64 gas :i64] [:ref :evm.native/execution]
+ (nx-evaluate (nx-initial seed code input input-size gas)))
+;; A single caller-owned staging buffer is shared by the synchronous call
+;; tree. A child finishes before its parent exports another snapshot. Private
+;; status 12 unwinds a size request without replaying a child locally. Only
+;; this outer root grows capacity and retries the pure whole execution, so
+;; nested CALL/CREATE cannot multiply retries at each depth. No I/O occurs in
+;; an attempt, and only the completed attempt's gas/state/logs are exposed.
+(defn- nx-root [seed [:ref :evm.native/execution] code :vector-i64 input :vector-i64 gas :i64] [:ref :evm.native/execution]
+ (let [initial (nx-initial seed code input (vector-count input) gas)]
+  (loop [start initial attempt 0]
+   (let [buffer (record-get [:ref :evm.native/execution] start :buffer)
+         outcome
+         (arena-scope
+          (let [result (nx-evaluate start)]
+           (if (= (status result) 12) 2
+            (let [packed (nx-pack result buffer)] (if (= packed 0) 2 packed)))))]
+    (cond (< outcome 0) (nx-halt start 10)
+          (= outcome 2) (if (>= attempt 14) (nx-halt start 10)
+                         (recur (record-assoc [:ref :evm.native/execution] start :buffer (nx-grow-buffer buffer)) (+ attempt 1)))
+          :else (nx-unpack start buffer))))))
+
+(defn- nx-hex-size? [text :string n :i64] :bool
+  (and (= (string-length text) n) (b/valid-hex? text)))
+(defn- nx-valid-message? [message :string] :bool
+  (and (<= (string-length message) 384) (= (b/fields message 124) 8)
+       (nx-hex-size? (b/field message 124 0) 40)
+       (nx-hex-size? (b/field message 124 1) 40)
+       (nx-hex-size? (b/field message 124 2) 40)
+       (nx-hex-size? (b/field message 124 3) 64)
+       (nx-hex-size? (b/field message 124 4) 64)
+       (<= (nx-number (b/field message 124 5)) 1024)
+       (= (str (nx-number (b/field message 124 5))) (b/field message 124 5))
+       (or (= (b/field message 124 6) "0") (= (b/field message 124 6) "1"))
+       (nx-hex-size? (b/field message 124 7) 40)))
+(defn- nx-valid-block? [block :string] :bool
+  (and (<= (string-length block) 35000) (= (b/fields block 124) 8)
+       (nx-hex-size? (b/field block 124 1) 40)
+       (loop [i 0]
+         (if (= i 7) true
+           (and (or (= i 1) (nx-hex-size? (b/field block 124 i) 64)) (recur (+ i 1)))))
+       (let [recent (b/field block 124 7) length (string-length recent)
+             count (quot (+ length 1) 130)]
+         (and (or (= length 0) (= (rem (+ length 1) 130) 0)) (<= count 256)
+           (loop [i 0 previous ""]
+             (if (= i count) true
+               (let [offset (* i 130) key (string-substring recent offset (+ offset 64))]
+                 (and (= (string-code-point-at recent (+ offset 64)) 58) (nx-hex-size? key 64)
+                      (> (string-compare key previous) 0)
+                      (nx-hex-size? (string-substring recent (+ offset 65) (+ offset 129)) 64)
+                      (or (= (+ i 1) count) (= (string-code-point-at recent (+ offset 129)) 44))
+                      (recur (+ i 1) key)))))))))
+
+(defn run-frame [state :string message :string input :vector-i64 gas :i64 block :string] [:ref :evm.native/execution]
+  ;; Executes account code with explicitly provided message context. A
+  ;; transaction adapter owns top-level signature/nonce/fee/value admission.
+  (let [address (b/field message 124 0) initial (e/make-machine (vector-i64) input (vector-i64) (vector-i64) gas (= (b/field message 124 6) "1"))
+        warm (loop [i 1 out (nx-add (nx-add "" address) (b/field message 124 2))]
+               (if (= i 10) out (recur (+ i 1) (nx-add out (s/address (w/from-long i))))))
+        seed (record-new [:ref :evm.native/execution] initial state state state message block warm "" "" "" "" "" (vector-i64)
+              (record-new [:ref :evm.native/frame-buffer] (vector-alloc 2048) (vector-alloc 21) (vector-alloc 21)))]
+    (if (or (not (s/valid-world? state)) (not (b/valid? input)) (< gas 0)
+            (not (nx-valid-message? message)) (not (nx-valid-block? block))
+            (> (vector-count input) 65536)) (nx-halt seed 11)
+      (nx-root seed (s/code state (b/field message 124 7)) input gas))))
+
+(defn logs [x [:ref :evm.native/execution]] :string
+  (if (= (status x) 1) (record-get [:ref :evm.native/execution] x :logs) ""))
+
+(defn valid-block? [block :string] :bool (nx-valid-block? block))
+(defn run-admitted [state :string message :string code :vector-i64 input :vector-i64 gas :i64 block :string
+                    access-addresses :string access-slots :string creation :bool] [:ref :evm.native/execution]
+  ;; Pure transaction adapter boundary. All authority is in the transaction
+  ;; envelope; this function grants no external operation or persistence.
+  (let [address (b/field message 124 0)
+        initial (e/make-machine (vector-i64) input (vector-i64) (vector-i64) gas false)
+        warm0 (loop [i 1 out (nx-add (nx-add "" address) (b/field message 124 2))]
+                (if (= i 10) out (recur (+ i 1) (nx-add out (s/address (w/from-long i))))))
+        warm (loop [i 0 out warm0]
+               (if (= i (b/fields access-addresses 44)) out
+                (recur (+ i 1) (nx-add out (b/field access-addresses 44 i)))))
+        slots (loop [i 0 out ""]
+                (if (= i (b/fields access-slots 44)) out
+                  (let [entry (b/field access-slots 44 i)]
+                    (recur (+ i 1) (nx-add out (string-concat (b/field entry 58 0) (b/field entry 58 1)))))))
+        seed (record-new [:ref :evm.native/execution] initial state state state message block warm slots "" ""
+                         (if creation address "") address (vector-i64)
+              (record-new [:ref :evm.native/frame-buffer] (vector-alloc 2048) (vector-alloc 21) (vector-alloc 21)))]
+    (if (or (not (s/valid-world? state)) (not (b/valid? input)) (not (b/valid? code))
+            (< gas 0) (not (nx-valid-message? message)) (not (nx-valid-block? block))) (nx-halt seed 11)
+      (if (or (> (vector-count input) 65536) (> (vector-count code) 65536)) (nx-halt seed 10)
+        (let [pre (if creation (record-new [:ref :evm.native/precompile] 0 gas (vector-i64))
+                    (p/execute address input gas))
+              state (record-get [:ref :evm.native/precompile] pre :status)]
+          (if (= state 0) (nx-root seed code input gas)
+            (nx-m seed (record-assoc [:ref :evm.native/machine]
+                        (record-assoc [:ref :evm.native/machine]
+                          (e/frame-halt initial state) :gas (record-get [:ref :evm.native/precompile] pre :gas))
+                        :output (record-get [:ref :evm.native/precompile] pre :output)))))))))
+(defn complete-creation [x [:ref :evm.native/execution]] [:ref :evm.native/execution]
+  (if (not (= (status x) 1)) x
+    (let [code (output x) deposit (* 200 (vector-count code))]
+      (cond (or (> (vector-count code) 24576)
+                (and (> (vector-count code) 0) (= (vector-at code 0) 239))) (nx-halt x 4)
+            (> deposit (gas-left x)) (nx-halt x 3)
+            :else
+            (record-assoc [:ref :evm.native/execution]
+              (nx-m x (record-assoc [:ref :evm.native/machine] (machine x) :gas (- (gas-left x) deposit)))
+              :world (s/set-code (world x) (nx-msg x 0) code))))))
+(defn refund [x [:ref :evm.native/execution]] :i64
+  (if (= (status x) 1) (record-get [:ref :evm.native/machine] (machine x) :refund) 0))
+(defn finalize-world [x [:ref :evm.native/execution]] :string
+  ;; Transaction boundary only: Paris SELFDESTRUCT leaves code/nonce present
+  ;; within the transaction; EIP-161 prunes only touched empty accounts.
+  (if (not (= (status x) 1)) (world x)
+    (let [deleted (record-get [:ref :evm.native/execution] x :deleted)
+          touched (record-get [:ref :evm.native/execution] x :touched)
+          state (loop [i 0 out (world x)]
+                  (if (= i (b/fields deleted 44)) out
+                    (recur (+ i 1) (s/remove-account out (b/field deleted 44 i)))))]
+      (loop [i 0 out state]
+        (if (= i (b/fields touched 44)) out
+          (let [address (b/field touched 44 i)]
+            (recur (+ i 1) (if (s/alive? out address) out (s/remove-account out address)))))))))

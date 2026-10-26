@@ -1,0 +1,92 @@
+;; Paris legacy, EIP-2930 and EIP-1559 transaction envelopes and signing
+;; payloads. Exact canonical RLP, EIP-155 chain binding and EIP-2 low-s.
+(ns kotoba.vm.evm.native-transaction
+ (:require [kotoba.vm.evm.native-bytes :as b]
+           [kotoba.vm.evm.native-word :as w]
+           [kotoba.vm.evm.native-rlp :as r]
+           [kotoba.vm.evm.native-keccak :as k]
+           [kotoba.vm.evm.native-recover :as recover])
+ (:schemas {:evm.native/transaction [:record :evm.native/transaction
+  [[:status :i64] [:type :i64] [:nonce :vector-i64] [:gas-limit :i64]
+   [:fee-cap :vector-i64] [:tip-cap :vector-i64] [:to :string]
+   [:value :vector-i64] [:data :vector-i64] [:access-addresses :string]
+   [:access-slots :string] [:intrinsic :i64] [:sender :string]
+   [:hash :vector-i64] [:signing-hash :vector-i64]]]}))
+(defn- tx-invalid [] [:ref :evm.native/transaction]
+ (record-new [:ref :evm.native/transaction] 11 0 (w/zero-word) 0 (w/zero-word) (w/zero-word) "" (w/zero-word) (vector-i64) "" "" 0 "" (vector-i64) (vector-i64)))
+(defn- tx-join [a :string bb :string] :string
+ (if (= a "") bb (string-concat (string-concat a ",") bb)))
+(defn- tx-at [input :vector-i64 index :i64] :i64 (r/list-nth input 0 index))
+(defn- tx-word [input :vector-i64 index :i64] :vector-i64 (r/decode-word input (tx-at input index)))
+(defn- tx-encoded-prefix [input :vector-i64 count :i64] :vector-i64
+ (let [start (r/payload-start input 0) end (tx-at input count)] (b/slice input start (- end start))))
+(defn- tx-access-valid [input :vector-i64 at :i64] :bool
+ (and (r/list-item? input at)
+  (loop [i 0]
+   (if (= i (r/list-count input at)) true
+    (let [entry (r/list-nth input at i) address (r/list-nth input entry 0) slots (r/list-nth input entry 1)]
+     (and (= (r/list-count input entry) 2) (not (r/list-item? input address)) (= (r/payload-length input address) 20)
+          (r/list-item? input slots)
+          (loop [j 0] (if (= j (r/list-count input slots)) true
+                       (let [slot (r/list-nth input slots j)]
+                        (and (not (r/list-item? input slot)) (= (r/payload-length input slot) 32) (recur (+ j 1))))))
+          (recur (+ i 1))))))))
+(defn- tx-addresses [input :vector-i64 at :i64] :string
+ (loop [i 0 out ""]
+  (if (= i (r/list-count input at)) out
+   (let [entry (r/list-nth input at i) addr (b/to-hex (r/payload input (r/list-nth input entry 0)))]
+    (recur (+ i 1) (tx-join out addr))))))
+(defn- tx-slots [input :vector-i64 at :i64] :string
+ (loop [i 0 out ""]
+  (if (= i (r/list-count input at)) out
+   (let [entry (r/list-nth input at i) addr (b/to-hex (r/payload input (r/list-nth input entry 0))) slots (r/list-nth input entry 1)
+         next (loop [j 0 text out]
+                (if (= j (r/list-count input slots)) text
+                 (let [key (b/to-hex (r/payload input (r/list-nth input slots j)))]
+                  (recur (+ j 1) (tx-join text (string-concat (string-concat addr ":") key))))))]
+    (recur (+ i 1) next)))))
+(defn decode [raw :vector-i64 chain-id :vector-i64] [:ref :evm.native/transaction]
+ (if (or (= (vector-count raw) 0) (> (vector-count raw) 1048576) (not (b/valid? raw))) (tx-invalid)
+  (let [first (vector-at raw 0) type (if (>= first 192) 0 first)
+        payload (if (= type 0) raw (b/slice raw 1 (- (vector-count raw) 1)))
+        fields (cond (= type 0) 9 (= type 1) 11 (= type 2) 12 :else 0)]
+   (if (or (= fields 0) (not (r/valid? payload)) (not (= (r/list-count payload 0) fields))) (tx-invalid)
+    (let [shift (if (= type 0) 0 1) fee-index (+ shift 1) gas-index (+ shift (if (= type 2) 3 2))
+          to-index (+ gas-index 1) value-index (+ gas-index 2) data-index (+ gas-index 3)
+          access-index (+ gas-index 4) sig-index (- fields 3)
+          valid (loop [i 0]
+                  (if (= i fields) true
+                   (let [at (tx-at payload i)]
+                    (and (cond (= i to-index) (and (not (r/list-item? payload at)) (or (= (r/payload-length payload at) 0) (= (r/payload-length payload at) 20)))
+                               (= i data-index) (not (r/list-item? payload at))
+                               (and (> type 0) (= i access-index)) (tx-access-valid payload at)
+                               :else (r/canonical-word? payload at)) (recur (+ i 1))))))]
+     (if (or (not valid) (> (r/payload-length payload (tx-at payload shift)) 8)
+             (> (r/payload-length payload (tx-at payload gas-index)) 8)) (tx-invalid)
+      (let [v (tx-word payload sig-index) rr (tx-word payload (+ sig-index 1)) ss (tx-word payload (+ sig-index 2))
+            legacy-unprotected (and (= type 0) (or (w/equal-word v (w/from-long 27)) (w/equal-word v (w/from-long 28))))
+            protected (and (= type 0) (not (w/less-word v (w/from-long 35))))
+            vv (if protected (w/subtract-word v (w/from-long 35)) v)
+            parity (if (= type 0) (if legacy-unprotected (- (w/bounded-long v 29) 27) (w/bit-at vv 0)) (w/bounded-long v 2))
+            chain (if (= type 0) (w/shift-right vv 1 false) (tx-word payload 0))
+            chain-valid (if (= type 0) (or legacy-unprotected (and protected (w/equal-word chain chain-id))) (w/equal-word chain chain-id))
+            low-s (and (not (w/zero? ss)) (not (w/less-word (w/from-hex "7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0") ss)))
+            unsigned (if (= type 0)
+                       (r/encode-list (if legacy-unprotected (tx-encoded-prefix payload 6)
+                        (b/concat (tx-encoded-prefix payload 6) (b/concat (r/encode-word chain-id) (vector-i64 128 128)))))
+                       (b/concat (vector-i64 type) (r/encode-list (tx-encoded-prefix payload sig-index))))
+            signing-hash (k/digest unsigned)
+            sender (if (and chain-valid low-s (< parity 2)) (recover/address signing-hash rr ss parity) (vector-i64))]
+       (if (not (= (vector-count sender) 20)) (tx-invalid)
+        (let [to (b/to-hex (r/payload payload (tx-at payload to-index))) data (r/payload payload (tx-at payload data-index))
+              addresses (if (= type 0) "" (tx-addresses payload (tx-at payload access-index)))
+              slots (if (= type 0) "" (tx-slots payload (tx-at payload access-index)))
+              intrinsic (+ 21000 (if (= to "") 32000 0) (* 2400 (b/fields addresses 44)) (* 1900 (b/fields slots 44))
+                            (loop [i 0 gas 0] (if (= i (vector-count data)) gas (recur (+ i 1) (+ gas (if (= (vector-at data i) 0) 4 16))))))
+              fee (tx-word payload (if (= type 2) (+ fee-index 1) fee-index))
+              tip (tx-word payload fee-index)]
+         (if (w/less-word (w/from-hex "7fffffffffffffff") (tx-word payload gas-index))
+          (record-assoc [:ref :evm.native/transaction] (tx-invalid) :status 10)
+          (record-new [:ref :evm.native/transaction] 1 type (tx-word payload shift)
+          (w/bounded-long (tx-word payload gas-index) 9223372036854775807) fee tip to (tx-word payload value-index) data
+          addresses slots intrinsic (b/to-hex sender) (k/digest raw) signing-hash)))))))))))

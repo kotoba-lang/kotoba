@@ -1,0 +1,79 @@
+;; Single-writer durable publication of a verified bounded Ethereum domain.
+;; Full proof/catalog/state/receipt bytes are replaced together. A checksum
+;; detects corruption; certified replay, not that checksum, admits state.
+(ns kotoba.vm.evm.native-store
+ (:require [kotoba.vm.evm.native-store-io :as io]
+           [kotoba.vm.evm.native-ethereum-domain :as d]
+           [kotoba.vm.evm.native-bytes :as b]
+           [inga.native-prefix :as n]
+           [sha2.core :as sha]))
+(defn- ds-hash [s :string] :string (sha/sha256-hex (b/ascii-bytes s)))
+(defn- ds-directory? [base :string] :bool
+ ;; Exclude wire-control tokens and noncanonical dot segments in paths.
+ (and (> (string-length base) 1) (< (string-length base) 3800)
+      (= (string-code-point-at base 0) 47) (not (= (string-code-point-at base (- (string-length base) 1)) 47))
+      (loop [i 1 slash true] (if (= i (string-length base)) true
+        (let [c (string-code-point-at base i)]
+          (and (or (and (>= c 48) (<= c 57)) (and (>= c 65) (<= c 90)) (and (>= c 97) (<= c 122)) (= c 45) (= c 47))
+               (not (and slash (= c 47))) (recur (+ i 1) (= c 47))))))))
+(defn- ds-path [base :string name :string] :string (string-concat (string-concat base "/awai81.") name))
+(defn- ds-first [envelope :string] :string
+ (loop [i 0 out ""] (if (= i 7) out
+  (recur (+ i 1) (if (= i 0) (b/field envelope 10 i) (string-concat (string-concat out "\n") (b/field envelope 10 i)))))))
+(defn- ds-body [ctx :string checkpoint :string prefix :string qc :string catalog :string result :string] :string
+ (string-concat "AWAI81-ETHEREUM-STORE-V1\n" (string-concat (ds-hash ctx)
+  (string-concat "\n" (string-concat checkpoint (string-concat "\n" (string-concat (b/ascii-hex prefix)
+   (string-concat "\n" (string-concat (b/ascii-hex qc) (string-concat "\n" (string-concat (b/ascii-hex catalog)
+    (string-concat "\n" (b/ascii-hex result)))))))))))))
+(defn- ds-envelope-valid? [ctx :string validators :string quorum :i64 envelope :string] :bool
+ (and (<= (string-length envelope) 8388608) (b/ascii? envelope) (= (b/fields envelope 10) 8)
+      (= (b/field envelope 10 0) "AWAI81-ETHEREUM-STORE-V1") (= (b/field envelope 10 1) (ds-hash ctx))
+      (= (b/field envelope 10 7) (ds-hash (ds-first envelope)))
+      (loop [i 3] (if (= i 7) true (and (b/valid-ascii-hex? (b/field envelope 10 i)) (recur (+ i 1)))))
+      (let [checkpoint (b/field envelope 10 2) prefix (b/hex-text (b/field envelope 10 3))
+            result (b/hex-text (b/field envelope 10 6)) height (n/number (b/field checkpoint 58 0))]
+       (and (= (b/fields checkpoint 58) 2) (>= height 0)
+            (= (b/field result 124 0) "ok") (= (n/number (b/field result 124 1)) height)
+            (= (n/block-hash (b/field prefix 10 height)) (b/field checkpoint 58 1))
+            (= result (d/replay ctx validators quorum prefix (b/hex-text (b/field envelope 10 4))
+                               (b/hex-text (b/field envelope 10 5)) checkpoint))))))
+(defn recover [base :string ctx :string validators :string quorum :i64] :string
+ (if (not (ds-directory? base)) "rejected:path"
+  (let [path (ds-path base "state")]
+   (if (not (io/exists? path)) "uninitialized"
+    (let [envelope (io/read path)]
+     (if (ds-envelope-valid? ctx validators quorum envelope) (b/hex-text (b/field envelope 10 6)) "rejected:corrupt"))))))
+(defn checkpoint [base :string ctx :string validators :string quorum :i64] :string
+ (if (not (ds-directory? base)) "rejected:path"
+  (let [path (ds-path base "state")]
+   (if (not (io/exists? path)) (string-concat "0:" (b/field ctx 124 2))
+    (let [envelope (io/read path)]
+     (if (ds-envelope-valid? ctx validators quorum envelope) (b/field envelope 10 2) "rejected:corrupt"))))))
+(defn candidate-envelope [ctx :string validators :string quorum :i64 prefix :string qc :string catalog :string current :string] :string
+(let [result (d/replay ctx validators quorum prefix qc catalog current)]
+ (if (not (= (b/field result 124 0) "ok")) result
+  (let [height (n/number (b/field result 124 1))
+        next (string-concat (str height) (string-concat ":" (n/block-hash (b/field prefix 10 height))))
+        body (ds-body ctx next prefix qc catalog result)]
+   (if (> (string-length body) 8000000) "rejected:persistence-bound"
+    (string-concat body (string-concat "\n" (ds-hash body))))))))
+(defn- ds-publish-locked [base :string ctx :string validators :string quorum :i64 prefix :string qc :string catalog :string expected :string] :string
+(let [current (checkpoint base ctx validators quorum)]
+ (cond (= current "rejected:corrupt") current
+       (not (= current expected)) "rejected:compare"
+       :else
+       (let [envelope (candidate-envelope ctx validators quorum prefix qc catalog current)
+             temp (ds-path base "pending") final (ds-path base "state")]
+        (cond (not (= (b/field envelope 10 0) "AWAI81-ETHEREUM-STORE-V1")) envelope
+              (not (io/write temp envelope)) "rejected:write"
+              (not (io/sync temp)) "rejected:sync"
+              (not (io/rename temp final)) "rejected:rename"
+              (not (io/sync base)) "uncertain:directory-sync"
+              :else (b/hex-text (b/field envelope 10 6)))))))
+(defn publish [base :string ctx :string validators :string quorum :i64 prefix :string qc :string catalog :string expected :string] :string
+ (if (not (ds-directory? base)) "rejected:path"
+  (let [lock-path (ds-path base "lock")]
+   (if (not (io/lock lock-path)) "rejected:busy"
+    (let [result (ds-publish-locked base ctx validators quorum prefix qc catalog expected)
+          released (io/unlock lock-path)]
+     (if released result "uncertain:unlock"))))))
