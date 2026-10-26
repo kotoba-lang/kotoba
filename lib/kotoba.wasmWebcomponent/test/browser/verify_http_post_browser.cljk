@@ -1,0 +1,172 @@
+(ns verify-http-post-browser
+  "Real-browser (headless Chromium via Playwright) end-to-end verification
+  that `http-post` works through the SharedArrayBuffer+Atomics.wait bridge
+  (`src/http-post-bridge.js`'s `createSabHttpPostBridge`, wired into
+  `src/actor-host.js`'s `http_post` via `opts.httpPostBridge`) in an
+  ACTUAL cross-origin-isolated browser tab -- not Node's own WebAssembly
+  engine (`test/verify-http-post.mjs` already covers the inject path that
+  way) and not just the bridge primitive in isolation. This is the one gap
+  both `main`'s merged http-post implementation and the (closed, superseded)
+  PR #6 left open: a real `.kotoba`-shaped WASM guest, instantiated inside a
+  dedicated Worker (`kotoba-wasm-worker-host.js`, via
+  `kotoba-wasm-worker-element.js`'s `<worker-http-post-demo>` custom
+  element -- see `examples/actor-host/index.html`), actually completing a
+  real HTTP POST round-trip against a real local server, on a page served
+  with real COOP/COEP headers.
+
+  Run from this repo's root: `kbb --backend sci -cp test/browser
+  test/browser/verify_http_post_browser.cljk`
+
+  The guest fixture is generated fresh each run (a small WAT template with
+  the local echo server's OS-assigned port baked in, compiled via the
+  `wasm-tools` CLI -- the same 'assemble a WAT fixture into real Wasm bytes
+  at test time' technique `kototama.tender-test` (JVM) already uses) rather
+  than a checked-in `.wasm`, since the target URL's port isn't known until
+  the echo server is actually listening.
+
+  This test drove two real, previously-latent bugs to ground (both fixed
+  alongside it, not just worked around):
+  1. `http-post-bridge.js`'s inner Worker decoded the URL via
+     `new TextDecoder().decode(payload.subarray(...))` -- a view directly
+     over a `SharedArrayBuffer`, which `TextDecoder.decode` refuses
+     ('The provided ArrayBufferView value must not be shared', confirmed
+     live). Fixed to `.slice(...)` (copies into a fresh, non-shared
+     buffer) in the same commit as this test.
+  2. `createSabHttpPostBridge` spawns its own inner Worker and returns
+     before that Worker has actually started (Worker instantiation is
+     async) -- calling `postSync` immediately is a real, confirmed-live
+     deadlock. `kotoba-wasm-worker-host.js` documents and works around this
+     with a short yield; see its own comment."
+  (:require ["node:http" :as http]
+            ["node:child_process" :as child-process]
+            ["node:fs/promises" :as fsp]
+            ["node:path" :as path]
+            [lib.browser-harness :as harness]))
+
+(def repo-root (.cwd js/process))
+(def tmp-dir (.join path repo-root "test" "browser" ".tmp"))
+
+(defn- report! [m]
+  (println (js/JSON.stringify (clj->js m) nil 2)))
+
+(defn- start-echo-server
+  "A real local HTTP server that echoes `ECHO:<url>:<body>` -- the guest's
+  `http_post` call target. Deliberately a DIFFERENT origin than the static
+  server (different port), so this also exercises the real cross-origin
+  path a guest's `http_post` normally hits: `Cross-Origin-Embedder-Policy:
+  require-corp` on the page (needed for `SharedArrayBuffer`) requires a
+  cross-origin fetch response to carry `Cross-Origin-Resource-Policy:
+  cross-origin`, and the bridge's non-simple `content-type:
+  application/octet-stream` POST triggers a CORS preflight (`OPTIONS`) that
+  needs its own `Access-Control-Allow-Methods`/`-Headers` response --
+  confirmed live: omitting either one made `http_post` fail closed (fast,
+  not a hang) with no real request ever reaching this handler. Returns a
+  Promise of `{:baseUrl :close}`."
+  []
+  (js/Promise.
+   (fn [resolve reject]
+     (let [server (http/createServer
+                   (fn [req res]
+                     (if (= (.-method req) "OPTIONS")
+                       (do (.writeHead res 204 #js {"Access-Control-Allow-Origin" "*"
+                                                    "Access-Control-Allow-Methods" "POST"
+                                                    "Access-Control-Allow-Headers" "content-type"
+                                                    "Cross-Origin-Resource-Policy" "cross-origin"})
+                           (.end res))
+                       (let [chunks (array)]
+                         (.on req "data" (fn [c] (.push chunks c)))
+                         (.on req "end"
+                              (fn []
+                                (let [body-text (.toString (js/Buffer.concat chunks) "utf-8")]
+                                  (.writeHead res 200 #js {"content-type" "text/plain"
+                                                           "Access-Control-Allow-Origin" "*"
+                                                           "Cross-Origin-Resource-Policy" "cross-origin"})
+                                  (.end res (str "ECHO:" (.-url req) ":" body-text)))))))))]
+       (.on server "error" reject)
+       (.listen server 0 "127.0.0.1"
+                (fn []
+                  (let [port (.-port (.address server))]
+                    (resolve #js {:baseUrl (str "http://127.0.0.1:" port)
+                                  :close (fn [] (js/Promise. (fn [r] (.close server r))))}))))))))
+
+(defn- compile-http-post-fixture!
+  "Writes a small WAT module calling `http_post` with URL/BODY baked in
+  (url at offset 0, body at offset 128, response written at offset 256
+  with a 256-byte capacity -- generous fixed spacing so a longer
+  127.0.0.1:<port> URL never collides with the body constant, unlike the
+  checked-in `examples/http-post-echo.wat`'s tighter offsets, which assume
+  a short fixed URL), compiles it via the `wasm-tools` CLI (must already be
+  on PATH -- same external dependency `kototama.tender-test`'s WAT
+  fixtures already require), and returns the OUTPUT `.wasm` path."
+  [url body]
+  (-> (.mkdir fsp tmp-dir #js {:recursive true})
+      (.then (fn []
+               (let [wat (str "(module\n"
+                              "  (import \"kotoba\" \"http_post\"\n"
+                              "    (func $http_post (param i32 i32 i32 i32 i32 i32) (result i32)))\n"
+                              "  (memory (export \"memory\") 1)\n"
+                              "  (data (i32.const 0) " (js/JSON.stringify url) ")\n"
+                              "  (data (i32.const 128) " (js/JSON.stringify body) ")\n"
+                              "  (func (export \"main\") (result i64)\n"
+                              "    (i64.extend_i32_s\n"
+                              "      (call $http_post\n"
+                              "        (i32.const 0) (i32.const " (.-length url) ")\n"
+                              "        (i32.const 128) (i32.const " (.-length body) ")\n"
+                              "        (i32.const 256) (i32.const 256)))))\n")
+                     wat-path (.join path tmp-dir "http-post-e2e.wat")
+                     wasm-path (.join path tmp-dir "http-post-e2e.wasm")]
+                 (-> (.writeFile fsp wat-path wat)
+                     (.then (fn []
+                              (let [result (.spawnSync child-process "wasm-tools"
+                                                       #js ["parse" wat-path "-o" wasm-path])]
+                                (when (not= 0 (.-status result))
+                                  (throw (js/Error. (str "wasm-tools parse failed: "
+                                                          (or (some-> result .-stderr (.toString))
+                                                              (.-error result))))))
+                                wasm-path)))))))))
+
+(defn- check-page [page url]
+  (-> (.goto page url #js {:waitUntil "load"})
+      (.then (fn [] (.evaluate page "(() => self.crossOriginIsolated)()")))
+      (.then (fn [isolated]
+               (-> (harness/wait-for-shadow-text page "worker-http-post-demo")
+                   (.then (fn [text] #js [isolated text])))))))
+
+(defn- run-page-check [server wasm-path]
+  (let [rel-src (str "/" (.relative path repo-root wasm-path))
+        url (str (.-baseUrl server) "/examples/actor-host/worker-http-post.html?src="
+                  (js/encodeURIComponent rel-src))]
+    (harness/with-headless-browser
+     (fn [browser]
+       (-> (.newPage browser)
+           (.then (fn [page] (check-page page url))))))))
+
+(defn- evaluate-result! [result]
+  (let [isolated (aget result 0)
+        text (aget result 1)
+        ok? (and (true? isolated)
+                 (not (.startsWith text "ERROR"))
+                 (.includes text "bytes-written:")
+                 (not (.includes text "bytes-written: -1")))]
+    (report! {:name "worker-http-post-demo"
+              :cross-origin-isolated isolated
+              :ok ok?
+              :text text})
+    (when-not ok? (set! (.-exitCode js/process) 1))))
+
+(defn- run-with-servers [echo server]
+  (-> (compile-http-post-fixture! (str (.-baseUrl echo) "/echo") "ping")
+      (.then (fn [wasm-path] (run-page-check server wasm-path)))
+      (.then evaluate-result!)
+      (.finally (fn []
+                  (js/Promise.all #js [((.-close echo)) ((.-close server))])))))
+
+(defn -main []
+  (-> (js/Promise.all #js [(start-echo-server)
+                           (harness/start-static-server repo-root {:cross-origin-isolated? true})])
+      (.then (fn [pair] (run-with-servers (aget pair 0) (aget pair 1))))
+      (.catch (fn [e]
+                (js/console.error e)
+                (set! (.-exitCode js/process) 1)))))
+
+(-main)
