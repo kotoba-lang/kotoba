@@ -1,0 +1,159 @@
+(ns aiueos.uefi.elf
+  (:export [u8 u16 u32 u64 segment-reason admit entry-point segment-field]))
+
+;; The PT_LOAD admission contract, for a BOOTX64.EFI written in Kotoba.
+;;
+;; This is the DECISION half of `os/aiueos/uefi/main.c`'s ELF stage
+;; (:1100-1121) -- which bytes are allowed to become the kernel. ADR-0015 draws
+;; the C boundary at MECHANISM, and "is this file allowed to run as ring-0 code
+;; on this machine" is not mechanism. What stays in C for now is the copying:
+;; `AllocatePages(AllocateAddress)` and `copy_bytes` need an out-pointer and a
+;; writable destination, and a Kotoba UEFI application has neither yet.
+;;
+;; The rules are the ones amu's `package-embedded-kernel` already enforces at
+;; `src/kotoba/compiler/packaging/pe32plus.cljc:344-351`, so the loader admits
+;; exactly what the packager produced. Where the two disagreed, the C was
+;; looser and this follows the packager.
+;;
+;; ---------------------------------------------------------------------------
+;; NOT A BOOLEAN. ZERO IS THE SUCCESS VALUE.
+;; ---------------------------------------------------------------------------
+;; The convention of `aiueos-hkdf-sha256` and `aiueos-sha256-stream`: zero is
+;; admitted and every non-zero value NAMES the clause that refused.
+;;
+;;    1  image shorter than the 64-byte ELF header
+;;    2  e_ident magic is not 7f 45 4c 46
+;;    3  e_ident[4] is not 2 (ELFCLASS64)
+;;    4  e_type is not 2 (ET_EXEC)
+;;    5  e_machine is not 62 (EM_X86_64)
+;;    6  e_phentsize is not 56
+;;    7  e_phnum is not 2
+;;    8  e_phoff is not a multiple of 8
+;;    9  the program header table falls outside the window or the image
+;;   2c  segment 0 refused by clause c below
+;;   3c  segment 1 refused by clause c below
+;;   40  segment 0 flags are not 5 (R+X)
+;;   41  segment 1 flags are not 6 (R+W)
+;;   42  e_entry is not inside segment 0
+;;   43  the two segments overlap
+;;
+;; and the per-segment clauses c:
+;;
+;;    1  p_type is not 1 (PT_LOAD)
+;;    2  p_filesz is zero
+;;    3  p_filesz is not equal to p_memsz
+;;    4  p_paddr below 1 MiB
+;;    5  p_memsz above 1 MiB
+;;    6  p_paddr + p_memsz above 1 GiB
+;;    7  p_paddr is not page aligned
+;;    8  p_offset + p_filesz past the end of the image
+;;
+;; ---------------------------------------------------------------------------
+;; WHY e_phoff'S ALIGNMENT IS CHECKED HERE AND NOT IN THE C
+;; ---------------------------------------------------------------------------
+;; `main.c` casts `kernel_file + elf->phoff` to a `struct` pointer and reads it
+;; whatever its alignment; on x86-64 that happens to work. A bounded Kotoba
+;; load checks alignment LAST and TRAPS (ud2) when it fails, so an unaligned
+;; e_phoff would kill the loader instead of refusing the file. Clause 8 turns
+;; that trap into a verdict. Clause 9 does the same for the table's extent:
+;; both bounds are proved BEFORE the first program-header byte is read.
+;;
+;; ---------------------------------------------------------------------------
+;; TWO LENGTHS
+;; ---------------------------------------------------------------------------
+;; `win` is how many bytes of the file are readable through this region and is
+;; capped at 4096 by the -4k tier; `image-len` is how long the whole file is,
+;; up to the 1 MiB `KERNEL_BUFFER_SIZE`. The headers live in the first page;
+;; clause 8's `p_offset + p_filesz` is a claim about the WHOLE file, so it is
+;; checked against `image-len` and never read through.
+
+(defn u8 [base win i] (kernel-load-u8-4k base win i))
+(defn u16 [base win i] (kernel-load-u16-4k base win i))
+(defn u32 [base win i] (kernel-load-u32-4k base win i))
+(defn u64 [base win i] (kernel-load-u64-4k base win i))
+
+(defn entry-point [base win] (u64 base win 24))
+
+;; p_type +0, p_flags +4, p_offset +8, p_paddr +24, p_filesz +32, p_memsz +40.
+(defn segment-field [base win seg-off which]
+  (if (= which 0) (u32 base win seg-off)
+    (if (= which 1) (u32 base win (+ seg-off 4))
+      (if (= which 2) (u64 base win (+ seg-off 8))
+        (if (= which 3) (u64 base win (+ seg-off 24))
+          (if (= which 4) (u64 base win (+ seg-off 32))
+            (u64 base win (+ seg-off 40))))))))
+
+(defn segment-reason [base win image-len seg-off]
+  (let [type (segment-field base win seg-off 0)
+        offset (segment-field base win seg-off 2)
+        paddr (segment-field base win seg-off 3)
+        filesz (segment-field base win seg-off 4)
+        memsz (segment-field base win seg-off 5)]
+    (if (= type 1)
+      (if (= filesz 0) 2
+        (if (= filesz memsz)
+          (if (< paddr 1048576) 4
+            (if (> memsz 1048576) 5
+              (if (> paddr (- 1073741824 memsz)) 6
+                (if (= (bit-and paddr 4095) 0)
+                  (if (> (+ offset filesz) image-len) 8 0)
+                  7))))
+          3))
+      1)))
+
+(defn admit [base win image-len]
+  (if (< image-len 64) 1
+    (let [magic (u32 base win 0)
+          class (u8 base win 4)
+          type (u16 base win 16)
+          machine (u16 base win 18)
+          phentsize (u16 base win 54)
+          phnum (u16 base win 56)
+          phoff (u64 base win 32)]
+      ;; 0x464c457f is "7f 45 4c 46" read little-endian.
+      (if (= magic 1179403647)
+        (if (= class 2)
+          (if (= type 2)
+            (if (= machine 62)
+              (if (= phentsize 56)
+                (if (= phnum 2)
+                  (if (= (bit-and phoff 7) 0)
+                    (if (> (+ phoff 112) win)
+                      9
+                      (if (> (+ phoff 112) image-len)
+                        9
+                        (let [r0 (segment-reason base win image-len phoff)
+                              r1 (segment-reason base win image-len (+ phoff 56))]
+                          (if (> r0 0) (+ 20 r0)
+                            (if (> r1 0) (+ 30 r1)
+                              (let [f0 (segment-field base win phoff 1)
+                                    f1 (segment-field base win (+ phoff 56) 1)
+                                    p0 (segment-field base win phoff 3)
+                                    m0 (segment-field base win phoff 5)
+                                    p1 (segment-field base win (+ phoff 56) 3)
+                                    m1 (segment-field base win (+ phoff 56) 5)
+                                    entry (entry-point base win)]
+                                (if (= f0 5)
+                                  (if (= f1 6)
+                                    ;; entry must land in segment 0's memory
+                                    ;; window, and the two segments' memory
+                                    ;; windows must not overlap. Spelled as
+                                    ;; nested comparisons: the Kotoba subset
+                                    ;; rejects an :i64 used as an `if` test
+                                    ;; ("a number is never truthy"), and a
+                                    ;; 0/1 flag computed first is exactly that.
+                                    (if (< entry p0) 42
+                                      (if (< entry (+ p0 m0))
+                                        (if (> (+ p0 m0) p1)
+                                          (if (> (+ p1 m1) p0) 43 0)
+                                          0)
+                                        42))
+                                    41)
+                                  40)))))))
+                    8)
+                  7)
+                6)
+              5)
+            4)
+          3)
+        2))))

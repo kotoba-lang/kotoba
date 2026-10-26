@@ -1,0 +1,176 @@
+;; aiueos.compositor.ime -- handle-key state machine as a pure Kotoba guest
+;; (oracle: src/aiueos/compositor/ime.cljk, second slice).
+;;
+;; handle-key is the product decision the kana gate tests: keys are consumed
+;; into the romaji buffer, kana commits only on Enter/Space, and latin
+;; leaking to a focused guest while IME is on is the named red
+;; (:ime-bypass). The guest owns the whole branch tree; the key string
+;; arrives already normalized to an i64 code (the oracle's normalize-key is
+;; case folding plus four names -- host string work), and the IME state
+;; travels as one :document both ways.
+;;
+;; The readings dictionary (3 entries: か ひ あ) fits one map, unlike the
+;; 111-entry mora table of the first slice.
+;;
+;; Compile (single file, JVM-free):
+;;   kotoba compile aiueos/compositor/ime_key.kotoba --target wasm32-browser --output ime_key.wasm
+
+(ns aiueos.compositor.ime-key
+  (:export [handle-key]))
+
+(defn- dg [d k :keyword] :document
+  (option-value-of [:option :document] (document-get d k) (document-null)))
+
+(defn- ds [d k :keyword] :string
+  (option-value-of [:option :string] (document-string-value (dg d k)) ""))
+
+(defn- di [d k :keyword] :i64
+  (option-value-of [:option :i64] (document-i64-value (dg d k)) 0))
+
+(defn- flag [d k :keyword] :bool
+  (= (di d k) 1))
+
+;; readings dictionary: か→[加 可 課], ひ→[日 火], あ→[亜]
+(defn- readings-for [reading :string] :document
+  (let [r (document-map
+         (document-string "か") (document-vector (document-string "加") (document-string "可") (document-string "課"))
+         (document-string "ひ") (document-vector (document-string "日") (document-string "火"))
+         (document-string "あ") (document-vector (document-string "亜")))]
+    (option-value-of [:option :document] (document-get r (document-string reading)) (document-vector))))
+
+;; --- per-key branch builders -------------------------------------------------
+;; Each branch returns the event document; the new state rides on it (:state).
+
+(defn- ev
+  [consumed :i64 reason :keyword strs :document state :document] :document
+  ;; strs: 0 guest-text, 1 preedit, 2 committed
+  (document-map
+   :consumed (document-i64 consumed)
+   :reason (document-keyword reason)
+   :guest-text (document-string (str-at strs 0))
+   :preedit (document-string (str-at strs 1))
+   :committed (document-string (str-at strs 2))
+   :state state))
+
+(defn- str-at [v :document i :i64] :string
+  (option-value-of [:option :string]
+    (document-string-value (option-value-of [:option :document] (document-vector-at v i) (document-null)))
+    ""))
+
+;; off-IME: every named key passes nothing; a letter leaks verbatim.
+(defn- branch-off [ime :document k :i64] :document
+  (let [ch (if (if (= k 0) true (if (= k 1) true (if (= k 2) true (= k 3))))
+             ""
+             (ds ime :preedit))
+        leaked (if (= k 4) k 5)]
+    (ev 0 :ime-bypass (document-vector (document-string ch) (document-string (ds ime :preedit)) (document-string (ds ime :committed)))
+        (document-assoc ime :guest-log (document-string ch)))))
+
+(defn- branch-escape [ime :document] :document
+  ;; cancel-conversion: converting -> back to reading; else clear buf/preedit
+  (let [ime2 (if (flag ime :converting)
+               (document-assoc
+                (document-assoc ime :converting (document-i64 0))
+                :preedit (document-string (ds ime :reading)))
+               (document-assoc
+                (document-assoc ime :buf (document-string ""))
+                :preedit (document-string "")))]
+    (ev 1 :cancel (document-vector (document-string "") (document-string (ds ime2 :preedit)) (document-string (ds ime :committed))) ime2)))
+
+(defn- drop-last [s :string] :string
+  (if (= (string-length s) 0)
+    ""
+    (string-substring s 0 (- (string-length s) 1))))
+
+(defn- branch-backspace [ime :document] :document
+  (let [ime2 (if (flag ime :converting)
+               (document-assoc
+                (document-assoc ime :converting (document-i64 0))
+                :preedit (document-string (ds ime :reading)))
+               (if (> (string-length (ds ime :buf)) 0)
+                 (document-assoc ime :buf (document-string (drop-last (ds ime :buf))))
+                 (if (> (string-length (ds ime :preedit)) 0)
+                   (document-assoc ime :preedit (document-string (drop-last (ds ime :preedit))))
+                   ime)))]
+    (ev 1 :backspace (document-vector (document-string "") (document-string (ds ime2 :preedit)) (document-string (ds ime :committed))) ime2)))
+
+;; --- Space: kanji cycle / convert / kanji-absent ------------------------------
+
+(defn- cand-at [cands :document i :i64] :string
+  (option-value-of [:option :string]
+    (document-string-value (option-value-of [:option :document] (document-vector-at cands i) (document-null)))
+    ""))
+
+(defn- branch-space [ime :document] :document
+  (let [ime1 (if (flag ime :converting)
+               ime
+               (document-assoc ime :preedit (document-string "FLUSH")))
+        reading (if (flag ime1 :converting) (ds ime1 :reading) (ds ime1 :preedit))
+        cands (if (flag ime1 :kanji) (readings-for reading) (document-vector))]
+    (if (if (> (document-count cands) 0) (flag ime1 :converting) false)
+      (let [idx (+ 1 (di ime1 :cand-idx))
+            idx2 (- idx (* (quot idx (document-count cands)) (document-count cands)))
+            ch (cand-at cands idx2)
+            ime2 (document-assoc (document-assoc ime1 :cand-idx (document-i64 idx2))
+                                 :preedit (document-string ch))]
+        (ev 1 :cycle (document-vector (document-string "") (document-string ch) (document-string (ds ime :committed))) ime2))
+      (if (> (document-count cands) 0)
+        (let [ch (cand-at cands 0)
+              ime2 (document-assoc
+                    (document-assoc
+                     (document-assoc
+                      (document-assoc ime1 :converting (document-i64 1))
+                      :reading (document-string reading))
+                     :cand-idx (document-i64 0))
+                    :preedit (document-string ch))]
+          (ev 1 :convert (document-vector (document-string "") (document-string ch) (document-string (ds ime :committed))) ime2))
+        (let [text (ds ime1 :preedit)
+              ime2 (document-assoc
+                    (document-assoc ime1 :buf (document-string ""))
+                    :committed (document-string (string-concat (ds ime :committed) text)))]
+          (ev 1 :kanji-absent (document-vector (document-string text) (document-string "") (document-string (ds ime2 :committed))) ime2))))))
+
+
+;; --- Enter: flush and commit --------------------------------------------------
+
+(defn- branch-enter [ime :document] :document
+  (let [text (ds ime :preedit)
+        ime2 (document-assoc
+              (document-assoc
+               (document-assoc ime :buf (document-string ""))
+               :preedit (document-string ""))
+              :committed (document-string (string-concat (ds ime :committed) text)))]
+    (ev 1 :commit (document-vector (document-string text) (document-string "") (document-string (ds ime2 :committed))) ime2)))
+
+;; --- letter: append to buffer and reconvert -----------------------------------
+;; The letter itself arrives as :key-char (the host lower-cases and passes
+;; the single character; kotoba has no char type). This slice appends and
+;; reconverts via the conversion core.
+
+(defn- branch-letter [ime :document key-char :string] :document
+  (let [buf (string-concat (ds ime :buf) key-char)
+        ime2 (document-assoc ime :buf (document-string buf))]
+    (ev 1 :compose (document-vector (document-string "") (document-string (ds ime2 :preedit)) (document-string (ds ime :committed))) ime2)))
+
+;; --- other: ignored, consumed -------------------------------------------------
+
+(defn- branch-ignored [ime :document] :document
+  (ev 1 :ignored (document-vector (document-string "") (document-string (ds ime :preedit)) (document-string (ds ime :committed))) ime))
+
+;; --- dispatch -----------------------------------------------------------------
+
+(defn handle-key
+  [ime :document k :i64 key-char :string] :document
+  (if (= (di ime :on) 0)
+    (branch-off ime k)
+    (if (= k 1)
+      (branch-escape ime)
+      (if (= k 2)
+        (branch-backspace ime)
+        (if (= k 3)
+          (branch-space ime)
+          (if (= k 0)
+            (branch-enter ime)
+            (if (= k 4)
+              (branch-letter ime key-char)
+              (branch-ignored ime))))))))

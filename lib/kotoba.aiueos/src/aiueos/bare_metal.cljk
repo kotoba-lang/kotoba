@@ -1,0 +1,284 @@
+(ns aiueos.bare-metal
+  "P2 gate: the bare-metal guest (UEFI + KERNEL.ELF under QEMU) must reach
+  kotobase itself.
+
+  Root ADR-2608221625 / aiueos ADR-0041 steps 1–5 / ADR-0081.
+
+  `kbb -M:cloud-live check` is the hosted JVM profile. `kbb -M:session
+  smoke` is the session process on the Mac host. Neither greens this gate.
+  Fetching kotobase from this process is named `:host-fetch-does-not-count`.
+
+  Exit 0 = the guest performed HTTPS GET (or `/ipfs/:cid`) with CID
+  verification. Exit 1 = a leftover the serial named, or a host fetch
+  standing in. Exit 3 = QEMU / OVMF / serial could not be answered.
+
+  Command: `kbb -M:bare-metal cloud`
+  CertVerify: `kbb -M:bare-metal cert-verify`"
+  (:require [kotoba.lang.text :as str]
+            #?(:clj [clojure.java.io :as io])
+            #?(:clj [clojure.pprint :as pprint])))
+
+;; The empty-bytes raw CIDv1 the hosted gate already pins. Named here so a
+;; future guest HTTP line can be compared without this namespace opening a
+;; socket. This file must not fetch it.
+(def expected-cid
+  "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku")
+
+(defn guest-http+cid?
+  "True only when the *guest serial* says HTTP succeeded with a CID.
+  A host process that fetched kotobase is not this."
+  [serial]
+  (boolean
+   (and (string? serial)
+        (re-find #"(?m)^AIUEOS_HTTP_PROBE result=ok" serial)
+        (re-find #"(?m)^AIUEOS_HTTP_PROBE result=ok.*cid=" serial))))
+
+(defn guest-certverify?
+  "True only when the guest serial says CertificateVerify was admitted.
+  Hashing the handshake bytes without this line is `:cert-verify-hashed-only`."
+  [serial]
+  (boolean
+   (and (string? serial)
+        (re-find #"(?m)^AIUEOS_CERTVERIFY_PROBE result=ok" serial))))
+
+(defn leftover-from-serial
+  "Named leftovers the serial already printed. Order is the stack: lease,
+  DNS, TCP:443, TLS, HTTP. A TLS record without a handshake is
+  `:tls-handshake-incomplete`, not `:tls-absent`. A completed handshake
+  without HTTP (`result=ok` / `result=handshake`) leaves only `:http-absent`."
+  [serial]
+  (if (guest-http+cid? serial)
+    []
+    (cond-> []
+      (not (re-find #"AIUEOS_DHCP_CONSUMED src=" (or serial "")))
+      (conj :lease-not-consumed)
+      (not (re-find #"AIUEOS_DNS_PROBE result=ok" (or serial "")))
+      (conj :dns-absent)
+      (not (re-find #"AIUEOS_TCP_CLOUD_PROBE result=ok" (or serial "")))
+      (conj :tcp-cloud-absent)
+      (re-find #"AIUEOS_TLS_PROBE result=record" (or serial ""))
+      (conj :tls-handshake-incomplete)
+      (and (not (re-find #"AIUEOS_TLS_PROBE result=(record|ok|handshake)" (or serial "")))
+           (or (re-find #"AIUEOS_TLS_PROBE result=absent" (or serial ""))
+               (not (re-find #"AIUEOS_TLS_PROBE" (or serial "")))))
+      (conj :tls-absent)
+      true (conj :http-absent))))
+
+(defn leftover-from-cert-verify
+  "Named leftover for the CertVerify gate. HTTP+CID without
+  `AIUEOS_CERTVERIFY_PROBE result=ok` is `:cert-verify-hashed-only`.
+  The `cloud` command does not use this — P2 HTTP+CID stays green."
+  [serial]
+  (if (guest-certverify? serial)
+    []
+    (if (guest-http+cid? serial)
+      [:cert-verify-hashed-only]
+      (leftover-from-serial serial))))
+
+(defn p2-result
+  "Classify a boot. `host-fetched?` is for tests: the command never sets it.
+  If it is true and the guest serial has no HTTP+CID, the reason is
+  `:host-fetch-does-not-count` even if leftover would have been something
+  else — that is the discrimination this gate exists to keep."
+  [{:keys [serial host-fetched? qemu-unmeasured?]}]
+  (cond
+    qemu-unmeasured?
+    {:green? false :exit 3 :reason :unmeasured :leftover [:unmeasured]}
+
+    (and host-fetched? (not (guest-http+cid? serial)))
+    {:green? false :exit 1 :reason :host-fetch-does-not-count
+     :leftover [:host-fetch-does-not-count]}
+
+    (guest-http+cid? serial)
+    {:green? true :exit 0 :reason :guest-http :leftover []}
+
+    :else
+    (let [leftover (leftover-from-serial serial)]
+      {:green? false :exit 1 :reason (or (first leftover) :http-absent)
+       :leftover leftover})))
+
+(defn cert-verify-result
+  "Classify a boot for CertificateVerify. HTTP+CID without
+  `AIUEOS_CERTVERIFY_PROBE result=ok` is leftover `:cert-verify-hashed-only`.
+  The `cloud` command does not use this."
+  [{:keys [serial qemu-unmeasured?]}]
+  (cond
+    qemu-unmeasured?
+    {:green? false :exit 3 :reason :unmeasured :leftover [:unmeasured]}
+
+    (guest-certverify? serial)
+    {:green? true :exit 0 :reason :guest-certverify :leftover []}
+
+    :else
+    (let [leftover (leftover-from-cert-verify serial)]
+      {:green? false :exit 1
+       :reason (or (first leftover) :cert-verify-hashed-only)
+       :leftover leftover})))
+
+(defn serial-measured?
+  "True when the guest actually printed aiueos markers. A missing serial is
+  unmeasured; a boot that ran and named a leftover is not."
+  [serial]
+  (boolean (and (string? serial) (re-find #"AIUEOS_" serial))))
+
+(defn unmeasured-reason
+  "Map a failed UEFI smoke onto exit 3 only when the question could not be
+  asked. A boot that ran and lacked DHCP consumption is exit 1."
+  [exit stderr]
+  (let [text (str stderr)]
+    (cond
+      (re-find #"OVMF firmware not found" text) :firmware-missing
+      (re-find #"qemu-system-x86_64 is required" text) :qemu-missing
+      (re-find #"did not terminate within" text) :qemu-timeout
+      (and (integer? exit) (not (zero? exit))
+           (re-find #"hung guest" text)) :qemu-timeout
+      :else nil)))
+
+#?(:clj
+   (do
+     (defn repo-root
+       []
+       (io/file (System/getProperty "user.dir")))
+
+     (defn uefi-smoke
+       []
+       (io/file (repo-root) "os" "aiueos" "scripts" "smoke-qemu-uefi.sh"))
+
+     (defn serial-file
+       []
+       (io/file (repo-root) "build" "aiueos" "kernel-serial.log"))
+
+     (defn receipt-file
+       []
+       (io/file (repo-root) "build" "aiueos" "bare-metal-cloud-receipt.edn"))
+
+     (defn run-uefi-net!
+       "Run the existing UEFI QEMU smoke with a NIC. No new .sh. This process
+       does not open a socket to kotobase."
+       []
+       (let [script (uefi-smoke)]
+         (if-not (.isFile script)
+           {:ok false :unmeasured true :reason :smoke-script-missing
+            :tried (.getPath script)}
+           (let [pb (doto (ProcessBuilder. ^java.util.List
+                                           ["sh" (.getPath script)])
+                      (.directory (repo-root))
+                      (.inheritIO))
+                 _ (.put (.environment pb) "AIUEOS_TEST_NET" "1")
+                 proc (.start pb)
+                 exit (.waitFor proc)
+                 serial (when (.isFile (serial-file))
+                          (slurp (serial-file)))]
+             {:ok (zero? exit)
+              :exit exit
+              :serial serial
+              :serial-path (.getPath (serial-file))}))))
+
+     (defn write-receipt!
+       [receipt]
+       (let [f (receipt-file)]
+         (io/make-parents f)
+         (spit f (with-out-str (pprint/pprint receipt)))
+         f))
+
+     (defn run-cloud
+       "P2 operator gate. Always writes a receipt. Exit 0 only if the guest
+       HTTP+CID line is in serial."
+       []
+       (let [script (uefi-smoke)]
+         (if-not (.isFile script)
+           (let [r (p2-result {:qemu-unmeasured? true})]
+             (write-receipt! (assoc r :measured-at (str (java.time.Instant/now))
+                                    :command "kbb -M:bare-metal cloud"
+                                    :profile :bare-metal-uefi
+                                    :host-fetch-does-not-count true
+                                    :why :smoke-script-missing))
+             r)
+           (let [boot (run-uefi-net!)
+                 measured? (serial-measured? (:serial boot))
+                 r (p2-result {:serial (:serial boot)
+                               :host-fetched? false
+                               :qemu-unmeasured? (not measured?)})
+                 receipt (assoc r
+                                :aiueos.bare-metal/receipt 1
+                                :measured-at (str (java.time.Instant/now))
+                                :command "kbb -M:bare-metal cloud"
+                                :profile :bare-metal-uefi
+                                :expected-cid expected-cid
+                                :uefi-smoke-exit (:exit boot)
+                                :serial-path (:serial-path boot)
+                                :host-fetch-does-not-count true
+                                :note "P2 is green only when the guest serial has AIUEOS_HTTP_PROBE result=ok with cid=. Hosted cloud-live and session smoke do not count.")]
+             (write-receipt! receipt)
+             (println (str "AIUEOS_BARE_METAL_PROFILE=uefi-qemu"))
+             (println (str "AIUEOS_BARE_METAL_SERIAL=" (:serial-path boot)))
+             (println (str "AIUEOS_BARE_METAL_RECEIPT=" (.getPath (receipt-file))))
+             (println (str "AIUEOS_BARE_METAL_LEFTOVER=" (pr-str (:leftover r))))
+             (when (:serial boot)
+               (doseq [line (str/split-lines (:serial boot))
+                       :when (re-find #"AIUEOS_(DHCP_CONSUMED|DNS_PROBE|TCP_CLOUD_PROBE|TLS_PROBE|HTTP_PROBE|BARE_METAL_P2)" line)]
+                 (println (str/replace line #"\r$" ""))))
+             (if (:green? r)
+               (println "AIUEOS_BARE_METAL_P2 green")
+               (println (str "AIUEOS_BARE_METAL_P2 not-green leftover="
+                             (pr-str (:leftover r)))))
+             r))))
+
+     (defn run-cert-verify
+       "CertVerify operator gate. Exit 0 only if serial has
+       AIUEOS_CERTVERIFY_PROBE result=ok. HTTP+CID without that line is
+       leftover `:cert-verify-hashed-only`. Host probe does not count."
+       []
+       (let [script (uefi-smoke)]
+         (if-not (.isFile script)
+           (let [r (cert-verify-result {:qemu-unmeasured? true})]
+             (write-receipt! (assoc r :measured-at (str (java.time.Instant/now))
+                                    :command "kbb -M:bare-metal cert-verify"
+                                    :profile :bare-metal-uefi))
+             r)
+           (let [boot (run-uefi-net!)
+                 measured? (serial-measured? (:serial boot))
+                 r (cert-verify-result {:serial (:serial boot)
+                                        :qemu-unmeasured? (not measured?)})
+                 receipt (assoc r
+                                :aiueos.bare-metal/receipt 1
+                                :measured-at (str (java.time.Instant/now))
+                                :command "kbb -M:bare-metal cert-verify"
+                                :profile :bare-metal-uefi
+                                :uefi-smoke-exit (:exit boot)
+                                :serial-path (:serial-path boot)
+                                :note "CertVerify is green only when the guest serial has AIUEOS_CERTVERIFY_PROBE result=ok. Host TLS probe and cloud HTTP+CID do not count.")]
+             (write-receipt! receipt)
+             (println (str "AIUEOS_BARE_METAL_PROFILE=uefi-qemu"))
+             (println (str "AIUEOS_BARE_METAL_SERIAL=" (:serial-path boot)))
+             (println (str "AIUEOS_BARE_METAL_RECEIPT=" (.getPath (receipt-file))))
+             (println (str "AIUEOS_BARE_METAL_LEFTOVER=" (pr-str (:leftover r))))
+             (when (:serial boot)
+               (doseq [line (str/split-lines (:serial boot))
+                       :when (re-find #"AIUEOS_(DHCP_CONSUMED|DNS_PROBE|TCP_CLOUD_PROBE|TLS_PROBE|CERTVERIFY_PROBE|HTTP_PROBE|ECDSA_P256|BARE_METAL_P2)" line)]
+                 (println (str/replace line #"\r$" ""))))
+             (if (:green? r)
+               (println "AIUEOS_BARE_METAL_CERTVERIFY green")
+               (println (str "AIUEOS_BARE_METAL_CERTVERIFY not-green leftover="
+                             (pr-str (:leftover r)))))
+             r))))
+
+     (defn -main
+       [& args]
+       (let [cmd (or (first args) "cloud")]
+         (case cmd
+           "cloud"
+           (let [r (run-cloud)]
+             (flush)
+             (System/exit (int (:exit r))))
+
+           "cert-verify"
+           (let [r (run-cert-verify)]
+             (flush)
+             (System/exit (int (:exit r))))
+
+           (do (println "usage: kbb -M:bare-metal cloud|cert-verify")
+               (println "P2: QEMU UEFI guest DHCP/DNS/TCP/TLS/HTTP to kotobase.")
+               (println "cert-verify: guest CertificateVerify (ECDSA P-256).")
+               (println "Hosted cloud-live and session smoke do not count.")
+               (System/exit 3)))))))

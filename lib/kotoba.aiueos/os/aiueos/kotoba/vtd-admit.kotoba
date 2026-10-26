@@ -1,0 +1,199 @@
+;; VT-d admission: may this IOMMU be programmed, and where is its IOTLB?
+;;
+;; `aiueos_vtd_initialize` in kernel/vtd.c opened with three decisions and then
+;; never made another one -- everything after them is mechanism: allocating
+;; pages, filling a second-level page table, writing RTADDR/GCMD/CCMD, spinning
+;; on GSTS. vtd.c was the last kernel file with no decision moved out at all.
+;;
+;; The three, in the order the C made them:
+;;
+;;   1. TOPOLOGY. `drhd_count == 0` and `drhd_count != 1 || segment != 0` are
+;;      two DIFFERENT outcomes and the C spelled them as two statements:
+;;
+;;        if (!aiueos_acpi_dmar_drhd_count()) return 1;              /* absent */
+;;        if (drhd_count() != 1 || segment() != 0) return 0;         /* refuse */
+;;
+;;      No DMAR at all means there is no IOMMU on this machine, nothing to
+;;      program, and a boot that succeeds. More than one remapping unit, or a
+;;      unit on a PCI segment other than 0, means there IS an IOMMU and this
+;;      kernel does not know how to cover it -- the rest of vtd.c programs
+;;      exactly one unit and builds one context table for segment 0 bus 0, so
+;;      admitting a second unit would leave its devices translating through a
+;;      root table nobody wrote. Collapsing the two into one verdict would turn
+;;      "no IOMMU" into a boot failure or, worse, "two IOMMUs" into a success.
+;;
+;;   2. CAPABILITY. `!version`, CAP bit 10, CAP bit 34, and ECAP bit 3:
+;;
+;;        if (!version || !(cap & (1ULL << (8 + 2))) || !(cap & (1ULL << 34)))
+;;          return 0;
+;;        interrupt_remapping_supported = !!(ecap & (1ULL << 3));
+;;
+;;      A zero VER register is not a version, it is an unmapped or dead window.
+;;      CAP bit 10 is SAGAW bit 2 -- the 48-bit, 4-level adjusted guest address
+;;      width -- and the second-level tables below are built with exactly four
+;;      levels and AW=48 in every context entry, so a unit without it would be
+;;      handed a page-table shape it cannot walk. CAP bit 34 is SLLPS bit 0,
+;;      2 MiB second-level leaves, and `sl_pd` is filled with nothing else.
+;;      ECAP bit 3 is not a refusal: it says whether interrupt remapping is
+;;      available, and the caller allocates an IR table only if it is.
+;;
+;;   3. IOTLB OFFSET -- the security-relevant one:
+;;
+;;        uint32_t iotlb = (uint32_t)((ecap >> 8) & 0x3ffU) * 16U + 8U;
+;;        if (iotlb < 8 || iotlb > 0xff8) { vtd_error = 5; return 0; }
+;;        write64(iotlb, ...);
+;;
+;;      That offset is DERIVED from a hardware-reported ECAP field and is then
+;;      used to address the 4 KiB MMIO register window. ECAP bits 17:8 are IRO,
+;;      the IOTLB Register Offset: the VT-d specification puts the Invalidate
+;;      Address register at IRO*16 and the IOTLB Invalidate register at
+;;      IRO*16 + 8. IRO is ten bits, so the derived offset runs 8..16376, while
+;;      the mapped window is one page: the widest 8-byte write that stays inside
+;;      it starts at 0xff8 = 4088, which is why the bound is 0xff8 and not
+;;      0x1000. Deriving an offset from untrusted input and bounding it is a
+;;      judgement, not a register write -- the same shape as
+;;      `net_tcp_peer_next` elsewhere in this tree. An unbounded IRO would put
+;;      a 64-bit write with bits 63 and 60 set somewhere past the end of the
+;;      device window, into whatever the page tables have next.
+;;
+;; THE PACKED PLAN
+;;
+;; One value, so the caller commits to a single admitted decision rather than
+;; recombining an `interrupt_remapping_supported` decided against one ECAP with
+;; an IOTLB offset decided against another. `aiueos-capability-plan` and
+;; `aiueos-murakumo-join-plan` in this directory use the same shape.
+;;
+;;   0        REFUSE. Program nothing, fail the boot stage.
+;;   bit 0    ADMITTED. Every clause held; the rest of this value is the plan.
+;;   bit 1    DMAR ABSENT. No remapping hardware. Touch nothing and succeed.
+;;            Mutually exclusive with bit 0 -- there is no unit to admit.
+;;   bit 2    TOPOLOGY ADMITTED. Exactly one DRHD, on segment 0.
+;;   bit 3    Interrupt remapping supported (ECAP.IR).
+;;   bits 4.. The bounded IOTLB Invalidate register offset, 8..4088.
+;;
+;; Bits 3 and 4.. are meaningful only when bit 0 is set; the object still
+;; computes them from the ECAP it was given, so a caller that reads them without
+;; checking bit 0 gets values derived from that same ECAP rather than garbage.
+;;
+;; WHY BIT 2 EXISTS, AND WHY THE CALLER ASKS TWICE
+;;
+;; The topology decision is made from ACPI, before anything is mapped. The
+;; capability and IOTLB decisions are made from CAP/ECAP, which are MMIO reads
+;; that do not exist until the register window has been mapped -- and mapping it
+;; is exactly what the topology decision authorises. So the caller asks twice:
+;;
+;;   gate = admit(drhd_count, segment, 0, 0, 0);      /* before mapping */
+;;   if (gate & ABSENT)     return 1;
+;;   if (!(gate & TOPOLOGY)) return 0;
+;;   ... map the window, read VER/CAP/ECAP ...
+;;   plan = admit(drhd_count, segment, version, cap, ecap);
+;;   if (!(plan & ADMITTED)) return 0;
+;;
+;; The first call passes 0 for the three registers because they have not been
+;; read yet, and 0 is not a sentinel: a zero VER genuinely is inadmissible, so
+;; the first call returns bit 2 alone -- topology admitted, full admission
+;; withheld -- which is the honest answer to "may I map this window?". The
+;; second call re-decides the topology against the same ACPI values and
+;; conjoins it into bit 0, so nothing the caller acts on was decided in the
+;; first call and reused. Splitting the two phases into two objects, or
+;; returning a bare 0/1 from each, is what would let them drift.
+;;
+;; WHAT MOVED, BEHAVIOURALLY
+;;
+;; The IOTLB bound is now checked BEFORE any register is written, where the C
+;; checked it after RTADDR had been programmed, SRTP issued and a context-cache
+;; invalidation completed. A machine that would have been refused now gets
+;; refused without its root-table pointer being set. That is a change, and it is
+;; the direction mmio-map-admit already moved paging.c: refuse before mutating,
+;; not after. Its cost is that `vtd_error` 5 is no longer reachable -- the
+;; refusal now shares code 1 with the version/CAP refusal that always used it.
+;; main.c prints nothing for either (it names only codes 3, 4, 6, 7, 8, 9), so
+;; no diagnostic is lost.
+;;
+;; SIGNEDNESS -- the C is unsigned, this object is signed i64
+;;
+;; `cap` and `ecap` are `uint64_t` register reads. A unit that reports bit 63 --
+;; and the caller has no way to stop it -- arrives here as a NEGATIVE i64. This
+;; is the one place in this object where a literal transcription of the C is
+;; wrong, so each use is spelled out:
+;;
+;;   * BIT TESTS are sign-agnostic. `bit-and` is the machine's 64-bit AND, and
+;;     every mask here is positive, so the result is in 0..mask and never
+;;     negative however the sign bit of `cap` or `ecap` fell. `(> ... 0)` then
+;;     means exactly "the bit is set", for any input.
+;;
+;;   * THE FIELD EXTRACTION IS NOT. There is no shift operator in this subset,
+;;     so `(ecap >> 8)` has to be `quot` by 256 -- and `quot` truncates toward
+;;     zero where `>>` floors. On a negative `ecap` the two disagree, and worse,
+;;     the C masks AFTER shifting, which discards the sign-extended high bits
+;;     that `quot` would have folded into the low ones. Written the obvious way,
+;;     `(bit-and (quot ecap 256) 1023)`, an ECAP with bit 63 set yields an IRO
+;;     that is not the one the hardware reported -- a wrong offset that can
+;;     still pass the bound and address the wrong register.
+;;
+;;     So this object MASKS FIRST and divides second:
+;;
+;;       (quot (bit-and ecap 261888) 256)          261888 = 0x3ff00
+;;
+;;     `bit-and` clears bits 63..18 including the sign bit, so its result is a
+;;     non-negative multiple of 256 in 0..261888, and on a non-negative multiple
+;;     of 256 `quot` and `>>` agree exactly. The extracted IRO is then the same
+;;     ten bits the C extracted, for every one of the 2^64 values ECAP can hold,
+;;     sign bit included. Mask-then-divide is the general rule here: it is not
+;;     an optimisation, it is what makes the division defined on the input.
+;;
+;;   * `drhd_count` (uint32_t), `segment` (uint16_t) and `version` (uint32_t)
+;;     are all narrower than i64, so no value the C can produce arrives
+;;     negative. They are compared for equality against 0 and 1 regardless, so a
+;;     negative one would be refused rather than admitted.
+;;
+;;   * The derived offset cannot overflow: IRO is at most 1023, so `IRO*16 + 8`
+;;     is at most 16376, and the packed result is at most `16376*16 + 15`, well
+;;     under 2^19. The packing is a sum of disjoint fields, so `+` and `bit-or`
+;;     agree on it.
+;;
+;;   * `(>= iotlb 8)` cannot fail -- the derivation adds 8 to a non-negative
+;;     multiple of 16. It transcribes the C's `iotlb < 8` and is kept for the
+;;     reason mmio-map-admit keeps its wraparound clause: it is a
+;;     bound-consistency check that a future edit to the derivation would have
+;;     to keep true, and the object should be total over its own signature
+;;     rather than over the one line that happens to precede it today.
+;;
+;; FUEL -- no replenish, and none needed
+;;
+;; This object is deliberately absent from `bounded-memory?` in kotoba-native's
+;; elf64.clj, so it gets no replenish and spends from its own context, which
+;; starts at 512 for the whole boot. Measured from the emitted object, not
+;; estimated: the disassembly contains exactly two `decq 0x8(%r9)` sites, one at
+;; the entry of this function and one at the entry of `main`, which the kernel
+;; never calls. There is no helper call and no recursion, so every invocation
+;; costs exactly ONE unit on every path. `aiueos_vtd_initialize` invokes it
+;; twice -- once before mapping, once after reading -- and main.c calls that
+;; once, on the BSP only. The .data context is file-backed in the kernel image,
+;; so the 512 is restored on every boot: 2 units spent of 512, a factor of 256
+;; in hand. Adding a helper `defn` here would cost one more unit per call;
+;; adding a walk would need a tier, which this deliberately does not have.
+
+(defn aiueos-vtd-admit [drhd-count segment version cap ecap]
+  (if (= drhd-count 0)
+    ;; DMAR absent: no remapping hardware, nothing to program, and a success.
+    ;; Bit 0 stays clear -- there is no unit to admit.
+    2
+    (if (and (= drhd-count 1) (= segment 0))
+      (let [iro (quot (bit-and ecap 261888) 256)
+            iotlb (+ (* iro 16) 8)
+            remapping (if (> (bit-and ecap 8) 0) 1 0)]
+        (if (and (not (= version 0))
+                 (> (bit-and cap 1024) 0)
+                 (> (bit-and cap 17179869184) 0)
+                 (>= iotlb 8)
+                 (<= iotlb 4088))
+          ;; admitted | topology | remapping | offset
+          (+ 5 (+ (* remapping 8) (* iotlb 16)))
+          ;; Topology holds; the capability or offset clauses do not. The
+          ;; pre-mapping caller reads this as "you may map the window", the
+          ;; post-read caller as a refusal.
+          4))
+      0)))
+
+(defn main [] 0)

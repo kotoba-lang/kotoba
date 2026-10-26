@@ -1,0 +1,200 @@
+#!/usr/bin/env kbb
+;; Create and verify aiueos install intents (install-v1.edn, root ADR
+;; adr-2608251418).
+;;
+;;   create: kbb --backend sci os/aiueos/scripts/install-intent.cljk create \
+;;             --receipt build/aiueos/aiueos-x86_64-build-receipt.json \
+;;             --hostname aiueos-b850m --target-model PNY \
+;;             --target-transport nvme --target-min-gb 400 --target-max-gb 600 \
+;;             --ssh-public-key-file ~/.ssh/id_ed25519.pub \
+;;             --confirm-create aiueos-b850m --out build/aiueos/install-intent.json
+;;   verify: kbb --backend sci os/aiueos/scripts/install-intent.cljk verify \
+;;             --intent build/aiueos/install-intent.json --report report.json
+;;
+;; An unattended installer must never pick its own target: "largest disk" and
+;; "first NVMe" both eventually name the wrong machine's data. The intent is
+;; the owner stating, before the USB is ever plugged in, which one disk on
+;; which machine may be erased, which hostname and SSH key the result carries,
+;; and until when. `verify` compares a live inspection report against that
+;; statement and refuses on any mismatch -- and it refuses with a NAMED reason,
+;; so a test can pin the literal and a wrong-reason refusal cannot pass as a
+;; right-reason one.
+;;
+;; Exit codes: 0 admit / 2 refuse (reasons printed) / 3 could-not-answer.
+;; 3 is deliberately neither 0 nor 1: an inspection that could not run must
+;; not look like an inspection that ran clean, and must also be
+;; distinguishable from this script itself crashing.
+
+(require '[kotoba.lang.text :as str])
+
+(def fs (js/require "node:fs"))
+(def path (js/require "node:path"))
+(def crypto (js/require "node:crypto"))
+
+(defn- die [code & msg]
+  (binding [*out* *err*] (apply println (cons "error:" msg)))
+  (.exit js/process code))
+
+(def args (vec *command-line-args*))
+(def command (first args))
+
+(defn- arg [flag]
+  (let [i (.indexOf (to-array args) flag)]
+    (when (>= i 0) (nth args (inc i) nil))))
+
+(defn- sha256-hex [buf]
+  (-> (.createHash crypto "sha256") (.update buf) (.digest "hex")))
+
+(defn- sha256-file [p]
+  (sha256-hex (.readFileSync fs p)))
+
+(defn- read-json [p]
+  (js->clj (.parse js/JSON (.readFileSync fs p "utf8")) :keywordize-keys true))
+
+(defn- ssh-fingerprint
+  "OpenSSH-style fingerprint of an authorized_keys line: SHA256: plus the
+  unpadded base64 of the SHA-256 of the decoded key blob."
+  [pubkey-line]
+  (let [fields (str/split (str/trim pubkey-line) #"\s+")
+        blob (js/Buffer.from (nth fields 1) "base64")]
+    (str "SHA256:"
+         (-> (.createHash crypto "sha256") (.update blob) (.digest "base64")
+             (str/replace #"=+$" "")))))
+
+(defn- serial-digest
+  "Digest of the canonical (trimmed) serial: sysfs pads serial numbers with
+  trailing spaces the way it pads model strings, and a digest over the padded
+  form refuses the very disk the intent names (measured in the QEMU gate)."
+  [salt-hex serial]
+  (sha256-hex (js/Buffer.from (str salt-hex ":" (str/trim (str serial))) "utf8")))
+
+;; ------------------------------------------------------------------- create
+
+(defn- create! []
+  (let [receipt-path (or (arg "--receipt") (die 3 "--receipt is required"))
+        hostname (or (arg "--hostname") (die 3 "--hostname is required"))
+        model (or (arg "--target-model") (die 3 "--target-model is required"))
+        transport (or (arg "--target-transport") (die 3 "--target-transport is required"))
+        min-gb (or (arg "--target-min-gb") (die 3 "--target-min-gb is required"))
+        max-gb (or (arg "--target-max-gb") (die 3 "--target-max-gb is required"))
+        key-file (or (arg "--ssh-public-key-file") (die 3 "--ssh-public-key-file is required"))
+        confirm (arg "--confirm-create")
+        out (or (arg "--out") (die 3 "--out is required"))
+        mode (or (arg "--mode") "interactive")
+        expires-days (js/parseInt (or (arg "--expires-days") "30") 10)
+        serial (arg "--target-serial")
+        machine-model (or (arg "--machine-model") "unspecified")
+        device-claim (arg "--device-claim")
+        principal (or (arg "--ssh-principal") "aiueos")]
+    ;; The intent authorizes destroying one disk, so creating one is itself
+    ;; confirmed: the confirmation must repeat the hostname, stated twice
+    ;; independently, the same shape flash-usb.cljs uses for --confirm.
+    (when-not (= confirm hostname)
+      (die 2 "--confirm-create must exactly repeat --hostname" hostname))
+    (when-not (#{"interactive" "unattended"} mode)
+      (die 3 "--mode must be interactive or unattended"))
+    (when-not (.existsSync fs receipt-path)
+      (die 3 "release receipt not found:" receipt-path))
+    (let [receipt (read-json receipt-path)
+          disk (:disk receipt)
+          _ (when-not (and (:bytes disk) (:sha256 disk))
+              (die 3 "release receipt has no disk.bytes/disk.sha256"))
+          pubkey (str/trim (.readFileSync fs key-file "utf8"))
+          _ (when-not (re-find #"^(ssh-ed25519|ssh-rsa|ecdsa-sha2-\S+)\s+\S+" pubkey)
+              (die 3 "not an OpenSSH public key line:" key-file))
+          salt (when serial (.toString (.randomBytes crypto 16) "hex"))
+          now (js/Date.)
+          expires (js/Date. (+ (.getTime now) (* expires-days 24 3600 1000)))
+          intent {:schema "aiueos.install-intent.v1"
+                  :created (.toISOString now)
+                  :expires (.toISOString expires)
+                  :mode mode
+                  :confirmedBy "owner-phrase"
+                  :release {:receiptSha256 (sha256-file receipt-path)
+                            :disk {:bytes (:bytes disk) :sha256 (:sha256 disk)}}
+                  :machineProfile {:architecture "x86_64" :firmware "uefi"
+                                   :model machine-model}
+                  :targetDisk {:model model
+                               :transport transport
+                               :minBytes (* (js/parseInt min-gb 10) 1000 1000 1000)
+                               :maxBytes (* (js/parseInt max-gb 10) 1000 1000 1000)
+                               :serialSha256 (when serial (serial-digest salt serial))
+                               :serialSalt salt}
+                  :hostname hostname
+                  :deviceClaim (when device-claim {:ref device-claim})
+                  :ssh {:authorizedPrincipal principal
+                        :publicKey pubkey
+                        :fingerprint (ssh-fingerprint pubkey)}
+                  :network {:policy "wired-dhcp"}}]
+      (.mkdirSync fs (.dirname path out) #js {:recursive true})
+      (.writeFileSync fs out (str (.stringify js/JSON (clj->js intent) nil 2) "\n"))
+      (println "AIUEOS_INSTALL_INTENT_CREATED" out
+               (str "sha256=" (sha256-file out))
+               (str "hostname=" hostname) (str "mode=" mode)
+               (str "expires=" (.toISOString expires))))))
+
+;; ------------------------------------------------------------------- verify
+
+(defn verify-intent
+  "Pure admission: intent map + inspection report map (+ optional probed
+  serial) -> {:admit bool :reasons [...]}. Reasons are stable literals;
+  install-v1.edn :intent :refuses lists them."
+  [intent report probed-serial now-ms]
+  (let [reasons (atom [])
+        refuse! (fn [r] (swap! reasons conj r))
+        td (:targetDisk intent)
+        target (:target report)
+        image (:image report)]
+    (when (< (.getTime (js/Date. (:expires intent))) now-ms)
+      (refuse! "intent-expired"))
+    (when-not (= (get-in intent [:release :disk :sha256]) (:sha256 image))
+      (refuse! "intent-release-digest-mismatch"))
+    (let [want (str/lower (or (:model td) ""))
+          got (str/lower (or (:model target) ""))]
+      (when-not (and (seq want) (str/includes? got want))
+        (refuse! "target-model-mismatch")))
+    (let [bytes (:bytes target)]
+      (when-not (and (number? bytes)
+                     (<= (:minBytes td) bytes (:maxBytes td)))
+        (refuse! "target-capacity-out-of-bounds")))
+    (cond
+      (nil? (:transport target)) (refuse! "target-transport-unmeasured")
+      (not= (str/lower (:transport target))
+            (str/lower (:transport td))) (refuse! "target-transport-mismatch"))
+    (when (:serialSha256 td)
+      (cond
+        (nil? probed-serial) (refuse! "target-serial-unmeasured")
+        (not= (:serialSha256 td)
+              (serial-digest (:serialSalt td) probed-serial))
+        (refuse! "target-serial-mismatch")))
+    {:admit (empty? @reasons) :reasons @reasons}))
+
+(defn- verify! []
+  (let [intent-path (or (arg "--intent") (die 3 "--intent is required"))
+        report-path (or (arg "--report") (die 3 "--report is required"))]
+    (when-not (.existsSync fs intent-path) (die 3 "intent not found:" intent-path))
+    (when-not (.existsSync fs report-path) (die 3 "report not found:" report-path))
+    (let [intent (read-json intent-path)
+          report (read-json report-path)]
+      (when-not (= "aiueos.install-intent.v1" (:schema intent))
+        (die 3 "not an aiueos.install-intent.v1:" intent-path))
+      (when-not (and (:target report) (:image report))
+        (die 3 "report has no target/image sections; run install.mjs inspect first"))
+      (let [{:keys [admit reasons]}
+          (verify-intent intent report (arg "--serial")
+                         (if-let [parity-now (.-AIUEOS_PARITY_NOW (.-env js/process))]
+                           (js/parseInt parity-now 10)
+                           (js/Date.now)))]
+        (if admit
+          (println "AIUEOS_INSTALL_INTENT_ADMIT"
+                   (str "hostname=" (:hostname intent))
+                   (str "target=" (get-in report [:target :path]))
+                   (str "fingerprint=" (get-in intent [:ssh :fingerprint])))
+          (do (doseq [r reasons]
+                (println "AIUEOS_INSTALL_INTENT_REFUSE" r))
+              (.exit js/process 2)))))))
+
+(case command
+  "create" (create!)
+  "verify" (verify!)
+  (die 3 "usage: install-intent.cljk {create|verify} ..."))

@@ -1,0 +1,176 @@
+#!/usr/bin/env kbb
+;; k16-control.cljs -- one LAN2 (bus3) control datagram from the Mac to the
+;; K16, and its one-byte answer read back from the bus3 sink.
+;;
+;; The board (os/aiueos/native/debug_link.kotoba `debug-tick`) polls bus3 once
+;; per stream-resident cycle and answers a closed set of single-byte commands
+;; on UDP 10.10.10.2:9000 -> 10.10.10.1:9000:
+;;   'P' ping    -> 'p'
+;;   'R' reboot  -> 'r', then DB on bus2 and 0xCF9 <- 0x06 (stream-resident)
+;;   other       -> '?'
+;; The answer does not come back to the sender's port: the board's TX is a
+;; fixed 4-tuple to 10.10.10.1:9000, which is where the sink
+;; (`kbb --backend sci os/aiueos/tools/k16-bus3-sink.cljk`) listens and appends one line per
+;; datagram to /tmp/k16-bus3-en8.log:
+;;   K16_BUS3_RX from=<ip>:<port> bytes=<n> hex=<hex> t=<iso>
+;; So this tool sends, then WATCHES THE SINK FILE from the offset it had when
+;; the datagram left -- a line that was already in the file cannot satisfy it
+;; (the rig check's rule: a stale log is not a reading). If the sink is
+;; unlinked and recreated while we wait, the offset resets to 0.
+;;
+;; Output, one line on stdout:
+;;   CONTROL<TAB><cmd><TAB><answer|timeout>
+;; exit 0 answered (any answer, '?' included -- it IS the board's answer) /
+;; exit 1 timeout (sent, nothing from the board in --wait-ms) /
+;; exit 2 could-not-send (bind or send failed; the sink was never consulted).
+;; A K16_CONTROL_* detail line goes to stderr so stdout stays one line.
+;;
+;; Why nbb and not kbb (owner rule 2026-09-07: new operational tooling is
+;; kbb-first). Measured: kbb hosts no UDP send. E14 (evolve-01.edn, 2026-09-08)
+;; listed "TCP/UDP listen+connect ... none hosted by kbb today", and re-measured
+;; here the same day: `ls orgs/kotoba-lang/kotoba/lib/kbb/` = browse edn env fs
+;; git proc str -- no socket capability of any kind. This file is therefore a
+;; migration candidate the moment kbb gains a :net/udp capability (added on the
+;; kbb side, per the rule), not a reason to keep writing nbb.
+;;
+;; Latency to expect on the real board: debug-tick runs ONCE PER CYCLE, and a
+;; cycle is a whole connect plus a receive window with bounded waits -- seconds,
+;; not milliseconds. --wait-ms defaults to 20000 for that reason.
+;;
+;; Usage:
+;;   kbb --backend sci os/aiueos/tools/k16-control.cljk <P|R|c> [--to 10.10.10.2:9000]
+;;       [--from 10.10.10.1] [--sink /tmp/k16-bus3-en8.log] [--wait-ms 20000]
+;;       [--answer-from <ip>   (default: the host of --to)]
+;; Loopback proof (no board): a sink on 127.0.0.1:19000, a fake board on
+;; 127.0.0.1:19001 that answers into the sink, then
+;;   kbb --backend sci os/aiueos/tools/k16-control.cljk R --to 127.0.0.1:19001 --from 127.0.0.1 \
+;;       --sink /tmp/x/sink.log --wait-ms 2000        # CONTROL  R  r ; exit 0
+
+(ns k16-control
+  (:require ["node:dgram" :as dgram]
+            ["node:fs" :as fs]
+            [kotoba.lang.text :as str]))
+
+(def defaults
+  {"to" "10.10.10.2:9000"
+   "from" "10.10.10.1"
+   "sink" "/tmp/k16-bus3-en8.log"
+   "wait-ms" "20000"
+   "answer-from" nil})
+
+(defn- parse-args [argv]
+  (loop [args argv acc defaults cmd nil]
+    (if (empty? args)
+      [acc cmd]
+      (let [[k v & more] args]
+        (cond
+          (= k "--help") (recur more (assoc acc "help" "true") cmd)
+          (str/starts-with? k "--")
+          (let [key (subs k 2)]
+            (when-not (contains? defaults key)
+              (println (str "UNKNOWN_FLAG\t" k))
+              (js/process.exit 2))
+            (recur more (assoc acc key v) cmd))
+          (nil? cmd) (recur (rest args) acc k)
+          :else (do (println (str "UNEXPECTED_ARG\t" k)) (js/process.exit 2)))))))
+
+(defn- usage! []
+  (println (str/join "\n"
+                     ["kbb --backend sci k16-control.cljk <P|R|c> [--flag value ...]"
+                      "flags (defaults in brackets):"
+                      (str/join "\n" (map (fn [[k v]] (str "  --" k " [" v "]")) (sort-by first defaults)))
+                      "stdout: CONTROL<TAB><cmd><TAB><answer|timeout>"
+                      "exit 0 answered / 1 timeout / 2 could-not-send"]))
+  (js/process.exit 0))
+
+(defn- host-port [s default-port]
+  (let [[h p] (str/split s #":")]
+    [h (if (and p (not (str/blank? p))) (js/parseInt p 10) default-port)]))
+
+(defn- now [] (.toISOString (js/Date.)))
+(defn- detail [& parts] (.write js/process.stderr (str (str/join " " (map str parts)) "\n")))
+
+(defn- verdict! [cmd answer code]
+  (println (str "CONTROL\t" cmd "\t" answer))
+  (js/process.exit code))
+
+(defn- printable [byte]
+  (if (and (>= byte 33) (<= byte 126))
+    (js/String.fromCharCode byte)
+    (str "0x" (.padStart (.toString byte 16) 2 "0"))))
+
+(defn- sink-size [sink]
+  (try (.-size (fs/statSync sink)) (catch :default _ 0)))
+
+(defn- answer-in
+  "Lines appended to `sink` after `offset`, first K16_BUS3_RX from <answer-from>
+   carrying exactly one byte -> that byte, else nil."
+  [sink offset answer-from]
+  (let [size (sink-size sink)
+        start (if (< size offset) 0 offset)      ; recreated smaller: rescan
+        text (try (let [fd (fs/openSync sink "r")
+                        buf (js/Buffer.alloc (- size start))]
+                    (fs/readSync fd buf 0 (- size start) start)
+                    (fs/closeSync fd)
+                    (.toString buf "utf8"))
+                  (catch :default _ ""))
+        re (js/RegExp. (str "^K16_BUS3_RX from=" (str/replace answer-from "." "\\.")
+                            ":\\d+ bytes=1 hex=([0-9a-f]{2}) "))]
+    (some (fn [line]
+            (when-let [m (.exec re line)]
+              (js/parseInt (aget m 1) 16)))
+          (str/split-lines text))))
+
+(defn -main [& argv]
+  (let [[opts cmd] (parse-args argv)
+        _ (when (get opts "help") (usage!))
+        _ (when (or (nil? cmd) (not= 1 (count cmd)))
+            (println "USAGE\tone single-character command is required (P ping, R reboot)")
+            (js/process.exit 2))
+        [to-host to-port] (host-port (get opts "to") 9000)
+        from (get opts "from")
+        sink (get opts "sink")
+        wait-ms (js/parseInt (get opts "wait-ms") 10)
+        answer-from (or (get opts "answer-from") to-host)
+        _ (when (or (js/isNaN wait-ms) (<= wait-ms 0))
+            (println (str "USAGE\tbad --wait-ms " (get opts "wait-ms"))) (js/process.exit 2))
+        offset (sink-size sink)
+        sock (dgram/createSocket "udp4")
+        sent (atom false)]
+    (.on sock "error"
+         (fn [e]
+           (detail "K16_CONTROL_SEND_FAIL" (str "stage=" (if @sent "after-send" "bind"))
+                   (str "code=" (or (.-code e) (.-message e))) (str "from=" from)
+                   (str "to=" to-host ":" to-port) (str "t=" (now)))
+           (try (.close sock) (catch :default _ nil))
+           (verdict! cmd "could-not-send" 2)))
+    (.bind sock 0 from
+           (fn []
+             (let [buf (js/Buffer.from cmd "ascii")]
+               (.send sock buf 0 (.-length buf) to-port to-host
+                      (fn [err]
+                        (if err
+                          (do (detail "K16_CONTROL_SEND_FAIL" "stage=send"
+                                      (str "code=" (or (.-code err) (.-message err)))
+                                      (str "to=" to-host ":" to-port) (str "t=" (now)))
+                              (try (.close sock) (catch :default _ nil))
+                              (verdict! cmd "could-not-send" 2))
+                          (let [t0 (.now js/Date)]
+                            (reset! sent true)
+                            (try (.close sock) (catch :default _ nil))
+                            (detail "K16_CONTROL_SENT" (str "cmd=" cmd) (str "to=" to-host ":" to-port)
+                                    (str "from=" from) (str "sink=" sink) (str "sink-offset=" offset)
+                                    (str "answer-from=" answer-from) (str "wait-ms=" wait-ms) (str "t=" (now)))
+                            (letfn [(poll []
+                                      (if-let [byte (answer-in sink offset answer-from)]
+                                        (do (detail "K16_CONTROL_ANSWER" (str "byte=0x" (.toString byte 16))
+                                                    (str "after-ms=" (- (.now js/Date) t0)) (str "t=" (now)))
+                                            (verdict! cmd (printable byte) 0))
+                                        (if (>= (- (.now js/Date) t0) wait-ms)
+                                          (do (detail "K16_CONTROL_TIMEOUT" (str "waited-ms=" (- (.now js/Date) t0))
+                                                      (str "sink-size-now=" (sink-size sink)) (str "t=" (now)))
+                                              (verdict! cmd "timeout" 1))
+                                          (js/setTimeout poll 50))))]
+                              (poll)))))))))))
+
+(apply -main *command-line-args*)

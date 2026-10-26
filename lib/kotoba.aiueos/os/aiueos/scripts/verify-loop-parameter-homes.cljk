@@ -1,0 +1,221 @@
+#!/usr/bin/env kbb
+;; Refuse a Kotoba kernel object whose self-tail loop reads a frame slot that is
+;; only ever written OUTSIDE the loop.
+;;
+;;   kbb --backend sci os/aiueos/scripts/verify-loop-parameter-homes.cljk [--root <dir>]
+;;                                                          [--objects a.o,b.o]
+;;                                                          [--objdump <path>]
+;;                                                          [--baseline <edn>]
+;;
+;;   0  every object scanned, nothing new has the shape
+;;   2  COULD NOT RUN -- no disassembler, an object that will not read,
+;;      `scanned=0`, or an object set with no self-tail loop in it at all.
+;;      Never a pass.
+;;   3  at least one object has it that the baseline does not know, and the
+;;      report names the function, the slot, the single store, the loop label
+;;      and the reload.
+;;   4  the baseline is stale: an entry it records no longer reproduces. Not a
+;;      regression -- somebody fixed one -- but the entry must be deleted, and a
+;;      quiet 0 would let the file rot into a list nobody reads.
+;;
+;; WHAT IT LOOKS FOR, AND WHY THAT IS THE WHOLE BUG. A self-tail function
+;; compiled with a direct reentry edge keeps its parameters in registers and
+;; jumps back to a label inside its own frame. If the register allocator also
+;; backs a parameter with a frame slot, the store must be inside the loop,
+;; because the recur edge REDEFINES the parameter. kotoba-mir spliced it at the
+;; definition instead -- correct under SSA, wrong across the one edge that is
+;; not -- so the store ran once and every later iteration reloaded the value the
+;; parameter had on ENTRY. In `sha256.o` that froze `round-block`'s counter at
+;; its initial value, `(= i 64)` never held, and the object spun until its fuel
+;; guard trapped with #UD. Fixed in kotoba-mir ADR 0038; see ADR-0190.
+;;
+;; This checks the ARTIFACT, so it keeps answering after the compiler is fixed,
+;; for any future edge that reintroduces the shape from a different direction.
+;; It is deliberately not a source check: nothing in `.kotoba` says where a
+;; spill goes.
+;;
+;; WHAT IT DOES NOT CATCH. A slot written more than once (that store may still
+;; be misplaced, but "written once" is the signature that discriminates), a
+;; loop whose back edge targets the function entry (that form re-runs the whole
+;; prologue and is safe by construction), and anything on AArch64 objects --
+;; this tree emits x86-64 kernel objects only, and the parser is AT&T syntax.
+(ns verify-loop-parameter-homes
+  (:require [clojure.edn :as edn]
+            [kotoba.lang.text :as str]
+            ["node:child_process" :as child]
+            ["node:fs" :as fs]
+            ["node:path" :as path]))
+
+(def ^:private args (vec *command-line-args*))
+
+(defn- opt [f] (let [i (.indexOf args f)] (when-not (neg? i) (nth args (inc i) nil))))
+
+(def ^:private root (path/resolve (or (opt "--root") (.cwd js/process))))
+(def ^:private kotoba-dir (path/join root "os" "aiueos" "kotoba"))
+
+(defn- die! [code msg] (.error js/console msg) (.exit js/process code))
+
+(def ^:private baseline
+  (let [file (or (opt "--baseline")
+                 (path/join root "os" "aiueos" "contracts"
+                            "loop-parameter-home-baseline.edn"))]
+    (if-not (.existsSync fs file)
+      {:known []}
+      (let [read (try (edn/read-string (.readFileSync fs file "utf8"))
+                      (catch :default e ::unreadable))]
+        (when (= ::unreadable read)
+          (die! 2 (str "COULD-NOT-RUN reason=baseline-unreadable file=" file)))
+        read))))
+
+(def ^:private known
+  (into #{} (map (juxt :object :function :slot)) (:known baseline)))
+
+(defn- disassembler []
+  (or (opt "--objdump")
+      (first (filter (fn [candidate]
+                       (zero? (or (.-status (.spawnSync child candidate
+                                                        #js ["--version"]
+                                                        #js {:encoding "utf8"}))
+                                  1)))
+                     ["llvm-objdump" "objdump" "/usr/bin/objdump"]))
+      (die! 2 (str "COULD-NOT-RUN reason=no-disassembler\n"
+                   "  tried llvm-objdump, objdump, /usr/bin/objdump; pass --objdump <path>"))))
+
+;; ------------------------------------------------------------- listing ----
+
+(defn- parse-line [line]
+  (when-let [[_ address _bytes text]
+             (re-matches #"^\s+([0-9a-f]+):\s+((?:[0-9a-f]{2} )+\s+)?(.*)$" line)]
+    (let [text (str/trim text)
+          [mnemonic operands] (str/split text #"\s+" 2)]
+      {:address (js/parseInt address 16)
+       :mnemonic mnemonic
+       :operands (str/trim (or operands ""))})))
+
+(defn- disassemble [objdump object]
+  (let [result (.spawnSync child objdump
+                           (clj->js ["-d" "--no-show-raw-insn" object])
+                           #js {:encoding "utf8" :maxBuffer 67108864})]
+    (when-not (zero? (or (.-status result) 1))
+      (die! 2 (str "COULD-NOT-RUN reason=disassembly-failed object=" object
+                   "\n  " (str/trim (str (.-stderr result))))))
+    (let [instructions (vec (keep parse-line (str/split-lines (str (.-stdout result)))))]
+      (when (empty? instructions)
+        (die! 2 (str "COULD-NOT-RUN reason=no-instructions object=" object
+                     "\n  the disassembler produced no instruction lines; an object"
+                     " that reads as empty must not report clean")))
+      instructions)))
+
+;; ---------------------------------------------------------------- shape ----
+
+(defn- branch-target [operands]
+  (when-let [[_ hex] (re-find #"^0x([0-9a-f]+)" (str/trim (str operands)))]
+    (js/parseInt hex 16)))
+
+(defn- slot
+  "The frame offset an operand names, or nil. `(%rsp)` is slot 0."
+  [operands]
+  (when-let [[_ hex] (re-find #"(?:^|,)\s*(?:0x([0-9a-f]+))?\(%rsp\)" (str operands))]
+    (if hex (js/parseInt hex 16) 0)))
+
+(defn- store? [{:keys [mnemonic operands]}]
+  (and (str/starts-with? (str mnemonic) "mov")
+       (re-find #"%\w+,\s*(0x[0-9a-f]+)?\(%rsp\)" (str operands))))
+
+(defn- load? [{:keys [mnemonic operands]}]
+  (and (str/starts-with? (str mnemonic) "mov")
+       (re-find #"\(%rsp\),\s*%\w+" (str operands))))
+
+(defn- findings [instructions]
+  (let [callees (into #{} (keep #(when (str/starts-with? (str (:mnemonic %)) "call")
+                                   (branch-target (:operands %))))
+                      instructions)
+        entries (vec (sort (conj callees 0)))
+        function-of (fn [address] (last (take-while #(<= % address) entries)))
+        back-edges (for [{:keys [address mnemonic operands]} instructions
+                         :when (= "jmp" mnemonic)
+                         :let [target (branch-target operands)]
+                         :when (and target (< target address)
+                                    (= (function-of target) (function-of address))
+                                    ;; the entry form re-runs the prologue
+                                    (not= target (function-of address)))]
+                     {:from address :to target :function (function-of address)})]
+    {:back-edges (count back-edges)
+     :findings
+     (vec (for [{:keys [from to function]} back-edges
+                :let [body (filterv #(and (>= (:address %) function)
+                                          (<= (:address %) from))
+                                    instructions)
+                      stores (group-by (comp slot :operands) (filter store? body))
+                      loads (group-by (comp slot :operands) (filter load? body))]
+                [where written] stores
+                :when where
+                :let [read-back (get loads where)]
+                :when (and (= 1 (count written))
+                           (< (:address (first written)) to)
+                           (some #(and (>= (:address %) to) (< (:address %) from))
+                                 read-back))]
+            {:function function :slot where
+             :store (:address (first written)) :label to :back-edge from
+             :reloads (mapv :address (filter #(>= (:address %) to) read-back))}))}))
+
+;; ----------------------------------------------------------------- main ----
+
+(defn- hex [n] (str "0x" (.toString n 16)))
+
+(let [objdump (disassembler)
+      named (some-> (opt "--objects") (str/split #","))
+      objects (->> (if named
+                     named
+                     (filter #(str/ends-with? % ".o") (.readdirSync fs kotoba-dir)))
+                   ;; an explicit --objects entry may be an absolute path
+                   ;; (a freshly produced object outside the tree)
+                   (map #(if (path/isAbsolute %) % (path/join kotoba-dir %)))
+                   sort
+                   vec)]
+  (when (empty? objects)
+    (die! 2 (str "COULD-NOT-RUN reason=no-objects dir=" kotoba-dir
+                 "\n  scanned=0 is never a pass")))
+  (let [results (mapv (fn [object]
+                        (when-not (.existsSync fs object)
+                          (die! 2 (str "COULD-NOT-RUN reason=object-missing object=" object)))
+                        (assoc (findings (disassemble objdump object)) :object object))
+                      objects)
+        bad (filter (comp seq :findings) results)
+        edges (reduce + (map :back-edges results))]
+    (doseq [{:keys [object findings]} bad
+            f findings]
+      (println (str (if (contains? known [(path/basename object) (:function f) (:slot f)])
+                      "KNOWN-STALE-PARAMETER-HOME\t"
+                      "STALE-PARAMETER-HOME\t")
+                    (path/basename object)
+                    "\tfunction=" (hex (:function f))
+                    "\tslot=" (hex (:slot f)) "(%rsp)"
+                    "\tstored-once-at=" (hex (:store f))
+                    "\tloop-label=" (hex (:label f))
+                    "\tback-edge=" (hex (:back-edge f))
+                    "\treloaded-in-loop-at=" (str/join "," (map hex (:reloads f))))))
+    (let [seen (into #{} (for [{:keys [object findings]} results, f findings]
+                           [(path/basename object) (:function f) (:slot f)]))
+          fresh (remove (fn [[o f]] (contains? known [o (:function f) (:slot f)]))
+                        (for [{:keys [object findings]} results, f findings]
+                          [(path/basename object) f]))
+          ;; A --objects run scans a SUBSET, so a baseline entry it did not
+          ;; look at is not cleared -- it is unmeasured. Reporting it as cleared
+          ;; would delete real defects from the baseline on the strength of a
+          ;; run that never opened those files.
+          stale (if named [] (remove seen known))]
+      (println (str "SCANNED\t" (count objects) "\tself-tail-loops=" edges
+                    "\tfindings=" (reduce + (map (comp count :findings) results))
+                    "\tknown=" (count known)
+                    "\tnew=" (count fresh)
+                    "\tbaseline-cleared=" (if named "n/a-subset-run" (count stale))))
+      (doseq [[o f sl] stale]
+        (println (str "BASELINE-CLEARED\t" o "\tfunction=" (hex f) "\tslot=" (hex sl)
+                      "\t-- delete this entry from the baseline")))
+      ;; An object set with no self-tail loop at all cannot discriminate: say so
+      ;; rather than reporting a pass nobody can act on.
+      (when (zero? edges)
+        (die! 2 (str "COULD-NOT-RUN reason=no-self-tail-loops scanned=" (count objects)
+                     "\n  nothing in this object set exercises the shape this checks")))
+      (.exit js/process (cond (seq fresh) 3 (seq stale) 4 :else 0)))))

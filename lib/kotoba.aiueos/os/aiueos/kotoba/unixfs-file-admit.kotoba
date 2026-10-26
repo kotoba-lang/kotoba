@@ -1,0 +1,156 @@
+(ns aiueos.unixfs-file-admit
+  (:export [aiueos-unixfs-file-admit main]))
+
+;; Decides that a dag-pb block is the UnixFS file root a manifest says it is.
+;;
+;; WHY A BOUNDED MACHINE NEEDS THIS. `aiueos.cid-v1-admit` verifies one block
+;; against one CID, and SHA-256 here caps a block at 12,288 bytes. The
+;; artifacts this device actually fetches are a 10.9 GB GGUF (ADR-0116) and a
+;; multi-megabyte KERNEL.ELF (ADR-0122). Nothing about holding more memory
+;; fixes that: the C-free profile maps the first GiB and tracks 256 pages.
+;;
+;; A UnixFS file is the shape that makes the gap disappear. The root names its
+;; children by CID; each child is a bounded block; so an unbounded artifact is
+;; verified block by block, in a 12 KiB working window, against ONE name. This
+;; object decides the root: that its links are well-formed CIDv1 links, that
+;; its UnixFS header says File, and that the header's own arithmetic closes --
+;; one blocksize per link and their sum equal to the declared filesize. The
+;; caller then admits each leaf with `cid-v1-admit`, and the composition is a
+;; verified file.
+;;
+;; STRICT ON PURPOSE. Only the canonical go-unixfs encoding is admitted:
+;; Links (field 2) before Data (field 1), each link exactly Hash + empty Name +
+;; Tsize, Data exactly Type + filesize + blocksizes. Being permissive would
+;; cost something and buy nothing -- the block is content-addressed, so its
+;; bytes are already fixed by the CID that named it, and a parser that accepts
+;; a second encoding of the same node accepts bytes no CID here will ever
+;; name. `unixfs.file` in `tech-ipfs-specs-unixfs` emits exactly this shape and
+;; is checked against kubo 0.41.
+
+;; --- protobuf base-128 varints, bounded to five bytes (2^35) ---------------
+;; Five bytes covers a 32 GiB Tsize. A sixth would still be a valid protobuf
+;; varint, so this is a policy bound and is declared as one.
+
+(defn scale [i]
+  (if (= i 0) 1 (if (= i 1) 128 (if (= i 2) 16384
+  (if (= i 3) 2097152 268435456)))))
+
+;; Byte count of the varint at POS, or 0 if it is malformed or runs off the
+;; end. Callers ask this FIRST -- `varint-value` returning 0 is a legitimate
+;; value and cannot double as a refusal.
+(defn varint-size [node length pos i]
+  (if (>= (+ pos i) length) 0
+    (if (< (kernel-load-u8-4k node length (+ pos i)) 128) (+ i 1)
+      (if (= i 4) 0
+        (varint-size node length pos (+ i 1))))))
+
+(defn varint-value [node length pos i acc]
+  (if (>= (+ pos i) length) acc
+    (let [b (kernel-load-u8-4k node length (+ pos i))
+          next (+ acc (* (bit-and b 127) (scale i)))]
+      (if (< b 128) next
+        (if (= i 4) next
+          (varint-value node length pos (+ i 1) next))))))
+
+;; --- links -----------------------------------------------------------------
+;; A canonical link is `12 <len> 0a 24 <36 CID bytes> 12 00 18 <tsize>`, so its
+;; inner length is at least 42. That minimum is checked BEFORE any inner byte
+;; is read: a shorter declared length would otherwise put a load past the
+;; window, and a load past the window is UD2 -- the kernel dying on data an
+;; attacker chose, rather than refusing it.
+;; Returns the offset just past the link, or a negative reason.
+(defn link-end [node length pos]
+  (let [size (varint-size node length (+ pos 1) 0)]
+    (if (= size 0) -2
+      (let [inner (+ (+ pos 1) size)
+            inner-length (varint-value node length (+ pos 1) 0 0)
+            end (+ inner inner-length)]
+        (if (< inner-length 42) -2
+          (if (> end length) -2
+            (if (not (= (kernel-load-u8-4k node length inner) 10)) -3
+              (if (not (= (kernel-load-u8-4k node length (+ inner 1)) 36)) -3
+                (if (not (= (kernel-load-u8-4k node length (+ inner 38)) 18)) -4
+                  (if (not (= (kernel-load-u8-4k node length (+ inner 39)) 0)) -4
+                    (if (not (= (kernel-load-u8-4k node length (+ inner 40)) 24)) -5
+                      (let [tsize (varint-size node length (+ inner 41) 0)]
+                        (if (= tsize 0) -5
+                          (if (not (= end (+ (+ inner 41) tsize))) -6
+                            end))))))))))))))
+
+;; Walks links until a byte that is not the Links tag. Returns
+;; `offset * 64 + count`, or a negative reason. The pack is exact: the node is
+;; at most 4096 bytes and the count at most 32.
+(defn scan-links [node length pos count]
+  (if (> count 32) -7
+    (if (>= pos length) (+ (* pos 64) count)
+      (if (not (= (kernel-load-u8-4k node length pos) 18)) (+ (* pos 64) count)
+        (let [end (link-end node length pos)]
+          (if (< end 0) end
+            (scan-links node length end (+ count 1))))))))
+
+;; --- the UnixFS Data message ------------------------------------------------
+;; Returns `payload-offset * 8192 + payload-length`, or a negative reason.
+(defn data-region [node length pos]
+  (if (>= pos length) -8
+    (if (not (= (kernel-load-u8-4k node length pos) 10)) -8
+      (let [size (varint-size node length (+ pos 1) 0)]
+        (if (= size 0) -9
+          (let [start (+ (+ pos 1) size)
+                payload (varint-value node length (+ pos 1) 0 0)
+                end (+ start payload)]
+            (if (< payload 4) -9
+              (if (not (= end length)) -13
+                (+ (* start 8192) payload)))))))))
+
+(defn blocksizes-count [node length pos end acc]
+  (if (> pos end) -12
+    (if (= pos end) acc
+      (if (not (= (kernel-load-u8-4k node length pos) 32)) -12
+        (let [size (varint-size node length (+ pos 1) 0)]
+          (if (= size 0) -12
+            (blocksizes-count node length (+ (+ pos 1) size) end (+ acc 1))))))))
+
+(defn blocksizes-sum [node length pos end acc]
+  (if (>= pos end) acc
+    (let [size (varint-size node length (+ pos 1) 0)]
+      (if (= size 0) -12
+        (blocksizes-sum node length (+ (+ pos 1) size) end
+                        (+ acc (varint-value node length (+ pos 1) 0 0)))))))
+
+(defn admit-data [node length after links expected-filesize]
+  (let [region (data-region node length after)]
+    (if (< region 0) (- 0 region)
+      (let [start (quot region 8192)
+            payload (- region (* start 8192))
+            end (+ start payload)]
+        (if (not (= (kernel-load-u8-4k node length start) 8)) 10
+          (if (not (= (kernel-load-u8-4k node length (+ start 1)) 2)) 10
+            (if (not (= (kernel-load-u8-4k node length (+ start 2)) 24)) 11
+              (let [filesize-size (varint-size node length (+ start 3) 0)]
+                (if (= filesize-size 0) 11
+                  (let [filesize (varint-value node length (+ start 3) 0 0)
+                        blocks-at (+ (+ start 3) filesize-size)
+                        count (blocksizes-count node length blocks-at end 0)]
+                    (if (< count 0) 12
+                      (let [total (blocksizes-sum node length blocks-at end 0)]
+                        (if (< total 0) 12
+                          (if (not (= count links)) 16
+                            (if (not (= total filesize)) 17
+                              (if (not (= filesize expected-filesize)) 15 0))))))))))))))))
+
+;; NOT A BOOLEAN. Zero admits; every non-zero value names the clause that
+;; produced it, and the codes ascend with how far into the node the check
+;; reaches -- links first, then the header, then the two arithmetic identities
+;; that bind the header to the manifest.
+(defn aiueos-unixfs-file-admit
+  [node :i64 node-length :i64 expected-links :i64 expected-filesize :i64] :i64
+  (if (< node-length 1) 1
+    (if (> node-length 4096) 1
+      (let [packed (scan-links node node-length 0 0)]
+        (if (< packed 0) (- 0 packed)
+          (let [after (quot packed 64)
+                links (- packed (* after 64))]
+            (if (not (= links expected-links)) 14
+              (admit-data node node-length after links expected-filesize))))))))
+
+(defn main [] :i64 0)

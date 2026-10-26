@@ -1,0 +1,132 @@
+(ns aiueos.aes128-gcm
+  (:require [aiueos.lib.aes128-gcm-core :as gcm])
+  (:export [aiueos-aes128-gcm main]))
+
+;; AES-128-GCM (FIPS 197 + SP 800-38D) for the freestanding aiueos kernel.
+;;
+;;   (aiueos-aes128-gcm ctx ctx-len data data-len mode)
+;;
+;; This replaces `kernel/tls_aes_gcm.c`.  That file was 275 lines of C holding
+;; the whole AEAD -- the S-box, the key schedule, the cipher, GHASH, CTR and
+;; the tag comparison -- which is the entire confidentiality and integrity
+;; decision of every TLS 1.3 record this OS sends or accepts.  ADR-0015 draws
+;; the C boundary at MECHANISM; nothing about "are these bytes the bytes the
+;; peer sent, under the key we agreed" is mechanism.
+;;
+;; ---------------------------------------------------------------------------
+;; NOT A BOOLEAN.  ZERO IS THE SUCCESS VALUE.
+;; ---------------------------------------------------------------------------
+;; Like `aiueos-dhcp-reply-valid` and `aiueos-cid-v1-admit`, this returns a
+;; REASON CODE:
+;;
+;;     0   done -- sealed, or opened and authenticated
+;;     1   ctx-len below the 1280 bytes this object requires
+;;     2   data-len above 12288
+;;     3   the aad length byte in ctx is above 64
+;;     4   mode is neither 0 (open) nor 1 (seal)
+;;     5   OPEN ONLY: the tag did not match, and nothing was decrypted
+;;
+;; A caller that writes `if (aes128_gcm(...))` inverts the decision and accepts
+;; exactly the records this object refused.  The C it replaces returned 1 for
+;; success; the call sites therefore have to change, and that is deliberate --
+;; a silent convention flip is the one thing worse than a loud one.
+;;
+;; ---------------------------------------------------------------------------
+;; ONE REGION, BECAUSE THE ABI ADMITS FIVE PARAMETERS
+;; ---------------------------------------------------------------------------
+;; Key, nonce, AAD, tag and every scratch buffer live in one caller-owned
+;; region.  Six pointers would not fit, and passing the workspace separately
+;; (the shape `aiueos-sha256` uses) would leave no parameter for `mode`.
+;;
+;;   ctx offset  bytes  what
+;;   ----------  -----  ----------------------------------------------------
+;;        0        16   key (AES-128)
+;;       16        12   nonce (the FINAL 96-bit IV; sequence-number XOR is the
+;;                      record layer's job, not this object's)
+;;       28         1   aad length, 0..64
+;;       29         3   reserved
+;;       32        16   tag.  SEAL writes it; OPEN reads it as the expected tag
+;;       48        16   reserved
+;;       64        64   aad
+;;      128       176   AES-128 round keys
+;;      304        16   H = E_K(0^128)
+;;      320        16   J0 = nonce || 00 00 00 01
+;;      336        16   counter block
+;;      352        16   GHASH accumulator Y
+;;      368        16   E_K(J0)
+;;      384        16   GHASH scratch Z
+;;      400        16   GHASH scratch V
+;;      416        16   AES scratch T (SubBytes output, before ShiftRows)
+;;      432        16   AES state
+;;      448        16   keystream block
+;;      464        16   GHASH length block
+;;      480        32   reserved
+;;      512       256   antilog table (3^i in GF(2^8))
+;;      768       256   log table
+;;     1024       256   S-box
+;;     1280            end -- ctx-len must be at least this
+;;
+;; `data` is a SEPARATE region and is transformed IN PLACE: seal turns
+;; plaintext into ciphertext there, open turns ciphertext back into plaintext.
+;; CTR mode is an XOR, so in-place is exact rather than a shortcut, and it is
+;; what lets a 12 KiB record be handled without a second 12 KiB buffer.
+;;
+;; ---------------------------------------------------------------------------
+;; OPEN AUTHENTICATES BEFORE IT DECRYPTS.  THE C DID NOT.
+;; ---------------------------------------------------------------------------
+;; `tls_aes_gcm.c`'s `aiueos_aes128_gcm_decrypt` ran `gcm_run` -- which writes
+;; the plaintext -- and compared the tag afterwards, returning 0 on mismatch.
+;; Every caller checked the return, so nothing was exploited; but the buffer
+;; held attacker-chosen plaintext for the duration, and "no caller reads it" is
+;; a property of today's callers.  Here the GHASH and the tag comparison run
+;; first and `crypt-all` is not reached at all unless the tag matched, so a
+;; forged record leaves `data` holding the ciphertext it arrived as.
+;;
+;; ---------------------------------------------------------------------------
+;; NO S-BOX TABLE IN THE SOURCE
+;; ---------------------------------------------------------------------------
+;; The C carried the 256-byte FIPS 197 table as a literal.  Here the table is
+;; DERIVED: the log/antilog pair for the generator 3 is built by 255 doublings,
+;; the multiplicative inverse is `alog[255 - log[x]]`, and the S-box is that
+;; inverse under the FIPS 197 affine map.  Two reasons, and neither is
+;; aesthetic.  A 256-arm nested `if` is the only other way to write a constant
+;; table in this subset, and `value-runtime-sha256`'s 64-arm one already
+;; needs `node --stack-size=4000` to analyse; and a derived table can be
+;; checked -- if the construction is wrong every vector fails, whereas one
+;; mistyped byte in a transcribed table fails only the inputs that touch it.
+;;
+;; TIMING.  This object consumes a SECRET (the traffic key), so its timing is a
+;; security property.  It is not constant time and does not claim to be: the
+;; S-box is a memory lookup indexed by key-dependent state, exactly as the C
+;; was, and this subset has no way to express a bitsliced or table-free AES
+;; within the fuel this target allows.  What IS true is that no CONTROL FLOW
+;; depends on secret data -- every loop bound here is a length or a literal,
+;; and the only `if` on a value tests `mode`, a length, or the tag comparison
+;; result, all of which are public.  The same caveat `x25519.kotoba` states
+;; about `quot`, `bit-and` and backend discretion applies here unchanged.;; ---------------------------------------------------------------------------
+;; THE AEAD IS `aiueos/lib/aes128_gcm_core.kotoba`, IMPORTED
+;; ---------------------------------------------------------------------------
+;; The S-box, the key schedule, the cipher, GHASH, CTR and the tag comparison
+;; used to be IN THIS FILE and also, byte for byte, in `tls13-record.kotoba`.
+;; They had to be: before amu#742 a namespace declaring `(:require ...)` could
+;; not be packaged for `x86_64-aiueos-kernel-v1` at all, so a kernel object
+;; could not import anything.
+;;
+;; This entry is now what is left when that is taken out: the argument check,
+;; the mode, and the AAD length. `(gcm/gcm-prepare ctx 16)` names the offset
+;; the 12-byte nonce is read from -- the record layer passes 480 -- which was
+;; the ONLY behavioural difference between the two copies.
+
+(defn aiueos-aes128-gcm [ctx ctx-len data data-len mode]
+  (if (< ctx-len 1280) 1
+    (if (> data-len 12288) 2
+      (if (> (gcm/cl ctx 28) 64) 3
+        (if (> mode 1) 4
+          (if (< mode 0) 4
+            (let [aad-len (gcm/cl ctx 28)
+                  prep (gcm/gcm-prepare ctx 16)]
+              (if (= mode 1)
+                (+ (gcm/gcm-seal ctx data data-len aad-len) (* 0 prep))
+                (+ (gcm/gcm-open ctx data data-len aad-len) (* 0 prep))))))))))
+
+(defn main [] 0)

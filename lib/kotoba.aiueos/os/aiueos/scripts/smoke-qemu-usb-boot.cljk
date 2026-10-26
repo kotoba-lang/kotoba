@@ -1,0 +1,181 @@
+#!/usr/bin/env kbb
+;; USB removable-media boot gate (ADR-0019).
+;;
+;; A GPT release image only earns the claim "bootable from a USB stick" if the
+;; firmware reaches it the way it reaches a physical stick: through the USB
+;; stack, on a device that reports itself REMOVABLE, via the removable-media
+;; fallback path `\EFI\BOOT\BOOTX64.EFI` -- not as a fixed drive the firmware
+;; enumerates directly. This gate boots the SAME release image twice, once per
+;; transport, and requires:
+;;
+;;   1. the USB run booted through a USB device path and the disk run did not,
+;;   2. the aiueos evidence of both runs is byte-identical, and
+;;   3. both runs reached the same terminal state.
+;;
+;; (2) is the load-bearing assertion. Equality means the transport swap changed
+;; nothing observable anywhere in the boot: same loader admission, same kernel
+;; handoff, same Kotoba object results, same driver and storage evidence. A USB
+;; run that merely "also passed" could still have diverged silently; identical
+;; evidence cannot.
+;;
+;; This gate deliberately does NOT hardcode a passing exit status. It asserts
+;; equivalence between two runs in whatever environment it is invoked in, so it
+;; stays honest on a host whose QEMU fails the shared suite for an unrelated
+;; reason (see os/aiueos/README.md, "USB removable-media boot"): if the disk
+;; transport cannot pass here, neither transport is claimed to pass -- but the
+;; transports are still proven indistinguishable.
+
+(require '[kotoba.lang.text :as str])
+
+(def fs (js/require "node:fs"))
+(def path (js/require "node:path"))
+(def cp (js/require "node:child_process"))
+
+(def aiueos (.resolve path (.dirname path *file*) ".."))
+(def repo (.resolve path aiueos ".." ".."))
+(def out (or (.-AIUEOS_OUT js/process.env) (.join path repo "build" "aiueos")))
+;; Kept so the verdict below can quote a cause instead of guessing at one.
+(def evidence-text (atom {}))
+(def image (.join path out "aiueos-x86_64-gpt.img"))
+(def data (.join path out "aiueos-x86_64-data.img"))
+
+(defn- die [& msg]
+  (binding [*out* *err*] (apply println msg))
+  (.exit js/process 1))
+
+(defn- slurp* [p] (.readFileSync fs p "utf8"))
+
+(when-not (.existsSync fs image)
+  (binding [*out* *err*]
+    (println "error: release image not built:" image)
+    (println "hint: run os/aiueos/scripts/build-release-image.sh first"))
+  (.exit js/process 1))
+
+(defn- run-transport
+  "Boot the release image once over TRANSPORT, returning its exit status.
+  Each run starts from a pristine data disk so a partially-written disk from
+  one transport cannot change the other's outcome."
+  [transport]
+  (.copyFileSync fs data (.join path out "virtio-blk-smoke.img"))
+  (let [env (doto (js/Object.assign #js {} js/process.env)
+              (aset "AIUEOS_DISK_IMAGE" image)
+              (aset "AIUEOS_BOOT_TRANSPORT" transport)
+              (aset "AIUEOS_PRESERVE_BLK_IMAGE" "1"))
+        r (.spawnSync cp (.join path aiueos "scripts" "smoke-qemu-uefi.sh")
+                      #js [] #js {:encoding "utf8" :env env :shell false})]
+    (.writeFileSync fs (.join path out (str "usb-gate-" transport ".out"))
+                    (str (.-stdout r) (.-stderr r)))
+    (swap! evidence-text assoc (keyword transport)
+           (str (.-stdout r) (.-stderr r)))
+    (doseq [[stream src] [["serial" "kernel-serial.log"] ["debug" "uefi-debug.log"]]]
+      (.copyFileSync fs (.join path out src)
+                     (.join path out (str "usb-gate-" transport "-" stream ".log"))))
+    (or (.-status r) 1)))
+
+(def disk-status (run-transport "disk"))
+(def usb-status (run-transport "usb"))
+
+(defn- log-for [transport stream]
+  (slurp* (.join path out (str "usb-gate-" transport "-" stream ".log"))))
+
+;; Positive transport proof. The firmware announces the device path it booted
+;; from. A USB device path (`/USB(`) is emitted only when the firmware ran its
+;; USB stack and enumerated a USB mass-storage device, so these two assertions
+;; together distinguish a real transport swap from a silently-ignored argument
+;; -- the USB run must show a USB path, and the disk run must NOT.
+(def usb-serial (log-for "usb" "serial"))
+(def disk-serial (log-for "disk" "serial"))
+
+(when-not (str/includes? usb-serial "/USB(")
+  (binding [*out* *err*]
+    (println "error: USB run did not boot through a USB device path")
+    (doseq [l (filter #(str/includes? % "BdsDxe:") (str/split-lines usb-serial))]
+      (println l)))
+  (.exit js/process 1))
+
+(when (str/includes? disk-serial "/USB(")
+  (die "error: disk run unexpectedly booted through a USB device path"))
+
+(def usb-path
+  (or (last (filter #(str/includes? % "BdsDxe: starting") (str/split-lines usb-serial)))
+      "(no BdsDxe banner)"))
+
+;; Compare the aiueos evidence only. The firmware's own pre-handoff banner
+;; NAMES the boot device, so it necessarily differs between transports -- that
+;; difference is the point, and is asserted above. Everything the OS itself
+;; emits, from its first line onward, must be identical.
+;; Each application processor writes a one-character liveness marker ("A", "B")
+;; straight to the debug port while the bootstrap processor is writing its own
+;; evidence lines, so those characters land at a nondeterministic offset and in
+;; a nondeterministic order relative to each other (observed: "BAAIUEOS_..."
+;; on one boot, "ABAIUEOS_..." on the next, same transport). That race is a
+;; property of SMP bring-up, not of the boot medium, and the shared UEFI gate
+;; asserts the SMP evidence itself. Comparing from each line's own "AIUEOS_"
+;; marker onward drops the racing prefix without weakening what is compared:
+;; every byte the kernel emits as evidence still has to match exactly.
+(defn- normalize-line [line]
+  (let [i (str/index-of line "AIUEOS_")]
+    (if i (subs line i) line)))
+
+(defn- evidence [text]
+  (let [lines (str/split-lines text)
+        start (->> lines (keep-indexed (fn [i l] (when (str/includes? l "AIUEOS_") i))) first)]
+    (if start
+      (str/join "\n" (map normalize-line (drop start lines)))
+      "")))
+
+(def evidence-lines (atom 0))
+
+(doseq [stream ["serial" "debug"]]
+  (let [d (evidence (log-for "disk" stream))
+        u (evidence (log-for "usb" stream))]
+    (when (str/blank? u)
+      (die (str "error: USB run produced no " stream " evidence at all")))
+    (when (= stream "serial")
+      (reset! evidence-lines (count (str/split-lines u))))
+    (when-not (= d u)
+      (binding [*out* *err*]
+        (println (str "error: USB and disk transports produced different "
+                      stream " evidence"))
+        (let [dl (str/split-lines d) ul (str/split-lines u)]
+          (doseq [i (range (max (count dl) (count ul)))]
+            (let [a (nth dl i nil) b (nth ul i nil)]
+              (when-not (= a b)
+                (println (str "  disk[" i "]: " a))
+                (println (str "  usb [" i "]: " b)))))))
+      (.exit js/process 1))))
+
+(when-not (= disk-status usb-status)
+  (die (str "error: USB transport terminal state (" usb-status
+            ") differs from disk (" disk-status ")")))
+
+(println (str "AIUEOS_USB_BOOT_PATH " usb-path))
+(if (zero? disk-status)
+  (println (str "AIUEOS_USB_BOOT_OK removable-media xhci-usb-storage "
+                "evidence-identical lines=" @evidence-lines))
+  (do
+    (println (str "AIUEOS_USB_BOOT_EQUIVALENT removable-media xhci-usb-storage "
+                  "evidence-identical lines=" @evidence-lines
+                  " status=" disk-status))
+    (binding [*out* *err*]
+      ;; Name the cause when the evidence names it. This note used to say the
+      ;; suite fails "in this environment", and for months the commonest reason
+      ;; was not the environment at all: the image under test was built without
+      ;; AIUEOS_INPUT_SMOKE_SYNTHETIC, a define smoke-qemu-uefi.sh sets when it
+      ;; builds its own kernel. Without it the guest waits for a virtio-keyboard
+      ;; event no host here delivers, and stops -- which is correct behaviour
+      ;; for a production image and a misconfigured test for this gate.
+      (if (re-find #"AIUEOS_VIRTIO_INPUT_FAIL no-event-no-synthetic-build"
+                   (str (:disk @evidence-text) (:usb @evidence-text)))
+        (do
+          (println "note: this image was built WITHOUT AIUEOS_INPUT_SMOKE_SYNTHETIC.")
+          (println "      The shared suite requires a keyboard event that only that")
+          (println "      define fabricates, so the image stops at virtio-input. That")
+          (println "      is the gate being misconfigured, not the image failing:")
+          (println "      rebuild with AIUEOS_INPUT_SMOKE_SYNTHETIC=1, as")
+          (println "      smoke-qemu-release-image.sh already does, and re-run.")
+          (println "      Nothing here says anything about boot transport."))
+        (do
+          (println "note: the shared UEFI suite does not pass in this environment for a")
+          (println "      reason unrelated to boot transport; both transports fail")
+          (println "      identically, so USB introduces no divergence. See README."))))))

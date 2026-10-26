@@ -1,0 +1,235 @@
+;; Generate os/aiueos/native/relay_text.kotoba -- the ASCII skeletons of the
+;; murakumo relay protocol, as i64 word literals the native kernel can write.
+;;
+;; The templates here and the regexes in os/aiueos/tools/k16-pxe-server.py are
+;; the same protocol seen from the two ends, and nothing but this generator
+;; keeps them the same.  So the generator does not merely emit: it builds a
+;; sample of every line it can emit and requires the relay's own regex to
+;; accept it.  A template that no longer matches is a compile-time failure
+;; here rather than a board that transmits into silence.
+;;
+;; WHY WORDS, not bytes.  A `(defn x-byte [index] (if (= index 0) 65 ...))`
+;; chain costs one comparison per byte per byte written -- 91 bytes of the
+;; hello line is 8,281 comparisons against a 2^20 per-boot fuel budget shared
+;; with a TCP stack.  Eight ASCII bytes fit in one i64 (ASCII is <= 0x7F so the
+;; sign bit is never set), so a line is 12 words and the same write costs 144.
+;;
+;; WHY THE FIELDS ARE FIXED WIDTH.  The relay parses `score=([0-9]{1,5})` with
+;; int(), so leading zeros are accepted -- every numeric field can be written
+;; at a constant width and the board needs no variable-length decimal
+;; formatter.  The ONE exception is `id`, which the relay compares as a STRING
+;; (`got_id != str(job_id)`), so it must be echoed byte-for-byte from the
+;; request rather than reformatted.  That is why the result line is emitted as
+;; a head and a tail with the id copied between them.
+;;
+;; `--check` re-derives and fails if the committed file has drifted.
+;; Exit 0 clean / 1 drift / 2 refused.
+(ns gen-relay-text
+  (:require ["fs" :as fs] ["path" :as path] [kotoba.lang.text :as str]))
+
+(def root (or (first (remove #(str/starts-with? % "--") *command-line-args*)) "."))
+(def check? (some #(= % "--check") *command-line-args*))
+(def out-path (path/join root "os/aiueos/native/relay_text.kotoba"))
+(def relay-path (path/join root "os/aiueos/tools/k16-pxe-server.py"))
+
+(defn refuse [msg]
+  (binding [*print-fn* *print-err-fn*] (println "REFUSED" msg))
+  (js/process.exit 2))
+
+(when-not (fs/existsSync relay-path) (refuse (str "no relay at " relay-path)))
+
+;; ---- the protocol, once -------------------------------------------------
+;; :parts is the literal skeleton; :fields names each variable run and its
+;; width so the offsets below are derived rather than counted by hand.
+(def lines
+  [{:kind 0 :name "hello"
+    :parts ["AIUEOS_NODE_HELLO_V1 boot=" [:boot 16] " mac=" [:mac 17]
+            " profile=rtl8125-relay-test"]}
+   {:kind 1 :name "result-head"
+    :parts ["AIUEOS_JOB_RESULT_V1 boot=" [:boot 16] " id="]}
+   {:kind 2 :name "result-tail"
+    :parts [" model=aiueos-char-bigram-v1 token=" [:token 2]
+            " score=" [:score 2] " total=" [:total 2]
+            " cycles=" [:cycles 16]]}
+   {:kind 3 :name "pong"
+    :parts ["AIUEOS_NODE_PONG_V1 boot=" [:boot 16] " seq=" [:seq 10]
+            " state=ready"]}
+   {:kind 4 :name "job-request-prefix"
+    :parts ["AIUEOS_JOB_V1 boot="]}
+   {:kind 5 :name "job-request-middle"
+    :parts [" kind=aiueos-micro-infer prompt="]}
+   {:kind 6 :name "ping-request-prefix"
+    :parts ["AIUEOS_NODE_PING_V1 boot="]}])
+
+(defn rendered [line filler]
+  (apply str (for [p (:parts line)]
+               (if (string? p) p (apply str (repeat (second p) (filler (first p))))))))
+
+;; The skeleton the board writes: every variable run is written as '0' and then
+;; overwritten in place, so the template's own length is the line's length.
+(def zero-filler {:boot "0" :mac "0" :token "0" :score "0" :total "0"
+                  :cycles "0" :seq "0"})
+
+(defn field-offsets [line]
+  (loop [parts (:parts line) at 0 out []]
+    (if (empty? parts)
+      {:length at :fields out}
+      (let [p (first parts)]
+        (if (string? p)
+          (recur (rest parts) (+ at (count p)) out)
+          (recur (rest parts) (+ at (second p))
+                 (conj out [(first p) at (second p)])))))))
+
+;; ---- the relay must accept what these templates can produce --------------
+(def relay-text (fs/readFileSync relay-path "utf8"))
+(defn relay-regex [name]
+  (let [m (re-find (re-pattern (str name " = re\\.compile\\(\\s*((?:r\"[^\"]*\"\\s*)+)\\)"))
+                   relay-text)]
+    (when-not m (refuse (str "relay regex " name " not found")))
+    (->> (re-seq #"r\"([^\"]*)\"" (second m)) (map second) (apply str))))
+
+(def samples
+  {"hello"       ["NODE_HELLO"  {:boot "0123456789abcdef" :mac "70-70-fc-0b-b6-31"}]
+   "pong"        ["NODE_PONG"   {:boot "0123456789abcdef" :seq "0000000001"}]})
+
+(doseq [[name [regex-name fills]] samples]
+  (let [line (first (filter #(= (:name %) name) lines))
+        text (rendered line (fn [k] (or (get fills k) "0")))
+        ;; the fixed-width fills are single runs, so substitute them whole
+        text (reduce (fn [s [k _ w]]
+                       (str/replace-first s (apply str (repeat w "0"))
+                                          (or (get fills k) (apply str (repeat w "0")))))
+                     (rendered line zero-filler)
+                     (:fields (field-offsets line)))
+        pattern (js/RegExp. (str "^(?:" (relay-regex regex-name) ")$"))]
+    (when-not (.test pattern text)
+      (refuse (str "the " name " template does not match the relay's " regex-name
+                   " regex. template=" (pr-str text))))))
+
+;; The result line is head + id + tail; check the whole thing against JOB_RESULT.
+(let [head (rendered (first (filter #(= (:name %) "result-head") lines)) zero-filler)
+      tail (rendered (first (filter #(= (:name %) "result-tail") lines)) zero-filler)
+      head (str/replace-first head (apply str (repeat 16 "0")) "0123456789abcdef")
+      tail (-> tail (str/replace-first "token=00" "token=6f")
+                    (str/replace-first "score=00" "score=02")
+                    (str/replace-first "total=00" "total=05"))
+      text (str head "209" tail)
+      pattern (js/RegExp. (str "^(?:" (relay-regex "JOB_RESULT") ")$"))]
+  (when-not (.test pattern text)
+    (refuse (str "the result template does not match the relay's JOB_RESULT regex. "
+                 "line=" (pr-str text))))
+  (println (str "RELAY_SAMPLE " (pr-str text))))
+
+;; The request prefixes must be prefixes of what the relay actually sends.
+(let [job (re-find #"AIUEOS_JOB_V1 boot=\{boot\} id=\{job_id\} kind=\{kind\} " relay-text)
+      emitted (str/join "" (map #(if (string? %) % "") (:parts (nth lines 4))))]
+  (when-not (str/includes? relay-text "AIUEOS_JOB_V1 boot=")
+    (refuse "the relay no longer emits an AIUEOS_JOB_V1 line"))
+  (when-not (str/starts-with? "AIUEOS_JOB_V1 boot=" emitted)
+    (refuse (str "job-request-prefix " (pr-str emitted) " is not what the relay sends"))))
+(when-not (str/includes? relay-text "kind=aiueos-micro-infer")
+  ;; the relay interpolates {kind}; the value is MURAKUMO_JOB_KIND
+  (when-not (re-find #"MURAKUMO_JOB_KIND\s*=\s*\"aiueos-micro-infer\"" relay-text)
+    (refuse "MURAKUMO_JOB_KIND is no longer \"aiueos-micro-infer\"")))
+
+;; ---- pack each template into i64 words ----------------------------------
+(defn bpow8 [n] (reduce (fn [a _] (* a (js/BigInt 256))) (js/BigInt 1) (range n)))
+(defn words [text]
+  (let [bytes (map #(.charCodeAt text %) (range (count text)))]
+    (when (some #(or (< % 32) (> % 126)) bytes)
+      (refuse (str "template is not printable ASCII: " (pr-str text))))
+    (vec (for [chunk (partition-all 8 bytes)]
+           (str (reduce (fn [acc [i b]] (+ acc (* (js/BigInt b) (bpow8 i))))
+                        (js/BigInt 0) (map-indexed vector chunk)))))))
+
+(def packed
+  (vec (for [line lines]
+         (let [text (rendered line zero-filler)
+               fo (field-offsets line)]
+           (assoc line :text text :words (words text)
+                       :length (:length fo) :fields (:fields fo))))))
+
+;; ---- emit ---------------------------------------------------------------
+(defn nest [pairs default]
+  ;; (if (= k v0) r0 (if (= k v1) r1 ... default))
+  (str (str/join "" (for [[k r] pairs] (str "(if (= " (first k) " " (second k) ") " r " ")))
+       default (apply str (repeat (count pairs) ")"))))
+
+(def word-branches
+  (str/join "\n"
+    (for [line packed]
+      (str "    ;; " (:name line) " (" (:length line) " bytes): "
+           (pr-str (:text line)) "\n"
+           "    (if (= kind " (:kind line) ")\n      "
+           (nest (for [[i w] (map-indexed vector (:words line))] [["index" i] w]) "0")
+           "\n"))))
+
+(def rendered-file
+  (str
+"(ns native.relay-text
+  ;; The ASCII skeletons of the murakumo relay protocol, as i64 words.
+  ;;
+  ;; GENERATED by os/aiueos/tools/gen-relay-text.cljk -- do not edit by hand.
+  ;; The generator checks every template it emits against the RELAY'S OWN
+  ;; regexes in os/aiueos/tools/k16-pxe-server.py, so a protocol change on the
+  ;; Mac makes this file fail to regenerate instead of making the board
+  ;; transmit lines nothing accepts.
+  ;;
+  ;; Each line is packed eight ASCII bytes to an i64, low byte first.  ASCII is
+  ;; at most 0x7F so the sign bit is never set.  Variable fields are written as
+  ;; '0' in the skeleton and overwritten in place; every numeric field is fixed
+  ;; width because the relay parses them with int(), which accepts leading
+  ;; zeros.  `id` is the exception -- the relay compares it as a string -- so
+  ;; the result line is a head and a tail with the request's own id bytes
+  ;; copied between them.
+  (:export [template-word template-length
+            hello-boot-offset hello-mac-offset
+            result-boot-offset result-head-length
+            result-token-offset result-score-offset result-total-offset
+            result-cycles-offset result-tail-length
+            pong-boot-offset pong-seq-offset pong-length
+            job-prefix-length job-middle-length ping-prefix-length]))
+
+;; Word `index` of template `kind`, or 0 past the end.
+(defn template-word [kind index]\n"
+word-branches
+"    0" (apply str (repeat (count packed) ")")) ")
+
+(defn template-length [kind]\n    "
+(nest (for [line packed] [["kind" (:kind line)] (:length line)]) "0")
+")
+
+;; Field offsets, derived by the generator from the templates above.\n"
+(let [f (fn [name] (into {} (for [[k o w] (:fields (first (filter #(= (:name %) name) packed)))]
+                              [k [o w]])))
+      hello (f "hello") res-head (f "result-head") res-tail (f "result-tail") pong (f "pong")
+      len (fn [name] (:length (first (filter #(= (:name %) name) packed))))]
+  (str/join "\n"
+    [(str "(defn hello-boot-offset [] " (first (:boot hello)) ")")
+     (str "(defn hello-mac-offset [] " (first (:mac hello)) ")")
+     (str "(defn result-boot-offset [] " (first (:boot res-head)) ")")
+     (str "(defn result-head-length [] " (len "result-head") ")")
+     (str "(defn result-token-offset [] " (first (:token res-tail)) ")")
+     (str "(defn result-score-offset [] " (first (:score res-tail)) ")")
+     (str "(defn result-total-offset [] " (first (:total res-tail)) ")")
+     (str "(defn result-cycles-offset [] " (first (:cycles res-tail)) ")")
+     (str "(defn result-tail-length [] " (len "result-tail") ")")
+     (str "(defn pong-boot-offset [] " (first (:boot pong)) ")")
+     (str "(defn pong-seq-offset [] " (first (:seq pong)) ")")
+     (str "(defn pong-length [] " (len "pong") ")")
+     (str "(defn job-prefix-length [] " (len "job-request-prefix") ")")
+     (str "(defn job-middle-length [] " (len "job-request-middle") ")")
+     (str "(defn ping-prefix-length [] " (len "ping-request-prefix") ")")]))
+"\n"))
+
+(if check?
+  (let [current (when (fs/existsSync out-path) (fs/readFileSync out-path "utf8"))]
+    (if (= current rendered-file)
+      (do (println (str "RELAY_TEXT_OK templates=" (count packed))) (js/process.exit 0))
+      (do (println (str "RELAY_TEXT_DRIFT path=" out-path)) (js/process.exit 1))))
+  (do (fs/writeFileSync out-path rendered-file)
+      (println (str "RELAY_TEXT_WROTE templates=" (count packed) " path=" out-path))
+      (doseq [line packed]
+        (println (str "TEMPLATE " (:kind line) " " (:name line)
+                      " length=" (:length line) " words=" (count (:words line))
+                      " " (pr-str (:text line)))))))

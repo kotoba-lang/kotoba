@@ -1,0 +1,222 @@
+# ADR-0131: The K16 pure-native profile refuses foreign code
+
+## Status
+
+Accepted (2026-09-02)
+
+## Context
+
+AIUEOS calls itself a Kotoba native OS. The K16 image does not currently earn
+that name, and until now nothing in the build could tell you so.
+
+`build-uefi.sh` hands `zig ld.lld` a list of objects and links whatever is in
+it. Measured on 2d56457, under the environment
+`build-qwen38-murakumo-node-pxe.sh` sets, that list is **99 objects: 67 Kotoba
+and 32 compiled from `os/aiueos/kernel/*.c` and three hand-written `.S`
+files.** BOOTX64.EFI is `uefi/main.c` end to end. Nothing checks any of it.
+
+A gate for exactly this already exists -- `build-kotoba-native-kernel.sh:26-30`
+finds foreign artifacts, and `verify-kotoba-native-kernel.py` writes a receipt
+asserting `"foreign_objects": []`. It guards the *demo* single-object kernel,
+not the image that ships. The one place the C boundary is written down for the
+K16 image is prose: ADR-0015, "the honest C boundary".
+
+Prose does not fail a build. Four streams are now porting the loader, the NIC,
+TLS and the Qwen path to Kotoba, and none of them has a number to move.
+
+## Decision
+
+A **pure-native build profile with a foreign-code negative gate**, enforced by
+the build system.
+
+`AIUEOS_K16_PURE_NATIVE=1` restricts the kernel link input to Kotoba objects
+and Amu toolchain stubs, hands that exact list to
+`os/aiueos/scripts/k16-pure-native-gate.cljk` *before* `zig ld.lld` runs, and
+aborts on a non-zero exit. Artifacts are named `aiueos-k16-pure-native-*` and
+the gate receipt is written beside them.
+
+The link list is **derived from the production `zig ld.lld` invocation** by
+reading the variable names back out of it, not restated. A second copy of that
+list is a copy that can fall out of step silently, and a gate over the wrong
+list is worse than no gate.
+
+Every input is classified as one of three things:
+
+| class | admitted | what it must satisfy |
+|---|---|---|
+| `:kotoba-object` | yes | the seven assertions `verify-kotoba-kernel-object.py` makes -- exact section set, one GLOBAL FUNC `kotoba_aiueos_*` export in `.text`, zero undefined symbols, exactly one `R_X86_64_PC32` relocation with addend `-4` into its own `.data` -- **plus** a receipt naming a `.kotoba` source, both digests, the target, and an Amu revision |
+| `:toolchain-stub` | yes | a receipt saying `:producer :amu-toolchain-stub` with a stub kind and an Amu revision; section set a subset of the allowed one; zero imports |
+| foreign | **no** | everything else |
+
+Foreign means: a receipt naming a `.c` / `.S` / `.s` / `.asm` / `.inc` source,
+no receipt at all, an archive (`!<arch>`), an `ET_EXEC` or `ET_DYN`, a section
+outside the allowed set, any undefined symbol, or a digest that disagrees with
+its receipt. The refusal prints
+`REFUSED foreign-code: <object> reason=<literal>` and the build exits 3.
+
+The ELF is parsed by the gate itself (Node `fs` + `DataView`, ~150 lines of
+ClojureScript), not by `readelf` or `objdump`. The gate must run where the
+build runs and must not depend on a binutils that may be a different vendor's.
+
+### Two exit codes, not one
+
+`0` admitted, `2` could not answer, `3` refused. `verify-kotoba-kernel-object.py`
+exits 1 for both of the latter and `build-uefi.sh` treats every non-zero the
+same, so today a missing object and a C object are indistinguishable there.
+
+`scanned=0` is exit 2, never a pass. So is a link-list entry that is not on
+disk, and a provenance manifest that does not read. This is root
+ADR-2608136000's first question, and the reason the gate prints `SCANNED<TAB>n`
+before its verdict.
+
+### A refusal that is not a claim of foreign code
+
+Twenty of the 67 committed Kotoba objects conform to the object ABI in every
+structural respect and match their digests, but **no recipe in this repository
+records which Amu revision produced them.**
+`reproduce-kotoba-kernel-object.sh` names 45 of them and pins amu `9cf3a0a`;
+`reproduce-ecdsa-sign-object.clj` accounts for two more. The remaining twenty
+-- `x25519`, `net-arp-reply-valid`, `pic-disable`, `msr-read`, `msr-write`,
+`vtd-admit`, `acpi-checksum-ok`, `acpi-table-valid`, the three `cpu-feature*`
+objects, `idt-gate-build`, `mmio-map-admit`, `kernel-context-build`,
+`pci-config-read`, `pci-config-write`, `ipv4-checksum`,
+`ipv4-icmp-reply-valid`, `tcp-checksum-ok`, `tcp-segment-valid` -- have no
+producer on record anywhere.
+
+They are refused (an unrecorded producer is not a pass) but under their own
+message, `REFUSED unattested-provenance: <object> reason=compiler-unrecorded`,
+and counted separately in the receipt as `:unattested`. Calling a structurally
+verified Kotoba object "foreign code" would report the wrong cause and would
+inflate the one number this profile exists to drive to zero.
+
+`os/aiueos/kotoba/provenance.edn` states the gap as `:compiler {:sha nil
+:recipe :unrecorded}` rather than filling it with a plausible revision. It is
+generated by `build-k16-pure-native.cljs --emit-provenance`, which reads the
+pin out of the recipe script instead of restating it.
+
+### The profile refuses to produce a loader
+
+BOOTX64.EFI in this profile would have to come from a Kotoba/Amu artifact.
+None exists. So the profile prints `REFUSED foreign-code: uefi/main.c` and
+exits, rather than linking the C loader and calling the result pure-native.
+
+The refusal is conditional on a measurement, not hard-coded: set
+`AIUEOS_KOTOBA_LOADER_EFI` to a Kotoba/Amu-produced PE32+ image and it stops
+refusing on that ground.
+
+## Result, measured
+
+Gate over **today's K16 production link list**, captured with the new
+`AIUEOS_K16_LINK_LIST_OUT=<file>` (which writes the exact list and changes
+nothing else) from a real build under the K16 environment:
+
+```
+SCANNED	99
+AIUEOS_K16_PURE_NATIVE_REFUSED scanned=99 kotoba=47 stubs=0 foreign=32 unattested=20
+reasons {receipt-missing 32, compiler-unrecorded 20}
+```
+
+Gate over the **restricted pure-native link list** (`AIUEOS_K16_PURE_NATIVE=1`,
+same environment):
+
+```
+AIUEOS_K16_PURE_NATIVE link-list=... entries=67
+SCANNED	67
+AIUEOS_K16_PURE_NATIVE_REFUSED scanned=67 kotoba=47 stubs=0 foreign=0 unattested=20
+REFUSED foreign-code: uefi/main.c
+AIUEOS_K16_PURE_NATIVE_INCOMPLETE loader=refused kernel=not-linked bootable=no
+```
+
+**Not one committed Kotoba object is C-derived or malformed.** The 32 in the
+production link are the C and ASM objects; the 20 are the unattested Kotoba
+ones. Those are the two numbers to move.
+
+## What this does not claim
+
+**The profile does not boot, and cannot.** `aiueos_kernel_entry` is in the
+hand-written `entry.S` the profile excludes, so a link of the Kotoba objects
+alone has no entry point.
+
+The ADMITTED branch was still exercised, by running the profile against a
+manifest in which every object carries a compiler revision
+(`AIUEOS_K16_PURE_NATIVE_PROVENANCE` -- an override the gate still checks
+digest-for-digest, not a way to wave objects through):
+
+```
+SCANNED	67
+AIUEOS_K16_PURE_NATIVE_OK scanned=67 kotoba=67 stubs=0 foreign=0 unattested=0
+ld.lld: warning: cannot find entry symbol aiueos_kernel_entry; not setting start address
+REFUSED foreign-code: uefi/main.c
+AIUEOS_K16_PURE_NATIVE_INCOMPLETE loader=refused kernel=linked bootable=no
+```
+
+398,856 bytes of linked Kotoba, with no way to enter it. That is the honest
+shape of the gap, and it is why the loader refusal is unconditional today.
+
+**It does not claim the objects reproduce.** The receipts record what the
+repository *records* about each object's producer. Whether those sources at
+those revisions still emit those bytes is a different question, measured in
+ADR-0129 and `qualification/object-producer-measurement.edn`, where the answer
+today is mostly no.
+
+**32 is a count of objects in one link, not of C source files**, and it moves
+with the build environment: the default `build-uefi.sh` environment links 65
+Kotoba objects rather than 67, because two ECDSA objects are conditional.
+
+## Evidence
+
+`test/aiueos/k16-pure-native-gate-test` -- 9 tests, 41 assertions, run with
+`kbb -M:test -n aiueos.k16-pure-native-gate-test`. Every negative pins the
+**reason literal**, not just the exit code, because `object-sha256-mismatch`
+and `sections` are both exit 3 and confusing them would hide the difference
+between a swapped object and a C object.
+
+Shown in both directions, one deliberate break at a time, each restored and
+re-run green:
+
+- removing the `c-source` clause from `classify` turned
+  `an-object-compiled-from-c-is-refused` red on
+  `expected: (str/includes? out "reason=c-source")` / `actual: ... reason=sections`;
+- removing the undefined-symbol clause from `check-kotoba-structure` turned
+  `an-object-with-an-undefined-symbol-is-refused` red on
+  `expected: ... "reason=undefined-symbol"` / `actual: ... reason=export`.
+
+Both are refusals *for the wrong reason* -- which is precisely the failure a
+test that asserted only on the exit code would have called a pass.
+
+The C fixture is compiled from `os/aiueos/kernel/framebuffer.c`, a file the
+repository already carries, with `zig cc -target x86_64-freestanding-none -c`
+into a temp directory. Compiling a fixture is allowed; shipping one is what
+the profile forbids. The same object is then gated twice: once with a receipt
+that honestly names the `.c` (refused `c-source`), and once with a receipt
+that **lies and claims a `.kotoba` source** (refused `sections`). The second
+is the threat model -- provenance alone cannot be trusted, so the ELF is read.
+
+`nbb` and `zig` absent are assertion failures, not skips.
+
+## Alternatives considered
+
+**Extend `verify-kotoba-native-kernel.py`.** It is Python, and new scripts in
+this workspace are nbb `.cljs` (root AGENTS.md). It also answers a different
+question -- it validates one whole-image artifact, not a link list.
+
+**Fail the ordinary K16 build on foreign objects.** That would break the only
+image that works today, for a goal four streams have not reached. The profile
+is a second, refusing path; the production path is untouched except for the
+opt-in link-list dump.
+
+**Record a plausible compiler revision for the 20 unattested objects.** It
+would make the gate green over the restricted link and would be a guess
+written into a provenance file. The whole value of that file is that it does
+not guess.
+
+## Related
+
+- ADR-0015 -- stack topology and the honest C boundary (the prose this makes
+  machine-checked).
+- ADR-0129 -- the object producer advance, measured whole.
+- ADR-0130 -- the object producer leaves the JVM.
+- `os/aiueos/contracts/k16-pure-native-profile-v1.edn` -- the acceptance
+  conditions, the receipt schema and the measured status.
+- Root ADR-2608136000 -- the six questions a check must answer before its
+  green means anything.

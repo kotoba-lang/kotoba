@@ -1,0 +1,1584 @@
+#!/usr/bin/env kbb
+;; A model of the guest browser desktop frame (ADR-0224 .. 0233), written
+;; apart from browser-frame2.kotoba and from the C blit, so a gate's known
+;; answers do not come from the thing the gate measures.
+;;
+;;   kbb --backend sci os/aiueos/scripts/browser-frame-model.cljk [font.fnt]
+;;   kbb --backend sci os/aiueos/scripts/browser-frame-model.cljk --ops <scene.edn> <font>
+;;
+;; The second form prints the op count and the op list as the object would
+;; write it at word 480 (kind x y a b rgb, u32 LE) for one scene, or one line
+;; per scene for a vector of them -- how the
+;; success vectors of os/aiueos/contracts/browser-frame2-v1.edn got their
+;; expected memory.
+;;
+;; It lays out a surface by the rules in browser-frame2.kotoba's header (read
+;; as prose, not code), paints the ops as aiueos_desktop_present_ops2 does
+;; (rects fill, glyph bits set in the op's colour, later ops over earlier),
+;; and prints for each named scene the op count and the #111111 census that
+;; aiueos_desktop_colour_census would report: the count, and FNV-1a over each
+;; pixel's position (y * 65536 + x, four little-endian bytes) in raster order.
+;;
+;; The scenes marked :pinned are frames already pinned on KERNEL.ELF serial
+;; (ADR-0224, 0225, 0227, 0228, 0229, 0230; re-pinned with the caret by ADR-0232
+;; and with cssom's body flow by ADR-0234); the model must reproduce them before
+;; its other answers are used. Since ADR-0234 the body rule is also checked
+;; against the hosted engine itself: --parity compares every scene's body
+;; glyphs with os/aiueos/contracts/browser-flow-parity-v1.edn, which
+;; browser-flow-oracle.cljk writes from kotoba-lang/browser + cssom. Exit 0 all pinned scenes reproduced, 1 one did not, 2 could not
+;; run (font unreadable).
+(ns browser-frame-model
+  (:require [clojure.edn :as edn]
+            ["node:fs" :as fs]))
+
+(defn- die [code msg] (.error js/console msg) (.exit js/process code))
+
+(def ^:private args (vec (remove #(= "--" %) *command-line-args*)))
+(def ^:private mode (#{"--ops" "--scenes" "--parity" "--vectors"} (first args)))
+(def ^:private ops-mode? (= "--ops" mode))
+(def ^:private font-path
+  (or (if (#{"--ops"} mode) (get args 2) (if mode nil (first args))) "os/aiueos/fonts/aiueos-16.fnt"))
+
+(def ^:private font-state (atom nil))
+
+(defn use-font!
+  "Make `buf` (an aiueos-font/v1 Buffer) the font every layout below reads --
+  the committed font for the kernel's scenes, a contract's fixture for its
+  vectors."
+  [buf]
+  (let [u32 (fn [i] (.readUInt32LE buf (* 4 i)))
+        n (u32 2)]
+    (reset! font-state
+            {:buf buf :glyphs n
+             ;; code point -> [glyph index, width]
+             :index (into {} (for [i (range n)
+                                   :let [e (u32 (+ 4 i))]]
+                               [(bit-and e 16777215) [i (if (> e 16777215) 16 8)]]))})))
+
+(use-font! (try (.readFileSync fs font-path)
+                (catch :default e (die 2 (str "COULD-NOT-RUN font " font-path ": " e)))))
+
+(defn glyph [cp] (let [{:keys [index]} @font-state] (or (index cp) (index 65533))))
+
+(defn- bits [gi]
+  ;; positions [dx dy] of the set bits of glyph gi
+  (let [{font :buf glyphs :glyphs} @font-state
+        base (+ 16 (* 4 glyphs) (* 32 gi))]
+    (for [row (range 16)
+          :let [line (bit-or (bit-shift-left (aget font (+ base (* 2 row))) 8)
+                             (aget font (+ base (* 2 row) 1)))]
+          col (range 16)
+          :when (pos? (bit-and line (unsigned-bit-shift-right 32768 col)))]
+      [col row])))
+
+;; --- layout -------------------------------------------------------------------
+
+(def ^:private ink 0x333333)
+
+(defn- lay-line
+  "Lay code points from cursor [x y]; returns {:ops :x :y}. Wrap at `right`
+  (or stop, when wrap? is false), skip glyphs whose foot passes `bottom`.
+  With underline? every drawn glyph gets a 1 px rule under it."
+  [{:keys [x y left right bottom ceiling wrap? underline?]} cps]
+  (loop [cps cps x x y y ops []]
+    (if-let [cp (first cps)]
+      (if (= cp 10)
+        (recur (rest cps) left (+ y 20) ops)
+        (let [[gi gw] (glyph cp)
+              cross? (> (+ x gw) right)]
+          (if (and cross? (not wrap?))
+            {:ops ops :x x :y y}
+            (let [[x y] (if cross? [left (+ y 20)] [x y])
+                  drawn? (and (<= (+ y 16) bottom) (or (nil? ceiling) (>= y ceiling)))
+                  ops (if drawn?
+                        (cond-> (conj ops [:glyph x y gi gw])
+                          underline? (conj [:rect x (+ y 17) gw 1 ink]))
+                        ops)]
+              (recur (rest cps) (+ x gw) y ops)))))
+      {:ops ops :x x :y y})))
+
+(def ^:private white-space
+  ;; What cssom's text path collapses (a JS `\\s` run -> one U+0020), less 10,
+  ;; which the kernel's body uses as <br>. Measured against browser.surface +
+  ;; cssom.layout on 2026-09-25: U+3000, U+00A0, CR, FF, VT and TAB all
+  ;; collapse.
+  (into #{9 11 12 13 32 160 5760 8232 8233 8239 8287 12288 65279} (range 8192 8203)))
+
+(defn- width-of [cps] (reduce + (map (comp second glyph) cps)))
+
+;; ADR-0240: the layout below carries each code point with its index in the
+;; body, [cp i], so the selection can be found on the line it went to. A
+;; collapsed run's one U+0020 carries the index it stands for: the first of
+;; the run on a line kept as collapsed, the last before the word it precedes
+;; on a line packed by words.
+(defn- ws? [[c]] (white-space c))
+
+(defn- words [cps] (remove #(ws? (first %)) (partition-by #(boolean (ws? %)) cps)))
+
+(defn- pack
+  "Lines (vectors of [cp i]) of one run packed by words into `wmax`: the
+  first word of a line goes whatever its width, a next word joins with one
+  space when the line still fits, else it opens the next line."
+  [wmax cps]
+  (reduce (fn [lines word]
+            (let [line (peek lines)
+                  sp [32 (dec (second (first word)))]]
+              (cond
+                (nil? line) [(vec word)]
+                (empty? line) (conj (pop lines) (vec word))
+                (<= (+ (width-of (map first line)) (width-of [32]) (width-of (map first word))) wmax)
+                (conj (pop lines) (into (conj line sp) word))
+                :else (conj lines (vec word)))))
+          [[]] (words cps)))
+
+(defn- segments
+  "The body split at each 10, empty segments kept: `x 10 10 y` is x, (), y."
+  [body]
+  (loop [cps body cur [] out []]
+    (if-let [[c :as p] (first cps)]
+      (if (= c 10) (recur (rest cps) [] (conj out cur)) (recur (rest cps) (conj cur p) out))
+      (conj out cur))))
+
+(defn- nl-indexes
+  "For each segment of the body, the index of the 10 that ends it (nil for the last segment)."
+  [body]
+  (let [idx (keep (fn [[c i]] (when (= c 10) i)) body)]
+    (vec (concat idx [nil]))))
+
+(defn body-lines-indexed
+  "ADR-0234: the body's lines as browser.surface + cssom lay out the window's
+  document -- the body text, each 10 a <br> -- at line width `wmax`; each
+  element [cp i] (ADR-0240)."
+  [wmax body]
+  (let [body (vec (map-indexed (fn [i c] [c i]) (take-while pos? body)))]
+    (if (some #(= 10 (first %)) body)
+      (vec (mapcat (fn [seg end]
+                     ;; ADR-0263: the 10 that ends a segment is a zero-width [:nl index] at the end of its
+                     ;; last line, so a caret standing on it is found at the end of that line
+                     (let [ls (pack wmax seg)]
+                       (if end (conj (pop ls) (conj (peek ls) [:nl end])) ls)))
+                   (segments body) (nl-indexes body)))
+      (let [collapsed (vec (mapcat #(if (ws? (first %)) [[32 (second (first %))]] %)
+                                   (partition-by #(boolean (ws? %)) body)))]
+        (cond
+          (empty? (words body)) []
+          (<= (width-of (map first collapsed)) (max 0 wmax)) [collapsed]
+          :else (pack wmax body))))))
+
+(defn body-lines
+  "The lines as code points alone."
+  [wmax body]
+  (mapv #(mapv first %) (body-lines-indexed wmax body)))
+
+(def ^:private highlight
+  ;; ADR-0240: cssom sel-ops' rgba(70,130,220,0.4) over the focused body's
+  ;; #ffffff, rounded per channel: 0.4 * c + 0.6 * 255
+  (let [mix (fn [c] (js/Math.round (+ (* 0.4 c) (* 0.6 255))))]
+    (+ (* 65536 (mix 70)) (* 256 (mix 130)) (mix 220))))
+
+(defn- lay-body
+  "The body's lines ([cp i] each) from (left, top), 20 apart: {:ops :x :y :cap}
+  with the pen after the last glyph. A glyph whose foot passes `bottom` or
+  whose right edge passes `vw` is not drawn, nor (ADR-0238) one whose top is
+  above `ceiling`; the pen moves anyway. A drawn glyph whose index is in
+  `sel` = [lo hi) has a highlight rect of its size right before it (ADR-0240,
+  ADR-0263). :cap is the pen where the first index at or past `caret` was
+  reached, drawn or not -- also at the zero-width [:nl i] -- or nil (ADR-0263)."
+  [{:keys [left top bottom ceiling vw sel caret]} lines]
+  (reduce (fn [{:keys [ops cap]} [i line]]
+            (let [y (+ top (* 20 i))]
+              (loop [cps line x left ops ops cap cap]
+                (if-let [[cp j] (first cps)]
+                  (if (= cp :nl)
+                    (recur (rest cps) x ops (or cap (when (and caret (>= j caret)) [x y])))
+                    (let [[gi gw] (glyph cp)
+                          cap (or cap (when (and caret (>= j caret)) [x y]))]
+                      (recur (rest cps) (+ x gw)
+                             (if (and (<= (+ y 16) bottom) (>= y ceiling) (<= (+ x gw) vw))
+                               (cond-> ops
+                                 (and sel (>= j (first sel)) (< j (second sel))) (conj [:rect x y gw 16 highlight])
+                                 true (conj [:glyph x y gi gw]))
+                               ops)
+                             cap)))
+                  {:ops ops :x x :y y :cap cap}))))
+          {:ops [] :x left :y top :cap nil}
+          (map-indexed vector lines)))
+
+(def ^:private hot-colour 0xd9d9d9)
+
+(defn- ctl-colour
+  "ADR-0253: a control's face -- pressed (#bfbfbf, #e6b800 in the high-contrast palette) when it is
+  hot and the pointer's button is down, hot (#d9d9d9, #ffd400), or plain (#e6e6e6, #e0e0e0)."
+  [hc down hot?]
+  (cond (and hot? down) (if hc 0xe6b800 0xbfbfbf)
+        hot? (if hc 0xffd400 0xd9d9d9)
+        :else (if hc 0xe0e0e0 0xe6e6e6)))
+
+(defn- hot?
+  "ADR-0246: the pointer [px py] is inside the control rect (x y w h)."
+  [pointer x y w h]
+  (when-let [[px py] pointer]
+    (and (<= x px) (< px (+ x w)) (<= y py) (< py (+ y h)))))
+
+(defn- ring-ops
+  "ADR-0248: the keyboard focus ring, 2 px outside (x y w h): top, bottom, left,
+  right, in #1a56db or, in the high-contrast palette, black."
+  [hc x y w h]
+  (let [c (if hc 0x000000 0x1a56db)]
+    [[:rect (- x 2) (- y 2) (+ w 4) 2 c] [:rect (- x 2) (+ y h) (+ w 4) 2 c]
+     [:rect (- x 2) y 2 h c] [:rect (+ x w) y 2 h c]]))
+
+(defn- launcher
+  "ADR-0233: with an app register (:apps, bit k-1 = app k), the launcher row
+  under every window -- #edf0f5 across the top 28 px -- and one #e4e8ef
+  96 x 24 button per registered app at x 6 + 102(k-1), y 2, its title
+  (:titles k) from (x + 6, 6), one line, clipped at x + 90. ADR-0264: then the
+  clock -- HH:MM from (vw - 48, 6) in the ink -- when `status`, the minute of the day, is given."
+  [{:keys [vw apps titles pointer hc ring down status net]}]
+  (when (pos? (or apps 0))
+    (let [buttons (mapcat (fn [k]
+                            (let [x (+ 6 (* 102 (dec k)))]
+                              (when (pos? (bit-and apps (bit-shift-left 1 (dec k))))
+                                (into (into [[:rect x 2 96 24 (ctl-colour hc down (hot? pointer x 2 96 24))]]
+                                            (:ops (lay-line {:x (+ x 6) :y 6 :left (+ x 6) :right (+ x 90)
+                                                             :bottom 28 :wrap? false}
+                                                            (take 32 (get titles k)))))
+                                      (when (= ring k) (ring-ops hc x 2 96 24))))))
+                          [1 2 3 4])
+          clock (when status
+                  (let [h (quot status 60) m (mod status 60)]
+                    (:ops (lay-line {:x (- vw 48) :y 6 :left (- vw 48) :right vw :bottom 28 :wrap? false}
+                                    [(+ 48 (quot h 10)) (+ 48 (mod h 10)) 58 (+ 48 (quot m 10)) (+ 48 (mod m 10))]))))
+          netw (when net
+                 (:ops (lay-line {:x (- vw 160) :y 6 :left (- vw 160) :right (- vw 52) :bottom 28 :wrap? false}
+                                 (map #(.charCodeAt % 0) (case net 3 "ONLINE" 2 "LINK" "OFFLINE")))))]
+      (-> [[:rect 0 0 vw 28 (if hc 0xffffff 0xf1f1f2)]]
+          (into buttons)
+          (into clock)
+          (into netw)))))
+
+(defn- resize-handle?
+  "ADR-0252: the pointer [x y] is on the resize handle (the last 16 px of both axes,
+  inclusive) of the topmost window containing it, with 6 px of room on every side."
+  [{:keys [vw vh stack]} [x y]]
+  (and (>= x 6) (>= y 6) (< (+ x 6) vw) (< (+ y 6) vh)
+       (when-let [{wx :x wy :y ww :w wh :h}
+                  (last (filter (fn [{wx :x wy :y ww :w wh :h}]
+                                  (and (<= wx x (+ wx ww)) (<= wy y (+ wy wh))))
+                                stack))]
+         (and (>= x (- (+ wx ww) 16)) (>= y (- (+ wy wh) 16))))))
+
+(defn- pointer-sprite
+  "ADR-0236: the pointer's arrow, tip at [x y], 12 rows: row r an outline
+  (r + 1 wide, ink) and in rows 2..10 a white fill (r - 1 wide from x + 1) over
+  it. Rows at or past vh are left out; every rect is cut at vw, and a fill with no
+  width left is left out. ADR-0252: over a resize handle it is the resize cursor."
+  [{:keys [vw vh pointer] :as scene}]
+  (when-let [[x y] pointer]
+    (if (resize-handle? scene [x y])
+      (into (vec (for [i (range 10)] [:rect (+ (- x 5) i) (+ (- y 5) i) 2 2 ink]))
+            [[:rect (- x 6) (- y 6) 5 1 ink] [:rect (- x 6) (- y 6) 1 5 ink]
+             [:rect (+ x 1) (+ y 5) 5 1 ink] [:rect (+ x 5) (+ y 1) 1 5 ink]])
+      (vec (for [r (range 12)
+                 :when (< (+ y r) vh)
+                 op [[:rect x (+ y r) (min (inc r) (- vw x)) 1 ink]
+                     (when (and (<= 2 r 10) (pos? (min (dec r) (- vw x 1))))
+                       [:rect (inc x) (+ y r) (min (dec r) (- vw x 1)) 1 0xffffff])]
+                 :when op]
+             op)))))
+
+(defn- dock
+  "JUN-143 dock (browser-frame2.kotoba dock, dock-icon): with an app register,
+  a 184 x 48 #e6e6e6 bar centred at the bottom (4 px above the edge), and for
+  every registered app k a 36 x 36 tile at x + 8 + 44(k-1), y + 6 in the app's
+  colour with the app's initial (M I Y A) as a white glyph, centred in the tile
+  and 10 px down."
+  [{:keys [vw vh apps minimized hc]}]
+  (when (pos? (or apps 0))
+    (let [left (quot (- vw 184) 2) top (- vh 52)]
+      (into [[:rect left top 184 48 0xe6e6e6]]
+            (mapcat (fn [k]
+                      (when (pos? (bit-and apps (bit-shift-left 1 (dec k))))
+                        (let [x (+ left 8 (* 44 (dec k)))
+                              [gi gw] (glyph ({1 77 2 73 3 89 4 65} k))]
+                          (concat
+                           [[:rect x (+ top 6) 36 36 ({1 3900159 2 3978018 3 10123472 4 14651230} k)]
+                            [:glyph (+ x (quot (- 36 gw) 2)) (+ top 16) gi gw 0xffffff]]
+                           ;; ADR-0254: a minimized app's icon carries a bar 12 x 3 under it
+                           (when (contains? (set minimized) k)
+                             [[:rect (+ x 12) (+ top 43) 12 3 (if hc 0x404040 0x595959)]])))))
+                    [1 2 3 4])))))
+
+(defn- tray
+  "ADR-0255: one 120 x 24 button per minimized window, by id, at (6 + 126 i, vh - 30), its title in
+  the ink from (x + 6, y + 4), clipped at x + 114."
+  [{:keys [vh minimized pointer hc down titles ring]}]
+  (vec (mapcat (fn [i k]
+                 (let [x (+ 6 (* 126 i)) y (- vh 30)]
+                   (-> [[:rect x y 120 24 (ctl-colour hc down (hot? pointer x y 120 24))]]
+                       (into (:ops (lay-line {:x (+ x 6) :y (+ y 4) :left (+ x 6) :right (+ x 114)
+                                              :bottom (+ y 26) :wrap? false}
+                                             (take 32 (get titles k)))))
+                       ;; ADR-0262: ring target 8 + i
+                       (into (when (= ring (+ 8 i)) (ring-ops hc x y 120 24))))))
+               (range) (sort minimized))))
+
+(defn- lock-frame
+  "ADR-0258: the lock screen: a dark background, ロック中 in white from (vw/2 - 32, vh/2 - 48), four
+  dots (the PIN digits typed so far white, the rest grey) at (vw/2 - 44 + 24 i, vh/2), a red bar
+  under them after a refusal, and the arrow."
+  [{:keys [vw vh hc pin denied] :as scene}]
+  (let [x0 (- (quot vw 2) 32) y0 (- (quot vh 2) 48)
+        glyphs (loop [cps [12525 12483 12463 20013] x x0 out []]
+                 (if (empty? cps) out
+                   (let [[gi gw] (glyph (first cps))]
+                     (recur (rest cps) (+ x gw) (conj out [:glyph x y0 gi gw 0xffffff])))))]
+    (-> [[:rect 0 0 vw vh (if hc 0x000000 0x1f2430)]]
+        (into glyphs)
+        (into (for [i (range 4)]
+                [:rect (+ (- (quot vw 2) 44) (* 24 i)) (quot vh 2) 12 12
+                 (if (< i (or pin 0)) 0xffffff (if hc 0x808080 0x555a66))]))
+        (into (when denied [[:rect (- (quot vw 2) 44) (+ (quot vh 2) 24) 84 4 0xd93025]]))
+        (into (pointer-sprite (assoc scene :stack []))))))
+
+(defn- hc-ink
+  "ADR-0247: under the high-contrast palette the text colour is black: every
+  glyph that names no colour, and every rect the model draws in the ink, is
+  #000000."
+  [hc ops]
+  (if-not hc
+    ops
+    (mapv (fn [[k x y a b c :as o]]
+            (cond (and (= k :glyph) (nil? c)) [:glyph x y a b 0x000000]
+                  (and (= k :rect) (= c ink)) [:rect x y a b 0x000000]
+                  :else o))
+          ops)))
+
+;; ADR-0268: notifications. :notes is a vector of up to four [state text], state 1 a toast and 2 dismissed (kept in
+;; the list); :panel opens the list. A toast is a 208 x 26 #fff3c4 box at (vw - 216, 36 + 30 slot) with its text from
+;; (vw - 208, 41 + 30 slot); the open list is a white box (vw - 216, 36) 208 x (8 + 22 m) with a '*' at vw - 208 for an
+;; entry still shown and the text from vw - 198 at y 42 + 22 row.
+(defn- note-text-ops [x y text]
+  (:ops (lay-line {:x x :y y :left x :right 100000 :bottom 100000 :wrap? false}
+                  (map #(.charCodeAt % 0) text))))
+
+(defn- notify-ops [{:keys [vw notes panel]}]
+  (let [live (vec (remove #(zero? (first %)) notes))]
+    (cond
+      panel (into [[:rect (- vw 216) 36 208 (+ 8 (* 22 (count live))) 0xffffff]]
+                  (mapcat (fn [row [st text]]
+                            (let [y (+ 42 (* 22 row))]
+                              (concat (when (= st 1) (note-text-ops (- vw 208) y "*"))
+                                      (note-text-ops (- vw 198) y text))))
+                          (range) live))
+      :else (mapcat (fn [slot [_ text]]
+                      (into [[:rect (- vw 216) (+ 36 (* 30 slot)) 208 26 0xfff3c4]]
+                            (note-text-ops (- vw 208) (+ 41 (* 30 slot)) text)))
+                    (range) (filter #(= 1 (first %)) notes)))))
+
+(declare frame*)
+
+(defn frame
+  "Ops for a scene: {:vw :vh :focus :stack [{:id :x :y :w :h :title :body}]
+  :composition [cp ...] :apps register :titles {k [cp ...]} :pointer [x y]
+  :selection [id k]} (stack bottom first)."
+  [{:keys [vw vh focus composition apps selection hc minimized locked] :as scene0}]
+  (if locked (lock-frame scene0)
+  (frame* scene0)))
+
+(defn frame*
+  [{:keys [vw vh focus composition apps selection hc minimized] :as scene0}]
+  ;; ADR-0254: a minimized window (its id in :minimized) is neither drawn nor hit; the minimize
+  ;; control shows on a window at least 200 wide while two or more windows are visible.
+  (let [stack (vec (remove #(contains? (set minimized) (:id %)) (:stack scene0)))
+        scene (assoc scene0 :stack stack)
+        nvis (count stack)]
+  (hc-ink hc (into (into (into [[:rect 0 0 vw vh (if hc 0xffffff 0xf1f1f2)]] (launcher scene))
+        (mapcat
+         (fn [{:keys [id x y w h title body scroll]}]
+           (let [f? (= id focus)
+                 ;; ADR-0238: the body, its composition and its caret sit
+                 ;; `scroll` px higher and are cut at the top inset y + 36.
+                 sc (or scroll 0)
+                 ;; ADR-0233: a close control in windows at least 40 wide
+                 ;; when there is an app register; the title then stops 4 px
+                 ;; before it.
+                 chrome? (and (pos? (or apps 0)) (>= w 40))
+                 t (lay-line {:x (+ x 8) :y (+ y 6) :left (+ x 8)
+                              :right (- (+ x w) (+ (cond (and chrome? (>= w 160)) 48 chrome? 28 :else 8)
+                                                    (if (and chrome? (>= w 200) (>= nvis 2)) 20 0)))
+                              :bottom (+ y 28) :wrap? false} (take 32 title))
+                 [xi xw] (glyph 215)
+                 ;; ADR-0257: the close control of the only visible window is disabled
+                 off? (< nvis 2)
+                 close (when chrome?
+                         [[:rect (- (+ x w) 24) (+ y 6) 16 16
+                           (if off?
+                             (ctl-colour hc false false)
+                             (ctl-colour hc (:down scene) (hot? (:pointer scene) (- (+ x w) 24) (+ y 6) 16 16)))]
+                          (into [:glyph (+ (- (+ x w) 24) (quot (- 16 xw) 2)) (+ y 6) xi xw]
+                                (when off? [(if hc 0x707070 0x9e9e9e)]))])
+                 ;; ADR-0234: the body flows as cssom lays out the window's
+                 ;; document: text 14 in from the body box (x, y + 28), lines
+                 ;; w - 28 wide.
+                 ;; ADR-0240: the focused window's selection, when it is
+                 ;; this window's: the last min(k, n) code points
+                 n (count (take-while pos? (take 64 body)))
+                 k (if (and f? (= (first selection) id)) (min (second selection) n) 0)
+                 ;; ADR-0263: a scene may name the selection as a range [id lo hi) and the caret as
+                 ;; [id index]; the legacy [id k] is the last k code points, the caret at the end
+                 rng (cond (and f? (= (first (:range scene)) id)) [(second (:range scene)) (nth (:range scene) 2)]
+                           (pos? k) [(- n k) n])
+                 sel (when (and rng (< (first rng) (second rng))) rng)
+                 caret-ix (when (and f? (= (first (:caret scene)) id) (< (second (:caret scene)) n))
+                            (second (:caret scene)))
+                 b (lay-body {:left (+ x 14) :top (- (+ y 42) sc) :bottom (- (+ y h) 8)
+                              :ceiling (+ y 36) :vw vw :sel sel :caret caret-ix}
+                             (body-lines-indexed (- w 28) (take 64 body)))
+                 c (when (and f? (seq composition))
+                     (lay-line {:x (:x b) :y (:y b) :left (+ x 14) :right (- (+ x w) 14)
+                                :bottom (- (+ y h) 8) :ceiling (+ y 36) :wrap? true :underline? true}
+                               composition))
+                 ;; ADR-0232: the focused window's caret, cssom sel-ops'
+                 ;; collapsed selection -- 1 x 16 in the text colour, where
+                 ;; the next glyph would go (after the composition, if any);
+                 ;; not drawn when its foot passes the bottom inset.
+                 [cx cy] (if c [(:x c) (:y c)] (or (:cap b) [(:x b) (:y b)]))
+                 ;; ADR-0240: no caret while something is selected (sel-ops
+                 ;; draws one only for a collapsed selection)
+                 caret (when (and f? (nil? sel) (<= (+ cy 16) (- (+ y h) 8)) (>= cy (+ y 36)) (<= (+ cx 1) vw))
+                         [[:rect cx cy 1 16 ink]])]
+             ;; JUN-143 (browser-frame2.kotoba window-shadow and emit-window):
+             ;; the shadow is two clipped strips outside the right and bottom
+             ;; edge (3 px, cut at the viewport), the body and the titlebar
+             ;; are each the additive union of three rects that round the
+             ;; corners by 2 px. Colours: shadow #cccccc, body #ffffff,
+             ;; titlebar #cccccc focused / #e6e6e6 otherwise.
+             (concat (let [rw (min 3 (- vw (+ x w)))
+                           bh (min 3 (- vh (+ y h)))]
+                       (concat (when (pos? rw) [[:rect (+ x w) (+ y 3) rw (- h 3) (if hc 0x808080 0xcccccc)]])
+                               (when (pos? bh) [[:rect (+ x 3) (+ y h) (- w 3) bh (if hc 0x808080 0xcccccc)]])))
+                     [[:rect (+ x 2) y (- w 4) h 0xffffff]
+                      [:rect (+ x 1) (+ y 1) (- w 2) (- h 2) 0xffffff]
+                      [:rect x (+ y 2) w (- h 4) 0xffffff]]
+                     (let [tc (if hc (if f? 0xffd400 0xd0d0d0) (if f? 0xcccccc 0xe6e6e6))]
+                       [[:rect (+ x 2) y (- w 4) 28 tc]
+                        [:rect (+ x 1) (+ y 1) (- w 2) 28 tc]
+                        [:rect x (+ y 2) w 26 tc]])
+                     (:ops t) close
+                     (when (and f? chrome? (= (:ring scene) 5)) (ring-ops hc (- (+ x w) 24) (+ y 6) 16 16))
+                     ;; ADR-0251: the maximize control, left of the close control, on a
+                     ;; window with a launcher at least 160 wide; its U+25A1 is #595959
+                     ;; (#404040 in the high-contrast palette), not the ink
+                     (when (and chrome? (>= w 160))
+                       (let [cx (- (+ x w) 44)
+                             [gi gw] (glyph 9633)]
+                         [[:rect cx (+ y 6) 16 16
+                           (ctl-colour hc (:down scene) (hot? (:pointer scene) cx (+ y 6) 16 16))]
+                          [:glyph (+ cx (quot (- 16 gw) 2)) (+ y 6) gi gw (if hc 0x404040 0x595959)]]))
+                     ;; ADR-0262: the focus ring on the focused window's maximize control (ring target 6)
+                     (when (and f? chrome? (>= w 160) (= (:ring scene) 6)) (ring-ops hc (- (+ x w) 44) (+ y 6) 16 16))
+                     ;; ADR-0254: the minimize control, left of the maximize control: a 16 x 16
+                     ;; face and a bar 8 x 2 at (x + w - 60, y + 16) in the icon colour
+                     (when (and chrome? (>= w 200) (>= nvis 2))
+                       (let [cx (- (+ x w) 64)]
+                         [[:rect cx (+ y 6) 16 16
+                           (ctl-colour hc (:down scene) (hot? (:pointer scene) cx (+ y 6) 16 16))]
+                          [:rect (+ cx 4) (+ y 16) 8 2 (if hc 0x404040 0x595959)]]))
+                     ;; ADR-0262: ... and on the minimize control (ring target 7)
+                     (when (and f? chrome? (>= w 200) (>= nvis 2) (= (:ring scene) 7))
+                       (ring-ops hc (- (+ x w) 64) (+ y 6) 16 16))
+                     (:ops b) (:ops c) caret))))
+        stack)
+        (concat (dock scene) (tray scene) (notify-ops scene0) (pointer-sprite scene))))))
+
+;; --- paint and census -----------------------------------------------------------
+
+(defn census
+  "The census of `colour` (default #111111) after painting `ops`: how many
+  pixels end that colour, and FNV-1a over their positions. A glyph's bits are
+  #111111 (ADR-0240 generalised this from the ink alone)."
+  ([ops] (census ink ops))
+  ([colour ops]
+  (let [ink-px (reduce
+                (fn [px [k x y a b c]]
+                  (case k
+                    :rect (if (= c colour)
+                            (into px (for [yy (range y (+ y b)) xx (range x (+ x a))] (+ (* yy 65536) xx)))
+                            (into #{} (remove (fn [p] (let [py (quot p 65536) pxx (mod p 65536)]
+                                                        (and (<= x pxx) (< pxx (+ x a)) (<= y py) (< py (+ y b)))))
+                                              px)))
+                    :glyph (let [g (for [[dx dy] (bits a) :when (< dx b)] (+ (* (+ y dy) 65536) (+ x dx)))]
+                             ;; a glyph is ink unless its op names another colour (the dock's white initials)
+                             (if (= colour (or c ink)) (into px g) (reduce disj px g)))))
+                #{} ops)
+        h (reduce (fn [h p]
+                    (reduce (fn [h b]
+                              (let [h (bit-xor h (bit-and (unsigned-bit-shift-right p (* 8 b)) 255))]
+                                (unsigned-bit-shift-right (js/Math.imul h 16777619) 0)))
+                            h (range 4)))
+                  2166136261 (sort ink-px))]
+    {:ops (count ops) :text-px (count ink-px)
+     :hash (.padStart (.toString (unsigned-bit-shift-right h 0) 16) 8 "0")})))
+
+;; --- the kernel's scenes (os/aiueos/kernel/main.c, ADR-0224 .. 0227) ---------------
+
+(def ^:private w1 {:id 1 :x 32 :y 32 :w 720 :h 540
+                   :title [97 105 117 101 111 115]
+                   :body [107 111 116 111 98 97 45 108 97 110 103 47 98 114 111 119 115 101 114 10
+                          12502 12521 12454 12470 12364 30011 38754 12391 12377]})
+(def ^:private w2 {:id 2 :x 96 :y 72 :w 640 :h 480
+                   :title [12502 12521 12454 12470]
+                   :body [26085 26412 35486 12398 25991 23383 12418 34920 31034 12391 12365 12414 12377 12290]})
+(def ^:private nihongo-ka [12395 12411 12435 12372 21152])
+
+(def scenes
+  [{:name "text" :pinned {:ops 70 :text-px 1079 :hash "89910f34"}
+    :scene {:vw 1280 :vh 800 :focus 2 :stack [w1 w2]}}
+   {:name "text-raised" :pinned {:ops 70 :text-px 880 :hash "b9f96599"}
+    :scene {:vw 1280 :vh 800 :focus 1 :stack [w2 w1]}}
+   {:name "typed" :pinned {:ops 75 :text-px 1068 :hash "a92b8f58"}
+    :scene {:vw 1280 :vh 800 :focus 1 :stack [w2 (update w1 :body into nihongo-ka)]}}
+   ;; ADR-0227: after typing `k a n`, the composition か + romaji n is drawn,
+   ;; underlined, after the body; Enter commits かん and the rule is gone.
+   {:name "preedit" :pinned {:ops 79 :text-px 1146 :hash "566a1c8f"}
+    :scene {:vw 1280 :vh 800 :focus 1 :stack [w2 (update w1 :body into nihongo-ka)]
+            :composition [12363 110]}}
+   {:name "preedit-committed" :pinned {:ops 77 :text-px 1128 :hash "193030b3"}
+    :scene {:vw 1280 :vh 800 :focus 1 :stack [w2 (update w1 :body into (concat nihongo-ka [12363 12435]))]}}
+   ;; ADR-0228: Hankaku/Zenkaku turns the IME off, `k a` goes in as latin,
+   ;; Hankaku/Zenkaku turns it back on, `k a` Enter commits か.
+   {:name "ime-toggle" :pinned {:ops 80 :text-px 1205 :hash "322e206e"}
+    :scene {:vw 1280 :vh 800 :focus 1
+            :stack [w2 (update w1 :body into (concat nihongo-ka [12363 12435] [107 97 12363]))]}}
+   ;; ADR-0229: a titlebar press at (60, 50), moves to (140, 90) (220, 120)
+   ;; (300, 150), release: window 1 is dragged by (240, 100) to (272, 132).
+   {:name "drag" :pinned {:ops 80 :text-px 1947 :hash "523440e0"}
+    :scene {:vw 1280 :vh 800 :focus 1
+            :stack [w2 (-> w1
+                           (update :body into (concat nihongo-ka [12363 12435] [107 97 12363]))
+                           (assoc :x 272 :y 132))]}}
+   ;; ADR-0230: a press in window 1's resize handle at (984, 664), moves to
+   ;; (784, 564) (300, 200 -- clamped at 120 x 80) (504, 324), release:
+   ;; window 1 is 240 x 200 at (272, 132), and its body wraps at the new width.
+   {:name "resize" :pinned {:ops 80 :text-px 1947 :hash "523440e0"}
+    :scene {:vw 1280 :vh 800 :focus 1
+            :stack [w2 (-> w1
+                           (update :body into (concat nihongo-ka [12363 12435] [107 97 12363]))
+                           (assoc :x 272 :y 132 :w 240 :h 200))]}}])
+
+;; ADR-0231: the event loop. After the resize, one running loop takes k a Enter
+;; (window 1), a press on window 2's titlebar at (150, 85), a move to
+;; (250, 185), a release, then n i Enter (window 2), and presents a frame after
+;; each of the nine. These are the nine frames, in order.
+(def ^:private w1r (-> w1
+                       (update :body into (concat nihongo-ka [12363 12435] [107 97 12363]))
+                       (assoc :x 272 :y 132 :w 240 :h 200)))
+(def ^:private w1k (update w1r :body conj 12363))
+(def ^:private w2m (assoc w2 :x 196 :y 172))
+
+(def loop-frames
+  [["k" {:vw 1280 :vh 800 :focus 1 :stack [w2 w1r] :composition [107]}]
+   ["a" {:vw 1280 :vh 800 :focus 1 :stack [w2 w1r] :composition [12363]}]
+   ["enter" {:vw 1280 :vh 800 :focus 1 :stack [w2 w1k]}]
+   ["down" {:vw 1280 :vh 800 :focus 2 :stack [w1k w2]}]
+   ["move" {:vw 1280 :vh 800 :focus 2 :stack [w1k w2m]}]
+   ["up" {:vw 1280 :vh 800 :focus 2 :stack [w1k w2m]}]
+   ["n" {:vw 1280 :vh 800 :focus 2 :stack [w1k w2m] :composition [110]}]
+   ["i" {:vw 1280 :vh 800 :focus 2 :stack [w1k w2m] :composition [12395]}]
+   ["enter" {:vw 1280 :vh 800 :focus 2 :stack [w1k (update w2m :body conj 12395)]}]])
+
+;; ADR-0232: the caret. After the loop, window 2 is focused with に committed.
+;; k a composes か (the caret after it), Backspace drops the preedit (the
+;; caret back after the body), and two more Backspaces delete に and 。 -- the
+;; code points before the caret (browser.text-edit delete-backward).
+(def ^:private w2n (update w2m :body conj 12395))
+
+(def caret-frames
+  [["k" {:vw 1280 :vh 800 :focus 2 :stack [w1k w2n] :composition [107]}]
+   ["a" {:vw 1280 :vh 800 :focus 2 :stack [w1k w2n] :composition [12363]}]
+   ["backspace" {:vw 1280 :vh 800 :focus 2 :stack [w1k w2n]}]
+   ["backspace" {:vw 1280 :vh 800 :focus 2 :stack [w1k w2m]}]
+   ["backspace" {:vw 1280 :vh 800 :focus 2 :stack [w1k (update w2m :body pop)]}]])
+
+;; ADR-0233: launcher and close. After the caret, the host registers apps 1 2
+;; 3 (window 3's title メモ and body ランチャーから開きました are its slot's)
+;; and sends eight tablet events: a press on launcher button 3 at (258, 14),
+;; release, a press on window 3's close control at (584, 94), release, the
+;; launcher again, release, a press on window 2's close control at (820, 186),
+;; release. A frame after each.
+(def ^:private w2c (update w2m :body pop))
+(def ^:private w3 {:id 3 :x 80 :y 80 :w 520 :h 360
+                   :title [12513 12514]
+                   :body [12521 12531 12481 12515 12540 12363 12425 38283 12365 12414 12375 12383]})
+(def ^:private shell {:vw 1280 :vh 800 :apps 7
+                      :titles {1 (:title w1) 2 (:title w2) 3 (:title w3)}})
+
+(def launch-frames
+  [["launch" (assoc shell :focus 3 :stack [w1k w2c w3])]
+   ["up" (assoc shell :focus 3 :stack [w1k w2c w3])]
+   ["close-3" (assoc shell :focus 2 :stack [w1k w2c])]
+   ["up" (assoc shell :focus 2 :stack [w1k w2c])]
+   ["launch" (assoc shell :focus 3 :stack [w1k w2c w3])]
+   ["up" (assoc shell :focus 3 :stack [w1k w2c w3])]
+   ["close-2" (assoc shell :focus 3 :stack [w1k w3])]
+   ["up" (assoc shell :focus 3 :stack [w1k w3])]])
+
+;; ADR-0235: the dictionary. After the launcher (windows [1 3], focus 3) the
+;; host types y a m a Space: やま converts through the Unihan dictionary to its
+;; first candidate 山, drawn as the composition after window 3's body. Then
+;; Space (岾) Escape (やま) Space (山) Enter, and s h o u Space Space (償,
+;; しょう's second) Enter: 山 and 償 are committed into window 3's body.
+(def dict-frames
+  [["converting" (assoc shell :focus 3 :stack [w1k w3] :composition [23665])]
+   ["committed" (assoc shell :focus 3 :stack [w1k (update w3 :body into [23665 20767])])]])
+
+;; ADR-0236: the pointer. After the dictionary, the host moves the tablet to
+;; (400, 300) -- over window 3 and window 1 under it -- (700, 450) over the
+;; background, (1276, 796) at the bottom-right corner (the arrow cut to 4 rows
+;; of at most 4 px), presses at (1000, 600) on no window and releases there. A
+;; frame after each; every one ends with the arrow at the pointer.
+(def ^:private dict-committed (assoc shell :focus 3 :stack [w1k (update w3 :body into [23665 20767])]))
+
+(def cursor-frames
+  (mapv (fn [ev at] [ev (assoc dict-committed :pointer at)])
+        ["move" "move" "move" "down" "up"]
+        [[400 300] [700 450] [1276 796] [1000 600] [1000 600]]))
+
+;; ADR-0237: Alt+Tab. After the pointer, the host presses launcher button 2 at
+;; (150, 14) -- window 2 opens at open-window's default rect (80, 80, 520, 360)
+;; with its slot's title and body, on top of window 3 -- and releases; then
+;; Alt down, Tab down / up three times, Alt up, and a Tab alone (down, up).
+;; Each Tab
+;; press with Alt held focuses and raises the bottom window: [1 3 2] ->
+;; [3 2 1] -> [2 1 3] -> [1 3 2]. The lone Tab is the IME's, which ignores it.
+;; A frame after each of the twelve; the pointer stays at (150, 14).
+(def ^:private w3y (update w3 :body into [23665 20767]))
+(def ^:private w2l (assoc w2c :x 80 :y 80 :w 520 :h 360))
+
+(def focus-frames
+  (let [at (fn [focus stack] (assoc shell :focus focus :stack stack :pointer [150 14]))
+        a (at 2 [w1k w3y w2l])]
+    [["launch-2" a] ["up" a] ["alt" a]
+     ["tab" (at 1 [w3y w2l w1k])] ["tab-up" (at 1 [w3y w2l w1k])]
+     ["tab" (at 3 [w2l w1k w3y])] ["tab-up" (at 3 [w2l w1k w3y])]
+     ["tab" a] ["tab-up" a] ["alt-up" a] ["lone-tab" a] ["lone-tab-up" a]]))
+
+;; ADR-0238: the wheel. After Alt+Tab (stack [1 3 2], focus 2) C registers app
+;; 4 -- title スクロール, body the lines 1 .. 20 (each 10 a <br>) -- and the host
+;; presses launcher button 4 at (360, 14): window 4 opens at (80, 80, 520, 360)
+;; on top, focused, fifteen of its twenty lines inside it. Then the release, a
+;; wheel notch toward the end at (360, 14) over no window (nothing scrolls), a
+;; move to (300, 300), six notches toward the end (the offset 20 .. 120: lines
+;; 7 .. 20 and the caret after 20) and seven toward the start (100 .. 0, the
+;; seventh clamped at 0). A frame after each of the seventeen.
+(def ^:private w4 {:id 4 :x 80 :y 80 :w 520 :h 360
+                   :title [12473 12463 12525 12540 12523]
+                   :body (vec (butlast (mapcat #(conj (vec (map (fn [c] (.charCodeAt c 0)) (str %))) 10)
+                                               (range 1 21))))})
+
+(def scroll-offsets [0 0 0 0 20 40 60 80 100 120 100 80 60 40 20 0 0])
+
+(def scroll-frames
+  (let [shell4 (assoc shell :apps 15 :titles (assoc (:titles shell) 4 (:title w4)))]
+    (mapv (fn [ev sc pointer]
+            [ev (assoc shell4 :focus 4 :stack [w1k w3y w2l (assoc w4 :scroll sc)] :pointer pointer)])
+          ["launch-4" "up" "wheel-miss" "move" "down" "down" "down" "down" "down" "down"
+           "up" "up" "up" "up" "up" "up" "up-at-0"]
+          scroll-offsets
+          (concat (repeat 3 [360 14]) (repeat 14 [300 300])))))
+
+;; ADR-0240: the selection. After the wheel (window 4 on top and focused, its
+;; offset 0, the pointer at (300, 300)) the host sends five notches toward the
+;; end (offset 20 .. 100: line 20 and the caret inside the window), then Shift
+;; down, Left down / up twice (browser.text-edit move-caret -1 :extend?: "0",
+;; then "20" -- the last k code points of the body selected, highlighted behind
+;; their glyphs, no caret), Right down / up (move-caret +1 :extend?: "0"
+;; again), Left down / up ("20"), Shift up, and Backspace down / up:
+;; delete-backward removes the selection, the body ends with the 10 after 19,
+;; and the caret stands at the start of the empty line 20. A frame after each
+;; of the seventeen.
+(def selection-keys
+  ;; [event offset k body-drop]: body-drop code points gone from the end
+  [["wheel" 20 0 0] ["wheel" 40 0 0] ["wheel" 60 0 0] ["wheel" 80 0 0] ["wheel" 100 0 0]
+   ["shift" 100 0 0] ["left" 100 1 0] ["left-up" 100 1 0] ["left" 100 2 0] ["left-up" 100 2 0]
+   ["right" 100 1 0] ["right-up" 100 1 0] ["left" 100 2 0] ["left-up" 100 2 0]
+   ["shift-up" 100 2 0] ["backspace" 100 0 2] ["backspace-up" 100 0 2]])
+
+(def selection-frames
+  (let [shell4 (assoc shell :apps 15 :titles (assoc (:titles shell) 4 (:title w4)))]
+    (mapv (fn [[ev sc k drop]]
+            [ev (assoc shell4 :focus 4
+                       :stack [w1k w3y w2l (assoc w4 :scroll sc :body (vec (drop-last drop (:body w4))))]
+                       :pointer [300 300]
+                       :selection (if (pos? k) [4 k] [0 0]))])
+          selection-keys)))
+
+;; ADR-0241: the clipboard. After the selection (window 4 focused, offset 100,
+;; its body the lines 1 .. 19 each followed by a 10 -- 48 code points) the host
+;; sends Shift down, Left down / up three times ("19" and its 10 selected),
+;; Shift up, Ctrl down, C down / up -- a :clipboard/write the broker admits:
+;; the clipboard holds "19\n", nothing on the screen changes --, Ctrl up,
+;; Backspace down / up (the selection goes: 45 code points), Ctrl down, V down /
+;; up twice (two admitted :clipboard/read completions, each insert-text of
+;; "19\n": 48, then 51 code points), then -- the stage's grant now
+;; file-picker only -- V down / up (the broker refuses: nothing is pasted),
+;; Ctrl up. A frame after each of the twenty-two.
+(def clipboard-keys
+  ;; [event k body-length]
+  [["shift" 0 48] ["left" 1 48] ["left-up" 1 48] ["left" 2 48] ["left-up" 2 48]
+   ["left" 3 48] ["left-up" 3 48] ["shift-up" 3 48] ["ctrl" 3 48] ["c" 3 48] ["c-up" 3 48]
+   ["ctrl-up" 3 48] ["backspace" 0 45] ["backspace-up" 0 45] ["ctrl" 0 45]
+   ["v" 0 48] ["v-up" 0 48] ["v" 0 51] ["v-up" 0 51] ["v-refused" 0 51] ["v-up" 0 51]
+   ["ctrl-up" 0 51]])
+
+(def clipboard-frames
+  (let [shell4 (assoc shell :apps 15 :titles (assoc (:titles shell) 4 (:title w4)))
+        body48 (vec (drop-last 2 (:body w4)))
+        bodies {48 body48 45 (vec (drop-last 3 body48)) 51 (into body48 [49 57 10])}]
+    (mapv (fn [[ev k n]]
+            [ev (assoc shell4 :focus 4
+                       :stack [w1k w3y w2l (assoc w4 :scroll 100 :body (bodies n))]
+                       :pointer [300 300]
+                       :selection (if (pos? k) [4 k] [0 0]))])
+          clipboard-keys)))
+
+;; ADR-0242: damage. After the clipboard (window 4 focused and on top, the
+;; pointer at (300, 300)) the host moves the tablet to (320, 310) -- only the
+;; arrow moves --, then Alt down, Tab down (Alt+Tab raises window 1 from the
+;; bottom: [1 3 2 4] -> [3 2 4 1], focus 1), Tab up and Alt up, which draw
+;; nothing new. After each, the kernel sends only the damage, then (the host's
+;; F12) the whole screen.
+(def damage-frames
+  (let [shell4 (assoc shell :apps 15 :titles (assoc (:titles shell) 4 (:title w4)))
+        w4c (assoc w4 :scroll 100 :body (into (vec (drop-last 2 (:body w4))) [49 57 10]))
+        at (fn [focus stack pointer] (assoc shell4 :focus focus :stack stack :pointer pointer
+                                            :selection [0 0]))
+        before (at 4 [w1k w3y w2l w4c] [300 300])
+        moved (at 4 [w1k w3y w2l w4c] [320 310])
+        raised (at 1 [w3y w2l w4c w1k] [320 310])]
+    {:before before
+     :frames [["move" moved] ["alt" moved] ["tab" raised] ["tab-up" raised] ["alt-up" raised]]}))
+
+;; ADR-0247: after the damage stage the host sends F10 down and up (the
+;; high-contrast palette on), F10 down and up (off). The scene is the damage
+;; stage's last: window 1 raised and focused, the pointer at (320, 310).
+(def uiux-frames
+  (let [raised (get-in damage-frames [:frames 4 1])
+        hc (assoc raised :hc true)]
+    [["f10" hc] ["f10-up" hc] ["f10" raised] ["f10-up" raised]]))
+
+;; ADR-0248/0249: after the palette there, the host sends F6 down and up twice
+;; (the ring on launcher button 1, then 2), Shift down, F6 down and up, Shift
+;; up (back to 1), F6 down and up (2), Enter down and up (button 2 is pressed:
+;; window 2 is raised and focused), Escape down and up (the focused window is
+;; closed; the one now on top is focused). The ring stays on button 2.
+(def key-frames
+  (let [raised (get-in damage-frames [:frames 4 1])
+        stack0 (:stack raised)
+        w2 (first (filter #(= (:id %) 2) stack0))
+        others (vec (remove #(= (:id %) 2) stack0))
+        launched (assoc raised :ring 2 :focus 2 :stack (conj others w2))
+        closed (assoc raised :ring 2 :focus (:id (last others)) :stack others)]
+    (let [r (fn [ring] (assoc raised :ring ring))]
+      [["f6" (r 1)] ["f6-up" (r 1)] ["f6" (r 2)] ["f6-up" (r 2)]
+       ["shift" (r 2)] ["shift-f6" (r 1)] ["shift-f6-up" (r 1)] ["shift-up" (r 1)]
+       ["f6" (r 2)] ["f6-up" (r 2)]
+       ["enter" launched] ["enter-up" launched]
+       ["esc" closed] ["esc-up" closed]])))
+
+;; ADR-0250: after the keyboard frames the host double-presses window 1's
+;; titlebar at (380, 142) -- press, release, press, release -- and then, the
+;; window being maximized to the work area (0, 28, 1280, 720), its titlebar at
+;; (380, 40) the same way, and the window is back in the rect it had. The
+;; pointer is where the tablet last was.
+(def max-frames
+  (let [raised (get-in damage-frames [:frames 4 1])
+        others (vec (remove #(= (:id %) 2) (:stack raised)))
+        w1 (last others)
+        base (assoc raised :ring 2 :focus 1 :stack others)
+        maxed (assoc w1 :x 0 :y 28 :w 1280 :h 720)
+        at (fn [scene p] (assoc scene :pointer p))
+        stack-with (fn [w] (conj (vec (butlast others)) w))
+        s0 (at base [380 142])
+        s1 (at (assoc base :stack (stack-with maxed)) [380 142])
+        s2 (at (assoc base :stack (stack-with maxed)) [380 40])
+        s3 (at base [380 40])]
+    (let [c (fn [scene] (at scene [476 146]))
+          s4 (c (assoc base :stack (stack-with maxed)))
+          s5 (c base)
+          mn (assoc base :minimized #{1} :focus (:id (last (butlast others))))
+          ;; the press at (380, 142) raises window 4 over the minimized window 1
+          mn2 (assoc mn :stack [(nth others 0) w1 (nth others 1)])
+          ;; ADR-0257 states: windows 1 and 4 minimized (3 alone), 1 restored, both restored
+          mn3 (assoc base :minimized #{1 4} :focus 3 :stack [(nth others 0) w1 (nth others 1)])
+          mn4 (assoc base :minimized #{4} :focus 1 :stack others)
+          mn5 (assoc base :focus 4 :stack [(nth others 0) w1 (nth others 1)])
+          lk (fn [pin denied p] (assoc mn5 :locked true :pin pin :denied denied :pointer p))
+          ;; ADR-0259: the signed-out session: one window 1 at the default rect with an empty body
+          clean (assoc base :ring 0 :focus 1 :minimized #{}
+                       :stack [(assoc w1 :x 80 :y 80 :w 520 :h 360 :body [])])
+          lk2 (fn [pin p] (assoc clean :locked true :pin pin :denied false :pointer p))]
+      [["press" s0] ["release" s0] ["press-2-max" s1] ["release" s1]
+       ["press" s2] ["release" s2] ["press-2-restore" s3] ["release" s3]
+       ;; ADR-0251: a press on the maximize control at (476, 146) maximizes, F11 on
+       ;; the maximized window presses its control and restores
+       ["control-max" (c (assoc base :stack (stack-with maxed)))] ["release" s4]
+       ["f11-restore" s5] ["f11-up" s5]
+       ;; ADR-0252: the pointer moves onto window 1's resize handle at (500, 320), where it
+       ;; is the resize cursor, and back to (380, 142), where it is the arrow
+       ["move-to-handle" (at base [500 320])] ["move-away" (at base [380 142])]
+       ;; ADR-0253: the button goes down on launcher button 1 at (54, 14) and up again
+       ["press-launcher" (assoc (at base [54 14]) :down true)] ["release-launcher" (at base [54 14])]
+       ;; ADR-0254: a press on window 1's minimize control at (456, 146) minimizes it (focus to the
+       ;; window now on top, 4); a press at (380, 142), where window 1 was, lands on window 4
+       ;; (the minimized window is not hit); a press on app 1's dock icon at (574, 772) restores
+       ;; it, raised and focused
+       ["min-press" (assoc (at mn [456 146]) :down true)] ["release" (at mn [456 146])]
+       ["press-through" (assoc (at mn2 [380 142]) :down true)] ["release" (at mn2 [380 142])]
+       ["restore-press" (assoc (at base [574 772]) :down true)] ["release" (at base [574 772])]
+       ;; ADR-0255: minimized again, the tray of minimized windows lists it by title, a press on
+       ;; its button at (60, 780) restores it
+       ["min-press-2" (assoc (at mn [456 146]) :down true)] ["release" (at mn [456 146])]
+       ["tray-restore" (assoc (at base [60 780]) :down true)] ["release" (at base [60 780])]
+       ;; ADR-0256: Alt down, '-' down (Alt+- presses window 1's minimize control: minimized, focus 4),
+       ;; '-' up, Alt up, then the tray button restores it
+       ["alt" (at base [60 780])] ["alt-minus" (at mn [60 780])] ["minus-up" (at mn [60 780])]
+       ["alt-up" (at mn [60 780])]
+       ["tray-restore-2" (assoc (at base [60 780]) :down true)] ["release" (at base [60 780])]
+       ;; ADR-0257: window 1 minimized, then window 4 by its own control (544, 94): window 3 is the
+       ;; only visible window and its close control is disabled; a press on it (584, 94) is refused;
+       ;; two presses on the tray button (60, 780) restore window 1 and then window 4
+       ["min-1" (assoc (at mn [456 146]) :down true)] ["release" (at mn [456 146])]
+       ["min-4" (assoc (at mn3 [544 94]) :down true)] ["release" (at mn3 [544 94])]
+       ["close-refused" (assoc (at mn3 [584 94]) :down true)] ["release" (at mn3 [584 94])]
+       ["restore-1" (assoc (at mn4 [60 780]) :down true)] ["release" (at mn4 [60 780])]
+       ["restore-4" (assoc (at mn5 [60 780]) :down true)] ["release" (at mn5 [60 780])]
+       ;; ADR-0258: Ctrl, Alt, L down (the screen locks), L, Alt, Ctrl up; a press at (456, 146) and a
+       ;; key (x) are swallowed; a wrong PIN (4 2 4 3, Enter) is refused, the right one (4 2 4 2, Enter)
+       ;; unlocks and the session is as it was
+       ["ctrl" (at mn5 [60 780])] ["alt" (at mn5 [60 780])]
+       ["lock" (lk 0 false [60 780])] ["l-up" (lk 0 false [60 780])] ["alt-up" (lk 0 false [60 780])]
+       ["ctrl-up" (lk 0 false [60 780])]
+       ["locked-press" (assoc (lk 0 false [456 146]) :down true)] ["release" (lk 0 false [456 146])]
+       ["locked-x" (lk 0 false [456 146])] ["x-up" (lk 0 false [456 146])]
+       ["4" (lk 1 false [456 146])] ["4-up" (lk 1 false [456 146])]
+       ["2" (lk 2 false [456 146])] ["2-up" (lk 2 false [456 146])]
+       ["4" (lk 3 false [456 146])] ["4-up" (lk 3 false [456 146])]
+       ["3" (lk 4 false [456 146])] ["3-up" (lk 4 false [456 146])]
+       ["enter-refused" (lk 0 true [456 146])] ["enter-up" (lk 0 true [456 146])]
+       ["4" (lk 1 false [456 146])] ["4-up" (lk 1 false [456 146])]
+       ["2" (lk 2 false [456 146])] ["2-up" (lk 2 false [456 146])]
+       ["4" (lk 3 false [456 146])] ["4-up" (lk 3 false [456 146])]
+       ["2" (lk 4 false [456 146])] ["2-up" (lk 4 false [456 146])]
+       ;; the lock cleared the keyboard focus ring (it is transient), so the unlocked frame has no ring
+       ["enter-accepted" (at (assoc mn5 :ring 0) [456 146])] ["enter-up" (at (assoc mn5 :ring 0) [456 146])]
+       ;; ADR-0259: Ctrl, Alt, Q down (the session ends: one fresh window 1 at the default rect, empty body,
+       ;; and the screen locked), Q, Alt, Ctrl up; the PIN 4 2 4 2 and Enter sign in to the clean session
+       ["ctrl" (at (assoc mn5 :ring 0) [456 146])] ["alt" (at (assoc mn5 :ring 0) [456 146])]
+       ["sign-out" (lk2 0 [456 146])] ["q-up" (lk2 0 [456 146])] ["alt-up" (lk2 0 [456 146])]
+       ["ctrl-up" (lk2 0 [456 146])]
+       ["4" (lk2 1 [456 146])] ["4-up" (lk2 1 [456 146])] ["2" (lk2 2 [456 146])] ["2-up" (lk2 2 [456 146])]
+       ["4" (lk2 3 [456 146])] ["4-up" (lk2 3 [456 146])] ["2" (lk2 4 [456 146])] ["2-up" (lk2 4 [456 146])]
+       ["enter-signed-in" (at clean [456 146])] ["enter-up" (at clean [456 146])]])))
+
+;; ADR-0261: the UI scale stage, after the sign-out stage. Kotoba lays the clean session out in the logical
+;; viewport (1280 x 800 over the scale) and C magnifies what it paints. F11 maximizes the window; Ctrl+= twice
+;; takes the scale to 125 then 150 and fits the window into the shrinking viewport; a third Ctrl+= changes
+;; nothing (150 is the top); Ctrl+- twice takes it back to 100 (the window stays where the fit left it); F11 again
+;; restores the rect it had before it was maximized.
+(def scale-frames
+  (let [clean (second (last max-frames))
+        w1 (first (:stack clean))
+        at (fn [pct vw vh x y w h]
+             (assoc clean :vw vw :vh vh :scale pct :stack [(assoc w1 :x x :y y :w w :h h)]))
+        s0 (at 100 1280 800 80 80 520 360)
+        m (at 100 1280 800 0 28 1280 720)
+        z125 (at 125 1024 640 0 28 1024 612)
+        z150 (at 150 853 533 0 28 853 505)
+        z125b (at 125 1024 640 0 28 853 505)
+        z100 (at 100 1280 800 0 28 853 505)]
+    [["f11" m] ["f11-up" m] ["ctrl" m]
+     ["ctrl=" z125] ["=-up" z125] ["ctrl=" z150] ["=-up" z150] ["ctrl=-max" z150] ["=-up" z150]
+     ["ctrl--" z125b] ["--up" z125b] ["ctrl--" z100] ["--up" z100]
+     ["ctrl-up" z100] ["f11-restore" s0] ["f11-up" s0]]))
+
+(defn- scale-ops
+  "What aiueos_desktop_present_ops2 paints at `pct` percent: a rect covers [x s / 100, ceil ((x + w) s / 100))
+  on each axis, and each set bit of a glyph is the block of the same rule, in the glyph's colour."
+  [pct ops]
+  (let [sc (fn [v] (quot (* v pct) 100)) ce (fn [v] (quot (+ (* v pct) 99) 100))]
+    (vec (mapcat (fn [[k x y a b c]]
+                   (if (= k :rect)
+                     [[:rect (sc x) (sc y) (- (ce (+ x a)) (sc x)) (- (ce (+ y b)) (sc y)) c]]
+                     (for [[dx dy] (bits a) :when (< dx b)]
+                       [:rect (sc (+ x dx)) (sc (+ y dy)) (- (ce (+ x dx 1)) (sc (+ x dx))) (- (ce (+ y dy 1)) (sc (+ y dy))) (or c ink)])))
+                 ops))))
+
+;; ADR-0263: text editing, stated here apart from browser-ime.kotoba. The body is a vector of code points; the
+;; caret is an index; a selection is the span between the anchor and the caret; undo remembers the last edit of
+;; the window (a run of typed code points, a deletion) once. Word and line moves are the plain rules:
+;; Ctrl+Left goes to the start of the word at or before the caret, Ctrl+Right to the end of the next word; Home and
+;; End go to the start and end of the caret's line (the lines are separated by 10); with Shift a move keeps or starts
+;; a selection, without it a selection collapses to its near edge on Left and Right.
+(defn- ed-ws? [c] (contains? #{32 10 9 12288} c))
+(defn- ed-sel [{:keys [caret anchor]}] (when (and anchor (not= anchor caret)) [(min anchor caret) (max anchor caret)]))
+(defn- ed-move [st c extend?]
+  (let [a (when extend? (or (:anchor st) (:caret st)))]
+    (assoc st :caret c :anchor (when (and a (not= a c)) a))))
+(defn- ed-line-start [body i] (loop [i i] (if (or (<= i 0) (= 10 (nth body (dec i)))) i (recur (dec i)))))
+(defn- ed-line-end [body i] (loop [i i] (if (or (>= i (count body)) (= 10 (nth body i))) i (recur (inc i)))))
+(defn- ed-word-left [body i]
+  (let [i (loop [i i] (if (and (pos? i) (ed-ws? (nth body (dec i)))) (recur (dec i)) i))]
+    (loop [i i] (if (and (pos? i) (not (ed-ws? (nth body (dec i))))) (recur (dec i)) i))))
+(defn- ed-word-right [body i]
+  (let [n (count body)
+        i (loop [i i] (if (and (< i n) (ed-ws? (nth body i))) (recur (inc i)) i))]
+    (loop [i i] (if (and (< i n) (not (ed-ws? (nth body i)))) (recur (inc i)) i))))
+(defn- ed-delete [st lo hi caret-after]
+  (let [body (:body st)
+        txt (subvec body lo hi)]
+    (assoc st :body (into (subvec body 0 lo) (subvec body hi)) :caret lo :anchor nil
+           :undo (when (<= (- hi lo) 32) {:kind :del :idx lo :text txt :caret caret-after}))))
+(defn- ed-insert [st cps]
+  (let [{:keys [body caret undo]} st
+        at caret m (count cps)
+        merge? (and undo (= :ins (:kind undo)) (= (+ (:idx undo) (:len undo)) at))]
+    (assoc st :body (into (into (subvec body 0 at) cps) (subvec body at)) :caret (+ at m) :anchor nil
+           :undo (if merge? (update undo :len + m) {:kind :ins :idx at :len m}))))
+(defn- ed-drop-sel [st]
+  (if-let [[lo hi] (ed-sel st)] (ed-delete st lo hi hi) (assoc st :anchor nil)))
+(defn- ed-step [st [op arg]]
+  (let [{:keys [body caret]} st n (count body)]
+    (case op
+      :type (-> st ed-drop-sel (ed-insert [arg]))
+      :left (if-let [[lo _] (ed-sel st)] (ed-move st lo false) (ed-move st (max 0 (dec caret)) false))
+      :right (if-let [[_ hi] (ed-sel st)] (ed-move st hi false) (ed-move st (min n (inc caret)) false))
+      :shift-left (ed-move st (max 0 (dec caret)) true)
+      :shift-right (ed-move st (min n (inc caret)) true)
+      :home (ed-move st (ed-line-start body caret) false)
+      :end (ed-move st (ed-line-end body caret) false)
+      :shift-home (ed-move st (ed-line-start body caret) true)
+      :ctrl-left (ed-move st (ed-word-left body caret) false)
+      :ctrl-right (ed-move st (ed-word-right body caret) false)
+      :backspace (if (ed-sel st) (ed-drop-sel st)
+                   (if (pos? caret) (ed-delete st (dec caret) caret caret) st))
+      :delete (if (ed-sel st) (ed-drop-sel st)
+                (if (< caret n) (ed-delete st caret (inc caret) caret) st))
+      :undo (let [u (:undo st)]
+              (case (:kind u)
+                :ins (assoc (ed-delete st (:idx u) (+ (:idx u) (:len u)) 0) :undo nil)
+                :del (assoc st :body (into (into (subvec body 0 (:idx u)) (:text u)) (subvec body (:idx u)))
+                            :caret (:caret u) :anchor nil :undo nil)
+                st)))))
+
+;; The sequence the host sends after the keyboard-only stage; each step is a key (Ctrl or Shift held round it
+;; where named). [step, evdev code, qcode, modifier]
+(def edit-steps
+  [[[:type 97] 30 "a"] [[:type 98] 48 "b"] [[:type 32] 57 "spc"] [[:type 99] 46 "c"] [[:type 100] 32 "d"]
+   [[:home] 102 "home"] [[:right] 106 "right"] [[:right] 106 "right"]
+   [[:ctrl-right] 106 "right" :ctrl] [[:ctrl-left] 105 "left" :ctrl] [[:left] 105 "left"]
+   [[:type 120] 45 "x"] [[:undo] 44 "z" :ctrl]
+   [[:shift-right] 106 "right" :shift] [[:shift-right] 106 "right" :shift]
+   [[:backspace] 14 "backspace"] [[:undo] 44 "z" :ctrl] [[:delete] 111 "delete"]
+   [[:type 10] 28 "ret"] [[:type 101] 18 "e"]
+   [[:left] 105 "left"] [[:left] 105 "left"] [[:end] 107 "end"] [[:home] 102 "home"] [[:end] 107 "end"]
+   [[:right] 106 "right"] [[:end] 107 "end"] [[:shift-home] 102 "home" :shift] [[:left] 105 "left"]])
+
+(def edit-frames
+  (let [clean (second (last max-frames))
+        w1 (first (:stack clean))
+        scene (fn [st]
+                (let [rng (ed-sel st)]
+                  (cond-> (assoc clean :stack [(assoc w1 :body (:body st))]
+                                       :caret [1 (:caret st)])
+                    rng (assoc :range [1 (first rng) (second rng)]))))
+        mod-code {:ctrl 29 :shift 42}
+        mod-q {:ctrl "ctrl" :shift "shift"}]
+    (loop [steps edit-steps st {:body [] :caret 0 :anchor nil :undo nil} out []]
+      (if-let [[step code q md] (first steps)]
+        (let [st2 (ed-step st step)
+              ev (fn [label st] [label st code q])
+              frames (cond-> []
+                       md (conj [(str (name md) " down") st nil (mod-q md) (mod-code md) true])
+                       true (conj [(str q " down") st2 q code true])
+                       true (conj [(str q " up") st2 q code false])
+                       md (conj [(str (name md) " up") st2 (mod-q md) (mod-code md) false]))]
+          ;; the modifier's down comes before the key's change; the key's down is the frame that changes
+          (recur (rest steps) st2
+                 (into out (map (fn [[label s2 _ _ _]] [label (scene (if (re-find #"(ctrl|shift) down" label) st s2))]) frames))))
+        out))))
+
+(defn- ed-text [body]
+  (apply str (map #(case % 32 "_" 10 "|" (str (char %))) body)))
+
+;; ADR-0264: the clock stage, after the editing stage: the same session, then the launcher row with the time the stage
+;; set the machine's clock to, 12:34 (the minute of the day, 754).
+(def clock-frames
+  (let [last-edit (second (last edit-frames))]
+    [["no-status" last-edit] ["12:34" (assoc last-edit :status 754)]
+     ;; ADR-0266: the network state beside the clock -- 1 OFFLINE, 2 LINK, 3 ONLINE
+     ["net-1" (assoc last-edit :status 754 :net 1)] ["net-2" (assoc last-edit :status 754 :net 2)]
+     ["net-3" (assoc last-edit :status 754 :net 3)]]))
+
+;; ADR-0267: the layout stage, after the clock stage, continues in the session the editing stage left: the keys are
+;; typed at the caret in English mode. [modifier key char]: US shift+2 '@', 2, shift+a 'A', shift+; ':', shift+' '"'; F9 flips
+;; to JIS; shift+2 '"', shift+' '*', the key right of P '@', shift+; '+'; F9 flips back. A char of nil is the F9 key.
+(def layout-keys
+  [[:shift "2" 64] [nil "2" 50] [:shift "a" 65] [:shift "semicolon" 58] [:shift "apostrophe" 34]
+   [nil "f9" nil]
+   [:shift "2" 34] [:shift "apostrophe" 42] [nil "bracket_left" 64] [:shift "semicolon" 43]
+   [nil "f9" nil]])
+
+(def layout-frames
+  (let [clean (second (last max-frames))
+        w1 (first (:stack clean))
+        scene (fn [st layout]
+                (let [rng (ed-sel st)]
+                  (cond-> (assoc clean :stack [(assoc w1 :body (:body st))]
+                                       :caret [1 (:caret st)] :layout layout)
+                    rng (assoc :range [1 (first rng) (second rng)]))))
+        st0 (reduce (fn [st [step]] (ed-step st step)) {:body [] :caret 0 :anchor nil :undo nil} edit-steps)]
+    (loop [ks layout-keys st st0 layout 0 out []]
+      (if-let [[md q ch] (first ks)]
+        (let [st2 (if ch (ed-step st [:type ch]) st)
+              layout2 (if ch layout (- 1 layout))
+              fr (fn [label s l] [label (scene s l) l])]
+          (recur (rest ks) st2 layout2
+                 (cond-> out
+                   md (conj (fr (str (name md) " down") st layout))
+                   true (conj (fr (str q " down") st2 layout2))
+                   true (conj (fr (str q " up") st2 layout2))
+                   md (conj (fr (str (name md) " up") st2 layout2)))))
+        out))))
+
+;; ADR-0268: the notification stage, after the layout stage, in the same session. Two apps raise a notification (the stage
+;; plays the app: "Backup", then "Update"): both show as toasts. F8 dismisses the newest one still shown, F7 opens and closes
+;; the list; a dismissed notification leaves the toasts and stays in the list. A frame is [label scene notes-string], the
+;; notes-string the four states as digits.
+(def notify-frames
+  (let [base (second (last layout-frames))
+        sc (fn [notes panel] (assoc base :notes notes :panel panel))
+        digits (fn [notes] (apply str (concat (map first notes) (repeat (- 4 (count notes)) 0))))
+        s0 []
+        s1 [[1 "Backup"]]
+        s2 [[1 "Backup"] [1 "Update"]]
+        s3 [[1 "Backup"] [2 "Update"]]
+        s4 [[2 "Backup"] [2 "Update"]]
+        fr (fn [label notes panel] [label (sc notes panel) (digits notes) (if panel 1 0)])]
+    [(fr "baseline" s0 false) (fr "raise Backup" s1 false) (fr "raise Update" s2 false)
+     (fr "f8 down" s3 false) (fr "f8 up" s3 false)
+     (fr "f7 down" s3 true) (fr "f7 up" s3 true)
+     (fr "f7 down" s3 false) (fr "f7 up" s3 false)
+     (fr "f8 down" s4 false) (fr "f8 up" s4 false)
+     (fr "f7 down" s4 true) (fr "f7 up" s4 true)
+     (fr "f7 down" s4 false) (fr "f7 up" s4 false)]))
+
+;; ADR-0270: the passkey stage, after the notification stage, in the same session. Ctrl+Alt+L locks the screen (the lock screen of ADR-0258);
+;; F3 asks for a passkey of another device -- it does not verify against this device's public point, so the lock stays and the red bar
+;; shows; F4 asks for this device's passkey -- it verifies and the session opens as it was.
+(def passkey-frames
+  (let [base (second (last layout-frames))
+        locked (assoc base :locked true :pin 0)
+        denied (assoc locked :denied true)]
+    [["ctrl down" base] ["alt down" base] ["l down" locked] ["l up" locked] ["alt up" locked] ["ctrl up" locked]
+     ["f3 down" denied] ["f3 up" denied] ["f4 down" base] ["f4 up" base]]))
+
+;; ADR-0262: the keyboard-only stage, after the scale stage (the clean session, window 1 alone). F6 moves the
+;; focus ring through every shell control that exists, Enter activates the one it is on, all through the same
+;; press path as the pointer. F6 F6 puts the ring on launcher button 2 and Enter opens window 2; F6 four times
+;; takes it over button 3, button 4, window 2's close control and its maximize control; Enter maximizes window 2;
+;; F6 moves it to the minimize control and Enter minimizes window 2 (focus to window 1); F6 moves it to the
+;; tray's button for window 2 and Enter restores it (maximized, raised, focused); F6 once more finds no control
+;; further on and puts the ring away; Escape closes window 2 and leaves the session as the stage found it.
+(def ring-frames
+  (let [clean (second (last max-frames))
+        w1 (first (:stack clean))
+        title2 (get (:titles clean) 2)
+        w2 {:id 2 :x 80 :y 80 :w 520 :h 360 :title title2 :body []}
+        w2m (assoc w2 :x 0 :y 28 :w 1280 :h 720)
+        st (fn [ring focus stack & [mn]]
+             (assoc clean :ring ring :focus focus :stack stack :minimized (or mn #{})))
+        one (st 0 1 [w1])
+        two (fn [ring] (st ring 2 [w1 w2]))
+        mx (fn [ring] (st ring 2 [w1 w2m]))
+        gone (st 7 1 [w1 w2m] #{2})]
+    [["f6" (assoc one :ring 1)] ["f6-up" (assoc one :ring 1)]
+     ["f6" (assoc one :ring 2)] ["f6-up" (assoc one :ring 2)]
+     ["enter" (two 2)] ["enter-up" (two 2)]
+     ["f6" (two 3)] ["f6-up" (two 3)] ["f6" (two 4)] ["f6-up" (two 4)]
+     ["f6" (two 5)] ["f6-up" (two 5)] ["f6" (two 6)] ["f6-up" (two 6)]
+     ["enter-max" (mx 6)] ["enter-up" (mx 6)]
+     ["f6" (mx 7)] ["f6-up" (mx 7)]
+     ["enter-min" gone] ["enter-up" gone]
+     ["f6" (assoc gone :ring 8)] ["f6-up" (assoc gone :ring 8)]
+     ["enter-restore" (mx 8)] ["enter-up" (mx 8)]
+     ["f6" (mx 0)] ["f6-up" (mx 0)]
+     ;; Escape closes the focused window (ADR-0248): window 1 alone again, as the stage found it
+     ["esc" one] ["esc-up" one]]))
+
+;; ADR-0260/0269: the settings stage, after the notification stage, in the same session: window 2 is the settings app, opened by a
+;; press on launcher button 2 (its title slot says "Settings", which is also the button's label), focused, on top of window 1 at the
+;; default rect. Its body is the three settings, rebuilt after every key. First boot: F10 (contrast high), Ctrl+= (125 %), F5
+;; (network off); the status area says ONLINE until the network setting is off, then OFFLINE. Second boot of the same volume: the
+;; window opens with the stored values and only Alt is pressed.
+(def settings-frames
+  (let [base (second (last layout-frames))   ; the session as the layout and notification stages left it
+        w1 (first (:stack base))
+        cps (fn [text] (mapv #(.charCodeAt % 0) text))
+        body (fn [hc pct off] (cps (str "Contrast: " (if hc "High" "Normal") "\nScale: " pct "%\nNetwork: " (if off "Off" "On"))))
+        sc (fn [hc pct off at]
+             (cond-> (assoc base :hc hc :scale pct :vw (quot (* 1280 100) pct) :vh (quot (* 800 100) pct) :focus 2
+                            :net (if off 1 3)
+                            :titles (assoc (:titles base) 2 (cps "Settings"))
+                            :stack [w1 {:id 2 :x 80 :y 80 :w 520 :h 360 :title (cps "Settings") :body (body hc pct off)}])
+               at (assoc :pointer at)))
+        fr (fn [label hc pct off at] [label (sc hc pct off at) hc off])]
+    ;; first boot: three clicks, a press and a release each, on the lines of the window's body (contrast at (200, 131),
+    ;; scale at (200, 151), network at (200, 171)); the second boot only presses Alt
+    [(fr "open" false 100 false nil)
+     (fr "click contrast" true 100 false [200 131]) (fr "release" true 100 false [200 131])
+     (fr "click scale" true 125 false [200 151])
+     ;; the release carries no position: the tablet is where it was in the 32768 units, which the 1024 x 640 viewport reads as (160, 120)
+     (fr "release" true 125 false [160 120])
+     (fr "click network" true 125 true [200 171]) (fr "release" true 125 true [200 171])]))
+
+;; The colours the kernel reads out of a draw list for AIUEOS_GUEST_BROWSER_HC:
+;; the background (op 0), the first glyph's colour (the ink), and the distinct
+;; colours of the 28 px rects (titlebars) in the order they first appear.
+(defn- hc-line [n hc ops]
+  (let [hx #(.padStart (.toString % 16) 8 "0")
+        glyphs (filter #(= (first %) :glyph) ops)
+        titles (distinct (map #(nth % 5) (filter (fn [[k _ _ _ b _]] (and (= k :rect) (= b 28))) ops)))]
+    (str "hc-frame n=" n " mode=" (if hc 1 0) " bg=" (hx (nth (first ops) 5))
+         " ink=" (hx (or (nth (first glyphs) 5 nil) ink))
+         " bars=" (apply str (interpose "," (map hx (take 4 titles)))))))
+
+(defn- op-box
+  "The pixels an op can set: a rect's own, a glyph's width x 16."
+  [[k x y a b]]
+  (if (= k :rect) [x y (+ x a) (+ y b)] [x y (+ x b) (+ y 16)]))
+
+(defn damage
+  "The rectangle a present sends after `prev` when `cur` is painted: the
+  bounding box of every op, in either list, at a position where the two
+  lists differ; the whole viewport after no list; nothing when they are the
+  same. Written from the rule in ADR-0242, not from browser-damage.kotoba."
+  [prev cur vw vh]
+  (if (nil? prev)
+    {:d (count cur) :rect [0 0 vw vh]}
+    (let [js (filter #(not= (get prev %) (get cur %)) (range (max (count prev) (count cur))))
+          boxes (for [j js o [(get prev j) (get cur j)] :when o] (op-box o))]
+      (if (empty? js)
+        {:d 0 :rect [0 0 0 0]}
+        (let [x0 (apply min (map #(nth % 0) boxes)) y0 (apply min (map #(nth % 1) boxes))
+              x1 (min vw (apply max (map #(nth % 2) boxes))) y1 (min vh (apply max (map #(nth % 3) boxes)))]
+          {:d (count js) :rect [x0 y0 (- x1 x0) (- y1 y0)]})))))
+
+(defn- paint
+  "The colour of every pixel after painting `ops` over black, as
+  aiueos_desktop_present_ops2 paints them."
+  [ops vw vh]
+  (let [px (js/Uint32Array. (* vw vh))]
+    (doseq [[k x y a b c] ops]
+      (if (= k :rect)
+        (doseq [yy (range y (+ y b))] (.fill px c (+ (* yy vw) x) (+ (* yy vw) x a)))
+        (doseq [[dx dy] (bits a) :when (< dx b)] (aset px (+ (* (+ y dy) vw) x dx) ink))))
+    px))
+
+(defn pixel-box
+  "The bounding box of the pixels that actually differ between two painted
+  lists, [x y w h], or nil -- what `damage` must contain."
+  [prev cur vw vh]
+  (let [a (paint prev vw vh) b (paint cur vw vh)
+        hits (filter #(not= (aget a %) (aget b %)) (range (* vw vh)))]
+    (when (seq hits)
+      (let [xs (map #(mod % vw) hits) ys (map #(quot % vw) hits)
+            x0 (apply min xs) y0 (apply min ys)]
+        [x0 y0 (- (inc (apply max xs)) x0) (- (inc (apply max ys)) y0)]))))
+
+;; ADR-0234: the flow-parity frame. After everything above, the kernel lays
+;; out this surface on a surface of its own (no tablet needed): four windows
+;; whose bodies take each of cssom's rules -- packing by words with space runs,
+;; a tab and U+3000 collapsed (1); <br>s, an empty segment, leading and
+;; trailing spaces dropped per segment (2); a CJK run with no break
+;; opportunity overflowing the window (3); a body that fits kept as collapsed,
+;; its leading and trailing space included (4).
+(defn- cps [s] (vec (map #(.codePointAt % 0) (js/Array.from s))))
+
+(def flow-scene
+  {:vw 1280 :vh 800 :focus 4
+   ;; window 1's first line is exactly its 160 px (20 half-width glyphs), and
+   ;; its second would be 168 -- it fits the old inset (w - 16) and not
+   ;; cssom's (w - 28). Window 4's collapsed body is exactly its 152 px.
+   :stack [{:id 1 :x 16 :y 40 :w 188 :h 220 :title (cps "flow")
+            :body (cps "cssom  lays\tout words one by one,\u3000as hosted engine.")}
+           {:id 2 :x 220 :y 40 :w 420 :h 220 :title (cps "br")
+            :body (cps "  first  line  \n\n空行の次　全角空白も\nkotoba-lang/browser flows words")}
+           {:id 3 :x 656 :y 40 :w 200 :h 160 :title (cps "長い行")
+            :body (cps "ab 日本語の文字は単語の中で折り返さない cd")}
+           {:id 4 :x 16 :y 300 :w 180 :h 120 :title (cps "fits")
+            :body (cps " 画面　に　出る  text ")}]})
+
+(defn body-glyphs
+  "The span rule the flow-parity gate reads a kernel op list with: window k's
+  ops run from its body rects (the first is x+2 y w-4 h, JUN-143's rounded union of three) followed by its titlebar rects (the first x+2 y w-4 28)
+  to the next window's; its body glyphs are the glyph ops there at or below
+  y + 28, as [dx dy glyph width] from (x, y + 28). Composition glyphs would
+  count too: a parity scene has none."
+  [{:keys [stack]} ops]
+  (let [starts (map (fn [{:keys [x y w h]}]
+                      (first (keep-indexed (fn [i o]
+                                             (when (and (= (vec (take 5 o)) [:rect (+ x 2) y (- w 4) h])
+                                                        (= (vec (take 5 (get ops (+ i 3)))) [:rect (+ x 2) y (- w 4) 28]))
+                                               i))
+                                           ops)))
+                    stack)]
+    (into (sorted-map)
+          (map (fn [{:keys [id x y]} [a b]]
+                 [id (vec (for [[k gx gy gi gw] (subvec ops a b)
+                                :when (= k :glyph)
+                                :when (>= gy (+ y 28))]
+                            [(- gx x) (- gy (+ y 28)) gi gw]))])
+               stack
+               (partition 2 1 (concat starts [(count ops)]))))))
+
+(defn chain
+  "FNV-1a over each frame's census hash (u32, little-endian), in order -- what
+  the kernel folds as it presents the loop's frames."
+  [hashes]
+  (let [h (reduce (fn [h v]
+                    (reduce (fn [h b]
+                              (let [h (bit-xor h (bit-and (unsigned-bit-shift-right v (* 8 b)) 255))]
+                                (unsigned-bit-shift-right (js/Math.imul h 16777619) 0)))
+                            h (range 4)))
+                  2166136261 hashes)]
+    (.padStart (.toString (unsigned-bit-shift-right h 0) 16) 8 "0")))
+
+(defn- op-hex [[k x y a b c]]
+  (let [buf (js/Buffer.alloc 24)
+        words (if (= k :rect) [1 x y a b c] [2 x y a b (or c ink)])]
+    (doseq [[i v] (map-indexed vector words)] (.writeUInt32LE buf v (* 4 i)))
+    (.toString buf "hex")))
+
+(defn- named-scenes []
+  (concat (map #(select-keys % [:name :scene]) scenes)
+          (map-indexed (fn [i [ev s]] {:name (str "loop-" (inc i) "-" ev) :scene s}) loop-frames)
+          (map-indexed (fn [i [ev s]] {:name (str "caret-" (inc i) "-" ev) :scene s}) caret-frames)
+          (map-indexed (fn [i [ev s]] {:name (str "launch-" (inc i) "-" ev) :scene s}) launch-frames)
+          [{:name "flow" :scene flow-scene}]))
+
+(case mode
+  "--scenes"
+  ;; every scene, without its composition (not part of the body's layout)
+  (prn (mapv #(update % :scene dissoc :composition :apps :titles) (named-scenes)))
+
+  "--parity"
+  ;; the model's body glyphs, read out of its op list by the gate's span rule,
+  ;; against the hosted engine's (browser-flow-parity-v1.edn)
+  (let [contract (edn/read-string (str (.readFileSync fs (get args 1))))
+        diffs (for [{:keys [name scene bodies]} (:scenes contract)
+                    :let [mine (body-glyphs scene (frame scene))]
+                    id (keys bodies)
+                    :let [want (get bodies id) got (get mine id)]
+                    :when (not= want got)]
+                (let [i (count (take-while true? (map = want got)))]
+                  (str name " window " id " glyph " i ": hosted " (pr-str (get want i))
+                       " model " (pr-str (get got i)))))
+        n (reduce + (map (comp count :bodies) (:scenes contract)))]
+    (println (str "COMPARED\t" n))
+    (doseq [d diffs] (println "DIFFERS" d))
+    (.exit js/process (cond (zero? n) 2 (seq diffs) 1 :else 0)))
+
+  "--vectors"
+  ;; every success vector of browser-frame2-v1.edn: its seed decoded into a
+  ;; scene (surface words as the object's header lays them out) over its own
+  ;; fixture font, then `name count ops-hex`, one line each
+  (let [contract (edn/read-string (str (.readFileSync fs (get args 1))))]
+    (doseq [{:keys [name seed expect-memory]} (:vectors contract)
+            :when expect-memory
+            :let [surf (js/Buffer.alloc 8192)
+                  _ (doseq [{:keys [offset hex]} seed :when (< offset 8192)]
+                      (.copy (js/Buffer.from hex "hex") surf offset))
+                  _ (use-font! (js/Buffer.from (:hex (first (filter #(= 8192 (:offset %)) seed))) "hex"))
+                  w (fn [i] (.readUInt32LE surf (* 4 i)))
+                  run (fn [base n] (vec (take-while pos? (map #(w (+ base %)) (range n)))))
+                  n (w 1)
+                  stack (mapv (fn [k] (let [b (+ 5 (* 5 k)) id (w b)]
+                                        {:id id :x (w (+ b 1)) :y (w (+ b 2)) :w (w (+ b 3)) :h (w (+ b 4))
+                                         :scroll (if (<= 1 id 4) (w (+ 2039 id)) 0)
+                                         :title (run (+ 32 (* 32 (dec id))) 32)
+                                         :body (run (+ 160 (* 64 (dec id))) 64)}))
+                              (range n))
+                  scene {:vw (w 3) :vh (w 4) :focus (w 2) :stack stack
+                         :composition (into (mapv #(w (+ 446 %)) (range (w 445)))
+                                            (map #(w (+ 434 %)) (range (w 433))))
+                         :apps (w 31)
+                         :pointer (when (pos? (w 2046)) [(dec (w 2046)) (w 2047)])
+                         :selection [(w 2036) (w 2037)]
+                         :titles (into {} (map (fn [k] [k (run (+ 32 (* 32 (dec k))) 32)]) [1 2 3 4]))}
+                  ops (frame scene)]]
+      (println (subs (str name) 1) (count ops) (apply str (map op-hex ops)))))
+
+  "--ops"
+  (let [in (edn/read-string (str (.readFileSync fs (get args 1))))]
+    ;; one scene, or a vector of scenes: one line each
+    (doseq [scene (if (map? in) [in] in)
+            :let [ops (frame scene)]]
+      (println (count ops) (apply str (map op-hex ops)))))
+(let [results (for [{:keys [name pinned scene]} scenes
+                    :let [c (census (frame scene))]]
+                (do (println (str name " ops=" (:ops c) " text-px=" (:text-px c) " hash=" (:hash c)
+                                  (cond (nil? pinned) ""
+                                        (= pinned c) " pinned=reproduced"
+                                        :else (str " pinned=MISMATCH " pinned))))
+                    (or (nil? pinned) (= pinned c))))]
+  (when-not (every? true? (doall results)) (.exit js/process 1))
+  (let [cs (map-indexed (fn [i [ev scene]]
+                          (let [c (census (frame scene))]
+                            (println (str "loop-frame n=" (inc i) " " ev " ops=" (:ops c)
+                                          " text-px=" (:text-px c) " hash=" (:hash c)))
+                            c))
+                        loop-frames)
+        cs (vec cs)]
+    (println (str "loop frames=" (count cs) " ops=" (apply str (interpose "," (map :ops cs)))
+                  " chain=" (chain (map #(js/parseInt (:hash %) 16) cs))
+                  " last-px=" (:text-px (peek cs)) " last-hash=" (:hash (peek cs)))))
+  (let [cs (vec (map-indexed (fn [i [ev scene]]
+                               (let [ops (frame scene)
+                                     c (census ops)
+                                     [_ cx cy] (peek ops)]
+                                 (println (str "caret-frame n=" (inc i) " " ev " ops=" (:ops c)
+                                               " text-px=" (:text-px c) " hash=" (:hash c)
+                                               " caret=" cx "," cy))
+                                 c))
+                             caret-frames))]
+    (println (str "caret frames=" (count cs) " ops=" (apply str (interpose "," (map :ops cs)))
+                  " chain=" (chain (map #(js/parseInt (:hash %) 16) cs))
+                  " last-px=" (:text-px (peek cs)) " last-hash=" (:hash (peek cs)))))
+  (let [cs (vec (map-indexed (fn [i [ev scene]]
+                               (let [c (census (frame scene))]
+                                 (println (str "launch-frame n=" (inc i) " " ev " ops=" (:ops c)
+                                               " text-px=" (:text-px c) " hash=" (:hash c)))
+                                 c))
+                             launch-frames))]
+    (println (str "launch frames=" (count cs) " ops=" (apply str (interpose "," (map :ops cs)))
+                  " chain=" (chain (map #(js/parseInt (:hash %) 16) cs))
+                  " last-px=" (:text-px (peek cs)) " last-hash=" (:hash (peek cs)))))
+  (doseq [[i [ev scene]] (map-indexed vector dict-frames)
+          :let [c (census (frame scene))]]
+    (println (str "dict-frame n=" (inc i) " " ev " ops=" (:ops c)
+                  " text-px=" (:text-px c) " hash=" (:hash c))))
+  (let [cs (vec (map-indexed (fn [i [ev scene]]
+                               (let [c (census (frame scene))
+                                     [x y] (:pointer scene)]
+                                 (println (str "cursor-frame n=" (inc i) " " ev " at=" x "," y
+                                               " ops=" (:ops c) " text-px=" (:text-px c) " hash=" (:hash c)))
+                                 c))
+                             cursor-frames))]
+    (println (str "cursor frames=" (count cs) " ops=" (apply str (interpose "," (map :ops cs)))
+                  " chain=" (chain (map #(js/parseInt (:hash %) 16) cs))
+                  " last-px=" (:text-px (peek cs)) " last-hash=" (:hash (peek cs)))))
+  (let [cs (vec (map-indexed (fn [i [ev scene]]
+                               (let [c (census (frame scene))]
+                                 (println (str "focus-frame n=" (inc i) " " ev " focus=" (:focus scene)
+                                               " stack=" (apply str (map :id (:stack scene)))
+                                               " ops=" (:ops c) " text-px=" (:text-px c) " hash=" (:hash c)))
+                                 c))
+                             focus-frames))]
+    (println (str "focus frames=" (count cs) " ops=" (apply str (interpose "," (map :ops cs)))
+                  " chain=" (chain (map #(js/parseInt (:hash %) 16) cs))
+                  " last-px=" (:text-px (peek cs)) " last-hash=" (:hash (peek cs)))))
+  ;; ADR-0245: the titlebar census the kernel prints per focus frame -- the
+  ;; 28 px rects in the focused colour (#cccccc) and the others' (#e6e6e6), and
+  ;; the x,y of the first focused one (the focused window's x + 2, y). Counted from
+  ;; the model's own op list, not from the kernel's.
+  (doseq [[i [_ scene]] (map-indexed vector focus-frames)
+          :let [t (filter (fn [[k _ _ _ b _]] (and (= k :rect) (= b 28))) (frame scene))
+                act (filter #(= (nth % 5) 0xcccccc) t)
+                ina (filter #(= (nth % 5) 0xe6e6e6) t)]]
+    (println (str "title-frame n=" (inc i) " active=" (count act) " inactive=" (count ina)
+                  " at=" (second (first act)) "," (nth (first act) 2))))
+  ;; ADR-0246: the hover colour (#d9d9d9) rects counted in the model's own op
+  ;; list for the cursor, focus and scroll frames -- the kernel prints the
+  ;; same count beside each frame (AIUEOS_GUEST_BROWSER_HOT).
+  (doseq [[i [ev scene]] (map-indexed vector clock-frames)
+          :let [ops (frame scene)
+                c (census ops)]]
+    (println (str "clock-frame n=" (inc i) " " ev " status=" (if (:status scene) (inc (:status scene)) 0) " net=" (or (:net scene) 0)
+                  " ops=" (:ops c) " text-px=" (:text-px c) " hash=" (:hash c))))
+  (doseq [[i [ev scene]] (map-indexed vector edit-frames)
+          :let [ops (frame scene)
+                c (census ops)
+                w (first (:stack scene))
+                n (count (:body w))
+                [_ ci] (:caret scene)
+                rng (when-let [r (:range scene)] [(nth r 1) (nth r 2)])]]
+    (println (str "edit-frame n=" (inc i) " " ev " text=" (ed-text (:body w)) " caret=" (if (< ci n) ci n)
+                  " sel=" (if rng (str (first rng) "," (second rng)) "-")
+                  " ops=" (:ops c) " text-px=" (:text-px c) " hash=" (:hash c))))
+  (doseq [[i [ev scene layout]] (map-indexed vector layout-frames)
+          :let [ops (frame scene)
+                c (census ops)
+                w (first (:stack scene))
+                n (count (:body w))
+                [_ ci] (:caret scene)]]
+    (println (str "layout-frame n=" (inc i) " " ev " layout=" layout " text=" (ed-text (:body w))
+                  " caret=" (if (< ci n) ci n) " ops=" (:ops c) " text-px=" (:text-px c) " hash=" (:hash c))))
+  (doseq [[i [ev scene notes panel]] (map-indexed vector notify-frames)
+          :let [ops (frame scene)
+                c (census ops)]]
+    (println (str "notify-frame n=" (inc i) " " ev " notes=" notes " panel=" panel
+                  " ops=" (:ops c) " text-px=" (:text-px c) " hash=" (:hash c))))
+  (doseq [[i [ev scene]] (map-indexed vector passkey-frames)
+          :let [ops (frame scene)
+                c (census ops)]]
+    (println (str "passkey-frame n=" (inc i) " " ev " locked=" (if (:locked scene) 1 0) " denied=" (if (:denied scene) 1 0)
+                  " ops=" (:ops c) " text-px=" (:text-px c) " hash=" (:hash c))))
+  (doseq [[i [ev scene]] (map-indexed vector ring-frames)
+          :let [ops (frame scene)
+                c (census ops)
+                top (last (:stack scene))]]
+    (println (str "ring-frame n=" (inc i) " " ev " ring=" (:ring scene) " windows=" (count (:stack scene))
+                  " focus=" (:focus scene) " stack=" (apply str (map :id (:stack scene)))
+                  " min=" (reduce + (map #(bit-shift-left 1 (dec %)) (:minimized scene)))
+                  " top=" (:x top) "," (:y top) "," (:w top) "," (:h top)
+                  " ops=" (:ops c) " text-px=" (:text-px c) " hash=" (:hash c))))
+  (doseq [[i [ev scene]] (map-indexed vector scale-frames)
+          :let [ops (frame scene)
+                pct (:scale scene)
+                c (assoc (census (if (= pct 100) ops (scale-ops pct ops))) :ops (count ops))
+                w (first (:stack scene))]]
+    (println (str "scale-frame n=" (inc i) " " ev " pct=" pct " vw=" (:vw scene) " vh=" (:vh scene)
+                  " win=" (:x w) "," (:y w) "," (:w w) "," (:h w)
+                  " ops=" (:ops c) " text-px=" (:text-px c) " hash=" (:hash c))))
+  (doseq [[i [ev scene hc off]] (map-indexed vector settings-frames)
+          :let [ops (frame scene)
+                pct (or (:scale scene) 100)
+                c (assoc (census (if hc 0 ink) (if (= pct 100) ops (scale-ops pct ops))) :ops (count ops))]]
+    (println (str "settings-frame n=" (inc i) " " ev " hc=" (if hc 1 0) " pct=" pct " net=" (if off 1 0)
+                  " ops=" (:ops c) " text-px=" (:text-px c) " hash=" (:hash c))))
+  (doseq [[i [ev scene]] (map-indexed vector uiux-frames)
+          :let [ops (frame scene)
+                c (if (:hc scene) (census 0 ops) (census ops))]]
+    (println (str "uiux-frame n=" (inc i) " " ev " ops=" (:ops c) " text-px=" (:text-px c)
+                  " hash=" (:hash c) " " (hc-line (inc i) (:hc scene) ops))))
+  (doseq [[i [ev scene]] (map-indexed vector max-frames)
+          :let [ops (frame scene)
+                c (census ops)
+                w (first (filter #(= 1 (:id %)) (:stack scene)))
+                [px py] (:pointer scene)]]
+    (println (str "max-frame n=" (+ 19 i) " " ev " at=" px "," py
+                  " windows=" (count (:stack scene)) " focus=" (:focus scene)
+                  " stack=" (apply str (map :id (:stack scene)))
+                  " rect=" (:x w) "," (:y w) "," (:w w) "," (:h w)
+                  " ops=" (:ops c) " text-px=" (:text-px c) " hash=" (:hash c))))
+  (doseq [[i [ev scene]] (map-indexed vector max-frames)
+          :when (<= 16 i 41)
+          :let [ops (frame scene)
+                cnt (fn [a b col] (count (filter (fn [[k _ _ w h c]] (and (= k :rect) (= w a) (= h b) (= c col))) ops)))]]
+    (println (str "min-frame n=" (+ 19 i) " " ev
+                  " reg=" (reduce + (map #(bit-shift-left 1 (dec %)) (:minimized scene)))
+                  " minctl=" (cnt 8 2 0x595959) " dockbar=" (cnt 12 3 0x595959)
+                  " tray=" (count (filter (fn [[k _ _ w h _]] (and (= k :rect) (= w 120) (= h 24))) ops))
+                  " dis=" (count (filter (fn [[k _ _ _ _ c]] (and (= k :glyph) (= c 0x9e9e9e))) ops)))))
+  (doseq [[i [ev scene]] (map-indexed vector max-frames)
+          :when (>= i 42)
+          :let [ops (frame scene)
+                n (count (filter (fn [[k _ _ a b c]] (and (= k :rect) (= a 12) (= b 12) (= c 0xffffff))) ops))]]
+    (println (str "lock-frame n=" (+ 19 i) " " ev " locked=" (if (:locked scene) 1 0)
+                  " bars=" (count (filter (fn [[k _ _ _ b _]] (and (= k :rect) (= b 28))) ops))
+                  " dots=" n
+                  " denied=" (count (filter (fn [[k _ _ a b _]] (and (= k :rect) (= a 84) (= b 4))) ops)))))
+  (doseq [[i [ev scene]] (map-indexed vector max-frames)
+          :when (<= 14 i 41)
+          :let [ops (frame scene)
+                cnt #(count (filter (fn [[k _ _ _ _ c]] (and (= k :rect) (= c %))) ops))]]
+    (println (str "press-frame n=" (+ 19 i) " " ev " pressed=" (cnt 0xbfbfbf) " hot=" (cnt hot-colour))))
+  (doseq [[i [ev scene]] (map-indexed vector key-frames)
+          :let [ops (frame scene)
+                c (census ops)
+                hx #(.padStart (.toString % 16) 8 "0")
+                rings (filter (fn [[k _ _ _ _ col]] (and (= k :rect) (= col 0x1a56db))) ops)
+                face (first (filter (fn [[k _ _ a b _]] (and (= k :rect) (= a 96) (= b 24))) ops))
+                bar (first (filter (fn [[k _ _ _ b _]] (and (= k :rect) (= b 28))) ops))]]
+    (println (str "key-frame n=" (+ 5 i) " " ev " ring=" (or (:ring scene) 0)
+                  " windows=" (count (:stack scene)) " focus=" (:focus scene)
+                  " stack=" (apply str (map :id (:stack scene)))
+                  " rings=" (count rings)
+                  " at=" (if (seq rings) (str (second (first rings)) "," (nth (first rings) 2)) "0,0")
+                  " ringc=" (if (seq rings) (hx (nth (first rings) 5)) "00000000")
+                  " bar=" (hx (nth bar 5)) " face=" (hx (nth face 5))
+                  " ops=" (:ops c) " text-px=" (:text-px c) " hash=" (:hash c))))
+  (doseq [[stage frames] [["cursor" cursor-frames] ["focus" focus-frames] ["scroll" scroll-frames]]
+          [i [_ scene]] (map-indexed vector frames)]
+    (println (str "hot-frame stage=" stage " n=" (inc i) " hot="
+                  (count (filter (fn [[k _ _ _ _ c]] (and (= k :rect) (= c hot-colour))) (frame scene))))))
+  (let [cs (vec (map-indexed (fn [i [ev scene]]
+                               (let [c (census (frame scene))]
+                                 (println (str "scroll-frame n=" (inc i) " " ev
+                                               " scroll=" (:scroll (peek (:stack scene)))
+                                               " ops=" (:ops c) " text-px=" (:text-px c) " hash=" (:hash c)))
+                                 c))
+                             scroll-frames))]
+    (println (str "scroll frames=" (count cs) " ops=" (apply str (interpose "," (map :ops cs)))
+                  " chain=" (chain (map #(js/parseInt (:hash %) 16) cs))
+                  " last-px=" (:text-px (peek cs)) " last-hash=" (:hash (peek cs)))))
+  (let [cs (vec (map-indexed (fn [i [ev scene]]
+                               (let [ops (frame scene)
+                                     c (census ops)
+                                     h (census highlight ops)]
+                                 (println (str "selection-frame n=" (inc i) " " ev
+                                               " scroll=" (:scroll (peek (:stack scene)))
+                                               " sel=" (second (:selection scene))
+                                               " ops=" (:ops c) " text-px=" (:text-px c) " hash=" (:hash c)
+                                               " sel-px=" (:text-px h) " sel-hash=" (:hash h)))
+                                 (assoc c :sel h)))
+                             selection-frames))]
+    (println (str "selection frames=" (count cs) " ops=" (apply str (interpose "," (map :ops cs)))
+                  " chain=" (chain (map #(js/parseInt (:hash %) 16) cs))
+                  " sel-chain=" (chain (map #(js/parseInt (:hash (:sel %)) 16) cs))
+                  " last-px=" (:text-px (peek cs)) " last-hash=" (:hash (peek cs)))))
+  (let [cs (vec (map-indexed (fn [i [ev scene]]
+                               (let [ops (frame scene)
+                                     c (census ops)
+                                     h (census highlight ops)]
+                                 (println (str "clipboard-frame n=" (inc i) " " ev
+                                               " sel=" (second (:selection scene))
+                                               " body=" (count (:body (peek (:stack scene))))
+                                               " ops=" (:ops c) " text-px=" (:text-px c) " hash=" (:hash c)
+                                               " sel-px=" (:text-px h) " sel-hash=" (:hash h)))
+                                 (assoc c :sel h)))
+                             clipboard-frames))]
+    (println (str "clipboard frames=" (count cs) " ops=" (apply str (interpose "," (map :ops cs)))
+                  " chain=" (chain (map #(js/parseInt (:hash %) 16) cs))
+                  " sel-chain=" (chain (map #(js/parseInt (:hash (:sel %)) 16) cs))
+                  " last-px=" (:text-px (peek cs)) " last-hash=" (:hash (peek cs)))))
+  (let [{:keys [before frames]} damage-frames
+        rows (loop [prev (frame before) [[ev scene] & more] frames i 1 out []]
+               (if-not ev
+                 out
+                 (let [ops (frame scene)
+                       c (census ops)
+                       {:keys [d rect]} (damage prev ops 1280 800)
+                       pb (pixel-box prev ops 1280 800)
+                       [x y w h] rect
+                       inside? (or (nil? pb)
+                                   (let [[px py pw ph] pb]
+                                     (and (<= x px) (<= y py) (<= (+ px pw) (+ x w)) (<= (+ py ph) (+ y h)))))]
+                   (println (str "damage-frame n=" i " " ev " focus=" (:focus scene)
+                                 " ops=" (:ops c) " text-px=" (:text-px c) " hash=" (:hash c)
+                                 " slots=" d " damage=" (apply str (interpose "," rect))
+                                 " bytes=" (* 4 w h)
+                                 " pixels=" (if pb (apply str (interpose "," pb)) "none")
+                                 (if inside? "" " PIXELS-OUTSIDE-DAMAGE")))
+                   (recur ops more (inc i) (conj out (assoc c :rect rect :inside? inside?))))))]
+    (println (str "damage frames=" (count rows) " ops=" (apply str (interpose "," (map :ops rows)))
+                  " chain=" (chain (map #(js/parseInt (:hash %) 16) rows))
+                  " bytes=" (reduce + (map (fn [{[_ _ w h] :rect}] (* 4 w h)) rows))
+                  " full-bytes=" (* (count rows) 4 1280 800)))
+    (when-not (every? :inside? rows) (.exit js/process 1)))
+  (let [ops (frame flow-scene)
+        c (census ops)]
+    (println (str "flow ops=" (:ops c) " text-px=" (:text-px c) " hash=" (:hash c)
+                  " body-glyphs=" (apply str (interpose "," (map count (vals (body-glyphs flow-scene ops))))))))))

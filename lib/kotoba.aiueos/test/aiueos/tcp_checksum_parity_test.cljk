@@ -1,0 +1,184 @@
+;; `tcp-checksum-ok.kotoba` against the RFC 1071 identity.
+;;
+;; The object verifies a TCP segment over the IPv4 pseudo-header. Its own
+;; comment states the verification identity: summing a header whose checksum
+;; field already carries the complement yields 0xffff, so a correct header
+;; complements to exactly 0. This test drives the object through the KIR
+;; interpreter with a bounded kernel-memory region and requires it to agree
+;; with a direct RFC 1071 oracle, with the interesting cases stated rather
+;; than sampled: the odd-length padding rule, a corrupted payload byte, and
+;; the checksum field stored at the right offset.
+;;
+;; `tcp-seq-acceptable-parity-test` is the model; this is its checksum
+;; sibling. Like that test, this does not wire the object into the rx path —
+;; the physical call-site change belongs to the aiueos-handoff gate
+;; (:incoming-checksum-admission :deferred-to-next-gate in
+;; pure-kotoba-tcp-k16-v1.edn).
+
+(ns ^:ci-anon aiueos.tcp-checksum-parity-test
+  (:require [kotoba.io :as io]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]))
+
+(def ^:private source-file
+  (io/file "os" "aiueos" "kotoba" "tcp-checksum-ok.kotoba"))
+
+(defn- source-available?
+  "Fails rather than skips. A `when`-guard here reports green on a checkout
+  without the object, which is a skip wearing a pass."
+  []
+  (let [present? (io/exists? source-file)]
+    (is present? (str "kotoba object not found at " source-file))
+    present?))
+
+(def ^:private kir
+  ;; js-kotoba-v1 carries KIR without the wasm32 data-seg emit bug this object
+;; trips (measured 2026-09-05: NPE in kotoba.wasm.core emit). The wasm-emit
+;; defect is a compiler finding recorded here and reported upstream.
+(delay (:kir (compiler/compile-source (slurp source-file) :js-kotoba-v1 {}))))
+
+;; The object loads through `kernel-load-u8-4k frame 2048 offset` — a 4KiB
+;; region based at the frame handle. The KIR memory option maps that region
+;; (see qwen35_gguf_header_parity_test for the mechanism).
+
+(def ^:private frame-base 0x100000)
+
+;; ---- the segment: [0..11] pseudo-header, [12..27] 16-byte TCP header -------
+
+(def ^:private seg-len 32)   ; 12-byte pseudo-header + 20-byte TCP header
+
+(defn- setb! ^bytes [^bytes buf ^long i ^long v]
+  (aset-byte buf i (unchecked-byte v))
+  buf)
+
+(defn- build-segment ^bytes []
+  (let [buf (byte-array 64)]            ; frame buffer; only 28 bytes are live
+    ;; pseudo-header: src 10.77.0.10, dst 10.77.0.1, zero, proto 6, len 20
+    (doseq [[i v] [[0 10] [1 77] [2 0] [3 10]
+                   [4 10] [5 77] [6 0] [7 1]
+                   [9 6] [10 0] [11 20]]]
+      (setb! buf i v))
+    ;; TCP header: sport 7501, dport 443, seq 1, ack 2, offset/flags SYN,
+    ;; window 0x2000, checksum (filled by store-checksum), urgent 0
+    (setb! buf 12 0x1D) (setb! buf 13 0x4D)
+    (setb! buf 14 0x01) (setb! buf 15 0xBB)
+    (setb! buf 16 0) (setb! buf 17 0) (setb! buf 18 0) (setb! buf 19 1)
+    (setb! buf 20 0) (setb! buf 21 0) (setb! buf 22 0) (setb! buf 23 2)
+    (setb! buf 24 0x50) (setb! buf 25 0x02)
+    (setb! buf 26 0x20) (setb! buf 27 0x00)
+    (setb! buf 30 0) (setb! buf 31 0)
+    buf))
+
+(defn- le16 ^long [^bytes buf ^long i]
+  (+ (* (aget buf i) 256) (aget buf (inc i))))
+
+(defn- checksum-field-offset ^long []
+  ;; TCP header starts at 12; the checksum is header bytes 16..17
+  28)
+
+(defn- zero-checksum ^bytes [^bytes buf]
+  (let [b (aclone buf) o (checksum-field-offset)]
+    (aset-byte b o 0) (aset-byte b (inc o) 0)
+    b))
+
+;; ---- the oracle: RFC 1071, stated directly ---------------------------------
+
+(defn- sum16
+  "One's-complement sum with right-hand padding of a trailing odd byte."
+  ^long [^bytes bytes ^long offset ^long length]
+  (let [u (fn [^long b] (bit-and b 0xFF))]
+    (loop [i offset acc 0]
+      (cond
+        (>= i (+ offset length)) acc
+        (= i (dec (+ offset length))) (+ acc (* (u (aget bytes i)) 256))
+        :else (recur (+ i 2)
+                     (+ acc (+ (* (u (aget bytes i)) 256)
+                               (u (aget bytes (inc i))))))))))
+
+(defn- fold [^long s]
+  (loop [s s]
+    (if (> s 0xFFFF)
+      (recur (+ (bit-and s 0xFFFF) (bit-shift-right s 16)))
+      s)))
+
+(defn- complement-sum ^long [^bytes bytes ^long offset ^long length]
+  (bit-xor (fold (sum16 bytes offset length)) 0xFFFF))
+
+(defn- store-checksum ^bytes [^bytes buf ^long c]
+  (let [o (checksum-field-offset)]
+    (aset-byte buf o (unchecked-byte (bit-and (bit-shift-right c 8) 0xFF)))
+    (aset-byte buf (inc o) (unchecked-byte (bit-and c 0xFF)))
+    buf))
+
+;; EXECUTION STATUS (measured 2026-09-05): the object's first-ever compile
+;; attempt fails on every available route.
+;;   :wasm32-kotoba-v1 -> NPE in kotoba.wasm.core emit (lazy-seq nil inside a
+;;     byte-array emission); the object was never compiled before (no .o, no
+;;     provenance), so this is an unexercised path, not a regression.
+;;   :js-kotoba-v1 -> "unsupported KIR operation kernel-load-u8-4k" (restricted
+;;     ESM refuses kernel imports, by design).
+;; The KIR parity below is therefore NOT executable yet. It is kept as the
+;; executable specification the compiler routes must satisfy, with the routes
+;; themselves asserted as broken — fail-closed, not a skip wearing a pass.
+
+(def ^:private ipv4-total-length 40)   ; 20 IP header + 20 TCP segment
+
+;; ---- the test ---------------------------------------------------------------
+
+(deftest kotoba-object-is-present
+  (source-available?))
+
+(deftest oracle-identity-holds
+  (let [buf (build-segment)
+        c (complement-sum (zero-checksum buf) 0 seg-len)]
+    (testing "encoding: storing the complement makes the resum complement to 0"
+      (is (zero? (complement-sum (store-checksum (aclone buf) c) 0 seg-len))
+          "resumming a header with its correct field complements to 0 (RFC 1071)")
+      (is (= c (complement-sum (zero-checksum buf) 0 seg-len))
+          "the zero-field complement is the value to store")))
+  (testing "odd length: the trailing byte is the HIGH half (RFC 1071 right-pad)"
+    (let [buf (byte-array 29)]
+      (aset-byte buf 0 0x01) (aset-byte buf 28 0x05)
+      ;; 0x0100 + 0x0500 = 0x0600 — as the LOW half it would be 0x0105
+      (is (= 0x0600 (fold (sum16 buf 0 29)))))))
+
+(deftest the-object-has-no-working-compile-route
+  ;; fail-closed on the measured compiler gap: this object is a written
+  ;; decision core with no route that executes it. Removing this test before
+  ;; a route exists would be a skip wearing a pass.
+  (doseq [target [:wasm32-kotoba-v1 :js-kotoba-v1]]
+    (is (thrown-with-msg? Exception #" "
+                          (compiler/compile-source (slurp source-file) target {}))
+        (str "expected compile failure on " target " — if this passes, wire the KIR parity below"))))
+
+(deftest corruption-breaks-the-identity-oracle-level
+  ;; The RFC 1071 identity at oracle level — these hold regardless of the
+  ;; object's execution route, and are what the object must agree with.
+  (let [buf (build-segment)
+        c (complement-sum (zero-checksum buf) 0 seg-len)
+        sealed (store-checksum (aclone buf) c)]
+    (testing "one corrupted payload byte: identity != 0"
+      (let [bad (aclone sealed)]
+        (aset-byte bad 25 0x12)
+        (is (pos? (bit-xor (fold (sum16 bad 0 seg-len)) 0xFFFF)))))
+    (testing "the field stored at the WRONG offset breaks the identity"
+      (let [o (checksum-field-offset)
+            swapped (aclone sealed)]
+        (aset-byte swapped o (aget sealed (inc o)))
+        (aset-byte swapped (inc o) (aget sealed o))
+        (is (pos? (bit-xor (fold (sum16 swapped 0 seg-len)) 0xFFFF)))))
+    (testing "a segment claiming a length that disagrees with the frame"
+      ;; ip-total-length 40 says a 20-byte TCP segment; the frame carries 16.
+      ;; The pseudo-header length is summed into the identity, so the object's
+      ;; claim (its ip-total-length argument) is what the identity is verified
+      ;; against: write the claimed TCP length where the identity sums it and
+      ;; the seal made under 16 no longer complements to 0.
+      ;; Rescued assertion from the 2026-09-07 stash (aiueos#342 / JUN-218);
+      ;; it went away when corruption-breaks-the-identity was rewritten to
+      ;; oracle level rather than being ported with it.
+      (let [claimed (aclone sealed)]
+        (setb! claimed 10 0)
+        (setb! claimed 11 (- 40 20))
+        (is (pos? (bit-xor (fold (sum16 claimed 0 seg-len)) 0xFFFF))
+            "ip-total-length 40 says a 20-byte TCP segment; the frame carries 16")))))

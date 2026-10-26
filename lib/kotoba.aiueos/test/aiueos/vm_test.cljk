@@ -1,0 +1,245 @@
+(ns aiueos.vm-test
+  (:require [aiueos.vm :as vm]
+            [kotoba.test :refer [deftest is testing]]))
+
+(deftest plan-defaults
+  (let [p (vm/plan {:kernel "Image" :initramfs "init.cpio.gz"})]
+    (is (= "1024M" (:memory p)))
+    (is (= "2" (:cpus p)))
+    (is (= "console=ttyAMA0 panic=0 rdinit=/init" (:cmdline p)))
+    (is (= "none" (:graphics p)))
+    (is (= "none" (:display p)))
+    (is (= "pl011" (:console p)))
+    (is (= "qemu-system-aarch64" (:qemu-binary p)))))
+
+(deftest x86-profile-has-q35-and-serial-console
+  (let [p (vm/plan {:kernel "bzImage" :initramfs "init.cpio.gz" :arch "x86_64" :accel "tcg"})
+        a (vm/argv p)]
+    (is (= "qemu-system-x86_64" (:qemu-binary p)))
+    (is (= "console=ttyS0 panic=0 rdinit=/init" (:cmdline p)))
+    (is (some #{"q35,accel=tcg"} a))))
+
+(deftest plan-requires-kernel-and-initramfs
+  (is (thrown? #?(:clj Exception :cljs js/Error) (vm/plan {:initramfs "init.cpio.gz"})))
+  (is (thrown? #?(:clj Exception :cljs js/Error) (vm/plan {:kernel "Image"}))))
+
+(deftest plan-virtio-gpu-defaults-display-to-cocoa
+  (let [p (vm/plan {:kernel "Image" :initramfs "init.cpio.gz" :graphics "virtio-gpu"})]
+    (is (= "cocoa" (:display p)))))
+
+(deftest plan-rejects-unknown-graphics-and-console
+  (is (thrown? #?(:clj Exception :cljs js/Error)
+               (vm/plan {:kernel "Image" :initramfs "init.cpio.gz" :graphics "vga"})))
+  (is (thrown? #?(:clj Exception :cljs js/Error)
+               (vm/plan {:kernel "Image" :initramfs "init.cpio.gz" :console "serial0"}))))
+
+(deftest plan-rejects-display-without-virtio-gpu
+  (is (thrown? #?(:clj Exception :cljs js/Error)
+               (vm/plan {:kernel "Image" :initramfs "init.cpio.gz" :display "cocoa"}))))
+
+(deftest argv-shape-minimal
+  ;; `:accel` is PINNED here rather than left at the "auto" default.
+  ;;
+  ;; The previous version of this test derived the `-machine` string from
+  ;; `(#'vm/accel-name p)` -- which resolves "auto" from the host OS -- while
+  ;; hardcoding `-cpu host` next to it. That pair only holds on a host whose
+  ;; auto-accel is NOT tcg, so it asserted a property of the machine running
+  ;; it. On ClojureScript, where "auto" falls through to tcg, the very same
+  ;; expression produced `-cpu max` and the test failed for a reason that had
+  ;; nothing to do with the argv shape. The accel -> cpu rule it was half
+  ;; checking is now checked directly, in both directions, below.
+  (let [p (vm/plan {:kernel "Image" :initramfs "init.cpio.gz" :accel "hvf"})]
+    (is (= ["qemu-system-aarch64" "-machine" "virt,accel=hvf" "-cpu" "host"
+            "-smp" "2" "-m" "1024M" "-nographic"
+            "-kernel" "Image" "-initrd" "init.cpio.gz"
+            "-append" "console=ttyAMA0 panic=0 rdinit=/init"]
+           (vm/argv p)))))
+
+(deftest cpu-model-follows-the-accelerator
+  (let [cpu-of (fn [accel]
+                 (nth (vm/argv (vm/plan {:kernel "Image" :initramfs "init.cpio.gz"
+                                         :accel accel}))
+                      4))]
+    (testing "pure emulation cannot pass the physical CPU through"
+      (is (= "max" (cpu-of "tcg"))))
+    (testing "a hardware accelerator does"
+      (doseq [accel ["hvf" "kvm" "kvm:tcg"]]
+        (is (= "host" (cpu-of accel)) accel)))
+    (testing "the argv position asserted above really is -cpu's value"
+      (is (= "-cpu" (nth (vm/argv (vm/plan {:kernel "Image" :initramfs "init.cpio.gz"}))
+                         3))))))
+
+(deftest argv-with-virtio-gpu-block-and-console
+  (let [p (vm/plan {:kernel "Image" :initramfs "init.cpio.gz" :graphics "virtio-gpu"
+                     :block "disk.raw" :console "virtio-console" :console-socket "c.sock"})
+        a (vm/argv p)]
+    (testing "virtio-gpu device + display, not -nographic"
+      (is (some #(= "virtio-gpu-pci" %) a))
+      (is (not (some #(= "-nographic" %) a))))
+    (testing "virtio-blk drive + device"
+      (is (some #(= "file=disk.raw,if=none,format=raw,id=aiueosblk" %) a))
+      (is (some #(= "virtio-blk-pci,drive=aiueosblk" %) a)))
+    (testing "virtio-console chardev + device"
+      (is (some #(= "socket,id=aiueoscon,path=c.sock,server=on,wait=off" %) a))
+      (is (some #(= "virtconsole,chardev=aiueoscon,name=aiueos.console.0" %) a)))))
+
+(deftest command-line-quotes-multi-word-args
+  (is (re-find #"\"console=ttyAMA0 panic=0 rdinit=/init\"" (vm/command-line (vm/plan {:kernel "Image" :initramfs "i.gz"})))))
+
+#?(:clj
+   (deftest boot-throws-on-nonzero-exit
+     (testing "qemu-binary overridden to a command guaranteed to fail fast"
+       (let [kernel (java.io.File/createTempFile "kernel" "")
+             initrd (java.io.File/createTempFile "initrd" "")]
+         (try
+           (is (thrown? Exception
+                        (vm/boot! (assoc (vm/plan {:kernel (.getPath kernel)
+                                                   :initramfs (.getPath initrd)})
+                                         :qemu-binary "false"))))
+           (finally (.delete kernel) (.delete initrd)))))))
+
+;; ── the launcher refuses artifacts a signed manifest does not name ─────────
+
+#?(:clj
+   (defn- artifact-file! [content]
+     (let [f (java.io.File/createTempFile "aiueos-vm-artifact" ".bin")]
+       (.deleteOnExit f)
+       (spit f content)
+       f)))
+
+#?(:clj
+   (defn- signed-release [kernel-digest initramfs-digest]
+     {:manifest-id "release-42" :sequence 42 :timestamp-ms 1000
+      :signatures [{:key-id "k1" :verified? true :status-index 0}
+                   {:key-id "k2" :verified? true :status-index 1}]
+      :artifacts [{:kind :kernel :sha256 kernel-digest}
+                  {:kind :initramfs :sha256 initramfs-digest}]}))
+
+#?(:clj
+   (def publisher-state
+     {:now-ms 1000 :root {:keys #{"k1" "k2"} :threshold 2} :revocation-bits [0 0 0 0]}))
+
+#?(:clj
+   (deftest a-boot-with-no-release-records-that-it-was-not-checked
+     (let [k (artifact-file! "kernel") i (artifact-file! "initramfs")
+           p (vm/validate-boot-inputs!
+              (vm/plan {:kernel (.getPath k) :initramfs (.getPath i)}))]
+       (is (false? (:aiueos.boot/verified? p))
+           "unverified is written down, not inferred from the absence of a complaint"))))
+
+#?(:clj
+   (deftest artifacts-that-match-the-manifest-boot-and-the-plan-says-so
+     (let [k (artifact-file! "kernel") i (artifact-file! "initramfs")
+           measured (vm/measure-artifacts {:kernel (.getPath k) :initramfs (.getPath i)})
+           p (vm/validate-boot-inputs!
+              (vm/plan {:kernel (.getPath k) :initramfs (.getPath i)
+                        :release (signed-release (:kernel measured) (:initramfs measured))
+                        :publisher-state publisher-state}))]
+       (is (true? (:aiueos.boot/verified? p)))
+       (is (= "release-42" (:aiueos.boot/release-id p)))
+       (is (= measured (:aiueos.boot/observed p))))))
+
+#?(:clj
+   (deftest an-initramfs-changed-after-signing-never-reaches-qemu
+     (let [k (artifact-file! "kernel") i (artifact-file! "initramfs")
+           measured (vm/measure-artifacts {:kernel (.getPath k) :initramfs (.getPath i)})
+           release (signed-release (:kernel measured) (:initramfs measured))]
+       (spit i "initramfs-with-something-extra")
+       (is (thrown-with-msg?
+            Exception #"refusing to boot: artifact-digest-mismatch"
+            (vm/validate-boot-inputs!
+             (vm/plan {:kernel (.getPath k) :initramfs (.getPath i)
+                       :release release :publisher-state publisher-state})))))))
+
+#?(:clj
+   (deftest an-unsigned-release-never-reaches-qemu
+     (let [k (artifact-file! "kernel") i (artifact-file! "initramfs")
+           measured (vm/measure-artifacts {:kernel (.getPath k) :initramfs (.getPath i)})]
+       (is (thrown-with-msg?
+            Exception #"refusing to boot: no-signatures"
+            (vm/validate-boot-inputs!
+             (vm/plan {:kernel (.getPath k) :initramfs (.getPath i)
+                       :release (assoc (signed-release (:kernel measured) (:initramfs measured))
+                                       :signatures [])
+                       :publisher-state publisher-state})))))))
+
+;; ── the host declares the profile it is launching under (ADR-0069) ────────
+
+#?(:clj
+   (deftest a-production-launch-refuses-an-unverified-artifact
+     (let [k (artifact-file! "kernel") i (artifact-file! "initramfs")]
+       (doseq [profile [:sensitive-local :regulated]]
+         (testing (name profile)
+           (is (thrown-with-msg?
+                Exception #"requires a signed release to verify against"
+                (vm/validate-boot-inputs!
+                 (vm/plan {:kernel (.getPath k) :initramfs (.getPath i)
+                           :deployment-profile profile})))))))))
+
+#?(:clj
+   (deftest research-launches-unverified-and-says-so
+     (let [k (artifact-file! "kernel") i (artifact-file! "initramfs")
+           p (vm/validate-boot-inputs!
+              (vm/plan {:kernel (.getPath k) :initramfs (.getPath i)
+                        :deployment-profile :research}))]
+       (is (false? (:aiueos.boot/verified? p))
+           "unchanged for development: recorded, not refused"))))
+
+#?(:clj
+   (deftest a-production-launch-with-a-matching-release-proceeds
+     (let [k (artifact-file! "kernel") i (artifact-file! "initramfs")
+           measured (vm/measure-artifacts {:kernel (.getPath k) :initramfs (.getPath i)})
+           p (vm/validate-boot-inputs!
+              (vm/plan {:kernel (.getPath k) :initramfs (.getPath i)
+                        :deployment-profile :regulated
+                        :release (signed-release (:kernel measured) (:initramfs measured))
+                        :publisher-state publisher-state}))]
+       (is (true? (:aiueos.boot/verified? p)))
+       (is (= :regulated (:deployment-profile p))
+           "the plan carries the profile it was launched under, so a receipt can
+            say which rule was in force"))))
+
+#?(:clj
+   (deftest a-launcher-weaker-than-the-image-refuses
+     (let [k (artifact-file! "kernel") i (artifact-file! "initramfs")]
+       (is (thrown-with-msg?
+            Exception #"the image declares regulated"
+            (vm/validate-boot-inputs!
+             (vm/plan {:kernel (.getPath k) :initramfs (.getPath i)
+                       :deployment-profile :research
+                       :image-profile :regulated})))))))
+
+#?(:clj
+   (deftest a-launcher-stricter-than-the-image-proceeds
+     (let [k (artifact-file! "kernel") i (artifact-file! "initramfs")
+           measured (vm/measure-artifacts {:kernel (.getPath k) :initramfs (.getPath i)})
+           p (vm/validate-boot-inputs!
+              (vm/plan {:kernel (.getPath k) :initramfs (.getPath i)
+                        :deployment-profile :regulated
+                        :image-profile :research
+                        :release (signed-release (:kernel measured) (:initramfs measured))
+                        :publisher-state publisher-state}))]
+       (is (true? (:aiueos.boot/verified? p))
+           "verifying more than the image asked for costs nothing"))))
+
+#?(:clj
+   (deftest a-verified-launch-tells-the-guest-on-the-command-line
+     (let [k (artifact-file! "kernel") i (artifact-file! "initramfs")
+           measured (vm/measure-artifacts {:kernel (.getPath k) :initramfs (.getPath i)})
+           p (vm/validate-boot-inputs!
+              (vm/plan {:kernel (.getPath k) :initramfs (.getPath i)
+                        :release (signed-release (:kernel measured) (:initramfs measured))
+                        :publisher-state publisher-state}))
+           cmdline (vm/cmdline-with-evidence p)]
+       (is (.contains ^String cmdline "aiueos.boot.verified=release-42"))
+       (is (some #(and (string? %) (.contains ^String % "aiueos.boot.verified=release-42")) (vm/argv p))
+           "and it reaches the actual QEMU arguments, not just a helper"))))
+
+#?(:clj
+   (deftest an-unverified-launch-claims-nothing
+     (let [k (artifact-file! "kernel") i (artifact-file! "initramfs")
+           p (vm/validate-boot-inputs!
+              (vm/plan {:kernel (.getPath k) :initramfs (.getPath i)}))]
+       (is (not (.contains ^String (vm/cmdline-with-evidence p) "aiueos.boot.verified"))
+           "silence rather than an empty claim: a guest reading this must not
+            find a key with nothing after it and call that a verification"))))

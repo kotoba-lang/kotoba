@@ -1,0 +1,1164 @@
+(ns aiueos.native.kernel
+  ;; The live root links main and the explicit vector-6 callback. Namespace
+  ;; exports are linker interfaces; only the selected image root owns the
+  ;; actual boot/interrupt ABI entries.
+  (:require [native.watchdog :as watchdog]
+             [native.rtl8125 :as rtl]
+            [native.serial :as serial]
+            [native.tcp-stream :as stream]
+            [native.debug-link :as debug])
+  (:export [main aiueos-isr-6]))
+
+;; Gate N2 (ADR-0134): the persistent TCP byte stream runtime profile links
+;; into the same closed module graph as the diagnostics profile. `main` still
+;; runs only rtl/qualify -- the diagnostics path is byte-identical in behavior
+;; -- but the stream profile's module (its RX ring re-layout, bounded TCB,
+;; ESTABLISHED-state receive and the org-ietf-tcp seq/reassemble cores) is
+;; compiled, linked and receipt-recorded in every N2-era artifact. The
+;; physical tranche wires its entry into the post-qualification flow.
+
+;; The compiler-emitted loader keeps the final UEFI memory map in a bounded
+;; region directly after the 160-byte boot-info prefix. The kernel derives that
+;; region; it never turns the pointer stored by firmware into authority.
+(defn dump-bus3-ip-header [win mmio log-frame bus3-dma index]
+  ;; DD <byte> for offsets 14..33 of the last bus3 frame: the whole IPv4 header
+  ;; as it sits in the buffer the NIC transmitted from. One DD per byte, the
+  ;; shape lang-h9b requires, because any of these bytes can be a sentinel.
+  (if (> index 33)
+    1
+    (let [mark (stream/stream-log win mmio log-frame 221)
+          b (stream/stream-log win mmio log-frame
+                               (+ (debug/debug-frame-byte bus3-dma index)
+                                  (* 0 mark)))]
+      (+ (dump-bus3-ip-header win mmio log-frame bus3-dma (+ index 1))
+         (* 0 b)))))
+
+(defn load64 [base length offset]
+  (+ (kernel-load-u8-16k base length offset)
+     (* (kernel-load-u8-16k base length (+ offset 1)) 256)
+     (* (kernel-load-u8-16k base length (+ offset 2)) 65536)
+     (* (kernel-load-u8-16k base length (+ offset 3)) 16777216)
+     (* (kernel-load-u8-16k base length (+ offset 4)) 4294967296)
+     (* (kernel-load-u8-16k base length (+ offset 5)) 1099511627776)
+     (* (kernel-load-u8-16k base length (+ offset 6)) 281474976710656)
+     (* (kernel-load-u8-16k base length (+ offset 7)) 72057594037927936)))
+
+(defn load64-boot-far [boot boot-length offset]
+  ;; Boot-info v5 has a160-byte header, followed by the16KiB map. Pass the
+  ;; original region length explicitly; a loaded address grants no authority.
+  (let [window (kernel-subregion boot boot-length 160 16384)]
+    (load64 window 16384 offset)))
+
+(defn allow-loader-exec [pd loader-text]
+  (let [index (quot loader-text 2097152)]
+    (if (and (> loader-text 0) (< index 512))
+      (let [value (+ (* index 2097152) 131)]
+        (if (= (store64-page pd (* index 8) value) 1) 1 0))
+      1)))
+
+(defn load64-boot [base length offset]
+  (let [header (kernel-subregion base length 0 160)]
+    (kernel-load-u64 header 160 offset)))
+
+(defn load32-boot [base length offset]
+  (let [header (kernel-subregion base length 0 160)]
+    (kernel-load-u32 header 160 offset)))
+
+;; Keep only one effectful write live at a time.  This uses less sealed fuel
+;; than retaining sixteen store results and reducing them after the writes.
+;; The store proves the byte writable (an out-of-range store traps); it does
+;; NOT prove it zero -- a kernel store returns its operand, so `(= stored 0)`
+;; here was a tautology (lang-h13). The byte is not read back per iteration:
+;; that is one extra load for every byte of every page against the sealed
+;; fuel budget, and the publication gates read the pages they depend on.
+(defn zero-page [page offset]
+  (if (= offset 4096)
+    1
+    (let [stored (kernel-store-u8-4k page 4096 offset 0)]
+      (if (= 0 (* 0 stored))
+        (zero-page page (+ offset 1))
+        0))))
+
+;; One byte per bounded allocator slot is deliberately simple: zero means
+;; free, one means owned.  The state lives in an allocator page rather than in
+;; transient scalar control flow, so later claims observe earlier decisions.
+(defn claim-slot [state slot]
+  (if (= (kernel-load-u8-4k state 4096 slot) 0)
+    (let [claimed (kernel-store-u8-4k state 4096 slot 1)]
+      (if (= (+ (kernel-load-u8-4k state 4096 slot) (* 0 claimed)) 1) 1 0))
+    0))
+
+(defn release-slot [state slot]
+  (if (= (kernel-load-u8-4k state 4096 slot) 1)
+    (let [released (kernel-store-u8-4k state 4096 slot 0)]
+      (if (= (+ (kernel-load-u8-4k state 4096 slot) (* 0 released)) 0) 1 0))
+    0))
+
+(defn load64-page [page offset]
+  (+ (kernel-load-u8-4k page 4096 offset)
+     (* (kernel-load-u8-4k page 4096 (+ offset 1)) 256)
+     (* (kernel-load-u8-4k page 4096 (+ offset 2)) 65536)
+     (* (kernel-load-u8-4k page 4096 (+ offset 3)) 16777216)
+     (* (kernel-load-u8-4k page 4096 (+ offset 4)) 4294967296)
+     (* (kernel-load-u8-4k page 4096 (+ offset 5)) 1099511627776)
+     (* (kernel-load-u8-4k page 4096 (+ offset 6)) 281474976710656)
+     (* (kernel-load-u8-4k page 4096 (+ offset 7)) 72057594037927936)))
+
+;; Page-table entries are little-endian u64 values.  Keeping this in Kotoba
+;; avoids introducing a C helper or widening the privileged intrinsic surface.
+(defn store64-page [page offset value]
+  (let [s0 (kernel-store-u8-4k page 4096 offset (bit-and value 255))
+        s1 (kernel-store-u8-4k page 4096 (+ offset 1) (bit-and (quot value 256) 255))
+        s2 (kernel-store-u8-4k page 4096 (+ offset 2) (bit-and (quot value 65536) 255))
+        s3 (kernel-store-u8-4k page 4096 (+ offset 3) (bit-and (quot value 16777216) 255))
+        s4 (kernel-store-u8-4k page 4096 (+ offset 4) (bit-and (quot value 4294967296) 255))
+        s5 (kernel-store-u8-4k page 4096 (+ offset 5) (bit-and (quot value 1099511627776) 255))
+        s6 (kernel-store-u8-4k page 4096 (+ offset 6) (bit-and (quot value 281474976710656) 255))
+        s7 (kernel-store-u8-4k page 4096 (+ offset 7) (bit-and (quot value 72057594037927936) 255))]
+    (if (= (load64-page page offset) value)
+      (+ 1 (* 0 (+ s0 s1 s2 s3 s4 s5 s6 s7)))
+      0)))
+
+;; NX lives in byte 7, so it is installed without pretending signed i64
+;; literals are unsigned page-table entries.
+(defn store64-nx-page [page offset value]
+  (if (and (= (store64-page page offset value) 1)
+           (= 0 (* 0 (kernel-store-u8-4k page 4096 (+ offset 7) 128)))
+           (= (kernel-load-u8-4k page 4096 (+ offset 7)) 128))
+    1
+    0))
+
+;; PDE 0 points to a 4 KiB PT.  The remaining 2 MiB leaves preserve the first
+;; GiB identity map but are RW+NX rather than executable.
+(defn fill-identity-pd [page index]
+  (if (= index 512)
+    1
+    (let [value (+ (* index 2097152) 131)]
+      (if (= (store64-nx-page page (* index 8) value) 1)
+        (fill-identity-pd page (+ index 1))
+        0))))
+
+(defn fill-low-pt [page index rx-limit rw-start]
+  (if (= index 512)
+    1
+    (let [physical (* index 4096)
+          offset (* index 8)
+          stored (if (= index 256)
+                   (store64-page page offset 0)
+                   (if (and (>= physical 1052672) (< physical rx-limit))
+                     (store64-page page offset (+ physical 1))
+                     (if (and (>= physical rx-limit) (< physical rw-start))
+                       (store64-page page offset 0)
+                       (store64-nx-page page offset (+ physical 3)))))]
+      (if (= stored 1)
+        (fill-low-pt page (+ index 1) rx-limit rw-start)
+        0))))
+
+(defn five-distinct [a b c d e]
+  (and (> a 0) (> b 0) (> c 0) (> d 0) (> e 0)
+       ;; AllocateAnyPages may legally place loader-owned scratch above the
+       ;; first GiB. Keep the same 512 GiB physical-authority ceiling enforced
+       ;; by main and kernel-subregion instead of retaining the old low-RAM
+       ;; conventional-memory scan limit.
+       (< e 549755813888)
+       (not (= a b)) (not (= a c)) (not (= a d)) (not (= a e))
+       (not (= b c)) (not (= b d)) (not (= b e))
+       (not (= c d)) (not (= c e)) (not (= d e))))
+
+(defn zero-five-status [state pml4 pdpt pd pt]
+  (if (not (= (zero-page state 0) 1)) 30
+    ;; UNREACHABLE, and so are 30 and 32-34 below. `zero-page` cannot return
+    ;; anything but 1: its failure branch is guarded by `(= 0 (* 0 stored))`,
+    ;; which is true for every value of `stored`. The same shape makes 25-27
+    ;; in prepare-extra-pages and 79-84 in prepare-nic-pages unreachable.
+    ;;
+    ;; Nor could it be otherwise. `kernel-store-u8-4k` returns its operand, so
+    ;; there is no failure value to test, and an out-of-range offset does not
+    ;; return at all -- the emitter compares the declared length against the
+    ;; op's profile maximum and falls through to UD2.
+    ;;
+    ;; The real check is the readback immediately below (35-39), which loads
+    ;; the last byte and compares it. That one can fail and says so.
+    ;;
+    ;; Left in place rather than deleted: removing them renumbers a status
+    ;; vocabulary that receipts and ADRs already quote. Marked instead, so the
+    ;; next reader does not spend a run waiting for a code that cannot arrive
+    ;; -- which is what happened here on 2026-09-09, when exit 63 was
+    ;; attributed to this branch and a label was put on it.
+    (if (not (= (zero-page pml4 0) 1)) 31
+      (if (not (= (zero-page pdpt 0) 1)) 32
+        (if (not (= (zero-page pd 0) 1)) 33
+          (if (not (= (zero-page pt 0) 1)) 34
+            (if (not (= (kernel-load-u8-4k state 4096 4095) 0)) 35
+              (if (not (= (kernel-load-u8-4k pml4 4096 4095) 0)) 36
+                (if (not (= (kernel-load-u8-4k pdpt 4096 4095) 0)) 37
+                  (if (not (= (kernel-load-u8-4k pd 4096 4095) 0)) 38
+                    (if (= (kernel-load-u8-4k pt 4096 4095) 0) 0 39)))))))))))
+
+(defn claim-eight-status [state]
+  ;; 71 ("the store did not return 1") was unreachable: a store returns its
+  ;; operand (lang-h13). 72 -- the slot does not read back as 1 -- is the check.
+  (if (not (= (kernel-load-u8-4k state 4096 0) 0)) 70
+    (let [claimed (kernel-store-u8-4k state 4096 0 1)]
+      (if (not (= (+ (kernel-load-u8-4k state 4096 0) (* 0 claimed)) 1)) 72
+        (if (not (= (claim-slot state 1) 1)) 51
+          (if (not (= (claim-slot state 2) 1)) 52
+            (if (not (= (claim-slot state 3) 1)) 53
+              (if (not (= (claim-slot state 4) 1)) 54
+                (if (not (= (claim-slot state 5) 1)) 55
+                  (if (not (= (claim-slot state 6) 1)) 56
+                    (if (= (claim-slot state 7) 1) 0 57)))))))))))
+
+(defn reclaim-status [state]
+  (if (not (= (claim-slot state 1) 0)) 58
+    (if (not (= (release-slot state 4) 1)) 59
+      (if (not (= (release-slot state 4) 0)) 60
+        (if (= (claim-slot state 4) 1) 0 61)))))
+
+(defn ownership-read-status [state]
+  (if (not (= (kernel-load-u8-4k state 4096 0) 1)) 62
+    (if (not (= (kernel-load-u8-4k state 4096 1) 1)) 63
+      (if (not (= (kernel-load-u8-4k state 4096 2) 1)) 64
+        (if (not (= (kernel-load-u8-4k state 4096 3) 1)) 65
+          (if (not (= (kernel-load-u8-4k state 4096 4) 1)) 66
+            (if (not (= (kernel-load-u8-4k state 4096 5) 1)) 67
+              (if (not (= (kernel-load-u8-4k state 4096 6) 1)) 68
+                (if (= (kernel-load-u8-4k state 4096 7) 1) 0 69)))))))))
+
+(defn ownership-eight-status [state]
+  (let [claim-status (claim-eight-status state)]
+    (if (not (= claim-status 0))
+      claim-status
+      (let [reuse-status (reclaim-status state)]
+        (if (not (= reuse-status 0))
+          reuse-status
+          (ownership-read-status state))))))
+
+(defn prepare-owned-pages [state pml4 pdpt pd pt]
+  (if (= state 0) 40
+    (if (= pml4 0) 41
+      (if (= pdpt 0) 42
+        (if (= pd 0) 43
+          (if (= pt 0) 44
+            (let [zero-status (zero-five-status state pml4 pdpt pd pt)]
+              (if (not (= zero-status 0))
+                zero-status
+                (ownership-eight-status state)))))))))
+
+(defn prepare-extra-pages [reusable-page frame-page stack-page]
+  (if (not (= (zero-page reusable-page 0) 1))
+    25
+    (if (not (= (zero-page frame-page 0) 1))
+      26
+      (if (not (= (zero-page stack-page 0) 1))
+        27
+        (if (= (kernel-load-u8-4k reusable-page 4096 4095) 0) 0 28)))))
+
+(defn claim-nic-slots-status [state]
+  (if (not (= (claim-slot state 8) 1)) 73
+    (if (not (= (claim-slot state 9) 1)) 74
+      (if (not (= (claim-slot state 10) 1)) 75
+        (if (not (= (claim-slot state 11) 1)) 76
+          (if (not (= (claim-slot state 12) 1)) 77
+            (if (= (claim-slot state 13) 1) 0 78)))))))
+
+(defn prepare-nic-pages [directory-a directory-b dma-pages]
+  (let [tx (kernel-subregion dma-pages 16384 0 4096)
+        rx (kernel-subregion dma-pages 16384 4096 4096)
+        tx-frame (kernel-subregion dma-pages 16384 8192 4096)
+        rx-frame (kernel-subregion dma-pages 16384 12288 4096)]
+    (if (not (= (zero-page directory-a 0) 1)) 79
+      (if (not (= (zero-page directory-b 0) 1)) 80
+        (if (not (= (zero-page tx 0) 1)) 81
+          (if (not (= (zero-page rx 0) 1)) 82
+            (if (not (= (zero-page tx-frame 0) 1)) 83
+              (if (= (zero-page rx-frame 0) 1) 0 84))))))))
+
+(defn prepare-rtl-page-tables [pdpt directory-a directory-b bar-a bar-b]
+  (if (and (= bar-a 0) (= bar-b 0))
+    true
+    (if (and (> bar-a 0) (> bar-b 0)
+             (= (quot bar-a 1073741824) (quot bar-b 1073741824)))
+      (and (= (rtl/install-directory pdpt directory-a bar-a) 1)
+           (= (rtl/install-bar-page directory-a bar-b) 1))
+      (and (if (> bar-a 0)
+             (= (rtl/install-directory pdpt directory-a bar-a) 1)
+             true)
+           (if (> bar-b 0)
+             (= (rtl/install-directory pdpt directory-b bar-b) 1)
+             true)))))
+
+(defn qualify-rtl8125 [bar-a bar-b dma-pages]
+  (if (> bar-a 0)
+    (let [first-result (rtl/qualify 2 bar-a dma-pages)]
+      (if (= first-result 0)
+        0
+        (if (and (> bar-b 0) (= (rtl/quiesce 2 bar-a) 1))
+          (rtl/qualify 3 bar-b dma-pages)
+          first-result)))
+    (if (> bar-b 0) (rtl/qualify 3 bar-b dma-pages) -1)))
+
+(defn prepare-page-tables [pml4 pdpt pd pt]
+  (and (= (store64-page pml4 0 (+ pdpt 3)) 1)
+       (= (store64-page pdpt 0 (+ pd 3)) 1)
+       (= (store64-page pd 0 (+ pt 3)) 1)
+       (= (fill-identity-pd pd 1) 1)
+       (= (load64-page pml4 0) (+ pdpt 3))
+       (= (load64-page pdpt 0) (+ pd 3))
+       (= (load64-page pd 0) (+ pt 3))
+       (= (kernel-load-u8-4k pd 4096 15) 128)
+       (= (kernel-load-u8-4k pd 4096 4095) 128)))
+
+(defn prepare-low-page-table [pt rx-limit rw-start]
+  (and (= (fill-low-pt pt 0 rx-limit rw-start) 1)
+       (= (load64-page pt 2048) 0)
+       (= (load64-page pt 2056) 1052673)
+       (= (load64-page pt (* (- (quot rx-limit 4096) 1) 8))
+          (- rx-limit 4095))
+       (if (< rx-limit rw-start)
+         (= (load64-page pt (* (quot rx-limit 4096) 8)) 0)
+         true)
+       (= (kernel-load-u8-4k pt 4096
+                             (+ (* (quot rw-start 4096) 8) 7)) 128)))
+
+(defn enable-page-protection []
+  (if (and (>= (kernel-cpuid-eax 2147483648 0) 2147483649)
+           (not (= (bit-and (kernel-cpuid-edx 2147483649 0) 1048576) 0)))
+    (let [efer (kernel-read-msr 3221225600)
+          nxe (bit-or efer 2048)
+          efer-written (kernel-write-msr 3221225600 nxe)
+          cr0 (kernel-read-cr0)
+          wp (bit-or cr0 65536)
+          cr0-written (kernel-write-cr0 wp)]
+      (and (= efer-written nxe)
+           (= (bit-and (kernel-read-msr 3221225600) 2048) 2048)
+           (= cr0-written wp)
+           (= (bit-and (kernel-read-cr0) 65536) 65536)))
+    false))
+
+(defn activate-page-tables [pml4]
+  (let [written (kernel-write-cr3 pml4)
+        active (kernel-read-cr3)
+        flushed (kernel-invlpg 1048576)]
+    (and (= written pml4)
+         (= (+ active (* 0 flushed)) pml4))))
+
+;; The IDT storage is allocator-owned and remains RW+NX under the replacement
+;; map. The backend contributes only the address of its sealed non-returning
+;; entry; Kotoba constructs vector 14 and the pseudo-descriptor byte layout.
+
+;; ── the two faults that leave nothing behind ─────────────────────────────
+;;
+;; A page fault has had a handler and a recovery frame for a long time. #UD and
+;; #GP have had neither, so `ud2` (which is how fuel exhaustion ends) and any
+;; bad access outside the paging path take the machine straight to a triple
+;; fault. It dies silently, and the two instruments that could have said where
+;; both die with it: the netlog is fire-and-forget UDP that stops when the
+;; machine stops, and the loader's STATUS panel is only reached when `main`
+;; RETURNS, which a fault prevents by definition.
+;;
+;; Measured 2026-09-08: the run ends at 12, 27, 33, 34, 38, 62, 64, 65, 70, 73
+;; and 94 cycles across boots -- varying, so not a budget being exhausted at a
+;; fixed point -- and not once did anything survive to say why.
+;;
+;; These two handlers change that in the only way available. They write the
+;; vector number into a page that survives a warm reset, then reset the
+;; platform. The next boot reads the byte and puts it on the wire. So a fault
+;; stops being a death and becomes two facts: the board comes back on its own,
+;; and the next boot says which vector killed the last one.
+;;
+;; Gates 6 and 13 sit at IDT offsets 96 and 208, both inside the limit of 239
+;; the page-fault installer already sets, so no descriptor moves.
+;;
+;; The mark lives at offset1024 of the loader-owned IDT scratch page.
+;; ISR entries restore the image context; the bounded constructor obtains
+;; slot5 directly, without treating a pointer loaded from boot-info as a root.
+(defn record-fault-and-reset [vector]
+  ;; The trusted pre-main initializer seals the same loader allocation for
+  ;; main and every callback. No helper returns an untracked pointer here.
+  (let [page (kernel-owned-page 5)
+        ;; Say so on the debug port BEFORE resetting.  A reset under -no-reboot
+        ;; makes QEMU exit 0 with the trace simply stopping, which is
+        ;; indistinguishable from a triple fault, a firmware dead-loop, or a
+        ;; hang -- three different bugs with one appearance.  These two bytes
+        ;; are the only thing that tells them apart, and the scratch-page record
+        ;; below cannot: it is read by the NEXT boot, and -no-reboot means there
+        ;; isn't one.
+        bang (serial/trace-byte 33)
+        digit (serial/trace-byte (+ 48 (if (< vector 10) vector 9)))
+        mark (kernel-store-u8-4k page 4096 1024
+                                 (+ vector (* 0 (+ bang digit))))
+        ;; 0xCF9 <- 0x06. If the chipset ignores it the machine simply hangs
+        ;; as it did before, which is no worse than the state this replaces.
+        reset (kernel-out-u8 3321 (+ 6 (* 0 mark)))]
+    (+ 0 (* 0 reset))))
+
+;; The native image profile emits a64-vector table. Only #UD is exported
+;; by this kernel today; other slots retain their separate canned/absent
+;; policies. The callback ABI is (vector,error,rip,rsp), all scalar values.
+(defn aiueos-isr-6 [vector error rip rsp]
+  (+ (record-fault-and-reset 6) (* 0 (+ vector error rip rsp))))
+
+(defn install-fault-gate [idt-page vector entry]
+  (let [selector (kernel-read-cs)
+        gate-offset (* vector 16)
+        handler-low (bit-and entry 65535)
+        handler-mid (bit-and (quot entry 65536) 65535)
+        handler-high (bit-and (quot entry 4294967296) 4294967295)
+        gate-low (+ handler-low
+                    (* selector 65536)
+                    (* 142 1099511627776)
+                    (* handler-mid 281474976710656))]
+    (if (and (> entry 0) (> selector 0) (<= selector 65535)
+             (= (store64-page idt-page gate-offset gate-low) 1)
+             (= (store64-page idt-page (+ gate-offset 8) handler-high) 1)
+             (= (load64-page idt-page gate-offset) gate-low))
+      1
+      0)))
+
+(defn install-page-fault-idt [idt-page rx-limit]
+  (let [handler (kernel-page-fault-handler-address)
+        selector (kernel-read-cs)
+        handler-low (bit-and handler 65535)
+        handler-mid (bit-and (quot handler 65536) 65535)
+        handler-high (bit-and (quot handler 4294967296) 4294967295)
+        gate-low (+ handler-low
+                    (* selector 65536)
+                    (* 142 1099511627776)
+                    (* handler-mid 281474976710656))]
+    ;; The handler is compiler-emitted executable text. Bind it to this exact
+    ;; artifact's admitted RX boundary instead of the older 0x10c000 size;
+    ;; adding the pure TCP module legitimately grows text within that segment.
+    (if (and (>= handler 1052672) (< handler rx-limit)
+             (> selector 0) (<= selector 65535)
+             (= (store64-page idt-page 224 gate-low) 1)
+             (= (store64-page idt-page 232 handler-high) 1)
+             (= 0 (* 0 (kernel-store-u8-4k idt-page 4096 512 239)))
+             (= 0 (* 0 (kernel-store-u8-4k idt-page 4096 513 0)))
+             (= (store64-page idt-page 514 idt-page) 1)
+             (= (load64-page idt-page 224) gate-low)
+             (= (load64-page idt-page 232) handler-high)
+             (= (kernel-load-u8-4k idt-page 4096 512) 239)
+             (= (kernel-load-u8-4k idt-page 4096 513) 0)
+             (= (load64-page idt-page 514) idt-page))
+      (let [descriptor (kernel-subregion idt-page 4096 512 10)]
+        (kernel-load-idt descriptor 10))
+      0)))
+
+(defn recoverable-frame-valid [frame-page stack-page probe]
+  (if (= probe 424242)
+    1
+    (if (and (= probe 0)
+             (= (load64-page frame-page 0) 1048576)
+             (= (bit-and (load64-page frame-page 8) 3) 2)
+             (> (load64-page frame-page 16) 1052672)
+             (= (load64-page frame-page 24) (+ stack-page 4080)))
+      (if (= (serial/trace-byte 69) 69) 1 0)
+      0)))
+
+;; Mutation scripts replace this exact body with one sealed hardware access.
+;; Keeping the positive artifact free of a dormant arbitrary-address branch
+;; makes each fault receipt attributable to the compiled probe it contains.
+(defn page-fault-probe []
+  (+ 424200 42))
+
+(defn main []
+  ;; The UART comes up before anything has something to say. It costs seven
+  ;; port writes and it is the only transport this kernel has that survives the
+  ;; NIC not being ready -- or being reset out from under it.
+  (let [_uart (serial/serial-init)
+        boot (kernel-boot-info)
+        boot-header (kernel-subregion boot 16544 0 160)
+        cr3 (kernel-read-cr3)
+        map-size (load64-boot boot 16544 24)
+        descriptor-size (load64-boot boot 16544 32)
+        rx-limit (load64-boot boot 16544 56)
+        rw-start (load64-boot boot 16544 64)
+        rw-end (load64-boot boot 16544 72)
+        scratch-start (load64-boot boot 16544 80)
+        scratch-pages (load64-boot boot 16544 88)
+        framebuffer-base (load64-boot boot 16544 112)
+        framebuffer-size (load64-boot boot 16544 120)
+        framebuffer-width (load32-boot boot 16544 128)
+        framebuffer-height (load32-boot boot 16544 132)
+        framebuffer-stride (load32-boot boot 16544 136)
+        framebuffer-format (load32-boot boot 16544 140)
+        memory-map (kernel-subregion boot 16544 160 16384)]
+    (if (and (> boot 0) (> cr3 0)
+             (= (kernel-load-u8 boot-header 160 0) 65)
+             (= (kernel-load-u8 boot-header 160 1) 73)
+             (= (kernel-load-u8 boot-header 160 2) 85)
+             (= (kernel-load-u8 boot-header 160 3) 69)
+             (= (kernel-load-u8 boot-header 160 4) 66)
+             (= (kernel-load-u8 boot-header 160 5) 79)
+             (= (kernel-load-u8 boot-header 160 6) 79)
+             (= (kernel-load-u8 boot-header 160 7) 84)
+             (= (load64-boot boot 16544 8) 6)
+             (= (load64-boot boot 16544 16) memory-map)
+             (> map-size 0)
+             ;; 16368, not 16384: the last 16 bytes of the map window hold
+             ;; the loader's own text address, which the loader writes after
+             ;; the map.  A map that reaches them would be read back with its
+             ;; tail overwritten, so refuse it instead of trusting the tail.
+             (<= map-size 16368)
+             (>= descriptor-size 40)
+             (<= descriptor-size map-size)
+             (> (load64-boot boot 16544 40) 0)
+             (> rx-limit 1052672)
+             (= (bit-and rx-limit 4095) 0)
+             (>= rw-start rx-limit)
+             (= (bit-and rw-start 4095) 0)
+             (> rw-end rw-start)
+             (= (bit-and rw-end 4095) 0)
+             (< rw-end 1073741824)
+             (> scratch-start 0)
+             (= (bit-and scratch-start 4095) 0)
+             (= scratch-pages 15)
+             ;; GOP is optional for the general boot profile; when present its
+             ;; geometry and pixel format must describe a bounded linear mode.
+             (or (= framebuffer-base 0)
+                 (and (> framebuffer-size 0)
+                      (>= framebuffer-width 320)
+                      (>= framebuffer-height 200)
+                      (>= framebuffer-stride framebuffer-width)
+                      (<= framebuffer-format 1)
+                      (<= (* (* framebuffer-stride framebuffer-height) 4)
+                          framebuffer-size)))
+             (<= (+ scratch-start 61440) 549755813888))
+      (let [map-marker (serial/trace-byte 77)
+            ;; Boot-info v5 carries the exact fifteen-page EfiLoaderData
+            ;; allocation made by Amu before the final memory map.
+            physical-start scratch-start]
+        (if (> physical-start 0)
+          (let [second-start (+ physical-start 4096)
+                third-start (+ physical-start 8192)
+                fourth-start (+ physical-start 12288)
+                fifth-start (+ physical-start 16384)
+                sixth-start (+ physical-start 20480)
+                seventh-start (+ physical-start 24576)
+                eighth-start (+ physical-start 28672)
+                ninth-start (+ physical-start 32768)
+                tenth-start (+ physical-start 36864)
+                eleventh-start (+ physical-start 40960)
+                twelfth-start (+ physical-start 45056)
+                thirteenth-start (+ physical-start 49152)
+                fourteenth-start (+ physical-start 53248)
+                ;; Fifteen sealed slots0..14; slots15..17 do not exist.
+                ;; Slots10..13 own the RX DMA window. Slot14 is the CPU RX
+                ;; snapshot, separate from DMA and stream log/TX staging.
+                ;; Browser must obtain a distinct image-owned workspace.
+                ;; The LAN2 debug plane takes its 16 KiB from
+                ;; the pages the CR3 branch would have used instead; see the
+                ;; stream branch below (ADR-0156).
+                bar-a (rtl/bar-for-bus 2)
+                bar-b (rtl/bar-for-bus 3)]
+            (if (and (five-distinct physical-start second-start third-start
+                                    fourth-start fifth-start)
+                     (> sixth-start 0) (< sixth-start 549755813888)
+                     (not (= sixth-start physical-start))
+                     (not (= sixth-start second-start))
+                     (not (= sixth-start third-start))
+                     (not (= sixth-start fourth-start))
+                     (not (= sixth-start fifth-start))
+                     (> seventh-start 0) (> eighth-start 0)
+                     (< eighth-start 549755813888)
+                     (not (= seventh-start physical-start))
+                     (not (= seventh-start second-start))
+                     (not (= seventh-start third-start))
+                     (not (= seventh-start fourth-start))
+                     (not (= seventh-start fifth-start))
+                     (not (= seventh-start sixth-start))
+                     (not (= eighth-start physical-start))
+                     (not (= eighth-start second-start))
+                     (not (= eighth-start third-start))
+                     (not (= eighth-start fourth-start))
+                     (not (= eighth-start fifth-start))
+                     (not (= eighth-start sixth-start))
+                     (not (= eighth-start seventh-start))
+                     (> ninth-start eighth-start)
+                     (> tenth-start ninth-start)
+                     (> eleventh-start tenth-start)
+                     (> twelfth-start eleventh-start)
+                     (> thirteenth-start twelfth-start)
+                     (> fourteenth-start thirteenth-start)
+                     (< fourteenth-start 549755813888))
+                  ;; Constructors derive only the sealed loader allocation.
+                  ;; Public metadata and literal addresses cannot mint regions.
+                  (let [state (kernel-owned-page 0)
+                        page-table-root (kernel-owned-page 1)
+                        pdpt (kernel-owned-page 2)
+                        pd (kernel-owned-page 3)
+                        pt (kernel-owned-page 4)
+                        reusable-page (kernel-owned-page 5)
+                        frame-page (kernel-owned-page 6)
+                        stack-page (kernel-owned-page 7)
+                        rtl-directory-a (kernel-owned-page 8)
+                        rtl-directory-b (kernel-owned-page 9)
+                        rtl-dma-pages (kernel-owned-window 10 16384)
+                        owned-status (prepare-owned-pages
+                                      state page-table-root pdpt pd pt)
+                        extra-status (prepare-extra-pages
+                                      reusable-page frame-page stack-page)
+                        nic-owned-status (if (= owned-status 0)
+                                           (claim-nic-slots-status state)
+                                           85)
+                        nic-pages-status (if (and (= owned-status 0)
+                                                  (= extra-status 0)
+                                                  (= nic-owned-status 0))
+                                           (prepare-nic-pages
+                                            rtl-directory-a rtl-directory-b
+                                            rtl-dma-pages)
+                                           86)]
+                    (if (and (= map-marker 77)
+                             (= owned-status 0)
+                             (= extra-status 0)
+                             (= nic-owned-status 0)
+                             (= nic-pages-status 0))
+                      ;; The UEFI PXE path has just used this BAR and therefore
+                      ;; supplies a known-good mapping until CR3 is replaced.
+                      ;; Qualify a physical RTL8125 once under that mapping so
+                      ;; the wire receipt separates provider faults from faults
+                      ;; in AIUEOS's replacement page tables.  The no-device
+                      ;; QEMU gate keeps exercising the complete CR3/IDT path.
+                      (if (or (> bar-a 0) (> bar-b 0))
+                        (let [pre-cr3-nic-status
+                              (qualify-rtl8125 bar-a bar-b rtl-dma-pages)]
+                          ;; 0x60 is the pure TCP qualification base. Provider
+                          ;; zero means both the earlier ARP/UDP receipt and the
+                          ;; new 8443 SYN/SYN-ACK exchange completed.
+                          (if (= pre-cr3-nic-status 0)
+                            ;; Gate N2 tranche one (ADR-0134): with the
+                            ;; diagnostics qualification green under the
+                            ;; known-good pre-CR3 mapping, install the stream
+                            ;; profile's 4-descriptor RX ring, arm the TCB, and
+                            ;; run one bounded ESTABLISHED-state receive window
+                            ;; on the fixed 4-tuple. The wire status is honest:
+                            ;; 192 + 99 (0x123) = a delivery+ACK ran, 192 + 21 =
+                            ;; the ring is live but the peer sent nothing inside
+                            ;; the window, 192 + 30/26/25 = the specific stream
+                            ;; fault. Diagnostics codes 96..96+0 stay untouched.
+                            (let [stream-mmio (kernel-pci-mmio 2 0 0 bar-a 512)
+                                  stream-win (kernel-subregion rtl-dma-pages
+                                                               16384 0 16384)
+                                  ;; The stream's three CPU-side buffers, in
+                                  ;; ONE region with fixed offsets (log +0,
+                                  ;; tx +4096, staging +8192) so that no two of
+                                  ;; them can be the same page by accident.
+                                  ;; They were three separately-computed
+                                  ;; addresses, and two of them landed on the
+                                  ;; same page for months: tx-frame and staging
+                                  ;; were both rtl-dma-pages + 8192, which is
+                                  ;; also the stream's rx-buffer-a. Worse,
+                                  ;; stream-log built its receipt in the TX
+                                  ;; frame, so the SYN was overwritten between
+                                  ;; being built and being submitted -- which
+                                  ;; the Mac measured as `0 connection request`
+                                  ;; over ~363,000 attempts (ADR-0156).
+                                  ;;
+                                  ;; page-table-root, pdpt and pd are the free
+                                  ;; pages here and they are contiguous. Only
+                                  ;; prepare-page-tables installs them, and that
+                                  ;; runs in the CR3 arm, not this one;
+                                  ;; prepare-owned-pages has already zeroed
+                                  ;; them. They sit below the bus3 window
+                                  ;; (pages 4..7) and far below rtl-dma-pages
+                                  ;; (pages 10..13).
+                                  stream-scratch (kernel-owned-window 1 12288)
+                                  stream-log-frame (kernel-subregion
+                                                    stream-scratch 12288 0 4096)
+                                  stream-tcb (kernel-owned-page 11)
+                                  ring-status (stream/rx-ring-init
+                                               stream-mmio rtl-dma-pages)
+                                  ;; A STEP KEEPS ITS TCB. `tcb-init` zeroes
+                                  ;; the block, including the boot-nonce slot
+                                  ;; and the cycle counter, and the tender
+                                  ;; re-enters `main` every ~76 ms -- so with
+                                  ;; it the board drew a FRESH NONCE PER STEP
+                                  ;; and announced itself as a new node
+                                  ;; thirteen times a second. Measured
+                                  ;; 2026-09-09: 54 hellos and 55 entries from
+                                  ;; two image loads, which buried the relay's
+                                  ;; single-flight mint under a burst it was
+                                  ;; never shaped for (its window was derived
+                                  ;; for one hello per 20 s) and turned every
+                                  ;; enrolment into a 401.
+                                  ;;
+                                  ;; The nonce slot is already written once and
+                                  ;; reused while non-zero; it was the
+                                  ;; re-initialisation underneath it that made
+                                  ;; that pointless. Keeping the block also
+                                  ;; keeps `cycles`, which gates the hello on
+                                  ;; `(= cycles 0)` -- so the hello returns to
+                                  ;; once per COLD BOOT, which is what it
+                                  ;; always meant.
+                                  ;;
+                                  ;; Same CR3 test as the page-fault probe and
+                                  ;; the NIC qualification: the hardware
+                                  ;; already knows whether init has run.
+                                  tcb-status (if (= cr3 page-table-root)
+                                               0
+                                               (if (= ring-status 0)
+                                                 (stream/tcb-init stream-tcb 2715820034)
+                                                 1))
+                                  stream-status
+                                  (if (and (= ring-status 0) (= tcb-status 0))
+                                    0
+                                    (if (not (= ring-status 0)) 97 98))]
+                              ;; Plan A-2: the stream runs resident — every
+                              ;; cycle re-arms, connects, receives, and logs
+                              ;; over UDP. The screen write happens before
+                              ;; entering the loop; outcomes ride STREAM_C.
+                              ;; LAN2 debug plane, step 1. The census (B7 7F
+                              ;; 7F, read on the K16 2026-09-06) said bus3
+                              ;; answers config space, decodes its BAR, has
+                              ;; MEM-SPACE and BUS-MASTER set, reads back its
+                              ;; revision and MAC, and has PHY link -- so the
+                              ;; NIC can DMA. What it still lacked was a
+                              ;; loader-OWNED window.
+                              ;;
+                              ;; This branch never replaces CR3 (bar-a > 0, so
+                              ;; prepare-page-tables / activate-page-tables are
+                              ;; in the other arm), which leaves pt,
+                              ;; reusable-page, frame-page and stack-page
+                              ;; allocated by the loader, zeroed by
+                              ;; prepare-owned-pages / prepare-extra-pages, and
+                              ;; idle for the life of this branch. They are
+                              ;; four contiguous pages = the 16 KiB bus3 needs.
+                              ;;
+                              ;; Six bytes ride the known-good bus2 netlog once
+                              ;; before the resident loop: B7 sentinel, bus3
+                              ;; census, bus2 census (control), B8 sentinel,
+                              ;; debug-init status, debug-send status. Phase 1
+                              ;; observed none of this and was therefore
+                              ;; useless whatever the wire did (ADR-0156).
+                              (do (kernel-out-u32 244 (+ 192 stream-status))
+                                  (let [census-b (rtl/bus-probe 3)
+                                        census-a (rtl/bus-probe 2)
+                                        mark (stream/stream-log
+                                              stream-win stream-mmio
+                                              stream-log-frame 183)
+                                        logged-b (stream/stream-log
+                                                  stream-win stream-mmio
+                                                  stream-log-frame
+                                                  (+ census-b (* 0 mark)))
+                                        logged-a (stream/stream-log
+                                                  stream-win stream-mmio
+                                                  stream-log-frame
+                                                  (+ census-a (* 0 logged-b)))
+                                        bus3-dma-pages (kernel-owned-window 4 16384)
+                                        bus3-mmio (kernel-pci-mmio 3 0 0 bar-b 512)
+                                        ;; 6 = bar-b never decoded, so there is
+                                        ;; no MMIO to init. Distinct from every
+                                        ;; code debug-init itself returns.
+                                        dbg-init (if (> bar-b 0)
+                                                   (debug/debug-init
+                                                    3 bus3-mmio bus3-dma-pages)
+                                                   6)
+                                        ;; 7 = not attempted, because init
+                                        ;; refused. Never confuse "skipped"
+                                        ;; with "sent".
+                                        ;; What the PHY reports, as DD <hi>
+                                        ;; DD <lo> -- the same one-DA-per-byte
+                                        ;; shape the MAC block uses, and for
+                                        ;; the same reason (lang-h9b: a raw
+                                        ;; byte on this wire is a sentinel
+                                        ;; somewhere). Emitted before the
+                                        ;; greeting, because the greeting's
+                                        ;; status is only meaningful beside it.
+                                        phy-hi-mark (if (= dbg-init 0)
+                                                      (stream/stream-log
+                                                       stream-win stream-mmio
+                                                       stream-log-frame 221)
+                                                      0)
+                                        phy-hi (if (= dbg-init 0)
+                                                 (stream/stream-log
+                                                  stream-win stream-mmio
+                                                  stream-log-frame
+                                                  (+ (debug/debug-phy-byte
+                                                      bus3-mmio 0)
+                                                     (* 0 phy-hi-mark)))
+                                                 0)
+                                        phy-lo-mark (if (= dbg-init 0)
+                                                      (stream/stream-log
+                                                       stream-win stream-mmio
+                                                       stream-log-frame
+                                                       (+ 221 (* 0 phy-hi)))
+                                                      0)
+                                        phy-lo (if (= dbg-init 0)
+                                                 (stream/stream-log
+                                                  stream-win stream-mmio
+                                                  stream-log-frame
+                                                  (+ (debug/debug-phy-byte
+                                                      bus3-mmio 1)
+                                                     (* 0 phy-lo-mark)))
+                                                 0)
+                                        dbg-sent (if (= dbg-init 0)
+                                                   (+ (debug/debug-send
+                                                       bus3-mmio bus3-dma-pages)
+                                                      (* 0 phy-lo))
+                                                   7)
+                                        hdr (if (= dbg-init 0)
+                                              (dump-bus3-ip-header
+                                               stream-win stream-mmio
+                                               stream-log-frame
+                                               bus3-dma-pages 14)
+                                              0)
+                                        mark-b (stream/stream-log
+                                                stream-win stream-mmio
+                                                stream-log-frame
+                                                (+ 184 (* 0 (+ logged-a hdr))))
+                                        logged-init (stream/stream-log
+                                                     stream-win stream-mmio
+                                                     stream-log-frame
+                                                     (+ dbg-init (* 0 mark-b)))
+                                        ;; bus3's MAC as six DA <byte> PAIRS
+                                        ;; (12 datagrams). The Mac cannot reach
+                                        ;; 10.10.10.2 without it, because this
+                                        ;; plane answers UDP and not ARP.
+                                        ;; Emitted once, only when bus3 came up
+                                        ;; ready. One DA before EVERY byte: the
+                                        ;; wire is one byte per datagram, and
+                                        ;; with a single DA followed by six
+                                        ;; positional bytes a MAC byte FC was
+                                        ;; read as the FC checksum verdict
+                                        ;; (measured 2026-09-07, lang-h9b).
+                                        ;; After a DA the reader consumes
+                                        ;; exactly one byte, whatever its value.
+                                        mark-c (if (= dbg-init 0)
+                                                 (stream/stream-log
+                                                  stream-win stream-mmio
+                                                  stream-log-frame
+                                                  (+ 218 (* 0 logged-init)))
+                                                 0)
+                                        m0 (if (= dbg-init 0)
+                                             (stream/stream-log
+                                              stream-win stream-mmio
+                                              stream-log-frame
+                                              (+ (debug/debug-mac-byte
+                                                  bus3-mmio 0)
+                                                 (* 0 mark-c)))
+                                             0)
+                                        da1 (if (= dbg-init 0)
+                                              (stream/stream-log
+                                               stream-win stream-mmio
+                                               stream-log-frame
+                                               (+ 218 (* 0 m0)))
+                                              0)
+                                        m1 (if (= dbg-init 0)
+                                             (stream/stream-log
+                                              stream-win stream-mmio
+                                              stream-log-frame
+                                              (+ (debug/debug-mac-byte
+                                                  bus3-mmio 1)
+                                                 (* 0 da1)))
+                                             0)
+                                        da2 (if (= dbg-init 0)
+                                              (stream/stream-log
+                                               stream-win stream-mmio
+                                               stream-log-frame
+                                               (+ 218 (* 0 m1)))
+                                              0)
+                                        m2 (if (= dbg-init 0)
+                                             (stream/stream-log
+                                              stream-win stream-mmio
+                                              stream-log-frame
+                                              (+ (debug/debug-mac-byte
+                                                  bus3-mmio 2)
+                                                 (* 0 da2)))
+                                             0)
+                                        da3 (if (= dbg-init 0)
+                                              (stream/stream-log
+                                               stream-win stream-mmio
+                                               stream-log-frame
+                                               (+ 218 (* 0 m2)))
+                                              0)
+                                        m3 (if (= dbg-init 0)
+                                             (stream/stream-log
+                                              stream-win stream-mmio
+                                              stream-log-frame
+                                              (+ (debug/debug-mac-byte
+                                                  bus3-mmio 3)
+                                                 (* 0 da3)))
+                                             0)
+                                        da4 (if (= dbg-init 0)
+                                              (stream/stream-log
+                                               stream-win stream-mmio
+                                               stream-log-frame
+                                               (+ 218 (* 0 m3)))
+                                              0)
+                                        m4 (if (= dbg-init 0)
+                                             (stream/stream-log
+                                              stream-win stream-mmio
+                                              stream-log-frame
+                                              (+ (debug/debug-mac-byte
+                                                  bus3-mmio 4)
+                                                 (* 0 da4)))
+                                             0)
+                                        da5 (if (= dbg-init 0)
+                                              (stream/stream-log
+                                               stream-win stream-mmio
+                                               stream-log-frame
+                                               (+ 218 (* 0 m4)))
+                                              0)
+                                        m5 (if (= dbg-init 0)
+                                             (stream/stream-log
+                                              stream-win stream-mmio
+                                              stream-log-frame
+                                              (+ (debug/debug-mac-byte
+                                                  bus3-mmio 5)
+                                                 (* 0 da5)))
+                                             0)]
+                                    (stream/stream-log stream-win stream-mmio
+                                                       stream-log-frame
+                                                       (+ dbg-sent (* 0 m5)))
+                                    ;; LAN2 stays in the loop only if bus3 came
+                                    ;; up ready. On a board without the second
+                                    ;; NIC bus3-mmio is 0, and the loop must
+                                    ;; never dereference it -- so the gate is
+                                    ;; the init status, not the pointer.
+                                    ;; Arm the chipset watchdog before the
+                                    ;; loop that will kick it. D3 says it is
+                                    ;; running, D4 that the platform refused --
+                                    ;; not an Intel PCH, no ACPI base, or a
+                                    ;; locked TCO. D4 is not a failure to act
+                                    ;; on here: it means the board still needs
+                                    ;; a human, which is what it needed before.
+                                    (let [wd (watchdog/tco-base)
+                                          wd-armed (watchdog/arm wd)
+                                          ;; D3 armed, D5 armed after a
+                                          ;; previous timeout, D4 refused.
+                                          ;;
+                                          ;; THREE COPIES, for the reason
+                                          ;; ADR-0203 already recorded about
+                                          ;; DE: this wire is fire-and-forget
+                                          ;; UDP, one datagram per byte, and a
+                                          ;; single copy of a byte that decides
+                                          ;; an interpretation is a byte whose
+                                          ;; absence means nothing. Measured
+                                          ;; 2026-09-08: a boot that armed the
+                                          ;; watchdog delivered NEITHER mark,
+                                          ;; and the question "did it arm?"
+                                          ;; could not be answered at all.
+                                          ;; Refused? say WHICH refusal.
+                                          ;; D4 not-Intel, D6 no ACPI base,
+                                          ;; D2 the halt bit would not clear.
+                                          wd-why (if (= wd-armed 0)
+                                                   (watchdog/refusal)
+                                                   0)
+                                          wd-byte (if (= wd-armed 0)
+                                                    (if (= wd-why 1) 212
+                                                      (if (= wd-why 2) 214 210))
+                                                    (if (= wd-armed 2) 213 211))
+                                          ;; WHAT KILLED THE LAST BOOT.
+                                          ;; The #UD/#GP handlers write their
+                                          ;; vector to offset 1024 of this page
+                                          ;; and reset; DRAM survives a warm
+                                          ;; reset, so the byte is still here.
+                                          ;; D0 = the last run died on #UD,
+                                          ;; which is where fuel exhaustion
+                                          ;; arrives; D1 = it died on #GP.
+                                          ;; Cleared once read, so the answer
+                                          ;; belongs to one boot only.
+                                          prev-fault (kernel-load-u8-4k
+                                                      reusable-page 4096 1024)
+                                          fault-cleared (kernel-store-u8-4k
+                                                         reusable-page 4096 1024
+                                                         (* 0 prev-fault))
+                                          fault-byte (if (= prev-fault 6) 208
+                                                       (if (= prev-fault 13) 209 0))
+                                          fm1 (if (= fault-byte 0) 0
+                                                (stream/stream-log
+                                                 stream-win stream-mmio
+                                                 stream-log-frame
+                                                 (+ fault-byte (* 0 fault-cleared))))
+                                          fm2 (if (= fault-byte 0) 0
+                                                (stream/stream-log
+                                                 stream-win stream-mmio
+                                                 stream-log-frame
+                                                 (+ fault-byte (* 0 fm1))))
+                                          fm3 (if (= fault-byte 0) 0
+                                                (stream/stream-log
+                                                 stream-win stream-mmio
+                                                 stream-log-frame
+                                                 (+ fault-byte (* 0 fm2))))
+                                          wd-m1 (stream/stream-log
+                                                 stream-win stream-mmio
+                                                 stream-log-frame
+                                                 (+ wd-byte (* 0 fm3)))
+                                          wd-m2 (stream/stream-log
+                                                 stream-win stream-mmio
+                                                 stream-log-frame
+                                                 (+ wd-byte (* 0 wd-m1)))
+                                          wd-mark (stream/stream-log
+                                                   stream-win stream-mmio
+                                                   stream-log-frame
+                                                   (+ wd-byte (* 0 wd-m2)))
+                                          bus3-ready (if (= dbg-init 0) 1 0)]
+                                      (stream/stream-resident
+                                       stream-win
+                                       stream-mmio
+                                       stream-scratch
+                                       bus3-dma-pages
+                                       bus3-ready
+                                       ;; The sequencing multiply rides the
+                                       ;; CYCLE COUNT, not the DMA region: a
+                                       ;; kernel memory base must NAME a region
+                                       ;; rather than compute one, and
+                                       ;; `(+ bus3-dma-pages (* 0 wd-mark))`
+                                       ;; computes one. Refused at :subset with
+                                       ;; :kotoba.error/kernel-region-provenance.
+                                       (+ (stream/debug-run-cycles)
+                                          (* 0 wd-mark)))))))
+                            (kernel-out-u32 244 (+ 96 pre-cr3-nic-status))))
+                        (if (and (prepare-page-tables page-table-root pdpt pd pt)
+                                 (= (allow-loader-exec
+                                     pd (load64-boot-far boot 16544 16368)) 1)
+                                 (prepare-low-page-table pt rx-limit rw-start)
+                                 (prepare-rtl-page-tables
+                                  pdpt rtl-directory-a rtl-directory-b bar-a bar-b))
+                            (if (and (enable-page-protection)
+                                     ;; MASK INTERRUPTS FIRST. Between the CR3
+                                     ;; load and `install-page-fault-idt` below,
+                                     ;; the firmware's IDT is still the live one
+                                     ;; -- and every one of its handlers sits
+                                     ;; above 2 MiB, which this map has just
+                                     ;; made NX. Any interrupt delivered in that
+                                     ;; window vectors into a page that cannot
+                                     ;; be fetched: #PF, whose firmware handler
+                                     ;; is equally unfetchable, so it recurses
+                                     ;; until the stack is gone and the machine
+                                     ;; triple faults.
+                                     ;;
+                                     ;; That is not hypothetical. It is what the
+                                     ;; roughly one-run-in-five QEMU abort was,
+                                     ;; measured 2026-09-09 with -d int: a
+                                     ;; healthy run logs 157 events, all APIC
+                                     ;; timer; the aborted run logs 97,886, of
+                                     ;; which the first 149 are the same timer
+                                     ;; and the 150th is a #PF. Tick 149 is the
+                                     ;; only one whose IP is in guest text
+                                     ;; (0x125058) rather than firmware -- the
+                                     ;; tick that arrived after the switch. The
+                                     ;; error code is 0x11 throughout: present,
+                                     ;; instruction fetch.
+                                     ;;
+                                     ;; Nothing re-enables interrupts here. The
+                                     ;; guest runs to its own return with them
+                                     ;; masked, which is what it did in every
+                                     ;; run that already passed -- it just did
+                                     ;; it by not being interrupted rather than
+                                     ;; by saying so.
+                                     (= (kernel-cli) 0)
+                                     (activate-page-tables page-table-root)
+                                     (= (kernel-configure-page-fault-recovery
+                                         frame-page stack-page) 1)
+                                     (= (install-page-fault-idt
+                                         reusable-page rx-limit) 1)
+                                     ;; #UD and #GP, into the SAME table the
+                                     ;; page-fault installer just loaded --
+                                     ;; gates 6 and 13 are at offsets 96 and
+                                     ;; 208, inside its limit of 239, so this
+                                     ;; adds entries without touching the
+                                     ;; descriptor. Installed after it on
+                                     ;; purpose: the table must be live before
+                                     ;; these gates mean anything.
+                                     (= (install-fault-gate
+                                         reusable-page 6
+                                         (kernel-isr-entry-address 6)) 1))
+                              (let [page-marker (serial/trace-byte 80)
+                                    root-marker (serial/trace-byte 82)
+                                    cr3-marker (serial/trace-byte 67)
+                                    idt-marker (serial/trace-byte 68)
+                                    ;; IS THIS A STEP, OR A BOOT?
+                                    ;;
+                                    ;; The tender re-enters `main` without a
+                                    ;; platform reset (ADR-0204/0205 step 2),
+                                    ;; and measured 2026-09-08 the SECOND entry
+                                    ;; died in 60 ms, twice. A re-entry is not
+                                    ;; a reboot: the machine it starts on is
+                                    ;; not the machine a reboot starts on, and
+                                    ;; two things below only make sense from
+                                    ;; cold.
+                                    ;;
+                                    ;; No flag has to be stored anywhere. The
+                                    ;; state is already in the hardware: CR3
+                                    ;; holds the firmware's tables on a real
+                                    ;; boot and holds OURS from
+                                    ;; `activate-page-tables` onward, and
+                                    ;; nothing between entries puts it back.
+                                    ;; `activate-page-tables` compares
+                                    ;; `kernel-read-cr3` against this same
+                                    ;; region to check its own work, so the
+                                    ;; comparison is the one the machine
+                                    ;; already trusts.
+                                    step? (= cr3 page-table-root)
+                                    ;; `page-fault-probe` takes a DELIBERATE
+                                    ;; page fault to prove recovery works. That
+                                    ;; is a cold-boot assertion; taking it again
+                                    ;; while the NIC holds live DMA is asking
+                                    ;; the machine to survive something it was
+                                    ;; never asked to survive. 424242 is
+                                    ;; `recoverable-frame-valid`'s own bypass.
+                                    probe (if step? 424242 (page-fault-probe))
+                                    core-ok (and (= page-marker 80)
+                                                 (= root-marker 82)
+                                                 (= cr3-marker 67)
+                                                 (= idt-marker 68)
+                                                 (= (recoverable-frame-valid
+                                                     frame-page stack-page probe) 1))
+                                    ;; And do not re-qualify a NIC that is
+                                    ;; already up: qualification RESETS the
+                                    ;; device, and the previous step's rings and
+                                    ;; descriptors are still live. 0 is the
+                                    ;; status a good qualification returns.
+                                    nic-status (if step?
+                                                 0
+                                                 (if core-ok
+                                                   (qualify-rtl8125
+                                                    bar-a bar-b rtl-dma-pages)
+                                                   -2))
+                                    nic-marker (if (= nic-status 0)
+                                                 (serial/trace-byte 78)
+                                                 (if (>= nic-status 0)
+                                                   ;; 'Q', not 'F'. Three
+                                                   ;; different things emit
+                                                   ;; 'F' on this port: this
+                                                   ;; marker, the loader's
+                                                   ;; :fail arm, and
+                                                   ;; kotoba-native's
+                                                   ;; fail-closed-receipt --
+                                                   ;; and the last of those
+                                                   ;; also writes 0x1f to the
+                                                   ;; debug-exit port, which
+                                                   ;; is where exit 63 comes
+                                                   ;; from. The collision is
+                                                   ;; why exit 63 was read for
+                                                   ;; days as a guest status:
+                                                   ;; the trailing byte looked
+                                                   ;; like this line.
+                                                   (serial/trace-byte 81)
+                                                   0))]
+                                (kernel-out-u32 244
+                                                (+ (if core-ok 16 17)
+                                                   (* 0 nic-marker))))
+                              (kernel-out-u32 244 24))
+                          (kernel-out-u32 244 23)))
+                      ;; 'l' -- this ladder is a failure exit, so say which
+                      ;; writer produced the status. Without it a numeric exit
+                      ;; code has to be matched back to one of nine call sites
+                      ;; by hand, and the trailing bytes cannot help: the guest
+                      ;; keeps running after it writes the port, so everything
+                      ;; printed AFTER a write is a race. A byte printed BEFORE
+                      ;; one is not.
+                      (kernel-out-u32 244
+                                      (if (= (serial/trace-byte 108) 108)
+                                      (if (not (= owned-status 0))
+                                        owned-status
+                                        (if (not (= extra-status 0))
+                                          extra-status
+                                          (if (not (= nic-owned-status 0))
+                                            nic-owned-status
+                                            nic-pages-status))) 0))))
+              (kernel-out-u32 244 20)))
+          (kernel-out-u32 244 19)))
+      (kernel-out-u32 244 18))))

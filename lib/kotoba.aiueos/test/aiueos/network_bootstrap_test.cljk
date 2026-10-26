@@ -1,0 +1,132 @@
+(ns aiueos.network-bootstrap-test
+  "Discriminating tests for the bootstrap-network decision (root ADR
+  adr-2609092800 D6, install-v1 :network-policy).
+
+  Every refusal names its own reason. A test that only asserted `not ok?` would
+  pass when the refusal came from somewhere else entirely, which is how a check
+  stops discriminating without saying so -- the failure this repository has hit
+  often enough to write down (root ADR 2608136000)."
+  (:require [aiueos.network-bootstrap :as nb]
+            [kotoba.test :refer [deftest is testing]]))
+
+(defn- are-reasons [pairs]
+  (doseq [[expected iface] pairs]
+    (is (= expected (:reason (nb/bootstrap-decision iface)))
+        (str "expected " expected " for " (pr-str iface)))))
+
+(def wired {:name "enp1s0" :class :pci-ethernet :carrier? true :addressing :dhcp})
+(def tether {:name "enp0s20u1" :class :usb-cdc-ncm :carrier? true :addressing :dhcp})
+(def iphone {:name "eth1" :class :usb-ipheth :carrier? true :addressing :dhcp})
+
+(deftest admits-the-two-keyboard-free-paths
+  (testing "wired DHCP is admitted and is the machine's own network"
+    (let [d (nb/bootstrap-decision wired)]
+      (is (:ok? d))
+      (is (= :durable (:durability d)))
+      (is (false? (:tether? d)))
+      (is (nb/durable? wired))))
+
+  (testing "a tethered phone is admitted to CARRY first boot"
+    (let [d (nb/bootstrap-decision tether)]
+      (is (:ok? d))
+      (is (true? (:tether? d)))))
+
+  (testing "and is refused as the machine's own network -- the whole point"
+    (is (false? (nb/durable? tether)))
+    (is (false? (nb/durable? iphone)))
+    (is (= :ephemeral (:durability (nb/bootstrap-decision iphone))))))
+
+(deftest carrying-first-boot-and-being-the-network-are-different-answers
+  ;; If these two ever collapse into one value, the box comes up over a phone,
+  ;; the phone leaves, and nothing in the record says why it went unreachable.
+  (testing "the same interface answers yes to one and no to the other"
+    (is (:ok? (nb/bootstrap-decision tether)))
+    (is (false? (nb/durable? tether))))
+  (testing "the receipt states what is still owed, rather than implying it"
+    (let [r (nb/receipt (nb/select [tether]))]
+      (is (false? (:durable? r)))
+      (is (= [:durable-network-not-yet-established
+              :phone-may-disconnect-at-any-time]
+             (:owed r)))
+      (is (= [:record-this-interface-as-the-machine-network] (:must-not r)))))
+  (testing "a durable bootstrap owes nothing"
+    (let [r (nb/receipt (nb/select [wired]))]
+      (is (true? (:durable? r)))
+      (is (nil? (:owed r)))
+      (is (nil? (:must-not r))))))
+
+(deftest refusals-are-named
+  (testing "an interface that is up but only link-local is not a network"
+    ;; The 169.254 case: an address exists, `ip addr` prints it, nothing routes.
+    (is (= :link-local-only-is-not-a-network
+           (:reason (nb/bootstrap-decision (assoc wired :addressing :link-local-only))))))
+
+  (testing "each other way of looking up while being unusable has its own name"
+    (are-reasons
+     [[:no-carrier (assoc wired :carrier? false)]
+      [:no-address (assoc wired :addressing :none)]
+      [:addressing-unknown (dissoc wired :addressing)]
+      [:addressing-unrecognised (assoc wired :addressing :bootp)]
+      [:static-addressing-not-authorised (assoc wired :addressing :static)]]))
+
+  (testing "an unclassified interface is refused, not guessed"
+    (is (= :unknown-interface-class
+           (:reason (nb/bootstrap-decision (assoc wired :class :ppp0)))))
+    (is (= :no-interface-class
+           (:reason (nb/bootstrap-decision (dissoc wired :class))))))
+
+  (testing "Wi-Fi is refused for R0 by name, not by omission"
+    (is (= :class-not-admitted-for-bootstrap
+           (:reason (nb/bootstrap-decision (assoc wired :class :wifi-sta))))))
+
+  (testing "loopback never bootstraps"
+    (is (= :class-not-admitted-for-bootstrap
+           (:reason (nb/bootstrap-decision (assoc wired :class :loopback)))))))
+
+(deftest static-addressing-opens-only-when-asked
+  (is (= :static-addressing-not-authorised
+         (:reason (nb/bootstrap-decision (assoc wired :addressing :static)))))
+  (is (:ok? (nb/bootstrap-decision (assoc wired :addressing :static)
+                                   {:static-allowed? true}))))
+
+(deftest selection-ranks-rather-than-refusing
+  ;; The install target disk refuses ambiguity because writing the wrong disk
+  ;; destroys data. Choosing the wrong link is corrected by choosing again, so
+  ;; refusing here would strand a machine that has two working paths.
+  (testing "wired wins over a tether when both are up"
+    (let [s (nb/select [tether wired])]
+      (is (:ok? s))
+      (is (= "enp1s0" (get-in s [:chosen :name])))
+      (is (= ["enp0s20u1"] (mapv :name (:alternatives s))))))
+
+  (testing "the tether carries it when there is no wired link"
+    (let [s (nb/select [(assoc wired :carrier? false) tether])]
+      (is (:ok? s))
+      (is (= "enp0s20u1" (get-in s [:chosen :name])))
+      (is (= [{:name "enp1s0" :reason :no-carrier}] (:refused s)))))
+
+  (testing "the same probe always yields the same choice"
+    (let [ifaces [iphone tether wired {:name "enp2s0" :class :pci-ethernet
+                                       :carrier? true :addressing :dhcp}]]
+      (is (apply = (map #(get-in (nb/select %) [:chosen :name])
+                        (take 8 (iterate shuffle ifaces)))))))
+
+  (testing "nothing admissible is a named refusal carrying every reason"
+    (let [s (nb/select [(assoc wired :carrier? false)
+                        (assoc tether :addressing :link-local-only)])]
+      (is (false? (:ok? s)))
+      (is (= :no-admissible-interface (:reason s)))
+      (is (= #{:no-carrier :link-local-only-is-not-a-network}
+             (set (map :reason (:refused s)))))))
+
+  (testing "an empty probe is refused, not treated as clean"
+    (is (= :no-admissible-interface (:reason (nb/select []))))))
+
+(deftest summary-says-which-question-was-answered
+  (is (= "bootstrapped on enp1s0 (pci-ethernet); durable"
+         (nb/summary (nb/receipt (nb/select [wired])))))
+  (is (= (str "bootstrapped on enp0s20u1 (usb-cdc-ncm); "
+              "EPHEMERAL -- this machine has no network of its own yet")
+         (nb/summary (nb/receipt (nb/select [tether])))))
+  (is (= "no bootstrap interface: no-admissible-interface (enp1s0=no-carrier)"
+         (nb/summary (nb/receipt (nb/select [(assoc wired :carrier? false)]))))))

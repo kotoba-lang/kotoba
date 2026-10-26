@@ -1,0 +1,131 @@
+#!/usr/bin/env kbb
+;; k16-job-probe.cljs -- one aiueos-micro-infer job across bus3, end to end,
+;; without murakumo credentials.
+;;
+;; This exists because "the relay works" and "the board computed something"
+;; are different claims and the murakumo path cannot separate them: a relay
+;; round trip proves liveness, and the contract
+;; os/aiueos/contracts/micro-inference-qualification-v1.edn says so in as many
+;; words. This probe speaks the SAME wire protocol the Mac relay speaks --
+;; AIUEOS_JOB_V1 out, AIUEOS_JOB_RESULT_V1 back -- and verifies the answer with
+;; the SAME table the relay verifies it with, read out of k16-pxe-server.py so
+;; there is no second copy to drift.
+;;
+;; It binds 10.10.10.1:9000, which k16-bus3-sink.cljs normally holds, so the
+;; sink must be stopped for the duration. That is deliberate: two readers of
+;; one UDP port is a coin toss, and a probe that silently lost the race would
+;; report "the board never answered".
+;;
+;; Usage:
+;;   kbb --backend sci os/aiueos/tools/k16-job-probe.cljk [--root .] [--prompt murakum]
+;;       [--listen 0.0.0.0:9000] [--node 10.10.10.2:9000] [--wait-s 180]
+;; Exit 0 = a verified answer, 1 = an answer that did not verify or none
+;; arrived, 2 = REFUSED (could not answer: port busy, no table, ...).
+(ns k16-job-probe
+  (:require ["node:dgram" :as dgram] ["node:fs" :as fs] [kotoba.lang.text :as str]))
+
+(defn arg [flag d] (let [a (vec *command-line-args*) i (.indexOf a flag)]
+                     (if (>= i 0) (nth a (inc i) d) d)))
+(def root (arg "--root" "."))
+(def prompt (arg "--prompt" "murakum"))
+(def listen (str/split (arg "--listen" "0.0.0.0:9000") #":"))
+(def node (str/split (arg "--node" "10.10.10.2:9000") #":"))
+(def wait-ms (* 1000 (js/parseInt (arg "--wait-s" "180") 10)))
+(def job-id (arg "--id" (str (+ 200 (mod (js/Date.now) 800)))))
+
+(defn now [] (.toISOString (js/Date.)))
+(defn say [& parts] (println (str (str/join " " parts) " t=" (now))))
+(defn refuse [& parts] (say "K16_JOB_PROBE_REFUSED" (str/join " " parts)) (js/process.exit 2))
+
+(def relay-path (str root "/os/aiueos/tools/k16-pxe-server.py"))
+(when-not (fs/existsSync relay-path) (refuse "reason=no-relay path=" relay-path))
+(def relay-text (fs/readFileSync relay-path "utf8"))
+
+(defn relay-regex [name]
+  (let [m (re-find (re-pattern (str name " = re\\.compile\\(\\s*((?:r\"[^\"]*\"\\s*)+)\\)")) relay-text)]
+    (when-not m (refuse (str "reason=no-regex name=" name)))
+    (js/RegExp. (apply str (map second (re-seq #"r\"([^\"]*)\"" (second m)))))))
+(def hello-re (relay-regex "NODE_HELLO"))
+(def result-re (relay-regex "JOB_RESULT"))
+
+(def expected
+  (let [block (second (re-find #"(?s)MURAKUMO_MICRO_INFER_ROWS = \{(.*?)\n\}" relay-text))
+        _ (when-not block (refuse "reason=no-expectation-table"))
+        rows (into {} (for [[_ k t s n] (re-seq #"\"(.)\": \(\"(.)\", (\d+), (\d+)\)" block)]
+                        [k [t (js/parseInt s 10) (js/parseInt n 10)]]))
+        row (get rows (subs prompt (dec (count prompt))))]
+    (when-not row (refuse (str "reason=prompt-not-in-table prompt=" (pr-str prompt))))
+    row))
+
+(def payload
+  (str "AIUEOS_JOB_V1 boot=BOOT id=" job-id " kind=aiueos-micro-infer prompt="
+       (str/join "" (map #(.padStart (.toString (.charCodeAt prompt %) 16) 2 "0")
+                         (range (count prompt))))))
+
+(def sock (dgram/createSocket "udp4"))
+(def state (atom {:boot nil :sent 0 :done false}))
+(def started (js/Date.now))
+
+(defn finish! [code & parts]
+  (when-not (:done @state)
+    (swap! state assoc :done true)
+    (apply say parts)
+    (.close sock (fn [] (js/process.exit code)))))
+
+(defn send-job! []
+  (when-let [boot (:boot @state)]
+    (let [line (str/replace payload "BOOT" boot)
+          buf (js/Buffer.from line "ascii")]
+      (.send sock buf 0 (.-length buf) (js/parseInt (second node) 10) (first node)
+             (fn [e] (when e (say "K16_JOB_PROBE_SEND_FAIL err=" (str e)))))
+      (swap! state update :sent inc))))
+
+(.on sock "error"
+     (fn [e] (say "K16_JOB_PROBE_BIND_FAIL err=" (str e))
+       (.close sock (fn [] (js/process.exit 2)))))
+
+(.on sock "message"
+     (fn [buf rinfo]
+       (let [text (.toString buf "ascii")]
+         (cond
+           (.test hello-re text)
+           (let [boot (second (.exec hello-re text))]
+             (when-not (= boot (:boot @state))
+               (swap! state assoc :boot boot :sent 0)
+               (say "K16_JOB_PROBE_HELLO boot=" boot "from=" (str (.-address rinfo) ":" (.-port rinfo)))
+               (send-job!)))
+
+           (.test result-re text)
+           (let [m (.exec result-re text)
+                 [_ boot got-id token-hex score total cycles] (js->clj m)
+                 token (js/String.fromCharCode (js/parseInt token-hex 16))
+                 ok (and (= boot (:boot @state))
+                         (= got-id job-id)
+                         (= token (first expected))
+                         (= (js/parseInt score 10) (second expected))
+                         (= (js/parseInt total 10) (nth expected 2)))]
+             (say "K16_JOB_PROBE_RESULT boot=" boot "id=" got-id
+                  "token=" (pr-str token) "score=" score "total=" total
+                  "cycles=" cycles "sent=" (str (:sent @state)))
+             (if ok
+               (finish! 0 "K16_JOB_PROBE_VERIFIED prompt=" (pr-str prompt)
+                        "expected=" (pr-str expected) "cycles=" cycles
+                        "round-trip-ms=" (str (- (js/Date.now) started)))
+               (finish! 1 "K16_JOB_PROBE_MISMATCH expected=" (pr-str expected)
+                        "got=" (pr-str [token (js/parseInt score 10) (js/parseInt total 10)])
+                        "boot-match=" (str (= boot (:boot @state)))
+                        "id-match=" (str (= got-id job-id)))))
+
+           :else nil))))
+
+;; The board polls bus3 ONCE per cycle and a run is four cycles, so a single
+;; datagram can miss the whole boot. Resend while the run lasts, exactly as
+;; dispatch_murakumo_job resends, and say how many it took.
+(js/setInterval (fn [] (when-not (:done @state) (send-job!))) 150)
+(js/setTimeout (fn [] (finish! 1 "K16_JOB_PROBE_TIMEOUT boot=" (str (:boot @state))
+                               "sent=" (str (:sent @state)))) wait-ms)
+
+(.bind sock (js/parseInt (second listen) 10) (first listen)
+       (fn [] (say "K16_JOB_PROBE_READY listen=" (str/join ":" listen)
+                   "node=" (str/join ":" node) "prompt=" (pr-str prompt)
+                   "id=" job-id "expect=" (pr-str expected))))

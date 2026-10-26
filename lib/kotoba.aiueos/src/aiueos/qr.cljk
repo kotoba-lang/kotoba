@@ -1,0 +1,363 @@
+(ns aiueos.qr
+  "QR Code (ISO/IEC 18004) encoder, byte mode, portable.
+
+  The installer shows the device-authorization approval URL as a QR on the
+  Linux console of the live USB (ADR-0239), and the native session is meant to
+  show the same QR on KERNEL.ELF later. Both need the same encoder, and the
+  hosted adapter's encoder is `io.nayuki/qrcodegen` -- a JVM jar, which neither
+  nbb on the stick nor amu-native can load. This namespace is the portable one;
+  the jar stays as the ORACLE (`aiueos.qr-test` compares every module against
+  it on the JVM) and is not replaced as the hosted adapter's dependency.
+
+  The algorithm follows qrcodegen 1.8.0 step for step -- the version-capacity
+  tables, the Reed-Solomon divisor, the codeword placement and the penalty
+  rules -- so the automatic mask choice is the same one it makes, not only a
+  decodable one. Only byte mode: the payload here is a URL, and an encoder that
+  picked numeric/alphanumeric segments would be a second place to be wrong.
+
+  A symbol is {:version v :ecc e :mask m :size s :modules [[bool]]}, row-major,
+  `true` = dark. No quiet zone is included; renderers add four modules.")
+
+(def ^:private ecc-ordinal {:low 0 :medium 1 :quartile 2 :high 3})
+(def ^:private ecc-format-bits {:low 1 :medium 0 :quartile 3 :high 2})
+
+(def ^:private ecc-codewords-per-block
+  [[-1 7 10 15 20 26 18 20 24 30 18 20 24 26 30 22 24 28 30 28 28 28 28 30 30 26 28 30 30 30 30 30 30 30 30 30 30 30 30 30 30]
+   [-1 10 16 26 18 24 16 18 22 22 26 30 22 22 24 24 28 28 26 26 26 26 28 28 28 28 28 28 28 28 28 28 28 28 28 28 28 28 28 28 28]
+   [-1 13 22 18 26 18 24 18 22 20 24 28 26 24 20 30 24 28 28 26 30 28 30 30 30 30 28 30 30 30 30 30 30 30 30 30 30 30 30 30 30]
+   [-1 17 28 22 16 22 28 26 26 24 28 24 28 22 24 24 30 28 28 26 28 30 24 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30]])
+
+(def ^:private num-error-correction-blocks
+  [[-1 1 1 1 1 1 2 2 2 2 4 4 4 4 4 6 6 6 6 7 8 8 9 9 10 12 12 12 13 14 15 16 17 18 19 19 20 21 22 24 25]
+   [-1 1 1 1 2 2 4 4 4 5 5 5 8 9 9 10 10 11 13 14 16 17 17 18 20 21 23 25 26 28 29 31 33 35 37 38 40 43 45 47 49]
+   [-1 1 1 2 2 4 4 6 6 8 8 8 10 12 16 12 17 16 18 21 20 23 23 25 27 29 34 34 35 38 40 43 45 48 51 53 56 59 62 65 68]
+   [-1 1 1 2 4 4 4 5 6 8 8 11 11 16 16 18 16 19 21 25 25 25 34 30 32 35 37 40 42 45 48 51 54 57 60 63 66 70 74 77 81]])
+
+(defn- bit? [x i] (not= 0 (bit-and (unsigned-bit-shift-right x i) 1)))
+(defn- magnitude [x] (if (neg? x) (- x) x))
+
+;; ---------------------------------------------------------------- capacity
+
+(defn- num-raw-data-modules [ver]
+  (let [r (+ (* (+ (* 16 ver) 128) ver) 64)
+        r (if (>= ver 2)
+            (let [n (+ (quot ver 7) 2)]
+              (- r (- (* (- (* 25 n) 10) n) 55)))
+            r)]
+    (if (>= ver 7) (- r 36) r)))
+
+(defn- block-ecc-len [ver ecc] (get-in ecc-codewords-per-block [(ecc-ordinal ecc) ver]))
+(defn- num-blocks [ver ecc] (get-in num-error-correction-blocks [(ecc-ordinal ecc) ver]))
+
+(defn- num-data-codewords [ver ecc]
+  (- (quot (num-raw-data-modules ver) 8)
+     (* (block-ecc-len ver ecc) (num-blocks ver ecc))))
+
+(defn- char-count-bits [ver] (if (<= ver 9) 8 16))
+
+(defn- data-bits-needed [ver n-bytes]
+  (+ 4 (char-count-bits ver) (* 8 n-bytes)))
+
+;; ---------------------------------------------------------------- GF(256)
+
+(defn- gf-mul [x y]
+  (loop [i 7 z 0]
+    (if (neg? i)
+      z
+      (let [z (bit-xor (bit-shift-left z 1)
+                       (* (unsigned-bit-shift-right z 7) 0x11D))
+            z (bit-and z 0x1FF)
+            z (if (bit? y i) (bit-xor z x) z)]
+        (recur (dec i) z)))))
+
+(defn- rs-divisor [degree]
+  (loop [i 0 root 1 result (assoc (vec (repeat degree 0)) (dec degree) 1)]
+    (if (= i degree)
+      result
+      (let [result (reduce (fn [r j]
+                             (let [v (gf-mul (r j) root)
+                                   v (if (< (inc j) degree) (bit-xor v (r (inc j))) v)]
+                               (assoc r j v)))
+                           result (range degree))]
+        (recur (inc i) (gf-mul root 2) result)))))
+
+(defn- rs-remainder [data divisor]
+  (reduce (fn [result b]
+            (let [factor (bit-xor b (first result))
+                  shifted (conj (subvec result 1) 0)]
+              (vec (map-indexed (fn [i v] (bit-xor v (gf-mul (divisor i) factor)))
+                                shifted))))
+          (vec (repeat (count divisor) 0))
+          data))
+
+;; ---------------------------------------------------------------- codewords
+
+(defn- data-codewords
+  "Byte-mode segment, terminator, bit padding and pad bytes, as codewords."
+  [ver ecc data]
+  (let [capacity-bits (* 8 (num-data-codewords ver ecc))
+        push (fn [bits value n] (into bits (map #(bit? value %) (range (dec n) -1 -1))))
+        bits (-> []
+                 (push 4 4)
+                 (push (count data) (char-count-bits ver)))
+        bits (reduce #(push %1 %2 8) bits data)
+        bits (into bits (repeat (min 4 (- capacity-bits (count bits))) false))
+        bits (into bits (repeat (mod (- 8 (mod (count bits) 8)) 8) false))
+        bytes (mapv (fn [chunk] (reduce (fn [acc b] (+ (* 2 acc) (if b 1 0))) 0 chunk))
+                    (partition 8 bits))]
+    (into bytes (take (- (quot capacity-bits 8) (count bytes)) (cycle [0xEC 0x11])))))
+
+(defn- add-ecc-and-interleave [ver ecc data]
+  (let [nblocks (num-blocks ver ecc)
+        ecc-len (block-ecc-len ver ecc)
+        raw (quot (num-raw-data-modules ver) 8)
+        n-short (- nblocks (mod raw nblocks))
+        short-len (quot raw nblocks)
+        divisor (rs-divisor ecc-len)
+        blocks (loop [i 0 k 0 acc []]
+                 (if (= i nblocks)
+                   acc
+                   (let [dlen (+ (- short-len ecc-len) (if (< i n-short) 0 1))
+                         dat (subvec data k (+ k dlen))
+                         block (into dat (rs-remainder dat divisor))
+                         ;; short blocks get a placeholder so every block has
+                         ;; short-len + 1 entries; it is skipped below
+                         block (if (< i n-short)
+                                 (into (conj (subvec block 0 dlen) nil) (subvec block dlen))
+                                 block)]
+                     (recur (inc i) (+ k dlen) (conj acc block)))))]
+    (vec (for [i (range (inc short-len))
+               j (range nblocks)
+               :when (or (not= i (- short-len ecc-len)) (>= j n-short))]
+           ((blocks j) i)))))
+
+;; ---------------------------------------------------------------- grid
+
+(defn- set-mod [g x y dark function?]
+  (cond-> (assoc-in g [:modules y x] dark)
+    function? (assoc-in [:function y x] true)))
+
+(defn- alignment-positions [ver size]
+  (if (= ver 1)
+    []
+    (let [n (+ (quot ver 7) 2)
+          step (* 2 (quot (+ (* ver 8) (* n 3) 5) (- (* n 4) 4)))]
+      (into [6] (reverse (take (dec n) (iterate #(- % step) (- size 7))))))))
+
+(defn- format-bits [ecc mask]
+  (let [data (bit-or (bit-shift-left (ecc-format-bits ecc) 3) mask)
+        rem (reduce (fn [r _] (bit-xor (bit-shift-left r 1)
+                                       (* (unsigned-bit-shift-right r 9) 0x537)))
+                    data (range 10))]
+    (bit-xor (bit-or (bit-shift-left data 10) (bit-and rem 0x3FF)) 0x5412)))
+
+(defn- draw-format-bits [g ecc mask]
+  (let [bits (format-bits ecc mask)
+        size (:size g)
+        b #(bit? bits %)
+        g (reduce #(set-mod %1 8 %2 (b %2) true) g (range 6))
+        g (-> g (set-mod 8 7 (b 6) true) (set-mod 8 8 (b 7) true) (set-mod 7 8 (b 8) true))
+        g (reduce #(set-mod %1 (- 14 %2) 8 (b %2) true) g (range 9 15))
+        g (reduce #(set-mod %1 (- size 1 %2) 8 (b %2) true) g (range 8))
+        g (reduce #(set-mod %1 8 (+ (- size 15) %2) (b %2) true) g (range 8 15))]
+    (set-mod g 8 (- size 8) true true)))
+
+(defn- draw-version [g ver]
+  (if (< ver 7)
+    g
+    (let [rem (reduce (fn [r _] (bit-xor (bit-shift-left r 1)
+                                         (* (unsigned-bit-shift-right r 11) 0x1F25)))
+                      ver (range 12))
+          bits (bit-or (bit-shift-left ver 12) (bit-and rem 0xFFF))
+          size (:size g)]
+      (reduce (fn [g i]
+                (let [dark (bit? bits i)
+                      a (+ (- size 11) (mod i 3))
+                      c (quot i 3)]
+                  (-> g (set-mod a c dark true) (set-mod c a dark true))))
+              g (range 18)))))
+
+(defn- draw-finder [g cx cy]
+  (let [size (:size g)]
+    (reduce (fn [g [dx dy]]
+              (let [d (max (magnitude dx) (magnitude dy))
+                    x (+ cx dx) y (+ cy dy)]
+                (if (and (< -1 x size) (< -1 y size))
+                  (set-mod g x y (and (not= d 2) (not= d 4)) true)
+                  g)))
+            g (for [dy (range -4 5) dx (range -4 5)] [dx dy]))))
+
+(defn- draw-alignment [g cx cy]
+  (reduce (fn [g [dx dy]]
+            (set-mod g (+ cx dx) (+ cy dy) (not= 1 (max (magnitude dx) (magnitude dy))) true))
+          g (for [dy (range -2 3) dx (range -2 3)] [dx dy])))
+
+(defn- function-patterns [ver ecc]
+  (let [size (+ 17 (* 4 ver))
+        row (vec (repeat size false))
+        g {:size size
+           :modules (vec (repeat size row))
+           :function (vec (repeat size row))}
+        g (reduce (fn [g i] (-> g (set-mod 6 i (even? i) true) (set-mod i 6 (even? i) true)))
+                  g (range size))
+        g (-> g (draw-finder 3 3) (draw-finder (- size 4) 3) (draw-finder 3 (- size 4)))
+        pos (alignment-positions ver size)
+        n (count pos)
+        g (reduce (fn [g [i j]]
+                    (if (or (and (= i 0) (= j 0))
+                            (and (= i 0) (= j (dec n)))
+                            (and (= i (dec n)) (= j 0)))
+                      g
+                      (draw-alignment g (pos i) (pos j))))
+                  g (for [i (range n) j (range n)] [i j]))]
+    (-> g (draw-format-bits ecc 0) (draw-version ver))))
+
+(defn- draw-codewords [g codewords]
+  (let [size (:size g)
+        total (* 8 (count codewords))
+        ;; column pairs right to left; the vertical timing column 6 is
+        ;; stepped over, so every pair left of it shifts by one
+        coords (for [right (map #(if (<= % 6) (dec %) %) (range (dec size) 0 -2))
+                     vert (range size)
+                     j [0 1]
+                     :let [x (- right j)
+                           upward (zero? (bit-and (inc right) 2))
+                           y (if upward (- size 1 vert) vert)]
+                     :when (not (get-in g [:function y x]))]
+                 [x y])]
+    (loop [g g i 0 cs coords]
+      (if (or (empty? cs) (>= i total))
+        g
+        (let [[x y] (first cs)
+              dark (bit? (codewords (quot i 8)) (- 7 (bit-and i 7)))]
+          (recur (assoc-in g [:modules y x] dark) (inc i) (rest cs)))))))
+
+(defn- mask-fn [mask]
+  (case (int mask)
+    0 (fn [x y] (zero? (mod (+ x y) 2)))
+    1 (fn [_ y] (zero? (mod y 2)))
+    2 (fn [x _] (zero? (mod x 3)))
+    3 (fn [x y] (zero? (mod (+ x y) 3)))
+    4 (fn [x y] (zero? (mod (+ (quot x 3) (quot y 2)) 2)))
+    5 (fn [x y] (zero? (+ (mod (* x y) 2) (mod (* x y) 3))))
+    6 (fn [x y] (zero? (mod (+ (mod (* x y) 2) (mod (* x y) 3)) 2)))
+    7 (fn [x y] (zero? (mod (+ (mod (+ x y) 2) (mod (* x y) 3)) 2)))))
+
+(defn- apply-mask [g mask]
+  (let [f (mask-fn mask)
+        size (:size g)
+        fun (:function g)]
+    (assoc g :modules
+           (vec (for [y (range size)]
+                  (let [row (get-in g [:modules y])
+                        frow (fun y)]
+                    (vec (for [x (range size)]
+                           (let [m (row x)]
+                             (if (and (not (frow x)) (f x y)) (not m) m))))))))))
+
+;; ---------------------------------------------------------------- penalty
+
+(defn- history-add [size h run]
+  (let [run (if (zero? (h 0)) (+ run size) run)]
+    (into [run] (subvec h 0 6))))
+
+(defn- history-count [h]
+  (let [n (h 1)
+        core (and (pos? n) (= (h 2) n) (= (h 3) (* n 3)) (= (h 4) n) (= (h 5) n))]
+    (+ (if (and core (>= (h 0) (* n 4)) (>= (h 6) n)) 1 0)
+       (if (and core (>= (h 6) (* n 4)) (>= (h 0) n)) 1 0))))
+
+(defn- line-penalty [size line]
+  (loop [xs line color false run 0 h (vec (repeat 7 0)) score 0]
+    (if (empty? xs)
+      (let [[run h] (if color [0 (history-add size h run)] [run h])
+            h (history-add size h (+ run size))]
+        (+ score (* 40 (history-count h))))
+      (let [c (first xs)]
+        (if (= c color)
+          (let [run (inc run)]
+            (recur (rest xs) color run h
+                   (cond (= run 5) (+ score 3) (> run 5) (inc score) :else score)))
+          (let [h (history-add size h run)
+                score (if color score (+ score (* 40 (history-count h))))]
+            (recur (rest xs) c 1 h score)))))))
+
+(defn- penalty [g]
+  (let [size (:size g)
+        m (:modules g)
+        rows (reduce + (map #(line-penalty size %) m))
+        cols (reduce + (map (fn [x] (line-penalty size (map #(% x) m))) (range size)))
+        blocks (* 3 (count (for [y (range (dec size)) x (range (dec size))
+                                 :let [c (get-in m [y x])]
+                                 :when (and (= c (get-in m [y (inc x)]))
+                                            (= c (get-in m [(inc y) x]))
+                                            (= c (get-in m [(inc y) (inc x)])))]
+                             1)))
+        dark (count (filter true? (apply concat m)))
+        total (* size size)
+        k (dec (quot (+ (magnitude (- (* dark 20) (* total 10))) total -1) total))]
+    (+ rows cols blocks (* 10 k))))
+
+;; ---------------------------------------------------------------- public
+
+(defn encode-bytes
+  "Encode `data` (a sequence of integers 0..255) in byte mode.
+
+  Options: :ecc (:low :medium :quartile :high, default :medium),
+  :min-version / :max-version (1..40), :mask (0..7, default automatic).
+  Returns nil when the data does not fit in :max-version -- a caller that gets
+  nil must refuse, not truncate."
+  ([data] (encode-bytes data {}))
+  ([data {:keys [ecc min-version max-version mask]
+          :or {ecc :medium min-version 1 max-version 40}}]
+   (let [data (vec data)
+         n (count data)]
+     (when-not (every? #(and (integer? %) (<= 0 % 255)) data)
+       (throw (ex-info "qr data must be bytes 0..255" {:reason :not-bytes})))
+     (when-not (contains? ecc-ordinal ecc)
+       (throw (ex-info "unknown qr ecc level" {:reason :ecc :ecc ecc})))
+     (when-let [ver (first (filter #(and (< n (bit-shift-left 1 (char-count-bits %)))
+                                         (<= (data-bits-needed % n)
+                                             (* 8 (num-data-codewords % ecc))))
+                                   (range min-version (inc max-version))))]
+       (let [codewords (add-ecc-and-interleave ver ecc (data-codewords ver ecc data))
+             base (draw-codewords (function-patterns ver ecc) codewords)
+             ;; first mask with the strictly lowest penalty, as qrcodegen
+             ;; picks it (`min-key` would keep the last of a tie)
+             choose (fn []
+                      (first (reduce (fn [[best score] m]
+                                       (let [p (penalty (draw-format-bits (apply-mask base m) ecc m))]
+                                         (if (< p score) [m p] [best score])))
+                                     [0 (penalty (draw-format-bits (apply-mask base 0) ecc 0))]
+                                     (range 1 8))))
+             mask (if (some? mask) mask (choose))
+             g (draw-format-bits (apply-mask base mask) ecc mask)]
+         {:version ver :ecc ecc :mask mask :size (:size g) :modules (:modules g)})))))
+
+(defn ascii-bytes
+  "The bytes of an ASCII string, or nil when any character is outside 0x20..0x7E.
+  The approval URL is ASCII by the authority's own shape; anything else is
+  refused rather than transcoded. (`(int \\c)` is not the code point on
+  ClojureScript, so the host reads it directly.)"
+  [s]
+  (let [codes (for [i (range (count s))]
+                #?(:clj (int (.charAt ^String s (int i)))
+                   :cljs (.charCodeAt s i)))]
+    (when (every? #(<= 0x20 % 0x7E) codes)
+      (vec codes))))
+
+(defn terminal-lines
+  "Render with a four-module quiet zone as terminal lines, two characters per
+  module, light modules drawn as reverse video so the code is dark-on-light on
+  any console (the Linux VT is light-on-dark). Runs of one colour share one
+  escape. Pure: returns strings."
+  [{:keys [size modules]}]
+  (let [quiet 4
+        dim (+ size (* 2 quiet))
+        dark? (fn [x y] (let [x (- x quiet) y (- y quiet)]
+                          (boolean (and (< -1 x size) (< -1 y size) (get-in modules [y x])))))
+        run (fn [d n] (let [cells (apply str (repeat (* 2 n) " "))]
+                        (if d cells (str "\u001b[7m" cells "\u001b[0m"))))]
+    (vec (for [y (range dim)]
+           (apply str (map (fn [grp] (run (first grp) (count grp)))
+                           (partition-by identity (map #(dark? % y) (range dim)))))))))

@@ -1,0 +1,261 @@
+(ns aiueos.session.operator
+  "P4: itonami operator plane from the same hosted daily shell.
+
+  Consumer kotobase/murakumo stays in `aiueos.session.live` and
+  `resources/aiueos/cloud_live.edn`. This namespace is the industrial
+  path: grant first, then this process GETs live itonami.cloud.
+  Without the operator grant the socket must not open
+  (root ADR-2608221625).
+
+  Deny import is `:itonami/operator`, which grant does not resolve —
+  public reason `:operator-grant-required`. Allow drops that import so
+  grant admits, then HTTP uses `resources/aiueos/operator_itonami.edn`
+  (itonami.cloud only)."
+  (:require [kotoba.lang.text :as str]
+            #?(:clj [aiueos.cloud-live :as cloud-live])
+            #?(:clj [aiueos.provider.cloud :as provider])
+            #?(:clj [clojure.edn :as edn])
+            #?(:clj [kotoba.io :as io])
+            #?(:clj [grant.broker :as broker])
+            #?(:clj [grant.cloud :as cloud])
+            #?(:clj [grant.graph :as graph])
+            #?(:clj [grant.policy :as policy])))
+
+(def component-id :operator/itonami)
+
+(def operator-grant-reason :operator-grant-required)
+
+(def policy-resource "aiueos/operator_itonami.edn")
+
+(def authority-host "itonami.cloud")
+
+#?(:clj (def empty-graph (graph/build [])))
+
+#?(:clj (def default-policy policy/default-policy))
+
+#?(:clj (defonce ^:private itonami-http-count (atom 0)))
+
+#?(:clj
+   (defn http-call-count
+     []
+     @itonami-http-count))
+
+#?(:clj
+   (defn reset-http-call-count!
+     []
+     (reset! itonami-http-count 0)))
+
+(defn allow-manifest
+  "Grant admits: kernel `:log/write` only. The process, not the
+  component, is what later talks to itonami."
+  []
+  {:aiueos/component component-id
+   :aiueos/kind :app
+   :aiueos/trust :untrusted
+   :aiueos/imports #{:log/write}
+   :aiueos/exports #{:operator/itonami}
+   :aiueos/effects #{}
+   :aiueos/limits {:memory-pages 16 :fuel 100000}})
+
+(defn deny-manifest
+  "Grant refuses: `:itonami/operator` has no provider. Named reason is
+  `:operator-grant-required` (broker kind stays `:unresolved-capability`)."
+  []
+  {:aiueos/component component-id
+   :aiueos/kind :app
+   :aiueos/trust :untrusted
+   :aiueos/imports #{:itonami/operator}
+   :aiueos/exports #{:operator/itonami}
+   :aiueos/effects #{}
+   :aiueos/limits {:memory-pages 16 :fuel 100000}})
+
+(defn parse-grant-mode
+  [x]
+  (let [s (str/lower (str (or x "")))]
+    (if (contains? #{"allow" ":allow" "grant"} s) :allow :deny)))
+
+(defn violation-kind
+  [decision]
+  (some-> (:aiueos/violations decision) first :aiueos/kind))
+
+(defn- json-true?
+  [body k]
+  (boolean (re-find (re-pattern (str "\"" (name k) "\"\\s*:\\s*true"))
+                    (str body))))
+
+(defn- clip
+  [s n]
+  (let [t (str s)]
+    (if (<= (count t) n) t (str (subs t 0 n) "…"))))
+
+#?(:clj
+   (defn read-operator-policy
+     "Operator allowlist + host-bound pin. Not `cloud_live.edn`."
+     []
+     (let [res (io/resource policy-resource)]
+       (when-not res
+         (throw (ex-info "operator_itonami.edn missing"
+                         {:aiueos.session.operator/reason :policy-missing
+                          :resource policy-resource})))
+       (cloud-live/with-clock (edn/read-string (slurp res))))))
+
+#?(:clj
+   (defn- get-path!
+     "GET against the operator policy. Increments the HTTP counter only
+     when `grant.cloud/perform` is about to run."
+     [policy path]
+     (let [plan (cloud/plan-liveness policy path)
+           url (or (get-in plan [:aiueos.cloud/request :url])
+                   (:aiueos.cloud/url plan)
+                   (str "https://" authority-host path))]
+       (if-not (cloud/allowed? plan)
+         {:called false
+          :url url
+          :path path
+          :outcome :refused
+          :reason (or (:aiueos.cloud/reason plan) :plan-not-allowed)}
+         (do
+           (swap! itonami-http-count inc)
+           (let [arrived (provider/perform! policy plan {:decode-body? true})
+                 fault (:aiueos.provider.cloud/error arrived)
+                 status (:status arrived)
+                 body (:body arrived)
+                 host (or (:peer-host arrived) authority-host)]
+             {:called true
+              :url url
+              :path path
+              :host host
+              :status status
+              :body (clip body 1500)
+              :peer_spki (:peer-spki arrived)
+              :fault (some-> fault name)
+              :outcome (cond
+                         (and (nil? fault) (= 200 status)) :admitted
+                         (contains? #{:request-failed} fault) :unmeasured
+                         (nil? status) :unmeasured
+                         :else :refused)
+              :ok (json-true? body :ok)
+              :live (json-true? body :live)
+              :inventory (boolean (and (= 200 status)
+                                       (re-find #"\"tenants\"" (str body))))}))))))
+
+#?(:clj
+   (defn admit-operator
+     "Grant only. No HTTP. Deny never becomes a 500."
+     [mode]
+     (let [m (case mode
+               :allow (allow-manifest)
+               :deny (deny-manifest)
+               (throw (ex-info "grant mode must be :allow or :deny"
+                               {:aiueos.session.operator/reason :unknown-grant-mode
+                                :mode mode})))
+           decision (broker/verify-one m empty-graph default-policy)
+           granted? (= :grant (:aiueos/decision decision))
+           kind (violation-kind decision)
+           reason (when-not granted?
+                    (if (= :unresolved-capability kind)
+                      operator-grant-reason
+                      (or kind (:aiueos/decision decision) operator-grant-reason)))]
+       {:mode mode
+        :component component-id
+        :decision (:aiueos/decision decision)
+        :granted granted?
+        :visible false
+        :called false
+        :reason reason
+        :grant-kind kind
+        :via "grant"
+        :via_process "session-process"
+        :violations (mapv (fn [v]
+                            {:kind (name (:aiueos/kind v))
+                             :message (:aiueos/message v)})
+                          (:aiueos/violations decision))})))
+
+#?(:clj
+   (defn- live-legs!
+     [adm]
+     (let [policy (read-operator-policy)
+           health-path (or (:aiueos.operator/health-path policy) "/api/health")
+           inv-path (or (:aiueos.operator/inventory-path policy) "/api/fleet/metrics")
+           auth-path (or (:aiueos.operator/auth-path policy)
+                         "/api/network-awai/cloud-itonami/state")
+           health (get-path! policy health-path)
+           inventory (get-path! policy inv-path)
+           auth (get-path! policy auth-path)
+           health-ok? (and (= :admitted (:outcome health))
+                           (= 200 (:status health))
+                           (= authority-host (:host health))
+                           (or (:live health) (:ok health)))
+           inv-ok? (and (= :admitted (:outcome inventory))
+                        (= 200 (:status inventory))
+                        (= authority-host (:host inventory))
+                        (or (:ok inventory) (:inventory inventory)))
+           visible? (and health-ok? inv-ok?)]
+       (merge adm
+              {:visible visible?
+               :called true
+               :host authority-host
+               :health_status (:status health)
+               :health_outcome (name (:outcome health))
+               :inventory_status (:status inventory)
+               :inventory_outcome (name (:outcome inventory))
+               :inventory (boolean (:inventory inventory))
+               :auth_status (:status auth)
+               :auth_outcome (name (:outcome auth))
+               :auth_path auth-path
+               :surface (:url health)
+               :health_body (:body health)
+               :inventory_body (:body inventory)
+               :http_calls (http-call-count)
+               :reason (when-not visible?
+                         (or (:reason health) (:reason inventory)
+                             :operator-surface-not-admitted))}))))
+
+#?(:clj
+   (defn run
+     "Live itonami legs run only after grant allow.
+     Deny is 403 `:operator-grant-required` with zero HTTP."
+     [mode]
+     (let [adm (admit-operator mode)]
+       (if (and (= :allow mode) (:granted adm))
+         (live-legs! adm)
+         (assoc adm :called false :visible false)))))
+
+(defn public-snapshot
+  [state]
+  (when state
+    (let [visible? (boolean (:visible state))
+          decision (name (or (:decision state) :deny))
+          reason (some-> (:reason state) name)]
+      (cond-> {:component (str/replace (str (:component state component-id)) #"^:" "")
+               :decision decision
+               :visible visible?
+               :called (boolean (:called state))
+               :via (or (:via state) "grant")
+               :via_process (or (:via_process state) "session-process")
+               :authority authority-host}
+        reason (assoc :reason reason)
+        (:grant-kind state) (assoc :grant_kind (name (:grant-kind state)))
+        (:host state) (assoc :host (:host state))
+        (:surface state) (assoc :surface (:surface state))
+        (:health_status state) (assoc :health_status (:health_status state)
+                                      :health_outcome (:health_outcome state))
+        (:inventory_status state) (assoc :inventory_status (:inventory_status state)
+                                         :inventory_outcome (:inventory_outcome state)
+                                         :inventory (:inventory state))
+        (:auth_status state) (assoc :auth_status (:auth_status state)
+                                    :auth_outcome (:auth_outcome state)
+                                    :auth_path (:auth_path state))
+        (:health_body state) (assoc :health_body (:health_body state))
+        (:inventory_body state) (assoc :inventory_body (:inventory_body state))
+        (seq (:violations state)) (assoc :violations (:violations state))))))
+
+(defn http-code
+  [state]
+  (cond
+    (nil? state) 200
+    (:visible state) 200
+    (and (= :allow (:mode state))
+         (contains? #{:unmeasured} (keyword (:health_outcome state)))) 503
+    (:granted state) (if (= "unmeasured" (:health_outcome state)) 503 400)
+    :else 403))

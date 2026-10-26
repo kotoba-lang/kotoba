@@ -1,0 +1,202 @@
+(ns native.relay-line
+  ;; The murakumo relay protocol as bytes: writing the fixed-width ASCII lines
+  ;; native/relay_text.kotoba packs, reading the one line the Mac sends back,
+  ;; and the IPv4 header checksum a variable-length datagram needs.
+  ;;
+  ;; This module touches only pages the caller hands it. It holds no MMIO, no
+  ;; ring, and no capability -- the frame assembly and the submit live in
+  ;; native/debug_link.kotoba, which owns bus3. Keeping the two apart is what
+  ;; lets the formatting be reasoned about without a NIC.
+  ;;
+  ;; EVERY store is checked by a READ-BACK. `kernel-store-u8-4k` RETURNS ITS
+  ;; OPERAND, so `(= (kernel-store-u8-4k f p o v) v)` is a tautology that
+  ;; passes whether or not the byte landed (lang-h13). The `(* 0 stored)`
+  ;; term keeps the store in the dependency graph without letting its value
+  ;; into the comparison.
+  (:require [native.relay-text :as text]
+            [native.micro-infer :as mi])
+  (:export [store-byte store-template store-hex store-dec store-mac-hex
+            template-match header-checksum digits-run decimal-value
+            hex-pair prompt-scan copy-bytes frame-be16]))
+
+;; ── writing ──────────────────────────────────────────────────────────────
+
+(defn store-byte [frame offset value]
+  (let [stored (kernel-store-u8-4k frame 4096 offset value)]
+    (if (= (+ (kernel-load-u8-4k frame 4096 offset) (* 0 stored)) value) 1 0)))
+
+(defn hex-char [value]
+  ;; lowercase: the relay's regexes are [0-9a-f], not [0-9a-fA-F].
+  (if (< value 10) (+ 48 value) (+ 87 value)))
+
+(defn store-word [frame offset word bytes]
+  ;; `bytes` ASCII characters out of one packed i64, low byte first.
+  (if (= bytes 0)
+    1
+    (if (= (store-byte frame offset (bit-and word 255)) 1)
+      (store-word frame (+ offset 1) (quot word 256) (- bytes 1))
+      0)))
+
+(defn store-template [frame offset kind index remaining]
+  ;; Write `remaining` bytes of template `kind` starting at word `index`.
+  ;; Callers pass index 0 and the template's own length.
+  (if (<= remaining 0)
+    1
+    (if (= (store-word frame offset (text/template-word kind index)
+                       (if (< remaining 8) remaining 8))
+           1)
+      (store-template frame (+ offset 8) kind (+ index 1)
+                      (- remaining (if (< remaining 8) remaining 8)))
+      0)))
+
+(defn store-hex [frame offset value digits]
+  ;; `digits` lowercase hex characters, right-aligned: the least significant
+  ;; nibble lands at offset+digits-1. The caller must keep `value`
+  ;; non-negative -- a set bit 63 makes `quot` walk the wrong way -- which is
+  ;; why the boot nonce is masked to 60 bits where it is drawn.
+  (if (= digits 0)
+    1
+    (if (= (store-byte frame (+ offset (- digits 1)) (hex-char (bit-and value 15))) 1)
+      (store-hex frame offset (quot value 16) (- digits 1))
+      0)))
+
+(defn store-dec [frame offset value digits]
+  ;; Fixed width with leading zeros. Legitimate because every numeric field
+  ;; the relay reads back goes through int(), which accepts them -- the ONE
+  ;; field that does not is `id`, which the relay compares as a string and
+  ;; which is therefore copied from the request rather than formatted here.
+  (if (= digits 0)
+    1
+    ;; `rem` is not a builtin in this subset -- the modulus is spelled out.
+    (if (= (store-byte frame (+ offset (- digits 1))
+                       (+ 48 (- value (* 10 (quot value 10))))) 1)
+      (store-dec frame offset (quot value 10) (- digits 1))
+      0)))
+
+(defn store-mac-hex [frame offset mmio index]
+  ;; IDR0..5 as xx-xx-xx-xx-xx-xx, 17 bytes. The separator is written for
+  ;; every octet but the last, so the run ends on a hex digit.
+  (if (= index 6)
+    1
+    (let [octet (bit-and (kernel-load-u8 mmio 512 index) 255)
+          at (+ offset (* index 3))]
+      (if (and (= (store-byte frame at (hex-char (quot octet 16))) 1)
+               (= (store-byte frame (+ at 1) (hex-char (bit-and octet 15))) 1)
+               (= (if (= index 5) 1 (store-byte frame (+ at 2) 45)) 1))
+        (store-mac-hex frame offset mmio (+ index 1))
+        0))))
+
+(defn copy-bytes [dst src dst-offset src-offset count]
+  (if (= count 0)
+    1
+    (let [value (kernel-load-u8-4k src 4096 src-offset)]
+      (if (= (store-byte dst dst-offset value) 1)
+        (copy-bytes dst src (+ dst-offset 1) (+ src-offset 1) (- count 1))
+        0))))
+
+;; ── reading ──────────────────────────────────────────────────────────────
+
+(defn frame-be16 [frame offset]
+  (+ (* (kernel-load-u8-4k frame 4096 offset) 256)
+     (kernel-load-u8-4k frame 4096 (+ offset 1))))
+
+(defn word-match [frame offset word bytes]
+  (if (= bytes 0)
+    1
+    (if (= (kernel-load-u8-4k frame 4096 offset) (bit-and word 255))
+      (word-match frame (+ offset 1) (quot word 256) (- bytes 1))
+      0)))
+
+(defn template-match [frame offset kind index remaining]
+  ;; 1 when the bytes at `offset` are template `kind`, 0 otherwise. Used to
+  ;; recognise the request the Mac sends, from the SAME table the answer is
+  ;; written from -- so the two ends cannot drift apart in this file.
+  (if (<= remaining 0)
+    1
+    (if (= (word-match frame offset (text/template-word kind index)
+                       (if (< remaining 8) remaining 8))
+           1)
+      (template-match frame (+ offset 8) kind (+ index 1)
+                      (- remaining (if (< remaining 8) remaining 8)))
+      0)))
+
+(defn digits-run [frame offset limit count]
+  ;; How many decimal digits start at `offset`, up to `limit`. The relay
+  ;; compares the id as a string, so this measures the run rather than
+  ;; parsing it.
+  (if (>= count limit)
+    count
+    (let [c (kernel-load-u8-4k frame 4096 (+ offset count))]
+      (if (and (>= c 48) (<= c 57))
+        (digits-run frame offset limit (+ count 1))
+        count))))
+
+(defn- decimal-value-loop [frame offset count acc]
+  ;; The value of `count` decimal digits at `offset`. The relay compares the
+  ;; liveness sequence numerically (int(seq) == sequence), so unlike `id` this
+  ;; one is parsed and re-emitted at a fixed width rather than copied.
+  (if (= count 0)
+    acc
+    (decimal-value-loop frame (+ offset 1) (- count 1)
+                   (+ (* acc 10) (- (kernel-load-u8-4k frame 4096 offset) 48)))))
+
+(defn decimal-value [parent parent-bytes offset count acc]
+  ;; This retained diagnostic has no external kernel caller. Its public
+  ;; pair supplies a bounded frame before the recursive implementation runs.
+  (let [frame (kernel-subregion parent parent-bytes 0 4096)]
+    (decimal-value-loop frame offset count acc)))
+
+(defn hex-value [c]
+  (if (and (>= c 48) (<= c 57))
+    (- c 48)
+    (if (and (>= c 97) (<= c 102)) (- c 87) 16)))
+
+(defn hex-pair [frame offset]
+  ;; One byte out of two lowercase hex characters, or 256 if either is not
+  ;; one. 256 is outside the byte range on purpose: a caller that forgets to
+  ;; check it gets a vocabulary refusal rather than a plausible character.
+  (let [hi (hex-value (kernel-load-u8-4k frame 4096 offset))
+        lo (hex-value (kernel-load-u8-4k frame 4096 (+ offset 1)))]
+    (if (= hi 16)
+      256
+      (if (= lo 16) 256 (+ (* hi 16) lo)))))
+
+(defn prompt-scan [frame offset remaining last]
+  ;; The hex-encoded prompt, validated the way kernel/micro_infer.c validates
+  ;; it: EVERY character must be in the vocabulary and the answer comes from
+  ;; the LAST one. Returns 27 for a prompt that is empty, odd-length, or
+  ;; carries anything outside " a-z" -- which the caller must treat as a
+  ;; refusal, never as a token.
+  (if (< remaining 2)
+    (if (= remaining 0) last 27)
+    (let [value (mi/vocab-index (hex-pair frame offset))]
+      (if (= value 27)
+        27
+        (prompt-scan frame (+ offset 2) (- remaining 2) value)))))
+
+;; ── the IPv4 header checksum ─────────────────────────────────────────────
+;; debug_link's one-byte datagram could bake its checksum in, because every
+;; field of that header was a constant. A result line's length depends on the
+;; id the Mac chose, so this one is computed. Leaving it wrong is not visible
+;; from the board: the Mac drops the datagram in ip_input and both ends read
+;; as healthy (measured 2026-09-08, and it cost this plane a day).
+
+(defn checksum-word [frame base offset]
+  (+ (* (kernel-load-u8-4k frame 4096 (+ base offset)) 256)
+     (kernel-load-u8-4k frame 4096 (+ base offset 1))))
+
+(defn checksum-sum [frame base offset remaining total]
+  (if (= remaining 0)
+    total
+    (checksum-sum frame base (+ offset 2) (- remaining 2)
+                  (+ total (checksum-word frame base offset)))))
+
+(defn checksum-fold [total]
+  (if (<= total 65535)
+    total
+    (checksum-fold (+ (bit-and total 65535) (quot total 65536)))))
+
+(defn header-checksum [frame base]
+  ;; The caller must have written the 20-byte header with the checksum field
+  ;; itself zeroed.
+  (- 65535 (checksum-fold (checksum-sum frame base 0 20 0))))

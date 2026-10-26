@@ -1,0 +1,304 @@
+#!/usr/bin/env kbb
+;; Offline proof of the install chain's admission and refusal behavior
+;; (install-v1.edn gates I2 and I5). Runs on fake devices and temp files;
+;; never opens a real block device.
+;;
+;; Discipline (root ADR adr-2608136000 question 6): every refusal test pins
+;; the NAMED reason literal, not just a non-zero exit -- a run that fails for
+;; a different reason than the one under test is a test bug, not a pass. The
+;; admit tests exist so the refusals are non-vacuous: a pipeline that cannot
+;; pass at all would make every refusal green for free.
+;;
+;; Output: one AIUEOS_INSTALL_CHAIN_* line per case, then a summary with an
+;; exact expected count. Exit 0 only when every case held AND the count
+;; matches -- a harness that silently ran fewer cases must not look like one
+;; that ran them all.
+
+(require '[kotoba.lang.text :as str])
+
+(def fs (js/require "node:fs"))
+(def path (js/require "node:path"))
+(def cp (js/require "node:child_process"))
+(def os-mod (js/require "node:os"))
+(def crypto (js/require "node:crypto"))
+
+(def scripts-dir (.dirname path *file*))
+(def tmp (.mkdtempSync fs (.join path (.tmpdir os-mod) "aiueos-install-chain-")))
+
+(def results (atom []))
+(defn- record! [name ok detail]
+  (swap! results conj {:name name :ok ok :detail detail})
+  (println (if ok "AIUEOS_INSTALL_CHAIN_OK " "AIUEOS_INSTALL_CHAIN_FAIL") name detail))
+
+(defn- run [cmd args env]
+  (let [r (.spawnSync cp cmd (to-array args)
+                      #js {:encoding "utf8" :shell false
+                           :env (js/Object.assign #js {} (.-env js/process) (clj->js env))})]
+    {:status (or (.-status r) 1) :out (or (.-stdout r) "") :err (or (.-stderr r) "")}))
+
+(defn- sha256-hex [buf]
+  (-> (.createHash crypto "sha256") (.update buf) (.digest "hex")))
+
+(defn- write! [p content]
+  (.writeFileSync fs p content))
+
+(defn- json! [p m]
+  (write! p (.stringify js/JSON (clj->js m) nil 2)))
+
+;; ------------------------------------------------------------------ fixtures
+
+;; A fake release image whose LBA 1 looks enough like the release GPT for the
+;; repeat-safety probe: "EFI PART" magic and the deterministic release disk
+;; GUID at header offset 56.
+(def image-bytes (* 4 1024 1024))
+(def fake-image
+  (let [buf (js/Buffer.alloc image-bytes)]
+    (.write buf "EFI PART" 512 "utf8")
+    (.copy (js/Buffer.from "d1b20bd7e33801529f66a46b55077905" "hex") buf (+ 512 56))
+    buf))
+(def image-path (.join path tmp "release.img"))
+(write! image-path fake-image)
+(def receipt-path (.join path tmp "release-receipt.json"))
+(json! receipt-path {:schema "aiueos.build-receipt.v1"
+                     :disk {:bytes image-bytes :sha256 (sha256-hex fake-image)}})
+
+;; A REAL ssh-ed25519 authorized_keys line: string "ssh-ed25519" + the 32-byte
+;; public key, each length-prefixed. Provisioning parses this and refuses a
+;; blob that is not a well-formed ed25519 key, so a random blob would not do.
+(def pubkey-path (.join path tmp "test-key.pub"))
+(defn- ssh-string [buf]
+  (let [len (js/Buffer.alloc 4)]
+    (.writeUInt32BE len (.-length buf) 0)
+    (js/Buffer.concat #js [len buf])))
+(def owner-keypair (.generateKeyPairSync crypto "ed25519"))
+(def owner-raw-pub
+  (let [spki (.export (.-publicKey owner-keypair) #js {:format "der" :type "spki"})]
+    (.subarray spki (- (.-length spki) 32))))
+(def owner-blob
+  (js/Buffer.concat #js [(ssh-string (js/Buffer.from "ssh-ed25519" "utf8"))
+                         (ssh-string owner-raw-pub)]))
+(write! pubkey-path
+        (str "ssh-ed25519 " (.toString owner-blob "base64") " install-chain-test\n"))
+
+(defn- create-intent! [out & extra]
+  (run "nbb" (concat [(.join path scripts-dir "install-intent.cljk") "create"
+                      "--receipt" receipt-path
+                      "--hostname" "aiueos-test" "--confirm-create" "aiueos-test"
+                      "--target-model" "FAKE" "--target-transport" "nvme"
+                      "--target-min-gb" "0" "--target-max-gb" "1"
+                      "--ssh-public-key-file" pubkey-path
+                      "--out" out]
+                     extra)
+       {}))
+
+(def intent-path (.join path tmp "intent.json"))
+(let [{:keys [status err]} (create-intent! intent-path)]
+  (record! "intent-create" (zero? status) (str/trim err)))
+
+;; A live-shaped inspection report to feed `verify` directly.
+(defn- report [target-overrides]
+  {:mode "inspect" :backend "fake" :allowed true :reasons []
+   :image {:bytes image-bytes :sha256 (sha256-hex fake-image)}
+   :target (merge {:path "/dev/fakedisk0" :type "disk" :whole true :internal true
+                   :empty true :mounted false :boot false :system false
+                   :bytes (* 8 1024 1024) :model "FAKE NVMe Disk"
+                   :transport "nvme"}
+                  target-overrides)
+   :systemDisks ["/dev/fakesys0"]})
+
+(defn- verify-case!
+  "Run install-intent verify against REPORT and require exactly EXPECT:
+  :admit, or a refusal whose printed reason includes the named literal."
+  [name the-report expect & verify-args]
+  (let [rp (.join path tmp (str name "-report.json"))]
+    (json! rp the-report)
+    (let [{:keys [status out]}
+          (run "nbb" (concat [(.join path scripts-dir "install-intent.cljk") "verify"
+                              "--intent" intent-path "--report" rp]
+                             verify-args)
+               {})]
+      (if (= expect :admit)
+        (record! name (and (zero? status)
+                           (str/includes? out "AIUEOS_INSTALL_INTENT_ADMIT"))
+                 (str "status=" status))
+        (record! name (and (= 2 status)
+                           (str/includes? out (str "AIUEOS_INSTALL_INTENT_REFUSE " expect)))
+                 (str "status=" status " out=" (str/trim out)))))))
+
+(verify-case! "verify-admit" (report {}) :admit)
+(verify-case! "refuse-model" (report {:model "Samsung SSD 990"}) "target-model-mismatch")
+(verify-case! "refuse-capacity" (report {:bytes (* 2000 1000 1000 1000)})
+              "target-capacity-out-of-bounds")
+(verify-case! "refuse-transport" (report {:transport "usb"}) "target-transport-mismatch")
+(verify-case! "refuse-transport-unmeasured" (report {:transport nil})
+              "target-transport-unmeasured")
+(verify-case! "refuse-release-digest"
+              (assoc (report {}) :image {:bytes image-bytes :sha256 (str/join (repeat 64 "0"))})
+              "intent-release-digest-mismatch")
+
+;; Serial binding: a second intent that pins a serial digest.
+(def serial-intent (.join path tmp "intent-serial.json"))
+(let [{:keys [status]} (create-intent! serial-intent "--target-serial" "SN-1234")]
+  (record! "intent-create-serial" (zero? status) ""))
+(defn- verify-serial! [name expect & args]
+  (let [rp (.join path tmp (str name "-report.json"))]
+    (json! rp (report {}))
+    (let [{:keys [status out]}
+          (run "nbb" (concat [(.join path scripts-dir "install-intent.cljk") "verify"
+                              "--intent" serial-intent "--report" rp]
+                             args)
+               {})]
+      (if (= expect :admit)
+        (record! name (zero? status) (str "status=" status))
+        (record! name (and (= 2 status)
+                           (str/includes? out (str "AIUEOS_INSTALL_INTENT_REFUSE " expect)))
+                 (str "status=" status " out=" (str/trim out)))))))
+(verify-serial! "serial-admit" :admit "--serial" "SN-1234")
+(verify-serial! "refuse-serial-mismatch" "target-serial-mismatch" "--serial" "SN-9999")
+(verify-serial! "refuse-serial-unmeasured" "target-serial-unmeasured")
+
+;; Expiry: an intent that is already expired refuses everything.
+(def expired-intent (.join path tmp "intent-expired.json"))
+(let [{:keys [status]} (create-intent! expired-intent "--expires-days" "-1")]
+  (record! "intent-create-expired" (zero? status) ""))
+(let [rp (.join path tmp "expired-report.json")]
+  (json! rp (report {}))
+  (let [{:keys [status out]}
+        (run "nbb" [(.join path scripts-dir "install-intent.cljk") "verify"
+                    "--intent" expired-intent "--report" rp] {})]
+    (record! "refuse-expired"
+             (and (= 2 status)
+                  (str/includes? out "AIUEOS_INSTALL_INTENT_REFUSE intent-expired"))
+             (str "status=" status))))
+
+;; --------------------------------------------------- fake-device end to end
+
+(def fake-env {:NODE_ENV "test" :AIUEOS_INSTALLER_ALLOW_FAKE "1"})
+(def fake-out (.join path tmp "fake-target.bin"))
+(def fake-config (.join path tmp "fake-device.json"))
+(json! fake-config {:info {:path "/dev/fakedisk0" :type "disk" :whole true
+                           :internal true :empty true :mounted false
+                           :boot false :system false :bytes (* 8 1024 1024)
+                           :model "FAKE NVMe Disk" :transport "nvme"
+                           :nodeIdentity {:dev 1 :ino 1 :rdev 1 :mode 1}}
+                    :systemDisks ["/dev/fakesys0"]
+                    :outputPath fake-out})
+
+(defn- orchestrate [& extra]
+  (run "nbb" (concat [(.join path scripts-dir "install-to-disk.cljk")
+                      "--intent" intent-path "--device" "/dev/fakedisk0"
+                      "--image" image-path "--receipt" receipt-path
+                      "--fake-device-config" fake-config]
+                     extra)
+       fake-env))
+
+(let [{:keys [status out err]} (orchestrate)]
+  (record! "e2e-dry-run-admit"
+           (and (zero? status) (str/includes? out "AIUEOS_INSTALL_ADMIT"))
+           (str "status=" status " " (str/trim err))))
+
+(let [{:keys [status out err]}
+      (orchestrate "--install" "--confirm-device" "/dev/fakedisk0"
+                   "--destructive-phrase" "ERASE /dev/fakedisk0 FOR AIUEOS")]
+  (record! "e2e-install"
+           (and (zero? status) (str/includes? out "AIUEOS_INSTALL_OK"))
+           (str "status=" status " " (str/trim err))))
+
+(def receipt-offset (* (quot (- (* 8 1024 1024) (* 1024 1024)) 4096) 4096))
+(def provision-offset (- receipt-offset 16384))
+
+(record! "e2e-target-receipt-present"
+         (let [fd (.openSync fs fake-out "r")
+               buf (js/Buffer.alloc 25)]
+           (.readSync fs fd buf 0 25 receipt-offset)
+           (.closeSync fs fd)
+           (= "AIUEOS-INSTALL-RECEIPT-V1" (.toString buf "utf8")))
+         "")
+
+;; Provisioning: the record landed, its host key is a valid ed25519 key
+;; (matches the openssh line it published), and the authorized key is the
+;; owner's, not something invented.
+(def provision-record
+  (let [fd (.openSync fs fake-out "r")
+        buf (js/Buffer.alloc 16384)]
+    (.readSync fs fd buf 0 16384 provision-offset)
+    (.closeSync fs fd)
+    (let [text (.toString buf "utf8")
+          magic "AIUEOS-PROVISION-V1\n"]
+      (when (str/starts-with? text magic)
+        (let [start (count magic)
+              end (str/index-of text "\n" start)]
+          (try (js->clj (.parse js/JSON (subs text start end)) :keywordize-keys true)
+               (catch :default _ nil)))))))
+
+(record! "e2e-provision-record-present"
+         (= "aiueos.provision.v1" (:schema provision-record)) "")
+
+(record! "e2e-provision-host-key-valid-ed25519"
+         (let [pub (get-in provision-record [:sshHostKey :public])]
+           (and (string? pub) (= 64 (count pub))          ; 32-byte raw key
+                (re-matches #"[0-9a-f]{64}" pub)))
+         "")
+
+(record! "e2e-provision-authorized-is-owner"
+         (= (.toString owner-raw-pub "hex")
+            (get-in provision-record [:authorizedKeys 0 :public]))
+         (str "principal=" (get-in provision-record [:authorizedKeys 0 :principal])))
+
+(record! "e2e-provision-bound-to-receipt"
+         (let [fd (.openSync fs fake-out "r")
+               buf (js/Buffer.alloc 4096)]
+           (.readSync fs fd buf 0 4096 receipt-offset)
+           (.closeSync fs fd)
+           (let [text (.toString buf "utf8")
+                 json (subs text (inc (str/index-of text "\n"))
+                            (str/index-of text "\n" (inc (str/index-of text "\n"))))
+                 rcpt (js->clj (.parse js/JSON json) :keywordize-keys true)
+                 block (js/Buffer.alloc 16384)
+                 fd2 (.openSync fs fake-out "r")]
+             (.readSync fs fd2 block 0 16384 provision-offset)
+             (.closeSync fs fd2)
+             (= (:provisionSha256 rcpt) (sha256-hex block))))
+         "")
+
+;; The stick is reinserted: same intent, same fake device still CLAIMING to be
+;; empty -- the target receipt alone must stop the erase, with exit 4.
+(let [{:keys [status out]}
+      (orchestrate "--install" "--confirm-device" "/dev/fakedisk0"
+                   "--destructive-phrase" "ERASE /dev/fakedisk0 FOR AIUEOS")]
+  (record! "e2e-repeat-refused"
+           (and (= 4 status)
+                (str/includes? out "AIUEOS_INSTALL_REFUSED existing-install"))
+           (str "status=" status " out=" (str/trim out))))
+
+;; Installer-level refusal still surfaces through the orchestrator with its
+;; own named reason (a non-empty target that carries no aiueos receipt).
+(def dirty-config (.join path tmp "dirty-device.json"))
+(json! dirty-config {:info {:path "/dev/fakedisk1" :type "disk" :whole true
+                            :internal true :empty false :mounted false
+                            :boot false :system false :bytes (* 8 1024 1024)
+                            :model "FAKE NVMe Disk" :transport "nvme"
+                            :nodeIdentity {:dev 1 :ino 2 :rdev 2 :mode 1}}
+                     :systemDisks ["/dev/fakesys0"]
+                     :outputPath (.join path tmp "dirty-target.bin")})
+(let [{:keys [status out]}
+      (run "nbb" [(.join path scripts-dir "install-to-disk.cljk")
+                  "--intent" intent-path "--device" "/dev/fakedisk1"
+                  "--image" image-path "--receipt" receipt-path
+                  "--fake-device-config" dirty-config]
+           fake-env)]
+  (record! "refuse-nonempty-target"
+           (and (= 2 status)
+                (str/includes? out "AIUEOS_INSTALL_REFUSED target is not empty"))
+           (str "status=" status " out=" (str/trim out))))
+
+;; ------------------------------------------------------------------ summary
+
+(let [expected 22
+      ran (count @results)
+      failed (remove :ok @results)]
+  (println (str "AIUEOS_INSTALL_CHAIN_SUMMARY ran=" ran " expected=" expected
+                " failed=" (count failed)))
+  (.rmSync fs tmp #js {:recursive true :force true})
+  (when (or (not= ran expected) (seq failed))
+    (.exit js/process 1)))

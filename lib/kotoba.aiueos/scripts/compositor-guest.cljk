@@ -1,0 +1,167 @@
+#!/usr/bin/env kbb
+;; Guest KERNEL.ELF compositor gates without a JVM (ADR-0100).
+;;
+;; Evidence:
+;;   kbb --backend sci --classpath src scripts/compositor-guest.cljk guest-session
+;;
+;; Same UEFI smoke as the old `kbb -M:compositor guest-*` path
+;; (`os/aiueos/scripts/smoke-qemu-uefi.sh`). Classification is
+;; `aiueos.compositor.guest` — one implementation. Hosted
+;; `kbb -M:compositor wm` serial does not count. QEMU/firmware/serial
+;; unanswered is exit 3, not a silent pass.
+;;
+;; Hosted leftover after a green guest gate is still
+;; `:native-compositor-absent` (native component runtime, P5).
+;; JVM `kbb -M:compositor guest-*` is leftover `:jvm-gate-runner`.
+
+(ns compositor-guest
+  (:require ["node:fs" :as fs]
+            ["node:path" :as path]
+            ["node:child_process" :as cp]
+            [clojure.edn :as edn]
+            [kotoba.lang.text :as str]
+            [aiueos.compositor.guest :as guest]))
+
+(def repo (.resolve path (.dirname path *file*) ".."))
+(def out (or (.-AIUEOS_OUT js/process.env) (.join path repo "build" "aiueos")))
+(def smoke (.join path repo "os" "aiueos" "scripts" "smoke-qemu-uefi.sh"))
+(def serial-path (.join path out "kernel-serial.log"))
+
+(defn- die3 [msg]
+  (binding [*out* *err*] (println msg))
+  (.exit js/process 3))
+
+(defn- ppm-pixels [^js buf]
+  ;; "P6\n<w> <h>\n255\n" then the bytes; returns the offset of the first pixel byte
+  (loop [off 0 newlines 0]
+    (cond (>= off (.-length buf)) off
+          (= 10 (aget buf off)) (if (= newlines 2) (inc off) (recur (inc off) (inc newlines)))
+          :else (recur (inc off) newlines))))
+
+(defn- suspend-evidence
+  "ADR-0273: the three screendumps the host took around the suspend and the resume time it measured."
+  []
+  (let [read (fn [n] (let [f (.join path out n)] (when (.existsSync fs f) (.readFileSync fs f))))
+        sha (fn [b] (when b (-> (.createHash (js/require "node:crypto") "sha256") (.update b) (.digest "hex"))))
+        before (read "suspend-before.ppm") during (read "suspend-during.ppm") after (read "suspend-after.ppm")
+        timing (when (.existsSync fs (.join path out "suspend-timing.txt"))
+                 (re-find #"resume_ms=(\d+)" (str (.readFileSync fs (.join path out "suspend-timing.txt") "utf8"))))
+        black? (fn [b] (when b (let [o (ppm-pixels b)] (loop [i o] (cond (>= i (.-length b)) true (not= 0 (aget b i)) false :else (recur (inc i)))))))]
+    {:before-sha (sha before) :during-sha (sha during) :after-sha (sha after) :during-black? (black? during) :before-black? (black? before)
+     :resume-ms (some-> timing second parse-long)}))
+
+(defn- profile-arg []
+  (let [args (vec *command-line-args*)
+        args (if (= "--" (first args)) (subvec args 1) args)]
+    (or (first args) "guest-session")))
+
+(defn- write-receipt! [profile receipt]
+  (when-not (.existsSync fs out) (.mkdirSync fs out #js {:recursive true}))
+  (let [f (.join path out (str "compositor-" profile "-receipt.edn"))]
+    (.writeFileSync fs f (pr-str receipt))
+    f))
+
+(defn- run-uefi! [profile & [more-env]]
+  (when-not (.existsSync fs smoke)
+    (die3 (str "AIUEOS_COMPOSITOR leftover=:unmeasured why=:smoke-script-missing path=" smoke)))
+  (let [env (js/Object.assign #js {} js/process.env)
+        _ (doseq [[k v] (merge (or (guest/extra-env profile) {}) (or more-env {}))]
+            (aset env k v))
+        r (.spawnSync cp smoke #js []
+                      #js {:cwd repo :encoding "utf8" :env env :shell false
+                           :stdio #js ["ignore" "inherit" "inherit"]})
+        serial (when (.existsSync fs serial-path)
+                 (.readFileSync fs serial-path "utf8"))]
+    {:exit (or (.-status r) 1)
+     :serial serial
+     :serial-path serial-path}))
+
+;; ADR-0242: the damage stage's ten screendumps, as damage-shots-verdict reads
+;; them -- each present, written after `started` (ms), a 1280 x 800 P6, and
+;; its sha256 -- five maps, frame 1..5.
+(defn- damage-shots [started]
+  (let [crypto (js/require "node:crypto")
+        shot (fn [name]
+               (let [f (.join path out name)]
+                 (when (.existsSync fs f)
+                   (let [buf (.readFileSync fs f)]
+                     {:fresh? (>= (.-mtimeMs (.statSync fs f)) started)
+                      :header-ok? (= "P6\n1280 800\n255\n" (.toString (.subarray buf 0 16) "latin1"))
+                      :digest (-> (.createHash crypto "sha256") (.update buf) (.digest "hex"))}))))]
+    (mapv (fn [n] {:damage (shot (str "guest-browser-damage-" n ".ppm"))
+                   :full (shot (str "guest-browser-damage-full-" n ".ppm"))})
+          (range 1 6))))
+
+(let [profile (profile-arg)]
+  (when-not (some #{profile} guest/guest-profiles)
+    (binding [*out* *err*]
+      (println "usage: kbb --backend sci --classpath src scripts/compositor-guest.cljk"
+               (str/join "|" guest/guest-profiles)))
+    (.exit js/process 3))
+  (let [;; ADR-0234: the hosted engine's answer for the flow-parity frame,
+        ;; read before the boot so a missing contract is exit 3, not a red
+        parity (when (= profile "guest-browser-flow-parity")
+                 (let [f (.join path repo "os" "aiueos" "contracts" "browser-flow-parity-v1.edn")]
+                   (when-not (.existsSync fs f)
+                     (die3 (str "AIUEOS_COMPOSITOR leftover=:unmeasured why=:parity-contract-missing path=" f)))
+                   (or (first (filter #(= "flow" (:name %))
+                                      (:scenes (edn/read-string (.readFileSync fs f "utf8")))))
+                       (die3 (str "AIUEOS_COMPOSITOR leftover=:unmeasured why=:no-flow-scene path=" f)))))
+        started (.now js/Date)
+        ;; ADR-0260: the settings gate boots the same volume twice; the first serial is kept beside the second
+        boot (if (= profile "guest-browser-settings")
+               (let [b1 (run-uefi! profile {"AIUEOS_SETTINGS_PHASE" "1"})
+                     b2 (run-uefi! profile {"AIUEOS_SETTINGS_PHASE" "2" "AIUEOS_PRESERVE_BLK_IMAGE" "1"})]
+                 (when (:serial b1) (.writeFileSync fs (str serial-path ".boot1") (:serial b1)))
+                 (assoc b2 :serial1 (:serial b1) :exit (if (zero? (:exit b1)) (:exit b2) (:exit b1))))
+               (run-uefi! profile))
+        measured? (guest/serial-measured? (:serial boot))
+        r (guest/classify profile {:serial (:serial boot)
+                                   :serial1 (:serial1 boot)
+                                   :qemu-unmeasured? (not measured?)
+                                   :hosted-wm? false
+                                   :hosted-ime? false
+                                   :wav (let [f (.join path out "audio.wav")]
+                                          (when (and (contains? #{"guest-browser-audio" "guest-browser-suspend"} profile) (.existsSync fs f)) (.readFileSync fs f)))
+                                   :suspend (when (= profile "guest-browser-suspend") (suspend-evidence))
+                                   :flow-parity parity
+                                   :damage-shots (when (= profile "guest-browser-damage")
+                                                   (damage-shots started))})
+        receipt (assoc r
+                       :aiueos.compositor/nbb-guest-receipt 1
+                       :measured-at (.toISOString (js/Date.))
+                       :command (guest/gate-cmd profile)
+                       :profile (keyword (str "uefi-qemu-" profile))
+                       :uefi-smoke-exit (:exit boot)
+                       :serial-path (:serial-path boot)
+                       :note (str "Green only on KERNEL.ELF serial. Hosted kbb -M:compositor wm does not count. Native component runtime remains. P5 UNVERIFIED."))]
+    (write-receipt! profile receipt)
+    (println (str "AIUEOS_COMPOSITOR_" (str/replace (str/upper profile) "-" "_")
+                  "_PROFILE=uefi-qemu-nbb"))
+    (println (str "AIUEOS_COMPOSITOR_" (str/replace (str/upper profile) "-" "_")
+                  "_SERIAL=" (:serial-path boot)))
+    (println (str "AIUEOS_COMPOSITOR_" (str/replace (str/upper profile) "-" "_")
+                  "_LEFTOVER=" (pr-str (:leftover r))))
+    (when (:serial boot)
+      (let [marker (guest/serial-marker profile)]
+        (doseq [line (str/split-lines (:serial boot))
+                :when (and marker (str/includes? line marker))]
+          ;; the flow-parity op list is ~7,600 characters: its head is enough
+          (let [line (str/replace line #"\r$" "")]
+            (println (if (> (count line) 240) (str (subs line 0 240) "...") line))))))
+    (when-let [d (:first-difference r)]
+      (println (str "AIUEOS_COMPOSITOR_FIRST_DIFFERENCE " (pr-str d))))
+    (when (= profile "guest-browser-damage")
+      (let [shots (damage-shots started)]
+        (println (str "AIUEOS_COMPOSITOR_DAMAGE_SHOTS " (name (guest/damage-shots-verdict shots))
+                      " " (pr-str (mapv (fn [{:keys [damage full]}]
+                                          [(some-> (:digest damage) (subs 0 12))
+                                           (some-> (:digest full) (subs 0 12))])
+                                        shots))))))
+    (when-let [n (:compared r)]
+      (println (str "AIUEOS_COMPOSITOR_COMPARED\t" n)))
+    (if (:green? r)
+      (println (guest/ok-print profile))
+      (println (str "AIUEOS_COMPOSITOR_" (str/replace (str/upper profile) "-" "_")
+                    " not-green leftover=" (pr-str (:leftover r)))))
+    (.exit js/process (int (:exit r)))))

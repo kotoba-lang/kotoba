@@ -1,0 +1,246 @@
+#!/usr/bin/env kbb
+;; The expected answers of os/aiueos/contracts/browser-ime-v2.edn's selection
+;; vectors (ADR-0240), taken from kotoba-lang/browser's browser.text-edit
+;; itself: every change to the focused body and its selection is text-edit's
+;; move-caret (with :extend?), delete-backward or insert-text applied to the
+;; body as a string. Neither browser-ime.kotoba nor the kernel's C is
+;; consulted.
+;;
+;;   kbb --backend sci --classpath <kotoba-lang/browser>/src:os/aiueos/scripts \
+;;     os/aiueos/scripts/browser-selection-oracle.cljk          ; print the vectors
+;;   ... browser-selection-oracle.cljk --check os/aiueos/contracts/browser-ime-v2.edn
+;;
+;; Which key is which text-edit call is the kernel's rule, written here apart
+;; from the object (browser.input maps Shift+Arrow to :text/edit move-caret
+;; with :extend?, Backspace to delete-backward, a typed character to
+;; insert-text):
+;;   Shift (42 or 54) press / release   word 2035 1 / 0; repeat changes nothing
+;;   Left (105) / Right (106) press with Shift held and nothing composed
+;;                                      move-caret -1 / +1 {:extend? true}
+;;   Left / Right without Shift, while composing, released or repeated
+;;                                      nothing (`:caret-only-at-the-end`,
+;;                                      `:no-arrows-in-a-composition`)
+;;   Backspace with nothing composed    delete-backward
+;;   a letter, IME off                  insert-text of the letter
+;;   a letter, IME on                   insert-text "" when something is
+;;                                      selected (the composition starts over
+;;                                      the emptied place), then the letter
+;;                                      into the romaji buffer
+;; The state the object keeps is the text-edit state encoded: the body's code
+;; points at word 160 + 64(id-1), and a selection [s n] whose end is the end
+;; of the body as word 2036 = the window id and word 2037 = n - s (0 and 0 for
+;; a collapsed one at the end). The generator refuses (exit 2) a sequence
+;; text-edit answers with anything else -- a caret not at the start of a
+;; selection that ends at the body's end -- because the object could not hold
+;; it. A seeded selection of another window, or one longer than the body, is
+;; decoded as the object decodes it (none; clamped, as normalize-selection
+;; clamps) -- the two vectors that seed one say so.
+;;
+;; --check: exit 0 every generated vector equals the contract's vector of the
+;; same name; 1 one differs or is missing; 2 could not run. It prints
+;; COMPARED<TAB>n; n = 0 is exit 2.
+(ns browser-selection-oracle
+  (:require [browser.text-edit :as te]
+            [clojure.edn :as edn]
+            [clojure.string :as str]
+            ["node:fs" :as fs]))
+
+(defn- die [code msg] (.error js/console msg) (.exit js/process code))
+
+;; --- the surface ------------------------------------------------------------------
+
+(def ^:private base-words
+  ;; abi n focus vw vh; window 1 (32, 32, 720 x 540), window 2 (96, 72,
+  ;; 640 x 480) on top and focused -- the seed every browser-ime-v2 vector uses
+  {0 1 1 2 2 2 3 1280 4 800
+   5 1 6 32 7 32 8 720 9 540
+   10 2 11 96 12 72 13 640 14 480})
+
+(defn- cps [s] (vec (map #(.codePointAt % 0) (js/Array.from s))))
+(defn- from-cps [v] (apply str (map #(js/String.fromCodePoint %) v)))
+
+(defn- body-word [id] (+ 160 (* 64 (dec id))))
+
+(defn- hex-words [words]
+  (let [buf (js/Buffer.alloc (* 4 (count words)))]
+    (doseq [[i v] (map-indexed vector words)] (.writeUInt32LE buf v (* 4 i)))
+    (.toString buf "hex")))
+
+(defn- surface-hex [m]
+  (hex-words (map #(get m % 0) (range 2048))))
+
+;; --- the world: surface words + the focused body as a text-edit state -------------
+
+(defn- decode-selection
+  "The object's reading of words 2036 / 2037 for the focused body of n code
+  points: k = min(word 2037, n) when word 2036 is the focus, else 0."
+  [m n]
+  (if (= (get m 2036 0) (get m 2 0)) (min (get m 2037 0) n) 0))
+
+(defn- text-state [m]
+  (let [id (get m 2)
+        b (body-word id)
+        body (vec (take-while pos? (map #(get m (+ b %) 0) (range 64))))
+        n (count body)
+        k (decode-selection m n)
+        value (from-cps body)]
+    ;; anchor at the end, caret k before it
+    (te/select (assoc (te/empty-state) :text/value value) n (- n k))))
+
+(defn- encode-text
+  "Write a text-edit state back as the object keeps it; refuse what it cannot
+  hold."
+  [m st]
+  (let [st (te/normalize-selection st)
+        v (cps (:text/value st))
+        n (count v)
+        [s e] (:text/selection st)
+        caret (:text/caret st)
+        id (get m 2)
+        b (body-word id)]
+    (when (or (not= e n) (not= caret s) (> n 64))
+      (die 2 (str "COULD-NOT-RUN text-edit answered a state the object cannot hold: "
+                  (pr-str st))))
+    (let [k (- n s)
+          m (reduce (fn [m i] (assoc m (+ b i) (get v i 0))) m (range 64))]
+      ;; a collapsed selection clears the words only when they were this
+      ;; window's: another window's text state is not this edit's to touch
+      (cond
+        (pos? k) (assoc m 2036 id 2037 k)
+        (= (get m 2036 0) id) (assoc m 2036 0 2037 0)
+        :else m))))
+
+(defn- composing? [m]
+  (or (pos? (get m 433 0)) (pos? (get m 445 0)) (= 1 (get m 442 0))))
+
+(def ^:private letters {30 "a" 37 "k" 31 "s"})
+
+(defn- step
+  "One key [code value] -> [world' answer], by the rules in the header."
+  [m [code value]]
+  (cond
+    (#{42 54} code)
+    [(case value 1 (assoc m 2035 1) 0 (assoc m 2035 0) m) 0]
+
+    (not= value 1) [m 0]
+
+    (#{105 106} code)
+    (if (or (zero? (get m 2035 0)) (composing? m))
+      [m 0]
+      [(encode-text m (te/move-caret (text-state m) (if (= code 105) -1 1) {:extend? true})) 0])
+
+    (= code 14)
+    (if (composing? m)
+      (die 2 "COULD-NOT-RUN a Backspace into a composition is the IME oracle's, not this one's")
+      [(encode-text m (te/delete-backward (text-state m))) 0])
+
+    (letters code)
+    (let [ch (letters code)
+          st (text-state m)]
+      (if (zero? (get m 432 0))
+        [(encode-text m (te/insert-text st ch)) 1]
+        (let [[s e] (:text/selection (te/normalize-selection st))
+              m (if (< s e) (encode-text m (te/insert-text st "")) m)]
+          ;; a letter that converts to nothing alone waits in the romaji
+          ;; buffer (the IME oracle's rule; only such letters are used here)
+          [(assoc m 433 (inc (get m 433 0)) (+ 434 (get m 433 0)) (.charCodeAt ch 0)) 0])))
+
+    :else (die 2 (str "COULD-NOT-RUN no rule for key " code))))
+
+;; --- the vectors ------------------------------------------------------------------
+
+(defn- seed [{:keys [body ime shift selection romaji body1]}]
+  (cond-> (merge base-words {432 (if (= ime :off) 0 1)})
+    body (into (map-indexed (fn [i c] [(+ 224 i) c]) (cps body)))
+    body1 (into (map-indexed (fn [i c] [(+ 160 i) c]) (cps body1)))
+    shift (assoc 2035 1)
+    selection (assoc 2036 (first selection) 2037 (second selection))
+    romaji (into (concat [[433 (count romaji)]]
+                         (map-indexed (fn [i c] [(+ 434 i) (.charCodeAt c 0)]) romaji)))))
+
+(defn- memory [m romaji?]
+  (cond-> [{:label :body :offset 896 :hex (hex-words (map #(get m (+ 224 %) 0) (range 64)))}
+           {:label :selection :offset 8140 :hex (hex-words (map #(get m % 0) [2035 2036 2037]))}]
+    romaji? (conj {:label :romaji :offset 1732
+                   :hex (hex-words (map #(get m % 0) (range 433 442)))})))
+
+(def ^:private specs
+  [{:name :shift-press-holds-shift :keys "Shift" :seed {:body "日本"} :steps [[42 1]]}
+   {:name :right-shift-holds-shift-too :keys "RightShift" :seed {:body "日本"} :steps [[54 1]]}
+   {:name :shift-release-lets-go :keys "(Shift held)|Shift(release)" :seed {:body "日本" :shift true}
+    :steps [[42 0]]}
+   {:name :shift-repeat-changes-nothing :keys "(Shift held)|Shift(repeat)" :seed {:body "日本" :shift true}
+    :steps [[42 2]]}
+   {:name :shift-left-selects-the-last-code-point :keys "Shift|Left" :seed {:body "日本語"}
+    :steps [[42 1] [105 1]]}
+   {:name :shift-left-twice-selects-two :keys "Shift|Left|Left" :seed {:body "日本語"}
+    :steps [[42 1] [105 1] [105 0] [105 1]]}
+   {:name :shift-left-stops-at-the-start-of-the-body :keys "Shift|Left|Left|Left" :seed {:body "日本"}
+    :steps [[42 1] [105 1] [105 1] [105 1]]}
+   {:name :shift-right-moves-the-caret-back-toward-the-end :keys "Shift|Left|Left|Right" :seed {:body "日本語"}
+    :steps [[42 1] [105 1] [105 1] [106 1]]}
+   {:name :shift-right-with-nothing-selected-changes-nothing :keys "Shift|Right" :seed {:body "日本"}
+    :steps [[42 1] [106 1]]}
+   {:name :shift-left-on-an-empty-body-changes-nothing :keys "Shift|Left" :seed {}
+    :steps [[42 1] [105 1]]}
+   {:name :left-without-shift-is-not-taken :keys "Left" :seed {:body "日本"} :steps [[105 1]]}
+   {:name :an-arrow-release-or-repeat-changes-nothing :keys "(Shift held)|Left(release)|Left(repeat)"
+    :seed {:body "日本" :shift true} :steps [[105 0] [105 2]]}
+   {:name :the-selection-outlives-shifts-release :keys "Shift|Left|Shift(release)" :seed {:body "日本語"}
+    :steps [[42 1] [105 1] [42 0]]}
+   {:name :backspace-deletes-the-selection :keys "Shift|Left|Left|Shift(release)|Backspace"
+    :seed {:body "日本語"} :steps [[42 1] [105 1] [105 1] [42 0] [14 1]]}
+   {:name :backspace-after-the-selection-is-gone-deletes-one :keys "Shift|Left|Backspace|Backspace"
+    :seed {:body "日本語"} :steps [[42 1] [105 1] [14 1] [14 1]]}
+   {:name :ime-off-shift-left-selects-too :keys "(IME off)|Shift|Left" :seed {:body "abc" :ime :off}
+    :steps [[42 1] [105 1]]}
+   {:name :ime-off-a-letter-replaces-the-selection :keys "(IME off)|Shift|Left|Left|a"
+    :seed {:body "abc" :ime :off} :steps [[42 1] [105 1] [105 1] [30 1]]}
+   {:name :ime-off-backspace-deletes-the-selection :keys "(IME off)|Shift|Left|Backspace"
+    :seed {:body "abc" :ime :off} :steps [[42 1] [105 1] [14 1]]}
+   {:name :ime-on-a-letter-empties-the-selection-and-composes :keys "Shift|Left|Left|k"
+    :seed {:body "日本語"} :steps [[42 1] [105 1] [105 1] [37 1]] :romaji? true}
+   {:name :arrows-while-composing-change-nothing :keys "k|Shift|Left"
+    :seed {:body "日本"} :steps [[37 1] [42 1] [105 1]] :romaji? true}
+   {:name :a-selection-of-another-window-reads-as-none :keys "(window 1's selection)|Shift|Left"
+    :seed {:body "日本語" :body1 "ab" :selection [1 1]} :steps [[42 1] [105 1]]}
+   {:name :backspace-with-another-windows-selection-deletes-one :keys "(window 1's selection)|Backspace"
+    :seed {:body "日本語" :body1 "ab" :selection [1 1]} :steps [[14 1]]}
+   {:name :a-selection-longer-than-the-body-is-clamped :keys "(selection 5 of 2)|Backspace"
+    :seed {:body "日本" :selection [2 5]} :steps [[14 1]]}])
+
+(defn vectors []
+  (for [{:keys [name keys steps romaji?] s :seed} specs
+        :let [m0 (seed s)
+              run (reduce (fn [{:keys [m out]} k]
+                            (let [[m' r] (step m k)] {:m m' :out (conj out [k r m'])}))
+                          {:m m0 :out []} steps)
+              out (:out run)]]
+    {:name name :keys keys
+     :seed [{:offset 0 :hex (surface-hex m0)}]
+     :steps (vec (map-indexed (fn [i [k r m]]
+                                (cond-> {:args k :expected r}
+                                  (= i (dec (count out))) (assoc :expect-memory (memory m romaji?))))
+                              out))}))
+
+(defn- edn-str [x] (str/replace (pr-str x) ", :" " :"))
+
+(defn- print-vector [{:keys [name keys seed steps]}]
+  (println (str "  {:name " name))
+  (println (str "   :keys " (pr-str keys)))
+  (println (str "   :seed " (edn-str seed)))
+  (println (str "   :steps [" (str/join "\n    " (map edn-str steps)) "]}")))
+
+(let [args (vec (remove #(= "--" %) *command-line-args*))]
+  (if (= "--check" (first args))
+    (let [contract (try (edn/read-string (str (.readFileSync fs (get args 1))))
+                        (catch :default e (die 2 (str "COULD-NOT-RUN " e))))
+          have (into {} (map (juxt :name identity) (:vectors contract)))
+          gen (vectors)
+          bad (remove (fn [v] (= (select-keys v [:name :keys :seed :steps])
+                                 (select-keys (have (:name v)) [:name :keys :seed :steps])))
+                      gen)]
+      (println (str "COMPARED\t" (count gen)))
+      (doseq [v bad] (println "DIFFERS" (:name v)))
+      (.exit js/process (cond (zero? (count gen)) 2 (seq bad) 1 :else 0)))
+    (doseq [v (vectors)] (print-vector v))))

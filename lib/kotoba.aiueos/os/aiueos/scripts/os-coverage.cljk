@@ -1,0 +1,179 @@
+#!/usr/bin/env kbb
+;; How much of what AIUEOS claims does a real boot actually prove?
+;;
+;; Usage: kbb --backend sci os/aiueos/scripts/os-coverage.cljk <evidence-log> [<evidence-log>...]
+;;
+;; Exit 0 measured, 1 findings, 2 REFUSED (could not measure). The third code
+;; exists because "no evidence" and "nothing passed" must not look alike: given
+;; no readable log this refuses to print a number rather than printing 0%.
+;;
+;; DECLARED comes from the sources, EMITTED from the logs, and only EMITTED
+;; counts. A marker in a .c file is an intention; a marker in a serial log is a
+;; proof. The gap between them is the measurement.
+;;
+;; Written for nbb, against the workspace's kbb-first rule for new tooling:
+;; there is no kbb repo in the manifest and no kbb on PATH, so kbb-first is not
+;; achievable here today. Port when it lands -- skill nbb-to-kbb-migration.
+(require '[kotoba.lang.text :as str]
+         '[kotoba.lang.coll :as set])
+
+(def fs (js/require "node:fs"))
+(def path (js/require "node:path"))
+
+(def aiueos (.resolve path (.dirname path *file*) ".."))
+(def contract (.join path aiueos "contracts" "os-coverage-v1.edn"))
+
+(defn- die [code & msg]
+  (.write js/process.stderr (str (str/join " " msg) "\n"))
+  (js/process.exit code))
+
+(defn- read-file [p] (.readFileSync fs p "utf8"))
+
+(defn- walk-sources [dir]
+  (if-not (.existsSync fs dir)
+    []
+    (mapcat (fn [e]
+              (let [p (.join path dir e)]
+                (cond (.isDirectory (.statSync fs p)) (walk-sources p)
+                      (re-find #"\.(c|h)$" e) [p]
+                      :else [])))
+            (.readdirSync fs dir))))
+
+(defn- markers-in [text]
+  (set (map #(keyword (str/replace (str/replace % "AIUEOS_" "") #"_OK$" ""))
+            (re-seq #"AIUEOS_[A-Z0-9_]+_OK" text))))
+
+;; Markers whose _OK is a report rather than a verdict need their line read, not
+;; just their name counted. AIUEOS_DMA_POLICY_OK is emitted both as
+;; `dmar=validated dma=vtd-isolated` and as `dmar=absent test-only-unisolated`,
+;; so the name alone credited an explicitly unisolated boot with isolation.
+(defn- payload-ok? [text marker want]
+  (boolean (some #(str/includes? % want)
+                 (re-seq (re-pattern (str "AIUEOS_" (name marker) "_OK[^\n\r]*")) text))))
+
+;; The same reasoning one level up, applied to the log rather than the line.
+;; smoke-qemu-physical-{persistent,pxe} run the qualification image under QEMU
+;; and legitimately require AIUEOS_PHYSICAL_QUALIFICATION_OK -- the kernel
+;; prints it on any host that reaches the native core. But those gates end by
+;; declaring physical-k16=unverified, and the claim the marker carries
+;; ("internal-disk-writes=none") is vacuous where no internal disk exists. So a
+;; log that says it did not verify the board cannot witness the markers the
+;; taxonomy classes as :board; counting them would prove from a QEMU run
+;; exactly what the run says it has not proven.
+(defn- board-unverified? [text] (str/includes? text "physical-k16=unverified"))
+
+(defn- emitted-in [text requires board-markers]
+  (let [named (markers-in text)
+        named (if (board-unverified? text)
+                (set/difference named board-markers)
+                named)]
+    (set (remove (fn [m]
+                   (when-let [want (get requires m)]
+                     (not (payload-ok? text m want))))
+                 named))))
+
+;; *command-line-args*, not (drop 2 js/process.argv). Under nbb that drop
+;; leaves this script's own path in the list, so the run "measured" itself and
+;; printed 0% instead of refusing -- the precise failure this file exists to
+;; prevent, and its own control caught it on the first execution.
+(let [args (vec *command-line-args*)]
+  (when (empty? args)
+    (die 2 "REFUSED: no evidence log given."
+         "\nThis measures what a boot EMITTED, not what the sources declare."
+         "\nWithout a log there is nothing to measure, and 0% would be a lie."
+         "\nusage: kbb --backend sci os/aiueos/scripts/os-coverage.cljk <evidence-log> [...]"))
+  (let [missing (remove #(.existsSync fs %) args)]
+    (when (seq missing)
+      (die 2 "REFUSED: unreadable evidence log(s):" (str/join " " missing))))
+
+  (let [spec (cljs.reader/read-string (read-file contract))
+        subsystems (:subsystems spec)
+        _ nil
+        declared (reduce set/union
+                         (map (comp markers-in read-file)
+                              (mapcat walk-sources
+                                      [(.join path aiueos "kernel")
+                                       (.join path aiueos "uefi")])))
+        requires (:requires-payload spec)
+        board-markers (set (keep (fn [[m why]] (when (= why :board) m))
+                                 (:unproven-because spec)))
+        emitted (reduce set/union
+                        (map #(emitted-in (read-file %) requires board-markers) args))
+        ;; A log can only prove markers the sources still declare. One that
+        ;; names a marker the tree no longer has is stale evidence, and saying
+        ;; so is the point -- a green report from a log of a build that no
+        ;; longer exists is the exact failure this file is guarding against.
+        stale (set/difference emitted declared)
+        taxonomised (set (mapcat :markers (vals subsystems)))
+        untaxonomised (set/difference declared taxonomised)
+        rows (for [[k v] subsystems
+                   :let [ms (set (:markers v))
+                         d (set/intersection ms declared)
+                         e (set/intersection ms emitted)]]
+               {:subsystem k
+                :relevance (:relevance v)
+                :declared (count d)
+                :emitted (count e)
+                :missing (sort (set/difference d e))
+                ;; declared-but-absent-from-source: the taxonomy naming a
+                ;; marker the tree does not have. Reported, never scored.
+                :phantom (sort (set/difference ms declared))
+                :coverage (when (pos? (count d))
+                            (/ (js/Math.round (* 1000 (/ (count e) (count d)))) 10.0))})
+        rows (sort-by (juxt #(if (= :core (:relevance %)) 0 1) :subsystem) rows)
+        because (:unproven-because spec)
+        ;; What every unproven marker is waiting on, counted. A single number
+        ;; for "unproven" hides that these need five different things and that
+        ;; only one group is code anyone could write.
+        tally (frequencies (map #(get because % :unclassified)
+                                (mapcat :missing (filter #(= :core (:relevance %)) rows))))
+        core (filter #(and (= :core (:relevance %)) (pos? (:declared %))) rows)
+        unmeasured (filter #(zero? (:declared %)) rows)
+        core-d (reduce + (map :declared core))
+        core-e (reduce + (map :emitted core))]
+
+    (when (zero? core-d)
+      (die 2 "REFUSED: no core subsystem declares a marker the sources contain."
+           "\nEither the taxonomy or the tree moved; a number here would be noise."))
+
+    (println "AIUEOS OS COVERAGE -- emitted / declared, from" (count args) "evidence log(s)")
+    (println (str "  " (str/join "  " (map #(.basename path %) args))))
+    (println)
+    (doseq [{:keys [subsystem relevance declared emitted coverage missing]} rows]
+      (println (str "  " (if (= :core relevance) " " "~") " "
+                    (let [n (name subsystem)] (str n (apply str (repeat (max 0 (- 12 (count n))) " "))))
+                    "  " emitted "/" declared
+                    (when coverage (str "  " coverage "%"))
+                    (when (seq missing)
+                      (str "   unproven: " (str/join " " (map name (take 4 missing)))
+                           (when (> (count missing) 4) (str " +" (- (count missing) 4))))))))
+    (println)
+    (println "  CORE (the headline; ~ rows are measured but excluded):"
+             core-e "/" core-d
+             (str (/ (js/Math.round (* 1000 (/ core-e core-d))) 10.0) "%"))
+    (when (seq tally)
+      (println)
+      (println "  UNPROVEN CORE MARKERS BY WHAT THEY WAIT ON")
+      (doseq [[k n] (sort-by (juxt #(- (val %)) #(name (key %))) tally)]
+        ;; width from the content, not a constant: a fixed 15 truncated
+        ;; "live-exchange-stalls" and ran the count into the label.
+        (println (str "    " (let [nm (name k)]
+                               (str nm (apply str (repeat (- (+ 2 (apply max (map (comp count name) (keys tally))))
+                                                             (count nm)) " ")))) n
+                      (when (= k :live-exchange-stalls)
+                        "   <- nearest blocker once AIUEOS_SSH_LISTEN is built; not closable in the default build")
+                      (when (= k :unclassified) "   <- not yet attributed; not the same as unblocked")))))
+    (when (seq unmeasured)
+      (println "  UNMEASURED (no declared marker in source, excluded from the total):"
+               (str/join " " (map (comp name :subsystem) unmeasured))))
+    (when (seq untaxonomised)
+      (println)
+      (println "  DECLARED BUT NOT IN THE TAXONOMY --" (count untaxonomised) "marker(s).")
+      (println "  The tree grew capabilities the benchmark does not know about;")
+      (println "  add them to os-coverage-v1.edn or the number drifts silently:")
+      (println "   " (str/join " " (map name (sort untaxonomised)))))
+    (when (seq stale)
+      (println)
+      (println "  IN THE LOG BUT NOT IN THE SOURCES --" (count stale) "marker(s).")
+      (println "  The evidence is older than the tree:" (str/join " " (map name (sort stale)))))
+    (js/process.exit (if (or (seq untaxonomised) (seq stale)) 1 0))))

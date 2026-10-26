@@ -1,0 +1,165 @@
+;; Does this CPU support NX (execute-disable)?
+;;
+;; This is the first of three objects replacing the six hand-written `cpuid`
+;; inline-asm sites in this kernel. Those six sites ask THREE different
+;; questions, and only two of them are feature tests:
+;;
+;;   paging.c:83,86   leaf 0x80000001, EDX bit 20 -- NX          (this object)
+;;   process.c:124,127 leaf 0x80000001, EDX bit 11 -- SYSCALL    (cpu-feature-syscall)
+;;   pci.c:668,709    leaf 1, EBX 31:24 -- initial APIC ID       (cpu-apic-id)
+;;
+;; The third is not a feature test at all: it reads an identifier and uses it
+;; as an MSI-X message destination. Calling all three "the cpuid sites" is what
+;; made them look like one problem with one answer.
+;;
+;; WHY THREE OBJECTS RATHER THAN ONE `(cpu-feature leaf bit)`
+;;
+;; A generic accessor would take the leaf and the bit as arguments, which means
+;; the C call site would read
+;;
+;;   if (!kotoba_aiueos_cpu_feature(0x80000001, 20)) return 0;
+;;
+;; and the two numbers that constitute the entire decision -- WHICH leaf and
+;; WHICH bit answer "does this CPU support NX" -- would still be magic numbers
+;; in C, exactly where they are today. Nothing would have moved except the
+;; instruction. The instruction is not the part worth moving; every kernel can
+;; execute `cpuid`. The knowledge of what to ask it is the part that is a
+;; decision, so it is what lives here, baked in, unparameterised, named.
+;;
+;; That is also why this object takes no arguments. There is no input to it
+;; other than the machine.
+;;
+;; THE GUARD, AND WHY IT IS DUPLICATED IN TWO OF THESE OBJECTS
+;;
+;; Leaf 0x80000001 is an EXTENDED leaf. On a CPU that implements no extended
+;; leaves, `cpuid` with a leaf above the maximum does not fault and does not
+;; return zeroes -- it returns the data of the highest BASIC leaf the CPU does
+;; implement. So an unguarded `(kernel-cpuid-edx 2147483649 0)` on such a CPU
+;; reads some basic leaf's EDX and tests bit 20 of it, which is a feature bit
+;; belonging to a different question entirely. The answer would not be "no", it
+;; would be an unrelated CPU's unrelated bit, and the kernel would branch on it.
+;;
+;; Leaf 0x80000000 returns, in EAX, the highest extended leaf supported. The
+;; guard is therefore `eax >= 0x80000001`, and the C being replaced spells it
+;; `if (eax < 0x80000001) return 0;`.
+;;
+;; `cpu-feature-syscall` performs the SAME guard, with the same two constants,
+;; because it queries the same extended leaf. That duplication is by NECESSITY,
+;; not by oversight: a Kotoba object in this profile cannot call another Kotoba
+;; object -- each is a separately compiled, separately linked artifact with its
+;; own `.data` context and its own fuel counter, and the subset has no import
+;; form. A shared `max-extended-leaf` helper would have to be a fourth object,
+;; and there is no way to reach it from here. The alternative -- a single object
+;; answering both questions with a "which" argument -- is the generic accessor
+;; rejected above. So the guard is written twice, on purpose, and this paragraph
+;; is the record that it was noticed rather than missed.
+;;
+;; The nesting is load-bearing. `if` is a real conditional, so when the guard
+;; fails the second `cpuid` IS NOT EXECUTED. Writing this as
+;; `(and (>= ...) (not (= (bit-and ...) 0)))` would rely on `and`
+;; short-circuiting to get the same property, which is a weaker thing to rely on
+;; than a branch when the consequence of getting it wrong is reading a leaf the
+;; CPU does not implement.
+;;
+;; SIGNEDNESS -- i64 is signed, the C is unsigned, and the compare is safe
+;;
+;; This is the recurring bug in this tree, so it is worked out rather than
+;; asserted. `(>= eax 2147483649)` compiles to a SIGNED 64-bit comparison
+;; (`cmp`/`setge`), while the C it replaces compares two `uint32_t` UNSIGNED.
+;; Those two agree only if the left operand cannot be negative as an i64, and
+;; here it cannot, for a reason that is a property of the backend rather than
+;; of this file:
+;;
+;;   `cpuid` writes the four 32-BIT registers `eax`/`ebx`/`ecx`/`edx`, and a
+;;   32-bit destination write on x86-64 zeroes bits 63:32 of the containing
+;;   64-bit register. The backend's `emit-kernel-cpuid` then moves the selected
+;;   result with a 32-bit `mov` (`89 /r`), re-establishing the same property in
+;;   `rax`. So every `kernel-cpuid-*` result arrives as an i64 in [0, 2^32) --
+;;   non-negative, always, with no mask needed anywhere.
+;;
+;; And 0x80000001 = 2147483649 is itself positive as an i64: it is under 2^63,
+;; and it is only under 2^63 because it is being read as a 64-bit value with a
+;; known-zero upper half. As a 32-bit signed value the same bit pattern is
+;; -2147483647, and the comparison would invert -- a machine WITH extended
+;; leaves would be told it has none, NX would never be enabled, and every PTE
+;; this kernel writes carries PTE_NX, which is a RESERVED bit until NXE is set.
+;; The failure would be a page fault on the first access to any mapped page,
+;; arbitrarily far from anything mentioning `cpuid`. Widening to i64 first is
+;; what makes the signed compare answer the unsigned question.
+;;
+;; No masking, no `quot`, no arithmetic on the leaf result at all: the guard
+;; compares it and the feature test `bit-and`s it. `bit-and` is bit-exact and
+;; sign-agnostic, so bit 20 is bit 20 whatever the upper half holds.
+;;
+;; That last claim about inversion is MEASURED, not reasoned. The emitted
+;; object was loaded, its `cpuid` neutralised, and chosen register values fed in
+;; through the immediates it already contains, against the C predicate this
+;; replaces: 56 (max-leaf, EDX) pairs agree, including every case with bit 31
+;; set in either register. Feeding the SAME bit pattern sign-extended --
+;; 0xffffffff_80000001, i.e. what a backend without the 32-bit result move would
+;; produce -- makes this object answer 0 where the C answers 1. The guard does
+;; invert, exactly as described above, and the zero-extension is what stops it.
+;;
+;; WHAT "NO" MEANS
+;;
+;; 0 means this CPU does not support NX, and paging.c refuses to initialise --
+;; `aiueos_paging_initialize` returns 0 at its first line and main.c exits with
+;; AIUEOS_PAGING_FAIL. That is the same behaviour the C had. There is no
+;; refusal path distinct from a negative answer here, because there is no
+;; argument to refuse: the object is a total function of the machine, its two
+;; possible answers are the machine's two possible states, and both are
+;; legitimate. Unlike `msr-read`, 0 is not overloaded.
+;;
+;; FUEL -- 1 per call, 1 call per boot
+;;
+;; Deliberately absent from `bounded-memory?` in kotoba-native's elf64.clj, so
+;; the wrapper emits no `mov qword [r9+8], N` replenish and this object spends
+;; from the 512 its own `.data` context is initialised with. Per object, not
+;; shared: in the `.o` path each object's `lea ...,%r9` relocates against its
+;; own `.data` symbol, so 512 is this object's alone for the whole boot.
+;;
+;; Measured from the emitted object rather than estimated: the disassembly
+;; contains exactly TWO fuel-charge sequences (`cmpq $0,0x8(%r9)` / `jne` /
+;; `ud2` / `decq 0x8(%r9)`), at 0x15 -- this function's entry -- and at 0xe5,
+;; `main`'s, which the kernel never calls. The wrapper at 0x0 is
+;; `lea r9` / `sub rsp,8` / `call` / `add rsp,8` / `ret` with NO
+;; `mov qword [r9+8], N` between the `lea` and the `sub`, which is what a
+;; `bounded-memory?` object has there (pci-config-read.o carries
+;; `49 c7 41 08 00 04 00 00` = 1024 at offset 0x7; this object carries nothing).
+;;
+;; Fuel is charged per FUNCTION ENTRY, not per operation, and `cpuid` -- like
+;; `kernel-out-u8` before it -- is emitted INLINE (`0f a2`, at 0x3d and 0x7c)
+;; rather than as a call, so it charges nothing. This was CHECKED rather than
+;; assumed from the `kernel-out-u8` precedent: two `cpuid` instructions against
+;; two fuel sites, neither of which belongs to them. Both `cpuid` executions and
+;; the compare and the bit test therefore cost ONE unit in total, and the
+;; refused-guard path costs the same one, since the charge at 0x1e precedes the
+;; branch at 0x5c.
+;;
+;; The call count is ONE per boot, and it is one on every boot:
+;;
+;;   paging.c:94   aiueos_paging_initialize   main.c:375   1 call
+;;
+;; `aiueos_kernel_main` is a straight-line boot sequence with no loop around
+;; that initialiser, and the SMP path does not multiply it -- `aiueos_ap_entry`
+;; in smp.c does not call `aiueos_paging_initialize`; the APs run on the page
+;; tables the BSP built. 1 of 512.
+;;
+;; This is ONE function with no helper `defn` for the reason `pic-disable`
+;; gives: a helper would cost a second unit per call, which is still nothing
+;; against 512, but it would make the cost a function of the structure rather
+;; than a constant.
+
+(defn aiueos-cpu-feature-nx []
+  ;; Leaf 0x80000000 -> EAX = highest extended leaf. Guard before asking for
+  ;; 0x80000001, or an unsupported extended leaf silently answers with a basic
+  ;; leaf's data. See above for why this is a branch and not an `and`.
+  (if (>= (kernel-cpuid-eax 2147483648 0) 2147483649)
+    ;; Leaf 0x80000001, subleaf 0 (this leaf ignores the subleaf; the primitive
+    ;; is arity 2 because `cpuid` genuinely reads ECX, so 0 is passed rather
+    ;; than inherited). EDX bit 20 = 1048576 is NX / execute-disable.
+    (if (= (bit-and (kernel-cpuid-edx 2147483649 0) 1048576) 0) 0 1)
+    ;; No extended leaves: the CPU cannot be asked, so it does not support NX.
+    0))
+
+(defn main [] 0)

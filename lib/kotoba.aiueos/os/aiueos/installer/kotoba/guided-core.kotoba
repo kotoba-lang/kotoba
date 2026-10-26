@@ -1,0 +1,574 @@
+(ns aiueos.installer.guided-core
+  (:export [main]))
+
+;; The guided installer's DECISION core on the selfhost substrate
+;; (owner direction 2026-10-18, Linear JUN-70 S1). This is the port of the
+;; pure decision half of src/aiueos/installer/guided.cljk: every judgment
+;; the screens make lives here; the driver that asks the questions is the
+;; next slice.
+;;
+;; Disk records are FLAT, one per line, ten '|'-separated fields (the
+;; ADR-0219 convention: one flat record the caller packs and this reads by
+;; offset, never a walked struct):
+;;
+;;   type|path|size|rm|measured|pttype|fstype|model|tran|serial
+;;
+;;   type      "disk" for a whole disk (lsblk TYPE)
+;;   path      device path -- recorded in NO intent
+;;   size      bytes, decimal
+;;   rm        1 when removable, else 0
+;;   measured  1 when blkid answered (signatures-measured?); unmeasured is
+;;             NEVER blank (ADR-0240)
+;;   pttype    partition table type or ""
+;;   fstype    filesystem signature or ""
+;;   model     trimmed  /  tran  lower-cased  /  serial  or ""
+;;
+;; SUBSTRATE SURFACE, measured 2026-10-18 on x86_64-linux-static (podman
+;; amd64, one probe per op because a trap kills the process):
+;;   ANSWERS   string-substring (in bounds; end > length traps SIGILL,
+;;             start==end==length is fine and answers ""), string-concat,
+;;             string=?, string-index-of (absent = -1), string-from-i64,
+;;             string-byte-length, string-contains?, typed-cap-call, the
+;;             i64 arithmetic/comparisons and pairs
+;;   TRAPS     string-index-of-from, string-fold-ascii,
+;;             string-compare (:slot/unimplemented, exit 125), and an
+;;             out-of-range substring end (SIGILL, exit 120)
+;;   COMPILE-REFUSED on this target: string-split-count, string-fold-case
+;; So every use below is from the ANSWERS set; `sub` clamps the end, the
+;; from-position searches are remainder + string-index-of, and slug-case is
+;; a per-char A-Z map.
+;;
+;; `main` is the self-test: both directions for every predicate, the
+;; boundary cases included, and the result line is the FAILURE COUNT (the
+;; 8-question rule: a self-check answers a count, not a boolean).
+
+;; ------------------------------------------------------------------ surface
+
+(defn emit [s :string] :string (typed-cap-call :io/write :string :string s))
+(defn nl [] :string (string-substring "a
+b" 1 2))
+
+;; ------------------------------------------------------------------- basics
+
+(defn sub [s :string i :i64 j :i64] :string
+  (let [n (string-byte-length s)]
+    (if (> j n) (sub s i n)
+      (if (>= i j) "" (string-substring s i j)))))
+
+(defn byte-at [s :string i :i64] :string (string-substring s i (+ i 1)))
+
+(defn lower-char [c :string] :string
+  (let [d (string-index-of "ABCDEFGHIJKLMNOPQRSTUVWXYZ" c)]
+    (if (and (<= 0 d) (< d 26)) (string-substring "abcdefghijklmnopqrstuvwxyz" d (+ d 1)) c)))
+
+(defn ws-char? [c :string] :bool
+  (if (string=? c " ") true (if (string=? c (nl)) true false)))
+
+(defn blank? [s :string] :bool
+  (if (string=? s "") true
+    (if (ws-char? (byte-at s 0)) (blank? (sub s 1 (string-byte-length s)))
+      false)))
+
+(defn nonspace-set [] :string "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_./+")
+(defn b64-set [] :string "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
+(defn eq-set [] :string "=")
+
+(defn skip-ws [s :string i :i64] :i64
+  (if (< i (string-byte-length s))
+    (if (ws-char? (byte-at s i)) (skip-ws s (+ i 1)) i) i))
+
+(defn trim-left [s :string] :string (sub s (skip-ws s 0) (string-byte-length s)))
+
+(defn trim-right-at [s :string n :i64] :string
+  (if (> n 0)
+    (if (ws-char? (byte-at s (- n 1))) (trim-right-at s (- n 1)) (sub s 0 n))
+    (sub s 0 n)))
+
+(defn trim [s :string] :string (trim-right-at (trim-left s) (string-byte-length (trim-left s))))
+
+(defn starts-with? [s :string lit :string] :bool
+  (if (< (string-byte-length s) (string-byte-length lit)) false
+    (string=? (sub s 0 (string-byte-length lit)) lit)))
+
+;; the position of the next SEPARATOR at or after from, or -1. No
+;; string-index-of-from on this substrate: search the remainder. The
+;; builtin's absent sentinel is not assumed -- any answer below 0 is absent.
+(defn find-sep-in [s :string from :i64 sep :string] :i64
+  (let [n (string-byte-length s)]
+    (if (>= from n) -1
+      (let [p (string-index-of (sub s from n) sep)]
+        (if (< p 0) -1 (+ from p))))))
+
+(defn find-sep [s :string from :i64] :i64 (find-sep-in s from "|"))
+(defn find-dot [s :string from :i64] :i64 (find-sep-in s from "."))
+
+(defn field-at [rec :string n :i64 start :i64] :string
+  (let [p (find-sep rec start)]
+    (if (= n 0)
+      (if (< p 0) (sub rec start (string-byte-length rec)) (sub rec start p))
+      (if (< p 0) "" (field-at rec (- n 1) (+ p 1))))))
+
+(defn field [rec :string n :i64] :string (field-at rec n 0))
+
+(defn digit-value [c :string] :i64
+  (let [d (string-index-of "0123456789" c)]
+    (if (and (<= 0 d) (< d 10)) d -1)))
+
+(defn parse-u64-rec [s :string i :i64 n :i64 acc :i64] :i64
+  (if (= i n) acc
+    (let [d (digit-value (byte-at s i))]
+      (if (< d 0) -1 (parse-u64-rec s (+ i 1) n (+ (* acc 10) d))))))
+
+;; decimal parse: digits only; -1 when anything else (including empty)
+(defn parse-u64 [s :string] :i64
+  (if (string=? s "") -1 (parse-u64-rec s 0 (string-byte-length s) 0)))
+
+(defn alnum? [c :string] :bool
+  (if (string-contains? "0123456789" c) true
+    (if (string-contains? "abcdefghijklmnopqrstuvwxyz" c) true false)))
+
+(defn alnum-hyphen? [c :string] :bool (if (alnum? c) true (string=? c "-")))
+
+(defn skip-class [s :string i :i64 set :string] :i64
+  (if (< i (string-byte-length s))
+    (if (string-contains? set (byte-at s i)) (skip-class s (+ i 1) set) i) i))
+
+;; ---------------------------------------------------------------- hostname
+
+(defn label-chars-ok? [l :string i :i64 n :i64] :bool
+  (if (= i n) true
+    (if (alnum-hyphen? (byte-at l i)) (label-chars-ok? l (+ i 1) n) false)))
+
+;; RFC 1123 label: 1..63 bytes of [a-z0-9-], first and last alnum. The
+;; guards are nested ifs, not and-chains, so no byte-at runs on an empty
+;; label whatever the callee's evaluation order is.
+(defn label-ok? [l :string] :bool
+  (let [n (string-byte-length l)]
+    (if (< n 1) false
+      (if (> n 63) false
+        (if (not (alnum? (byte-at l 0))) false
+          (if (not (alnum? (byte-at l (- n 1)))) false
+            (label-chars-ok? l 0 n)))))))
+
+(defn label-end [s :string from :i64] :i64
+  (let [p (find-dot s from)]
+    (if (< p 0) (string-byte-length s) p)))
+
+(defn hostname-labels-ok? [s :string from :i64] :bool
+  (let [e (label-end s from)]
+    (if (not (label-ok? (sub s from e))) false
+      (if (= e (string-byte-length s)) true
+        (hostname-labels-ok? s (+ e 1))))))
+
+;; RFC 1123 host name: dot-separated ok labels, 1..253 bytes overall.
+(defn hostname-ok? [s :string] :bool
+  (let [n (string-byte-length s)]
+    (if (< n 1) false (if (> n 253) false (hostname-labels-ok? s 0)))))
+
+;; ------------------------------------------------------------ network policy
+
+;; R0 admits exactly one policy (install-v1.edn :network-policy).
+(defn network-policy-ok? [p :string] :bool (string=? p "wired-dhcp"))
+
+;; ------------------------------------------------------------- ssh key line
+
+(defn type-end [t :string] :i64
+  (cond (starts-with? t "ssh-ed25519") 11
+        (starts-with? t "ssh-rsa") 7
+        (starts-with? t "ecdsa-sha2-") (skip-class t 11 (nonspace-set))
+        :else -1))
+
+(defn openssh-body-ok? [t :string] :bool
+  (let [e (type-end t)]
+    (if (< e 0) false
+      (let [w (skip-ws t e)]
+        (if (= w e) false
+          (let [b (skip-class t w (b64-set))]
+            (if (= b w) false
+              (let [p (skip-class t b (eq-set))]
+                (if (= p (string-byte-length t)) true
+                  (if (ws-char? (byte-at t p)) true false))))))))))
+
+;; One authorized_keys line: type, base64 blob, optional comment. The blob is
+;; not decoded here -- the fingerprint step does that. Mirrors guided.cljk's
+;; ^(ssh-ed25519|ssh-rsa|ecdsa-sha2-\S+)\s+[A-Za-z0-9+/]+=*(\s|$) on trim(s).
+(defn openssh-public-key? [s :string] :bool
+  (let [t (trim s)]
+    (if (string=? t "") false (openssh-body-ok? t))))
+
+;; ---------------------------------------------------------------- disk core
+
+(defn disk-blank? [d :string] :bool
+  (if (= 1 (parse-u64 (field d 4)))
+    (if (blank? (field d 5)) (blank? (field d 6)) false) false))
+
+(defn disk-candidate? [d :string boot :string image-bytes :i64] :bool
+  (if (string=? (field d 0) "disk")
+    (if (string=? (field d 1) boot) false
+      (if (= 0 (parse-u64 (field d 3)))
+        (if (<= 0 (parse-u64 (field d 2)))
+          (<= image-bytes (parse-u64 (field d 2))) false) false)) false))
+
+;; disk->match's capacity bounds (guided.cljk): margin 10% around the
+;; probed size, both ends truncate toward zero, the top gets one gigabyte
+;; back, the bottom never falls below 1. Inclusive on both ends.
+(defn match-min-gb [size :i64] :i64
+  (let [margin (quot (* size 10) 100)
+        lo (quot (- size margin) 1000000000)]
+    (if (< lo 1) 1 lo)))
+
+(defn match-max-gb [size :i64] :i64
+  (+ 1 (quot (+ size (quot (* size 10) 100)) 1000000000)))
+
+;; ---------------------------------------------------------- account slug ---
+
+(defn slug-run [s :string i :i64 n :i64 acc :string last-dash :bool] :string
+  (if (= i n) acc
+    (let [c (lower-char (byte-at s i))]
+      (if (alnum? c) (slug-run s (+ i 1) n (string-concat acc c) false)
+        (if last-dash (slug-run s (+ i 1) n acc true)
+          (slug-run s (+ i 1) n (string-concat acc "-") true))))))
+
+(defn trim-dashes-right-at [s :string n :i64] :string
+  (if (> n 0)
+    (if (string=? (byte-at s (- n 1)) "-") (trim-dashes-right-at s (- n 1)) (sub s 0 n))
+    (sub s 0 n)))
+
+(defn skip-dashes [s :string i :i64] :i64
+  (if (< i (string-byte-length s))
+    (if (string=? (byte-at s i) "-") (skip-dashes s (+ i 1)) i) i))
+
+(defn trim-dashes [s :string] :string
+  (let [l (skip-dashes s 0)]
+    (trim-dashes-right-at (sub s l (string-byte-length s))
+                          (- (string-byte-length s) l))))
+
+;; account-model (guided.cljk): case-fold, non-alnum runs to '-', trim
+;; leading/trailing dashes, cap at 63 bytes then trim trailing dashes again;
+;; "" or "unspecified" answers "" -- a flow bound to "unspecified" would
+;; claim a model. Case-fold is per-char A-Z (string-fold-ascii traps on this
+;; substrate).
+(defn account-model [model :string] :string
+  (let [s (trim-dashes (slug-run model 0 (string-byte-length model) "" false))
+        n (string-byte-length s)
+        s2 (if (> n 63) (trim-dashes-right-at (sub s 0 63) 63) s)]
+    (if (string=? s2 "") "" (if (string=? s2 "unspecified") "" s2))))
+
+(defn default-hostname [model :string] :string
+  (let [h (account-model model)]
+    (if (string=? h "") "aiueos" (if (hostname-ok? h) h "aiueos"))))
+
+;; ------------------------------------------------------------ self-test ---
+
+(defn p3 [a :i64 b :i64 c :i64] :i64 (+ a (+ b c)))
+
+(defn check [name :string ok? :bool] :i64
+  (if ok? (do (emit "PASS ") (emit name) (emit (nl)) 0)
+    (do (emit "FAIL ") (emit name) (emit (nl)) 1)))
+
+(defn show [name :string v :i64] :i64
+  (do (emit "SHOW ") (emit name) (emit "=") (emit (string-from-i64 v)) (emit (nl)) 0))
+
+(defn rep-a [n :i64] :string (if (= n 0) "" (string-concat "a" (rep-a (- n 1)))))
+
+(defn t-surface [] :i64
+  (p3 (do (show "index-of-absent" (string-index-of "abc" "z")) 0)
+      (do (show "index-of-at" (string-index-of "abc" "b")) 0)
+      (do (show "byte-length" (string-byte-length "hello"))
+          (show "contains" (if (string-contains? "abcd" "bc") 1 0))
+          (show "sub-clamp" (if (string=? (sub "abcde" 2 999) "cde") 1 0)) 0)))
+
+(defn t-host [] :i64
+  (let [l63 (rep-a 63)] (p3 (p3 (p3 (check "host-ok-simple" (hostname-ok? "aiueos")) (check "host-ok-dotted" (hostname-ok? "k16.local")) (check "host-ok-label63" (hostname-ok? l63))) (p3 (check "host-empty" (not (hostname-ok? ""))) (check "host-label64" (not (hostname-ok? (rep-a 64)))) (check "host-leading-hyphen" (not (hostname-ok? "-bad")))) (p3 (check "host-trailing-hyphen" (not (hostname-ok? "bad-"))) (check "host-upper" (not (hostname-ok? "BAD"))) (check "host-dot-empty-label" (not (hostname-ok? "a..b"))))) (p3 (check "host-253" (hostname-ok? (string-concat l63 (string-concat "." (string-concat l63 (string-concat "." (string-concat l63 (string-concat "." (rep-a 61))))))))) (check "host-254" (not (hostname-ok? (string-concat l63 (string-concat "." (string-concat l63 (string-concat "." (string-concat l63 (string-concat "." (rep-a 62)))))))))) 0) 0)))
+
+(defn t-net [] :i64
+  (p3 (check "net-wired" (network-policy-ok? "wired-dhcp")) (check "net-other" (not (network-policy-ok? "wifi"))) (check "net-empty" (not (network-policy-ok? "")))))
+
+(defn t-ssh [] :i64
+  (p3 (p3 (p3 (check "ssh-ed25519" (openssh-public-key? "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBl6g2nUJZaNJMvqfLqBFiTPF9rWjXq/DB4XzJZq5j5j")) (check "ssh-comment" (openssh-public-key? "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBl6g2nUJZaNJMvqfLqBFiTPF9rWjXq/DB4XzJZq5j5j k16")) (check "ssh-rsa" (openssh-public-key? "ssh-rsa AAAAB3NzaC1yc2E="))) (p3 (check "ssh-ecdsa" (openssh-public-key? "ecdsa-sha2-p256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTY=")) (check "ssh-trailing-space" (openssh-public-key? "ssh-ed25519 AAAAC3Nz ")) (check "ssh-leading-space" (openssh-public-key? "  ssh-ed25519 AAAAC3Nz"))) (p3 (check "ssh-empty" (not (openssh-public-key? ""))) (check "ssh-garbage" (not (openssh-public-key? "hello world"))) (check "ssh-no-blob" (not (openssh-public-key? "ssh-ed25519"))))) (p3 (check "ssh-bad-blob-char" (not (openssh-public-key? "ssh-ed25519 AAA!AA"))) (check "ssh-no-space-after-type" (not (openssh-public-key? "ssh-rsaAAA"))) (check "ssh-only-type-and-space" (not (openssh-public-key? "ssh-ed25519 ")))) 0))
+
+(defn t-disk [] :i64
+  (let [d1 "disk|/dev/nvme1n1|1000204886016|0|1|||SAMSUNG MZVL21T0HCLR-00B00|nvme|S4EWNX0R"
+        d2 "disk|/dev/sda|500107862016|0|0|||Old Disk|sata|"
+        d3 "disk|/dev/sdb|500107862016|0|1|dos|ext4|USB Stick|usb|ABC"
+        d4 "disk|/dev/sdc|2000398934016|1|1|||Removable|usb|X"
+        part "part|/dev/sda1|100|0|1|||||"] (p3 (p3 (p3 (check "field-path" (string=? (field d1 1) "/dev/nvme1n1")) (check "field-serial" (string=? (field d1 9) "S4EWNX0R")) (check "field-empty" (string=? (field d1 5) ""))) (p3 (check "field-last-empty" (string=? (field d2 9) "")) (check "parse-size" (= 1000204886016 (parse-u64 (field d1 2)))) (check "parse-bad" (= -1 (parse-u64 "12a4")))) (p3 (check "parse-empty" (= -1 (parse-u64 ""))) (check "blank-measured-empty" (disk-blank? d1)) (check "blank-unmeasured" (not (disk-blank? d2))))) (p3 (p3 (check "blank-has-signature" (not (disk-blank? d3))) (check "candidate-yes" (disk-candidate? d1 "/dev/sdz" 1)) (check "candidate-boot-excluded" (not (disk-candidate? d1 "/dev/nvme1n1" 1)))) (p3 (check "candidate-too-small" (not (disk-candidate? d1 "/dev/sdz" 2000000000000))) (check "candidate-not-disk" (not (disk-candidate? part "/dev/sdz" 1))) (check "candidate-removable" (not (disk-candidate? d4 "/dev/sdz" 1)))) (check "candidate-no-image-bound" (disk-candidate? d1 "/dev/sdz" -1))) 0)))
+
+(defn t-match [] :i64
+  (p3 (p3 (check "match-min" (= 900 (match-min-gb 1000204886016))) (check "match-max" (= 1101 (match-max-gb 1000204886016))) (check "match-min-floor" (= 1 (match-min-gb 1)))) (p3 (check "match-min-boundary" (= 1 (match-min-gb 2))) (check "match-min-exact" (= 9 (match-min-gb 10000000000))) (check "match-max-exact" (= 12 (match-max-gb 10000000000)))) 0))
+
+(defn t-slug [] :i64
+  (p3 (p3 (check "slug-basic" (string=? (account-model "GMKtec K16") "gmktec-k16")) (check "slug-unspecified" (string=? (account-model "unspecified") "")) (check "slug-Unspecified-bang" (string=? (account-model "Unspecified!") ""))) (p3 (check "slug-empty" (string=? (account-model "") "")) (check "slug-dashes" (string=? (account-model "--Foo--Bar--") "foo-bar")) (check "slug-cap63" (string=? (account-model (rep-a 70)) (rep-a 63)))) (p3 (check "slug-cap63-tail-trim" (string=? (account-model (string-concat (rep-a 62) (string-concat "-" (rep-a 20)))) (rep-a 62))) (check "default-aiueos" (string=? (default-hostname "unspecified") "aiueos")) (check "default-model" (string=? (default-hostname "GMKtec K16") "gmktec-k16")))))
+
+
+;; ------------------------------------------------------- driver (screens) ---
+
+;; The screen driver (Linear JUN-70 S1 goal 3): the guided flow as one
+;; x86_64-linux-static process. argv:
+;;   1  answers file to write (inside the fs scope)
+;;   2  disks: flat records (see header) separated by newlines
+;;   3  boot disk path (excluded from candidates)
+;;   4  release image size in bytes (-1 when unbounded)
+;;   5  machine model for the defaults (empty when unknown)
+;; stdin is read line-wise through one 256-byte chunk per question. The
+;; result line is the guided contract: 0 written, 2 refused with
+;; AIUEOS_GUIDED_REFUSE <reason> on stdout, 3 nobody answered (EOF).
+;; ask-valid / ask-y-n / ask-chunk answer "V:<value>", "E" (EOF) or
+;; "R:<reason>" -- code-owned markers a typed value can never collide with.
+
+(defn arg [i :string] :string (typed-cap-call :cli/args :string :string i))
+(defn stdin [s :string] :string (typed-cap-call :io/read :string :string s))
+(defn fsq [s :string] :string (typed-cap-call :fs/app-data :string :string s))
+
+(defn line-of [c :string] :string
+  (let [p (string-index-of c (nl))]
+    (if (< p 0) c (sub c 0 p))))
+
+(defn e-tag [s :string] :bool (string=? s "E"))
+(defn r-tag [s :string] :bool (starts-with? s "R:"))
+(defn v-of [s :string] :string (sub s 2 (string-byte-length s)))
+(defn r-of [s :string] :string (sub s 2 (string-byte-length s)))
+
+(defn lower-word-acc [s :string i :i64 n :i64 acc :string] :string
+  (if (= i n) acc (lower-word-acc s (+ i 1) n (string-concat acc (lower-char (byte-at s i))))))
+
+(defn lower-word [s :string] :string (lower-word-acc s 0 (string-byte-length s) ""))
+
+(defn yes? [s :string] :bool
+  (let [l (lower-word s)]
+    (if (string=? l "y") true (if (string=? l "yes") true false))))
+
+(defn no? [s :string] :bool (string=? (lower-word s) "n"))
+
+(defn read-rest [acc :string] :string
+  (let [c (stdin "1")]
+    (if (string=? c "") acc
+      (if (string=? c (nl)) acc (read-rest (string-concat acc c))))))
+
+;; One line per question, read BYTE-wise: a single larger read would swallow
+;; every piped answer at once and leave the later screens at EOF (measured
+;; 2026-10-18 with a 256-byte read). Answers "E" on EOF, "" on an empty line.
+;; The one collision: a line that is exactly "E" is read as EOF -- no screen
+;; accepts "E" as a value (policy/host/key are validated, and the confirm
+;; line must equal a hostname, which cannot be "E").
+(defn ask-chunk [prompt :string] :string
+  (do (emit prompt)
+      (let [c (stdin "1")]
+        (if (string=? c "") "E"
+          (if (string=? c (nl)) "" (read-rest c))))))
+
+(defn valid-reason [kind :string] :string
+  (cond (string=? kind "policy") "answers-network-policy-unsupported"
+        (string=? kind "host") "answers-hostname-invalid"
+        (string=? kind "key") "answers-ssh-key-not-openssh"
+        (string=? kind "pick") "guided-storage-pick-out-of-range"
+        (string=? kind "yesno") "guided-yesno-invalid"
+        :else "answers-value-invalid"))
+
+(defn valid-value? [kind :string v :string limit :i64] :bool
+  (cond (string=? kind "policy") (network-policy-ok? v)
+        (string=? kind "host") (hostname-ok? v)
+        (string=? kind "key") (openssh-public-key? v)
+        (string=? kind "pick") (let [n (parse-u64 v)] (if (and (<= 1 n) (<= n limit)) true false))
+        (string=? kind "yesno") (if (yes? v) true (if (no? v) true false))
+        :else true))
+
+(defn ask-valid [prompt :string default :string kind :string limit :i64 tries :i64] :string
+  (if (< tries 1) (string-concat "R:" (valid-reason kind))
+    (let [c (ask-chunk prompt)]
+      (if (string=? c "E") "E"
+        (let [raw (line-of c)
+              v (if (string=? raw "") default raw)]
+          (if (valid-value? kind v limit) (string-concat "V:" v)
+            (do (emit "AIUEOS_GUIDED_REFUSE ") (emit (valid-reason kind)) (emit (nl))
+                (emit "try again:") (emit (nl))
+                (ask-valid prompt default kind limit (- tries 1)))))))))
+
+(defn ask-y-n [prompt :string default :string tries :i64] :string
+  (if (< tries 1) "R:guided-yesno-invalid"
+    (let [c (ask-chunk prompt)]
+      (if (string=? c "E") "E"
+        (let [raw (line-of c)
+              v (if (string=? raw "") default raw)]
+          (if (yes? v) "V:yes"
+            (if (no? v) "V:no"
+              (do (emit "AIUEOS_GUIDED_REFUSE guided-yesno-invalid") (emit (nl))
+                  (emit "try again:") (emit (nl))
+                  (ask-y-n prompt default (- tries 1))))))))))
+
+;; walk the newline-separated records: with pick 0 answer the candidate
+;; count, with pick > 0 answer "V:" + the 1-based picked record.
+(defn walk-disks [disks :string from :i64 boot :string img :i64 pick :i64 seen :i64] :string
+  (let [n (string-byte-length disks)]
+    (if (>= from n) (if (= pick 0) (string-from-i64 seen) "R:guided-storage-pick-out-of-range")
+      (let [e (find-sep-in disks from (nl))
+            rec (if (< e 0) (sub disks from n) (sub disks from e))
+            nxt (if (< e 0) n (+ e 1))]
+        (if (disk-candidate? rec boot img)
+          (let [seen2 (+ seen 1)]
+            (if (and (> pick 0) (= pick seen2)) (string-concat "V:" rec)
+              (walk-disks disks nxt boot img pick seen2)))
+          (walk-disks disks nxt boot img pick seen))))))
+
+(defn esc-acc [s :string i :i64 n :i64 acc :string] :string
+  (if (= i n) acc
+    (let [c (byte-at s i)]
+      (if (string=? c "\"") (esc-acc s (+ i 1) n (string-concat acc "\\\""))
+        (if (string=? c "\\") (esc-acc s (+ i 1) n (string-concat acc "\\\\"))
+          (esc-acc s (+ i 1) n (string-concat acc c)))))))
+
+(defn esc [s :string] :string (esc-acc s 0 (string-byte-length s) ""))
+
+(defn jstr [k :string v :string] :string
+  (string-concat "\"" (string-concat k (string-concat "\":\"" (string-concat (esc v) "\"")))))
+
+(defn refuse2 [reason :string] :i64
+  (do (emit "AIUEOS_GUIDED_REFUSE ") (emit reason) (emit (nl)) 2))
+
+;; ---- probe + live handoff (Linear JUN-70 S5: the stick's console chain) ---
+
+(defn spawn [s :string] :string (typed-cap-call :process/spawn :string :string s))
+
+(defn spawn-exit [a :string] :i64
+  (let [p (string-index-of a (nl))]
+    (if (< p 0) -1 (parse-u64 (sub a 0 p)))))
+
+(defn spawn-out [a :string] :string
+  (let [p (string-index-of a (nl))]
+    (if (< p 0) "" (sub a (+ p 1) (string-byte-length a)))))
+
+(defn first-line [s :string] :string
+  (let [p (string-index-of s (nl))]
+    (if (< p 0) s (sub s 0 p))))
+
+(defn word-at [line :string from :i64 n :i64] :string
+  (if (= n 0)
+    (let [p (find-sep-in line from " ")]
+      (if (< p 0) (sub line from (string-byte-length line)) (sub line from p)))
+    (let [p (find-sep-in line from " ")]
+      (if (< p 0) "" (word-at line (+ p 1) (- n 1))))))
+
+;; one single-column lsblk query on a device (a model may contain spaces,
+;; so MODEL/TRAN/SERIAL are asked one column at a time -- measured).
+(defn q-col [path :string col :string] :string
+  (let [a (spawn (string-concat "lsblk" (string-concat "ARG_SEP" (string-concat "-bdno" (string-concat "ARG_SEP" (string-concat col (string-concat "ARG_SEP" path)))))))]
+    (if (= 0 (spawn-exit a)) (trim (first-line (spawn-out a))) "")))
+
+;; one `lsblk -bdno TYPE,PATH,SIZE,RM` line -> a full flat record
+(defn probe-line [line :string] :string
+  (let [typ (word-at line 0 0) path (word-at line 0 1) size (word-at line 0 2) rm (word-at line 0 3)]
+    (string-concat typ (string-concat "|" (string-concat path (string-concat "|" (string-concat size (string-concat "|" (string-concat rm (string-concat "|" (string-concat "0" (string-concat "|" (string-concat "" (string-concat "|" (string-concat "" (string-concat "|" (string-concat (q-col path "MODEL") (string-concat "|" (string-concat (q-col path "TRAN") (string-concat "|" (q-col path "SERIAL")))))))))))))))))))))
+
+(defn probe-records [acc :string from :i64 out :string] :string
+  (if (>= from (string-byte-length acc)) out
+    (let [e (find-sep-in acc from (nl))
+          line (if (< e 0) (sub acc from (string-byte-length acc)) (sub acc from e))
+          nxt (if (< e 0) (string-byte-length acc) (+ e 1))]
+      (if (string=? line "") (probe-records acc nxt out)
+        (let [rec (probe-line line)]
+          (probe-records acc nxt (if (string=? out "") rec (string-concat out (string-concat (nl) rec)))))))))
+
+(defn probe-disks [] :string
+  (let [a (spawn (string-concat "lsblk" (string-concat "ARG_SEP" (string-concat "-bdno" (string-concat "ARG_SEP" "TYPE,PATH,SIZE,RM")))))]
+    (if (= 0 (spawn-exit a)) (probe-records (spawn-out a) 0 "") "")))
+
+;; the live handoff: hand the recorded MATCH to install-live, which
+;; re-derives the device (exactly one) and runs the write. argv 6 is the
+;; install-live program, 7 the install-disk program, 8 the release image
+;; (all absolute; the spawn grants are sealed per program).
+;; ---- the MATCH rule, re-derived at install time (install-v1.edn
+;; decision 2). The pick is recorded as model / transport / inclusive
+;; capacity bounds / serial; here the machine re-derives the ONE target
+;; from those and refuses on 0 or 2+ matches.
+(defn gb-of [size :i64] :i64 (quot size 1000000000))
+
+(defn matches? [rec :string model :string tran :string lo :i64 hi :i64 serial :string] :bool
+  (let [size (parse-u64 (field rec 2))]
+    (if (< size 0) false
+      (if (not (string=? (field rec 7) model)) false
+        (if (not (string=? (field rec 8) tran)) false
+          (let [gb (gb-of size)]
+            (if (or (< gb lo) (> gb hi)) false
+              (if (string=? serial "") true (string=? (field rec 9) serial)))))))))
+
+(defn count-matches [records :string from :i64 model :string tran :string lo :i64 hi :i64 serial :string seen :i64] :i64
+  (if (>= from (string-byte-length records)) seen
+    (let [e (find-sep-in records from (nl))
+          rec (if (< e 0) (sub records from (string-byte-length records)) (sub records from e))
+          nxt (if (< e 0) (string-byte-length records) (+ e 1))]
+      (count-matches records nxt model tran lo hi serial
+                     (if (matches? rec model tran lo hi serial) (+ seen 1) seen)))))
+
+(defn find-match [records :string from :i64 model :string tran :string lo :i64 hi :i64 serial :string] :string
+  (if (>= from (string-byte-length records)) "R:target-no-match"
+    (let [e (find-sep-in records from (nl))
+          rec (if (< e 0) (sub records from (string-byte-length records)) (sub records from e))
+          nxt (if (< e 0) (string-byte-length records) (+ e 1))]
+      (if (matches? rec model tran lo hi serial) (string-concat "V:" rec)
+        (find-match records nxt model tran lo hi serial)))))
+
+(defn derive-target [records :string model :string tran :string lo :i64 hi :i64 serial :string] :string
+  (let [c (count-matches records 0 model tran lo hi serial 0)]
+    (if (= c 0) "R:target-no-match"
+      (if (> c 1) "R:target-ambiguous"
+        (find-match records 0 model tran lo hi serial)))))
+
+;; ---- the flat phase chain (JUN-70). guided-core is NOT a spawn child
+;; (init runs it), so it has no wall; every phase it spawns is short (the
+;; substrate kills a spawn child at 10 s). argv 6 is the work dir (inside
+;; the sealed fs scope), 7 the install-disk program, 8 the release image.
+(defn disk-phase [disk-elf :string device :string src :string work :string mode :string e1 :string e2 :string] :string
+  (spawn (string-concat (string-concat (string-concat (string-concat disk-elf "ARG_SEP") (string-concat device "ARG_SEP")) (string-concat (string-concat src "ARG_SEP") (string-concat "-" "ARG_SEP"))) (string-concat (string-concat (string-concat mode "ARG_SEP") (string-concat work "ARG_SEP")) (string-concat (string-concat e1 "ARG_SEP") e2)))))
+
+(defn phase-failed? [out :string] :bool (string-contains? out "AIUEOS_INSTALL_REFUSE"))
+
+(defn verify-loop [disk-elf :string device :string src :string work :string blk :i64 end :i64] :i64
+  (if (>= blk end) 0
+    (let [n (if (< (+ blk 512) end) 512 (- end blk))
+          out (disk-phase disk-elf device src work "verify" (string-from-i64 blk) (string-from-i64 (+ blk n)))]
+      (if (phase-failed? out) -1
+        (do (emit out) (verify-loop disk-elf device src work (+ blk n) end))))))
+
+(defn run-live [d :string size :i64 bind :string typed :string disks :string] :i64
+  (let [model (field d 7) tran (field d 8)
+        lo (match-min-gb size) hi (match-max-gb size)
+        serial (if (string=? (v-of bind) "yes") (field d 9) "")
+        disk-elf (arg "7") image (arg "8") work (arg "6") records disks
+        derived (derive-target records model tran lo hi serial)]
+    (if (r-tag derived) (refuse2 (r-of derived))
+      (let [device (field (v-of derived) 1)]
+        (do (emit "AIUEOS_LIVE_TARGET ") (emit device) (emit (nl))
+            (let [ck (disk-phase disk-elf device image work "receipt-check" "" "")]
+              (if (phase-failed? ck) (do (emit ck) 2)
+                (let [w (disk-phase disk-elf device image work "write" "" "")]
+                  (if (phase-failed? w) (do (emit w) 2)
+                    (do (emit w)
+                        (let [vr (verify-loop disk-elf device image work 0 (quot size 4096))]
+                          (if (< vr 0) (refuse2 "readback-mismatch")
+                            (let [rq (disk-phase disk-elf device image work "receipt-write" "" "")]
+                              (if (phase-failed? rq) (do (emit rq) 2)
+                                (do (emit rq) 0)))))))))))))))
+(defn run-flow [out :string disks :string boot :string img :i64 model :string] :i64
+  (let [net (ask-valid "Network policy for the installed machine [wired-dhcp]: " "wired-dhcp" "policy" 0 3)] (if (e-tag net) 3 (if (r-tag net) (refuse2 (r-of net)) (let [cnt (walk-disks disks 0 boot img 0 0)] (if (string=? cnt "0") (refuse2 "no-candidate-disks") (do (emit "candidates:") (emit (nl)) (emit (string-concat cnt (string-concat " whole disk(s) may be offered" (nl)))) (let [pick (ask-valid "Disk to erase (number): " "1" "pick" (parse-u64 cnt) 3)] (if (e-tag pick) 3 (if (r-tag pick) (refuse2 (r-of pick)) (let [rec (walk-disks disks 0 boot img (parse-u64 (v-of pick)) 0)] (if (r-tag rec) (refuse2 (r-of rec)) (let [d (v-of rec) size (parse-u64 (field d 2))] (let [bind (if (string=? (field d 9) "") "V:no" (ask-y-n "Bind the intent to this disk serial digest? y/n [y]: " "y" 3))] (if (e-tag bind) 3 (if (r-tag bind) (refuse2 (r-of bind)) (do (emit "the intent will record this MATCH, not the device path:") (emit (nl)) (emit "  model      ") (emit (field d 7)) (emit (nl)) (emit "  transport  ") (emit (field d 8)) (emit (nl)) (emit "  capacity   ") (emit (string-from-i64 (match-min-gb size))) (emit " GB .. ") (emit (string-from-i64 (match-max-gb size))) (emit " GB (inclusive)") (emit (nl)) (emit "  serial     ") (emit (if (string=? (v-of bind) "yes") "bound by digest" "not bound")) (emit (nl)) (let [accm (ask-y-n "Accept this match? y/n [y]: " "y" 3)] (if (e-tag accm) 3 (if (r-tag accm) (refuse2 (r-of accm)) (if (no? (v-of accm)) (refuse2 "guided-storage-match-rejected") (let [host (ask-valid "Hostname of the installed machine [default from model]: " (default-hostname model) "host" 0 3)] (if (e-tag host) 3 (if (r-tag host) (refuse2 (r-of host)) (let [mm (ask-chunk (string-concat "Machine model, for the receipt [" (string-concat (if (string=? model "") "unspecified" model) "]: ")))] (if (string=? mm "E") 3 (let [mmv (if (string=? (line-of mm) "") (if (string=? model "") "unspecified" model) (line-of mm))] (let [key (ask-valid "OpenSSH public key that may log in: " "" "key" 0 3)] (if (e-tag key) 3 (if (r-tag key) (refuse2 (r-of key)) (let [pr (ask-valid "Principal that key logs in as [aiueos]: " "aiueos" "free" 0 3)] (if (e-tag pr) 3 (if (r-tag pr) (refuse2 (r-of pr)) (let [cf (ask-chunk "Repeat the hostname to confirm the erase: ")] (if (string=? cf "E") 3 (if (string=? (line-of cf) (v-of host)) (do (emit "AIUEOS_GUIDED_ANSWERS_WRITTEN") (emit (nl)) (if (string=? (arg "6") "") 0 (let [mf (string-concat (string-concat (string-concat (string-concat (field d 7) "|") (string-concat (field d 8) "|")) (string-concat (string-concat (string-from-i64 (match-min-gb size)) "|") (string-concat (string-from-i64 (match-max-gb size)) "|"))) (if (string=? (v-of bind) "yes") (field d 9) "")) w (fsq (string-concat (arg "1") (string-concat ".match" (string-concat "WRITE_SEP" mf))))] (if (string=? w mf) 0 (refuse2 "match-write-failed"))))) (refuse2 "guided-confirm-mismatch")))))))))))))))))))))))))))))))))))))
+
+(defn driver-main [] :i64
+  (let [out (arg "1") disks (if (string=? (arg "2") "") (probe-disks) (arg "2")) boot (arg "3") img (parse-u64 (arg "4")) model (arg "5")]
+    (if (string=? out "") (refuse2 "no-out-path")
+      (run-flow out disks boot img model))))
+
+(defn main [] :i64
+  ;; argv 0 selects the section. One section per PROCESS on purpose: the
+  ;; static profile's pair arena (lang/limits.edn, 4096 cells) holds string
+  ;; handles and a full single-process run of all 57 vectors exhausted it
+  ;; measured 2026-10-18 (KEXE_TRAP {:kind :budget :reason :budget/cells
+  ;; :arena :pairs} at check 53). A section answers its own failure count.
+  (let [mode (typed-cap-call :cli/args :string :string "0")]
+    (cond (string=? mode "surface") (t-surface)
+          (string=? mode "host") (t-host)
+          (string=? mode "net") (t-net)
+          (string=? mode "ssh") (t-ssh)
+          (string=? mode "disk") (t-disk)
+          (string=? mode "match") (t-match)
+          (string=? mode "slug") (t-slug)
+          (string=? mode "install") (driver-main)
+          :else (do (emit "usage: guided-core surface|host|net|ssh|disk|match|slug|install") (emit (nl)) 2))))

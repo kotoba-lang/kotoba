@@ -1,0 +1,97 @@
+;; The TCP checksum, verified over the IPv4 pseudo-header.
+;;
+;; TCP is the first protocol in this stack whose checksum is not self-contained:
+;; it covers twelve bytes that appear nowhere in the segment -- the two IPv4
+;; addresses, the protocol number and the TCP length -- which is what stops a
+;; segment from being replayed between connections that differ only in their
+;; endpoints. Nothing above the IPv4 header can therefore decide on its own
+;; whether a segment is intact, and the addresses have to be stated by whoever
+;; asks.
+;;
+;; This object exists alongside `tcp-segment-valid.kotoba` rather than being
+;; called by it: a kernel object is compiled with host imports disabled and
+;; exports exactly one symbol, so one object cannot call another (the same
+;; duplication ADR-0021 pays for between `ipv4-checksum` and
+;; `ipv4-icmp-reply-valid`). What it buys is a check on the SEND side. The
+;; driver lays the pseudo-header and the segment out contiguously in a scratch
+;; buffer and lets `aiueos-ipv4-checksum` produce the field; this object then
+;; re-derives the same sum from the frame itself, by a different path, before
+;; the segment is posted.
+;;
+;; What that catches, precisely: a scratch copy of the wrong length or from the
+;; wrong offset, a checksum field that was not zero while it was computed, a
+;; field stored at the wrong offset, a TCP length that disagrees with the IPv4
+;; total length. What it does NOT catch is an address that is wrong in the same
+;; way in both places -- both derivations are given the endpoints the caller
+;; intends, so they agree about a header that says something else. Only the peer
+;; can catch that, by dropping the segment; the point of checking here is that
+;; a dropped segment on a bare-metal probe looks exactly like a peer that never
+;; answered, and takes a whole TCG boot to distinguish.
+;;
+;; Offsets, from the frame's first byte:
+;;   14      version and IHL        34..35  source port        46      data offset
+;;   16..17  IPv4 total length      36..37  destination port   47      flags
+;;   23      protocol               38..41  sequence           48..49  window
+;;   26..29  source address         42..45  acknowledgement    50..51  checksum
+;;   30..33  destination address
+;;
+;; `src` and `dst` arrive as big-endian IPv4 addresses widened to i64, so the
+;; halves are split arithmetically here rather than loaded -- they are the one
+;; part of the sum that is not in memory at all.
+
+(defn aiueos-tcpsum-word [frame base length offset]
+  ;; RFC 1071 pads a trailing odd byte on the right, so it is the high half. A
+  ;; TCP segment can end on an odd byte whenever its payload does, which is why
+  ;; this case is reachable here and never was for the fixed-size ICMP header.
+  (if (>= (+ offset 1) length)
+    (* (kernel-load-u8-4k frame 2048 (+ base offset)) 256)
+    (+ (* (kernel-load-u8-4k frame 2048 (+ base offset)) 256)
+       (kernel-load-u8-4k frame 2048 (+ base offset 1)))))
+
+(defn aiueos-tcpsum-sum [frame base length offset total]
+  (if (>= offset length) total
+    (aiueos-tcpsum-sum frame base length (+ offset 2)
+                       (+ total (aiueos-tcpsum-word frame base length offset)))))
+
+(defn aiueos-tcpsum-fold [total]
+  (if (< total 65536) total
+    (aiueos-tcpsum-fold (+ (bit-and total 65535) (quot total 65536)))))
+
+(defn aiueos-tcpsum-pseudo [src dst tcp-length]
+  ;; The zero byte and the protocol number are one 16-bit word, which is why 6
+  ;; is added rather than 1536: the padding byte is the HIGH half.
+  (+ (+ (quot src 65536) (bit-and src 65535))
+     (+ (+ (quot dst 65536) (bit-and dst 65535))
+        (+ 6 tcp-length))))
+
+(defn aiueos-tcpsum-checksum [frame base length seed]
+  ;; The region is always the FRAME; `base` is how far into it the summed range
+  ;; starts. The compiler requires a kernel memory base to NAME a region rather
+  ;; than compute one -- passing `(+ frame 34)` is rejected outright -- which is
+  ;; what keeps a bounded load bounded, since a computed base could put the 2048
+  ;; trap bound anywhere. `seed` carries the pseudo-header in as an already
+  ;; summed value, for the same reason: it is not in the region.
+  ;; Out of range returns 0xffff, the one value the verification identity below
+  ;; can never read as valid, so an over-long segment fails closed.
+  (if (or (< length 0) (> (+ base length) 2048)) 65535
+    (- 65535 (aiueos-tcpsum-fold (aiueos-tcpsum-sum frame base length 0 seed)))))
+
+(defn aiueos-tcp-checksum-ok [frame ip-total-length src dst]
+  ;; The TCP length is not a field -- it is the IPv4 total length less the
+  ;; 20-byte header, which is why this takes the IPv4 length and not the TCP
+  ;; one: deriving it here means the two can never be given inconsistently.
+  ;; IHL is assumed to be 5; the caller admits that separately, and this object
+  ;; is reached in the driver only for segments it built with no options.
+  (let [tcp-length (- ip-total-length 20)]
+    (and ;; At least the fixed 20-byte TCP header, and the whole segment within
+         ;; the frame the loads are bounded to.
+         (>= tcp-length 20)
+         (<= (+ tcp-length 34) 2048)
+         ;; Summing a segment that carries a correct checksum leaves 0xffff, so
+         ;; the complement is 0 exactly when it is intact -- the field is
+         ;; verified without ever being read on its own.
+         (= (aiueos-tcpsum-checksum frame 34 tcp-length
+                                    (aiueos-tcpsum-pseudo src dst tcp-length))
+            0))))
+
+(defn main [] 0)

@@ -1,0 +1,208 @@
+;; Legacy 8259A pair: remap, then shut down.
+;;
+;; This is mechanism, not another decision, and it is expressible only because
+;; `kernel-out-u8` exists: the whole object is ten byte writes to four fixed
+;; ports, with an I/O delay between them.
+;;
+;; WHY IT MOVED, AND WHY IT IS SHARED
+;;
+;; ADR-0028 diagnosed a ~22% flaky Multiboot boot. QEMU's `-kernel` path still
+;; runs SeaBIOS, which programs the 8259s (master vector base 0x08) and leaves
+;; the 8254 channel 0 ticking at ~18.2 Hz before handing off. The kernel
+;; inherited a live PIC, never masked it, and the first `sti` let IRQ0 arrive
+;; through LINT0 as an ExtINT and INTA-cycle to vector 0x08 + 0 = 8 -- where it
+;; masqueraded as #DF. Whether that beat the Local APIC timer's own vector-32
+;; tick was a race, which is why the gate failed intermittently rather than
+;; every time, and why it stayed opaque for so long.
+;;
+;; The fix landed in C, in multiboot/main.c, and only there. The UEFI path has
+;; the SAME gap: kernel/main.c enables interrupts at main.c:456 having never
+;; touched the 8259, and the only masking anywhere on that path is the
+;; `out8(0x21,0xff); out8(0xa1,0xff)` pair inside
+;; `aiueos_ioapic_route_legacy_timer` (ioapic.c:31), which does not run until
+;; main.c:692 -- 236 lines and one `sti` too late, and which masks without ever
+;; remapping. That path is green only because OVMF happens to mask the PIC
+;; before handoff. Its correctness is currently a property of its firmware, not
+;; of this OS. One object, called from both paths, is what makes it the OS's.
+;;
+;; WHAT THE SEQUENCE IS (Intel 8259A, ICW1-ICW4 then OCW1)
+;;
+;;   0x20/0xa0 command, 0x21/0xa1 data; master first, then slave, each step.
+;;
+;;   ICW1 = 0x11   begin initialisation, ICW4 will follow. Writing this to the
+;;                 command port is what makes the next three writes to the data
+;;                 port mean ICW2, ICW3, ICW4 rather than OCW1.
+;;   ICW2          the vector base. THE DECISION THIS OBJECT OWNS -- see below.
+;;   ICW3 = 0x04 / 0x02
+;;                 cascade wiring: the master learns a slave hangs off IRQ2
+;;                 (bit 2), the slave learns it is cascade identity 2. Fixed by
+;;                 the PC/AT board, not by the caller, so they are literals.
+;;   ICW4 = 0x01   8086/8088 mode rather than MCS-80/85.
+;;   OCW1 = 0xff   mask every line on both chips. After ICW4 the data port
+;;                 means the interrupt mask register again.
+;;
+;; THE I/O DELAY
+;;
+;; The C being replaced writes port 0x80 with 0 after every one of the ten
+;; writes, including the last. Port 0x80 is the POST diagnostic port: nothing
+;; is listening, and the write costs an ISA bus cycle, which is the classic way
+;; to give a real 8259 time to latch one initialisation word before the next
+;; arrives. It is reproduced here exactly -- ten writes, ten delays, same
+;; positions. Dropping it would be a silent behavioural change on real hardware
+;; that QEMU would never show, and adding one where the C had none would be a
+;; different sequence wearing the same name.
+;;
+;; DOMAIN AND FAILURE -- WHICH VECTOR BASES ARE ADMISSIBLE
+;;
+;; The bases are arguments, so they are checked rather than trusted, and this
+;; is the part that matters: remapping onto a range the CPU or this kernel
+;; already owns is EXACTLY the failure ADR-0028 spent a long time not seeing.
+;; A bad base here does not fail loudly; it makes one interrupt indistinguish-
+;; able from another, and the reader of the resulting evidence is told the
+;; wrong thing.
+;;
+;; Seven clauses, each closing a distinct way to be wrong:
+;;
+;;   (>= base 32)    Above the CPU exception range. Vectors 0-31 are reserved
+;;                   by the architecture; base 0x08 -- SeaBIOS's own choice --
+;;                   puts IRQ0 on vector 8, #DF. This is the clause that would
+;;                   have refused the configuration this kernel inherited.
+;;
+;;                   It is ALSO the clause that makes the object total over its
+;;                   own i64 signature. i64 is signed and the C it replaces was
+;;                   unsigned: a negative base under an unsigned comparison
+;;                   becomes a huge positive and sails past any lone upper
+;;                   bound. Here the comparison is signed, so -1 and -8 land
+;;                   BELOW 32 and are refused by this clause, not by luck.
+;;
+;;   (<= base 248)   The chip occupies eight vectors, base..base+7. 248 is the
+;;                   largest base whose span fits in the 256-entry IDT; 250
+;;                   would put IRQ7 at 257, off the end of the table entirely.
+;;
+;;   (= (bit-and base 7) 0)
+;;                   8-alignment. ICW2 latches only bits 7:3 -- the chip
+;;                   supplies the low three bits itself from the IRQ number.
+;;                   So an unaligned base does not fail, it TRUNCATES: 0xe2
+;;                   silently becomes 0xe0 and the caller's intent is lost
+;;                   without a symptom. Note this clause cannot stand in for
+;;                   the range check: -8 is 8-aligned, and only `>= 32` stops
+;;                   it.
+;;
+;;   (not (= base 32))
+;;   (not (= base 128))
+;;   (not (= base 248))
+;;                   The three 8-aligned blocks that collide with a vector this
+;;                   kernel has already given a meaning. Grepped, not assumed:
+;;
+;;                     32..39   32 Local APIC timer   main.c:332, apic.c:44
+;;                              33 IOAPIC/PIT timer   main.c:333, ioapic.c:33
+;;                              34 virtio-rng         main.c:334
+;;                              35 virtio-blk         main.c:335
+;;                     128..135 128 syscall gate      main.c:336
+;;                     248..255 255 LAPIC SPURIOUS    apic.c:42, SVR 0x100|0xff
+;;
+;;                   Because every admitted base is 8-aligned and every span is
+;;                   exactly 8 wide, a span contains a used vector if and only
+;;                   if its base is one of these three; no arithmetic over the
+;;                   span is needed, and none is done.
+;;
+;;                   The third one has a consequence worth stating plainly: it
+;;                   REFUSES 0xf8, which is the slave base the C this replaces
+;;                   used. That C moved the bases to 0xf0/0xf8 with the stated
+;;                   aim that "if a line is ever unmasked the resulting vector
+;;                   is reported as itself instead of aliasing onto a CPU
+;;                   exception vector or onto vector 32" -- and 0xf8 does not
+;;                   meet its own aim, because 0xf8+7 is 255 and 255 is the
+;;                   Local APIC's spurious vector. An unmasked IRQ15 would have
+;;                   arrived indistinguishable from a spurious LAPIC interrupt:
+;;                   the same masquerade as IRQ0-as-#DF, one chip over. Both
+;;                   callers therefore pass 0xe0/0xe8 (224..231, 232..239),
+;;                   which is clear of everything above.
+;;
+;;   (not (= master-base slave-base))
+;;                   The two chips must not land on the same eight vectors. For
+;;                   8-aligned, 8-wide spans, overlapping and coinciding are
+;;                   the same thing, so equality is the exact test. Overlap
+;;                   would mean master IRQ_n and slave IRQ_n raise one vector,
+;;                   which is not a wrong number -- it is two devices wearing
+;;                   one name, and no handler can tell them apart.
+;;
+;; A REFUSED CALL WRITES NOTHING
+;;
+;; Every `kernel-out-u8` is inside the admitted arm. A refused call performs no
+;; port I/O at all and returns 0. This is not a courtesy: a half-initialised
+;; 8259 -- ICW1 accepted, ICW2 refused -- is strictly worse than an untouched
+;; one, because the chip is left waiting for initialisation words that will
+;; never come and its data port no longer means the mask register. Refusing
+;; before the first write is the only refusal that leaves the machine in a
+;; state the caller can reason about.
+;;
+;; The return is a STATUS, 1 written / 0 refused, the same shape as `msr-write`
+;; and for the same reason: there is no value read back here that a status
+;; could be confused with, and a caller that wants to know whether the machine
+;; was actually changed must be able to test it. Both callers do.
+;;
+;; FUEL
+;;
+;; Deliberately absent from `bounded-memory?` in kotoba-native's elf64.clj, so
+;; this object gets no replenish and spends from the 512 its own `.data`
+;; context starts with -- per object, not shared with any other. Fuel is
+;; charged per FUNCTION ENTRY, not per operation: `kernel-out-u8` is emitted
+;; inline as `out %al,%dx` and is not a call, and `let` is sequencing that
+;; costs nothing. One call is therefore 1 unit regardless of the twenty writes
+;; inside it. Measured from the emitted object, not predicted: it contains
+;; exactly two `decq 0x8(%r9)` sites, at 0x1e (this function's entry) and 0x6c0
+;; (`main`'s, which the kernel never calls), against twenty `outb %al,%dx` at
+;; 0x4c9..0x68d that charge nothing. The
+;; Multiboot path calls this once per boot and the UEFI path once; 1 or 2 of
+;; 512 leaves a factor of 256 in hand, so no tier decision is needed.
+;;
+;; This is written as ONE function with no helper for that reason. A helper for
+;; "write then delay", called ten times, would cost eleven units per call
+;; instead of one -- still far inside 512, but it would make the cost a
+;; function of the sequence length, which is the shape that eventually traps.
+
+(defn aiueos-pic-disable [master-base slave-base]
+  (if (and (>= master-base 32) (<= master-base 248)
+           (= (bit-and master-base 7) 0)
+           (not (= master-base 32))
+           (not (= master-base 128))
+           (not (= master-base 248))
+           (>= slave-base 32) (<= slave-base 248)
+           (= (bit-and slave-base 7) 0)
+           (not (= slave-base 32))
+           (not (= slave-base 128))
+           (not (= slave-base 248))
+           (not (= master-base slave-base)))
+    ;; Admitted. `let` here is sequencing, not naming: every binding is
+    ;; evaluated exactly once, in order, before the body -- which is the entire
+    ;; protocol, since an 8259 interprets each write by how many have preceded
+    ;; it. The written byte that `kernel-out-u8` returns is deliberately
+    ;; unused; what these bindings carry is order.
+    ;;
+    ;;                          port         value
+    (let [c1 (kernel-out-u8      32           17)   ; ICW1 master: init, ICW4 follows
+          d1 (kernel-out-u8     128            0)   ; io_wait
+          c2 (kernel-out-u8     160           17)   ; ICW1 slave
+          d2 (kernel-out-u8     128            0)
+          c3 (kernel-out-u8      33  master-base)   ; ICW2 master vector base
+          d3 (kernel-out-u8     128            0)
+          c4 (kernel-out-u8     161   slave-base)   ; ICW2 slave vector base
+          d4 (kernel-out-u8     128            0)
+          c5 (kernel-out-u8      33            4)   ; ICW3 master: slave on IRQ2
+          d5 (kernel-out-u8     128            0)
+          c6 (kernel-out-u8     161            2)   ; ICW3 slave: cascade id 2
+          d6 (kernel-out-u8     128            0)
+          c7 (kernel-out-u8      33            1)   ; ICW4 master: 8086 mode
+          d7 (kernel-out-u8     128            0)
+          c8 (kernel-out-u8     161            1)   ; ICW4 slave: 8086 mode
+          d8 (kernel-out-u8     128            0)
+          c9 (kernel-out-u8      33          255)   ; OCW1 master: mask all
+          d9 (kernel-out-u8     128            0)
+          c10 (kernel-out-u8    161          255)   ; OCW1 slave: mask all
+          d10 (kernel-out-u8    128            0)]
+      1)
+    ;; Refused: not one byte has reached a port.
+    0))
+
+(defn main [] 0)

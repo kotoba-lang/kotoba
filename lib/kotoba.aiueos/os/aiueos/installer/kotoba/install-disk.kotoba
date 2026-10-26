@@ -1,0 +1,226 @@
+(ns aiueos.installer.install-disk
+  (:export [main]))
+
+;; install-to-disk on the selfhost substrate (owner direction 2026-10-18,
+;; Linear JUN-70 slice S2): the destructive half of the install chain with
+;; no node, nbb or npm. The DECISIONS are this program: the named target,
+;; the dry run first, the typed destructive phrase, the refusal names. The
+;; MECHANISM of byte movement and hashing is :process/spawn of the live
+;; environment's dd / sha256sum / stat -- the same "C marshals, Kotoba
+;; judges" rule the kernel follows.
+;;
+;; WHY not :fs/app-data streaming (MEASURED 2026-10-18): the static
+;; profile's string pool is a fixed ~64 KiB arena and the pair arena holds
+;; string handles, so reading or writing image-sized content through
+;; strings traps :budget/bytes {:arena :string-pool} (exit 124) on one
+;; 64 KiB file; a policy :budgets map does not reach the static packager.
+;; Spawn copies bytes outside the process; only the judgments run here.
+;;
+;; argv:
+;;   1  target device (canonical name; recorded nowhere else)
+;;   2  source image path
+;;   3  the destructive phrase the operator typed, verbatim ("" = ask on
+;;      stdin)
+;;   4  "install" to write; anything else is a DRY RUN and writes nothing
+;;
+;; The phrase is DERIVED here and compared exactly, as device-policy.mjs
+;; does: "ERASE " + <canonical device> + " FOR AIUEOS". A mismatch refuses
+;; with a named reason and the write never starts.
+;;
+;; Result line: 0 written and verified (or dry-run reported), 2 refused
+;; with AIUEOS_INSTALL_REFUSE <reason>, 3 nobody answered (an ask hit EOF).
+;; Device-level guards that stay with the QEMU gate: exclusive open,
+;; whole-disk inspection, second-disk rules, the target receipt.
+
+(defn emit [s :string] :string (typed-cap-call :io/write :string :string s))
+(defn stdin [s :string] :string (typed-cap-call :io/read :string :string s))
+(defn arg [i :string] :string (typed-cap-call :cli/args :string :string i))
+(defn spawn [s :string] :string (typed-cap-call :process/spawn :string :string s))
+
+(defn nl [] :string (string-substring "a
+b" 1 2))
+
+(defn sub [s :string i :i64 j :i64] :string
+  (let [n (string-byte-length s)]
+    (if (> j n) (sub s i n)
+      (if (>= i j) "" (string-substring s i j)))))
+
+(defn digit-value [c :string] :i64
+  (let [d (string-index-of "0123456789" c)]
+    (if (and (<= 0 d) (< d 10)) d -1)))
+
+(defn parse-u64-rec [s :string i :i64 n :i64 acc :i64] :i64
+  (if (= i n) acc
+    (let [d (digit-value (sub s i (+ i 1)))]
+      (if (< d 0) -1 (parse-u64-rec s (+ i 1) n (+ (* acc 10) d))))))
+
+(defn parse-u64 [s :string] :i64
+  (if (string=? s "") -1 (parse-u64-rec s 0 (string-byte-length s) 0)))
+
+(defn refuse [reason :string] :i64
+  (do (emit "AIUEOS_INSTALL_REFUSE ") (emit reason) (emit (nl)) 2))
+
+;; "ERASE <device> FOR AIUEOS" -- the phrase device-policy.mjs checks
+;; against, derived from the canonical device name, never typed into code.
+(defn destructive-phrase [device :string] :string
+  (string-concat "ERASE " (string-concat device " FOR AIUEOS")))
+
+(defn read-line-acc [acc :string] :string
+  (let [c (stdin "1")]
+    (if (string=? c "") acc
+      (if (string=? c (nl)) acc (read-line-acc (string-concat acc c))))))
+
+(defn ask-phrase [prompt :string] :string
+  (do (emit prompt)
+      (let [c (stdin "1")]
+        (if (string=? c "") "E" (read-line-acc c)))))
+
+;; ---- :process/spawn answers: "<exit>\n<stdout>" (capability-catalog) ----
+
+(defn spawn-exit [a :string] :i64
+  (let [p (string-index-of a (nl))]
+    (if (< p 0) -1 (parse-u64 (sub a 0 p)))))
+
+(defn spawn-out [a :string] :string
+  (let [p (string-index-of a (nl))]
+    (if (< p 0) "" (sub a (+ p 1) (string-byte-length a)))))
+
+;; stat -c %s <path>: the size in decimal, or -1.
+(defn first-line [s :string] :string
+  (let [p (string-index-of s (nl))]
+    (if (< p 0) s (sub s 0 p))))
+
+;; stat -c %s <path>: the size in decimal, or -1. stat ends its answer with
+;; a newline, so the line is cut before parsing (measured: parsing the raw
+;; output fails at the trailing newline).
+(defn size-of [p :string] :i64
+  (let [a (spawn (string-concat "stat" (string-concat "ARG_SEP-c" (string-concat "ARG_SEP%s" (string-concat "ARG_SEP" p)))))]
+    (if (= 0 (spawn-exit a)) (parse-u64 (first-line (spawn-out a))) -1)))
+
+;; sha256sum <path>: the 64-char hex digest, or "".
+(defn piece-hash [p :string] :string
+  (let [a (spawn (string-concat "sha256sum" (string-concat "ARG_SEP" p)))]
+    (if (= 0 (spawn-exit a)) (sub (spawn-out a) 0 64) "")))
+
+;; dd one piece to /tmp: bs=4096 SKIP COUNT, or bs=1 SKIP COUNT for the
+;; tail (the tail must extract EXACTLY the same byte count on both sides).
+(defn extract-piece [path :string out :string skip :i64 count :i64 tail? :bool] :i64
+  (let [bs (if tail? "ARG_SEPbs=1" "ARG_SEPbs=4096")
+        req (string-concat (string-concat (string-concat (string-concat "dd" "ARG_SEPif=") (string-concat path "ARG_SEPof=")) (string-concat (string-concat out bs) (string-concat "ARG_SEPskip=" (string-from-i64 skip)))) (string-concat "ARG_SEPcount=" (string-from-i64 count)))]
+    (spawn-exit (spawn req))))
+
+(defn verify-tail [src :string dev :string skip :i64 tail :i64] :i64
+  (if (not (= 0 (extract-piece src "/tmp/aiueos-src.p" skip tail true))) -1
+    (if (not (= 0 (extract-piece dev "/tmp/aiueos-dev.p" skip tail true))) -1
+      (let [h1 (piece-hash "/tmp/aiueos-src.p") h2 (piece-hash "/tmp/aiueos-dev.p")]
+        (if (or (string=? h1 "") (not (string=? h1 h2))) -1 0)))))
+
+;; readback verification in 8 MiB pieces (2048 blocks of 4096), then the
+;; tail. One spawn gets 10 s (capability-catalog) and a whole-image
+;; sha256sum of 64 MiB exceeds that under QEMU TCG -- measured 2026-10-19:
+;; dd wrote 64 records and then sha256sum hit :spawn/timeout. Pieces keep
+;; every child far inside the deadline on any host. 8 MiB is MEASURED
+;; green end to end; 2 MiB (32 pieces) exhausts the pair arena instead
+;; (KEXE_TRAP :budget/cells {:arena :pairs}), and a bigger piece times out
+;; under heavy host contention -- the gate wants a quiet host.
+(defn verify-pieces [src :string dev :string blk :i64 total-blk :i64 tail :i64] :i64
+  (if (>= blk total-blk) (verify-tail src dev (* total-blk 4096) tail)
+    (let [n (if (< (+ blk 2048) total-blk) 2048 (- total-blk blk))]
+      (if (not (= 0 (extract-piece src "/tmp/aiueos-src.p" blk n false))) -1
+        (if (not (= 0 (extract-piece dev "/tmp/aiueos-dev.p" blk n false))) -1
+          (let [h1 (piece-hash "/tmp/aiueos-src.p") h2 (piece-hash "/tmp/aiueos-dev.p")]
+            (if (or (string=? h1 "") (not (string=? h1 h2))) -1
+              (verify-pieces src dev (+ blk n) total-blk tail))))))))
+
+(defn dd-request [src :string device :string] :string
+  (string-concat "dd"
+    (string-concat "ARG_SEPif="
+      (string-concat src
+        (string-concat "ARG_SEPof="
+          (string-concat device
+            (string-concat "ARG_SEPbs=1M" "ARG_SEPconv=fsync,notrunc")))))))
+
+(defn fsq [s :string] :string (typed-cap-call :fs/app-data :string :string s))
+
+;; ---- the target receipt (install-v1.edn repeat safety; JUN-70 S3a) -------
+;; After a verified install a receipt block is written into the target's
+;; LAST 4096-byte block (the shape install.mjs leaves behind), and a later
+;; install refuses while that marker is there -- the refusal touches
+;; nothing. The window moves through the disk as one block, so no
+;; image-sized content crosses the string pool.
+(defn dev-size-of [p :string] :i64
+  ;; stat -c %s is st_size and is 0 on a device node (measured: the receipt
+  ;; seek computed -1 on the NVMe). lsblk -bdno SIZE answers the device's
+  ;; bytes in decimal.
+  (let [a (spawn (string-concat "lsblk" (string-concat "ARG_SEP" (string-concat "-bdno" (string-concat "ARG_SEP" (string-concat "SIZE" (string-concat "ARG_SEP" p)))))))]
+    (if (= 0 (spawn-exit a)) (parse-u64 (first-line (spawn-out a))) -1)))
+
+(defn receipt-marker [] :string "AIUEOS-INSTALL-TARGET-RECEIPT-v1")
+(defn receipt-file [work :string] :string (string-concat work "/.aiueos-receipt"))
+(defn receipt-window [work :string] :string (string-concat work "/.aiueos-window"))
+
+(defn extract-block [dev :string out :string block :i64] :i64
+  (spawn-exit (spawn (string-concat (string-concat (string-concat (string-concat "dd" "ARG_SEPif=") (string-concat dev "ARG_SEPof=")) (string-concat (string-concat out "ARG_SEPbs=4096") (string-concat "ARG_SEPskip=" (string-from-i64 block)))) "ARG_SEPcount=1"))))
+
+(defn has-receipt? [dev :string work :string size :i64] :bool
+  (if (not (= 0 (extract-block dev (receipt-window work) (- (quot size 4096) 1)))) false
+    (let [w (fsq (string-concat (receipt-window work) "RANGE_SEP0:64"))]
+      (if (string=? w "") false (string-contains? w (receipt-marker))))))
+
+(defn write-receipt [dev :string work :string size :i64] :i64
+  (let [body (string-concat (string-concat (string-concat (receipt-marker) (nl)) (string-concat "size=" (string-from-i64 size))) (nl))
+        w (fsq (string-concat (receipt-file work) (string-concat "WRITE_SEP" body)))]
+    (if (not (string=? w body)) -1 (spawn-exit (spawn (string-concat (string-concat (string-concat (string-concat "dd" "ARG_SEPif=") (string-concat (receipt-file work) "ARG_SEPof=")) (string-concat (string-concat dev "ARG_SEPbs=4096") (string-concat "ARG_SEPseek=" (string-from-i64 (- (quot size 4096) 1))))) (string-concat "ARG_SEPcount=1" "ARG_SEPconv=notrunc")))))))
+
+;; ---- the blank-target guard (install.mjs rule 2; JUN-70) ----------------
+;; A target with a filesystem signature or a mounted child is refused:
+;; the K16 keeps its existing SSD, and this is the rule that keeps the
+;; installer away from it (the second-disk property of install.mjs).
+;; blkid -p answers exit 0 when a signature IS present, 2 when none is.
+(defn target-blank? [device :string] :string
+  ;; FAIL CLOSED: blkid -p exits 2 exactly when no signature is present.
+  ;; Anything else (0 = a signature, 1/-1 = blkid could not run) refuses.
+  ;; Measured 2026-10-19: a missing blkid passed as blank before this.
+  (let [b (spawn (string-concat (string-concat (string-concat "/usr/sbin/blkid" "ARG_SEP") (string-concat "-p" "ARG_SEP")) device))
+        mp (spawn (string-concat (string-concat (string-concat (string-concat "/bin/lsblk" "ARG_SEP") (string-concat "-n" "ARG_SEP")) (string-concat (string-concat "-o" "ARG_SEP") (string-concat "MOUNTPOINTS" "ARG_SEP"))) device))]
+    (if (= 2 (spawn-exit b))
+      (if (= 0 (spawn-exit mp))
+        (if (string-contains? (spawn-out mp) "/") "R:target-mounted" "V:ok")
+        "R:target-probe-failed")
+      (if (= 0 (spawn-exit b)) (string-concat "S:" (first-line (spawn-out b)))
+        "R:target-probe-failed"))))(defn main [] :i64
+  (let [device (arg "0") src (arg "1") given (arg "2") mode (arg "3") work (arg "4")]
+    ;; Phase modes (JUN-70 flat chain): every :process/spawn child lives at
+    ;; most the substrate's 10 s wall, so the console chain runs this
+    ;; program in SHORT phases from guided-core (which is not a spawn and
+    ;; has no wall) instead of one long nested run (measured 2026-10-19:
+    ;; the nested install-live exceeded the wall, was SIGKILLed, and every
+    ;; captured marker was lost).
+    (cond
+      (string=? mode "write")
+      (if (= 0 (spawn-exit (spawn (dd-request src device))))
+        (do (emit "AIUEOS_INSTALL_WRITE_OK bytes=") (emit (string-from-i64 (size-of src))) (emit (nl)) 0)
+        (refuse "write-failed"))
+      (string=? mode "verify")
+      (let [b (parse-u64 (arg "5")) e (parse-u64 (arg "6"))
+            vr (verify-pieces src device b e 0)]
+        (if (< vr 0) (refuse "readback-mismatch")
+          (do (emit "AIUEOS_INSTALL_READBACK_OK pieces4k=") (emit (string-from-i64 (- e b))) (emit (nl)) 0)))
+      (string=? mode "receipt-check")
+      (if (has-receipt? device work (dev-size-of device)) (refuse "existing-install") 0)
+      (string=? mode "target-check")
+      ;; NON-empty targets are ALLOWED (owner direction 2026-10-19): the
+      ;; signatures found are printed so the person at the console sees
+      ;; what they are about to erase. mounted and probe-failed still
+      ;; refuse -- those are a running system and an unprobed target.
+      (let [t (target-blank? device)]
+        (if (string=? t "V:ok") 0
+          (if (string=? t "R:target-mounted") (refuse "target-mounted")
+            (if (string=? t "R:target-probe-failed") (refuse "target-probe-failed")
+              (do (emit "AIUEOS_INSTALL_TARGET_SIGNATURES ") (emit (sub t 2 (string-byte-length t))) (emit (nl)) 0)))))
+      (string=? mode "receipt-write")
+      (if (= 0 (write-receipt device work (dev-size-of device)))
+        (do (emit "AIUEOS_INSTALL_RECEIPT_OK") (emit (nl)) 0)
+        (refuse "receipt-write-failed"))
+      :else (if (string=? device "") (refuse "no-device") (if (string=? src "") (refuse "no-image") (let [want (destructive-phrase device) size (size-of src) dev-size (size-of device)] (if (or (< size 0) (= size 0)) (refuse "image-missing-or-empty") (if (< dev-size 4096) (refuse "device-too-small") (if (not (string=? mode "install")) (do (emit "AIUEOS_INSTALL_DRY_RUN ") (emit device) (emit " bytes=") (emit (string-from-i64 size)) (emit (nl)) (emit "to erase, re-run with the install flag and the phrase:") (emit (nl)) (emit "  ") (emit want) (emit (nl)) 0) (do (emit "Type the destructive phrase to proceed:") (emit (nl)) (let [typed (if (string=? given "") (ask-phrase "phrase: ") given)] (if (string=? typed "E") 3 (if (not (string=? typed want)) (refuse "destructive-phrase-mismatch") (if (has-receipt? device work (dev-size-of device)) (refuse "existing-install") (if (string=? (target-blank? device) "R:target-mounted") (refuse "target-mounted") (let [w (spawn (dd-request src device))] (if (not (= 0 (spawn-exit w))) (refuse "write-failed") (do (emit "AIUEOS_INSTALL_WRITE_OK bytes=") (emit (string-from-i64 size)) (emit (nl)) (let [total-blk (quot size 4096) tail (- size (* total-blk 4096)) vr (verify-pieces src device 0 total-blk tail)] (if (< vr 0) (refuse "readback-mismatch") (if (not (= 0 (write-receipt device work (dev-size-of device)))) (refuse "receipt-write-failed") (do (emit "AIUEOS_INSTALL_READBACK_OK pieces4k=") (emit (string-from-i64 total-blk)) (emit (nl)) (emit "AIUEOS_INSTALL_RECEIPT_OK") (emit (nl)) 0)))))))))))))))))))))
+)

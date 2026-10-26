@@ -1,0 +1,261 @@
+#!/usr/bin/env kbb
+;; Gate for the full publickey login (ssh-v1.edn / ADR-0108): an independent
+;; real-crypto client completes the entire SSH exchange against the kernel over
+;; QEMU's inbound hostfwd -- kex, NEWKEYS, then the aes128-gcm@openssh.com record
+;; layer carrying the service request and a publickey USERAUTH_REQUEST signed by
+;; the authorized key -- and receives an encrypted USERAUTH_SUCCESS. Green iff
+;; the serial shows AIUEOS_SSH_AUTH_OK AND this client decrypted a real
+;; USERAUTH_SUCCESS. The client uses Node's own AES-128-GCM and ECDSA, and the
+;; wire layouts come from ssh.{transport,kex,keys,record,userauth} in
+;; kotoba-lang/org-ietf-ssh, so a different implementation logging in is the
+;; proof the kernel's login is real.
+
+(require '[kotoba.lang.text :as str]
+         '[ssh.transport :as t] '[ssh.kex :as kex]
+         '[ssh.keys :as keys] '[ssh.record :as rec] '[ssh.userauth :as ua]
+         '[ssh.connection :as con])
+(def command "runtime status")
+(def expect-output "aiueos: runtime unavailable\n")
+
+(def fs (js/require "node:fs")) (def path (js/require "node:path"))
+(def cp (js/require "node:child_process")) (def net (js/require "node:net"))
+(def crypto (js/require "node:crypto"))
+
+(def aiueos (.resolve path (.dirname path *file*) ".."))
+(def repo (.resolve path aiueos ".." ".."))
+(def out (or (.-AIUEOS_OUT js/process.env) (.join path repo "build" "aiueos")))
+(def kernel (.join path out "esp" "EFI" "AIUEOS" "KERNEL.ELF"))
+(def serial-log (.join path out "kernel-serial.log"))
+(def host-port 8022)
+(def client-id "SSH-2.0-realgate")
+(def username "runtime")
+
+;; the authorized key's PRIVATE half (matches ssh_auth_x/y baked in the kernel)
+(def auth-d "8f71791cab5a5f45468c32abf8d67a35122bbd451d65986465d6f45b02536267")
+(def auth-x "46870e7ce79bcbc6014714618f3543dc1e6d67cbc5da378d91c8d71711af1abf")
+(def auth-y "04aed0995946fb244e15109ee276c579fa0b14405bf9507522eee26568d2c0f3")
+
+(defn- die [& m] (binding [*out* *err*] (apply println (cons "error:" m))) (.exit js/process 1))
+(defn- ->buf [v] (js/Buffer.from (js/Uint8Array. (clj->js v))))
+(defn- ->vec [b] (vec (js/Array.from b)))
+(defn- hexbuf [h] (js/Buffer.from h "hex"))
+(defn- b64u [buf] (.toString buf "base64url"))
+(defn- sha256 [bytes] (->vec (.digest (.update (.createHash crypto "sha256") (->buf bytes)))))
+(defn- be32 [b o] (+ (* 16777216 (nth b o)) (* 65536 (nth b (+ o 1))) (* 256 (nth b (+ o 2))) (nth b (+ o 3))))
+
+;; client X25519 ephemeral
+(defn- x25519-keypair []
+  (let [kp (.generateKeyPairSync crypto "x25519")]
+    {:ko kp :pub (->vec (.subarray (.export (.-publicKey kp) #js {:type "spki" :format "der"}) 12))}))
+(defn- x25519-shared [my-ko peer32]
+  (let [peer (.createPublicKey crypto #js {:key (js/Buffer.concat (clj->js [(js/Buffer.from #js [0x30 0x2a 0x30 0x05 0x06 0x03 0x2b 0x65 0x6e 0x03 0x21 0x00]) (->buf peer32)])) :format "der" :type "spki"})]
+    (->vec (.diffieHellman crypto #js {:privateKey (.-privateKey my-ko) :publicKey peer}))))
+(defn- verify-over-h [x y r s h]
+  (.verify crypto "sha256" (->buf h)
+           #js {:key (.createPublicKey crypto #js {:key #js {:kty "EC" :crv "P-256" :x (b64u (hexbuf x)) :y (b64u (hexbuf y))} :format "jwk"}) :dsaEncoding "ieee-p1363"}
+           (->buf (into r s))))
+
+;; the authorized private key (from raw d,x,y) for signing signed-data
+(def auth-priv
+  (.createPrivateKey crypto #js {:key #js {:kty "EC" :crv "P-256"
+                                           :d (b64u (hexbuf auth-d)) :x (b64u (hexbuf auth-x)) :y (b64u (hexbuf auth-y))}
+                                 :format "jwk"}))
+(defn- sign-rs [msg]
+  (let [raw (->vec (.sign crypto "sha256" (->buf msg) #js {:key auth-priv :dsaEncoding "ieee-p1363"}))]
+    [(subvec raw 0 32) (subvec raw 32 64)]))
+
+;; AES-128-GCM matching ssh.record's caller contract
+(defn- gcm-encrypt [key nonce aad plaintext]
+  (let [c (.createCipheriv crypto "aes-128-gcm" (->buf key) (->buf nonce))]
+    (.setAAD c (->buf aad))
+    {:ciphertext (->vec (js/Buffer.concat (clj->js [(.update c (->buf plaintext)) (.final c)]))) :tag (->vec (.getAuthTag c))}))
+(defn- gcm-decrypt [key nonce aad ciphertext tag]
+  (try (let [d (.createDecipheriv crypto "aes-128-gcm" (->buf key) (->buf nonce))]
+         (.setAAD d (->buf aad)) (.setAuthTag d (->buf tag))
+         (->vec (js/Buffer.concat (clj->js [(.update d (->buf ciphertext)) (.final d)]))))
+       (catch :default _ nil)))
+
+(defn- wrap [payload]                       ; unencrypted binary packet
+  (let [plen (count payload) pad (let [p (- 8 (mod (+ 5 plen) 8))] (if (< p 4) (+ p 8) p))
+        pl (+ 1 plen pad)] (->buf (-> (t/u32 pl) (conj pad) (into payload) (into (vec (repeat pad 0)))))))
+(defn- take-string [b] (let [n (be32 b 0)] [(subvec b 4 (+ 4 n)) (subvec b (+ 4 n))]))
+(defn- take-mpint [b] (let [n (be32 b 0) raw (subvec b 4 (+ 4 n)) st (vec (drop-while zero? raw))]
+                        [(into (vec (repeat (- 32 (count st)) 0)) st) (subvec b (+ 4 n))]))
+
+(def result (atom {:done false :authed nil :reason nil :banner nil}))
+(def cli-eph (x25519-keypair))
+(def open-sockets (atom []))
+
+(defn- drive [sock]
+  (let [rxbin (atom []) i-c (atom nil) i-s (atom nil) phase (atom :banner)
+        sk (atom nil) sc-seq (atom 0) cs-seq (atom 0)]  ; s->c and c->s GCM counters
+    (.setNoDelay sock true)
+    (letfn [(unenc-packets! []             ; pull complete unencrypted packets
+              (loop [acc []]
+                (let [b @rxbin]
+                  (if (< (count b) 6) acc
+                    (let [pl (be32 b 0)] (if (< (count b) (+ 4 pl)) acc
+                      (let [payload (subvec b 5 (+ 5 (- pl (nth b 4) 1)))]
+                        (reset! rxbin (subvec b (+ 4 pl))) (recur (conj acc payload)))))))))
+            (gcm-packets! []               ; pull + decrypt GCM packets (s->c)
+              (loop [acc []]
+                (let [b @rxbin]
+                  (if (< (count b) 4) acc
+                    (let [pl (be32 b 0) total (+ 4 pl 16)]
+                      (if (< (count b) total) acc
+                        (let [aad (subvec b 0 4) ct (subvec b 4 (+ 4 pl)) tag (subvec b (+ 4 pl) total)
+                              nonce (rec/nonce (:iv-s->c @sk) @sc-seq)
+                              plain (gcm-decrypt (:key-s->c @sk) nonce aad ct tag)]
+                          (when plain (swap! sc-seq inc))
+                          (reset! rxbin (subvec b total))
+                          (recur (conj acc (when plain (subvec (vec plain) 1 (+ 1 (- pl (first plain) 1)))))))))))))
+            (finish [authed reason]
+              (swap! result assoc :done true :authed authed :reason reason)
+              (js/setTimeout (fn [] (doseq [s @open-sockets] (try (.destroy s) (catch :default _ nil)))) 400))
+            (clog [& m] (binding [*out* *err*] (apply println (cons "CLIENT" m))))
+            (seal-cs [payload]              ; seal one c->s packet with the running counter
+              (let [w (rec/seal gcm-encrypt (:key-c->s @sk) (:iv-c->s @sk) @cs-seq payload (repeat 0))]
+                (swap! cs-seq inc) (->buf w)))
+            (start-encrypted [k h]
+              (reset! sk (keys/session-keys sha256 k h h))
+              (clog "kex verified; sending NEWKEYS then SERVICE_REQUEST")
+              (.write sock (wrap [t/msg-newkeys]))
+              (js/setTimeout
+               (fn [] (clog "sending encrypted SERVICE_REQUEST")
+                 (.write sock (seal-cs (ua/service-request-payload ua/service-userauth))))
+               650))
+            (send-userauth [h]
+              (let [point (kex/ec-point (->vec (hexbuf auth-x)) (->vec (hexbuf auth-y)))
+                    pk-blob (ua/pubkey-blob point)
+                    sd (ua/signed-data h username pk-blob)
+                    [r s] (sign-rs sd)
+                    sig-blob (kex/signature-blob r s)
+                    req (ua/userauth-request-payload username pk-blob sig-blob)]
+                (clog "got SERVICE_ACCEPT; sending USERAUTH_REQUEST")
+                (.write sock (seal-cs req))))
+            (open-channel []                ; after USERAUTH_SUCCESS: open a session channel
+              (clog "logged in; opening session channel")
+              (.write sock (seal-cs (con/channel-open-payload "session" 0 2097152 32768))))
+            (send-exec []                   ; after CONFIRMATION: run the command
+              (clog "channel confirmed; sending exec" (pr-str command))
+              (.write sock (seal-cs (con/channel-request-exec-payload 0 true command))))
+            (on-reply [payload h-atom]
+              (when (and (not (:done @result)) (= 31 (first payload)))
+                (let [buf (vec (rest payload))
+                      [k-s r1] (take-string buf) [q-s r2] (take-string r1) [sig _] (take-string r2)
+                      [_a ra] (take-string k-s) [_c rb] (take-string ra) [point _] (take-string rb)
+                      px (subvec point 1 33) py (subvec point 33 65)
+                      [_sa sa] (take-string sig) [inner _] (take-string sa)
+                      [rv ia] (take-mpint inner) [sv _] (take-mpint ia)
+                      k (x25519-shared (:ko cli-eph) q-s)
+                      h (t/exchange-hash sha256 {:v-c client-id :v-s "SSH-2.0-aiueos_0.1"
+                                                 :i-c @i-c :i-s @i-s :k-s k-s :q-c (:pub cli-eph) :q-s q-s :k k})
+                      pinned (and (= px (->vec (hexbuf "32b002b8fe6254c0894d2c082429992bd28c0d53b45186ab7906df4118515e35")))
+                                  (= py (->vec (hexbuf "d21a8d3906329b624a31cce2ef7352935a3ed88f5f093e5709572057646eb29f"))))]
+                  (if (and pinned (verify-over-h "32b002b8fe6254c0894d2c082429992bd28c0d53b45186ab7906df4118515e35"
+                                                 "d21a8d3906329b624a31cce2ef7352935a3ed88f5f093e5709572057646eb29f" rv sv h))
+                    (do (reset! h-atom h) (reset! phase :encrypted) (start-encrypted k h))
+                    (finish false "kex host-key signature did not verify")))))
+            (on-encrypted [h-atom]
+              (doseq [p (gcm-packets!)]
+                (when (not (:done @result))
+                  (if (nil? p)
+                    (clog "GCM decrypt FAILED on an s->c packet")
+                    (do (clog "decrypted s->c msg" (first p))
+                        (cond
+                          (= ua/msg-service-accept (first p)) (send-userauth @h-atom)
+                          (= ua/msg-userauth-success (first p)) (open-channel)
+                          (= ua/msg-userauth-failure (first p)) (finish false "userauth-failure")
+                          (= con/msg-channel-open-confirmation (first p)) (send-exec)
+                          (= con/msg-channel-data (first p))
+                          (let [d (con/parse-channel-data p)
+                                out (apply str (map char (:data d)))]
+                            (clog "CHANNEL_DATA:" (pr-str out))
+                            (if (= out expect-output)
+                              (finish true "channel-data-matches")
+                              (finish false (str "channel-data mismatch: " (pr-str out)))))))))))]
+      (let [h-atom (atom nil)]
+        (.on sock "data"
+             (fn [d]
+               (cond
+                 (= :banner @phase)
+                 (let [s (.toString d "utf8")]
+                   (when (str/includes? s "\n")
+                     (swap! result assoc :banner (first (str/split s #"\r?\n")))
+                     ;; the UNWRAPPED KEXINIT payload (I_C) for the transcript; it
+                     ;; is wrapped only when sent.
+                     (reset! i-c (t/kexinit-payload (->vec (.randomBytes crypto 16))))
+                     (reset! phase :kexinit)
+                     (.write sock (str client-id "\r\n"))))
+                 (= :kexinit @phase)
+                 (do (swap! rxbin into (->vec d))
+                     (doseq [p (unenc-packets!)]
+                       (when (= 20 (first p))
+                         (reset! i-s p) (reset! phase :reply)
+                         (.write sock (wrap @i-c))
+                         (js/setTimeout (fn [] (.write sock (wrap (into [30] (t/string-bytes (:pub cli-eph)))))) 600))))
+                 (= :reply @phase)
+                 (do (swap! rxbin into (->vec d)) (doseq [p (unenc-packets!)] (on-reply p h-atom)))
+                 (= :encrypted @phase)
+                 (do (swap! rxbin into (->vec d)) (on-encrypted h-atom)))))
+        (.on sock "error" (fn [_] (try (.destroy sock) (catch :default _ nil))))
+        (.on sock "timeout" (fn [] (try (.destroy sock) (catch :default _ nil))))))))
+
+(defn- open-one [] (when-not (:done @result)
+  (let [sock (.connect net #js {:host "127.0.0.1" :port host-port})]
+    (swap! open-sockets conj sock) (.setTimeout sock 180000) (drive sock))))
+(defn- pool-tick [] (when-not (:done @result) (open-one) (js/setTimeout pool-tick 4000)))
+
+(when-not (.existsSync fs kernel) (die "kernel not built"))
+(when-not (str/includes? (.toString (.readFileSync fs kernel)) "AIUEOS_SSH_SESSION_OK")
+  (die "kernel has no session marker; rebuild with AIUEOS_SSH_LISTEN=1"))
+(js/setTimeout pool-tick 5000)
+(println "AIUEOS_SSH_SESSION_GATE booting; client runs a command over" host-port)
+(def env (doto (js/Object.assign #js {} js/process.env)
+           (aset "AIUEOS_SSH_LISTEN" "1") (aset "AIUEOS_TEST_NET" "1") (aset "AIUEOS_SSH_HOSTFWD" (str host-port))
+           ;; the session boot runs the kex/userauth crypto AND the channel during
+           ;; enumeration; give it room to reach qemu_exit so the serial is complete.
+           (aset "AIUEOS_QEMU_TIMEOUT" "1500")))
+;; detached so the whole boot (smoke-qemu-uefi.sh -> timeout -> qemu) is a process
+;; group we can kill on early conclude -- otherwise a killed wrapper leaves QEMU
+;; holding the hostfwd port and the next run's client connects to the stale guest.
+(def child (.spawn cp (.join path aiueos "scripts" "smoke-qemu-uefi.sh") #js []
+                   #js {:stdio "inherit" :env env :detached true}))
+(defn- kill-group [] (try (.kill js/process (- (.-pid child)) "SIGKILL") (catch :default _ nil)))
+(def concluded (atom false))
+(defn- conclude [code]
+  (when (compare-and-set! concluded false true)
+    (let [serial (if (.existsSync fs serial-log) (str/replace (.readFileSync fs serial-log "utf8") "\r" "") "")
+          kernel-ok (str/includes? serial "AIUEOS_SSH_SESSION_OK")
+          {:keys [authed reason banner]} @result]
+      ;; The gate concludes early (see the watch below) and kills the process
+       ;; group, so smoke-qemu-uefi.sh never reaches its own append -- without
+       ;; this the guest's serial, and with it the only first-hand record of
+       ;; AIUEOS_SSH_SESSION_OK, dies with the QEMU that produced it and the
+       ;; proof survives only as this gate's stdout.
+       (when (seq serial)
+         (.appendFileSync fs (.join path out "evidence-all.log")
+                          (str "\n=== smoke-qemu-ssh-session (concluded early, code=" code ") ===\n"
+                               serial "\n")))
+      (println "AIUEOS_SSH_SESSION_GATE boot-exit code=" code)
+      (println "AIUEOS_SSH_SESSION_GATE kernel-marker=" (if kernel-ok "AIUEOS_SSH_SESSION_OK" "absent"))
+      (println "AIUEOS_SSH_SESSION_GATE client-banner=" (pr-str banner) "client-ok=" (pr-str authed) "reason=" (pr-str reason))
+      (when-not kernel-ok
+        (println "AIUEOS_SSH_SESSION_GATE line="
+                 (pr-str (->> (str/split-lines serial) (filter #(str/includes? % "AIUEOS_SSH")) last))))
+      (kill-group)
+      (if (and kernel-ok (= reason "channel-data-matches"))
+        (do (println "AIUEOS_SSH_SESSION_SMOKE_OK an independent client ran a command (exec) over a session channel and got its output back from the kernel")
+            (js/setTimeout (fn [] (.exit js/process 0)) 300))
+        (do (println "AIUEOS_SSH_SESSION_SMOKE_FAIL kernel-ok=" kernel-ok "client-ok=" authed "reason=" reason)
+            (js/setTimeout (fn [] (.exit js/process 1)) 300))))))
+;; Conclude as soon as the proof is complete -- the client logged in and got the
+;; command output, and the kernel printed the marker -- rather than waiting for
+;; the (very slow, crypto-during-enumeration) boot to reach qemu_exit, which past
+;; the timeout triggers a reboot that overwrites the serial.
+(def watch (js/setInterval
+            (fn [] (when (and (:done @result) (= "channel-data-matches" (:reason @result)))
+                     (let [serial (if (.existsSync fs serial-log) (.readFileSync fs serial-log "utf8") "")]
+                       (when (str/includes? serial "AIUEOS_SSH_SESSION_OK") (conclude 0)))))
+            1000))
+(.on child "exit" (fn [code _] (conclude code)))

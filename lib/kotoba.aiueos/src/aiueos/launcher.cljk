@@ -1,0 +1,427 @@
+(ns aiueos.launcher
+  "The aiueos CLI binary itself, per ADR-2607022700/2607022900: the retired
+  Rust `bin/aiueos.rs` argv-parsing/file-I/O role, reimplemented as JVM
+  Clojure. Ties together `grant.cli` (command/request shaping),
+  `grant.manifest` (normalization), `grant.policy`/`grant.broker`
+  (decisions), and `aiueos.execute` (real Chicory execution) into a single
+  runnable entry point.
+
+  This is deliberately NOT the same thing as `grant.decide` (the
+  bb-runnable, decision-only EDN-over-stdio subprocess for host adapters
+  without Chicory available). `aiueos.launcher` is the JVM-specific,
+  execution-capable launcher: `run`/`admit` here ACTUALLY EXECUTE a granted
+  component via `aiueos.execute`, not just report `:host-action
+  :adapter-required` like `grant.cli/command-result` does generically for
+  a host-neutral caller.
+
+  JVM-only (`#?(:clj ...)` throughout) -- file I/O and `aiueos.execute`'s
+  Chicory dependency both require it; not runnable under babashka."
+  (:require [kotoba.ffi :as ffi] [grant.audit :as audit]
+            [grant.broker :as broker]
+            [grant.cli :as cli]
+            [grant.contract :as contract]
+            [aiueos.execute :as execute]
+            [grant.graph :as graph]
+            [aiueos.image :as image]
+            #?(:clj [grant.key-lifecycle :as key-lifecycle])
+            [grant.manifest :as manifest]
+            [aiueos.pid1 :as pid1]
+            [grant.policy :as policy]
+            [aiueos.vm :as vm]
+            #?(:clj [clojure.edn :as edn])
+            #?(:clj [clojure.java.io :as io])
+            #?(:clj [kotoba.lang.text :as str])))
+
+#?(:clj
+   (defn read-edn-file
+     "Read and parse one EDN file. Throws ex-info with the path on failure
+     (a manifest/policy/system file that doesn't parse should fail loud,
+     not silently)."
+     [path]
+     (try
+       (edn/read-string (slurp path))
+       (catch Exception e
+         (throw (ex-info (str "failed to read EDN file: " path) {:path path} e))))))
+
+#?(:clj
+   (defn- resolve-wasm-path
+     "The `:aiueos/wasm` a normalized manifest declares, resolved relative
+     to the manifest FILE's own directory (not the caller's cwd) -- matches
+     the retired Rust `System::load` convention: a component's
+     `:aiueos/source`/`:aiueos/wasm` paths resolve against where that
+     component's manifest was loaded from."
+     [manifest-path m]
+     (when-let [wasm-rel (:aiueos/wasm m)]
+       (.getPath (io/file (.getParentFile (io/file manifest-path)) wasm-rel)))))
+
+#?(:clj
+   (defn- read-wasm-bytes [path]
+     (with-open [in (io/input-stream path)
+                 out (java.io.ByteArrayOutputStream.)]
+       (io/copy in out)
+       (.toByteArray out))))
+
+#?(:clj
+   (defn load-manifest
+     "Read MANIFEST-PATH, validate its shape, and normalize it
+     (`grant.manifest/normalize`). Throws ex-info on an invalid manifest
+     shape (fail loud, matching the rest of this repo's manifest handling)."
+     [manifest-path]
+     (let [raw (read-edn-file manifest-path)
+           validation (contract/validate-manifest raw)]
+       (when-not (:valid? validation)
+         (throw (ex-info (str manifest-path ": invalid manifest") validation)))
+       (manifest/normalize raw))))
+
+#?(:clj
+   (defn load-policy
+     "POLICY-PATH's deployment-policy overlay, parsed into an effective
+     policy via `grant.policy/parse-policy`; `grant.policy/default-policy`
+     when POLICY-PATH is nil (no `--policy` given)."
+     [policy-path]
+     (if-not policy-path
+       policy/default-policy
+       (let [overlay (read-edn-file policy-path)
+             validation (contract/validate-deployment-policy overlay)]
+         (when-not (:valid? validation)
+           (throw (ex-info (str policy-path ": invalid deployment policy")
+                           validation)))
+         (let [effective (policy/parse-policy overlay)]
+           (if-let [{:keys [root-public-key node-state bundle now-ms]}
+                    (:aiueos/key-lifecycle overlay)]
+             (let [required? (and (string? root-public-key)
+                                  (map? node-state)
+                                  (map? bundle)
+                                  (nat-int? now-ms))
+                   _ (when-not required?
+                       (throw
+                        (ex-info "invalid key lifecycle configuration"
+                                 {:type :invalid-key-lifecycle-configuration})))
+                   result (key-lifecycle/apply-bundle
+                           node-state root-public-key bundle now-ms)]
+               (when-not (:ok? result)
+                 (throw
+                  (ex-info "key lifecycle epoch admission failed"
+                           (dissoc result :state))))
+               (key-lifecycle/apply-to-policy
+                effective (:state result) now-ms))
+             effective))))))
+
+#?(:clj
+   (defn run-command
+     "The `run`/`admit` command bodies: load MANIFEST-PATH (+ POLICY-PATH),
+     resolve+read its declared `:aiueos/wasm` bytes, and actually execute
+     via `aiueos.execute/execute` (or `execute-admission` when ADMIT? is
+     true). Returns the same shape `aiueos.execute/execute` does. Throws
+     ex-info if the manifest declares no `:aiueos/wasm` -- nothing to run."
+     [manifest-path policy-path admit?]
+     (let [m (load-manifest manifest-path)
+           wasm-path (resolve-wasm-path manifest-path m)
+           _ (when-not wasm-path
+               (throw (ex-info (str manifest-path ": no :aiueos/wasm to run") {:manifest m})))
+           wasm-bytes (read-wasm-bytes wasm-path)
+           policy* (load-policy policy-path)
+           g (graph/build [m])]
+       (if admit?
+         (execute/execute-admission m g policy* wasm-bytes)
+         (execute/execute m g policy* wasm-bytes)))))
+
+#?(:clj
+   (defn verify-command
+     "The `verify` command body: load MANIFEST-PATH (+ POLICY-PATH) and
+     return `grant.broker/verify-one`'s decision -- no execution, matching
+     `grant.cli.edn`'s `:full` coverage for `verify`."
+     [manifest-path policy-path]
+     (let [m (load-manifest manifest-path)
+           policy* (load-policy policy-path)
+           g (graph/build [m])]
+       (broker/verify-one m g policy*))))
+
+#?(:clj
+   (defn- resolve-system-component-paths
+     "A system.aiueos.edn's `:aiueos/components` is a vector of manifest
+     paths relative to the SYSTEM file itself (matches the retired Rust
+     `System::load` convention -- same base-directory rule
+     `resolve-wasm-path` applies to a single manifest's `:aiueos/wasm`)."
+     [system-path components]
+     (let [base (.getParentFile (io/file system-path))]
+       (mapv #(.getPath (io/file base %)) components))))
+
+#?(:clj
+   (defn load-system-entries
+     "Read SYSTEM-PATH (`{:aiueos/system id :aiueos/components [paths...]}`)
+     and return `[{:aiueos.launcher/path <manifest-path> :aiueos/manifest
+     <normalized-manifest>} ...]`, one per component, in
+     `:aiueos/components` declaration order (NOT boot order -- see
+     `up-command` for that). Keeping each manifest's own file path
+     alongside it (rather than just the normalized manifest, as
+     `load-system` returns) is what lets `up-command` resolve each
+     component's OWN `:aiueos/wasm` relative to ITS OWN manifest file,
+     exactly like `run-command` does for a single manifest."
+     [system-path]
+     (let [raw (read-edn-file system-path)
+           validation (contract/validate-system raw)]
+       (when-not (:valid? validation)
+         (throw (ex-info (str system-path ": invalid system") validation)))
+       (mapv (fn [path] {:aiueos.launcher/path path :aiueos/manifest (load-manifest path)})
+             (resolve-system-component-paths system-path (:aiueos/components raw))))))
+
+#?(:clj
+   (defn load-system
+     "Read SYSTEM-PATH and return just the vector of normalized component
+     manifests (see `load-system-entries` for the path-carrying variant)."
+     [system-path]
+     (mapv :aiueos/manifest (load-system-entries system-path))))
+
+#?(:clj
+   (defn inspect-command
+     "The `inspect` command body: load SYSTEM-PATH's components and return
+     `grant.cli`'s `:inspect` result (capability providers, boot order,
+     dependency depths) -- no execution, `:full` coverage."
+     [system-path]
+     (cli/command-result (cli/read-contract) :inspect
+                          {:aiueos/components (load-system system-path)})))
+
+#?(:clj
+   (defn up-command
+     "The `up` command body: boot the components of SYSTEM-PATH that are
+     DUE at SCHED-CYCLE (a non-negative ADR-0006 cycle counter, defaulting
+     to 0 -- see `grant.manifest/due-this-cycle?`; cycle 0 is always due
+     for every component, so the default invocation boots everyone, same
+     as before scheduling existed). Boot order is
+     `grant.graph/priority-boot-order` -- dependency order (providers
+     before consumers) with same-depth components ordered by
+     `:aiueos/schedule`'s `:priority` (lower = more urgent). A component
+     not due this cycle is simply skipped (omitted from
+     `:aiueos/boot-results`, not treated as stopped/denied).
+
+     Each due component is verified + (if granted and it declares
+     `:aiueos/wasm`) actually executed via `aiueos.execute/execute`,
+     exactly like `run-command` does for a single manifest; a component
+     with no `:aiueos/wasm` (a pure capability provider with nothing to
+     run) only gets a decision, matching `verify-command`.
+
+     Stops at the FIRST denied/quota-or-fuel-exceeded/capability-unlinked
+     DUE component -- a system doesn't boot past a component that can't run, since later
+     components may depend on it. Returns `{:aiueos.cli/ok? true
+     :aiueos/boot-results [...]}` on a clean boot (every due component
+     reached) or `{:aiueos.cli/ok? false :aiueos/boot-results [...]
+     :aiueos/stopped-at <component-id>}` when boot halted early. A
+     dependency CYCLE (no valid boot order exists) is reported as
+     `{:aiueos.cli/ok? false :aiueos.cli/code :graph/cycle :aiueos/cycle
+     [component-ids...]}` before anything executes.
+
+     The normalized `:aiueos.manifest/deadline-ms` is enforced as a wall
+     watchdog around Chicory instantiation and execution. Timeout interrupts
+     the dedicated worker; boot stops after termination is observed."
+     ([system-path policy-path] (up-command system-path policy-path 0))
+     ([system-path policy-path sched-cycle]
+      (let [entries (load-system-entries system-path)
+            manifests (mapv :aiueos/manifest entries)
+            priorities (mapv #(get-in % [:aiueos/schedule :aiueos.manifest/priority]) manifests)
+            policy* (load-policy policy-path)
+            g (graph/build manifests)
+            order-result (graph/priority-boot-order manifests priorities)]
+        (if-let [cycle (:aiueos.graph/cycle order-result)]
+          {:aiueos.cli/command :up :aiueos.cli/ok? false :aiueos.cli/code :graph/cycle
+           :aiueos/cycle cycle}
+          (loop [indices (get-in order-result [:aiueos.graph/order]) results []]
+            (if (empty? indices)
+              {:aiueos.cli/command :up :aiueos.cli/ok? true :aiueos/boot-results results}
+              (let [i (first indices)
+                    {:aiueos.launcher/keys [path] :aiueos/keys [manifest]} (nth entries i)]
+                (if-not (manifest/due-this-cycle? (:aiueos/schedule manifest) sched-cycle)
+                  (recur (rest indices) results)
+                  (let [wasm-path (resolve-wasm-path path manifest)
+                        result (if wasm-path
+                                 (execute/execute manifest g policy* (read-wasm-bytes wasm-path))
+                                 (broker/verify-one manifest g policy*))
+                        results' (conj results result)
+                        booted? (and (= :grant (:aiueos/decision result))
+                                     (not (contains? result :aiueos.execute/quota-exceeded))
+                                     (not (contains? result :aiueos.execute/fuel-exceeded))
+                                     (not (contains? result :aiueos.execute/watchdog-exceeded))
+                                     (not (contains? result :aiueos.execute/capability-unlinked)))]
+                    (if booted?
+                      (recur (rest indices) results')
+                      {:aiueos.cli/command :up :aiueos.cli/ok? false :aiueos/boot-results results'
+                       :aiueos/stopped-at (:aiueos/component manifest)})))))))))))
+
+#?(:clj
+   (defn surface-command
+     "The `surface inspect --id <id>` command body: no file I/O needed
+     beyond the contract itself."
+     [surface-id-str]
+     (cli/command-result (cli/read-contract) :surface
+                          {:aiueos/surface-id (keyword surface-id-str)})))
+
+#?(:clj
+   (defn audit-command
+     "The `audit` command body: read the log at LOG-PATH (defaulting to
+     `grant.audit/log-path` under the current directory when nil, matching
+     the retired Rust `AuditLog::under` default) via `grant.audit/read-log`,
+     then delegate the pure event/component filtering to
+     `grant.cli`'s `:audit` handler."
+     [log-path event-str component-str]
+     (let [path (or log-path (.getPath (audit/log-path ".")))
+           events (audit/read-log path)]
+       (cli/command-result (cli/read-contract) :audit
+                            (cond-> {:aiueos/audit-events events}
+                              event-str (assoc :aiueos/event (keyword event-str))
+                              component-str (assoc :aiueos/component (keyword component-str)))))))
+
+#?(:clj
+   (defn- print-result [result edn?]
+     (cond
+       edn? (println (pr-str result))
+
+       (contains? result :aiueos/decision)
+       (do (println (str (name (:aiueos/decision result)) " " (name (:aiueos/component result))))
+           (when (:aiueos/violations result)
+             (doseq [v (:aiueos/violations result)]
+               (println (str "  [" (name (:aiueos/kind v)) "] " (:aiueos/message v)))))
+           (when (contains? result :aiueos.execute/result)
+             (println (str "  result: " (:aiueos.execute/result result)))))
+
+       (contains? result :aiueos/boot-order)
+       (do (println (str "boot order: " (get-in result [:aiueos/boot-order :aiueos.graph/order])))
+           (println (str "depths: " (:aiueos/depths result))))
+
+       (contains? result :aiueos/offered)
+       (println (str (name (:aiueos/surface-id result)) " offers: " (:aiueos/offered result)))
+
+       (contains? result :aiueos/audit-events)
+       (doseq [{:aiueos/keys [ts event component detail]} (:aiueos/audit-events result)]
+         (println (str ts " [" (name event) "] " (name component) " -- " detail)))
+
+       (contains? result :aiueos/boot-results)
+       (do (doseq [r (:aiueos/boot-results result)]
+             (println (str (name (:aiueos/decision r)) " " (name (:aiueos/component r))
+                            (when (contains? r :aiueos.execute/quota-exceeded) " (quota exceeded)")
+                            (when (contains? r :aiueos.execute/fuel-exceeded) " (fuel exceeded)")
+                            (when (contains? r :aiueos.execute/capability-unlinked) " (capability unlinked)"))))
+           (when (:aiueos/stopped-at result)
+             (println (str "boot stopped at " (name (:aiueos/stopped-at result))))))
+
+       (contains? result :aiueos/cycle)
+       (println (str "boot order impossible -- dependency cycle: " (:aiueos/cycle result)))
+
+       :else (println (pr-str result)))))
+
+#?(:clj
+   (defn verify-system-for-image!
+     "Refuse to package a system which the broker would deny."
+     [system-path policy-path]
+     (let [decision (broker/verify-system (load-system system-path) (load-policy policy-path))]
+       (when (= :deny (:aiueos/decision decision))
+         (throw (ex-info (str system-path ": system would not be grantable as a whole")
+                         {:aiueos.image/denied true
+                          :aiueos/violations (:aiueos/violations decision)})))
+       decision)))
+
+#?(:clj
+   (defn- image-command
+     "`image build <system-path> [--policy <p>] [--out <p>] [--jre-dir <d>]
+     [--jar <j>] [--edn]` -- ADR-0011, replacing the retired Rust
+     `InitramfsPlan`/`cmd_image_build`. `--edn` prints the plan without
+     building; otherwise stages and packages the initramfs and prints the
+     output path."
+     [positionals options edn?]
+     (case (first positionals)
+       "build"
+       (let [system-path (second positionals)
+             p (image/plan {:system system-path :policy (:policy options)
+                             :out (:out options) :jre-dir (:jre-dir options) :jar (:jar options)
+                             :runtime-root (:runtime-root options)
+                             :shutdown-after-boot? (:shutdown-after-boot options)})]
+         (if edn?
+           (println (pr-str p))
+           (do
+             (verify-system-for-image! system-path (:policy options))
+             (println (str "initramfs: " (:out (image/build-initramfs! p)))))))
+       (do (binding [*out* *err*]
+             (println "aiueos image: supported subcommand: build <system-path>"))
+           (System/exit 2)))))
+
+#?(:clj
+   (defn- vm-command
+     "`vm boot --kernel <Image> --initramfs <cpio.gz> [--memory <M>]
+     [--cpus <N>] [--cmdline <s>] [--graphics none|virtio-gpu] [--display <d>]
+     [--block <raw-image>] [--console pl011|virtio-console]
+     [--console-socket <path>] [--qemu-binary <bin>] [--edn]` -- ADR-0011,
+     replacing the retired Rust `QemuBootPlan`/`cmd_vm_boot`. `--edn` prints
+     the plan without booting; otherwise execs QEMU and blocks until it
+     exits."
+     [positionals options edn?]
+     (case (first positionals)
+       "boot"
+       (let [p (vm/plan {:kernel (:kernel options) :initramfs (:initramfs options)
+                          :arch (:arch options) :accel (:accel options)
+                          :memory (:memory options) :cpus (:cpus options) :cmdline (:cmdline options)
+                          :graphics (:graphics options) :display (:display options)
+                          :block (:block options) :console (:console options)
+                          :console-socket (:console-socket options) :qemu-binary (:qemu-binary options)})]
+         (if edn?
+           (println (pr-str p))
+           (vm/boot! p)))
+       (do (binding [*out* *err*]
+             (println "aiueos vm: supported subcommand: boot --kernel <path> --initramfs <path>"))
+           (System/exit 2)))))
+
+#?(:clj
+   (defn dispatch
+     "Run one aiueos CLI invocation. ARGV[0] is the command name; the rest
+     are positionals/flags, shaped via `grant.cli/parse-argv`.
+
+     `verify`/`run`/`admit <manifest-path> [--policy <path>] [--edn]` --
+     `run`/`admit` actually execute a granted component via `aiueos.execute`.
+     `inspect <system-path> [--edn]` -- capability providers/boot
+     order/depths across a system's components.
+     `surface <surface-id> [--edn]` -- a deployment surface's offered set.
+     `audit [--log <path>] [--event <kw>] [--component <kw>] [--edn]` --
+     query the append-only audit log (defaults to `.aiueos/audit.edn`
+     under the current directory).
+     `up <system-path> [--policy <path>] [--cycle <n>] [--edn]` -- boot the
+     components due at cycle N (default 0, ADR-0006; see `up-command`) in
+     priority-aware dependency order, executing each as it's reached;
+     stops at the first denied/quota-or-fuel-exceeded DUE component.
+     `image build <system-path> [...]` / `vm boot [...]` -- ADR-0011: build
+     a bootable initramfs / boot it under QEMU (see `image-command`/
+     `vm-command`'s docstrings). Restores two of the previously-adapter-only
+     six (`sign`/`check`/`compile`/`hash` remain unwired -- `check`/`compile`
+     delegate to kototama/kotoba-clj, `sign` is key-custody tooling; see
+     `grant.cli`'s namespace docstring)."
+     [argv]
+     (let [command (some-> (first argv) keyword)
+           {:keys [positionals options]} (cli/parse-argv (rest argv))
+           edn? (boolean (:edn options))]
+       (case command
+         :verify (print-result (verify-command (first positionals) (:policy options)) edn?)
+         :run (print-result (run-command (first positionals) (:policy options) false) edn?)
+         :admit (print-result (run-command (first positionals) (:policy options) true) edn?)
+         :inspect (print-result (inspect-command (first positionals)) edn?)
+         :surface (print-result (surface-command (or (first positionals) (:id options))) edn?)
+         :audit (print-result (audit-command (:log options) (:event options) (:component options)) edn?)
+         :up (print-result (up-command (first positionals) (:policy options)
+                                        (if-let [c (:cycle options)] (Long/parseLong c) 0))
+                            edn?)
+         :image (image-command positionals options edn?)
+         :vm (vm-command positionals options edn?)
+         (do (binding [*out* *err*]
+               (println (str "aiueos: unsupported or not-yet-wired command `" (name command) "`"))
+               (println "supported: verify, run, admit, inspect, surface, audit, up, image, vm"))
+             #?(:clj (System/exit 2)))))))
+
+#?(:clj
+   (defn -main
+     "If running as PID 1 with `/etc/aiueos/boot.edn` present (ADR-0011),
+     enter PID-1 mode instead of the ordinary one-shot CLI dispatch: boot the
+     configured system, then serve as init (reap zombies, wait for shutdown,
+     power off) via `aiueos.pid1/boot!` -- this call never returns. Otherwise,
+     ordinary CLI dispatch (unchanged)."
+     [& argv]
+     (if (pid1/pid1-mode?)
+       (let [boot-config (pid1/load-boot-config pid1/boot-edn-path)]
+         (with-open [arena (ffi/confined-arena)]
+           (pid1/boot! boot-config up-command (fn [] (pid1/power-off!)) arena)))
+       (dispatch argv))))

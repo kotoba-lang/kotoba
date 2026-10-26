@@ -1,0 +1,156 @@
+(ns aiueos.os-update-test
+  (:require [aiueos.os-update :as update]
+            [kotoba.test :refer [deftest is testing]]))
+
+(def digest-a (apply str (repeat 64 "a")))
+(def digest-b (apply str (repeat 64 "b")))
+(def digest-c (apply str (repeat 64 "c")))
+(def manifest-id (apply str (repeat 64 "d")))
+
+(def context {:architecture "x86_64" :machine "gmktec-k16" :aiueos-abi 4})
+(def artifacts
+  [{:kind :loader :bytes 100 :sha256 digest-a
+    :url "https://ipfs.kotobase.net/ipfs/bafkreiloader"}
+   {:kind :kernel :bytes 200 :sha256 digest-b
+    :url "https://ipfs.kotobase.net/ipfs/bafkreikernel"}
+   {:kind :initramfs :bytes 300 :sha256 digest-c
+    :url "https://ipfs.kotobase.net/ipfs/bafkreiinitramfs"}])
+(def manifest
+  {:schema update/schema
+   :manifest-id manifest-id
+   :sequence 2
+   :timestamp-ms 1000
+   :artifact-digests-match? true
+   :signatures [{:key-id :release/a :verified? true :status-index 0}
+                {:key-id :release/b :verified? true :status-index 1}]
+   :target {:architecture "x86_64" :machine "gmktec-k16"
+            :min-aiueos-abi 4}
+   :artifacts artifacts})
+(def publisher-state
+  {:installed-sequence 1
+   :now-ms 2000
+   :root {:keys #{:release/a :release/b} :threshold 2}
+   :revocation-bits [0 0]
+   :root-expires-ms 100000})
+(def observed {:loader digest-a :kernel digest-b :initramfs digest-c})
+(def health {:boot true :storage true :direct-https true
+             :murakumo-node true})
+
+(defn pull []
+  (update/plan-pull {:context context :manifest manifest
+                     :publisher-state publisher-state}))
+
+(defn advance [step extra]
+  (update/advance
+   (merge {:context context :manifest manifest
+           :admission (:admission (pull))
+           :step step :observed-digests observed :now-ms 2500
+           :previous-preserved? true :rollback-window 1
+           :owner-peers-updating 0 :machine-busy? false
+           :in-maintenance-window? true :consent? false
+           :health-signals health :probe-elapsed-ms 1}
+          extra)))
+
+(deftest signed-k16-release-walks-the-complete-ab-machine
+  (let [planned (pull)]
+    (is (= :pull (:status planned)))
+    (is (= :https (:transport planned)))
+    (is (= :inactive-os (get-in planned [:staging :slot])))
+    (is (false? (get-in planned [:staging :active-slot-writes?])))
+    (is (= :after-full-verification
+           (get-in planned [:staging :selector-write]))))
+  (is (= [:fetched :staged :probing :committed]
+         (mapv #(-> (advance % {}) :status)
+               [:idle :fetched :staged :probing])))
+  (is (= :activate-candidate (:action (advance :probing {})))))
+
+(deftest publisher-sequence-signatures-and-target-fail-closed
+  (testing "a rollback never produces download work"
+    (let [result (update/plan-pull
+                  {:context context :manifest manifest
+                   :publisher-state (assoc publisher-state :installed-sequence 2)})]
+      (is (= :refused (:status result)))
+      (is (= :sequence-not-monotonic
+             (get-in result [:verdict :aiueos.publisher/reason])))))
+  (testing "one signature is below the two-key release threshold"
+    (let [result (update/plan-pull
+                  {:context context
+                   :manifest (assoc manifest :signatures
+                                    [(first (:signatures manifest))])
+                   :publisher-state publisher-state})]
+      (is (= :below-threshold
+             (get-in result [:verdict :aiueos.publisher/reason])))))
+  (testing "a valid K16 signature cannot authorize another machine"
+    (let [result (update/plan-pull
+                  {:context (assoc context :machine "other")
+                   :manifest manifest :publisher-state publisher-state})]
+      (is (= :refused (:status result)))
+      (is (some #{:incompatible-machine} (:errors result))))))
+
+(deftest transport-and-artifact-set-are-not-negotiable
+  (is (some #{:artifact-url}
+            (update/manifest-errors
+             context (assoc-in manifest [:artifacts 0 :url]
+                               "http://ipfs.kotobase.net/ipfs/bafkreiloader"))))
+  (is (some #{:artifact-url}
+            (update/manifest-errors
+             context (assoc-in manifest [:artifacts 0 :url]
+                               "https://example.invalid/ipfs/bafkreiloader"))))
+  (is (some #{:artifact-set}
+            (update/manifest-errors context
+                                    (update manifest :artifacts pop)))))
+
+(deftest partial-or-corrupt-download-never-stages
+  (testing "missing bytes are a refusal, not a partial update"
+    (let [result (advance :idle {:observed-digests (dissoc observed :kernel)})]
+      (is (= :refused (:status result)))
+      (is (= :artifact-missing
+             (get-in result [:verdict :aiueos.ota/reason])))))
+  (testing "a digest mismatch is a refusal"
+    (let [result (advance :idle {:observed-digests (assoc observed :kernel digest-a)})]
+      (is (= :artifact-digest-mismatch
+             (get-in result [:verdict :aiueos.ota/reason])))))
+  (testing "staging requires an intact previous slot"
+    (let [result (advance :staged {:previous-preserved? false})]
+      (is (= :no-previous-version-preserved
+             (get-in result [:verdict :aiueos.update/reason]))))))
+
+(deftest physical-health-is-all-or-nothing
+  (is (= :pass (update/health-status health)))
+  (is (= :unknown (update/health-status (dissoc health :murakumo-node))))
+  (is (= :fail (update/health-status (assoc health :direct-https false))))
+  (testing "missing evidence waits until the bounded timeout"
+    (let [result (advance :probing
+                          {:health-signals (dissoc health :murakumo-node)
+                           :probe-elapsed-ms 1000})]
+      (is (= :probing (:status result)))
+      (is (= :wait-for-health (:action result)))))
+  (testing "a named failure rolls back immediately"
+    (let [result (advance :probing
+                          {:health-signals (assoc health :direct-https false)})]
+      (is (= :rolled-back (:status result)))
+      (is (= :health-failed (:reason result)))))
+  (testing "no health response becomes rollback, never success"
+    (let [result (advance :probing
+                          {:health-signals {}
+                           :probe-elapsed-ms 120001})]
+      (is (= :rolled-back (:status result)))
+      (is (= :health-timeout (:reason result))))))
+
+(deftest inference-health-does-not-own-the-os-slot
+  (is (= :pass (update/health-status (assoc health :inference false))))
+  (is (= :committed
+         (:status (advance :probing
+                           {:health-signals (assoc health :inference false)}))))
+  "Kototama runtime rollback is separate from AIUEOS A/B rollback")
+
+(deftest an-unconfirmed-candidate-gets-one-trial-boot
+  (is (= {:boot :b :mode :trial :next-trial-attempts 1}
+         (update/boot-selection {:step :staged :previous-slot :a
+                                 :candidate-slot :b :trial-attempts 0})))
+  (is (= {:boot :a :mode :last-known-good}
+         (update/boot-selection {:step :staged :previous-slot :a
+                                 :candidate-slot :b :trial-attempts 1})))
+  (is (= {:boot :b :mode :committed}
+         (update/boot-selection {:step :committed :previous-slot :a
+                                 :candidate-slot :b :trial-attempts 1}))))

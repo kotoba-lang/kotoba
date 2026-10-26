@@ -1,0 +1,264 @@
+#!/usr/bin/env kbb
+;; image-freshness.cljs -- the receipt that makes a boot say WHICH kernel it ran.
+;;
+;; Why this exists (ADR-0155). Every acceptance claim in the K16 programme is a
+;; string read off a serial log: `TLS-PARITY ok`, `DEVCLIENT-PARITY canonical
+;; ok`, `NIC-PARITY ok`, `DISRP`, `AIUEOS_DOT_F32_QEMU_OK`,
+;; `AIUEOS_QWEN35_ADMISSION_OK`, `KHSTCUGLWOZ`. The harness that produces those
+;; strings builds an image and then boots it, and until this file existed
+;; NOTHING connected the two halves: the boot consumed whatever bytes happened
+;; to be sitting in the output directory. A run whose build never happened, or
+;; happened three commits ago, printed the same markers as a run that measured
+;; the tree in front of you -- root AGENTS.md's "a check that could not run
+;; returns the same value as a check that ran and found nothing wrong".
+;;
+;; Measured 2026-09-02 on aiueos c9f7506, before the fix:
+;;   - `smoke-qemu-firmware-matrix.sh` boots `build/aiueos/esp` after checking
+;;     only that the directory EXISTS. Editing kernel/main.c and running it
+;;     produced a full pass against a kernel built before the edit.
+;;   - a build that fails leaves the previous run's `esp/` AND the previous
+;;     run's `kernel-serial.log` on disk, so the very grep every stream uses to
+;;     collect evidence still answers with the old kernel's markers.
+;;
+;; The receipt closes both. `record` is run by the builder, immediately after
+;; it produced the artifacts, and writes their sha256 plus the state of the
+;; tree they were built from. `assert` is run by the boot harness, immediately
+;; before QEMU, and refuses if either has moved.
+;;
+;; Exit codes are three, deliberately, and the same three everywhere:
+;;
+;;   0  fresh          -- the artifacts and the tree are what the receipt says
+;;   3  could-not-run  -- no receipt, no artifact, no git. NOT a pass, and not
+;;                        a boot failure either: the question was not answered
+;;   4  refused        -- the artifacts or the tree moved. `REFUSED stale-image`
+;;
+;; Usage:
+;;   kbb --backend sci image-freshness.cljk record --out <receipt> [--root <repo>]
+;;                                   [--scope <path>] <artifact>...
+;;   kbb --backend sci image-freshness.cljk assert --receipt <receipt> [--root <repo>]
+;;                                   [--scope <path>] <artifact>...
+;;   kbb --backend sci image-freshness.cljk show   --receipt <receipt>
+
+(ns image-freshness
+  (:require ["node:child_process" :as cp]
+            ["node:crypto" :as crypto]
+            ["node:fs" :as fs]
+            ["node:path" :as path]
+            [clojure.edn :as edn]
+            [kotoba.lang.text :as str]))
+
+(def exit-fresh 0)
+(def exit-could-not-run 3)
+(def exit-refused 4)
+
+(defn- out! [& parts] (println (str/join " " parts)))
+
+(defn- could-not-run!
+  "Neither 0 nor the refusal code. A machine without git, or a receipt that was
+  never written, has not shown the image to be stale -- it has failed to look."
+  [reason & detail]
+  (binding [*out* *err*]
+    (println (str/join " " (into ["COULD-NOT-RUN" reason] detail))))
+  (js/process.exit exit-could-not-run))
+
+(defn- refuse!
+  "The pinned literal. Callers grep for `REFUSED stale-image`; the tail names
+  which of the two comparisons disagreed and with what."
+  [& detail]
+  (binding [*out* *err*]
+    (println (str/join " " (into ["REFUSED" "stale-image"] detail))))
+  (js/process.exit exit-refused))
+
+;; --- primitives ------------------------------------------------------------
+
+(defn- sha256-hex [^js buffer]
+  (-> (crypto/createHash "sha256") (.update buffer) (.digest "hex")))
+
+(defn- sha256-string [s] (sha256-hex (js/Buffer.from s "utf8")))
+
+(defn- sha256-file [p]
+  (when (fs/existsSync p) (sha256-hex (fs/readFileSync p))))
+
+(defn- file-bytes [p]
+  (when (fs/existsSync p) (.-size (fs/statSync p))))
+
+(defn- git
+  "nil when git could not answer. Callers turn that into `could-not-run`, never
+  into an empty result -- an unreadable tree must not look like a clean one."
+  [root & args]
+  (let [r (cp/spawnSync "git"
+                        (clj->js (concat ["-c" "core.quotepath=false" "-C" root] args))
+                        #js {:encoding "utf8" :maxBuffer (* 128 1024 1024)})]
+    (when (and (zero? (.-status r)) (some? (.-stdout r)))
+      (.-stdout r))))
+
+;; --- the tree half of the receipt -----------------------------------------
+
+(defn- porcelain-path
+  "A porcelain v1 line is `XY<space>PATH`, and a rename is `PATH -> PATH`.
+  The destination is the one whose bytes are on disk."
+  [line]
+  (let [p (subs line 3)
+        arrow (str/index-of p " -> ")]
+    (if arrow (subs p (+ arrow 4)) p)))
+
+(defn- tree-state
+  "What the image was built FROM, as one digest.
+
+  Three inputs, in this order and no other: the commit, the index of the scoped
+  subtree (blob SHAs -- free, git already has them), and the working-tree bytes
+  of everything git reports as changed or untracked under the scope. The third
+  is what makes an uncommitted edit count: `ls-files -s` alone reports the
+  INDEX, so a modified-but-unstaged kernel source would hash identically to the
+  file it was built from."
+  [root scope]
+  (let [head (some-> (git root "rev-parse" "HEAD") str/trim)
+        index (git root "ls-files" "-s" "--" scope)
+        status (git root "status" "--porcelain=v1" "--untracked-files=all" "--" scope)]
+    (when (or (nil? head) (nil? index) (nil? status))
+      (could-not-run! "git-unavailable" (str "root=" root)))
+    (let [entries (->> (str/split-lines status)
+                       (remove str/blank?)
+                       (map (fn [line]
+                              (let [rel (porcelain-path line)
+                                    abs (path/join root rel)]
+                                [rel (subs line 0 2)
+                                 (or (sha256-file abs) "absent")])))
+                       (sort-by first))
+          canonical (str "head " head "\n"
+                         "scope " scope "\n"
+                         "index " (sha256-string index) "\n"
+                         "dirty " (count entries) "\n"
+                         (str/join "\n" (map (fn [[rel xy sha]]
+                                               (str xy " " sha " " rel))
+                                             entries))
+                         "\n")]
+      {:head head
+       :dirty (count entries)
+       :digest (sha256-string canonical)})))
+
+;; --- the artifact half -----------------------------------------------------
+
+(defn- artifact-entry [root p]
+  (let [abs (if (path/isAbsolute p) p (path/join root p))
+        sha (sha256-file abs)]
+    (when-not sha
+      (could-not-run! "artifact-missing" abs))
+    {:path (path/relative root abs)
+     :sha256 sha
+     :bytes (file-bytes abs)}))
+
+;; --- argv ------------------------------------------------------------------
+
+(def script-dir (path/dirname *file*))
+(def default-root (path/resolve (path/join script-dir ".." ".." "..")))
+
+(defn- parse-args [argv]
+  (loop [args argv opts {:root default-root :scope "os/aiueos"} positional []]
+    (if (empty? args)
+      [opts positional]
+      (let [[a & more] args]
+        (case a
+          "--root" (recur (rest more) (assoc opts :root (path/resolve (first more))) positional)
+          "--scope" (recur (rest more) (assoc opts :scope (first more)) positional)
+          "--out" (recur (rest more) (assoc opts :out (first more)) positional)
+          "--receipt" (recur (rest more) (assoc opts :receipt (first more)) positional)
+          (recur more opts (conj positional a)))))))
+
+;; --- commands --------------------------------------------------------------
+
+(defn- do-record [{:keys [root scope out]} artifacts]
+  (when-not out (could-not-run! "usage" "record requires --out <receipt>"))
+  (when (empty? artifacts)
+    ;; Evidence floor. A receipt over zero artifacts would let every later
+    ;; `assert` pass while covering nothing.
+    (could-not-run! "no-artifacts" "record was given no artifact paths"))
+  (let [tree (tree-state root scope)
+        entries (mapv #(artifact-entry root %) artifacts)
+        receipt {:receipt/format :aiueos.image-freshness/v1
+                 :receipt/recorded-at (.toISOString (js/Date.))
+                 :tree/head (:head tree)
+                 :tree/scope scope
+                 :tree/dirty-entries (:dirty tree)
+                 :tree/digest (:digest tree)
+                 :artifacts entries}]
+    (fs/mkdirSync (path/dirname out) #js {:recursive true})
+    (fs/writeFileSync out (str (pr-str receipt) "\n"))
+    (out! "IMAGE-RECEIPT" (str "artifacts=" (count entries))
+          (str "head=" (subs (:head tree) 0 7))
+          (str "dirty=" (:dirty tree))
+          (str "tree=" (subs (:digest tree) 0 12))
+          (str "out=" out))
+    (out! "SCANNED" (count entries))
+    (js/process.exit exit-fresh)))
+
+(defn- read-receipt [p]
+  (when-not (fs/existsSync p) (could-not-run! "receipt-missing" p))
+  (let [text (try (fs/readFileSync p "utf8")
+                  (catch :default _ (could-not-run! "receipt-unreadable" p)))
+        value (try (edn/read-string text)
+                   (catch :default e
+                     (could-not-run! "receipt-unreadable" p (.-message e))))]
+    (when-not (= :aiueos.image-freshness/v1 (:receipt/format value))
+      (could-not-run! "receipt-unreadable" p
+                      (str "format=" (pr-str (:receipt/format value)))))
+    value))
+
+(defn- do-assert [{:keys [root scope receipt]} artifacts]
+  (when-not receipt (could-not-run! "usage" "assert requires --receipt <receipt>"))
+  (let [r (read-receipt receipt)
+        recorded (:artifacts r)
+        _ (when (empty? recorded)
+            (could-not-run! "no-artifacts" (str receipt " records no artifact")))
+        by-path (into {} (map (juxt :path identity)) recorded)
+        ;; The caller may name the artifacts it is about to boot; naming none
+        ;; means "everything the receipt covers".
+        wanted (if (seq artifacts)
+                 (mapv #(path/relative root (if (path/isAbsolute %) % (path/join root %)))
+                       artifacts)
+                 (mapv :path recorded))]
+      (doseq [rel wanted]
+        (let [expected (get by-path rel)]
+          (when-not expected
+            (could-not-run! "artifact-not-in-receipt" rel (str "receipt=" receipt)))
+          (let [abs (path/join root rel)
+                found (sha256-file abs)]
+            (when-not found
+              (refuse! (str "artifact=" rel)
+                       (str "expected=" (:sha256 expected)) "found=absent"))
+            (when-not (= found (:sha256 expected))
+              (refuse! (str "artifact=" rel)
+                       (str "expected=" (:sha256 expected))
+                       (str "found=" found))))))
+      ;; The tree half. An artifact can be byte-identical to the receipt and
+      ;; still be stale: the receipt was written three commits ago and nobody
+      ;; rebuilt. This is the comparison that catches the boot-only harnesses.
+      (let [now (tree-state root (or (:tree/scope r) scope))]
+        (when-not (= (:digest now) (:tree/digest r))
+          (refuse! (str "tree=" (or (:tree/scope r) scope))
+                   (str "expected=" (:tree/digest r))
+                   (str "found=" (:digest now))
+                   (str "receipt-head=" (:tree/head r))
+                   (str "head=" (:head now)))))
+      (out! "IMAGE-FRESH" (str "artifacts=" (count wanted))
+            (str "head=" (subs (:tree/head r) 0 7))
+            (str "tree=" (subs (:tree/digest r) 0 12)))
+      (out! "SCANNED" (count wanted))
+      (js/process.exit exit-fresh)))
+
+(defn- do-show [{:keys [receipt]}]
+  (when-not receipt (could-not-run! "usage" "show requires --receipt <receipt>"))
+  (println (pr-str (read-receipt receipt)))
+  (js/process.exit exit-fresh))
+
+(defn -main [argv]
+  (let [[command & rest-args] argv
+        [opts positional] (parse-args (vec rest-args))]
+    (case command
+      "record" (do-record opts positional)
+      "assert" (do-assert opts positional)
+      "show" (do-show opts)
+      (could-not-run! "usage"
+                      "expected one of: record | assert | show"))))
+
+(-main (vec (drop 3 (js->clj js/process.argv))))

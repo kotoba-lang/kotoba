@@ -1,0 +1,461 @@
+#!/usr/bin/env kbb
+;; The K16 pure-native NEGATIVE gate: refuse a link whose inputs are not all
+;; Kotoba source compiled by Amu, or fixed stubs Amu itself emitted.
+;;
+;;   kbb --backend sci os/aiueos/scripts/k16-pure-native-gate.cljk \
+;;     --link-list <file> --provenance <file-or-dir> [--receipt-out <file>] [--root <dir>]
+;;
+;; Exit 0 = every input admitted.
+;; Exit 2 = COULD NOT ANSWER (no link list, empty link list, an input that is
+;;          not on disk, a provenance manifest that does not read).
+;; Exit 3 = REFUSED: at least one input is foreign.
+;;
+;; WHY 2 AND 3 ARE DIFFERENT CODES. Root AGENTS.md's six questions: a check
+;; that could not run must not return the value of a check that ran and found
+;; nothing. `verify-kotoba-kernel-object.py` -- which this gate re-implements
+;; per object -- exits 1 for both, and `build-uefi.sh` treats every non-zero
+;; the same, so a missing object and a C object are indistinguishable there.
+;; Here `scanned=0` is exit 2 and never a pass.
+;;
+;; WHAT THIS IS NOT. It does not compile anything, and it does not claim the
+;; committed objects reproduce byte-for-byte from their sources -- that is a
+;; separate and separately measured question (ADR-0129,
+;; `qualification/object-producer-measurement.edn`). What it answers is: is
+;; every byte entering this link accounted for by a Kotoba source and an Amu
+;; revision that the repository records?
+(ns k16-pure-native-gate
+  (:require [clojure.edn :as edn]
+            [kotoba.lang.text :as str]
+            ["node:crypto" :as crypto]
+            ["node:fs" :as fs]
+            ["node:path" :as path]))
+
+(def ^:private target "x86_64-aiueos-kernel-v1")
+
+;; The exact section set `verify-kotoba-kernel-object.py` requires. A Kotoba
+;; kernel object must carry all seven and nothing else; a toolchain stub may
+;; carry a subset. Anything outside the set -- `.comment`, `.note.GNU-stack`,
+;; `.eh_frame`, a C `.rodata` -- is how a C-derived object announces itself
+;; even when its receipt lies about the source.
+(def ^:private allowed-sections
+  #{"" ".text" ".data" ".rela.text" ".symtab" ".strtab" ".shstrtab"})
+
+(def ^:private stub-required-sections
+  #{"" ".text" ".symtab" ".strtab" ".shstrtab"})
+
+(def ^:private foreign-source-extensions
+  #{".c" ".h" ".S" ".s" ".asm" ".inc" ".cc" ".cpp" ".rs"})
+
+;; Reason literals. Pinned: the tests assert on these strings, and an upstream
+;; rename that silently changes a refusal's stated cause is exactly what those
+;; assertions exist to catch.
+(def ^:private foreign-reasons
+  #{"archive" "not-elf" "elf-type" "machine" "elf-header" "sections" "export"
+    "undefined-symbol" "relocation" "receipt-missing" "receipt-shape"
+    "c-source" "target" "object-sha256-mismatch"
+    "source-missing" "source-sha256-mismatch"})
+
+;; A refusal that is NOT a claim of foreign code. The object conforms to the
+;; Kotoba kernel-object ABI in every structural respect and its digests match
+;; its receipt -- what is absent is a record of WHICH Amu revision produced it.
+;; It is refused (an unrecorded producer is not a pass) under its own label,
+;; because calling a structurally verified Kotoba object "foreign code" would
+;; report the wrong cause, and the number this profile exists to move is the
+;; C/ASM one.
+(def ^:private unattested-reasons #{"compiler-unrecorded"})
+
+(def ^:private reasons (into foreign-reasons unattested-reasons))
+
+;; ---------------------------------------------------------------- bytes ----
+
+(defn- read-bytes [p]
+  (try (.readFileSync fs p) (catch :default _ nil)))
+
+(defn- sha256-hex [buf]
+  (-> (.createHash crypto "sha256") (.update buf) (.digest "hex")))
+
+(defn- dv [buf]
+  (js/DataView. (.-buffer buf) (.-byteOffset buf) (.-byteLength buf)))
+
+(defn- u8 [d off] (.getUint8 d off))
+(defn- u16 [d off] (.getUint16 d off true))
+(defn- u32 [d off] (.getUint32 d off true))
+(defn- u64 [d off] (js/Number (.getBigUint64 d off true)))
+(defn- i64 [d off] (js/Number (.getBigInt64 d off true)))
+
+;; ------------------------------------------------------------------ ELF ----
+
+(def ^:private elf64-ident
+  ;; \x7fELF, ELFCLASS64, ELFDATA2LSB, EV_CURRENT, ELFOSABI_NONE, 8 zero pad.
+  [0x7f 0x45 0x4c 0x46 2 1 1 0 0 0 0 0 0 0 0 0])
+
+(defn- cstring [buf off]
+  (when (< off (.-length buf))
+    (let [end (.indexOf buf 0 off)
+          end (if (neg? end) (.-length buf) end)]
+      (.toString buf "latin1" off end))))
+
+(defn- parse-elf
+  "Parse an ELF64 relocatable object, fail-closed. Returns either
+  `{:error <reason literal>}` or a map of what the gate needs. Nothing here
+  tolerates a surprise: a table that does not fit the file, a string that is
+  not terminated, a section count outside the shape this target emits."
+  [buf]
+  (let [n (.-length buf)]
+    (cond
+      (and (>= n 8) (= "!<arch>\n" (.toString buf "latin1" 0 8))) {:error "archive"}
+      (< n 64) {:error "not-elf"}
+      (not= elf64-ident (mapv #(aget buf %) (range 16))) {:error "not-elf"}
+      :else
+      (let [d (dv buf)
+            etype (u16 d 16) machine (u16 d 18) version (u32 d 20)
+            entry (u64 d 24) phoff (u64 d 32) shoff (u64 d 40)
+            flags (u32 d 48) ehsize (u16 d 52) phentsize (u16 d 54)
+            phnum (u16 d 56) shentsize (u16 d 58) shnum (u16 d 60)
+            shstrndx (u16 d 62)]
+        (cond
+          (not= etype 1) {:error "elf-type"}
+          (not= machine 62) {:error "machine"}
+          (not= [version entry phoff phnum flags ehsize shentsize]
+                [1 0 0 0 0 64 64]) {:error "elf-header"}
+          ;; `verify-kotoba-kernel-object.py` caps shnum at 16 here and calls
+          ;; the overflow "invalid section table bounds". This gate does NOT:
+          ;; a C object has 24 sections, and reporting that as a malformed
+          ;; header instead of a section-set violation would name the wrong
+          ;; cause for the most common foreign input there is. The bound that
+          ;; matters for parsing is that the table fits the file.
+          (or (zero? shnum) (>= shstrndx shnum)
+              (> (+ shoff (* shnum 64)) n)) {:error "elf-header"}
+          :else
+          (let [sections (mapv (fn [i]
+                                 (let [o (+ shoff (* i 64))]
+                                   {:name-off (u32 d o) :type (u32 d (+ o 4))
+                                    :flags (u64 d (+ o 8)) :offset (u64 d (+ o 24))
+                                    :size (u64 d (+ o 32)) :link (u32 d (+ o 40))
+                                    :info (u32 d (+ o 44)) :entsize (u64 d (+ o 56))}))
+                               (range shnum))
+                bytes-of (fn [s]
+                           (cond (= 8 (:type s)) (.subarray buf 0 0) ; SHT_NOBITS
+                                 (> (+ (:offset s) (:size s)) n) nil
+                                 :else (.subarray buf (:offset s)
+                                                  (+ (:offset s) (:size s)))))]
+            (if (some #(nil? (bytes-of %)) sections)
+              {:error "elf-header"}
+              (let [shstr (bytes-of (nth sections shstrndx))
+                    names (mapv #(cstring shstr (:name-off %)) sections)]
+                (if (some nil? names)
+                  {:error "elf-header"}
+                  (let [sections (mapv #(assoc %1 :name %2) sections names)
+                        idx (into {} (map-indexed (fn [i s] [(:name s) i]) sections))
+                        symtab (get idx ".symtab")
+                        strtab (get idx ".strtab")
+                        symbols
+                        (when (and symtab strtab)
+                          (let [sb (bytes-of (nth sections symtab))
+                                st (bytes-of (nth sections strtab))
+                                sd (dv sb)
+                                cnt (quot (.-length sb) 24)]
+                            (when (zero? (mod (.-length sb) 24))
+                              (mapv (fn [i]
+                                      (let [o (* i 24)]
+                                        {:name (or (cstring st (u32 sd o)) "")
+                                         :info (u8 sd (+ o 4)) :other (u8 sd (+ o 5))
+                                         :shndx (u16 sd (+ o 6)) :value (u64 sd (+ o 8))
+                                         :size (u64 sd (+ o 16))}))
+                                    (range cnt)))))
+                        rela-idx (get idx ".rela.text")
+                        relas
+                        (when rela-idx
+                          (let [rb (bytes-of (nth sections rela-idx))
+                                rd (dv rb)
+                                cnt (quot (.-length rb) 24)]
+                            (when (zero? (mod (.-length rb) 24))
+                              ;; r_info is one u64 whose high half is the symbol
+                              ;; index and low half the type. Read it as two
+                              ;; little-endian u32s rather than shifting a
+                              ;; BigInt: ClojureScript's bit-shift-right
+                              ;; coerces to int32 and would silently truncate.
+                              (mapv (fn [i]
+                                      (let [o (* i 24)]
+                                        {:offset (u64 rd o)
+                                         :type (u32 rd (+ o 8))
+                                         :sym (u32 rd (+ o 12))
+                                         :addend (i64 rd (+ o 16))}))
+                                    (range cnt)))))]
+                    (cond
+                      (nil? symbols) {:error "elf-header"}
+                      (and rela-idx (nil? relas)) {:error "elf-header"}
+                      :else
+                      {:sections sections :names names :index idx
+                       :symbols symbols :relas (or relas [])
+                       :text-size (if-let [i (get idx ".text")]
+                                    (:size (nth sections i))
+                                    0)})))))))))))
+
+;; ----------------------------------------------------------- structure ----
+
+(defn- undefined-symbols [elf]
+  (->> (:symbols elf)
+       (filter #(and (zero? (:shndx %)) (seq (:name %))))
+       (mapv :name)))
+
+(defn- global-funcs [elf]
+  (filterv #(= 0x12 (:info %)) (:symbols elf)))
+
+(defn- check-kotoba-structure
+  "The same seven assertions `verify-kotoba-kernel-object.py` makes, in the
+  same order, so a disagreement between the two is a bug in one of them and
+  not a difference of policy."
+  [elf]
+  (let [idx (:index elf) names (:names elf)]
+    (cond
+      (or (not= (set names) allowed-sections)
+          (not= (count names) (count allowed-sections))) {:reason "sections"}
+
+      (let [t (nth (:sections elf) (get idx ".text"))]
+        (or (not= 1 (:type t)) (zero? (bit-and (:flags t) 4)))) {:reason "sections"}
+
+      (let [s (nth (:sections elf) (get idx ".data"))]
+        (or (not= 1 (:type s)) (pos? (bit-and (:flags s) 4)))) {:reason "sections"}
+
+      (let [s (nth (:sections elf) (get idx ".symtab"))]
+        (or (not= 2 (:type s)) (not= 24 (:entsize s))
+            (not= (get idx ".strtab") (:link s)))) {:reason "sections"}
+
+      (seq (undefined-symbols elf)) {:reason "undefined-symbol"
+                                     :imports (undefined-symbols elf)}
+
+      (not= 1 (count (global-funcs elf))) {:reason "export"}
+
+      :else
+      (let [{:keys [name other shndx size]} (first (global-funcs elf))
+            rela (nth (:sections elf) (get idx ".rela.text"))]
+        (cond
+          (not (str/starts-with? name "kotoba_aiueos_")) {:reason "export"}
+          (or (not= 0 other) (not= (get idx ".text") shndx) (zero? size)) {:reason "export"}
+          (or (not= 4 (:type rela)) (not= 24 (:entsize rela)) (not= 24 (:size rela))
+              (not= (get idx ".symtab") (:link rela))
+              (not= (get idx ".text") (:info rela))) {:reason "relocation"}
+          :else
+          (let [r (first (:relas elf))]
+            (cond
+              (or (nil? r) (not= 2 (:type r)) (not= -4 (:addend r))) {:reason "relocation"}
+              (>= (:sym r) (count (:symbols elf))) {:reason "relocation"}
+              (not= (get idx ".data") (:shndx (nth (:symbols elf) (:sym r)))) {:reason "relocation"}
+              (> (+ (:offset r) 4) (:text-size elf)) {:reason "relocation"}
+              :else {:export name})))))))
+
+(defn- check-stub-structure
+  "A toolchain stub is a fixed sequence Amu emits (an interrupt entry, a
+  context switch): it has no Kotoba source, so the export-name and single
+  relocation rules do not apply. Everything that keeps foreign bytes out
+  still does -- section set, zero imports."
+  [elf]
+  (let [names (set (:names elf))]
+    (cond
+      (not (every? allowed-sections names)) {:reason "sections"}
+      (not (every? names stub-required-sections)) {:reason "sections"}
+      (seq (undefined-symbols elf)) {:reason "undefined-symbol"
+                                     :imports (undefined-symbols elf)}
+      :else {:export (:name (first (global-funcs elf)))})))
+
+;; ------------------------------------------------------------ receipts ----
+
+(defn- hex40? [s] (and (string? s) (re-matches #"[0-9a-f]{40}" s)))
+(defn- hex64? [s] (and (string? s) (re-matches #"[0-9a-f]{64}" s)))
+
+(defn- foreign-source? [s]
+  (and (string? s)
+       (contains? foreign-source-extensions (str/lower (path/extname s)))))
+
+(defn- classify
+  "One object -> `{:class ...}` or `{:reason <literal>}`. Order matters and is
+  the point: the most specific statement of foreignness wins, so a C object
+  carrying a receipt that names its `.c` is refused as `c-source` rather than
+  as whatever structural surprise its sections happen to produce first."
+  [obj buf receipt root]
+  (let [sha (sha256-hex buf)]
+    (cond
+      (nil? receipt) {:reason "receipt-missing" :sha256 sha}
+
+      (not (map? receipt)) {:reason "receipt-shape" :sha256 sha}
+
+      (or (foreign-source? (:source receipt)) (seq (:c-sources receipt)))
+      {:reason "c-source" :sha256 sha
+       :c-sources (vec (concat (when (foreign-source? (:source receipt))
+                                 [(:source receipt)])
+                               (:c-sources receipt)))}
+
+      (not (hex64? (:object-sha256 receipt))) {:reason "receipt-shape" :sha256 sha}
+      (not= sha (:object-sha256 receipt)) {:reason "object-sha256-mismatch" :sha256 sha}
+      (not= target (:target receipt)) {:reason "target" :sha256 sha}
+      (not (hex40? (get-in receipt [:compiler :sha]))) {:reason "compiler-unrecorded" :sha256 sha}
+
+      :else
+      (let [elf (parse-elf buf)]
+        (if (:error elf)
+          {:reason (:error elf) :sha256 sha}
+          (let [stub? (= :amu-toolchain-stub (:producer receipt))
+                verdict (if stub? (check-stub-structure elf) (check-kotoba-structure elf))]
+            (cond
+              (:reason verdict) (assoc verdict :sha256 sha)
+
+              stub?
+              (if (keyword? (:stub receipt))
+                {:class :toolchain-stub :sha256 sha :export (:export verdict)
+                 :stub (:stub receipt)}
+                {:reason "receipt-shape" :sha256 sha})
+
+              :else
+              (let [src (:source receipt)
+                    src-path (when (string? src) (path/resolve root src))
+                    src-buf (when src-path (read-bytes src-path))]
+                (cond
+                  (not (and (string? src) (str/ends-with? src ".kotoba")))
+                  {:reason "receipt-shape" :sha256 sha}
+                  (nil? src-buf) {:reason "source-missing" :sha256 sha}
+                  (not (hex64? (:source-sha256 receipt))) {:reason "receipt-shape" :sha256 sha}
+                  (not= (sha256-hex src-buf) (:source-sha256 receipt))
+                  {:reason "source-sha256-mismatch" :sha256 sha}
+                  :else {:class :kotoba-object :sha256 sha :export (:export verdict)
+                         :source src})))))))))
+
+;; ---------------------------------------------------------------- input ----
+
+(defn- die! [code & msg]
+  (.error js/console (str/join " " msg))
+  (.exit js/process code))
+
+(defn- read-edn [p]
+  (try (edn/read-string (.readFileSync fs p "utf8")) (catch :default _ ::unreadable)))
+
+(defn- load-provenance
+  "A manifest file (basename -> receipt) or a directory of `<basename>.edn`.
+  Both shapes exist because the committed manifest is one reviewable file and
+  a build can drop per-object receipts beside its outputs."
+  [p]
+  (cond
+    (nil? p) {:kind :none}
+    (not (.existsSync fs p)) {:kind :missing}
+    (.isDirectory (.statSync fs p)) {:kind :dir :dir p}
+    :else (let [v (read-edn p)]
+            (cond (= ::unreadable v) {:kind :unreadable}
+                  (not (map? v)) {:kind :unreadable}
+                  :else {:kind :manifest
+                         :entries (:objects v v)}))))
+
+(defn- receipt-for [prov obj]
+  (let [base (path/basename obj)]
+    (case (:kind prov)
+      :dir (let [p (path/join (:dir prov) (str base ".edn"))]
+             (when (.existsSync fs p)
+               (let [v (read-edn p)] (when-not (= ::unreadable v) v))))
+      :manifest (get (:entries prov) base)
+      nil)))
+
+(defn- parse-args [args]
+  (loop [a args opts {:objects []}]
+    (if (empty? a)
+      opts
+      (let [[k & more] a]
+        (case k
+          "--link-list"   (recur (rest more) (assoc opts :link-list (first more)))
+          "--provenance"  (recur (rest more) (assoc opts :provenance (first more)))
+          "--receipt-out" (recur (rest more) (assoc opts :receipt-out (first more)))
+          "--root"        (recur (rest more) (assoc opts :root (first more)))
+          (recur more (update opts :objects conj k)))))))
+
+(defn- link-entries [opts]
+  (let [from-file
+        (when-let [p (:link-list opts)]
+          (if-not (.existsSync fs p)
+            ::missing
+            (->> (str/split-lines (.readFileSync fs p "utf8"))
+                 (map str/trim)
+                 (remove #(or (empty? %) (str/starts-with? % "#")))
+                 vec)))]
+    (cond
+      (= ::missing from-file) ::missing
+      :else (into (vec from-file) (:objects opts)))))
+
+;; ----------------------------------------------------------------- main ----
+
+(defn- -main [& args]
+  (let [opts (parse-args (vec args))
+        root (path/resolve (or (:root opts) (.cwd js/process)))
+        entries (link-entries opts)]
+    (when (= ::missing entries)
+      (die! 2 "UNANSWERED nothing-to-gate reason=link-list-missing path=" (:link-list opts)))
+    (when (empty? entries)
+      (die! 2 "UNANSWERED nothing-to-gate reason=empty-link-list"))
+    (let [prov (load-provenance (:provenance opts))]
+      (when (contains? #{:missing :unreadable} (:kind prov))
+        (die! 2 (str "UNANSWERED nothing-to-gate reason=provenance-" (name (:kind prov)))
+              "path=" (:provenance opts)))
+      (let [resolved (mapv #(path/resolve root %) entries)
+            absent (filterv #(not (.existsSync fs %)) resolved)]
+        (when (seq absent)
+          (die! 2 "UNANSWERED could-not-answer reason=link-input-absent n=" (count absent)
+                "first=" (first absent)))
+        (let [results
+              (mapv (fn [p]
+                      (let [buf (read-bytes p)]
+                        (if (nil? buf)
+                          {:object (path/relative root p) :reason "not-elf"}
+                          (merge {:object (path/relative root p)}
+                                 (classify p buf (receipt-for prov p) root)))))
+                    resolved)
+              refused (filterv :reason results)
+              foreign (filterv #(contains? foreign-reasons (:reason %)) refused)
+              unattested (filterv #(contains? unattested-reasons (:reason %)) refused)
+              kotoba (filterv #(= :kotoba-object (:class %)) results)
+              stubs (filterv #(= :toolchain-stub (:class %)) results)
+              c-sources (vec (distinct (mapcat :c-sources foreign)))
+              imports (vec (distinct (mapcat :imports results)))
+              histogram (reduce (fn [m r] (update m (:reason r) (fnil inc 0))) {} refused)
+              receipt {:format :aiueos.k16-pure-native-receipt/v1
+                       :target target
+                       :link-list (:link-list opts)
+                       :provenance (:provenance opts)
+                       :scanned (count results)
+                       :kotoba (count kotoba)
+                       :stubs (count stubs)
+                       :refused (count refused)
+                       :foreign (count foreign)
+                       :unattested (count unattested)
+                       :foreign-objects (mapv :object foreign)
+                       :unattested-objects (mapv :object unattested)
+                       :c-sources c-sources
+                       :reasons histogram
+                       :objects (mapv #(select-keys % [:object :class :export :source
+                                                       :stub :sha256 :reason])
+                                      results)
+                       :foreign-code-receipt {:c-sources c-sources
+                                              :foreign-objects (mapv :object foreign)
+                                              :imports imports
+                                              :dynamic-dependencies []}}]
+          (doseq [r refused]
+            (when-not (contains? reasons (:reason r))
+              (die! 2 "UNANSWERED could-not-answer reason=unknown-reason-literal literal="
+                    (:reason r)))
+            (println (str (if (contains? foreign-reasons (:reason r))
+                            "REFUSED foreign-code: "
+                            "REFUSED unattested-provenance: ")
+                          (:object r) " reason=" (:reason r))))
+          (println (str "SCANNED\t" (count results)))
+          (when-let [out (:receipt-out opts)]
+            (.mkdirSync fs (path/dirname (path/resolve root out)) #js {:recursive true})
+            (.writeFileSync fs (path/resolve root out)
+                            (str (pr-str receipt) "\n") "utf8"))
+          (if (zero? (count refused))
+            (do (println (str "AIUEOS_K16_PURE_NATIVE_OK scanned=" (count results)
+                              " kotoba=" (count kotoba) " stubs=" (count stubs)
+                              " foreign=0 unattested=0"))
+                (.exit js/process 0))
+            (do (println (str "AIUEOS_K16_PURE_NATIVE_REFUSED scanned=" (count results)
+                              " kotoba=" (count kotoba) " stubs=" (count stubs)
+                              " foreign=" (count foreign)
+                              " unattested=" (count unattested)))
+                (.exit js/process 3))))))))
+
+(apply -main *command-line-args*)

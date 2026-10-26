@@ -1,0 +1,91 @@
+(ns native.serial
+  ;; COM1 (0x3F8) as a SECOND transport for this kernel's trace bytes.
+  ;;
+  ;; WHY. Until now the only transport visible on the physical board was the
+  ;; bus2 netlog: fire-and-forget UDP, one datagram per byte, through a NIC
+  ;; whose DMA the kernel has just set up. 0xE9 exists (43 sites) but is a QEMU
+  ;; device and writes nowhere on hardware. So on the board there was exactly
+  ;; ONE way for this kernel to say anything, it was lossy, and the loss was
+  ;; not uniform -- the run-end byte DE is emitted immediately before the
+  ;; platform reset and never arrived at all, while other bytes arrived ~14% of
+  ;; the time. A wedge was attributed to fuel exhaustion on that evidence,
+  ;; wrongly (ADR-0203).
+  ;;
+  ;; The C kernel this one replaced did not have that problem, and the reason
+  ;; is countable: os/aiueos/kernel/main.c writes to COM1 in 470 places, to
+  ;; 0xE9 in 193 and to the framebuffer in 58. Three transports, of which
+  ;; serial was the one it used most. It could say "the node started" and keep
+  ;; saying things, because losing one wire did not silence it.
+  ;;
+  ;; Ported line for line from that kernel's serial_init/serial_byte, with one
+  ;; deliberate change: the THR-empty poll budget. C spins up to 1,000,000
+  ;; times; here every loop iteration is a function entry charged one fuel
+  ;; against a per-boot budget, so a 1e6 budget would cost more fuel per BYTE
+  ;; than the whole run has. 10,000 is ~10 ms on real hardware at one inb per
+  ;; microsecond and is never reached when the UART is idle, which is the case
+  ;; on every call this kernel makes.
+  ;;
+  ;; A board with no UART at 0x3F8 reads 0xFF from every port, and 0xFF has bit
+  ;; 5 set, so the poll passes on the first look and the write goes nowhere.
+  ;; That is the desired behaviour: no stall, no branch, nothing to configure.
+  (:export [serial-init serial-byte serial-hex-byte serial-eol trace-byte]))
+
+;; 0x3F8..0x3FD in decimal, because `def` takes literals.
+(def com1-data 1016)        ; 0x3F8
+(def com1-ier 1017)         ; 0x3F9  interrupt enable / divisor high
+(def com1-divisor-lo 1016)  ; 0x3F8 while DLAB is set
+(def com1-fifo 1018)        ; 0x3FA
+(def com1-lcr 1019)         ; 0x3FB
+(def com1-mcr 1020)         ; 0x3FC
+(def com1-lsr 1021)         ; 0x3FD
+(def thr-empty 32)          ; LSR bit 5
+
+(defn serial-init []
+  ;; 115200 8N1, FIFO on -- the same seven writes, in the same order, as
+  ;; main.c's serial_init.
+  (let [a (kernel-out-u8 com1-ier 0)          ; interrupts off
+        b (kernel-out-u8 com1-lcr 128)        ; DLAB on
+        c (kernel-out-u8 com1-divisor-lo 1)   ; divisor 1 = 115200
+        d (kernel-out-u8 com1-ier 0)          ; divisor high 0
+        e (kernel-out-u8 com1-lcr 3)          ; DLAB off, 8N1
+        f (kernel-out-u8 com1-fifo 199)       ; FIFO on, clear, 14-byte trigger
+        g (kernel-out-u8 com1-mcr 11)]        ; DTR|RTS|OUT2
+    (+ 1 (* 0 (+ a b c d e f g)))))
+
+(defn serial-wait [budget]
+  ;; 1 when the transmit holding register is empty, 0 when the budget ran out.
+  (if (= budget 0)
+    0
+    (if (= (bit-and (kernel-in-u8 com1-lsr) thr-empty) thr-empty)
+      1
+      (serial-wait (- budget 1)))))
+
+(defn serial-byte [value]
+  (if (= (serial-wait 10000) 1)
+    (+ 1 (* 0 (kernel-out-u8 com1-data (bit-and value 255))))
+    0))
+
+(defn hex-digit [value]
+  (if (< value 10) (+ 48 value) (+ 87 value)))
+
+(defn serial-hex-byte [value]
+  ;; Two lowercase hex characters, the same rendering the netlog receiver
+  ;; prints, so one grep reads either transport.
+  (let [hi (serial-byte (hex-digit (bit-and (quot value 16) 15)))
+        lo (serial-byte (hex-digit (bit-and value 15)))]
+    (if (= (+ hi lo) 2) 1 0)))
+
+(defn serial-eol []
+  (let [cr (serial-byte 13)
+        lf (serial-byte 10)]
+    (if (= (+ cr lf) 2) 1 0)))
+
+(defn trace-byte [value]
+  ;; ONE character on BOTH transports. 0xE9 is a QEMU device and writes nowhere
+  ;; on the board; COM1 is the reverse for anyone with a cable. Neither is a
+  ;; superset of the other, so the boot markers go to both and the call site
+  ;; keeps returning the byte, which is what the existing readback checks
+  ;; compare against.
+  (let [e9 (kernel-out-u8 233 value)
+        com (serial-byte value)]
+    (+ value (* 0 (+ e9 com)))))

@@ -1,0 +1,157 @@
+#!/usr/bin/env kbb
+;; The ADR 0285 slice carrier, executed.
+;;
+;; Everything else about `[:slice T]` is a claim about bytes. amu ADR 0314
+;; shows that a carried traversal and a hand-written `(slice-load-u8 base
+;; length index)` traversal compile to IDENTICAL objects on both ISAs, which
+;; is the right thing to check and is not the same as checking that the object
+;; addresses the memory it says it does. That is a claim about a machine.
+;;
+;; So this boots one. `os/aiueos/native/slice-carrier-probe.kotoba` builds a
+;; `[:slice :u8]` over a real conventional-memory page, PASSES IT AS A
+;; FUNCTION PARAMETER, writes a pattern through it, sums it back, narrows it
+;; with `slice-sub` and sums the narrowing. Nothing in the probe reconstructs
+;; the slice from two i64s at a call site -- `main` builds it once and hands
+;; the value on.
+;;
+;; The console is <whole:8 hex><tail:8 hex>"SLC":
+;;
+;;   00000820   1 + 2 + ... + 64   = 2080, the whole slice
+;;   00000410  17 + 18 + ... + 48  = 1040, (slice-sub s 16 32)
+;;
+;; The second is what makes the narrowing readable rather than plausible.
+;; Measured 2026-09-02 by editing the probe and re-running:
+;;
+;;   (slice-sub s 0 32)   -> 00000820 00000210 SLC, exit 27  (offset ignored)
+;;   (slice-sub s 48 32)  -> EMPTY console, exit 0           (48+32 > 64: the
+;;                                                            narrowing traps
+;;                                                            before printing)
+;;
+;; Usage: kbb --backend sci os/aiueos/scripts/smoke-qemu-slice-carrier.cljk /path/to/amu
+(ns smoke-qemu-slice-carrier
+  (:require ["child_process" :as cp]
+            ["fs" :as fs]
+            ["os" :as os]
+            ["path" :as path]
+            [kotoba.lang.text :as str]))
+
+(def repo (path/resolve (path/join (path/dirname *file*) ".." ".." "..")))
+(def aiueos (path/join repo "os" "aiueos"))
+(def source (path/join aiueos "native" "slice-carrier-probe.kotoba"))
+
+(def expected-whole "00000820")
+(def expected-tail "00000410")
+(def expected-marker "SLC")
+;; QEMU's isa-debug-exit reports (value << 1) | 1, and the probe writes 16 when
+;; all six of its own checks hold.
+(def expected-status 33)
+
+(def ovmf-candidates
+  ["/opt/homebrew/share/qemu/edk2-x86_64-code.fd"
+   "/usr/share/OVMF/OVMF_CODE_4M.fd"
+   "/usr/share/OVMF/OVMF_CODE.fd"
+   "/usr/share/edk2/x64/OVMF_CODE.fd"])
+
+(defn die [message]
+  (js/console.error (str "error: " message))
+  (js/process.exit 1))
+
+(defn run! [command args options]
+  (let [result (cp/spawnSync command (clj->js args)
+                             (clj->js (merge {:encoding "utf8"} options)))]
+    {:status (.-status result)
+     :stdout (or (.-stdout result) "")
+     :stderr (or (.-stderr result) "")}))
+
+(defn firmware []
+  (or (some #(when (fs/existsSync %) %) (cons (.. js/process -env -OVMF_CODE)
+                                              ovmf-candidates))
+      (die (str "OVMF firmware not found. Looked at: "
+                (str/join ", " ovmf-candidates)))))
+
+(defn build! [compiler out]
+  (let [kernel (path/join out "KERNEL.ELF")
+        efi (path/join out "esp" "EFI" "BOOT" "BOOTX64.EFI")
+        binary (path/join compiler "bin" "amu")]
+    (fs/mkdirSync (path/dirname efi) #js {:recursive true})
+    ;; NOT `--jvm-free`. kotoba-native ADR-0036 keeps the portable elf64 twin
+    ;; and the JVM one apart for the x86-64 KERNEL IMAGE specifically -- the
+    ;; twin does not carry the live-boot GDT/TSS shim -- and `bin/amu` refuses
+    ;; the route rather than emitting a different file under the same name.
+    ;; The kernel OBJECT of this same source IS byte-identical on both routes,
+    ;; and amu ADR 0314 compiles the carrier fixture that way.
+    (let [compiled (run! binary ["compile" source
+                                 "--target" "x86_64-aiueos-kernel-v1"
+                                 "--artifact" "image"
+                                 "--fuel" "32768"
+                                 "--output" kernel]
+                         {})]
+      (when-not (zero? (:status compiled))
+        (die (str "compile failed:\n" (:stdout compiled) (:stderr compiled)))))
+    (let [packaged (run! binary ["package-aiueos-boot" kernel "--output" efi] {})]
+      (when-not (zero? (:status packaged))
+        (die (str "package failed:\n" (:stdout packaged) (:stderr packaged)))))
+    ;; The same no-foreign-object floor the shipping kernel's build script
+    ;; keeps. A test variant that quietly linked a C object would prove
+    ;; nothing about a pure-Kotoba kernel.
+    (doseq [entry (fs/readdirSync out #js {:recursive true})]
+      (when (re-find #"\.(c|o|obj|a|so)$" entry)
+        (die (str "foreign/C artifact entered the probe output: " entry))))
+    {:kernel kernel :efi efi}))
+
+(defn observe [out code]
+  (let [log (path/join out "debug.log")]
+    (when (fs/existsSync log) (fs/unlinkSync log))
+    (let [result (run! (or (.. js/process -env -QEMU_SYSTEM_X86_64)
+                           "qemu-system-x86_64")
+                       ["-machine" "q35,accel=tcg"
+                        "-cpu" "max"
+                        "-m" "128M" "-smp" "2"
+                        "-drive" (str "if=pflash,format=raw,readonly=on,file=" code)
+                        "-drive" (str "format=raw,file=fat:rw:" (path/join out "esp"))
+                        "-device" "isa-debugcon,iobase=0xe9,chardev=debug"
+                        "-chardev" (str "file,id=debug,path=" log)
+                        "-device" "isa-debug-exit,iobase=0xf4,iosize=0x04"
+                        "-display" "none" "-serial" "none" "-no-reboot"]
+                       {:timeout 300000})
+          console (if (fs/existsSync log) (fs/readFileSync log "utf8") "")]
+      {:status (:status result) :console console})))
+
+(defn -main [& args]
+  (let [compiler (or (first args)
+                     (die "usage: smoke-qemu-slice-carrier.cljk /path/to/amu"))
+        out (fs/mkdtempSync (path/join (os/tmpdir) "aiueos-slice-carrier-"))
+        code (firmware)
+        _ (build! compiler out)
+        {:keys [status console]} (observe out code)]
+    (println (str "exit=" status " console=" (pr-str console)))
+    ;; An EMPTY console is the shape a trapped narrowing leaves, so it is
+    ;; refused explicitly rather than falling into the regex arm -- "no digits"
+    ;; and "wrong digits" are different findings.
+    (when (str/blank? console)
+      (die (str "the guest printed nothing and exited " status
+                " -- the probe trapped before reaching the console")))
+    (when-not (re-find #"^[0-9A-F]{16}SLC$" console)
+      (die (str "console " (pr-str console)
+                " is not <whole:8><tail:8>SLC")))
+    (let [whole (subs console 0 8)
+          tail (subs console 8 16)]
+      (println (str "  whole=" whole " tail=" tail))
+      (when-not (= expected-whole whole)
+        (die (str "the whole slice summed to " whole ", expected " expected-whole
+                  " (1..64 = 2080) -- the carrier did not walk what it names")))
+      (when-not (= expected-tail tail)
+        (die (str "the narrowing summed to " tail ", expected " expected-tail
+                  " (17..48 = 1040). " expected-whole " would mean slice-sub did"
+                  " nothing; 00000210 that it ignored its offset; 00000798 that"
+                  " it ignored its count")))
+      (when-not (= expected-status status)
+        (die (str "the guest exited " status ", expected " expected-status
+                  " -- the digits are right and one of the probe's own checks"
+                  " is not")))
+      (println (str "AIUEOS_SLICE_CARRIER_QEMU_OK whole=" whole " tail=" tail
+                    " exit=" status
+                    " slice-passed-as-a-function-parameter=yes"))
+      (js/process.exit 0))))
+
+(apply -main (drop 3 (js->clj js/process.argv)))

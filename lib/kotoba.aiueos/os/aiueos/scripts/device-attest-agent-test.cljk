@@ -1,0 +1,102 @@
+#!/usr/bin/env kbb
+;; Does what this device signs verify where the control plane checks it?
+;;
+;; The agent signs with node's `crypto.sign`; the Worker verifies with
+;; WebCrypto's `crypto.subtle`, which is what workerd implements. Those are
+;; two different API paths over the same primitive, and the encoding between
+;; them (base64url, UTF-8) is the part most likely to be wrong and least
+;; likely to fail loudly -- a wrong encoding is not an error, it is a
+;; signature that does not verify, which looks exactly like a wrong key.
+;;
+;; So this drives both halves for real: sign the way the agent does, verify
+;; the way the Worker does, and require the answer to be true. Then require it
+;; to be FALSE for the bare nonce and for a proof made for another endpoint,
+;; because a check that only ever says true is not checking the binding.
+;;
+;;   kbb --backend sci --classpath ../grant/src:../text/src \
+;;     os/aiueos/scripts/device-attest-agent-test.cljk
+
+(require '[kotoba.lang.text] '[grant.device-attest :as attest]
+         '["node:crypto" :as crypto])
+
+(def subtle (.-subtle (.-webcrypto crypto)))
+(def results (atom []))
+
+(defn- check! [name ok detail]
+  (swap! results conj [name ok])
+  (println (if ok "AGENT_OK  " "AGENT_FAIL") name (if ok "" (str "-- " detail))))
+
+(def kp (crypto/generateKeyPairSync "ed25519"))
+(def private-key (.-privateKey kp))
+(def public-key (.-publicKey kp))
+
+;; The Worker imports a RAW 32-byte public key (it gets those bytes out of the
+;; did:key). JWK `x` is that same raw key, base64url.
+(def raw-public
+  (js/Buffer.from (.-x (.export public-key #js {:format "jwk"})) "base64url"))
+
+(def did "did:key:z6MkfakeDeviceForThisTest")
+(def endpoint "https://murakumo.cloud")
+(def nonce "n0nce-from-the-plane")
+
+;; agent side, exactly as device-attest-agent.cljs does it
+(defn- agent-sign [message]
+  (-> (crypto/sign nil (js/Buffer.from message "utf8") private-key)
+      (.toString "base64url")))
+
+;; worker side, exactly as cloud-murakumo.devices-http/verify-possession does it
+(defn- worker-verify [message signature-b64url]
+  (-> (.importKey subtle "raw" raw-public #js {:name "Ed25519"} false #js ["verify"])
+      (.then (fn [key]
+               (.verify subtle #js {:name "Ed25519"} key
+                        (js/Buffer.from signature-b64url "base64url")
+                        (.encode (js/TextEncoder.) message))))
+      (.then (fn [ok] (true? ok)))
+      (.catch (fn [_] false))))
+
+(def message (attest/signing-input {:did did :endpoint endpoint :nonce nonce}))
+(def signature (agent-sign message))
+
+(check! "signing-input-is-a-string" (string? message) (pr-str message))
+(check! "signature-is-base64url"
+        (and (string? signature)
+             (not (re-find #"[+/=]" signature)))
+        (str "got " signature))
+
+(-> (js/Promise.all
+     #js [(worker-verify message signature)
+          ;; the bare nonce: what the plane used to verify. If this still
+          ;; passed, the binding would be decorative.
+          (worker-verify nonce signature)
+          ;; a proof minted for another enrolment service
+          (worker-verify (attest/signing-input {:did did
+                                                :endpoint "https://evil.example"
+                                                :nonce nonce})
+                         signature)
+          ;; a proof for another device
+          (worker-verify (attest/signing-input {:did "did:key:z6MkSomeOtherBox"
+                                                :endpoint endpoint :nonce nonce})
+                         signature)
+          ;; a replay against a different nonce
+          (worker-verify (attest/signing-input {:did did :endpoint endpoint
+                                                :nonce "another-nonce"})
+                         signature)])
+    (.then
+     (fn [[bound bare other-endpoint other-did other-nonce]]
+       (check! "the-plane-accepts-what-the-agent-signs" bound
+               "the agent's signature did not verify through WebCrypto")
+       (check! "the-bare-nonce-no-longer-verifies" (false? bare)
+               "a signature over the bound message also verified as a bare nonce")
+       (check! "a-proof-is-bound-to-its-endpoint" (false? other-endpoint)
+               "a proof for one enrolment service verified for another")
+       (check! "a-proof-is-bound-to-its-device" (false? other-did)
+               "a proof made by one device verified for another")
+       (check! "a-proof-is-bound-to-its-nonce" (false? other-nonce)
+               "a proof replayed against a different nonce verified")
+       (let [total (count @results) failed (remove second @results)]
+         (println)
+         (println (str "checks=" total " failed=" (count failed)))
+         (when (seq failed)
+           (println (str "failed: " (kotoba.lang.text/join ", " (map first failed)))))
+         (println (if (empty? failed) "DEVICE_ATTEST_AGENT_OK" "DEVICE_ATTEST_AGENT_FAIL"))
+         (js/process.exit (if (empty? failed) 0 1))))))

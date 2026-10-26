@@ -1,0 +1,114 @@
+(ns aiueos.hvt-vmm-gate-test
+  "The gate on the vmm call sites inside `aiueos.hvt`.
+
+  Root ADR-2608239100 splits hosting a foreign environment: the DECISIONS
+  live in kotoba-lang/vmm's Kotoba cores and execute from their shipped KIR
+  artifacts; the mechanism (mapping RAM, writing bytes, servicing exits) stays
+  in this tender. This gate pins both directions:
+
+    1. `foreign-guest-boot-plan` really consults those cores -- placements,
+       x0/PC and the DTB bytes are the cores' answers, and refusals carry the
+       cores' pinned reason literals.
+    2. This file's own map constants (`guest-mmio-base`, `virtio-mmio-*`,
+       `psci-system-off-fid`) still agree with the exit core that describes
+       the same map -- a drift between the two turns this red instead of
+       silently giving the guest two maps.
+
+  Runs on any JVM host (no /dev/kvm needed); the live boot is the #110 smoke
+  gate's job."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [vmm.oracle :as vmm-kir]
+            [aiueos.hvt :as hvt]))
+
+(defn- bytes [xs]
+  #?(:clj (byte-array (map unchecked-byte xs))
+     :cljs (js/Uint8Array.from (clj->js xs))))
+
+(defn- le32 [n]
+  [(bit-and n 0xff) (bit-and (unsigned-bit-shift-right n 8) 0xff)
+   (bit-and (unsigned-bit-shift-right n 16) 0xff)
+   (bit-and (unsigned-bit-shift-right n 24) 0xff)])
+
+(defn- image
+  "`size`-byte arm64 Image: the booting.rst header (text_offset 0,
+  image_size `size`, flags 0, magic ARM-x64 at offset 56) plus filler."
+  [size]
+  (let [z (fn [n] (take n (repeat 0)))]
+    (bytes (concat (z 8)                     ;; code0, code1
+                   (z 8)                     ;; text_offset = 0
+                   (le32 size) (z 4)         ;; image_size, u64 LE
+                   (z 8)                     ;; flags = 0
+                   (z 24)                    ;; res2, res3, res4
+                   (le32 0x644D5241) (z 4)   ;; magic "ARM\x64", res3
+                   (z (- size 64))))))
+
+(def ^:private guest-shape
+  {:image-bytes (image 3072)
+   :initrd-bytes (bytes (take 4096 (repeat 7)))
+   :bootargs "console=ttyAMA0 earlycon=pl011,0x09000000"
+   :ram-base 1073741824        ;; 0x40000000
+   :ram-size 536870912         ;; 512 MiB
+   :uart-base 150994944        ;; 0x09000000
+   :uart-size 4096
+   :gicd-base 134217728 :gicd-size 65536
+   :gicr-base 134742016 :gicr-size 1007616
+   :virtio-base 167772160      ;; 0x0a000000
+   :virtio-stride 512
+   :virtio-count 2})
+
+(deftest foreign-guest-plan-consults-the-vmm-cores
+  (let [{:keys [ok? pc x0 kernel-gpa dtb-gpa initrd-gpa initrd-end dtb-bytes]}
+        (hvt/foreign-guest-boot-plan guest-shape)]
+    (is ok?)
+    (testing "placements are arm64-boot's decisions"
+      (is (= 1073741824 pc))                    ;; text_offset 0 at 2 MiB base
+      (is (= 1073741824 kernel-gpa))
+      (is (= x0 dtb-gpa))                       ;; booting.rst: x0 = DTB address
+      (is (= 0 (mod dtb-gpa 2097152)))
+      (is (= (+ initrd-gpa 4096) initrd-end)))
+    (testing "the DTB bytes are fdt-core's answers"
+      (is (pos? (count dtb-bytes)))
+      (is (= [0xd0 0x0d 0xfe 0xed] (vec (take 4 dtb-bytes))))
+      ;; totalsize (big-endian u32 at offset 4) == the blob we were handed
+      (is (= (count dtb-bytes)
+             (let [[a b c d] (take 4 (drop 4 dtb-bytes))]
+               (+ (* a 16777216) (* b 65536) (* c 256) d)))))))
+
+(deftest refusals-carry-the-cores-reason-literals
+  (testing "an Image with the wrong magic"
+    (let [bad (bytes (take 64 (repeat 0)))]
+      (is (= "arm64-boot/bad-magic"
+             (:reason (hvt/foreign-guest-boot-plan
+                       (assoc guest-shape :image-bytes bad)))))))
+  (testing "an empty bootargs"
+    (is (= "fdt/bootargs-empty"
+           (:reason (hvt/foreign-guest-boot-plan
+                     (assoc guest-shape :bootargs ""))))))
+  (testing "a DTB past booting.rst's ceiling"
+    (is (= "fdt/blob-too-large"
+           (:reason (hvt/foreign-guest-boot-plan
+                     (assoc guest-shape
+                            :bootargs (apply str (repeat 2100000 "a")))))))))
+
+(deftest exit-decisions-come-from-the-exit-core
+  (is (= {:ok? true :device :uart :offset 0}
+         (hvt/mmio-exit-decision {:gpa 150994944 :len 4})))
+  (is (= {:ok? true :device :virtio :offset 80 :index 3}
+         (hvt/mmio-exit-decision {:gpa 167773776 :len 4})))   ;; 0x0A000650
+  (is (= "mmio/bad-access-size"
+         (:reason (hvt/mmio-exit-decision {:gpa 150994944 :len 3}))))
+  (is (= "mmio/unmapped"
+         (:reason (hvt/mmio-exit-decision {:gpa 4096 :len 4}))))
+  (is (= {:ok? true :action :system-off}
+         (hvt/psci-exit-decision 2214592520)))                ;; 0x84000008
+  (is (= "psci/not-supported"
+         (:reason (hvt/psci-exit-decision 3735928559)))))     ;; 0xdeadbeef
+
+(deftest the-local-map-constants-agree-with-the-exit-core
+  ;; The tender's own copies of the QEMU `virt` map must be the exit core's
+  ;; numbers, not a second map. Both directions are checked by construction:
+  ;; if either side changes alone, this fails.
+  (is (= (vmm-kir/call :exit :uart-base []) hvt/guest-mmio-base))
+  (is (= (vmm-kir/call :exit :virtio-base []) hvt/virtio-mmio-base))
+  (is (= (vmm-kir/call :exit :virtio-stride []) hvt/virtio-mmio-size))
+  (is (= (vmm-kir/call :exit :psci-system-off-fid []) hvt/psci-system-off-fid)))

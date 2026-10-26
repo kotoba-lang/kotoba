@@ -1,0 +1,388 @@
+#!/usr/bin/env kbb
+;; Recompile every committed Kotoba kernel object from its recorded recipe and
+;; compare the bytes. One driver, one recipe format, one exit convention.
+;;
+;;   kbb --backend sci os/aiueos/scripts/reproduce-kotoba-objects.cljk --amu <dir> [options]
+;;
+;;   --amu <dir>        an amu checkout to compile with (required)
+;;   --provenance <f>   default os/aiueos/kotoba/provenance.edn
+;;   --root <dir>       repository root, default cwd
+;;   --objects a.o,b.o  only these
+;;   --jobs N           parallel compiles, default 4
+;;   --allow-drift      compile with the amu at --amu even when it is not the
+;;                      revision the receipt records (the verdict is then
+;;                      :drift, and --allow-drift keeps that from failing)
+;;   --attest           write the freshly produced bytes over the committed
+;;                      objects and rewrite the provenance manifest to record
+;;                      THIS amu
+;;   --keep <dir>       keep the freshly produced objects here
+;;
+;; Exit 0 = every object reproduced (or, under --attest, every object compiled).
+;; Exit 2 = COULD NOT RUN: no amu, a dirty amu tree, a receipt that does not
+;;          read, a source that is not on disk, a compile that did not produce
+;;          an object. `scanned=0` is exit 2 and never a pass.
+;; Exit 3 = at least one object did not reproduce.
+;;
+;; WHY THIS REPLACES THE OLD RECIPES. `reproduce-kotoba-kernel-object.sh` named
+;; 45 of the objects and pinned one amu revision in a shell variable;
+;; `reproduce-ecdsa-sign-object.clj` named 2 more and patched the pinned
+;; toolchain in-process. Between them, 26 committed objects had no recipe at
+;; all, and neither script could say whether the revision it pinned is the one
+;; that produced the bytes in the tree -- the pin was an assertion, not a
+;; measurement. Here the pin lives per object in the receipt, the driver
+;; refuses to answer when the amu in front of it is a different revision, and
+;; the answer is a byte comparison.
+(ns reproduce-kotoba-objects
+  (:require [clojure.edn :as edn]
+            [kotoba.lang.text :as str]
+            ["node:child_process" :as child]
+            ["node:crypto" :as crypto]
+            ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:path" :as path]))
+
+(def ^:private target "x86_64-aiueos-kernel-v1")
+
+(def ^:private args (vec *command-line-args*))
+
+(defn- flag? [f] (some #(= f %) args))
+
+(defn- opt [f]
+  (let [i (.indexOf args f)] (when-not (neg? i) (nth args (inc i) nil))))
+
+(def ^:private root (path/resolve (or (opt "--root") (.cwd js/process))))
+(def ^:private kotoba-dir (path/join root "os" "aiueos" "kotoba"))
+
+(defn- die! [code msg]
+  (.error js/console msg)
+  (.exit js/process code))
+
+(defn- sha256-file [p]
+  (-> (.createHash crypto "sha256") (.update (.readFileSync fs p)) (.digest "hex")))
+
+(defn- read-edn [p]
+  (try (edn/read-string (.readFileSync fs p "utf8")) (catch :default _ ::unreadable)))
+
+;; ------------------------------------------------------------------ amu ----
+
+(defn- git [dir & a]
+  (let [r (.spawnSync child "git" (clj->js (into ["-C" dir] a))
+                      #js {:encoding "utf8"})]
+    (when (zero? (or (.-status r) 1)) (str/trim (.-stdout r)))))
+
+(defn- amu-pins
+  "The upstream revisions amu's own deps.edn fixes. Recorded beside the amu SHA
+  because they are what actually decides codegen; recording only `amu` would
+  name a revision whose meaning depends on a file the receipt never quotes."
+  [dir]
+  (let [d (read-edn (path/join dir "deps.edn"))]
+    (if (= ::unreadable d)
+      (sorted-map)
+      (let [deps (:deps d)]
+        (into (sorted-map)
+              (for [n ["kotoba-native" "kotoba-sema" "kotoba-kir" "kotoba-verifier"
+                       "kotoba-mir" "kotoba-gmir" "kotoba-codegen" "kotoba-object"]
+                    :let [s (get-in deps [(symbol "io.github.kotoba-lang" n) :git/sha])]
+                    :when s]
+                [(keyword n) s]))))))
+
+(defn- amu-revision
+  "The revision of the amu checkout at `dir`, or a reason it cannot be named.
+  A dirty tree is not a revision: bytes produced by uncommitted edits cannot be
+  reproduced by anyone who checks that SHA out."
+  [dir]
+  (cond
+    (not (.existsSync fs (path/join dir "bin" "amu")))
+    {:error (str "amu-absent path=" dir)}
+
+    (not (.existsSync fs (path/join dir "node_modules")))
+    {:error (str "amu-node-modules-absent path=" dir " (run npm ci there)")}
+
+    :else
+    (let [sha (git dir "rev-parse" "HEAD")
+          dirty (git dir "status" "--porcelain")]
+      (cond
+        (not (and sha (re-matches #"[0-9a-f]{40}" sha)))
+        {:error (str "amu-head-unreadable path=" dir)}
+        (seq dirty)
+        {:error (str "amu-tree-dirty path=" dir " files=" (count (str/split-lines dirty)))}
+        :else {:sha sha :pins (amu-pins dir)}))))
+
+;; -------------------------------------------------------------- recipes ----
+
+(defn- source-text
+  "The exact bytes handed to the compiler. `:source-transform` is a vector of
+  [find replace] pairs applied in order -- the one mechanism by which a second
+  object may come from one reviewed source (ecdsa-p256-public renames the sign
+  entry out of the export allow-list so the public-point entry is the only
+  exported one). Each `find` must occur, or this is a could-not-run: a
+  transform that silently matched nothing would compile the WRONG object and
+  report it as reproduced."
+  [receipt src-path]
+  (let [text (.readFileSync fs src-path "utf8")]
+    (reduce (fn [t [find replace]]
+              (if (str/includes? t find)
+                (str/replace t find replace)
+                (reduced {:error (str "source-transform-no-match find=" (pr-str find))})))
+            text
+            (:source-transform receipt))))
+
+(defn- write-manifest! [p old objects amu-sha pins]
+  (.writeFileSync
+   fs p
+   (str ";; GENERATED by os/aiueos/scripts/reproduce-kotoba-objects.cljk --attest\n"
+        ";; Do not hand-edit. Every receipt here was written by compiling the\n"
+        ";; named source with the named amu revision and hashing what came out --\n"
+        ";; not by asserting a pin. `kbb --backend sci os/aiueos/scripts/reproduce-kotoba-objects.cljk\n"
+        ";; --amu <checkout>` recompiles them all and compares the bytes.\n"
+        ";;\n"
+        ";; :verification says what was checked BEYOND the bytes:\n"
+        ";;   :contract-vectors     a verify-admissions contract covers this object\n"
+        ";;   :qemu                 the object was executed on a CPU under QEMU\n"
+        ";;   :attested-unverified  produced and hashed, but nothing exercises it\n"
+        ";;                         (the reason is in :verification-note)\n"
+        ;; MERGE into the receipts already recorded; never replace them. With
+        ;; `--objects a,b` the run only attested a and b, and writing `objects`
+        ;; alone dropped the other 98 receipts from the manifest -- measured
+        ;; 2026-09-11, the first `--attest --objects` ever run: the file came
+        ;; back with 2 objects, 91 recorded producers gone, and exit 0.
+        (let [merged (into (sorted-map) (merge (:objects old) objects))
+              unrecorded (->> merged
+                              (filter #(nil? (get-in (val %) [:compiler :sha])))
+                              (mapv key))]
+          (pr-str (assoc old
+                         :objects merged
+                         :attested-with {:repo "kotoba-lang/amu" :sha amu-sha :pins pins}
+                         :recorded (- (count merged) (count unrecorded))
+                         :unrecorded unrecorded)))
+        "\n")
+   "utf8"))
+
+;; ----------------------------------------------------------------- main ----
+
+(defn- selected [entries]
+  (if-let [s (opt "--objects")]
+    (let [want (set (str/split s #","))]
+      (into (sorted-map) (filter #(contains? want (key %)) entries)))
+    (into (sorted-map) entries)))
+
+;; THREE digests, not two. The receipt CLAIMS one, the tree HOLDS one, and the
+;; compiler PRODUCES one, and each pair can disagree for its own reason:
+;;
+;;   receipt vs tree      the manifest describes bytes that are not here. The
+;;                        K16 gate calls this `object-sha256-mismatch` and the
+;;                        name is kept, because it is the same fact.
+;;   compiler vs tree     the recorded recipe no longer produces the committed
+;;                        object.
+;;
+;; Comparing only the last two is what this driver did until a red test asked
+;; it about a receipt whose `:object-sha256` had one hex digit changed: it
+;; recompiled, got the committed bytes, and reported MATCH. A manifest is the
+;; thing being checked here, so a claim it makes that nothing reads is a claim
+;; nothing can falsify.
+(defn- verdict-for [receipt available fresh-sha committed-sha]
+  (let [recorded (get-in receipt [:compiler :sha])
+        claimed (:object-sha256 receipt)]
+    (cond
+      (not= claimed committed-sha) :object-sha256-mismatch
+      (not= fresh-sha committed-sha) :differs
+      (nil? recorded) :unrecorded-producer
+      (= :recorded available) :match
+      (not= recorded available) :drift
+      :else :match)))
+
+(def ^:private state (atom {}))
+
+(defn- report! [rev entries attest? drift-ok? prov-path manifest]
+  (let [names (vec (keys entries))
+        rs (mapv #(get @state %) names)
+        by (frequencies (map :verdict rs))
+        differs (filterv #(contains? #{:differs :object-sha256-mismatch} (:verdict %)) rs)
+        errored (filterv :error rs)]
+    (doseq [r rs]
+      (println (str (case (:verdict r)
+                      :match "MATCH      "
+                      :drift "DRIFT      "
+                      :differs "DIFFERS    "
+                      :object-sha256-mismatch "RECEIPT-MISMATCH "
+                      :unrecorded-producer "UNRECORDED "
+                      "COULD-NOT-RUN ")
+                    (:object r)
+                    (when (:error r) (str " reason=" (:error r)))
+                    (when (= :object-sha256-mismatch (:verdict r))
+                      (str " receipt=" (subs (str (:object-sha256 (:receipt r))) 0 12)
+                           " tree=" (subs (:committed-sha r) 0 12)))
+                    (when (= :differs (:verdict r))
+                      (str " committed=" (subs (:committed-sha r) 0 12)
+                           "/" (:committed-bytes r) "B"
+                           " produced=" (subs (:fresh-sha r) 0 12)
+                           "/" (:fresh-bytes r) "B"))
+                    (when (= :drift (:verdict r))
+                      (str " recorded=" (subs (str (get-in r [:receipt :compiler :sha])) 0 12)
+                           " available=" (subs (:sha rev) 0 12)))
+                    (when (:detail r) (str "\n              " (:detail r))))))
+    (println (str "SCANNED\t" (count rs)))
+    (println (str "REPRODUCE amu=" (:sha rev)
+                  " scanned=" (count rs)
+                  " match=" (get by :match 0)
+                  " drift=" (get by :drift 0)
+                  " differs=" (get by :differs 0)
+                  " receipt-mismatch=" (get by :object-sha256-mismatch 0)
+                  " unrecorded=" (get by :unrecorded-producer 0)
+                  " could-not-run=" (count errored)))
+    (when (and attest? (empty? errored))
+      (let [ok (filterv #(not (:error %)) rs)
+            rewritten (filterv #(not= (:fresh-sha %) (:committed-sha %)) ok)]
+        (doseq [r rewritten]
+          (.copyFileSync fs (:fresh-path r) (path/join kotoba-dir (:object r))))
+        (write-manifest!
+         prov-path manifest
+         (into (sorted-map)
+               (for [r ok]
+                 [(:object r)
+                  (-> (:receipt r)
+                      ;; `:verification` is not carried across a rebuild. It is
+                      ;; a claim about bytes, and these are new bytes; the
+                      ;; provenance generator recomputes it from what is on
+                      ;; disk after this runs.
+                      (dissoc :verification :verification-note)
+                      (assoc :object-sha256 (:fresh-sha r)
+                             :source-sha256 (sha256-file
+                                             (path/resolve root (:source (:receipt r))))
+                             :compiler (cond-> {:repo "kotoba-lang/amu" :sha (:sha rev)}
+                                         (seq (:pins rev)) (assoc :pins (:pins rev)))))]))
+         (:sha rev) (:pins rev))
+        (println (str "ATTESTED objects=" (count ok) " rewritten=" (count rewritten)))))
+    (.exit js/process
+           (cond (seq errored) 2
+                 (and (seq differs) (not attest?)) 3
+                 (and (not attest?) (not drift-ok?)
+                      (pos? (+ (get by :drift 0) (get by :unrecorded-producer 0)))) 3
+                 :else 0))))
+
+(defn -main []
+  (let [git-resolve? (flag? "--git-resolve")
+        amu-dir (when-let [d (opt "--amu")] (path/resolve d))
+        _ (when-not (or amu-dir git-resolve?)
+            (die! 2 "COULD-NOT-RUN reason=amu-not-given (pass --amu <dir> or --git-resolve)"))
+        rev (if git-resolve? {:sha :recorded :pins {}} (amu-revision amu-dir))
+        _ (when (:error rev) (die! 2 (str "COULD-NOT-RUN reason=" (:error rev))))
+        prov-path (path/resolve (or (opt "--provenance")
+                                    (path/join kotoba-dir "provenance.edn")))
+        manifest (read-edn prov-path)
+        _ (when (or (= ::unreadable manifest) (not (map? manifest)))
+            (die! 2 (str "COULD-NOT-RUN reason=provenance-unreadable path=" prov-path)))
+        entries (selected (:objects manifest))
+        _ (when (empty? entries)
+            (die! 2 "COULD-NOT-RUN reason=no-objects-selected"))
+        attest? (flag? "--attest")
+        drift-ok? (flag? "--allow-drift")
+        jobs (max 1 (js/parseInt (or (opt "--jobs") "4") 10))
+        keep-dir (when-let [d (opt "--keep")] (path/resolve d))
+        work-dir (or keep-dir
+                     (.mkdtempSync fs (path/join (.tmpdir os) "aiueos-reproduce-")))
+        names (vec (keys entries))
+        queue (atom names)
+        pending (atom (count names))
+        done! (fn [object r]
+                (swap! state assoc object (merge {:object object
+                                                  :receipt (get entries object)} r))
+                (swap! pending dec))]
+    (when keep-dir (.mkdirSync fs keep-dir #js {:recursive true}))
+    (println (str "AMU sha=" (:sha rev)))
+    (doseq [[k v] (:pins rev)] (println (str "  pin " (name k) "=" v)))
+    (println (str "SCANNING\t" (count entries) " jobs=" jobs))
+    (letfn
+        [(next! []
+           (if-let [object (first @queue)]
+             (do (swap! queue rest) (start! object))
+             (when (zero? @pending)
+               (report! rev entries attest? drift-ok? prov-path manifest))))
+         (finish! [object r]
+           (done! object r)
+           (if (seq @queue)
+             (next!)
+             (when (zero? @pending)
+               (report! rev entries attest? drift-ok? prov-path manifest))))
+         (start! [object]
+           (let [receipt (get entries object)
+                 src-path (path/resolve root (:source receipt))
+                 committed (path/join kotoba-dir object)
+                 out-path (path/join work-dir object)]
+             (cond
+               (not (.existsSync fs src-path))
+               (finish! object {:error (str "source-absent path=" (:source receipt))})
+
+               (not (.existsSync fs committed))
+               (finish! object {:error (str "committed-object-absent object=" object)})
+
+               ;; Nothing to resolve. Reported as its own verdict, never as a
+               ;; compile that happened to agree.
+               (and git-resolve? (not (get-in receipt [:compiler :sha])))
+               (finish! object {:verdict :unrecorded-producer
+                                :committed-sha (sha256-file committed)})
+
+               (and (not drift-ok?) (not attest?) (not git-resolve?)
+                    (get-in receipt [:compiler :sha])
+                    (not= (get-in receipt [:compiler :sha]) (:sha rev)))
+               (finish! object {:verdict :drift :committed-sha (sha256-file committed)})
+
+               :else
+               (let [text (source-text receipt src-path)]
+                 (if (map? text)
+                   (finish! object text)
+                   (let [project? (= :project (:route receipt))
+                         transformed? (seq (:source-transform receipt))
+                         in-path (if transformed?
+                                   (path/join (if project? kotoba-dir work-dir)
+                                              (str ".reproduce-" object ".kotoba"))
+                                   src-path)
+                         _ (when transformed? (.writeFileSync fs in-path text "utf8"))
+;; `--git-resolve` compiles at the revision THIS receipt records, resolved
+                         ;; straight from git by tools.deps. It is the only mode in which the
+                         ;; driver cannot quietly answer about a different compiler than the one
+                         ;; the manifest names -- and it is how the retired recipes' pin becomes
+                         ;; checkable without anyone having that checkout on disk. It costs a JVM
+                         ;; per object, which is the price of asking the exact question.
+                         recorded (get-in receipt [:compiler :sha])
+                         a (cond-> (if git-resolve?
+                                     ["-Sdeps" (str "{:deps {io.github.kotoba-lang/amu "
+                                                    "{:git/url \"https://github.com/kotoba-lang/amu.git\" "
+                                                    ":git/sha \"" recorded "\"}}}")
+                                      "-M" "-m" "kotoba.compiler.cli"
+                                      "compile" in-path "--target" target "--output" out-path]
+                                     ["compile" in-path "--target" target
+                                      "--output" out-path "--jvm-free"])
+                             project? (into ["--source-path" kotoba-dir
+                                             ;; the pure-native tree, for objects that
+                                             ;; require `native.*` modules (ADR-0220)
+                                             "--source-path" (path/join kotoba-dir "..")]))
+                         p (.spawn child (if git-resolve? "clojure" (path/join amu-dir "bin" "amu"))
+                                   (clj->js a)
+                                   #js {:cwd (if git-resolve? root amu-dir)
+                                        :stdio #js ["ignore" "pipe" "pipe"]})
+                         tail (atom "")]
+                     (.on (.-stdout p) "data" #(swap! tail (fn [t] (str t %))))
+                     (.on (.-stderr p) "data" #(swap! tail (fn [t] (str t %))))
+                     (.on p "close"
+                          (fn [status]
+                            (when (and transformed? (.existsSync fs in-path))
+                              (.unlinkSync fs in-path))
+                            (cond
+                              (not= 0 status)
+                              (finish! object {:error (str "compile-failed status=" status)
+                                               :detail (str/trim (apply str (take-last 300 @tail)))})
+                              (not (.existsSync fs out-path))
+                              (finish! object {:error "compile-produced-no-object"})
+                              :else
+                              (let [fresh (sha256-file out-path)
+                                    comm (sha256-file committed)]
+                                (finish! object
+                                         {:verdict (verdict-for receipt (:sha rev) fresh comm)
+                                          :fresh-sha fresh :committed-sha comm
+                                          :fresh-path out-path
+                                          :fresh-bytes (.-size (.statSync fs out-path))
+                                          :committed-bytes (.-size (.statSync fs committed))})))))))))))]
+      (dotimes [_ (min jobs (count names))] (next!)))))
+
+(-main)

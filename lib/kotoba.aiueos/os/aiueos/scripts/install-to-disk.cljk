@@ -1,0 +1,335 @@
+#!/usr/bin/env kbb
+;; Orchestrate one guarded aiueos internal-disk install (install-v1.edn, root
+;; ADR adr-2608251418).
+;;
+;;   inspect: kbb --backend sci os/aiueos/scripts/install-to-disk.cljk \
+;;              --intent install-intent.json --device /dev/nvme0n1 \
+;;              --image aiueos-x86_64-gpt.img --receipt build-receipt.json
+;;   install: same + --install --confirm-device /dev/nvme0n1 \
+;;              --destructive-phrase 'ERASE /dev/nvme0n1 FOR AIUEOS'
+;;
+;; The pieces this composes each keep their own authority: install.mjs (a
+;; ported, scope-frozen legacy asset) owns device inspection, admission,
+;; exclusive-open write and readback; install-intent.cljs owns the
+;; intent-vs-probe admission; this script owns the ORDER, the repeat-safety
+;; check, and the target receipt. It never opens the target for writing
+;; before both admissions have passed, and it never writes the receipt before
+;; install.mjs has proved the readback.
+;;
+;; Repeat safety (decision 6): before installing, the last MiB of the target
+;; is read. A valid install receipt there plus a valid AIUEOS GPT at LBA 1
+;; means this target already carries an install -- an unattended run then
+;; refuses with its own exit code (4) and names rescue/inspect, rather than
+;; erasing the machine again. The non-empty-target refusal inside install.mjs
+;; blocks the erase independently; the receipt is what makes the refusal
+;; DIAGNOSABLE as "existing install" instead of "some partitions".
+;;
+;; Exit codes: 0 admitted (inspect) or installed / 2 refused with reasons /
+;; 3 could-not-answer / 4 existing-install-found (rescue/inspect).
+
+(require '[kotoba.lang.text :as str])
+
+(def fs (js/require "node:fs"))
+(def path (js/require "node:path"))
+(def cp (js/require "node:child_process"))
+(def crypto (js/require "node:crypto"))
+(def os (js/require "node:os"))
+
+(def scripts-dir (.dirname path *file*))
+
+(defn- die [code & msg]
+  (binding [*out* *err*] (apply println (cons "error:" msg)))
+  (.exit js/process code))
+
+(def args (vec *command-line-args*))
+(defn- arg [flag]
+  (let [i (.indexOf (to-array args) flag)]
+    (when (>= i 0) (nth args (inc i) nil))))
+(defn- flag? [flag] (>= (.indexOf (to-array args) flag) 0))
+
+(def receipt-magic "AIUEOS-INSTALL-RECEIPT-V1")
+(def receipt-zone-bytes 4096)
+;; The provisioning record (ssh-v1.edn: host key + authorized key) sits in a
+;; reserved band immediately below the target receipt, in the target's last
+;; MiB and well outside the 64 MiB release extent. 16 KiB holds the record
+;; with margin. The host-key seed is a secret and lives ONLY here, on the
+;; target -- never on the install USB (secret floor).
+(def provision-magic "AIUEOS-PROVISION-V1")
+(def provision-zone-bytes 16384)
+;; Deterministic release-image disk GUID (make-release-image.py DISK_GUID),
+;; little-endian as stored at GPT header offset 56.
+(def release-disk-guid-le "d1b20bd7e33801529f66a46b55077905")
+
+(defn- sha256-hex [buf]
+  (-> (.createHash crypto "sha256") (.update buf) (.digest "hex")))
+
+;; -------------------------------------------------------------- target zone
+
+(defn- receipt-offset
+  "The receipt lives in the last MiB of the target, 4 KiB-aligned -- outside
+  any extent the release image writes, deterministic from the disk size alone
+  so a later run can find it without knowing which release was installed."
+  [disk-bytes]
+  (* (quot (- disk-bytes (* 1024 1024)) receipt-zone-bytes) receipt-zone-bytes))
+
+(defn- read-at
+  "Read LEN bytes at OFFSET of DEVICE, or nil when the device cannot be read
+  (no permission, too small). nil is 'unmeasured', never 'absent'."
+  [device offset len]
+  (try
+    (let [fd (.openSync fs device "r")
+          buf (js/Buffer.alloc len)]
+      (try
+        (let [got (.readSync fs fd buf 0 len offset)]
+          (when (pos? got) (.subarray buf 0 got)))
+        (finally (.closeSync fs fd))))
+    (catch :default _ nil)))
+
+(defn- parse-target-receipt [buf]
+  (when (and buf (.startsWith (.toString buf "utf8" 0 (count receipt-magic))
+                              receipt-magic))
+    (let [text (.toString buf "utf8")
+          start (inc (str/index-of text "\n"))
+          end (str/index-of text "\n" start)
+          json (subs text start (or end (count text)))]
+      (try (js->clj (.parse js/JSON json) :keywordize-keys true)
+           (catch :default _ nil)))))
+
+(defn- aiueos-gpt? [device]
+  (when-let [header (read-at device 512 512)]
+    (and (= "EFI PART" (.toString header "utf8" 0 8))
+         (= release-disk-guid-le (.toString (.subarray header 56 72) "hex")))))
+
+(defn- existing-install
+  "{:receipt ... :gpt bool} when the target carries evidence of a completed
+  aiueos install; nil when it provably does not; :unmeasured when the device
+  could not be read at all."
+  [device disk-bytes]
+  (let [zone (read-at device (receipt-offset disk-bytes) receipt-zone-bytes)
+        header (read-at device 512 8)]
+    (cond
+      (and (nil? zone) (nil? header)) :unmeasured
+      :else (let [receipt (parse-target-receipt zone)
+                  gpt (aiueos-gpt? device)]
+              (when (and receipt gpt) {:receipt receipt :gpt true})))))
+
+(defn- write-target-receipt!
+  "Write the 4 KiB receipt block into the last MiB of DEVICE and read it
+  back. Runs only after install.mjs proved the image readback."
+  [device disk-bytes intent-sha image-sha hostname provision-sha]
+  (let [offset (receipt-offset disk-bytes)
+        payload {:schema "aiueos.install-target-receipt.v1"
+                 :intentSha256 intent-sha
+                 :imageSha256 image-sha
+                 :provisionSha256 provision-sha
+                 :hostname hostname
+                 :installedAt (.toISOString (js/Date.))}
+        json (.stringify js/JSON (clj->js payload))
+        block (js/Buffer.alloc receipt-zone-bytes)]
+    (.write block (str receipt-magic "\n" json "\n") 0 "utf8")
+    (let [fd (.openSync fs device "r+")]
+      (try
+        (.writeSync fs fd block 0 receipt-zone-bytes offset)
+        (.fsyncSync fs fd)
+        (finally (.closeSync fs fd))))
+    (let [readback (read-at device offset receipt-zone-bytes)]
+      (when-not (and readback (= (sha256-hex readback) (sha256-hex block)))
+        (die 3 "target receipt readback does not match; treat the install as"
+             "complete but the receipt as ABSENT, and do not re-run unattended"))
+      offset)))
+
+;; ------------------------------------------------------------- subprocesses
+
+(defn- run [cmd cmd-args]
+  (let [r (.spawnSync cp cmd (to-array cmd-args)
+                      #js {:encoding "utf8" :shell false
+                           :env (.-env js/process)})]
+    {:status (or (.-status r) 1) :out (or (.-stdout r) "") :err (or (.-stderr r) "")}))
+
+(defn- provision-offset [disk-bytes]
+  (- (receipt-offset disk-bytes) provision-zone-bytes))
+
+(defn- write-provision!
+  "Generate the per-device provisioning record on the target at install time
+  and write it into the provision zone, read back. The record's host-key seed
+  is generated here, on the machine being installed -- it never travels on the
+  USB. Returns {:offset :sha256 :host-fp :authorized-fp}."
+  [device disk-bytes intent-path record-script account-record]
+  (let [tmp (.join path (.tmpdir os) (str "aiueos-provision-" (.-pid js/process) ".json"))
+        {:keys [status out err]}
+        (run "nbb" (concat [record-script "--intent" intent-path "--out" tmp]
+                           (when account-record ["--account-record" account-record])))]
+    (when-not (zero? status)
+      (die 3 "provision record generation failed:" (str/trim err)))
+    (let [record-bytes (.readFileSync fs tmp)
+          record (js->clj (.parse js/JSON (.toString record-bytes "utf8")) :keywordize-keys true)
+          header (str provision-magic "\n")
+          block (js/Buffer.alloc provision-zone-bytes)]
+      (.rmSync fs tmp)
+      (when (> (+ (count header) (.-length record-bytes) 1) provision-zone-bytes)
+        (die 3 "provision record exceeds the" provision-zone-bytes "byte zone"))
+      (.write block header 0 "utf8")
+      (.copy record-bytes block (count header))
+      (.write block "\n" (+ (count header) (.-length record-bytes)) "utf8")
+      (let [offset (provision-offset disk-bytes)
+            fd (.openSync fs device "r+")]
+        (try
+          (.writeSync fs fd block 0 provision-zone-bytes offset)
+          (.fsyncSync fs fd)
+          (finally (.closeSync fs fd)))
+        (let [readback (read-at device offset provision-zone-bytes)]
+          (when-not (and readback (= (sha256-hex readback) (sha256-hex block)))
+            (die 3 "provision record readback does not match; the target has no"
+                 "usable SSH identity, so headless boot cannot come up"))
+          {:offset offset :sha256 (sha256-hex block)
+           :account-did (get-in record [:account :accountDid])
+           :host-fp (get-in record [:sshHostKey :fingerprint])
+           :authorized-fp (get-in record [:authorizedKeys 0 :fingerprint])})))))
+
+
+(defn- parse-report
+  "install.mjs prints its JSON report and, on an allowed dry run, trailing
+  human lines after it -- so parse the brace-delimited slice, not the whole
+  stream."
+  [stdout]
+  (let [start (str/index-of stdout "{")
+        end (str/last-index-of stdout "}")]
+    (when (and start end (< start end))
+      (try (js->clj (.parse js/JSON (subs stdout start (inc end)))
+                    :keywordize-keys true)
+           (catch :default _ nil)))))
+
+(def install-mjs
+  ;; Repo layout keeps install.mjs in ../installer/; the live-USB bundle
+  ;; (make-install-usb-image.py) is flat, with everything beside this script.
+  (let [repo-form (.join path scripts-dir ".." "installer" "install.mjs")
+        flat-form (.join path scripts-dir "install.mjs")]
+    (cond (.existsSync fs repo-form) repo-form
+          (.existsSync fs flat-form) flat-form
+          :else (die 3 "install.mjs not found beside or above" scripts-dir))))
+
+(def provision-script
+  (let [repo-form (.join path scripts-dir "make-provision-record.cljk")
+        flat-form (.join path scripts-dir "make-provision-record.cljk")]
+    (cond (.existsSync fs repo-form) repo-form
+          (.existsSync fs flat-form) flat-form
+          :else (die 3 "make-provision-record.cljk not found beside" scripts-dir))))
+
+(defn- installer-args [& extra]
+  (let [base ["--device" (arg "--device")
+              "--image" (arg "--image")
+              "--receipt" (arg "--receipt")]
+        fake (arg "--fake-device-config")]
+    (concat [install-mjs]
+            base
+            (when fake ["--fake-device-config" fake])
+            extra)))
+
+;; --------------------------------------------------------------------- main
+
+(let [intent-path (or (arg "--intent") (die 3 "--intent is required"))
+      device (or (arg "--device") (die 3 "--device is required"))
+      _ (or (arg "--image") (die 3 "--image is required"))
+      _ (or (arg "--receipt") (die 3 "--receipt is required"))
+      install? (flag? "--install")
+      fake (arg "--fake-device-config")
+      intent (try (js->clj (.parse js/JSON (.readFileSync fs intent-path "utf8"))
+                          :keywordize-keys true)
+                  (catch :default e (die 3 "cannot read intent:" (.-message e))))
+      _ (when-not (= "aiueos.install-intent.v1" (:schema intent))
+          (die 3 "not an aiueos.install-intent.v1:" intent-path))
+      intent-sha (sha256-hex (.readFileSync fs intent-path))
+
+      ;; 1. inspect through the ported installer (never writes)
+      inspect (run "node" (installer-args))
+      _ (when (and (not (zero? (:status inspect))) (not= 2 (:status inspect)))
+          (die 3 "install.mjs inspection failed:" (str/trim (:err inspect))))
+      report (or (parse-report (:out inspect))
+                 (die 3 "install.mjs printed no parseable report"))
+
+      ;; the raw device node for zone reads; the fake backend's "device" is
+      ;; its declared outputPath once written, so zone I/O targets that file
+      zone-device (if fake
+                    (let [cfg (js->clj (.parse js/JSON (.readFileSync fs fake "utf8"))
+                                       :keywordize-keys true)]
+                      (:outputPath cfg))
+                    device)
+      disk-bytes (get-in report [:target :bytes])]
+
+  ;; 2. repeat safety, before any admission decision is even reported
+  (let [existing (when (and disk-bytes (or (not fake) (.existsSync fs zone-device)))
+                   (existing-install zone-device disk-bytes))]
+    (cond
+      (map? existing)
+      (do (println "AIUEOS_INSTALL_REFUSED existing-install"
+                   (str "installed-at=" (get-in existing [:receipt :installedAt]))
+                   (str "hostname=" (get-in existing [:receipt :hostname]))
+                   "next=rescue-inspect")
+          (.exit js/process 4))
+      (and (= :unmeasured existing) install?)
+      (die 3 "cannot read the target to rule out an existing install;"
+           "refusing to install unattended over an unmeasured disk")
+      :else nil))
+
+  ;; 3. intent admission against the live report
+  (let [tmp (.join path (.tmpdir os) (str "aiueos-inspect-" (.-pid js/process) ".json"))]
+    (.writeFileSync fs tmp (.stringify js/JSON (clj->js report)))
+    (let [verify (run "nbb" (concat [(.join path scripts-dir "install-intent.cljk")
+                                     "verify" "--intent" intent-path "--report" tmp]
+                                    (when-let [s (arg "--serial")] ["--serial" s])))]
+      (.rmSync fs tmp)
+      (println (str/trim-newline (:out verify)))
+      (when-not (zero? (:status verify))
+        (binding [*out* *err*] (println (str/trim-newline (:err verify))))
+        (.exit js/process (:status verify)))))
+
+  ;; 4. the installer's own admission
+  (when-not (:allowed report)
+    (doseq [r (:reasons report)]
+      (println "AIUEOS_INSTALL_REFUSED" r))
+    (.exit js/process 2))
+
+  (if-not install?
+    (println "AIUEOS_INSTALL_ADMIT dry-run"
+             (str "device=" (get-in report [:target :path]))
+             (str "intent-sha256=" intent-sha)
+             "nothing was written")
+    ;; 5. guarded write + readback inside install.mjs, then the target receipt
+    (let [confirm (or (arg "--confirm-device")
+                      (die 3 "--install requires --confirm-device"))
+          phrase (or (arg "--destructive-phrase")
+                     (die 3 "--install requires --destructive-phrase"))
+          result (run "node" (installer-args
+                              "--install" "--confirm-device" confirm
+                              "--destructive-phrase" phrase))]
+      (when-not (zero? (:status result))
+        (binding [*out* *err*] (print (:err result)))
+        (die (if (= 2 (:status result)) 2 3)
+             "install.mjs refused or failed; nothing valid is on the target"))
+      (let [installed (or (parse-report (:out result))
+                          (die 3 "install.mjs printed no parseable install report"))
+            image-sha (get-in installed [:readback :sha256])
+            ;; provisioning comes AFTER the image write proves its readback and
+            ;; BEFORE the target receipt: the receipt binds the provision
+            ;; digest, so a target with a receipt always has a matching SSH
+            ;; identity beside it.
+            account-record (arg "--account-record")
+            prov (write-provision! zone-device disk-bytes intent-path provision-script
+                                   account-record)
+            ;; the account record holds the device's private keys; its only
+            ;; durable home is the provision zone just written and read back
+            _ (when account-record (.rmSync fs account-record #js {:force true}))
+            offset (write-target-receipt! zone-device disk-bytes intent-sha
+                                          image-sha (:hostname intent) (:sha256 prov))]
+        (println "AIUEOS_PROVISION_OK"
+                 (str "offset=" (:offset prov))
+                 (str "host-key=" (:host-fp prov))
+                 (str "authorized=" (:authorized-fp prov))
+                 (str "account=" (or (:account-did prov) "none")))
+        (println "AIUEOS_INSTALL_OK"
+                 (str "device=" (get-in report [:target :path]))
+                 (str "image-sha256=" image-sha)
+                 (str "intent-sha256=" intent-sha)
+                 (str "receipt-offset=" offset)
+                 (str "provision-sha256=" (:sha256 prov))
+                 "next=poweroff-remove-usb")))))

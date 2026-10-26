@@ -1,0 +1,131 @@
+(ns aiueos.reproducibility-test
+  (:require [grant.deployment-profile :as profile]
+            [aiueos.reproducibility :as repro]
+            [aiueos.sbom :as sbom]
+            [aiueos.tcb :as tcb]
+            [kotoba.test :refer [deftest is]]))
+
+(def artifact-digest (str "sha256:" (apply str (repeat 64 "a"))))
+(def other-digest (str "sha256:" (apply str (repeat 64 "c"))))
+(def source-commit (apply str (repeat 40 "b")))
+
+(defn- claimed
+  "A build that truthfully claims a fresh, hermetic clone and reproduced the
+  same artifact twice."
+  [& {:as overrides}]
+  (repro/qualify (merge {:source-commit source-commit
+                         :first-artifact-digest artifact-digest
+                         :second-artifact-digest artifact-digest
+                         :fresh-clone? true
+                         :hermetic? true}
+                        overrides)))
+
+;; --- derived, not asserted -------------------------------------------------
+
+(deftest dependency-transparency-is-measured-against-the-resolved-checkout
+  (let [deps (repro/dependencies)]
+    (is (seq deps) "the inventory's git dependencies are the dependency list")
+    (is (every? #(= :passed (:dependency/exact-fetch %)) deps)
+        "this JVM is running on the pinned commits' checkouts")
+    (is (every? #(re-matches #"[0-9a-f]{40}" (:dependency/commit %)) deps))))
+
+(deftest a-classpath-that-is-not-the-pinned-commit-is-reported-not-assumed
+  ;; What a `:local/root` override looks like from here: the pinned commit's
+  ;; checkout is not what serves the classpath. The check cannot be satisfied by
+  ;; a declaration, because the declaration is what it disbelieves.
+  (let [inventory (update (tcb/read-inventory) :tcb/external
+                          (fn [entries]
+                            (mapv #(cond-> % (= :git (:source %))
+                                           (assoc :git-sha (apply str (repeat 40 "e"))))
+                                  entries)))
+        evidence (repro/evidence {:inventory inventory
+                                  :source-commit source-commit
+                                  :first-artifact-digest artifact-digest
+                                  :second-artifact-digest artifact-digest})]
+    (is (true? (:local-overrides? evidence)))
+    (is (every? #(= :unresolved (:dependency/exact-fetch %)) (:dependencies evidence)))))
+
+(deftest a-real-override-fails-the-shared-evaluator
+  (let [inventory (update (tcb/read-inventory) :tcb/external
+                          (fn [entries]
+                            (mapv #(cond-> % (= :git (:source %))
+                                           (assoc :git-sha (apply str (repeat 40 "e"))))
+                                  entries)))
+        result (claimed :inventory inventory)
+        violations (set (:reproducibility/violations result))]
+    (is (false? (:reproducibility/qualified? result)))
+    (is (contains? violations :local-overrides))
+    (is (contains? violations :dependency-transparency))))
+
+;; --- fail-closed -----------------------------------------------------------
+
+(deftest an-unclaimed-environment-is-not-quietly-claimed-reproducible
+  (let [result (repro/qualify {:source-commit source-commit
+                               :first-artifact-digest artifact-digest
+                               :second-artifact-digest artifact-digest})
+        violations (set (:reproducibility/violations result))]
+    (is (false? (:reproducibility/qualified? result)))
+    (is (contains? violations :fresh-clone)
+        "omitting the assertion must not default to true")
+    (is (contains? violations :hermetic-build))))
+
+(deftest two-builds-that-disagree-are-refused
+  (let [result (claimed :second-artifact-digest other-digest)]
+    (is (false? (:reproducibility/qualified? result)))
+    (is (contains? (set (:reproducibility/violations result)) :artifact-reproducibility))))
+
+(deftest one-build-is-not-a-reproduction
+  (let [result (claimed :second-artifact-digest nil)]
+    (is (false? (:reproducibility/qualified? result)))
+    (is (contains? (set (:reproducibility/violations result)) :artifact-reproducibility))))
+
+;; --- the qualified case ----------------------------------------------------
+
+(deftest a-truthful-claim-on-this-tree-qualifies
+  (let [result (claimed)]
+    (is (true? (:reproducibility/qualified? result))
+        (pr-str (:reproducibility/violations result)))
+    (is (= artifact-digest (:reproducibility/artifact-digest result)))))
+
+;; --- the regulated profile -------------------------------------------------
+
+(defn- regulated-violations
+  "Only the reproducibility keys are under test here, so the rest of the
+  regulated evidence is absent and its violations are ignored -- the assertions
+  below name the keys they care about."
+  [attestations]
+  (set (profile/profile-violations
+        {:aiueos/deployment-profile :regulated
+         :aiueos/profile-evidence (assoc (:evidence attestations)
+                                         :profile/version profile/profile-version)})))
+
+(defn- built [& {:as overrides}]
+  (sbom/attestations (merge {:artifact-digest artifact-digest
+                             :source-commit source-commit
+                             :builder "github-actions/ubuntu-latest"
+                             :invocation {:command "lib/kotoba.aiueos/os/aiueos/scripts/build-release-image.sh"}
+                             :isolated-builder? true}
+                            overrides)))
+
+(deftest the-regulated-profile-refuses-a-release-with-no-reproduction
+  (let [violations (regulated-violations (built))]
+    (is (contains? violations :reproducibility-qualified?)
+        "the profile's own documentation has required this since it was written")
+    (is (contains? violations :reproducibility-artifact-digest))))
+
+(deftest the-regulated-profile-accepts-a-qualified-reproduction
+  (let [violations (regulated-violations
+                    (built :reproducibility (repro/profile-evidence (claimed))))]
+    (is (not (contains? violations :reproducibility-qualified?)))
+    (is (not (contains? violations :reproducibility-artifact-digest)))
+    (is (not (contains? violations :reproducibility-artifact-binding)))))
+
+(deftest reproducing-a-different-artifact-does-not-qualify-this-release
+  ;; A qualified reproduction of *something* must not satisfy a release of
+  ;; something else.
+  (let [elsewhere (repro/profile-evidence
+                   (claimed :first-artifact-digest other-digest
+                            :second-artifact-digest other-digest))
+        violations (regulated-violations (built :reproducibility elsewhere))]
+    (is (not (contains? violations :reproducibility-qualified?)))
+    (is (contains? violations :reproducibility-artifact-binding))))

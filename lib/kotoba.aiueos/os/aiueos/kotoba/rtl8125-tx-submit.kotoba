@@ -1,0 +1,83 @@
+(ns aiueos.rtl8125-tx-submit
+  (:require [aiueos.lib.rtl8125-regs :as reg])
+  (:export [aiueos-rtl8125-tx-submit main]))
+
+;; Hand one Ethernet frame to the transmit engine and ring the doorbell.
+;;
+;;   (aiueos-rtl8125-tx-submit mmio-base mmio-length tx-desc frame-physical
+;;                             frame-length)
+;;
+;; `aiueos_rtl8125_tx_submit` (kernel/rtl8125.c:259-274), unchanged in order and
+;; in the bits it writes.
+;;
+;; ZERO IS SUCCESS. Non-zero is `enum aiueos_rtl8125_result`:
+;;   1  AIUEOS_RTL8125_INVALID  arguments; nothing was read and nothing written
+;;   5  AIUEOS_RTL8125_TX_BUSY  the descriptor is still owned by the hardware
+;;
+;; TX_BUSY is not an error the caller retries blindly. `rtl8125_qualify_device`
+;; (kernel/pci.c:4084-4092) submits, then spins on `tx_complete` before the next
+;; submit; a TX_BUSY means the previous frame has not left, and with a
+;; one-descriptor ring there is nowhere for a second one to go.
+;;
+;; THE SEQUENCE, and every step of it is load-bearing:
+;;
+;;   lfence                          the C's `dma_acquire()` (:264)
+;;   read command                    is OWN still set?
+;;   write extension = 0             (:266)
+;;   write address                   (:267)
+;;   sfence                          the C's `dma_release()` (:268)
+;;   write command = OWN|EOR|SOF|EOF|length   (:269-270)
+;;   sfence                          the C's second `dma_release()` (:271)
+;;   write RGE_TXSTART = 1           (:272) the doorbell
+;;
+;; THE ACQUIRE FENCE COMES FIRST, BEFORE THE READ. That is what an acquire is:
+;; without it the OWN test may be answered from a value the core read before the
+;; hardware cleared the bit, and the object reports TX_BUSY for a descriptor
+;; that is free. On x86 the load fence is nearly free and the reordering it
+;; prevents is rare; it is written because the C wrote it and because the cost
+;; of finding out empirically which of these fences the machine needs is a
+;; frame lost every few thousand transmissions.
+;;
+;; THE SECOND STORE FENCE, between the command word and the doorbell, is the one
+;; that cannot be dropped. RGE_TXSTART is an MMIO write to the device telling it
+;; to look at the descriptor. If the descriptor's OWN bit is still sitting in a
+;; store buffer when the doorbell lands, the engine looks, sees a descriptor it
+;; does not own, and transmits nothing -- and the caller then spins in
+;; `tx_complete` until its budget runs out, reporting error 22 for a frame that
+;; was never sent.
+;;
+;; The command word is 0xf0000000 | length:
+;;   0x80000000 OWN   hand the descriptor to the engine
+;;   0x40000000 EOR   end of ring, one descriptor
+;;   0x20000000 SOF   start of frame
+;;   0x10000000 EOF   end of frame  -- one descriptor is the whole frame
+;;
+;; `frame_length` is bounded 14..2048 as the C bounds it: below 14 there is not
+;; even an Ethernet header, and above AIUEOS_RTL8125_FRAME_CAPACITY the length
+;; would run past the buffer `frame-physical` names. The hardware pads short
+;; frames to the 60-byte minimum itself, which is why 14 rather than 60.
+
+(defn aiueos-rtl8125-tx-submit [mmio-base mmio-length tx-desc frame-physical frame-length]
+  (if (or (= 0 (reg/mmio-ok mmio-base mmio-length))
+          (= 0 (reg/desc-ok tx-desc))
+          (<= frame-physical 0)
+          (< frame-length 14)
+          (> frame-length 2048))
+    1
+    (let [acquire (kernel-fence-load)]
+      ;; RGE_DESC_OWN 0x80000000 = 2147483648, at offset 0 of a transmit
+      ;; descriptor.
+      (if (not (= 0 (bit-and (kernel-load-u32 tx-desc 32 0) 2147483648)))
+        5
+        (let [ext (kernel-store-u32 tx-desc 32 4 0)]
+          (let [addr (kernel-store-u64 tx-desc 32 8 frame-physical)]
+            (let [release1 (kernel-fence-store)]
+              ;; 0xf0000000 = OWN|EOR|SOF|EOF = 4026531840.
+              (let [cmd (kernel-store-u32 tx-desc 32 0
+                                          (bit-or 4026531840 frame-length))]
+                (let [release2 (kernel-fence-store)]
+                  ;; RGE_TXSTART 0x90 = 144, u16, value 1.
+                  (let [doorbell (kernel-store-u16-4k mmio-base mmio-length 144 1)]
+                    0))))))))))
+
+(defn main [] 0)

@@ -1,0 +1,513 @@
+(ns aiueos.cloud-live
+  "The gate that leaves this machine.
+
+  Everything else in this repository proves its cloud story against a loopback
+  server, which is the right place to prove a seam and the wrong place to learn
+  that a pin is stale or that an authority renamed a field. This runs the same
+  code against the real `kotobase.net`, `api.murakumo.cloud` and the endpoint
+  the model alias resolves onto, and prints what it measured.
+
+  ## An operator runs this, not the fleet
+
+  The murakumo fleet holds no credentials by invariant, and its nodes' egress is
+  not uniform -- measured across this workspace more than once, and the reason
+  `scripts/fleet-ci` is told to measure reachability rather than assume it. A
+  gate that needs an open path to three named hosts, and a token for one of
+  them, is an operator's to run. It is therefore an alias, not a fleet gate.
+
+  ## Three exit codes, because there are three answers
+
+  - **0** every leg that was attempted was admitted;
+  - **1** a leg was refused -- a pin did not match, a digest did not match, an
+    endpoint was outside the allowlist. Something is wrong;
+  - **3** a leg could not be answered -- no network, no route, nothing to ask.
+    Nothing is known to be wrong and nothing was established either.
+
+  Root ADR-2608136000 is explicit that a check which could not run must never
+  return the value of a check that ran and found nothing wrong. The usual way
+  that rule gets broken is not by lying, it is by having only two exit codes and
+  rounding. So the receipt prints the word UNMEASURED next to the leg and the
+  reason it could not answer, and `exit-code` prefers 1 over 3 over 0: a real
+  refusal is never hidden behind a leg that was skipped.
+
+  A refusal by the authority is a refusal: a 401 exits 1, whether or not this
+  machine had a credential to send. That is not a judgement about the operator's
+  environment, it is the gate saying the machine could not do the thing it is
+  configured to do -- and the receipt carries `:credential :absent` so the
+  reason is legible rather than mysterious.
+
+  ## Why the split down the middle
+
+  The decision rule -- what counts as admitted, refused or unanswerable, and
+  which exit code follows -- is portable and sits in the open. The gate itself
+  is sockets, TLS and a process exit code, and is behind `#?(:clj …)`. That is
+  not tidiness: a rule that can only be exercised by running it against the
+  internet is a rule nothing checks, and the exit code is the whole product.
+
+  ## A credential is attached, never required
+
+  If the environment carries the token the policy names, it goes on the request.
+  If it does not, the request is made anyway and whatever the authority answers
+  is judged. Requiring one would make the inference leg unfalsifiable on the
+  endpoint that does not need one.
+
+  ## What it never prints
+
+  A credential. The environment variable's *name* appears in the receipt, so a
+  reader knows which one to set; the value reaches a request header and nothing
+  else."
+  (:require [kotoba.bytes :as kbytes] [kotoba.security.information-flow :as sec-info-flow]
+            [grant.cloud :as cloud]
+            [kotoba.lang.text :as str]
+            #?@(:clj [[aiueos.provider.cloud :as provider]
+                      [clojure.edn :as edn]
+                      [kotoba.io :as io]
+                      [clojure.pprint :as pprint]]))
+  #?(:clj (:import [java.net URI]
+                   [java.security.cert CertificateException X509Certificate]
+                   [java.time Instant]
+                   [java.util Collections]
+                   [javax.net.ssl SNIHostName SSLContext SSLSocket TrustManager
+                                  X509TrustManager])))
+
+(def default-policy-resource "aiueos/cloud_live.edn")
+
+;; ── classifying a verdict, purely ──────────────────────────────────────────
+
+(def ^:private unmeasured-faults
+  "Provider faults that mean the request could not complete. Everything else in
+  `aiueos.provider.cloud/errors` is a refusal wearing a fault's clothes: a
+  rejected pin surfaces as an I/O exception because that is what a failed
+  handshake is, and reporting it as \"could not answer\" would turn the single
+  most important negative this repository has into a shrug."
+  #{:request-failed})
+
+(defn outcome-of
+  "`:admitted`, `:refused` or `:unmeasured` for one verdict.
+
+  **The fault decides, when there is one.** A verdict can carry both a fault and
+  a deny reason, and they can disagree about which of the three this is: a
+  rejected pin fails the handshake, so the decision layer never sees a status
+  and says `:response-unmeasured`, while the provider knows perfectly well the
+  peer was refused. Reading the reason first turned the single most important
+  negative this repository has into \"could not answer\" -- measured 2026-08-22,
+  by breaking one hex digit of the inference host's pin and watching the gate
+  exit 3 instead of 1.
+
+  **Which refusals are unanswerable is `grant.cloud`'s to say**, not this
+  namespace's: it reads `grant.cloud/unmeasurable-reasons` rather than keeping
+  a list beside it. Two lists would have drifted the day
+  `:response-upstream-fault` was added -- and the way they drift is that the
+  gate keeps calling a 503 a refusal, which is the defect this reads for."
+  [verdict]
+  (let [fault (:aiueos.provider.cloud/error verdict)]
+    (cond
+      (cloud/allowed? verdict) :admitted
+      (some? fault) (if (contains? unmeasured-faults fault) :unmeasured :refused)
+      (contains? cloud/unmeasurable-reasons (:aiueos.cloud/reason verdict)) :unmeasured
+      :else :refused)))
+
+(defn negative-outcome-of
+  "The outcome of a leg whose *point* is that the authority refuses.
+
+  Admitted only when the refusal is the expected one. An allow here would mean
+  the CID this policy calls absent is not absent, and reporting that as a pass
+  would make the negative leg decoration -- the failure mode ADR-2608136000
+  calls a check that cannot go red."
+  [verdict expected-reason expected-status]
+  (let [outcome (outcome-of verdict)]
+    (cond
+      (= :unmeasured outcome) :unmeasured
+      (and (= :refused outcome)
+           (= expected-reason (:aiueos.cloud/reason verdict))
+           (= expected-status (:aiueos.cloud/status verdict)))
+      :admitted
+      :else :refused)))
+
+(defn anchor-summary
+  "What this policy will accept from whom, as data, at NOW-MS.
+
+  The receipt used to carry one number -- how many pins were declared -- which
+  said nothing about the question that turned out to matter: whether each key
+  is bound to the host it was measured from. A count of three is the same
+  number whether the policy names three hosts or names none.
+
+  Per host: how many pins are current, how many are retiring, and the state of
+  the rotation window (`:none`, `:open`, `:closed`, `:unevaluated`). An open
+  window is worth seeing on a green run, because it is the only warning that a
+  key is still working *because of a deadline* -- and deadlines pass."
+  [policy now-ms]
+  (let [{:keys [shape by-host pins malformed]} (cloud/anchor-bindings policy)
+        clocked (assoc policy :aiueos.cloud/now-ms now-ms)]
+    (cond-> {:shape shape :pins (count pins)}
+      (seq malformed) (assoc :malformed malformed)
+      (= :host-bound shape)
+      (assoc :hosts
+             (into (sorted-map)
+                   (map (fn [[host binding]]
+                          [host {:pins (count (:pins binding))
+                                 :retiring (count (:previous binding))
+                                 :usable-now (count (cloud/usable-pins clocked host))
+                                 :window (cond
+                                           (empty? (:previous binding)) :none
+                                           (nil? (:accept-previous-until-ms binding)) :unevaluated
+                                           (nil? now-ms) :unevaluated
+                                           (<= now-ms (:accept-previous-until-ms binding)) :open
+                                           :else :closed)}]))
+                   by-host)))))
+
+(defn exit-code
+  "1 if any leg was refused, else 3 if any could not be answered, else 0.
+
+  No legs at all is 3 rather than 0: a gate that ran nothing has not passed."
+  [legs]
+  (let [outcomes (set (map :outcome legs))]
+    (cond
+      (empty? legs) 3
+      (contains? outcomes :refused) 1
+      (contains? outcomes :unmeasured) 3
+      :else 0)))
+
+(defn leg-line
+  "One human line per leg. The word is the outcome, so ADMITTED, REFUSED and
+  UNMEASURED are distinguishable in the text a person actually reads and not
+  only in a key they have to look for."
+  [{:keys [leg outcome reason why measured fault]}]
+  (str "LEG "
+       (str/join (take 20 (concat (name leg) (repeat " "))))
+       (str/join (take 12 (concat (str/upper (name outcome)) (repeat " "))))
+       ;; The fault leads when there is one, for the same reason `outcome-of`
+       ;; prefers it: a refused pin arrives with the reason `:response-unmeasured`
+       ;; attached, and a line reading "REFUSED :response-unmeasured" would
+       ;; contradict its own first word.
+       (cond
+         fault (str fault (when (and reason (not= reason fault))
+                            (str " (decision " reason ")")))
+         reason (str reason)
+         why why
+         :else (pr-str (or measured {})))))
+
+(defn observations
+  "What the provider actually saw, with the nils dropped. Never headers."
+  [verdict extra]
+  (into (sorted-map)
+        (remove (comp nil? val))
+        (merge {:status (or (:aiueos.provider.cloud/status verdict)
+                            (:aiueos.cloud/status verdict))
+                :byte-count (:aiueos.provider.cloud/byte-count verdict)
+                :peer-spki (:aiueos.provider.cloud/peer-spki verdict)
+                ;; Whether the key that was accepted was accepted FOR THIS
+                ;; HOST. An unbound pin set is a real acceptance and a weaker
+                ;; one, and a receipt that did not say so would make the two
+                ;; look identical.
+                :anchor-binding (or (:aiueos.provider.cloud/peer-anchor-binding verdict)
+                                    (:aiueos.cloud/anchor-binding verdict))
+                :host (or (:aiueos.provider.cloud/peer-host verdict)
+                          (:aiueos.cloud/host verdict))
+                ;; Which other host's key this was, when that is what happened.
+                :pinned-for (:aiueos.cloud/pinned-for verdict)
+                ;; The key that was seen when it was not the key that was named.
+                ;; A refusal that will not say what it saw cannot be acted on --
+                ;; rotation and attack look identical without it.
+                :observed-spki (:aiueos.cloud/observed-spki verdict)
+                :digest (:aiueos.cloud/digest verdict)}
+               extra)))
+
+(defn verdict-leg
+  "One leg of a receipt: the outcome, what was observed, and -- when it is not
+  an allow -- the reason and any fault."
+  [leg verdict extra outcome]
+  (cond-> {:leg leg :outcome outcome :measured (observations verdict extra)}
+    (not= :admitted outcome) (assoc :reason (:aiueos.cloud/reason verdict))
+    (:aiueos.provider.cloud/error verdict)
+    (assoc :fault (:aiueos.provider.cloud/error verdict))
+    (:aiueos.provider.cloud/message verdict)
+    (assoc :fault-message (:aiueos.provider.cloud/message verdict))))
+
+;; ── the gate itself ────────────────────────────────────────────────────────
+;;
+;; Sockets, TLS, a policy file and a process exit code. One reader conditional
+;; around the lot rather than fifteen: the boundary is the point, and repeating
+;; it per function would bury it.
+
+#?(:clj
+   (do
+
+     (defn read-policy
+       "The live policy: a path if one is given, otherwise the resource. It is an
+  ordinary `grant.cloud` policy map with `:aiueos.cloud-live/*` keys added, so
+  the same map is handed to the decision layer unchanged."
+       ([] (read-policy nil))
+       ([path]
+        (if path
+          (edn/read-string (slurp path))
+          (some-> (io/resource default-policy-resource) slurp edn/read-string))))
+
+     ;; ── measuring a peer key, which is not trusting it ────────────────────
+
+     (defn- recording-trust-manager
+       "Records the leaf certificate and accepts the chain.
+
+  **This accepts any peer and is used by `pin` only.** It exists because a first
+  pin cannot be verified against a pin -- somebody has to look at a key before
+  anyone can decide to trust it. `check` never touches it: that path goes
+  through `aiueos.provider.cloud`, whose trust manager asks
+  `grant.cloud/admit-peer` and throws when the answer is no. The two live in
+  different namespaces so neither can be reached from the other by editing a
+  flag."
+       ^TrustManager [seen]
+       (reify X509TrustManager
+         (getAcceptedIssuers [_] (make-array X509Certificate 0))
+         (checkClientTrusted [_ _ _]
+           (throw (CertificateException. "aiueos is not a TLS server")))
+         (checkServerTrusted [_ chain _]
+           (reset! seen (first chain)))))
+
+     (defn measure-peer!
+       "Handshake with ORIGIN and report the leaf key's SPKI SHA-256. Sends no
+  request and judges nothing.
+
+  Returns `{:origin :host :spki-sha256 :measured-at}`, or `{:origin :error}`."
+       [origin]
+       (let [uri (URI/create (str origin))
+             host (.getHost uri)
+             port (if (pos? (.getPort uri)) (.getPort uri) 443)
+             seen (atom nil)]
+         (try
+           (let [ctx (doto (SSLContext/getInstance "TLS")
+                       (.init nil
+                              (into-array TrustManager [(recording-trust-manager seen)])
+                              nil))
+                 ^SSLSocket socket (.createSocket (.getSocketFactory ctx)
+                                                  ^String host (int port))]
+             (try
+               (.setSoTimeout socket 8000)
+               (let [params (.getSSLParameters socket)]
+                 (.setServerNames params (Collections/singletonList (SNIHostName. host)))
+                 (.setSSLParameters socket params))
+               (.startHandshake socket)
+               (if-let [leaf @seen]
+                 {:origin (str origin)
+                  :host host
+                  :spki-sha256 (provider/spki-sha256-hex leaf)
+                  :measured-at (str (Instant/now))}
+                 {:origin (str origin) :error :no-certificate})
+               (finally (.close socket))))
+           (catch Exception e
+             {:origin (str origin)
+              :error :handshake-failed
+              :exception (.getSimpleName (class e))
+              :message (.getMessage e)}))))
+
+     ;; ── the legs ──────────────────────────────────────────────────────────
+
+     (defn- credential
+       "`{:env <name> :headers {…}}` when the environment carries LEG's
+  credential, otherwise `{:env <name>}` with no headers. The value never leaves
+  this function except into a request."
+       [live leg]
+       (let [{:keys [env header prefix]} (get-in live [:aiueos.cloud-live/credentials leg])
+             value (when env (System/getenv env))]
+         (cond-> {:env env}
+           (not (str/blank? value)) (assoc :headers {header (str prefix value)}))))
+
+     (defn- resolve-leg [live]
+       (let [verdict (provider/resolve-model! live)
+             model (:aiueos.cloud/model verdict)]
+         [(verdict-leg :model-resolve verdict
+                       {:alias (:alias model)
+                        :alias-for (:alias-for model)
+                        :endpoint (:endpoint model)
+                        :endpoint-source (:aiueos.cloud/endpoint-source verdict)}
+                       (outcome-of verdict))
+          model]))
+
+     (defn- liveness-leg [live]
+       (let [verdict (provider/ready! live)]
+         (verdict-leg :inference-liveness verdict
+                      {:path (get live :aiueos.cloud/liveness-path "/ready")
+                       :live? (:aiueos.cloud/live? verdict)}
+                      (outcome-of verdict))))
+
+     (defn- read-leg [live]
+       (let [cid (:aiueos.cloud-live/read-cid live)
+             verdict (provider/read-block! live cid)]
+         (verdict-leg :storage-read verdict {:cid cid} (outcome-of verdict))))
+
+     (defn- absent-leg [live]
+       (let [cid (:aiueos.cloud-live/absent-cid live)
+             verdict (provider/read-block! live cid)]
+         (verdict-leg :storage-absent verdict
+                      {:cid cid
+                       :expected-reason :response-not-ok
+                       :expected-status 404
+                       :refusal-reason (:aiueos.cloud/reason verdict)}
+                      (negative-outcome-of verdict :response-not-ok 404))))
+
+     (defn- inference-leg
+       "The POST. Attempted whether or not a credential is present; a credential
+  is attached when the environment carries one.
+
+  This used to skip the request when no credential was set, on the reasoning
+  that a 401 obtained without one is not evidence about the mechanism. That was
+  wrong in a way worth recording, because it made the leg unfalsifiable: the
+  endpoint the alias actually resolves to answers **without** a credential
+  (measured 2026-08-22, `infer.murakumo.cloud` returns 200 with a completion),
+  so refusing to ask meant never finding out. A gate that declines to run the
+  one request it exists for reports the same UNMEASURED whether the authority
+  is healthy, broken, or gone.
+
+  So all three answers are now reachable and stay distinct: a 200 carrying a
+  completion is ADMITTED, a 401 or any other refusal by the authority is
+  REFUSED and takes the exit code with it, and a request that could not
+  complete is UNMEASURED. The receipt records whether a credential was sent, so
+  a 401 with `:credential :absent` reads as what it is."
+       [live model]
+       (let [{:keys [env headers]} (credential live :inference)]
+         (if (nil? model)
+           {:leg :inference :outcome :unmeasured
+            :why "the alias did not resolve, so there was no admitted endpoint to ask"}
+           (let [verdict (provider/infer! live model
+                                          {:messages (:aiueos.cloud-live/messages live)
+                                           :max-tokens (:aiueos.cloud-live/max-tokens live)}
+                                          (cond-> {}
+                                            headers (assoc :headers headers)
+                                            (:aiueos.cloud-live/inference-timeout-ms live)
+                                            (assoc :request-timeout-ms
+                                                   (:aiueos.cloud-live/inference-timeout-ms live))))]
+             (verdict-leg :inference verdict
+                          {:credential-env env
+                           :credential (if headers :present :absent)
+                           :response-shape (:aiueos.cloud/response-shape verdict)
+                           :completion-chars (:aiueos.cloud/completion-chars verdict)
+                           :stop-reason (:aiueos.cloud/stop-reason verdict)}
+                          (outcome-of verdict))))))
+
+     (defn with-clock
+       "POLICY with the wall clock stamped on it, once per run.
+
+  `grant.cloud` is pure and cannot read a clock, so a rotation window is
+  evaluated against `:aiueos.cloud/now-ms` or not at all -- and \"not at all\"
+  refuses the retiring key rather than admitting it. Stamping it here, once,
+  means every leg of one receipt judges the same instant: a run that straddled
+  a window's expiry would otherwise report two different answers about the same
+  policy and blame the authority for one of them."
+       [policy]
+       (assoc policy :aiueos.cloud/now-ms (System/currentTimeMillis)))
+
+     (defn run-check
+       "Every leg, in order, as data. No printing and no exit: the caller decides
+  what to do with a receipt."
+       [policy]
+       (let [live (with-clock policy)
+             [resolved model] (resolve-leg live)
+             legs [resolved
+                   (liveness-leg live)
+                   (inference-leg live model)
+                   (read-leg live)
+                   (absent-leg live)]]
+         {:aiueos.cloud-live/receipt 1
+          :measured-at (str (Instant/now))
+          ;; Which stack these bytes went through. A receipt that did not say
+          ;; would make two runs of the same gate indistinguishable, and the
+          ;; whole point of having two transports is comparing them.
+          :transport (provider/transport-of live)
+          :origins {:storage (:aiueos.cloud/storage-origin live)
+                    :inference (:aiueos.cloud/inference-origin live)}
+          :trust-anchors (anchor-summary live (:aiueos.cloud/now-ms live))
+          :legs legs
+          :exit (exit-code legs)}))
+
+     (defn run-write
+       "The write leg, on its own, because it is not part of `check`.
+
+  It needs an operator secret this machine does not hold, so including it in
+  `check` would pin that gate's exit code at 3 forever and make the code mean
+  \"the write is still blocked\" rather than \"something could not be
+  answered\"."
+       [policy]
+       (let [live (with-clock policy)
+             cid (:aiueos.cloud-live/write-cid live)
+             text (:aiueos.cloud-live/write-text live)
+             bytes (kbytes/utf8-bytes ^String (str text))
+             {:keys [env headers]} (credential live :write)
+             leg (if (nil? headers)
+                   {:leg :storage-write :outcome :unmeasured
+                    :why (str "no credential: " env " is unset")
+                    :measured {:cid cid :credential-env env :credential :absent}}
+                   (let [verdict (provider/write-block! live cid bytes {:headers headers})]
+                     (verdict-leg :storage-write verdict
+                                  {:cid cid :credential-env env :credential :present
+                                   :byte-count (alength bytes)}
+                                  (outcome-of verdict))))]
+         {:aiueos.cloud-live/receipt 1
+          :measured-at (str (Instant/now))
+          :transport (provider/transport-of live)
+          :trust-anchors (anchor-summary live (:aiueos.cloud/now-ms live))
+          :legs [leg]
+          :exit (exit-code [leg])}))
+
+     ;; ── the command line ──────────────────────────────────────────────────
+
+     (defn- print-receipt! [receipt]
+       (doseq [leg (:legs receipt)] (println (leg-line leg)))
+       (println)
+       (pprint/pprint receipt))
+
+     (defn- policy-arg [args]
+       (second (drop-while #(not= "--policy" %) args)))
+
+     (defn transport-arg
+       "`--transport jdk|own`, or nil. Kept portable-shaped and named rather than
+  parsed inline so the one test that can run without a network can assert that
+  an unknown word does not silently become the default -- which is the whole
+  hazard of a flag that selects which stack the bytes go through.
+
+  Returns `[:ok <keyword>]`, `[:ok nil]` when the flag is absent, or
+  `[:error <word>]`."
+       [args]
+       (if-let [word (second (drop-while #(not= "--transport" %) args))]
+         (let [k (keyword word)]
+           (if (contains? provider/transports k) [:ok k] [:error word]))
+         [:ok nil]))
+
+     (defn with-transport
+       "POLICY with the transport the command line named, if it named one.
+
+  The policy file's value stands when the flag is absent; the flag exists so
+  one operator can run the same gate both ways in one sitting and compare the
+  two receipts, which is the only way to find out that a transport works
+  against a real authority."
+       [policy transport]
+       (cond-> policy transport (assoc :aiueos.cloud/transport transport)))
+
+     (defn- run-pin! [origins]
+       (let [results (mapv measure-peer! origins)]
+         (println "MEASURED, NOT TRUSTED. These keys were observed; nothing here")
+         (println "decided to accept them. Putting one into a policy is a person's act.")
+         (println)
+         (pprint/pprint results)
+         (if (every? :spki-sha256 results) 0 3)))
+
+     (defn -main [& args]
+       (let [transport (transport-arg args)
+             code
+             (if (= :error (first transport))
+               ;; An unrecognised transport exits 3 and runs nothing. Falling
+               ;; back to the default would make `--transport onw` report a
+               ;; green run of the stack the operator was trying not to use.
+               (do (println "unknown --transport" (pr-str (second transport))
+                            "-- expected one of" (pr-str (sort (map name provider/transports))))
+                   3)
+               (let [live (with-transport (read-policy (policy-arg args)) (second transport))
+                     flags (cond-> #{"--policy" (policy-arg args) "--transport"}
+                             (second transport) (conj (name (second transport))))]
+                 (case (first args)
+                   "pin" (run-pin! (remove flags (rest args)))
+                   "write" (let [r (run-write live)] (print-receipt! r) (:exit r))
+                   ("check" nil) (let [r (run-check live)] (print-receipt! r) (:exit r))
+                   (do (println "usage: check | pin <origin>... | write"
+                                "  [--policy <file>] [--transport jdk|own]")
+                       3))))]
+         (flush)
+         (System/exit code)))))

@@ -1,0 +1,275 @@
+(ns aiueos.qwen35-norm
+  (:export [aiueos-qwen35-norm main]))
+
+;; The four normalisations of the Qwen3.5 forward pass: `rms_norm`,
+;; `l2_norm_heads`, `rms_norm_heads_weighted` and the output norm of
+;; `linear_attention` (`linear_output_norm_c`) in `kernel/qwen35_infer.c`.
+;;
+;; ## Modes
+;;
+;;   0  rms_norm                 a=input  b=weights  c=count  d=output
+;;   1  l2_norm_heads            a=values b=heads    c=width  d=0   (in place)
+;;   2  rms_norm_heads_weighted  a=values b=heads    c=width  d=weights
+;;   3  linear output norm       a=values b=heads    c=width  d=weights (in place)
+;;
+;; Four modes in one object rather than four objects because they are one
+;; page of arithmetic with one shared reduction, and each additional export is
+;; a row in kotoba-native's closed allowlist plus a fuel tier plus a contract.
+;;
+;; ## Return
+;;
+;; **Zero is the success value.**
+;;
+;;    0    done
+;;   -1    null a
+;;   -2    mode outside 0..3
+;;   -3    count / width outside 1..65536
+;;   -4    heads outside 1..4096, or heads * width above 262144
+;;   -5    a mode's second region is null
+;;   -6    mode 2: a value was already non-finite
+;;   -7    mode 2: the computed scale was non-finite
+;;   -8    mode 2: a scaled result was non-finite
+;;
+;; ## THE ACCUMULATOR IS f64 AND THE PRODUCT IS f32
+;;
+;; All three reduce `sum += (double)(v[i] * v[i])`: the SQUARE is computed in
+;; binary32 and then widened. Squaring in f64 would be more accurate and would
+;; disagree with the C on most inputs, so this object does exactly what the C
+;; does -- `f32-mul` then `f32-to-f64-exact` then `f64-add`.
+;;
+;; The two reductions then differ in where the narrowing happens, and this is
+;; not a detail either:
+;;
+;;   rms_norm        `(float)(sum / (double)count) + EPSILON`   divide, THEN cast
+;;   l2_norm_heads   `(float)sum + EPSILON`                     cast, THEN add
+;;
+;; ## Mode 2's second path
+;;
+;; `rms_norm_heads_weighted` has a fallback for a head whose squares overflow
+;; binary32: it rescales by the head's largest magnitude and folds EPSILON by
+;; the same factor. It is ported because it is in the C, not because it is
+;; expected to fire -- and if it were dropped, an input the C handles would
+;; come back as a refusal instead of a value.
+;;
+;; ## Mode 3 is mode 2 WITHOUT the refusals and the fallback
+;;
+;; `linear_attention`'s output norm (aiueos ADR-0222) is the same per-head
+;; weighted RMS, but its C has neither the finiteness refusals nor the rescaled
+;; path, and it does not skip a non-finite square -- `sum += (double)(v*v)`
+;; takes an infinity into the sum, the scale becomes 0 and the head comes out
+;; 0 or NaN. Mode 2 would refuse (-6) or rescale on those inputs, so it is not
+;; the same function; mode 3 is. On finite inputs whose squares stay finite
+;; the two agree bit for bit (the reduction and the product are the same
+;; operations in the same order).
+;;
+;; The gate `linear_attention` multiplies in afterwards is NOT here: the ABI
+;; has no sixth word for its address. The caller applies it with the
+;; activation object's mode 4 (`silu(g) * x`), which is the C's
+;; `x * silu(g)` because binary32 multiplication is commutative.
+
+(defn f32w [u]
+  (if (> u 2147483647) (- u 4294967296) u))
+
+(defn u32w [v]
+  (bit-and v 4294967295))
+
+(defn f32-at [base n4 i]
+  (f32w (kernel-load-u32 (kernel-subregion base n4 (* i 4) 4) 4 0)))
+
+;; `finite_float` (:96): the exponent field is not all ones.
+(defn nonfinite [bits]
+  (if (= (bit-and (u32w bits) 2139095040) 2139095040) 1 0))
+
+(defn any-nonfinite [base n4 i]
+  (if (>= i (quot n4 4))
+    0
+    (if (= 1 (nonfinite (f32-at base n4 i)))
+      1
+      (any-nonfinite base n4 (+ i 1)))))
+
+(defn any-nonfinite-square [base n4 i]
+  (if (>= i (quot n4 4))
+    0
+    (if (= 1 (nonfinite (f32-to-bits (f32-mul (f32-from-bits (f32-at base n4 i))
+                                              (f32-from-bits (f32-at base n4 i))))))
+      1
+      (any-nonfinite-square base n4 (+ i 1)))))
+
+;; The C's `sum`, which SKIPS a non-finite square rather than poisoning the
+;; accumulator (`if (!finite_float(square)) ordinary = 0; else sum += square;`).
+;; In the ordinary case nothing is skipped and this is the plain sum.
+(defn sumsq [base n4 i acc]
+  (if (>= i (quot n4 4))
+    acc
+    (sumsq base n4 (+ i 1)
+           (if (= 1 (nonfinite (f32-to-bits (f32-mul (f32-from-bits (f32-at base n4 i))
+                                                     (f32-from-bits (f32-at base n4 i))))))
+             acc
+             (f64-to-bits
+              (f64-add (f64-from-bits acc)
+                       (f32-to-f64-exact (f32-mul (f32-from-bits (f32-at base n4 i))
+                                                  (f32-from-bits (f32-at base n4 i))))))))))
+
+;; Mode 3's sum: every square goes in, a non-finite one included, as the C
+;; of `linear_attention` does.
+(defn sumsq-all [base n4 i acc]
+  (if (>= i (quot n4 4))
+    acc
+    (sumsq-all base n4 (+ i 1)
+               (f64-to-bits
+                (f64-add (f64-from-bits acc)
+                         (f32-to-f64-exact (f32-mul (f32-from-bits (f32-at base n4 i))
+                                                    (f32-from-bits (f32-at base n4 i)))))))))
+
+(defn maxabs [base n4 i acc]
+  (if (>= i (quot n4 4))
+    acc
+    (maxabs base n4 (+ i 1)
+            (if (f32-gt (f32-abs (f32-from-bits (f32-at base n4 i))) (f32-from-bits acc))
+              (f32-to-bits (f32-abs (f32-from-bits (f32-at base n4 i))))
+              acc))))
+
+(defn sumsq-scaled [base n4 i acc mx]
+  (if (>= i (quot n4 4))
+    acc
+    (sumsq-scaled base n4 (+ i 1)
+                  (f64-to-bits
+                   (f64-add (f64-from-bits acc)
+                            (f64-mul (f64-div (f32-to-f64-exact (f32-from-bits (f32-at base n4 i)))
+                                              (f32-to-f64-exact (f32-from-bits mx)))
+                                     (f64-div (f32-to-f64-exact (f32-from-bits (f32-at base n4 i)))
+                                              (f32-to-f64-exact (f32-from-bits mx))))))
+                  mx)))
+
+(defn copy-f32 [src dst n4 i]
+  (if (>= i (quot n4 4))
+    0
+    (do (kernel-store-u32 (kernel-subregion dst n4 (* i 4) 4) 4 0
+                          (kernel-load-u32 (kernel-subregion src n4 (* i 4) 4) 4 0))
+        (copy-f32 src dst n4 (+ i 1)))))
+
+(defn scale-mul [base n4 i scale]
+  (if (>= i (quot n4 4))
+    0
+    (do (kernel-store-u32
+         (kernel-subregion base n4 (* i 4) 4) 4 0
+         (u32w (f32-to-bits (f32-mul (f32-from-bits (f32-at base n4 i))
+                                     (f32-from-bits scale)))))
+        (scale-mul base n4 (+ i 1) scale))))
+
+;; `vector[index] * scale * weights[index]`, left to right as C evaluates it.
+(defn scale-mul-w [base n4 i scale w]
+  (if (>= i (quot n4 4))
+    0
+    (do (kernel-store-u32
+         (kernel-subregion base n4 (* i 4) 4) 4 0
+         (u32w (f32-to-bits (f32-mul (f32-mul (f32-from-bits (f32-at base n4 i))
+                                              (f32-from-bits scale))
+                                     (f32-from-bits (f32-at w n4 i))))))
+        (scale-mul-w base n4 (+ i 1) scale w))))
+
+;; Mode 2's version, which refuses a non-finite product the way the C does.
+(defn scale-mul-w-checked [base n4 i scale w]
+  (if (>= i (quot n4 4))
+    0
+    (do (kernel-store-u32
+         (kernel-subregion base n4 (* i 4) 4) 4 0
+         (u32w (f32-to-bits (f32-mul (f32-mul (f32-from-bits (f32-at base n4 i))
+                                              (f32-from-bits scale))
+                                     (f32-from-bits (f32-at w n4 i))))))
+        (if (= 1 (nonfinite (f32-at base n4 i)))
+          -8
+          (scale-mul-w-checked base n4 (+ i 1) scale w)))))
+
+;; `1.0f / local_sqrt((float)(sum / (double)count) + EPSILON)`
+(defn rms-scale [sum count]
+  (f32-to-bits
+   (f32-div (f32-from-bits 1065353216)
+            (f32-sqrt (f32-add (f64-to-f32-rounded (f64-div (f64-from-bits sum)
+                                                            (i64-to-f64-rounded count)))
+                               (f32-from-bits 897988541))))))
+
+;; `1.0f / local_sqrt((float)sum + EPSILON)` -- cast first, then add.
+(defn l2-scale [sum]
+  (f32-to-bits
+   (f32-div (f32-from-bits 1065353216)
+            (f32-sqrt (f32-add (f64-to-f32-rounded (f64-from-bits sum))
+                               (f32-from-bits 897988541))))))
+
+;; `(1.0f / maximum) / local_sqrt((float)(scaled_sum / width + epsilon_scaled))`
+(defn rmsw-fallback [base n4 mx width]
+  (f32-to-bits
+   (f32-div (f32-div (f32-from-bits 1065353216) (f32-from-bits mx))
+            (f32-sqrt
+             (f64-to-f32-rounded
+              (f64-add (f64-div (f64-from-bits (sumsq-scaled base n4 0 0 mx))
+                                (i64-to-f64-rounded width))
+                       (f64-div (f32-to-f64-exact (f32-from-bits 897988541))
+                                (f64-mul (f32-to-f64-exact (f32-from-bits mx))
+                                         (f32-to-f64-exact (f32-from-bits mx))))))))))
+
+(defn rmsw-one [base width w]
+  (if (= 1 (any-nonfinite base (* width 4) 0))
+    -6
+    (let [scale (if (= 1 (any-nonfinite-square base (* width 4) 0))
+                  (rmsw-fallback base (* width 4) (maxabs base (* width 4) 0 0) width)
+                  (rms-scale (sumsq base (* width 4) 0 0) width))]
+      (if (= 1 (nonfinite scale))
+        -7
+        (scale-mul-w-checked base (* width 4) 0 scale w)))))
+
+(defn rmsw-heads [a heads width w h]
+  (if (>= h heads)
+    0
+    (let [v (rmsw-one (kernel-subregion a (* heads (* width 4)) (* h (* width 4)) (* width 4))
+                      width w)]
+      (if (not (= v 0))
+        v
+        (rmsw-heads a heads width w (+ h 1))))))
+
+(defn rmsl-one [base width w]
+  (scale-mul-w base (* width 4) 0 (rms-scale (sumsq-all base (* width 4) 0 0) width) w))
+
+(defn rmsl-heads [a heads width w h]
+  (if (>= h heads)
+    0
+    (do (rmsl-one (kernel-subregion a (* heads (* width 4)) (* h (* width 4)) (* width 4))
+                  width w)
+        (rmsl-heads a heads width w (+ h 1)))))
+
+(defn l2-heads [a heads width h]
+  (if (>= h heads)
+    0
+    (do (scale-mul (kernel-subregion a (* heads (* width 4)) (* h (* width 4)) (* width 4))
+                   (* width 4) 0
+                   (l2-scale (sumsq (kernel-subregion a (* heads (* width 4))
+                                                      (* h (* width 4)) (* width 4))
+                                    (* width 4) 0 0)))
+        (l2-heads a heads width (+ h 1)))))
+
+;; `output[i] = input[i] * scale * weight[i]` as a copy then an in-place scale.
+;; The two are the same value: the copy makes `output[i]` equal `input[i]`
+;; before the multiply, and the multiply is the C's, left to right.
+(defn rms-norm [a b count d]
+  (do (copy-f32 a d (* count 4) 0)
+      (scale-mul-w d (* count 4) 0 (rms-scale (sumsq a (* count 4) 0 0) count) b)))
+
+(defn aiueos-qwen35-norm [mode a b c d]
+  (if (= a 0) -1
+    (if (< mode 0) -2
+      (if (> mode 3) -2
+        (if (< c 1) -3
+          (if (> c 65536) -3
+            (if (= mode 0)
+              (if (= b 0) -5 (if (= d 0) -5 (rms-norm a b c d)))
+              (if (< b 1) -4
+                (if (> b 4096) -4
+                  (if (> (* b c) 262144) -4
+                    (if (= mode 1)
+                      (l2-heads a b c 0)
+                      (if (= d 0) -5
+                        (if (= mode 2)
+                          (rmsw-heads a b c d 0)
+                          (rmsl-heads a b c d 0))))))))))))))
+
+(defn main [] 0)

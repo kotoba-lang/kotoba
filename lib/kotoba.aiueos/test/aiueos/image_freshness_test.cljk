@@ -1,0 +1,221 @@
+(ns aiueos.image-freshness-test
+  "The boot-freshness receipt, shown in both directions (ADR-0155).
+
+  What this namespace is defending is not a script: it is the meaning of every
+  acceptance string in the K16 programme. `NIC-PARITY ok`, `TLS-PARITY ok`,
+  `DEVCLIENT-PARITY canonical ok`, `DISRP`, `AIUEOS_DOT_F32_QEMU_OK`,
+  `AIUEOS_QWEN35_ADMISSION_OK`, `KHSTCUGLWOZ` -- each is a string read off a
+  serial log, and each is a claim about the tree only if something connects the
+  bytes QEMU opened to the build that produced them.
+
+  Every negative below pins the REASON LITERAL as well as the exit status,
+  because `REFUSED stale-image` (4) and `COULD-NOT-RUN` (3) are the two answers
+  that must never be confused with each other or with 0. A test that merely
+  asserted `(not= 0 exit)` would pass while the tool reported a missing receipt
+  as a stale image -- root ADR-2608136000's sixth question."
+  (:require [kotoba.io :as io]
+            [clojure.java.shell :as shell]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]))
+
+(def repo (System/getProperty "user.dir"))
+(def tool (str (io/file repo "os" "aiueos" "scripts" "image-freshness.cljk")))
+(def gate (str (io/file repo "os" "aiueos" "scripts" "verify-smoke-freshness.cljk")))
+
+(defn- on-path? [t]
+  (some (fn [d] (let [f (io/file d t)] (and (io/file? f) (io/can-execute? f))))
+        (str/split (or (System/getenv "PATH") "") #":")))
+
+(def nbb?
+  "`nbb` absent is NOT a pass. Every deftest asserts this first, so a machine
+  without it reports an unrun check rather than a clean one."
+  (on-path? "nbb"))
+
+(defn- run [& args]
+  (let [r (apply shell/sh "nbb" args)]
+    {:exit (:exit r) :out (str (:out r) (:err r))}))
+
+(defn- tmpdir []
+  (io/temp-dir "aiueos-freshness"))
+
+(defn- artifact! [dir name content]
+  (let [f (io/file dir name)]
+    (io/make-parents f)
+    (spit f content)
+    (str f)))
+
+;; --- the receipt itself ----------------------------------------------------
+
+(deftest records-and-agrees-with-itself
+  (is nbb? "nbb must be on PATH; without it this namespace measures nothing")
+  (when nbb?
+    (let [dir (tmpdir)
+          a (artifact! dir "BOOTX64.EFI" "MZ-one")
+          b (artifact! dir "KERNEL.ELF" "ELF-two")
+          receipt (str (io/file dir "image-receipt.edn"))
+          rec (run tool "record" "--out" receipt "--root" repo a b)]
+      (is (zero? (:exit rec)) (:out rec))
+      (is (str/includes? (:out rec) "IMAGE-RECEIPT artifacts=2"))
+      (testing "the evidence floor is printed, and it is not zero"
+        (is (str/includes? (:out rec) "SCANNED 2")))
+      (let [ok (run tool "assert" "--receipt" receipt "--root" repo a b)]
+        (is (zero? (:exit ok)) (:out ok))
+        (is (str/includes? (:out ok) "IMAGE-FRESH artifacts=2"))))))
+
+(deftest refuses-an-artifact-whose-bytes-moved
+  (is nbb?)
+  (when nbb?
+    (let [dir (tmpdir)
+          a (artifact! dir "BOOTX64.EFI" "MZ-one")
+          receipt (str (io/file dir "image-receipt.edn"))
+          _ (run tool "record" "--out" receipt "--root" repo a)
+          _ (spit a "MZ-one-but-different")
+          bad (run tool "assert" "--receipt" receipt "--root" repo a)]
+      (is (= 4 (:exit bad))
+          "a substituted artifact is exit 4, distinct from could-not-run")
+      (is (str/includes? (:out bad) "REFUSED stale-image"))
+      (is (str/includes? (:out bad) "expected=")
+          "the literal names both digests, so the reader can tell WHICH bytes")
+      (is (str/includes? (:out bad) "found=")))))
+
+(deftest refuses-an-artifact-that-vanished
+  (is nbb?)
+  (when nbb?
+    (let [dir (tmpdir)
+          a (artifact! dir "BOOTX64.EFI" "MZ-one")
+          receipt (str (io/file dir "image-receipt.edn"))
+          _ (run tool "record" "--out" receipt "--root" repo a)
+          _ (io/delete (io/file a))
+          bad (run tool "assert" "--receipt" receipt "--root" repo a)]
+      (is (= 4 (:exit bad)))
+      (is (str/includes? (:out bad) "found=absent")))))
+
+(deftest refuses-when-the-tree-moved-under-a-byte-identical-artifact
+  (testing "the comparison the boot-only harnesses depend on: the image is
+            untouched, but it was built from a tree that no longer exists"
+    (is nbb?)
+    (when nbb?
+      (let [dir (tmpdir)
+            scope-root (tmpdir)
+            src (io/file scope-root "os" "aiueos" "kernel")
+            _ (io/mkdirs src)
+            _ (spit (io/file src "main.c") "int main(void){return 0;}\n")
+            _ (shell/sh "git" "init" "-q" :dir scope-root)
+            _ (shell/sh "git" "add" "-A" :dir scope-root)
+            _ (shell/sh "git" "-c" "user.email=t@t" "-c" "user.name=t"
+                        "commit" "-qm" "seed" :dir scope-root)
+            a (artifact! dir "BOOTX64.EFI" "MZ-one")
+            receipt (str (io/file dir "image-receipt.edn"))
+            rec (run tool "record" "--out" receipt "--root" (str scope-root) a)
+            _ (is (zero? (:exit rec)) (:out rec))
+            ;; the artifact is NOT touched; only the source is
+            _ (spit (io/file src "main.c") "int main(void){return 1;}\n")
+            bad (run tool "assert" "--receipt" receipt "--root" (str scope-root) a)]
+        (is (= 4 (:exit bad))
+            "an unchanged image built from a changed tree is still stale")
+        (is (str/includes? (:out bad) "REFUSED stale-image tree=os/aiueos"))
+        (testing "and it goes green again when the edit is reverted -- the red
+                  above was caused by what was broken, not by collateral damage"
+          (spit (io/file src "main.c") "int main(void){return 0;}\n")
+          (let [ok (run tool "assert" "--receipt" receipt "--root" (str scope-root) a)]
+            (is (zero? (:exit ok)) (:out ok))))))))
+
+;; --- could-not-run is its own answer --------------------------------------
+
+(deftest a-missing-receipt-is-could-not-run-not-refused
+  (is nbb?)
+  (when nbb?
+    (let [dir (tmpdir)
+          a (artifact! dir "BOOTX64.EFI" "MZ-one")
+          bad (run tool "assert" "--receipt" (str (io/file dir "nope.edn"))
+                   "--root" repo a)]
+      (is (= 3 (:exit bad))
+          "no receipt means the question was not asked, not that it was answered")
+      (is (str/includes? (:out bad) "COULD-NOT-RUN receipt-missing"))
+      (is (not (str/includes? (:out bad) "REFUSED"))
+          "could-not-run must not be reported with the refusal literal"))))
+
+(deftest an-unreadable-receipt-is-could-not-run
+  (is nbb?)
+  (when nbb?
+    (let [dir (tmpdir)
+          a (artifact! dir "BOOTX64.EFI" "MZ-one")
+          receipt (artifact! dir "image-receipt.edn" "{:receipt/format :other}")
+          bad (run tool "assert" "--receipt" receipt "--root" repo a)]
+      (is (= 3 (:exit bad)))
+      (is (str/includes? (:out bad) "COULD-NOT-RUN receipt-unreadable")))))
+
+(deftest recording-zero-artifacts-is-refused-not-an-empty-pass
+  (testing "a receipt over nothing would let every later assert pass while
+            covering nothing -- the evidence floor from root ADR-2608136000"
+    (is nbb?)
+    (when nbb?
+      (let [dir (tmpdir)
+            bad (run tool "record" "--out" (str (io/file dir "r.edn"))
+                     "--root" repo)]
+        (is (= 3 (:exit bad)))
+        (is (str/includes? (:out bad) "COULD-NOT-RUN no-artifacts"))))))
+
+(deftest a-missing-artifact-at-record-time-is-could-not-run
+  (is nbb?)
+  (when nbb?
+    (let [dir (tmpdir)
+          bad (run tool "record" "--out" (str (io/file dir "r.edn"))
+                   "--root" repo (str (io/file dir "never-built.efi")))]
+      (is (= 3 (:exit bad)))
+      (is (str/includes? (:out bad) "COULD-NOT-RUN artifact-missing")))))
+
+;; --- the ratchet -----------------------------------------------------------
+
+(deftest the-harness-inventory-is-a-ratchet
+  (is nbb?)
+  (when nbb?
+    (let [r (run gate "--root" repo)]
+      (is (zero? (:exit r)) (:out r))
+      (is (str/includes? (:out r) "SMOKE-FRESHNESS-OK"))
+      (testing "and it counts what it scanned; an empty scan is exit 2"
+        (is (re-find #"SCANNED (\d+) booting=(\d+)" (:out r)))
+        (let [[_ scanned booting] (re-find #"SCANNED (\d+) booting=(\d+)" (:out r))]
+          (is (pos? (Long/parseLong scanned)))
+          (is (pos? (Long/parseLong booting)))))
+      (testing "the hub and the three named harnesses are attested"
+        (doseq [n ["smoke-qemu-uefi.sh" "smoke-qemu-dot-f32.cljk"
+                   "smoke-qemu-qwen35-admission.cljk"
+                   "smoke-qemu-firmware-matrix.sh"]]
+          (is (re-find (re-pattern (str "ASSERTS " n)) (:out r))
+              (str n " must assert image freshness")))))))
+
+(deftest the-ratchet-refuses-a-new-unattested-harness
+  (testing "shown by running the gate against a scratch tree whose baseline
+            omits a harness that boots -- the gate must go red for THAT reason"
+    (is nbb?)
+    (when nbb?
+      (let [root (tmpdir)
+            scripts (io/file root "os" "aiueos" "scripts")
+            contracts (io/file root "os" "aiueos" "contracts")
+            _ (io/mkdirs scripts)
+            _ (io/mkdirs contracts)
+            _ (spit (io/file scripts "smoke-qemu-new.sh")
+                    "#!/bin/sh\nqemu-system-x86_64 -display none\n")
+            _ (spit (io/file contracts "smoke-freshness-baseline.edn")
+                    (pr-str {:format :aiueos.smoke-freshness-baseline/v1
+                             :unattested []}))
+            r (run gate "--root" (str root))]
+        (is (= 1 (:exit r)) (:out r))
+        (is (str/includes? (:out r) "REFUSED unattested-boot-harness"))
+        (is (str/includes? (:out r) "smoke-qemu-new.sh"))
+        (testing "and green once the baseline records it"
+          (spit (io/file contracts "smoke-freshness-baseline.edn")
+                (pr-str {:format :aiueos.smoke-freshness-baseline/v1
+                         :unattested ["smoke-qemu-new.sh"]}))
+          (let [ok (run gate "--root" (str root))]
+            (is (zero? (:exit ok)) (:out ok))))))))
+
+(deftest an-empty-scan-is-not-a-pass
+  (is nbb?)
+  (when nbb?
+    (let [root (tmpdir)
+          _ (io/mkdirs (io/file root "os" "aiueos" "scripts"))
+          r (run gate "--root" (str root))]
+      (is (= 2 (:exit r)))
+      (is (str/includes? (:out r) "COULD-NOT-RUN no-smokes-found")))))

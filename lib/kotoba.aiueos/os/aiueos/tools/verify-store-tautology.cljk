@@ -1,0 +1,155 @@
+#!/usr/bin/env kbb
+(ns verify-store-tautology
+  "Store checks that cannot fail (lang-h13).
+
+  kernel-store-u8/u16/u32/u64 (and their -4k/-16k variants) RETURN THEIR
+  OPERAND, and an out-of-range store traps. So every check of the shape
+
+      (= (kernel-store-u8-4k frame 4096 14 69) 69)      ; direct
+      (let [s (kernel-store-u64-4k tcb 4096 16 iss)] (if (= s iss) ...))  ; let-bound
+      (if (kernel-store-u8-4k ...) ...)                  ; truthiness
+
+  is a tautology: it compares the value that was asked for with the value
+  that was asked for. It does not test the store. One of these masqueraded as
+  a fix (tcp-h14, 2026-09-07 09:00) until commit f752e1f rewrote tcb-init and
+  held-table-store to READ BACK the slot:
+
+      (= (kernel-load-u64-4k tcb 4096 16) iss)          ; can fail -- not reported
+
+  Classes reported (one line per site, file:line and the form):
+    direct/tautology     (= (store ... v) X) where X is structurally v
+    direct/operand-echo  (= (store ... v) X) where X is not v -- the check is
+                         of the operand, not the store; same misleading shape
+    let-bound/tautology  s bound to (store ... v), then (= s v) or (= s s')
+    let-bound/operand-echo  (= s X), X not v
+    truthiness           (if|when|and|or|not (store ...)) or of a bound s
+
+  Not reported: read-back comparisons, `(= 0 (* 0 (+ s0 s1 ...)))`
+  sequencing sums (no side is a bare store), and wrapper functions such as
+  store-be16 / frame-store-be16-stream (their return contract is not this
+  script's to assert; count them separately if you widen the class).
+
+  This does NOT rewrite anything. The corpus rewrite rebuilds the kernel and is
+  a separate change; this measures it.
+
+  Refusals (exit 2): no .kotoba under <root>/os/aiueos/native, or a file that
+  does not parse (an unmeasured file must not look like a clean file), or
+  zero kernel-store forms found at all.
+
+  Usage: kbb --backend sci os/aiueos/tools/verify-store-tautology.cljk [<repo-root>] [--dir <rel>]
+  Exit 0 clean / 1 findings / 2 refused. Evidence: SCANNED<TAB>n."
+  (:require ["fs" :as fs] ["path" :as p]
+            [kotoba.lang.text :as str]
+            [edamame.core :as e]))
+
+;; nbb: process.argv = [node, nbb, <this script>, args...]; take what follows the
+;; script path itself, wherever it sits (measured: (drop 2) left the script in).
+(def argv (let [all (vec (.-argv js/process))
+                me (p/basename (or (nth all 2 nil) ""))
+                i (first (keep-indexed (fn [i a] (when (and (seq me) (str/ends-with? a (str "/" me))) i)) all))]
+            (vec (if (nil? i) (drop 3 all) (drop (inc i) all)))))
+(defn opt [n d] (let [i (.indexOf argv n)] (if (neg? i) d (get argv (inc i) d))))
+(def root (or (first (remove #(or (str/starts-with? % "--") (= % (opt "--dir" nil))) argv)) "."))
+(def dir (p/join root (opt "--dir" "os/aiueos/native")))
+
+(defn refuse! [& msg] (println (str "REFUSED\t" (str/join " " msg))) (.exit js/process 2))
+(defn slurp* [f] (try (.readFileSync fs f "utf8") (catch :default _ nil)))
+
+(defn kotoba-files [d]
+  (let [names (try (vec (.readdirSync fs d)) (catch :default _ nil))]
+    (when-not names (refuse! "no such directory:" d))
+    (->> names
+         (mapcat (fn [n]
+                   (let [f (p/join d n)]
+                     (if (.isDirectory (.statSync fs f))
+                       (kotoba-files f)
+                       (when (str/ends-with? n ".kotoba") [f])))))
+         sort vec)))
+
+(def store-re #"^kernel-store-u(8|16|32|64)(-\d+k)?$")
+(defn store-form? [x]
+  (and (seq? x) (symbol? (first x)) (re-matches store-re (name (first x)))))
+(defn store-operand [x] (last x))
+(defn head [x] (when (and (seq? x) (symbol? (first x))) (first x)))
+
+(def findings (atom []))
+(def store-count (atom 0))
+(defn short [form] (let [s (pr-str form)] (if (> (count s) 110) (str (subs s 0 107) "...") s)))
+(defn finding! [cls file form]
+  (swap! findings conj {:class cls :file file :line (or (:row (meta form)) "?") :form (short form)}))
+
+(defn compare-check!
+  "(= A B): if either side is a store form or a store-bound symbol, classify."
+  [file form env]
+  (let [[_ a b] form
+        side (fn [x other]
+               (cond
+                 (store-form? x)
+                 (if (= other (store-operand x)) :direct/tautology :direct/operand-echo)
+                 (and (symbol? x) (contains? env x))
+                 (cond (= other (get env x)) :let-bound/tautology
+                       (and (symbol? other) (contains? env other)) :let-bound/tautology
+                       :else :let-bound/operand-echo)))]
+    (when-let [cls (or (side a b) (side b a))]
+      (finding! cls file form))))
+
+(defn truthiness-check! [file form env]
+  (let [h (head form)
+        tests (case (name h)
+                ("if" "when") [(second form)]
+                ("and" "or") (rest form)
+                "not" [(second form)]
+                nil)]
+    (doseq [t tests]
+      (when (or (store-form? t) (and (symbol? t) (contains? env t)))
+        (finding! :truthiness file form)))))
+
+(defn walk [file form env]
+  (when (store-form? form) (swap! store-count inc))
+  (cond
+    (and (seq? form) (= 'let (head form)) (vector? (second form)))
+    ;; bindings are sequential: a name bound to a store enters env; a later
+    ;; rebinding of the same name to a non-store removes it (shadowing).
+    (let [env' (reduce (fn [en [sym init]]
+                         (walk file init en)
+                         (if (and (symbol? sym) (store-form? init))
+                           (assoc en sym (store-operand init))
+                           (dissoc en sym)))
+                       env (partition 2 (second form)))]
+      (doseq [x (drop 2 form)] (walk file x env')))
+
+    (seq? form)
+    (do (case (some-> (head form) name)
+          "=" (compare-check! file form env)
+          ("if" "when" "and" "or" "not") (truthiness-check! file form env)
+          nil)
+        (doseq [x form] (walk file x env)))
+
+    (or (vector? form) (set? form)) (doseq [x form] (walk file x env))
+    (map? form) (doseq [[k v] form] (walk file k env) (walk file v env))
+    :else nil))
+
+;; ── run ────────────────────────────────────────────────────────────────────
+(def files (kotoba-files dir))
+(when (empty? files) (refuse! "zero .kotoba files under" dir))
+(doseq [f files]
+  (let [src (slurp* f)
+        forms (try (e/parse-string-all src {:all true})
+                   (catch :default ex (refuse! "does not parse:" f (ex-message ex))))
+        rel (p/relative root f)]
+    (doseq [form forms] (walk rel form {}))))
+
+(println (str "SCANNED\t" (count files) "\t.kotoba files under " (p/relative root dir)))
+(println (str "SCANNED\t" @store-count "\tkernel-store-* forms"))
+(when (zero? @store-count) (refuse! "zero kernel-store-* forms found -- wrong tree or renamed primitive"))
+
+(let [fs* (sort-by (juxt :file :line) @findings)
+      by-file (frequencies (map :file fs*))
+      by-class (frequencies (map :class fs*))]
+  (println (str "FINDINGS\t" (count fs*)))
+  (doseq [[f n] (sort by-file)] (println (str "PER-FILE\t" n "\t" f)))
+  (doseq [[c n] (sort by-class)] (println (str "PER-CLASS\t" n "\t" (str (namespace c) (when (namespace c) "/") (name c)))))
+  (doseq [x fs*]
+    (println (str "SITE\t" (str (namespace (:class x)) (when (namespace (:class x)) "/") (name (:class x)))
+                  "\t" (:file x) ":" (:line x) "\t" (:form x))))
+  (.exit js/process (if (seq fs*) 1 0)))

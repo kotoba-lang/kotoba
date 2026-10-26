@@ -1,0 +1,247 @@
+;; Admission for a DHCPv4 reply -- the first thing this OS accepts that decides
+;; what its own address is.
+;;
+;; The driver in `kernel/pci.c` owns the mechanism: it built the DISCOVER,
+;; posted the buffers, rang the doorbells and spun. It does NOT decide whether
+;; the bytes that came back are an offer addressed to this machine. That
+;; decision is here, the same split every other admission path in this OS uses
+;; (ADR-0015).
+;;
+;; WHAT MAKES THIS ONE DIFFERENT FROM THE ARP, ICMP AND TCP ADMISSIONS
+;;
+;; Every field those three read sits at a constant offset. A DHCP reply's
+;; payload does not: it ends in an OPTIONS field that is a chain of
+;; (code, length, value) records, variable length, self-describing, terminated
+;; by a byte inside itself, and written entirely by whoever answered. The
+;; length byte says how far to jump. A walk that believes it reads past the end
+;; of the frame -- which is the classic DHCP client defect, and the reason this
+;; parse cannot live in C.
+;;
+;; So `aiueos-dhcp-find` and `aiueos-dhcp-opts-ok` below check, at EVERY step,
+;; that the record's header and its whole value lie strictly below `limit`
+;; before advancing. `limit` is derived from the IPv4 total length, which has
+;; already been proved to fit inside the received frame, so it can never point
+;; past the bytes the device actually wrote.
+;;
+;; THIS OBJECT RETURNS A REASON CODE, NOT A BOOLEAN
+;;
+;;    0  admitted
+;;    1  frame length outside 283..2048
+;;    2  not an IPv4 datagram, or the IPv4 header checksum does not verify
+;;    3  not UDP 67 -> 68, or the UDP length is inconsistent, or its checksum
+;;       does not verify
+;;    4  not a BOOTREPLY for 6-byte Ethernet hardware addresses
+;;    5  the transaction id is not the one this boot chose
+;;    6  the hardware address is not this machine's
+;;    7  the DHCP magic cookie is absent
+;;    8  the options field does not parse within the frame
+;;    9  no message type, or not the one expected
+;;   10  no server identifier
+;;   11  the offered address and mask are not internally consistent
+;;   12  no lease time, or one outside the accepted range
+;;
+;; ZERO IS THE SUCCESS VALUE. `if (aiueos_dhcp_reply_valid(...))` -- the shape
+;; every neighbouring object invites -- admits exactly what this refuses. The
+;; codes ascend with how far into the frame the check reaches, so a caller
+;; comparing several candidate frames can report the one that got furthest
+;; without deciding anything itself.
+;;
+;; A boolean would have made "the transaction id belongs to somebody else" and
+;; "an option claims 255 bytes that are not there" the same event. They are the
+;; two ends of what this object exists to tell apart.
+;;
+;; Offsets, from the frame's first byte:
+;;    0..5   destination MAC     34..35  UDP source port      42  op
+;;    6..11  source MAC          36..37  UDP destination port 43  htype
+;;   12..13  EtherType           38..39  UDP length           44  hlen
+;;   14      version and IHL     40..41  UDP checksum         46..49  xid
+;;   16..17  IPv4 total length                                58..61  yiaddr
+;;   23      protocol                                         70..75  chaddr
+;;   24..25  header checksum                                 278..281 cookie
+;;   26..33  source, destination                             282..    options
+;;
+;; `mac` is this machine's six bytes as one big-endian integer. It is compared
+;; against `chaddr` and NOT against the Ethernet destination: a client that has
+;; no address yet is answered by broadcast, so the Ethernet header cannot say
+;; who a reply is for. RFC 2131 uses `chaddr`, and so does this.
+
+(defn aiueos-dhcp-u16 [frame offset]
+  (+ (* (kernel-load-u8-4k frame 2048 offset) 256)
+     (kernel-load-u8-4k frame 2048 (+ offset 1))))
+
+(defn aiueos-dhcp-u32 [frame offset]
+  (+ (* (kernel-load-u8-4k frame 2048 offset) 16777216)
+     (+ (* (kernel-load-u8-4k frame 2048 (+ offset 1)) 65536)
+        (+ (* (kernel-load-u8-4k frame 2048 (+ offset 2)) 256)
+           (kernel-load-u8-4k frame 2048 (+ offset 3))))))
+
+(defn aiueos-dhcp-u48 [frame offset]
+  (+ (* (aiueos-dhcp-u16 frame offset) 4294967296)
+     (aiueos-dhcp-u32 frame (+ offset 2))))
+
+;; RFC 1071, as in `ipv4-checksum.kotoba` and duplicated here for the reason
+;; that file gives: a kernel object exports one symbol and cannot call another,
+;; so the arithmetic is copied rather than moved into C, where it would stop
+;; being reviewable as a decision.
+(defn aiueos-dhcp-word [frame base length offset]
+  (if (>= (+ offset 1) length)
+    (* (kernel-load-u8-4k frame 2048 (+ base offset)) 256)
+    (+ (* (kernel-load-u8-4k frame 2048 (+ base offset)) 256)
+       (kernel-load-u8-4k frame 2048 (+ base offset 1)))))
+
+(defn aiueos-dhcp-sum [frame base length offset total]
+  (if (>= offset length) total
+    (aiueos-dhcp-sum frame base length (+ offset 2)
+                     (+ total (aiueos-dhcp-word frame base length offset)))))
+
+(defn aiueos-dhcp-fold [total]
+  (if (< total 65536) total
+    (aiueos-dhcp-fold (+ (bit-and total 65535) (quot total 65536)))))
+
+;; The region is always the FRAME; `base` is how far into it this header starts
+;; (14 for IPv4, 34 for UDP). The compiler requires a kernel memory base to NAME
+;; a region rather than compute one, which is what keeps a bounded load bounded.
+(defn aiueos-dhcp-checksum [frame base length seed]
+  (if (or (< length 0) (> (+ base length) 2048)) 65535
+    (- 65535 (aiueos-dhcp-fold (aiueos-dhcp-sum frame base length 0 seed)))))
+
+;; The 12-byte UDP pseudo-header, summed rather than laid out: source and
+;; destination as two words each, then the zero byte with protocol 17 -- the pad
+;; is the HIGH half, so the word is 17 and not 4352 -- then the UDP length.
+(defn aiueos-dhcp-pseudo [frame udp-length]
+  (+ (+ (aiueos-dhcp-u16 frame 26) (aiueos-dhcp-u16 frame 28))
+     (+ (+ (aiueos-dhcp-u16 frame 30) (aiueos-dhcp-u16 frame 32))
+        (+ 17 udp-length))))
+
+;; The first offset that is NOT part of the datagram. Derived from the IPv4
+;; total length, which the envelope check has already proved fits the frame.
+(defn aiueos-dhcp-limit [frame]
+  (+ 14 (aiueos-dhcp-u16 frame 16)))
+
+;; Does the whole options field parse inside `limit`? This is asked BEFORE any
+;; option is looked up, so that a field which does not parse is reported as
+;; exactly that rather than as whichever option the walk failed to reach.
+(defn aiueos-dhcp-opts-ok [frame limit offset]
+  (if (>= offset limit) 0
+    (if (= (kernel-load-u8-4k frame 2048 offset) 0)
+      (aiueos-dhcp-opts-ok frame limit (+ offset 1))
+      (if (= (kernel-load-u8-4k frame 2048 offset) 255) 1
+        (if (> (+ offset 2) limit) 0
+          (if (> (+ offset 2 (kernel-load-u8-4k frame 2048 (+ offset 1))) limit) 0
+            (aiueos-dhcp-opts-ok frame limit
+                                 (+ offset 2
+                                    (kernel-load-u8-4k frame 2048 (+ offset 1))))))))))
+
+;; Offset of the VALUE bytes of the first option with this code and exactly this
+;; length, or 0 when absent. Offset 0 is the first byte of the Ethernet header
+;; and can never be an option value, so it is unambiguous as "not found".
+;; Every bound is re-checked here rather than assumed from `aiueos-dhcp-opts-ok`
+;; -- one walk proving the field parses does not make a second walk safe if the
+;; two ever disagree about where the field ends.
+(defn aiueos-dhcp-find [frame limit offset code want-length]
+  (if (>= offset limit) 0
+    (if (= (kernel-load-u8-4k frame 2048 offset) 0)
+      (aiueos-dhcp-find frame limit (+ offset 1) code want-length)
+      (if (= (kernel-load-u8-4k frame 2048 offset) 255) 0
+        (if (> (+ offset 2) limit) 0
+          (if (> (+ offset 2 (kernel-load-u8-4k frame 2048 (+ offset 1))) limit) 0
+            (if (and (= (kernel-load-u8-4k frame 2048 offset) code)
+                     (= (kernel-load-u8-4k frame 2048 (+ offset 1)) want-length))
+              (+ offset 2)
+              (aiueos-dhcp-find frame limit
+                                (+ offset 2
+                                   (kernel-load-u8-4k frame 2048 (+ offset 1)))
+                                code want-length))))))))
+
+(defn aiueos-dhcp-envelope-ok [frame length]
+  (and (= (aiueos-dhcp-u16 frame 12) 2048)
+       (= (kernel-load-u8-4k frame 2048 14) 69)
+       ;; 20 IPv4 + 8 UDP + 236 BOOTP + 4 cookie is the smallest datagram that
+       ;; could carry an option at all, and the whole of it has to fit the
+       ;; frame. It may be SHORTER than the frame -- Ethernet pads -- never
+       ;; longer.
+       (>= (aiueos-dhcp-u16 frame 16) 268)
+       (<= (+ (aiueos-dhcp-u16 frame 16) 14) length)
+       (= (kernel-load-u8-4k frame 2048 23) 17)
+       ;; Summing a header that carries a correct checksum leaves 0, so the
+       ;; field is verified without ever being read on its own.
+       (= (aiueos-dhcp-checksum frame 14 20 0) 0)))
+
+(defn aiueos-dhcp-udp-ok [frame]
+  (and (= (aiueos-dhcp-u16 frame 34) 67)
+       (= (aiueos-dhcp-u16 frame 36) 68)
+       ;; The UDP length must agree with the IPv4 total length rather than being
+       ;; believed on its own; every offset below is derived from one of them.
+       (= (aiueos-dhcp-u16 frame 38) (- (aiueos-dhcp-u16 frame 16) 20))
+       (>= (aiueos-dhcp-u16 frame 38) 248)
+       ;; RFC 768 makes the UDP checksum optional over IPv4 and a zero field
+       ;; means "not computed". Accepting zero is conformant and is also a real
+       ;; hole -- anything that can rewrite the payload can rewrite this field
+       ;; to zero. It is accepted because refusing it would refuse conforming
+       ;; servers; nothing above depends on it.
+       (or (= (aiueos-dhcp-u16 frame 40) 0)
+           (= (aiueos-dhcp-checksum frame 34 (aiueos-dhcp-u16 frame 38)
+                                    (aiueos-dhcp-pseudo frame (aiueos-dhcp-u16 frame 38)))
+              0))))
+
+;; A netmask is a run of ones followed by a run of zeros. Its complement plus
+;; one is therefore a power of two, which `(x & (x+1)) == 0` tests without a
+;; loop. /32 is refused: a lease that leaves no host bits leaves nothing to
+;; check the address against, and no server this OS talks to offers one.
+(defn aiueos-dhcp-mask-ok [mask]
+  (and (>= mask 4278190080)
+       (< mask 4294967295)
+       (= (bit-and (- 4294967295 mask) (+ (- 4294967295 mask) 1)) 0)))
+
+(defn aiueos-dhcp-address-ok [address mask]
+  (and (aiueos-dhcp-mask-ok mask)
+       ;; Not this-network, not loopback, not multicast or above.
+       (>= (quot address 16777216) 1)
+       (not (= (quot address 16777216) 127))
+       (< (quot address 16777216) 224)
+       ;; Not the subnet's own network address, and not its directed broadcast.
+       ;; Either would be a well-formed 32-bit number and an unusable lease.
+       (not (= (bit-and address (- 4294967295 mask)) 0))
+       (not (= (bit-and address (- 4294967295 mask)) (- 4294967295 mask)))))
+
+(defn aiueos-dhcp-after-options [frame limit expected-type]
+  ;; Message type, then server identifier, then the address/mask pair, then the
+  ;; lease -- in that order, because that is the order in which a caller can act
+  ;; on what it learns, and the reason codes ascend with it.
+  (if (= (aiueos-dhcp-find frame limit 282 53 1) 0) 9
+    (if (not (= (kernel-load-u8-4k frame 2048 (aiueos-dhcp-find frame limit 282 53 1))
+                expected-type)) 9
+      (if (= (aiueos-dhcp-find frame limit 282 54 4) 0) 10
+        (if (= (aiueos-dhcp-find frame limit 282 1 4) 0) 11
+          (if (not (aiueos-dhcp-address-ok
+                    (aiueos-dhcp-u32 frame 58)
+                    (aiueos-dhcp-u32 frame (aiueos-dhcp-find frame limit 282 1 4)))) 11
+            (if (= (aiueos-dhcp-find frame limit 282 51 4) 0) 12
+              ;; One minute to thirty days. Below that a client would spend its
+              ;; life renewing; above it the lease outlives any reason to
+              ;; believe the topology has not changed. Both ends are policy, and
+              ;; both are stated here rather than in C.
+              (if (< (aiueos-dhcp-u32 frame (aiueos-dhcp-find frame limit 282 51 4)) 60) 12
+                (if (> (aiueos-dhcp-u32 frame (aiueos-dhcp-find frame limit 282 51 4))
+                       2592000) 12
+                  0)))))))))
+
+(defn aiueos-dhcp-reply-valid [frame length xid mac expected-type]
+  (if (or (< length 283) (> length 2048)) 1
+    (if (not (aiueos-dhcp-envelope-ok frame length)) 2
+      (if (not (aiueos-dhcp-udp-ok frame)) 3
+        ;; op 2 = BOOTREPLY (1 is what was sent), htype 1 = Ethernet, hlen 6.
+        (if (not (and (= (kernel-load-u8-4k frame 2048 42) 2)
+                      (= (kernel-load-u8-4k frame 2048 43) 1)
+                      (= (kernel-load-u8-4k frame 2048 44) 6))) 4
+          ;; The transaction id is what ties this reply to the request THIS boot
+          ;; sent. A well-formed offer answering somebody else's DISCOVER is a
+          ;; real datagram and still not an answer to ours.
+          (if (not (= (aiueos-dhcp-u32 frame 46) xid)) 5
+            (if (not (= (aiueos-dhcp-u48 frame 70) mac)) 6
+              (if (not (= (aiueos-dhcp-u32 frame 278) 1669485411)) 7
+                (if (= (aiueos-dhcp-opts-ok frame (aiueos-dhcp-limit frame) 282) 0) 8
+                  (aiueos-dhcp-after-options frame (aiueos-dhcp-limit frame)
+                                             expected-type))))))))))
+
+(defn main [] 0)

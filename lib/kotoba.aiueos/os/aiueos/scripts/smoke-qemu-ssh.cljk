@@ -1,0 +1,115 @@
+#!/usr/bin/env kbb
+;; Gate for the SSH passive-open listener (ssh-v1.edn / ADR-0102): the kernel
+;; accepts ONE inbound TCP connection on port 22 and exchanges SSH-2.0
+;; identification strings with a real external client. No crypto -- this proves
+;; the two blockers under the crypto (no LISTEN/accept, and no post-evidence
+;; service loop) are gone.
+;;
+;; The boot is driven by smoke-qemu-uefi.sh, the SAME harness the other network
+;; gates (offline-floor, dhcp) use and the one proven to reach the network
+;; evidence on this machine. AIUEOS_TEST_NET=1 attaches the NIC; the new
+;; AIUEOS_SSH_HOSTFWD adds a host->guest:22 forward so an external node client
+;; can connect IN. The kernel must be built with AIUEOS_SSH_LISTEN=1.
+;;
+;; The client is cooperating -- it waits for the server's id line before
+;; sending its own -- because the guest's one-buffer RX stack drops
+;; back-to-back segments. Green iff the serial shows AIUEOS_SSH_LISTEN_OK AND
+;; the client read exactly "SSH-2.0-aiueos_0.1" from the kernel: the marker
+;; alone could be a self-report, the client read alone could be anyone.
+
+(require '[kotoba.lang.text :as str])
+
+(def fs (js/require "node:fs"))
+(def path (js/require "node:path"))
+(def cp (js/require "node:child_process"))
+(def net (js/require "node:net"))
+
+(def aiueos (.resolve path (.dirname path *file*) ".."))
+(def repo (.resolve path aiueos ".." ".."))
+(def out (or (.-AIUEOS_OUT js/process.env) (.join path repo "build" "aiueos")))
+(def kernel (.join path out "esp" "EFI" "AIUEOS" "KERNEL.ELF"))
+(def serial-log (.join path out "kernel-serial.log"))
+(def host-port 8022)
+(def expected-id "SSH-2.0-aiueos_0.1")
+
+(defn- die [& msg]
+  (binding [*out* *err*] (apply println (cons "error:" msg)))
+  (.exit js/process 1))
+
+(when-not (.existsSync fs kernel)
+  (die "kernel not built with the listener:"
+       "\nhint: AIUEOS_SSH_LISTEN=1 sh os/aiueos/scripts/build-release-image.sh"))
+(when-not (str/includes? (.toString (.readFileSync fs kernel)) "AIUEOS_SSH_LISTEN_OK")
+  (die "the built kernel has no SSH listener string; rebuild with AIUEOS_SSH_LISTEN=1"))
+
+;; The cooperating client. It reconnects until the guest's listener is up, and
+;; on a live connection waits for the server's id line, then sends its own. The
+;; RESULT it records is what the KERNEL sent -- proof independent of the serial.
+(def client-result (atom {:banner nil :done false}))
+
+;; The measured hazard is timing, and it cuts both ways. A single held socket
+;; can go stale before the guest listener -- which runs once, tens of seconds
+;; into the TCG boot -- posts a buffer and catches its SYN (a former race left
+;; the listener at stage 3 with the host side gone; a single long hold missed
+;; on a slower boot). So the client keeps a POOL of overlapping connections: a
+;; new one opened every few seconds, each held open, so at any instant during
+;; the listener's window there is at least one live host socket whose SLIRP
+;; SYN the guest can complete. The guest completes exactly one; whichever host
+;; socket maps to it reads the banner. First banner wins and stops the pool.
+(def open-sockets (atom []))
+
+(defn- open-one []
+  (when-not (:done @client-result)
+    (let [sock (.connect net #js {:host "127.0.0.1" :port host-port})
+          buf (atom "")]
+      (swap! open-sockets conj sock)
+      (.setTimeout sock 120000)
+      (.on sock "data"
+           (fn [d]
+             (swap! buf str (.toString d "utf8"))
+             (when (and (not (:done @client-result)) (str/includes? @buf "\n"))
+               (let [line (first (str/split @buf #"\r?\n"))]
+                 (swap! client-result assoc :banner line :done true)
+                 (.write sock "SSH-2.0-aiueos-gate-client\r\n")
+                 (js/setTimeout (fn []
+                                  (doseq [s @open-sockets] (try (.destroy s) (catch :default _ nil))))
+                                600)))))
+      (.on sock "error" (fn [_] (try (.destroy sock) (catch :default _ nil))))
+      (.on sock "timeout" (fn [] (try (.destroy sock) (catch :default _ nil)))))))
+
+;; Open a fresh overlapping connection every 4 s for the boot's duration, until
+;; one succeeds. Start early; the boot reaches the listener tens of seconds in.
+(defn- pool-tick []
+  (when-not (:done @client-result)
+    (open-one)
+    (js/setTimeout pool-tick 4000)))
+(js/setTimeout pool-tick 5000)
+
+(println "AIUEOS_SSH_GATE booting via smoke-qemu-uefi.sh + client on" host-port)
+(def env (doto (js/Object.assign #js {} js/process.env)
+           (aset "AIUEOS_TEST_NET" "1")
+           (aset "AIUEOS_SSH_HOSTFWD" (str host-port))))
+(def child (.spawn cp (.join path aiueos "scripts" "smoke-qemu-uefi.sh")
+                   #js [] #js {:stdio "inherit" :env env}))
+
+(.on child "exit"
+     (fn [code _]
+       (let [serial (if (.existsSync fs serial-log)
+                      (str/replace (.readFileSync fs serial-log "utf8") "\r" "") "")
+             kernel-ok (str/includes? serial "AIUEOS_SSH_LISTEN_OK")
+             banner (:banner @client-result)
+             client-ok (= banner expected-id)]
+         (println "AIUEOS_SSH_GATE boot-exit code=" code)
+         (println "AIUEOS_SSH_GATE kernel-marker="
+                  (if kernel-ok "AIUEOS_SSH_LISTEN_OK" "absent"))
+         (println "AIUEOS_SSH_GATE client-read=" (pr-str banner))
+         (when-not kernel-ok
+           (println "AIUEOS_SSH_GATE listener-line="
+                    (pr-str (->> (str/split-lines serial)
+                                 (filter #(str/includes? % "AIUEOS_SSH_LISTEN"))
+                                 last))))
+         (if (and kernel-ok client-ok)
+           (println "AIUEOS_SSH_SMOKE_OK passive-open id-exchange client-read="
+                    (pr-str banner))
+           (do (println "AIUEOS_SSH_SMOKE_FAIL kernel-ok=" kernel-ok "client-ok=" client-ok)
+               (.exit js/process 1))))))

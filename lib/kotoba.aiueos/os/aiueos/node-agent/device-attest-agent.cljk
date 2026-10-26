@@ -1,0 +1,186 @@
+#!/usr/bin/env kbb
+;; The device half of the claim ceremony: poll for a challenge, sign it with
+;; the key that never leaves this box, post the signature back.
+;;
+;; Until this ran, a claim reached `awaiting-proof` and timed out -- the phone
+;; had scanned the label and the server had issued a nonce, and nothing on the
+;; device ever answered. This is what makes a scanned label become a device.
+;;
+;; What it decides: nothing. Every decision is `grant.device-attest`, which the
+;; control plane's verifier imports too, so the bytes signed here and the bytes
+;; checked there come from one function rather than two readings of one spec.
+;; What is here is sockets, a private key, and an exit code.
+;;
+;;   kbb --backend sci --classpath ../grant/src:../text/src \
+;;     os/aiueos/scripts/device-attest-agent.cljk \
+;;     --did did:key:z6Mk... --endpoint https://murakumo.cloud \
+;;     --key /path/to/device-ed25519-pkcs8.pem [--watch --interval 15]
+;;
+;; The relative classpath is the west layout (grant and text are siblings of
+;; this repository under orgs/kotoba-lang/). It does not resolve from a
+;; worktree placed elsewhere -- pass absolute paths there.
+;;
+;; Exit codes are `grant.device-attest/exit-codes`, so a supervisor can tell
+;; "nothing to prove" (0) from "could not reach the plane" (3) from "the plane
+;; read my signature and refused it" (1) without parsing this output.
+
+(require '[grant.device-attest :as attest]
+         '[kotoba.lang.text :as str]
+         '["node:crypto" :as crypto]
+         '["node:fs" :as fs])
+
+;; ── arguments ─────────────────────────────────────────────────────────────
+
+(def argv (vec *command-line-args*))
+
+(defn- opt [flag]
+  (let [i (.indexOf argv flag)]
+    (when (and (not (neg? i)) (< (inc i) (count argv)))
+      (nth argv (inc i)))))
+
+(defn- flag? [f] (not (neg? (.indexOf argv f))))
+
+(def did (opt "--did"))
+(def endpoint (some-> (or (opt "--endpoint") "") (str/replace #"/+$" "")))
+(def key-path (opt "--key"))
+(def watch? (flag? "--watch"))
+(def dry-run? (flag? "--dry-run"))
+(def interval-ms (* 1000 (js/parseInt (or (opt "--interval") "15") 10)))
+;; A watcher with no bound cannot report the one thing a boot most needs to
+;; hear. Retrying forever turns "I never reached the plane" into silence, and
+;; silence is indistinguishable from still working. 0 means unbounded, which
+;; is right for a resident service and wrong for a boot.
+(def max-attempts (js/parseInt (or (opt "--attempts") "0") 10))
+;; Where to write the final outcome as a keyword. Exit codes deliberately
+;; collapse outcomes a supervisor should treat the same -- `proved` and `idle`
+;; are both 0, because being told there is nothing to prove is a successful
+;; run. A caller that needs to tell them apart needs the outcome, not the code,
+;; and reading it out of human-readable output would be a parser waiting to
+;; disagree with the thing it parses.
+(def outcome-file (opt "--outcome-file"))
+
+(defn- die! [code msg]
+  (binding [*print-fn* #(.error js/console %)] (println (str "device-attest: " msg)))
+  (js/process.exit code))
+
+(when (or (str/blank? (str did)) (str/blank? (str endpoint)) (str/blank? (str key-path)))
+  (die! 2 "usage: --did <did:key:…> --endpoint <https://…> --key <pkcs8.pem> [--watch] [--interval s] [--dry-run]"))
+
+;; ── the key ───────────────────────────────────────────────────────────────
+;;
+;; PKCS#8 PEM, read from a path the caller names. Deliberately NOT a location
+;; or a protection scheme invented here: where a device's operational key
+;; lives and what guards it is custody, which `kagi` owns. This reads what it
+;; is pointed at and nothing else.
+
+(def private-key
+  (try
+    (crypto/createPrivateKey (fs/readFileSync key-path "utf8"))
+    (catch :default e (die! 2 (str "cannot read a private key from " key-path ": " (.-message e))))))
+
+(when-not (= "ed25519" (.-asymmetricKeyType private-key))
+  (die! 2 (str "the key at " key-path " is " (.-asymmetricKeyType private-key)
+               ", not ed25519 -- the plane verifies Ed25519 and nothing else")))
+
+;; NOTE: this does NOT check that the key corresponds to `--did`. Deciding
+;; whether a did:key names a given public key is `sekisho.didkey`'s single
+;; definition, and restating the multibase/multicodec envelope here would be a
+;; second one. A mismatch therefore surfaces from the plane as `:rejected`,
+;; which already has its own exit code rather than looking like a network
+;; problem.
+
+(defn- sign-b64url [^string message]
+  (-> (crypto/sign nil (js/Buffer.from message "utf8") private-key)
+      (.toString "base64url")))
+
+;; ── the plane ─────────────────────────────────────────────────────────────
+;;
+;; A request that does not complete yields {:status nil}, which `plan-poll` and
+;; `interpret-attest` treat as its own outcome. Collapsing it into "nothing
+;; pending" is the failure this whole exit-code scheme exists to prevent.
+
+(defn- request [url init]
+  (-> (js/fetch url (clj->js init))
+      (.then (fn [res]
+               (-> (.text res)
+                   (.then (fn [body]
+                            {:status (.-status res)
+                             :body (try (js->clj (js/JSON.parse body)) (catch :default _ nil))})))))
+      (.catch (fn [e] {:status nil :error (.-message e)}))))
+
+(defn- poll []
+  (request (str endpoint "/api/devices/" (js/encodeURIComponent did) "/challenge")
+           {:method "GET" :headers {"accept" "application/json"}}))
+
+(defn- attest [challenge signature]
+  (request (str endpoint "/api/devices/" (js/encodeURIComponent did) "/attest")
+           {:method "POST"
+            :headers {"content-type" "application/json"}
+            :body (js/JSON.stringify (clj->js {"challenge" challenge "signature" signature}))}))
+
+;; ── one round ─────────────────────────────────────────────────────────────
+
+(defn- report [outcome detail]
+  (println (str "device-attest: " (name outcome) (when detail (str " — " detail))))
+  outcome)
+
+(defn- run-once []
+  (-> (poll)
+      (.then
+       (fn [res]
+         (let [plan (attest/plan-poll (assoc res :now-ms (js/Date.now)))]
+           (case (:action plan)
+             :idle (js/Promise.resolve (report :idle "no challenge pending"))
+             :skip (js/Promise.resolve (report :skipped (name (:reason plan))))
+             :refuse (js/Promise.resolve
+                      (report (if (= :control-plane-unreachable (:reason plan))
+                                :unreachable :error)
+                              (str (name (:reason plan))
+                                   (when-let [e (:error res)] (str ": " e)))))
+             :sign
+             (let [message (attest/signing-input {:did did :endpoint endpoint
+                                                  :nonce (:nonce plan)})]
+               (if-not (string? message)
+                 ;; The plane issued something this device cannot frame. Loud,
+                 ;; and not signed: framing that is not unambiguous is not
+                 ;; something to put a signature on.
+                 (js/Promise.resolve (report :malformed (name (:error message))))
+                 (if dry-run?
+                   (js/Promise.resolve
+                    (do (println (str "device-attest: would sign challenge " (:challenge plan)))
+                        (report :skipped "dry-run")))
+                   (-> (attest (:challenge plan) (sign-b64url message))
+                       (.then (fn [ar]
+                                (let [r (attest/interpret-attest ar)]
+                                  (report (:outcome r)
+                                          (or (some-> (:reason r) name)
+                                              (some-> (:status r) str))))))))))))))))
+
+;; ── drive ─────────────────────────────────────────────────────────────────
+
+(defn- exit-for [outcome] (get attest/exit-codes outcome 2))
+
+(defn- finish! [outcome]
+  (when outcome-file
+    (try (fs/writeFileSync outcome-file (name outcome)) (catch :default _ nil)))
+  (js/process.exit (exit-for outcome)))
+
+(if-not watch?
+  (-> (run-once) (.then (fn [o] (js/process.exit (exit-for o)))))
+  ;; A watcher keeps going through the outcomes a retry can fix and stops on
+  ;; the one it cannot: a signature the plane read and refused will be refused
+  ;; again, and looping on it would turn a key fault into a quiet busy wait.
+  (let [attempts (atom 0)]
+    (letfn [(tick []
+              (swap! attempts inc)
+              (-> (run-once)
+                  (.then (fn [o]
+                           (cond
+                             (= :proved o) (finish! o)
+                             (= :rejected o) (finish! o)
+                             (and (pos? max-attempts) (>= @attempts max-attempts))
+                             (do (println (str "device-attest: giving up after "
+                                               @attempts " attempts"))
+                                 (finish! o))
+                             :else (js/setTimeout tick interval-ms))))))]
+      (tick))))

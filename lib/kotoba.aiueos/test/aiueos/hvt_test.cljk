@@ -1,0 +1,420 @@
+(ns aiueos.hvt-test
+  "Pure unit tests for `aiueos.hvt` -- the parts that don't need a live
+  `/dev/kvm`: ioctl-number encoding, struct-field offsets, the aarch64 core
+  PC register id, and the fixed guest program. The live KVM boot loop
+  (`aiueos.hvt/spike`) is exercised by the #110 smoke gate inside a Linux/KVM
+  VM, not here (this suite runs on any JVM host, incl. macOS CI), mirroring
+  `aiueos.vfio`'s hardware-honesty split."
+  (:require [kotoba.test :refer [deftest is testing]]
+            #?(:clj [kotoba.io :as io])
+            [aiueos.hvt :as hvt]
+            [aiueos.virtio :as vio]))
+
+;; ---------------------------------------------------------------------------
+;; JVM-only from here to the end of this block, and the reason is arithmetic,
+;; not I/O.
+;;
+;; KVM ioctl request numbers and ARM64 core-register ids are 64-bit values
+;; assembled with `bit-or`/`bit-shift-left` in `aiueos.hvt`. ClojureScript's
+;; bitwise operators are defined on 32-bit signed integers, so on the second
+;; runtime `KVM_ARM_PREFERRED_TARGET` (0x8020AEAF) comes back -2145341777,
+;; `KVM_REG_ARM64|SIZE_U64|ARM_CORE|pc` (0x6030000000100040) collapses to
+;; 1048640, `rd-le` cannot assemble a 4-byte word above 2^31, and
+;; `(bit-shift-left 1 32)` is 1 because JS masks the shift count -- which
+;; inverts which feature word VIRTIO_F_VERSION_1 appears in.
+;;
+;; These are guarded rather than fixed. `aiueos.hvt` is a KVM monitor: it
+;; drives /dev/kvm through java.lang.foreign, there is no ClojureScript
+;; deployment of it, and rewriting its constant algebra onto BigInt to satisfy
+;; a runtime that will never run it would add a second arithmetic to the one
+;; place where being off by a bit means the ioctl goes to the wrong device.
+;;
+;; Everything OUTSIDE these guards -- the virtqueue walk, the descriptor
+;; bounds checks, the ELF load range, the struct offsets -- is ordinary
+;; small-integer logic and does run on both runtimes.
+;; ---------------------------------------------------------------------------
+
+#?(:clj
+   (deftest ioctl-numbers
+     (testing "KVM ioctl request numbers match linux/kvm.h (KVMIO=0xAE)"
+       ;; _IO(0xAE, nr)
+       (is (= 0xAE00 hvt/get-api-version))
+       (is (= 0xAE01 hvt/create-vm))
+       (is (= 0xAE04 hvt/get-vcpu-mmap-size))
+       (is (= 0xAE41 hvt/create-vcpu))
+       (is (= 0xAE80 hvt/run))
+       ;; _IOW(0xAE, 0x46, sizeof kvm_userspace_memory_region=32)
+       (is (= 0x4020AE46 hvt/set-user-memory-region))
+       ;; _IOW(0xAE, 0xac, sizeof kvm_one_reg=16)
+       (is (= 0x4010AEAC hvt/set-one-reg))
+       ;; _IOW(0xAE, 0xae, sizeof kvm_vcpu_init=32)
+       (is (= 0x4020AEAE hvt/arm-vcpu-init))
+       ;; _IOR(0xAE, 0xaf, sizeof kvm_vcpu_init=32)
+       (is (= 0x8020AEAF hvt/arm-preferred-target))
+       ;; _IOR(0xAE, 0x98, sizeof kvm_mp_state=4) / _IOW(0xAE, 0x99, 4)
+       (is (= 0x8004AE98 hvt/get-mp-state))
+       (is (= 0x4004AE99 hvt/set-mp-state)))))
+
+(deftest mp-state-constants
+  (testing "KVM_MP_STATE values (linux/kvm.h)"
+    (is (= 0 (:runnable hvt/mp-state)))
+    (is (= 5 (:stopped hvt/mp-state)))))
+
+#?(:clj
+   (deftest ioc-encoding
+     (testing "the _IOC direction/type/nr/size bit layout"
+       (is (= 0xAE00 (hvt/io- 0xAE 0x00)))
+       (is (= 0x4020AE46 (hvt/iow 0xAE 0x46 32)))
+       (is (= 0x8020AEAF (hvt/ior 0xAE 0xaf 32))))))
+
+#?(:clj
+   (deftest arm64-pc-register-id
+     (testing "KVM_REG_ARM64 | SIZE_U64 | ARM_CORE | (offsetof(pc)/4 = 0x40)"
+       (is (= 0x6030000000100040 hvt/arm64-core-reg-pc)))
+     (testing "SP_EL1 core reg (offsetof(kvm_regs.sp_el1)=272 /4 = 0x44 -- the stack the EL1h guest uses)"
+       (is (= 0x6030000000100044 hvt/arm64-core-reg-sp)))))
+
+(deftest struct-offsets
+  (testing "kvm_userspace_memory_region field byte offsets"
+    (is (= {:slot 0 :flags 4 :guest-phys-addr 8 :memory-size 16 :userspace-addr 24}
+           hvt/mem-region-layout)))
+  (testing "kvm_run fields V0 reads: exit_reason @8, union @32"
+    (is (= 8 (:exit-reason hvt/kvm-run-layout)))
+    (is (= 32 (:mmio-phys-addr hvt/kvm-run-layout)))
+    (is (= 40 (:mmio-data hvt/kvm-run-layout)))
+    (is (= 48 (:mmio-len hvt/kvm-run-layout)))
+    (is (= 52 (:mmio-is-write hvt/kvm-run-layout)))
+    (is (= 32 (:sysevent-type hvt/kvm-run-layout))))
+  (testing "exit-reason + system-event-type constants (linux/kvm.h)"
+    (is (= 6 (:mmio hvt/exit-reason)))
+    (is (= 24 (:system-event hvt/exit-reason)))
+    (is (= 1 (:shutdown hvt/system-event-type)))))
+
+(deftest guest-program
+  (testing "the V0 guest is 10 aarch64 words: write HI\\n via serial MMIO, then the poweroff port"
+    (is (= 10 (count hvt/guest-program-words)))
+    (is (= "HI\n" hvt/guest-serial-expected))
+    (is (= 0x09000000 hvt/guest-mmio-base))
+    (is (= 0x09000008 hvt/guest-poweroff-addr)
+        "poweroff port is serial base + 8")
+    ;; spot-check the load-address movz and the b . that parks the guest.
+    (is (= 0xD2A12001 (first hvt/guest-program-words))   ; movz x1,#0x0900,lsl#16
+        "x1 <- 0x09000000 (MMIO base)")
+    (is (= 0x14000000 (last hvt/guest-program-words))    ; b .
+        "guest ends parked in b . (VMM halts on the poweroff write)")
+    ;; three strb w0,[x1] stores to the serial port, one per emitted byte.
+    (is (= 3 (count (filter #(= 0x39000020 %) hvt/guest-program-words))))
+    ;; one strb w0,[x1,#8] store to the poweroff port.
+    (is (= 1 (count (filter #(= 0x39002020 %) hvt/guest-program-words)))
+        "one poweroff-port store")
+    ;; every word fits in 32 bits.
+    (is (every? #(<= 0 % 0xFFFFFFFF) hvt/guest-program-words))))
+
+(deftest psci-diagnostic-guest
+  (testing "the PSCI variant: serial HI\\n, then hvc PSCI SYSTEM_OFF, then a poweroff fall-through"
+    (is (= 13 (count hvt/guest-program-psci)))
+    (is (= 0x84000008 hvt/psci-system-off-fid) "PSCI 0.2 SYSTEM_OFF fid")
+    ;; movz x1 base, then the hvc, then the fall-through poweroff store + b .
+    (is (= 0xD2A12001 (first hvt/guest-program-psci)))
+    (is (= 1 (count (filter #(= 0xD4000002 %) hvt/guest-program-psci)))
+        "exactly one hvc #0")
+    (is (= 0x14000000 (last hvt/guest-program-psci)) "parks in b .")
+    ;; the diagnostic fall-through: a poweroff store reached only if PSCI did
+    ;; not fire, so :halt :mmio-poweroff in the receipt means PSCI was ignored.
+    (is (= 1 (count (filter #(= 0x39002020 %) hvt/guest-program-psci)))
+        "one poweroff fall-through store")
+    (is (every? #(<= 0 % 0xFFFFFFFF) hvt/guest-program-psci))))
+
+(deftest vcpu-init-psci-constants
+  (testing "KVM_ARM_VCPU_PSCI_0_2 feature-bit layout (features[0] at struct offset 4, bit 0)"
+    (is (= 4 hvt/vcpu-init-features0-offset))
+    (is (= 1 hvt/vcpu-feature-psci-0-2) "KVM_ARM_VCPU_PSCI_0_2 == feature bit 0")))
+
+(defn- code
+  "The character code of `c`, on both runtimes.
+
+  `(int \\A)` is 65 on the JVM and **0** on ClojureScript, where `\\A` reads as
+  the one-character string \"A\" and `int` coerces it. Three places here used
+  it on BOTH sides of an assertion -- filling synthetic guest RAM and then
+  comparing against it -- so on the second runtime the test wrote 0, read 0,
+  and passed while checking nothing. A test that goes green by being equally
+  wrong twice is worse than one that fails."
+  [c]
+  #?(:clj (int c) :cljs (.charCodeAt (str c) 0)))
+
+(defn- vec-accessor [v] (fn [off] (nth v off)))
+
+#?(:clj
+   (deftest rd-le-reads-little-endian
+     (testing "rd-le assembles n little-endian bytes into a long"
+       (let [rd (vec-accessor [0x78 0x56 0x34 0x12 0xff 0xee])]
+         (is (= 0x12345678 (hvt/rd-le rd 0 4)))
+         (is (= 0x5678 (hvt/rd-le rd 0 2)))
+         (is (= 0xeeff (hvt/rd-le rd 4 2)))
+         (is (= 0xEEFF1234 (hvt/rd-le rd 2 4)))))))
+
+(deftest elf-load-range-spans-segments
+  (testing "elf-load-range covers all PT_LOAD vaddr..vaddr+memsz, page-aligned"
+    ;; a single segment at 0x40000000, memsz 0x28 -> [0x40000000, 0x40001000)
+    (is (= [0x40000000 0x40001000]
+           (hvt/elf-load-range [{:vaddr 0x40000000 :memsz 0x28}] 4096)))
+    ;; two segments -> lo rounds down, hi rounds up across both
+    (is (= [0x40000000 0x40003000]
+           (hvt/elf-load-range [{:vaddr 0x40000100 :memsz 0x10}
+                                {:vaddr 0x40002000 :memsz 0x40}] 4096)))))
+
+#?(:clj
+   (do
+     (deftest parse-elf64-rejects-non-elf
+       (testing "a bad magic throws with a specific reason"
+         (is (thrown-with-msg? clojure.lang.ExceptionInfo #"bad magic"
+               (hvt/parse-elf64 (vec-accessor [0x00 0x01 0x02 0x03 0x04 0x05]))))))
+
+     (deftest parse-elf64-on-real-fixture
+       (testing "parsing the checked-in aarch64 ELF fixture yields the expected load plan"
+         (let [bytes (with-open [in (io/input-stream (io/resource "hvt/guest-aarch64.elf"))]
+                       (.readAllBytes in))
+               rd (fn [off] (bit-and (long (aget bytes (int off))) 0xff))
+               {:keys [class machine entry segments]} (hvt/parse-elf64 rd)]
+           (is (= hvt/elf-class-64 class) "ELFCLASS64")
+           (is (= (:aarch64 hvt/elf-machine) machine) "EM_AARCH64 (0xB7)")
+           (is (= 0x40000000 entry) "e_entry")
+           (is (= 1 (count segments)) "one PT_LOAD")
+           (let [{:keys [offset vaddr filesz memsz]} (first segments)]
+             (is (= 0x1000 offset) "p_offset")
+             (is (= 0x40000000 vaddr) "p_vaddr")
+             (is (= 0x28 filesz) "p_filesz (10 aarch64 words)")
+             (is (= 0x28 memsz) "p_memsz"))
+           (is (= [0x40000000 0x40001000] (hvt/elf-load-range segments 4096))))))))
+
+(deftest virtio-window
+  (testing "the virtio-mmio register window at 0x0a000000"
+    (is (hvt/virtio-window? hvt/virtio-mmio-base))
+    (is (hvt/virtio-window? (+ hvt/virtio-mmio-base 0x70)))
+    (is (not (hvt/virtio-window? (dec hvt/virtio-mmio-base))))
+    (is (not (hvt/virtio-window? (+ hvt/virtio-mmio-base hvt/virtio-mmio-size))))
+    (is (not (hvt/virtio-window? hvt/guest-mmio-base)) "the plain serial port is not virtio")))
+
+#?(:clj
+   (deftest virtio-console-device-reads
+     (testing "the emulated console device presents the identity registers"
+       (is (= vio/mmio-magic (hvt/virtio-console-read {} (:magic-value vio/mmio-reg))))
+       (is (= vio/mmio-version-2 (hvt/virtio-console-read {} (:version vio/mmio-reg))))
+       (is (= (:console vio/device-type-id) (hvt/virtio-console-read {} (:device-id vio/mmio-reg)))
+           "device-id 3 = console")
+       (is (= hvt/virtio-console-queue-num-max
+              (hvt/virtio-console-read {} (:queue-num-max vio/mmio-reg))))
+       (is (= hvt/virtio-console-vendor (hvt/virtio-console-read {} (:vendor-id vio/mmio-reg)))))
+     (testing "VIRTIO_F_VERSION_1 is offered in the high feature word (bit 32)"
+       (is (= 0 (hvt/virtio-console-read {:device-features-sel 0} (:device-features vio/mmio-reg))))
+       (is (= 1 (hvt/virtio-console-read {:device-features-sel 1} (:device-features vio/mmio-reg)))))
+     (testing "an unimplemented register reads as 0"
+       (is (= 0 (hvt/virtio-console-read {} 0x1fc))))))
+
+(deftest virtio-console-status-handshake
+  (testing "status writes are tracked and read back (the FEATURES_OK-stuck check depends on this)"
+    (let [ack (bit-or (:acknowledge vio/device-status-bit) (:driver vio/device-status-bit)
+                      (:features-ok vio/device-status-bit))
+          s1 (hvt/virtio-console-write {} (:status vio/mmio-reg) ack)]
+      (is (= ack (:status s1)))
+      (is (= ack (hvt/virtio-console-read s1 (:status vio/mmio-reg)))
+          "reading Status returns what the driver last wrote")
+      (let [drv-ok (bit-or ack (:driver-ok vio/device-status-bit))
+            s2 (hvt/virtio-console-write s1 (:status vio/mmio-reg) drv-ok)]
+        (is (= drv-ok (:status s2))))))
+  (testing "feature/queue selectors are tracked"
+    (is (= 1 (:device-features-sel (hvt/virtio-console-write {} (:device-features-sel vio/mmio-reg) 1))))
+    (is (= 0 (:queue-sel (hvt/virtio-console-write {} (:queue-sel vio/mmio-reg) 0))))))
+
+(deftest queue-config-per-queue
+  (testing "queue-config registers route into the selected queue and resolve 64-bit addrs"
+    (let [prog (fn [st reg v] (hvt/virtio-console-write st reg v))
+          st (-> {}
+                 (prog (:queue-sel vio/mmio-reg) 1)
+                 (prog (:queue-num vio/mmio-reg) 8)
+                 (prog (:queue-desc-low vio/mmio-reg) 0x40010000)
+                 (prog (:queue-desc-high vio/mmio-reg) 0)
+                 (prog (:queue-driver-low vio/mmio-reg) 0x40020000)
+                 (prog (:queue-device-low vio/mmio-reg) 0x40030000)
+                 (prog (:queue-ready vio/mmio-reg) 1))]
+      (is (= {:desc 0x40010000 :driver 0x40020000 :device 0x40030000 :num 8}
+             (hvt/queue-config st 1)))
+      (is (= 1 (get-in st [:queues 1 :ready])))
+      (testing "a different queue is independent"
+        (is (= {:desc 0 :driver 0 :device 0 :num 0} (hvt/queue-config st 0)))))))
+
+;; A synthetic guest-RAM helper: build a byte map, then a gpa->byte accessor.
+(defn- ram-write-le [ram gpa n v]
+  (reduce (fn [m i] (assoc m (+ gpa i) (bit-and (unsigned-bit-shift-right v (* 8 i)) 0xff)))
+          ram (range n)))
+
+(defn- synthetic-transmit-ram
+  "Guest RAM with one transmit descriptor at `desc`, avail idx 1 pointing at it,
+  used idx 0, and `bytes` in a buffer at `buf`."
+  [{:keys [desc driver device buf]} byte-seq]
+  (let [n (count byte-seq)]
+    (as-> {} r
+      (ram-write-le r desc 8 buf)              ; desc0.addr
+      (ram-write-le r (+ desc 8) 4 n)          ; desc0.len
+      (ram-write-le r (+ desc 12) 2 0)         ; desc0.flags (device-readable)
+      (ram-write-le r (+ desc 14) 2 0)         ; desc0.next
+      (ram-write-le r driver 2 0)              ; avail.flags
+      (ram-write-le r (+ driver 2) 2 1)        ; avail.idx = 1
+      (ram-write-le r (+ driver 4) 2 0)        ; avail.ring[0] = desc 0
+      (ram-write-le r device 2 0)              ; used.flags
+      (ram-write-le r (+ device 2) 2 0)        ; used.idx = 0
+      (reduce (fn [m [i b]] (assoc m (+ buf i) (code b)))
+              r (map-indexed vector byte-seq)))))
+
+(deftest virtqueue-plan-transmit
+  (testing "servicing a transmit queue pulls the buffer bytes and plans the used ring"
+    (let [cfg {:desc 0x1000 :driver 0x2000 :device 0x3000 :buf 0x4000}
+          ram (synthetic-transmit-ram cfg [\H \I \newline])
+          rd (fn [gpa] (get ram gpa 0))
+          plan (hvt/virtqueue-plan rd (assoc (dissoc cfg :buf) :num 8) 0)]
+      (is (= "HI\n" (:emitted plan)) "device reads the transmit buffer out of guest RAM")
+      (is (= [{:slot 0 :id 0 :len 3}] (:used plan)) "one completion pushed to the used ring")
+      (is (= 1 (:used-idx plan)))
+      (is (= 1 (:seen plan)) "avail idx consumed")))
+  (testing "nothing available (avail idx == seen) emits nothing"
+    (let [ram (synthetic-transmit-ram {:desc 0x1000 :driver 0x2000 :device 0x3000 :buf 0x4000} [\X])
+          rd (fn [gpa] (get ram gpa 0))
+          plan (hvt/virtqueue-plan rd {:desc 0x1000 :driver 0x2000 :device 0x3000 :num 8} 1)]
+      (is (= "" (:emitted plan)))
+      (is (= [] (:used plan))))))
+
+(defn- synthetic-receive-ram
+  "Guest RAM with one device-WRITABLE receive descriptor of capacity `cap` at
+  `desc`, avail idx 1 pointing at it, used idx 0."
+  [{:keys [desc driver device buf]} cap]
+  (as-> {} r
+    (ram-write-le r desc 8 buf)                          ; desc0.addr
+    (ram-write-le r (+ desc 8) 4 cap)                    ; desc0.len (capacity)
+    (ram-write-le r (+ desc 12) 2 (:write vio/desc-flag)) ; desc0.flags: WRITABLE
+    (ram-write-le r (+ desc 14) 2 0)                     ; desc0.next
+    (ram-write-le r driver 2 0)                          ; avail.flags
+    (ram-write-le r (+ driver 2) 2 1)                    ; avail.idx = 1
+    (ram-write-le r (+ driver 4) 2 0)                    ; avail.ring[0] = desc 0
+    (ram-write-le r device 2 0)                          ; used.flags
+    (ram-write-le r (+ device 2) 2 0)))                  ; used.idx = 0
+
+(deftest virtqueue-rx-plan-receive
+  (testing "servicing a receive queue plans writes of input into the writable buffer"
+    (let [cfg {:desc 0x1000 :driver 0x2000 :device 0x3000 :buf 0x4000}
+          ram (synthetic-receive-ram cfg 16)
+          rd (fn [gpa] (get ram gpa 0))
+          plan (hvt/virtqueue-rx-plan rd (assoc (dissoc cfg :buf) :num 8) 0 "HI\n")]
+      (is (= [{:gpa 0x4000 :byte \H} {:gpa 0x4001 :byte \I} {:gpa 0x4002 :byte \newline}]
+             (:writes plan)) "input bytes planned into the buffer at its addr")
+      (is (= [{:slot 0 :id 0 :len 3}] (:used plan)) "completion carries the byte count written")
+      (is (= 1 (:used-idx plan)))
+      (is (= 1 (:seen plan)))))
+  (testing "input is truncated to the buffer capacity"
+    (let [cfg {:desc 0x1000 :driver 0x2000 :device 0x3000 :buf 0x4000}
+          ram (synthetic-receive-ram cfg 2)   ; capacity 2, input 3
+          rd (fn [gpa] (get ram gpa 0))
+          plan (hvt/virtqueue-rx-plan rd (assoc (dissoc cfg :buf) :num 8) 0 "HI\n")]
+      (is (= 2 (count (:writes plan))) "only 2 bytes fit")
+      (is (= [{:slot 0 :id 0 :len 2}] (:used plan))))))
+
+(deftest fill-targets-and-writable-chain
+  (testing "fill-targets spreads input across targets up to capacity"
+    (is (= [[{:gpa 100 :byte \A} {:gpa 101 :byte \B} {:gpa 200 :byte \C}] [] 3]
+           (hvt/fill-targets [{:addr 100 :len 2} {:addr 200 :len 5}] "ABC"))))
+  (testing "walk-writable-chain collects only device-writable segments"
+    (let [ram (as-> {} r
+                ;; desc 0: readable, chains to desc 1 (writable)
+                (ram-write-le r 0x1000 8 0x5000)
+                (ram-write-le r 0x1008 4 2)
+                (ram-write-le r 0x100c 2 (:next vio/desc-flag))
+                (ram-write-le r 0x100e 2 1)
+                (ram-write-le r 0x1010 8 0x6000)
+                (ram-write-le r 0x1018 4 8)
+                (ram-write-le r 0x101c 2 (:write vio/desc-flag))
+                (ram-write-le r 0x101e 2 0))
+          rd (fn [gpa] (get ram gpa 0))]
+      (is (= [{:addr 0x6000 :len 8}] (hvt/walk-writable-chain rd 0x1000 8 0))
+          "only the writable descriptor is a receive target"))))
+
+(deftest walk-descriptor-chain-follows-next
+  (testing "a two-descriptor chain concatenates both device-readable buffers"
+    (let [ram (as-> {} r
+                ;; desc 0 -> "AB" @0x5000, chains to desc 1
+                (ram-write-le r 0x1000 8 0x5000)
+                (ram-write-le r 0x1008 4 2)
+                (ram-write-le r 0x100c 2 (:next vio/desc-flag))
+                (ram-write-le r 0x100e 2 1)
+                ;; desc 1 -> "C" @0x5002, no next
+                (ram-write-le r 0x1010 8 0x5002)
+                (ram-write-le r 0x1018 4 1)
+                (ram-write-le r 0x101c 2 0)
+                (ram-write-le r 0x101e 2 0)
+                (assoc r 0x5000 (code \A) 0x5001 (code \B) 0x5002 (code \C)))
+          rd (fn [gpa] (get ram gpa 0))
+          {:keys [bytes len]} (hvt/walk-descriptor-chain rd 0x1000 8 0)]
+      (is (= [(code \A) (code \B) (code \C)] bytes))
+      (is (= 3 len))))
+  (testing "a device-WRITABLE descriptor is not emitted (it's a receive buffer)"
+    (let [ram (as-> {} r
+                (ram-write-le r 0x1000 8 0x5000)
+                (ram-write-le r 0x1008 4 2)
+                (ram-write-le r 0x100c 2 (:write vio/desc-flag))
+                (ram-write-le r 0x100e 2 0)
+                (assoc r 0x5000 (code \Z) 0x5001 (code \Z)))
+          rd (fn [gpa] (get ram gpa 0))
+          {:keys [bytes]} (hvt/walk-descriptor-chain rd 0x1000 8 0)]
+      (is (= [] bytes) "device-writable buffers carry no transmit data"))))
+
+;; The chain guard bounded how many descriptors were followed, not how big one
+;; was. :len is a 32-bit guest-written field and went straight into (range len).
+(deftest a-descriptor-cannot-claim-more-than-guest-ram
+  (let [desc-gpa 0x1000
+        ;; one descriptor, no NEXT flag, claiming the whole 32-bit range
+        ram (atom {})
+        put-le! (fn [addr n width]
+                  (dotimes [i width]
+                    (swap! ram assoc (+ addr i)
+                           (bit-and (bit-shift-right n (* 8 i)) 0xff))))
+        rd (fn [addr] (get @ram addr 0))]
+    (put-le! (+ desc-gpa 0) 0x2000 8)          ; addr
+    ;; one past the bound, not 0xffffffff: the field really does reach 4 GiB,
+    ;; but asking an unpatched build to allocate that is how you take the host
+    ;; down while checking that it would.
+    (put-le! (+ desc-gpa 8) (inc hvt/guest-ram-size) 4)
+    (put-le! (+ desc-gpa 12) 0 2)              ; flags: not writable, no next
+    (put-le! (+ desc-gpa 14) 0 2)              ; next
+    (let [e (try (hvt/walk-descriptor-chain rd desc-gpa 8 0)
+                 (catch :default e e))]
+      (is (some? (ex-data e))
+          "a 4 GiB descriptor was collected instead of rejected")
+      (is (= (inc hvt/guest-ram-size) (:len (ex-data e))))
+      (is (= hvt/guest-ram-size (:max (ex-data e))))))
+  (testing "a length within guest RAM still works"
+    (let [ram (atom {})
+          rd (fn [addr] (get @ram addr 0))]
+      (swap! ram assoc 0x2000 72 0x2001 73)
+      (dotimes [i 8] (swap! ram assoc (+ 0x1000 i) (if (= i 1) 0x20 0)))
+      (swap! ram assoc 0x1008 2)
+      (is (= 2 (:len (hvt/walk-descriptor-chain rd 0x1000 8 0)))))))
+
+(deftest a-descriptor-index-must-be-inside-the-queue
+  ;; :next is a 16-bit guest field and read-descriptor turned it straight into
+  ;; desc-gpa + d*16, so a chain could step a megabyte past the table and read
+  ;; whatever was there as a descriptor.
+  (let [ram (atom {})
+        rd (fn [addr] (get @ram addr 0))
+        put-le! (fn [addr n width]
+                  (dotimes [i width]
+                    (swap! ram assoc (+ addr i)
+                           (bit-and (bit-shift-right n (* 8 i)) 0xff))))]
+    ;; descriptor 0: len 1, NEXT set, next = 4000 (well outside an 8-slot table)
+    (put-le! 0x1000 0x2000 8)
+    (put-le! 0x1008 1 4)
+    (put-le! 0x100c (:next vio/desc-flag) 2)
+    (put-le! 0x100e 4000 2)
+    (let [e (try (hvt/walk-descriptor-chain rd 0x1000 8 0)
+                 (catch :default e e))]
+      (is (some? (ex-data e))
+          "a chain stepped outside the descriptor table")
+      (is (= 4000 (:descriptor (ex-data e))))
+      (is (= 8 (:queue-size (ex-data e)))))))

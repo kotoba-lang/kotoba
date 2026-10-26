@@ -1,0 +1,179 @@
+;; The initial APIC ID of the CPU executing this call.
+;;
+;; The third of the three objects replacing this kernel's six `cpuid` sites,
+;; and the one that is NOT a feature test. Its two siblings
+;; (`cpu-feature-nx`, `cpu-feature-syscall`) ask a yes/no question about the
+;; machine's capabilities; this one reads an IDENTIFIER and hands it back.
+;;
+;; That distinction was worth making the objects three rather than one. Grouped
+;; under "the cpuid sites", all six looked like one problem with one answer --
+;; a generic `(cpu-feature leaf bit)` -- and this site does not fit that shape
+;; at all: it extracts an 8-bit FIELD, not a bit, and what it returns is not a
+;; predicate. A generic accessor would have forced this call site to keep its
+;; own shift and mask in C, which is the arithmetic most likely to be wrong.
+;;
+;; WHAT IT IS AND WHERE IT GOES
+;;
+;; Leaf 1, EBX bits 31:24 is the LOCAL APIC ID assigned at reset ("initial APIC
+;; ID"). pci.c uses it as the DESTINATION field of an MSI-X message address:
+;;
+;;   pci.c:670  entry[0].address_low = 0xfee00000U | (((ebx >> 24) & 0xffU) << 12);
+;;   pci.c:710  uint32_t destination = (ebx >> 24) & 0xffU;
+;;   pci.c:711  uint32_t message_address = 0xfee00000U | (destination << 12);
+;;
+;; 0xfee00000 is the x86 interrupt-message address range, and bits 19:12 of the
+;; address carry the destination APIC ID -- an MSI-X write to that address is
+;; how the device raises an interrupt on a specific CPU. So a wrong value here
+;; does not corrupt anything and does not fault: the device writes to a
+;; DIFFERENT, perfectly legal message address, the interrupt is delivered to a
+;; CPU that is not waiting for it or to none at all, and what the kernel
+;; observes is that `aiueos_virtio_rng_irq_count` never increments and the boot
+;; hangs in the completion loop until its 100,000,000-iteration budget expires.
+;; A wrong shift here reads as a dead device.
+;;
+;; The two call sites are not identical in context, which is why both were read
+;; before either was changed. The rng one inlines the extraction straight into
+;; `address_low`; the blk one binds `destination` first because it also passes
+;; it to `aiueos_vtd_program_msix`, which may REWRITE the message address and
+;; data when VT-d interrupt remapping is on. `destination` therefore survives
+;; the change as a local at the second site and does not at the first.
+;;
+;; THE EXTRACTION, AND THE ORDER THAT HAS BITTEN THIS TREE BEFORE
+;;
+;; There is no shift operator in this subset, so `(x >> 24)` is
+;; `(quot x 16777216)`. The question is whether to mask first or divide first,
+;; and it is a real question rather than a stylistic one -- `vtd-admit` records
+;; a MEASURED case where getting it backwards turned a refusal into an
+;; admission.
+;;
+;; The two forms are:
+;;
+;;   divide-first  (bit-and (quot ebx 16777216) 255)          <- mirrors the C
+;;   mask-first    (quot (bit-and ebx 4278190080) 16777216)   <- USED HERE
+;;
+;; They differ because `quot` TRUNCATES TOWARD ZERO where `>>` FLOORS, and the
+;; two agree only on non-negative inputs. Worked out on a concrete negative,
+;; since "they differ on negatives" is easy to say and easy to get wrong: for
+;; ebx = 0xffffffff_80000001 (i.e. -2147483647), whose bits 31:24 are 0x80,
+;;
+;;   divide-first: (quot -2147483647 16777216) = -127   (truncation; floor is -128)
+;;                 (bit-and -127 255)          = 129     <- WRONG, off by one
+;;   mask-first:   (bit-and -2147483647 4278190080) = 0x80000000
+;;                 (quot 0x80000000 16777216)     = 128   <- correct
+;;
+;; DOES IT MATTER HERE? Strictly, no -- and this is the part worth stating
+;; rather than leaving implicit. `kernel-cpuid-ebx` cannot return a negative
+;; i64: `cpuid` writes the 32-bit register `ebx`, a 32-bit destination write
+;; zeroes bits 63:32 of the containing 64-bit register, and the backend's
+;; result move (`mov eax,ebx`, `89 d8`) is itself 32-bit and re-establishes the
+;; same property in `rax`. Every `kernel-cpuid-*` result arrives in [0, 2^32),
+;; non-negative, so `quot` and `>>` coincide and BOTH orders give the same
+;; answer. The zero-extension is what makes the divide-first form safe, and it
+;; is a property of the backend, not of this file.
+;;
+;; Mask-first is used anyway, for two reasons. It costs exactly the same -- one
+;; `and` and one divide either way -- and it is correct WITHOUT depending on the
+;; zero-extension, so it stays correct if this object is ever fed from something
+;; other than a `cpuid` primitive. And it makes the trailing `& 0xff`
+;; unnecessary: masking with 0xff000000 = 4278190080 before dividing by
+;; 2^24 = 16777216 leaves a result already in [0, 255], so the C's final mask
+;; has no counterpart here. The C's `& 0xffU` was itself redundant, for the same
+;; reason its `ebx` was a `uint32_t`; that redundancy is not reproduced.
+;;
+;; The disassembly makes the stakes concrete, and is the reason this paragraph
+;; is not hand-waving: `quot` compiles to `cqo` + `idiv rcx` (0x63, 0x65) --
+;; SIGNED division, sign-extending RAX into RDX:RAX first and truncating toward
+;; zero, exactly the semantics that disagree with `>>` on negatives. Because the
+;; `and` at 0x51 runs BEFORE it, the dividend entering `cqo` is at most
+;; 0x00000000_ff000000, so `cqo` writes 0 into RDX and the truncation has
+;; nothing to truncate. Divide-first would have put the raw `cpuid` result into
+;; that `idiv` and leaned on the zero-extension to keep it non-negative.
+;;
+;; Both halves of that are measured rather than argued. Ten EBX values run
+;; through the emitted object with `cpuid` neutralised agree with the C
+;; expression, including 0x80000000, 0x80ffffff, 0x81020304, 0xff000000 and
+;; 0xffffffff -- every one with bit 31 set. And feeding 0xffffffff_81020304, the
+;; sign-extended form the zero-extension would otherwise prevent, still yields
+;; 129, which is what mask-first buys: the answer does not depend on the upper
+;; half being clean. The divide-first form is the one that would not survive
+;; that -- for 0xffffffff_80000001 it yields 129 where the correct answer is
+;; 128, off by one because `idiv` truncates toward zero where `>>` floors.
+;;
+;; Both constants are positive as i64: 4278190080 = 0xff000000 and
+;; 16777216 = 2^24 are far under 2^63.
+;;
+;; NO GUARD, AND WHY THAT IS NOT AN OMISSION
+;;
+;; The sibling objects guard leaf 0x80000001 against the maximum extended leaf.
+;; This one queries LEAF 1, which is BASIC, and leaf 1 is architecturally
+;; guaranteed on every CPU that implements `cpuid` at all -- there is no
+;; 64-bit x86 CPU that reaches this code and answers leaf 1 with something
+;; else. The `0x80000000` probe the other two perform has no analogue here and
+;; adding one would be ceremony. (Leaf 0's EAX gives the maximum BASIC leaf,
+;; which would be the corresponding check; it cannot be less than 1 on any CPU
+;; that got this far, since the kernel is already executing 64-bit code.)
+;;
+;; WHAT THIS IS NOT
+;;
+;; It is not the x2APIC ID (leaf 0xb / 0x1f), and it is not the CPU's index in
+;; any table this kernel keeps. It is 8 bits, so it cannot name more than 256
+;; CPUs -- the field saturates at 0xff on larger machines, where leaf 0xb is
+;; the correct source. This kernel brings up two CPUs and reads the running
+;; core's ID from MMIO in smp.c, so the limit is not reached; if that changes,
+;; the replacement belongs HERE, as a different object with a different name,
+;; not as an argument to this one.
+;;
+;; FUEL -- 1 per call, 2 calls in the gate configuration, 512 is the ceiling
+;;
+;; Deliberately absent from `bounded-memory?` in kotoba-native's elf64.clj, so
+;; no replenish: 512 from its own `.data` context for the whole boot, per
+;; object and not shared with the two feature objects.
+;;
+;; Measured from the emitted object: exactly TWO fuel-charge sequences
+;; (`cmpq $0,0x8(%r9)` / `jne` / `ud2` / `decq 0x8(%r9)`), at 0x15 -- this
+;; function's entry -- and at 0x70, `main`'s, which the kernel never calls. The
+;; wrapper at 0x0 carries no `mov qword [r9+8], N` between its `lea` and its
+;; `sub`, which is where a `bounded-memory?` object's replenish sits.
+;; `cpuid` is emitted INLINE (`0f a2` at 0x3d), not as a call, so it charges
+;; nothing -- checked here rather than assumed from the `kernel-out-u8`
+;; precedent; the `and` and the `idiv` are arithmetic and charge nothing.
+;; ONE unit per call, on the single path this object has.
+;;
+;; The call count is the one that needed checking rather than assuming, because
+;; unlike its siblings this object is NOT called from a one-shot initialiser --
+;; it is called PER MSI-X SETUP, from inside PCI enumeration:
+;;
+;;   pci.c:668  setup_rng_msix <- virtio_rng <- pci.c:1729  enumeration loop
+;;   pci.c:709  setup_blk_msix <- virtio_blk <- pci.c:1731  enumeration loop
+;;
+;; The loop at pci.c:1718 walks 256 buses x 32 devices x up to 8 functions and
+;; does NOT break once a device of each kind has succeeded: the guard is on the
+;; device ID alone (`device_id == VIRTIO_RNG_* && virtio_rng(...)`), so a second
+;; virtio-rng function would be brought up, and would program MSI-X, a second
+;; time. The count is therefore "one per virtio-rng plus one per virtio-blk
+;; function that reaches MSI-X programming", not "once".
+;;
+;; In the gate configuration that is TWO: smoke-qemu-uefi.sh passes exactly one
+;; `-device virtio-rng-pci` and one `-device virtio-blk-pci`. (virtio-input,
+;; virtio-gpu and virtio-net are also present but do not program MSI-X and
+;; contain no `cpuid` site.) 2 of 512.
+;;
+;; The ceiling is worth naming since the count is data-dependent: this object
+;; supports 512 MSI-X setups per boot before its counter reaches zero and the
+;; prologue `ud2` fires. Reaching that would need 512 virtio-rng/blk functions
+;; each getting as far as a mapped MSI-X table, which is two orders of magnitude
+;; beyond anything this kernel is configured against -- but it IS a bound, and
+;; it is a bound on device count rather than on anything this file controls. A
+;; machine that exceeded it would need this object added to `bounded-memory?`;
+;; nothing else about it would change.
+
+(defn aiueos-cpu-apic-id []
+  ;; Leaf 1, subleaf 0 -> EBX. Bits 31:24 are the initial APIC ID.
+  ;; Mask with 0xff000000 BEFORE dividing by 2^24, per the rule `vtd-admit`
+  ;; measured: `quot` truncates toward zero where `>>` floors, so the orders
+  ;; disagree on negatives. A `cpuid` result cannot be negative here (32-bit
+  ;; register writes zero-extend), so both orders would in fact agree -- this
+  ;; one is correct without relying on that, and needs no trailing mask.
+  (quot (bit-and (kernel-cpuid-ebx 1 0) 4278190080) 16777216))
+
+(defn main [] 0)

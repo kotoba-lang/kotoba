@@ -1,0 +1,154 @@
+#!/usr/bin/env kbb
+;; verify-smoke-freshness.cljs -- which boot harnesses can still lie (ADR-0155).
+;;
+;; A harness that boots an image is making a claim about the tree in front of
+;; it. It can only make that claim if something connects the bytes QEMU opened
+;; to the build that produced them. `image-freshness.cljs assert` is that
+;; connection; this file enumerates who has it.
+;;
+;; It is a RATCHET, not a pass/fail on the whole set. Wiring all 40-odd
+;; harnesses is not one change -- several build media (PXE, USB, GRUB,
+;; multiboot) that cannot be exercised on this workstation. So the unattested
+;; set is written down, with a count, and this refuses when the set GROWS. A
+;; new smoke that boots an image without a freshness assert goes red on the
+;; commit that adds it, and the existing debt is visible rather than absent.
+;;
+;;   0  the unattested set is a subset of the baseline
+;;   1  a smoke boots an image with no freshness assertion and is not in the
+;;      baseline -- or a baseline entry no longer exists / no longer boots
+;;   2  COULD-NOT-RUN: no smokes found, or the baseline is unreadable. An
+;;      empty scan is never a pass.
+;;
+;; Usage: kbb --backend sci os/aiueos/scripts/verify-smoke-freshness.cljk [--root <repo>]
+;;                                                          [--write-baseline]
+
+(ns verify-smoke-freshness
+  (:require ["node:fs" :as fs]
+            ["node:path" :as path]
+            [clojure.edn :as edn]
+            [kotoba.lang.text :as str]))
+
+(def script-dir (path/dirname *file*))
+(def default-root (path/resolve (path/join script-dir ".." ".." "..")))
+
+(defn- parse-args [argv]
+  (loop [args argv opts {:root default-root}]
+    (if (empty? args)
+      opts
+      (let [[a & more] args]
+        (case a
+          "--root" (recur (rest more) (assoc opts :root (path/resolve (first more))))
+          "--write-baseline" (recur more (assoc opts :write-baseline true))
+          (recur more opts))))))
+
+(def opts (parse-args (vec (drop 3 (js->clj js/process.argv)))))
+(def root (:root opts))
+(def scripts-dir (path/join root "os" "aiueos" "scripts"))
+(def baseline-path
+  (path/join root "os" "aiueos" "contracts" "smoke-freshness-baseline.edn"))
+
+(defn- could-not-run! [& detail]
+  (binding [*out* *err*]
+    (println (str/join " " (into ["COULD-NOT-RUN"] detail))))
+  (js/process.exit 2))
+
+(when-not (fs/existsSync scripts-dir) (could-not-run! "scripts-dir-missing" scripts-dir))
+
+(def smokes
+  (->> (fs/readdirSync scripts-dir)
+       (filter #(str/starts-with? % "smoke-qemu-"))
+       sort
+       vec))
+
+(when (zero? (count smokes))
+  ;; Evidence floor. Zero files scanned is the same output as "everything is
+  ;; attested", and that is the defect this whole ADR is about.
+  (could-not-run! "no-smokes-found" scripts-dir))
+
+(defn- classify [name]
+  (let [text (fs/readFileSync (path/join scripts-dir name) "utf8")
+        ;; Delegation counts: a harness that runs smoke-qemu-uefi.sh inherits
+        ;; that script's build, its receipt assert and its exit codes.
+        ;; A COMMENT that mentions the hub is not delegation. Counting one
+        ;; would be this ADR's own defect in miniature: a harness that merely
+        ;; talks about the attested path would be recorded as taking it.
+        code-lines (remove (fn [l] (let [t (str/triml l)]
+                                     (or (str/blank? t)
+                                         (str/starts-with? t ";")
+                                         (str/starts-with? t "#"))))
+                           (str/split-lines text))
+        delegates? (boolean (some #(str/includes? % "smoke-qemu-uefi.sh") code-lines))
+        direct? (or (str/includes? text "qemu-system-x86_64")
+                    (str/includes? text "QEMU_SYSTEM_X86_64"))
+        ;; Either the shared tool, or an in-file check that emits the same
+        ;; pinned literal. dot-f32 compiles into its own mkdtemp and compares
+        ;; the digests it recorded; what makes it attested is that it REFUSES
+        ;; with `REFUSED stale-image`, not which file the comparison lives in.
+        asserts? (or (str/includes? text "image-freshness.cljk")
+                     (str/includes? text "REFUSED stale-image"))]
+    {:name name
+     :boots? (boolean (or direct? delegates?))
+     :attested? (boolean (or asserts? (and delegates? (not direct?))))
+     :how (cond asserts? :asserts
+                (and delegates? (not direct?)) :delegates
+                direct? :direct
+                :else :none)}))
+
+(def rows (mapv classify smokes))
+(def booting (filterv :boots? rows))
+(def unattested (->> booting (remove :attested?) (mapv :name) sort vec))
+
+(when (:write-baseline opts)
+  (fs/mkdirSync (path/dirname baseline-path) #js {:recursive true})
+  (fs/writeFileSync baseline-path
+                    (str (pr-str {:format :aiueos.smoke-freshness-baseline/v1
+                                  :measured "2026-09-02"
+                                  :note (str "Image-booting smoke harnesses with no "
+                                             "image-freshness.cljk assert. This list may "
+                                             "only shrink.")
+                                  :unattested unattested})
+                         "\n"))
+  (println "BASELINE written" baseline-path "unattested=" (count unattested))
+  (js/process.exit 0))
+
+(when-not (fs/existsSync baseline-path) (could-not-run! "baseline-missing" baseline-path))
+(def baseline
+  (let [v (try (edn/read-string (fs/readFileSync baseline-path "utf8"))
+               (catch :default e (could-not-run! "baseline-unreadable" (.-message e))))]
+    (when-not (= :aiueos.smoke-freshness-baseline/v1 (:format v))
+      (could-not-run! "baseline-unreadable" (str "format=" (pr-str (:format v)))))
+    v))
+
+(def allowed (set (:unattested baseline)))
+(def added (vec (sort (remove allowed unattested))))
+(def removed (vec (sort (remove (set unattested) allowed))))
+
+(println (str "SCANNED " (count smokes)
+              " booting=" (count booting)
+              " attested=" (count (filter :attested? booting))
+              " unattested=" (count unattested)
+              " baseline=" (count allowed)))
+(doseq [row booting]
+  (println (str "  " (str/upper (clojure.core/name (:how row))) " " (:name row))))
+
+(cond
+  (seq added)
+  (do (binding [*out* *err*]
+        (println "REFUSED unattested-boot-harness")
+        (doseq [n added]
+          (println (str "  " n " boots an image and never calls"
+                        " image-freshness.cljk assert"))))
+      (js/process.exit 1))
+
+  (seq removed)
+  (do (binding [*out* *err*]
+        (println "REFUSED stale-baseline")
+        (doseq [n removed]
+          (println (str "  " n " is in the baseline but no longer boots an"
+                        " image (or no longer exists) -- shrink the list"))))
+      (js/process.exit 1))
+
+  :else
+  (do (println "SMOKE-FRESHNESS-OK unattested=" (count unattested)
+               "(baseline may only shrink)")
+      (js/process.exit 0)))

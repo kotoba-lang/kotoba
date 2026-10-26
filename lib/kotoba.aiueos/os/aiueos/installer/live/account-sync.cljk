@@ -1,0 +1,317 @@
+#!/usr/bin/env kbb
+;; Link the machine being installed to a kotoba.cloud account, at the console
+;; of the live installer (aiueos ADR-0239; the protocol is ADR-0113's, unchanged).
+;;
+;;   kbb --backend sci account-sync.cljk --model gmktec-k16 --out account.json
+;;       [--method phone-scan|passkey] [--no-qr]
+;;
+;; The machine shows a QR; a phone scans it and approves with its Passkey at
+;; auth.kotoba.cloud; this program polls the authority, checks that the result
+;; binds THIS flow, device and keys, proves possession of the device key, and
+;; only then writes the record. The phone never receives the poll token or any
+;; device private key, and the authority never receives a private key at all.
+;;
+;; The device keys are generated here, on the machine, at install time -- the
+;; same rule as the SSH host key (make-provision-record.cljk): nothing secret is
+;; on the stick. `--out` is written 0600 into the installer's tmpfs and goes to
+;; the target's private provision zone, nowhere else.
+;;
+;; Exit codes, one meaning each:
+;;   0  linked; the record is written
+;;   2  refused, with `AIUEOS_ACCOUNT_SYNC_REFUSE <reason>` on stdout
+;;   3  could not answer (authority unreachable, no fetch, expired unanswered)
+;;   4  skipped by the person at the console -- NOT linked, and not a failure
+;;
+;; What this does not do: apply the Wi-Fi profile the phone may attach (the
+;; envelope is kept opaque, ADR-0113 decision 7), or make the installed kernel
+;; read the record. Both are native work (ADR-0239 stage 2).
+
+(require '[kotoba.lang.text :as str]
+         '[aiueos.device-auth :as device-auth]
+         '[aiueos.qr :as qr])
+
+(def fs (js/require "node:fs"))
+(def crypto (js/require "node:crypto"))
+
+(def authority "https://auth.kotoba.cloud")
+(def rp-id "auth.kotoba.cloud")
+(def start-url (str authority "/v1/aiueos/device/start"))
+(def poll-url (str authority "/v1/aiueos/device/poll"))
+(def response-limit (* 64 1024))
+
+(def args (vec *command-line-args*))
+(defn- arg [flag]
+  (let [i (.indexOf (to-array args) flag)]
+    (when (and (>= i 0) (< (inc i) (count args))) (nth args (inc i)))))
+(defn- flag? [f] (>= (.indexOf (to-array args) f) 0))
+
+(defn- exit! [code] (.exit js/process code))
+(defn- refuse! [reason & more]
+  (apply println "AIUEOS_ACCOUNT_SYNC_REFUSE" reason more)
+  (exit! 2))
+(defn- unanswered! [reason & more]
+  (apply println "AIUEOS_ACCOUNT_SYNC_UNANSWERED" reason more)
+  (exit! 3))
+
+(def model (or (arg "--model") (unanswered! "model-missing" "--model is required")))
+(def out (or (arg "--out") (unanswered! "out-missing" "--out is required")))
+(def method (keyword (or (arg "--method") "phone-scan")))
+
+(when-not (contains? device-auth/webauthn-methods method)
+  ;; the installer console carries no wallet; SIWE is a front door of the same
+  ;; state machine, but not one this program can open
+  (refuse! "method-not-offered-at-installer" (str "method=" (name method))))
+(when-not (re-matches #"[a-z0-9][a-z0-9-]{0,62}" model)
+  (refuse! "model-not-a-slug" (str "model=" (pr-str model))))
+
+;; ------------------------------------------------------------------ keys
+
+(defn- random-hex [n] (.toString (.randomBytes crypto n) "hex"))
+
+(defn- device-keys []
+  (let [ed (.generateKeyPairSync crypto "ed25519")
+        x (.generateKeyPairSync crypto "x25519")
+        jwk (fn [k] (.export k #js {:format "jwk"}))]
+    {:ed-private (.-privateKey ed)
+     :ed-public (.-publicKey ed)
+     :signing-seed (.-d (jwk (.-privateKey ed)))
+     :signing-public (.-x (jwk (.-publicKey ed)))
+     :encryption-private (.-d (jwk (.-privateKey x)))
+     :encryption-public (.-x (jwk (.-publicKey x)))}))
+
+(defn- sign-b64url [keys text]
+  (.toString (.sign crypto nil (js/Buffer.from text "utf8") (:ed-private keys)) "base64url"))
+
+(defn- verify-b64url [keys text sig]
+  (try (.verify crypto nil (js/Buffer.from text "utf8") (:ed-public keys)
+                (js/Buffer.from sig "base64url"))
+       (catch :default _ false)))
+
+;; The two proof messages are ADR-0113's, byte for byte (phone_bind.cljk
+;; start-proof-message / poll-proof-message): the authority verifies these
+;; exact strings, so they are not a place for a second spelling.
+(defn- start-proof-message
+  [{:keys [device-did challenge model method signing-public-key
+           encryption-public-key request-nonce]}]
+  (str "aiueos-device-start-v1\n"
+       device-did "\n" challenge "\n" model "\n" method "\n"
+       signing-public-key "\n" encryption-public-key "\n" request-nonce))
+
+(defn- poll-proof-message [{:keys [flow-id poll-token device-did challenge]}]
+  (str "aiueos-device-poll-v1\n"
+       flow-id "\n" device-did "\n" challenge "\n" poll-token))
+
+;; ------------------------------------------------------------------ http
+
+(defn- post-json
+  "One POST to a fixed authority URL. Redirects are errors (the origin is
+  fixed), responses over 64 KiB are refused, and a body that is not JSON is
+  returned as nil -- never guessed at."
+  [url body]
+  (-> (js/fetch url #js {:method "POST"
+                         :redirect "error"
+                         :headers #js {"content-type" "application/json"}
+                         :body (.stringify js/JSON (clj->js body))
+                         :signal (js/AbortSignal.timeout 15000)})
+      (.then (fn [res]
+               (-> (.arrayBuffer res)
+                   (.then (fn [buf]
+                            (if (> (.-byteLength buf) response-limit)
+                              {:status (.-status res) :body nil :oversize true}
+                              {:status (.-status res)
+                               :body (try (js->clj (.parse js/JSON (.toString (js/Buffer.from buf) "utf8"))
+                                                   :keywordize-keys true)
+                                          (catch :default _ nil))}))))))))
+
+(defn- sleep [ms] (js/Promise. (fn [resolve] (js/setTimeout resolve ms))))
+
+;; ------------------------------------------------------------------ checks
+;; Both mirror phone_bind.cljk (valid-authority-start? and
+;; verified-authority-result?), the hosted adapter these results were first
+;; admitted by. A field the authority echoes is compared, never trusted.
+
+(defn- token? [v]
+  (and (string? v) (<= 40 (count v) 256) (boolean (re-matches #"[A-Za-z0-9_-]+" v))))
+
+(defn- valid-start? [body]
+  (let [flow-id (:flowId body)]
+    (and (token? flow-id)
+         (token? (:pollToken body))
+         (= (str authority "/aiueos/device") (:verificationUri body))
+         (= (str authority "/aiueos/device?flow=" flow-id) (:verificationUriComplete body))
+         (integer? (:expiresIn body)) (<= 1 (:expiresIn body) 300)
+         (integer? (:interval body)) (<= 1 (:interval body) 10))))
+
+(defn- bound-result? [state flow body]
+  (and (true? (:valid body))
+       (= (:flow-id flow) (:flowId body))
+       (= (:device/did state) (:deviceDid body))
+       (= (:auth/challenge state) (:challenge body))
+       (= (:device/model state) (:model body))
+       (= (name method) (:method body))
+       (= authority (:authority body))
+       (= rp-id (:rpId body))
+       (= (:signing-public-key flow) (:deviceSigningPublicKey body))
+       (= (:encryption-public-key flow) (:deviceEncryptionPublicKey body))
+       (true? (:userPresent body))
+       (true? (:userVerified body))
+       (true? (:passkeyVerified body))
+       (string? (:principalId body))
+       (string? (:accountDid body))
+       (string? (:activeDid body))))
+
+;; ------------------------------------------------------------------ console
+
+(defn- show-approval! [url]
+  (println)
+  (println "   Scan this with the phone that holds your kotoba.cloud Passkey.")
+  (println "   The phone shows what it is approving; nothing is typed here.")
+  (println)
+  (if (flag? "--no-qr")
+    (println "   (QR suppressed by --no-qr)")
+    (let [bytes (or (qr/ascii-bytes url) (refuse! "approval-url-not-ascii"))
+          sym (or (qr/encode-bytes bytes {:ecc :medium})
+                  (refuse! "approval-url-too-long-for-qr"))]
+      (doseq [line (qr/terminal-lines sym)] (println (str "   " line)))
+      (println)
+      (println (str "   QR version " (:version sym) ", ECC M, mask " (:mask sym)))))
+  (println "   Or open it by hand:")
+  (println (str "   " url))
+  (println))
+
+;; ------------------------------------------------------------------ the flow
+
+(when-not (exists? js/fetch)
+  (unanswered! "no-fetch" "this node has no fetch; the authority cannot be reached"))
+
+(def keys* (device-keys))
+(def device-did (str "did:aiueos:" model ":" (random-hex 16)))
+(def challenge (random-hex 32))
+(def request-nonce (random-hex 32))
+
+(def state0
+  (device-auth/issue-challenge
+   (device-auth/factory {:device-did device-did :model model :rp-id rp-id
+                         :origin authority :authority authority})
+   {:challenge challenge :now-ms (js/Date.now) :ttl-ms 300000}))
+
+(defn- start! []
+  (let [binding {:device-did device-did :challenge challenge :model model
+                 :method (name method)
+                 :signing-public-key (:signing-public keys*)
+                 :encryption-public-key (:encryption-public keys*)
+                 :request-nonce request-nonce}]
+    (post-json start-url
+               {:deviceDid device-did
+                :challenge challenge
+                :model model
+                :method (name method)
+                :deviceSigningPublicKey (:signing-public keys*)
+                :deviceEncryptionPublicKey (:encryption-public keys*)
+                :requestNonce request-nonce
+                :deviceProof (sign-b64url keys* (start-proof-message binding))})))
+
+(defn- poll! [flow]
+  (post-json poll-url
+             {:flowId (:flow-id flow)
+              :pollToken (:poll-token flow)
+              :deviceDid device-did
+              :challenge challenge
+              :deviceProof (sign-b64url keys* (poll-proof-message
+                                               {:flow-id (:flow-id flow)
+                                                :poll-token (:poll-token flow)
+                                                :device-did device-did
+                                                :challenge challenge}))}))
+
+(defn- complete! [flow body]
+  (when-not (bound-result? state0 flow body)
+    (refuse! "authority-result-binding-invalid"))
+  (let [now (js/Date.now)
+        authenticated (device-auth/authenticate-account
+                       state0
+                       {:auth/method method
+                        :auth/challenge (:challenge body)
+                        :auth/rp-id (:rpId body)
+                        :auth/origin (:authority body)
+                        :auth/user-present? (:userPresent body)
+                        :auth/user-verified? (:userVerified body)
+                        :authority/verified? true
+                        :account/principal-id (:principalId body)
+                        :account/did (:accountDid body)
+                        :passkey/sign-count-ok? true
+                        :phone/device-did (:activeDid body)
+                        :phone/passkey-verified? (:passkeyVerified body)
+                        :phone/approved? true}
+                       now)
+        ;; possession: the device key signs the challenge and the signature is
+        ;; verified here, before anything is persisted (ADR-0113 decision 5)
+        signature (sign-b64url keys* (:auth/challenge authenticated))
+        claimed (device-auth/prove-device
+                 authenticated
+                 {:device-did device-did
+                  :public-key (:signing-public keys*)
+                  :proof-valid? (verify-b64url keys* (:auth/challenge authenticated) signature)}
+                 now)]
+    (when-not (device-auth/claimed? claimed)
+      (refuse! (name (or (:aiueos.device-auth/reason claimed) :device-claim-denied))))
+    (let [record {:schema "aiueos.account-sync.v1"
+                  :authority authority
+                  :rpId rp-id
+                  :method (name method)
+                  :model model
+                  :deviceDid device-did
+                  :flowId (:flow-id flow)
+                  :challenge challenge
+                  :principalId (:account/principal-id claimed)
+                  :accountDid (:account/did claimed)
+                  :activeDid (:activeDid body)
+                  :syncedAt (.toISOString (js/Date. now))
+                  :possessionSignature signature
+                  ;; secret halves: provision zone only, like the SSH host seed
+                  :deviceKeys {:signingAlgo "ed25519"
+                               :signingSeed (:signing-seed keys*)
+                               :signingPublic (:signing-public keys*)
+                               :encryptionAlgo "x25519"
+                               :encryptionPrivate (:encryption-private keys*)
+                               :encryptionPublic (:encryption-public keys*)}
+                  ;; opaque: decrypting and applying it is a native-driver gate
+                  :networkEnvelope (:networkEnvelope body)}]
+      (.writeFileSync fs out (str (.stringify js/JSON (clj->js record)) "\n") #js {:mode 0600})
+      (println "AIUEOS_ACCOUNT_SYNC_OK"
+               (str "account=" (:account/did claimed))
+               (str "device=" device-did)
+               (str "signing-public=" (:signing-public keys*))
+               (str "wifi-envelope=" (if (:networkEnvelope body) "carried" "none")))
+      (exit! 0))))
+
+(defn- poll-loop [flow]
+  (if (>= (js/Date.now) (:expires-at-ms flow))
+    (unanswered! "device-flow-expired" "nobody approved within the flow lifetime")
+    (-> (sleep (* 1000 (:interval flow)))
+        (.then #(poll! flow))
+        (.then (fn [{:keys [status body]}]
+                 (case status
+                   202 (poll-loop (assoc flow :interval (or (:interval body) (:interval flow))))
+                   200 (complete! flow body)
+                   (refuse! "authority-poll-refused" (str "status=" status)
+                            (str "error=" (pr-str (:error body))))))))))
+
+(-> (start!)
+    (.then (fn [{:keys [status body]}]
+             (when-not (and (= 201 status) (valid-start? body))
+               (refuse! "authority-start-refused" (str "status=" status)
+                        (str "error=" (pr-str (:error body)))))
+             (let [flow {:flow-id (:flowId body)
+                         :poll-token (:pollToken body)
+                         :signing-public-key (:signing-public keys*)
+                         :encryption-public-key (:encryption-public keys*)
+                         :interval (:interval body)
+                         :expires-at-ms (+ (js/Date.now) (* 1000 (:expiresIn body)))}]
+               (println "AIUEOS_ACCOUNT_SYNC_PENDING"
+                        (str "flow=" (:flow-id flow))
+                        (str "device=" device-did)
+                        (str "expires-in=" (:expiresIn body) "s"))
+               (show-approval! (:verificationUriComplete body))
+               (poll-loop flow))))
+    (.catch (fn [e]
+              (unanswered! "authority-unreachable" (str (.-message e))))))

@@ -1,0 +1,115 @@
+#!/usr/bin/env kbb
+;; Gate-N2.5 host KAT oracle for the PURE-KOTOBA SSH port (planning:
+;; os/aiueos/docs/ssh-pure-port-plan.md, tranche T2 ssh-kex-hash.kotoba).
+;;
+;; The C-kernel SSH path had an oracle with teeth: smoke-qemu-ssh-kex.cljs
+;; REQUIRES ssh.transport from kotoba-lang/org-ietf-ssh and asserts the
+;; kernel's emitted AIUEOS_SSH_KEX_H equals the core's H for the same fixed
+;; inputs (the kernel bakes that H as want[], os/aiueos/kernel/main.c:1997).
+;; The pure-Kotoba port keeps the SAME oracle: this script is the host side of
+;; it. It requires ssh.transport via org-ietf-ssh's deps.edn classpath,
+;; recomputes h-transcript for the exact fixed inputs the C kernel KAT bakes
+;; (ssh-v1.edn :exchange-hash :kat-h), and asserts:
+;;   1. H == 520a9ba70d60201af9365b0e53ffafa1a31446d17ec24315eb678a9b2e709833
+;;   2. the transcript is 173 bytes (the kernel's `off`; pins the byte layout,
+;;      not just the digest)
+;; When ssh-kex-hash.kotoba exists, its (transcript -> H, 173) must equal
+;; these values in a boot KAT -- this script is the reference they must hit.
+;;
+;; Run (from a west superproject checkout the sibling repo is found
+;; automatically; from a plain aiueos worktree set ORG_IETF_SSH_SRC):
+;;   kbb --backend sci --classpath <org-ietf-ssh>/src os/aiueos/scripts/ssh-kex-kat.cljk
+
+(require '[clojure.edn :as edn]
+         '[kotoba.lang.text :as str])
+
+(def fs (js/require "node:fs"))
+(def path (js/require "node:path"))
+(def crypto (js/require "node:crypto"))
+
+;; ── locate kotoba-lang/org-ietf-ssh and build its deps.edn classpath ─────────
+(defn- ssh-repo-candidates []
+  (concat
+   ;; explicit wins
+   (when-let [env (.-ORG_IETF_SSH_SRC js/process.env)] [env])
+   ;; west superproject layout: <superproject>/orgs/kotoba-lang/aiueos is the
+   ;; aiueos repo root, so three ups from os/aiueos/scripts lands there and
+   ;; orgs/kotoba-lang/org-ietf-ssh sits beside it.
+   (let [here (.dirname path *file*)]
+     [(.join path here "../../../orgs/kotoba-lang/org-ietf-ssh")])))
+
+(def ^:private ssh-repo
+  (first (filter #(and (.existsSync fs %)
+                       (.existsSync fs (.join path % "deps.edn")))
+                 (ssh-repo-candidates))))
+
+(when-not ssh-repo
+  (binding [*out* *err*]
+    (println "error: kotoba-lang/org-ietf-ssh not found.")
+    (println "  set ORG_IETF_SSH_SRC to the repo checkout (e.g. the west")
+    (println "  checkout <superproject>/orgs/kotoba-lang/org-ietf-ssh), then:")
+    (println "  kbb --backend sci --classpath <dir>/src os/aiueos/scripts/ssh-kex-kat.cljk"))
+  (.exit js/process 2))
+
+;; The classpath is org-ietf-ssh's OWN deps.edn :paths (currently ["src"]) --
+;; read, not assumed. (nbb/SCI has no slurp; read the file via node:fs.)
+(def ^:private ssh-classpath
+  (let [deps (edn/read-string
+              (str (.readFileSync fs (.join path ssh-repo "deps.edn"))))]
+    (->> (:paths deps)
+         (map #(.join path ssh-repo %)))))
+
+(println "AIUEOS_SSH_KEX_KAT org-ietf-ssh =" ssh-repo)
+(println "AIUEOS_SSH_KEX_KAT deps.edn :paths=" (str/join ":" (:paths
+(edn/read-string (str (.readFileSync fs (.join path ssh-repo "deps.edn")))))))
+(println "AIUEOS_SSH_KEX_KAT run classpath   =" (str/join ":" ssh-classpath))
+
+;; ── require the shared core (own top-level form so the alias is analysis-
+;;    visible to the forms below; nbb aborts with its own error if the
+;;    --classpath flag was forgotten) ──────────────────────────────────────────
+(require '[ssh.transport :as t])
+
+(def ^:private results (atom []))
+(defn- check! [name ok detail]
+  (swap! results conj ok)
+  (println (if ok "SSH_KEX_KAT_OK  " "SSH_KEX_KAT_FAIL") name detail))
+
+(defn- sha256 [bytes]
+  (vec (.digest (.update (.createHash crypto "sha256")
+                         (js/Uint8Array. (clj->js bytes))))))
+(defn- hex [bytes]
+  (str/join (map #(.padStart (.toString % 16) 2 "0") bytes)))
+
+;; ── the fixed KAT inputs, identical to the C kernel's aiueos_ssh_kex_h() ─────
+;; (os/aiueos/kernel/main.c:390-398) and smoke-qemu-ssh-kex.cljs kat-inputs.
+;; K has its high bit set to exercise the mpint leading-zero rule.
+(def kat-inputs
+  {:v-c "SSH-2.0-C"
+   :v-s "SSH-2.0-aiueos"
+   :i-c [0x14 0x01 0x02 0x03]
+   :i-s [0x14 0x0a 0x0b 0x0c 0x0d]
+   :k-s (t/str->bytes "hostkey-blob")
+   :q-c (vec (range 32))
+   :q-s (vec (map #(bit-and (+ % 100) 255) (range 32)))
+   :k   (into [0x80] (vec (range 31)))})
+
+(def want-h "520a9ba70d60201af9365b0e53ffafa1a31446d17ec24315eb678a9b2e709833")
+
+;; ── assertion 2: transcript is 173 bytes (kernel `off`, main.c:399-408) ──────
+;; 13 (V_C) + 18 (V_S) + 8 (I_C) + 9 (I_S) + 16 (K_S) + 36 (Q_C) + 36 (Q_S)
+;; + 37 (mpint K: 0x80-prefixed 33-byte string) = 173
+(def transcript (t/h-transcript kat-inputs))
+(check! "transcript-length" (= 173 (count transcript))
+        (str "got " (count transcript) " want 173"))
+
+;; ── assertion 1: H equals the ssh-v1.edn kat-h the C kernel KAT bakes ────────
+(def got-h (hex (t/exchange-hash sha256 kat-inputs)))
+(check! "kat-h" (= want-h got-h) (str "got " got-h))
+
+;; ── the pure port's future boot KAT target, spelled out ──────────────────────
+(println "AIUEOS_SSH_KEX_KAT_H" got-h)
+(println "AIUEOS_SSH_KEX_KAT_TRANSCRIPT_LEN" (count transcript))
+
+(if (every? true? @results)
+  (println "AIUEOS_SSH_KEX_KAT_PASS")
+  (do (println "AIUEOS_SSH_KEX_KAT_FAIL") (.exit js/process 1)))

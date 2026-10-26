@@ -1,0 +1,213 @@
+(ns aiueos.qwen35-detokenize
+  (:export [aiueos-qwen35-detokenize cp-byte main]))
+
+;; Qwen3.5 token ids -> UTF-8 text, over the GGUF vocabulary where it lies.
+;;
+;; The inverse of `aiueos-qwen35-tokenize`, and llama.cpp's
+;; `llama_vocab::impl::token_to_piece` for a BPE vocabulary: take the token's
+;; string out of the model mapping, read it as codepoints, and map each
+;; codepoint back through the GPT-2 byte alphabet to the byte it stands for.
+;; `Ġthe` is four codepoints and comes back as the four bytes of " the".
+;;
+;; The token offset table `aiueos-qwen35-vocab-index-build` wrote is what makes
+;; this a lookup rather than a walk: token 173,092's string is at a file offset
+;; the table already holds, so nothing has to traverse 173,092 length-prefixed
+;; strings to find it.
+;;
+;; ## Return
+;;
+;; **Zero is the success value**, and the object does NOT return a byte count
+;; -- that goes to workspace header slot 92:
+;;
+;;      0   detokenized; the byte count is in header slot 92
+;;     -1   null model base
+;;     -2   null workspace base
+;;     -3   workspace shorter than the 128-byte header
+;;     -4   the workspace carries no index (the KTOK magic is absent)
+;;     -5   model window above 16,777,216 bytes
+;;     -6   more than 32,768 ids
+;;     -7   the id input does not lie inside the workspace
+;;     -8   the text output does not lie inside the workspace
+;;     -9   the index tables do not lie inside the workspace
+;;    -31   a token id is at or above the vocabulary count
+;;    -32   a token string ran past the model window
+;;    -33   a token carries a codepoint that is not in the byte alphabet
+;;    -34   the text output capacity was exhausted
+;;
+;; -33 is where this is narrower than llama.cpp, which substitutes the literal
+;; text `[UNK_BYTE_0x...]` for a codepoint it cannot map and carries on. That
+;; string then flows into whatever reads the output, which for a chat loop is
+;; the user. A token that is not in the alphabet is a token the vocabulary and
+;; this decoder disagree about; naming it is cheaper than printing it.
+;;
+;; ## token_type
+;;
+;; Header slot 44 carries the file offset of `tokenizer.ggml.token_type`'s
+;; first element, or 0 for "the caller did not supply it". With it:
+;;
+;;   3 CONTROL, 5 UNUSED    render as nothing
+;;   4 USER_DEFINED         renders VERBATIM, not byte-decoded
+;;   everything else        byte-decoded
+;;
+;; which is `token_to_piece`'s switch with `special = false`. Without it every
+;; id is byte-decoded, so a caller that has not supplied the array sees BOS and
+;; EOS come out as their literal spellings rather than silently vanish. That is
+;; the direction to fail in: a visible `<|endoftext|>` is a bug report, and a
+;; silently dropped one is a mystery.
+;;
+;; ⚠ The GGUF `token_type` values and llama.cpp's own `llama_token_attr` bit
+;; flags are DIFFERENT enumerations that its loader assigns across without a
+;; conversion. This object reads the GGUF value, which is what the file
+;; carries and what the table above names.
+;;
+;; ## Scratch (workspace header slots 96..124, this object's use)
+;;
+;;    96  A  write cursor into the text output, in bytes
+;;   100  B  the id being rendered
+;;   104  C..H unused
+
+;; ----------------------------------------------------------------- readers
+
+(defn u32-at [base length off]
+  (kernel-load-u32 (kernel-subregion base length off 4) 4 0))
+
+(defn put-u32 [base length off v]
+  (kernel-store-u32 (kernel-subregion base length off 4) 4 0 v))
+
+(defn put-u8 [base length off v]
+  (kernel-store-u8 (kernel-subregion base length off 1) 1 0 v))
+
+(defn cont-ok [reg len p]
+  (if (>= p len) 0
+    (if (= 128 (bit-and (kernel-load-u8 (kernel-subregion reg len p 1) 1 0) 192)) 1 0)))
+
+;; `unicode_cpt_from_utf8`, packed as `length * 2097152 + codepoint`, 0 past
+;; the end. Same decoder as `qwen35-tokenize`'s, and inlined here for the same
+;; reason the three GGUF admission objects repeat their header clauses: a
+;; kernel object exports one symbol and cannot call another (ADR-0030).
+(defn cp-dec [reg len p]
+  (if (>= p len) 0
+    (let [b0 (kernel-load-u8 (kernel-subregion reg len p 1) 1 0)]
+      (if (< b0 128) (+ 2097152 b0)
+        (if (< b0 192) 2162685
+          (if (< b0 224)
+            (if (= 0 (cont-ok reg len (+ p 1))) 2162685
+              (+ 4194304 (+ (* (bit-and b0 31) 64)
+                            (bit-and (kernel-load-u8 (kernel-subregion reg len (+ p 1) 1) 1 0) 63))))
+            (if (< b0 240)
+              (if (= 0 (if (= 0 (cont-ok reg len (+ p 1))) 0 (cont-ok reg len (+ p 2)))) 2162685
+                (+ 6291456 (+ (* (bit-and b0 15) 4096)
+                              (+ (* (bit-and (kernel-load-u8 (kernel-subregion reg len (+ p 1) 1) 1 0) 63) 64)
+                                 (bit-and (kernel-load-u8 (kernel-subregion reg len (+ p 2) 1) 1 0) 63)))))
+              (if (< b0 248)
+                (if (= 0 (if (= 0 (cont-ok reg len (+ p 1))) 0
+                           (if (= 0 (cont-ok reg len (+ p 2))) 0
+                             (cont-ok reg len (+ p 3))))) 2162685
+                  (+ 8388608 (+ (* (bit-and b0 7) 262144)
+                                (+ (* (bit-and (kernel-load-u8 (kernel-subregion reg len (+ p 1) 1) 1 0) 63) 4096)
+                                   (+ (* (bit-and (kernel-load-u8 (kernel-subregion reg len (+ p 2) 1) 1 0) 63) 64)
+                                      (bit-and (kernel-load-u8 (kernel-subregion reg len (+ p 3) 1) 1 0) 63))))))
+                2162685))))))))
+
+;; `unicode_utf8_to_byte`, the inverse of the alphabet `qwen35-tokenize` maps
+;; INTO. -1 is "this codepoint is not one of the 256".
+(defn cp-byte [cp]
+  (if (< cp 33) -1
+    (if (< cp 127) cp
+      (if (< cp 161) -1
+        (if (< cp 173) cp
+          (if (= cp 173) -1
+            (if (< cp 256) cp
+              (if (< cp 289) (- cp 256)
+                (if (< cp 323) (- cp 162)
+                  (if (= cp 323) 173 -1))))))))))
+
+;; ------------------------------------------------------------- one token
+
+(defn put-byte [wb wl b]
+  (let [k (u32-at wb wl 96)]
+    (if (>= k (u32-at wb wl 88)) -34
+      (do (put-u8 wb wl (+ (u32-at wb wl 84) k) b)
+          (put-u32 wb wl 96 (+ k 1))
+          0))))
+
+;; Byte-decode: walk the token's codepoints and emit the byte each stands for.
+(defn decode-run [reg len wb wl p]
+  (if (>= p len) 0
+    (let [d (cp-dec reg len p)]
+      (if (= d 0) 0
+        (let [b (cp-byte (bit-and d 2097151))]
+          (if (< b 0) -33
+            (let [r (put-byte wb wl b)]
+              (if (< r 0) r
+                (decode-run reg len wb wl (+ p (quot d 2097152)))))))))))
+
+;; Verbatim: the USER_DEFINED arm, which copies the stored bytes.
+(defn copy-run [reg len wb wl p]
+  (if (>= p len) 0
+    (let [r (put-byte wb wl (kernel-load-u8 (kernel-subregion reg len p 1) 1 0))]
+      (if (< r 0) r (copy-run reg len wb wl (+ p 1))))))
+
+;; The GGUF token_type of the id in slot 100, or 1 (NORMAL) when the caller
+;; supplied no array.
+(defn token-type [mb ml wb wl]
+  (if (= 0 (u32-at wb wl 44)) 1
+    (if (> (+ (u32-at wb wl 44) (* 4 (+ (u32-at wb wl 100) 1))) ml) 1
+      (u32-at mb ml (+ (u32-at wb wl 44) (* 4 (u32-at wb wl 100)))))))
+
+(defn one-token [mb ml wb wl id]
+  (if (>= id (u32-at wb wl 4)) -31
+    (let [pos (u32-at wb wl (+ (u32-at wb wl 20) (* id 4)))]
+      (if (> (+ pos 8) ml) -32
+        (if (not (= 0 (u32-at mb ml (+ pos 4)))) -32
+          (let [len (u32-at mb ml pos)]
+            (if (> (+ pos (+ 8 len)) ml) -32
+              (if (= len 0) 0
+                (do (put-u32 wb wl 100 id)
+                    (let [t (token-type mb ml wb wl)]
+                      (if (if (= t 3) true (= t 5)) 0
+                        (if (= t 4)
+                          (copy-run (kernel-subregion mb ml (+ pos 8) len) len wb wl 0)
+                          (decode-run (kernel-subregion mb ml (+ pos 8) len) len wb wl 0)))))))))))))
+
+;; -------------------------------------------------------------- the walk
+;;
+;; Two levels, because the KIR oracle recurses on its host stack and this can
+;; be handed 32,768 ids.
+
+(defn ids-chunk [mb ml wb wl n]
+  (if (= n 0) 0
+    (let [i (u32-at wb wl 124)]
+      (if (>= i (u32-at wb wl 80)) 0
+        (let [r (one-token mb ml wb wl
+                           (u32-at wb wl (+ (u32-at wb wl 76) (* i 4))))]
+          (if (< r 0) r
+            (do (put-u32 wb wl 124 (+ i 1))
+                (ids-chunk mb ml wb wl (- n 1)))))))))
+
+(defn ids-loop [mb ml wb wl remaining]
+  (if (= remaining 0) 0
+    (let [c (if (> remaining 256) 256 remaining)]
+      (let [r (ids-chunk mb ml wb wl c)]
+        (if (< r 0) r (ids-loop mb ml wb wl (- remaining c)))))))
+
+(defn run-detokenize [mb ml wb wl]
+  (do (put-u32 wb wl 96 0)
+      (put-u32 wb wl 124 0)
+      (let [r (ids-loop mb ml wb wl (u32-at wb wl 80))]
+        (if (< r 0) r
+          (do (put-u32 wb wl 92 (u32-at wb wl 96)) 0)))))
+
+(defn aiueos-qwen35-detokenize [mb ml wb wl]
+  (if (= mb 0) -1
+    (if (= wb 0) -2
+      (if (< wl 128) -3
+        (if (not (= (u32-at wb wl 0) 1263816523)) -4
+          (if (> ml 16777216) -5
+            (if (> (u32-at wb wl 80) 32768) -6
+              (if (> (+ (u32-at wb wl 76) (* 4 (u32-at wb wl 80))) wl) -7
+                (if (> (+ (u32-at wb wl 84) (u32-at wb wl 88)) wl) -8
+                  (if (> (u32-at wb wl 40) wl) -9
+                    (run-detokenize mb ml wb wl)))))))))))
+
+(defn main [] 0)

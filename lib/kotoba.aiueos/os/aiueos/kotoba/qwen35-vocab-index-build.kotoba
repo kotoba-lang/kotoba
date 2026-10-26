@@ -1,0 +1,395 @@
+(ns aiueos.qwen35-vocab-index-build
+  (:export [aiueos-qwen35-vocab-index-build main]))
+
+;; The GPT-2 BPE index for the Qwen3.8-27B artifact, built IN PLACE over the
+;; GGUF metadata arrays rather than over a copy of them.
+;;
+;; `aiueos-qwen35-gguf-kv-scan` walks the 50 metadata entries and records six
+;; coordinates the C threw away: where `tokenizer.ggml.tokens` starts, how many
+;; elements it has, where it ends, and the same three for
+;; `tokenizer.ggml.merges`. Those arrays hold 248,320 and 247,587
+;; length-prefixed strings inside the model mapping. This object reads them
+;; where they lie and writes two lookup tables into a caller-owned workspace:
+;;
+;;   token string -> token id       (open addressing, FNV-1a over the bytes)
+;;   (left id, right id) -> rank    (open addressing, FNV-1a over the two ids)
+;;
+;; Nothing is copied. The token STRINGS stay in the model region; the tables
+;; hold a 4-byte file offset per id, so the whole index is 9,381,888 bytes for
+;; an artifact whose two arrays are 4.7 MB of strings -- and a tokenizer that
+;; needs the bytes of token 173,092 reads them out of the model, once.
+;;
+;; ## Return
+;;
+;; **Zero is the success value.** Non-zero is a REASON CODE, never a count --
+;; the `aiueos-dhcp-reply-valid` convention the three GGUF admission objects
+;; already use, so a caller that writes `if (build(...))` inverts the decision:
+;;
+;;      0   built
+;;     -1   null model base
+;;     -2   null workspace base
+;;     -3   workspace shorter than the 128-byte header
+;;     -4   vocabulary count is zero or above 1,048,576
+;;     -5   merge count is above 1,048,576
+;;     -6   the token array does not start inside the model window
+;;     -7   the merge array does not start inside the model window
+;;     -8   the derived index does not fit in the workspace
+;;     -9   a token string ran past the model window, or the array held
+;;          fewer strings than the header claims
+;;    -10   a merge string ran past the model window
+;;    -11   the token hash table would not close (probe budget exhausted)
+;;    -12   a merge string carries no ` ` separator at index 1 or beyond
+;;    -13   a merge rule's LEFT side is not a vocabulary token
+;;    -14   a merge rule's RIGHT side is not a vocabulary token
+;;    -15   the merge table would not close (probe budget exhausted)
+;;    -16   model window above 16,777,216 bytes
+;;
+;; -16 is not a safety bound, it is a FUEL bound. Every token and every merge
+;; string is hashed and compared byte by byte, so this object's cost is linear
+;; in the window it is handed rather than in the element counts -- handed the
+;; whole 10.9 GiB mapping instead of the 10,996,640-byte metadata prefix it
+;; needs, no finite fuel bound would hold and the object would `ud2` partway
+;; through. kotoba-native's fuel arm for this entry states the same number.
+;;
+;; -13 and -14 are the load-bearing ones. The merge table here is keyed by a
+;; PAIR OF TOKEN IDS; llama.cpp's `bpe_ranks` is keyed by a pair of STRINGS.
+;; The two agree exactly when every merge side is itself a vocabulary token,
+;; because then the string->id map is injective on the keys that matter. That
+;; is a property of the artifact, not of the format, so it is CHECKED here
+;; rather than assumed: a merges array naming a side the vocabulary does not
+;; carry is refused, instead of being indexed under an id that does not exist.
+;;
+;; ## Workspace header (128 bytes at workspace offset 0, u32 little-endian)
+;;
+;;     off  field                                    written by
+;;       0  magic 0x4B544F4B ("KTOK")                 this object, last
+;;       4  vocabulary count V                        caller (kv-scan slot 104)
+;;       8  merge count M                             caller (kv-scan slot 116)
+;;      12  token array file offset                   caller (kv-scan slot 100)
+;;      16  merge array file offset                   caller (kv-scan slot 112)
+;;      20  token offset table, workspace offset      this object
+;;      24  token hash table, workspace offset        this object
+;;      28  token hash capacity (a power of two)      this object
+;;      32  merge table, workspace offset             this object
+;;      36  merge table capacity (a power of two)     this object
+;;      40  index end = first free workspace offset   this object
+;;      44  tokenizer.ggml.token_type file offset     caller (0 = absent)
+;;      48  input text, workspace offset              caller (tokenize)
+;;      52  input text length in bytes                caller (tokenize)
+;;      56  token id output, workspace offset         caller (tokenize)
+;;      60  token id output capacity, in ids          caller (tokenize)
+;;      64  token id output count                     tokenize
+;;      68  symbol scratch, workspace offset          caller (tokenize)
+;;      72  symbol scratch capacity in bytes          caller (tokenize)
+;;      76  token id input, workspace offset          caller (detokenize)
+;;      80  token id input count                      caller (detokenize)
+;;      84  text output, workspace offset             caller (detokenize)
+;;      88  text output capacity in bytes             caller (detokenize)
+;;      92  text output length in bytes               detokenize
+;;      96  scratch A                                 object-private
+;;     100  scratch B                                 object-private
+;;     104  scratch C                                 object-private
+;;     108  scratch D                                 object-private
+;;     112  scratch E                                 object-private
+;;     116  scratch F                                 object-private
+;;     120  reserved
+;;     124  reserved
+;;
+;; The six scratch words are this ABI's answer to a five-parameter limit. A
+;; probe step needs the model region, the workspace region, the needle and a
+;; slot -- seven values -- and the kernel-object ABI admits five. Rather than
+;; packing four of them into one integer and unpacking it in every clause, the
+;; loop's own frame lives in the header, where a parity test can read it. The
+;; six words are private to whichever object is running and carry nothing
+;; between calls.
+;;
+;; ## Layout the object derives (nothing here is a literal for this artifact)
+;;
+;;     token offset table   128                      4 bytes x V
+;;     token hash table     128 + 4V                 4 bytes x C1
+;;     merge table          128 + 4V + 4C1          12 bytes x C2
+;;
+;; C1 is the smallest power of two at or above 2V and C2 the smallest at or
+;; above 2M (at least 2). The 2x is what makes the probe loops terminate: with
+;; V entries in C1 >= 2V slots at least half the table is empty, so a linear
+;; probe reaches an empty slot. The budget carried in `st` is belt and braces
+;; -- a workspace that arrived with a corrupted table would otherwise spin
+;; until the fuel bound trapped, and a `ud2` reads as a compiler bug.
+;;
+;; For the admitted artifact: C1 = 524,288, C2 = 524,288, index end 9,382,016.
+;; For a 32-token test fixture: C1 = 64, C2 = 64, index end 1,024. The same
+;; object serves both because the sizes are derived from the header rather
+;; than transcribed from the contract.
+;;
+;; ## Duplicate keys
+;;
+;; A duplicate token STRING resolves to the LAST id that carries it, because
+;; llama.cpp's loader writes `token_to_id[word] = i` in ascending i. A
+;; duplicate merge PAIR keeps the FIRST rank, because its loader writes
+;; `bpe_ranks.emplace(...)`, which does not overwrite. The two directions are
+;; opposite and both are deliberate; each is implemented where it is named.
+
+;; ------------------------------------------------------------------ readers
+
+(defn u32-at [base length off]
+  (kernel-load-u32 (kernel-subregion base length off 4) 4 0))
+
+(defn put-u32 [base length off v]
+  (kernel-store-u32 (kernel-subregion base length off 4) 4 0 v))
+
+;; FNV-1a over a region that is EXACTLY `len` bytes. The caller narrows with
+;; `kernel-subregion` before calling, which is what keeps the parameter count
+;; at four and makes the window check the backend's rather than this object's.
+;; The product cannot overflow i64: h < 2^32 and 16777619 < 2^24, so the
+;; multiply stays under 2^56.
+(defn fnv-bytes [reg len i h]
+  (if (= i len) h
+    (fnv-bytes reg len (+ i 1)
+      (bit-and (* (bit-xor h (kernel-load-u8 (kernel-subregion reg len i 1) 1 0))
+              16777619)
+           4294967295))))
+
+(defn fnv-step [h b]
+  (bit-and (* (bit-xor h b) 16777619) 4294967295))
+
+;; FNV-1a over the four little-endian bytes of a u32, so a pair of token ids
+;; hashes the same way a pair of bytes would.
+(defn fnv-u32 [h v]
+  (fnv-step (fnv-step (fnv-step (fnv-step h (bit-and v 255))
+                                (bit-and (quot v 256) 255))
+                      (bit-and (quot v 65536) 255))
+            (bit-and (quot v 16777216) 255)))
+
+;; Two regions, each EXACTLY `len` bytes, compared byte for byte. They may sit
+;; in different regions -- one in the model mapping and one in the workspace --
+;; because both arrive as parameters, which is what the region provenance rule
+;; requires of a base.
+(defn bytes-eq [a b len i]
+  (if (= i len) 1
+    (if (= (kernel-load-u8 (kernel-subregion a len i 1) 1 0)
+           (kernel-load-u8 (kernel-subregion b len i 1) 1 0))
+      (bytes-eq a b len (+ i 1))
+      0)))
+
+;; The smallest power of two at or above n, or 0 if that is above 2^22.
+(defn pow2-ceil [n p]
+  (if (>= p n) p (if (>= p 4194304) 0 (pow2-ceil n (* p 2)))))
+
+;; --------------------------------------------------------- the token index
+;;
+;; `st` packs a probe budget and a slot: budget * 4194304 + slot. C1 is at
+;; most 2^22 so a slot never reaches the multiplier, and a budget of C1 means
+;; the loop gives up before it can wrap onto itself.
+
+;; Does hash entry `e` (an id plus one) name a token whose bytes equal the
+;; needle at scratch B for scratch C bytes?
+(defn tok-slot-eq [mb ml wb wl e]
+  (let [pos (u32-at wb wl (+ (u32-at wb wl 20) (* (- e 1) 4)))]
+    (let [n (u32-at mb ml pos)]
+      (if (not (= n (u32-at wb wl 104))) 0
+        (bytes-eq (kernel-subregion mb ml (+ pos 8) n)
+                  (kernel-subregion mb ml (u32-at wb wl 100) n)
+                  n 0)))))
+
+;; Insert the id at scratch D under the needle at scratch B / scratch C.
+;; An equal string already present is OVERWRITTEN -- last id wins.
+(defn tok-insert [mb ml wb wl st]
+  (if (< st 4194304) -11
+    (let [slot (bit-and st 4194303)]
+      (let [cell (+ (u32-at wb wl 24) (* slot 4))]
+        (let [e (u32-at wb wl cell)]
+          (if (= e 0)
+            (do (put-u32 wb wl cell (+ (u32-at wb wl 108) 1)) 0)
+            (if (= 1 (tok-slot-eq mb ml wb wl e))
+              (do (put-u32 wb wl cell (+ (u32-at wb wl 108) 1)) 0)
+              (tok-insert mb ml wb wl
+                          (+ (* (- (quot st 4194304) 1) 4194304)
+                             (bit-and (+ slot 1) (- (u32-at wb wl 28) 1)))))))))))
+
+;; The id whose string equals the needle at scratch B / scratch C, or -1.
+(defn tok-lookup [mb ml wb wl st]
+  (if (< st 4194304) -1
+    (let [slot (bit-and st 4194303)]
+      (let [e (u32-at wb wl (+ (u32-at wb wl 24) (* slot 4)))]
+        (if (= e 0) -1
+          (if (= 1 (tok-slot-eq mb ml wb wl e)) (- e 1)
+            (tok-lookup mb ml wb wl
+                        (+ (* (- (quot st 4194304) 1) 4194304)
+                           (bit-and (+ slot 1) (- (u32-at wb wl 28) 1))))))))))
+
+;; Hash the needle at scratch B / scratch C into a starting `st`.
+(defn needle-st [mb ml wb wl]
+  (+ (* (u32-at wb wl 28) 4194304)
+     (bit-and (fnv-bytes (kernel-subregion mb ml (u32-at wb wl 100)
+                                           (u32-at wb wl 104))
+                         (u32-at wb wl 104) 0 2166136261)
+              (- (u32-at wb wl 28) 1))))
+
+;; ---------------------------------------------------------------- pass one
+;;
+;; Walk `tokenizer.ggml.tokens`. Scratch A is the element cursor and scratch D
+;; the id; the offset table row for each id is its ELEMENT offset, so the
+;; length prefix stays available to every later reader and nothing has to be
+;; stored twice.
+
+(defn tok-chunk [mb ml wb wl n]
+  (if (= n 0) 0
+    (let [id (u32-at wb wl 108)]
+      (if (>= id (u32-at wb wl 4)) 0
+        (let [pos (u32-at wb wl 96)]
+          (if (> (+ pos 8) ml) -9
+            (if (not (= 0 (u32-at mb ml (+ pos 4)))) -9
+              (let [len (u32-at mb ml pos)]
+                (if (> (+ pos (+ 8 len)) ml) -9
+                  (do (put-u32 wb wl (+ (u32-at wb wl 20) (* id 4)) pos)
+                      (put-u32 wb wl 100 (+ pos 8))
+                      (put-u32 wb wl 104 len)
+                      (let [r (tok-insert mb ml wb wl (needle-st mb ml wb wl))]
+                        (if (< r 0) r
+                          (do (put-u32 wb wl 108 (+ id 1))
+                              (put-u32 wb wl 96 (+ pos (+ 8 len)))
+                              (tok-chunk mb ml wb wl (- n 1)))))))))))))))
+
+;; Two levels, for the same reason `qwen35-gguf-kv-scan` chunks its walk: the
+;; KIR interpreter recurses on its host stack, so 248,320 self tail calls are
+;; 248,320 host frames even though the backends emit a jump. Chunking makes
+;; the deepest host stack ~2 x sqrt(V).
+(defn tok-loop [mb ml wb wl remaining]
+  (if (= remaining 0)
+    (if (= (u32-at wb wl 108) (u32-at wb wl 4)) 0 -9)
+    (let [c (if (> remaining 512) 512 remaining)]
+      (let [r (tok-chunk mb ml wb wl c)]
+        (if (< r 0) r (tok-loop mb ml wb wl (- remaining c)))))))
+
+;; ---------------------------------------------------------------- pass two
+;;
+;; Walk `tokenizer.ggml.merges`. Each element is "<left> <right>"; llama.cpp
+;; splits at `word.find(' ', 1)`, so the separator is the first space at index
+;; ONE or later and a leading space is part of the left side. That detail
+;; matters for exactly the rules a byte-level vocabulary is full of, where the
+;; left side is a single encoded space.
+
+(defn space-at [reg len i]
+  (if (>= i len) -1
+    (if (= 32 (kernel-load-u8 (kernel-subregion reg len i 1) 1 0)) i
+      (space-at reg len (+ i 1)))))
+
+;; `st` packs budget and slot the way the token table's does.
+(defn merge-insert [wb wl st]
+  (if (< st 4194304) -15
+    (let [cell (+ (u32-at wb wl 32) (* (bit-and st 4194303) 12))]
+      (if (= 0 (u32-at wb wl cell))
+        (do (put-u32 wb wl cell (+ (u32-at wb wl 112) 1))
+            (put-u32 wb wl (+ cell 4) (u32-at wb wl 116))
+            (put-u32 wb wl (+ cell 8) (u32-at wb wl 108))
+            0)
+        (if (if (= (u32-at wb wl cell) (+ (u32-at wb wl 112) 1))
+              (= (u32-at wb wl (+ cell 4)) (u32-at wb wl 116))
+              false)
+          0
+          (merge-insert wb wl
+                        (+ (* (- (quot st 4194304) 1) 4194304)
+                           (bit-and (+ (bit-and st 4194303) 1)
+                                    (- (u32-at wb wl 36) 1)))))))))
+
+(defn merge-st [wb wl]
+  (+ (* (u32-at wb wl 36) 4194304)
+     (bit-and (fnv-u32 (fnv-u32 2166136261 (u32-at wb wl 112))
+                       (u32-at wb wl 116))
+              (- (u32-at wb wl 36) 1))))
+
+(defn merge-one [mb ml wb wl pos]
+  (let [len (u32-at mb ml pos)]
+    (if (> (+ pos (+ 8 len)) ml) -10
+      (let [sp (space-at (kernel-subregion mb ml (+ pos 8) len) len 1)]
+        (if (< sp 0) -12
+          (do (put-u32 wb wl 100 (+ pos 8))
+              (put-u32 wb wl 104 sp)
+              (let [l (tok-lookup mb ml wb wl (needle-st mb ml wb wl))]
+                (if (< l 0) -13
+                  (do (put-u32 wb wl 100 (+ pos (+ 9 sp)))
+                      (put-u32 wb wl 104 (- len (+ sp 1)))
+                      (let [r (tok-lookup mb ml wb wl (needle-st mb ml wb wl))]
+                        (if (< r 0) -14
+                          (do (put-u32 wb wl 112 l)
+                              (put-u32 wb wl 116 r)
+                              (merge-insert wb wl (merge-st wb wl))))))))))))))
+
+(defn mrg-chunk [mb ml wb wl n]
+  (if (= n 0) 0
+    (let [rank (u32-at wb wl 108)]
+      (if (>= rank (u32-at wb wl 8)) 0
+        (let [pos (u32-at wb wl 96)]
+          (if (> (+ pos 8) ml) -10
+            (if (not (= 0 (u32-at mb ml (+ pos 4)))) -10
+              (let [r (merge-one mb ml wb wl pos)]
+                (if (< r 0) r
+                  (do (put-u32 wb wl 108 (+ rank 1))
+                      (put-u32 wb wl 96 (+ pos (+ 8 (u32-at mb ml pos))))
+                      (mrg-chunk mb ml wb wl (- n 1))))))))))))
+
+(defn mrg-loop [mb ml wb wl remaining]
+  (if (= remaining 0)
+    (if (= (u32-at wb wl 108) (u32-at wb wl 8)) 0 -10)
+    (let [c (if (> remaining 512) 512 remaining)]
+      (let [r (mrg-chunk mb ml wb wl c)]
+        (if (< r 0) r (mrg-loop mb ml wb wl (- remaining c)))))))
+
+;; ---------------------------------------------------------------- clearing
+;;
+;; The workspace arrives with whatever the caller left in it, and an empty
+;; slot is spelled zero, so both tables are cleared before either is written.
+;; There is no bulk store in this dialect -- `kernel-store-u32` writes four
+;; bytes -- so this is C1 + 3*C2 stores, 2,097,152 of them for the admitted
+;; artifact, and it is the largest single term in this object's fuel bound.
+
+(defn zero-chunk [wb wl off n]
+  (if (= n 0) off
+    (do (put-u32 wb wl off 0) (zero-chunk wb wl (+ off 4) (- n 1)))))
+
+(defn zero-loop [wb wl off remaining]
+  (if (= remaining 0) 0
+    (let [c (if (> remaining 512) 512 remaining)]
+      (zero-loop wb wl (zero-chunk wb wl off c) (- remaining c)))))
+
+;; ------------------------------------------------------------------- entry
+
+(defn build-tables [mb ml wb wl c1]
+  (let [c2 (pow2-ceil (if (> (* 2 (u32-at wb wl 8)) 2) (* 2 (u32-at wb wl 8)) 2) 1)]
+    (if (= c2 0) -5
+      (let [off-hash (+ 128 (* 4 (u32-at wb wl 4)))]
+        (let [off-merge (+ off-hash (* 4 c1))]
+          (let [index-end (+ off-merge (* 12 c2))]
+            (if (> index-end wl) -8
+              (do (put-u32 wb wl 20 128)
+                  (put-u32 wb wl 24 off-hash)
+                  (put-u32 wb wl 28 c1)
+                  (put-u32 wb wl 32 off-merge)
+                  (put-u32 wb wl 36 c2)
+                  (put-u32 wb wl 40 index-end)
+                  (zero-loop wb wl off-hash (+ c1 (* 3 c2)))
+                  (put-u32 wb wl 96 (u32-at wb wl 12))
+                  (put-u32 wb wl 108 0)
+                  (let [r (tok-loop mb ml wb wl (u32-at wb wl 4))]
+                    (if (< r 0) r
+                      (do (put-u32 wb wl 96 (u32-at wb wl 16))
+                          (put-u32 wb wl 108 0)
+                          (let [s (mrg-loop mb ml wb wl (u32-at wb wl 8))]
+                            (if (< s 0) s
+                              (do (put-u32 wb wl 0 1263816523) 0))))))))))))))
+
+(defn aiueos-qwen35-vocab-index-build [mb ml wb wl]
+  (if (= mb 0) -1
+    (if (= wb 0) -2
+      (if (< wl 128) -3
+       (if (> ml 16777216) -16
+        (if (if (= (u32-at wb wl 4) 0) true (> (u32-at wb wl 4) 1048576)) -4
+          (if (> (u32-at wb wl 8) 1048576) -5
+            (if (> (+ (u32-at wb wl 12) 8) ml) -6
+              (if (if (= (u32-at wb wl 8) 0) false
+                    (> (+ (u32-at wb wl 16) 8) ml)) -7
+                (let [c1 (pow2-ceil (* 2 (u32-at wb wl 4)) 1)]
+                  (if (= c1 0) -4
+                    (build-tables mb ml wb wl c1))))))))))))
+
+(defn main [] 0)

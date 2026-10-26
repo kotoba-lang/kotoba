@@ -1,0 +1,459 @@
+(ns aiueos.installer.guided
+  "The decision core of the guided installer -- aiueos' answer to the
+  ubuntu-server installer (subiquity), with subiquity's shape and this
+  repository's admission rules.
+
+  What is borrowed from subiquity:
+
+    * the screen sequence is DATA, not control flow. Subiquity has one
+      controller per screen and walks them in order; `flow` below is that
+      list, and `pending-steps` is the walk.
+    * an ANSWER FILE (subiquity: autoinstall.yaml) may pre-answer any screen,
+      and `interactive-sections` names the screens that get asked anyway even
+      though they are answered. Same semantics, same escape hatch `\"*\"`.
+    * the answer file is validated BEFORE anything is probed or written, so a
+      malformed unattended run fails while the target disk is still untouched.
+    * a completed run emits the answer file that reproduces it (subiquity
+      writes autoinstall-user-data at the end of an interactive install).
+
+  What is NOT borrowed, and the reason:
+
+    * subiquity's storage answers may name a device path (`path: /dev/sda`).
+      Here that is refused by contract (install-v1.edn decision 2): a bare
+      device name eventually names the wrong machine's disk. The guided
+      storage screen therefore does not record the disk the operator picked;
+      it records the MATCH the pick implies -- model, transport, capacity
+      bounds and optionally the serial digest -- and the installer re-derives
+      the device from that on the target machine. `disk->match` is that
+      derivation.
+    * there is no language, keyboard or mirror screen. The live environment
+      has no keymap layer and no package mirror, and a screen that collects
+      an answer nothing reads is theatre.
+    * this namespace decides nothing about the disk itself. It renders an
+      `aiueos.install-intent.v1` and hands it to the admission that already
+      exists (install-intent.cljk verify, install-to-disk.cljk, install.mjs).
+      The guided path adds a way to AUTHOR an intent; it adds no authority.
+
+  Everything here is pure: maps in, maps out, no host interop, no crypto.
+  Digests, fingerprints and probes are the runner's job
+  (os/aiueos/installer/live/guided-install.cljk), which keeps this file
+  testable without a block device and without a Node runtime."
+  (:require [kotoba.lang.text :as str]))
+
+(def answers-schema "aiueos.install-answers.v1")
+(def intent-schema "aiueos.install-intent.v1")
+
+;; ------------------------------------------------------------------- screens
+
+(def flow
+  "The screen sequence, in order. `:section` is the answer-file key the screen
+  fills in; `:id` is the name used in :interactive-sections, in prompts and in
+  every emitted line, so an operator, an answer file and a log all say the
+  same word for the same screen."
+  [{:id "network"
+    :section :network
+    :title "Network"
+    :prompt "Network policy for the installed machine"
+    :help "R0 admits exactly one policy: a wired DHCP lease. Wi-Fi secrets are
+           not on the install path (install-v1.edn :network-policy)."}
+   {:id "storage"
+    :section :storage
+    :title "Guided storage"
+    :prompt "Target disk"
+    :help "One whole internal disk is erased. The pick is recorded as a match
+           (model / transport / capacity bounds / serial digest), never as a
+           device path."}
+   {:id "identity"
+    :section :identity
+    :title "Identity"
+    :prompt "Hostname of the installed machine"
+    :help "Fixed on first boot together with the device identity."}
+   {:id "ssh"
+    :section :ssh
+    :title "SSH"
+    :prompt "OpenSSH public key that may log in"
+    :help "Password login is not a default (install-v1.edn :password-login).
+           The key named here is the only way in after the install."}
+   {:id "confirm"
+    :section :confirm
+    :title "Confirm"
+    :prompt "Repeat the hostname to confirm the erase"
+    :help "The confirmation repeats a value stated on an earlier screen, so a
+           held-down return key cannot answer it."}])
+
+(def section-ids (mapv :id flow))
+
+(defn account-model
+  "The model slug the kotoba.cloud device flow binds (aiueos ADR-0239): the
+  identity screen's free-text machine model, lower-cased, non-alphanumeric runs
+  collapsed to `-`, at most 63 characters. nil when nothing usable was typed --
+  `unspecified` names no model, and a flow bound to it would claim one."
+  [model]
+  (let [s (-> (str/lower (str model))
+              (str/replace #"[^a-z0-9]+" "-")
+              (str/replace #"^-+|-+$" ""))
+        s (if (> (count s) 63) (str/replace (subs s 0 63) #"-+$" "") s)]
+    (when-not (or (str/blank? s) (= s "unspecified"))
+      s)))
+
+(defn step-by-id [id] (first (filter #(= id (:id %)) flow)))
+
+;; ------------------------------------------------------------------ validate
+
+(def network-policies #{"wired-dhcp"})
+(def modes #{"interactive" "unattended"})
+
+(defn hostname-ok?
+  "RFC 1123 host name: dot-separated labels of ASCII lowercase letters, digits
+  and hyphens, each 1-63 characters and neither starting nor ending with a
+  hyphen, 253 characters overall. Rejected here rather than on first boot,
+  where the failure would be a machine that came up unreachable."
+  [s]
+  (boolean
+   (and (string? s)
+        (<= 1 (count s) 253)
+        (let [labels (str/split s #"\." -1)]
+          (and (seq labels)
+               (every? (fn [l]
+                         (and (<= 1 (count l) 63)
+                              (some? (str/re-matches #"[a-z0-9]([a-z0-9-]*[a-z0-9])?" l))))
+                       labels))))))
+
+(defn openssh-public-key?
+  "One authorized_keys line: type, base64 blob, optional comment. The blob is
+  not decoded here -- the runner does that when it computes the fingerprint,
+  and a blob that is not a key fails there."
+  [s]
+  (boolean (and (string? s)
+                (str/re-find #"^(ssh-ed25519|ssh-rsa|ecdsa-sha2-\S+)\s+[A-Za-z0-9+/]+=*(\s|$)"
+                             (str/trim s)))))
+
+(defn- gb->bytes [gb] (* (long gb) 1000 1000 1000))
+
+(defn- z2 [n] (str/pad-left (str n) 2 "0"))
+(defn- z3 [n] (str/pad-left (str n) 3 "0"))
+
+(defn epoch-ms->iso8601
+  "`2026-09-10T04:15:00.000Z` from epoch milliseconds, computed rather than
+  delegated to a host date type.
+
+  Delegating would mean a reader conditional, and the two branches do not
+  agree: JavaScript's `toISOString` always prints milliseconds while
+  `java.time.Instant/toString` omits them when they are zero. An intent is a
+  digested artifact -- a field that renders differently on two hosts is a
+  digest that differs for no reason. The civil-from-days arithmetic is
+  Howard Hinnant's, valid for every instant at or after the epoch; negative
+  input is refused rather than silently truncated the wrong way."
+  [ms]
+  (when (neg? ms) (throw (ex-info "epoch-ms->iso8601 is not defined before 1970" {:ms ms})))
+  (let [day-ms 86400000
+        days (quot ms day-ms)
+        tod (rem ms day-ms)
+        z (+ days 719468)
+        era (quot z 146097)
+        doe (- z (* era 146097))
+        yoe (quot (+ (- doe (quot doe 1460)) (quot doe 36524) (- (quot doe 146096))) 365)
+        y (+ yoe (* era 400))
+        doy (- doe (+ (* 365 yoe) (quot yoe 4) (- (quot yoe 100))))
+        mp (quot (+ (* 5 doy) 2) 153)
+        d (inc (- doy (quot (+ (* 153 mp) 2) 5)))
+        m (+ mp (if (< mp 10) 3 -9))
+        y (if (<= m 2) (inc y) y)]
+    (str y "-" (z2 m) "-" (z2 d) "T"
+         (z2 (quot tod 3600000)) ":"
+         (z2 (rem (quot tod 60000) 60)) ":"
+         (z2 (rem (quot tod 1000) 60)) "."
+         (z3 (rem tod 1000)) "Z")))
+
+(defn validate-answers
+  "Pure admission of an answer file. Returns {:ok bool :reasons [literal ...]}.
+
+  Reasons are stable literals so a test can pin the one it provoked; a refusal
+  that fires for a different reason than the one under test is a test bug, not
+  a pass (root ADR adr-2608136000 question 6). `install-v1.edn` :guided
+  :refuses lists them.
+
+  `:complete? false` validates a partially filled answer file -- the shape of
+  what IS there must still be right, but a missing section is a screen still
+  to ask rather than a refusal. `:complete? true` is what an unattended run
+  and the final render use."
+  ([answers] (validate-answers answers {:complete? true}))
+  ([answers {:keys [complete?] :or {complete? true}}]
+   (let [reasons (atom [])
+         refuse! (fn [r] (swap! reasons conj r))
+         present? (fn [k] (some? (get answers k)))
+         missing! (fn [k id] (when complete? (when-not (present? k)
+                                               (refuse! (str "answers-missing-" id)))))]
+     (when-not (= answers-schema (:schema answers))
+       (refuse! "answers-schema-unknown"))
+
+     (when-let [mode (:mode answers)]
+       (when-not (contains? modes mode) (refuse! "answers-mode-invalid")))
+     (when (and complete? (nil? (:mode answers)))
+       (refuse! "answers-missing-mode"))
+
+     (when-let [days (:expires-days answers)]
+       (when-not (and (number? days) (pos? days) (<= days 365))
+         (refuse! "answers-expiry-out-of-range")))
+
+     (doseq [s (:interactive-sections answers)]
+       (when-not (or (= "*" s) (some #{s} section-ids))
+         (refuse! "answers-interactive-section-unknown")))
+
+     (missing! :network "network")
+     (when-let [net (:network answers)]
+       (when-not (contains? network-policies (:policy net))
+         (refuse! "answers-network-policy-unsupported")))
+
+     (missing! :storage "storage")
+     (when-let [st (:storage answers)]
+       (let [{:keys [model transport min-gb max-gb]} st]
+         (when (str/blank? (str model)) (refuse! "answers-storage-model-missing"))
+         (when (str/blank? (str transport)) (refuse! "answers-storage-transport-missing"))
+         (if (and (number? min-gb) (number? max-gb))
+           (when-not (<= min-gb max-gb) (refuse! "answers-capacity-bounds-inverted"))
+           (refuse! "answers-capacity-bounds-missing"))))
+
+     (missing! :identity "identity")
+     (when-let [id (:identity answers)]
+       (when-not (hostname-ok? (:hostname id)) (refuse! "answers-hostname-invalid")))
+
+     (missing! :ssh "ssh")
+     (when-let [ssh (:ssh answers)]
+       (when-not (openssh-public-key? (:public-key ssh))
+         (refuse! "answers-ssh-key-not-openssh")))
+
+     ;; The confirmation is checked only against a hostname that is itself
+     ;; present and valid: "confirm mismatch" against a garbage hostname would
+     ;; name the wrong screen.
+     (when complete?
+       (let [want (get-in answers [:identity :hostname])
+             got (get-in answers [:confirm :hostname])]
+         (cond
+           (nil? got) (refuse! "answers-missing-confirm")
+           (and (hostname-ok? want) (not= want got)) (refuse! "answers-confirm-mismatch"))))
+
+     {:ok (empty? @reasons) :reasons (vec (distinct @reasons))})))
+
+;; ----------------------------------------------------------------- the walk
+
+(defn answered?
+  "A screen is answered when its section is present AND that section on its
+  own passes validation. A section that is present but malformed is not
+  skipped silently -- it is asked again, which is why partial validation
+  exists."
+  [answers step]
+  (let [k (:section step)]
+    (and (some? (get answers k))
+         (let [only (-> (select-keys answers [:schema k])
+                        (assoc :schema answers-schema))
+               {:keys [reasons]} (validate-answers only {:complete? false})]
+           (empty? reasons)))))
+
+(defn interactive-section?
+  [answers step]
+  (let [xs (set (:interactive-sections answers))]
+    (or (contains? xs "*") (contains? xs (:id step)))))
+
+(defn pending-steps
+  "The screens this run must still put in front of a person, in order.
+
+  Subiquity's rule, kept: a section already answered by the answer file is
+  skipped unless :interactive-sections names it. A complete answer file
+  therefore asks nothing, which is what makes an unattended replay possible;
+  a partial one asks only for what is missing.
+
+  The confirm screen has its own rule: it is asked whenever ANY other screen
+  was asked. If a person answered something in this run, that person confirms
+  in this run -- a confirmation carried over from a file cannot be a
+  confirmation of a hostname or a disk chosen a minute ago. When nothing was
+  asked, the answer file's own confirmation stands, exactly as
+  install-intent.cljk accepts --confirm-create from a script.
+
+  Note what this does NOT key off: the intent's :mode. That field says how the
+  INSTALL runs on the target machine (install-v1.edn decision 2), not how the
+  intent was authored. Deciding here whether to ask a person based on it
+  conflated the two, and an operator authoring an unattended intent at the
+  machine was asked nothing and got an empty intent."
+  [answers]
+  (let [asked (vec (remove (fn [step]
+                             (or (= "confirm" (:id step))
+                                 (and (answered? answers step)
+                                      (not (interactive-section? answers step)))))
+                           flow))
+        confirm (step-by-id "confirm")]
+    (if (or (seq asked)
+            (not (answered? answers confirm))
+            (interactive-section? answers confirm))
+      (conj asked confirm)
+      asked)))
+
+;; -------------------------------------------------------- storage: the match
+
+(defn candidate-disks
+  "The disks the storage screen may offer, from a `lsblk --json --bytes
+  --nodeps` blockdevices list.
+
+  Kept out: anything that is not a whole disk, the disk the installer booted
+  from, removable media, and anything smaller than the release image. This is
+  the same shape install-live.cljk already applies to an intent; here it runs
+  BEFORE an intent exists, which is the whole point of a guided screen.
+
+  Refusing to offer is not the same as refusing to erase. Every device-level
+  guard in install.mjs still runs below whatever is picked here."
+  [blockdevices {:keys [boot-disk image-bytes]}]
+  (vec (filter (fn [d]
+                 (and (= "disk" (:type d))
+                      (not= (:path d) boot-disk)
+                      (not (contains? #{1 true "1"} (:rm d)))
+                      (number? (:size d))
+                      (or (nil? image-bytes) (>= (:size d) image-bytes))))
+               blockdevices)))
+
+(defn blank-disk?
+  "MEASURED to carry no partition table and no filesystem signature. A disk
+  that was ever used carries one of the two; an empty second SSD neither
+  (ADR-0240).
+
+  Unmeasured is not blank. lsblk reads PTTYPE/FSTYPE from udev, and the live
+  installer has no udev -- on the QEMU trial it reported both fields empty for
+  a disk with a DOS partition table. So the probe asks `blkid -p` per disk and
+  sets `:signatures-measured?` only when blkid answered; without that flag a
+  disk is never called empty, whatever its fields say."
+  [d]
+  (and (true? (:signatures-measured? d))
+       (str/blank? (str (:pttype d)))
+       (str/blank? (str (:fstype d)))))
+
+(defn default-target
+  "The 1-based pick the storage screen offers as its default, or nil.
+
+  One candidate: that one (as before). Several: the one that is blank, but
+  only when exactly one is -- two empty disks are a choice the person makes,
+  and a default between them would be a guess. A default is only what Enter
+  means; the pick still goes through the match, the confirm screen and the
+  typed ERASE phrase."
+  [candidates]
+  (cond
+    (= 1 (count candidates)) 1
+    :else (let [blank (keep-indexed (fn [i d] (when (blank-disk? d) (inc i))) candidates)]
+            (when (= 1 (count blank)) (first blank)))))
+
+(defn default-hostname
+  "Hostname offered by default: the machine model's slug (DMI on the target),
+  or `aiueos` when there is no usable model. Always passes hostname-ok?."
+  [model]
+  (let [h (account-model model)]
+    (if (and h (hostname-ok? h)) h "aiueos")))
+
+(defn disk->match
+  "The match an operator's pick implies.
+
+  `margin-pct` widens the capacity bounds around the probed size so that a
+  replacement disk of the same model is still admitted, while a different
+  model or a different size class is not. Bounds are inclusive on both ends
+  (install-intent.cljk verify uses `<=` on both), so a disk of exactly the
+  derived minimum or exactly the derived maximum is admitted -- that is the
+  boundary the guided test pins."
+  ([disk] (disk->match disk 10))
+  ([disk margin-pct]
+   (let [size (:size disk)
+         margin (quot (* size margin-pct) 100)
+         model (str/trim (str (:model disk)))
+         tran (str/lower (str/trim (str (:tran disk))))]
+     (cond-> {:model model
+              :transport tran
+              ;; Both ends truncate toward zero, which is permissive at the
+              ;; bottom and would be one gigabyte too tight at the top -- so
+              ;; the top gets that gigabyte back. A bound that excluded the
+              ;; very disk the operator just picked would refuse on the
+              ;; target machine with target-capacity-out-of-bounds and read
+              ;; like the wrong disk was fitted.
+              :min-gb (max 1 (quot (- size margin) (* 1000 1000 1000)))
+              :max-gb (inc (quot (+ size margin) (* 1000 1000 1000)))}
+       (seq (str/trim (str (:serial disk)))) (assoc :serial (str/trim (str (:serial disk))))))))
+
+;; --------------------------------------------------------- render the intent
+
+(defn answers->intent
+  "Render an answer file as an `aiueos.install-intent.v1`.
+
+  The digests are supplied, not computed: this namespace has no crypto and no
+  filesystem. `release` carries the receipt digest and the release disk facts
+  read from the build receipt; `ssh-fingerprint` is the OpenSSH fingerprint of
+  the answer file's key; `serial-sha256`/`serial-salt` are present only when
+  the answer file named a serial.
+
+  The output shape is install-intent.cljk's, field for field, because it is
+  the SAME artifact -- it is verified by the same `verify`, consumed by the
+  same install-to-disk.cljk, and sealed into the same USB receipt chain. A
+  second intent shape would be a second admission surface."
+  [{:keys [answers release ssh-fingerprint serial-sha256 serial-salt now-ms]}]
+  (let [{:keys [ok reasons]} (validate-answers answers)]
+    (when-not ok
+      (throw (ex-info "answers do not validate" {:reasons reasons})))
+    (let [st (:storage answers)
+          ;; A replayed answer file carries the serial DIGEST, never the
+          ;; serial: the digest is all the intent ever held. Preferring the
+          ;; caller's freshly computed digest and falling back to the one the
+          ;; answer file carries is what makes a replay bind the same disk --
+          ;; dropping it here would reinstall a different machine and say
+          ;; nothing.
+          serial-sha256 (or serial-sha256 (:serial-sha256 st))
+          serial-salt (or serial-salt (:serial-salt st))
+          days (or (:expires-days answers) 30)
+          created (epoch-ms->iso8601 now-ms)
+          expires (epoch-ms->iso8601 (+ now-ms (* days 24 3600 1000)))]
+      {:schema intent-schema
+       :created created
+       :expires expires
+       :mode (:mode answers)
+       :confirmedBy "owner-phrase"
+       :authoredBy "guided"
+       :release {:receiptSha256 (:receipt-sha256 release)
+                 :disk {:bytes (get-in release [:disk :bytes])
+                        :sha256 (get-in release [:disk :sha256])}}
+       :machineProfile {:architecture "x86_64"
+                        :firmware "uefi"
+                        :model (or (get-in answers [:identity :machine-model]) "unspecified")}
+       :targetDisk (cond-> {:model (:model st)
+                            :transport (:transport st)
+                            :minBytes (gb->bytes (:min-gb st))
+                            :maxBytes (gb->bytes (:max-gb st))}
+                     serial-sha256 (assoc :serialSha256 serial-sha256
+                                          :serialSalt serial-salt))
+       :hostname (get-in answers [:identity :hostname])
+       :deviceClaim (when-let [c (:device-claim answers)] {:ref c})
+       :ssh {:authorizedPrincipal (or (get-in answers [:ssh :principal]) "aiueos")
+             :publicKey (str/trim (get-in answers [:ssh :public-key]))
+             :fingerprint ssh-fingerprint}
+       :network {:policy (get-in answers [:network :policy])}})))
+
+(defn intent->answers
+  "The reverse render: the answer file that reproduces an intent unattended.
+
+  Subiquity writes this file at the end of an interactive install so the same
+  machine can be reinstalled without a person. The round trip is exact on
+  every field the intent binds, which is what the guided test asserts -- a
+  reproduction that quietly drops the serial or the principal would reinstall
+  a different machine."
+  [intent]
+  (let [td (:targetDisk intent)]
+    (cond-> {:schema answers-schema
+             :mode (:mode intent)
+             :network {:policy (get-in intent [:network :policy])}
+             :storage (cond-> {:model (:model td)
+                               :transport (:transport td)
+                               :min-gb (quot (:minBytes td) (* 1000 1000 1000))
+                               :max-gb (quot (:maxBytes td) (* 1000 1000 1000))}
+                        ;; The serial itself is never in the intent (only its
+                        ;; digest is, by design), so a reproduction carries the
+                        ;; digest forward rather than inventing a serial.
+                        (:serialSha256 td) (assoc :serial-sha256 (:serialSha256 td)
+                                                  :serial-salt (:serialSalt td)))
+             :identity {:hostname (:hostname intent)
+                        :machine-model (get-in intent [:machineProfile :model])}
+             :ssh {:principal (get-in intent [:ssh :authorizedPrincipal])
+                   :public-key (get-in intent [:ssh :publicKey])}
+             :confirm {:hostname (:hostname intent)}}
+      (get-in intent [:deviceClaim :ref]) (assoc :device-claim (get-in intent [:deviceClaim :ref])))))

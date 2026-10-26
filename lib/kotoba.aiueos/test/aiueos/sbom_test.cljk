@@ -1,0 +1,117 @@
+(ns aiueos.sbom-test
+  (:require [grant.deployment-profile :as profile]
+            [grant.key-lifecycle :as key-lifecycle]
+            [aiueos.sbom :as sbom]
+            [kotoba.test :refer [deftest is]]
+            [kotoba.security.supply-chain :as supply-chain]))
+
+(def artifact-digest (str "sha256:" (apply str (repeat 64 "a"))))
+(def source-commit (apply str (repeat 40 "b")))
+
+(defn- built []
+  ;; This JVM's classpath is the `:test` alias's, not the one the inventory
+  ;; describes, and evidence about the wrong classpath is worse than evidence
+  ;; that says which one it looked at (ADR-0062).
+  (sbom/attestations {:artifact-digest artifact-digest
+                      :source-commit source-commit
+                      :builder "github-actions/ubuntu-latest"
+                      :invocation {:command "lib/kotoba.aiueos/os/aiueos/scripts/build-release-image.sh"}
+                      :isolated-builder? true
+                      :classpath-scope :not-in-scope}))
+
+(defn- signed [key-pair {:keys [sbom provenance] :as attestations}]
+  (let [private (.getPrivate key-pair)]
+    (assoc attestations
+           :sbom (sbom/sign sbom :sbom/signature private)
+           :provenance (sbom/sign provenance :provenance/signature private))))
+
+(defn- judge [key-pair {:keys [sbom provenance]}]
+  (let [public (.getPublic key-pair)]
+    (supply-chain/evaluate-attestations
+     {:sbom sbom :provenance provenance}
+     {:artifact-digest artifact-digest
+      :source-commit source-commit
+      :verify-sbom-signature-fn (sbom/verify-fn :sbom/signature public)
+      :verify-provenance-signature-fn (sbom/verify-fn :provenance/signature public)})))
+
+(deftest signed-attestations-satisfy-the-shared-evaluator
+  (let [key-pair (key-lifecycle/generate-key-pair)
+        result (judge key-pair (signed key-pair (built)))]
+    (is (true? (:attestation/qualified? result)) (pr-str (:attestation/violations result)))
+    (is (= [] (:attestation/violations result)))))
+
+(deftest components-cover-all-three-inventory-halves
+  (let [kinds (set (map :component/kind (sbom/components)))]
+    (is (= #{:source :dependency :classpath} kinds))
+    (is (< 30 (count (sbom/components)))
+        "the component list is the inventory, not a sample of it")))
+
+(deftest a-dependency-without-a-content-address-carries-its-caveat
+  (let [gapped (filter :component/assurance-gap (sbom/components))]
+    (is (seq gapped) "java.base has no content address and must say so")
+    (is (every? #(nil? (:component/digest %)) gapped))))
+
+(deftest the-evidence-is-computed-not-asserted
+  (let [{:keys [evidence]} (built)]
+    (is (re-matches #"sha256:[0-9a-f]{64}" (:tcb-inventory-digest evidence)))
+    (is (re-matches #"sha256:[0-9a-f]{64}" (:sbom-digest evidence)))
+    (is (re-matches #"sha256:[0-9a-f]{64}" (:provenance-digest evidence)))
+    (is (true? (:tcb-drift-check? evidence))
+        "reports the inventory check's real verdict")
+    (is (= :not-in-scope (:tcb-classpath-scope evidence))
+        "and says which classpath question it answered -- under this alias the
+         loaded jars are the test runner's, not the ones the inventory is
+         about, so a verdict about them would be about the wrong classpath")))
+
+(deftest the-regulated-profile-accepts-this-supply-chain-evidence
+  (let [{:keys [evidence]} (built)
+        violations (set (profile/profile-violations
+                         {:aiueos/deployment-profile :regulated
+                          :aiueos/profile-evidence evidence}))]
+    (is (not (contains? violations :sbom-digest)))
+    (is (not (contains? violations :provenance-digest)))
+    (is (not (contains? violations :tcb-inventory-digest)))
+    (is (not (contains? violations :tcb-drift-check?)))))
+
+;; --- fail-closed ----------------------------------------------------------
+
+(deftest an-unsigned-attestation-is-refused
+  (let [key-pair (key-lifecycle/generate-key-pair)
+        result (judge key-pair (built))]
+    (is (false? (:attestation/qualified? result)))
+    (is (contains? (set (:attestation/violations result)) :sbom-signature))
+    (is (contains? (set (:attestation/violations result)) :provenance-signature))))
+
+(deftest an-attestation-for-a-different-artifact-is-refused
+  (let [key-pair (key-lifecycle/generate-key-pair)
+        tampered (update (signed key-pair (built)) :sbom
+                         assoc :sbom/artifact-digest
+                         (str "sha256:" (apply str (repeat 64 "c"))))
+        result (judge key-pair tampered)]
+    (is (false? (:attestation/qualified? result)))
+    (is (contains? (set (:attestation/violations result)) :sbom-artifact-binding))
+    ;; The edit also breaks the signature it was made under, which is the point
+    ;; of signing the document rather than the digest alone.
+    (is (contains? (set (:attestation/violations result)) :sbom-signature))))
+
+(deftest provenance-must-name-this-sbom
+  (let [key-pair (key-lifecycle/generate-key-pair)
+        {:keys [sbom provenance]} (built)
+        detached (sbom/provenance {:artifact-digest artifact-digest
+                                   :source-commit source-commit
+                                   :sbom-digest (str "sha256:" (apply str (repeat 64 "d")))
+                                   :builder "x" :invocation {}
+                                   :isolated-builder? true})
+        result (judge key-pair (signed key-pair {:sbom sbom :provenance (or detached provenance)}))]
+    (is (false? (:attestation/qualified? result)))
+    (is (contains? (set (:attestation/violations result)) :provenance-sbom-binding))))
+
+(deftest an-unisolated-builder-is-not-quietly-claimed-isolated
+  (let [key-pair (key-lifecycle/generate-key-pair)
+        local (sbom/attestations {:artifact-digest artifact-digest
+                                  :source-commit source-commit
+                                  :builder "local" :invocation {}})
+        result (judge key-pair (signed key-pair local))]
+    (is (false? (:provenance/isolated-builder? (:provenance local)))
+        "omitting the assertion must not default to true")
+    (is (contains? (set (:attestation/violations result)) :isolated-builder))))

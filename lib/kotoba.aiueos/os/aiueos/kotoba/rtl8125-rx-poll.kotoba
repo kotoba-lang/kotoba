@@ -1,0 +1,85 @@
+(ns aiueos.rtl8125-rx-poll
+  (:require [aiueos.lib.rtl8125-regs :as reg])
+  (:export [aiueos-rtl8125-rx-poll main]))
+
+;; Has a frame arrived, and how long is it?
+;;
+;;   (aiueos-rtl8125-rx-poll rx-desc capacity)
+;;
+;; `aiueos_rtl8125_rx_poll` (kernel/rtl8125.c:282-296). It reads the receive
+;; descriptor and touches no MMIO at all, which is why this is the one object in
+;; the family that takes no BAR window: the completion is in memory the device
+;; wrote, not in a register.
+;;
+;; ---------------------------------------------------------------------------
+;; NOT ZERO-IS-SUCCESS. A NON-NEGATIVE RESULT IS A LENGTH.
+;; ---------------------------------------------------------------------------
+;;   >= 0   the frame length in bytes, with the four Ethernet FCS bytes the
+;;          hardware includes already subtracted. ZERO MEANS NOTHING HAS
+;;          ARRIVED: the descriptor is still owned by the device.
+;;   -1     AIUEOS_RTL8125_INVALID, negated -- the arguments are not a
+;;          descriptor and a capacity
+;;   -6     AIUEOS_RTL8125_RX_INVALID, negated -- a completed descriptor whose
+;;          status the driver refuses
+;;
+;; The C returned a reason code and wrote the length through a `uint32_t *`. An
+;; object has one i64 to answer with, and a length and a reason cannot share a
+;; non-negative value space -- a caller testing `if (result)` on a
+;; zero-is-success convention would read "a 60-byte frame arrived" as an error.
+;; The negation is what makes the two spaces disjoint, and it makes the C's
+;; `*frame_length = 0; return OK` (:288) a single value: 0.
+;;
+;; A caller must therefore test `< 0` for failure, never `!= 0`. The two
+;; existing call sites in kernel/pci.c both already distinguish "no frame yet"
+;; from "error", so neither becomes more complicated.
+;;
+;; ---------------------------------------------------------------------------
+;; THE STATUS CLAUSES (rtl8125.c:287-293), transcribed
+;; ---------------------------------------------------------------------------
+;;   0x80000000 OWN        still the device's; nothing to report
+;;   0x00003fff length     the frame length INCLUDING the FCS
+;;   0x00100000 RX_ERROR   the hardware flagged the frame
+;;   0x02000000 RX_SOF     start of frame -- must be set
+;;   0x01000000 RX_EOF     end of frame -- must be set
+;;
+;; SOF and EOF are both required because this is a ONE-DESCRIPTOR ring: a frame
+;; split across descriptors would set one and not the other, and a driver with
+;; nowhere to put the rest of it must not report the first fragment as a whole
+;; frame. `bytes < 18` refuses a frame shorter than an Ethernet header plus the
+;; FCS. `bytes > capacity` refuses one longer than the buffer that received it,
+;; which cannot happen if RGE_RXMAXSIZE was programmed -- and is checked anyway,
+;; because the value that says how many bytes the caller may now read comes from
+;; a device register and this object is the last place to bound it.
+;;
+;; THE FCS SUBTRACTION IS NOT COSMETIC. `bytes` counts the four-byte frame check
+;; sequence the hardware leaves in the buffer. A caller that used it as the
+;; frame length would hand four bytes of checksum to the ARP and IPv4 admission
+;; objects as if they were payload. The C subtracts at :294 with the same
+;; comment; the guard `bytes < 18` is what makes the subtraction safe.
+;;
+;; The load fence is the C's `dma_acquire()` (:286) and comes BEFORE the read,
+;; for the reason `tx-submit` gives: without it the status word may be answered
+;; from a value read before the device finished writing the frame, and the
+;; object reports a length for bytes that are not there yet.
+
+(defn aiueos-rtl8125-rx-poll [rx-desc capacity]
+  (if (or (= 0 (reg/desc-ok rx-desc))
+          (< capacity 1)
+          (> capacity 2048))
+    -1
+    (let [acquire (kernel-fence-load)]
+      ;; The receive command word is at offset 28 (`rtl8125.h`:39-45), not 0 --
+      ;; the transmit and receive descriptor layouts differ.
+      (let [command (kernel-load-u32 rx-desc 32 28)]
+        (if (not (= 0 (bit-and command 2147483648)))   ; RGE_DESC_OWN
+          0
+          (let [bytes (bit-and command 16383)]         ; RGE_RX_LENGTH 0x3fff
+            (if (or (not (= 0 (bit-and command 1048576)))   ; RGE_RX_ERROR
+                    (= 0 (bit-and command 33554432))        ; RGE_RX_SOF
+                    (= 0 (bit-and command 16777216))        ; RGE_RX_EOF
+                    (< bytes 18)
+                    (> bytes capacity))
+              -6
+              (- bytes 4))))))))
+
+(defn main [] 0)

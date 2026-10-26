@@ -1,0 +1,170 @@
+#!/usr/bin/env kbb
+;; PTQ1_0's fused dequantize-and-dot instruction, both arms, executed.
+;;
+;; `kernel-dequant-dot-ptq1-0` (kotoba-native ADR 0088) selects one of two
+;; instruction sequences at run time from the `cpuid`/`xgetbv` guard: eight
+;; lanes of AVX2 where the machine has it, legacy scalar SSE where it does not.
+;; The compiler's suites assert the bytes of both; that the two compute the
+;; number `kotoba.kir` computes is a claim about machines, so this runs one
+;; compiled program on two of them:
+;;
+;;   scalar  the x86_64 loader under Rosetta 2, which exposes no AVX at all
+;;           (measured 2026-09-26, macOS 26.4: `arch -x86_64 sysctl
+;;           machdep.cpu.features` lists SSE4.2 and no AVX)
+;;   avx2    an x86_64 Linux host named by PTQ1_AVX2_HOST, over ssh
+;;
+;; The QEMU-image route the K-quant smoke uses (`--artifact image` for
+;; x86_64-aiueos-kernel-v1) left with amu's JVM route on 2026-09-11, so the
+;; program here is a granted-region kexe (`--target x86_64-linux`) run by
+;; amu's own `tools/kexe_loader.c`.
+;;
+;; WHICH ARM RAN is not visible in an answer, so it is TESTED: each arm is
+;; broken separately in a copy of the machine code (the AVX2 arm's `>> 8`
+;; becomes `>> 9`; the scalar arm's `sub rax,1` becomes `sub rax,2`) and each
+;; machine must change its answer for exactly one of the two breaks.
+;;
+;; Exit: 0 both arms ran and agree with the oracle; 1 an arm disagreed or a
+;; control did not move; 2 the scalar arm passed and the AVX2 arm was NOT
+;; exercised (no host); 3 could not run (no amu, no cc, compile failed).
+;;
+;; Usage: PTQ1_AVX2_HOST=gad kbb --backend sci os/aiueos/scripts/smoke-dequant-ptq1-arms.cljk /path/to/amu
+(ns smoke-dequant-ptq1-arms
+  (:require ["child_process" :as cp]
+            ["fs" :as fs]
+            ["os" :as os]
+            ["path" :as path]
+            [kotoba.lang.text :as str]))
+
+(def repo (path/resolve (path/join (path/dirname *file*) ".." ".." "..")))
+(def source (path/join repo "os" "aiueos" "native" "dequant-ptq1-arms.kotoba"))
+
+;; What `kotoba.kir` answers for these bytes (2026-09-26), and the three
+;; nearest wrong answers the fixture was chosen to separate:
+(def expected "C88A9DFA")
+(def near-misses
+  {"C88A9DFD" "the upper half of each group added first"
+   "C88A9DF9" "a straight left-to-right sum"
+   "C88AA001" "the qh stage read at digit q mod 4 instead of q/2"})
+
+;; Two 28-byte blocks: code byte k of block b is (37k + 101b + 11) mod 256,
+;; then d = 0x3C55 and 0x4055. 256 activations: [2^18 2 3 4 5 6 7 8] x 32.
+(defn weights-hex []
+  (str/join (for [[b hi] [[0 60] [1 64]]
+                  byte (concat (map #(bit-and (+ (* 37 %) (* 101 b) 11) 255) (range 26))
+                               [0x55 hi])]
+              (.padStart (.toString byte 16) 2 "0"))))
+
+(defn f32-le-hex [x]
+  (let [view (js/DataView. (js/ArrayBuffer. 4))]
+    (.setFloat32 view 0 x true)
+    (str/join (map #(.padStart (.toString (.getUint8 view %) 16) 2 "0") (range 4)))))
+
+(defn activations-hex []
+  (str/join (map f32-le-hex (apply concat (repeat 32 [262144 2 3 4 5 6 7 8])))))
+
+(defn loader-args []
+  [(str "g:" (weights-hex)) "gl:0" (str "g:" (activations-hex)) "gl:1" "2"])
+
+(defn run! [command args]
+  (let [r (cp/spawnSync command (clj->js args)
+                        #js {:encoding "utf8" :timeout 1200000
+                             :env (js/Object.assign #js {} js/process.env
+                                                    #js {:KEXE_STRUCTURED_REPORT "1"})})]
+    {:status (.-status r) :out (str (.-stdout r) (.-stderr r))}))
+
+(defn unmeasured [message]
+  (js/console.error (str "COULD-NOT-RUN " message))
+  (js/process.exit 3))
+
+(defn die [message]
+  (js/console.error (str "error: " message))
+  (js/process.exit 1))
+
+(defn result-hex [out]
+  (when-let [[_ n] (re-find #":result (-?\d+)" out)]
+    (.toUpperCase (.padStart (.toString (unsigned-bit-shift-right (js/parseInt n 10) 0) 16) 8 "0"))))
+
+(defn patch
+  "A copy of BYTES with every occurrence of FIND's byte at INDEX set to VALUE,
+  and the number of occurrences -- zero is a failure, not a no-op."
+  [bytes find index value]
+  (let [out (js/Buffer.from bytes)
+        needle (js/Buffer.from find "hex")]
+    (loop [at (.indexOf out needle 0) n 0]
+      (if (neg? at)
+        [out n]
+        (do (aset out (+ at index) value)
+            (recur (.indexOf out needle (inc at)) (inc n)))))))
+
+(defn -main [& args]
+  (let [amu (or (first args) (unmeasured "usage: smoke-dequant-ptq1-arms.cljk /path/to/amu"))
+        bin (path/join amu "bin" "amu")
+        dir (fs/mkdtempSync (path/join (os/tmpdir) "aiueos-ptq1-arms-"))
+        kexe (path/join dir "p.kexe")
+        code (path/join dir "p.bin")
+        _ (when-not (fs/existsSync bin) (unmeasured (str "no amu at " bin)))
+        compiled (run! bin ["compile" source "--target" "x86_64-linux" "--output" kexe])
+        _ (when-not (zero? (:status compiled)) (unmeasured (str "compile-failed:\n" (:out compiled))))
+        extracted (run! bin ["extract-native" kexe "--symbol" "dot-ptq1-0" "--output" code])
+        _ (when-not (zero? (:status extracted)) (unmeasured (str "extract-failed:\n" (:out extracted))))
+        original (fs/readFileSync code)
+        ;; vpsrld $8,%ymm1,%ymm1 -> $9 (AVX2 arm only; 15 sites)
+        [avx-broken avx-sites] (patch original "c5f572d108" 4 9)
+        ;; sub $1,%rax -> $2 (legacy arm only; 128 sites)
+        [scalar-broken scalar-sites] (patch original "4881e801000000" 3 2)
+        _ (when-not (and (= 15 avx-sites) (= 128 scalar-sites))
+            (die (str "the break sites moved: avx2 " avx-sites " (want 15), scalar "
+                      scalar-sites " (want 128) -- re-derive them before trusting a control")))
+        _ (fs/writeFileSync (path/join dir "p-avx-broken.bin") avx-broken)
+        _ (fs/writeFileSync (path/join dir "p-scalar-broken.bin") scalar-broken)
+        loader-src (path/join amu "tools" "kexe_loader.c")
+        loader (path/join dir "loader-x86_64")
+        built (run! "cc" ["-arch" "x86_64" "-std=c11" "-O2" loader-src "-o" loader])
+        _ (when-not (zero? (:status built)) (unmeasured (str "rosetta-loader-build-failed:\n" (:out built))))
+        local (fn [file] (result-hex (:out (run! loader (concat [(path/join dir file) "0" "5" "x86_64" "-"]
+                                                            (loader-args))))))
+        scalar {:machine "rosetta" :arm "scalar"
+                :answer (local "p.bin") :avx-broken (local "p-avx-broken.bin")
+                :scalar-broken (local "p-scalar-broken.bin")}
+        host (.. js/process -env -PTQ1_AVX2_HOST)
+        avx2 (when (seq host)
+               (let [remote (str/trim (:out (run! "ssh" ["-o" "BatchMode=yes" host "mktemp -d /tmp/ptq1-arms.XXXXXX"])))
+                     _ (run! "scp" (concat ["-q" "-o" "BatchMode=yes" loader-src]
+                                           (map #(path/join dir %) ["p.bin" "p-avx-broken.bin" "p-scalar-broken.bin"])
+                                           [(str host ":" remote "/")]))
+                     argv (str/join " " (loader-args))
+                     out (:out (run! "ssh" ["-o" "BatchMode=yes" host
+                                            (str "cd " remote " && grep -q -w avx2 /proc/cpuinfo && echo HAS-AVX2; "
+                                                 "cc -std=c11 -O2 kexe_loader.c -o loader && for f in p p-avx-broken p-scalar-broken; do "
+                                                 "echo \"$f $(KEXE_STRUCTURED_REPORT=1 ./loader $f.bin 0 5 x86_64 - " argv " | grep -o ':result -\\?[0-9]*')\"; done; "
+                                                 "cd / && rm -rf " remote)]))
+                     answer (fn [f] (some->> (re-find (re-pattern (str "(?m)^" f " :result (-?\\d+)")) out)
+                                             second (str ":result ") result-hex))]
+                 (when-not (re-find #"HAS-AVX2" out)
+                   (die (str host " reports no AVX2 in /proc/cpuinfo")))
+                 {:machine host :arm "avx2" :answer (answer "p")
+                  :avx-broken (answer "p-avx-broken") :scalar-broken (answer "p-scalar-broken")}))
+        runs (remove nil? [scalar avx2])]
+    (doseq [r runs] (println (str "  " (:machine r) " (" (:arm r) " arm): " (pr-str (dissoc r :machine :arm)))))
+    (doseq [{:keys [machine answer]} runs]
+      (when-not (= expected answer)
+        (die (str machine " answered " answer ", kotoba.kir answers " expected
+                  (when-let [named (get near-misses answer)] (str " -- that is " named))))))
+    ;; The controls: each machine moves for its own arm's break and only that.
+    (let [{:keys [avx-broken scalar-broken]} scalar]
+      (when-not (and (= expected avx-broken) (not= expected scalar-broken))
+        (die (str "rosetta did not behave as the scalar arm: avx-broken " avx-broken
+                  " scalar-broken " scalar-broken))))
+    (when avx2
+      (let [{:keys [avx-broken scalar-broken]} avx2]
+        (when-not (and (not= expected avx-broken) (= expected scalar-broken))
+          (die (str host " did not behave as the AVX2 arm: avx-broken " avx-broken
+                    " scalar-broken " scalar-broken)))))
+    (println (str "SCANNED\t" (count runs) "\tmachines"))
+    (if avx2
+      (do (println (str "AIUEOS_DEQUANT_PTQ1_ARMS_OK both-arms-executed-and-agree-with-kotoba-kir " expected))
+          (js/process.exit 0))
+      (do (js/console.error "AIUEOS_DEQUANT_PTQ1_AVX2_ARM_NOT_EXERCISED set PTQ1_AVX2_HOST to an x86_64 AVX2 host")
+          (js/process.exit 2)))))
+
+(apply -main (drop 3 (js->clj js/process.argv)))
