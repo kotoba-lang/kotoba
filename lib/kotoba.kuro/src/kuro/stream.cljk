@@ -1,0 +1,123 @@
+(ns kuro.stream
+  "実行中のコマンドを値として持つ。
+
+  ## なぜ要るのか（設計上の穴）
+
+  `kuro.terminal` の session は「これから走らせてよいか」を持ち、receipt は
+  「走り終わったあと何が起きたか」を持つ。**走っている最中を表す値が無かった。**
+  そのせいで `kuro.host.node/run` は終わるまで返れず、呼び出し側からは
+  10 分の build と無限ループの区別が付かない（どちらも「まだ返らない」）。
+
+  ここは `state + event -> next-state` の形をとる:
+
+      (-> (open sess cmd)                 ; :running
+          (append-chunk {:stream :stdout :text \"…\"})
+          (append-chunk {:stream :stderr :text \"…\"})
+          (finish {:exit-code 0}))        ; -> receipt
+
+  ## 純粋
+
+  時計も PRNG も IO も持たない。chunk の順序は `:kuro/seq`（受理順の単調増加）
+  であって時刻ではない —— 時刻はホストが入れる値であり、順序の根拠にはしない
+  （同一ミリ秒に複数 chunk が来る）。
+
+  ## 上限はここで数える
+
+  出力上限（`:max-output-bytes`）は host が spawn に渡す `maxBuffer` でも
+  効くが、**畳んだ側の総量**はここでしか分からない（stdout と stderr の合計、
+  複数 chunk にまたがる分）。超えたら `:kuro/truncated?` を立てて以後の本文を
+  捨て、**捨てたバイト数を数える** —— 黙って切ると receipt が嘘をつく。"
+  (:require [kotoba.bytes :as kbytes] [kotoba.lang.text :as str]
+            [kuro.terminal :as t]))
+
+(def default-max-output-bytes (* 1024 1024))
+
+(defn byte-count
+  "UTF-8 バイト数。JVM/JS で同じ数を出す（`count` は文字数なので使えない —— 日本語の
+   ログで 3 倍ずれる）。`kuro.checkpoint` の `:max-chunk-bytes` 切詰めもこれを共有する。"
+  [s]
+  #?(:clj (alength (kbytes/utf8-bytes ^String (str s)))
+     :cljs (.-length (.encode (js/TextEncoder.) (str s)))))
+
+(defn open
+  "実行中の session を開く。opts: `:max-output-bytes`。"
+  ([sess cmd] (open sess cmd {}))
+  ([sess cmd opts]
+   {:kuro/type :kuro/stream
+    :kuro/state :running
+    :kuro/session sess
+    :kuro/command cmd
+    :kuro/session-id (:kuro/session-id sess)
+    :kuro/chunks []
+    :kuro/seq 0
+    :kuro/stdout-bytes 0
+    :kuro/stderr-bytes 0
+    :kuro/dropped-bytes 0
+    :kuro/truncated? false
+    :kuro/max-output-bytes (:max-output-bytes opts default-max-output-bytes)}))
+
+(defn total-bytes [st]
+  (+ (:kuro/stdout-bytes st 0) (:kuro/stderr-bytes st 0)))
+
+(defn append-chunk
+  "出力の一片を積む。chunk: `{:stream :stdout|:stderr :text \"…\"}`。
+
+  上限を超えた分は**本文を捨てて数だけ残す**。落とした事実が receipt に出ない
+  切り詰めは、成功した短い出力と見分けが付かない。truncated? に一度なったら
+  以後の本文は**一切積まない** —— 残り枠へ収まる後続 chunk を再び積むと kept が
+  出力の exact prefix でなくなり、README の「what is kept is always an exact prefix of the
+   emitted output」保証を破る。"
+  [st {:keys [stream text] :as chunk}]
+  (when-not (#{:stdout :stderr} stream)
+    (throw (ex-info "chunk stream must be :stdout or :stderr" {:chunk chunk})))
+  (if (not= :running (:kuro/state st))
+    (throw (ex-info "cannot append to a finished stream"
+                    {:state (:kuro/state st) :session-id (:kuro/session-id st)}))
+    (let [n (byte-count text)
+          already? (:kuro/truncated? st)
+          room (max 0 (- (:kuro/max-output-bytes st) (total-bytes st)))
+          keep? (and (not already?) (<= n room))
+          over? (and (not already?) (not (<= n room)))]
+      (cond-> st
+        true (update :kuro/seq inc)
+        keep? (update (if (= :stdout stream) :kuro/stdout-bytes :kuro/stderr-bytes) + n)
+        keep? (update :kuro/chunks conj (assoc chunk :kuro/seq (:kuro/seq st)))
+        (not keep?) (update :kuro/dropped-bytes + n)
+        over? (assoc :kuro/truncated? true)))))
+
+(defn text-of
+  "積まれた chunk を、そのストリームの連結テキストに畳む。"
+  [st stream]
+  (->> (:kuro/chunks st)
+       (filter #(= stream (:stream %)))
+       (map :text)
+       str/join))
+
+(defn finish
+  "実行の終了。`result` は host が測った `{:exit-code … :started-at … …}`。
+  戻り値は `kuro.terminal/receipt`（=これまでと同じ形）。
+
+  stdout/stderr の本文と実測バイト数、切り詰めの有無はここで埋める —— host が
+  同じことを二度数えなくてよいように。host の result が同じ key を持っても
+  **ここで数えた値が勝つ** (host が数え直した値が実測と食い違う時、receipt は
+  実測の側を載せる)。host 固有の key (:started-at, :stdout-cid, :error …) は
+  そのまま通る。"
+  [st result]
+  (when (not= :running (:kuro/state st))
+    (throw (ex-info "stream already finished" {:state (:kuro/state st)})))
+  (t/receipt (:kuro/session st) (:kuro/command st)
+             (merge result
+                    {:stdout (text-of st :stdout)
+                     :stderr (text-of st :stderr)
+                     :stdout-bytes (:kuro/stdout-bytes st)
+                     :stderr-bytes (:kuro/stderr-bytes st)}
+                    (when (:kuro/truncated? st)
+                      {:truncated? true :dropped-bytes (:kuro/dropped-bytes st)}))))
+
+(defn running? [st] (= :running (:kuro/state st)))
+
+(defn mark-finished
+  "state を `:exited` にする。receipt を作らずに「もう積めない」ことだけを示す
+   （host が spawn error で終わる場合など）。"
+  [st]
+  (assoc st :kuro/state :exited))

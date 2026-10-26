@@ -1,0 +1,160 @@
+(ns verify-guest-fs-cap
+  "Integration E2E (S5): a REAL WASM guest reads a file that kuro.fs wrote,
+  through a capability check — the intersection of S1 (kuro.fs), S2 (OPFS
+  block store) and S3 (guest invocation).
+
+  The capability story, kept honest: the page grants the guest exactly one
+  fs capability (fs/read on the file CID it needs). The host-side guard
+  evaluates the grant BEFORE instantiating the guest; a second, un-granted
+  scenario (fs/write) is denied and its denial recorded — proving the gate
+  actually gates, not decorates.
+
+  What must be REAL:
+    - real .wasm guest (wasm-tools-assembled, like PR #17's fixture) whose
+      `run(cid-ptr)` reads the file bytes FROM THE OPFS STORE via the host
+      import `fs_read` — not from constants baked into the guest
+    - the bytes it reads are the ones kuro.fs wrote (round-trip through
+      CID addressing)
+    - the un-granted write scenario is refused with a recorded denial
+
+  Run: amu compile --target wasm32-browser fs-browser && kbb --backend sci -cp test/browser
+       test/browser/verify_guest_fs_cap.cljk"
+
+  (:require ["node:child_process" :as child-process]
+            ["node:http" :as http]
+            ["node:path" :as path]
+            ["node:fs" :as fs]
+            ["playwright" :refer [chromium]]
+            [kotoba.lang.text :as str]))
+
+(def repo-root (.cwd js/process))
+(def tmp-dir (.join path repo-root "test" "browser" ".tmp"))
+
+(defn- report! [m]
+  (println (js/JSON.stringify (clj->js m) nil 2)))
+
+(defn- start-static-server
+  [root-dir]
+  (js/Promise.
+   (fn [resolve reject]
+     (let [server
+           (http/createServer
+            (fn [req res]
+              (let [url-path (js/decodeURIComponent (first (.split (.-url req) "?")))
+                    file-path (.join path root-dir url-path)]
+                (if-not (.startsWith file-path root-dir)
+                  (do (.writeHead res 403) (.end res "forbidden"))
+                  (fs/readFile file-path
+                               (fn [err data]
+                                 (if err
+                                   (do (.writeHead res 404)
+                                       (.end res (str "not found: " (.-message err))))
+                                   (let [ext (.extname path file-path)
+                                         mime (get {".html" "text/html; charset=utf-8"
+                                                    ".js" "text/javascript"
+                                                    ".wasm" "application/wasm"}
+                                                   ext "application/octet-stream")]
+                                     (.writeHead res 200 #js {"Content-Type" mime})
+                                     (.end res data)))))))))]
+       (.on server "error" reject)
+       (.listen server 0 "127.0.0.1"
+                (fn []
+                  (let [port (.-port (.address server))]
+                    (resolve #js {:baseUrl (str "http://127.0.0.1:" port)
+                                  :close (fn [] (js/Promise. (fn [r] (.close server r))))}))))))))
+
+(defn- compile-guest!
+  "Guest with an fs_read host import: run(cid-ptr, len) copies the file
+  bytes the host places at FS_BUF into GUEST_BUF and returns a checksum
+  (sum of bytes) — the host verifies it against the original content. The
+  guest can only 'see' the file through the fs_read import the host
+  chooses to satisfy."
+  []
+  (let [wat (str "(module\n"
+                 "  (import \"kuro\" \"fs_read\"\n"
+                 "    (func $fs_read (param i32 i32) (result i32)))\n"
+                 "  (memory (export \"memory\") 1)\n"
+                 "  (func (export \"run\") (param $len i32) (result i32)\n"
+                 "    ;; ask the host to copy the file into guest memory at 2048\n"
+                 "    (local $i i32) (local $sum i32)\n"
+                 "    (drop (call $fs_read (i32.const 2048) (local.get $len)))\n"
+                 "    ;; checksum: sum of bytes the host copied\n"
+                 "    (local.set $i (i32.const 0))\n"
+                 "    (block $done\n"
+                 "      (loop $next\n"
+                 "        (br_if $done (i32.ge_u (local.get $i) (local.get $len)))\n"
+                 "        (local.set $sum (i32.add (local.get $sum)\n"
+                 "                                 (i32.load8_u (i32.add (i32.const 2048) (local.get $i)))))\n"
+                 "        (local.set $i (i32.add (local.get $i) (i32.const 1)))\n"
+                 "        (br $next)))\n"
+                 "    (local.get $sum)))\n")
+        wat-path (.join path tmp-dir "guest-fs.wat")
+        wasm-path (.join path tmp-dir "guest-fs.wasm")]
+    (.writeFileSync fs wat-path wat)
+    (let [result (.spawnSync child-process "wasm-tools" #js ["parse" wat-path "-o" wasm-path])]
+    (when (not= 0 (.-status result))
+      (throw (js/Error. (str "wasm-tools parse failed: "
+                             (or (some-> result .-stderr (.toString)) (.-error result))))))
+    wasm-path)))
+
+(def page-html
+  "<!doctype html>
+<html><head><script src='/js/base.js'></script><script src='/js/fs-cap.js'></script></head>
+<body><script type='module'>
+window.addEventListener('error', (e) => { window.__failed = 'top: ' + e.message; });
+window.addEventListener('unhandledrejection', (e) => { window.__failed = 'rej: ' + (e.reason && e.reason.message || String(e.reason)); });
+// drive the integration scenario through the compiled kuro.fs + guest
+window.fsCapE2E().then((r) => { window.__capResults = r; window.__done = true; })
+                 .catch((e) => { window.__failed = 'cap: ' + (e && e.message || String(e)); });
+</script></body></html>")
+
+(defn- -main []
+  (-> (js/Promise.resolve
+       (do (.mkdirSync fs tmp-dir #js {:recursive true})
+           (when-not (.existsSync fs (.join path tmp-dir "js" "fs-cap.js"))
+             (throw (js/Error. "fs-cap.js not built — run: amu compile --target wasm32-browser fs-browser")))))
+      (.then (fn [] (compile-guest!)))
+      (.then (fn [wasm-path]
+               (.copyFileSync fs wasm-path (.join path tmp-dir "guest-fs.wasm"))
+               (.writeFileSync fs (.join path tmp-dir "index.html") page-html)
+               ;; the demo's worker source, same as the opfs E2E
+               (.writeFileSync fs
+                               (.join path tmp-dir "kuro-opfs-worker.js")
+                               (.readFileSync fs
+                                              (.join path repo-root "src" "kuro" "host" "opfs_worker.js")
+                                              "utf8"))))
+      (.then (fn [] (start-static-server tmp-dir)))
+      (.then (fn [srv]
+               (-> (.launch chromium #js {:headless true})
+                   (.then (fn [browser]
+                            (-> (.newPage browser)
+                                (.then (fn [page]
+                                         (.on page "console" (fn [msg] (report! {:console (.-text msg)})))
+                                         (.on page "pageerror" (fn [err] (report! {:pageerror (.-message err)})))
+                                         (-> (.goto page (str (.-baseUrl srv) "/index.html"))
+                                             (.then (fn []
+                                                      (.evaluate page
+                                                                 "(async function(){ const t0 = Date.now(); while (Date.now() - t0 < 25000) { if (window.__done) { return JSON.stringify(window.__capResults); } if (window.__failed) { return JSON.stringify({failed: window.__failed}); } await new Promise(r => setTimeout(r, 100)); } return JSON.stringify({failed: 'timeout'}); })()")))
+                                             (.then (fn [raw]
+                                                      (let [r (js->clj (js/JSON.parse raw) :keywordize-keys true)]
+                                                        (if (:failed r)
+                                                          (do (report! {:page-failed (:failed r)})
+                                                              (report! {:verdict "FAIL"})
+                                                              (set! (.-exitCode js/process) 1))
+                                                          (let [ok? (and (:guestRead r)
+                                                                         (:checksumMatch r)
+                                                                         (:writeDenied r))]
+                                                            (report! {:guest-fs-cap-e2e r})
+                                                            (report! {:verdict (if ok? "PASS" "FAIL")})
+                                                            (when-not ok?
+                                                              (set! (.-exitCode js/process) 1)))))))
+                                             (.catch (fn [e]
+                                                       (report! {:e2e-error (.-message e)})
+                                                       (set! (.-exitCode js/process) 1))))))
+                                (.then (fn [_] (.close browser))))))
+                   (.then (fn [_] ((.-close srv)))))))
+      (.catch (fn [e]
+                (report! {:fatal (.-message e)})
+                (set! (.-exitCode js/process) 1)))))
+
+(-main)

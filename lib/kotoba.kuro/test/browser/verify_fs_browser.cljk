@@ -1,0 +1,129 @@
+;; verify_fs_browser.cljs — S4 E2E: the REAL kuro.fs model running INSIDE a
+;; browser, with its host seam wired to the REAL OPFS block store Worker.
+;;
+;; Compile: amu compile --target wasm32-browser fs-browser (the .cljc model compiles to
+;; cljs for the browser — the same source the JVM and nbb parity suites run).
+;;
+;; What must be REAL:
+;;   - kuro.fs (not a JS port) executing in the browser
+;;   - real OPFS blocks through kuro-opfs-worker.js (WebCrypto CID mint)
+;;   - the kuro.fs host seam (put-block/get-block) satisfied by that store
+;;
+;; Run:
+;;   amu compile --target wasm32-browser fs-browser
+;;   kbb --backend sci -cp test/browser test/browser/verify_fs_browser.cljk
+
+(ns verify-fs-browser
+  (:require ["node:http" :as http]
+            ["node:path" :as path]
+            ["node:fs" :as fs]
+            ["playwright" :refer [chromium]]
+            [kotoba.lang.text :as str]))
+
+(def repo-root (.cwd js/process))
+(def tmp-dir (.join path repo-root "test" "browser" ".tmp"))
+
+(defn- report! [m]
+  (println (js/JSON.stringify (clj->js m) nil 2)))
+
+(defn- start-static-server
+  [root-dir]
+  (js/Promise.
+   (fn [resolve reject]
+     (let [server
+           (http/createServer
+            (fn [req res]
+              (let [url-path (js/decodeURIComponent (first (.split (.-url req) "?")))
+                    file-path (.join path root-dir url-path)]
+                (if-not (.startsWith file-path root-dir)
+                  (do (.writeHead res 403) (.end res "forbidden"))
+                  (-> (fs/readFile file-path
+                                   (fn [err data]
+                                     (if err
+                                       (do (.writeHead res 404)
+                                           (.end res (str "not found: " (.-message err))))
+                                       (let [ext (.extname path file-path)
+                                             mime (get {".html" "text/html; charset=utf-8"
+                                                        ".js" "text/javascript"
+                                                        ".wasm" "application/wasm"}
+                                                       ext "application/octet-stream")]
+                                         (.writeHead res 200 #js {"Content-Type" mime})
+                                         (.end res data))))))))))]
+       (.on server "error" reject)
+       (.listen server 0 "127.0.0.1"
+                (fn []
+                  (let [port (.-port (.address server))]
+                    (resolve #js {:baseUrl (str "http://127.0.0.1:" port)
+                                  :close (fn [] (js/Promise. (fn [r] (.close server r))))}))))))))
+
+(def page-html
+  "<!doctype html>
+<html><head><script src='/js/base.js'></script><script src='/js/fs-demo.js'></script></head>
+<body><script type='module'>
+window.addEventListener('error', (e) => { window.__failed = 'top: ' + e.message; });
+window.addEventListener('unhandledrejection', (e) => { window.__failed = 'rej: ' + (e.reason && e.reason.message || String(e.reason)); });
+// raw worker put probe BEFORE the cljs demo loads its scenario
+const probeWorker = new Worker('/kuro-opfs-worker.js');
+probeWorker.onmessage = (ev) => { window.__rawPut = JSON.stringify(ev.data); window.__probeDone = true; };
+probeWorker.postMessage({ 'kuro.opfs/type': 'request', 'kuro.opfs/id': 1, 'kuro.opfs/op': 'put',
+  'kuro.opfs/payload': { bytes: new Uint8Array([72, 73]) } });
+try {
+  window.window.fsE2E().then((r) => { window.__fsResults = r; window.__done = true; });
+} catch (err) { window.__failed = 'caught: ' + err.message; }
+</script></body></html>")
+
+(defn- -main []
+  (-> (js/Promise.resolve
+       (do (.mkdirSync fs tmp-dir #js {:recursive true})
+           ;; the shadow-cljs build already emitted test/browser/.tmp/js/fs-demo.js
+           (when-not (.existsSync fs (.join path tmp-dir "js" "fs-demo.js"))
+             (throw (js/Error. "fs-demo.js not built — run: amu compile --target wasm32-browser fs-browser")))
+           (.writeFileSync fs (.join path tmp-dir "index.html") page-html)
+           ;; the worker source comes from src/ (same as the opfs E2E)
+           (.writeFileSync fs
+                           (.join path tmp-dir "kuro-opfs-worker.js")
+                           (.readFileSync fs
+                                          (.join path repo-root "src" "kuro" "host" "opfs_worker.js")
+                                          "utf8"))))
+      (.then (fn [] (start-static-server tmp-dir)))
+      (.then (fn [srv]
+               (-> (.launch chromium #js {:headless true})
+                   (.then (fn [browser]
+                            (-> (.newPage browser)
+                                (.then (fn [page]
+                                         (.on page "console" (fn [msg] (report! {:console (.-text msg)})))
+                                         (.on page "pageerror" (fn [err] (report! {:pageerror (.-message err)})))
+                                         (-> (.goto page (str (.-baseUrl srv) "/index.html"))
+                                             (.then (fn []
+                                                      (.evaluate page
+                                                                 "(async function(){ const t0 = Date.now(); while (Date.now() - t0 < 20000) { if (window.__done) { return JSON.stringify({results: window.__fsResults, rawPut: window.__rawPut}); } if (window.__failed) { return JSON.stringify({failed: window.__failed}); } await new Promise(r => setTimeout(r, 100)); } return JSON.stringify({failed: 'timeout'}); })()")))
+                                             (.then (fn [raw]
+                                                      (let [parsed (js/JSON.parse raw)
+                                                        r (js->clj (.-results parsed) :keywordize-keys true)]
+                                                        (if (:failed parsed)
+                                                          (do (report! {:page-failed (:failed r)})
+                                                              (report! {:verdict "FAIL"})
+                                                              (set! (.-exitCode js/process) 1))
+                                                          (let [raw-cid (some-> (.-rawPut parsed) js/JSON.parse (aget "kuro.opfs/result") (aget "cid"))
+                                                         ok? (and raw-cid
+                                                                         (:wroteCid r)
+                                                                         (str/starts-with? (:wroteCid r) "bafkrei")
+                                                                         (str/starts-with? raw-cid "bafkrei")
+                                                                         (= "hello from kuro.fs" (:readText r))
+                                                                         (:readMatches r)
+                                                                         (pos? (:receiptCount r))
+                                                                         (zero? (:denials r)))]
+                                                            (report! {:fs-e2e r :raw-put (.-rawPut parsed)})
+                                                            (report! {:verdict (if ok? "PASS" "FAIL")})
+                                                            (when-not ok?
+                                                              (set! (.-exitCode js/process) 1)))))))
+                                             (.catch (fn [e]
+                                                       (report! {:e2e-error (.-message e)})
+                                                       (set! (.-exitCode js/process) 1))))))
+                                (.then (fn [_] (.close browser))))))
+                   (.then (fn [_] ((.-close srv)))))))
+      (.catch (fn [e]
+                (report! {:fatal (.-message e)})
+                (set! (.-exitCode js/process) 1)))))
+
+(-main)

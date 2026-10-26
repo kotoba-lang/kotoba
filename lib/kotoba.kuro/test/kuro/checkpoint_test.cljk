@@ -1,0 +1,303 @@
+(ns kuro.checkpoint-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kuro.checkpoint :as cp]
+            [kuro.stream :as stream]
+            [kuro.terminal :as t]))
+
+(defn- sess [] (t/session "s1" "cid:repo" :terminal-repo))
+(defn- cmd [] (t/command ["npm" "test"]))
+
+(defn- running-stream []
+  (-> (stream/open (sess) (cmd))
+      (stream/append-chunk {:stream :stdout :text "compiling…\n"})
+      (stream/append-chunk {:stream :stderr :text "warn\n"})))
+
+(deftest round-trips-what-matters
+  (let [st (running-stream)
+        back (cp/restore (cp/->edn st))]
+    (is (= "compiling…\n" (stream/text-of back :stdout)))
+    (is (= "warn\n" (stream/text-of back :stderr)))
+    (is (= (:kuro/stdout-bytes st) (:kuro/stdout-bytes back)))
+    (is (= (:kuro/seq st) (:kuro/seq back)))
+    (is (= (:kuro/command st) (:kuro/command back)))
+    (is (= (:kuro/session st) (:kuro/session back)))))
+
+(deftest a-restored-run-is-never-running
+  (testing "the process did not survive the host — saying :running invites stdin to a corpse"
+    (let [back (cp/restore (cp/->edn (running-stream)))]
+      (is (cp/orphaned? back))
+      (is (false? (stream/running? back)))
+      (is (= :running (:kuro/restored-from back)) "what it was is still recorded"))))
+
+(deftest a-finished-run-restores-as-finished
+  (let [st (stream/mark-finished (running-stream))
+        back (cp/restore (cp/->edn st))]
+    (is (not (cp/orphaned? back)))
+    (is (= :exited (:kuro/state back)))))
+
+(deftest an-orphan-can-be-closed-into-a-receipt
+  (testing "a run that never finished must still be closable, or the ledger keeps a hole"
+    (let [r (cp/abandon (cp/restore (cp/->edn (running-stream))))]
+      (is (= :kuro/receipt (:kuro/type r)))
+      (is (= 129 (:kuro/exit-code r)))
+      (is (= "process did not survive its host" (:kuro/error r)))
+      (is (= :none (:kuro/isolation r)))
+      (is (= "compiling…\n" (:kuro/stdout r)) "the output it did produce is kept")))
+  (testing "the host may supply what it actually knows"
+    (let [r (cp/abandon (cp/restore (cp/->edn (running-stream)))
+                        {:exit-code 137 :error "OOM-killed"})]
+      (is (= 137 (:kuro/exit-code r)))
+      (is (= "OOM-killed" (:kuro/error r))))))
+
+(deftest abandon-refuses-a-run-that-has-a-real-ending
+  ;; README: "`cp/abandon` closes an **orphan** into a receipt" — orphan のみ。
+  ;; すでに終わった (:exited など) stream に 129 を捏造すると、台帳に
+  ;; 「起きてもいない終わり方」が載る。
+  (testing "an already-finished stream is refused, not closed as exit 129"
+    (let [exited (stream/mark-finished (running-stream))]
+      (is (thrown? js/Error
+                   (cp/abandon (cp/restore (cp/->edn exited)))))))
+  (testing "the legit path still works: restored orphan closes into a receipt"
+    (is (= 129 (:kuro/exit-code (cp/abandon (cp/restore (cp/->edn (running-stream)))))))))
+
+(deftest truncation-is-declared-not-silent
+  (let [st (-> (stream/open (sess) (cmd))
+               (stream/append-chunk {:stream :stdout :text "0123456789"}))
+        c (cp/->edn st {:max-chunk-bytes 4})]
+    (is (= 6 (:kuro.checkpoint/dropped-bytes c)))
+    (is (= "0123" (:text (first (:kuro/chunks c)))))
+    (testing "byte counters keep the pre-truncation truth"
+      (is (= 10 (:kuro/stdout-bytes c)))))
+  (testing "no cap means no truncation and no field"
+    (is (nil? (:kuro.checkpoint/dropped-bytes (cp/->edn (running-stream)))))))
+
+(deftest a-truncated-orphan-closes-as-a-truncated-receipt
+  ;; README (kuro.checkpoint 節) は :max-chunk-bytes について「the byte
+  ;; counters keep the pre-truncation truth」と言い、kuro.stream 節は「a
+  ;; silently-cut receipt is indistinguishable from a short success」と言う。
+  ;; この接合を pin する: stream 層で切られた出力を持つ orphan を abandon した
+  ;; 時、truncation の事実 (:kuro/truncated? と :kuro/dropped-bytes) が
+  ;; checkpoint → restore → receipt まで生き残らねばならない。落ちた実行が
+  ;; 「成功した短い出力」の顔をして台帳に載る regression をここで止める。
+  ;; なお stream 層の cap は chunk 単位 (部分保持はしない): room を超えた
+  ;; chunk は本文ごと捨てられ、捨てたバイト数だけが残る。
+  (let [st (-> (stream/open (sess) (cmd) {:max-output-bytes 4})
+               (stream/append-chunk {:stream :stdout :text "abcd"})
+               (stream/append-chunk {:stream :stdout :text "efghij"}))
+        back (cp/restore (cp/->edn st))]
+    (testing "the restore itself carries the stream's truncation"
+      (is (true? (:kuro/truncated? back)))
+      (is (= 6 (:kuro/dropped-bytes back)))
+      (is (= 4 (:kuro/stdout-bytes back))))
+    (testing "and the abandoned receipt repeats it, not a clean exit 129"
+      (let [r (cp/abandon back)]
+        (is (= 129 (:kuro/exit-code r)))
+        (is (true? (:kuro/truncated? r)))
+        (is (= 6 (:kuro/dropped-bytes r)))
+        (is (= "abcd" (:kuro/stdout r)) "only the kept body, never the dropped tail")))
+    (testing "an untruncated orphan's receipt stays untruncated"
+      (let [clean (cp/abandon (cp/restore (cp/->edn (running-stream))))]
+        (is (not (contains? clean :kuro/truncated?)))
+        (is (not (contains? clean :kuro/dropped-bytes)))))))
+
+(deftest checkpoint-layer-truncation-survives-restore
+  ;; README は 2 つの切り詰めを区別する: kuro.stream の `:max-output-bytes`
+  ;; (実行中に切る) と kuro.checkpoint の `:max-chunk-bytes` (保存時に切る)。
+  ;; 後者は stream 自体は untruncated のまま切り、`:kuro.checkpoint/dropped-bytes`
+  ;; にだけ記録する —— だから restore でその事実を落とすと、`abandon` した
+  ;; receipt が `:kuro/truncated?` も `:kuro/dropped-bytes` も持たない
+  ;; 「成功した短い出力」の顔をする (stream 層の禁止が checkpoint 層に漏れる)。
+  ;; 既存の a-truncated-orphan-closes-as-a-truncated-receipt は stream 層の
+  ;; 切り詰めだけを pin していたが、checkpoint 層は→edn/restore/abandon の
+  ;; 接合を通して切った事実が残ることを pin していなかった。
+  (let [st (-> (stream/open (sess) (cmd))
+               (stream/append-chunk {:stream :stdout :text "0123456789"}))
+        cp (cp/->edn st {:max-chunk-bytes 4})]
+    (testing "the checkpoint records the cut at the checkpoint layer"
+      (is (= 6 (:kuro.checkpoint/dropped-bytes cp)))
+      (is (= false (:kuro/truncated? cp)) "the stream itself was not capped"))
+    (testing "the restored orphan carries the cut as truncation"
+      (let [back (cp/restore cp)]
+        (is (true? (:kuro/truncated? back)))
+        (is (= 6 (:kuro/dropped-bytes back)))
+        (is (= 10 (:kuro/stdout-bytes back)) "pre-truncation truth is kept")))
+    (testing "and the abandoned receipt says it was cut, not a clean short exit"
+      (let [r (cp/abandon (cp/restore cp))]
+        (is (= 129 (:kuro/exit-code r)))
+        (is (true? (:kuro/truncated? r)))
+        (is (= 6 (:kuro/dropped-bytes r)))
+        (is (= "0123" (:kuro/stdout r)) "only the kept body, never the dropped tail"))))
+  (testing "checkpoint-layer and stream-layer cuts compose — both are reported"
+    (let [st (-> (stream/open (sess) (cmd) {:max-output-bytes 5})
+                 (stream/append-chunk {:stream :stdout :text "abc"})   ; kept (3 <= cap 5)
+                 (stream/append-chunk {:stream :stdout :text "defgh"})) ; over: dropped 5
+          cp (cp/->edn st {:max-chunk-bytes 2})]                       ; keep "ab", cut 1
+      ;; stream cut 5 (defgh over the 5 cap), checkpoint cut 1 on the kept prefix "abc"->"ab"
+      (is (= 1 (:kuro.checkpoint/dropped-bytes cp)))
+      (let [back (cp/restore cp)]
+        (is (true? (:kuro/truncated? back)))
+        (is (= 6 (:kuro/dropped-bytes back)) "stream cut + checkpoint cut both survive")))))
+
+(deftest cap-spans-chunks
+  (let [st (-> (stream/open (sess) (cmd))
+               (stream/append-chunk {:stream :stdout :text "aaaa"})
+               (stream/append-chunk {:stream :stdout :text "bbbb"})
+               (stream/append-chunk {:stream :stdout :text "cccc"}))
+        c (cp/->edn st {:max-chunk-bytes 6})]
+    (is (= ["aaaa" "bb"] (mapv :text (:kuro/chunks c))))
+    (is (= 6 (:kuro.checkpoint/dropped-bytes c)))))
+
+(deftest byte-cap-counts-bytes-not-characters
+  ;; Issue #106: `:max-chunk-bytes` の切詰めは (count) = 文字数だったので、日本語の
+  ;; 出力では dropped-bytes が最大 3 倍小さく出て、restore した receipt が
+  ;; kept_bytes + dropped_bytes = stdout-bytes を満たさなかった。kuro.stream の
+  ;; byte-count (この名前空間が「count は文字数で日本語で 3 倍ずれる——」と
+  ;; 警告しているその byte-count) で切り、char 境界を裂かない (壊れたコード
+  ;; ポイントを保存先に置かない) ことが fix。reconcile 不変量を実テキストで pin する。
+  (let [st (-> (stream/open (sess) (cmd))
+               (stream/append-chunk {:stream :stdout :text "こんにちは"}))  ; 5 chars = 15 UTF-8 bytes
+        cp (cp/->edn st {:max-chunk-bytes 4})]
+    (testing "cap は byte で、切れ目は char 境界"
+      (is (= "こ" (:text (first (:kuro/chunks cp)))) "「ん」は 3+3=6 > 4 で入らない")
+      (is (= 1 (count (:kuro/chunks cp)))))
+    (testing "dropped は切り落とした**バイト**数: 15 - 3 = 12"
+      (is (= 12 (:kuro.checkpoint/dropped-bytes cp)))
+      (is (= 15 (:kuro/stdout-bytes cp)) "pre-truncation の byte 真実は保たれる"))
+    (testing "復元した receipt は reconcile する: kept_bytes + dropped_bytes = stdout-bytes"
+      (let [back (cp/restore cp)
+            r    (cp/abandon back)]
+        (is (= "こ" (:kuro/stdout r)))
+        (is (= 12 (:kuro/dropped-bytes r)))
+        (is (= 15 (+ (stream/byte-count (:kuro/stdout r)) (:kuro/dropped-bytes r))))))))
+
+(deftest an-unknown-version-is-refused
+  (testing "a checkpoint from a future format must not be silently misread"
+    (is (thrown? js/Error
+                 (cp/restore (assoc (cp/->edn (running-stream))
+                                    :kuro.checkpoint/version 999))))))
+
+(deftest summary-says-the-operational-facts
+  (let [s (cp/summary (cp/->edn (running-stream)))]
+    (is (re-find #"npm test" s))
+    (is (re-find #"running" s))
+    (is (re-find #"\d+B" s))))
+
+
+(deftest summary-declares-checkpoint-truncation
+  ;; cp/summary の `(checkpoint dropped NB)` 接尾辞 (`when-let [d
+  ;; (:kuro.checkpoint/dropped-bytes cp)]`) は `->edn` に `:max-chunk-bytes` を
+  ;; 渡した (checkpoint 層で本文を切った) 時にだけ現れる branch。既存の
+  ;; summary-says-the-operational-facts は untruncated な stream だけを見るので、
+  ;; この接尾辞が消えたり壊れたりしても全 suite が緑のまま -- 「切った事実」が
+  ;; 運用者の最初の 1 行から消える regression をここで止める。
+  (let [s (cp/summary (cp/->edn (running-stream) {:max-chunk-bytes 4}))]
+    (is (re-find #"npm test" s))
+    (is (re-find #"\[running\]" s)
+        "base line is unchanged -- the suffix is an addition, not a replacement")
+    (is (re-find #"\(checkpoint dropped \d+B\)" s)))
+  (testing "the exact count: cp/->edn の cap は UTF-8 **byte** で切る"
+    ;; running-stream = stdout "compiling…\n" (9 ASCII + "…"=3B + "\n" = 13 bytes)
+    ;; + stderr "warn\n" (5 bytes)。cap 4 → 最初の chunk から "comp" (4 bytes) を
+    ;; 残し 9 bytes 切り落とし、2 つ目は丸ごと落ちる → 9 + 5 = 14。
+    ;; Issue #106: 以前は (count) 文字数で切っていた (12B) が、日本語で byte と
+    (is (re-find #"\(checkpoint dropped 14B\)"
+                 (cp/summary (cp/->edn (running-stream) {:max-chunk-bytes 4})))))
+  (testing "the untruncated case has no suffix"
+    (is (not (re-find #"checkpoint dropped"
+                      (cp/summary (cp/->edn (running-stream))))))))
+
+(deftest summary-declares-stream-truncation
+  ;; cp/summary の `(stream dropped NB)` 接尾辞 (`:kuro/dropped-bytes`) は
+  ;; **実行中**に出力上限 (`:max-output-bytes`) で切られた stream の checkpoint
+  ;; に現れる branch。既存の summary-declares-checkpoint-truncation は保存時
+  ;; (:max-chunk-bytes) の切れ方だけを見ていた -- 実行中に切られた実行は
+  ;; `[running] 4B` の顔のまま切った事実が運用者の最初の 1 行から消える
+  ;; regression (README「silently-cut receipt は short success と見分けが
+  ;; 付かない」の禁止が summary に漏れる) をここで止める。
+  (let [st (-> (stream/open (sess) (cmd) {:max-output-bytes 4})
+               (stream/append-chunk {:stream :stdout :text "abcd"})
+               (stream/append-chunk {:stream :stdout :text "efghij"}))
+        s (cp/summary (cp/->edn st))]
+    (is (re-find #"npm test" s))
+    (is (re-find #"\[running\]" s)
+        "base line is unchanged -- the suffix is an addition, not a replacement")
+    (is (re-find #"\(stream dropped 6B\)" s)
+        "the 6 bytes the run was cut short by are on the first line"))
+  (testing "a stream cut and a checkpoint cut are both named, not merged into one"
+    (let [st (-> (stream/open (sess) (cmd) {:max-output-bytes 5})
+                 (stream/append-chunk {:stream :stdout :text "abc"})
+                 (stream/append-chunk {:stream :stdout :text "defgh"}))
+          s (cp/summary (cp/->edn st {:max-chunk-bytes 2}))]
+      (is (re-find #"\(stream dropped 5B\)" s))
+      (is (re-find #"\(checkpoint dropped 1B\)" s))))
+  (testing "the untruncated case has no suffix"
+    (is (not (re-find #"stream dropped"
+                      (cp/summary (cp/->edn (running-stream))))))))
+
+(deftest checkpoint-edn-chunk-shape-is-closed
+  ;; This is the one select-keys site without a shape-closure pin: kuro.terminal
+  ;; (terminal_test receipt-drops-undeclared-result-keys) and kuro.fs
+  ;; (fs_test fs-receipts-are-fixed-shape-and-namespaced) each pin their
+  ;; select-keys discipline; kuro.checkpoint's chunk->edn
+  ;; `(select-keys c [:stream :text :kuro/seq])` had none. append-chunk stores
+  ;; the whole caller chunk (`assoc chunk :kuro/seq`), so a chunk carrying an
+  ;; extra key keeps it in the live stream and silently loses it in the
+  ;; checkpoint EDN -- a reader would see a shape that depends on whether the
+  ;; value happened to pass through checkpoint or not, the exact hazard the
+  ;; select-keys in terminal/fs exist to prevent. Pin the closed shape.
+  (let [st (-> (stream/open (sess) (cmd))
+               (stream/append-chunk {:stream :stdout :text "hi" :priority "high"}))
+        cp (cp/->edn st)
+        c  (first (:kuro/chunks cp))]
+    (is (= 1 (count (:kuro/chunks cp))))
+    (is (= #{:stream :text :kuro/seq} (set (keys c)))
+        "the checkpoint EDN chunk is closed to [:stream :text :kuro/seq] -- the appended :priority is dropped")
+    (is (= "hi" (:text c)))
+    (is (= :stdout (:stream c)))
+    (is (not (contains? c :priority)))))
+(deftest max-chunk-bytes-accounting-tracks-a-running-total
+  ;; ->edn の :max-chunk-bytes 切詰めは、kept 全部の byte 数を**毎 chunk 足し直す**
+  ;; 実装 (O(k^2)) だった — chatty な実行の checkpoint 保存で 2 次の時間が溶ける。
+  ;; running total 方式に直しても、issue #106 が pin した reconcile は変わらない:
+  ;; kept-bytes + dropped-bytes == stream の実 byte 総数、かつ kept は cap を
+  ;; 超えない。このテストは fits / partial-cut / whole-drop の 3 分岐全部を
+  ;; >2 chunk で通して、accumulator の byte 会計が壊れていないことを押さえる。
+  (let [st (-> (stream/open (sess) (cmd))
+               (stream/append-chunk {:stream :stdout :text "ab"})         ;; 2B fits
+               (stream/append-chunk {:stream :stdout :text "cd"})         ;; 2B fits  -> 4B
+               (stream/append-chunk {:stream :stdout :text "こんにちは"}) ;; 15B CJK, 3B room -> "こ" kept, 12B cut
+               (stream/append-chunk {:stream :stdout :text "xy"}))        ;; 2B, room 0 -> whole-drop
+        orig (+ (stream/byte-count "ab") (stream/byte-count "cd")
+                (stream/byte-count "こんにちは") (stream/byte-count "xy"))
+        edn (cp/->edn st {:max-chunk-bytes 7})
+        kept (reduce + 0 (map (comp stream/byte-count :text) (:kuro/chunks edn)))]
+    (is (= "abcdこ" (apply str (map :text (:kuro/chunks edn))))
+        "the kept prefix is a character-boundary cut of the real output")
+    (is (<= kept 7) "the kept prefix stays within the byte cap")
+    (is (= 14 (:kuro.checkpoint/dropped-bytes edn))
+        "dropped counts the cut CJK bytes (12) plus the whole-dropped chunk (2)")
+    (is (= orig (+ kept (:kuro.checkpoint/dropped-bytes edn)))
+        "kept-bytes + checkpoint dropped-bytes == the stream's real byte total")))
+
+(deftest astral-char-cut-never-splits-a-surrogate-pair
+  ;; :max-chunk-bytes の切詰めは **コードポイント単位**でなければならない。
+  ;; 旧実装 (cut-to-bytes) は UTF-16 コードユニット単位で足し、astral 文字
+  ;; (絵文字 U+1F600 は 2 ユニット = 4 UTF-8 byte) をサロゲートペアの途中で
+  ;; 裂いた —— 実測 (2026-09-09): 'a😀b' を cap=4 に切ると cljs (実消費者 =
+  ;; kobo サーバ) は孤立サロゲート 'a\\uD83D' を保存先に置き (namespace の
+  ;; 文書「壊れたコードポイントを保存先に置かない」を破る)、JVM は 6 byte 全部を
+  ;; 保持して **cap を超えた**。同じ入力・同じ cap で runtime ごとに別の byte 列が
+  ;; 生まれる —— このテストの断言が両 runtime で通ることは、cut-to-bytes が
+  ;; コードポイント値からバイト長を算定する (parity 安全) ことの証明でもある。
+  (let [text "a😀b"]                     ; 1 + 4 + 1 = 6 UTF-8 bytes = 4 code units
+    (doseq [[cap kept'] {1 "a" 2 "a" 3 "a" 4 "a" 5 "a😀" 6 "a😀b"}]
+      (let [st (-> (stream/open (sess) (cmd))
+                   (stream/append-chunk {:stream :stdout :text text}))
+            c (cp/->edn st {:max-chunk-bytes cap})
+            kept (apply str (map :text (:kuro/chunks c)))
+            dropped (:kuro.checkpoint/dropped-bytes c 0)]
+        (testing (str "cap " cap)
+          (is (= kept' kept)
+              "kept is a code-point-aligned prefix — the 4-byte astral char is never half-kept")
+          (is (= 6 (+ (stream/byte-count kept') dropped))
+              "byte accounting still reconciles: kept + dropped == the whole emoji string's bytes"))))))

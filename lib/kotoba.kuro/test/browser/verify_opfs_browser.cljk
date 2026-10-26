@@ -1,0 +1,220 @@
+;; verify_opfs_browser.cljs — real-browser E2E for the OPFS block store (S2).
+;;
+;; Pattern: wasm-webcomponent's test/browser harness (static server + headless
+;; Chromium via Playwright, nbb-driven). kuro has no browser test precedent of
+;; its own yet, so this file ports the technique rather than requiring that
+;; repo's harness (different repo, different deps).
+;;
+;; What must be REAL for this to count (kuro rule: a host test proves the host
+;; actually does the effect):
+;;   - a real OPFS (Chromium's, under the page's origin)
+;;   - a real Worker running src/kuro/host/opfs_worker.js
+;;   - real put/get round-trip through kuro.fs's injected seam
+;;   - real CID mint via WebCrypto inside the Worker
+;;
+;; Run: kbb --backend sci -cp test/browser test/browser/verify_opfs_browser.cljk
+
+(ns verify-opfs-browser
+  (:require ["node:http" :as http]
+            ["node:path" :as path]
+            ["node:fs/promises" :as fsp]
+            ["playwright" :refer [chromium]]
+            [kotoba.lang.text :as str]))
+
+(def repo-root (.cwd js/process))
+(def tmp-dir (.join path repo-root "test" "browser" ".tmp"))
+
+(defn- report! [m]
+  (println (js/JSON.stringify (clj->js m) nil 2)))
+
+(defn- start-static-server
+  [root-dir]
+  (js/Promise.
+   (fn [resolve reject]
+     (let [server
+           (http/createServer
+            (fn [req res]
+              (let [url-path (js/decodeURIComponent (first (.split (.-url req) "?")))
+                    file-path (.join path root-dir url-path)]
+                (if-not (.startsWith file-path root-dir)
+                  (do (.writeHead res 403) (.end res "forbidden"))
+                  (-> (fsp/readFile file-path)
+                      (.then (fn [data]
+                               (let [ext (.extname path file-path)
+                                     mime (get {".html" "text/html; charset=utf-8"
+                                                ".js" "text/javascript"
+                                                ".mjs" "text/javascript"}
+                                               ext "application/octet-stream")]
+                                 (.writeHead res 200 #js {"Content-Type" mime})
+                                 (.end res data))))
+                      (.catch (fn [e]
+                                (.writeHead res 404)
+                                (.end res (str "not found: " (.-message e))))))))))
+           ]
+       (.on server "error" reject)
+       (.listen server 0 "127.0.0.1"
+                (fn []
+                  (let [port (.-port (.address server))]
+                    (resolve #js {:baseUrl (str "http://127.0.0.1:" port)
+                                  :close (fn [] (js/Promise. (fn [r] (.close server r))))}))))))))
+
+(def page-html
+  "The page under test: spawns the Worker, runs put/get/stats/drop/publish
+  through the wire contract, and reports results as JSON on window.__results.
+  Single quotes throughout the HTML/JS so the Clojure string needs no escapes."
+  "<!doctype html>
+<html><body><script type='module'>
+window.addEventListener('error', (e) => { window.__failed = 'top: ' + e.message; });
+window.addEventListener('unhandledrejection', (e) => { window.__failed = 'rej: ' + (e.reason && e.reason.message || String(e.reason)); });
+const worker = new Worker('./kuro-opfs-worker.js');
+let nextId = 1;
+const pending = new Map();
+
+worker.onmessage = (ev) => {
+  const m = ev.data;
+  const id = m['kuro.opfs/id'];
+  const p = pending.get(id);
+  if (p) { pending.delete(id); p(m); }
+};
+
+function call(op, payload) {
+  return new Promise((resolve) => {
+    const id = nextId++;
+    pending.set(id, resolve);
+    worker.postMessage({
+      'kuro.opfs/type': 'request',
+      'kuro.opfs/id': id,
+      'kuro.opfs/op': op,
+      'kuro.opfs/payload': payload || {},
+    });
+  });
+}
+
+const results = {};
+
+const bytes = new Uint8Array([104, 101, 108, 108, 111]);
+const put = await call('put', { bytes });
+results.putCid = put['kuro.opfs/result']?.cid ?? null;
+results.putError = put['kuro.opfs/error'];
+
+if (results.putCid) {
+  const got = await call('get', { cid: results.putCid });
+  const back = got['kuro.opfs/result']?.bytes;
+  results.getMatches = back instanceof Uint8Array &&
+    back.length === bytes.length &&
+    back.every((b, i) => b === bytes[i]);
+}
+
+const miss = await call('get', { cid: 'bafkrei000000000000000000000000000000000000000000000000000000' });
+results.missIsNull = miss['kuro.opfs/result']?.bytes === null && miss['kuro.opfs/error'] === null;
+
+const st1 = await call('stats', {});
+results.statsAfterPut = st1['kuro.opfs/result']?.count;
+
+await call('drop-cache', {});
+const st2 = await call('stats', {});
+results.statsAfterDrop = st2['kuro.opfs/result']?.count;
+const got2 = await call('get', { cid: results.putCid });
+results.missAfterDrop = got2['kuro.opfs/result']?.bytes === null;
+
+const bad = await call('publish', { cids: ['bafkrei-fake'], bytesByCid: { 'bafkrei-fake': bytes } });
+results.publishMismatchRefused = bad['kuro.opfs/error'] === 'cid-mismatch';
+
+// Issue #54 contract, pinned in a real browser:
+//  - delete of a cached cid: {removed: true}, no error
+//  - delete of a never-cached cid: IDEMPOTENT SUCCESS {removed: false}, no error
+//  - delete twice: second is {removed: false}
+//  - drop-cache reports {removed: n} matching the blocks that existed
+//  - after drop-cache, delete of a previously-cached cid is still {removed: false}
+// (the block for putCid was already removed by the drop-cache above — the
+// page re-puts the same bytes first; same cid, so this is the same block)
+await call('put', { bytes });
+const del = await call('delete', { cid: results.putCid });
+results.deleteCached = del['kuro.opfs/result']?.removed === true && del['kuro.opfs/error'] === null;
+
+const delMiss = await call('delete', { cid: 'bafkrei000000000000000000000000000000000000000000000000000000' });
+results.deleteMissIdempotent = delMiss['kuro.opfs/result']?.removed === false && delMiss['kuro.opfs/error'] === null;
+
+// re-put so delete-twice and drop-cache removed counts have known blocks
+const put2 = await call('put', { bytes });
+const cid2 = put2['kuro.opfs/result']?.cid;
+const put3 = await call('put', { bytes: new Uint8Array([119, 111, 114, 108, 100]) });
+const cid3 = put3['kuro.opfs/result']?.cid;
+const del1 = await call('delete', { cid: cid2 });
+results.deleteTwiceFirstTrue = del1['kuro.opfs/result']?.removed === true;
+const del2 = await call('delete', { cid: cid2 });
+results.deleteTwiceSecondFalse = del2['kuro.opfs/result']?.removed === false && del2['kuro.opfs/error'] === null;
+
+const drop = await call('drop-cache', {});
+// after the deletes above, exactly cid3's block remains
+results.dropReportsRemovedCount = drop['kuro.opfs/result']?.removed === 1 && drop['kuro.opfs/error'] === null;
+const st3 = await call('stats', {});
+results.statsAfterDropZero = st3['kuro.opfs/result']?.count === 0;
+const delAfterDrop = await call('delete', { cid: cid3 });
+results.deleteAfterDropIdempotent = delAfterDrop['kuro.opfs/result']?.removed === false;
+
+window.__results = results;
+</script></body></html>")
+
+(defn- start-static-server-tmp [_]
+  (start-static-server tmp-dir))
+
+(defn- goto-and-check [page srv]
+  (.on page "console"
+       (fn [msg] (report! {:console (.-text msg)})))
+  (.on page "pageerror"
+       (fn [err] (report! {:pageerror (.-message err)})))
+  (-> (.goto page (str (.-baseUrl srv) "/index.html"))
+      (.then (fn [] (.evaluate page "(async function(){ const t0 = Date.now(); while (Date.now() - t0 < 15000) { if (window.__results) { return JSON.stringify({results: window.__results, failed: null}); } if (window.__failed) { return JSON.stringify({results: null, failed: window.__failed}); } await new Promise(r => setTimeout(r, 100)); } return JSON.stringify({results: null, failed: 'timeout'}); })()")))
+      (.then (fn [results]
+               (let [raw (js/JSON.parse results)
+                     r (js->clj (.-results raw) :keywordize-keys true)
+                     _ (when (.-failed raw) (report! {:page-failed (.-failed raw)}))
+                     ok? (and (:putCid r)
+                              (str/starts-with? (:putCid r) "bafkrei")
+                              (:getMatches r)
+                              (:missIsNull r)
+                              (= 1 (:statsAfterPut r))
+                              (zero? (:statsAfterDrop r))
+                              (:missAfterDrop r)
+                              (:publishMismatchRefused r)
+                              (:deleteCached r)
+                              (:deleteMissIdempotent r)
+                              (:deleteTwiceFirstTrue r)
+                              (:deleteTwiceSecondFalse r)
+                              (:dropReportsRemovedCount r)
+                              (:statsAfterDropZero r)
+                              (:deleteAfterDropIdempotent r))]
+                 (report! {:opfs-e2e r})
+                 (report! {:verdict (if ok? "PASS" "FAIL")})
+                 (when-not ok? (set! (.-exitCode js/process) 1)))))
+      (.catch (fn [e]
+                (report! {:e2e-error (.-message e)})
+                (set! (.-exitCode js/process) 1)))))
+
+(defn- run-browser-checks [srv]
+  (-> (.launch chromium #js {:headless true})
+      (.then (fn [browser] (-> (.newPage browser)
+                               (.then (fn [page] (goto-and-check page srv)))
+                               (.then (fn [_] (.close browser))))))
+      (.then (fn [_] ((.-close srv))))))
+
+(defn- -main []
+  (let [fs (js/require "fs")
+        prep
+        (js/Promise.resolve
+         (do (.mkdirSync fs tmp-dir #js {:recursive true})
+             (.writeFileSync fs (.join path tmp-dir "index.html") page-html)
+             (.writeFileSync fs
+                             (.join path tmp-dir "kuro-opfs-worker.js")
+                             (.readFileSync fs
+                                            (.join path repo-root "src" "kuro" "host" "opfs_worker.js")
+                                            "utf8"))))]
+    (-> prep
+        (.then start-static-server-tmp)
+        (.then run-browser-checks)
+        (.catch (fn [e]
+                  (report! {:fatal (.-message e)})
+                  (set! (.-exitCode js/process) 1))))))
+
+(-main)

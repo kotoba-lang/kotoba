@@ -1,0 +1,66 @@
+(ns kuro.host.tool-browser
+  "Browser tool-call adapter. The JS host factory is supplied by page glue;
+  admission comes from the terminal session, and receipts retain its identity.
+  Tool results/files are separate from kuro.terminal's fixed receipt shape."
+  (:require [kuro.terminal :as terminal]
+            [kuro.fs :as fs]))
+
+(defn create
+  "factory is createToolHost from the bundled client.js. opts cannot override
+  the session grant. It may supply limits and the trusted Worker asset URL."
+  [session factory opts]
+  {:session session
+   :host (factory (clj->js (assoc opts :capabilities
+                                (vec (terminal/effective-capabilities session)))))})
+
+(defn call
+  "Accept an OpenAI-style function tool call. Returns a Promise of
+  {:id :result :files :receipt}. Files are explicit UTF-8 snapshots; callers
+  import/export them through kuro.fs with its own grants, never auto-publish."
+  ([adapter tool-call] (call adapter tool-call {}))
+  ([{:keys [session host]} tool-call options]
+   (-> (.call host (clj->js tool-call) (clj->js options))
+       (.then
+        (fn [response]
+          (let [r (js->clj response :keywordize-keys true)
+                raw (:receipt r)
+                result (into {} (map (fn [[k v]] [(keyword (name k)) v])) raw)
+                cmd (terminal/command (:kuro/argv raw))]
+            (assoc r :result (js->clj (.-result response))
+                   :files (js->clj (.-files response))
+                   :receipt (terminal/receipt session cmd result))))))))
+
+(defn call-with-filesystem
+  "Read explicit paths through kuro.fs, run the tool, and import its explicit
+  exports through kuro.fs. get-block/put-block are the existing synchronous
+  block-store effects. No implicit publication, no automatic concurrent merge.
+  A failed call imports nothing. FS denials retain their receipts in :store."
+  [adapter tool-call store {:keys [read-paths get-block put-block call-options]}]
+  (let [decoder (js/TextDecoder. "utf-8" #js {:fatal true})
+        encoder (js/TextEncoder.)
+        [read-store files denied?]
+        (reduce (fn [[st files denied?] path]
+                  (if denied? [st files true]
+                    (let [[next-st bytes] (fs/read-file st path get-block)]
+                      (if (nil? bytes) [next-st files true]
+                        [next-st (assoc files path (.decode decoder bytes)) false]))))
+                [store {} false] read-paths)]
+    (if denied?
+      (js/Promise.resolve {:store read-store :error :filesystem-read-denied})
+      (let [arguments (get-in tool-call [:function :arguments])
+            args (if (string? arguments)
+                   (js->clj (js/JSON.parse arguments) :keywordize-keys true)
+                   arguments)
+            request (assoc-in tool-call [:function :arguments] (assoc args :files files))]
+        (-> (call adapter request call-options)
+            (.then
+             (fn [response]
+               (if (zero? (get-in response [:receipt :kuro/exit-code]))
+                 (let [[next-store denied?]
+                       (reduce (fn [[st denied?] [path text]]
+                                 (if denied? [st true]
+                                   (let [[next-st cid] (fs/write st path (.encode encoder text) put-block)]
+                                     [next-st (nil? cid)])))
+                               [read-store false] (:files response))]
+                   (assoc response :store next-store :error (when denied? :filesystem-write-denied)))
+                 (assoc response :store read-store)))))))))
