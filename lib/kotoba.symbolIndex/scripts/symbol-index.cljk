@@ -1,0 +1,1340 @@
+#!/usr/bin/env kbb
+;; シンボル索引: .cljk / .cljc / .cljs / .clj / .kotoba を走査し、
+;; (def...) / (ns...) の top-level form に現れるシンボルから
+;; 「シンボル → file:line」の索引を作る。
+;;
+;; なぜ必要か。2026-09-15 の Co-Scientist iteration 1 で実測した:
+;;
+;;   * コード理解のための full-file read は 1 query あたり平均 ~6,580 tok
+;;     (p50 2,212 tok)。シンボル位置 + 前後 3 行の snippet なら平均 ~122 tok。
+;;     **54 倍の差**。hyakka/catalog.cljk (1.28M tok) のような file を
+;;     full read すると context が破綻する。
+;;   * superproject root の `git grep` は子 repo (gitlink) を 1 件も引かない
+;;     (実測 0 hit)。rg なら 424 MB 走査が 3.6s。
+;;
+;; そこで: **「コードを読む」前に、これを引く。**
+;;
+;;   kbb --backend sci scripts/symbol-index.cljk build          # 索引生成
+;;   kbb --backend sci scripts/symbol-index.cljk find reconcile  # シンボル検索
+;;   kbb --backend sci scripts/symbol-index.cljk show kagami.db/apply-pin-advance
+;;                                                              # 定義の snippet 表示
+;;   kbb --backend sci scripts/symbol-index.cljk outline kagami.db  # file/ns の定義一覧
+;;   kbb --backend sci scripts/symbol-index.cljk status         # 索引の素性
+;;
+;; 索引は .kotoba-cache/symbol-index.tsv (v4: 7 列目が構造 hash) に落ちる。iteration 2 (2026-09-15)
+;; で JSON + js->clj (108 MB, 5.5 s/query) を捨て、TSV を native RegExp で
+;; 走査する形にした (measurements.edn に実測)。
+;;
+;; exit code は 3 値: 0 = hit / 1 = 測って 0 件 (grep 規約) / 2 = 答えを拒否
+;; (無引数・未知 cmd・索引が空・索引の top が cwd と違う・show の不在 symbol)。
+;; 「測れなかった」と「測って無かった」を同じ値にしない。
+
+(require '[clojure.string :as str]
+         '[clojure.walk :as walk]
+         '[edamame.core :as e])
+
+(def fs (js/require "node:fs"))
+(def path (js/require "node:path"))
+
+(def index-dir ".kotoba-cache")
+(def index-file "symbol-index.tsv")
+(def index-version "v5")   ; v5: 8 列目に参照 (iteration 18)。v4: 7 列目が構造 hash、読めない定義は text hash + flag t
+
+(defn- nearest-indexed-ancestor
+  "cwd から上へ辿って .kotoba-cache/symbol-index.tsv を持つ最初の dir。無ければ nil。
+  agent の shell は project root に居ないことが多い (Hermes Agent の terminal は
+  $HOME で始まる実測、2026-09-15) ので、cwd 決め打ちにしない。"
+  [start]
+  (loop [d start]
+    (if (.existsSync fs (.join path d index-dir index-file))
+      d
+      (let [up (.dirname path d)]
+        (if (= up d) nil (recur up))))))
+
+(def os (js/require "node:os"))
+
+(def roots-file
+  "build が索引の root を 1 行ずつ記録する登録簿 (新しい順、realpath)。cwd の外から呼ばれた
+  ときの fallback にだけ使う。"
+  (.join path (.homedir os) index-dir "symbol-index-roots"))
+
+(defn- known-roots
+  "登録簿の root のうち、今も索引を持つもの (新しい順)。登録簿が無ければ []。"
+  []
+  (try
+    (->> (str/split-lines (.readFileSync fs roots-file "utf8"))
+         (map str/trim) (remove empty?) distinct
+         (filterv #(.existsSync fs (.join path % index-dir index-file))))
+    (catch :default _ [])))
+
+(defn- remember-root!
+  "build 後に root を登録簿の先頭へ (重複は消す)。失敗しても build は失敗にしない。"
+  [root]
+  (try
+    (let [dir (.dirname path roots-file)
+          old (try (str/split-lines (.readFileSync fs roots-file "utf8")) (catch :default _ []))
+          rows (into [root] (remove #{root ""} (map str/trim old)))]
+      (.mkdirSync fs dir #js{:recursive true})
+      (.writeFileSync fs roots-file (str (str/join "\n" (take 20 rows)) "\n")))
+    (catch :default _ nil)))
+
+(def ^:private top-fallback-note
+  "cwd にも祖先にも索引が無く、登録簿の唯一の root で答えたときに 1 行目に出す注記。nil なら通常。"
+  (volatile! nil))
+
+(def top
+  "索引の root。優先順: SYMBOL_INDEX_ROOT > CLAUDE_PROJECT_DIR > 索引を持つ最寄りの
+  祖先 dir > (iteration 16) 登録簿の root がちょうど 1 つならそれ > cwd。cwd に落ちるのは
+  build のときだけ意味がある (find/show は索引が無ければ拒否する —— 以前は $HOME で
+  呼ばれて home 全体を走査し、Hermes の terminal tool の 120s timeout に当たった)。
+  登録簿の fallback は **読むだけ** (build はしない)。09-17 の Hermes 腕 D で 8 query 中 7 が
+  $HOME から呼んで REFUSE され、6 が REFUSE 文に従って build を走らせた (1 query あたり
+  +1.1 tool call、+43% token) —— 索引が在るのに場所を知らないだけだった。"
+  (let [env-root (or (not-empty (.-SYMBOL_INDEX_ROOT (.-env js/process)))
+                     (not-empty (.-CLAUDE_PROJECT_DIR (.-env js/process))))
+        anc (when-not env-root (nearest-indexed-ancestor (.cwd js/process)))
+        argv (vec (js->clj (.-argv js/process)))
+        building? (some #{"build"} argv)
+        roots (when-not (or env-root anc building?) (known-roots))
+        chosen (cond env-root env-root
+                     anc anc
+                     (= 1 (count roots)) (do (vreset! top-fallback-note
+                                                      (str "(using index root " (first roots) " — cwd " (.cwd js/process)
+                                                           " has none; cd there or set SYMBOL_INDEX_ROOT to silence this)"))
+                                             (first roots))
+                     :else (.cwd js/process))]
+    ;; header の top と文字列比較するので realpath に揃える (macOS の /var → /private/var、
+    ;; env で symlink 側の path を渡された場合に top 不一致で拒否していた実測)。
+    (try (.realpathSync fs chosen) (catch :default _ chosen))))
+
+(def ^:private scan-exts #{".cljk" ".cljc" ".cljs" ".clj" ".kotoba"})
+(def ^:private skip-dirs #{".git" "node_modules" ".west" "target" ".cpcache" ".lsp" ".clj-kondo"
+                           ".kotoba-cache" ".shadow-cljs" ".nbb" "dist" "build"})
+(def ^:private max-file-bytes (* 4 1024 1024))
+(def ^:private find-limit 40)
+
+(def def-form-re
+  "top-level 定義 form。sexp parser を持ち込まない代わりに、この家系の codebase は
+  top-level def を行頭に置く規約で書かれている。iteration 2 で足した形:
+    * 行頭 `#?(:clj (defn …` の inline reader conditional (実測 1,347 行)
+    * 3 桁以内の浅い indent (`#?(:clj\\n   (defn …` / `(comment\\n  (defn …`、
+      実測 3,393 行)。4 桁以上は test の文字列内 code が多いので取らない。
+    * 名前の前の metadata `^:private` / `^{:doc \"…\"}` / `^String` を読み飛ばす
+      (iteration 1 では 38,894 件 = 5% が `^:private` という名前で索引に載った)。
+  iteration 3: 行ごとでなく file 全文に `gm` で当てる native RegExp。SCI の
+  per-line loop (5,000 file で 1,712 ms) が 387 ms になり、複数行に跨る
+  `^{:doc \"…\"}\\n  name` の def (per-line では取れなかった) も名前と行を拾う。
+  indent は `[ \\t]{1,3}` にする (`\\s` だと `^` の後の空行を跨いで誤る)。
+  group 1 = reader-cond / indent の有無 (nested 判定)、2 = kind、3 = name。"
+  (js/RegExp.
+   (str "^((?:#\\?\\(:\\w+\\s+)|[ \\t]{1,3})?"
+        "\\((defn|defn-|def|defonce|defmacro|defmulti|defmethod|defprotocol|defrecord|deftype|ns|deftest)"
+        "\\s+(?:(?:\\^\\{[^}]*\\}|\\^\\S+)\\s+)*"
+        "([^\\s\\^\\(\\)\\[\\]\\{\\}\"]+)")
+   "gm"))
+
+(defn- linked-worktree?
+  "`.git` が **file** で `gitdir: …/.git/worktrees/<name>` を指す = git の linked
+  worktree。主 checkout と同じ内容の写しなので既定では走査しない (submodule の
+  gitfile は `.git/modules/…` を指すので該当しない)。名前 (`worktrees/`, `_wt-*`)
+  ではなく実在する構造で判定する (itonami-maturity-scan の virtualenv? と同じ理由)。
+  iteration 6: 子 dir ごとに `.git` を statSync していた (dir 数と同じ 74K 回) のを
+  やめ、その dir を **読んだとき** の dirent (`.git` が file か) で判定する。
+  git-entry は readdir が返した `.git` の Dirent か nil。"
+  [dir git-entry]
+  (boolean
+   (and git-entry (.isFile git-entry)
+        (try (str/includes? (.readFileSync fs (.join path dir ".git") "utf8") "/worktrees/")
+             (catch :default _ false)))))
+
+(defn- gitignored-children
+  "top が git repo なら、top **直下** の entry のうち gitignore され、かつ自身が
+  git repo でない (`.git` を持たない) ものの名前集合。生成物 dir (`runs/`
+  `verify-runs/` 等、実測で 3.2 万 symbol) を索引から外す。west の子 repo は
+  root の .gitignore に載っているが `.git` を持つので残る。深さ 2 以上は見ない
+  (5,000 行の .gitignore に対する check-ignore が depth 2 で 30 s、depth 1 で
+  0.85 s と測ったため)。git が無い / top が repo でない → 空集合 (skip 0 は
+  「何も無い」ではなく「測っていない」なので stats に :gitignore-checked を残す)。"
+  []
+  (if-not (.existsSync fs (.join path top ".git"))
+    {:names #{} :checked false}
+    (try
+      (let [cp (js/require "node:child_process")
+            names (remove #{".git"} (js->clj (.readdirSync fs top)))
+            out (.execFileSync cp "git" #js["check-ignore" "--stdin"]
+                               #js{:cwd top :input (str (str/join "\n" names) "\n")
+                                   :encoding "utf8" :stdio #js["pipe" "pipe" "ignore"]})
+            ignored (remove str/blank? (str/split-lines out))]
+        {:checked true
+         :names (into #{} (remove #(.existsSync fs (.join path top % ".git"))) ignored)})
+      ;; check-ignore は 1 件も ignore が無いと exit 1 で throw する。それ以外
+      ;; (git 不在 / exit 128) は「測れなかった」なので checked false。
+      (catch :default e {:names #{} :checked (= 1 (.-status e))}))))
+
+(def ^:private prune-budget
+  "group (repo 直下 2 段、repo 外は top から 4 段) の中で **連続して** source file を
+  1 つも持たない dir がこの数に達したら、その group の残りを歩かない。
+  iteration 4 の実測 (root corpus、136,302 dir): source を持つ group の最長 fileless
+  run は 737 (`etzhayyim/root/50-infra/etzhayyim-did-web`)、fileless な group の dir
+  は 116,269。budget 800 で誤爆 0 / 62,447 dir を prune、1000 は余裕 36%。
+  prune した group は header の pruned-groups と `status` に必ず載る (黙って
+  消さない)。`build --no-prune` で無効。"
+  1000)
+
+(defn- group-of
+  "prune の集計単位。repo (`.git` を持つ最寄りの祖先) の中なら repo path + 直下 2 段、
+  repo の外なら top 相対 4 段。1 段だと `50-infra` (1,362 run の後に 86 file) を
+  誤爆し、2 段なら誤爆 0 だった (measurements.edn :h13)。"
+  [rel repo]
+  (if repo
+    (let [segs (remove str/blank? (str/split (subs rel (count repo)) #"/"))]
+      (if (seq segs) (str repo "/" (str/join "/" (take 2 segs))) repo))
+    (str/join "/" (take 4 (str/split rel #"/")))))
+
+(def cache-file "symbol-index.cache.json")
+
+(defn- cache-path [] (.join path top index-dir cache-file))
+
+(defn- load-cache
+  "前回 build の sidecar cache (JSON、native parse)。無い / 読めない / top 違い / --full
+  は空。形: {\"v\" \"top\" \"dirs\" {rel {\"m\" mtimeMs \"e\" [[name kind link?] ...] \"w\" worktree?}}
+  \"files\" {rel {\"m\" mtimeMs \"s\" size \"n\" rows \"r\" rows-text}}}。
+  iteration 7: 日次 rebuild で変わる file は僅かなのに毎回 51K file を読み 74K dir を
+  readdir していた。dir は mtime (entry の増減で変わる)、file は mtime+size で
+  変化を判定し、変わっていなければ readdir / read を省く。同一 ms・同一 size の
+  書き換えは見えない (--full で全読み)。"
+  [opts]
+  (if (:full opts)
+    nil
+    (try
+      (let [c (.parse js/JSON (.readFileSync fs (cache-path) "utf8"))]
+        (when (and (= (aget c "v") index-version) (= (aget c "top") top)) c))
+      (catch :default _ nil))))
+
+(defn- dir-entries
+  "dir を読む。cache の mtime が一致すれば cache の entry 列 (readdir も link の stat も
+  無し)。返り値 {:entries [[name kind link?] ...] :cached? bool :mtime ms :wt bool}
+  kind は \"f\" / \"d\" / \"\"。読めない dir は :unreadable true。"
+  [d rel cache]
+  (let [m (try (.-mtimeMs (.statSync fs d)) (catch :default _ nil))
+        hit (when (and m cache) (aget (aget cache "dirs") rel))]
+    (if (and hit (= (aget hit "m") m))
+      {:entries (js->clj (aget hit "e")) :cached? true :mtime m :wt (boolean (aget hit "w"))}
+      (let [raw (try (.readdirSync fs d #js{:withFileTypes true})
+                     (catch :default _ ::unreadable))]
+        (if (= raw ::unreadable)
+          {:entries [] :cached? false :mtime m :wt false :unreadable true}
+          (let [entries (mapv (fn [e]
+                                (let [name (.-name e) link? (.isSymbolicLink e)
+                                      [file? dir?] (if link?
+                                                     (let [st (try (.statSync fs (.join path d name)) (catch :default _ nil))]
+                                                       (if st [(.isFile st) (.isDirectory st)] [false false]))
+                                                     [(.isFile e) (.isDirectory e)])]
+                                  [name (cond file? "f" dir? "d" :else "") link?]))
+                              raw)
+                git (some (fn [[name kind]] (when (= name ".git") kind)) entries)
+                wt (boolean (and (= git "f")
+                                 (try (str/includes? (.readFileSync fs (.join path d ".git") "utf8") "/worktrees/")
+                                      (catch :default _ false))))]
+            {:entries entries :cached? false :mtime m :wt wt}))))))
+
+(defn- walk
+  "dir 配下の走査対象 file を返す。west の子 repo は symlink checkout なので
+  symlink の **指先** を辿る。visited set (realpath) で symlink loop を断つ。
+
+  iteration 2: 返す path は **realpath** にする。iteration 1 は symlink 側の path
+  を返していたので `worktrees/kotoba-lang/kagami/...` が先に踏まれると正本の
+  `orgs/kotoba-lang/kagami/...` が索引から消えた (実測: apply-pin-advance が
+  worktrees/ 側 1 件のみ)。
+
+  iteration 3: readdirSync withFileTypes で dirent の種別を使い、statSync は
+  symlink のときだけ、realpathSync は symlink か symlink 配下 (aliased) のとき
+  だけ呼ぶ (同一 tree で 67 s → 46 s)。⚠ Node Stats / Dirent の isFile 等は
+  method — (.-isFile e) は関数が返るだけで真偽にならない。読めない dir
+  (EACCES / ENAMETOOLONG、実測: 名前が shell script 全文の dir が在った) は
+  落とさず :unreadable-dirs に数える。
+
+  iteration 4: dir の 76% (105K/136K) は source を 1 つも持たない subtree
+  (takeout / news resources / onedrive archive / .venv) だった。名前でなく
+  「連続 fileless dir 数」で prune し (prune-budget)、`pyvenv.cfg` を持つ dir は
+  virtualenv として歩かない。
+
+  iteration 7: dir ごとに statSync 1 回で mtime を見て、cache と一致すれば readdir を
+  省く (dir-entries)。歩いた dir は new-cache に記録して build の最後に書く。
+  返り値は {:files [...] :stats {...} :dir-cache #js{}}。"
+  [dir opts cache]
+  (let [out (volatile! [])
+        seen-files (volatile! #{})
+        visited (volatile! #{})
+        {ignored :names checked :checked} (gitignored-children)
+        budget (if (:no-prune opts) js/Infinity prune-budget)
+        runs (volatile! {})            ; group -> 連続 fileless dir 数
+        pruned (volatile! #{})         ; 打ち切った group
+        dir-cache #js{}
+        stats (volatile! {:dirs 0 :stat-dirs 0 :cached-dirs 0 :pruned-dirs 0 :unreadable-dirs 0 :skipped-worktrees 0 :skipped-venvs 0
+                          :skipped-gitignored (count ignored)
+                          :gitignore-checked checked})
+        realpath (fn [p] (try (.realpathSync fs p) (catch :default _ p)))]
+    ;; queue entry = [path realpath repo]; repo = 最寄りの祖先 repo の top 相対 path
+    (loop [dirs [[dir (realpath dir) nil]]]
+      (if-let [[d dreal repo] (first dirs)]
+        (let [;; ⚠ (rest dirs) は seq なので conj は先頭に積む = DFS になる (iteration 2-3
+              ;; はそうなっていた)。prune の budget は BFS で校正したので vec にして末尾に積む。
+              next-dirs (volatile! (vec (rest dirs)))
+              at-top? (= d dir)
+              aliased? (not= d dreal)
+              rel (if at-top? "" (subs d (inc (count dir))))]
+          (when-not (contains? @visited dreal)
+            (vswap! visited conj dreal)
+            ;; prune 済み group の dir は readdir しない: 親から継いだ repo で group を出し、
+            ;; その dir 自身が repo (.git を持つ) でなければ stat 1 回で打ち切る (nested repo
+            ;; は prune の外に出す = iteration 4 と同じ挙動)。
+            (if (and (contains? @pruned (group-of rel repo))
+                     (not (.existsSync fs (.join path d ".git"))))
+              (vswap! stats update :pruned-dirs inc)
+            (let [{:keys [entries cached? mtime wt unreadable]} (dir-entries d rel cache)
+                  names (into #{} (map first) entries)
+                  repo (if (and (seq rel) (contains? names ".git")) rel repo)
+                  group (group-of rel repo)]
+              (vswap! stats update :stat-dirs inc)
+              (when unreadable (vswap! stats update :unreadable-dirs inc))
+              (when cached? (vswap! stats update :cached-dirs inc))
+              (when mtime
+                (aset dir-cache rel #js{:m mtime :w wt :e (clj->js entries)}))
+              (cond
+                (contains? @pruned group) nil
+                ;; top 自身が linked worktree でも歩く (agent の作業は worktree 内が標準。
+                ;; iteration 6 で top も skip して SCANNED 0 になる regression を test が掴んだ)
+                (and (not at-top?) (not (:include-worktrees opts)) wt)
+                (vswap! stats update :skipped-worktrees inc)
+                (contains? names "pyvenv.cfg") (vswap! stats update :skipped-venvs inc)
+                :else
+                (let [found (volatile! false)]
+                  (vswap! stats update :dirs inc)
+                  (doseq [[name kind link?] entries]
+                    (when-not (or (contains? skip-dirs name)
+                                  (and at-top? (contains? ignored name)))
+                      (let [full (.join path d name)]
+                        (cond
+                          (and (= kind "f") (contains? scan-exts (.extname path name)))
+                          (let [rf (if (or link? aliased?) (realpath full) full)]
+                            (vreset! found true)
+                            (when-not (contains? @seen-files rf)
+                              (vswap! seen-files conj rf)
+                              (vswap! out conj rf)))
+                          (= kind "d")
+                          (vswap! next-dirs conj [full (if (or link? aliased?) (realpath full) full) repo])
+                          :else nil))))
+                  (if @found
+                    (vswap! runs assoc group 0)
+                    (let [n (inc (get @runs group 0))]
+                      (vswap! runs assoc group n)
+                      (when (>= n budget) (vswap! pruned conj group)))))))))
+          (recur @next-dirs))
+        :done))
+    {:files @out :stats (assoc @stats :pruned-groups (sort @pruned)) :dir-cache dir-cache}))
+
+(defn- rel-path [full]
+  (if (str/starts-with? full (str top "/"))
+    (subs full (inc (count top)))
+    full))
+
+(def ^:private crypto (js/require "node:crypto"))
+
+(defn- sha10 [s]
+  (subs (.digest (.update (.createHash crypto "sha256") s "utf8") "hex") 0 10))
+
+(defn- content-hash
+  "定義本文の text hash (v3): 空白の連なりを 1 つに畳み、前後を trim して sha256、先頭 10 hex。
+  v4 では reader を通せない定義の fallback (flag t)。文字列リテラル内の空白差を『同じ』と
+  答える欠陥がある (iteration 15 で実測) ので、読める定義には使わない。"
+  [span]
+  (sha10 (str/trim (str/replace span #"\s+" " "))))
+
+;; ---------------------------------------------------------------- 構造 hash (iteration 15)
+;; 名前でなく本文で同一、の「本文」を text でなく form にする。def 名を %name、束縛位置に現れた
+;; symbol を出現順に %0 %1 …、docstring と位置 meta を落とし、set / map は要素の印字を sort、
+;; `*print-meta*` で pr-str して sha256。syntactic-structural であって semantic ではない
+;; (macro 展開前、参照先の hash は入れない —— Merkle 化は未着地)。scope は見ないので
+;; shadowing は畳む。root corpus の実測 (measurements.edn :h35): 他と同一の定義 39.0% → 45.8%、
+;; rename / comment に不感、末尾に nil を足せば変わる。
+
+(def ^:private parse-opts
+  (e/normalize-opts {:all true :read-cond :preserve :auto-resolve name
+                     :readers (fn [t] (fn [v] (list 'TAG t v)))
+                     :syntax-quote true :location? (constantly false)}))
+
+(def ^:private binding-heads
+  '#{fn fn* defn defn- defmacro let let* loop loop* for doseq dotimes when-let if-let
+     when-some if-some letfn binding with-open with-redefs as-> defmethod deftest
+     defrecord deftype catch})
+
+(defn- binding-syms
+  "vector (束縛位置) の中の symbol を出現順に。destructuring の中も拾う。"
+  [v]
+  (let [acc (volatile! [])]
+    (walk/prewalk (fn [x]
+                    (when (and (symbol? x) (not (str/includes? (name x) "/")) (not= x '&))
+                      (vswap! acc conj x))
+                    x)
+                  v)
+    @acc))
+
+(defn- collect-locals
+  "定義全体から「束縛位置に現れた symbol」を出現順に集める (scope は見ない)。"
+  [form]
+  (let [acc (volatile! []) seen (volatile! #{})
+        push! (fn [s] (when-not (@seen s) (vswap! seen conj s) (vswap! acc conj s)))
+        arity! (fn [ys] (doseq [y ys]
+                          (cond (vector? y) (run! push! (binding-syms y))
+                                (and (seq? y) (vector? (first y))) (run! push! (binding-syms (first y))))))]
+    (walk/prewalk
+     (fn [x]
+       (when (and (seq? x) (symbol? (first x)) (binding-heads (first x)))
+         (let [[h & r] x]
+           (cond
+             (#{'defn 'defn- 'defmacro 'defmethod 'deftest} h) (arity! (rest r))
+             (#{'fn 'fn*} h) (arity! r)
+             (#{'let 'let* 'loop 'loop* 'for 'doseq 'dotimes 'when-let 'if-let 'when-some 'if-some 'binding 'with-open 'with-redefs} h)
+             (when (vector? (first r)) (run! push! (mapcat binding-syms (take-nth 2 (first r)))))
+             (#{'as-> 'catch} h) (when (symbol? (second r)) (push! (second r)))
+             (= 'letfn h) (when (vector? (first r))
+                            (doseq [f (first r)] (when (and (seq? f) (symbol? (first f))) (push! (first f)))))
+             (#{'defrecord 'deftype} h) (when (vector? (second r)) (run! push! (binding-syms (second r))))
+             :else nil)))
+       x)
+     form)
+    @acc))
+
+(defn- strip-loc-meta [x]
+  (if (and (some? x) (satisfies? IMeta x) (meta x))
+    (let [m (dissoc (meta x) :row :col :end-row :end-col :source)]
+      (with-meta x (when (seq m) m)))
+    x))
+
+(defn- def-form? [form]
+  (and (seq? form) (symbol? (first form)) (str/starts-with? (name (first form)) "def")))
+
+(defn- strip-doc
+  "(defX name \"doc\" …) → (defX name …)。"
+  [form]
+  (if (and (def-form? form) (>= (count form) 4) (string? (nth form 2)))
+    (with-meta (concat (take 2 form) (drop 3 form)) (meta form))
+    form))
+
+(defn- structural-hash
+  "span の第 1 form の構造 hash と正規化 form [hash norm]。reader を通らなければ nil (呼び側が text hash に落とす)。"
+  [span]
+  (try
+    (let [form (e/parse-next (e/reader span) parse-opts)]
+      (when-not (= ::e/eof form)
+        (let [form (strip-doc form)
+              defname (when (def-form? form) (second form))
+              ren (into {} (map-indexed (fn [i s] [s (symbol (str "%" i))]) (collect-locals form)))
+              ren (if (symbol? defname) (assoc ren defname '%name) ren)
+              norm (walk/postwalk
+                    (fn [x]
+                      (let [x (strip-loc-meta x)]
+                        (cond
+                          (symbol? x)
+                          (let [x' (get ren x x)]
+                            ;; syntax-quote の gensym a__12__auto__ は番号が不安定
+                            (if (str/ends-with? (name x') "__auto__")
+                              (symbol (str/replace (name x') #"__\d+__auto__$" "__auto__"))
+                              (with-meta x' (meta x))))
+                          ;; regex は値等価を持たず、9 要素以上の map は hash 順 → 印字を sort
+                          (set? x) (with-meta (list 'SET* (vec (sort (map pr-str x)))) (meta x))
+                          (map? x) (with-meta (list 'MAP* (vec (sort (map (fn [[k v]] (pr-str [k v])) x)))) (meta x))
+                          :else x)))
+                    form)]
+          [(sha10 (binding [*print-meta* true] (pr-str norm))) norm])))
+    (catch :default _ nil)))
+
+;; ---------------------------------------------------------------- 参照 (iteration 18)
+;; 8 列目: この定義の本文が参照する、索引で辿れる可能性のある symbol。quote の中と局所 (%N) と自名 (%name)
+;; は除く。持つのは 3 種だけ (core / interop / 索引外の lib は名前を持たない):
+;;   bare `sym`     同じ file に定義がある unqualified symbol   (同 ns の別 file は落ちる。設計上の穴、README に記す)
+;;   `ns/sym`       ns form の :require [x :as a] の alias 経由 (`a/sym` → `x/sym`) と :refer、および完全修飾
+;; 参照先の解決 (どの行か) は query 時 (find --dependents / closure)。build cost を上げないため。
+
+(defn- ns-info
+  "(ns x (:require [a.b :as c] [d.e :refer [f]] ...)) の span → {:aliases {\"c\" \"a.b\"} :refers {\"f\" \"d.e\"}}。
+  reader conditional の両 branch を見る。読めなければ空。"
+  [span]
+  (try
+    (let [form (e/parse-next (e/reader span) parse-opts)
+          aliases (volatile! {}) refers (volatile! {})]
+      (walk/prewalk
+       (fn [x]
+         (when (and (seq? x) (#{:require :require-macros :use} (first x)))
+           (doseq [spec (rest x)]
+             (let [spec (if (symbol? spec) [spec] spec)]
+               (when (and (vector? spec) (symbol? (first spec)))
+                 (let [ns* (name (first spec)) opts (apply hash-map (rest spec))]
+                   (when (symbol? (:as opts)) (vswap! aliases assoc (name (:as opts)) ns*))
+                   (when (vector? (:refer opts)) (doseq [s (:refer opts)] (when (symbol? s) (vswap! refers assoc (name s) ns*)))))))))
+         x)
+       form)
+      {:aliases @aliases :refers @refers})
+    (catch :default _ {:aliases {} :refers {}})))
+
+(def ^:private core-names
+  "bare 参照から除く名前: clojure.core の public (sci が実行時に持つ 674 個) + special form。
+  iteration 20: 同 ns の別 file にある定義への bare 参照を落とさないため、『同 file の定義名』でなく
+  『core でない unqualified symbol』を bare 参照として持つ。core は identity の外 (版が変わっても hash は不変)。"
+  (into (set (map str (keys (ns-publics 'clojure.core))))
+        ["if" "do" "let*" "fn*" "loop*" "recur" "throw" "try" "catch" "finally" "def" "quote" "var" "set!" "new" "."
+         "js*" "deftype*" "defrecord*" "letfn*" "case*" "ns" "in-ns" "&" "%name"
+         ;; cljs / kotoba でよく出る interop・型名 (core に無いが定義でもない)
+         "js" "Math" "Object" "Array" "String" "Number" "Boolean" "Date" "RegExp" "Error" "JSON" "Promise" "console"
+         "nil" "true" "false"]))
+
+(defn- body-refs
+  "正規化 form → 参照 symbol 列 (sorted、重複無し)。local-syms は同 file の定義名の集合 (bare は
+  『同 file の定義』か『core でも local でもない unqualified』なら持つ)。"
+  [norm {:keys [aliases refers]} local-syms]
+  (let [acc (volatile! #{})]
+    (letfn [(w [x] (cond
+                     (and (seq? x) (= 'quote (first x))) nil
+                     (symbol? x)
+                     (let [s (str x)]
+                       (when-not (str/starts-with? s "%")
+                         (let [i (.indexOf s "/")]
+                           (if (pos? i)
+                             (let [a (subs s 0 i) b (subs s (inc i))]
+                               (cond (get aliases a) (vswap! acc conj (str (get aliases a) "/" b))
+                                     (str/includes? a ".") (vswap! acc conj s)
+                                     :else nil))
+                             (cond (local-syms s) (vswap! acc conj s)
+                                   (get refers s) (vswap! acc conj (str (get refers s) "/" s))
+                                   ;; iteration 20: core でない unqualified は同 ns の別 file の定義かもしれない → 持つ
+                                   ;; (query 時に同 ns の定義と突き合わせる。当たらなければ落ちるだけ)
+                                   (and (not (core-names s)) (re-find #"^[A-Za-z_*+!<>=?$-]" s) (not (str/starts-with? s ".")))
+                                   (vswap! acc conj s)
+                                   :else nil)))))
+                     (coll? x) (run! w x)
+                     :else nil))]
+      (w norm))
+    (vec (sort @acc))))
+
+(defn- definition-hash
+  "7 列目: 構造 hash、読めなければ text hash。返り値 [hash flag refs]、flag \"t\" = text fallback (refs は空)。"
+  [span info local-syms]
+  (if-let [[h norm] (structural-hash span)]
+    [h "" (body-refs norm info local-syms)]
+    [(content-hash span) "t" []]))
+
+(defn- scan-file
+  "1 file から TSV 行 (sym<TAB>kind<TAB>file<TAB>line<TAB>ns<TAB>flags<TAB>hash) の列を返す。
+  `(ns …)` を跨ぐごとに ns を持ち替え、後続の def にその ns を付ける (show の ns/sym
+  曖昧性解消に使う)。行番号は match の index までの改行を数えて出す (前回 match から
+  差分で数える)。iteration 7: map でなく行文字列を返す (cache にそのまま入る)。"
+  [full rel]
+  (let [text (.readFileSync fs full "utf8")
+        ns* (volatile! "")
+        heads (volatile! [])]
+    (set! (.-lastIndex def-form-re) 0)
+    (loop [line 1 from 0]
+      (when-let [m (.exec def-form-re text)]
+        (let [;; 行は `(def` の位置で数える。group 1 が `#?(:clj\n   ` のとき match は
+              ;; 前の行から始まるので、その長さ分ずらす (iter2 と同じ行に揃える)
+              idx (+ (.-index m) (count (or (aget m 1) "")))
+              ;; from..idx の改行数を native indexOf で数える
+              line (loop [l line i (.indexOf text "\n" from)]
+                     (if (or (neg? i) (>= i idx)) l (recur (inc l) (.indexOf text "\n" (inc i)))))
+              kind (aget m 2) sym (aget m 3) nested (some? (aget m 1))]
+          (when (= kind "ns") (vreset! ns* sym))
+          (vswap! heads conj {:sym sym :kind kind :line line :ns (if (= kind "ns") sym @ns*) :nested nested :idx idx})
+          (recur line idx))))
+    ;; iteration 14: 定義の span = この def の先頭から次の top-level def の直前まで。
+    ;; iteration 15: span の第 1 form を reader に通した構造 hash (definition-hash)。読めなければ
+    ;; text hash に落として flag t を立てる (「測れなかった」を「同じ」に混ぜない)。
+    ;; iteration 18: 8 列目に参照。ns form の alias / refer は file 内で持ち替え、bare 参照は同 file の定義名だけ。
+    (let [hs @heads n (count hs)
+          local-syms (set (map :sym (remove #(= "ns" (:kind %)) hs)))
+          info (volatile! {:aliases {} :refers {}})]
+      (vec (map-indexed
+            (fn [i {:keys [sym kind line ns nested idx]}]
+              (let [end (if (< (inc i) n) (:idx (nth hs (inc i))) (count text))
+                    span (subs text idx end)]
+                (if (= kind "ns")
+                  (do (vreset! info (ns-info span))
+                      (let [[h tflag] (let [r (structural-hash span)] (if r [(first r) ""] [(content-hash span) "t"]))]
+                        (str sym "\t" kind "\t" rel "\t" line "\t" ns "\t" (str (if nested "n" "") tflag) "\t" h "\t")))
+                  (let [[h tflag refs] (definition-hash span @info local-syms)]
+                    (str sym "\t" kind "\t" rel "\t" line "\t" ns "\t" (str (if nested "n" "") tflag) "\t" h "\t" (str/join "," refs))))))
+            hs)))))
+
+(defn- build-index
+  "全対象 file から TSV 行の列 (file ごとの block) と走査統計を作る。統計は evidence
+  floor: SCANNED が 0 の索引は書かない (「空の tree」と「top を間違えた」を pass に
+  混ぜない)。iteration 7: file は statSync で (mtime, size) を見て cache と一致すれば
+  前回の行をそのまま使う (read も regex も無し)。返り値の :blocks は file ごとの
+  行文字列 (改行結合済み)、:symbols は行数。"
+  [opts]
+  (let [cache (load-cache opts)
+        {:keys [files stats dir-cache]} (walk top opts cache)
+        cfiles (when cache (aget cache "files"))
+        file-cache #js{}
+        blocks (volatile! [])
+        nsyms (volatile! 0)
+        st (volatile! (assoc stats :scanned 0 :cached-files 0 :skipped-size 0 :unreadable 0))]
+    (doseq [full files]
+      (let [rel (rel-path full)]
+        (try
+          (let [fst (.statSync fs full) m (.-mtimeMs fst) size (.-size fst)
+                hit (when cfiles (aget cfiles rel))]
+            (if (<= size max-file-bytes)
+              (let [[n text] (if (and hit (= (aget hit "m") m) (= (aget hit "s") size))
+                               (do (vswap! st update :cached-files inc) [(aget hit "n") (aget hit "r")])
+                               (let [rows (scan-file full rel)] [(count rows) (str/join "\n" rows)]))]
+                (vswap! st update :scanned inc)
+                (vswap! nsyms + n)
+                (aset file-cache rel #js{:m m :s size :n n :r text})
+                (when (pos? n) (vswap! blocks conj text)))
+              (vswap! st update :skipped-size inc)))
+          (catch :default _ (vswap! st update :unreadable inc)))))
+    {:blocks @blocks :symbols @nsyms :stats @st
+     :cache #js{:v index-version :top top :dirs dir-cache :files file-cache}}))
+
+;; ---------------------------------------------------------------- TSV v2
+;; header: #symbol-index<TAB>v2<TAB>key=value ...
+;; row:    sym<TAB>kind<TAB>file<TAB>line<TAB>ns<TAB>flags   (flags: "" | "n")
+
+(defn- index-path [] (.join path top index-dir index-file))
+
+(defn- write-index
+  [{:keys [blocks symbols stats cache]}]
+  (let [dir (.join path top index-dir)
+        header (str "#symbol-index\t" index-version
+                    "\ttop=" top
+                    "\tbuilt-at=" (.toISOString (js/Date.))
+                    "\tscanned=" (:scanned stats)
+                    "\tskipped-size=" (:skipped-size stats)
+                    "\tskipped-worktrees=" (:skipped-worktrees stats)
+                    "\tskipped-gitignored=" (:skipped-gitignored stats)
+                    "\tgitignore-checked=" (:gitignore-checked stats)
+                    "\tunreadable=" (:unreadable stats)
+                    "\tunreadable-dirs=" (:unreadable-dirs stats)
+                    "\tskipped-venvs=" (:skipped-venvs stats)
+                    "\tpruned=" (count (:pruned-groups stats))
+                    "\tpruned-groups=" (str/join ";" (:pruned-groups stats))
+                    "\tcached-dirs=" (:cached-dirs stats)
+                    "\tcached-files=" (:cached-files stats)
+                    "\tsymbols=" symbols)]
+    (when-not (.existsSync fs dir)
+      (.mkdirSync fs dir #js{:recursive true}))
+    (.writeFileSync fs (index-path) (str header "\n" (str/join "\n" blocks) "\n") "utf8")
+    ;; sidecar cache は索引の後に書く (索引だけ在って cache が無い状態は許容、逆は不可)
+    (.writeFileSync fs (cache-path) (.stringify js/JSON cache) "utf8")))
+
+(defn- parse-header
+  "先頭行を {:version :top :scanned :symbols ...} に。v1 (JSON) や壊れた先頭は nil。"
+  [text]
+  (let [nl (.indexOf text "\n")
+        line (if (neg? nl) text (subs text 0 nl))
+        [tag version & kvs] (str/split line #"\t")]
+    (when (= tag "#symbol-index")
+      (into {:version version}
+            (map (fn [kv] (let [i (.indexOf kv "=")]
+                            [(keyword (subs kv 0 i)) (subs kv (inc i))])))
+            kvs))))
+
+(defn- parse-row [line]
+  (let [[sym kind file ln ns flags hash refs] (str/split line #"\t")]
+    {:sym sym :kind kind :file file :line (js/parseInt ln 10) :ns (or ns "")
+     :nested (str/includes? (or flags "") "n") :text-fallback (str/includes? (or flags "") "t") :hash (or hash "")
+     :refs (if (seq refs) (str/split refs #",") [])}))
+
+(defn- refuse
+  "拒否は理由を印字して 2 を返す。理由の literal は test が pin する。"
+  [& msg]
+  (println (str "REFUSE\t" (apply str msg)))
+  2)
+
+(defn- do-build [opts]
+  (let [{:keys [symbols stats] :as built} (build-index opts)]
+    (println (str "SCANNED\t" (:scanned stats)))
+    (println (str "SKIPPED-SIZE\t" (:skipped-size stats)))
+    (println (str "SKIPPED-WORKTREES\t" (:skipped-worktrees stats)))
+    (println (str "SKIPPED-GITIGNORED\t" (:skipped-gitignored stats)
+                  (if (:gitignore-checked stats) "" "\t(not checked: no git or top is not a repo)")))
+    (println (str "UNREADABLE\t" (:unreadable stats)))
+    (println (str "UNREADABLE-DIRS\t" (:unreadable-dirs stats)))
+    (println (str "SKIPPED-VENVS\t" (:skipped-venvs stats)))
+    (println (str "CACHED-DIRS\t" (:cached-dirs stats) "\tof " (:stat-dirs stats)
+                  (if (:full opts) "\t(--full: cache ignored)" "")))
+    (println (str "CACHED-FILES\t" (:cached-files stats) "\tof " (:scanned stats)))
+    (println (str "PRUNED-DIRS\t" (:pruned-dirs stats) "\t(queued under a pruned group; 1 stat each, no readdir)"))
+    (println (str "PRUNED\t" (count (:pruned-groups stats))
+                  (when (seq (:pruned-groups stats))
+                    (str "\t(" prune-budget " consecutive dirs without source; see `status`, or build --no-prune)"))))
+    (if (zero? (:scanned stats))
+      (refuse "scanned 0 files under " top " — empty tree or wrong top (set CLAUDE_PROJECT_DIR or cd)")
+      (do (write-index built)
+          (println (str "indexed " symbols " symbols -> " index-dir "/" index-file))
+          (remember-root! top)
+          0))))
+
+(defn- load-index-text
+  "索引の本文 (TSV 全文) と header を返す。無い / top 不一致 / 空 / 旧形式は
+  {:error …} を返す (呼び側が refuse する)。**無くても build を代行しない** ——
+  top が $HOME に落ちた状態で呼ばれると home 全体を走査して timeout する
+  (Hermes Agent で実測)。build は明示の `build` だけ。"
+  []
+  (let [p (index-path)]
+    (when-let [n @top-fallback-note] (println n))
+    (if-not (.existsSync fs p)
+      {:error (let [roots (known-roots)]
+                (str "no index at " p " — "
+                     (if (seq roots)
+                       (str "cd to an indexed root and retry (or set SYMBOL_INDEX_ROOT): " (str/join " | " roots)
+                            ". Do not build here.")
+                       "cd to the project root and retry (or set SYMBOL_INDEX_ROOT); only if the root itself has no index, run `symbol-index build` there (never in $HOME)")))}
+      (let [text (.readFileSync fs p "utf8")
+            h (parse-header text)]
+        (cond
+          (nil? h) {:error "index is not a TSV index (stale JSON?) — run build"}
+          ;; iteration 19: 版ずれの向きで文言を変える。索引の方が新しい = この script の写しが古い (root の写しが
+          ;; 上流に遅れる形。09-17 に Claude Code が v4 の写しで v5 索引を引いて拒否された)。そこで build を勧めると
+          ;; 古い版で索引を作り直して新しい索引を潰す —— 新しい script を使えと言う
+          (not= (:version h) index-version)
+          {:error (let [idx (js/parseInt (subs (:version h) 1) 10) me (js/parseInt (subs index-version 1) 10)]
+                    (if (> idx me)
+                      (str "index is " (:version h) " but this script copy is " index-version " (older) — use the newer script (`symbol-index` on PATH, or orgs/kotoba-lang/symbol-index/scripts/symbol-index.cljk); do NOT build with this copy, it would downgrade the index")
+                      (str "index is " (:version h) ", this script needs " index-version " — run build")))}
+          (not= (:top h) top) {:error (str "index was built for top=" (:top h) " but cwd top=" top " — run build here")}
+          (= "0" (:symbols h)) {:error (str "index has 0 symbols (scanned " (:scanned h) " files) — run build")}
+          :else {:header h :text text})))))
+
+(defn- escape-re [s]
+  (str/replace s #"[.*+?^${}()|\[\]\\/]" "\\$&"))
+
+(defn- scan-rows
+  "TSV 本文を native RegExp で走査し、当たった行だけ parse する。SCI の per-line
+  loop を回さないのが iteration 2 の速度の源 (5.5 s → 実測は measurements.edn)。
+  sym-pattern は sym 列に対する正規表現の断片、flags は RegExp flags。"
+  [text sym-pattern flags]
+  (let [re (js/RegExp. (str "^" sym-pattern "\\t[^\\n]*$") (str "gm" flags))
+        out (volatile! [])]
+    (loop []
+      (when-let [m (.exec re text)]
+        (vswap! out conj (parse-row (aget m 0)))
+        (recur)))
+    @out))
+
+(defn- age-warning
+  "索引が 24 h より古ければ 1 行だけ言う。自動 rebuild はしない (2 分かかる判断を
+  黙って agent に肩代わりさせない)。"
+  [header]
+  (let [ms (- (.getTime (js/Date.)) (.getTime (js/Date. (:built-at header))))]
+    (when (> ms (* 24 3600 1000))
+      (println (str "  (index is " (js/Math.round (/ ms 3600000)) " h old — `build` if you edited code since)")))))
+
+(defn- rank-key
+  "exact < prefix < substring、同点は top-level が nested より先、次に path。"
+  [term-lower {:keys [sym nested file]}]
+  (let [s (str/lower-case sym)]
+    [(cond (= s term-lower) 0 (str/starts-with? s term-lower) 1 :else 2)
+     (if nested 1 0)
+     (count file)
+     file]))
+
+(defn- fmt-hit
+  [{:keys [sym kind file line nested copies hash]}]
+  (str "  " (if nested "~" "") kind " " sym " — " file ":" line
+       (when (seq hash) (str "  #" hash))
+       (when (and copies (pos? copies)) (str "  (+" copies " identical)"))))
+
+(defn- built-ms [header]
+  (try (.getTime (js/Date. (:built-at header))) (catch :default _ 0)))
+
+(defn- stale-file?
+  "file が索引の build より後に書かれたか (mtime > built-at)。stat できなければ false。"
+  [file built]
+  (try (> (.-mtimeMs (.statSync fs (.join path top file))) built) (catch :default _ false)))
+
+(defn- fresh-rows
+  "file を今読んで scan-file した行 (parse 済み)。読めなければ nil。"
+  [file]
+  (try (mapv parse-row (scan-file (.join path top file) file)) (catch :default _ nil)))
+
+(defn- relocate
+  "iteration 12: 索引より新しい file の hit は、その file だけ再走査して行番号を直す
+  (rebuild 無しで精度を保つ。1.6 h の索引で変更済み file は 0.10% だが、agent が
+  今編集している file こそ次に引く file)。同 sym/kind の行のうち旧行に最も近いものを
+  採る。返り値は hit に :relocated-from (旧行) か :gone true を足したもの。"
+  [{:keys [file sym kind line hash] :as hit} built]
+  (if-not (stale-file? file built)
+    hit
+    (let [cands (filter #(and (= sym (:sym %)) (= kind (:kind %))) (or (fresh-rows file) []))]
+      (if (empty? cands)
+        (assoc hit :gone true)
+        ;; iteration 14: 同じ hash (本文同一) を最優先、無ければ旧行に最も近いもの。
+        ;; 本文が変わったかどうかは hash の一致で分かるので note に出す (agent は
+        ;; 「行がずれただけ」なら読み直さなくてよい)
+        (let [best (apply min-key (fn [c] (+ (if (= (:hash c) hash) 0 1000000) (js/Math.abs (- (:line c) line)))) cands)
+              same? (= (:hash best) hash)]
+          (cond-> (assoc hit :hash (:hash best) :content-changed (not same?))
+            (not= (:line best) line) (assoc :line (:line best) :relocated-from line)))))))
+
+(defn- relocation-note [{:keys [relocated-from gone content-changed hash]}]
+  (cond gone "  (file changed after index and no longer defines this symbol — build)"
+        relocated-from (str "  (re-located: file changed after index, was line " relocated-from
+                            (if content-changed (str "; body changed → #" hash) "; body unchanged") ")")
+        content-changed (str "  (file changed after index; this definition's body changed → #" hash ")")
+        :else nil))
+
+(defn- snippet
+  "file の line の 1 行前から、定義の冒頭 after 行 (既定 6) を返す。iteration 7 で
+  前後対称 (±3) から前 1 / 後 6 に変えた: agent の問いは「定義の冒頭を見せて」で、
+  def 行の *前* の 3 行は docstring でも本体でもない (Hermes A/B の 8 query 全部が
+  find の後に show か read_file をもう 1 回呼んでいた)。"
+  [file line & [after]]
+  (let [after (or after 6)
+        full (.join path top file)]
+    (try
+      (let [lines (str/split-lines (.readFileSync fs full "utf8"))
+            from (max 0 (- line 2))
+            to (min (count lines) (+ line after))]
+        (str/join "\n" (map #(str "  " (inc %) "| " (nth lines %))
+                            (range from to))))
+      (catch :default _ "  (unreadable)"))))
+
+(defn- repo-of
+  "hit の repo 相当 (path の先頭 3 段、`orgs/<org>/<repo>`; 浅い path はそのまま)。"
+  [file]
+  (let [segs (str/split file #"/")]
+    (if (>= (count segs) 4)
+      (str/join "/" (take 3 segs))
+      (str/join "/" (butlast segs)))))
+
+(defn- suggest-near
+  "0 hit のときの近傍: term を - / _ / . で割った 4 文字以上の断片ごとに substring で
+  引き、symbol 名を最大 8 個返す。Hermes A/B の baseline 誤答は 4/4 が『定義は存在
+  しない』型の false negative だった — 0 hit を『無い』と読ませない。"
+  [text term keep?]
+  (let [parts (->> (str/split term #"[-_./]")
+                   (mapcat (fn [p] [p (when (> (count p) 5) (subs p 0 5))]))
+                   (remove nil?) (filter #(>= (count %) 4)) distinct)
+        near (->> parts
+                  (mapcat #(scan-rows text (str "[^\\t\\n]*" (escape-re %) "[^\\t\\n]*") "i"))
+                  (filter keep?)
+                  (map :sym) distinct (take 8))]
+    (when (seq near)
+      (println (str "  near (by fragment " (str/join "," parts) "): " (str/join " " near)))
+      (println "  → find <one of them>   (0 hits is not 'undefined'; symbols may be spelled differently)"))))
+
+;; ---------------------------------------------------------------- dependents / closure (iteration 18)
+(defn- scan-lines
+  "TSV 本文を正規表現 (行全体、gm) で走査して parse-row の列を返す。"
+  [text re-src]
+  (let [re (js/RegExp. re-src "gm") out (volatile! [])]
+    (loop []
+      (when-let [m (.exec re text)]
+        (vswap! out conj (parse-row (aget m 0)))
+        (recur)))
+    @out))
+
+(defn- direct-dependents
+  "keys: [[ns sym] ...] → それを参照する行 (8 列目に bare sym が同 ns で在る、または ns/sym が在る)。
+  1 step を 2 本の正規表現 (bare / qualified) で走査し、key は 300 個ずつ chunk にする。"
+  [text keys]
+  (let [col "[^\t\n]*"
+        bare (fn [[ns sym]] (str (escape-re ns) "\t" col "\t" col "\t(?:" col ",)?" (escape-re sym) "(?:," col ")?$"))
+        qual (fn [[ns sym]] (escape-re (str ns "/" sym)))
+        rows (volatile! [])]
+    (doseq [chunk (partition-all 300 keys)]
+      (vswap! rows into (scan-lines text (str "^(?:" col "\t){4}(?:" (str/join "|" (map bare chunk)) ")")))
+      (vswap! rows into (scan-lines text (str "^(?:" col "\t){7}(?:" col ",)?(?:" (str/join "|" (map qual chunk)) ")(?:," col ")?$"))))
+    (->> @rows (remove #(= "ns" (:kind %))) (distinct))))
+
+(def site-limit 3)
+
+(def sym-char-re
+  "symbol を成す文字 (境界判定用)。`/` は ns/alias の区切りなので境界側 —— `db/apply-pin-advance` の leaf を当てるため。"
+  "[^\\s()\\[\\]{}\"'`,;/]")
+
+(defn- reference-sites
+  "iteration 21: dependent (file:line) の定義 span の中で、target の leaf を参照している行を
+  [line text] で返す (最大 limit 件、超過分は :more に)。span は line から次の column-0 `(` まで。
+  09-18 の Claude Code 腕 G3 q9: --dependents が 7 件を 1 call で出した後、agent が rg / sed で
+  call site を確かめるのに 10 call かけた (prompt が『読んで確かめよ』)。証拠を出力に同梱する。"
+  [file line leafs limit]
+  (try
+    (let [lines (str/split-lines (.readFileSync fs (.join path top file) "utf8"))
+          start (dec line)
+          end (loop [i (inc start)]
+                (cond (>= i (count lines)) i
+                      (re-find #"^\(" (nth lines i)) i
+                      :else (recur (inc i))))
+          re (js/RegExp. (str "(?<!" sym-char-re ")(?:" (str/join "|" (map escape-re leafs)) ")(?!" sym-char-re ")"))
+          ;; def 行自身も見る (1 行定義 `(defn f [z] (ac/base z))` は def 行に site が在る)
+          hits (for [i (range start end)
+                     :let [t (nth lines i)]
+                     :when (.test re t)]
+                 [(inc i) (str/trim t)])]
+      {:sites (take limit hits) :more (max 0 (- (count hits) limit))})
+    (catch :default _ {:sites [] :more 0 :unreadable true})))
+
+(defn- cmd-dependents
+  "find <sym|ns/sym> --dependents [--depth N|all]: この定義を参照する定義を、深さごとに列挙する。
+  『X を変えたら見直すべき定義』を 1 call で。写しは hash で畳む。exit 1 = 被依存 0 件。"
+  [term args]
+  (let [{:keys [header text error]} (load-index-text)]
+    (if error
+      (refuse error)
+      (let [depth-arg (let [i (.indexOf (to-array args) "--depth")] (when (and (>= i 0) (< (inc i) (count args))) (nth args (inc i))))
+            max-depth (cond (nil? depth-arg) 2 (= depth-arg "all") 1000 :else (js/parseInt depth-arg 10))
+            [ns* leaf] (let [i (.lastIndexOf term "/")] (if (pos? i) [(subs term 0 i) (subs term (inc i))] [nil term]))
+            targets (->> (scan-rows text (escape-re leaf) "")
+                         (remove #(= "ns" (:kind %)))
+                         (filter #(or (nil? ns*) (= ns* (:ns %)))))]
+        (if (empty? targets)
+          (do (println (str "0 definitions named " term " — nothing to depend on")) 1)
+          (let [root-keys (distinct (map (fn [r] [(:ns r) (:sym r)]) targets))
+                seen (volatile! (set root-keys))
+                levels (loop [frontier root-keys d 1 acc []]
+                         (if (or (empty? frontier) (> d max-depth))
+                           acc
+                           (let [rows (->> (direct-dependents text frontier)
+                                           (remove #(@seen [(:ns %) (:sym %)])))
+                                 ;; 写しは [sym kind hash] で畳む (find と同じ)
+                                 folded (->> rows (group-by (fn [{:keys [sym kind hash]}] [sym kind hash])) vals
+                                             (map (fn [g] (assoc (first (sort-by (comp count :file) g)) :copies (dec (count g)))))
+                                             (sort-by (juxt :ns :sym)))
+                                 keys* (distinct (map (fn [r] [(:ns r) (:sym r)]) rows))]
+                             (vswap! seen into keys*)
+                             (recur keys* (inc d) (if (seq folded) (conj acc [d folded]) acc)))))
+                total (reduce + (map (comp count second) levels))
+                total-unfolded (reduce + (map (fn [[_ rows]] (reduce + (map #(inc (:copies %)) rows))) levels))]
+            (println (str "dependents of " (str/join " | " (map (fn [[n s]] (str n "/" s)) root-keys))
+                          ": " total " definitions in " (count levels) " level(s)"
+                          (when (> total-unfolded total) (str " (" (- total-unfolded total) " identical folded)"))
+                          " — depth " (if (>= max-depth 1000) "all" max-depth) (when (< max-depth 1000) "; --depth all for the whole closure")))
+            (age-warning header)
+            (let [limit 60 printed (volatile! 0)
+                  sites? (not (some #{"--no-sites"} args))
+                  leafs (distinct (map second root-keys))
+                  built (built-ms header)]
+              (doseq [[d rows] levels]
+                (println (str "  depth " d " (" (count rows) ")"))
+                (doseq [r rows]
+                  (when (< @printed limit)
+                    (vswap! printed inc)
+                    (let [r (relocate r built)]
+                      (println (str "  " (fmt-hit r)))
+                      (when-let [note (relocation-note r)] (println (str "    " note)))
+                      ;; depth 1 だけ call site を添える (root の leaf を span 内で探す)。深い層の site は
+                      ;; 前の層の名前になるので、要るときは find <that-sym> --dependents で 1 段ずつ
+                      (when (and sites? (= d 1) (not (:gone r)))
+                        (let [{:keys [sites more unreadable]} (reference-sites (:file r) (:line r) leafs site-limit)]
+                          (doseq [[ln t] sites] (println (str "      " ln "| " t)))
+                          (when (pos? more) (println (str "      (+" more " more site" (when (> more 1) "s") " in this definition)")))
+                          (when unreadable (println "      (unreadable)")))))))
+                (when (> (count rows) (- limit (min limit @printed)))
+                  nil))
+              (when (> total limit)
+                (println (str "  … " (- total limit) " more not listed; narrow with --depth 1 or read the level counts")))
+              (when (and sites? (some (fn [[d _]] (= d 1)) levels))
+                (println (str "  (indented `N| …` lines are the call sites inside each depth-1 definition, read from the file now — no grep needed; --no-sites to omit)"))))
+            (if (pos? total) 0 1)))))))
+
+(defn- resolve-ref-row
+  "参照文字列 → 行 (memo)。bare は同 ns、ns/sym はその ns。同 repo (path 先頭 3 段) を優先、無ければ最短 path。"
+  [text memo from-row ref]
+  (let [[ns* sym] (let [i (.lastIndexOf ref "/")] (if (pos? i) [(subs ref 0 i) (subs ref (inc i))] [(:ns from-row) ref]))
+        k (str ns* "/" sym)]
+    (if (contains? @memo k)
+      (get @memo k)
+      (let [rows (->> (scan-rows text (escape-re sym) "") (filter #(and (= ns* (:ns %)) (not= "ns" (:kind %)))))
+            repo (repo-of (:file from-row))
+            pick (or (first (sort-by (comp count :file) (filter #(= repo (repo-of (:file %))) rows)))
+                     (first (sort-by (comp count :file) rows)))]
+        (vswap! memo assoc k pick)
+        pick))))
+
+(defn- closure-map
+  "roots (行) から到達可能な subgraph を集め、Tarjan SCC を逆位相順に処理して closure hash を付ける。
+  返り値 {:closure {key hash} :nodes {key row} :adjacency :sccs :unresolved}。key は file:line。"
+  [text roots]
+  (let [memo (volatile! {})
+        key-of (fn [r] (str (:file r) ":" (:line r)))
+        nodes (volatile! {}) adjacency (volatile! {}) unresolved (volatile! 0)]
+    (loop [stack (vec roots)]
+      (when-let [r (peek stack)]
+        (let [stack (pop stack) k (key-of r)]
+          (if (contains? @nodes k)
+            (recur stack)
+            (let [deps (for [ref (:refs r) :let [d (resolve-ref-row text memo r ref)]]
+                         (if d d (do (vswap! unresolved inc) nil)))
+                  deps (remove nil? deps)]
+              (vswap! nodes assoc k r)
+              (vswap! adjacency assoc k (vec (distinct (map key-of deps))))
+              (recur (into stack (remove #(contains? @nodes (key-of %)) deps))))))))
+    (let [keys* (vec (keys @nodes))
+          sccs (let [index (volatile! {}) low (volatile! {}) on (volatile! #{}) st (volatile! []) c (volatile! 0) out (volatile! [])]
+                 (doseq [v0 keys*]
+                   (when-not (contains? @index v0)
+                     (let [call (volatile! [[v0 0]])]
+                       (vswap! index assoc v0 @c) (vswap! low assoc v0 @c) (vswap! c inc) (vswap! st conj v0) (vswap! on conj v0)
+                       (while (seq @call)
+                         (let [[v i] (peek @call) succ (get @adjacency v [])]
+                           (if (< i (count succ))
+                             (let [w (nth succ i)]
+                               (vswap! call #(conj (pop %) [v (inc i)]))
+                               (cond (not (contains? @index w))
+                                     (do (vswap! index assoc w @c) (vswap! low assoc w @c) (vswap! c inc) (vswap! st conj w) (vswap! on conj w) (vswap! call conj [w 0]))
+                                     (@on w) (vswap! low assoc v (min (@low v) (@index w)))))
+                             (do (vswap! call pop)
+                                 (when (seq @call) (let [[p _] (peek @call)] (vswap! low assoc p (min (@low p) (@low v)))))
+                                 (when (= (@low v) (@index v))
+                                   (vswap! out conj (loop [acc []] (let [w (peek @st)] (vswap! st pop) (vswap! on disj w)
+                                                                      (if (= w v) (conj acc w) (recur (conj acc w))))))))))))))
+                 @out)
+          closure (volatile! {})]
+      (doseq [scc sccs]
+        (let [members (vec (sort-by (fn [k] [(:hash (@nodes k)) k]) scc))
+              pos (into {} (map-indexed (fn [i k] [k i]) members))
+              input (fn [k] (str (:hash (@nodes k)) "|" (str/join "," (sort (map #(if-let [p (pos %)] (str "@" p) (get @closure % "?")) (get @adjacency k []))))))
+              scc-hash (when (> (count members) 1) (sha10 (str/join "\n" (map input members))))]
+          (doseq [k members]
+            (vswap! closure assoc k (if scc-hash (sha10 (str scc-hash "#" (pos k))) (sha10 (input k)))))))
+      {:closure @closure :nodes @nodes :adjacency @adjacency :sccs sccs :unresolved @unresolved :key-of key-of})))
+
+(defn- cmd-closure
+  "closure <ns/sym> | <file>: closure hash (参照先の hash を再帰的に identity に入れた Merkle hash) を
+  その場で計算する。循環 (declare の相互再帰) は SCC を 1 単位で hash する。索引に列は持たない
+  (bench/closure_hash.cljk の全件計算は build の 4 倍かかった)。compile / test 結果の memo key に使う。
+  iteration 20: <file> (拡張子で判定、path 末尾一致) なら file の全定義の closure を sort して 1 つの
+  file closure hash にする (plugin-hermes の kotoba_check の memo key)。"
+  [term]
+  (let [{:keys [header text error]} (load-index-text)]
+    (if error
+      (refuse error)
+      (if (re-find #"\.(cljk|cljc|cljs|clj|kotoba)$" term)
+        ;; ---- file mode
+        (let [rows (->> (scan-lines text (str "^[^\t\n]*\t[^\t\n]*\t[^\t\n]*" (escape-re term) "\t[^\n]*$"))
+                        (filter #(str/ends-with? (:file %) term)))
+              files (distinct (map :file rows))]
+          (cond
+            (empty? rows) (do (println (str "0 definitions in a file ending with " term)) 1)
+            (> (count files) 1) (refuse (str term " matches " (count files) " files — say which: " (str/join " | " (take 6 files))))
+            :else
+            (let [{:keys [closure nodes sccs unresolved key-of]} (closure-map text rows)
+                  per-def (sort (map (fn [r] (str (:sym r) ":" (get closure (key-of r)))) rows))
+                  file-hash (sha10 (str/join "\n" per-def))]
+              (println (str "closure-file " (first files) "  #" file-hash))
+              (println (str "  definitions: " (count rows) "  reachable: " (count nodes) "  cycles: " (count (filter #(> (count %) 1) sccs))
+                            "  unresolved refs: " unresolved " (core / interop / not indexed — names only)"))
+              (age-warning header)
+              (doseq [r (sort-by :line rows)]
+                (println (str "  " (:line r) "\t" (:kind r) " " (:sym r) "  #" (get closure (key-of r)))))
+              0)))
+        ;; ---- symbol mode
+        (let [[ns* leaf] (let [i (.lastIndexOf term "/")] (if (pos? i) [(subs term 0 i) (subs term (inc i))] [nil term]))
+              roots (->> (scan-rows text (escape-re leaf) "") (remove #(= "ns" (:kind %))) (filter #(or (nil? ns*) (= ns* (:ns %)))))]
+          (cond
+            (empty? roots) (do (println (str "0 definitions named " term)) 1)
+            (and (nil? ns*) (> (count (distinct (map :ns roots))) 1))
+            (refuse (str term " is defined in " (count (distinct (map :ns roots))) " namespaces — say which: "
+                         (str/join " | " (take 6 (distinct (map #(str (:ns %) "/" (:sym %)) roots))))))
+            :else
+            (let [root (first (sort-by (comp count :file) roots))
+                  {:keys [closure nodes adjacency sccs unresolved key-of]} (closure-map text [root])
+                  rk (key-of root)]
+              (println (str "closure " (:ns root) "/" (:sym root) " — " (:file root) ":" (:line root)
+                            "  #" (get closure rk) "  (structural #" (:hash root) ")"))
+              (println (str "  definitions in closure: " (count nodes) "  cycles: " (count (filter #(> (count %) 1) sccs))
+                            "  unresolved refs: " unresolved " (core / interop / not indexed — names only)"))
+              (age-warning header)
+              (doseq [k (get adjacency rk [])]
+                (let [r (nodes k)] (println (str "  → " (:ns r) "/" (:sym r) " — " (:file r) ":" (:line r) "  #" (get closure k)))))
+              0)))))))
+
+(defn- cmd-find
+  "term [term...] [--in <path-substr>] [--exact]。term が `ns/sym` なら leaf で引いて ns 列で絞る。
+  hit が find-limit を超えたら substring hit を垂れ流さず、exact/prefix hit + repo ごとの
+  件数表を出して次の 1 手 (--in / --exact) を示す (iteration 8)。"
+  [args]
+  (let [{:keys [header text error]} (load-index-text)]
+    (if error
+      (refuse error)
+      (let [in-idx (.indexOf (to-array args) "--in")
+            in-filter (when (and (>= in-idx 0) (< (inc in-idx) (count args))) (nth args (inc in-idx)))
+            exact? (some #{"--exact"} args)
+            unfold? (some #{"--unfold"} args)
+            terms (->> args (remove #{"--exact" "--unfold"}) (remove #{"--in"}) (remove #{in-filter}))
+            split-ns (fn [t] (let [i (.lastIndexOf t "/")] (if (pos? i) [(subs t 0 i) (subs t (inc i))] [nil t])))
+            leafs (map (comp second split-ns) terms)
+            nss (keep (comp first split-ns) terms)
+            keep? (fn [h] (and (or (empty? nss) (some (fn [n] (= n (:ns h))) nss))
+                               (or (nil? in-filter) (str/includes? (:file h) in-filter))))
+            hits (->> leafs
+                      (mapcat #(scan-rows text (if exact? (escape-re %) (str "[^\\t\\n]*" (escape-re %) "[^\\t\\n]*")) "i"))
+                      distinct
+                      (filter keep?))
+            term0 (str/lower-case (first leafs))
+            ;; 同じ定義の写し (同 sym/kind/line/basename、verify-run や clone の copy) は 1 行に
+            ;; 畳み、最短 path を代表にして :copies に残りの数を持つ (iteration 9)
+            ranked (->> (sort-by #(rank-key term0 %) hits)
+                        ;; iteration 14: 写しは content hash で畳む (stem/line の推定をやめた)。
+                        ;; 同じ本文なら別 repo・別行・別拡張子でも 1 行、本文が違えば別 (行が同じでも)
+                        (group-by (fn [{:keys [sym kind hash]}] [sym kind hash]))
+                        vals
+                        (map (fn [grp] (assoc (first grp) :copies (dec (count grp)) :copy-rows (rest grp))))
+                        (sort-by #(rank-key term0 %)))
+            n (count ranked)
+            exact (filter #(zero? (first (rank-key term0 %))) ranked)]
+        (println (str "indexed " (:symbols header) " symbols, " n " hits for " (str/join " " terms)
+                      ;; --unfold の誘いは定義が 2 つ以上のときだけ (09-17 腕 F q2: 単一 hit でも誘いに乗って
+                      ;; --unfold → 写しの sed まで行き +2 call。複数定義の q8 では誘いが 600 s の時間切れを消した)
+                      (when (> (count hits) n) (str " (" (- (count hits) n) " identical folded"
+                                                    (cond unfold? ", listed" (>= n 2) "; --unfold lists them" :else "") ")"))
+                      (when in-filter (str " --in " in-filter)) (when exact? " --exact")))
+        ;; iteration 21: 網羅性の根拠を 1 行で出す。09-18 の Claude Code 腕 G3 q8 (多重 hit) は exact 3 件を 1 call で
+        ;; 得た後、索引が全部を拾っているか rg を tree 全体に 2 回かけて確かめた (+5 call、prompt が『全部挙げよ』)。
+        ;; 「何を走査した索引か」が出力に無いと、agent は索引の外を疑う
+        (when (and (pos? n) (<= n find-limit) (not exact?))
+          (println (str "  exact " (count exact) " / substring " (- n (count exact))
+                        " · scanned " (:scanned header) " files" (when (= "0" (:unreadable header)) ", unreadable 0")
+                        " (built " (subs (str (:built-at header)) 0 (min 16 (count (str (:built-at header))))) "Z)"
+                        "; exact = every definition named exactly this in the scanned tree (~ = nested); a file newer than the index is read fresh on hit")))
+        (age-warning header)
+        (if (<= n find-limit)
+          (doseq [h ranked]
+            (println (fmt-hit h))
+            ;; iteration 16: --unfold で畳んだ写しの file:line を出す。09-17 の Hermes 腕 D q8 は
+            ;; 「写しの file:line も」を TSV の直接 grep で出そうとして 600 s で時間切れになった
+            (when unfold?
+              (doseq [c (:copy-rows h)] (println (str "      = " (:file c) ":" (:line c))))))
+          (let [n-exact (count exact)
+                repos (map (comp repo-of :file) ranked)
+                by-repo (->> repos frequencies (sort-by (comp - val)) (take 12))]
+            (println (str "  too many to list: " n-exact " exact, " (- n n-exact) " substring, in "
+                          (count (distinct repos)) " repos. Top repos:"))
+            (doseq [[r c] by-repo] (println (str "  " c "\t" r)))
+            (println "  first 8 by rank:")
+            (doseq [h (take 8 ranked)] (println (fmt-hit h)))
+            (println (str "  narrow: find " (first leafs) " --in <repo-path>"
+                          (when-not exact? (str "  |  find " (first leafs) " --exact"))
+                          "  |  find <ns>/" (first leafs)))))
+        ;; hit が 3 件以下なら show を待たずに全部の snippet を出す (round trip を 1 つ減らす。
+        ;; iteration 2 は 1 件のときだけだった; Hermes A/B では全 query が 2 call だった)
+        ;; iteration 9: 合計でなく **exact hit** が 1-3 件なら exact の snippet を出す。substring
+        ;; hit (kernel-base → kernel-base-positions …) が混ざって合計 >3 になり、agent が
+        ;; show をもう 1 回呼ぶ形が one_call bench で 3/8 あった
+        (let [pick (cond (<= 1 (count exact) 3) exact
+                         (<= 1 n 3) ranked
+                         :else nil)
+              built (built-ms header)]
+          (doseq [h pick]
+            (let [{:keys [file line sym kind gone] :as h} (relocate h built)]
+              (when (> n 1) (println (str "== " kind " " sym " — " file ":" line)))
+              (when-let [note (relocation-note h)] (println note))
+              (when-not gone (println (snippet file line)))))
+          ;; iteration 21: snippet は今 file から読んだ本文 (索引の写しではない) と言う。09-18 の腕 G3 は
+          ;; q1–q7 の 7/7 で find の後に sed / grep で同じ行を読み直していた (2 tool、Hermes 腕 H は 1 tool)
+          (when (seq pick)
+            (println "  (snippet lines are read from the file now, line numbers as in the file — no need to sed/grep them again)")))
+        (when (zero? n) (suggest-near text (first leafs) keep?))
+        ;; iteration 19: 被依存の口を 1 行で示す (09-17 の Claude Code 腕 G q9: --dependents を知らず rg で探して
+        ;; turn 上限。新しい口は出力に書かないと使われない)
+        (when (pos? n)
+          (println (str "  (who references it: find " (first leafs) " --dependents  |  identity incl. dependencies: closure <ns>/" (first leafs) ")")))
+        (if (seq hits) 0 1)))))
+
+(defn- cmd-show
+  "`sym` / `ns/sym` / `sym:line` を受ける。ns が付いていれば ns 列で絞り、絞って
+  0 件なら leaf だけで引き直す (その旨を印字)。"
+  [target]
+  (let [{:keys [header text error]} (load-index-text)]
+    (if error
+      (refuse error)
+      (let [[sym-part] (str/split target #":")
+            slash (.lastIndexOf sym-part "/")
+            ns-part (when (pos? slash) (subs sym-part 0 slash))
+            leaf (if (pos? slash) (subs sym-part (inc slash)) sym-part)
+            all (scan-rows text (escape-re leaf) "")
+            in-ns (when ns-part (filter #(= (:ns %) ns-part) all))
+            hits (cond (seq in-ns) in-ns
+                       (and ns-part (seq all))
+                       (do (println (str "no " leaf " in ns " ns-part " — showing " leaf " from other ns")) all)
+                       :else all)
+            hits (sort-by #(rank-key (str/lower-case leaf) %) hits)]
+        (if (empty? hits)
+          (refuse "no exact match for " target " — try: find " leaf)
+          (do
+            (doseq [h (take 3 hits)]
+              (let [{:keys [file line sym kind ns gone hash] :as h} (relocate h (built-ms header))]
+                (println (str "== " kind " " (if (seq ns) (str ns "/") "") sym " — " file ":" line (when (seq hash) (str "  #" hash))))
+                (when-let [note (relocation-note h)] (println note))
+                (when-not gone (println (snippet file line)))))
+            (when (> (count hits) 3)
+              (println (str "  ... " (- (count hits) 3) " more definitions of " leaf " (qualify with ns/)")))
+            0))))))
+
+(defn- signature
+  "def 行の名前より後ろ (arglist か本体の先頭) を 1 行に。無ければ次行が docstring なら
+  その 1 行目。iteration 10 の実測 (defn 600 件): arglist は 55% が def 行、40% は
+  docstring が先 (arglist はその後)。どちらでも 1 行で『何を取るか / 何をするか』が
+  分かるので、agent が outline の後に Read へ行く理由を減らす。80 字で切る。"
+  [lines line sym]
+  (let [l (nth lines (dec line) "")
+        i (.indexOf l sym)
+        rest (if (neg? i) "" (str/trim (subs l (+ i (count sym)))))
+        rest (str/replace rest #"\)+$" "")
+        nxt (str/trim (nth lines line ""))
+        sig (cond (seq rest) rest
+                  (str/starts-with? nxt "\"") (str/replace nxt #"^\"|\"$" "")
+                  (str/starts-with? nxt "[") nxt
+                  :else "")
+        sig (str/replace sig #"\s+" " ")]
+    (if (> (count sig) 80) (str (subs sig 0 79) "…") sig)))
+
+(defn- cmd-outline
+  "file (path の末尾一致) か ns (完全一致) の定義を行順に並べる。file を Read する
+  前の地図: 1 行 ≈ 10 tok なので 100 def の file でも ~1k tok で済む。
+  iteration 10: 各行に signature (arglist か docstring 1 行目) を添える。--bare で消す。"
+  [target opts]
+  (let [{:keys [header text error]} (load-index-text)]
+    (if error
+      (refuse error)
+      (let [by-path? (or (str/includes? target "/") (re-find #"\.(cljk|cljc|cljs|clj|kotoba)$" target))
+            rows (if by-path?
+                   (let [re (js/RegExp. (str "^[^\t\n]*\t[^\t\n]*\t[^\t\n]*" (escape-re target) "\t[^\n]*$") "gm")
+                         out (volatile! [])]
+                     (loop [] (when-let [m (.exec re text)] (vswap! out conj (parse-row (aget m 0))) (recur)))
+                     @out)
+                   (let [re (js/RegExp. (str "^[^\t\n]*\t[^\t\n]*\t[^\t\n]*\t\\d+\t" (escape-re target) "\t[^\n]*$") "gm")
+                         out (volatile! [])]
+                     (loop [] (when-let [m (.exec re text)] (vswap! out conj (parse-row (aget m 0))) (recur)))
+                     @out))
+            files (distinct (map :file rows))]
+        (if (empty? rows)
+          (refuse "no definitions for " target " — try: find " (last (str/split target #"[/.]")))
+          (do
+            (age-warning header)
+            (doseq [f (take 5 files)]
+              (println (str "== " f))
+              (let [stale? (stale-file? f (built-ms header))
+                    frows (when stale? (fresh-rows f))
+                    _ (when frows (println "  (re-scanned: file changed after index)"))
+                    lines (when-not (:bare opts)
+                            (try (str/split-lines (.readFileSync fs (.join path top f) "utf8")) (catch :default _ nil)))]
+                (doseq [{:keys [line kind sym nested hash]} (sort-by :line (or frows (filter #(= f (:file %)) rows)))]
+                  (let [sig (when lines (signature lines line sym))]
+                    (println (str "  " line "\t" (if nested "~" "") kind " " sym
+                                  (when (seq sig) (str "  · " sig))
+                                  (when (seq hash) (str "  #" hash))))))))
+            (when (> (count files) 5)
+              (println (str "  ... " (- (count files) 5) " more files match " target " (give a longer path)")))
+            0))))))
+
+(defn- cmd-status
+  "索引の素性を印字する。dead code だった iteration 1 の index-stale? の代わり:
+  鮮度は自動判定せず built-at と age を見せ、判断を人に返す。"
+  []
+  (let [p (index-path)]
+    (if-not (.existsSync fs p)
+      (refuse "no index at " p " — run build")
+      (let [text (.readFileSync fs p "utf8")
+            h (parse-header text)]
+        (if (nil? h)
+          (refuse "index is not v2 TSV (stale JSON?) — run build")
+          (let [age-min (js/Math.round (/ (- (.getTime (js/Date.)) (.getTime (js/Date. (:built-at h)))) 60000))]
+            (doseq [[k v] (sort-by key h)]
+              (if (= k :pruned-groups)
+                (doseq [g (remove str/blank? (str/split v #";"))]
+                  (println (str "pruned-group\t" g)))
+                (println (str (name k) "\t" v))))
+            (println (str "age-minutes\t" age-min))
+            (println (str "bytes\t" (.-size (.statSync fs p))))
+            (if (not= (:top h) top)
+              (refuse "index top=" (:top h) " differs from cwd top=" top)
+              0)))))))
+
+(defn- script-args
+  "nbb / kbb どちらでも *command-line-args* が空のことがあるため
+  gen-west-manifest.cljs / repo-search.cljk と同じ復元を行う。"
+  []
+  (if (seq *command-line-args*)
+    *command-line-args*
+    (let [argv (vec (js->clj (.-argv js/process)))
+          index (first (keep-indexed
+                        (fn [i value]
+                          (when (str/ends-with? value "scripts/symbol-index.cljk") i))
+                        argv))]
+      (if (some? index) (subvec argv (inc index)) []))))
+
+(defn- usage []
+  (println "usage: kbb --backend sci scripts/symbol-index.cljk <query> | build|find|show|outline|status [args]")
+  (println "  <query> — no subcommand needed: *.cljk / a.b → outline, a.b/c → show, anything else → find")
+  (println "  build [--include-worktrees] [--no-prune] [--full] — scan .cljk/.cljc/.cljs/.clj/.kotoba and write the index")
+  (println "  find <term|ns/term> [term...] [--in <path-substr>] [--exact] [--unfold] — symbol name search (exit 1 = 0 hits; --unfold lists folded copies)")
+  (println "  find <sym|ns/sym> --dependents [--depth N|all] — definitions that reference it, by depth (what to re-check after a change; exit 1 = none)")
+  (println "  closure <ns/sym> | <file> — Merkle closure hash (dependencies' hashes folded in); memo key for compile/test results (file: all its definitions)")
+  (println "  show <symbol|ns/symbol> — definition snippet (file:line + context lines)")
+  (println "  outline <file-suffix|ns> [--bare] — every definition in a file/namespace with its signature (map before Read)")
+  (println "  status — index header (top / built-at / scanned / symbols) and age")
+  2)
+
+(defn -main [& args]
+  (let [[cmd & rest-args] args]
+    (cond
+      (= cmd "build")
+      (do-build {:include-worktrees (some #{"--include-worktrees"} rest-args)
+                 :no-prune (some #{"--no-prune"} rest-args)
+                 :full (some #{"--full"} rest-args)})
+
+      (= cmd "find")
+      (cond (empty? rest-args) (refuse "find needs at least one term")
+            (some #{"--dependents"} rest-args)
+            (let [terms (remove #(or (str/starts-with? % "--") (re-find #"^\d+$|^all$" %)) rest-args)]
+              (if (empty? terms) (refuse "find --dependents needs a symbol") (cmd-dependents (first terms) rest-args)))
+            :else (cmd-find rest-args))
+
+      (= cmd "closure")
+      (if (empty? rest-args)
+        (refuse "closure needs a symbol (e.g. kagami.db/apply-pin-advance)")
+        (cmd-closure (first rest-args)))
+
+      (= cmd "show")
+      (if (empty? rest-args)
+        (refuse "show needs a symbol (e.g. kagami.db/apply-pin-advance)")
+        (cmd-show (first rest-args)))
+
+      (= cmd "outline")
+      (let [targets (remove #{"--bare"} rest-args)]
+        (if (empty? targets)
+          (refuse "outline needs a file suffix or a namespace (e.g. kagami/db.cljk or kagami.db)")
+          (cmd-outline (first targets) {:bare (some #{"--bare"} rest-args)})))
+
+      (= cmd "status")
+      (cmd-status)
+
+      ;; iteration 11: subcommand 無しの引数は形で dispatch する (agent が find / show /
+      ;; outline のどれかを毎回決めなくてよい)。解釈を 1 行目に印字して学べるようにする。
+      ;;   *.cljk 等の拡張子 → outline (file)   a.b (dot、slash 無し) → outline (ns)
+      ;;   a.b/c (slash)      → show (ns/sym)    それ以外 → find
+      (and cmd (not (str/starts-with? cmd "-")))
+      (let [file? (re-find #"\.(cljk|cljc|cljs|clj|kotoba)$" cmd)
+            slash? (str/includes? cmd "/")
+            ns? (and (not slash?) (str/includes? cmd ".") (not (str/includes? cmd " ")))
+            as (cond file? "outline" slash? (if (re-find #"^[^/]+\.[^/]+/" cmd) "show" "find") ns? "outline" :else "find")]
+        (println (str "(interpreted as: " as " " (str/join " " args) ")"))
+        (cond
+          (some #{"--dependents"} rest-args) (cmd-dependents cmd rest-args)
+          (= as "outline") (cmd-outline cmd {:bare (some #{"--bare"} rest-args)})
+          (= as "show") (cmd-show cmd)
+          :else (cmd-find args)))
+
+      :else
+      (usage))))
+
+(let [args (script-args)]
+  (if (seq args)
+    (let [code (apply -main args)]
+      (.exit js/process (if (number? code) code 0)))
+    (do (usage)
+        (.exit js/process 2))))

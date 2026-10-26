@@ -1,0 +1,378 @@
+#!/usr/bin/env kbb
+;; bench/closure_hash.cljk — iteration 17 の仮説を測る: 定義の構造 hash (v4、名前と局所束縛を落とした form)
+;; の中の **参照 symbol を参照先の hash に置換** (Merkle / Unison の本来の identity) すると何が変わるか。
+;;
+;;   kbb --backend sci bench/closure_hash.cljk [--root <superproject>] [--sample <files>] [--seed <n>] [--all]
+;;                                              [--trials <n>] [--out <edn>]
+;;
+;; 出す数 (evidence floor: 定義 0 なら exit 2、伝播 test が 1 つでも落ちたら exit 1):
+;;   :defs / :files / :file-parse-failed          読めなかった file は「依存が無い」ではなく未測定
+;;   :struct-hash-agrees-with-index               ここで計算した構造 hash が索引 v4 の 7 列目と一致する率 (写しの忠実さ)
+;;   :refs {:same-ns :alias :qualified :refer :cross-repo :unresolved}   参照の解決内訳 (unresolved は core / 外部 lib / 未 checkout)
+;;   :out-degree / :in-degree / :blast-radius     直接依存 / 直接被依存 / 推移的被依存 (sample) の分布
+;;   :scc                                         循環 (相互再帰) の個数と最大サイズ
+;;   :propagation                                 両方向: 1 定義の本文を変えた (struct hash を差し替えた) とき、
+;;                                                closure hash が変わる定義の集合 == {自分} ∪ 推移的被依存、それ以外は不変
+;;   :closure-dup-share                           closure hash で見た「他と同一」の割合 (struct 45.8% との差 = 依存先が違う写し)
+;;
+;; closure hash の定義: SCC (Tarjan) を逆位相順に処理し、member の入力 = 構造 hash + sorted [参照ごとに:
+;; 同じ SCC なら "@<member 番号>"、外なら参照先の closure hash]。単独なら sha256(入力)、循環なら SCC の
+;; 全 member 入力を連結した scc-hash に位置を足す (1 単位で hash: 仲間の依存が変われば全員変わる)。先頭 10 hex。
+;; 参照の解決: 同 ns の定義 → ns の :require の :as alias / :refer → 完全修飾 ns/sym → 同 repo (path 先頭 3 段) を
+;; 優先し、無ければ他 repo の同 ns (最短 path)。解決できない symbol は構造 hash の中に名前として残るだけ。
+
+(require '[clojure.string :as str]
+         '[clojure.walk :as walk]
+         '[edamame.core :as e]
+         '[cljs.pprint :as pp]
+         '[clojure.set])
+
+(def fs (js/require "node:fs"))
+(def path (js/require "node:path"))
+(def crypto (js/require "node:crypto"))
+
+(defn- argv [] (vec (js->clj (.-argv js/process))))
+(defn- arg-after [flag]
+  (let [a (argv) i (.indexOf a flag)]
+    (when (and (>= i 0) (< (inc i) (count a))) (nth a (inc i)))))
+(defn- flag? [f] (>= (.indexOf (argv) f) 0))
+
+(def root (or (arg-after "--root") "/Users/junkawasaki/github/com-junkawasaki"))
+(def index-file (.join path root ".kotoba-cache" "symbol-index.tsv"))
+(def sample-n (js/parseInt (or (arg-after "--sample") "1500") 10))
+(def seed (js/parseInt (or (arg-after "--seed") "17") 10))
+(def trials (js/parseInt (or (arg-after "--trials") "30") 10))
+(def out-file (arg-after "--out"))
+
+(defn- sha10 [s]
+  (subs (.digest (.update (.createHash crypto "sha256") s "utf8") "hex") 0 10))
+
+;; ---------------------------------------------------------------- 構造 hash (scripts/symbol-index.cljk の写し)
+;; bench は単 file で完結させる。索引の 7 列目との一致率を :struct-hash-agrees-with-index で出すので、
+;; 写しがずれれば数字に出る。
+(def parse-opts
+  (e/normalize-opts {:all true :read-cond :preserve :auto-resolve name
+                     :readers (fn [t] (fn [v] (list 'TAG t v)))
+                     :syntax-quote true :location? seq?}))
+
+(def binding-heads
+  '#{fn fn* defn defn- defmacro let let* loop loop* for doseq dotimes when-let if-let
+     when-some if-some letfn binding with-open with-redefs as-> defmethod deftest
+     defrecord deftype catch})
+
+(defn- binding-syms [v]
+  (let [acc (volatile! [])]
+    (walk/prewalk (fn [x]
+                    (when (and (symbol? x) (not (str/includes? (name x) "/")) (not= x '&))
+                      (vswap! acc conj x))
+                    x)
+                  v)
+    @acc))
+
+(defn- collect-locals [form]
+  (let [acc (volatile! []) seen (volatile! #{})
+        push! (fn [s] (when-not (@seen s) (vswap! seen conj s) (vswap! acc conj s)))
+        arity! (fn [ys] (doseq [y ys]
+                          (cond (vector? y) (run! push! (binding-syms y))
+                                (and (seq? y) (vector? (first y))) (run! push! (binding-syms (first y))))))]
+    (walk/prewalk
+     (fn [x]
+       (when (and (seq? x) (symbol? (first x)) (binding-heads (first x)))
+         (let [[h & r] x]
+           (cond
+             (#{'defn 'defn- 'defmacro 'defmethod 'deftest} h) (arity! (rest r))
+             (#{'fn 'fn*} h) (arity! r)
+             (#{'let 'let* 'loop 'loop* 'for 'doseq 'dotimes 'when-let 'if-let 'when-some 'if-some 'binding 'with-open 'with-redefs} h)
+             (when (vector? (first r)) (run! push! (mapcat binding-syms (take-nth 2 (first r)))))
+             (#{'as-> 'catch} h) (when (symbol? (second r)) (push! (second r)))
+             (= 'letfn h) (when (vector? (first r))
+                            (doseq [f (first r)] (when (and (seq? f) (symbol? (first f))) (push! (first f)))))
+             (#{'defrecord 'deftype} h) (when (vector? (second r)) (run! push! (binding-syms (second r))))
+             :else nil)))
+       x)
+     form)
+    @acc))
+
+(defn- strip-loc-meta [x]
+  (if (and (some? x) (satisfies? IMeta x) (meta x))
+    (let [m (dissoc (meta x) :row :col :end-row :end-col :source)]
+      (with-meta x (when (seq m) m)))
+    x))
+
+(defn- def-form? [form]
+  (and (seq? form) (symbol? (first form)) (str/starts-with? (name (first form)) "def")))
+
+(defn- strip-doc [form]
+  (if (and (def-form? form) (>= (count form) 4) (string? (nth form 2)))
+    (with-meta (concat (take 2 form) (drop 3 form)) (meta form))
+    form))
+
+(defn- normalize
+  "def form → [構造 hash, 正規化後の form (局所は %N、自名は %name)]。"
+  [form]
+  (let [form (strip-doc form)
+        defname (when (def-form? form) (second form))
+        ren (into {} (map-indexed (fn [i s] [s (symbol (str "%" i))]) (collect-locals form)))
+        ren (if (symbol? defname) (assoc ren defname '%name) ren)
+        norm (walk/postwalk
+              (fn [x]
+                (let [x (strip-loc-meta x)]
+                  (cond
+                    (symbol? x)
+                    (let [x' (get ren x x)]
+                      (if (str/ends-with? (name x') "__auto__")
+                        (symbol (str/replace (name x') #"__\d+__auto__$" "__auto__"))
+                        (with-meta x' (meta x))))
+                    (set? x) (with-meta (list 'SET* (vec (sort (map pr-str x)))) (meta x))
+                    (map? x) (with-meta (list 'MAP* (vec (sort (map (fn [[k v]] (pr-str [k v])) x)))) (meta x))
+                    :else x)))
+              form)]
+    [(sha10 (binding [*print-meta* true] (pr-str norm))) norm]))
+
+;; ---------------------------------------------------------------- ns form → alias / refer
+(defn- ns-info
+  "(ns x (:require [a.b :as c] [d.e :refer [f]] ...)) → {:aliases {c a.b} :refers {f d.e}}。
+  reader conditional の中の :require も両 branch を見る。"
+  [form]
+  (let [aliases (volatile! {}) refers (volatile! {})]
+    (walk/prewalk
+     (fn [x]
+       (when (and (seq? x) (#{:require :require-macros :use} (first x)))
+         (doseq [spec (rest x)]
+           (let [spec (if (symbol? spec) [spec] spec)]
+             (when (and (vector? spec) (symbol? (first spec)))
+               (let [ns* (first spec) opts (apply hash-map (rest spec))]
+                 (when (symbol? (:as opts)) (vswap! aliases assoc (:as opts) ns*))
+                 (when (vector? (:refer opts)) (doseq [s (:refer opts)] (when (symbol? s) (vswap! refers assoc s ns*)))))))))
+       x)
+     form)
+    {:aliases @aliases :refers @refers}))
+
+;; ---------------------------------------------------------------- 索引
+(defn- read-index []
+  (when-not (.existsSync fs index-file)
+    (println (str "REFUSE\tno index at " index-file)) (.exit js/process 2))
+  (let [lines (str/split-lines (.readFileSync fs index-file "utf8"))]
+    (when-not (str/starts-with? (first lines) "#symbol-index\tv4")
+      (println (str "REFUSE\tindex is not v4: " (subs (first lines) 0 40))) (.exit js/process 2))
+    (->> (rest lines)
+         (keep (fn [l]
+                 (let [[sym kind rel line ns flags h] (str/split l #"\t")]
+                   (when (and rel line (seq ns) (not= kind "ns"))
+                     {:sym sym :kind kind :rel rel :line (js/parseInt line 10) :ns ns :h h}))))
+         (group-by :rel))))
+
+(defn- sample-keys [ks n seed]
+  (if (or (flag? "--all") (>= n (count ks)))
+    (vec ks)
+    (let [v (vec (sort ks)) st (volatile! seed)
+          nxt (fn [] (vswap! st #(mod (+ (* 1103515245 %) 12345) 2147483648)) @st)]
+      (loop [acc #{} i 0]
+        (if (or (>= (count acc) n) (> i (* 20 n))) (vec acc)
+            (recur (conj acc (nth v (mod (nxt) (count v)))) (inc i)))))))
+
+(defn- repo-of [rel] (str/join "/" (take 3 (str/split rel #"/"))))
+
+(defn- body-symbols
+  "正規化 form の中の symbol (局所 %N・自名 %name・quote の中は除く)。quote は data なので参照ではない。"
+  [norm]
+  (let [acc (volatile! #{})]
+    (letfn [(w [x] (cond
+                     (and (seq? x) (= 'quote (first x))) nil
+                     (symbol? x) (when-not (str/starts-with? (name x) "%") (vswap! acc conj x))
+                     (coll? x) (run! w x)
+                     :else nil))]
+      (w norm))
+    @acc))
+
+;; ---------------------------------------------------------------- file → 定義 node 列
+(defn- scan-file
+  "file の top-level form を全部読み、def form ごとに {:key :ns :sym :repo :rel :line :struct :norm} を返す。
+  ns の alias / refer は file 内で持ち替える。読めなければ nil。"
+  [rel]
+  (try
+    (let [text (.readFileSync fs (.join path root rel) "utf8")
+          forms (e/parse-string-all text parse-opts)
+          repo (repo-of rel)
+          cur-ns (volatile! nil) info (volatile! {:aliases {} :refers {}})
+          out (volatile! [])]
+      (doseq [f forms]
+        (cond
+          (and (seq? f) (= 'ns (first f)) (symbol? (second f)))
+          (do (vreset! cur-ns (name (second f))) (vreset! info (ns-info f)))
+          (and (def-form? f) (symbol? (second f)) @cur-ns)
+          (let [[h norm] (normalize f)]
+            ;; norm は持たない (600k 定義で heap を割った実測)。参照候補の symbol 集合と自己参照の有無だけ残す
+            (vswap! out conj {:ns @cur-ns :sym (name (second f)) :repo repo :rel rel
+                              :line (or (:row (meta f)) 0) :struct h
+                              :syms (body-symbols norm) :self? (str/includes? (pr-str (drop 2 norm)) "%name")
+                              :info @info}))
+          :else nil))
+      @out)
+    (catch :default _ nil)))
+
+;; ---------------------------------------------------------------- 参照解決
+(defn- resolve-ref
+  "symbol → [kind target-key]。by-ns-sym: {[ns sym] [key ...]} (同 ns/sym の定義が複数 repo にあるとき)。"
+  [s {:keys [ns repo info]} by-ns-sym ns-set]
+  (let [pick (fn [kind ns* sym*]
+               (when-let [keys (get by-ns-sym [ns* sym*])]
+                 (let [same-repo (filter #(str/starts-with? % (str repo "\t")) keys)]
+                   (if (seq same-repo) [kind (first same-repo)] [:cross-repo (first (sort-by count keys))]))))]
+    (if-let [i (let [i (.indexOf (str s) "/")] (when (pos? i) i))]
+      (let [a (subs (str s) 0 i) b (subs (str s) (inc i))]
+        (or (when-let [ns* (get (:aliases info) (symbol a))] (pick :alias (name ns*) b))
+            (when (ns-set a) (pick :qualified a b))
+            [:unresolved nil]))
+      (or (pick :same-ns ns (name s))
+          (when-let [ns* (get (:refers info) s)] (pick :refer (name ns*) (name s)))
+          [:unresolved nil]))))
+
+;; ---------------------------------------------------------------- Tarjan SCC + closure hash
+(defn- tarjan
+  "adjacency: {key [key ...]} → SCC の列 (逆位相順 = 依存先が先)。反復版 (600k node で再帰は stack を割る)。"
+  [keys adjacency]
+  (let [index (volatile! {}) low (volatile! {}) on (volatile! #{}) stack (volatile! [])
+        counter (volatile! 0) sccs (volatile! [])]
+    (doseq [v0 keys]
+      (when-not (contains? @index v0)
+        ;; 手動 stack: [node 子の index]
+        (let [call (volatile! [[v0 0]])]
+          (vswap! index assoc v0 @counter) (vswap! low assoc v0 @counter) (vswap! counter inc)
+          (vswap! stack conj v0) (vswap! on conj v0)
+          (while (seq @call)
+            (let [[v i] (peek @call)
+                  succ (get adjacency v [])]
+              (if (< i (count succ))
+                (let [w (nth succ i)]
+                  (vswap! call #(conj (pop %) [v (inc i)]))
+                  (cond
+                    (not (contains? @index w))
+                    (do (vswap! index assoc w @counter) (vswap! low assoc w @counter) (vswap! counter inc)
+                        (vswap! stack conj w) (vswap! on conj w)
+                        (vswap! call conj [w 0]))
+                    (@on w) (vswap! low assoc v (min (@low v) (@index w)))))
+                (do
+                  (vswap! call pop)
+                  (when (seq @call)
+                    (let [[p _] (peek @call)] (vswap! low assoc p (min (@low p) (@low v)))))
+                  (when (= (@low v) (@index v))
+                    (let [scc (loop [acc []]
+                                (let [w (peek @stack)]
+                                  (vswap! stack pop) (vswap! on disj w)
+                                  (if (= w v) (conj acc w) (recur (conj acc w)))))]
+                      (vswap! sccs conj scc))))))))))
+    @sccs))
+
+(defn- closure-hashes
+  "struct: {key hash}, adjacency: {key [key…]}, sccs: 逆位相順 → {key closure-hash}。"
+  [struct adjacency sccs]
+  (let [out (volatile! {})]
+    (doseq [scc sccs]
+      (let [members (vec (sort-by (fn [k] [(struct k) k]) scc))
+            pos (into {} (map-indexed (fn [i k] [k i]) members))
+            ;; SCC は 1 単位で hash する (Unison と同じ)。member の入力を全部連結した scc-hash に位置を足す。
+            ;; 最初の版は member ごとに自分の入力だけを hash していて、仲間の外部依存が変わっても自分が
+            ;; 変わらなかった (全件の伝播 test 20 回中 5 回が『dependent unchanged』、全部 declare の相互再帰)
+            member-input (fn [k] (str (struct k) "|"
+                                     (str/join "," (sort (map (fn [r] (if-let [p (pos r)] (str "@" p) (get @out r "?")))
+                                                              (get adjacency k []))))))
+            scc-hash (if (= 1 (count members))
+                       nil
+                       (sha10 (str/join "\n" (map member-input members))))]
+        (doseq [k members]
+          (vswap! out assoc k (if scc-hash (sha10 (str scc-hash "#" (pos k))) (sha10 (member-input k)))))))
+    @out))
+
+(defn- pct [a b] (if (pos? b) (/ (Math/round (* 1000 (/ a b))) 10) 0))
+(defn- dist [xs]
+  (let [v (vec (sort xs)) n (count v)]
+    (if (zero? n) {}
+        {:n n :median (nth v (quot n 2)) :p90 (nth v (min (dec n) (quot (* 9 n) 10))) :max (peek v)
+         :zero (count (filter zero? v))})))
+
+;; ---------------------------------------------------------------- main
+(defn -main []
+  (let [by-file (read-index)
+        files (sample-keys (keys by-file) sample-n seed)
+        t0 (.now js/Date)
+        nodes (volatile! []) parse-failed (volatile! 0)]
+    (doseq [rel files]
+      (if-let [ns* (scan-file rel)]
+        (vswap! nodes into ns*)
+        (vswap! parse-failed inc)))
+    (let [nodes @nodes
+          nodes (map-indexed (fn [i n] (assoc n :key (str (:repo n) "\t" (:ns n) "\t" (:sym n) "\t" i))) nodes)
+          n (count nodes)]
+      (when (zero? n)
+        (println (str "REFUSE\tparsed 0 definitions (files=" (count files) " parse-failed=" @parse-failed ")"))
+        (.exit js/process 2))
+      (let [by-key (into {} (map (juxt :key identity) nodes))
+            by-ns-sym (reduce (fn [m nd] (update m [(:ns nd) (:sym nd)] (fnil conj []) (:key nd))) {} nodes)
+            ns-set (set (map :ns nodes))
+            ;; 索引 v4 の hash と突き合わせ (同 file・同 sym の行)
+            idx-agree (count (filter (fn [nd] (some #(and (= (:sym %) (:sym nd)) (= (:h %) (:struct nd))) (get by-file (:rel nd)))) nodes))
+            ;; 参照解決
+            ref-kinds (volatile! {}) adjacency (volatile! {})
+            _ (doseq [nd nodes]
+                (let [rs (for [s (:syms nd)
+                               :let [[kind tgt] (resolve-ref s nd by-ns-sym ns-set)]]
+                           (do (vswap! ref-kinds update kind (fnil inc 0)) tgt))
+                      ;; 自己参照 (再帰) は SCC で扱う。同じ target の重複は 1 本
+                      targets (vec (distinct (remove nil? rs)))]
+                  (vswap! adjacency assoc (:key nd) targets)))
+            adjacency @adjacency
+            keys* (mapv :key nodes)
+            sccs (tarjan keys* adjacency)
+            struct (into {} (map (fn [nd] [(:key nd) (:struct nd)]) nodes))
+            closure (closure-hashes struct adjacency sccs)
+            reverse-adj (reduce (fn [m [k ts]] (reduce (fn [m t] (update m t (fnil conj []) k)) m ts)) {} adjacency)
+            out-deg (map #(count (get adjacency % [])) keys*)
+            in-deg (map #(count (get reverse-adj % [])) keys*)
+            dependents (fn [k] (loop [seen #{} frontier [k]]
+                                 (if (empty? frontier) (disj seen k)
+                                     (let [nxt (remove seen (mapcat #(get reverse-adj % []) frontier))]
+                                       (recur (into seen frontier) (vec (distinct nxt)))))))
+            sample-nodes (sample-keys keys* 2000 (+ seed 1))
+            blast (map #(count (dependents %)) sample-nodes)
+            ;; 伝播 test (両方向): 被依存を持つ node の struct hash を差し替え、closure の変化集合を比べる
+            with-deps (filter #(seq (get reverse-adj % [])) (sample-keys keys* 5000 (+ seed 2)))
+            trial-nodes (take trials with-deps)
+            prop (for [k trial-nodes]
+                    (let [expected (conj (dependents k) k)
+                          struct' (assoc struct k (sha10 (str (struct k) "|mutated")))
+                          closure' (closure-hashes struct' adjacency sccs)
+                          changed (set (filter #(not= (closure %) (closure' %)) keys*))]
+                      {:key k :expected (count expected) :changed (count changed)
+                       :ok (= expected changed)
+                       :reason (cond (= expected changed) nil
+                                     (seq (clojure.set/difference expected changed)) (str "dependent unchanged: " (first (clojure.set/difference expected changed)))
+                                     :else (str "non-dependent changed: " (first (clojure.set/difference changed expected))))}))
+            prop (doall prop)
+            cg (frequencies (vals closure)) sg (frequencies (vals struct))
+            closure-dup (count (filter #(> (cg (closure %)) 1) keys*))
+            struct-dup (count (filter #(> (sg (struct %)) 1) keys*))
+            ;; struct では同一だが closure では別 = 本文同じで依存先が違う写し
+            split (count (filter #(and (> (sg (struct %)) 1) (= 1 (cg (closure %)))) keys*))
+            rk @ref-kinds rtotal (reduce + (vals rk))
+            report {:index index-file :files (count files) :file-parse-failed @parse-failed :defs n
+                    :wall-ms (- (.now js/Date) t0)
+                    :struct-hash-agrees-with-index (str idx-agree "/" n)
+                    :refs (assoc rk :total rtotal :resolved-share (pct (- rtotal (get rk :unresolved 0)) rtotal))
+                    :out-degree (dist out-deg) :in-degree (dist in-deg)
+                    :blast-radius (assoc (dist blast) :note "sample 2000 node の推移的被依存の数")
+                    :scc {:count (count (filter #(> (count %) 1) sccs)) :max (apply max 0 (map count sccs))
+                          ;; 自名は %name に正規化されるので参照グラフには乗らない (構造 hash が既に持つ)。本文に %name が在る定義を数える
+                          :self-recursive (count (filter :self? nodes))}
+                    :propagation {:trials (count prop) :ok (count (filter :ok prop))
+                                  :fail (vec (take 3 (map #(select-keys % [:key :expected :changed :reason]) (remove :ok prop))))
+                                  :changed-per-trial (dist (map :changed prop))}
+                    :dup-share {:struct (pct struct-dup n) :closure (pct closure-dup n)
+                                :struct-same-closure-differs split
+                                :note "closure < struct の差 = 本文は同じだが依存先の本文が違う写し (text/struct hash では見えなかった)"}}]
+        (println (with-out-str (pp/pprint report)))
+        (when out-file (.writeFileSync fs out-file (with-out-str (pp/pprint report))) (println (str "wrote " out-file)))
+        (println (str "SCANNED\t" n))
+        (.exit js/process (if (= (count prop) (count (filter :ok prop))) 0 1))))))
+
+(-main)

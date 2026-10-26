@@ -223,6 +223,7 @@ The bundled standard libraries live in this repository:
 | `org.ethereum.jsonrpc` | `org.ethereum.jsonrpc/src` | `kotobase.ethereum.client`, `kotobase.ethereum.rpc` (an external specification, publisher ethereum.org) |
 | `org.ietf.hpke` | `org.ietf.hpke/src` | `hpke.core`, `hpke.dhkem`, `hpke.kdf` (an external specification, publisher ietf.org) |
 | `org.ietf.srtp` | `org.ietf.srtp/src` | `srtp.aes-cm`, `srtp.index`, `srtp.kdf`, `srtp.packet` (an external specification, publisher ietf.org) |
+| `kotoba.symbolIndex` | `kotoba.symbolIndex/src` | `` (Kotoba project library) |
 | `kotoba.kotobaBuild` | `kotoba.kotobaBuild/src` | `` (Kotoba project library) |
 | `kotoba.kototama` | `kotoba.kototama/src` | `kototama.aiueos-adapter`, `kototama.bounded-stream`, `kototama.browser`, `kototama.cli` (Kotoba project library) |
 | `kotoba.kotobaVm` | `kotoba.kotobaVm/src` | `kotoba.vm`, `kotoba.vm.evm.calls`, `kotoba.vm.evm.core`, `kotoba.vm.evm.env` (Kotoba project library) |
