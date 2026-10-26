@@ -1,0 +1,125 @@
+(ns kotobase.protocols.router-test
+  (:require [kotoba.lang.edn :as edn]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [kotobase.local :as local]
+            [kotobase.protocols.blocks :as blocks]
+            [kotobase.protocols.json :as json]
+            [kotobase.protocols.router :as router]))
+
+(defn- ctx [] {:store (local/local-store) :now "2026-07-17T00:00:00Z"})
+
+(deftest surface-of
+  (is (= "s3" (router/surface-of "s3.kotobase.net" "kotobase.net")))
+  (is (= "atproto" (router/surface-of "atproto.kotobase.net" "kotobase.net")))
+  (is (nil? (router/surface-of "kotobase.net" "kotobase.net")))
+  (is (nil? (router/surface-of "a.b.kotobase.net" "kotobase.net")))
+  (is (nil? (router/surface-of "s3.example.net" "kotobase.net")))
+  (is (nil? (router/surface-of nil "kotobase.net"))))
+
+(deftest host-based-dispatch
+  (let [c (ctx)]
+    (testing "every protocol subdomain has a no-store health boundary"
+      (doseq [surface ["s3" "ipfs" "atproto" "git"]
+              :let [res (router/handle c {:method :get
+                                          :host (str surface ".kotobase.net")
+                                          :path "/health"})]]
+        (is (= 200 (:status res)))
+        (is (= "no-store" (get-in res [:headers "cache-control"])))
+        (is (str/includes? (:body res) (str ":surface :" surface)))))
+    (testing "s3 subdomain round-trip"
+      (is (= 200 (:status (router/handle c {:method :put :host "s3.kotobase.net"
+                                            :path "/bkt/k" :body "v"}))))
+      (is (= "v" (:body (router/handle c {:method :get :host "s3.kotobase.net"
+                                          :path "/bkt/k"})))))
+    (testing "ipfs subdomain"
+      (blocks/put-block! (:store c) "bafyexample" {:bytes "x" :content-type "text/plain"})
+      (is (= "x" (:body (router/handle c {:method :get :host "ipfs.kotobase.net"
+                                          :path "/ipfs/bafyexample"})))))
+    (testing "atproto subdomain"
+      (is (= 501 (:status (router/handle c {:method :get :host "atproto.kotobase.net"
+                                            :path "/xrpc/does.not.exist"})))))
+    (testing "git subdomain"
+      (is (= 404 (:status (router/handle c {:method :get :host "git.kotobase.net"
+                                            :path "/nope/info/refs"})))))
+    (testing "pinning subdomain (write surface, distinct from read-only ipfs)"
+      (blocks/put-block! (:store c) "bafypinme" {:bytes "x" :content-type "text/plain"})
+      (let [res (router/handle c {:method :post :host "pinning.kotobase.net"
+                                  :path "/pins" :body (json/encode {"cid" "bafypinme"})})]
+        (is (= 202 (:status res)))
+        (is (= "pinned" (get (json/parse (:body res)) "status")))))
+    (testing "issues subdomain (EDN wire format, not JSON)"
+      (let [res (router/handle c {:method :post :host "issues.kotobase.net"
+                                  :path "/gftdcojp/local-manimani/issues"
+                                  :body (pr-str {:title "hello"})})]
+        (is (= 201 (:status res)))
+        (is (= "hello" (:title (edn/read-string (:body res)))))))))
+
+(deftest single-origin-fallback
+  (let [c (ctx)]
+    (is (= 200 (:status (router/handle c {:method :put :host "peer.local"
+                                          :path "/s3/bkt/k" :body "v"})))
+        "/s3/* mounts the S3 surface with the prefix stripped")
+    (is (= "v" (:body (router/handle c {:method :get :host "peer.local"
+                                        :path "/s3/bkt/k"}))))
+    (is (= 501 (:status (router/handle c {:method :get :host "peer.local"
+                                          :path "/xrpc/does.not.exist"}))))
+    (testing "/pins is the spec-native path, mounted unstripped"
+      (blocks/put-block! (:store c) "bafypeerpin" {:bytes "x" :content-type "text/plain"})
+      (let [res (router/handle c {:method :post :host "peer.local" :path "/pins"
+                                  :body (json/encode {"cid" "bafypeerpin"})})]
+        (is (= 202 (:status res)))
+        (is (= "pinned" (get (json/parse (:body res)) "status")))))
+    (testing "/issues/* mounts the issue surface with the prefix stripped"
+      (let [res (router/handle c {:method :post :host "peer.local"
+                                  :path "/issues/gftdcojp/local-manimani/issues"
+                                  :body (pr-str {:title "hi"})})]
+        (is (= 201 (:status res)))))
+    (let [res (router/handle c {:method :get :host "peer.local" :path "/other"})]
+      (is (= 404 (:status res)))
+      (is (str/includes? (:body res) "no protocol surface")))))
+
+(deftest custom-apex
+  (let [c (assoc (ctx) :apex "peer.example")]
+    (is (= 200 (:status (router/handle c {:method :put :host "s3.peer.example"
+                                          :path "/bkt/k" :body "v"}))))))
+
+;; --- injected surfaces (deploy-shell composition) --------------------------
+
+(deftest a-shell-can-add-a-surface-without-this-repo-depending-on-it
+  (testing "the query protocols (sparql/cypher/gremlin) live in their own
+            repositories; the shell that already depends on both composes them"
+    (let [handler (fn [_ctx req] {:status 200 :headers {} :body (str "mine:" (:path req))})
+          ctx {:surfaces {"sparql" handler}}]
+      (testing "by host label"
+        (is (= 200 (:status (router/handle ctx {:method :get :host "sparql.kotobase.net"
+                                                :path "/sparql"})))))
+      (testing "and /health answers for it like any built-in surface"
+        (let [r (router/handle ctx {:method :get :host "sparql.kotobase.net" :path "/health"})]
+          (is (= 200 (:status r)))
+          (is (re-find #":sparql" (:body r))))))))
+
+(deftest an-injected-surface-cannot-shadow-a-built-in
+  (testing "a shell adds surfaces; it does not redefine s3 out from under the
+            router, which would be a silent takeover of a live protocol"
+    (let [evil (fn [_ _] {:status 200 :headers {} :body "hijacked"})
+          r (router/handle {:surfaces {"s3" evil}}
+                           {:method :get :host "s3.kotobase.net" :path "/health"})]
+      (is (not= "hijacked" (:body r))))))
+
+(deftest path-surfaces-mount-on-a-single-origin-without-stripping
+  (testing "these protocols specify absolute paths of their own — SPARQL 1.1
+            Protocol, and Neo4j's /db/data/transaction/commit — so stripping a
+            mount prefix would break the handlers' own path checks"
+    (let [seen (atom nil)
+          handler (fn [_ req] (reset! seen (:path req)) {:status 200 :headers {} :body "ok"})
+          ctx {:surfaces {"cypher" handler}
+               :path-surfaces {"/db/data/" "cypher"}}
+          r (router/handle ctx {:method :post :host "kotobase-protocols-worker.workers.dev"
+                                :path "/db/data/transaction/commit"})]
+      (is (= 200 (:status r)))
+      (is (= "/db/data/transaction/commit" @seen) "path arrives unstripped"))))
+
+(deftest an-unmounted-path-still-falls-through
+  (is (= 404 (:status (router/handle {:surfaces {"sparql" (fn [_ _] {:status 200})}}
+                                     {:method :get :host "example.com" :path "/nope"})))))
