@@ -1,0 +1,174 @@
+(ns aes.gcm-siv
+  "AES-GCM-SIV — [RFC 8452](https://www.rfc-editor.org/rfc/rfc8452) — in portable
+  `.cljc`.
+
+  Nonce-misuse-resistant AEAD: POLYVAL authenticates the plaintext (not the
+  ciphertext), then AES-CTR encrypts with a counter derived from the tag."
+  (:require [aes.core :as aes]
+            [aes.gcm :as gcm]))
+
+(def tag-bytes 16)
+(def key-sizes aes/key-sizes)
+
+(defn- ->bytes [x] (mapv #(bit-and (int %) 0xFF) (seq x)))
+
+(defn- byte-reverse-16 [v] (vec (reverse v)))
+
+(defn- mul-x-ghash-key
+  "RFC 8452 Appendix A: `mulX_GHASH(ByteReverse(H))` for POLYVAL keys."
+  [h]
+  (let [k (byte-reverse-16 h)
+        hi-bit (bit-and (nth k 15) 1)
+        k (vec (loop [carry 0 i 0 acc []]
+                 (if (= i 16)
+                   acc
+                   (let [t (nth k i)
+                         new-b (bit-or (bit-shift-right t 1) carry)
+                         carry (bit-shift-left (bit-and t 1) 7)]
+                     (recur carry (inc i) (conj acc new-b))))))
+        k (if (= hi-bit 1) (update k 0 bit-xor 0xE1) k)]
+    k))
+
+(defn- polyval
+  [h data]
+  (let [gh-key (mul-x-ghash-key h)
+        blocks (map byte-reverse-16 (map vec (partition 16 data)))]
+    (byte-reverse-16
+     (reduce (fn [y block] (gcm/block-mul (mapv bit-xor y block) gh-key))
+             (vec (repeat 16 0))
+             blocks))))
+
+(defn- u32le-bytes [n]
+  (vec (map #(bit-and (bit-shift-right (bit-and n 0xFFFFFFFF) (* 8 %)) 0xFF) (range 4))))
+
+(defn- u64le-bytes [n]
+  (vec (map #(bit-and (bit-shift-right n (* 8 %)) 0xFF) (range 8))))
+
+(defn- length-block [aad-len pt-len]
+  (vec (concat (u64le-bytes (* 8 aad-len)) (u64le-bytes (* 8 pt-len)))))
+
+(defn- pad16 [data]
+  (let [r (mod (count data) 16)]
+    (if (zero? r) (vec data) (into (vec data) (repeat (- 16 r) 0)))))
+
+(defn- derive-block [counter nonce]
+  (vec (concat (u32le-bytes counter) nonce)))
+
+(defn- derive-keys [key nonce]
+  (let [sched (aes/expand-key! key)
+        take8 #(subvec (vec (aes/encrypt-block sched (derive-block % nonce))) 0 8)
+        auth-key (vec (concat (take8 0) (take8 1)))
+        enc-key (if (= 32 (count key))
+                  (vec (concat (take8 2) (take8 3) (take8 4) (take8 5)))
+                  (vec (concat (take8 2) (take8 3))))]
+    {:auth-key auth-key :enc-key enc-key}))
+
+(defn- read-u32le [blk]
+  (bit-and 0xFFFFFFFF
+           (+ (nth blk 0)
+              (bit-shift-left (nth blk 1) 8)
+              (bit-shift-left (nth blk 2) 16)
+              (bit-shift-left (nth blk 3) 24))))
+
+(defn- write-u32le [blk n]
+  (assoc blk
+         0 (bit-and n 0xFF)
+         1 (bit-and (bit-shift-right n 8) 0xFF)
+         2 (bit-and (bit-shift-right n 16) 0xFF)
+         3 (bit-and (bit-shift-right n 24) 0xFF)))
+
+(defn- inc32le [blk]
+  (write-u32le blk (inc (read-u32le blk))))
+
+(defn- siv-ctr [schedule icb data]
+  (if (empty? data)
+    []
+    (loop [cb icb chunks (partition-all 16 data) out (transient [])]
+      (if-let [c (first chunks)]
+        (let [ks (aes/encrypt-block schedule cb)]
+          (recur (inc32le cb) (next chunks)
+                 (reduce conj! out (map bit-xor c ks))))
+        (persistent! out)))))
+
+(defn- compute-tag [enc-sched auth-key nonce aad pt]
+  (let [poly-in (concat (pad16 aad) (pad16 pt) (length-block (count aad) (count pt)))
+        s (polyval auth-key poly-in)
+        s (vec (concat (mapv bit-xor (subvec s 0 12) nonce) (subvec s 12 16)))
+        s (assoc s 15 (bit-and (nth s 15) 0x7F))]
+    (vec (aes/encrypt-block enc-sched s))))
+
+(defn- constant-time= [a b]
+  (and (= (count a) (count b))
+       (zero? (reduce bit-or 0 (map bit-xor a b)))))
+
+(defn- check-params [key nonce]
+  (cond
+    (not (contains? key-sizes (count key)))
+    {:status :error :reason :bad-key-length :length (count key)}
+
+    (not= 12 (count nonce))
+    {:status :error :reason :bad-nonce-length :length (count nonce)}))
+
+(defn seal
+  [key nonce aad pt]
+  (let [key (->bytes key) nonce (->bytes nonce) aad (->bytes aad) pt (->bytes pt)]
+    (or (check-params key nonce)
+        (let [{:keys [auth-key enc-key]} (derive-keys key nonce)
+              enc-sched (aes/expand-key! enc-key)
+              tag (compute-tag enc-sched auth-key nonce aad pt)
+              counter (update tag 15 #(bit-or % 0x80))
+              ct (siv-ctr enc-sched counter pt)]
+          {:status :ok :bytes (into (vec ct) tag) :ciphertext (vec ct) :tag tag}))))
+
+(defn open
+  [key nonce aad sealed]
+  (let [key (->bytes key) nonce (->bytes nonce) aad (->bytes aad) sealed (->bytes sealed)]
+    (or (check-params key nonce)
+        (if (< (count sealed) tag-bytes)
+          {:status :error :reason :too-short-for-a-tag :length (count sealed)}
+          (let [n (- (count sealed) tag-bytes)
+                ct (subvec sealed 0 n)
+                tag (subvec sealed n)
+                {:keys [auth-key enc-key]} (derive-keys key nonce)
+                enc-sched (aes/expand-key! enc-key)
+                counter (update (vec tag) 15 #(bit-or % 0x80))
+                pt (vec (siv-ctr enc-sched counter ct))
+                expected (compute-tag enc-sched auth-key nonce aad pt)]
+            (if (constant-time= tag expected)
+              {:status :ok :bytes pt}
+              {:status :error :reason :authentication-failed}))))))
+
+(defn seal!
+  [key nonce aad pt]
+  (let [r (seal key nonce aad pt)]
+    (if (= :ok (:status r)) (:bytes r)
+        (throw (ex-info (str "aes-gcm-siv: " (name (:reason r))) r)))))
+
+(defn open!
+  [key nonce aad sealed]
+  (let [r (open key nonce aad sealed)]
+    (if (= :ok (:status r)) (:bytes r)
+        (throw (ex-info (str "aes-gcm-siv: " (name (:reason r))) r)))))
+
+#?(:cljs
+   (do
+     (defn- coerce-bytes [x]
+       (cond
+         (instance? js/Uint8Array x) (vec (array-seq x))
+         (sequential? x) (vec (map #(bit-and (int %) 0xFF) x))
+         :else (throw (ex-info "aes-gcm-siv: expected Uint8Array or sequential bytes" {}))))
+
+     (defn- bytes->u8 [xs]
+       (js/Uint8Array.from (clojure.core/into-array (map #(bit-and (int %) 0xFF) xs))))
+
+     (defn gcmsiv
+       "Noble-compatible factory: `(gcmsiv key nonce aad)` returns
+       `#js {:encrypt fn :decrypt fn}` operating on `Uint8Array` values."
+       [key nonce aad]
+       (let [aad-bytes (coerce-bytes (or aad []))]
+         #js {:encrypt (fn [pt]
+                         (bytes->u8 (seal! (coerce-bytes key) (coerce-bytes nonce)
+                                           aad-bytes (coerce-bytes pt))))
+              :decrypt (fn [ct]
+                         (bytes->u8 (open! (coerce-bytes key) (coerce-bytes nonce)
+                                           aad-bytes (coerce-bytes ct))))}))))

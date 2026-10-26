@@ -1,0 +1,163 @@
+(ns aes.core
+  "AES — [FIPS 197](https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.197-upd1.pdf)
+  — the forward cipher only, in portable `.cljc`.
+
+  128, 192 and 256-bit keys. A block is 16 unsigned bytes in and 16 out.
+
+  ## Why there is no decryption here
+
+  GCM, CTR and CCM never invoke the inverse cipher: they encrypt a counter
+  and XOR. Shipping `InvMixColumns` and an inverse key schedule would add a
+  second table, a second round function and a second set of ways to be
+  wrong, for a mode this workspace does not have and cannot currently test
+  against a consumer. `aes.gcm` is what this exists for.
+
+  It is a real absence rather than a hidden one — see the README. If CBC or
+  ECB decryption is ever needed, it is a known, bounded piece of work and
+  not a reason to treat this file as unfinished.
+
+  ## The tables are derived, not transcribed
+
+  The S-box is not a copied 256-byte block. It is computed the way FIPS 197
+  §5.1.1 defines it: the multiplicative inverse in GF(2^8) modulo
+  `x^8 + x^4 + x^3 + x + 1`, then the affine transform. The round constants
+  are successive powers of `x`.
+
+  `org-nist-sha2` made the same choice for the same reason — a hand-copied
+  table of magic numbers invites exactly one failure, a single wrong nibble,
+  and that failure looks like nothing at all until a ciphertext disagrees
+  with the rest of the world.")
+
+;; ── GF(2^8) ──────────────────────────────────────────────────────────────────
+
+(defn- xtime
+  "Multiply by x, reducing modulo the AES polynomial 0x11B."
+  [b]
+  (let [s (bit-shift-left b 1)]
+    (bit-and 0xFF (if (>= s 0x100) (bit-xor s 0x1B) s))))
+
+(defn- gmul
+  "Multiply two elements of GF(2^8). Used for MixColumns and for building the
+  logarithm tables the S-box needs."
+  [a b]
+  (loop [a a b b acc 0]
+    (if (zero? b)
+      acc
+      (recur (xtime a) (bit-shift-right b 1)
+             (if (odd? b) (bit-xor acc a) acc)))))
+
+(def ^:private alog
+  "Powers of 3, a generator of the multiplicative group. `alog` and `log` are
+  inverses, and together they give the multiplicative inverse in one lookup:
+  `inv(x) = alog[255 - log[x]]`."
+  (vec (take 256 (iterate #(gmul % 3) 1))))
+
+(def ^:private logt
+  (reduce (fn [t i] (assoc t (nth alog i) i)) (vec (repeat 256 0)) (range 255)))
+
+(defn- rotl8 [b n] (bit-and 0xFF (bit-or (bit-shift-left b n) (bit-shift-right b (- 8 n)))))
+
+(def ^:private sbox
+  "FIPS 197 §5.1.1. Inverse in GF(2^8), then the affine transform
+  `b ^ (b<<<1) ^ (b<<<2) ^ (b<<<3) ^ (b<<<4) ^ 0x63`."
+  (mapv (fn [x]
+          (let [i (if (zero? x) 0 (nth alog (- 255 (nth logt x))))]
+            (reduce bit-xor 0x63 (map #(rotl8 i %) [0 1 2 3 4]))))
+        (range 256)))
+
+(def ^:private rcon
+  "FIPS 197 §5.2: `Rcon[j]` is `x^(j-1)`, and `j` starts at one.
+
+  Stored zero-indexed, so the call site subtracts. Writing `rcon[j]` instead
+  is the whole bug: every round key after the first is wrong, the cipher is
+  still a permutation, it still round-trips against itself, and it agrees
+  with no other implementation."
+  (vec (take 11 (iterate xtime 1))))
+
+;; ── key schedule ─────────────────────────────────────────────────────────────
+
+(def key-sizes
+  "The three legal key lengths, in bytes. AES has exactly these; a fourth
+  would be a different cipher."
+  #{16 24 32})
+
+(defn- sub-word [w] (mapv #(nth sbox %) w))
+(defn- rot-word [w] (conj (subvec w 1) (nth w 0)))
+
+(defn expand-key
+  "FIPS 197 §5.2. Returns `{:status :ok :round-keys …, :rounds n}`, where
+  `:round-keys` is `16 * (rounds + 1)` bytes — one block per AddRoundKey.
+
+  The number of rounds follows the key: 10, 12 or 14. It is not a parameter,
+  and a caller cannot weaken the cipher by choosing fewer."
+  [key]
+  (let [key (mapv #(bit-and (int %) 0xFF) (seq key))
+        nk (quot (count key) 4)]
+    (if-not (contains? key-sizes (count key))
+      {:status :error :reason :bad-key-length :length (count key)}
+      (let [nr (+ nk 6)
+            total (* 4 (inc nr))
+            ws (loop [ws (mapv vec (partition 4 key)) i nk]
+                 (if (= i total)
+                   ws
+                   (let [prev (nth ws (dec i))
+                         t (cond
+                             (zero? (mod i nk)) (mapv bit-xor
+                                                      (sub-word (rot-word prev))
+                                                      [(nth rcon (dec (quot i nk))) 0 0 0])
+                             (and (> nk 6) (= 4 (mod i nk))) (sub-word prev)
+                             :else prev)]
+                     (recur (conj ws (mapv bit-xor (nth ws (- i nk)) t)) (inc i)))))]
+        {:status :ok :rounds nr :round-keys (vec (apply concat ws))}))))
+
+(defn expand-key!
+  [key]
+  (let [r (expand-key key)]
+    (if (= :ok (:status r)) r
+        (throw (ex-info (str "aes: " (name (:reason r))) r)))))
+
+;; ── the round function ───────────────────────────────────────────────────────
+;;
+;; The state is sixteen bytes in FIPS 197's order: index `4*column + row`.
+;; Every operation below is written against that indexing rather than against
+;; a 4x4 nested structure, because the columns are exactly the key-schedule
+;; words and keeping one layout means AddRoundKey is a plain XOR.
+
+(def ^:private shift-rows-index
+  (vec (for [c (range 4) r (range 4)] (+ (* 4 (mod (+ c r) 4)) r))))
+
+(defn- shift-rows [s] (mapv #(nth s %) shift-rows-index))
+
+(defn- mix-columns [s]
+  (vec (mapcat (fn [c]
+                 (let [[a b d e] (subvec s (* 4 c) (+ 4 (* 4 c)))]
+                   [(bit-xor (gmul a 2) (gmul b 3) d e)
+                    (bit-xor a (gmul b 2) (gmul d 3) e)
+                    (bit-xor a b (gmul d 2) (gmul e 3))
+                    (bit-xor (gmul a 3) b d (gmul e 2))]))
+               (range 4))))
+
+(defn- add-round-key [s rk r]
+  (let [off (* 16 r)]
+    (mapv #(bit-xor (nth s %) (nth rk (+ off %))) (range 16))))
+
+(defn encrypt-block
+  "One forward AES block. `schedule` is the map `expand-key` returns.
+
+  The last round omits MixColumns. That omission is not an optimisation —
+  it is what makes the cipher invertible with a schedule read backwards, and
+  adding it back produces a cipher that encrypts perfectly well and agrees
+  with nothing."
+  [schedule block]
+  (let [{:keys [rounds round-keys]} schedule
+        s (mapv #(bit-and (int %) 0xFF) (seq block))]
+    (loop [s (add-round-key s round-keys 0) r 1]
+      (cond
+        (< r rounds) (recur (-> (mapv #(nth sbox %) s)
+                                shift-rows
+                                mix-columns
+                                (add-round-key round-keys r))
+                            (inc r))
+        :else (-> (mapv #(nth sbox %) s)
+                  shift-rows
+                  (add-round-key round-keys rounds))))))

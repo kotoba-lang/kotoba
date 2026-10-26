@@ -228,6 +228,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.odoh` | `org.ietf.odoh/src` | `odoh.core`, `odoh.wire` (an external specification, publisher ietf.org) |
 | `org.ietf.tcp` | `org.ietf.tcp/src` | `tcp.congestion`, `tcp.options`, `tcp.pacing`, `tcp.pmtu` (an external specification, publisher ietf.org) |
 | `org.ietf.x448` | `org.ietf.x448/src` | `x448.core`, `x448.fp` (an external specification, publisher ietf.org) |
+| `gov.nist.aes` | `gov.nist.aes/src` | `aes.core`, `aes.gcm`, `aes.gcm-siv` (Kotoba project library) |
 | `kotoba.libp2p` | `kotoba.libp2p/src` | `` (Kotoba project library) |
 | `kotoba.kotobaTopology` | `kotoba.kotobaTopology/src` | `` (Kotoba project library) |
 | `kotoba.x402Sdk` | `kotoba.x402Sdk/src` | `` (Kotoba project library) |
