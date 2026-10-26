@@ -1,0 +1,136 @@
+(ns kototama.evm-tender-test
+  "The EVM tender against the transition the spec fixes.
+
+  These mirror the obligations `tender_test.clj` places on the Wasm plane --
+  pre-flight denial, budget as a value, overlay discipline, receipted
+  attempts -- so that 'peer execution plane' means the same contract, not a
+  second contract with the same name."
+  (:require [kotoba.lang.error :as kerror] [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.edn :as edn]
+            [kotoba.io :as io]
+            [kototama.evm-tender :as evm-tender]))
+
+(defn- hex [s]
+  (vec (for [i (range 0 (count s) 2)] (Integer/parseInt (subs s i (+ i 2)) 16))))
+
+;; PUSH1 6, PUSH1 7, MUL, PUSH1 0, MSTORE, PUSH1 32, PUSH1 0, RETURN
+(def mul-return (hex "600660070260005260206000f3"))
+(def revert-code (hex "60006000fd"))
+(def invalid-code (hex "0c"))
+;; PUSH1 1, PUSH1 0, SSTORE  -- writes slot 0, then stops
+(def sstore-code (hex "6001600055"))
+;; SSTORE then REVERT: the write must not survive
+(def sstore-then-revert (hex "600160005560006000fd"))
+;; JUMPDEST; PUSH1 0; JUMP -- an unbounded loop, to exhaust the budget
+(def infinite-loop (hex "5b600056"))
+
+(deftest a-normal-run-commits-and-reports-gas-spent
+  (let [r (evm-tender/run mul-return)]
+    (is (:ok? r))
+    (is (= :halted (:status r)))
+    (is (pos? (:gas-used r)) "gas-used is a spend, not the remaining budget")
+    (is (< (:gas-used r) (:gas-limit r)))
+    (is (= :committed (get-in r [:receipt :outcome :overlay])))))
+
+(deftest budget-exhaustion-is-a-value-not-a-throw
+  (testing "the spec forbids an uncatchable host trap for resource exhaustion"
+    ;; Straight-line exhaustion: PUSH1 costs 3, so a budget of 2 runs out on
+    ;; the first instruction. Deliberately NOT the unbounded loop below -- a
+    ;; loop only exhausts a budget if JUMP transfers control, so a loop-based
+    ;; exhaustion test silently becomes a no-op when it does not, which is
+    ;; exactly what kotoba-vm #11 found.
+    (let [r (evm-tender/run mul-return {:gas 2})]
+      (is (map? r) "returned rather than threw")
+      (is (false? (:ok? r)))
+      (is (= :invalid (:status r)))
+      (is (= :discarded (get-in r [:receipt :outcome :overlay])))
+      (is (= "out of gas" (get-in r [:receipt :outcome :reason]))
+          "refused for the reason it names, not incidentally"))))
+
+(deftest an-unbounded-loop-exhausts-the-budget
+  ;; Requires kotoba-vm #11 (JUMP transferred control nowhere before it), so
+  ;; this asserts the pinned dependency actually carries that fix rather than
+  ;; assuming it. If the pin is behind, this reports :stopped and fails --
+  ;; which is the correct thing for it to do.
+  (let [r (evm-tender/run infinite-loop {:gas 5000})]
+    (is (= :invalid (:status r)))
+    (is (= "out of gas" (get-in r [:receipt :outcome :reason])))))
+
+(deftest revert-discards-the-overlay
+  (let [wrote (evm-tender/run sstore-code)
+        reverted (evm-tender/run sstore-then-revert)]
+    (is (seq (:storage wrote)) "the plain SSTORE run does publish a write")
+    (is (empty? (:storage reverted))
+        "the reverted run must not publish the write it made")
+    (is (= (get-in reverted [:receipt :state-before])
+           (get-in reverted [:receipt :state-after]))
+        "a discarded overlay leaves state-after equal to state-before")))
+
+(deftest an-ungranted-request-is-rejected-before-any-bytecode-runs
+  (is (thrown-with-msg?
+       kerror/ExceptionInfo #"rejected by contract"
+       (evm-tender/open-session mul-return {:grants #{:no-such-capability}}))))
+
+(deftest an-invalid-budget-is-refused-before-any-bytecode-runs
+  (doseq [bad [0 -1 nil "30000000"]]
+    (is (thrown-with-msg?
+         kerror/ExceptionInfo #"budget must be a positive integer"
+         (evm-tender/open-session mul-return {:gas bad}))
+        (str "budget " (pr-str bad) " must be refused"))))
+
+(deftest every-attempt-is-receipted-including-failed-ones
+  (testing ":attempt-always-receipted true"
+    (doseq [[label code] [["ok" mul-return] ["revert" revert-code]
+                          ["invalid" invalid-code]]]
+      (let [r (evm-tender/run code)]
+        (is (map? (:receipt r)) (str label " produced a receipt"))
+        (is (= :kototama.vm/receipt-v1 (get-in r [:receipt :schema])) label)))))
+
+(deftest the-receipt-carries-every-required-key
+  (let [spec (edn/read-string (slurp (io/file "lib/kotoba.kototama/spec/kototama-vm-v1.edn")))
+        required (set (get-in spec [:receipt :required]))
+        sub-required (set (get-in spec [:receipt :authority-decision]))
+        r (:receipt (evm-tender/run mul-return))]
+    (is (seq required) "the spec actually declared required keys")
+    (is (empty? (remove #(contains? r %) required))
+        (str "missing: " (vec (remove #(contains? r %) required))))
+    (is (empty? (remove #(contains? (:authority-decision r) %) sub-required))
+        (str "missing from :authority-decision: "
+             (vec (remove #(contains? (:authority-decision r) %) sub-required))))))
+
+(deftest the-receipt-omits-every-forbidden-key
+  (let [spec (edn/read-string (slurp (io/file "lib/kotoba.kototama/spec/kototama-vm-v1.edn")))
+        forbidden (set (get-in spec [:receipt :forbidden]))
+        r (:receipt (evm-tender/run mul-return))]
+    (is (seq forbidden) "the spec actually declared forbidden keys")
+    (doseq [k forbidden]
+      (is (not (contains? r k)) (str "receipt must not carry " k)))))
+
+(deftest identity-is-stable-and-discriminating
+  (testing "same program and message -> same cids"
+    (is (= (:receipt (evm-tender/run mul-return))
+           (:receipt (evm-tender/run mul-return)))))
+  (testing "different calldata is a different message, same program"
+    (let [a (:receipt (evm-tender/run mul-return {:calldata [1]}))
+          b (:receipt (evm-tender/run mul-return {:calldata [2]}))]
+      (is (= (:program-cid a) (:program-cid b)))
+      (is (not= (:message-cid a) (:message-cid b)))))
+  (testing "different program is a different program-cid"
+    (is (not= (:program-cid (:receipt (evm-tender/run mul-return)))
+              (:program-cid (:receipt (evm-tender/run revert-code)))))))
+
+(deftest the-gas-mapping-is-named-and-versioned
+  (testing "the spec requires a mapping be identified, not implied"
+    (let [m evm-tender/gas-mapping
+          r (:receipt (evm-tender/run mul-return))]
+      (is (qualified-keyword? (:mapping/id m)))
+      (is (integer? (:mapping/version m)))
+      (is (false? (:mapping/ethereum-gas-equality m))
+          "equality with Ethereum mainnet gas is explicitly NOT claimed")
+      (is (= (:mapping/id m) (get-in r [:implementation :gas-mapping]))
+          "the receipt cites the mapping it was produced under"))))
+
+(deftest the-exit-code-is-the-fvm-mapping-not-an-ad-hoc-one
+  (is (= 0 (get-in (:receipt (evm-tender/run mul-return)) [:outcome :exit-code])))
+  (is (= 33 (get-in (:receipt (evm-tender/run revert-code)) [:outcome :exit-code]))
+      "FIP-0054 EVM_CONTRACT_REVERTED"))

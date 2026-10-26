@@ -1,0 +1,129 @@
+(ns kototama.core-test
+  "Contract tests for the kototama common organism/cell library."
+  (:require [kotoba.lang.error :as kerror] [kotoba.test :refer [deftest is testing run-tests]]
+            [kototama.kotoba :as kt]
+            [kototama.cell :as cell]
+            [kototama.life :as life]
+            [kototama.gates :as gates]
+            [kototama.leash :as leash]
+            [kototama.emit :as emit]
+            [kototama.organism :as org]))
+
+;; ───────────────────────── kotoba substrate ─────────────────────────
+
+(deftest content-addressed-append-only
+  (let [c (kt/connect)]
+    (kt/transact c [[:db/add "e1" :a 1]])
+    (kt/transact c [[:db/add "e1" :a 2]])
+    (is (= 2 (count (kt/log c))))
+    (is (= 2 (get-in (kt/db c) ["e1" :a])) "later datom wins")
+    (is (= 1 (get-in (kt/as-of c 1) ["e1" :a])) "as-of replays to tx 1")
+    (is (:ok? (kt/verify-chain c)) "chain verifies")))
+
+(deftest idempotent-by-content
+  (let [c (kt/connect)
+        tx (kt/make-tx [[:db/add "e" :a 1]] {:prev nil})]
+    (kt/append-tx! c tx)
+    (let [r (kt/append-tx! c tx)]
+      (is (false? (:appended? r)) "re-appending identical head tx is a no-op"))
+    (is (= 1 (count (kt/log c))))))
+
+(deftest tamper-evident
+  (let [c (kt/connect)]
+    (kt/transact c [[:db/add "e" :a 1]])
+    (kt/transact c [[:db/add "e" :a 2]])
+    (swap! c update-in [:log 0 :tx/datoms] conj [:db/add "e" :a 99]) ; tamper
+    (is (false? (:ok? (kt/verify-chain c))) "mutated tx fails verify")
+    (is (= :cid-mismatch (:reason (kt/verify-chain c))))))
+
+;; ───────────────────────── cell ─────────────────────────
+
+(deftest cell-is-pure-transformer
+  (let [c (cell/register! (cell/cell :inc (fn [s] (update s :n inc))))]
+    (is (= {:n 1} (cell/run :inc {:n 0})))
+    (is (= {:n 6} (cell/run c {:n 5})))
+    (is (thrown? kerror/ExceptionInfo (cell/run :nope {})))))
+
+;; ───────────────────────── life ─────────────────────────
+
+(deftest mood-and-metabolism-fold-from-log
+  (let [c (kt/connect)]
+    (kt/transact c [[:db/add "x" :organism/event :event/flourishing]
+                    [:db/add "x" :organism/event :event/served]])
+    (is (= :flourishing (life/fold-mood c)))
+    (kt/transact c [[:db/add "y" :organism/intake 10]
+                    [:db/add "y" :organism/dissipation 4]
+                    [:db/add "y" :organism/exported 8]
+                    [:db/add "y" :organism/consumed 8]])
+    (let [m (life/metabolism c)]
+      (is (= 6 (:phi m)))
+      (is (= 1.0 (:eta m)))
+      (is (false? (life/net-taker? c)) "η ≥ 1.0 → not a net taker"))))
+
+;; ───────────────────────── leash ─────────────────────────
+
+(deftest leash-validity-and-attribution
+  (let [l (leash/leash {:member-did "did:plc:alice" :capability "datom:transact"
+                        :graph "kyoninka" :exp 1000 :cacao-b64 "opaque"})]
+    (is (leash/valid? l 999))
+    (is (not (leash/valid? l 1001)) "expired")
+    (is (not (leash/valid? l 0 {:need-graph "other"})) "wrong graph scope")
+    (is (= "did:plc:alice" (leash/write-author l)))
+    (is (leash/revoked? nil 0) "absent leash is revoked")))
+
+;; ───────────────────────── emit ─────────────────────────
+
+(deftest emit-never-published-member-attributed
+  (let [l (leash/leash {:member-did "did:plc:bob" :capability "datom:transact"
+                        :graph "kyoninka" :exp 1000 :cacao-b64 "x"})
+        rec (emit/post-record {:text "hello world" :actor-did "did:web:...:kyoninka"
+                               :mood :steady :created-at "2026-06-28T00:00:00Z"})
+        env (emit/envelope rec l {:target :app-aozora :now 0})]
+    (is (= :dry-run (:status env)) "never :published from the lib")
+    (is (true? (:requiresMemberSignature env)))
+    (is (false? (:serverHeldKey env)) "no custodial key")
+    (is (= "did:plc:bob" (:writeAuthor env)) "attributed to consenting member")
+    (is (= "https://bsky.social" (:pds env)) "app-aozora target"))
+  (testing "content safety preserved under autonomy"
+    (is (thrown? kerror/ExceptionInfo
+                 (emit/post-record {:text "how to manipulate a child" :created-at "t"})))
+    (is (thrown? kerror/ExceptionInfo
+                 (emit/post-record {:text (apply str (repeat 301 "x")) :created-at "t"}))))
+  (testing "no valid leash → cannot publish autonomously"
+    (is (thrown? kerror/ExceptionInfo
+                 (emit/envelope {:$type "app.bsky.feed.post" :text "hi"} nil {:now 0})))))
+
+;; ───────────────────────── organism heartbeat ─────────────────────────
+
+(def alice-leash
+  (leash/leash {:member-did "did:plc:alice" :capability "datom:transact"
+                :graph "demo" :exp 9999999999 :cacao-b64 "opaque"}))
+
+(deftest beat-folds-mood-and-publishes-when-leashed
+  (let [o (org/organism
+            {:id "demo" :leash alice-leash :baseline 3
+             :decide (fn [_] {:events [:event/served] :act? true
+                              :post-text "served a request"})})
+        r (org/beat o {:now 1 :created-at "2026-06-28T00:00:00Z"})]
+    (is (= :flourishing (:mood r)) "baseline 3 → flourishing")
+    (is (some? (:envelope r)) "leashed + act? → an envelope")
+    (is (= :dry-run (get-in r [:envelope :status])))
+    (is (true? (:appended? r)) "the beat persisted events")))
+
+(deftest beat-refuses-publication-without-leash
+  (let [o (org/organism {:id "noleash"
+                         :decide (fn [_] {:events [] :act? true :post-text "hi"})})
+        r (org/beat o {:now 1})]
+    (is (nil? (:envelope r)) "no leash → no envelope (publication refused)")))
+
+(deftest beat-is-idempotent-when-nothing-changes
+  (let [o (org/organism {:id "quiet" :decide (fn [_] {:events [] :act? false})})
+        r1 (org/beat o {:now 1})
+        r2 (org/beat o {:now 1})]
+    (is (false? (:appended? r1)) "no events, no act → nothing persisted")
+    (is (false? (:appended? r2)))
+    (is (= 0 (count (kt/log (:conn o)))) "log stays empty (idempotent)")))
+
+(defn -main [& _]
+  (let [{:keys [fail error]} (run-tests 'kototama.core-test)]
+    (when (pos? (+ (or fail 0) (or error 0))) (System/exit 1))))

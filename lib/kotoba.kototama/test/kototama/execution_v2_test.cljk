@@ -1,0 +1,231 @@
+(ns kototama.execution-v2-test
+  #?(:cljs (:require [cljs.test :refer [deftest is testing]]
+            [kototama.execution-v2 :as host]
+            [kototama.execution-ledger :as ledger]
+            [kotoba.verifier.signing :as signing]
+            [kotoba.artifact.execution :as blocks]
+            [kotoba.core.execution :as execution]
+            [kotoba.abi.target :as target]
+            [grant.execution-v2 :as grant]
+            ["node:fs" :as fs] ["node:os" :as os] ["node:path" :as path])))
+
+#?(:cljs
+   (do
+(defn refused? [f] (try (f) false (catch :default _ true)))
+(defn trust [key]
+  {:format :kotoba.trust/v1 :trusted-signers #{(:signer key)}
+   :revoked-signers #{} :revoked-artifacts #{}})
+(def authority (signing/generate-keypair))
+(def executor (signing/generate-keypair))
+(def cid (:cid (blocks/block :policy {:policy :fixture})))
+(defn fixture [target-id]
+  (let [now (atom 1000) epoch (atom 1) revoked (atom #{}) calls (atom [])
+        directory (fs/mkdtempSync (path/join (os/tmpdir) "kotoba-v2-"))
+        _ (fs/chmodSync directory 448)
+        input (blocks/block :input {:arg 7})
+        invocation (grant/issue-invocation (apply str (repeat 64 "a")))
+        context {:target target-id :profile :sync :artifact-cid cid :interface-cid cid
+                 :runtime-identity cid
+                 :layout (if (= :component (:family (get target/profiles target-id)))
+                           {:component-cid cid :wit-world-cid cid :wasi-version "0.3.0"}
+                           (cond-> (:layout (get target/profiles target-id))
+                           (seq (:context-versions (get target/profiles target-id))) (assoc :context-version 11)))}
+        binding (blocks/binding-block target-id :sync cid cid cid (:layout context))
+        intent (blocks/intent-block binding context
+                 (assoc (zipmap execution/execution-intent-keys (repeat cid))
+                        :format :kotoba.execution-intent/v2 :profile-binding-cid (:cid binding)
+                        :input-cid (:cid input) :invocation-cid (:cid invocation) :grant-cids [cid] :approval-cids []))
+        plan {:format :kotoba.plan/v1 :plan-cid cid :code-closure-cid cid :artifact-cid cid
+              :compiler-contract cid :requested-effects #{:audit/append} :requested-resources #{cid}
+              :input-cid (:cid input) :budget {}}
+        decision {:format :kotoba.policy-decision/v1 :decision-cid cid :plan-cid cid
+                  :policy-cid cid :db-basis cid :result :permit :reasons []
+                  :issued-at "1970-01-01T00:00:00Z" :expires-at "1970-01-01T00:01:00Z"}
+        permissions {cid {:grant-cid cid :resource-cid cid :purpose :audit/append
+                          :expires-at "1970-01-01T00:01:00Z" :max-uses 2
+                          :transfer :non-transferable :max-delegation-depth 0}}
+        request {:capability-cid cid :resource-cid cid :purpose :audit/append
+                 :expires-at "1970-01-01T00:01:00Z" :uses 1 :transfer :non-transferable
+                 :delegation-depth 0}
+        issuance {:intent intent :invocation invocation :plan plan :decision decision :permissions permissions
+                  :requested [request] :now-iso "1970-01-01T00:00:01Z"}
+        lease (first (grant/issue-leases issuance))
+        window {:audience "fixture-host" :not-before 0 :expires 60000 :epoch 1}
+        packet {:artifact :actual-artifact-fixture :runtime :actual-runtime-fixture
+                :binding binding :intent intent :invocation invocation :input input
+                :authorization (host/attest :intent intent authority window)
+                :leases [{:block lease :attestation (host/attest :lease lease authority window)}]}
+        configuration {:inspect! (fn [a r]
+                                   (when-not (= [a r] [:actual-artifact-fixture :actual-runtime-fixture])
+                                     (throw (ex-info "not inspected" {}))) context)
+                       :execute! (fn [{:keys [call! input]}]
+                                   (call! [cid cid :audit/append] input) 42)
+                       :providers {[cid cid :audit/append] #(swap! calls conj %)}
+                       :ledger! (ledger/open-ledger! directory) :epoch! #(deref epoch)
+                       :clock! #(deref now) :audience "fixture-host"
+                       :authority-trust (trust authority) :executor-trust (trust executor)
+                       :executor-key executor :revoked-cids! #(deref revoked)}]
+    {:host configuration :packet packet :issuance issuance :window window
+     :calls calls :now now :epoch epoch :revoked revoked :directory directory}))
+(defn clean! [f] (fs/rmSync (:directory f) #js {:recursive true :force true}))
+
+(deftest authority-issuance-never-widens-the-permit
+  (let [f (fixture :js-kotoba-v1) issuance (:issuance f)]
+    (try
+      (is (= 1 (count (grant/issue-leases issuance))))
+      (doseq [[k v] [[:uses 3] [:resource-cid (:cid (blocks/block :input :other))]
+                     [:purpose :other] [:delegation-depth 1] [:transfer :transferable]
+                     [:expires-at "1970-01-01T00:01:01Z"]]]
+        (is (refused? #(grant/issue-leases (assoc-in issuance [:requested 0 k] v)))))
+      (is (refused? #(grant/issue-leases (assoc-in issuance [:decision :result] :deny))))
+      (is (refused? #(grant/issue-leases (assoc issuance :requested (vec (repeat 2 (first (:requested issuance))))))))
+      (doseq [date ["2026-02-30T00:00:00Z" "invalid" "1970-01-01T00:00:01+00:00"]]
+        (is (nil? (grant/instant-ms date))))
+      (finally (clean! f)))))
+
+(deftest each-physical-profile-admits-authenticated-closed-packets
+  ;; Fixture mechanisms prove admission contract coverage, not physical target qualification.
+  (doseq [target-id (keys target/profiles)]
+    (let [f (fixture target-id)]
+      (try
+        (let [result (host/run! (:host f) (:packet f))]
+          (is (= {:status :ok :value 42} (blocks/verify-block :outcome (:outcome result))))
+          (is (= result (host/verify-completion! (:host f) (:intent (:packet f)) result)))
+          (is (= 1 (count @(:calls f))))
+          (is (refused? #(host/run! (:host f) (:packet f))))
+          (is (refused? #(host/verify-completion! (:host f) (:intent (:packet f))
+                             (assoc result :outcome (blocks/block :outcome {:value 43}))))))
+        (finally (clean! f))))))
+
+(deftest forged-expired-revoked-cross-role-and-cross-target-refuse-before-effect
+  (doseq [mutation [(fn [f] (update (:packet f) :authorization assoc :signature "fake"))
+                    (fn [f] (update (:packet f) :authorization assoc :audience "another"))
+                    (fn [f] (update (:packet f) :authorization assoc :epoch 2))
+                    (fn [f] (assoc (:packet f) :input (blocks/block :input {:arg 8})))
+                    (fn [f] (assoc (:packet f) :artifact :uninspected))
+                    (fn [f] (assoc (:packet f) :authorization
+                                   (host/attest :intent (:intent (:packet f)) executor (:window f))))
+                    (fn [f] (swap! (:now f) (constantly 60000)) (:packet f))
+                    (fn [f] (swap! (:epoch f) inc) (:packet f))
+                    (fn [f] (swap! (:revoked f) conj (:cid (:intent (:packet f)))) (:packet f))
+                    (fn [f] (update-in (:packet f) [:leases 0 :block] assoc :verified true))]]
+    (let [f (fixture :js-kotoba-v1)]
+      (try (is (refused? #(host/run! (:host f) (mutation f))))
+           (is (empty? @(:calls f)))
+           (finally (clean! f))))))
+
+(deftest durable-ledger-prevents-restart-replay-and-refreshes-live-authority
+  (let [f (fixture :wasm32-kotoba-v1)]
+    (try
+      (let [admission (host/admit! (:host f) (:packet f))
+            call! (:call! admission)]
+        (call! [cid cid :audit/append] :first)
+        (is (refused? #(call! [cid cid :audit/append] :second)))
+        (is (refused? #(call! [cid cid :other] :unscoped)))
+        (is (refused? #(host/admit! (assoc (:host f) :ledger! (ledger/open-ledger! (:directory f))) (:packet f))))
+        (is (= [:first] @(:calls f))))
+      (finally (clean! f))))
+  (doseq [change [(fn [f] (swap! (:epoch f) inc))
+                 (fn [f] (reset! (:now f) 60000))
+                 (fn [f] (swap! (:revoked f) conj (:cid (:block (first (:leases (:packet f)))))))]]
+    (let [f (fixture :js-kotoba-v1)]
+      (try (let [admission (host/admit! (:host f) (:packet f))]
+             (change f)
+             (is (refused? #((:call! admission) [cid cid :audit/append] :late)))
+             (is (empty? @(:calls f))))
+           (finally (clean! f))))))
+
+(deftest ledger-lock-corruption-and-clock-rollback-fail-closed
+  (let [f (fixture :js-kotoba-v1)]
+    (try
+      (fs/mkdirSync (path/join (:directory f) "execution-v2.lock"))
+      (is (refused? #(host/admit! (:host f) (:packet f))))
+      (fs/rmdirSync (path/join (:directory f) "execution-v2.lock"))
+      (let [admission (host/admit! (:host f) (:packet f))]
+        (reset! (:now f) 999)
+        (is (refused? #((:call! admission) [cid cid :audit/append] :rollback)))
+        (reset! (:now f) 1000)
+        (fs/writeFileSync (path/join (:directory f) "execution-v2.json") "{}" #js {:mode 384})
+        (is (refused? #((:call! admission) [cid cid :audit/append] :corrupt))))
+      (is (empty? @(:calls f)))
+      (finally (clean! f)))))
+
+
+(defn reissue [f invocation input]
+  (let [packet (:packet f)
+        descriptor (assoc (blocks/verify-block :intent (:intent packet))
+                          :invocation-cid (:cid invocation) :input-cid (:cid input))
+        intent (blocks/block :intent descriptor)
+        old-lease (blocks/verify-block :lease (:block (first (:leases packet))))
+        lease (blocks/lease-block intent (assoc old-lease :execution-identity-cid (:cid intent)))]
+    (assoc packet :intent intent :invocation invocation :input input
+           :authorization (host/attest :intent intent authority (:window f))
+           :leases [{:block lease :attestation (host/attest :lease lease authority (:window f))}])))
+
+(deftest invocation-cannot-fork-but-a-fresh-invocation-can-run-at-the-same-basis
+  (let [f (fixture :js-kotoba-v1)]
+    (try
+      (let [first-admission (host/admit! (:host f) (:packet f))
+            fork (reissue f (:invocation (:packet f)) (blocks/block :input {:arg 8}))
+            fresh (reissue f (grant/issue-invocation (apply str (repeat 64 "b"))) (:input (:packet f)))]
+        (is (refused? #(host/admit! (:host f) fork)))
+        (is (empty? @(:calls f)))
+        (let [admission (host/admit! (:host f) fresh)]
+          ((:call! admission) [cid cid :audit/append] :fresh)
+          (is (= [:fresh] @(:calls f)))
+          ((:close! admission))
+          (is (refused? #((:call! admission) [cid cid :audit/append] :closed))))
+        ((:close! first-admission)))
+      (finally (clean! f)))))
+
+(deftest referenced-authority-revocation-and-provider-traps-are-fenced
+  (let [f (fixture :js-kotoba-v1)]
+    (try (let [admission (host/admit! (:host f) (:packet f))]
+           (swap! (:revoked f) conj cid)
+           (is (refused? #((:call! admission) [cid cid :audit/append] :revoked-policy)))
+           (is (empty? @(:calls f))))
+         (finally (clean! f))))
+  (let [f (fixture :js-kotoba-v1)]
+    (try
+      (let [configuration (assoc-in (:host f) [:providers [cid cid :audit/append]]
+                                    (fn [_] (throw (ex-info "provider trapped" {}))))
+            result (host/run! configuration (:packet f))
+            journal (js->clj (js/JSON.parse (fs/readFileSync (path/join (:directory f) "execution-v2.json") "utf8")) :keywordize-keys true)]
+        (is (= :trap (:status (blocks/verify-block :outcome (:outcome result)))))
+        (is (= 0 (get-in journal [:entries 0 :leases 0 :uses])))
+        (is (refused? #(host/run! configuration (:packet f)))))
+      (finally (clean! f)))))
+))
+
+(deftest execution-handoff-scopes-are-derived-from-admitted-leases
+  (let [f (fixture :wasm32-kotoba-v1) seen (atom nil)
+        expected (set (map #((juxt :capability-cid :resource-cid :purpose) %)
+                           (get-in f [:issuance :requested])))
+        configured (assoc (:host f) :execute! (fn [request] (reset! seen request) 42))]
+    (try
+      (is (refused? #(host/run! configured (assoc (:packet f) :scopes expected))))
+      (host/run! configured (:packet f))
+      (is (= expected (:scopes @seen)))
+      (is (refused? #((:call! @seen) (first expected) :after-completion)))
+      (is (empty? @(:calls f)))
+      (finally (clean! f)))))
+
+(deftest admitted-input-is-decoded-once-before-runtime-handoff
+  (let [f (fixture :aarch64-macos-kotoba-v1) seen (atom nil) decoded (atom [])
+        verify blocks/verify-block
+        configured (assoc (:host f) :execute!
+                          (fn [{:keys [input call!]}]
+                            (reset! seen input)
+                            (call! [cid cid :audit/append] input)
+                            42))]
+    (try
+      (with-redefs [blocks/verify-block
+                    (fn [kind block]
+                      (let [value (verify kind block)]
+                        (when (= :input kind) (swap! decoded conj value))
+                        value))]
+        (host/run! configured (:packet f)))
+      (is (= 1 (count @decoded)))
+      (is (identical? (first @decoded) @seen))
+      (is (identical? @seen (first @(:calls f))))
+      (finally (clean! f)))))

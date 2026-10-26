@@ -1,0 +1,86 @@
+(ns test-component-v2
+  (:require [kototama.component-platform :as platform] [kototama.execution-v2 :as v2]
+            [kototama.execution-ledger :as ledger] [kotoba.abi.component :as abi]
+            [kotoba.core.execution :as core] [kotoba.artifact.execution :as blocks]
+            [grant.execution-v2 :as issuer] [kotoba.verifier.signing :as signing]
+            [kotoba.bytes :as bytes] [multiformats.core :as mf]
+            ["node:fs" :as fs] ["node:path" :as path] ["node:os" :as os]
+            ["node:crypto" :as crypto] ["node:child_process" :as process]))
+(def engine (first *command-line-args*))
+(def assembler (second *command-line-args*))
+(when-not (and engine assembler (path/isAbsolute engine) (path/isAbsolute assembler))
+  (throw (ex-info "usage: test-component-v2.cljk ABS_WASMTIME ABS_WASM_TOOLS" {})))
+(def directory (fs/mkdtempSync (path/join (os/tmpdir) "kotoba-component-v2-")))
+(fs/chmodSync directory 448)
+(defn file [name] (path/join directory name))
+(defn command! [command args]
+  (let [r (process/spawnSync command (clj->js args) #js {:encoding "utf8" :timeout 10000 :maxBuffer 65536})]
+    (when-not (= 0 (.-status r)) (throw (ex-info "Component mechanism failed" {:error (.-stderr r)})))
+    (.-stdout r)))
+(defn digest [file] (-> (crypto/createHash "sha256") (.update (fs/readFileSync file)) (.digest "hex")))
+(defn trust [key] {:format :kotoba.trust/v1 :trusted-signers #{(:signer key)} :revoked-signers #{} :revoked-artifacts #{}})
+(try
+  (fs/writeFileSync (file "answer.wat") "(component (core module $m (func (export \"run\") (result i64) i64.const 42)) (core instance $i (instantiate $m)) (func $run (result s64) (canon lift (core func $i \"run\"))) (export \"run\" (func $run)))")
+  (command! assembler ["parse" (file "answer.wat") "-o" (file "answer.wasm")])
+  (let [component-bytes (fs/readFileSync (file "answer.wasm"))
+        component-cid (str (mf/cidv1-raw component-bytes))
+        ref (:cid (blocks/block :input {}))
+        world {:target :wasm-component-kotoba-v1 :profile :sync :wasi-version abi/wasi-version
+               :imports #{} :exports #{:app/run} :grants #{} :provider-bindings {} :abilities {}
+               :runtime-bindings {} :ambient-wasi false :budgets {:fuel 1024 :memory-pages 1}
+               :identity {:component-cid component-cid :package-lock-cid ref :definition-cids #{ref}}}
+        wit-cid (str (mf/cidv1-raw (bytes/utf8-bytes (abi/world-wit []))))
+        artifact {:format :kotoba.component-execution-artifact/v2 :component-cid component-cid :world world}
+        runtime {:format :kotoba.component-test-runtime/v2 :engine-sha256 (digest engine)
+                 :version (command! engine ["--version"]) :ambient-wasi false}
+        context {:target (:target world) :profile :sync :artifact-cid (:cid (blocks/block :artifact-envelope artifact))
+                 :interface-cid (:cid (blocks/block :interface {:format :kotoba.component-interface/v2
+                                                              :imports #{} :exports #{:app/run} :wit-world-cid wit-cid}))
+                 :runtime-identity (:cid (blocks/block :runtime runtime))
+                 :layout {:component-cid component-cid :wit-world-cid wit-cid :wasi-version abi/wasi-version}}
+        binding (blocks/binding-block (:target context) :sync (:artifact-cid context) (:interface-cid context)
+                                       (:runtime-identity context) (:layout context))
+        invocation (issuer/issue-invocation (-> (crypto/randomBytes 32) (.toString "hex")))
+        input (blocks/block :input {})
+        intent (blocks/intent-block binding context
+                 (assoc (zipmap core/execution-intent-keys (repeat ref))
+                        :format :kotoba.execution-intent/v2 :artifact-cid (:artifact-cid context)
+                        :runtime-identity (:runtime-identity context) :profile-binding-cid (:cid binding)
+                        :invocation-cid (:cid invocation) :input-cid (:cid input) :grant-cids [] :approval-cids []))
+        authority (signing/generate-keypair) executor (signing/generate-keypair)
+        now (js/Date.now) window {:audience "component-fixture" :not-before now :expires (+ now 60000) :epoch 1}
+        calls (atom 0)
+        host {:inspect! (fn [a r] (when-not (and (= a artifact) (= r runtime) (= (:engine-sha256 r) (digest engine)))
+                                   (throw (ex-info "unmeasured Component mechanism" {}))) context)
+              :execute! (fn [_] (throw (ex-info "use explicit Component linker" {}))) :providers {}
+              :ledger! (ledger/open-ledger! directory) :clock! #(js/Date.now) :epoch! (constantly 1)
+              :audience "component-fixture" :authority-trust (trust authority) :executor-trust (trust executor)
+              :executor-key executor :revoked-cids! (constantly #{})}
+        packet {:artifact artifact :runtime runtime :binding binding :intent intent :invocation invocation
+                :input input :authorization (v2/attest :intent intent authority window) :leases []}
+        linker (fn [{:keys [component-bytes budgets]}]
+                 (when-not (= component-cid (str (mf/cidv1-raw component-bytes)))
+                   (throw (ex-info "Component substitution" {})))
+                 (fs/writeFileSync (file "admitted.wasm") component-bytes #js {:mode 384})
+                 (swap! calls inc)
+                 (command! engine ["run" "-C" "cache=n" "-S" "cli=n" "-W"
+                                   (str "fuel=" (:fuel budgets) ",max-memory-size=" (* 65536 (:memory-pages budgets)))
+                                   "--invoke" "run()" (file "admitted.wasm")]))
+        admitted (platform/admit-and-link-v2! world host packet component-bytes linker)
+        _ ((:close! (:admission admitted)))
+        _ (when-not (= "42\n" (:linked admitted)) (throw (ex-info "Component result mismatch" {})))
+        outcome (blocks/block :outcome {:status :ok :value 42})
+        receipt (blocks/block :receipt {:format :kotoba.execution-receipt/v2 :intent-cid (:cid intent)
+                                        :profile-binding-cid (:cid binding) :artifact-cid (:artifact-cid context)
+                                        :runtime-identity (:runtime-identity context) :outcome-cid (:cid outcome)
+                                        :status :ok :sequence 0})
+        completed (blocks/complete-identity intent outcome [receipt])
+        result {:outcome outcome :receipts [{:block receipt :attestation (v2/attest :receipt receipt executor window)}]
+                :identity completed :attestation (v2/attest :identity completed executor window)}]
+    (v2/verify-completion! host intent result)
+    (let [denied? (try (platform/admit-and-link-v2! (assoc-in world [:budgets :fuel] 2048)
+                                                  host packet component-bytes linker) false
+                       (catch :default _ true))]
+      (when-not (and denied? (= 1 @calls)) (throw (ex-info "world widening reached Component engine" {}))))
+    (println {:target (:target world) :result 42 :identity (:cid completed) :world-widening-denied true :ambient-wasi false}))
+  (finally (fs/rmSync directory #js {:recursive true :force true})))

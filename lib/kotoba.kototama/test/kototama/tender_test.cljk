@@ -1,0 +1,1636 @@
+(ns kototama.tender-test
+  "Real Wasm binaries, not just Clojure-closure unit tests -- same
+  end-to-end discipline `kotoba.wasm-exec_test.clj` uses. WAT fixtures are
+  compiled to real Wasm bytes at test time via the `wasm-tools` CLI
+  (Bytecode Alliance, ~/.cargo/bin/wasm-tools), so these tests exercise
+  the actual Chicory Parser/Instance/HostFunction linkage, not a mock."
+  (:require [kotoba.lang.error :as kerror] [kotoba.bytes :as kbytes] [kotoba.test :refer [deftest is testing]]
+            [kotoba.io :as io]
+            [kotoba.process :as shell]
+            [kotoba.lang.text :as str]
+            [kototama.signer-lifecycle :as signer]
+            [kototama.tender :as tender]
+            [kototama.contract :as contract])
+  (:import (com.sun.net.httpserver HttpExchange HttpHandler HttpServer)
+           (java.net InetAddress InetSocketAddress ServerSocket URI)
+           (java.net.http HttpRequest HttpRequest$BodyPublishers
+                          HttpResponse$BodyHandlers)))
+
+;; --- identities ------------------------------------------------------------
+;; These were "bafy-plan", "bafycomponent" and so on: readable labels that are
+;; not CIDs. `kotoba.abi.contract/cid?` used to be `#"b.+"`, so they passed the
+;; portable contract — while THIS repository's own component-platform check
+;; already decoded the multihash. The gap those fixtures lived in is exactly
+;; the one abi 32ee84b closed (com-junkawasaki ADR-2608100500).
+;;
+;; Each label now resolves to a real CIDv1, derived so the value is
+;; reproducible rather than magic:
+;;
+;;   cidv1-raw(sha2-256("kototama/" + label))
+(def ^:private cids
+  {"artifact" "bafkreiaoor2wcoaq3u7mrbjrhbirx34xzqys3a2q5qhjpgdqwyg6ptrlfy"
+   "basis" "bafkreihsn6mdnvobjlbmjk5vz7ztnjb5miyvol7my3ixlz6xecob42qitq"
+   "clock" "bafkreiezmplwyi7toi4hydjfhnwwx55cvzfnoeswo3ruqj7wew7br2ph7y"
+   "closure" "bafkreie7sgf5oizcxm6ldv3ojinwde7lkwcnhk4wjfb7l3knyabc7dnocy"
+   "compiler" "bafkreid5nekxdlvum3rkqoragyxpeivn3j7ddzorynljvwxbir27w7jhly"
+   "component" "bafkreieyhyecmsmbwccq2y4qfvknhz6m6ydqsmgiklglgho5ldm3de5p24"
+   "componentauthority" "bafkreig3gnp7dytwmbiqyjr3dwcoougkhotkklikcnvqqnfne2mfxpog7a"
+   "componentauthorityhttp" "bafkreielvningeuw4nh7k22q6twdn2lrde55xk2c2ojlwxgrgi6pr6ohfy"
+   "componentflat" "bafkreia3znmizxxhlc4p7dxo6kzbofd7p3kob2thtcwujuy6otradpvriy"
+   "decision" "bafkreiaknav3buhvecbannx2d5mcyh6b5q6r6cmdhsv3ide5hr7srnffny"
+   "execution" "bafkreic7qyrftgfgap62nhskelvq4prffjs4np2semo75nwj7izxm2xw34"
+   "grant" "bafkreiby4j4qg5uqwdtcrxazwv5ldzzbjacotc743swvcat2gbgdz7tauq"
+   "input" "bafkreigmoi3fbt5coqs5ajsq6b6ehopxwmzmexlvcjghmow7ipzwviu4n4"
+   "lease" "bafkreihazedup3nijxru74js7xnltjhcdd6dih3cek7scw7ph6pokbww3q"
+   "lock" "bafkreic26zmsjddegdrv7ikbyoxrafgb7tyrps6wj2aslivthqbn3aczcy"
+   "missing" "bafkreidifls6tixbtvpa5vejfn35eqhgbhh2wgxwmiq6gskwk2siro4xi4"
+   "other" "bafkreifmdvltsfon4orf4cvrfieqxy5bkxb6bxzngmih2sxi47gtqp3o4y"
+   "outcome" "bafkreif7c255ykmnhcl7qhy3y4f747cxky4ha4dyry5gv4vnxeouldlgay"
+   "plan" "bafkreifotqbi536xl5ijkmfetw6boo6yzyrxpcsc5zh4sx4724uqiy273i"
+   "policy" "bafkreibwzjisibgslumbwv2l2ty5r4mlreapyy7g5j4uk7brqcvoczzobe"
+   "runtime" "bafkreihjph4khvpagzlzaxa3cgejh3x56pjkknahjt67zp2tjgtvk3t2vu"
+   "world" "bafkreifqsv77i4q4jxcojmgzgpbajbzwexn7e4qvw6t5gzd6kc2pfjkxrq"})
+
+(defn- cid-of
+  "The real CIDv1 fixture for `label`. Unknown labels fail loudly rather than
+  returning nil, which `cid?` would then reject with a confusing message."
+  [label]
+  (or (get cids label)
+      (throw (ex-info "no CID fixture for label" {:label label}))))
+
+
+(defn- wat->wasm
+  "Shell out to `wasm-tools parse` to assemble WAT text into real Wasm
+  bytes -- fails loudly (test error, not a silent skip) if the binary
+  isn't on PATH, since these tests are meaningless without it."
+  [wat]
+  (let [in (java.io.File/createTempFile "kototama-tender-test" ".wat")
+        out (java.io.File/createTempFile "kototama-tender-test" ".wasm")]
+    (try
+      (spit in wat)
+      (let [{:keys [exit err]} (shell/sh "wasm-tools" "parse" (.getPath in) "-o" (.getPath out))]
+        (when-not (zero? exit)
+          (throw (ex-info "wasm-tools parse failed" {:wat wat :stderr err}))))
+      (with-open [is (io/input-stream out)]
+        (.readAllBytes is))
+      (finally
+        (.delete in)
+        (.delete out)))))
+
+(def sha256-hex-wat
+  "Imports sha256_hex, hashes the 5-byte literal \"hello\" at offset 0,
+  writes the 64-char hex digest at offset 100 (exact capacity)."
+  "(module
+     (import \"kotoba\" \"sha256_hex\" (func $sha256_hex (param i32 i32 i32 i32) (result i32)))
+     (memory (export \"memory\") 1)
+     (data (i32.const 0) \"hello\")
+     (func (export \"main\") (result i64)
+       (i64.extend_i32_s (call $sha256_hex (i32.const 0) (i32.const 5) (i32.const 100) (i32.const 64)))))")
+
+(def clock-monotonic-wat
+  "Imports clock_monotonic, calls it once, returns whatever it got (proves
+  linkage -- a specific value isn't asserted, just that it doesn't trap)."
+  "(module
+     (import \"kotoba\" \"clock_monotonic\" (func $clock_monotonic (result i64)))
+     (func (export \"main\") (result i64) (call $clock_monotonic)))")
+
+(def multi-export-wat
+  "No imports -- a guest with `main` AND `on-http` (ADR-2607082400's
+  `dispatch-trigger`), each a distinct 0-arity export returning its own
+  constant so a test can tell which one actually ran. No `on-tick`/
+  `on-kse` export, so `has-export?`/`dispatch-trigger` on those two must
+  report :dispatched? false, same as kotoba-server's own route table
+  not sending a trigger to a component that isn't bound to it."
+  "(module
+     (func (export \"main\") (result i64) (i64.const 111))
+     (func (export \"on-http\") (result i64) (i64.const 222)))")
+
+(def memory-grow-wat
+  "No imports -- declares 1 initial page, main tries to grow BY the
+  amount passed as a global-like constant baked per test (see below);
+  returns memory.grow's result (previous page count, or -1 on failure)."
+  (fn [grow-by]
+    (str "(module
+            (memory (export \"memory\") 1)
+            (func (export \"main\") (result i64)
+              (i64.extend_i32_s (memory.grow (i32.const " grow-by ")))))")))
+
+(def infinite-loop-wat
+  "No imports -- just an unconditional back-edge loop, to trip the fuel
+  listener."
+  "(module
+     (func (export \"main\") (result i64)
+       (loop $l (br $l))
+       (i64.const 0)))")
+
+(def log-write-thrice-wat
+  "Imports log_write, calls it 3 times with the same 4-byte payload,
+  returns the THIRD call's result (i32 sign-extended to i64) -- so a
+  RuntimeLimits cap of e.g. 8 bytes (2 calls' worth) shows up as -1 on
+  the third call."
+  "(module
+     (import \"kotoba\" \"log_write\" (func $log_write (param i32 i32) (result i32)))
+     (memory (export \"memory\") 1)
+     (data (i32.const 0) \"data\")
+     (func (export \"main\") (result i64)
+       (drop (call $log_write (i32.const 0) (i32.const 4)))
+       (drop (call $log_write (i32.const 0) (i32.const 4)))
+       (i64.extend_i32_s (call $log_write (i32.const 0) (i32.const 4)))))")
+
+(def http-post-wat
+  "Imports http_post, POSTs the 4-byte literal \"body\" (offset 50) to URL
+  (baked into a data segment at offset 0, URL's own byte length as url-len
+  -- URL must be pure ASCII and contain no `\"`/`\\`, true of every URL used
+  below), writes the response at offset 200 (256-byte capacity)."
+  (fn [url]
+    (str "(module
+            (import \"kotoba\" \"http_post\" (func $http_post (param i32 i32 i32 i32 i32 i32) (result i32)))
+            (memory (export \"memory\") 1)
+            (data (i32.const 0) \"" url "\")
+            (data (i32.const 50) \"body\")
+            (func (export \"main\") (result i64)
+              (i64.extend_i32_s
+                (call $http_post (i32.const 0) (i32.const " (count url) ")
+                                 (i32.const 50) (i32.const 4)
+                                 (i32.const 200) (i32.const 256)))))")))
+
+(def llm-infer-wat
+  "Imports llm_infer, sends the 5-byte literal \"hello\" as the prompt,
+  writes the reply at offset 100 (64-byte capacity)."
+  "(module
+     (import \"kotoba\" \"llm_infer\" (func $llm_infer (param i32 i32 i32 i32) (result i32)))
+     (memory (export \"memory\") 1)
+     (data (i32.const 0) \"hello\")
+     (func (export \"main\") (result i64)
+       (i64.extend_i32_s (call $llm_infer (i32.const 0) (i32.const 5) (i32.const 100) (i32.const 64)))))")
+
+(def llm-infer-twice-wat
+  "Imports llm_infer, calls it twice with the same 5-byte prompt, returns
+  the SECOND call's result (i32 sign-extended to i64) -- so a
+  RuntimeLimits cap of 1 call shows up as -1 on the second call."
+  "(module
+     (import \"kotoba\" \"llm_infer\" (func $llm_infer (param i32 i32 i32 i32) (result i32)))
+     (memory (export \"memory\") 1)
+     (data (i32.const 0) \"hello\")
+     (func (export \"main\") (result i64)
+       (drop (call $llm_infer (i32.const 0) (i32.const 5) (i32.const 100) (i32.const 64)))
+       (i64.extend_i32_s (call $llm_infer (i32.const 0) (i32.const 5) (i32.const 100) (i32.const 64)))))")
+
+;; ── ADR-2607230943 second wave: http-fetch (GET) shares http-post-wat's
+;; shape (URL baked into a data segment, ASCII/no-"/\\ only); cbor-encode/
+;; json-encode/json-extract-field need a WAT string ESCAPE helper since
+;; their guest-facing wire format embeds literal TAB/LF byte separators,
+;; which the WAT text grammar can only express via `\t`/`\n` escapes --
+;; `wat-escape` produces THOSE TWO SOURCE CHARACTERS (backslash + letter),
+;; not an actual tab/newline byte, so `wasm-tools parse` decodes them back
+;; to the single real byte kototama's own `parse-flat-pairs` expects. ────
+
+(def http-fetch-wat
+  "Imports http_fetch, GETs URL (baked into a data segment at offset 0,
+  URL's own byte length as url-len -- same ASCII/no-\"/\\\\ constraint
+  http-post-wat's URL has), writes the response at offset 200
+  (256-byte capacity)."
+  (fn [url]
+    (str "(module
+            (import \"kotoba\" \"http_fetch\" (func $http_fetch (param i32 i32 i32 i32) (result i32)))
+            (memory (export \"memory\") 1)
+            (data (i32.const 0) \"" url "\")
+            (func (export \"main\") (result i64)
+              (i64.extend_i32_s
+                (call $http_fetch (i32.const 0) (i32.const " (count url) ")
+                                  (i32.const 200) (i32.const 256)))))")))
+
+(defn- wat-escape
+  "Escapes S (a real Java/Clojure string, possibly containing literal
+  TAB/LF/`\"`/`\\\\` bytes) into WAT string-literal SOURCE TEXT --
+  `wasm-tools parse` decodes `\\t`/`\\n`/`\\\"`/`\\\\` back to the single
+  real byte each represents, matching the grammar every other `.wat`
+  fixture's `(data ...)` string already relies on."
+  [^String s]
+  (-> s
+      (str/replace "\\" "\\\\")
+      (str/replace "\"" "\\\"")
+      (str/replace "\t" "\\t")
+      (str/replace "\n" "\\n")))
+
+(def http-post-headers-wat
+  "Imports http_post_headers, POSTs BODY to URL with HEADERS (kototama's
+  flat key<TAB>value, LF-separated wire format -- same as
+  cbor-encode-wat/json-encode-wat below, `wat-escape` handles the
+  TAB/LF), writes the response at offset 500 (256-byte capacity). URL/
+  BODY/HEADERS are laid out at offsets 0/100/200 respectively (each
+  region generously sized so no fixture's literal overflows into the
+  next)."
+  (fn [url body headers]
+    (str "(module
+            (import \"kotoba\" \"http_post_headers\"
+              (func $http_post_headers (param i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
+            (memory (export \"memory\") 1)
+            (data (i32.const 0) \"" (wat-escape url) "\")
+            (data (i32.const 100) \"" (wat-escape body) "\")
+            (data (i32.const 200) \"" (wat-escape headers) "\")
+            (func (export \"main\") (result i64)
+              (i64.extend_i32_s
+                (call $http_post_headers (i32.const 0) (i32.const " (count url) ")
+                                          (i32.const 100) (i32.const " (count body) ")
+                                          (i32.const 200) (i32.const " (count headers) ")
+                                          (i32.const 500) (i32.const 256)))))")))
+
+(def cbor-encode-wat
+  "Imports cbor_encode, encodes RAW-PAIRS (kototama's flat key<TAB>value
+  wire format, byte length = RAW-PAIRS' own character count since test
+  data below is pure ASCII) baked at offset 0, writes CBOR bytes at
+  offset 300 (OUT-CAP capacity)."
+  (fn [raw-pairs out-cap]
+    (str "(module
+            (import \"kotoba\" \"cbor_encode\" (func $cbor_encode (param i32 i32 i32 i32) (result i32)))
+            (memory (export \"memory\") 1)
+            (data (i32.const 0) \"" (wat-escape raw-pairs) "\")
+            (func (export \"main\") (result i64)
+              (i64.extend_i32_s
+                (call $cbor_encode (i32.const 0) (i32.const " (count raw-pairs) ")
+                                   (i32.const 300) (i32.const " out-cap ")))))")))
+
+(def json-encode-wat
+  "Imports json_encode, same shape as cbor-encode-wat above."
+  (fn [raw-pairs out-cap]
+    (str "(module
+            (import \"kotoba\" \"json_encode\" (func $json_encode (param i32 i32 i32 i32) (result i32)))
+            (memory (export \"memory\") 1)
+            (data (i32.const 0) \"" (wat-escape raw-pairs) "\")
+            (func (export \"main\") (result i64)
+              (i64.extend_i32_s
+                (call $json_encode (i32.const 0) (i32.const " (count raw-pairs) ")
+                                   (i32.const 300) (i32.const " out-cap ")))))")))
+
+(def json-extract-field-wat
+  "Imports json_extract_field, scans JSON-TEXT (offset 0) for FIELD
+  (offset 100), writes the extracted string value at offset 300
+  (OUT-CAP capacity)."
+  (fn [json-text field out-cap]
+    (str "(module
+            (import \"kotoba\" \"json_extract_field\"
+              (func $json_extract_field (param i32 i32 i32 i32 i32 i32) (result i32)))
+            (memory (export \"memory\") 1)
+            (data (i32.const 0) \"" (wat-escape json-text) "\")
+            (data (i32.const 100) \"" (wat-escape field) "\")
+            (func (export \"main\") (result i64)
+              (i64.extend_i32_s
+                (call $json_extract_field (i32.const 0) (i32.const " (count json-text) ")
+                                          (i32.const 100) (i32.const " (count field) ")
+                                          (i32.const 300) (i32.const " out-cap ")))))")))
+
+(def everything (constantly true))
+
+(defn- read-fixture [name]
+  (with-open [is (io/input-stream (io/resource (str "kototama/fixtures/" name)))]
+    (.readAllBytes is)))
+
+(deftest sha256-hex-round-trips-through-real-chicory
+  (let [wasm (wat->wasm sha256-hex-wat)
+        caps (contract/host-caps {:grants [:sha256-hex]})
+        instance (tender/instantiate wasm [:sha256-hex] caps)
+        n (tender/call-main instance)]
+    (is (= 64 n))
+    (is (= "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+           (tender/read-memory-string instance 100 64)))))
+
+(deftest clock-monotonic-links-and-returns-without-trapping
+  (let [wasm (wat->wasm clock-monotonic-wat)
+        caps (contract/host-caps {:grants [:clock-monotonic]})
+        n (tender/run-main wasm [:clock-monotonic] caps)]
+    (is (pos? n))))
+
+(deftest call-export-invokes-any-named-export-not-just-main
+  (let [wasm (wat->wasm multi-export-wat)
+        caps (contract/host-caps {:grants []})
+        instance (tender/instantiate wasm [] caps)]
+    (is (= 111 (tender/call-export instance "main")))
+    (is (= 111 (tender/call-main instance)) "call-main stays the historical main-only shim")
+    (is (= 222 (tender/call-export instance "on-http")))))
+
+(deftest has-export?-distinguishes-present-from-absent-exports
+  (let [wasm (wat->wasm multi-export-wat)
+        caps (contract/host-caps {:grants []})
+        instance (tender/instantiate wasm [] caps)]
+    (is (true? (tender/has-export? instance "main")))
+    (is (true? (tender/has-export? instance "on-http")))
+    (is (false? (tender/has-export? instance "on-tick")))
+    (is (false? (tender/has-export? instance "on-kse")))))
+
+(deftest dispatch-trigger-maps-kotoba-server-trigger-kinds-to-export-names
+  (is (= {:run "run" :http "on-http" :tick "on-tick" :kse "on-kse"}
+         tender/trigger->export))
+  (let [wasm (wat->wasm multi-export-wat)
+        caps (contract/host-caps {:grants []})
+        instance (tender/instantiate wasm [] caps)]
+    (testing "bound trigger dispatches and returns the export's result"
+      (is (= {:dispatched? true :result 222}
+             (tender/dispatch-trigger instance :http))))
+    (testing "unbound trigger is a non-event, not an error (component isn't bound to it)"
+      (is (= {:dispatched? false} (tender/dispatch-trigger instance :tick)))
+      (is (= {:dispatched? false} (tender/dispatch-trigger instance :kse))))
+    (testing "unknown trigger kind is a caller bug -- throws"
+      (is (thrown-with-msg? kerror/ExceptionInfo #"unknown trigger kind"
+                            (tender/dispatch-trigger instance :bogus))))))
+
+(deftest ungranted-import-is-rejected-pre-flight-before-any-wasm-runs
+  (testing "validate-import-surface's own :grants/missing error, no Instance ever built"
+    (let [caps (contract/host-caps {:grants []})]
+      (is (thrown-with-msg? kerror/ExceptionInfo #"rejected by contract"
+                            (tender/instantiate (byte-array 0) [:http-post] caps))))))
+
+(deftest a-defense-in-depth-grant-check-also-guards-each-call
+  (testing "sha256-hex granted at the surface level but the per-call check still gates it"
+    ;; Build caps that pass pre-flight (grants sha256-hex) then hand-craft
+    ;; a denial by requesting a DIFFERENT import than what's granted --
+    ;; validate-import-surface itself would already refuse this combo, so
+    ;; this just re-confirms the pre-flight path is what actually fires.
+    (let [wasm (wat->wasm sha256-hex-wat)
+          caps (contract/host-caps {:grants [:clock-monotonic]})]
+      (is (thrown-with-msg? kerror/ExceptionInfo #"rejected by contract"
+                            (tender/instantiate wasm [:sha256-hex] caps))))))
+
+;; ── http-post: connect/request timeouts + SSRF-adjacent destination
+;; filtering (security fix, ADR audit finding #1). The destination check
+;; means a real end-to-end round-trip through the guest/Chicory path can
+;; only ever hit a PUBLIC address -- any local `HttpServer`/`ServerSocket`
+;; this test process can stand up and reach from itself is necessarily
+;; loopback or a private address, which the filter now correctly refuses.
+;; So: the classification logic and the "refused before any connection"
+;; property are tested end-to-end via the real guest/Chicory path (a local
+;; spy server proves it's never even contacted); the timeout WIRING itself
+;; (both the "doesn't break a normal fast response" and the "fails fast
+;; instead of hanging on a slow peer" properties) is tested directly
+;; against `tender`'s own private `timed-http-client`/`http-request-timeout`
+;; -- the exact objects `http-post-host-fn` builds requests with -- since
+;; that part of the fix is destination-agnostic and loopback is a
+;; perfectly valid target for testing it in isolation. ─────────────────────
+
+(deftest blocked-http-post-destination?-classifies-ssrf-shaped-targets
+  (testing "loopback"
+    (is (true? (#'tender/blocked-http-post-destination? "http://127.0.0.1/x")))
+    (is (true? (#'tender/blocked-http-post-destination? "http://localhost/x")))
+    (is (true? (#'tender/blocked-http-post-destination? "http://[::1]/x"))))
+  (testing "RFC1918 private ranges"
+    (is (true? (#'tender/blocked-http-post-destination? "http://10.1.2.3/")))
+    (is (true? (#'tender/blocked-http-post-destination? "http://172.16.0.1/")))
+    (is (true? (#'tender/blocked-http-post-destination? "http://192.168.1.1/"))))
+  (testing "link-local, including the cloud-metadata address"
+    (is (true? (#'tender/blocked-http-post-destination? "http://169.254.1.1/")))
+    (is (true? (#'tender/blocked-http-post-destination? "http://169.254.169.254/latest/meta-data/"))
+        "explicit 169.254.169.254 check -- also already covered by isLinkLocalAddress"))
+  (testing "IPv6 unique-local (RFC4193, fc00::/7) -- the modern Docker/Kubernetes/
+            private-cloud addressing scheme, NOT covered by isSiteLocalAddress'
+            legacy fec0::/10-only check"
+    (is (true? (#'tender/blocked-http-post-destination? "http://[fc00::1]/")))
+    (is (true? (#'tender/blocked-http-post-destination? "http://[fd12:3456:789a:1::1]/"))))
+  (testing "IPv6 loopback/link-local/deprecated-site-local/multicast, and a real
+            public IPv6 address is NOT blocked"
+    (is (true? (#'tender/blocked-http-post-destination? "http://[::1]/")))
+    (is (true? (#'tender/blocked-http-post-destination? "http://[fe80::1]/")))
+    (is (true? (#'tender/blocked-http-post-destination? "http://[fec0::1]/")))
+    (is (true? (#'tender/blocked-http-post-destination? "http://[ff02::1]/")))
+    (is (false? (#'tender/blocked-http-post-destination? "http://[2606:4700:4700::1111]/"))
+        "a real public IPv6 address (Cloudflare DNS) is not over-broadly blocked"))
+  (testing "multicast"
+    (is (true? (#'tender/blocked-http-post-destination? "http://224.0.0.1/"))))
+  (testing "unparseable / hostless URLs fail CLOSED, not open"
+    (is (true? (#'tender/blocked-http-post-destination? "not-a-url")))
+    (is (true? (#'tender/blocked-http-post-destination? ""))))
+  (testing "legitimate public destinations are NOT blocked (IP literals -- no live DNS needed to classify)"
+    (is (false? (#'tender/blocked-http-post-destination? "http://1.1.1.1/")))
+    (is (false? (#'tender/blocked-http-post-destination? "http://8.8.8.8/")))))
+
+;; DNS-rebinding (resolves to a public address when checked, then to an internal
+;; one at actual connect time) is a KNOWN, DOCUMENTED gap in
+;; blocked-http-post-destination? -- see its docstring and the namespace-level
+;; comment above `http-connect-timeout` for why it isn't closed here (no
+;; supported per-request DNS-pinning hook in java.net.http.HttpClient's public
+;; API without risking a subtle TLS hostname-verification regression). Not
+;; tested here for the same reason the finding was reported rather than
+;; "fixed-and-verified": reproducing it faithfully requires installing a custom
+;; java.net.spi.InetAddressResolverProvider, which is real, heavy, JVM-global
+;; test machinery disproportionate to a mitigation this function was never
+;; supposed to fully provide.
+
+(deftest http-post-host-fn-refuses-a-loopback-destination-before-any-real-connection
+  (let [hits (atom 0)
+        server (doto (HttpServer/create (InetSocketAddress. "127.0.0.1" 0) 0)
+                 (.createContext "/" (reify HttpHandler
+                                       (handle [_ exchange]
+                                         (swap! hits inc)
+                                         (.sendResponseHeaders ^HttpExchange exchange 200 -1))))
+                 (.start))]
+    (try
+      (let [port (.getPort (.getAddress server))
+            url (str "http://127.0.0.1:" port "/")
+            wasm (wat->wasm (http-post-wat url))
+            caps (contract/host-caps {:grants [:http-post] :limits {:max-http-posts 1}})
+            started (System/currentTimeMillis)
+            n (tender/run-main wasm [:http-post] caps)
+            elapsed (- (System/currentTimeMillis) started)]
+        (is (= -1 n) "loopback destination refused, the standard fail-closed -1 convention")
+        (is (zero? @hits) "the local server never received a request -- rejected BEFORE any real HTTP call was attempted")
+        (is (< elapsed 2000) "rejection is immediate (pure classification), not gated behind a connect/request timeout"))
+      (finally (.stop server 0)))))
+
+;; ── :allowed-url-prefixes: opt-in caller allowlist layered on top of the
+;; unconditional denylist above (contract/url-allowed?, nil/unrestricted
+;; by default) -- see http-post-host-fn's docstring. ────────────────────────
+
+(deftest url-allowed?-defaults-to-unrestricted
+  (is (true? (contract/url-allowed? {} "http://anything.example/x"))
+      "no :allowed-url-prefixes at all -- unrestricted, matches every prior caller")
+  (is (true? (contract/url-allowed? {:allowed-url-prefixes nil} "http://anything.example/x"))
+      "explicit nil remains unrestricted (legacy default)"))
+
+(deftest url-allowed?-empty-collection-fails-closed
+  (testing "empty set/vector means the caller opted into an allowlist but listed nothing"
+    (is (false? (contract/url-allowed? {:allowed-url-prefixes []} "http://anything.example/x")))
+    (is (false? (contract/url-allowed? {:allowed-url-prefixes #{}} "http://anything.example/x")))))
+
+(deftest url-allowed?-checks-prefix-membership
+  (let [limits {:allowed-url-prefixes ["https://api.example.test/"]}]
+    (is (true? (contract/url-allowed? limits "https://api.example.test/v1/echo")))
+    (is (false? (contract/url-allowed? limits "https://not-example.test/v1/echo")))
+    (is (false? (contract/url-allowed? limits "http://api.example.test/v1/echo"))
+        "scheme is part of the prefix -- http does not match an https-only prefix")))
+
+(deftest url-allowed?-matches-any-of-multiple-prefixes
+  (let [limits {:allowed-url-prefixes ["https://a.test/" "https://b.test/"]}]
+    (is (true? (contract/url-allowed? limits "https://a.test/x")))
+    (is (true? (contract/url-allowed? limits "https://b.test/x")))
+    (is (false? (contract/url-allowed? limits "https://c.test/x")))))
+
+(deftest http-post-host-fn-refuses-a-destination-outside-the-allowlist-before-any-real-connection
+  ;; 198.51.100.0/24 (RFC 5737 TEST-NET-2) is a literal IPv4 address --
+  ;; parses without a real DNS round-trip -- that is public/routable-shaped
+  ;; (NOT loopback/private/link-local/metadata), so blocked-http-post-
+  ;; destination? lets it through; url-allowed? is the only thing that can
+  ;; reject it here, isolating what this test actually verifies.
+  (let [url "http://198.51.100.1/x"
+        wasm (wat->wasm (http-post-wat url))
+        caps (contract/host-caps {:grants [:http-post]
+                                   :limits {:max-http-posts 1
+                                            :allowed-url-prefixes ["http://192.0.2."]}})
+        started (System/currentTimeMillis)
+        n (tender/run-main wasm [:http-post] caps)
+        elapsed (- (System/currentTimeMillis) started)]
+    (is (= -1 n) "destination not matching :allowed-url-prefixes refused, the standard fail-closed -1 convention")
+    (is (< elapsed 2000) "rejection is immediate (pure classification), not a real network attempt/timeout")))
+
+(deftest http-post-host-fn-allowlist-does-not-weaken-the-unconditional-denylist
+  ;; A caller's :allowed-url-prefixes matching a loopback URL must NOT
+  ;; override blocked-http-post-destination? -- the two checks are ANDed,
+  ;; not either-or, so a permissive allowlist can never re-open the SSRF
+  ;; hole the denylist exists to close.
+  (let [hits (atom 0)
+        server (doto (HttpServer/create (InetSocketAddress. "127.0.0.1" 0) 0)
+                 (.createContext "/" (reify HttpHandler
+                                       (handle [_ exchange]
+                                         (swap! hits inc)
+                                         (.sendResponseHeaders ^HttpExchange exchange 200 -1))))
+                 (.start))]
+    (try
+      (let [port (.getPort (.getAddress server))
+            url (str "http://127.0.0.1:" port "/")
+            wasm (wat->wasm (http-post-wat url))
+            caps (contract/host-caps {:grants [:http-post]
+                                       :limits {:max-http-posts 1
+                                                :allowed-url-prefixes [url]}})
+            n (tender/run-main wasm [:http-post] caps)]
+        (is (= -1 n) "still refused despite an allowlist that explicitly matches this exact URL")
+        (is (zero? @hits) "the local server never received a request"))
+      (finally (.stop server 0)))))
+
+(deftest http-request-timeout-fires-instead-of-hanging-on-a-slow-loris-peer
+  (let [accepted (atom nil)
+        server (ServerSocket. 0 1 (InetAddress/getByName "127.0.0.1"))
+        server-thread (Thread. ^Runnable (fn []
+                                           (try (reset! accepted (.accept server))
+                                                (catch Exception _ nil))))]
+    (.start server-thread)
+    (try
+      (let [port (.getLocalPort server)
+            client (#'tender/timed-http-client)
+            req (-> (HttpRequest/newBuilder (URI/create (str "http://127.0.0.1:" port "/")))
+                   (.timeout (java.time.Duration/ofMillis @#'tender/default-http-timeout-ms))
+                   (.POST (HttpRequest$BodyPublishers/ofByteArray (byte-array 0)))
+                   .build)
+            started (System/currentTimeMillis)
+            outcome (try
+                      (.send client req (HttpResponse$BodyHandlers/ofByteArray))
+                      :unexpectedly-succeeded
+                      (catch Exception _ :failed-as-expected))
+            elapsed (- (System/currentTimeMillis) started)]
+        (is (= :failed-as-expected outcome)
+            "a peer that accepts the connection but never responds must not let the call succeed")
+        (is (< elapsed 8000)
+            "fails within the configured connect/request timeout instead of hanging indefinitely (no timeout was previously set at all)"))
+      (finally
+        (.close server)
+        (when-let [s @accepted] (.close ^java.net.Socket s))))))
+
+(deftest http-request-timeout-does-not-break-a-normal-fast-round-trip
+  (let [server (doto (HttpServer/create (InetSocketAddress. "127.0.0.1" 0) 0)
+                 (.createContext "/" (reify HttpHandler
+                                       (handle [_ exchange]
+                                         (let [resp (kbytes/utf8-bytes "pong")]
+                                           (.sendResponseHeaders ^HttpExchange exchange 200 (count resp))
+                                           (with-open [os (.getResponseBody ^HttpExchange exchange)]
+                                             (.write os resp))))))
+                 (.start))]
+    (try
+      (let [port (.getPort (.getAddress server))
+            client (#'tender/timed-http-client)
+            req (-> (HttpRequest/newBuilder (URI/create (str "http://127.0.0.1:" port "/")))
+                   (.timeout (java.time.Duration/ofMillis @#'tender/default-http-timeout-ms))
+                   (.POST (HttpRequest$BodyPublishers/ofByteArray (byte-array 0)))
+                   .build)
+            resp (.send client req (HttpResponse$BodyHandlers/ofString))]
+        (is (= 200 (.statusCode resp)))
+        (is (= "pong" (.body resp))
+            "adding connect/request timeouts doesn't interfere with a normal fast response"))
+      (finally (.stop server 0)))))
+
+;; ── http-fetch (GET, ADR-2607230943 second wave): shares http-post-host-
+;; fn's `blocked-http-post-destination?`/`contract/url-allowed?` verbatim,
+;; so every real local `HttpServer` this test process can stand up is
+;; necessarily loopback -- same "denylist proven via refusal, not via a
+;; completed round-trip" shape http-post's own tests above use, for the
+;; same structural reason (see that section's header comment). ────────────
+
+(deftest http-fetch-host-fn-refuses-a-loopback-destination-before-any-real-connection
+  (let [hits (atom 0)
+        server (doto (HttpServer/create (InetSocketAddress. "127.0.0.1" 0) 0)
+                 (.createContext "/" (reify HttpHandler
+                                       (handle [_ exchange]
+                                         (swap! hits inc)
+                                         (.sendResponseHeaders ^HttpExchange exchange 200 -1))))
+                 (.start))]
+    (try
+      (let [port (.getPort (.getAddress server))
+            url (str "http://127.0.0.1:" port "/")
+            wasm (wat->wasm (http-fetch-wat url))
+            caps (contract/host-caps {:grants [:http-fetch] :limits {:max-http-fetches 1}})
+            started (System/currentTimeMillis)
+            n (tender/run-main wasm [:http-fetch] caps)
+            elapsed (- (System/currentTimeMillis) started)]
+        (is (= -1 n) "loopback destination refused, the standard fail-closed -1 convention")
+        (is (zero? @hits) "the local server never received a request -- rejected BEFORE any real HTTP call was attempted")
+        (is (< elapsed 2000) "rejection is immediate (pure classification), not gated behind a connect/request timeout"))
+      (finally (.stop server 0)))))
+
+(deftest http-fetch-host-fn-allowlist-does-not-weaken-the-unconditional-denylist
+  (let [hits (atom 0)
+        server (doto (HttpServer/create (InetSocketAddress. "127.0.0.1" 0) 0)
+                 (.createContext "/" (reify HttpHandler
+                                       (handle [_ exchange]
+                                         (swap! hits inc)
+                                         (.sendResponseHeaders ^HttpExchange exchange 200 -1))))
+                 (.start))]
+    (try
+      (let [port (.getPort (.getAddress server))
+            url (str "http://127.0.0.1:" port "/")
+            wasm (wat->wasm (http-fetch-wat url))
+            caps (contract/host-caps {:grants [:http-fetch]
+                                       :limits {:max-http-fetches 1
+                                                :allowed-url-prefixes [url]}})
+            n (tender/run-main wasm [:http-fetch] caps)]
+        (is (= -1 n) "still refused despite an allowlist that explicitly matches this exact URL")
+        (is (zero? @hits) "the local server never received a request"))
+      (finally (.stop server 0)))))
+
+(deftest http-fetch-denied-pre-flight-when-max-http-fetches-is-zero-by-default
+  (testing "granted but :max-http-fetches stays at its default-runtime-limits 0 -- rejected before any Instance is built (validate-import-surface counts REQUESTED import declarations against this same limit, same as :max-http-posts already does for http-post -- no test in this file ever requests a given import type more than once, so the separate RUNTIME per-call counter this limit ALSO gates via within-count-limit? is only exercised by imports a guest calls multiple times per `main`, e.g. log-write-thrice-wat/llm-infer-twice-wat below, not http-post/http-fetch)"
+    (let [caps (contract/host-caps {:grants [:http-fetch]})]
+      (is (thrown-with-msg? kerror/ExceptionInfo #"rejected by contract"
+                            (tender/instantiate (byte-array 0) [:http-fetch] caps))))))
+
+;; ── http-post-headers (com-junkawasaki/root, third wave): a SEPARATE
+;; host-import from http-post (see tender.clj's own comment), but shares
+;; http-post-host-fn's SSRF/DoS hardening verbatim -- so, same structural
+;; reason as http-post/http-fetch above, every local `HttpServer` this
+;; test process can stand up is necessarily loopback, and the guarded
+;; full path (http-post-headers-host-fn itself) can only be tested for
+;; REFUSAL. The header-APPLICATION logic itself (does `.header` actually
+;; get called with the right name/value pairs, in order) is tested
+;; directly against `post-request-with-headers` -- the exact fn
+;; http-post-headers-host-fn calls, split out for testability -- and a
+;; real local server, same "test the destination-agnostic part in
+;; isolation" pattern http-request-timeout-does-not-break-a-normal-fast-
+;; round-trip above uses. ──────────────────────────────────────────────
+
+(deftest http-post-headers-host-fn-refuses-a-loopback-destination-before-any-real-connection
+  (let [hits (atom 0)
+        server (doto (HttpServer/create (InetSocketAddress. "127.0.0.1" 0) 0)
+                 (.createContext "/" (reify HttpHandler
+                                       (handle [_ exchange]
+                                         (swap! hits inc)
+                                         (.sendResponseHeaders ^HttpExchange exchange 200 -1))))
+                 (.start))]
+    (try
+      (let [port (.getPort (.getAddress server))
+            url (str "http://127.0.0.1:" port "/")
+            wasm (wat->wasm (http-post-headers-wat url "body" "Authorization\tBearer tok"))
+            caps (contract/host-caps {:grants [:http-post-headers] :limits {:max-http-posts 1}})
+            started (System/currentTimeMillis)
+            n (tender/run-main wasm [:http-post-headers] caps)
+            elapsed (- (System/currentTimeMillis) started)]
+        (is (= -1 n) "loopback destination refused, the standard fail-closed -1 convention")
+        (is (zero? @hits) "the local server never received a request -- rejected BEFORE headers/body were ever sent")
+        (is (< elapsed 2000) "rejection is immediate (pure classification), not gated behind a connect/request timeout"))
+      (finally (.stop server 0)))))
+
+(deftest http-post-headers-host-fn-allowlist-does-not-weaken-the-unconditional-denylist
+  (let [hits (atom 0)
+        server (doto (HttpServer/create (InetSocketAddress. "127.0.0.1" 0) 0)
+                 (.createContext "/" (reify HttpHandler
+                                       (handle [_ exchange]
+                                         (swap! hits inc)
+                                         (.sendResponseHeaders ^HttpExchange exchange 200 -1))))
+                 (.start))]
+    (try
+      (let [port (.getPort (.getAddress server))
+            url (str "http://127.0.0.1:" port "/")
+            wasm (wat->wasm (http-post-headers-wat url "body" "Authorization\tBearer tok"))
+            caps (contract/host-caps {:grants [:http-post-headers]
+                                       :limits {:max-http-posts 1
+                                                :allowed-url-prefixes [url]}})
+            n (tender/run-main wasm [:http-post-headers] caps)]
+        (is (= -1 n) "still refused despite an allowlist that explicitly matches this exact URL")
+        (is (zero? @hits) "the local server never received a request"))
+      (finally (.stop server 0)))))
+
+(deftest http-post-headers-denied-pre-flight-when-max-http-posts-is-zero-by-default
+  (testing ":max-http-posts stays at its default-runtime-limits 0 for http-post-headers too -- rejected before any Instance is built"
+    (let [caps (contract/host-caps {:grants [:http-post-headers]})]
+      (is (thrown-with-msg? kerror/ExceptionInfo #"rejected by contract"
+                            (tender/instantiate (byte-array 0) [:http-post-headers] caps))))))
+
+(deftest post-request-with-headers-sends-real-headers-to-a-local-server
+  ;; The actual proof the task asked for: real headers, genuinely sent,
+  ;; verified server-side -- via the SAME `post-request-with-headers` +
+  ;; `timed-http-client` `http-post-headers-host-fn` itself calls, against
+  ;; a real local server (loopback is fine here -- this bypasses ONLY the
+  ;; destination guard, not the header-application code path under test).
+  (let [received (atom nil)
+        server (doto (HttpServer/create (InetSocketAddress. "127.0.0.1" 0) 0)
+                 (.createContext "/" (reify HttpHandler
+                                       (handle [_ exchange]
+                                         (reset! received
+                                                 {:authorization (.getFirst (.getRequestHeaders ^HttpExchange exchange) "Authorization")
+                                                  :content-type (.getFirst (.getRequestHeaders ^HttpExchange exchange) "Content-Type")
+                                                  :body (kbytes/utf8-string (.readAllBytes (.getRequestBody ^HttpExchange exchange)))})
+                                         (.sendResponseHeaders ^HttpExchange exchange 200 -1))))
+                 (.start))]
+    (try
+      (let [port (.getPort (.getAddress server))
+            url (str "http://127.0.0.1:" port "/xrpc/com.atproto.repo.createRecord")
+            headers (#'tender/parse-flat-pairs "Content-Type\tapplication/json\nAuthorization\tBearer fixed-jwt-token-value")
+            req (#'tender/post-request-with-headers url (kbytes/utf8-bytes "{\"hello\":\"world\"}") headers)
+            resp (.send (#'tender/timed-http-client) req (HttpResponse$BodyHandlers/ofString))]
+        (is (= 200 (.statusCode resp)))
+        (is (= "Bearer fixed-jwt-token-value" (:authorization @received))
+            "the Authorization header createRecord genuinely needs arrived intact")
+        (is (= "application/json" (:content-type @received))
+            "a SECOND header in the same flat-pairs block also arrived -- proves multi-header, not just single-header")
+        (is (= "{\"hello\":\"world\"}" (:body @received))))
+      (finally (.stop server 0)))))
+
+;; ── cbor-encode / json-encode / json-extract-field (ADR-2607230943 second
+;; wave): pure computation, real byte-level round trips via Chicory,
+;; ground-truth values computed once via a direct REPL call to the same
+;; private functions these WAT fixtures exercise through the full guest/
+;; host-fn path (`#'tender/cbor-pairs-bytes` etc.), same "reach into a
+;; private var" pattern `blocked-http-post-destination?` above uses. ──────
+
+(deftest cbor-encode-host-fn-round-trips-through-real-chicory
+  (let [pairs "iss\tdid:key:zTest\naud\tpds.aozora.app"
+        wasm (wat->wasm (cbor-encode-wat pairs 256))
+        caps (contract/host-caps {:grants [:cbor-encode]})
+        instance (tender/instantiate wasm [:cbor-encode] caps)
+        written (tender/call-main instance)]
+    (is (= 38 written) "definite-length CBOR map header + 2 string-key/string-value pairs")
+    (is (= [0xA2 0x63 0x69 0x73 0x73 0x6d 0x64 0x69 0x64 0x3a 0x6b 0x65 0x79
+            0x3a 0x7a 0x54 0x65 0x73 0x74 0x63 0x61 0x75 0x64 0x6e 0x70 0x64
+            0x73 0x2e 0x61 0x6f 0x7a 0x6f 0x72 0x61 0x2e 0x61 0x70 0x70]
+           (vec (map #(bit-and (int %) 0xff) (#'tender/read-bytes! instance 300 written))))
+        "0xA2 = map(2); 0x63 \"iss\" (3 bytes); 0x6d \"did:key:zTest\" (13 bytes); 0x63 \"aud\" (3 bytes); 0x70 \"pds.aozora.app\" (16 bytes)")))
+
+(deftest cbor-encode-host-fn-out-cap-overflow-is-in-band-minus-one
+  (let [pairs "iss\tdid:key:zTest\naud\tpds.aozora.app"
+        wasm (wat->wasm (cbor-encode-wat pairs 4)) ; 38 bytes needed, 4 given
+        caps (contract/host-caps {:grants [:cbor-encode]})
+        n (tender/run-main wasm [:cbor-encode] caps)]
+    (is (= -1 n) "same write-bytes! overflow convention every other host-fn uses")))
+
+(deftest cbor-encode-host-fn-skips-a-malformed-line-fail-soft
+  (let [pairs "a\tb\nnotab\nc\td" ; middle line has no TAB
+        wasm (wat->wasm (cbor-encode-wat pairs 256))
+        caps (contract/host-caps {:grants [:cbor-encode]})
+        instance (tender/instantiate wasm [:cbor-encode] caps)
+        written (tender/call-main instance)]
+    ;; map(2): "a"->"b", "c"->"d" -- "notab" contributed no pair
+    (is (= [0xA2 0x61 0x61 0x61 0x62 0x61 0x63 0x61 0x64]
+           (vec (map #(bit-and (int %) 0xff) (#'tender/read-bytes! instance 300 written)))))))
+
+(deftest json-encode-host-fn-round-trips-through-real-chicory
+  (let [pairs "identifier\tuser.bsky.social\npassword\thunter2"
+        wasm (wat->wasm (json-encode-wat pairs 256))
+        caps (contract/host-caps {:grants [:json-encode]})
+        instance (tender/instantiate wasm [:json-encode] caps)
+        written (tender/call-main instance)]
+    (is (= "{\"identifier\":\"user.bsky.social\",\"password\":\"hunter2\"}"
+           (tender/read-memory-string instance 300 written))
+        "flat XRPC-shaped request body")))
+
+(deftest json-encode-host-fn-escapes-quotes-backslashes-and-tabs
+  ;; A literal newline in the VALUE is deliberately NOT covered here --
+  ;; `parse-flat-pairs` uses LF as the pair separator, so an embedded
+  ;; newline would split this into two (guest-level) lines, not survive
+  ;; as part of one value; see `json-escape-directly-handles-newline-and-
+  ;; control-chars` below for that escaping logic tested in isolation,
+  ;; bypassing the wire format's own LF-as-delimiter constraint.
+  (let [raw-value "has \"quote\" and \\backslash\\ and\ttab"
+        pairs (str "k\t" raw-value)
+        wasm (wat->wasm (json-encode-wat pairs 256))
+        caps (contract/host-caps {:grants [:json-encode]})
+        instance (tender/instantiate wasm [:json-encode] caps)
+        written (tender/call-main instance)]
+    (is (= "{\"k\":\"has \\\"quote\\\" and \\\\backslash\\\\ and\\ttab\"}"
+           (tender/read-memory-string instance 300 written)))))
+
+(deftest json-escape-directly-handles-newline-and-control-chars
+  ;; Bypasses parse-flat-pairs' LF-as-pair-separator wire format entirely
+  ;; -- calls the private json-escape helper directly, the same pattern
+  ;; blocked-http-post-destination? above uses.
+  (is (= "line1\\nline2" (#'tender/json-escape "line1\nline2")))
+  (is (= "cr\\rhere" (#'tender/json-escape "cr\rhere")))
+  (is (= "\\u0001\\u0002" (#'tender/json-escape (str (char 1) (char 2))))
+      "other C0 control characters get \\uXXXX, not passed through raw"))
+
+(deftest json-encode-host-fn-out-cap-overflow-is-in-band-minus-one
+  (let [pairs "a\tb"
+        wasm (wat->wasm (json-encode-wat pairs 2)) ; {"a":"b"} needs 9 bytes, 2 given
+        caps (contract/host-caps {:grants [:json-encode]})
+        n (tender/run-main wasm [:json-encode] caps)]
+    (is (= -1 n))))
+
+;; ── dotted-path nesting extension (com-junkawasaki/root, third wave --
+;; Phase A's own ADR-2607230943 flagged this as an explicit follow-up,
+;; closed here). Same `cbor_encode`/`json_encode` host-imports, same ABI
+;; shape -- ONLY the interpretation of the (already-existing) flat
+;; key<TAB>value wire format grew a dotted-path convention. WAT tests
+;; below prove the REAL Chicory host-fn path (not just the Clojure logic
+;; in isolation) handles it; the byte-EXACT CACAO-envelope/createRecord-
+;; body reproduction tests further below are direct calls to the same
+;; private functions the WAT fixtures exercise (this file's own
+;; established ground-truth pattern, see the section header above
+;; cbor-encode-host-fn-round-trips-through-real-chicory), since baking a
+;; 264-byte CBOR fixture into WAT string-literal source is unwieldy and
+;; not what those two tests are proving (the compiler/Chicory LINKAGE for
+;; the dotted-path feature is already proven by the small WAT/compiled-
+;; guest tests here and below). ──────────────────────────────────────────
+
+(deftest cbor-encode-host-fn-nests-one-object-level-through-real-chicory
+  (testing "\"s.t\"/\"s.s\" -- exactly the CACAO wire's own nested \"s\" object shape"
+    (let [pairs "s.t\teip4361\ns.s\tsigvalue"
+          wasm (wat->wasm (cbor-encode-wat pairs 256))
+          caps (contract/host-caps {:grants [:cbor-encode]})
+          instance (tender/instantiate wasm [:cbor-encode] caps)
+          written (tender/call-main instance)]
+      (is (= 25 written) "map(1) \"s\"->map(2) \"t\"->\"eip4361\" \"s\"->\"sigvalue\"")
+      (is (= [0xA1 0x61 0x73 0xA2 0x61 0x74 0x67 0x65 0x69 0x70 0x34 0x33 0x36 0x31
+              0x61 0x73 0x68 0x73 0x69 0x67 0x76 0x61 0x6c 0x75 0x65]
+             (vec (map #(bit-and (int %) 0xff) (#'tender/read-bytes! instance 300 written))))
+          "0xA1 map(1) \"s\"(1 byte); 0xA2 nested map(2) \"t\"(1)\"eip4361\"(7) \"s\"(1)\"sigvalue\"(8)"))))
+
+(deftest cbor-encode-host-fn-nests-one-array-level-through-real-chicory
+  (testing "\"resources.0\"/\"resources.1\" -- exactly the CACAO wire's own \"p.resources\" array shape"
+    (let [pairs "resources.0\ta\nresources.1\tb"
+          wasm (wat->wasm (cbor-encode-wat pairs 256))
+          caps (contract/host-caps {:grants [:cbor-encode]})
+          instance (tender/instantiate wasm [:cbor-encode] caps)
+          written (tender/call-main instance)]
+      (is (= 16 written) "map(1) \"resources\"(9-byte string key)->array(2) \"a\" \"b\"")
+      (is (= [0xA1 0x69 0x72 0x65 0x73 0x6f 0x75 0x72 0x63 0x65 0x73 0x82 0x61 0x61 0x61 0x62]
+             (vec (map #(bit-and (int %) 0xff) (#'tender/read-bytes! instance 300 16))))
+          "0xA1 map(1) \"resources\"(9 bytes); 0x82 array(2); \"a\" \"b\""))))
+
+(deftest cbor-encode-host-fn-array-index-order-is-independent-of-source-order
+  (testing "resources.1 declared BEFORE resources.0 still renders index-ascending"
+    (let [pairs "resources.1\tb\nresources.0\ta"
+          wasm (wat->wasm (cbor-encode-wat pairs 256))
+          caps (contract/host-caps {:grants [:cbor-encode]})
+          instance (tender/instantiate wasm [:cbor-encode] caps)
+          written (tender/call-main instance)]
+      (is (= [0xA1 0x69 0x72 0x65 0x73 0x6f 0x75 0x72 0x63 0x65 0x73 0x82 0x61 0x61 0x61 0x62]
+             (vec (map #(bit-and (int %) 0xff) (#'tender/read-bytes! instance 300 written))))))))
+
+(deftest cbor-encode-host-fn-dot-free-keys-are-byte-identical-to-pre-nesting-behavior
+  (testing "a purely numeric-looking DOT-FREE top-level key is NOT reinterpreted as an array -- top-level is always a map"
+    (let [pairs "0\ta\n1\tb"
+          wasm (wat->wasm (cbor-encode-wat pairs 256))
+          caps (contract/host-caps {:grants [:cbor-encode]})
+          instance (tender/instantiate wasm [:cbor-encode] caps)
+          written (tender/call-main instance)]
+      (is (= [0xA2 0x61 0x30 0x61 0x61 0x61 0x31 0x61 0x62]
+             (vec (map #(bit-and (int %) 0xff) (#'tender/read-bytes! instance 300 written))))
+          "0xA2 = map(2) \"0\"->\"a\" \"1\"->\"b\" -- NOT 0x82 array(2), because these keys never had a dot"))))
+
+(deftest json-encode-host-fn-nests-object-and-array-through-real-chicory
+  (let [pairs "s.t\teip4361\ns.s\tsigvalue\np.resources.0\ta\np.resources.1\tb"
+        wasm (wat->wasm (json-encode-wat pairs 256))
+        caps (contract/host-caps {:grants [:json-encode]})
+        instance (tender/instantiate wasm [:json-encode] caps)
+        written (tender/call-main instance)]
+    (is (= "{\"s\":{\"t\":\"eip4361\",\"s\":\"sigvalue\"},\"p\":{\"resources\":[\"a\",\"b\"]}}"
+           (tender/read-memory-string instance 300 written)))))
+
+;; ── byte-exact fidelity vs the REAL JVM reference implementations
+;; (com-junkawasaki/root, this ADR): `cloud_itonami.media.cacao/->wire`
+;; (traced to kawaraban.cacao/tashikame.cacao/kotoba.cacao, 52 real
+;; published records against pds.aozora.app as of ADR-2607110200) and
+;; `cloud_itonami.media.aozora/create-record!`'s `com.atproto.repo.
+;; createRecord` request body (via `cheshire.core/generate-string`, the
+;; SAME JSON writer `cloud_itonami.media.batch` wires production with).
+;; Expected bytes below were computed ONCE, in this development session,
+;; by directly requiring `cloud-itonami.media.cacao`/`cloud-itonami.media.
+;; aozora` from a local sibling checkout and calling `->wire`/
+;; `create-record!` with the exact fixed inputs reproduced here (a mocked
+;; `:http-fn` captured the request instead of making a real network call
+;; -- see this PR's description for the verification script and its
+;; output). This ns does NOT depend on cloud-itonami (no cross-repo
+;; dependency was added) -- the expected values are hardcoded golden
+;; fixtures, same as every other byte-vector `is` above in this file. ────
+
+(deftest cbor-encode-nested-reproduces-cacao-wire-envelope-byte-exact
+  (testing "cloud_itonami.media.cacao/->wire's own {\"h\":{\"t\":...} \"p\":{...\"resources\":[...]...} \"s\":{...}} shape, for a real (non-:statement) mint-session! parameter set -- \"p\" stays at <=8 keys (iss aud iat nonce domain version resources exp), so PersistentArrayMap's insertion-order iteration applies deterministically on the JVM reference side too, no hash-map iteration-order guessing needed"
+    (let [raw-pairs (str/join "\n"
+                              ["h.t\teip4361"
+                               "p.iss\tdid:key:zTestDid123"
+                               "p.aud\thttps://pds.aozora.app"
+                               "p.iat\t2026-07-23T00:00:00Z"
+                               "p.nonce\tnonce-fixed-abc"
+                               "p.domain\taozora.app"
+                               "p.version\t1"
+                               "p.resources.0\tkotoba://op/datom:transact"
+                               "p.resources.1\tkotoba://graph/graph-42"
+                               "p.exp\t2026-07-23T01:00:00Z"
+                               "s.t\tEdDSA"
+                               "s.s\tsig-b64-fixed-value"])
+          pairs (#'tender/parse-flat-pairs raw-pairs)
+          cbor-bytes (#'tender/cbor-pairs-bytes pairs)
+          expected (byte-array
+                    (map unchecked-byte
+                         [163 97 104 161 97 116 103 101 105 112 52 51 54 49 97 112 168 99 105 115
+                          115 115 100 105 100 58 107 101 121 58 122 84 101 115 116 68 105 100 49
+                          50 51 99 97 117 100 118 104 116 116 112 115 58 47 47 112 100 115 46 97
+                          111 122 111 114 97 46 97 112 112 99 105 97 116 116 50 48 50 54 45 48 55
+                          45 50 51 84 48 48 58 48 48 58 48 48 90 101 110 111 110 99 101 111 110
+                          111 110 99 101 45 102 105 120 101 100 45 97 98 99 102 100 111 109 97
+                          105 110 106 97 111 122 111 114 97 46 97 112 112 103 118 101 114 115
+                          105 111 110 97 49 105 114 101 115 111 117 114 99 101 115 130 120 26
+                          107 111 116 111 98 97 58 47 47 111 112 47 100 97 116 111 109 58 116
+                          114 97 110 115 97 99 116 119 107 111 116 111 98 97 58 47 47 103 114
+                          97 112 104 47 103 114 97 112 104 45 52 50 99 101 120 112 116 50 48
+                          50 54 45 48 55 45 50 51 84 48 49 58 48 48 58 48 48 90 97 115 162 97
+                          116 101 69 100 68 83 65 97 115 115 115 105 103 45 98 54 52 45 102
+                          105 120 101 100 45 118 97 108 117 101]))]
+      (is (= 264 (count cbor-bytes)))
+      (is (= (vec expected) (vec cbor-bytes))
+          "byte-exact against cloud_itonami.media.cacao/->wire's real CBOR output for this fixed payload"))))
+
+(deftest json-encode-nested-reproduces-createrecord-body-byte-exact
+  (testing "cloud_itonami.media.aozora/create-record!'s com.atproto.repo.createRecord body -- {repo,collection,rkey,record}, record itself an object with an array-of-objects field (cites), matching cloud_itonami.media.murakumo/generate-digest! + publish/digest->wire's real field set"
+    (let [raw-pairs (str/join "\n"
+                              ["repo\tdid:key:zTestDid123"
+                               "collection\tnet.itonami.media.digest"
+                               "rkey\tdigest.fixed123"
+                               "record.analysis\tThis is a test digest analysis."
+                               "record.cites.0.url\thttps://example.com/a"
+                               "record.cites.1.url\thttps://example.com/b"
+                               "record.createdAt\t2026-07-23T03:10:24.706886Z"
+                               "record.actor\tdid:key:zTestDid123"])
+          pairs (#'tender/parse-flat-pairs raw-pairs)
+          json-str (kbytes/utf8-string ^bytes (#'tender/json-pairs-bytes pairs))
+          expected (str "{\"repo\":\"did:key:zTestDid123\",\"collection\":\"net.itonami.media.digest\","
+                        "\"rkey\":\"digest.fixed123\",\"record\":{\"analysis\":\"This is a test digest analysis.\","
+                        "\"cites\":[{\"url\":\"https://example.com/a\"},{\"url\":\"https://example.com/b\"}],"
+                        "\"createdAt\":\"2026-07-23T03:10:24.706886Z\",\"actor\":\"did:key:zTestDid123\"}}")]
+      (is (= 297 (count (kbytes/utf8-bytes json-str))))
+      (is (= expected json-str)
+          "byte-exact against cloud_itonami.media.aozora/create-record!'s real cheshire-generated JSON body for this fixed record"))))
+
+(deftest json-extract-field-host-fn-round-trips-through-real-chicory
+  (let [json-text "{\"accessJwt\":\"abc.def.ghi\",\"uri\":\"at://x\"}"
+        wasm (wat->wasm (json-extract-field-wat json-text "accessJwt" 64))
+        caps (contract/host-caps {:grants [:json-extract-field]})
+        instance (tender/instantiate wasm [:json-extract-field] caps)
+        written (tender/call-main instance)]
+    (is (= "abc.def.ghi" (tender/read-memory-string instance 300 written)))))
+
+(deftest json-extract-field-host-fn-tolerates-whitespace-after-the-colon
+  (let [json-text "{\"accessJwt\": \"abc\"}"
+        wasm (wat->wasm (json-extract-field-wat json-text "accessJwt" 64))
+        caps (contract/host-caps {:grants [:json-extract-field]})
+        instance (tender/instantiate wasm [:json-extract-field] caps)
+        written (tender/call-main instance)]
+    (is (= "abc" (tender/read-memory-string instance 300 written)))))
+
+(deftest json-extract-field-host-fn-missing-field-is-in-band-minus-one
+  (let [json-text "{\"foo\":\"bar\"}"
+        wasm (wat->wasm (json-extract-field-wat json-text "accessJwt" 64))
+        caps (contract/host-caps {:grants [:json-extract-field]})
+        n (tender/run-main wasm [:json-extract-field] caps)]
+    (is (= -1 n) "field absent -- not a general parser, so no attempt to synthesize a value")))
+
+(deftest json-extract-field-host-fn-non-string-value-is-in-band-minus-one
+  (let [json-text "{\"n\":123}"
+        wasm (wat->wasm (json-extract-field-wat json-text "n" 64))
+        caps (contract/host-caps {:grants [:json-extract-field]})
+        n (tender/run-main wasm [:json-extract-field] caps)]
+    (is (= -1 n) "value isn't a quoted string -- out of this bounded scan's scope, not coerced")))
+
+;; ── llm-infer: DI'd via :llm-client (`{:infer-fn}`), same shape :store
+;; already uses for log-read/log-write -- these tests inject a fake
+;; :infer-fn instead of ever reaching the real Anthropic API. ───────────────
+
+(deftest llm-infer-denied-without-explicit-grant-and-limit
+  (testing "default caps: no :llm-infer grant AND max-llm-infers 0 -- pre-flight rejects before any Instance is built"
+    (let [caps (contract/host-caps {})]
+      (is (thrown-with-msg? kerror/ExceptionInfo #"rejected by contract"
+                            (tender/instantiate (byte-array 0) [:llm-infer] caps))))))
+
+(deftest production-host-support-is-checked-before-wasm-parsing
+  (testing "default LLM and in-memory storage are not production fallbacks"
+    (doseq [import [:llm-infer :log-read :log-write]]
+      (let [caps (contract/host-caps
+                  {:grants [import]
+                   :limits {:max-llm-infers 1
+                            :allow-write-imports? true}})]
+        (try
+          (tender/instantiate (byte-array 0) [import] caps
+                              {:profile :production})
+          (is false (str import " should be denied"))
+          (catch kerror/ExceptionInfo e
+            (is (= :host-surface-rejected
+                   (:kototama.host/code (ex-data e)))))))))
+  (testing "explicit providers pass host admission and reach artifact parsing"
+    (let [caps (contract/host-caps
+                {:grants [:llm-infer]
+                 :limits {:max-llm-infers 1}})]
+      (is (thrown? Exception
+                   (tender/instantiate
+                    (byte-array 0) [:llm-infer] caps
+                    {:profile :production
+                     :llm-client {:infer-fn (fn [_] "ok")}}))))))
+
+(deftest production-http-requires-complete-bound-authority-before-artifact-parse
+  (let [caps (contract/host-caps
+              {:grants [:http-post] :limits {:max-http-posts 1}})
+        configured {:profile :production
+                    :http-policy {}
+                    :request-purpose :model-inference
+                    :credential-provider (constantly {"Authorization" "x"})}]
+    (testing "missing authority configuration is rejected by host admission"
+      (try
+        (tender/open-session (byte-array 0) [:http-post] caps
+                             {:profile :production})
+        (is false "unconfigured production HTTP should fail")
+        (catch kerror/ExceptionInfo e
+          (is (= :host-surface-rejected
+                 (:kototama.host/code (ex-data e)))))))
+    (testing "present but incomplete policy is rejected before signed artifact parsing"
+      (try
+        (tender/open-session (byte-array 0) [:http-post] caps configured)
+        (is false "incomplete production network policy should fail")
+        (catch kerror/ExceptionInfo e
+          (is (= :incomplete-policy
+                 (:kototama.network/code (ex-data e)))))))))
+
+(defn- production-signing-fixture [wasm]
+  (let [registry (signer/new-registry :root)
+        root-verify (fn [_ body signature]
+                      (= signature [:root (:epoch (read-string body))]))
+        verify-manifest
+        (fn [public-key body signature]
+          (= signature [:manifest public-key
+                        (:manifest/artifact-sha256 (read-string body))]))
+        signer-record {:key-id :release/a :public-key :pub/a
+                       :not-before-ms 1000 :expires-at-ms 3000
+                       :status :active}
+        update {:epoch 1 :issued-at-ms 900
+                :add-signers {:release/a signer-record}
+                :revoke-signers #{} :emergency-distrust #{}
+                :signature [:root 1]}
+        _ (signer/apply-trust-update! registry update root-verify)
+        digest (tender/artifact-sha256 wasm)
+        manifest {:manifest/id :fixture/fact
+                  :manifest/signer-key-id :release/a
+                  :manifest/artifact-sha256 digest
+                  :manifest/signature [:manifest :pub/a digest]}]
+    {:signer-registry registry :signed-manifest manifest
+     :manifest-now-ms 1500 :verify-manifest-fn verify-manifest}))
+
+(deftest production-artifact-admission-is-signed-digest-bound-and-live
+  (let [wasm (wat->wasm "(module (func (export \"main\") (result i64) (i64.const 7)))")
+        caps (contract/host-caps {})
+        signing (production-signing-fixture wasm)]
+    (testing "unsigned production artifacts fail before parsing"
+      (try
+        (tender/open-session wasm [] caps {:profile :production})
+        (is false "unsigned artifact should be denied")
+        (catch kerror/ExceptionInfo e
+          (is (= :signed-manifest-required
+                 (:kototama.tender/problem (ex-data e)))))))
+    (testing "authorized manifest is bound to the exact Wasm digest"
+      (let [session (tender/open-session
+                     wasm [] caps (assoc signing :profile :production))]
+        (is (= 7 (tender/session-call-main session)))
+        (is (true? (get-in session [:artifact-admission :authorized?]))))
+      (is (thrown-with-msg?
+           kerror/ExceptionInfo #"digest mismatch"
+           (tender/open-session
+            (byte-array (concat wasm [0]))
+            [] caps (assoc signing :profile :production)))))
+    (testing "emergency distrust applies to the next admission without restart"
+      (signer/apply-trust-update!
+       (:signer-registry signing)
+       {:epoch 2 :issued-at-ms 1600 :add-signers {}
+        :revoke-signers #{} :emergency-distrust #{:release/a}
+        :signature [:root 2]}
+       (fn [_ body signature]
+         (= signature [:root (:epoch (read-string body))])))
+      (is (thrown-with-msg?
+           kerror/ExceptionInfo #"manifest signer denied"
+           (tender/open-session
+            wasm [] caps (assoc signing :profile :production)))))))
+
+(deftest llm-infer-round-trips-through-an-injected-mock-client
+  (let [wasm (wat->wasm llm-infer-wat)
+        caps (contract/host-caps {:grants [:llm-infer] :limits {:max-llm-infers 1}})
+        seen-prompt (atom nil)
+        instance (tender/instantiate wasm [:llm-infer] caps
+                                     {:llm-client {:infer-fn (fn [prompt]
+                                                               (reset! seen-prompt prompt)
+                                                               "mocked reply")}})
+        n (tender/call-main instance)]
+    (is (= "hello" @seen-prompt) "the guest's prompt bytes were read out of its own memory correctly")
+    (is (= (count "mocked reply") n))
+    (is (= "mocked reply" (tender/read-memory-string instance 100 n)))))
+
+(deftest llm-infer-count-limit-denies-once-exceeded
+  (let [wasm (wat->wasm llm-infer-twice-wat)
+        caps (contract/host-caps {:grants [:llm-infer] :limits {:max-llm-infers 1}})
+        n (tender/run-main wasm [:llm-infer] caps {:llm-client {:infer-fn (fn [_] "ok")}})]
+    (testing "1st call fits the max-llm-infers 1 cap; the 2nd call is denied"
+      (is (= -1 n)))))
+
+(deftest llm-infer-fails-closed-when-the-client-yields-nil
+  (testing "no API key configured / underlying call failed -- :infer-fn returns nil, the host-fn is fail-closed (-1), not an exception"
+    (let [wasm (wat->wasm llm-infer-wat)
+          caps (contract/host-caps {:grants [:llm-infer] :limits {:max-llm-infers 5}})
+          n (tender/run-main wasm [:llm-infer] caps {:llm-client {:infer-fn (fn [_] nil)}})]
+      (is (= -1 n)))))
+
+(deftest llm-infer-fails-closed-through-the-real-default-client-when-no-api-key-is-set
+  (testing "no :llm-client opt passed at all -- wired to the real default-llm-client; asserts the fail-closed path only when this env truly has no key configured, so this never makes a live network call in an environment that happens to have one set for something else"
+    (when (nil? (tender/resolve-llm-api-key))
+      (let [wasm (wat->wasm llm-infer-wat)
+            caps (contract/host-caps {:grants [:llm-infer] :limits {:max-llm-infers 1}})
+            n (tender/run-main wasm [:llm-infer] caps)]
+        (is (= -1 n))))))
+
+(deftest fuel-limit-traps-an-infinite-loop
+  (let [wasm (wat->wasm infinite-loop-wat)
+        caps (contract/host-caps {})]
+    (is (thrown-with-msg? kerror/ExceptionInfo #"host instruction meter"
+                          (tender/run-main wasm [] caps {:fuel 10000})))))
+
+(deftest bounded-run-enforces-deadline-and-concurrency-admission
+  (testing "a blocking host provider is cancelled at the wall deadline"
+    (let [wasm (wat->wasm llm-infer-wat)
+          caps (contract/host-caps
+                {:grants [:llm-infer] :limits {:max-llm-infers 1}})
+          started (promise)
+          interrupted (promise)]
+      (is (thrown-with-msg?
+           kerror/ExceptionInfo #"deadline exceeded"
+           (tender/run-main-bounded
+            wasm [:llm-infer] caps
+            {:deadline-ms 50
+             :llm-client {:infer-fn
+                          (fn [_]
+                            (deliver started true)
+                            (try (Thread/sleep 10000)
+                                 (catch InterruptedException _
+                                   (deliver interrupted true)))
+                            "late")}})))
+      (is (= true (deref started 1000 false)))
+      (is (= true (deref interrupted 1000 false)))))
+  (testing "saturation is rejected without queuing or parsing a guest"
+    (let [permits (java.util.concurrent.Semaphore. 1)]
+      (.acquire permits)
+      (try
+        (is (thrown-with-msg?
+             kerror/ExceptionInfo #"concurrent run limit"
+             (tender/run-main-bounded
+              (byte-array 0) [] (contract/host-caps {})
+              {:run-permits permits :deadline-ms 100})))
+        (finally (.release permits))))))
+
+(deftest bounded-run-rejects-invalid-deadline-before-execution
+  (is (thrown-with-msg?
+       kerror/ExceptionInfo #"deadline-ms must be positive"
+       (tender/run-main-bounded
+        (byte-array 0) [] (contract/host-caps {}) {:deadline-ms 0}))))
+
+(deftest memory-grow-within-cap-succeeds
+  (let [wasm (wat->wasm (memory-grow-wat 1)) ; 1 initial + 1 = 2, exactly the cap
+        caps (contract/host-caps {:limits {:max-memory-pages 2}})
+        prev-size (tender/run-main wasm [] caps)]
+    (is (= 1 prev-size) "memory.grow returns the PREVIOUS page count on success")))
+
+(deftest memory-grow-past-cap-fails
+  (let [wasm (wat->wasm (memory-grow-wat 5)) ; 1 initial + 5 = 6, past a 2-page cap
+        caps (contract/host-caps {:limits {:max-memory-pages 2}})
+        result (tender/run-main wasm [] caps)]
+    (is (= -1 result) "memory.grow returns -1 when it would exceed max-memory-pages")))
+
+(deftest memory-less-guest-is-unaffected-by-the-memory-cap
+  (let [wasm (wat->wasm clock-monotonic-wat)
+        caps (contract/host-caps {:grants [:clock-monotonic] :limits {:max-memory-pages 0}})]
+    (is (pos? (tender/run-main wasm [:clock-monotonic] caps))
+        "a guest declaring no memory section links and runs fine even with max-memory-pages 0")))
+
+(deftest session-grants-have-call-time-use-revoke-and-drop-lifecycle
+  (testing "successful host use is accounted and revocation applies immediately"
+    (let [wasm (wat->wasm clock-monotonic-wat)
+          caps (contract/host-caps {:grants [:clock-monotonic]})
+          session (tender/open-session wasm [:clock-monotonic] caps)]
+      (is (pos? (tender/session-call-main session)))
+      (is (= 1 (get-in (tender/authority-snapshot session)
+                       [:uses :clock-monotonic])))
+      (tender/revoke-import! session :clock-monotonic :incident-response)
+      (is (thrown-with-msg?
+           kerror/ExceptionInfo #"host import denied"
+           (tender/session-call-main session)))
+      (is (= :incident-response
+             (get-in (tender/authority-snapshot session)
+                     [:reasons :clock-monotonic])))))
+  (testing "voluntary drop uses the same common host-call chokepoint"
+    (let [wasm (wat->wasm clock-monotonic-wat)
+          caps (contract/host-caps {:grants [:clock-monotonic]})
+          session (tender/open-session wasm [:clock-monotonic] caps)]
+      (tender/drop-import! session :clock-monotonic)
+      (is (contains? (:dropped (tender/authority-snapshot session))
+                     :clock-monotonic))
+      (is (thrown? kerror/ExceptionInfo
+                   (tender/session-call-main session))))))
+
+(deftest every-actor-host-import-obeys-the-session-authority-chokepoint
+  (let [import-ids (set (keys contract/import-by-id))]
+    (is (= import-ids
+           (set (map :import/id (:abi/imports contract/import-surface))))
+        "the table is derived from the authoritative actor:host surface")
+    (doseq [import-id import-ids]
+      (let [authority-state (atom {:active #{import-id}
+                                   :revoked #{}
+                                   :dropped #{}
+                                   :consumed #{}
+                                   :remaining {}
+                                   :uses {}})
+            caps {:grants #{import-id}
+                  :authority-state authority-state}
+            session {:authority-state authority-state}]
+        (#'tender/ensure-granted! caps import-id)
+        (is (= 1 (get-in @authority-state [:uses import-id]))
+            (str import-id " accounts its call atomically"))
+        (tender/revoke-import! session import-id :qualification-revocation)
+        (is (thrown-with-msg?
+             kerror/ExceptionInfo #"host import denied"
+             (#'tender/ensure-granted! caps import-id))
+            (str import-id " cannot retain linked authority after revocation"))))))
+
+(deftest capability-lease-use-budget-is-consumed-atomically
+  (let [wasm (wat->wasm clock-monotonic-wat)
+        caps (contract/host-caps {:grants [:clock-monotonic]})
+        execution-identity {:format :kotoba.execution-identity/v1
+                            :plan-cid (cid-of "plan") :code-closure-cid (cid-of "closure")
+                            :artifact-cid (cid-of "artifact") :compiler-contract (cid-of "compiler")
+                            :component-cid (cid-of "component") :wit-world-cid (cid-of "world")
+                            :package-lock-cid (cid-of "lock") :policy-cid (cid-of "policy")
+                            :policy-decision-cid (cid-of "decision") :db-basis (cid-of "basis")
+                            :grant-cids [(cid-of "grant")] :approval-cids []
+                            :runtime-identity (cid-of "runtime") :input-cid (cid-of "input")
+                            :outcome-cid (cid-of "outcome") :host-receipt-cids []}
+        lease {:format :kotoba.capability-lease/v1
+               :capability-cid (cid-of "lease") :execution-identity-cid (cid-of "execution")
+               :component-cid (cid-of "component") :resource-cid (cid-of "clock")
+               :purpose :clock/monotonic :expires-at "2099-07-25T00:01:00Z"
+               :uses 1 :transfer :non-transferable :delegation-depth 0}
+        session (tender/open-session wasm [:clock-monotonic] caps
+                                     {:capability-leases {:clock-monotonic lease}
+                                      :execution-identity execution-identity
+                                      :execution-identity-cid (cid-of "execution")
+                                      :lease-now-ms 0})]
+    (is (pos? (tender/session-call-main session)))
+    (is (zero? (get-in (tender/authority-snapshot session) [:remaining :clock-monotonic])))
+    (is (contains? (:consumed (tender/authority-snapshot session)) :clock-monotonic))
+    (is (thrown? kerror/ExceptionInfo (tender/session-call-main session)))))
+
+(deftest capability-leases-bind-the-session-to-identity-component-and-expiry
+  (let [wasm (wat->wasm clock-monotonic-wat)
+        caps (contract/host-caps {:grants [:clock-monotonic]})
+        identity {:format :kotoba.execution-identity/v1
+                  :plan-cid (cid-of "plan") :code-closure-cid (cid-of "closure")
+                  :artifact-cid (cid-of "artifact") :compiler-contract (cid-of "compiler")
+                  :component-cid (cid-of "component") :wit-world-cid (cid-of "world")
+                  :package-lock-cid (cid-of "lock") :policy-cid (cid-of "policy")
+                  :policy-decision-cid (cid-of "decision") :db-basis (cid-of "basis")
+                  :grant-cids [(cid-of "grant")] :approval-cids []
+                  :runtime-identity (cid-of "runtime") :input-cid (cid-of "input")
+                  :outcome-cid (cid-of "outcome") :host-receipt-cids []}
+        lease {:format :kotoba.capability-lease/v1
+               :capability-cid (cid-of "lease") :execution-identity-cid (cid-of "execution")
+               :component-cid (cid-of "component") :resource-cid (cid-of "clock")
+               :purpose :clock/monotonic :expires-at "2099-07-25T00:01:00Z"
+               :uses 1 :transfer :non-transferable :delegation-depth 0}]
+    (is (thrown? kerror/ExceptionInfo
+                 (tender/open-session wasm [:clock-monotonic] caps
+                                      {:capability-leases {:clock-monotonic lease}
+                                       :execution-identity identity
+                                       :execution-identity-cid (cid-of "other")
+                                       :lease-now-ms 0})))
+    (is (thrown? kerror/ExceptionInfo
+                 (tender/open-session wasm [:clock-monotonic] caps
+                                      {:capability-leases {:clock-monotonic
+                                                           (assoc lease :expires-at "2020-01-01T00:00:00Z")}
+                                       :execution-identity identity
+                                       :execution-identity-cid (cid-of "execution")
+                                       :lease-now-ms 2000000000000})))
+    (let [clock (atom 0)
+          session (tender/open-session wasm [:clock-monotonic] caps
+                                       {:capability-leases {:clock-monotonic (assoc lease :uses 2)}
+                                        :execution-identity identity
+                                        :execution-identity-cid (cid-of "execution")
+                                        :lease-now-ms #(deref clock)})]
+      (is (pos? (tender/session-call-main session)))
+      (reset! clock 5000000000000)
+      (is (thrown? kerror/ExceptionInfo (tender/session-call-main session)))
+      (is (contains? (:expired (tender/authority-snapshot session)) :clock-monotonic)))))
+
+(deftest log-write-byte-limit-denies-once-exceeded
+  (let [wasm (wat->wasm log-write-thrice-wat)
+        caps (contract/host-caps {:grants [:log-write]
+                                  :limits {:allow-write-imports? true
+                                           :max-log-write-bytes 8}})
+        n (tender/run-main wasm [:log-write] caps)]
+    (testing "2 calls x 4 bytes = 8 bytes fits the cap; the 3rd call (12 total) is denied"
+      (is (= -1 n)))))
+
+(deftest log-write-under-the-limit-all-succeed
+  (let [wasm (wat->wasm log-write-thrice-wat)
+        caps (contract/host-caps {:grants [:log-write]
+                                  :limits {:allow-write-imports? true
+                                           :max-log-write-bytes 1000}})
+        n (tender/run-main wasm [:log-write] caps)]
+    (is (= 0 n))))
+
+(deftest sign-and-verify-round-trip-through-real-chicory
+  (let [wat "(module
+               (import \"kotoba\" \"gen_keypair\" (func $gk (param i32 i32) (result i32)))
+               (import \"kotoba\" \"sign\" (func $sign (param i32 i32 i32 i32 i32) (result i32)))
+               (import \"kotoba\" \"verify\" (func $verify (param i32 i32 i32 i32 i32 i32) (result i32)))
+               (memory (export \"memory\") 1)
+               (data (i32.const 200) \"msg!\")
+               (func (export \"main\") (result i64)
+                 (drop (call $gk (i32.const 0) (i32.const 64)))
+                 (drop (call $sign (i32.const 0) (i32.const 200) (i32.const 4) (i32.const 300) (i32.const 64)))
+                 (i64.extend_i32_s
+                   (call $verify (i32.const 32) (i32.const 32) (i32.const 200) (i32.const 4)
+                                 (i32.const 300) (i32.const 64)))))"
+        wasm (wat->wasm wat)
+        caps (contract/host-caps {:grants [:gen-keypair :sign :verify]
+                                  :limits {:allow-secret-imports? true}})
+        ok? (tender/run-main wasm [:gen-keypair :sign :verify] caps)]
+    (is (= 1 ok?))))
+
+;; ---------------------------------------------------------------------------
+;; Real .kotoba-compiler-emitted fixtures (kotoba-lang/kotoba's `kotoba wasm
+;; emit`, checked in as bytes -- NOT a hand-written WAT string self-consistent
+;; only with this repo's own field-name choices). ADR-2607062330's addendum 3
+;; found `kotoba wasm emit` could not call these imports at all until
+;; kotoba-core-contracts registered them (kotoba-core-contracts#3); this is
+;; the actual end-to-end proof that closed loop: a real compiled guest
+;; produced by the independent `kotoba` compiler links against
+;; `kototama.tender`'s HostFunctions without any shape mismatch. Source
+;; alongside each fixture for provenance (`fixtures/*.kotoba`).
+
+(deftest kotoba-compiled-sha256-hex-guest-round-trips-through-real-chicory
+  (testing "(sha256-hex 0 0 2048 64), compiled by `kotoba wasm emit`, not WAT"
+    (let [wasm (read-fixture "kotoba-compiled-sha256-hex.wasm")
+          caps (contract/host-caps {:grants [:sha256-hex]})
+          instance (tender/instantiate wasm [:sha256-hex] caps)
+          written (tender/call-main instance)]
+      (is (= 64 written))
+      (is (= "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+             (tender/read-memory-string instance 2048 written))
+          "sha256(\"\") computed by the real host function, written into the guest's own memory"))))
+
+(deftest kotoba-compiled-gen-keypair-guest-round-trips-through-real-chicory
+  (testing "(gen-keypair 2048 64), compiled by `kotoba wasm emit`, not WAT"
+    (let [wasm (read-fixture "kotoba-compiled-gen-keypair.wasm")
+          caps (contract/host-caps {:grants [:gen-keypair] :limits {:allow-secret-imports? true}})
+          written (tender/run-main wasm [:gen-keypair] caps)]
+      (is (= 64 written) "32-byte seed + 32-byte derived pubkey"))))
+
+(deftest kotoba-compiled-http-fetch-guest-round-trips-through-real-chicory
+  ;; ADR-2607230943 second wave's proof that the independent `kotoba`
+  ;; compiler and kototama.tender agree on http-fetch's shape too --
+  ;; compiled straight from kotoba-core-contracts' PRE-EXISTING "http/fetch"
+  ;; (id 205) capability, no kotoba-core-contracts change needed for this
+  ;; one fixture (unlike cbor-encode/json-encode/json-extract-field, which
+  ;; are net-new to that table and so aren't exercised here). The guest's
+  ;; literal URL ("http://127.0.0.1/") is deliberately loopback -- kototama
+  ;; unconditionally refuses it (same denylist http-post's own compiled
+  ;; fixtures would hit, which is why neither has one either), so this
+  ;; proves real compiler-to-tender LINKAGE + real SSRF-guard EXECUTION,
+  ;; not a live network round trip (see tender_test.clj's http-fetch WAT
+  ;; tests above for that same guard tested directly against the host-fn).
+  (testing "(http-fetch (str-ptr url) (str-len url) (alloc 64) 64), compiled by `kotoba wasm emit`, not WAT"
+    (let [wasm (read-fixture "kotoba-compiled-http-fetch.wasm")
+          caps (contract/host-caps {:grants [:http-fetch] :limits {:max-http-fetches 1}})
+          written (tender/run-main wasm [:http-fetch] caps)]
+      (is (= -1 written) "loopback URL refused by the same denylist the WAT-based tests above verify"))))
+
+;; cbor-encode/json-encode/json-extract-field, unlike http-fetch above,
+;; ARE net-new to kotoba-core-contracts' capability_contract.edn (ids 245/
+;; 246) -- compiled with `kbb -M:dev` against a LOCAL sibling checkout
+;; of the SAME edited kotoba-core-contracts this wave's own PR carries
+;; (com-junkawasaki/root ADR-2607230943), proving the independent `kotoba`
+;; compiler resolves these new host-import call targets and kototama.tender
+;; links the resulting binary, end to end -- same E2E proof PR #23
+;; established for sha256-hex/gen-keypair.
+
+;; `alloc`'s returned pointer is `kotoba wasm emit`'s fixed heap-base for
+;; every one of these short guests (verified once via a direct
+;; `kotoba.runtime/wasm-binary` call at fixture-generation time, same
+;; value `kotoba-compiled-sha256-hex.kotoba`'s own literal `2048` offset
+;; already uses -- these 3 fixtures just reach it through `alloc` instead
+;; of a hand-picked literal, since their source strings are built with
+;; `str-ptr`/`str-len` rather than assuming offset 0 holds nothing).
+(def ^:private alloc-heap-base 2048)
+
+(deftest kotoba-compiled-cbor-encode-guest-round-trips-through-real-chicory
+  (testing "(cbor-encode (str-ptr \"a\\tb\") (str-len \"a\\tb\") (alloc 64) 64), compiled by `kotoba wasm emit`, not WAT"
+    (let [wasm (read-fixture "kotoba-compiled-cbor-encode.wasm")
+          caps (contract/host-caps {:grants [:cbor-encode]})
+          instance (tender/instantiate wasm [:cbor-encode] caps)
+          written (tender/call-main instance)]
+      (is (= 5 written) "map(1) header + 1-byte-string \"a\" + 1-byte-string \"b\"")
+      (is (= [0xA1 0x61 0x61 0x61 0x62]
+             (vec (map #(bit-and (int %) 0xff) (#'tender/read-bytes! instance alloc-heap-base written))))))))
+
+(deftest kotoba-compiled-json-encode-guest-round-trips-through-real-chicory
+  (testing "(json-encode (str-ptr \"a\\tb\") (str-len \"a\\tb\") (alloc 64) 64), compiled by `kotoba wasm emit`, not WAT"
+    (let [wasm (read-fixture "kotoba-compiled-json-encode.wasm")
+          caps (contract/host-caps {:grants [:json-encode]})
+          instance (tender/instantiate wasm [:json-encode] caps)
+          written (tender/call-main instance)]
+      (is (= "{\"a\":\"b\"}" (tender/read-memory-string instance alloc-heap-base written))))))
+
+(deftest kotoba-compiled-json-extract-field-guest-round-trips-through-real-chicory
+  (testing "(json-extract-field ... \"{\\\"k\\\":\\\"v\\\"}\" ... \"k\" ...), compiled by `kotoba wasm emit`, not WAT"
+    (let [wasm (read-fixture "kotoba-compiled-json-extract-field.wasm")
+          caps (contract/host-caps {:grants [:json-extract-field]})
+          instance (tender/instantiate wasm [:json-extract-field] caps)
+          written (tender/call-main instance)]
+      (is (= "v" (tender/read-memory-string instance alloc-heap-base written))))))
+
+;; ── com-junkawasaki/root, third wave: cbor-encode/json-encode nesting +
+;; http-post-headers, compiled by REAL `kotoba wasm emit` (not hand-written
+;; WAT) against a local sibling checkout of THIS wave's own edited
+;; kotoba-core-contracts, same "net-new to capability_contract.edn, so
+;; compile against a local sibling checkout" proof shape PR #49 established
+;; for cbor-encode/json-encode/json-extract-field's own first compiled
+;; fixtures (http-post-headers reuses http-post's http/post capability id
+;; 223, already resolvable through any kotoba-core-contracts pin -- but the
+;; NEW `http_post_headers` host-import name itself is net-new, so this
+;; fixture needed the same local-sibling-checkout compile as the other two
+;; anyway). ──────────────────────────────────────────────────────────────
+
+(deftest kotoba-compiled-cbor-encode-nested-guest-round-trips-through-real-chicory
+  (testing "(cbor-encode (str-ptr \"s.t\\teip4361\\ns.s\\tsigvalue\") ...), compiled by `kotoba wasm emit`, not WAT -- same nested {\"s\":{\"t\":...,\"s\":...}} shape the hand-written WAT test above proves, this time through the real compiler"
+    (let [wasm (read-fixture "kotoba-compiled-cbor-encode-nested.wasm")
+          caps (contract/host-caps {:grants [:cbor-encode]})
+          instance (tender/instantiate wasm [:cbor-encode] caps)
+          written (tender/call-main instance)]
+      (is (= 25 written))
+      (is (= [0xA1 0x61 0x73 0xA2 0x61 0x74 0x67 0x65 0x69 0x70 0x34 0x33 0x36 0x31
+              0x61 0x73 0x68 0x73 0x69 0x67 0x76 0x61 0x6c 0x75 0x65]
+             (vec (map #(bit-and (int %) 0xff) (#'tender/read-bytes! instance alloc-heap-base written))))))))
+
+(deftest kotoba-compiled-json-encode-nested-guest-round-trips-through-real-chicory
+  (testing "(json-encode (str-ptr \"s.t\\teip4361\\ns.s\\tsigvalue\\np.resources.0\\ta\\np.resources.1\\tb\") ...), compiled by `kotoba wasm emit`, not WAT"
+    (let [wasm (read-fixture "kotoba-compiled-json-encode-nested.wasm")
+          caps (contract/host-caps {:grants [:json-encode]})
+          instance (tender/instantiate wasm [:json-encode] caps)
+          written (tender/call-main instance)]
+      (is (= "{\"s\":{\"t\":\"eip4361\",\"s\":\"sigvalue\"},\"p\":{\"resources\":[\"a\",\"b\"]}}"
+             (tender/read-memory-string instance alloc-heap-base written))))))
+
+(deftest kotoba-compiled-http-post-headers-guest-round-trips-through-real-chicory
+  (testing "(http-post-headers (str-ptr url) ... (str-ptr \"Authorization\\tBearer tok\") ...), compiled by `kotoba wasm emit`, not WAT -- loopback URL deliberately refused by the SSRF denylist (same non-live-network proof shape kotoba-compiled-http-fetch.wasm above uses), proving real compiler-to-tender LINKAGE for the net-new http_post_headers host-import"
+    (let [wasm (read-fixture "kotoba-compiled-http-post-headers.wasm")
+          caps (contract/host-caps {:grants [:http-post-headers] :limits {:max-http-posts 1}})
+          written (tender/run-main wasm [:http-post-headers] caps)]
+      (is (= -1 written) "loopback URL refused by the same denylist the WAT-based tests above verify"))))
+
+;; ---------------------------------------------------------------------------
+;; Guests amu wove (kotoba compile / wasm32-kotoba-v1), not `kotoba wasm emit`.
+;; The checked-in bytes are produced by kotoba-wasm from the KIR amu lowers;
+;; source sits beside each fixture. This is the stack bind ADR-2608139980
+;; names: amu weaves, kototama binds.
+
+(deftest amu-compiled-i64-main-runs-on-the-tender
+  (testing "host-free `(defn main [] 42)` from amu, not WAT or wasm emit"
+    (let [wasm (read-fixture "amu-compiled-i64-main.wasm")
+          inspected (tender/inspect-module wasm)]
+      (is (:has-main? inspected))
+      (is (empty? (:import-names inspected))
+          "this guest is host-free")
+      (is (= 42 (tender/run-main wasm [] {}))))))
+
+(deftest amu-compiled-clock-now-links-kotoba-cap-call
+  (testing "`(clock/now 0)` → kotoba:cap/call id 7, granted as :clock-monotonic"
+    (let [wasm (read-fixture "amu-compiled-clock-now.wasm")
+          inspected (tender/inspect-module wasm)
+          caps (contract/host-caps {:grants [:clock-monotonic]})
+          before (System/currentTimeMillis)
+          n (tender/run-main wasm [:clock-monotonic] caps)
+          after (System/currentTimeMillis)]
+      (is (= [{:module "kotoba:cap" :name "call"}] (:imports inspected)))
+      (is (<= before n after)
+          "host returns wall millis from the same clock_monotonic grant")
+      (is (thrown-with-msg?
+           kerror/ExceptionInfo #"host import denied"
+           (tender/run-main wasm [] {}))
+          "missing :clock-monotonic grant is fail-closed at the call"))))
+
+;; ── koto-h6: one denial shape, carried by every denial path ─────────────
+;; Denials used to come in four shapes: `{:kototama.tender/problem k}`,
+;; `{:kototama.tender/denied id :kototama.tender/reason k}`,
+;; `{:kototama.tender/rejected .. :kototama.tender/errors ..}` and, from the
+;; browser admission, `{:kototama.host/code k}` (that one landed as koto-h5,
+;; see kototama.denial-parity-test). One reader could not tell a
+;; denial from a bug without knowing which path it came from. Every path now
+;; carries the same four keys (`kototama.denial/shape-keys`); the old keys
+;; stay beside them for the readers that pin them (sahai / fleet store
+;; tests read `[:error :kototama.tender/problem]`).
+
+(def ^:private denial-shape-keys
+  #{:kototama.tender/problem :kototama.tender/reason
+    :kototama.tender/value :kototama.tender/host})
+
+(defn- ex-data-of
+  "The ex-data THUNK throws, or ::no-throw."
+  [thunk]
+  (try (thunk) ::no-throw
+       (catch kerror/ExceptionInfo e (ex-data e))))
+
+(deftest every-denial-path-returns-the-one-denial-shape
+  (let [caps (contract/host-caps {})
+        loop-wasm (wat->wasm infinite-loop-wat)
+        multi (tender/instantiate (wat->wasm multi-export-wat) [] caps)
+        clock-now (read-fixture "amu-compiled-clock-now.wasm")
+        paths
+        {:host-meter/instructions-exhausted
+         #(tender/run-main loop-wasm [] caps {:fuel 100})
+         :invalid-deadline
+         #(tender/run-main-bounded (byte-array 0) [] caps {:deadline-ms 0})
+         :unknown-trigger-kind
+         #(tender/dispatch-trigger multi :bogus)
+         :import-surface-rejected
+         #(tender/instantiate (byte-array 0) [:http-post] caps)
+         :signed-manifest-required
+         #(tender/open-session loop-wasm [] caps {:profile :production})
+         ;; every open-session has an authority-state, so an ungranted
+         ;; import reaches `ensure-granted!`'s atomic swap and is
+         ;; :grant/inactive there (:grant/missing is the no-authority-state
+         ;; path, reachable only by calling a host fn outside a session)
+         :grant/inactive
+         #(tender/run-main clock-now [] {})}]
+    (doseq [[reason thunk] paths]
+      (testing (str reason)
+        (let [d (ex-data-of thunk)]
+          (is (map? d) "must throw ex-info")
+          (when (map? d)
+            (is (= denial-shape-keys
+                   (set (filter denial-shape-keys (keys d))))
+                (str "all four shape keys present; got " (pr-str (keys d))))
+            (is (= reason (:kototama.tender/reason d) (:kototama.tender/problem d))
+                "reason literal, under both names")
+            (is (= :jvm (:kototama.tender/host d)))))))
+    (testing "the returned (not thrown) operational denials carry the same shape"
+      (let [r (tender/run-report-bounded (byte-array 0) [] caps {:deadline-ms 0})]
+        (is (false? (:ok? r)))
+        (is (= denial-shape-keys
+               (set (filter denial-shape-keys (keys (:error r))))))
+        (is (= :invalid-deadline
+               (get-in r [:error :kototama.tender/reason])
+               (get-in r [:error :kototama.tender/problem])))
+        (is (= 0 (get-in r [:error :kototama.tender/value])))))
+    (testing "the old shapes' keys are still there for the readers that pin them"
+      (let [d (ex-data-of #(tender/run-main clock-now [] {}))]
+        (is (= :clock-monotonic (:kototama.tender/denied d))
+            "cap-call id 7 is the :clock-monotonic grant")
+        (is (= :clock-monotonic (:kototama.tender/value d))))
+      (let [d (ex-data-of #(tender/instantiate (byte-array 0) [:http-post] caps))]
+        (is (vector? (:kototama.tender/errors d)))))))
+
+;; ── koto-h1: fuel is a per-call budget on a session, not a lifetime cap ──
+;; Measured on the base of this change (kotoba-compiled-fact.wasm, `main`
+;; costs 59 instructions): three `session-call-main` on ONE session reported
+;; :fuel-used 59, 118, 177 -- the counter was created once per Instance in
+;; `open-session` and never restarted, so a long-lived actor died of fuel at
+;; whatever later call happened to cross the cap. `spec/kototama-vm-v1.edn`
+;; makes `budget` an input of ONE transition and every `:message` carries its
+;; own `:fuel-limit`; the EVM tender already gets that for free (a fresh
+;; machine with the full gas per `run-report`). The JVM tender now matches:
+;; a session's budget window restarts at every `session-call-*`, and the
+;; scope is a named, validated option (`:fuel-scope` :call | :instance)
+;; that every fuel denial reports.
+
+(deftest fuel-is-budgeted-per-call-on-a-session
+  (let [caps (contract/host-caps {})
+        fact (read-fixture "kotoba-compiled-fact.wasm")
+        c (:fuel-used (tender/run-report fact [] caps))
+        n 3
+        ;; c < cap < 2c: one call fits, two do not, so a lifetime cap dies
+        ;; at the second call and a per-call budget never does.
+        cap (+ c (quot c 2))]
+    (is (pos? c))
+    (is (< c cap (* 2 c)))
+    (testing "default scope :call -- N calls each costing c under cap < N*c all succeed"
+      (let [s (tender/open-session fact [] caps {:fuel cap})]
+        (is (= :call (:fuel-scope s)))
+        (dotimes [i n]
+          (is (= 120 (tender/session-call-main s)) (str "call " (inc i)))
+          (is (= c @(:fuel-used s)) "the window restarts at every call"))
+        (is (= {:fuel-scope :call :fuel-limit cap :fuel-used c
+                :fuel-total (* n c) :fuel-calls n}
+               (tender/fuel-report s))
+            "replenish arithmetic: window = c, total = N*c, calls = N")))
+    (testing "explicit :instance scope -- the same session dies at the second call and says so"
+      (let [s (tender/open-session fact [] caps {:fuel cap :fuel-scope :instance})
+            _ (is (= 120 (tender/session-call-main s)))
+            d (ex-data-of #(tender/session-call-main s))]
+        (is (= :host-meter/instructions-exhausted (:kototama.tender/reason d) (:kototama.tender/problem d)))
+        (is (= :jvm (:kototama.tender/host d)))
+        (is (= :instance (:kototama.tender/fuel-scope d)))
+        (is (= 2 (:kototama.tender/calls d)) "died at call 2 of the lifetime cap")
+        (is (= (inc cap) (:kototama.tender/fuel-used d)))
+        (is (= cap (:kototama.tender/fuel-limit d)))))
+    (testing "the Instance-only entry is lifetime by construction and its denial says so"
+      (let [inst (tender/instantiate fact [] caps {:fuel cap})
+            _ (is (= 120 (tender/call-main inst)))
+            d (ex-data-of #(tender/call-main inst))]
+        (is (= :host-meter/instructions-exhausted (:kototama.tender/reason d)))
+        (is (= :instance (:kototama.tender/fuel-scope d)))
+        (is (not (contains? d :kototama.tender/calls))
+            "no session counts the calls on a bare Instance, so none is claimed")))
+    (testing "the Instance-only entry cannot promise per-call replenish -- refused, not ignored"
+      (let [d (ex-data-of #(tender/instantiate fact [] caps {:fuel cap :fuel-scope :call}))]
+        (is (= :invalid-fuel-scope (:kototama.tender/reason d)))
+        (is (= :call (:kototama.tender/value d)))
+        (is (= :instantiate (:kototama.tender/entry d)))))
+    (testing "budget and scope are validated before any Wasm is parsed (EVM parity: :invalid-budget)"
+      (doseq [bad [0 -1 nil "5" 1.5]]
+        (let [d (ex-data-of #(tender/open-session (byte-array 0) [] caps {:fuel bad}))]
+          (is (= :invalid-budget (:kototama.tender/reason d)) (str "fuel " (pr-str bad)))
+          (is (= bad (:kototama.tender/value d)))))
+      (let [d (ex-data-of #(tender/open-session (byte-array 0) [] caps {:fuel-scope :forever}))]
+        (is (= :invalid-fuel-scope (:kototama.tender/reason d)))
+        (is (= :forever (:kototama.tender/value d)))
+        (is (= #{:call :instance} (:kototama.tender/known-scopes d)))))
+    (testing "run-report names the scope it ran under"
+      (let [r (tender/run-report fact [] caps)]
+        (is (= :call (:fuel-scope r)))
+        (is (= 1 (:fuel-calls r)))
+        (is (= c (:fuel-used r)))))))
+
+(deftest dispatch-on-a-session-is-budgeted-per-trigger
+  (let [caps (contract/host-caps {})
+        multi (wat->wasm multi-export-wat)
+        c (:fuel-used (tender/run-report multi [] caps))
+        s (tender/open-session multi [] caps {:fuel (+ c (quot c 2))})]
+    (is (pos? c))
+    (dotimes [_ 3]
+      (is (= {:dispatched? true :result 222} (tender/session-dispatch-trigger s :http)))
+      (is (= {:dispatched? false} (tender/session-dispatch-trigger s :tick))
+          "a non-event is not a call and spends no window"))
+    (is (= 3 (:fuel-calls (tender/fuel-report s))))))

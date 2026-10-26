@@ -1,0 +1,140 @@
+(ns kototama.execution-native
+  "Native v2 mechanism composition over the existing measured executor.
+  The launcher supplies the plugin; this namespace imports no native engine."
+  {:kotoba/export [mechanisms]}
+  (:require [kotoba.artifact.execution :as blocks]
+            [kotoba.artifact.core :as artifact]
+            [kotoba.value.codec :as value]
+            [kotoba.abi.target :as target]
+            [kotoba.core.execution :as core]))
+
+(defn- reject! [reason]
+  (throw (ex-info "native v2 mechanism refused" {:phase :execution-native :reason reason})))
+
+(defn- canonical-value [x]
+  (cond
+    #?(:cljs (and (some? x) (= js/BigInt (.-constructor x))) :clj false)
+    #?(:cljs (if (<= (js/BigInt js/Number.MIN_SAFE_INTEGER) x (js/BigInt js/Number.MAX_SAFE_INTEGER))
+               (js/Number x) (value/int64 x)) :clj x)
+    (and (integer? x) (or (< x -9007199254740991) (> x 9007199254740991))) (value/int64 x)
+    (and (number? x) (not (integer? x))) (value/float64 x)
+    (vector? x) (mapv canonical-value x)
+    (map? x) (into {} (map (fn [[k v]] [(canonical-value k) (canonical-value v)]) x))
+    (set? x) (set (map canonical-value x))
+    (seq? x) (apply list (map canonical-value x))
+    :else x))
+
+(def ^:private internal-ops
+  ;; These operations stay in the admitted native context. Its typed handles
+  ;; do not cross the provider transport: only typed-cap-call's i64 argument
+  ;; and result do. The measured executor independently verifies the artifact
+  ;; and owns fuel/arena limits. Raw memory and ambient host calls stay out.
+  '#{typed-cap-call let if do loop recur + - * quot rem = not= < <= > >=
+     not and or bit-and bit-or bit-xor bit-not
+     pair pair-first pair-second record-new record-get record-assoc
+     typed-list-new typed-list-count typed-list-nth typed-list-conj})
+
+(defn- native-bindings! [artifact bindings]
+  (let [program (:program artifact)
+        forms (mapcat #(tree-seq coll? seq (:body %)) (:functions program))
+        calls (filter #(and (seq? %) (= (first %) (symbol "typed-cap-call"))) forms)
+        number-id #?(:clj identity :cljs js/Number)
+        ids (set (map #(number-id (second %)) calls))
+        effects (set (map (fn [e] (when (and (vector? e) (= 2 (count e)) (= :cap/call (first e)))
+                                    (number-id (second e)))) (:effects artifact)))
+        ops (into internal-ops (map :name (:functions program)))]
+    (when-not (and (vector? bindings) (<= 1 (count bindings) 64)
+                   (every? #(and (= #{:id :scope} (set (keys %)))
+                                  (pos-int? (:id %)) (<= (:id %) 255)
+                                  (vector? (:scope %)) (= 3 (count (:scope %)))
+                                  (every? core/cid? (take 2 (:scope %)))
+                                  (keyword? (nth (:scope %) 2))) bindings)
+                   (= (count bindings) (count (distinct (map :id bindings)))
+                                      (count (distinct (map :scope bindings))))
+                   (= [(symbol "main")] (:exports program))
+                   (seq calls) (= ids effects (set (map :id bindings)))
+                   (every? #(and (= 5 (count %)) (= :i64 (nth % 2)) (= :i64 (nth % 3))) calls)
+                   (every? #(or (not (seq? %)) (contains? ops (first %))) forms))
+      (reject! :bounded-native-i64-bindings-required)))
+  bindings)
+
+(defn mechanisms
+  "PLUGIN is the actual native executor's prepare/execute/close! functions.
+  Admission independently stages and measures the loader through prepare,
+  then closes it; execution revalidates signatures, runtime and effect policy.
+  TRUST/POLICY/LOADER-PATH/CLOCK! are launcher-owned, never packet fields."
+  ([plugin trust policy loader-path clock!]
+   (mechanisms plugin trust policy loader-path clock! []))
+  ([plugin trust policy loader-path clock! bindings]
+  (when-not (and (= #{:prepare :execute :close!} (set (keys plugin)))
+                 (every? fn? (vals plugin)) (fn? clock!)
+                 (string? loader-path) (seq loader-path))
+    (reject! :invalid-launcher))
+  {:inspect!
+   (fn [envelope runtime]
+     (let [session ((:prepare plugin) envelope trust
+                    {:now (quot (clock!) 1000) :runtime runtime :loader-path loader-path})]
+       (try
+         (let [artifact (:artifact session) target-id (:target artifact)
+               profile (get target/profiles target-id)
+               interface (cond-> {:format :kotoba.native-interface/v2
+                          :entry (get-in artifact [:program :entry]) :exports (get-in artifact [:program :exports])
+                          :functions (mapv #(select-keys % [:name :params :result :effects])
+                                           (get-in artifact [:program :functions]))}
+                           (seq bindings) (assoc :lease-transport :posix-node-i64/v2 :bindings bindings))]
+           (when-not (and (= [] (get-in artifact [:program :signature :params]))
+                          (= :i64 (get-in artifact [:program :signature :result])))
+             (reject! :pure-zeroarg-i64-required))
+           (when-not (and (contains? #{nil :on} (get-in artifact [:limits :fuel-metering]))
+                          (let [fuel (get-in artifact [:limits :fuel])]
+                            #?(:clj (and (integer? fuel) (pos? fuel))
+                               :cljs (or (pos-int? fuel)
+                                         (and (some? fuel) (= js/BigInt (.-constructor fuel))
+                                              (< (js/BigInt 0) fuel))))))
+             (reject! :explicit-native-fuel-required))
+           (when (seq (:effects artifact))
+             (native-bindings! artifact bindings)
+             (when-not #?(:clj false :cljs (contains? #{"linux" "darwin"} (.-platform js/process)))
+               (reject! :native-lease-transport-requires-posix-node)))
+           (when (and (empty? (:effects artifact)) (seq bindings)) (reject! :unused-native-bindings))
+           (when-not (and (= :native (:family profile))
+                          (= (get-in profile [:layout :isa]) (get-in artifact [:target-profile :isa]))
+                          (= (get-in profile [:layout :abi]) (get-in artifact [:target-profile :abi]))
+                          (or (= :portable (get-in profile [:layout :os]))
+                              (= (get-in profile [:layout :os]) (get-in artifact [:target-profile :os])))
+                          (= :supervisor (:mode (:layout profile)))
+                          (contains? (:context-versions profile) (canonical-value (get-in artifact [:context-abi :version]))))
+             (reject! :unsupported-native-profile))
+           {:target target-id :profile :sync
+            :artifact-cid (:cid (blocks/block :artifact-envelope
+                           {:format :kotoba.signed-native-reference/v2
+                            :sealed-bytes (artifact/canonical-bytes envelope)}))
+            :interface-cid (:cid (blocks/block :interface (canonical-value interface)))
+            :runtime-identity (:cid (blocks/block :runtime (canonical-value runtime)))
+            :layout (assoc (:layout profile) :context-version (canonical-value (get-in artifact [:context-abi :version])))})
+         (finally ((:close! plugin) session)))))
+   :execute!
+   (fn [{:keys [artifact runtime input call! scopes]}]
+     (when-not (and (map? input) (= #{:entry :arguments} (set (keys input)))
+                    (symbol? (:entry input)) (vector? (:arguments input)))
+       (reject! :invalid-native-input))
+     (when (seq bindings)
+       (when-not (= {:entry (symbol "main") :arguments []} input) (reject! :native-provider-entry-required))
+       (native-bindings! (:artifact artifact) bindings)
+       (when-not (and (fn? call!) (= scopes (set (map :scope bindings))))
+         (reject! :native-scope-admission-mismatch)))
+     (let [by-id (into {} (map (juxt :id :scope) bindings))
+           observed ((:execute plugin) artifact trust policy {:args (:arguments input)}
+                     {:now (quot (clock!) 1000) :entry (:entry input)
+                      :runtime runtime :loader-path loader-path
+                      :lease-call! (when (seq bindings)
+                                     (fn [id request]
+                                       (let [scope (get by-id id)]
+                                         (when-not scope (reject! :undeclared-native-import))
+                                         (let [answer (call! scope request)]
+                                           answer))))})
+           result (canonical-value {:evidence (:evidence observed) :report (:report observed)
+                   :started-at (:started-at observed) :finished-at (:finished-at observed)})]
+       (if (= :ok (get-in observed [:evidence :status]))
+         result
+         (throw (ex-info "native program trapped" {:execution-outcome {:status :trap :value result}})))))}))

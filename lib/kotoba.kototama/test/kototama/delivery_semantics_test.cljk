@@ -1,0 +1,157 @@
+(ns kototama.delivery-semantics-test
+  "What survives an unreliable transport, and what does not.
+
+  Superproject ADR-2608170400 P5-4 asks for tests over transport loss,
+  duplicate delivery, reordering and replay, and asks specifically that
+  idempotency and exactly-once not be conflated. This namespace exists to keep
+  them apart with evidence rather than with a sentence, because the two are
+  easy to confuse in a stack built on content addressing: writes really are
+  idempotent, and it is tempting to read that as delivery being exactly-once.
+
+  `linear-journal`'s own docstring already says the sharp part -- *content
+  addressing is not idempotence; the CID does not stop a second execution* --
+  and the three properties below are what the implementation actually
+  provides. The third is a negative result and is the point of the file."
+  (:require [kotoba.io :as kio] [kotoba.test :refer [deftest is testing]]
+            [kototama.linear-journal :as journal]))
+
+(defn- temp-path [prefix]
+  (.toString (kio/temp-file prefix ".edn")))
+
+(defn- fresh [] (journal/open! (temp-path "delivery-")))
+
+(def ^:private receipt
+  "Every key in `journal/required-receipt-keys`, read from the source rather
+  than guessed -- a first draft supplied two of the four and got
+  `:incomplete-receipt` from three tests, which is the library holding a line
+  it documents (`capability-semantics.edn`'s attempt-always-receipted)."
+  {:receipt/cap "cap-1" :receipt/call "call-1"
+   :receipt/outcome :ok :receipt/at "2026-08-18T00:00:00Z"})
+
+;; ── 1. storage is idempotent, and that is not delivery ──────────────────────
+
+(deftest the-same-entry-has-the-same-cid-which-stops-nothing
+  (testing "content addressing makes the RECORD idempotent"
+    (let [e {:op :consume :lease-id "L" :import "http" :ordinal 1}]
+      (is (= (journal/entry-cid e) (journal/entry-cid e)))
+      (is (= (journal/entry-cid e) (journal/entry-cid (into (sorted-map) e)))
+          "and canonically, so two writers agree")))
+  (testing "but two deliveries of one request still spend twice"
+    ;; The conflation, demonstrated. A caller who reasons \"our writes are
+    ;; content-addressed, so a duplicate is a no-op\" is right about the block
+    ;; store and wrong about the authority: `claim!` is keyed on
+    ;; (lease-id, import) and counts, and nothing in the entry says WHICH
+    ;; delivery it was. The second claim is not a duplicate of the first, it
+    ;; is the next ordinal.
+    (let [j (fresh)]
+      (is (true? (journal/claim! j "L" "http" 2)))
+      (is (true? (journal/claim! j "L" "http" 2))
+          "the same request, delivered twice, consumed twice")
+      (is (= 2 (journal/consumed j "L" "http")))
+      (is (= [1 2] (mapv :ordinal (journal/entries j)))
+          "two distinct consumptions, not one record written twice"))))
+
+;; ── 2. what the journal does provide: at-most-N ─────────────────────────────
+
+(deftest the-budget-is-what-bounds-a-storm-of-duplicates
+  (testing "duplicates beyond the budget are refused, which is the guarantee"
+    (let [j (fresh)]
+      (is (true? (journal/claim! j "L" "http" 3)))
+      (is (true? (journal/claim! j "L" "http" 3)))
+      (is (true? (journal/claim! j "L" "http" 3)))
+      (is (false? (journal/claim! j "L" "http" 3))
+          "at-most-N is a real bound and it is the one on offer")
+      (is (= 3 (journal/consumed j "L" "http")))))
+  (testing "and a replay after recovery cannot reissue spent authority"
+    ;; Re-opening is what a restarted process does; the count comes off disk.
+    (let [path (temp-path "replay-")
+          j1 (journal/open! path)]
+      (dotimes [_ 2] (journal/claim! j1 "L" "http" 2))
+      (let [j2 (journal/open! path)]
+        (is (false? (journal/claim! j2 "L" "http" 2))
+            "replay is bounded by what is durable, not by what is in memory")))))
+
+;; ── 3. at-most-once is NOT exactly-once ─────────────────────────────────────
+
+(deftest transport-loss-leaves-spent-authority-with-no-outcome
+  ;; The negative result this file exists for. The claim is fsynced BEFORE the
+  ;; provider runs, so losing the response -- or the process -- leaves
+  ;; authority spent and nothing knowing what came of it. That is at-most-once
+  ;; and it is not exactly-once, and no amount of content addressing closes
+  ;; the gap: the missing thing is an effect that never reported, not a byte
+  ;; that was written twice.
+  (let [j (fresh)]
+    (journal/claim! j "L" "http" 5)
+    (testing "the response is lost: no receipt is ever written"
+      (is (= 1 (count (journal/unreceipted j)))
+          "spent, with no outcome -- visible rather than silent"))
+    (testing "recovery cannot re-run it, which is the whole trade"
+      (is (= 1 (journal/consumed j "L" "http"))))
+    (testing "a later delivery that DOES report closes only that one"
+      (journal/claim! j "L" "http" 5)
+      (journal/receipt! j "L" "http" 2 receipt)
+      (is (= 1 (count (journal/unreceipted j)))
+          "the first is still open; a second success does not retroactively
+           explain the first")
+      (is (= 1 (:ordinal (first (journal/unreceipted j))))))))
+
+(deftest exactly-once-is-not-on-offer-and-the-journal-says-which-half-it-gives
+  (testing "at-most-once: never twice"
+    (let [j (fresh)]
+      (journal/claim! j "L" "http" 1)
+      (is (false? (journal/claim! j "L" "http" 1)))))
+  (testing "at-least-once: NOT provided -- there is no retry here"
+    ;; Stated as a test so the absence is recorded rather than assumed. A
+    ;; caller wanting at-least-once must retry, and retrying is exactly what
+    ;; spends another unit of budget above. The two guarantees pull in
+    ;; opposite directions and this journal picks one on purpose.
+    (let [j (fresh)]
+      (journal/claim! j "L" "http" 1)
+      (is (= 1 (journal/consumed j "L" "http")))
+      (is (= 1 (count (journal/unreceipted j)))
+          "an attempt with no outcome stays an attempt with no outcome; the
+           journal will not re-drive it"))))
+
+;; ── 4. reordering ───────────────────────────────────────────────────────────
+
+(deftest a-receipt-that-arrives-before-its-claim-is-refused
+  ;; Out-of-order delivery, in the one direction that matters: a receipt for
+  ;; an ordinal that does not exist yet would be a record of authority nobody
+  ;; spent.
+  ;;
+  ;; Note the order of the two refusals: completeness is checked BEFORE the
+  ;; claim exists, and it THROWS where the missing claim returns nil. Two
+  ;; different failures with two different shapes, which is right -- an
+  ;; incomplete receipt is a caller bug, an early receipt is a race.
+  (let [j (fresh)]
+    (is (nil? (journal/receipt! j "L" "http" 1 receipt))
+        "no claim to attach it to")
+    (journal/claim! j "L" "http" 5)
+    (is (some? (journal/receipt! j "L" "http" 1 receipt))
+        "and it is accepted once the claim it names exists")))
+
+(deftest receipts-out-of-order-attach-to-the-right-claims
+  (let [j (fresh)]
+    (dotimes [_ 3] (journal/claim! j "L" "http" 3))
+    (journal/receipt! j "L" "http" 3 receipt)
+    (journal/receipt! j "L" "http" 1 receipt)
+    (is (= [2] (mapv :ordinal (journal/unreceipted j)))
+        "ordinal 2 is the only one still open, regardless of arrival order")
+    (is (= #{1 3} (set (map :ordinal (journal/receipts j "L" "http")))))))
+
+;; ── 5. the chain still verifies through all of it ───────────────────────────
+
+(deftest an-interleaved-history-is-still-a-verifiable-chain
+  ;; Loss, duplication and reordering together, then the integrity check that
+  ;; has to survive them: none of these are corruption, and a checker that
+  ;; called them corruption would be useless on any real journal.
+  (let [j (fresh)]
+    (journal/claim! j "L" "http" 4)
+    (journal/claim! j "M" "fs" 4)
+    (journal/receipt! j "M" "fs" 1 receipt)
+    (journal/claim! j "L" "http" 4)
+    (journal/receipt! j "L" "http" 2 receipt)
+    (let [report (journal/verify-chain j)]
+      (is (:ok? report) (pr-str report)))
+    (is (= 1 (count (journal/unreceipted j)))
+        "and the one genuinely open consumption is still the one reported")))

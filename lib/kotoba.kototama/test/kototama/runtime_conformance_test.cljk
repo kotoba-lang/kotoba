@@ -1,0 +1,169 @@
+(ns kototama.runtime-conformance-test
+  (:require [kotoba.process :as shell]
+            [kotoba.test :refer [deftest is testing]]
+            [kototama.runtime-conformance :as conformance]))
+
+(def host-free-corpus
+  ["test/kototama/fixtures/kotoba-compiled-fact.wasm"
+   "test/kototama/fixtures/kotoba-compiled-peak-cells.wasm"
+   "web/demo.wasm"])
+
+(defn wat-file [wat]
+  (let [wat-file (java.io.File/createTempFile "kototama-differential" ".wat")
+        wasm-file (java.io.File/createTempFile "kototama-differential" ".wasm")]
+    (spit wat-file wat)
+    (let [{:keys [exit err]}
+          (shell/sh "wasm-tools" "parse" (.getPath wat-file)
+                    "-o" (.getPath wasm-file))]
+      (.delete wat-file)
+      (when-not (zero? exit)
+        (throw (ex-info "wasm-tools parse failed" {:error err})))
+      wasm-file)))
+
+(deftest production-host-free-corpus-agrees-across-independent-runtimes
+  (doseq [path host-free-corpus]
+    (let [result (conformance/compare-main path)]
+      (is (:ok? result) (str path " diverged: " (pr-str result)))
+      (is (= :result (:mode result)))
+      (is (= 1 (count (set (map :result (vals (:results result))))))))))
+
+(deftest arithmetic-memory-and-trap-semantics-agree
+  (doseq [[label wat expected-mode expected]
+          [[:memory-grow
+            "(module (memory 1 2)
+               (func (export \"main\") (result i64)
+                 (i64.extend_i32_s (memory.grow (i32.const 1)))))"
+            :result 1]
+           [:signed-arithmetic
+            "(module
+               (func (export \"main\") (result i64)
+                 (i64.div_s (i64.const -84) (i64.const 2))))"
+            :result -42]
+           [:division-trap
+            "(module
+               (func (export \"main\") (result i64)
+                 (i64.div_s (i64.const 1) (i64.const 0))))"
+            :trap nil]]]
+    (testing (name label)
+      (let [file (wat-file wat)]
+        (try
+          (let [result (conformance/compare-main (.getPath file))]
+            (is (:ok? result) (pr-str result))
+            (is (= expected-mode (:mode result)))
+            (when (= :result expected-mode)
+              (is (= #{expected}
+                     (set (map :result (vals (:results result)))))))
+            (when (= :trap expected-mode)
+              ;; A trap is agreed only when all three engines name the SAME
+              ;; pinned kind -- "all three failed" is not that.
+              (is (= :integer-divide-by-zero (:trap-kind result)))
+              (is (= #{:integer-divide-by-zero}
+                     (set (map :trap-kind (vals (:results result))))))))
+          (finally
+            (.delete file)))))))
+
+;; ── a broken engine invocation is :unmeasured, not a shared trap ────────────
+;;
+;; Break/unbreak evidence for koto-h7. Before 2026-09-07 `compare-main`
+;; returned {:ok? true :mode :trap} for the division-trap module when
+;; wasmtime was invoked with `--no-such-flag` (measured on this tree): the
+;; engine's "unexpected argument" exit 2 counted as agreeing with the other
+;; two traps. The same injection must now be red, and red for the stated
+;; reason (:tool-failure), not for some other one.
+
+(def division-trap-wat
+  "(module
+     (func (export \"main\") (result i64)
+       (i64.div_s (i64.const 1) (i64.const 0))))")
+
+(deftest a-broken-wasmtime-invocation-is-unmeasured-not-a-trap
+  (let [file (wat-file division-trap-wat)]
+    (try
+      (with-redefs [conformance/wasmtime-main
+                    (fn [path]
+                      (conformance/classify-wasmtime
+                       (shell/sh "wasmtime" "run" "--no-such-flag" "--invoke" "main" (str path))))]
+        (let [result (conformance/compare-main (.getPath file))]
+          (is (false? (:ok? result)) "a tool failure is never a passing trap")
+          (is (= :unmeasured (:mode result)))
+          (is (= :tool-failure (get-in result [:results :wasmtime :trap-kind]))
+              "red for the stated reason: wasmtime could not be asked")
+          (is (= [:wasmtime] (mapv :engine (:unmeasured result))))
+          ;; The other two engines still classified the real trap.
+          (is (= :integer-divide-by-zero (get-in result [:results :chicory :trap-kind])))
+          (is (= :integer-divide-by-zero (get-in result [:results :node :trap-kind])))))
+      (finally (.delete file)))))
+
+(deftest a-broken-node-invocation-is-unmeasured-not-a-trap
+  (let [file (wat-file division-trap-wat)]
+    (try
+      (with-redefs [conformance/node-main
+                    (fn [path]
+                      (conformance/classify-node
+                       (shell/sh "node" "--no-such-flag" "-e" conformance/node-program (str path))))]
+        (let [result (conformance/compare-main (.getPath file))]
+          (is (false? (:ok? result)))
+          (is (= :unmeasured (:mode result)))
+          (is (= :tool-failure (get-in result [:results :node :trap-kind])))))
+      (finally (.delete file)))))
+
+(deftest a-missing-engine-binary-is-a-tool-failure
+  (let [file (wat-file division-trap-wat)]
+    (try
+      (with-redefs [conformance/wasmtime-main
+                    (fn [path]
+                      (conformance/classify-wasmtime
+                       (try (shell/sh "wasmtime-does-not-exist" "run" (str path))
+                            (catch java.io.IOException e
+                              {:exit -1 :out "" :err (.getMessage e)}))))]
+        (let [result (conformance/compare-main (.getPath file))]
+          (is (= :unmeasured (:mode result)))
+          (is (false? (:ok? result)))))
+      (finally (.delete file)))))
+
+;; ── classifiers, pinned on measured literals ────────────────────────────────
+
+(deftest classifiers-keep-trap-tool-failure-and-result-apart
+  (testing "wasmtime (42.0.1, measured 2026-09-07)"
+    (is (= {:ok? true :result 42}
+           (conformance/classify-wasmtime
+            {:exit 0 :out "42\n" :err "warning: using `--invoke` with a function that returns values is experimental"})))
+    (is (= :integer-divide-by-zero
+           (:trap-kind (conformance/classify-wasmtime
+                        {:exit 134 :out ""
+                         :err "Error: failed to run main module `t.wasm`\n\nCaused by:\n    2: wasm trap: integer divide by zero"}))))
+    (is (= :unclassified-trap
+           (:trap-kind (conformance/classify-wasmtime
+                        {:exit 134 :out "" :err "wasm trap: out of bounds memory access"}))))
+    (is (= :tool-failure
+           (:trap-kind (conformance/classify-wasmtime
+                        {:exit 2 :out "" :err "error: unexpected argument '--no-such-flag' found"}))))
+    (is (= :tool-failure
+           (:trap-kind (conformance/classify-wasmtime {:exit 0 :out "not a number" :err ""})))
+        "exit 0 with unreadable stdout is not a result"))
+  (testing "node (v26.0.0, measured 2026-09-07)"
+    (is (= {:ok? true :result -42} (conformance/classify-node {:exit 0 :out "-42\n" :err ""})))
+    (is (= :integer-divide-by-zero
+           (:trap-kind (conformance/classify-node {:exit 1 :out "" :err "RuntimeError: divide by zero"}))))
+    (is (= :unclassified-trap
+           (:trap-kind (conformance/classify-node {:exit 1 :out "" :err "RuntimeError: unreachable"}))))
+    (is (= :tool-failure
+           (:trap-kind (conformance/classify-node {:exit 9 :out "" :err "node: bad option: --no-such-flag"})))))
+  (testing "chicory (1.4.0, measured 2026-09-07): by exception class"
+    (is (= :tool-failure
+           (:trap-kind (conformance/classify-chicory (ex-info "tender refused" {})))))))
+
+(deftest compare-results-verdicts
+  (let [trap {:ok? false :trap-kind :integer-divide-by-zero}
+        tool {:ok? false :trap-kind :tool-failure :message "bad flag"}]
+    (is (= :result (:mode (conformance/compare-results {:a {:ok? true :result 1} :b {:ok? true :result 1}}))))
+    (is (= :divergence (:mode (conformance/compare-results {:a {:ok? true :result 1} :b {:ok? true :result 2}}))))
+    (is (= :divergence (:mode (conformance/compare-results {:a {:ok? true :result 1} :b trap}))))
+    (let [r (conformance/compare-results {:a trap :b trap :c trap})]
+      (is (true? (:ok? r))) (is (= :trap (:mode r))) (is (= :integer-divide-by-zero (:trap-kind r))))
+    (is (= :divergence
+           (:mode (conformance/compare-results {:a trap :b {:ok? false :trap-kind :some-other-pinned-kind}})))
+        "two different pinned kinds are a measured disagreement, not an agreed trap")
+    (let [r (conformance/compare-results {:a trap :b trap :c tool})]
+      (is (false? (:ok? r))) (is (= :unmeasured (:mode r))) (is (nil? (:trap-kind r)))
+      (is (= [{:engine :c :trap-kind :tool-failure :message "bad flag"}] (:unmeasured r))))))

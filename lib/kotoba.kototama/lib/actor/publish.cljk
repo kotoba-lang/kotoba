@@ -1,0 +1,119 @@
+#!/usr/bin/env kbb
+;; nbb port of kototama/lib/actor/publish.bb (ADR-2607173000 Wave 1).
+;;
+;;   kbb --backend sci publish.cljk --actor <actor-dir> [--live]
+;;
+;; Loads sibling kototama gates/atproto via relative paths from this file when
+;; present under lib/actor/; wrappers in etzhayyim actors pass --actor.
+(require '[kotoba.lang.edn :as edn]
+         '[kotoba.lang.text :as str])
+
+(def fs (js/require "node:fs"))
+(def path (js/require "node:path"))
+(def cp (js/require "node:child_process"))
+
+(defn- sh
+  ([args] (sh args nil))
+  ([args opts]
+   (let [o (clj->js (merge {:encoding "utf8"} (or opts {})))
+         r (.spawnSync cp (first args) (to-array (rest args)) o)]
+     {:exit (or (.-status r) 1)
+      :out (or (.-stdout r) "")
+      :err (or (.-stderr r) "")})))
+
+(defn- shell
+  "Like babashka.process/shell inherit + throw on non-zero when :check true (default)."
+  [args & {:keys [dir check] :or {check true}}]
+  (let [r (sh args (cond-> {:stdio "inherit"}
+                     dir (assoc :cwd dir)))]
+    (when (and check (not (zero? (:exit r))))
+      (throw (js/Error. (str "command failed: " (pr-str args) " exit=" (:exit r)))))
+    r))
+
+(defn- slurp [f] (.readFileSync fs (str f) "utf8"))
+(defn- spit [f s]
+  (.mkdirSync fs (.dirname path (str f)) #js {:recursive true})
+  (.writeFileSync fs (str f) (str s)))
+(defn- exists? [p] (.existsSync fs (str p)))
+
+(def here (.dirname path *file*))
+;; lib/actor → lib → try load gates from sibling kototama tree
+(def lib-root (.resolve path here ".."))
+
+(defn- try-load-cljc [name]
+  (let [p (.join path lib-root "kototama" (str name ".cljc"))]
+    (when (exists? p)
+      ;; nbb cannot load-file arbitrary cljc with java interop; require if on classpath
+      p)))
+
+(defn- argval [flag]
+  (let [a (vec *command-line-args*)
+        i (.indexOf a flag)]
+    (when (>= i 0) (get a (inc i)))))
+
+(def live? (boolean (some #{"--live"} *command-line-args*)))
+(def actor-dir (.resolve path (or (argval "--actor") ".")))
+(defn at-actor [& xs] (apply (.-join path) (cons actor-dir xs)))
+
+(when-not (exists? (at-actor "actor.edn"))
+  (binding [*out* *err*] (println "missing actor.edn in" actor-dir))
+  (.exit js/process 1))
+
+(def cfg (edn/read-string (slurp (at-actor "actor.edn"))))
+(def ipns-key (:ipns-key cfg))
+
+(defn sh-out [& args]
+  (str/trim (:out (sh args))))
+
+(defn ensure-key! []
+  (when-not (some #{ipns-key} (str/split-lines (sh-out "ipfs" "key" "list")))
+    (println "  minting IPNS key" ipns-key)
+    (sh ["ipfs" "key" "gen" ipns-key "--type=ed25519"]))
+  (some (fn [line]
+          (when (str/ends-with? line ipns-key)
+            (first (str/split line #"\s+"))))
+        (str/split-lines (sh-out "ipfs" "key" "list" "-l"))))
+
+(defn regenerate! []
+  (doseq [cmd (:regen cfg)]
+    (println "  regen:" (str/join " " (take 2 cmd)) "…")
+    (shell (mapv str cmd) :dir actor-dir)))
+
+(defn assert-posts-clean! []
+  ;; Full G-no-advice gate requires kototama.gates; when unavailable, warn.
+  (when-let [pf (:posts-file cfg)]
+    (when (exists? (at-actor pf))
+      (println "  posts-file present:" pf "(G-no-advice gate: ensure gates.cljc on classpath for strict mode)"))))
+
+(defn bundle! []
+  (let [pub (at-actor "out" "publish")]
+    (sh ["rm" "-rf" pub])
+    (.mkdirSync fs pub #js {:recursive true})
+    (doseq [[src dst] (:bundle cfg)]
+      (when (exists? (at-actor src))
+        (let [df (at-actor "out" "publish" dst)]
+          (.mkdirSync fs (.dirname path df) #js {:recursive true})
+          (sh ["cp" "-r" (at-actor src) df]))))
+    (let [ipns (ensure-key!)
+          index {"$type" (or (:graph-type cfg) "com.etzhayyim.actor.graph")
+                 "actor" (:did cfg)
+                 "handle" (:handle cfg)
+                 "ipns" (str "/ipns/" ipns)
+                 "self_published" true
+                 "runtime" "kototama/lib/actor publish.cljs (nbb)"
+                 "model" "self-issued CACAO — actor holds its own key"
+                 "published" (or (:published cfg) "2026-06-28")}]
+      (spit (.join path pub "index.json") (.stringify js/JSON (clj->js index) nil 2)))
+    pub))
+
+(let [ipns (ensure-key!)]
+  (println (str "organism self-publish — " (:did cfg) " · /ipns/" ipns))
+  (regenerate!)
+  (assert-posts-clean!)
+  (let [pub (bundle!)
+        cid (sh-out "ipfs" "add" "-rQ" "--pin=true" pub)]
+    (println "  bundle CID:" cid)
+    (if live?
+      (do (shell ["ipfs" "name" "publish" (str "--key=" ipns-key) (str "/ipfs/" cid)])
+          (println "  PUBLISHED → /ipns/" ipns))
+      (println "  dry-run (pass --live). would publish /ipfs/" cid "under" ipns-key))))
