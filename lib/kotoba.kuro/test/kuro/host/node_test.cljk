@@ -1,0 +1,267 @@
+(ns kuro.host.node-test
+  "Every claim in `kuro.host.node`'s guarantee table gets a test that would
+  fail if the guarantee were dropped. Claims the provider does *not* make
+  (filesystem confinement, network) get no test — an assertion that passes
+  because nothing tried to violate it is theater."
+  (:require [kotoba.lang.coll :as set]
+            [kotoba.lang.text :as str]
+            [cljs.test :refer [deftest is testing]]
+            [kuro.host.cid :as cid]
+            [kuro.host.node :as host]
+            [kuro.terminal :as t]))
+
+;; Absolute path to the running node binary. Tests must not depend on the
+;; provider's PATH: the point of `default-env` is that PATH is declared, and a
+;; test that needs a specific PATH cannot also prove that.
+(def node (.-execPath js/process))
+
+(defn- safe-session
+  ([] (safe-session {}))
+  ([attrs] (t/session "test" "repo-cid" :terminal-repo attrs)))
+
+(defn- emit [js-src] (t/command [node "-e" js-src]))
+
+;; ---------------------------------------------------------------- cid
+
+(deftest cid-matches-published-vector
+  (testing "CIDv1/raw/sha2-256 of \"hello world\" is the vector IPFS publishes"
+    (is (= "bafkreifzjut3te2nhyekklss27nh3k72ysco7y32koao5eei66wof36n5e"
+           (cid/text-cid "hello world")))))
+
+(deftest cid-hashes-utf8-bytes-not-characters
+  ;; The enforce row "content-addressed output" promises the CID is the hash of
+  ;; the *UTF-8 byte* sequence the child wrote. The sibling counter test
+  ;; (stream_test's byte-counts-are-utf8-not-characters) records the same trap
+  ;; for byte counters: a character-counting regression is 3x off on Japanese
+  ;; logs while every ASCII test stays green. cid-shape only pins the 59-char
+  ;; shape for non-ASCII ("ünïcode"); a hashing regression (code units, code
+  ;; points, or an encoder re-encode) passes it. Pin an exact vector for a
+  ;; string whose code points are ALL 3-byte CJK, so any wrong-byte hash
+  ;; differs. Computed with sha256(Buffer.from s "utf8") + CIDv1/raw
+  ;; (0x01 0x55 0x12 0x20) - the same construction that reproduces the
+  ;; published "hello world" vector above.
+  (testing "\u3053\u3093\u306b\u3061\u306f = 5 code points / 15 UTF-8 bytes, every byte 3-byte CJK"
+    (is (= "bafkreiasllvn6j5qiwnyoygbhi6ybejn7kfidjucmgig6ygyp5fae2denq"
+           (cid/text-cid "\u3053\u3093\u306b\u3061\u306f")))))
+
+(deftest cid-shape
+  (testing "the 0x01 0x55 0x12 0x20 header always renders as bafkrei…"
+    (doseq [s ["" "ok\n" "a longer body with ünïcode"]]
+      (let [c (cid/text-cid s)]
+        (is (str/starts-with? c "bafkrei"))
+        ;; 'b' + base32(36 bytes) = 1 + ceil(36*8/5) = 59
+        (is (= 59 (count c)))))))
+
+(deftest base32-lower-no-pad-encodes-rfc4648
+  ;; `kuro.host.cid/base32-lower-no-pad` is a public fn whose docstring makes a
+  ;; standalone port claim — "port of kotobase-client's base32-lower-no-pad",
+  ;; "32-bit accumulator draining 5-bit groups MSB-first", byte-identical to the
+  ;; kotobase edge. It is the one cid fn with no direct test: the parity gate
+  ;; (opfs python-mint-parity) only exercises it *through a sha256 digest*, so a
+  ;; codec regression shared by the framing layer AND the Python mint (wrong
+  ;; alphabet, reversed drain order, dropped no-pad, mishandled final partial
+  ;; group) would stay green while every real CID went wrong. Pin the
+  ;; independent RFC 4648 §10 base32 vectors in lowercase, unpadded form —
+  ;; they do not pass through any hash, so they cannot be masked by one.
+  ;; (Verified identical to `scripts/cid_mint.py`'s base32_lower_no_pad and to
+  ;; Python's base64.b32encode, the reference stdlib the parity gate trusts.)
+  (let [enc (fn [s] (cid/base32-lower-no-pad (js/Buffer.from s "utf8")))]
+    (is (= ""              (enc "")))
+    (is (= "my"            (enc "f")))
+    (is (= "mzxq"          (enc "fo")))
+    (is (= "mzxw6"         (enc "foo")))
+    (is (= "mzxw6yq"       (enc "foob")))
+    (is (= "mzxw6ytb"      (enc "fooba")))
+    (is (= "mzxw6ytboi"    (enc "foobar")))
+    (testing "the alphabet is lowercase a-z + 2-7, never A-Z or +/' (no pad)"
+      (is (not (re-find #"[A-Z+/=]" (enc "foobar")))))))
+
+(deftest cid-is-content-addressed
+  (is (= (cid/text-cid "same") (cid/text-cid "same")))
+  (is (not= (cid/text-cid "a") (cid/text-cid "b"))))
+
+;; ------------------------------------------------------------- confine
+
+(deftest confine-allows-inside
+  (is (some? (host/confine "/tmp/repo" ".")))
+  (is (some? (host/confine "/tmp/repo" "src")))
+  (is (some? (host/confine "/tmp/repo" "lib/kotoba.kuro/src/../test"))))
+
+(deftest confine-rejects-escape
+  (testing "resolved, not spotted — the check is on the result, not on '..'"
+    (is (nil? (host/confine "/tmp/repo" "..")))
+    (is (nil? (host/confine "/tmp/repo" "src/../../etc")))
+    (is (nil? (host/confine "/tmp/repo" "/etc")))
+    (testing "a sibling that merely shares a name prefix is outside"
+      (is (nil? (host/confine "/tmp/repo" "/tmp/repo-evil"))))))
+
+(deftest cwd-escape-throws
+  (is (thrown? ExceptionInfo
+               (host/run (safe-session {:kuro/cwd ".."}) (emit "0")
+                         {:repo-root "/tmp/repo"}))))
+
+;; -------------------------------------------------------- capabilities
+
+(deftest running-anything-requires-repo-read
+  (is (= #{"repo/read"} (host/required-capabilities (emit "0"))))
+  (is (= #{"repo/read" "net/fetch"}
+         (host/required-capabilities (assoc (emit "0") :kuro/requires #{"net/fetch"})))))
+
+(deftest denial-happens-before-execution
+  (testing "a session with an emptied grant cannot execute at all"
+    (let [sess (safe-session {:kuro/grant {:capabilities #{}}})
+          out (host/run sess (emit "process.stdout.write('SHOULD-NOT-RUN')")
+                        {:repo-root "."})]
+      (is (false? (:kuro/allowed? out)))
+      (is (= :missing-capabilities (:kuro/reason out)))
+      (is (= ["repo/read"] (:kuro/missing out)))
+      (testing "a denial is not a receipt — no exit code, no output"
+        (is (nil? (:kuro/exit-code out)))
+        (is (nil? (:kuro/stdout out)))))))
+
+(deftest declared-capability-is-checked
+  (let [sess (safe-session)                       ; safe grant has no net/fetch
+        cmd (assoc (emit "0") :kuro/requires #{"net/fetch"})
+        out (host/run sess cmd {:repo-root "."})]
+    (is (= ["net/fetch"] (:kuro/missing out)))))
+
+(deftest terminal-host-has-no-backing
+  (is (thrown? ExceptionInfo
+               (host/run (t/session "h" "repo-cid" :terminal-host
+                                    {:kuro/signed-opt-in? true})
+                         (emit "0") {:repo-root "."}))))
+
+;; ------------------------------------------------------------ execution
+
+(deftest runs-and-receipts
+  (let [r (host/run (safe-session) (emit "process.stdout.write('ok')")
+                    {:repo-root "."})]
+    (is (= 0 (:kuro/exit-code r)))
+    (is (= "ok" (:kuro/stdout r)))
+    (is (= :kuro/receipt (:kuro/type r)))
+    (is (= :terminal-repo (:kuro/mode r)))
+    (is (= #{"repo/read" "tmp/write" "log/write"} (:kuro/effective-capabilities r)))
+    (testing "output is content-addressed, not just carried"
+      (is (= (cid/text-cid "ok") (:kuro/stdout-cid r)))
+      (is (= 2 (:kuro/stdout-bytes r))))))
+
+(deftest nonzero-exit-is-recorded-not-thrown
+  (let [r (host/run (safe-session) (emit "process.exit(3)") {:repo-root "."})]
+    (is (= 3 (:kuro/exit-code r)))
+    (is (nil? (:kuro/error r)))))
+
+(deftest stderr-is-separate
+  (let [r (host/run (safe-session) (emit "process.stderr.write('boom')")
+                    {:repo-root "."})]
+    (is (= "" (:kuro/stdout r)))
+    (is (= "boom" (:kuro/stderr r)))
+    (is (= (cid/text-cid "boom") (:kuro/stderr-cid r)))))
+
+(deftest environment-is-declared-not-inherited
+  (testing "a variable set in the host process does not reach the child"
+    (aset (.-env js/process) "KURO_HOST_MARKER" "leaked")
+    (let [r (host/run (safe-session)
+                      (emit "process.stdout.write(String(process.env.KURO_HOST_MARKER))")
+                      {:repo-root "."})]
+      (is (= "undefined" (:kuro/stdout r)))))
+  (testing "the child's environment is the declared manifest plus only what the OS injects"
+    ;; macOS CoreFoundation adds __CF_USER_TEXT_ENCODING to every child process
+    ;; below the spawn API — measured 2026-08-03, not something this provider
+    ;; can decline. Naming it keeps the assertion exact: anything else appearing
+    ;; here is a leak and fails.
+    (let [r (host/run (safe-session)
+                      (emit "process.stdout.write(Object.keys(process.env).sort().join(','))")
+                      {:repo-root "."})
+          keys (set (str/split (:kuro/stdout r) #","))]
+      (is (= #{"LANG" "PATH" "TERM"} (set/intersection keys #{"LANG" "PATH" "TERM"})))
+      (is (empty? (set/difference keys #{"LANG" "PATH" "TERM" "__CF_USER_TEXT_ENCODING"}))))
+    (testing "TERM=dumb, because a pipe is not a terminal — same guarantee as the streaming provider"
+      (let [r (host/run (safe-session)
+                        (emit "process.stdout.write(process.env.TERM + ':' + process.stdout.isTTY)")
+                        {:repo-root "."})]
+        (is (= "dumb:undefined" (:kuro/stdout r))
+            "we must not claim xterm over a pipe")))))
+
+(deftest caller-supplied-env-replaces-the-default-manifest
+  ;; README / `run` opts list `:env (default default-env)`; the docstring says
+  ;; the child env is exactly the declared manifest. Both existing env tests
+  ;; only exercise the *default* manifest — none passes a caller `:env`. This
+  ;; pins the documented option's semantics: a caller-provided manifest
+  ;; **replaces** default-env wholesale, it is not merged in. If it were merged,
+  ;; a caller who declares a minimal {PATH} map would silently also inherit the
+  ;; default vars, and TERM=dumb would leak into a run as a claimed guarantee
+  ;; over a pipe. OS-independent — __CF_USER_TEXT_ENCODING is never queried.
+  (let [r (host/run (safe-session)
+                    (emit "process.stdout.write((process.env.CUSTOM_MARKER||'none') + ':P=' + (process.env.PATH?'y':'n') + ':L=' + (process.env.LANG?'y':'n') + ':T=' + (process.env.TERM?'y':'n'))")
+                    {:repo-root "."
+                     :env {"CUSTOM_MARKER" "set"}})]
+    (is (= 0 (:kuro/exit-code r)))
+    (is (= "set:P=n:L=n:T=n" (:kuro/stdout r))
+        "the caller's var reaches the child; PATH/LANG/TERM don't leak in")))
+
+(deftest no-shell-interpolation
+  (testing "argv reaches the binary verbatim — $HOME is a literal, not expanded"
+    (let [r (host/run (safe-session) (t/command ["/bin/echo" "$HOME" "&&" "whoami"])
+                      {:repo-root "."})]
+      (is (= 0 (:kuro/exit-code r)))
+      (is (= "$HOME && whoami" (str/trim (:kuro/stdout r)))))))
+
+(deftest missing-binary-is-a-receipt
+  (let [r (host/run (safe-session) (t/command ["kuro-no-such-binary"]) {:repo-root "."})]
+    (is (= 127 (:kuro/exit-code r)))
+    (is (str/includes? (:kuro/error r) "kuro-no-such-binary"))))
+
+(deftest deadline-kills-and-says-so
+  (let [r (host/run (safe-session) (emit "while (true) {}")
+                    {:repo-root "." :timeout-ms 300})]
+    (is (= 124 (:kuro/exit-code r)))
+    (is (true? (:kuro/timed-out? r)))))
+
+(deftest output-cap-kills-and-says-so
+  (let [r (host/run (safe-session)
+                    (emit "for(;;) process.stdout.write('x'.repeat(4096))")
+                    {:repo-root "." :max-output-bytes 4096 :timeout-ms 10000})]
+    (is (= 125 (:kuro/exit-code r)))
+    (is (true? (:kuro/truncated? r)))))
+
+(deftest clock-is-injectable
+  (let [ticks (atom [100 350])
+        r (host/run (safe-session) (emit "0")
+                    {:repo-root "." :now #(let [[t & more] @ticks]
+                                            (reset! ticks (or more [t]))
+                                            t)})]
+    (is (= 100 (:kuro/started-at r)))
+    (is (= 350 (:kuro/finished-at r)))
+    (is (= 250 (:kuro/duration-ms r)))))
+
+(deftest sync-receipt-never-omits-isolation
+  (testing "README: every receipt carries :kuro/isolation, defaulting to :none —
+            a receipt that omits it would be read as though it had been isolated.
+            The sync path goes straight through t/receipt, so the key must be
+            there even though no host code ever names it."
+    (let [r (host/run (safe-session) (emit "process.stdout.write('ok')")
+                      {:repo-root "."})]
+      (is (contains? r :kuro/isolation)
+          "omitted isolation reads as isolation")
+      (is (= :none (:kuro/isolation r)))
+      (is (every? #(= "kuro" (namespace %)) (keys r))
+          "receipt keys are all :kuro/*"))))
+
+(deftest receipt-becomes-a-kotoba-fact
+  ;; `kuro.terminal/receipt-fact` is the seam where a terminal receipt leaves
+  ;; the kuro namespace for the kotoba fact store. AGENTS.md rule 4 has the
+  ;; fact carrying the whole map -- a consumer that reaches for
+  ;; `(:kuro/receipt f)` is relying on the *embedding* itself, which no test
+  ;; pinned. The existing assertions covered only :kotoba/type and
+  ;; :kotoba/id; if the :kuro/receipt key were dropped, renamed, or replaced
+  ;; with a digest-only view, every CI job would stay green while kotoba read
+  ;; nil. Pin that the embedded map IS the source receipt -- same exact map,
+  ;; :kuro/* one-namespace intact.
+  (let [r (host/run (safe-session) (emit "0") {:repo-root "."})
+        f (t/receipt-fact r)]
+    (is (= :kuro/terminal-receipt (:kotoba/type f)))
+    (is (= [:kuro/receipt "test" [node "-e" "0"]] (:kotoba/id f)))
+    (is (contains? f :kuro/receipt) "the receipt is embedded, not just referenced")
+    (is (= r (:kuro/receipt f)) "the embedded map is the exact source receipt")
+    (testing "the embedded receipt keeps the :kuro/* one-namespace shape"
+      (is (every? #(= "kuro" (namespace %)) (keys (:kuro/receipt f)))))))

@@ -1,0 +1,175 @@
+;; verify_stream_worker.cljs — S3 Worker-convergence E2E: the guest-execution
+;; responsibility moves OUT of the page and INTO a real Worker
+;; (src/kuro/host/stream_worker.js, served as kuro-stream-worker.js).
+;;
+;; What must be REAL:
+;;   - the page only postMessages a start request; it does NOT instantiate
+;;     the guest itself (that was the S3-last-mile E2E, verify_stream_browser)
+;;   - a real .wasm guest (wasm-tools CLI fixture, same technique as PR #17)
+;;     is fetched and instantiated INSIDE the Worker by WebAssembly.instantiate
+;;   - the guest's memory output becomes the kuro.stream stdout chunk and its
+;;     i32 return the exit code, both crossing the Worker boundary as
+;;     plain-string-key wire messages
+;;
+;; Wire contract (mirrors kuro.host.opfs): request/reply with plain string
+;; keys — Main -> Worker {"kuro.stream/type": "request", "kuro.stream/op":
+;; "start", payload {guest, args}}, Worker -> Main {"kuro.stream/type":
+;; "chunk"|"exit"|"ack"}. See stream_worker.js header for the full contract.
+;;
+;; Run: kbb --backend sci -cp test/browser test/browser/verify_stream_worker.cljk
+
+(ns verify-stream-worker
+  (:require ["node:http" :as http]
+            ["node:path" :as path]
+            ["node:fs" :as fs]
+            ["playwright" :refer [chromium]]
+))
+
+(def repo-root (.cwd js/process))
+(def tmp-dir (.join path repo-root "test" "browser" ".tmp"))
+
+(defn- report! [m]
+  (println (js/JSON.stringify (clj->js m) nil 2)))
+
+(defn- start-static-server
+  [root-dir]
+  (js/Promise.
+   (fn [resolve reject]
+     (let [server
+           (http/createServer
+            (fn [req res]
+              (let [url-path (js/decodeURIComponent (first (.split (.-url req) "?")))
+                    file-path (.join path root-dir url-path)]
+                (if-not (.startsWith file-path root-dir)
+                  (do (.writeHead res 403) (.end res "forbidden"))
+                  (-> (fs/readFile file-path
+                                   (fn [err data]
+                                     (if err
+                                       (do (.writeHead res 404)
+                                           (.end res (str "not found: " (.-message err))))
+                                       (let [ext (.extname path file-path)
+                                             mime (get {".html" "text/html; charset=utf-8"
+                                                        ".js" "text/javascript"
+                                                        ".wasm" "application/wasm"}
+                                                       ext "application/octet-stream")]
+                                         (.writeHead res 200 #js {"Content-Type" mime})
+                                         (.end res data))))))))))]
+       (.on server "error" reject)
+       (.listen server 0 "127.0.0.1"
+                (fn []
+                  (let [port (.-port (.address server))]
+                    (resolve #js {:baseUrl (str "http://127.0.0.1:" port)
+                                  :close (fn [] (js/Promise. (fn [r] (.close server r))))}))))))))
+
+(def page-html
+  "<!doctype html>
+<html><body><script type='module'>
+window.addEventListener('error', (e) => { window.__failed = 'top: ' + e.message; });
+window.addEventListener('unhandledrejection', (e) => { window.__failed = 'rej: ' + (e.reason && e.reason.message || String(e.reason)); });
+const worker = new Worker('./kuro-stream-worker.js');
+worker.onerror = (e) => { window.__failed = 'worker: ' + (e.message || 'error'); };
+const events = [];
+let done = false;
+worker.onmessage = (ev) => {
+  const m = ev.data;
+  events.push(m);
+  if (m['kuro.stream/type'] === 'exit') done = true;
+};
+worker.postMessage({
+  'kuro.stream/type': 'request',
+  'kuro.stream/op': 'start',
+  'kuro.stream/started-at': Date.now(),
+  'kuro.stream/payload': {guest: './stream-worker-guest.wasm', args: [40, 2]},
+});
+window.__drain = () => JSON.stringify({events: events, done: done, failed: window.__failed || null});
+</script></body></html>")
+
+(defn- compile-guest! []
+  (let [fs (js/require "fs")
+        cp (js/require "child_process")
+        wat (str "(module\n"
+                 "  (memory (export \"memory\") 1)\n"
+                 "  (func (export \"run\") (param $a i32) (param $b i32) (result i32)\n"
+                 "    (local $sum i32)\n"
+                 "    (local.set $sum (i32.add (local.get $a) (local.get $b)))\n"
+                 "    ;; UTF-8 for \u3042 (E3 81 82) and \u3053 (E3 81 93): readChunk\n"
+                 "    ;; must decode bytes as UTF-8, not String.fromCharCode each\n"
+                 "    ;; one (that mangles every non-ASCII char into mojibake).\n"
+                 "    (i32.store8 (i32.const 2048) (i32.const 227))\n"
+                 "    (i32.store8 (i32.const 2049) (i32.const 129))\n"
+                 "    (i32.store8 (i32.const 2050) (i32.const 130))\n"
+                 "    (i32.store8 (i32.const 2051) (i32.const 227))\n"
+                 "    (i32.store8 (i32.const 2052) (i32.const 129))\n"
+                 "    (i32.store8 (i32.const 2053) (i32.const 147))\n"
+                 "    (i32.store8 (i32.const 2054) (i32.const 115))\n"
+                 "    (i32.store8 (i32.const 2055) (i32.const 117))\n"
+                 "    (i32.store8 (i32.const 2056) (i32.const 109))\n"
+                 "    (i32.store8 (i32.const 2057) (i32.const 61))\n"
+                 "    (i32.store8 (i32.const 2058) (i32.add (i32.const 48)\n"
+                 "                 (i32.div_u (local.get $sum) (i32.const 10))))\n"
+                 "    (i32.store8 (i32.const 2059) (i32.add (i32.const 48)\n"
+                 "                 (i32.rem_u (local.get $sum) (i32.const 10))))\n"
+                 "    (local.get $sum)))\n")
+        wat-path (.join path tmp-dir "stream-worker-guest.wat")
+        wasm-path (.join path tmp-dir "stream-worker-guest.wasm")]
+    (.writeFileSync fs wat-path wat)
+    (let [r (.spawnSync cp "wasm-tools" #js ["parse" wat-path "-o" wasm-path])]
+      (when (not= 0 (.-status r))
+        (throw (js/Error. (str "wasm-tools parse failed: "
+                               (or (some-> r .-stderr (.toString)) (.-error r))))))
+      wasm-path)))
+
+(defn- check-raw [raw]
+  (let [r (js->clj (js/JSON.parse raw) :keywordize-keys true)
+        events (or (:events r) [])
+        chunks (filter #(= "chunk" (:kuro.stream/type %)) events)
+        exits (filter #(= "exit" (:kuro.stream/type %)) events)
+        exit (first exits)
+        acks (filter #(= "ack" (:kuro.stream/type %)) events)
+        ok? (and (:done r)
+                 (= 1 (count chunks))
+                 (= "\u3042\u3053sum=42" (:kuro.stream/text (first chunks)))
+                 (= "stdout" (:kuro.stream/stream (first chunks)))
+                 (= 1 (count exits))
+                 (= 42 (:kuro.stream/exit-code exit))
+                 (pos? (count acks)))]
+    (report! {:stream-worker-e2e {:chunks chunks :exit exit :acks (count acks) :failed (:failed r)}})
+    (report! {:verdict (if ok? "PASS" "FAIL")})
+    (when-not ok? (set! (.-exitCode js/process) 1))))
+
+(defn- prepare-tmp []
+  (let [fs (js/require "fs")]
+    (do (.mkdirSync fs tmp-dir #js {:recursive true})
+        (.writeFileSync fs (.join path tmp-dir "index.html") page-html)
+        (.writeFileSync fs
+                        (.join path tmp-dir "kuro-stream-worker.js")
+                        (.readFileSync fs
+                                       (.join path repo-root "src" "kuro" "host" "stream_worker.js")
+                                       "utf8"))
+        (compile-guest!)
+        nil)))
+
+(defn- -main []
+  (-> (js/Promise.resolve (prepare-tmp))
+      (.then (fn [_] (start-static-server tmp-dir)))
+      (.then (fn [srv]
+               (-> (.launch chromium #js {:headless true})
+                   (.then (fn [browser]
+                            (-> (.newPage browser)
+                                (.then (fn [page]
+                                         (.on page "pageerror" (fn [err] (report! {:pageerror (.-message err)})))
+                                         (-> (.goto page (str (.-baseUrl srv) "/index.html"))
+                                             (.then (fn []
+                                                      (.evaluate page
+                                                                 "(async function(){ const t0 = Date.now(); while (Date.now() - t0 < 15000) { if (window.__done || window.__failed) { return window.__drain(); } await new Promise(r => setTimeout(r, 100)); } return window.__drain(); })()")))
+                                             (.then (fn [raw] (check-raw raw)))
+                                             (.catch (fn [e]
+                                                       (report! {:e2e-error (.-message e)})
+                                                       (set! (.-exitCode js/process) 1))))))
+                                (.then (fn [_] (.close browser))))))
+                   (.then (fn [_] ((.-close srv)))))))
+      (.catch (fn [e]
+                (report! {:fatal (.-message e)})
+                (set! (.-exitCode js/process) 1)))))
+
+(-main)

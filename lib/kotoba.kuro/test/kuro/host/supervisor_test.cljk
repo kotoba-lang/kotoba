@@ -1,0 +1,318 @@
+(ns kuro.host.supervisor-test
+  "async テスト。cljs.test の async を使い、コールバックが呼ばれたことを必ず
+  確認する (呼ばれなければタイムアウトで落ちる)。"
+  (:require [cljs.test :refer [deftest is testing async]]
+            [cljs.reader :as reader]
+            [kotoba.lang.text :as str]
+            [kuro.host.supervisor :as sup]
+            [kuro.terminal :as t]))
+
+(def node (.-execPath js/process))
+
+(defn- safe [] (t/session "s1" "repo-cid" :terminal-repo))
+(defn- emit [src] (t/command [node "-e" src]))
+
+(defn- verify-run-output [s]
+  (testing "a finished session stays in the registry, marked exited"
+    (is (= {"build" :exited} (sup/session-states s))))
+  (testing "attachments can read what streamed in"
+    (is (= ["one\n" "two\n"] (map :text (sup/read-window s "build")))))
+  (testing "receipt is captured on exit"
+    (is (= 0 (:kuro/exit-code (sup/receipt-of s "build"))))))
+
+(deftest start-registers-and-streams-into-registry
+  (async done
+    (let [s (sup/new-supervisor)]
+      (sup/start! s "build" (safe)
+                  (emit "process.stdout.write('one\\n'); setTimeout(()=>process.stdout.write('two\\n'),40)")
+                  {:repo-root "."
+                   :on-exit (fn [_] (verify-run-output s) (done))})
+      (is (= {"build" :running} (sup/session-states s))
+          "registered synchronously at start!"))))
+
+(defn- verify-after-gap [s done]
+  (is (= ["before" "after"] (map :text (sup/read-window s "build")))
+      "detached window reads the accumulated output")
+  (sup/reattach-window! s "build" "w2")
+  (testing "reattached window inherits the read position"
+    (is (empty? (sup/read-window s "w2")) "no double-delivery across reattach"))
+  (done))
+
+(deftest detach-keeps-the-child-running-and-reads-the-gap
+  (async done
+    (let [s (sup/new-supervisor)
+          seen (atom [])]
+      (sup/start! s "build" (safe)
+                  (emit "process.stdout.write('before'); setTimeout(()=>process.stdout.write('after'),15); setTimeout(()=>process.exit(0),120)")
+                  {:repo-root "."
+                   :on-chunk (fn [_ c]
+                               (swap! seen conj (:text c))
+                               (when (= 2 (count @seen))
+                                 ;; both chunks observed via on-chunk — now verify
+                                 (verify-after-gap s done)))})
+      ;; detach the window at start; the child keeps producing into the registry
+      (sup/detach-window! s "build"))))
+
+(defn- check-restore [sup s2]
+  (sup/restore! s2 (sup/snapshot sup))
+  (testing "restored stream is orphaned — honest about death"
+    (is (= {"build" :orphaned} (sup/session-states s2))))
+  (testing "restored attachment is suspended — not pretending to be live"
+    (is (= :suspended
+           (get-in (sup/registry s2)
+                   [:kuro.registry/attachments "build" :kuro.attachment/state])))))
+
+(deftest snapshot-restore-is-honest
+  (testing "checkpoint a running command, then restore in a fresh supervisor —
+            the dead process is reported honestly as orphaned"
+    (async done
+      (let [s (sup/new-supervisor)
+            s2 (sup/new-supervisor)
+            once (atom false)]
+        (sup/start! s "build" (safe)
+                    (emit "process.stdout.write('x'); setInterval(()=>{},1000)")
+                    {:repo-root "."
+                     :on-chunk (fn [_ _]
+                                 (when-not @once
+                                   (reset! once true)
+                                   (check-restore s s2)
+                                   (sup/kill! s "build")
+                                   (done)))})))))
+
+(deftest snapshot-mid-run-freezes-a-prefix-the-live-run-keeps-going
+  (testing "snapshot taken between chunks: the restored registry is frozen at
+            the prefix received so far (no loss, no duplication), while the
+            live registry keeps receiving and finishes with a receipt.
+            sup/start!'s chunk wrapper updates the registry copy BEFORE the
+            caller's on-chunk runs, so a snapshot taken inside on-chunk must
+            already contain that chunk."
+    (async done
+      (let [live (sup/new-supervisor)
+            s2 (sup/new-supervisor)
+            seen (atom 0)]
+        (sup/start! live "build" (safe)
+                    (emit "process.stdout.write('a\\n'); setTimeout(()=>process.stdout.write('b\\n'),30); setTimeout(()=>process.exit(0),90)")
+                    {:repo-root "."
+                     :on-chunk (fn [_ _]
+                                 (when (= 1 (swap! seen inc))
+                                   (sup/restore! s2 (sup/snapshot live))))
+                     :on-exit (fn [r]
+                                (is (= 0 (:kuro/exit-code r)))
+                                (testing "live run finishes normally"
+                                  (is (= {"build" :exited} (sup/session-states live)))
+                                  (is (= "a\nb\n" (:kuro/stdout (sup/receipt-of live "build")))))
+                                (testing "restored copy is frozen at the prefix"
+                                  (is (= {"build" :orphaned} (sup/session-states s2)))
+                                  (is (nil? (sup/receipt-of s2 "build"))
+                                      "the restored host never ran the process")
+                                  (is (= ["a\n"] (map :text (sup/read-window s2 "build"))))
+                                  (is (empty? (sup/read-window s2 "build"))
+                                      "the later chunk and exit never leak into the frozen copy"))
+                                (done))})))))
+
+
+(deftest snapshot-survives-an-edn-round-trip
+  (testing "README persistence contract: the caller serializes sup/snapshot.
+            Prove the snapshot is plain serializable EDN - pr-str -> read-string
+            -> restore! lands on the same honest registry (exited, chunks kept,
+            attachment suspended)."
+    (async done
+      (let [s (sup/new-supervisor)
+            s2 (sup/new-supervisor)
+            once (atom false)]
+        (sup/start! s "build" (safe)
+                    (emit "process.stdout.write('persisted\\n'); process.exit(0)")
+                    {:repo-root "."
+                     :on-exit (fn [_]
+                                (when-not @once
+                                  (reset! once true)
+                                  (let [text (pr-str (sup/snapshot s))
+                                        edn (reader/read-string text)]
+                                    (is (= (sup/snapshot s) edn)
+                                        "pr-str / read-string is identity on the snapshot")
+                                    (sup/restore! s2 edn)
+                                    (is (= {"build" :exited} (sup/session-states s2))
+                                        "the session was finished at snapshot time, so it restores finished (only :running becomes :orphaned)")
+                                    (is (= ["persisted\n"]
+                                           (mapv :text
+                                                 (get-in (sup/registry s2)
+                                                         [:kuro.registry/sessions "build" :kuro.session/stream
+                                                          :kuro/chunks])))
+                                        "the streamed output survives the round trip")
+                                    (is (= :suspended
+                                           (get-in (sup/registry s2)
+                                                   [:kuro.registry/attachments "build" :kuro.attachment/state]))
+                                        "restored attachment is suspended"))
+                                  (done)))})))))
+(deftest kill-on-a-restored-session-closes-without-a-receipt
+  (testing "restored (handle-less) session: kill! marks the stream finished and
+            stores no receipt — a dead process has no host-measured exit values,
+            so no receipt is invented (sup/kill! docstring)"
+    (async done
+      (let [live (sup/new-supervisor)
+            s2 (sup/new-supervisor)
+            once (atom false)]
+        (sup/start! live "build" (safe)
+                    (emit "process.stdout.write('x'); setInterval(()=>{},1000)")
+                    {:repo-root "."
+                     :on-chunk (fn [_ _]
+                                 (when-not @once
+                                   (reset! once true)
+                                   (sup/restore! s2 (sup/snapshot live))
+                                   (is (= {"build" :orphaned} (sup/session-states s2)))
+                                   (sup/kill! s2 "build")
+                                   (is (= {"build" :exited} (sup/session-states s2))
+                                       "kill! on a restored session marks it finished")
+                                   (is (nil? (sup/receipt-of s2 "build"))
+                                       "no receipt is fabricated for a process this host never ran")
+                                   (sup/kill! live "build")
+                                   (done)))})))))
+
+(deftest denial-registers-nothing
+  (let [s (sup/new-supervisor)
+        out (sup/start! s "x"
+                        (t/session "s1" "repo-c" :terminal-repo
+                                   {:kuro/grant {:capabilities #{}}})
+                        (emit "process.stdout.write('X')")
+                        {:repo-root "."})]
+    (is (false? (:kuro/allowed? out)))
+    (is (= {} (sup/session-states s)) "no session registered on denial")
+    (is (nil? (sup/handle-of s "x")) "no child was created")))
+
+(deftest attach-window-pins-a-fresh-window-as-forward-only
+  ;; sup/attach-window! is the supervisor's public attach seam - the analog of
+  ;; sess/attach at the supervisor level. start! wires sess/spawn + sess/attach
+  ;; internally and reattach-window! is pinned (verify-after-gap), but a direct
+  ;; attach-window! call on a live session was never exercised - the one public
+  ;; sup fn the suite does not hit. A regression that broke it (window not
+  ;; registered, or a fresh window replaying the already-streamed prefix) would
+  ;; stay green. Pin: the new window's cursor starts at (dec current-seq), so
+  ;; nothing already streamed is replayed, while output that lands after the
+  ;; attach still reaches it (session-test's a-late-attached-window-is-forward-
+  ;; only, at the supervisor seam).
+  (async done
+    (let [s (sup/new-supervisor)
+          seen (atom 0)
+          ;; pipe は書き込みごとに 1 チャンクを保証しない ('b\n' と 'c\n' が
+          ;; 'b\nc\n' に合流する実行があった: w2 が () に、build が
+          ;; ("a\n" "b\nc\n") になった)。pinned なのは chunk 分割ではなく性質 --
+          ;; forward-only (attach 時点の prefix を replay しない) と no-loss
+          ;; (attach 以降に流れた全 byte が w2 に届く)。
+          ;;
+          ;; read-window はその窓の cursor を進める (tmux と同じ)。prefix を
+          ;; read-window で記録すると build 窓の cursor が進み、on-exit 以降
+          ;; の read は残りの分しか返さない (08c399c で :188 赤になった経路)。
+          ;; だから prefix は on-chunk 経路の :text で記録し (window cursor を
+          ;; 触らず)、no-loss は build 窓の cursor を触らず on-exit で一度だけ
+          ;; 読む。no-loss が成り立つのは attach が on-chunk コールバック内
+          ;; (そのチャンクの配信完了後) で行われるから。
+          prefix (atom "")
+          full-text (atom "")]
+      (sup/start! s "build" (safe)
+                  (emit "process.stdout.write('a\\n'); setTimeout(()=>process.stdout.write('b\\n'),60); setTimeout(()=>process.stdout.write('c\\n'),160); setTimeout(()=>process.exit(0),300)")
+                  {:repo-root "."
+                   :on-chunk (fn [_ c]
+                               (swap! full-text str (:text c))
+                               (when (= 2 (swap! seen inc))
+                                 ;; 'a' and 'b' have streamed; attach a brand-new window now
+                                 (reset! prefix @full-text)
+                                 (sup/attach-window! s "w2" "build")
+                                 (is (empty? (sup/read-window s "w2"))
+                                     "a fresh attach replays nothing already streamed")))
+                   :on-exit (fn [r]
+                              (is (= 0 (:kuro/exit-code r)))
+                              (testing "the late-attached window sees exactly what streams in after it"
+                                (let [full "a\nb\nc\n"
+                                      tail (subs full (count @prefix))]
+                                  (is (= tail (apply str (map :text (sup/read-window s "w2"))))
+                                      "forward-only from the attach moment: no replay, no loss")))
+                              (testing "the child's output reached the registry with no loss"
+                                (is (= "a\nb\nc\n" @full-text)
+                                    "no loss, regardless of how the pipe chunked the writes"))
+                              (testing "the original window keeps its full prefix"
+                                (is (= "a\nb\nc\n"
+                                       (apply str (map :text (sup/read-window s "build"))))
+                                    "the build window's cursor was never advanced mid-run,
+so it still holds everything the child wrote"))
+                              (testing "reading the same window twice does not double-deliver"
+                                (is (empty? (sup/read-window s "build"))
+                                    "the cursor advanced with the read (tmux semantics)"))
+                              (done))}))))
+(deftest start-binds-a-window-id-distinct-from-the-session-name
+  ;; sup/start! docstring: "sess で cmd を spawn し、registry に name で登録、
+  ;; 窓 :window-id (既定 name) を付ける。" The default path (window id = session
+  ;; name) is what every existing start! test exercises, so `(or (:window-id
+  ;; opts) name)` and `(sess/attach wire name)` could regress to "always name"
+  ;; and the whole suite would stay green -- a caller who spawned a session
+  ;; under one name and attached a *differently*-named window to it would
+  ;; silently lose the separation. Pin that a caller-supplied :window-id
+  ;; actually becomes the attachment id: the session is registered as "build",
+  ;; the window is attached as "w1" (bound to "build"), output is readable from
+  ;; the window id and not the session name, and the receipt is kept on the
+  ;; session name.
+  (async done
+    (let [s (sup/new-supervisor)]
+      (sup/start! s "build" (safe)
+                  (emit "process.stdout.write('hi\\n'); setTimeout(()=>process.exit(0),40)")
+                  {:repo-root "."
+                   :window-id "w1"
+                   :on-exit (fn [_]
+                              (testing "the receipt is kept on the session name, not the window"
+                                (is (= 0 (:kuro/exit-code (sup/receipt-of s "build"))))
+                                (is (nil? (sup/receipt-of s "w1"))))
+                              (testing "state is keyed by session name"
+                                (is (= {"build" :exited} (sup/session-states s))))
+                              (testing "output is readable from the window id"
+                                (is (= ["hi\n"] (map :text (sup/read-window s "w1")))
+                                    "the w1 attachment received the streamed chunk"))
+                              (done))})
+      (testing "the window is attached under the caller's id, bound to the session"
+        (is (= "build"
+                (get-in (sup/registry s)
+                        [:kuro.registry/attachments "w1" :kuro.attachment/session]))
+            "the w1 window points at the build session"))
+      (testing "the session itself is the registry entry the caller named"
+        (is (= {"build" :running} (sup/session-states s))))
+      (testing "no implicit window is created under the session name"
+        (is (nil? (get-in (sup/registry s)
+                          [:kuro.registry/attachments "build"])))))))
+
+(deftest live-kill-terminates-and-records-state-and-receipt
+  ;; sup/kill! の live 分岐 (docstring: "live な子 (name) を止める (SIGTERM)。
+  ;; 子が終わると on-exit が registry の stream を finished にし、receipt を
+  ;; 保存する") は、既存の kill-on-a-restored-session-closes-without-a-receipt
+  ;; が pin する reverse (restored / handle-less) と対になる正の半分が無い。
+  ;; snapshot-restore-is-honest と killed-on-restored は `(sup/kill! live
+  ;; "build")` を呼ぶが、その 2 箇所は after の状態 (:exited か、receipt が
+  ;; 保存されたか) を一度も検証せずに `(done)` する — supervisor の live
+  ;; 終了経路 (kill! -> (:kill h) -> SIGTERM -> on-exit -> registry finished
+  ;; + receipt 保存) が落ちても全 suite は緑。このテストを塞ぐ:
+  (async done
+    (let [s (sup/new-supervisor)
+          state-snap (atom nil)
+          receipt-snap (atom ::none)
+          exit-snap (atom ::none)]
+      (sup/start! s "build" (safe)
+                  (emit "setInterval(()=>{},1000)")
+                  {:repo-root "."
+                   :on-exit (fn [r] (reset! exit-snap r))})
+      ;; kill once the child is registered and live
+      (js/setTimeout
+       (fn []
+         (sup/kill! s "build")
+         ;; let the SIGTERM propagate: child exits -> on-exit -> registry
+         (js/setTimeout
+          (fn []
+            (reset! state-snap (sup/session-states s))
+            (reset! receipt-snap (sup/receipt-of s "build"))
+            (testing "the live child was terminated: registry marked :exited"
+              (is (= {"build" :exited} @state-snap)))
+            (testing "a receipt was recorded from the on-exit handler"
+              (is (some? @receipt-snap)))
+            (testing "the exit receipt names who stopped it (SIGTERM)"
+              (is (or (str/includes? (str (:kuro/error @exit-snap)) "SIGTERM")
+                      (= 143 (:kuro/exit-code @exit-snap)))))
+            (done))
+          250))
+      50))))
+

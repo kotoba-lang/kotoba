@@ -1,0 +1,95 @@
+(ns verify-tool-adapter
+  (:require [kuro.host.tool-browser :as tools]
+            [kuro.terminal :as terminal]
+            [kuro.fs :as fs]))
+
+(defn check [ok label]
+  (when-not ok (throw (js/Error. label))))
+
+(def session (terminal/session "tool-session" "root-cid" :terminal-repo
+                              {:kuro/grant {:capabilities #{"tool/js" "fs/read" "fs/write"}}}))
+(def seen (atom []))
+(def factory
+  (fn [options]
+    (check (= #{"tool/js" "fs/read" "fs/write"}
+              (set (js->clj (.-capabilities options)))) "session owns admission")
+    #js {:call (fn [request _]
+                 (swap! seen conj (js->clj request :keywordize-keys true))
+                 (js/Promise.resolve
+                  #js {:id "call-1" :result #js {:answer 42}
+                       :files #js {"nested/out.txt" "あ✓"}
+                       :receipt #js {"kuro/argv" #js ["browser-tool" "js"]
+                                     "kuro/isolation" "quickjs-wasm-worker"
+                                     "kuro/exit-code" 0
+                                     "kuro/stdout" "日本語\n"
+                                     "kuro/unknown" "must be dropped"}}))}))
+(def adapter (tools/create session factory {:capabilities ["host/shell"]}))
+(def blocks (atom {}))
+(defn put-block [bytes]
+  (let [cid (str "test-cid-" (count @blocks))]
+    (swap! blocks assoc cid bytes) cid))
+(defn get-block [cid] (get @blocks cid))
+(def input (js/Uint8Array. #js [227 129 130]))
+(def initial (first (fs/write (fs/store "root-cid") "in.txt" input put-block)))
+(def request {:id "call-1" :type "function"
+              :function {:name "js" :arguments "{\"code\":\"42\",\"exportFiles\":[\"nested/out.txt\"]}"}})
+(-> (tools/call-with-filesystem adapter request initial
+                                {:read-paths ["in.txt"] :get-block get-block :put-block put-block})
+    (.then (fn [response]
+             (check (= "tool-session" (get-in response [:receipt :kuro/session-id])) "receipt session")
+             (check (= "root-cid" (get-in response [:receipt :kuro/repo-root-cid])) "receipt root")
+             (check (= "日本語\n" (get-in response [:receipt :kuro/stdout])) "stdout")
+             (check (= "quickjs-wasm-worker" (get-in response [:receipt :kuro/isolation])) "isolation")
+             (check (not (contains? (:receipt response) :kuro/unknown)) "receipt shape")
+             (check (= {"answer" 42} (:result response)) "JSON result keys")
+             (check (= {"nested/out.txt" "あ✓"} (:files response)) "file paths preserved")
+             (check (= "あ" (get-in (first @seen) [:function :arguments :files :in.txt])) "FS snapshot")
+             (let [[_ bytes] (fs/read-file (:store response) "nested/out.txt" get-block)]
+               (check (= "あ✓" (.decode (js/TextDecoder.) bytes)) "FS import"))
+             (tools/call-with-filesystem adapter request (fs/with-grant initial #{})
+                                         {:read-paths ["in.txt"] :get-block get-block :put-block put-block})))
+    (.then (fn [denied]
+             (check (= :filesystem-read-denied (:error denied)) "FS denial")
+             (check (= 1 (count @seen)) "denied FS must not call worker")
+             (println "PASS: tool adapter session grants, fixed receipt, JSON keys and kuro.fs round-trip/denial")))
+    (.then (fn [_]
+             (let [fail-factory (fn [_]
+                                  #js {:call (fn [_ _]
+                                               (js/Promise.resolve
+                                                #js {:id "call-2" :result #js {}
+                                                     :files #js {"leaked/out.txt" "must not be imported"}
+                                                     :receipt #js {"kuro/argv" #js ["browser-tool" "js"]
+                                                                   "kuro/isolation" "quickjs-wasm-worker"
+                                                                   "kuro/exit-code" 1
+                                                                   "kuro/stdout" ""}}))})
+                   fail-adapter (tools/create session fail-factory {})
+                   blocks-before (count @blocks)]
+               (-> (tools/call-with-filesystem fail-adapter request initial
+                                               {:read-paths ["in.txt"] :get-block get-block :put-block put-block})
+                   (.then (fn [response]
+                            (check (= 1 (get-in response [:receipt :kuro/exit-code])) "failed exit code")
+                            (check (= blocks-before (count @blocks)) "failed call imports nothing")
+                            (println "PASS: failed tool call imports nothing")))))))
+    (.then (fn [_]
+             ;; A successful tool call whose exported file lands outside the
+             ;; store's fs/write grant: the export is a denial, not a write.
+             (let [export-factory (fn [_]
+                                    #js {:call (fn [_ _]
+                                                 (js/Promise.resolve
+                                                  #js {:id "call-3" :result #js {}
+                                                       :files #js {"denied/out.txt" "must not be written"}
+                                                       :receipt #js {"kuro/argv" #js ["browser-tool" "js"]
+                                                                     "kuro/isolation" "quickjs-wasm-worker"
+                                                                     "kuro/exit-code" 0
+                                                                     "kuro/stdout" ""}}))})
+                   export-adapter (tools/create session export-factory {})
+                   blocks-before (count @blocks)]
+               (-> (tools/call-with-filesystem export-adapter request (fs/with-grant initial #{"fs/read"})
+                                               {:read-paths [] :get-block get-block :put-block put-block})
+                   (.then (fn [response]
+                            (check (= :filesystem-write-denied (:error response)) "FS write denial")
+                            (check (= blocks-before (count @blocks)) "denied export stores no block")
+                            (check (nil? (second (fs/read-file (:store response) "denied/out.txt" get-block)))
+                                   "denied export imports nothing")
+                            (println "PASS: write-denied export imports nothing")))))))
+    (.catch (fn [error] (js/console.error error) (set! (.-exitCode js/process) 1))))

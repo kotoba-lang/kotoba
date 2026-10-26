@@ -1,0 +1,565 @@
+(ns kuro.host.stream-node-test
+  "async テスト。`cljs.test` の `async` を使い、コールバックが呼ばれたことを
+  必ず確認する —— 呼ばれなければタイムアウトで落ちる（黙って通らない）。"
+  (:require [kotoba.lang.coll :as set]
+            [kotoba.lang.text :as str]
+            [cljs.test :refer [deftest is testing async]]
+            [kuro.host.cid :as cid]
+            [kuro.host.stream-node :as sh]
+            [kuro.stream :as stream]
+            [kuro.terminal :as t]))
+
+(def node (.-execPath js/process))
+
+(defn- safe [] (t/session "s1" "repo-cid" :terminal-repo))
+(defn- emit [src] (t/command [node "-e" src]))
+(deftest start-returns-the-live-pid
+  ;; kuro.host.stream-node's docstring documents the start handle's shape:
+  ;; `{:stream <atom of kuro.stream> :write fn :kill fn :pid n}`. The suite
+  ;; exercises :stream / :write / :close-stdin / :kill everywhere, but :pid is
+  ;; only ever asserted *nil in the denial path* (denial-happens-before-spawn) --
+  ;; no test proves a SUCCESSFUL start actually returns the child's live pid.
+  ;; A regression that dropped the :pid field from the returned map (or stopped
+  ;; reading `(.-pid proc)`) would leave every CI job green while a caller who
+  ;; stores the pid to observe / externally terminate the child silently got
+  ;; nil. Pin: the success handle carries a positive integer pid that names the
+  ;; live process, and stays present alongside the other documented keys.
+  (let [h (sh/start (safe) (emit "process.stdout.write('alive')") {:repo-root "."})]
+    (testing "the documented handle shape is present on a real spawn"
+      (is (contains? h :stream))
+      (is (contains? h :write))
+      (is (contains? h :kill))
+      (is (contains? h :pid)))
+    (testing "the pid names the live child - a positive integer, not nil/0"
+      (is (integer? (:pid h)))
+      (is (pos? (:pid h)))))
+  ;; and the denial path reports no pid - a denial creates no process to name.
+  (let [denied (sh/start (t/session "s1" "repo-cid" :terminal-repo
+                                    {:kuro/grant {:capabilities #{}}})
+                          (emit "0") {:repo-root "."})]
+    (is (nil? (:pid denied)))))
+
+
+(deftest streams-output-before-the-process-exits
+  (async done
+    (let [chunks (atom [])]
+      (sh/start (safe)
+                (emit "process.stdout.write('one\\n'); setTimeout(()=>process.stdout.write('two\\n'), 40)")
+                {:repo-root "."
+                 :on-chunk (fn [_ c] (swap! chunks conj (:text c)))
+                 :on-exit (fn [r]
+                            (is (= 0 (:kuro/exit-code r)))
+                            (is (= "one\ntwo\n" (:kuro/stdout r)))
+                            (testing "output arrived in pieces, not all at the end"
+                              (is (= 2 (count @chunks))))
+                            (done))}))))
+
+(deftest stdin-reaches-the-child
+  (async done
+    (let [h (sh/start (safe)
+                      (emit "let b='';process.stdin.on('data',d=>b+=d);process.stdin.on('end',()=>process.stdout.write('got:'+b))")
+                      {:repo-root "."
+                       :on-exit (fn [r]
+                                  (is (= "got:hello\n" (:kuro/stdout r)))
+                                  (done))})]
+      ((:write h) "hello\n")
+      ((:close-stdin h)))))
+
+(deftest kill-stops-a-long-running-command
+  (async done
+    (let [h (sh/start (safe)
+                      (emit "setInterval(()=>{}, 1000)")
+                      {:repo-root "." :timeout-ms 10000
+                       :on-exit (fn [r]
+                                  (testing "the receipt says who stopped it"
+                                    (is (or (str/includes? (str (:kuro/error r)) "SIGTERM")
+                                            (= 143 (:kuro/exit-code r))))
+                                    (done)))})]
+      (js/setTimeout #((:kill h)) 30))))
+
+(deftest deadline-kills-a-streaming-command
+  (async done
+    (sh/start (safe) (emit "setInterval(()=>{}, 1000)")
+              {:repo-root "." :timeout-ms 150
+               :on-exit (fn [r]
+                          (is (= 124 (:kuro/exit-code r)))
+                          (is (true? (:kuro/timed-out? r)))
+                          (done))})))
+
+(deftest output-cap-kills-the-flood-and-reports-it
+  (async done
+    (sh/start (safe)
+              (emit "setInterval(()=>process.stdout.write('x'.repeat(8192)), 1)")
+              {:repo-root "." :max-output-bytes 4096 :timeout-ms 5000
+               :on-exit (fn [r]
+                          (is (= 125 (:kuro/exit-code r)))
+                          (is (true? (:kuro/truncated? r)))
+                          (is (pos? (:kuro/dropped-bytes r)))
+                          (done))})))
+
+(deftest slow-flood-truncation-counts-every-dropped-byte
+  ;; README enforce row "bounded output ... => exit 125, :kuro/truncated?".
+  ;; The existing fast-flood test pins that the cap *fires*, but its child
+  ;; blows past the cap in a single burst chunk - it never pins the
+  ;; multi-chunk shape a real build produces: many small chunks, the cap
+  ;; crossed mid-run, and the kill racing the pipe. `kuro.stream` drops
+  ;; chunk-wise (a chunk that does not fit whole is dropped whole), so the
+  ;; invariants the receipt must satisfy regardless of how the OS coalesces
+  ;; the writes are: kept <= cap, kept is a prefix of the emitted text, and
+  ;; kept + dropped is at least the cap - every byte the host actually READ
+  ;; is either kept or counted. Bytes still in the OS pipe when the cap
+  ;; fires are NOT counted: the provider SIGKILLs on truncation, so the
+  ;; tail is unread, not dropped - that gap is filed, not silently accepted
+  ;; (see issue "truncated streaming receipts undercount the unread tail").
+  (testing "a slow flood crossing the cap in many chunks: exit 125, kept <= cap, prefix, every read byte accounted"
+    (async done
+      (let [pattern "abcdefgh"
+            writes 10
+            emitted (* writes (count pattern))]
+        (sh/start (safe)
+                  (emit (str "let i=0;const t=setInterval(()=>{"
+                             "process.stdout.write('abcdefgh');"
+                             "if(++i===10){clearInterval(t);}},50)"))
+                  {:repo-root "." :max-output-bytes 16 :timeout-ms 10000
+                   :on-exit (fn [r]
+                              (is (= 125 (:kuro/exit-code r)))
+                              (is (true? (:kuro/truncated? r)))
+                              (is (<= (:kuro/stdout-bytes r) 16)
+                                  "the kept body never exceeds the cap")
+                              (is (>= (+ (:kuro/stdout-bytes r)
+                                         (:kuro/dropped-bytes r))
+                                      16)
+                                  "every byte the host read is kept or counted")
+                              (is (.startsWith (apply str (repeat writes pattern))
+                                               (:kuro/stdout r))
+                                  "what was kept is the emitted prefix, not a middle")
+                              (is (pos? (:kuro/dropped-bytes r)))
+                              (is (<= (+ (:kuro/stdout-bytes r)
+                                         (:kuro/dropped-bytes r))
+                                      emitted))
+                              (done))})))))
+
+(deftest denial-happens-before-spawn
+  (let [out (sh/start (t/session "s1" "repo-cid" :terminal-repo
+                                 {:kuro/grant {:capabilities #{}}})
+                      (emit "process.stdout.write('SHOULD-NOT-RUN')")
+                      {:repo-root "."})]
+    (is (false? (:kuro/allowed? out)))
+    (is (nil? (:pid out)) "no process was created")))
+
+(deftest terminal-host-is-refused-here-too
+  (is (thrown? ExceptionInfo
+               (sh/start (t/session "h" "repo-cid" :terminal-host {:kuro/signed-opt-in? true})
+                         (emit "0") {:repo-root "."}))))
+
+(deftest missing-binary-becomes-a-receipt
+  (async done
+    (sh/start (safe) (t/command ["kuro-no-such-binary"])
+              {:repo-root "."
+               :on-exit (fn [r]
+                          (is (= 127 (:kuro/exit-code r)))
+                          (is (str/includes? (:kuro/error r) "kuro-no-such-binary"))
+                          (done))})))
+
+(deftest no-shell-interpolation-in-the-streaming-path
+  (testing "README 'The same guarantees apply — ... argv with no shell': the
+            streaming provider must hand argv to the binary verbatim too —
+            $HOME stays a literal, && is an argument, not a pipeline"
+    (async done
+      (sh/start (safe)
+                (t/command ["/bin/echo" "$HOME" "&&" "whoami"])
+                {:repo-root "."
+                 :on-exit (fn [r]
+                            (is (= "$HOME && whoami" (str/trim (:kuro/stdout r)))
+                                "argv reached node verbatim; no shell in between")
+                            (done))}))))
+
+(deftest term-is-dumb-because-a-pipe-is-not-a-terminal
+  (async done
+    (sh/start (safe)
+              (emit "process.stdout.write(process.env.TERM + ':' + process.stdout.isTTY)")
+              {:repo-root "."
+               :on-exit (fn [r]
+                          (is (= "dumb:undefined" (:kuro/stdout r))
+                              "we must not claim xterm over a pipe")
+                          (done))})))
+
+(deftest stream-environment-is-declared-not-inherited
+  (testing "the same guarantee as kuro.host.node: a variable set in the host
+            process does not reach a streaming child either"
+    (aset (.-env js/process) "KURO_HOST_MARKER" "leaked")
+    (async done
+      (sh/start (safe)
+                (emit "process.stdout.write(String(process.env.KURO_HOST_MARKER))")
+                {:repo-root "."
+                 :on-exit (fn [r]
+                            (is (= "undefined" (:kuro/stdout r)))
+                            (done))}))))
+
+(deftest stream-env-is-the-declared-manifest
+  ;; README "The same guarantees apply" - declared environment. The sync
+  ;; provider (node_test) pins the child env to the manifest plus only the OS
+  ;; injection; the streaming path only checked a single marker. Pin the
+  ;; full-manifest assertion here too so streaming cannot quietly widen it.
+  (async done
+    (sh/start (safe)
+              (emit "process.stdout.write(Object.keys(process.env).sort().join(','))")
+              {:repo-root "."
+               :on-exit (fn [r]
+                          (let [keys (set (str/split (:kuro/stdout r) #","))]
+                            (is (= #{"LANG" "PATH" "TERM"}
+                                   (set/intersection keys #{"LANG" "PATH" "TERM"})))
+                            (is (empty? (set/difference
+                                         keys
+                                         #{"LANG" "PATH" "TERM" "__CF_USER_TEXT_ENCODING"}))
+                                "anything else in the child env is a leak"))
+                          (done))})))
+
+(deftest caller-supplied-env-replaces-the-default-manifest
+  ;; README "The same guarantees apply" — declared environment. Both providers
+  ;; document a caller-supplied `:env` (`kuro.host.node/run` opts, `start` opts),
+  ;; yet the existing env tests only pin the *default* manifest — none passes a
+  ;; caller `:env`. Pin the option's semantics here: a caller-provided manifest
+  ;; **replaces** default-env wholesale, it is not merged in. If a replace were
+  ;; turned into a merge, a caller who declares only CUSTOM_MARKER would silently
+  ;; inherit the default PATH/LANG/TERM too — and TERM=dumb would leak into a run
+  ;; as a claimed guarantee over a pipe. OS-independent: __CF_USER_TEXT_ENCODING
+  ;; (the one unavoidable macOS injection) is never queried.
+  (async done
+    (sh/start (safe)
+              (emit "process.stdout.write((process.env.CUSTOM_MARKER||'none') + ':P=' + (process.env.PATH?'y':'n') + ':L=' + (process.env.LANG?'y':'n') + ':T=' + (process.env.TERM?'y':'n'))")
+              {:repo-root "."
+               :env {"CUSTOM_MARKER" "set"}
+               :on-exit (fn [r]
+                          (is (= "set:P=n:L=n:T=n" (:kuro/stdout r))
+                              "replace, not merge — default PATH/LANG/TERM don't leak in")
+                          (done))})))
+
+(deftest stream-cwd-escape-throws
+  (is (thrown? ExceptionInfo
+               (sh/start (t/session "s1" "repo-cid" :terminal-repo {:kuro/cwd ".."})
+                         (emit "0") {:repo-root "."}))))
+
+(deftest stream-cwd-sibling-prefix-is-outside-too
+  ;; README enforce row 'cwd confinement: resolved path must stay under the
+  ;; session's repo root'. The sync path pins confine's prefix-sibling case
+  ;; directly (node_test: "a sibling that merely shares a name prefix is
+  ;; outside") and the streaming path goes through the same confine, but only
+  ;; the (cwd "..") shape was pinned here. A cwd that resolves to a sibling
+  ;; sharing the repo-root's name prefix must be refused by resolution, not
+  ;; by spotting "..", on this path too.
+  (is (thrown? ExceptionInfo
+               (sh/start (t/session "s1" "repo-cid" :terminal-repo
+                                    {:kuro/cwd "/repo-evil"})
+                         (emit "0") {:repo-root "/repo"}))))
+
+(deftest stream-receipt-never-omits-isolation
+  (testing "README: every receipt carries :kuro/isolation, defaulting to :none —
+            a receipt that omits it would be read as though it had been isolated.
+            The streaming path goes through stream/finish → t/receipt, so the
+            key must be there even though no host code ever names it."
+    (async done
+      (sh/start (safe)
+                (emit "process.stdout.write('ok')")
+                {:repo-root "."
+                 :on-exit (fn [r]
+                            (is (contains? r :kuro/isolation)
+                                "omitted isolation reads as isolation")
+                            (is (= :none (:kuro/isolation r)))
+                            (is (map? r))
+                            (is (every? #(= "kuro" (namespace %)) (keys r))
+                                "receipt keys are all :kuro/*")
+                            (done))}))))
+
+(deftest run-async-resolves-a-denial-without-spawning
+  (async done
+    (testing "README: `run-async` resolves a denial **immediately** — the returned
+            value is the denial map, not a receipt, and no process is created.
+            A regression that drops the `(resolve h)` branch would leave the
+            promise forever pending: the caller hangs instead of failing."
+      (-> (sh/run-async (t/session "s1" "repo-cid" :terminal-repo
+                                   {:kuro/grant {:capabilities #{}}})
+                        (emit "process.stdout.write('SHOULD-NOT-RUN')")
+                        {:repo-root "."})
+          (.then (fn [out]
+                   (is (false? (:kuro/allowed? out)))
+                   (is (= :missing-capabilities (:kuro/reason out)))
+                   (is (= ["repo/read"] (:kuro/missing out)))
+                   (is (nil? (:kuro/exit-code out)) "a denial is not a receipt")
+                   (is (nil? (:kuro/stdout out)))
+                   (done)))))))
+
+(deftest run-async-resolves-to-a-receipt
+  (async done
+    (-> (sh/run-async (safe) (emit "process.stdout.write('ok')") {:repo-root "."})
+        (.then (fn [r]
+                 (is (= "ok" (:kuro/stdout r)))
+                 (is (= 0 (:kuro/exit-code r)))
+                 (done))))))
+
+(deftest receipt-is-content-addressed
+  (testing "README 'content-addressed output' is a both-providers guarantee —
+            the streaming receipt carries the same CIDv1/raw/sha2-256 as the
+            sync one, not just the bytes"
+    (async done
+      (sh/start (safe)
+                (emit "process.stdout.write('ok'); process.stderr.write('boom')")
+                {:repo-root "."
+                 :on-exit (fn [r]
+                            (is (= (cid/text-cid "ok") (:kuro/stdout-cid r)))
+                            (is (= (cid/text-cid "boom") (:kuro/stderr-cid r)))
+                            (testing "the CID is of the same bytes the receipt carries"
+                              (is (= "bafkrei" (subs (:kuro/stdout-cid r) 0 7)))
+                              (is (= 2 (:kuro/stdout-bytes r))))
+                            (done))}))))
+
+(deftest live-state-is-observable-while-running
+  (testing "the caller can read progress without waiting for exit"
+    ;; 観測は wall-clock ではなく **chunk の到着**に載せる。最初の版は 25 ms の
+    ;; setTimeout で覗いて落ちた（node の起動が 25 ms より遅い日があるだけ）。
+    ;; 時間で同期するテストは、製品の欠陥ではなくその日のマシンの速さを測る。
+    (async done
+      (let [seen (atom nil)]
+        (sh/start (safe)
+                  (emit "process.stdout.write('a'); setTimeout(()=>process.exit(0), 60)")
+                  {:repo-root "."
+                   :on-chunk (fn [st _]
+                               (when-not @seen
+                                 (reset! seen {:running? (stream/running? st)
+                                               :text (stream/text-of st :stdout)})))
+                   :on-exit (fn [r]
+                              (is (= {:running? true :text "a"} @seen)
+                                  "state was already readable at the first chunk")
+                              (is (= 0 (:kuro/exit-code r)))
+                              (done))})))))
+
+(deftest no-shell-interpolation-on-the-streaming-path-too
+  (testing "README enforce row 'no shell interpolation': the guarantee belongs
+            to the provider, not to one implementation. argv reaches the binary
+            verbatim over cp/spawn with :shell false, exactly as in
+            kuro.host.node — $HOME is a literal, && is a plain argument."
+    (async done
+      (-> (sh/run-async (safe)
+                        (t/command [node "-e"
+                                    "process.stdout.write(process.argv.slice(1).join(' '))"
+                                    "$HOME" "&&" "whoami"])
+                        {:repo-root "."})
+          (.then (fn [r]
+                   (is (= 0 (:kuro/exit-code r)))
+                   (is (= "$HOME && whoami" (:kuro/stdout r))
+                       "no expansion, no shell metacharacter interpretation")
+                   (done)))))))
+
+(deftest write-after-close-stdin-does-not-crash-the-host
+  ;; README documents `((:write h) "y\n")` and `((:close-stdin h))` as the
+  ;; streaming stdin API. But writing to a stdin that has been `.end()`-ed is
+  ;; write-after-end: Node emits ERR_STREAM_WRITE_AFTER_END as an **async**
+  ;; 'error' event on the child's stdin socket. With no listener that is an
+  ;; unhandled 'error' -> an uncaught exception that crashed the whole nbb host
+  ;; (the kobo server) rather than failing just the write (measured: the probe
+  ;; process died with exit 1, not just a dropped byte). A late write must
+  ;; degrade to a dropped write, never take down the host. The error listener
+  ;; makes the write a no-op; this test proves the run still completes and
+  ;; on-exit still fires.
+  (testing "a write after close-stdin completes without crashing the host"
+    (async done
+      (let [h (sh/start (safe) (emit "setTimeout(()=>process.exit(0), 60)")
+                        {:repo-root "."
+                         :on-exit (fn [r]
+                                    (is (= 0 (:kuro/exit-code r))
+                                        "the child still finishes normally; the host survived")
+                                    (done))})]
+        ;; synchronously close stdin, then write to it -- write-after-end
+        ((:close-stdin h))
+        ((:write h) "too-late\n")
+        ;; if the write crashed the host as an unhandled error, this test would
+        ;; die before on-exit/done -- passing proves the write degraded instead.
+        ))))
+
+(deftest stderr-flood-triggers-the-cap-and-the-kill
+  (testing "README 'the cap is enforced across both streams together' - the
+            pure model pins the joining (stream_test: cap-counts-both-streams),
+            but the *provider* must wire it: take-chunk! checks the cap on the
+            stderr path too, or a child that floods only stderr bypasses the
+            kill and melts time instead of being cut. Every existing host
+            flood test emits on stdout only, so a regression to the stdout
+            path alone would pass all of them. exit 125 + truncated? prove the
+            stderr flood was cut, not left running."
+    (async done
+      (sh/start (safe)
+                (emit "setInterval(()=>process.stderr.write('x'.repeat(8192)), 1)")
+                {:repo-root "." :max-output-bytes 4096 :timeout-ms 5000
+                 :on-exit (fn [r]
+                            (is (= 125 (:kuro/exit-code r)))
+                            (is (true? (:kuro/truncated? r)))
+                            (is (pos? (:kuro/dropped-bytes r)))
+                            (is (<= (:kuro/stderr-bytes r) 4096)
+                                "the kept stderr body never exceeds the cap")
+                            (is (= 0 (:kuro/stdout-bytes r))
+                                "nothing was written to stdout")
+                            (done))}))))
+
+
+
+(deftest truncation-precedence-over-the-deadline
+  ;; The cap and the deadline can both be configured; when the cap fires
+  ;; first the run is *capped*, and a deadline that later elapses must not
+  ;; come back and relabel the same run timed-out. take-chunk! SIGKILLs on
+  ;; truncation, but until the fix it left the :timeout-ms timer armed (only
+  ;; the close/error handlers disarmed it): in the window between the kill and
+  ;; the close event a firing deadline called finish! first with
+  ;; {:exit-code 124 :timed-out? true} and marked done, so the final receipt
+  ;; claimed a timeout for a run the provider actually stopped for the output
+  ;; cap. Consumers branch on exit-code, so 124 vs 125 changes how the run is
+  ;; categorised, not just a flag. Pin: a capped run reports itself as
+  ;; truncated (125), never as timed-out. (The sub-ms kill-to-close window
+  ;; itself is not deterministically reproducible from a real spawn; this pins
+  ;; the precedence contract and guards the common path.)
+  (async done
+    (sh/start (safe)
+              (emit "setInterval(()=>process.stdout.write('x'.repeat(8192)), 1)")
+              {:repo-root "." :max-output-bytes 4096 :timeout-ms 3000
+               :on-exit (fn [r]
+                          (is (= 125 (:kuro/exit-code r))
+                              "the cap won, so the run is categorized truncated")
+                          (is (true? (:kuro/truncated? r)))
+                          (is (pos? (:kuro/dropped-bytes r)))
+                          (is (nil? (:kuro/timed-out? r))
+                              "a capped run is never relabelled as a timeout")
+                          (done))})))
+
+
+(deftest streaming-receipt-carries-the-session-context-shape
+  ;; README: "A receipt is uniformly :kuro/*" and stream-node's ns docstring
+  ;; "保証は kuro.host.node と同じ". kuro.host.node pins its sync receipt's
+  ;; session context (:kuro/mode + :kuro/effective-capabilities in
+  ;; run-and-receipts, :kuro/argv via receipt-fact); the streaming path's
+  ;; receipt only pinned isolation + key namespacing (stream-receipt-never-
+  ;; omits-isolation). If sh/start's finish path (or stream/finish) stopped
+  ;; carrying the session into the receipt, the sync suite would stay green
+  ;; while every streaming receipt lost its session identity -- who ran it,
+  ;; from where, with what grant. Pin the full fixed shape here.
+  (async done
+    (sh/start (t/session "s1" "cid:repo" :terminal-repo {:kuro/cwd "sub"})
+              (t/command ["echo" "hello"])
+              {:repo-root "."
+               :on-exit (fn [r]
+                          (testing "the streaming receipt carries the session context"
+                            (is (= "s1" (:kuro/session-id r)))
+                            (is (= "cid:repo" (:kuro/repo-root-cid r)))
+                            (is (= :terminal-repo (:kuro/mode r)))
+                            (is (= "sub" (:kuro/cwd r)))
+                            (is (= ["echo" "hello"] (:kuro/argv r)))
+                            (is (= #{"repo/read" "tmp/write" "log/write"}
+                                   (:kuro/effective-capabilities r))))
+                          (done))})))
+
+
+(deftest multibyte-char-split-across-pipe-chunks-stays-whole
+  ;; comment
+  (testing "a CJK char split across two pipe reads: whole text, whole bytes, honest CID"
+    (async done
+      (sh/start (safe)
+                (emit "const b=Buffer.from('こ');process.stdout.write(b.subarray(0,1));setTimeout(()=>{process.stdout.write(b.subarray(1));setTimeout(()=>process.exit(0),30)},40)")
+                {:repo-root "."
+                 :on-chunk (fn [_ _])
+                 :on-exit (fn [r]
+                            (is (= "こ" (:kuro/stdout r))
+                                "no U+FFFD replacement chars leaked into the text")
+                            (is (= 3 (:kuro/stdout-bytes r))
+                                "byte count is the real 3 bytes of U+3053, not 3-6 of U+FFFD")
+                            (is (= (cid/text-cid "こ") (:kuro/stdout-cid r))
+                                "the CID hashes the child's real bytes, not the corrupted ones")
+                            (done))
+                            }))))
+
+(deftest streaming-clock-is-injectable
+  ;; README (“The same guarantees apply”) and stream-node's ns docstring
+  ;; document `:now` as an opts key of start; the sync provider pins that a
+  ;; caller-supplied clock reaches started-at/finished-at/duration-ms
+  ;; (node_test: clock-is-injectable). The streaming path calls
+  ;; `(now)` once for `started` and once for `finished` (stream_node:71,96)
+  ;; and carries both into stream/finish -- with no test proving the carrier
+  ;; stays wired. A regression to `js/Date.now` inside start would leave the
+  ;; whole suite green while the documented injectable clock silently stopped
+  ;; working (the same class of loss rule 2 warns about: a .cljc/host seam
+  ;; tested on one path alone). Pin both stamps plus the derived duration.
+  (testing "a caller-supplied clock reaches the streaming receipt"
+    (async done
+      (let [ticks (atom [100 350])]
+        (sh/start (safe) (emit "0")
+                  {:repo-root "."
+                   :now #(let [[t & more] @ticks]
+                           (reset! ticks (or more [t]))
+                           t)
+                   :on-exit (fn [r]
+                              (is (= 100 (:kuro/started-at r)))
+                              (is (= 350 (:kuro/finished-at r)))
+                              (is (= 250 (:kuro/duration-ms r)))
+                              (done))})))))
+
+(deftest deadline-with-output-does-not-crash-the-host
+  (async done
+    (sh/start (safe)
+              (emit "setInterval(()=>process.stdout.write('x'.repeat(8192)),2)")
+              {:repo-root "." :timeout-ms 100
+               :on-chunk (fn [_ _] nil)
+               :on-exit (fn [r]
+                          (is (= 124 (:kuro/exit-code r)))
+                          (is (true? (:kuro/timed-out? r)))
+                          (is (nil? (:kuro/truncated? r)))
+                          ;; a flood child hit by the deadline: the provider stops it with a
+                          ;; timeout receipt;any stdout data already buffered at SIGKILL
+                          ;; lands es delivered to take-chunk! AFTER finish! -- if it
+                          ;; called append-chunk on the :exited stream it throws,and the
+                          ;; uncaught exception inside the stdout EventEmitter kills the
+                          ;; host exactly like the existing write-after-close-stdin test
+                          ;; documents. A late data read must degrade to a silent no-op
+                          ;; (`(when (stream/running? @st) ...))`); reaching on-exit/done
+                          ;; here is the proof it did.
+                          (done))})))
+
+
+
+(deftest deadline-does-not-relabel-an-already-exited-child
+  ;; issue #113: the deadline timer fires on a :timeout-ms that elapses in the
+  ;; window between the child's 'exit' event (real exit code known) and the
+  ;; 'close' event (stdio fully drained). A grandchild that inherited the pipe
+  ;; keeps close delayed past the deadline. The deadline must NOT overwrite the
+  ;; real exit code with 124/:timed-out? -- the receipt reports the exit code the
+  ;; host actually saw. With no 'exit' handler the timer wins the done? guard and
+  ;; the receipt lies (exit 0 => 124); the 'exit' handler that records + disarms
+  ;; is what this test guards.
+  (testing "a child that already exit(0)'d before the deadline is reported exit 0, never 124"
+    (async done
+      (sh/start (safe)
+                (emit (str "const{spawn}=require('node:child_process');"
+                           "spawn(process.execPath,['-e','setTimeout(()=>{},1500)'],"
+                           "{stdio:['ignore','inherit','inherit']});"
+                           "process.exit(0)"))
+                {:repo-root "." :timeout-ms 3000
+                 :on-exit (fn [r]
+                            (is (= 0 (:kuro/exit-code r))
+                                "the real exit code wins; a firing deadline must not relabel to 124")
+                            (is (nil? (:kuro/timed-out? r)))
+                            (done))}))))
+
+
+(deftest deadline-never-claims-timed-out-after-an-exit-is-observed
+  ;; issue #113's decide-exit contract, pinned as a pure fn (no spawn): the
+  ;; :timeout-ms deadline may claim 124/timed-out? ONLY while no real exit has
+  ;; been observed. Once the child's 'exit' fires with a code, a queued deadline
+  ;; must report the truth, never a mislabeled timeout. This is the policy the
+  ;; e2e test (deadline-does-not-relabel-an-already-exited-child) proves is wired
+  ;; to the real spawn events; this pins each branch so the precedence can't
+  ;; slip under timing.
+  (testing "deadline-decision reports 124/timed-out? only before the exit is known"
+    (is (= {:exit-code 124 :timed-out? true} (sh/deadline-decision nil))
+        "no exit observed yet -> the deadline still legitimately times the run out")
+    (is (= {:exit-code 0} (sh/deadline-decision {:code 0 :signal nil}))
+        "a clean exit 0 wins over a later deadline")
+    (is (= {:exit-code 7} (sh/deadline-decision {:code 7 :signal nil}))
+        "any real code wins, not just 0")
+    (is (= {:exit-code 128 :error "terminated by SIGTERM"}
+           (sh/deadline-decision {:code nil :signal "SIGTERM"}))
+        "a signal death keeps the 128/signal shape, never a timeout")))
