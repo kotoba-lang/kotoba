@@ -1,0 +1,187 @@
+(ns hata.admission
+  (:export [admission-preflight admission-initialize admission-submit
+            admission-complete admission-recover admission-status
+            admission-row-status]))
+
+;; Internal, post-verification state machine. This is NOT a wire authenticator
+;; or an effect permit. See docs/accountable-admission.md for the trust boundary,
+;; exact vector ABI, durable checkpoint protocol, and decision codes.
+;; No capability imports, clock reads, keys, LLM decisions, or effects occur here.
+;; Every returned vector is newly allocated; caller-owned snapshots are unchanged.
+
+(defn- ad-copy [v :vector-i64] :vector-i64
+  (loop [i 0 out (vector-i64)]
+    (if (= i (vector-count v)) out
+      (recur (+ i 1) (vector-conj out (vector-at v i))))))
+
+(defn- ad-equal [a :vector-i64 ai :i64 b :vector-i64 bi :i64 n :i64] :bool
+  (loop [i 0]
+    (if (= i n) true
+      (and (= (vector-at a (+ ai i)) (vector-at b (+ bi i)))
+           (recur (+ i 1))))))
+
+(defn- ad-nonzero [v :vector-i64 start :i64] :bool
+  (or (not= (vector-at v start) 0) (not= (vector-at v (+ start 1)) 0)
+      (not= (vector-at v (+ start 2)) 0) (not= (vector-at v (+ start 3)) 0)))
+
+(defn- ad-nonnegative [v :vector-i64 start :i64 n :i64] :bool
+  (loop [i 0]
+    (if (= i n) true
+      (and (>= (vector-at v (+ start i)) 0) (recur (+ i 1))))))
+
+(defn- ad-state? [s :vector-i64] :bool
+  (and (>= (vector-count s) 24)
+       (= (vector-at s 0) 1)
+       (> (vector-at s 1) 0) (> (vector-at s 2) 0)
+       (>= (vector-at s 3) 0) (>= (vector-at s 4) 0)
+       (> (vector-at s 5) 0) (<= (vector-at s 5) 64)
+       (>= (vector-at s 6) 0) (<= (vector-at s 6) (vector-at s 5))
+       (= (vector-count s) (+ 24 (* (vector-at s 6) 57)))
+       (ad-nonzero s 9) (ad-nonzero s 13)
+       (ad-nonnegative s 17 7)))
+
+(defn- ad-decision [s :vector-i64 code :i64 row :i64] :vector-i64
+  (vector-assoc! (vector-assoc! (ad-copy s) 7 code) 8 row))
+
+(defn admission-status [s :vector-i64] :i64
+  (if (ad-state? s) (vector-at s 7) 10))
+
+(defn admission-preflight [frame-bytes :i64 payload-bytes :i64
+                           max-payload :i64 queued :i64 capacity :i64] :bool
+  (and (= frame-bytes 400) (>= payload-bytes 0) (>= max-payload 0)
+       (<= payload-bytes max-payload) (>= queued 0)
+       (> capacity 0) (< queued capacity)))
+
+(defn admission-initialize [config :vector-i64] :vector-i64
+  (if (and (= (vector-count config) 24) (ad-state? config)
+           (= (vector-at config 3) 0) (= (vector-at config 6) 0)
+           (= (vector-at config 7) 0) (= (vector-at config 8) -1))
+    (ad-copy config)
+    (vector-i64)))
+
+(defn- ad-request? [r :vector-i64] :bool
+  (and (= (vector-count r) 50) (= (vector-at r 0) 1)
+       (> (vector-at r 1) 0) (ad-nonnegative r 2 4)
+       (or (= (vector-at r 6) 1) (= (vector-at r 6) 2))
+       (ad-nonnegative r 7 3)
+       (< (vector-at r 2) (vector-at r 3))
+       (>= (vector-at r 9) (vector-at r 3))
+       (ad-nonzero r 10) (ad-nonzero r 14) (ad-nonzero r 18)
+       (ad-nonzero r 22) (ad-nonzero r 26) (ad-nonzero r 30)
+       (ad-nonzero r 34) (ad-nonnegative r 38 12)
+       (= (vector-at r 38) 1)
+       (>= (vector-at r 39) 400)
+       (<= (vector-at r 8) (- (vector-at r 39) 400))))
+
+(defn- ad-find [s :vector-i64 key :vector-i64 ki :i64 ri :i64] :i64
+  (loop [i 0]
+    (cond (= i (vector-at s 6)) -1
+          (ad-equal s (+ 31 (+ (* i 57) ri)) key ki 4) i
+          :else (recur (+ i 1)))))
+
+(defn admission-row-status [s :vector-i64 request-digest :vector-i64] :i64
+  (if (and (ad-state? s) (= (vector-count request-digest) 4))
+    (let [i (ad-find s request-digest 0 22)]
+      (if (< i 0) 0 (vector-at s (+ 24 (* i 57)))))
+    -1))
+
+(defn- ad-budget? [s :vector-i64 r :vector-i64] :bool
+  (loop [i 0]
+    (if (= i 6) true
+      (and (<= (vector-at r (+ 38 i)) (vector-at r (+ 44 i)))
+           (<= (vector-at r (+ 38 i)) (vector-at s (+ 17 i)))
+           (recur (+ i 1))))))
+
+(defn- ad-anchor? [s :vector-i64 now :i64 anchor :i64 epoch :i64] :bool
+  (and (= anchor (vector-at s 3)) (= epoch (vector-at s 1))
+       (>= now (vector-at s 4))
+       (< (vector-at s 3) 9223372036854775807)))
+
+(defn- ad-advance [s :vector-i64 now :i64] :vector-i64
+  (vector-assoc! (vector-assoc! (ad-copy s) 3 (+ (vector-at s 3) 1)) 4 now))
+
+(defn- ad-reserve [s :vector-i64 r :vector-i64 now :i64] :vector-i64
+  (let [next (ad-advance s now)
+        charged (loop [i 0 out next]
+                  (if (= i 6) out
+                    (recur (+ i 1) (vector-assoc! out (+ 17 i)
+                                          (- (vector-at out (+ 17 i))
+                                             (vector-at r (+ 38 i)))))))
+        head (vector-assoc! (vector-assoc! (vector-assoc! charged 6 (+ (vector-at s 6) 1))
+                                         7 1) 8 (vector-at s 6))
+        row (vector-conj (vector-conj (vector-conj head 1) (vector-at next 3)) 0)
+        zeroed (loop [i 0 out row]
+                 (if (= i 4) out (recur (+ i 1) (vector-conj out 0))))]
+    (loop [i 0 out zeroed]
+      (if (= i 50) out (recur (+ i 1) (vector-conj out (vector-at r i)))))))
+
+(defn admission-submit [s :vector-i64 r :vector-i64 now :i64
+                        anchor :i64 epoch :i64] :vector-i64
+  (cond (not (ad-state? s)) (vector-i64)
+        (not (ad-anchor? s now anchor epoch)) (ad-decision s 11 -1)
+        (not (ad-request? r)) (ad-decision s 12 -1)
+        (or (not= (vector-at r 1) epoch)
+            (not= (vector-at r 5) (vector-at s 2))
+            (not (ad-equal s 9 r 10 4))
+            (not (ad-equal s 13 r 14 4))) (ad-decision s 13 -1)
+        (or (< now (vector-at r 2)) (>= now (vector-at r 3))
+            (>= now (vector-at r 4)) (>= now (vector-at r 7))) (ad-decision s 14 -1)
+        (> (vector-at r 8) (vector-at s 23)) (ad-decision s 15 -1)
+        :else
+        (let [coupon-row (ad-find s r 18 18)
+              request-row (ad-find s r 22 22)
+              row (if (>= coupon-row 0) coupon-row request-row)]
+          (cond (>= row 0)
+                (if (and (= coupon-row request-row)
+                         (ad-equal s (+ 31 (* row 57)) r 0 50))
+                  (ad-decision s 2 row)
+                  (ad-decision s 16 row))
+                (>= (vector-at s 6) (vector-at s 5)) (ad-decision s 17 -1)
+                (not (ad-budget? s r)) (ad-decision s 18 -1)
+                :else (ad-reserve s r now)))))
+
+(defn admission-complete [s :vector-i64 request-digest :vector-i64
+                          outcome :i64 result-digest :vector-i64
+                          context :vector-i64] :vector-i64
+  (cond (not (ad-state? s)) (vector-i64)
+        (not= (vector-count context) 3) (ad-decision s 19 -1)
+        :else
+        (let [now (vector-at context 0) anchor (vector-at context 1)
+              epoch (vector-at context 2)]
+          (cond
+                (not (ad-anchor? s now anchor epoch)) (ad-decision s 11 -1)
+                (or (not= (vector-count request-digest) 4)
+                    (not= (vector-count result-digest) 4)
+                    (not (or (= outcome 2) (= outcome 3) (= outcome 4)))) (ad-decision s 19 -1)
+                (and (not= outcome 4) (not (ad-nonzero result-digest 0))) (ad-decision s 19 -1)
+                :else
+                (let [row (ad-find s request-digest 0 22)]
+                  (if (< row 0) (ad-decision s 20 -1)
+                    (let [start (+ 24 (* row 57))
+                          previous (vector-at s start)]
+                      (if (not= previous 1)
+                        (if (and (= previous outcome) (ad-equal s (+ start 3) result-digest 0 4))
+                          (ad-decision s 2 row) (ad-decision s 21 row))
+                        (let [next (ad-advance s now)
+                              marked (vector-assoc! (vector-assoc! next start outcome) (+ start 2) (vector-at next 3))
+                              completed (loop [i 0 out marked]
+                                          (if (= i 4) out
+                                            (recur (+ i 1) (vector-assoc! out (+ (+ start 3) i)
+                                                                  (vector-at result-digest i)))))]
+                          (ad-decision completed 3 row))))))))))
+
+(defn admission-recover [s :vector-i64 now :i64 anchor :i64
+                         old-epoch :i64 new-epoch :i64] :vector-i64
+  (cond (not (ad-state? s)) (vector-i64)
+        (or (not (ad-anchor? s now anchor old-epoch))
+            (<= new-epoch old-epoch)) (ad-decision s 11 -1)
+        :else
+        (let [next (vector-assoc! (ad-advance s now) 1 new-epoch)
+              recovered (loop [i 0 out next]
+                          (if (= i (vector-at s 6)) out
+                            (let [start (+ 24 (* i 57))]
+                              (recur (+ i 1)
+                                     (if (= (vector-at s start) 1)
+                                       (vector-assoc! (vector-assoc! out start 4) (+ start 2) (vector-at next 3))
+                                       out)))))]
+          (ad-decision recovered 4 -1))))
