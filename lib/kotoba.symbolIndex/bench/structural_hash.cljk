@@ -1,0 +1,347 @@
+#!/usr/bin/env kbb
+;; bench/structural_hash.cljk — iteration 15 の仮説を測る: 定義の識別子を text hash (v3、空白畳み
+;; sha256) から **構造 hash** (reader を通し、名前と局所束縛と docstring と位置 meta を落として
+;; sha256) に変えたとき、何が変わるか。
+;;
+;;   kbb --backend sci bench/structural_hash.cljk [--root <superproject>] [--sample <files>] [--seed <n>]
+;;                                                [--all] [--out <edn>]
+;;
+;; 出す数 (evidence floor: parsed が 0 なら exit 2):
+;;   :rows / :parsed / :parse-failed (理由 literal 上位)   —— 読めなかった定義は「同一でない」ではなく未測定
+;;   :text-dup-ratio / :struct-dup-ratio                    —— 「他と同一の本文を持つ定義」の割合 (v3 README 41.2% と同じ定義)
+;;   :gain      text では違うが構造では同じ定義の数 (= 構造 hash が新しく畳んだ写し)
+;;   :names-per-struct  1 つの構造 hash に束縛された異なる名前の数の分布 (naming 面 / identity 面の分離の根拠)
+;;   :rename-check  同じ定義を 4 通りに壊して両 hash の反応を見る (両方向):
+;;       :ws       空白だけ         → text 同 / struct 同   (v3 が既に持つ性質の control)
+;;       :comment  コメント挿入     → text 異 / struct 同
+;;       :rename   局所束縛の改名   → text 異 / struct 同
+;;       :body     本文に nil を足す → text 異 / struct 異   (「変わったのに同じ」を出さない側)
+;;   期待と違った件は理由 literal 付きで列挙する。
+;;
+;; 構造 hash の定義 (syntactic-structural であって semantic ではない):
+;;   edamame で第 1 form を読む (:read-cond :preserve、両 branch とも identity に入る)
+;;   → def 名を %name に、束縛位置に現れた symbol を出現順に %0 %1 … に (scope は見ない: shadowing は畳む)
+;;   → docstring を落とす → meta から :row :col :end-row :end-col を落とす (他の meta ^:private 等は残す)
+;;   → *print-meta* true で pr-str → sha256 先頭 10 hex。
+;;   参照先の hash への置換 (Merkle) は **この bench では未実装** —— 依存が変わっても自分は変わらない。
+
+(require '[clojure.string :as str]
+         '[clojure.walk :as walk]
+         '[edamame.core :as e]
+         '[cljs.pprint :as pp])
+
+(def fs (js/require "node:fs"))
+(def path (js/require "node:path"))
+(def crypto (js/require "node:crypto"))
+
+(defn- argv [] (vec (js->clj (.-argv js/process))))
+(defn- arg-after [flag]
+  (let [a (argv) i (.indexOf a flag)]
+    (when (and (>= i 0) (< (inc i) (count a))) (nth a (inc i)))))
+(defn- flag? [f] (>= (.indexOf (argv) f) 0))
+
+(def root (or (arg-after "--root") "/Users/junkawasaki/github/com-junkawasaki"))
+(def index-file (.join path root ".kotoba-cache" "symbol-index.tsv"))
+(def sample-n (js/parseInt (or (arg-after "--sample") "2000") 10))
+(def seed (js/parseInt (or (arg-after "--seed") "15") 10))
+(def out-file (arg-after "--out"))
+
+(defn- sha10 [s]
+  (subs (.digest (.update (.createHash crypto "sha256") s "utf8") "hex") 0 10))
+
+;; v3 と同じ text hash (scripts/symbol-index.cljk content-hash)
+(defn- text-hash [span] (sha10 (str/trim (str/replace span #"\s+" " "))))
+
+;; ---------------------------------------------------------------- 構造 hash
+(def parse-opts (e/normalize-opts {:all true :read-cond :preserve :auto-resolve name
+                                   :readers (fn [t] (fn [v] (list 'TAG t v)))
+                                   :syntax-quote true :location? (constantly false)}))
+(def parse-opts-loc (e/normalize-opts {:all true :read-cond :preserve :auto-resolve name
+                                       :readers (fn [t] (fn [v] (list 'TAG t v)))
+                                       :syntax-quote true :location? seq?}))
+
+(def binding-heads '#{fn fn* defn defn- defmacro let let* loop loop* for doseq dotimes when-let if-let
+                      when-some if-some letfn binding with-open with-redefs as-> defmethod deftest
+                      defrecord deftype defprotocol reify extend-type extend-protocol catch})
+
+(defn- binding-syms
+  "vector (束縛位置) の中の symbol を出現順に。destructuring の map key 側 (:keys …) の symbol も拾う。"
+  [v]
+  (let [acc (volatile! [])]
+    (walk/prewalk (fn [x]
+                    (when (and (symbol? x) (not (str/includes? (name x) "/")) (not= x '&))
+                      (vswap! acc conj x))
+                    x)
+                  v)
+    @acc))
+
+(defn- collect-locals
+  "定義全体から「束縛位置に現れた symbol」を出現順に集める (scope は見ない)。"
+  [form]
+  (let [acc (volatile! [])
+        seen (volatile! #{})
+        push! (fn [s] (when-not (@seen s) (vswap! seen conj s) (vswap! acc conj s)))]
+    (walk/prewalk
+     (fn [x]
+       (when (and (seq? x) (symbol? (first x)) (binding-heads (first x)))
+         (let [[h & r] x]
+           (cond
+             ;; (defn name [args] …) / (defn name "doc" [args] …) / (defn name ([a]) ([a b]))
+             (#{'defn 'defn- 'defmacro 'defmethod 'deftest} h)
+             (doseq [y (rest r)]
+               (cond (vector? y) (run! push! (binding-syms y))
+                     (and (seq? y) (vector? (first y))) (run! push! (binding-syms (first y)))))
+             ;; (fn name? [args] …) / (fn ([a]) …)
+             (#{'fn 'fn*} h)
+             (doseq [y r]
+               (cond (vector? y) (run! push! (binding-syms y))
+                     (and (seq? y) (vector? (first y))) (run! push! (binding-syms (first y)))))
+             ;; (let [a 1 b 2] …) 系: 偶数位置が束縛
+             (#{'let 'let* 'loop 'loop* 'for 'doseq 'dotimes 'when-let 'if-let 'when-some 'if-some 'binding 'with-open 'with-redefs} h)
+             (when (vector? (first r))
+               (run! push! (mapcat binding-syms (take-nth 2 (first r)))))
+             (= 'as-> h) (when (symbol? (second r)) (push! (second r)))
+             (= 'catch h) (when (symbol? (second r)) (push! (second r)))
+             (= 'letfn h) (when (vector? (first r))
+                            (doseq [f (first r)] (when (and (seq? f) (symbol? (first f))) (push! (first f)))))
+             ;; defrecord / deftype / reify / extend-*: fields と method args
+             (#{'defrecord 'deftype} h)
+             (when (vector? (second r)) (run! push! (binding-syms (second r))))
+             :else nil)))
+       x)
+     form)
+    @acc))
+
+(defn- strip-loc-meta [x]
+  (if (and (some? x) (satisfies? IMeta x) (meta x))
+    (let [m (dissoc (meta x) :row :col :end-row :end-col :source)]
+      (with-meta x (when (seq m) m)))
+    x))
+
+(defn- def-form? [form]
+  (and (seq? form) (symbol? (first form)) (str/starts-with? (name (first form)) "def")))
+
+(defn- strip-doc
+  "(defX name \"doc\" …) → (defX name …)。(def name \"doc\" value) も同じ。"
+  [form]
+  (if (and (def-form? form) (>= (count form) 4) (string? (nth form 2)))
+    (with-meta (concat (take 2 form) (drop 3 form)) (meta form))
+    form))
+
+(defn- structural-hash
+  "span の第 1 form の構造 hash。読めなければ {:error literal}。"
+  [span]
+  (try
+    (let [rdr (e/reader span)
+          form (e/parse-next rdr parse-opts)]
+      (if (= ::e/eof form)
+        {:error "eof-before-form"}
+        (let [form (strip-doc form)
+              defname (when (def-form? form) (second form))
+              locals (collect-locals form)
+              ren (into {} (map-indexed (fn [i s] [s (symbol (str "%" i))]) locals))
+              ren (if (symbol? defname) (assoc ren defname '%name) ren)
+              s (binding [*print-meta* true]
+                  (pr-str
+                   (walk/postwalk (fn [x]
+                                    (let [x (strip-loc-meta x)]
+                                      (cond
+                                        (symbol? x)
+                                        (let [x' (get ren x x)]
+                                          ;; syntax-quote の gensym は不安定
+                                          (if (str/ends-with? (name x') "__auto__")
+                                            (symbol (str/replace (name x') #"__\d+__auto__$" "__auto__"))
+                                            (with-meta x' (meta x))))
+                                        ;; set / map は印字順が値に依らない (regex は値等価を持たず、
+                                        ;; 9 要素以上の map は hash 順) ので、要素の印字を sort した形に畳む
+                                        (set? x) (with-meta (list 'SET* (vec (sort (map pr-str x)))) (meta x))
+                                        (map? x) (with-meta (list 'MAP* (vec (sort (map (fn [[k v]] (pr-str [k v])) x)))) (meta x))
+                                        :else x)))
+                                  form)))]
+          {:hash (sha10 s) :locals (count locals) :named (some? defname) :size (count s)})))
+    (catch :default ex
+      (let [m (or (.-message ex) (str ex))]
+        {:error (first (str/split-lines m))}))))
+
+;; ---------------------------------------------------------------- 索引を読む
+(defn- read-index []
+  (when-not (.existsSync fs index-file)
+    (println (str "REFUSE\tno index at " index-file)) (.exit js/process 2))
+  (let [lines (str/split-lines (.readFileSync fs index-file "utf8"))
+        hdr (first lines)]
+    (when-not (str/starts-with? hdr "#symbol-index\tv3")
+      (println (str "REFUSE\tindex is not v3: " (subs hdr 0 40))) (.exit js/process 2))
+    (->> (rest lines)
+         (keep (fn [l]
+                 (let [[sym kind rel line ns flags h] (str/split l #"\t")]
+                   (when (and rel line) {:sym sym :kind kind :rel rel :line (js/parseInt line 10) :flags flags :h h}))))
+         (group-by :rel))))
+
+;; 決定的な sample (LCG)
+(defn- sample-keys [ks n seed]
+  (if (or (flag? "--all") (>= n (count ks)))
+    ks
+    (let [v (vec (sort ks))
+          st (volatile! seed)
+          nxt (fn [] (vswap! st #(mod (+ (* 1103515245 %) 12345) 2147483648)) @st)]
+      (loop [acc #{} i 0]
+        (if (or (>= (count acc) n) (> i (* 20 n)))
+          (vec acc)
+          (recur (conj acc (nth v (mod (nxt) (count v)))) (inc i)))))))
+
+(defn- spans-of
+  "file の行と索引行から (row, span) を作る。span は def の行から次の def 行の直前まで。"
+  [text rows]
+  (let [ls (str/split-lines text)
+        rows (sort-by :line rows)
+        n (count ls)]
+    (map-indexed
+     (fn [i r]
+       (let [start (dec (:line r))
+             end (if-let [nx (nth rows (inc i) nil)] (max (:line r) (dec (:line nx))) n)
+             end (min end n)]
+         [r (str/join "\n" (subvec ls (min start n) end))]))
+     rows)))
+
+;; ---------------------------------------------------------------- 壊して測る (両方向)
+(defn- first-form-text
+  "span から第 1 form のテキスト範囲 [0 end) を edamame の位置で取る (壊す位置を決めるため)。"
+  [span]
+  (try
+    (let [rdr (e/reader span)
+          form (e/parse-next rdr parse-opts-loc)
+          m (meta form)]
+      (when (and (:end-row m) (:end-col m))
+        (let [ls (str/split-lines span)
+              end (+ (reduce + (map #(inc (count %)) (take (dec (:end-row m)) ls))) (dec (:end-col m)))]
+          end)))
+    (catch :default _ nil)))
+
+(defn- multiline-string? [span]
+  (try
+    (let [form (e/parse-next (e/reader span) parse-opts)
+          hit (volatile! false)]
+      (walk/postwalk (fn [x] (when (and (string? x) (str/includes? x "\n")) (vreset! hit true)) x) form)
+      @hit)
+    (catch :default _ true)))
+
+(defn- mutate [span kind local]
+  (case kind
+    ;; 複数行の文字列リテラルを含む定義は「空白だけ」の変異にならない (文字列の中身が変わる) ので測らない
+    :ws (when-not (multiline-string? span) (str/replace span #"\n" "\n  "))
+    :comment (str ";; mutated comment\n" span)
+    :rename (when local
+              (let [re (js/RegExp. (str "(?<![\\w*+!?<>=.$/:\\-'\"])" (str/replace (name local) #"[.*+?^${}()|\[\]\\]" "\\$&") "(?![\\w*+!?<>=.$/\\-'\"])") "g")
+                    out (str/replace span re (str (name local) "__renamed"))]
+                (when (not= out span) out)))
+    :body (when-let [end (first-form-text span)]
+            (when (and (pos? end) (= ")" (subs span (dec end) end)))
+              (str (subs span 0 (dec end)) " nil)" (subs span end))))))
+
+(defn- first-local [span]
+  (try
+    (let [form (e/parse-next (e/reader span) parse-opts)]
+      (first (collect-locals form)))
+    (catch :default _ nil)))
+
+(def expectations {:ws [:same :same] :comment [:diff :same] :rename [:diff :same] :body [:diff :diff]})
+
+(defn- check-one [span r]
+  (let [t0 (text-hash span) s0 (structural-hash span)]
+    (when-not (:error s0)
+      (let [local (first-local span)]
+        (for [[kind [et es]] expectations
+              :let [m (mutate span kind local)]
+              :when m
+              :let [t1 (text-hash m) s1 (structural-hash m)
+                    tr (if (= t0 t1) :same :diff)
+                    sr (cond (:error s1) :error (= (:hash s0) (:hash s1)) :same :else :diff)]]
+          {:kind kind :expected [et es] :got [tr sr] :ok (= [et es] [tr sr]) :at (str (:rel r) ":" (:line r) " " (:sym r) " local=" local)
+           :reason (cond (:error s1) (str "parse-after-mutation: " (:error s1))
+                         (not= et tr) (str "text-hash " (name tr) " expected " (name et))
+                         (not= es sr) (str "struct-hash " (name sr) " expected " (name es))
+                         :else nil)})))))
+
+;; ---------------------------------------------------------------- main
+(defn- pct [a b] (if (pos? b) (/ (Math/round (* 1000 (/ a b))) 10) 0))
+
+(defn -main []
+  (let [by-file (read-index)
+        files (sample-keys (keys by-file) sample-n seed)
+        t-start (.now js/Date)
+        recs (volatile! [])
+        fails (volatile! {})
+        unreadable (volatile! 0)
+        checks (volatile! [])]
+    (doseq [rel files]
+      (let [full (.join path root rel)
+            text (try (.readFileSync fs full "utf8") (catch :default _ nil))]
+        (if (nil? text)
+          (vswap! unreadable inc)
+          (doseq [[r span] (spans-of text (get by-file rel))]
+            (let [sh (structural-hash span)
+                  th (text-hash span)]
+              (if-let [err (:error sh)]
+                (vswap! fails update (str/replace err #"\d+" "N") (fnil inc 0))
+                (vswap! recs conj {:rel rel :sym (:sym r) :kind (:kind r) :line (:line r)
+                                   :text th :text-v3 (:h r) :struct (:hash sh) :locals (:locals sh) :size (:size sh)}))
+              ;; rename check は defn 系だけ (束縛があるもの) を最大 400 件
+              (when (and (nil? (:error sh)) (pos? (:locals sh)) (< (count @checks) 400))
+                (vswap! checks into (check-one span r))))))))
+    (let [recs @recs
+          n (count recs)
+          nfail (reduce + (vals @fails))]
+      (when (zero? n)
+        (println (str "REFUSE\tparsed 0 definitions (files=" (count files) " unreadable=" @unreadable ")"))
+        (.exit js/process 2))
+      (let [tg (frequencies (map :text recs))
+            sg (frequencies (map :struct recs))
+            text-dup (count (filter #(> (tg (:text %)) 1) recs))
+            struct-dup (count (filter #(> (sg (:struct %)) 1) recs))
+            ;; gain: 構造では他と同一だが text では単独
+            gain (count (filter #(and (> (sg (:struct %)) 1) (= 1 (tg (:text %)))) recs))
+            ;; 逆: text では同一だが構造では単独 (名前を落としているので理論上 0。0 でなければ bug)
+            loss-recs (filter #(and (> (tg (:text %)) 1) (= 1 (sg (:struct %)))) recs)
+            loss (count loss-recs)
+            v3-agree (count (filter #(= (:text %) (:text-v3 %)) recs))
+            ;; 自明な定義 (正規形が 60 字未満: `(def %name 32)` の類) を除いた gain
+            nontrivial (filter #(>= (:size %) 60) recs)
+            gain-nt (count (filter #(and (> (sg (:struct %)) 1) (= 1 (tg (:text %)))) nontrivial))
+            struct-dup-nt (count (filter #(> (sg (:struct %)) 1) nontrivial))
+            text-dup-nt (count (filter #(> (tg (:text %)) 1) nontrivial))
+            names-per (->> recs (group-by :struct) vals
+                           (map #(count (distinct (map :sym %))))
+                           frequencies (into (sorted-map)))
+            multi-name (->> recs (group-by :struct) vals
+                            (filter #(> (count (distinct (map :sym %))) 1))
+                            (sort-by (comp - count))
+                            (take 5)
+                            (map (fn [g] {:names (vec (take 6 (distinct (map :sym g)))) :n (count g)
+                                          :example (str (:rel (first g)) ":" (:line (first g)))})))
+            checks @checks
+            by-kind (->> checks (group-by :kind)
+                         (map (fn [[k cs]] [k {:n (count cs) :ok (count (filter :ok cs))
+                                               :fail (vec (take 3 (map #(select-keys % [:got :reason :at]) (remove :ok cs))))}]))
+                         (into (sorted-map)))
+            wall (- (.now js/Date) t-start)
+            report {:index index-file :files (count files) :unreadable @unreadable :wall-ms wall
+                    :rows (+ n nfail) :parsed n :parse-failed nfail
+                    :parse-fail-top (vec (take 8 (sort-by (comp - val) @fails)))
+                    :text-hash-agrees-with-v3 (str v3-agree "/" n)
+                    :text-dup {:n text-dup :ratio (pct text-dup n)}
+                    :struct-dup {:n struct-dup :ratio (pct struct-dup n)}
+                    :gain gain :loss loss
+                    :loss-examples (vec (take 5 (map #(str (:rel %) ":" (:line %) " " (:sym %)) loss-recs)))
+                    :nontrivial {:n (count nontrivial) :text-dup text-dup-nt :struct-dup struct-dup-nt :gain gain-nt
+                                 :note "正規形 60 字以上の定義だけ"}
+                    :names-per-struct names-per
+                    :multi-name-examples (vec multi-name)
+                    :rename-check by-kind}]
+        (println (with-out-str (pp/pprint report)))
+        (when out-file
+          (.writeFileSync fs out-file (with-out-str (pp/pprint report)))
+          (println (str "wrote " out-file)))
+        (println (str "SCANNED\t" n))
+        (.exit js/process (if (every? #(= (:n %) (:ok %)) (vals by-kind)) 0 1))))))
+
+(-main)

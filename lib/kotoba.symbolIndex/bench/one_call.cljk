@@ -1,0 +1,108 @@
+#!/usr/bin/env kbb
+;; bench/one_call.cljk — agent 無しで測る代理指標: Hermes A/B (bench/hermes_ab.cljk) と同じ
+;; 8 query について、`find <sym>` **1 call の出力だけ**で agent が答えられるか。
+;;
+;;   kbb --backend sci bench/one_call.cljk [--root <superproject>] [--out <jsonl>]
+;;
+;; 判定は hermes_ab と同じ (期待 basename + 行番号 ±2、multi は全 hit)。加えて
+;;   :opening   期待 file の定義行 (`N| (def…`) が snippet として出ているか (= 2 call 目不要)
+;;   :chars     出力の文字数 (≒ tok の 1/3〜1/4)
+;;   :wall-ms   CLI 1 回の壁時計
+;; を取る。agent の実測 (:h18) の腕 C は 8/8 が find → show の 2 call だった。ここが 8/8
+;; :opening なら、agent 側で 2 call 目が消える条件は揃っている (消えたかは hermes で測る)。
+;; 出力は 1 行 1 query の JSONL + 末尾に集計。「測れなかった」は exit 2。
+
+(require '[clojure.string :as str])
+
+(def fs (js/require "node:fs"))
+(def path (js/require "node:path"))
+(def cp (js/require "node:child_process"))
+
+(defn- arg-after [flag]
+  (let [argv (vec (js->clj (.-argv js/process)))
+        i (.indexOf argv flag)]
+    (when (and (>= i 0) (< (inc i) (count argv))) (nth argv (inc i)))))
+
+(def root (or (arg-after "--root")
+              (not-empty (.-HERMES_AB_ROOT (.-env js/process)))
+              "/Users/junkawasaki/github/com-junkawasaki"))
+
+(def script
+  (let [argv (vec (js->clj (.-argv js/process)))
+        me (some #(when (str/ends-with? % "bench/one_call.cljk") %) argv)
+        here (if me (.resolve path (.dirname path me) "..") (.cwd js/process))]
+    (.join path here "scripts" "symbol-index.cljk")))
+
+;; hermes_ab.cljk と同じ表 (期待 file:line は grep -n で独立に確かめたもの)。
+(def queries
+  [{:id "q1" :sym "pin-advance-event"
+    :expect [{:path "orgs/kotoba-lang/kagami/src/kagami/db.cljk" :line 68}]}
+   {:id "q2" :sym "select-quote"
+    :expect [{:path "orgs/network-awai/cloud-murakumo/src/cloud_murakumo/compute_market.cljk" :line 199}]}
+   {:id "q3" :sym "verify-heartbeat"
+    :expect [{:path "orgs/network-awai/cloud-murakumo/src/cloud_murakumo/devices_http.cljk" :line 298}]}
+   {:id "q4" :sym "compile-kernel"
+    :expect [{:path "orgs/kotoba-lang/amu/src/kotoba/compiler/accelerator.cljk" :line 117}]}
+   {:id "q5" :sym "wire-grant"
+    :expect [{:path "orgs/kotoba-lang/amu/src/kotoba/compiler/capability_names.cljk" :line 113}]}
+   {:id "q6" :sym "kernel-base"
+    :expect [{:path "orgs/kotoba-lang/vmm/kotoba/arm64_boot_core.kotoba" :line 41}]}
+   {:id "q7" :sym "write-manifest"
+    :expect [{:path "orgs/kotoba-lang/org-apache-iceberg/src/iceberg/manifest.cljk" :line 98}]}
+   {:id "q8" :sym "capability-catalog" :multi true
+    :expect [{:path "orgs/kotoba-lang/kotoba-sema/src/kotoba/compiler/frontend.cljk" :line 178}
+             {:path "orgs/kotoba-lang/kotoba-component/src/kotoba/component/wasi_contract.cljk" :line 63}
+             {:path "orgs/cloud-itonami/cloud-itonami-app/src/cloud/itonami/app/tenant_connection.cljk" :line 20}]}])
+
+(defn run-find [sym]
+  (let [t0 (.now js/Date)
+        env (js/Object.assign #js{} (.-env js/process))
+        _ (js-delete env "CLAUDE_PROJECT_DIR")
+        _ (aset env "SYMBOL_INDEX_ROOT" root)
+        r (.spawnSync cp "kbb" #js["--backend" "sci" script "find" sym]
+                      #js{:cwd root :encoding "utf8" :env env :maxBuffer (* 64 1024 1024)})]
+    {:out (str (.-stdout r) (.-stderr r)) :code (.-status r) :wall-ms (- (.now js/Date) t0)}))
+
+(defn line-near? [text line]
+  (boolean (some #(<= (js/Math.abs (- % line)) 2) (map js/parseInt (re-seq #"\d+" text)))))
+
+(defn grade [out {:keys [expect]}]
+  (let [hits (for [{p :path line :line} expect
+                   :let [base (.basename path p)
+                         idx (.indexOf out base)
+                         near (if (neg? idx) "" (subs out idx (min (count out) (+ idx 200))))
+                         base-ok (>= idx 0)
+                         line-ok (and base-ok (line-near? near line))
+                         ;; 定義行が snippet として出ている: "  <line>| (" の形
+                         opening (boolean (re-find (js/RegExp. (str "^  " line "\\| \\(") "m") out))]]
+               {:path p :base-ok base-ok :line-ok line-ok :opening opening})]
+    {:hits hits
+     :correct (every? #(and (:base-ok %) (:line-ok %)) hits)
+     :opening (every? :opening hits)}))
+
+(when-not (.existsSync fs (.join path root ".kotoba-cache" "symbol-index.tsv"))
+  (println (str "REFUSE\tno index under " root " — build it first"))
+  (.exit js/process 2))
+
+(let [out-file (arg-after "--out")
+      rows (doall
+            (for [q queries]
+              (let [{:keys [out code wall-ms]} (run-find (:sym q))
+                    g (grade out q)
+                    row (merge {:id (:id q) :sym (:sym q) :exit code :chars (count out)
+                                :lines (count (str/split-lines out)) :wall-ms wall-ms}
+                               g)]
+                (println (str (:id q) "\t" (:sym q) "\tcorrect=" (:correct g) "\topening=" (:opening g)
+                              "\tchars=" (count out) "\tlines=" (:lines row) "\twall=" wall-ms "ms\texit=" code))
+                row)))
+      n (count rows)]
+  (println (str "SUMMARY\tqueries=" n
+                "\tcorrect=" (count (filter :correct rows)) "/" n
+                "\topening=" (count (filter :opening rows)) "/" n
+                "\tchars-mean=" (js/Math.round (/ (reduce + (map :chars rows)) n))
+                "\tchars-max=" (reduce max (map :chars rows))
+                "\twall-ms-mean=" (js/Math.round (/ (reduce + (map :wall-ms rows)) n))))
+  (when out-file
+    (.writeFileSync fs out-file (str (str/join "\n" (map #(.stringify js/JSON (clj->js %)) rows)) "\n") "utf8")
+    (println (str "wrote\t" out-file)))
+  (.exit js/process (if (every? :correct rows) 0 1)))

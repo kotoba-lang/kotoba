@@ -1,0 +1,674 @@
+#!/usr/bin/env kbb
+;; symbol-index の自己検査。fixture tree を tmp に作り、script を子プロセスで
+;; 実際に走らせて exit code と出力を pin する (生成物を実行する — 「ビルドできた」
+;; で満足しない)。
+;;
+;;   kbb --backend sci test/symbol_index_test.cljk
+;;
+;; 出力は `CHECKS<TAB>n` / `FAILED<TAB>n` (boolean でなく個数)。1 件でも落ちれば
+;; exit 1、fixture が作れなければ exit 2 (「測れなかった」を 0 にしない)。
+;;
+;; 8 問 (verification-discipline) との対応:
+;;   Q1 入力が無いとき   → 空 tree の build は REFUSE / exit 2
+;;   Q2 実行できないとき → 索引の top が違う場合 find は REFUSE / exit 2
+;;   Q4 skip と pass     → 0 hit は exit 1、hit は exit 0、拒否は exit 2
+;;   Q5 境界             → max-file-bytes ちょうどは scan、+1 byte は SKIPPED-SIZE
+;;   Q6 理由の literal   → REFUSE 行の文言を pin する
+;;   Q7 仕事をしたから緑 → 各 check は変更した経路 (realpath / metadata / worktree /
+;;                          gitignore / nested / ns 曖昧性) を必ず通す入力で走る
+
+(require '[clojure.string :as str])
+
+(def fs (js/require "node:fs"))
+(def path (js/require "node:path"))
+(def os (js/require "node:os"))
+(def cp (js/require "node:child_process"))
+
+(def script
+  (let [argv (vec (js->clj (.-argv js/process)))
+        me (some #(when (str/ends-with? % "lib/kotoba.symbolIndex/test/symbol_index_test.cljk") %) argv)
+        root (if me (.resolve path (.dirname path me) "..") (.cwd js/process))]
+    (.join path root "scripts" "symbol-index.cljk")))
+
+(def runner
+  "この test 自身を起動した runtime で script も走らせる (kbb / nbb / bb)。"
+  (let [argv0 (str (first (js->clj (.-argv js/process))))
+        argv (vec (js->clj (.-argv js/process)))]
+    (cond
+      (some #(= % "--backend") argv) ["kbb" "--backend" "sci"]
+      (str/includes? argv0 "nbb") ["nbb"]
+      :else ["kbb" "--backend" "sci"])))
+
+(defn mk-tmp [tag]
+  (.mkdtempSync fs (.join path (.tmpdir os) (str "symbol-index-" tag "-"))))
+
+(def test-home (mk-tmp "home"))
+
+(defn run
+  "script を top で走らせ {:code :out} を返す。第 1 引数が map なら
+  {:env {\"K\" \"V\"}} で環境変数を足す (SYMBOL_INDEX_ROOT の check 用)。"
+  [top & args]
+  (let [[opts args] (if (map? (first args)) [(first args) (rest args)] [{} args])
+        [bin & pre] runner
+        ;; process.env は plain object ではないので js->clj が素通しする — copy して消す
+        env (js/Object.assign #js{} (.-env js/process))
+        _ (js-delete env "CLAUDE_PROJECT_DIR")
+        _ (js-delete env "SYMBOL_INDEX_ROOT")
+        ;; iteration 16: build は ~/.kotoba-cache/symbol-index-roots に root を記録し、find は cwd に
+        ;; 索引が無いときそこへ fallback する。test が本物の $HOME を汚さない / 本物の登録簿に
+        ;; 影響されないよう、test 全体で 1 つの空の HOME を使う (登録簿を試す test は自前の HOME を渡す)
+        _ (aset env "HOME" test-home)
+        _ (doseq [[k v] (:env opts)] (aset env k v))
+        r (.spawnSync cp bin (clj->js (concat pre [script] args))
+                      #js{:cwd top :encoding "utf8" :env env})]
+    {:code (.-status r) :out (str (.-stdout r) (.-stderr r))}))
+
+(defn write! [top rel content]
+  (let [full (.join path top rel)]
+    (.mkdirSync fs (.dirname path full) #js{:recursive true})
+    (.writeFileSync fs full content "utf8")))
+
+(def checks (volatile! 0))
+(def failed (volatile! []))
+
+(defn check! [label ok? detail]
+  (vswap! checks inc)
+  (if ok?
+    (println (str "ok\t" label))
+    (do (println (str "FAIL\t" label "\n"
+                      (if (> (count detail) 1500) (str (subs detail 0 1500) "\n  … (" (count detail) " chars)") detail)))
+        (vswap! failed conj label))))
+
+
+;; ------------------------------------------------------------------ fixture
+
+(defn fixture-tree
+  "top/
+     orgs/a/src/a/core.cljk   (ns a.core) + defn/def with metadata + nested
+     orgs/b/src/b/core.cljc   (ns b.core) + defn same-name (ns 曖昧性)
+     link -> orgs/a           (symlink: realpath で 1 回だけ数える)
+     wt/                      linked worktree (.git file → 既定で skip)
+     gen/                     .gitignore された生成物 dir (git repo なら skip)
+     big.cljk                 max-file-bytes + 1 (SKIPPED-SIZE)
+     edge.cljk                max-file-bytes ちょうど (scan される)"
+  [top]
+  (write! top "orgs/a/src/a/core.cljk"
+          (str "(ns a.core)\n"
+               "(defn ^:private hidden-fn [x] x)\n"
+               "(def ^{:doc \"d\"} doc-val 1)\n"
+               "(defn same-name [] :a)\n"
+               "#?(:clj (defn inline-cond [] 1))\n"
+               "#?(:cljs\n   (defn split-cond [] 1))\n"
+               "(comment\n  (defn nested-fn [] 2))\n"
+               "    (defn deep-string-def [] 3)\n"
+               "\n\n(def ^{:doc \"multi\n  line doc\"}\n  multiline-meta 7)\n"))
+  ;; 読めない dir: 中に def を置き、mode 000 にする (root で走ると読めてしまうので
+  ;; その場合は check 側で geteuid を見て skip 扱いにする)
+  ;; prune: repo `orgs/p` の data/x の下に 1,050 個の空 dir (group = orgs/p/data/x)。
+  ;; 同じ repo の src は歩かれる。dNNNN の 1 段下に source を置くと、BFS では
+  ;; 1,050 個の dNNNN を全部 (fileless で) 読んだ後なので prune されて見えない
+  ;; (それが prune の意味; status に載る)。readdir 順に依らないよう 1 段下に置く。
+  (.mkdirSync fs (.join path top "orgs" "p" ".git") #js{:recursive true})
+  (write! top "orgs/p/src/p/core.cljk" "(ns p.core)\n(defn kept-in-pruned-repo [] 1)\n")
+  (dotimes [i 1050]
+    (.mkdirSync fs (.join path top "orgs" "p" "data" "x" (str "d" (+ 1000 i))) #js{:recursive true}))
+  (write! top "orgs/p/data/x/d2049/deep/late.cljk" "(defn lost-after-budget [] 1)\n")
+  ;; virtualenv: pyvenv.cfg を持つ dir は歩かない
+  (write! top "orgs/a/.venv-tts/pyvenv.cfg" "home = /usr/bin\n")
+  (write! top "orgs/a/.venv-tts/lib/site.cljk" "(defn only-in-venv [] 1)\n")
+  (write! top "locked/x.cljk" "(defn only-in-locked [] 1)\n")
+  (.chmodSync fs (.join path top "locked") 0)
+  (write! top "orgs/b/src/b/core.cljc"
+          (str "(ns b.core)\n"
+               "(defn same-name [] :b)\n"))
+  ;; b の写し (rename 前の .clj、同じ行): find は 1 行に畳む (+1 copies)
+  (write! top "orgs/c/verify-run/src/b/core.clj"
+          (str "(ns b.core)\n"
+               "(defn same-name [] :b)\n"))
+  ;; exact 1 件 + substring 3 件: exact の snippet だけ出る
+  (write! top "orgs/a/src/a/wide.cljk"
+          (str "(ns a.wide)\n" (apply str (for [i (range 45)] (str "(defn wide-" i " [] " i ")\n")))))
+  (write! top "orgs/a/src/a/more.cljk"
+          (str "(ns a.more)\n(defn hidden-fn-more [] 1)\n(defn hidden-fn-most [] 1)\n(defn hidden-fn-x [] 1)\n"
+               "(defn documented\n  \"Says hi to the caller.\"\n  [who] who)\n"))
+  (.symlinkSync fs (.join path top "orgs" "a") (.join path top "link"))
+  (write! top "wt/src/wt/core.cljk" "(ns wt.core)\n(defn only-in-worktree [] 1)\n")
+  (write! top "wt/.git" (str "gitdir: " top "/orgs/a/.git/worktrees/wt\n"))
+  (write! top "gen/out.cljk" "(ns gen.out)\n(defn only-in-generated [] 1)\n")
+  (let [line "(def pad 1)\n"
+        n (* 4 1024 1024)
+        body (apply str (repeat (quot n (count line)) line))
+        edge (str body (apply str (repeat (- n (count body)) ";")))]
+    (write! top "edge.cljk" edge)
+    (write! top "big.cljk" (str edge ";"))))
+
+(defn git-init! [top]
+  (try
+    (.execFileSync cp "git" #js["init" "-q"] #js{:cwd top :stdio "ignore"})
+    (write! top ".gitignore" "gen/\n.kotoba-cache/\n")
+    true
+    (catch :default _ false)))
+
+;; ------------------------------------------------------------------ checks
+
+(defn test-build-and-find [top git?]
+  (let [{:keys [code out]} (run top "build")]
+    (check! "build exit 0" (= 0 code) out)
+    (check! "build prints SCANNED (evidence floor)" (re-find #"(?m)^SCANNED\t7$" out) out)
+    (check! "prune: 1,000 consecutive source-less dirs cut the group and say so"
+            (re-find #"(?m)^PRUNED\t1\t\(1000 consecutive" out) out)
+    (check! "venv: pyvenv.cfg dir skipped and counted"
+            (re-find #"(?m)^SKIPPED-VENVS\t1$" out) out)
+    (if (zero? (.geteuid js/process))
+      (println "skip\tunreadable dir (running as root, chmod 0 is readable)")
+      (check! "unreadable dir is counted, not a crash"
+              (re-find #"(?m)^UNREADABLE-DIRS\t1$" out) out))
+    (check! "build boundary: SKIPPED-SIZE 1 (max+1 skipped, max exactly scanned)"
+            (re-find #"(?m)^SKIPPED-SIZE\t1$" out) out)
+    (check! "build skips linked worktree" (re-find #"(?m)^SKIPPED-WORKTREES\t1$" out) out)
+    (if git?
+      (check! "build skips gitignored generated dir"
+              (re-find #"(?m)^SKIPPED-GITIGNORED\t[1-9]\d*$" out) out)
+      (check! "build says gitignore was NOT checked outside a repo"
+              (re-find #"(?m)^SKIPPED-GITIGNORED\t0\t\(not checked" out) out)))
+  (let [idx (.readFileSync fs (.join path top ".kotoba-cache" "symbol-index.tsv") "utf8")]
+    (check! "metadata is skipped, not captured as a name"
+            (and (re-find #"(?m)^hidden-fn\tdefn\t" idx)
+                 (re-find #"(?m)^doc-val\tdef\t" idx)
+                 (not (re-find #"(?m)^\^" idx)))
+            idx)
+    (check! "symlinked checkout counted once, under its realpath"
+            (and (= 1 (count (re-seq #"(?m)^same-name\tdefn\torgs/a/" idx)))
+                 (not (re-find #"(?m)\tlink/" idx)))
+            idx)
+    (check! "linked worktree content absent by default"
+            (not (re-find #"only-in-worktree" idx)) idx)
+    (when git?
+      (check! "gitignored generated dir absent"
+              (not (re-find #"only-in-generated" idx)) idx))
+    (check! "inline reader-cond and shallow-indent defs indexed as nested"
+            (and (re-find #"(?m)^inline-cond\tdefn\t[^\n]*\tn\t[0-9a-f]{10}\t[^\n]*$" idx)
+                 (re-find #"(?m)^nested-fn\tdefn\t[^\n]*\tn\t[0-9a-f]{10}\t[^\n]*$" idx))
+            idx)
+    (check! "multi-line ^{:doc} metadata: name and the (def line, not the name's line"
+            (re-find #"(?m)^multiline-meta\tdef\torgs/a/src/a/core.cljk\t13\ta.core\t\t[0-9a-f]{10}\t[^\n]*$" idx) idx)
+    (check! "blank lines before a def do not turn it into nested"
+            (re-find #"(?m)^multiline-meta\tdef\t[^\n]*\t\t[0-9a-f]{10}\t[^\n]*$" idx) idx)
+    (check! "reader-cond split over two lines: line is the (defn line, nested"
+            (re-find #"(?m)^split-cond\tdefn\torgs/a/src/a/core.cljk\t7\ta.core\tn\t[0-9a-f]{10}\t[^\n]*$" idx) idx)
+    (check! "prune keeps the repo's src and drops only the pruned group"
+            (and (re-find #"kept-in-pruned-repo" idx) (not (re-find #"lost-after-budget" idx))) idx)
+    (check! "pruned group is named in the header"
+            (re-find #"\tpruned-groups=orgs/p/data/x\t" idx) idx)
+    (check! "venv content absent" (not (re-find #"only-in-venv" idx)) idx)
+    (check! "4+ space indent is not indexed"
+            (not (re-find #"deep-string-def" idx)) idx)
+    (check! "ns column filled from the file's (ns …)"
+            (re-find #"(?m)^same-name\tdefn\torgs/b/src/b/core.cljc\t2\tb.core\t\t[0-9a-f]{10}\t[^\n]*$" idx) idx))
+  (let [{:keys [code out]} (run top "find" "same-name")]
+    (check! "find hit exit 0 with 2 hits" (and (= 0 code) (re-find #"2 hits" out)) out))
+  (let [{:keys [code out]} (run top "find" "SAME-NAME")]
+    (check! "find is case-insensitive" (and (= 0 code) (re-find #"2 hits" out)) out))
+  (let [{:keys [code out]} (run top "find" "no-such-symbol-xyz")]
+    (check! "find 0 hits exit 1 (measured, none)" (and (= 1 code) (re-find #"0 hits" out)) out))
+  (let [{:keys [code out]} (run top "find")]
+    (check! "find without term REFUSE exit 2"
+            (and (= 2 code) (re-find #"(?m)^REFUSE\tfind needs at least one term" out)) out))
+  (let [{:keys [code out]} (run top "show" "b.core/same-name")]
+    (check! "show ns/sym picks the ns"
+            (and (= 0 code) (str/includes? out "== defn b.core/same-name — orgs/b/src/b/core.cljc:2")
+                 (not (str/includes? out "orgs/a/src"))) out))
+  (let [{:keys [code out]} (run top "show" "zz.core/same-name")]
+    (check! "show unknown ns falls back to leaf and says so"
+            (and (= 0 code) (re-find #"no same-name in ns zz.core" out)) out))
+  (let [{:keys [code out]} (run top "show" "no-such-symbol-xyz")]
+    (check! "show absent symbol REFUSE exit 2"
+            (and (= 2 code) (re-find #"(?m)^REFUSE\tno exact match for no-such-symbol-xyz" out)) out))
+  (let [{:keys [code out]} (run top "find" "hidden-fn")]
+    (check! "find: 1 exact + 3 substring hits → the exact hit's snippet is printed (no second round trip)"
+            (and (= 0 code) (re-find #"4 hits for hidden-fn" out)
+                 (re-find #"(?m)^  2\| \(defn \^:private hidden-fn" out)
+                 (not (re-find #"(?m)^  2\| \(defn hidden-fn-more" out))) out)
+    (check! "snippet is forward-biased: 1 line before, 6 after (the definition's opening)"
+            (and (re-find #"(?m)^  1\| \(ns a.core\)" out) (re-find #"(?m)^  8\| " out) (not (re-find #"(?m)^  9\| " out))) out))
+  (let [{:keys [code out]} (run top "find" "same-name")]
+    (check! "identical copies (same content hash, .clj vs .cljc) fold into one row with +N identical"
+            (and (re-find #"2 hits for same-name \(1 identical folded; --unfold lists them\)" out)
+                 (re-find #"(?m)^  defn same-name — orgs/b/src/b/core.cljc:2  #[0-9a-f]{10}  \(\+1 identical\)$" out)) out)
+    (check! "find with 2 hits prints both snippets, each under its own == header"
+            (and (= 0 code) (= 2 (count (re-seq #"(?m)^== defn same-name — " out)))
+                 (re-find #"(?m)^  2\| \(defn same-name \[\] :b\)" out)) out))
+  (let [{:keys [code out]} (run top "find" "-")]
+    (check! "find with more than 3 hits prints no snippets"
+            (and (= 0 code) (not (re-find #"(?m)^  \d+\| " out))) out))
+  (let [{:keys [code out]} (run top "find" "b.core/same-name")]
+    (check! "find ns/term filters by the ns column"
+            (and (= 0 code) (re-find #"1 hits for b.core/same-name" out) (re-find #"orgs/b/src" out) (not (re-find #"orgs/a/src" out))) out))
+  (let [{:keys [code out]} (run top "find" "same-name" "--in" "orgs/a/")]
+    (check! "find --in filters by path substring"
+            (and (= 0 code) (re-find #"1 hits for same-name --in orgs/a/" out) (not (re-find #"orgs/b/src" out))) out))
+  (let [{:keys [code out]} (run top "find" "same" "--exact")]
+    (check! "find --exact needs the whole name (0 hits for a fragment)"
+            (and (= 1 code) (re-find #"0 hits for same --exact" out)) out))
+  (let [{:keys [code out]} (run top "find" "wide-")]
+    (check! "wide hits: summary by repo + 8 ranked rows, not a 40-row dump"
+            (and (= 0 code) (re-find #"too many to list: 0 exact, 45 substring" out)
+                 (= 8 (count (re-seq #"(?m)^  defn wide-" out)))) out))
+  (let [{:keys [code out]} (run top "find" "pad")]
+    ;; edge.cljk の最後の (def pad 1) は span に末尾の ; 詰め物を含む。v3 (text hash) では別行だったが、
+    ;; v4 (構造 hash) では comment は identity に入らないので 1 行に畳む (iteration 15)
+    ;; 定義が 1 つなら --unfold の誘いは出さない (2 つ以上のときだけ。same-name の test が対になる)
+    (check! "identical (def pad 1) fold into one row by structural hash, even the one whose span carries trailing comments"
+            (and (= 0 code) (re-find #"1 hits for pad \(\d+ identical folded\)" out)
+                 (re-find #"(?m)^  def pad — edge.cljk:1  #[0-9a-f]{10}  \(\+\d+ identical\)$" out)) out))
+  (let [{:keys [code out]} (run top "find" "hidden-fx")]
+    (check! "0 hits: near suggestions by fragment (false negative guard)"
+            (and (= 1 code) (re-find #"(?m)^  near \(by fragment [^)]*\): [^\n]*hidden-fn" out)) out))
+  (let [{:keys [code out]} (run top "find" "hidden-fx" "--in" "orgs/b/")]
+    (check! "0 hits with --in: suggestions respect the filter (none leak from orgs/a)"
+            (and (= 1 code) (not (re-find #"hidden-fn" out))) out))
+  (let [{:keys [code out]} (run top "outline" "b/core.cljc" "--bare")]
+    (check! "outline --bare by file suffix lists defs in line order"
+            (and (= 0 code) (re-find #"(?m)^== orgs/b/src/b/core.cljc\n  1\tns b.core  #[0-9a-f]{10}\n  2\tdefn same-name  #[0-9a-f]{10}$" out)) out))
+  (let [{:keys [code out]} (run top "outline" "a.core")]
+    (check! "outline by ns marks nested defs with ~ and shows the signature (arglist + body head)"
+            (and (= 0 code) (re-find #"(?m)^  5\t~defn inline-cond  · \[\] 1  #[0-9a-f]{10}$" out)
+                 (re-find #"(?m)^  2\tdefn hidden-fn  · \[x\] x  #[0-9a-f]{10}$" out)
+                 (not (re-find #"deep-string-def" out))) out))
+  (let [{:keys [code out]} (run top "outline" "a.more")]
+    (check! "outline signature falls back to the docstring's first line when the arglist comes later"
+            (and (= 0 code) (re-find #"(?m)^  5\tdefn documented  · Says hi to the caller\.  #[0-9a-f]{10}$" out)) out))
+  (let [{:keys [code out]} (run top "outline" "nope.core")]
+    (check! "outline unknown target REFUSE exit 2"
+            (and (= 2 code) (re-find #"(?m)^REFUSE\tno definitions for nope.core" out)) out))
+  ;; iteration 11: subcommand 無しの dispatch
+  (let [{:keys [code out]} (run top "hidden-fn")]
+    (check! "bare symbol → find" (and (= 0 code) (re-find #"(?m)^\(interpreted as: find hidden-fn\)$" out) (re-find #"4 hits for hidden-fn" out)) out))
+  (let [{:keys [code out]} (run top "b/core.cljc")]
+    (check! "bare *.cljc path → outline" (and (= 0 code) (re-find #"(?m)^\(interpreted as: outline b/core.cljc\)$" out) (re-find #"== orgs/b/src/b/core.cljc" out)) out))
+  (let [{:keys [code out]} (run top "a.core")]
+    (check! "bare dotted name → outline (ns)" (and (= 0 code) (re-find #"(?m)^\(interpreted as: outline a.core\)$" out) (re-find #"hidden-fn" out)) out))
+  (let [{:keys [code out]} (run top "b.core/same-name")]
+    (check! "bare ns/sym → show" (and (= 0 code) (re-find #"(?m)^\(interpreted as: show b.core/same-name\)$" out) (re-find #"== defn b.core/same-name" out)) out))
+  (let [{:keys [code out]} (run top "status")]
+    (check! "status exit 0 and prints symbols=" (and (= 0 code) (re-find #"(?m)^symbols\t\d+" out)) out)
+    (check! "status lists each pruned group on its own line"
+            (re-find #"(?m)^pruned-group\torgs/p/data/x$" out) out))
+  (let [{:keys [code out]} (run top "build" "--no-prune")]
+    (check! "--no-prune walks everything (PRUNED 0) and finds the late file"
+            (and (= 0 code) (re-find #"(?m)^PRUNED\t0$" out)
+                 (re-find #"lost-after-budget" (.readFileSync fs (.join path top ".kotoba-cache" "symbol-index.tsv") "utf8"))) out))
+  (let [{:keys [code out]} (run top)]
+    (check! "no args exit 2 with usage" (and (= 2 code) (re-find #"usage:" out)) out))
+  (let [{:keys [code out]} (run top "bogus")]
+    (check! "unknown bare word is a find (0 hits → exit 1), not a usage error"
+            (and (= 1 code) (re-find #"interpreted as: find bogus" out)) out))
+  (let [{:keys [code out]} (run top "--bogus")]
+    (check! "unknown flag exit 2 with usage" (and (= 2 code) (re-find #"usage:" out)) out))
+  ;; iteration 12: 索引より新しい file は、その file だけ再走査して行を直す
+  ;; (fixture を書き換えるので、この節は build 系 check の後に置く)
+  (let [f (.join path top "orgs" "b" "src" "b" "core.cljc")
+        _ (.writeFileSync fs f (str ";; two lines\n;; inserted\n" (.readFileSync fs f "utf8")) "utf8")
+        {:keys [code out]} (run top "find" "b.core/same-name")]
+    (check! "stale file: find re-locates the line and says so"
+            (and (= 0 code) (re-find #"(?m)^  \(re-located: file changed after index, was line 2; body unchanged\)$" out)
+                 (re-find #"(?m)^  4\| \(defn same-name \[\] :b\)" out)) out))
+  (let [{:keys [code out]} (run top "show" "b.core/same-name")]
+    (check! "stale file: show re-locates too"
+            (and (= 0 code) (re-find #"core.cljc:4  #[0-9a-f]{10}$" (first (filter #(str/starts-with? % "== defn b.core/same-name") (str/split-lines out))))
+                 (re-find #"(?m)^  4\| \(defn same-name" out)) out))
+  (let [{:keys [code out]} (run top "outline" "b/core.cljc" "--bare")]
+    (check! "stale file: outline re-scans the file"
+            (and (= 0 code) (re-find #"(?m)^  \(re-scanned: file changed after index\)$" out)
+                 (re-find #"(?m)^  3\tns b.core  #[0-9a-f]{10}\n  4\tdefn same-name  #[0-9a-f]{10}$" out)) out))
+  (let [{:keys [code out]} (run top "find" "hidden-fn")]
+    (check! "fresh file: no relocation note" (and (= 0 code) (not (re-find #"re-located|re-scanned" out))) out))
+  (let [f (.join path top "orgs" "b" "src" "b" "core.cljc")
+        _ (.writeFileSync fs f "(ns b.core)\n" "utf8")
+        {:keys [code out]} (run top "show" "b.core/same-name")]
+    (check! "stale file that lost the symbol: says so instead of showing a wrong snippet"
+            (and (= 0 code) (re-find #"no longer defines this symbol — build\)\n== " out)) out))
+  (let [{:keys [code out]} (run top "build" "--include-worktrees")]
+    (check! "--include-worktrees keeps the worktree"
+            (and (= 0 code) (re-find #"(?m)^SKIPPED-WORKTREES\t0$" out)) out)))
+
+(defn test-empty-tree []
+  (let [top (mk-tmp "empty")
+        {:keys [code out]} (run top "build")]
+    (check! "Q1: empty tree build REFUSE exit 2 (not an empty green index)"
+            (and (= 2 code) (re-find #"(?m)^REFUSE\tscanned 0 files under " out)) out)
+    (check! "Q1: no index file written for empty tree"
+            (not (.existsSync fs (.join path top ".kotoba-cache" "symbol-index.tsv"))) "")))
+
+(defn test-wrong-top []
+  (let [a (mk-tmp "topa") b (mk-tmp "topb")]
+    (write! a "x.cljk" "(defn foo [] 1)\n")
+    (run a "build")
+    (.mkdirSync fs (.join path b ".kotoba-cache") #js{:recursive true})
+    (.copyFileSync fs (.join path a ".kotoba-cache" "symbol-index.tsv")
+                   (.join path b ".kotoba-cache" "symbol-index.tsv"))
+    (let [{:keys [code out]} (run b "find" "foo")]
+      (check! "Q2: index built for another top REFUSE exit 2"
+              (and (= 2 code) (re-find #"(?m)^REFUSE\tindex was built for top=" out)) out))
+    (let [{:keys [code out]} (run b "status")]
+      (check! "status also refuses on top mismatch" (= 2 code) out))))
+
+(defn test-no-index-and-root-discovery
+  "iteration 3 (Hermes Agent 導入で実測): agent の shell は $HOME に居るので
+  cwd 決め打ちだと find が home 全体を build しに行って timeout する。
+    * 索引が無い top で find → REFUSE exit 2、**索引を作らない** (build を代行しない)
+    * 索引を持つ root の subdir から find → 上に辿って root の索引を引く
+    * 無関係な cwd でも SYMBOL_INDEX_ROOT があればそこを引く"
+  []
+  (let [root (mk-tmp "root") elsewhere (mk-tmp "elsewhere")]
+    (write! root "src/r/core.cljk" "(ns r.core)\n(defn root-only-fn [] 1)\n")
+    (write! root "src/r/deep/leaf.cljk" "(ns r.deep.leaf)\n")
+    (write! elsewhere "y.cljk" "(defn elsewhere-fn [] 1)\n")
+    ;; 登録簿が空の HOME で (共有 test-home には先の build の root が溜まっている)
+    (let [{:keys [code out]} (run elsewhere {:env {"HOME" (mk-tmp "empty-home")}} "find" "elsewhere-fn")]
+      (check! "Q2: find with no index and no known root REFUSE exit 2 (cd first; build last, never in $HOME)"
+              (and (= 2 code) (re-find #"(?m)^REFUSE\tno index at .* — cd to the project root and retry \(or set SYMBOL_INDEX_ROOT\); only if the root itself has no index, run `symbol-index build` there \(never in \$HOME\)" out)) out)
+      (check! "Q2: find with no index leaves no index behind"
+              (not (.existsSync fs (.join path elsewhere ".kotoba-cache" "symbol-index.tsv"))) ""))
+    (run root "build")
+    (let [sub (.join path root "src" "r" "deep")
+          {:keys [code out]} (run sub "find" "root-only-fn")]
+      (check! "subdir cwd walks up to the root index"
+              (and (= 0 code) (re-find #"1 hits for root-only-fn" out)) out))
+    (let [{:keys [code out]} (run elsewhere {:env {"SYMBOL_INDEX_ROOT" root}} "find" "root-only-fn")]
+      (check! "SYMBOL_INDEX_ROOT overrides an unrelated cwd"
+              (and (= 0 code) (re-find #"1 hits for root-only-fn" out)) out))))
+
+(defn test-top-is-worktree []
+  (let [top (mk-tmp "wt-top")]
+    (write! top "src/x.cljk" "(defn in-worktree-top [] 1)\n")
+    (write! top ".git" (str "gitdir: " top "/../main/.git/worktrees/wt-top\n"))
+    (let [{:keys [code out]} (run top "build")]
+      (check! "top that is itself a linked worktree is still indexed"
+              (and (= 0 code) (re-find #"(?m)^SCANNED\t1$" out)) out))))
+
+(defn test-incremental []
+  (let [top (mk-tmp "incr")
+        idx-file (fn [] (.readFileSync fs (.join path top ".kotoba-cache" "symbol-index.tsv") "utf8"))
+        strip #(str/join "\n" (sort (rest (str/split-lines %))))]
+    (write! top "a/one.cljk" "(ns one)\n(defn f1 [] 1)\n")
+    (write! top "b/two.cljk" "(ns two)\n(defn f2 [] 2)\n")
+    (let [{:keys [out]} (run top "build")]
+      (check! "cold build: nothing cached" (re-find #"(?m)^CACHED-FILES\t0\tof 2$" out) out))
+    (let [cold (idx-file)
+          _ (run top "build")            ; 1 回目の warm は top の mtime が .kotoba-cache 作成で変わっている
+          {:keys [out]} (run top "build")
+          warm (idx-file)]
+      (check! "warm build: every dir and file served from cache"
+              (and (re-find #"(?m)^CACHED-FILES\t2\tof 2$" out) (re-find #"(?m)^CACHED-DIRS\t3\tof 3$" out)) out)
+      (check! "warm build rows identical to cold" (= (strip cold) (strip warm)) (str cold "\n---\n" warm)))
+    ;; 1) 既存 file の書き換え (size が変わる) → その file だけ再 scan
+    (write! top "a/one.cljk" "(ns one)\n(defn f1 [] 1)\n(defn f1-added [] 3)\n")
+    (let [{:keys [out]} (run top "build") idx (idx-file)]
+      (check! "changed file is re-scanned, the other served from cache"
+              (and (re-find #"(?m)^CACHED-FILES\t1\tof 2$" out) (re-find #"(?m)^f1-added\tdefn\ta/one.cljk\t3\tone\t\t[0-9a-f]{10}\t[^\n]*$" idx)) (str out idx)))
+    ;; 2) 新 file の追加 → 親 dir の mtime が変わり readdir し直す
+    (write! top "b/three.cljk" "(defn f3 [] 3)\n")
+    (let [{:keys [out]} (run top "build") idx (idx-file)]
+      (check! "new file in a cached dir is found (dir mtime changed)"
+              (and (re-find #"f3\tdefn\tb/three.cljk" idx) (re-find #"(?m)^CACHED-DIRS\t2\tof 3$" out)) (str out idx)))
+    ;; 3) file 削除 → 行が消える
+    (.unlinkSync fs (.join path top "a" "one.cljk"))
+    (let [{:keys [out]} (run top "build") idx (idx-file)]
+      (check! "deleted file's rows disappear" (not (re-find #"one.cljk" idx)) (str out idx)))
+    ;; 4) --full は cache を無視する
+    (let [{:keys [out]} (run top "build" "--full")]
+      (check! "--full ignores the cache" (re-find #"(?m)^CACHED-FILES\t0\tof 2$" out) out))))
+
+(defn test-content-hash []
+  (let [top (mk-tmp "hash")
+        idx (fn [] (.readFileSync fs (.join path top ".kotoba-cache" "symbol-index.tsv") "utf8"))
+        hash-of (fn [sym] (second (re-find (js/RegExp. (str "^" sym "\\t[^\\n]*\\t([0-9a-f]{10})\\t[^\\n]*$") "m") (idx))))]
+    (write! top "a.cljk" "(ns a)\n(defn f [x]\n  (+ x 1))\n(defn g [] 2)\n")
+    (run top "build")
+    (let [f0 (hash-of "f") g0 (hash-of "g")]
+      (check! "hash is 10 hex per definition" (and (re-find #"^[0-9a-f]{10}$" (str f0)) (re-find #"^[0-9a-f]{10}$" (str g0))) (idx))
+      ;; 空白だけの変更 → 同じ hash
+      (write! top "a.cljk" "(ns a)\n(defn f [x]\n    (+ x   1))\n\n(defn g [] 2)\n")
+      (run top "build" "--full")
+      (check! "whitespace-only change keeps the hash (Unison-style identity)" (= f0 (hash-of "f")) (str f0 " vs " (hash-of "f")))
+      ;; 本文の変更 → 違う hash、隣の定義は不変
+      (write! top "a.cljk" "(ns a)\n(defn f [x]\n  (+ x 2))\n(defn g [] 2)\n")
+      (run top "build" "--full")
+      (check! "body change changes the hash; the neighbour's hash is untouched"
+              (and (not= f0 (hash-of "f")) (= g0 (hash-of "g"))) (idx))
+      ;; stale file: 行がずれただけ → body unchanged、本文も変えた → body changed → #new
+      (let [f1 (hash-of "f")]
+        (write! top "a.cljk" ";; moved\n(ns a)\n(defn f [x]\n  (+ x 2))\n(defn g [] 3)\n")
+        (let [{:keys [out]} (run top "show" "a/f")]
+          (check! "stale file, same body: note says body unchanged"
+                  (re-find #"re-located: file changed after index, was line 2; body unchanged" out) out))
+        (let [{:keys [out]} (run top "show" "a/g")]
+          (check! "stale file, changed body: note says body changed with the new hash"
+                  (and (re-find #"was line 4; body changed → #[0-9a-f]{10}" out) (not (re-find (js/RegExp. (str "#" (hash-of "g") "\\)")) out))) out))))))
+
+(defn test-structural-hash []
+  ;; iteration 15: 7 列目は構造 hash。両方向を pin する (同じであるべき 4 通り / 違うべき 3 通り) と
+  ;; fallback (読めない定義は text hash + flag t)。
+  (let [top (mk-tmp "shash")
+        idx (fn [] (.readFileSync fs (.join path top ".kotoba-cache" "symbol-index.tsv") "utf8"))
+        row (fn [sym] (re-find (js/RegExp. (str "^" sym "\\t[^\\n]*$") "m") (idx)))
+        hash-of (fn [sym] (second (re-find (js/RegExp. (str "^" sym "\\t[^\\n]*\\t([0-9a-f]{10})\\t[^\\n]*$") "m") (idx))))
+        flags-of (fn [sym] (nth (str/split (row sym) #"\t") 5))
+        build! (fn [src] (write! top "a.cljk" src) (run top "build" "--full"))]
+    (build! "(ns a)\n(defn f [x] (+ x 1))\n(def one 1)\n(def two 1)\n(def s \"one two\")\n(def pats #{#\"x\" #\"y\" #\"z\"})\n(def broken \"unterminated\n")
+    (let [f0 (hash-of "f") s0 (hash-of "s") p0 (hash-of "pats")]
+      (check! "v5 header" (re-find #"^#symbol-index\tv5\t" (idx)) (subs (idx) 0 40))
+      (check! "name is not identity: (def one 1) and (def two 1) share the hash" (= (hash-of "one") (hash-of "two")) (idx))
+      (check! "unparsable definition falls back to text hash with flag t (measured-not-same, not silent)"
+              (and (= "t" (flags-of "broken")) (re-find #"^[0-9a-f]{10}$" (str (hash-of "broken")))) (row "broken"))
+      (check! "parsable definitions carry no t flag" (= "" (flags-of "f")) (row "f"))
+      ;; 同じであるべき: 局所束縛の rename / comment / docstring / 空白
+      (build! "(ns a)\n(defn f [y] (+ y 1))\n(def one 1)\n(def two 1)\n(def s \"one two\")\n(def pats #{#\"x\" #\"y\" #\"z\"})\n(def broken \"unterminated\n")
+      (check! "renaming a local binding keeps the hash" (= f0 (hash-of "f")) (str f0 " vs " (hash-of "f")))
+      (build! "(ns a)\n;; c\n(defn f\n  \"doc\"\n  [x] ; c2\n  (+ x 1))\n(def one 1)\n(def two 1)\n(def s \"one two\")\n(def pats #{#\"x\" #\"y\" #\"z\"})\n(def broken \"unterminated\n")
+      (check! "comments, docstring and whitespace keep the hash" (= f0 (hash-of "f")) (str f0 " vs " (hash-of "f")))
+      (check! "a set of regex literals hashes the same across builds (element order is not identity)"
+              (= p0 (hash-of "pats")) (str p0 " vs " (hash-of "pats")))
+      ;; regex は値等価を持たないので、sort しなければ書いた順 (= identity 順) が hash に漏れる
+      (write! top "b.cljk" "(ns b)\n(def p1 #{#\"x\" #\"y\" #\"z\"})\n(def p2 #{#\"z\" #\"y\" #\"x\"})\n")
+      (run top "build" "--full")
+      (check! "the same regex set written in a different element order hashes the same (sorted canonical form)"
+              (= (hash-of "p1") (hash-of "p2")) (str (hash-of "p1") " vs " (hash-of "p2")))
+      ;; 違うべき: 本文 / 文字列リテラル内の空白 (v3 の text hash が『同じ』と答えていた欠陥) / 束縛の入れ替え
+      (build! "(ns a)\n(defn f [x] (+ x 1) nil)\n(def one 1)\n(def two 1)\n(def s \"one  two\")\n(def pats #{#\"x\" #\"y\"})\n(def broken \"unterminated\n")
+      (check! "adding a form to the body changes the hash" (not= f0 (hash-of "f")) (str f0 " vs " (hash-of "f")))
+      (check! "whitespace inside a string literal changes the hash (v3 text hash said same)" (not= s0 (hash-of "s")) (str s0 " vs " (hash-of "s")))
+      (check! "removing a set element changes the hash" (not= p0 (hash-of "pats")) (str p0 " vs " (hash-of "pats")))
+      (build! "(ns a)\n(defn f [x] (+ 1 x))\n(def one 1)\n(def two 1)\n(def s \"one two\")\n(def pats #{#\"x\" #\"y\" #\"z\"})\n(def broken \"unterminated\n")
+      (check! "swapping argument order in the body changes the hash" (not= f0 (hash-of "f")) (str f0 " vs " (hash-of "f"))))))
+
+(defn test-known-roots []
+  ;; iteration 16: build が root を登録簿 ($HOME/.kotoba-cache/symbol-index-roots) に記録し、cwd にも祖先にも
+  ;; 索引が無いとき、登録簿の root がちょうど 1 つならそれで答える (build はしない)。2 つ以上なら列挙して拒否。
+  (let [home (mk-tmp "roots-home") proj (mk-tmp "roots-proj") proj2 (mk-tmp "roots-proj2") elsewhere (mk-tmp "roots-elsewhere")
+        env {"HOME" home}
+        roots-file (.join path home ".kotoba-cache" "symbol-index-roots")]
+    (write! proj "src/p/core.cljk" "(ns p.core)\n(defn known-root-fn [] 1)\n(defn known-root-fn [] 1)\n")
+    (write! proj "src/p/other.cljk" "(ns p.other)\n(defn known-root-fn [] 1)\n")
+    (let [{:keys [code out]} (run proj {:env env} "build")]
+      (check! "build records its root in $HOME/.kotoba-cache/symbol-index-roots"
+              (and (= 0 code) (.existsSync fs roots-file)
+                   (= (.realpathSync fs proj) (str/trim (.readFileSync fs roots-file "utf8")))) (str out (try (.readFileSync fs roots-file "utf8") (catch :default _ "NO-FILE")))))
+    (let [{:keys [code out]} (run elsewhere {:env env} "find" "known-root-fn")]
+      (check! "find from a cwd without an index answers from the single known root and says so on line 1"
+              (and (= 0 code) (re-find #"(?m)^\(using index root .* — cwd .* has none; cd there or set SYMBOL_INDEX_ROOT to silence this\)$" out)
+                   (re-find #"1 hits for known-root-fn \(2 identical folded\)" out)) out)
+      (check! "the fallback does not build anything in the cwd"
+              (not (.existsSync fs (.join path elsewhere ".kotoba-cache" "symbol-index.tsv"))) ""))
+    (let [{:keys [code out]} (run elsewhere {:env env} "find" "known-root-fn" "--unfold")]
+      (check! "find --unfold lists each folded copy as file:line under the representative"
+              (and (= 0 code) (re-find #"\(2 identical folded, listed\)" out)
+                   (re-find #"(?m)^      = src/p/core.cljk:3$" out) (re-find #"(?m)^      = src/p/other.cljk:2$" out)) out))
+    (let [{:keys [code out]} (run elsewhere {:env env} "build")]
+      (check! "an explicit build in a cwd without an index still builds there (fallback is read-only)"
+              (and (= 2 code) (re-find #"scanned 0 files under" out)) out))
+    ;; 2 つ目の root を登録 → 曖昧なので拒否 (両方を列挙)
+    (write! proj2 "src/q.cljk" "(ns q)\n(defn other-root-fn [] 1)\n")
+    (run proj2 {:env env} "build")
+    (let [{:keys [code out]} (run elsewhere {:env env} "find" "known-root-fn")]
+      (check! "two known roots: REFUSE and list both (no guessing between trees)"
+              (and (= 2 code) (re-find #"(?m)^REFUSE\tno index at .* — cd to an indexed root and retry \(or set SYMBOL_INDEX_ROOT\): .*roots-proj2.* \| .*roots-proj.*\. Do not build here\." out)) out))
+    ;; 登録簿の root が消えたら候補から外れる
+    (.rmSync fs (.join path proj2 ".kotoba-cache") #js{:recursive true :force true})
+    (let [{:keys [code]} (run elsewhere {:env env} "find" "known-root-fn")]
+      (check! "a registered root whose index is gone is ignored (back to the single root)" (= 0 code) ""))))
+
+(defn test-refs-dependents-closure []
+  ;; iteration 18: 8 列目の参照、find --dependents (被依存の BFS)、closure (on-demand の Merkle hash、SCC は 1 単位)
+  (let [top (mk-tmp "refs")
+        idx (fn [] (.readFileSync fs (.join path top ".kotoba-cache" "symbol-index.tsv") "utf8"))
+        refs-of (fn [sym] (let [l (re-find (js/RegExp. (str "^" sym "\\t[^\\n]*$") "m") (idx))] (nth (str/split l #"\t") 7 "")))
+        closure-of (fn [t] (second (re-find #"  #([0-9a-f]{10})  \(structural" (:out (run top "closure" t)))))]
+    (write! top "orgs/o/r/src/a/core.cljk" "(ns a.core)\n(defn base [x] (+ x 1))\n(defn uses-base [y] (base y))\n(defn rec [n] (if (pos? n) (rec (dec n)) n))\n")
+    (write! top "orgs/o/r/src/b/core.cljk" "(ns b.core (:require [a.core :as ac] [a.core :refer [base]] [clojure.string :as str]))\n(defn via-alias [z] (ac/base z))\n(defn via-refer [z] (base z))\n(defn via-full [z] (a.core/base z))\n(defn none [z] (str/join z 'base))\n")
+    (write! top "orgs/o/r/src/c.cljk" "(ns c.core)\n(defn leaf [x] x)\n(declare b)\n(defn a [x] (b (leaf x)))\n(defn b [x] (if (pos? x) (a (dec x)) x))\n(defn top [x] (a x))\n")
+    (run top "build" "--full")
+    (check! "refs: bare same-file reference" (= "base" (refs-of "uses-base")) (refs-of "uses-base"))
+    (check! "refs: alias, refer and fully-qualified all become ns/sym"
+            (= ["a.core/base" "a.core/base" "a.core/base"] [(refs-of "via-alias") (refs-of "via-refer") (refs-of "via-full")]) (idx))
+    ;; alias 経由の参照は build 時に「索引に在るか」を知れないので ns/sym のまま持つ (query 時に解決できず落ちる)。
+    ;; quote の中の symbol は data であって参照ではない
+    (check! "refs: an alias to a non-indexed ns is kept as ns/sym; a quoted symbol is data, not a reference"
+            (= "clojure.string/join" (refs-of "none")) (refs-of "none"))
+    (check! "refs: self-recursion is not a reference (the name is %name in the structural hash already)" (= "" (refs-of "rec")) (refs-of "rec"))
+    (let [{:keys [code out]} (run top "find" "base" "--dependents")]
+      (check! "--dependents lists every definition referencing base, across alias/refer/qualified, at depth 1"
+              (and (= 0 code) (re-find #"dependents of a.core/base: 4 definitions in 1 level\(s\)" out)
+                   (every? #(re-find (js/RegExp. (str "defn " % " — ")) out) ["uses-base" "via-alias" "via-refer" "via-full"])) out))
+    ;; iteration 21: depth-1 の各 dependent に call site (定義 span 内で leaf を参照する行) を添える。
+    ;; alias (ac/base)・refer (base)・qualified (a.core/base) の 3 形とも当たり、行番号は file の行
+    (let [{:keys [code out]} (run top "find" "base" "--dependents")]
+      (check! "--dependents prints the call site line under each depth-1 dependent (alias / refer / qualified forms)"
+              (and (= 0 code)
+                   (re-find #"(?m)^      2\| \(defn via-alias \[z\] \(ac/base z\)\)$" out)
+                   (re-find #"(?m)^      3\| \(defn via-refer \[z\] \(base z\)\)$" out)
+                   (re-find #"(?m)^      4\| \(defn via-full \[z\] \(a.core/base z\)\)$" out)
+                   (re-find #"(?m)^      3\| \(defn uses-base \[y\] \(base y\)\)$" out)
+                   (re-find #"call sites inside each depth-1 definition" out)) out))
+    (let [{:keys [code out]} (run top "find" "base" "--dependents" "--no-sites")]
+      (check! "--no-sites omits the call site lines and the note" (and (= 0 code) (not (re-find #"(?m)^      \d+\| " out)) (not (re-find #"call sites" out))) out))
+    (let [{:keys [code out]} (run top "find" "base")]
+      (check! "find prints the coverage evidence line (exact/substring split, scanned count, built time)"
+              (and (= 0 code) (re-find #"(?m)^  exact 1 / substring 1 · scanned \d+ files, unreadable 0 \(built \d{4}-\d\d-\d\dT\d\d:\d\dZ\); exact = every definition named exactly this" out)
+                   (re-find #"snippet lines are read from the file now" out)) out))
+    (let [{:keys [code out]} (run top "find" "nonexistent-sym")]
+      (check! "0 hits: no coverage line, no snippet note (nothing to vouch for)"
+              (and (= 1 code) (not (re-find #"exact \d+ / substring" out)) (not (re-find #"snippet lines" out))) out))
+    (let [{:keys [code out]} (run top "find" "leaf" "--dependents" "--depth" "1")]
+      (check! "--depth 1 stops at direct dependents (a only)"
+              (and (= 0 code) (re-find #"1 definitions in 1 level" out) (re-find #"defn a — " out) (not (re-find #"defn top — " out))) out))
+    (let [{:keys [code out]} (run top "find" "leaf" "--dependents" "--depth" "all")]
+      (check! "--depth all walks the transitive closure through the mutual recursion (a, b, top)"
+              (and (= 0 code) (re-find #"3 definitions in 2 level" out) (re-find #"defn top — " out) (re-find #"defn b — " out)) out))
+    (let [{:keys [code out]} (run top "find" "none" "--dependents")]
+      (check! "no dependents: exit 1 with the count 0 (not a refusal)" (and (= 1 code) (re-find #"0 definitions in 0 level" out)) out))
+    (let [{:keys [code out]} (run top "find" "nonexistent-sym" "--dependents")]
+      (check! "unknown symbol: exit 1, says nothing to depend on" (and (= 1 code) (re-find #"0 definitions named nonexistent-sym" out)) out))
+    ;; closure: 依存先の本文が変われば変わる / 無関係は変わらない / 相互再帰の仲間の依存も入る
+    (let [top0 (closure-of "c.core/top") b0 (closure-of "c.core/b") none0 (closure-of "b.core/none")]
+      (check! "closure prints a hash distinct from the structural hash's role" (re-find #"^[0-9a-f]{10}$" (str top0)) (str top0))
+      (write! top "orgs/o/r/src/c.cljk" "(ns c.core)\n(defn leaf [x] (inc x))\n(declare b)\n(defn a [x] (b (leaf x)))\n(defn b [x] (if (pos? x) (a (dec x)) x))\n(defn top [x] (a x))\n")
+      (run top "build" "--full")
+      (check! "changing a leaf dependency changes the closure of the root" (not= top0 (closure-of "c.core/top")) (str top0 " vs " (closure-of "c.core/top")))
+      (check! "… and of the mutual-recursion partner that only reaches leaf through its cycle (SCC hashed as a unit)" (not= b0 (closure-of "c.core/b")) (str b0 " vs " (closure-of "c.core/b")))
+      (check! "an unrelated definition's closure is unchanged" (= none0 (closure-of "b.core/none")) (str none0 " vs " (closure-of "b.core/none"))))
+    (let [{:keys [code out]} (run top "closure" "base")]
+      (check! "closure by bare name works when the name is in one namespace" (and (= 0 code) (re-find #"closure a.core/base" out)) out))
+    (write! top "orgs/o/r/src/d.cljk" "(ns d.core)\n(defn base [] 0)\n")
+    (run top "build" "--full")
+    (let [{:keys [code out]} (run top "closure" "base")]
+      (check! "closure by bare name in two namespaces: REFUSE and list them"
+              (and (= 2 code) (re-find #"REFUSE\tbase is defined in 2 namespaces — say which: " out)) out))))
+
+(defn test-cross-file-refs-and-file-closure []
+  ;; iteration 20: 同 ns の別 file にある定義への bare 参照 (core は除く) と、file 単位の closure hash (memo key)
+  (let [top (mk-tmp "xfile")
+        idx (fn [] (.readFileSync fs (.join path top ".kotoba-cache" "symbol-index.tsv") "utf8"))
+        refs-of (fn [sym] (let [l (re-find (js/RegExp. (str "^" sym "\\t[^\\n]*$") "m") (idx))] (nth (str/split l #"\t") 7 "")))
+        file-hash (fn [f] (second (re-find #"closure-file [^ ]+  #([0-9a-f]{10})" (:out (run top "closure" f)))))]
+    (write! top "orgs/o/r/src/a/core.cljk" "(ns a.core)\n(defn base [x] (+ x 1))\n")
+    (write! top "orgs/o/r/src/a/more.cljk" "(ns a.core)\n(defn other-file-user [y] (base (map inc y)))\n")
+    (write! top "orgs/o/r/src/c.cljk" "(ns c.core)\n(defn leaf [x] x)\n(defn top [x] (leaf x))\n")
+    (run top "build" "--full")
+    (check! "a non-core unqualified symbol is kept as a bare reference; core names (map, inc) are not"
+            (= "base" (refs-of "other-file-user")) (refs-of "other-file-user"))
+    (let [{:keys [code out]} (run top "find" "base" "--dependents")]
+      (check! "--dependents reaches a same-namespace definition in another file"
+              (and (= 0 code) (re-find #"defn other-file-user — orgs/o/r/src/a/more.cljk:2" out)) out))
+    (let [h0 (file-hash "c.cljk")]
+      (check! "closure <file> prints a file closure hash" (re-find #"^[0-9a-f]{10}$" (str h0)) (str h0))
+      (write! top "orgs/o/r/src/c.cljk" "(ns c.core)\n;; comment\n(defn leaf [x] x)\n\n(defn top [x] (leaf x))\n")
+      (run top "build" "--full")
+      (check! "a comment / whitespace edit keeps the file closure hash (memo hit)" (= h0 (file-hash "c.cljk")) (str h0 " vs " (file-hash "c.cljk")))
+      (write! top "orgs/o/r/src/c.cljk" "(ns c.core)\n(defn leaf [x] (inc x))\n(defn top [x] (leaf x))\n")
+      (run top "build" "--full")
+      (check! "a body edit changes the file closure hash (memo miss)" (not= h0 (file-hash "c.cljk")) (str h0 " vs " (file-hash "c.cljk"))))
+    (let [{:keys [code out]} (run top "closure" "nope.cljk")]
+      (check! "closure <file> with no such file: exit 1" (and (= 1 code) (re-find #"0 definitions in a file ending with nope.cljk" out)) out))
+    (write! top "orgs/o/r/src/b/core.cljk" "(ns b.core)\n(defn bb [] 1)\n")
+    (run top "build" "--full")
+    (let [{:keys [code out]} (run top "closure" "core.cljk")]
+      (check! "closure <file> with an ambiguous suffix: REFUSE listing the files"
+              (and (= 2 code) (re-find #"REFUSE\tcore.cljk matches 2 files — say which: " out)) out))
+    (let [{:keys [code out]} (run top "closure" "b/core.cljk")]
+      (check! "closure <file> with a longer suffix picks the one file" (and (= 0 code) (re-find #"closure-file orgs/o/r/src/b/core.cljk" out)) out))))
+
+(defn test-version-skew []
+  ;; iteration 19: 索引が script より新しいときは build を勧めない (古い写しで新しい索引を潰さない)
+  (let [top (mk-tmp "skew")]
+    (write! top "x.cljk" "(defn foo [] 1)\n")
+    (run top "build")
+    (let [f (.join path top ".kotoba-cache" "symbol-index.tsv")
+          t (.readFileSync fs f "utf8")]
+      (.writeFileSync fs f (str/replace-first t #"^#symbol-index\tv\d+" "#symbol-index\tv99"))
+      (let [{:keys [code out]} (run top "find" "foo")]
+        (check! "index newer than the script: REFUSE says use the newer script, never build"
+                (and (= 2 code) (re-find #"REFUSE\tindex is v99 but this script copy is v\d+ \(older\) — use the newer script .*do NOT build with this copy" out)) out))
+      (.writeFileSync fs f (str/replace-first t #"^#symbol-index\tv\d+" "#symbol-index\tv1"))
+      (let [{:keys [code out]} (run top "find" "foo")]
+        (check! "index older than the script: REFUSE says run build"
+                (and (= 2 code) (re-find #"REFUSE\tindex is v1, this script needs v\d+ — run build" out)) out)))))
+
+(defn test-stale-json []
+  (let [top (mk-tmp "json")]
+    (write! top "x.cljk" "(defn foo [] 1)\n")
+    (write! top ".kotoba-cache/symbol-index.tsv" "{\"symbols\":[]}\n")
+    (let [{:keys [code out]} (run top "find" "foo")]
+      (check! "non-TSV index REFUSE exit 2"
+              (and (= 2 code) (re-find #"(?m)^REFUSE\tindex is not a TSV index" out)) out))))
+
+;; ------------------------------------------------------------------ main
+
+(when-not (.existsSync fs script)
+  (println (str "REFUSE\tscript not found at " script))
+  (.exit js/process 2))
+
+(let [top (mk-tmp "tree")
+      git? (git-init! top)]
+  (fixture-tree top)
+  (println (str "fixture\t" top "\tgit=" git?))
+  (test-build-and-find top git?)
+  (test-empty-tree)
+  (test-wrong-top)
+  (test-top-is-worktree)
+  (test-incremental)
+  (test-content-hash)
+  (test-structural-hash)
+  (test-known-roots)
+  (test-refs-dependents-closure)
+  (test-version-skew)
+  (test-cross-file-refs-and-file-closure)
+  (test-no-index-and-root-discovery)
+  (test-stale-json))
+
+(println (str "CHECKS\t" @checks))
+(println (str "FAILED\t" (count @failed)))
+(when (seq @failed)
+  (doseq [f @failed] (println (str "  - " f))))
+(.exit js/process (if (seq @failed) 1 0))

@@ -1,0 +1,324 @@
+(ns build-core
+  ;; The build itself, as a value.
+  ;;
+  ;; shadow-cljs takes a config and DOES things: compile, write an index.html,
+  ;; hash the outputs, serve them. This module decides all of that and does
+  ;; none of it. `plan` turns a config document into an ordered vector of
+  ;; inert steps, and the host performs them -- the same shape re-frame's
+  ;; `{:db .. :fx ..}` has, and for the same reason: a build that is a value
+  ;; can be printed, diffed, tested and refused before anything is written.
+  ;;
+  ;; So this module compiles with an EMPTY requiredCapabilities. It never
+  ;; names the filesystem, never spawns the compiler, never opens a socket.
+  ;;
+  ;;   (plan config)              -> [[:module-lock {..}] [:compile {..}] ..]
+  ;;   (shell-html config)        -> the single-page document
+  ;;   (manifest config outputs)  -> what was built, from digests the host measured
+  ;;
+  ;; The host measures bytes and digests because measuring is mechanism; what
+  ;; the manifest MEANS is decided here.
+  ;;
+  ;; ## Why the shell is one document, one bundle, one mount
+  ;;
+  ;; ADR-2608080100: navigation is a change of state, not of location. The
+  ;; shell therefore has exactly one mount point and imports exactly one
+  ;; module. It does not grow a router.
+  ;;
+  ;; ## The title is admitted, not escaped
+  ;;
+  ;; A generated page that interpolates text needs an HTML escaper, and this
+  ;; workspace already has one (`kotoba-lang/html`, and shitsuke's RAWTEXT
+  ;; breakout predicate behind it). A second copy of an escaping rule is how
+  ;; one copy gets fixed and the other stays broken. So this module does not
+  ;; escape: it ADMITS. A title carrying any of < > & " ' is refused, `plan`
+  ;; emits `[:refuse ..]` instead of a write, and the host stops. When this
+  ;; needs real text it should require the html module, not grow an escaper.
+  (:export [main
+            plan shell-html manifest
+            plan-text shell-html-text manifest-text
+            title-admitted? cfg-str cfg-kw path-join out-path
+            step-id step-args
+            test-plan test-plan-dev test-shell test-manifest test-title-refusal
+            test-path-join]))
+
+;; --- reading a document ---------------------------------------------------
+
+(defn dget [d :document k :keyword] :document
+  (option-value-of [:option :document] (document-get d k) (document-null)))
+
+(defn dat [v :document i :i64] :document
+  (option-value-of [:option :document] (document-vector-at v i) (document-null)))
+
+(defn cfg-str [cfg :document k :keyword] :string
+  (option-value-of [:option :string] (document-string-value (dget cfg k)) ""))
+
+(defn cfg-kw [cfg :document k :keyword d :keyword] :keyword
+  (option-value-of [:option :keyword] (document-keyword-value (dget cfg k)) d))
+
+;; --- paths ----------------------------------------------------------------
+;;
+;; The host resolves paths; this only joins them, because a step that names a
+;; file has to name the same file the shell links to.
+
+(defn path-join [a :string b :string] :string
+  (cond
+    (= 0 (string-byte-length a)) b
+    (= 0 (string-byte-length b)) a
+    :else (string-concat a (string-concat "/" b))))
+
+(defn out-path [cfg :document name :string] :string
+  (path-join (cfg-str cfg :out) name))
+
+(defn build-dir [cfg :document] :string
+  (out-path cfg ".build"))
+
+;; --- the title admission --------------------------------------------------
+
+;; `string-contains?` is typed :bool in the current compiler, and :i64 (1/0)
+;; in the one shitsuke pins -- the `?` is in the name and the type is in
+;; neither, so a port that compares it to 1 compiles there and is refused here
+;; with "equality operands must have the same value type". Measured 2026-09-09
+;; against kotoba-sema on main.
+(defn free-of? [s :string bad :string] :bool
+  (not (string-contains? s bad)))
+
+(defn title-admitted? [t :string] :bool
+  (and (> (string-byte-length t) 0)
+       (< (string-byte-length t) 128)
+       (free-of? t "<")
+       (free-of? t ">")
+       (free-of? t "&")
+       (free-of? t "\"")
+       (free-of? t "'")))
+
+;; --- the shell ------------------------------------------------------------
+;;
+;; Built from pieces because a `.kotoba` string literal tops out at 4096
+;; bytes. Nothing here is dynamic except the admitted title, the mount id and
+;; the two module names.
+
+(defn shell-head [title :string] :string
+  (string-concat
+   "<!doctype html>\n<html lang=\"ja\">\n<head>\n<meta charset=\"utf-8\">\n"
+   (string-concat
+    "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>"
+    (string-concat title "</title>\n</head>\n"))))
+
+;; The driver is amu's `runtime/dom-driver.mjs`, required rather than
+;; rewritten (the browser-stack charter: compose the existing parts). It wants
+;; a FACTORY, because an instance's fuel is spent and never replenished, and
+;; the emitted ESM's `instantiateKotoba` is exactly that.
+(defn shell-body [mount :string bundle :string driver :string] :string
+  (string-concat
+   (string-concat "<body>\n<div id=\"" (string-concat mount "\"></div>\n"))
+   (string-concat
+    (string-concat "<script type=\"module\">\nimport { instantiateKotoba } from \"./"
+                   (string-concat bundle "\";\n"))
+    (string-concat
+     (string-concat "import { mountKotobaApp } from \"./" (string-concat driver "\";\n"))
+     (string-concat
+      (string-concat "mountKotobaApp({ instantiate: instantiateKotoba, container: document.getElementById(\""
+                     (string-concat mount "\") });\n"))
+      "</script>\n</body>\n</html>\n")))))
+
+(defn shell-html [cfg :document] :string
+  (let [title (cfg-str cfg :title)]
+    (if (title-admitted? title)
+      (string-concat (shell-head title)
+                     (shell-body (cfg-str cfg :mount) "app.mjs" "dom-driver.mjs"))
+      "")))
+
+;; --- steps ----------------------------------------------------------------
+
+(defn step [id :keyword args :document] :document
+  (document-vector (document-keyword id) args))
+
+(defn step-id [s :document] :keyword
+  (option-value-of [:option :keyword] (document-keyword-value (dat s 0)) :build/unknown))
+
+(defn step-args [s :document] :document
+  (dat s 1))
+
+(defn lock-path [cfg :document] :string
+  (path-join (build-dir cfg) "app.lock.edn"))
+
+(defn blocks-path [cfg :document] :string
+  (path-join (build-dir cfg) "blocks"))
+
+(defn module-lock-step [cfg :document] :document
+  (step :module-lock
+        (document-map :entry (document-string (cfg-str cfg :entry))
+                      :source-paths (dget cfg :source-paths)
+                      :lock (document-string (lock-path cfg))
+                      :blocks (document-string (blocks-path cfg)))))
+
+(defn compile-step [cfg :document] :document
+  (step :compile
+        (document-map :lock (document-string (lock-path cfg))
+                      :blocks (document-string (blocks-path cfg))
+                      :target (document-string (cfg-str cfg :target))
+                      :output (document-string (out-path cfg "app.mjs")))))
+
+;; Two files, because `dom-driver.mjs` imports `reconcileUiDocument` from
+;; `browser-host.mjs`. That second file is 155 KB of Wasm host for one
+;; function, which the manifest will show as bytes rather than hide: the fix
+;; is upstream (amu splitting the reconciler out), not a second reconciler
+;; here.
+(defn runtime-asset [cfg :document name :string] :document
+  (document-map :asset (document-string name)
+                :output (document-string (out-path cfg name))))
+
+(defn runtime-step [cfg :document] :document
+  (step :runtime
+        (document-map :assets (document-vector (runtime-asset cfg "dom-driver.mjs")
+                                               (runtime-asset cfg "browser-host.mjs")))))
+
+(defn shell-step [cfg :document] :document
+  (step :write
+        (document-map :path (document-string (out-path cfg "index.html"))
+                      :content (document-string (shell-html cfg)))))
+
+(defn refuse-step [why :keyword what :string] :document
+  (step :refuse (document-map :why (document-keyword why)
+                              :what (document-string what))))
+
+;; A release build ends by recording what it produced; a dev build ends by
+;; serving it. That is the whole difference, and it is a real one: nothing
+;; about the emitted module changes between the two, so a dev build is not a
+;; different artifact, it is the same artifact with a server in front of it.
+(defn last-step [cfg :document] :document
+  (if (= :dev (cfg-kw cfg :mode :release))
+    (step :serve (document-map :dir (document-string (cfg-str cfg :out))
+                               :open (document-string "index.html")))
+    (step :manifest (document-map :path (document-string (out-path cfg "build-manifest.edn"))))))
+
+(defn plan [cfg :document] :document
+  (let [title (cfg-str cfg :title)]
+    (if (not (title-admitted? title))
+      (document-vector (refuse-step :title/not-admitted title))
+      (document-vector (module-lock-step cfg)
+                       (compile-step cfg)
+                       (runtime-step cfg)
+                       (shell-step cfg)
+                       (last-step cfg)))))
+
+;; --- the manifest ---------------------------------------------------------
+;;
+;; `outputs` is what the host MEASURED: [{:path .. :bytes .. :sha256 ..} ..].
+;; Measuring is mechanism. Which of those files is the entry, and what the
+;; record means, is decided here.
+
+(defn manifest [cfg :document outputs :document] :document
+  (document-map :app (document-string (cfg-str cfg :app))
+                :target (document-string (cfg-str cfg :target))
+                :mode (document-keyword (cfg-kw cfg :mode :release))
+                :entry (document-string "index.html")
+                :bundle (document-string "app.mjs")
+                :outputs outputs))
+
+;; --- the text boundary ----------------------------------------------------
+
+(defn plan-text [cfg-text :string] :string
+  (document-edn-print (plan (document-edn-read cfg-text))))
+
+(defn shell-html-text [cfg-text :string] :string
+  (shell-html (document-edn-read cfg-text)))
+
+(defn manifest-text [cfg-text :string outputs-text :string] :string
+  (document-edn-print (manifest (document-edn-read cfg-text)
+                                (document-edn-read outputs-text))))
+
+;; --- tests ----------------------------------------------------------------
+
+(defn demo-cfg [] :document
+  (document-map :app (document-string "counter")
+                :entry (document-string "/w/app/counter.kotoba")
+                :source-paths (document-vector (document-string "/w/app")
+                                               (document-string "/w/shitsuke/kotoba"))
+                :target (document-string "js")
+                :out (document-string "/w/dist")
+                :mode (document-keyword :release)
+                :mount (document-string "app")
+                :title (document-string "Counter")))
+
+(defn test-path-join [] :bool
+  (and (string=? "/w/dist/app.mjs" (out-path (demo-cfg) "app.mjs"))
+       ;; an empty side must not produce a leading or doubled separator
+       (string=? "a" (path-join "a" ""))
+       (string=? "b" (path-join "" "b"))
+       (string=? "a/b" (path-join "a" "b"))))
+
+(defn test-plan [] :bool
+  (let [p (plan (demo-cfg))]
+    (and (= 5 (document-count p))
+         (= :module-lock (step-id (dat p 0)))
+         (= :compile (step-id (dat p 1)))
+         (= :runtime (step-id (dat p 2)))
+         ;; the driver the shell imports is one of the files the runtime step
+         ;; copies -- naming them in two places is how a shell ends up
+         ;; importing a file the build never wrote
+         (= 2 (document-count (dget (step-args (dat p 2)) :assets)))
+         (string=? "/w/dist/dom-driver.mjs"
+                   (option-value-of [:option :string]
+                                    (document-string-value
+                                     (dget (dat (dget (step-args (dat p 2)) :assets) 0) :output))
+                                    ""))
+         (= :write (step-id (dat p 3)))
+         (= :manifest (step-id (dat p 4)))
+         ;; the compile writes exactly the file the shell imports
+         (string=? "/w/dist/app.mjs"
+                   (option-value-of [:option :string]
+                                    (document-string-value (dget (step-args (dat p 1)) :output))
+                                    ""))
+         ;; the lock the compile reads is the lock the module-lock wrote
+         (document-equal? (dget (step-args (dat p 0)) :lock)
+                          (dget (step-args (dat p 1)) :lock)))))
+
+(defn test-plan-dev [] :bool
+  (let [p (plan (document-assoc (demo-cfg) :mode (document-keyword :dev)))]
+    (and (= 5 (document-count p))
+         ;; only the last step differs, and the artifact steps are unchanged
+         (= :serve (step-id (dat p 4)))
+         (= :compile (step-id (dat p 1)))
+         (document-equal? (step-args (dat p 1))
+                          (step-args (dat (plan (demo-cfg)) 1))))))
+
+(defn test-shell [] :bool
+  (let [s (shell-html (demo-cfg))]
+    (and (string-contains? s "<div id=\"app\"></div>")
+         (string-contains? s "import { instantiateKotoba } from \"./app.mjs\"")
+         (string-contains? s "import { mountKotobaApp } from \"./dom-driver.mjs\"")
+         (string-contains? s "<title>Counter</title>")
+         ;; one document, one bundle, one mount: exactly one module import of
+         ;; the bundle and exactly one mount id
+         (not (string-contains? s "<div id=\"app\"></div>\n<div")))))
+
+(defn test-title-refusal [] :bool
+  (let [bad (document-assoc (demo-cfg) :title (document-string "a<script>b"))
+        p (plan bad)]
+    (and (not (title-admitted? "a<script>b"))
+         (not (title-admitted? "a\"b"))
+         (not (title-admitted? ""))
+         (title-admitted? "Counter")
+         ;; refused: no write step is produced at all, and the shell is empty
+         (= 1 (document-count p))
+         (= :refuse (step-id (dat p 0)))
+         (= 0 (string-byte-length (shell-html bad))))))
+
+(defn test-manifest [] :bool
+  (let [outputs (document-vector
+                 (document-map :path (document-string "app.mjs")
+                               :bytes (document-i64 1234)
+                               :sha256 (document-string "abc")))
+        m (manifest (demo-cfg) outputs)]
+    (and (string=? "counter" (option-value-of [:option :string] (document-string-value (dget m :app)) ""))
+         (string=? "index.html" (option-value-of [:option :string] (document-string-value (dget m :entry)) ""))
+         (= 1 (document-count (dget m :outputs)))
+         (= 1234 (option-value-of [:option :i64]
+                                  (document-i64-value (dget (dat (dget m :outputs) 0) :bytes))
+                                  0)))))
+
+;; Entry point: the module is a library, so `main` exists only to satisfy the
+;; compiler's entryless-library rule.
+(defn main []
+  (document-count (plan (demo-cfg))))
