@@ -1,0 +1,98 @@
+(ns kotoba.kir-gas-test
+  "Consensus gas (`kotoba.kir.gas`, superproject adr-2610092340 D12): one
+  debit per evaluated KIR application form, weighed by a versioned schedule.
+  Every count below is shown in both directions -- the run answers at exactly
+  the gas it used, and traps :budget/gas one unit short -- so a meter that
+  counted nothing, or counted twice, cannot pass."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.kir :as kir]
+            [kotoba.kir.gas :as gas]))
+
+(defn- trap-of [thunk]
+  (try (thunk) :no-trap
+       (catch #?(:clj Throwable :cljs :default) e
+         (loop [x e]
+           (if-let [t (:trap (ex-data x))]
+             t
+             (if-let [c (ex-cause x)] (recur c) [:untrapped (ex-message e)]))))))
+
+(defn- refusal-of [thunk]
+  (try (thunk) :no-refusal
+       (catch #?(:clj Throwable :cljs :default) e (:reason (ex-data e)))))
+
+(defn- module [& functions]
+  {:format :kotoba.kir/v4 :entry 'main :exports ['main] :functions (vec functions)})
+
+(defn- fn-of [name params body]
+  {:name name :params params :param-types (vec (repeat (count params) :i64)) :result :i64 :body body})
+
+(def v0 gas/schedule-v0-draft)
+
+(defn- run [kir limit & [schedule]]
+  (kir/execute-metered kir 'main [] {:gas limit :gas-schedule (or schedule v0)}))
+
+(defn- answers-at-and-traps-below
+  "The run answers `expected` at `used` gas, reports `used`, and traps
+  :budget/gas at `used` - 1."
+  [kir used expected & [schedule]]
+  (let [{:keys [value gas-used]} (run kir used schedule)]
+    (is (= expected (str value)))
+    (is (= used gas-used))
+    (is (= :budget/gas (trap-of #(run kir (dec used) schedule))))))
+
+;; (+ 1 (* 2 3)): two application forms.
+(def arithmetic (module (fn-of 'main [] '(+ 1 (* 2 3)))))
+
+;; (sq 3) is a call, (* x x) inside it a builtin.
+(def call (module (fn-of 'sq '[x] '(* x x)) (fn-of 'main [] '(sq 3))))
+
+;; Only the taken arm is charged: if, <, + -- the (* 9 9) never runs.
+(def branch (module (fn-of 'main [] '(if (< 1 2) (+ 1 1) (* 9 9)))))
+
+;; A loop is a self-calling helper. Each taken iteration evaluates
+;; if, <, the call, + and + (5); the last evaluates if and < (2); main's
+;; call into the helper is 1. Ten iterations: 1 + 10*5 + 2 = 53.
+(def counted-loop
+  (module (fn-of '__kotoba_loop_1 '[i acc]
+                 '(if (< i 10) (__kotoba_loop_1 (+ i 1) (+ acc i)) acc))
+          (fn-of 'main [] '(__kotoba_loop_1 0 0))))
+
+(deftest one-debit-per-evaluated-application-form
+  (answers-at-and-traps-below arithmetic 2 "7")
+  (answers-at-and-traps-below call 2 "9")
+  (answers-at-and-traps-below branch 3 "2"))
+
+(deftest a-loop-is-charged-per-iteration-unlike-fuel
+  ;; Fuel charges this loop 2 on this interpreter (the helper's re-entries
+  ;; are trampolined free); gas charges every iteration, which is what makes
+  ;; it comparable across backends.
+  (answers-at-and-traps-below counted-loop 53 "45")
+  (is (= "45" (str (kir/execute counted-loop 'main [] {:fuel 2}))))
+  (is (= :budget/fuel (trap-of #(kir/execute counted-loop 'main [] {:fuel 1})))))
+
+(deftest the-schedule-sets-the-weights
+  (let [heavy-multiply (assoc v0 :gas-schedule/id :test/heavy-multiply :weights {'* 5})
+        dear-call (assoc v0 :gas-schedule/id :test/dear-call :call 10)]
+    (answers-at-and-traps-below arithmetic 6 "7" heavy-multiply)
+    (answers-at-and-traps-below call 15 "9" (merge heavy-multiply {:call 10}))
+    (answers-at-and-traps-below call 11 "9" dear-call)))
+
+(deftest gas-runs-beside-fuel-never-instead-of-it
+  (testing "fuel still stops a run that has gas to spare"
+    (is (= :budget/fuel (trap-of #(kir/execute call 'main [] {:fuel 1 :gas 1000 :gas-schedule v0})))))
+  (testing "gas is not metered unless named: the same run answers with no gas option"
+    (is (= "9" (str (kir/execute call 'main []))))))
+
+(deftest a-gas-budget-and-its-schedule-come-together-or-not-at-all
+  (is (= :gas-outside-admitted-range (refusal-of #(kir/execute call 'main [] {:gas-schedule v0}))))
+  (is (= :gas-schedule-not-a-map (refusal-of #(kir/execute call 'main [] {:gas 10}))))
+  (is (= :gas-outside-admitted-range (refusal-of #(kir/execute call 'main [] {:gas 0 :gas-schedule v0}))))
+  (is (= :gas-schedule-default (refusal-of #(run call 10 (assoc v0 :default 0)))))
+  (is (= :gas-schedule-call (refusal-of #(run call 10 (assoc v0 :call 0)))))
+  (is (= :gas-schedule-weights (refusal-of #(run call 10 (assoc v0 :weights {'* -1})))))
+  (is (= :gas-schedule-id (refusal-of #(run call 10 (dissoc v0 :gas-schedule/id)))))
+  (testing "a refused schedule is refused before the run, so nothing is charged"
+    (is (= :gas-schedule-weights (refusal-of #(run call 1 (assoc v0 :weights {"*" 1})))))))
+
+(deftest budget-gas-is-a-named-budget-trap
+  (is (contains? kir/budget-traps :budget/gas)))

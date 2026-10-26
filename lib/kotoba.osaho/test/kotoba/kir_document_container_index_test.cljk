@@ -1,0 +1,132 @@
+(ns kotoba.kir-document-container-index-test
+  "Indexing a document container works on BOTH runtimes.
+
+  An i64 is a Long on the JVM and a BigInt on ClojureScript, and `nth`,
+  `assoc`, `subvec` and `inc` all reject a BigInt outright. Every document
+  container operation that takes an index reached the host container with the
+  i64 it had just range-checked, so on ClojureScript:
+
+    (document-vector-at [10 20 30] 0)   ;; => host TypeError escapes
+    (document-vector-at [10 20 30] 9)   ;; => none
+
+  The IN-RANGE read -- the one every real program does -- was the one that
+  threw, and the out-of-range read returned a clean `none`. So the broken path
+  was the quieter of the two, and a test that only checked that a bad index
+  yields `none` would have stayed green while no document could be read at
+  all. Measured 2026-08-31 on nbb: all six of `document-vector-at`,
+  `document-list-at`, `document-map-entry-at`, `document-vector-assoc`,
+  `document-vector-drop` and `document-vector-remove` failed this way, while
+  the string operations next to them were fine because they go through
+  `value/utf8-*` rather than a host collection.
+
+  Both directions are asserted here: the in-range read returns its item, and
+  the out-of-range one still refuses -- in the language's own vocabulary,
+  never as a host error object."
+  (:require #?(:clj  [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing] :include-macros true])
+            [kotoba.kir :as ir]
+            [kotoba.test-hir :as test-hir]))
+
+(def ^:private items
+  (list 'document-vector
+        (list 'document-i64 10) (list 'document-i64 20) (list 'document-i64 30)))
+
+(def ^:private entries
+  (list 'document-map (list 'document-keyword :a) (list 'document-i64 7)))
+
+(defn- i64-module
+  "A module whose single export evaluates BODY to an i64."
+  [body]
+  (test-hir/module
+   {:format :kotoba.hir/v3
+    :entry 'main
+    :exports ['main]
+    :result :i64
+    :schemas {}
+    :schema-identities {}
+    :functions [{:name 'main :params [] :param-types [] :result :i64 :body body}]}))
+
+(defn- unwrap-i64
+  "OPTION-FORM's i64 payload, or -1 when it carries none."
+  [option-form]
+  (list 'option-value-of [:option :i64] option-form -1))
+
+(defn- item-at
+  "The i64 held by the document at INDEX of ITEMS, or -1 when absent."
+  [op collection index]
+  (unwrap-i64
+   (list 'document-i64-value
+         (list 'option-value-of [:option :document]
+               (list op collection index)
+               (list 'document-null)))))
+
+(defn- trap-data
+  "The trap E carries, looked for down the whole cause chain -- reading
+   `(ex-data e)` one link deep is not enough on ClojureScript, for the reason
+   `kir_host_stack_trap_test` records."
+  [e]
+  (loop [x e]
+    (when x
+      (let [data (ex-data x)]
+        (if (:trap data)
+          data
+          (recur #?(:clj (.getCause ^Throwable x) :cljs (.-cause x))))))))
+
+(defn- outcome
+  "The oracle value BODY folds to, or the trap that aborted `lower`, or -- if
+   no trap is anywhere in the chain -- the host error that escaped."
+  [body]
+  (try (str (:oracle-value (ir/lower (i64-module body))))
+       (catch #?(:clj Throwable :cljs :default) e
+         (or (trap-data e) {:host-error-escaped (str (ex-message e))}))))
+
+;; `str` rather than `=`: the oracle hands back a host i64, which is a Long on
+;; the JVM and a BigInt on ClojureScript, and `(= 10 #object[BigInt 10])` is
+;; false. The same reason `kir_host_stack_trap_test` gives.
+
+(deftest an-in-range-index-reads-its-item
+  (testing "document-vector-at"
+    (is (= "10" (outcome (item-at 'document-vector-at items 0))))
+    (is (= "30" (outcome (item-at 'document-vector-at items 2)))))
+  (testing "document-list-at"
+    (is (= "7" (outcome (item-at 'document-list-at
+                                 (list 'document-list (list 'document-i64 7))
+                                 0)))))
+  (testing "document-map-entry-at returns the key/value pair"
+    (is (= "2" (outcome (list 'document-count
+                              (list 'option-value-of [:option :document]
+                                    (list 'document-map-entry-at entries 0)
+                                    (list 'document-null))))))))
+
+(deftest an-index-taking-rewrite-produces-the-rewritten-vector
+  (testing "assoc keeps the length"
+    (is (= "3" (outcome (list 'document-count
+                              (list 'document-vector-assoc items 0
+                                    (list 'document-i64 99)))))))
+  (testing "assoc replaces the item it names"
+    (is (= "99" (outcome (item-at 'document-vector-at
+                                  (list 'document-vector-assoc items 0
+                                        (list 'document-i64 99))
+                                  0)))))
+  (testing "drop removes a prefix"
+    (is (= "2" (outcome (list 'document-count (list 'document-vector-drop items 1)))))
+    (is (= "20" (outcome (item-at 'document-vector-at
+                                  (list 'document-vector-drop items 1) 0)))))
+  (testing "remove closes the gap it leaves"
+    (is (= "2" (outcome (list 'document-count (list 'document-vector-remove items 1)))))
+    (is (= "30" (outcome (item-at 'document-vector-at
+                                  (list 'document-vector-remove items 1) 1))))))
+
+(deftest an-out-of-range-index-still-refuses
+  (testing "reads answer none, and answering none is not the same as throwing"
+    (is (= "-1" (outcome (item-at 'document-vector-at items 9))))
+    (is (= "-1" (outcome (item-at 'document-vector-at items -1)))))
+  (testing "rewrites trap, and trap in the language's own vocabulary"
+    (let [refused (outcome (list 'document-count
+                                 (list 'document-vector-assoc items 9
+                                       (list 'document-i64 99))))]
+      (is (nil? (:host-error-escaped refused))
+          (str "a host error escaped the language boundary: "
+               (pr-str (:host-error-escaped refused))))
+      (is (= :document-vector-index-out-of-range (:trap refused))
+          "the trap must name the guard that actually fired"))))

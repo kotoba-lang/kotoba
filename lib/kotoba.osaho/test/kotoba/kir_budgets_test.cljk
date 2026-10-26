@@ -1,0 +1,118 @@
+(ns kotoba.kir-budgets-test
+  "P4 of superproject adr-2609242100: the reference profile's four resource
+  budgets -- fuel, cells, bytes, frames -- each set per run, each exceeded as
+  its own named trap, each shown in both directions (under budget the run
+  answers; one unit short it traps BY NAME). And section 4: an oracle run that
+  stops on a resource is `:oracle-inconclusive`, not a refusal."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.kir :as kir]
+            [kotoba.test-hir :as test-hir]))
+
+(def lst [:variant :app/list [[:empty :i64] [:cons [:ref :app/cell]]]])
+(def cell [:record :app/cell [[:head :i64] [:tail [:ref :app/list]]]])
+(def schemas {:app/list lst :app/cell cell})
+
+(defn- trap-of [thunk]
+  (try (thunk) :no-trap
+       (catch #?(:clj Throwable :cljs :default) e
+         (loop [x e]
+           (if-let [t (:trap (ex-data x))]
+             t
+             (if-let [c (ex-cause x)] (recur c) [:untrapped (ex-message e)]))))))
+
+(defn- message-of [thunk]
+  (try (thunk) nil (catch #?(:clj Throwable :cljs :default) e (ex-message e))))
+
+;; 5 cells built by `kons`: one variant + one record each, plus the :empty
+;; variant = 11 cells.
+(def build-five
+  {:format :kotoba.kir/v4 :entry 'main :exports ['main] :schemas schemas
+   :functions
+   [{:name 'kons :params ['h 't] :param-types [:i64 [:ref :app/list]] :result [:ref :app/list]
+     :body (list 'variant-new lst :cons (list 'record-new cell 'h 't))}
+    {:name '__kotoba_loop_1 :params ['n 'acc] :param-types [:i64 [:ref :app/list]]
+     :result [:ref :app/list]
+     :body (list 'if (list '= 'n 0) 'acc
+                 (list '__kotoba_loop_1 (list '- 'n 1) (list 'kons 'n 'acc)))}
+    {:name 'main :params [] :param-types [] :result :i64
+     :body (list 'variant-match lst (list '__kotoba_loop_1 5 (list 'variant-new lst :empty 0))
+                 [[:empty '_ 0] [:cons '_ 1]])}]})
+
+(def concat-six
+  {:format :kotoba.kir/v4 :entry 'main :exports ['main]
+   :functions [{:name 'main :params [] :param-types [] :result :i64
+                :body (list 'string-byte-length (list 'string-concat "abc" "def"))}]})
+
+(def deep
+  {:format :kotoba.kir/v4 :entry 'main :exports ['main]
+   :functions [{:name 'main :params [] :param-types [] :result :i64
+                :body (list 'deep 4)}
+               {:name 'deep :params ['n] :param-types [:i64] :result :i64
+                :body (list 'if (list '<= 'n 0) 0
+                            (list '+ 1 (list 'deep (list '- 'n 1))))}]})
+
+(deftest cells-is-a-per-run-budget-with-a-named-trap
+  (is (= "1" (str (kir/execute build-five 'main [] {:cells 11}))))
+  (is (= :budget/cells (trap-of #(kir/execute build-five 'main [] {:cells 10}))))
+  (is (= "budget/cells" (message-of #(kir/execute build-five 'main [] {:cells 10})))
+      "the message is the trap's full name, not its bare `cells`")
+  (testing "unmetered by default: no budget named, no cells trap"
+    (is (= "1" (str (kir/execute build-five 'main []))))))
+
+(deftest a-constructor-debits-fuel-whether-or-not-cells-are-metered
+  ;; amu ADR 0353 point 7: 7 function entries (main, the loop's first entry,
+  ;; five kons) + 11 constructed cells = 18 units of fuel, with no cells
+  ;; budget named. Before this floor the run answered at 7.
+  (is (= "1" (str (kir/execute build-five 'main [] {:fuel 18}))))
+  (is (= :budget/fuel (trap-of #(kir/execute build-five 'main [] {:fuel 17}))))
+  (is (= :budget/fuel (trap-of #(kir/execute build-five 'main [] {:fuel 7})))
+      "the entries alone no longer pay for the list")
+  (testing "the cells ledger still counts its own unit beside it"
+    (is (= "1" (str (kir/execute build-five 'main [] {:fuel 18 :cells 11}))))
+    (is (= :budget/cells (trap-of #(kir/execute build-five 'main [] {:fuel 18 :cells 10}))))))
+
+(deftest bytes-is-a-per-run-budget-with-a-named-trap
+  (is (= "6" (str (kir/execute concat-six 'main [] {:bytes 6}))))
+  (is (= :budget/bytes (trap-of #(kir/execute concat-six 'main [] {:bytes 5}))))
+  (is (= "6" (str (kir/execute concat-six 'main [])))))
+
+(deftest fuel-and-frames-are-named-budget-traps
+  ;; main + 5 entries of deep (4..0) = 6 function entries, depth 6.
+  (is (= "4" (str (kir/execute deep 'main [] {:fuel 6}))))
+  (is (= :budget/fuel (trap-of #(kir/execute deep 'main [] {:fuel 5}))))
+  (is (= "budget/fuel" (message-of #(kir/execute deep 'main [] {:fuel 5}))))
+  (is (= "4" (str (kir/execute deep 'main [] {:frames 6}))))
+  (is (= :budget/frames (trap-of #(kir/execute deep 'main [] {:frames 5})))))
+
+(deftest a-budget-outside-its-range-is-refused-before-running
+  (is (thrown? #?(:clj Exception :cljs :default) (kir/execute deep 'main [] {:cells 0})))
+  (is (thrown? #?(:clj Exception :cljs :default) (kir/execute deep 'main [] {:bytes -1}))))
+
+(defn- counting-entry [n]
+  (test-hir/module
+   {:format :kotoba.hir/v3 :entry 'main :exports ['main] :result :i64
+    :schemas {} :schema-identities {}
+    :functions
+    [{:name 'main :params [] :param-types [] :result :i64
+      :body (list '__kotoba_loop_1 n 0)}
+     {:name '__kotoba_loop_1 :params ['n 'acc] :param-types [:i64 :i64] :result :i64
+      :body (list 'if (list '<= 'n 0) 'acc
+                  (list '__kotoba_loop_1 (list '- 'n 1) (list 'tick 'acc)))}
+     {:name 'tick :params ['x] :param-types [:i64] :result :i64
+      :body (list '+ 'x 1)}]}))
+
+(deftest an-oracle-stopped-by-a-resource-is-inconclusive-not-refused
+  (let [answered (kir/lower (counting-entry 10) {:oracle-fuel 100})
+        stopped (kir/lower (counting-entry 10) {:oracle-fuel 5})]
+    (is (= "10" (str (:oracle-value answered))))
+    (is (nil? (:oracle-inconclusive answered)))
+    (is (nil? (:oracle-value stopped)) "no value is sealed for an inconclusive oracle")
+    (is (= :budget/fuel (:oracle-inconclusive stopped)))
+    (is (= [] (:blocks stopped)) "and nothing is constant-folded from it"))
+  (testing "a trap that is not a resource still aborts lower"
+    (is (= :division-by-zero
+           (trap-of #(kir/lower (test-hir/module
+                                 {:format :kotoba.hir/v3 :entry 'main :exports ['main] :result :i64
+                                  :schemas {} :schema-identities {}
+                                  :functions [{:name 'main :params [] :param-types [] :result :i64
+                                               :body (list 'quot 1 0)}]})))))))

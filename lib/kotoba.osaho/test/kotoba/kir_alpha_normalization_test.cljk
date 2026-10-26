@@ -1,0 +1,192 @@
+(ns kotoba.kir-alpha-normalization-test
+  "kotoba-kir owns alpha-normalization (kotoba-lang lang/code-identity.edn,
+  :implementation :ci8 residual risk, 2026-09-02).
+
+  What these assert is the pair of facts that made the move necessary: the
+  canonical encoder alone does NOT make identity alpha-rename-independent, and
+  this walk is what does. Both directions are stated -- a suite that only shows
+  the renaming working would pass just as well against a walk that renamed
+  nothing, because nothing would then leak either."
+  (:require #?(:clj  [kotoba.test :refer [deftest is testing]]
+            :cljs [cljs.test :refer [deftest is testing] :include-macros true])
+            [kotoba.kir.alpha-normalization :as an]
+            [kotoba.kir.definition-identity :as di]))
+
+(defn- payload [kir]
+  {:definition/profile-version 6
+   :definition/desugar-contract-version 1
+   :definition/kir kir
+   :definition/effect-row #{}
+   :definition/interface {:arity 1 :result :i64}
+   :definition/dependencies []})
+
+(defn- cid-of [function]
+  (let [{:keys [params body]} (an/normalize-function function #{'callee})]
+    (di/definition-cid (payload {:op :kotoba.definition/function
+                                 :params params
+                                 :body body}))))
+
+;; ---------------------------------------------------------------------------
+;; The fact the move exists to fix
+
+(deftest the-canonical-encoder-alone-leaks-binder-names
+  (testing "di/normalize maps a symbol to [\"sym\" <name>] verbatim, so two
+  payloads differing only in a binder name are two identities. This is the
+  measurement kotoba-lang lang/code-identity.edn records for 2026-09-02, and it
+  is why alpha-normalization is a separate step rather than something
+  definition-cid could be assumed to do."
+    (is (not= (di/definition-cid (payload {:op :fn :params '[a] :body '(+ a 1)}))
+              (di/definition-cid (payload {:op :fn :params '[b] :body '(+ b 1)})))))
+  (testing "and the walk is what closes it"
+    (is (= (cid-of {:params '[a] :body '(+ a 1)})
+           (cid-of {:params '[b] :body '(+ b 1)})))))
+
+(deftest definition-cid-does-not-normalize-internally
+  (testing "stated rather than assumed: a caller that forgets to normalize gets
+  a CID over the names it wrote. definition-cid hashes a payload whose :kir may
+  be a const or a do-block, verification needs the caller's call targets, and
+  renaming has to precede dependency linking -- so the step is explicit."
+    (let [named (payload {:op :fn :params '[a] :body '(+ a 1)})]
+      (is (not= (di/definition-cid named)
+                (cid-of {:params '[a] :body '(+ a 1)}))))))
+
+;; ---------------------------------------------------------------------------
+;; The five binding forms
+
+(deftest params-are-renamed-by-position
+  (is (= {:params '[k0 k1] :body '(+ k0 k1) :bound '#{x y}}
+         (an/alpha-normalize {:params '[x y] :body '(+ x y)}))))
+
+(deftest let-binds-after-its-value-is-normalized
+  (testing "(let [x x] x): the value's x is the OUTER x, the body's is the new
+  binder. Normalizing the value first is what keeps them apart."
+    (is (= '(let [k1 k0] k1)
+           (:body (an/alpha-normalize {:params '[x] :body '(let [x x] x)}))))))
+
+(deftest result-match-of-binds-both-arms
+  (is (= '(result-match-of :i64 k0 k1 (+ k1 1) k2 (- k2 1))
+         (:body (an/alpha-normalize
+                 {:params '[r] :body '(result-match-of :i64 r ok (+ ok 1) err (- err 1))})))))
+
+(deftest variant-match-binds-each-branch
+  (is (= '(variant-match :v k0 [[:a k1 (+ k1 1)] [:b k2 (- k2 1)]])
+         (:body (an/alpha-normalize
+                 {:params '[v] :body '(variant-match :v v [[:a p (+ p 1)] [:b q (- q 1)]])})))))
+
+(deftest option-match-binds-only-the-some-arm
+  (is (= '(option-match :i64 k0 0 k1 (+ k1 1))
+         (:body (an/alpha-normalize
+                 {:params '[o] :body '(option-match :i64 o 0 s (+ s 1))})))))
+
+(deftest binding-forms-names-the-four-operators
+  (testing "params is the fifth site and is not an operator"
+    (is (= '#{let result-match-of variant-match option-match} an/binding-forms))
+    (is (every? an/handles? an/binding-forms))
+    (is (not (an/handles? 'loop)))))
+
+;; ---------------------------------------------------------------------------
+;; One counter, never reset
+
+(deftest the-counter-never-resets-across-binding-forms
+  (testing "two sibling binders in different forms must not both become k0. A
+  counter that restarted per form would make two different functions share an
+  identity, so this is the assertion that a cheaper implementation fails."
+    (let [{:keys [body]} (an/alpha-normalize
+                          {:params '[]
+                           :body '(pair (let [a 1] a) (option-match :i64 z 0 b (+ b 1)))})]
+      (is (= '(pair (let [k0 1] k0) (option-match :i64 z 0 k1 (+ k1 1))) body))
+      (is (= '#{k0 k1} (into #{} (filter #{'k0 'k1}) (an/symbols-in body)))
+          "k0 and k1 each appear; neither name is reused for a different binder")))
+  (testing "and the two functions the reset would conflate stay apart: under a
+  per-form reset both would read (pair (let [k0 1] k0) (let [k0 2] ...)) and the
+  bodies would differ only where the counter distinguishes them"
+    (is (not= (cid-of {:params '[] :body '(pair (let [a 1] a) (let [b 2] (+ b b)))})
+              (cid-of {:params '[] :body '(pair (let [a 1] (let [b 2] b)) 0)})))))
+
+(deftest nesting-depth-does-not-change-a-canonical-name
+  (testing "scope is restored on the way out but the counter is not, so a name
+  is a function of position alone"
+    (is (= '(let [k0 1] (let [k2 (let [k1 2] k1)] k2))
+           (:body (an/alpha-normalize
+                   {:params '[] :body '(let [a 1] (let [b (let [c 2] c)] b))}))))))
+
+;; ---------------------------------------------------------------------------
+;; Refusal
+
+(deftest a-name-that-escapes-the-scope-the-walk-modelled-is-refused-not-hashed
+  (testing "the check is `a name this walk renamed is still present verbatim`.
+  It fires when a binder's extent is wrong -- the shape a sixth binding form
+  produces when it takes a name the walk already bound and lets a reference to
+  it escape. Refusing is the point: an identity that seals a source-chosen name
+  is one two spellings of the same definition disagree about."
+    (let [ex (try (an/normalize-function
+                   {:params '[] :body '(pair (let [a 1] a) a)}
+                   #{})
+                  nil
+                  (catch #?(:clj Exception :cljs :default) e e))]
+      (is (some? ex) "refused")
+      (is (= :kotoba.kir.alpha-normalization/binder-not-normalized
+             (:problem (ex-data ex))))
+      (is (= ["a"] (:symbols (ex-data ex)))))))
+
+(deftest the-refusal-does-not-catch-a-self-contained-unhandled-form
+  (testing "MEASURED LIMIT, stated rather than overclaimed. Both copies this
+  namespace replaces documented `verify-normalized!` as catching any sixth
+  binding form. It does not. A form whose binder is a name the walk never bound
+  -- (loop [i 0] (+ i 1)) with no outer i -- leaks nothing by this test's
+  definition, so the source name `i` is sealed into the identity and two
+  spellings of that function get two CIDs.
+
+  Distinguishing it soundly needs an operator table: `i` is a symbol in
+  non-head position, and so is a legitimate free reference to a callee, and the
+  head `+` is a symbol too. kotoba-kir does not own that table and inventing
+  one here would be a second admission gate. So the guard against a sixth
+  binding form is `binding-forms` being public and this test naming the hole,
+  not a check that closes it."
+    (is (= '(loop [i 0] (+ i 1))
+           (:body (an/normalize-function {:params '[] :body '(loop [i 0] (+ i 1))} #{}))))
+    (is (not= (an/normalize-function {:params '[] :body '(loop [i 0] (+ i 1))} #{})
+              (an/normalize-function {:params '[] :body '(loop [j 0] (+ j 1))} #{}))
+        "two spellings of one function, two normal forms -- the hole, measured")))
+
+(deftest a-leaked-binder-is-detected-only-because-bound-is-reported
+  (testing "the check is `a name this walk bound is still in the body`, which
+  needs :bound. A walk that reported no bound names would refuse nothing."
+    (is (= '#{x} (:bound (an/alpha-normalize {:params '[x] :body 'x}))))))
+
+(deftest a-call-target-is-a-free-name-not-a-leak
+  (is (= '(callee k0)
+         (:body (an/normalize-function {:params '[x] :body '(callee x)} #{'callee})))))
+
+(deftest the-caller-owns-the-refusal-keyword
+  (testing "each consumer keeps its own diagnostic vocabulary; renaming theirs
+  would change what a consumer of their errors matches on"
+    (let [ex (try (an/normalize-function
+                   {:params '[] :body '(pair (let [a 1] a) a)}
+                   #{}
+                   {:problem :typed-code/binder-not-normalized})
+                  nil
+                  (catch #?(:clj Exception :cljs :default) e e))]
+      (is (= :typed-code/binder-not-normalized (:problem (ex-data ex)))))))
+
+;; ---------------------------------------------------------------------------
+;; The two reconciled differences
+
+(deftest a-set-is-walked-so-a-binder-inside-one-is-renamed
+  (testing "the compiler's copy had this branch and the codebase's did not.
+  Keeping it widens a refusal into a CID; it moves no CID that exists, because
+  the case it changes is exactly the case that produced none."
+    (is (= '#{k0} (:body (an/alpha-normalize {:params '[x] :body '#{x}}))))))
+
+(deftest the-leaf-is-the-callers-and-defaults-to-identity
+  (testing "value canonicalization is not binder renaming. The compiler passes
+  one because nbb holds an integer literal as a BigInt; the codebase passes
+  none because its own encoder admits host floats."
+    (is (= '(+ k0 1) (:body (an/alpha-normalize {:params '[x] :body '(+ x 1)}))))
+    (is (= '(+ k0 "1")
+           (:body (an/alpha-normalize {:params '[x] :body '(+ x 1)}
+                                      {:scalar #(if (integer? %) (str %) %)}))))))
+
+(deftest a-ref-type-vector-is-a-schema-name-and-is-not-renamed
+  (is (= '(cast [:ref x] k0)
+         (:body (an/alpha-normalize {:params '[x] :body '(cast [:ref x] x)})))))

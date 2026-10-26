@@ -1,0 +1,321 @@
+(ns kotoba.kir-kernel-dot-f32-test
+  "The oracle for `kernel-dot-f32`, and in particular for its ACCUMULATION
+  TREE.
+
+  The tree is the whole contract of this operation. Floating-point addition is
+  not associative, so `a . b` is not one number -- it is one number per order
+  of summation, and an emitter whose AVX2 arm and scalar arm sum in different
+  orders produces two different answers on two machines from the same source.
+  This namespace pins the order:
+
+    four lane accumulators, all +0.0
+    while eight or more elements remain:
+        lane k += a[i+k] * b[i+k]        for k = 0..3   (lower half)
+        lane k += a[i+4+k] * b[i+4+k]    for k = 0..3   (upper half)
+        i += 8
+    sum = (lane0 + lane1) + (lane2 + lane3)
+    for each remaining element: sum += a[i] * b[i]
+
+  Two of the tests below are written so that a DIFFERENT tree gives a
+  DIFFERENT answer, and assert both halves of that: the answer the contract
+  produces, and the two answers it must not produce -- a straight left-to-right
+  sum, and the four-at-a-time loop the reference `dot_scalar` uses. Without
+  those controls this suite would pass for any implementation that adds the
+  right products, which is the thing it exists not to do.
+
+  The expected values are computed here by an UNROLLED tree written out
+  element by element, not by a loop. A loop in the test would repeat whatever
+  off-by-one the loop under test has."
+  (:require #?(:clj  [kotoba.test :refer [deftest is testing]]
+            :cljs [cljs.test :refer [deftest is testing] :include-macros true])
+            [kotoba.kir :as kir]
+            [kotoba.kir.value :as value]
+            [kotoba.test-hir :as test-hir]))
+
+;; ---------------------------------------------------------------------------
+;; host arithmetic, at binary32
+;; ---------------------------------------------------------------------------
+
+(defn- f32 [x] #?(:clj (float x) :cljs (js/Math.fround x)))
+(defn- fadd [x y] #?(:clj (float (+ (float x) (float y))) :cljs (js/Math.fround (+ x y))))
+(defn- fmul [x y] #?(:clj (float (* (float x) (float y))) :cljs (js/Math.fround (* x y))))
+
+(defn- bits
+  "The canonical f32 word of a binary32 value: its pattern sign-extended from
+  bit 31, which is what the operation answers with."
+  [x]
+  #?(:clj (long (value/f32-to-i64-bits (f32 x)))
+     :cljs (js/Number (value/f32-to-i64-bits (f32 x)))))
+
+(defn- f32-le-bytes
+  "The four little-endian bytes of a binary32 value, as an image writes them."
+  [x]
+  (let [b (bits x)]
+    (mapv #(bit-and (bit-shift-right b (* 8 %)) 255) (range 4))))
+
+(defn- w [x] #?(:clj x :cljs (js/Number x)))
+
+;; ---------------------------------------------------------------------------
+;; the module under test
+;; ---------------------------------------------------------------------------
+
+(def ^:private dot
+  {:format :kotoba.kir/v4
+   :entry 'main
+   :effects #{}
+   :functions [{:name 'main
+                :params '[a-base a-length b-base b-length count]
+                :param-types [:i64 :i64 :i64 :i64 :i64]
+                :result :i64 :effects #{}
+                :body '(kernel-dot-f32 a-base a-length b-base b-length count)}]})
+
+(def ^:private image-base 4096)
+
+(defn- two-regions
+  "One image holding A at `image-base` and B immediately after it."
+  [av bv]
+  {:base image-base
+   :bytes (volatile! (vec (concat (mapcat f32-le-bytes av)
+                                  (mapcat f32-le-bytes bv))))})
+
+(defn- run
+  "Run the dot product over A and B, declaring each region's exact byte length
+  unless `opts` overrides an argument."
+  ([av bv] (run av bv (count av) {}))
+  ([av bv n] (run av bv n {}))
+  ([av bv n opts]
+   (let [a-bytes (* 4 (count av))]
+     (w (kir/execute dot 'main
+                     [image-base a-bytes (+ image-base a-bytes) (* 4 (count bv)) n]
+                     (merge {:memory (two-regions av bv)} opts))))))
+
+(defn- trapped [thunk]
+  (try (thunk) nil
+       (catch :default e (ex-data e))))
+
+;; ---------------------------------------------------------------------------
+;; plumbing: values whose sum is exact, so any tree agrees
+;; ---------------------------------------------------------------------------
+
+(deftest exactly-representable-sums-are-exact
+  (testing "ten elements -- one full block of eight and a two-element tail"
+    (is (= (bits 55.0) (run (mapv double (range 1 11)) (vec (repeat 10 1.0))))))
+  (testing "the products are products, not sums"
+    (is (= (bits 30.0) (run [1.0 2.0 3.0 4.0] [1.0 2.0 3.0 4.0]))))
+  (testing "negative values come back sign-extended, as the f32 word is"
+    (let [answer (run [-1.0 -1.0] [1.0 1.0])]
+      (is (= (bits -2.0) answer))
+      (is (neg? answer)
+          "a zero-extended pattern would be positive and `f32-from-bits` would refuse it")))
+  (testing "and the answer is a word `f32-from-bits` accepts"
+    (is (= (f32 -2.0) (value/i64-bits-to-f32
+                       #?(:clj (run [-1.0 -1.0] [1.0 1.0])
+                          :cljs (js/BigInt (run [-1.0 -1.0] [1.0 1.0]))))))))
+
+(deftest a-count-of-zero-is-positive-zero
+  (is (= (bits 0.0) (run [1.0 2.0] [3.0 4.0] 0)))
+  (is (zero? (run [1.0 2.0] [3.0 4.0] 0))))
+
+(deftest counts-below-eight-run-only-the-tail
+  ;; No block executes, so every accumulator stays +0.0 and the answer is the
+  ;; tail's own left-to-right sum onto (0+0)+(0+0).
+  (doseq [n [1 2 3 7]]
+    (testing (str "count " n)
+      (let [av (vec (repeat n 2.0))
+            bv (vec (repeat n 3.0))]
+        (is (= (bits (* 6.0 n)) (run av bv n)))))))
+
+(deftest a-count-below-the-region-reads-only-that-many-elements
+  ;; The regions are longer than the count. Elements past it must not be read.
+  (is (= (bits 3.0) (run [1.0 2.0 1000000.0] [1.0 1.0 1000000.0] 2))))
+
+;; ---------------------------------------------------------------------------
+;; the tree, where a different tree gives a different answer
+;; ---------------------------------------------------------------------------
+
+;; 2^24 is the largest integer after which f32 spacing becomes 2, so adding 1
+;; to it rounds away. Every ordering question about the tree becomes visible.
+(def ^:private big (f32 16777216.0))
+
+;; Lanes 2^24, 1, 1, 1 -- chosen so that all three candidate trees disagree.
+;; `(s0+s1)+(s2+s3)` is 2^24 + 2; `((s0+s1)+s2)+s3` and a straight
+;; left-to-right sum both lose every 1 into the gap and answer 2^24.
+(def ^:private tree-a-8 [big 1.0 1.0 1.0 0.0 0.0 0.0 0.0])
+(def ^:private tree-b-8 (vec (repeat 8 1.0)))
+
+(deftest one-full-block-uses-four-lanes-lower-then-upper
+  (let [p (fn [i] (fmul (nth tree-a-8 i) (nth tree-b-8 i)))
+        ;; Unrolled, exactly as the contract reads.
+        s0 (fadd (fadd (f32 0.0) (p 0)) (p 4))
+        s1 (fadd (fadd (f32 0.0) (p 1)) (p 5))
+        s2 (fadd (fadd (f32 0.0) (p 2)) (p 6))
+        s3 (fadd (fadd (f32 0.0) (p 3)) (p 7))
+        contract (fadd (fadd s0 s1) (fadd s2 s3))
+        ;; The two trees this must NOT be.
+        sequential (reduce (fn [acc i] (fadd acc (p i))) (f32 0.0) (range 8))
+        left-to-right (fadd (fadd (fadd s0 s1) s2) s3)]
+    (is (= (bits contract) (run tree-a-8 tree-b-8))
+        "the answer is the contract's tree")
+    (is (not= (bits sequential) (bits contract))
+        "the control is meaningful: a straight left-to-right sum differs here")
+    (is (not= (bits sequential) (run tree-a-8 tree-b-8))
+        "and a straight left-to-right sum is not what was computed")
+    (is (not= (bits left-to-right) (bits contract))
+        "the control is meaningful: reducing the lanes left to right differs")
+    (is (not= (bits left-to-right) (run tree-a-8 tree-b-8))
+        "and the lanes were not reduced left to right")))
+
+(def ^:private tree-a-12 (into [big] (repeat 11 1.0)))
+(def ^:private tree-b-12 (vec (repeat 12 1.0)))
+
+(deftest the-block-is-eight-elements-and-the-remainder-is-a-scalar-tail
+  ;; Twelve elements: one block of eight, then four elements added one at a
+  ;; time onto the already-reduced sum. The reference `dot_scalar` folds four
+  ;; at a time instead, which would put all twelve into lanes and leave no
+  ;; tail -- a different answer, asserted here so "eight" is pinned rather
+  ;; than assumed.
+  (let [p (fn [i] (fmul (nth tree-a-12 i) (nth tree-b-12 i)))
+        s0 (fadd (fadd (f32 0.0) (p 0)) (p 4))
+        s1 (fadd (fadd (f32 0.0) (p 1)) (p 5))
+        s2 (fadd (fadd (f32 0.0) (p 2)) (p 6))
+        s3 (fadd (fadd (f32 0.0) (p 3)) (p 7))
+        reduced (fadd (fadd s0 s1) (fadd s2 s3))
+        contract (fadd (fadd (fadd (fadd reduced (p 8)) (p 9)) (p 10)) (p 11))
+        ;; Four at a time: three blocks, no tail.
+        q0 (fadd (fadd (fadd (f32 0.0) (p 0)) (p 4)) (p 8))
+        q1 (fadd (fadd (fadd (f32 0.0) (p 1)) (p 5)) (p 9))
+        q2 (fadd (fadd (fadd (f32 0.0) (p 2)) (p 6)) (p 10))
+        q3 (fadd (fadd (fadd (f32 0.0) (p 3)) (p 7)) (p 11))
+        four-wide (fadd (fadd q0 q1) (fadd q2 q3))]
+    (is (= (bits contract) (run tree-a-12 tree-b-12))
+        "one block of eight, then a four-element scalar tail")
+    (is (not= (bits four-wide) (bits contract))
+        "the control is meaningful: a four-at-a-time loop differs here")
+    (is (not= (bits four-wide) (run tree-a-12 tree-b-12))
+        "and a four-at-a-time loop is not what was computed")))
+
+;; Two blocks, so each lane takes FOUR addends and the order within a lane
+;; becomes observable. It is not observable with one block: a lane then has
+;; exactly two addends, and `(0+x)+y` and `(0+y)+x` are the same number
+;; because IEEE addition is commutative. Lower-before-upper therefore needs
+;; sixteen elements to pin at all, and this is the test that pins it.
+;;
+;; Lane 0 receives 2^24, 1, 1, -2^24 in the contract's order and
+;; 1, 2^24, -2^24, 1 if the halves are taken the other way round. The first
+;; loses both 1s into the gap above 2^24 and cancels to +0.0; the second
+;; cancels FIRST and keeps the last 1. Every other lane is zero throughout,
+;; so the two orders answer 0.0 and 1.0.
+(def ^:private lane-order-a
+  [big 0.0 0.0 0.0
+   1.0 0.0 0.0 0.0
+   1.0 0.0 0.0 0.0
+   (f32 -16777216.0) 0.0 0.0 0.0])
+(def ^:private lane-order-b (vec (repeat 16 1.0)))
+
+(deftest the-lower-half-is-added-before-the-upper-half
+  (let [p (fn [i] (fmul (nth lane-order-a i) (nth lane-order-b i)))
+        lane (fn [k order]
+               (reduce (fn [acc i] (fadd acc (p (+ k i)))) (f32 0.0) order))
+        ;; The contract: block 0 lower, block 0 upper, block 1 lower, block 1
+        ;; upper -- element offsets 0, 4, 8, 12 within the lane.
+        contract (let [s (fn [k] (lane k [0 4 8 12]))]
+                   (fadd (fadd (s 0) (s 1)) (fadd (s 2) (s 3))))
+        ;; Upper before lower: offsets 4, 0, 12, 8.
+        swapped (let [s (fn [k] (lane k [4 0 12 8]))]
+                  (fadd (fadd (s 0) (s 1)) (fadd (s 2) (s 3))))]
+    (is (= (bits 0.0) (bits contract))
+        "the contract's order cancels to zero on these values")
+    (is (= (bits 1.0) (bits swapped))
+        "the control is meaningful: the other order answers one")
+    (is (= (bits contract) (run lane-order-a lane-order-b))
+        "the lower half of each block is added before the upper half")))
+
+;; ---------------------------------------------------------------------------
+;; the checks, in the emitter's order, with their reasons pinned
+;; ---------------------------------------------------------------------------
+
+(defn- fault [args]
+  (trapped #(kir/execute dot 'main args
+                         {:memory (two-regions [1.0 1.0] [1.0 1.0])})))
+
+(deftest without-an-image-it-refuses-rather-than-answering
+  (let [data (trapped #(kir/execute dot 'main [4096 8 4104 8 2] {}))]
+    (is (= :kernel-memory-unavailable (:trap data)))
+    (is (= 'kernel-dot-f32 (:operation data)))))
+
+(deftest each-region-is-bounded-by-the-profile-maximum
+  (is (= :length-above-profile-maximum
+         (:check (fault [image-base 65537 4104 8 2]))))
+  (is (= :second-length-above-profile-maximum
+         (:check (fault [image-base 8 4104 65537 2]))))
+  (testing "and 65536 itself is admitted -- the ceiling is inclusive"
+    (is (not= :length-above-profile-maximum
+              (:check (fault [image-base 65536 4104 65536 2]))))))
+
+(deftest neither-base-may-be-null
+  (is (= :null-base (:check (fault [0 8 4104 8 2]))))
+  (is (= :null-second-base (:check (fault [image-base 8 0 8 2])))))
+
+(deftest the-count-is-bounded-before-it-is-scaled
+  ;; The element limit is checked FIRST, because it is what makes `count * 4`
+  ;; safe to compute. A count of 2^62 scaled by four wraps to zero, and a
+  ;; wrapped span passes every length check there is.
+  (let [data (fault [image-base 8 4104 8 4611686018427387904])]
+    (is (= :count-above-element-limit (:check data)))
+    (is (= 16384 (w (:limit data)))))
+  (is (= :count-above-element-limit
+         (:check (fault [image-base 8 4104 8 16385]))))
+  (testing "a negative count is a huge unsigned one and is refused the same way"
+    (is (= :count-above-element-limit (:check (fault [image-base 8 4104 8 -1]))))))
+
+(deftest the-count-must-fit-inside-both-regions
+  (is (= :count-outside-window (:check (fault [image-base 4 4104 8 2]))))
+  (is (= :count-outside-second-window (:check (fault [image-base 8 4104 4 2]))))
+  (testing "an exact fit is admitted"
+    (is (nil? (fault [image-base 8 4104 8 2])))))
+
+(deftest a-region-outside-the-supplied-image-is-a-refusal-not-a-verdict
+  ;; The machine would read these bytes happily. The oracle has not been given
+  ;; them, and must say so in a way that cannot be read as either verdict.
+  (let [data (trapped #(kir/execute dot 'main [image-base 8 999999 8 2]
+                                    {:memory (two-regions [1.0 1.0] [1.0 1.0])}))]
+    (is (= :kernel-memory-outside-image (:trap data)))))
+
+(deftest fuel-is-charged-per-element
+  ;; The interpreter really does that much work. A fold charging one unit
+  ;; total would let a 16384-element dot product run inside the fuel a single
+  ;; addition is given.
+  (let [av (vec (repeat 10 1.0))]
+    (is (= (bits 10.0) (run av av 10 {:fuel 64})))
+    (let [data (trapped #(kir/execute dot 'main
+                                      [image-base 40 (+ image-base 40) 40 10]
+                                      {:memory (two-regions av av) :fuel 4}))]
+      (is (= :budget/fuel (:trap data))))))
+
+;; ---------------------------------------------------------------------------
+;; `lower` must not start an oracle it cannot finish
+;; ---------------------------------------------------------------------------
+
+(deftest a-literal-dot-product-is-not-constant-folded
+  ;; Every argument is a literal, so a folder has every structural reason to
+  ;; try -- and it has no image, so the attempt would trap and abort the
+  ;; compile of a valid program. Membership in `lower`'s `kernel-operations`
+  ;; is what prevents the attempt.
+  (let [module (test-hir/module
+                {:format :kotoba.hir/v3 :entry 'main :exports ['main]
+                 :result :i64
+                 :functions [{:name 'main :params [] :param-types []
+                              :result :i64
+                              :body '(kernel-dot-f32 4096 8 4104 8 2)}]})
+        lowered (kir/lower module)]
+    (is (nil? (:oracle-value lowered))
+        "a folded dot product would be a compile-time answer about memory the compiler has not seen")
+    (is (= [] (:blocks lowered))))
+  (testing "the control -- `lower` is still folding what it should fold"
+    (is (= 7 (w (:oracle-value
+                 (kir/lower
+                  (test-hir/module
+                   {:format :kotoba.hir/v3 :entry 'main :exports ['main]
+                    :result :i64
+                    :functions [{:name 'main :params [] :param-types []
+                                 :result :i64 :body '(bit-or 6 1)}]}))))))))

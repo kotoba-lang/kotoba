@@ -1,0 +1,130 @@
+(ns kotoba.kir-fuel64-test
+  "fuel64: a declared budget above 2^31 is HONOURED, and a budget above the
+  ceiling is REFUSED.
+
+  Both halves matter and they fail in opposite directions. A carrier that
+  truncates the budget to 32 bits produces a program that traps for no reason
+  its source can explain; a carrier with no ceiling at all admits a budget the
+  counter cannot decrement, which is a program that never traps -- also for no
+  reason its source can explain.
+
+  THE DISCRIMINATOR IS THE LOW WORD. The positive assertions use
+  4,294,967,396 = 2^32 + 100 and 4,294,968,796 = 2^32 + 1500, whose low 32
+  bits are 100 and 1,500. The negative assertions run the SAME program at
+  exactly those low words and show that it traps there. Without that pair the
+  positive assertions would pass on a program that was never in danger.
+
+  The object probe tier (4,300,000,000, low word 5,032,704) appears here only
+  in the carried list: separating it from its low word costs five million
+  interpreter calls, and the machine that has to walk past that number is a
+  CPU rather than this evaluator. aiueos ADR-0195 is where that run lives.
+
+  Runs on BOTH runtimes on purpose (`.cljc`, listed in `run-tests.cljk`). The
+  ceiling exists because of what the counter does on Node, so a JVM-only test
+  would be asserting the constraint on the runtime it was not chosen for."
+  (:require #?(:clj  [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing] :include-macros true])
+            [kotoba.kir :as ir]
+            [kotoba.test-hir :as test-hir]))
+
+;; The loop is `spin`, NOT the entry, and that is load bearing. `lower` runs a
+;; constant oracle over the ZERO-ARITY entry and seals the answer, so a loop
+;; reachable from `main` folds at compile time -- and a folded program spends
+;; no fuel at all, which would make every assertion below hold vacuously.
+;; `main` folds to 0; `spin` is exported separately and takes its iteration
+;; count as an argument, so nothing can fold it.
+;;
+;; `tick` is what makes the loop cost anything. A `__kotoba_loop_*` self-tail
+;; re-entry is DELIBERATELY zero-charge (T7.1 trampoline), so a bare countdown
+;; costs two units regardless of `n`; the leaf call charges one per iteration
+;; without growing the host stack.
+(def ^:private counting-loop
+  (test-hir/module
+   {:format :kotoba.hir/v3
+    :entry 'main
+    :exports ['main 'spin]
+    :result :i64
+    :schemas {}
+    :schema-identities {}
+    :functions
+    [{:name 'main :params [] :param-types [] :result :i64 :body 0}
+     {:name 'spin :params ['n] :param-types [:i64] :result :i64
+      :body (list '__kotoba_loop_1 'n 0)}
+     {:name '__kotoba_loop_1 :params ['n 'acc] :param-types [:i64 :i64] :result :i64
+      :body (list 'if (list '<= 'n 0)
+                  'acc
+                  (list '__kotoba_loop_1 (list '- 'n 1) (list 'tick 'acc)))}
+     {:name 'tick :params ['x] :param-types [:i64] :result :i64
+      :body (list '+ 'x 1)}]}))
+
+(def ^:private lowered (delay (ir/lower counting-loop)))
+
+;; An i64 result leaves the interpreter as a BigInt on ClojureScript and a Long
+;; on the JVM. Normalised here rather than at each assertion, because this file
+;; is about the fuel counter and nothing in it turns on the result's host type.
+(defn- run [fuel n]
+  (let [v (ir/execute @lowered 'spin [n] {:fuel fuel})]
+    #?(:clj v :cljs (js/Number v))))
+
+(defn- trap-of [thunk]
+  (try (thunk) nil
+       (catch :default e
+         (ex-data e))))
+
+(def ^:private iterations 1000)
+(def ^:private cost 1002)          ; spin + first loop entry + one tick each
+(def ^:private wide 4294967396)    ; 2^32 + 100
+
+(deftest the-loop-costs-what-this-file-says-it-costs
+  ;; Without this the two numbers below are asserted against themselves.
+  (is (= iterations (run cost iterations)) "exactly enough")
+  (is (= :budget/fuel (:trap (trap-of #(run (dec cost) iterations))))
+      "one short"))
+
+(deftest a-budget-past-2-to-the-31-is-carried-not-truncated
+  (doseq [[label fuel] [["2^31, the first value the old imm32 could not write" 2147483648]
+                        ["2^32 + 100" wide]
+                        ["the object probe tier" 4300000000]
+                        ["the ceiling itself" ir/max-fuel]]]
+    (is (= iterations (run fuel iterations)) label))
+  (testing "and the low word alone is not enough, which is what makes it a test"
+    (is (= :budget/fuel (:trap (trap-of #(run 100 iterations))))
+        "4,294,967,396 truncated to 32 bits is 100")
+    (is (= :budget/fuel (:trap (trap-of #(run 1500 3000))))
+        "4,294,968,796 truncated to 32 bits is 1,500")
+    (is (= 3000 (run 4294968796 3000))
+        "and the same run completes at the real budget")))
+
+(deftest a-budget-above-the-ceiling-is-refused-by-name
+  (doseq [[label fuel] [["one past the ceiling" (inc ir/max-fuel)]
+                        ["2^53+4, the first value where x - 1 == x on Node"
+                         9007199254740996]
+                        ["the wasm ceiling, which this counter cannot hold"
+                         4611686018427387903]
+                        ["zero" 0]
+                        ["negative" -1]]]
+    (let [data (trap-of #(run fuel 1))]
+      (is (some? data) (str label " must be refused"))
+      (is (= :fuel-outside-admitted-range (:reason data))
+          (str label " must be refused for THIS reason"))
+      (is (= ir/max-fuel (:maximum data)) label))))
+
+(deftest the-ceiling-is-max-safe-integer
+  (is (= 9007199254740991 ir/max-fuel))
+  #?(:cljs
+     (testing "measured on the runtime the ceiling was chosen for"
+       (is (= ir/max-fuel js/Number.MAX_SAFE_INTEGER))
+       (is (= (- ir/max-fuel 1) (dec ir/max-fuel)) "still exact at the ceiling")
+       (is (= 9007199254740996 (- 9007199254740996 1))
+           "and already stuck four above it -- this is why the line is here")))
+  #?(:clj
+     (testing "the JVM's own counter would carry more, and that is not the point"
+       (is (< ir/max-fuel Long/MAX_VALUE)))))
+
+;; The trap says how much fuel the run had. It used to say 512 always -- the
+;; historical default -- including for the aiueos objects that run at
+;; 250,000,000. One field, wrong every time the caller passed a budget.
+(deftest an-exhausted-run-names-the-budget-it-exhausted
+  (is (= 1001 (:limit (trap-of #(run 1001 iterations)))))
+  (is (= 512 (:limit (trap-of #(ir/execute @lowered 'spin [iterations] {}))))
+      "and still 512 when the caller did not ask for anything else"))

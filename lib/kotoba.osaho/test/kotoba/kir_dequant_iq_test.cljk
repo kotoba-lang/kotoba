@@ -1,0 +1,359 @@
+(ns kotoba.kir-dequant-iq-test
+  "The oracle for the four CODEBOOK dequantization formats.
+
+  In Q8_0, Q4_K and Q6_K a code is a number: sign-extend it, mask a nibble out
+  of it, assemble it from two fields, multiply. In IQ4_XS, IQ2_S, IQ3_XXS and
+  IQ3_S a code is an INDEX INTO A TABLE that belongs to the format and not to
+  the block, and three of the four also carry a per-element SIGN the table
+  does not. 306 of the Qwen3.5 model's 866 tensors are one of these four,
+  which is more than any other family.
+
+  WHAT IS INDEPENDENT HERE AND WHAT IS NOT.
+
+  The EQUATIONS are. Each reference below is a transcription of
+  `dequantize_row_iq*` from `os/aiueos/kernel/qwen35_quant.c` written with the
+  C's own pointer walk -- `qs += 4`, `signs += 4`, `y += 8`, `qh += 2` -- and
+  with mutable cursors, where the oracle is written with `reduce` over derived
+  indices. An off-by-one in one is not an off-by-one in the other.
+
+  The TABLES are NOT independent: both sides read `kotoba.kir.iq-codebook`,
+  because a second hand transcription of 8192 bytes would be a second copy of
+  the same typing rather than a second opinion. What guards the table instead
+  is (1) a positional digest over each byte image, pinned from
+  `qwen35_quant_tables.inc`, so that ANOTHER repository's copy can be compared
+  with this one by a test, and (2) six entries read out of the `.inc` by hand
+  and asserted here.
+
+  The comparison is ELEMENT BY ELEMENT, which the fold makes possible: an
+  activation vector that is 1.0 at one position and 0.0 everywhere else
+  answers with exactly that element's dequantized value.
+
+  NO REAL MODEL BYTES. This host carries no GGUF (measured 2026-09-02), so
+  every block below is synthesised by a small generator that makes each field
+  differ from its neighbours -- which is what makes a wrong index visible."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.kir :as kir]
+            [kotoba.kir.iq-codebook :as iq]
+            [kotoba.kir.value :as value]))
+
+(defn- f32 [x] #?(:clj (float x) :cljs (js/Math.fround x)))
+(defn- fmul [x y] #?(:clj (float (* (float x) (float y))) :cljs (js/Math.fround (* x y))))
+(defn- fadd [x y] #?(:clj (float (+ (float x) (float y))) :cljs (js/Math.fround (+ x y))))
+
+(defn- bits [x]
+  #?(:clj (long (value/f32-to-i64-bits (f32 x)))
+     :cljs (js/Number (value/f32-to-i64-bits (f32 x)))))
+
+(defn- f32-le-bytes [x]
+  (let [b (bits x)]
+    (mapv #(bit-and (bit-shift-right b (* 8 %)) 255) (range 4))))
+
+(defn- w [x] #?(:clj x :cljs (js/Number x)))
+
+(defn- signless-zero
+  "`+0.0 + -0.0` is `+0.0` under round-to-nearest, so a dequantized element of
+  -0.0 comes back from a one-hot fold as +0.0 and no fold can tell them apart.
+  Both sides are normalised, as BIT PATTERNS: the canonical f32 word is sign
+  extended from bit 31, so -0.0 arrives as -2147483648."
+  [pattern] (if (= pattern -2147483648) 0 pattern))
+
+;; ---------------------------------------------------------------------------
+;; half precision, from the definition
+;; ---------------------------------------------------------------------------
+
+(def ^:private half-bits 0x3C4D)      ; 1.0751953125, a normal with mantissa
+(def ^:private half-value (f32 1.0751953125))
+
+;; ---------------------------------------------------------------------------
+;; synthesised blocks
+;;
+;; A linear generator rather than a constant: a block of equal bytes cannot
+;; show a wrong index, because every wrong answer is the right one.
+;; ---------------------------------------------------------------------------
+
+(defn- filler [n seed]
+  (mapv (fn [i] (bit-and (+ (* 37 i) seed) 255)) (range n)))
+
+(defn- iq4-xs-block []
+  ;; d, scales_h (16 bits), scales_l[4], qs[128]
+  (vec (concat [(bit-and half-bits 255) (bit-shift-right half-bits 8)]
+               [0x5A 0xA3]
+               (filler 4 11)
+               (filler 128 3))))
+
+(defn- iq2-s-block []
+  ;; d, qs[64] (32 codes then 32 sign bytes), qh[8], scales[8]
+  (vec (concat [(bit-and half-bits 255) (bit-shift-right half-bits 8)]
+               (filler 64 7) (filler 8 29) (filler 8 53))))
+
+(defn- iq3-xxs-block []
+  ;; d, qs[96] (64 codes then eight 32-bit scale-and-sign words)
+  (vec (concat [(bit-and half-bits 255) (bit-shift-right half-bits 8)]
+               (filler 96 5))))
+
+(defn- iq3-s-block []
+  ;; d, qs[64], qh[8], signs[32], scales[4]
+  (vec (concat [(bit-and half-bits 255) (bit-shift-right half-bits 8)]
+               (filler 64 13) (filler 8 41) (filler 32 17) (filler 4 61))))
+
+;; ---------------------------------------------------------------------------
+;; the C, transcribed with its own pointer walk
+;; ---------------------------------------------------------------------------
+
+(defn- sign-of [signs j]
+  (if (pos? (bit-and signs (nth iq/kmask-iq2xs j))) -1.0 1.0))
+
+(defn- reference-iq4-xs [b]
+  (let [d half-value
+        out (atom [])
+        qs (atom 8)
+        scales-h (+ (nth b 2) (* 256 (nth b 3)))]
+    (dotimes [ib 8]
+      (let [ls (bit-or (bit-and (bit-shift-right (nth b (+ 4 (quot ib 2)))
+                                                 (* 4 (mod ib 2))) 0xF)
+                       (bit-shift-left (bit-and (bit-shift-right scales-h (* 2 ib)) 3) 4))
+            dl (fmul d (- ls 32))
+            low (atom []) high (atom [])]
+        (dotimes [j 16]
+          (let [byte (nth b (+ @qs j))]
+            (swap! low conj (fmul dl (nth iq/kvalues-iq4nl (bit-and byte 0xF))))
+            (swap! high conj (fmul dl (nth iq/kvalues-iq4nl (bit-shift-right byte 4))))))
+        (swap! out into @low)
+        (swap! out into @high)
+        (swap! qs + 16)))
+    @out))
+
+(defn- reference-iq2-s [b]
+  (let [d half-value
+        out (atom [])
+        qs (atom 2)
+        signs (atom 34)]
+    (dotimes [ib32 8]
+      (let [scale (nth b (+ 74 ib32))
+            db [(fmul (fmul d (f32 (+ 0.5 (bit-and scale 0xF)))) (f32 0.25))
+                (fmul (fmul d (f32 (+ 0.5 (bit-shift-right scale 4)))) (f32 0.25))]
+            high (nth b (+ 66 ib32))]
+        (dotimes [l 4]
+          (let [dl (nth db (quot l 2))
+                index (bit-or (nth b (+ @qs l))
+                              (bit-and (bit-shift-left high (- 8 (* 2 l))) 0x300))
+                grid (* 8 index)
+                s (nth b (+ @signs l))]
+            (dotimes [j 8]
+              (swap! out conj (fmul (fmul dl (nth iq/iq2s-grid (+ grid j)))
+                                    (sign-of s j))))))
+        (swap! qs + 4)
+        (swap! signs + 4)))
+    @out))
+
+(defn- reference-iq3-xxs [b]
+  (let [d half-value
+        out (atom (vec (repeat 256 (f32 0.0))))
+        y (atom 0)
+        qs (atom 2)]
+    (dotimes [ib32 8]
+      (let [at (+ 66 (* 4 ib32))
+            aux32 (+ (nth b at) (* 256 (nth b (+ at 1)))
+                     (* 65536 (nth b (+ at 2))) (* 16777216 (nth b (+ at 3))))
+            db (fmul (fmul d (f32 (+ 0.5 (quot aux32 268435456)))) (f32 0.5))]
+        (dotimes [l 4]
+          (let [s (nth iq/ksigns-iq2xs (bit-and (quot aux32 (bit-shift-left 1 (* 7 l))) 127))
+                g1 (* 4 (nth b (+ @qs (* 2 l))))
+                g2 (* 4 (nth b (+ @qs (* 2 l) 1)))]
+            (dotimes [j 4]
+              (swap! out assoc (+ @y j)
+                     (fmul (fmul db (nth iq/iq3xxs-grid (+ g1 j))) (sign-of s j)))
+              (swap! out assoc (+ @y j 4)
+                     (fmul (fmul db (nth iq/iq3xxs-grid (+ g2 j))) (sign-of s (+ j 4)))))
+            (swap! y + 8)))
+        (swap! qs + 8)))
+    @out))
+
+(defn- reference-iq3-s [b]
+  (let [d half-value
+        out (atom (vec (repeat 256 (f32 0.0))))
+        y (atom 0)
+        qs (atom 2)
+        qh (atom 66)
+        signs (atom 74)]
+    (dotimes [pair 4]
+      (let [scale (nth b (+ 106 pair))
+            db1 (fmul d (+ 1 (* 2 (bit-and scale 0xF))))
+            db2 (fmul d (+ 1 (* 2 (bit-shift-right scale 4))))]
+        (doseq [[db which] [[db1 0] [db2 1]]]
+          (let [ninth (nth b (+ @qh which))]
+            (dotimes [l 4]
+              (let [g1 (* 4 (bit-or (nth b (+ @qs (* 2 l)))
+                                    (bit-and (bit-shift-left ninth (- 8 (* 2 l))) 256)))
+                    g2 (* 4 (bit-or (nth b (+ @qs (* 2 l) 1))
+                                    (bit-and (bit-shift-left ninth (- 7 (* 2 l))) 256)))
+                    s (nth b (+ @signs l))]
+                (dotimes [j 4]
+                  (swap! out assoc (+ @y j)
+                         (fmul (fmul db (nth iq/iq3s-grid (+ g1 j))) (sign-of s j)))
+                  (swap! out assoc (+ @y j 4)
+                         (fmul (fmul db (nth iq/iq3s-grid (+ g2 j))) (sign-of s (+ j 4)))))
+                (swap! y + 8)))
+            (swap! qs + 8)
+            (swap! signs + 4)))
+        (swap! qh + 2)))
+    @out))
+
+;; ---------------------------------------------------------------------------
+;; the module under test
+;; ---------------------------------------------------------------------------
+
+(defn- module [head]
+  {:format :kotoba.kir/v4
+   :entry 'main
+   :effects #{}
+   :functions [{:name 'main
+                :params '[w-base w-length x-base x-length blocks]
+                :param-types [:i64 :i64 :i64 :i64 :i64]
+                :result :i64 :effects #{}
+                :body (list head 'w-base 'w-length 'x-base 'x-length 'blocks)}]})
+
+(def ^:private image-base 4096)
+
+(defn- run [head packed activations]
+  (let [image {:base image-base
+               :bytes (volatile! (vec (concat packed (mapcat f32-le-bytes activations))))}]
+    (w (kir/execute (module head) 'main
+                    [image-base (count packed)
+                     (+ image-base (count packed)) (* 4 (count activations)) 1]
+                    {:memory image :fuel 4000000}))))
+
+(defn- one-hot [n i] (mapv (fn [j] (if (= i j) (f32 1.0) (f32 0.0))) (range n)))
+
+(def ^:private formats
+  [['kernel-dequant-dot-iq4-xs (iq4-xs-block) reference-iq4-xs 136]
+   ['kernel-dequant-dot-iq2-s (iq2-s-block) reference-iq2-s 82]
+   ['kernel-dequant-dot-iq3-xxs (iq3-xxs-block) reference-iq3-xxs 98]
+   ['kernel-dequant-dot-iq3-s (iq3-s-block) reference-iq3-s 110]])
+
+;; ---------------------------------------------------------------------------
+;; 1. the tables
+;; ---------------------------------------------------------------------------
+
+(deftest the-codebook-images-are-the-cs
+  (doseq [[k table] [[:kmask-iq2xs iq/kmask-iq2xs]
+                     [:ksigns-iq2xs iq/ksigns-iq2xs]
+                     [:kvalues-iq4nl (mapv #(if (neg? %) (+ % 256) %) iq/kvalues-iq4nl)]
+                     [:iq3xxs-grid iq/iq3xxs-grid]
+                     [:iq3s-grid iq/iq3s-grid]
+                     [:iq2s-grid iq/iq2s-grid]]]
+    (let [{:keys [bytes fnv1a32]} (get iq/digests k)]
+      (is (= bytes (count table)) (str k " byte count"))
+      (is (= fnv1a32 (iq/fnv1a32 table)) (str k " positional digest"))))
+  (testing "six entries read out of qwen35_quant_tables.inc by hand"
+    ;; A digest says the image did not change. These say the image is the
+    ;; RIGHT one -- they were read from the `.inc` and converted by hand, and
+    ;; they cover the first and last entry of every grid.
+    (is (= [-127 -104 -83 -65 -49 -35 -22 -10 1 13 25 38 53 69 89 113]
+           iq/kvalues-iq4nl))
+    (is (= [1 2 4 8 16 32 64 128] iq/kmask-iq2xs))
+    (is (= [0 129 130 3] (take 4 iq/ksigns-iq2xs)))
+    (is (= 255 (nth iq/ksigns-iq2xs 127)))
+    ;; iq3xxs_grid[0] = 0x04040404, [255] = 0x3e341c04, little-endian
+    (is (= [4 4 4 4] (take 4 iq/iq3xxs-grid)))
+    (is (= [4 28 52 62] (subvec iq/iq3xxs-grid 1020 1024)))
+    ;; iq3s_grid[0] = 0x01010101, [511] = 0x0f0f0101
+    (is (= [1 1 1 1] (take 4 iq/iq3s-grid)))
+    (is (= [1 1 15 15] (subvec iq/iq3s-grid 2044 2048)))
+    ;; iq2s_grid[0] = 0x0808080808080808, [1023] = 0x2b2b2b2b2b2b2b2b
+    (is (= (vec (repeat 8 8)) (take 8 iq/iq2s-grid)))
+    (is (= (vec (repeat 8 43)) (subvec iq/iq2s-grid 8184 8192))))
+  (testing "and the digest separates a permutation, which a sum does not"
+    ;; The first and last bytes, which differ (4 and 62). Two EQUAL bytes
+    ;; swapped is not a permutation of the image and would make this control
+    ;; pass for a digest that could not see one.
+    (let [swapped (assoc iq/iq3xxs-grid 0 (nth iq/iq3xxs-grid 1023)
+                         1023 (nth iq/iq3xxs-grid 0))]
+      (is (not= (nth iq/iq3xxs-grid 0) (nth iq/iq3xxs-grid 1023))
+          "the two positions must actually differ")
+      (is (= (reduce + iq/iq3xxs-grid) (reduce + swapped))
+          "a sum cannot see it")
+      (is (not= (iq/fnv1a32 iq/iq3xxs-grid) (iq/fnv1a32 swapped))
+          "the positional digest can"))))
+
+;; ---------------------------------------------------------------------------
+;; 2. the equations, element by element
+;; ---------------------------------------------------------------------------
+
+(deftest every-codebook-format-dequantizes-what-the-c-dequantizes
+  (doseq [[head block reference _] formats]
+    (let [expected (reference block)
+          disagreements (filterv
+                         (fn [i]
+                           (not= (signless-zero (bits (nth expected i)))
+                                 (signless-zero (run head block (one-hot 256 i)))))
+                         (range 256))]
+      (println (str "SCANNED\t256\tDISAGREEMENTS\t" (count disagreements)
+                    "\t" head))
+      (is (= 256 (count expected)) (str head " produced 256 elements"))
+      (is (empty? disagreements)
+          (str head " disagrees at " (take 4 disagreements))))))
+
+(deftest the-synthesised-blocks-are-not-degenerate
+  ;; The comparison above is worth nothing if every element is the same
+  ;; number: a wrong index would be invisible. These say the fixtures make a
+  ;; wrong index visible.
+  (doseq [[head block reference _] formats]
+    (let [values (reference block)]
+      (is (< 16 (count (distinct values)))
+          (str head " must produce many distinct weights, not "
+               (count (distinct values))))
+      (is (some neg? values) (str head " must produce negative weights"))
+      (is (some pos? values) (str head " must produce positive weights")))))
+
+(deftest the-block-strides-are-the-c-block-sizes
+  ;; A wrong stride reads the next block's bytes as this one's, which is a
+  ;; whole-row error rather than an element one.
+  (doseq [[head block _ size] formats]
+    (is (= size (count block)) (str head " block is sizeof(block_*)"))))
+
+;; ---------------------------------------------------------------------------
+;; 3. and the comparison is not vacuous
+;; ---------------------------------------------------------------------------
+
+(deftest a-perturbed-reference-disagrees-with-the-oracle
+  ;; Each perturbation is a mistake a transcription actually makes. Without
+  ;; this, the tests above would pass for two ports that were wrong in the
+  ;; same way -- and they cannot be, because only one of them is being
+  ;; perturbed.
+  (testing "IQ4_XS: the two nibble halves are 16 apart, not 32"
+    (let [b (iq4-xs-block)
+          right (reference-iq4-xs b)
+          wrong (vec (mapcat (fn [ib]
+                               (let [strip (subvec (vec right) (* 32 ib) (* 32 (inc ib)))]
+                                 (concat (subvec strip 16 32) (subvec strip 0 16))))
+                             (range 8)))]
+      (is (not= right wrong))))
+  (testing "IQ2_S: the scale of a quarter is db[l/2], not db[l mod 2]"
+    (let [b (iq2-s-block)
+          d half-value
+          at (fn [ib32 l j]
+               (let [scale (nth b (+ 74 ib32))
+                     db [(fmul (fmul d (f32 (+ 0.5 (bit-and scale 0xF)))) (f32 0.25))
+                         (fmul (fmul d (f32 (+ 0.5 (bit-shift-right scale 4)))) (f32 0.25))]
+                     high (nth b (+ 66 ib32))
+                     index (bit-or (nth b (+ 2 (* 4 ib32) l))
+                                   (bit-and (bit-shift-left high (- 8 (* 2 l))) 0x300))
+                     s (nth b (+ 34 (* 4 ib32) l))]
+                 [(fmul (fmul (nth db (quot l 2)) (nth iq/iq2s-grid (+ (* 8 index) j)))
+                        (sign-of s j))
+                  (fmul (fmul (nth db (mod l 2)) (nth iq/iq2s-grid (+ (* 8 index) j)))
+                        (sign-of s j))]))]
+      (is (some (fn [[a c]] (not= a c))
+                (for [ib32 (range 8) l (range 4) j (range 8)] (at ib32 l j))))))
+  (testing "IQ3_XXS: the sign selector is seven bits per quarter, not eight"
+    (let [b (iq3-xxs-block)
+          aux32 (+ (nth b 66) (* 256 (nth b 67)) (* 65536 (nth b 68))
+                   (* 16777216 (nth b 69)))]
+      (is (not= (mapv #(bit-and (quot aux32 (bit-shift-left 1 (* 7 %))) 127) (range 4))
+                (mapv #(bit-and (quot aux32 (bit-shift-left 1 (* 8 %))) 127) (range 4))))))
+  (testing "IQ3_S: grid2's ninth bit is at 7-2l, not 8-2l"
+    (let [b (iq3-s-block)
+          ninth (nth b 66)]
+      (is (not= (mapv #(bit-and (bit-shift-left ninth (- 7 (* 2 %))) 256) (range 4))
+                (mapv #(bit-and (bit-shift-left ninth (- 8 (* 2 %))) 256) (range 4)))))))

@@ -1,0 +1,250 @@
+;; Canonical native payload-v2 identity. Form is the explicit input domain;
+;; no host reader, numeric coercion, platform hash provider or ambient I/O.
+;; Frozen v2 ordering is recursive tagged-value order, not encoded-key order.
+(ns kotoba.kir.definition-identity
+ (:export [admit-build canonical-bytes canonical-hex check-case cid? control-effects definition-cid definition-error definition-required effect-row-from-hir f64 i64 identity-payload normalize payload-version verify-locked-definitions])
+ (:require [kotoba.form :as f] [cbor.form :as cbor] [multiformats.cid :as cid]
+           [multiformats.sha256 :as sha]))
+
+(defn payload-version [] :i64 2)
+(defn- get [m [:ref :form/r] k :keyword] [:ref :form/r] (f/form-get m (f/keyword-form k)))
+(defn- has? [m [:ref :form/r] k :keyword] :bool (f/form-has? m (f/keyword-form k)))
+(defn- put [m [:ref :form/r] k :keyword v [:ref :form/r]] [:ref :form/r] (f/assoc-form m (f/keyword-form k) v))
+(defn- member? [xs [:ref :form/r] x [:ref :form/r]] :bool
+ (loop [i 0] (cond (= i (f/count-of xs)) false (f/eq x (f/nth-of xs i)) true :else (recur (+ i 1)))))
+(defn- add-set [s [:ref :form/r] x [:ref :form/r]] [:ref :form/r]
+ (if (member? s x) s (f/form-set (f/append-form (f/kids-of s) x))))
+(defn- field-map [k :keyword v [:ref :form/r]] [:ref :form/r] (f/form-map (f/two-forms (f/keyword-form k) v)))
+(defn- failed [reason :keyword] [:ref :form/r]
+ (put (field-map :ok? (f/bool-form false)) :reason (f/keyword-form reason)))
+(defn- passed [] [:ref :form/r] (field-map :ok? (f/bool-form true)))
+(defn- ok? [r [:ref :form/r]] :bool (f/is-true? (get r :ok?)))
+(defn- error [message :string] [:ref :form/r]
+ (put (field-map :valid? (f/bool-form false)) :message (f/string-form message)))
+(defn definition-required [] [:ref :form/r]
+ (f/form-vec (f/append-many (f/three-forms (f/keyword-form :definition/profile-version)
+   (f/keyword-form :definition/desugar-contract-version) (f/keyword-form :definition/kir))
+   (f/three-forms (f/keyword-form :definition/effect-row) (f/keyword-form :definition/interface)
+    (f/keyword-form :definition/dependencies)))))
+(defn control-effects [] [:ref :form/r]
+ (f/form-set (f/two-forms (f/keyword-form :abort) (f/keyword-form :state))))
+(defn cid? [x [:ref :form/r]] :bool (and (f/is-string? x) (cid/cid-valid? (f/string-value x))))
+(defn- hex [bytes :vector-i64] :string
+ (let [digits "0123456789abcdef"]
+  (loop [i 0 out ""] (if (= i (vector-count bytes)) out
+   (let [b (vector-at bytes i)]
+    (recur (+ i 1) (string-concat out (string-concat
+     (string-substring digits (quot b 16) (+ (quot b 16) 1))
+     (string-substring digits (bit-and b 15) (+ (bit-and b 15) 1))))))))))
+(defn f64 [value :f64] [:ref :form/r]
+ (let [bits (f64-to-bits value) bytes (loop [i 7 out (vector-i64)]
+   (if (< i 0) out (recur (- i 1) (vector-conj out (bit-and (u64-shift-right bits (* i 8)) 255)))))]
+  (field-map :kotoba.lang.code-identity/f64 (f/string-form (hex bytes)))))
+(defn i64 [value :i64] [:ref :form/r]
+ (field-map :kotoba.lang.code-identity/i64 (f/string-form (string-from-i64 value))))
+(defn- decimal? [s :string] :bool
+ (let [n (string-length s) start (if (and (> n 0) (= (string-code-point-at s 0) 45)) 1 0)]
+  (and (> n start) (not (and (> (- n start) 1) (= (string-code-point-at s start) 48)))
+   (loop [i start] (if (= i n) true
+    (let [c (string-code-point-at s i)] (if (and (>= c 48) (<= c 57)) (recur (+ i 1)) false)))))))
+(defn- lower-hex [s :string] :string
+ (loop [i 0 out ""] (if (= i (string-length s)) out
+  (let [c (string-code-point-at s i)]
+   (recur (+ i 1) (string-concat out (if (and (>= c 65) (<= c 70))
+    (string-substring "abcdef" (- c 65) (+ (- c 65) 1)) (string-substring s i (+ i 1)))))))))
+(defn- wrapper? [value [:ref :form/r] key :keyword] :bool
+ (and (f/is-map? value) (= (f/count-of value) 2) (f/is-string? (get value key))))
+(defn- tag1 [tag :string] [:ref :form/r] (f/form-vec (f/one-form (f/string-form tag))))
+(defn- tagged [tag :string value [:ref :form/r]] [:ref :form/r]
+ (f/form-vec (f/two-forms (f/string-form tag) value)))
+
+;; The original v2 comparator compares UTF-16 code units. Recreate that
+;; ordering explicitly, including supplementary characters vs BMP characters.
+(defn- utf16 [s :string] :vector-i64
+ (loop [i 0 out (vector-i64)] (if (= i (string-length s)) out
+  (let [c (string-code-point-at s i) width (cond (< c 128) 1 (< c 2048) 2 (< c 65536) 3 :else 4)]
+   (recur (+ i width) (if (< c 65536) (vector-conj out c)
+    (vector-conj (vector-conj out (+ 55296 (quot (- c 65536) 1024))) (+ 56320 (bit-and (- c 65536) 1023)))))))))
+(defn- compare-text [a :string b :string] :i64
+ (let [a (utf16 a) b (utf16 b) na (vector-count a) nb (vector-count b)]
+  (loop [i 0] (cond (= i na) (if (= i nb) 0 -1) (= i nb) 1
+   (< (vector-at a i) (vector-at b i)) -1 (> (vector-at a i) (vector-at b i)) 1 :else (recur (+ i 1))))))
+(defn- rank [x [:ref :form/r]] :i64
+ (cond (f/is-nil? x) 0 (f/is-bool? x) 1 (f/is-string? x) 2 (f/is-vec? x) 3 :else 4))
+(defn- compare-value [a [:ref :form/r] b [:ref :form/r]] :i64
+ (let [ra (rank a) rb (rank b)]
+  (cond (< ra rb) -1 (> ra rb) 1 (= ra 0) 0
+   (= ra 1) (let [x (f/int-value a) y (f/int-value b)] (cond (< x y) -1 (> x y) 1 :else 0))
+   (= ra 2) (compare-text (f/string-value a) (f/string-value b))
+   (= ra 3) (loop [i 0] (cond (= i (f/count-of a)) (if (= i (f/count-of b)) 0 -1)
+    (= i (f/count-of b)) 1 :else (let [c (compare-value (f/nth-of a i) (f/nth-of b i))]
+     (if (= c 0) (recur (+ i 1)) c)))) :else 0)))
+(defn- insert [xs [:list [:ref :form/r]] x [:ref :form/r] pair? :bool] [:list [:ref :form/r]]
+ (loop [i 0 done false out (f/no-forms)]
+  (if (= i (vector-count xs)) (if done out (f/append-form out x))
+   (let [y (typed-list-nth [:list [:ref :form/r]] xs i)
+         before (and (not done) (< (compare-value (if pair? (f/nth-of x 0) x) (if pair? (f/nth-of y 0) y)) 0))]
+    (recur (+ i 1) (or done before) (f/append-form (if before (f/append-form out x) out) y))))))
+(defn- sorted [xs [:list [:ref :form/r]] pair? :bool] [:list [:ref :form/r]]
+ (loop [i 0 out (f/no-forms)] (if (= i (vector-count xs)) out
+  (recur (+ i 1) (insert out (typed-list-nth [:list [:ref :form/r]] xs i) pair?)))))
+(defn- normalize-checked [value [:ref :form/r] depth :i64] [:result [:ref :form/r] :keyword]
+ (try (result-ok-of [:result [:ref :form/r] :keyword] (normalize-at value depth))
+  (catch :keyword error (result-err-of [:result [:ref :form/r] :keyword] error))))
+(defn- normalized-children [value [:ref :form/r] depth :i64] [:list [:ref :form/r]]
+ (loop [i 0 out (f/no-forms)] (if (= i (f/count-of value)) out
+  (let [r (normalize-checked (f/nth-of value i) (+ depth 1))]
+   (if (result-ok?-of [:result [:ref :form/r] :keyword] r)
+    (let [x (result-value-of [:result [:ref :form/r] :keyword] r (f/nil-form))]
+     (recur (+ i 1) (f/append-form out x)))
+    (throw (result-error-of [:result [:ref :form/r] :keyword] r :definition/uncanonical-value)))))))
+(defn- normalize-at [value [:ref :form/r] depth :i64] [:ref :form/r]
+ (if (> depth 512) (throw :definition/depth)
+  (cond (f/is-nil? value) (tag1 "nil") (f/is-bool? value) (tagged "bool" value)
+   (f/is-int? value) (tagged "int" (f/string-form (string-from-i64 (f/int-value value))))
+   (f/is-string? value) (tagged "str" value)
+   (f/is-keyword? value) (let [text (document-edn-print (document-keyword (f/keyword-value value)))]
+    (tagged "kw" (f/string-form (string-substring text 1 (string-length text)))))
+   (f/is-symbol? value) (tagged "sym" (f/string-form (f/symbol-value value)))
+   (f/is-bytes? value) (tagged "bytes" (f/string-form (hex (vector-i64-from-bytes (f/bytes-of value)))))
+   (and (wrapper? value :kotoba.lang.code-identity/f64)
+    (= (string-length (f/string-value (get value :kotoba.lang.code-identity/f64))) 16)
+    (cid/hex-valid? (f/string-value (get value :kotoba.lang.code-identity/f64))))
+    (tagged "f64" (f/string-form (lower-hex (f/string-value (get value :kotoba.lang.code-identity/f64)))))
+   (and (wrapper? value :kotoba.lang.code-identity/i64)
+    (decimal? (f/string-value (get value :kotoba.lang.code-identity/i64))))
+    (tagged "int" (get value :kotoba.lang.code-identity/i64))
+   (f/is-f64? value) (throw :definition/unencodable-float)
+   (f/is-map? value) (if (not= (bit-and (f/count-of value) 1) 0) (throw :definition/map-arity)
+    (let [all (normalized-children value depth)
+          pairs (loop [i 0 out (f/no-forms)] (if (= i (vector-count all)) out
+           (recur (+ i 2) (f/append-form out (f/form-vec (f/two-forms
+            (typed-list-nth [:list [:ref :form/r]] all i) (typed-list-nth [:list [:ref :form/r]] all (+ i 1))))))))]
+     (tagged "map" (f/form-vec (sorted pairs true)))))
+   (f/is-set? value) (tagged "set" (f/form-vec (sorted (normalized-children value depth) false)))
+   (f/is-vec? value) (tagged "vec" (f/form-vec (normalized-children value depth)))
+   (f/is-seq? value) (tagged "list" (f/form-vec (normalized-children value depth)))
+   :else (throw :definition/uncanonical-value))))
+(defn normalize [value [:ref :form/r]] [:ref :form/r] (normalize-at value 0))
+
+(defn definition-error [d [:ref :form/r]] [:ref :form/r]
+ (let [required (definition-required) deps (get d :definition/dependencies) row (get d :definition/effect-row)
+       missing (loop [i 0] (cond (= i (f/count-of required)) (f/nil-form)
+        (not (f/form-has? d (f/nth-of required i))) (f/nth-of required i) :else (recur (+ i 1))))]
+  (cond (not (f/is-map? d)) (error "definition map required")
+   (not (f/is-nil? missing)) (put (error "definition missing required field") :data (field-map :missing missing))
+   (or (not (f/is-int? (get d :definition/profile-version))) (<= (f/int-value (get d :definition/profile-version)) 0))
+    (error "definition profile version must be positive integer")
+   (or (not (f/is-int? (get d :definition/desugar-contract-version))) (<= (f/int-value (get d :definition/desugar-contract-version)) 0))
+    (error "definition desugar contract version must be positive integer")
+   (not (f/is-map? (get d :definition/kir))) (error "definition typed KIR map required")
+   (not (has? (get d :definition/kir) :op)) (error "definition typed KIR must be an IR node with :op, not an arbitrary map")
+   (not (f/is-set? row)) (error "definition effect row must be a set")
+   (not (loop [i 0] (cond (= i (f/count-of row)) true (not (f/is-keyword? (f/nth-of row i))) false :else (recur (+ i 1)))))
+    (error "definition effect row members must be keywords")
+   (not (f/is-map? (get d :definition/interface))) (error "definition interface map required")
+   (not (f/is-vec? deps)) (error "definition dependencies vector required")
+   (not (loop [i 0] (cond (= i (f/count-of deps)) true (not (cid? (f/nth-of deps i))) false :else (recur (+ i 1)))))
+    (error "definition dependency CID required")
+   (loop [i 0 seen (f/form-set (f/no-forms))]
+    (cond (= i (f/count-of deps)) false (member? seen (f/nth-of deps i)) true
+     :else (recur (+ i 1) (add-set seen (f/nth-of deps i))))) (error "definition dependencies must be unique")
+   :else (f/nil-form))))
+(defn- sort-strings [xs [:ref :form/r]] [:ref :form/r]
+ (let [wrapped (loop [i 0 out (f/no-forms)] (if (= i (f/count-of xs)) out
+   (recur (+ i 1) (f/append-form out (f/nth-of xs i)))))]
+  (f/form-vec (sorted wrapped false))))
+(defn identity-payload [d [:ref :form/r]] [:ref :form/r]
+ (let [m0 (field-map :kotoba.definition-identity/version (f/int-form (payload-version)))
+       m1 (put m0 :profile-version (get d :definition/profile-version))
+       m2 (put m1 :desugar-contract-version (get d :definition/desugar-contract-version))
+       m3 (put m2 :typed-kir (get d :definition/kir)) m4 (put m3 :effect-row (get d :definition/effect-row))
+       m5 (put m4 :interface (get d :definition/interface))]
+  (put m5 :dependencies (sort-strings (get d :definition/dependencies)))))
+(defn canonical-bytes [d [:ref :form/r]] :vector-i64
+ (if (f/is-nil? (definition-error d)) (cbor/encode-form (normalize (identity-payload d))) (throw :definition/invalid)))
+(defn canonical-hex [d [:ref :form/r]] :string (hex (canonical-bytes d)))
+(defn definition-cid [d [:ref :form/r]] :string (cid/cidv1 113 (sha/digest-hex (canonical-bytes d))))
+
+(defn- catalog [opts [:ref :form/r]] [:ref :form/r]
+ (let [source (get opts :id->name)]
+  (if (not (f/is-map? source)) (throw :definition/effect-row-unbridged)
+   (loop [i 0 seen (f/form-set (f/no-forms)) out (f/form-map (f/no-forms))]
+    (if (>= i (f/count-of source)) out
+     (let [id (f/nth-of source i) name (f/nth-of source (+ i 1))]
+      (cond (not (f/is-int? id)) (recur (+ i 2) seen out)
+       (or (not (f/is-keyword? name)) (member? seen name)) (throw :definition/effect-row-unbridged)
+       :else (recur (+ i 2) (add-set seen name) (f/assoc-form out id name)))))))))
+(defn effect-row-from-hir [hir [:ref :form/r] opts [:ref :form/r]] [:ref :form/r]
+ (let [table (catalog opts) row (get hir :effects) named (get hir :named-operations)]
+  (cond (not (f/is-map? hir)) (throw :definition/effect-row-unbridged)
+   (not (f/is-set? row)) (throw :definition/effect-row-unbridged)
+   (and (not (f/is-nil? named)) (not (f/is-set? named))) (throw :definition/effect-row-unbridged)
+   :else (let [provenance (loop [i 0]
+     (if (= i (f/count-of named)) true
+      (let [op (f/nth-of named i) known (loop [j 1] (cond (>= j (f/count-of table)) false
+       (f/eq op (f/nth-of table j)) true :else (recur (+ j 2))))]
+       (if (and (f/is-keyword? op) known) (recur (+ i 1)) false))))]
+    (if (not provenance) (throw :definition/effect-row-unbridged)
+     (loop [i 0 out (f/form-set (f/no-forms))]
+      (if (= i (f/count-of row)) out
+       (let [m (f/nth-of row i)]
+        (cond (member? (control-effects) m) (recur (+ i 1) (add-set out m))
+         (and (f/is-vec? m) (= (f/count-of m) 2) (f/eq (f/nth-of m 0) (f/keyword-form :cap/call))
+          (f/is-int? (f/nth-of m 1)) (f/form-has? table (f/nth-of m 1)))
+          (recur (+ i 1) (add-set out (f/form-get table (f/nth-of m 1))))
+         :else (throw :definition/effect-row-unbridged))))))))))
+
+(defn- actual-cid [d [:ref :form/r]] [:result :string :keyword]
+ (try (result-ok-of [:result :string :keyword] (definition-cid d))
+  (catch :keyword error (result-err-of [:result :string :keyword] error))))
+(defn- dependency [lock [:ref :form/r] name [:ref :form/r]] [:ref :form/r]
+ (let [deps (get lock :deps)]
+  (loop [i 0 found (f/nil-form)] (if (= i (f/count-of deps)) found
+   (let [dep (f/nth-of deps i)] (recur (+ i 1) (if (f/eq name (get dep :dep/name)) dep found)))))))
+(defn- verify-one [lock [:ref :form/r] entry [:ref :form/r]] [:ref :form/r]
+ (let [dep (dependency lock (get entry :dep/name)) expected (get entry :definition-cid)]
+  (cond (f/is-nil? dep) (put (failed :definition/unknown-dependency) :entry entry)
+   (not (cid? expected)) (put (failed :definition/cid-invalid) :entry entry)
+   :else (let [r (actual-cid (get entry :definition))]
+    (if (result-ok?-of [:result :string :keyword] r)
+     (let [actual (result-value-of [:result :string :keyword] r "")]
+      (cond (not (string=? actual (f/string-value expected)))
+       (put (put (put (failed :definition/hash-mismatch) :entry entry) :expected expected) :actual (f/string-form actual))
+       (not (member? (get dep :dep/definition-cids) expected)) (put (failed :definition/not-locked) :entry entry)
+       :else (passed)))
+     (put (failed :definition/invalid) :entry entry))))))
+(defn verify-locked-definitions [lock [:ref :form/r] resolved [:ref :form/r]] [:ref :form/r]
+ (loop [i 0] (if (= i (f/count-of resolved)) (passed)
+  (let [r (verify-one lock (f/nth-of resolved i))] (if (ok? r) (recur (+ i 1)) r)))))
+(defn- coverage [dep [:ref :form/r] resolved [:ref :form/r]] [:ref :form/r]
+ (let [name (get dep :dep/name) want (get dep :dep/definition-cids)
+       got (loop [i 0 out (f/form-set (f/no-forms))]
+        (if (= i (f/count-of resolved)) out (let [entry (f/nth-of resolved i)]
+         (recur (+ i 1) (if (f/eq name (get entry :dep/name)) (add-set out (get entry :definition-cid)) out)))))
+       missing (loop [i 0 out (f/no-forms)] (if (= i (f/count-of want)) (f/form-vec out)
+        (recur (+ i 1) (if (member? got (f/nth-of want i)) out (f/append-form out (f/nth-of want i))))))]
+  (cond (= (f/count-of want) 0) (passed)
+   (= (f/count-of got) 0) (put (put (failed :definition/unresolved-dependency) :dep/name name) :expected (sort-strings want))
+   (> (f/count-of missing) 0) (put (put (failed :definition/unresolved-definition) :dep/name name) :missing (sort-strings missing))
+   :else (passed))))
+(defn admit-build [lock [:ref :form/r] resolved [:ref :form/r]] [:ref :form/r]
+ (let [verified (verify-locked-definitions lock resolved) deps (get lock :deps)]
+  (if (not (ok? verified)) verified
+   (loop [i 0] (if (= i (f/count-of deps)) (passed)
+    (let [r (coverage (f/nth-of deps i) resolved)] (if (ok? r) (recur (+ i 1)) r)))))))
+(defn check-case [tc [:ref :form/r] data [:ref :form/r]] [:ref :form/r]
+ (let [type (get tc :type) accept (f/eq (get tc :kind) (f/keyword-form :accept))]
+  (cond (f/eq type (f/keyword-form :identity))
+   (let [r (actual-cid data) success (result-ok?-of [:result :string :keyword] r)
+         outcome (if success (field-map :cid (f/string-form (result-value-of [:result :string :keyword] r "")))
+          (field-map :problem (f/keyword-form (result-error-of [:result :string :keyword] r :definition/invalid))))
+         matches (if accept (and success (f/eq (get tc :expected-cid) (get outcome :cid)))
+          (and (not success) (or (f/is-nil? (get tc :expected-problem)) (f/eq (get tc :expected-problem) (get outcome :problem)))))]
+    (put (field-map :ok? (f/bool-form matches)) :actual outcome))
+   (f/eq type (f/keyword-form :admission))
+    (let [outcome (admit-build (get data :lock) (get data :resolved))]
+     (put (field-map :ok? (f/bool-form (if accept (ok? outcome)
+      (and (not (ok? outcome)) (f/eq (get tc :expected-reason) (get outcome :reason)))))) :actual outcome))
+   :else (put (field-map :ok? (f/bool-form false)) :actual
+    (put (field-map :problem (f/keyword-form :conformance/unknown-case-type)) :type type)))))

@@ -1,0 +1,422 @@
+(ns kotoba.kir.lowering
+  "The lowering VALIDATION half of `kotoba.kir/lower`, over `kotoba.form`.
+
+  Host `lower` is two halves. (1) It validates the HIR module and refuses what
+  the interpreter and the backends cannot take: the module envelope
+  (`kotoba.hir/validate!`), the shape of the core forms `let` / `if` / `do`,
+  loop-helper self-calls outside tail position, and the three descriptor
+  refinements a function may carry (closure parameter indexes, i64 pair-chain
+  parameter indexes, closure result). It then assembles the KIR module map.
+  (2) It SEALS `:oracle-value` by running the KIR interpreter over a pure entry.
+
+  This module is half (1) plus the assembly, as pure functions over Form that
+  answer values (a Kotoba abort cannot be caught, so nothing here aborts):
+    lower-problem     the first refusal, as a problem record, or :ok
+    lower-base        the KIR module Form, `:oracle-value` nil and `:blocks` []
+    oracle-wanted?    whether host `lower` would run the interpreter (a pure
+                      i64/bool entry that is not kernel-native): the one case
+                      whose result this module cannot complete
+    kernel-native?    the host's operation-head scan
+  Differential-tested against the host `lower` (test/kotoba/kir/lowering_diff).
+
+  Kotoba-only, like kotoba.form."
+  {:kotoba/export [lower-problem problem-of problem-function problem-message problem-form
+                   lower-base oracle-wanted? kernel-native? kernel-operation?
+                   shape-violation loop-helper-off-tail-count loop-helper-name?
+                   closure-param-indexes-ok? pair-chain-param-indexes-ok? closure-result-ok?]}
+  (:require [kotoba.form :as form]
+            [kotoba.hir :as hir])
+  (:schemas {:kir.lower/problem [:record :kir.lower/problem
+                                 [[:problem :keyword] [:function [:ref :form/r]] [:message :string]]]
+             :form/r [:record :form/r [[:tag :i64] [:s :string] [:n :i64] [:k :keyword]
+                                       [:kids [:list [:ref :form/r]]] [:span :i64] [:data :bytes]]]}))
+
+;; ---- small Form helpers ----
+
+(defn- kw [k :keyword] [:ref :form/r] (form/keyword-form k))
+
+(defn- fget [m [:ref :form/r] k :keyword] [:ref :form/r] (form/form-get m (kw k)))
+
+(defn- fhas? [m [:ref :form/r] k :keyword] :bool (form/form-has? m (kw k)))
+
+(defn- head-is? [f [:ref :form/r] name :string] :bool
+  (and (form/is-seq? f)
+       (> (form/count-of f) 0)
+       (form/is-symbol? (form/first-of f))
+       (string=? (form/symbol-value (form/first-of f)) name)))
+
+(defn- is-kw? [f [:ref :form/r] k :keyword] :bool
+  (and (form/is-keyword? f) (= (form/keyword-value f) k)))
+
+(defn- seqable-form? [f [:ref :form/r]] :bool (form/is-list-like? f))
+
+;; ---- problem record ----
+
+(defn- problem [p :keyword fn-name [:ref :form/r] message :string] [:ref :kir.lower/problem]
+  (record-new [:ref :kir.lower/problem] p fn-name message))
+
+(defn- no-problem [] [:ref :kir.lower/problem]
+  (problem :ok (form/nil-form) ""))
+
+(defn problem-of [p [:ref :kir.lower/problem]] :keyword (record-get [:ref :kir.lower/problem] p :problem))
+(defn problem-function [p [:ref :kir.lower/problem]] [:ref :form/r] (record-get [:ref :kir.lower/problem] p :function))
+(defn problem-message [p [:ref :kir.lower/problem]] :string (record-get [:ref :kir.lower/problem] p :message))
+
+(defn problem-form
+  "{:problem KW :function NAME} as a Form, the diagnostic a refusal carries."
+  [p [:ref :kir.lower/problem]] [:ref :form/r]
+  (form/assoc-form (form/assoc-form (form/form-map (form/no-forms)) (kw :problem) (kw (problem-of p)))
+                   (kw :function) (problem-function p)))
+
+;; ---- core form shape: let takes ONE body form, if is ternary, do is non-empty ----
+
+(defn- first-shape-violation [xs [:list [:ref :form/r]] from :i64 step :i64] :keyword
+  (let [n (vector-count xs)]
+    (loop [i from]
+      (if (>= i n) :ok
+        (let [p (shape-violation (typed-list-nth [:list [:ref :form/r]] xs i))]
+          (if (= p :ok) (recur (+ i step)) p))))))
+
+(defn- let-shape-violation [args [:list [:ref :form/r]]] :keyword
+  (let [n (vector-count args)]
+    (if (not (= 1 (- n 1)))
+      :let-body-not-one-form
+      (let [bindings (typed-list-nth [:list [:ref :form/r]] args 0)
+            bp (if (seqable-form? bindings)
+                 (first-shape-violation (form/kids-of bindings) 1 2)
+                 :ok)]
+        (if (= bp :ok)
+          (shape-violation (typed-list-nth [:list [:ref :form/r]] args 1))
+          bp)))))
+
+(defn shape-violation
+  "The first core form in BODY whose shape the interpreter and the backends do
+  not take, as the host's `:rejected` keyword, or :ok. Depth-first in source
+  order, the binding vector stepped as binder/value pairs and never walked as a
+  form."
+  [body [:ref :form/r]] :keyword
+  (if (and (form/is-seq? body) (> (form/count-of body) 0))
+    (let [args (form/rest-list body)
+          n (vector-count args)]
+      (cond
+        (head-is? body "let") (if (= n 0) :let-body-not-one-form (let-shape-violation args))
+        (head-is? body "if") (if (not (= 3 n)) :if-not-ternary (first-shape-violation args 0 1))
+        (head-is? body "do") (if (= n 0) :do-empty (first-shape-violation args 0 1))
+        :else (first-shape-violation args 0 1)))
+    :ok))
+
+(defn- shape-message [p :keyword] :string
+  (cond
+    (= p :let-body-not-one-form) "let takes a binding vector and one body form"
+    (= p :if-not-ternary) "if takes exactly three parts: test, then, else"
+    :else "do takes at least one form"))
+
+;; ---- loop-helper self-calls outside tail position ----
+
+(defn- all-digits-from? [s :string i :i64 n :i64] :bool
+  (loop [i i]
+    (if (>= i n) true
+      (let [c (string-code-point-at s i)]
+        (if (and (>= c 48) (<= c 57)) (recur (inc i)) false)))))
+
+(defn loop-helper-name?
+  "True for a symbol named __kotoba_loop_<digits> (no namespace)."
+  [f [:ref :form/r]] :bool
+  (and (form/is-symbol? f)
+       (let [s (form/symbol-value f)
+             n (string-byte-length s)]
+         (and (> n 14)
+              (string=? (string-substring s 0 14) "__kotoba_loop_")
+              (all-digits-from? s 14 n)))))
+
+(defn- sum-off-tail [xs [:list [:ref :form/r]] from :i64 step :i64 fname [:ref :form/r] tail? :bool] :i64
+  (let [n (vector-count xs)]
+    (loop [i from acc 0]
+      (if (>= i n) acc
+        (recur (+ i step) (+ acc (off-tail (typed-list-nth [:list [:ref :form/r]] xs i) fname tail?)))))))
+
+(defn- off-tail [f [:ref :form/r] fname [:ref :form/r] tail? :bool] :i64
+  (if (and (form/is-seq? f) (> (form/count-of f) 0))
+    (let [args (form/rest-list f)
+          n (vector-count args)]
+      (cond
+        (head-is? f "let")
+        (let [bindings (form/nth-of f 1)
+              body (form/nth-of f 2)
+              bs (if (seqable-form? bindings) (sum-off-tail (form/kids-of bindings) 1 2 fname false) 0)]
+          (+ bs (off-tail body fname tail?)))
+
+        (head-is? f "if")
+        (+ (off-tail (form/nth-of f 1) fname false)
+           (+ (off-tail (form/nth-of f 2) fname tail?)
+              (off-tail (form/nth-of f 3) fname tail?)))
+
+        (head-is? f "do")
+        (if (= n 0) 0 (do-off-tail f fname tail?))
+
+        :else
+        (+ (if (and (form/is-symbol? (form/first-of f)) (form/eq (form/first-of f) fname) (not tail?)) 1 0)
+           (sum-off-tail (form/kids-of f) 1 1 fname false))))
+    0))
+
+;; `do` needs its last argument in tail position: sum the non-last arguments as
+;; non-tail and the last with the caller's flag. Split out of `off-tail` so the
+;; loop above stays a single expression.
+(defn- do-off-tail [f [:ref :form/r] fname [:ref :form/r] tail? :bool] :i64
+  (let [kids (form/kids-of f)
+        n (vector-count kids)]
+    (+ (sum-off-tail-upto kids 1 (- n 1) fname)
+       (off-tail (typed-list-nth [:list [:ref :form/r]] kids (- n 1)) fname tail?))))
+
+(defn- sum-off-tail-upto [xs [:list [:ref :form/r]] from :i64 to :i64 fname [:ref :form/r]] :i64
+  (loop [i from acc 0]
+    (if (>= i to) acc
+      (recur (inc i) (+ acc (off-tail (typed-list-nth [:list [:ref :form/r]] xs i) fname false))))))
+
+(defn loop-helper-off-tail-count
+  "Self-calls to FNAME in BODY that are not in tail position."
+  [fname [:ref :form/r] body [:ref :form/r]] :i64
+  (off-tail body fname true))
+
+;; ---- descriptor refinements ----
+
+(defn- param-count [function [:ref :form/r]] :i64
+  (form/count-of (fget function :params)))
+
+(defn- param-type-i64? [function [:ref :form/r] i :i64] :bool
+  (let [pt (fget function :param-types)]
+    (if (or (form/is-nil? pt) (and (form/is-bool? pt) (not (form/bool-value pt))))
+      (and (>= i 0) (< i (param-count function)))
+      (is-kw? (form/nth-of pt i) :i64))))
+
+(defn- indexes-shape-ok? [function [:ref :form/r] idx [:ref :form/r]] :bool
+  (and (form/is-vec? idx)
+       (let [xs (form/kids-of idx)
+             n (vector-count xs)]
+         (loop [i 0 prev -1]
+           (if (>= i n) true
+             (let [x (typed-list-nth [:list [:ref :form/r]] xs i)]
+               (if (and (form/is-int? x)
+                        (> (form/int-value x) prev)
+                        (>= (form/int-value x) 0)
+                        (< (form/int-value x) (param-count function))
+                        (param-type-i64? function (form/int-value x)))
+                 (recur (inc i) (form/int-value x))
+                 false)))))))
+
+(defn closure-param-indexes-ok? [function [:ref :form/r]] :bool
+  (or (not (fhas? function :closure-param-indexes))
+      (indexes-shape-ok? function (fget function :closure-param-indexes))))
+
+(defn- member-int? [idx [:ref :form/r] v :i64] :bool
+  (let [xs (form/kids-of idx)
+        n (vector-count xs)]
+    (loop [i 0]
+      (if (>= i n) false
+        (if (= v (form/int-value (typed-list-nth [:list [:ref :form/r]] xs i))) true (recur (inc i)))))))
+
+(defn- disjoint-from-closure? [function [:ref :form/r] idx [:ref :form/r]] :bool
+  (if (fhas? function :closure-param-indexes)
+    (let [closure (fget function :closure-param-indexes)
+          xs (form/kids-of idx)
+          n (vector-count xs)]
+      (loop [i 0]
+        (if (>= i n) true
+          (if (member-int? closure (form/int-value (typed-list-nth [:list [:ref :form/r]] xs i)))
+            false
+            (recur (inc i))))))
+    true))
+
+(defn pair-chain-param-indexes-ok? [function [:ref :form/r]] :bool
+  (or (not (fhas? function :i64-pair-chain-param-indexes))
+      (let [idx (fget function :i64-pair-chain-param-indexes)]
+        (and (indexes-shape-ok? function idx)
+             (disjoint-from-closure? function idx)))))
+
+(defn closure-result-ok? [function [:ref :form/r]] :bool
+  (or (not (fhas? function :closure-result?))
+      (and (form/is-true? (fget function :closure-result?))
+           (let [r (fget function :result)]
+             (or (form/is-nil? r) (is-kw? r :i64))))))
+
+(defn- descriptor-problem [function [:ref :form/r]] [:ref :kir.lower/problem]
+  (let [name (fget function :name)]
+    (cond
+      (not (closure-param-indexes-ok? function))
+      (problem :closure-param-indexes-malformed name "closure parameter indexes are malformed")
+      (not (pair-chain-param-indexes-ok? function))
+      (problem :i64-pair-chain-param-indexes-malformed name "i64 pair-chain parameter indexes are malformed")
+      (not (closure-result-ok? function))
+      (problem :closure-result-malformed name "closure result refinement is malformed")
+      :else (no-problem))))
+
+;; ---- the three passes over the functions, in the host's order ----
+
+(defn- functions-of [hir [:ref :form/r]] [:list [:ref :form/r]]
+  (form/kids-of (fget hir :functions)))
+
+(defn- shape-pass [fns [:list [:ref :form/r]] i :i64] [:ref :kir.lower/problem]
+  (if (>= i (vector-count fns)) (no-problem)
+    (let [f (typed-list-nth [:list [:ref :form/r]] fns i)
+          p (shape-violation (fget f :body))]
+      (if (= p :ok) (shape-pass fns (inc i))
+        (problem p (fget f :name) (shape-message p))))))
+
+(defn- loop-pass [fns [:list [:ref :form/r]] i :i64] [:ref :kir.lower/problem]
+  (if (>= i (vector-count fns)) (no-problem)
+    (let [f (typed-list-nth [:list [:ref :form/r]] fns i)
+          name (fget f :name)]
+      (if (and (loop-helper-name? name)
+               (> (loop-helper-off-tail-count name (fget f :body)) 0))
+        (problem :loop-helper-self-call-not-in-tail-position name
+                 "loop-helper self-call outside tail position")
+        (loop-pass fns (inc i))))))
+
+(defn- descriptor-pass [fns [:list [:ref :form/r]] i :i64] [:ref :kir.lower/problem]
+  (if (>= i (vector-count fns)) (no-problem)
+    (let [p (descriptor-problem (typed-list-nth [:list [:ref :form/r]] fns i))]
+      (if (= (problem-of p) :ok) (descriptor-pass fns (inc i)) p))))
+
+(defn lower-problem
+  "The first reason host `lower` refuses HIR (before it would run the
+  interpreter), as a problem record whose :problem is :ok when there is none.
+  Order: module envelope, core form shapes, loop-helper tails, descriptors."
+  [hir [:ref :form/r]] [:ref :kir.lower/problem]
+  (let [hp (hir/module-problem hir)]
+    (if (not (= hp :ok))
+      (problem hp (form/nil-form) (str "HIR rejected: " (keyword-name hp)))
+      (let [fns (functions-of hir)
+            sp (shape-pass fns 0)]
+        (if (not (= (problem-of sp) :ok)) sp
+          (let [lp (loop-pass fns 0)]
+            (if (not (= (problem-of lp) :ok)) lp
+              (descriptor-pass fns 0))))))))
+
+;; ---- kernel-native? and the oracle decision ----
+;;
+;; `kernel-operation?` is the union of kir.cljk's `lower` operation set and the
+;; private sets it unions in (checked-memory, atomic, system, uefi, rodata /
+;; image address, dot-f32, dequant-dot, extended-state). The list is
+;; test/kotoba/kir/kernel_operations.txt; the differential test lowers one
+;; module per name through the host and requires the same kernel-native
+;; verdict, so a set that drifts on the host fails there.
+
+(defn- kernel-op-group-0? [s :string] :bool
+  (or (string=? s "bytes-literal") (string=? s "guid") (string=? s "kernel-atomic-add-u32") (string=? s "kernel-atomic-add-u64") (string=? s "kernel-boot-info") (string=? s "kernel-cli") (string=? s "kernel-cmpxchg-u32") (string=? s "kernel-cmpxchg-u64") (string=? s "kernel-configure-double-fault-ist") (string=? s "kernel-configure-page-fault-recovery") (string=? s "kernel-cpuid-eax") (string=? s "kernel-cpuid-ebx") (string=? s "kernel-cpuid-ecx") (string=? s "kernel-cpuid-edx") (string=? s "kernel-dequant-dot-iq2-s") (string=? s "kernel-dequant-dot-iq3-s")))
+
+(defn- kernel-op-group-1? [s :string] :bool
+  (or (string=? s "kernel-dequant-dot-iq3-xxs") (string=? s "kernel-dequant-dot-iq4-xs") (string=? s "kernel-dequant-dot-ptq1-0") (string=? s "kernel-dequant-dot-q4-k") (string=? s "kernel-dequant-dot-q6-k") (string=? s "kernel-dequant-dot-q8-0") (string=? s "kernel-dot-f32") (string=? s "kernel-double-fault-handler-address") (string=? s "kernel-fence-full") (string=? s "kernel-fence-load") (string=? s "kernel-fence-store") (string=? s "kernel-function-address") (string=? s "kernel-hlt") (string=? s "kernel-in-u32") (string=? s "kernel-in-u8") (string=? s "kernel-invlpg")))
+
+(defn- kernel-op-group-2? [s :string] :bool
+  (or (string=? s "kernel-isr-entry-address") (string=? s "kernel-jump-to") (string=? s "kernel-load-gdt-tss") (string=? s "kernel-load-idt") (string=? s "kernel-load-ptr") (string=? s "kernel-load-u16") (string=? s "kernel-load-u16-16k") (string=? s "kernel-load-u16-4k") (string=? s "kernel-load-u16-64k") (string=? s "kernel-load-u32") (string=? s "kernel-load-u32-16k") (string=? s "kernel-load-u32-4k") (string=? s "kernel-load-u32-64k") (string=? s "kernel-load-u64") (string=? s "kernel-load-u64-16k") (string=? s "kernel-load-u64-4k")))
+
+(defn- kernel-op-group-3? [s :string] :bool
+  (or (string=? s "kernel-load-u64-64k") (string=? s "kernel-load-u8") (string=? s "kernel-load-u8-16k") (string=? s "kernel-load-u8-4k") (string=? s "kernel-load-u8-64k") (string=? s "kernel-out-u32") (string=? s "kernel-out-u8") (string=? s "kernel-page-fault-handler-address") (string=? s "kernel-page-fault-recovery-handler-address") (string=? s "kernel-pause") (string=? s "kernel-probe-double-fault") (string=? s "kernel-probe-guard-write") (string=? s "kernel-probe-nx-execute") (string=? s "kernel-probe-recoverable-guard-write") (string=? s "kernel-probe-text-write") (string=? s "kernel-rdtsc")))
+
+(defn- kernel-op-group-4? [s :string] :bool
+  (or (string=? s "kernel-rdtscp") (string=? s "kernel-read-cr0") (string=? s "kernel-read-cr2") (string=? s "kernel-read-cr3") (string=? s "kernel-read-cr4") (string=? s "kernel-read-cs") (string=? s "kernel-read-msr") (string=? s "kernel-rt-timer-handler-address") (string=? s "kernel-scratch-region") (string=? s "kernel-sti") (string=? s "kernel-store-u16") (string=? s "kernel-store-u16-16k") (string=? s "kernel-store-u16-4k") (string=? s "kernel-store-u16-64k") (string=? s "kernel-store-u32") (string=? s "kernel-store-u32-16k")))
+
+(defn- kernel-op-group-5? [s :string] :bool
+  (or (string=? s "kernel-store-u32-4k") (string=? s "kernel-store-u32-64k") (string=? s "kernel-store-u64") (string=? s "kernel-store-u64-16k") (string=? s "kernel-store-u64-4k") (string=? s "kernel-store-u64-64k") (string=? s "kernel-store-u8") (string=? s "kernel-store-u8-16k") (string=? s "kernel-store-u8-4k") (string=? s "kernel-store-u8-64k") (string=? s "kernel-subregion") (string=? s "kernel-swapgs") (string=? s "kernel-system-table") (string=? s "kernel-try-lock-u32") (string=? s "kernel-uefi-alloc-region") (string=? s "kernel-uefi-call2")))
+
+(defn- kernel-op-group-6? [s :string] :bool
+  (or (string=? s "kernel-uefi-call4") (string=? s "kernel-uefi-call6") (string=? s "kernel-undefined-opcode-handler-address") (string=? s "kernel-unlock-u32") (string=? s "kernel-write-cr0") (string=? s "kernel-write-cr3") (string=? s "kernel-write-cr4") (string=? s "kernel-write-msr") (string=? s "kernel-xchg-u32") (string=? s "kernel-xchg-u64") (string=? s "kernel-xgetbv") (string=? s "kernel-xsetbv") (string=? s "slice-load-u16") (string=? s "slice-load-u32") (string=? s "slice-load-u64") (string=? s "slice-load-u8")))
+
+(defn- kernel-op-group-7? [s :string] :bool
+  (or (string=? s "slice-store-u16") (string=? s "slice-store-u32") (string=? s "slice-store-u64") (string=? s "slice-store-u8") (string=? s "ucs2")))
+
+(defn kernel-operation? [s :string] :bool
+  (or (kernel-op-group-0? s) (kernel-op-group-1? s) (kernel-op-group-2? s) (kernel-op-group-3? s) (kernel-op-group-4? s) (kernel-op-group-5? s) (kernel-op-group-6? s) (kernel-op-group-7? s)))
+
+
+(defn- any-kernel-head? [xs [:list [:ref :form/r]] i :i64] :bool
+  (if (>= i (vector-count xs)) false
+    (if (kernel-native-form? (typed-list-nth [:list [:ref :form/r]] xs i))
+      true
+      (any-kernel-head? xs (inc i)))))
+
+(defn- kernel-native-form? [f [:ref :form/r]] :bool
+  (let [t (form/tag-of f)]
+    (if (and (>= t 6) (<= t 9))
+      (or (and (= t 6)
+               (> (form/count-of f) 0)
+               (form/is-symbol? (form/first-of f))
+               (kernel-operation? (form/symbol-value (form/first-of f))))
+          (any-kernel-head? (form/kids-of f) 0))
+      false)))
+
+(defn kernel-native?
+  "Some list form anywhere in the module's :functions is headed by a kernel /
+  memory / image-address operation (the host's `(tree-seq coll? seq ...)`)."
+  [hir [:ref :form/r]] :bool
+  (kernel-native-form? (fget hir :functions)))
+
+(defn- effects-pure-or-state? [effects [:ref :form/r]] :bool
+  (let [xs (form/kids-of effects)
+        n (vector-count xs)]
+    (loop [i 0]
+      (if (>= i n) true
+        (let [e (typed-list-nth [:list [:ref :form/r]] xs i)]
+          (if (or (is-kw? e :state) (is-kw? e :abort)) (recur (inc i)) false))))))
+
+(defn oracle-wanted?
+  "Host `lower` seals an oracle exactly when the module has an entry whose
+  result is :i64 or :bool, every effect is :state or :abort, and it is not
+  kernel-native. Sealing runs the interpreter, which has no native port yet."
+  [hir [:ref :form/r]] :bool
+  (and (not (form/is-nil? (fget hir :entry)))
+       (let [r (fget hir :result)] (or (is-kw? r :i64) (is-kw? r :bool)))
+       (effects-pure-or-state? (fget hir :effects))
+       (not (kernel-native? hir))))
+
+;; ---- assembly of the KIR module ----
+
+(defn- key-kept? [k [:ref :form/r] typed? :bool] :bool
+  (or (is-kw? k :name) (is-kw? k :params) (is-kw? k :result) (is-kw? k :effects) (is-kw? k :body)
+      (and typed? (is-kw? k :param-types))
+      (is-kw? k :closure-param-indexes)
+      (is-kw? k :i64-pair-chain-param-indexes)
+      (is-kw? k :closure-result?)))
+
+(defn- select-function [f [:ref :form/r] typed? :bool] [:ref :form/r]
+  (let [kids (form/kids-of f)
+        n (vector-count kids)]
+    (form/form-map
+     (loop [j 0 acc (form/no-forms)]
+       (if (>= (+ j 1) n) acc
+         (let [k (typed-list-nth [:list [:ref :form/r]] kids j)]
+           (recur (+ j 2)
+                  (if (key-kept? k typed?)
+                    (form/append-form (form/append-form acc k) (typed-list-nth [:list [:ref :form/r]] kids (+ j 1)))
+                    acc))))))))
+
+(defn- select-functions [fns [:list [:ref :form/r]] typed? :bool] [:list [:ref :form/r]]
+  (let [n (vector-count fns)]
+    (loop [i 0 acc (form/no-forms)]
+      (if (>= i n) acc
+        (recur (inc i) (form/append-form acc (select-function (typed-list-nth [:list [:ref :form/r]] fns i) typed?)))))))
+
+(defn- put [m [:ref :form/r] k :keyword v [:ref :form/r]] [:ref :form/r]
+  (form/assoc-form m (kw k) v))
+
+(defn lower-base
+  "The KIR module host `lower` builds before sealing: the HIR's entry, exports,
+  schemas, effects and selected function keys, `:oracle-value` nil and
+  `:blocks` []. Only meaningful when `lower-problem` answers :ok."
+  [hir [:ref :form/r]] [:ref :form/r]
+  (let [typed? (is-kw? (fget hir :format) :kotoba.hir/v3)
+        entry (fget hir :entry)
+        empty-map (form/form-map (form/no-forms))
+        signature (if (form/is-nil? entry)
+                    (form/nil-form)
+                    (put (put empty-map :params (form/form-vec (form/no-forms))) :result (fget hir :result)))
+        m0 (put empty-map :format (kw (if typed? :kotoba.kir/v4 :kotoba.kir/v3)))
+        m1 (put m0 :entry entry)
+        m2 (put m1 :exports (fget hir :exports))
+        m3 (put m2 :schemas (fget hir :schemas))
+        m4 (put m3 :schema-identities (fget hir :schema-identities))
+        m5 (put m4 :signature signature)
+        m6 (put m5 :effects (fget hir :effects))
+        m7 (put m6 :functions (form/form-vec (select-functions (functions-of hir) typed?)))
+        m8 (put m7 :oracle-value (form/nil-form))]
+    (put m8 :blocks (form/form-vec (form/no-forms)))))

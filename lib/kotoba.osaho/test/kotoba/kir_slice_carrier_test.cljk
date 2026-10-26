@@ -1,0 +1,152 @@
+(ns kotoba.kir-slice-carrier-test
+  "slice-value: the two things this oracle owes the ADR 0285 carrier.
+
+  The first is the SEMANTICS of a carried traversal, executed rather than
+  read: a sum over a real `:memory` image, and the trap at the first index
+  outside. The machine operations are the same ones the window family uses, so
+  what is checked here is specifically the element scaling and the single
+  unsigned compare that is the whole per-element cost of the carrier.
+
+  The second is a NAMED refusal. `[:slice T]` is a type kotoba-sema's source
+  syntax admits and erases before HIR (kotoba-sema ADR 0009). It is two
+  machine words, so nothing here can carry it -- but `native-word-value-type?`
+  would have refused it the way it refuses `[:banana :u8]`, by absence, and a
+  caller reporting that refusal would print a paragraph about typed values
+  that never mentions the slice. So the refusal is written down."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.kir :as kir]))
+
+(defn- module [params body]
+  {:format :kotoba.kir/v4
+   :entry 'main
+   :effects #{}
+   :functions [{:name 'main :params params
+                :param-types (vec (repeat (count params) :i64))
+                :result :i64 :effects #{} :body body}]})
+
+(defn- image [base bytes] {:base base :bytes (volatile! bytes)})
+
+(defn- trapped [thunk]
+  (try (thunk) nil
+       (catch :default e (ex-data e))))
+
+(defn- w [x] #?(:clj x :cljs (js/Number x)))
+
+;; The shape kotoba-sema's `erase-slice-values` emits for
+;;
+;;   (defn- sum [s [:slice :u8] index :i64 total :i64] ...)
+;;
+;; -- the slice parameter as its two halves, and the element access as the
+;; machine operation. Written out here rather than imported, because this
+;; repository is the oracle the frontend is checked AGAINST and must not take
+;; its answer from it.
+(def ^:private sum-bytes
+  {:format :kotoba.kir/v4
+   :entry 'main
+   :effects #{}
+   :functions
+   [{:name 'sum :params '[base length index total]
+     :param-types [:i64 :i64 :i64 :i64] :result :i64 :effects #{}
+     :body '(if (< index length)
+              (sum base length (+ index 1)
+                   (+ total (slice-load-u8 base length index)))
+              total)}
+    {:name 'main :params '[base length]
+     :param-types [:i64 :i64] :result :i64 :effects #{}
+     :body '(sum base length 0 0)}]})
+
+(deftest a-carried-traversal-sums-what-the-image-holds
+  (let [mem (image 4096 [1 2 3 4 5 6 7 8])]
+    (is (= 36 (w (kir/execute sum-bytes 'main [4096 8] {:memory mem})))
+        "1..8 summed one element at a time through the carrier's lowering")
+    (is (= 6 (w (kir/execute sum-bytes 'main [4096 3] {:memory mem})))
+        "and a shorter length reads fewer elements, not the same ones")
+    (is (= 0 (w (kir/execute sum-bytes 'main [4096 0] {:memory mem})))
+        "an empty slice reads nothing at all")))
+
+(deftest a-slice-load-traps-at-index-equal-to-length
+  ;; The single unsigned compare. `index == length` is the FIRST index
+  ;; outside, and the reason literal is pinned: a trap for some other reason
+  ;; -- a null base, a misaligned one, a length above the ceiling -- would
+  ;; otherwise count as this assertion passing.
+  (let [mem (image 4096 [1 2 3 4])
+        module (module '[base length index] '(slice-load-u8 base length index))
+        data (trapped #(kir/execute module 'main [4096 4 4] {:memory mem}))]
+    (is (= :kernel-memory-fault (:trap data)))
+    (is (= :index-outside-slice (:check data)))
+    (is (= 'slice-load-u8 (:operation data)))
+    (testing "and the index one below it does not trap"
+      (is (= 4 (w (kir/execute module 'main [4096 4 3] {:memory mem}))))))
+  (testing "at every element width, where length counts ELEMENTS"
+    (doseq [[op length] '[[slice-load-u8 8] [slice-load-u16 4]
+                          [slice-load-u32 2] [slice-load-u64 1]]]
+      (let [mem (image 4096 [1 2 3 4 5 6 7 8])
+            module (module '[base length index] (list op 'base 'length 'index))
+            data (trapped #(kir/execute module 'main [4096 length length]
+                                        {:memory mem}))]
+        (is (= :index-outside-slice (:check data)) (str op))
+        (is (= op (:operation data)) (str op))
+        (is (some? (kir/execute module 'main [4096 length (dec length)]
+                                {:memory mem}))
+            (str op " must still read its last element"))))))
+
+(deftest a-narrowed-slice-traps-on-its-own-length-not-the-parents
+  ;; `slice-sub` erases into `kernel-subregion` plus a new length. The point of
+  ;; the narrowing is that the shorter length is what the trap uses, so an
+  ;; index the PARENT would have admitted must still trap.
+  (let [mem (image 4096 [1 2 3 4 5 6 7 8])
+        narrowed (module '[base length offset count index]
+                         '(slice-load-u8 (kernel-subregion base length offset count)
+                                         count index))]
+    (is (= 4 (w (kir/execute narrowed 'main [4096 8 2 3 1] {:memory mem})))
+        "element 1 of the three elements starting at 2 is the image's byte 3")
+    (let [data (trapped #(kir/execute narrowed 'main [4096 8 2 3 3] {:memory mem}))]
+      (is (= :index-outside-slice (:check data))
+          "index 3 is inside the parent's 8 and outside the narrowing's 3"))
+    (let [data (trapped #(kir/execute narrowed 'main [4096 8 7 3 0] {:memory mem}))]
+      (is (= :subwindow-outside-window (:check data))
+          "and a narrowing that does not fit its parent traps before any load"))))
+
+;; ── the named refusal ───────────────────────────────────────────────────────
+
+(deftest a-slice-type-is-not-a-native-boundary-type-and-says-why
+  (doseq [element [:u8 :u16 :u32 :u64 :f32]]
+    (let [type [:slice element]]
+      (is (= :kotoba.error/slice-not-a-native-boundary-type
+             (kir/native-boundary-type-refusal type))
+          (str type))))
+  (testing "a type refused by absence has no named reason, which is the default"
+    (is (nil? (kir/native-boundary-type-refusal :i64)))
+    (is (nil? (kir/native-boundary-type-refusal [:option :i64])))
+    (is (nil? (kir/native-boundary-type-refusal [:banana :u8]))))
+  (testing "and the refusal is real: the admission gate rejects the module"
+    (let [hir {:format :kotoba.hir/v3
+               :entry 'main :exports ['main] :effects #{}
+               :functions [{:name 'p :params '[s index]
+                            :param-types [[:slice :u8] :i64]
+                            :result :i64 :effects #{}
+                            :body '(slice-load-u8 s 8 index)}
+                           {:name 'main :params [] :param-types []
+                            :result :i64 :effects #{} :body 0}]}]
+      (is (false? (kir/only-native-word-typed-features? hir)))
+      (is (= [{:function 'p :type [:slice :u8]
+               :reason :kotoba.error/slice-not-a-native-boundary-type}]
+             (kir/native-unadmitted-boundary-types hir)))
+      (testing "and the same module with the type erased is admitted"
+        (let [erased (update-in hir [:functions 0]
+                                #(assoc % :params '[base index]
+                                          :param-types [:i64 :i64]
+                                          :body '(slice-load-u8 base 8 index)))]
+          (is (true? (kir/only-native-word-typed-features? erased)))
+          (is (= [] (kir/native-unadmitted-boundary-types erased))))))))
+
+(deftest a-slice-result-is-refused-too
+  (let [hir {:format :kotoba.hir/v3
+             :entry 'main :exports ['main] :effects #{}
+             :functions [{:name 'p :params '[base] :param-types [:i64]
+                          :result [:slice :u8] :effects #{} :body 'base}
+                         {:name 'main :params [] :param-types []
+                          :result :i64 :effects #{} :body 0}]}]
+    (is (= [{:function 'p :type [:slice :u8]
+             :reason :kotoba.error/slice-not-a-native-boundary-type}]
+           (kir/native-unadmitted-boundary-types hir)))))
