@@ -224,6 +224,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.hpke` | `org.ietf.hpke/src` | `hpke.core`, `hpke.dhkem`, `hpke.kdf` (an external specification, publisher ietf.org) |
 | `org.ietf.srtp` | `org.ietf.srtp/src` | `srtp.aes-cm`, `srtp.index`, `srtp.kdf`, `srtp.packet` (an external specification, publisher ietf.org) |
 | `org.ietf.tls` | `org.ietf.tls/src` | `tls.alert`, `tls.cert`, `tls.client`, `tls.codec` (an external specification, publisher ietf.org) |
+| `kotoba.kotodamaHost` | `kotoba.kotodamaHost/src` | `kotodama.host-cadence`, `kotodama.host-contract`, `kotodama.host-effects`, `kotodama.host-export` (Kotoba project library) |
 | `kotoba.libp2p` | `kotoba.libp2p/src` | `` (Kotoba project library) |
 | `kotoba.kotobaTopology` | `kotoba.kotobaTopology/src` | `` (Kotoba project library) |
 | `kotoba.kotobaseSdk` | `kotoba.kotobaseSdk/src` | `` (Kotoba project library) |
