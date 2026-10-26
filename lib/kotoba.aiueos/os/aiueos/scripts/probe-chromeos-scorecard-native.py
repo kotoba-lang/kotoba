@@ -70,11 +70,17 @@ EXPECTED_LEDGER = (
 )
 
 
-def admitted_subset(card):
+def admitted_subset(card, keep=None):
     """Demote only current pass rows without complete native admission."""
+    if keep is not None and keep not in UNVERIFIED_ROWS:
+        raise ValueError(f'unknown diagnostic row: {keep}')
     for row_id in UNVERIFIED_ROWS:
         pattern = (rb'(\{:id :' + row_id.encode() +
                    rb'\s(?:(?!\n  \{:id).)*?:status ):pass(?=\s+:qemu-progress)')
+        if row_id == keep:
+            if len(re.findall(pattern, card, flags=re.S)) != 1:
+                raise ValueError(f'unverified row anchor changed: {row_id}')
+            continue
         card, count = re.subn(pattern, rb'\1:unachieved', card,
                               count=1, flags=re.S)
         if count != 1:
@@ -191,8 +197,9 @@ def main():
         raise ValueError('native output has an undeclared dylib dependency')
 
     observations = {}
+    row_controls = tuple(f'row-unadmitted-{row_id}' for row_id in UNVERIFIED_ROWS)
     for name in ('positive', 'canonical-refusal', *NEGATIVES,
-                 *RECEIPT_NEGATIVES):
+                 *RECEIPT_NEGATIVES, *row_controls):
         directory = output / name
         directory.mkdir(mode=0o700)
         target_receipts = directory/'os/aiueos/qualification/receipts'
@@ -203,6 +210,9 @@ def main():
             expected_exit, expected_stdout = 0, EXPECTED_LEDGER
         elif name == 'canonical-refusal':
             data = canonical_card
+            expected_exit, expected_stdout = 1, b'AIUEOS_SCORE -1\n'
+        elif name in row_controls:
+            data = admitted_subset(canonical_card, keep=name.rsplit('-', 1)[1])
             expected_exit, expected_stdout = 1, b'AIUEOS_SCORE -1\n'
         elif name in NEGATIVES:
             before, after = NEGATIVES[name]
