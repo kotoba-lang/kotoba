@@ -4,9 +4,11 @@
 This is a schema/point-ledger probe with native qualification-release RSA
 verification, referenced serial-log digest checks, and tagged-receipt row
 binding. The A2/I3 admitted anchors require their exact receipt paths and
-row tags, with source-pinned SHA-256 for the exact receipt bytes. Other
-legacy receipts remain unbound. It does not
-qualify other evidence, freshness, or hardware.
+row tags, with source-pinned SHA-256 for the exact receipt bytes. A5 and the
+other pending rows remain refused even if a diagnostic input supplies a
+self-asserted serial digest and a signed-release reference. Other legacy
+receipts remain unbound. It does not qualify other evidence, freshness,
+or hardware.
 """
 
 import argparse
@@ -67,6 +69,8 @@ A2_RECEIPT = Path(
     'os/aiueos/qualification/receipts/vm-20261026/a2-display-change/receipt.edn')
 I2_RECEIPT = Path(
     'os/aiueos/qualification/receipts/vm-20261026/i2-battery-power-management/receipt.edn')
+A5_RECEIPT = Path(
+    'os/aiueos/qualification/receipts/vm-20261025/a5-first-run-setup/receipt.edn')
 # I2 has synthetic battery input and separate sleep-run evidence. The
 # remaining rows also lack evidence this native core can fully admit.
 UNVERIFIED_ROWS = ('A5', 'C9', 'F2', 'G1', 'G3', 'G5', 'H1', 'H2',
@@ -215,6 +219,7 @@ def main():
     row_controls = tuple(f'row-unadmitted-{row_id}' for row_id in UNVERIFIED_ROWS)
     for name in ('positive', 'canonical-refusal', *NEGATIVES,
                  'i2-synthetic-with-bound-log',
+                 'a5-forged-serial-and-release',
                  *RECEIPT_NEGATIVES, *row_controls):
         directory = output / name
         directory.mkdir(mode=0o700)
@@ -238,6 +243,27 @@ def main():
                 raise ValueError('I2 synthetic evidence anchor missing')
             target.write_bytes(receipt_bytes.replace(
                 anchor, anchor + b'\n :serial-sha256 "'
+                + hashlib.sha256(serial.read_bytes()).hexdigest().encode()
+                + b'"', 1))
+        elif name == 'a5-forged-serial-and-release':
+            data = admitted_subset(canonical_card, keep='A5')
+            anchor = b'"receipt ' + str(A5_RECEIPT).encode() + b'"'
+            release = b'"receipt ' + str(SIGNED_RELEASE_RECEIPT).encode() + b'"'
+            if data.count(anchor) != 1:
+                raise ValueError('A5 scorecard receipt anchor missing')
+            data = data.replace(anchor, anchor + b' ' + release, 1)
+            expected_exit, expected_stdout = 1, b'AIUEOS_SCORE -1\n'
+            target = directory/A5_RECEIPT
+            serial = target.with_name('kernel-serial.log')
+            serial.write_bytes(
+                b'AIUEOS_SETUP_APPLIED name=aiueos-gate device=dev-001 account=acct-link-77\n'
+                b'AIUEOS_SETUP_LOADED name=aiueos-gate device=dev-001 account=acct-link-77\n')
+            receipt_bytes = target.read_bytes()
+            receipt_commit = b':commit "7bcfbd73a0984b8c0af90c5e11bd7245dbc1042d"'
+            if receipt_bytes.count(receipt_commit) != 1:
+                raise ValueError('A5 receipt commit anchor missing')
+            target.write_bytes(receipt_bytes.replace(
+                receipt_commit, receipt_commit + b'\n :serial-sha256 "'
                 + hashlib.sha256(serial.read_bytes()).hexdigest().encode()
                 + b'"', 1))
         elif name in row_controls:
@@ -400,6 +426,7 @@ def main():
               'admittedA2I3ReceiptAnchorsVerified': True,
               'admittedA2I3ReceiptDigestsVerified': True,
               'syntheticI2RefusedWithBoundSerialLog': True,
+              'pendingRowsRequireExplicitNativeAdmission': True,
               'legacyUntaggedReceiptRowBindingVerified': False,
               'referencedReceiptSerialDigestsVerified': True,
               'signedReleaseReceiptFileDigestsVerified': True,
