@@ -52,6 +52,8 @@ SIGNED_RELEASE_SIGNATURE = SIGNED_RELEASE_RECEIPT.with_name(
     'aiueos-x86_64-build-receipt.sig')
 I3_RECEIPT = Path(
     'os/aiueos/qualification/receipts/vm-20261026/i3-display-scaling-external/receipt.edn')
+# A4 lacks the linked signed-release receipt; I2 lacks admitted serial
+# evidence. The remaining rows also lack evidence this native core can admit.
 UNVERIFIED_ROWS = ('A4', 'A5', 'C9', 'F2', 'G1', 'G3', 'G5', 'H1', 'H2',
                    'H3', 'I2', 'I6')
 EXPECTED_LEDGER = (
@@ -69,7 +71,7 @@ EXPECTED_LEDGER = (
 
 
 def admitted_subset(card):
-    """Demote only rows whose new pass receipts lack native-checkable logs."""
+    """Demote only current pass rows without complete native admission."""
     for row_id in UNVERIFIED_ROWS:
         pattern = (rb'(\{:id :' + row_id.encode() +
                    rb'\s(?:(?!\n  \{:id).)*?:status ):pass(?=\s+:qemu-progress)')
