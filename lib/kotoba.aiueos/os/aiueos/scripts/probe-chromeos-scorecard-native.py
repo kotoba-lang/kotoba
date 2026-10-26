@@ -63,6 +63,8 @@ I3_RECEIPT = Path(
     'os/aiueos/qualification/receipts/vm-20261026/i3-display-scaling-external/receipt.edn')
 A2_RECEIPT = Path(
     'os/aiueos/qualification/receipts/vm-20261026/a2-display-change/receipt.edn')
+I2_RECEIPT = Path(
+    'os/aiueos/qualification/receipts/vm-20261026/i2-battery-power-management/receipt.edn')
 # I2 has synthetic battery input and separate sleep-run evidence. The
 # remaining rows also lack evidence this native core can fully admit.
 UNVERIFIED_ROWS = ('A5', 'C9', 'F2', 'G1', 'G3', 'G5', 'H1', 'H2',
@@ -210,6 +212,7 @@ def main():
     observations = {}
     row_controls = tuple(f'row-unadmitted-{row_id}' for row_id in UNVERIFIED_ROWS)
     for name in ('positive', 'canonical-refusal', *NEGATIVES,
+                 'i2-synthetic-with-bound-log',
                  *RECEIPT_NEGATIVES, *row_controls):
         directory = output / name
         directory.mkdir(mode=0o700)
@@ -222,6 +225,19 @@ def main():
         elif name == 'canonical-refusal':
             data = canonical_card
             expected_exit, expected_stdout = 1, b'AIUEOS_SCORE -1\n'
+        elif name == 'i2-synthetic-with-bound-log':
+            data = admitted_subset(canonical_card, keep='I2')
+            expected_exit, expected_stdout = 1, b'AIUEOS_SCORE -1\n'
+            target = directory/I2_RECEIPT
+            serial = target.with_name('kernel-serial.log')
+            receipt_bytes = target.read_bytes()
+            anchor = b':commit "134146345189990190ee18573f593ba7968b1d72"'
+            if receipt_bytes.count(anchor) != 1 or not serial.is_file():
+                raise ValueError('I2 synthetic evidence anchor missing')
+            target.write_bytes(receipt_bytes.replace(
+                anchor, anchor + b'\n :serial-sha256 "'
+                + hashlib.sha256(serial.read_bytes()).hexdigest().encode()
+                + b'"', 1))
         elif name in row_controls:
             data = admitted_subset(canonical_card, keep=name.rsplit('-', 1)[1])
             expected_exit, expected_stdout = 1, b'AIUEOS_SCORE -1\n'
@@ -371,6 +387,7 @@ def main():
               'receiptFieldsVerified': True, 'evidenceArtifactsVerified': False,
               'taggedReceiptRowBindingVerified': True,
               'admittedA2I3ReceiptAnchorsVerified': True,
+              'syntheticI2RefusedWithBoundSerialLog': True,
               'legacyUntaggedReceiptRowBindingVerified': False,
               'referencedReceiptSerialDigestsVerified': True,
               'signedReleaseReceiptFileDigestsVerified': True,
