@@ -1,0 +1,287 @@
+(ns mls.message-test
+  "Message protection against the working group's corpus — the framing layer,
+  end to end, on all seven suites.
+
+  The corpus gives, for each of a proposal, a commit and an application
+  message: the raw content, a `PublicMessage` and a `PrivateMessage` produced
+  by another implementation. So both directions are exercised against someone
+  else's bytes: **unprotect what they protected**, and then protect the same
+  content and unprotect it again.
+
+  Only the second half of that is a round-trip. The first is the real check,
+  and the two are labelled apart.
+
+  **Suites 4 and 6 sign with Ed448, which this workspace does not have.** They
+  are not skipped: their messages are still decoded and their content codecs
+  still checked, and the signature step is asserted to refuse **by name**. A
+  skipped suite and a passing one look identical in a summary line."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [mls.framing :as fr]
+            [mls.message :as msg]
+            [mls.proposal :as prop]
+            [mls.result :as r]
+            [mls.suite :as suite]
+            [mls.vectors :as vec-]
+            [ecc.bignum :as bn]
+            [mls.varint]))
+
+(defn- unhex [s]
+  (mapv #(#?(:clj Integer/parseInt :cljs js/parseInt) (apply str %) 16) (partition 2 s)))
+
+(defn- hex [bs]
+  (apply str (map (fn [b] (let [b (bit-and (int b) 0xFF)
+                                s #?(:clj (Integer/toString b 16) :cljs (.toString b 16))]
+                            (if (= 1 (count s)) (str "0" s) s)))
+                  bs)))
+
+(def ^:private sender-leaf
+  "The corpus says: in all of these tests, the member with LeafIndex 1 is the
+  sender, in a group of two."
+  1)
+(def ^:private n-leaves 2)
+
+(defn- signs? [s] (not= :ed448 (:signature s)))
+
+(defn- ctx-of [{:keys [cipher-suite group-id epoch tree-hash confirmed-transcript-hash]}]
+  {:cipher-suite cipher-suite
+   :group-id (unhex group-id)
+   :epoch epoch
+   :tree-hash (unhex tree-hash)
+   :confirmed-transcript-hash (unhex confirmed-transcript-hash)
+   :extensions []})
+
+(deftest the-corpus-is-whole
+  (is (= 7 (count vec-/message-protection)))
+  (is (= [1 2 3 4 5 6 7] (mapv :cipher-suite vec-/message-protection)))
+  (doseq [e vec-/message-protection]
+    (doseq [k [:proposal :proposal-pub :proposal-priv
+               :commit :commit-pub :commit-priv
+               :application :application-priv]]
+      (is (seq (get e k)) (str "suite " (:cipher-suite e) " has " (name k))))))
+
+;; ── the content codecs, which framing cannot work without ───────────────────
+
+(deftest proposals-and-commits-round-trip-to-the-published-bytes
+  ;; FramedContent embeds these with NO length prefix, so a reader that cannot
+  ;; say where a Commit ends cannot say where the signature after it begins.
+  ;; This is why mls.proposal exists.
+  (doseq [{:keys [cipher-suite proposal commit]} vec-/message-protection]
+    (testing (str "suite " cipher-suite)
+      (let [pb (unhex proposal)
+            p (prop/decode-proposal pb 0)]
+        (is (r/ok? p) (pr-str (r/err p)))
+        (let [[parsed next-] (r/val p)]
+          (is (= (count pb) next-) "the whole proposal and nothing after it")
+          (is (= proposal (hex (r/val (prop/encode-proposal parsed)))))))
+      (let [cb (unhex commit)
+            c (prop/decode-commit cb 0)]
+        (is (r/ok? c) (pr-str (r/err c)))
+        (let [[parsed next-] (r/val c)]
+          (is (= (count cb) next-) "the whole commit")
+          (is (= commit (hex (r/val (prop/encode-commit parsed))))))))))
+
+;; ── unprotecting what another implementation protected ──────────────────────
+
+(defn- expect-content
+  "Either the content came back and matches, or the suite cannot verify a
+  signature and said which scheme it was missing. Written once, because the
+  branch is the same for every message shape and repeating it four times is
+  four chances to write `is` without an assertion in one of them."
+  [s got raw]
+  (if-not (signs? s)
+    (is (= :unimplemented-signature-scheme (r/reason got))
+        "Ed448: framed, MAC'd or decrypted, and refused at the signature")
+    (do
+      (is (r/ok? got) (pr-str (r/err got)))
+      (when (r/ok? got)
+        (let [fc (:mls/framed-content (r/val got))]
+          (is (= sender-leaf (:index (:sender fc))))
+          (is (= raw (hex (r/val (#'fr/encode-content (:content-type fc)
+                                                      (:content fc)))))))))))
+
+(deftest this-unprotects-what-the-working-group-protected
+  (doseq [{:keys [cipher-suite membership-key signature-pub encryption-secret
+                  sender-data-secret proposal proposal-pub proposal-priv
+                  commit commit-pub commit-priv application application-priv]
+           :as e} vec-/message-protection]
+    (testing (str "suite " cipher-suite)
+      (let [s (get suite/suites cipher-suite)
+            ctx (ctx-of e)
+            pub (fn [wire raw]
+                  (expect-content s (msg/unprotect-public
+                                     s {:message (unhex wire) :group-context ctx
+                                        :membership-key (unhex membership-key)
+                                        :signature-public-key (unhex signature-pub)})
+                                  raw))
+            priv (fn [wire raw]
+                   (expect-content s (msg/unprotect-private
+                                      s {:message (unhex wire) :group-context ctx
+                                         :encryption-secret (unhex encryption-secret)
+                                         :n-leaves n-leaves
+                                         :sender-data-secret (unhex sender-data-secret)
+                                         :signature-public-key (unhex signature-pub)})
+                                   raw))]
+        (testing "proposal" (pub proposal-pub proposal) (priv proposal-priv proposal))
+        (testing "commit" (pub commit-pub commit) (priv commit-priv commit))
+        (testing "application"
+          ;; The application content is opaque<V>, so the ENCODED form carries
+          ;; a length prefix the raw value does not -- which is why this one
+          ;; compares the content directly rather than through the codec.
+          (let [got (msg/unprotect-private
+                     s {:message (unhex application-priv) :group-context ctx
+                        :encryption-secret (unhex encryption-secret)
+                        :n-leaves n-leaves
+                        :sender-data-secret (unhex sender-data-secret)
+                        :signature-public-key (unhex signature-pub)})]
+            (if-not (signs? s)
+              (is (= :unimplemented-signature-scheme (r/reason got)))
+              (do
+                (is (r/ok? got) (pr-str (r/err got)))
+                (when (r/ok? got)
+                  (is (= application
+                         (hex (:content (:mls/framed-content (r/val got)))))))))))))))
+
+;; ── and protects its own, which unprotects again ────────────────────────────
+
+(def ^:private nonce (bn/of-dec "5678901234567890123456789012345678901"))
+
+(deftest what-this-protects-it-can-unprotect
+  (doseq [{:keys [cipher-suite membership-key signature-priv signature-pub
+                  encryption-secret sender-data-secret proposal application]
+           :as e} vec-/message-protection]
+    (testing (str "suite " cipher-suite)
+      (let [s (get suite/suites cipher-suite)
+            ctx (ctx-of e)
+            prop- (first (r/val (prop/decode-proposal (unhex proposal) 0)))
+            fc {:group-id (:group-id ctx) :epoch (:epoch ctx)
+                :sender {:type :member :index sender-leaf}
+                :authenticated-data []
+                :content-type :proposal :content prop-}
+            made-pub (msg/protect-public s {:framed-content fc :group-context ctx
+                                            :signature-key (unhex signature-priv)
+                                            :membership-key (unhex membership-key)
+                                            :signature-nonce nonce})
+            made-priv (msg/protect-private
+                       s {:framed-content fc :group-context ctx
+                          :signature-key (unhex signature-priv) :signature-nonce nonce
+                          :encryption-secret (unhex encryption-secret) :n-leaves n-leaves
+                          :generation 3 :reuse-guard [1 2 3 4]
+                          :sender-data-secret (unhex sender-data-secret)
+                          :padding-length 7})]
+
+        (if-not (signs? s)
+          (testing "Ed448 refuses to protect rather than framing something unsigned"
+            (is (= :unimplemented-signature-scheme (r/reason made-pub)))
+            (is (= :unimplemented-signature-scheme (r/reason made-priv))))
+
+          (do
+            (testing "as a PublicMessage"
+              (is (r/ok? made-pub) (pr-str (r/err made-pub)))
+              (is (r/ok? (msg/unprotect-public
+                          s {:message (r/val made-pub) :group-context ctx
+                             :membership-key (unhex membership-key)
+                             :signature-public-key (unhex signature-pub)}))))
+
+            (testing "as a PrivateMessage"
+              (is (r/ok? made-priv) (pr-str (r/err made-priv)))
+              (let [got (msg/unprotect-private
+                         s {:message (r/val made-priv) :group-context ctx
+                            :encryption-secret (unhex encryption-secret) :n-leaves n-leaves
+                            :sender-data-secret (unhex sender-data-secret)
+                            :signature-public-key (unhex signature-pub)})]
+                (is (r/ok? got) (pr-str (r/err got)))
+                (when (r/ok? got)
+                  (is (= prop- (:content (:mls/framed-content (r/val got)))))
+                  (is (= 3 (:generation (:mls/sender-data (r/val got)))))
+                  (is (= [1 2 3 4] (:reuse-guard (:mls/sender-data (r/val got)))))
+                  (is (= 7 (:mls/padding-length (r/val got)))))))))
+
+        (testing "and application data may not be a PublicMessage, whatever the suite"
+          ;; §6.1. Checked BEFORE the signature, so it holds for Ed448 too --
+          ;; a refusal that depended on being able to sign would be no rule
+          ;; at all for the suites that cannot.
+          (is (= :application-data-must-be-private
+                 (r/reason (msg/protect-public
+                            s {:framed-content (assoc fc :content-type :application
+                                                      :content (unhex application))
+                               :group-context ctx
+                               :signature-key (unhex signature-priv)
+                               :membership-key (unhex membership-key)
+                               :signature-nonce nonce})))))))))
+
+;; ── the checks that make it authentication and not decoration ───────────────
+
+(deftest a-tampered-membership-tag-is-refused
+  (let [{:keys [cipher-suite membership-key signature-pub proposal-pub] :as e}
+        (first vec-/message-protection)
+        s (get suite/suites cipher-suite)
+        ctx (ctx-of e)]
+    (is (r/ok? (msg/unprotect-public s {:message (unhex proposal-pub) :group-context ctx
+                                        :membership-key (unhex membership-key)
+                                        :signature-public-key (unhex signature-pub)})))
+    (testing "a wrong membership key"
+      (is (= :membership-tag-mismatch
+             (r/reason (msg/unprotect-public
+                        s {:message (unhex proposal-pub) :group-context ctx
+                           :membership-key (vec (repeat (:nh s) 0))
+                           :signature-public-key (unhex signature-pub)})))))
+    (testing "a wrong group context -- the tag covers it"
+      (is (= :membership-tag-mismatch
+             (r/reason (msg/unprotect-public
+                        s {:message (unhex proposal-pub)
+                           :group-context (assoc ctx :epoch (inc (:epoch ctx)))
+                           :membership-key (unhex membership-key)
+                           :signature-public-key (unhex signature-pub)})))))
+    (testing "a wrong signature key -- past the tag, and still refused"
+      (is (r/error? (msg/unprotect-public
+                     s {:message (unhex proposal-pub) :group-context ctx
+                        :membership-key (unhex membership-key)
+                        :signature-public-key (unhex (:signature-pub
+                                                      (second vec-/message-protection)))}))))))
+
+(deftest a-private-message-will-not-open-with-the-wrong-secrets
+  (let [{:keys [cipher-suite encryption-secret sender-data-secret signature-pub
+                proposal-priv] :as e} (first vec-/message-protection)
+        s (get suite/suites cipher-suite)
+        ctx (ctx-of e)
+        base {:message (unhex proposal-priv) :group-context ctx
+              :encryption-secret (unhex encryption-secret) :n-leaves n-leaves
+              :sender-data-secret (unhex sender-data-secret)
+              :signature-public-key (unhex signature-pub)}]
+    (is (r/ok? (msg/unprotect-private s base)))
+    (testing "a wrong sender-data secret stops it before the content"
+      (is (= :sender-data-decryption-failed
+             (r/reason (msg/unprotect-private
+                        s (assoc base :sender-data-secret (vec (repeat (:nh s) 0))))))))
+    (testing "a wrong encryption secret stops it at the content"
+      (is (= :content-decryption-failed
+             (r/reason (msg/unprotect-private
+                        s (assoc base :encryption-secret (vec (repeat (:nh s) 0))))))))
+    (testing "and a tree of the wrong size derives a different leaf"
+      (is (r/error? (msg/unprotect-private s (assoc base :n-leaves 8)))))))
+
+(deftest the-reuse-guard-covers-four-bytes-and-not-the-rest
+  ;; §6.3.1. XORing it over the whole nonce, or appending it, still produces a
+  ;; nonce -- and one the recipient cannot reconstruct.
+  (let [nonce- (vec (range 12))
+        guarded (fr/apply-reuse-guard nonce- [0xFF 0xFF 0xFF 0xFF])]
+    (is (= [0xFF 0xFE 0xFD 0xFC] (vec (take 4 guarded))))
+    (is (= (vec (drop 4 nonce-)) (vec (drop 4 guarded))))
+    (is (= 12 (count guarded)))))
+
+(deftest padding-must-be-zero
+  ;; §6.3.1: a receiver MUST verify there are no non-zero bytes. Without that
+  ;; check the padding is a covert channel in a field nobody looks at.
+  (let [{:keys [cipher-suite]} (first vec-/message-protection)
+        s (get suite/suites cipher-suite)]
+    (is (= :non-zero-padding
+           (r/reason (#'msg/parse-private-content
+                      :application (vec (concat (r/val (mls.varint/opaque [1 2 3]))
+                                                (r/val (fr/encode-auth :application
+                                                                       {:signature [9 9]}))
+                                                [0 0 1]))))))
+    (is (r/ok? (#'msg/parse-private-content
+                :application (vec (concat (r/val (mls.varint/opaque [1 2 3]))
+                                          (r/val (fr/encode-auth :application
+                                                                 {:signature [9 9]}))
+                                          [0 0 0])))))))

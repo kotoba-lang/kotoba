@@ -1,0 +1,164 @@
+(ns mls.proposal
+  "`Proposal`, `ProposalOrRef` and `Commit` — [RFC 9420](https://www.rfc-editor.org/rfc/rfc9420)
+  §12.1 and §12.4.
+
+  These exist here because `FramedContent` embeds them **without a length
+  prefix**: a reader that cannot say where a Commit ends cannot say where the
+  signature after it begins. Framing needs a content codec, and this is it.
+
+  ## All seven proposal types, and Commit paths
+
+  `add` and `update` carry a `KeyPackage` and a `LeafNode`, and a Commit's
+  path carries an `UpdatePath`. Those were refused by name until `mls.node`
+  existed; they now go through it. The refusal that stood here is gone rather
+  than renamed — a reason keyword that no longer names anything is worse than
+  no keyword, because a caller can still assert on it."
+  (:require [mls.node :as node]
+            [mls.psk :as psk]
+            [mls.result :as r :refer [ok error]]
+            [mls.varint :as v]))
+
+(def proposal-types
+  {1 :add 2 :update 3 :remove 4 :psk 5 :reinit 6 :external-init 7 :group-context-extensions})
+
+(def proposal-codes (into {} (map (fn [[k x]] [x k])) proposal-types))
+
+(defn- u16 [n] [(bit-and (quot n 256) 0xFF) (bit-and n 0xFF)])
+(defn- u32 [n] (vec (loop [x n out () k 0]
+                      (if (= k 4) out (recur (quot x 256) (conj out (bit-and x 0xFF)) (inc k))))))
+(defn- read-u16 [bs off] (+ (* 256 (nth bs off)) (nth bs (inc off))))
+(defn- read-u32 [bs off] (reduce (fn [a i] (+ (* 256 a) (nth bs (+ off i)))) 0 (range 4)))
+
+;; ── Proposal ────────────────────────────────────────────────────────────────
+
+(defn encode-add [{:keys [key-package]}] (node/encode-key-package key-package))
+(defn decode-add [bs off]
+  (r/let-ok [[kp next-] (node/decode-key-package bs off)] (ok [{:key-package kp} next-])))
+
+(defn encode-update [{:keys [leaf-node]}] (node/encode-leaf-node leaf-node))
+(defn decode-update [bs off]
+  (r/let-ok [[ln next-] (node/decode-leaf-node bs off)] (ok [{:leaf-node ln} next-])))
+
+(defn encode-remove [{:keys [removed]}] (ok (u32 removed)))
+(defn decode-remove [bs off]
+  (if (> (+ off 4) (count bs))
+    (error :truncated-remove {:mls/at off})
+    (ok [{:removed (read-u32 bs off)} (+ off 4)])))
+
+(defn encode-pre-shared-key [{:keys [psk]}] (psk/encode-psk-id psk))
+(defn decode-pre-shared-key [bs off]
+  (r/let-ok [[id next-] (psk/decode-psk-id bs off)] (ok [{:psk id} next-])))
+
+(defn encode-external-init [{:keys [kem-output]}] (v/opaque kem-output))
+(defn decode-external-init [bs off]
+  (r/let-ok [k (v/read-opaque bs off)]
+    (ok [{:kem-output (:mls/value k)} (:mls/next k)])))
+
+(defn encode-group-context-extensions [{:keys [extensions]}] (node/encode-extensions extensions))
+(defn decode-group-context-extensions [bs off]
+  (r/let-ok [[e next-] (node/decode-extensions bs off)] (ok [{:extensions e} next-])))
+
+(defn encode-reinit
+  [{:keys [group-id version cipher-suite extensions]}]
+  (r/let-ok [g (v/opaque group-id) e (node/encode-extensions extensions)]
+    (ok (vec (concat g (u16 version) (u16 cipher-suite) e)))))
+
+(defn decode-reinit
+  [bs off]
+  (r/let-ok [g (v/read-opaque bs off)]
+    (let [off (:mls/next g)]
+      (if (> (+ off 4) (count bs))
+        (error :truncated-reinit {:mls/at off})
+        (r/let-ok [[e next-] (node/decode-extensions bs (+ off 4))]
+          (ok [{:group-id (:mls/value g) :version (read-u16 bs off)
+                :cipher-suite (read-u16 bs (+ off 2)) :extensions e}
+               next-]))))))
+
+(def ^:private bodies
+  "Each proposal type's bare struct, by name. `Proposal` is the variant over
+  these — separating them is what lets the working group's corpus, which
+  carries the bare structs, be read at all."
+  {:add [encode-add decode-add]
+   :update [encode-update decode-update]
+   :remove [encode-remove decode-remove]
+   :psk [encode-pre-shared-key decode-pre-shared-key]
+   :reinit [encode-reinit decode-reinit]
+   :external-init [encode-external-init decode-external-init]
+   :group-context-extensions [encode-group-context-extensions decode-group-context-extensions]})
+
+(defn encode-proposal
+  [{:keys [type] :as p}]
+  (if-let [[enc _] (get bodies type)]
+    (r/let-ok [body (enc p)] (ok (into (u16 (get proposal-codes type)) body)))
+    (error :unknown-proposal-type {:mls/type type})))
+
+(defn decode-proposal
+  "Returns `[proposal next-offset]`. The offset is the point of the whole
+  exercise: `FramedContent` has no length prefix around this."
+  [bs off]
+  (if (> (+ off 2) (count bs))
+    (error :truncated-proposal {:mls/at off})
+    (let [code (read-u16 bs off)
+          type (get proposal-types code)]
+      (if-let [[_ dec] (get bodies type)]
+        (r/let-ok [[body next-] (dec bs (+ off 2))]
+          (ok [(assoc body :type type) next-]))
+        (error :unknown-proposal-type {:mls/code code})))))
+
+;; ── ProposalOrRef and Commit ────────────────────────────────────────────────
+
+(defn encode-proposal-or-ref
+  [{:keys [kind] :as p}]
+  (case kind
+    :proposal (r/let-ok [x (encode-proposal (:proposal p))] (ok (into [1] x)))
+    :reference (r/let-ok [x (v/opaque (:reference p))] (ok (into [2] x)))
+    (error :unknown-proposal-or-ref {:mls/kind kind})))
+
+(defn decode-proposal-or-ref
+  [bs off]
+  (if (>= off (count bs))
+    (error :truncated-proposal-or-ref {:mls/at off})
+    (let [k (nth bs off) off (inc off)]
+      (case k
+        1 (r/let-ok [[p next-] (decode-proposal bs off)]
+            (ok [{:kind :proposal :proposal p} next-]))
+        2 (r/let-ok [x (v/read-opaque bs off)]
+            (ok [{:kind :reference :reference (:mls/value x)} (:mls/next x)]))
+        (error :unknown-proposal-or-ref {:mls/code k})))))
+
+(defn encode-commit
+  "`Commit { ProposalOrRef proposals<V>; optional<UpdatePath> path; }`.
+
+  `nil` and a path are both real: a Commit that dropped its `UpdatePath`
+  would say the sender did not rotate its key, which is the opposite of what
+  it means, so the absence is a presence byte and never an omission."
+  [{:keys [proposals path]}]
+  (loop [ps proposals acc []]
+    (if-let [p (first ps)]
+      (let [x (encode-proposal-or-ref p)]
+        (if (r/error? x) x (recur (next ps) (into acc (r/val x)))))
+      (r/let-ok [body (v/opaque acc)]
+        (if (nil? path)
+          (ok (conj (vec body) 0))
+          (r/let-ok [up (node/encode-update-path path)]
+            (ok (vec (concat body [1] up)))))))))
+
+(defn decode-commit
+  [bs off]
+  (r/let-ok [ps (v/read-opaque bs off)]
+    (let [body (:mls/value ps)
+          after (:mls/next ps)]
+      (loop [i 0 acc []]
+        (if (= i (count body))
+          (if (>= after (count bs))
+            (error :truncated-commit {:mls/at after})
+            (let [present (nth bs after)]
+              (case present
+                0 (ok [{:proposals acc :path nil} (inc after)])
+                1 (r/let-ok [[up next-] (node/decode-update-path bs (inc after))]
+                    (ok [{:proposals acc :path up} next-]))
+                (error :bad-optional-tag {:mls/tag present}))))
+          (let [x (decode-proposal-or-ref body i)]
+            (if (r/error? x)
+              x
+              (let [[p next-] (r/val x)] (recur next- (conj acc p))))))))))

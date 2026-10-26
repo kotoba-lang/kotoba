@@ -1,0 +1,433 @@
+(ns mls.node
+  "The ratchet tree's node encodings — [RFC 9420](https://www.rfc-editor.org/rfc/rfc9420)
+  §5.3, §7.2, §7.6 and §7.8.
+
+  `Credential`, `Capabilities`, `Lifetime`, `Extension`, `LeafNode`,
+  `KeyPackage`, `HPKECiphertext`, `UpdatePath`, `ParentNode`, `Node`, and the
+  `ratchet_tree` extension that carries a whole tree.
+
+  These are what `add` and `update` proposals and a Commit's `UpdatePath`
+  carry, and what the tree hash is computed over. Every remaining corpus is
+  written in terms of a tree with real nodes in it, so this is the layer
+  underneath all of them.
+
+  ## Decoders return `[value next-offset]`
+
+  Same convention as `mls.proposal`, and for the same reason: a `LeafNode`
+  inside a `Node` inside a `ratchet_tree` has no length prefix of its own. A
+  reader that cannot say where a node ends cannot find the next one.
+
+  ## The signed forms are separate functions
+
+  `LeafNodeTBS` is not `LeafNode` minus the signature: for the `update` and
+  `commit` sources it *appends* the group id and leaf index, which never
+  appear on the wire. A leaf signed as a group member does not verify as a
+  standalone KeyPackage leaf, which is the point — §7.2 says so — and it is
+  why `leaf-node-tbs` takes the group id and index rather than reading them
+  off the node."
+  (:require [mls.result :as r :refer [ok error]]
+            [mls.varint :as v]))
+
+;; ── fixed-width integers ────────────────────────────────────────────────────
+
+(defn- u16 [n] [(bit-and (quot n 256) 0xFF) (bit-and n 0xFF)])
+(defn- u32 [n] (vec (loop [x n out () k 0]
+                      (if (= k 4) out (recur (quot x 256) (conj out (bit-and x 0xFF)) (inc k))))))
+(defn- rd16 [bs off] (+ (* 256 (nth bs off)) (nth bs (inc off))))
+(defn- rd32 [bs off] (reduce (fn [a i] (+ (* 256 a) (nth bs (+ off i)))) 0 (range 4)))
+
+(defn- need
+  "`[:ok off]` if `n` more bytes are readable at `off`."
+  [bs off n reason]
+  (if (> (+ off n) (count bs)) (error reason {:mls/at off :mls/need n}) (ok off)))
+
+(defn- concat-ok
+  "Encode every item and concatenate, short-circuiting on the first error."
+  [f xs]
+  (loop [xs (seq xs) acc []]
+    (if-not xs
+      (ok acc)
+      (let [x (f (first xs))]
+        (if (r/error? x) x (recur (next xs) (into acc (r/val x))))))))
+
+(defn- vector-v
+  "`T items<V>` — the varint byte length of the concatenation, not a count."
+  [f xs]
+  (r/let-ok [body (concat-ok f xs)] (v/opaque body)))
+
+(defn- read-vector-v
+  "Read a `T items<V>` by running `f` over the framed body until it is spent.
+
+  `f` is `(fn [bs off] -> [:ok [item next]])`. A body that ends mid-item is an
+  error rather than a short list: the length said how many bytes there were,
+  so an item that runs past it is a disagreement about the encoding and not a
+  list that happened to stop."
+  [bs off f]
+  (r/let-ok [framed (v/read-opaque bs off)]
+    (let [body (:mls/value framed)]
+      (loop [i 0 acc []]
+        (if (= i (count body))
+          (ok [acc (:mls/next framed)])
+          (let [x (f body i)]
+            (if (r/error? x)
+              x
+              (let [[item next-] (r/val x)]
+                (if (<= next- i)
+                  (error :zero-length-item {:mls/at i})
+                  (recur next- (conj acc item)))))))))))
+
+(defn- read-u16-vector
+  "`uint16 xs<V>` — a byte length that must be a multiple of two."
+  [bs off]
+  (r/let-ok [framed (v/read-opaque bs off)]
+    (let [body (:mls/value framed)]
+      (if (odd? (count body))
+        (error :ragged-u16-vector {:mls/length (count body)})
+        (ok [(mapv #(rd16 body (* 2 %)) (range (quot (count body) 2)))
+             (:mls/next framed)])))))
+
+;; ── Credential — §5.3 ───────────────────────────────────────────────────────
+
+(def credential-types {1 :basic 2 :x509})
+(def credential-codes (into {} (map (fn [[k x]] [x k])) credential-types))
+
+(defn encode-credential
+  [{:keys [type] :as c}]
+  (case type
+    :basic (r/let-ok [id (v/opaque (:identity c))] (ok (into (u16 1) id)))
+    :x509 (r/let-ok [certs (vector-v #(v/opaque %) (:certificates c))]
+            (ok (into (u16 2) certs)))
+    (error :unknown-credential-type {:mls/type type})))
+
+(defn decode-credential
+  [bs off]
+  (r/let-ok [_ (need bs off 2 :truncated-credential)]
+    (let [code (rd16 bs off) off (+ off 2)]
+      (case (get credential-types code)
+        :basic (r/let-ok [id (v/read-opaque bs off)]
+                 (ok [{:type :basic :identity (:mls/value id)} (:mls/next id)]))
+        :x509 (r/let-ok [[certs next-] (read-vector-v bs off
+                                         (fn [b i] (r/let-ok [c (v/read-opaque b i)]
+                                                     (ok [(:mls/value c) (:mls/next c)]))))]
+                (ok [{:type :x509 :certificates certs} next-]))
+        (error :unknown-credential-type {:mls/code code})))))
+
+;; ── Capabilities and Lifetime — §7.2 ────────────────────────────────────────
+
+(defn encode-capabilities
+  "Five `uint16` lists. Encoded in the order §7.2 gives them, which is not
+  alphabetical and not the order they are usually talked about."
+  [{:keys [versions cipher-suites extensions proposals credentials]}]
+  (r/let-ok [a (vector-v #(ok (u16 %)) versions)
+             b (vector-v #(ok (u16 %)) cipher-suites)
+             c (vector-v #(ok (u16 %)) extensions)
+             d (vector-v #(ok (u16 %)) proposals)
+             e (vector-v #(ok (u16 %)) credentials)]
+    (ok (vec (concat a b c d e)))))
+
+(defn decode-capabilities
+  [bs off]
+  (r/let-ok [[versions o1] (read-u16-vector bs off)
+             [suites o2] (read-u16-vector bs o1)
+             [exts o3] (read-u16-vector bs o2)
+             [props o4] (read-u16-vector bs o3)
+             [creds o5] (read-u16-vector bs o4)]
+    (ok [{:versions versions :cipher-suites suites :extensions exts
+          :proposals props :credentials creds}
+         o5])))
+
+(defn encode-lifetime
+  "`Lifetime { uint64 not_before; uint64 not_after; }` — §7.2.
+
+  The two fields are **eight-byte vectors, not numbers**, and that is not
+  laziness. A `uint64` has no exact representation that both runtimes this
+  library targets can hold: a JVM `long` overflows on `not_after` set to
+  2^64-1, which is what implementations actually put there, and a JavaScript
+  number loses the low bits above 2^53. Either way the value that came back
+  would not be the value that was sent, and it would re-encode to different
+  bytes.
+
+  Nothing here compares them, because §7.3's lifetime check is not
+  implemented — and a number that cannot be trusted is a worse foundation for
+  that check than bytes that can."
+  [{:keys [not-before not-after]}]
+  (let [a (mapv #(bit-and (int %) 0xFF) (seq not-before))
+        b (mapv #(bit-and (int %) 0xFF) (seq not-after))]
+    (if (and (= 8 (count a)) (= 8 (count b)))
+      (ok (into a b))
+      (error :bad-lifetime-length {:mls/not-before (count a) :mls/not-after (count b)}))))
+
+(defn decode-lifetime
+  [bs off]
+  (r/let-ok [_ (need bs off 16 :truncated-lifetime)]
+    (ok [{:not-before (subvec (vec bs) off (+ off 8))
+          :not-after (subvec (vec bs) (+ off 8) (+ off 16))}
+         (+ off 16)])))
+
+;; ── Extension — §2.1.3 ──────────────────────────────────────────────────────
+
+(defn encode-extension
+  [{:keys [type data]}] (r/let-ok [d (v/opaque data)] (ok (into (u16 type) d))))
+
+(defn decode-extension
+  [bs off]
+  (r/let-ok [_ (need bs off 2 :truncated-extension)]
+    (r/let-ok [d (v/read-opaque bs (+ off 2))]
+      (ok [{:type (rd16 bs off) :data (:mls/value d)} (:mls/next d)]))))
+
+(defn encode-extensions [xs] (vector-v encode-extension xs))
+(defn decode-extensions [bs off] (read-vector-v bs off decode-extension))
+
+;; ── LeafNode — §7.2 ─────────────────────────────────────────────────────────
+
+(def leaf-node-sources {1 :key-package 2 :update 3 :commit})
+(def leaf-node-source-codes (into {} (map (fn [[k x]] [x k])) leaf-node-sources))
+
+(defn- leaf-node-prefix
+  "Everything up to and including `extensions` — the part `LeafNode` and
+  `LeafNodeTBS` have in common."
+  [{:keys [encryption-key signature-key credential capabilities source] :as leaf}]
+  (if-not (contains? leaf-node-source-codes source)
+    (error :unknown-leaf-node-source {:mls/source source})
+    (r/let-ok [ek (v/opaque encryption-key)
+               sk (v/opaque signature-key)
+               cred (encode-credential credential)
+               caps (encode-capabilities capabilities)
+               sel (case source
+                     :key-package (encode-lifetime (:lifetime leaf))
+                     :update (ok [])
+                     :commit (v/opaque (:parent-hash leaf)))
+               exts (encode-extensions (:extensions leaf))]
+      (ok (vec (concat ek sk cred caps [(get leaf-node-source-codes source)] sel exts))))))
+
+(defn encode-leaf-node
+  [leaf]
+  (r/let-ok [prefix (leaf-node-prefix leaf)
+             sig (v/opaque (:signature leaf))]
+    (ok (into prefix sig))))
+
+(defn leaf-node-tbs
+  "`LeafNodeTBS` — §7.2.
+
+  Not the LeafNode minus its signature. For the `update` and `commit` sources
+  it appends the group id and the sender's leaf index, which are **not on the
+  wire**: a leaf signed inside a group does not verify as a standalone
+  KeyPackage leaf, and one signed in group A does not verify in group B.
+
+  `group-id` and `leaf-index` are arguments rather than fields of the node
+  because the node does not carry them — a caller that has to supply them
+  cannot forget that the binding exists."
+  [leaf group-id leaf-index]
+  (r/let-ok [prefix (leaf-node-prefix leaf)]
+    (case (:source leaf)
+      :key-package (ok prefix)
+      (:update :commit) (r/let-ok [g (v/opaque group-id)]
+                          (ok (vec (concat prefix g (u32 leaf-index)))))
+      (error :unknown-leaf-node-source {:mls/source (:source leaf)}))))
+
+(defn decode-leaf-node
+  [bs off]
+  (r/let-ok [ek (v/read-opaque bs off)]
+    (r/let-ok [sk (v/read-opaque bs (:mls/next ek))]
+      (r/let-ok [[cred o1] (decode-credential bs (:mls/next sk))
+                 [caps o2] (decode-capabilities bs o1)
+                 _ (need bs o2 1 :truncated-leaf-node)]
+        (let [src (get leaf-node-sources (nth bs o2))
+              o3 (inc o2)
+              sel (case src
+                    :key-package (r/let-ok [[lt o] (decode-lifetime bs o3)]
+                                   (ok [{:lifetime lt} o]))
+                    :update (ok [{} o3])
+                    :commit (r/let-ok [ph (v/read-opaque bs o3)]
+                              (ok [{:parent-hash (:mls/value ph)} (:mls/next ph)]))
+                    (error :unknown-leaf-node-source {:mls/code (nth bs o2)}))]
+          (r/let-ok [[extra o4] sel
+                     [exts o5] (decode-extensions bs o4)
+                     sig (v/read-opaque bs o5)]
+            (ok [(merge {:encryption-key (:mls/value ek)
+                         :signature-key (:mls/value sk)
+                         :credential cred :capabilities caps :source src
+                         :extensions exts :signature (:mls/value sig)}
+                        extra)
+                 (:mls/next sig)])))))))
+
+;; ── KeyPackage — §10 ────────────────────────────────────────────────────────
+
+(defn key-package-tbs
+  "Everything but the signature. Unlike `LeafNodeTBS` this really is the
+  struct minus its last field, and saying so here is what keeps a reader from
+  assuming the same of the leaf."
+  [{:keys [version cipher-suite init-key leaf-node extensions]}]
+  (r/let-ok [ik (v/opaque init-key)
+             ln (encode-leaf-node leaf-node)
+             ex (encode-extensions extensions)]
+    (ok (vec (concat (u16 version) (u16 cipher-suite) ik ln ex)))))
+
+(defn encode-key-package
+  [kp]
+  (r/let-ok [tbs (key-package-tbs kp) sig (v/opaque (:signature kp))]
+    (ok (into tbs sig))))
+
+(defn decode-key-package
+  [bs off]
+  (r/let-ok [_ (need bs off 4 :truncated-key-package)]
+    (r/let-ok [ik (v/read-opaque bs (+ off 4))]
+      (r/let-ok [[ln o1] (decode-leaf-node bs (:mls/next ik))
+                 [exts o2] (decode-extensions bs o1)
+                 sig (v/read-opaque bs o2)]
+        (ok [{:version (rd16 bs off) :cipher-suite (rd16 bs (+ off 2))
+              :init-key (:mls/value ik) :leaf-node ln :extensions exts
+              :signature (:mls/value sig)}
+             (:mls/next sig)])))))
+
+;; ── UpdatePath — §7.6 ───────────────────────────────────────────────────────
+
+(defn encode-hpke-ciphertext
+  [{:keys [kem-output ciphertext]}]
+  (r/let-ok [k (v/opaque kem-output) c (v/opaque ciphertext)] (ok (into k c))))
+
+(defn decode-hpke-ciphertext
+  [bs off]
+  (r/let-ok [k (v/read-opaque bs off)]
+    (r/let-ok [c (v/read-opaque bs (:mls/next k))]
+      (ok [{:kem-output (:mls/value k) :ciphertext (:mls/value c)} (:mls/next c)]))))
+
+(defn encode-update-path-node
+  [{:keys [encryption-key encrypted-path-secret]}]
+  (r/let-ok [ek (v/opaque encryption-key)
+             cs (vector-v encode-hpke-ciphertext encrypted-path-secret)]
+    (ok (into ek cs))))
+
+(defn decode-update-path-node
+  [bs off]
+  (r/let-ok [ek (v/read-opaque bs off)]
+    (r/let-ok [[cs next-] (read-vector-v bs (:mls/next ek) decode-hpke-ciphertext)]
+      (ok [{:encryption-key (:mls/value ek) :encrypted-path-secret cs} next-]))))
+
+(defn encode-update-path
+  [{:keys [leaf-node nodes]}]
+  (r/let-ok [ln (encode-leaf-node leaf-node)
+             ns- (vector-v encode-update-path-node nodes)]
+    (ok (into ln ns-))))
+
+(defn decode-update-path
+  [bs off]
+  (r/let-ok [[ln o1] (decode-leaf-node bs off)
+             [nodes o2] (read-vector-v bs o1 decode-update-path-node)]
+    (ok [{:leaf-node ln :nodes nodes} o2])))
+
+;; ── ParentNode and Node — §7.2, §7.8 ────────────────────────────────────────
+
+(defn encode-parent-node
+  [{:keys [encryption-key parent-hash unmerged-leaves]}]
+  (r/let-ok [ek (v/opaque encryption-key)
+             ph (v/opaque parent-hash)
+             ul (vector-v #(ok (u32 %)) unmerged-leaves)]
+    (ok (vec (concat ek ph ul)))))
+
+(defn decode-parent-node
+  [bs off]
+  (r/let-ok [ek (v/read-opaque bs off)]
+    (r/let-ok [ph (v/read-opaque bs (:mls/next ek))]
+      (r/let-ok [framed (v/read-opaque bs (:mls/next ph))]
+        (let [body (:mls/value framed)]
+          (if-not (zero? (mod (count body) 4))
+            (error :ragged-unmerged-leaves {:mls/length (count body)})
+            (ok [{:encryption-key (:mls/value ek) :parent-hash (:mls/value ph)
+                  :unmerged-leaves (mapv #(rd32 body (* 4 %)) (range (quot (count body) 4)))}
+                 (:mls/next framed)])))))))
+
+(def node-types {1 :leaf 2 :parent})
+(def node-codes (into {} (map (fn [[k x]] [x k])) node-types))
+
+(defn encode-node
+  [{:keys [type] :as n}]
+  (case type
+    :leaf (r/let-ok [x (encode-leaf-node (:leaf-node n))] (ok (into [1] x)))
+    :parent (r/let-ok [x (encode-parent-node (:parent-node n))] (ok (into [2] x)))
+    (error :unknown-node-type {:mls/type type})))
+
+(defn decode-node
+  [bs off]
+  (r/let-ok [_ (need bs off 1 :truncated-node)]
+    (case (get node-types (nth bs off))
+      :leaf (r/let-ok [[ln next-] (decode-leaf-node bs (inc off))]
+              (ok [{:type :leaf :leaf-node ln} next-]))
+      :parent (r/let-ok [[pn next-] (decode-parent-node bs (inc off))]
+                (ok [{:type :parent :parent-node pn} next-]))
+      (error :unknown-node-type {:mls/code (nth bs off)}))))
+
+(defn encode-optional-node
+  "`optional<Node>` — a presence byte, then the node. `nil` is a blank node,
+  which is a real value in a ratchet tree and not a missing one."
+  [n]
+  (if (nil? n) (ok [0]) (r/let-ok [x (encode-node n)] (ok (into [1] x)))))
+
+(defn decode-optional-node
+  [bs off]
+  (r/let-ok [_ (need bs off 1 :truncated-optional-node)]
+    (case (nth bs off)
+      0 (ok [nil (inc off)])
+      1 (decode-node bs (inc off))
+      (error :bad-optional-tag {:mls/tag (nth bs off)}))))
+
+;; ── the ratchet_tree extension — §12.4.3.3 ─────────────────────────────────
+
+(defn vector-v-for-test
+  "Encode a node list **without** dropping trailing blanks, so a test can
+  produce the bytes §12.4.3.3 forbids. Nothing in the library calls it: the
+  only way to check that a refusal fires is to build the thing it refuses."
+  [nodes] (vector-v encode-optional-node nodes))
+
+(defn- padded-width
+  "The node count a `ratchet_tree` of `n` entries logically has.
+
+  §12.4.3.3: a tree with 2^d leaves has 2^(d+1)-1 nodes, and the receiver
+  extends to the smallest such length. Not `n` rounded up to odd — the leaf
+  count is rounded up to a **power of two**, so 5 entries become 7 and not 5."
+  [n]
+  (loop [d 0]
+    (let [w (dec (bit-shift-left 1 (inc d)))]
+      (if (>= w n) w (recur (inc d))))))
+
+(defn encode-ratchet-tree
+  "`optional<Node> ratchet_tree<V>` — §12.4.3.3.
+
+  Trailing blanks are dropped: the sender **MUST NOT** include a blank after
+  the last non-blank node. That is not a size optimisation the encoder may
+  skip — a peer is required to reject a tree that ends in a blank, so writing
+  one produces bytes no conformant implementation will accept."
+  [nodes]
+  (let [nodes (vec nodes)
+        end (loop [i (count nodes)] (if (and (pos? i) (nil? (nth nodes (dec i)))) (recur (dec i)) i))]
+    (vector-v encode-optional-node (subvec nodes 0 end))))
+
+(defn decode-ratchet-tree
+  "The mirror: refuse a trailing blank, then extend with blanks to the full
+  width.
+
+  Both halves are **MUST**s in §12.4.3.3 and they are not decoration. Skipping
+  the extension gives an array whose indices no longer mean what
+  `mls.tree`'s arithmetic says they mean — every parent index past the
+  truncation point would address the wrong slot, and the tree hash of a
+  perfectly valid tree would come out wrong. Skipping the check would accept
+  two different encodings of one tree."
+  [bs off]
+  (r/let-ok [[nodes next-] (read-vector-v bs off decode-optional-node)]
+    (cond
+      (empty? nodes) (error :empty-ratchet-tree {})
+      (nil? (peek nodes)) (error :ratchet-tree-ends-in-a-blank {:mls/length (count nodes)})
+      :else (ok [(into nodes (repeat (- (padded-width (count nodes)) (count nodes)) nil))
+                 next-]))))
+
+(defn ratchet-tree
+  "Decode a standalone `ratchet_tree` and refuse trailing bytes.
+
+  A tree is normally the whole of an extension's data, so bytes after it are
+  not the caller's next field — they are a disagreement about the encoding."
+  [bs]
+  (let [bs (mapv #(bit-and (int %) 0xFF) (seq bs))]
+    (r/let-ok [[nodes next-] (decode-ratchet-tree bs 0)]
+      (if (= next- (count bs))
+        (ok nodes)
+        (error :trailing-bytes {:mls/at next- :mls/length (count bs)})))))

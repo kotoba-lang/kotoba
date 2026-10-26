@@ -1,0 +1,282 @@
+(ns mls.framing
+  "MLS message framing — [RFC 9420](https://www.rfc-editor.org/rfc/rfc9420) §6.
+
+  A message is a `FramedContent` plus the authentication that covers it. It
+  travels either as a `PublicMessage` — signed and MAC'd, readable by anyone
+  who can see the wire — or as a `PrivateMessage`, encrypted with a key from
+  the secret tree.
+
+  ## Three things sit underneath, and each is a different guarantee
+
+  - the **signature** over `FramedContentTBS` says who wrote it
+  - the **membership tag** over `AuthenticatedContentTBM` says the writer is
+    in this group, in this epoch
+  - the **encryption** in a PrivateMessage says nobody outside the group can
+    read it
+
+  A PublicMessage has the first two and not the third. Dropping the second
+  would leave a message anyone holding the sender's signature key could
+  replay into a group they had since left, which is why §6.2 makes it a MUST
+  for messages from members.
+
+  ## Application data may not travel as a PublicMessage
+
+  §6.1 says so, and this refuses it by name. A PublicMessage is readable by
+  the delivery service; an application message sent that way would be
+  plaintext to the network, and the caller who asked for it would get exactly
+  what they asked for and not what they meant."
+  (:require [mls.crypto :as crypto]
+            [mls.group-context :as gc]
+            [mls.proposal :as prop]
+            [mls.result :as r :refer [ok error]]
+            [mls.uint :as uint]
+            [mls.secret-tree :as st]
+            [mls.varint :as v]))
+
+(def wire-formats
+  {1 :mls-public-message 2 :mls-private-message 3 :mls-welcome
+   4 :mls-group-info 5 :mls-key-package})
+(def wire-codes (into {} (map (fn [[k x]] [x k])) wire-formats))
+
+(def content-types {1 :application 2 :proposal 3 :commit})
+(def content-codes (into {} (map (fn [[k x]] [x k])) content-types))
+
+(def sender-types {1 :member 2 :external 3 :new-member-proposal 4 :new-member-commit})
+(def sender-codes (into {} (map (fn [[k x]] [x k])) sender-types))
+
+(def version 1)
+
+(defn- u16 [n] [(bit-and (quot n 256) 0xFF) (bit-and n 0xFF)])
+(defn- u32 [n] (vec (loop [x n out () k 0]
+                      (if (= k 4) out (recur (quot x 256) (conj out (bit-and x 0xFF)) (inc k))))))
+(defn- rd16 [bs o] (+ (* 256 (nth bs o)) (nth bs (inc o))))
+(defn- rd32 [bs o] (reduce (fn [a i] (+ (* 256 a) (nth bs (+ o i)))) 0 (range 4)))
+
+;; ── Sender ──────────────────────────────────────────────────────────────────
+
+(defn encode-sender [{:keys [type index]}]
+  (case type
+    (:member :external) (ok (into [(get sender-codes type)] (u32 index)))
+    (:new-member-proposal :new-member-commit) (ok [(get sender-codes type)])
+    (error :unknown-sender-type {:mls/type type})))
+
+(defn decode-sender [bs off]
+  (if (>= off (count bs))
+    (error :truncated-sender {:mls/at off})
+    (let [t (get sender-types (nth bs off))]
+      (case t
+        (:member :external) (ok [{:type t :index (rd32 bs (inc off))} (+ off 5)])
+        (:new-member-proposal :new-member-commit) (ok [{:type t} (inc off)])
+        (error :unknown-sender-type {:mls/code (nth bs off)})))))
+
+;; ── FramedContent ───────────────────────────────────────────────────────────
+
+(defn- encode-content [content-type content]
+  (case content-type
+    :application (v/opaque content)
+    :proposal (prop/encode-proposal content)
+    :commit (prop/encode-commit content)
+    (error :unknown-content-type {:mls/type content-type})))
+
+(defn- decode-content
+  "The reason `mls.proposal` exists. Only `application` is length-prefixed;
+  the other two are structures that have to be walked to find their end."
+  [content-type bs off]
+  (case content-type
+    :application (r/let-ok [x (v/read-opaque bs off)]
+                   (ok [(:mls/value x) (:mls/next x)]))
+    :proposal (prop/decode-proposal bs off)
+    :commit (prop/decode-commit bs off)
+    (error :unknown-content-type {:mls/type content-type})))
+
+(defn encode-framed-content
+  [{:keys [group-id epoch sender authenticated-data content-type content]}]
+  (r/let-ok [gid (v/opaque group-id)
+             snd (encode-sender sender)
+             ad (v/opaque (or authenticated-data []))
+             body (encode-content content-type content)]
+    (if-not (contains? content-codes content-type)
+      (error :unknown-content-type {:mls/type content-type})
+      (ok (vec (concat gid (uint/u64! epoch) snd ad [(get content-codes content-type)] body))))))
+
+(defn decode-framed-content
+  "Returns `[framed-content next-offset]`."
+  [bs off]
+  (r/let-ok [gid (v/read-opaque bs off)
+             epoch (uint/read-u64 bs (:mls/next gid))
+             [snd off] (decode-sender bs (+ (:mls/next gid) 8))
+             ad (v/read-opaque bs off)]
+    (let [off (:mls/next ad)]
+      (if (>= off (count bs))
+        (error :truncated-framed-content {:mls/at off})
+        (let [ct (get content-types (nth bs off))]
+          (if-not ct
+            (error :unknown-content-type {:mls/code (nth bs off)})
+            (r/let-ok [[body next-] (decode-content ct bs (inc off))]
+              (ok [{:group-id (:mls/value gid) :epoch epoch :sender snd
+                    :authenticated-data (:mls/value ad)
+                    :content-type ct :content body}
+                   next-]))))))))
+
+(defn encode-auth
+  [content-type {:keys [signature confirmation-tag]}]
+  (r/let-ok [sig (v/opaque signature)]
+    (if (= :commit content-type)
+      (if-not confirmation-tag
+        (error :commit-without-confirmation-tag {})
+        (r/let-ok [t (v/opaque confirmation-tag)] (ok (into sig t))))
+      (ok sig))))
+
+(defn decode-auth
+  [content-type bs off]
+  (r/let-ok [sig (v/read-opaque bs off)]
+    (if (= :commit content-type)
+      (r/let-ok [t (v/read-opaque bs (:mls/next sig))]
+        (ok [{:signature (:mls/value sig) :confirmation-tag (:mls/value t)} (:mls/next t)]))
+      (ok [{:signature (:mls/value sig)} (:mls/next sig)]))))
+
+;; ── the two things that get signed and MAC'd ────────────────────────────────
+
+(defn framed-content-tbs
+  "§6.1. The GroupContext is included **only** for senders that are in the
+  group — which is what makes a member's signature specific to a group and an
+  epoch, and what lets an external sender's signature be checked by someone
+  who does not have that context."
+  [wire-format framed-content group-context]
+  (r/let-ok [fc (encode-framed-content framed-content)]
+    (let [head (vec (concat (u16 version) (u16 (get wire-codes wire-format)) fc))
+          t (:type (:sender framed-content))]
+      (if (contains? #{:member :new-member-commit} t)
+        (if-not group-context
+          (error :group-context-required-for-sender {:mls/sender-type t})
+          (r/let-ok [ctx (gc/encode group-context)]
+            (ok (into head ctx))))
+        (ok head)))))
+
+(defn authenticated-content-tbm
+  "§6.2 — the TBS with the auth data appended. What the membership tag covers."
+  [wire-format framed-content group-context auth]
+  (r/let-ok [tbs (framed-content-tbs wire-format framed-content group-context)
+             a (encode-auth (:content-type framed-content) auth)]
+    (ok (into tbs a))))
+
+(defn membership-tag
+  [suite membership-key wire-format framed-content group-context auth]
+  (r/let-ok [tbm (authenticated-content-tbm wire-format framed-content group-context auth)]
+    (ok (vec ((:hmac (:kdf suite)) (vec membership-key) tbm)))))
+
+;; ── PublicMessage ───────────────────────────────────────────────────────────
+
+(defn- constant-time= [a b]
+  (and (= (count a) (count b)) (zero? (reduce bit-or 0 (map bit-xor a b)))))
+
+(defn encode-public-message
+  [{:keys [framed-content auth membership-tag]}]
+  (r/let-ok [fc (encode-framed-content framed-content)
+             a (encode-auth (:content-type framed-content) auth)]
+    (if (= :member (:type (:sender framed-content)))
+      (if-not membership-tag
+        (error :member-message-without-membership-tag {})
+        (r/let-ok [t (v/opaque membership-tag)] (ok (vec (concat fc a t)))))
+      (ok (vec (concat fc a))))))
+
+(defn decode-public-message
+  [bs]
+  (let [bs (mapv #(bit-and (int %) 0xFF) (seq bs))]
+    (r/let-ok [[fc off] (decode-framed-content bs 0)
+               [auth off] (decode-auth (:content-type fc) bs off)]
+      (if (= :member (:type (:sender fc)))
+        (r/let-ok [t (v/read-opaque bs off)]
+          (if (not= (count bs) (:mls/next t))
+            (error :trailing-bytes {:mls/at (:mls/next t) :mls/total (count bs)})
+            (ok {:framed-content fc :auth auth :membership-tag (:mls/value t)})))
+        (if (not= (count bs) off)
+          (error :trailing-bytes {:mls/at off :mls/total (count bs)})
+          (ok {:framed-content fc :auth auth}))))))
+
+;; ── PrivateMessage ──────────────────────────────────────────────────────────
+
+(defn private-content-aad
+  [{:keys [group-id epoch content-type authenticated-data]}]
+  (r/let-ok [gid (v/opaque group-id)
+             ad (v/opaque (or authenticated-data []))]
+    (ok (vec (concat gid (uint/u64! epoch) [(get content-codes content-type)] ad)))))
+
+(defn encode-sender-data [{:keys [leaf-index generation reuse-guard]}]
+  (if (not= 4 (count reuse-guard))
+    (error :bad-reuse-guard-length {:mls/length (count reuse-guard)})
+    (ok (vec (concat (u32 leaf-index) (u32 generation)
+                     (mapv #(bit-and (int %) 0xFF) reuse-guard))))))
+
+(defn decode-sender-data [bs]
+  (if (not= 12 (count bs))
+    (error :bad-sender-data-length {:mls/length (count bs)})
+    (ok {:leaf-index (rd32 bs 0) :generation (rd32 bs 4)
+         :reuse-guard (subvec (vec bs) 8 12)})))
+
+(defn sender-data-aad
+  "§6.3.2. The first three fields of PrivateMessage."
+  [{:keys [group-id epoch content-type]}]
+  (r/let-ok [gid (v/opaque group-id)]
+    (ok (vec (concat gid (uint/u64! epoch) [(get content-codes content-type)])))))
+
+(defn apply-reuse-guard
+  "§6.3.1: XOR the guard over the **first four bytes** of the nonce.
+
+  Not appended, not XORed over the whole nonce. The guard exists because the
+  key schedule's nonces are deterministic and a client that lost its state
+  could reuse a generation; XORing it in the wrong place would still produce a
+  nonce, and still be a nonce the recipient cannot reconstruct."
+  [nonce guard]
+  (vec (map-indexed (fn [i b] (if (< i 4) (bit-xor b (nth guard i)) b)) nonce)))
+
+(defn encode-private-message
+  [{:keys [group-id epoch content-type authenticated-data
+           encrypted-sender-data ciphertext]}]
+  (r/let-ok [gid (v/opaque group-id)
+             ad (v/opaque (or authenticated-data []))
+             esd (v/opaque encrypted-sender-data)
+             ct (v/opaque ciphertext)]
+    (ok (vec (concat gid (uint/u64! epoch) [(get content-codes content-type)] ad esd ct)))))
+
+(defn decode-private-message
+  [bs]
+  (let [bs (mapv #(bit-and (int %) 0xFF) (seq bs))]
+    (r/let-ok [gid (v/read-opaque bs 0)
+               epoch (uint/read-u64 bs (:mls/next gid))]
+      (let [off (+ (:mls/next gid) 8)]
+        (if (>= off (count bs))
+          (error :truncated-private-message {:mls/at off})
+          (let [ct (get content-types (nth bs off))]
+            (if-not ct
+              (error :unknown-content-type {:mls/code (nth bs off)})
+              (r/let-ok [ad (v/read-opaque bs (inc off))
+                         esd (v/read-opaque bs (:mls/next ad))
+                         c (v/read-opaque bs (:mls/next esd))]
+                (if (not= (count bs) (:mls/next c))
+                  (error :trailing-bytes {:mls/at (:mls/next c) :mls/total (count bs)})
+                  (ok {:group-id (:mls/value gid) :epoch epoch :content-type ct
+                       :authenticated-data (:mls/value ad)
+                       :encrypted-sender-data (:mls/value esd)
+                       :ciphertext (:mls/value c)}))))))))))
+
+;; ── MLSMessage ──────────────────────────────────────────────────────────────
+
+(defn encode-mls-message
+  [wire-format body]
+  (if-not (contains? wire-codes wire-format)
+    (error :unknown-wire-format {:mls/format wire-format})
+    (ok (vec (concat (u16 version) (u16 (get wire-codes wire-format)) body)))))
+
+(defn decode-mls-message
+  "Returns `{:wire-format … :body …}` — the body still encoded, because what
+  it is depends on the wire format and the caller knows which one it wants."
+  [bs]
+  (let [bs (mapv #(bit-and (int %) 0xFF) (seq bs))]
+    (if (< (count bs) 4)
+      (error :truncated-mls-message {:mls/length (count bs)})
+      (let [ver (rd16 bs 0) wf (get wire-formats (rd16 bs 2))]
+        (cond
+          (not= version ver) (error :unknown-protocol-version {:mls/version ver})
+          (nil? wf) (error :unknown-wire-format {:mls/code (rd16 bs 2)})
+          :else (ok {:wire-format wf :body (subvec bs 4)}))))))

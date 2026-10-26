@@ -1,0 +1,164 @@
+(ns mls.key-schedule-test
+  "The key schedule against the working group's corpus: 7 cipher suites × 5
+  epochs, chained.
+
+  **Chained is the word that matters.** Each epoch's `init_secret` is the next
+  epoch's input, so the test runs the schedule forward from
+  `initial_init_secret` and never reads an epoch's `init_secret` from the
+  fixture to feed the next one. An implementation that got the chaining
+  backwards, or that recomputed each epoch from the fixture, would pass a
+  per-epoch check and fail this one."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [mls.crypto :as crypto]
+            [mls.group-context :as gc]
+            [mls.key-schedule :as ks]
+            [mls.result :as r]
+            [mls.suite :as suite]
+            [mls.vectors :as vec-]))
+
+(defn- unhex [s]
+  (mapv #(#?(:clj Integer/parseInt :cljs js/parseInt) (apply str %) 16) (partition 2 s)))
+
+(defn- hex [bs]
+  (apply str (map (fn [b] (let [b (bit-and (int b) 0xFF)
+                                s #?(:clj (Integer/toString b 16) :cljs (.toString b 16))]
+                            (if (= 1 (count s)) (str "0" s) s)))
+                  bs)))
+
+(deftest the-corpus-is-whole
+  (is (= 7 (count vec-/key-schedule)))
+  (is (= [1 2 3 4 5 6 7] (mapv :cipher-suite vec-/key-schedule)))
+  (is (= 35 (reduce + (map #(count (:epochs %)) vec-/key-schedule)))
+      "five epochs each, and the chain is what makes five better than one"))
+
+(deftest the-group-context-encodes-to-the-published-bytes
+  ;; The serialised GroupContext is an input to two ExpandWithLabel calls, so
+  ;; an encoding that differs by one byte is a group whose members derive
+  ;; different keys and cannot tell each other why.
+  (doseq [{:keys [cipher-suite group-id epochs]} vec-/key-schedule]
+    (testing (str "suite " cipher-suite)
+      (doseq [[n ep] (map-indexed vector epochs)]
+        (let [ctx {:cipher-suite cipher-suite
+                   :group-id (unhex group-id)
+                   :epoch n
+                   :tree-hash (unhex (:tree-hash ep))
+                   :confirmed-transcript-hash (unhex (:confirmed-transcript-hash ep))
+                   :extensions []}
+              enc (gc/encode ctx)]
+          (is (r/ok? enc))
+          (is (= (:group-context ep) (hex (r/val enc))) (str "epoch " n))
+          (testing "and decodes back to the same fields"
+            (let [back (gc/decode (r/val enc))]
+              (is (r/ok? back))
+              (is (= n (:epoch (r/val back))))
+              (is (= (unhex (:tree-hash ep)) (:tree-hash (r/val back)))))))))))
+
+(def ^:private published-fields
+  [:joiner-secret :welcome-secret :init-secret :sender-data-secret :encryption-secret
+   :exporter-secret :external-secret :confirmation-key :membership-key
+   :resumption-psk :epoch-authenticator])
+
+(deftest every-epoch-of-every-suite-chained-forward
+  (doseq [{:keys [cipher-suite initial-init-secret epochs]} vec-/key-schedule]
+    (testing (str "suite " cipher-suite)
+      (let [s (get suite/suites cipher-suite)]
+        (reduce
+         (fn [init [n ep]]
+           (let [got (ks/epoch s {:init-secret init
+                                  :commit-secret (unhex (:commit-secret ep))
+                                  :group-context (unhex (:group-context ep))
+                                  :psk-secret (unhex (:psk-secret ep))})]
+             (is (r/ok? got) (str "epoch " n " " (pr-str (r/err got))))
+             (if-not (r/ok? got)
+               ;; Carrying the fixture's value forward here would let one bad
+               ;; epoch hide behind the next one's inputs. Stopping the chain
+               ;; is the honest response.
+               (reduced nil)
+               (let [v (r/val got)]
+                 (doseq [f published-fields]
+                   (is (= (get ep f) (hex (get v f))) (str "epoch " n " " (name f))))
+                 (:init-secret v)))))
+         (unhex initial-init-secret)
+         (map-indexed vector epochs))))))
+
+(deftest the-external-key-pair-is-derived-from-the-external-secret
+  ;; The whole group holds this private key -- which is why it is derived
+  ;; rather than chosen: every member has to arrive at the same one.
+  (doseq [{:keys [cipher-suite epochs]} vec-/key-schedule]
+    (testing (str "suite " cipher-suite)
+      (let [s (get suite/suites cipher-suite)]
+        (doseq [[n ep] (map-indexed vector epochs)]
+          (let [kp (ks/external-key-pair s (unhex (:external-secret ep)))]
+            (is (r/ok? kp))
+            (is (= (:external-pub ep) (hex (:mls/public (r/val kp))))
+                (str "epoch " n))))))))
+
+(deftest the-exporter
+  ;; §8.5. The corpus's label is a 64-character string that looks like hex --
+  ;; and is not. It is passed as text, and reading it as bytes gives a
+  ;; plausible, wrong answer for every one of these; that misreading is what
+  ;; sent an earlier version of `mls.crypto/labelled` off to accept raw bytes
+  ;; for a case that does not exist.
+  (doseq [{:keys [cipher-suite epochs]} vec-/key-schedule]
+    (testing (str "suite " cipher-suite)
+      (let [s (get suite/suites cipher-suite)]
+        (doseq [[n ep] (map-indexed vector epochs)]
+          (let [{:keys [label context length secret]} (:exporter ep)
+                got (ks/exporter s (unhex (:exporter-secret ep))
+                                 label (unhex context) length)]
+            (is (r/ok? got) (str "epoch " n " " (pr-str (r/err got))))
+            (is (= secret (hex (r/val got))) (str "epoch " n))
+            (is (= length (count (r/val got))))))))))
+
+(deftest the-exporter-hashes-its-context
+  ;; ExpandWithLabel(DeriveSecret(exporter_secret, Label), "exported",
+  ;; Hash(Context), Length). Passing the raw context instead gives a value
+  ;; that varies with the context's LENGTH as well as its content, and every
+  ;; vector above would fail -- but only because they all hash. This asserts
+  ;; the step directly.
+  (let [{:keys [cipher-suite epochs]} (first vec-/key-schedule)
+        s (get suite/suites cipher-suite)
+        ep (first epochs)
+        {:keys [label context length secret]} (:exporter ep)
+        es (unhex (:exporter-secret ep))
+        inner (r/val (crypto/derive-secret s es label))]
+    (is (= secret (hex (r/val (crypto/expand-with-label
+                               s inner "exported" (vec ((:hash s) (unhex context))) length)))))
+    (is (not= secret (hex (r/val (crypto/expand-with-label
+                                  s inner "exported" (unhex context) length))))
+        "the unhashed context gives a different answer")))
+
+(deftest the-two-extracts-take-their-salt-from-the-top
+  ;; The one thing in Figure 22 that is easy to invert, and inverting it
+  ;; produces a key schedule that is entirely self-consistent and shares
+  ;; nothing with anyone else. Asserted against the published joiner_secret
+  ;; directly, with the arguments the other way round shown to differ.
+  (let [{:keys [cipher-suite initial-init-secret epochs]} (first vec-/key-schedule)
+        s (get suite/suites cipher-suite)
+        ep (first epochs)
+        init (unhex initial-init-secret)
+        commit (unhex (:commit-secret ep))
+        ctx (unhex (:group-context ep))
+        right (crypto/extract s init commit)
+        wrong (crypto/extract s commit init)]
+    (is (= (:joiner-secret ep)
+           (hex (r/val (crypto/expand-with-label s right "joiner" ctx (:nh s))))))
+    (is (not= (:joiner-secret ep)
+              (hex (r/val (crypto/expand-with-label s wrong "joiner" ctx (:nh s)))))
+        "salt and IKM swapped gives a different, equally usable-looking secret")))
+
+(deftest an-absent-psk-is-Nh-zeros-and-not-an-empty-string
+  ;; The RFC writes it as "psk_secret (or 0)", and the 0 is KDF.Nh long. An
+  ;; empty IKM to Extract is a different function -- HMAC over nothing is not
+  ;; HMAC over zeros.
+  (let [s (get suite/suites 1)
+        base {:init-secret (vec (repeat 32 1))
+              :commit-secret (vec (repeat 32 2))
+              :group-context [9 9 9]}
+        implicit (r/val (ks/epoch s base))
+        explicit (r/val (ks/epoch s (assoc base :psk-secret (vec (repeat (:nh s) 0)))))
+        empty- (r/val (ks/epoch s (assoc base :psk-secret [])))]
+    (is (= (:epoch-secret implicit) (:epoch-secret explicit))
+        "omitting the psk is the same as passing Nh zeros")
+    (is (not= (:epoch-secret implicit) (:epoch-secret empty-))
+        "and not the same as passing nothing")))

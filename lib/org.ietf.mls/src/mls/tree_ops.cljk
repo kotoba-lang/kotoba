@@ -1,0 +1,111 @@
+(ns mls.tree-ops
+  "Applying an `Add`, `Update` or `Remove` to a ratchet tree —
+  [RFC 9420](https://www.rfc-editor.org/rfc/rfc9420) §12.1.1 to §12.1.3, with
+  the extend and truncate of §7.7.
+
+  These are the three proposals that change the *shape* of the tree rather
+  than the key schedule. Each is a handful of steps and every one of them
+  matters to the tree hash, so a step quietly skipped produces a tree that is
+  internally consistent and disagrees with the rest of the group.
+
+  ## The three do different things to the direct path, on purpose
+
+  | | the leaf | the path to the root |
+  |---|---|---|
+  | `Add` | filled | **unmerged**, not blanked |
+  | `Update` | replaced | blanked |
+  | `Remove` | blanked | blanked |
+
+  `Add` is the odd one. Blanking the path there would throw away key material
+  the existing members still hold and can still use; instead the new leaf is
+  recorded as *unmerged* at each non-blank ancestor, which says exactly the
+  true thing — those nodes' keys are known to everyone below them **except**
+  this leaf."
+  (:require [mls.result :as r :refer [ok error]]
+            [mls.tree :as tree]))
+
+(defn leaf-count
+  "The number of leaves in an array of `2n-1` nodes."
+  [nodes] (quot (inc (count nodes)) 2))
+
+(defn extend-tree
+  "§7.7. A new blank root whose left subtree is the old tree and whose right
+  subtree is all blank — which on the array is `n` more slots."
+  [nodes] (into (vec nodes) (repeat (inc (count nodes)) nil)))
+
+(defn- blank-path
+  "Blank every node from `x`'s parent to the root."
+  [nodes x]
+  (r/let-ok [path (tree/direct-path x (leaf-count nodes))]
+    (ok (reduce #(assoc %1 %2 nil) (vec nodes) path))))
+
+(defn- leftmost-blank-leaf
+  [nodes]
+  (first (filter #(nil? (nth nodes (* 2 %) nil)) (range (leaf-count nodes)))))
+
+(defn apply-add
+  "§12.1.1. Place the KeyPackage's leaf in the leftmost blank leaf, extending
+  the tree if there is none, and record it as unmerged all the way up.
+
+  The unmerged list is kept **sorted** — §7.1 says it MUST be, and the leaf
+  reused here is often not the largest index, so appending would produce a
+  correctly-sized list in the wrong order and a `ParentNode` that encodes to
+  different bytes than everyone else's."
+  [nodes leaf-node]
+  (let [blank (leftmost-blank-leaf nodes)
+        [nodes l] (if blank [(vec nodes) blank] [(extend-tree nodes) (leaf-count nodes)])
+        x (* 2 l)]
+    (r/let-ok [path (tree/direct-path x (leaf-count nodes))]
+      (ok (-> (reduce (fn [ns p]
+                        (if (nth ns p nil)
+                          (update-in ns [p :parent-node :unmerged-leaves]
+                                     #(vec (sort (conj (vec %) l))))
+                          ns))
+                      nodes path)
+              (assoc x {:type :leaf :leaf-node leaf-node}))))))
+
+(defn apply-update
+  "§12.1.2. Replace the sender's leaf and blank its path to the root."
+  [nodes sender leaf-node]
+  (let [x (* 2 sender)]
+    (if (>= x (count nodes))
+      (error :leaf-out-of-range {:mls/leaf sender :mls/nodes (count nodes)})
+      (r/let-ok [blanked (blank-path nodes x)]
+        (ok (assoc blanked x {:type :leaf :leaf-node leaf-node}))))))
+
+(defn- truncate
+  "§12.1.3. Drop the right subtree while it holds no non-blank leaf.
+
+  The check is over the whole right half of the array, not just its leaves —
+  the RFC says *non-blank leaf node*, and a parent cannot be non-blank with
+  every leaf below it blank, so the two agree; testing the half is the cheaper
+  way to say it and cannot disagree."
+  [nodes]
+  (loop [nodes (vec nodes)]
+    (let [root (quot (count nodes) 2)]
+      (if (or (< (count nodes) 3) (some some? (subvec nodes root)))
+        nodes
+        (recur (subvec nodes 0 root))))))
+
+(defn apply-remove
+  "§12.1.3. Blank the leaf, blank its path, then truncate."
+  [nodes removed]
+  (let [x (* 2 removed)]
+    (cond
+      (>= x (count nodes)) (error :leaf-out-of-range {:mls/leaf removed
+                                                      :mls/nodes (count nodes)})
+      (nil? (nth nodes x)) (error :removing-a-blank-leaf {:mls/leaf removed})
+      :else (r/let-ok [blanked (blank-path nodes x)]
+              (ok (truncate (assoc blanked x nil)))))))
+
+(defn apply-proposal
+  "Dispatch on a decoded proposal. `sender` is the proposal sender's leaf
+  index, which only `update` uses — and it takes it as an argument because an
+  Update proposal does not carry one: §12.1.2 says *the sender's* leaf, so a
+  reader that guessed would replace the wrong member."
+  [nodes sender {:keys [type] :as p}]
+  (case type
+    :add (apply-add nodes (:leaf-node (:key-package p)))
+    :update (apply-update nodes sender (:leaf-node p))
+    :remove (apply-remove nodes (:removed p))
+    (error :proposal-does-not-change-the-tree {:mls/type type})))

@@ -1,0 +1,111 @@
+(ns mls.psk
+  "Pre-shared keys — [RFC 9420](https://www.rfc-editor.org/rfc/rfc9420) §8.4.
+
+  A group can inject entropy from outside MLS. Several PSKs are combined into
+  one `psk_secret`, which the key schedule then takes as the IKM of its second
+  Extract.
+
+  ## Why they are chained rather than concatenated
+
+  `psk_secret_[i] = Extract(psk_input_[i-1], psk_secret_[i-1])`, starting from
+  `Nh` zeros. Order matters, and it matters **on purpose**: the `PSKLabel`
+  that each PSK is expanded with carries its `index` and the total `count`, so
+  the same set of PSKs in a different order is a different secret, and a
+  subset of them is a different secret again.
+
+  That is what stops a member from dropping one PSK it does not hold and
+  proceeding with the rest. §8.4 says existing and new members MUST indicate
+  the same PSKs in the same order; this is the mechanism that makes a
+  disagreement visible rather than silent."
+  (:require [mls.crypto :as crypto]
+            [mls.result :as r :refer [ok error]]
+            [mls.uint :as uint]
+            [mls.varint :as v]))
+
+(def psk-type
+  "§8.4. `reserved(0)` is not a value a peer may send."
+  {:external 1 :resumption 2})
+
+(def resumption-usage
+  {:application 1 :reinit 2 :branch 3})
+
+(defn- u16 [n] [(bit-and (quot n 256) 0xFF) (bit-and n 0xFF)])
+
+(defn encode-psk-id
+  "`PreSharedKeyID` — a tagged union, and the two arms carry different fields.
+
+  The `psk_nonce` is common to both and MUST be `KDF.Nh` fresh random bytes
+  each time a PSK is injected. That is what lets the same PSK be used twice
+  without the key schedule seeing the same input twice; this namespace does
+  not generate it, for the reason randomness is a capability everywhere else
+  here."
+  [{:keys [type psk-id usage group-id epoch psk-nonce]}]
+  (case type
+    :external
+    (r/let-ok [id (v/opaque psk-id)
+               nonce (v/opaque psk-nonce)]
+      (ok (vec (concat [(:external psk-type)] id nonce))))
+
+    :resumption
+    (if-not (contains? resumption-usage usage)
+      (error :unknown-resumption-usage {:mls/usage usage})
+      (r/let-ok [gid (v/opaque group-id)
+                 nonce (v/opaque psk-nonce)]
+        (ok (vec (concat [(:resumption psk-type) (get resumption-usage usage)]
+                         gid (uint/u64! epoch) nonce)))))
+
+    (error :unknown-psk-type {:mls/type type})))
+
+(defn psk-label
+  "`PSKLabel { PreSharedKeyID id; uint16 index; uint16 count; }` — §8.4."
+  [psk-id index count-]
+  (r/let-ok [id (encode-psk-id psk-id)]
+    (ok (vec (concat id (u16 index) (u16 count-))))))
+
+(defn psk-secret
+  "Combine `psks` — a sequence of `{:id … :secret …}` — into one `psk_secret`.
+
+  With no PSKs at all the answer is `Nh` zeros, and that is the same value the
+  key schedule uses when the field is absent. The two paths agree by
+  construction rather than by both happening to be written the same way."
+  [suite psks]
+  (let [nh (:nh suite)
+        n (count psks)]
+    (loop [i 0 acc (vec (repeat nh 0))]
+      (if (= i n)
+        (ok acc)
+        (let [{:keys [id secret]} (nth psks i)
+              extracted (crypto/extract suite [] secret)]
+          (let [lbl (psk-label id i n)]
+            (if (r/error? lbl)
+              lbl
+              (let [input (crypto/expand-with-label suite extracted "derived psk"
+                                                    (r/val lbl) nh)]
+                (if (r/error? input)
+                  input
+                  (recur (inc i) (crypto/extract suite (r/val input) acc)))))))))))
+
+(defn decode-psk-id
+  "`PreSharedKeyID` — the decoder half of `mls.psk/encode-psk-id`."
+  [bs off]
+  (if (>= off (count bs))
+    (error :truncated-psk-id {:mls/at off})
+    (let [t (nth bs off) off (inc off)]
+      (cond
+        (= 1 t) (r/let-ok [id (v/read-opaque bs off)]
+                  (r/let-ok [n (v/read-opaque bs (:mls/next id))]
+                    (ok [{:type :external :psk-id (:mls/value id)
+                          :psk-nonce (:mls/value n)} (:mls/next n)])))
+        (= 2 t)
+        (if (>= off (count bs))
+          (error :truncated-psk-id {:mls/at off})
+          (let [usage (nth bs off)]
+            (r/let-ok [g (v/read-opaque bs (inc off))
+                       epoch (uint/read-u64 bs (:mls/next g))
+                       n (v/read-opaque bs (+ (:mls/next g) 8))]
+              (ok [{:type :resumption
+                    :usage (get {1 :application 2 :reinit 3 :branch} usage usage)
+                    :group-id (:mls/value g) :epoch epoch
+                    :psk-nonce (:mls/value n)}
+                   (:mls/next n)]))))
+        :else (error :unknown-psk-type {:mls/type t})))))

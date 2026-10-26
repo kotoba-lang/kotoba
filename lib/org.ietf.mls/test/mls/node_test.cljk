@@ -1,0 +1,367 @@
+(ns mls.node-test
+  "The ratchet tree's node encodings, against three of the working group's
+  corpora.
+
+  `messages` is a **codec** corpus: 300 entries of structs another
+  implementation serialised with random field values. Nothing in it is
+  cryptographically valid and it is not meant to be — decoding those bytes and
+  re-encoding to *the same bytes* is the whole of what it proves, and that is
+  exactly the question a wire format raises.
+
+  `tree-validation` is the semantic half: 98 real trees across all seven
+  suites, with the tree hash and the resolution of every node.
+
+  `tree-operations` applies one proposal to a tree.
+
+  ## Every entry is counted, and the ones nothing reads are named
+
+  Three of the seventeen structs in `messages` are the Welcome layer, which
+  does not exist yet. The test asserts **which** ones are unread rather than
+  looping over a handler map and quietly covering fewer structs each time one
+  is renamed — a corpus that lost a field between releases would otherwise
+  produce a smaller test that still passes."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [mls.framing :as fr]
+            [mls.node :as node]
+            [mls.proposal :as prop]
+            [mls.result :as r]
+            [mls.suite :as suite]
+            [mls.tree :as tree]
+            [mls.tree-hash :as th]
+            [mls.tree-ops :as ops]
+            [mls.tree-vectors :as tv]))
+
+(defn- unhex [s]
+  (mapv #(#?(:clj Integer/parseInt :cljs js/parseInt) (apply str %) 16) (partition 2 s)))
+
+(defn- hex [bs]
+  (apply str (map (fn [b] (let [b (bit-and (int b) 0xFF)
+                                s #?(:clj (Integer/toString b 16) :cljs (.toString b 16))]
+                            (if (= 1 (count s)) (str "0" s) s)))
+                  bs)))
+
+;; ── the codec corpus ────────────────────────────────────────────────────────
+
+(defn- whole
+  "Run a `[bs off] -> [:ok [v next]]` decoder over the whole buffer and refuse
+  a short read. A decoder that stopped early would re-encode to a prefix, and
+  a prefix that is compared against itself is not a round-trip."
+  [dec bs]
+  (r/let-ok [[v next-] (dec bs 0)]
+    (if (= next- (count bs))
+      (r/ok v)
+      (r/error :short-read {:mls/at next- :mls/total (count bs)}))))
+
+(defn- via-mls-message
+  "Unwrap an `MLSMessage` of the expected wire format, run `dec` over the body,
+  and re-wrap. The version and wire format are part of the bytes under test."
+  [wire-format dec enc]
+  (fn [bs]
+    (r/let-ok [m (fr/decode-mls-message bs)]
+      (if (not= wire-format (:wire-format m))
+        (r/error :wrong-wire-format {:mls/got (:wire-format m)})
+        (r/let-ok [v (dec (:body m))
+                   body (enc v)]
+          (fr/encode-mls-message wire-format body))))))
+
+(def ^:private codecs
+  "Struct name -> `bytes -> [:ok bytes]`, decoding and re-encoding.
+
+  The proposal entries carry the **bare** structs (`Add`, `Update`, …), not a
+  `Proposal` with its type tag. That is why `mls.proposal` separates the two:
+  the variant is what travels in a `FramedContent`, and the bare struct is
+  what this corpus and the RFC's own field names talk about."
+  {:mls-key-package (via-mls-message :mls-key-package
+                                     #(whole node/decode-key-package %)
+                                     node/encode-key-package)
+   :ratchet-tree #(r/let-ok [t (node/ratchet-tree %)] (node/encode-ratchet-tree t))
+   :add-proposal #(r/let-ok [v (whole prop/decode-add %)] (prop/encode-add v))
+   :update-proposal #(r/let-ok [v (whole prop/decode-update %)] (prop/encode-update v))
+   :remove-proposal #(r/let-ok [v (whole prop/decode-remove %)] (prop/encode-remove v))
+   :pre-shared-key-proposal #(r/let-ok [v (whole prop/decode-pre-shared-key %)]
+                               (prop/encode-pre-shared-key v))
+   :re-init-proposal #(r/let-ok [v (whole prop/decode-reinit %)] (prop/encode-reinit v))
+   :external-init-proposal #(r/let-ok [v (whole prop/decode-external-init %)]
+                              (prop/encode-external-init v))
+   :group-context-extensions-proposal
+   #(r/let-ok [v (whole prop/decode-group-context-extensions %)]
+      (prop/encode-group-context-extensions v))
+   :commit #(r/let-ok [v (whole prop/decode-commit %)] (prop/encode-commit v))
+   :public-message-application (via-mls-message :mls-public-message
+                                                fr/decode-public-message
+                                                fr/encode-public-message)
+   :public-message-proposal (via-mls-message :mls-public-message
+                                             fr/decode-public-message
+                                             fr/encode-public-message)
+   :public-message-commit (via-mls-message :mls-public-message
+                                           fr/decode-public-message
+                                           fr/encode-public-message)
+   :private-message (via-mls-message :mls-private-message
+                                     fr/decode-private-message
+                                     fr/encode-private-message)})
+
+(def ^:private welcome-layer
+  "The three structs this library cannot read yet. Named rather than counted:
+  a number would still be right after one of them was implemented and another
+  appeared."
+  #{:mls-welcome :mls-group-info :group-secrets})
+
+(deftest the-corpus-is-the-shape-this-test-assumes
+  (let [fields (set (keys (first tv/messages)))]
+    (is (= 300 (count tv/messages)))
+    (is (= fields (into (set (keys codecs)) welcome-layer))
+        "every struct in the corpus is either read or named as unread")
+    (is (empty? (clojure.set/intersection (set (keys codecs)) welcome-layer)))
+    (doseq [e tv/messages]
+      (is (= fields (set (keys e)))))))
+
+(deftest what-another-implementation-encoded-re-encodes-to-the-same-bytes
+  (doseq [[field codec] (sort-by key codecs)]
+    (testing (name field)
+      (doseq [[i e] (map-indexed vector tv/messages)]
+        (let [want (get e field)
+              got (codec (unhex want))]
+          (is (r/ok? got) (str field " " i " " (pr-str (r/err got))))
+          (when (r/ok? got)
+            (is (= want (hex (r/val got))) (str field " " i))))))))
+
+(deftest the-welcome-layer-is-absent-and-says-so
+  (doseq [field welcome-layer]
+    (is (contains? (set (keys (first tv/messages))) field)
+        (str (name field) " is in the corpus and nothing here reads it"))
+    (is (not (contains? codecs field)))))
+
+;; ── the semantic corpus ─────────────────────────────────────────────────────
+
+(defn- suite-of [id] (get suite/suites id))
+
+(deftest the-tree-hash-of-every-node-of-every-tree
+  (doseq [[i e] (map-indexed vector tv/tree-validation)]
+    (let [s (suite-of (:cipher-suite e))
+          nodes (node/ratchet-tree (unhex (:tree e)))]
+      (is (r/ok? nodes) (str "tree " i " " (pr-str (r/err nodes))))
+      (when (r/ok? nodes)
+        (let [nodes (r/val nodes)]
+          (is (= (count (:tree-hashes e)) (count nodes))
+              (str "tree " i ": the corpus has a hash for every node"))
+          (doseq [[x want] (map-indexed vector (:tree-hashes e))]
+            (let [got (th/tree-hash s nodes x)]
+              (is (r/ok? got) (str "tree " i " node " x))
+              (when (r/ok? got)
+                (is (= want (hex (r/val got))) (str "tree " i " node " x))))))))))
+
+(deftest the-resolution-of-every-node-of-every-tree
+  (doseq [[i e] (map-indexed vector tv/tree-validation)]
+    (let [nodes (r/val (node/ratchet-tree (unhex (:tree e))))]
+      (is (= (count (:resolutions e)) (count nodes)))
+      (doseq [[x want] (map-indexed vector (:resolutions e))]
+        (let [got (th/resolution nodes x)]
+          (is (r/ok? got) (str "tree " i " node " x))
+          (when (r/ok? got)
+            (is (= want (r/val got)) (str "tree " i " node " x))))))))
+
+(deftest a-leaf-in-a-real-tree-signs-over-the-group-it-is-in
+  (testing "LeafNodeTBS binds the group id and the leaf index — five suites"
+    (let [checked (atom 0) refused (atom 0)]
+      (doseq [e tv/tree-validation]
+        (let [s (suite-of (:cipher-suite e))
+              nodes (r/val (node/ratchet-tree (unhex (:tree e))))
+              gid (unhex (:group-id e))]
+          (doseq [[x n] (map-indexed vector nodes)]
+            (when (and n (= :leaf (:type n)))
+              (let [leaf (:leaf-node n)
+                    tbs (th/leaf-hash-input x leaf)]        ; forces the encoder
+                (is (r/ok? tbs))
+                (let [signed (node/leaf-node-tbs leaf gid (quot x 2))]
+                  (is (r/ok? signed))
+                  (let [v (mls.crypto/verify-with-label
+                           s (:signature-key leaf) "LeafNodeTBS"
+                           (r/val signed) (:signature leaf))]
+                    (if (= :ed448 (:signature s))
+                      (do (swap! refused inc)
+                          (is (= :unimplemented-signature-scheme (r/reason v))))
+                      (do (swap! checked inc)
+                          (is (r/ok? v)
+                              (str "leaf " x " suite " (:cipher-suite e)
+                                   " " (pr-str (r/err v)))))))))))))
+      (is (pos? @checked) "some leaf signature was actually verified")
+      (is (pos? @refused) "the Ed448 suites were reached, not skipped"))))
+
+(deftest a-leaf-signature-does-not-verify-in-another-group
+  (testing "the group id in LeafNodeTBS is load-bearing"
+    (let [e (first (filter #(= 1 (:cipher-suite %)) tv/tree-validation))
+          s (suite-of 1)
+          nodes (r/val (node/ratchet-tree (unhex (:tree e))))
+          [x n] (first (keep-indexed (fn [i n]
+                                       (when (and n (= :leaf (:type n))
+                                                  (not= :key-package (:source (:leaf-node n))))
+                                         [i n]))
+                                     nodes))]
+      (is (some? n) "the corpus has a leaf signed as a group member")
+      (when n
+        (let [leaf (:leaf-node n)
+              gid (unhex (:group-id e))
+              right (r/val (node/leaf-node-tbs leaf gid (quot x 2)))
+              wrong-group (r/val (node/leaf-node-tbs leaf (assoc gid 0 (bit-xor 1 (nth gid 0)))
+                                                     (quot x 2)))
+              wrong-index (r/val (node/leaf-node-tbs leaf gid (inc (quot x 2))))
+              verify #(mls.crypto/verify-with-label s (:signature-key leaf) "LeafNodeTBS"
+                                                    % (:signature leaf))]
+          (is (r/ok? (verify right)))
+          (is (= :signature-mismatch (r/reason (verify wrong-group))))
+          (is (= :signature-mismatch (r/reason (verify wrong-index)))))))))
+
+(deftest a-blank-node-is-a-value-and-not-a-gap
+  (testing "trees in the corpus have blanks, and they survive a round trip"
+    (let [with-blanks (filter (fn [e]
+                                (let [t (node/ratchet-tree (unhex (:tree e)))]
+                                  (and (r/ok? t) (some nil? (r/val t)))))
+                              tv/tree-validation)]
+      (is (pos? (count with-blanks)) "the corpus exercises blank nodes")
+      (doseq [e with-blanks]
+        (let [nodes (r/val (node/ratchet-tree (unhex (:tree e))))]
+          (is (= (:tree e) (hex (r/val (node/encode-ratchet-tree nodes)))))))))
+  (testing "a blank hashes to something, and to something else than a leaf"
+    (let [s (suite-of 1)
+          e (first tv/tree-validation)
+          nodes (r/val (node/ratchet-tree (unhex (:tree e))))
+          real (r/val (th/tree-hash s nodes 0))
+          blanked (r/val (th/tree-hash s (assoc nodes 0 nil) 0))]
+      (is (= 32 (count blanked)))
+      (is (not= real blanked)))))
+
+;; ── applying a proposal to a tree ───────────────────────────────────────────
+
+(deftest one-proposal-applied-to-a-real-tree
+  (testing "add, update and remove, against trees another implementation built"
+    (let [seen (atom #{})]
+      (doseq [[i e] (map-indexed vector tv/tree-operations)]
+        (let [s (suite-of (:cipher-suite e))
+              before (r/val (node/ratchet-tree (unhex (:tree-before e))))
+              after (r/val (node/ratchet-tree (unhex (:tree-after e))))
+              p (whole prop/decode-proposal (unhex (:proposal e)))]
+          (is (r/ok? p) (str i " " (pr-str (r/err p))))
+          (when (r/ok? p)
+            (swap! seen conj (:type (r/val p)))
+            (testing (str i " " (name (:type (r/val p))))
+              ;; the corpus's own hashes first, so a wrong tree hash and a
+              ;; wrong tree are told apart
+              (is (= (:tree-hash-before e) (hex (r/val (th/root-hash s before)))))
+              (is (= (:tree-hash-after e) (hex (r/val (th/root-hash s after)))))
+              (let [got (ops/apply-proposal before (:proposal-sender e) (r/val p))]
+                (is (r/ok? got) (str i " " (pr-str (r/err got))))
+                (when (r/ok? got)
+                  (is (= after (r/val got)) (str i ": the tree itself"))
+                  (is (= (:tree-hash-after e) (hex (r/val (th/root-hash s (r/val got)))))
+                      (str i ": and its hash"))))))))
+      (is (= #{:add :update :remove} @seen)
+          "all three tree-changing proposals are exercised"))))
+
+(deftest a-proposal-that-does-not-change-the-tree-says-so
+  (let [nodes (r/val (node/ratchet-tree (unhex (:tree (first tv/tree-validation)))))]
+    (doseq [t [:psk :reinit :external-init :group-context-extensions]]
+      (is (= :proposal-does-not-change-the-tree
+             (r/reason (ops/apply-proposal nodes 0 {:type t})))))))
+
+;; ── the two MUSTs on the ratchet_tree encoding ──────────────────────────────
+
+(deftest a-tree-that-ends-in-a-blank-is-refused
+  (testing "§12.4.3.3: the receiver MUST check that the last node is non-blank"
+    (let [nodes (r/val (node/ratchet-tree (unhex (:tree (first tv/tree-validation)))))
+          padded (r/val (node/vector-v-for-test (conj (vec (take-while some? nodes)) nil)))]
+      (is (= :ratchet-tree-ends-in-a-blank (r/reason (node/ratchet-tree padded))))))
+  (testing "and an empty one, which has no last node at all"
+    (is (= :empty-ratchet-tree (r/reason (node/ratchet-tree [0]))))))
+
+(deftest the-encoder-drops-the-trailing-blanks-it-was-given
+  (testing "§12.4.3.3: the sender MUST NOT include a blank after the last non-blank"
+    (let [e (first (filter (fn [x]
+                             (let [t (node/ratchet-tree (unhex (:tree x)))]
+                               (and (r/ok? t)
+                                    (nil? (peek (r/val t))))))
+                           tv/tree-validation))
+          _ (is (some? e) "the corpus has a tree the decoder had to pad")
+          nodes (r/val (node/ratchet-tree (unhex (:tree e))))]
+      (is (nil? (peek nodes)) "the decoder really did pad this tree")
+      (is (= (:tree e) (hex (r/val (node/encode-ratchet-tree nodes)))))
+      (is (= (:tree e) (hex (r/val (node/encode-ratchet-tree (into nodes (repeat 8 nil))))))
+          "extra blanks a caller adds are dropped too"))))
+
+(deftest a-uint64-that-neither-runtime-holds-exactly-is-refused-not-crashed
+  (testing "an epoch of 2^63 used to throw on the JVM and round on ClojureScript"
+    (let [msg (vec (concat [0] (repeat 8 0xFF) [1 0 0 0]))]
+      (is (= :u64-beyond-exact-range (r/reason (fr/decode-private-message msg))))))
+  (testing "the boundary is 2^53-1, and it is a boundary and not a cliff"
+    (let [at (vec (concat [0] [0x00 0x1F 0xFF 0xFF 0xFF 0xFF 0xFF 0xFF] [1 0 0 0]))
+          over (vec (concat [0] [0x00 0x20 0x00 0x00 0x00 0x00 0x00 0x00] [1 0 0 0]))]
+      (is (= 9007199254740991 (:epoch (r/val (fr/decode-private-message at)))))
+      (is (= :u64-beyond-exact-range (r/reason (fr/decode-private-message over)))))))
+
+;; ── the part of Add the corpus does not reach ───────────────────────────────
+;;
+;; `tree-operations` has two Add cases and **neither of them exercises the
+;; unmerged step**: one extends the tree into an all-blank subtree, and the
+;; other's blank leaf has no non-blank ancestor. Measured: an implementation
+;; that blanks the direct path on Add — the thing §12.1.1 conspicuously does
+;; not do — passes that corpus with nothing red.
+;;
+;; So the states come from `tree-validation` instead, which has 63 trees where
+;; the leftmost blank leaf does sit under a non-blank ancestor. Those are
+;; another implementation's trees; the expected *result* is the RFC's rule
+;; rather than another implementation's answer, and that is weaker evidence.
+;; It is labelled here rather than folded into the counts above.
+
+(defn- add-sites
+  "Corpus trees whose leftmost blank leaf has at least one non-blank ancestor."
+  []
+  (for [e tv/tree-validation
+        :let [nodes (r/val (node/ratchet-tree (unhex (:tree e))))
+              n (ops/leaf-count nodes)
+              l (first (filter #(nil? (nth nodes (* 2 %))) (range n)))]
+        :when l
+        :let [path (r/val (tree/direct-path (* 2 l) n))
+              live (filterv #(some? (nth nodes %)) path)]
+        :when (seq live)]
+    {:nodes nodes :l l :path path :live live}))
+
+(defn- sorted-unmerged?
+  [nodes]
+  (every? (fn [n]
+            (or (nil? n) (not= :parent (:type n))
+                (let [u (:unmerged-leaves (:parent-node n))] (= u (vec (sort u))))))
+          nodes))
+
+(deftest add-leaves-the-path-standing-and-records-the-leaf-as-unmerged
+  (let [sites (add-sites)]
+    (is (<= 60 (count sites)) "the corpus supplies these states")
+    (doseq [{:keys [nodes l path live]} sites]
+      (let [leaf (:leaf-node (first (filter #(and % (= :leaf (:type %))) nodes)))
+            got (ops/apply-add nodes leaf)]
+        (is (r/ok? got))
+        (when (r/ok? got)
+          (let [after (r/val got)]
+            (is (= {:type :leaf :leaf-node leaf} (nth after (* 2 l))))
+            (doseq [p live]
+              (is (some? (nth after p)) "Add does not blank the path")
+              (is (contains? (set (:unmerged-leaves (:parent-node (nth after p)))) l)
+                  "and records the new leaf as unmerged at each live ancestor"))
+            (doseq [p (remove (set live) path)]
+              (is (nil? (nth after p)) "a blank ancestor stays blank"))
+            (is (sorted-unmerged? after))
+            (is (= after (r/val (node/ratchet-tree (r/val (node/encode-ratchet-tree after))))))))))))
+
+(deftest the-unmerged-list-stays-sorted-when-the-new-leaf-is-not-the-largest
+  (testing "§7.1: the entries MUST be sorted in increasing order"
+    ;; **This state is constructed.** Of the 63 sites above, none has an
+    ;; existing unmerged entry greater than the leaf being added, so nothing in
+    ;; the working group's corpus tells the two orderings apart. The tree is
+    ;; real; the unmerged entry placed on it is not.
+    (let [{:keys [nodes l live]} (first (filter #(> (count (:live %)) 0) (add-sites)))
+          p (first live)
+          bigger (dec (ops/leaf-count nodes))
+          seeded (assoc-in nodes [p :parent-node :unmerged-leaves] [bigger])
+          leaf (:leaf-node (first (filter #(and % (= :leaf (:type %))) nodes)))]
+      (is (< l bigger) "the seeded entry really is larger than the new leaf")
+      (let [after (r/val (ops/apply-add seeded leaf))]
+        (is (= [l bigger] (:unmerged-leaves (:parent-node (nth after p)))))
+        (is (sorted-unmerged? after))))))
