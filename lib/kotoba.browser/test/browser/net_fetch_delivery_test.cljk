@@ -1,0 +1,208 @@
+(ns browser.net-fetch-delivery-test
+  "Verifies the REAL half of `fetch()` response delivery this repo can prove
+   on the JVM: a REAL local HTTP server (JDK `com.sun.net.httpserver.HttpServer`,
+   the exact same pattern `net_http_test.clj`/`net_worker_test.clj` use)
+   serves a real response body, `browser.net.http/fetch-fn` really fetches it
+   over a real socket, and `browser.compat.quickjs-execution/apply-capability`
+   really captures that real response (status/headers/body) EAGERLY into
+   `:net/fetch-responses` the instant it processes the `:net/fetch` request
+   (mirroring `worker-create-result`'s eager-capture reasoning -- a real
+   HTTP client call is itself synchronous/blocking, so there is nothing left
+   to wait for), then really hands it to the NEXT `evaluate!` call's engine
+   invocation as `:fetch/snapshot` (`quickjs-execution/fetch-snapshot`) --
+   proving the WIRING (real fetch -> real response captured -> real snapshot
+   delivered to the next script tag, outbox cleared) end to end.
+
+   What this suite CANNOT prove (and does not claim to): the JVM
+   `browser.compat.quickjs-wasm` engine has no real QuickJS VM to offer at
+   all (`engine!`'s `:clj` branch is a stub, `:invoke nil` -- see that
+   namespace), so there is no real `globalThis.fetch`/`.then()` JS shim
+   running here, exactly the way `net_worker_test.clj` cannot prove a real
+   second QuickJS context. The genuinely novel claim -- a real `fetch()`
+   call's returned thenable actually being resolved (or rejected) by the
+   webapi shim's fetch delivery IIFE, across two real `<script>` tags -- is
+   proven only in
+   `test-cljs/browser/compat/quickjs_fetch_smoke_test.cljk`, the one
+   platform where `quickjs-wasm`'s engine is real (see that namespace's own
+   docstring for the JVM/real-engine split rationale, mirroring
+   `quickjs_worker_smoke_test.cljs`'s)."
+  (:require [kotoba.bytes :as kbytes] [browser.compat.quickjs :as quickjs]
+            [browser.compat.quickjs-binding :as binding]
+            [browser.compat.quickjs-execution :as execution]
+            [browser.net.http :as http]
+            [browser.origin :as origin]
+            [browser.profile :as profile]
+            [kotoba.test :refer [deftest is]])
+  (:import [com.sun.net.httpserver HttpExchange HttpHandler HttpServer]
+           [java.net InetSocketAddress]))
+
+;; ---------------------------------------------------------------------
+;; A real HttpServer serving a real response body (mirrors
+;; net_http_test.clj's/net_worker_test.clj's start-server!/server-url
+;; exactly).
+;; ---------------------------------------------------------------------
+
+(defn- respond!
+  [^HttpExchange exchange status headers ^String body]
+  (let [response-headers (.getResponseHeaders exchange)]
+    (doseq [[k v] headers]
+      (.add response-headers (str k) (str v))))
+  (let [bytes (kbytes/utf8-bytes (or body ""))]
+    (if (zero? (alength bytes))
+      (.sendResponseHeaders exchange status -1)
+      (do (.sendResponseHeaders exchange status (alength bytes))
+          (with-open [os (.getResponseBody exchange)]
+            (.write os bytes)))))
+  (.close exchange))
+
+(defn- start-server!
+  [handlers]
+  (let [server (HttpServer/create (InetSocketAddress. "127.0.0.1" 0) 0)]
+    (doseq [[path handler-fn] handlers]
+      (.createContext server path
+                       (reify HttpHandler
+                         (handle [_ exchange] (handler-fn exchange)))))
+    (.setExecutor server nil)
+    (.start server)
+    server))
+
+(defn- server-url
+  [^HttpServer server path]
+  (str "http://127.0.0.1:" (.getPort (.getAddress server)) path))
+
+;; ---------------------------------------------------------------------
+;; quickjs-execution wiring: real :net/fetch against the real server,
+;; eager capture into :net/fetch-responses, and the host-computed
+;; fetch-snapshot delivered to the next script tag's engine invocation.
+;; ---------------------------------------------------------------------
+
+(deftest quickjs-fetch-wiring-moves-real-fetched-response-through-apply-capability
+  (let [server (start-server!
+                {"/data" (fn [exchange]
+                           (respond! exchange 200
+                                     {"Content-Type" "text/plain"}
+                                     "hello real fetch"))})]
+    (try
+      (let [url (server-url server "/data")
+            page-url (server-url server "/app")
+            profile (-> (profile/new-profile {:id "fetchers"})
+                        (profile/grant-permission (origin/origin url) :net/fetch))
+            adapter (quickjs/new-adapter {:origin (origin/origin url)
+                                          :profile-id "fetchers"})
+            received-payload (atom nil)
+            call-count (atom 0)
+            state (execution/new-state
+                   {:binding (binding/empty-binding adapter)
+                    ;; Same-origin as the real server (both page and fetch
+                    ;; target are 127.0.0.1:<port>) so this test exercises
+                    ;; real fetch delivery without also having to stand up
+                    ;; CORS response headers -- browser.net-test already
+                    ;; covers cross-origin/CORS policy in isolation.
+                    :net-context {:profile profile
+                                  :page-url page-url}
+                    :fetch-fn (http/fetch-fn {:connect-timeout-ms 2000 :request-timeout-ms 5000})
+                    ;; A real two-<script>-tag page never re-sends the SAME
+                    ;; capability requests on its second script tag; this
+                    ;; fake engine mirrors that by only returning the
+                    ;; fetch request on the FIRST call (standing in for
+                    ;; script 1's `fetch(url)`) and an empty request list
+                    ;; on any later call (standing in for script 2, which
+                    ;; -- exactly like the CLJS smoke test's
+                    ;; `run-script2!` -- does not even touch fetch itself,
+                    ;; relying entirely on the host-computed fetch-snapshot
+                    ;; it receives).
+                    :engine (fn [request]
+                              (reset! received-payload request)
+                              (swap! call-count inc)
+                              {:result :fetch
+                               :requests (if (= 1 @call-count)
+                                           [{:request/id "fetch-1"
+                                             :capability :net/fetch
+                                             :url url
+                                             :request {:method :get}}]
+                                           [])})})
+            state (execution/evaluate! state {:source "fetch('...')"})]
+        ;; Real fetch actually happened: the real local server's real bytes
+        ;; reached the audit-visible capability result.
+        (is (= true (-> state :capability/results first :ok?)))
+        (is (= 200 (-> state :capability/results first :result :status)))
+        (is (= "hello real fetch" (-> state :capability/results first :result :body))
+            "expected the real HTTP server's real response body")
+        ;; Eager capture: the real response is already stashed into
+        ;; :net/fetch-responses, keyed by the fetch call's own :request/id,
+        ;; not yet delivered.
+        (is (= 200 (get-in state [:net/fetch-responses "fetch-1" :status])))
+        (is (= "hello real fetch" (get-in state [:net/fetch-responses "fetch-1" :body])))
+        ;; A SECOND evaluate! (standing in for a later <script> tag on the
+        ;; same page, exactly the way browser.compat.quickjs-runner threads
+        ;; page-lifetime state across real script tags) computes a fresh
+        ;; fetch-snapshot BEFORE invoking the engine -- delivering the
+        ;; queued response into the payload the (fake, but
+        ;; request-capturing) engine receives, and clearing the outbox.
+        (let [state (execution/evaluate! state {:source "/* second script tag */"})
+              snapshot (:fetch/snapshot @received-payload)]
+          (is (= 200 (get-in snapshot ["fetch-1" :status]))
+              (str "expected the real fetched response to show up in the "
+                   "host-computed fetch-snapshot passed to the next script's "
+                   "invocation -- got " (pr-str snapshot)))
+          (is (= "hello real fetch" (get-in snapshot ["fetch-1" :body])))
+          (is (empty? (:net/fetch-responses state))
+              "expected :net/fetch-responses to be cleared once its snapshot was taken")
+          (is (map? state))))
+      (finally (.stop server 0)))))
+
+(deftest quickjs-fetch-denied-by-profile-permission-still-delivers-a-rejection
+  ;; Permission denial is itself a real, synchronous, host-computed outcome
+  ;; (decided before ever touching the network) -- so, mirroring a real
+  ;; browser's fetch() REJECTING for a blocked/denied request, it DOES get
+  ;; captured into :net/fetch-responses for delivery (as a rejected
+  ;; promise -- see quickjs-wasm's fetch delivery IIFE, which rejects
+  ;; whenever the snapshot entry carries an :error). What must NEVER happen
+  ;; is a real network attempt: permission short-circuits before the real
+  ;; :fetch-fn is ever called.
+  (let [profile (profile/new-profile {:id "no-fetch"}) ; no grant
+        adapter (quickjs/new-adapter {:origin "https://app.example"
+                                      :profile-id "no-fetch"})
+        calls (atom [])
+        state (execution/new-state
+               {:binding (binding/empty-binding adapter)
+                :net-context {:profile profile
+                              :page-url "https://app.example/app"}
+                :fetch-fn (fn [req]
+                            (swap! calls conj req)
+                            {:status 200 :headers {} :body "nope"})
+                :engine (fn [_]
+                          {:result :fetch
+                           :requests [{:request/id "fetch-1"
+                                       :capability :net/fetch
+                                       :url "https://api.example/data"
+                                       :request {:method :get}}]})})
+        state (execution/evaluate! state {:source "fetch('...')"})]
+    (is (empty? @calls)
+        "expected permission denial to short-circuit before any real fetch attempt")
+    (is (= false (-> state :capability/results first :ok?)))
+    (is (= :permission/not-granted
+           (get-in state [:net/fetch-responses "fetch-1" :error])))))
+
+(deftest quickjs-fetch-fabricated-mode-is-byte-for-byte-unchanged-without-fetch-fn
+  ;; No :fetch-fn (and no :net-context) injected at all -- the default,
+  ;; exactly mirroring quickjs_execution_test.clj's own pre-existing
+  ;; fetch coverage (e.g. quickjs-engine-module-fetch-storage-and-
+  ;; unsupported-capabilities always supplies a :fetch-fn; this test is the
+  ;; genuinely bare default), re-asserted here to make explicit that
+  ;; :net/fetch-responses stays completely untouched in fabricated mode.
+  (let [adapter (quickjs/new-adapter {:origin "https://app.example"
+                                      :profile-id "default"})
+        state (execution/new-state
+               {:binding (binding/empty-binding adapter)
+                :engine (fn [_]
+                          {:result :fetch
+                           :requests [{:request/id "fetch-1"
+                                       :capability :net/fetch
+                                       :url "https://app.example/data"
+                                       :request {:method :get}}]})})
+        state (execution/evaluate! state {:source "fetch('...')"})]
+    (is (= false (-> state :capability/results first :ok?)))
+    (is (nil? (-> state :capability/results first :result)))
+    (is (empty? (:net/fetch-responses state))
+        "fabricated mode must never populate :net/fetch-responses")))
