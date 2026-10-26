@@ -1,0 +1,99 @@
+(ns kotoba.vm-inga-bind-test
+  "The one-line bind ADR-2608147100 left as a follow-up: construct
+  `inga.state/machine` with `kotoba.vm/invoke-fn` against the same
+  IPLD store, run `:actor-call`, and watch only the callee's state
+  root move.
+
+  inga is a test extra-dep. This namespace is the composition site.
+  Production `src/` still does not import consensus, and nothing here
+  imports Filecoin — the guest is the v1 IPLD register machine."
+  (:require [kotoba.lang.error :as kerror] [kotoba.test :refer [deftest is testing]]
+            [inga.state :as state]
+            [ipld.core :as ipld]
+            [kotoba.vm :as vm]
+            [kotoba.vm-test :as vt]))
+
+(defn- put-into! [store]
+  (fn [cid bytes]
+    (swap! store assoc cid bytes)
+    cid))
+
+(defn- bind-machine
+  "inga.state/machine whose `:invoke-fn` is this kernel, sharing `store`."
+  ([store] (bind-machine store nil))
+  ([store fuel]
+   (let [get-fn (fn [cid] (get @store cid))
+         put! (put-into! store)
+         invoke (vm/invoke-fn {:get-fn get-fn :put! put!})]
+     (state/machine
+      (cond-> {:decode-block :ops
+               :emit-fn state/default-emit
+               :put! put!
+               :get-fn get-fn
+               :blind-fn pr-str
+               :encrypt-fn identity
+               :authority {}
+               :height-fn :height
+               :invoke-fn invoke}
+        fuel (assoc :fuel fuel))))))
+
+(defn- put-alice [code state]
+  {:op :actor-put :address "alice" :caller "alice"
+   :actor {:code code :state state :nonce 1 :balance 100}})
+
+(defn- call-inc []
+  {:op :actor-call :address "alice" :caller "bob"
+   :method "inc" :args []})
+
+(defn- count-at [store cid]
+  (get (ipld/get-node (fn [c] (get @store c)) cid) "count"))
+
+(deftest an-inga-machine-running-kotoba-vm-advances-only-callee-state
+  (let [store (atom {})
+        put! (put-into! store)
+        code (vm/put-code! put! (vt/guest-node))
+        init (ipld/put-node! put! {"count" 0})
+        m (bind-machine store)
+        st ((:apply-fn m) ((:init-fn m))
+            {:height 1 :ops [(put-alice code init) (call-inc)]})
+        alice (get (state/actors st) "alice")]
+    (is (string? (:state alice)))
+    (is (not= init (:state alice))
+        "the call advanced the callee's own state root")
+    (is (= 1 (count-at store (:state alice))))
+    (is (= [100 1 code] [(:balance alice) (:nonce alice) (:code alice)])
+        "and touched nothing else — balance, nonce and code are not a call's to move")
+    (is (nil? (get (state/actors st) "bob"))
+        "the caller did not come into existence by calling")))
+
+(deftest fuel-from-inga-is-the-calls-budget
+  (testing "the block's price for :actor-call is the VM budget; exhaustion refuses, state stays"
+    (let [store (atom {})
+          put! (put-into! store)
+          code (vm/put-code! put! (vt/guest-node))
+          init (ipld/put-node! put! {"count" 0})
+          m (bind-machine store {:budget-fn (constantly 100000)
+                                 :cost-fn (fn [op]
+                                            (if (= :actor-call (:op op)) 5 1))
+                                 :height-fn :height})
+          st ((:apply-fn m) ((:init-fn m))
+              {:height 2 :ops [(put-alice code init) (call-inc)]})
+          alice (get (state/actors st) "alice")]
+      (is (= init (:state alice))
+          "an exhausted call must not flush")
+      (is (= 0 (count-at store init)))
+      (is (= #{[1]} (state/query st {:find '[?v]
+                                     :where '[["inga.refusal/block/2"
+                                               "inga.refusal/fuel-exhausted" ?v]]}))))))
+
+(deftest a-corrupt-store-still-throws-through-inga
+  (testing "CID mismatch is a storage fault, not an actor refusal, even behind the seam"
+    (let [store (atom {})
+          put! (put-into! store)
+          code (vm/put-code! put! (vt/guest-node))
+          init (ipld/put-node! put! {"count" 0})
+          _ (swap! store assoc code (ipld/encode {"not" "code"}))
+          m (bind-machine store)]
+      (is (thrown-with-msg? kerror/ExceptionInfo #"CID mismatch"
+                            ((:apply-fn m) ((:init-fn m))
+                             {:height 3 :ops [(put-alice code init) (call-inc)]}))))))

@@ -1,0 +1,97 @@
+;; Ordered Ethereum transitions inside an explicitly admitted AWAI Cell.
+;; Inga finality and Cell authority remain separate from Ethereum signatures.
+;; This bounded adapter is not an Ethereum block producer or RPC endpoint.
+(ns kotoba.vm.evm.native-ethereum-domain
+ (:require [kotoba.vm.evm.native-domain :as cid]
+           [kotoba.vm.evm.native-transition :as tr]
+           [kotoba.vm.evm.native-execution :as x]
+           [kotoba.vm.evm.native-state :as s]
+           [kotoba.vm.evm.native-trie :as trie]
+           [kotoba.vm.evm.native-bytes :as b]
+           [inga.native-prefix :as n]
+           [sha2.core :as sha]
+           [ed25519.selfhost :as ed]))
+;; Context: domain|Inga-chain|trusted-genesis|authority-key|Cell|Cell-key|
+;; genesis-world ASCII hex|prescribed EVM block-context ASCII hex.
+;; Request: domain|Cell|domain-nonce|before-stateRoot|raw-tx-hex|grant|Cell-sig.
+;; The grant binds the complete context. The Cell signature binds all first
+;; six request fields, including the authority's grant and transaction bytes.
+(defn request-cid [request :string] :string (cid/request-cid request))
+(defn- de-hex-size [s :string size :i64] :bool
+ (and (= (string-length s) size) (b/valid-hex? s)))
+(defn- de-context? [ctx :string] :bool
+ (and (b/ascii? ctx) (= (b/fields ctx 124) 8)
+      (> (string-length (b/field ctx 124 0)) 0) (> (string-length (b/field ctx 124 1)) 0)
+      (> (string-length (b/field ctx 124 4)) 0)
+      (de-hex-size (b/field ctx 124 2) 64) (de-hex-size (b/field ctx 124 3) 64)
+      (de-hex-size (b/field ctx 124 5) 64) (b/valid-ascii-hex? (b/field ctx 124 6))
+      (b/valid-ascii-hex? (b/field ctx 124 7))
+      (s/valid-world? (b/hex-text (b/field ctx 124 6)))
+      (x/valid-block? (b/hex-text (b/field ctx 124 7)))))
+(defn- de-body [request :string] :string
+ (loop [i 0 out "awai.ethereum-request.v1"]
+  (if (= i 6) out (recur (+ i 1) (string-concat (string-concat out "\n") (b/field request 124 i))))))
+(defn- de-authorized? [ctx :string request :string] :bool
+ (and (b/ascii? request) (= (b/fields request 124) 7)
+      (= (b/field request 124 0) (b/field ctx 124 0)) (= (b/field request 124 1) (b/field ctx 124 4))
+      (>= (n/number (b/field request 124 2)) 0) (de-hex-size (b/field request 124 3) 64)
+      (b/valid-hex? (b/field request 124 4)) (<= (string-length (b/field request 124 4)) 2097152)
+      (de-hex-size (b/field request 124 5) 128) (de-hex-size (b/field request 124 6) 128)
+      (ed/verify? (ed/hex-bytes (b/field ctx 124 3))
+                  (b/ascii-bytes (string-concat "awai.ethereum-grant.v1\n" ctx)) (ed/hex-bytes (b/field request 124 5)))
+      (ed/verify? (ed/hex-bytes (b/field ctx 124 5)) (b/ascii-bytes (de-body request)) (ed/hex-bytes (b/field request 124 6)))))
+(defn- de-find [catalog :string id :string] :string
+ (loop [i 0] (if (= i (b/fields catalog 10)) ""
+  (let [request (b/field catalog 10 i)] (if (= (request-cid request) id) request (recur (+ i 1)))))))
+(defn- de-seen? [seen :string id :string] :bool
+ (loop [i 0] (if (= i (b/fields seen 44)) false
+  (if (= (b/field seen 44 i) id) true (recur (+ i 1))))))
+(defn- de-add [out :string item :string separator :string] :string
+ (if (= out "") item (string-concat (string-concat out separator) item)))
+(defn- de-result [height :i64 nonce :i64 world :string receipts :string] :string
+(let [a (de-add "ok" (str height) "|") bb (de-add a (str nonce) "|")
+      c (de-add bb (b/to-hex (trie/state-root world)) "|") dd (de-add c (b/ascii-hex world) "|")]
+ (de-add dd receipts "|")))
+(defn- de-receipt [id :string status :i64 before :string after :string admitted :bool tx [:ref :evm.native/transition]] :string
+(let [a (de-add id (str status) ",") bb (de-add a before ",") cc (de-add bb after ",")
+      dd (de-add cc (str (if admitted (record-get [:ref :evm.native/transition] tx :gas-used) 0)) ",")
+      ee (de-add dd (if admitted (b/to-hex (record-get [:ref :evm.native/transition] tx :hash)) "") ",")
+      ff (de-add ee (if admitted (b/to-hex (record-get [:ref :evm.native/transition] tx :output)) "") ",")]
+ (de-add ff (if admitted (b/ascii-hex (record-get [:ref :evm.native/transition] tx :logs)) "") ",")))
+(defn replay [ctx :string validators :string quorum :i64 prefix :string tip-qc :string catalog :string checkpoint :string] :string
+ ;; Full genesis replay plus durable checkpoint extension verification.
+ ;; Output: ok|finalized-height|Cell-nonce|stateRoot|world-hex|receipts.
+ ;; Receipts: CID,status,before-root,after-root,gas-used,tx-hash,output-hex,logs-hex.
+ ;; Rejected Cell requests and invalid Ethereum envelopes are domain
+ ;; refusal receipts, not Ethereum transaction inclusion receipts.
+ (if (or (not (de-context? ctx)) (not (b/ascii? catalog)) (> (string-length catalog) 4194304)
+         (> (b/fields catalog 10) 16)) "rejected:context-or-bounds"
+  (let [height (n/verify-extension (b/field ctx 124 1) (b/field ctx 124 2) validators quorum prefix tip-qc checkpoint)]
+   (if (< height 0) "rejected:proof-or-checkpoint"
+    (let [block-context (b/hex-text (b/field ctx 124 7)) initial (b/hex-text (b/field ctx 124 6))]
+     (loop [block 1 proposal 0 count 0 nonce 0 world initial seen "" receipts ""]
+      (if (> block height)
+       (de-result height nonce world receipts)
+       (let [entries (b/field (b/field prefix 10 block) 124 2)]
+        (cond (= proposal (b/fields entries 44)) (recur (+ block 1) 0 count nonce world seen receipts)
+              (>= count 16) "rejected:execution-bound"
+              :else
+              (let [id (b/field entries 44 proposal) request (de-find catalog id)]
+               (cond (de-seen? seen id) (recur block (+ proposal 1) count nonce world seen receipts)
+                     (= request "") "rejected:missing-request"
+                     :else
+                     (let [before (b/to-hex (trie/state-root world))
+                           reason (cond (not (de-authorized? ctx request)) 20
+                                        (not (= (n/number (b/field request 124 2)) nonce)) 21
+                                        (not (= (b/field request 124 3) before)) 22 :else 0)
+                           tx (tr/apply-transaction world (if (= reason 0) (b/from-hex (b/field request 124 4)) (vector-i64)) block-context)
+                           status (if (= reason 0) (record-get [:ref :evm.native/transition] tx :status) reason)]
+                      (if (or (= status 8) (= status 10)) "rejected:execution-profile"
+                       (let [admitted (and (= reason 0) (< status 10))
+                             next (if admitted (record-get [:ref :evm.native/transition] tx :world) world)
+                             after (b/to-hex (trie/state-root next))
+                             receipt (de-receipt id status before after admitted tx)]
+                        (recur block (+ proposal 1) (+ count 1) (+ nonce (if admitted 1 0)) next
+                          (de-add seen id ",") (de-add receipts receipt ";"))))))))))))))
+)
+)

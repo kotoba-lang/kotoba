@@ -1,0 +1,77 @@
+;; Paris transaction state transition. Admission, nonce and fee accounting
+;; are independent of frame rollback; policy refusals never publish a state.
+(ns kotoba.vm.evm.native-transition
+ (:require [kotoba.vm.evm.native-transaction :as t]
+           [kotoba.vm.evm.native-execution :as x]
+           [kotoba.vm.evm.native-state :as s]
+           [kotoba.vm.evm.native-word :as w]
+           [kotoba.vm.evm.native-bytes :as b]
+           [kotoba.vm.evm.native-trie :as trie])
+ (:schemas {:evm.native/transition [:record :evm.native/transition
+   [[:status :i64] [:world :string] [:gas-used :i64] [:output :vector-i64]
+    [:logs :string] [:state-root :vector-i64] [:hash :vector-i64]]]}))
+(defn- tr-refuse [state :string code :i64] [:ref :evm.native/transition]
+ (record-new [:ref :evm.native/transition] code state 0 (vector-i64) "" (vector-i64) (vector-i64)))
+(defn- tr-overflow-product [a :vector-i64 scalar :i64 product :vector-i64] :bool
+ (and (> scalar 0) (not (w/equal-word (w/divide-word product (w/from-long scalar)) a))))
+(defn apply-transaction [world :string raw :vector-i64 block :string] [:ref :evm.native/transition]
+ (if (not (s/within-limits? world)) (tr-refuse world 10)
+  (if (or (not (s/valid-world? world)) (not (x/valid-block? block))) (tr-refuse world 11)
+  (let [tx (t/decode raw (w/from-hex (b/field block 124 0)))
+        status (record-get [:ref :evm.native/transaction] tx :status)]
+   (if (not (= status 1)) (tr-refuse world status)
+    (let [sender (record-get [:ref :evm.native/transaction] tx :sender)
+          nonce (record-get [:ref :evm.native/transaction] tx :nonce)
+          gas (record-get [:ref :evm.native/transaction] tx :gas-limit)
+          fee (record-get [:ref :evm.native/transaction] tx :fee-cap)
+          tip (record-get [:ref :evm.native/transaction] tx :tip-cap)
+          value (record-get [:ref :evm.native/transaction] tx :value)
+          intrinsic (record-get [:ref :evm.native/transaction] tx :intrinsic)
+          base (w/from-hex (b/field block 124 6))
+          block-gas (w/from-hex (b/field block 124 5))
+          maximum (w/multiply-word fee (w/from-long gas))
+          required (w/add-word maximum value)
+          balance (s/balance world sender)]
+     (cond
+      (or (not (w/equal-word nonce (s/nonce world sender)))
+          (w/equal-word nonce (w/from-hex "ffffffffffffffff"))
+          (> (vector-count (s/code world sender)) 0)
+          (< gas intrinsic) (w/less-word block-gas (w/from-long gas))
+          (w/less-word fee base) (w/less-word fee tip)
+          (tr-overflow-product fee gas maximum) (w/less-word required maximum)
+          (w/less-word balance required)) (tr-refuse world 11)
+      :else
+      (let [dynamic (= (record-get [:ref :evm.native/transaction] tx :type) 2)
+            available-tip (w/subtract-word fee base)
+            actual-tip (if dynamic (if (w/less-word tip available-tip) tip available-tip) available-tip)
+            price (w/add-word base actual-tip)
+            upfront (w/multiply-word price (w/from-long gas))
+            admitted (s/set-nonce (s/set-balance world sender (w/subtract-word balance upfront)) sender (w/add-word nonce (w/from-long 1)))
+            to (record-get [:ref :evm.native/transaction] tx :to) creation (= to "")
+            target (if creation (s/create-address sender nonce) to)
+            collision (and creation (not (s/deployable? admitted target)))
+            prepared (if creation (s/set-storage (s/set-code (s/set-nonce admitted target (w/from-long 1)) target (vector-i64)) target (vector-i64)) admitted)
+            funded (s/transfer prepared sender target value)
+            data (record-get [:ref :evm.native/transaction] tx :data)
+            message (x/make-message target sender sender value price 0 false target)
+            frame (x/run-admitted funded message (if collision (vector-i64) (if creation data (s/code admitted target)))
+                     (if creation (vector-i64) data) (- gas intrinsic) block
+                     (record-get [:ref :evm.native/transaction] tx :access-addresses)
+                     (record-get [:ref :evm.native/transaction] tx :access-slots) creation)
+            executed (if creation (x/complete-creation frame) frame)
+            result-status (if collision 3 (x/status executed))]
+       (if (or (= result-status 8) (= result-status 10) (= result-status 11)) (tr-refuse world result-status)
+        (let [left (if collision 0 (x/gas-left executed))
+              spent (- gas left) refund (if (= result-status 1) (x/refund executed) 0)
+              credited (if (< refund (quot spent 5)) refund (quot spent 5))
+              unused (+ left credited) used (- gas unused)
+              state (if (= result-status 1) (x/finalize-world executed) admitted)
+              returned (s/set-balance state sender (w/add-word (s/balance state sender) (w/multiply-word price (w/from-long unused))))
+              coinbase (b/field block 124 1) reward (w/multiply-word actual-tip (w/from-long used))
+              rewarded (s/set-balance returned coinbase (w/add-word (s/balance returned coinbase) reward))
+              final (if (s/alive? rewarded coinbase) rewarded (s/remove-account rewarded coinbase))]
+         (if (not (s/valid-world? final)) (tr-refuse world 10)
+          (record-new [:ref :evm.native/transition] result-status final used
+          (if collision (vector-i64) (x/output executed)) (if (= result-status 1) (x/logs executed) "")
+          (trie/state-root final) (record-get [:ref :evm.native/transaction] tx :hash)))))))))))
+))

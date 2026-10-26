@@ -1,0 +1,166 @@
+;; Canonical bounded Ethereum account state for native execution. Presence is
+;; explicit (including empty accounts); transaction finalization owns pruning.
+(ns kotoba.vm.evm.native-state
+  (:require [kotoba.vm.evm.native-bytes :as b]
+            [kotoba.vm.evm.native-word :as w]
+            [kotoba.vm.evm.native-keccak :as k]
+            [kotoba.vm.evm.native-rlp :as r]))
+
+;; Accounts ascending by address40, separated by '|'. Account fields are
+;; address40:nonce64:balance64:codeHex:storageHex. Storage is ascending nonzero
+;; key64/value64 pairs without delimiters. No Unicode or ambient storage.
+(defn zero-hex [] :string "0000000000000000000000000000000000000000000000000000000000000000")
+(defn empty-account [address :string] :string
+  (string-concat address (string-concat ":" (string-concat (zero-hex)
+    (string-concat ":" (string-concat (zero-hex) "::"))))))
+
+(defn address [value :vector-i64] :string
+  (string-substring (w/to-hex value) 24 64))
+(defn address-word [address :string] :vector-i64 (w/from-hex address))
+
+(defn- account-end [world :string start :i64] :i64
+ (let [end (string-length world) next (string-index-of (string-substring world start end) "|")]
+  (if (< next 0) end (+ start next))))
+(defn- account-key [world :string start :i64 end :i64] :string
+ (string-substring world start (if (< (- end start) 40) end (+ start 40))))
+(defn- locate [world :string address :string] :i64
+ ;; The canonical world is sorted. Search each account once; do not rebuild
+ ;; or rescan all preceding fields for every candidate address.
+ (loop [start 0]
+  (if (>= start (string-length world)) (string-length world)
+   (let [end (account-end world start) key (account-key world start end)]
+    (if (>= (string-compare key address) 0) start (recur (+ end 1)))))))
+(defn find-account [world :string address :string] :string
+ (let [start (locate world address)]
+  (if (= start (string-length world)) ""
+   (let [end (account-end world start)]
+    (if (= (account-key world start end) address) (string-substring world start end) "")))))
+
+(defn account [world :string address :string] :string
+  (let [a (find-account world address)] (if (= a "") (empty-account address) a)))
+(defn exists? [world :string address :string] :bool
+  (not (= (find-account world address) "")))
+(defn nonce [world :string address :string] :vector-i64
+  (w/from-hex (b/field (account world address) 58 1)))
+(defn balance [world :string address :string] :vector-i64
+  (w/from-hex (b/field (account world address) 58 2)))
+(defn code [world :string address :string] :vector-i64
+  (b/from-hex (b/field (account world address) 58 3)))
+(defn storage-text [world :string address :string] :string
+  (b/field (account world address) 58 4))
+(defn alive? [world :string address :string] :bool
+  (let [a (account world address)]
+    (or (not (= (b/field a 58 1) (zero-hex)))
+        (not (= (b/field a 58 2) (zero-hex))) (not (= (b/field a 58 3) "")))))
+(defn deployable? [world :string address :string] :bool
+  (let [a (account world address)]
+    ;; The pinned official corpus and Geth include the retroactive EIP-7610
+    ;; collision rule: a storage-only account cannot be overwritten either.
+    (and (= (b/field a 58 1) (zero-hex)) (= (b/field a 58 3) "") (= (b/field a 58 4) ""))))
+
+(defn set-account [world :string a :string] :string
+ ;; Immutable prefix/replacement/suffix: allocation is linear in world
+ ;; bytes, including when the account count reaches the profile boundary.
+ (let [address (b/field a 58 0) start (locate world address) length (string-length world)]
+  (if (= start length) (if (= length 0) a (string-concat world (string-concat "|" a)))
+   (let [end (account-end world start) prefix (string-substring world 0 start)
+         same (= (account-key world start end) address)
+         tail (if same (string-concat a (string-substring world end length))
+                (string-concat a (string-concat "|" (string-substring world start length))))]
+    (string-concat prefix tail)))))
+(defn remove-account [world :string address :string] :string
+ (let [start (locate world address) length (string-length world)]
+  (if (= start length) world
+   (let [end (account-end world start)]
+    (if (not (= (account-key world start end) address)) world
+     (if (= start 0) (if (= end length) "" (string-substring world (+ end 1) length))
+      (string-concat (string-substring world 0 (- start 1)) (string-substring world end length))))))))
+
+(defn- replace-field [a :string index :i64 value :string] :string
+  (loop [i 0 out ""]
+    (if (= i 5) out
+      (recur (+ i 1) (string-concat out
+        (string-concat (if (= i 0) "" ":") (if (= i index) value (b/field a 58 i))))))))
+(defn set-balance [world :string address :string value :vector-i64] :string
+  (set-account world (replace-field (account world address) 2 (w/to-hex value))))
+(defn set-nonce [world :string address :string value :vector-i64] :string
+  (set-account world (replace-field (account world address) 1 (w/to-hex value))))
+(defn set-code [world :string address :string value :vector-i64] :string
+  (set-account world (replace-field (account world address) 3 (b/to-hex value))))
+
+(defn decode-storage [text :string] :vector-i64
+  (let [n (quot (string-length text) 4) out (vector-alloc n)]
+    (loop [i 0]
+      (if (= i n) out
+        (let [offset (* (quot i 16) 64) word (w/from-hex (string-substring text offset (+ offset 64)))
+              copied (loop [j 0]
+                       (if (= j 16) 0
+                         (let [z (vector-assoc! out (+ i j) (vector-at word j))] (recur (+ j 1)))))]
+          (recur (+ i 16)))))))
+(defn encode-storage [v :vector-i64] :string
+  (let [alphabet "0123456789abcdef" n (* (vector-count v) 4) out (vector-alloc n)]
+    (loop [i 0]
+      (if (= i n) (string-from-utf8 (bytes-from-vector-i64 out))
+        (let [limb (+ (* (quot i 64) 16) (- 15 (quot (rem i 64) 4)))
+              shift (* (- 3 (rem i 4)) 4)
+              digit (bit-and (i64-shift-right (vector-at v limb) shift) 15)
+              z (vector-assoc! out i (string-code-point-at alphabet digit))] (recur (+ i 1)))))))
+(defn storage [world :string address :string] :vector-i64 (decode-storage (storage-text world address)))
+(defn set-storage [world :string address :string value :vector-i64] :string
+  (set-account world (replace-field (account world address) 4 (encode-storage value))))
+
+(defn transfer [world :string from :string to :string value :vector-i64] :string
+  ;; Execution validates balance availability before invoking this update.
+  (if (or (w/zero? value) (= from to)) world
+    (set-balance (set-balance world from (w/subtract-word (balance world from) value))
+                 to (w/add-word (balance world to) value))))
+
+(defn- valid-storage? [s :string] :bool
+  (and (= (rem (string-length s) 128) 0) (<= (string-length s) 524288) (b/valid-hex? s)
+    (loop [i 0 previous ""]
+      (if (= i (string-length s)) true
+        (let [key (string-substring s i (+ i 64)) value (string-substring s (+ i 64) (+ i 128))]
+          (and (> (string-compare key previous) 0) (not (= value (zero-hex)))
+               (recur (+ i 128) key)))))))
+(defn within-limits? [world :string] :bool
+  (and (<= (string-length world) 16777216)
+   ;; Scan once. Repeated indexed fields retained too many arena cells at this
+   ;; boundary and rescanned the entire world for every account.
+   (loop [start 0 count 0]
+    (if (= start (string-length world)) true
+     (if (>= count 2048) false
+      (let [end (account-end world start)
+            a (string-substring world start end)
+            okay (and (<= (string-length (b/field a 58 3)) 131072)
+                      (<= (string-length (b/field a 58 4)) 524288))]
+       (and okay (if (= end (string-length world)) true
+                   (recur (+ end 1) (+ count 1))))))))))
+(defn valid-world? [world :string] :bool
+  (and (within-limits? world)
+    (loop [start 0 previous-start -1 previous-end -1]
+      (if (= start (string-length world)) true
+       (let [end (account-end world start)
+             a (string-substring world start end)
+             key (b/field a 58 0) n (b/field a 58 1)
+             value (b/field a 58 2) code (b/field a 58 3)
+             store (b/field a 58 4)
+             okay (and (= (b/fields a 58) 5) (= (string-length key) 40)
+                       (b/valid-hex? key)
+                       (or (< previous-start 0)
+                           (> (string-compare key (account-key world previous-start previous-end)) 0))
+                       (= (string-length n) 64) (b/valid-hex? n)
+                       (= (string-substring n 0 48) "000000000000000000000000000000000000000000000000")
+                       (= (string-length value) 64) (b/valid-hex? value)
+                       (<= (string-length code) 131072) (b/valid-hex? code)
+                       (valid-storage? store))]
+         (and okay (if (= end (string-length world)) true
+                    (if (= (+ end 1) (string-length world)) false
+                     (recur (+ end 1) start end)))))))))
+
+(defn create-address [sender :string nonce :vector-i64] :string
+  (let [encoded (r/encode-list (b/concat (r/encode-bytes (b/from-hex sender)) (r/encode-word nonce)))]
+    (string-substring (b/to-hex (k/digest encoded)) 24 64)))
+(defn create2-address [sender :string salt :vector-i64 init-code :vector-i64] :string
+  (let [encoded (b/concat (b/concat (vector-i64 255) (b/from-hex sender))
+                          (b/concat (w/append-bytes (vector-i64) salt) (k/digest init-code)))]
+    (string-substring (b/to-hex (k/digest encoded)) 24 64)))

@@ -1,0 +1,101 @@
+;; Ethereum secure MPT. Fixed entry storage and index ranges avoid copying
+;; growing CSV subtries during sort and recursion. No host hash or trie.
+(ns kotoba.vm.evm.native-trie
+ (:require [kotoba.vm.evm.native-bytes :as b]
+           [kotoba.vm.evm.native-word :as w]
+           [kotoba.vm.evm.native-keccak :as k]
+           [kotoba.vm.evm.native-rlp :as r]))
+;; Each entry: 32 key bytes, encoded value length, up to 110 RLP bytes.
+;; Account RLP is bounded by nonce:u64, balance:u256 and two 32-byte roots.
+(defn- nt-copy [out :vector-i64 offset :i64 input :vector-i64] :i64
+ (loop [i 0]
+  (if (= i (vector-count input)) 0
+   (let [z (vector-assoc! out (+ offset i) (vector-at input i))] (recur (+ i 1))))))
+(defn- nt-entry [entries :vector-i64 index :i64 key :vector-i64 value :vector-i64] :i64
+ (let [offset (* index 144) a (nt-copy entries offset key)
+       z (vector-assoc! entries (+ offset 32) (vector-count value))]
+  (nt-copy entries (+ offset 33) value)))
+(defn- nt-less [entries :vector-i64 a :i64 bb :i64] :bool
+ (loop [i 0]
+  (if (= i 32) false
+   (let [x (vector-at entries (+ (* a 144) i)) y (vector-at entries (+ (* bb 144) i))]
+    (cond (< x y) true (> x y) false :else (recur (+ i 1)))))))
+(defn- nt-indices [entries :vector-i64 count :i64] :vector-i64
+ (let [indices (vector-alloc count)]
+  (loop [i 0]
+   (if (= i count) indices
+    (let [at (loop [j i]
+              (if (or (= j 0) (not (nt-less entries i (vector-at indices (- j 1))))) j
+               (let [z (vector-assoc! indices j (vector-at indices (- j 1)))] (recur (- j 1)))))
+          z (vector-assoc! indices at i)] (recur (+ i 1)))))))
+(defn- nt-nibble [entries :vector-i64 index :i64 depth :i64] :i64
+ (let [byte (vector-at entries (+ (* index 144) (quot depth 2)))]
+  (if (= (rem depth 2) 0) (quot byte 16) (rem byte 16))))
+(defn- nt-path [entries :vector-i64 index :i64 start :i64 end :i64 leaf :bool] :vector-i64
+ (let [length (- end start) odd (= (rem length 2) 1)
+       out (vector-alloc (+ 1 (quot length 2)))
+       flag (+ (if leaf 32 0) (if odd 16 0))
+       z (vector-assoc! out 0 (+ flag (if odd (nt-nibble entries index start) 0)))
+       begin (+ start (if odd 1 0))]
+  (loop [i 1 depth begin]
+   (if (= depth end) out
+    (let [a (vector-assoc! out i (+ (* 16 (nt-nibble entries index depth)) (nt-nibble entries index (+ depth 1))))]
+     (recur (+ i 1) (+ depth 2)))))))
+(defn- nt-reference [node :vector-i64] :vector-i64
+ (if (< (vector-count node) 32) node (r/encode-bytes (k/digest node))))
+(defn- nt-node [entries :vector-i64 indices :vector-i64 start :i64 end :i64 depth :i64] :vector-i64
+ (let [first (vector-at indices start)]
+  (if (= (- end start) 1)
+   (r/encode-list
+    (b/concat (r/encode-bytes (nt-path entries first depth 64 true))
+     (r/encode-bytes (b/slice entries (+ (* first 144) 33) (vector-at entries (+ (* first 144) 32))))))
+   (let [last (vector-at indices (- end 1))
+         common (loop [i depth]
+                 (if (or (= i 64) (not (= (nt-nibble entries first i) (nt-nibble entries last i)))) i (recur (+ i 1))))]
+    (if (> common depth)
+     (r/encode-list (b/concat (r/encode-bytes (nt-path entries first depth common false))
+                    (nt-reference (nt-node entries indices start end common))))
+     (let [children (loop [digit 0 cursor start out (vector-i64)]
+                      (if (= digit 16) out
+                       (let [next (loop [i cursor]
+                                    (if (or (= i end) (not (= (nt-nibble entries (vector-at indices i) depth) digit))) i (recur (+ i 1))))
+                             child (if (= cursor next) (r/encode-bytes (vector-i64))
+                                     (nt-reference (nt-node entries indices cursor next (+ depth 1))))]
+                        (recur (+ digit 1) next (b/concat out child)))))]
+      (r/encode-list (b/concat children (r/encode-bytes (vector-i64))))))))))
+(defn- nt-root [entries :vector-i64 count :i64] :vector-i64
+ (k/digest (if (= count 0) (r/encode-bytes (vector-i64))
+            (nt-node entries (nt-indices entries count) 0 count 0))))
+(defn storage-root [storage :string] :vector-i64
+ (let [out (vector-alloc 32)
+       computed
+       (arena-scope
+        (let [count (quot (string-length storage) 128) entries (vector-alloc (* count 144))
+              filled (loop [i 0]
+                       (if (= i count) 0
+                        (let [z (arena-scope
+                                 (let [offset (* i 128)
+                                       key (k/digest (b/from-hex (string-substring storage offset (+ offset 64))))
+                                       value (r/encode-word (w/from-hex (string-substring storage (+ offset 64) (+ offset 128))))]
+                                  (nt-entry entries i key value)))] (recur (+ i 1)))))]
+         (nt-copy out 0 (nt-root entries count))))]
+  out))
+(defn state-root [world :string] :vector-i64
+ ;; Caller admits canonical account/storage shape and owns empty-account policy.
+ (let [out (vector-alloc 32)
+       computed
+       (arena-scope
+        (let [count (b/fields world 124) entries (vector-alloc (* count 144))
+              filled (loop [i 0]
+                       (if (= i count) 0
+                        (let [z (arena-scope
+                                 (let [account (b/field world 124 i)
+                                       key (k/digest (b/from-hex (b/field account 58 0)))
+                                       nonce (r/encode-word (w/from-hex (b/field account 58 1)))
+                                       balance (r/encode-word (w/from-hex (b/field account 58 2)))
+                                       storage (r/encode-bytes (storage-root (b/field account 58 4)))
+                                       code (r/encode-bytes (k/digest (b/from-hex (b/field account 58 3))))
+                                       value (r/encode-list (b/concat (b/concat nonce balance) (b/concat storage code)))]
+                                  (nt-entry entries i key value)))] (recur (+ i 1)))))]
+         (nt-copy out 0 (nt-root entries count))))]
+  out))

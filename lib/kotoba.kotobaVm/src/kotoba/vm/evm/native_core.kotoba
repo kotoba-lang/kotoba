@@ -1,0 +1,573 @@
+;; AWAI-81 native frame executor. Fork: Paris. This is a partial profile:
+;; account/call/create/precompile/transaction/proof support is not claimed.
+;; Unsupported operations and resource policy limits are explicit refusals,
+;; distinct from Ethereum exceptional halts. No host BigInt or host VM.
+(ns kotoba.vm.evm.native-core
+  (:require [kotoba.vm.evm.native-word :as w]
+            [kotoba.vm.evm.native-keccak :as k])
+  (:schemas
+    {:evm.native/workspace [:record :evm.native/workspace
+      [[:stack :vector-i64] [:memory :vector-i64] [:storage :vector-i64]
+       [:warm :vector-i64] [:output :vector-i64] [:meta :vector-i64] [:trial :vector-i64]]]
+     :evm.native/machine
+     [:record :evm.native/machine
+      [[:code :vector-i64] [:calldata :vector-i64] [:stack :vector-i64]
+       [:memory :vector-i64] [:storage :vector-i64] [:original :vector-i64]
+       [:warm :vector-i64] [:output :vector-i64]
+       [:pc :i64] [:gas :i64] [:status :i64] [:refund :i64]
+       [:steps :i64] [:static :bool] [:retained-words :i64] [:storage-version :i64]
+       [:workspace [:ref :evm.native/workspace]]
+       [:memory-size :i64] [:calldata-size :i64]]]}))
+
+;; status: 0 running, 1 success, 2 REVERT, 3 out-of-gas, 4 invalid opcode,
+;; 5 stack underflow, 6 stack overflow, 7 invalid jump, 8 unsupported opcode,
+;; 9 static violation, 10 host resource policy refusal, 11 malformed input.
+(defn make-machine [code :vector-i64 calldata :vector-i64 storage :vector-i64
+                    warm :vector-i64 gas :i64 static :bool] [:ref :evm.native/machine]
+  (record-new [:ref :evm.native/machine] code calldata (vector-i64) (vector-i64)
+              storage storage warm (vector-i64) 0 gas 0 0 0 static 0 0
+              (record-new [:ref :evm.native/workspace] (vector-alloc 64) (vector-alloc 32)
+               (vector-alloc 32) (vector-alloc 16) (vector-i64) (vector-alloc 16) (vector-alloc 16))
+              0 (vector-count calldata)))
+
+(defn status [m [:ref :evm.native/machine]] :i64
+  (record-get [:ref :evm.native/machine] m :status))
+(defn gas-left [m [:ref :evm.native/machine]] :i64
+  (record-get [:ref :evm.native/machine] m :gas))
+(defn output [m [:ref :evm.native/machine]] :vector-i64
+  (record-get [:ref :evm.native/machine] m :output))
+(defn storage [m [:ref :evm.native/machine]] :vector-i64
+  (if (= (status m) 1) (record-get [:ref :evm.native/machine] m :storage)
+    (record-get [:ref :evm.native/machine] m :original)))
+
+(defn- stop [m [:ref :evm.native/machine] state :i64] [:ref :evm.native/machine]
+  (let [r (record-assoc [:ref :evm.native/machine] m :status state)]
+    (if (and (>= state 3) (<= state 7))
+      (record-assoc [:ref :evm.native/machine] r :gas 0)
+      (if (= state 9) (record-assoc [:ref :evm.native/machine] r :gas 0) r))))
+
+(defn- charge [m [:ref :evm.native/machine] cost :i64] [:ref :evm.native/machine]
+  (if (not (= (status m) 0)) m
+    (if (or (< cost 0) (> cost (gas-left m))) (stop m 3)
+      (record-assoc [:ref :evm.native/machine] m :gas (- (gas-left m) cost)))))
+
+(defn- stack-size [m [:ref :evm.native/machine]] :i64
+  (quot (vector-count (record-get [:ref :evm.native/machine] m :stack)) 16))
+
+(defn stack-word [m [:ref :evm.native/machine] depth :i64] :vector-i64
+  (let [stack (record-get [:ref :evm.native/machine] m :stack)
+        start (- (vector-count stack) (* (+ depth 1) 16)) out (vector-alloc 16)]
+   (loop [i 0] (if (= i 16) out
+                (let [z (vector-assoc! out i (vector-at stack (+ start i)))] (recur (+ i 1)))))))
+
+(defn- drop-stack [m [:ref :evm.native/machine] count :i64] [:ref :evm.native/machine]
+  (let [stack (record-get [:ref :evm.native/machine] m :stack)
+        size (- (vector-count stack) (* count 16)) out (vector-alloc size)
+        copied (loop [i 0] (if (= i size) 0
+                            (let [z (vector-assoc! out i (vector-at stack i))] (recur (+ i 1)))))]
+   (record-assoc [:ref :evm.native/machine] m :stack out)))
+
+(defn- push [m [:ref :evm.native/machine] word :vector-i64] [:ref :evm.native/machine]
+  (if (not (= (status m) 0)) m
+    (if (>= (stack-size m) 1024) (stop m 6)
+      (let [stack (loop [i 0 out (record-get [:ref :evm.native/machine] m :stack)]
+                    (if (= i 16) out (recur (+ i 1) (vector-conj out (vector-at word i)))))]
+       (record-assoc [:ref :evm.native/machine] m :stack stack)))))
+
+(defn- slice [v :vector-i64 offset :i64 length :i64] :vector-i64
+  (let [out (vector-alloc length)]
+   (loop [i 0]
+    (if (= i length) out
+     (let [z (vector-assoc! out i (vector-get v (+ offset i) 0))] (recur (+ i 1)))))))
+
+(defn- word-match [v :vector-i64 offset :i64 word :vector-i64] :bool
+  (loop [i 0]
+    (if (= i 16) true
+      (if (= (vector-at v (+ offset i)) (vector-at word i))
+        (recur (+ i 1)) false))))
+
+(defn- slot-less [v :vector-i64 offset :i64 word :vector-i64] :bool
+  (loop [i 15]
+    (if (< i 0) false
+      (let [a (vector-at v (+ offset i)) b (vector-at word i)]
+        (if (= a b) (recur (- i 1)) (< a b))))))
+
+(defn- slot-index [v :vector-i64 slot :vector-i64 stride :i64] :i64
+  (loop [i 0]
+    (if (>= i (vector-count v)) -1
+      (if (word-match v i slot) i (recur (+ i stride))))))
+
+(defn read-slot [store :vector-i64 slot :vector-i64] :vector-i64
+  (let [i (slot-index store slot 32)]
+    (if (< i 0) (w/zero-word) (slice store (+ i 16) 16))))
+
+(defn- append-word [v :vector-i64 word :vector-i64] :vector-i64
+  (let [count (vector-count v) out (vector-alloc (+ count 16))]
+   (loop [i 0]
+    (if (= i (+ count 16)) out
+     (let [z (vector-assoc! out i (if (< i count) (vector-at v i) (vector-at word (- i count))))]
+      (recur (+ i 1)))))))
+
+(defn- write-slot [store :vector-i64 slot :vector-i64 value :vector-i64] :vector-i64
+  (let [at (slot-index store slot 32) zero (w/zero? value) count (vector-count store)]
+   (if (and (< at 0) zero) store
+    (let [position (if (>= at 0) at
+                     (loop [i 0] (if (or (= i count) (not (slot-less store i slot))) i (recur (+ i 32)))))
+          change (if (< at 0) 32 (if zero -32 0)) out (vector-alloc (+ count change))]
+     (loop [i 0]
+      (if (= i (+ count change)) out
+       (let [entry (and (not zero) (>= i position) (< i (+ position 32)))
+             element (if entry (if (< i (+ position 16)) (vector-at slot (- i position))
+                                 (vector-at value (- i position 16)))
+                       (vector-at store (if (< i position) i (- i change))))
+             z (vector-assoc! out i element)] (recur (+ i 1)))))))))
+
+(defn- memory-cost [bytes :i64] :i64
+  ;; Divide before multiplying so gas arithmetic cannot overflow at large
+  ;; offsets. -1 denotes a cost above the signed native gas envelope.
+  (let [words (quot (+ bytes 31) 32)
+        quadratic (* (quot words 512) words)
+        rest (+ (* words 3) (quot (* (rem words 512) words) 512))]
+   (if (> quadratic (- 9223372036854775807 rest)) -1 (+ quadratic rest))))
+
+(defn- expand-memory [m [:ref :evm.native/machine] offset :i64 length :i64] [:ref :evm.native/machine]
+  (if (or (not (= (status m) 0)) (= length 0)) m
+   (if (or (< offset 0) (< length 0)) (stop m 11)
+    (if (or (>= offset 2199023255552) (>= length 2199023255552)) (stop m 3)
+    (let [end (+ offset length)]
+     (if (>= end 2199023255552) (stop m 3)
+      (let [before (record-get [:ref :evm.native/machine] m :memory-size)
+            after (* 32 (quot (+ end 31) 32))
+            total (memory-cost after)
+            charged (if (< total 0) (stop m 3)
+                      (charge m (if (> after before) (- total (memory-cost before)) 0)))]
+        (cond (or (not (= (status charged) 0)) (<= after before)) charged
+              (> after 33554432) (stop m 10)
+              :else (record-assoc [:ref :evm.native/machine] charged :memory-size after)))))))))
+
+(defn- write-memory [m [:ref :evm.native/machine] offset :i64 bytes :vector-i64] [:ref :evm.native/machine]
+  (if (not (= (status m) 0)) m
+    (if (= (vector-count bytes) 0) m
+    (let [old (record-get [:ref :evm.native/machine] m :memory)
+          size (if (> (+ offset (vector-count bytes)) (vector-count old))
+                 (+ offset (vector-count bytes)) (vector-count old))
+          out (vector-alloc size)
+          preserved (loop [i 0] (if (= i (vector-count old)) 0
+                      (let [z (vector-assoc! out i (vector-at old i))] (recur (+ i 1)))))
+          copied (loop [i 0]
+                   (if (= i (vector-count bytes)) 0
+                    (let [z (vector-assoc! out (+ offset i) (vector-at bytes i))] (recur (+ i 1)))))]
+     (record-assoc [:ref :evm.native/machine] m :memory out)))))
+
+(defn- base-cost [op :i64] :i64
+  (cond
+    (or (= op 0) (= op 243) (= op 253)) 0
+    (or (= op 2) (= op 4) (= op 5) (= op 6) (= op 7) (= op 11)) 5
+    (or (= op 8) (= op 9)) 8
+    (= op 10) 10
+    (= op 32) 30
+    (= op 86) 8
+    (= op 87) 10
+    (= op 91) 1
+    (or (= op 48) (= op 50) (= op 51) (= op 52) (= op 54)
+        (= op 56) (= op 58) (= op 61) (= op 65) (= op 66) (= op 67)
+        (= op 68) (= op 69) (= op 70) (= op 72) (= op 80) (= op 88)
+        (= op 89) (= op 90)) 2
+    (or (= op 84) (= op 85)) 0
+    :else 3))
+
+(defn- stack-required [op :i64] :i64
+  (cond
+    (and (>= op 96) (<= op 127)) 0
+    (and (>= op 128) (<= op 143)) (+ (- op 128) 1)
+    (and (>= op 144) (<= op 159)) (+ (- op 144) 2)
+    (or (= op 0) (= op 48) (= op 50) (= op 51) (= op 52) (= op 54)
+        (= op 56) (= op 58) (= op 61) (= op 65) (= op 66) (= op 67)
+        (= op 68) (= op 69) (= op 70) (= op 72) (= op 88) (= op 89)
+        (= op 90) (= op 91)) 0
+    (or (= op 8) (= op 9) (= op 55) (= op 57) (= op 62)) 3
+    (or (= op 21) (= op 25) (= op 53) (= op 80) (= op 81) (= op 84) (= op 86)) 1
+    :else 2))
+
+(defn- binary-word [op :i64 a :vector-i64 b :vector-i64] :vector-i64
+  (cond
+    (= op 1) (w/add-word a b)
+    (= op 2) (w/multiply-word a b)
+    (= op 3) (w/subtract-word a b)
+    (= op 4) (w/divide-word a b)
+    (= op 5) (w/signed-divide a b)
+    (= op 6) (w/remainder-word a b)
+    (= op 7) (w/signed-remainder a b)
+    (= op 10) (w/power-word a b)
+    (= op 11) (w/sign-extend b (w/bounded-long a 32))
+    (= op 16) (w/from-long (if (w/less-word a b) 1 0))
+    (= op 17) (w/from-long (if (w/less-word b a) 1 0))
+    (= op 18) (w/from-long (if (w/signed-less a b) 1 0))
+    (= op 19) (w/from-long (if (w/signed-less b a) 1 0))
+    (= op 20) (w/from-long (if (w/equal-word a b) 1 0))
+    (= op 22) (w/bitwise-word a b 0)
+    (= op 23) (w/bitwise-word a b 1)
+    (= op 24) (w/bitwise-word a b 2)
+    (= op 26) (w/from-long (w/byte-at b (w/bounded-long a 32)))
+    (= op 27) (w/shift-left b (w/bounded-long a 256))
+    (= op 28) (w/shift-right b (w/bounded-long a 256) false)
+    :else (w/shift-right b (w/bounded-long a 256) true)))
+
+(defn- jump-valid? [code :vector-i64 destination :i64] :bool
+  ;; A 0x5b inside PUSH data is not a JUMPDEST.
+  (loop [i 0]
+    (if (>= i (vector-count code)) false
+      (let [op (vector-at code i)]
+        (if (= i destination) (= op 91)
+          (if (> i destination) false
+            (recur (+ i 1 (if (and (>= op 96) (<= op 127)) (- op 95) 0)))))))))
+
+(defn- sload-op [m [:ref :evm.native/machine]] [:ref :evm.native/machine]
+  (let [slot (stack-word m 0) warm (record-get [:ref :evm.native/machine] m :warm)
+        cold (< (slot-index warm slot 16) 0)
+        charged (charge m (if cold 2100 100))]
+    (if (not (= (status charged) 0)) charged
+      (push (record-assoc [:ref :evm.native/machine] (drop-stack charged 1) :warm
+               (if cold (append-word warm slot) warm))
+            (read-slot (record-get [:ref :evm.native/machine] m :storage) slot)))))
+
+(defn- sstore-op [m [:ref :evm.native/machine]] [:ref :evm.native/machine]
+  (if (record-get [:ref :evm.native/machine] m :static) (stop m 9)
+    (if (<= (gas-left m) 2300) (stop m 3)
+      (let [slot (stack-word m 0) value (stack-word m 1)
+            store (record-get [:ref :evm.native/machine] m :storage)
+            old (read-slot store slot)
+            orig (read-slot (record-get [:ref :evm.native/machine] m :original) slot)
+            warm (record-get [:ref :evm.native/machine] m :warm)
+            cold (< (slot-index warm slot 16) 0)
+            same (w/equal-word old value) clean (w/equal-word orig old)
+            cost (if same 100 (if clean (if (w/zero? orig) 20000 2900) 100))
+            refund (if same 0
+                     (if clean (if (and (not (w/zero? orig)) (w/zero? value)) 4800 0)
+                       (+ (if (w/zero? orig) 0
+                            (+ (if (w/zero? old) -4800 0) (if (w/zero? value) 4800 0)))
+                          (if (w/equal-word orig value) (if (w/zero? orig) 19900 2800) 0))))
+            charged (charge m (+ cost (if cold 2100 0)))]
+        (if (not (= (status charged) 0)) charged
+          (if (and (>= (vector-count store) 131072)
+                   (< (slot-index store slot 32) 0) (not (w/zero? value))) (stop charged 10)
+            (record-assoc [:ref :evm.native/machine]
+              (record-assoc [:ref :evm.native/machine]
+                (record-assoc [:ref :evm.native/machine] (drop-stack charged 2) :storage
+                              (write-slot store slot value)) :warm (if cold (append-word warm slot) warm))
+              :refund (+ (record-get [:ref :evm.native/machine] m :refund) refund))))))))
+
+(defn- memory-op [m [:ref :evm.native/machine] op :i64] [:ref :evm.native/machine]
+  (let [offset (w/bounded-long (stack-word m 0) 2199023255552)
+        length (if (= op 83) 1 32)
+        expanded (expand-memory m offset length)]
+    (if (not (= (status expanded) 0)) expanded
+      (if (= op 81)
+        (push (drop-stack expanded 1)
+              (w/from-bytes (record-get [:ref :evm.native/machine] expanded :memory) offset 32))
+        (let [value (stack-word expanded 1)
+              bytes (if (= op 83) (vector-i64 (w/byte-at value 31)) (w/append-bytes (vector-i64) value))]
+          (write-memory (drop-stack expanded 2) offset bytes))))))
+
+(defn- copy-op [m [:ref :evm.native/machine] op :i64] [:ref :evm.native/machine]
+  (let [dest (w/bounded-long (stack-word m 0) 2199023255552)
+        source (w/bounded-long (stack-word m 1) 9223372036854775807)
+        length (w/bounded-long (stack-word m 2) 2199023255552)
+        data (if (= op 55) (record-get [:ref :evm.native/machine] m :calldata)
+                         (record-get [:ref :evm.native/machine] m :code))
+        expanded (expand-memory (charge m (* 3 (quot (+ length 31) 32))) dest length)]
+    (if (not (= (status expanded) 0)) expanded
+      (write-memory (drop-stack expanded 3) dest
+        (if (>= source (vector-count data))
+          (slice (vector-i64) 0 length) (slice data source length))))))
+
+(defn- return-op [m [:ref :evm.native/machine] op :i64] [:ref :evm.native/machine]
+  (let [offset (w/bounded-long (stack-word m 0) 2199023255552)
+        length (w/bounded-long (stack-word m 1) 2199023255552)
+        expanded (expand-memory m offset length)]
+    (if (not (= (status expanded) 0)) expanded
+      (stop (record-assoc [:ref :evm.native/machine] (drop-stack expanded 2) :output
+              (slice (record-get [:ref :evm.native/machine] expanded :memory) offset length))
+            (if (= op 253) 2 1)))))
+
+(defn- keccak-op [m [:ref :evm.native/machine]] [:ref :evm.native/machine]
+  (let [offset (w/bounded-long (stack-word m 0) 2199023255552)
+        length (w/bounded-long (stack-word m 1) 2199023255552)
+        expanded (expand-memory (charge m (* 6 (quot (+ length 31) 32))) offset length)]
+    (if (not (= (status expanded) 0)) expanded
+      (push (drop-stack expanded 2)
+            (w/from-bytes (k/digest (slice (record-get [:ref :evm.native/machine] expanded :memory)
+                                         offset length)) 0 32)))))
+
+(defn- swap-op [m [:ref :evm.native/machine] depth :i64] [:ref :evm.native/machine]
+ (let [stack (record-get [:ref :evm.native/machine] m :stack) count (vector-count stack)
+       top (- count 16) other (- count (* (+ depth 1) 16)) out (slice stack 0 count)
+       swapped (loop [i 0] (if (= i 16) 0
+                             (let [a (vector-assoc! out (+ top i) (vector-at stack (+ other i)))
+                                   z (vector-assoc! out (+ other i) (vector-at stack (+ top i)))] (recur (+ i 1)))))]
+  (record-assoc [:ref :evm.native/machine] m :stack out)))
+
+(defn- valid-paris-op? [op :i64] :bool
+  (or (and (>= op 0) (<= op 11)) (and (>= op 16) (<= op 29)) (= op 32)
+      (and (>= op 48) (<= op 72)) (and (>= op 80) (<= op 91))
+      (and (>= op 96) (<= op 164)) (and (>= op 240) (<= op 245))
+      (= op 250) (= op 253) (= op 254) (= op 255)))
+
+(defn step [input [:ref :evm.native/machine]] [:ref :evm.native/machine]
+  (let [pc (record-get [:ref :evm.native/machine] input :pc)
+        code (record-get [:ref :evm.native/machine] input :code)
+        op (vector-get code pc 0)
+        supported (or (= op 0) (and (>= op 1) (<= op 11)) (= op 32)
+                      (and (>= op 16) (<= op 29)) (= op 53) (= op 54) (= op 55)
+                      (= op 56) (= op 57) (= op 80) (= op 81) (= op 82) (= op 83)
+                      (= op 84) (= op 85) (= op 86) (= op 87) (= op 88) (= op 89)
+                      (= op 90) (= op 91) (and (>= op 96) (<= op 159))
+                      (= op 243) (= op 253) (= op 254))]
+    (cond
+      (not (= (status input) 0)) input
+      (>= (record-get [:ref :evm.native/machine] input :steps) 100000000) (stop input 10)
+      (not supported) (stop input (if (valid-paris-op? op) 8 4))
+      (= op 254) (stop input 4)
+      (< (stack-size input) (stack-required op)) (stop input 5)
+      :else
+      (let [advanced (record-assoc [:ref :evm.native/machine]
+                       (record-assoc [:ref :evm.native/machine] input :pc (+ pc 1))
+                       :steps (+ (record-get [:ref :evm.native/machine] input :steps) 1))
+            m (charge advanced (base-cost op))]
+        (cond
+          (not (= (status m) 0)) m
+          (= op 0) (stop m 1)
+          (and (>= op 96) (<= op 127))
+          (push (record-assoc [:ref :evm.native/machine] m :pc (+ pc 1 (- op 95)))
+                (w/from-bytes code (+ pc 1) (- op 95)))
+          (and (>= op 128) (<= op 143)) (push m (stack-word m (- op 128)))
+          (and (>= op 144) (<= op 159)) (swap-op m (+ (- op 144) 1))
+          (or (= op 8) (= op 9))
+          (push (drop-stack m 3)
+                (if (= op 8) (w/add-modulo (stack-word m 0) (stack-word m 1) (stack-word m 2))
+                             (w/multiply-modulo (stack-word m 0) (stack-word m 1) (stack-word m 2))))
+          (= op 10)
+          (let [charged (charge m (* 50 (w/significant-bytes (stack-word m 1))))]
+            (if (not (= (status charged) 0)) charged
+              (push (drop-stack charged 2) (w/power-word (stack-word m 0) (stack-word m 1)))))
+          (= op 21) (push (drop-stack m 1) (w/from-long (if (w/zero? (stack-word m 0)) 1 0)))
+          (= op 25) (push (drop-stack m 1) (w/not-word (stack-word m 0)))
+          (or (and (>= op 1) (<= op 11)) (and (>= op 16) (<= op 29)))
+          (push (drop-stack m 2) (binary-word op (stack-word m 0) (stack-word m 1)))
+          (= op 32) (keccak-op m)
+          (= op 53)
+          (push (drop-stack m 1)
+            (w/from-bytes (record-get [:ref :evm.native/machine] m :calldata)
+                          (w/bounded-long (stack-word m 0) 9223372036854775807) 32))
+          (= op 54) (push m (w/from-long (record-get [:ref :evm.native/machine] m :calldata-size)))
+          (= op 56) (push m (w/from-long (vector-count code)))
+          (or (= op 55) (= op 57)) (copy-op m op)
+          (= op 80) (drop-stack m 1)
+          (or (= op 81) (= op 82) (= op 83)) (memory-op m op)
+          (= op 84) (sload-op m)
+          (= op 85) (sstore-op m)
+          (or (= op 86) (= op 87))
+          (let [destination (w/bounded-long (stack-word m 0) 2199023255552)
+                take (or (= op 86) (not (w/zero? (stack-word m 1))))
+                popped (drop-stack m (if (= op 86) 1 2))]
+            (if (not take) popped
+              (if (jump-valid? code destination)
+                (record-assoc [:ref :evm.native/machine] popped :pc destination) (stop popped 7))))
+          (= op 88) (push m (w/from-long pc))
+          (= op 89) (push m (w/from-long (record-get [:ref :evm.native/machine] m :memory-size)))
+          (= op 90) (push m (w/from-long (gas-left m)))
+          (= op 91) m
+          (or (= op 243) (= op 253)) (return-op m op)
+          :else (stop m 8))))))
+
+;; Checked scalar regions cannot return references. Owned staging buffers
+;; carry live state across nested temporary regions. A core segment is retried
+;; only when those buffers must grow; it has no external effects and its gas
+;; is committed once. Ordinary execution evaluates each segment once.
+(defn core-boundary? [op :i64] :bool
+ (or (and (>= op 48) (<= op 52)) (and (>= op 58) (<= op 72))
+     (and (>= op 160) (<= op 164)) (= op 240) (= op 241) (= op 242)
+     (= op 244) (= op 245) (= op 250) (= op 255)))
+(defn- chunk-copy [out :vector-i64 input :vector-i64] :i64
+ (loop [i 0] (if (= i (vector-count out)) 0
+              (let [z (vector-assoc! out i (vector-at input i))] (recur (+ i 1))))))
+(defn- chunk-meta [m [:ref :evm.native/machine] meta :vector-i64 memory-dirty :bool store-dirty :bool] :i64
+ (let [a (vector-assoc! meta 0 (record-get [:ref :evm.native/machine] m :pc))
+       b (vector-assoc! meta 1 (gas-left m)) c (vector-assoc! meta 2 (status m))
+       d (vector-assoc! meta 3 (record-get [:ref :evm.native/machine] m :refund))
+       f (vector-assoc! meta 4 (record-get [:ref :evm.native/machine] m :steps))
+       g (vector-assoc! meta 5 (vector-count (record-get [:ref :evm.native/machine] m :stack)))
+       h (vector-assoc! meta 6 (vector-count (record-get [:ref :evm.native/machine] m :memory)))
+       i (vector-assoc! meta 7 (vector-count (record-get [:ref :evm.native/machine] m :storage)))
+       j (vector-assoc! meta 8 (vector-count (record-get [:ref :evm.native/machine] m :warm)))
+       k (vector-assoc! meta 9 (vector-count (output m)))
+       l (vector-assoc! meta 10 (if memory-dirty 1 0))
+       n (vector-assoc! meta 11 (if store-dirty 1 0))
+       size (vector-assoc! meta 13 (record-get [:ref :evm.native/machine] m :memory-size))] 0))
+(defn- chunk-evaluate [input [:ref :evm.native/machine] meta :vector-i64] [:ref :evm.native/machine]
+ (loop [m input count 0 memory-dirty false store-dirty false movement 0]
+  (let [op (vector-get (record-get [:ref :evm.native/machine] m :code) (record-get [:ref :evm.native/machine] m :pc) 0)]
+   (if (or (not (= (status m) 0)) (= count 64) (>= movement 33554432) (core-boundary? op))
+    (let [z (chunk-meta m meta memory-dirty store-dirty)] m)
+    (let [next (step m)
+          before (vector-count (record-get [:ref :evm.native/machine] m :memory))
+          after (vector-count (record-get [:ref :evm.native/machine] next :memory))
+          writing (and (= (status next) 0) (or (= op 82) (= op 83) (= op 55) (= op 57)))
+          stored (and (= op 85) (= (status next) 0)
+                   (not (w/equal-word (read-slot (record-get [:ref :evm.native/machine] m :storage) (stack-word m 0)) (stack-word m 1))))
+          moved (+ (if writing (* 2 after) 0) (if (> after before) after 0)
+                   (if (= op 32) after 0)
+                   (if stored (vector-count (record-get [:ref :evm.native/machine] next :storage)) 0))]
+     (recur next (+ count 1) (or memory-dirty writing (> after before)) (or store-dirty stored) (+ movement moved)))))))
+;; Workspace buffers are caller-owned and carry bytes/limbs, never handles
+;; allocated in a released region. Trial metadata is separate from committed
+;; metadata, so a size retry cannot advance the EVM or publish partial state.
+(defn- chunk-copy-n [out :vector-i64 input :vector-i64 count :i64] :i64
+ (loop [i 0] (if (= i count) 0
+              (let [z (vector-assoc! out i (vector-at input i))] (recur (+ i 1))))))
+(defn- chunk-fits? [work [:ref :evm.native/workspace] meta :vector-i64] :bool
+ (and (<= (vector-at meta 5) (vector-count (record-get [:ref :evm.native/workspace] work :stack)))
+      (<= (vector-at meta 6) (vector-count (record-get [:ref :evm.native/workspace] work :memory)))
+      (<= (vector-at meta 7) (vector-count (record-get [:ref :evm.native/workspace] work :storage)))
+      (<= (vector-at meta 8) (vector-count (record-get [:ref :evm.native/workspace] work :warm)))
+      (<= (vector-at meta 9) (vector-count (record-get [:ref :evm.native/workspace] work :output)))))
+(defn- chunk-grown [old :vector-i64 size :i64] :vector-i64
+ (if (<= size (vector-count old)) old
+  (vector-alloc (let [double (* 2 (vector-count old))] (if (> double size) double size)))))
+(defn- chunk-grow [work [:ref :evm.native/workspace] meta :vector-i64] [:ref :evm.native/workspace]
+ (record-new [:ref :evm.native/workspace]
+  (chunk-grown (record-get [:ref :evm.native/workspace] work :stack) (vector-at meta 5))
+  (chunk-grown (record-get [:ref :evm.native/workspace] work :memory) (vector-at meta 6))
+  (chunk-grown (record-get [:ref :evm.native/workspace] work :storage) (vector-at meta 7))
+  (chunk-grown (record-get [:ref :evm.native/workspace] work :warm) (vector-at meta 8))
+  (chunk-grown (record-get [:ref :evm.native/workspace] work :output) (vector-at meta 9))
+  (record-get [:ref :evm.native/workspace] work :meta) (record-get [:ref :evm.native/workspace] work :trial)))
+(defn- chunk-seed [input [:ref :evm.native/machine] work [:ref :evm.native/workspace]] :i64
+ (let [meta (record-get [:ref :evm.native/workspace] work :meta)
+       source-stack (record-get [:ref :evm.native/machine] input :stack)
+       stack (record-get [:ref :evm.native/workspace] work :stack)
+       a (chunk-meta input meta false false)
+       z (vector-assoc! meta 12 (record-get [:ref :evm.native/machine] input :storage-version))
+       copied (loop [i 0] (if (= i (vector-count source-stack)) 0
+                           (let [v (vector-assoc! stack i (vector-at source-stack i))] (recur (+ i 1)))))
+       b (chunk-copy-n (record-get [:ref :evm.native/workspace] work :memory) (record-get [:ref :evm.native/machine] input :memory) (vector-at meta 6))
+       c (chunk-copy-n (record-get [:ref :evm.native/workspace] work :storage) (record-get [:ref :evm.native/machine] input :storage) (vector-at meta 7))
+       d (chunk-copy-n (record-get [:ref :evm.native/workspace] work :warm) (record-get [:ref :evm.native/machine] input :warm) (vector-at meta 8))
+       f (chunk-copy-n (record-get [:ref :evm.native/workspace] work :output) (output input) (vector-at meta 9))] 0))
+(defn- chunk-accept [m [:ref :evm.native/machine] work [:ref :evm.native/workspace] trial :vector-i64] :i64
+ (let [meta (record-get [:ref :evm.native/workspace] work :meta)
+       source-stack (record-get [:ref :evm.native/machine] m :stack) stack (record-get [:ref :evm.native/workspace] work :stack)
+       a (loop [i 0] (if (= i (vector-count source-stack)) 0
+                       (let [z (vector-assoc! stack i (vector-at source-stack i))] (recur (+ i 1)))))
+       b (if (= (vector-at trial 10) 1) (chunk-copy-n (record-get [:ref :evm.native/workspace] work :memory) (record-get [:ref :evm.native/machine] m :memory) (vector-at trial 6)) 0)
+       c (if (= (vector-at trial 11) 1) (chunk-copy-n (record-get [:ref :evm.native/workspace] work :storage) (record-get [:ref :evm.native/machine] m :storage) (vector-at trial 7)) 0)
+       d (chunk-copy-n (record-get [:ref :evm.native/workspace] work :warm) (record-get [:ref :evm.native/machine] m :warm) (vector-at trial 8))
+       f (chunk-copy-n (record-get [:ref :evm.native/workspace] work :output) (output m) (vector-at trial 9))
+       md (if (or (= (vector-at meta 10) 1) (= (vector-at trial 10) 1)) 1 0)
+       sd (if (or (= (vector-at meta 11) 1) (= (vector-at trial 11) 1)) 1 0)
+       version (+ (vector-at meta 12) (vector-at trial 11))
+       scalar (loop [i 0] (if (= i 10) 0
+                           (let [z (vector-assoc! meta i (vector-at trial i))] (recur (+ i 1)))))
+       g (vector-assoc! meta 10 md) h (vector-assoc! meta 11 sd)
+       j (vector-assoc! meta 12 version)
+       size (vector-assoc! meta 13 (vector-at trial 13))] 0))
+(defn- chunk-materialize [previous [:ref :evm.native/machine] work [:ref :evm.native/workspace]
+                         memory-dirty :bool store-dirty :bool retained :i64] [:ref :evm.native/machine]
+ (let [meta (record-get [:ref :evm.native/workspace] work :meta)
+       stack (slice (record-get [:ref :evm.native/workspace] work :stack) 0 (vector-at meta 5))
+       memory (if memory-dirty (slice (record-get [:ref :evm.native/workspace] work :memory) 0 (vector-at meta 6)) (record-get [:ref :evm.native/machine] previous :memory))
+       store (if store-dirty (slice (record-get [:ref :evm.native/workspace] work :storage) 0 (vector-at meta 7)) (record-get [:ref :evm.native/machine] previous :storage))
+       warm (if (= (vector-at meta 8) (vector-count (record-get [:ref :evm.native/machine] previous :warm))) (record-get [:ref :evm.native/machine] previous :warm)
+              (slice (record-get [:ref :evm.native/workspace] work :warm) 0 (vector-at meta 8)))
+       out (slice (record-get [:ref :evm.native/workspace] work :output) 0 (vector-at meta 9))]
+  (record-new [:ref :evm.native/machine]
+   (record-get [:ref :evm.native/machine] previous :code) (record-get [:ref :evm.native/machine] previous :calldata)
+   stack memory store (record-get [:ref :evm.native/machine] previous :original)
+   warm out (vector-at meta 0) (vector-at meta 1) (vector-at meta 2) (vector-at meta 3) (vector-at meta 4)
+   (record-get [:ref :evm.native/machine] previous :static) retained (vector-at meta 12) work
+   (vector-at meta 13) (record-get [:ref :evm.native/machine] previous :calldata-size))))
+(defn run-chunk [input [:ref :evm.native/machine]] [:ref :evm.native/machine]
+ (let [work (record-get [:ref :evm.native/machine] input :workspace)
+       meta (record-get [:ref :evm.native/workspace] work :meta)
+       trial (record-get [:ref :evm.native/workspace] work :trial)
+       sizes (chunk-meta input trial false false)]
+  (if (or (> (vector-at trial 5) 16384) (> (vector-at trial 6) 33554432)
+          (> (vector-at trial 7) 131072) (> (vector-at trial 8) 131072) (> (vector-at trial 9) 33554432)) (stop input 10)
+   (if (not (chunk-fits? work trial))
+   (let [grown (chunk-grow work trial)] (run-chunk (record-assoc [:ref :evm.native/machine] input :workspace grown)))
+   (let [seeded (chunk-seed input work)
+         result
+         (arena-scope
+          (loop [m input chunks 0 movement 0]
+           (let [op (vector-get (record-get [:ref :evm.native/machine] m :code) (record-get [:ref :evm.native/machine] m :pc) 0)]
+            (if (or (not (= (status m) 0)) (core-boundary? op) (= chunks 64) (>= movement 33554432)) 0
+             (let [accepted (arena-scope (let [next (chunk-evaluate m trial)]
+                                         (if (chunk-fits? work trial) (let [z (chunk-accept next work trial)] 1) 0)))]
+              (if (= accepted 0) 1
+               (let [memory-dirty (= (vector-at trial 10) 1) store-dirty (= (vector-at trial 11) 1)
+                     warm-dirty (not (= (vector-at trial 8) (vector-count (record-get [:ref :evm.native/machine] m :warm))))
+                     copied (+ 512 (* 3 (vector-at trial 5)) (if memory-dirty (vector-at trial 6) 0)
+                               (if store-dirty (vector-at trial 7) 0) (if warm-dirty (vector-at trial 8) 0) (vector-at trial 9))
+                     next (chunk-materialize m work memory-dirty store-dirty 0)]
+                (recur next (+ chunks 1) (+ movement copied)))))))))
+         retained (+ (record-get [:ref :evm.native/machine] input :retained-words) 512 (* 3 (vector-at meta 5))
+                     (if (= (vector-at meta 10) 1) (vector-at meta 6) 0)
+                     (if (= (vector-at meta 11) 1) (vector-at meta 7) 0)
+                     (if (= (vector-at meta 8) (vector-count (record-get [:ref :evm.native/machine] input :warm))) 0 (vector-at meta 8))
+                     (vector-at meta 9))]
+    (if (> retained 67108864) (stop input 10)
+     (let [snapshot (chunk-materialize input work (= (vector-at meta 10) 1) (= (vector-at meta 11) 1) retained)]
+      (if (= result 0) snapshot
+       (if (or (> (vector-at trial 5) 16384) (> (vector-at trial 6) 33554432)
+               (> (vector-at trial 7) 131072) (> (vector-at trial 8) 131072) (> (vector-at trial 9) 33554432)) (stop snapshot 10)
+        (run-chunk (record-assoc [:ref :evm.native/machine] snapshot :workspace (chunk-grow work trial))))))))))))
+
+(defn- bounded-elements? [v :vector-i64 max :i64] :bool
+  (loop [i 0]
+    (if (= i (vector-count v)) true
+      (if (or (< (vector-at v i) 0) (> (vector-at v i) max)) false (recur (+ i 1))))))
+
+(defn- canonical-store? [store :vector-i64] :bool
+  (if (or (not (= (rem (vector-count store) 32) 0))
+          (not (bounded-elements? store 65535))) false
+    (loop [i 0]
+      (if (= i (vector-count store)) true
+        (let [slot (slice store i 16) value (slice store (+ i 16) 16)]
+          (if (or (w/zero? value) (and (> i 0) (not (slot-less store (- i 32) slot)))) false
+            (recur (+ i 32))))))))
+
+(defn run [code :vector-i64 calldata :vector-i64 store :vector-i64
+            warm :vector-i64 gas :i64 static :bool] [:ref :evm.native/machine]
+  (let [initial (make-machine code calldata store warm gas static)]
+    (if (or (< gas 0)
+            (> (vector-count code) 65536) (> (vector-count calldata) 65536)
+            (> (vector-count store) 131072) (> (vector-count warm) 16384)) (stop initial 10)
+      (if (or (not (bounded-elements? code 255)) (not (bounded-elements? calldata 255))
+              (not (canonical-store? store)) (not (bounded-elements? warm 65535))
+              (not (= (rem (vector-count warm) 16) 0))) (stop initial 11)
+      (loop [m initial]
+        (if (not (= (status m) 0)) m
+          (recur (if (core-boundary? (vector-get code (record-get [:ref :evm.native/machine] m :pc) 0)) (step m) (run-chunk m)))))))))
+
+;; Internal native execution interface. These preserve the frame rules and
+;; checked record schema when an account/call manager dispatches an opcode.
+(defn frame-halt [m [:ref :evm.native/machine] state :i64] [:ref :evm.native/machine] (stop m state))
+(defn frame-charge [m [:ref :evm.native/machine] cost :i64] [:ref :evm.native/machine] (charge m cost))
+(defn frame-stack-size [m [:ref :evm.native/machine]] :i64 (stack-size m))
+(defn frame-drop [m [:ref :evm.native/machine] count :i64] [:ref :evm.native/machine] (drop-stack m count))
+(defn frame-push [m [:ref :evm.native/machine] word :vector-i64] [:ref :evm.native/machine] (push m word))
+(defn frame-expand [m [:ref :evm.native/machine] offset :i64 length :i64] [:ref :evm.native/machine]
+  (expand-memory m offset length))
+(defn frame-memory [m [:ref :evm.native/machine]] :vector-i64
+ (let [physical (record-get [:ref :evm.native/machine] m :memory)
+       out (vector-alloc (record-get [:ref :evm.native/machine] m :memory-size))]
+  (loop [i 0]
+   (if (= i (vector-count physical)) out
+    (let [copied (vector-assoc! out i (vector-at physical i))]
+     (recur (+ i 1)))))))
+(defn frame-memory-physical [m [:ref :evm.native/machine]] :vector-i64
+ (record-get [:ref :evm.native/machine] m :memory))
+(defn frame-memory-size [m [:ref :evm.native/machine]] :i64
+ (record-get [:ref :evm.native/machine] m :memory-size))
+(defn frame-write-memory [m [:ref :evm.native/machine] offset :i64 bytes :vector-i64] [:ref :evm.native/machine]
+  (write-memory m offset bytes))

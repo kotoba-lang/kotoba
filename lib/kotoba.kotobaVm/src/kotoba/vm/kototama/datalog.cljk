@@ -1,0 +1,345 @@
+(ns kotoba.vm.kototama.datalog
+  "Bounded, function-free Datalog for Kototama's authority plane.
+
+  Facts retain their issuer through every derivation. The fixed authority
+  relation is decided here, in the local evaluator; caller-supplied facts and
+  rules cannot manufacture its protected inputs or its `kotoba:eligible`
+  result. Exhaustion is returned as a value and never exposes partial allows.")
+
+(def trusted-origins
+  {"amu:requires" :amu
+   "amu:world" :amu
+   "vm:runs" :vm
+   "vm:requests" :vm
+   "grant:right" :grant
+   "policy:allows" :policy
+   "runtime:world" :runtime
+   "runtime:available" :runtime})
+
+(def authority-origins #{:amu :vm :grant :policy :runtime})
+
+(def ^:private protected-predicates
+  (conj (set (keys trusted-origins)) "kotoba:eligible"))
+
+(def ^:private eligibility-rule
+  {:head ["kotoba:eligible" '?actor '?kind '?resource]
+   :body [["vm:runs" '?actor '?definition]
+          ["amu:requires" '?definition '?kind]
+          ["amu:world" '?definition '?world]
+          ["vm:requests" '?actor '?kind '?resource]
+          ["grant:right" '?actor '?kind '?resource]
+          ["policy:allows" '?actor '?kind '?resource]
+          ["runtime:world" '?world]
+          ["runtime:available" '?kind '?resource]]})
+
+(def ^:private default-budget
+  {:max-rounds 32 :max-facts 4096 :max-joins 65536})
+
+(def ^:private max-budget
+  {:max-rounds 256 :max-facts 65536 :max-joins 1048576})
+
+(def ^:private max-rules 1024)
+(def ^:private max-body-atoms 128)
+(def ^:private max-tuple-arity 64)
+(def ^:private max-term-depth 32)
+(def ^:private max-collection-items 4096)
+(def ^:private max-text-chars 4096)
+(def ^:private max-byte-value 65536)
+
+(defn- invalid! [reason data]
+  (throw (ex-info "Invalid Kototama Datalog input"
+                  (merge {:type :kototama.vm/datalog-invalid :reason reason} data))))
+
+(defn- variable? [x]
+  (and (symbol? x) (.startsWith (name x) "?")))
+
+(defn- bytes?* [x]
+  #?(:clj (bytes? x)
+     :cljs (and (exists? js/Uint8Array) (instance? js/Uint8Array x))))
+
+(defn- portable-value? [x depth]
+  (cond
+    (> depth max-term-depth) false
+    (or (nil? x) (boolean? x)) true
+    (keyword? x) (<= (+ (count (name x)) (count (or (namespace x) "")))
+                     max-text-chars)
+    (integer? x) (<= (count (str x)) max-text-chars)
+    (string? x) (<= (count x) max-text-chars)
+    (bytes?* x) (<= #?(:clj (alength ^bytes x) :cljs (.-length x)) max-byte-value)
+    (vector? x) (and (<= (count x) max-collection-items)
+                     (every? #(portable-value? % (inc depth)) x))
+    (list? x) (and (<= (count x) max-collection-items)
+                   (every? #(portable-value? % (inc depth)) x))
+    (set? x) (and (<= (count x) max-collection-items)
+                  (every? #(portable-value? % (inc depth)) x))
+    (map? x) (and (<= (count x) max-collection-items)
+                  (every? (fn [[k v]] (and (portable-value? k (inc depth))
+                                           (portable-value? v (inc depth)))) x))
+    :else false))
+
+(defn- value= [a b]
+  (cond
+    (and (bytes?* a) (bytes?* b))
+    (and (= (alength a) (alength b))
+         (every? true? (map = a b)))
+    (and (vector? a) (vector? b))
+    (and (= (count a) (count b)) (every? true? (map value= a b)))
+    (and (list? a) (list? b))
+    (and (= (count a) (count b)) (every? true? (map value= a b)))
+    (and (map? a) (map? b))
+    (and (= (count a) (count b))
+         (every? (fn [[ka va]]
+                   (some (fn [[kb vb]] (and (value= ka kb) (value= va vb))) b)) a))
+    (and (set? a) (set? b))
+    (and (= (count a) (count b))
+         (every? (fn [x] (some #(value= x %) b)) a))
+    :else (= a b)))
+
+(defn- tuple= [a b]
+  (and (= (count a) (count b)) (every? true? (map value= a b))))
+
+(defn- validate-tuple! [tuple allow-vars?]
+  (when-not (and (vector? tuple) (string? (first tuple)) (seq tuple)
+                 (<= (count tuple) max-tuple-arity))
+    (invalid! :invalid-tuple {:tuple tuple}))
+  (doseq [term (rest tuple)]
+    (when-not (if (and allow-vars? (variable? term))
+                true
+                (portable-value? term 0))
+      (invalid! :non-portable-term {:term term :tuple tuple})))
+  tuple)
+
+(defn- tuple-vars [tuple]
+  (into #{} (filter variable? (rest tuple))))
+
+(defn- validate-fact! [{:keys [tuple origin] :as fact}]
+  (when-not (= #{:tuple :origin} (set (keys fact)))
+    (invalid! :invalid-fact-envelope {:fact fact}))
+  (validate-tuple! tuple false)
+  (when-not (contains? authority-origins origin)
+    (invalid! :untrusted-origin {:origin origin :tuple tuple}))
+  (when-let [expected (get trusted-origins (first tuple))]
+    (when-not (= expected origin)
+      (invalid! :origin-mismatch {:predicate (first tuple)
+                                  :expected expected :actual origin})))
+  (when (= "kotoba:eligible" (first tuple))
+    (invalid! :protected-derived-predicate {:predicate (first tuple)}))
+  {:tuple tuple :proofs [#{origin}]})
+
+(defn- validate-rule! [rule allow-eligibility-rule?]
+  (when-not (and (map? rule)
+                 (= #{:head :body} (set (keys rule)))
+                 (vector? (:body rule))
+                 (seq (:body rule))
+                 (<= (count (:body rule)) max-body-atoms))
+    (invalid! :invalid-rule {:rule rule}))
+  (validate-tuple! (:head rule) true)
+  (doseq [tuple (:body rule)] (validate-tuple! tuple true))
+  (when (and (contains? protected-predicates (first (:head rule)))
+             (not (and allow-eligibility-rule? (= rule eligibility-rule))))
+    (invalid! :protected-rule-head {:predicate (first (:head rule))}))
+  (let [body-vars (into #{} (mapcat tuple-vars) (:body rule))
+        head-vars (tuple-vars (:head rule))]
+    (when-not (every? body-vars head-vars)
+      (invalid! :not-range-restricted {:unbound (set (remove body-vars head-vars))})))
+  rule)
+
+(defn- same-proof? [a b] (= a b))
+
+(defn- find-entry [entries tuple]
+  (some #(when (tuple= tuple (:tuple %)) %) entries))
+
+(defn- add-proof [relations tuple proof max-facts]
+  (let [entries (get relations (first tuple) [])
+        existing (find-entry entries tuple)]
+    (cond
+      (and existing (some #(same-proof? proof %) (:proofs existing)))
+      [relations false]
+
+      existing
+      [(update relations (first tuple)
+               (fn [items]
+                 (mapv #(if (identical? % existing)
+                          (update % :proofs conj proof)
+                          %)
+                       items))) true]
+
+      (>= (reduce + 0 (map count (vals relations))) max-facts)
+      (throw (ex-info "Kototama Datalog fact budget exhausted"
+                      {:type :kototama.vm/datalog-exhausted :budget :max-facts}))
+
+      :else
+      [(update relations (first tuple) (fnil conj []) {:tuple tuple :proofs [proof]}) true])))
+
+(defn- unify-term [pattern value bindings]
+  (if (variable? pattern)
+    (if (contains? bindings pattern)
+      (when (value= (get bindings pattern) value) bindings)
+      (assoc bindings pattern value))
+    (when (value= pattern value) bindings)))
+
+(defn- unify-tuple [pattern tuple bindings]
+  (when (and (= (first pattern) (first tuple)) (= (count pattern) (count tuple)))
+    (loop [i 1 bindings bindings]
+      (if (= i (count pattern))
+        bindings
+        (when-let [next-bindings (unify-term (nth pattern i) (nth tuple i) bindings)]
+          (recur (inc i) next-bindings))))))
+
+(defn- join-body [relations body consume!]
+  (reduce
+   (fn [rows pattern]
+     (vec
+      (mapcat
+       (fn [{:keys [bindings proof]}]
+         (for [entry (get relations (first pattern) [])
+               fact-proof (:proofs entry)
+               :let [_ (consume!)
+                     next-bindings (unify-tuple pattern (:tuple entry) bindings)]
+               :when next-bindings]
+           {:bindings next-bindings :proof (into proof fact-proof)}))
+       rows)))
+   [{:bindings {} :proof #{}}]
+   body))
+
+(defn- instantiate [tuple bindings]
+  (mapv #(if (variable? %) (get bindings %) %) tuple))
+
+(defn- derive-round [relations rules consume! max-facts]
+  (reduce
+   (fn [[relations changed?] {:keys [head body]}]
+     (reduce
+      (fn [[relations changed?] {:keys [bindings proof]}]
+        (let [[relations added?] (add-proof relations (instantiate head bindings)
+                                            proof max-facts)]
+          [relations (or changed? added?)]))
+      [relations changed?]
+      (join-body relations body consume!)))
+   [relations false]
+   rules))
+
+(defn- normalize-query [query]
+  (validate-tuple! query true))
+
+(defn- query-answers [relations query]
+  (->> (get relations (first query) [])
+       (keep (fn [{:keys [tuple proofs]}]
+               (when (unify-tuple query tuple {})
+                 {:tuple tuple :provenances proofs})))
+       vec))
+
+(defn- exhaustion? [error]
+  (= :kototama.vm/datalog-exhausted (:type (ex-data error))))
+
+(defn- evaluate* [input allow-eligibility-rule?]
+  (let [{:keys [facts rules query budget]} input
+        {:keys [max-rounds max-facts max-joins]}
+        (merge default-budget budget)
+        joins (volatile! 0)
+        consume! (fn []
+                   (let [n (vswap! joins inc)]
+                     (when (> n max-joins)
+                       (throw (ex-info "Kototama Datalog join budget exhausted"
+                                       {:type :kototama.vm/datalog-exhausted
+                                        :budget :max-joins})))))]
+    (try
+      (when-not (and (vector? facts) (vector? rules))
+        (invalid! :facts-and-rules-must-be-vectors {}))
+      (when-not (and (integer? max-rounds) (pos? max-rounds)
+                     (<= max-rounds (:max-rounds max-budget))
+                     (integer? max-facts) (pos? max-facts)
+                     (<= max-facts (:max-facts max-budget))
+                     (integer? max-joins) (pos? max-joins)
+                     (<= max-joins (:max-joins max-budget))
+                     (or (nil? budget)
+                         (every? #{:max-rounds :max-facts :max-joins}
+                                 (keys budget))))
+        (invalid! :invalid-budget {:budget budget}))
+      (when (> (count facts) max-facts)
+        (throw (ex-info "Kototama Datalog fact budget exhausted"
+                        {:type :kototama.vm/datalog-exhausted :budget :max-facts})))
+      (when (> (count rules) max-rules)
+        (invalid! :rule-count-exceeded {:max-rules max-rules :actual (count rules)}))
+      (normalize-query query)
+      (let [rules (mapv #(validate-rule! % allow-eligibility-rule?) rules)
+            initial (reduce (fn [relations fact]
+                              (let [{:keys [tuple proofs]} (validate-fact! fact)]
+                                (first (add-proof relations tuple (first proofs) max-facts))))
+                            {} facts)
+            [relations rounds]
+            (loop [relations initial, round 0]
+              (let [[next changed?] (derive-round relations rules consume! max-facts)
+                    round' (inc round)]
+                (cond
+                  (not changed?) [next round']
+                  (>= round' max-rounds)
+                  (throw (ex-info "Kototama Datalog round budget exhausted"
+                                  {:type :kototama.vm/datalog-exhausted
+                                   :budget :max-rounds}))
+                  :else (recur next round'))))]
+        {:status :ok
+         :answers (query-answers relations query)
+         :fuel-used @joins
+         :rounds rounds})
+      (catch #?(:clj Exception :cljs :default) error
+        (if (exhaustion? error)
+          {:status :resource-exhaustion :reason (:budget (ex-data error))
+           :fuel-used @joins :answers []}
+          {:status :invalid :reason (:reason (ex-data error))
+           :detail (dissoc (ex-data error) :type :reason)
+           :fuel-used @joins :answers []})))))
+
+(defn evaluate
+  "Evaluate positive, range-restricted Datalog to a bounded least fixed point.
+
+  Input is `{:facts [{:tuple [predicate ...] :origin :origin} ...]
+             :rules [{:head tuple :body [tuple ...]} ...]
+             :query tuple :budget {:max-rounds n :max-facts n :max-joins n}}`.
+  Query answers carry alternative provenance sets. Unknown origins, host
+  objects, function terms, negation, and non-range-restricted rules fail
+  closed. Budget exhaustion discards every partial answer."
+  [input]
+  (evaluate* input false))
+
+(defn authorize
+  "Decide one effect through the closed five-origin eligibility join.
+
+  ORIGIN-FACTS is a map from source owner (`:amu`, `:vm`, `:grant`, `:policy`,
+  `:runtime`) to that owner's tuple vector. The evaluator assigns provenance
+  from the owning input slot; callers cannot attach an origin to an individual
+  fact. The host must populate each slot only from its source-verified input.
+  Only this local evaluator may return `:allow`. Every required origin must
+  occur in the same derivation; missing or mismatched evidence denies."
+  [origin-facts actor effect resource budget]
+  (let [facts (when (and (map? origin-facts)
+                         (every? authority-origins (keys origin-facts))
+                         (every? vector? (vals origin-facts)))
+                (vec (mapcat (fn [[origin tuples]]
+                               (map (fn [tuple] {:tuple tuple :origin origin}) tuples))
+                             (sort-by (comp name key) origin-facts))))
+        query ["kotoba:eligible" actor effect resource]
+        result (if facts
+                 (evaluate* {:facts facts :rules [eligibility-rule]
+                             :query query :budget budget}
+                            true)
+                 {:status :invalid :reason :invalid-origin-facts
+                  :fuel-used 0 :answers []})
+        required authority-origins
+        allowed? (some (fn [{:keys [tuple provenances]}]
+                         (and (tuple= tuple query)
+                              (some #(= required %) provenances)))
+                       (:answers result))]
+    (cond
+      (= :resource-exhaustion (:status result))
+      {:decision :resource-exhaustion :reason (:reason result)
+       :fuel-used (:fuel-used result)}
+      (not= :ok (:status result))
+      {:decision :deny :reason :invalid-authority-evidence
+       :detail (:reason result) :fuel-used (:fuel-used result)}
+      allowed?
+      {:decision :allow :actor actor :effect effect :resource resource
+       :origins required :fuel-used (:fuel-used result)}
+      :else
+      {:decision :deny :reason :incomplete-authority-intersection
+       :actor actor :effect effect :resource resource
+       :fuel-used (:fuel-used result)})))

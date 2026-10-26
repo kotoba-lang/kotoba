@@ -1,0 +1,108 @@
+;; Canonical RLP byte/list encoding and strict bounded traversal. No host RLP.
+(ns kotoba.vm.evm.native-rlp
+  (:require [kotoba.vm.evm.native-bytes :as b]
+            [kotoba.vm.evm.native-word :as w]))
+
+(defn integer-bytes [value :vector-i64] :vector-i64
+  (let [all (w/append-bytes (vector-i64) value)
+        first (loop [i 0] (if (or (= i 32) (not (= (vector-at all i) 0))) i (recur (+ i 1))))]
+    (b/slice all first (- 32 first))))
+
+(defn- length-size [n :i64] :i64
+  (loop [x n size 0]
+    (if (= x 0) size (recur (quot x 256) (+ size 1)))))
+
+(defn- length-prefix [n :i64 base :i64] :vector-i64
+  (if (< n 56) (vector-i64 (+ base n))
+    (let [size (length-size n) out (vector-alloc (+ size 1))
+          tag (vector-assoc! out 0 (+ base 55 size))]
+      (loop [x n i size]
+        (if (= i 0) out
+          (let [z (vector-assoc! out i (rem x 256))] (recur (quot x 256) (- i 1))))))))
+
+(defn encode-bytes [payload :vector-i64] :vector-i64
+  (if (and (= (vector-count payload) 1) (< (vector-at payload 0) 128)) payload
+    (b/concat (length-prefix (vector-count payload) 128) payload)))
+
+(defn encode-word [value :vector-i64] :vector-i64
+  (encode-bytes (integer-bytes value)))
+
+(defn encode-list [encoded-items :vector-i64] :vector-i64
+  ;; Argument is concatenated encodings of children, not unencoded payloads.
+  (b/concat (length-prefix (vector-count encoded-items) 192) encoded-items))
+
+(defn- long-length [input :vector-i64 at :i64 size :i64] :i64
+  ;; This codec's resource envelope is 1 MiB; avoid overflow BEFORE shifting.
+  (if (or (< size 1) (> size 3) (> (+ at size) (vector-count input))
+          (= (vector-at input at) 0)) -1
+    (loop [i 0 n 0]
+      (if (= i size) (if (and (>= n 56) (<= n 1048576)) n -1)
+        (recur (+ i 1) (+ (* n 256) (vector-at input (+ at i))))))))
+
+(defn payload-start [input :vector-i64 at :i64] :i64
+  (if (or (< at 0) (>= at (vector-count input))) -1
+    (let [tag (vector-at input at)]
+      (cond (< tag 128) at (< tag 184) (+ at 1)
+            (< tag 192) (+ at 1 (- tag 183))
+            (< tag 248) (+ at 1) :else (+ at 1 (- tag 247))))))
+
+(defn payload-length [input :vector-i64 at :i64] :i64
+  (if (or (< at 0) (>= at (vector-count input))) -1
+    (let [tag (vector-at input at)]
+      (cond (< tag 128) 1 (< tag 184) (- tag 128)
+            (< tag 192) (long-length input (+ at 1) (- tag 183))
+            (< tag 248) (- tag 192) :else (long-length input (+ at 1) (- tag 247))))))
+
+(defn list-item? [input :vector-i64 at :i64] :bool
+  (and (>= at 0) (< at (vector-count input)) (>= (vector-at input at) 192)))
+
+(defn item-end [input :vector-i64 at :i64] :i64
+  (let [start (payload-start input at) length (payload-length input at)]
+    (if (or (< start 0) (< length 0) (> (+ start length) (vector-count input))
+            (and (= (vector-get input at 0) 129) (= length 1)
+                 (< (vector-get input start 0) 128))) -1 (+ start length))))
+
+(defn- valid-item? [input :vector-i64 at :i64 limit :i64 depth :i64] :bool
+  (let [end (item-end input at)]
+    (and (>= depth 0) (<= depth 64) (> end at) (<= end limit)
+      (if (not (list-item? input at)) true
+        (loop [i (payload-start input at)]
+          (if (= i end) true
+            (let [next (item-end input i)]
+              (if (and (> next i) (<= next end) (valid-item? input i end (+ depth 1)))
+                (recur next) false))))))))
+
+(defn valid? [input :vector-i64] :bool
+  (and (> (vector-count input) 0) (<= (vector-count input) 1048576)
+       (b/valid? input) (= (item-end input 0) (vector-count input))
+       (valid-item? input 0 (vector-count input) 0)))
+
+(defn list-count [input :vector-i64 at :i64] :i64
+  (if (not (list-item? input at)) -1
+    (let [end (item-end input at)]
+      (if (< end 0) -1
+        (loop [i (payload-start input at) n 0]
+          (if (= i end) n
+            (let [next (item-end input i)]
+              (if (or (<= next i) (> next end)) -1 (recur next (+ n 1))))))))))
+
+(defn list-nth [input :vector-i64 at :i64 index :i64] :i64
+  (if (or (< index 0) (not (list-item? input at))) -1
+    (let [end (item-end input at)]
+      (loop [i (payload-start input at) n 0]
+        (cond (or (< end 0) (>= i end)) -1 (= n index) i
+              :else (let [next (item-end input i)]
+                      (if (or (<= next i) (> next end)) -1 (recur next (+ n 1)))))))))
+
+(defn payload [input :vector-i64 at :i64] :vector-i64
+  (if (< (item-end input at) 0) (vector-i64)
+    (b/slice input (payload-start input at) (payload-length input at))))
+
+(defn canonical-word? [input :vector-i64 at :i64] :bool
+  (let [n (payload-length input at) start (payload-start input at)]
+    (and (not (list-item? input at)) (>= (item-end input at) 0) (>= n 0) (<= n 32)
+         (or (= n 0) (not (= (vector-at input start) 0))))))
+
+(defn decode-word [input :vector-i64 at :i64] :vector-i64
+  ;; Call canonical-word? before accepting an Ethereum integer field.
+  (w/from-bytes input (payload-start input at) (payload-length input at)))
