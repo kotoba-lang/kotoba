@@ -2,8 +2,9 @@
 """Build and exercise the native scorecard core on macOS without hosted runtimes.
 
 This is a schema/point-ledger probe with native qualification-release RSA
-verification and referenced serial-log digest checks. It does not qualify
-other evidence, freshness, or hardware.
+verification, referenced serial-log digest checks, and tagged-receipt row
+binding. Legacy receipts without a :row tag remain unbound. It does not
+qualify other evidence, freshness, or hardware.
 """
 
 import argparse
@@ -29,11 +30,15 @@ NEGATIVES = {
         b'"record os/aiueos/qualification/receipts/vm-20261024/a1-qmp60/receipt.edn"'),
     'owner-unconfirmed': (b':confirmed-by-owner true', b':confirmed-by-owner false'),
     'unknown-category': (b'{:id :A1 :category :boot', b'{:id :A1 :category :bogus'),
+    'swapped-row-receipt': (
+        b'"receipt os/aiueos/qualification/receipts/vm-20261026/a2-display-change/receipt.edn"',
+        b'"receipt os/aiueos/qualification/receipts/vm-20261026/i3-display-scaling-external/receipt.edn"'),
     'missing-signed-release-reference': (
         b'"receipt os/aiueos/qualification/receipts/vm-20261025/signed-release/receipt.edn"',
         b'"record os/aiueos/qualification/receipts/vm-20261025/signed-release/receipt.edn"'),
 }
 RECEIPT_NEGATIVES = ('missing-receipt-file', 'red-verdict',
+                     'wrong-row-tag',
                      'bad-release-signature-field', 'missing-release-verdict',
                      'tampered-release-json', 'tampered-release-signature',
                      'rehashed-invalid-signature', 'tampered-serial-log',
@@ -52,6 +57,8 @@ SIGNED_RELEASE_SIGNATURE = SIGNED_RELEASE_RECEIPT.with_name(
     'aiueos-x86_64-build-receipt.sig')
 I3_RECEIPT = Path(
     'os/aiueos/qualification/receipts/vm-20261026/i3-display-scaling-external/receipt.edn')
+A2_RECEIPT = Path(
+    'os/aiueos/qualification/receipts/vm-20261026/a2-display-change/receipt.edn')
 # I2 has synthetic battery input and separate sleep-run evidence. The
 # remaining rows also lack evidence this native core can fully admit.
 UNVERIFIED_ROWS = ('A5', 'C9', 'F2', 'G1', 'G3', 'G5', 'H1', 'H2',
@@ -237,6 +244,7 @@ def main():
                 ('tampered-i3-scale-log', 'missing-i3-scale-log')
                 else I3_RECEIPT.with_name('scanout-two-run-serial.log') if name in
                 ('tampered-i3-scanout-log', 'missing-i3-scanout-log')
+                else A2_RECEIPT if name == 'wrong-row-tag'
                 else A1_RECEIPT)
             if name in ('missing-receipt-file', 'missing-serial-log',
                         'missing-secondary-serial-log', 'missing-i3-scale-log',
@@ -257,6 +265,12 @@ def main():
                     raise ValueError('image-bound verdict anchor missing')
                 target.write_bytes(receipt_bytes.replace(
                     before, b'"image-unbound"', 1))
+            elif name == 'wrong-row-tag':
+                receipt_bytes = target.read_bytes()
+                before = b':row :A2'
+                if receipt_bytes.count(before) != 1:
+                    raise ValueError('A2 row tag anchor missing')
+                target.write_bytes(receipt_bytes.replace(before, b':row :I3', 1))
             elif name in ('tampered-release-json', 'tampered-release-signature',
                           'tampered-serial-log', 'tampered-secondary-serial-log',
                           'tampered-i3-scale-log', 'tampered-i3-scanout-log'):
@@ -345,6 +359,8 @@ def main():
               'executableSha256': digest(executable),
               'observations': observations,
               'receiptFieldsVerified': True, 'evidenceArtifactsVerified': False,
+              'taggedReceiptRowBindingVerified': True,
+              'legacyUntaggedReceiptRowBindingVerified': False,
               'referencedReceiptSerialDigestsVerified': True,
               'signedReleaseReceiptFileDigestsVerified': True,
               'qualificationReleaseSignatureVerified': True,
