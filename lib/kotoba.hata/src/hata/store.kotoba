@@ -1,0 +1,144 @@
+(ns hata.store
+  (:export [create load submit complete recover token state])
+  (:require [hata.codec :as c] [hata.authority :as a] [hata.admission :as ad]
+            [hata.store-io :as io] [ed25519.selfhost :as ed]))
+
+;; Single-host C0 checkpoint service. Wire 35 and the checkpoint signing seed
+;; belong to the trusted host, not to callers/LLMs. No effect dispatch occurs.
+;; A snapshot carries state plus retained request/proof/admission-time records.
+;; Blob: [version state-length record-count record-stride=781 state... records...].
+(defn- path [base :string name :string] :string
+  (string-concat base (string-concat "/awai-admission." name)))
+(defn state [blob :vector-i64] :vector-i64
+  (if (and (>= (vector-count blob) 28) (= (vector-at blob 0) 1)
+           (>= (vector-at blob 1) 24) (<= (vector-at blob 1) 3672)
+           (>= (vector-at blob 2) 0) (<= (vector-at blob 2) 64)
+           (= (vector-at blob 3) 781)
+           (= (vector-count blob) (+ (+ 4 (vector-at blob 1)) (* (vector-at blob 2) 781))))
+    (let [s (c/slice blob 4 (vector-at blob 1))]
+      (if (and (not= (ad/admission-status s) 10) (= (vector-at blob 2) (vector-at s 6))) s (vector-i64)))
+    (vector-i64)))
+(defn token [blob :vector-i64] :vector-i64
+  (c/digest (c/message "awai.c0.checkpoint-token.v1" blob)))
+(defn- checkpoint-message [blob :vector-i64] :vector-i64
+  (c/message "awai.c0.checkpoint-signature.v1" (token blob)))
+(defn- seed-matches? [p :vector-i64 seed :vector-i64] :bool
+  (and (>= (vector-count p) 112) (= (vector-count seed) 32) (c/bytes? seed)
+       (arena-scope (c/equal? (ed/public-from-seed seed) (c/slice p 80 32)))))
+(defn- envelope [blob :vector-i64 seed :vector-i64] :string
+  (let [sig (vector-alloc 64) signed (ed/sign-into sig seed (checkpoint-message blob))]
+    (if (not= signed 0) ""
+      (string-concat "AWAI-C0-STORE-V1\n"
+        (string-concat (c/hex blob) (string-concat "\n" (c/hex sig)))))))
+(defn- decode [text :string p :vector-i64] :vector-i64
+  (if (or (> (string-length text) 1048576) (< (vector-count p) 112)
+          (not= (string-index-of text "AWAI-C0-STORE-V1\n") 0)) (vector-i64)
+    (let [rest (string-substring text 17 (string-length text)) split (string-index-of rest "\n")]
+      (if (< split 0) (vector-i64)
+        (let [blob (c/unhex (string-substring rest 0 split))
+              sig (c/unhex (string-substring rest (+ split 1) (string-length rest))) s (state blob)]
+          (if (and (> (vector-count s) 0) (= (vector-count sig) 64) (c/bytes? sig)
+                   (= (vector-at s 2) (vector-at p 2))
+                   (c/equal? (c/slice s 9 4) (c/slice p 8 4))
+                   (c/equal? (c/slice s 13 4) (c/slice p 12 4))
+                   (ed/prime-order-key? (c/slice p 80 32))
+                   (ed/verify? (c/slice p 80 32) (checkpoint-message blob) sig)) blob (vector-i64)))))))
+(defn load [base :string p :vector-i64] :vector-i64
+  (if (and (c/safe-base? base) (io/exists? (path base "state")))
+    (decode (io/read (path base "state")) p) (vector-i64)))
+(defn- publish [base :string blob :vector-i64 seed :vector-i64] :string
+  (let [text (envelope blob seed) temp (path base "pending") final (path base "state")]
+    (cond (= (string-length text) 0) "rejected:sign"
+          (not (io/write temp text)) "rejected:write"
+          (not (io/sync temp)) "rejected:sync"
+          (not (io/rename temp final)) "uncertain:rename"
+          (not (io/sync base)) "uncertain:directory-sync"
+          :else (string-concat "committed:" (c/hex (token blob))))))
+(defn- release [base :string result :string] :string
+  (if (io/unlock (path base "lock")) result "uncertain:unlock"))
+(defn create [base :string config :vector-i64 p :vector-i64 seed :vector-i64] :string
+  (cond (not (c/safe-base? base)) "rejected:path"
+        (not (a/policy? p)) "rejected:policy"
+        (not (seed-matches? p seed)) "rejected:signer"
+        :else
+        (let [s (ad/admission-initialize config)]
+          (cond (= (vector-count s) 0) "rejected:config"
+                (or (not= (vector-at s 1) (vector-at p 1)) (not= (vector-at s 2) (vector-at p 2))
+                    (not (c/equal? (c/slice s 9 4) (c/slice p 8 4)))
+                    (not (c/equal? (c/slice s 13 4) (c/slice p 12 4)))) "rejected:binding"
+                (not (io/lock (path base "lock"))) "rejected:busy"
+                :else (release base
+                        (if (or (io/exists? (path base "state")) (io/exists? (path base "pending")))
+                          "rejected:exists"
+                          (publish base (c/append (vector-i64 1 24 0 781) s) seed)))))))
+(defn- expected? [blob :vector-i64 command :vector-i64] :bool
+  (c/equal? (token blob) (c/slice command 1 4)))
+(defn- stable-row [blob :vector-i64 r :vector-i64 auth :vector-i64] :i64
+  (loop [i 0]
+    (if (= i (vector-at blob 2)) -1
+      (let [start (+ (+ 4 (vector-at blob 1)) (* i 781))]
+        (if (and (c/equal? (c/slice blob (+ start 27) 4) (c/slice r 26 4))
+                 (c/equal? (c/slice blob (+ start 52) 4) (c/slice auth 1 4))) i
+          (recur (+ i 1)))))))
+(defn- replace-state [blob :vector-i64 next :vector-i64] :vector-i64
+  (c/append (c/append (vector-i64 1 (vector-count next) (vector-at next 6) 781) next)
+    (c/slice blob (+ 4 (vector-at blob 1)) (* (vector-at blob 2) 781))))
+(defn- submit-locked [base :string p :vector-i64 seed :vector-i64 command :vector-i64] :string
+  (let [blob (load base p)]
+    (cond (= (vector-count blob) 0) "rejected:missing-or-corrupt"
+          (not (expected? blob command)) "rejected:compare"
+          :else
+          (let [s (state blob) r (c/slice command 5 50) auth (c/slice command 55 297)
+                row (stable-row blob r auth)]
+            (if (>= row 0)
+              (let [start (+ (+ 4 (vector-at blob 1)) (* row 781))]
+                (if (c/equal? (c/slice blob (+ start 1) 50) r)
+                  (string-concat "duplicate:" (str (vector-at s (+ 24 (* row 57)))))
+                  "rejected:request-id-conflict"))
+              (let [next (a/admit s r p auth (vector-i64 (vector-at command 0) (vector-at s 3) (vector-at s 1)))
+                    decision (ad/admission-status next)]
+                (cond (= decision 2) "duplicate:envelope"
+                      (not= decision 1) (string-concat "rejected:admission:" (str decision))
+                      :else
+                      (let [with-state (replace-state blob next)
+                            record0 (c/append (vector-i64 (vector-at command 0)) (c/append r auth))
+                            policy-frame (loop [i 0 out (vector-i64 (vector-count p))]
+                                           (if (= i 432) out
+                                             (recur (+ i 1) (vector-conj out
+                                               (if (< i (vector-count p)) (vector-at p i) 0)))))
+                            record (c/append record0 policy-frame)]
+                        (publish base (c/append with-state record) seed)))))))))
+(defn submit [base :string p :vector-i64 seed :vector-i64 command :vector-i64] :string
+  (cond (not (c/safe-base? base)) "rejected:path"
+        (not= (vector-count command) 352) "rejected:command"
+        (not (seed-matches? p seed)) "rejected:signer"
+        :else
+        (let [decision (a/verify p (c/slice command 5 50) (c/slice command 55 297) (vector-at command 0))]
+          (cond (not= decision 0) (string-concat "rejected:authority:" (str decision))
+                (not (io/lock (path base "lock"))) "rejected:busy"
+                :else (release base (submit-locked base p seed command))))))
+(defn- change-locked [base :string p :vector-i64 seed :vector-i64 command :vector-i64 recovery :bool] :string
+  (let [blob (load base p)]
+    (cond (= (vector-count blob) 0) "rejected:missing-or-corrupt"
+          (not (expected? blob command)) "rejected:compare"
+          (not= (vector-at (state blob) 1) (vector-at p 1)) "rejected:epoch"
+          :else
+          (let [s (state blob) now (vector-at command 0)
+                next (if recovery
+                       (ad/admission-recover s now (vector-at s 3) (vector-at s 1) (vector-at command 5))
+                       (ad/admission-complete s (c/slice command 5 4) (vector-at command 9)
+                         (c/slice command 10 4) (vector-i64 now (vector-at s 3) (vector-at s 1))))
+                decision (ad/admission-status next)]
+            (cond (= decision 2) "duplicate:completion"
+                  (not= decision (if recovery 4 3)) (string-concat "rejected:transition:" (str decision))
+                  :else (publish base (replace-state blob next) seed))))))
+(defn- change [base :string p :vector-i64 seed :vector-i64 command :vector-i64 recovery :bool] :string
+  (cond (not (c/safe-base? base)) "rejected:path"
+        (not= (vector-count command) (if recovery 6 14)) "rejected:command"
+        (not (seed-matches? p seed)) "rejected:signer"
+        (not (io/lock (path base "lock"))) "rejected:busy"
+        :else (release base (change-locked base p seed command recovery))))
+(defn complete [base :string p :vector-i64 seed :vector-i64 command :vector-i64] :string
+  (change base p seed command false))
+(defn recover [base :string p :vector-i64 seed :vector-i64 command :vector-i64] :string
+  (change base p seed command true))
