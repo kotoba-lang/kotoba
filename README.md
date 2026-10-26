@@ -40,6 +40,23 @@ for source layout and portable verification, and the
 [library and Lexicon event design](docs/ADR-kotoba-library-monorepo-and-lexicon-events.md).
 Amu and other execution/contract owners remain separate repositories.
 
+## Common foundation and Awai distribution
+
+Kotoba is the reusable language/tooling foundation. Amu owns compilation and
+Kototama owns common execution/state/authority-budget/receipt contracts.
+**AIUEOS is the common OS; AWAI OS is its Awai Network distribution**, maintained
+in the same [`kotoba-lang/aiueos`](https://github.com/kotoba-lang/aiueos)
+repository with the same kernel and ABI. `network-awai` owns the distributed
+network and Awai-specific product composition. See the
+[distribution decision](https://github.com/kotoba-lang/aiueos/blob/main/90-docs/adr/0274-awai-os-is-an-aiueos-distribution.md).
+
+Distribution choice does not change language/VM semantics, confer capability
+or node membership, or qualify a release. Awai Node and Itonami also have
+independently qualified paths on other hosts. Common fixes stay in their
+existing owners; Awai presets do not create another language or OS fork.
+
+## Install
+
 ```sh
 brew tap kotoba-lang/kotoba && brew trust kotoba-lang/kotoba && brew install kotoba
 kotoba -e '(+ 1 2)'
