@@ -1,0 +1,195 @@
+(ns murakumo.bench-test
+  "Tests for the bench surface.
+
+  Every fixture below is a string this code actually produced on the fleet
+  (k16 / aiueos-node-260910, 2026-09-12), not a hand-written approximation —
+  the parse bugs this file pins were all found by running the real binary and
+  reading the real bytes:
+
+    - `llama-bench` pads its columns, so `|           pp512 |` is what it emits
+      and a `\"| pp512 |\"` literal never matches;
+    - a capture group in the number regex makes `re-find` return a vector and
+      `js/parseFloat` of a vector is NaN — a rate that looks numeric and is not;
+    - `clj->js` drops keyword namespaces, so `:bench/metrics` would be written
+      as \"metrics\" and read back as `:metrics`, and every row would print as a
+      run that measured nothing."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.text :as str]
+            ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:path" :as path]
+            [murakumo.bench :as bench]))
+
+(def llama-table
+  "| model                          |       size |     params | backend    | threads |  fa |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | ------: | --: | --------------: | -------------------: |
+| bailingmoe3 7.9B.A1.3B Q4_K - Medium |   4.49 GiB |     7.89 B | CPU        |      16 |   1 |           pp512 |        195.54 ± 2.24 |
+| bailingmoe3 7.9B.A1.3B Q4_K - Medium |   4.49 GiB |     7.89 B | CPU        |      16 |   1 |           tg128 |         24.79 ± 0.17 |
+
+build: d8f26ee (1)")
+
+(deftest llama-bench-table-is-parsed-from-the-padded-form-it-emits
+  (is (= {:pp512 195.54 :tg128 24.79} (bench/parse-llama-bench llama-table)))
+  (testing "the padding really is there, and a single-space literal would miss it"
+    (is (str/includes? llama-table "|           pp512 |"))
+    (is (not (str/includes? llama-table "| pp512 |"))))
+  (testing "no table at all is empty, not zero — zero is a rate someone measures"
+    (is (= {} (bench/parse-llama-bench "no table here")))))
+
+(def host-probe
+  "HOST=aiueos-node
+KERNEL=6.8.0-139-generic
+THREADS=16
+MEMTOTAL_KB=27435684
+GTT_BYTES=14047068160
+VRAM_BYTES=5368709120
+MODEL_BYTES=4823894944
+MODEL_SHA8=246d67d4")
+
+(deftest host-probe-keys-are-keywords
+  (let [m (bench/parse-kv host-probe)]
+    (is (= "16" (:threads m)))
+    (is (= "27435684" (:memtotal_kb m)))
+    (testing "a key containing a digit must still parse (MODEL_SHA8)"
+      (is (= "246d67d4" (:model_sha8 m))))
+    (testing "and the lookup must not be answered by a string-keyed map"
+      (is (nil? (get m "threads"))))))
+
+(def gnu-time-report
+  "	Command exited with non-zero status 1
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:00.03
+	Maximum resident set size (kbytes): 22748
+	Major (requiring I/O) page faults: 0
+	Exit status: 1")
+
+(def diffuse-block
+  "RC=1
+===TIME
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:00.03
+	Maximum resident set size (kbytes): 22748
+	Major (requiring I/O) page faults: 0
+===STEPS
+0
+===PROMPT
+===GENERATING
+===LASTSTEP
+")
+
+(deftest gnu-time-report-is-seconds-not-a-string
+  (is (= {:wall-s 0.03 :max-rss-kb 22748 :major-faults 0} (bench/parse-gnu-time gnu-time-report)))
+  (testing "h:mm:ss too"
+    (is (= 754.56 (:wall-s (bench/parse-gnu-time
+                            "	Elapsed (wall clock) time (h:mm:ss or m:ss): 12:34.56"))))))
+
+(deftest a-refused-model-is-recorded-as-a-refusal
+  (let [m (bench/parse-diffuse diffuse-block)]
+    (is (= 1 (:exit m)))
+    (is (= 0 (:denoise-steps m)))
+    (is (= 22748 (:max-rss-kb m)))
+    (testing "no token count is ABSENT, so nothing downstream can divide by it"
+      (is (not (contains? m :tokens))))))
+
+(deftest a-recorded-row-can-be-read-back
+  (let [p (.join path (.tmpdir os) (str "bench-test-" (js/Date.now) ".jsonl"))
+        row (bench/row {:node {:name "box" :ip "1.2.3.4"}
+                        :engine "llama-bench"
+                        :bin "/b"
+                        :model "/m/x.gguf"
+                        :remote "./llama-bench -m x"
+                        :metrics {:tg128 24.69 :pp512 193.44 :max-rss-kb 1048576}
+                        :extra {:bytes 4823894944 :sha "246d67d4" :host {:threads "16"}}})]
+    (bench/append-row! p row)
+    (let [{:keys [rows bad]} (bench/read-rows p)]
+      (is (= 0 bad))
+      (is (= 1 (count rows)))
+      (testing "namespaces survive the JSON round trip"
+        (is (= "box" (:bench/node (first rows))))
+        (is (= 4823894944 (:bench/model-bytes (first rows)))))
+      (testing "and the row renders as the rate that was measured, not as a blank"
+        (is (str/includes? (bench/ledger-line (first rows)) "tg128=24.69"))))
+    (fs/unlinkSync p)))
+
+(deftest a-node-is-found-by-name-or-address
+  (let [nodes [{:name "a" :ip "100.0.0.1" :online true}
+               {:name "b" :ip "100.0.0.2" :online false}]]
+    (is (= "a" (:name (bench/resolve-node nodes "a"))))
+    (is (= "b" (:name (bench/resolve-node nodes "100.0.0.2"))))
+    (is (nil? (bench/resolve-node nodes "zzz")))))
+
+(deftest options-are-not-silently-dropped
+  (is (= {:node "n" :t "16"} (bench/parse-args ["--node" "n" "--t" "16"])))
+  (is (thrown? js/Error (bench/parse-args ["--node"])))
+  (testing "no options is legal — `bench nodes` and `bench help` are real commands"
+    (is (= {} (bench/parse-args [])))))
+
+;; ── kotoba-native engine ─────────────────────────────────────────────────────
+;; The fixtures below carry the REAL bytes of one decode-guest run
+;; (out/run2.json, 2026-10-19: Qwen2.5-0.5B-Instruct Q8_0, 24 layers, greedy
+;; prompt 760,6511,314,9338,369, Apple M1 Max / MoltenVK): the per-step SUBMIT
+;; ns and the greedy argmax ids, 8/8 equal to the f64 oracle. The per-step x
+;; payload (7168 hex chars in the real output) is elided to a 4-byte stand-in —
+;; the parser never reads it — and the last part's extra 4th segment (the final
+;; logits) is kept in shape because ignoring it is one of the parse rules.
+
+(def real-step-ns
+  [52093000 21520000 21196000 22035000 22869000 22012000 21419000 21146000])
+
+(def real-step-ids [220 14 715 262 314 746 600 220])
+
+(defn- id-hex [n]
+  (let [b (js/Buffer.alloc 4)]
+    (.writeUInt32LE b n 0)
+    (.toString b "hex")))
+
+(def kotoba-native-report
+  (let [parts (map-indexed
+               (fn [i [ns id]]
+                 (str ns "|0000c07f|" (id-hex id)
+                      (when (= i (dec (count real-step-ns))) "|7fc000007fc00000")))
+               (map vector real-step-ns real-step-ids))]
+    (str "{:status :ok :result-type :string :result-utf8-hex \""
+         (.toString (js/Buffer.from (str/join "#" parts) "utf8") "hex")
+         "\"}")))
+
+(deftest kotoba-native-argv-shape
+  (let [cmd (bench/kotoba-native-remote {:bin "/opt/kgpu" :guest "/opt/kgpu/g.bin"
+                                         :offset 5872 :isa "aarch64" :wires "42"
+                                         :model "/opt/kgpu/x.gguf"})]
+    (is (str/includes? cmd "./kexe-loader-gpu '/opt/kgpu/g.bin' 5872 0 aarch64 42"))
+    (testing "the guest's own timing needs the string result type and the report"
+      (is (str/includes? cmd "KEXE_RESULT_TYPE=string"))
+      (is (str/includes? cmd "KEXE_STRUCTURED_REPORT=1")))
+    (testing "loader defaults land when the opts are absent"
+      (is (str/includes? (bench/kotoba-native-remote {:guest "g.bin" :offset 200})
+                         "./kexe-loader-gpu 'g.bin' 200 0 aarch64 42")))
+    (testing "and when the CLI path forwards them as nil — :or does not cover a present nil"
+      (is (str/includes? (bench/kotoba-native-remote {:guest "g.bin" :offset 200
+                                                      :isa nil :wires nil :arity nil})
+                         "./kexe-loader-gpu 'g.bin' 200 0 aarch64 42")))
+    (testing "the recorded model is bound to the invocation (guest bytes grep)"
+      (is (str/includes? cmd "GUEST_MODEL_MISMATCH=1")))
+    (testing "the guest's wall budget is the requested run limit"
+      (is (str/includes? (bench/kotoba-native-remote {:guest "g.bin" :offset 200
+                                                      :wall-seconds 1234})
+                         "KEXE_WALL_SECONDS=1234")))))
+
+(deftest kotoba-native-parse-reads-the-engine-timing
+  (let [m (bench/parse-kotoba-native kotoba-native-report)]
+    (is (= 8 (:steps m)))
+    (testing "the argmax ids survive the parse (and the extra segment does not)"
+      (is (= real-step-ids (:token-ids m))))
+    (testing "step 0 is warmup and is dropped from the rate"
+      (is (< (js/Math.abs (- 21.7424 (:ms-per-token m))) 0.0001))
+      (is (< (js/Math.abs (- 45.99 (:tok-s m))) 0.01)))
+    (testing "no report is empty, not zero — zero is a rate someone measures"
+      (is (= {} (bench/parse-kotoba-native "nothing here"))))))
+
+(deftest a-kotoba-native-row-renders-its-own-unit
+  (let [row (bench/row {:node {:name "box" :ip "1.2.3.4"}
+                        :engine "kexe-loader"
+                        :bin "/b"
+                        :model "/m/x.gguf"
+                        :remote "./kexe-loader-gpu g.bin 200 0 aarch64 42"
+                        :metrics {:ms-per-token 21.7424 :tok-s 45.99 :steps 7}
+                        :extra {:bytes 531068480 :sha "246d67d4"}})]
+    (is (str/includes? (bench/ledger-line row) "ms/tok=21.742"))))
