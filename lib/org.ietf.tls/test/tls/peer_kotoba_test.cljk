@@ -1,0 +1,177 @@
+;; `kotoba/tls/peer.kotoba` against `tls.cert`.
+;;
+;; Held against the repository's own DER fixtures and the real JVM provider,
+;; so the certificate the guest is asked about is the one the library is
+;; asked about.
+;;
+;; ## Two findings
+;;
+;;   * `an-expired-certificate-authenticates` -- `authenticate-peer`
+;;     compares `:tls/now` against the certificate's validity with
+;;     `compare`, which is byte order. The certificate's two ends come from
+;;     `asn1/time-value` and are always `YYYY-MM-DDTHH:MM:SSZ`; the caller's
+;;     instant is whatever the caller wrote. `"2020-04-01T00:00:00-05:00"`
+;;     is 05:00Z, five hours after this fixture expired, and it
+;;     authenticates -- with `:validity` in `:tls/checked`, so the result
+;;     says the check ran.
+;;
+;;   * `a-name-a-client-wants-must-be-a-name` --
+;;     `server-name-matches?`'s first clause is `(= p w)`, before any of the
+;;     wildcard rules, so a WANTED name carrying a `*` matches the pattern
+;;     it is. And a name with an empty label matches, because `str/split`
+;;     produces the empty string and empty strings compare equal.
+;;
+;; Parity covers the wildcard rules the library gets right, which is most of
+;; them: entire leftmost label, three labels, one label consumed, no partial
+;; wildcards, ASCII-insensitive, trailing dot ignored.
+
+(ns tls.peer-kotoba-test
+  (:require [asn1.core :as asn1]
+            [kotoba.io :as io]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]
+            [tls.cert :as cert]
+            [tls.provider.jvm :as jvm]
+            [x509.core :as x509]))
+
+(def ^:private guest-file
+  (io/file (System/getProperty "user.dir") "kotoba" "tls" "peer.kotoba"))
+
+(def ^:private kir
+  (delay (:kir (compiler/compile-project {'tls.peer (slurp guest-file)}
+                                         'tls.peer :wasm32-kotoba-v1))))
+
+(defn- call
+  ([f args] (ir/execute @kir f args))
+  ([f args fuel] (ir/execute @kir f args {:fuel fuel})))
+
+(defn- match [p w] (call 'name-match [p w]))
+
+(defn- der [n]
+  (with-open [in (io/input-stream (io/file (str "lib/org.ietf.tls/test/resources/tls/" n)))]
+    (asn1/->ints (.readAllBytes in))))
+
+(def ^:private provider (jvm/provider))
+
+(deftest guest-source-is-present
+  (is (io/exists? guest-file) (str "kotoba object not found at " guest-file)))
+
+;; --- finding one: the instant -----------------------------------------------------
+
+(def ^:private expired (delay (x509/parse (der "p256-expired-leaf.der"))))
+
+(defn- decide [now]
+  (cert/authenticate-peer
+   provider {:tls/chain [@expired]
+             :tls/expect {:tls/spki-pins
+                          #{(second (cert/spki-sha256-hex provider @expired))}}
+             :tls/now now}))
+
+(deftest an-expired-certificate-authenticates
+  (is (= "2020-04-01T00:00:00Z" (:x509/not-after @expired))
+      "the fixture expired in April 2020")
+  (testing "an offset-bearing instant is compared as bytes"
+    (let [[tag value] (decide "2020-04-01T00:00:00-05:00")]
+      (is (= :ok tag)
+          "05:00Z, five hours after it expired -- and '-' is 0x2D against 'Z' at 0x5A")
+      (is (contains? (:tls/checked value) :validity)
+          "and the result says the validity check ran")))
+  (testing "the same moment in the form the certificate uses is refused"
+    (is (= :certificate-expired (:reason (second (decide "2020-04-01T05:00:00Z"))))
+        "so the acceptance above is the spelling and not the moment"))
+  (testing "the guest requires the form instead of comparing whatever arrives"
+    (let [nb (:x509/not-before @expired) na (:x509/not-after @expired)]
+      (is (= :now-not-normalised
+             (call 'validity-problem [nb na "2020-04-01T00:00:00-05:00"])))
+      (is (= :certificate-expired
+             (call 'validity-problem [nb na "2020-04-01T05:00:00Z"])))
+      (is (= :none (call 'validity-problem [nb na "2020-02-01T00:00:00Z"])))
+      (is (= :certificate-not-yet-valid
+             (call 'validity-problem [nb na "2019-01-01T00:00:00Z"])))
+      (testing "and says separately when it is the certificate that is unreadable"
+        (is (= :validity-unreadable
+               (call 'validity-problem ["whenever" na "2020-02-01T00:00:00Z"]))))
+      (testing "and when the period contains no instant at all"
+        (is (= :validity-inverted
+               (call 'validity-problem [na nb "2020-02-01T00:00:00Z"])))))))
+
+(deftest the-guest-and-authenticate-peer-agree-on-normalised-instants
+  (doseq [[now expected] [["2020-02-01T00:00:00Z" :none]
+                          ["2019-01-01T00:00:00Z" :certificate-not-yet-valid]
+                          ["2026-08-22T00:00:00Z" :certificate-expired]]]
+    (let [[tag value] (decide now)
+          nb (:x509/not-before @expired) na (:x509/not-after @expired)]
+      (is (= expected (call 'validity-problem [nb na now])) now)
+      (if (= :none expected)
+        (is (= :ok tag) now)
+        (is (= expected (:reason value)) now)))))
+
+;; --- finding two: the name -----------------------------------------------------------
+
+(deftest a-name-a-client-wants-must-be-a-name
+  (testing "the library matches a wanted name that is itself a wildcard"
+    (is (true? (cert/server-name-matches? "*.example.com" "*.example.com"))
+        "`(= p w)` runs before every wildcard rule")
+    (is (= :wanted-is-a-wildcard (match "*.example.com" "*.example.com"))))
+  (testing "and matches names with empty labels, which no host has"
+    (is (true? (cert/server-name-matches? "*.example.com" ".example.com")))
+    (is (true? (cert/server-name-matches? "*..com" "a..com")))
+    (is (= :empty-label (match "*.example.com" ".example.com")))
+    (is (= :empty-label (match "*..com" "a..com")))
+    (testing "on either side, separately"
+      ;; The discrimination pass is what found this: breaking the
+      ;; presented-side check reddened nothing while every case with an
+      ;; empty label had one on BOTH sides.
+      (is (= :empty-label (match "*..com" "a.b.com")) "presented only")
+      (is (= :empty-label (match "*.b.com" "a..com")) "wanted only"))))
+
+(deftest the-wildcard-rules-the-library-gets-right
+  (doseq [[p w expected why]
+          [["*.example.com" "a.example.com" :match "one label consumed"]
+           ["*.example.com" "example.com" :no-match "no label to consume"]
+           ["*.example.com" "b.a.example.com" :no-match "two labels is not one"]
+           ["w*.example.com" "wa.example.com" :partial-wildcard
+            "never interoperable; honouring it turns one compromised label into a range"]
+           ["*.com" "example.com" :wildcard-too-shallow "§6.4.3 wants three labels"]
+           ["*.example.com" "A.Example.COM" :match "RFC 4343, ASCII case only"]
+           ["example.com." "example.com" :match "one trailing dot is the root"]
+           ["a.example.com" "b.example.com" :no-match "no wildcard, not equal"]
+           ["*.example.com" "a.other.com" :no-match
+            "the same number of labels and a different suffix -- which is the
+             only case that reaches the suffix comparison, and the
+             discrimination pass is what found it missing"]
+           ["example.com" "example.com" :match "the ordinary case"]]]
+    (testing why
+      (is (= expected (match p w)) (str p " / " w))
+      (is (= (= :match expected) (cert/server-name-matches? p w))
+          "and the library agrees on the outcome"))))
+
+(deftest a-non-ascii-name-is-refused-rather-than-folded
+  ;; A host name on the wire is an A-label, so anything else is refused
+  ;; rather than guessed at -- the same boundary the DNSSEC canonical slice
+  ;; draws, for the same reason.
+  ;; One case per side, separately: with only the both-sides case present,
+  ;; breaking the presented-side check reddened nothing.
+  (is (= :non-ascii-name (match "*.exämple.com" "a.example.com")) "presented only")
+  (is (= :non-ascii-name (match "*.example.com" "ä.example.com")) "wanted only")
+  (is (= :non-ascii-name (match "*.exämple.com" "a.exämple.com")) "both"))
+
+(deftest an-empty-name-is-not-a-match
+  (doseq [[p w] [["" "example.com"] ["example.com" ""] ["." "example.com"]
+                 ["example.com" "."]]]
+    (is (= :empty-name (match p w)) (str (pr-str p) " / " (pr-str w)))
+    (is (false? (cert/server-name-matches? p w))
+        "the library refuses these too, which is why they are parity and not a finding")))
+
+(deftest the-default-budget-still-suffices
+  ;; Measured in both directions rather than guessed. 4000 was written here
+  ;; first, on the assumption that walking two names byte by byte would need
+  ;; it; the interpreter default carries every name in this file.
+  (is (= :match (match "*.example.com" "a.example.com")))
+  (is (thrown? Exception (call 'name-match ["*.example.com" "a.example.com"] 64))
+      "and sixty-four is not enough, so the assertion above is not vacuous")
+  (is (= :none (call 'validity-problem [(:x509/not-before @expired)
+                                        (:x509/not-after @expired)
+                                        "2020-02-01T00:00:00Z"]))
+      "while the validity comparison runs on the interpreter default"))

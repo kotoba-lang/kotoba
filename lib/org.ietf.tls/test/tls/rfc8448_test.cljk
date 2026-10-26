@@ -1,0 +1,277 @@
+(ns tls.rfc8448-test
+  "RFC 8448 section 3 -- 'Simple 1-RTT Handshake' -- as the oracle.
+
+  A cryptographic implementation checked only against itself is worth nothing.
+  Every assertion here compares against bytes that came out of the RFC's own
+  text, and each one is `is (= expected actual)` on full byte vectors so a
+  failure prints the divergence rather than `false`.
+
+  The suite counts what it ran and refuses to report success on zero -- see
+  `tls.suite-report`. A vector that could not be exercised is printed as
+  SKIPPED with the reason, never quietly omitted."
+  (:require [kotoba.test :refer [deftest testing is]]
+            [tls.codec :as c]
+            [tls.extension :as ext]
+            [tls.handshake :as hs]
+            [tls.harness :as harness]
+            [tls.record :as rec]
+            [tls.result :as r]
+            [tls.schedule :as sch]
+            [tls.suite :as suite]
+            [tls.transcript :as tr]
+            [tls.vectors :as v]))
+
+(def provider @harness/provider)
+(def h (r/val (sch/hashes provider :sha256)))
+(def aes128 (r/val (suite/suite provider :TLS_AES_128_GCM_SHA256)))
+
+(def counters (atom {:vectors 0 :skipped []}))
+(defn- vec= [label expected actual]
+  (swap! counters update :vectors inc)
+  (is (= (vec expected) (vec actual)) label))
+
+;; ------------------------------------------------------------------ inputs
+
+(def client-hello (v/one {:actor :client :label "ClientHello"}))
+(def server-hello (v/one {:actor :server :label "ServerHello"}))
+(def client-priv (v/one {:actor :client :step "ephemeral x25519" :label "private key"}))
+(def client-pub (v/one {:actor :client :step "ephemeral x25519" :label "public key"}))
+(def server-pub (v/one {:actor :server :step "ephemeral x25519" :label "public key"}))
+(def ecdhe (v/one {:actor :server :step "extract secret \"handshake\"" :label "IKM"}))
+
+;; -------------------------------------------------------- 1. key exchange
+
+(deftest x25519-produces-the-shared-secret-the-rfc-used
+  (testing "RFC 7748 X25519(client private, server public) is the handshake IKM"
+    ;; This is the join between the injected primitive and the trace: if the
+    ;; provider's X25519 were wrong, every secret below would still agree with
+    ;; the RFC (they are derived from the printed IKM), and the handshake would
+    ;; still fail against a real server. So the DH is checked separately.
+    (vec= "X25519 shared secret"
+          ecdhe ((get-in provider [:x25519 :dh]) client-priv server-pub))))
+
+;; ------------------------------------------------- 2. handshake messages
+
+(deftest client-hello-round-trips-byte-for-byte
+  (testing "RFC 8448's ClientHello parses and re-encodes identically"
+    (let [m (r/val (hs/split client-hello))
+          ch (r/val (hs/parse-client-hello (:tls/body m)))
+          re (r/val (hs/client-hello
+                     {:random (:tls/random ch)
+                      :session-id (:tls/session-id ch)
+                      :cipher-suites (:tls/cipher-suites ch)
+                      :extensions (mapv (fn [e] (ext/->ext (:tls/type e) (:tls/raw e)))
+                                        (:tls/extensions ch))}))]
+      (is (= :client_hello (:tls/type m)))
+      (is (= [0x1301 0x1303 0x1302] (:tls/cipher-suites ch)))
+      (is (= 9 (count (:tls/extensions ch))))
+      (vec= "ClientHello re-encoded" client-hello re))))
+
+(deftest server-hello-parses-and-negotiates
+  (testing "RFC 8448's ServerHello, and the section 4.1.3 client checks"
+    (let [m (r/val (hs/split server-hello))
+          sh (r/val (hs/parse-server-hello (:tls/body m)))
+          ch (r/val (hs/parse-client-hello (:tls/body (r/val (hs/split client-hello)))))
+          neg (hs/check-server-hello sh {:session-id (:tls/session-id ch)
+                                         :offered-suites (:tls/cipher-suites ch)
+                                         :offered-groups [:x25519]})]
+      (is (= :server_hello (:tls/type m)))
+      (is (false? (:tls/hello-retry-request sh)))
+      (is (r/ok? neg) (str "negotiation refused: " (r/err neg)))
+      (is (= 0x1301 (:tls/cipher-suite (r/val neg))))
+      (is (= :x25519 (:tls/group (r/val neg))))
+      (vec= "server key_share" server-pub (:tls/peer-key-share (r/val neg))))))
+
+;; ------------------------------------------------------- 3. key schedule
+
+(def transcript-hello
+  (tr/digest (-> (tr/transcript) (tr/add client-hello) (tr/add server-hello)) (:hash h)))
+
+(deftest transcript-hash-matches
+  (testing "Transcript-Hash(ClientHello..ServerHello) -- section 4.4.1"
+    ;; The RFC prints this as the `hash` input to the c/s hs traffic derivation.
+    (vec= "ClientHello..ServerHello"
+          (v/one {:actor :server :step "derive secret \"tls13 c hs traffic\"" :label "hash"})
+          transcript-hello)))
+
+(deftest hkdf-label-serialization-matches
+  (testing "the HkdfLabel struct -- section 7.1"
+    ;; The RFC prints the serialized info block for every derivation, which is
+    ;; what makes a mismatch localisable: a wrong info and a wrong PRK produce
+    ;; the same wrong output, and only this distinguishes them.
+    (vec= "info for tls13 derived"
+          (v/nth-of {:actor :server :step "derive secret for handshake" :label "info"} 0)
+          (r/val (sch/hkdf-label 32 "derived" ((:hash h) []))))
+    (vec= "info for tls13 c hs traffic"
+          (v/one {:actor :server :step "derive secret \"tls13 c hs traffic\"" :label "info"})
+          (r/val (sch/hkdf-label 32 "c hs traffic" transcript-hello)))
+    (vec= "info for tls13 key"
+          (v/nth-of {:actor :server :step "derive write traffic keys for handshake" :label "key info"} 0)
+          (r/val (sch/hkdf-label 16 "key" [])))
+    (vec= "info for tls13 iv"
+          (v/nth-of {:actor :server :step "derive write traffic keys for handshake" :label "iv info"} 0)
+          (r/val (sch/hkdf-label 12 "iv" [])))
+    (vec= "info for tls13 finished"
+          (v/nth-of {:actor :server :step "calculate finished" :label "info"} 0)
+          (r/val (sch/hkdf-label 32 "finished" [])))))
+
+(def early (sch/early-secret h))
+(def hs-secret (r/val (sch/handshake-secret h early ecdhe)))
+(def c-hs (r/val (sch/derive-secret h hs-secret "c hs traffic" transcript-hello)))
+(def s-hs (r/val (sch/derive-secret h hs-secret "s hs traffic" transcript-hello)))
+(def master (r/val (sch/master-secret h hs-secret)))
+
+(deftest the-secret-ladder-matches
+  (testing "RFC 8446 section 7.1, every step"
+    (vec= "early secret"
+          (v/one {:actor :server :step "extract secret \"early\"" :label "secret"}) early)
+    (vec= "derived (early -> handshake)"
+          (v/nth-of {:actor :server :step "derive secret for handshake" :label "expanded"} 0)
+          (r/val (sch/derived h early)))
+    (vec= "handshake secret"
+          (v/one {:actor :server :step "extract secret \"handshake\"" :label "secret"}) hs-secret)
+    (vec= "client handshake traffic secret"
+          (v/one {:actor :server :step "derive secret \"tls13 c hs traffic\"" :label "expanded"}) c-hs)
+    (vec= "server handshake traffic secret"
+          (v/one {:actor :server :step "derive secret \"tls13 s hs traffic\"" :label "expanded"}) s-hs)
+    (vec= "derived (handshake -> master)"
+          (v/nth-of {:actor :server :step "derive secret for master" :label "expanded"} 0)
+          (r/val (sch/derived h hs-secret)))
+    (vec= "master secret"
+          (v/one {:actor :server :step "extract secret \"master\"" :label "secret"}) master)))
+
+(deftest handshake-traffic-keys-match
+  (testing "section 7.3, both directions"
+    (let [sk (r/val (sch/traffic-keys h s-hs aes128))
+          ck (r/val (sch/traffic-keys h c-hs aes128))]
+      (vec= "server handshake write key"
+            (v/nth-of {:actor :server :step "derive write traffic keys for handshake" :label "key expanded"} 0)
+            (:tls/key sk))
+      (vec= "server handshake write iv"
+            (v/nth-of {:actor :server :step "derive write traffic keys for handshake" :label "iv expanded"} 0)
+            (:tls/iv sk))
+      (vec= "client handshake write key"
+            (v/nth-of {:actor :server :step "derive read traffic keys for handshake" :label "key expanded"} 0)
+            (:tls/key ck))
+      (vec= "client handshake write iv"
+            (v/nth-of {:actor :server :step "derive read traffic keys for handshake" :label "iv expanded"} 0)
+            (:tls/iv ck)))))
+
+;; ------------------------------------------ 4. record layer, byte for byte
+
+(defn- nth-record [q i] (nth (map :bytes (v/find-all q)) i))
+(def server-flight
+  "The second `send handshake record` of the server: EncryptedExtensions,
+   Certificate, CertificateVerify, Finished, as one 657-octet payload."
+  (nth-record {:actor :server :step "send handshake record" :label "payload"} 1))
+(deftest server-handshake-flight-decrypts-and-re-encrypts
+  (testing "RFC 8448's 679-octet protected handshake record -- section 5.2"
+    (let [record (nth (map :bytes (v/find-all {:actor :server :step "send handshake record"
+                                               :label "complete record"})) 1)
+          payload (nth (map :bytes (v/find-all {:actor :server :step "send handshake record"
+                                                :label "payload"})) 1)
+          keys (r/val (sch/traffic-keys h s-hs aes128))
+          opened (rec/open aes128 keys 0 record)]
+      (is (r/ok? opened) (str "open refused: " (r/err opened)))
+      (is (= :handshake (:tls/content-type (r/val opened))))
+      (vec= "decrypted server flight" payload (:tls/content (r/val opened)))
+      ;; and the other direction: sealing the same plaintext must reproduce the
+      ;; RFC's ciphertext exactly. AES-GCM is deterministic given key and nonce,
+      ;; so this is a real equality, not a round-trip through our own code.
+      (vec= "re-sealed server flight"
+            record (r/val (rec/seal aes128 keys 0 :handshake payload))))))
+
+(deftest every-protected-record-in-the-trace
+  (testing "all six protected records of section 3, both directions"
+    (let [s-hs-k (r/val (sch/traffic-keys h s-hs aes128))
+          c-hs-k (r/val (sch/traffic-keys h c-hs aes128))
+          ;; application secrets are derived over ClientHello..server Finished
+          sf (tr/digest (-> (tr/transcript)
+                            (tr/add client-hello) (tr/add server-hello)
+                            (tr/add-all (map :tls/raw (r/val (hs/split-all server-flight)))))
+                        (:hash h))
+          c-ap (r/val (sch/derive-secret h master "c ap traffic" sf))
+          s-ap (r/val (sch/derive-secret h master "s ap traffic" sf))
+          c-ap-k (r/val (sch/traffic-keys h c-ap aes128))
+          s-ap-k (r/val (sch/traffic-keys h s-ap aes128))
+          check (fn [label keys seq ct record payload]
+                  (vec= (str label " sealed") record (r/val (rec/seal aes128 keys seq ct payload)))
+                  (let [o (rec/open aes128 keys seq record)]
+                    (is (r/ok? o) (str label " open refused: " (r/err o)))
+                    (vec= (str label " opened") payload (:tls/content (r/val o)))))
+          rec-of nth-record]
+      ;; the transcript hash must match what the RFC used for c/s ap traffic
+      (vec= "ClientHello..server Finished"
+            (v/one {:actor :server :step "derive secret \"tls13 c ap traffic\"" :label "hash"}) sf)
+      (vec= "client application write key"
+            (v/one {:actor :client :step "derive write traffic keys for application data" :label "key expanded"})
+            (:tls/key c-ap-k))
+      (vec= "server application write key"
+            (v/one {:actor :server :step "derive write traffic keys for application data" :label "key expanded"})
+            (:tls/key s-ap-k))
+      ;; index 1, not 0: the client's first `send handshake record` is the
+      ;; UNPROTECTED ClientHello. Reading index 0 here produced a
+      ;; `:protected-record-wrong-opaque-type` refusal with `:code 22`, which is
+      ;; the record layer correctly declining to decrypt a plaintext handshake
+      ;; record -- the check earned its keep on its first run.
+      (check "client Finished" c-hs-k 0 :handshake
+             (rec-of {:actor :client :step "send handshake record" :label "complete record"} 1)
+             (rec-of {:actor :client :step "send handshake record" :label "payload"} 1))
+      (check "server NewSessionTicket" s-ap-k 0 :handshake
+             (rec-of {:actor :server :step "send handshake record" :label "complete record"} 2)
+             (rec-of {:actor :server :step "send handshake record" :label "payload"} 2))
+      (check "client application data" c-ap-k 0 :application_data
+             (v/one {:actor :client :step "send application_data record" :label "complete record"})
+             (v/one {:actor :client :step "send application_data record" :label "payload"}))
+      (check "server application data" s-ap-k 1 :application_data
+             (v/one {:actor :server :step "send application_data record" :label "complete record"})
+             (v/one {:actor :server :step "send application_data record" :label "payload"}))
+      (check "client close_notify" c-ap-k 1 :alert
+             (v/one {:actor :client :step "send alert record" :label "complete record"})
+             (v/one {:actor :client :step "send alert record" :label "payload"}))
+      (check "server close_notify" s-ap-k 2 :alert
+             (v/one {:actor :server :step "send alert record" :label "complete record"})
+             (v/one {:actor :server :step "send alert record" :label "payload"})))))
+
+;; ----------------------------------------------------------- 5. Finished
+
+(deftest finished-verify-data-matches-both-directions
+  (testing "section 4.4.4"
+    (let [msgs (mapv :tls/raw (r/val (hs/split-all server-flight)))
+          ;; the server's Finished is over everything up to but NOT including it
+          upto-cv (butlast msgs)
+          t1 (tr/digest (-> (tr/transcript) (tr/add client-hello) (tr/add server-hello)
+                            (tr/add-all upto-cv))
+                        (:hash h))
+          sfin (r/val (sch/verify-data h s-hs t1))
+          t2 (tr/digest (-> (tr/transcript) (tr/add client-hello) (tr/add server-hello)
+                            (tr/add-all msgs))
+                        (:hash h))
+          cfin (r/val (sch/verify-data h c-hs t2))]
+      (vec= "server finished_key"
+            (v/nth-of {:actor :server :step "calculate finished" :label "expanded"} 0)
+            (r/val (sch/finished-key h s-hs)))
+      (vec= "server verify_data"
+            (v/one {:actor :server :step "calculate finished" :label "finished"}) sfin)
+      (vec= "client finished_key"
+            (v/nth-of {:actor :client :step "calculate finished" :label "expanded"} 0)
+            (r/val (sch/finished-key h c-hs)))
+      (vec= "client verify_data"
+            (v/one {:actor :client :step "calculate finished" :label "finished"}) cfin)
+      (is (r/ok? (sch/check-finished h s-hs t1 sfin)))
+      (is (= :finished-mismatch
+             (r/reason (sch/check-finished h s-hs t1 (assoc (vec sfin) 0 (bit-xor 1 (first sfin))))))
+          "a flipped bit in verify_data must be refused"))))
+
+;; -------------------------------------------- 6. resumption / exporter
+
+(deftest resumption-secret-matches
+  (testing "section 4.6.1 -- the PSK a NewSessionTicket names"
+    (let [res-master (v/one {:actor :client :step "derive secret \"tls13 res master\"" :label "expanded"})
+          nonce (v/one {:actor :server :step "generate resumption secret" :label "hash"})]
+      (vec= "resumption info"
+            (v/one {:actor :server :step "generate resumption secret" :label "info"})
+            (r/val (sch/hkdf-label 32 "resumption" nonce)))
+      (vec= "resumption PSK"
+            (v/one {:actor :server :step "generate resumption secret" :label "expanded"})
+            (r/val (sch/resumption-psk h res-master nonce))))))

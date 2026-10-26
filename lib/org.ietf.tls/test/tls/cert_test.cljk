@@ -1,0 +1,642 @@
+(ns tls.cert-test
+  "Both directions, for everything.
+
+  Every refusal `tls.cert` can produce has a case here that produces exactly
+  that refusal, and the fixture that produces it is broken in exactly one
+  place — the assertion is on the reason keyword, not on \"an error happened\",
+  because a test that goes red for a different reason has demonstrated nothing.
+
+  The positives are against octets this repository did not make: RFC 8448's
+  handshake trace, Google Trust Services' certificate for `kotobase.net`, and
+  an Ed25519 signature OpenSSL produced over a CertificateVerify content that
+  shell built rather than this library. A parser tested only against its own
+  encoder agrees with itself."
+  (:require [asn1.core :as asn1]
+            [asn1.oid :as oid]
+            [kotoba.io :as io]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing use-fixtures]]
+            [tls.cert :as cert]
+            [tls.provider :as tls-provider]
+            [tls.provider.jvm :as jvm]
+            [x509.core :as x509]))
+
+;; ── fixtures on disk ─────────────────────────────────────────────────────────
+
+(def ^:private fixture-dir "lib/org.ietf.tls/test/resources/tls/")
+
+(defn- fixture-file [n]
+  (let [f (io/file (str fixture-dir n))]
+    (when-not (io/exists? f)
+      (throw (ex-info (str "fixture missing: " f
+                           " — `kbb -M:test` must run from the repository root")
+                      {:fixture n})))
+    f))
+
+(defn- hex-fixture [n] (asn1/unhex (str/trim (slurp (fixture-file n)))))
+(defn- der-fixture [n]
+  (with-open [in (io/input-stream (fixture-file n))] (asn1/->ints (.readAllBytes in))))
+(defn- cert-fixture [n] (x509/parse (der-fixture n)))
+
+;; ── the provider seam ───────────────────────────────────────────────────────
+;;
+;; The real one. `tls.provider/contract` puts the digest at `[:hash :sha256]`
+;; and defines verification as `(fn [scheme spki msg sig]) -> [:ok true] |
+;; [:error reason]`, with no `[:ok false]` -- so a caller that tests the answer
+;; for truth reads `[:error :signature/bad-signature]`, a non-empty vector, as
+;; an acceptance. Testing against a stand-in shaped the way this file's author
+;; guessed would have agreed with the guess.
+
+(defn- sha256 ^bytes [^bytes bs] ((get-in (jvm/provider) [:hash :sha256]) bs))
+
+(def ^:private provider (jvm/provider))
+
+(deftest the-accepted-schemes-are-the-seams-accepted-schemes
+  ;; A drift gate. If either side adds a scheme the other does not have,
+  ;; `select-signature-scheme` either refuses something the provider could
+  ;; verify or hands it something it cannot -- and neither shows up until a
+  ;; handshake with that peer.
+  (is (= tls-provider/signature-schemes cert/accepted-schemes)))
+
+;; ── evidence floor ───────────────────────────────────────────────────────────
+
+(def ^:private demonstrated (atom []))
+
+(defn- refused
+  "The reason of an `[:error …]`, recorded so the run can report which refusals
+  it actually produced. `(is (= :peer-not-pinned (refused r)))` fails loudly
+  when `r` is an `[:ok …]` — a negative test that quietly passed is the thing
+  this whole file exists to not do."
+  [result]
+  (let [r (cert/reason result)]
+    (when r (swap! demonstrated conj r))
+    (or r [:NOT-AN-ERROR result])))
+
+(defn- evidence-floor [run]
+  (reset! demonstrated [])
+  (run)
+  (let [vars (count (filter (comp :test meta) (vals (ns-interns 'tls.cert-test))))
+        shown (set @demonstrated)
+        documented (set (keys cert/refusals))]
+    (println)
+    (println (format "tls.cert-test evidence: %d deftest vars scanned, %d assertions of a named refusal, %d/%d documented refusals demonstrated"
+                     vars (count @demonstrated) (count shown) (count documented)))
+    (when-let [missing (seq (sort (remove shown documented)))]
+      (println "  NOT demonstrated:" (pr-str (vec missing))))
+    (when-let [undocumented (seq (sort (remove documented shown)))]
+      (println "  produced but NOT documented in tls.cert/refusals:" (pr-str (vec undocumented))))
+    (when (or (zero? vars) (empty? shown))
+      ;; Neither 0 nor 1: this is "the suite could not answer", which must not
+      ;; look like either a pass or an ordinary failure.
+      (println "REFUSING TO REPORT A PASS: the suite ran no cases")
+      (System/exit 2))))
+
+(use-fixtures :once evidence-floor)
+
+;; ── framing helpers, for the fixtures this file builds ───────────────────────
+
+(defn- bit-flip-low
+  "One bit of one octet. A fixture broken in exactly one place."
+  [b] (bit-xor b 0x01))
+
+(defn- u16 [n] [(bit-and (bit-shift-right n 8) 0xff) (bit-and n 0xff)])
+(defn- u24 [n] [(bit-and (bit-shift-right n 16) 0xff)
+                (bit-and (bit-shift-right n 8) 0xff) (bit-and n 0xff)])
+
+(defn- entry [der] (into [] cat [(u24 (count der)) der (u16 0)]))
+
+(defn- certificate-message
+  "A `Certificate` message body around these DER certificates."
+  ([ders] (certificate-message [] ders))
+  ([ctx ders]
+   (let [entries (into [] cat (map entry ders))]
+     (into [] cat [[(count ctx)] ctx (u24 (count entries)) entries]))))
+
+(defn- certificate-verify-message [code sig]
+  (into [] cat [(u16 code) (u16 (count sig)) sig]))
+
+;; ── RFC 8448 §3: the trace nobody here wrote ─────────────────────────────────
+
+(def ^:private rfc8448
+  (delay
+    (let [msg #(hex-fixture (str "rfc8448-simple-1rtt-" % ".hex"))]
+      {:certificate (msg "certificate")
+       :certificate-verify (msg "certificate-verify")
+       :transcript-hash
+       (asn1/->ints
+        (sha256 (asn1/ints->bytes
+                 (into [] cat [(msg "client-hello") (msg "server-hello")
+                               (msg "encrypted-extensions") (msg "certificate")]))))})))
+
+(deftest rfc8448-certificate-message-parses
+  (let [r (cert/parse-certificate-handshake (:certificate @rfc8448))]
+    (is (cert/ok? r) (str "expected [:ok …], got " (pr-str r)))
+    (let [{:tls/keys [certificate-request-context entries leaf]} (second r)]
+      (is (= [] certificate-request-context)
+          "a server's Certificate in a 1-RTT handshake carries an empty context")
+      (is (= 1 (count entries)))
+      (is (= [] (:tls/extensions (first entries))))
+      (is (= "CN=rsa" (:text (:x509/subject leaf))))
+      (is (= 432 (count (:tls/cert-der (first entries))))
+          "0x01b0, the cert_data length the message states")
+      (is (= (oid/dotted :rsa-encryption) (get-in leaf [:x509/public-key :algorithm]))))))
+
+(deftest rfc8448-transcript-hash-is-the-one-the-rfc-printed
+  ;; Not an assertion about this library — an assertion that the fixture files
+  ;; are the bytes they are supposed to be. If this fails, nothing below means
+  ;; anything, and it would otherwise fail as "signature invalid".
+  (is (= "764d6632b3c35c3f3205e3499ac3edbaabb88295fba751461d3678e2e5ea0687"
+         (asn1/hex (:transcript-hash @rfc8448)))))
+
+(deftest rfc8448-certificate-verify-known-answer
+  (testing "the signature a 2019 implementation made verifies against the content this builds"
+    (let [leaf (:tls/leaf (second (cert/parse-certificate-handshake (:certificate @rfc8448))))
+          cv (cert/parse-certificate-verify-handshake (:certificate-verify @rfc8448))]
+      (is (cert/ok? cv))
+      (is (= 0x0804 (:tls/signature-scheme-code (second cv))))
+      (is (= 128 (count (:tls/signature (second cv)))))
+      (let [r (cert/verify-certificate-verify
+               provider {:certificate leaf
+                         :transcript-hash (:transcript-hash @rfc8448)
+                         :message (second cv)})]
+        (is (cert/ok? r) (str "RFC 8448 §3 known answer failed: " (pr-str r)))
+        (is (= :rsa-pss-rsae-sha256 (:tls/signature-scheme (second r))))
+        (is (= 130 (:tls/signed-octets (second r)))
+            "64 spaces + 33 context octets + 1 separator + 32 hash octets")))))
+
+(deftest rfc8448-certificate-verify-over-the-wrong-transcript
+  (testing "one flipped bit in the transcript and the same signature is invalid"
+    (let [leaf (:tls/leaf (second (cert/parse-certificate-handshake (:certificate @rfc8448))))
+          cv (second (cert/parse-certificate-verify-handshake (:certificate-verify @rfc8448)))
+          wrong (update (vec (:transcript-hash @rfc8448)) 0 bit-flip-low)
+          r (cert/verify-certificate-verify
+             provider {:certificate leaf :transcript-hash wrong :message cv})]
+      (is (= :signature-invalid (refused r)))
+      (is (= :rsa-pss-rsae-sha256 (:scheme (second r)))
+          "the refusal still names what it tried, so an operator can tell this from a dispatch failure"))))
+
+;; ── the content construction, octet by octet ─────────────────────────────────
+
+(deftest certificate-verify-content-structure
+  (let [h (vec (repeat 32 0xab))
+        [tag content] (cert/certificate-verify-content h)]
+    (is (= :ok tag))
+    (is (= 130 (count content)))
+    (is (= (repeat 64 0x20) (take 64 content)) "64 octets of 0x20")
+    (is (= "TLS 1.3, server CertificateVerify"
+           (apply str (map char (subvec content 64 97)))))
+    (is (= 0x00 (nth content 97)) "a single separator octet")
+    (is (= h (subvec content 98)) "then the transcript hash, unmodified"))
+  (testing "the client's context string is a different string"
+    (is (= "TLS 1.3, client CertificateVerify"
+           (apply str (map char (subvec (second (cert/certificate-verify-content
+                                                 :client (vec (repeat 32 0))))
+                                        64 97))))))
+  (testing "an unmeasured transcript is refused rather than hashed as nothing"
+    (is (= :empty-transcript-hash (refused (cert/certificate-verify-content []))))
+    (is (= :unknown-side (refused (cert/certificate-verify-content :proxy (vec (repeat 32 1)))))))) 
+
+;; ── Ed25519, signed by OpenSSL over a content shell built ────────────────────
+
+(deftest ed25519-certificate-verify-known-answer
+  (let [leaf (cert-fixture "ed25519-leaf.der")
+        h (hex-fixture "certificate-verify-transcript-sha256.hex")
+        sig (hex-fixture "ed25519-certificate-verify.sig.hex")
+        msg (certificate-verify-message 0x0807 sig)
+        r (cert/verify-certificate-verify
+           provider {:certificate leaf :transcript-hash h :message msg})]
+    (is (= 64 (count sig)))
+    (is (cert/ok? r) (str "Ed25519 known answer failed: " (pr-str r)))
+    (is (= :ed25519 (:tls/signature-scheme (second r)))))
+  (testing "and the same signature over a different transcript is invalid"
+    (let [leaf (cert-fixture "ed25519-leaf.der")
+          h (vec (update (vec (hex-fixture "certificate-verify-transcript-sha256.hex")) 31 bit-flip-low))
+          msg (certificate-verify-message 0x0807 (hex-fixture "ed25519-certificate-verify.sig.hex"))]
+      (is (= :signature-invalid
+             (refused (cert/verify-certificate-verify
+                       provider {:certificate leaf :transcript-hash h :message msg})))))))
+
+;; ── the pin: the cross-check against the rest of the stack ───────────────────
+
+(def ^:private kotobase-pin
+  "What `aiueos.provider.cloud/spki-sha256-hex` computes for this host, and what
+  the live gate has been pinning it at. If `tls.cert` disagrees with this, the
+  two halves of the workspace are pinning different things and one of them is
+  wrong."
+  "50602ad366823fcf5274a7c917baa4fd24b9de4fd15635ff501177c83d05473e")
+
+(deftest spki-digest-agrees-with-the-pin-the-workspace-already-uses
+  (let [leaf (cert-fixture "kotobase-net-leaf.der")]
+    (is (= [:ok kotobase-pin] (cert/spki-sha256-hex provider leaf)))
+    (testing "and it is the digest of the SPKI DER, not of the certificate"
+      (is (= kotobase-pin (asn1/hex (sha256 (asn1/ints->bytes (cert/spki-der leaf))))))
+      (is (not= kotobase-pin (asn1/hex (sha256 (asn1/ints->bytes (:x509/der leaf)))))))))
+
+(deftest spki-digest-through-a-parsed-certificate-message
+  (testing "the same digest, reached the way a handshake reaches it"
+    (let [msg (certificate-message [(der-fixture "kotobase-net-leaf.der")
+                                    (der-fixture "kotobase-net-intermediate.der")])
+          r (cert/parse-certificate-message msg)]
+      (is (cert/ok? r))
+      (is (= 2 (count (:tls/entries (second r)))))
+      (is (= [:ok kotobase-pin]
+             (cert/spki-sha256-hex provider (:tls/leaf (second r))))))))
+
+;; ── signature scheme dispatch ────────────────────────────────────────────────
+
+(deftest scheme-from-wire-accepts-exactly-four
+  (is (= [:ok :ecdsa-secp256r1-sha256] (cert/scheme-from-wire 0x0403)))
+  (is (= [:ok :rsa-pss-rsae-sha256] (cert/scheme-from-wire 0x0804)))
+  (is (= [:ok :rsa-pss-rsae-sha384] (cert/scheme-from-wire 0x0805)))
+  (is (= [:ok :ed25519] (cert/scheme-from-wire 0x0807)))
+  (is (= #{:ecdsa-secp256r1-sha256 :rsa-pss-rsae-sha256 :rsa-pss-rsae-sha384 :ed25519}
+         cert/accepted-schemes)))
+
+(deftest scheme-from-wire-refuses-by-name
+  (testing "an unknown codepoint is refused, never defaulted"
+    (is (= :signature-scheme-unknown (refused (cert/scheme-from-wire 0x0999))))
+    (is (= "0x0999" (:code (second (cert/scheme-from-wire 0x0999))))))
+  (testing "PKCS#1 v1.5 gets its own reason: it is forbidden here, not missing"
+    (doseq [code [0x0401 0x0501 0x0601 0x0201]]
+      (is (= :rsa-pkcs1-forbidden-in-certificate-verify
+             (refused (cert/scheme-from-wire code)))
+          (format "code 0x%04x" code)))
+    (is (= :rsa-pkcs1-sha256 (:scheme-name (second (cert/scheme-from-wire 0x0401))))))
+  (testing "a broken digest is retired, which is not the same as unsupported"
+    (is (= :signature-scheme-retired (refused (cert/scheme-from-wire 0x0203)))))
+  (testing "registered schemes outside the accepted set say which they are"
+    (doseq [code [0x0503 0x0603 0x0806 0x0808 0x0809]]
+      (is (= :signature-scheme-unsupported (refused (cert/scheme-from-wire code)))
+          (format "code 0x%04x" code)))
+    (is (= :ecdsa-secp384r1-sha384 (:scheme-name (second (cert/scheme-from-wire 0x0503)))))))
+
+(deftest scheme-from-the-key
+  (is (= [:ok #{:ecdsa-secp256r1-sha256}]
+         (cert/key-signature-schemes (cert-fixture "kotobase-net-leaf.der"))))
+  (is (= [:ok #{:ed25519}]
+         (cert/key-signature-schemes (cert-fixture "ed25519-leaf.der"))))
+  (is (= [:ok #{:rsa-pss-rsae-sha256 :rsa-pss-rsae-sha384}]
+         (cert/key-signature-schemes (cert-fixture "rsa2048-leaf.der")))
+      "an RSA key could have made either; which one it did is the wire's to say")
+  (testing "a curve outside the accepted set is refused with the curve named"
+    (let [r (cert/key-signature-schemes (cert-fixture "p384-leaf.der"))]
+      (is (= :public-key-algorithm-unsupported (refused r)))
+      (is (str/includes? (:curve (second r)) "secp384r1")))))
+
+(deftest scheme-must-agree-with-the-key
+  (testing "a P-256 certificate that signed with ed25519 is a mismatch, named as one"
+    (let [r (cert/select-signature-scheme (cert-fixture "kotobase-net-leaf.der") 0x0807)]
+      (is (= :signature-scheme-key-mismatch (refused r)))
+      (is (= :ed25519 (:signed-with (second r))))
+      (is (= #{:ecdsa-secp256r1-sha256} (:key-can-produce (second r))))))
+  (testing "and the agreeing case is the ok"
+    (is (= [:ok :ecdsa-secp256r1-sha256]
+           (cert/select-signature-scheme (cert-fixture "kotobase-net-leaf.der") 0x0403)))))
+
+;; ── framing refusals: each fixture broken in exactly one place ───────────────
+
+(def ^:private good-message
+  (delay (certificate-message [(der-fixture "kotobase-net-leaf.der")])))
+
+(deftest framing-baseline-is-good
+  ;; The control. Every case below is this message with one thing changed, so a
+  ;; red here means the negatives are measuring the wrong thing.
+  (is (cert/ok? (cert/parse-certificate-message @good-message))))
+
+(deftest refuses-a-message-shorter-than-its-fixed-part
+  (is (= :message-too-short (refused (cert/parse-certificate-message [0x00 0x00 0x00]))))
+  (is (= :message-too-short (refused (cert/parse-certificate-verify [0x08 0x04 0x00]))))
+  (is (= :message-too-short (refused (cert/parse-certificate-handshake [0x0b 0x00 0x00])))))
+
+(deftest refuses-a-truncated-certificate-message
+  (testing "the last 20 octets never arrived"
+    (let [truncated (subvec (vec @good-message) 0 (- (count @good-message) 20))
+          r (cert/parse-certificate-message truncated)]
+      (is (= :length-past-end (refused r)))
+      ;; The OUTER length is what notices: certificate_list still says how many
+      ;; octets it had before the truncation, and 20 of them are not there. The
+      ;; refusal names certificate_list rather than the certificate inside it,
+      ;; which is right -- the entry was never reached, and reporting the inner
+      ;; field would say the parser got further than it did.
+      (is (= "certificate_list" (:field (second r)))
+          "and it names the field that ran off the end, not just the offset")
+      (is (= 20 (- (:wanted (second r)) (:available (second r))))
+          "short by exactly what was removed"))))
+
+(deftest refuses-a-length-prefix-that-runs-past-the-buffer
+  (testing "certificate_list claims 0xffffff octets"
+    (let [m (-> (vec @good-message) (assoc 1 0xff) (assoc 2 0xff) (assoc 3 0xff))
+          r (cert/parse-certificate-message m)]
+      (is (= :length-past-end (refused r)))
+      (is (= "certificate_list" (:field (second r))))
+      (is (= 0xffffff (:wanted (second r))))))
+  (testing "cert_data claims more than the certificate_list has, and the outer framing is untouched"
+    ;; The one an end-of-buffer check would miss. The message's own length is
+    ;; unchanged and every outer prefix still adds up, so nothing overruns the
+    ;; array -- but cert_data now claims the whole certificate_list including
+    ;; its own 3-octet length and the 2-octet extensions after it. Checked
+    ;; against the array, this parses; checked against the enclosing structure,
+    ;; it is an overrun.
+    (let [m (vec @good-message)
+          list-len (+ (* 65536 (nth m 1)) (* 256 (nth m 2)) (nth m 3))
+          overlong (u24 list-len)
+          m (reduce (fn [acc i] (assoc acc (+ 4 i) (nth overlong i))) m (range 3))
+          r (cert/parse-certificate-message m)]
+      (is (= (count @good-message) (count m)) "nothing was added or removed")
+      (is (= :length-past-end (refused r)))
+      (is (= "cert_data[0]" (:field (second r))))
+      (is (= list-len (:wanted (second r))))
+      (is (= (- list-len 3) (:available (second r))))))
+  (testing "an entry's extensions length runs past the list"
+    (let [der (der-fixture "kotobase-net-leaf.der")
+          ;; a well-formed entry, then a 2-octet extensions length of 0xffff
+          entries (into [] cat [(u24 (count der)) der [0xff 0xff]])
+          m (into [] cat [[0x00] (u24 (count entries)) entries])
+          r (cert/parse-certificate-message m)]
+      (is (= :length-past-end (refused r)))
+      (is (str/starts-with? (:field (second r)) "extensions")))))
+
+(deftest refuses-octets-after-the-structure-ended
+  (is (= :trailing-bytes (refused (cert/parse-certificate-message
+                                   (conj (vec @good-message) 0x00)))))
+  (is (= :trailing-bytes (refused (cert/parse-certificate-verify
+                                   (conj (certificate-verify-message 0x0807 (vec (repeat 64 1)))
+                                         0x00))))))
+
+(deftest refuses-an-empty-certificate-list
+  (is (= :empty-certificate-list
+         (refused (cert/parse-certificate-message [0x00 0x00 0x00 0x00])))))
+
+(deftest refuses-a-zero-length-certificate-entry
+  (is (= :empty-certificate
+         (refused (cert/parse-certificate-message
+                   (into [] cat [[0x00] (u24 5) (u24 0) (u16 0)]))))))
+
+(deftest refuses-octets-that-are-not-a-certificate
+  (let [r (cert/parse-certificate-message (certificate-message [[0x30 0x82 0xff 0xff 0x00]]))]
+    (is (= :certificate-unparseable (refused r)))
+    (is (= 0 (:index (second r))) "and says which entry it was")))
+
+(deftest refuses-a-handshake-message-of-the-wrong-type
+  (is (= :not-a-certificate-message
+         (refused (cert/parse-certificate-handshake (:certificate-verify @rfc8448)))))
+  (is (= :not-a-certificate-verify
+         (refused (cert/parse-certificate-verify-handshake (:certificate @rfc8448)))))
+  (testing "and a header whose length disagrees with the body it is attached to"
+    (let [m (conj (vec (:certificate @rfc8448)) 0x00)]
+      (is (= :handshake-length-mismatch (refused (cert/parse-certificate-handshake m)))))))
+
+(deftest refuses-a-certificate-verify-with-no-signature
+  (is (= :empty-signature (refused (cert/parse-certificate-verify [0x08 0x07 0x00 0x00]))))
+  (is (= :length-past-end (refused (cert/parse-certificate-verify [0x08 0x07 0xff 0xff 0x01])))))
+
+;; ── the provider seam's own failure modes ────────────────────────────────────
+
+(deftest a-provider-that-cannot-run-does-not-look-like-a-pass
+  (let [leaf (cert-fixture "kotobase-net-leaf.der")
+        h (vec (repeat 32 0))
+        msg (certificate-verify-message 0x0403 (vec (repeat 70 1)))]
+    (is (= :provider-missing-signature-verify
+           (refused (cert/verify-certificate-verify {} {:certificate leaf :transcript-hash h :message msg}))))
+    (is (= :provider-missing-digest (refused (cert/spki-sha256-hex {} leaf))))
+
+    (testing "a provider that throws is not a peer that failed to authenticate"
+      (let [angry {:hash {:sha256 (fn [_] (throw (ex-info "no such algorithm" {})))}
+                   :signature {:verify (fn [& _] (throw (ex-info "key rejected" {})))}}]
+        (is (= :provider-threw (refused (cert/spki-sha256-hex angry leaf))))
+        (is (= :provider-threw
+               (refused (cert/verify-certificate-verify
+                         angry {:certificate leaf :transcript-hash h :message msg}))))))
+
+    (testing "a provider that declines for its own reason is not a bad signature"
+      (let [declining {:hash {:sha256 (fn [_] [:error :hash/bad-input])}
+                       :signature {:verify (fn [& _] [:error :signature/bad-public-key])}}
+            r (cert/verify-certificate-verify
+               declining {:certificate leaf :transcript-hash h :message msg})]
+        (is (= :provider-refused (refused r)))
+        (is (= :signature/bad-public-key (:provider-reason (second r)))
+            "and it carries the reason, because :signature-invalid would name the wrong party")
+        (let [d (cert/spki-sha256-hex declining leaf)]
+          (is (= :provider-refused (refused d)))
+          (is (= :hash/bad-input (:provider-reason (second d)))
+              "hexing that vector would have produced a plausible-looking pin"))))
+
+    (testing "an answer outside the contract is refused, including a truthy one"
+      ;; This is the defect this file's author shipped and then found: the first
+      ;; version of `verify-certificate-verify` treated any truthy return as a
+      ;; pass, which makes `[:error :signature/bad-signature]` an acceptance.
+      ;; `true` is what the guessed contract returned, so it is what this asserts
+      ;; against.
+      (let [wrong-shape {:hash {:sha256 (fn [_] (byte-array 7))}
+                         :signature {:verify (fn [& _] true)}}
+            r (cert/verify-certificate-verify
+               wrong-shape {:certificate leaf :transcript-hash h :message msg})]
+        (is (= :provider-answer-unrecognised (refused r)))
+        (is (= "true" (:got (second r))))
+        (let [d (cert/spki-sha256-hex wrong-shape leaf)]
+          (is (= :provider-answer-unrecognised (refused d)))
+          (is (= 7 (:got-octets (second d)))
+              "a 7-octet digest would have hexed into a 14-character pin"))))))
+
+;; ── hostname matching (RFC 6125 §6.4) ────────────────────────────────────────
+
+(deftest wildcards-are-one-label-in-the-leftmost-position
+  (is (cert/server-name-matches? "kotobase.net" "kotobase.net"))
+  (is (cert/server-name-matches? "KOTOBASE.NET" "kotobase.net") "DNS is case-insensitive")
+  (is (cert/server-name-matches? "kotobase.net" "kotobase.net."))
+  (is (cert/server-name-matches? "*.ipni.kotobase.net" "a.ipni.kotobase.net"))
+  (is (not (cert/server-name-matches? "*.ipni.kotobase.net" "ipni.kotobase.net"))
+      "a wildcard consumes exactly one label, so it cannot consume none")
+  (is (not (cert/server-name-matches? "*.ipni.kotobase.net" "b.a.ipni.kotobase.net"))
+      "nor two")
+  (is (not (cert/server-name-matches? "*.net" "kotobase.net"))
+      "a wildcard directly under a public suffix would be every host under it")
+  (is (not (cert/server-name-matches? "w*.example.com" "www.example.com"))
+      "partial wildcards match nothing")
+  (is (not (cert/server-name-matches? "*.example.com" "example.com")))
+  (is (not (cert/server-name-matches? "" "kotobase.net"))))
+
+(deftest reads-dns-names-from-the-subject-alt-name
+  ;; The reader is `x509.core/dns-names`. `tls.cert` had a private copy of it
+  ;; until org-ietf-x509 80a0686 landed; the copy is deleted, and this asserts
+  ;; the library answers what the copy did.
+  (is (= ["kotobase.net" "ipni.kotobase.net" "*.ipni.kotobase.net"]
+         (x509/dns-names (cert-fixture "kotobase-net-leaf.der"))))
+
+  ;; Three states, and all three are fed here. A reader that collapsed nil into
+  ;; [] would pass a suite that only ever fed it one of them, which is why the
+  ;; othername-only fixture exists at all.
+  (testing "no subjectAltName extension at all"
+    (is (nil? (x509/dns-names (cert-fixture "no-san-leaf.der")))
+        "absent is nil, not empty — they are different facts"))
+  (testing "a subjectAltName that names no host"
+    (let [names (x509/dns-names (cert-fixture "othername-only-leaf.der"))]
+      (is (= [] names) "present-but-no-dNSName is [], not nil")
+      (is (some? names) "and it must not be nil, or the two facts have merged")))
+  (testing "lowercased per RFC 4343, order kept"
+    (is (= ["kotobase.net" "ipni.kotobase.net" "*.ipni.kotobase.net"]
+           (x509/dns-names (cert-fixture "kotobase-net-leaf.der")))
+        "issuer order, not sorted")))
+
+;; ── the decision ─────────────────────────────────────────────────────────────
+
+(def ^:private now "2026-08-22T00:00:00Z")
+
+(defn- decide [leaf-file expect]
+  (cert/authenticate-peer provider
+                          {:tls/chain [(cert-fixture leaf-file)]
+                           :tls/expect expect
+                           :tls/now now}))
+
+(defn- pin-of [leaf-file]
+  (second (cert/spki-sha256-hex provider (cert-fixture leaf-file))))
+
+(deftest the-two-absences-refuse-differently
+  ;; The distinction is only worth having if it survives into the decision.
+  (testing "no subjectAltName -> :no-subject-alt-name"
+    (let [r (decide "no-san-leaf.der"
+                    {:tls/spki-pins #{(pin-of "no-san-leaf.der")}
+                     :tls/server-name "no-san.test.invalid"
+                     :tls/check-validity? false})]
+      (is (= :no-subject-alt-name (refused r)))))
+  (testing "subjectAltName with no dNSName -> :server-name-mismatch, presented []"
+    (let [r (decide "othername-only-leaf.der"
+                    {:tls/spki-pins #{(pin-of "othername-only-leaf.der")}
+                     :tls/server-name "othername-only.test.invalid"
+                     :tls/check-validity? false})]
+      (is (= :server-name-mismatch (refused r))
+          "a certificate that HAS a SAN naming no host is a mismatch, not an absence")
+      (is (= [] (:presented (second r)))
+          "and the refusal says the list was empty rather than saying nothing"))))
+
+
+(deftest authenticates-a-pinned-peer
+  (let [r (decide "kotobase-net-leaf.der"
+                  {:tls/spki-pins #{kotobase-pin} :tls/server-name "kotobase.net"})]
+    (is (cert/ok? r) (str "expected [:ok …], got " (pr-str r)))
+    (let [v (second r)]
+      (is (= :spki-pin (:tls/authenticated-by v)))
+      (is (= kotobase-pin (:tls/spki-sha256 v)))
+      (is (= "CN=kotobase.net" (:tls/subject v)))
+      (is (= #{:spki-pin :leaf-usable :validity :basic-constraints :server-name}
+             (:tls/checked v)))
+      (testing "and the value says what it does not mean"
+        (is (contains? (:tls/not-checked v) :chain-to-trust-anchor))
+        (is (contains? (:tls/not-checked v) :revocation))
+        (is (contains? (:tls/not-checked v) :issuer-signature)))))
+  (testing "a wildcard SAN entry authenticates a name under it"
+    (is (cert/ok? (decide "kotobase-net-leaf.der"
+                          {:tls/spki-pins #{kotobase-pin}
+                           :tls/server-name "shard7.ipni.kotobase.net"})))))
+
+(deftest refuses-a-peer-whose-key-is-not-the-pinned-one
+  (let [wrong (apply str (repeat 64 "a"))
+        r (decide "kotobase-net-leaf.der" {:tls/spki-pins #{wrong}})]
+    (is (= :peer-not-pinned (refused r)))
+    (is (= kotobase-pin (:observed (second r)))
+        "and it reports the digest that was actually there, or the operator cannot repin")
+    (is (= [wrong] (:pins (second r))))))
+
+(deftest refuses-an-empty-pin-set
+  (let [r (decide "kotobase-net-leaf.der" {:tls/spki-pins #{}})]
+    (is (= :no-spki-pins-configured (refused r)))
+    (is (= kotobase-pin (:observed (second r)))
+        "still measured, so the operator has the value to configure")))
+
+(deftest refuses-an-empty-chain
+  (is (= :empty-certificate-chain
+         (refused (cert/authenticate-peer provider {:tls/chain []
+                                                    :tls/expect {:tls/spki-pins #{kotobase-pin}}
+                                                    :tls/now now})))))
+
+(deftest each-validity-failure-is-its-own-refusal
+  (let [expired (cert-fixture "p256-expired-leaf.der")
+        pin (second (cert/spki-sha256-hex provider expired))]
+    (testing "notAfter in the past"
+      (let [r (cert/authenticate-peer provider {:tls/chain [expired]
+                                                :tls/expect {:tls/spki-pins #{pin}}
+                                                :tls/now now})]
+        (is (= :certificate-expired (refused r)))
+        (is (= "2020-04-01T00:00:00Z" (:not-after (second r))))))
+    (testing "notBefore in the future is a different refusal"
+      (let [r (cert/authenticate-peer provider {:tls/chain [expired]
+                                                :tls/expect {:tls/spki-pins #{pin}}
+                                                :tls/now "2019-01-01T00:00:00Z"})]
+        (is (= :certificate-not-yet-valid (refused r)))
+        (is (= "2020-01-01T00:00:00Z" (:not-before (second r))))))
+    (testing "and a validity check with no time is unmeasured, not valid"
+      (is (= :validity-unmeasured
+             (refused (cert/authenticate-peer provider {:tls/chain [expired]
+                                                        :tls/expect {:tls/spki-pins #{pin}}})))))
+    (testing "asking for no validity check gets no validity check, and says so"
+      (let [r (cert/authenticate-peer provider {:tls/chain [expired]
+                                                :tls/expect {:tls/spki-pins #{pin}
+                                                             :tls/check-validity? false}})]
+        (is (cert/ok? r))
+        (is (not (contains? (:tls/checked (second r)) :validity)))))))
+
+(deftest each-name-failure-is-its-own-refusal
+  (let [pin kotobase-pin]
+    (testing "a name the certificate does not carry"
+      (let [r (decide "kotobase-net-leaf.der" {:tls/spki-pins #{pin}
+                                               :tls/server-name "evil.example.com"})]
+        (is (= :server-name-mismatch (refused r)))
+        (is (= ["kotobase.net" "ipni.kotobase.net" "*.ipni.kotobase.net"]
+               (:presented (second r))))))
+    (testing "an IP literal, which needs a SAN type this does not implement"
+      (is (= :server-name-is-ip-address
+             (refused (decide "kotobase-net-leaf.der" {:tls/spki-pins #{pin}
+                                                       :tls/server-name "203.0.113.9"}))))
+      (is (= :server-name-is-ip-address
+             (refused (decide "kotobase-net-leaf.der" {:tls/spki-pins #{pin}
+                                                       :tls/server-name "2001:db8::1"})))))
+    (testing "no subjectAltName at all, and commonName is not a fallback"
+      (let [leaf (cert-fixture "no-san-leaf.der")
+            p (second (cert/spki-sha256-hex provider leaf))
+            r (cert/authenticate-peer provider
+                                      {:tls/chain [leaf]
+                                       :tls/expect {:tls/spki-pins #{p}
+                                                    :tls/server-name "no-san.test.invalid"}
+                                       :tls/now now})]
+        (is (= :no-subject-alt-name (refused r))
+            "the CN says no-san.test.invalid; that is not enough and must not be")))))
+
+(deftest refuses-a-ca-certificate-as-an-end-entity
+  (let [ca (cert-fixture "kotobase-net-intermediate.der")
+        pin (second (cert/spki-sha256-hex provider ca))
+        r (cert/authenticate-peer provider {:tls/chain [ca]
+                                            :tls/expect {:tls/spki-pins #{pin}}
+                                            :tls/now now})]
+    (is (= :leaf-is-ca (refused r)))
+    (is (true? (:ca? (:basic-constraints (second r)))))))
+
+(deftest refuses-a-leaf-x509-itself-refuses
+  (let [leaf (cert-fixture "critical-ext-leaf.der")
+        r (cert/authenticate-peer provider {:tls/chain [leaf]
+                                            :tls/expect {:tls/spki-pins #{"unused"}}
+                                            :tls/now now})]
+    (is (= :leaf-unusable (refused r))
+        "a critical extension nobody understands means do not use this certificate")
+    (is (= :unhandled-critical-extension (:reason (first (:detail (second r))))))))
+
+(deftest accepts-a-chain-of-parsed-entries-or-of-certificates
+  (testing "authenticate-peer takes what parse-certificate-message produced"
+    (let [msg (certificate-message [(der-fixture "kotobase-net-leaf.der")
+                                    (der-fixture "kotobase-net-intermediate.der")])
+          entries (:tls/entries (second (cert/parse-certificate-message msg)))
+          r (cert/authenticate-peer provider {:tls/chain entries
+                                              :tls/expect {:tls/spki-pins #{kotobase-pin}
+                                                           :tls/server-name "kotobase.net"}
+                                              :tls/now now})]
+      (is (cert/ok? r))
+      (is (= 2 (:tls/chain-length (second r)))))))
+
+;; ── the refusal vocabulary itself ────────────────────────────────────────────
+
+(deftest every-refusal-is-documented
+  (doseq [[reason why] cert/refusals]
+    (is (keyword? reason))
+    (is (and (string? why) (not (str/blank? why))) (str reason " has no explanation")))
+  (testing "and every reason this run produced is one of them"
+    (is (empty? (remove (set (keys cert/refusals)) (set @demonstrated)))
+        (str "undocumented: " (pr-str (remove (set (keys cert/refusals)) (set @demonstrated)))))))

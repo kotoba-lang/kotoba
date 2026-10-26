@@ -1,0 +1,654 @@
+(ns tls.ech
+  "Encrypted ClientHello — [draft-ietf-tls-esni-25](https://datatracker.ietf.org/doc/draft-ietf-tls-esni/).
+
+  The client sends **two** ClientHellos: a `ClientHelloOuter` naming the
+  client-facing server's `public_name`, and a `ClientHelloInner` — the real
+  one, with the real SNI — encrypted with HPKE into the outer's
+  `encrypted_client_hello` extension. A network observer sees the public
+  name; the client-facing server decrypts and forwards the inner to the
+  backend.
+
+  ## Not an RFC
+
+  ECH is `draft-ietf-tls-esni-25`, not an RFC, and it publishes **no test
+  vectors**. That is measured, not assumed: the datatracker gives the document
+  no RFC number, and the draft text contains no test vector section.
+
+  So the evidence here is of three kinds, and they are kept apart:
+
+  - **live configurations.** `test/tls/ech_configs.cljk` holds `ECHConfigList`
+    values published in real HTTPS resource records — Cloudflare's and
+    defo.ie's, the latter carrying three configs. Parsing bytes that are
+    actually deployed is the only part of this that is not self-consistency.
+  - **two-sided round-trip.** Everything a client does here has a server-side
+    counterpart in the same file, and the tests run both.
+  - **the aborts.** §5.1 names four conditions under which a server MUST
+    abort while reconstructing the inner. Each has a test, and each is
+    asserted by its own reason.
+
+  ## What is here and what is not
+
+  This is the ECH **data plane**: configurations, the encoding and
+  reconstruction of `EncodedClientHelloInner`, `ClientHelloOuterAAD`, the HPKE
+  seal and open, and the acceptance confirmation.
+
+  It is **not wired into `tls.client`** yet. Offering ECH in a live handshake
+  additionally needs HelloRetryRequest handling, the retry-config path of
+  §6.1.6, and a second transcript — and doing that halfway would produce a
+  client that offers ECH and cannot tell whether it was accepted, which is
+  worse than one that does not offer it."
+  (:require [tls.codec :as c]
+            [tls.extension :as ext]
+            [tls.handshake :as hs]
+            [tls.result :as r :refer [ok error]]
+            [tls.schedule :as sched]
+            [hpke.core :as hpke]
+            [hpke.dhkem :as dhkem]
+            [hpke.kdf :as kdf]))
+
+(def version
+  "0xfe0d — draft-25's `ECHConfig.version`, and also the extension code.
+
+  They are the same number on purpose: the draft ties the configuration
+  format to the extension that consumes it, so a client that understands the
+  extension understands the config."
+  0xfe0d)
+
+(def outer-type 0)
+(def inner-type 1)
+
+(def info-prefix
+  "`\"tls ech\" || 0x00` — the start of the HPKE `info`."
+  (conj (vec (c/ascii "tls ech")) 0x00))
+
+(defn config-info
+  "The HPKE `info`: `\"tls ech\" || 0x00 || ECHConfig` — §6.1.
+
+  A named function rather than an expression inlined into `seal` and `open`,
+  because **a symmetric change to it is invisible to a round-trip test.** Both
+  halves live in this file, so replacing the info with anything at all leaves
+  every two-sided test green; it is only wrong against a peer. Measured:
+  dropping `(:raw config)` broke nothing until this got an assertion of its
+  own, pinned to the draft's text rather than to the other half of the code.
+
+  It binds the whole ECHConfig, not just the public key, so a config with the
+  same key and a different `public_name` cannot produce the same context."
+  [config]
+  (vec (concat info-prefix (:raw config))))
+
+;; ── ECHConfigList, §4 ────────────────────────────────────────────────────────
+
+(defn- parse-cipher-suites [bs]
+  (if (or (odd? (count bs)) (not= 0 (mod (count bs) 4)) (zero? (count bs)))
+    (error :decode_error :bad-cipher-suites-length {:tls/length (count bs)})
+    (ok (mapv (fn [[a b d e]] {:kdf-id (+ (* 256 a) b) :aead-id (+ (* 256 d) e)})
+              (partition 4 bs)))))
+
+(defn parse-config-contents
+  "`ECHConfigContents` — §4."
+  [body]
+  (let [cur (c/cursor body)]
+    (r/let-ok [[cid cur] (c/read-u8 cur :config_id)
+               [kem cur] (c/read-u16 cur :kem_id)
+               [pk cur] (c/read-vector cur 2 1 65535 :public_key)
+               [cs cur] (c/read-vector cur 2 4 65532 :cipher_suites)
+               [mnl cur] (c/read-u8 cur :maximum_name_length)
+               [pn cur] (c/read-vector cur 1 1 255 :public_name)
+               [exts cur] (c/read-vector cur 2 0 65535 :extensions)
+               _ (c/end cur :ECHConfigContents)
+               suites (parse-cipher-suites cs)]
+      (ok {:config-id cid :kem-id kem :public-key pk :cipher-suites suites
+           :maximum-name-length mnl :public-name (vec pn) :extensions (vec exts)}))))
+
+(defn encode-config-contents [{:keys [config-id kem-id public-key cipher-suites
+                                      maximum-name-length public-name extensions]}]
+  (r/let-ok [pk (c/write-vector 2 1 65535 :public_key (vec public-key))
+             cs (c/write-vector 2 4 65532 :cipher_suites
+                                (vec (mapcat (fn [{:keys [kdf-id aead-id]}]
+                                               (concat (c/u16 kdf-id) (c/u16 aead-id)))
+                                             cipher-suites)))
+             pn (c/write-vector 1 1 255 :public_name (vec public-name))
+             ex (c/write-vector 2 0 65535 :extensions (vec extensions))]
+    (ok (vec (concat [config-id] (c/u16 kem-id) pk cs [maximum-name-length] pn ex)))))
+
+(defn encode-config
+  "One `ECHConfig`: version, length, contents. This is what `info-prefix` is
+  completed with — the whole struct, headers included."
+  [contents]
+  (r/let-ok [body (encode-config-contents contents)]
+    (ok (vec (concat (c/u16 version) (c/u16 (count body)) body)))))
+
+(defn parse-config-list
+  "`ECHConfigList` — §4. Returns `{:configs [...] :skipped n}`.
+
+  A config whose **version** this build does not know is skipped, not
+  rejected: §4 says a client MUST ignore one, and failing the whole list would
+  make publishing a future version a breaking change. `:skipped` is reported
+  so a client that finds nothing usable can say which case it is in.
+
+  Each surviving config keeps its own `:raw` bytes, because the HPKE `info` is
+  the serialized ECHConfig and re-encoding it from the parsed form would be a
+  second answer to what those bytes are."
+  [bytes]
+  (let [cur (c/cursor bytes)]
+    (r/let-ok [[body cur] (c/read-vector cur 2 1 65535 :ECHConfigList)
+               _ (c/end cur :ECHConfigList)]
+      (loop [cur (c/cursor body) out [] skipped 0]
+        (if (c/exhausted? cur)
+          (ok {:configs out :skipped skipped})
+          (let [res (r/let-ok [[ver cur] (c/read-u16 cur :ECHConfig_version)
+                               [cts cur] (c/read-vector cur 2 0 65535 :ECHConfig_contents)]
+                      (ok [ver cts cur]))]
+            (if (r/error? res)
+              res
+              (let [[ver cts cur] (r/val res)]
+                (if (not= version ver)
+                  (recur cur out (inc skipped))
+                  (r/let-ok [parsed (parse-config-contents cts)]
+                    (recur cur
+                           (conj out (assoc parsed
+                                            :raw (vec (concat (c/u16 ver) (c/u16 (count cts)) cts))))
+                           skipped)))))))))))
+
+;; ── choosing one ─────────────────────────────────────────────────────────────
+
+(defn runnable-suites
+  "The `(kdf, aead)` pairs of a config that this build can actually execute.
+
+  An `export_only` AEAD is excluded: ECH encrypts a ClientHello, so a suite
+  that cannot encrypt is not a suite ECH can use, whatever the config says."
+  [{:keys [kem-id cipher-suites]}]
+  (when (get dhkem/kems kem-id)
+    (seq (filter (fn [{:keys [kdf-id aead-id]}]
+                   (let [a (get hpke/aeads aead-id)]
+                     (and (get kdf/kdfs kdf-id) a (pos? (:nk a)))))
+                 cipher-suites))))
+
+(def ^:private dot 0x2E)
+(def ^:private hyphen 0x2D)
+
+(defn- digit? [b] (<= 0x30 b 0x39))
+(defn- hex-digit? [b] (or (digit? b) (<= 0x41 b 0x46) (<= 0x61 b 0x66)))
+(defn- letter? [b] (or (<= 0x41 b 0x5A) (<= 0x61 b 0x7A)))
+
+(defn- ldh-label?
+  "An LDH label — RFC 5890 §2.3.1: ASCII letters, digits and hyphen, with the
+  hyphen not at either end, and 1 to 63 octets."
+  [label]
+  (and (<= 1 (count label) 63)
+       (every? (fn [b] (or (letter? b) (digit? b) (= hyphen b))) label)
+       (not= hyphen (first label))
+       (not= hyphen (last label))))
+
+(defn- ipv4-looking?
+  "All digits, or `0x`/`0X` followed by (possibly no) hex digits."
+  [label]
+  (or (and (seq label) (every? digit? label))
+      (and (>= (count label) 2)
+           (= 0x30 (nth label 0))
+           (contains? #{0x78 0x58} (nth label 1))
+           (every? hex-digit? (drop 2 label)))))
+
+(defn valid-public-name?
+  "§6.1.7. A `public_name` a client should be willing to authenticate against.
+
+  Two rules, and the second is the one with teeth. The first is shape: a
+  dot-separated sequence of LDH labels — ASCII letters, digits and hyphen,
+  hyphen not at either end of a label, labels of 1 to 63 octets, and no
+  leading or trailing dot.
+
+  The second says the **final** label must not be all digits, nor `0x`/`0X`
+  followed by hex. That is not tidiness: a name whose last label reads as a
+  number is a name some resolvers and URL parsers interpret as an **IPv4
+  literal**, and a client that authenticated a certificate for such a name
+  would be authenticating something other than a host.
+
+  Applied to configurations rather than to certificates, because §6.1.7 says
+  a client that checks here does not need to repeat the check later.
+
+  ## It works on the bytes, and never on a string
+
+  Two versions of this were wrong before this one, and both for the same
+  reason — the value is a byte vector and the checks kept being written
+  against characters:
+
+  - splitting labels on a regex with one escape too many, so the pattern
+    matched a backslash followed by anything instead of a dot: nothing ever
+    split, every name became one label containing dots, and **every valid
+    name was rejected**
+  - classifying characters with `(int ch)`, which is a code point on the JVM
+    and `0` under ClojureScript — the trap `hpke.kdf/ascii` documents
+
+  Comparing bytes to byte constants has neither failure available to it."
+  [name-bytes]
+  (let [bs (mapv #(bit-and (int %) 0xFF) (seq name-bytes))]
+    (and (seq bs)
+         (not= dot (first bs))
+         (not= dot (last bs))
+         (let [labels (reduce (fn [acc b]
+                                (if (= dot b)
+                                  (conj acc [])
+                                  (conj (pop acc) (conj (peek acc) b))))
+                              [[]] bs)]
+           (and (seq labels)
+                (every? ldh-label? labels)
+                (not (ipv4-looking? (last labels))))))))
+
+(defn choose
+  "The first config with a runnable suite, and that suite.
+
+  \"First\" is the draft's own order: §5 says the list is in decreasing order
+  of preference, so the server's preference wins over any ranking a client
+  might invent.
+
+  A config whose `public_name` is not a valid host name is skipped even if its
+  suite runs — §6.1.7. The client will have to authenticate a certificate for
+  that name if the server rejects ECH, and a name that reads as an IPv4
+  literal is not a host to authenticate."
+  [configs]
+  (first (keep (fn [cfg]
+                 (when (and (valid-public-name? (:public-name cfg))
+                            (seq (runnable-suites cfg)))
+                   {:config cfg :cipher-suite (first (runnable-suites cfg))}))
+               configs)))
+
+(defn suite-of [config cipher-suite]
+  (hpke/suite (get dhkem/kems (:kem-id config))
+              (get kdf/kdfs (:kdf-id cipher-suite))
+              (get hpke/aeads (:aead-id cipher-suite))))
+
+;; ── the extension payload, §5 ────────────────────────────────────────────────
+
+(defn encode-outer-ech
+  "The outer variant of `ECHClientHello`."
+  [{:keys [cipher-suite config-id enc payload]}]
+  (r/let-ok [e (c/write-vector 2 0 65535 :enc (vec enc))
+             p (c/write-vector 2 1 65535 :payload (vec payload))]
+    (ok (vec (concat [outer-type]
+                     (c/u16 (:kdf-id cipher-suite)) (c/u16 (:aead-id cipher-suite))
+                     [config-id] e p)))))
+
+(def encoded-inner-ech
+  "The inner variant: a single byte.
+
+  Empty because a TLS server may not put an extension in ServerHello that was
+  not in ClientHello — so the inner hello has to carry the extension type even
+  though it has nothing to say."
+  [inner-type])
+
+(defn parse-ech-extension
+  "Either variant, discriminated by its first byte."
+  [data]
+  (let [cur (c/cursor data)]
+    (r/let-ok [[t cur] (c/read-u8 cur :ECHClientHelloType)]
+      (cond
+        (= inner-type t) (r/let-ok [_ (c/end cur :ECHClientHello_inner)]
+                           (ok {:type :inner}))
+        (= outer-type t)
+        (r/let-ok [[kdf cur] (c/read-u16 cur :kdf_id)
+                   [aead cur] (c/read-u16 cur :aead_id)
+                   [cid cur] (c/read-u8 cur :config_id)
+                   [enc cur] (c/read-vector cur 2 0 65535 :enc)
+                   [pay cur] (c/read-vector cur 2 1 65535 :payload)
+                   _ (c/end cur :ECHClientHello_outer)]
+          (ok {:type :outer
+               :cipher-suite {:kdf-id kdf :aead-id aead}
+               :config-id cid :enc (vec enc) :payload (vec pay)}))
+        :else (error :illegal_parameter :unknown-ech-client-hello-type {:tls/type t})))))
+
+;; ── the ClientHello body, without its handshake header ───────────────────────
+;;
+;; Everything ECH serializes is a ClientHello *structure*: the draft says
+;; twice that it does not include the Handshake header. `tls.handshake` builds
+;; and parses whole messages, so these two strip and restore the four bytes
+;; rather than duplicating either.
+
+(defn hello-body
+  "The ClientHello structure from `tls.handshake/client-hello`'s message."
+  [fields]
+  (r/let-ok [msg (hs/client-hello fields)]
+    (ok (vec (subvec (vec msg) 4)))))
+
+(defn- body-length
+  "How many bytes of `bs` a ClientHello structure occupies.
+
+  Needed because `EncodedClientHelloInner` is a ClientHello followed by
+  padding with **no length prefix between them** — the reader has to know
+  where the structure ends, and `tls.handshake/parse-client-hello` requires
+  the buffer to be exhausted."
+  [bs]
+  (let [cur (c/cursor bs)]
+    (r/let-ok [[_ cur] (c/read-bytes cur 2 :legacy_version)
+               [_ cur] (c/read-bytes cur 32 :random)
+               [_ cur] (c/read-vector cur 1 0 32 :legacy_session_id)
+               [_ cur] (c/read-vector cur 2 2 65534 :cipher_suites)
+               [_ cur] (c/read-vector cur 1 1 255 :legacy_compression_methods)
+               [_ cur] (c/read-vector cur 2 8 65535 :extensions)]
+      (ok (:pos cur)))))
+
+(defn parse-hello-body [bs] (hs/parse-client-hello (vec bs)))
+
+(defn- reassemble
+  "A parsed ClientHello back to bytes, with a possibly different session id and
+  extension list."
+  [parsed session-id exts]
+  (r/let-ok [sid (c/write-vector 1 0 32 :legacy_session_id (vec session-id))
+             cs (c/write-vector 2 2 65534 :cipher_suites
+                                (vec (mapcat c/u16 (:tls/cipher-suites parsed))))
+             comp (c/write-vector 1 1 255 :legacy_compression_methods [0])
+             eb (ext/encode-block 8 exts)]
+    (ok (vec (concat (:tls/legacy-version parsed) (:tls/random parsed)
+                     sid cs comp eb)))))
+
+;; ── EncodedClientHelloInner, §5.1 ────────────────────────────────────────────
+
+(defn outer-extensions-payload
+  "`ExtensionType OuterExtensions<2..254>` — a one-byte length prefix over
+  uint16 codes."
+  [codes]
+  (c/write-vector 1 2 254 :OuterExtensions (vec (mapcat c/u16 codes))))
+
+(defn parse-outer-extensions [data]
+  (let [cur (c/cursor data)]
+    (r/let-ok [[body cur] (c/read-vector cur 1 2 254 :OuterExtensions)
+               _ (c/end cur :OuterExtensions)]
+      (if (odd? (count body))
+        (error :decode_error :odd-outer-extensions-length {:tls/length (count body)})
+        (ok (mapv (fn [[a b]] (+ (* 256 a) b)) (partition 2 body)))))))
+
+(defn recommended-padding
+  "§6.1.3. Deterministic, so two clients with the same profile pad alike.
+
+  Two rules, and the second is the one that is easy to drop: a hello with
+  **no** `server_name` still pads, by `L + 9` — the length of a `server_name`
+  extension holding an `L`-byte name. Skipping it makes connecting to an IP
+  address distinguishable from connecting to a host, which is the thing ECH
+  exists to hide."
+  [max-name-length inner-server-name-length encoded-length-so-far]
+  (let [name-pad (if inner-server-name-length
+                   (max 0 (- max-name-length inner-server-name-length))
+                   (+ max-name-length 9))
+        l (+ encoded-length-so-far name-pad)]
+    (+ name-pad (- 31 (mod (dec l) 32)))))
+
+(defn encode-inner
+  "Build `EncodedClientHelloInner` from a ClientHelloInner body.
+
+  `compress` is the ordered list of extension types to replace with a single
+  `ech_outer_extensions`. The draft requires them to be **contiguous** in the
+  inner hello and to appear in the outer in the same relative order; the first
+  is enforced here, the second is checked on the way back in by
+  `reconstruct-inner`, which is where an attacker's version arrives."
+  [inner-body compress padding-length]
+  (r/let-ok [parsed (parse-hello-body inner-body)]
+    (let [exts (:tls/extensions parsed)
+          codes (mapv (fn [e] (let [t (:tls/type e)] (if (keyword? t) (get ext/types t) t))) exts)
+          want (mapv (fn [t] (if (keyword? t) (get ext/types t) t)) compress)
+          idx (keep-indexed (fn [i cd] (when (some #{cd} want) i)) codes)]
+      (cond
+        (and (seq want) (not= (count want) (count idx)))
+        (error :internal_error :compressed-extension-missing-from-inner
+               {:tls/types compress})
+
+        (and (seq idx) (not= (vec idx) (range (first idx) (inc (last idx)))))
+        (error :internal_error :compressed-extensions-not-contiguous {:tls/types compress})
+
+        (and (seq want) (not= want (mapv #(nth codes %) idx)))
+        (error :internal_error :compressed-extensions-out-of-order {:tls/types compress})
+
+        :else
+        (r/let-ok [oe (when (seq want) (outer-extensions-payload want))
+                   marker (when oe (ext/extension :ech_outer_extensions oe))]
+          (let [exts' (if (seq idx)
+                        (vec (concat (subvec exts 0 (first idx))
+                                     [(ext/->ext :ech_outer_extensions marker)]
+                                     (subvec exts (inc (last idx)))))
+                        exts)]
+            (r/let-ok [body (reassemble parsed [] exts')]
+              (ok (vec (concat body (repeat padding-length 0)))))))))))
+
+(defn reconstruct-inner
+  "The client-facing server's half of §5.1: `EncodedClientHelloInner` and the
+  ClientHelloOuter back to the ClientHelloInner.
+
+  Every abort the draft names has its own reason, because \"it failed\" is not
+  a thing an operator can act on:
+
+  | | |
+  |---|---|
+  | non-zero padding | `:non-zero-padding` |
+  | a referenced extension missing from the outer | `:outer-extension-missing` |
+  | one referenced twice | `:duplicate-outer-extension` |
+  | `encrypted_client_hello` referenced | `:ech-referenced-in-outer-extensions` |
+  | the outer's order does not match | `:outer-extensions-out-of-order` |
+
+  The last three exist to stop a small ClientHelloOuter expanding into a huge
+  ClientHelloInner — §10.12.4's amplification attack. They are not tidiness."
+  [encoded outer-body]
+  (r/let-ok [n (body-length (vec encoded))]
+    (let [encoded (vec encoded)
+          ch (subvec encoded 0 n)
+          padding (subvec encoded n)]
+      (if-not (every? zero? padding)
+        (error :illegal_parameter :non-zero-padding {:tls/length (count padding)})
+        (r/let-ok [inner (parse-hello-body ch)
+                   outer (parse-hello-body outer-body)]
+          (let [code-of (fn [e] (let [t (:tls/type e)] (if (keyword? t) (get ext/types t) t)))
+                outer-exts (:tls/extensions outer)
+                outer-codes (mapv code-of outer-exts)
+                by-code (into {} (map (juxt code-of identity)) outer-exts)
+                exts (:tls/extensions inner)
+                marker (first (keep-indexed
+                               (fn [i e] (when (= :ech_outer_extensions (:tls/type e)) i))
+                               exts))]
+            (if-not marker
+              (r/let-ok [body (reassemble inner (:tls/session-id outer) exts)]
+                (ok body))
+              (r/let-ok [refs (parse-outer-extensions (:tls/data (nth exts marker)))]
+                (cond
+                  (not= (count refs) (count (set refs)))
+                  (error :illegal_parameter :duplicate-outer-extension {:tls/types refs})
+
+                  (some #{version} refs)
+                  (error :illegal_parameter :ech-referenced-in-outer-extensions {})
+
+                  (not-every? by-code refs)
+                  (error :illegal_parameter :outer-extension-missing
+                         {:tls/types (vec (remove by-code refs))})
+
+                  (not= refs (vec (filter (set refs) outer-codes)))
+                  (error :illegal_parameter :outer-extensions-out-of-order
+                         {:tls/referenced refs
+                          :tls/in-outer (vec (filter (set refs) outer-codes))})
+
+                  :else
+                  (let [exts' (vec (concat (subvec exts 0 marker)
+                                           (map by-code refs)
+                                           (subvec exts (inc marker))))]
+                    (r/let-ok [body (reassemble inner (:tls/session-id outer) exts')]
+                      (ok body))))))))))))
+
+;; ── ClientHelloOuterAAD, §5.2 ────────────────────────────────────────────────
+
+(defn outer-aad
+  "The ClientHelloOuter with the ECH extension's `payload` replaced by zeros of
+  the same length.
+
+  This is what binds the outer to the inner. Without it a network attacker
+  could rewrite the outer — its SNI, its key share, its ALPN — and leave the
+  encrypted inner untouched, and the backend would accept a hello the client
+  never composed (§10.12.3)."
+  [outer-body]
+  (r/let-ok [parsed (parse-hello-body outer-body)]
+    (let [exts (:tls/extensions parsed)
+          i (first (keep-indexed
+                    (fn [i e] (when (= :encrypted_client_hello (:tls/type e)) i)) exts))]
+      (if-not i
+        (error :illegal_parameter :no-ech-extension-in-outer {})
+        (r/let-ok [p (parse-ech-extension (:tls/data (nth exts i)))]
+          (if (not= :outer (:type p))
+            (error :illegal_parameter :inner-ech-extension-in-outer {})
+            (r/let-ok [zeroed (encode-outer-ech
+                               (assoc p :payload (vec (repeat (count (:payload p)) 0))))
+                       raw (ext/extension :encrypted_client_hello zeroed)]
+              (reassemble parsed (:tls/session-id parsed)
+                          (assoc exts i (ext/->ext :encrypted_client_hello raw))))))))))
+
+;; ── seal and open ────────────────────────────────────────────────────────────
+
+(defn seal
+  "§6.1.1. Returns the finished ClientHelloOuter body.
+
+  Note the error context key is `:tls/hpke-reason`, not `:tls/reason`.
+  `tls.result/error` merges the caller's data *over* `{:tls/alert :tls/reason}`,
+  so a context map carrying `:tls/reason` silently replaces the stable keyword
+  the caller asserts on. That was a real bug here, caught only because the
+  tests assert **by reason** rather than by \"an error happened\".
+
+  `partial-outer` must already carry an `encrypted_client_hello` extension
+  whose payload is `L` zeros, where `L` is the sealed length — the draft says
+  so, and the reason is that the AAD is the serialized outer, so the payload's
+  *length* has to be settled before the payload's *value* can be computed."
+  [config cipher-suite partial-outer encoded-inner eph]
+  (let [s (suite-of config cipher-suite)]
+    (if-not s
+      (error :internal_error :unrunnable-ech-suite {})
+      (let [info (config-info config)
+            setup (hpke/setup-base-sender s (:public-key config) info eph)]
+        (if (not= :ok (:status setup))
+          (error :illegal_parameter :ech-setup-failed {:tls/hpke-reason (:reason setup)})
+          (r/let-ok [aad (outer-aad partial-outer)]
+            (let [sealed (hpke/seal (:context setup) aad encoded-inner)]
+              (if (not= :ok (:status sealed))
+                (error :internal_error :ech-seal-failed {:tls/hpke-reason (:reason sealed)})
+                (r/let-ok [parsed (parse-hello-body partial-outer)]
+                  (let [exts (:tls/extensions parsed)
+                        i (first (keep-indexed
+                                  (fn [i e] (when (= :encrypted_client_hello (:tls/type e)) i))
+                                  exts))]
+                    (r/let-ok [p (parse-ech-extension (:tls/data (nth exts i)))]
+                      (if (not= (count (:payload p)) (count (:bytes sealed)))
+                        (error :internal_error :ech-payload-length-mismatch
+                               {:tls/placeholder (count (:payload p))
+                                :tls/sealed (count (:bytes sealed))})
+                        (r/let-ok [filled (encode-outer-ech (assoc p :payload (:bytes sealed)))
+                                   raw (ext/extension :encrypted_client_hello filled)]
+                          (r/let-ok [body (reassemble parsed (:tls/session-id parsed)
+                                                      (assoc exts i (ext/->ext
+                                                                     :encrypted_client_hello raw)))]
+                            (ok {:tls/outer body
+                                 :tls/enc (:enc setup)
+                                 :tls/context (:context setup)})))))))))))))))
+
+(defn open
+  "The client-facing server's half: decrypt an `encrypted_client_hello` and
+  return the `EncodedClientHelloInner`.
+
+  A failure here is not fatal to the connection. §7.1 says the server
+  continues with the ClientHelloOuter and offers retry configs — so this
+  returns an error the caller can *choose* to ignore, rather than aborting."
+  [config cipher-suite kp-r outer-body]
+  (let [s (suite-of config cipher-suite)]
+    (if-not s
+      (error :internal_error :unrunnable-ech-suite {})
+      (r/let-ok [parsed (parse-hello-body outer-body)]
+        (let [exts (:tls/extensions parsed)
+              e (first (filter #(= :encrypted_client_hello (:tls/type %)) exts))]
+          (if-not e
+            (error :illegal_parameter :no-ech-extension-in-outer {})
+            (r/let-ok [p (parse-ech-extension (:tls/data e))]
+              (cond
+                (not= :outer (:type p))
+                (error :illegal_parameter :inner-ech-extension-in-outer {})
+
+                (not= (:config-id p) (:config-id config))
+                (error :illegal_parameter :config-id-mismatch
+                       {:tls/offered (:config-id p) :tls/have (:config-id config)})
+
+                (not= (:cipher-suite p) cipher-suite)
+                (error :illegal_parameter :cipher-suite-mismatch {:tls/offered (:cipher-suite p)})
+
+                :else
+                (let [info (config-info config)
+                      setup (hpke/setup-base-recipient s (:enc p) kp-r info)]
+                  (if (not= :ok (:status setup))
+                    (error :decrypt_error :ech-setup-failed {:tls/hpke-reason (:reason setup)})
+                    (r/let-ok [aad (outer-aad outer-body)]
+                      (let [opened (hpke/open (:context setup) aad (:payload p))]
+                        (if (not= :ok (:status opened))
+                          (error :decrypt_error :ech-open-failed {:tls/hpke-reason (:reason opened)})
+                          (ok {:tls/encoded-inner (:bytes opened)
+                               :tls/context (:context setup)}))))))))))))))
+
+;; ── acceptance confirmation, §7.2 ────────────────────────────────────────────
+
+(defn parse-retry-configs
+  "`ECHEncryptedExtensions { ECHConfigList retry_configs; }` — §5.
+
+  §6.1.6 requires the client to check this is syntactically valid and to abort
+  with `decode_error` if not, so a parse failure here is not something to work
+  around.
+
+  **A caller must not act on the result until the handshake has authenticated
+  the `public_name`.** These arrive in EncryptedExtensions, which is encrypted
+  under keys derived from a handshake that has not yet been authenticated at
+  that point; §6.1.6 says in as many words that if authentication fails the
+  client MUST NOT use them. `tls.client` returns them only on the path where
+  that authentication succeeded."
+  [data]
+  (r/let-ok [parsed (parse-config-list (vec data))]
+    (ok (:configs parsed))))
+
+(defn encrypted-extensions-response
+  "What an `encrypted_client_hello` in EncryptedExtensions means, given whether
+  ECH was accepted. Returns `{:tls/retry-configs …}`.
+
+  Both of the draft's rules live here, and both are refusals:
+
+  - **§5**: the server may send this only in response to the *outer* variant.
+    After accepting ECH there is nothing to retry, and sending it anyway gets
+    `unsupported_extension`.
+  - **§6.1.6**: if present, it MUST be syntactically valid, or `decode_error`.
+    Not `ignore what does not parse` — a client that read a corrupt retry
+    config as `the server sent none` would conclude ECH was securely disabled
+    and stop offering it, which is the downgrade the alert exists to prevent.
+
+  A named function because the first branch is **unreachable from any test in
+  this repository**: reaching it needs a server that accepts ECH and then
+  violates §5 in the same handshake. Nothing here can produce one, and a
+  branch nothing can reach is a branch nothing is checking."
+  [accepted ech-extension]
+  (cond
+    (nil? ech-extension) (ok {:tls/retry-configs nil})
+    accepted (error :unsupported_extension :ech-extension-after-acceptance {})
+    :else (r/let-ok [cs (parse-retry-configs (:tls/data ech-extension))]
+            (ok {:tls/retry-configs cs}))))
+
+(defn accept-confirmation
+  "§7.2. The eight bytes the backend server writes over the tail of
+  `ServerHello.random`, and the client recomputes to learn whether ECH was
+  accepted.
+
+  `transcript-hash` is over ClientHelloInner up to and including a ServerHello
+  whose **last eight random bytes are zero**. That detail is the whole
+  mechanism: the confirmation is a function of a transcript that contains the
+  place the confirmation will go."
+  [h inner-random transcript-hash]
+  (sched/hkdf-expand-label h (sched/hkdf-extract h [] (vec inner-random))
+                           "ech accept confirmation" (vec transcript-hash) 8))
+
+(defn hrr-accept-confirmation
+  "§7.2.1 — the same thing for HelloRetryRequest, where the eight bytes travel
+  in an extension instead of in `random`, because HRR's random is a fixed
+  constant the draft may not overwrite."
+  [h inner-random transcript-hash]
+  (sched/hkdf-expand-label h (sched/hkdf-extract h [] (vec inner-random))
+                           "hrr ech accept confirmation" (vec transcript-hash) 8))
+
+(defn accepted?
+  "Does `server-hello-random` carry `expected`? Compared without an early exit."
+  [server-hello-random expected]
+  (let [tail (vec (take-last 8 (vec server-hello-random)))
+        e (vec expected)]
+    (and (= 8 (count e)) (= 8 (count tail))
+         (zero? (reduce bit-or 0 (map bit-xor tail e))))))
