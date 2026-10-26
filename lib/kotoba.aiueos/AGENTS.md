@@ -9,12 +9,80 @@ in distribution configuration. Distribution metadata neither grants authority
 nor changes component qualification. See `distributions/README.md` and
 `90-docs/adr/0274-awai-os-is-an-aiueos-distribution.md`.
 
+## Native desktop debug without a human login
+
+For routine QEMU Itonami debugging, run
+`os/aiueos/scripts/debug-native-itonami.py` on a completed native user-v2 or
+user-v3 build. It selects the matching live-Goal, durable-Goal or local-model gate from
+the build receipt, launches isolated QEMU boots and writes a run receipt plus
+logs even when the guest gate fails. For the older local-draft desktop profile,
+run `os/aiueos/scripts/debug-native-desktop-unattended.py`, adding
+`--verify-restore` for save and cold reboot. See
+`90-docs/native-desktop-headless-debug.md`.
+This is the default for each routine VM debug run: inspect `debug-run.json`,
+the guest gate receipt, logs and screenshots before reporting the result.
+Do not ask the user to reconnect Screen Sharing, enter a VNC password or press
+guest keys to repeat a technical check. Request human input only when the
+remaining question actually requires a person's judgment or a trusted product
+approval; a QMP-injected key cannot supply that approval.
+Keep any separately shared VNC session password protected.
+QMP is a local VM control channel, so keep its Unix socket inside a private
+task workspace when attaching to a running VM. The headless restart gate uses
+private QMP standard-input/output pipes and needs no socket listener. A QMP
+screenshot and diagnostic desktop state do not qualify
+the full Itonami agent loop or physical AIUEOS hardware.
+
+For the user-v2 Goal ELF, run the private-QMP CPL3 gate in
+`docs/evidence/aiueos-user-v2-goal-20261026/README.md` instead of asking for
+a Screen Sharing key press. Its `a b` Goal is a fixed boot fixture; live UI
+ingress, approval and durable Itonami execution remain separate work.
+For the subsequent live UI handoff, use the three-boot private-QMP gate in
+`docs/evidence/aiueos-user-v2-live-goal-20261026/README.md`. It types two
+different Goals through the actual native desktop and checks a CPL3 read plus
+an empty-Goal refusal. The earlier inline bridge used the sole font payload
+slot. The dual-payload candidate keeps the font and user ELF in separate
+slots; run `os/aiueos/scripts/debug-native-user-v2-unattended.py` on its
+Mac native build directory to type a chosen Goal, check CPL3, take a guest
+screenshot and exercise empty/tampered-slot refusals without a password or
+human key press. It does not qualify signed app admission, approval,
+model/tool effects or durable turns.
+
+For the combined local-draft and user-v2 diagnostic profile, run
+`os/aiueos/scripts/debug-native-user-v2-durable-unattended.py` on its exact
+Mac native build directory. It creates a fresh marked scratch disk, types a
+Goal, saves with F5, cold-boots, checks restored pixels and reads the CPL3
+result. Private QMP standard I/O needs no Screen Sharing login, VNC password,
+guest key press or network. Never treat injected test keys as trusted approval
+for a model, tool or other external operation. See
+`docs/evidence/aiueos-durable-user-v2-unattended-20261026/README.md`.
+
+The next local-model diagnostic profile is exercised by
+`os/aiueos/scripts/debug-native-local-model-confirm-qemu.py`. It cold-restores
+the Goal, displays an AIUEOS-owned Y/N choice, verifies denial leaves the
+user pages untouched, runs the native bigram model only after the fresh
+choice, and checks the one-token result in CPL3. The builder's `--user-source`
+route regenerates user ELF, slot, kernel and EFI with one native Amu compiler.
+Private-QMP injected Y/N keys prove the guest branching logic, not that a
+human approved an external operation. This profile is a local model proof,
+not a general `:llm/generate` provider or Itonami agent loop. See
+`docs/evidence/aiueos-local-model-confirm-20261026/README.md`.
+
+The user-v3 local-model profile uses the same headless entry on a pinned
+Mac-native build. It checks a user-originated syscall 5 request and a consumed
+one-operation choice after Goal cold restore; it also exercises denial and
+modified-slot refusal. See
+`docs/evidence/aiueos-user-v3-local-model-20261026/README.md`. The synthetic
+QMP choice does not count as human consent, and the fixed one-token model is
+not a general agent loop.
 ## Shared Browser native progress (JUN-93)
 
 See `90-docs/shared-browser-native-progress.md` and the source-bound native
 qualification record. Shared text/DOM/text-edit component execution, kernel
 desktop integration, dapps/broker consent and durable restore are separate
 gates. The diagnostic Browser-frame2 cards do not execute registered services.
+AWAI-90's opt-in local-draft transport has a source-bound native cold-boot
+receipt; see `90-docs/native-workspace-restore-progress.md`. It does not qualify
+the D2 workspace codec, signed Cell head, user target or release admission.
 The legacy hosted maturity ladder and scores retain their original scope;
 do not run KBB/NBB/JVM or count those receipts as current native acceptance.
 
@@ -30,6 +98,18 @@ native tool. See `90-docs/native-desktop-media-v1.md` for exact boundaries.
 Local raw-media/QEMU desktop/input proofs do not qualify Browser/CSSOM
 parity, dapp execution, preemptive scheduling or physical hardware. The
 final compiler still requires native x86/controller/pin adoption evidence.
+The separate Apple Silicon Mac selfhost candidate builds the same font,
+31-module desktop kernel, EFI and GPT/FAT16 media bytes with signed
+Kotoba/Amu Mach-O images; the exact Mac media passed QEMU desktop input.
+The ordinary desktop entry now runs all Mac stages and the private QMP gate
+in one source-bound invocation; the gate checks visible Goal glyph pixels.
+With `AIUEOS_NATIVE_DESKTOP_PROFILE=local-draft`, the same entry also builds
+the opt-in workspace kernel and checks F5 save, cold restore, refusal cases
+and visible restored Goal text without Screen Sharing or a password.
+See 90-docs/native-macos-selfhost-build.md. This is a diagnostic candidate;
+the expanded FS2 Mac compiler fixed point and merged-root diagnostic VM repeat
+have local evidence, while exact-head native Linux compiler/controller gates,
+release and physical qualification remain open.
 
 ## CDCI migration: native only (2026-10-24)
 

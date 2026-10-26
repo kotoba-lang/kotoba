@@ -112,9 +112,12 @@ provides trusted per-operation consent.
 
 The current `itonami-agent` CLI entry imports Node host APIs
 (`node:readline`, `node:crypto`) and its KBB/JS host adapters; that
-implementation is not an AIUEOS native app artifact. The current native
-diagnostic desktop has a RAM-only goal draft and no durable storage operation
-in that path. The next native integration gate is the complete shared
+implementation is not an AIUEOS native app artifact. The default native
+diagnostic desktop retains a RAM-only goal draft. AWAI-90 adds an opt-in
+[local draft commit/cold-restore probe](native-workspace-restore-progress.md),
+with actual native disk I/O and refusal receipts. Its unsigned draft record
+does not implement the D2 image codec or restore a registered workspace.
+The next native integration gate is the complete shared
 Browser/CSSOM runtime plus an Itonami target artifact with declared operations,
 then a real agent turn, committed state and restart recovery on AIUEOS.
 No product-local consent implementation is used.

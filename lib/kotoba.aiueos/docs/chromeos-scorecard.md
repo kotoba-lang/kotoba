@@ -24,7 +24,23 @@ evidence that shared Browser/Itonami/restoration have been integrated.
 
 Evidence levels, in order: `:design` < `:qemu` < `:device` < `:release` < `:user`. A QEMU run is `:qemu` unless it is a run in the reference VM with a kept receipt (below); only then does it count as `:device`.
 
-## Where AIUEOS stands (ledger reconciled 2026-10-25)
+## Current EDN row state (2026-10-26)
+
+The current EDN declares 55 required rows of total weight 100. Counting its
+`:status` fields gives 42 pass rows of weight 71 and 13 unachieved rows of
+weight 29. The unachieved rows are D3, D8, E1–E7, F3, F5, F6 and I2.
+The separate `:qemu-progress` field totals 80 of 100 by its stated
+pass/partial/none weights. I3 was added as a declared pass with a reference-VM
+receipt, and D3 now has partial QEMU progress after the historical 69/77
+ledger below.
+
+These are **declared row totals**, not a new native selfhost scorecard verdict.
+The retired KBB checker has not been run on this source and the Kotoba/Amu
+native checker remains open (JUN-409). Each pass still needs its cited receipt
+and acceptance scope reviewed; no VM count is physical hardware or a general
+ChromeOS-complete product claim.
+
+## Historical reference-VM ledger (reconciled 2026-10-25)
 
 **SCORE 69%.** Forty-one rows are `:pass`, each by a receipt of a run in the reference VM (below): A1, A2, A3, A4, A5, B1, B2, B3, C1, C2, C3, C4, C5, C7, C8, C9, C10, D1, D2, D4, D5, D6, D7, F1, F2, F4, G1, G2, G3, G4, G5, H1, H2, H3, H4, I1, I4, I5, I6, I7 and I8
 (weight 69 of 100), verified by `kbb --backend sci scripts/chromeos-scorecard.cljk` on the merged tree (`AIUEOS_CHROMEOS_SCORECARD_OK`, QEMU-progress 77%). Fourteen required rows remain `:unachieved` and weigh 31: D3, D8, E1, E2, E3, E4, E5, E6, E7, F3, F5, F6, I2 and I3 -- the whole web category (20) is still `:pass` nowhere. The checker refuses a `:pass` without a receipt that reads back, with a red verdict, with an unconfirmed reference, or at `:release` level on a VM receipt alone; the `:release` rows A3--A5 pass on the signed-release receipt and its install/refusal readbacks, which is the receipt the reference VM produced, not a physical machine. P5 real-hardware qualification remains `:spec`, and the checker has not yet been ported to the native Amu/Kotoba route (JUN-409), so this score is the hosted checker's verdict over reference-VM receipts, not a native-qualification percentage.
