@@ -1,0 +1,247 @@
+#!/usr/bin/env kbb
+;; Acceptance for kotoba-build: build the example app, serve it with the dev
+;; server, and DRIVE IT IN A REAL BROWSER.
+;;
+;; Why a browser and not a unit test: this repo's claim is that a Kotoba app
+;; can be built and looked at. A test that asserted the plan's shape would
+;; pass on a day when the page loaded to a blank screen -- and a page that
+;; renders but never responds to a click is the same failure one step later.
+;; So the last three checks are: the DOM the guest drew, the click the driver
+;; carried back, and the state it changed.
+;;
+;; The browser is launched headless over CDP, the way
+;; `kotoba-lang/htmldom/conformance/cdp_dump.cljs` does (prior art in this
+;; workspace; a third copy of this glue should become a library instead).
+;; Node's WebSocket global is used directly -- no `ws` dependency.
+;;
+;; Exit codes: 0 passed, 1 failed, 2 REFUSED (a tool needed to answer is
+;; missing -- and a skipped check is not a pass).
+;;
+;;   kbb --backend sci test/build_acceptance.cljk
+
+(ns build-acceptance
+  (:require ["node:child_process" :as cp]
+            ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:path" :as path]
+            [clojure.edn :as edn]
+            [kotoba.lang.text :as str]))
+
+(def script
+  (or (first (filter (fn [a] (or (.endsWith a ".cljk") (.endsWith a ".cljs")))
+                     (rest (.slice js/process.argv 0))))
+      "lib/kotoba.kotobaBuild/test/build_acceptance.cljk"))
+(def repo-root (path/resolve (path/dirname (path/resolve script)) ".."))
+(def port 8793)
+
+(def browsers
+  ["/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"
+   "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+   "/usr/bin/chromium"])
+
+(def failures (atom 0))
+(def checks (atom 0))
+
+(defn check! [label expected actual]
+  (swap! checks inc)
+  (when-not (= expected actual)
+    (swap! failures inc)
+    (println "  FAIL" label "\n    expected:" (pr-str expected) "\n    actual:  " (pr-str actual))))
+
+(defn- sh [cmd args]
+  (let [r (cp/spawnSync cmd (clj->js args) #js {:encoding "utf8" :timeout 900000})]
+    {:exit (.-status r) :out (or (.-stdout r) "") :err (or (.-stderr r) "")}))
+
+(defn- sleep [ms] (js/Promise. (fn [res] (js/setTimeout res ms))))
+
+(defn- refuse! [& msg]
+  (println (str "REFUSED: " (str/join " " (map str msg))))
+  (js/process.exit 2))
+
+;; --- the build ------------------------------------------------------------
+
+(defn- write-config! [dir]
+  (let [shitsuke (path/resolve repo-root ".." "com-junkawasaki" "orgs" "kotoba-lang" "shitsuke" "kotoba")
+        amu (path/resolve repo-root ".." "com-junkawasaki" "orgs" "kotoba-lang" "amu" "runtime")]
+    (when-not (fs/existsSync shitsuke)
+      (refuse! "shitsuke's kotoba/ is not checked out at" shitsuke))
+    (when-not (fs/existsSync amu)
+      (refuse! "amu's runtime/ is not checked out at" amu))
+    (let [cfg {:app "counter"
+               :entry (path/join repo-root "example" "counter_app.kotoba")
+               :source-paths [(path/join repo-root "example") shitsuke]
+               :target "js"
+               :out (path/join dir "dist")
+               :mode :release
+               :mount "app"
+               :title "Counter"
+               :amu-runtime amu}
+          file (path/join dir "build.edn")]
+      (fs/writeFileSync file (pr-str cfg))
+      file)))
+
+;; --- CDP ------------------------------------------------------------------
+
+(defn- wait-http
+  "Poll the dev server until it answers. The serve step is the LAST step of a
+  dev build, so the server does not listen until the compile has finished --
+  navigating before that gives ERR_CONNECTION_REFUSED, and a browser that
+  failed to connect renders a page whose every query is null."
+  [url attempts]
+  (js/Promise.
+   (fn [resolve _]
+     (letfn [(try-once [n]
+               (if (zero? n)
+                 (resolve false)
+                 (-> (js/fetch url)
+                     (.then (fn [r] (if (.-ok r) (resolve true) (js/setTimeout #(try-once (dec n)) 1000))))
+                     (.catch (fn [_] (js/setTimeout #(try-once (dec n)) 1000))))))]
+       (try-once attempts)))))
+
+(defn- browser-binary []
+  (first (filter fs/existsSync browsers)))
+
+(defn- launch-browser! [binary profile]
+  (cp/spawn binary
+            #js["--headless=new" "--disable-gpu" "--no-first-run"
+                "--remote-debugging-port=0"
+                (str "--user-data-dir=" profile)
+                "about:blank"]
+            #js {:stdio #js["ignore" "ignore" "pipe"]}))
+
+(defn- devtools-url
+  "The port is written to DevToolsActivePort in the profile once the browser is
+  up. Polling the file is how the harness avoids guessing a port."
+  [profile attempts]
+  (js/Promise.
+   (fn [resolve _]
+     (letfn [(try-once [n]
+               (let [f (path/join profile "DevToolsActivePort")]
+                 (if (fs/existsSync f)
+                   (let [lines (str/split-lines (fs/readFileSync f "utf8"))]
+                     (resolve (str "http://127.0.0.1:" (str/trim (first lines))))) 
+                   (if (zero? n)
+                     (resolve nil)
+                     (js/setTimeout #(try-once (dec n)) 250)))))]
+       (try-once attempts)))))
+
+(defn- ws-eval
+  "One CDP session: navigate, then evaluate each expression in order and
+  return the results."
+  [ws-url url exprs]
+  (js/Promise.
+   (fn [resolve reject]
+     (let [sock (js/WebSocket. ws-url)
+           results (atom [])
+           pending (atom (vec exprs))
+           id (atom 0)
+           send! (fn [method params]
+                   (swap! id inc)
+                   (.send sock (js/JSON.stringify (clj->js {:id @id :method method :params params})))
+                   @id)]
+       (set! (.-onerror sock) (fn [e] (reject (str "cdp socket error " (.-message e)))))
+       (set! (.-onopen sock) (fn [_] (send! "Page.enable" {}) (send! "Page.navigate" {:url url})))
+       (set! (.-onmessage sock)
+             (fn [ev]
+               (let [msg (js->clj (js/JSON.parse (.-data ev)) :keywordize-keys true)]
+                 (cond
+                   ;; wait for the page to finish loading before evaluating
+                   (= "Page.loadEventFired" (:method msg))
+                   (js/setTimeout #(send! "Runtime.evaluate"
+                                          {:expression (first @pending) :returnByValue true})
+                                  300)
+
+                   (and (:result msg) (get-in msg [:result :result]))
+                   ;; An expression that THREW must not read as a nil value:
+                   ;; that is how a page which never loaded looked like a page
+                   ;; whose element happened to be empty (measured 2026-09-09,
+                   ;; against a dev server that was still compiling).
+                   (do (swap! results conj (if (get-in msg [:result :exceptionDetails])
+                                             (str "THREW: " (get-in msg [:result :result :description]))
+                                             (get-in msg [:result :result :value])))
+                       (swap! pending rest)
+                       (if (seq @pending)
+                         (send! "Runtime.evaluate" {:expression (first @pending) :returnByValue true})
+                         (do (.close sock) (resolve @results))))
+                   :else nil))))))))
+
+;; --- main -----------------------------------------------------------------
+
+(defn main []
+  (when-not (zero? (:exit (sh "kotoba" ["--help"])))
+    (refuse! "the kotoba CLI is not runnable here (measured by running it, not by `which`)"))
+  (let [binary (browser-binary)]
+    (when-not binary (refuse! "no Chromium-family browser found:" (str/join ", " browsers)))
+    (let [dir (fs/mkdtempSync (path/join (os/tmpdir) "kotoba-build-acc-"))
+          cfg-file (write-config! dir)
+          dist (path/join dir "dist")
+          built (sh "nbb" [(path/join repo-root "bin" "kotoba_build.cljk") cfg-file])]
+      (check! "the build exits 0" 0 (:exit built))
+      (when-not (zero? (:exit built)) (println (:out built) (:err built)))
+      (check! "the bundle is written" true (fs/existsSync (path/join dist "app.mjs")))
+      (check! "the shell is written" true (fs/existsSync (path/join dist "index.html")))
+      (check! "the driver the shell imports is written" true
+              (fs/existsSync (path/join dist "dom-driver.mjs")))
+      (let [manifest (edn/read-string (fs/readFileSync (path/join dist "build-manifest.edn") "utf8"))
+            bundle (first (filter #(= "app.mjs" (:path %)) (:outputs manifest)))]
+        (check! "the manifest names the entry" "index.html" (:entry manifest))
+        ;; the digest is of the file that is actually there, not of what the
+        ;; build meant to write
+        (check! "the manifest's bundle size is the file's size"
+                (.-size (fs/statSync (path/join dist "app.mjs")))
+                (:bytes bundle)))
+      ;; serve it with the repo's own dev server, then look at it
+      (let [server (cp/spawn "nbb" #js[(path/join repo-root "bin" "kotoba_build.cljk")
+                                       cfg-file "--mode" "dev" "--port" (str port)]
+                             #js {:stdio "ignore"})
+            profile (path/join dir "browser-profile")
+            browser (launch-browser! binary profile)]
+        (-> (wait-http (str "http://127.0.0.1:" port "/") 180)
+            (.then (fn [up]
+                     (when-not up
+                       (.kill server) (.kill browser)
+                       (refuse! "the dev server never answered on port" port))
+                     (devtools-url profile 60)))
+            (.then (fn [base]
+                     (when-not base (refuse! "the browser never wrote DevToolsActivePort"))
+                     (js/fetch (str base "/json/list"))))
+            (.then (fn [r] (.json r)))
+            (.then (fn [targets]
+                     (let [t (first (filter #(= "page" (:type %))
+                                            (js->clj targets :keywordize-keys true)))]
+                       (when-not t (refuse! "the browser exposed no page target"))
+                       (ws-eval (:webSocketDebuggerUrl t)
+                                (str "http://127.0.0.1:" port "/")
+                                [;; that the page under test is the page that loaded
+                                 "document.title"
+                                 ;; what the guest drew
+                                 "document.querySelector('#app main output').textContent"
+                                 "document.querySelectorAll('#app button').length"
+                                 ;; the click the driver has to carry back
+                                 "document.querySelector('#app [data-k=\"inc\"]').click(), document.querySelector('#app main output').textContent"
+                                 "document.querySelector('#app [data-k=\"inc\"]').click(), document.querySelector('#app main output').textContent"
+                                 "document.querySelector('#app [data-k=\"dec\"]').click(), document.querySelector('#app main output').textContent"
+                                 "document.querySelector('#app [data-k=\"reset\"]').click(), document.querySelector('#app main output').textContent"
+                                 "document.querySelector('#app h1').textContent"])))) 
+            (.then (fn [[loaded initial buttons after-one after-two after-dec after-reset title]]
+                     (check! "the shell loaded" "Counter" loaded)
+                     (check! "the guest's view reached the DOM" "0" initial)
+                     (check! "every button the view names is there" 3 buttons)
+                     (check! "a click reaches the guest and comes back" "1" after-one)
+                     (check! "and again" "2" after-two)
+                     (check! "and the other direction" "1" after-dec)
+                     (check! "an event carrying an effect still updates the db" "0" after-reset)
+                     (check! "the label is the db's" "clicks" title)
+                     (.kill server) (.kill browser)
+                     (println (str "SCANNED\t" @checks))
+                     (println (if (zero? @failures)
+                                (str "kotoba-build acceptance: " @checks "/" @checks
+                                     " passed (built, served, and clicked in " (path/basename binary) ")")
+                                (str "kotoba-build acceptance: " (- @checks @failures) "/" @checks " FAILED")))
+                     (js/process.exit (if (zero? @failures) 0 1))))
+            (.catch (fn [e]
+                      (println "ERROR" (str e))
+                      (.kill server) (.kill browser)
+                      (js/process.exit 1))))))))
+
+(main)

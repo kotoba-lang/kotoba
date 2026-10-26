@@ -1,0 +1,221 @@
+#!/usr/bin/env kbb
+;; kotoba-build — perform a build that `kotoba/build_core.kotoba` decided.
+;;
+;; The division is the same one the rest of this workspace draws: the plan is a
+;; value the guest computes, and this file is the authority that acts on it.
+;; It spawns the compiler, writes files, measures bytes and serves a directory.
+;; It decides nothing about what a build IS -- not the step order, not the
+;; shell, not the manifest, not whether a title may go in a page.
+;;
+;;   kbb --backend sci bin/kotoba_build.cljk build.edn
+;;   kbb --backend sci bin/kotoba_build.cljk build.edn --mode dev     # ends by serving
+;;
+;; Exit codes: 0 built, 1 failed, 2 REFUSED (a tool needed to answer is
+;; missing, or the guest refused the config). A refusal is not a pass.
+
+(ns kotoba-build
+  (:require ["node:child_process" :as cp]
+            ["node:crypto" :as crypto]
+            ["node:fs" :as fs]
+            ["node:http" :as http]
+            ["node:os" :as os]
+            ["node:path" :as path]
+            [clojure.edn :as edn]
+            [kotoba.lang.text :as str]))
+
+(def script
+  (or (first (filter (fn [a] (or (.endsWith a ".cljk") (.endsWith a ".cljs")))
+                     (rest (.slice js/process.argv 0))))
+      "bin/kotoba_build.cljk"))
+
+(def repo-root (path/resolve (path/dirname (path/resolve script)) ".."))
+
+(defn- die [code & msg]
+  (println (str/join " " (map str msg)))
+  (js/process.exit code))
+
+(defn- sh [cmd args]
+  (let [r (cp/spawnSync cmd (clj->js args) #js {:encoding "utf8" :timeout 900000})]
+    {:exit (.-status r) :out (or (.-stdout r) "") :err (or (.-stderr r) "")}))
+
+(defn- sha256 [buf]
+  (-> (crypto/createHash "sha256") (.update buf) (.digest "hex")))
+
+(defn- mkdirs [p]
+  (fs/mkdirSync p #js {:recursive true}))
+
+;; --- the tool's own guest -------------------------------------------------
+;;
+;; The build tool is itself a Kotoba module, so it has to be compiled before it
+;; can plan anything. Cached by the SOURCE digest: a stale cache would answer
+;; with yesterday's plan and look exactly like today's.
+
+(defn- tool-artifact []
+  (let [src (path/join repo-root "kotoba" "build_core.kotoba")
+        digest (subs (sha256 (fs/readFileSync src)) 0 16)
+        dir (path/join (os/tmpdir) (str "kotoba-build-tool-" digest))
+        out (path/join dir "build_core.mjs")]
+    (if (fs/existsSync out)
+      out
+      (do (mkdirs dir)
+          (let [c (sh "kotoba" ["-M" "compile" src "--target" "js" "--output" out])]
+            (when-not (zero? (:exit c))
+              (die 1 "compiling the build tool failed:" (:err c)))
+            out)))))
+
+;; --- config ---------------------------------------------------------------
+
+(defn- absolutise [base cfg]
+  (let [abs (fn [p] (path/resolve base p))]
+    (-> cfg
+        (update :entry abs)
+        (update :out abs)
+        (update :source-paths (fn [ps] (mapv abs ps)))
+        (update :amu-runtime abs))))
+
+(defn- read-config [file mode-override]
+  (let [base (path/dirname (path/resolve file))
+        cfg (edn/read-string (fs/readFileSync (path/resolve file) "utf8"))
+        cfg (cond-> cfg mode-override (assoc :mode mode-override))]
+    (absolutise base cfg)))
+
+;; --- performing a step ----------------------------------------------------
+
+(defn- step-module-lock [args]
+  (mkdirs (path/dirname (:lock args)))
+  (let [r (sh "kotoba" (concat ["-M" "module-lock" (:entry args)]
+                               (mapcat (fn [p] ["--source-path" p]) (:source-paths args))
+                               ["--blocks" (:blocks args) "--output" (:lock args)]))]
+    (when-not (zero? (:exit r)) (die 1 "module-lock failed:" (:err r)))
+    (println "  module-lock" (path/basename (:lock args)))))
+
+(defn- step-compile [args]
+  (mkdirs (path/dirname (:output args)))
+  (let [r (sh "kotoba" ["-M" "compile" "--module-lock" (:lock args)
+                        "--blocks" (:blocks args)
+                        "--target" (:target args) "--output" (:output args)])]
+    (when-not (zero? (:exit r)) (die 1 "compile failed:" (:err r)))
+    (println "  compile   " (path/basename (:output args)) (str (.-size (fs/statSync (:output args))) " bytes"))))
+
+(defn- step-runtime [args amu-runtime]
+  (doseq [a (:assets args)]
+    (let [from (path/join amu-runtime (:asset a))]
+      (when-not (fs/existsSync from)
+        (die 2 (str "REFUSED: the driver this shell imports is not at " from
+                    " -- set :amu-runtime to a checked-out kotoba-lang/amu")))
+      (mkdirs (path/dirname (:output a)))
+      (fs/copyFileSync from (:output a))
+      (println "  runtime   " (:asset a) (str (.-size (fs/statSync (:output a))) " bytes")))))
+
+(defn- step-write [args]
+  (mkdirs (path/dirname (:path args)))
+  (fs/writeFileSync (:path args) (:content args))
+  (println "  write     " (path/basename (:path args))))
+
+(defn- outputs-of
+  "What the build produced, measured. Measuring is mechanism; what the record
+  MEANS is the guest's."
+  [out-dir]
+  (->> (fs/readdirSync out-dir)
+       (remove #(= % ".build"))
+       (sort)
+       (mapv (fn [name]
+               (let [p (path/join out-dir name)
+                     buf (fs/readFileSync p)]
+                 {:path name :bytes (.-length buf) :sha256 (sha256 buf)})))))
+
+(defn- step-manifest [args cfg call]
+  (let [outputs (outputs-of (:out cfg))
+        text (call "manifest-text" (pr-str cfg) (pr-str outputs))]
+    (fs/writeFileSync (:path args) (str text "\n"))
+    (println "  manifest  " (path/basename (:path args)) (str (count outputs) " outputs"))))
+
+(def ^:private content-types
+  {".html" "text/html; charset=utf-8"
+   ".mjs" "text/javascript; charset=utf-8"
+   ".js" "text/javascript; charset=utf-8"
+   ".css" "text/css; charset=utf-8"
+   ".edn" "application/edn; charset=utf-8"
+   ".wasm" "application/wasm"})
+
+(defn- step-serve [args port]
+  ;; A dev server, not a watcher: nothing rebuilds yet when a source changes.
+  ;; Saying so is the point -- a server that silently serves yesterday's
+  ;; bundle is the failure this whole repo is about.
+  (let [dir (:dir args)
+        srv (http/createServer
+             (fn [req res]
+               (let [url (first (str/split (.-url req) #"\?"))
+                     rel (if (= url "/") (:open args) (subs url 1))
+                     file (path/join dir rel)]
+                 (if (and (str/starts-with? (path/resolve file) (path/resolve dir))
+                          (fs/existsSync file)
+                          (.isFile (fs/statSync file)))
+                   (do (.writeHead res 200 (clj->js {"content-type" (get content-types (path/extname file)
+                                                                        "application/octet-stream")
+                                                     "cache-control" "no-store"}))
+                       (.end res (fs/readFileSync file)))
+                   (do (.writeHead res 404 #js {"content-type" "text/plain"})
+                       (.end res "not found\n"))))))]
+    (.on srv "error"
+         (fn [e]
+           ;; A port already held is the ordinary case when a previous dev
+           ;; server was left running, and a raw EADDRINUSE stack says so in
+           ;; the least useful way available.
+           (if (= "EADDRINUSE" (.-code e))
+             (die 2 (str "REFUSED: port " port " is already in use --"
+                         " another dev server is probably still running"))
+             (die 1 (str "serve failed: " (.-message e))))))
+    (.listen srv port)
+    (println (str "  serve      http://127.0.0.1:" port "/  (ctrl-c to stop; no watch yet)"))))
+
+;; --- main -----------------------------------------------------------------
+
+(defn- guest-call
+  "A synchronous call into the tool's own guest. The module is imported once,
+  and every call gets a FRESH instance: fuel is spent and never replenished,
+  and the guest is pure, so nothing is carried between calls."
+  [mod]
+  (fn [export & args]
+    (let [inst (.instantiateKotoba mod)]
+      (.apply (aget inst export) inst (clj->js args)))))
+
+(defn- perform! [cfg steps call port]
+  (doseq [s steps]
+    (let [[id args] s]
+      (case id
+        :refuse (die 1 (str "REFUSED by the build: " (:why args) " " (pr-str (:what args))))
+        :module-lock (step-module-lock args)
+        :compile (step-compile args)
+        :runtime (step-runtime args (:amu-runtime cfg))
+        :write (step-write args)
+        :manifest (step-manifest args cfg call)
+        :serve (step-serve args port)
+        (die 1 (str "no performer for build step " id))))))
+
+(defn- flag-value [argv name fallback]
+  (let [i (.indexOf (clj->js argv) name)]
+    (if (>= i 0) (nth argv (inc i) fallback) fallback)))
+
+(defn main []
+  (let [argv (vec (rest (rest (rest (.slice js/process.argv 0)))))
+        file (first (remove (fn [a] (str/starts-with? a "--")) argv))
+        mode (when (>= (.indexOf (clj->js argv) "--mode") 0)
+               (keyword (flag-value argv "--mode" "release")))
+        port (js/parseInt (flag-value argv "--port" "8788"))]
+    (when-not file (die 2 "REFUSED: no build.edn given"))
+    (when-not (zero? (:exit (sh "kotoba" ["--help"])))
+      (die 2 "REFUSED: the kotoba CLI is not runnable here (measured by running it, not by `which`)"))
+    (let [cfg (read-config file mode)
+          artifact (tool-artifact)]
+      (println (str "kotoba-build " (:app cfg) " -> " (:out cfg) " (" (name (:mode cfg :release)) ")"))
+      (-> (js/import artifact)
+          (.then (fn [mod]
+                   (let [call (guest-call mod)
+                         steps (edn/read-string (call "plan-text" (pr-str cfg)))]
+                     (perform! cfg steps call port)
+                     (println "kotoba-build: ok")
+                     (when-not (= :dev (:mode cfg :release)) (js/process.exit 0)))))
+          (.catch (fn [e] (die 1 "build failed:" (str e))))))))
+
+(main)
