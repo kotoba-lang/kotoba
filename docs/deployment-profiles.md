@@ -3,6 +3,11 @@
 See also `kotoba-lang/security/docs/deployment-profiles.md` for the cross-repo
 claim table. This file is the language-runtime operator view.
 
+OS distribution is independent of this assurance axis. AIUEOS is the common
+OS foundation; AWAI OS is its Awai composition in the same AIUEOS repository.
+Choosing it does not select `regulated` or change Kotoba capabilities. See
+[AIUEOS distributions](https://github.com/kotoba-lang/aiueos/tree/main/distributions).
+
 | Profile | Default stance |
 |---------|----------------|
 | `research` | capability confinement + fuel; network allowlist required by default |
