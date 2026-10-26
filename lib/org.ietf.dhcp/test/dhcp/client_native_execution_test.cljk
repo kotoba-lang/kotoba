@@ -1,0 +1,114 @@
+;; Does `client_core.kotoba` RUN, and does it answer correctly?
+;;
+;; The parity suite next door answers "does the KIR interpreter agree with
+;; dhcp.client". This one signs the artifact, measures the runtime, builds a
+;; loader and executes machine code on this CPU, then compares.
+;;
+;; What it asks about is the two decisions a client gets wrong expensively: a
+;; reply carrying somebody else's transaction id, and the lease timers. On a
+;; shared segment the first is every DHCP conversation happening nearby; the
+;; second decides when the address stops being yours.
+;;
+;; It FAILS rather than skips when it cannot run. A native-execution test that
+;; passes where nothing executed reports the strongest claim in the repository
+;; on the strength of having done nothing.
+;;
+;; The probe is flattened from client_core rather than requiring it (process
+;; and ISA targets do not link multi-module projects, amu#611/#612), and the
+;; packing multiplies rather than shifting, because bit-or shares an admission
+;; set with the shifts and this module has :bool parameters -- the pair the
+;; native target refuses. Base 16 by multiplication is the same packing without
+;; the operation.
+
+(ns dhcp.client-native-execution-test
+  (:require [clojure.java.io :as io]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is]]
+            [kotoba.compiler.atomic-output :as atomic-output]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.artifact.runtime-identity :as runtime-identity]
+            [kotoba.verifier.signing :as signing]
+            [kototama.native.executor :as executor]
+            [dhcp.client :as client]))
+
+(def ^:private source-file
+  (io/file (System/getProperty "user.dir") "kotoba" "dhcp" "client_core.kotoba"))
+
+(defn- loader-source-dir
+  "tools/kexe_loader.c lives in the compiler's repository and is not on the
+  classpath (amu#614), so this finds the repository through a resource that is
+  and walks up to it. Needs the dependency to be an exploded git checkout."
+  []
+  (when-let [r (io/resource "kotoba/compiler/core.clj")]
+    (when (= "file" (.getProtocol r))
+      (let [root (->> (io/file (.getPath r))
+                      (iterate #(.getParentFile ^java.io.File %))
+                      (take 5) last)
+            dir (io/file root "tools")]
+        (when (.isFile (io/file dir "kexe_loader.c")) (.getPath dir))))))
+
+;; A foreign xid must be refused (1), an ACK in :requesting with an address
+;; must bind (4), T1 of a one-hour lease is 1800000 ms and T2 is 3150000.
+;; Packed base-16 for the two small codes, then the timers added on top with
+;; room to spare.
+(def ^:private entry
+  (str "\n(defn main [] :i64\n"
+       "  (+ (receive-verdict 1 2 true false true)\n"
+       "     (+ (* 16 (receive-verdict 2 5 true true true))\n"
+       "        (+ (* 256 (t1-ms 0 3600))\n"
+       "           (* 1099511627776 (t2-ms 0 3600))))))\n"))
+
+(defn- oracle []
+  (let [cfg client/default-config
+        t1 (var-get #'dhcp.client/t1-ms)
+        t2 (var-get #'dhcp.client/t2-ms)
+        lease {:dhcp/lease-seconds 3600}]
+    (+ 1                                   ; foreign xid -> rcv-foreign-xid
+       (* 16 4)                            ; ack in :requesting with address -> bound
+       (* 256 (t1 lease cfg))
+       (* 1099511627776 (t2 lease cfg)))))
+
+(defn- probe-source []
+  (let [src (slurp source-file)
+        open (str/index-of src "(ns dhcp.client-core")
+        close (str/index-of src "]))" open)]
+    (is (and open close)
+        "client_core.kotoba's ns form is not in the shape this test flattens")
+    (str (subs src 0 open) "(ns probe (:export [main]))" (subs src (+ close 3))
+         entry)))
+
+(def ^:private target
+  (if (contains? #{"aarch64" "arm64"} (.toLowerCase (System/getProperty "os.arch")))
+    :aarch64-kotoba-v1
+    :x86_64-kotoba-v1))
+
+(deftest client-core-runs-as-machine-code-and-agrees
+  (is (.exists source-file) (str "kotoba object not found at " source-file))
+  (let [dir (loader-source-dir)]
+    (is dir "the reviewed loader source was not found (see amu#614)")
+    (when (and dir (.exists source-file))
+      (let [artifact (:artifact (compiler/compile-source (probe-source) target
+                                                         {:allow #{}}))
+            k (signing/generate-keypair)
+            envelope (signing/sign artifact k {:not-before 1000 :expires 2000})
+            measured (executor/measure-runtime {:loader-source-dir dir})
+            loader (doto (java.io.File/createTempFile "kotoba-loader-" "")
+                     (.deleteOnExit))
+            _ (atomic-output/write-bytes! (.getPath loader) (:loader-bytes measured)
+                                          {:executable? true})
+            trust {:format :kotoba.trust/v1 :trusted-signers #{(:signer k)}
+                   :revoked-signers #{} :revoked-artifacts #{}
+                   :trusted-runtime-sha256
+                   #{(runtime-identity/identity-sha256 (:runtime measured))}}
+            {:keys [evidence]} (executor/execute envelope trust {:allow #{}}
+                                                 {:args []}
+                                                 {:now 1500 :entry 'main
+                                                  :runtime (:runtime measured)
+                                                  :loader-path (.getPath loader)})]
+        (is (= :native (get-in evidence [:runtime :target-profile :execution]))
+            "the artifact must have executed as machine code, not been interpreted")
+        (is (= :ok (:status evidence))
+            (str "native execution did not succeed: " (pr-str (:status evidence))))
+        (is (= (oracle) (:result evidence))
+            (str "machine code returned " (:result evidence)
+                 " and dhcp.client says " (oracle)))))))

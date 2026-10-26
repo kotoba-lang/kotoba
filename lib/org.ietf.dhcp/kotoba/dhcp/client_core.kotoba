@@ -1,0 +1,117 @@
+;; RFC 2131 DHCP client decisions, as safe Kotoba.
+;;
+;; The decision core of `dhcp.client`: which state an event moves the client
+;; to, when the lease timers fire, and how far the retransmission backoff has
+;; walked. Encoding and decoding packets stay in .cljc -- those walk byte
+;; vectors, and the decisions are the same either way.
+;;
+;; Message-type codes are RFC 2131's own wire values, not a private numbering.
+;; A client that invents its own would need a translation table, which is a
+;; place for the two to disagree.
+;;
+;; The lease fractions are the reason this is expressible at all. RFC 2131 puts
+;; T1 at half the lease and T2 at seven eighths, and both are dyadic: the .cljc
+;; multiplies by 0.5 and 0.875 as doubles and truncates, and `(quot ms 2)` and
+;; `(quot (* ms 7) 8)` give the same integer for every lease a client can hold.
+;; That is exactness, not approximation, and the parity suite checks it over
+;; the whole range rather than asserting it here.
+;;
+;; Checked against `dhcp.client` in test/dhcp/client_kotoba_parity_test.cljk.
+
+(ns dhcp.client-core
+  (:export [backoff t1-ms t2-ms lease-deadline attempts-exhausted?
+            receive-verdict timeout-verdict]))
+
+(def st-init 0)
+(def st-selecting 1)
+(def st-requesting 2)
+(def st-bound 3)
+(def st-renewing 4)
+(def st-rebinding 5)
+
+;; RFC 2131 option 53 values.
+(def msg-discover 1)
+(def msg-offer 2)
+(def msg-request 3)
+(def msg-decline 4)
+(def msg-ack 5)
+(def msg-nak 6)
+(def msg-release 7)
+(def msg-inform 8)
+
+(def rcv-undecodable 0)
+(def rcv-foreign-xid 1)
+(def rcv-nak 2)
+(def rcv-offer-accepted 3)
+(def rcv-ack-bound 4)
+(def rcv-no-address 5)
+(def rcv-wrong-type-for-state 6)
+
+(def to-lease-expired 0)
+(def to-renew 1)
+(def to-rebind 2)
+(def to-gave-up 3)
+(def to-retry-discover 4)
+(def to-retry-request 5)
+(def to-nothing 6)
+
+(defn- imin [a :i64 b :i64] :i64 (if (< a b) a b))
+
+;; §4.1: four seconds, doubled each time, capped at sixty-four. The
+;; randomisation the RFC also asks for belongs to the caller -- this namespace
+;; has no randomness, and a decision core that invented some would not be a
+;; decision core.
+(defn backoff [current-ms :i64 initial-ms :i64 max-ms :i64] :i64
+  (if (= current-ms 0) (imin (* 2 initial-ms) max-ms)
+      (imin (* 2 current-ms) max-ms)))
+
+;; 0 means the server named nothing. A server-supplied renewal time wins; the
+;; fraction is the fallback.
+(defn t1-ms [renewal-seconds :i64 lease-seconds :i64] :i64
+  (if (> renewal-seconds 0) (* renewal-seconds 1000)
+      (if (> lease-seconds 0) (quot (* lease-seconds 1000) 2) 0)))
+
+(defn t2-ms [rebinding-seconds :i64 lease-seconds :i64] :i64
+  (if (> rebinding-seconds 0) (* rebinding-seconds 1000)
+      (if (> lease-seconds 0) (quot (* lease-seconds 7000) 8) 0)))
+
+(defn lease-deadline [bound-ms :i64 lease-seconds :i64] :i64
+  (if (> lease-seconds 0) (+ bound-ms (* lease-seconds 1000)) 0))
+
+(defn attempts-exhausted? [attempts :i64 max-attempts :i64] :bool
+  (>= attempts max-attempts))
+
+;; The xid check is what keeps a shared segment from driving this client's
+;; state machine: without it any broadcast near it can, and on a LAN that is
+;; every DHCP conversation happening nearby.
+;;
+;; A NAK returns to init and drops the lease from every state that can receive
+;; one. Keeping the address after being told it is not ours is the case where
+;; two hosts hold the same address and neither knows.
+(defn receive-verdict
+  [state :i64 msg-type :i64 decodable? :bool xid-matches? :bool
+   has-address? :bool] :i64
+  (if (not decodable?) rcv-undecodable
+      (if (not xid-matches?) rcv-foreign-xid
+          (if (= msg-type msg-nak) rcv-nak
+              (if (and (= state st-selecting) (= msg-type msg-offer))
+                (if has-address? rcv-offer-accepted rcv-no-address)
+                (if (and (= msg-type msg-ack)
+                         (or (= state st-requesting)
+                             (or (= state st-renewing) (= state st-rebinding))))
+                  (if has-address? rcv-ack-bound rcv-no-address)
+                  rcv-wrong-type-for-state))))))
+
+;; Expiry outranks everything: a lease that outlived its own end is gone
+;; whatever else is due. Then T1, then T2, then the per-state retransmission.
+(defn timeout-verdict
+  [state :i64 expired? :bool past-t1? :bool past-t2? :bool exhausted? :bool] :i64
+  (if expired? to-lease-expired
+      (if (and (= state st-bound) past-t1?) to-renew
+          (if (and (= state st-renewing) past-t2?) to-rebind
+              (if (= state st-selecting)
+                (if exhausted? to-gave-up to-retry-discover)
+                (if (or (= state st-requesting)
+                        (or (= state st-renewing) (= state st-rebinding)))
+                  to-retry-request
+                  to-nothing))))))

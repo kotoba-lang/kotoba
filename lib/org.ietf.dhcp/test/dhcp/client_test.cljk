@@ -1,0 +1,163 @@
+(ns dhcp.client-test
+  (:require [dhcp.client :as c]
+            [dhcp.wire :as w]
+            [kotoba.test :refer [deftest is testing]]))
+
+(def chaddr [0x52 0x54 0x00 0x12 0x34 0x56])
+(def xid 0xdeadbeef)
+(defn- client [] (c/init {:chaddr chaddr :xid xid}))
+
+(defn- reply
+  "A server reply of TYPE, with the given xid, built by hand."
+  [type & {:keys [x yiaddr lease-secs t1 t2]
+           :or {x [0xde 0xad 0xbe 0xef] yiaddr [192 168 1 50] lease-secs 3600}}]
+  (vec (concat [2 1 6 0] x [0 0] [0 0]
+               [0 0 0 0] yiaddr [0 0 0 0] [0 0 0 0]
+               chaddr (repeat 10 0) (repeat 64 0) (repeat 128 0)
+               w/magic-cookie
+               [53 1 (w/message-type-codes type)]
+               [54 4 192 168 1 1]
+               [51 4 (bit-and (bit-shift-right lease-secs 24) 0xff)
+                (bit-and (bit-shift-right lease-secs 16) 0xff)
+                (bit-and (bit-shift-right lease-secs 8) 0xff)
+                (bit-and lease-secs 0xff)]
+               (when t1 [58 4 0 0 (bit-and (bit-shift-right t1 8) 0xff) (bit-and t1 0xff)])
+               (when t2 [59 4 0 0 (bit-and (bit-shift-right t2 8) 0xff) (bit-and t2 0xff)])
+               [255])))
+
+(defn- run [st & events]
+  (reduce (fn [acc e] (c/step (:state acc) e)) {:state st} events))
+
+;; ── the happy path ────────────────────────────────────────────────────────
+
+(deftest start-broadcasts-a-discover
+  (let [r (c/step (client) {:kind :start :now-ms 0})]
+    (is (= :selecting (:dhcp/state (:state r))))
+    (is (= 1 (count (:send r))))
+    (is (= :discover (:dhcp/message-type (w/decode (assoc (vec (first (:send r))) 0 2)))))
+    (is (= 4000 (:arm-ms r)) "RFC 2131 4s initial backoff")))
+
+(deftest an-offer-is-answered-with-a-request
+  (let [r (run (client) {:kind :start :now-ms 0}
+               {:kind :receive :bytes (reply :offer) :now-ms 10})]
+    (is (= :requesting (:dhcp/state (:state r))))
+    (is (= :request (:dhcp/message-type (w/decode (assoc (vec (first (:send r))) 0 2)))))))
+
+(deftest an-ack-binds-the-lease
+  (let [r (run (client) {:kind :start :now-ms 0}
+               {:kind :receive :bytes (reply :offer) :now-ms 10}
+               {:kind :receive :bytes (reply :ack) :now-ms 20})
+        st (:state r)]
+    (is (= :bound (:dhcp/state st)))
+    (is (= [192 168 1 50] (c/bound-address st)))
+    (is (= (+ 20 3600000) (:dhcp/expires-at st)))
+    (is (= (+ 20 1800000) (:dhcp/t1-at st)) "T1 defaults to half the lease")))
+
+(deftest an-address-is-not-yours-until-the-ack
+  (let [r (run (client) {:kind :start :now-ms 0}
+               {:kind :receive :bytes (reply :offer) :now-ms 10})]
+    (is (nil? (c/bound-address (:state r)))
+        "the offer named an address; :requesting does not own it")))
+
+;; ── what it refuses ───────────────────────────────────────────────────────
+
+(deftest a-reply-for-someone-elses-transaction-changes-nothing
+  (let [started (c/step (client) {:kind :start :now-ms 0})
+        r (c/step (:state started) {:kind :receive :bytes (reply :offer :x [1 2 3 4]) :now-ms 5})]
+    (is (= :foreign-xid (:ignored r)))
+    (is (= :selecting (:dhcp/state (:state r)))
+        "on a shared LAN this is every other DHCP conversation on the segment")))
+
+(deftest an-undecodable-packet-changes-nothing-and-says-why
+  (let [started (c/step (client) {:kind :start :now-ms 0})
+        r (c/step (:state started) {:kind :receive :bytes (vec (repeat 10 0)) :now-ms 5})]
+    (is (= :undecodable (:ignored r)))
+    (is (= :too-short (:dhcp/error r)))))
+
+(deftest a-nak-drops-the-lease-from-every-state-that-can-get-one
+  (doseq [[label st] [[:requesting (:state (run (client) {:kind :start :now-ms 0}
+                                                {:kind :receive :bytes (reply :offer) :now-ms 1}))]
+                      [:bound (:state (run (client) {:kind :start :now-ms 0}
+                                           {:kind :receive :bytes (reply :offer) :now-ms 1}
+                                           {:kind :receive :bytes (reply :ack) :now-ms 2}))]]]
+    (let [r (c/step st {:kind :receive :bytes (reply :nak) :now-ms 100})]
+      (is (= :init (:dhcp/state (:state r))) (str label " -> :init"))
+      (is (true? (:dhcp/naked? r)))
+      (is (nil? (c/bound-address (:state r)))
+          "keeping the address is how two hosts hold one address and neither knows"))))
+
+(deftest an-ack-in-selecting-is-the-wrong-type-for-the-state
+  (let [started (c/step (client) {:kind :start :now-ms 0})
+        r (c/step (:state started) {:kind :receive :bytes (reply :ack) :now-ms 5})]
+    (is (= :wrong-type-for-state (:ignored r)))))
+
+(deftest an-offer-with-no-address-is-ignored
+  (let [started (c/step (client) {:kind :start :now-ms 0})
+        r (c/step (:state started) {:kind :receive :bytes (reply :offer :yiaddr [0 0 0 0]) :now-ms 5})]
+    (is (= :no-address-in-message (:ignored r)))))
+
+;; ── timers ────────────────────────────────────────────────────────────────
+
+(deftest discover-backs-off-and-eventually-gives-up
+  (let [start (c/step (client) {:kind :start :now-ms 0})]
+    (loop [st (:state start) n 1 last-arm 4000]
+      (let [r (c/step st {:kind :timeout :now-ms (* n 1000)})]
+        (cond
+          (:dhcp/gave-up? r)
+          (do (is (= :init (:dhcp/state (:state r))))
+              (is (= 6 n) "max-discover-attempts"))
+          :else
+          (do (is (>= (:arm-ms r) last-arm) "backoff never shrinks")
+              (is (<= (:arm-ms r) 64000) "and is capped")
+              (recur (:state r) (inc n) (:arm-ms r))))))))
+
+(deftest t1-moves-a-bound-client-to-renewing-and-unicasts
+  (let [bound (:state (run (client) {:kind :start :now-ms 0}
+                           {:kind :receive :bytes (reply :offer) :now-ms 1}
+                           {:kind :receive :bytes (reply :ack) :now-ms 2}))
+        r (c/step bound {:kind :timeout :now-ms (+ 2 1800000)})
+        sent (w/decode (assoc (vec (first (:send r))) 0 2))]
+    (is (= :renewing (:dhcp/state (:state r))))
+    (is (= [192 168 1 50] (:dhcp/ciaddr sent))
+        "renewal is unicast from the leased address, not a broadcast for a new one")))
+
+(deftest t2-moves-a-renewing-client-to-rebinding-and-broadcasts
+  (let [bound (:state (run (client) {:kind :start :now-ms 0}
+                           {:kind :receive :bytes (reply :offer) :now-ms 1}
+                           {:kind :receive :bytes (reply :ack) :now-ms 2}))
+        renewing (:state (c/step bound {:kind :timeout :now-ms (+ 2 1800000)}))
+        r (c/step renewing {:kind :timeout :now-ms (+ 2 3150000)})
+        sent (w/decode (assoc (vec (first (:send r))) 0 2))]
+    (is (= :rebinding (:dhcp/state (:state r))))
+    (is (= [0 0 0 0] (:dhcp/ciaddr sent)) "rebinding asks anyone, not the old server")))
+
+(deftest an-expired-lease-is-given-up-not-renewed-in-place
+  (let [bound (:state (run (client) {:kind :start :now-ms 0}
+                           {:kind :receive :bytes (reply :offer) :now-ms 1}
+                           {:kind :receive :bytes (reply :ack) :now-ms 2}))
+        r (c/step bound {:kind :timeout :now-ms (+ 2 3600001)})]
+    (is (true? (:dhcp/expired? r)))
+    (is (= :init (:dhcp/state (:state r))))
+    (is (nil? (c/bound-address (:state r)))
+        "an expired lease is an address someone else may now hold")))
+
+(deftest a-server-supplied-t1-overrides-the-default-fraction
+  (let [r (run (client) {:kind :start :now-ms 0}
+               {:kind :receive :bytes (reply :offer) :now-ms 1}
+               {:kind :receive :bytes (reply :ack :t1 600) :now-ms 2})]
+    (is (= (+ 2 600000) (:dhcp/t1-at (:state r))))))
+
+(deftest release-gives-the-address-back
+  (let [bound (:state (run (client) {:kind :start :now-ms 0}
+                           {:kind :receive :bytes (reply :offer) :now-ms 1}
+                           {:kind :receive :bytes (reply :ack) :now-ms 2}))
+        r (c/step bound {:kind :release :now-ms 100})]
+    (is (= :init (:dhcp/state (:state r))))
+    (is (= :release (:dhcp/message-type (w/decode (assoc (vec (first (:send r))) 0 2)))))))
+
+(deftest every-ignore-reason-is-in-the-declared-set
+  (let [started (:state (c/step (client) {:kind :start :now-ms 0}))]
+    (doseq [b [(reply :offer :x [1 2 3 4]) (vec (repeat 10 0)) (reply :ack)
+               (reply :offer :yiaddr [0 0 0 0])]]
+      (let [i (:ignored (c/step started {:kind :receive :bytes b :now-ms 1}))]
+        (when i (is (contains? c/ignore-reasons i) (str "undeclared: " i)))))))
