@@ -1,0 +1,220 @@
+(ns mls.crypto
+  "MLS's labelled cryptographic operations — [RFC 9420](https://www.rfc-editor.org/rfc/rfc9420)
+  §5.1.3, §5.2 and §8.
+
+  Every one of these is an ordinary primitive with a **label and a context
+  serialised into its input**. That is the whole idea: a value produced for
+  one purpose must not verify or decrypt for another, and the way MLS
+  guarantees it is to make the purpose part of what gets hashed.
+
+  The `\"MLS 1.0 \"` prefix does the same job one level up — it separates MLS
+  from any other protocol that labels its KDF inputs the same way. It is not
+  optional and it is not cosmetic; dropping it is a change no test of MLS
+  against itself can see."
+  (:require [ecc.bignum :as bn]
+            [ecc.ecdsa :as ecdsa]
+            [ecc.result :as ecc-r]
+            [ed25519.sign :as ed]
+            [hpke.core :as hpke]
+            [hpke.kdf :as hkdf]
+            [mls.result :as r :refer [ok error]]
+            [mls.varint :as v]))
+
+(def version-label "MLS 1.0 ")
+
+(defn- ascii
+  "ASCII bytes. Not `(map int s)`: that is code points on the JVM and a vector
+  of zeros under ClojureScript. `hpke.kdf/ascii` documents the trap, and it
+  was walked into three times in one afternoon by code written to avoid it."
+  [s]
+  #?(:clj (mapv #(bit-and (int %) 0xFF) (.getBytes ^String s "US-ASCII"))
+     :cljs (mapv #(.charCodeAt s %) (range (count s)))))
+
+(defn ascii-bytes
+  "ASCII bytes of a string, for callers that need a byte context rather than a
+  label. Public because `mls.secret-tree` builds the `left`/`right` contexts
+  of §9 and must not reach for `(map int s)` -- code points on the JVM, zeros
+  under ClojureScript."
+  [s] (ascii s))
+
+(defn- labelled
+  "`\"MLS 1.0 \" || label`.
+
+  Strings only. An earlier version also took raw bytes, on the strength of the
+  working group's key-schedule vectors appearing to use 32 random bytes as an
+  `MLS-Exporter` label — the value is a 64-character hex string, and it was
+  read as hex. It is not. It is a **label that happens to look like hex**, and
+  the corpus passes it as text.
+
+  The generalisation ran fine and was needed by nothing. It is gone, because
+  an unexercised branch justified by a misreading is two problems at once."
+  [label] (ascii (str version-label label)))
+
+;; ── §5.2 RefHash ────────────────────────────────────────────────────────────
+
+(defn ref-hash
+  "`RefHash(label, value) = Hash(opaque label<V> || opaque value<V>)` — §5.2.
+
+  The labels MLS itself uses already carry the version prefix
+  (`\"MLS 1.0 KeyPackage Reference\"`), so this takes the label whole rather
+  than prefixing it. Two functions that both add `\"MLS 1.0 \"` would be one
+  too many."
+  [suite label value]
+  (r/let-ok [l (v/opaque (ascii label))
+             x (v/opaque value)]
+    (ok (vec ((:hash suite) (into l x))))))
+
+;; ── §8 the labelled KDF ─────────────────────────────────────────────────────
+
+(defn kdf-label
+  "The serialised `KDFLabel` of §8: `uint16 length || opaque label<V> ||
+  opaque context<V>`, with the label prefixed by `\"MLS 1.0 \"`."
+  [label context length]
+  (r/let-ok [l (v/opaque (labelled label))
+             c (v/opaque context)]
+    (ok (vec (concat [(bit-and (quot length 256) 0xFF) (bit-and length 0xFF)] l c)))))
+
+(defn extract
+  "`KDF.Extract(salt, ikm)` for the suite's KDF.
+
+  Exposed because the key schedule needs it directly -- RFC 9420 §8's diagram
+  alternates Extract and ExpandWithLabel, and hiding one of the two behind a
+  labelled wrapper would make the diagram unreadable in the code."
+  [suite salt ikm]
+  (hkdf/extract (:kdf suite) salt ikm))
+
+(defn expand-with-label
+  "`ExpandWithLabel(Secret, Label, Context, Length)` — §8."
+  [suite secret label context length]
+  (r/let-ok [info (kdf-label label context length)]
+    (let [x (hkdf/expand (:kdf suite) secret info length)]
+      (if (= :ok (:status x))
+        (ok (:bytes x))
+        (error :expand-failed {:mls/detail (:reason x)})))))
+
+(defn derive-secret
+  "`DeriveSecret(Secret, Label) = ExpandWithLabel(Secret, Label, \"\", KDF.Nh)`."
+  [suite secret label]
+  (expand-with-label suite secret label [] (:nh suite)))
+
+(defn derive-tree-secret
+  "`DeriveTreeSecret(Secret, Label, Generation, Length)` — §9.
+
+  The generation is a **big-endian uint32** used as the context. Not a
+  varint and not a decimal string: it is the only place in MLS where an
+  integer becomes a KDF context directly, and getting the width wrong
+  produces a key schedule that is self-consistent and shared with nobody."
+  [suite secret label generation length]
+  (expand-with-label suite secret label
+                     [(bit-and (quot generation 16777216) 0xFF)
+                      (bit-and (quot generation 65536) 0xFF)
+                      (bit-and (quot generation 256) 0xFF)
+                      (bit-and generation 0xFF)]
+                     length))
+
+;; ── §5.1.3 labelled HPKE ────────────────────────────────────────────────────
+
+(defn encrypt-context
+  "`EncryptContext { opaque label<V>; opaque context<V>; }` — §5.1.3. This is
+  HPKE's `info`, and the label carries the `\"MLS 1.0 \"` prefix."
+  [label context]
+  (r/let-ok [l (v/opaque (labelled label))
+             c (v/opaque context)]
+    (ok (into l c))))
+
+(defn encrypt-with-label
+  "`EncryptWithLabel` — §5.1.3. HPKE base mode, with the labelled context as
+  `info` and an **empty** AAD.
+
+  `eph` is the ephemeral key pair. Randomness is a capability and this is a
+  leaf, so it is taken rather than made — and a caller who reuses one is doing
+  so visibly."
+  [suite public-key label context plaintext eph]
+  (r/let-ok [info (encrypt-context label context)]
+    (let [s (hpke/seal-base (:hpke suite) public-key info [] plaintext eph)]
+      (if (= :ok (:status s))
+        (ok {:mls/kem-output (:enc s) :mls/ciphertext (:bytes s)})
+        (error :encrypt-failed {:mls/detail (:reason s)})))))
+
+(defn decrypt-with-label
+  "`DecryptWithLabel` — §5.1.3."
+  [suite key-pair label context kem-output ciphertext]
+  (r/let-ok [info (encrypt-context label context)]
+    (let [o (hpke/open-base (:hpke suite) kem-output key-pair info [] ciphertext)]
+      (if (= :ok (:status o))
+        (ok (:bytes o))
+        (error :decrypt-failed {:mls/detail (:reason o)})))))
+
+;; ── §5.1.2 labelled signatures ──────────────────────────────────────────────
+;;
+;; Two shapes, and RFC 9420 §5.1.2 names both: EdDSA signatures are the
+;; concatenation of R and S per RFC 8032, and ECDSA signatures are DER
+;; encoded, per RFC 8446. They are not interchangeable, and a library that
+;; produced one where the other was expected would produce something no peer
+;; accepts.
+;;
+;; Ed448 -- suites 4 and 6 -- has no implementation in this workspace, so
+;; those two suites sign with nothing. That is an absence with a name
+;; (`:unimplemented-signature-scheme`) rather than a missing branch.
+
+(defn sign-content
+  "`SignContent { opaque label<V>; opaque content<V>; }` — §5.1.2, with the
+  label prefixed by `\"MLS 1.0 \"`.
+
+  The same shape as `EncryptContext` and a **different** function: they carry
+  different labels for the same operation name, and MLS keeps two IANA
+  registries so that a value signed for one purpose cannot verify for
+  another."
+  [label content]
+  (r/let-ok [l (v/opaque (labelled label))
+             c (v/opaque content)]
+    (ok (into l c))))
+
+(defn sign-with-label
+  "`SignWithLabel(SignatureKey, Label, Content)` — §5.1.2.
+
+  `nonce` is used only by the ECDSA suites, where it is the per-signature `k`
+  and a repeat under one key reveals the private key. EdDSA derives its nonce
+  from the message and ignores this — which is exactly why the argument is
+  required rather than optional: a caller must not have to know which suite
+  needs randomness to use the function safely."
+  [suite private-key label content nonce]
+  (r/let-ok [msg (sign-content label content)]
+    (case (:signature suite)
+      :ed25519
+      (ok (vec (ed/sign (ed/secret-key! private-key) msg)))
+
+      (:ecdsa-secp256r1-sha256 :ecdsa-secp384r1-sha384 :ecdsa-secp521r1-sha512)
+      (let [c (:curve (:kem suite))
+            digest (vec ((:hash suite) msg))
+            s (ecdsa/sign c (bn/of-bytes private-key) nonce digest)]
+        (if (ecc-r/ok? s)
+          (ok (:ecc/bytes (ecc-r/val s)))
+          (error :sign-failed {:mls/detail (ecc-r/reason s)})))
+
+      (error :unimplemented-signature-scheme {:mls/scheme (:signature suite)}))))
+
+(defn verify-with-label
+  "`VerifyWithLabel(VerificationKey, Label, Content, SignatureValue)` — §5.1.2.
+
+  Returns `{:mls/valid? true}` or an error. Not a boolean: `this signature is
+  wrong` and `this suite has no signature implementation` are different
+  answers, and a caller that cannot tell them apart will record a missing
+  implementation as a forgery."
+  [suite public-key label content signature]
+  (r/let-ok [msg (sign-content label content)]
+    (case (:signature suite)
+      :ed25519
+      (if (ed/verify public-key msg signature)
+        (ok {:mls/valid? true})
+        (error :signature-mismatch))
+
+      (:ecdsa-secp256r1-sha256 :ecdsa-secp384r1-sha384 :ecdsa-secp521r1-sha512)
+      (let [c (:curve (:kem suite))
+            digest (vec ((:hash suite) msg))
+            r- (ecdsa/verify c public-key digest signature)]
+        (if (ecc-r/ok? r-)
+          (ok {:mls/valid? true})
+          (error :signature-mismatch {:mls/detail (ecc-r/reason r-)})))
+
+      (error :unimplemented-signature-scheme {:mls/scheme (:signature suite)}))))

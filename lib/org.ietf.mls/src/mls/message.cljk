@@ -1,0 +1,183 @@
+(ns mls.message
+  "Protecting and unprotecting MLS messages — [RFC 9420](https://www.rfc-editor.org/rfc/rfc9420)
+  §6.2 and §6.3.
+
+  Four operations, two in each direction. What separates them is not what is
+  authenticated — both carry the same signature and cover the same content —
+  but who can read it.
+
+  ## The ratchet a message uses is decided by its content type
+
+  Handshake messages (proposal, commit) draw from the handshake ratchet and
+  application messages from the application one. They are separate ratchets
+  from the same leaf, so a handshake message can never consume a generation an
+  application message needed, and the two sequences advance independently.
+
+  ## Nothing here generates randomness
+
+  The reuse guard and the generation are parameters. A reuse guard is four
+  fresh random bytes per message (§6.3.1) and a generation must not repeat —
+  both are the caller's to keep, because both depend on state this namespace
+  does not hold. `unprotect-*` needs neither: they arrive in the message."
+  (:require [mls.crypto :as crypto]
+            [mls.framing :as fr]
+            [mls.result :as r :refer [ok error]]
+            [mls.secret-tree :as st]
+            [mls.varint :as v]))
+
+(def signature-label "FramedContentTBS")
+
+(defn- ratchet-for [content-type]
+  (if (= :application content-type) :application :handshake))
+
+;; ── PublicMessage ───────────────────────────────────────────────────────────
+
+(defn protect-public
+  "§6.2. Sign, MAC, and frame — for everything except application data.
+
+  Application data is refused (`:application-data-must-be-private`). §6.1 says
+  it MUST NOT travel this way, and a PublicMessage is readable by the delivery
+  service: a caller who asked for this would get exactly what they asked for
+  and not what they meant."
+  [suite {:keys [framed-content group-context signature-key membership-key
+                 signature-nonce confirmation-tag]}]
+  (if (= :application (:content-type framed-content))
+    (error :application-data-must-be-private {})
+    (r/let-ok [tbs (fr/framed-content-tbs :mls-public-message framed-content group-context)
+               sig (crypto/sign-with-label suite signature-key signature-label
+                                           tbs signature-nonce)]
+      (let [auth (cond-> {:signature sig}
+                   (= :commit (:content-type framed-content))
+                   (assoc :confirmation-tag confirmation-tag))]
+        (r/let-ok [tag (fr/membership-tag suite membership-key :mls-public-message
+                                          framed-content group-context auth)
+                   pm (fr/encode-public-message {:framed-content framed-content
+                                                 :auth auth :membership-tag tag})]
+          (fr/encode-mls-message :mls-public-message pm))))))
+
+(defn unprotect-public
+  "§6.2. Decode, check the membership tag, then the signature.
+
+  In that order, and it matters: the membership tag is a symmetric check that
+  a non-member cannot forge, so it rejects most garbage before any public-key
+  work happens. The signature is checked too — the tag says *someone in this
+  group*, the signature says *this member*."
+  [suite {:keys [message group-context membership-key signature-public-key]}]
+  (r/let-ok [m (fr/decode-mls-message message)]
+    (if (not= :mls-public-message (:wire-format m))
+      (error :not-a-public-message {:mls/wire-format (:wire-format m)})
+      (r/let-ok [pm (fr/decode-public-message (:body m))]
+        (let [fc (:framed-content pm)
+              auth (:auth pm)]
+          (r/let-ok [expected (fr/membership-tag suite membership-key :mls-public-message
+                                                 fc group-context auth)]
+            (if (and (= :member (:type (:sender fc)))
+                     (not= expected (:membership-tag pm)))
+              (error :membership-tag-mismatch {})
+              (r/let-ok [tbs (fr/framed-content-tbs :mls-public-message fc group-context)
+                         v- (crypto/verify-with-label suite signature-public-key
+                                                      signature-label tbs (:signature auth))]
+                (ok {:mls/framed-content fc :mls/auth auth :mls/verified true})))))))))
+
+;; ── PrivateMessage ──────────────────────────────────────────────────────────
+
+(defn- private-content
+  "`PrivateMessageContent` — the content, the auth data, then zero padding."
+  [framed-content auth padding-length]
+  (r/let-ok [body (#'fr/encode-content (:content-type framed-content) (:content framed-content))
+             a (fr/encode-auth (:content-type framed-content) auth)]
+    (ok (vec (concat body a (repeat (or padding-length 0) 0))))))
+
+(defn- parse-private-content
+  "The reverse. Everything after the auth data is padding, and it **MUST** be
+  all zeros — §6.3.1 says a receiver that does not check that has left a
+  covert channel open in a field nobody looks at."
+  [content-type bs]
+  (r/let-ok [[body off] (#'fr/decode-content content-type bs 0)
+             [auth off] (fr/decode-auth content-type bs off)]
+    (let [padding (subvec (vec bs) off)]
+      (if-not (every? zero? padding)
+        (error :non-zero-padding {:mls/length (count padding)})
+        (ok {:content body :auth auth :padding-length (count padding)})))))
+
+(defn protect-private
+  "§6.3. Sign, encrypt with a ratchet key, then encrypt the sender data with a
+  key derived from the ciphertext."
+  [suite {:keys [framed-content group-context signature-key signature-nonce
+                 confirmation-tag encryption-secret n-leaves generation
+                 reuse-guard sender-data-secret padding-length]}]
+  (let [ct (:content-type framed-content)
+        leaf (:index (:sender framed-content))]
+    (r/let-ok [tbs (fr/framed-content-tbs :mls-private-message framed-content group-context)
+               sig (crypto/sign-with-label suite signature-key signature-label
+                                           tbs signature-nonce)]
+      (let [auth (cond-> {:signature sig}
+                   (= :commit ct) (assoc :confirmation-tag confirmation-tag))]
+        (r/let-ok [plaintext (private-content framed-content auth padding-length)
+                   keys- (st/leaf-keys suite encryption-secret n-leaves leaf
+                                       (ratchet-for ct) generation)
+                   aad (fr/private-content-aad framed-content)]
+          (let [nonce (fr/apply-reuse-guard (:mls/nonce keys-) reuse-guard)
+                sealed ((:seal (:aead suite)) (:mls/key keys-) nonce aad plaintext)]
+            (if (not= :ok (:status sealed))
+              (error :content-encryption-failed {:mls/detail (:reason sealed)})
+              (r/let-ok [sd (fr/encode-sender-data {:leaf-index leaf :generation generation
+                                                    :reuse-guard reuse-guard})
+                         sd-keys (st/sender-data-keys suite sender-data-secret (:bytes sealed))
+                         sd-aad (fr/sender-data-aad framed-content)]
+                (let [sd-sealed ((:seal (:aead suite)) (:mls/key sd-keys) (:mls/nonce sd-keys)
+                                 sd-aad sd)]
+                  (if (not= :ok (:status sd-sealed))
+                    (error :sender-data-encryption-failed {:mls/detail (:reason sd-sealed)})
+                    (r/let-ok [pm (fr/encode-private-message
+                                   {:group-id (:group-id framed-content)
+                                    :epoch (:epoch framed-content)
+                                    :content-type ct
+                                    :authenticated-data (:authenticated-data framed-content)
+                                    :encrypted-sender-data (:bytes sd-sealed)
+                                    :ciphertext (:bytes sealed)})]
+                      (fr/encode-mls-message :mls-private-message pm))))))))))))
+
+(defn unprotect-private
+  "§6.3, in reverse: sender data first, because it names the key.
+
+  The order is forced by the construction. The sender data says which leaf and
+  which generation, and without it there is no way to know which of the
+  group's many ratchet keys to try — which is also what makes the sender data
+  key derive from the ciphertext rather than from the ratchet."
+  [suite {:keys [message group-context encryption-secret n-leaves
+                 sender-data-secret signature-public-key]}]
+  (r/let-ok [m (fr/decode-mls-message message)]
+    (if (not= :mls-private-message (:wire-format m))
+      (error :not-a-private-message {:mls/wire-format (:wire-format m)})
+      (r/let-ok [pm (fr/decode-private-message (:body m))
+                 sd-keys (st/sender-data-keys suite sender-data-secret (:ciphertext pm))
+                 sd-aad (fr/sender-data-aad pm)]
+        (let [sd-opened ((:open (:aead suite)) (:mls/key sd-keys) (:mls/nonce sd-keys)
+                         sd-aad (:encrypted-sender-data pm))]
+          (if (not= :ok (:status sd-opened))
+            (error :sender-data-decryption-failed {:mls/detail (:reason sd-opened)})
+            (r/let-ok [sd (fr/decode-sender-data (:bytes sd-opened))
+                       keys- (st/leaf-keys suite encryption-secret n-leaves
+                                           (:leaf-index sd) (ratchet-for (:content-type pm))
+                                           (:generation sd))
+                       aad (fr/private-content-aad pm)]
+              (let [nonce (fr/apply-reuse-guard (:mls/nonce keys-) (:reuse-guard sd))
+                    opened ((:open (:aead suite)) (:mls/key keys-) nonce aad (:ciphertext pm))]
+                (if (not= :ok (:status opened))
+                  (error :content-decryption-failed {:mls/detail (:reason opened)})
+                  (r/let-ok [parsed (parse-private-content (:content-type pm) (:bytes opened))]
+                    (let [fc {:group-id (:group-id pm) :epoch (:epoch pm)
+                              :sender {:type :member :index (:leaf-index sd)}
+                              :authenticated-data (:authenticated-data pm)
+                              :content-type (:content-type pm)
+                              :content (:content parsed)}]
+                      (r/let-ok [tbs (fr/framed-content-tbs :mls-private-message fc group-context)
+                                 v- (crypto/verify-with-label
+                                     suite signature-public-key signature-label
+                                     tbs (:signature (:auth parsed)))]
+                        (ok {:mls/framed-content fc
+                             :mls/auth (:auth parsed)
+                             :mls/sender-data sd
+                             :mls/padding-length (:padding-length parsed)
+                             :mls/verified true})))))))))))))

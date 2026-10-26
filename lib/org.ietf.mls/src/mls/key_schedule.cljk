@@ -1,0 +1,88 @@
+(ns mls.key-schedule
+  "The MLS key schedule — [RFC 9420](https://www.rfc-editor.org/rfc/rfc9420) §8.
+
+  Each epoch takes three inputs — the previous epoch's `init_secret`, this
+  epoch's `commit_secret`, and the serialised `GroupContext` — and produces
+  every secret the epoch needs, ending in the `init_secret` for the next one.
+
+  ## Reading the diagram right
+
+  RFC 9420's Figure 22 states the convention in prose above it, and it is the
+  one thing here that is easy to invert: **`KDF.Extract` takes its salt from
+  the top of the diagram and its IKM from the left.** So the first extract is
+  `Extract(salt = init_secret[n-1], ikm = commit_secret)`, not the other way
+  round, and the second is `Extract(salt = joiner_secret, ikm = psk_secret)`.
+
+  Getting that backwards produces a key schedule that is entirely
+  self-consistent — every member of a group running the same wrong code agrees
+  with every other — and shares nothing with anyone else. It is the exact
+  shape of failure the interop corpus exists to catch, and there is no way to
+  catch it from inside."
+  (:require [mls.crypto :as crypto]
+            [mls.result :as r :refer [ok]]
+            [hpke.dhkem :as dhkem]))
+
+(def epoch-labels
+  "RFC 9420 Table 4. Each is `DeriveSecret(epoch_secret, label)`.
+
+  A table rather than eight function bodies: they differ only in a string, and
+  writing them out would be writing the same derivation eight times with eight
+  chances to mistype it."
+  {:sender-data-secret "sender data"
+   :encryption-secret "encryption"
+   :exporter-secret "exporter"
+   :external-secret "external"
+   :confirmation-key "confirm"
+   :membership-key "membership"
+   :resumption-psk "resumption"
+   :epoch-authenticator "authentication"})
+
+(defn epoch
+  "One turn of the schedule.
+
+  `psk-secret` is the PSK contribution, or `Nh` zero bytes when there is none
+  — the RFC writes that as `psk_secret (or 0)`, and the zero is `KDF.Nh` long,
+  not empty. An empty IKM to `Extract` is a different function."
+  [suite {:keys [init-secret commit-secret group-context psk-secret]}]
+  (let [k (:kdf suite)
+        nh (:nh suite)
+        psk (or psk-secret (vec (repeat nh 0)))
+        ;; Extract: salt from the top, IKM from the left.
+        joiner-in (crypto/extract suite init-secret commit-secret)]
+    (r/let-ok [joiner (crypto/expand-with-label suite joiner-in "joiner" group-context nh)]
+      (let [member (crypto/extract suite joiner psk)]
+        (r/let-ok [welcome (crypto/derive-secret suite member "welcome")
+                   epoch-secret (crypto/expand-with-label suite member "epoch" group-context nh)]
+          (loop [ks (seq epoch-labels) acc {}]
+            (if-let [[key label] (first ks)]
+              (let [d (crypto/derive-secret suite epoch-secret label)]
+                (if (r/error? d) d (recur (next ks) (assoc acc key (r/val d)))))
+              (r/let-ok [init (crypto/derive-secret suite epoch-secret "init")]
+                (ok (assoc acc
+                           :joiner-secret joiner
+                           :welcome-secret welcome
+                           :epoch-secret epoch-secret
+                           :init-secret init))))))))))
+
+(defn external-key-pair
+  "§8: `external_priv, external_pub = KEM.DeriveKeyPair(external_secret)`.
+
+  The whole group holds this private key, which is the point — it lets a
+  non-member join by external Commit. It is also why it is derived rather than
+  chosen: every member must arrive at the same one."
+  [suite external-secret]
+  (let [d (dhkem/derive-key-pair (:kem suite) external-secret)]
+    (if (= :ok (:status d))
+      (ok {:mls/private (:private d) :mls/public (:public d)})
+      (r/error :external-key-pair-failed {:mls/detail (:reason d)}))))
+
+(defn exporter
+  "`MLS-Exporter(Label, Context, Length)` — §8.5.
+
+  Note the context is **hashed** before it goes in, and the inner label is the
+  application's while the outer is the constant `exported`. Passing the raw
+  context to the outer expansion would produce a value that varies with the
+  context's length as well as its content."
+  [suite exporter-secret label context length]
+  (r/let-ok [inner (crypto/derive-secret suite exporter-secret label)]
+    (crypto/expand-with-label suite inner "exported" (vec ((:hash suite) context)) length)))

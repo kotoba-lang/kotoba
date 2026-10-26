@@ -1,0 +1,259 @@
+(ns mls.crypto-test
+  "MLS's labelled crypto against the working group's `crypto-basics` corpus.
+
+  Seven cipher suites, and **all seven run here** — the KEMs are X25519,
+  X448 and P-256/384/521, the KDFs HKDF-SHA256/384/512, the AEADs
+  AES-128/256-GCM and ChaCha20Poly1305, and this workspace has every one of
+  them portably.
+
+  What it does not have is a **signature**. Every MLS suite names Ed25519,
+  Ed448 or ECDSA, and none of those exist here in portable form. So
+  `sign_with_label` is carried in the fixture and not exercised, and this
+  namespace says so rather than letting six of seven functions passing read as
+  a suite that works."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [mls.crypto :as crypto]
+            [mls.result :as r]
+            [mls.suite :as suite]
+            [mls.varint :as v]
+            [mls.vectors :as vec-]
+            [hpke.dhkem :as dhkem]
+            [ecc.bignum :as bn]))
+
+(defn- unhex [s]
+  (mapv #(#?(:clj Integer/parseInt :cljs js/parseInt) (apply str %) 16) (partition 2 s)))
+
+(defn- hex [bs]
+  (apply str (map (fn [b] (let [b (bit-and (int b) 0xFF)
+                                s #?(:clj (Integer/toString b 16) :cljs (.toString b 16))]
+                            (if (= 1 (count s)) (str "0" s) s)))
+                  bs)))
+
+(deftest the-corpus-covers-every-suite
+  (is (= 7 (count vec-/crypto-basics)))
+  (is (= [1 2 3 4 5 6 7] (mapv :cipher-suite vec-/crypto-basics)))
+  (is (= 7 (count suite/suites)))
+  (doseq [{:keys [cipher-suite]} vec-/crypto-basics]
+    (is (some? (get suite/suites cipher-suite))
+        (str "suite " cipher-suite " is implemented"))))
+
+(deftest ref-hash
+  (doseq [{:keys [cipher-suite ref-hash]} vec-/crypto-basics]
+    (testing (str "suite " cipher-suite)
+      (let [s (get suite/suites cipher-suite)
+            got (crypto/ref-hash s (:label ref-hash) (unhex (:value ref-hash)))]
+        (is (r/ok? got) (pr-str (r/err got)))
+        (is (= (:out ref-hash) (hex (r/val got))))))))
+
+(deftest expand-with-label
+  (doseq [{:keys [cipher-suite expand-with-label]} vec-/crypto-basics]
+    (testing (str "suite " cipher-suite)
+      (let [s (get suite/suites cipher-suite)
+            {:keys [secret label context length out]} expand-with-label
+            got (crypto/expand-with-label s (unhex secret) label (unhex context) length)]
+        (is (r/ok? got) (pr-str (r/err got)))
+        (is (= out (hex (r/val got))))
+        (is (= length (count (r/val got))))))))
+
+(deftest derive-secret
+  (doseq [{:keys [cipher-suite derive-secret]} vec-/crypto-basics]
+    (testing (str "suite " cipher-suite)
+      (let [s (get suite/suites cipher-suite)
+            got (crypto/derive-secret s (unhex (:secret derive-secret)) (:label derive-secret))]
+        (is (r/ok? got) (pr-str (r/err got)))
+        (is (= (:out derive-secret) (hex (r/val got))))
+        (is (= (:nh s) (count (r/val got)))
+            "DeriveSecret is KDF.Nh bytes, which is not the same for every suite")))))
+
+(deftest derive-tree-secret
+  (doseq [{:keys [cipher-suite derive-tree-secret]} vec-/crypto-basics]
+    (testing (str "suite " cipher-suite)
+      (let [s (get suite/suites cipher-suite)
+            {:keys [secret label generation length out]} derive-tree-secret
+            got (crypto/derive-tree-secret s (unhex secret) label generation length)]
+        (is (r/ok? got) (pr-str (r/err got)))
+        (is (= out (hex (r/val got))))))))
+
+(deftest the-generation-is-a-big-endian-uint32
+  ;; The corpus uses 2694881440 = 0xA0A0A0A0, which is symmetric in every byte
+  ;; -- so it would pass with the bytes reversed. A value that is not is
+  ;; checked here against `expand-with-label` called directly, which is the
+  ;; only place the width and the order are visible.
+  (let [s (get suite/suites 1)
+        secret (vec (repeat 32 7))]
+    (doseq [[g bytes-] {0 [0 0 0 0]
+                        1 [0 0 0 1]
+                        256 [0 0 1 0]
+                        0x01020304 [1 2 3 4]
+                        4294967295 [255 255 255 255]}]
+      (is (= (r/val (crypto/expand-with-label s secret "x" bytes- 32))
+             (r/val (crypto/derive-tree-secret s secret "x" g 32)))
+          (str "generation " g)))
+    (testing "and a reversed encoding would be a different secret"
+      (is (not= (r/val (crypto/derive-tree-secret s secret "x" 0x01020304 32))
+                (r/val (crypto/expand-with-label s secret "x" [4 3 2 1] 32)))))))
+
+(deftest this-opens-what-the-working-group-sealed
+  ;; The strongest form available: the corpus carries ciphertexts other
+  ;; implementations produced, and this one decrypts them.
+  ;;
+  ;; It cannot be run the other way. HPKE's encapsulation needs an ephemeral
+  ;; key that the corpus does not publish, so the ciphertexts are not
+  ;; reproducible byte-for-byte -- sealing is covered by round-trip below, and
+  ;; that substitution is stated rather than glossed.
+  (doseq [{:keys [cipher-suite encrypt-with-label]} vec-/crypto-basics]
+    (testing (str "suite " cipher-suite)
+      (let [s (get suite/suites cipher-suite)
+            {:keys [priv pub label context plaintext kem_output ciphertext]} encrypt-with-label
+            kp {:private (unhex priv) :public (unhex pub)}
+            got (crypto/decrypt-with-label s kp label (unhex context)
+                                           (unhex kem_output) (unhex ciphertext))]
+        (is (r/ok? got) (pr-str (r/err got)))
+        (is (= plaintext (hex (r/val got))))))))
+
+(deftest and-round-trips-its-own
+  (doseq [{:keys [cipher-suite encrypt-with-label]} vec-/crypto-basics]
+    (testing (str "suite " cipher-suite)
+      (let [s (get suite/suites cipher-suite)
+            kem (:kem (:hpke s))
+            kp {:private (unhex (:priv encrypt-with-label))
+                :public (unhex (:pub encrypt-with-label))}
+            eph (dhkem/derive-key-pair! kem (vec (repeat (:nsk kem) 3)))
+            pt (unhex (:plaintext encrypt-with-label))
+            ctx (unhex (:context encrypt-with-label))
+            sealed (crypto/encrypt-with-label s (:public kp) "Label" ctx pt eph)]
+        (is (r/ok? sealed) (pr-str (r/err sealed)))
+        (let [{:mls/keys [kem-output ciphertext]} (r/val sealed)]
+          (is (= pt (r/val (crypto/decrypt-with-label s kp "Label" ctx
+                                                      kem-output ciphertext))))
+          (testing "and the label is part of what is decrypted"
+            (is (r/error? (crypto/decrypt-with-label s kp "Other" ctx
+                                                     kem-output ciphertext))))
+          (testing "as is the context"
+            (is (r/error? (crypto/decrypt-with-label s kp "Label" (conj (vec ctx) 0)
+                                                     kem-output ciphertext)))))))))
+
+(deftest the-mls-version-prefix-is-part-of-every-label
+  ;; "MLS 1.0 " separates MLS from any other protocol that labels KDF inputs
+  ;; the same way. Dropping it is a change no test of MLS against itself can
+  ;; see -- both halves would agree -- so it is checked against the serialised
+  ;; form directly.
+  ;;
+  ;; The check reads the label back out and compares STRINGS. Building the
+  ;; expected bytes with `(map int "MLS 1.0 Test")` is code points on the JVM
+  ;; and zeros under ClojureScript, and this test walked into that -- the
+  ;; fourth time in one afternoon, across four different namespaces, all
+  ;; written by someone who had just been bitten by it. `(map char bytes)` is
+  ;; correct on both, so the comparison happens on the side that has no trap.
+  (let [s (get suite/suites 1)
+        label- (r/val (crypto/kdf-label "Test" [] 32))
+        read-label (fn [bs off]
+                     (let [o (r/val (v/read-opaque bs off))]
+                       [(apply str (map char (:mls/value o))) (:mls/next o)]))]
+    (is (= [0 32] (vec (take 2 label-))) "uint16 length, big-endian")
+    (let [[lbl next-] (read-label label- 2)]
+      (is (= "MLS 1.0 Test" lbl) "then opaque label<V>, version-prefixed")
+      (is (= (count label-) (:mls/next (r/val (v/read-opaque label- next-))))
+          "then opaque context<V>, and nothing after it")))
+
+  (testing "EncryptContext carries it too"
+    (let [ec (r/val (crypto/encrypt-context "Test" [1 2 3]))
+          o (r/val (v/read-opaque ec 0))]
+      (is (= "MLS 1.0 Test" (apply str (map char (:mls/value o)))))
+      (is (= [1 2 3] (:mls/value (r/val (v/read-opaque ec (:mls/next o))))))))
+
+  (testing "but RefHash does not — its labels already carry the version"
+    (let [s (get suite/suites 1)
+          got (r/val (crypto/ref-hash s "MLS 1.0 KeyPackage Reference" [1 2 3]))
+          twice (r/val (crypto/ref-hash s "MLS 1.0 MLS 1.0 KeyPackage Reference" [1 2 3]))]
+      (is (not= got twice)))))
+
+(deftest this-verifies-what-the-working-group-signed
+  ;; The corpus carries signatures other implementations produced. ECDSA is
+  ;; randomised so those cannot be reproduced byte-for-byte -- but they can be
+  ;; verified, which is the direction that matters and the one a group member
+  ;; actually performs on someone else's message.
+  ;;
+  ;; Ed448 -- suites 4 and 6 -- has no implementation here, so those two are
+  ;; asserted to refuse BY NAME rather than skipped. A skipped suite and a
+  ;; passing one look the same in a summary line.
+  (doseq [{:keys [cipher-suite sign-with-label]} vec-/crypto-basics]
+    (testing (str "suite " cipher-suite)
+      (let [s (get suite/suites cipher-suite)
+            {:keys [pub label content signature]} sign-with-label
+            got (crypto/verify-with-label s (unhex pub) label (unhex content)
+                                          (unhex signature))]
+        (if (contains? #{:ed448} (:signature s))
+          (do (is (r/error? got))
+              (is (= :unimplemented-signature-scheme (r/reason got))
+                  "Ed448 is absent, and says so"))
+          (do (is (r/ok? got) (str (pr-str (r/err got))))
+              (is (:mls/valid? (r/val got)))))))))
+
+(deftest a-tampered-signature-does-not-verify
+  (doseq [{:keys [cipher-suite sign-with-label]} vec-/crypto-basics
+          :let [s (get suite/suites cipher-suite)]
+          :when (not= :ed448 (:signature s))]
+    (testing (str "suite " cipher-suite)
+      (let [{:keys [pub label content signature]} sign-with-label
+            sig (unhex signature)
+            flipped (assoc (vec sig) (dec (count sig)) (bit-xor 1 (last sig)))]
+        (is (r/error? (crypto/verify-with-label s (unhex pub) label
+                                                (unhex content) flipped)))
+        (testing "and neither does the right signature over different content"
+          (is (r/error? (crypto/verify-with-label s (unhex pub) label
+                                                  (conj (vec (unhex content)) 0) sig))))
+        (testing "nor under a different label"
+          (is (r/error? (crypto/verify-with-label s (unhex pub) "Other"
+                                                  (unhex content) sig))))))))
+
+(deftest signing-round-trips-where-a-signature-exists
+  (doseq [{:keys [cipher-suite sign-with-label]} vec-/crypto-basics
+          :let [s (get suite/suites cipher-suite)]]
+    (testing (str "suite " cipher-suite " " (name (:signature s)))
+      (let [{:keys [priv pub content]} sign-with-label
+            ;; ECDSA needs a k; EdDSA ignores it. The argument is required so
+            ;; that a caller does not have to know which.
+            nonce (bn/of-dec "1234567890123456789012345678901234567")
+            made (crypto/sign-with-label s (unhex priv) "RoundTrip" (unhex content) nonce)]
+        (if (= :ed448 (:signature s))
+          (is (= :unimplemented-signature-scheme (r/reason made)))
+          (do
+            (is (r/ok? made) (pr-str (r/err made)))
+            (is (r/ok? (crypto/verify-with-label s (unhex pub) "RoundTrip"
+                                                 (unhex content) (r/val made))))
+            (testing "and the label is signed, not just the content"
+              (is (r/error? (crypto/verify-with-label s (unhex pub) "Different"
+                                                      (unhex content) (r/val made)))))))))))
+
+(deftest the-two-signature-encodings-are-not-interchangeable
+  ;; RFC 9420 §5.1.2: EdDSA is R||S (64 bytes) and ECDSA is DER. A library
+  ;; that produced one where the other was expected would produce something no
+  ;; peer accepts -- and DER's leading 0x30 makes the confusion easy to check
+  ;; for.
+  (let [ed (get suite/suites 1)
+        ecdsa- (get suite/suites 2)
+        v1 (first (filter #(= 1 (:cipher-suite %)) vec-/crypto-basics))
+        v2 (first (filter #(= 2 (:cipher-suite %)) vec-/crypto-basics))]
+    (is (= :ed25519 (:signature ed)))
+    (is (= :ecdsa-secp256r1-sha256 (:signature ecdsa-)))
+    (is (= 64 (count (unhex (:signature (:sign-with-label v1)))))
+        "EdDSA: R || S, and nothing else")
+    (is (= 0x30 (first (unhex (:signature (:sign-with-label v2)))))
+        "ECDSA: a DER SEQUENCE")
+    (is (not= 64 (count (unhex (:signature (:sign-with-label v2)))))
+        "which is not 64 bytes, so the two cannot be confused by length alone")))
+
+(deftest what-is-not-here
+  ;; Ed448, and therefore MLS suites 4 and 6. Asserted rather than only
+  ;; written down, so that the day it lands this test fails and someone reads
+  ;; it.
+  (is (= #{:ed25519 :ed448 :ecdsa-secp256r1-sha256
+           :ecdsa-secp384r1-sha384 :ecdsa-secp521r1-sha512}
+         (set (map :signature (vals suite/suites))))
+      "the schemes MLS requires")
+  (is (= #{4 6} (set (keep (fn [[id s]] (when (= :ed448 (:signature s)) id))
+                           suite/suites)))
+      "and Ed448 is exactly suites 4 and 6")
+  (is (seq (:sign-with-label (first vec-/crypto-basics)))
+      "the corpus carries the vectors, waiting"))

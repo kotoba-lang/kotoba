@@ -1,0 +1,171 @@
+(ns mls.psk-transcript-test
+  "PSK secrets (§8.4) and transcript hashes (§8.2) — the two remaining inputs
+  to the key schedule.
+
+  The PSK corpus is the wider of the two: 77 entries, 7 suites × **0 to 10
+  PSKs**. The zero case matters as much as the ten — with no PSKs the answer
+  is `Nh` zeros, which is also what the key schedule uses when the field is
+  absent, and the two paths have to agree."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [mls.crypto :as crypto]
+            [mls.key-schedule :as ks]
+            [mls.psk :as psk]
+            [mls.result :as r]
+            [mls.suite :as suite]
+            [mls.transcript :as tx]
+            [mls.varint :as v]
+            [mls.vectors :as vec-]))
+
+(defn- unhex [s]
+  (mapv #(#?(:clj Integer/parseInt :cljs js/parseInt) (apply str %) 16) (partition 2 s)))
+
+(defn- hex [bs]
+  (apply str (map (fn [b] (let [b (bit-and (int b) 0xFF)
+                                s #?(:clj (Integer/toString b 16) :cljs (.toString b 16))]
+                            (if (= 1 (count s)) (str "0" s) s)))
+                  bs)))
+
+;; ── §8.4 ────────────────────────────────────────────────────────────────────
+
+(deftest the-psk-corpus-is-whole
+  (is (= 77 (count vec-/psk-secret)))
+  (is (= (vec (range 0 11)) (vec (sort (distinct (map #(count (:psks %)) vec-/psk-secret))))))
+  (is (= #{1 2 3 4 5 6 7} (set (map :cipher-suite vec-/psk-secret)))))
+
+(deftest every-psk-combination
+  (doseq [{:keys [cipher-suite psks psk-secret]} vec-/psk-secret]
+    (testing (str "suite " cipher-suite ", " (count psks) " PSKs")
+      (let [s (get suite/suites cipher-suite)
+            inputs (mapv (fn [{:keys [psk-id psk psk-nonce]}]
+                           {:id {:type :external
+                                 :psk-id (unhex psk-id)
+                                 :psk-nonce (unhex psk-nonce)}
+                            :secret (unhex psk)})
+                         psks)
+            got (psk/psk-secret s inputs)]
+        (is (r/ok? got) (pr-str (r/err got)))
+        (is (= psk-secret (hex (r/val got))))))))
+
+(deftest no-psks-gives-Nh-zeros-and-the-key-schedule-agrees
+  ;; The empty case is a real answer, not a degenerate one -- and it is the
+  ;; same value the key schedule substitutes when the field is absent. If the
+  ;; two disagreed, a group with no PSKs would derive one epoch two ways.
+  (doseq [id [1 4 7]]
+    (let [s (get suite/suites id)
+          got (r/val (psk/psk-secret s []))]
+      (is (= (vec (repeat (:nh s) 0)) got))
+      (let [base {:init-secret (vec (repeat (:nh s) 1))
+                  :commit-secret (vec (repeat (:nh s) 2))
+                  :group-context [7 7]}]
+        (is (= (:epoch-secret (r/val (ks/epoch s base)))
+               (:epoch-secret (r/val (ks/epoch s (assoc base :psk-secret got)))))
+            "omitting the PSK secret and passing the empty combination agree")))))
+
+(deftest order-and-count-are-inside-the-derivation
+  ;; PSKLabel carries index and count, so the same PSKs in another order, or
+  ;; a subset of them, is a different secret. That is what stops a member
+  ;; from quietly dropping one it does not hold.
+  (let [s (get suite/suites 1)
+        mk (fn [n] {:id {:type :external :psk-id [n] :psk-nonce (vec (repeat 32 n))}
+                    :secret (vec (repeat 32 (+ 100 n)))})
+        a (mk 1) b (mk 2) c (mk 3)
+        of (fn [xs] (hex (r/val (psk/psk-secret s xs))))]
+    (is (not= (of [a b]) (of [b a])) "order")
+    (is (not= (of [a b]) (of [a b c])) "count")
+    (is (not= (of [a b c]) (of [a c])) "a dropped PSK is not the same as never having it")
+    (is (= (of [a b]) (of [a b])) "and it is deterministic")))
+
+(deftest the-two-psk-types-encode-differently
+  ;; A resumption PSK carries a usage, a group id and an epoch where an
+  ;; external one carries only an id. They must not collide: a resumption PSK
+  ;; proves membership in a prior epoch, and an external one proves nothing of
+  ;; the kind.
+  (let [nonce (vec (repeat 32 9))
+        ext (r/val (psk/encode-psk-id {:type :external :psk-id [1 2 3] :psk-nonce nonce}))
+        res (r/val (psk/encode-psk-id {:type :resumption :usage :application
+                                       :group-id [1 2 3] :epoch 5 :psk-nonce nonce}))]
+    (is (= 1 (first ext)))
+    (is (= 2 (first res)))
+    (is (not= ext res))
+    (is (= :unknown-psk-type (r/reason (psk/encode-psk-id {:type :other}))))
+    (is (= :unknown-resumption-usage
+           (r/reason (psk/encode-psk-id {:type :resumption :usage :nope
+                                         :group-id [] :epoch 0 :psk-nonce nonce}))))
+    (testing "and the epoch is inside the resumption id"
+      (is (not= res (r/val (psk/encode-psk-id {:type :resumption :usage :application
+                                               :group-id [1 2 3] :epoch 6
+                                               :psk-nonce nonce})))))))
+
+;; ── §8.2 ────────────────────────────────────────────────────────────────────
+
+(deftest the-transcript-corpus-is-whole
+  (is (= 7 (count vec-/transcript-hashes)))
+  (is (= [1 2 3 4 5 6 7] (mapv :cipher-suite vec-/transcript-hashes))))
+
+(deftest transcript-hashes-for-every-suite
+  ;; The AuthenticatedContent is split by recomputing the confirmation tag and
+  ;; matching it as a suffix -- which checks the tag and finds the boundary in
+  ;; one step, without parsing a Commit.
+  (doseq [{:keys [cipher-suite confirmation-key authenticated-content
+                  interim-before confirmed-after interim-after]} vec-/transcript-hashes]
+    (testing (str "suite " cipher-suite)
+      (let [s (get suite/suites cipher-suite)
+            split (tx/split-authenticated-content s (unhex confirmation-key)
+                                                  (unhex confirmed-after)
+                                                  (unhex authenticated-content))]
+        (is (r/ok? split) (pr-str (r/err split)))
+        (when (r/ok? split)
+          (let [{:mls/keys [confirmed-input confirmation-tag]} (r/val split)]
+            (testing "the confirmed hash is the interim before, plus this Commit"
+              (is (= confirmed-after
+                     (hex (r/val (tx/confirmed-hash s (unhex interim-before)
+                                                    confirmed-input))))))
+            (testing "and the interim hash folds the confirmation tag back in"
+              (is (= interim-after
+                     (hex (r/val (tx/interim-hash s (unhex confirmed-after)
+                                                  confirmation-tag))))))))))))
+
+(deftest the-tag-is-a-mac-over-the-confirmed-hash
+  (doseq [{:keys [cipher-suite confirmation-key confirmed-after
+                  authenticated-content]} vec-/transcript-hashes]
+    (testing (str "suite " cipher-suite)
+      (let [s (get suite/suites cipher-suite)
+            tag (tx/confirmation-tag s (unhex confirmation-key) (unhex confirmed-after))]
+        (is (= (:nh s) (count tag)) "one KDF.Nh-sized MAC")
+        (testing "and it really is the suffix of the AuthenticatedContent"
+          (let [ac (unhex authenticated-content)
+                suffix (r/val (v/opaque tag))]
+            (is (= suffix (vec (take-last (count suffix) ac))))))
+        (testing "a different key gives a different tag"
+          (is (not= tag (tx/confirmation-tag s (vec (repeat (:nh s) 0))
+                                             (unhex confirmed-after)))))))))
+
+(deftest a-wrong-confirmation-key-cannot-split-the-content
+  ;; The split and the tag check are the same operation. A content that was
+  ;; not produced under this key has no matching suffix, and the failure is
+  ;; the same one as content that is not a Commit -- deliberately, because
+  ;; from outside those are the same statement.
+  (let [{:keys [cipher-suite authenticated-content confirmed-after]}
+        (first vec-/transcript-hashes)
+        s (get suite/suites cipher-suite)]
+    (is (= :confirmation-tag-not-at-the-end
+           (r/reason (tx/split-authenticated-content
+                      s (vec (repeat (:nh s) 0)) (unhex confirmed-after)
+                      (unhex authenticated-content)))))
+    (is (= :confirmation-tag-not-at-the-end
+           (r/reason (tx/split-authenticated-content
+                      s (vec (repeat (:nh s) 0)) (unhex confirmed-after) []))))))
+
+(deftest epoch-zero-starts-from-the-empty-string
+  ;; §8.2 says zero-length, not a hash of nothing and not Nh zeros. A group
+  ;; started from any other value agrees with no one, and the difference never
+  ;; shows up inside that group.
+  (let [s (get suite/suites 1)
+        cthi [1 2 3]
+        from-empty (r/val (tx/confirmed-hash s [] cthi))
+        from-zeros (r/val (tx/confirmed-hash s (vec (repeat 32 0)) cthi))
+        from-hash-of-nothing (r/val (tx/confirmed-hash s (vec ((:hash s) [])) cthi))]
+    (is (= (vec ((:hash s) cthi)) from-empty)
+        "with an empty interim hash the input is just the Commit")
+    (is (not= from-empty from-zeros))
+    (is (not= from-empty from-hash-of-nothing))))
