@@ -1,0 +1,189 @@
+(ns aiueos.native.install-copy-entry
+  (:require [native.serial :as serial])
+  (:export [main]))
+
+;; QEMU diagnostic for the future AIUEOS-native installer block path. This
+;; runs in the guest: the host supplies only a pinned 8 MiB boot disk and an
+;; isolated blank 8 MiB target. No Linux process, dd or host-side copy writes
+;; the target. The real installer still needs signed release admission,
+;; target enumeration, a trusted human approval surface and recovery.
+;;
+;; Primary master is read-only. Primary slave is the only writable unit.
+;; A synthetic keyboard phrase tests the mechanism; QMP keys do not prove
+;; human consent. Sector 0 is published only after every other sector has
+;; been copied, flushed and read back.
+
+(def disk-sectors 16384)
+(def data-port 496)
+(def count-port 498)
+(def lba0-port 499)
+(def lba1-port 500)
+(def lba2-port 501)
+(def drive-port 502)
+(def command-port 503)
+(def alt-status-port 1014)
+
+(defn word [page offset]
+  (kernel-load-u32-4k page 4096 offset))
+(defn put [page offset value]
+  (kernel-store-u32-4k page 4096 offset value))
+
+(defn ready [remaining data]
+  (let [status (kernel-in-u8 command-port)]
+    (if (or (= status 0) (= status 255)) 0
+      (if (= remaining 0) 0
+        (if (= (bit-and status 128) 128)
+          (ready (- remaining 1) data)
+          (if (> (bit-and status 33) 0) 0
+            (if (or (and (= data 1) (= (bit-and status 8) 8))
+                    (and (= data 2) (= (bit-and status 8) 0))) 1
+              (ready (- remaining 1) data))))))))
+
+(defn select [unit sector command]
+  (if (or (< sector 0) (>= sector disk-sectors)
+          (< unit 0) (> unit 1)) 0
+    (do
+      (kernel-out-u8 drive-port (+ 224 (* 16 unit)))
+      (kernel-in-u8 alt-status-port)
+      (kernel-in-u8 alt-status-port)
+      (kernel-in-u8 alt-status-port)
+      (kernel-in-u8 alt-status-port)
+      (if (= (ready 65536 2) 1)
+        (do (kernel-out-u8 count-port 1)
+            (kernel-out-u8 lba0-port (bit-and sector 255))
+            (kernel-out-u8 lba1-port (bit-and (quot sector 256) 255))
+            (kernel-out-u8 lba2-port (bit-and (quot sector 65536) 255))
+            (kernel-out-u8 command-port command)
+            (ready 65536 1))
+        0))))
+
+(defn transfer-read [page offset]
+  (if (= offset 512) 1
+    (do (put page offset (kernel-in-u32 data-port))
+        (transfer-read page (+ offset 4)))))
+(defn transfer-write [page offset]
+  (if (= offset 512) 1
+    (do (kernel-out-u32 data-port (word page offset))
+        (transfer-write page (+ offset 4)))))
+(defn read-sector [unit sector page]
+  (if (= (select unit sector 32) 1)
+      (if (= (transfer-read page 0) 1) (ready 65536 2) 0)
+    0))
+(defn write-sector [unit sector page]
+  (if (not (= unit 1)) 0
+    (if (= (select unit sector 48) 1)
+      (if (= (transfer-write page 0) 1) (ready 65536 2) 0)
+      0)))
+(defn flush-target []
+  (do (kernel-out-u8 drive-port 240)
+      (kernel-in-u8 alt-status-port)
+      (kernel-in-u8 alt-status-port)
+      (kernel-in-u8 alt-status-port)
+      (kernel-in-u8 alt-status-port)
+      (if (= (ready 65536 2) 1)
+        (do (kernel-out-u8 command-port 231) (ready 65536 2))
+        0)))
+(defn identify [unit page]
+  (if (= (select unit 0 236) 1)
+    (if (= (transfer-read page 0) 1)
+      (if (= (ready 65536 2) 1)
+        (if (= (word page 120) disk-sectors) 1 0)
+        0)
+      0)
+    0))
+
+(defn blank? [page offset]
+  (if (= offset 512) 1
+    (if (= (word page offset) 0)
+      (blank? page (+ offset 4))
+      0)))
+(defn equal? [a b offset]
+  (if (= offset 512) 1
+    (if (= (word a offset) (word b offset))
+      (equal? a b (+ offset 4))
+      0)))
+(defn target-blank? [page sector]
+  (if (= sector disk-sectors) 1
+    (if (= (read-sector 1 sector page) 1)
+      (if (= (blank? page 0) 1)
+        (target-blank? page (+ sector 1))
+        0)
+      0)))
+
+(defn keyboard-key [remaining]
+  (if (= remaining 0) 0
+    (let [status (kernel-in-u8 100)]
+      (if (= (bit-and status 1) 0)
+        (do (kernel-pause) (keyboard-key (- remaining 1)))
+        (let [code (kernel-in-u8 96)]
+          (if (or (= code 0) (>= code 128)
+                  (= (bit-and status 32) 32))
+            (keyboard-key (- remaining 1))
+            code))))))
+(defn expected-key [index]
+  (case index 0 18 1 19 2 30 3 31 4 18 0))
+(defn approved? [index]
+  (if (= index 5) 1
+    (let [code (keyboard-key 10000000)]
+      (if (= code (expected-key index))
+        (approved? (+ index 1))
+        0))))
+
+(defn copy-body [source sector]
+  (if (= sector disk-sectors) 1
+    (do (if (= (rem sector 1024) 0)
+          (kernel-out-u8 233 (+ 48 (quot sector 1024))) 0)
+        (if (= (read-sector 0 sector source) 1)
+          (if (= (write-sector 1 sector source) 1)
+            (copy-body source (+ sector 1))
+            (do (kernel-out-u8 233 119) 0))
+          (do (kernel-out-u8 233 114) 0)))))
+(defn verify-body [source target sector]
+  (if (= sector disk-sectors) 1
+    (if (= (read-sector 0 sector source) 1)
+      (if (= (read-sector 1 sector target) 1)
+        (if (= (equal? source target 0) 1)
+          (verify-body source target (+ sector 1))
+          0)
+        0)
+      0)))
+(defn publish-zero [source target]
+  (if (= (read-sector 0 0 source) 1)
+    (if (= (write-sector 1 0 source) 1)
+      (if (= (flush-target) 1)
+        (if (= (read-sector 1 0 target) 1)
+          (equal? source target 0)
+          0)
+        0)
+      0)
+    0))
+(defn install [source target]
+  (do (serial/trace-byte 73) ; I: entered installer decision
+  (if (and (= (identify 0 source) 1)
+           (= (identify 1 target) 1)
+           (= (read-sector 0 0 source) 1)
+           (= (kernel-load-u16-4k source 4096 510) 43605)
+           (= (target-blank? target 0) 1))
+    (do (serial/trace-byte 82) ; R: ready for a fresh keyboard phrase
+        (if (= (approved? 0) 1)
+          (if (= (copy-body source 1) 1)
+            (if (= (flush-target) 1)
+              (if (= (verify-body source target 1) 1)
+                (publish-zero source target)
+                0)
+              0)
+            0)
+          -1))
+    0)))
+(defn main [] :i64
+  (let [begin (kernel-out-u8 233 83) ; S: entered native main
+        started (serial/serial-init)
+        source (kernel-owned-page 0)
+        target (kernel-owned-page 1)
+        allocated (kernel-out-u8 233 65) ; A: page roots acquired
+        result (install source target)
+        marker (serial/trace-byte
+                 (if (= result 1) 80 (if (= result -1) 78 69)))]
+    (kernel-out-u32 244
+      (+ (if (= result 1) 16 (if (= result -1) 17 18))
+         (* 0 (+ begin started allocated marker))))))

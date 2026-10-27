@@ -103,6 +103,9 @@ def main(args):
             raise ValueError("kernel-v2 requires user-v4")
     elif args.user_target in ("x86_64-aiueos-user-v4", "x86_64-aiueos-user-v5"):
         raise ValueError("user-v4/v5 requires matching kernel layout")
+    if args.pci_resources_mode == "none" and (args.kernel_target != "x86_64-aiueos-kernel-v1"
+                                               or args.font or args.user_slot or args.user_source):
+        raise ValueError("non-PCI boot-info v5 is limited to kernel-v1 without dual payload")
     if ((args.font or args.user_slot or args.user_source)
             and (not args.font or not (args.user_slot or args.user_source) or args.payload)):
         raise ValueError("dual payload requires font and one user payload without legacy payload")
@@ -275,7 +278,7 @@ def main(args):
                 run("package-" + name, ["package-aiueos-boot", "KERNEL.ELF", "--output", name,
                     *(["--payload", "boot-payload.bin"] if payload else []),
                     *(["--font", "boot-font.bin", "--user-slot", "boot-user-slot.bin"] if font else []),
-                    "--pci-resources", "v1"])
+                    *(["--pci-resources", "v1"] if args.pci_resources_mode == "v1" else [])])
                 path = stage / name
                 if not path.is_file() or path.read_bytes().count((stage / "KERNEL.ELF").read_bytes()) != 1:
                     raise ValueError("EFI does not embed exact kernel once")
@@ -311,6 +314,7 @@ def main(args):
             if any(pin(stage / virtual[1:]) != sources[virtual] for virtual in modules):
                 raise ValueError("module bytes changed during build")
             state.update(state="MACOS_NATIVE_IMAGE_CANDIDATE", kernel=images[0], efi=efi_images[0],
+                         pciResourcesMode=args.pci_resources_mode,
                          images=images, efiImages=efi_images,
                          qualification="native Mac artifact reproduction; boot and desktop gates remain open")
             save()
@@ -345,6 +349,7 @@ if __name__ == "__main__":
                                                      "x86_64-aiueos-kernel-v2",
                                                      "x86_64-aiueos-kernel-v3"),
                         default="x86_64-aiueos-kernel-v1")
+    parser.add_argument("--pci-resources-mode", choices=("v1", "none"), default="v1")
     parser.add_argument("--user-target", choices=("x86_64-aiueos-user-v2",
                                                   "x86_64-aiueos-user-v3",
                                                   "x86_64-aiueos-user-v4",
