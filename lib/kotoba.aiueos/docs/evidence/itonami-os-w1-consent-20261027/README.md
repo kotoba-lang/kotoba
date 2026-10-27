@@ -21,7 +21,7 @@ by the panel, so nothing under it can be clicked.
 - The standard gate does not open the panel (it appears only on the goal-model profile); the checks above are manual.
 - QMP/HMP keys and clicks are synthetic and do not prove a human consent.
 - Why kernel-v3: kernel-v1's packager admission (amu seed/84-aiueos-boot.kotoba `eb-admit?`) requires RX to end below RW at
-  0x200000, i.e. at most 1,044,480 code bytes; this build is 1,048,064. kernel-v3 puts RW at 0x400000 (about 3 MiB for code).
+  0x200000, i.e. at most 1,044,480 code bytes; this build is 1,048,064. kernel-v3 puts RW at 0x400000 (about 3 MiB of packager room; the compiler's text cap for v3 stays 2 MiB, see native/layout-table.json).
 - The repository bootstrap compiler is v1-only, so the driver now refuses it with that explanation instead of failing in the packager.
 - check-native-desktop-qemu.py's expected CR3 depends on the layout (RW 0x200000 -> 0x30000, 0x400000 -> 0x130000); an unknown layout fails closed.
 

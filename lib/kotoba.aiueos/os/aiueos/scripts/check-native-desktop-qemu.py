@@ -23,7 +23,7 @@ def main(media,efi,kernel,font,qemu,firmware,out):
  goal_glyphs={cp:glyph_index(ord(cp)) for cp in ('a','b')}
  rw=struct.unpack_from('<IIQQQQQQ',image,120);context=rw[3];assert rw[5]==0x240000
  # The page-table root is fixed by the kernel target's layout: kernel-v1 has RW at 0x200000, kernel-v3 at 0x400000. An unknown layout fails closed.
- cr3_offset={0x200000:0x30000,0x400000:0x130000}[context]
+ cr3_offset=int(json.loads((HERE.parent/'native'/'layout-table.json').read_text())['rungs'][hex(context)]['pageTableRootOffset'],16)
  spec=importlib.util.spec_from_file_location('reader',HERE/'check-native-media-format.py');reader=importlib.util.module_from_spec(spec);spec.loader.exec_module(reader);format_proof=reader.verify(media,efi)
  out.mkdir(parents=True,exist_ok=False)
  args=[str(qemu),'-machine','q35,accel=tcg','-cpu','max','-m','128M','-smp','1','-drive',f'if=pflash,format=raw,readonly=on,file={firmware}',
@@ -136,7 +136,7 @@ def main(media,efi,kernel,font,qemu,firmware,out):
   key('esc');closed=wait('keyboard-closes-focused-card',lambda s:s['windows']==1 and s['lastKey']==1 and s['framesCompleted']>released['framesCompleted'])
   final=screenshot('desktop-after-input');assert first!=final
   assert pin(media)==before
-  report=dict(status='PASS_NATIVE_DESKTOP_INPUT_QEMU',kernel=pin(kernel),efi=pin(efi),media=before,font=pin(font),firmware=pin(firmware),observer=pin(Path(__file__)),independentMedia=format_proof,events=events,renderedGoalGlyphs=visual_glyphs,initialFuelRemaining=initial_fuel,sealedGop=dict(base=base,bytes=size,width=width,height=height,stride=stride,format=fmt,pciBarContained=True),screenshots=['desktop-initial.png','itonami-goal-a.png','itonami-goal-ab.png','desktop-after-input.png'],guestEmulation='QEMU TCG',blockDevice='q35 SATA with temporary overlay',privatePageTables=True,currentDomain=73,nativeCDCI=False,BrowserCSSOMParity=False,dappsExecuted=False,preemptiveScheduler=False,completeKernel=False,physicalHardware=False)
+  report=dict(status='PASS_NATIVE_DESKTOP_INPUT_QEMU',layoutTable=pin(HERE.parent/'native'/'layout-table.json'),kernel=pin(kernel),efi=pin(efi),media=before,font=pin(font),firmware=pin(firmware),observer=pin(Path(__file__)),independentMedia=format_proof,events=events,renderedGoalGlyphs=visual_glyphs,initialFuelRemaining=initial_fuel,sealedGop=dict(base=base,bytes=size,width=width,height=height,stride=stride,format=fmt,pciBarContained=True),screenshots=['desktop-initial.png','itonami-goal-a.png','itonami-goal-ab.png','desktop-after-input.png'],guestEmulation='QEMU TCG',blockDevice='q35 SATA with temporary overlay',privatePageTables=True,currentDomain=73,nativeCDCI=False,BrowserCSSOMParity=False,dappsExecuted=False,preemptiveScheduler=False,completeKernel=False,physicalHardware=False)
   (out/'native-desktop-qemu.json').write_text(json.dumps(report,indent=2)+'\n');print(report['status'])
  finally:
   if p.poll() is None:
