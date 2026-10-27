@@ -559,7 +559,7 @@ The bundled standard libraries live in this repository:
 | `kotoba.kamiMangakaExpression` | `kotoba.kamiMangakaExpression/src` | `kami.mangaka.expression` (Kotoba project library) |
 | `kotoba.kamiEngineSdk` | `kotoba.kamiEngineSdk/src` | `kami.avatar`, `kami.backend.browser`, `kami.backend.host`, `kami.benchmark` (Kotoba project library) |
 | `kotoba.kamiEngineCfd` | `kotoba.kamiEngineCfd/src` | `kami-cfd`, `kami-cfd.d3`, `kami-cfd.duct`, `kami-cfd.mesh` (Kotoba project library) |
-| `kotoba.kamiContracts` | `kotoba.kamiContracts/src` | `kami.app-fixtures`, `kami.app-state-machines`, `kami.component`, `kami.contracts.gpu` (Kotoba project library) |
+| `kotoba.kamiContracts` | `kotoba.kamiContracts/src` | `kami.app-fixtures-catalog`, `kami.app-state-machines`, `kami.component`, `kami.contracts.gpu` (Kotoba project library) |
 | `kotoba.kamiCadImport` | `kotoba.kamiCadImport/src` | `cad-import`, `cad-import.demos`, `cad-import.demos.roadster`, `cad-import.demos.synth-sedan` (Kotoba project library) |
 | `kotoba.kamiAutodrive` | `kotoba.kamiAutodrive/src` | `autodrive`, `autodrive.autopilot`, `autodrive.classes`, `autodrive.control` (Kotoba project library) |
 | `kotoba.kamiAppShibuya` | `kotoba.kamiAppShibuya/src` | `kotoba.shibuya` (Kotoba project library) |
@@ -848,6 +848,7 @@ The bundled standard libraries live in this repository:
 | `kotoba.kaiyu` | `kotoba.kaiyu/src` | `kaiyu.core`, `kaiyu.diagnose`, `kaiyu.session` (Kotoba project library) |
 | `kotoba.kaisha` | `kotoba.kaisha/src` | `kaisha.model`, `kaisha.validate` (Kotoba project library) |
 | `kotoba.jsonlogic` | `kotoba.jsonlogic/src` | `jsonlogic.core`, `jsonlogic.ports`, `jsonlogic.validate` (Kotoba project library) |
+| `kotoba.jsonrpc` | `kotoba.jsonrpc/src` | `org.jsonrpc` (Kotoba project library) |
 | `kotoba.jsonLd` | `kotoba.jsonLd/src` | `json-ld.core` (Kotoba project library) |
 | `kotoba.jpHiroshibaVoicevox` | `kotoba.jpHiroshibaVoicevox/src` | `voicevox.client`, `voicevox.speakers`, `voicevox.synthesize` (Kotoba project library) |
 | `kotoba.jiten` | `kotoba.jiten/src` | `jiten.core`, `jiten.link`, `jiten.revision`, `jiten.schema` (Kotoba project library) |
