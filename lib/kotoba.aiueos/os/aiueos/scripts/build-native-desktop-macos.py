@@ -279,7 +279,7 @@ def main(args):
                            else "PASS_NATIVE_CONSENT_QEMU" if args.profile == "consent"
                            else "PASS_NATIVE_DESKTOP_INPUT_QEMU")
         expected_events = (11 if args.profile == "local-draft"
-                           else 9 if args.profile == "consent" else 12)
+                           else 11 if args.profile == "consent" else 12)
         if (observed["status"] != expected_status
                 or len(observed["events"]) != expected_events
                 or observed["kernel"] != kernel_state["kernel"]
@@ -304,7 +304,8 @@ def main(args):
         elif args.profile == "consent":
             if (observed["font"] != font_state["padded"]
                     or [row["name"] for row in observed["events"]] != [
-                        "first-frame", "itonami-goal-typed", "consent-open",
+                        "first-frame", "itonami-goal-typed", "collapse-key", "collapse-click",
+                        "consent-open",
                         "launcher-key-ignored", "launcher-click-ignored", "key-deny",
                         "pointer-deny", "esc-deny", "pointer-allow"]
                     or observed["syntheticInputProvesHumanConsent"]):
