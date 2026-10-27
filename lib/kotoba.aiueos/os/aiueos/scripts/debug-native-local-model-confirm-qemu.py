@@ -364,6 +364,36 @@ def main():
         finally:
             base.close(process, qmp, log)
         assert disk.read_bytes() == second
+        edit_disk = output / "edited-goal.raw"
+        edit_disk.write_bytes(second)
+        directory = output / "edit-after-result"
+        process, qmp, log = base.boot(args, directory, edit_disk)
+        try:
+            wait(base, qmp, directory, context, "boot",
+                 lambda s: s["restore"] == 2 and s["modelToken"] == expected_token)
+            base.key(qmp, "2")
+            wait(base, qmp, directory, context, "open", lambda s: s["focus"] == 2)
+            base.key(qmp, "a")
+            edited = wait(base, qmp, directory, context, "edit",
+                          lambda s: s["goal"] == base.PREFIX + goal + "a"
+                          and s["modelToken"] == 0 and s["title"] == "Itonami")
+            base.key(qmp, "f5")
+            committed = wait(base, qmp, directory, context, "commit",
+                             lambda s: s["generation"] == 3 and s["commit"] == 3
+                             and s["modelToken"] == 0)
+        finally:
+            base.close(process, qmp, log)
+        directory = output / "edited-goal-restore"
+        process, qmp, log = base.boot(args, directory, edit_disk)
+        try:
+            edited_restored = wait(base, qmp, directory, context, "boot",
+                                   lambda s: s["goal"] == base.PREFIX + goal + "a"
+                                   and s["restore"] == 3 and s["generation"] == 3
+                                   and s["modelToken"] == 0 and s["pending"] == 0
+                                   and s["approved"] == 0 and s["title"] == "Itonami")
+        finally:
+            base.close(process, qmp, log)
+        assert disk.read_bytes() == second
         corrupt_disk = output / "corrupt-result.raw"
         corrupt = bytearray(second)
         corrupt[1024 + 20] ^= 1
@@ -383,6 +413,9 @@ def main():
         modified_disk.write_bytes(first)
     else:
         refused = None
+        edited = None
+        committed = None
+        edited_restored = None
         modified_disk = disk
     # A changed code byte in the sealed slot must fail before the guest copies
     # either user page or computes the local model. Keep the original EFI and
@@ -455,6 +488,9 @@ def main():
               "goal": goal, "expectedToken": expected_token,
               "modelContract": base.pin(matrix_path), "boots": boots,
               "corruptResultRefusal": refused,
+              "editedGoalClearedResult": edited,
+              "editedGoalCommitted": committed,
+              "editedGoalColdRestore": edited_restored,
               "modifiedSlotRefusal": modified,
               "scratchDisk": base.pin(disk), "qmpTransport": "private-stdio",
               "vncUsed": False, "networkUsed": False, "humanPasswordRequired": False,
