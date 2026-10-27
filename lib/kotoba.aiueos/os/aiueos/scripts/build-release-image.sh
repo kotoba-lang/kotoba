@@ -17,9 +17,13 @@ python3 "$aiueos/scripts/make-aiuefs-image.py" \
   --entry "app/hello,$aiueos/kotoba/user-smoke.elf,$aiueos/kotoba/user-smoke.sig" \
   --entry "app/worker,$aiueos/kotoba/user-smoke.elf,$aiueos/kotoba/user-smoke.sig" \
   --catalog-signature "$aiueos/kotoba/app-catalog.sig" --output "$data_image"
-python3 "$aiueos/scripts/make-release-image.py" build \
+set -- build \
   --efi "$efi" --kernel "$kernel" --initramfs "$initramfs" --data "$data_image" \
   --output "$image" --iso "$iso" --receipt "$receipt"
+if [ -n "${AIUEOS_DISTRIBUTION_JSON:-}" ]; then
+  set -- "$@" --distribution-json "$AIUEOS_DISTRIBUTION_JSON"
+fi
+python3 "$aiueos/scripts/make-release-image.py" "$@"
 python3 "$aiueos/scripts/make-release-image.py" verify \
   --image "$image" --iso "$iso" --efi "$efi" --kernel "$kernel" \
   --initramfs "$initramfs"

@@ -43,7 +43,7 @@ def main():
 
     out = Path(a.out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    (out / "aiueos-x86_64-build-receipt.sig").write_bytes(signature)
+    (out / (Path(a.receipt).stem + ".sig")).write_bytes(signature)
     print("AIUEOS_RELEASE_SIGNED receipt=%s bytes=%d" % (Path(a.receipt).name, len(body)))
 
 

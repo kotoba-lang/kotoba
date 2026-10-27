@@ -50,6 +50,32 @@ ISO_BOOT_BLOCKS = ISO_BOOT_SECTORS * SECTOR // ISO_BLOCK
 ISO_VOLUME_BLOCKS = ISO_BOOT_IMAGE_LBA + ISO_BOOT_BLOCKS
 
 
+def load_distribution(path):
+    """Bind an aiueos.distribution.v1 descriptor into the signed receipt.
+
+    The descriptor is build input (the shell repository's
+    distributions/<id>/distribution.json); recording its identity and digest
+    here is what makes a signed release say WHICH distribution it is. The
+    descriptor grants no authority, installs no components and qualifies
+    nothing; see distributions/README.md."""
+    source = Path(path)
+    descriptor = json.loads(source.read_text(encoding="utf-8"))
+    if descriptor.get("schema") != "aiueos.distribution.v1":
+        raise SystemExit("distribution descriptor must be aiueos.distribution.v1")
+    for key in ("id", "name", "configurationOwner"):
+        if not descriptor.get(key):
+            raise SystemExit("distribution descriptor is missing %s" % key)
+    return {
+        "id": descriptor["id"],
+        "name": descriptor["name"],
+        "base": descriptor.get("base"),
+        "configurationOwner": descriptor["configurationOwner"],
+        "descriptor": {"file": source.name,
+                       "bytes": source.stat().st_size,
+                       "sha256": sha256(source)},
+    }
+
+
 def sha256(path):
     h = hashlib.sha256()
     with open(path, "rb") as stream:
@@ -705,6 +731,8 @@ def main():
     build.add_argument("--data")
     build.add_argument("--iso")
     build.add_argument("--output", required=True); build.add_argument("--receipt", required=True)
+    build.add_argument("--distribution-json",
+                       help="aiueos.distribution.v1 descriptor to bind into the receipt")
     verify = sub.add_parser("verify")
     verify.add_argument("--image"); verify.add_argument("--iso")
     verify.add_argument("--efi"); verify.add_argument("--kernel")
@@ -778,6 +806,8 @@ def main():
                           "image_lba": ISO_BOOT_IMAGE_LBA,
                           "virtual_sectors": ISO_BOOT_SECTORS},
         }
+    if args.distribution_json:
+        receipt["distribution"] = load_distribution(args.distribution_json)
     Path(args.receipt).write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(args.output)
 
