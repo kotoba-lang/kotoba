@@ -173,12 +173,110 @@ def require_native(result, operation):
     return result.stdout
 
 
+def probe_ui_artifacts(output, executable, artifact_source):
+    """Stage historical PPM bytes; require one native verdict per fixed index."""
+    if not artifact_source.is_dir():
+        raise ValueError('UI artifact source directory missing')
+    receipt_bytes = (ROOT/UI_RECEIPT).read_bytes()
+    manifest = re.search(rb':screenshots-sha256\s*\{([^}]*)\}', receipt_bytes)
+    if manifest is None:
+        raise ValueError('UI screenshot manifest missing')
+    names = re.findall(rb'"([^"/]+\.ppm)"\s+"[0-9a-f]{64}"', manifest.group(1))
+    if len(names) != 117 or len(set(names)) != 117:
+        raise ValueError('UI screenshot manifest count or uniqueness changed')
+    positive = output/'ui-artifacts-positive'
+    target = positive/UI_RECEIPT.parent
+    target.mkdir(parents=True, mode=0o700)
+    shutil.copyfile(ROOT/UI_RECEIPT, target/'receipt.edn')
+    shutil.copyfile(artifact_source/'kernel-serial.log', target/'kernel-serial.log')
+    total_bytes = 0
+    for encoded in names:
+        name = encoded.decode('ascii')
+        candidate = artifact_source/name
+        if not candidate.is_file() or candidate.is_symlink():
+            raise ValueError(f'UI screenshot source missing or linked: {name}')
+        os.link(candidate, target/name)
+        total_bytes += candidate.stat().st_size
+
+    def observe(directory):
+        outcomes = []
+        for index in range(117):
+            (directory/'ui-artifact-index.bin').write_bytes(bytes([index]))
+            result = run(executable, directory, timeout=120)
+            expected = f'AIUEOS_UI_ARTIFACT {index}\n'.encode()
+            accepted = (result.returncode == 0 and result.stdout == expected
+                        and not result.stderr)
+            refused = (result.returncode == 1
+                       and result.stdout == b'AIUEOS_UI_ARTIFACT -1\n'
+                       and not result.stderr)
+            if not (accepted or refused):
+                raise ValueError(f'UI artifact native execution failed at {index}: '
+                                 f'{result.returncode} {result.stdout!r} {result.stderr!r}')
+            outcomes.append({'index': index, 'accepted': accepted})
+        return outcomes
+
+    positive_outcomes = observe(positive)
+    if not all(item['accepted'] for item in positive_outcomes):
+        raise ValueError('historical UI artifact positive native verdict failed')
+    controls = {}
+    first = names[0].decode('ascii')
+    for label in ('missing', 'tampered'):
+        directory = output/f'ui-artifacts-{label}'
+        shutil.copytree(positive, directory, copy_function=os.link)
+        index_file = directory/'ui-artifact-index.bin'
+        index_file.unlink()
+        changed = directory/UI_RECEIPT.parent/first
+        changed.unlink()
+        if label == 'tampered':
+            original = (artifact_source/first).read_bytes()
+            changed.write_bytes(bytes([original[0] ^ 1]) + original[1:])
+        outcomes = observe(directory)
+        refused = [item['index'] for item in outcomes if not item['accepted']]
+        if len(refused) != 1:
+            raise ValueError(f'UI artifact {label} did not refuse exactly one index: {refused}')
+        controls[label] = {'refusedIndices': refused, 'otherIndicesAccepted': 116}
+
+    for label, relative in (('receipt', UI_RECEIPT),
+                            ('serial-log', UI_RECEIPT.parent/'kernel-serial.log')):
+        directory = output/f'ui-artifacts-{label}-tampered'
+        shutil.copytree(positive, directory, copy_function=os.link)
+        (directory/'ui-artifact-index.bin').unlink()
+        changed = directory/relative
+        changed.unlink()
+        original = (positive/relative).read_bytes()
+        changed.write_bytes(bytes([original[0] ^ 1]) + original[1:])
+        (directory/'ui-artifact-index.bin').write_bytes(b'\x00')
+        result = run(executable, directory, timeout=120)
+        if (result.returncode != 1
+                or result.stdout != b'AIUEOS_UI_ARTIFACT -1\n'
+                or result.stderr):
+            raise ValueError(f'UI artifact {label} tamper was accepted')
+        controls[f'{label}-tampered'] = {'refusedIndex': 0}
+
+    (positive/'ui-artifact-index.bin').write_bytes(b'\x00\x01')
+    invalid_index = run(executable, positive, timeout=120)
+    if (invalid_index.returncode != 1
+            or invalid_index.stdout != b'AIUEOS_UI_ARTIFACT -1\n'
+            or invalid_index.stderr):
+        raise ValueError('UI artifact malformed index was accepted')
+    controls['malformed-index'] = {'refused': True}
+    return {'sourceDirectory': str(artifact_source),
+            'historicalScreenshotCount': 117, 'historicalScreenshotBytes': total_bytes,
+            'nativeAcceptedCount': 117, 'positive': positive_outcomes,
+            'negativeControls': controls,
+            'currentFeatureFreshnessVerified': False,
+            'productionReleaseSignatureVerified': False,
+            'physicalHardwareQualified': False}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--compiler', type=Path, required=True)
     parser.add_argument('--compiler-sha256', required=True)
     parser.add_argument('--packager', type=Path, required=True)
     parser.add_argument('--packager-sha256', required=True)
+    parser.add_argument('--ui-artifact-source-dir', type=Path,
+                        help='historical PPM directory for the optional native byte gate')
     parser.add_argument('--output', type=Path, required=True,
                         help='new private directory under github/workspaces')
     args = parser.parse_args()
@@ -449,6 +547,10 @@ def main():
             or result.stderr):
         raise ValueError('native wrong-key refusal mismatch')
 
+    ui_artifacts = (probe_ui_artifacts(output, executable,
+                    args.ui_artifact_source_dir.resolve())
+                    if args.ui_artifact_source_dir else None)
+
     report = {'schema': 'aiueos.native-scorecard-core-probe.v1',
               'status': 'CORE_SCHEMA_PASS_EVIDENCE_PENDING',
               'sourceCommit': commit, 'sourceAtCommit': source_at_commit,
@@ -460,6 +562,7 @@ def main():
               'compilerSha256': digest(compiler), 'packagerSha256': digest(packager),
               'executableSha256': digest(executable),
               'observations': observations,
+              'uiHistoricalArtifactNativeProbe': ui_artifacts,
               'receiptFieldsVerified': True, 'evidenceArtifactsVerified': False,
               'taggedReceiptRowBindingVerified': True,
               'admittedA2I3ReceiptAnchorsVerified': True,
