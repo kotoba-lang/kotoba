@@ -30,6 +30,15 @@ OWNER_ENV = {
 FUEL = 1073741824
 
 
+def owner_source_default(name):
+    # The standalone repo has sibling owners; the imported library lives under
+    # kotoba/lib and must resolve them from the canonical github forest root.
+    for parent in REPO.parents:
+        if parent.name == "github":
+            return parent / "kotoba-lang" / name / "kotoba"
+    return REPO.parent / name / "kotoba"
+
+
 def pin(path):
     raw = path.read_bytes()
     return {"bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
@@ -147,7 +156,7 @@ def main(args):
             name = dependency["repo"]
             if name not in OWNER_ENV:
                 raise ValueError("undeclared source owner")
-            default = REPO.parent / name / "kotoba"
+            default = owner_source_default(name)
             root = Path(os.environ.get(OWNER_ENV[name], default)).resolve(strict=True)
             for relative, expected in dependency["files"].items():
                 parts = Path(relative).parts
