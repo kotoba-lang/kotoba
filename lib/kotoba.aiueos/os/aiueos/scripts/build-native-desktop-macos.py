@@ -160,6 +160,7 @@ def main(args):
             "build-native-font-macos.py", "build-native-kernel-macos.py",
             "build-native-media-macos.py", "check-native-desktop-qemu.py",
             "check-native-draft-restart-qemu.py", "check-native-consent-qemu.py",
+            "check-native-idle-silent-qemu.py",
             "check-native-media-format.py",
         )
     }
@@ -265,6 +266,7 @@ def main(args):
 
         guest_script = ("check-native-draft-restart-qemu.py" if args.profile == "local-draft"
                         else "check-native-consent-qemu.py" if args.profile == "consent"
+                        else "check-native-idle-silent-qemu.py" if args.profile == "idle"
                         else "check-native-desktop-qemu.py")
         guest_args = [
             "--media", disk, "--efi", efi, "--kernel", image,
@@ -273,13 +275,16 @@ def main(args):
         call("qemu", scripts[guest_script], guest_args)
         receipt_name = ("native-draft-restart.json" if args.profile == "local-draft"
                         else "native-consent-qemu.json" if args.profile == "consent"
+                        else "native-idle-silent-qemu.json" if args.profile == "idle"
                         else "native-desktop-qemu.json")
         observed = json.loads((guest / receipt_name).read_text())
         expected_status = ("PASS_NATIVE_LOCAL_DRAFT_COLD_RESTORE" if args.profile == "local-draft"
                            else "PASS_NATIVE_CONSENT_QEMU" if args.profile == "consent"
+                           else "PASS_NATIVE_IDLE_SILENT_QEMU" if args.profile == "idle"
                            else "PASS_NATIVE_DESKTOP_INPUT_QEMU")
         expected_events = (11 if args.profile == "local-draft"
-                           else 11 if args.profile == "consent" else 12)
+                           else 11 if args.profile == "consent"
+                           else 4 if args.profile == "idle" else 12)
         if (observed["status"] != expected_status
                 or len(observed["events"]) != expected_events
                 or observed["kernel"] != kernel_state["kernel"]
@@ -301,6 +306,15 @@ def main(args):
                            for shot in observed["visibleGoalScreenshots"]
                            for row in shot["glyphs"])):
                 raise ValueError("local-draft persistence verdict is incomplete")
+        elif args.profile == "idle":
+            if (observed["font"] != font_state["padded"]
+                    or observed["measuredGuestFramesAfterFirstFrame"] != 0
+                    or [row["name"] for row in observed["events"]] != [
+                        "first-frame", "idle", "control", "input"]
+                    or observed["events"][1]["newFrames"] != 0
+                    or observed["events"][2]["newFrames"] < 1
+                    or observed["physicalHardware"]):
+                raise ValueError("idle-silent verdict is incomplete")
         elif args.profile == "consent":
             if (observed["font"] != font_state["padded"]
                     or [row["name"] for row in observed["events"]] != [
@@ -329,6 +343,7 @@ def main(args):
         state.update(state=("MACOS_NATIVE_DRAFT_RESTORE_QEMU_CANDIDATE"
                             if args.profile == "local-draft"
                             else "MACOS_NATIVE_CONSENT_QEMU_CANDIDATE" if args.profile == "consent"
+                            else "MACOS_NATIVE_IDLE_SILENT_QEMU_CANDIDATE" if args.profile == "idle"
                             else "MACOS_NATIVE_DESKTOP_QEMU_CANDIDATE"),
                      font=font_state["padded"], kernel=kernel_state["kernel"],
                      efi=kernel_state["efi"], media=media_state["image"],
@@ -339,6 +354,8 @@ def main(args):
                                     if args.profile == "local-draft"
                                     else "Mac native consent surface (Allow, Deny, modal) on QEMU"
                                     if args.profile == "consent"
+                                    else "Mac native idle desktop emits no guest frame on a captured virtual NIC (QEMU)"
+                                    if args.profile == "idle"
                                     else "Mac native build and QEMU desktop input")
                      + "; D2 workspace, release and physical gates separate")
         save()
@@ -365,7 +382,7 @@ if __name__ == "__main__":
     parser.add_argument("--firmware", type=Path, required=True)
     parser.add_argument("--firmware-sha256", required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--profile", choices=("desktop", "local-draft", "consent"), default="desktop")
+    parser.add_argument("--profile", choices=("desktop", "local-draft", "consent", "idle"), default="desktop")
     parser.add_argument("--distribution", choices=("aiueos", "awai"), default="aiueos")
     # kernel-v3 (RW at 0x400000) leaves the packager about 3 MiB of room (the compiler's
     # text cap stays 2 MiB, native/layout-table.json) instead of kernel-v1's
