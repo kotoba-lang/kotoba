@@ -154,8 +154,18 @@ def main(args):
         assert band(before_allow) != band(after_allow), "the Approved digit did not change after Allow"
         changed_cols = sorted({i % 120 for i, (u, v) in enumerate(zip(band(before_allow), band(after_allow))) if u != v})
         assert changed_cols and min(changed_cols) >= 80 and max(changed_cols) - min(changed_cols) < 10, changed_cols
+        # The Itonami home also states "Network: off" and "Telemetry: none" (rows y 205..222 and
+        # 225..242): both bands must carry ink on the white body, and the band under them must not.
+        def ink(raw, y0, y1):
+            w = raw[0]
+            return sum(1 for y in range(y0, y1) for x in range(180, 330)
+                       if raw[2][3 * (y * w + x):3 * (y * w + x) + 3] != b"\xff\xff\xff")
+        network_ink, telemetry_ink, below_ink = (ink(after_allow, 205, 223), ink(after_allow, 225, 243),
+                                                 ink(after_allow, 250, 290))
+        assert network_ink > 20 and telemetry_ink > 20 and below_ink == 0, (network_ink, telemetry_ink, below_ink)
         event("pointer-allow", pending=W(87), approved=W(88), stop=W(85),
-              approvedCount=S(2039) // 2, changedColumns=[changed_cols[0] + 180, changed_cols[-1] + 180])
+              approvedCount=S(2039) // 2, changedColumns=[changed_cols[0] + 180, changed_cols[-1] + 180],
+              networkInk=network_ink, telemetryInk=telemetry_ink)
     finally:
         try: send("quit", 0.5)
         except Exception: pass
