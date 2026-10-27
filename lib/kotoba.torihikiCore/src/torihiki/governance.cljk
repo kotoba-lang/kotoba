@@ -1,0 +1,131 @@
+(ns torihiki.governance
+  "Protocol upgrades decided by the chain, not by a deploy.
+
+  Roadmap D5. `torihiki-node` has a `code-version` it bumps by hand on every
+  deploy, and its README records what that costs: a Durable Object does not
+  pick up a deploy, and replicas on two versions compute different roots for
+  the same state, which looks exactly like the divergence the root exists to
+  catch. On a chain run by several operators the same thing has a worse name:
+  whoever deploys first changes the rules for everyone, or forks.
+
+  Here the PROTOCOL VERSION is chain state. A rule change ships in a binary
+  gated on `(active-version ex)`, and takes effect only when:
+
+  1. an active-set operator proposes `{:version v :activation h}` — `v` above
+     the current and any scheduled version, `h` at least `:notice` blocks
+     away, so every operator has time to install a binary that knows `v`;
+  2. operators holding more than 2/3 of the set's weight vote for it — the
+     same threshold that certifies a block;
+  3. the chain reaches height `h`. From that block on, `active-version` is
+     `v` on every replica at once.
+
+  A proposal that does not pass within `:ttl` blocks lapses. Nothing here can
+  lower the version.
+
+  What a node does with this is the node's business, and the rule is simple:
+  a binary that does not know the active version must STOP rather than keep
+  producing roots under rules it does not have. `supported?` is that check.
+
+  Absent from chains without a validator set: there is nobody to vote."
+  (:require [torihiki.validators :as vals]))
+
+(def default-params
+  {;; Blocks between a proposal passing and the version changing. At ~40
+   ;; blocks/s this is about four minutes — a devnet number; a real chain sets
+   ;; it against how long operators need to upgrade.
+   :notice 10000
+   ;; Blocks a proposal may wait for votes.
+   :ttl 100000})
+
+(defn enabled? [ex] (some? (:protocol ex)))
+
+(defn init
+  "Start at `version` (default 1) when the chain has a validator set."
+  [ex {:keys [version] :as params}]
+  (if (vals/enabled? ex)
+    (assoc ex :protocol {:version (or version 1)
+                         :params (merge default-params (dissoc params :version))
+                         :scheduled nil
+                         :proposals {}
+                         :seq 0})
+    ex))
+
+(defn active-version
+  "The protocol version the rules of the current block follow. 1 on a chain
+  that has no governance."
+  [ex]
+  (get-in ex [:protocol :version] 1))
+
+(defn supported?
+  "May a binary that knows versions up to `max-known` keep running this chain?"
+  [ex max-known]
+  (<= (active-version ex) max-known))
+
+(defn- member? [ex account] (some? (vals/member-of-account ex account)))
+
+(declare vote)
+
+(defn propose
+  [ex {:keys [account version activation]}]
+  (let [{:keys [scheduled seq params] cur :version} (:protocol ex)
+        v version
+        h (:height ex 0)
+        floor (max (or cur 1) (or (:version scheduled) 0))]
+    (if (or (not (enabled? ex))
+            (not (member? ex account))
+            (not (integer? v)) (<= v floor)
+            (not (integer? activation)) (< activation (+ h (:notice params))))
+      ex
+      (let [id (inc seq)
+            ex (-> ex
+                   (assoc-in [:protocol :seq] id)
+                   (assoc-in [:protocol :proposals id]
+                             ;; It must pass with its notice intact, so it stops
+                             ;; taking votes `notice` blocks before it would
+                             ;; activate, or at its ttl, whichever is first.
+                             {:version v :activation activation :by account
+                              :votes #{} :expires (min (+ h (:ttl params))
+                                                       (- activation (:notice params)))}))]
+        ;; The proposer's own vote.
+        (vote ex {:account account :proposal id})))))
+
+(defn vote
+  [ex {:keys [account proposal]}]
+  (let [p (get-in ex [:protocol :proposals proposal])]
+    (if (or (nil? p) (not (member? ex account))
+            ;; Past its last block for votes. Checked here rather than left to
+            ;; `expire`, which runs after the block's transactions and would
+            ;; let one more block of votes in. A vote that passes it this late
+            ;; would schedule a version with less notice than was promised.
+            (> (:height ex 0) (:expires p)))
+      ex
+      (let [votes (conj (:votes p) account)]
+        (if (vals/supermajority? ex votes)
+          ;; Passed. It replaces any scheduled upgrade only by being higher,
+          ;; which `propose` already required of it; every other proposal at
+          ;; or below it is now moot.
+          (-> ex
+              (assoc-in [:protocol :scheduled] {:version (:version p) :at (:activation p)
+                                                :proposal proposal})
+              (update-in [:protocol :proposals]
+                         (fn [ps] (into {} (remove (fn [[_ q]] (<= (:version q) (:version p)))) ps))))
+          (assoc-in ex [:protocol :proposals proposal :votes] votes))))))
+
+(defn activate
+  "At the start of block `height`: a scheduled version whose height has come
+  becomes the active one, before any transaction in the block runs."
+  [ex height]
+  (let [s (get-in ex [:protocol :scheduled])]
+    (if (and s (>= height (:at s)))
+      (-> ex
+          (assoc-in [:protocol :version] (:version s))
+          (assoc-in [:protocol :scheduled] nil))
+      ex)))
+
+(defn expire
+  "At the end of block `height`: proposals past their ttl lapse."
+  [ex height]
+  (if (enabled? ex)
+    (update-in ex [:protocol :proposals]
+               (fn [ps] (into {} (remove (fn [[_ p]] (> height (:expires p)))) ps)))
+    ex))

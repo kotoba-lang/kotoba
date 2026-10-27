@@ -1,0 +1,165 @@
+(ns torihiki.thorchain-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.text :as str]
+            [torihiki.keccak :as kc]
+            [torihiki.thorchain :as tc]))
+
+(deftest a-memo-names-one-account-or-nothing
+  (testing "the memo is the whole binding between a transfer on another chain
+            and an account here, and it is user-supplied text. THORChain memos
+            are already a command language (SWAP:, ADD:), so a loose parser is
+            one that reads somebody else's instruction as a deposit for
+            whichever account the digits happen to form."
+    (is (= 12345 (tc/parse-memo "TORIHIKI:12345")))
+    (is (nil? (tc/parse-memo "TORIHIKI:12345 ")) "trailing space")
+    (is (nil? (tc/parse-memo " TORIHIKI:12345")) "leading space")
+    (is (nil? (tc/parse-memo "torihiki:12345")) "case")
+    (is (nil? (tc/parse-memo "TORIHIKI:12a45")) "not digits")
+    (is (nil? (tc/parse-memo "TORIHIKI:")) "no account at all")
+    (is (nil? (tc/parse-memo "TORIHIKI:0")) "account zero is not an account")
+    (is (nil? (tc/parse-memo "SWAP:BTC.BTC:TORIHIKI:12345"))
+        "somebody else's instruction read as our deposit")
+    (is (nil? (tc/parse-memo nil)))))
+
+(defn- obs [& {:as m}]
+  (merge {"memo" "TORIHIKI:900" "tx_id" "ABC" "asset" "ETH.ETH"
+          "amount" 1000 "to" "vault-1" "height" 10}
+         m))
+
+(deftest only-what-arrived-in-our-vault-and-settled
+  (testing "an observation is a claim a validator is about to sign. Each of
+            these is a way for it to be about somebody else's money, or about
+            money THORChain can still take back."
+    (let [tip 100
+          ok (obs)]
+      (is (= 1 (count (tc/deposits-in 7 #{"vault-1"} tip [ok]))))
+      (is (empty? (tc/deposits-in 7 #{"vault-2"} tip [ok]))
+          "attested a transfer that never reached this venue")
+      (is (empty? (tc/deposits-in 7 #{"vault-1"} tip [(obs "memo" "hello")]))
+          "credited a deposit whose sender named no account")
+      (is (empty? (tc/deposits-in 7 #{"vault-1"} tip [(obs "amount" 0)]))
+          "attested a zero")
+      (is (empty? (tc/deposits-in 7 #{"vault-1"} 11 [(obs "height" 10)]))
+          "attested something one block deep, and an attestation cannot be
+           withdrawn")
+      (is (empty? (tc/deposits-in 7 #{"vault-1"} tip [(obs "tx_id" "")]))
+          "attested a transaction with no id — the key the credit is deduped on"))))
+
+(deftest an-observation-becomes-the-transaction-a-validator-signs
+  (let [[tx] (tc/deposits-in 7 #{"vault-1"} 100 [(obs)])]
+    (is (= {:tx :deposit-attest :account 7 :txid "ABC" :credit 900
+            :amount 1000 :asset "ETH.ETH"}
+           tx))))
+
+(deftest a-payout-settles-the-claim-its-memo-names
+  (let [tip 100
+        p {"memo" (tc/withdrawal-memo 42) "tx_id" "OUT-1"
+           "to" "0xabc" "height" 10}]
+    (is (= [{:tx :withdraw-attest :account 7 :claim 42
+             :txid "OUT-1" :dest "0xabc"}]
+           (tc/payouts-in 7 tip [p])))
+    (is (empty? (tc/payouts-in 7 tip [(assoc p "memo" "OUT")]))
+        "a payout naming no claim settled one anyway")))
+
+(deftest a-vault-that-churned-is-still-our-vault
+  (testing "THORChain rotates its asgard every few days, and a deposit sent to
+            the outgoing vault minutes before the rotation is still a real
+            deposit. A watcher holding one address stops crediting on every
+            churn and says nothing — the venue keeps running and quietly stops
+            taking money."
+    (let [old (obs "to" "vault-old")
+          new (obs "to" "vault-new")
+          both #{"vault-old" "vault-new"}]
+      (is (= 2 (count (tc/deposits-in 7 both 100 [old new]))))
+      (is (= 1 (count (tc/deposits-in 7 #{"vault-new"} 100 [old new])))
+          "the address that was ours an hour ago stopped being ours"))))
+
+;; ── reading the deposit off Ethereum ────────────────────────────────────────
+
+(defn- char-code
+  "The code point of one character of `s`.
+
+  `(int \\T)` is 84 on the JVM and **0** on ClojureScript, where there is no
+  character type and `int` is `(bit-or x 0)` over a one-character string. It
+  does not throw; it returns a number, so a fixture built with it produces a
+  well-formed ABI blob whose every byte is NUL.
+
+  That is what this file did until the suite was first run on ClojureScript.
+  `decode-deposit-data` was correct there all along -- verified against a
+  fixture built with this function -- but these assertions were exercising it
+  with a memo of nul bytes, so they proved nothing on the runtime that
+  deploys. A fixture that is wrong in the same direction as no fixture at all
+  is the failure this workspace names: a check that could not measure
+  returning the value of a check that measured and found nothing."
+  [c]
+  #?(:clj (int c) :cljs (.charCodeAt (str c) 0)))
+
+(defn- hex-byte [n]
+  (let [h (#?(:clj Integer/toHexString :cljs (fn [x] (.toString x 16))) n)]
+    (if (= 1 (count h)) (str "0" h) h)))
+
+(defn- format-word [n]
+  (let [h (#?(:clj Integer/toHexString :cljs (fn [x] (.toString x 16))) (int n))]
+    (str (apply str (repeat (- 64 (count h)) \0)) h)))
+
+(defn- abi-string
+  "A `string` as the ABI lays it out: offset, length, bytes padded to 32."
+  [s]
+  (let [hex (apply str (map (comp hex-byte char-code) s))
+        pad (- 64 (mod (count hex) 64))]
+    (str (format-word 0x40) (format-word (count s)) hex
+         (apply str (repeat (if (= 64 pad) 0 pad) \0)))))
+
+(deftest the-fixture-encodes-real-bytes-on-this-runtime
+  ;; The floor under the three tests below. Without it they pass on a memo of
+  ;; nul bytes, which is how they passed on the JVM while proving nothing on
+  ;; ClojureScript.
+  (is (= 84 (char-code \T)) "char-code returned 0 -- the fixture is nul bytes")
+  (is (= "TORIHIKI:900" (:memo (tc/decode-deposit-data
+                                (str "0x" (format-word 1) (abi-string "TORIHIKI:900")))))
+      "the fixture and the decoder disagree about the memo"))
+
+(defn- log-of [{:keys [vault memo amount block txid]}]
+  {"topics" ["0xdeadbeef"
+             (str "0x" (apply str (repeat 24 \0)) (subs vault 2))
+             (str "0x" (apply str (repeat 24 \0)) (apply str (repeat 40 \0)))]
+   "data" (str "0x" (format-word amount) (abi-string memo))
+   "transactionHash" txid
+   "blockNumber" (str "0x" (#?(:clj Integer/toHexString :cljs (fn [x] (.toString x 16))) block))})
+
+(deftest the-topic-is-derived-not-pasted
+  ;; A pasted topic is a constant nobody can check. This one is the keccak of
+  ;; the signature, computed by the same code that computes mapping slots.
+  (is (= 64 (count (kc/digest-hex (map int tc/deposit-event-signature))))))
+
+(deftest a-deposit-is-read-out-of-an-ethereum-log
+  (testing "THORChain's own hosts do not answer a Cloudflare Worker — four of
+            five could not even be resolved. The deposit is also an Ethereum
+            event, and the log carries every field an attestation needs."
+    (let [vault "0x1234567890abcdef1234567890abcdef12345678"
+          l (log-of {:vault vault :memo "TORIHIKI:900" :amount 4242
+                     :block 100 :txid "0xabc"})
+          [tx] (tc/deposits-from-logs 7 #{vault} 200 [l])]
+      (is (= 900 (:credit tx)))
+      (is (= 4242 (:amount tx)))
+      (is (= "0xabc" (:txid tx)))
+      (is (str/starts-with? (:asset tx) "ETH.")
+          "the asset was dropped — a quorum would agree about an amount of
+           nothing in particular"))))
+
+(deftest the-same-refusals-apply-to-a-log
+  (let [vault "0x1234567890abcdef1234567890abcdef12345678"
+        other "0x9999999999999999999999999999999999999999"
+        ok (log-of {:vault vault :memo "TORIHIKI:900" :amount 4242
+                    :block 100 :txid "0xabc"})]
+    (is (= 1 (count (tc/deposits-from-logs 7 #{vault} 200 [ok]))))
+    (is (empty? (tc/deposits-from-logs 7 #{other} 200 [ok]))
+        "attested a transfer into somebody else's vault")
+    (is (empty? (tc/deposits-from-logs 7 #{vault} 101 [ok]))
+        "attested a log one block deep — and an attestation cannot be
+         withdrawn")
+    (is (empty? (tc/deposits-from-logs
+                 7 #{vault} 200
+                 [(log-of {:vault vault :memo "hello" :amount 4242
+                           :block 100 :txid "0xabc"})]))
+        "credited a deposit whose sender named no account")))

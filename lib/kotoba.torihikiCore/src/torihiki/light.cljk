@@ -1,0 +1,117 @@
+(ns torihiki.light
+  "A light client: check one account's balance without replaying the chain
+  and without trusting any one server.
+
+  Roadmap D5. Blocks do not carry a state root — consensus orders
+  transactions and never compares what executing them produced — so the
+  root a client can trust has to be vouched for another way: each validator
+  signs `(chain, engine height, state root)` with its consensus key, and a
+  root is trusted when signatures from MORE THAN 2/3 of the set's weight name
+  it. That is the same threshold that certifies a block; a client that
+  accepts it trusts exactly what a full node trusts about who decides.
+
+  Then `torihiki.commit/verify` checks an account's leaf against that root.
+  The leaf's merkle-sum value is its collateral, so the balance itself is
+  what is proved, not just that some account exists.
+
+  Pure and portable: no network, no clock, no platform. Signature checking
+  is injected (`verify-fn` of `[pubkey payload sig] -> boolean`), so the
+  same code runs in a browser on WebCrypto results, in Node, or on the JVM,
+  and nothing here depends on where the validators run."
+  (:require [torihiki.commit :as cm]
+            [torihiki.fixed :as fx]))
+
+(defn root-payload
+  "The string a validator signs to vouch for `root` at engine `height`, as a
+  member of the set of engine epoch `epoch`.
+
+  The epoch is in the payload so a signature says WHICH set it speaks for: a
+  client holding the set of epoch n accepts only signatures made as members
+  of epoch n, and keys of validators that have since left — which nobody need
+  protect any more — cannot vouch for anything in it. Field-per-line with
+  names, like every signed payload here."
+  [chain-id epoch height root]
+  (str "torihiki/root/v2\n"
+       "chain=" chain-id "\n"
+       "epoch=" epoch "\n"
+       "height=" height "\n"
+       "root=" root "\n"))
+
+(defn attested-root
+  "The `{:height :root :signers :weight :total}` that validators holding more
+  than 2/3 of `members`' weight signed, as members of epoch `epoch`, or nil —
+  or `{:conflict [...]}` when two different roots at one height each carry
+  more than 1/3 of the weight. That cannot happen unless more than a third of
+  the set signed both, and a client should stop and show the evidence rather
+  than pick one.
+
+  `members` is `{witness {:pubkey :weight}}` — the set the client trusts for
+  that height (one weight each when the set carries no stake). Each witness
+  counts once, a signature that does not verify counts for nothing, and
+  attestations from outside the set are ignored rather than refused: a
+  server can relay whatever it was handed, and only the set's word adds up."
+  [attestations members chain-id epoch verify-fn]
+  ;; The weight sums are accumulators like every other: per-key in-domain,
+  ;; aggregate past the ceiling (falsify-14's class), and here the aggregate is
+  ;; a VERDICT. Both folds saturate through `fx/sadd`, so the threshold reads
+  ;; the same number on both runtimes. The thresholds themselves avoid the 3x
+  ;; product: `(* 3 w)` with an in-domain `w` over ~3e15 is not a double and
+  ;; rounds on JS while `(* 2 x)` — always even, always under 2^54 — is exact.
+  ;; `3w > 2t` reads as `w > 2(t − w)` and `3w > t` as `2w > t − w`; every
+  ;; operand is in-domain (weights are non-negative, a partial sum never
+  ;; exceeds the total), so every product here is twice an in-domain integer
+  ;; and the verdict is identical on both runtimes.
+  (let [total (reduce fx/sadd 0 (map :weight (vals members)))
+        valid (->> attestations
+                   (filter (fn [{:keys [witness height root sig]}]
+                             (when-let [m (get members witness)]
+                               (and (integer? height) (string? root) (string? sig)
+                                    (true? (try (verify-fn (:pubkey m)
+                                                           (root-payload chain-id epoch height root) sig)
+                                                (catch #?(:clj Throwable :cljs :default) _ false)))))))
+                   (group-by (juxt :height :root)))
+        weigh (fn [as] (reduce fx/sadd 0 (map #(:weight (get members %)) (set (map :witness as)))))
+        conflicts (->> valid
+                       (filter (fn [[_ as]]
+                                 (let [w (weigh as)]
+                                   (> (* 2 w) (- total w)))))
+                       (group-by (comp first key))
+                       (filter (fn [[_ rs]] (> (count rs) 1)))
+                       (mapcat val))]
+    (if (seq conflicts)
+      {:conflict (vec (for [[[h r] as] conflicts]
+                        {:height h :root r :signers (set (map :witness as))}))}
+      (some (fn [[[h r] as]]
+              (let [signers (set (map :witness as))
+                    weight (weigh as)]
+                (when (and (pos? total) (> weight (* 2 (- total weight))))
+                  {:height h :root r :signers signers :weight weight :total total})))
+            (sort-by (comp - first key) valid)))))
+
+(defn proof-from-json
+  "A proof as it arrives over JSON, made checkable again: the path's `:side`
+  is a keyword (`:left`/`:right`) and JSON turns it into a string, after
+  which every step reads as `:right` and a genuine proof fails. Idempotent."
+  [p]
+  (when p
+    (-> p
+        (update :proof (fn [steps] (mapv #(update % :side (fn [s] (when s (keyword s)))) steps)))
+        (update :bytes vec))))
+
+(defn verify-account
+  "Account `a`'s collateral, proved against an attested root, or nil.
+
+  `p` is a proof as `torihiki.commit/proof` returns it, for the same height
+  the root was attested at. The proof must be for `a`'s own leaf: a valid
+  proof of somebody else's balance is still a valid proof."
+  [p attested a]
+  (when-let [p (proof-from-json p)]
+  (when (and attested (:root attested)
+             ;; A one-leaf tree's root is the leaf itself, and then the sum is
+             ;; the server's word: a real exchange has more than one leaf, and
+             ;; a proof with no path proves nothing about the balance.
+             (seq (:proof p))
+             (= (:id p) (cm/account-leaf-id a))
+             (cm/verify p (:root attested)))
+    {:account a :collateral (:sum p) :height (:height attested)
+     :signers (:signers attested)})))
