@@ -1,0 +1,100 @@
+(ns kotoba-harness.main
+  (:export [main])
+  (:require [kotoba-harness.data :as d] [kotoba-harness.catalog :as c] [kotoba-harness.search :as s]
+            [kotoba-harness.decision :as j] [kotoba-harness.ledger :as l] [kotoba-harness.io :as io] [kotoba-harness.verification :as v]))
+
+(defn- exchange [effect :document] [:ref :harness/parsed]
+  (let [sent (io/send (d/json effect))]
+    (if (not= sent 0) (d/make-result (document-null) 0 "transport-write")
+      (let [reply (io/receive)]
+        (if (not (string=? (d/error reply) "")) reply (d/read-json (d/text (d/value reply))))))))
+(defn- verify [project :document bodies :document] :document
+  (let [sources (v/sources project bodies)]
+    (if (not (string=? (d/error sources) ""))
+      (document-map :passed (document-bool false) :blocked (document-bool true) :error (document-string (d/error sources)))
+      (let [data (d/value sources) effect (document-assoc data :op (document-string "verify")) reply (exchange effect)]
+        (if (not (string=? (d/error reply) ""))
+          (document-map :passed (document-bool false) :blocked (document-bool true) :error (document-string (d/error reply)))
+          (v/judge (d/value reply) (d/field data :checked)))))))
+(defn- list-json [xs [:list :document]] :string
+  (loop [i 0 out "["]
+    (if (= i (vector-count xs)) (str out "]")
+      (recur (+ i 1) (str out (if (= i 0) "" ",") (d/json (typed-list-nth [:list :document] xs i)))))))
+(defn- tokens [audit [:list :document] key :keyword] :document
+  (loop [i 0 total 0]
+    (if (= i (vector-count audit)) (document-i64 total)
+      (let [entry (typed-list-nth [:list :document] audit i) usage (d/field entry :usage) value (d/field usage key)]
+        (if (d/kind? (d/field entry :choice) :null) (recur (+ i 1) total)
+          (if (and (d/kind? value :i64) (>= (d/integer value) 0)) (recur (+ i 1) (+ total (d/integer value))) (document-null)))))))
+(defn- finish [config :document project :document method :string status :string error :string b :document verification :document
+               audit [:list :document] attempts [:list :document] spent :i64 started :i64] :i64
+  (let [sources (if (> (document-count b) 0) (v/sources project b) (d/make-result (document-null) 0 ""))
+        receipt (document-map :format (document-string "kotoba-harness.receipt/v1") :project (d/field project :id) :title (d/field project :title)
+          :method (document-string method) :status (document-string status) :error (if (string=? error "") (document-null) (document-string error))
+          :escalate (d/field config :escalate) :date (d/field config :date) :cases (d/field project :cases)
+          :program-sha256 (document-string (io/sha (document-edn-print (d/field project :program))))
+          :check-sha256 (document-string (io/sha (d/text (d/field project :check))))
+          :baseline-sha256 (document-string (io/sha (d/text (d/field project :baseline))))
+          :bodies b :verification verification :source (d/field (d/value sources) :source)
+          :wall-seconds (document-edn-read (str (- (io/now) started) "e-3"))
+          :input-tokens (tokens audit :input_tokens) :output-tokens (tokens audit :output_tokens) :api-usd (l/usd spent)
+          :native-route (d/field config :native-route))
+        base (d/json receipt)
+        json (str (string-substring base 0 (- (string-length base) 1)) ",\"decisions\":" (list-json audit) ",\"attempts\":" (list-json attempts) "}")
+        effect (document-map :op (document-string "finish") :receipt (document-string json)
+                 :exit (document-i64 (cond (or (string=? status "verified") (string=? status "valid")) 0 (string=? status "blocked") 78 :else 1)))
+        sent (io/send (d/json effect))]
+    (if (= sent 0) (d/integer (d/field effect :exit)) 78)))
+(defn- scripted [choices :document id :document] :document
+  (let [probs (loop [i 0 out (document-map)]
+                (if (= i (document-count choices)) out
+                  (let [key (d/field (d/at choices i) :id)]
+                    (recur (+ i 1) (document-assoc out key (document-i64 (if (document-equal? key id) 1 0)))))))]
+    (document-map :choice id :confidence (document-i64 1) :probabilities probs :model (document-string "native-script")
+      :usage (document-map :input_tokens (document-i64 0) :output_tokens (document-i64 0) :cost (document-i64 0)))))
+(defn- run-search [config :document project :document plan [:ref :harness/plan] method :string started :i64] :i64
+  (let [script (d/field config :script) budget (l/cost (d/field config :budget-usd))]
+    (loop [state (s/advance (s/start plan (d/truth (d/field config :escalate)))) index 0 spent 0 unknown false]
+      (cond (string=? (s/phase state) "done")
+              (finish config project method "verified" "" (s/bodies state) (s/verification state) (s/audit state) (s/attempts state) spent started)
+            (string=? (s/phase state) "refused")
+              (finish config project method (if (or unknown (string=? (s/failure state) "verification-blocked") (string=? (s/failure state) "provider-price-exceeded")) "blocked" "refused")
+                      (s/failure state) (document-map) (s/verification state) (s/audit state) (s/attempts state) (if unknown -1 spent) started)
+            (string=? (s/phase state) "verify")
+              (recur (s/verified state (verify project (s/bodies state))) index spent unknown)
+            (string=? method "scripted")
+              (if (or (not (d/kind? script :vector)) (>= index (document-count script)))
+                (recur (s/abort state "script-exhausted") index spent false)
+                (recur (s/answer state (scripted (s/offered state) (d/at script index)) (document-i64 0)) (+ index 1) spent false))
+            ;; 32,768 input tokens at the verified $0.042/M price. One request
+            ;; at a time, reserve its whole maximum before transmission. No
+            ;; transport retries; unknown charges stop the session.
+            (or (< budget 0) (> (+ spent 1376256000) budget))
+              (recur (s/abort state "api-budget") index spent false)
+            :else
+              (let [begin (io/now) raw (exchange (document-map :op (document-string "decide") :body (document-string (d/json (s/request state)))))
+                    observation (d/value raw) status (d/field observation :status)
+                    parsed (j/response (d/text (d/field observation :body)))
+                    answer (d/value parsed) charge (l/cost (d/field (d/field answer :usage) :cost))
+                    transport-ok (and (string=? (d/error raw) "") (d/kind? status :i64) (>= (d/integer status) 200) (< (d/integer status) 300))]
+                (cond (not transport-ok) (recur (s/abort state (if (and (d/kind? status :i64) (> (d/integer status) 0)) (str "provider-http-" (d/integer status)) "provider-transport")) index spent true)
+                      (or (not (string=? (d/error parsed) "")) (< charge 0))
+                        (recur (s/abort state (if (< charge 0) "provider-usage" (d/error parsed))) index spent true)
+                      (> charge 1376256000) (recur (s/abort state "provider-price-exceeded") index (+ spent charge) false)
+                      :else (recur (s/answer state answer (document-i64 (- (io/now) begin))) index (+ spent charge) false)))))))
+(defn main [] :i64
+  (let [initial (io/receive) parsed (d/read-json (d/text (d/value initial))) config (d/value parsed)
+        project-input (d/read-edn (d/text (d/field config :project))) project (d/value project-input)
+        method (d/text (d/field config :method)) plan (c/prepare (d/field project :program))
+        error (cond (not (string=? (d/error initial) "")) (d/error initial)
+                    (not (string=? (d/error parsed) "")) (d/error parsed)
+                    (not (string=? (d/error project-input) "")) (d/error project-input)
+                    :else (c/project-error project plan))
+        started (io/now) empty (typed-list-new [:list :document])]
+    (cond (not (string=? error "")) (finish config project method "refused" error (document-map) (document-null) empty empty 0 started)
+          (string=? method "validate") (finish config project method "valid" "" (document-map) (document-null) empty empty 0 started)
+          (or (string=? method "known") (string=? method "wrong"))
+            (let [b (d/field project (if (string=? method "known") :known :wrong)) result (verify project b)]
+              (finish config project method (cond (d/truth (d/field result :blocked)) "blocked" (d/truth (d/field result :passed)) "verified" :else "rejected") "" b result empty empty 0 started))
+          (or (string=? method "jev") (string=? method "scripted")) (run-search config project plan method started)
+          :else (finish config project method "refused" "method" (document-map) (document-null) empty empty 0 started))))
