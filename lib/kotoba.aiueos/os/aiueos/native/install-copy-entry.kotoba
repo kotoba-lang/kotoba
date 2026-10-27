@@ -1,19 +1,43 @@
 (ns aiueos.native.install-copy-entry
-  (:require [native.serial :as serial])
-  (:export [main]))
+  (:require [native.serial :as serial]
+            [aiueos.sha256 :as sha])
+  (:export [main aiueos-value-runtime-entry aiueos-value-runtime-syscall-plan
+            aiueos-value-runtime-publish-domain aiueos-value-runtime-provider-status
+            aiueos-value-runtime-capability-grant aiueos-value-runtime-provider-claim
+            aiueos-value-runtime-provider-complete aiueos-value-runtime-cas-verify]))
+
+;; The boot-payload root is in the sealed user-context image profile. This
+;; diagnostic does not enter user mode or offer a provider; all required
+;; ValueRuntime callback slots deny work while source admission is exercised.
+(defn aiueos-value-runtime-entry [a :i64 p :i64 u :i64 r :i64 c :i64] :i64 0)
+(defn aiueos-value-runtime-syscall-plan [n :i64 d :i64 p :i64 i :i64 s :i64] :i64 0)
+(defn aiueos-value-runtime-publish-domain [d :i64] :i64 0)
+(defn aiueos-value-runtime-provider-status [g :i64 a :i64] :i64 0)
+(defn aiueos-value-runtime-capability-grant [a :i64 s :i64 g :i64 r :i64 o :i64] :i64 0)
+(defn aiueos-value-runtime-provider-claim [] :i64 0)
+(defn aiueos-value-runtime-provider-complete [t :i64 r :i64 b :i64 n :i64 d :i64] :i64 0)
+(defn aiueos-value-runtime-cas-verify [b :i64 n :i64 e :i64 o :i64 w :i64] :i64 0)
 
 ;; QEMU diagnostic for the future AIUEOS-native installer block path. This
-;; runs in the guest: the host supplies only a pinned 8 MiB boot disk and an
-;; isolated blank 8 MiB target. No Linux process, dd or host-side copy writes
-;; the target. The real installer still needs signed release admission,
+;; runs in the guest: the booted installer carries a 512 KiB manifest payload,
+;; while a separate ATA source contains the image to install. The guest checks
+;; a SHA-256 sector chain over the entire source before touching the target.
+;; For fixed 16,384-sector images, H[0] is 32 zero bytes and
+;; H[i+1] = SHA256(H[i] || sector[i]). This diagnostic commitment is distinct
+;; from the ordinary whole-image SHA-256 in the host-side media receipt. No Linux
+;; process, dd or host-side copy writes the target. The manifest is not signed;
+;; the real installer still needs signed release admission,
 ;; target enumeration, a trusted human approval surface and recovery.
 ;;
-;; Primary master is read-only. Primary slave is the only writable unit.
+;; Guest code only reads primary master. Primary slave is its only write target;
+;; the observer independently verifies that the source backing file is intact.
 ;; A synthetic keyboard phrase tests the mechanism; QMP keys do not prove
 ;; human consent. Sector 0 is published only after every other sector has
 ;; been copied, flushed and read back.
 
 (def disk-sectors 16384)
+(def manifest-magic 3626328201566177601) ; "AIUEINS2" little-endian
+(def poll-limit 1048576)
 (def data-port 496)
 (def count-port 498)
 (def lba0-port 499)
@@ -27,17 +51,23 @@
   (kernel-load-u32-4k page 4096 offset))
 (defn put [page offset value]
   (kernel-store-u32-4k page 4096 offset value))
+(defn hex-code [digit]
+  (if (< digit 10) (+ 48 digit) (+ 87 digit)))
+(defn trace-status []
+  (let [status (kernel-in-u8 command-port)]
+    (do (serial/trace-byte (hex-code (quot status 16)))
+        (serial/trace-byte (hex-code (bit-and status 15))))))
 
 (defn ready [remaining data]
   (let [status (kernel-in-u8 command-port)]
     (if (or (= status 0) (= status 255)) 0
       (if (= remaining 0) 0
         (if (= (bit-and status 128) 128)
-          (ready (- remaining 1) data)
+          (do (kernel-pause) (ready (- remaining 1) data))
           (if (> (bit-and status 33) 0) 0
             (if (or (and (= data 1) (= (bit-and status 8) 8))
                     (and (= data 2) (= (bit-and status 8) 0))) 1
-              (ready (- remaining 1) data))))))))
+              (do (kernel-pause) (ready (- remaining 1) data)))))))))
 
 (defn select [unit sector command]
   (if (or (< sector 0) (>= sector disk-sectors)
@@ -48,31 +78,53 @@
       (kernel-in-u8 alt-status-port)
       (kernel-in-u8 alt-status-port)
       (kernel-in-u8 alt-status-port)
-      (if (= (ready 65536 2) 1)
+      (if (= (ready poll-limit 2) 1)
         (do (kernel-out-u8 count-port 1)
             (kernel-out-u8 lba0-port (bit-and sector 255))
             (kernel-out-u8 lba1-port (bit-and (quot sector 256) 255))
             (kernel-out-u8 lba2-port (bit-and (quot sector 65536) 255))
             (kernel-out-u8 command-port command)
-            (ready 65536 1))
+            (ready poll-limit 1))
         0))))
 
 (defn transfer-read [page offset]
   (if (= offset 512) 1
     (do (put page offset (kernel-in-u32 data-port))
         (transfer-read page (+ offset 4)))))
+(defn transfer-read-at [page offset]
+  (if (= offset 512) 1
+    (do (put page (+ 32 offset) (kernel-in-u32 data-port))
+        (transfer-read-at page (+ offset 4)))))
 (defn transfer-write [page offset]
   (if (= offset 512) 1
     (do (kernel-out-u32 data-port (word page offset))
         (transfer-write page (+ offset 4)))))
 (defn read-sector [unit sector page]
   (if (= (select unit sector 32) 1)
-      (if (= (transfer-read page 0) 1) (ready 65536 2) 0)
+      (if (= (transfer-read page 0) 1) (ready poll-limit 2) 0)
     0))
+(defn read-sector-at [unit sector page]
+  (if (= (select unit sector 32) 1)
+      (if (= (transfer-read-at page 0) 1)
+        (if (= (ready poll-limit 2) 1) 1
+          (do (serial/trace-byte 98) ; b: completion status refused
+              (trace-status) 0))
+        0)
+    (do (serial/trace-byte 97) ; a: device selection/status refused
+        (trace-status) 0)))
+(defn read-source-at [sector page retries]
+  (if (= (read-sector-at 0 sector page) 1) 1
+    (if (= retries 3)
+      (do (serial/trace-byte 90) ; Z: failed sector, little-endian u16
+          (serial/trace-byte (bit-and sector 255))
+          (serial/trace-byte (bit-and (quot sector 256) 255))
+          0)
+      (do (serial/trace-byte 120) ; x: one bounded source-read retry
+          (read-source-at sector page (+ retries 1))))))
 (defn write-sector [unit sector page]
   (if (not (= unit 1)) 0
     (if (= (select unit sector 48) 1)
-      (if (= (transfer-write page 0) 1) (ready 65536 2) 0)
+      (if (= (transfer-write page 0) 1) (ready poll-limit 2) 0)
       0)))
 (defn flush-target []
   (do (kernel-out-u8 drive-port 240)
@@ -80,13 +132,13 @@
       (kernel-in-u8 alt-status-port)
       (kernel-in-u8 alt-status-port)
       (kernel-in-u8 alt-status-port)
-      (if (= (ready 65536 2) 1)
-        (do (kernel-out-u8 command-port 231) (ready 65536 2))
+      (if (= (ready poll-limit 2) 1)
+        (do (kernel-out-u8 command-port 231) (ready poll-limit 2))
         0)))
 (defn identify [unit page]
   (if (= (select unit 0 236) 1)
     (if (= (transfer-read page 0) 1)
-      (if (= (ready 65536 2) 1)
+      (if (= (ready poll-limit 2) 1)
         (if (= (word page 120) disk-sectors) 1 0)
         0)
       0)
@@ -107,6 +159,51 @@
     (if (= (read-sector 1 sector page) 1)
       (if (= (blank? page 0) 1)
         (target-blank? page (+ sector 1))
+        0)
+      0)))
+
+(defn clear-prefix [page word-index]
+  (if (= word-index 8) 1
+    (do (put page (* word-index 4) 0)
+        (clear-prefix page (+ word-index 1)))))
+(defn copy-digest [page digest word-index]
+  (if (= word-index 8) 1
+    (do (put page (* word-index 4)
+             (kernel-load-u32 digest 32 (* word-index 4)))
+        (copy-digest page digest (+ word-index 1)))))
+(defn hash-step [page sector]
+  (if (= (read-source-at sector page 0) 1)
+    (let [input (kernel-subregion page 4096 0 544)
+          digest (kernel-subregion page 4096 544 32)
+          work (kernel-subregion page 4096 576 352)]
+      (if (= (sha/aiueos-sha256 input 544 digest work 352) 1)
+        (copy-digest page digest 0)
+        (do (serial/trace-byte 89) 0))) ; Y: SHA primitive refused
+    (do (serial/trace-byte 88) 0))) ; X: source read failed
+(defn hash-source [page sector]
+  (if (= sector disk-sectors) 1
+    (if (= (hash-step page sector) 1)
+      (do (if (= (mod sector 1024) 0) (serial/trace-byte 46) 0)
+          (hash-source page (+ sector 1)))
+      0)))
+(defn digest-equal? [page expected index]
+  (if (= index 32) 1
+    (if (= (kernel-load-u8-4k page 4096 (+ 544 index))
+           (kernel-load-u8 expected 32 index))
+      (digest-equal? page expected (+ index 1))
+      0)))
+(defn source-admitted? [payload page]
+  (let [header (kernel-subregion payload 524288 0 64)
+        expected (kernel-subregion header 64 24 32)]
+    (if (and (= (kernel-load-u64 header 64 0) manifest-magic)
+             (= (kernel-load-u64 header 64 8) 2)
+             (= (kernel-load-u64 header 64 16) (* disk-sectors 512)))
+      (if (= (clear-prefix page 0) 1)
+        (if (= (hash-source page 0) 1)
+          (do (serial/trace-byte 72) ; H: every sector was hashed
+              (if (= (digest-equal? page expected 0) 1) 1
+                (do (serial/trace-byte 68) 0))) ; D: digest mismatch
+          (do (serial/trace-byte 70) 0)) ; F: chain failed before comparison
         0)
       0)))
 
@@ -157,13 +254,14 @@
         0)
       0)
     0))
-(defn install [source target]
+(defn install [source target work payload]
   (do (serial/trace-byte 73) ; I: entered installer decision
   (if (and (= (identify 0 source) 1)
            (= (identify 1 target) 1)
            (= (read-sector 0 0 source) 1)
            (= (kernel-load-u16-4k source 4096 510) 43605)
-           (= (target-blank? target 0) 1))
+           (= (target-blank? target 0) 1)
+           (= (source-admitted? payload work) 1))
     (do (serial/trace-byte 82) ; R: ready for a fresh keyboard phrase
         (if (= (approved? 0) 1)
           (if (= (copy-body source 1) 1)
@@ -180,8 +278,10 @@
         started (serial/serial-init)
         source (kernel-owned-page 0)
         target (kernel-owned-page 1)
+        work (kernel-owned-page 2)
+        payload (kernel-boot-payload)
         allocated (kernel-out-u8 233 65) ; A: page roots acquired
-        result (install source target)
+        result (install source target work payload)
         marker (serial/trace-byte
                  (if (= result 1) 80 (if (= result -1) 78 69)))]
     (kernel-out-u32 244
