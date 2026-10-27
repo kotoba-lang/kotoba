@@ -1,0 +1,119 @@
+(ns aiueos.ed25519
+  (:require [aiueos.gf25519 :as gf]
+            [aiueos.sha512 :as sha])
+  (:export [aiueos-ed25519-pubkey main]))
+
+;; Ed25519 public key from a 32-byte seed (RFC 8032 section 5.1.5) for the freestanding aiueos kernel,
+;; after TweetNaCl: SHA-512 of the seed, clamp, fixed-window-free double-and-add over extended twisted
+;; Edwards coordinates with a constant-time conditional swap (mask select, no branch on the scalar bit),
+;; then affine conversion and encoding (y, with the sign of x in the top bit).
+;; Workspace words (a caller-owned 4096-byte region, reused after the hash): P 0..63 (X,Y,Z,T of 16 words),
+;; Q 64..127, temporaries a,b,c,d,t at 128, 144, 160, 176, 192, the constant 2d at 208, tx 224, ty 240,
+;; zi 256, scalar bytes 272..303. The field multiply keeps its own scratch at words 320..431 (see gf25519).
+;; No signing, no secret erasure beyond what the caller does, no side-channel claim beyond the swap.
+
+(defn c-d2 [i] (case i 0 61785 1 9906 2 39828 3 60374 4 45398 5 33411 6 5274 7 224 8 53552 9 61171 10 33010 11 6542 12 64743 13 22239 14 55772 15 9222 0))
+(defn c-x [i] (case i 0 54554 1 36645 2 11616 3 51542 4 42930 5 38181 6 51040 7 26924 8 56412 9 64982 10 57905 11 49316 12 21502 13 52590 14 14035 15 8553 0))
+(defn c-y [i] (case i 0 26200 1 26214 2 26214 3 26214 4 26214 5 26214 6 26214 7 26214 8 26214 9 26214 10 26214 11 26214 12 26214 13 26214 14 26214 15 26214 0))
+(defn c-xy [i] (case i 0 56739 1 42423 2 35507 3 28126 4 21237 5 30545 6 40832 7 8432 8 58237 9 25771 10 20110 11 26346 12 30309 13 55179 14 24335 15 26503 0))
+
+(defn load-const [ws o which i]
+  (if (= i 16) 1
+    (let [v (if (= which 0) (c-d2 i) (if (= which 1) (c-x i) (if (= which 2) (c-y i) (c-xy i))))
+          s (gf/st ws (+ o i) v)]
+      (load-const ws o which (+ i 1 (* 0 s))))))
+
+(defn set-elem [ws o v i]
+  (if (= i 16) 1
+    (let [s (gf/st ws (+ o i) (if (= i 0) v 0))]
+      (set-elem ws o v (+ i 1 (* 0 s))))))
+
+;; point set: P := (0, 1, 1, 0)
+(defn point-identity [ws]
+  (let [x (set-elem ws 0 0 0) y (set-elem ws 16 1 0) z (set-elem ws 32 1 0) t (set-elem ws 48 0 0)]
+    (+ 1 (* 0 (+ x (+ y (+ z t)))))))
+
+;; Q := base point (X, Y, 1, X*Y)
+(defn point-base [ws]
+  (let [x (load-const ws 64 1 0) y (load-const ws 80 2 0) z (set-elem ws 96 1 0) t (load-const ws 112 3 0)]
+    (+ 1 (* 0 (+ x (+ y (+ z t)))))))
+
+;; constant-time conditional swap of two 64-word points, mask = -b
+(defn swap-word [ws p q mask i]
+  (if (= i 64) 1
+    (let [x (gf/ld ws (+ p i))
+          y (gf/ld ws (+ q i))
+          t (bit-and mask (bit-xor x y))
+          a (gf/st ws (+ p i) (bit-xor x t))
+          b (gf/st ws (+ q i) (bit-xor y t))]
+      (swap-word ws p q mask (+ i 1 (* 0 (+ a b)))))))
+
+(defn point-swap [ws p q b] (swap-word ws p q (- 0 b) 0))
+
+;; p := p + q (extended coordinates, TweetNaCl add); temporaries a b c d t at 128..207
+(defn point-add [ws p q]
+  (let [s1 (gf/gf-sub ws 128 (+ p 16) p 0)
+        s2 (gf/gf-sub ws 192 (+ q 16) q 0)
+        m1 (gf/gf-mul ws 128 128 192)
+        a1 (gf/gf-add ws 144 p (+ p 16) 0)
+        a2 (gf/gf-add ws 192 q (+ q 16) 0)
+        m2 (gf/gf-mul ws 144 144 192)
+        m3 (gf/gf-mul ws 160 (+ p 48) (+ q 48))
+        m4 (gf/gf-mul ws 160 160 208)
+        m5 (gf/gf-mul ws 176 (+ p 32) (+ q 32))
+        a3 (gf/gf-add ws 176 176 176 0)
+        e (gf/gf-sub ws 192 144 128 0)
+        h (gf/gf-add ws 128 144 128 0)
+        f (gf/gf-sub ws 144 176 160 0)
+        g (gf/gf-add ws 160 176 160 0)
+        o0 (gf/gf-mul ws p 192 144)
+        o1 (gf/gf-mul ws (+ p 16) 128 160)
+        o2 (gf/gf-mul ws (+ p 32) 160 144)
+        o3 (gf/gf-mul ws (+ p 48) 192 128)]
+    (+ 1 (* 0 (+ s1 (+ s2 (+ m1 (+ a1 (+ a2 (+ m2 (+ m3 (+ m4 (+ m5 (+ a3 (+ e (+ h (+ f (+ g (+ o0 (+ o1 (+ o2 o3)))))))))))))))))))))
+
+(defn scalar-bit [ws i]
+  (bit-and (u64-shift-right (gf/ld ws (+ 272 (quot i 8))) (bit-and i 7)) 1))
+
+(defn scalar-loop [ws i]
+  (if (< i 0) 1
+    (let [b (scalar-bit ws i)
+          s1 (point-swap ws 0 64 b)
+          a1 (point-add ws 64 0)
+          a2 (point-add ws 0 0)
+          s2 (point-swap ws 0 64 b)]
+      (scalar-loop ws (- i (+ 1 (* 0 (+ s1 (+ a1 (+ a2 s2))))))))))
+
+;; scalar bytes (clamped hash half) into words 272..303
+(defn put-scalar [ws hash i]
+  (if (= i 32) 1
+    (let [v (kernel-load-u8 hash 64 i)
+          v2 (if (= i 0) (bit-and v 248) (if (= i 31) (bit-or (bit-and v 127) 64) v))
+          s (gf/st ws (+ 272 i) v2)]
+      (put-scalar ws hash (+ i 1 (* 0 s))))))
+
+(defn flip-sign-byte [out]
+  (let [x (kernel-load-u8 (kernel-subregion out 128 32 1) 1 0)
+        y (kernel-load-u8 (kernel-subregion out 128 31 1) 1 0)
+        s (kernel-store-u8 (kernel-subregion out 128 31 1) 1 0
+                           (bit-xor y (i64-shift-left (bit-and x 1) 7)))]
+    (+ 1 (* 0 s))))
+
+;; out (128 bytes): bytes 0..31 the encoded public key; 32..63 scratch (packed x)
+(defn aiueos-ed25519-pubkey [seed :i64 out :i64 ws :i64 hash :i64] :i64
+  (let [sc (kernel-subregion ws 4096 0 4096)
+        h (sha/aiueos-sha512 seed 32 hash sc 4096)
+        ps (put-scalar sc hash 0)
+        id (point-identity sc)
+        bs (point-base sc)
+        d2 (load-const sc 208 0 0)
+        lp (scalar-loop sc 255)
+        zi (gf/gf-inv sc 256 32)
+        tx (gf/gf-mul sc 224 0 256)
+        ty (gf/gf-mul sc 240 16 256)
+        py (gf/gf-pack sc out 0 240)
+        px (gf/gf-pack sc out 32 224)
+        fl (flip-sign-byte out)]
+    (+ 1 (* 0 (+ h (+ ps (+ id (+ bs (+ d2 (+ lp (+ zi (+ tx (+ ty (+ py (+ px fl)))))))))))))))
+
+(defn main [] :i64 0)
