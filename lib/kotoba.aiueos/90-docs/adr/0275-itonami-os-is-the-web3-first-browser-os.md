@@ -4,7 +4,7 @@ Date: 2026-10-27
 
 ## Status
 
-Accepted direction (owner request 2026-10-27). **Nothing below is implemented by this ADR**: it fixes the positioning, the
+Accepted direction (owner request 2026-10-27). **Nothing below is claimed as done except these native-desktop slices** (2026-10-27, kernel-v3 desktop, QEMU only): the launcher status area, dock markers, the Itonami goal field and trust summary (items 1, 2, 4, 5, first slices) the consent surface half of W1 and a first measured slice of W8 (the idle desktop emits no guest frame on a virtual NIC; `docs/evidence/itonami-os-w8-idle-silent-20261027`) (`docs/evidence/itonami-os-w1-consent-20261027`; the gate does not open the panel, so the other half of W1, a gate that does, is open): it fixes the positioning, the
 scorecard and the order of work. Every row is `:spec` until its gate prints green; no row is claimed. Extends ADR-0274 (Itonami OS is
 the `awai` distribution of AIUEOS); it creates no kernel, ABI, signer or trust root.
 
