@@ -1,0 +1,165 @@
+(ns aiueos.gf25519
+  (:export [aiueos-gf25519-selftest main]))
+
+;; GF(2^255 - 19) for the freestanding aiueos kernel, after TweetNaCl: an element is 16 limbs of
+;; nominally 16 bits held in u64 words of a caller-owned 4096-byte workspace region (the words are
+;; used as signed i64: limbs may go negative after a subtraction and are renormalised by the carry
+;; pass). There is no arithmetic shift in the native subset, so a floor shift right by 16 is
+;; (u64-shift-right (+ v 2^52) 16) minus 2^36, valid for |v| < 2^52 (the largest value here is below 2^45).
+;; Workspace (word offsets): elements are addressed by word offset; the multiply uses 31 words at 400.
+;; Functions return 1 (or a value); every store is sequenced with `(* 0 stored)`.
+
+(defn ld [ws i] (kernel-load-u64-4k ws 4096 (* i 8)))
+(defn st [ws i v]
+  (let [stored (kernel-store-u64-4k ws 4096 (* i 8) v)]
+    (+ 1 (* 0 stored))))
+
+(defn asr16 [v] (- (u64-shift-right (+ v 4503599627370496) 16) 68719476736))
+
+;; carry pass over o (16 limbs): TweetNaCl car25519
+(defn car-step [ws o i]
+  (let [v (+ (ld ws (+ o i)) 65536)
+        c (asr16 v)
+        next (if (= i 15) o (+ o (+ i 1)))
+        add (if (= i 15) (+ (- c 1) (* 37 (- c 1))) (- c 1))
+        s1 (st ws next (+ (ld ws next) add))
+        s0 (st ws (+ o i) (- v (i64-shift-left c 16)))]
+    (+ 1 (* 0 (+ s1 s0)))))
+
+(defn car-loop [ws o i]
+  (if (= i 16) 1
+    (let [r (car-step ws o i)]
+      (car-loop ws o (+ i 1 (* 0 r))))))
+
+(defn gf-car [ws o] (+ (car-loop ws o 0) 0))
+
+(defn gf-add [ws o a b i]
+  (if (= i 16) 1
+    (let [s (st ws (+ o i) (+ (ld ws (+ a i)) (ld ws (+ b i))))]
+      (gf-add ws o a b (+ i 1 (* 0 s))))))
+
+(defn gf-sub [ws o a b i]
+  (if (= i 16) 1
+    (let [s (st ws (+ o i) (- (ld ws (+ a i)) (ld ws (+ b i))))]
+      (gf-sub ws o a b (+ i 1 (* 0 s))))))
+
+(defn gf-copy [ws o a i]
+  (if (= i 16) 1
+    (let [s (st ws (+ o i) (ld ws (+ a i)))]
+      (gf-copy ws o a (+ i 1 (* 0 s))))))
+
+;; product accumulation: t (words 400..430) += a[i] * b[j]
+(defn mul-clear [ws i]
+  (if (= i 31) 1
+    (let [s (st ws (+ 400 i) 0)]
+      (mul-clear ws (+ i 1 (* 0 s))))))
+
+(defn mul-inner [ws a b i j]
+  (if (= j 16) 1
+    (let [s (st ws (+ 400 (+ i j))
+                (+ (ld ws (+ 400 (+ i j))) (* (ld ws (+ a i)) (ld ws (+ b j)))))]
+      (mul-inner ws a b i (+ j 1 (* 0 s))))))
+
+(defn mul-outer [ws a b i]
+  (if (= i 16) 1
+    (let [r (mul-inner ws a b i 0)]
+      (mul-outer ws a b (+ i 1 (* 0 r))))))
+
+(defn mul-fold [ws i]
+  (if (= i 15) 1
+    (let [s (st ws (+ 400 i) (+ (ld ws (+ 400 i)) (* 38 (ld ws (+ 400 (+ i 16))))))]
+      (mul-fold ws (+ i 1 (* 0 s))))))
+
+(defn mul-store [ws o i]
+  (if (= i 16) 1
+    (let [s (st ws (+ o i) (ld ws (+ 400 i)))]
+      (mul-store ws o (+ i 1 (* 0 s))))))
+
+(defn gf-mul [ws o a b]
+  (let [c (mul-clear ws 0)
+        p (mul-outer ws a b (* 0 c))
+        f (mul-fold ws (* 0 p))
+        m (mul-store ws o (* 0 f))
+        c1 (gf-car ws o)
+        c2 (gf-car ws o)]
+    (+ 1 (* 0 (+ c (+ p (+ f (+ m (+ c1 c2)))))))))
+
+;; inverse by z^(p-2): TweetNaCl inv25519. c at 320, input at i; result in o.
+(defn inv-loop [ws c i a]
+  (if (< a 0) 1
+    (let [sq (gf-mul ws c c c)
+          ml (if (or (= a 2) (= a 4)) 0 (gf-mul ws c c i))]
+      (inv-loop ws c i (- a (+ 1 (* 0 (+ sq ml))))))))
+
+(defn gf-inv [ws o i]
+  (let [cp (gf-copy ws 320 i 0)
+        lp (inv-loop ws 320 i (+ 253 (* 0 cp)))
+        out (gf-copy ws o 320 0)]
+    (+ 1 (* 0 (+ cp (+ lp out))))))
+
+;; unpack 32 little-endian bytes (region `bytes`, 32 long) into limbs of o
+(defn byte-at [bytes i] (kernel-load-u8 bytes 32 i))
+(defn unpack-loop [ws o bytes i]
+  (if (= i 16) 1
+    (let [s (st ws (+ o i) (+ (byte-at bytes (* 2 i)) (i64-shift-left (byte-at bytes (+ (* 2 i) 1)) 8)))]
+      (unpack-loop ws o bytes (+ i 1 (* 0 s))))))
+(defn gf-unpack [ws o bytes]
+  (let [u (unpack-loop ws o bytes 0)
+        top (st ws (+ o 15) (bit-and (ld ws (+ o 15)) 32767))]
+    (+ 1 (* 0 (+ u top)))))
+
+;; pack: TweetNaCl pack25519. t at 340, m at 360.
+(defn pack-sub-loop [ws i]
+  (if (= i 15) 1
+    (let [prev (ld ws (+ 360 (- i 1)))
+          borrow (if (< prev 0) 1 0)
+          s (st ws (+ 360 i) (- (ld ws (+ 340 i)) (+ 65535 borrow)))
+          s2 (st ws (+ 360 (- i 1)) (bit-and prev 65535))]
+      (pack-sub-loop ws (+ i 1 (* 0 (+ s s2)))))))
+
+(defn pack-round [ws]
+  (let [m0 (st ws 360 (- (ld ws 340) 65517))
+        lp (pack-sub-loop ws (+ 1 (* 0 m0)))
+        prev (ld ws 374)
+        borrow (if (< prev 0) 1 0)
+        m15 (st ws 375 (- (ld ws 355) (+ 32767 borrow)))
+        b (if (< (ld ws 375) 0) 1 0)
+        fix (st ws 374 (bit-and prev 65535))
+        copy (if (= b 0) (gf-copy ws 340 360 0) 1)]
+    (+ 1 (* 0 (+ m0 (+ lp (+ m15 (+ fix copy))))))))
+
+(defn put-byte [out at v] (kernel-store-u8 (kernel-subregion out 128 at 1) 1 0 v))
+(defn pack-bytes [ws out base i]
+  (if (= i 16) 1
+    (let [t (ld ws (+ 340 i))
+          a (put-byte out (+ base (* 2 i)) (bit-and t 255))
+          b (put-byte out (+ base (+ (* 2 i) 1)) (bit-and (u64-shift-right t 8) 255))]
+      (pack-bytes ws out base (+ i 1 (* 0 (+ a b)))))))
+
+(defn gf-pack [ws out base n]
+  (let [cp (gf-copy ws 340 n 0)
+        c1 (gf-car ws 340) c2 (gf-car ws 340) c3 (gf-car ws 340)
+        r1 (pack-round ws) r2 (pack-round ws)
+        by (pack-bytes ws out base 0)]
+    (+ 1 (* 0 (+ cp (+ c1 (+ c2 (+ c3 (+ r1 (+ r2 by))))))))))
+
+;; Self-test entry: inputs a and b (32-byte regions) and a 128-byte output laid out as
+;; a*b, inv(a), a+b, a-b (32 bytes each, canonical little-endian). Workspace words: a at 0, b at 16,
+;; results at 32, 48, 64, 80.
+(defn aiueos-gf25519-selftest [a :i64 b :i64 out :i64 ws :i64] :i64
+  (let [s (kernel-subregion ws 4096 0 4096)
+        ua (gf-unpack s 0 a)
+        ub (gf-unpack s 16 b)
+        m (gf-mul s 32 0 16)
+        v (gf-inv s 48 0)
+        ad (gf-add s 64 0 16 0)
+        ac (gf-car s 64)
+        sb (gf-sub s 80 0 16 0)
+        sc (gf-car s 80)
+        p0 (gf-pack s out 0 32)
+        p1 (gf-pack s out 32 48)
+        p2 (gf-pack s out 64 64)
+        p3 (gf-pack s out 96 80)]
+    (+ 1 (* 0 (+ ua (+ ub (+ m (+ v (+ ad (+ ac (+ sb (+ sc (+ p0 (+ p1 (+ p2 p3)))))))))))))))
+
+(defn main [] :i64 0)
