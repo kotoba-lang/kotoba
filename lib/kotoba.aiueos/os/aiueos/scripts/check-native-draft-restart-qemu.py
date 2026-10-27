@@ -304,6 +304,19 @@ def main(args):
             active.close();active=None
             assert disk.read_bytes()==data, (name, 'refusal wrote disk')
             events.append(dict(name=name+'-refused-without-write', state=state))
+        # A copied marker does not identify the provisioned device. The
+        # guest must read ATA IDENTIFY and refuse a larger primary-slave disk
+        # before touching any of its sectors.
+        oversized_disk = args.output/'oversized-draft.raw'
+        oversized = bytes(blank) + bytes(128*512)
+        oversized_disk.write_bytes(oversized)
+        active = Guest(args, args.output/'oversized-medium', oversized_disk)
+        state = active.boot(-22, '')
+        active.open();active.commit(-24)
+        active.close();active=None
+        assert oversized_disk.read_bytes()==oversized, 'oversized refusal wrote disk'
+        events.append(dict(name='oversized-medium-refused-without-write', state=state,
+                           disk=pin(oversized_disk)))
         active = Guest(args, args.output/'missing-medium', None)
         state = active.boot(-22, '')
         active.open();active.commit(-24)

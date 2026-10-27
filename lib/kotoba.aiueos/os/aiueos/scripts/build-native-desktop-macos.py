@@ -272,7 +272,7 @@ def main(args):
         observed = json.loads((guest / receipt_name).read_text())
         expected_status = ("PASS_NATIVE_LOCAL_DRAFT_COLD_RESTORE" if args.profile == "local-draft"
                            else "PASS_NATIVE_DESKTOP_INPUT_QEMU")
-        expected_events = 11 if args.profile == "local-draft" else 12
+        expected_events = 12
         if (observed["status"] != expected_status
                 or len(observed["events"]) != expected_events
                 or observed["kernel"] != kernel_state["kernel"]
