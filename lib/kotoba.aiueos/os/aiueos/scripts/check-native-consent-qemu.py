@@ -18,6 +18,54 @@ def pin(path):
     raw = Path(path).read_bytes()
     return {"bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
 
+# --- reference Ed25519 (RFC 8032) used to check what the guest derived and signed ---
+_P = 2**255 - 19
+_L = 2**252 + 27742317777372353535851937790883648493
+_D = (-121665 * pow(121666, _P - 2, _P)) % _P
+_BX = 0x216936D3CD6E53FEC0A4E231FDD6DC5C692CC7609525A7B2C9562D608F25D51A
+_BY = 0x6666666666666666666666666666666666666666666666666666666666666658
+_B = (_BX, _BY, 1, _BX * _BY % _P)
+
+def _add(p, q):
+    x1, y1, z1, t1 = p; x2, y2, z2, t2 = q
+    a = (y1 - x1) * (y2 - x2) % _P; b = (y1 + x1) * (y2 + x2) % _P
+    c = t1 * t2 * 2 * _D % _P; d = 2 * z1 * z2 % _P
+    e, f, g, h = b - a, d - c, d + c, b + a
+    return (e * f % _P, h * g % _P, f * g % _P, e * h % _P)
+
+def _mul(s, p):
+    r = (0, 1, 1, 0)
+    for i in range(255, -1, -1):
+        r = _add(r, r)
+        if (s >> i) & 1: r = _add(r, p)
+    return r
+
+def _enc(p):
+    x, y, z, _ = p; zi = pow(z, _P - 2, _P); x = x * zi % _P; y = y * zi % _P
+    return (y | ((x & 1) << 255)).to_bytes(32, "little")
+
+def _dec(b):
+    y = int.from_bytes(b, "little"); sign = y >> 255; y &= (1 << 255) - 1
+    if y >= _P: return None
+    u = (y * y - 1) % _P; v = (_D * y * y + 1) % _P
+    x = pow(u * pow(v, _P - 2, _P), (_P + 3) // 8, _P)
+    if (v * x * x - u) % _P: x = x * pow(2, (_P - 1) // 4, _P) % _P
+    if (v * x * x - u) % _P: return None
+    if (x & 1) != sign: x = _P - x
+    return (x, y, 1, x * y % _P)
+
+def ed_public(seed):
+    h = bytearray(hashlib.sha512(seed).digest()[:32]); h[0] &= 248; h[31] &= 127; h[31] |= 64
+    return _enc(_mul(int.from_bytes(h, "little"), _B))
+
+def ed_verify(pub, msg, sig):
+    a = _dec(pub); r = _dec(sig[:32])
+    if a is None or r is None: return False
+    s = int.from_bytes(sig[32:], "little")
+    if s >= _L: return False
+    k = int.from_bytes(hashlib.sha512(sig[:32] + pub + msg).digest(), "little") % _L
+    return _enc(_mul(s, _B)) == _enc(_add(r, _mul(k, a)))
+
 def main(args):
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=False)
@@ -90,7 +138,7 @@ def main(args):
                 if abs(dx) <= 2 and abs(dy) <= 2: return cx, cy
                 step = lambda v: max(-100, min(100, v))
                 send(f"mouse_move {step(dx)} {step(dy)}", 0.4)
-            raise AssertionError("pointer did not reach target")
+            raise AssertionError(("pointer did not reach target", x, y, S(2046), S(2047), W(40), W(41), W(87), hex(S(2039))))
         def click():
             send("mouse_button 1", 0.5); send("mouse_button 0", 1.5)
         # window collapse (roll up to the titlebar): F9, then the control left of close
@@ -145,12 +193,47 @@ def main(args):
         # Allow button approves exactly as Y does: pending 0, approved 1, loop stop 1.
         # Word 2039 keeps the Allow count in bits 1 and up (W2): the home line
         # "Approved: n" changes only in its digit, and only after an Allow.
+        # --- ADR-0277 W3: the device key through its own consent request (F8) ---
+        # Deny first: N closes the request and no entropy is consumed (the seed bytes stay 0).
+        seed_words = lambda: [W(128 + i) for i in range(8)]
+        assert S(2039) == 0 and seed_words() == [0] * 8 and W(94) == 0
+        send("sendkey f8", 1.5); assert W(87) == 2 and S(2039) == 3, (W(87), S(2039))
+        key_panel = screenshot("key-request")
+        send("sendkey n", 1.5)
+        assert W(87) == 0 and S(2039) == 0 and seed_words() == [0] * 8 and W(94) == 3
+        event("key-deny", seedBytes=seed_words(), approvedCount=0)
+        # Allow by key Y: a 32-byte seed is drawn, the public key derived, a proof message signed.
+        send("sendkey f8", 1.5); assert W(87) == 2 and S(2039) == 3
+        send("sendkey y", 3.0)
+        assert W(87) == 0 and W(94) == 1, (W(87), W(94))
+        flags = S(2039)
+        assert flags & 3 == 0 and (flags >> 2) & 15 == 1 and (flags >> 6) & 1 == 1, hex(flags)
+        seed = b"".join(struct.pack("<I", W(128 + i)) for i in range(8))
+        pub = b"".join(struct.pack("<I", W(320 + i)) for i in range(8))
+        sig = b"".join(struct.pack("<I", W(768 + i)) for i in range(16))
+        proof = b"itonami-w3-key-proof"
+        assert seed != bytes(32) and len(set(seed)) > 8, "seed looks empty or constant"
+        assert pub == ed_public(seed), ("the guest public key is not the key of its seed", pub.hex())
+        assert ed_verify(pub, proof, sig), "the guest signature does not verify under its public key"
+        # negative controls: a foreign key, a changed message and a changed signature are refused
+        foreign = ed_public(bytes(range(32)))
+        assert not ed_verify(foreign, proof, sig), "a foreign key must not verify"
+        assert not ed_verify(pub, proof + b"!", sig), "a changed message must not verify"
+        assert not ed_verify(pub, proof, sig[:63] + bytes([sig[63] ^ 1])), "a changed signature must not verify"
+        fp = (flags >> 7) & 0xffffff
+        assert fp == int.from_bytes(pub[:3], "big"), (hex(fp), pub[:3].hex())
+        key_home = screenshot("key-home")
+        # a second request is refused while a key exists (one device key per boot)
+        send("sendkey f8", 1.5); assert W(87) == 0 and S(2039) == flags
+        event("key-allow", fingerprint=pub[:3].hex(), publicKey=pub.hex(), proofMessage=proof.decode(),
+              signature=sig.hex(), verifies=True, foreignKeyRefused=True, changedMessageRefused=True,
+              changedSignatureRefused=True, seedDisplayed=False, persisted=False)
         move_to(px + 24 + 70, py + 164 + 18)
         before_allow = screenshot("before-allow")
-        assert S(2039) == 0
-        send("sendkey ret", 1.5); assert W(87) == 1 and S(2039) == 1
+        assert (S(2039) >> 2) & 15 == 1 and S(2039) & 3 == 0
+        send("sendkey ret", 1.5); assert W(87) == 1 and S(2039) & 3 == 1
         move_to(px + 24 + 70, py + 164 + 18); click()
-        assert W(87) == 0 and S(2039) == 2 and W(88) == 1 and W(85) == 1
+        assert W(87) == 0 and (S(2039) >> 2) & 15 == 2 and S(2039) & 3 == 0 and W(88) == 1 and W(85) == 1
         after_allow = screenshot("after-allow")
         w0, h0, p0 = before_allow
         assert (w0, h0) == after_allow[:2]
@@ -175,7 +258,7 @@ def main(args):
         keys_ink = ink(after_allow, 255, 273)
         assert network_ink > 20 and telemetry_ink > 20 and keys_ink > 20 and below_ink == 0, (network_ink, telemetry_ink, keys_ink, below_ink)
         event("pointer-allow", pending=W(87), approved=W(88), stop=W(85),
-              approvedCount=S(2039) // 2, changedColumns=[changed_cols[0] + 180, changed_cols[-1] + 180],
+              approvedCount=(S(2039) >> 2) & 15, changedColumns=[changed_cols[0] + 180, changed_cols[-1] + 180],
               networkInk=network_ink, telemetryInk=telemetry_ink, keysHintInk=keys_ink)
     finally:
         try: send("quit", 0.5)

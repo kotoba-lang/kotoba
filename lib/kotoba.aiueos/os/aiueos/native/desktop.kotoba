@@ -1,7 +1,8 @@
 (ns aiueos.native.desktop
   (:require [aiueos.browser-frame2 :as browser-frame]
             [aiueos.session.app-catalog :as app-catalog]
-            [aiueos.native.draft-store :as draft-store])
+            [aiueos.native.draft-store :as draft-store]
+            [aiueos.ed25519 :as ed])
   (:export [main workspace-main goal-main goal-draft-main goal-model-main
             show-diagnostic-result]))
 
@@ -363,10 +364,85 @@
     (do (put-word s (+ 64 index) cp)
         (if (< index 28) (model-confirm-title s (+ index 1)) 1))))
 
+
+;; ADR-0277 W3: the device key. F8 opens a consent request of its own kind (word 2039 bit 1);
+;; only Allow (Y or the button) draws a 32-byte seed with kernel-rdrand (guarded by CPUID, and a draw
+;; of 0 means no entropy: the request fails closed and no key exists), derives the Ed25519 public key
+;; and signs a fixed proof message with it. The seed stays in guest RAM (context bytes 512..543): it is
+;; never displayed, never persisted and never leaves the device. The home then shows the first three
+;; public-key bytes. ctx bytes: seed 512, hash scratch 1088, public key 1280 (128-byte scratch),
+;; signing buffer 2048 (1024), proof message at buffer+256, signature 3072 (64), workspace 4096 (4096).
+(defn ctx-byte [ctx at] (kernel-load-u8 (kernel-subregion ctx 8192 at 1) 1 0))
+(defn put-ctx8 [ctx at v]
+  (let [stored (kernel-store-u8 (kernel-subregion ctx 8192 at 1) 1 0 v)]
+    (+ 1 (* 0 stored))))
+
+(defn store-draw [ctx at v i]
+  (if (= i 8) 1
+    (let [stored (put-ctx8 ctx (+ at i) (bit-and (u64-shift-right v (* 8 i)) 255))]
+      (store-draw ctx at v (+ i 1 (* 0 stored))))))
+
+;; 1 when four non-zero 64-bit draws were stored at ctx 512..543, else 0 (nothing stored on failure)
+(defn draw-seed [ctx flags]
+  (if (= (bit-and flags 1) 0) 0
+    (let [d0 (kernel-rdrand) d1 (kernel-rdrand) d2 (kernel-rdrand) d3 (kernel-rdrand)]
+      (if (or (= d0 0) (or (= d1 0) (or (= d2 0) (= d3 0)))) 0
+        (let [a (store-draw ctx 512 d0 0) b (store-draw ctx 520 d1 0)
+              c (store-draw ctx 528 d2 0) d (store-draw ctx 536 d3 0)]
+          (+ 1 (* 0 (+ a (+ b (+ c d))))))))))
+
+(defn proof-byte [i]
+  (case i 0 105 1 116 2 111 3 110 4 97 5 109 6 105 7 45 8 119 9 51 10 45 11 107 12 101 13 121 14 45 15 112 16 114 17 111 18 111 19 102 0))
+
+(defn copy-seed-and-proof [ctx i]
+  (if (= i 32) 1
+    (let [a (put-ctx8 ctx (+ 2048 i) (ctx-byte ctx (+ 512 i)))
+          b (put-ctx8 ctx (+ 2304 i) (proof-byte i))]
+      (copy-seed-and-proof ctx (+ i 1 (* 0 (+ a b)))))))
+
+(defn derive-and-sign [ctx]
+  (let [pk (ed/aiueos-ed25519-pubkey (kernel-subregion ctx 8192 512 32)
+                                     (kernel-subregion ctx 8192 1280 128)
+                                     (kernel-subregion ctx 8192 4096 4096)
+                                     (kernel-subregion ctx 8192 1088 64))
+        cp (copy-seed-and-proof ctx 0)
+        sg (ed/aiueos-ed25519-sign (kernel-subregion ctx 8192 2048 1024) 20
+                                   (kernel-subregion ctx 8192 3072 64)
+                                   (kernel-subregion ctx 8192 4096 4096))]
+    (+ 1 (* 0 (+ pk (+ cp sg))))))
+
+;; Allow on the key request: returns 1. The request is closed either way.
+(defn allow-key [s ctx]
+  (let [ok (draw-seed ctx (word ctx 90))]
+    (if (= ok 1)
+      (let [d (derive-and-sign ctx)
+            fp (+ (* 65536 (ctx-byte ctx 1280)) (+ (* 256 (ctx-byte ctx 1281)) (ctx-byte ctx 1282)))]
+        (do (put-word ctx 87 0)
+            (put-word s 2039 (+ (+ (- (word s 2039) 3) 4) (+ 64 (* fp 128))))
+            (put-word ctx 94 1)
+            (+ 1 (* 0 d))))
+      (do (put-word ctx 87 0)
+          (put-word s 2039 (- (word s 2039) 3))
+          (put-word ctx 94 2)
+          1))))
+
+(defn deny-key [s ctx]
+  (do (put-word ctx 87 0) (put-word s 2039 (- (word s 2039) 3)) (put-word ctx 94 3) 1))
+
+(defn open-key-request [s ctx]
+  (if (and (= (word ctx 87) 0) (= (bit-and (quot (word s 2039) 64) 1) 0))
+    (do (put-word ctx 87 2) (put-word s 2039 (+ (word s 2039) 3)) 1)
+    0))
+
+(defn key-pending [s code ctx]
+  (if (= code 21) (allow-key s ctx)
+    (if (or (= code 49) (= code 1)) (deny-key s ctx) 0)))
+
 (defn reduce-key [s code ctx]
+  (if (= (word ctx 87) 2) (key-pending s code ctx)
   (if (and (= (word ctx 86) 4) (= (word ctx 87) 1))
     (if (= code 21)
-      (do (put-word ctx 87 0) (put-word s 2039 (+ (word s 2039) 1)) (put-word ctx 88 1) (put-word ctx 85 1) 1)
+      (do (put-word ctx 87 0) (put-word s 2039 (+ (word s 2039) 3)) (put-word ctx 88 1) (put-word ctx 85 1) 1)
       (if (or (= code 49) (= code 1))
         (do (put-word ctx 87 0) (put-word s 2039 (- (word s 2039) 1)) (seed-app-label s 2 0) 1)
         0))
@@ -395,7 +471,8 @@
         (if (= code 3) (launch-app s 2 (word ctx 40) (word ctx 41))
           (if (= code 4) (launch-app s 3 (word ctx 40) (word ctx 41))
             (if (= code 5) (launch-app s 4 (word ctx 40) (word ctx 41))
-              (if (= code 67) (collapse-focused s (word ctx 41)) 0)))))))))))))
+              (if (= code 67) (collapse-focused s (word ctx 41))
+                (if (= code 66) (open-key-request s ctx) 0)))))))))))))))
 
 (defn clamp-coordinate [value extent]
   (if (< value 0) 0
@@ -414,9 +491,11 @@
   (let [px (quot (- (word ctx 40) 480) 2)
         py (quot (- (word ctx 41) 224) 2)]
     (if (in-rect x y (+ px 24) (+ py 164) 140 36)
-      (do (put-word ctx 87 0) (put-word s 2039 (+ (word s 2039) 1)) (put-word ctx 88 1) (put-word ctx 85 1) 1)
+      (if (= (word ctx 87) 2) (allow-key s ctx)
+        (do (put-word ctx 87 0) (put-word s 2039 (+ (word s 2039) 3)) (put-word ctx 88 1) (put-word ctx 85 1) 1))
       (if (in-rect x y (+ px 180) (+ py 164) 140 36)
-        (do (put-word ctx 87 0) (put-word s 2039 (- (word s 2039) 1)) (seed-app-label s 2 0) 1)
+        (if (= (word ctx 87) 2) (deny-key s ctx)
+          (do (put-word ctx 87 0) (put-word s 2039 (- (word s 2039) 1)) (seed-app-label s 2 0) 1))
         0))))
 
 (defn hit-launcher [x id]
