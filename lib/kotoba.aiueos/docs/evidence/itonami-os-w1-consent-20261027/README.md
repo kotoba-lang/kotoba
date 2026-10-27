@@ -32,3 +32,9 @@ the panel opens (Allow pixel, border, dock not drawn), a launcher key and a laun
 N, Esc and the Deny button deny (Goal intact, approved 0), and the Allow button approves exactly as Y does
 (pending 0, approved 1, loop stop 1). Receipt: `native-consent-qemu.json` (status `PASS_NATIVE_CONSENT_QEMU`, 9 events).
 Synthetic HMP input proves no human consent. The earlier manual checks above are superseded by this gate.
+
+## Window collapse (added; shell UX, not a W row)
+A window rolls up to its titlebar (validated minimum height 29) and back: the control left of close, or F9. Unrolling restores
+launch-app's height and keeps the window on screen; the Itonami field and summary are not drawn while collapsed. The consent
+gate checks it before the consent steps: F9 (29, body gone, then restored) and the pointer (29, restored), Goal intact (11 events).
+This is a roll-up, not a minimize to the dock: a minimized-window state needs surface words that are exhausted (JUN-479).
