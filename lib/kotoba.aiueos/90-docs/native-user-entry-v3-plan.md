@@ -39,6 +39,15 @@ private. Negative probes must distinguish wrong request, forged R9,
 forbidden supervisor access, NX and guard faults. Full kernel scheduling,
 canonical value/token binding and physical hardware remain separate gates.
 
+The [Mac selfhost scalar-code probe](../docs/evidence/aiueos-native-user-scalar-20261026/README.md)
+adds a separate observation: exact Amu `x86_64-aiueos-user-v1` code bytes ran
+at CPL3 in a C-free native kernel and wrote result `42`. That root stages
+verified literal bytes rather than parsing the ELF. Its code page differs
+from the ELF's declared virtual address, and it does not perform signature
+or app admission. The next user-target gate must load the ELF according to
+its declared mapping and bind code identity, capability policy and budget
+before a registered Itonami turn can use this mechanism.
+
 The native media gate now emits/reproduces an8MiB GPT/FAT16 diagnostic ESP.
 Independent GPT/FAT/CRC/EFI readback and11 negative controls pass. Raw-media
 boot and desktop/input are measured on QEMU q35 SATA with a temporary

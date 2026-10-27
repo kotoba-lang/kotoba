@@ -3,7 +3,10 @@
 import argparse,hashlib,importlib.util,json,os,subprocess,sys
 from pathlib import Path
 HERE=Path(__file__).resolve().parent
-def main(amu,out,*,distribution='aiueos'):
+# The native desktop polls for its entire session. The previous 2^30 fuel
+# budget was observed to expire during ordinary interactive use (AIUEOS #506).
+DESKTOP_FUEL=9007199254740991
+def main(amu,out,*,profile='desktop',distribution='aiueos'):
  # Distribution selects static composition metadata, never a kernel fork,
  # runtime profile, admission decision or automatic component installation.
  if distribution not in ('aiueos','awai'):raise ValueError('unknown distribution: '+distribution)
@@ -20,12 +23,13 @@ def main(amu,out,*,distribution='aiueos'):
   assert not r.returncode and not r.stderr,(name,r.returncode,r.stderr[-2000:]);print(name,'PASS',flush=True)
  font=out/'font/aiueos-padded.fnt';kernel=out/'kernel';media=out/'media'
  run('font',[HERE/'build-native-font.py','--amu-source',amu,'--compiler',compiler,'--compiler-sha256',digest,'--font',HERE.parent/'fonts/aiueos-16.fnt','--output',out/'font'])
- env.update(AIUEOS_NATIVE_OUT=str(kernel),AIUEOS_NATIVE_KERNEL_SOURCE=str(HERE.parent/'native/desktop-entry.kotoba'),AIUEOS_NATIVE_FUEL='1073741824',AIUEOS_NATIVE_BOOT_PAYLOAD=str(font),AIUEOS_NATIVE_BOOT_PAYLOAD_SHA256=hashlib.sha256(font.read_bytes()).hexdigest())
+ entry='workspace-entry.kotoba' if profile=='local-draft' else 'desktop-entry.kotoba'
+ env.update(AIUEOS_NATIVE_OUT=str(kernel),AIUEOS_NATIVE_KERNEL_SOURCE=str(HERE.parent/'native'/entry),AIUEOS_NATIVE_FUEL=str(DESKTOP_FUEL),AIUEOS_NATIVE_BOOT_PAYLOAD=str(font),AIUEOS_NATIVE_BOOT_PAYLOAD_SHA256=hashlib.sha256(font.read_bytes()).hexdigest())
  run('kernel',[HERE/'build-native-kernel.py',amu])
  run('media',[HERE/'build-native-media.py','--amu-source',amu,'--compiler',compiler,'--compiler-sha256',digest,'--efi',kernel/'BOOTX64.EFI','--output',media])
- state=json.loads((kernel/'build-state.json').read_text());assert state['state']=='NATIVE_IMAGE_CANDIDATE' and state['sourceModuleCount']==30
- result=dict(schema='aiueos.native-desktop-candidate.v1',state='NATIVE_DESKTOP_MEDIA_CANDIDATE',kernel=state['images'][0],efi=state['efiImages'][0],media=json.loads((media/'native-media.json').read_text())['image'],font=json.loads((out/'font/native-font.json').read_text())['padded'],compiler=state['compiler'],sourceModuleCount=30,JVMNodeOrGraalFallback=False,cCompilerOrLoader=False,guestBoot=False,desktopInput=False,BrowserCSSOMParity=False,dappsExecuted=False,physicalHardware=False)
+ state=json.loads((kernel/'build-state.json').read_text());assert state['state']=='NATIVE_IMAGE_CANDIDATE' and state['sourceModuleCount']==31
+ result=dict(schema='aiueos.native-desktop-candidate.v1',state='NATIVE_DESKTOP_MEDIA_CANDIDATE',profile=profile,localDraftCandidate=profile=='local-draft',D2WorkspaceCodec=False,signedHeadAuthority=False,kernel=state['images'][0],efi=state['efiImages'][0],media=json.loads((media/'native-media.json').read_text())['image'],font=json.loads((out/'font/native-font.json').read_text())['padded'],compiler=state['compiler'],sourceModuleCount=31,kernelFuelInitial=DESKTOP_FUEL,JVMNodeOrGraalFallback=False,cCompilerOrLoader=False,guestBoot=False,desktopInput=False,BrowserCSSOMParity=False,dappsExecuted=False,physicalHardware=False)
  result['distribution']=dict(id=distribution,descriptor=dict(path='distribution.json',bytes=len(descriptor_bytes),sha256=hashlib.sha256(descriptor_bytes).hexdigest()))
  (out/'native-desktop.json').write_text(json.dumps(result,indent=2)+'\n');print(result['state'])
 if __name__=='__main__':
- p=argparse.ArgumentParser();p.add_argument('--amu-source',type=Path,required=True);p.add_argument('--output',type=Path,required=True);p.add_argument('--distribution',choices=['aiueos','awai'],default='aiueos');a=p.parse_args();main(a.amu_source.resolve(),a.output.resolve(),distribution=a.distribution)
+ p=argparse.ArgumentParser();p.add_argument('--amu-source',type=Path,required=True);p.add_argument('--output',type=Path,required=True);p.add_argument('--profile',choices=['desktop','local-draft'],default='desktop');p.add_argument('--distribution',choices=['aiueos','awai'],default='aiueos');a=p.parse_args();main(a.amu_source.resolve(),a.output.resolve(),profile=a.profile,distribution=a.distribution)
