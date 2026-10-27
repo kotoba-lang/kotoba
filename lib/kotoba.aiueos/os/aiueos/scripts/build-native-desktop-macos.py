@@ -286,7 +286,9 @@ def main(args):
                 or observed["efi"] != kernel_state["efi"]
                 or observed["media"] != media_state["image"]
                 or observed["firmware"] != firmware_pin
-                or observed["observer"] != script_pins[guest_script]):
+                or observed["observer"] != script_pins[guest_script]
+                or (args.profile == "desktop"
+                    and observed.get("layoutTable") != pin(OS / "native/layout-table.json"))):
             raise ValueError("QEMU guest observation is not bound to this build")
         if args.profile == "local-draft":
             if (not observed["nativeATACommit"] or not observed["coldProcessBoot"]
@@ -365,7 +367,8 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--profile", choices=("desktop", "local-draft", "consent"), default="desktop")
     parser.add_argument("--distribution", choices=("aiueos", "awai"), default="aiueos")
-    # kernel-v3 (RW at 0x400000) leaves about 3 MiB for code instead of kernel-v1's
+    # kernel-v3 (RW at 0x400000) leaves the packager about 3 MiB of room (the compiler's
+    # text cap stays 2 MiB, native/layout-table.json) instead of kernel-v1's
     # 1,044,480 bytes (the packager's bounded-ELF admission requires RX to end below
     # RW). The desktop with the consent surface no longer fits v1, so v3 is the
     # default. It needs a compiler image that knows the target; the repository
