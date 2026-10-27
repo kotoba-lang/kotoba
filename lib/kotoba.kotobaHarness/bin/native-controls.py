@@ -110,7 +110,7 @@ def run_control(cfg, name, method, entry, out):
         selftest = subprocess.run(command(cfg, directory, ['selftest'], guest=True),
                                   capture_output=True, text=True, timeout=50, env=env)
         receipt['native_selftest'] = dict(exit=selftest.returncode, stdout=selftest.stdout, stderr=selftest.stderr)
-        if selftest.returncode:
+        if selftest.returncode or selftest.stdout.strip() != 'selftest-verified':
             raise Blocked('native verdict selftest failed; no browser result accepted')
         version, lines = cfg['host'].run_modules(cfg['browser'], directory / 'browser',
                                                 [(name, wasm, dict(fuel=FUEL))], timeout=45)
@@ -122,10 +122,15 @@ def run_control(cfg, name, method, entry, out):
                         str(observation['result']), line.get('wasmTrap') or '']
         verdict = subprocess.run(command(cfg, directory, verdict_args, guest=True),
                                  capture_output=True, text=True, timeout=50, env=env)
-        receipt.update(status=verdict.stdout.strip() or 'blocked', failures=observation['result'],
-                       expected_failures=entry['failures'], control_passed=verdict.returncode == 0,
-                       verdict=dict(exit=verdict.returncode, stdout=verdict.stdout, stderr=verdict.stderr,
-                                    source_sha256=sha(directory / 'verdict.kotoba'), image_sha256=sha(directory / 'verdict.elf')))
+        receipt['verdict'] = dict(exit=verdict.returncode, stdout=verdict.stdout, stderr=verdict.stderr,
+                                  source_sha256=sha(directory / 'verdict.kotoba'),
+                                  image_sha256=sha(directory / 'verdict.elf'))
+        native_status = verdict.stdout.strip()
+        protocol = {0: ('verified', 'rejected'), 1: ('failed-control',), 78: ('blocked',)}
+        if native_status not in protocol.get(verdict.returncode, ()):
+            raise Blocked('native verdict terminated or returned an invalid exit/status pair')
+        receipt.update(status=native_status, failures=observation['result'],
+                       expected_failures=entry['failures'], control_passed=verdict.returncode == 0)
     except (Blocked, OSError, subprocess.TimeoutExpired, RuntimeError, TimeoutError) as error:
         receipt.update(status='blocked', error=str(error), control_passed=False)
     (directory / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
@@ -157,7 +162,7 @@ def main(args):
     receipts = [run_control(cfg, name, method, entry, out) for name, method, entry in selected]
     if any(r['status'] == 'blocked' for r in receipts):
         return 78
-    return 0 if all(r['control_passed'] if gate else r['status'] == 'verified' for r in receipts) else 1
+    return 0 if all(r['control_passed'] and (gate or r['status'] == 'verified') for r in receipts) else 1
 
 
 if __name__ == '__main__':

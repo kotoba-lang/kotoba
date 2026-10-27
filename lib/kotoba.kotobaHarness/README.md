@@ -9,7 +9,7 @@ The active entry runs **fixed native verification controls only**. A pinned
 Amu selfhost compiler checks canonical `.kotoba` fixtures and compiles them to
 `wasm32-browser`; the current official Amu static Worker host runs them in real
 Chrome/Chromium. The selfhost-built `src/kotoba_harness/control_verdict.kotoba` owns the
-control verdict and its 13-case positive/refusal selftest. Python only stages
+control verdict and its 16-case positive/refusal selftest. Python only stages
 bytes, launches these processes and records the native verdict. It does not implement the search, EDN evaluator, model policy
 or Kotoba function behavior.
 

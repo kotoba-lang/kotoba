@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -78,6 +79,37 @@ class NativeBoundary(unittest.TestCase):
             self.assertEqual(run.call_count, 1, 'failure must not trigger another compiler')
             self.assertEqual(receipt['status'], 'blocked')
             self.assertNotIn('failures', receipt)
+
+    def test_verdict_signal_after_success_output_is_blocked(self):
+        entry = json.loads(controls.MANIFEST.read_text())['cases']['kotoba']['controls']['known']
+        host = SimpleNamespace(
+            run_modules=lambda *args, **kwargs: ({'product': 'test'}, {'kotoba': {'wasmTrap': None}}),
+            observe=lambda line: {'status': 'ok', 'exit': 0, 'result': 0})
+        cfg = dict(container=False, compiler=Path('/native/compiler'), pin={},
+                   target='aarch64-linux', host=host, browser='test', host_sha256='test')
+        def process(argv, **kwargs):
+            if argv[0] == '/native/compiler':
+                if '--output' in argv:
+                    Path(argv[argv.index('--output') + 1]).write_bytes(b'test artifact')
+                return subprocess.CompletedProcess(argv, 0, '', '')
+            if argv[1:] == ['selftest']:
+                return subprocess.CompletedProcess(argv, 0, 'selftest-verified', '')
+            return subprocess.CompletedProcess(argv, -9, 'verified', 'killed after write')
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(controls.subprocess, 'run', side_effect=process):
+                receipt = controls.run_control(cfg, 'kotoba', 'known', entry, Path(directory))
+            self.assertEqual(receipt['status'], 'blocked')
+            self.assertFalse(receipt['control_passed'])
+            self.assertEqual(receipt['verdict']['exit'], -9)
+            self.assertEqual(receipt['verdict']['stdout'], 'verified')
+
+    def test_single_control_requires_successful_native_exit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            interrupted = {'status': 'verified', 'control_passed': False}
+            with patch.object(controls, 'environment', return_value={}), \
+                 patch.object(controls, 'run_control', return_value=interrupted):
+                status = controls.main([str(ROOT / 'projects/kotoba.edn'), 'known', directory])
+            self.assertEqual(status, 1)
 
     def test_retired_corpus_is_preserved_and_has_no_active_launch_files(self):
         archive = ROOT / 'docs/retired/hosted-harness-20261027'
