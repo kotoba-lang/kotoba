@@ -16,7 +16,7 @@ import sys
 
 HERE = Path(__file__).resolve().parent
 NATIVE = HERE.parent / "native"
-SOURCE_PROBE_SHA256 = "f901ec81b7b565ddc39954ccc94faf2e8648030f4eb531a9926af478569e21c6"
+SOURCE_PROBE_SHA256 = "de5cd34b18141c9960b1e372e9c53d80e8b9f5511f347f00fd41471c45338aa7"
 
 
 def pin(path):
@@ -125,6 +125,10 @@ def main():
                  "empty-system-prompt-same-root",
                  "prompt-result-same-root",
                  "prompt-result-overlap-offset-1",
+             ],
+             "resultAliasRefusalsObserved": [
+                 "completion-text-finish-same-root",
+                 "completion-inactive-code-text-same-root",
              ],
              "nestedUserValueQualified": False,
              "desktop": False, "physicalHardware": False}
