@@ -4,7 +4,8 @@ Date: 2026-10-27
 
 ## Status
 
-Proposed (design only). Nothing here is implemented. It records what was measured on 2026-10-27 while the W1 consent surface of
+Accepted as a decision (owner delegation 2026-10-27: the recommendations below are adopted; see Decisions). **Nothing is implemented yet**;
+the implementation is in Amu (compiler and boot packager) and this repository's gates. It records what was measured on 2026-10-27 while the W1 consent surface of
 ADR-0275 outgrew the kernel-v1 layout, and the two changes that remove that class of failure. Part A is owned by the Amu packager
 and the JUN-450 layout contract and needs their owner's decision; Part B is a compiler change.
 
@@ -53,7 +54,23 @@ Measure code density on the desktop before and after (bytes of RX per UI line, w
 - B: the same UI text is smaller as data than as code, measured, and the desktop gates still pass.
 - Say in the closing note which of these is a source change, a built candidate, a QEMU result, merged, or deployed.
 
-## Not decided here
+## Decisions (2026-10-27, owner delegated; recommendations adopted)
 
-The budget itself (which physical ranges), whether to retire `slot-version`, and whether the data segment is read-only RX-adjacent or its own
-PT_LOAD. These are owner decisions of the packager and the layout contract (JUN-450).
+1. **Budget.** The kernel image region is physical `[0x100000, 0x1000000)` (15 MiB). A layout is admitted if all its segments and fixed regions lie inside it.
+2. **Rungs, not slot-versions.** RW bases form a ladder: `0x200000` (kernel-v1), `0x400000` (kernel-v3), `0x800000`. No new `slot-version` is
+   minted. kernel-v1/v2/v3 stay admitted, immutable, as named points so existing evidence stays valid. The driver selects the smallest rung whose
+   RX room (`RW - 0x101000`) fits the measured text; the rung is the only thing that changes between builds.
+3. **One owned-region table.** The fixed regions (page-table root, guard pages, Browser surface/context, font and slot payloads) are one table keyed by the rung,
+   emitted by the compiler in its build state. Gates read it; they keep no per-layout map (today: `check-native-desktop-qemu.py` has
+   `{0x200000: 0x30000, 0x400000: 0x130000}` for the page-table root).
+4. **Read-only data.** Constants go in their own PT_LOAD, `R` only (never W or X), page aligned, directly after RX and inside the budget; the packager checks it like any other segment.
+5. **Order of work.** (a) the table in the build state and gates reading it; (b) the packager rule with all negative controls; (c) the `0x800000` rung;
+   (d) the read-only data segment and the removal of the packed-text workaround. Each step has its own acceptance (above) and is independent.
+
+Why these: the budget is large enough for a desktop-class kernel yet small enough to keep the whole image under a few identity-mapped 2 MiB pages; a ladder keeps
+the compiler's data addresses constants (no layout fix-point); and a table that the compiler emits cannot drift from the compiler.
+
+## Not decided here (still open)
+
+Whether the budget should later be derived from the firmware memory map instead of fixed; and how `0x800000` interacts with the DMA slots and the user domain pages (it must be
+measured on the compiler's region seed before the rung is added).
