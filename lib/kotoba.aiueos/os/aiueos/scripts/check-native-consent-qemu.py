@@ -73,6 +73,32 @@ def main(args):
         send("sendkey 2", 1.5); send("sendkey a", 1.5)
         assert S(1) == 1 and S(2) == 2 and S(2038) == 13, (S(1), S(2), S(2038))
         event("itonami-goal-typed", goalLength=S(2038))
+        def move_to(x, y):
+            for _ in range(60):
+                cx, cy = S(2046) - 1, S(2047)
+                dx, dy = x - cx, y - cy
+                if abs(dx) <= 2 and abs(dy) <= 2: return cx, cy
+                step = lambda v: max(-100, min(100, v))
+                send(f"mouse_move {step(dx)} {step(dy)}", 0.4)
+            raise AssertionError("pointer did not reach target")
+        def click():
+            send("mouse_button 1", 0.5); send("mouse_button 0", 1.5)
+        # window collapse (roll up to the titlebar): F9, then the control left of close
+        wx, wy, ww, wh = S(6), S(7), S(8), S(9)
+        full = wh
+        assert wh > 100 and ww > 100, (wx, wy, ww, wh)
+        send("sendkey f9", 1.5)
+        assert S(9) == 29 and S(2038) == 13, S(9)
+        shot = screenshot("collapsed")
+        assert pixel(shot, wx + 100, wy + 60) != (255, 255, 255), "collapsed window still has a body"
+        send("sendkey f9", 1.5)
+        assert S(9) == full and S(7) == wy, (S(9), S(7))
+        event("collapse-key", collapsed=29, restored=full)
+        move_to(wx + ww - 36, wy + 14); click()
+        assert S(9) == 29 and S(2038) == 13
+        click()
+        assert S(9) == full and S(2038) == 13
+        event("collapse-click", collapsed=29, restored=full, goalLength=S(2038))
         send("sendkey ret", 1.5)
         assert W(87) == 1 and S(2039) == 1 and W(88) == 0 and W(85) == 0
         shot = screenshot("consent-open")
@@ -87,16 +113,6 @@ def main(args):
         send("sendkey 3", 1.5)
         assert S(1) == 1 and W(87) == 1 and S(2039) == 1
         event("launcher-key-ignored", windows=S(1))
-        def move_to(x, y):
-            for _ in range(60):
-                cx, cy = S(2046) - 1, S(2047)
-                dx, dy = x - cx, y - cy
-                if abs(dx) <= 2 and abs(dy) <= 2: return cx, cy
-                step = lambda v: max(-100, min(100, v))
-                send(f"mouse_move {step(dx)} {step(dy)}", 0.4)
-            raise AssertionError("pointer did not reach target")
-        def click():
-            send("mouse_button 1", 0.5); send("mouse_button 0", 1.5)
         move_to(150, 14); click()
         assert S(1) == 1 and W(87) == 1 and S(2039) == 1
         event("launcher-click-ignored", windows=S(1))
