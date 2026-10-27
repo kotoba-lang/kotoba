@@ -71,11 +71,15 @@ def main(args):
         assert W(79) >= 1, "no first frame"
         event("first-frame", frames=W(79))
         # W3a: word 90 reports the CPU's entropy instructions (QEMU -cpu max has both); availability only,
-        # no entropy is drawn because the compiler has no RDRAND/RDSEED intrinsic yet.
+        # two RDRAND draws are checked to be non-zero and different.
         entropy = W(90)
         assert entropy == 7, hex(entropy)
+        draw_a, draw_b = W(91), W(92)
+        # Two draws of the guest's RDRAND (QEMU draws them from the host): each is non-zero and they differ
+        # (a stuck source or a failed instruction would give 0 or a repeat).
+        assert draw_a != 0 and draw_b != 0 and draw_a != draw_b, (hex(draw_a), hex(draw_b))
         event("entropy-probe", flags=entropy, rdrand=bool(entropy & 1), rdseed=bool(entropy & 2),
-              leaf7=bool(entropy & 4), drawn=False)
+              leaf7=bool(entropy & 4), drawn=True, distinctNonZeroDraws=True)
         send("sendkey 2", 1.5); send("sendkey a", 1.5)
         assert S(1) == 1 and S(2) == 2 and S(2038) == 13, (S(1), S(2), S(2038))
         event("itonami-goal-typed", goalLength=S(2038))
