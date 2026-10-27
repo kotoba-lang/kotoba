@@ -16,7 +16,7 @@ import sys
 
 HERE = Path(__file__).resolve().parent
 NATIVE = HERE.parent / "native"
-SOURCE_PROBE_SHA256 = "908ce96b05c44356a2b46dac87a20304210a6bdf5af16c70d7019f64909733f2"
+SOURCE_PROBE_SHA256 = "f901ec81b7b565ddc39954ccc94faf2e8648030f4eb531a9926af478569e21c6"
 
 
 def pin(path):
@@ -79,7 +79,8 @@ def main():
                       "--kernel", build / "KERNEL.ELF",
                       "--efi", build / "BOOTX64.EFI", "--qemu", a.qemu,
                       "--firmware", a.firmware, "--output", guest,
-                      "--llm-result"], output / (name + "-qemu.stdout"),
+                      "--llm-result", "--llm-keyword-text"],
+                     output / (name + "-qemu.stdout"),
                      output / (name + "-qemu.stderr"), 240)
         receipt = guest / "entry-qemu.json"
         if expected:
@@ -115,6 +116,9 @@ def main():
              "utf8ComponentValidated": True, "aliasingQualified": False,
              "keywordFieldByteBoundary": {"accepted": 512, "refused": 513,
                                           "fields": ["model", "finish-reason", "error-code"]},
+             "keywordTextFraming": {"leadingColon": True,
+                                    "minBytes": 2, "maxBytes": 512,
+                                    "missingColonRefused": True},
              "keywordValueConversionQualified": False,
              "aliasRefusalsObserved": [
                  "model-selected-same-root",
