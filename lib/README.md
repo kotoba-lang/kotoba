@@ -231,6 +231,7 @@ The bundled standard libraries live in this repository:
 | `gov.nist.aes` | `gov.nist.aes/src` | `aes.core`, `aes.gcm`, `aes.gcm-siv` (Kotoba project library) |
 | `gov.nist.ecc` | `gov.nist.ecc/src` | `ecc.bignum`, `ecc.curve`, `ecc.der`, `ecc.ecdh` (Kotoba project library) |
 | `org.ietf.mls` | `org.ietf.mls/src` | `mls.crypto`, `mls.framing`, `mls.group-context`, `mls.key-schedule` (an external specification, publisher ietf.org) |
+| `kotoba.kotobasePeerCore` | `kotoba.kotobasePeerCore/src` | `kotobase-peer.atomic-publication`, `kotobase-peer.availability`, `kotobase-peer.block-sizing`, `kotobase-peer.cache` (Kotoba project library) |
 | `kotoba.murakumoCore` | `kotoba.murakumoCore/src` | `murakumo.artifact-protocol`, `murakumo.bench`, `murakumo.blob`, `murakumo.canonical` (Kotoba project library) |
 | `kotoba.browser` | `kotoba.browser/src` | `browser.accessibility`, `browser.account`, `browser.audit`, `browser.browser-use` (Kotoba project library) |
 | `kotoba.aiueos` | `kotoba.aiueos/src` | `aiueos.bare-metal`, `aiueos.cloud-live`, `aiueos.compositor`, `aiueos.compositor.desktop` (Kotoba project library) |

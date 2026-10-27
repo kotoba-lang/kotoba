@@ -1,0 +1,108 @@
+(ns kotobase-peer.statistics-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotobase-peer.statistics :as statistics]
+            [merkle-lsm.core :as lsm]))
+
+;; ============================================================================
+;; M5 Statistics Tests
+;; ============================================================================
+
+(deftest m5-histogram-estimates-cardinality
+  (testing "build-cardinality-histogram should compute full and prefix cardinalities"
+    (let [rows (mapv (fn [i]
+                      {"key" (lsm/canonical-key :eavt "t" ["e" "a" (str i)] i)
+                       "components" ["e" "a" (str i)]
+                       "epoch" i
+                       "op" "assert"
+                       "value" i})
+                    (range 100))
+          hist (statistics/build-cardinality-histogram :eavt rows)]
+      (is (= 100 (:full-cardinality hist)))
+      (is (pos? (count (:prefix-cardinalities hist)))))))
+
+(deftest m5-join-planner-orders-by-selectivity
+  (testing "plan-join-order should order indexes by selectivity reduction"
+    (let [histograms {:eavt {:full-cardinality 1000}
+                      :aevt {:full-cardinality 50}
+                      :avet {:full-cardinality 500}}
+          plan (statistics/plan-join-order {:query-indexes [:eavt :aevt :avet]}
+                                          histograms)]
+      (is (= :aevt (:index (first plan))))
+      (is (= #{:eavt :avet} (set (map :index (rest plan))))))))
+
+(deftest multi-clause-plan-starts-selective-and-stays-connected
+  (let [plan (statistics/plan-clause-order
+              [{:id :posts :estimated-rows 1000 :vars #{'?post}}
+               {:id :authors :estimated-rows 100 :vars #{'?author}}
+               {:id :edges :estimated-rows 20 :vars #{'?post '?author}}])]
+    (is (= [:edges :authors :posts] (mapv :id plan)))
+    (is (= #{'?post '?author} (:bound-vars-after (last plan))))))
+
+(deftest query-statistics-refreshes-from-effective-deltas
+  (let [current {:visibility-scope "tenant-a/public-v1" :epoch 7
+                 :clauses [{:pattern [nil "role" nil] :rows 10}
+                           {:pattern [nil "role" "admin"] :rows 2}]}
+        refreshed (statistics/refresh-query-statistics
+                   current
+                   [{:e "new" :a "role" :v "admin" :op :assert}
+                    {:e "old" :a "role" :v "user" :op :retract}]
+                   8)]
+    (is (= 8 (:epoch refreshed)))
+    (is (= [10 3] (mapv :rows (:clauses refreshed))))
+    (is (statistics/query-statistics-fresh? 8 8 0))
+    (is (statistics/query-statistics-fresh? 8 10 2))
+    (is (false? (statistics/query-statistics-fresh? 8 10 1)))))
+
+(deftest query-statistics-refresh-rejects-drift
+  (is (thrown? #?(:clj Exception :cljs js/Error)
+               (statistics/refresh-query-statistics
+                {:visibility-scope "tenant" :epoch 1
+                 :clauses [{:pattern [nil "role" "admin"] :rows 0}]}
+                [{:e "missing" :a "role" :v "admin" :op :retract}]
+                2))))
+
+(deftest m5-selectivity-estimate-computes-ratio
+  (testing "selectivity-estimate should compute cardinality reduction factor"
+    (let [histograms {:eavt {:full-cardinality 1000}
+                      :aevt {:full-cardinality 100}}
+          sel (statistics/selectivity-estimate histograms :eavt :aevt)]
+      (is (< 0.0 sel 1.0))
+      (is (= 0.1 sel)))))
+
+(deftest m5-arrangement-materializes-deltas
+  (testing "maintain-materialized-delta should record delta rows"
+    (let [arr (statistics/delta-arrangement
+              {:name :resource-index :base-index :eavt})
+          new-datoms [{:e "e1" :a :type :v "resource" :op :assert}]
+          updated (statistics/maintain-materialized-delta arr new-datoms)]
+      (is (:arrangement/materialized? updated))
+      (is (= 1 (count (:arrangement/delta-rows updated))))
+      (is (= 0 (:arrangement/epoch updated)))
+      (is (not (contains? updated :arrangement/last-updated))
+          "the pure arrangement kernel does not read wall clock state"))))
+
+(deftest m5-delta-arrangement-initialization
+  (testing "delta-arrangement should create uninitialized arrangement descriptor"
+    (let [arr (statistics/delta-arrangement
+              {:name :test-arr :base-index :eavt :manifest-cid "cid1" :epoch 1})]
+      (is (= :test-arr (:arrangement/name arr)))
+      (is (false? (:arrangement/materialized? arr)))
+      (is (empty? (:arrangement/rows arr))))))
+
+(deftest m5-query-with-arrangements-fallback
+  (testing "query-with-arrangements should fall back to scan when no arrangement"
+    (let [manifest (lsm/build-manifest {:db-id "test" :epoch 1})
+          result (statistics/query-with-arrangements
+                 manifest {:arrangement-name :missing} [])]
+      (is (= :scan (:result-type result)))
+      (is (true? (:needs-index-scan result))))))
+
+(deftest m5-build-index-statistics
+  (testing "build-index-statistics should create histograms for all indexes"
+    (let [run (lsm/build-run :eavt "t" [{:components ["a" "b"] :epoch 1 :op :assert :value 1}])
+          manifest (lsm/build-manifest
+                   {:db-id "test" :epoch 1
+                    :indexes {:eavt {:l0 [run]}}})
+          stats (statistics/build-index-statistics manifest)]
+      (is (contains? stats :eavt))
+      (is (pos? (:full-cardinality (:eavt stats)))))))
