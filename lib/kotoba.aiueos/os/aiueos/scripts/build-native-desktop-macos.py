@@ -65,15 +65,19 @@ def repository_bootstrap(amu, args):
         if not all(value is not None for value in supplied):
             raise ValueError("explicit Mac bootstrap requires four image/pin arguments")
         return None, None
-    if args.kernel_target != "x86_64-aiueos-kernel-v1":
+    descriptor_path = amu / "seed/bootstrap/aarch64-macos/root.json"
+    descriptor_pin = verified_file(descriptor_path)
+    descriptor = json.loads(descriptor_path.read_text())
+    # A root that knows kernel-v3 pins the previous compiler as its v1/v2 reference
+    # (amu#1624); an older root only knows kernel-v1, whose code limit (1,044,480
+    # bytes) the desktop exceeds, so it must be refused for any other target.
+    if (args.kernel_target != "x86_64-aiueos-kernel-v1"
+            and "kernelV2ReferenceCompiler" not in descriptor):
         raise ValueError(
             "the repository bootstrap compiler only knows x86_64-aiueos-kernel-v1, whose "
             "code limit (1,044,480 bytes) the desktop exceeds; pass --compiler-image/"
             "--compiler-sha256/--packager-image/--packager-sha256 of a compiler that knows "
             + args.kernel_target + ", or --kernel-target x86_64-aiueos-kernel-v1")
-    descriptor_path = amu / "seed/bootstrap/aarch64-macos/root.json"
-    descriptor_pin = verified_file(descriptor_path)
-    descriptor = json.loads(descriptor_path.read_text())
     if (descriptor.get("schema") != "amu.macos-arm64-selfhost-root.v1"
             or descriptor.get("status") != "diagnostic-candidate"
             or descriptor.get("fullManifest") != "seed/FULL-MANIFEST"):
@@ -354,7 +358,8 @@ def main(args):
                 or (descriptor_pin is not None and
                     repository_bootstrap(amu, argparse.Namespace(
                         compiler_image=None, compiler_sha256=None,
-                        packager_image=None, packager_sha256=None)) !=
+                        packager_image=None, packager_sha256=None,
+                        kernel_target=args.kernel_target)) !=
                     (descriptor_pin, bootstrap_source_pin))
                 or pin(qemu) != qemu_pin or pin(firmware) != firmware_pin
                 or pin(font_source) != font_pin
