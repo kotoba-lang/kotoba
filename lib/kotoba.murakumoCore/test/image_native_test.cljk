@@ -1,0 +1,67 @@
+(ns image-native-test
+  (:require [murakumo.infer.image-native :as n] ["node:fs" :as fs] ["node:os" :as os]
+            ["node:path" :as path] ["node:assert/strict" :as a]
+            [kotoba.test :refer [deftest is run-tests]]))
+(def claim {:model n/model-id :deadline (+ (js/Date.now) 30000)
+            :input {:prompt "A blue teapot $(not-a-shell-command)" :width 512 :height 512 :steps 25 :seed 42}})
+(deftest fixed-profile-and-literal-prompt
+  (let [args (n/arguments {:native-root "/models"} claim "/tmp/output.png")]
+    (is (= (:prompt (:input claim)) (nth args (inc (.indexOf (clj->js args) "-p")))))
+    (is (= "cpu" (nth args (inc (.indexOf (clj->js args) "--backend")))))
+    (is (= "cpu" (nth args (inc (.indexOf (clj->js args) "--params-backend")))))
+    (is (= "off" (nth args (inc (.indexOf (clj->js args) "--auto-fit"))))))
+  (is (try (n/arguments {:native-root "/models"} (assoc claim :model "another-model") "/tmp/output.png") false
+           (catch :default _ true))))
+(deftest no-unqualified-advertisement
+  (is (not (n/qualified? {:native-root "/nonexistent-murakumo-test" :sd-cli "/nonexistent"}))))
+(deftest explicit-gpu-profile
+  (let [args (clj->js (n/arguments {:native-root "/models" :backend "metal"} claim "/tmp/output.png"))]
+    (is (= "diffusion=MTL0,te=cpu,vae=cpu" (aget args (inc (.indexOf args "--backend")))))
+    (is (= "diffusion=MTL0,te=cpu,vae=cpu" (aget args (inc (.indexOf args "--params-backend")))))
+    (is (= "off" (aget args (inc (.indexOf args "--auto-fit")))))))
+(let [r (run-tests 'image-native-test)] (when (pos? (+ (:fail r) (:error r))) (js/process.exit 1)))
+
+(let [root (fs/mkdtempSync (path/join (.tmpdir os) "native-image-test-"))
+      executable (path/join root "renderer")
+      cfg {:native-root root :sd-cli executable}
+      fake (str "#!/usr/bin/env node\nconst fs=require('node:fs');const a=process.argv.slice(2);"
+                "function emit(){const p=Buffer.alloc(24);Buffer.from('89504e470d0a1a0a','hex').copy(p);p.writeUInt32BE(512,16);p.writeUInt32BE(512,20);fs.writeFileSync(a[a.indexOf('-o')+1],p);}"
+                "if(a[a.indexOf('-p')+1].includes('wait-for-cancellation'))setInterval(()=>{},1000);"
+                "else if(a[a.indexOf('-p')+1].includes('observation-recovery'))setTimeout(emit,3500);else emit();")]
+  (fs/writeFileSync executable fake #js {:mode 493})
+  (-> (n/render! cfg claim (atom false))
+      (.then (fn [b64]
+               (a/equal (.-length (js/Buffer.from b64 "base64")) 24)
+               (a/equal (count (filter #(.startsWith % "job-") (fs/readdirSync root))) 0)
+               (let [lost (atom false)]
+                 (js/setTimeout #(reset! lost true) 50)
+                 (-> (n/render! cfg (assoc-in claim [:input :prompt] "wait-for-cancellation") lost)
+                     (.then (fn [_] (throw (js/Error. "Expired lease left a renderer running"))))
+                     (.catch (fn [e] (a/match (.-message e) #"lease expired")))))))
+      (.then (fn [_]
+               (let [checks (atom 0) lost (atom false)]
+                 (-> (n/render! (assoc cfg :backend "metal" :gpu-idle-fn
+                                       (fn [_] (if (= 2 (swap! checks inc))
+                                                 (js/Promise.reject (js/Error. "transient observation timeout"))
+                                                 (js/Promise.resolve true))))
+                                (assoc-in claim [:input :prompt] "observation-recovery") lost)
+                     (.then (fn [_] (a/equal @lost false) (a/ok (> @checks 2))))))))
+      (.then (fn [_]
+               (let [checks (atom 0) lost (atom false)]
+                 (-> (n/render! (assoc cfg :backend "metal" :gpu-idle-fn
+                                       (fn [_] (if (= 1 (swap! checks inc)) (js/Promise.resolve true)
+                                                 (js/Promise.reject (js/Error. "persistent observation timeout")))))
+                                (assoc-in claim [:input :prompt] "wait-for-cancellation") lost)
+                     (.then (fn [_] (throw (js/Error. "Unobserved GPU execution continued indefinitely"))))
+                     (.catch (fn [e] (a/match (.-message e) #"gpu-observation-failed") (a/equal @lost true)))))))
+      (.then (fn [_]
+               (let [checks (atom 0) lost (atom false)]
+                 (-> (n/render! (assoc cfg :backend "metal" :gpu-idle-fn (fn [_] (js/Promise.resolve (= 1 (swap! checks inc)))))
+                                (assoc-in claim [:input :prompt] "wait-for-cancellation") lost)
+                     (.then (fn [_] (throw (js/Error. "External GPU occupation did not cancel our image"))))
+                     (.catch (fn [e] (a/match (.-message e) #"lease expired") (a/equal @lost true)))))))
+      (.then (fn [_]
+               (a/equal (count (filter #(.startsWith % "job-") (fs/readdirSync root))) 0)
+               (println "Native renderer: literal arguments, artifact cleanup and lease cancellation passed.")))
+      (.catch (fn [e] (println (.-message e)) (set! (.-exitCode js/process) 1)))
+      (.finally #(fs/rmSync root #js {:recursive true :force true}))))

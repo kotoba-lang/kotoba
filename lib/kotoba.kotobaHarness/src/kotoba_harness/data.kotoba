@@ -1,0 +1,191 @@
+(ns kotoba-harness.data
+  (:export [read-edn read-json value next-position error field at text integer
+            truth kind? member? list-member? identifier? width utf16-count json quote make-result])
+  (:schemas {:harness/parsed
+             [:record :harness/parsed [[:value :document] [:next :i64] [:error :string]]]}))
+
+;; Input normalization is data parsing, never source evaluation. The compiler's
+;; document operations consume single-space EDN; project files and JSON do not.
+(defn width [cp :i64] :i64 (cond (< cp 128) 1 (< cp 2048) 2 (< cp 65536) 3 :else 4))
+(defn value [r [:ref :harness/parsed]] :document (record-get [:ref :harness/parsed] r :value))
+(defn next-position [r [:ref :harness/parsed]] :i64 (record-get [:ref :harness/parsed] r :next))
+(defn error [r [:ref :harness/parsed]] :string (record-get [:ref :harness/parsed] r :error))
+(defn- result [v :document p :i64 e :string] [:ref :harness/parsed]
+  (record-new [:ref :harness/parsed] v p e))
+(defn make-result [v :document p :i64 e :string] [:ref :harness/parsed] (result v p e))
+(defn- bad [p :i64 e :string] [:ref :harness/parsed] (result (document-null) p e))
+(defn kind? [v :document k :keyword] :bool (= (document-kind v) k))
+(defn field [v :document k :keyword] :document
+  (if (kind? v :map)
+    (let [found (document-get v k) name (document-edn-print (document-keyword k))]
+      (option-value-of [:option :document] found
+        (option-value-of [:option :document] (document-get v (document-string (string-substring name 1 (string-length name)))) (document-null))))
+    (document-null)))
+(defn at [v :document i :i64] :document
+  (if (kind? v :vector) (option-value-of [:option :document] (document-vector-at v i) (document-null)) (document-null)))
+(defn text [v :document] :string (option-value-of [:option :string] (document-string-value v) ""))
+(defn integer [v :document] :i64 (option-value-of [:option :i64] (document-i64-value v) -1))
+(defn truth [v :document] :bool (option-value-of [:option :bool] (document-bool-value v) false))
+(defn utf16-count [s :string] :i64
+  (loop [i 0 n 0]
+    (if (= i (string-length s)) n
+      (let [c (string-code-point-at s i)] (recur (+ i (width c)) (+ n (if (> c 65535) 2 1)))))))
+(defn member? [v :document x :document] :bool
+  (and (kind? v :vector)
+       (loop [i 0] (cond (= i (document-count v)) false
+                         (document-equal? (at v i) x) true :else (recur (+ i 1))))))
+(defn list-member? [v [:list :document] x :document] :bool
+  (loop [i 0]
+    (cond (= i (vector-count v)) false (document-equal? (typed-list-nth [:list :document] v i) x) true :else (recur (+ i 1)))))
+(defn identifier? [s :string] :bool
+  (and (> (string-length s) 0) (<= (string-length s) 64)
+       (>= (string-code-point-at s 0) 97) (<= (string-code-point-at s 0) 122)
+       (loop [i 1]
+         (if (= i (string-length s)) true
+           (let [c (string-code-point-at s i)]
+             (and (or (and (>= c 97) (<= c 122)) (and (>= c 48) (<= c 57)) (= c 45))
+                  (recur (+ i 1))))))))
+(defn- cp [s :string i :i64] :i64 (if (>= i (string-length s)) -1 (string-code-point-at s i)))
+(defn- ws? [c :i64] :bool (or (= c 32) (= c 9) (= c 10) (= c 13) (= c 44)))
+(defn- skip [s :string i :i64 json? :bool] :i64
+  (cond (>= i (string-length s)) i
+        (and (ws? (cp s i)) (or (not json?) (not= (cp s i) 44))) (skip s (+ i 1) json?)
+        (and (not json?) (= (cp s i) 59))
+          (skip s (loop [p (+ i 1)] (if (or (>= p (string-length s)) (= (cp s p) 10)) p (recur (+ p (width (cp s p)))))) json?)
+        :else i))
+(defn- hex [c :i64] :i64
+  (cond (and (>= c 48) (<= c 57)) (- c 48)
+        (and (>= c 65) (<= c 70)) (- c 55)
+        (and (>= c 97) (<= c 102)) (- c 87) :else -1))
+(defn- hex4 [s :string i :i64] :i64
+  (loop [k 0 n 0]
+    (if (= k 4) n
+      (let [h (hex (cp s (+ i k)))] (if (< h 0) -1 (recur (+ k 1) (+ (* n 16) h)))))))
+(defn- emit-byte [v :vector-i64 i :i64 b :i64] :i64
+  (let [z (vector-assoc! v i b)] (+ i 1)))
+(defn- emit-cp [v :vector-i64 i :i64 c :i64] :i64
+  (cond (< c 128) (emit-byte v i c)
+        (< c 2048) (emit-byte v (emit-byte v i (+ 192 (quot c 64))) (+ 128 (rem c 64)))
+        (< c 65536) (emit-byte v (emit-byte v (emit-byte v i (+ 224 (quot c 4096))) (+ 128 (rem (quot c 64) 64))) (+ 128 (rem c 64)))
+        :else (emit-byte v (emit-byte v (emit-byte v (emit-byte v i (+ 240 (quot c 262144))) (+ 128 (rem (quot c 4096) 64))) (+ 128 (rem (quot c 64) 64))) (+ 128 (rem c 64)))))
+(defn- string-end [s :string i :i64] :i64
+  (cond (>= i (string-length s)) -1 (= (cp s i) 34) i
+        (= (cp s i) 92) (if (< (+ i 1) (string-length s)) (string-end s (+ i 2)) -1)
+        :else (string-end s (+ i (width (cp s i))))))
+(defn- read-string-at [s :string start :i64 json? :bool] [:ref :harness/parsed]
+  (let [end (string-end s (+ start 1))]
+    (if (< end 0) (bad start "input-string")
+      (let [bytes (vector-alloc (- end start))]
+        (loop [i (+ start 1) n 0]
+          (if (= i end)
+            (result (document-string (string-from-utf8 (bytes-slice (bytes-from-vector-i64 bytes) 0 n))) (+ end 1) "")
+            (let [c (cp s i)]
+              (cond (and json? (< c 32)) (bad i "input-control")
+                    (not= c 92) (recur (+ i (width c)) (emit-cp bytes n c))
+                    :else
+                    (let [e (cp s (+ i 1))
+                          simple (cond (= e 34) 34 (= e 92) 92 (= e 110) 10 (= e 114) 13 (= e 116) 9
+                                       (= e 98) 8 (= e 102) 12 (and json? (= e 47)) 47 :else -1)]
+                      (cond (>= simple 0) (recur (+ i 2) (emit-cp bytes n simple))
+                            (= e 117)
+                              (let [a (hex4 s (+ i 2))]
+                                (cond (or (< a 0) (> (+ i 6) end)) (bad i "input-unicode")
+                                      (and (>= a 55296) (<= a 56319))
+                                        (let [b (hex4 s (+ i 8))]
+                                          (if (and (<= (+ i 12) end) (= (cp s (+ i 6)) 92) (= (cp s (+ i 7)) 117) (>= b 56320) (<= b 57343))
+                                            (recur (+ i 12) (emit-cp bytes n (+ 65536 (+ (* (- a 55296) 1024) (- b 56320)))))
+                                            (bad i "input-surrogate")))
+                                      (and (>= a 56320) (<= a 57343)) (bad i "input-surrogate")
+                                      :else (recur (+ i 6) (emit-cp bytes n a))))
+                            :else (bad i "input-escape")))))))))))
+(defn- delimiter? [c :i64] :bool
+  (or (< c 0) (ws? c) (= c 93) (= c 125) (= c 41) (= c 91) (= c 123) (= c 40) (= c 59) (= c 34) (= c 58)))
+(defn- token-end [s :string i :i64] :i64
+  (if (delimiter? (cp s i)) i (token-end s (+ i (width (cp s i))))))
+(defn- digits-end [s :string i :i64] :i64
+  (if (and (>= (cp s i) 48) (<= (cp s i) 57)) (digits-end s (+ i 1)) i))
+(defn- number? [s :string json? :bool] :bool
+  (let [size (string-length s) begin (if (or (= (cp s 0) 45) (and (not json?) (= (cp s 0) 43))) 1 0)
+        ints (digits-end s begin) dot (= (cp s ints) 46) fraction (if dot (digits-end s (+ ints 1)) ints)
+        exp (or (= (cp s fraction) 101) (= (cp s fraction) 69))
+        e0 (if exp (+ fraction 1) fraction)
+        e1 (if (or (= (cp s e0) 43) (= (cp s e0) 45)) (+ e0 1) e0)
+        end (if exp (digits-end s e1) fraction)]
+    (and (> ints begin) (= end size) (or (not dot) (> fraction (+ ints 1)))
+         (or (not exp) (> end e1))
+         (or (not json?) (not (and (= (cp s begin) 48) (> ints (+ begin 1))))))))
+(defn- numeric-token [token :string end :i64] [:ref :harness/parsed]
+  (if (or (>= (string-index-of token ".") 0) (>= (string-index-of token "e") 0) (>= (string-index-of token "E") 0))
+    (result (document-edn-read token) end "")
+    (let [negative (= (cp token 0) 45) start (if (or negative (= (cp token 0) 43)) 1 0)
+          first (loop [i start] (if (and (< i (- (string-length token) 1)) (= (cp token i) 48)) (recur (+ i 1)) i))
+          digits (string-substring token first (string-length token))
+          limit (if negative "9223372036854775808" "9223372036854775807")]
+      (if (or (> (string-length digits) 19) (and (= (string-length digits) 19) (> (string-compare digits limit) 0)))
+        (bad end "input-i64-range")
+        (result (document-edn-read (if (and negative (not (string=? digits "0"))) (str "-" digits) digits)) end "")))))
+(defn- read-token [s :string start :i64 json? :bool] [:ref :harness/parsed]
+  (let [keyword? (and (not json?) (= (cp s start) 58))
+        end (token-end s (+ start (if keyword? 1 0))) token (string-substring s start end)]
+    (cond (= end start) (bad start "input-token")
+          (or (string=? token "true") (string=? token "false")) (result (document-edn-read token) end "")
+          (or (and json? (string=? token "null")) (and (not json?) (string=? token "nil"))) (result (document-null) end "")
+          (number? token json?) (numeric-token token end)
+          (and keyword? (> (- end start) 1)) (result (document-edn-read token) end "")
+          :else (bad start "input-token"))))
+(defn- read-sequence [s :string start :i64 depth :i64 json? :bool map? :bool] [:ref :harness/parsed]
+  (let [close (if map? 125 93) open (if map? "{" "[") ending (if map? "}" "]")]
+    (loop [p (skip s (+ start 1) json?) count 0 out open seen (typed-list-new [:list :document])]
+      (cond (>= p (string-length s)) (bad p "input-unclosed")
+            (= (cp s p) close)
+              (if (and map? (not= (rem count 2) 0)) (bad p "input-map-pair")
+                (result (document-edn-read (string-concat out ending)) (+ p 1) ""))
+            (> count 4096) (bad p "input-node-budget")
+            :else
+            (let [r (read-value s p (+ depth 1) json?) key? (and map? (= (rem count 2) 0))
+                  v (value r) raw (document-edn-print v) q (skip s (next-position r) json?)]
+              (cond (not (string=? (error r) "")) r
+                    (and json? key? (not (kind? v :string))) (bad p "json-key")
+                    (and key? (list-member? seen v)) (bad p "input-duplicate-key")
+                    (and json? map? key? (not= (cp s q) 58)) (bad q "json-colon")
+                    :else
+                    (let [after (if (and json? map? key?) (skip s (+ q 1) true) q)
+                          comma? (and json? (or (not map?) (not key?)) (= (cp s after) 44))
+                          next (if comma? (skip s (+ after 1) true) after)
+                          sep (if (= count 0) "" " ")]
+                      (cond (and json? (or (not map?) (not key?)) (not comma?) (not= (cp s next) close)) (bad next "json-comma")
+                            (and comma? (= (cp s next) close)) (bad next "json-trailing-comma")
+                            :else (recur next (+ count 1) (string-concat out (string-concat sep raw))
+                                         (if key? (typed-list-conj [:list :document] seen v) seen))))))))))
+(defn- read-value [s :string start :i64 depth :i64 json? :bool] [:ref :harness/parsed]
+  (let [p (skip s start json?) c (cp s p)]
+    (cond (> depth 64) (bad p "input-depth")
+          (= c 34) (read-string-at s p json?)
+          (= c 91) (read-sequence s p depth json? false)
+          (= c 123) (read-sequence s p depth json? true)
+          (< c 0) (bad p "input-eof")
+          :else (read-token s p json?))))
+(defn- read [s :string json? :bool] [:ref :harness/parsed]
+  (if (> (string-length s) 1048576) (bad 0 "input-byte-budget")
+    (let [r (read-value s 0 0 json?)]
+      (if (or (not (string=? (error r) "")) (= (skip s (next-position r) json?) (string-length s))) r
+        (bad (next-position r) "input-trailing")))))
+(defn read-edn [s :string] [:ref :harness/parsed] (read s false))
+(defn read-json [s :string] [:ref :harness/parsed] (read s true))
+(defn quote [s :string] :string (document-edn-print (document-string s)))
+(defn json [v :document] :string
+  (let [k (document-kind v)]
+    (cond (= k :null) "null"
+          (or (= k :i64) (= k :f64) (= k :bool) (= k :string)) (document-edn-print v)
+          (= k :keyword) (let [s (document-edn-print v)] (quote (string-substring s 1 (string-length s))))
+          (= k :vector)
+            (loop [i 0 out "["]
+              (if (= i (document-count v)) (string-concat out "]")
+                (recur (+ i 1) (string-concat out (string-concat (if (= i 0) "" ",") (json (at v i)))))))
+          (= k :map)
+            (loop [i 0 out "{"]
+              (if (= i (document-count v)) (string-concat out "}")
+                (let [pair (option-value-of [:option :document] (document-map-entry-at v i) (document-vector))
+                      key (at pair 0) val (at pair 1)]
+                  (recur (+ i 1) (string-concat out (string-concat (if (= i 0) "" ",") (string-concat (json key) (string-concat ":" (json val)))))))))
+          :else "null")))

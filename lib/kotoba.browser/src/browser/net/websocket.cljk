@@ -1,0 +1,408 @@
+(ns browser.net.websocket
+  "Real host I/O for the WebSocket capability (`:websocket/connect` /
+   `:websocket/send` / `:websocket/close` in
+   `browser.compat.quickjs-execution`) -- the WebSocket analogue of
+   `browser.net.http`.
+
+   Before this namespace, every `:websocket/connect`/`:websocket/send` in
+   this repo was a pure host-side fabrication: `quickjs-execution` made up a
+   `{:ready-state :open ...}` map and appended sent data to an in-memory
+   vector, but no byte ever left the process and nothing could ever really
+   come back. This namespace opens a REAL socket:
+
+   - `:clj` -- `java.net.http.HttpClient`'s built-in `newWebSocketBuilder()`
+     (JDK 11+, no new dependency): a real TCP connection, a real RFC6455
+     HTTP-Upgrade handshake, real text frames on the wire.
+   - `:cljs` -- the host JS runtime's own built-in, global `WebSocket`
+     client (stable in both real browsers and modern Node -- also no new
+     dependency, the same kind of \"real, already-there capability\" trade
+     `browser.net.http`'s `fetch-async` sketch relies on for `js/fetch`).
+     Unlike that sketch, THIS branch is genuinely wired up and used (by
+     `browser.compat.quickjs-execution` via an injected `:websocket-fn`, see
+     that namespace) -- but with one real, honestly-documented limitation:
+     `drain-messages!` on this branch can only ever be a non-blocking peek
+     at whatever has already arrived, never a bounded *wait* the way the
+     `:clj` branch's can genuinely be. A JS host is single-threaded: the
+     only way inbound WebSocket bytes ever get copied into `messages` is by
+     letting the event loop run an `onmessage` callback, and busy-waiting
+     this thread (there is no blocking `Thread/sleep` equivalent available
+     to plain JS) would starve that very event loop, guaranteeing the wait
+     sees nothing -- the same async/sync mismatch `browser.net.http`
+     documents for `fetch-async`. The real wait has to happen OUTSIDE this
+     function, at the caller's own async boundary (a real `await`/
+     `setTimeout` between running one `<script>` tag and the next) -- see
+     `test-cljs/browser/compat/quickjs_websocket_smoke_test.cljk` for how
+     that plays out in practice.
+
+   Every function here is deliberately shaped to be called from
+   `quickjs-execution`'s capability-application code through a single
+   dispatch function (`websocket-fn`, mirroring `browser.net.http/fetch-fn`)
+   so that namespace never has to know or care which platform's real
+   implementation it is talking to: `(websocket-fn {:op :connect ...})`,
+   `{:op :send ...}`, `{:op :close ...}`, `{:op :drain ...}`."
+  (:require [kotoba.lang.text :as str]))
+
+(def default-connect-timeout-ms
+  "Default bound on how long a real WebSocket handshake (the initial TCP
+   connect + HTTP Upgrade round trip) is allowed to take before giving up."
+  10000)
+
+(def default-request-timeout-ms
+  "Default bound on how long a real `send!`/`close!` call is allowed to
+   block waiting for its underlying frame to actually go out."
+  10000)
+
+(def default-drain-wait-ms
+  "Default bound on how long `drain-messages!` (the `:clj` branch) is
+   willing to block waiting for at least one real inbound message to show
+   up before giving up empty-handed. Deliberately \"a few hundred ms\", not
+   longer: this runs host-side before every `<script>` tag evaluation (see
+   `browser.compat.quickjs-execution/websocket-snapshot`), so it directly
+   adds to script-eval latency whenever a real connection is open."
+  300)
+
+(def default-drain-poll-interval-ms
+  "Poll interval `drain-messages!` (the `:clj` branch) sleeps for between
+   checks of the real message queue while waiting out `default-drain-wait-ms`."
+  20)
+
+#?(:clj
+   (do
+
+     (defn create-client
+       "Build a `java.net.http.HttpClient` tuned for use as a
+        `browser.net.websocket` backend. Mirrors `browser.net.http/create-client`
+        but only needs a connect timeout -- HTTP redirect/version policy
+        (relevant to plain request/response fetches) does not apply to a
+        WebSocket upgrade handshake."
+       (^java.net.http.HttpClient []
+        (create-client {}))
+       (^java.net.http.HttpClient [{:keys [connect-timeout-ms]
+                                     :or {connect-timeout-ms default-connect-timeout-ms}}]
+        (-> (java.net.http.HttpClient/newBuilder)
+            (.connectTimeout (java.time.Duration/ofMillis connect-timeout-ms))
+            (.build))))
+
+     (defn- unwrap-execution-exception
+       "`CompletableFuture#get` wraps whatever real exception actually failed
+        the operation (connection refused, unknown host, ...) in an
+        `ExecutionException`; unwrap it so callers see the real cause, the
+        same way `browser.net.http/fetch!` classifies real, unwrapped
+        exceptions from `HttpClient#send`."
+       [^java.util.concurrent.ExecutionException e]
+       (or (.getCause e) e))
+
+     (defn- classify-exception
+       [e]
+       (cond
+         (instance? java.util.concurrent.TimeoutException e)
+         {:error :net/timeout :error/message (.getMessage e)}
+
+         (instance? java.util.concurrent.ExecutionException e)
+         (classify-exception (unwrap-execution-exception e))
+
+         (instance? java.net.UnknownHostException e)
+         {:error :net/unknown-host :error/message (.getMessage e)}
+
+         (instance? java.net.ConnectException e)
+         {:error :net/connection-refused :error/message (.getMessage e)}
+
+         (instance? IllegalArgumentException e)
+         {:error :net/invalid-request :error/message (.getMessage e)}
+
+         (instance? java.io.IOException e)
+         {:error :net/io-error :error/message (.getMessage e)}
+
+         (instance? InterruptedException e)
+         (do (.interrupt (Thread/currentThread))
+             {:error :net/interrupted :error/message (.getMessage e)})
+
+         :else
+         {:error :net/websocket-failed :error/message (str (.getMessage e))}))
+
+     (defn- websocket-listener
+       "A `java.net.http.WebSocket$Listener` that copies every real inbound
+        text frame into `messages` (a `ConcurrentLinkedQueue`, safe to drain
+        from a different thread than the one the JDK's internal I/O threads
+        call these methods on) and records real close/error info into atoms.
+        Binary frames are acknowledged (so the connection does not stall
+        waiting for a `request` we never send) but their bytes are dropped --
+        this repo's WebSocket subset only carries text, matching the
+        `webapi-shim`'s `WebSocket.prototype.send` (always `String(data)`).
+
+        Per `WebSocket.Listener.onText`'s own Javadoc contract, a real server
+        is free to split any single logical text message across multiple
+        WebSocket frames (fragmentation is normal, spec-legal RFC6455
+        behavior -- common for large payloads), and `onText` is invoked once
+        per fragment with that fragment's `data` and `last` false until the
+        final fragment, where `last` is true. `data` is only ever THAT
+        FRAGMENT's text, never the whole message -- so fragments are
+        accumulated into `buffer` across calls and only the fully assembled
+        message (the concatenation of every fragment since the last `last`)
+        is pushed onto `messages`, exactly once per logical message, when
+        `last` is finally true; `buffer` is then reset for the next message."
+       [messages closed? close-info error]
+       (let [buffer (StringBuilder.)]
+         (reify java.net.http.WebSocket$Listener
+           (onOpen [_ webSocket]
+             (.request webSocket 1))
+           (onText [_ webSocket data last]
+             (.append buffer (str data))
+             (when last
+               (.add ^java.util.Queue messages (.toString buffer))
+               (.setLength buffer 0))
+             (.request webSocket 1)
+             nil)
+           (onBinary [_ webSocket data last]
+             (.request webSocket 1)
+             nil)
+           (onPing [_ webSocket data]
+             (.request webSocket 1)
+             nil)
+           (onPong [_ webSocket data]
+             (.request webSocket 1)
+             nil)
+           (onClose [_ _webSocket status-code reason]
+             (reset! closed? true)
+             (reset! close-info {:code status-code :reason reason})
+             nil)
+           (onError [_ _webSocket err]
+             (reset! error {:message (.getMessage ^Throwable err)})
+             nil))))
+
+     (defn connect!
+       "Open a REAL WebSocket connection: a real TCP socket, a real RFC6455
+        HTTP-Upgrade handshake against `url` (`ws://`/`wss://`), blocking up
+        to `:connect-timeout-ms` for the handshake to complete.
+
+        Returns `{:ok? true :handle {...}}` on success -- `handle` is an
+        opaque map (real `java.net.http.WebSocket` + the real message
+        queue/close/error atoms `send-text!`/`close!`/`drain-messages!`
+        expect) meant to be threaded back into those functions unchanged,
+        the same way `browser.compat.quickjs-execution` threads it through
+        page-lifetime state (see that namespace's `:websocket/handles`).
+        On failure, `{:ok? false :error <keyword> :error/message <string>}`,
+        matching `browser.net.http/fetch!`'s convention -- never throws."
+       ([client url] (connect! client url {}))
+       ([^java.net.http.HttpClient client url {:keys [protocols connect-timeout-ms]
+                                                :or {connect-timeout-ms default-connect-timeout-ms}}]
+        (try
+          (let [messages (java.util.concurrent.ConcurrentLinkedQueue.)
+                closed? (atom false)
+                close-info (atom nil)
+                error (atom nil)
+                listener (websocket-listener messages closed? close-info error)
+                builder (.newWebSocketBuilder client)
+                builder (cond-> builder
+                          (seq protocols)
+                          (.subprotocols (first protocols)
+                                         (into-array String (rest protocols))))
+                websocket (-> (.buildAsync builder (java.net.URI/create (str url)) listener)
+                              (.get connect-timeout-ms java.util.concurrent.TimeUnit/MILLISECONDS))]
+            {:ok? true
+             :handle {:websocket websocket
+                      :messages messages
+                      :closed? closed?
+                      :close-info close-info
+                      :error error}})
+          (catch Exception e
+            (assoc (classify-exception e) :ok? false)))))
+
+     (defn send-text!
+       "Send a REAL text frame over `handle`'s real socket (see `connect!`),
+        blocking up to `:request-timeout-ms` for the send to complete.
+        Returns `{:ok? true}` or `{:ok? false :error ... :error/message ...}`,
+        never throws."
+       ([handle data] (send-text! handle data {}))
+       ([{:keys [^java.net.http.WebSocket websocket]} data
+         {:keys [request-timeout-ms] :or {request-timeout-ms default-request-timeout-ms}}]
+        (try
+          (.get (.sendText websocket (str data) true)
+                request-timeout-ms java.util.concurrent.TimeUnit/MILLISECONDS)
+          {:ok? true}
+          (catch Exception e
+            (assoc (classify-exception e) :ok? false)))))
+
+     (defn close!
+       "Send a REAL close frame over `handle`'s real socket (see `connect!`),
+        blocking up to `:request-timeout-ms`. Returns `{:ok? true}` or
+        `{:ok? false :error ... :error/message ...}`, never throws."
+       ([handle] (close! handle {}))
+       ([{:keys [^java.net.http.WebSocket websocket]}
+         {:keys [code reason request-timeout-ms]
+          :or {code java.net.http.WebSocket/NORMAL_CLOSURE
+               reason ""
+               request-timeout-ms default-request-timeout-ms}}]
+        (try
+          (.get (.sendClose websocket code reason)
+                request-timeout-ms java.util.concurrent.TimeUnit/MILLISECONDS)
+          {:ok? true}
+          (catch Exception e
+            (assoc (classify-exception e) :ok? false)))))
+
+     (defn drain-messages!
+       "Pop every REAL text message that has genuinely arrived on `handle`'s
+        real socket so far (see `connect!`), waiting up to `:wait-ms`
+        (default `default-drain-wait-ms`) for at least one to show up before
+        giving up empty-handed -- `handle`'s listener callbacks run on the
+        JDK HttpClient's own I/O threads, not this thread, so a message that
+        left the wire moments ago needs a moment to actually land in the
+        queue. This bounded wait is genuinely meaningful on the JVM (real
+        OS threads keep servicing the socket while this thread sleeps) --
+        contrast the `:cljs` branch below, which cannot do this.
+
+        Returns `{:messages [...] :closed? bool :close-info {...} :error {...}}`
+        (`:messages` in the order they arrived; draining removes them from
+        the queue, so a later call only sees what has arrived since)."
+       ([handle] (drain-messages! handle {}))
+       ([{:keys [^java.util.Queue messages closed? close-info error]}
+         {:keys [wait-ms poll-interval-ms]
+          :or {wait-ms default-drain-wait-ms
+               poll-interval-ms default-drain-poll-interval-ms}}]
+        (let [deadline (+ (System/currentTimeMillis) wait-ms)]
+          (while (and (.isEmpty messages)
+                      (not @closed?)
+                      (< (System/currentTimeMillis) deadline))
+            (Thread/sleep (long (max 1 (min poll-interval-ms
+                                             (- deadline (System/currentTimeMillis))))))))
+        (loop [acc []]
+          (if-let [msg (.poll messages)]
+            (recur (conj acc msg))
+            {:messages acc
+             :closed? @closed?
+             :close-info @close-info
+             :error @error}))))
+
+     (defn websocket-fn
+       "Return a single dispatch function (the shape
+        `browser.compat.quickjs-execution`'s `:websocket-fn` state key
+        expects) backed by a real, shared `java.net.http.HttpClient`:
+        `{:op :connect :url ...}`, `{:op :send :handle ... :data ...}`,
+        `{:op :close :handle ...}`, `{:op :drain :handle ...}`. Mirrors
+        `browser.net.http/fetch-fn`'s \"build once, reuse (connection-pooled)
+        across every call\" shape."
+       ([] (websocket-fn {}))
+       ([opts]
+        (let [client (create-client opts)]
+          (fn real-websocket-fn [{:keys [op] :as request}]
+            (case op
+              :connect (connect! client (:url request)
+                                 (select-keys request [:protocols :connect-timeout-ms]))
+              :send (send-text! (:handle request) (:data request)
+                                 (select-keys request [:request-timeout-ms]))
+              :close (close! (:handle request)
+                             (select-keys request [:code :reason :request-timeout-ms]))
+              :drain (drain-messages! (:handle request)
+                                      (select-keys request [:wait-ms :poll-interval-ms]))
+              {:ok? false :error :websocket/unsupported-op})))))))
+
+#?(:cljs
+   (do
+
+     (defn connect!
+       "Open a REAL WebSocket connection using the host JS runtime's own
+        built-in, global `WebSocket` (real in both browsers and modern
+        Node -- no new dependency). Unlike the `:clj` branch, this cannot
+        block for the handshake to complete (JS has no such blocking call):
+        it returns `{:ok? true :handle {...}}` immediately, with the real
+        connection still in progress. `handle`'s `:open?` atom flips to
+        `true` for real once the real `onopen` event fires -- until then,
+        `send-text!` below buffers writes rather than sending them early
+        (a real WebSocket throws `InvalidStateError` if you call `.send`
+        before it is really open)."
+       ([url] (connect! url {}))
+       ([url {:keys [protocols]}]
+        (let [messages (atom [])
+              open? (atom false)
+              closed? (atom false)
+              close-info (atom nil)
+              error (atom nil)
+              pending-sends (atom [])
+              ^js websocket (if (seq protocols)
+                              (js/WebSocket. url (clj->js (vec protocols)))
+                              (js/WebSocket. url))]
+          (set! (.-onopen websocket)
+                (fn [_event]
+                  (reset! open? true)
+                  (doseq [data @pending-sends]
+                    (.send websocket data))
+                  (reset! pending-sends [])))
+          (set! (.-onmessage websocket)
+                (fn [event] (swap! messages conj (.-data event))))
+          (set! (.-onclose websocket)
+                (fn [event]
+                  (reset! closed? true)
+                  (reset! close-info {:code (.-code event) :reason (.-reason event)})))
+          (set! (.-onerror websocket)
+                (fn [event] (reset! error {:message (str (.-message event))})))
+          {:ok? true
+           :handle {:websocket websocket
+                    :messages messages
+                    :open? open?
+                    :closed? closed?
+                    :close-info close-info
+                    :error error
+                    :pending-sends pending-sends}})))
+
+     (defn send-text!
+       "Send real text over `handle`'s real (or still-connecting) socket.
+        If the real `onopen` event has not fired yet, buffers `data`
+        host-side and flushes it for real the moment `onopen` does (see
+        `connect!`) -- always returns `{:ok? true}` (fire-and-forget,
+        matching a real `WebSocket.prototype.send`'s synchronous-return/
+        async-delivery shape); never throws."
+       [{:keys [websocket open? pending-sends]} data]
+       (try
+         (if @open?
+           (.send websocket data)
+           (swap! pending-sends conj data))
+         {:ok? true}
+         (catch :default e
+           {:ok? false :error :net/websocket-send-failed :error/message (str (.-message e))})))
+
+     (defn close!
+       [{:keys [websocket]} {:keys [code reason]}]
+       (try
+         (.close websocket (or code 1000) (or reason ""))
+         {:ok? true}
+         (catch :default e
+           {:ok? false :error :net/websocket-close-failed :error/message (str (.-message e))})))
+
+     (defn drain-messages!
+       "Pop every real text message that has already arrived and been
+        buffered by the real `onmessage` handler `connect!` installed --
+        a NON-BLOCKING peek, deliberately. There is no bounded-wait
+        equivalent to the `:clj` branch's `drain-messages!` here: a real
+        JS host is single-threaded, and the only way a real inbound
+        message ever reaches `messages` is by letting the event loop run
+        the `onmessage` callback -- busy-waiting this thread would starve
+        that very event loop and guarantee the wait sees nothing (the same
+        async/sync mismatch documented on `browser.net.http/fetch-async`).
+        A caller that needs real inbound data to have genuinely arrived
+        before calling this MUST let real wall-clock time pass first via
+        its own real async boundary (`js/Promise`/`setTimeout`) -- see this
+        namespace's docstring and
+        `test-cljs/browser/compat/quickjs_websocket_smoke_test.cljk`."
+       [{:keys [messages closed? close-info error]}]
+       (let [drained @messages]
+         (reset! messages [])
+         {:messages drained
+          :closed? @closed?
+          :close-info @close-info
+          :error @error}))
+
+     (defn websocket-fn
+       "Return a single dispatch function, same shape/contract as the `:clj`
+        branch's `websocket-fn` (see that docstring), backed by the host JS
+        runtime's real, built-in `WebSocket` global. See this namespace's
+        docstring for the one real behavioral difference (`:drain` cannot
+        bound-wait here)."
+       ([] (websocket-fn {}))
+       ([_opts]
+        (fn real-websocket-fn [{:keys [op] :as request}]
+          (case op
+            :connect (connect! (:url request) (select-keys request [:protocols]))
+            :send (send-text! (:handle request) (:data request))
+            :close (close! (:handle request) (select-keys request [:code :reason]))
+            :drain (drain-messages! (:handle request))
+            {:ok? false :error :websocket/unsupported-op}))))))

@@ -1,0 +1,879 @@
+(ns torihiki.clearing
+  "The perpetuals clearinghouse: positions, margin, and the equity test that
+  decides whether an account is still solvent.
+
+  Everything here is a pure function of an immutable state map. Unlike
+  `torihiki.book`, which mutates preallocated arrays because it is called
+  hundreds of thousands of times a second, the clearinghouse runs once per
+  fill and once per mark-price update, so ordinary Clojure data is both fast
+  enough and much easier to reason about — and reasoning about it is the
+  point, because THIS is the layer where money is actually lost.
+
+  ## Model
+
+  An account holds `:collateral` (integer, in the quote asset's smallest unit)
+  and a map of `:positions` keyed by market id. A position is
+
+    {:size <signed lots>          ; positive = long, negative = short
+     :entry-notional <signed>     ; running cost basis, same sign as size
+     :isolated <collateral or nil>}
+
+  Cost basis is carried as a NOTIONAL rather than as an average entry price,
+  because an average price forces a division on every fill and a division
+  forces a rounding decision on every fill. Accumulating the notional exactly
+  and dividing only when someone asks for the entry price moves all the
+  rounding to one place.
+
+  ## Margin
+
+  Following Hyperliquid's published parameters: maintenance margin is half the
+  initial margin at maximum leverage, so a market that allows 40x has 2.5%
+  initial and 1.25% maintenance, and one that allows 3x has 33.3% initial and
+  16.7% maintenance. An account is liquidatable when its equity falls below
+  the sum of its positions' maintenance requirements.
+
+  Cross margin pools collateral across every position. Isolated margin fences
+  a stated amount to one position, so that position's liquidation cannot reach
+  the rest of the account — which also means its equity test must exclude the
+  cross pool entirely."
+  (:require [torihiki.fixed :as fx]))
+
+;; ── markets ─────────────────────────────────────────────────────────────────
+
+(defn market
+  "A market's risk parameters. `max-leverage` is the only number an operator
+  sets; initial and maintenance margin are derived from it so the pair can
+  never be configured inconsistently.
+
+  `margin-tiers` is optional: a vector of `{:max-notional n :max-leverage l}`
+  in ascending order of size. A position pays the rate of the first tier whose
+  `:max-notional` it fits inside; anything past the last tier pays the last
+  tier's rate. Without tiers every position pays the same rate regardless of
+  size, which is how a large position ends up under-collateralised — the book
+  cannot absorb it at the price the margin assumed, and the difference is paid
+  by the insurance fund or by ADL.
+
+  `open-interest-cap` is optional and is checked by `torihiki.api`.
+
+  `symbol` is what a human calls this market. Not used by any arithmetic here
+  and committed to the state root all the same: it is what a terminal puts on
+  a trade ticket, so two replicas that disagreed about it would label the same
+  position two different things."
+  [{:keys [id symbol max-leverage tick lot margin-tiers open-interest-cap]}]
+  (let [initial (fx/fdiv fx/rate-scale max-leverage)]
+    (cond-> {:id id
+             :symbol (or symbol (str "MKT-" id))
+             :tick tick
+             :lot lot
+             :max-leverage max-leverage
+             :initial-margin-rate initial
+             ;; half the initial margin at max leverage — Hyperliquid's rule
+             :maintenance-margin-rate (fx/fdiv initial 2)}
+      margin-tiers
+      (assoc :margin-tiers
+             (mapv (fn [{:keys [max-notional max-leverage]}]
+                     (let [im (fx/fdiv fx/rate-scale max-leverage)]
+                       {:max-notional max-notional
+                        :max-leverage max-leverage
+                        :initial-margin-rate im
+                        :maintenance-margin-rate (fx/fdiv im 2)}))
+                   (sort-by :max-notional margin-tiers)))
+      open-interest-cap (assoc :open-interest-cap open-interest-cap))))
+
+(defn tier-for
+  "The tier a position of `notional` falls into, or nil when the market has no
+  tiers. Past the last tier the last tier applies — a position does not escape
+  the margin schedule by being bigger than anyone anticipated."
+  [market notional]
+  (when-let [tiers (seq (:margin-tiers market))]
+    (or (first (filter #(<= notional (:max-notional %)) tiers))
+        (last tiers))))
+
+(defn rates-for
+  "[initial maintenance] for a position of `notional` in `market`."
+  [market notional]
+  (if-let [t (tier-for market notional)]
+    [(:initial-margin-rate t) (:maintenance-margin-rate t)]
+    [(:initial-margin-rate market 0) (:maintenance-margin-rate market 0)]))
+
+;; ── tier shape: what a schedule must carry to be readable ───────────────────
+;;
+;; `tier-for` derefs `:max-notional`, `rates-for` derefs the two rates out of
+;; the tier it picked, and `fee-rates-for` derefs `:min-volume`. A tier missing
+;; any of those is not a tier with a hole in it — it is a throw on the first
+;; sweep through the market, inside apply-block, from a transaction that was
+;; signed once and validated nowhere (the falsify-6/7 class). So the shape is
+;; judged BEFORE the schedule is stored: `torihiki.api/validate` refuses the
+;; transaction with `:missing-field`, and `apply-tx` answers a direct caller
+;; with a no-op. The readers stay total by contract, not by luck.
+
+(defn- rate-ok?
+  "A rate field inside a tier, judged by the same rules `torihiki.api` judges
+  rates by: a fee may be negative (a rebate), a margin requirement may not —
+  a negative requirement is not a requirement, it is free leverage."
+  [v margin?]
+  (and (integer? v)
+       (if margin?
+         (<= 0 v fx/rate-scale)
+         (<= (- fx/rate-scale) v fx/rate-scale))))
+
+(defn margin-tiers-ok?
+  "Whether `tiers` is a complete margin schedule — every entry a map carrying
+  `:max-notional` (0..i53-max, what `tier-for` compares against) and both
+  margin rates (0..rate-scale, what `rates-for` hands to `mul-rate`), all
+  slab-storable integers. nil is the flat schedule (no tiers), and so is an
+  empty vector.
+
+  Ranges as well as presence: a non-integer `:max-notional` compares fine and
+  stores badly, and a rate outside 0..100% is refused for the same reason
+  `torihiki.api` refuses one — `mul-rate` against it leaves the domain and
+  throws mid-fill."
+  [tiers]
+  (or (nil? tiers)
+      (and (sequential? tiers)
+           (every? (fn [t]
+                     (and (map? t)
+                          (integer? (:max-notional t))
+                          (<= 0 (:max-notional t) fx/i53-max)
+                          (rate-ok? (:initial-margin-rate t) true)
+                          (rate-ok? (:maintenance-margin-rate t) true)))
+                   tiers))))
+
+(defn fee-tiers-ok?
+  "Whether `tiers` is a readable fee schedule — every entry a map carrying
+  `:min-volume` (0..i53-max, what `fee-rates-for` compares the rolling volume
+  against). Tier rates are OPTIONAL (`fee-rates-for` falls back to the flat
+  rates) but when present they are judged by `rate-ok?`. nil and the empty
+  vector are the flat schedule."
+  [tiers]
+  (or (nil? tiers)
+      (and (sequential? tiers)
+           (every? (fn [t]
+                     (and (map? t)
+                          (integer? (:min-volume t))
+                          (<= 0 (:min-volume t) fx/i53-max)
+                          (let [tk (:taker-fee-rate t)
+                                mk (:maker-fee-rate t)]
+                            (and (or (nil? tk) (rate-ok? tk false))
+                                 (or (nil? mk) (rate-ok? mk false))))))
+                   tiers))))
+
+;; ── positions ───────────────────────────────────────────────────────────────
+
+(def flat {:size 0 :entry-notional 0 :isolated nil})
+
+(defn position [state acct mkt]
+  (get-in state [:accounts acct :positions mkt] flat))
+
+(defn entry-price
+  "Average entry price in ticks, or 0 for a flat position. The only division
+  in the cost-basis path, deliberately."
+  [{:keys [size entry-notional]}]
+  (if (zero? size) 0 (fx/fdiv entry-notional size)))
+
+(defn unrealized
+  "Mark-to-market profit or loss, signed, in the quote unit.
+
+  `(mark - entry) * size` expands to `mark*size - entry-notional`, which
+  avoids recovering the entry price — and therefore avoids reintroducing the
+  rounding that `entry-price` concentrates in one place."
+  [{:keys [size entry-notional]} mark]
+  ;; the difference of two in-domain values is a saturated sum like any other:
+  ;; raw `(- ...)` leaves the domain quietly and forks the runtimes
+  ;; (falsify-8's class) — this value is compared, summed and returned by the
+  ;; reporting path, so it must be in-domain at the boundary.
+  (fx/sadd (fx/notional mark size) (- entry-notional)))
+
+(defn- apply-fill-to-position
+  "Fold one fill into a position. `delta` is signed: positive when the account
+  bought. Returns [position' realized-pnl].
+
+  Three cases, and the middle one is where implementations usually go wrong:
+
+  - INCREASING (or opening): cost basis simply accumulates.
+  - REDUCING: the closed portion realises PnL against the average entry, and
+    the remaining basis shrinks proportionally. Taking the closed portion's
+    basis as `entry-price * closed` rather than pro-rating the stored notional
+    would leave a residue in `entry-notional` that never goes away, so a
+    position that returned to flat would still carry a phantom cost basis.
+  - FLIPPING: the position crosses through zero, so it must be split — realise
+    everything against the old side, then open the remainder at the fill price
+    with a fresh basis."
+  [{:keys [size entry-notional] :as pos} delta price]
+  (let [new-size (fx/sadd size delta)]
+    (cond
+      ;; opening from flat, or adding in the same direction
+      (or (zero? size) (= (neg? size) (neg? delta)))
+      [(assoc pos :size new-size
+                  ;; the basis is an accumulator like any other: sadd, not +.
+                  ;; A basis that leaves the domain silently rounds on JS and
+                  ;; forks the two runtimes (falsify-8's class).
+                  :entry-notional (fx/sadd entry-notional (fx/notional price delta)))
+       0]
+
+      ;; the fill crosses through zero: close the old side entirely, reopen
+      (or (and (pos? size) (neg? new-size)) (and (neg? size) (pos? new-size)))
+      ;; `closed` is the POSITION being closed (same sign as size), not the
+      ;; delta that closes it. Using the delta here inverts the sign of every
+      ;; realised PnL on a flip: a long that closed at a profit books a loss.
+      (let [realized (fx/sadd (fx/notional price size) (- entry-notional))]
+        [(assoc pos :size new-size
+                    :entry-notional (fx/notional price new-size))
+         realized])
+
+      ;; reducing without crossing zero
+      :else
+      (let [closed (- delta)                                 ; same sign as size
+            ;; `entry-notional x closed` routinely exceeds 2^53 while the
+            ;; quotient does not (7.2e14 x 1e12 / 2e12 = 3.6e14): direct `*`
+            ;; is a bare overflow on the JVM and a silent rounding on JS, and
+            ;; a new-size of 0 lands here — falsify-11's secondary finding.
+            ;; fmul folds the division into the multiplication, so the retired
+            ;; basis is EXACT — the pmul clamp this replaces retired 4503599
+            ;; of basis on falsify-11's numbers (see torihiki.fixed).
+            closed-basis (fx/fmul entry-notional closed size)
+            realized (fx/sadd (fx/notional price closed) (- closed-basis))]
+        [(assoc pos :size new-size
+                    :entry-notional (fx/acc entry-notional (- closed-basis)))
+         realized]))))
+
+(defn open-interest
+  "Total long exposure in `mkt`, which equals total short exposure because a
+  perp market nets to zero. Maintained incrementally rather than summed on
+  demand: summing would make a risk check cost a walk of every account."
+  [state mkt]
+  (get-in state [:open-interest mkt] 0))
+
+(def ^:const referral-share
+  "The fraction of the VENUE's fee that goes to a referrer, as a rate.
+
+  Ten percent. It comes out of what the exchange keeps, not out of what the
+  trader pays — a referral that raised the price of trading would be a
+  surcharge for having been introduced to the venue, which is the opposite of
+  what it is sold as.
+
+  A rate rather than a per-referrer number: a negotiable share is a governance
+  surface, and this chain has one authority and no way to price a deal."
+  100000000)
+
+(def ^:const unbond-delay-blocks
+  "How long an unbonding sits before it can be collected.
+
+  A bond that could be withdrawn the instant it is at risk is not security: a
+  validator would unbond the moment it equivocated and be gone before anybody
+  could slash it. The delay is what makes the stake answerable for what it did
+  while it was staked.
+
+  In BLOCKS, like every other duration here — the engine has no clock. At this
+  chain's cadence 20000 blocks is roughly an hour, which is a devnet number,
+  not a policy: a real one would be set against how long a dispute takes to
+  surface."
+  20000)
+
+(defn bond
+  "Move `amount` of `acct`'s free collateral into a bond backing `validator`.
+
+  The money stays in the account. Bonding is a CLAIM against it, not a
+  transfer — slashing has to be able to take it from where it is, and an
+  account that had already moved it away would have nothing to slash."
+  [state acct validator amount free]
+  (let [amount (long amount)]
+    (if (or (not (pos? amount)) (> amount (long free)))
+      state
+      (update-in state [:bonds acct validator] fx/acc amount))))
+
+(defn unbond
+  "Begin unbonding `amount` from `validator`. It leaves the bond now and
+  becomes collectable at `height + unbond-delay-blocks`.
+
+  Two steps rather than one because the delay is the whole point: the stake
+  must stop counting toward the validator's weight immediately — it is being
+  withdrawn — and must stay answerable for a while longer."
+  [state acct validator amount height]
+  (let [amount (long amount)
+        have (get-in state [:bonds acct validator] 0)]
+    (if (or (not (pos? amount)) (> amount have))
+      state
+      (-> state
+          (update-in [:bonds acct validator] fx/acc (- amount))
+          (update-in [:unbonding acct] (fnil conj [])
+                     {:validator validator :amount amount
+                      :at (+ (long height) unbond-delay-blocks)})))))
+
+(defn collect-unbonded
+  "Release every matured unbonding for `acct` at `height`.
+
+  Releasing means the claim disappears; the collateral never moved, so nothing
+  is credited here. That is what makes bonding safe to interrupt: a chain that
+  stopped mid-unbond leaves the money where it always was."
+  [state acct height]
+  (let [q (get-in state [:unbonding acct] [])
+        [done pending] [(filter #(<= (:at %) (long height)) q)
+                        (vec (remove #(<= (:at %) (long height)) q))]]
+    (if (empty? done)
+      state
+      (assoc-in state [:unbonding acct] pending))))
+
+(defn stake-of
+  "Total bonded to `validator` by everybody — the weight its word carries."
+  [state validator]
+  (reduce fx/sadd 0 (keep (fn [[_ by-v]] (get by-v validator)) (:bonds state {}))))
+
+(defn vault-shares
+  "`[shares-of-acct total-shares]` for `vault`."
+  [state vault acct]
+  [(get-in state [:vaults vault :shares acct] 0)
+   (get-in state [:vaults vault :total-shares] 0)])
+
+(defn vault-deposit
+  "Move `amount` from `acct` into `vault` and mint the shares it buys.
+
+  ## Shares are priced on COLLATERAL, not equity
+
+  A vault holding a position has unrealised PnL, and pricing shares on it would
+  let a depositor buy in cheap the moment before it is realised — or, worse,
+  let an existing holder withdraw at a profit the vault has not actually made
+  and leave the loss to whoever is left. Collateral is what the vault HAS.
+
+  The cost is that a depositor joining a vault with a large unrealised gain
+  gets it at book value, which is a real transfer between depositors. It is
+  the smaller of the two unfairnesses and the one that cannot be timed: the
+  other can.
+
+  The first deposit into an empty vault mints one share per unit, which is
+  where the price starts."
+  [state acct vault amount]
+  (let [amount (long amount)
+        have (get-in state [:accounts acct :collateral] 0)
+        pool (get-in state [:accounts vault :collateral] 0)
+        total (get-in state [:vaults vault :total-shares] 0)]
+    (if (or (not (pos? amount)) (> amount have) (= acct vault))
+      state
+      (let [minted (if (or (zero? total) (zero? pool))
+                     amount
+                   ;; the share price: amount x total / pool. The product is
+                   ;; routinely past 2^53 and the quotient is not — exact via
+                   ;; fmul, not a rounded double divided by another.
+                   (fx/fmul amount total pool))]
+        (if-not (pos? minted)
+          ;; A deposit too small to buy a share would be a donation. Refusing
+          ;; is the honest answer; taking it silently is not.
+          state
+          (-> state
+              (update-in [:accounts acct :collateral] fx/acc (- amount))
+              (update-in [:accounts vault :collateral] fx/acc amount)
+              (update-in [:vaults vault :shares acct] fx/acc minted)
+              (update-in [:vaults vault :total-shares] fx/acc minted)))))))
+
+(defn vault-withdraw
+  "Burn `shares` of `acct`'s holding in `vault` and pay out their share of its
+  collateral.
+
+  `free` is the vault's free collateral. A vault that could pay out the margin
+  behind its positions would be closing somebody else's position to fund an
+  exit, so a withdrawal it cannot cover is refused rather than partially
+  filled — a partial burn priced as if the whole had gone through would
+  misprice every remaining share."
+  [state acct vault shares free]
+  (let [shares (long shares)
+        held (get-in state [:vaults vault :shares acct] 0)
+        total (get-in state [:vaults vault :total-shares] 0)
+        pool (get-in state [:accounts vault :collateral] 0)]
+    (if (or (not (pos? shares)) (> shares held) (not (pos? total)))
+      state
+      (let [payout (fx/fmul shares pool total)]
+        (if (or (not (pos? payout)) (> payout (long free)))
+          state
+          (-> state
+              (update-in [:accounts vault :collateral] fx/acc (- payout))
+              (update-in [:accounts acct :collateral] fx/acc payout)
+              (update-in [:vaults vault :shares acct] fx/acc (- shares))
+              (update-in [:vaults vault :total-shares] fx/acc (- shares))))))))
+
+(defn family
+  "The owner an account belongs to: itself, or the account it is a sub-account
+  of."
+  [state acct]
+  (get-in state [:sub-of acct] acct))
+
+(defn same-family?
+  "Whether two accounts share an owner. A transfer between them moves one
+  trader's own money; a transfer outside is a payment, and this engine has one
+  of those already — `deposit` with a `:credit`, gated on the bridge."
+  [state a b]
+  (= (family state a) (family state b)))
+
+(defn create-sub-account
+  "Record `sub` as a sub-account of `owner`.
+
+  ## Why sub-accounts at all
+
+  Margin is pooled across an account's cross positions, so two strategies in
+  one account are one strategy as far as liquidation is concerned: the losing
+  one eats the winning one's collateral before anybody notices. A sub-account
+  is a second margin pool under the same person.
+
+  `sub` must be untouched — no key, no collateral, no positions. An id that
+  already means something to somebody cannot be adopted, or adopting it would
+  be a way to take it.
+
+  One level only. A sub-account cannot have sub-accounts of its own, and an
+  account that is already somebody's sub cannot own one: a tree would make
+  `family` a walk whose depth an attacker chooses."
+  [state owner sub bound-key?]
+  (if (or (= owner sub)
+          bound-key?
+          (contains? (:sub-of state) owner)
+          (contains? (:sub-of state) sub)
+          (pos? (get-in state [:accounts sub :collateral] 0))
+          (seq (get-in state [:accounts sub :positions])))
+    state
+    (assoc-in state [:sub-of sub] owner)))
+
+(defn transfer
+  "Move `amount` of free collateral from `from` to `to` inside one family.
+
+  Free, not total: collateral backing a position is not the trader's to move,
+  and moving it would leave that position under-margined without a trade.
+  Refused rather than clamped, for the reason every other refusal here is."
+  [state from to amount free]
+  (let [amount (long amount)]
+    (if (or (not (pos? amount))
+            (= from to)
+            (not (same-family? state from to))
+            (> amount (long free)))
+      state
+      (-> state
+          (update-in [:accounts from :collateral] fx/acc (- amount))
+          (update-in [:accounts to :collateral] fx/acc amount)))))
+
+(defn set-referrer
+  "Bind `acct`'s referrer, once and forever.
+
+  Once, because a referrer who could be replaced is a referrer who can be
+  taken: the last client to touch an account would own its stream. Forever for
+  the same reason — an account that could clear its referrer would let a
+  trader collect their own referral by pointing it at a second account they
+  control, which is a rebate wearing a referral's clothes.
+
+  Self-referral is refused for the same reason spelled out directly."
+  [state acct referrer]
+  (if (or (= acct referrer)
+          (some? (get-in state [:referrers acct])))
+    state
+    (assoc-in state [:referrers acct] referrer)))
+
+(defn apply-fill
+  "Credit one fill to one account. `delta` is signed lots, `fee-rate` is
+  applied to the traded notional. Returns the new state."
+  [state acct mkt delta price fee-rate]
+  (let [pos (position state acct mkt)
+        [pos' realized] (apply-fill-to-position pos delta price)
+        fee (fx/mul-rate (fx/abs* (fx/notional price delta)) fee-rate)
+        ;; open interest counts the long side only; the delta is exact because
+        ;; it is the change in THIS account's long exposure
+        oi-delta (- (max 0 (:size pos')) (max 0 (:size pos)))]
+    (-> state
+        (assoc-in [:accounts acct :positions mkt] pos')
+        (update-in [:accounts acct :collateral] fx/acc (- realized fee))
+        (update-in [:open-interest mkt] fx/acc oi-delta)
+        ;; The venue keeps the fee, less the referrer's share.
+        ;;
+        ;; Out of what the exchange keeps, never out of what the trader pays:
+        ;; a referral that raised the price of trading would be a surcharge for
+        ;; having been introduced to the venue. The trader's collateral above
+        ;; is debited by `fee` either way — this only decides where it lands.
+        (as-> st
+              (let [ref (get-in st [:referrers acct])
+                    share (if ref (fx/mul-rate fee referral-share) 0)]
+                (cond-> (update st :fees-collected fx/acc (- fee share))
+                  (pos? share)
+                  (update-in [:accounts ref :collateral] fx/acc share)))))))
+
+;; ── equity and margin ───────────────────────────────────────────────────────
+
+(defn- cross-positions
+  [state acct]
+  (->> (get-in state [:accounts acct :positions] {})
+       (remove (fn [[_ p]] (:isolated p)))))
+
+(defn equity
+  "Collateral plus unrealized PnL across every CROSS position. Isolated
+  positions are excluded by construction — their collateral is fenced off and
+  their losses must not be able to reach the cross pool."
+  [state acct marks]
+  (reduce (fn [acc [mkt pos]]
+            ;; the fold is an accumulator like any other: a raw `+` over
+            ;; in-domain unrealized terms can leave the domain and fork the
+            ;; runtimes (falsify-8's class) — this total is root-visible.
+            (fx/acc acc (unrealized pos (get marks mkt 0))))
+          (get-in state [:accounts acct :collateral] 0)
+          (cross-positions state acct)))
+
+(defn maintenance-margin
+  "What the account's cross positions must be backed by to stay open. The rate
+  comes from the position's own tier, so a larger position is held to a
+  stricter one."
+  [state acct marks markets]
+  (reduce (fn [acc [mkt pos]]
+            (let [n (fx/abs* (fx/notional (get marks mkt 0) (:size pos)))
+                  [_ mm] (rates-for (get markets mkt) n)]
+              (fx/acc acc (fx/mul-rate n mm))))
+          0
+          (cross-positions state acct)))
+
+(defn chosen-leverage
+  "The leverage `acct` has chosen on `mkt`, or nil when it has not chosen.
+
+  Choosing is a way of asking for a HIGHER margin requirement than the market
+  demands — 5x on a market that allows 40x means five times the collateral per
+  unit of notional. It cannot go the other way: a market's own maximum is the
+  most anybody may take, and a per-account setting that could exceed it would
+  be a leverage limit anyone could opt out of."
+  [state acct mkt]
+  (get-in state [:leverage acct mkt]))
+
+(defn initial-margin-rate-for
+  "The initial-margin rate `acct` pays on `mkt` at `notional`.
+
+  The market's tier says the most leverage this size may take; a chosen
+  leverage only ever tightens it. `max` of the two rates is the whole rule —
+  a higher rate is a stricter requirement, and taking the stricter of the two
+  is what makes the choice safe to honour without re-checking anything else."
+  [state acct mkt market notional]
+  (let [[tier-im _] (rates-for market notional)]
+    (if-let [lev (chosen-leverage state acct mkt)]
+      (max tier-im (fx/fdiv fx/rate-scale lev))
+      tier-im)))
+
+(defn initial-margin
+  [state acct marks markets]
+  (reduce (fn [acc [mkt pos]]
+            (let [n (fx/abs* (fx/notional (get marks mkt 0) (:size pos)))
+                  im (initial-margin-rate-for state acct mkt (get markets mkt) n)]
+              (fx/acc acc (fx/mul-rate n im))))
+          0
+          (cross-positions state acct)))
+
+(defn set-leverage
+  "Record `acct`'s chosen leverage on `mkt`, bounded by what the market allows.
+
+  Refused rather than clamped when it exceeds the market's maximum: a trader
+  who asked for 50x on a 40x market and silently got 40x would size a position
+  against the number they asked for.
+
+  Refused, too, while the account holds a position on that market. Lowering
+  the requirement under an open position is how an account becomes
+  under-margined without trading; raising it is harmless but the two would
+  need different rules, and a rule that depends on which direction you move is
+  one nobody remembers correctly."
+  [state acct mkt market lev has-position?]
+  (if (or (not (integer? lev)) (not (pos? lev))
+          (> lev (:max-leverage market 1))
+          has-position?)
+    state
+    (assoc-in state [:leverage acct mkt] lev)))
+
+(defn liquidatable?
+  "The solvency test. Strictly less-than: an account sitting exactly at its
+  maintenance requirement is not yet liquidated."
+  [state acct marks markets]
+  (and (seq (cross-positions state acct))
+       (< (equity state acct marks)
+          (maintenance-margin state acct marks markets))))
+
+(defn isolated-liquidatable?
+  "The same test for one isolated position, against its own fenced margin."
+  [state acct mkt marks markets]
+  (let [pos (position state acct mkt)]
+    (boolean
+     (when-let [iso (:isolated pos)]
+       (and (not (zero? (:size pos)))
+            (< (fx/sadd iso (unrealized pos (get marks mkt 0)))
+               (fx/mul-rate (fx/abs* (fx/notional (get marks mkt 0) (:size pos)))
+                            (get-in markets [mkt :maintenance-margin-rate] 0))))))))
+
+(defn balance
+  "How much of `asset` `acct` holds, free of what its resting spot orders have
+  already committed."
+  [state acct asset]
+  (- (get-in state [:balances acct asset] 0)
+     (get-in state [:committed acct asset] 0)))
+
+(defn commit-spot
+  "Reserve `amount` of `asset` against `acct`'s resting spot orders.
+
+  Reserved rather than moved. An order that took the money when it rested
+  would make cancelling a refund, and a refund is a second place for the
+  amount to be wrong. The balance stays where it is and this says how much of
+  it is already spoken for.
+
+  Without it, an account could rest ten sells of everything it owns and honour
+  whichever filled first — the other nine would create the asset out of
+  nothing when they filled."
+  [state acct asset amount]
+  (update-in state [:committed acct asset] fx/acc (long amount)))
+
+(defn release-spot
+  "Give back a reservation — the order filled, or was cancelled."
+  [state acct asset amount]
+  (update-in state [:committed acct asset] fx/acc (- (long amount))))
+
+(defn spot-fill
+  "Settle one spot fill: `qty` of `asset` at `price`, buyer to seller.
+
+  Nothing here is margined. A spot trade is an exchange of two things both
+  sides already hold, which is what makes it spot — there is no position to
+  liquidate, no funding to pay, and no mark to be wrong about.
+
+  The fee is charged on the QUOTE side to both parties, in the quote asset,
+  because that is the one the venue keeps its books in."
+  [state buyer seller asset qty price buy-fee-rate sell-fee-rate]
+  (let [quote-amt (fx/notional price qty)
+        bf (fx/mul-rate quote-amt buy-fee-rate)
+        sf (fx/mul-rate quote-amt sell-fee-rate)]
+    (-> state
+        ;; buyer: pays quote, receives asset
+        (update-in [:accounts buyer :collateral] fx/acc (- (+ quote-amt bf)))
+        (update-in [:balances buyer asset] fx/acc qty)
+        ;; seller: gives asset, receives quote
+        (update-in [:balances seller asset] fx/acc (- qty))
+        (update-in [:accounts seller :collateral] fx/acc (- quote-amt sf))
+        (update :fees-collected fx/acc (+ bf sf)))))
+
+(defn bonded
+  "What `acct` has bonded, across every validator it has delegated to.
+
+  Bonded collateral is still in the account — it has to be, because slashing
+  takes it from there — but it is not free. See `free-collateral`."
+  [state acct]
+  ;; Unbonding counts until it is collected. `unbond` says the stake "must stay
+  ;; answerable for a while longer", and it was not: the moment it left the
+  ;; bond it became free collateral and could be withdrawn, so a validator
+  ;; could unbond, withdraw, and leave nothing for a slash to take.
+  (fx/sadd (reduce fx/sadd 0 (vals (get-in state [:bonds acct] {})))
+           (reduce fx/sadd 0 (map :amount (get-in state [:unbonding acct] [])))))
+
+(defn free-collateral
+  "What the account may withdraw or commit to new positions: equity less the
+  initial margin its open positions already consume, less anything bonded.
+  Never negative.
+
+  Bonded collateral is subtracted because a bond that could also back a
+  position would be counted twice: once as security the chain can slash and
+  once as margin the trader can lose. Whichever way the account then moved,
+  one of those two claims would be on money that is not there."
+  [state acct marks markets]
+  (max 0 (- (equity state acct marks)
+            (initial-margin state acct marks markets)
+            (bonded state acct))))
+
+;; ── account admin ───────────────────────────────────────────────────────────
+
+(def ^:const volume-epoch-blocks
+  "How many blocks one volume epoch spans.
+
+  Fee tiers are supposed to reward RECENT activity, so the number they read has
+  to fall as well as rise. A cumulative-forever total only ratchets: an account
+  that traded once, years ago, keeps the discount it earned then.
+
+  A rolling window needs a clock and the engine has none — so the window is
+  blocks. Volume is kept per epoch and the tier reads the current epoch plus
+  the previous one, which is a window between one and two epochs wide
+  depending on where in the current one you ask. That wobble is the price of
+  not having a clock, and it is bounded and identical on every replica, which
+  a wall-clock window would not be."
+  20000)
+
+(defn volume-of
+  "The rolling notional `acct` has traded: this epoch plus the last one.
+
+  Zero for an account whose record is from an epoch that has since passed —
+  the volume did not move to `:prev`, because nothing has traded to move it."
+  [state acct height]
+  (let [e (quot (long height) volume-epoch-blocks)
+        {:keys [epoch cur prev] :or {epoch 0 cur 0 prev 0}}
+        (get-in state [:volume acct])]
+    (cond
+      (= epoch e) (fx/sadd cur prev)
+      (= epoch (dec e)) cur
+      :else 0)))
+
+(defn add-volume
+  "Record `notional` traded by `acct` at `height`.
+
+  The absent record and the current-epoch record are deliberately NOT the same
+  branch. Reading defaults out of a missing map and then `update`-ing that
+  missing map is how the first version threw a NullPointerException on the
+  very first fill of a fresh chain — the defaults made the code look total
+  while the map it went on to update was still nil."
+  [state acct height notional]
+  (let [e (quot (long height) volume-epoch-blocks)
+        rec (get-in state [:volume acct])]
+    (assoc-in state [:volume acct]
+              (cond
+                (nil? rec) {:epoch e :cur (fx/acc 0 notional) :prev 0}
+                (= (:epoch rec 0) e) (update rec :cur fx/acc notional)
+                ;; One epoch on: what was current becomes previous.
+                (= (:epoch rec 0) (dec e)) {:epoch e :cur (fx/acc 0 notional) :prev (:cur rec 0)}
+                ;; Further than that and both windows are stale, so neither is
+                ;; carried — a gap in trading is a gap in volume.
+                :else {:epoch e :cur (fx/acc 0 notional) :prev 0}))))
+
+(defn fee-rates-for
+  "`[taker maker]` for `acct` on `market`, given its rolling volume.
+
+  A market with no `:fee-tiers` charges its flat rates, which is what every
+  market did before this existed. Tiers are ascending by `:min-volume` and the
+  LAST one the account clears applies — the same shape `margin-tiers` already
+  has, and for the same reason: a schedule read from the wrong end is a
+  discount handed to the smallest account."
+  [state acct market-spec height]
+  (let [tiers (:fee-tiers market-spec)
+        base [(get market-spec :taker-fee-rate 0) (get market-spec :maker-fee-rate 0)]]
+    (if (empty? tiers)
+      base
+      (let [v (volume-of state acct height)
+            t (last (filter #(<= (:min-volume %) v) tiers))]
+        (if t
+          [(get t :taker-fee-rate (first base)) (get t :maker-fee-rate (second base))]
+          base)))))
+
+(defn pay-builder
+  "Move `amount` from `payer` to `builder`.
+
+  A transfer, not a fee: it does not touch `:fees-collected`, because the
+  venue is not the one charging it. Whoever wrote the client is, and the
+  trader agreed to it by signing the order — so the money goes to them and
+  the exchange's books show none of it as income.
+
+  Refused, rather than clamped, when the payer cannot afford it: an order that
+  fills and then partially pays its builder would leave a debt with no name.
+  `torihiki.api` caps the rate so this is rare; making it a no-op keeps a
+  builder from being paid out of collateral that is backing a position."
+  [state payer builder amount]
+  (let [amount (long amount)]
+    (if (or (not (pos? amount))
+            (= payer builder)
+            (> amount (get-in state [:accounts payer :collateral] 0)))
+      state
+      (-> state
+          (update-in [:accounts payer :collateral] fx/acc (- amount))
+          (update-in [:accounts builder :collateral] fx/acc amount)))))
+
+(defn settle-deficit
+  "Move an account's negative collateral into `:deficit`, leaving collateral at
+  zero. Idempotent, and a no-op on an account that is not underwater.
+
+  ## Why the debt moves instead of staying where it was
+
+  Collateral going negative is how the liquidation waterfall records a hole:
+  `torihiki.liquidation` hands the position to the vault at the mark, and when
+  that costs more than the account had, the difference sits on the account as
+  a negative number. The insurance fund adds back what it can cover; anything
+  it cannot stays negative forever.
+
+  A negative balance is a true statement in the wrong field. It is a DEBT, and
+  storing it as collateral means the one number an exchange must be able to
+  add up — what it owes its users — cannot be added up, because part of the
+  sum is a hole rather than a holding. `torihiki.commit` had to keep every
+  merkle-sum leaf at zero for exactly this reason: a sum that is only valid
+  while nobody is underwater is a claim that fails when it matters most.
+
+  Split into two non-negative fields, both are true and both are usable.
+  `:collateral` is what the account has and what reserves must cover;
+  `:deficit` is what it owes and what a later deposit pays down first. The
+  identity `collateral - deficit` is the old single number, so nothing is
+  invented and nothing is forgiven.
+
+  Bad debt does NOT reduce equity. It was already absorbed — by the insurance
+  fund, or socialised onto counterparties by auto-deleveraging — so charging
+  it to the account again would double-count the loss AND put equity back
+  below zero, which is the state this exists to remove."
+  [state acct]
+  (let [c (get-in state [:accounts acct :collateral] 0)
+        owed (get-in state [:accounts acct :deficit] 0)]
+    (if (neg? c)
+      ;; Move as much of the hole as the deficit can still hold. `moved` is
+      ;; capped by the room left in the domain rather than checked after the
+      ;; fact: `fx/check :deficit` here threw on an out-of-domain delta, and a
+      ;; throw inside `apply-block`'s liquidation sweep halted every validator
+      ;; at the same place (falsify-12's secondary finding). A capped move is
+      ;; total, never throws, and is identical on both runtimes — and it keeps
+      ;; the identity `collateral - deficit` = the old single number, because
+      ;; whatever is not moved stays on `:collateral` as the negative it was.
+      (let [moved (min (- c) (max 0 (- fx/i53-max owed)))]
+        (-> state
+            (update-in [:accounts acct :collateral] fx/acc moved)
+            (update-in [:accounts acct :deficit] fx/acc moved)))
+      state)))
+
+(defn deposit
+  "Credit `amount`, paying down any bad debt first.
+
+  A deposit into an account that owes the system is a repayment before it is a
+  balance. Crediting collateral while leaving the deficit standing would let
+  the same account trade on new money while its old hole stayed on the books.
+
+  Refused (returned unchanged) rather than credited in three cases: a
+  non-positive or out-of-domain amount, and a deposit whose credit would take
+  `collateral` past the i53 ceiling. The ceiling check is a REAL gate, not
+  paranoia — two in-domain deposits stacked past 2^53 and the two runtimes
+  then held different collateral (falsify-8 measured exactly that, root
+  divergence with no throw). `fx/check` used to throw here for an
+  out-of-domain amount; a throw in the transaction path is a halted chain, so
+  the refusal moved up to `torihiki.api/validate` (`:bad-amount`) and this
+  became total."
+  [state acct amount]
+  (if-not (and (integer? amount) (pos? amount) (fx/in-domain? amount))
+    state
+    (let [owed (get-in state [:accounts acct :deficit] 0)
+          coll (get-in state [:accounts acct :collateral] 0)
+          repaid (min owed amount)]
+      (if (> (+ coll amount) fx/i53-max)
+        state
+        (cond-> state
+          (pos? repaid) (update-in [:accounts acct :deficit] fx/acc (- repaid))
+          true (update-in [:accounts acct :collateral] fx/acc (- amount repaid)))))))
+
+(defn withdraw
+  "Withdrawals are refused unless free collateral covers them. Returning the
+  state unchanged rather than throwing keeps this usable directly as a
+  transaction handler: a rejected withdrawal is a no-op block entry, not a
+  halted chain."
+  ([state acct amount marks markets]
+   (withdraw state acct amount (free-collateral state acct marks markets)))
+  ([state acct amount free]
+   ;; `free` from the caller: from protocol version 2 it counts resting orders
+   ;; (`torihiki.order-margin/free-collateral`), which this namespace cannot see.
+   (if (<= amount free)
+     (update-in state [:accounts acct :collateral] fx/acc (- amount))
+     state)))
+
+(defn new-state []
+  {:accounts {} :fees-collected 0})
+
+;; ── reduce-only ─────────────────────────────────────────────────────────────
+
+(defn reducing-qty
+  "How much of `qty` on `side` would actually REDUCE the account's position in
+  `mkt` — 0 when the order would only increase it.
+
+  `side` follows the book's convention: 0 buys, 1 sells. A sell reduces a
+  long, a buy reduces a short, and neither can reduce a flat position.
+
+  Clamping rather than rejecting outright is deliberate. A trader closing a
+  position often sends slightly more size than they hold — because the
+  position moved between reading it and sending, or because they rounded. The
+  intent is unambiguous ('get me out'), so honour the intent and cap the size.
+  What must never happen is the excess silently opening a position on the
+  other side, which is exactly what reduce-only exists to prevent."
+  [state acct mkt side qty]
+  (let [size (:size (position state acct mkt))]
+    (cond
+      (zero? size) 0
+      ;; selling reduces a long
+      (and (= side 1) (pos? size)) (min qty size)
+      ;; buying reduces a short
+      (and (= side 0) (neg? size)) (min qty (- size))
+      :else 0)))

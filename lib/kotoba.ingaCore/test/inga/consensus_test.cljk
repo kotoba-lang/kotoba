@@ -1,0 +1,238 @@
+(ns inga.consensus-test
+  "Pure-logic unit tests for `inga.consensus` — no crypto, no I/O, no network;
+  a whole n-witness validator set is simulated as plain data. Runs
+  identically under `kbb -M:test` (JVM) and shadow-cljs :node-test."
+  (:require [inga.consensus :as consensus]
+            #?(:clj [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer-macros [deftest is testing]])))
+
+;; ── quorum arithmetic ───────────────────────────────────────────────────────
+
+(deftest quorum-size-and-tolerance-for-various-n
+  (testing "n=4 (f=1): quorum=3"
+    (is (= 1 (consensus/byzantine-tolerance 4)))
+    (is (= 3 (consensus/quorum-size 4))))
+  (testing "n=7 (f=2): quorum=5"
+    (is (= 2 (consensus/byzantine-tolerance 7)))
+    (is (= 5 (consensus/quorum-size 7))))
+  (testing "n=1 (f=0): quorum=1 (degenerate single-witness case)"
+    (is (= 0 (consensus/byzantine-tolerance 1)))
+    (is (= 1 (consensus/quorum-size 1)))))
+
+(deftest on-3f+1-the-quorum-is-still-exactly-2f+1
+  (testing "generalising the rule must not move any threshold this system uses"
+    (doseq [f (range 0 12)]
+      (let [n (inc (* 3 f))]
+        (is (= (inc (* 2 f)) (consensus/quorum-size n))
+            (str "n=" n " must stay at 2f+1"))))))
+
+(deftest two-quorums-always-share-an-honest-witness
+  (testing "the safety lemma, asserted as the property rather than as one
+            formula's outputs — 2f+1 has it only on n=3f+1, and n was never
+            required to be 3f+1. At n=6 it gave 3, and {a b c} and {d e f} are
+            two disjoint quorums, which is two conflicting certificates at one
+            height."
+    (doseq [n (range 1 200)]
+      (let [q (consensus/quorum-size n)
+            f (consensus/byzantine-tolerance n)]
+        (is (> (- (* 2 q) n) f)
+            (str "n=" n ": two quorums of " q " share at most "
+                 (- (* 2 q) n) " witnesses, and " f " of them may be faulty"))
+        (is (<= q n) (str "n=" n ": a quorum larger than the set is unreachable"))))))
+
+(deftest the-quorum-is-the-smallest-safe-one
+  (testing "a threshold higher than necessary costs liveness, so being safe is
+            not on its own enough"
+    (doseq [n (range 1 200)]
+      (let [q (consensus/quorum-size n)
+            f (consensus/byzantine-tolerance n)]
+        (is (not (> (- (* 2 (dec q)) n) f))
+            (str "n=" n ": " (dec q) " would have been safe too"))))))
+
+;; ── QC formation ─────────────────────────────────────────────────────────────
+
+(deftest qc-forms-once-distinct-witnesses-reach-quorum
+  (let [votes (map #(consensus/make-vote % "hashA" 5) ["w1" "w2" "w3"])]
+    (is (some? (consensus/qc votes 4)) "3 distinct witnesses meets n=4's quorum of 3")))
+
+(deftest qc-nil-below-quorum
+  (let [votes (map #(consensus/make-vote % "hashA" 5) ["w1" "w2"])]
+    (is (nil? (consensus/qc votes 4)) "2 distinct witnesses is below n=4's quorum of 3")))
+
+(deftest qc-duplicate-votes-from-same-witness-do-not-count-twice
+  (let [votes [(consensus/make-vote "w1" "hashA" 5)
+               (consensus/make-vote "w1" "hashA" 5)   ; w1 resubmits (or is double-counted by a bug)
+               (consensus/make-vote "w2" "hashA" 5)]]
+    (is (nil? (consensus/qc votes 4))
+        "only 2 DISTINCT witnesses voted even though 3 vote records exist")))
+
+(deftest qc-rejects-mismatched-votes
+  (let [votes [(consensus/make-vote "w1" "hashA" 5)
+               (consensus/make-vote "w2" "hashB" 5)]]
+    (is (thrown? #?(:clj Exception :cljs js/Error) (consensus/qc votes 4)))))
+
+;; ── direct-extends? / 3-chain commit ─────────────────────────────────────────
+
+(defn- hash-fn [b] (str "h" (:inga.block/height b)))
+
+(defn- linked-chain
+  "Build a clean, fully-justified chain of `n` blocks (genesis + n-1
+  properly-linked descendants), each justify QC meeting quorum for `nval`
+  witnesses."
+  [nval n]
+  (let [witnesses (map #(str "w" %) (range 1 (inc nval)))
+        genesis {:inga.block/height 0 :inga.block/parent-hash "genesis"
+                 :inga.block/proposals [] :inga.block/proposer (first witnesses)
+                 :inga.block/ts 0 :inga.block/justify nil}]
+    (reduce
+     (fn [chain height]
+       (let [parent (peek chain)
+             parent-hash (hash-fn parent)
+             votes (map #(consensus/make-vote % parent-hash (:inga.block/height parent)) witnesses)
+             justify (consensus/qc votes nval)
+             block (consensus/make-block {:height height :parent-hash parent-hash
+                                           :proposals [] :proposer (nth witnesses (mod height nval))
+                                           :ts height :justify justify})]
+         (conj chain block)))
+     [genesis]
+     (range 1 n))))
+
+(deftest direct-extends-true-for-properly-linked-block
+  (let [[genesis b1] (linked-chain 4 2)]
+    (is (consensus/direct-extends? hash-fn genesis b1))))
+
+(deftest direct-extends-false-when-parent-hash-does-not-match
+  (let [[genesis b1] (linked-chain 4 2)
+        spliced (assoc b1 :inga.block/parent-hash "not-the-real-parent")]
+    (is (not (consensus/direct-extends? hash-fn genesis spliced)))))
+
+(deftest direct-extends-false-when-justify-qc-does-not-certify-parent
+  (let [[genesis b1] (linked-chain 4 2)
+        ;; a Byzantine proposer names the right parent-hash but attaches a QC
+        ;; for the WRONG height -- direct-extends? must catch this, not just
+        ;; check the hash link.
+        forged (assoc-in b1 [:inga.block/justify :inga.qc/height] 999)]
+    (is (not (consensus/direct-extends? hash-fn genesis forged)))))
+
+(deftest three-chain-commits-the-safe-prefix-only
+  (let [chain (linked-chain 4 4)  ; genesis, b1, b2, b3 -- 4 blocks, heights 0..3
+        committed (consensus/three-chain-commits hash-fn chain)]
+    (testing "genesis and b1 (index 0,1) have two direct-extension descendants each within the chain"
+      (is (= [0 1] (mapv :inga.block/height committed))))
+    (testing "b2 (index 2, the tip's parent) is NOT yet committed -- no third link exists yet"
+      (is (not (contains? (set (map :inga.block/height committed)) 2))))))
+
+(deftest three-chain-commits-empty-for-short-chain
+  (let [chain (linked-chain 4 2)] ; only genesis + b1, no 3-chain possible yet
+    (is (= [] (consensus/three-chain-commits hash-fn chain)))))
+
+;; ── leader rotation ──────────────────────────────────────────────────────────
+
+(deftest leader-for-round-robins
+  (let [witnesses ["w1" "w2" "w3" "w4"]]
+    (is (= "w1" (consensus/leader-for witnesses 0)))
+    (is (= "w2" (consensus/leader-for witnesses 1)))
+    (is (= "w4" (consensus/leader-for witnesses 3)))
+    (is (= "w1" (consensus/leader-for witnesses 4)) "wraps back around")))
+
+;; ── THE safety property: two conflicting QCs at the same height can never
+;;    both form, even with an equivocating Byzantine witness ────────────────
+;;
+;; This is the concrete demonstration of ADR-2607993000's core claim: the
+;; algorithm is designed Byzantine-tolerant from day one, not just
+;; crash-fault-tolerant, regardless of who actually operates the witnesses
+;; today.
+
+(deftest byzantine-equivocation-cannot-split-quorum-n4-f1
+  (testing "n=4 (f=1): 2 honest vote A, 1 honest votes B (conflicting), 1 Byzantine double-votes both"
+    (let [votes-a [(consensus/make-vote "honest1" "blockA" 10)
+                   (consensus/make-vote "honest2" "blockA" 10)
+                   (consensus/make-vote "byzantine" "blockA" 10)]
+          votes-b [(consensus/make-vote "honest3" "blockB" 10)
+                   (consensus/make-vote "byzantine" "blockB" 10)]]
+      (is (some? (consensus/qc votes-a 4)) "A reaches quorum (3 distinct: 2 honest + the equivocator)")
+      (is (nil? (consensus/qc votes-b 4)) "B does NOT reach quorum (only 2 distinct) -- no conflicting QC forms"))))
+
+(deftest byzantine-equivocation-cannot-split-quorum-n7-f2
+  (testing "n=7 (f=2): 5 honest witnesses split 3/2 across a conflicting pair, both Byzantine witnesses equivocate on both sides"
+    (let [votes-a (concat (map #(consensus/make-vote % "blockA" 10) ["h1" "h2" "h3"])
+                          (map #(consensus/make-vote % "blockA" 10) ["b1" "b2"]))
+          votes-b (concat (map #(consensus/make-vote % "blockB" 10) ["h4" "h5"])
+                          (map #(consensus/make-vote % "blockB" 10) ["b1" "b2"]))]
+      (is (= 5 (count (set (map :inga.vote/witness votes-a)))))
+      (is (some? (consensus/qc votes-a 7)) "A reaches quorum of 5 (3 honest + both equivocators)")
+      (is (nil? (consensus/qc votes-b 7)) "B has only 4 distinct witnesses -- below quorum of 5, no conflicting QC"))))
+
+;; ── the bounded scan must not change the answer ──────────────────────────────
+
+(deftest bounding-the-scan-does-not-change-what-commits
+  ;; The whole claim of the `above-height` arity is that it drops exactly the
+  ;; windows the caller discards anyway. Asserted against the unbounded form
+  ;; at every height, rather than at one convenient one.
+  (let [chain (linked-chain 4 40)
+        full (consensus/three-chain-commits hash-fn chain)]
+    (doseq [h (range -1 41)]
+      (is (= (vec (filter #(> (:inga.block/height %) h) full))
+             (vec (filter #(> (:inga.block/height %) h)
+                          (consensus/three-chain-commits hash-fn chain h))))
+          (str "bounded scan disagreed above height " h)))))
+
+(deftest the-bounded-scan-hashes-a-bounded-amount
+  ;; The reason for the change, measured rather than asserted in prose. An
+  ;; unbounded scan of a 400-block chain hashes it whole; bounded to the last
+  ;; few heights it must not.
+  (let [chain (linked-chain 4 400)
+        n (atom 0)
+        counting (fn [b] (swap! n inc) (hash-fn b))]
+    (consensus/three-chain-commits counting chain)
+    (let [unbounded @n]
+      (reset! n 0)
+      (consensus/three-chain-commits counting chain 396)
+      (is (< @n (/ unbounded 20))
+          (str "bounded scan hashed " @n " of " unbounded
+               " — the bound is not bounding anything")))))
+
+;; ── the two-chain rule ──────────────────────────────────────────────────────
+;;
+;; One link instead of two, which is only sound because a proposal may not
+;; claim a round further than one past its parent's without a timeout
+;; certificate. The round check is what carries that; these pin it.
+
+(defn- rounded-chain
+  "`linked-chain` with rounds set the way a live proposal sets them: one past
+  the parent's.
+
+  The shared fixture leaves `:round` to `make-block`'s default, which derives
+  it from the certificate's view — and the votes it builds carry no view, so
+  every block in it lands in the same round. That is fine for the three-chain
+  rule, which never looks, and it makes the two-chain rule commit nothing:
+  the round check is the whole reason one link is enough."
+  [nval n]
+  (vec (map-indexed (fn [i b] (assoc b :inga.block/round i)) (linked-chain nval n))))
+
+(deftest two-chain-commits-on-one-link
+  (let [chain (rounded-chain 4 2)]
+    (is (= 1 (count (consensus/two-chain-commits hash-fn chain)))
+        "one direct extension at the next round did not commit the parent")
+    (is (empty? (consensus/three-chain-commits hash-fn chain))
+        "the three-chain rule must still want a second link, or this proves nothing")))
+
+(deftest two-chain-lags-the-tip-by-one-and-three-chain-by-two
+  (let [chain (rounded-chain 4 6)]
+    (is (= (- (count chain) 1) (count (consensus/two-chain-commits hash-fn chain))))
+    (is (= (- (count chain) 2) (count (consensus/three-chain-commits hash-fn chain))))))
+
+(deftest a-skipped-round-does-not-commit-on-one-link
+  ;; The case the extra link existed to exclude: a leader that skipped rounds
+  ;; with a timeout certificate must not thereby commit its parent early.
+  (let [[g b1] (rounded-chain 4 2)
+        far (assoc b1 :inga.block/round 7)]
+    (is (empty? (consensus/two-chain-commits hash-fn [g far]))
+        "a block seven rounds past its parent committed it on one link")))
+
+(deftest two-chain-still-needs-a-real-link
+  ;; `direct-extends?` checks the hash AND the certificate; the round is the
+  ;; third thing, not a replacement for either.
+  (let [[g b1] (rounded-chain 4 2)
+        spliced (assoc b1 :inga.block/parent-hash "not-the-parent")]
+    (is (empty? (consensus/two-chain-commits hash-fn [g spliced])))))

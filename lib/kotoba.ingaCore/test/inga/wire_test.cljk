@@ -1,0 +1,251 @@
+(ns inga.wire-test
+  "A codec that throws on malformed input hands every peer a way to kill the
+  replica by sending nonsense."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [inga.consensus :as c]
+            [inga.wire :as w]))
+
+(def limits w/default-limits)
+
+(defn- qc [] (c/qc (mapv #(c/make-vote % "bh" 4) ["w1" "w2" "w3"]) 4 7))
+
+(defn- block []
+  {:inga.block/height 5
+   :inga.block/parent-hash "H4"
+   :inga.block/proposals ["cid-a" "cid-b"]
+   :inga.block/proposer "w1"
+   :inga.block/ts 50
+   ;; A block without a round has no checkable leadership claim, so `dec-block`
+   ;; refuses it (ADR-2608680000 D1). These fixtures build blocks by hand
+   ;; rather than through `make-block`, so the field has to be here too.
+   :inga.block/round 8
+   :inga.block/justify (qc)})
+
+;; ── round trips ─────────────────────────────────────────────────────────────
+
+(deftest every-message-round-trips
+  (doseq [m [{:type :proposal :block (block)}
+             {:type :vote :witness "w2" :block-hash "H5" :height 5 :view 7}
+             {:type :new-view :witness "w3" :view 9 :high-qc (qc)}
+             {:type :new-view :witness "w3" :view 9 :high-qc nil}
+             {:type :sync-request :from 10 :to 40}
+             {:type :sync-request :from 5 :to 5 :witness "w2" :target-hash "certified-rival"}
+             {:type :sync-response :blocks [(block)]}
+             {:type :sync-response :blocks [(block)] :target-hash "certified-rival"}]]
+    (is (w/round-trip? m) (str "did not survive: " (:type m)))))
+
+(deftest a-certificate-keeps-its-view
+  (testing "the field whose absence stopped the pacemaker locking at all"
+    (let [[m _] (w/decode (w/encode {:type :new-view :witness "w1" :view 3
+                                     :high-qc (qc)}))]
+      (is (= 7 (:inga.qc/view (:high-qc m)))))))
+
+(deftest a-genesis-block-with-no-certificate-round-trips
+  (let [g (assoc (block) :inga.block/justify nil :inga.block/height 0
+                 :inga.block/parent-hash "genesis")]
+    (is (w/round-trip? {:type :proposal :block g}))))
+
+;; ── decoding is total ───────────────────────────────────────────────────────
+
+(deftest nothing-a-peer-sends-can-throw
+  (doseq [junk [nil 42 "string" [] {} {"t" "nope"}
+                {"t" "vote"}
+                {"t" "vote" "witness" 7 "block-hash" "h" "height" 1 "view" 1}
+                {"t" "vote" "witness" "w" "block-hash" "h" "height" -1 "view" 1}
+                {"t" "proposal"}
+                {"t" "proposal" "block" "not-a-map"}
+                {"t" "proposal" "block" {"height" 1}}
+                {"t" "sync-request" "from" 9 "to" 2}
+                {"t" "sync-request" "from" "a" "to" 2}
+                {"t" "sync-request" "from" 1 "to" 2 "target-hash" 7}
+                {"t" "sync-response" "blocks" "not-a-vector"}
+                {"t" "sync-response" "blocks" [] "target-hash" 7}
+                {"t" "new-view" "witness" "w" "view" 1 "high-qc" {"height" "x"}}]]
+    (let [[m r] (w/decode junk)]
+      (is (nil? m) (str "should not decode: " (pr-str junk)))
+      (is (contains? w/reasons r) (str r " is outside the closed set")))))
+
+(deftest an-unknown-type-is-refused-not-ignored
+  (testing "silently dropping what you do not understand is how two versions
+            run side by side believing they agree"
+    (is (= :unknown-type (second (w/decode {"t" "gossip-v2" "x" 1}))))))
+
+;; ── bounds ──────────────────────────────────────────────────────────────────
+
+(deftest an-oversized-message-is-refused
+  (testing "a peer needs no invalid data to exhaust a replica"
+    (let [big (assoc (block) :inga.block/proposals
+                     (vec (repeat (inc (:max-proposals limits)) "cid")))]
+      (is (= :bad-shape (second (w/decode (w/encode {:type :proposal :block big}))))))
+    (let [many (mapv (fn [_] (block)) (range (inc (:max-blocks limits))))]
+      (is (= :too-large
+             (second (w/decode (w/encode {:type :sync-response :blocks many}))))))
+    (let [long-hash (apply str (repeat (inc (:max-string limits)) "x"))]
+      (is (= :bad-shape
+             (second (w/decode {"t" "vote" "witness" "w" "block-hash" long-hash
+                                "height" 1 "view" 1})))))))
+
+;; ── a broken certificate is not the absence of one ──────────────────────────
+
+(deftest a-broken-certificate-is-refused-rather-than-read-as-none
+  (testing "otherwise a peer downgrades its own high QC by corrupting it"
+    (let [[m r] (w/decode {"t" "new-view" "witness" "w1" "view" 5
+                           "high-qc" {"block-hash" "h" "height" "not-a-number"
+                                      "witnesses" ["w1"]}})]
+      (is (nil? m))
+      (is (= :bad-shape r))))
+  (testing "but genuinely having none is fine"
+    (let [[m r] (w/decode {"t" "new-view" "witness" "w1" "view" 5 "high-qc" nil})]
+      (is (some? m))
+      (is (nil? r))
+      (is (nil? (:high-qc m))))))
+
+(deftest a-non-genesis-block-with-a-broken-justify-is-refused
+  (let [[m r] (w/decode {"t" "proposal"
+                         "block" {"height" 3 "parent-hash" "H2" "proposals" []
+                                  "proposer" "w1" "ts" 30
+                                  "justify" {"block-hash" "H2"}}})]
+    (is (nil? m))
+    (is (= :bad-shape r))))
+
+;; ── it feeds the layers that consume it ─────────────────────────────────────
+
+(deftest a-decoded-certificate-works-with-the-pacemaker
+  (testing "the codec must produce the shape the rest of the engine reads"
+    (let [[m _] (w/decode (w/encode {:type :new-view :witness "w1" :view 9
+                                     :high-qc (qc)}))
+          high (:high-qc m)]
+      (is (= 4 (:inga.qc/height high)))
+      (is (= 3 (count (:inga.qc/witnesses high))))
+      (is (= 3 (:inga.qc/vote-count high))))))
+
+(deftest decoded-blocks-satisfy-the-commit-rule
+  (testing "sync must not accept over the wire what direct-extends? rejects"
+    (let [h (fn [b] (str "H" (:inga.block/height b)))
+          parent {:inga.block/height 4 :inga.block/parent-hash "H3"
+                  :inga.block/proposals [] :inga.block/proposer "w1"
+                  :inga.block/ts 40 :inga.block/round 0 :inga.block/justify nil}
+          child {:inga.block/height 5 :inga.block/parent-hash "H4"
+                 :inga.block/proposals [] :inga.block/proposer "w1"
+                 :inga.block/ts 50 :inga.block/round 1
+                 :inga.block/justify {:inga.qc/block-hash "H4" :inga.qc/height 4
+                                      :inga.qc/witnesses #{"w1" "w2" "w3"}
+                                      :inga.qc/vote-count 3}}
+          [decoded _] (w/decode (w/encode {:type :sync-response
+                                           :blocks [parent child]}))
+          [p c] (:blocks decoded)]
+      (is (c/direct-extends? h p c)
+          "the certificate survived the wire intact enough to be checked"))))
+
+;; ── the wire is actually JSON-shaped ────────────────────────────────────────
+
+(deftest every-encoded-message-is-json-safe
+  (testing "a keyword that slips through survives an in-memory round trip and
+            only becomes a string once a real transport serialises it"
+    (doseq [m [{:type :proposal :block (block)}
+               {:type :vote :witness "w2" :block-hash "H5" :height 5 :view 7}
+               {:type :new-view :witness "w3" :view 9 :high-qc (qc)}
+               {:type :new-view :witness "w3" :view 9 :high-qc nil}
+               {:type :sync-request :from 10 :to 40}
+               {:type :sync-response :blocks [(block)]}]]
+      (is (w/json-safe? (w/encode m))
+          (str (:type m) " encoded to something JSON cannot carry")))))
+
+(deftest json-safe-rejects-what-json-cannot-carry
+  (is (not (w/json-safe? {:a 1})) "keyword keys")
+  (is (not (w/json-safe? {"a" :b})) "keyword values")
+  (is (not (w/json-safe? {"a" #{1 2}})) "sets")
+  (is (not (w/json-safe? ["ok" :nope])))
+  (is (w/json-safe? {"a" [1 "two" nil true {"b" 3}]})))
+
+(deftest a-keyword-witness-is-stringified-on-the-way-out
+  (testing "engi's own code uses keyword witnesses; the wire must not"
+    (let [enc (w/encode {:type :vote :witness :w1 :block-hash "h" :height 1 :view 1})]
+      (is (w/json-safe? enc))
+      (is (= "w1" (get enc "witness"))))))
+
+(deftest a-namespaced-keyword-keeps-its-namespace
+  (testing "`name` would collapse :org/w1 and :other/w1 into the same witness"
+    (let [a (w/encode {:type :vote :witness :org/w1 :block-hash "h" :height 1 :view 1})
+          b (w/encode {:type :vote :witness :other/w1 :block-hash "h" :height 1 :view 1})]
+      (is (= "org/w1" (get a "witness")))
+      (is (not= (get a "witness") (get b "witness"))))))
+
+(deftest a-certificate-keeps-its-witness-count-across-the-wire
+  (testing "quorum is counted by DISTINCT witness, so mangled ids break it"
+    (let [local (c/qc (mapv #(c/make-vote % "bh" 4) [:w1 :w2 :w3]) 4 7)
+          [m _] (w/decode (w/encode {:type :new-view :witness :w1 :view 9
+                                     :high-qc local}))]
+      (is (= 3 (count (:inga.qc/witnesses (:high-qc m)))))
+      (is (= #{"w1" "w2" "w3"} (:inga.qc/witnesses (:high-qc m)))
+          "the same three, not three colon-prefixed strangers"))))
+
+;; ── a vote's signature survives, because a vote without one is a claim ──────
+
+(deftest a-vote-carries-its-signature
+  (testing "a replica assembles certificates from wire votes, so an
+            unauthenticated vote lets one peer forge a quorum by itself"
+    (let [[m _] (w/decode (w/encode {:type :vote :witness :w2 :block-hash "H5"
+                                     :height 5 :view 7 :sig "c2ln"}))]
+      (is (= "c2ln" (:sig m)))
+      (is (= "w2" (:witness m))))))
+
+(deftest an-unsigned-vote-still-decodes-and-is-refused-elsewhere
+  (testing "this ns says what a message IS; whether an unsigned one may be
+            believed is a consensus rule, and a replica replaying its own
+            checked history must not have to re-sign it"
+    (let [[m r] (w/decode (w/encode {:type :vote :witness :w2 :block-hash "H5"
+                                     :height 5 :view 7}))]
+      (is (some? m))
+      (is (nil? r))
+      (is (nil? (:sig m))))))
+
+(deftest a-signature-that-is-not-a-string-is-refused
+  (is (= :bad-shape (second (w/decode {"t" "vote" "witness" "w" "block-hash" "h"
+                                       "height" 1 "view" 1 "sig" 42})))))
+
+(deftest a-witness-survives-the-wire
+  (let [m {:type :sync-request :witness "w3" :from 4 :to 9}
+        [d err] (w/decode (w/encode m) w/default-limits)]
+    (is (nil? err))
+    (is (= m d)))
+  ;; the previous version's form, which has to keep decoding
+  (let [[d err] (w/decode (w/encode {:type :sync-request :from 4 :to 9})
+                          w/default-limits)]
+    (is (nil? err))
+    (is (nil? (:witness d))))
+  ;; a witness long enough to be a payload is not one
+  (let [[_ err] (w/decode (w/encode {:type :sync-request
+                                     :witness (apply str (repeat 100000 "x"))
+                                     :from 4 :to 9})
+                          w/default-limits)]
+    (is (some? err) "an unbounded witness was accepted as a destination")))
+
+(deftest wire-carries-every-field-the-hash-covers
+  (testing "a field in the canonical block that the wire drops is a chain that splits"
+    ;; `enc-block` and `inga.consensus/canonical-block` are two hand-written
+    ;; lists of the same fields, and they drifted the moment one was extended:
+    ;; adding `:inga.block/round` to the hash without adding it to the wire
+    ;; left the whole unit suite green while every block crossing a socket
+    ;; hashed differently on arrival. The failure has no error and no log —
+    ;; remote proposals simply stop being adopted.
+    ;;
+    ;; Rather than compare the two source lists, this changes each field and
+    ;; asks the wire whether the change survived. A field the wire drops
+    ;; round-trips to the SAME hash as the original, and that is the bug.
+    (let [b (block)
+          h #(c/canonical-block %)
+          through #(:block (first (w/decode (w/encode {:type :proposal :block %}))))]
+      (is (= (h b) (h (through b))) "the unmodified block must survive unchanged")
+      (doseq [[k v] {:inga.block/height 99
+                     :inga.block/parent-hash "different"
+                     :inga.block/proposals ["other"]
+                     :inga.block/proposer "w9"
+                     :inga.block/ts 999
+                     :inga.block/round 999}]
+        (let [changed (assoc b k v)]
+          (is (not= (h b) (h changed))
+              (str k " is in the hash — if this fails the field left canonical-block"))
+          (is (= (h changed) (h (through changed)))
+              (str k " changed the hash but did not survive the wire: enc-block "
+                   "and canonical-block have drifted")))))))

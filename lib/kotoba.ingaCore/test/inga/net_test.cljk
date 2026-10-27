@@ -1,0 +1,133 @@
+(ns inga.net-test
+  "The failure modes here do not look like failures: a tight retry loop looks
+  busy, an unbounded queue looks fine until the process dies, and a peer
+  sending garbage looks like a peer."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [inga.net :as net]))
+
+(def params net/default-params)
+
+;; ── backoff ─────────────────────────────────────────────────────────────────
+
+(deftest reconnect-backs-off-and-then-stops-growing
+  (is (= 500 (net/backoff-for 0 params)))
+  (is (= 1000 (net/backoff-for 1 params)))
+  (is (= 32000 (net/backoff-for 6 params)))
+  (is (= 32000 (net/backoff-for 100 params))
+      "recovery must not be proportional to how long the peer was down"))
+
+(deftest a-connection-that-comes-up-resets-the-backoff
+  (testing "so the backoff measures consecutive failures, not total ones"
+    (let [s (-> (net/session :p1)
+                (net/on-closed 0 params)
+                (net/on-closed 0 params)
+                (net/on-closed 0 params))]
+      (is (= 3 (:failures s)))
+      (is (= 0 (:failures (net/on-open s)))))))
+
+(deftest a-replica-does-not-dial-before-the-backoff-elapses
+  (let [s (net/on-closed (net/session :p1) 1000 params)]
+    (is (= 1500 (:next-attempt s)))
+    (is (not (net/may-attempt? s 1499)))
+    (is (net/may-attempt? s 1500))))
+
+(deftest only-a-disconnected-session-is-dialled
+  (doseq [st [:connecting :open :dropped]]
+    (is (not (net/may-attempt? (assoc (net/session :p) :state st) 99999))
+        (str "must not dial a session in " st))))
+
+;; ── the outbound queue ──────────────────────────────────────────────────────
+
+(deftest the-queue-is-bounded
+  (testing "consensus is a broadcast protocol, so an unbounded queue is every
+            proposal and every vote forever, with no invalid data involved"
+    (let [s (reduce (fn [s i] (net/enqueue s {:n i} params))
+                    (net/on-open (net/session :p1))
+                    (range (+ 100 (:max-queue params))))]
+      (is (= (:max-queue params) (count (:queue s))))
+      (is (= 100 (:dropped-messages s))))))
+
+(deftest the-queue-drops-the-oldest
+  (testing "a stale vote is worthless; the newest message is the one that matters"
+    (let [s (reduce (fn [s i] (net/enqueue s i params))
+                    (net/on-open (net/session :p1))
+                    (range (+ 3 (:max-queue params))))]
+      (is (= (+ 2 (:max-queue params)) (last (:queue s))) "the newest survived")
+      (is (= 3 (first (:queue s))) "the three oldest were dropped"))))
+
+(deftest a-closed-session-discards-its-queue
+  (testing "holding it would replay a stale view's votes on reconnect"
+    (let [s (-> (net/on-open (net/session :p1))
+                (net/enqueue {:a 1} params)
+                (net/enqueue {:a 2} params)
+                (net/on-closed 0 params))]
+      (is (empty? (:queue s))))))
+
+(deftest only-an-open-session-drains
+  (let [queued (-> (net/on-open (net/session :p1)) (net/enqueue {:a 1} params))]
+    (is (= [{:a 1}] (first (net/drain queued))))
+    (is (empty? (:queue (second (net/drain queued))))))
+  (testing "draining a connecting session would send into a socket that is not there"
+    (let [s (assoc (net/session :p1) :state :connecting :queue [{:a 1}])]
+      (is (empty? (first (net/drain s))))
+      (is (= [{:a 1}] (:queue (second (net/drain s)))) "and keeps it for later"))))
+
+;; ── misbehaviour ────────────────────────────────────────────────────────────
+
+(deftest enough-garbage-drops-a-peer
+  (let [s (reduce (fn [s _] (net/on-bad-message s params))
+                  (net/on-open (net/session :p1))
+                  (range (:max-strikes params)))]
+    (is (net/dropped? s))
+    (is (empty? (:queue s)))))
+
+(deftest a-dropped-peer-stays-dropped
+  (let [s (reduce (fn [s _] (net/on-bad-message s params))
+                  (net/on-open (net/session :p1))
+                  (range (:max-strikes params)))]
+    (is (net/dropped? (net/on-closed s 0 params)) "closing does not un-drop it")
+    (is (= [] (:queue (net/enqueue s {:a 1} params))) "and nothing queues for it")))
+
+(deftest one-glitch-does-not-condemn-a-peer
+  (testing "a truncated frame or a version skew during a deploy is not hostility"
+    (let [s (-> (net/on-open (net/session :p1)) (net/on-bad-message params))]
+      (is (= 1 (:strikes s)))
+      (let [recovered (reduce (fn [s _] (net/on-good-message s params))
+                              s (range (:strike-decay params)))]
+        (is (= 0 (:strikes recovered)) "sustained good behaviour clears it")))))
+
+(deftest a-run-of-good-messages-is-required-not-a-single-one
+  (testing "otherwise a peer alternates garbage and greetings indefinitely"
+    (let [alternating (reduce (fn [s _] (-> s
+                                            (net/on-bad-message params)
+                                            (net/on-good-message params)))
+                              (net/on-open (net/session :p1))
+                              (range (:max-strikes params)))]
+      (is (net/dropped? alternating)
+          "one good message per bad one must not keep a peer alive forever"))))
+
+;; ── the peer set ────────────────────────────────────────────────────────────
+
+(deftest dialling-order-is-deterministic
+  (testing "two replays of the same replica must dial in the same order"
+    (let [peers (net/peer-set [:c :a :b])]
+      (is (= [:a :b :c] (net/due-for-attempt peers 0))))))
+
+(deftest broadcast-reaches-only-live-peers
+  (let [peers (-> (net/peer-set [:a :b :c])
+                  (update :a net/on-open)
+                  (update :b net/on-open))
+        after (net/broadcast peers {:msg 1} params)]
+    (is (= [:a :b] (net/live-peers after)))
+    (is (= 1 (count (:queue (:a after)))))
+    (is (= 1 (count (:queue (:b after)))))
+    (is (empty? (:queue (:c after))) "a disconnected peer queues nothing")))
+
+(deftest broadcast-skips-a-dropped-peer
+  (let [peers (-> (net/peer-set [:a :b])
+                  (update :a net/on-open)
+                  (update :b #(reduce (fn [s _] (net/on-bad-message s params))
+                                      (net/on-open %) (range (:max-strikes params)))))
+        after (net/broadcast peers {:msg 1} params)]
+    (is (= 1 (count (:queue (:a after)))))
+    (is (empty? (:queue (:b after))))))

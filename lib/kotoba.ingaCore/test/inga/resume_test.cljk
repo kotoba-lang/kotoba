@@ -1,0 +1,432 @@
+(ns inga.resume-test
+  "A replica that restarts must not vote twice at one height.
+
+  These tests were written BEFORE `snapshot`/`resume` existed, because the
+  failure they guard against is the one this system slashes for and it is
+  invisible from the inside: a replica that votes a second time at a height it
+  already voted at has equivocated, and nothing in its own state looks wrong
+  afterwards. The only way to see it is to catch the second vote leaving.
+
+  `replay` already restores `:voted` from the blocks it folds, which is why
+  restarting from the WHOLE log is safe. `resume` exists so a replica does not
+  have to fold the whole log — and the whole point of the bounded form is that
+  it throws away the very thing `replay` was reconstructing. So the bound has
+  to be replaced by something that refuses at least as much."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [inga.replica :as r]
+            [inga.consensus :as c]
+            [inga.sync :as sync]))
+
+(def witnesses [:w1 :w2 :w3 :w4])
+
+(defn- hash-fn [b] (str "h:" (c/canonical-block b)))
+
+(defn- opts [w]
+  {:witness w :witnesses witnesses :quorum (c/quorum-size 4) :hash-fn hash-fn})
+
+(defn- net []
+  (into {} (for [w witnesses] [w (r/replica (opts w))])))
+
+(defn- deliver-all [replicas outbox now max-steps]
+  (loop [rs replicas ob outbox t now steps 0]
+    (if (or (empty? ob) (>= steps max-steps))
+      rs
+      (let [[{:keys [from to msg]} & more] ob
+            targets (if (= :all to) (sort (keys rs))
+                        [(if (string? to) (keyword to) to)])
+            [rs' produced]
+            (reduce (fn [[rs acc] w]
+                      (if (= w from)
+                        [rs acc]
+                        (let [[s' out] (r/on-message (get rs w) msg t)]
+                          [(assoc rs w s') (into acc (map #(assoc % :from w) out))])))
+                    [rs []]
+                    targets)]
+        (recur rs' (vec (concat more produced)) (+ t 1) (inc steps))))))
+
+(defn- run
+  "Start the network and let it settle, so there is a chain with real history
+  rather than a genesis block and a hope."
+  []
+  (let [rs (net)
+        leader (c/leader-for witnesses 1)
+        [s0 out] (r/start (get rs leader) 1000)
+        rs (assoc rs leader s0)
+        rs (deliver-all rs (mapv #(assoc % :from leader) out) 1000 4000)]
+    (reduce (fn [rs t]
+              (let [{rs' :rs ob :ob}
+                    (reduce (fn [acc w]
+                              (let [[s' out] (r/on-tick (get rs w) t)]
+                                (-> acc
+                                    (update :rs assoc w s')
+                                    (update :ob into (map #(assoc % :from w) out)))))
+                            {:rs rs :ob []}
+                            (sort (keys rs)))]
+                (deliver-all rs' (vec ob) t 4000)))
+            rs
+            (range 2000 2800 100))))
+
+(defn- votes-out
+  "Vote messages in an outbox, as `[height block-hash]` pairs."
+  [out]
+  (for [{:keys [msg]} out
+        :when (= :vote (:type msg))]
+    [(:height msg) (:block-hash msg)]))
+
+;; ── the bound has to refuse at least as much ────────────────────────────────
+
+(deftest a-resumed-replica-does-not-vote-again-below-its-tip
+  ;; The whole reason `resume` is dangerous. Re-deliver a proposal the replica
+  ;; already voted on and watch what leaves.
+  (let [rs (run)
+        w :w2
+        s (get rs w)
+        h (r/height s)]
+    (is (pos? h) "the fixture produced no chain, so this test proves nothing")
+    (let [snap (r/snapshot s)
+          s' (r/resume (opts w) snap)
+          ;; every block this replica holds, offered back to it one at a time
+          blocks (:chain (r/snapshot s))
+          seconds (for [b blocks
+                        :let [[_ out] (r/on-message s' {:type :proposal :block b} 9999)]
+                        v (votes-out out)]
+                    v)]
+      (testing "no vote for a DIFFERENT block at a height already decided"
+        (doseq [[vh vhash] seconds]
+          (let [original (some (fn [b] (when (= vh (:inga.block/height b)) (hash-fn b)))
+                               blocks)]
+            (is (= original vhash)
+                (str "resumed replica voted at height " vh
+                     " for a block it had not adopted — that is equivocation"))))))))
+
+(deftest resume-refuses-at-least-as-much-as-replay
+  ;; `replay` is the safe baseline: it reconstructs `:voted` from the blocks.
+  ;; `resume` may refuse MORE (fail-closed) but never less.
+  ;;
+  ;; **The baseline replays the WHOLE chain, not the snapshot's tail.** Handing
+  ;; `replay` a tail is not a smaller version of the same thing: the first
+  ;; block does not extend genesis, so `extend-chain` adopts none of them and
+  ;; the replica sits at genesis with nothing voted. Comparing against that
+  ;; measures nothing, and the first version of this test did exactly that and
+  ;; reported the difference as a resume bug.
+  (let [rs (run)
+        w :w3
+        s (get rs w)
+        full (vec (:chain s))
+        tail (:chain (r/snapshot s))
+        resumed (r/resume (opts w) (r/snapshot s))
+        replayed (r/replay (r/replica (opts w)) full)]
+    (is (= (r/height replayed) (r/height s))
+        "the baseline did not reconstruct the chain, so it is not a baseline")
+    (doseq [b tail]
+      (let [h (:inga.block/height b)
+            [_ o1] (r/on-message replayed {:type :proposal :block b} 9999)
+            [_ o2] (r/on-message resumed {:type :proposal :block b} 9999)]
+        (is (<= (count (votes-out o2)) (count (votes-out o1)))
+            (str "at height " h " resume emitted more votes than replay"))
+        (testing "and any vote it does emit names the block it holds"
+          (doseq [[vh vhash] (votes-out o2)]
+            (is (= vh h))
+            (is (= vhash (hash-fn b))
+                "resume voted for a block other than the one proposed")))))))
+
+;; ── and it still has to work ────────────────────────────────────────────────
+
+(deftest a-resumed-replica-keeps-its-place-in-the-chain
+  (let [rs (run)
+        w :w4
+        s (get rs w)
+        s' (r/resume (opts w) (r/snapshot s))]
+    (is (= (r/height s) (r/height s')))
+    (is (= (hash-fn (r/tip s)) (hash-fn (r/tip s'))))
+    (is (= (r/committed-height s) (r/committed-height s'))
+        "a resumed replica that forgot what it committed would re-apply blocks")))
+
+(deftest the-chain-advances-after-every-replica-restarts
+  ;; The production stall this test was written for, reproduced.
+  ;;
+  ;; A deploy restarts all four at once. Each comes back holding a tip it
+  ;; adopted, and `voted?` says it voted at that height — because it did, and
+  ;; because `replay` records exactly that. `vote-on-tip` then refuses, nobody
+  ;; certifies the tip, nobody can propose the next height, and the chain sits
+  ;; there forever with `votes-for-tip: 0` on every replica at once.
+  ;;
+  ;; Measured on the deployed devnet at height 282, view 267: `blocked-by: no
+  ;; certificate for the tip`, `sent-types {new-view 29, sync-response 87}` —
+  ;; not one vote.
+  ;;
+  ;; **The height has to move.** `committed-height` moving is not enough and
+  ;; is what the first version of this file asserted: the 3-chain rule keeps
+  ;; committing blocks the replica already held for a while after a restart,
+  ;; so a frozen chain reports progress it is not making.
+  ;; Reproduced the way the node actually restarts: resume from a checkpoint
+  ;; taken EARLIER, then fold the blocks above it with `replay` — which is
+  ;; what `catchUp` does off storage.
+  ;;
+  ;; That distinction is the whole test. A replica resumed from a snapshot
+  ;; taken live keeps the certificate its own vote-folding built for the tip,
+  ;; so the leader can propose on it and nothing looks wrong. A replica that
+  ;; REPLAYS to the tip has no such certificate: `replay` recovers a
+  ;; certificate only from a block's `:justify`, and the certificate for the
+  ;; tip travels in the block AFTER it — which was never produced. So the
+  ;; restarted network holds a tip that nobody has certified and that
+  ;; `vote-on-tip` refuses to vote for.
+  (let [rs (run)
+        before (apply max (map (comp r/height val) rs))
+        rs' (into {}
+                  (for [[w s] rs]
+                    (let [full (vec (:chain s))
+                          cut (max 1 (- (count full) 6))
+                          early (subvec full 0 cut)
+                          tail (subvec full cut)
+                          ;; a checkpoint from further back …
+                          snap (r/snapshot (r/replay (r/replica (opts w)) early))
+                          ;; … then catch up to the tip off "storage"
+                          resumed (r/replay (r/resume (opts w) snap) tail)]
+                      [w resumed])))
+        after-net (reduce (fn [rs t]
+                            (let [{rs2 :rs ob :ob}
+                                  (reduce (fn [acc w]
+                                            (let [[s' out] (r/on-tick (get rs w) t)]
+                                              (-> acc
+                                                  (update :rs assoc w s')
+                                                  (update :ob into (map #(assoc % :from w) out)))))
+                                          {:rs rs :ob []}
+                                          (sort (keys rs)))]
+                              (deliver-all rs2 (vec ob) t 4000)))
+                          rs'
+                          (range 5000 6400 100))
+        after (apply max (map (comp r/height val) after-net))]
+    (is (> after before)
+        (str "the chain froze at " before " after every replica restarted"))))
+
+(deftest a-restarted-replica-only-ever-recasts-for-its-own-tip
+  ;; The safety side of the fix above. Re-casting at a height it already voted
+  ;; at is only safe because the block is the one it holds — the same argument
+  ;; `handle-proposal` already makes. Anything else at that height must still
+  ;; get nothing.
+  (let [rs (run)
+        w :w2
+        s (get rs w)
+        resumed (r/resume (opts w) (r/snapshot s))
+        [_ out] (r/on-tick resumed 9999)
+        tip-hash (hash-fn (r/tip resumed))]
+    (doseq [[vh vhash] (votes-out out)]
+      (is (= vh (r/height resumed)))
+      (is (= vhash tip-hash)
+          "a restarted replica voted for a block that is not its own tip"))))
+
+(deftest a-resumed-replica-still-commits-new-blocks
+  ;; The trap in truncating `:chain`: `commits` used to count how many entries
+  ;; of `three-chain-commits` were already in `:committed`, and over a
+  ;; truncated chain that count is larger than the list — so nothing new is
+  ;; ever committed and the replica stalls while looking healthy.
+  (let [rs (run)
+        rs' (into {} (for [[w s] rs] [w (r/resume (opts w) (r/snapshot s))]))
+        before (into {} (for [[w s] rs'] [w (r/committed-height s)]))
+        after-net (reduce (fn [rs t]
+                            (let [{rs2 :rs ob :ob}
+                                  (reduce (fn [acc w]
+                                            (let [[s' out] (r/on-tick (get rs w) t)]
+                                              (-> acc
+                                                  (update :rs assoc w s')
+                                                  (update :ob into (map #(assoc % :from w) out)))))
+                                          {:rs rs :ob []}
+                                          (sort (keys rs)))]
+                              (deliver-all rs2 (vec ob) t 4000)))
+                          rs'
+                          (range 5000 6000 100))]
+    (is (some (fn [[w s]] (> (r/committed-height s) (get before w)))
+              after-net)
+        "no resumed replica committed anything new — the chain stalled after resume")))
+
+;; ── bounded, which is the entire point ──────────────────────────────────────
+
+(deftest a-snapshot-does-not-grow-with-the-chain
+  (let [rs (run)
+        s (get rs :w1)
+        snap (r/snapshot s)]
+    (is (<= (count (:chain snap)) r/resume-tail)
+        "the snapshot carried more blocks than the tail bound")
+    (is (<= (count (:by-hash snap)) (inc r/resume-tail))
+        "by-hash grew past the blocks the snapshot retains")
+    (testing "and it is plain data — it has to survive storage"
+      (is (nil? (:hash-fn snap)) "an injected fn cannot be serialised")
+      (is (nil? (:machine snap)))
+      (is (nil? (:sign-fn snap))))))
+
+(deftest resume-rejects-a-snapshot-it-does-not-understand
+  (let [s (get (run) :w1)]
+    (is (thrown? js/Error
+                 (r/resume (opts :w1) (assoc (r/snapshot s) :inga.snapshot/version 999))))))
+
+(deftest a-behind-replica-does-not-broadcast-its-tip-forever
+  ;; The regression the first version of the on-tick gate shipped: a replica
+  ;; that has fallen behind holds a tip nobody else will vote for, so
+  ;; "uncertified" never clears and it re-broadcast on every tick. Deployed,
+  ;; that was 1,348 votes against 15 messages received — the fix for a stall
+  ;; drowning the transport it needed in order to stop being stalled.
+  (let [rs (run)
+        w :w1
+        ;; a replica three blocks behind the others, resumed so it holds no
+        ;; vote for its own tip
+        s (get rs w)
+        full (vec (:chain s))
+        behind (r/replay (r/replica (opts w))
+                         (subvec full 0 (max 1 (- (count full) 3))))
+        ;; many ticks inside one view
+        [_ votes] (reduce (fn [[st acc] t]
+                            (let [[st' out] (r/on-tick st t)]
+                              [st' (into acc (votes-out out))]))
+                          [behind []]
+                          (range 100000 100400 10))]
+    (is (<= (count votes) 2)
+        (str "a behind replica emitted " (count votes)
+             " votes for its own tip inside one view"))))
+
+;; ── a laggard has to be able to catch up on its own ─────────────────────────
+
+(deftest a-replica-left-behind-asks-for-what-it-is-missing
+  ;; Observed in production: w4 three blocks behind, the other three sitting on
+  ;; a certified tip waiting for w4 to lead the next height, and
+  ;; `last-sync-request: null` on ALL FOUR. Resetting w4 to genesis did not
+  ;; help either — it still never asked.
+  ;;
+  ;; A sync request only left on two paths: a proposal whose parent is unknown,
+  ;; and a new-view carrying a higher high-qc. In a stall nobody proposes, and
+  ;; the replica that is behind receives almost nothing (measured: 8 messages
+  ;; in, against 1,527 out). **Falling behind makes a replica isolated, and
+  ;; being isolated is what keeps it behind.**
+  ;;
+  ;; The one thing a stuck replica always knows is that it is stuck. That has
+  ;; to be enough to make it ask.
+  (let [rs (run)
+        w :w1
+        s (get rs w)
+        full (vec (:chain s))
+        behind (r/replay (r/replica (opts w))
+                         (subvec full 0 (max 1 (- (count full) 4))))
+        ;; nothing arrives — this replica is alone with its own clock
+        [_ out] (reduce (fn [[st acc] t]
+                          (let [[st' o] (r/on-tick st t)]
+                            [st' (into acc o)]))
+                        [behind []]
+                        ;; several view timeouts
+                        (range 100000 160000 2000))
+        reqs (filter #(= :sync-request (:type (:msg %))) out)]
+    (is (seq reqs)
+        "a replica that has timed out repeatedly never asked for a sync")
+    (testing "and it asks for the range above its own tip"
+      (let [r (:msg (first reqs))]
+        (is (= (inc (r/height behind)) (:from r)))))))
+
+(deftest the-laggard-does-not-flood-either
+  ;; The same trap as the tip re-vote: a condition that never clears becomes a
+  ;; sender that never stops. One request per view.
+  (let [rs (run)
+        w :w2
+        s (get rs w)
+        full (vec (:chain s))
+        behind (r/replay (r/replica (opts w))
+                         (subvec full 0 (max 1 (- (count full) 4))))
+        [_ out] (reduce (fn [[st acc] t]
+                          (let [[st' o] (r/on-tick st t)]
+                            [st' (into acc o)]))
+                        [behind []]
+                        ;; many ticks, few views
+                        (range 200000 200400 10))
+        reqs (filter #(= :sync-request (:type (:msg %))) out)]
+    (is (<= (count reqs) 2)
+        (str "a behind replica sent " (count reqs) " sync requests inside one view"))))
+
+(deftest the-below-quorum-diagnostic-names-the-block-that-failed
+  ;; It named `(first segment)` — the one block that is EXEMPT, because its
+  ;; justify is the genesis certificate. So every report showed a passing
+  ;; certificate and pointed at a genesis problem that did not exist. Two
+  ;; iterations of the gap loop were spent on that wrong answer.
+  (let [rs (run)
+        s (get rs :w1)
+        full (vec (:chain s))
+        ;; A real segment starts at height 1 — genesis is what the receiver
+        ;; already holds, not something it is offered. `(take 4 full)` includes
+        ;; genesis, whose justify is nil rather than the genesis CERTIFICATE,
+        ;; so it reports as uncertified and the test measured the fixture.
+        ;;
+        ;; a segment whose SECOND block carries a certificate nobody signed
+        seg (mapv (fn [i b]
+                    (if (= i 1)
+                      (assoc b :inga.block/justify
+                             {:inga.qc/height 7 :inga.qc/view 1
+                              :inga.qc/witnesses #{} :inga.qc/sigs {}})
+                      b))
+                  (range)
+                  (subvec full 1 5))
+        bad (sync/first-uncertified 3 seg)]
+    (is (some? bad) "the planted certificate was not detected")
+    (is (= (:inga.block/height (nth seg 1)) (:inga.block/height bad))
+        "the diagnostic named a block other than the one that failed")
+    (testing "and the genesis-justified first block is still exempt"
+      (is (not= (:inga.block/height (first seg)) (:inga.block/height bad))))))
+
+;; ── the end of the sync chain of defects ────────────────────────────────────
+
+(deftest a-network-with-one-replica-behind-heals-itself
+  ;; The property every earlier sync fix was a step toward, asserted directly.
+  ;;
+  ;; Four defects were found and fixed one at a time, each hidden by the one
+  ;; before it: the laggard never asked (S10); peers could not serve history
+  ;; after a bounded resume (S11); the certificates inside a response were
+  ;; never verified so every segment was refused (S12); and the response was
+  ;; broadcast rather than addressed, so the laggard kept receiving somebody
+  ;; else's range and discarding it (S13).
+  ;;
+  ;; **Each fix looked complete until the next one was measured.** So this
+  ;; test does not check that a request leaves, or that a response arrives, or
+  ;; that a segment validates. It checks the only thing that matters: the
+  ;; replica that was behind is not behind any more.
+  (let [rs (run)
+        w :w4
+        s (get rs w)
+        full (vec (:chain s))
+        target (r/height s)
+        ;; w4 knocked back several blocks, the others untouched
+        behind (r/replay (r/replica (opts w))
+                         (subvec full 0 (max 1 (- (count full) 5))))
+        net' (assoc rs w behind)
+        healed (reduce (fn [rs t]
+                         (let [{rs2 :rs ob :ob}
+                               (reduce (fn [acc x]
+                                         (let [[s' out] (r/on-tick (get rs x) t)]
+                                           (-> acc
+                                               (update :rs assoc x s')
+                                               (update :ob into (map #(assoc % :from x) out)))))
+                                       {:rs rs :ob []}
+                                       (sort (keys rs)))]
+                           (deliver-all rs2 (vec ob) t 8000)))
+                       net'
+                       (range 300000 302000 100))]
+    (is (>= (r/height (get healed w)) target)
+        (str "the replica left behind at " (r/height behind)
+             " never caught up to " target))))
+
+(deftest a-sync-response-goes-to-the-replica-that-asked
+  (let [rs (run)
+        asker :w3
+        s (get rs asker)
+        [_ out] (r/on-message (get rs :w1)
+                              {:type :sync-request :witness asker :from 1 :to 3}
+                              9999)
+        resp (first (filter #(= :sync-response (:type (:msg %))) out))]
+    (is (some? resp) "no response at all")
+    (is (= asker (:to resp))
+        "the response was not addressed to the replica that asked")))
+
+(deftest a-request-without-a-witness-still-gets-an-answer
+  ;; Both node versions run side by side during a deploy, so an old request —
+  ;; one with no `:witness` — has to keep working. Refusing it would make the
+  ;; upgrade itself the outage.
+  (let [rs (run)
+        [_ out] (r/on-message (get rs :w1) {:type :sync-request :from 1 :to 3} 9999)
+        resp (first (filter #(= :sync-response (:type (:msg %))) out))]
+    (is (some? resp))
+    (is (= :all (:to resp)) "an unaddressed request must fall back to broadcast")))

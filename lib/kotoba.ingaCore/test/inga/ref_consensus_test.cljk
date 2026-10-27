@@ -1,0 +1,157 @@
+(ns inga.ref-consensus-test
+  "`kotobase.storage.contract/verify` against a ref store whose CAS is decided
+  by the real commit rule.
+
+  `inga.ref-test` runs the same suite against a cooperative oracle and says so:
+  an agreeable oracle is the easiest way to believe something false. This is
+  the run that is evidence about agreement — four JVM threads race the same
+  expected head, and what separates them is a consensus network committing
+  their records in some order.
+
+  ## What the lock is and is not doing
+
+  The replica network is an in-process data structure, so `drive!` holds a
+  lock while folding it. The lock protects the STRUCTURE. It does not decide
+  the race: every thread submits into a shared pending set before any of them
+  drives, all four records reach the same network, and the winner is whichever
+  one the committed order puts first at that sequence. Remove the lock and you
+  corrupt an atom; remove the consensus and there is no answer at all."
+  (:require [kotoba.test :refer [deftest is]]
+            [inga.consensus :as c]
+            [inga.ref :as iref]
+            [inga.replica :as r]
+            [inga.wire :as wire]
+            [kotobase.storage.contract :as contract]
+            [kotobase.storage.core :as storage]
+            [kotobase.storage.memory :as memory]))
+
+(def witnesses [:w1 :w2 :w3 :w4])
+
+(defn- hash-fn [b] (str "h:" (c/canonical-block b)))
+
+;; A block's proposals are opaque ids to the consensus, so the head records
+;; they stand for live beside it -- `inga.state` draws the same line with
+;; `decode-block`, and for the same reason: inga does not learn what a
+;; transaction is.
+(defn- network []
+  {:replicas (into {} (for [w witnesses]
+                        [w (r/replica {:witness w :witnesses witnesses
+                                       :quorum (c/quorum-size (count witnesses))
+                                       :hash-fn hash-fn})]))
+   :records {}          ; proposal id -> head record
+   :started? false
+   :now 1000})
+
+(defn- deliver-all [rs outbox now steps]
+  (loop [rs rs ob outbox t now i 0]
+    (if (or (empty? ob) (>= i steps))
+      rs
+      (let [[{:keys [from to msg]} & more] ob
+            targets (if (= :all to) (sort (keys rs)) [to])
+            [rs' produced]
+            (reduce (fn [[rs acc] w]
+                      (if (= w from)
+                        [rs acc]
+                        (let [[s' out] (r/on-message (get rs w) msg t)]
+                          [(assoc rs w s') (into acc (map #(assoc % :from w) out))])))
+                    [rs []] targets)]
+        (recur rs' (vec (concat more produced)) (inc t) (inc i))))))
+
+(defn- tick-window
+  "Tick every replica across a window and settle after each one.
+
+  One tick at one instant is not enough after the first round: the replica
+  that leads the next height has to reach its own deadline before it proposes,
+  and a single instant either is or is not past it. The original version of
+  this drove once at a fixed time, which committed the genesis block and
+  nothing after — so the second race had no block to be decided by and every
+  writer lost. Zero winners reads exactly like a safety failure in the
+  report, and is the opposite: nothing happened at all."
+  [rs from steps]
+  (reduce (fn [rs t]
+            (let [[rs' ob] (reduce (fn [[rs ob] w]
+                                     (let [[s' out] (r/on-tick (get rs w) t)]
+                                       [(assoc rs w s') (into ob (map #(assoc % :from w) out))]))
+                                   [rs []] (sort (keys rs)))]
+              (deliver-all rs' (vec ob) t 6000)))
+          rs
+          (range from (+ from (* steps 100)) 100)))
+
+(defn- drive
+  "Submit every pending record to the leader and run the network far enough
+  that a block carrying them can commit."
+  [{:keys [replicas records started? now] :as net}]
+  (let [leader (c/leader-for witnesses 1)
+        seeded (update replicas leader
+                       (fn [s] (reduce (fn [s id] (r/submit s id 64)) s (sort (keys records)))))
+        [rs started?']
+        (if-not started?
+          (let [[s0 out] (r/start (get seeded leader) now)]
+            [(deliver-all (assoc seeded leader s0)
+                          (mapv #(assoc % :from leader) out) now 6000) true])
+          [seeded true])
+        now' (+ now 1000)]
+    (assoc net
+           :replicas (tick-window rs now' 12)
+           :started? started?'
+           :now (+ now' 1200))))
+
+(defn- committed-records [{:keys [replicas records]}]
+  (->> (:committed (get replicas (first witnesses)))
+       (mapcat :inga.block/proposals)
+       (keep records)))
+
+(defn- certificate-for
+  "The certificate a committed record carries: the witnesses that certified
+  the block it rode in.
+
+  This is the substantive difference from the oracle version. There, a
+  certificate was manufactured for whoever the oracle picked. Here it is
+  whatever the consensus already produced, and a record that never made it
+  into a committed block has none because there is nothing to point at."
+  [{:keys [replicas]} id]
+  (let [blocks (:committed (get replicas (first witnesses)))]
+    (when-let [b (first (filter #(some #{id} (:inga.block/proposals %)) blocks))]
+      {:sigs (mapv (fn [w] {:witness (str w) :sig (str "committed@" (:inga.block/height b))})
+                   (or (seq (:inga.qc/witnesses (:inga.block/justify b))) witnesses))})))
+
+(defn- consensus-store []
+  (let [net (atom (network))
+        heads (atom {})                ; the durable head record, as in a real deployment
+        lock #?(:clj (Object.) :cljs nil)
+        id-of (fn [rec] (str (get rec "ref") "/" (get rec "seq") "/" (get rec "cid")))]
+    (iref/ref-store
+     {;; `compose {:blocks <store> :refs <inga>}`: the log decides WHICH record
+      ;; is the head, and the record itself still lives somewhere durable.
+      :read-head! (fn [ref-name] (get @heads ref-name))
+      :write-head! (fn [ref-name h] (swap! heads assoc ref-name h))
+      ;; Certificates are the consensus's. This verifier checks the shape the
+      ;; head plane requires and defers the crypto, which is the same division
+      ;; of labour inga.attest draws for votes.
+      :verify-fn (fn [_ sig _] (some? sig))
+      ;; Through `wire/admits`, not `(set witnesses)`: this suite holds its
+      ;; witnesses as keywords (:w1) while a certificate that came off the
+      ;; wire names them as strings ("w1"). A raw set rejects every genuine
+      ;; witness -- and a check that rejects everything looks exactly like a
+      ;; check that works, when what you are measuring is a forgery no longer
+      ;; getting in. `inga.sync` already paid for that lesson once.
+      :admitted? (wire/admits witnesses)
+      :quorum 1
+      :propose! (fn [record]
+                  (let [id (id-of record)]
+                    ;; Submit BEFORE driving, so every racing thread's record is
+                    ;; in the network before any of them folds it.
+                    (swap! net assoc-in [:records id] record)
+                    #?(:clj (locking lock (swap! net drive))
+                       :cljs (swap! net drive))
+                    (let [snapshot @net
+                          o (iref/outcome (iref/project (committed-records snapshot)) record)]
+                      (cond-> o
+                        (:certified? o) (assoc :cert (certificate-for snapshot id))))))})))
+
+(deftest the-conformance-suite-against-real-agreement
+  (let [refs (consensus-store)
+        backend (storage/compose {:blocks (memory/memory-store) :refs refs})
+        result (contract/verify backend (fn [ok? label] (is ok? label)))]
+    (is (= {:profile :linearizable-ref :concurrency :verified} result)
+        "the same suite inga.ref-test runs against an oracle, run against consensus")))

@@ -1,0 +1,331 @@
+(ns torihiki.auth
+  "Who is allowed to move an account, and how a signature stops being reusable.
+
+  Until this existed, `:account` was a number a client asserted. Anyone could
+  submit a transaction claiming to be account 5 and the engine would apply it.
+  The API validated the SHAPE of a request and never asked who sent it.
+
+  ## Why authentication lives in the engine, not the transport
+
+  It looks like a transport concern and it is not. Two of its three parts are
+  consensus state:
+
+  - the **nonce** is per-account state, and every validator must agree on its
+    value or they disagree about which transactions are replays;
+  - the **key binding** is per-account state, for the same reason;
+  - only the *framing* — HTTP headers, a WebSocket envelope — belongs to a
+    transport, and that part is the easy half.
+
+  Putting nonces in a server would mean a chain whose replay protection lives
+  outside the thing that agrees on state, which is not replay protection.
+
+  ## The signed payload
+
+  `signing-payload` covers the chain id, the account, the nonce, and every
+  field of the transaction. Each of those is load-bearing:
+
+  - **chain id** is domain separation. A signature produced on a testnet must
+    not authorise the same transaction on the mainnet, and the only thing that
+    stops it is the signature covering which chain it was for.
+  - **nonce** is what makes the signature single-use.
+  - **every field** — a payload that summarised the transaction would let two
+    different transactions share one signature.
+
+  ## Keys, accounts, and what this does not solve
+
+  The KEY is the identity; the id is a short handle for it. Binding is
+  immutable — a rebindable account is an account that can be stolen from
+  whoever holds the key.
+
+  ## Which id a key may bind, and why first-use was not enough
+
+  With `derive-fn` supplied, a key may only bind the id DERIVED FROM IT. That
+  closes an attack that first-use binding does not survive under consensus:
+  the party ordering transactions sees a pending binding before it commits and
+  can insert its own binding for that id first. Under a single sequencer the
+  owner is always first, which is why this was invisible until four replicas
+  ran with a Byzantine leader — it claimed the account, and the genuine owner
+  was refused `:wrong-key` on their own id, permanently.
+
+  The earlier note here said deriving the id trades a registration race for an
+  account collision, and that this was worse. That was the wrong comparison. A
+  collision is REFUSED — the second key gets `:wrong-key`, sees it, and can
+  use another key — while the race is silent, permanent, and profitable for
+  whoever orders the transactions. And the slab holds i53, not 32 bits, so the
+  space is large enough that a collision needs tens of millions of accounts
+  rather than tens of thousands.
+
+  `derive-fn` is injected for the same reason `verify-fn` is: this namespace
+  has no crypto and a browser that cannot hash is still allowed to replay.
+  Without one, ids remain first-come — which is correct for replaying a
+  history already agreed and wrong anywhere a proposer can front-run.
+
+  ## Injected verification
+
+  `verify-fn` receives `[pubkey payload sig]` and returns truthy when the
+  signature is good. Nothing here imports crypto, for the same reason
+  `torihiki.log` does not: `kotoba-lang/ed25519` is JVM-only, and a browser
+  that cannot re-verify a block is not a verifier."
+  (:require [kotoba.lang.text :as str]))
+
+(def reasons
+  #{:unsigned :bad-signature :bad-nonce :wrong-key :missing-account
+    :not-your-account :agent-may-not})
+
+(defn canonical-value
+  "A structure as a string that does not depend on how it is held.
+
+  Maps are emitted with their keys sorted and their values rendered the same
+  way; sequences keep their order, because in a schedule the order IS the
+  meaning. Keywords become their names, so `:min-volume` and `\"min-volume\"`
+  — the same field before and after a JSON round trip — render identically.
+
+  nil is the empty string rather than `\"null\"`, so a field that is absent and
+  a field that is explicitly nil sign the same, which is what every other
+  optional field in the payload already does."
+  [v]
+  (cond
+    (nil? v) ""
+    (map? v) (str "{" (str/join "," (map (fn [[k x]]
+                                           (str (if (keyword? k) (name k) (str k))
+                                                "=" (canonical-value x)))
+                                         (sort-by (fn [[k _]] (if (keyword? k) (name k) (str k))) v)))
+                  "}")
+    (sequential? v) (str "[" (str/join "," (map canonical-value v)) "]")
+    (keyword? v) (name v)
+    :else (str v)))
+
+(defn- tx-fields
+  "Every transaction field that can change what a transaction DOES, in a fixed
+  order. Anything omitted here is a field an attacker could alter without
+  invalidating the signature, so the list is deliberately exhaustive rather
+  than minimal — an unused field costs a few bytes, a missing one costs the
+  account."
+  [tx]
+  [(name (:tx tx :none))
+   (:market tx) (:side tx) (:level tx) (:qty tx) (:flags tx)
+   (:oid tx) (:amount tx) (:price tx) (:id tx)
+   (:trigger-price tx)
+   (when-let [d (:direction tx)] (name d))
+   (get-in tx [:order :side]) (get-in tx [:order :level])
+   (get-in tx [:order :qty]) (get-in tx [:order :flags])
+   ;; `:credit` — who a bridge deposit pays. APPENDED, and appended is the
+   ;; only safe place: the payload numbers fields by position, so inserting
+   ;; one renumbers every field after it and invalidates every signature ever
+   ;; made. Appending changes the payload too (every transaction gains a
+   ;; trailing `f16=` line, empty for the ones that do not use it) — which is
+   ;; why the node and the browser have to ship together. A client one pin
+   ;; behind signs a payload the node does not compute and gets
+   ;; `bad-signature`, which reads as a cryptography problem and is not one.
+   ;;
+   ;; Unconditional rather than present-only. A field that is signed only when
+   ;; it appears is a field an attacker can ADD to a signed transaction: the
+   ;; signature still verifies because the payload it covered did not mention
+   ;; it, and a deposit made out to somebody else arrives looking authentic.
+   (:credit tx)
+   ;; APPENDED, in this order, for the reason given above: the payload numbers
+   ;; fields by position, so only the end is safe.
+   ;;
+   ;; `:claim` selects WHICH pending withdrawal a settle or a cancel acts on,
+   ;; and it was not signed. `:withdraw-cancel` is gated on owning the claim
+   ;; and `:withdraw-settle` on being the bridge, so the reachable damage was
+   ;; bounded — but an unsigned field that chooses what a transaction acts on
+   ;; is the exact shape this list exists to prevent, and "bounded today" is a
+   ;; property of the other checks rather than of the signature.
+   (:claim tx)
+   ;; `:agent` and `:expires` decide which key gains authority over an account
+   ;; and for how long. Unsigned, an authorisation could be re-aimed at an
+   ;; attacker's key in flight and would still verify.
+   (:agent tx) (:expires tx)
+   ;; The ladder: how many rungs and how far apart. Unsigned, an attacker
+   ;; could widen a quote or multiply its size without touching the signature.
+   (:count* tx) (:step tx)
+   ;; Who is paid for routing this order and how much. Unsigned, an order could
+   ;; be re-aimed at an attacker's account, or its fee raised to the cap, and
+   ;; the signature would still verify.
+   (:builder tx) (:builder-fee tx)
+   ;; Who is credited for introducing this account. Bound once and forever, so
+   ;; an unsigned field here is an attacker claiming somebody's fee stream for
+   ;; the life of the account.
+   (:referrer tx)
+   ;; Which vault, and how many shares are being burned. Unsigned, a
+   ;; withdrawal could be re-aimed at a vault the signer holds more of.
+   (:vault tx) (:shares tx)
+   ;; Which validator a bond backs. Unsigned, a delegation could be re-aimed
+   ;; at whoever wanted the weight.
+   (:validator tx)
+   ;; What the escrow is said to hold, and as of when. Unsigned, anybody who
+   ;; could reach the node could make the venue look solvent.
+   (:height* tx)
+   ;; Which sub-account is being created, and where a transfer goes. Unsigned,
+   ;; a transfer could be re-aimed inside the family — still the owner's money,
+   ;; and still not the pool they chose.
+   (:sub tx) (:to tx)
+   ;; `:spec` is a market's parameters — leverage, tick, fees, and the margin
+   ;; and fee SCHEDULES, which are vectors of maps.
+   ;;
+   ;; Rendered by `canonical-value`, all the way down. The first version sorted
+   ;; the top-level keys and then called `str` on each value, which is exactly
+   ;; the trap the docstring below warns about, one level in: a nested map
+   ;; prints in whatever order it happens to hold, and a spec that has been
+   ;; through JSON does not hold it in the same order as the one that was
+   ;; signed. Measured on the deployed chain — every market amend carrying fee
+   ;; tiers came back `bad-signature`, four in a row.
+   ;; The escrow, appended for the same reason as everything above it.
+   ;;
+   ;; `:txid` is the transaction on the OTHER chain that a validator says it
+   ;; saw. Unsigned, a validator's attestation could be re-pointed at a
+   ;; different deposit in flight — and an attestation is the only thing
+   ;; standing between "somebody sent money" and "this account has
+   ;; collateral". `:asset` says which asset it was, `:dest` where a
+   ;; withdrawal is to be paid. An unsigned `:dest` is an attacker choosing
+   ;; where somebody else's money goes.
+   (canonical-value (:spec tx))
+   ;; AFTER `:spec`, which was the last field until now.
+   ;;
+   ;; These first went in ABOVE it — an insertion, not an append, which
+   ;; renumbers `f<n>` for `:spec` and invalidates every market listing and
+   ;; amend ever signed. That is the exact mistake the note on `:credit`
+   ;; describes, made while reading it.
+   ;;
+   ;; `:txid` is the transaction on the OTHER chain that a validator says it
+   ;; saw. Unsigned, an attestation could be re-pointed at a different deposit
+   ;; in flight — and an attestation is the only thing standing between
+   ;; "somebody sent money" and "this account has collateral". `:asset` says
+   ;; which asset, `:dest` where a withdrawal is paid. An unsigned `:dest` is
+   ;; an attacker choosing where somebody else's money goes.
+   (:txid tx) (:asset tx) (:dest tx)
+   ;; Contract code and the salt that places it. Unsigned, an attacker could
+   ;; swap the bytecode of a deployment in flight and it would land, signed by
+   ;; somebody who never saw it, at the address they were told to expect.
+   (:code tx) (:salt tx)
+   ;; The key-recovery handshake, which was not signed at all. `:principal`
+   ;; names who may rotate an account and `:subject`/`:pubkey` which account
+   ;; and to WHICH key: unsigned, a relay could re-aim a rotation at its own
+   ;; key and the controller's signature would still verify.
+   (:principal tx) (:subject tx) (:pubkey tx)
+   ;; The validator set (`torihiki.validators`). `:witness` is which validator
+   ;; a registration, rotation or retirement acts on — `:pubkey` above is the
+   ;; consensus key it installs — and the rest is the equivocation proof.
+   ;; Unsigned, a relay could swap the proof under the submitter's name.
+   (:witness tx) (:evidence-height tx) (:view tx)
+   (:hash-a tx) (:sig-a tx) (:hash-b tx) (:sig-b tx)
+   ;; Governance (`torihiki.governance`): which version, from which height,
+   ;; and which proposal a vote is for. Unsigned, a relay could turn a vote
+   ;; for one upgrade into a vote for another.
+   (:version tx) (:activation tx) (:proposal tx)
+   ;; The anchor payload (`:anchor`, the receipt-CID checkpoint). Unsigned, a
+   ;; relay could re-point an anchor at a different receipt and the signer's
+   ;; signature would still verify over it.
+   (:cid tx)])
+
+(defn signing-payload
+  "The canonical string a client signs. Field-per-line with names, so two
+  different transactions cannot collide by juxtaposition — the same reason
+  `torihiki.state`'s canonical encoding is tagged rather than concatenated."
+  [chain-id account nonce tx]
+  (str "torihiki/tx/v1\n"
+       "chain=" chain-id "\n"
+       "account=" account "\n"
+       "nonce=" nonce "\n"
+       (str/join "\n" (map-indexed (fn [i v] (str "f" i "=" v)) (tx-fields tx)))
+       "\n"))
+
+(defn expected-nonce
+  "The only nonce this account may use next. Strictly sequential rather than
+  merely increasing: a gap would let a holder sign several transactions and
+  choose their order later, which is a reordering primitive handed to whoever
+  holds the key."
+  [ex account]
+  (inc (get-in ex [:nonces account] 0)))
+
+(def agent-forbidden
+  "What a delegated key may NEVER do, however long it lives.
+
+  An agent wallet exists so a trading program can hold a key that is useless to
+  whoever steals it. That is only true if the key cannot move money out and
+  cannot extend its own authority:
+
+  - `:withdraw` — the whole point. A stolen agent key that can withdraw is a
+    stolen account.
+  - `:withdraw-settle` — says money left the exchange. It is the bridge's
+    signature anyway, but an agent of the bridge must not be able to speak for
+    it.
+  - `:authorize-agent` — an agent that can mint agents is an owner.
+  - `:revoke-agent` — an agent that can revoke could lock the owner out of
+    their own account, which is the same loss by a different route.
+
+  Everything else — orders, cancels, amends, triggers, deposits — is what a
+  trading program does, and none of it can take the money anywhere the owner
+  did not already control."
+  #{:withdraw :withdraw-settle :authorize-agent :revoke-agent})
+
+(defn agent-of
+  "The record for `pubkey` acting as an agent of `account`, or nil.
+
+  Expiry is a BLOCK HEIGHT, not a wall clock. The engine has no clock, and a
+  timestamp would make the moment a key stops working depend on which
+  validator you asked."
+  [ex account pubkey]
+  (when-let [a (get-in ex [:agents account pubkey])]
+    (when (or (nil? (:expires a)) (> (:expires a) (:height ex 0)))
+      a)))
+
+(defn check
+  "nil when `signed` may be applied as `account`, otherwise a keyword from
+  `reasons`. Pure — `verify-fn` does the cryptography and `derive-fn` the
+  hashing.
+
+  `derive-fn` maps a public key to the only account id it may CLAIM. Supplying
+  one is what stops a proposer from binding an id it does not hold the key
+  for; omitting it leaves ids first-come. Already-bound accounts are unchanged
+  either way: the binding is immutable and the key must match.
+
+  ## Two kinds of signer
+
+  The owner key is bound to the account and may do anything. An AGENT key is
+  authorised by the owner, expires at a block height, and may not do what
+  `agent-forbidden` lists — a key a trading program can hold that is useless to
+  whoever steals it.
+
+  An agent is never checked against `derive-fn`: an agent id deliberately does
+  not derive its principal's account, which is what makes it a different key
+  rather than a copy of the same one."
+  ([ex signed chain-id verify-fn] (check ex signed chain-id verify-fn nil))
+  ([ex {:keys [tx account nonce sig pubkey]} chain-id verify-fn derive-fn]
+   (let [bound (get-in ex [:account-keys account])
+         agent (when (and bound (not= bound pubkey)) (agent-of ex account pubkey))]
+     (cond
+       (not (integer? account)) :missing-account
+       (or (nil? sig) (nil? pubkey)) :unsigned
+       (and bound (not= bound pubkey) (nil? agent)) :wrong-key
+       (and agent (contains? agent-forbidden (:tx tx))) :agent-may-not
+       ;; Only checked when the account is UNBOUND: this decides who may claim
+       ;; an id, not who may keep using one they already hold. An agent cannot
+       ;; reach here — an unbound account has no owner to have authorised one.
+       (and (nil? bound) derive-fn (not= account (derive-fn pubkey)))
+       :not-your-account
+       (not= nonce (expected-nonce ex account)) :bad-nonce
+       (not (verify-fn pubkey (signing-payload chain-id account nonce tx) sig))
+       :bad-signature
+       :else nil))))
+
+(defn accept
+  "Record that this account's nonce was consumed and its key is bound.
+
+  The nonce is consumed even when the transaction later fails validation. The
+  account holder authorised THAT nonce for THAT transaction; letting a
+  rejected transaction leave the nonce unspent would make the signature
+  reusable, which is exactly what the nonce exists to prevent. Only a failure
+  of authentication itself leaves the state untouched, because such a message
+  was never from the account at all.
+
+  The key binding is only ever set from an OWNER signature. `check` refuses an
+  agent on an unbound account, so an agent key cannot arrive here as the first
+  key an account ever saw — but the binding is written as `or` rather than
+  overwritten, so even if it could, it would not take the account over."
+  [ex {:keys [account nonce pubkey]}]
+  (-> ex
+      (assoc-in [:nonces account] nonce)
+      (update-in [:account-keys account]
+                 #(or % (when (nil? (get-in ex [:agents account pubkey])) pubkey)))))

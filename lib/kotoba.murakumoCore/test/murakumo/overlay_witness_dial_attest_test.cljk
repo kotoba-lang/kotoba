@@ -1,0 +1,108 @@
+;; murakumo.overlay-witness-dial-attest-test — nbb test for the
+;; dial+sign pipeline (ADR-2607110300). A real Node http.createServer
+;; stands in for a cloud-murakumo witness-rpc endpoint (same wire
+;; contract, no cross-repo dependency -- matches witness_dial.cljs's own
+;; discipline), and a real Ed25519 keypair proves the produced
+;; attestation's signature independently verifies.
+;;
+;; Run: kbb --backend sci --classpath "src:test:../witness-quorum/src" \
+;;        test/murakumo/overlay_witness_dial_attest_test.cljk
+
+(ns murakumo.overlay-witness-dial-attest-test
+  (:require [cljs.test :refer [deftest is testing async run-tests]]
+            [cljs.reader :as edn]
+            ["http" :as http]
+            [murakumo.overlay.witness-dial-attest :as wda]
+            [kotoba.lang.witness-quorum.signer :as signer]
+            [kotoba.lang.witness-quorum.attestation :as attestation]))
+
+(defn- respond! [handler res chunks]
+  (let [body (.toString (js/Buffer.concat (clj->js @chunks)))
+        envelope (edn/read-string body)
+        response (handler (:payload envelope))]
+    (.writeHead res 200 #js {"content-type" "application/edn"})
+    (.end res (pr-str {:type "cloud-murakumo.witness-rpc-response" :version 1 :payload response}))))
+
+(defn- handle-request! [handler req res]
+  (let [chunks (atom [])]
+    (.on req "data" (fn [c] (swap! chunks conj c)))
+    (.on req "end" (fn [] (respond! handler res chunks)))))
+
+(defn- fake-witness-server! [port handler]
+  (let [server (http/createServer (fn [req res] (handle-request! handler req res)))]
+    (.listen server port)
+    server))
+
+(defn- honest-recompute-handler [payload]
+  (if (= (:claimed-cids payload) ["bafy-x" "bafy-y"])
+    {:layer :deterministic :verdict :accept}
+    {:layer :deterministic :verdict :reject :reason "recompute mismatch"}))
+
+(defn- rule []
+  {:v 1 :nsid "test.nbb-pipeline"
+   :schema-ref {:content-hash (apply str (repeat 64 "a"))}
+   :policy-ref {:content-hash (apply str (repeat 64 "b"))}
+   :cell-ref {:content-hash (apply str (repeat 64 "c"))}})
+
+(deftest produce-http-witnessed-attestation-accepts-a-matching-claim
+  (async done
+    (let [server (fake-witness-server! 28900 honest-recompute-handler)
+          seed (js/Uint8Array. (clj->js (range 32)))
+          pubkey (signer/ed25519-public-key-bytes seed)
+          cell {:node "murakumo-nbb-worker" :cell-id "witness" :key "murakumo-nbb-worker::witness"}]
+      (-> (wda/produce-http-witnessed-attestation!
+           {:record-uri "at://x/1" :record-cid "bafy-nbb-pipeline-1"
+            :record {:inv {:job/id "j1"} :claimed-cids ["bafy-x" "bafy-y"]}
+            :cell cell :rule (rule) :signer (signer/make-ed25519-cell-signer seed)
+            :witness-url "http://127.0.0.1:28900/witness"})
+          (.then (fn [att]
+                   (is (= :accept (:verdict att)))
+                   (is (= "murakumo-nbb-worker" (:cell-node att)))
+                   (let [canonical (attestation/canonical-attestation-bytes
+                                     {:record-cid (:record-cid att) :cell-id (:cell-id att)
+                                      :verdict (:verdict att) :reason (or (:reason att) "")
+                                      :membrane-version (:membrane-version att) :attested-at (:attested-at att)})]
+                     (is (true? (signer/verify-ed25519-signature canonical (:signature att) pubkey))))
+                   (.close server)
+                   (done)))
+          (.catch (fn [e] (is false (str "unexpected error: " (.-message e))) (.close server) (done)))))))
+
+(deftest produce-http-witnessed-attestation-rejects-a-mismatched-claim
+  (async done
+    (let [server (fake-witness-server! 28901 honest-recompute-handler)
+          seed (js/Uint8Array. (clj->js (repeat 32 7)))
+          pubkey (signer/ed25519-public-key-bytes seed)
+          cell {:node "murakumo-nbb-worker-2" :cell-id "witness" :key "murakumo-nbb-worker-2::witness"}]
+      (-> (wda/produce-http-witnessed-attestation!
+           {:record-uri "at://x/2" :record-cid "bafy-nbb-pipeline-2"
+            :record {:inv {:job/id "j2"} :claimed-cids ["bafy-x" "bafy-FRAUD"]}
+            :cell cell :rule (rule) :signer (signer/make-ed25519-cell-signer seed)
+            :witness-url "http://127.0.0.1:28901/witness"})
+          (.then (fn [att]
+                   (is (= :reject (:verdict att)))
+                   (is (some? (:reason att)))
+                   (let [canonical (attestation/canonical-attestation-bytes
+                                     {:record-cid (:record-cid att) :cell-id (:cell-id att)
+                                      :verdict (:verdict att) :reason (or (:reason att) "")
+                                      :membrane-version (:membrane-version att) :attested-at (:attested-at att)})]
+                     (is (true? (signer/verify-ed25519-signature canonical (:signature att) pubkey))
+                         "a :reject verdict is signed just as validly as :accept -- authentic slashing evidence"))
+                   (.close server)
+                   (done)))
+          (.catch (fn [e] (is false (str "unexpected error: " (.-message e))) (.close server) (done)))))))
+
+(deftest produce-http-witnessed-attestation-fails-closed-when-endpoint-unreachable
+  (async done
+    (let [seed (js/Uint8Array. (clj->js (range 32)))
+          cell {:node "murakumo-nbb-worker-3" :cell-id "witness" :key "murakumo-nbb-worker-3::witness"}]
+      (-> (wda/produce-http-witnessed-attestation!
+           {:record-uri "at://x/3" :record-cid "bafy-nbb-pipeline-3"
+            :record {:inv {:job/id "j3"} :claimed-cids ["bafy-x"]}
+            :cell cell :rule (rule) :signer (signer/make-ed25519-cell-signer seed)
+            :witness-url "http://127.0.0.1:28902/witness"}) ;; nothing listens here
+          (.then (fn [att]
+                   (is (= :reject (:verdict att)) "unreachable endpoint -> :reject, not a silent :accept")
+                   (done)))
+          (.catch (fn [e] (is false (str "unexpected error: " (.-message e))) (done)))))))
+
+(run-tests)

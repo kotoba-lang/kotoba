@@ -1,0 +1,192 @@
+(ns browser-origin
+  ;; No :export: schemas enable record-new/record-get; `main` is the KIR
+  ;; self-check entry. JVM-free amu admission compiles this whole module.
+  ;;
+  ;; A `.kotoba` port of `browser.origin` (ADR-2607270100 §10 form A: pure
+  ;; functions, no capabilities, kotoba/pure profile). Not a WHATWG URL
+  ;; parser: the same deterministic subset -- scheme://authority/path plus
+  ;; kotoba internal URLs. `browser.origin` stays the host-facing ns; this
+  ;; module is the pure decision core, gated JVM-free.
+  ;;
+  ;; NO REGEX. Kotoba has no regex head, so the anchored
+  ;; `^([A-Za-z][A-Za-z0-9+.-]*):(.*)$` and the `.indexOf` / `.lastIndexOf` /
+  ;; `str/ends-with?` / `str/starts-with?` of the host are hand-written
+  ;; code-point scans, exactly as the css port does. Every needle here is
+  ;; single-byte ASCII (':' 58, '/' 47, '@' 64, ':'+digits for default
+  ;; ports) and every cursor advance steps over whole one-byte code points,
+  ;; so string-code-point-at / string-substring can never trap on a
+  ;; split UTF-8 code point.
+  ;;
+  ;; parity: the fixtures in browser/test/browser/origin_test.cljk
+  ;; (origin-normalizes-scheme-and-authority / same-origin-* /
+  ;; parse-url-strips-userinfo / parse-url-normalizes-default-port /
+  ;; parse-url-leaves-non-default-port) are reproduced in `main` below.
+  (:schemas {:browser.origin/parsed [:record :browser.origin/parsed
+                                     [[:url :string] [:scheme :string]
+                                      [:authority :string] [:path :string]
+                                      [:origin :string]]]}))
+
+;; --- char classes --------------------------------------------------------
+
+(defn scheme-cp? [cp :i64] :bool
+  ;; [A-Za-z0-9+.-]: '+' 43 '-' 45 '.' 46, 0-9 48..57, A-Z 65..90, a-z 97..122.
+  ;; Nested if, not or: or yields i64 in this profile.
+  (if (= cp 43) true
+      (if (= cp 45) true
+          (if (= cp 46) true
+              (if (< cp 48) false
+                  (if (<= cp 57) true
+                      (if (< cp 65) false
+                          (if (<= cp 90) true
+                              (if (< cp 97) false
+                                  (if (<= cp 122) true false))))))))))
+
+(defn letter-cp? [cp :i64] :bool
+  ;; First scheme char must be [A-Za-z] (the regex's `[A-Za-z]`).
+  (if (< cp 65) false
+      (if (<= cp 90) true
+          (if (< cp 97) false
+              (if (<= cp 122) true false)))))
+
+;; --- primitive scans (code-point safe) -----------------------------------
+
+(defn index-of-cp [s :string needle :i64 i :i64] :i64
+  ;; Byte index of the first `needle` at or after i, or -1. `needle` and every
+  ;; byte stepped over are single-byte ASCII (<0x80), so the cursor stays on
+  ;; a code-point boundary.
+  (if (>= i (string-length s)) (- 0 1)
+      (if (= (string-code-point-at s i) needle) i
+          (index-of-cp s needle (+ i 1)))))
+
+(defn last-index-of [s :string needle :i64 acc :i64 i :i64] :i64
+  ;; Byte index of the LAST `needle`, or acc (init -1). Forward scan tracking
+  ;; the most recent hit; the .cljc's `(subs awi (inc at))` needs lastIndexOf,
+  ;; e.g. `user@sub@host` -> host.
+  (if (>= i (string-length s)) acc
+      (if (= (string-code-point-at s i) needle)
+        (last-index-of s needle i (+ i 1))
+        (last-index-of s needle acc (+ i 1)))))
+
+(defn scheme-scan [s :string i :i64] :i64
+  ;; Index of the ':' (58) that closes a scheme run begun at index 1, or -1
+  ;; when a non-scheme char or end-of-string is reached first.
+  (if (>= i (string-length s)) (- 0 1)
+      (let [cp (string-code-point-at s i)]
+        (if (= cp 58) i
+            (if (scheme-cp? cp) (scheme-scan s (+ i 1))
+                (- 0 1))))))
+
+(defn starts-with-slashes [s :string] :bool
+  ;; `(str/starts-with? rest "//")`.
+  (if (< (string-length s) 2) false
+      (if (= (string-code-point-at s 0) 47)
+        (if (= (string-code-point-at s 1) 47) true false)
+        false)))
+
+(defn ends-with [s :string suffix :string] :bool
+  ;; `(str/ends-with? authority (str ":" default-port))`.
+  (if (> (string-length suffix) (string-length s)) false
+      (string=? (string-substring s
+                                  (- (string-length s) (string-length suffix))
+                                  (string-length s))
+                suffix)))
+
+;; --- default-port normalization (RFC 6454 origin comparison) -------------
+
+(defn default-port-for [scheme :string] :string
+  ;; The .cljc `default-ports` map: {"http" "80" "https" "443" "ws" "80"
+  ;; "wss" "443"}. "" = no default declared for this scheme.
+  (option-value-of [:option :string]
+                   (typed-map-get [:map :string :string]
+                                  (typed-map-new [:map :string :string]
+                                                 "http" "80" "https" "443"
+                                                 "ws" "80" "wss" "443")
+                                  scheme)
+                   ""))
+
+(defn strip-default-port [scheme :string authority :string] :string
+  ;; Removes a trailing `:<port>` when port is the scheme's own default; any
+  ;; OTHER explicit port (e.g. :8443) is left untouched. The .cljc computes
+  ;; `(- (count authority) (inc (count default-port)))` -- suffix length is
+  ;; that same amount, and string-substring takes byte offsets.
+  (let [dp (default-port-for scheme)]
+    (if (= (string-length dp) 0) authority
+        (let [suffix (string-concat ":" dp)]
+          (if (ends-with authority suffix)
+            (string-substring authority 0
+                              (- (string-length authority)
+                                 (string-length suffix)))
+            authority)))))
+
+;; --- parse-url -----------------------------------------------------------
+;; The .cljc is `re-matches #"^([A-Za-z][A-Za-z0-9+.-]*):(.*)$"`, which is
+;; anchored: a scheme is present exactly when s starts with a letter and a ':'
+;; terminates a run of [A-Za-z0-9+.-] started after that first letter; `rest`
+;; is everything after the ':' (possibly empty).
+
+(defn parse-url [url :string] [:ref :browser.origin/parsed]
+  (if (= (string-length url) 0)
+    (record-new [:ref :browser.origin/parsed] url "" "" url "opaque:")
+    (if (letter-cp? (string-code-point-at url 0))
+      (let [c (scheme-scan url 1)]
+        (if (>= c 0)
+          (let [scheme (string-fold-case (string-substring url 0 c))
+                rest (string-substring url (+ c 1) (string-length url))]
+            (if (starts-with-slashes rest)
+              (let [w (string-substring rest 2 (string-length rest))
+                    slash (index-of-cp w 47 0)
+                    awi (if (>= slash 0)
+                          (string-substring w 0 slash)
+                          w)
+                    at (last-index-of awi 64 (- 0 1) 0)
+                    host-part (if (>= at 0)
+                                (string-substring awi (+ at 1)
+                                                  (string-length awi))
+                                awi)
+                    authority (strip-default-port
+                               scheme (string-fold-case host-part))
+                    path (if (>= slash 0)
+                           (string-substring w slash (string-length w))
+                           "/")]
+                (record-new [:ref :browser.origin/parsed]
+                            url
+                            scheme
+                            authority
+                            path
+                            (string-concat scheme (string-concat "://" authority))))
+              (record-new [:ref :browser.origin/parsed]
+                          url scheme "" rest (string-concat scheme ":"))))
+          (record-new [:ref :browser.origin/parsed]
+                      url "" "" url "opaque:")))
+      (record-new [:ref :browser.origin/parsed]
+                  url "" "" url "opaque:"))))
+
+;; --- public API ----------------------------------------------------------
+
+(defn origin [url :string] :string
+  (record-get (parse-url url) :origin))
+
+(defn same-origin? [a :string b :string] :bool
+  (string=? (origin a) (origin b)))
+
+(defn internal? [url :string] :bool
+  ;; nil scheme in the .cljc is "" here; neither equals "kotoba".
+  (string=? (record-get (parse-url url) :scheme) "kotoba"))
+
+(defn main []
+  ;; Self-check: origin_test.clj fixtures via binary string-concat.
+  (string-length (string-concat
+ (string-concat
+ (string-concat
+ (string-concat
+ (string-concat
+ (string-concat
+ (string-concat
+ (origin "HTTPS://Example.Com/docs?q=1")
+ (origin "kotoba://shell/apps"))
+ (origin "mailto:jun@example.com"))
+ (origin "/relative/path"))
+ (origin "https://***@attacker.com/steal"))
+ (origin "https://example.com:443/page"))
+ (origin "https://example.com:8443/page"))
+ (origin "https://example.com:80/page"))))

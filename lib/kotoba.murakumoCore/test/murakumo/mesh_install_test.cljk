@@ -1,0 +1,128 @@
+(ns murakumo.mesh-install-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.text :as str]
+            [murakumo.mesh :as mesh]
+            [murakumo.mesh.install :as install]))
+
+(def pass "0123456789abcdef0123456789abcdef")
+(def token (install/format-token {:passphrase pass}))
+
+(deftest the-token-round-trips
+  (is (= "murakumo-mesh:v1:murakumo-mesh:0123456789abcdef0123456789abcdef:10.77.0.1:7077:5180" token))
+  (is (= {:mesh-id "murakumo-mesh" :passphrase pass :seed-address "10.77.0.1" :port 7077 :frequency 5180}
+         (install/parse-token token)))
+  (is (= (install/parse-token token) (install/parse-token (str "  " token "\n")))))
+
+(deftest a-malformed-token-parses-to-nil
+  (doseq [bad [nil "" "x" "murakumo-mesh:v2:a:b:c:d:e"
+                (str token ":extra")
+                "murakumo-mesh:v1:m:short:10.77.0.1:7077:5180"
+                (str "murakumo-mesh:v1:m;id:" pass ":10.77.0.1:7077:5180")
+                (str "murakumo-mesh:v1:m:" pass ":10.77.0.1;reboot:7077:5180")]]
+    (is (nil? (install/parse-token bad)) (pr-str bad))))
+
+(deftest seed-plan-hosts-the-endpoint-and-generates-the-secret-on-the-node
+  (let [{:keys [script units files]} (install/plan :seed {:node-name "seed-a"})]
+    (is (= ["murakumo-mesh-iface.service" "murakumo-mesh-wpa.service" "murakumo-enroll-seed.service"] units))
+    (is (str/includes? script "openssl rand -hex 16"))
+    (is (not (str/includes? script pass)) "no secret in the plan")
+    (is (str/includes? script "murakumo.mesh.seed-server"))
+    (is (str/includes? script "--bind 10.77.0.1"))
+    (is (str/includes? script "JOIN_TOKEN="))
+    (is (str/includes? script "FAILED: enrol endpoint not listening"))
+    (is (some #(= "0600" (:mode %)) files) "the config template is not world-readable")))
+
+(deftest seed-ledger-is-created-with-the-opt-in-only-if-absent
+  (let [{:keys [script]} (install/plan :seed {:node-name "seed-a"})]
+    (is (str/includes? script "[ -s /var/lib/murakumo/kekkai-tailnet.edn ] || printf '{:admit :auto-on-mesh :nodes {}}"))))
+
+(deftest joiner-plan-uses-the-token-and-starts-the-client
+  (let [{:keys [script units files]} (install/plan :joiner {:node-name "node-b" :token token})]
+    (is (= ["murakumo-mesh-iface.service" "murakumo-mesh-wpa.service" "murakumo-mesh-enroll.service"] units))
+    (is (not (str/includes? script pass)) "the passphrase is not in the script")
+    (is (str/includes? script "IFS= read -r MESH_PASSPHRASE") "it is read from stdin")
+    (is (str/includes? script "murakumo.mesh.client"))
+    (is (str/includes? script "--node-name node-b"))
+    (is (str/includes? script "--no-block") "a joiner's enrol may legitimately retry")
+    (is (not (str/includes? script "openssl")) "a joiner never mints the passphrase")
+    (let [addr (:content (first (filter #(str/ends-with? (:path %) "mesh-addr.sh") files)))]
+      (is (str/includes? addr "10.77.1.") "unadmitted joiners use the throwaway range")
+      (is (str/includes? addr "/var/lib/murakumo/mesh-address")))))
+
+(deftest joiner-matches-the-seed-channel-from-the-token
+  (let [t (install/format-token {:passphrase pass :frequency 5200})
+        {:keys [files]} (install/plan :joiner {:node-name "node-b" :token t})
+        conf (:content (first (filter #(str/ends-with? (:path %) "wpa-mesh.conf.tpl") files)))]
+    (is (str/includes? conf "frequency=5200"))))
+
+(deftest the-seed-address-is-fixed-and-the-joiner-one-is-not
+  (let [seed-addr (fn [p] (:content (first (filter #(str/ends-with? (:path %) "mesh-addr.sh") (:files p)))))]
+    (is (str/includes? (seed-addr (install/plan :seed {:node-name "s"})) "ip addr replace 10.77.0.1/16"))))
+
+(deftest hostile-values-never-reach-the-shell
+  (doseq [bad ["x; reboot" "A" "a b" "$(id)" "" "a\nb" "-x"]]
+    (is (thrown? Exception (install/plan :seed {:node-name bad})) (pr-str bad)))
+  (is (thrown? Exception (install/plan :seed {:node-name "ok" :iface "mesh0; id"})))
+  (is (thrown? Exception (install/plan :seed {:node-name "ok" :phy "phy0 && id"})))
+  (is (thrown? Exception (install/plan :joiner {:node-name "ok" :token "garbage"}))))
+
+(deftest every-file-is-written-via-a-quoted-heredoc-and-renamed-into-place
+  (let [{:keys [script files]} (install/plan :seed {:node-name "s"})]
+    (is (= (count files) (count (re-seq #"<<'MURAKUMO_EOF'" script))))
+    (is (= (count files) (count (re-seq #"mv [^ ]+\.tmp " script))))))
+
+(deftest the-secret-is-substituted-on-the-node-and-the-result-is-0600
+  (let [{:keys [script]} (install/plan :seed {:node-name "s"})]
+    (is (str/includes? script "sed \"s/@MESH_PASSPHRASE@/$MESH_PASSPHRASE/\""))
+    (is (str/includes? script "chmod 600 /etc/murakumo/wpa-mesh.conf"))))
+
+(deftest the-script-checks-the-radio-through-the-iface-script-not-by-assuming
+  (let [{:keys [files]} (install/plan :seed {:node-name "s"})
+        s (:content (first (filter #(str/ends-with? (:path %) "mesh-iface.sh") files)))]
+    (is (str/includes? s "mesh point"))))
+
+(deftest units-start-the-enrol-programs-on-kbb-with-the-repo-classpath
+  (let [{:keys [files]} (install/plan :seed {:node-name "s"})
+        u (:content (first (filter #(str/ends-with? (:path %) "murakumo-enroll-seed.service") files)))]
+    (is (str/includes? u "kbb -cp /opt/murakumo/src:/opt/murakumo/resources -m murakumo.mesh.seed-server"))
+    (is (not (str/includes? u "clojure")))))
+
+(deftest the-joiner-passphrase-travels-on-stdin-only
+  (let [{:keys [script stdin]} (install/plan :joiner {:node-name "node-b" :token token})
+        seed (install/plan :seed {:node-name "s"})]
+    (is (= (str pass "\n") stdin))
+    (is (nil? (:stdin seed)) "a seed mints its passphrase on the node; nothing to pipe")
+    (is (not (str/includes? (install/remote-command script) pass)))))
+
+(deftest the-remote-command-carries-the-script-as-base64-and-leaves-stdin-free
+  (let [cmd (install/remote-command "echo 'quo\"te' $(id)\n")]
+    (is (str/starts-with? cmd "sudo -n bash -c \"$(echo "))
+    (is (str/ends-with? cmd " | base64 -d)\""))
+    (is (not (str/includes? cmd "bash -s")) "the script is not on stdin")
+    (is (not (str/includes? cmd "$(id)")) "nothing of the script is visible to the transport's quoting")))
+
+(deftest the-stdin-reader-validates-what-it-is-given
+  (let [s install/read-passphrase-snippet]
+    (is (str/includes? s "bad passphrase on stdin"))
+    (is (str/includes? s "bad passphrase length on stdin"))
+    (is (str/includes? s "no passphrase on stdin"))))
+
+(deftest only-a-valid-printed-token-is-handed-on
+  (is (= token (install/join-token-from-output (str "noise\nJOIN_TOKEN=" token "\n"))))
+  (is (nil? (install/join-token-from-output "JOIN_TOKEN=garbage\n")))
+  (is (nil? (install/join-token-from-output nil))))
+
+(deftest the-seed-serves-operator-ops-on-a-root-only-socket-not-on-the-mesh
+  (let [{:keys [script files]} (install/plan :seed {:node-name "s"})
+        u (:content (first (filter #(str/ends-with? (:path %) "murakumo-enroll-seed.service") files)))]
+    (is (str/includes? u "--admin-socket /run/murakumo/enroll-admin.sock"))
+    (is (str/includes? u "RuntimeDirectory=murakumo"))
+    (is (str/includes? u "RuntimeDirectoryMode=0700"))
+    (is (str/includes? script "FAILED: admin socket missing"))
+    (is (str/includes? script "openssl curl") "ledger-cli reaches the socket with curl")
+    (is (not (str/includes? u "--admin-socket 10.77")) "never a network address")))
+
+(deftest a-joiner-has-no-admin-socket
+  (let [{:keys [files script]} (install/plan :joiner {:node-name "b" :token token})]
+    (is (not-any? #(str/includes? (:content %) "admin-socket") files))
+    (is (not (str/includes? script "curl")))))

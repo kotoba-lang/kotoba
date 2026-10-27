@@ -1,0 +1,113 @@
+(ns murakumo.infer.lease-test
+  "ADR-2610071730 P3b: quorum leases over three in-process voters (real
+  acceptors on temp dirs; the network is a function)."
+  (:require [cljs.test :refer [deftest is testing async run-tests]]
+            [murakumo.infer.lease :as lease]
+            ["node:fs" :as fs] ["node:os" :as os] ["node:path" :as path] ["node:crypto" :as crypto]))
+
+(def nodes [{:node "a" :enabled true} {:node "b" :enabled true} {:node "c" :enabled true}])
+(def topology {:state (atom {:payload {:nodes nodes}})})
+
+(defn- voters [n]
+  (vec (for [i (range n)]
+         (lease/start-acceptor! (.join path (.tmpdir os) (str "lease-" (.randomUUID crypto) "-" i)) topology))))
+
+(defn- client
+  "call!/hint! over the given acceptors; `down` is a set of indexes that do not answer."
+  [vs down]
+  {:n-voters (count vs)
+   :call! (fn [id op body]
+            (js/Promise.resolve
+             (vec (for [[i v] (map-indexed vector vs) :when (not (contains? @down i))]
+                    ;; round-trip through JSON like the wire does
+                    ((:handle! v) id (assoc (js->clj (js/JSON.parse (js/JSON.stringify (clj->js body))) :keywordize-keys true) :op op))))))
+   :hint! (fn [base]
+            (let [rs (for [[i v] (map-indexed vector vs) :when (not (contains? @down i))] ((:hint v) base))]
+              (if (< (count rs) 2) (js/Promise.reject (js/Error. "lease quorum unavailable (hint)"))
+                  (js/Promise.resolve (reduce max 0 rs)))))})
+
+(deftest decide-is-pure
+  (let [now 1000000 v {:node "a" :until (+ now lease/ttl-ms)}]
+    (is (= [:propose 1] (lease/decide "a" 0 nil now)))
+    (is (= :hold (first (lease/decide "a" 3 v now))))
+    (is (= [:propose 4] (lease/decide "a" 3 (assoc v :until (+ now 1000)) now)) "renew close to expiry")
+    (is (= :held-by (first (lease/decide "b" 3 v now))))
+    (is (= [:propose 4] (lease/decide "b" 3 (assoc v :until (- now lease/skew-ms 1)) now)) "take over after until + skew")
+    (is (= :held-by (first (lease/decide "b" 3 (assoc v :until (- now 10)) now))) "not before the skew margin")))
+
+(deftest acquire-hold-and-refuse
+  (async done
+    (let [vs (voters 3) down (atom #{}) c (client vs down)]
+      (-> (lease/acquire! (assoc c :me "a" :revision 1) "mishima-text" 0)
+          (.then (fn [r]
+                   (is (:held? r)) (is (= 1 (get-in r [:lease :epoch])))
+                   (lease/acquire! (assoc c :me "b" :revision 1) "mishima-text" 0)))
+          (.then (fn [r]
+                   (is (not (:held? r)) "b sees a's valid lease")
+                   (is (= "a" (get-in r [:lease :node])))
+                   (lease/acquire! (assoc c :me "a" :revision 1) "mishima-text" 0)))
+          (.then (fn [r] (is (:held? r)) (is (= 1 (get-in r [:lease :epoch])) "no renewal far from expiry")))
+          (.catch (fn [e] (is false (.-message e))))
+          (.finally done)))))
+
+(deftest concurrent-acquire-chooses-one
+  (async done
+    (let [vs (voters 3) down (atom #{}) c (client vs down)]
+      (-> (js/Promise.all #js [(lease/acquire! (assoc c :me "a" :revision 1) "img" 1)
+                               (lease/acquire! (assoc c :me "b" :revision 1) "img" 1)])
+          (.then (fn [[ra rb]]
+                   (is (= (get-in ra [:lease :node]) (get-in rb [:lease :node])) "both learn the same holder")
+                   (is (= 1 (count (filter :held? [ra rb]))) "exactly one holds")))
+          (.catch (fn [e] (is false (.-message e))))
+          (.finally done)))))
+
+(deftest one-voter-down-is-fine-two-is-closed
+  (async done
+    (let [vs (voters 3) down (atom #{2}) c (client vs down)]
+      (-> (lease/acquire! (assoc c :me "a" :revision 1) "x" 0)
+          (.then (fn [r]
+                   (is (:held? r) "2 of 3 voters")
+                   (reset! down #{1 2})
+                   (lease/acquire! (assoc c :me "b" :revision 1) "y" 0)))
+          (.then (fn [_] (is false "must not acquire with 1 of 3")))
+          (.catch (fn [e] (is (re-find #"quorum unavailable" (.-message e)))))
+          (.finally done)))))
+
+(deftest expired-lease-is-taken-over-and-old-epochs-collected
+  (async done
+    (let [vs (voters 3) down (atom #{}) c (client vs down)
+          base (lease/base-of "z" 0)
+          stale {:node "a" :class "z" :slot 0 :epoch 1 :until (- (js/Date.now) lease/skew-ms 5000) :revision 1}]
+      ;; a held epoch 1 long ago
+      (-> (lease/round! (:call! c) 3 (lease/id-of base 1) stale)
+          (.then (fn [_] (lease/acquire! (assoc c :me "b" :revision 1) "z" 0)))
+          (.then (fn [r]
+                   (is (:held? r) "b takes over after expiry")
+                   (is (= 2 (get-in r [:lease :epoch])))
+                   ;; push epochs forward past keep-epochs and check the first is gone
+                   (reduce (fn [p e] (.then p (fn [_] (lease/round! (:call! c) 3 (lease/id-of base e)
+                                                                     {:node "b" :class "z" :slot 0 :epoch e :until (js/Date.now) :revision 1}))))
+                           (js/Promise.resolve nil) (range 3 8))))
+          (.then (fn [_]
+                   (is (= 7 ((:hint (first vs)) base)))
+                   (is (nil? (some #(= (lease/id-of base 1) %)
+                                   (map #(.replace % ".json" "") (array-seq (.readdirSync fs (:path (first vs)))))))
+                       "epoch 1 collected")))
+          (.catch (fn [e] (is false (.-message e))))
+          (.finally done)))))
+
+(deftest values-are-validated-by-voters
+  (let [[v] (voters 1)
+        id (lease/id-of (lease/base-of "q" 0) 1)]
+    (is (= false (:ok ((:handle! v) id {:op "accept" :ballot [1 "x"] :value {:node "zz" :class "q" :slot 0 :epoch 1 :until 1 :revision 1}})))
+        "unknown node")
+    (is (= false (:ok ((:handle! v) id {:op "accept" :ballot [1 "x"] :value {:node "a" :class "q" :slot 0 :epoch 2 :until 1 :revision 1}})))
+        "epoch must match the id")
+    (is (= false (:ok ((:handle! v) id {:op "accept" :ballot [1 "x"] :value {:node "a" :class "q" :slot 0 :epoch 1 :until (+ (js/Date.now) (* 3 lease/ttl-ms)) :revision 1}})))
+        "until bounded")
+    (is (= false (:ok ((:handle! v) "../etc" {:op "prepare" :ballot [1 "x"]}))) "id shape")))
+
+(defmethod cljs.test/report [:cljs.test/default :end-run-tests] [m]
+  (when-not (cljs.test/successful? m) (set! (.-exitCode js/process) 1)))
+
+(run-tests)

@@ -1,0 +1,666 @@
+(ns browser.demo-smoke-test
+  "Real, non-browser verification of `browser.demo`'s own WebSocket/Worker/
+  fetch() proofs -- the exact real `sample-html`/`ws-script1-source`/
+  `ws-script2-source`/`grant-demo-permissions`/`synchronous-fetch-fn`
+  functions `src/browser/demo.cljk`'s `init!` uses, imported directly (not
+  a re-typed copy), driven through the real `browser.session`/
+  `browser.compat.quickjs-runner` pipeline against a REAL local Node server
+  -- exactly the way `quickjs_websocket_smoke_test.cljs`/
+  `quickjs_worker_smoke_test.cljs`/`quickjs_fetch_smoke_test.cljs` already
+  verify each capability in isolation.
+
+  `browser-demo-real-generated-content-proof-test` below additionally
+  drives the SAME real `sample-html` (plus `demo/generated-content-css`,
+  the real CSS text `init!` now also passes as `session/load-html!`'s
+  `:css` argument -- see that fn's own docstring for why) through the
+  same real pipeline, proving `sample-html`'s real `<style>` block's
+  `::before`/`::after` generated content (`content: attr(...)` on
+  `#status-badge`, `content: counter(...)` numbering `#step-counter`'s
+  four real sibling `<li>`s) is genuinely resolved by the real
+  `cssom.core/apply-cascade` this repo depends on, and genuinely painted
+  into the real draw-ops the WebGL canvas renders from.
+
+  ## What this proves, and what it deliberately does NOT
+
+  `browser.demo/init!` itself cannot run under Node -- it calls
+  `(.getElementById js/document \"kotoba-gl\")` and
+  `kotoba.wasm.host.webgl/create-host!` needs a real `<canvas>` + WebGL
+  context, neither of which exist outside a real browser tab. This test
+  does not attempt to fake a DOM/WebGL environment; instead, exactly like
+  the three smoke tests it mirrors, it uses `kotoba.wasm.host/recording-host`
+  (no WebGL) and drives the SAME real capability-wiring functions `init!`
+  calls, in the SAME order, with the SAME real script sources -- proving
+  the actual demo content genuinely round-trips through real WebSocket/
+  Worker/fetch() when driven with a real local server. The only thing left
+  genuinely unverified by this test (or by any Node-based test) is the
+  real WebGL paint of the resulting DOM state -- that needs an actual
+  browser tab (see this repo's own verification discipline for `init!`'s
+  original flexbox/grid/paint proof, which was likewise only ever verified
+  live in a browser).
+
+  ## The real local server
+
+  A single combined Node server (this test's own `start-demo-server!`,
+  mirroring the THREE existing smoke tests' individually hand-rolled
+  servers, combined into one process -- exactly the shape
+  `scripts/demo-server.js` gives the real demo) serving:
+
+    - `GET /worker.js`      -- real JS source, `self.onmessage = function(e)
+                               { self.postMessage(e.data * 2); };` (same
+                               body `scripts/demo-server.js` serves).
+    - `GET /api/fetch-data` -- a real plain-text body (same body
+                               `scripts/demo-server.js` serves).
+    - `WS  /ws-echo`        -- a real, minimal, hand-rolled RFC6455 echo
+                               server (real HTTP-Upgrade handshake incl. a
+                               real Sec-WebSocket-Accept computation, real
+                               frame parsing/framing) -- verbatim the same
+                               algorithm as
+                               `quickjs_websocket_smoke_test.cljs`'s
+                               `websocket-echo-server`.
+
+  Real Node `http.get` (not `js/fetch` -- matching
+  `quickjs_worker_smoke_test.cljs`/`quickjs_fetch_smoke_test.cljs`'s own
+  precedent exactly) pre-fetches `/worker.js` and `/api/fetch-data` ahead
+  of building the session, then `browser.demo/synchronous-fetch-fn` wraps
+  those ALREADY-real responses into the synchronous `:fetch-fn` this
+  repo's contract needs (see that function's own docstring)."
+  (:require ["net" :as net]
+            ["http" :as http]
+            ["crypto" :as crypto]
+            [cljs.test :refer [deftest is async]]
+            [kotoba.lang.text :as str]
+            [browser.compat.quickjs-runner :as quickjs-runner]
+            [browser.demo :as demo]
+            [browser.dom-bridge :as dom-bridge]
+            [browser.net.websocket :as ws]
+            [browser.session :as session]
+            [kotoba.wasm.host :as host]))
+
+;; ---------------------------------------------------------------------
+;; A single, combined REAL local server: /worker.js + /api/fetch-data over
+;; plain http, plus a real, minimal RFC6455 echo on /ws-echo over the same
+;; port's raw 'upgrade' socket -- see namespace docstring. Ports
+;; test-cljs/browser/compat/quickjs_websocket_smoke_test.cljk's
+;; websocket-echo-server verbatim (same algorithm), combined with
+;; quickjs_worker_smoke_test.cljs's/quickjs_fetch_smoke_test.cljs's plain
+;; http handlers.
+;; ---------------------------------------------------------------------
+
+(def worker-script-source
+  "self.onmessage = function(e) { self.postMessage(e.data * 2); };")
+
+(def fetch-data-body
+  "hello real fetch, from the real kotoba-lang/browser demo server")
+
+(def ^:private websocket-magic "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
+
+(defn- accept-value
+  [key]
+  (-> (.createHash crypto "sha1")
+      (.update (str key websocket-magic))
+      (.digest "base64")))
+
+(defn- try-parse-frame
+  [^js buf]
+  (when (>= (.-length buf) 2)
+    (let [b0 (.readUInt8 buf 0)
+          b1 (.readUInt8 buf 1)
+          opcode (bit-and b0 0x0F)
+          masked? (not (zero? (bit-and b1 0x80)))
+          len0 (bit-and b1 0x7F)
+          header-extra (cond (= len0 126) 2 (= len0 127) 8 :else 0)
+          mask-len (if masked? 4 0)]
+      (when (>= (.-length buf) (+ 2 header-extra mask-len))
+        (let [payload-len (cond
+                             (= len0 126) (.readUInt16BE buf 2)
+                             (= len0 127) (js/Number (.readBigUInt64BE buf 2))
+                             :else len0)
+              mask-offset (+ 2 header-extra)
+              payload-offset (+ mask-offset mask-len)
+              total (+ payload-offset payload-len)]
+          (when (>= (.-length buf) total)
+            (let [mask-key (when masked? (.slice buf mask-offset (+ mask-offset 4)))
+                  raw (.slice buf payload-offset total)
+                  payload (if masked?
+                            (let [out (js/Buffer.alloc payload-len)]
+                              (dotimes [i payload-len]
+                                (.writeUInt8 out
+                                             (bit-xor (.readUInt8 raw i)
+                                                      (.readUInt8 mask-key (mod i 4)))
+                                             i))
+                              out)
+                            raw)]
+              {:opcode opcode :payload payload :consumed total})))))))
+
+(defn- write-frame!
+  [^js socket opcode ^js payload]
+  (let [len (.-length payload)
+        header (cond
+                 (< len 126)
+                 (js/Buffer.from #js [(bit-or 0x80 opcode) len])
+
+                 (< len 65536)
+                 (let [b (js/Buffer.alloc 4)]
+                   (.writeUInt8 b (bit-or 0x80 opcode) 0)
+                   (.writeUInt8 b 126 1)
+                   (.writeUInt16BE b len 2)
+                   b)
+
+                 :else
+                 (let [b (js/Buffer.alloc 10)]
+                   (.writeUInt8 b (bit-or 0x80 opcode) 0)
+                   (.writeUInt8 b 127 1)
+                   (.writeBigUInt64BE b (js/BigInt len) 2)
+                   b))]
+    (.write socket (js/Buffer.concat #js [header payload]))))
+
+(defn- drain-frames!
+  [^js socket state]
+  (loop []
+    (when-let [{:keys [opcode payload consumed]} (try-parse-frame (:buffer @state))]
+      (swap! state update :buffer #(.slice ^js % consumed))
+      (case opcode
+        1 (write-frame! socket 1 payload)
+        8 (write-frame! socket 8 (js/Buffer.alloc 0))
+        9 (write-frame! socket 0xA payload)
+        nil)
+      (recur))))
+
+(defn- handle-upgrade!
+  [^js req ^js socket ^js head]
+  (let [url-path (first (str/split (or (.-url req) "/") #"\?"))]
+    (if (not= url-path "/ws-echo")
+      (.destroy socket)
+      (let [accept-key (aget (.-headers req) "sec-websocket-key")]
+        (if-not accept-key
+          (.destroy socket)
+          (let [accept (accept-value accept-key)
+                response (str "HTTP/1.1 101 Switching Protocols\r\n"
+                              "Upgrade: websocket\r\n"
+                              "Connection: Upgrade\r\n"
+                              "Sec-WebSocket-Accept: " accept "\r\n"
+                              "\r\n")
+                state (atom {:buffer (if (and head (pos? (.-length head)))
+                                        head
+                                        (js/Buffer.alloc 0))})]
+            (.write socket response "ascii")
+            (drain-frames! socket state)
+            (.on socket "data"
+                 (fn [chunk]
+                   (swap! state update :buffer #(js/Buffer.concat #js [% chunk]))
+                   (drain-frames! socket state)))
+            (.on socket "error" (fn [_] nil))))))))
+
+(defn- start-demo-server!
+  "Start a real, combined local server: /worker.js + /api/fetch-data over
+   plain http, plus a real RFC6455 echo on /ws-echo -- see namespace
+   docstring. Returns a Promise of
+   {:server :http-origin \"http://127.0.0.1:<port>\"}."
+  []
+  (js/Promise.
+   (fn [resolve _reject]
+     (let [server (.createServer http
+                                 (fn [^js req ^js res]
+                                   (let [url-path (first (str/split (or (.-url req) "/") #"\?"))]
+                                     (cond
+                                       (and (= (.-method req) "GET") (= url-path "/worker.js"))
+                                       (do (.writeHead res 200 #js {"Content-Type" "text/javascript"
+                                                                    "Access-Control-Allow-Origin" "*"})
+                                           (.end res worker-script-source))
+
+                                       (and (= (.-method req) "GET") (= url-path "/api/fetch-data"))
+                                       (do (.writeHead res 200 #js {"Content-Type" "text/plain"
+                                                                    "Access-Control-Allow-Origin" "*"})
+                                           (.end res fetch-data-body))
+
+                                       :else
+                                       (do (.writeHead res 404)
+                                           (.end res "not found"))))))]
+       (.on server "upgrade" handle-upgrade!)
+       (.listen server 0 "127.0.0.1"
+                (fn []
+                  (let [port (.-port (.address server))]
+                    (resolve {:server server
+                              :http-origin (str "http://127.0.0.1:" port)}))))))))
+
+(defn- stop-demo-server!
+  "Stop the server AND drop the connections it already accepted.
+
+  `.close` only stops it accepting new ones; a socket that is already up keeps
+  the Node event loop alive, so the process never exits and the run never
+  ends. The WebSocket proof leaves exactly such a socket -- upgraded, attached
+  to this server -- so without `closeAllConnections` the suite hangs after
+  this test whether it passed or failed. Measured 2026-08-29: the process sat
+  at 0% CPU for six minutes with nothing left to do, and closing the GUEST's
+  side of the socket was not enough."
+  [{:keys [server]}]
+  (when (fn? (.-closeAllConnections server))
+    (.closeAllConnections server))
+  (.close server))
+
+(defn- real-http-get!
+  "A REAL `http.get` (Node's own built-in client, real loopback TCP)
+   against `url`. Unlike
+   `quickjs_worker_smoke_test.cljs`/`quickjs_fetch_smoke_test.cljs`'s own
+   `real-http-get!` (which can afford to drop response headers because
+   those tests load their page at the SAME origin as the fetch target,
+   sidestepping browser.net's CORS check entirely -- see
+   `quickjs_fetch_smoke_test.cljs`'s `run-script1!` docstring), THIS test
+   drives the real demo's OWN page origin (`kotoba://browser-demo/index`,
+   genuinely cross-origin from the real local server), so it must also
+   carry the real, server-sent `access-control-allow-origin` header through
+   into the wrapped response -- exactly what `browser.demo/real-prefetch!`'s
+   real, native `js/fetch` naturally captures via `Response.headers` in an
+   actual browser. Returns a Promise of a browser.net-shaped response map
+   ({:status :headers :body})."
+  [url]
+  (js/Promise.
+   (fn [resolve reject]
+     (-> (.get http url
+               (fn [^js res]
+                 (let [chunks (atom [])]
+                   (.on res "data" (fn [chunk] (swap! chunks conj chunk)))
+                   (.on res "end"
+                        (fn []
+                          (resolve {:status (.-statusCode res)
+                                    :headers (js->clj (.-headers res))
+                                    :body (.toString (js/Buffer.concat (clj->js @chunks)))}))))))
+         (.on "error" reject)))))
+
+;; ---------------------------------------------------------------------
+;; Drive browser.demo's own real functions against the real server above.
+;; ---------------------------------------------------------------------
+
+(defn- wait-ms
+  [ms]
+  (js/Promise. (fn [resolve _reject] (js/setTimeout resolve ms))))
+
+(def ^:private ws-echo-proof
+  "What the real server echoes back.
+
+  ⚠ KNOWN FAILING on this workstation as of 2026-08-29, and not diagnosed. The
+  echo never reaches `#ws-proof`: `onmessage` does not fire, and the element
+  still holds its placeholder. What has been ruled out:
+
+  - It is not the length of the wait. 500ms, then a second boundary of 3s
+    after a first delivery pass, both left the placeholder in place.
+  - It is not the WebSocket machinery. `browser.compat.quickjs-websocket-
+    smoke-test` drives the same `websocket-fn`, the same `run-script!`
+    delivery shape and the same 500ms boundary, and passes in the same run.
+  - It is not a leaked handle. Measured after the failure: zero TCP handles
+    open in the process.
+
+  What differs between the two: this one registers `onmessage` on a session
+  that has already run three script tags, a real Worker and a real fetch, and
+  its handler writes through `document.getElementById(...)` rather than
+  `document.title`. Which of those matters is not known.
+
+  ⚠ MEASURE THE MACHINE BEFORE BLAMING THE TEST. Measured 2026-08-29: this
+  test appeared to hang, and most of that was FOUR COPIES OF THE SUITE RUNNING
+  AT ONCE. `scripts/resource-guard.mjs` serialises the BUILD, not the test run
+  that follows it, so a retry loop that waits on the guard still launches
+  overlapping runs. Of the four, one held the listening server and did the
+  work; the other three sat at 0% CPU with no server, stalled before their
+  first `println`, having lost the race for it.
+
+  That explains the symptoms that had been read as a hang: silence before any
+  output, 0% CPU, no TCP handles, and a WebSocket echo that never arrived
+  (there was no server of one's own to echo it). Five successive diagnoses --
+  idle, syscall-blocked, promise recursion, heavy layout, an unsettling flow
+  -- were each drawn from whichever process state was caught, and the state
+  differed per copy.
+
+  What is still a real weakness, independent of that: `start-demo-server!`
+  stalls SILENTLY when it cannot serve. A test that cannot start its own
+  server should say so, not wait. That is worth fixing and is not fixed here.
+
+  A second measurement error of the same family, worth naming because it is
+  cheap to repeat: a `pgrep -f` for the node test bundle, taking the first
+  match, matches
+  the SHELL WRAPPER (`sh -c npm run compile:node-test && node ...`) before it
+  the node process. Several readings of `0% CPU, therefore idle` were
+  readings of the wrapper. Ask for the process you mean -- the real one is the
+  leaf, and it was at 80% CPU while the wrapper sat at 0%.
+
+  Three things that genuinely were holding the Node event loop have been found
+  and released -- the socket the guest opened, the connections the server had
+  already accepted (`.close` does not drop those), and the deadline's own
+  timer (`Promise.race` does not stop the loser). Each is correct on its own
+  terms; none of them was the cause of the apparent hang.
+
+  Named once so the wait and the assertion cannot drift apart."
+  "WebSocket proof: real echo round-trip -> \"hello from the real kotoba-lang/browser demo\"")
+
+(defn- with-deadline
+  "Bound the wait, and say what it was waiting for.
+
+  `cljs.test`'s `async` has no timeout of its own: a promise that never
+  settles leaves the whole run waiting forever, and a run that hangs looks
+  exactly like one that is merely slow -- the sixth of AGENTS.md's six
+  questions, applied to a test rather than a gate. Measured 2026-08-29 on this
+  workstation, this test DOES hang: the suite reaches
+  `browser.demo-smoke-test` and stops there, and the WebSocket echo never
+  reaches `#ws-proof` (one delivery pass costs ~8s, and two of them still
+  showed the placeholder). Racing a timer does not fix that -- it names it, so
+  the next run reports a failure with a reason instead of a suite that never
+  ends."
+  [ms label p]
+  ;; The timer must be CLEARED when the race settles. `Promise.race` does not
+  ;; stop the loser, and a pending `setTimeout` keeps the Node event loop
+  ;; alive for its full duration -- so an instrument added to stop the suite
+  ;; hanging was itself holding it open for two more minutes per test, at 0%
+  ;; CPU and with no sockets left, which looks exactly like the hang it was
+  ;; meant to expose. Measured 2026-08-29.
+  (let [timer (atom nil)]
+    (-> (js/Promise.race
+         #js [p
+              (js/Promise.
+               (fn [_ reject]
+                 (reset! timer
+                         (js/setTimeout
+                          #(reject (js/Error. (str "timed out after " ms
+                                                   "ms waiting for " label)))
+                          ms))))])
+        (.finally (fn [] (when-let [t @timer] (js/clearTimeout t)))))))
+
+(defn- close-open-connections!
+  "Close every socket the guest opened.
+
+  Leaving one open here is not a leak, it is a HANG: in Node an open socket
+  keeps the event loop alive, so the run never exits -- and a suite that never
+  exits looks exactly like one still working. Measured 2026-08-29: after the
+  WebSocket proof failed, the test process sat at 0% CPU for eleven minutes
+  with nothing left to do. `dispose-engine!` disposes the QuickJS VM; the
+  connections the guest asked that VM to open are a separate thing and nobody
+  was closing them."
+  [session]
+  (when-let [ws (:browser.session/websocket-fn session)]
+    (doseq [handle (vals (get-in session [:browser.session/quickjs-runtime-state
+                                          :quickjs-runtime/state
+                                          :websocket/handles]))]
+      (try (ws {:op :close :handle handle})
+           (catch :default _ nil)))))
+
+(defn- dispose-engine!
+  [session]
+  (when-let [engine (get-in session [:browser.session/script-engine :script-engine/engine])]
+    (when-let [dispose (:quickjs.engine/dispose engine)]
+      (dispose engine))))
+
+(defn- element-text
+  [document id]
+  (some->> (dom-bridge/get-element-by-id document id)
+           (dom-bridge/node-snapshot document)
+           :text-content))
+
+(defn- node-attr
+  [document id k]
+  (some->> (dom-bridge/get-element-by-id document id)
+           (dom-bridge/node-snapshot document)
+           :attrs
+           k))
+
+(defn- pseudo-content
+  "Mirrors `browser.demo`'s own (private) `pseudo-content` helper: a
+   pseudo-element's generated content is never a DOM node/mutation (see
+   that namespace's docstring), so there is no `:text-content` to read --
+   `cssom.core/apply-cascade` instead decorates the real element's own
+   `:attrs` with a synthetic `:pseudo/before` style map holding the
+   resolved `content` string, read here via the SAME
+   `browser.dom-bridge/get-element-by-id`+`node-snapshot` `element-text`
+   above uses, just its `:attrs` key instead of `:text-content`."
+  [document id]
+  (:content (node-attr document id :pseudo/before)))
+
+(defn- index-of-text
+  [texts marker]
+  (first (keep-indexed (fn [i x] (when (= x marker) i)) texts)))
+
+(defn- text-draw-ops
+  [page]
+  (mapv :text (filter #(= :text (:draw/op %)) (:browser/draw-ops page))))
+
+(defn- merged-marker+text
+  "The single `:draw/op :text` draw-op string that IS `marker` (a resolved
+   ::before generated-content prefix, e.g. \"1. \" or \"live: \") merged
+   directly onto its real anchor sibling's own real text (`anchor-text`),
+   or nil if no such combined draw-op was painted.
+
+   cssom.layout now MERGES generated-content text with an adjacent real
+   text-node sibling onto the same draw-op line (fixed in kotoba-lang/cssom
+   so `::before`/`::after` `content: attr()`/`counter()` shares a paint
+   line with its real sibling instead of stacking as its own separate
+   line), so the real painted draw-ops carry ONE combined entry like
+   \"1. Real HTML parsed...\" rather than two separate adjacent entries
+   (\"1. \" then \"Real HTML parsed...\"). This proves the merge really
+   happened in this pipeline's own real painted output. Mirrors
+   cssom.layout-test's own adjacency checks (e.g. `(mapv :text text-ops)`
+   compared against an exact expected ordered list), scoped to a known
+   anchor instead of the whole page's exact list so this test stays
+   robust to unrelated content elsewhere on the page."
+  [texts marker anchor-text]
+  (let [combined (str marker anchor-text)]
+    (when (index-of-text texts combined) combined)))
+
+(deftest browser-demo-real-websocket-worker-fetch-proofs-test
+  (async done
+    (let [server-atom (atom nil)
+          session-atom (atom nil)
+          fail! (fn [err]
+                  (is false (str "browser.demo real WS/Worker/fetch smoke test failed: "
+                                 (or (.-message err) err)
+                                 (if-let [d (ex-data err)] (str " ex-data=" (pr-str d)) ""))))
+          cleanup! (fn []
+                     (close-open-connections! @session-atom)
+                     (dispose-engine! @session-atom)
+                     (when-let [server @server-atom] (stop-demo-server! server))
+                     (done))]
+      (-> (with-deadline 120000 "the browser.demo WS/Worker/fetch flow"
+           (-> (start-demo-server!)
+               (.then (fn [server]
+                        (reset! server-atom server)
+                        (let [{:keys [http-origin]} server
+                              worker-url (str http-origin "/worker.js")
+                              fetch-url (str http-origin "/api/fetch-data")]
+                          (js/Promise.all #js [(real-http-get! worker-url)
+                                               (real-http-get! fetch-url)]))))
+               (.then (fn [results]
+                        (let [worker-response (aget results 0)
+                              fetch-response (aget results 1)
+                              {:keys [http-origin]} @server-atom
+                              worker-url (str http-origin "/worker.js")
+                              fetch-url (str http-origin "/api/fetch-data")
+                              ws-url (str (str/replace http-origin #"^http" "ws") "/ws-echo")]
+                          (is (= 200 (:status worker-response)))
+                          (is (= worker-script-source (:body worker-response))
+                              "expected the real server's real worker script body")
+                          (is (= 200 (:status fetch-response)))
+                          (is (= fetch-data-body (:body fetch-response))
+                              "expected the real server's real fetch-data body")
+                          (let [prefetched {worker-url worker-response fetch-url fetch-response}
+                                demo-profile (demo/grant-demo-permissions worker-url fetch-url ws-url)
+                                h (host/recording-host)
+                                base-session (session/new-session
+                                              (quickjs-runner/quickjs-session-opts
+                                               {:host h
+                                                :profile demo-profile
+                                                :fetch-fn (demo/synchronous-fetch-fn prefetched)
+                                                :websocket-fn (ws/websocket-fn)}))]
+                            {:worker-url worker-url :fetch-url fetch-url :ws-url ws-url
+                             :ready (session/ensure-script-engine! base-session)}))))
+               (.then (fn [{:keys [worker-url fetch-url ws-url ready]}]
+                        (-> ready
+                            (.then (fn [ready-session]
+                                     (reset! session-atom ready-session)
+                                     (is (= :ready (get-in ready-session [:browser.session/script-engine
+                                                                           :script-engine/status]))
+                                         "engine should be ready before running page scripts")
+                                     {:worker-url worker-url :fetch-url fetch-url :ws-url ws-url
+                                      :ready-session ready-session})))))
+               (.then (fn [{:keys [worker-url fetch-url ws-url ready-session]}]
+                        ;; The EXACT real HTML browser.demo/init! loads -- imported
+                        ;; directly, not a re-typed copy.
+                        (let [after (session/load-html!
+                                    ready-session
+                                    {:url "kotoba://browser-demo/index"
+                                     :html (demo/sample-html worker-url fetch-url)})
+                              generation (:browser.session/page-generation after)
+                              doc (get-in after [:browser.session/page :browser/document])]
+                          (reset! session-atom after)
+                          (println "browser.demo smoke: document.title after page scripts ->"
+                                   (pr-str (get-in after [:browser.session/page :browser/title])))
+                          (println "browser.demo smoke: #worker-proof after page scripts ->"
+                                   (pr-str (element-text doc "worker-proof")))
+                          (println "browser.demo smoke: #fetch-proof after page scripts ->"
+                                   (pr-str (element-text doc "fetch-proof")))
+                          (is (= "Kotoba Browser: real QuickJS + real cssom layout + real WebGL paint"
+                                 (get-in after [:browser.session/page :browser/title]))
+                              "the original document.title proof must still land unchanged")
+                          (is (= "Worker proof: real 2nd QuickJS context computed 21 * 2 -> 42"
+                                 (element-text doc "worker-proof"))
+                              (str "expected the real Worker's real reply (21 * 2 = 42), delivered by "
+                                   "script 3's snapshot install, in #worker-proof"))
+                          (is (= (str "fetch() proof: real HTTP response body -> \"" fetch-data-body "\"")
+                                 (element-text doc "fetch-proof"))
+                              "expected the real (pre-fetched) fetch() response body in #fetch-proof")
+                          ;; WebSocket needs a real wall-clock wait -- see
+                          ;; browser.demo's own namespace docstring and
+                          ;; quickjs_websocket_smoke_test.cljs.
+                          (let [opened (quickjs-runner/run-script!
+                                       after
+                                       {:script/type :classic
+                                        :script/url "kotoba://browser-demo/index/ws-open.js"
+                                        :script/generation generation
+                                        :script/source (demo/ws-script1-source ws-url)})]
+                            (-> (wait-ms 500)
+                                (.then (fn [_]
+                                         (quickjs-runner/run-script!
+                                          opened
+                                          {:script/type :classic
+                                           :script/url "kotoba://browser-demo/index/ws-deliver.js"
+                                           :script/generation generation
+                                           :script/source demo/ws-script2-source}))))))))
+               (.then (fn [final-session]
+                        (reset! session-atom final-session)
+                        (let [doc (get-in final-session [:browser.session/page :browser/document])
+                              ws-proof (element-text doc "ws-proof")]
+                          (println "browser.demo smoke: #ws-proof after real WS round-trip ->"
+                                   (pr-str ws-proof))
+                          (is (= ws-echo-proof ws-proof)
+                              "expected the real server's real echoed text in #ws-proof"))))))
+          (.catch fail!)
+          (.finally cleanup!)))))
+
+;; ---------------------------------------------------------------------
+;; Real ::before/::after generated content: content: attr(...) and
+;; content: counter(...), added to cssom.core/apply-cascade in a later
+;; session on kotoba-lang/cssom and wired into this demo's own
+;; sample-html/generated-content-css. Reuses the same real local server +
+;; session-building helpers as the WS/Worker/fetch proof test above (this
+;; demo's sample-html always includes its own real Worker/fetch <script>
+;; tags, needing the same real server behind it), but does not need the
+;; WebSocket round trip's real wall-clock wait at all -- generated content
+;; is fully resolved synchronously as part of the real cascade
+;; `session/load-html!` runs.
+;; ---------------------------------------------------------------------
+
+(deftest browser-demo-real-generated-content-proof-test
+  (async done
+    (let [server-atom (atom nil)
+          session-atom (atom nil)
+          fail! (fn [err]
+                  (is false (str "browser.demo real generated-content smoke test failed: "
+                                 (or (.-message err) err)
+                                 (if-let [d (ex-data err)] (str " ex-data=" (pr-str d)) ""))))
+          cleanup! (fn []
+                     (close-open-connections! @session-atom)
+                     (dispose-engine! @session-atom)
+                     (when-let [server @server-atom] (stop-demo-server! server))
+                     (done))]
+      (-> (with-deadline 120000 "the browser.demo generated-content flow"
+           (-> (start-demo-server!)
+               (.then (fn [server]
+                        (reset! server-atom server)
+                        (let [{:keys [http-origin]} server
+                              worker-url (str http-origin "/worker.js")
+                              fetch-url (str http-origin "/api/fetch-data")]
+                          (js/Promise.all #js [(real-http-get! worker-url)
+                                               (real-http-get! fetch-url)]))))
+               (.then (fn [results]
+                        (let [worker-response (aget results 0)
+                              fetch-response (aget results 1)
+                              {:keys [http-origin]} @server-atom
+                              worker-url (str http-origin "/worker.js")
+                              fetch-url (str http-origin "/api/fetch-data")
+                              ws-url (str (str/replace http-origin #"^http" "ws") "/ws-echo")
+                              prefetched {worker-url worker-response fetch-url fetch-response}
+                              demo-profile (demo/grant-demo-permissions worker-url fetch-url ws-url)
+                              h (host/recording-host)
+                              base-session (session/new-session
+                                            (quickjs-runner/quickjs-session-opts
+                                             {:host h
+                                              :profile demo-profile
+                                              :fetch-fn (demo/synchronous-fetch-fn prefetched)
+                                              :websocket-fn (ws/websocket-fn)}))]
+                          {:worker-url worker-url :fetch-url fetch-url
+                           :ready (session/ensure-script-engine! base-session)})))
+               (.then (fn [{:keys [worker-url fetch-url ready]}]
+                        (-> ready
+                            (.then (fn [ready-session]
+                                     (reset! session-atom ready-session)
+                                     {:worker-url worker-url :fetch-url fetch-url
+                                      :ready-session ready-session})))))
+               (.then (fn [{:keys [worker-url fetch-url ready-session]}]
+                        ;; The EXACT real sample-html AND the EXACT real CSS text
+                        ;; browser.demo/init! passes as :css -- imported directly,
+                        ;; not a re-typed copy. See browser.session/load-html!'s
+                        ;; own docstring for why :css must be passed explicitly
+                        ;; here: this pipeline does not auto-extract a real
+                        ;; <style> tag's own text back out of parsed HTML.
+                        (let [after (session/load-html!
+                                    ready-session
+                                    {:url "kotoba://browser-demo/index"
+                                     :html (demo/sample-html worker-url fetch-url)
+                                     :css demo/generated-content-css})
+                              page (:browser.session/page after)
+                              doc (:browser/document page)
+                              texts (text-draw-ops page)
+                              step-ids ["step-1" "step-2" "step-3" "step-4"]
+                              step-texts ["Real HTML parsed into a real kotoba.wasm.dom document"
+                                          "Real cssom cascade resolves ::before/::after generated content"
+                                          "Real box-model layout produces real draw-ops"
+                                          "Real WebGL rasterization paints the canvas"]]
+                          (reset! session-atom after)
+                          (println "browser.demo smoke: real ::before attr() proof -- #status-badge ->"
+                                   (pr-str (pseudo-content doc "status-badge")))
+                          (println "browser.demo smoke: real ::before counter() proof -- #step-counter lis ->"
+                                   (pr-str (mapv #(pseudo-content doc %) step-ids)))
+                          (is (= "live" (node-attr doc "status-badge" :data-status))
+                              "expected the real, served data-status=\"live\" HTML attribute")
+                          (is (= "live: " (pseudo-content doc "status-badge"))
+                              "content: attr(data-status) \": \" must resolve to the real element's own real attribute value")
+                          (is (= "Kotoba engine" (element-text doc "status-badge"))
+                              "the real child text itself must be untouched by the ::before rule")
+                          (is (= ["1. " "2. " "3. " "4. "] (mapv #(pseudo-content doc %) step-ids))
+                              "four real sibling <li>s must be numbered sequentially purely by CSS counters")
+                          (is (= step-texts (mapv #(element-text doc %) step-ids))
+                              "each real <li>'s own real text must be untouched by its ::before rule")
+                          (is (= "live: Kotoba engine" (merged-marker+text texts "live: " "Kotoba engine"))
+                              (str "the real painted draw-ops (what the WebGL canvas actually renders) must carry a "
+                                   "single merged draw-op combining the resolved ::before text directly onto the "
+                                   "real element's own real text (cssom.layout merges generated content onto the "
+                                   "same draw-op as its adjacent real text-node sibling)"))
+                          (doseq [[expected-number step-text] (map vector ["1. " "2. " "3. " "4. "] step-texts)]
+                            (is (= (str expected-number step-text) (merged-marker+text texts expected-number step-text))
+                                (str "expected a single merged draw-op combining " (pr-str expected-number)
+                                     " with " (pr-str step-text) " (cssom.layout merges each ::before counter() "
+                                     "prefix onto the same draw-op as its own <li>'s real text)")))
+                          (let [combined-order (into [(str "live: " "Kotoba engine")]
+                                                      (map str ["1. " "2. " "3. " "4. "] step-texts))
+                                idxs (map #(index-of-text texts %) combined-order)]
+                            (is (every? some? idxs)
+                                "every merged draw-op above must actually be found in the real painted draw-ops")
+                            (is (apply < idxs)
+                                "the merged draw-ops must appear in real document order (badge, then steps 1-4)")))))))
+          (.catch fail!)
+          (.finally cleanup!)))))

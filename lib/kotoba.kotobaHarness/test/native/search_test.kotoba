@@ -1,0 +1,86 @@
+(ns kotoba-harness.search-test
+  (:export [main])
+  (:require [kotoba-harness.data :as d] [kotoba-harness.catalog :as c]
+            [kotoba-harness.search :as s] [kotoba-harness.decision :as j]
+            [kotoba-harness.ast :as a])
+  (:schemas {:harness/test-run [:record :harness/test-run [[:state [:ref :harness/search]] [:requests [:list :document]]]]}))
+(defn- check [ok :bool] :i64 (if ok 0 1))
+(defn- answer [choices :document choice :string] :document
+  (let [probs (loop [i 0 out (document-map)]
+                (if (= i (document-count choices)) out
+                  (let [id (d/field (d/at choices i) :id)]
+                    (recur (+ i 1) (document-assoc out id (document-i64 (if (string=? (d/text id) choice) 1 0)))))))]
+    (document-map :choice (document-string choice) :probabilities probs :confidence (document-edn-read "0.9"))))
+(defn- equal-bodies? [got :document want :document] :bool
+  (loop [i 0]
+    (if (= i (document-count got)) true
+      (let [pair (option-value-of [:option :document] (document-map-entry-at got i) (document-vector))
+            expected (option-value-of [:option :document] (document-get want (d/at pair 0)) (document-null))]
+        (and (document-equal? (d/at pair 1) expected) (recur (+ i 1)))))))
+(defn- run [plan [:ref :harness/plan] script :document want :document escalate :bool] [:ref :harness/test-run]
+  (loop [state (s/advance (s/start plan escalate)) i 0 requests (typed-list-new [:list :document]) fuel 500]
+    (cond (or (= fuel 0) (string=? (s/phase state) "done") (string=? (s/phase state) "refused"))
+            (record-new [:ref :harness/test-run] state requests)
+          (string=? (s/phase state) "verify")
+            (let [pass (equal-bodies? (s/bodies state) want)]
+              (recur (s/verified state (document-map :passed (document-bool pass) :failures (document-string (if pass "0" "3")))) i requests (- fuel 1)))
+          :else
+            (let [choice (if (< i (document-count script)) (d/text (d/at script i)) "stop")]
+              (recur (s/answer state (answer (s/offered state) choice) (document-i64 0)) (+ i 1)
+                     (typed-list-conj [:list :document] requests (s/current-state state)) (- fuel 1))))))
+(defn- state [r [:ref :harness/test-run]] [:ref :harness/search] (record-get [:ref :harness/test-run] r :state))
+(defn- events [state [:ref :harness/search] key :keyword] :document
+  (let [audit (s/audit state)]
+    (loop [i 0 out (document-vector)]
+      (if (= i (vector-count audit)) out
+        (let [v (d/field (typed-list-nth [:list :document] audit i) key)]
+          (recur (+ i 1) (if (d/kind? v :null) out (document-vector-conj out v))))))))
+(defn- distribution [choice :string confidence :string probs :string] :document
+  (document-map :choice (document-string choice) :confidence (d/value (d/read-json confidence)) :probabilities (d/value (d/read-json probs))))
+(defn main [] :i64
+  (let [project (d/value (d/read-edn (typed-cap-call :io/read :string :string "")))
+        p (d/field project :program) plan (c/prepare p) want (d/field project :known)
+        script (d/value (d/read-json "[\"subtract\",\"literal-three\",\"argument-used\",\"stop\",\"stop\",\"maximum\",\"literal-zero\",\"subtract\",\"literal-three\",\"argument-used\",\"if-bool\",\"less-than\",\"literal-zero\",\"call-account-left\",\"argument-account-used\",\"less-than\",\"argument-service-used\",\"literal-one-hundred\",\"literal-false\"]"))
+        r (run plan script want true) result (state r) requests (record-get [:ref :harness/test-run] r :requests)
+        exhausted (state (run plan (document-vector) want true))
+        no-escalation (state (run plan script want false))
+        choices (document-vector (document-map :id (document-string "a")) (document-map :id (document-string "b")))
+        stages (d/field p :stages) functions (d/field p :functions)
+        out (c/splice p (d/text (d/field project :baseline)) want)
+        sibling-p (d/value (d/read-edn "{:goal \"g\" :stages [{:id \"s\" :goal \"g\" :operations [\"less-than\"] :calls [] :depends-on []}] :functions [{:id \"a\" :stage \"s\" :goal \"x < y\" :args [{:name \"x\" :type :i64} {:name \"y\" :type :i64}] :returns :bool} {:id \"b\" :stage \"s\" :args [{:name \"x\" :type :i64} {:name \"y\" :type :i64}] :returns :bool}] :literals [] :max-decisions 32 :max-depth 3 :candidate-limit 8}"))
+        siblings (run (c/prepare sibling-p) (d/value (d/read-json "[\"less-than\",\"argument-y\",\"argument-x\",\"stop\",\"argument-x\",\"argument-y\",\"less-than\",\"argument-y\",\"argument-x\"]"))
+                      (document-map (document-string "a") (document-string "(< x y)") (document-string "b") (document-string "(< y x)")) true)
+        sa (s/attempts (state siblings))
+        candidates (c/candidates p 0 (document-keyword :i64) 0)]
+    ;; The original six tests / 25 assertions, in their original order.
+    (+ (check (and (string=? (s/phase result) "done") (document-equal? (s/bodies result) want)))
+       (check (document-equal? (events result :event) (d/value (d/read-json "[\"verification-failed\",\"stop-escalation\",\"stop-escalation\"]"))))
+       (check (document-equal? (events result :rewound-to) (d/value (d/read-json "[\"argument-used\",\"literal-three\",\"subtract\"]"))))
+       (check (= (vector-count (s/attempts result)) 3))
+       (check (>= (string-index-of (document-edn-print (typed-list-nth [:list :document] requests (- (vector-count requests) 1))) "(- 3 used)") 0))
+       (check (document-equal? (d/field (typed-list-nth [:list :document] requests (- (vector-count requests) 1)) :verified-functions)
+                               (document-map (document-string "account-left") (document-string "(max 0 (- 3 used))"))))
+       (check (string=? (s/failure exhausted) "search-exhausted"))
+       (check (= (j/admit choices (distribution "a" "0.6" "{\"a\":0.6,\"b\":0.4}")) 0))
+       (check (< (j/admit choices (distribution "b" "0.4" "{\"a\":0.6,\"b\":0.4}")) 0))
+       (check (< (j/admit choices (distribution "a" "0.6" "{\"a\":0.6}")) 0))
+       (check (= (j/admit choices (distribution "a" "0.6" "{\"a\":0.6,\"b\":0.39}")) 0))
+       (check (< (j/admit choices (distribution "a" "0.6" "{\"a\":0.6,\"b\":0.3}")) 0))
+       (check (< (j/admit choices (distribution "c" "0.6" "{\"a\":0.6,\"b\":0.4}")) 0))
+       (check (not (string=? (c/failure (c/prepare (document-assoc p :stages (document-vector-assoc stages 0 (document-assoc (d/at stages 0) :operations (document-vector (document-string "filterv"))))))) "")))
+       (check (not (string=? (c/failure (c/prepare (document-assoc p :stages (document-vector-assoc stages 0 (document-assoc (d/at stages 0) :calls (document-vector (document-string "admit"))))))) "")))
+       (check (not (string=? (c/failure (c/prepare (document-assoc p :functions (document-vector-assoc functions 0 (document-assoc (d/at functions 0) :returns (document-keyword :string)))))) "")))
+       (check (= (string-length (d/text (d/value out))) (+ (string-length (d/text (d/field project :baseline))) (- (+ (string-length "(max 0 (- 3 used))") (string-length "(if (< 0 (account-left account-used)) (< service-used 100) false)")) 6))))
+       (check (>= (string-index-of (d/text (d/value out)) "(defn marker [] :i64 7)") 0))
+       (check (not (string=? (d/error (c/splice p "(ns x)\n" want)) "")))
+       (check (= (vector-count candidates) 6))
+       (check (< (j/admit (s/offered (s/advance (s/start plan true))) (answer (s/offered (s/advance (s/start plan true))) "less-than")) 0))
+       (check (string=? (s/failure no-escalation) "policy-stopped"))
+       (check (and (string=? (s/phase (state siblings)) "done") (document-equal? (s/bodies (state siblings)) (document-map (document-string "a") (document-string "(< x y)") (document-string "b") (document-string "(< y x)")))))
+       (check (and (= (vector-count sa) 3) (= (document-count (d/field (typed-list-nth [:list :document] sa 0) :bodies)) 1)
+                   (= (document-count (d/field (typed-list-nth [:list :document] sa 1) :bodies)) 1)
+                   (= (document-count (d/field (typed-list-nth [:list :document] sa 2) :bodies)) 2)
+                   (string=? (d/text (d/field (typed-list-nth [:list :document] sa 0) :function)) "a")
+                   (string=? (d/text (d/field (typed-list-nth [:list :document] sa 1) :function)) "a")
+                   (string=? (d/text (d/field (typed-list-nth [:list :document] sa 2) :function)) "b")))
+       (check (string=? (d/text (d/field (typed-list-nth [:list :document] (record-get [:ref :harness/test-run] siblings :requests) 0) :function-goal)) "x < y")))))

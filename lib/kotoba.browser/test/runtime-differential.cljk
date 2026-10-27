@@ -1,0 +1,435 @@
+(ns runtime-differential
+  "G3: the two JavaScript runtimes `browser.runtime` offers, on the same scripts.
+
+  `browser.runtime/registry` names two engines for `:javascript` -- `:quickjs`
+  (quickjs-ng, the incumbent WASM blob) and `:ecma262` (the Kotoba engine amu
+  compiles). Whether the second can take the first's slot is not a question
+  about either engine alone; it is a question about whether they ANSWER THE
+  SAME. So both are driven here, on page-script-shaped sources, and compared.
+
+  This is the instrument `kotoba-lang/cssom` points at a real Blink browser,
+  aimed at the runtime seam instead: the incumbent is the oracle.
+
+  Run:  kbb --backend sci test/runtime-differential.cljk [path/to/ecma262.mjs]
+
+  Exit codes
+    0  every case agrees, and the recorded divergences are exactly those below
+    1  a disagreement -- a NEW one, or a recorded one that has been fixed
+    2  the harness could not answer (an engine is missing, or no case ran),
+       which is NOT agreement and must never be read as one."
+  (:require [kotoba.lang.text :as str]
+            ["node:fs" :as fs]
+            ["node:path" :as path]))
+
+;; Page-script-shaped: what a <script> in a document actually does -- build
+;; strings, walk arrays, keep state in a closure, guard with try/catch. Bare
+;; arithmetic is already covered against V8 in the engine's own repo; what is
+;; measured HERE is the seam browser.runtime would swap.
+(def cases
+  ["var out = ''; for (var i = 0; i < 3; i = i + 1) { out = out + i; } out"
+   "var xs = [3, 1, 2]; xs.length"
+   "var xs = [1, 2, 3]; xs.join('-')"
+   "var xs = [1, 2, 3, 4]; xs.filter(function (x) { return x > 2; }).join(',')"
+   "var xs = [1, 2, 3]; xs.map(function (x) { return x * 2; }).join(',')"
+   "var xs = []; xs.push('a'); xs.push('b'); xs.join('')"
+   "var o = {tag: 'div', depth: 2}; o.tag + ':' + o.depth"
+   "var o = {}; o.k = 'v'; o.k"
+   "function counter() { var n = 0; return function () { n = n + 1; return n; }; } var c = counter(); c(); c(); c()"
+   "function fib(n) { return n < 2 ? n : fib(n - 1) + fib(n - 2); } fib(12)"
+   "var s = 'hello world'; s.toUpperCase ? 'has' : 'lacks'"
+   "var s = 'hello world'; s.indexOf('world')"
+   "var s = 'a,b,c'; s.split(',').length"
+   "var s = 'abcdef'; s.substring(1, 4)"
+   "try { null.x; 'no-throw' } catch (e) { 'caught' }"
+   "try { undefinedFn(); 'no-throw' } catch (e) { e.name }"
+   "try { throw new Error('boom'); } catch (e) { e.message }"
+   "var t = 0; try { throw 1; } catch (e) { t = 5; } finally { t = t + 10; } t"
+   "var i = 0; while (true) { if (i >= 4) { break; } i = i + 1; } i"
+   "var t = 0; for (var i = 0; i < 5; i = i + 1) { if (i == 2) { continue; } t = t + 1; } t"
+   "typeof document"
+   "typeof window"
+   "typeof []"
+   "typeof {}"
+   "typeof function () {}"
+   "'' + [1, 2, 3]"
+   "'' + {a: 1}"
+   "var r = []; r.push(1 === 1 ? 1 : 'a'); var bad = r.filter(function (x) { return x !== 1; }); bad.length === 0 ? 'PASS' : 'FAIL'"
+   "var o = {n: 2, twice: function () { return this.n * 2; }}; o.twice()"
+   "(function () { return 'iife'; })()"
+   "var a = [1, 2, 3]; a[1] = 9; a.join(',')"
+   "var n = 0; [1, 2, 3].forEach(function (x) { n = n + x; }); n"
+   "'x' + (1 + 2) + 'y'"
+   "var flag = false; flag || 'default'"
+   "var flag = 'set'; flag && flag"
+   ;; A real, permanent divergence, kept in the corpus ON PURPOSE: it is the
+   ;; one case that proves this gate can still fail.
+   "7 / 2"])
+
+(def known-divergences
+  "Cases where the two runtimes genuinely disagree, each with the reason.
+  Asserted EXACTLY: a divergence that appears, and one that disappears, both
+  fail the run rather than being absorbed."
+  {"7 / 2" "JS numbers are IEEE-754 doubles; this engine's are i64, so division truncates"})
+
+;; ---------------------------------------------------------------------------
+;; The DOM bridge, measured the same way
+;;
+;; The Kotoba engine never touches a document: the host injects a snapshot and
+;; the guest returns an EFFECT LOG the host replays. To check that the log says
+;; what a real engine would have DONE, quickjs-ng is given a `document` shim
+;; whose textContent setter writes the same log format. Then the two logs are
+;; compared -- so what is measured is the SEMANTICS of the bridge, not a string
+;; someone recorded once.
+;; ---------------------------------------------------------------------------
+
+(def dom-snapshot
+  "element id -> textContent, the state both engines start from."
+  {"ws-proof" ""
+   "result" "A"
+   "title" "hello"
+   "btn" ""
+   "out" "before"})
+
+(def dom-attrs
+  "element id -> its attributes. Only elements listed above can carry any."
+  {"btn" {"title" "press me" "class" "primary"}})
+
+(def document-title "the page title both engines start from" "Hello")
+
+(def dom-cases
+  ["document.getElementById('ws-proof').textContent = 'done';"
+   "var el = document.getElementById('ws-proof'); el.textContent = 'via a variable';"
+   "document.getElementById('result').textContent += ' + handler B fired';"
+   ;; Two writes, both to elements that exist: the log must keep their order.
+   "document.getElementById('result').textContent = '1'; document.getElementById('ws-proof').textContent = '2';"
+   ;; A write through a null: both engines must call it a TypeError.
+   "document.getElementById('a').textContent = '1';"
+   "document.getElementById('title').textContent"
+   "document.getElementById('nope')"
+   "document.getElementById('nope') ? 'found' : 'missing'"
+   "var el = document.getElementById('result'); el.textContent = 'new'; el.textContent"
+   "1 + 1"
+   "var el = document.getElementById('ws-proof'); el.textContent = 'x' + (1 + 2);"
+   ;; attributes, both directions
+   "document.getElementById('btn').getAttribute('title')"
+   "document.getElementById('btn').getAttribute('nope')"
+   "document.getElementById('btn').getAttribute('title') + '/' + document.getElementById('btn').getAttribute('class')"
+   "document.getElementById('btn').setAttribute('class', 'on');"
+   "var b = document.getElementById('btn'); b.setAttribute('title', 'new'); b.getAttribute('title')"
+   "document.getElementById('out').getAttribute('title')"
+   ;; the page itself and the log -- neither is an element
+   "document.title"
+   "document.title = 'Kotoba';"
+   "console.log('hello');"
+   "console.log('a', 'b');"
+   "var t = document.title; document.title = 'New'; t"
+   ;; setTimeout -- a registration, not a clock
+   "setTimeout(function () { }, 250);"
+   "setTimeout(function () { }, 5)"
+   "var a = setTimeout(function () { }, 1); var b = setTimeout(function () { }, 2); a + '/' + b"
+   ;; fetch -- a registration, not a network call
+   "fetch('/api/data');"
+   "fetch('/one'); fetch('/two');"
+   "fetch('/x').then(function (b) { });"
+   "typeof fetch('/x').then(function (b) { })"
+   ;; workers, sockets, and the property form of addEventListener
+   "var w = new Worker('/w.js');"
+   "var s = new WebSocket('ws://x');"
+   "var w = new Worker('/w.js'); w.postMessage('hi');"
+   "var s = new WebSocket('ws://x'); s.send('data');"
+   "var w = new Worker('/w.js'); w.onmessage = function (e) { };"
+   "document.getElementById('btn').onclick = function () { };"])
+
+(def known-dom-divergences
+  "Same contract as `known-divergences`: asserted exactly, in both directions."
+  {})
+
+(defn- field [name type body]
+  (str name "=" type (count body) ":" body))
+
+(defn- node-region
+  "The engine's node shape: text, then attributes under `@name`."
+  [id text]
+  (reduce-kv (fn [r k v] (str (field (str "@" k) "s" v) r))
+             (field "textContent" "s" text)
+             (get dom-attrs id {})))
+
+(defn- snapshot-region []
+  ;; `#document` is the reserved id the engine uses for the page itself.
+  (str (field "#document" "o" (field "title" "s" document-title))
+       (reduce-kv (fn [region id text]
+                    (str (field id "o" (node-region id text)) region))
+                  "" dom-snapshot)))
+
+(def ^:private quickjs-dom-shim
+  "A `document` for quickjs-ng that records what a real setter would have done,
+  in the log format the Kotoba engine emits. The getter answers from the
+  snapshot and is NOT updated by a write -- which is what the Kotoba engine
+  does too, and the reason `+=` is a meaningful case here."
+  (str "var __snap = " (js/JSON.stringify (clj->js dom-snapshot)) ";"
+       "var __fx = '';"
+       "function __f(v) { var s = String(v); return s.length + ':' + s; }"
+       "var __attrs = " (js/JSON.stringify (clj->js dom-attrs)) ";"
+       "var document = { getElementById: function (id) {"
+       "  if (!Object.prototype.hasOwnProperty.call(__snap, id)) { return null; }"
+       "  var o = {"
+       "    getAttribute: function (n) {"
+       "      var a = __attrs[id] || {};"
+       "      return Object.prototype.hasOwnProperty.call(a, n) ? a[n] : null;"
+       "    },"
+       "    setAttribute: function (n, v) {"
+       "      __fx += __f('setAttribute') + __f(id) + __f(__f(n) + __f(String(v)));"
+       "    }"
+       "  };"
+       "  Object.defineProperty(o, 'textContent', {"
+       "    get: function () { return __snap[id]; },"
+       "    set: function (v) { __fx += __f('textContent') + __f(id) + __f(String(v)); }"
+       "  });"
+       "  Object.defineProperty(o, 'onclick', { set: function (fn) {"
+       "      var k = __hs.length; __hs.push(fn);"
+       "      __fx += __f('addEventListener') + __f(id)"
+       "            + __f(__f('click') + __f(String(k))); } });"
+       "  return o;"
+       "}, title: " (js/JSON.stringify document-title) " };"
+       "Object.defineProperty(document, 'title', {"
+       "  get: function () { return " (js/JSON.stringify document-title) "; },"
+       "  set: function (v) { __fx += __f('title') + __f('#document') + __f(String(v)); }"
+       "});"
+       "var __handlers2 = [];"
+       "function setTimeout(fn, ms) {"
+       "  var n = __handlers2.length; __handlers2.push(fn);"
+       "  __fx += __f('setTimeout') + __f('#window') + __f(__f(String(ms)) + __f(String(n)));"
+       "  return n;"
+       "}"
+       "var __hs = [];"
+       "function Worker(url) {"
+       "  var n = __hs.length; __hs.push(null);"
+       "  __fx += __f('newWorker') + __f('#window') + __f(__f(url) + __f(String(n)));"
+       "  var o = { postMessage: function (m) {"
+       "      __fx += __f('postMessage') + __f('#wrk' + n) + __f(String(m)); } };"
+       "  Object.defineProperty(o, 'onmessage', { set: function (fn) {"
+       "      var k = __hs.length; __hs.push(fn);"
+       "      __fx += __f('addEventListener') + __f('#wrk' + n)"
+       "            + __f(__f('message') + __f(String(k))); } });"
+       "  return o;"
+       "}"
+       "function WebSocket(url) {"
+       "  var n = __hs.length; __hs.push(null);"
+       "  __fx += __f('newWebSocket') + __f('#window') + __f(__f(url) + __f(String(n)));"
+       "  var o = { send: function (m) {"
+       "      __fx += __f('send') + __f('#sock' + n) + __f(String(m)); } };"
+       "  Object.defineProperty(o, 'onmessage', { set: function (fn) {"
+       "      var k = __hs.length; __hs.push(fn);"
+       "      __fx += __f('addEventListener') + __f('#sock' + n)"
+       "            + __f(__f('message') + __f(String(k))); } });"
+       "  return o;"
+       "}"
+       "var __reqs = [];"
+       "function fetch(url) {"
+       "  var n = __reqs.length; __reqs.push(null);"
+       "  __fx += __f('fetch') + __f('#window') + __f(__f(url) + __f(String(n)));"
+       "  return { then: function (fn) { __reqs[n] = fn; return this; } };"
+       "}"
+       "var console = { log: function () {"
+       "  var a = Array.prototype.slice.call(arguments).map(String).join(' ');"
+       "  __fx += __f('log') + __f('#console') + __f(a);"
+       "} };"))
+
+(defn- quickjs-dom-answers [QJS]
+  (fn [src]
+    (let [ctx (.newContext QJS)
+          r (.evalCode ctx (str quickjs-dom-shim "\n" src "\n__fx"))
+          out (if (.-error r)
+                (let [e (.dump ctx (.-error r))]
+                  (.dispose (.-error r))
+                  (str "<error:" (or (some-> e .-name) "Error") ">"))
+                (let [v (.dump ctx (.-value r))] (.dispose (.-value r)) (str v)))]
+      (.dispose ctx)
+      out)))
+
+(defn- engine-dom-answers [m]
+  (fn [src]
+    (let [out ((aget m "eval-dom") src (snapshot-region))]
+      (if (str/starts-with? out "ERROR ")
+        ;; Keep the error's NAME. Flattening every failure to "Error" made the
+        ;; two engines look like they disagreed about `null.textContent = x`
+        ;; when both answered TypeError -- the harness was discarding the
+        ;; message, which is the third of AGENTS.md's six questions.
+        (let [msg (subs out 6)
+              i (str/index-of msg ": ")]
+          (str "<error:" (if i (subs msg 0 i) "Error") ">"))
+        out))))
+
+;; --- events ----------------------------------------------------------------
+;;
+;; `addEventListener` hands the host a function, which a guest with no
+;; capabilities cannot be called back through. The Kotoba engine returns the
+;; REGISTRATION (element, type, handler number) and takes firing as a second
+;; entry point that re-runs the script, clears the log, and calls handler n.
+;;
+;; quickjs-ng is given the same shape -- a shim that records registrations in
+;; the same format and keeps the functions in an array -- and then both are
+;; asked the same two questions: what did registering say, and what did firing
+;; do. Nothing about the comparison assumes the two engines hold state the
+;; same way, because neither is asked to.
+
+(def event-cases
+  "[source, handler-number-to-fire]"
+  [["document.getElementById('btn').addEventListener('click', function () { });" 0]
+   ["var r = document.getElementById('out'); document.getElementById('btn').addEventListener('click', function () { r.textContent = 'fired'; });" 0]
+   ["var m = 'from the capture'; var r = document.getElementById('out'); document.getElementById('btn').addEventListener('click', function () { r.textContent = m; });" 0]
+   ["var b = document.getElementById('btn'); var r = document.getElementById('out'); b.addEventListener('click', function () { r.textContent = 'A'; }); b.addEventListener('blur', function () { r.textContent = 'B'; });" 1]
+   ["var r = document.getElementById('out'); document.getElementById('btn').addEventListener('click', function () { r.textContent = r.textContent + '!'; });" 0]])
+
+(def known-event-divergences {})
+
+(def ^:private quickjs-event-shim
+  (str quickjs-dom-shim
+       "var __handlers = [];"
+       "document.getElementById = (function (inner) { return function (id) {"
+       "  var o = inner(id); if (o === null) { return null; }"
+       "  o.addEventListener = function (type, fn) {"
+       "    var n = __handlers.length; __handlers.push(fn);"
+       "    __fx += __f('addEventListener') + __f(id) + __f(__f(type) + __f(String(n)));"
+       "  };"
+       "  return o;"
+       "}; })(document.getElementById);"))
+
+(defn- quickjs-event-answers [QJS]
+  (fn [[src n]]
+    (let [ctx (.newContext QJS)
+          run (fn [code]
+                (let [r (.evalCode ctx code)]
+                  (if (.-error r)
+                    (let [e (.dump ctx (.-error r))]
+                      (.dispose (.-error r))
+                      (str "<error:" (or (some-> e .-name) "Error") ">"))
+                    (let [v (.dump ctx (.-value r))] (.dispose (.-value r)) (str v)))))
+          reg (run (str quickjs-event-shim "\n" src "\n__fx"))
+          fired (run (str "__fx = '';"
+                          "if (!__handlers[" n "]) { throw new ReferenceError('no such handler'); }"
+                          "__handlers[" n "]();"
+                          "__fx"))]
+      (.dispose ctx)
+      [reg fired])))
+
+(defn- engine-event-answers [m]
+  (fn [[src n]]
+    (let [clean (fn [out]
+                  (if (str/starts-with? out "ERROR ")
+                    (let [msg (subs out 6) i (str/index-of msg ": ")]
+                      (str "<error:" (if i (subs msg 0 i) "Error") ">"))
+                    out))]
+      [(clean ((aget m "eval-dom") src (snapshot-region)))
+       ;; The engine's third parameter is `:i64`, and the restricted-ESM
+       ;; artifact asserts that: a plain JS number is refused as `invalid-i64`.
+       (clean ((aget m "eval-dom-event") src (snapshot-region) (js/BigInt n)))])))
+
+(defn- refuse! [msg]
+  (println (str "REFUSED\t" msg))
+  (println "This is not agreement. Exit 2.")
+  (js/process.exit 2))
+
+(defn- render
+  "How a value prints. Both engines are asked for the STRING, so neither
+  harness-side conversion can invent an agreement the engines do not have."
+  [src]
+  (str "String((function(){ return eval(" (js/JSON.stringify src) "); })())"))
+
+(defn- quickjs-answers
+  "The incumbent's answers, from the same quickjs-emscripten build
+  `browser.compat.quickjs-wasm` names (:singlefile-cjs-release-sync)."
+  [ctx]
+  (fn [src]
+    (let [r (.evalCode ctx (render src))]
+      (if (.-error r)
+        (let [e (.dump ctx (.-error r))]
+          (.dispose (.-error r))
+          (str "<error:" (or (some-> e .-name) "Error") ">"))
+        (let [v (.dump ctx (.-value r))]
+          (.dispose (.-value r))
+          (str v))))))
+
+(defn- engine-answers
+  "The Kotoba engine's answers, through the export `browser.runtime`'s
+  :runtime/eval seam would call."
+  [m]
+  (fn [src]
+    (let [ok ((aget m "eval-ok") src)]
+      (if (or (= ok 0) (= ok (js/BigInt 0)))
+        "<error:Error>"
+        ((aget m "eval-string") src)))))
+
+(defn- report-one [label answers known]
+  (let [diffs (remove (fn [[_ a b]] (= a b)) answers)
+        found (set (map first diffs))
+        expected (set (keys known))
+        new-diffs (remove #(contains? expected (first %)) diffs)
+        gone (remove found expected)]
+    (println (str "SCANNED\t" (count answers) "\t" label))
+    (println (str (- (count answers) (count diffs)) "/" (count answers)
+                  " agree with the incumbent runtime (quickjs-ng), "
+                  (count expected) " known divergence(s)"))
+    (doseq [[src reason] known]
+      (println (str "  known: " (pr-str src) " -- " reason)))
+    (when (seq new-diffs)
+      (println (str "\nNEW divergence(s) in " label " -- the engines answer differently:"))
+      (doseq [[src a b] new-diffs]
+        (println (str "  " (pr-str src)
+                      "\n    quickjs: " (pr-str a)
+                      "\n    ecma262: " (pr-str b)))))
+    (when (seq gone)
+      (println (str "\nRECORDED divergence(s) in " label " that no longer occur -- remove them:"))
+      (doseq [src gone] (println (str "  " (pr-str src)))))
+    (if (or (seq new-diffs) (seq gone)) 1 0)))
+
+(defn -main [& args]
+  (let [;; run from the browser repo root, the sibling west checkout
+        default (path/resolve (js/process.cwd) ".." "org-ecma-international-262"
+                              "target" "ecma262.mjs")
+        artifact (or (first args) default)]
+    (when-not (fs/existsSync artifact)
+      (refuse! (str "no ecma262 artifact at " artifact
+                    " -- build it with: kotoba -M compile src/ecma262.kotoba"
+                    " --target js --fuel 4000000000 --output target/ecma262.mjs")))
+    (when (zero? (count cases))
+      (refuse! "the language corpus is empty"))
+    (when (zero? (count dom-cases))
+      (refuse! "the DOM corpus is empty"))
+    (when (zero? (count event-cases))
+      (refuse! "the event corpus is empty"))
+    (-> (js/import "quickjs-emscripten-core")
+        (.then (fn [qjs]
+                 (-> (js/import "@jitl/quickjs-singlefile-cjs-release-sync")
+                     (.then (fn [variant]
+                              ((.-newQuickJSWASMModuleFromVariant qjs)
+                               (or (.-default variant) variant)))))))
+        (.then (fn [QJS]
+                 (-> (js/import (str "file://" artifact))
+                     (.then (fn [mod]
+                              (let [ctx (.newContext QJS)
+                                    m ((.-instantiateKotoba mod) #js {})
+                                    qa (quickjs-answers ctx)
+                                    ea (engine-answers m)
+                                    answers (mapv (fn [src] [src (qa src) (ea src)]) cases)
+                                    _ (.dispose ctx)
+                                    qd (quickjs-dom-answers QJS)
+                                    ed (engine-dom-answers m)
+                                    dom-answers (mapv (fn [src] [src (qd src) (ed src)])
+                                                      dom-cases)
+                                    a (report-one "language" answers known-divergences)
+                                    _ (println)
+                                    b (report-one "DOM bridge" dom-answers
+                                                  known-dom-divergences)
+                                    qe (quickjs-event-answers QJS)
+                                    ee (engine-event-answers m)
+                                    ev-answers (mapv (fn [c] [(first c) (qe c) (ee c)])
+                                                     event-cases)
+                                    _ (println)
+                                    c (report-one "events" ev-answers
+                                                  known-event-divergences)]
+                                (js/process.exit (if (or (pos? a) (pos? b) (pos? c)) 1 0))))))))
+        (.catch (fn [e]
+                  (refuse! (str "an engine could not be driven: " (.-message e))))))))
+
+(-main)

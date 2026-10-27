@@ -1,0 +1,161 @@
+(ns browser.net-http-test
+  "Verifies browser.net.http against a REAL local HTTP server (JDK
+   com.sun.net.httpserver.HttpServer) -- no mocks, no external network calls.
+
+   Coverage:
+   - a bare fetch-fn round trip against a real socket (status + body)
+   - a real redirect and a real 404 response passed through untouched
+   - browser.session/navigate! wired end to end to a real fetch-fn, asserting
+     the committed page actually contains the real server's HTML
+   - a real connection failure (closed port) surfacing as a response/error,
+     never as an uncaught exception, both at the fetch-fn level and through
+     the whole navigate! session."
+  (:require [kotoba.bytes :as kbytes] [browser.net :as net]
+            [browser.net.http :as http]
+            [browser.session :as session]
+            [kotoba.test :refer [deftest is]]
+            [kotoba.wasm.dom :as dom]
+            [kotoba.wasm.host :as host])
+  (:import [com.sun.net.httpserver HttpExchange HttpHandler HttpServer]
+           [java.net InetSocketAddress ServerSocket]))
+
+(defn- respond!
+  [^HttpExchange exchange status headers ^String body]
+  (let [response-headers (.getResponseHeaders exchange)]
+    (doseq [[k v] headers]
+      (.add response-headers (str k) (str v))))
+  (let [bytes (kbytes/utf8-bytes (or body ""))]
+    (if (zero? (alength bytes))
+      (.sendResponseHeaders exchange status -1)
+      (do (.sendResponseHeaders exchange status (alength bytes))
+          (with-open [os (.getResponseBody exchange)]
+            (.write os bytes)))))
+  (.close exchange))
+
+(defn- start-server!
+  "Start a real HttpServer bound to loopback on an OS-assigned port, with
+   one handler-fn per path. handler-fn receives the HttpExchange and must
+   call respond!."
+  [handlers]
+  (let [server (HttpServer/create (InetSocketAddress. "127.0.0.1" 0) 0)]
+    (doseq [[path handler-fn] handlers]
+      (.createContext server path
+                       (reify HttpHandler
+                         (handle [_ exchange] (handler-fn exchange)))))
+    (.setExecutor server nil)
+    (.start server)
+    server))
+
+(defn- server-url
+  [^HttpServer server path]
+  (str "http://127.0.0.1:" (.getPort (.getAddress server)) path))
+
+(defn- closed-port-url
+  "A URL for 127.0.0.1 on a port nothing is listening on: bind an ephemeral
+   port, close it immediately, and use that now-free port. Nothing else can
+   grab it fast enough within a single test process, so a connection there
+   reliably fails with connection-refused instead of flaking."
+  []
+  (let [port (with-open [probe (ServerSocket. 0)]
+               (.getLocalPort probe))]
+    (str "http://127.0.0.1:" port "/")))
+
+(deftest real-fetch-returns-real-status-and-body
+  (let [body "<main><h1>Real Server</h1><p>hello from a real socket</p></main>"
+        server (start-server!
+                {"/" (fn [exchange]
+                       (respond! exchange 200 {"Content-Type" "text/html; charset=utf-8"} body))})]
+    (try
+      (let [fetch-fn (http/fetch-fn {:connect-timeout-ms 2000 :request-timeout-ms 5000})
+            response (fetch-fn {:url (server-url server "/") :method :get})]
+        (is (= 200 (:status response)))
+        (is (= body (:body response)))
+        (is (= (count body) (count (:body response))))
+        (is (= "text/html; charset=utf-8" (net/header (:headers response) "content-type"))))
+      (finally (.stop server 0)))))
+
+(deftest real-fetch-returns-real-redirect-untouched
+  (let [server (start-server!
+                {"/redirect" (fn [exchange] (respond! exchange 302 {"Location" "/target"} ""))
+                 "/target" (fn [exchange] (respond! exchange 200 {} "<main>Target</main>"))})]
+    (try
+      (let [fetch-fn (http/fetch-fn)
+            response (fetch-fn {:url (server-url server "/redirect") :method :get})]
+        (is (= 302 (:status response)))
+        (is (= "/target" (net/header (:headers response) "location"))))
+      (finally (.stop server 0)))))
+
+(deftest real-fetch-returns-real-404
+  (let [server (start-server!
+                {"/missing" (fn [exchange] (respond! exchange 404 {} "Not Found"))})]
+    (try
+      (let [fetch-fn (http/fetch-fn)
+            response (fetch-fn {:url (server-url server "/missing") :method :get})]
+        (is (= 404 (:status response)))
+        (is (= "Not Found" (:body response))))
+      (finally (.stop server 0)))))
+
+(deftest real-fetch-connection-refused-returns-error-not-exception
+  (let [fetch-fn (http/fetch-fn {:connect-timeout-ms 2000 :request-timeout-ms 3000})
+        response (fetch-fn {:url (closed-port-url) :method :get})]
+    (is (= 0 (:status response)))
+    (is (keyword? (:error response)))
+    (is (string? (:error/message response)))))
+
+(deftest navigate-through-real-http-commits-real-server-content
+  (let [body "<main><h1 id=\"top\">Hello Real World</h1></main>"
+        server (start-server!
+                {"/" (fn [exchange]
+                       (respond! exchange 200 {"Content-Type" "text/html"} body))})]
+    (try
+      (let [h (host/recording-host)
+            fetch-fn (http/fetch-fn {:connect-timeout-ms 2000 :request-timeout-ms 5000})
+            s (session/new-session {:host h :fetch-fn fetch-fn})
+            navigated (session/navigate! s (server-url server "/"))
+            recorded (host/recorded h)]
+        (is (nil? (:browser.session/error navigated)))
+        (is (= 200 (get-in navigated [:browser.session/page :browser/response :status])))
+        (is (= "Hello Real World"
+               (-> navigated :browser.session/page :browser/document dom/text-content)))
+        (is (= 1 (:present-count recorded))))
+      (finally (.stop server 0)))))
+
+(deftest navigate-through-real-http-follows-real-redirect-to-real-content
+  (let [body "<main><h1>Landed</h1></main>"
+        server (start-server!
+                {"/start" (fn [exchange] (respond! exchange 302 {"Location" "/landed"} ""))
+                 "/landed" (fn [exchange]
+                             (respond! exchange 200 {"Content-Type" "text/html"} body))})]
+    (try
+      (let [h (host/recording-host)
+            fetch-fn (http/fetch-fn)
+            s (session/new-session {:host h :fetch-fn fetch-fn})
+            navigated (session/navigate! s (server-url server "/start"))]
+        (is (nil? (:browser.session/error navigated)))
+        (is (= "Landed" (-> navigated :browser.session/page :browser/document dom/text-content)))
+        (is (= 1 (count (get-in navigated [:browser.session/navigation :redirects]))))
+        (is (= 302 (:status (first (get-in navigated [:browser.session/navigation :redirects]))))))
+      (finally (.stop server 0)))))
+
+(deftest navigate-through-real-http-surfaces-real-404-without-throwing
+  (let [server (start-server!
+                {"/missing" (fn [exchange] (respond! exchange 404 {} "<main>Not Found</main>"))})]
+    (try
+      (let [h (host/recording-host)
+            fetch-fn (http/fetch-fn)
+            s (session/new-session {:host h :fetch-fn fetch-fn})
+            navigated (session/navigate! s (server-url server "/missing"))]
+        (is (= :navigation/http-error (:browser.session/error navigated)))
+        (is (= 404 (get-in navigated [:browser.session/page :browser/response :status])))
+        (is (some? (:browser.session/error-document navigated))))
+      (finally (.stop server 0)))))
+
+(deftest navigate-through-real-http-surfaces-connection-failure-without-throwing
+  (let [h (host/recording-host)
+        fetch-fn (http/fetch-fn {:connect-timeout-ms 2000 :request-timeout-ms 3000})
+        s (session/new-session {:host h :fetch-fn fetch-fn})
+        navigated (session/navigate! s (closed-port-url))]
+    (is (= :navigation/http-error (:browser.session/error navigated)))
+    (is (= 0 (get-in navigated [:browser.session/page :browser/response :status])))
+    (is (keyword? (get-in navigated [:browser.session/page :browser/response :error])))
+    (is (some? (:browser.session/error-document navigated)))))

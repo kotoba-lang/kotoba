@@ -1,0 +1,246 @@
+(ns torihiki.thorchain
+  "Reading THORChain, so a validator can attest what it saw.
+
+  ## Observation only — this is not an escrow (2026-10-07)
+
+  The design below assumed THORChain would hold a `TORIHIKI:<account>`
+  deposit for this chain and later pay it out. It will not:
+
+  - THORChain acts only on memos it understands (`SWAP:`, `ADD:`, ...). An
+    inbound whose memo it does not recognise is **refunded** to the sender,
+    not held for a third-party protocol.
+  - THORChain's validators never sign an outbound on torihiki's behalf, so
+    `payouts-in` would attest a payout that nobody is able to send.
+
+  So nothing here may be extended into custody. What survives is the parsing
+  and the attestation shape, which a validator-controlled bridge contract
+  (roadmap D3, `docs/decentralization-roadmap.md`) reuses: a quorum of bonded
+  validators attesting the same source-chain event, exactly once per txid.
+  The text below is kept as the original reasoning.
+
+  The escrow is THORChain: a user sends an asset to the network's inbound
+  vault with a memo naming their torihiki account, THORChain's own validators
+  observe it into their consensus, and the asset sits behind a key no single
+  party holds. `torihiki.state/deposit-attest` decides when that becomes
+  collateral here — it needs a quorum of bonded validators to say the same
+  thing about the same transaction.
+
+  This namespace is the half that turns THORChain's answers into that claim.
+  It is **pure**: it takes parsed JSON and returns transactions to sign. The
+  polling, the HTTP and the signing live in the node, because those are the
+  parts that cannot be tested without a network and this is the part that must
+  be.
+
+  ## The memo is the whole binding
+
+  Nothing about a THORChain transfer says which torihiki account it belongs
+  to. The memo does, and a memo is user-supplied text, so it is parsed
+  strictly: the exact prefix, then digits, and nothing else. A memo that does
+  not parse is not a deposit for anybody — crediting a best guess would mean
+  crediting an account the sender did not name."
+  (:require [kotoba.lang.text :as str]))
+
+(def ^:const memo-prefix
+  "What a deposit memo must start with. Namespaced, because a THORChain vault
+  serves every protocol that points at it and a bare number would be somebody
+  else's convention as easily as ours."
+  "TORIHIKI:")
+
+(defn- js-or-jvm-parse [s]
+  #?(:clj (Long/parseLong s)
+     :cljs (js/parseInt s 10)))
+
+(defn parse-memo
+  "The torihiki account a memo names, or nil.
+
+  Strict on purpose. `TORIHIKI:123` and nothing else — no whitespace, no
+  suffix, no other case. THORChain memos are already a command language
+  (`SWAP:`, `ADD:`), so a loose parser here is a parser that reads somebody
+  else's instruction as a deposit for whichever account the digits happen to
+  form."
+  [memo]
+  (when (and (string? memo) (str/starts-with? memo memo-prefix))
+    (let [tail (subs memo (count memo-prefix))]
+      (when (re-matches #"[0-9]+" tail)
+        (let [n (js-or-jvm-parse tail)]
+          (when (pos? n) n))))))
+
+(def ^:const min-confirmations
+  "How deep an observed transaction must be before it is attested. **2.**
+
+  THORChain reports an inbound as soon as its own validators have observed it,
+  and its own reorg handling is what makes that final — but a validator here
+  that attests at depth zero is attesting something that can still be undone,
+  and an attestation cannot be withdrawn. Two blocks is small, and the point is
+  that it is not zero."
+  2)
+
+(defn deposits-in
+  "Every credited deposit in a THORChain `/tx/details`-shaped answer, as the
+  transactions a validator would attest.
+
+  `me` is the attesting validator's account id. `vaults` is the SET of inbound
+  addresses this venue accepts — an observation naming anything else is
+  somebody else's deposit, and checking it here is what stops a validator from
+  being talked into attesting a transfer that never reached us.
+
+  A SET, not one address, because THORChain's vaults churn: the network
+  rotates its asgard every few days, and a deposit sent to the outgoing vault
+  minutes before the rotation is still a real deposit. Watching one address
+  means that, on every churn, deposits stop being credited and nothing says
+  so — the venue keeps running and quietly stops taking money. The set is the
+  current inbound plus the ones this validator has seen before.
+
+  Returns a vector of `:deposit-attest` transactions, one per usable
+  observation, in the order given. Anything unusable is DROPPED rather than
+  reported: a validator that cannot read an observation has nothing to say
+  about it, and saying something anyway is the failure this whole path exists
+  to avoid."
+  [me vaults tip-height observations]
+  (vec
+   (for [o observations
+         :let [memo (get o :memo (get o "memo"))
+               acct (parse-memo memo)
+               txid (get o :tx-id (get o "tx_id" (get o "txID")))
+               asset (get o :asset (get o "asset"))
+               amount (get o :amount (get o "amount"))
+               to (get o :to (get o "to"))
+               height (get o :height (get o "height"))]
+         :when (and acct
+                    (string? txid) (seq txid)
+                    (string? asset) (seq asset)
+                    (integer? amount) (pos? amount)
+                    ;; One of the vaults we watch, not any vault.
+                    (contains? (set vaults) to)
+                    ;; Deep enough that THORChain will not take it back.
+                    (integer? height)
+                    (>= (- tip-height height) min-confirmations))]
+     {:tx :deposit-attest
+      :account me
+      :txid txid
+      :credit acct
+      :amount amount
+      :asset asset})))
+
+(defn payouts-in
+  "Every outbound payment in a THORChain answer, as `:withdraw-attest`
+  transactions.
+
+  The exit needs witnessing for the same reason the entrance does: one key
+  that can settle a real claim can settle one that was never paid. A payout
+  carries the claim number in its own memo, written by whoever sent it, and
+  the same strictness applies — a payout whose memo does not name a claim
+  settles nothing."
+  [me tip-height observations]
+  (vec
+   (for [o observations
+         :let [memo (get o :memo (get o "memo"))
+               claim (parse-memo memo)
+               txid (get o :tx-id (get o "tx_id" (get o "txID")))
+               dest (get o :to (get o "to"))
+               height (get o :height (get o "height"))]
+         :when (and claim
+                    (string? txid) (seq txid)
+                    (string? dest) (seq dest)
+                    (integer? height)
+                    (>= (- tip-height height) min-confirmations))]
+     {:tx :withdraw-attest
+      :account me
+      :claim claim
+      :txid txid
+      :dest dest})))
+
+(defn withdrawal-memo
+  "The memo a payout must carry so the validators can attest it back to the
+  claim it settles. The same grammar as a deposit memo, and deliberately so:
+  one thing to parse, one thing to get wrong."
+  [claim]
+  (str memo-prefix claim))
+
+;; ── the deposit, read from Ethereum ─────────────────────────────────────────
+;;
+;; THORChain's own hosts are behind Cloudflare and a Worker cannot resolve
+;; them — measured, five of them, four unresolvable and one refusing. But an
+;; ETH deposit is not only a THORChain fact: it is a call to THORChain's
+;; Router **on Ethereum**, and the Router emits
+;;
+;;     Deposit(address indexed to, address indexed asset, uint amount, string memo)
+;;
+;; which carries every field an attestation needs — the vault, the asset, the
+;; amount, and the memo naming the account. An Ethereum RPC answers a Worker
+;; (`ethereum-rpc.publicnode.com`, measured), so the observation can come from
+;; the source chain instead.
+;;
+;; Reading the source chain is also the stronger position. THORChain's own view
+;; of an inbound is a report; the log is the transfer.
+
+(def ^:const deposit-event-signature
+  "The event whose keccak-256 is topic0. Written out so the topic can be
+  derived rather than pasted — a pasted topic is a constant nobody can check."
+  "Deposit(address,address,uint256,string)")
+
+(defn- hex->long [h]
+  #?(:clj (Long/parseLong h 16) :cljs (js/parseInt h 16)))
+
+(defn- topic->address
+  "The low 20 bytes of a 32-byte topic, lower-cased. An indexed address is
+  left-padded, and comparing the padded form against an ordinary address is
+  how a vault check silently never matches."
+  [t]
+  (when (and (string? t) (>= (count t) 40))
+    (str "0x" (str/lower (subs t (- (count t) 40))))))
+
+(defn decode-deposit-data
+  "`(amount, memo)` out of the non-indexed half of a Deposit log.
+
+  ABI: a uint256, then an offset to the string, then the string's length, then
+  its bytes padded up to 32. The offset is READ rather than assumed to be
+  0x40 — it is 0x40 for this event today, and a decoder that hard-codes an
+  offset is one ABI change away from reading the length as the amount."
+  [data]
+  (let [h (str/replace (or data "") #"^0x" "")
+        word (fn [i] (subs h (* 64 i) (* 64 (inc i))))]
+    (when (>= (count h) 192)
+      (let [amount (hex->long (word 0))
+            off (hex->long (word 1))
+            base (* 2 off)
+            len (hex->long (subs h base (+ base 64)))
+            body (subs h (+ base 64) (+ base 64 (* 2 len)))
+            memo (apply str (for [i (range len)]
+                              (char (hex->long (subs body (* 2 i) (+ 2 (* 2 i)))))))]
+        {:amount amount :memo memo}))))
+
+(defn deposits-from-logs
+  "`:deposit-attest` transactions from Ethereum logs of THORChain's Router.
+
+  Same refusals as `deposits-in`, for the same reasons: the vault must be one
+  we watch, the memo must name an account exactly, the amount must be
+  positive, and the log must be deep enough that the chain will not take it
+  back. `tip` is the current Ethereum head."
+  [me vaults tip logs]
+  (vec
+   (for [l logs
+         :let [topics (get l :topics (get l "topics"))
+               to (topic->address (second topics))
+               asset (topic->address (nth topics 2 nil))
+               txid (get l :transactionHash (get l "transactionHash"))
+               bn (get l :blockNumber (get l "blockNumber"))
+               height (when (string? bn) (hex->long (str/replace bn #"^0x" "")))
+               {:keys [amount memo]} (decode-deposit-data
+                                      (get l :data (get l "data")))
+               acct (parse-memo memo)]
+         :when (and acct to asset
+                    (string? txid) (seq txid)
+                    (integer? amount) (pos? amount)
+                    (contains? (set (map str/lower vaults)) to)
+                    (integer? height) (integer? tip)
+                    (>= (- tip height) min-confirmations))]
+     {:tx :deposit-attest
+      :account me
+      :txid txid
+      :credit acct
+      :amount amount
+      ;; The asset as the chain names it. An ERC-20's address is what
+      ;; distinguishes USDC from USDT here, and dropping it would let a
+      ;; quorum agree about an amount of nothing in particular.
+      :asset (str "ETH." asset)})))

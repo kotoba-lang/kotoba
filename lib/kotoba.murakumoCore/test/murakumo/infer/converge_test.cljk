@@ -1,0 +1,79 @@
+(ns murakumo.infer.converge-test
+  "ADR-2610071730 P3a: the plan a node computes for itself, and when it acts.
+  Offline; nothing is executed."
+  (:require [cljs.test :refer [deftest is testing run-tests]]
+            [murakumo.fleet.spec :as spec]
+            [murakumo.infer.converge :as c]))
+
+(def now 1000000)
+(defn- node [n & {:as m}]
+  (merge {"node" n "enabled" true "url" "http://100.64.0.1:8796" "owner-id" "00000000-0000-0000-0000-000000000000" "roles" []} m))
+
+(def intent
+  {"schema" 1 "spec-version" 2 "revision" 7
+   "models" {"mishima" {"kind" "text"}}
+   "classes" {"mishima-text" {"template" "llama-server" "model" "mishima" "replicas" 2 "eligible" {"max-pressure" 2}}}
+   "nodes" [(node "a" "pins" ["mishima-text"]) (node "b" "pins" ["mishima-text"]) (node "c")]})
+
+(defn- obs [units & {:as m}] (merge {:at-ms now :pressure 1 :units units :running #{}} m))
+
+(deftest plan-steps
+  (testing "pinned + installed + not running -> start"
+    (is (= [:start] (map :step (spec/converge-plan intent {"a" (obs {"com.murakumo.mishima" "not-loaded"}) "b" (obs {}) "c" (obs {})} "a" now)))))
+  (testing "running -> ok"
+    (is (= [:ok] (map :step (spec/converge-plan intent {"a" (obs {} :running #{"mishima-text"}) "b" (obs {}) "c" (obs {})} "a" now)))))
+  (testing "absent unit or missing model -> blocked"
+    (is (= [:blocked] (map :step (spec/converge-plan intent {"a" (obs {"com.murakumo.mishima" "absent"}) "b" (obs {}) "c" (obs {})} "a" now))))
+    (is (= [:blocked] (map :step (spec/converge-plan intent {"a" (obs {"com.murakumo.mishima" "loaded"} :models {"mishima" {:present false}}) "b" (obs {}) "c" (obs {})} "a" now)))))
+  (testing "placed by rendezvous (not pinned) -> needs a lease, never acted on in P3a"
+    (let [i (assoc-in intent ["nodes" 1] (node "b"))
+          l2 {"a" (obs {}) "b" (obs {"com.murakumo.mishima" "loaded"}) "c" (obs {"com.murakumo.mishima" "loaded"})}
+          placed (get-in (spec/placement i l2 now) ["mishima-text" :nodes])
+          other (first (remove #{"a"} placed))]
+      (is (= [:needs-lease] (map :step (spec/converge-plan i l2 other now))))))
+  (testing "a node not placed has an empty plan (and nothing is ever stopped)"
+    (is (= [] (spec/converge-plan intent {"a" (obs {}) "b" (obs {}) "c" (obs {"com.murakumo.mishima" "running"} :running #{"mishima-text"})} "c" now)))))
+
+(deftest leased-shares-start-like-pins
+  (let [i (assoc-in intent ["nodes" 1] (node "b"))
+        l2 {"a" (obs {}) "b" (obs {"com.murakumo.mishima" "loaded"}) "c" (obs {"com.murakumo.mishima" "loaded"})}
+        placed (get-in (spec/placement i l2 now) ["mishima-text" :nodes])
+        other (first (remove #{"a"} placed))]
+    (is (= {"mishima-text" 0} (spec/lease-slots i l2 other now)) "the unpinned share is slot 0")
+    (is (= {} (spec/lease-slots i l2 "a" now)) "a pinned node needs no lease")
+    (is (= [:start] (map :step (spec/converge-plan i l2 other now {:leased #{"mishima-text"}}))) "holding the lease -> start")))
+
+(deftest acts-only-when-enforced-on-darwin-with-cooldown
+  (let [plan [{:class "mishima-text" :unit "com.murakumo.mishima" :step :start}]
+        o {:units {"com.murakumo.mishima" "loaded"}}]
+    (is (= [] (c/decide "observe" plan o {} now 1000 true)) "observe never acts")
+    (is (= [] (c/decide "enforce" plan o {} now 1000 false)) "not on Linux yet")
+    (is (= [["/bin/launchctl" "kickstart" "system/com.murakumo.mishima"]]
+           (:argv (first (c/decide "enforce" plan o {} now 1000 true)))))
+    (is (= [] (c/decide "enforce" plan o {"com.murakumo.mishima" (- now 10)} now 1000 true)) "cooldown")
+    (is (= 2 (count (:argv (first (c/decide "enforce" plan {:units {"com.murakumo.mishima" "not-loaded"}} {} now 1000 true)))))
+        "enable + bootstrap when not loaded")
+    (is (nil? (c/action-argv {:unit "com.evil.thing"} "loaded")) "only template units")
+    (is (= [] (c/decide "enforce" [{:class "x" :unit "com.murakumo.mishima" :step :needs-lease}] o {} now 1000 true)))))
+
+(deftest review-fixes
+  (testing "malformed converge field is observe, never a throw"
+    (is (= "observe" (spec/converge-mode (assoc intent "converge" {"mode" "enforce" "nodes" 1}) "a")))
+    (is (= "observe" (spec/converge-mode (assoc intent "converge" "enforce") "a")))
+    (is (seq (spec/validate (assoc intent "converge" {"mode" "enforce" "nodes" ["nope"]}))))
+    (is (seq (spec/validate (assoc intent "converge" {"mode" "yolo" "nodes" []})))))
+  (testing "one action per unit when classes share a template"
+    (let [plan [{:class "x" :unit "com.murakumo.comfy" :step :start} {:class "y" :unit "com.murakumo.comfy" :step :start}]]
+      (is (= 1 (count (c/decide "enforce" plan {:units {"com.murakumo.comfy" "loaded"}} {} now 1000 true))))))
+  (testing "a model file of the wrong size blocks"
+    (is (= [:blocked] (map :step (spec/converge-plan intent {"a" (obs {"com.murakumo.mishima" "loaded"} :models {"mishima" {:present true :size-matches false}}) "b" (obs {}) "c" (obs {})} "a" now))))))
+
+(deftest mode-comes-from-the-signed-intent
+  (is (= "observe" (spec/converge-mode intent "a")))
+  (is (= "enforce" (spec/converge-mode (assoc intent "converge" {"mode" "enforce" "nodes" ["a"]}) "a")))
+  (is (= "observe" (spec/converge-mode (assoc intent "converge" {"mode" "enforce" "nodes" ["a"]}) "b"))))
+
+(defmethod cljs.test/report [:cljs.test/default :end-run-tests] [m]
+  (when-not (cljs.test/successful? m) (set! (.-exitCode js/process) 1)))
+
+(run-tests)

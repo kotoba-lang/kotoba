@@ -1,0 +1,304 @@
+(ns browser.net-worker-test
+  "Verifies the REAL half of Worker execution this repo can prove on the
+   JVM: a REAL local HTTP server (JDK `com.sun.net.httpserver.HttpServer`,
+   the exact same pattern `net_http_test.clj` uses) serves a worker
+   script's real bytes, `browser.net.http/fetch-fn` really fetches them
+   over a real socket, and
+   `browser.compat.quickjs-execution/apply-capability` really threads that
+   real, fetched source into whatever `:worker-fn` the engine provides --
+   proving the WIRING (real fetch -> real source -> real second-context
+   creation hook -> real reply queued for the next script tag's
+   `:worker/snapshot`) end to end.
+
+   What this suite CANNOT prove (and does not claim to): the JVM
+   `browser.compat.quickjs-wasm` engine has no real second QuickJS context
+   to offer at all (`engine!`'s `:clj` branch is a stub, `:invoke nil` --
+   see that namespace) -- there is no real JS engine on the JVM in this
+   repo, full stop, independent of this change. So `:worker-fn` here is a
+   FAKE, request-capturing test double standing in for
+   `browser.compat.quickjs-wasm/worker-fn`'s real, engine-backed
+   implementation, exactly the way `net_websocket_test.clj`'s
+   `quickjs-websocket-wiring-moves-real-bytes-through-apply-capability`
+   uses a fake `:engine` to prove REAL socket wiring without a real
+   QuickJS VM. The genuinely novel claim -- a worker's script REALLY
+   executing inside a real, second, independent QuickJS context, and a
+   real `self.onmessage`/`postMessage` round trip -- is proven only in
+   `test-cljs/browser/compat/quickjs_worker_smoke_test.cljk`, the one
+   platform where `quickjs-wasm`'s engine is real (see that namespace's
+   own docstring for the JVM/real-engine split rationale)."
+  (:require [kotoba.bytes :as kbytes] [browser.compat.quickjs :as quickjs]
+            [browser.compat.quickjs-binding :as binding]
+            [browser.compat.quickjs-execution :as execution]
+            [browser.net.http :as http]
+            [browser.origin :as origin]
+            [browser.profile :as profile]
+            [kotoba.test :refer [deftest is]])
+  (:import [com.sun.net.httpserver HttpExchange HttpHandler HttpServer]
+           [java.net InetSocketAddress ServerSocket]))
+
+;; ---------------------------------------------------------------------
+;; A real HttpServer serving a real, minimal worker script (mirrors
+;; net_http_test.clj's start-server!/server-url exactly).
+;; ---------------------------------------------------------------------
+
+(defn- respond!
+  [^HttpExchange exchange status headers ^String body]
+  (let [response-headers (.getResponseHeaders exchange)]
+    (doseq [[k v] headers]
+      (.add response-headers (str k) (str v))))
+  (let [bytes (kbytes/utf8-bytes (or body ""))]
+    (if (zero? (alength bytes))
+      (.sendResponseHeaders exchange status -1)
+      (do (.sendResponseHeaders exchange status (alength bytes))
+          (with-open [os (.getResponseBody exchange)]
+            (.write os bytes)))))
+  (.close exchange))
+
+(defn- start-server!
+  [handlers]
+  (let [server (HttpServer/create (InetSocketAddress. "127.0.0.1" 0) 0)]
+    (doseq [[path handler-fn] handlers]
+      (.createContext server path
+                       (reify HttpHandler
+                         (handle [_ exchange] (handler-fn exchange)))))
+    (.setExecutor server nil)
+    (.start server)
+    server))
+
+(defn- server-url
+  [^HttpServer server path]
+  (str "http://127.0.0.1:" (.getPort (.getAddress server)) path))
+
+(def worker-script-source
+  "A real, minimal worker script: doubles whatever number it's sent. The
+   REAL bytes a real local HTTP server below serves for `/worker.js`."
+  "self.onmessage = function(e) { self.postMessage(e.data * 2); };")
+
+;; ---------------------------------------------------------------------
+;; A fake, request-capturing :worker-fn test double standing in for
+;; `browser.compat.quickjs-wasm/worker-fn`'s real, engine-backed second
+;; QuickJS context -- see namespace docstring for why the JVM cannot offer
+;; a real one. Simulates exactly worker-script-source's behavior (doubles
+;; whatever it's handed) so the reply-threading half of the wiring
+;; (:worker/outbox -> :worker/snapshot) is exercised too.
+;; ---------------------------------------------------------------------
+
+(defn- fake-worker-fn
+  [received-create]
+  (fn [{:keys [op] :as request}]
+    (case op
+      :create
+      (do
+        (reset! received-create request)
+        {:ok? true :handle {:context :fake} :messages []})
+
+      :post-message
+      {:ok? true :messages [(* 2 (:data request))]}
+
+      :terminate
+      {:ok? true}
+
+      {:ok? false :error :worker/unsupported-op})))
+
+;; ---------------------------------------------------------------------
+;; quickjs-execution wiring: real :worker/create + :worker/post-message,
+;; real fetch against the real server, fake (engine-standing-in) second
+;; context creation, and the host-computed :worker/snapshot delivered to
+;; the next script tag.
+;; ---------------------------------------------------------------------
+
+(deftest quickjs-worker-wiring-moves-real-fetched-bytes-through-apply-capability
+  (let [server (start-server!
+                {"/worker.js" (fn [exchange]
+                                (respond! exchange 200
+                                          {"Content-Type" "text/javascript"}
+                                          worker-script-source))})]
+    (try
+      (let [url (server-url server "/worker.js")
+            profile (-> (profile/new-profile {:id "work"})
+                        (profile/grant-permission (origin/origin url) :worker/create))
+            adapter (quickjs/new-adapter {:origin "https://app.example"
+                                          :profile-id "work"})
+            received-payload (atom nil)
+            received-create (atom nil)
+            call-count (atom 0)
+            state (execution/new-state
+                   {:binding (binding/empty-binding adapter)
+                    :net-context {:profile profile
+                                  :page-url "https://app.example/app"}
+                    :fetch-fn (http/fetch-fn {:connect-timeout-ms 2000 :request-timeout-ms 5000})
+                    :worker-fn (fake-worker-fn received-create)
+                    ;; A real two-<script>-tag page never re-sends the SAME
+                    ;; capability requests on its second script tag; this
+                    ;; fake engine mirrors that by only returning
+                    ;; create+post-message on the FIRST call (standing in
+                    ;; for script 1) and an empty request list on any later
+                    ;; call (standing in for script 2, which -- exactly
+                    ;; like the CLJS smoke test's `run-script2!` -- does
+                    ;; not even touch the worker itself, relying entirely
+                    ;; on the host-computed :worker/snapshot it receives).
+                    :engine (fn [request]
+                              (reset! received-payload request)
+                              (swap! call-count inc)
+                              {:result :worker
+                               :requests (if (= 1 @call-count)
+                                           [{:request/id "create"
+                                             :capability :worker/create
+                                             :worker/id "worker-1"
+                                             :url url}
+                                            {:request/id "post"
+                                             :capability :worker/post-message
+                                             :worker/id "worker-1"
+                                             :message 21}]
+                                           [])})})
+            state (execution/evaluate! state {:source "const w = new Worker('...')"})]
+        ;; Real fetch actually happened: the fake worker-fn's :create op
+        ;; received the REAL bytes the real local server served.
+        (is (= worker-script-source (:source @received-create))
+            "expected the real fetched worker script body to reach :worker-fn's :create op")
+        ;; Real wiring: the worker genuinely "exists" and has a real handle.
+        (is (= :running (get-in state [:worker/instances "worker-1" :state])))
+        (is (= {:context :fake} (get-in state [:worker/handles "worker-1"])))
+        ;; The fake worker's reply (21 * 2 = 42, simulating
+        ;; worker-script-source's real doubling behavior) was captured
+        ;; immediately into :worker/outbox, not yet delivered.
+        (is (= [42] (get-in state [:worker/outbox "worker-1"])))
+        ;; A SECOND evaluate! (standing in for a later <script> tag on the
+        ;; same page, exactly the way browser.compat.quickjs-runner threads
+        ;; page-lifetime state across real script tags) computes a fresh
+        ;; worker-snapshot BEFORE invoking the engine -- delivering the
+        ;; queued reply into the payload the (fake, but request-capturing)
+        ;; engine receives, and clearing the outbox.
+        (let [state (execution/evaluate! state {:source "/* second script tag */"})
+              snapshot (:worker/snapshot @received-payload)]
+          (is (= [42] (get-in snapshot ["worker-1" :messages]))
+              (str "expected the real (fake-worker-simulated) reply to show up in the "
+                   "host-computed worker-snapshot passed to the next script's invocation -- got "
+                   (pr-str snapshot)))
+          (is (empty? (get-in state [:worker/outbox "worker-1"]))
+              "expected the outbox to be cleared once its snapshot was taken")
+          (is (map? state))))
+      (finally (.stop server 0)))))
+
+(deftest quickjs-worker-create-denies-without-script-origin-grant-real-mode
+  (let [server (start-server!
+                {"/worker.js" (fn [exchange]
+                                (respond! exchange 200 {} worker-script-source))})]
+    (try
+      (let [url (server-url server "/worker.js")
+            profile (profile/new-profile {:id "work"}) ; no grant
+            adapter (quickjs/new-adapter {:origin "https://app.example"
+                                          :profile-id "work"})
+            received-create (atom nil)
+            state (execution/new-state
+                   {:binding (binding/empty-binding adapter)
+                    :net-context {:profile profile
+                                  :page-url "https://app.example/app"}
+                    :fetch-fn (http/fetch-fn)
+                    :worker-fn (fake-worker-fn received-create)
+                    :engine (fn [_]
+                              {:result :worker
+                               :requests [{:request/id "create"
+                                           :capability :worker/create
+                                           :worker/id "worker-1"
+                                           :url url}]})})
+            state (execution/evaluate! state {:source "new Worker('...')"})]
+        (is (empty? (:worker/instances state)))
+        (is (nil? @received-create)
+            "expected permission denial to short-circuit before any real fetch/create attempt"))
+      (finally (.stop server 0)))))
+
+(deftest quickjs-worker-create-surfaces-real-404-as-error-not-fabricated-success
+  (let [server (start-server!
+                {"/missing.js" (fn [exchange] (respond! exchange 404 {} "Not Found"))})]
+    (try
+      (let [url (server-url server "/missing.js")
+            profile (-> (profile/new-profile {:id "work"})
+                        (profile/grant-permission (origin/origin url) :worker/create))
+            adapter (quickjs/new-adapter {:origin "https://app.example"
+                                          :profile-id "work"})
+            received-create (atom nil)
+            state (execution/new-state
+                   {:binding (binding/empty-binding adapter)
+                    :net-context {:profile profile
+                                  :page-url "https://app.example/app"}
+                    :fetch-fn (http/fetch-fn)
+                    :worker-fn (fake-worker-fn received-create)
+                    :engine (fn [_]
+                              {:result :worker
+                               :requests [{:request/id "create"
+                                           :capability :worker/create
+                                           :worker/id "worker-1"
+                                           :url url}]})})
+            state (execution/evaluate! state {:source "new Worker('...')"})]
+        (is (empty? (:worker/instances state))
+            "a real 404 fetching the worker script must not fabricate a running worker")
+        (is (= :worker/script-fetch-failed (:last-error state)))
+        (is (nil? @received-create)
+            "the (fake) second-context creation must never be attempted without real source"))
+      (finally (.stop server 0)))))
+
+(deftest quickjs-worker-create-without-fetch-fn-is-a-real-error-not-a-silent-fabrication
+  (let [url "https://app.example/worker.js"
+        profile (-> (profile/new-profile {:id "work"})
+                    (profile/grant-permission (origin/origin url) :worker/create))
+        adapter (quickjs/new-adapter {:origin "https://app.example"
+                                      :profile-id "work"})
+        received-create (atom nil)
+        state (execution/new-state
+               {:binding (binding/empty-binding adapter)
+                :net-context {:profile profile
+                              :page-url "https://app.example/app"}
+                ;; :worker-fn injected but NO :fetch-fn -- a real
+                ;; misconfiguration, must surface as a real error rather
+                ;; than silently falling back to fabricated success.
+                :worker-fn (fake-worker-fn received-create)
+                :engine (fn [_]
+                          {:result :worker
+                           :requests [{:request/id "create"
+                                       :capability :worker/create
+                                       :worker/id "worker-1"
+                                       :url url}]})})
+        state (execution/evaluate! state {:source "new Worker('...')"})]
+    (is (empty? (:worker/instances state)))
+    (is (= :worker/no-fetch-fn (:last-error state)))
+    (is (nil? @received-create))))
+
+(deftest quickjs-worker-fabricated-mode-is-byte-for-byte-unchanged-without-worker-fn
+  ;; No :worker-fn injected at all -- the default. Every field here mirrors
+  ;; quickjs_execution_test.clj's own pre-existing
+  ;; quickjs-worker-create-message-terminate-records-sandboxed-worker case,
+  ;; re-asserted here (against a real fetch-fn ALSO being present, proving
+  ;; that merely having a real :fetch-fn around does not by itself turn on
+  ;; real worker execution -- only a real, engine-provided :worker-fn does).
+  (let [profile (-> (profile/new-profile {:id "work"})
+                    (profile/grant-permission "https://app.example" :worker/create))
+        adapter (quickjs/new-adapter {:origin "https://app.example"
+                                      :profile-id "work"})
+        state (execution/new-state
+               {:binding (binding/empty-binding adapter)
+                :net-context {:profile profile
+                              :page-url "https://app.example/app"}
+                :fetch-fn (http/fetch-fn)
+                :engine (fn [_]
+                          {:result :worker
+                           :requests [{:request/id "create"
+                                       :capability :worker/create
+                                       :worker/id "worker-1"
+                                       :url "https://app.example/worker.js"
+                                       :worker/options {:type "module"}}
+                                      {:request/id "post"
+                                       :capability :worker/post-message
+                                       :worker/id "worker-1"
+                                       :message "hello"}
+                                      {:request/id "terminate"
+                                       :capability :worker/terminate
+                                       :worker/id "worker-1"}]})})
+        state (execution/evaluate! state {:source "const w = new Worker('/worker.js')"})]
+    (is (= :terminated (get-in state [:worker/instances "worker-1" :state])))
+    (is (nil? (get-in state [:worker/handles "worker-1"]))
+        "fabricated mode must never populate a real handle")
+    (is (= [{:worker/id "worker-1" :message "hello"}]
+           (:worker/messages state)))
+    (is (empty? (get-in state [:worker/outbox "worker-1"]))
+        "fabricated mode must never queue anything into the outbox")))

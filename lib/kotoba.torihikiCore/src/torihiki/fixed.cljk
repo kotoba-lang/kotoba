@@ -1,0 +1,375 @@
+(ns torihiki.fixed
+  "Fixed-point integer arithmetic for the torihiki state machine.
+
+  EVERY quantity in this engine is an integer. There is no floating point
+  anywhere on the state-transition path, because two validators that disagree
+  on the last bit of a f64 produce different state roots and the chain halts.
+  This ns defines the scales, the rounding, and — the load-bearing part — the
+  RANGE INVARIANT that makes the JVM and JS paths bit-identical.
+
+  ## The i53 domain
+
+  Values are integers in [-(2^53-1), 2^53-1]. Not i64. The ceiling is set by
+  the weaker of the two runtimes: JVM `long[]` holds i64 exactly, but JS has
+  no i64 array whose elements survive arithmetic (`BigInt64Array` elements are
+  BigInt, and `Number(bigint)` silently truncates above 2^53). Rather than let
+  the two platforms diverge in the top 11 bits, we forbid those bits outright
+  and check for them.
+
+  This is not a limitation in practice, it is a scaling decision, and it is the
+  same one every exchange makes. With the default scales below:
+
+    BTC at $100,000  = 10^7 price ticks
+    1 BTC            = 10^4 size lots
+    notional of 1 BTC = 10^11        (2^53 is 9.007 x 10^15)
+    1000 BTC position = 10^14        (still 90x of headroom)
+    $1,000,000,000 of collateral = 10^11
+
+  So the engine runs out of realistic market long before it runs out of
+  integer. `check` exists to prove that claim on every write rather than
+  assume it.
+
+  ## Scales
+
+  Chosen per-market at genesis, not hardcoded — a market's `tick` and `lot`
+  live in its config. What IS fixed globally is the ratio unit for rates:
+  `rate-scale` = 10^9, so a funding rate of 0.0001 (1 bp) is 100000.")
+
+;; ── the i53 domain ──────────────────────────────────────────────────────────
+
+(def ^:const i53-max 9007199254740991)   ; 2^53 - 1
+(def ^:const i53-min -9007199254740991)
+
+(defn in-domain?
+  "True when `v` is an integer this engine is allowed to store. Rejects the
+  i64 range JVM would accept but JS cannot mirror."
+  [v]
+  (and (<= i53-min v) (<= v i53-max)))
+
+(defn check
+  "Return `v` if it is inside the i53 domain, else throw. Called on every
+  value that crosses into the slab, so an overflow surfaces as a rejected
+  transaction at the boundary instead of as a silent state-root divergence
+  between two validators three blocks later.
+
+  `where` names the site for the error message; it is never used in the
+  happy path, so passing a keyword literal costs nothing."
+  [where v]
+  (if (in-domain? v)
+    v
+    (throw (ex-info "torihiki.fixed: value escaped the i53 domain"
+                    {:where where :value v :i53-max i53-max}))))
+
+;; ── accumulation: why sums are saturating and not checked ──────────────────
+;;
+;; `check` proves that ONE value is in the domain. It says nothing about a
+;; SUM: two in-domain values accumulated across blocks leave the domain with
+;; no single write being wrong, and then the two runtimes disagree — JVM keeps
+;; the exact long and JS rounds — with no throw anywhere (falsify-8 through
+;; falsify-13 measured this on collateral, :deficit, :funding-residue,
+;; :fees-collected and :insurance-fund). A sum gate that THROWS is the
+;; falsify-6/7 class instead: one signed transaction halts every validator at
+;; the same place. Saturation is the one verdict that is total, never throws,
+;; and is computed identically on both runtimes — the comparison against the
+;; bound decides the same way even when JS has already rounded the true sum,
+;; because a rounded-up sum is still over the ceiling.
+
+(defn sadd
+  "`v + delta`, saturated to the i53 domain. `nil` counts as 0 so it can
+  replace `(fnil + 0)` in an accumulator that has never been written.
+
+  Exact whenever the true sum is in the domain: with both terms in-domain the
+  sum is below 2^54, and a JS sum that rounds still lands on the same side of
+  the bound, so the cond below picks the same branch on both runtimes."
+  [v delta]
+  (let [v (or v 0)
+        delta (or delta 0)
+        s (+ v delta)]
+    (cond
+      (> s i53-max) i53-max
+      (< s i53-min) i53-min
+      :else s)))
+
+(defn acc
+  "The saturating `(fnil + 0)`. `(update m k fx/acc d)` folds `d` into the
+  accumulator at `k` exactly like `(update m k (fnil + 0) d)` until the sum
+  reaches the domain bound, and clamps instead of escaping it. Every
+  multi-block accumulator in the engine goes through this — see `sadd`."
+  [v delta]
+  (sadd v delta))
+
+;; ── rates ───────────────────────────────────────────────────────────────────
+
+(def ^:const rate-scale 1000000000)      ; 10^9. 1 bp = 100000, 100% = 10^9
+
+(defn bps
+  "Basis points -> rate. 1 bp = 0.0001."
+  [n]
+  (* n 100000))
+
+(defn pct
+  "Percent -> rate."
+  [n]
+  (* n 10000000))
+
+;; ── rounding ────────────────────────────────────────────────────────────────
+;;
+;; Division has to round SOMEWHERE, and the direction is a consensus rule: two
+;; implementations that round differently disagree on every fee. We use floor
+;; division (toward negative infinity) as the single primitive, and express
+;; every other rounding mode in terms of it, so there is exactly one place
+;; where the question is answered.
+
+(defn fdiv
+  "Floor division. Rounds toward negative infinity on both platforms —
+  unlike `quot`, which truncates toward zero and therefore rounds a
+  loss-making position's PnL in the trader's favour and a winning one's
+  against them.
+
+  A zero divisor SATURATES instead of failing. The JVM's `Math/floorDiv`
+  threw a bare `ArithmeticException` where JS divided to `Infinity` and kept
+  computing — so the same call either halted the chain at the call site or
+  forked it, measured at `bk/impact-price`'s level-0 afford computation
+  (falsify-6's shape one primitive down). The clamp is `sadd`'s, by the sign
+  of the dividend; `0/0` is not a sign case and stays 0. Callers that can see
+  a zero divisor decide their own semantics on top of this — the primitive
+  only guarantees both runtimes answer the same thing."
+  [a b]
+  (if (zero? b)
+    (cond (zero? a) 0
+          (neg? a) i53-min
+          :else i53-max)
+    #?(:clj  (Math/floorDiv (long a) (long b))
+       :cljs (Math/floor (/ a b)))))
+
+(defn fmod
+  "Remainder consistent with `fdiv`: always has the sign of the divisor."
+  [a b]
+  (- a (* b (fdiv a b))))
+
+(defn fdiv-diff
+  "floor((a - b) / c) — the quotient of a DIFFERENCE, computed without ever
+  forming the difference.
+
+  `a - b` is routinely past 2^53 while the quotient sits comfortably in the
+  domain (bankruptcy price: entry-notional 2^53-1 against collateral -4,
+  divided by size 2 — two in-domain numbers whose difference is not). There
+  the two runtimes disagree at the SUBTRACTION, before the division ever
+  runs: the true difference 2^53+3 is an odd number no f64 holds, so JS
+  rounds it to 2^53+4 and the quotient lands one high — measured on kbb
+  2026-10-26: 4503599627370498 against JVM floorDiv's 4503599627370497. Same
+  signed transaction, two chains, no throw anywhere.
+
+  So the division is folded into the subtraction:
+
+    a = qa*c + ra        b = qb*c + rb        (floor division throughout)
+
+    (a-b)/c = (qa - qb) + (ra - rb)/c
+
+  Every piece is exact on both runtimes: qa and qb are quotients of in-domain
+  values (`fdiv` is exact in-domain — the pinned invariant), ra and rb are
+  floorMod residues (`rem` is IEEE-exact) smaller than |c|, and (ra-rb)/c is
+  in (-1, 1), so its floor is -1 or 0. The pieces combine through `sadd`, so
+  a quotient past the ceiling clamps exactly like `pmul` instead of forking —
+  and below the ceiling every result is byte-identical to the old raw form.
+
+  Preconditions, as `fdiv`: `c` is non-zero and `a`/`b` are in-domain."
+  [a b c]
+  (let [qa (fdiv a c)
+        qb (fdiv b c)
+        ;; floorMod residues, sign of c: a = qa*c + ra exactly. `mod`, not
+        ;; `a - qa*c` — the product qa*c can itself leave the exact range on
+        ;; JS (a rounded product gives a wrong residue).
+        ra (mod a c)
+        rb (mod b c)]
+    (sadd qa (sadd (- qb) (fdiv (- ra rb) c)))))
+
+(def ^:private ^:const split
+  "10^5. The limb base for the exact product below: rate-scale (10^9) is
+  split^2 x 10, so every intermediate in the decomposition stays below 2^53."
+  100000)
+
+(defn mul-rate
+  "Apply a rate (scaled by `rate-scale`) to an integer amount, rounding
+  toward negative infinity. Used for fees, funding, and margin fractions.
+
+  The product `amount x rate` is NEVER computed directly. It is routinely
+  above 2^53 while the result is comfortably in the domain — notional 10^14
+  at a 1 bp fee is a product of 10^19 and a fee of 10^10 — and there the two
+  runtimes fail differently: JVM `*` throws a bare overflow while JS rounds
+  and returns a wrong number silently (falsify-9's secondary finding). So the
+  division is folded into the multiplication:
+
+    amount = qa*S + ra        rate = qs*S + rs        (S = rate-scale)
+
+    amount*rate/S = amount*qs + qa*rs + floor(ra*rs/S)
+
+  and `floor(ra*rs/S)` is computed with a second split of `ra` so that no
+  intermediate anywhere exceeds 2^53 (all are below 10^14). Every partial is
+  exact on both runtimes whenever the RESULT is in the domain — the partial
+  sums are non-decreasing, so an intermediate is never larger than the final
+  sum — and when the result itself escapes the domain both runtimes throw the
+  same `check` error at the same place instead of disagreeing.
+
+  Out-of-domain `amount` or `rate` is refused up front for the same reason:
+  a silently rounded input is a different transaction on each validator."
+  [amount rate]
+  (check :mul-rate amount)
+  (check :mul-rate rate)
+  (if (or (zero? amount) (zero? rate))
+    0
+    (let [amount-neg? (neg? amount)
+          rate-neg? (neg? rate)
+          neg-out? (not= amount-neg? rate-neg?)
+          a (if amount-neg? (- amount) amount)
+          b (if rate-neg? (- rate) rate)
+          qs (quot b rate-scale)
+          rs (rem b rate-scale)
+          qa (quot a rate-scale)
+          ra (rem a rate-scale)
+          ;; floor(ra*rs / rate-scale), exact:
+          ;;   ra = q2*split + r2, so ra*rs = (q2*rs)*split + r2*rs
+          ;;   q2*rs = pw*10^4 + pr, so (q2*rs)*split = pw*rate-scale + pr*split
+          p (* (quot ra split) rs)                       ; < 10^4 * 10^9
+          tail (+ (* (rem p 10000) split) (* (rem ra split) rs))]  ; < 10^14
+      ;; `a*qs` is the one product the decomposition does not bound
+      (when (and (pos? qs) (> a (quot i53-max qs)))
+        (throw (ex-info "torihiki.fixed: value escaped the i53 domain"
+                        {:where :mul-rate :value [amount rate] :i53-max i53-max})))
+      (let [m (+ (* a qs) (* qa rs) (quot p 10000) (quot tail rate-scale))
+            exact? (zero? (rem tail rate-scale))
+            floor-m (if neg-out?
+                      (if exact? (- m) (- (inc m)))
+                      m)]
+        (check :mul-rate floor-m)))))
+
+(defn div-round-half-up
+  "a/b rounding halves away from zero. Only used where a specification
+  demands it; prefer `fdiv`."
+  [a b]
+  (let [neg? (not= (neg? a) (neg? b))
+        q (fdiv (+ (Math/abs (double a)) (fdiv (Math/abs (double b)) 2))
+                (Math/abs (double b)))]
+    (long (if neg? (- q) q))))
+
+;; ── notional ────────────────────────────────────────────────────────────────
+
+(defn abs*
+  "Absolute value that stays integral on both platforms."
+  [v]
+  (if (neg? v) (- v) v))
+
+(defn pmul
+  "`a x b`, saturated to the i53 domain.
+
+  For products whose DIVISOR is not a fixed scale — the reducing fill's
+  `entry-notional x closed / size` basis, where the quotient is always
+  in-domain but the product is not (falsify-11's secondary finding: 7.2e14 x
+  1e12 with a quotient of 7.2e14). Direct `*` there is a bare overflow on the
+  JVM and a silent rounding on JS — the same input, two different chains.
+
+  So the product is bounded BEFORE it is computed: in-domain products are
+  exact on both runtimes and returned unchanged (so every value this engine
+  has ever computed in the documented domain is byte-identical to before),
+  and out-of-domain products clamp deterministically to the bound on both
+  runtimes instead of throwing — a throw inside a fill is a halted chain, and
+  this path is reachable by an ordinary large position closing.
+
+  The clamp is a stated precision loss, not a silent one: past 2^53 the basis
+  a reducing fill retires is computed from a clamped product. Validate-layer
+  caps (`level x qty <= i53-max`) keep ordinary orders far below it."
+  [a b]
+  (let [a (or a 0)
+        b (or b 0)]
+    (if (or (zero? a) (zero? b))
+      0
+      (let [aa (abs* a)
+            ab (abs* b)]
+        (if (> aa (quot i53-max ab))
+          (if (not= (neg? a) (neg? b)) i53-min i53-max)
+          (* a b))))))
+
+(defn fmul
+  "`floor(a x b / c)` — the exact floor quotient of a product that is NEVER
+  formed, saturated to the i53 domain.
+
+  The product-then-divide class: `entry-notional x closed / size` on a reducing
+  fill, the vault share price (`amount x total / pool`), the ADL leverage and
+  score, the slash reward (`total x percent / 100`). The PRODUCT routinely
+  exceeds 2^53 while the quotient does not (7.2e14 x 1e12 / 2e12 = 3.6e14),
+  and then the two runtimes divide different numbers — the JVM the promoted
+  exact integer (or a bare overflow throw past 2^63), JS a rounded double —
+  and price the same fill two ways (falsify-11's secondary class). Folding the
+  division into the multiplication makes the quotient exact on both runtimes
+  for as long as the RESULT is in the domain, and clamps deterministically
+  past it (`pmul`'s philosophy: total, never throws — a throw inside a fill is
+  a halted chain).
+
+  The core is schoolbook on the bits of `b` from the top: the running value is
+  kept as `q*c + r` with `0 <= r < c`, and every step doubles `(q, r)` and
+  adds `a = qa*c + ra`. Only residues below `c` are ever combined, and each
+  combination is folded with a carry decided by COMPARISON (`r >= c - r`),
+  never by the doubled product itself — so no intermediate leaves the i53
+  domain on either runtime and every branch is decided identically on both.
+  `q` is saturated (`sadd`) since only `min(result, i53-max)` is observable.
+
+  Floor semantics, like `fdiv`: toward negative infinity, on every sign.
+  `c` must not be zero — every call site divides by a guarded positive, and
+  a zero divisor is a code contract violation, not a transaction outcome."
+  [a b c]
+  (when (zero? c)
+    (throw (ex-info "torihiki.fixed: value escaped the i53 domain"
+                    {:where :fmul :value [a b c] :i53-max i53-max})))
+  (let [a (or a 0)
+        b (or b 0)]
+    (if (or (zero? a) (zero? b))
+      0
+      (let [neg-out? (not= (not= (neg? a) (neg? b)) (neg? c))
+            A (abs* a)
+            B (abs* b)
+            C (abs* c)
+            qa (fdiv A C)                       ; A = qa*C + ra, 0 <= ra < C
+            ra (- A (* qa C))
+            top (loop [p 1] (if (> (* 2 p) B) p (recur (* 2 p))))]
+        (let [[q r] (loop [p top q 0 r 0 rem B]
+                      (if (zero? p)
+                        [q r]
+                        (let [bit? (>= rem p)
+                              rem (if bit? (- rem p) rem)
+                              ;; double r modulo c without forming 2r: the
+                              ;; carry is a comparison, the fold is a small
+                              ;; difference or a doubled residue below c.
+                              k (if (>= r (- C r)) 1 0)
+                              r (if (= k 1) (- r (- C r)) (+ r r))
+                              q (sadd (sadd q q) k)]
+                          (if bit?
+                            (let [k2 (if (>= r (- C ra)) 1 0)
+                                  r (if (= k2 1) (- r (- C ra)) (+ r ra))]
+                              (recur (quot p 2) (sadd (sadd q qa) k2) r rem))
+                            (recur (quot p 2) q r rem)))))
+              m (if (and neg-out? (pos? r)) (inc q) q)]
+          (if neg-out?
+            (max i53-min (- m))
+            (min i53-max m)))))))
+
+(defn notional
+  "price-ticks * size-lots, in the market's notional unit, saturated to the
+  i53 domain like every product here (`pmul`).
+
+  The single most common place to blow the i53 ceiling — and it is reached
+  with IN-DOMAIN factors from the valuation path: mark x accumulated size on a
+  large position (unrealized PnL, margin, liquidation, funding), a flipping
+  fill's price x old size. The old `(check :notional (* price size))` computed
+  the product first and then threw on it — mid-apply, after the book had
+  already traded, which is a halted chain (falsify-6/7's class) — and past
+  2^63 the JVM threw a bare overflow while JS rounded silently (falsify-9/11's
+  secondary class). Saturating is total and branch-identical on both runtimes;
+  see `pmul` for why in-domain products are byte-identical to before."
+  [price size]
+  (pmul price size))
+
+(defn clamp
+  [v lo hi]
+  (cond (< v lo) lo
+        (> v hi) hi
+        :else v))

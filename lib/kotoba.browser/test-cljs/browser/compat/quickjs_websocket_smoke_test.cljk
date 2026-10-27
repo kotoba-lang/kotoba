@@ -1,0 +1,308 @@
+(ns browser.compat.quickjs-websocket-smoke-test
+  "Real page-script round-trip proof for WebSocket: script 1 opens a REAL
+  connection and sends REAL bytes to a REAL local server, real wall-clock
+  time genuinely passes (so Node's real event loop can really finish the
+  real handshake + echo), and script 2 -- via the SAME mechanism
+  `quickjs_geolocation_smoke_test.cljs` proved for
+  `navigator.geolocation.getCurrentPosition` -- observes what really came
+  back, committed into `document.title` by the REAL, still-registered
+  `ws.onmessage` callback script 1 installed.
+
+  ## Why this test drives two `run-script!` calls instead of one page's
+  ## two `<script>` tags
+
+  `browser.compat.quickjs-runner/run-page-scripts!` evaluates every
+  `<script>` tag on a page in one synchronous `reduce` (see that
+  namespace's docstring) -- there is no point at which Node's event loop
+  gets to run BETWEEN two `<script>` tags on the same page, so a real
+  async WebSocket handshake+echo genuinely cannot complete mid-page the
+  way it needs to for this proof. This test instead calls
+  `quickjs-runner/run-script!` directly, twice, with a REAL `js/Promise`+
+  `setTimeout` wait in between -- exactly the real, honest place real time
+  has to pass for real async I/O to complete (a real browser would have
+  this same constraint WITHIN a single synchronous script's execution;
+  the wait here plays the role real inter-script/inter-tick browser time
+  would). Both calls carry the SAME `:script/generation` a real
+  `run-page-scripts!` reduce would tag two `<script>` tags on the SAME
+  page with, so `run-script!`'s normal page-lifetime state threading
+  (`persistent-execution-keys`, including the new `:websocket/handles`)
+  applies unchanged -- this is not a different code path from what two
+  literal `<script>` tags would exercise, just driven directly instead of
+  through `run-page-scripts!`'s HTML-tag discovery.
+
+  ## What is real here
+
+  - `websocket-echo-server` below is a REAL, minimal, hand-rolled RFC6455
+    server (real HTTP-Upgrade handshake incl. a real `Sec-WebSocket-Accept`
+    computation, real frame parsing/framing, echoes back whatever real text
+    frame it receives) built on Node's built-in `net` + `crypto` modules
+    (no new dependency) -- the Node-side analogue of
+    `test/browser/net_websocket_test.cljk`'s JVM `java.net.ServerSocket`
+    server, since the JDK server can't be reused from a Node process and
+    vice versa.
+  - The client side is `browser.net.websocket`'s REAL `:cljs` `websocket-fn`
+    (Node's own built-in, global `WebSocket`), injected into the session as
+    `:websocket-fn` exactly the way a real host would.
+  - `new WebSocket(url)`, `.send(...)`, and the registered `.onmessage`
+    callback are all real JS running in the real QuickJS VM
+    (`quickjs-wasm/engine!`), not mocked or inlined.
+  - The proof is genuinely JS-visible: the test asserts the REAL committed
+    `document.title`, not a host-side `:capability/results` log entry."
+  (:require ["net" :as net]
+            ["crypto" :as crypto]
+            [cljs.test :refer [deftest is async]]
+            [kotoba.lang.text :as str]
+            [browser.compat.quickjs-runner :as quickjs-runner]
+            [browser.net.websocket :as ws]
+            [browser.origin :as origin]
+            [browser.profile :as profile]
+            [browser.session :as session]
+            [kotoba.wasm.host :as host]))
+
+;; ---------------------------------------------------------------------
+;; A minimal, hand-rolled RFC6455 echo server on Node's built-in `net` +
+;; `crypto` (no new dependency) -- the Node-side analogue of
+;; test/browser/net_websocket_test.cljk's java.net.ServerSocket server.
+;; ---------------------------------------------------------------------
+
+(def ^:private websocket-magic "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
+
+(defn- accept-value
+  [key]
+  (-> (.createHash crypto "sha1")
+      (.update (str key websocket-magic))
+      (.digest "base64")))
+
+(defn- parse-header-block
+  [^js header-text]
+  (let [lines (str/split header-text #"\r\n")]
+    (reduce (fn [headers line]
+              (let [colon (.indexOf line ":")]
+                (if (pos? colon)
+                  (assoc headers
+                         (str/lower (str/trim (subs line 0 colon)))
+                         (str/trim (subs line (inc colon))))
+                  headers)))
+            {}
+            (rest lines))))
+
+(defn- try-parse-frame
+  "Try to parse one RFC6455 frame (client frames are always masked) out of
+   the front of `buf`. Returns nil if `buf` does not yet contain a whole
+   frame (more `data` chunks needed), else `{:opcode :payload :consumed}`."
+  [^js buf]
+  (when (>= (.-length buf) 2)
+    (let [b0 (.readUInt8 buf 0)
+          b1 (.readUInt8 buf 1)
+          opcode (bit-and b0 0x0F)
+          masked? (not (zero? (bit-and b1 0x80)))
+          len0 (bit-and b1 0x7F)
+          header-extra (cond (= len0 126) 2 (= len0 127) 8 :else 0)
+          mask-len (if masked? 4 0)]
+      (when (>= (.-length buf) (+ 2 header-extra mask-len))
+        (let [payload-len (cond
+                             (= len0 126) (.readUInt16BE buf 2)
+                             (= len0 127) (js/Number (.readBigUInt64BE buf 2))
+                             :else len0)
+              mask-offset (+ 2 header-extra)
+              payload-offset (+ mask-offset mask-len)
+              total (+ payload-offset payload-len)]
+          (when (>= (.-length buf) total)
+            (let [mask-key (when masked? (.slice buf mask-offset (+ mask-offset 4)))
+                  raw (.slice buf payload-offset total)
+                  payload (if masked?
+                            (let [out (js/Buffer.alloc payload-len)]
+                              (dotimes [i payload-len]
+                                (.writeUInt8 out
+                                             (bit-xor (.readUInt8 raw i)
+                                                      (.readUInt8 mask-key (mod i 4)))
+                                             i))
+                              out)
+                            raw)]
+              {:opcode opcode :payload payload :consumed total})))))))
+
+(defn- write-frame!
+  "Write one unmasked RFC6455 frame (servers never mask) with FIN set."
+  [^js socket opcode ^js payload]
+  (let [len (.-length payload)
+        header (cond
+                 (< len 126)
+                 (js/Buffer.from #js [(bit-or 0x80 opcode) len])
+
+                 (< len 65536)
+                 (let [b (js/Buffer.alloc 4)]
+                   (.writeUInt8 b (bit-or 0x80 opcode) 0)
+                   (.writeUInt8 b 126 1)
+                   (.writeUInt16BE b len 2)
+                   b)
+
+                 :else
+                 (let [b (js/Buffer.alloc 10)]
+                   (.writeUInt8 b (bit-or 0x80 opcode) 0)
+                   (.writeUInt8 b 127 1)
+                   (.writeBigUInt64BE b (js/BigInt len) 2)
+                   b))]
+    (.write socket (js/Buffer.concat #js [header payload]))))
+
+(defn- drain-frames!
+  [^js socket state]
+  (loop []
+    (when-let [{:keys [opcode payload consumed]} (try-parse-frame (:buffer @state))]
+      (swap! state update :buffer #(.slice ^js % consumed))
+      (case opcode
+        1 (write-frame! socket 1 payload)
+        8 (write-frame! socket 8 (js/Buffer.alloc 0))
+        9 (write-frame! socket 0xA payload)
+        nil)
+      (recur))))
+
+(defn- handle-socket!
+  [^js socket]
+  (let [state (atom {:handshaked? false :buffer (js/Buffer.alloc 0)})]
+    (.on socket "data"
+         (fn [chunk]
+           (swap! state update :buffer #(js/Buffer.concat #js [% chunk]))
+           (if (:handshaked? @state)
+             (drain-frames! socket state)
+             (let [buf (:buffer @state)
+                   idx (.indexOf buf "\r\n\r\n")]
+               (when (>= idx 0)
+                 (let [header-text (.toString (.slice buf 0 idx) "ascii")
+                       headers (parse-header-block header-text)
+                       accept (accept-value (get headers "sec-websocket-key"))
+                       response (str "HTTP/1.1 101 Switching Protocols\r\n"
+                                     "Upgrade: websocket\r\n"
+                                     "Connection: Upgrade\r\n"
+                                     "Sec-WebSocket-Accept: " accept "\r\n"
+                                     "\r\n")]
+                   (.write socket response "ascii")
+                   (swap! state assoc :handshaked? true :buffer (.slice buf (+ idx 4)))
+                   (drain-frames! socket state)))))))
+    (.on socket "error" (fn [_] nil))))
+
+(defn- start-echo-server!
+  "Start a real, minimal RFC6455 echo server bound to loopback on an
+   OS-assigned port. Returns a Promise of {:server server :url \"ws://...\"}."
+  []
+  (js/Promise.
+   (fn [resolve _reject]
+     (let [server (.createServer net (fn [socket] (handle-socket! socket)))]
+       (.listen server 0 "127.0.0.1"
+                (fn []
+                  (let [port (.-port (.address server))]
+                    (resolve {:server server
+                              :url (str "ws://127.0.0.1:" port "/echo")}))))))))
+
+(defn- stop-echo-server!
+  [{:keys [server]}]
+  (.close server))
+
+;; ---------------------------------------------------------------------
+;; Real two-script round trip
+;; ---------------------------------------------------------------------
+
+(defn- wait-ms
+  [ms]
+  (js/Promise. (fn [resolve _reject] (js/setTimeout resolve ms))))
+
+(defn- dispose-engine!
+  [session]
+  (when-let [engine (get-in session [:browser.session/script-engine :script-engine/engine])]
+    (when-let [dispose (:quickjs.engine/dispose engine)]
+      (dispose engine))))
+
+(defn- build-session
+  [url]
+  (let [profile (-> (profile/new-profile {:id "ws-allowed"})
+                    (profile/grant-permission (origin/origin url) :websocket/connect))
+        h (host/recording-host)]
+    (session/new-session
+     (quickjs-runner/quickjs-session-opts
+      {:host h
+       :profile profile
+       :websocket-fn (ws/websocket-fn)}))))
+
+(defn- run-script1!
+  "Run the FIRST real <script> tag (as `quickjs-runner/run-script!` would if
+   `run-page-scripts!` had discovered it): open a real connection, register
+   a real `onmessage` callback, send real data. Returns
+   `{:session ... :generation ...}` -- `generation` is threaded into
+   `run-script2!` unchanged so it rehydrates the SAME page-lifetime
+   `:websocket/handles` this call leaves behind (see namespace docstring)."
+  [ready-session url]
+  (let [page-session (session/load-html!
+                      ready-session
+                      {:url "kotoba://quickjs-runner/websocket-round-trip"
+                       :html "<main></main>"})
+        generation (:browser.session/page-generation page-session)
+        script1 {:script/type :classic
+                 :script/url "kotoba://quickjs-runner/websocket-round-trip/script1.js"
+                 :script/generation generation
+                 :script/source
+                 (str "var ws = new WebSocket(" (pr-str url) ");"
+                      "ws.onmessage = function(e) { document.title = e.data; };"
+                      "ws.send('hello real socket');")}]
+    {:session (quickjs-runner/run-script! page-session script1)
+     :generation generation}))
+
+(defn- run-script2!
+  "Run the SECOND real <script> tag. Its own source does not even touch
+   `ws` -- the real `onmessage` delivery already happened automatically
+   while installing THIS eval's snapshot (`quickjs-wasm`'s webapi shim,
+   before any user source runs), so `document.title` is already committed
+   by the time this returns. Deliberately minimal, to make the proof
+   crisp: whatever set `document.title` did so via the real snapshot/
+   registry mechanism, not because script 2 asked it to."
+  [session generation]
+  (quickjs-runner/run-script!
+   session
+   {:script/type :classic
+    :script/url "kotoba://quickjs-runner/websocket-round-trip/script2.js"
+    :script/generation generation
+    :script/source "void 0;"}))
+
+(defn- assert-real-round-trip!
+  [final-session]
+  (let [title (get-in final-session [:browser.session/page :browser/title])]
+    (println "websocket round-trip: real committed document.title ->" (pr-str title))
+    (is (= "hello real socket" title)
+        (str "expected script 2's snapshot install to synchronously invoke "
+             "script 1's real, still-registered ws.onmessage with the REAL "
+             "text echoed back by the real server, committing it into "
+             "document.title -- got " (pr-str title)))))
+
+(deftest quickjs-websocket-real-round-trip-across-two-script-tags-test
+  (async done
+    (let [server-atom (atom nil)
+          session-atom (atom nil)
+          fail! (fn [err]
+                  (is false (str "QuickJS WASM engine initialization / page load failed: "
+                                 (or (.-message err) err))))
+          cleanup! (fn []
+                     (dispose-engine! @session-atom)
+                     (when-let [server @server-atom] (stop-echo-server! server))
+                     (done))]
+      (-> (start-echo-server!)
+          (.then (fn [server]
+                   (reset! server-atom server)
+                   (let [base-session (build-session (:url server))]
+                     (reset! session-atom base-session)
+                     (session/ensure-script-engine! base-session))))
+          (.then (fn [ready-session]
+                   (reset! session-atom ready-session)
+                   (is (= :ready (get-in ready-session [:browser.session/script-engine
+                                                         :script-engine/status]))
+                       "engine should be ready before running page scripts")
+                   (run-script1! ready-session (:url @server-atom))))
+          (.then (fn [{:keys [session generation]}]
+                   (reset! session-atom session)
+                   ;; Real wall-clock time genuinely has to pass here for
+                   ;; Node's real event loop to finish the real
+                   ;; handshake + echo -- see namespace docstring.
+                   (-> (wait-ms 500)
+                       (.then (fn [_] (run-script2! session generation))))))
+          (.then (fn [final-session]
+                   (reset! session-atom final-session)
+                   (assert-real-round-trip! final-session)))
+          (.catch fail!)
+          (.finally cleanup!)))))

@@ -1,0 +1,1648 @@
+(ns browser.session
+  "Session adapter from browser pages/surfaces to the kotoba:dom host ABI."
+  (:require [kotoba.http.form-urlencoded :as form-urlencoded] [browser.accessibility :as accessibility]
+            [browser.audit :as audit]
+            [browser.chrome :as chrome]
+            [browser.core :as browser]
+            [browser.document-input :as document-input]
+            [browser.input :as input]
+            [browser.net :as net]
+            [browser.origin :as origin]
+            [browser.page-script :as page-script]
+            [browser.persistence :as persistence]
+            [browser.persistence-provider :as persistence-provider]
+            [browser.profile :as profile]
+            [browser.script-engine :as script-engine]
+            [browser.storage :as storage]
+            [browser.surface :as surface]
+            [kotoba.lang.text :as str]
+            [kotoba.wasm.host :as host]))
+
+(def redirect-statuses #{301 302 303 307 308})
+
+(defn- strip-fragment
+  [url]
+  (let [url (str url)
+        idx (.indexOf url "#")]
+    (if (neg? idx) url (subs url 0 idx))))
+
+(defn- current-navigation-page
+  [navigation]
+  (let [idx (:index navigation -1)]
+    (get-in navigation [:entries idx :page])))
+
+(defn- restore
+  [opts]
+  (if-let [provider (:persistence-provider opts)]
+    (if-let [snapshot (persistence-provider/load-snapshot! provider)]
+      (let [{:keys [history navigation]} (persistence/replay-session snapshot)]
+        (merge {:profile (:snapshot/profile snapshot)
+                :store (:snapshot/storage snapshot)
+                :audit (:snapshot/audit snapshot)
+                :chrome (:snapshot/chrome snapshot)
+                :surface (:snapshot/surface snapshot)
+                :navigation navigation
+                :history history
+                :page (current-navigation-page navigation)}
+               opts))
+      opts)
+    opts))
+
+(defn new-session
+  "Build a new browser session map from host-supplied `opts`.
+
+  `:fetch-fn`/`:websocket-fn`/`:worker-fn`/`:geolocation` are the host-injection
+  points a real embedding application supplies when constructing a session.
+  The first three are FUNCTIONS, called fresh each time a real I/O capability
+  is exercised. `:geolocation` is different in shape: it is an ATOM the host
+  owns and updates externally (e.g. a real GPS driver `swap!`s it whenever the
+  device moves) -- matching the exact shape `browser.compat.quickjs-execution/
+  new-state`'s own `:geolocation` key already expects and every existing test
+  already constructs by hand. This fn does NOT default `:geolocation` to a
+  fresh atom when none is supplied -- `new-state`'s own
+  `(or geolocation (atom {:latitude 0.0 :longitude 0.0 :accuracy 0.0}))`
+  default keeps doing that job, exactly as it already does today for direct
+  `new-state` callers; `browser.compat.quickjs-runner/run-script!` is what
+  threads `:browser.session/geolocation` into every `new-state` call."
+  [{:keys [host viewport theme color-scheme fetch-fn websocket-fn worker-fn geolocation surface account profile input audit
+           persistence-provider store chrome navigation history page script-runner
+           script-engine engine-factory dispose-engine-fn] :as opts}]
+  (let [{:keys [profile store audit chrome surface navigation history page] :as opts} (restore opts)]
+  {:browser.session/host host
+   :browser.session/viewport (or viewport [800 600])
+   :browser.session/theme theme
+   :browser.session/color-scheme color-scheme
+   :browser.session/fetch-fn fetch-fn
+   :browser.session/websocket-fn websocket-fn
+   :browser.session/worker-fn worker-fn
+   :browser.session/geolocation geolocation
+   :browser.session/script-runner script-runner
+   :browser.session/script-engine (or script-engine
+                                      (script-engine/empty-manager
+                                       {:engine-factory engine-factory
+                                        :dispose-fn dispose-engine-fn}))
+   :browser.session/persistence-provider persistence-provider
+   :browser.session/store store
+   :browser.session/chrome (or chrome (browser.chrome/empty-chrome))
+   :browser.session/account account
+   :browser.session/profile profile
+   :browser.session/input (or input (input/empty-state))
+   :browser.session/page page
+   :browser.session/page-generation (or (:page-generation opts) 0)
+   :browser.session/surface surface
+   :browser.session/last-batch nil
+   :browser.session/error nil
+   :browser.session/error-document nil
+   :browser.session/navigation (or navigation {:entries []
+                                               :index -1
+                                               :redirects []})
+   :browser.session/script-history-bridged-count 0
+   :browser.session/history (or history [])
+   :browser.session/audit (or audit (audit/empty-log))}))
+
+(defn- profile-id
+  [session]
+  (get-in session [:browser.session/profile :profile/id]))
+
+(defn- audit!
+  [session event]
+  (update session :browser.session/audit audit/append-event event))
+
+(defn- snapshot-state
+  [session]
+  {:profile (:browser.session/profile session)
+   :store (:browser.session/store session)
+   :audit (:browser.session/audit session)
+   :chrome (:browser.session/chrome session)
+   :surface (:browser.session/surface session)
+   :session {:history (:browser.session/history session)
+             :navigation (:browser.session/navigation session)}})
+
+(defn persist!
+  [session]
+  (if-let [provider (:browser.session/persistence-provider session)]
+    (do
+      (persistence-provider/save-browser-state! provider (snapshot-state session))
+      session)
+    session))
+
+(defn accessibility-tree
+  "Return the current host-facing accessibility tree for page + OS surface."
+  [session]
+  (accessibility/session-tree session))
+
+(defn ensure-script-engine!
+  [session]
+  (script-engine/ensure! session))
+
+(defn begin-script-engine-start!
+  [session]
+  (let [{:keys [session token generation engine-or-promise]} (script-engine/begin-start! session)]
+    {:session (update session :browser.session/history conj
+                      {:event :script-engine/start
+                       :script-engine/token token
+                       :page/generation generation})
+     :token token
+     :generation generation
+     :engine-or-promise engine-or-promise}))
+
+(defn complete-script-engine-start!
+  [session completion]
+  (let [before (get-in session [:browser.session/script-engine :script-engine/status])
+        session (script-engine/complete-start! session completion)
+        after (get-in session [:browser.session/script-engine :script-engine/status])
+        stale? (not= :ready after)]
+    (update session :browser.session/history conj
+            (cond-> {:event (if stale?
+                              :script-engine/stale-completion
+                              :script-engine/ready)
+                     :script-engine/token (:token completion)
+                     :page/generation (:generation completion)}
+              before (assoc :script-engine/previous-status before)))))
+
+(defn fail-script-engine-start!
+  [session failure]
+  (-> (script-engine/fail-start! session failure)
+      (update :browser.session/history conj
+              {:event :script-engine/error
+               :script-engine/token (:token failure)
+               :page/generation (:generation failure)
+               :error (:error failure)})))
+
+(defn abort-script-engine-start!
+  ([session]
+   (abort-script-engine-start! session :navigation/new-page))
+  ([session reason]
+   (let [pending (get-in session [:browser.session/script-engine :script-engine/pending])]
+     (cond-> (script-engine/abort-pending! session reason)
+       pending
+       (update :browser.session/history conj
+               {:event :script-engine/abort
+                :script-engine/token (:script-engine/token pending)
+                :page/generation (:script-engine/generation pending)
+                :reason reason})))))
+
+(defn dispose-script-engine!
+  [session]
+  (-> (script-engine/dispose! session)
+      (update :browser.session/history conj {:event :script-engine/dispose})))
+
+(defn- script-cache-source
+  "browser.storage keys every value by ORIGIN only (correct for
+  origin-scoped data like cookies), so script-source-storage-key alone
+  is not enough to tell two different scripts on the SAME origin apart
+  -- a map keyed by the full script url, stored under that one
+  per-origin slot, is (mirroring how cookie-variants already
+  disambiguates multiple cookies within one origin's storage slot)."
+  [session url]
+  (when (and (:browser.session/store session)
+             (:browser.session/profile session))
+    (get (storage/get-value (:browser.session/store session)
+                            (:browser.session/profile session)
+                            url
+                            page-script/script-source-storage-key)
+         (str url))))
+
+(defn- cache-script-source
+  [session url source]
+  (if (and (:browser.session/store session)
+           (:browser.session/profile session))
+    (update session :browser.session/store
+            (fn [store]
+              (let [profile (:browser.session/profile session)
+                    by-url (or (storage/get-value store profile url page-script/script-source-storage-key)
+                               {})]
+                (storage/put-value store
+                                   profile
+                                   url
+                                   page-script/script-source-storage-key
+                                   (assoc by-url (str url) source)))))
+    session))
+
+(defn- navigation-cookie-header
+  [session page-url url]
+  (when (and (:browser.session/store session)
+             (:browser.session/profile session))
+    ;; `navigate!` (this fn's only caller) always issues a top-level GET --
+    ;; the one real-browser case a SameSite=Lax/default cookie is still
+    ;; attached to even cross-site (e.g. clicking an inbound external
+    ;; link), unlike a cross-site subresource/script fetch.
+    (net/cookie-header (:browser.session/store session)
+                       (:browser.session/profile session)
+                       page-url
+                       url
+                       true)))
+
+(defn- remember-navigation-response-cookies
+  [session url response]
+  (if (and (:browser.session/store session)
+           (:browser.session/profile session))
+    (update session :browser.session/store
+            net/remember-response-cookies
+            (:browser.session/profile session)
+            url
+            response)
+    session))
+
+(defn net-context
+  "Build the browser network policy context for page script execution."
+  [session]
+  (when-let [page-url (get-in session [:browser.session/page :browser/url])]
+    (cond-> {:store (:browser.session/store session)
+             :profile (:browser.session/profile session)
+             :page-url page-url
+             :credentials :same-origin}
+      (:browser.session/fetch-fn session)
+      (assoc :fetch-fn (:browser.session/fetch-fn session)))))
+
+(defn- script-permission-decision
+  [session url]
+  (if-let [profile (:browser.session/profile session)]
+    (profile/permission-decision profile (origin/origin url) :net/fetch)
+    {:permission/decision :deny
+     :origin (origin/origin url)
+     :capability :net/fetch
+     :profile/id nil
+     :reason :permission/no-profile}))
+
+(defn- record-script-event
+  [session event]
+  (update session :browser.session/history conj event))
+
+(defn- lifecycle-script
+  [session target event-type]
+  (let [page-url (get-in session [:browser.session/page :browser/url])
+        dispatch (case target
+                   :document "document.dispatchEvent"
+                   :window "window.dispatchEvent")]
+    {:script/type :classic
+     :script/source (str dispatch "(new Event('" event-type "'));")
+     :script/url page-url
+     :script/lifecycle-event event-type
+     :script/event-target target}))
+
+(defn- fetch-script-source
+  [session url]
+  (when-let [fetch-fn (:browser.session/fetch-fn session)]
+    (net/fetch-resource (assoc (net-context session)
+                               :fetch-fn fetch-fn
+                               :cache? false)
+                        {:url url
+                         :method :get
+                         :capability :script/src
+                         :referrer (get-in session [:browser.session/page :browser/url])})))
+
+(defn- document-base-uri
+  [session]
+  (or (get-in session [:browser.session/page :browser/document :base-uri])
+      (get-in session [:browser.session/page :browser/url])))
+
+(defn resolve-script-source!
+  [session script]
+  (if-not (:script/src script)
+    {:session session :script script}
+    (let [url (page-script/resolve-src (document-base-uri session)
+                                       (:script/src script))
+          decision (script-permission-decision session url)
+          session (audit! session (audit/permission-event decision))]
+      (cond
+        (not= :allow (:permission/decision decision))
+        {:session (record-script-event session {:event :script/blocked
+                                                :url url
+                                                :script/type (:script/type script)
+                                                :reason (:reason decision)})
+         :script (assoc script
+                        :script/url url
+                        :script/error :script/permission-denied)}
+
+        (script-cache-source session url)
+        {:session (record-script-event session {:event :script/cache-hit
+                                                :url url
+                                                :script/type (:script/type script)})
+         :script (assoc script
+                        :script/url url
+                        :script/source (script-cache-source session url)
+                        :script/cache-hit? true)}
+
+        :else
+        (let [fetch-result (fetch-script-source session url)
+              session (cond-> session
+                        (contains? fetch-result :store)
+                        (assoc :browser.session/store (:store fetch-result)))
+              response (:response fetch-result)
+              status (:status response)]
+          (if (<= 200 (or status 0) 299)
+            (let [source (:body response)]
+              {:session (-> session
+                            (cache-script-source url source)
+                            (record-script-event {:event :script/fetch
+                                                  :url url
+                                                  :status status
+                                                  :script/type (:script/type script)}))
+               :script (assoc script
+                              :script/url url
+                              :script/source source)})
+            {:session (record-script-event session {:event :script/error
+                                                    :url url
+                                                    :status status
+                                                    :error :script/fetch-failed})
+             :script (assoc script
+                            :script/url url
+                            :script/error :script/fetch-failed)}))))))
+
+(defn- remember-navigation-entry
+  "`same-document?` (default false, i.e. a genuine, distinct navigation --
+   the far more common real caller, commit-page!'s own remember? branch)
+   tags whether `page` is a REAL, independently-fetched/committed
+   document (safe for back!/forward! to later re-commit its own
+   :browser/ops against the host) or merely a URL-only COPY of whatever
+   document already existed at the moment a script called pushState (see
+   bridge-pushed-history-entries below, the only caller that passes
+   `true`) -- re-committing THAT kind of entry's own :browser/ops would
+   replay real DOM-construction ops (:dom/create-element et al.) a SECOND
+   time against a host that already has those exact nodes, visibly
+   duplicating the rendered page. See back!/forward!'s own
+   navigate-to-history-entry! for the fix this tag exists to enable."
+  ([session page] (remember-navigation-entry session page false))
+  ([session page same-document?]
+   (let [nav (:browser.session/navigation session)
+         idx (inc (:index nav -1))
+         entries (-> (:entries nav)
+                     (subvec 0 (max 0 idx))
+                     (conj {:url (:browser/url page)
+                            :page page
+                            :same-document? same-document?}))]
+     (assoc session :browser.session/navigation
+            (assoc nav :entries entries :index idx)))))
+
+(defn- update-current-navigation-page
+  [session page]
+  (let [idx (get-in session [:browser.session/navigation :index] -1)]
+    (if (get-in session [:browser.session/navigation :entries idx])
+      (assoc-in session [:browser.session/navigation :entries idx :page] page)
+      session)))
+
+(defn- set-page-ready-state
+  [session ready-state]
+  (if-let [page (:browser.session/page session)]
+    (let [page (assoc-in page [:browser/document :ready-state] ready-state)]
+      (-> session
+          (assoc :browser.session/page page)
+          (update-current-navigation-page page)))
+    session))
+
+(defn- same-document-fragment-navigation?
+  [session url]
+  (let [current-url (get-in session [:browser.session/page :browser/url])]
+    (and current-url
+         (not= (str current-url) (str url))
+         (= (strip-fragment current-url) (strip-fragment url)))))
+
+(defn commit-page!
+  ([session page]
+   (commit-page! session page {:remember? true}))
+  ([session page {:keys [remember?] :or {remember? true}}]
+  (let [session (abort-script-engine-start! session :navigation/new-page)
+        batch (host/commit! (:browser.session/host session) (:browser/ops page))
+        generation (inc (:browser.session/page-generation session 0))]
+    (-> session
+        (assoc :browser.session/page page
+               :browser.session/page-generation generation
+               :browser.session/last-batch batch
+               :browser.session/error nil
+               :browser.session/error-document nil
+               :browser.session/script-history-bridged-count 0)
+        (update :browser.session/profile
+                (fn [p]
+                  (if p
+                    (profile/remember-navigation p {:url (:browser/url page)
+                                                    :title (:browser/title page)})
+                    p)))
+        (cond-> remember? (remember-navigation-entry page))
+        (audit! (audit/page-commit-event {:url (:browser/url page)
+                                          :op-count (count (:browser/ops page))
+                                          :profile-id (profile-id session)}))
+        (update :browser.session/history conj {:event :page/commit
+                                               :url (:browser/url page)
+                                               :page/generation generation
+                                               :op-count (count (:browser/ops page))})
+        (persist!)))))
+
+(defn commit-fragment-navigation!
+  [session url]
+  (let [page (assoc (:browser.session/page session) :browser/url url)]
+    (-> session
+        (assoc :browser.session/page page
+               :browser.session/error nil
+               :browser.session/error-document nil
+               :browser.session/navigation (assoc (:browser.session/navigation session)
+                                                  :redirects []))
+        (update :browser.session/profile
+                (fn [p]
+                  (if p
+                    (profile/remember-navigation p {:url url
+                                                    :title (:browser/title page)})
+                    p)))
+        (remember-navigation-entry page true)
+        (audit! (audit/navigation-event {:event :navigation/fragment
+                                         :url url
+                                         :profile-id (profile-id session)}))
+        (update :browser.session/history conj {:event :navigation/fragment
+                                               :url url})
+        (persist!))))
+
+(defn resume-current-page!
+  "Present the restored/current page to the host without changing navigation."
+  [session]
+  (if-let [page (:browser.session/page session)]
+    (let [batch (host/commit! (:browser.session/host session) (:browser/ops page))]
+      (-> session
+          (assoc :browser.session/last-batch batch
+                 :browser.session/error nil
+                 :browser.session/error-document nil)
+          (audit! (audit/page-commit-event {:url (:browser/url page)
+                                            :op-count (count (:browser/ops page))
+                                            :profile-id (profile-id session)}))
+          (update :browser.session/history conj {:event :page/resume
+                                                 :url (:browser/url page)
+                                                 :page/generation (:browser.session/page-generation session)
+                                                 :op-count (count (:browser/ops page))})
+          (persist!)))
+    session))
+
+(defn commit-document!
+  [session document]
+  (let [page (browser/refresh-page (:browser.session/page session)
+                                   {:document document
+                                    :viewport (:browser.session/viewport session)
+                                    :theme (:browser.session/theme session)
+                                    :color-scheme (:browser.session/color-scheme session)})
+        batch (host/commit! (:browser.session/host session) (:browser/ops page))]
+    (-> session
+        (assoc :browser.session/page page
+               :browser.session/last-batch batch
+               :browser.session/error nil)
+        (update-current-navigation-page page)
+        (audit! (audit/page-commit-event {:url (:browser/url page)
+                                          :op-count (count (:browser/ops page))
+                                          :profile-id (profile-id session)}))
+        (update :browser.session/history conj {:event :page/document-commit
+                                               :url (:browser/url page)
+                                               :page/generation (:browser.session/page-generation session)
+                                               :op-count (count (:browser/ops page))})
+        (persist!))))
+
+(defn- apply-script-net-store
+  [session script-state]
+  (if (contains? (:net/context script-state) :store)
+    (assoc session :browser.session/store (get-in script-state [:net/context :store]))
+    session))
+
+(defn- bridge-pushed-history-entries
+  "Real `history.pushState(state, title, url)` calls already run for real
+   against `quickjs-execution`'s own sandboxed `:history/entries`/
+   `:history/index` model (see `history-push-state-result` et al. in that
+   namespace) -- a script calling it gets a real, correct return value and
+   a real, growing in-VM entry list -- but until this fix, NOTHING ever
+   read that model back out into this session's own REAL navigation stack
+   (`:browser.session/navigation`, the same one `back!`/`forward!`/
+   `reload!` operate on): no session-level URL update, no new navigation
+   entry, nothing persisted. A script's `pushState` call was a real,
+   working no-op as far as the rest of this engine could tell.
+
+   `:browser.session/script-history-bridged-count` tracks how many of
+   `script-state`'s own `:history/entries` have ALREADY been bridged into
+   `:browser.session/navigation` (reset to 0 on every real navigation via
+   `commit-page!`, since `quickjs-execution/new-state` itself always
+   starts a fresh page generation's sandboxed history at `:history/entries
+   []` regardless of this session's own real navigation depth). Each
+   sandbox entry BEYOND that count is a genuinely NEW `pushState` call
+   this invocation just made -- bridged here by updating the session's
+   current page's own `:browser/url` (pushState never touches the
+   document itself, only the URL/history) and recording a real navigation
+   entry for it, mirroring `remember-navigation-entry`'s own shape.
+
+   Deliberately scoped to `pushState`-driven GROWTH only. See
+   `bridge-replaced-history-entry` right below for the sibling fix
+   closing `replaceState`, and `bridge-traversed-history-index` further
+   below for the third sibling closing (a scoped slice of) `history.
+   go()`/`back()`/`forward()`."
+  [session script-state]
+  (let [entries (vec (:history/entries script-state))
+        already-bridged (:browser.session/script-history-bridged-count session 0)]
+    (if (> (count entries) already-bridged)
+      (reduce (fn [session entry]
+                (let [page (assoc (:browser.session/page session) :browser/url (:url entry))]
+                  (-> session
+                      (assoc :browser.session/page page)
+                      (remember-navigation-entry page true))))
+              (assoc session :browser.session/script-history-bridged-count (count entries))
+              (subvec entries already-bridged))
+      session)))
+
+(defn- bridge-replaced-history-entry
+  "The `replaceState` half of the same gap `bridge-pushed-history-entries`
+   closes above -- deliberately a SEPARATE, follow-on fix rather than
+   folded into that one, since `replaceState`'s own real HTML5 semantics
+   are genuinely different: it overwrites the CURRENT sandbox entry's
+   content IN PLACE (same `:history/entries` count as before, just
+   different `:url`/`:title`/`:state` at the current `:history/index`),
+   never creating a new entry -- the exact case
+   `bridge-pushed-history-entries`'s own GROWTH-only check
+   (`(> (count entries) already-bridged)`) correctly, deliberately never
+   catches.
+
+   Only fires when: `:history/entries`' count is UNCHANGED from what's
+   already bridged (no `pushState` happened this call -- if one did,
+   `bridge-pushed-history-entries` runs first, in `commit-script-state!`,
+   and already advances `already-bridged` to match, so this fn correctly
+   sees `count == already-bridged` again and finds nothing left to
+   replace, since the freshly-pushed entry's content already matches
+   what was just bridged); the sandbox's own current index points at the
+   LAST already-bridged entry (an index moved by a `:history/traverse`
+   call is deliberately NOT treated as a replace -- see
+   `bridge-traversed-history-index` right below for that separate case);
+   and that entry's URL genuinely differs from what the session already
+   has recorded, i.e. an actual `replaceState` call happened, not a
+   same-tab replay of already-bridged state.
+
+   Updates the session's current page's own `:browser/url` (replaceState
+   never touches the document either, same as pushState) AND the
+   matching entry already sitting in `:browser.session/navigation` at
+   its own current `:index`, in place -- no new navigation entry, since
+   `replaceState`'s entire point in real HTML5 is that it does NOT grow
+   the history stack."
+  [session script-state]
+  (let [entries (vec (:history/entries script-state))
+        already-bridged (:browser.session/script-history-bridged-count session 0)
+        idx (:history/index script-state)]
+    (if-let [entry (when (and (= (count entries) already-bridged)
+                              (pos? already-bridged)
+                              (= idx (dec already-bridged)))
+                     (nth entries idx nil))]
+      (if (not= (:url entry) (get-in session [:browser.session/page :browser/url]))
+        (let [page (assoc (:browser.session/page session) :browser/url (:url entry))
+              nav-idx (get-in session [:browser.session/navigation :index] -1)]
+          (-> session
+              (assoc :browser.session/page page)
+              (assoc-in [:browser.session/navigation :entries nav-idx :page] page)
+              (assoc-in [:browser.session/navigation :entries nav-idx :url] (:url entry))))
+        session)
+      session)))
+
+(defn- bridge-traversed-history-index
+  "The `history.go()`/`back()`/`forward()` half of the same gap
+   `bridge-pushed-history-entries`/`bridge-replaced-history-entry` close
+   above -- a script's own programmatic traversal call (`:history/
+   traverse`) moves the sandbox's own `:history/index` without changing
+   `:history/entries` at all (no growth like `pushState`, no content
+   change like `replaceState`), so neither sibling fires for it.
+
+   DELIBERATELY, HONESTLY scoped narrower than the other two: only
+   bridges a traversal that stays ENTIRELY within the region of entries
+   THIS session itself already bridged via `pushState`/`replaceState`
+   (`already-bridged` of them, all sharing the SAME document -- neither
+   `pushState` nor `replaceState` ever touches it). Landing back on one
+   of those is safe to bridge with a plain session-bookkeeping update
+   (move `:browser.session/navigation`'s own `:index`, update the
+   current page's `:browser/url` to match) -- exactly like the other
+   two siblings, no document re-commit needed, because the document
+   genuinely never changed across any of these entries.
+
+   A traversal that would move OUTSIDE that region -- back past the
+   first `pushState` this generation ever did, into a REAL, distinct
+   navigation entry the SAME document did NOT produce -- is deliberately
+   NOT bridged here, and this is a real, structural limitation, not an
+   oversight: `back!`/`forward!` (the existing, real mechanism for
+   REAL page-to-page navigation) `navigate-to-history-entry!` re-
+   `commit-page!` the target entry's OWN `:browser/ops` to genuinely
+   restore that different document -- but a `pushState`-created entry's
+   `:page` is just a COPY of whatever document existed at push time,
+   carrying the SAME `:browser/ops` the original page already committed
+   once. Blindly re-committing those same ops on a traversal (naively
+   unifying this with `back!`/`forward!`'s own approach) would re-run
+   real DOM-construction ops (e.g. `:dom/create-element`) a SECOND time
+   against a host that already has those exact nodes -- confirmed via
+   reading `kotoba.wasm.host/commit!`'s own op-application loop that it
+   has no dedupe/no-op awareness of its own, so this is a REAL
+   correctness risk, not a theoretical one (in fact this exact class of
+   bug was independently confirmed live in `back!`/`forward!`
+   THEMSELVES via direct REPL reproduction and then fixed -- see
+   `navigate-to-history-entry!`/`remember-navigation-entry`'s own
+   `:same-document?` tag). Bridging traversal across THIS function's own
+   region-boundary would need to walk arbitrary nav-entries outside the
+   narrow, already-bridged region this fn's own `already-bridged` window
+   tracks -- the `:same-document?` marker `remember-navigation-entry`
+   now stamps on every entry already answers 'is this entry safe to
+   bridge without a re-commit', so the one remaining piece for a future
+   cycle to widen THIS function's own scope is walking/searching
+   `:browser.session/navigation`'s entries by that marker directly,
+   rather than deriving safety from `already-bridged`'s own generation-
+   relative counting the way this function still does -- left for a
+   separate, dedicated future cycle rather than folded in here as a
+   side effect."
+  [session script-state]
+  (let [entries (vec (:history/entries script-state))
+        already-bridged (:browser.session/script-history-bridged-count session 0)
+        sandbox-idx (:history/index script-state)]
+    (if (and (= (count entries) already-bridged)
+             (pos? already-bridged)
+             (<= 0 sandbox-idx (dec already-bridged)))
+      (let [nav-entries (get-in session [:browser.session/navigation :entries])
+            script-region-start (- (count nav-entries) already-bridged)
+            target-nav-index (+ script-region-start sandbox-idx)
+            target-entry (get nav-entries target-nav-index)]
+        (if (and target-entry
+                 (not= target-nav-index (get-in session [:browser.session/navigation :index] -1)))
+          (-> session
+              (assoc-in [:browser.session/navigation :index] target-nav-index)
+              (assoc :browser.session/page (assoc (:browser.session/page session)
+                                                   :browser/url (:url target-entry))))
+          session))
+      session)))
+
+(declare navigate!)
+
+(defn- bridge-script-location-change
+  "Real `location.assign(url)`/`location.replace(url)`/`location.href =
+   url` calls already run for real against `quickjs-execution`'s own
+   state -- a `:location/assign`/`:location/replace` capability request
+   lands in `script-state`'s `:context/requests` with the target `:url`
+   -- but NOTHING ever read that back out to make this session's REAL
+   page actually navigate: no fetch, no document swap, nothing. A
+   script's own `location.href = 'https://example.com'` was a real,
+   correctly-computed, entirely inert no-op as far as the rest of this
+   engine could tell -- the exact same bug shape `bridge-pushed-history-
+   entries` above closed for `pushState`, just for genuine cross-document
+   navigation instead of same-document history bookkeeping.
+
+   Takes the LAST such request THIS script tag made (mirrors a real
+   browser: synchronously calling `location.assign` twice in a row begins
+   navigating to the first URL, then immediately supersedes it with the
+   second -- only the final target actually loads). `:location/replace`
+   is threaded through as `{:remember? false}` so it correctly does NOT
+   push a new entry onto the real navigation stack (`:browser.session/
+   navigation`), matching `location.replace`'s real spec-defined
+   difference from `.assign`/`.href =` -- both otherwise share the exact
+   same real navigation path (`navigate!`, including its own already-
+   correct same-document-fragment short circuit).
+
+   Returns the NEW, post-navigation session (which subsumes any DOM
+   mutation `script-state` itself carries, exactly like a real browser
+   discards the old document once it navigates away), or nil when this
+   script tag made no location-changing call, so `commit-script-state!`
+   falls through to its normal per-script document commit."
+  [session script-state]
+  (when-let [request (last (filter #(#{:location/assign :location/replace} (:capability %))
+                                    (:context/requests script-state)))]
+    (navigate! session (:url request)
+               (when (= :location/replace (:capability request)) {:remember? false}))))
+
+(defn commit-script-state!
+  [session script-state]
+  (if-let [navigated (bridge-script-location-change session script-state)]
+    navigated
+    (let [net-store-updated? (contains? (:net/context script-state) :store)
+          session (-> session
+                      (apply-script-net-store script-state)
+                      (bridge-pushed-history-entries script-state)
+                      (bridge-replaced-history-entry script-state)
+                      (bridge-traversed-history-index script-state))]
+      (if-let [document (:document script-state)]
+        (-> (commit-document! session document)
+            (update :browser.session/history conj
+                    (cond-> {:event :script/document-state
+                             :result (:result script-state)
+                             :response-count (count (:results script-state))}
+                      net-store-updated? (assoc :net/store-updated? true)))
+            (persist!))
+        (if net-store-updated?
+          (-> session
+              (update :browser.session/history conj {:event :script/net-state
+                                                     :net/store-updated? true})
+              (persist!))
+          session)))))
+
+(defn run-page-scripts!
+  ;; `async` scripts (external `src`, `async` attribute present) are kept
+  ;; OUT of the document-order blocking reduce below and run AFTER
+  ;; DOMContentLoaded/load fire, never gating either -- previously every
+  ;; script, `async` or not, executed strictly in document order and
+  ;; unconditionally blocked both lifecycle events, so a slow- or never-
+  ;; fetching `async` script (e.g. denied by policy, or simply large)
+  ;; silently delayed DOMContentLoaded/load exactly as if it had no
+  ;; `async` attribute at all. This engine has no real concurrent fetch,
+  ;; so "run after load, still in document order among themselves" is
+  ;; the closest faithful approximation of "never blocks page-ready
+  ;; milestones" available in a synchronous host model -- genuine
+  ;; relative-ordering races between multiple async scripts (which real
+  ;; browsers resolve by fetch-completion order) are NOT modeled here.
+  ;; `defer` needs no separate handling: it already means "document
+  ;; order, before DOMContentLoaded," which is this engine's existing
+  ;; unconditional default for every non-async script.
+  [session]
+  (if-let [runner (:browser.session/script-runner session)]
+    (letfn [(run-one [session script]
+              (let [{:keys [session script]} (resolve-script-source! session script)]
+                (if (:script/source script)
+                  (runner session (assoc script :script/generation
+                                         (:browser.session/page-generation session)))
+                  session)))
+            (run-lifecycle [session target event-type ready-state]
+              (-> (set-page-ready-state session ready-state)
+                  (runner (assoc (lifecycle-script session target event-type)
+                                 :script/generation
+                                 (:browser.session/page-generation session)))
+                  (record-script-event {:event :page/lifecycle-dispatch
+                                        :event/target target
+                                        :event/type event-type
+                                        :document/ready-state ready-state})))]
+      (let [scripts (page-script/executable-scripts (:browser.session/page session))
+            blocking-scripts (remove page-script/async-script? scripts)
+            async-scripts (filter page-script/async-script? scripts)]
+        (-> (reduce run-one session blocking-scripts)
+            (run-lifecycle :document "DOMContentLoaded" "interactive")
+            (run-lifecycle :window "load" "complete")
+            (as-> s (reduce run-one s async-scripts))
+            (persist!))))
+    (-> session
+        (set-page-ready-state "complete")
+        (persist!))))
+
+(defn load-html!
+  "Navigate the current session to a fresh, real page: `browser.core/
+   load-html` parses `:html` into a real `kotoba.wasm.dom` document,
+   resolves the real cssom cascade against `:css` (a plain CSS text
+   string -- see `cssom.core/parse-rules`), then this fn commits the
+   resulting page and runs its scripts.
+
+   `:css` is NOT auto-extracted from any `<style>` tag `:html` might
+   literally contain -- `browser.core/load-html` parses HTML and CSS as
+   two independent inputs (exactly like `cssom.core-test`/
+   `cssom.layout-test` exercise `parse-rules`+`apply-cascade` directly),
+   and `htmldom.core` treats a `<style>` element as an ordinary
+   non-rendered raw-text element (see `cssom.layout/non-rendered-tags`),
+   never feeding its text content back into `parse-rules` itself. A caller
+   that wants a real `<style>` block's own text to actually cascade (e.g.
+   `browser.demo/sample-html`'s ::before/::after/attr()/counter()
+   generated-content proof) must pass that SAME text as this `:css`
+   argument too.
+
+   Until this fn's own fix, `:css` was silently DROPPED here even though
+   `browser.core/load-html` already accepted and cascaded one -- only
+   `document-click-hit-test-prefers-higher-z-index-absolute-node` in
+   test/browser/session_test.cljk ever passed a `:css` string through this
+   fn, and it kept passing anyway for a telling reason: it derives its
+   click coordinates from the ACTUAL rendered box of the higher-z-index
+   element rather than a hard-coded position, so it never actually
+   noticed its own declared `position`/`z-index` CSS was being silently
+   ignored either."
+  [session {:keys [url html css]}]
+  (-> (commit-page!
+       session
+       (browser/load-html {:url url
+                           :html html
+                           :css css
+                           :viewport (:browser.session/viewport session)
+                           :theme (:browser.session/theme session)
+                           :color-scheme (:browser.session/color-scheme session)}))
+      (run-page-scripts!)))
+
+(defn navigate!
+  ([session url]
+   (navigate! session url {}))
+  ([session url request]
+   (if (same-document-fragment-navigation? session url)
+     (commit-fragment-navigation! session url)
+     (let [fetch-fn (:browser.session/fetch-fn session)
+           base-request (cond-> (select-keys request [:headers])
+                          (:referrer/header request)
+                          (assoc-in [:headers "referer"] (:referrer/header request)))
+           page-url (or (get-in session [:browser.session/page :browser/url]) url)
+        {:keys [session url response redirects]} (loop [session session url url redirects [] depth 0]
+                                           (let [cookie (navigation-cookie-header session page-url url)
+                                                 request (cond-> (merge base-request {:url url :method :get})
+                                                           cookie (assoc-in [:headers "cookie"] cookie))
+                                                 response (fetch-fn request)
+                                                 session (remember-navigation-response-cookies session url response)
+                                                 status (:status response)
+                                                 location (net/header (:headers response) "location")]
+                                             (if (and (contains? redirect-statuses status)
+                                                      location
+                                                      (< depth 8))
+                                               (let [to-url (page-script/resolve-src url location)]
+                                                 (recur session
+                                                        to-url
+                                                        (conj redirects {:from url :to to-url :status status})
+                                                        (inc depth)))
+                                               {:session session :url url :response response :redirects redirects})))
+        page (if (<= 200 (or (:status response) 0) 299)
+               (assoc (browser/load-html {:url url
+                                          :html (:body response)
+                                          :viewport (:browser.session/viewport session)
+                                          :theme (:browser.session/theme session)
+                                          :color-scheme (:browser.session/color-scheme session)})
+                      :browser/response response)
+               {:browser/url url
+                :browser/response response
+                :browser/error :navigation/http-error})]
+    (if (:browser/error page)
+      (-> session
+          (abort-script-engine-start! :navigation/error)
+          (assoc :browser.session/error (:browser/error page)
+                 :browser.session/page page
+                 :browser.session/page-generation (inc (:browser.session/page-generation session 0))
+                 :browser.session/error-document
+                 (browser/load-html {:url (str "kotoba://error?url=" url)
+                                     :html (str "<main><h1>Navigation error</h1><p>"
+                                                (name (:browser/error page))
+                                                "</p></main>")
+                                     :viewport (:browser.session/viewport session)
+                                     :theme (:browser.session/theme session)
+                                     :color-scheme (:browser.session/color-scheme session)})
+                 :browser.session/navigation (assoc (:browser.session/navigation session)
+                                                    :redirects redirects))
+          (audit! (audit/navigation-error-event {:url url
+                                                 :status (get-in page [:browser/response :status])
+                                                 :error (:browser/error page)
+                                                 :profile-id (profile-id session)}))
+          (update :browser.session/history conj {:event :navigation/error
+                                                 :url url
+                                                 :status (get-in page [:browser/response :status])
+                                                 :error (:browser/error page)})
+          (persist!))
+      (-> session
+          (assoc :browser.session/navigation
+                 (assoc (:browser.session/navigation session) :redirects redirects))
+          (commit-page! page (select-keys request [:remember?]))
+          (run-page-scripts!)))))))
+
+(defn- navigate-to-history-entry!
+  "back!/forward!'s own shared landing step: a `:same-document?` entry
+   (see remember-navigation-entry's own docstring -- a pushState/
+   commit-fragment-navigation!-created URL-only copy sharing the SAME
+   :browser/ops as whatever document already existed at the moment it
+   was recorded) gets the same session-bookkeeping-only update bridge-
+   traversed-history-index already uses for its own, narrower same-
+   document traversal case (just move the current page's own
+   :browser/url, no document re-commit) -- re-committing that entry's
+   own :browser/ops would replay real DOM-construction ops a SECOND time
+   against a host that already has those exact nodes.
+
+   A real, distinct navigation entry (the default, and the far more
+   common case) still gets the original, correct commit-page! re-commit
+   -- confirmed via direct REPL reproduction of the bug this fixes
+   BEFORE this tag existed: landing back! on a pushState-derived entry
+   unconditionally re-committed its (shared) :browser/ops, and kotoba.
+   wasm.host/commit!'s own op-application loop has no dedupe awareness
+   of its own, so every :dom/create-element/:dom/append-child op ran a
+   second time -- confirmed via a recording host that every node id was
+   created twice and every parent/child pair appended twice, visibly
+   duplicating the whole rendered subtree.
+
+   `same-document?` is passed in EXPLICITLY by the caller rather than
+   read straight off `entry` itself -- `:same-document?` describes each
+   entry's relationship to its OWN immediate stack PREDECESSOR (the
+   entry it was pushState/fragment-navigated FROM), which is the right
+   question for `forward!` (moving to `entry`, whose predecessor IS the
+   page currently live) but the WRONG one for `back!`: moving back FROM
+   the current entry TO its predecessor needs to ask whether the
+   CURRENT entry (not the target) continues the same document as its
+   own predecessor -- confirmed via a second, more precise REPL
+   reproduction after the first (naive, target-entry-only) version of
+   this fix: navigating real A -> pushState to B, then back! from B
+   correctly avoided re-committing B's own document (never changed by
+   pushState in the first place) -- but back! from B to A ALSO
+   incorrectly checked B's own predecessor entry (A, itself a genuinely
+   real, distinct commit) using entry A's flag (false, since A is the
+   original real navigation), triggering an UNNECESSARY second real
+   commit of A's already-live document -- confirmed via the recording
+   host's own present-count incrementing a second time for a plain
+   back! that should have been bookkeeping-only, since A's OWN document
+   was never replaced by B's pushState call and was still live in the
+   host the whole time."
+  [session entry same-document?]
+  (if same-document?
+    (assoc session :browser.session/page
+           (assoc (:browser.session/page session) :browser/url (:url entry)))
+    (commit-page! session (:page entry) {:remember? false})))
+
+(defn back!
+  [session]
+  (let [current-idx (get-in session [:browser.session/navigation :index] -1)
+        current-entry (get-in session [:browser.session/navigation :entries current-idx])
+        idx (dec current-idx)
+        entry (get-in session [:browser.session/navigation :entries idx])]
+    (if entry
+      (-> session
+          (assoc-in [:browser.session/navigation :index] idx)
+          (navigate-to-history-entry! entry (:same-document? current-entry))
+          (audit! (audit/navigation-event {:event :navigation/back
+                                           :url (:url entry)
+                                           :profile-id (profile-id session)}))
+          (update :browser.session/history conj {:event :navigation/back
+                                                 :url (:url entry)})
+          (persist!))
+      session)))
+
+(defn forward!
+  [session]
+  (let [idx (inc (get-in session [:browser.session/navigation :index] -1))
+        entry (get-in session [:browser.session/navigation :entries idx])]
+    (if entry
+      (-> session
+          (assoc-in [:browser.session/navigation :index] idx)
+          (navigate-to-history-entry! entry (:same-document? entry))
+          (audit! (audit/navigation-event {:event :navigation/forward
+                                           :url (:url entry)
+                                           :profile-id (profile-id session)}))
+          (update :browser.session/history conj {:event :navigation/forward
+                                                 :url (:url entry)})
+          (persist!))
+      session)))
+
+(defn reload!
+  [session]
+  (if-let [url (get-in session [:browser.session/page :browser/url])]
+    (-> (navigate! session url)
+        (audit! (audit/navigation-event {:event :navigation/reload
+                                         :url url
+                                         :profile-id (profile-id session)}))
+        (update :browser.session/history conj {:event :navigation/reload :url url})
+        (persist!))
+    session))
+
+(defn- url-encode
+  [value]
+  #?(:clj (-> (form-urlencoded/form-encode (str value))
+              (str/replace "%20" "+"))
+     :cljs (-> (js/encodeURIComponent (str value))
+               (str/replace "%20" "+"))))
+
+(defn- form-query
+  [form-data]
+  (->> form-data
+       (map (fn [{:keys [name value]}]
+              (str (url-encode name) "=" (url-encode value))))
+       (str/join "&")))
+
+(defn- form-text-plain
+  [form-data]
+  (->> form-data
+       (map (fn [{:keys [name value]}]
+              (str name "=" value)))
+       (str/join "\r\n")))
+
+(def multipart-boundary "kotoba-browser-form-boundary")
+
+(defn- form-multipart
+  [form-data]
+  (str
+   (->> form-data
+        (map (fn [{:keys [name value]}]
+               (str "--" multipart-boundary "\r\n"
+                    "Content-Disposition: form-data; name=\"" name "\"\r\n\r\n"
+                    value "\r\n")))
+        (apply str))
+   "--" multipart-boundary "--\r\n"))
+
+(defn- submit-method
+  [value]
+  (case (str/lower (str value))
+    "post" :post
+    "dialog" :dialog
+    :get))
+
+(defn- submit-enctype
+  [value]
+  (case (str/lower (str value))
+    "text/plain" "text/plain"
+    "multipart/form-data" "multipart/form-data"
+    "application/x-www-form-urlencoded"))
+
+(defn- append-query
+  [url query]
+  (let [url (strip-fragment url)]
+    (if (str/blank? query)
+      url
+      (str url (if (str/includes? url "?") "&" "?") query))))
+
+(defn- referrer-downgrade?
+  "True when page-url is https and destination-url is not -- an
+   HTTPS -> non-HTTPS transition, which every non-\"unsafe-url\" referrer
+   policy must suppress the referrer for (https://www.w3.org/TR/referrer-policy/
+   #referrer-policy-strict-origin-when-cross-origin and friends). Note a
+   same-origin request can never be a downgrade: same-origin requires an
+   identical scheme, so this only ever fires for cross-origin destinations."
+  [page-url destination-url]
+  (and (= "https" (:scheme (origin/parse-url page-url)))
+       (not= "https" (:scheme (origin/parse-url destination-url)))))
+
+(defn- request-referrer
+  "Compute the Referer value for a request from page-url, given the real
+   destination-url and an optional explicit referrer-policy string.
+
+   \"no-referrer\" and \"origin\" are unconditional per spec (they do not
+   depend on cross-origin-ness or downgrade). \"unsafe-url\" is also
+   unconditional (always the full page-url). \"same-origin\",
+   \"origin-when-cross-origin\", \"strict-origin\", and
+   \"no-referrer-when-downgrade\" each have their own distinct algorithm
+   per https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer
+   -- previously all four fell through to the same default branch below,
+   silently applying strict-origin-when-cross-origin semantics regardless of
+   which policy was actually requested (a real spec violation: e.g.
+   \"strict-origin\" must never send more than the origin even same-origin,
+   \"same-origin\" must never send anything at all cross-origin, and
+   \"no-referrer-when-downgrade\" must send the FULL url on any non-downgrading
+   cross-origin request, not just the origin). Anything else -- including no
+   explicit policy at all, which is the overwhelmingly common case -- falls
+   back to the real modern default, strict-origin-when-cross-origin: full
+   page-url for a same-origin destination, origin-only for a cross-origin
+   one, and nothing at all on an HTTPS -> non-HTTPS downgrade (checked first,
+   since it must suppress regardless of the same/cross-origin split).
+
+   destination-url is structurally always available at every call site in
+   this file (form action / link href are always resolved before a referrer
+   is computed), so the `nil` case below is defensive only; it suppresses
+   (safe-restrictive) rather than assuming same-origin, since \"unknown
+   destination\" is not a case the spec's default policy ever actually faces."
+  [page-url destination-url policy]
+  (case (str/lower (str policy))
+    "no-referrer" nil
+    "origin" (origin/origin page-url)
+    "unsafe-url" page-url
+    "same-origin" (when (and page-url destination-url
+                             (origin/same-origin? page-url destination-url))
+                    page-url)
+    "origin-when-cross-origin" (when (and page-url destination-url)
+                                  (if (origin/same-origin? page-url destination-url)
+                                    page-url
+                                    (origin/origin page-url)))
+    "strict-origin" (when (and page-url destination-url
+                               (not (referrer-downgrade? page-url destination-url)))
+                       (origin/origin page-url))
+    "no-referrer-when-downgrade" (when (and page-url destination-url
+                                            (not (referrer-downgrade? page-url destination-url)))
+                                    page-url)
+    (when (and page-url destination-url
+               (not (referrer-downgrade? page-url destination-url)))
+      (if (origin/same-origin? page-url destination-url)
+        page-url
+        (origin/origin page-url)))))
+
+(defn- form-submit-request
+  [session result]
+  (let [document (:document result)
+        form-id (:form/id result)
+        form (get-in document [:nodes form-id])
+        attrs (:attrs form)
+        submitter-attrs (get-in document [:nodes (:node/id result) :attrs])
+        method (submit-method (or (:formmethod submitter-attrs)
+                                  (:method attrs)
+                                  "get"))
+        target (str (or (:formtarget submitter-attrs)
+                        (:target attrs)
+                        "_self"))
+        referrer-policy (or (:formreferrerpolicy submitter-attrs)
+                            (:referrerpolicy submitter-attrs)
+                            (:referrerpolicy attrs))
+        enctype (submit-enctype (or (:formenctype submitter-attrs)
+                                    (:enctype attrs)
+                                    "application/x-www-form-urlencoded"))]
+    (when (:submitted? result)
+      (let [page-url (get-in session [:browser.session/page :browser/url])
+            action (str (or (:formaction submitter-attrs)
+                            (:action attrs)
+                            page-url))
+            action-url (if (str/blank? action)
+                         page-url
+                         (page-script/resolve-src page-url action))
+            referrer (request-referrer page-url action-url referrer-policy)
+            urlencoded-body (form-query (:form/data result))
+            text-body (form-text-plain (:form/data result))
+            multipart-body (form-multipart (:form/data result))
+            post-body (case enctype
+                        "text/plain" text-body
+                        "multipart/form-data" multipart-body
+                        urlencoded-body)
+            content-type (case enctype
+                           "text/plain" "text/plain"
+                           "multipart/form-data" (str "multipart/form-data; boundary=" multipart-boundary)
+                           "application/x-www-form-urlencoded")]
+        (case method
+          :get (cond-> {:method :get
+                        :url (append-query action-url urlencoded-body)
+                        :target target
+                        :enctype enctype
+                        :form/id form-id
+                        :submitter/id (:node/id result)
+                        :form/data (:form/data result)}
+                 referrer-policy (assoc :referrer-policy referrer-policy)
+                 referrer (assoc :referrer/header referrer))
+          :post (cond-> {:method :post
+                         :url (strip-fragment action-url)
+                         :target target
+                         :enctype enctype
+                         :headers {"content-type" content-type}
+                         :body post-body
+                         :form/id form-id
+                         :submitter/id (:node/id result)
+                         :form/data (:form/data result)}
+                  referrer-policy (assoc :referrer-policy referrer-policy)
+                  referrer (assoc :referrer/header referrer))
+          :dialog {:method :dialog
+                   :target target
+                   :referrer-policy referrer-policy
+                   :enctype enctype
+                   :form/id form-id
+                   :submitter/id (:node/id result)
+                   :form/data (:form/data result)}
+          nil)))))
+
+(defn- link-navigation-request
+  [session result]
+  (when-let [href (:navigation/href result)]
+    (let [page-url (get-in session [:browser.session/page :browser/url])]
+      {:url (page-script/resolve-src page-url href)
+       :href href
+       :target (:navigation/target result)
+       :rel (:navigation/rel result)
+       :referrer-policy (:navigation/referrer-policy result)
+       :download? (:navigation/download? result)
+       :download/filename (:download/filename result)
+       :link/id (:link/id result)
+       :node/id (:node/id result)})))
+
+(defn download-request
+  "Build an explicit download capability request from a link navigation request."
+  [link-request]
+  (when (:download? link-request)
+    (cond-> {:capability :download/request
+             :url (:url link-request)
+             :href (:href link-request)
+             :target (:target link-request)
+             :link/id (:link/id link-request)
+             :node/id (:node/id link-request)}
+      (:download/filename link-request)
+      (assoc :download/filename (:download/filename link-request))
+
+      (:referrer-policy link-request)
+      (assoc :referrer-policy (:referrer-policy link-request)))))
+
+(defn- current-target?
+  [target]
+  (contains? #{"" "_self" "_top" "_parent"} (str/lower (str target))))
+
+(defn- token-attr?
+  [value token]
+  (contains? (set (str/split (str/lower (str value)) #"\s+"))
+             token))
+
+(defn- link-noreferrer?
+  [request]
+  (token-attr? (:rel request) "noreferrer"))
+
+(defn- link-request-referrer
+  [session request]
+  (when-not (link-noreferrer? request)
+    (request-referrer (get-in session [:browser.session/page :browser/url])
+                      (:url request)
+                      (:referrer-policy request))))
+
+(defn- link-navigation-event
+  [session request]
+  (let [referrer (link-request-referrer session request)]
+    (cond-> {:event :link/navigation
+             :url (:url request)
+             :href (:href request)
+             :target (:target request)
+             :link/id (:link/id request)
+             :node/id (:node/id request)}
+      (:rel request) (assoc :rel (:rel request))
+      (:referrer-policy request) (assoc :referrer-policy (:referrer-policy request))
+      (or (:rel request) (:referrer-policy request) referrer)
+      (assoc :referrer referrer))))
+
+(defn- link-context-request-event
+  [session request]
+  (let [noreferrer? (link-noreferrer? request)
+        noopener? (or (token-attr? (:rel request) "noopener")
+                      noreferrer?
+                      (= "_blank" (:target request)))]
+    {:event :link/context-request
+     :url (:url request)
+     :href (:href request)
+     :target (:target request)
+     :rel (:rel request)
+     :referrer-policy (:referrer-policy request)
+     ;; rel="noreferrer" is an additional, separate suppression mechanism on
+     ;; top of any referrer-policy (a noreferrer link must never send a
+     ;; referrer even if referrerpolicy says otherwise) -- it does not
+     ;; replace honoring an explicit referrerpolicy attribute.
+     :referrer (when-not noreferrer?
+                 (request-referrer (get-in session [:browser.session/page :browser/url])
+                                   (:url request)
+                                   (:referrer-policy request)))
+     :opener? (not noopener?)
+     :link/id (:link/id request)
+     :node/id (:node/id request)}))
+
+(defn- form-context-request-event
+  [session request]
+  (cond-> {:event :form/context-request
+           :url (:url request)
+           :method (:method request)
+           :target (:target request)
+           :referrer-policy (:referrer-policy request)
+           :referrer (request-referrer (get-in session [:browser.session/page :browser/url])
+                                       (:url request)
+                                       (:referrer-policy request))
+           :enctype (:enctype request)
+           :form/id (:form/id request)
+           :submitter/id (:submitter/id request)
+           :form/data (:form/data request)}
+    (:headers request) (assoc :headers (:headers request))
+    (:body request) (assoc :body (:body request))))
+
+(defn- commit-form-post-response!
+  [session request fetch-result]
+  (let [session (cond-> session
+                  (contains? fetch-result :store)
+                  (assoc :browser.session/store (:store fetch-result)))
+        response (:response fetch-result)
+        status (:status response)
+        location (net/header (:headers response) "location")]
+    (cond
+      (and (:allowed? fetch-result)
+           (contains? redirect-statuses status)
+           location)
+      (let [to-url (page-script/resolve-src (:url request) location)]
+        (-> session
+            (update :browser.session/history conj
+                    {:event :form/submit-redirect
+                     :url (:url request)
+                     :to to-url
+                     :method :post
+                     :target (:target request)
+                     :enctype (:enctype request)
+                     :status status
+                     :form/id (:form/id request)
+                     :submitter/id (:submitter/id request)
+                     :form/data (:form/data request)})
+            (navigate! to-url)))
+
+      (and (:allowed? fetch-result)
+           (<= 200 (or status 0) 299))
+      (-> session
+          (update :browser.session/history conj
+                  {:event :form/submit-fetch
+                   :url (:url request)
+                   :method :post
+                   :target (:target request)
+                   :enctype (:enctype request)
+                   :status status
+                   :form/id (:form/id request)
+                   :submitter/id (:submitter/id request)
+                   :form/data (:form/data request)})
+          (commit-page! (assoc (browser/load-html {:url (:url request)
+                                                   :html (:body response)
+                                                   :viewport (:browser.session/viewport session)
+                                                   :theme (:browser.session/theme session)
+                                                   :color-scheme (:browser.session/color-scheme session)})
+                               :browser/response response)))
+
+      :else
+      (-> session
+          (update :browser.session/history conj
+                  {:event :form/submit-fetch-blocked
+                   :url (:url request)
+                   :method :post
+                   :target (:target request)
+                   :enctype (:enctype request)
+                   :status status
+                   :error (:error response)
+                   :allowed? (:allowed? fetch-result)
+                   :form/id (:form/id request)
+                   :submitter/id (:submitter/id request)})
+          (persist!)))))
+
+(defn render-surface!
+  [session]
+  (let [rendered (surface/render-surface (:browser.session/surface session))
+        batch (host/commit! (:browser.session/host session) (:ops rendered))]
+    (-> session
+        (assoc :browser.session/last-batch batch
+               :browser.session/error nil)
+        (audit! (audit/surface-commit-event {:surface-id (get-in rendered [:surface :surface/id])
+                                             :op-count (count (:ops rendered))
+                                             :profile-id (profile-id session)}))
+        (update :browser.session/history conj {:event :surface/commit
+                                               :surface/id (get-in rendered [:surface :surface/id])
+                                               :op-count (count (:ops rendered))})
+        (persist!))))
+
+(defn resume-current-surface!
+  "Present the restored/current OS surface to the host without reducing input."
+  [session]
+  (if-let [surface-state (:browser.session/surface session)]
+    (let [rendered (surface/render-surface surface-state)
+          batch (host/commit! (:browser.session/host session) (:ops rendered))]
+      (-> session
+          (assoc :browser.session/last-batch batch
+                 :browser.session/error nil)
+          (audit! (audit/surface-commit-event {:surface-id (get-in rendered [:surface :surface/id])
+                                               :op-count (count (:ops rendered))
+                                               :profile-id (profile-id session)}))
+          (update :browser.session/history conj {:event :surface/resume
+                                                 :surface/id (get-in rendered [:surface :surface/id])
+                                                 :op-count (count (:ops rendered))})
+          (persist!)))
+    session))
+
+(defn apply-surface-action!
+  [session action]
+  (-> session
+      (update :browser.session/surface surface/apply-action action)
+      (render-surface!)))
+
+(defn apply-input-event!
+  [session event]
+  (let [{:keys [surface input actions]}
+        (input/reduce-event (:browser.session/surface session)
+                            (:browser.session/input session)
+                            event)]
+    (-> session
+        (assoc :browser.session/surface surface
+               :browser.session/input input)
+        (render-surface!)
+        (audit! (audit/input-event {:event-type (:event/type (input/normalize-event event))
+                                    :action-count (count actions)
+                                    :profile-id (profile-id session)}))
+        (update :browser.session/history conj {:event :input/reduce
+                                               :input/event-type (:event/type (input/normalize-event event))
+                                               :action-count (count actions)})
+        (persist!))))
+
+(defn- point-in-rect?
+  [x y r]
+  (and (number? x)
+       (number? y)
+       (<= (:x r) x (+ (:x r) (:w r)))
+       (<= (:y r) y (+ (:y r) (:h r)))))
+
+(defn- point-in-node?
+  "Whether a click at (x,y) lands on this `:node` op.
+
+   Its BOX, unless it declares a HIT REGION. cssom.layout attaches `:hit`
+   -- a vector of rects, `[]` meaning `not a hit-test candidate` -- to
+   every op whose box and hit region are different rectangles, which a
+   browser's own two APIs say they sometimes are: `getBoundingClientRect`
+   on a WRAPPED inline box is the union of its fragments while
+   `elementFromPoint` inside that union and outside every fragment
+   answers the containing block; a block whose lines OVERFLOW it reports
+   the clamped box and is hit outside it, per line; and a table row or
+   row group is never hit at all, painted background or not (all three
+   measured in Brave -- see cssom.layout's ns docstring).
+
+   Reading it rather than re-deriving it is the point: where an element
+   is clicked is the layout engine's answer, and this used to route a
+   click on the ragged edge of a two-line link to the link, a click on a
+   paragraph's overflowing text to nothing, and a click in a table's
+   border-spacing gap to the `<tr>`. A clip rect is a separate op stream
+   and is still applied on top by node-at, exactly as before."
+  [x y op]
+  (if-let [hit (:hit op)]
+    (boolean (some #(point-in-rect? x y %) hit))
+    (point-in-rect? x y op)))
+
+(defn- intersect-rect [a b]
+  (let [x0 (max (:x a) (:x b))
+        y0 (max (:y a) (:y b))
+        x1 (min (+ (:x a) (:w a)) (+ (:x b) (:w b)))
+        y1 (min (+ (:y a) (:h a)) (+ (:y b) (:h b)))]
+    (when (and (< x0 x1) (< y0 y1))
+      {:x x0 :y y0 :w (- x1 x0) :h (- y1 y0)})))
+
+(defn- active-clip [clip-stack]
+  (reduce intersect-rect (first clip-stack) (rest clip-stack)))
+
+(defn- hit-nodes
+  [draw-ops]
+  (loop [remaining draw-ops
+         clip-stack []
+         nodes []]
+    (if-let [op (first remaining)]
+      (case (:draw/op op)
+        :clip
+        (if (= :push (:clip/op op))
+          (recur (rest remaining)
+                 (conj clip-stack (select-keys op [:x :y :w :h]))
+                 nodes)
+          (recur (rest remaining)
+                 (if (seq clip-stack) (pop clip-stack) clip-stack)
+                 nodes))
+
+        :node
+        (let [clip (active-clip clip-stack)]
+          (recur (rest remaining)
+                 clip-stack
+                 (conj nodes (cond-> op
+                                clip (assoc :hit/clip clip)))))
+
+        (recur (rest remaining) clip-stack nodes))
+      nodes)))
+
+(defn- node-at
+  [page x y pred]
+  (->> (hit-nodes (:browser/draw-ops page))
+       reverse
+       (some (fn [op]
+               (when (and (point-in-node? x y op)
+                          (not= "none" (:pointer-events op))
+                          ;; visibility:hidden/collapse paints nothing and
+                          ;; is fully transparent to pointer events, same
+                          ;; as pointer-events:none -- previously never
+                          ;; consulted here, so a hidden overlay still
+                          ;; swallowed clicks meant for whatever's visibly
+                          ;; underneath it.
+                          (not (contains? #{"hidden" "collapse"} (:visibility op)))
+                          ;; point-in-RECT, not point-in-node: a clip is a
+                          ;; plain rectangle with no hit region of its own,
+                          ;; and it applies to whichever region the node
+                          ;; just matched on.
+                          (if-let [clip (:hit/clip op)]
+                            (point-in-rect? x y clip)
+                            true)
+                          (pred op))
+                 (:id op))))))
+
+(defn- resolve-document-input-target
+  [session event]
+  (let [event (input/normalize-event event)]
+    (cond
+      (or (:node/id event) (:node/selector event))
+      event
+
+      (= :pointer/wheel (:event/type event))
+      (if-let [node-id (node-at (:browser.session/page session)
+                                (:x event)
+                                (:y event)
+                                ;; The draw-op's own :overflow field (cssom's
+                                ;; cascade-resolved computed style, correctly
+                                ;; covering both stylesheet rules and inline
+                                ;; style="...") is the common/standard case
+                                ;; and must stay authoritative. But
+                                ;; browser.document-input/scrollable-node?
+                                ;; ALSO recognizes a raw `overflow="auto"`
+                                ;; ATTRIBUTE as a deliberate, pragmatic
+                                ;; fallback -- used elsewhere in this
+                                ;; codebase for the identical "is this node
+                                ;; scrollable" question -- that this
+                                ;; wheel-event hit-test never consulted,
+                                ;; silently diverging: a wheel event over an
+                                ;; attr-only-overflow element found no
+                                ;; scrollable ancestor at all and had zero
+                                ;; effect, confirmed via direct REPL
+                                ;; reproduction before this fix (scroll_at
+                                ;; had no effect on such an element, while
+                                ;; scroll_selector, which resolves its
+                                ;; target node-id directly by selector
+                                ;; rather than through this coordinate-based
+                                ;; lookup, worked fine).
+                                #(or (contains? #{"auto" "scroll"} (:overflow %))
+                                     (document-input/scrollable-node?
+                                      (get-in session [:browser.session/page :browser/document])
+                                      (:id %))))]
+        (assoc event :node/id node-id)
+        event)
+
+      (and (contains? #{:pointer/move :pointer/up :pointer/cancel}
+                      (:event/type event))
+           (get-in session [:browser.session/page
+                            :browser/document
+                            :pointer/capture
+                            (document-input/pointer-id event)]))
+      (assoc event :node/id
+             (get-in session [:browser.session/page
+                              :browser/document
+                              :pointer/capture
+                              (document-input/pointer-id event)]))
+
+      (contains? #{:pointer/down :pointer/up :pointer/cancel
+                   :pointer/click :pointer/move}
+                 (:event/type event))
+      (if-let [node-id (node-at (:browser.session/page session)
+                                (:x event)
+                                (:y event)
+                                (constantly true))]
+        (assoc event :node/id node-id)
+        event)
+
+      :else event)))
+
+(defn apply-document-input-event!
+  [session event]
+  (if-let [document (get-in session [:browser.session/page :browser/document])]
+    (let [event (resolve-document-input-target session event)
+          result (document-input/reduce-event document event)
+          document (:document result)
+          node-id (:node/id result)
+          handled? (:handled? result)
+          event (:event result)
+          commit? (if (contains? result :commit?)
+                    (:commit? result)
+                    handled?)
+          session (if commit?
+                    (commit-document! session document)
+                    session)]
+      (let [session (-> session
+                        (audit! (audit/input-event {:event-type (:event/type event)
+                                                    :action-count (if handled? 1 0)
+                                                    :profile-id (profile-id session)}))
+                        (update :browser.session/history conj {:event :document/input
+                                                               :input/event-type (:event/type event)
+                                                               :node/id node-id
+                                                               :handled? handled?})
+                        (assoc :browser.session/document-input-result result)
+                        (persist!))
+            submit-request (when (:browser.session/fetch-fn session)
+                             (form-submit-request session result))
+            link-request (link-navigation-request session result)]
+        (case (:method submit-request)
+          :get
+          (if (current-target? (:target submit-request))
+            (-> session
+                (update :browser.session/history conj
+                        (cond-> {:event :form/submit-navigation
+                                 :url (:url submit-request)
+                                 :target (:target submit-request)
+                                 :enctype (:enctype submit-request)
+                                 :form/id (:form/id submit-request)
+                                 :submitter/id (:submitter/id submit-request)
+                                 :form/data (:form/data submit-request)}
+                          (:referrer-policy submit-request)
+                          (assoc :referrer-policy (:referrer-policy submit-request))
+                          (:referrer/header submit-request)
+                          (assoc :referrer (:referrer/header submit-request))))
+                (navigate! (:url submit-request)
+                           (select-keys submit-request [:headers :referrer/header]))
+                (assoc :browser.session/document-input-result result))
+            (-> session
+                (update :browser.session/history conj (form-context-request-event session submit-request))
+                (persist!)
+                (assoc :browser.session/document-input-result result)))
+
+          :post
+          (if (current-target? (:target submit-request))
+            (let [fetch-result (net/fetch-resource (assoc (net-context session)
+                                                  :fetch-fn (:browser.session/fetch-fn session)
+                                                  :cache? false)
+                                                  (select-keys submit-request
+                                                               [:url :method :headers :body :referrer/header]))
+                  session (commit-form-post-response! session submit-request fetch-result)]
+              (assoc session :browser.session/document-input-result result))
+            (-> session
+                (update :browser.session/history conj (form-context-request-event session submit-request))
+                (persist!)
+                (assoc :browser.session/document-input-result result)))
+
+          :dialog
+          (-> session
+              (update :browser.session/history conj {:event :form/submit-dialog
+                                                     :target (:target submit-request)
+                                                     :enctype (:enctype submit-request)
+                                                     :form/id (:form/id submit-request)
+                                                     :submitter/id (:submitter/id submit-request)
+                                                     :form/data (:form/data submit-request)})
+              (persist!)
+              (assoc :browser.session/document-input-result result))
+
+          (if (:download? link-request)
+            (-> session
+                (update :browser.session/history conj
+                        (cond-> {:event :link/download-request
+                                 :url (:url link-request)
+                                 :href (:href link-request)
+                                 :target (:target link-request)
+                                 :link/id (:link/id link-request)
+                                 :node/id (:node/id link-request)}
+                          (:download/filename link-request)
+                          (assoc :download/filename (:download/filename link-request))))
+                (assoc :browser.session/download-request (download-request link-request))
+                (persist!)
+                (assoc :browser.session/document-input-result result))
+            (if (and link-request (not (current-target? (:target link-request))))
+              (-> session
+                  (update :browser.session/history conj (link-context-request-event session link-request))
+                  (persist!)
+                  (assoc :browser.session/document-input-result result))
+              (if (and link-request (:browser.session/fetch-fn session))
+                (let [referrer (link-request-referrer session link-request)
+                      navigate-request (cond-> {}
+                                         referrer (assoc :referrer/header referrer))]
+                  (-> session
+                      (update :browser.session/history conj (link-navigation-event session link-request))
+                      (navigate! (:url link-request) navigate-request)
+                      (assoc :browser.session/document-input-result result)))
+                session))))))
+    session))
