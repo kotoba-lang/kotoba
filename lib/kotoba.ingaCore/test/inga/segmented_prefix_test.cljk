@@ -1,0 +1,158 @@
+(ns inga.segmented-prefix-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.edn :as edn]
+            [inga.segmented-prefix :as segmented]
+            [inga.reservation :as reservation]
+            [inga.reservation-test :as fixture]
+            [inga-node.archive :as archive]
+            [kotobase.cid :as cid]))
+
+(defn byte-count [s] (.-length (cid/text->bytes s)))
+(defn raw-cid [s] (archive/raw-cid (cid/text->bytes s)))
+(def context (assoc fixture/context :segment-cid-fn raw-cid :text-byte-count byte-count))
+
+(defn bundle
+  "Pure test producer, also usable with recovered signed data: each segment's
+  tip QC comes from the next block's justify, or the full proof's final QC.
+  Produces no IO and does not mint signatures."
+  [proof width ctx]
+  (let [blocks (:blocks proof)
+        segments (reduce
+                  (fn [result from]
+                    (let [to (min (count blocks) (+ from width))
+                          envelope {:version segmented/version :chain-id (:chain-id ctx)
+                                    :genesis-hash ((:hash-fn ctx) (:genesis ctx))
+                                    :index (count result) :prev-cid (:cid (peek result))
+                                    :from-height from :to-height (dec to)
+                                    :blocks (subvec blocks from to)
+                                    :tip-qc (if (< to (count blocks))
+                                              (:inga.block/justify (nth blocks to)) (:tip-qc proof))}
+                          text (pr-str envelope)]
+                      (conj result {:cid (raw-cid text) :data text})))
+                  [] (range 0 (count blocks) width))]
+    {:checkpoint {:version segmented/version :chain-id (:chain-id ctx)
+                  :genesis-hash ((:hash-fn ctx) (:genesis ctx))
+                  :last-cid (:cid (peek segments)) :segment-count (count segments)
+                  :block-count (count blocks)}
+     :segments segments}))
+(defn verify [record {:keys [checkpoint segments]}]
+  (segmented/verify-acquisition record checkpoint segments context))
+(defn relink
+  "Re-address all envelopes after mutation, to exercise semantic checks beyond CID."
+  [{:keys [segments] :as b}]
+  (let [updated (reduce (fn [out item]
+                          (let [text (pr-str (assoc (edn/read-string (:data item))
+                                                   :prev-cid (:cid (peek out))))]
+                            (conj out {:cid (raw-cid text) :data text}))) [] segments)]
+    (-> b (assoc :segments updated) (assoc-in [:checkpoint :last-cid] (:cid (peek updated))))))
+(defn mutate [b i f]
+  (relink (update-in b [:segments i :data] #(pr-str (f (edn/read-string %))))))
+
+(deftest existing-first-wins-results-across-every-boundary
+  (doseq [batches [[[fixture/a fixture/b] [] [] [] []]
+                   [[fixture/b fixture/a] [] [] [] []]
+                   [[] [fixture/a] [fixture/b] [] []]
+                   [[fixture/a] [] [(assoc fixture/a "seq" 1 "prev" "prior")] [] []]
+                   [[] [] [] [] [fixture/a]]
+                   [[fixture/a] [] [(assoc fixture/b "v" "bad")] [] []]]
+          width [1 2 3 4 6]
+          record [fixture/a fixture/b]]
+    (let [p (fixture/proof batches) b (bundle p width context)]
+      (is (= (reservation/verify-acquisition record p fixture/context) (verify record b))
+          (str "width=" width " batches=" batches)))))
+
+(deftest missing-duplicate-reordered-and-suffix-segments-refuse
+  (let [b (bundle (fixture/proof [[fixture/a] [] [] [fixture/b] [] [] [] []]) 3 context)
+        xs (:segments b)]
+    (doseq [bad [(assoc b :segments (pop xs))
+                 (assoc b :segments (vec (rest xs)))
+                 (assoc b :segments [(first xs) (first xs) (last xs)])
+                 (assoc b :segments [(second xs) (first xs) (last xs)])
+                 (assoc b :segments [(first xs) (last xs)])]]
+      (is (= :rejected (:status (verify fixture/a bad)))))
+    ;; Even if the attacker rewrites manifest counts, a suffix cannot start
+    ;; without index=0, nil prev and actual trusted genesis.
+    (is (= :segment-link-mismatch
+           (:reason (verify fixture/a (-> b (assoc :segments (subvec xs 1))
+                                          (assoc-in [:checkpoint :segment-count] 2))))))
+    (is (= :segment-cid-mismatch
+           (:reason (verify fixture/a (update-in b [:segments 0 :data] str " ")))))
+    (is (= :checkpoint-cid-mismatch
+           (:reason (verify fixture/a (assoc-in b [:checkpoint :last-cid] (:cid (first xs)))))))))
+
+(deftest readdressed-wrong-context-height-qc-and-branch-refuse
+  (let [p (fixture/proof [[fixture/a] [] [] [] [] [] [] []])
+        b (bundle p 3 context)
+        other (bundle (fixture/proof [[fixture/b] [] [] [] [] [] [] []]) 3 context)]
+    (doseq [f [#(assoc % :chain-id "other") #(assoc % :genesis-hash "other")
+               #(assoc % :from-height 4) #(assoc % :to-height 6)
+               #(assoc % :index 7) #(assoc-in % [:tip-qc :inga.qc/block-hash] "bad")
+               #(assoc-in % [:tip-qc :inga.qc/sigs "w1"] "bad")
+               #(assoc-in % [:blocks 1 :inga.block/ts] 999)
+               #(update % :blocks (fn [xs] [(second xs) (first xs) (last xs)]))]]
+      (is (= :rejected (:status (verify fixture/a (mutate b 1 f))))))
+    ;; Every block and signature on this other branch is real. Readdressing
+    ;; the segment chain does not repair the consensus parent-hash boundary.
+    (is (= :does-not-link
+           (:reason (verify fixture/a (relink (assoc-in b [:segments 1] (second (:segments other))))))))
+    (is (= :invalid-checkpoint
+           (:reason (verify fixture/a (assoc-in b [:checkpoint :state-root] "trusted-without-proof")))))))
+
+(deftest finite-input-output-and-work-bounds
+  (let [b (bundle (fixture/proof [[fixture/a] [] [] [] []]) 3 context)
+        check-limit (fn [limits]
+                      (segmented/verify-acquisition fixture/a (:checkpoint b) (:segments b)
+                                                    (assoc context :limits limits)))]
+    (doseq [[limits reason] [[{:max-segments 1} :segment-count-exceeded]
+                             [{:max-segment-blocks 2} :segment-blocks-exceeded]
+                             [{:max-total-blocks 4} :invalid-checkpoint]
+                             [{:max-segment-bytes 10} :segment-bytes-exceeded]
+                             [{:max-total-bytes 10} :total-bytes-exceeded]
+                             [{:max-signature-checks 1} :signature-work-exceeded]
+                             [{:max-output-bytes 1} :output-bytes-exceeded]
+                             [{:max-edn-depth 1} :edn-depth-exceeded]
+                             [{:max-total-blocks 8193} :invalid-limits]
+                             [{:unknown 1} :invalid-limits]]]
+      (is (= reason (:reason (check-limit limits))) (str limits)))
+    (let [calls (atom 0)
+          ctx (assoc context :limits {:max-total-bytes 10}
+                     :verify-fn (fn [& _] (swap! calls inc) true))]
+      (is (= :total-bytes-exceeded (:reason (segmented/verify-acquisition fixture/a (:checkpoint b) (:segments b) ctx))))
+      (is (zero? @calls)))
+    (let [nested (apply str (repeat 100 "["))
+          xs [{:cid (raw-cid nested) :data nested}]
+          manifest (assoc (:checkpoint b) :segment-count 1 :last-cid (:cid (first xs)))]
+      (is (= :edn-depth-exceeded (:reason (segmented/verify-acquisition fixture/a manifest xs context)))))))
+
+(deftest no-early-success-after-winner-or-at-uncertified-tail
+  (let [b (bundle (fixture/proof [[fixture/a] [] [] [] []]) 3 context)]
+    (is (= :reserved (:status (verify fixture/a b))))
+    (is (= :rejected (:status (verify fixture/a (mutate b 1 #(assoc % :tip-qc {})))))))
+  (doseq [n [1 2]]
+    (let [p (fixture/proof (repeat n [fixture/a]))]
+      (is (= :unresolved (:status (verify fixture/a (bundle p 1 context))))))))
+
+(deftest readdressing-cannot-hide-a-prefix-gap-or-weak-qc
+  (let [b (bundle (fixture/proof [[fixture/a] [] [] [] [] [] [] []]) 3 context)
+        last-index (dec (count (:segments b)))
+        changed-text (pr-str (assoc (edn/read-string (get-in b [:segments last-index :data]))
+                                   :prev-cid (:cid (first (:segments b)))))
+        bad (-> b (assoc-in [:segments last-index] {:cid (raw-cid changed-text) :data changed-text})
+                (assoc-in [:checkpoint :last-cid] (raw-cid changed-text)))]
+    (is (= :segment-link-mismatch (:reason (verify fixture/a bad))))
+    (is (= :checkpoint-height-mismatch (:reason (verify fixture/a (update-in b [:checkpoint :block-count] inc)))))
+    (is (= :invalid-tip-certificate
+           (:reason (verify fixture/a (mutate b 1 #(update-in % [:tip-qc :inga.qc/witnesses] disj "w3"))))))
+    (let [suffix (-> b (assoc :segments (subvec (:segments b) 1))
+                     (assoc-in [:checkpoint :segment-count] 2))
+          forged (mutate suffix 0 #(assoc % :index 0 :from-height 0 :to-height 2))]
+      (is (= :segment-height-mismatch (:reason (verify fixture/a forged)))))))
+
+(deftest trusted-genesis-bootstrap-never-requires-a-new-signature
+  (let [p (fixture/proof [[fixture/a] [] []])
+        b (bundle p 1 context)
+        bootstrap (mutate b 0 #(update % :tip-qc dissoc :inga.qc/sigs))]
+    (is (= (reservation/verify-acquisition fixture/a p fixture/context)
+           (verify fixture/a bootstrap)))
+    (is (= :invalid-tip-certificate
+           (:reason (verify fixture/a (mutate bootstrap 0 #(assoc-in % [:tip-qc :inga.qc/block-hash] "wrong-genesis"))))))))

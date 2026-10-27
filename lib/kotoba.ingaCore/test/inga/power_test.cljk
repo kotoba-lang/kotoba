@@ -1,0 +1,272 @@
+(ns inga.power-test
+  "F3: the power table is a function of the committed prefix, so peers cannot
+  hold different validator sets while agreeing on blocks.
+
+  The `:slash` tests also pin superproject ADR-2608055000 G2 (invariant I4, no
+  adjudicator exists): a confiscation must carry the proof that justifies it
+  and this fold must check it, so no proposer can decide who loses collateral."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [inga.power :as power]
+            [inga.stake :as stake]))
+
+;; ── evidence fixtures ───────────────────────────────────────────────────────
+;;
+;; Shaped exactly as `inga.stake/detect-equivocation` emits and
+;; `verify-equivocation-evidence` consumes. The signature is a string and the
+;; verifier is injected, the same division of labour every other seam here uses
+;; -- this namespace has no crypto and must not grow any.
+
+(defn- vote
+  "A signed vote, carrying the VIEW it was cast in.
+
+  The view is not decoration: equivocation is defined per view, so evidence
+  whose votes do not say which view they were cast in cannot be shown to
+  conflict and `verify-equivocation-evidence` refuses it. A fixture without
+  one is not a production shape — `inga.replica/fold-vote` assoc's a view onto
+  every vote it handles."
+  ([w h block-hash] (vote w h block-hash 0))
+  ([w h block-hash view]
+   {:inga.vote/witness w :inga.vote/height h :inga.vote/block-hash block-hash
+    :inga.vote/view view
+    :inga.vote/sig (str "sig:" w ":" h ":" block-hash)}))
+
+(defn- equivocation
+  "A genuine double-vote by `w` at `h`: same witness, same height, SAME VIEW,
+  two blocks. Same view is what makes it a crime rather than a view change."
+  [w h]
+  {:inga.evidence/witness w :inga.evidence/height h :inga.evidence/view 0
+   :inga.evidence/vote-a (vote w h "block-a")
+   :inga.evidence/vote-b (vote w h "block-b")})
+
+(def ^:private accepts-every-signature (constantly true))
+(def ^:private accepts-no-signature (constantly false))
+
+(defn- table-after
+  ([events] (table-after events {:verify-sig-fn accepts-every-signature}))
+  ([events opts] (power/apply-events power/empty-table 1 events opts)))
+
+(def bonded
+  (table-after [{:event :bond :witness "w1" :amount 100 :roles [:ordering]}
+                {:event :bond :witness "w2" :amount 100 :roles [:ordering]}
+                {:event :bond :witness "w3" :amount 100 :roles [:ordering]}
+                {:event :bond :witness "w4" :amount 100 :roles [:ordering :storage]}]))
+
+(defn- slash-of [w h] {:event :slash :witness w :terms {} :evidence (equivocation w h)})
+
+(deftest the-table-is-a-function-of-the-committed-prefix
+  (testing "the same events in the same order give the same table -- which is
+            what moving it into committed state buys"
+    (let [evs [{:event :bond :witness "w1" :amount 50 :roles [:ordering]}
+               {:event :bond :witness "w2" :amount 25 :roles [:storage]}
+               (slash-of "w1" 7)]]
+      (is (= (table-after evs) (table-after evs)))
+      (is (= 25 (get-in (table-after evs) [:bonds "w2" :amount])))
+      (is (nil? (get-in (table-after evs) [:bonds "w1"]))
+          "inga.stake/slash removes the entire record, and this must not write it back")))
+  (testing "and the height it is a function OF is recorded"
+    (is (= 1 (:height bonded)))))
+
+(deftest storage-is-a-role-on-the-existing-market-not-a-second-economy
+  (is (= #{:ordering :recompute :storage} power/roles))
+  (is (= #{"w4"} (stake/eligible-witnesses (power/bonds bonded) 1 :storage)))
+  (is (= #{"w1" "w2" "w3" "w4"} (stake/eligible-witnesses (power/bonds bonded) 1 :ordering)))
+  (testing "one bond, self-selected roles"
+    (is (= 100 (get-in bonded [:bonds "w4" :amount]))
+        "w4 does not post separate collateral per role")))
+
+(deftest an-unknown-role-is-refused-rather-than-ignored
+  (testing "silently ignoring is either a typo that counts toward nothing or a
+            privilege escalation that counts toward everything"
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (table-after [{:event :bond :witness "w" :amount 1 :roles [:ordring]}])))))
+
+(deftest an-unknown-event-is-refused-rather-than-ignored
+  (testing "a no-op on an unknown type diverges a replica that knows it from
+            one that does not -- the exact failure the table moved to fix"
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (table-after [{:event :airdrop :witness "w1"}])))))
+
+(deftest the-bonds-seam-is-what-stake-consumes
+  (testing "the whole point of F3: inga.stake is handed a bonds map, and this
+            makes that map a function of the committed prefix"
+    (is (= 400 (stake/total-stake (power/bonds bonded)
+                                  (stake/eligible-witnesses (power/bonds bonded) 1 :ordering))))
+    (is (= #{} (stake/eligible-witnesses (power/bonds bonded) 101 :ordering))
+        "the floor is stake's policy, not this namespace's")))
+
+(deftest unbonding-leaves-the-active-set-before-the-collateral-leaves
+  (let [t (power/apply-events bonded 2 [{:event :unbond-request :witness "w4" :available-at 10}])]
+    (testing "a witness in its notice period is not in the map stake reads --
+              voting through the notice period would let it equivocate and
+              then walk the bond out"
+      (is (nil? (get (power/bonds t) "w4")))
+      (is (= #{"w1" "w2" "w3"} (stake/eligible-witnesses (power/bonds t) 1 :ordering))))
+    (testing "but the collateral is still in the table -- leaving immediately
+              would mean equivocating with nothing at risk"
+      (is (= 100 (get-in t [:bonds "w4" :amount]))))
+    (testing "and completing early is refused"
+      (is (thrown? #?(:clj Exception :cljs js/Error)
+                   (power/apply-events t 3 [{:event :unbond-complete :witness "w4" :height 3}])))
+      (is (nil? (get-in (power/apply-events t 10 [{:event :unbond-complete :witness "w4" :height 10}])
+                        [:bonds "w4"]))))))
+
+(deftest slashing-lands-at-a-decided-height
+  (let [t (power/apply-events bonded 5 [(slash-of "w1" 7)]
+                              {:verify-sig-fn accepts-every-signature})]
+    (is (nil? (get-in t [:bonds "w1"])) "the whole record goes -- no ghost entry")
+    (is (= 5 (:height t)) "and the table records which prefix it is a function of")
+    (is (nil? (get (power/bonds t) "w1"))
+        "so stake never counts it again from this height on")
+    (testing "the magnitude is committed too, not just the fact"
+      (is (= [{:witness "w1" :burned 95.0 :rewarded 0 :for-height 7}] (:slashes t))))
+    (testing "and WHICH double-vote was punished, which is what makes it auditable"
+      (is (= #{["w1" 7]} (:punished t))))))
+
+(deftest events-for-an-unbonded-witness-are-refused
+  (testing ":set-roles/:unbond-request throw -- a witness submits those about
+            ITSELF, so a ghost is a bug in the submitter, not adversarial input"
+    (doseq [e [{:event :set-roles :witness "ghost" :roles [:ordering]}
+               {:event :unbond-request :witness "ghost" :available-at 1}]]
+      (is (thrown? #?(:clj Exception :cljs js/Error) (table-after [e])) (pr-str e))))
+  (testing ":slash does NOT throw -- anyone may submit one about anyone, so a
+            throw would let one forged accusation halt every replica"
+    (let [t (table-after [(slash-of "ghost" 3)])]
+      (is (= {"ghost" {:not-bonded 1}} (:rejected-slashes t)))
+      (is (empty? (:slashes t))))))
+
+;; ── G2: a slash must carry its proof, and this fold must check it ───────────
+
+(deftest a-slash-without-a-verifier-throws
+  (testing "a replica that cannot check evidence must never apply a slash, and
+            must not quietly record refusals while its correctly-configured
+            peers apply the same slash for real -- that is divergence, so this
+            is the one slash failure that is loud"
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (power/apply-events bonded 2 [(slash-of "w1" 7)])))
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (power/apply-events bonded 2 [(slash-of "w1" 7)] {})))))
+
+(deftest a-slash-carrying-no-evidence-is-refused
+  (testing "THE regression this exists for. Until 2026-08-05 this event -- no
+            proof of anything -- confiscated w1's entire bond on every replica,
+            because the method validated only that w1 had a bond."
+    (let [t (power/apply-events bonded 2 [{:event :slash :witness "w1" :terms {}}]
+                                {:verify-sig-fn accepts-every-signature})]
+      (is (= {"w1" {:no-evidence 1}} (:rejected-slashes t)))
+      (is (= 100 (get-in t [:bonds "w1" :amount])) "the bond is untouched")
+      (is (empty? (:slashes t))))))
+
+(deftest evidence-about-someone-else-is-refused
+  (testing "otherwise a real proof about w2 launders into a confiscation from w1"
+    (let [t (power/apply-events bonded 2
+                                [{:event :slash :witness "w1" :terms {}
+                                  :evidence (equivocation "w2" 7)}]
+                                {:verify-sig-fn accepts-every-signature})]
+      (is (= {"w1" {:evidence-names-another-witness 1}} (:rejected-slashes t)))
+      (is (= 100 (get-in t [:bonds "w1" :amount])))
+      (is (= 100 (get-in t [:bonds "w2" :amount])) "and w2 is not slashed either"))))
+
+(deftest evidence-that-does-not-verify-is-refused
+  (testing "unverifiable evidence is how one node frames another -- the
+            signatures are re-checked here, not trusted from the proposer"
+    (let [t (power/apply-events bonded 2 [(slash-of "w1" 7)]
+                                {:verify-sig-fn accepts-no-signature})]
+      (is (= {"w1" {:evidence-did-not-verify 1}} (:rejected-slashes t)))
+      (is (= 100 (get-in t [:bonds "w1" :amount]))))))
+
+(deftest two-votes-for-the-same-block-are-not-equivocation
+  (testing "structurally malformed evidence is caught by stake's own re-check,
+            not by trusting that the proposer ran detection honestly"
+    (let [not-a-double-vote {:inga.evidence/witness "w1" :inga.evidence/height 7
+                             :inga.evidence/vote-a (vote "w1" 7 "block-a")
+                             :inga.evidence/vote-b (vote "w1" 7 "block-a")}
+          t (power/apply-events bonded 2
+                                [{:event :slash :witness "w1" :terms {}
+                                  :evidence not-a-double-vote}]
+                                {:verify-sig-fn accepts-every-signature})]
+      (is (= {"w1" {:evidence-did-not-verify 1}} (:rejected-slashes t)))
+      (is (= 100 (get-in t [:bonds "w1" :amount]))))))
+
+(deftest the-same-proof-cannot-punish-twice
+  (testing "evidence for height H stays valid forever. Without :punished, a
+            witness that was slashed, re-bonded, and has behaved since could be
+            confiscated again for the same past act by anyone holding the old
+            proof -- indefinitely."
+    (let [opts {:verify-sig-fn accepts-every-signature}
+          slashed (power/apply-events bonded 2 [(slash-of "w1" 7)] opts)
+          rebonded (power/apply-events slashed 3
+                                       [{:event :bond :witness "w1" :amount 100 :roles [:ordering]}]
+                                       opts)
+          again (power/apply-events rebonded 4 [(slash-of "w1" 7)] opts)]
+      (is (= 100 (get-in again [:bonds "w1" :amount]))
+          "the re-bonded collateral survives the replayed proof")
+      (is (= {"w1" {:already-punished 1}} (:rejected-slashes again)))
+      (is (= 1 (count (:slashes again))) "still exactly one slash on record"))
+    (testing "but a DIFFERENT height is a different offence and does apply"
+      (let [opts {:verify-sig-fn accepts-every-signature}
+            slashed (power/apply-events bonded 2 [(slash-of "w1" 7)] opts)
+            rebonded (power/apply-events slashed 3
+                                         [{:event :bond :witness "w1" :amount 100 :roles [:ordering]}]
+                                         opts)
+            again (power/apply-events rebonded 4 [(slash-of "w1" 9)] opts)]
+        (is (nil? (get-in again [:bonds "w1"])))
+        (is (= #{["w1" 7] ["w1" 9]} (:punished again)))))))
+
+(deftest a-flood-of-forged-accusations-is-attributable-not-fatal
+  (testing "adversarial input must not stop the chain, and must not vanish
+            either -- every refusal is committed state"
+    (let [t (power/apply-events bonded 2
+                                [{:event :slash :witness "w1" :terms {}}
+                                 {:event :slash :witness "w2" :terms {}
+                                  :evidence (equivocation "w3" 4)}
+                                 (slash-of "w3" 5)]
+                                {:verify-sig-fn accepts-no-signature})]
+      (is (= {"w1" {:no-evidence 1}
+              "w2" {:evidence-names-another-witness 1}
+              "w3" {:evidence-did-not-verify 1}}
+             (:rejected-slashes t)))
+      (is (= 400 (stake/total-stake (power/bonds t) ["w1" "w2" "w3" "w4"]))
+          "nobody lost anything"))))
+
+(deftest refusal-bookkeeping-is-bounded-under-a-flood
+  (testing "`:rejected-slashes` is ATTACKER-CHOSEN data in state folded across
+            the whole chain and hashed into a state root. The first version of
+            this appended to a vector, so a proposer could grow it without
+            bound forever at the cost of block space alone. Counting keeps the
+            same answer -- who was accused, how, how often -- in a map bounded
+            by the witness set times the fixed reason set."
+    (let [opts {:verify-sig-fn accepts-every-signature}
+          flood (repeat 500 {:event :slash :witness "w1" :terms {}})
+          t (power/apply-events bonded 2 flood opts)]
+      (is (= {"w1" {:no-evidence 500}} (:rejected-slashes t))
+          "one entry, not 500")
+      (is (= 1 (count (:rejected-slashes t))))
+      (is (= 100 (get-in t [:bonds "w1" :amount])) "and nothing was taken"))))
+
+(deftest a-successful-slash-still-appends-because-the-attacker-does-not-choose-it
+  (testing "the asymmetry that justifies the two shapes: appending to :slashes
+            requires a verified proof AND costs the offender their whole bond"
+    (let [opts {:verify-sig-fn accepts-every-signature}
+          t (power/apply-events bonded 2 [(slash-of "w1" 7) (slash-of "w2" 8)] opts)]
+      (is (vector? (:slashes t)))
+      (is (= 2 (count (:slashes t))))
+      (is (= #{["w1" 7] ["w2" 8]} (:punished t))))))
+
+
+;; ── a view change must not cost a witness its bond ──────────────────────────
+
+(deftest a-slash-built-from-a-view-change-is-refused
+  (testing "the failure this whole per-view change exists to stop, seen from
+            the money end: an honest replica that voted again at one height in
+            a LATER view (a view change, the mechanism by which a stalled
+            chain recovers) must not be slashable for it"
+    (let [view-change {:inga.evidence/witness "w1" :inga.evidence/height 7
+                       :inga.evidence/vote-a (vote "w1" 7 "block-a" 7)
+                       :inga.evidence/vote-b (vote "w1" 7 "block-b" 8)}
+          evs [{:event :bond :witness "w1" :amount 100 :roles #{:ordering}}
+               {:event :slash :witness "w1" :terms {} :evidence view-change}]
+          t (table-after evs)]
+      (is (= {"w1" {:evidence-did-not-verify 1}} (:rejected-slashes t))
+          "refused, and named as unverifiable rather than silently ignored")
+      (is (some? (get-in t [:bonds "w1"])) "the bond survives")
+      (is (= 100 (get-in t [:bonds "w1" :amount]))))))

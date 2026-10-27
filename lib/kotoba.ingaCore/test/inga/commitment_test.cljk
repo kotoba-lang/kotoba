@@ -1,0 +1,142 @@
+(ns inga.commitment-test
+  "Proving a record was committed, rather than signing it a second time.
+
+  Every test states the attack it removes. A verifier's tests are the only
+  place the checks are pinned in the order they have to run in."
+  (:require [kotoba.lang.edn :as edn]
+            [kotoba.test :refer [deftest is testing]]
+            [inga.attest :as att]
+            [inga.commitment :as cm]
+            [inga.consensus :as c]
+            [inga.head :as head]))
+
+(def ^:const chain "inga-commitment-test")
+(def quorum 3)
+(def validators #{"w1" "w2" "w3" "w4"})
+
+(defn- sign [w payload] (str "sig<" w "|" payload ">"))
+(defn- verify [w payload sig] (= sig (sign w payload)))
+
+;; The proposals a real block carries are strings — `inga-node` puts JSON in
+;; them. The decoder is the caller's seam, so the test supplies the trivial
+;; one and the namespace never learns a serialization.
+(defn- encode [record] (pr-str record))
+(defn- decode [s] (edn/read-string s))
+
+;; A deployment's own hash. Deliberately not a real digest: what is under test
+;; is that the hash BINDS the certificate to the block, not which hash.
+(defn- hash-fn [block] (str "BH:" (hash (:inga.block/proposals block))))
+
+(def ^:private record
+  (head/head-record {:ref-name "main" :seq 0 :cid "cid-one" :prev nil :height 3}))
+
+(defn- block-of [& records]
+  {:inga.block/height 3
+   :inga.block/proposals (mapv encode records)})
+
+(defn- qc-for [block & {:keys [witnesses view] :or {witnesses ["w1" "w2" "w3"] view 7}}]
+  (let [bh (hash-fn block)
+        votes (mapv (fn [w]
+                      (att/sign-vote (c/make-vote w bh 3) chain view (partial sign w)))
+                    witnesses)]
+    (att/certify (c/qc votes 4 view) votes)))
+
+(def ^:private context
+  {:chain-id chain :hash-fn hash-fn :quorum quorum
+   :verify-fn verify :admitted? validators :decode-proposal decode})
+
+(deftest a-record-in-a-certified-block-is-proved-committed
+  (let [block (block-of record)]
+    (is (nil? (cm/verify-commitment {:record record :block block :qc (qc-for block)}
+                                    context)))))
+
+(deftest a-certificate-for-another-block-does-not-prove-this-one
+  (testing "the attack: a real certificate for block X, plus an attacker's
+            block Y holding an attacker's record. Nothing is forged and the
+            record was never committed"
+    (let [honest (block-of record)
+          evil-record (head/head-record {:ref-name "main" :seq 0 :cid "cid-theirs"
+                                         :prev nil :height 3})
+          evil (block-of evil-record)]
+      (is (= :block-not-certified
+             (cm/verify-commitment {:record evil-record :block evil
+                                    :qc (qc-for honest)}
+                                   context))))))
+
+(deftest an-unverifiable-certificate-is-refused-with-its-own-reason
+  (let [block (block-of record)]
+    (testing "a forged signature"
+      (let [q (assoc-in (qc-for block) [:inga.qc/sigs "w2"] "sig<w2|whatever>")]
+        (is (= :bad-signature
+               (cm/verify-commitment {:record record :block block :qc q} context)))))
+    (testing "witnesses nobody admitted — minting keys is free"
+      (let [q (qc-for block :witnesses ["x1" "x2" "x3"])]
+        (is (= :not-admitted
+               (cm/verify-commitment {:record record :block block :qc q} context)))))
+    (testing "the reason is carried through rather than flattened: below-quorum
+              and bad-signature send an operator to different places"
+      ;; Built by narrowing a good certificate rather than by asking
+      ;; `c/qc` for a short one — it returns nil below quorum-size, so the
+      ;; first version of this test produced a certificate with no block hash
+      ;; and was answered `:block-not-certified` by an earlier check. It
+      ;; failed, which is the only reason the mistake is not still here.
+      (let [full (qc-for block)
+            q (-> full
+                  (update :inga.qc/witnesses disj "w3")
+                  (update :inga.qc/sigs dissoc "w3")
+                  (update :inga.qc/views dissoc "w3"))]
+        (is (= :below-quorum
+               (cm/verify-commitment {:record record :block block :qc q} context)))))))
+
+(deftest a-record-not-in-the-block-rides-on-nothing
+  (testing "the attack: a legitimately committed block, and any record at all
+            claimed against it"
+    (let [block (block-of record)
+          other (head/head-record {:ref-name "main" :seq 1 :cid "cid-two"
+                                   :prev "cid-one" :height 3})]
+      (is (= :not-in-block
+             (cm/verify-commitment {:record other :block block :qc (qc-for block)}
+                                   context))))))
+
+(deftest inclusion-compares-the-record-and-not-its-spelling
+  (testing "a proposal carrying extra fields is still the record it is —
+            what a commitment proves is that THIS record was committed, and
+            the caller gets the record it asked about"
+    (let [block {:inga.block/height 3
+                 :inga.block/proposals [(encode (assoc record "note" "whatever"))]}]
+      (is (nil? (cm/verify-commitment {:record record :block block :qc (qc-for block)}
+                                      context)))))
+  (testing "but a different cid is a different record"
+    (let [block (block-of (assoc record "cid" "cid-elsewhere"))]
+      (is (= :not-in-block
+             (cm/verify-commitment {:record record :block block :qc (qc-for block)}
+                                   context))))))
+
+(deftest a-proposal-that-cannot-be-decoded-is-skipped-not-thrown
+  (testing "the log is shared and another consumer may put its own proposals
+            in it — a verifier that dies on someone else's entry is a verifier
+            one other tenant can stop"
+    (let [block {:inga.block/height 3
+                 :inga.block/proposals ["{not readable" (encode record)]}]
+      (is (nil? (cm/verify-commitment {:record record :block block :qc (qc-for block)}
+                                      context))))))
+
+(deftest a-missing-seam-is-named-rather-than-guessed
+  (let [block (block-of record)]
+    (is (= :missing-seam
+           (cm/verify-commitment {:record record :block block :qc (qc-for block)}
+                                 (dissoc context :decode-proposal))))
+    (is (= :malformed
+           (cm/verify-commitment {:record record :block block :qc nil} context)))))
+
+(deftest verify-head-checks-the-ref-name-it-was-asked-about
+  (testing "`ref` is inside the record, so a head for ref A is a perfectly
+            good proof of ref A — served under ref B it must still be refused"
+    (let [block (block-of record)
+          proof {:block block :qc (qc-for block)}]
+      (is (some? (cm/verify-head record "main" proof context)))
+      (is (nil? (cm/verify-head record "other" proof context))
+          "the same head, the same valid proof, the wrong question")
+      (is (nil? (cm/verify-head record "main" {:block block :qc (qc-for (block-of))}
+                                context))
+          "and a proof that does not cover it is absent, not an error"))))

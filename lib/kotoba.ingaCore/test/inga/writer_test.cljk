@@ -1,0 +1,94 @@
+(ns inga.writer-test
+  "Writer policy on refs. Signatures here are `writer|text` strings, not
+  crypto, for the reason ref-test gives: the curve is injected, and what these
+  tests check is which record becomes state."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [inga.ref :as iref]
+            [inga.writer :as w]))
+
+(def op "did:key:z6MkOperator")
+(def mirror "did:key:z6MkMirror")
+(def outsider "did:key:z6MkOutsider")
+(def chain "isekai-score-20261006-v5")
+
+(def policy {"yataverse/lake" #{op}
+             "yataverse/graph/" #{mirror}})
+
+(defn- verify [writer text sig] (= sig (str writer "|" text)))
+
+(defn- signed
+  ([writer r] (signed writer chain r))
+  ([writer chain-id r] (assoc r "writer" writer "sig" (str writer "|" (w/signing-text chain-id r)))))
+
+(defn- refusal [r] (w/refusal policy chain verify r))
+(def admit (w/admit policy chain verify))
+
+(deftest writers-are-found-by-exact-key-then-longest-prefix
+  (is (= #{op} (:writers (w/writers-for policy "yataverse/lake"))))
+  (is (= #{mirror} (:writers (w/writers-for policy "yataverse/graph/bafyx"))))
+  (is (= #{"did:key:z6MkNarrow"}
+         (:writers (w/writers-for (assoc policy "yataverse/graph/bafyx" #{"did:key:z6MkNarrow"}) "yataverse/graph/bafyx"))))
+  (is (nil? (w/writers-for policy "isekai/scores")) "an uncovered ref is unrestricted")
+  (is (nil? (w/writers-for policy "yataverse/lakehouse")) "an exact key is not a prefix"))
+
+(deftest a-covered-ref-needs-an-allowed-writer-and-a-good-signature
+  (let [r {"ref" "yataverse/lake" "seq" 3 "cid" "bafyA" "prev" "bafyP"}]
+    (is (nil? (refusal (signed op r))))
+    (is (= :unsigned (refusal r)))
+    (is (= :writer-not-allowed (refusal (signed outsider r))))
+    (is (= :writer-not-allowed (refusal (signed mirror r))) "the graph mirror's key does not write the lake")
+    (testing "every field is bound, including v and height"
+      (let [good (signed op (assoc r "v" "inga.head/v1" "height" 7))]
+        (is (nil? (refusal good)))
+        (doseq [[k v] [["seq" 4] ["cid" "bafyB"] ["prev" "bafyQ"] ["v" "x"] ["height" 8]]]
+          (is (= :bad-signature (refusal (assoc good k v))) (str k " altered")))))
+    (testing "a field outside the signed set is refused, not ignored"
+      (is (= :unexpected-field (refusal (assoc (signed op r) "extra" 1)))))
+    (testing "a signature for another chain does not verify here"
+      (is (= :bad-signature (refusal (signed op "some-other-chain" r)))))
+    (testing "a throwing verifier, or one returning a truthy non-boolean, refuses"
+      (is (= :bad-signature (w/refusal policy chain (fn [& _] (throw (ex-info "boom" {}))) (signed op r))))
+      (is (= :bad-signature (w/refusal policy chain (fn [& _] "a promise, say") (signed op r))) "a promise-like object is not true"))))
+
+(deftest malformed-records-are-refused-not-thrown
+  (is (= :malformed (refusal {"ref" nil "seq" 0 "cid" "x"})))
+  (is (= :malformed (refusal {"ref" 42 "seq" 0 "cid" "x"})))
+  (is (= :malformed (refusal {"ref" "yataverse/lake" "seq" "0" "cid" "x"})))
+  (is (= {} (iref/project [{"ref" nil "seq" 0 "cid" "x"}] admit)) "projection survives a malformed record"))
+
+(deftest an-uncovered-ref-is-admitted-unsigned
+  (is (nil? (refusal {"ref" "isekai/scores" "seq" 0 "cid" "bafyS"}))))
+
+(deftest from-seq-grandfathers-history
+  (let [p {"yataverse/lake" {"writers" #{op} "from_seq" 3}}
+        old {"ref" "yataverse/lake" "seq" 2 "cid" "bafyOld"}
+        new-unsigned {"ref" "yataverse/lake" "seq" 3 "cid" "bafyForged"}
+        new-signed (signed op {"ref" "yataverse/lake" "seq" 3 "cid" "bafyNew"})
+        a (w/admit p chain verify)]
+    (is (nil? (w/refusal p chain verify old)) "pre-policy history is admitted as it is")
+    (is (= :unsigned (w/refusal p chain verify new-unsigned)))
+    (let [proj (iref/project [{"ref" "yataverse/lake" "seq" 0 "cid" "b0"}
+                              {"ref" "yataverse/lake" "seq" 1 "cid" "b1"}
+                              old new-unsigned new-signed] a)]
+      (is (= "bafyNew" (get (iref/head-of proj "yataverse/lake") "cid"))
+          "the head survives enabling the policy and continues with the signed record"))))
+
+(deftest a-refused-record-takes-no-sequence
+  (let [forged {"ref" "yataverse/lake" "seq" 0 "cid" "bafyForged"}
+        real (signed op {"ref" "yataverse/lake" "seq" 0 "cid" "bafyReal"})
+        next1 (signed op {"ref" "yataverse/lake" "seq" 1 "cid" "bafyNext" "prev" "bafyReal"})
+        proj (iref/project [forged (signed outsider forged) real next1] admit)]
+    (is (= "bafyReal" (get-in proj ["yataverse/lake" 0 "cid"]))
+        "the first ADMITTED record wins seq 0, though two refused ones came first")
+    (is (= "bafyNext" (get (iref/head-of proj "yataverse/lake") "cid")))
+    (testing "without a policy the forged record would have won, as before"
+      (is (= "bafyForged" (get-in (iref/project [forged real]) ["yataverse/lake" 0 "cid"]))))))
+
+(deftest an-occupied-sequence-is-not-verified-again
+  (let [calls (atom 0)
+        counting (fn [w t s] (swap! calls inc) (verify w t s))
+        a (w/admit policy chain counting)
+        real (signed op {"ref" "yataverse/lake" "seq" 0 "cid" "bafyReal"})
+        spam (repeat 50 (assoc real "cid" "bafySpam" "sig" "bad"))]
+    (iref/project (cons real spam) a)
+    (is (= 1 @calls) "only the record that could win was verified")))

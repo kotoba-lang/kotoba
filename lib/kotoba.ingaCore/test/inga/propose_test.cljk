@@ -1,0 +1,144 @@
+(ns inga.propose-test
+  "The loop around `inga.ref/outcome`, and the one distinction it cannot make."
+  (:require [kotoba.test :refer [deftest is testing #?@(:cljs [async])]]
+            [inga.head :as head]
+            [inga.ref :as ref]
+            [inga.propose :as propose]))
+
+(defn- rec [ref-name s cid]
+  (assoc (head/head-record {:ref-name ref-name :seq s :cid cid :prev nil :height nil})
+         "cert" {:sigs [{:witness "w1" :sig "s"}]}))
+
+(def mine (rec "main" 0 "cid-mine"))
+(def theirs (rec "main" 0 "cid-theirs"))
+
+;; ── the distinction ─────────────────────────────────────────────────────────
+
+(deftest an-unclaimed-sequence-is-pending-not-lost
+  (testing "outcome alone calls it a loss -- correct terminally, wrong as a poll"
+    (is (false? (:certified? (ref/outcome (ref/project []) mine))))
+    (is (= propose/pending (propose/step (ref/project []) mine))
+        "a proposal is submitted before it is committed; every successful one
+         passes through this state"))
+  (testing "claimed? is about the SEQUENCE, not about this record"
+    (is (not (propose/claimed? (ref/project []) mine)))
+    (is (propose/claimed? (ref/project [theirs]) mine)
+        "another writer taking the sequence is a decision too -- nothing left to wait for")))
+
+(deftest step-defers-to-outcome-once-decided
+  (testing "won"
+    (let [p (ref/project [mine])]
+      (is (true? (:certified? (propose/step p mine))))
+      (is (= (ref/outcome p mine) (propose/step p mine))
+          "this namespace decides WHEN to ask, never what the answer is")))
+  (testing "lost, and told what actually holds the sequence"
+    (let [p (ref/project [theirs])
+          s (propose/step p mine)]
+      (is (false? (:certified? s)))
+      (is (= "cid-theirs" (:current s))
+          "a caller that only learns false retries against the same base forever"))))
+
+(deftest first-wins-decides-a-race
+  (let [p (ref/project [theirs mine])]
+    (is (false? (:certified? (propose/step p mine))))
+    (is (true? (:certified? (propose/step p theirs))))))
+
+;; ── timing out ──────────────────────────────────────────────────────────────
+
+(deftest a-timeout-is-reported-as-a-loss-and-labelled
+  (let [t (propose/timed-out (ref/project []) mine)]
+    (is (false? (:certified? t)))
+    (is (true? (:timed-out? t))
+        "may still commit later, so it must not be indistinguishable from a real loss")))
+
+;; ── the JVM driver ──────────────────────────────────────────────────────────
+
+#?(:clj
+   (deftest sync-propose-waits-for-the-commit
+     (let [committed (atom [])
+           clock (atom 0)
+           p (propose/sync-propose!
+              {:submit! (fn [r] (future (Thread/sleep 5) (swap! committed conj r)))
+               :committed (fn [] @committed)
+               :now-ms (fn [] (swap! clock + 1))
+               :sleep! (fn [_] (Thread/sleep 1))
+               :timeout-ms 100000 :poll-ms 1})]
+       (is (true? (:certified? (p mine)))
+           "submitted, not yet committed, then committed -- the loop is the point"))))
+
+#?(:clj
+   (deftest sync-propose-gives-up-at-the-deadline
+     (let [clock (atom 0)
+           p (propose/sync-propose!
+              {:submit! (fn [_] nil)                 ; never commits
+               :committed (fn [] [])
+               :now-ms (fn [] (swap! clock + 10))
+               :sleep! (fn [_] nil)
+               :timeout-ms 50 :poll-ms 1})
+           out (p mine)]
+       (is (false? (:certified? out)))
+       (is (true? (:timed-out? out))))))
+
+#?(:clj
+   (deftest sync-propose-reports-the-winner-when-it-loses
+     (let [clock (atom 0)
+           p (propose/sync-propose!
+              {:submit! (fn [_] nil)
+               :committed (fn [] [theirs])
+               :now-ms (fn [] (swap! clock + 1))
+               :sleep! (fn [_] nil)
+               :timeout-ms 1000 :poll-ms 1})
+           out (p mine)]
+       (is (false? (:certified? out)))
+       (is (nil? (:timed-out? out)) "decided, not abandoned")
+       (is (= "cid-theirs" (:current out))))))
+
+;; ── the cljs driver ─────────────────────────────────────────────────────────
+
+#?(:cljs
+   (deftest async-propose-waits-for-the-commit
+     (async done
+       (let [committed (atom [])
+             clock (atom 0)
+             p (propose/async-propose!
+                {:submit! (fn [r] (js/setTimeout #(swap! committed conj r) 5))
+                 :committed (fn [] @committed)
+                 :now-ms (fn [] (swap! clock + 1))
+                 :timeout-ms 100000 :poll-ms 1})]
+         (-> (p mine)
+             (.then (fn [out]
+                      (is (true? (:certified? out)))
+                      (done))))))))
+
+#?(:cljs
+   (deftest async-propose-gives-up-at-the-deadline
+     (async done
+       (let [clock (atom 0)
+             p (propose/async-propose!
+                {:submit! (fn [_] nil)
+                 :committed (fn [] [])
+                 :now-ms (fn [] (swap! clock + 10))
+                 :timeout-ms 50 :poll-ms 1})]
+         (-> (p mine)
+             (.then (fn [out]
+                      (is (false? (:certified? out)))
+                      (is (true? (:timed-out? out)))
+                      (done))))))))
+
+#?(:cljs
+   (deftest async-propose-accepts-a-promise-returning-committed
+     ;; The first real deployment's committed prefix is an HTTP round trip.
+     ;; Before this, `committed` was folded as a value, a promise folded to
+     ;; nothing, and every proposal timed out.
+     (async done
+       (let [committed (atom [])
+             clock (atom 0)
+             p (propose/async-propose!
+                {:submit! (fn [r] (js/setTimeout #(swap! committed conj r) 5))
+                 :committed (fn [] (js/Promise.resolve @committed))
+                 :now-ms (fn [] (swap! clock + 1))
+                 :timeout-ms 100000 :poll-ms 1})]
+         (-> (p mine)
+             (.then (fn [out]
+                      (is (true? (:certified? out)))
+                      (done))))))))

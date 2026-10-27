@@ -1,0 +1,206 @@
+(ns inga.rival-qc-test
+  (:require [kotoba.test :refer [deftest is]]
+            [inga.replica :as r]
+            [inga.attest :as att]
+            [inga.consensus :as c]
+            [inga.wire :as wire]))
+
+(def witnesses [:w1 :w2 :w3 :w4])
+(def chain "engi-test-1")
+(defn- hash-fn [b] (str "h:" (c/canonical-block b)))
+(defn- fake-sign [w] (fn [payload] (str "sig(" w ")" (hash payload))))
+(defn- fake-verify [w payload sig]
+  (and (some? sig) (= sig ((fake-sign (name w)) payload))))
+(defn- opts [w]
+  {:witness w :witnesses witnesses :quorum (c/quorum-size 4)
+   :hash-fn hash-fn :chain-id chain
+   :sign-fn (fake-sign (name w)) :verify-fn fake-verify})
+(defn- genuine-cert [bh height]
+  (let [votes (mapv (fn [w]
+                      (let [id (name w)]
+                        {:inga.vote/witness id :inga.vote/block-hash bh
+                         :inga.vote/height height :inga.vote/view 0
+                         :inga.vote/sig ((fake-sign id)
+                                         (att/vote-payload chain 0 height bh id))}))
+                    [:w2 :w3 :w4])]
+    (att/certify (c/qc votes 4 0) votes)))
+(defn- certified-child [parent height]
+  (let [justify (genuine-cert (hash-fn parent) (:inga.block/height parent))
+        round (c/entitled-round parent)]
+    (c/make-block {:height height :parent-hash (hash-fn parent) :proposals []
+                   :proposer (name (c/leader-for witnesses round))
+                   :ts (* 10 height) :round round :justify justify})))
+(defn- nv [w view high-qc]
+  (let [id (name w)]
+    {:type :new-view :witness id :view view :high-qc high-qc
+     :sig ((fake-sign id) (att/new-view-payload chain view id high-qc))}))
+
+(deftest a-certified-same-height-rival-survives-restart-and-can-be-requested
+  (let [opts (opts :w1)
+        initial (r/replica opts)
+        genesis (r/tip initial)
+        local (certified-child genesis 1)
+        rival (update local :inga.block/ts inc)
+        target (hash-fn rival)
+        qc (genuine-cert target 1)
+        state (-> initial
+                  (assoc :chain [genesis local]
+                         :by-hash {(hash-fn genesis) genesis
+                                   (hash-fn local) local target rival}
+                         :qcs {target qc})
+                  (assoc-in [:pm :high-qc] qc))
+        restored (r/resume opts (r/snapshot state))
+        requester (-> initial
+                      (assoc :chain [genesis local]
+                             :by-hash {(hash-fn genesis) genesis
+                                       (hash-fn local) local}))
+        [requester requests] (r/on-message requester (nv :w2 7 qc) 1000)
+        request (:msg (first (filter #(= :sync-request (:type (:msg %))) requests)))
+        [decoded-request request-refusal] (wire/decode (wire/encode request))
+        [_ responses] (r/on-message restored decoded-request 1001)
+        response (:msg (first responses))
+        [decoded-response response-refusal] (wire/decode (wire/encode response))
+        [recovered _] (r/on-message requester decoded-response 1002)]
+    (is (contains? (:by-hash restored) target)
+        "the certified rival bytes must survive a process restart")
+    (is (= target (get-in restored [:pm :high-qc :inga.qc/block-hash])))
+    (is (= target (get-in restored [:qcs target :inga.qc/block-hash])))
+    (is (not (contains? (:by-hash requester) target))
+        "the requesting node has the certificate but not the rival bytes")
+    (is (= {:type :sync-request :witness "w1" :from 1 :to 1
+            :target-hash target} request)
+        "a same-height rival needs a hash-targeted request")
+    (is (nil? request-refusal))
+    (is (= target (:target-hash response)))
+    (is (= [rival] (:blocks response)))
+    (is (nil? response-refusal))
+    (is (= target (hash-fn (r/tip recovered)))
+        "the certified branch replaces only the uncommitted suffix")
+    (is (not= :no-certificate-for-the-tip
+              (get-in recovered [:propose-refusal :reason])))))
+
+(deftest a-tampered-snapshot-high-qc-is-rejected
+  (let [opts (opts :w1)
+        initial (r/replica opts)
+        genesis (r/tip initial)
+        child (certified-child genesis 1)
+        qc (genuine-cert (hash-fn child) 1)
+        state (-> initial
+                  (assoc :chain [genesis child]
+                         :by-hash {(hash-fn genesis) genesis (hash-fn child) child})
+                  (assoc-in [:pm :high-qc] qc))
+        snapshot (r/snapshot state)
+        tampered (assoc-in snapshot [:pm :high-qc :inga.qc/block-hash] "tampered")]
+    (is (try (r/resume opts tampered) false
+             (catch :default e
+               (= "inga.replica: invalid snapshot high QC" (ex-message e)))))))
+
+(deftest an-ahead-certified-branch-rewinds-from-the-committed-floor
+  (let [opts (opts :w1)
+        initial (r/replica opts)
+        genesis (r/tip initial)
+        local (certified-child genesis 1)
+        rival (update local :inga.block/ts inc)
+        target-block (certified-child rival 2)
+        target (hash-fn target-block)
+        qc (genuine-cert target 2)
+        requester (assoc initial :chain [genesis local]
+                         :by-hash {(hash-fn genesis) genesis
+                                   (hash-fn local) local})
+        responder (-> initial
+                      (assoc :chain [genesis rival target-block]
+                             :by-hash {(hash-fn genesis) genesis
+                                       (hash-fn rival) rival
+                                       target target-block}
+                             :qcs {target qc})
+                      (assoc-in [:pm :high-qc] qc))
+        restored (r/resume opts (r/snapshot responder))
+        [requester requests] (r/on-message requester (nv :w2 8 qc) 1000)
+        request (:msg (first (filter #(= :sync-request (:type (:msg %))) requests)))
+        [decoded-request request-refusal] (wire/decode (wire/encode request))
+        [_ responses] (r/on-message restored decoded-request 1001)
+        response (:msg (first responses))
+        [decoded-response response-refusal] (wire/decode (wire/encode response))
+        [recovered _] (r/on-message requester decoded-response 1002)]
+    (is (= {:type :sync-request :witness "w1" :from 1 :to 2
+            :target-hash target} request)
+        "a higher QC must ask from the committed floor, not the divergent tip")
+    (is (nil? request-refusal))
+    (is (= [rival target-block] (:blocks response)))
+    (is (nil? response-refusal))
+    (is (= target (hash-fn (r/tip recovered))) (pr-str (:last-sync recovered)))
+    (is (= 2 (r/height recovered)))))
+
+(deftest a-targeted-response-cannot-replace-a-chain-with-a-different-block
+  (let [opts (opts :w1)
+        initial (r/replica opts)
+        genesis (r/tip initial)
+        local (certified-child genesis 1)
+        rival (update local :inga.block/ts inc)
+        target (hash-fn rival)
+        qc (genuine-cert target 1)
+        state (-> initial
+                  (assoc :chain [genesis local]
+                         :by-hash {(hash-fn genesis) genesis (hash-fn local) local}
+                         :qcs {target qc}))
+        [after _] (r/on-message state {:type :sync-response
+                                       :target-hash target
+                                       :blocks [local]} 1000)]
+    (is (= (hash-fn local) (hash-fn (r/tip after))))
+    (is (= :wrong-certified-target (get-in after [:last-sync :reason])))))
+
+;; Measured 2026-10-07 on isekai-score-20261006-v5, stalled at committed 16154
+;; for four hours with all seven witnesses connected: every replica's chain
+;; ran 16154 -> e326 (16155) -> 7c9a (16156), while the quorum had certified a
+;; DIFFERENT 16155 (50f5), held as high-qc and lock by all seven. The tip was
+;; uncertified, so nobody could propose; the certified block sat one BELOW the
+;; tip, and the hash-targeted request only fired for a rival at the tip's own
+;; height or above. Nothing ever asked for 50f5, so nothing ever moved.
+(deftest a-certified-rival-below-the-tip-is-requested-and-adopted
+  (let [opts (opts :w1)
+        initial (r/replica opts)
+        genesis (r/tip initial)
+        local (certified-child genesis 1)
+        local-child (certified-child local 2)
+        rival (update local :inga.block/ts inc)
+        target (hash-fn rival)
+        qc (genuine-cert target 1)
+        requester (-> initial
+                      (assoc :chain [genesis local local-child]
+                             :by-hash {(hash-fn genesis) genesis
+                                       (hash-fn local) local
+                                       (hash-fn local-child) local-child}))
+        responder (-> initial
+                      (assoc :chain [genesis rival]
+                             :by-hash {(hash-fn genesis) genesis target rival}
+                             :qcs {target qc})
+                      (assoc-in [:pm :high-qc] qc))
+        [requester requests] (r/on-message requester (nv :w2 7 qc) 1000)
+        request (:msg (first (filter #(= :sync-request (:type (:msg %))) requests)))
+        [decoded-request _] (wire/decode (wire/encode request))
+        [_ responses] (r/on-message responder decoded-request 1001)
+        response (:msg (first responses))
+        [decoded-response _] (wire/decode (wire/encode response))
+        [recovered _] (r/on-message requester decoded-response 1002)]
+    (is (= {:type :sync-request :witness "w1" :from 1 :to 1 :target-hash target} request)
+        "a certified block below the tip that differs from the chain there is asked for by hash")
+    (is (= [rival] (:blocks response)))
+    (is (= target (hash-fn (r/tip recovered)))
+        "the uncertified suffix above the fork is discarded for the certified branch")
+    (is (not= :no-certificate-for-the-tip (get-in recovered [:propose-refusal :reason])))))
+
+(deftest a-certified-parent-of-the-tip-asks-for-nothing
+  (let [opts (opts :w1)
+        initial (r/replica opts)
+        genesis (r/tip initial)
+        local (certified-child genesis 1)
+        local-child (certified-child local 2)
+        qc (genuine-cert (hash-fn local) 1)
+        requester (-> initial
+                      (assoc :chain [genesis local local-child]
+                             :by-hash {(hash-fn genesis) genesis
+                                       (hash-fn local) local
+                                       (hash-fn local-child) local-child}))
+        [_ requests] (r/on-message requester (nv :w2 7 qc) 1000)]
+    (is (empty? (filter #(:target-hash (:msg %)) requests))
+        "the ordinary case — the tip's own parent is the certified block — is not a fork")))

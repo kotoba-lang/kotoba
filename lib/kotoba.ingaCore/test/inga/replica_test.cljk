@@ -1,0 +1,1613 @@
+(ns inga.replica-test
+  "Four replicas, a map for a transport, and the question nothing else in this
+  repo asked: does a block get proposed, voted, certified and committed?
+
+  Every namespace this composes was already tested. The composition was not,
+  and a suite full of correct parts is exactly what a system that has never
+  run looks like."
+  (:require [kotoba.test :refer [deftest is testing]]
+            #?(:cljs [kotoba.test :refer [async]])
+            [inga.replica :as r]
+            [inga.attest :as att]
+            [inga.consensus :as c]
+            [inga.pacemaker :as pm]
+            [inga.head :as head]
+            [inga.quorum :as q]
+            [inga.ref :as iref]
+            [inga.wire :as wire]
+            [inga.state :as state]
+            [inga.state-test :as state-test]
+            [kotoba.lang.text]
+            [inga.stake :as stake]
+            [inga.sync :as sync]))
+
+(def witnesses [:w1 :w2 :w3 :w4])
+
+(defn- hash-fn [b]
+  ;; Not cryptographic — the canonical string IS the identity here, which is
+  ;; enough to distinguish blocks and keeps the test free of a crypto import.
+  ;; The socket harness uses a real digest.
+  (str "h:" (c/canonical-block b)))
+
+(defn- net
+  "A network of replicas keyed by witness."
+  ([] (net (count witnesses)))
+  ([n]
+   (into {} (for [w (take n witnesses)]
+              [w (r/replica {:witness w :witnesses (vec (take n witnesses))
+                             :quorum (c/quorum-size n) :hash-fn hash-fn})]))))
+
+(defn- deliver-all
+  "Run the network until it goes quiet or `max-steps` elapses.
+
+  Delivery is in a fixed order, so a failure is reproducible: an intermittent
+  consensus test is worse than none, because it teaches you to re-run it."
+  [replicas outbox now max-steps]
+  (loop [rs replicas ob outbox t now steps 0]
+    (if (or (empty? ob) (>= steps max-steps))
+      [rs ob steps]
+      (let [[{:keys [from to msg]} & more] ob
+            targets (if (= :all to) (sort (keys rs)) [to])
+            [rs' produced]
+            (reduce (fn [[rs acc] w]
+                      (if (= w from)
+                        [rs acc]                    ; a replica does not send to itself
+                        (let [[s' out] (r/on-message (get rs w) msg t)]
+                          [(assoc rs w s')
+                           (into acc (map #(assoc % :from w) out))])))
+                    [rs []]
+                    targets)]
+        (recur rs' (vec (concat more produced)) (+ t 1) (inc steps))))))
+
+(defn- run
+  "Start the network and let it settle. Returns the replicas."
+  ([] (run (count witnesses) 4000))
+  ([n max-steps]
+   (let [rs (net n)
+         leader (c/leader-for (vec (take n witnesses)) 1)
+         [s0 out] (r/start (get rs leader) 1000)
+         rs (assoc rs leader s0)
+         [rs _ _] (deliver-all rs (mapv #(assoc % :from leader) out) 1000 max-steps)]
+     ;; tick everyone a few times so leaders whose turn came up can propose
+     (reduce (fn [rs t]
+               (let [ob (reduce (fn [acc w]
+                                  (let [[s' out] (r/on-tick (get rs w) t)]
+                                    (into (assoc acc :rs (assoc (:rs acc) w s'))
+                                          {})
+                                    (-> acc
+                                        (update :rs assoc w s')
+                                        (update :ob into (map #(assoc % :from w) out)))))
+                                {:rs rs :ob []}
+                                (sort (keys rs)))
+                     [rs' _ _] (deliver-all (:rs ob) (vec (:ob ob)) t max-steps)]
+                 rs'))
+             rs
+             (range 2000 2600 100)))))
+
+;; ── the thing that had never happened ───────────────────────────────────────
+
+(deftest a-block-is-proposed-voted-certified-and-committed
+  (let [rs (run)]
+    (testing "every replica adopted a chain past genesis"
+      (doseq [[w s] rs]
+        (is (> (r/height s) 0) (str w " never left genesis"))))
+    (testing "and committed under the 3-chain rule"
+      (doseq [[w s] rs]
+        (is (>= (r/committed-height s) 1)
+            (str w " has certificates but committed nothing"))))))
+
+(deftest every-replica-commits-the-same-blocks
+  (testing "safety: two replicas that committed different chains is the
+            failure this whole protocol exists to prevent"
+    (let [rs (run)
+          chains (map (fn [[_ s]] (mapv #(hash-fn %) (:committed s))) rs)
+          shortest (apply min (map count chains))]
+      (is (pos? shortest) "nothing was committed, so agreement is vacuous")
+      (is (apply = (map #(take shortest %) chains))
+          "replicas committed different blocks at the same heights"))))
+
+(deftest a-replica-votes-at-most-once-per-height
+  (testing "a proposer sending two blocks at one height must not be able to
+            extract two votes — that is equivocation, written by accident.
+
+            Per HEIGHT and not per view. Keying it by view is what this tried
+            first: views advance on TIMEOUT and heights advance on progress,
+            so a replica that voted at view 0 for height 1 could not vote for
+            height 2 until something timed out — and the thing that would have
+            timed out was the chain it had just refused to extend. Nothing
+            here could see it, because with no timeouts firing the two keys
+            are the same key. The socket harness stalled at height two."
+    (let [s (get (net) :w2)
+          leader (c/leader-for witnesses 1)
+          [_ out] (r/start (get (net) leader) 1000)
+          proposal (:msg (first out))
+          [s1 o1] (r/on-message s proposal 1001)
+          ;; the same view, a different block
+          other (assoc-in proposal [:block :inga.block/ts] 999)
+          [_ o2] (r/on-message s1 other 1002)]
+      (is (= 1 (count (filter #(= :vote (:type (:msg %))) o1))))
+      (is (empty? (filter #(= :vote (:type (:msg %))) o2))
+          "voted twice at one height"))))
+
+(deftest a-witness-is-one-witness-however-it-is-spelled
+  (testing "inga.wire sends a keyword witness as a bare string, so a replica
+            that recorded its own vote as a keyword and its peers' as strings
+            counted one physical witness as two — and a quorum of three could
+            be two replicas, one of them twice. Every id is normalised to its
+            wire form on the way in, including the replica's own."
+    (let [s (get (net) :w1)
+          bh "h:whatever"
+          [s' _] (reduce (fn [[s _] w]
+                           (r/on-message s {:type :vote :witness w :block-hash bh
+                                            :height 1 :view 0} 1000))
+                         [s []]
+                         [:w2 "w2" :w2 "w2" :w2])]
+      (is (= 1 (count (get-in s' [:votes bh])))
+          "the same witness under two spellings is one witness")
+      (is (nil? (get-in s' [:qcs bh]))))
+    (testing "and the replica's own id is stored in wire form"
+      (is (= "w1" (:witness (get (net) :w1)))))))
+
+(deftest a-proposal-whose-parent-is-unknown-asks-instead-of-voting
+  (testing "voting on a block whose parent this replica has never seen would
+            be letting the proposer decide what it is extending"
+    (let [s (get (net) :w2)
+          orphan (c/make-block {:height 7 :parent-hash "h:nothing"
+                                :proposals [] :proposer :w1 :ts 5
+                                :justify {:inga.qc/block-hash "h:nothing"
+                                          :inga.qc/height 6
+                                          :inga.qc/witnesses #{:w1 :w2 :w3}
+                                          :inga.qc/vote-count 3}})
+          [s' out] (r/on-message s {:type :proposal :block orphan} 1000)]
+      (is (= [:sync-request] (mapv #(:type (:msg %)) out)))
+      (is (= 0 (r/height s')) "and did not adopt it"))))
+
+(deftest a-proposal-whose-parent-is-known-but-above-the-tip-asks-for-the-gap
+  (testing "a replica that restarted behind the chain learns the next blocks
+            from proposals; after the first, every proposal has a parent it
+            holds, so 'parent unknown' never fires again and the blocks between
+            its tip and that parent never arrive (v5 joseph, v4 xavier)"
+    (let [s (get (net) :w2)
+          qc5 {:inga.qc/block-hash "h:four" :inga.qc/height 4
+               :inga.qc/witnesses #{:w1 :w3 :w4} :inga.qc/vote-count 3}
+          b5 (c/make-block {:height 5 :parent-hash "h:four" :proposals []
+                            :proposer :w1 :ts 5 :justify qc5})
+          ;; the first proposal: parent unknown, so it asks -- and keeps b5
+          [s _] (r/on-message s {:type :proposal :block b5} 1000)
+          b6 (c/make-block {:height 6 :parent-hash (hash-fn b5) :proposals []
+                            :proposer :w2 :ts 6
+                            :justify {:inga.qc/block-hash (hash-fn b5)
+                                      :inga.qc/height 5
+                                      :inga.qc/witnesses #{:w1 :w3 :w4}
+                                      :inga.qc/vote-count 3}})
+          [s' out] (r/on-message s {:type :proposal :block b6} 1001)
+          asks (filter #(= :sync-request (:type (:msg %))) out)]
+      (is (= 0 (r/height s')) "the tip has not moved: 1..4 are still missing")
+      (is (= 1 (count asks)) "so it asks again, although b6's parent is known")
+      (is (= 1 (:from (:msg (first asks)))) "from just above its tip")
+      (is (<= 5 (:to (:msg (first asks)))) "up to at least the known parent"))))
+
+(deftest a-proposal-extending-the-tip-asks-for-nothing
+  (testing "the gap request must not fire on the ordinary path"
+    (let [s (get (net) :w2)
+          g (r/tip s)
+          b1 (c/make-block {:height 1 :parent-hash (hash-fn g) :proposals []
+                            :proposer :w1 :ts 1 :justify nil})
+          [_ out] (r/on-message s {:type :proposal :block b1} 1000)]
+      (is (empty? (filter #(= :sync-request (:type (:msg %))) out))))))
+
+(deftest a-block-that-does-not-extend-its-parent-is-refused
+  (testing "naming a parent is not the same as carrying a certificate for it —
+            the splice this check exists to stop"
+    (let [s (get (net) :w2)
+          g (r/tip s)
+          spliced (c/make-block {:height 1 :parent-hash (hash-fn g)
+                                 :proposals [] :proposer :w1 :ts 5
+                                 :justify nil})
+          [s' out] (r/on-message s {:type :proposal :block spliced} 1000)]
+      (is (empty? out))
+      (is (= 0 (r/height s'))))))
+
+(deftest below-quorum-nothing-is-certified
+  (testing "one vote short is not a certificate, however many times it is sent"
+    (let [s (get (net) :w1)
+          bh "h:whatever"
+          [s' _] (reduce (fn [[s _] w]
+                           (r/on-message s {:type :vote :witness w :block-hash bh
+                                            :height 1 :view 0} 1000))
+                         [s []]
+                         ;; quorum for n=4 is 3
+                         [:w1 :w2 :w1 :w2 :w1])]
+      (is (nil? (get-in s' [:qcs bh]))))))
+
+(deftest a-quorum-of-one-witness-repeating-itself-is-not-a-quorum
+  (testing "distinct-by-witness, the concrete place equivocation is neutralised"
+    (let [s (get (net) :w1)
+          bh "h:whatever"
+          [s' _] (reduce (fn [[s _] _]
+                           (r/on-message s {:type :vote :witness :w3 :block-hash bh
+                                            :height 1 :view 0} 1000))
+                         [s []]
+                         (range 10))]
+      (is (nil? (get-in s' [:qcs bh]))))))
+
+(deftest submitted-proposals-ride-in-the-next-block-this-replica-leads
+  (let [leader (c/leader-for witnesses 1)
+        s (-> (get (net) leader) (r/submit "cid-a") (r/submit "cid-b"))
+        [s' out] (r/start s 1000)]
+    (is (= ["cid-a" "cid-b"] (:inga.block/proposals (:block (:msg (first out))))))
+    (is (empty? (:pending s')) "and are not proposed twice")))
+
+(deftest the-mempool-is-bounded
+  (testing "an unbounded one is a memory attack needing no invalid data"
+    (let [s (reduce (fn [s i] (r/submit s (str "cid-" i) 8))
+                    (get (net) :w1) (range 100))]
+      (is (= 8 (count (:pending s)))))))
+
+;; ── a vote nobody signed is a claim ─────────────────────────────────────────
+
+(def chain "engi-test-1")
+
+(defn- fake-sign
+  "A signature scheme where the secret is the witness's own name. Enough to
+  distinguish signed from forged, which is the property under test — the
+  socket harness uses real Ed25519."
+  [w]
+  (fn [payload] (str "sig(" w ")" (hash payload))))
+
+(defn- fake-verify [w payload sig]
+  (and (some? sig) (= sig ((fake-sign (name w)) payload))))
+
+(defn- checked-replica [w]
+  (r/replica {:witness w :witnesses witnesses :quorum (c/quorum-size 4)
+              :hash-fn hash-fn :chain-id chain
+              :sign-fn (fake-sign (name w)) :verify-fn fake-verify}))
+
+(defn- forge [victim block-hash]
+  {:type :vote :witness victim :block-hash block-hash :height 1 :view 0})
+
+(deftest without-verification-one-peer-manufactures-a-quorum
+  (testing "the hole this closes, asserted rather than described: a replica
+            assembles certificates out of the votes it receives, so an
+            unsigned vote lets one connected peer forge a quorum from
+            witnesses whose keys it does not hold"
+    (let [s (get (net) :w1)                       ; no verify-fn configured
+          bh "h:forged"
+          [s' _] (reduce (fn [[s _] v] (r/on-message s (forge v bh) 1000))
+                         [s []] [:w2 :w3 :w4])]
+      (is (some? (get-in s' [:qcs bh]))
+          "three forged votes and a certificate exists"))))
+
+(deftest with-verification-the-same-three-votes-do-nothing
+  (let [s (checked-replica :w1)
+        bh "h:forged"
+        [s' out] (reduce (fn [[s _] v] (r/on-message s (forge v bh) 1000))
+                         [s []] [:w2 :w3 :w4])]
+    (is (empty? (get-in s' [:votes bh])) "not one was counted")
+    (is (nil? (get-in s' [:qcs bh])))
+    (is (empty? out) "and nothing was said back — a reply tells a forger
+                      which of its guesses were closer")))
+
+(deftest a-signature-from-the-wrong-key-is-refused
+  (let [s (checked-replica :w1)
+        bh "h:forged"
+        ;; correctly formed, signed by somebody else
+        sig ((fake-sign "attacker") (att/vote-payload chain 0 1 bh "w2"))
+        [s' _] (r/on-message s (assoc (forge :w2 bh) :sig sig) 1000)]
+    (is (empty? (get-in s' [:votes bh])))))
+
+(deftest a-signature-for-another-chain-is-refused
+  (testing "domain separation — the reason chain-id is in the payload at all"
+    (let [s (checked-replica :w1)
+          bh "h:forged"
+          sig ((fake-sign "w2") (att/vote-payload "engi-othernet-9" 0 1 bh "w2"))
+          [s' _] (r/on-message s (assoc (forge :w2 bh) :sig sig) 1000)]
+      (is (empty? (get-in s' [:votes bh]))))))
+
+(deftest a-genuine-vote-is-counted
+  (testing "so the refusals above are about the signature and not about the
+            shape — a check that refuses everything proves nothing"
+    (let [s (checked-replica :w1)
+          bh "h:forged"
+          sig ((fake-sign "w2") (att/vote-payload chain 0 1 bh "w2"))
+          [s' _] (r/on-message s (assoc (forge :w2 bh) :sig sig) 1000)]
+      (is (= 1 (count (get-in s' [:votes bh])))))))
+
+(deftest certificates-carry-the-signatures-they-were-built-from
+  (testing "a certificate assembled from verified votes must be re-checkable
+            by somebody who did not see them"
+    (let [s (checked-replica :w1)
+          bh "h:forged"
+          [s' _] (reduce (fn [[s _] v]
+                           (let [sig ((fake-sign (name v))
+                                      (att/vote-payload chain 0 1 bh (name v)))]
+                             (r/on-message s (assoc (forge v bh) :sig sig) 1000)))
+                         [s []] [:w2 :w3 :w4])
+          cert (get-in s' [:qcs bh])]
+      (is (some? cert))
+      (is (att/signed? cert))
+      ;; Through `wire/admits`: this suite holds witnesses as keywords and the
+      ;; certificate names them as they crossed the wire.
+      (is (nil? (att/verify-certificate cert chain (c/quorum-size 4) fake-verify
+                                        (wire/admits witnesses)))
+          "and it verifies"))))
+
+;; ── the view-change path ────────────────────────────────────────────────────
+
+(defn- genuine-cert
+  "A certificate for `bh` signed by a quorum, the way a replica builds one."
+  ([bh] (genuine-cert bh 1))
+  ([bh height]
+   (let [s (checked-replica :w1)
+         [s' _] (reduce (fn [[s _] v]
+                          (let [sig ((fake-sign (name v))
+                                     (att/vote-payload chain 0 height bh (name v)))]
+                            (r/on-message s (assoc (forge v bh)
+                                                   :height height :sig sig) 1000)))
+                        [s []] [:w2 :w3 :w4])]
+     (get-in s' [:qcs bh]))))
+
+(defn- nv [w view high-qc]
+  (let [wn (name w)]
+    {:type :new-view :witness wn :view view :high-qc high-qc
+     :sig ((fake-sign wn) (att/new-view-payload chain view wn high-qc))}))
+
+(deftest a-genuine-view-change-still-happens
+  (testing "the refusals below are worth nothing if the honest path is broken
+            too — a check that refuses everything is not a check"
+    (let [cert (genuine-cert "h:real")
+          s (checked-replica :w1)
+          [s' _] (reduce (fn [[s _] w] (r/on-message s (nv w 7 cert) 1000))
+                         [s []] [:w2 :w3 :w4])]
+      (is (= 3 (count (get-in s' [:new-views 7]))))
+      (is (= 8 (:view (:pm s'))) "entered the view the certificate names")
+      (is (= "h:real" (get-in s' [:pm :locked-qc :inga.qc/block-hash]))))))
+
+(deftest an-unsigned-new-view-decides-nothing
+  (testing "a timeout certificate is folded out of these, and the result goes
+            straight into the lock — so quorum-many unsigned ones would let a
+            stranger choose what every replica locks onto"
+    (let [cert (genuine-cert "h:real")
+          s (checked-replica :w1)
+          [s' _] (reduce (fn [[s _] w]
+                           (r/on-message s (dissoc (nv w 7 cert) :sig) 1000))
+                         [s []] [:w2 :w3 :w4])]
+      (is (empty? (get-in s' [:new-views 7])))
+      (is (= 0 (:view (:pm s')))))))
+
+(deftest a-new-view-carrying-a-certificate-nobody-signed-is-refused
+  (testing "signing the message and asserting an unverified certificate inside
+            it moves the forgery one level in, it does not stop it"
+    (let [fake {:inga.qc/block-hash "h:invented" :inga.qc/height 9999
+                :inga.qc/view 9999 :inga.qc/witnesses #{"w2" "w3" "w4"}
+                :inga.qc/vote-count 3}
+          s (checked-replica :w1)
+          [s' _] (reduce (fn [[s _] w] (r/on-message s (nv w 9999 fake) 1000))
+                         [s []] [:w2 :w3 :w4])]
+      (is (empty? (get-in s' [:new-views 9999])))
+      (is (nil? (get-in s' [:pm :locked-qc]))
+          "no lock onto a block nobody proposed"))))
+
+(deftest the-certificate-cannot-be-swapped-out-of-a-genuine-new-view
+  (testing "which is why the payload covers the certificate's identity and not
+            just the view and the signer"
+    (let [real (genuine-cert "h:real")
+          fake {:inga.qc/block-hash "h:invented" :inga.qc/height 9999
+                :inga.qc/view 9999 :inga.qc/witnesses #{"w2" "w3" "w4"}
+                :inga.qc/vote-count 3 :inga.qc/sigs {"w2" "x" "w3" "y" "w4" "z"}}
+          s (checked-replica :w1)
+          swapped (assoc (nv :w2 7 real) :high-qc fake)
+          [s' _] (r/on-message s swapped 1000)]
+      (is (empty? (get-in s' [:new-views 7]))))))
+
+(deftest without-verification-a-stranger-chooses-the-lock
+  (testing "the hole, asserted rather than described"
+    (let [fake {:inga.qc/block-hash "h:invented" :inga.qc/height 9999
+                :inga.qc/view 9999 :inga.qc/witnesses #{:w2 :w3 :w4}
+                :inga.qc/vote-count 3}
+          s (get (net) :w1)                        ; no verify-fn
+          [s' _] (reduce (fn [[s _] w]
+                           (r/on-message s {:type :new-view :witness w
+                                            :view 9999 :high-qc fake} 1000))
+                         [s []] [:w2 :w3 :w4])]
+      (is (= "h:invented" (get-in s' [:pm :locked-qc :inga.qc/block-hash]))
+          "locked onto a block that never existed"))))
+
+;; ── catching up ─────────────────────────────────────────────────────────────
+
+(defn- certified-child
+  "A block at `height` extending `parent`, justified by a real certificate."
+  [parent height certify?]
+  (let [ph (hash-fn parent)
+        q (if certify?
+            (genuine-cert ph (:inga.block/height parent))
+            ;; named witnesses, signatures that verify for nobody
+            {:inga.qc/block-hash ph :inga.qc/height (:inga.block/height parent)
+             :inga.qc/view 0 :inga.qc/witnesses #{"w2" "w3" "w4"}
+             :inga.qc/vote-count 3 :inga.qc/sigs {"w2" "x" "w3" "y" "w4" "z"}})]
+    ;; The proposer is whoever leads that height, not a fixed name. Every
+    ;; block here used to say :w1, which no real chain produces — leadership
+    ;; rotates — and `inga.sync` now refuses a block whose proposer does not
+    ;; lead its height, because a sync response was the one way into a replica
+    ;; that nothing checked and the harness forger walked through it.
+    (c/make-block {:height height :parent-hash ph :proposals []
+                   :proposer (c/leader-for witnesses height)
+                   :ts (* 10 height) :justify q})))
+
+(deftest a-segment-whose-certificates-do-not-verify-is-refused-whole
+  (testing "inga.sync says a peer must not get to choose where this replica's
+            history ends by appending garbage to a good answer — which is the
+            reason to call it rather than re-implement a weaker version.
+
+            Checked ABOVE genesis. A certificate for height zero is exempt,
+            because the one inga.replica/start fabricates has a single witness
+            and no signatures and every replica has genesis by construction —
+            so a test that used a height-zero certificate as its example of a
+            bad one was testing the exemption, not the rule."
+    (let [s (checked-replica :w1)
+          good (certified-child (r/tip s) 1 true)
+          [s1 _] (r/on-message s {:type :sync-response :blocks [good]} 1000)
+          bad (certified-child (r/tip s1) 2 false)
+          [s' out] (r/on-message s1 {:type :sync-response :blocks [bad]} 1001)]
+      (is (= 1 (r/height s')) "adopted a block certified by nobody")
+      (is (empty? (filter #(= :sync-response (:type (:msg %))) out))))))
+
+(defn- chained-child
+  "Like `certified-child`, but at an explicit round, so several of these form
+  a segment a peer could really have sent. `certified-child` leaves every
+  block at round 1 (the round after the view-0 certificate it fabricates),
+  and `inga.sync` requires rounds to increase within a segment -- so a
+  multi-block segment built from it is refused as `:wrong-proposer` before
+  any of this test's subject is reached."
+  [parent height certify?]
+  (let [ph (hash-fn parent)
+        q (if certify?
+            (genuine-cert ph (:inga.block/height parent))
+            {:inga.qc/block-hash ph :inga.qc/height (:inga.block/height parent)
+             :inga.qc/view 0 :inga.qc/witnesses #{"w2" "w3" "w4"}
+             :inga.qc/vote-count 3 :inga.qc/sigs {"w2" "x" "w3" "y" "w4" "z"}})]
+    (c/make-block {:height height :parent-hash ph :proposals [] :round height
+                   :proposer (c/led-by witnesses height)
+                   :ts (* 10 height) :justify q})))
+
+(deftest a-vote-that-cannot-be-signed-does-not-spend-the-height
+  (testing "a Durable Object derives its signing key asynchronously and ticks
+            before the key is there, so the first vote after a restart is
+            unsigned -- and `fold-vote` drops an unsigned vote when a
+            verify-fn is configured, including the replica's own. The height
+            was marked voted anyway, so `voted?` answered yes from then on and
+            the tip could never be certified. Every deploy needed a hand-reset,
+            and reset worked because it is what clears `:voted`."
+    (let [s (checked-replica :w1)
+          b1 (chained-child (r/tip s) 1 true)
+          keyless (assoc s :sign-fn (fn [_] nil))
+          [s' out] (r/on-message keyless {:type :proposal :block b1} 1000)]
+      (is (not (r/voted? s' 1))
+          "spent height 1 on a vote that was thrown away")
+      (is (empty? (filter #(= :vote (:type (:msg %))) out))
+          "sent a vote it drops itself")
+      ;; and once the key is there, the height is still there to vote at
+      (let [[s'' out'] (r/on-message (assoc s' :sign-fn (:sign-fn s))
+                                     {:type :proposal :block b1} 1100)]
+        (is (r/voted? s'' 1) "never voted at all")
+        (is (seq (filter #(and (= :vote (:type (:msg %))) (:sig (:msg %))) out'))
+            "voted without a signature")))))
+
+(deftest a-replica-that-signs-elsewhere-still-votes
+  (testing "the other direction, and the regression that shipped. A
+            Cloudflare Worker cannot sign synchronously, so it runs with no
+            `sign-fn` on purpose: the replica emits the vote unsigned,
+            dispatch signs it and folds the signed copy back. Refusing to emit
+            a vote merely because it has no signature left dispatch with
+            nothing to sign, and the deployed chain stopped harder than the
+            bug being fixed. Absence of signing here is not failure to sign."
+    (let [s (assoc (checked-replica :w1) :sign-fn nil)
+          b1 (chained-child (r/tip s) 1 true)
+          [s' out] (r/on-message s {:type :proposal :block b1} 1000)]
+      (is (seq (filter #(= :vote (:type (:msg %))) out))
+          "emitted nothing for dispatch to sign")
+      (is (r/voted? s' 1)))))
+
+(deftest a-replica-that-does-not-propose-says-which-condition-said-no
+  (testing "`propose` returned `[state []]` and said nothing, so a stopped
+            chain looked like a chain with nothing to do. The Worker built its
+            own answer from outside and decided whose turn it was by HEIGHT,
+            while `propose` decides by ROUND -- once the view ran ahead of the
+            height those named different replicas, and the deployed instrument
+            read `blocked-by nothing, would-propose true` on a replica that was
+            not proposing."
+    (let [s (checked-replica :w1)
+          ;; height 1's leader by round is not w1 for every round, and w1
+          ;; holds no certificate for genesis either way.
+          ;; the first tick only starts the clock -- `pm/initial` leaves the
+          ;; deadline at 0 and that branch returns before `propose` is reached
+          [s0 _] (r/on-tick s 100000)
+          [s' out] (r/on-tick s0 100001)
+          why (:propose-refusal s')]
+      (is (empty? (filter #(= :proposal (:type (:msg %))) out)))
+      (is (some? why) "declined and recorded nothing")
+      (is (contains? #{:no-certificate-for-the-tip :not-my-round :too-soon}
+                     (:reason why)))
+      (is (= (:witness s) (:me why)))
+      (is (some? (:leads-that-round why))
+          "the round's leader is the fact the outside instrument got wrong"))))
+
+(deftest a-replay-does-not-come-back-behind-its-own-tip
+  (testing "leadership rotates by ROUND. A replica that replays its chain and
+            comes back at a lower view is not slightly behind: the round
+            entitled to extend the tip is one past the tip's round, exactly
+            one replica leads it, and everybody else answers `not-my-round`.
+
+            Deployed v2 after a restart: all four agreed the next round was
+            7530 and that w3 led it, all four were eight hundred views short,
+            and w3 was six blocks behind. Nobody proposed. `/reset` cleared it
+            because reset puts the rounds back to zero too."
+    (let [s (checked-replica :w1)
+          far (c/make-block {:height 1 :parent-hash (hash-fn (r/tip s))
+                             :proposals [] :round 500
+                             :proposer (c/led-by witnesses 500)
+                             :ts 10 :justify (genuine-cert (hash-fn (r/tip s)) 0)})
+          s' (r/replay s [far])]
+      (is (> (:view (:pm s')) 500)
+          "came back behind the round its own tip was proposed in"))))
+
+(deftest the-certified-prefix-survives-a-bad-tail
+  (testing "the refusal above was whole, and that is what deadlocked two
+            deployments. A peer offers what it has; the blocks past a failed
+            quorum are uncertified; the certified ones in front of them went
+            down with the answer, so a replica behind a split could never
+            catch up to where the certified history actually reached.
+
+            Whole refusal never bought the safety it claimed, because a peer
+            can always send the prefix ALONE -- appending garbage to a good
+            answer gets it nothing that truncating the answer would not.
+            What must hold is that the garbage itself is never adopted."
+    (let [s  (checked-replica :w1)
+          b1 (chained-child (r/tip s) 1 true)
+          b2 (chained-child b1 2 true)
+          bad (chained-child b2 3 false)
+          [s' _] (r/on-message s {:type :sync-response :blocks [b1 b2 bad]} 1000)]
+      (is (= 2 (r/height s'))
+          "refused the certified prefix along with the tail -- the deadlock")
+      (is (not= (hash-fn bad) (hash-fn (r/tip s')))
+          "adopted a block certified by nobody"))))
+
+(deftest a-genuine-segment-is-adopted
+  (testing "otherwise the refusal above is a check that refuses everything"
+    (let [s (checked-replica :w1)
+          good (certified-child (r/tip s) 1 true)
+          [s' _] (r/on-message s {:type :sync-response :blocks [good]} 1000)]
+      (is (= 1 (r/height s'))))))
+
+(deftest an-oversized-segment-is-refused
+  (testing "a peer needs no invalid data to exhaust a replica"
+    (let [s (get (net) :w1)                        ; no verify-fn: shape only
+          g (r/tip s)
+          many (mapv (fn [i] (certified-child g (inc i) false))
+                     (range (inc (:max-batch sync/default-params))))
+          [s' _] (r/on-message s {:type :sync-response :blocks many} 1000)]
+      (is (= 0 (r/height s'))))))
+
+(deftest a-sync-request-for-everything-is-answered-with-a-window
+  (testing "unclamped, one small message makes every replica serialise its
+            whole chain — a cost imposed by a peer that need not be a witness"
+    (let [s (assoc (get (net) :w1)
+                   :chain (mapv (fn [i] (c/make-block {:height i :parent-hash "p"
+                                                       :proposals [] :proposer :w1
+                                                       :ts i :justify nil}))
+                                (range 1000)))
+          [_ out] (r/on-message s {:type :sync-request :from 0 :to 999999} 1000)]
+      (is (= (:max-batch sync/default-params)
+             (count (:blocks (:msg (first out)))))))))
+
+;; ── equivocation ────────────────────────────────────────────────────────────
+
+(defn- signed-vote [w bh height]
+  (let [wn (name w)]
+    {:type :vote :witness wn :block-hash bh :height height :view 0
+     :sig ((fake-sign wn) (att/vote-payload chain 0 height bh wn))}))
+
+(defn- vote-verifier [v]
+  (fake-verify (:inga.vote/witness v)
+               (att/vote-payload chain (:inga.vote/view v 0) (:inga.vote/height v)
+                                 (:inga.vote/block-hash v) (:inga.vote/witness v))
+               (:inga.vote/sig v)))
+
+(deftest two-signed-votes-at-one-height-are-a-proof
+  (testing "the one crime that proves itself: both verify, both are from this
+            witness at this height, and they name different blocks — nothing
+            else in the protocol is decidable from the messages alone"
+    (let [s (checked-replica :w1)
+          [s' _] (r/on-message s (signed-vote :w2 "h:a" 1) 1000)
+          [s'' _] (r/on-message s' (signed-vote :w2 "h:b" 1) 1001)]
+      (is (= #{"w2"} (r/equivocators s'')))
+      (is (= 1 (count (r/verified-equivocations s'' vote-verifier)))
+          "and the proof holds up when re-checked by somebody who did not
+           watch the votes arrive"))))
+
+(deftest the-second-vote-is-refused-and-the-first-still-counts
+  (testing "discarding the honest half would let an equivocator retract a
+            vote it regretted by contradicting itself"
+    (let [s (checked-replica :w1)
+          [s' _] (r/on-message s (signed-vote :w2 "h:a" 1) 1000)
+          [s'' _] (r/on-message s' (signed-vote :w2 "h:b" 1) 1001)]
+      (is (= 1 (count (get-in s'' [:votes "h:a"]))))
+      (is (empty? (get-in s'' [:votes "h:b"]))))))
+
+(deftest repeating-the-same-vote-is-not-equivocation
+  (testing "a resend is not a crime — it is what a retrying peer does"
+    (let [s (checked-replica :w1)
+          [s' _] (reduce (fn [[s _] _] (r/on-message s (signed-vote :w2 "h:a" 1) 1000))
+                         [s []] (range 5))]
+      (is (empty? (r/equivocators s')))
+      (is (= 1 (count (get-in s' [:votes "h:a"])))))))
+
+(deftest voting-at-different-heights-is-not-equivocation
+  (testing "otherwise every honest validator would be slashable by block two"
+    (let [s (checked-replica :w1)
+          [s' _] (reduce (fn [[s _] h]
+                           (r/on-message s (signed-vote :w2 (str "h:" h) h) 1000))
+                         [s []] [1 2 3])]
+      (is (empty? (r/equivocators s'))))))
+
+(deftest an-unsigned-contradiction-is-not-a-proof
+  (testing "it is refused earlier, at the signature, and evidence nobody can
+            check is not evidence"
+    (let [s (checked-replica :w1)
+          [s' _] (r/on-message s (signed-vote :w2 "h:a" 1) 1000)
+          [s'' _] (r/on-message s' (dissoc (signed-vote :w2 "h:b" 1) :sig) 1001)]
+      (is (empty? (r/equivocators s''))))))
+
+(deftest a-quorum-cannot-form-for-both-blocks
+  (testing "safety does not depend on detection — with n=4 the threshold is 3
+            and one equivocator cannot certify two blocks at one height.
+            Detection is what makes it COST something."
+    (let [s (checked-replica :w1)
+          [s' _] (reduce (fn [[s _] w]
+                           (let [[s a] (r/on-message s (signed-vote w "h:a" 1) 1000)]
+                             (r/on-message s (signed-vote w "h:b" 1) 1001)))
+                         [s []] [:w2 :w3 :w4])]
+      (is (some? (get-in s' [:qcs "h:a"])) "the first block certified")
+      (is (nil? (get-in s' [:qcs "h:b"])) "the second did not")
+      (is (= #{"w2" "w3" "w4"} (r/equivocators s'))))))
+
+(deftest evidence-is-in-the-shape-stake-consumes
+  (testing "so slash and verify-equivocation-evidence take it unchanged"
+    (let [s (checked-replica :w1)
+          [s' _] (r/on-message s (signed-vote :w2 "h:a" 1) 1000)
+          [s'' _] (r/on-message s' (signed-vote :w2 "h:b" 1) 1001)
+          ev (first (:equivocations s''))]
+      (is (stake/verify-equivocation-evidence ev vote-verifier))
+      (is (= "w2" (:inga.evidence/witness ev)))
+      (is (= 1 (:inga.evidence/height ev))))))
+
+;; ── committed blocks execute ────────────────────────────────────────────────
+
+(def counting-machine
+  "Order-sensitive on purpose: a machine whose result did not depend on the
+  order would make agreement on the order untestable, which is the only thing
+  consensus produces."
+  {:init-fn (fn [] [])
+   :apply-fn (fn [st b] (conj st (:inga.block/height b)))
+   :root-fn (fn [st] (str (count st) ":" (kotoba.lang.text/join "," st)))})
+
+(defn- machine-replica [w]
+  (r/replica {:witness w :witnesses witnesses :quorum (c/quorum-size 4)
+              :hash-fn hash-fn :machine counting-machine}))
+
+(deftest a-replica-with-no-machine-has-no-root
+  (testing "nil rather than a constant: a replica that orders blocks and
+            executes nothing has no state to root, and a plausible-looking
+            zero would make every such replica agree with every other for the
+            wrong reason"
+    (is (nil? (r/state-root (get (net) :w1))))))
+
+(deftest committed-blocks-are-applied-in-order-exactly-once
+  (let [leader (c/leader-for witnesses 1)
+        rs (into {} (for [w witnesses] [w (machine-replica w)]))
+        [s0 out] (r/start (get rs leader) 1000)
+        rs (assoc rs leader s0)
+        [rs _ _] (deliver-all rs (mapv #(assoc % :from leader) out) 1000 4000)
+        rs (reduce (fn [rs t]
+                     (let [acc (reduce (fn [acc w]
+                                         (let [[s' o] (r/on-tick (get (:rs acc) w) t)]
+                                           (-> acc (update :rs assoc w s')
+                                               (update :ob into (map #(assoc % :from w) o)))))
+                                       {:rs rs :ob []} (sort (keys rs)))
+                           [rs' _ _] (deliver-all (:rs acc) (vec (:ob acc)) t 4000)]
+                       rs'))
+                   rs (range 2000 2600 100))]
+    (doseq [[w s] rs]
+      (let [applied (:machine-state s)]
+        (is (seq applied) (str w " committed blocks and applied none"))
+        (is (= applied (sort applied)) (str w " applied out of order"))
+        (is (= (count applied) (count (distinct applied)))
+            (str w " applied a block twice"))
+        (is (= (mapv :inga.block/height (:committed s)) applied)
+            (str w " applied something other than what it committed"))))))
+
+(deftest uncommitted-blocks-are-not-applied
+  (testing "applying a block that is merely adopted would be applying one that
+            can still be replaced, and undoing it afterwards is what the
+            3-chain rule exists to make unnecessary"
+    (let [leader (c/leader-for witnesses 1)
+          [_ out] (r/start (machine-replica leader) 1000)
+          proposal (:msg (first out))
+          [s' _] (r/on-message (machine-replica :w2) proposal 1001)]
+      (is (= 1 (r/height s')) "adopted")
+      (is (empty? (:machine-state s')) "and executed nothing"))))
+
+(deftest the-same-blocks-give-the-same-root
+  (testing "two replicas that committed the same blocks and derived different
+            roots have found a determinism bug — which is the failure the root
+            exists to surface"
+    (let [blocks [{:inga.block/height 1} {:inga.block/height 2}]
+          f (:apply-fn counting-machine)
+          root (:root-fn counting-machine)]
+      (is (= (root (reduce f ((:init-fn counting-machine)) blocks))
+             (root (reduce f ((:init-fn counting-machine)) blocks))))
+      (is (not= (root (reduce f ((:init-fn counting-machine)) blocks))
+                (root (reduce f ((:init-fn counting-machine)) (reverse blocks))))
+          "and a machine insensitive to order would make this test vacuous"))))
+
+(deftest each-replica-gets-its-own-initial-state
+  (testing "a state machine may own mutable structure — torihiki's book is a
+            struct of typed arrays — so four replicas sharing one value is
+            four replicas sharing one state. Producing it makes that
+            unrepresentable rather than documented."
+    (let [calls (atom 0)
+          m {:init-fn (fn [] (swap! calls inc) [])
+             :apply-fn conj :root-fn str}]
+      (doseq [w witnesses]
+        (r/replica {:witness w :witnesses witnesses :quorum 3
+                    :hash-fn hash-fn :machine m}))
+      (is (= 4 @calls) "the initial state was produced once per replica"))))
+
+;; ── the clock has to start on its own ───────────────────────────────────────
+
+(deftest a-replica-with-no-deadline-starts-one
+  (testing "pm/initial leaves the deadline at 0 and it was read as 'no clock
+            yet, do not time out' — so a replica that never saw a certificate
+            never got a deadline, never timed out, never sent a new-view, and
+            therefore never got a certificate. A deadlock at startup with
+            nothing on the wire and no error anywhere."
+    (let [s (get (net) :w2)
+          [s' out] (r/on-tick s 5000)]
+      (is (zero? (:deadline (:pm s))) "the state this starts from")
+      (is (pos? (:deadline (:pm s'))) "and the clock is running after one tick")
+      (is (empty? out) "starting the clock says nothing to anybody"))))
+
+(deftest once-the-clock-runs-a-stalled-replica-times-out
+  (testing "which is the whole point: a view that produces nothing has to end,
+            or a chain that loses one vote at genesis sits there forever"
+    (let [s (get (net) :w2)
+          [s1 _] (r/on-tick s 1000)
+          deadline (:deadline (:pm s1))
+          [_ out] (r/on-tick s1 (inc deadline))
+          types (mapv #(:type (:msg %)) out)]
+      (is (some #{:new-view} types) "a timed-out view has to end")
+      ;; A timeout now also asks for a sync. That is deliberate: a view that
+      ;; produced nothing is the only evidence a replica gets that it might be
+      ;; behind, and until this existed a laggard never asked at all — measured
+      ;; in production as `last-sync-request: null` on all four replicas while
+      ;; one of them sat three blocks back. See `vote-on-tip` and
+      ;; `a-replica-left-behind-asks-for-what-it-is-missing`.
+      ;;
+      ;; Asserted as a SET rather than loosened to "anything goes": the two
+      ;; messages are the contract, and a third appearing should fail here.
+      (is (= #{:new-view :sync-request} (set types))))))
+
+;; ── surviving a restart ─────────────────────────────────────────────────────
+
+(defn- chain-of-two []
+  (let [leader (c/leader-for witnesses 1)
+        [s0 out] (r/start (get (net) leader) 1000)
+        b1 (:block (:msg (first out)))]
+    [s0 b1]))
+
+(deftest a-restarted-replica-comes-back-where-it-was
+  (testing "a replica that comes back at genesis proposes a fresh block for a
+            height it already proposed, and every restart adds another
+            incompatible candidate — three votes, three block hashes, one
+            height, quorum forever out of reach"
+    (let [[_ b1] (chain-of-two)
+          fresh (get (net) :w2)
+          back (r/replay fresh [b1])]
+      (is (= 1 (r/height back)))
+      (is (= (hash-fn b1) (hash-fn (r/tip back)))))))
+
+(deftest a-replica-does-not-vote-twice-in-a-view
+  (testing "equivocation — the one crime this system slashes for — committed
+            by accident, against itself.
+
+            The rule is per VIEW now. Per height was stricter and that
+            strictness is what turned a transient fork into a permanent
+            deadlock; safety across views is the lock rule, which was always
+            here. What must remain impossible is two votes for DIFFERENT
+            blocks in the SAME view."
+    (let [[_ b1] (chain-of-two)
+          back (-> (r/replay (get (net) :w2) [b1])
+                   ;; What a host restores from durable storage. Without it
+                   ;; the replica does not know it has voted, which is the
+                   ;; window `with-voted-view` exists to close.
+                   (r/with-voted-view 9999))
+          [_ out] (r/on-message back {:type :proposal
+                                      :block (assoc b1 :inga.block/ts 999)} 2000)]
+      (is (empty? (filter #(= :vote (:type (:msg %))) out))
+          "voted a second time in a view it had already voted in"))))
+
+(deftest a-competing-block-in-a-later-view-can-be-voted-for
+  (testing "the deadlock the per-height rule caused. Two blocks at one height,
+            the votes split, and nobody able to move — measured on two
+            deployed chains. In HotStuff a later view resolves it, and this is
+            that: the same height, a higher view, and the lock rule deciding."
+    (let [[_ b1] (chain-of-two)
+          back (r/replay (get (net) :w2) [b1])
+          rival (assoc b1 :inga.block/ts 999)
+          ;; A view above anything this replica voted in.
+          ahead (assoc-in back [:pm :view] 50000)
+          [_ out] (r/on-message ahead {:type :proposal :block rival} 3000)]
+      (is (seq (filter #(= :vote (:type (:msg %))) out))
+          "refused a competing block in a later view — which is the deadlock"))))
+
+(deftest the-watermark-only-moves-forward
+  (let [s (r/with-voted-view (get (net) :w1) 100)]
+    (is (= 100 (r/voted-view s)))
+    (is (= 100 (r/voted-view (r/with-voted-view s 5)))
+        "an older watermark re-opened a view already voted in")))
+
+(deftest a-restarted-leader-can-propose-on-the-tip
+  (testing "without the certificates back, a leader sits on a chain it cannot
+            extend and the restart is only half a recovery"
+    (let [[_ b1] (chain-of-two)
+          back (r/replay (get (net) :w2) [b1])]
+      (is (some? (get-in back [:qcs (:inga.qc/block-hash (:inga.block/justify b1))]))
+          "the certificate b1 carried for its parent")
+      (is (some? (:high-qc (:pm back))) "and the pacemaker knows about it"))))
+
+(deftest replay-is-idempotent
+  (testing "a boot that lists storage twice must not build the chain twice"
+    (let [[_ b1] (chain-of-two)
+          once (r/replay (get (net) :w2) [b1])
+          twice (r/replay once [b1])]
+      (is (= (r/height once) (r/height twice)))
+      (is (= (count (:chain once)) (count (:chain twice)))))))
+
+;; ── a block is the same block ───────────────────────────────────────────────
+
+(deftest proposing-twice-produces-the-same-block
+  (testing "a leader that restarts and proposes again for the same height, on
+            the same parent, with the same transactions, must produce the SAME
+            block. When :ts came from the wall clock it did not, the votes for
+            the two split, and four validators sat at height one with three
+            votes across three hashes."
+    (let [leader (c/leader-for witnesses 1)
+          [_ a] (r/start (get (net) leader) 1000)
+          [_ b] (r/start (get (net) leader) 999999)]
+      (is (= (hash-fn (:block (:msg (first a))))
+             (hash-fn (:block (:msg (first b)))))
+          "proposed at wildly different moments, and the same block"))))
+
+(deftest a-blocks-time-comes-from-its-parent
+  (testing "the rule torihiki.state imposes on itself — the header IS the
+            clock — applied one level up, where the header is made"
+    (let [leader (c/leader-for witnesses 1)
+          [_ out] (r/start (get (net) leader) 1000)
+          b1 (:block (:msg (first out)))]
+      (is (= (:block-interval r/default-params) (:inga.block/ts b1)))
+      (is (not= 1000 (:inga.block/ts b1)) "and not from the caller's clock"))))
+
+(deftest a-new-view-carrying-only-the-genesis-certificate-is-accepted
+  (testing "start fabricates a certificate for genesis so the first proposal
+            has something to justify, and nobody signed it because nobody
+            voted. Requiring signatures on it refused every new-view from a
+            replica that had not yet certified anything — so replicas could
+            not tell each other they had timed out, their views drifted, no
+            two new-views shared a view, and no timeout certificate could
+            form. Four validators sat at views 5, 6, 6, 6 forever."
+    (let [g (r/tip (checked-replica :w1))
+          boot (c/qc [(c/make-vote "w1" (hash-fn g) 0)] 1 0)
+          s (checked-replica :w1)
+          [s' _] (reduce (fn [[s _] w] (r/on-message s (nv w 7 boot) 1000))
+                         [s []] [:w2 :w3 :w4])]
+      (is (= 3 (count (get-in s' [:new-views 7]))))
+      (is (= 8 (:view (:pm s'))) "and the view change happened"))))
+
+(deftest a-certificate-above-genesis-still-needs-its-signatures
+  (testing "the exception is genesis and nothing else — a certificate for
+            height 0 carries no claim about anything that was decided"
+    (let [fake {:inga.qc/block-hash "h:invented" :inga.qc/height 1
+                :inga.qc/view 1 :inga.qc/witnesses #{"w2" "w3" "w4"}
+                :inga.qc/vote-count 3}
+          s (checked-replica :w1)
+          [s' _] (reduce (fn [[s _] w] (r/on-message s (nv w 9 fake) 1000))
+                         [s []] [:w2 :w3 :w4])]
+      (is (empty? (get-in s' [:new-views 9]))))))
+
+;; ── leadership, and the gap that is still open ──────────────────────────────
+
+(deftest a-dead-leader-holds-its-turn-and-that-is-the-open-gap
+  (testing "keyed by height, the turn does not move while the leader is down —
+            measured on the deployed chain, where three surviving validators
+            out of four stopped at the height the wiped one was due to lead.
+            leader-for-view is the right key; deploying it stopped the chain at
+            height one instead, because view-keyed leadership needs the
+            replicas to agree about the view and nothing here makes them.
+            Recorded as a test so the gap is visible rather than remembered."
+    (is (= :w2 (c/leader-for witnesses 1)))
+    (is (= :w2 (c/leader-for witnesses 5)) "same leader for every height ≡ 1 mod 4")
+    ;; Same formula, different input — which is exactly the gap. While the
+    ;; height sits at 1 because its leader is down, a view change moves the
+    ;; view and the height does not follow, so the two answers part company
+    ;; and only the one that cannot help is consulted.
+    (is (= :w2 (c/leader-for witnesses 1)))
+    (is (= :w3 (pm/leader-for-view witnesses 2))
+        "two view changes later, somebody else could have proposed")))
+
+(deftest a-second-proposal-at-a-voted-height-gets-the-vote-again
+  (testing "nothing here is retransmitted, and over a transport with no
+            acknowledgements a lost vote is lost forever. The leader
+            re-proposes the same block — a pure function of its parent, so the
+            same block byte for byte — and every receiver stayed silent
+            because it had already voted. The height could never certify, and
+            a deployed chain sat at height one for as long as it was watched."
+    (let [leader (c/leader-for witnesses 1)
+          [_ out] (r/start (get (net) leader) 1000)
+          proposal (:msg (first out))
+          s (get (net) :w3)
+          [s1 o1] (r/on-message s proposal 1001)
+          [_ o2] (r/on-message s1 proposal 1002)]
+      (is (= 1 (count (filter #(= :vote (:type (:msg %))) o1))))
+      (is (= 1 (count (filter #(= :vote (:type (:msg %))) o2)))
+          "the same vote again, not silence")
+      (is (= (:block-hash (:msg (first (filter #(= :vote (:type (:msg %))) o1))))
+             (:block-hash (:msg (first (filter #(= :vote (:type (:msg %))) o2)))))
+          "and it is the same vote, which is why re-sending is safe"))))
+
+(deftest a-different-block-at-a-voted-height-still-gets-nothing
+  (testing "re-sending is not a licence to vote twice — that is the property
+            the height key exists for"
+    (let [leader (c/leader-for witnesses 1)
+          [_ out] (r/start (get (net) leader) 1000)
+          proposal (:msg (first out))
+          s (get (net) :w3)
+          [s1 _] (r/on-message s proposal 1001)
+          other (assoc-in proposal [:block :inga.block/proposals] ["different"])
+          [_ o2] (r/on-message s1 other 1002)]
+      (is (empty? (filter #(= :vote (:type (:msg %))) o2))))))
+
+(deftest a-new-view-from-somebody-ahead-makes-a-replica-ask
+  (testing "retransmission of a proposal stops when the sender no longer needs
+            votes for it, which is exactly when a replica that missed the
+            block still does — so a laggard has no way to learn the block
+            exists. One deployed replica sat at height one while the other
+            three reached two and stopped there, because three is the quorum
+            and there was no margin left for a single lost message."
+    (let [cert (genuine-cert "h:real" 5)
+          s (checked-replica :w1)
+          [_ out] (r/on-message s (nv :w2 7 cert) 1000)]
+      (is (= [:sync-request] (mapv #(:type (:msg %)) out)))
+      (is (= 1 (:from (:msg (first out)))))
+      (is (= 5 (:to (:msg (first out))))))))
+
+(deftest a-new-view-from-somebody-level-asks-for-nothing
+  (testing "or every message would start a catch-up"
+    (let [cert (genuine-cert "h:real" 0)
+          s (checked-replica :w1)
+          [_ out] (r/on-message s (nv :w2 7 cert) 1000)]
+      (is (empty? (filter #(= :sync-request (:type (:msg %))) out))))))
+
+(deftest catching-up-votes-for-what-it-lands-on
+  (testing "adopting without voting means a block everybody has and nobody
+            voted for, which can never be certified — four deployed validators
+            sat at that tip with thousands of proposals received, a thousand
+            sync-responses each, and ZERO votes recorded for it"
+    (let [s (checked-replica :w1)
+          good (certified-child (r/tip s) 1 true)
+          [s' out] (r/on-message s {:type :sync-response :blocks [good]} 1000)]
+      (is (= 1 (r/height s')) "adopted")
+      (is (= [:vote] (mapv #(:type (:msg %)) out)) "and voted for it")
+      (is (contains? (:voted s') 1)))))
+
+(deftest catching-up-does-not-vote-twice
+  (testing "a replica that already voted at that height stays quiet, which is
+            the property the height key exists for"
+    (let [s (checked-replica :w1)
+          good (certified-child (r/tip s) 1 true)
+          [s1 _] (r/on-message s {:type :sync-response :blocks [good]} 1000)
+          [_ out] (r/on-message s1 {:type :sync-response :blocks [good]} 1001)]
+      (is (empty? (filter #(= :vote (:type (:msg %))) out))))))
+
+(deftest a-block-this-replica-will-not-vote-for-is-not-adopted
+  (testing "adopting it puts the replica on a chain it will not support: the
+            block is its tip, nothing can certify it because its own vote is
+            missing, and every later proposal extends something it never
+            agreed to. Three deployed validators sat at a tip with zero votes
+            recorded for it — not even their own — while receiving three
+            thousand proposals each."
+    (let [;; locked on a block that is not an ancestor of what arrives
+          locked {:inga.qc/block-hash "h:elsewhere" :inga.qc/height 1
+                  :inga.qc/view 9 :inga.qc/witnesses #{"w2" "w3" "w4"}
+                  :inga.qc/vote-count 3}
+          s (assoc-in (get (net) :w2) [:pm :locked-qc] locked)
+          leader (c/leader-for witnesses 1)
+          [_ out] (r/start (get (net) leader) 1000)
+          proposal (:msg (first out))
+          [s' o] (r/on-message s proposal 1001)]
+      (is (empty? (filter #(= :vote (:type (:msg %))) o)) "did not vote")
+      (is (= 0 (r/height s')) "and did not adopt")
+      (is (contains? (:by-hash s') (hash-fn (:block proposal)))
+          "but kept it, because a later proposal may need it as a parent"))))
+
+;; ── views have to converge ──────────────────────────────────────────────────
+
+(deftest a-replica-jumps-when-f-plus-one-are-ahead
+  (testing "replicas time out independently so their views drift — 16, 16, 21
+            and 51 on the deployed chain — and a timeout certificate only
+            bundles new-views that share a view. Once drifted, nothing brings
+            them back, and the safety rule then deadlocks the chain: a replica
+            locked in a late view will not vote for a block justified in an
+            early one, correctly, and three replicas sat two votes short."
+    (let [s (checked-replica :w1)
+          [s1 _] (r/on-message s (nv :w2 9 nil) 1000)]
+      (is (= 0 (:view (:pm s1))) "one witness is not evidence")
+      (let [[s2 _] (r/on-message s1 (nv :w3 9 nil) 1001)]
+        (is (= 9 (:view (:pm s2)))
+            "f+1 of four is two, and two honest-or-not witnesses contain one honest")))))
+
+(deftest one-byzantine-replica-moves-nobody
+  (testing "f+1 rather than a quorum because the job is different: a quorum
+            decides what is agreed, this decides what is BELIEVABLE"
+    (let [s (checked-replica :w1)
+          [s1 _] (r/on-message s (nv :w2 9000 nil) 1000)]
+      (is (= 0 (:view (:pm s1)))))))
+
+(deftest a-replica-at-a-later-view-counts-for-the-earlier-one
+  (testing "a replica at view 51 has also passed 21, so it counts toward 21 —
+            and requiring it to say 21 again would make convergence depend on
+            everybody timing out at the same moment, which is exactly what is
+            not happening.
+
+            The destination is 21 and not 51, which is the rule working: only
+            one witness is at 51, and following one witness is what f+1
+            exists to prevent. This expectation said 51 and the code was
+            right."
+    (let [s (checked-replica :w1)
+          [s1 _] (r/on-message s (nv :w2 21 nil) 1000)
+          [s2 _] (r/on-message s1 (nv :w3 51 nil) 1001)]
+      (is (= 21 (:view (:pm s2)))
+          "the highest view f+1 witnesses are at OR PAST"))))
+
+(deftest converging-does-not-move-a-replica-backwards
+  (let [s (assoc-in (checked-replica :w1) [:pm :view] 30)
+        [s1 _] (r/on-message s (nv :w2 5 nil) 1000)
+        [s2 _] (r/on-message s1 (nv :w3 5 nil) 1001)]
+    (is (= 30 (:view (:pm s2))))))
+
+(deftest a-dropped-vote-is-counted-even-though-it-is-not-answered
+  (testing "silence is right — replying would tell a forger which guesses were
+            closer — and it is also why a chain whose votes are dropped looks
+            exactly like a chain whose votes are not sent"
+    (let [s (checked-replica :w1)
+          [s1 _] (r/on-message s (forge :w2 "h:a") 1000)]
+      (is (= 1 (get-in s1 [:dropped-votes :unsigned])))
+      (is (= "w2" (:witness (:last-dropped-vote s1))))
+      (let [sig ((fake-sign "attacker") (att/vote-payload chain 0 1 "h:a" "w2"))
+            [s2 _] (r/on-message s1 (assoc (forge :w2 "h:a") :sig sig) 1001)]
+        (is (= 1 (get-in s2 [:dropped-votes :did-not-verify])))))))
+
+(deftest a-replica-counts-its-own-vote-even-before-it-is-signed
+  (testing "a Worker signs with WebCrypto after the vote is produced, so the
+            copy folded locally has no signature yet. Requiring one before
+            consulting the verifier rejected every replica's own vote: each
+            was exactly one short of a quorum of three, and each recorded two
+            hundred of its own votes as unsigned while the chain sat there."
+    (let [;; a verifier that trusts this replica's own witness and nobody
+          ;; else without a signature — what a deployed validator uses
+          own-ok (fn [w payload sig]
+                   (or (= w "w1") (fake-verify w payload sig)))
+          s (r/replica {:witness :w1 :witnesses witnesses :quorum (c/quorum-size 4)
+                        :hash-fn hash-fn :chain-id chain :verify-fn own-ok})
+          [s' _] (r/on-message s {:type :vote :witness "w1" :block-hash "h:a"
+                                  :height 1 :view 0} 1000)]
+      (is (= 1 (count (get-in s' [:votes "h:a"]))))
+      (is (nil? (:dropped-votes s'))))))
+
+(deftest an-unsigned-vote-from-anybody-else-is-still-dropped
+  (testing "nothing is loosened: the verifier decides, and it says false for a
+            witness it does not trust without a signature"
+    (let [own-ok (fn [w payload sig]
+                   (or (= w "w1") (fake-verify w payload sig)))
+          s (r/replica {:witness :w1 :witnesses witnesses :quorum (c/quorum-size 4)
+                        :hash-fn hash-fn :chain-id chain :verify-fn own-ok})
+          [s' _] (r/on-message s {:type :vote :witness "w2" :block-hash "h:a"
+                                  :height 1 :view 0} 1000)]
+      (is (empty? (get-in s' [:votes "h:a"])))
+      (is (= 1 (get-in s' [:dropped-votes :unsigned]))))))
+
+;; ── evidence propagates ──────────────────────────────────────────────────────
+;;
+;; Until this existed, an equivocation was recorded by whichever replica
+;; happened to receive both conflicting votes and went no further. That
+;; punishes nobody: the equivocator only has to keep any single peer from
+;; seeing both, which is a routing property it can influence.
+
+(defn- conflicting-votes [witness height]
+  [{:inga.vote/witness witness :inga.vote/height height :inga.vote/view 0
+    :inga.vote/block-hash "block-a" :inga.vote/sig "sig-a"}
+   {:inga.vote/witness witness :inga.vote/height height :inga.vote/view 0
+    :inga.vote/block-hash "block-b" :inga.vote/sig "sig-b"}])
+
+(defn- evidence-for [witness height]
+  (let [[a b] (conflicting-votes witness height)]
+    {:inga.evidence/witness witness :inga.evidence/height height
+     :inga.evidence/vote-a a :inga.evidence/vote-b b}))
+
+(defn- receiver
+  "A replica with no signature verifier, so `vote-verifier` accepts and these
+  tests exercise the PROPAGATION rules rather than the crypto. The one test
+  that cares about verification installs its own `:verify-fn`."
+  []
+  (r/replica {:witness :w1 :witnesses [:w1 :w2 :w3 :w4]
+              :quorum (c/quorum-size 4) :hash-fn hash-fn}))
+
+(deftest evidence-from-a-peer-is-recorded-and-forwarded-once
+  (let [[s1 out1] (r/on-message (receiver)
+                                {:type :evidence :evidence (evidence-for :w9 7)} 0)]
+    (is (= #{:w9} (r/equivocators s1))
+        "a replica that never saw either vote now holds the proof")
+    (is (= [{:to :all}] (mapv #(select-keys % [:to]) out1))
+        "and passes it on, once")
+    (testing "the second copy is absorbed"
+      (let [[s2 out2] (r/on-message s1 {:type :evidence :evidence (evidence-for :w9 7)} 0)]
+        (is (= 1 (count (:equivocations s2))) "not recorded twice")
+        (is (= [] out2) "and not forwarded again -- otherwise one proof is a storm")))))
+
+(deftest a-different-pair-at-the-same-height-is-the-same-crime
+  (let [[s1 _] (r/on-message (receiver)
+                             {:type :evidence :evidence (evidence-for :w9 7)} 0)
+        other (assoc-in (evidence-for :w9 7)
+                        [:inga.evidence/vote-b :inga.vote/block-hash] "block-c")
+        [s2 out] (r/on-message s1 {:type :evidence :evidence other} 0)]
+    (is (= 1 (count (:equivocations s2)))
+        "two conflicting pairs at one height are one equivocation, not two")
+    (is (= [] out) "and re-forwarding on each new pair would be a way to keep the storm alive")))
+
+(deftest evidence-that-does-not-verify-is-refused
+  (testing "otherwise evidence is a way to accuse anyone of anything"
+    (let [state (assoc (receiver) :verify-fn (constantly false))
+          [s out] (r/on-message state {:type :evidence :evidence (evidence-for :w9 7)} 0)]
+      (is (= [] (:equivocations s)) "not recorded")
+      (is (= [] out) "and not forwarded")
+      (is (= 1 (get-in s [:dropped-evidence :did-not-verify]))
+          "dropping is counted, not silent"))))
+
+(deftest evidence-naming-one-witness-twice-for-one-block-is-not-equivocation
+  (let [same (let [e (evidence-for :w9 7)]
+               (assoc-in e [:inga.evidence/vote-b :inga.vote/block-hash] "block-a"))
+        [s out] (r/on-message (receiver) {:type :evidence :evidence same} 0)]
+    (is (= [] (:equivocations s)) "voting the same way twice is not a crime")
+    (is (= [] out))))
+
+(deftest detecting-an-equivocation-broadcasts-it
+  (testing "the detector no longer keeps the proof to itself"
+    (let [w :w9
+          base (receiver)
+          [a b] (conflicting-votes w 7)
+          to-msg (fn [v] {:type :vote :witness (:inga.vote/witness v)
+                          :block-hash (:inga.vote/block-hash v)
+                          :height (:inga.vote/height v) :view (:inga.vote/view v)
+                          :sig (:inga.vote/sig v)})
+          [s1 _] (r/on-message base (to-msg a) 0)
+          [s2 out2] (r/on-message s1 (to-msg b) 0)]
+      (is (= 1 (count (:equivocations s2))))
+      (is (some #(= :evidence (:type (:msg %))) out2)
+          "and the proof leaves this replica"))))
+
+(deftest a-replica-records-what-its-quorum-resists
+  (testing "a deployment that believes it has Sybil resistance while counting
+            heads has the belief and not the property"
+    (is (= :head-count (:quorum-profile (receiver)))
+        "the convenient default is a choice, and it is written down")
+    (is (= :head-count
+           (:quorum-profile (r/replica {:witness :w1 :witnesses [:w1 :w2 :w3 :w4]
+                                        :quorum 3 :hash-fn hash-fn}))))
+    (is (= :stake-weighted
+           (:quorum-profile
+            (r/replica {:witness :w1 :witnesses [:w1 :w2 :w3 :w4]
+                        :quorum (q/stake-weighted {"w1" {:amount 1}} #{"w1"})
+                        :hash-fn hash-fn}))))))
+
+;; ── F1 through the consensus, not beside it ──────────────────────────────────
+;;
+;; `inga.state`'s acceptance ran the CID machine STANDALONE: four folds of the
+;; same op list, one root. That shows the root is a function of the data. It
+;; does not show the thing the ADR actually promised — that four replicas
+;; which had to AGREE on an order arrive at a hydratable root — because
+;; nothing in it went through a commit rule. The socket harnesses do go
+;; through one, and their machine is an opaque digest, which is exactly what
+;; F1 replaced. So this half was covered twice and joined nowhere.
+
+(def ^:private ops-per-block
+  {"op-a" [{:op :assert :s "alice" :p "role" :o "witness"}]
+   "op-b" [{:op :assert :s "bob" :p "role" :o "witness"}]
+   "op-c" [{:op :assert :s "alice" :p "stake" :o 100}]})
+
+(defn- cid-net
+  "A network whose machine is `inga.state`'s, over one shared block store —
+  which is the real topology: blocks are immutable and CID-addressed, so two
+  replicas producing the same block produce the same bytes at one address."
+  [blocks]
+  (let [machine (state/machine
+                 {:decode-block (fn [b] (mapcat ops-per-block (:inga.block/proposals b)))
+                  :put! (fn [cid bytes] (swap! blocks assoc cid bytes))
+                  :get-fn (fn [cid] (get @blocks cid))
+                  :blind-fn state-test/blind
+                  :encrypt-fn state-test/crypt})]
+    [machine
+     (into {} (for [w witnesses]
+                [w (r/replica {:witness w :witnesses (vec witnesses)
+                               :quorum (c/quorum-size (count witnesses))
+                               :hash-fn hash-fn :machine machine})]))]))
+
+(defn- roots-at-common-height
+  "Each replica's root recomputed from the first `common` committed blocks.
+  Comparing as-of-now would fail because replicas are legitimately a block or
+  two apart, for reasons that have nothing to do with agreement."
+  [machine rs]
+  (let [states (vals rs)
+        common (apply min (map #(count (:committed %)) states))]
+    [common
+     (mapv (fn [s]
+             ((:root-fn machine)
+              (reduce (:apply-fn machine) ((:init-fn machine))
+                      (take common (:committed s)))))
+           states)]))
+
+(deftest four-replicas-that-had-to-agree-reach-a-hydratable-root
+  (let [blocks (atom {})
+        [machine rs0] (cid-net blocks)
+        leader (c/leader-for (vec witnesses) 1)
+        seeded (update rs0 leader #(-> % (r/submit "op-a") (r/submit "op-b") (r/submit "op-c")))
+        [s0 out] (r/start (get seeded leader) 1000)
+        rs1 (assoc seeded leader s0)
+        [rs _ _] (deliver-all rs1 (mapv #(assoc % :from leader) out) 1000 4000)
+        [common roots] (roots-at-common-height machine rs)
+        check (fn [cids]
+                (is (pos? common) "the network actually committed something")
+                (is (= 1 (count (set cids)))
+                    "every replica that voted its way to this prefix holds one root")
+                (is (re-find #"^b" (first cids)) "and it is a CID"))]
+    #?(:clj (do (check roots)
+                (testing "and a party holding only that CID can query it"
+                  (let [restored ((:hydrate-fn machine) (first roots) state-test/uncrypt)]
+                    (is (contains? (state/query restored
+                                                {:find '[?s] :where '[[?s "role" "witness"]]})
+                                   ["alice"])))))
+       :cljs (async done
+               (-> (js/Promise.all (clj->js roots))
+                   (.then (fn [cids]
+                            (check (vec cids))
+                            ((:hydrate-fn machine) (first cids) state-test/uncrypt)))
+                   (.then (fn [restored]
+                            (is (contains? (state/query restored
+                                                        {:find '[?s] :where '[[?s "role" "witness"]]})
+                                           ["alice"]))
+                            (done))))))))
+
+;; ── the ref plane on the real commit rule ────────────────────────────────────
+;;
+;; `inga.ref`'s conformance run uses a cooperative reference quorum, and says
+;; so: an agreeable oracle is the easiest way to believe something false. This
+;; replaces it with agreement. Two writers race the same sequence, the network
+;; orders them, and the projection decides — no oracle anywhere.
+
+(defn- head-record-for [ref-name seq cid]
+  (assoc (head/head-record {:ref-name ref-name :seq seq :cid cid
+                            :prev nil :height nil})
+         "cert" {:sigs [{:witness "w1" :sig "s"}]}))
+
+(defn- committed-records
+  "Head records carried by a replica's committed blocks, in committed order."
+  [state]
+  (->> (:committed state)
+       (mapcat :inga.block/proposals)
+       (keep #(get {"head-0-a" (head-record-for "main" 0 "cid-a")
+                    "head-0-b" (head-record-for "main" 0 "cid-b")
+                    "head-1"   (head-record-for "main" 1 "cid-next")} %))))
+
+(deftest two-writers-race-a-sequence-and-the-commit-rule-decides
+  (let [rs0 (net)
+        leader (c/leader-for (vec witnesses) 1)
+        ;; Both writers propose sequence 0 for DIFFERENT cids. Neither can be
+        ;; refused on shape; only the order can separate them.
+        seeded (update rs0 leader #(-> % (r/submit "head-0-a") (r/submit "head-0-b")))
+        [s0 out] (r/start (get seeded leader) 1000)
+        [rs _ _] (deliver-all (assoc seeded leader s0)
+                              (mapv #(assoc % :from leader) out) 1000 4000)
+        per-replica (map (fn [s] (iref/project (committed-records s))) (vals rs))]
+    (is (pos? (count (:committed (first (vals rs))))) "the network committed something")
+    (testing "every replica projects the same winner, because they agreed on the order"
+      (is (= 1 (count (set (map #(get-in % ["main" 0 "cid"]) per-replica))))))
+    (let [p (first per-replica)
+          a (head-record-for "main" 0 "cid-a")
+          b (head-record-for "main" 0 "cid-b")
+          oa (iref/outcome p a) ob (iref/outcome p b)]
+      (is (not= (:certified? oa) (:certified? ob))
+          "exactly one of the two writers won -- the commit rule is the CAS")
+      (let [loser (if (:certified? oa) ob oa)
+            winner-cid (get-in p ["main" 0 "cid"])]
+        (is (= winner-cid (:current loser))
+            "and the loser is told which head actually holds its sequence")))))
+
+(deftest a-gap-in-the-sequence-is-not-a-head
+  (testing "treating a later record as the head across a gap would let a writer
+            skip a sequence and silently drop whatever it should have held"
+    (let [p (iref/project [(head-record-for "main" 1 "cid-next")])]
+      (is (nil? (iref/head-of p "main"))))
+    (let [p (iref/project [(head-record-for "main" 0 "cid-a")
+                           (head-record-for "main" 1 "cid-next")])]
+      (is (= "cid-next" (get (iref/head-of p "main") "cid"))))))
+
+(deftest first-wins-is-the-compare-and-set
+  (testing "last-wins would let a writer that lost the ordering overwrite the
+            winner by proposing again -- the lost update this plane prevents"
+    (let [p (iref/project [(head-record-for "main" 0 "cid-a")
+                           (head-record-for "main" 0 "cid-b")])]
+      (is (= "cid-a" (get-in p ["main" 0 "cid"]))))))
+
+(deftest a-stalled-replica-does-not-flood-its-peers-with-asking
+  (testing "\"once per view\" is not a limit when the view runs away from the
+            height. A stalled chain times out continuously, so once-per-view
+            becomes once-per-timeout — and the deployed chain measured
+            4,611 sync-requests and 8,238 answers against 991 votes, two and a
+            half thousand views past its height. The recovery was eating the
+            transport it needed."
+    (let [;; A one-millisecond view budget, so EVERY tick times out and the
+          ;; view moves — which is the state the deployed chain was in, two and
+          ;; a half thousand views past its height. With the ordinary
+          ;; second-long budget the view gate alone bounds this and the test
+          ;; proves nothing; it passed against a version with no floor at all
+          ;; before this line existed.
+          s (assoc-in (checked-replica :w1) [:params :base-timeout] 1)
+          [s' asks]
+          (reduce (fn [[st n] i]
+                    (let [[st' out] (r/on-tick st (+ 1000 (* i 40)))]
+                      [st' (+ n (count (filter #(= :sync-request (:type (:msg %))) out)))]))
+                  [s 0] (range 20))]
+      (is (<= asks 2)
+          "asked once per timed-out view, which is what the flood is made of")
+      ;; and after the floor has passed, it may ask again
+      (let [[_ out] (r/on-tick s' 60000)]
+        (is (<= (count (filter #(= :sync-request (:type (:msg %))) out)) 1)
+            "stopped asking altogether")))))
+
+;; ── a partition that leaves two branches standing ───────────────────────────
+;;
+;; ADR-2800004800 §1d recorded the stall this section reproduces, measured on
+;; the deployed devnet after the equivocation fixes had cleared everything
+;; else:
+;;
+;;     w2  h 1031  view 1039  no-certificate-for-the-tip  tip-cert false votes 1
+;;         last-proposal 1030 -> locked-elsewhere
+;;     w4  h 1030  view 1050  no-certificate-for-the-tip  tip-cert false votes 1
+;;         last-proposal 1031 -> no-parent
+;;
+;; Two branches, one vote each, and neither replica able to add to the other's:
+;; w4 does not HOLD the parent of 1031, and w2 REFUSES 1030 because its lock
+;; points elsewhere. The ADR named the next step — "put two branches that both
+;; miss quorum into the harness, so this can be reproduced outside
+;; production" — and this is it.
+;;
+;; The two refusals are different in kind and only one of them is a bug:
+;; `locked-elsewhere` is the safety rule doing its job, and must survive.
+;; `no-parent` is a replica missing a block its peers hold, which is what sync
+;; exists to fix. A test that only asserted "the chain recovers" could pass by
+;; weakening the lock, so the assertions below pin both.
+
+(defn- deliver-partitioned
+  "`deliver-all`, with a `reachable?` predicate over [from to].
+
+  Messages that do not cross are DROPPED, not queued: a partition that
+  delivers everything late is a slow network, and the condition being
+  reproduced here needs two sides that genuinely never heard each other."
+  [replicas outbox now max-steps reachable?]
+  (loop [rs replicas ob outbox t now steps 0]
+    (if (or (empty? ob) (>= steps max-steps))
+      [rs ob steps]
+      (let [[{:keys [from to msg]} & more] ob
+            targets (if (= :all to) (sort (keys rs)) [to])
+            [rs' produced]
+            (reduce (fn [[rs acc] w]
+                      (if (or (= w from) (not (reachable? from w)))
+                        [rs acc]
+                        (let [[s' out] (r/on-message (get rs w) msg t)]
+                          [(assoc rs w s')
+                           (into acc (map #(assoc % :from w) out))])))
+                    [rs []]
+                    targets)]
+        (recur rs' (vec (concat more produced)) (+ t 1) (inc steps))))))
+
+(defn- tick-all
+  "One round of ticks for every replica, delivered under `reachable?`."
+  [rs t max-steps reachable?]
+  (let [{:keys [rs ob]}
+        (reduce (fn [acc w]
+                  (let [[s' out] (r/on-tick (get (:rs acc) w) t)]
+                    (-> acc
+                        (update :rs assoc w s')
+                        (update :ob into (map #(assoc % :from w) out)))))
+                {:rs rs :ob []}
+                (sort (keys rs)))
+        [rs' _ _] (deliver-partitioned rs (vec ob) t max-steps reachable?)]
+    rs'))
+
+(defn- run-ticks
+  "Tick the network over `ts` under `reachable?`."
+  [rs ts reachable?]
+  (reduce (fn [rs t] (tick-all rs t 4000 reachable?)) rs ts))
+
+(def ^:private split
+  "{:w1 :w2} on one side, {:w3 :w4} on the other. With n=4 the quorum is 3, so
+  NEITHER side can certify anything — which is the whole point. A 3/1 split
+  would let the majority carry on and would be testing something else."
+  (let [side {:w1 0 :w2 0 :w3 1 :w4 1}]
+    (fn [from to] (= (side from) (side to)))))
+
+(def ^:private connected (constantly true))
+
+(defn- blocks-per-height
+  "height -> the set of DISTINCT block hashes any replica holds at it.
+
+  A height with more than one entry is a fork, and this is the only assertion
+  that says so. Comparing TIPS does not: two replicas one block apart have two
+  different tips and no fork at all, which is what the first version of the
+  test below actually reproduced while claiming otherwise."
+  [replicas]
+  (reduce (fn [acc [_ s]]
+            (reduce (fn [a b]
+                      (update a (:inga.block/height b) (fnil conj #{}) (hash-fn b)))
+                    acc (:chain s)))
+          {}
+          replicas))
+
+(defn- forked-heights [replicas]
+  (vec (sort (keys (filter (fn [[_ v]] (> (count v) 1)) (blocks-per-height replicas))))))
+
+(deftest two-branches-neither-reaching-quorum-still-recover
+  (let [healthy (run)
+        ;; Partition. Neither side can certify, so neither can propose past its
+        ;; own uncertified tip — the split alone does not fork the chain, it
+        ;; leaves one side holding one extra uncertified block.
+        partitioned (run-ticks healthy (range 3000 4200 100) split)]
+
+    (testing "nothing was committed on either side: a 2/2 split cannot reach a
+              quorum of 3, which is what makes the next part possible"
+      (is (= 27 (apply max (map (fn [[_ s]] (r/committed-height s)) partitioned)))
+          "a side committed with only two replicas"))
+
+    ;; The FORK forms on healing, not in the split: the side that stayed behind
+    ;; leads a round, proposes its own block at the height the other side
+    ;; already filled, and now two blocks exist at one height with one vote
+    ;; each. Measured with the rewind disabled: all four replicas at height 29,
+    ;; height 29 holding two distinct blocks, and no further progress ever —
+    ;; the shape ADR-2800004800 §1d recorded on the devnet at 1030/1031.
+    (let [healed (run-ticks partitioned (range 5000 7000 100) connected)
+          heights (into {} (map (fn [[w s]] [w (r/height s)]) healed))]
+
+      (testing "SAFETY: no two replicas committed different blocks"
+        (let [chains (map (fn [[_ s]] (mapv hash-fn (:committed s))) healed)
+              shortest (apply min (map count chains))]
+          (is (apply = (map #(take shortest %) chains))
+              "replicas committed different blocks at the same heights")))
+
+      (testing "the fork is RESOLVED — no height is left holding two blocks"
+        (is (= [] (forked-heights healed))
+            (str "heights still forked: " (forked-heights healed)
+                 " at " heights)))
+
+      (testing "and the chain moves again rather than agreeing to be stuck:
+                converging on a frozen tip would satisfy the assertion above"
+        (is (> (apply min (vals heights))
+               (apply min (map (fn [[_ s]] (r/height s)) partitioned)))
+            (str "no replica advanced after healing: " heights))
+        (is (> (apply min (map (fn [[_ s]] (r/committed-height s)) healed))
+               (apply min (map (fn [[_ s]] (r/committed-height s)) partitioned)))
+            "converged on a tip but committed nothing further")))))
+
+;; ── a view change is not a crime ────────────────────────────────────────────
+;;
+;; `fold-vote` kept the first signed vote per `[witness height]` and treated a
+;; second one for a different block as equivocation — broadcasting a signed
+;; proof of it. That was right while a replica voted once per HEIGHT. The
+;; voting rule is now once per VIEW, and a view change is precisely "vote
+;; again at this height, for a different block, in a later view".
+;;
+;; Measured on the deployed devnet 2026-08-15 (root ADR-2608150300): after a
+;; reset the chain ran clean, `equivocators` went 0 -> 1 -> 4 as views turned
+;; over, and at four it stopped — four replicas each alone on their own tip
+;; with one vote apiece. The liveness mechanism was manufacturing the evidence
+;; that disabled it.
+
+(defn- signed-vote-msg
+  "A genuinely signed vote message from `w`. The signature covers the VIEW, so
+  a fixture that reused one string across views would be testing nothing the
+  verifier does."
+  [w block-hash height view]
+  {:type :vote :witness w :block-hash block-hash :height height :view view
+   :sig ((fake-sign w) (att/vote-payload chain view height block-hash w))})
+
+(deftest a-replica-voting-again-in-a-later-view-is-not-recorded-as-equivocating
+  (let [s (checked-replica :w1)
+        ;; w2 votes at height 3 in view 7, then again at height 3 in view 8
+        ;; for a different block. Honest: that is a view change.
+        [s1 out1] (r/on-message s (signed-vote-msg "w2" "hA" 3 7) 1000)
+        [s2 out2] (r/on-message s1 (signed-vote-msg "w2" "hB" 3 8) 1001)]
+    (testing "no evidence is recorded"
+      (is (empty? (:equivocations s2))
+          (str "recorded: " (pr-str (:equivocations s2)))))
+    (testing "and none is broadcast — the proof travels, so producing one
+              falsely convicts the witness everywhere, not just here"
+      (is (empty? (filter #(= :evidence (:type (:msg %))) (concat out1 out2)))))
+    (testing "w2 is not in the equivocator set"
+      (is (not (contains? (set (r/equivocators s2)) "w2"))))))
+
+(deftest two-blocks-at-one-height-in-ONE-view-is-still-recorded
+  (testing "narrowing the key must not stop a real equivocator being caught —
+            otherwise this change trades a liveness bug for a safety hole"
+    (let [s (checked-replica :w1)
+          [s1 _] (r/on-message s (signed-vote-msg "w2" "hA" 3 7) 1000)
+          [s2 out] (r/on-message s1 (signed-vote-msg "w2" "hB" 3 7) 1001)]
+      (is (seq (:equivocations s2)) "the crime must still be recorded")
+      (is (seq (filter #(= :evidence (:type (:msg %))) out))
+          "and still forwarded")
+      (is (contains? (set (r/equivocators s2)) "w2")))))
+
+;; ── asking low enough to see a fork below the tip ───────────────────────────
+
+(deftest a-replica-whose-tip-conflicts-asks-below-it
+  ;; Measured 2026-08-31 on `torihiki-validator-v3`, sixteen days into a stall:
+  ;;
+  ;;   w1 h 5616 committed 5614   /block?height=5615 identical
+  ;;   w2 h 5635 committed 5633   /block?height=5616 DIFFERENT
+  ;;
+  ;; The fork is one block above w1's committed height. `sync-step` has the
+  ;; rewind path for exactly this and never saw it, because `on-tick` asked
+  ;;
+  ;;     :from (inc (height state'))
+  ;;
+  ;; and a segment starting above our tip never reaches
+  ;; `conflicts-with-chain?`. w1 asked from 5617 nine hundred thousand times.
+  ;;
+  ;; A replica that has been refused for a linking reason has evidence that
+  ;; the disagreement is BELOW where it has been asking. The lowest useful
+  ;; place to ask is `committed + 1`: a rewind may never replace a committed
+  ;; block, so nothing under that could be adopted anyway.
+  (let [s (get (net) :w1)
+        ;; The state a refused sync leaves behind. `handle-sync-response`
+        ;; records it; nothing read it.
+        s (assoc s :last-sync {:offered 3 :from 10 :to 12
+                               :adopted 0 :reason :does-not-link})
+        ;; The request rides the timeout branch: a view that produced nothing
+        ;; is the only evidence a replica gets that it might be behind.
+        [s1 _] (r/on-tick s 1000)
+        [_ out] (r/on-tick s1 (inc (:deadline (:pm s1))))
+        req (first (filter #(= :sync-request (:type (:msg %))) out))]
+    (is (some? req) "a stalled replica has to ask")
+    (is (<= (:from (:msg req)) (inc (r/committed-height s)))
+        "after a linking refusal the replica asked above its own tip again,
+         which is the one place the answer cannot be")))
+
+(deftest a-replica-that-was-helped-goes-back-to-asking-above-its-tip
+  ;; The floor is not a new default. Asking from `committed + 1` every time
+  ;; would re-fetch the uncommitted suffix on every request forever; it is
+  ;; what a refusal buys, and a success spends.
+  (let [s (get (net) :w1)
+        s (assoc s :last-sync {:offered 3 :from 10 :to 12
+                               :adopted 3 :reason nil})
+        [s1 _] (r/on-tick s 1000)
+        [_ out] (r/on-tick s1 (inc (:deadline (:pm s1))))
+        req (first (filter #(= :sync-request (:type (:msg %))) out))]
+    (is (some? req))
+    (is (= (inc (r/height s)) (:from (:msg req)))
+        "a replica that is merely behind asked for blocks it already has")))
