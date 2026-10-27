@@ -288,7 +288,7 @@ def main(args):
                            else "PASS_NATIVE_IDLE_SILENT_QEMU" if args.profile == "idle"
                            else "PASS_NATIVE_DESKTOP_INPUT_QEMU")
         expected_events = (12 if args.profile == "local-draft"
-                           else 11 if args.profile == "consent"
+                           else 12 if args.profile == "consent"
                            else 4 if args.profile == "idle" else 12)
         if (observed["status"] != expected_status
                 or len(observed["events"]) != expected_events
@@ -323,7 +323,7 @@ def main(args):
         elif args.profile == "consent":
             if (observed["font"] != font_state["padded"]
                     or [row["name"] for row in observed["events"]] != [
-                        "first-frame", "itonami-goal-typed", "collapse-key", "collapse-click",
+                        "first-frame", "entropy-probe", "itonami-goal-typed", "collapse-key", "collapse-click",
                         "consent-open",
                         "launcher-key-ignored", "launcher-click-ignored", "key-deny",
                         "pointer-deny", "esc-deny", "pointer-allow"]
