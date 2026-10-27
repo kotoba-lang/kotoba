@@ -159,7 +159,7 @@ def main(args):
             "build-kotoba-native-desktop.sh", "build-native-desktop-macos.py",
             "build-native-font-macos.py", "build-native-kernel-macos.py",
             "build-native-media-macos.py", "check-native-desktop-qemu.py",
-            "check-native-draft-restart-qemu.py",
+            "check-native-draft-restart-qemu.py", "check-native-consent-qemu.py",
             "check-native-media-format.py",
         )
     }
@@ -229,6 +229,7 @@ def main(args):
             raise ValueError("font build receipt mismatch")
 
         kernel_entry = ("workspace-entry.kotoba" if args.profile == "local-draft"
+                        else "consent-entry.kotoba" if args.profile == "consent"
                         else "desktop-entry.kotoba")
         call("kernel", scripts["build-native-kernel-macos.py"], [
             "--compiler-image", compiler, "--compiler-sha256", args.compiler_sha256,
@@ -263,6 +264,7 @@ def main(args):
             raise ValueError("media build receipt mismatch")
 
         guest_script = ("check-native-draft-restart-qemu.py" if args.profile == "local-draft"
+                        else "check-native-consent-qemu.py" if args.profile == "consent"
                         else "check-native-desktop-qemu.py")
         guest_args = [
             "--media", disk, "--efi", efi, "--kernel", image,
@@ -270,11 +272,14 @@ def main(args):
             "--output", guest]
         call("qemu", scripts[guest_script], guest_args)
         receipt_name = ("native-draft-restart.json" if args.profile == "local-draft"
+                        else "native-consent-qemu.json" if args.profile == "consent"
                         else "native-desktop-qemu.json")
         observed = json.loads((guest / receipt_name).read_text())
         expected_status = ("PASS_NATIVE_LOCAL_DRAFT_COLD_RESTORE" if args.profile == "local-draft"
+                           else "PASS_NATIVE_CONSENT_QEMU" if args.profile == "consent"
                            else "PASS_NATIVE_DESKTOP_INPUT_QEMU")
-        expected_events = 11 if args.profile == "local-draft" else 12
+        expected_events = (11 if args.profile == "local-draft"
+                           else 9 if args.profile == "consent" else 12)
         if (observed["status"] != expected_status
                 or len(observed["events"]) != expected_events
                 or observed["kernel"] != kernel_state["kernel"]
@@ -294,6 +299,14 @@ def main(args):
                            for shot in observed["visibleGoalScreenshots"]
                            for row in shot["glyphs"])):
                 raise ValueError("local-draft persistence verdict is incomplete")
+        elif args.profile == "consent":
+            if (observed["font"] != font_state["padded"]
+                    or [row["name"] for row in observed["events"]] != [
+                        "first-frame", "itonami-goal-typed", "consent-open",
+                        "launcher-key-ignored", "launcher-click-ignored", "key-deny",
+                        "pointer-deny", "esc-deny", "pointer-allow"]
+                    or observed["syntheticInputProvesHumanConsent"]):
+                raise ValueError("consent surface verdict is incomplete")
         elif (observed["font"] != font_state["padded"]
               or [row["codepoint"] for row in observed["renderedGoalGlyphs"]] != [97, 98]
               or any(row["inkPixels"] <= 0 for row in observed["renderedGoalGlyphs"])):
@@ -312,6 +325,7 @@ def main(args):
             raise ValueError("tool or source changed during integrated build")
         state.update(state=("MACOS_NATIVE_DRAFT_RESTORE_QEMU_CANDIDATE"
                             if args.profile == "local-draft"
+                            else "MACOS_NATIVE_CONSENT_QEMU_CANDIDATE" if args.profile == "consent"
                             else "MACOS_NATIVE_DESKTOP_QEMU_CANDIDATE"),
                      font=font_state["padded"], kernel=kernel_state["kernel"],
                      efi=kernel_state["efi"], media=media_state["image"],
@@ -320,6 +334,8 @@ def main(args):
                      localDraftRestoreQualified=args.profile == "local-draft",
                      qualification=("Mac native local-draft save and cold restore on QEMU"
                                     if args.profile == "local-draft"
+                                    else "Mac native consent surface (Allow, Deny, modal) on QEMU"
+                                    if args.profile == "consent"
                                     else "Mac native build and QEMU desktop input")
                      + "; D2 workspace, release and physical gates separate")
         save()
@@ -346,7 +362,7 @@ if __name__ == "__main__":
     parser.add_argument("--firmware", type=Path, required=True)
     parser.add_argument("--firmware-sha256", required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--profile", choices=("desktop", "local-draft"), default="desktop")
+    parser.add_argument("--profile", choices=("desktop", "local-draft", "consent"), default="desktop")
     parser.add_argument("--distribution", choices=("aiueos", "awai"), default="aiueos")
     # kernel-v3 (RW at 0x400000) leaves about 3 MiB for code instead of kernel-v1's
     # 1,044,480 bytes (the packager's bounded-ELF admission requires RX to end below

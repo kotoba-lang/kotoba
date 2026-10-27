@@ -24,3 +24,11 @@ by the panel, so nothing under it can be clicked.
   0x200000, i.e. at most 1,044,480 code bytes; this build is 1,048,064. kernel-v3 puts RW at 0x400000 (about 3 MiB for code).
 - The repository bootstrap compiler is v1-only, so the driver now refuses it with that explanation instead of failing in the packager.
 - check-native-desktop-qemu.py's expected CR3 depends on the layout (RW 0x200000 -> 0x30000, 0x400000 -> 0x130000); an unknown layout fails closed.
+
+## Gate (added)
+`build-native-desktop-macos.py --profile consent` builds `native/consent-entry.kotoba` (the goal-model profile) and boots it
+under `scripts/check-native-consent-qemu.py`, which reads guest words with `xp` and pixels from `screendump`:
+the panel opens (Allow pixel, border, dock not drawn), a launcher key and a launcher click do nothing while it is pending,
+N, Esc and the Deny button deny (Goal intact, approved 0), and the Allow button approves exactly as Y does
+(pending 0, approved 1, loop stop 1). Receipt: `native-consent-qemu.json` (status `PASS_NATIVE_CONSENT_QEMU`, 9 events).
+Synthetic HMP input proves no human consent. The earlier manual checks above are superseded by this gate.
