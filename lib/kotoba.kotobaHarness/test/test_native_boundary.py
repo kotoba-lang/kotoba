@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import io
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -13,6 +14,9 @@ ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('controls', ROOT / 'bin/native-controls.py')
 controls = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(controls)
+spec = importlib.util.spec_from_file_location('transport', ROOT / 'bin/native-transport.py')
+transport = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(transport)
 
 
 class NativeBoundary(unittest.TestCase):
@@ -21,7 +25,7 @@ class NativeBoundary(unittest.TestCase):
         env.update(extra or {})
         return subprocess.run([str(ROOT / 'bin/kotoba-harness'), *args], capture_output=True, text=True, env=env)
 
-    def test_unported_jev_refuses_before_credential_or_compiler_access(self):
+    def test_jev_requires_explicit_budget_before_compiler_or_credential_discovery(self):
         with tempfile.TemporaryDirectory() as directory:
             trap = Path(directory) / 'called'
             for name in ('java', 'clojure', 'nbb', 'node', 'kotoba', 'kotoba-clj', 'security'):
@@ -56,9 +60,53 @@ class NativeBoundary(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory) / 'project.edn'
             project.write_text((ROOT / 'projects/kotoba.edn').read_text() + '\n; changed\n')
-            r = self.invoke([str(project), 'known'])
-            self.assertEqual(r.returncode, 78)
-            self.assertIn('not a pinned control', r.stderr)
+            # General known/wrong now use the native project reader. The
+            # separate fixed-control gate must still refuse modified bytes.
+            with self.assertRaisesRegex(controls.Blocked, 'not a pinned control'):
+                controls.main([str(project), 'known'])
+
+    def test_full_route_stops_before_any_process_for_bad_toolchain_pin(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(transport.subprocess, 'run') as run:
+                with self.assertRaisesRegex(transport.Blocked, 'dependency mismatch'):
+                    transport.Native(directory, Path(directory) / 'output')
+                run.assert_not_called()
+
+    def test_full_controller_success_frame_followed_by_signal_is_blocked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            native = SimpleNamespace(output=Path(directory), command=lambda *a, **kw: ['/native/controller'],
+                                     environment=transport.clean_env)
+            process = SimpleNamespace(stdin=io.BytesIO(), stdout=io.BytesIO(
+                b'{:status :ok :result 0 :fuel {:initial 100 :remaining 99}}\n'),
+                wait=lambda **kw: -9, poll=lambda: -9)
+            with patch.object(transport.subprocess, 'Popen', return_value=process), \
+                 patch.object(transport, 'receive', return_value=dict(op='finish', receipt='{"status":"verified"}', exit=0)):
+                with self.assertRaisesRegex(transport.Blocked, 'interrupted'):
+                    transport.execute(native, Path(directory), {})
+            self.assertFalse((Path(directory) / 'receipt.json').exists())
+
+    def test_credentials_and_ambient_grants_do_not_reach_children(self):
+        with patch.dict(os.environ, {'OPENROUTER_API_KEY': 'test-only-secret', 'KEXE_ALLOW': 'everything'}):
+            native = object.__new__(transport.Native)
+            native.container = False
+            env = native.environment(KEXE_ALLOW='3,7,37,39,41')
+            self.assertNotIn('OPENROUTER_API_KEY', env)
+            self.assertEqual(env['KEXE_ALLOW'], '3,7,37,39,41')
+            self.assertEqual(env['PATH'], '/native-no-host-tools')
+
+    def test_browser_driver_processes_never_inherit_model_credentials(self):
+        sentinel = object()
+        for module in (transport, controls):
+            driver = SimpleNamespace(subprocess=module._boundary.BrowserProcesses())
+            with patch.dict(os.environ, {'OPENROUTER_API_KEY': 'test-only-secret', 'KEXE_ALLOW': 'everything'}), \
+                 patch.object(subprocess, 'Popen', return_value=sentinel) as launch:
+                for explicit in (None, {'OPENROUTER_API_KEY': 'explicit-secret', 'OPENROUTER_OTHER': 'other', 'PATH': '/browser-tools'}):
+                    self.assertIs(driver.subprocess.Popen(['/browser'], env=explicit), sentinel)
+                    env = launch.call_args.kwargs['env']
+                    self.assertFalse(any(k.startswith(('OPENROUTER_', 'KEXE_')) for k in env))
+                    self.assertEqual(env['PATH'], os.environ['PATH'] if explicit is None else '/browser-tools')
+                self.assertEqual(os.environ['OPENROUTER_API_KEY'], 'test-only-secret')
+                self.assertIs(driver.subprocess.TimeoutExpired, subprocess.TimeoutExpired)
 
     def test_corrupt_compiler_pin_stops_before_execution(self):
         with tempfile.TemporaryDirectory() as directory:
