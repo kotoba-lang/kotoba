@@ -45,6 +45,9 @@ def snapshot(base, qmp, directory, context):
     title_words = surface[64:96]
     title_length = title_words.index(0) if 0 in title_words else len(title_words)
     row.update(pending=work[87], approved=work[88], modelToken=work[89],
+               ticketMagic=work[96], ticketDomain=work[98],
+               ticketProcess=work[100], ticketGeneration=work[102],
+               ticketModel=work[104],
                title="".join(chr(cp) for cp in title_words[:title_length]))
     return row
 
@@ -261,6 +264,8 @@ def main():
                            lambda s: s["goal"] == base.PREFIX + expected_goal
                            and s["restore"] == ordinal - 1 and s["pending"] == 0
                            and s["approved"] == 0 and s["modelToken"] == 0)
+            if layout_v2:
+                assert current["ticketMagic"] == 0, "cold boot restored a model ticket"
             base.key(qmp, "2")
             current = wait(base, qmp, directory, context, "open",
                            lambda s: s["focus"] == 2 and s["keys"] > current["keys"])
@@ -309,6 +314,9 @@ def main():
                 assert after["approved"] == (0 if user_call else 1)
                 assert after["modelToken"] == expected_token
                 if layout_v2:
+                    assert (after["ticketMagic"], after["ticketDomain"],
+                            after["ticketProcess"], after["ticketGeneration"],
+                            after["ticketModel"]) == (0, 73, code, 1, 1), after
                     assert after["generation"] == 2
                     assert after["title"] == "Itonami demo " + chr(expected_token)
                     result_visible = base.screenshot(
@@ -351,6 +359,7 @@ def main():
                             and s["submitted"] == 0
                             and s["modelToken"] == expected_token
                             and s["title"] == "Itonami demo " + chr(expected_token))
+            assert restored["ticketMagic"] == 0, "diagnostic approval survived reboot"
             base.key(qmp, "2")
             reopened = wait(base, qmp, directory, context, "reopened",
                             lambda s: s["focus"] == 2
