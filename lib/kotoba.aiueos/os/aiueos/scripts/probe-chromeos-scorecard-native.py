@@ -6,9 +6,10 @@ verification, referenced serial-log digest checks, and tagged-receipt row
 binding. The A2/I3 admitted anchors require their exact receipt paths and
 row tags, with source-pinned SHA-256 for the exact receipt bytes. A5 and the
 other pending rows remain refused even if a diagnostic input supplies a
-self-asserted serial digest and a signed-release reference. Other legacy
-receipts remain unbound. It does not qualify other evidence, freshness,
-or hardware.
+self-asserted serial digest and a signed-release reference. Legacy untagged
+receipts are bound to exact source-pinned paths, bytes, and cited rows;
+unregistered tagged receipts are refused. This does not qualify current
+feature execution, freshness, or hardware.
 """
 
 import argparse
@@ -40,6 +41,9 @@ NEGATIVES = {
     'swapped-row-legacy-receipt': (
         b'"receipt os/aiueos/qualification/receipts/vm-20261026/a2-display-change/receipt.edn"',
         b'"receipt os/aiueos/qualification/receipts/vm-20261024/a1-qmp60/receipt.edn"'),
+    'swapped-legacy-ui-to-a1': (
+        b'"receipt os/aiueos/qualification/receipts/vm-20261023/ui/receipt.edn"',
+        b'"receipt os/aiueos/qualification/receipts/vm-20261024/a1-qmp60/receipt.edn"'),
     'missing-signed-release-reference': (
         b'"receipt os/aiueos/qualification/receipts/vm-20261025/signed-release/receipt.edn"',
         b'"record os/aiueos/qualification/receipts/vm-20261025/signed-release/receipt.edn"'),
@@ -47,6 +51,7 @@ NEGATIVES = {
 RECEIPT_NEGATIVES = ('missing-receipt-file', 'red-verdict',
                      'wrong-row-tag', 'missing-row-tag',
                      'mutated-a2-claim', 'mutated-i3-claim',
+                     'mutated-legacy-ui-commit', 'tagged-legacy-g4-mutation',
                      'bad-release-signature-field', 'missing-release-verdict',
                      'tampered-release-json', 'tampered-release-signature',
                      'rehashed-invalid-signature', 'tampered-serial-log',
@@ -55,6 +60,8 @@ RECEIPT_NEGATIVES = ('missing-receipt-file', 'red-verdict',
                      'missing-i3-scale-log', 'tampered-i3-scanout-log',
                      'missing-i3-scanout-log')
 A1_RECEIPT = Path('os/aiueos/qualification/receipts/vm-20261024/a1-qmp60/receipt.edn')
+UI_RECEIPT = Path('os/aiueos/qualification/receipts/vm-20261023/ui/receipt.edn')
+BROKER_RECEIPT = Path('os/aiueos/qualification/receipts/vm-20261023/broker/receipt.edn')
 SETTINGS_RECEIPT = Path(
     'os/aiueos/qualification/receipts/vm-20261024/settings/receipt.edn')
 SIGNED_RELEASE_RECEIPT = Path(
@@ -220,6 +227,7 @@ def main():
     for name in ('positive', 'canonical-refusal', *NEGATIVES,
                  'i2-synthetic-with-bound-log',
                  'a5-forged-serial-and-release',
+                 'unregistered-tagged-b2-receipt',
                  *RECEIPT_NEGATIVES, *row_controls):
         directory = output / name
         directory.mkdir(mode=0o700)
@@ -266,6 +274,22 @@ def main():
                 receipt_commit, receipt_commit + b'\n :serial-sha256 "'
                 + hashlib.sha256(serial.read_bytes()).hexdigest().encode()
                 + b'"', 1))
+        elif name == 'unregistered-tagged-b2-receipt':
+            original = b'"receipt ' + str(UI_RECEIPT).encode() + b'"'
+            copied = UI_RECEIPT.parent.with_name('ui-copy')/'receipt.edn'
+            replacement = b'"receipt ' + str(copied).encode() + b'"'
+            if card_bytes.count(original) < 2:
+                raise ValueError('shared UI receipt anchor missing')
+            data = card_bytes.replace(original, replacement, 1)
+            source_dir = directory/UI_RECEIPT.parent
+            copied_dir = directory/copied.parent
+            shutil.copytree(source_dir, copied_dir)
+            receipt_bytes = (copied_dir/'receipt.edn').read_bytes()
+            if receipt_bytes.count(b':commit "') != 1:
+                raise ValueError('UI copy commit anchor missing')
+            (copied_dir/'receipt.edn').write_bytes(
+                receipt_bytes.replace(b':commit "', b':row :B2, :commit "', 1))
+            expected_exit, expected_stdout = 1, b'AIUEOS_SCORE -1\n'
         elif name in row_controls:
             data = admitted_subset(canonical_card, keep=name.rsplit('-', 1)[1])
             expected_exit, expected_stdout = 1, b'AIUEOS_SCORE -1\n'
@@ -295,6 +319,8 @@ def main():
                 else A2_RECEIPT if name in
                 ('wrong-row-tag', 'missing-row-tag', 'mutated-a2-claim')
                 else I3_RECEIPT if name == 'mutated-i3-claim'
+                else UI_RECEIPT if name == 'mutated-legacy-ui-commit'
+                else BROKER_RECEIPT if name == 'tagged-legacy-g4-mutation'
                 else A1_RECEIPT)
             if name in ('missing-receipt-file', 'missing-serial-log',
                         'missing-secondary-serial-log', 'missing-i3-scale-log',
@@ -334,6 +360,19 @@ def main():
                 if receipt_bytes.count(before) != 1:
                     raise ValueError(f'receipt claim anchor missing: {name}')
                 target.write_bytes(receipt_bytes.replace(before, b'Unverified claim', 1))
+            elif name == 'mutated-legacy-ui-commit':
+                receipt_bytes = target.read_bytes()
+                before = b':commit "d85843'
+                if receipt_bytes.count(before) != 1:
+                    raise ValueError('UI receipt commit anchor missing')
+                target.write_bytes(receipt_bytes.replace(before, b':commit "e85843', 1))
+            elif name == 'tagged-legacy-g4-mutation':
+                receipt_bytes = target.read_bytes()
+                before = b':commit "7a9f0f'
+                if receipt_bytes.count(before) != 1:
+                    raise ValueError('G4 receipt commit anchor missing')
+                target.write_bytes(receipt_bytes.replace(
+                    before, b':row :G4, :commit "8a9f0f', 1))
             elif name in ('tampered-release-json', 'tampered-release-signature',
                           'tampered-serial-log', 'tampered-secondary-serial-log',
                           'tampered-i3-scale-log', 'tampered-i3-scanout-log'):
@@ -425,9 +464,11 @@ def main():
               'taggedReceiptRowBindingVerified': True,
               'admittedA2I3ReceiptAnchorsVerified': True,
               'admittedA2I3ReceiptDigestsVerified': True,
+              'legacyReceiptContentAndRowsSourcePinned': True,
+              'unregisteredTaggedReceiptsRefused': True,
               'syntheticI2RefusedWithBoundSerialLog': True,
               'pendingRowsRequireExplicitNativeAdmission': True,
-              'legacyUntaggedReceiptRowBindingVerified': False,
+              'legacyUntaggedReceiptRowBindingVerified': True,
               'referencedReceiptSerialDigestsVerified': True,
               'signedReleaseReceiptFileDigestsVerified': True,
               'qualificationReleaseSignatureVerified': True,
