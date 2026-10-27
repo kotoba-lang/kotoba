@@ -23,7 +23,7 @@ if [ "$(uname -s)" = Darwin ]; then
       --packager-sha256 "$AIUEOS_KOTOBA_PACKAGER_SHA256"
   fi
   : "${AIUEOS_NATIVE_DESKTOP_OUT:?set a new output under github/workspaces}"
-  owner_root=${AIUEOS_OWNER_REPO_ROOT:-"$repo/.."}
+  owner_root=${AIUEOS_OWNER_REPO_ROOT:-$(python3 -c 'import pathlib,sys; p=pathlib.Path(sys.argv[1]); root=next((a for a in p.parents if a.name=="github"),None); print(root/"kotoba-lang" if root else p.parent)' "$repo")}
   qemu=${AIUEOS_QEMU_BIN:-$(command -v qemu-system-x86_64)}
   : "${qemu:?install or select QEMU for the diagnostic boot gate}"
   firmware=${AIUEOS_QEMU_FIRMWARE:-$(python3 -c 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).resolve().parent.parent/"share/qemu/edk2-x86_64-code.fd")' "$qemu")}
