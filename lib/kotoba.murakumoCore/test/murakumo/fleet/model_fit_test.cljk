@@ -1,0 +1,94 @@
+(ns murakumo.fleet.model-fit-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [murakumo.fleet.model-fit :as fit]))
+
+(def gib 1073741824)
+
+(defn- sample [& kvs]
+  (merge {:label "x" :ctx 8192 :model-bytes (* 5 gib) :memory-bytes (* 16 gib)
+          :base-wired (* 2 gib) :base-active 0 :base-compressed 0 :base-swap-mb 400.0
+          :peak-wired (* 8 gib) :peak-active 0 :peak-compressed 0 :peak-swap-mb 400.0
+          :idle-outbound-s 0.6 :load-outbound-s 0.9 :tok-s [17.5 17.4 17.3]}
+         (apply hash-map kvs)))
+
+(deftest a-config-that-loads-does-not-swap-and-stays-reachable-is-stable
+  (let [v (fit/verdict (sample))]
+    (is (= :stable (:verdict v)))
+    (is (= 17.4 (:tok-s v)) "the median, not the first or the best")))
+
+(deftest a-model-that-pages-is-not-stable-even-though-it-answers
+  ;; The weights are mmap'd: a model that does not fit does not fail, it pages.
+  (is (= :swapping (:verdict (fit/verdict (sample :peak-swap-mb 900.0))))))
+
+(deftest swap-noise-is-not-paging
+  ;; Measured 2026-09-10: with the 27B resident and serving, swap moved from
+  ;; 425 MB to 417 MB -- it went DOWN. A rule that called any movement paging
+  ;; would have failed the config that was actually running.
+  (is (= :stable (:verdict (fit/verdict (sample :peak-swap-mb 417.0 :base-swap-mb 425.0)))))
+  (is (= :stable (:verdict (fit/verdict (sample :peak-swap-mb 420.0 :base-swap-mb 400.0))))))
+
+(deftest a-node-that-cannot-answer-outbound-while-inferring-goes-dark
+  ;; The failure nothing was measuring. llama-server keeps answering /health
+  ;; while the heartbeat misses its deadline and the gateway drops the node.
+  (testing "slower than the budget"
+    (let [v (fit/verdict (sample :load-outbound-s 20.0))]
+      (is (= :goes-dark (:verdict v)))
+      (is (= 15000 (:budget-ms v)))))
+  (testing "never came back at all"
+    (is (= :goes-dark (:verdict (fit/verdict (sample :load-outbound-s :timeout)))))))
+
+(deftest going-dark-outranks-swapping
+  ;; A config that does both is reported as going dark: that is the one that
+  ;; takes the node out of the pool while looking healthy from the inside.
+  (is (= :goes-dark (:verdict (fit/verdict (sample :load-outbound-s 30.0 :peak-swap-mb 900.0))))))
+
+(deftest the-budget-boundary-is-tested-on-the-line
+  ;; A comparison with no case exactly on the boundary cannot show its operator.
+  (let [on-the-line (sample :load-outbound-s (/ fit/outbound-budget-ms 1000.0))]
+    (is (= :stable (:verdict (fit/verdict on-the-line)))
+        "exactly at the budget is within it")
+    (is (= :goes-dark (:verdict (fit/verdict (assoc on-the-line :load-outbound-s
+                                                   (/ (inc fit/outbound-budget-ms) 1000.0)))))
+        "one millisecond over is not")))
+
+(deftest admitted-with-nothing-left-is-its-own-answer
+  (let [v (fit/verdict (sample :peak-wired (long (* 15.6 gib))))]
+    (is (= :no-headroom (:verdict v)))
+    (is (< (:free-fraction v) 0.08))))
+
+(deftest a-missing-reading-is-never-a-pass
+  ;; The shape AGENTS.md forbids: a rule that could not run returning the value
+  ;; of a rule that ran and found nothing wrong.
+  (doseq [k [:peak-swap-mb :load-outbound-s :peak-wired :tok-s]]
+    (let [v (fit/verdict (dissoc (sample) k))]
+      (is (= :unmeasured (:verdict v)) (str "dropping " k))
+      (is (some #{k} (:missing v))))))
+
+(deftest a-model-that-never-loaded-says-so
+  (let [v (fit/verdict (assoc (sample) :loaded? false :load-err "out of memory"))]
+    (is (= :did-not-load (:verdict v)))
+    (is (= "out of memory" (:reason v)))))
+
+(deftest the-largest-stable-context-is-nil-when-none-was
+  (is (= 65536 (fit/largest-stable-ctx [(sample :ctx 8192) (sample :ctx 65536)
+                                        (sample :ctx 131072 :load-outbound-s 40.0)])))
+  (is (nil? (fit/largest-stable-ctx [(sample :ctx 8192 :peak-swap-mb 999.0)]))
+      "no stable context is a real answer, not 'not tried'"))
+
+(deftest parsing-a-probe-block-keeps-timeout-as-a-value
+  (let [text (str "===CONFIG\nLABEL=a\nCTX=8192\nMODEL_BYTES=100\n"
+                  "BASE_WIRED=1\nBASE_SWAP_MB=400.0\nIDLE_OUTBOUND_S=0.5\n"
+                  "REQ1_TOKPS=6.3\nREQ2_TOKPS=6.1\nLOAD_OUTBOUND_S=TIMEOUT\n"
+                  "PEAK_WIRED=2\nPEAK_SWAP_MB=401.0\nDONE=a\n")
+        [s] (fit/parse-results text (* 16 gib))]
+    (is (= "a" (:label s)))
+    (is (= 8192 (:ctx s)))
+    (is (= :timeout (:load-outbound-s s)) "TIMEOUT is a reading, not a gap")
+    (is (= [6.3 6.1] (:tok-s s)))
+    (is (= :goes-dark (:verdict (fit/verdict s))))))
+
+(deftest parsing-a-config-that-did-not-load
+  (let [text "===CONFIG\nLABEL=big\nCTX=32768\nVERDICT=did-not-load\nLOAD_ERR=out of memory\nDONE=big\n"
+        [s] (fit/parse-results text (* 16 gib))]
+    (is (false? (:loaded? s)))
+    (is (= :did-not-load (:verdict (fit/verdict s))))))

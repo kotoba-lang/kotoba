@@ -1,0 +1,55 @@
+(ns image-worker-test
+ (:require [murakumo.infer.image-worker :as w] [kotoba.test :refer [deftest is run-tests]]
+           ["node:assert/strict" :as assertion]))
+(deftest workflow-is-single-slot-and-fixed-profile
+ (let [graph (w/workflow {:checkpoint "animagine-xl-4.0.safetensors" :width 768 :height 768 :steps 24 :seed 12 :prompt "teapot"})]
+  (is (= 1 (get-in graph ["5" :inputs :batch_size])))
+  (is (= 768 (get-in graph ["5" :inputs :width])))
+  (is (= "teapot" (get-in graph ["6" :inputs :text])))
+  (is (= "animagine-xl-4.0.safetensors" (get-in graph ["4" :inputs :ckpt_name])))))
+(deftest readiness-never-interrupts-existing-work
+ (let [cfg {:name "node-a" :busy (atom false) :min-free 0}
+       info {:CheckpointLoaderSimple {:input {:required {:ckpt_name [["animagine-xl-4.0.safetensors"]]}}}}]
+  (is (:ready (w/readiness cfg info {:queue_running [] :queue_pending []})))
+  (is (not (:ready (w/readiness cfg info {:queue_running [1] :queue_pending []}))))
+  (is (not (:ready (w/readiness cfg info {:queue_running [] :queue_pending [1]}))))
+  (reset! (:busy cfg) true)
+  (is (not (:ready (w/readiness cfg info {:queue_running [] :queue_pending []}))))))
+(deftest fenced-worker-result
+ (is (= {:attempt 2 :lease-token "unique" :worker "node-b"}
+        (w/fence {:name "node-b"} {:id "id" :attempt 2 :lease-token "unique" :input {:prompt "private"}}))))
+(deftest memory-pressure-blocks-admission
+ (let [cfg {:name "node-a" :busy (atom false) :min-free 4294967296}
+       info {:CheckpointLoaderSimple {:input {:required {:ckpt_name [["animagine-xl-4.0.safetensors"]]}}}}]
+   (with-redefs [w/available-memory (fn [] 3221225472)]
+     (is (not (:ready (w/readiness cfg info {:queue_running [] :queue_pending []})))))
+   (with-redefs [w/available-memory (fn [] 5368709120)]
+     (is (:ready (w/readiness cfg info {:queue_running [] :queue_pending []}))))))
+(deftest prepared-checkpoints-use-the-shared-profile-catalog
+ (let [cfg {:name "node-a" :busy (atom false) :min-free 0
+            :model-files (atom {"future-image" "prepared.safetensors" "missing-image" "missing.safetensors"})}
+       info {:CheckpointLoaderSimple {:input {:required {:ckpt_name [["prepared.safetensors"]]}}}}]
+   (is (= ["future-image"] (:models (w/readiness cfg info {:queue_running [] :queue_pending []}))))))
+(let [r (run-tests 'image-worker-test)] (when (pos? (+ (:fail r) (:error r))) (js/process.exit 1)))
+(let [original (.-fetch js/globalThis) queue (atom {}) calls (atom [])
+      cfg {:comfy "http://localhost:8188"}
+      check! (fn [running pending expected]
+               (reset! queue {:queue_running running :queue_pending pending}) (reset! calls [])
+               (-> (w/release-idle! cfg)
+                   (.then (fn [_]
+                            (assertion/equal (count @calls) expected)
+                            (when (= expected 2)
+                              (assertion/deepEqual (clj->js (last @calls))
+                                                   #js {:url "http://localhost:8188/free" :method "POST"
+                                                        :body #js {:unload_models true :free_memory true}}))))))]
+  (set! (.-fetch js/globalThis)
+        (fn [url opts]
+          (swap! calls conj {:url url :method (.-method opts)
+                            :body (when (.-body opts) (js->clj (js/JSON.parse (.-body opts)) :keywordize-keys true))})
+          (js/Promise.resolve #js {:status 200 :json (fn [] (js/Promise.resolve (clj->js @queue)))})))
+  (-> (check! [1] [] 1)
+      (.then (fn [_] (check! [] [1] 1)))
+      (.then (fn [_] (check! [] [] 2)))
+      (.then (fn [_] (println "Idle model release: running and pending work are preserved.")))
+      (.catch (fn [e] (println (.-message e)) (set! (.-exitCode js/process) 1)))
+      (.finally (fn [] (set! (.-fetch js/globalThis) original)))))

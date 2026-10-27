@@ -1,0 +1,307 @@
+(ns murakumo.infer-poll-worker-test
+  (:require [cljs.test :refer [async deftest is run-tests testing]]
+            [kotoba.lang.text :as str]
+            [murakumo.infer.poll-worker :as worker]))
+
+(deftest local-auth-token-precedence
+  (testing "an explicit diagnostic option wins"
+    (is (= "arg" (worker/local-auth-token
+                   {:local-token "arg"}
+                   {"MURAKUMO_INFER_LOCAL_TOKEN" "dedicated"
+                    "VLLM_API_KEY" "vllm"}))))
+  (testing "the dedicated environment value wins over the vLLM compatibility value"
+    (is (= "dedicated" (worker/local-auth-token
+                         {}
+                         {"MURAKUMO_INFER_LOCAL_TOKEN" "dedicated"
+                          "VLLM_API_KEY" "vllm"}))))
+  (is (= "vllm" (worker/local-auth-token {} {"VLLM_API_KEY" "vllm"})))
+  (is (nil? (worker/local-auth-token {} {}))))
+
+(deftest node-trust-tier-defaults-to-community
+  ;; The ADR's asymmetry, pinned in both directions: a node that says nothing
+  ;; is Community (an unauthenticated provider must not become Secure by
+  ;; omission), and Secure is reachable only by saying so.
+  (testing "omission is community, not secure"
+    (is (= "community" (worker/node-trust-tier {} {}))))
+  (testing "the environment can opt a node in"
+    (is (= "awai-secure"
+           (worker/node-trust-tier {} {"MURAKUMO_TRUST_TIER" "awai-secure"}))))
+  (testing "an explicit flag wins over the environment"
+    (is (= "community"
+           (worker/node-trust-tier {:trust-tier "community"}
+                                   {"MURAKUMO_TRUST_TIER" "awai-secure"}))))
+  (testing "surrounding whitespace does not create a third tier"
+    (is (= "awai-secure" (worker/node-trust-tier {:trust-tier " awai-secure "} {})))))
+
+(deftest local-auth-header-is-optional
+  (is (= {"content-type" "application/json"}
+         (worker/local-auth-headers nil)))
+  (is (= {"content-type" "application/json"
+          "authorization" "Bearer secret"}
+         (worker/local-auth-headers "secret"))))
+
+(deftest control-plane-auth-prefers-explicit-device-authority
+  (is (= {:kind :biscuit :credential "device-biscuit"}
+         (worker/control-auth {:biscuit "device-biscuit" :cacao "legacy"} {})))
+  (is (= {"content-type" "application/json"
+          "authorization" "Biscuit device-biscuit"}
+         (worker/control-auth-headers {:kind :biscuit :credential (constantly "device-biscuit")})))
+  (is (= {:kind :cacao :credential "device-cacao"}
+         (worker/control-auth {:cacao "device-cacao" :token "operator"}
+                              {"MURAKUMO_NODE_CACAO" "env-cacao"
+                               "MURAKUMO_SERVICE_TOKEN" "env-token"})))
+  (is (= {:kind :bearer :credential "operator"}
+         (worker/control-auth {:token "operator"}
+                              {"MURAKUMO_NODE_CACAO" "env-cacao"})))
+  (is (= {"content-type" "application/json"
+          "authorization" "CACAO device-cacao"}
+         (worker/control-auth-headers {:kind :cacao :credential "device-cacao"})))
+  (is (= {"content-type" "application/json"
+          "authorization" "Bearer operator"}
+         (worker/control-auth-headers {:kind :bearer :credential "operator"}))))
+
+(deftest device-cacao-uses-its-real-did
+  (is (= "did:key:z6MkDevice"
+         (worker/node-did {} {"MURAKUMO_NODE_DID" "did:key:z6MkDevice"} "k16")))
+  (is (= "did:key:z6MkArg"
+         (worker/node-did {:did "did:key:z6MkArg"}
+                          {"MURAKUMO_NODE_DID" "did:key:z6MkDevice"} "k16")))
+  (is (str/starts-with? (worker/node-did {} {} "k16") "did:key:pending-"))
+  (is (worker/valid-node-name? "k16-node_1.local"))
+  (is (false? (worker/valid-node-name? "bad/name"))))
+
+(deftest heartbeat-separates-liveness-readiness-and-capacity
+  (let [busy? (atom false)
+        config {:did "did:key:node" :model "m" :engine "openai-compatible"
+                :slots 1 :busy? busy? :memory-bytes (constantly 4096)}]
+    (is (= {:did "did:key:node"
+            :node/ready? true
+            :node/model "m"
+            :node/engine "openai-compatible"
+            :node/planes ["inference"]
+            :node/observed-at 1000
+            :node/capacity {:slots-total 1 :slots-free 1 :memory-bytes 4096}}
+           (worker/heartbeat-body config true 1000)))
+    (reset! busy? true)
+    (let [body (worker/heartbeat-body config true 1001)]
+      (is (false? (:node/ready? body)))
+      (is (= 0 (get-in body [:node/capacity :slots-free]))))))
+
+(deftest heartbeat-names-the-planes-it-serves
+  (is (= ["generation"] (:node/planes (worker/heartbeat-body {:did "d" :model "m" :planes ["generation"]
+                                                              :memory-bytes (constantly 1)} true 1)))))
+
+(deftest idle-only-node-withholds-capacity-while-the-host-is-busy
+  (let [config {:did "did:key:node" :model "m" :slots 1
+                :memory-bytes (constantly 4096) :idle? (constantly false)}
+        body (worker/heartbeat-body config true 1000)]
+    (is (false? (:node/ready? body)))
+    (is (= 0 (get-in body [:node/capacity :slots-free]))))
+  (is (worker/host-idle? 2 8 3000000000 24000000000))
+  (is (false? (worker/host-idle? 6 8 3000000000 24000000000)))
+  (is (false? (worker/host-idle? 2 8 500000000 24000000000))))
+
+(deftest idle-only-node-does-not-claim-after-local-activity-starts
+  (async done
+    (let [idle (atom false)
+          requests (atom [])
+          fetch-fn (fn [url _]
+                     (swap! requests conj url)
+                     (reset! idle false)
+                     (js/Promise.resolve
+                      #js {:status 200
+                           :text (fn [] (js/Promise.resolve
+                                          "[{\"job-id\":\"job-1\"}]"))}))
+          config {:base "https://api.example" :model "m" :did "did:key:node"
+                  :idle? #(deref idle)}]
+      (-> (worker/poll-once-with-fetch! fetch-fn config)
+          (.then (fn [_]
+                   (is (empty? @requests))
+                   (reset! idle true)
+                   (worker/poll-once-with-fetch! fetch-fn config)))
+          (.then (fn [_]
+                   (is (= ["https://api.example/infer/queue?model=m&did=did%3Akey%3Anode"]
+                          @requests))))
+          (.catch (fn [error] (is false (str error))))
+          (.finally done)))))
+
+(deftest readiness-requires-the-requested-local-model
+  (is (worker/model-ready? "model-a" {:data [{:id "model-a"}]}))
+  (is (worker/model-ready? "model-a" {:models [{:name "model-a"}]}))
+  (is (false? (worker/model-ready? "model-a" {:data [{:id "model-b"}]})))
+  (is (false? (worker/model-ready? "model-a" {:data []}))))
+
+(deftest heartbeat-probes-model-and-sends-bounded-observation
+  (async done
+    (let [requests (atom [])
+          response (fn [status body]
+                     #js {:status status
+                          :text (fn [] (js/Promise.resolve (js/JSON.stringify (clj->js body))))})
+          fetch-fn (fn [url opts]
+                     (swap! requests conj [url opts])
+                     (js/Promise.resolve
+                      (if (str/ends-with? url "/models")
+                        (response 200 {:data [{:id "model-a"}]})
+                        (response 201 {:heartbeat/received-at 1000}))))
+          config {:base "https://api.example" :auth {:kind :cacao :credential "cap"}
+                  :did "did:key:node" :node-name "node-a" :model "model-a"
+                  :engine "openai-compatible" :slots 1 :busy? (atom false)
+                  :memory-bytes (constantly 2048)
+                  :local-url "http://local/v1" :local-token "local"}]
+      (-> (worker/heartbeat-with-fetch! fetch-fn config)
+          (.then (fn [{:keys [status probe]}]
+                   (is (= 201 status))
+                   (is (:ready? probe))
+                   (let [[url opts] (second @requests)
+                         body (js->clj (js/JSON.parse (.-body opts)) :keywordize-keys true)]
+                     (is (= "https://api.example/infer/nodes/node-a/heartbeat" url))
+                     (is (= "CACAO cap" (aget (.-headers opts) "authorization")))
+                     (is (true? (:node/ready? body)))
+                     (is (= 1 (get-in body [:node/capacity :slots-free]))))))
+          (.catch (fn [error] (is false (str error))))
+          (.finally done)))))
+
+(deftest completion-sends-local-bearer-and-rejects-http-errors
+  (async done
+    (let [requests (atom [])
+          response (fn [status body]
+                     #js {:status status
+                          :text (fn [] (js/Promise.resolve (js/JSON.stringify (clj->js body))))})]
+      (let [fetch-fn (fn [_url opts]
+                       (swap! requests conj opts)
+                       (js/Promise.resolve
+                        (if (= 1 (count @requests))
+                          (response 200 {:choices [{:message {:content "ok"}}]})
+                          (response 401 {:error "unauthorized"}))))]
+      (-> (worker/run-completion-with-fetch! fetch-fn "http://local/v1" "local-secret" "model" "hello" 4)
+          (.then (fn [outcome]
+                   (is (:ok outcome))
+                   (is (= "ok" (:text outcome)))
+                   (is (= "Bearer local-secret"
+                          (aget (.-headers (first @requests)) "authorization")))
+                   (worker/run-completion-with-fetch! fetch-fn "http://local/v1" "bad" "model" "hello" 4)))
+          (.then (fn [outcome]
+                   (is (false? (:ok outcome)))
+                   (is (re-find #"HTTP 401" (:error outcome)))))
+          (.catch (fn [error] (is false (str error))))
+          (.finally done))))))
+
+(deftest completion-preserves-edge-openai-request
+  (async done
+    (let [captured (atom nil)
+          request {:messages [{:role "user" :content [{:type "image_url"
+                                                        :image_url {:url "https://example.test/a.png"}}]}]
+                   :tools [{:type "function" :function {:name "inspect"}}]
+                   :max_tokens 9999 :stream true}
+          fetch-fn (fn [_url opts]
+                     (reset! captured (js->clj (js/JSON.parse (.-body opts)) :keywordize-keys true))
+                     (js/Promise.resolve
+                      #js {:status 200
+                           :text (fn [] (js/Promise.resolve
+                                         (js/JSON.stringify
+                                          #js {:choices #js [#js {:message #js {:content "ok"}}]}))) }))]
+      (-> (worker/run-completion-with-fetch!
+           fetch-fn "http://local/v1" nil "murakumo-edge" nil nil request)
+          (.then (fn [outcome]
+                   (is (:ok outcome))
+                   (is (= (:messages request) (:messages @captured)))
+                   (is (= (:tools request) (:tools @captured)))
+                   (is (= 2048 (:max_tokens @captured)))
+                   (is (false? (:stream @captured)))))
+          (.catch (fn [error] (is false (str error))))
+          (.finally done)))))
+
+(deftest promise-finally-runs-cleanup-on-both-arms
+  (async done
+    (let [cleanups (atom 0)]
+      (.then
+       (worker/promise-finally
+        (js/Promise.resolve 42)
+        #(swap! cleanups inc))
+       (fn [value]
+         (is (= 42 value))
+         (is (= 1 @cleanups))
+         (.then
+          (worker/promise-finally
+           (js/Promise.reject (js/Error. "expected"))
+           #(swap! cleanups inc))
+          (fn [_]
+            (is false "rejected promise unexpectedly resolved")
+            (done))
+          (fn [error]
+            (is (= "expected" (.-message error)))
+            (is (= 2 @cleanups))
+            (done))))
+       (fn [error]
+         (is false (str error))
+         (done))))))
+
+(deftest claim-contention-falls-through-without-another-poll
+  (async done
+    (let [attempted (atom [])
+          outcomes (atom [false false true true])
+          jobs [{:job-id "first"} {:job-id "second"}
+                {:job-id "third"} {:job-id "must-not-run"}]
+          claim-fn (fn [job]
+                     (swap! attempted conj (:job-id job))
+                     (let [outcome (first @outcomes)]
+                       (swap! outcomes rest)
+                       (js/Promise.resolve outcome)))]
+      (-> (worker/claim-first-available! claim-fn jobs)
+          (.then (fn [claimed?]
+                   (is claimed?)
+                   (is (= ["first" "second" "third"] @attempted))
+                   (reset! attempted [])
+                   (worker/claim-first-available!
+                    (fn [job]
+                      (swap! attempted conj (:job-id job))
+                      (js/Promise.resolve false))
+                    (take 2 jobs))))
+          (.then (fn [claimed?]
+                   (is (false? claimed?))
+                   (is (= ["first" "second"] @attempted))
+                   (reset! attempted [])
+                   (worker/claim-first-available!
+                    (fn [job]
+                      (swap! attempted conj (:job-id job))
+                      (js/Promise.resolve :stop))
+                    jobs)))
+          (.then (fn [claimed?]
+                   (is (false? claimed?))
+                   (is (= ["first"] @attempted))))
+          (.catch (fn [error] (is false (str error))))
+          (.finally done)))))
+
+(deftest claim-order-spreads-workers-without-dropping-jobs
+  (let [jobs (mapv #(hash-map :job-id (str "job-" %)) (range 12))
+        order-a (worker/claim-order "did:key:node-a" jobs)
+        order-b (worker/claim-order "did:key:node-b" jobs)]
+    (is (= (set jobs) (set order-a) (set order-b)))
+    (is (= order-a (worker/claim-order "did:key:node-a" jobs)))
+    (is (not= (mapv :job-id order-a) (mapv :job-id order-b)))
+    (is (not= (:job-id (first order-a)) (:job-id (first order-b))))))
+
+(deftest queue-poll-identifies-the-worker-for-cache-affinity
+  (is (= "/infer/queue?model=murakumo-edge&did=did%3Akey%3Anode-a"
+         (worker/queue-path "murakumo-edge" "did:key:node-a"))))
+
+(defmethod cljs.test/report [:cljs.test/default :end-run-tests] [m]
+  (println (str "\n" (:test m) " tests, " (:pass m) " assertions, "
+                (:fail m) " failures, " (:error m) " errors"))
+  (when-not (cljs.test/successful? m) (js/process.exit 1)))
+
+(deftest only-201-is-an-accepted-heartbeat
+  ;; Until 2026-09-10 the heartbeat loop reset its consecutive-failure counter
+  ;; on ANY resolved response, so a gateway answering 500 rode the same cadence
+  ;; as one answering 201. Measured on benjamin that day: `heartbeat rejected:
+  ;; 500` fifteen times, every retry logged `failure 1`, and free ephemeral
+  ;; ports fell 5,238 -> 2,069 while the backoff never grew.
+  (is (true? (worker/heartbeat-accepted? 201)))
+  (testing "every other status is a rejection, including 200"
+    ;; The contract is `201 Created` -- a row was written. A 200 means
+    ;; something else happened, and accepting it would keep a node enrolled in
+    ;; its own log while the registry had no record of it.
+    (doseq [s [200 202 400 403 409 429 500 502 503 nil]]
+      (is (false? (worker/heartbeat-accepted? s)) (str "status " s " must not count as accepted")))))
+
+(run-tests)

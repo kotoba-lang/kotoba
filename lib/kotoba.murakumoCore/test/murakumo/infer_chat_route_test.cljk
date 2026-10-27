@@ -1,0 +1,83 @@
+(ns murakumo.infer-chat-route-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [murakumo.infer.chat-route :as cr]))
+
+(def fleet
+  [{:id "a" :alive? true :inflight 0 :ctx 32768 :default-max-tokens 512 :ewma-ms 2000 :last-used 30}
+   {:id "b" :alive? true :inflight 0 :ctx 32768 :default-max-tokens 512 :ewma-ms 2000 :last-used 10}
+   {:id "j" :alive? true :inflight 0 :ctx 32768 :default-max-tokens 512 :low-priority? true :ewma-ms 1000 :last-used 0}
+   {:id "x" :alive? false :inflight 0 :ctx 32768 :last-used 0}])
+
+(deftest probe-rejects-degenerate-output
+  (is (cr/probe-ok? "5"))
+  (is (cr/probe-ok? "答えは5"))
+  (is (not (cr/probe-ok? "0000000000000000")))   ; asher with the canary Metal library
+  (is (not (cr/probe-ok? "")))
+  (is (not (cr/probe-ok? nil)))
+  (is (not (cr/probe-ok? "15")))
+  (is (not (cr/probe-ok? "0.5")))
+  (is (not (cr/probe-ok? "50")))
+  (is (not (cr/probe-ok? "5+5=10")))
+  (is (not (cr/probe-ok? "5は違います")))
+  (is (not (cr/probe-ok? "5 5 5 5 5 5 5 5 5 5"))))  ; runaway output is not an answer
+
+(deftest ewma-first-sample-and-smoothing
+  (is (= 2000 (cr/ewma nil 2000 0.3)))
+  (is (= 1000.0 (double (cr/ewma 1000 1000 0.3))))
+  (is (< 1000 (cr/ewma 1000 23000 0.3) 23000)))
+
+(deftest latency-tiers
+  (is (= 0 (cr/latency-tier cr/default-config nil)))
+  (is (= 0 (cr/latency-tier cr/default-config 5000)))
+  (is (= 1 (cr/latency-tier cr/default-config 5001)))
+  (is (= 1 (cr/latency-tier cr/default-config 15000)))
+  (is (= 2 (cr/latency-tier cr/default-config 15001))))
+
+(deftest picks-least-recently-used-among-equals
+  (is (= {:node "b"} (cr/pick fleet {:prompt-tokens 100 :max-tokens 100}))))
+
+(deftest never-picks-a-dead-or-busy-node
+  (is (= {:node "a"} (cr/pick (map #(if (= "b" (:id %)) (assoc % :inflight 1) %) fleet)
+                              {:prompt-tokens 100})))
+  (is (= {:none :no-live-node} (cr/pick (map #(assoc % :alive? false) fleet) {}))))
+
+(deftest manual-low-priority-is-last-resort
+  (let [busy (map #(if (#{"a" "b"} (:id %)) (assoc % :inflight 1) %) fleet)]
+    (is (= {:node "j"} (cr/pick busy {:prompt-tokens 10}))))
+  ;; with a normal node free, the pinned node is skipped even though it is faster
+  (is (not= {:node "j"} (cr/pick fleet {:prompt-tokens 10}))))
+
+(deftest a-slow-node-is-demoted-by-its-own-latency
+  (let [slow (map #(if (= "b" (:id %)) (cr/observe % 23000) %) fleet)
+        b    (first (filter #(= "b" (:id %)) slow))]
+    (is (= 2 (cr/latency-tier cr/default-config (:ewma-ms (cr/observe (assoc b :ewma-ms nil) 23000)))))
+    ;; b is the least recently used, but a faster node wins once b's EWMA is slow
+    (is (= {:node "a"} (cr/pick (map #(if (= "b" (:id %)) (assoc % :ewma-ms 23000) %) fleet) {:prompt-tokens 0 :max-tokens 0})))))
+
+(deftest context-window-gates-eligibility
+  (testing "fits"
+    (is (= {:node "b"} (cr/pick fleet {:prompt-tokens 30000 :max-tokens 2000}))))
+  (testing "too long for every live node → fall through to the next provider"
+    (is (= {:none :too-long} (cr/pick fleet {:prompt-tokens 31000 :max-tokens 4000}))))
+  (testing "a node with no declared window fails closed for a sized request"
+    (is (= {:none :too-long} (cr/pick [{:id "n" :alive? true :inflight 0}] {:prompt-tokens 10 :max-tokens 1})))))
+
+(deftest omitted-output-reserves-the-actual-backend-default
+  (is (= {:none :too-long} (cr/pick fleet {:prompt-tokens 32700})))
+  (is (= {:node "b"} (cr/pick fleet {:prompt-tokens 32256})))
+  (is (= {:node "b"} (cr/pick fleet {:prompt-tokens 32700 :max-tokens 68})))
+  (is (not (cr/fits? {:ctx 32768 :default-max-tokens 2048} {:prompt-tokens 32000}))))
+
+(deftest unknown-or-invalid-budgets-refuse-routing
+  (is (not (cr/fits? {:ctx 32768} {:prompt-tokens 100})))
+  (is (not (cr/fits? {:ctx 32768 :default-max-tokens 512} {})))
+  (is (not (cr/fits? {:ctx 32768} {:prompt-tokens -1 :max-tokens 1})))
+  (is (not (cr/fits? {:ctx 32768} {:prompt-tokens 100 :max-tokens -1})))
+  (is (not (cr/fits? {} {:prompt-tokens 0 :max-tokens 0}))))
+
+(deftest all-slots-busy-means-wait-not-fail
+  (is (= {:wait true} (cr/pick (map #(assoc % :inflight 1) fleet) {:prompt-tokens 100}))))
+
+(deftest total-slots-counts-only-live-nodes
+  (is (= 3 (cr/total-slots fleet)))
+  (is (= 6 (cr/total-slots (map #(assoc % :slots 2) fleet)))))

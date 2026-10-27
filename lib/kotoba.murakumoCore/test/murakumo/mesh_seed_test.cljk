@@ -1,0 +1,176 @@
+(ns murakumo.mesh-seed-test
+  (:require [kotoba.test :refer [deftest is]]
+            [murakumo.mesh :as mesh]
+            [murakumo.mesh.seed :as seed]))
+
+(def did-b "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK")
+(def did-evil "did:key:z6MknGc3ocHs3zdPiJbnaaqDi58NGb4pk1Sp9WxWufuXSdxf")
+(def endpoint "http://10.77.0.1:7077/enroll")
+
+(def ledger {:admit :auto-on-mesh
+             :nodes {"seed" {:id "seed" :status "authorized" :did "did:key:zSeed" :address "10.77.0.1"}}})
+
+(def nonces (atom 0))
+
+;; Stand-in crypto: a "signature" is valid iff it is exactly did|message. That
+;; makes the test fail if the handler ever stops binding a field into the
+;; message, without needing a real key in a pure test.
+(defn- sign [did msg] (str did "|" msg))
+
+(defn- deps [& {:as extra}]
+  (merge {:now-ms 1000
+          :endpoint endpoint
+          :new-nonce #(str "n-" (swap! nonces inc))
+          :verify (fn [did msg sig] (= sig (sign did msg)))}
+         extra))
+
+(defn- post [state path body & {:as d}]
+  (seed/handle state {:method :post :path path :body body} (deps)))
+
+(defn- challenge [state & {:keys [did name] :or {did did-b name "b"}}]
+  (post state "/enroll/challenge" {:did did :node-name name}))
+
+(defn- claim-body [nonce did name]
+  {:nonce nonce
+   :signature (sign did (mesh/proof-message {:nonce nonce :endpoint endpoint :did did :node-name name}))})
+
+(deftest the-happy-path-two-round-trips
+  (let [[s1 r1] (challenge (seed/initial-state ledger))
+        nonce (get-in r1 [:body :nonce])
+        [s2 r2] (post s1 "/enroll/claim" (claim-body nonce did-b "b"))]
+    (is (= 200 (:status r1)))
+    (is (= 200 (:status r2)))
+    (is (= "authorized" (get-in r2 [:body :status])))
+    (is (= "10.77.0.2" (get-in r2 [:body :address])))
+    (is (= "authorized" (get-in s2 [:ledger :nodes "b" :status])))))
+
+(deftest a-signature-over-another-name-does-not-enrol-this-one
+  (let [[s1 r1] (challenge (seed/initial-state ledger))
+        nonce (get-in r1 [:body :nonce])
+        [_ r2] (post s1 "/enroll/claim" (claim-body nonce did-b "someone-else"))]
+    (is (= :no-proof-of-possession (get-in r2 [:body :reason])))))
+
+(deftest a-signature-for-another-did-is-refused
+  (let [[s1 r1] (challenge (seed/initial-state ledger))
+        nonce (get-in r1 [:body :nonce])
+        [_ r2] (post s1 "/enroll/claim" (claim-body nonce did-evil "b"))]
+    (is (= 403 (:status r2)))))
+
+(deftest a-non-ed25519-did-never-gets-a-challenge
+  (let [[s r] (challenge (seed/initial-state ledger) :did "did:key:zQ3shokFTS3brHcDQrn82RUDfCZESWL1ZdCEJwekUDPQiYBme")]
+    (is (= 400 (:status r)))
+    (is (= :invalid-did (get-in r [:body :reason])))
+    (is (empty? (:challenges s)))))
+
+(deftest a-nonce-is-single-use-even-after-a-failed-proof
+  (let [[s1 r1] (challenge (seed/initial-state ledger))
+        nonce (get-in r1 [:body :nonce])
+        [s2 r2] (post s1 "/enroll/claim" {:nonce nonce :signature "garbage"})
+        [_ r3] (post s2 "/enroll/claim" (claim-body nonce did-b "b"))]
+    (is (= 403 (:status r2)))
+    (is (= :no-proof-of-possession (get-in r2 [:body :reason])))
+    (is (= :unknown-or-expired-nonce (get-in r3 [:body :reason])) "replay refused")))
+
+(deftest an-expired-challenge-is-refused
+  (let [[s1 r1] (challenge (seed/initial-state ledger))
+        nonce (get-in r1 [:body :nonce])
+        [_ r2] (seed/handle s1 {:method :post :path "/enroll/claim" :body (claim-body nonce did-b "b")}
+                            (deps :now-ms (+ 1000 seed/challenge-ttl-ms)))]
+    (is (= :unknown-or-expired-nonce (get-in r2 [:body :reason])))))
+
+(deftest a-proof-for-a-different-seed-endpoint-is-refused
+  (let [[s1 r1] (challenge (seed/initial-state ledger))
+        nonce (get-in r1 [:body :nonce])
+        replayed (sign did-b (mesh/proof-message {:nonce nonce :endpoint "http://10.77.0.9:7077/enroll"
+                                                  :did did-b :node-name "b"}))
+        [_ r2] (post s1 "/enroll/claim" {:nonce nonce :signature replayed})]
+    (is (= :no-proof-of-possession (get-in r2 [:body :reason])))))
+
+(deftest a-failed-claim-does-not-touch-the-ledger
+  (let [s0 (seed/initial-state ledger)
+        [s1 r1] (challenge s0)
+        nonce (get-in r1 [:body :nonce])
+        [s2 _] (post s1 "/enroll/claim" {:nonce nonce :signature "garbage"})]
+    (is (= (:ledger s0) (:ledger s2)))))
+
+(deftest without-the-opt-in-the-join-is-pending-202
+  (let [[s1 r1] (challenge (seed/initial-state (dissoc ledger :admit)))
+        nonce (get-in r1 [:body :nonce])
+        [_ r2] (post s1 "/enroll/claim" (claim-body nonce did-b "b"))]
+    (is (= 202 (:status r2)))
+    (is (= "pending" (get-in r2 [:body :status])))))
+
+(deftest bad-node-names-are-refused
+  (is (= :invalid-node-name (get-in (second (challenge (seed/initial-state ledger) :name "../etc")) [:body :reason])))
+  (is (= :invalid-node-name (get-in (second (challenge (seed/initial-state ledger) :name "")) [:body :reason]))))
+
+(deftest pending-challenges-are-capped-and-expired-ones-do-not-count
+  (let [full (reduce (fn [s i] (first (seed/handle s {:method :post :path "/enroll/challenge"
+                                                      :body {:did did-b :node-name "b"}}
+                                                  (deps :now-ms (+ 1000 i)))))
+                     (seed/initial-state ledger) (range seed/max-pending-challenges))
+        [_ r-full] (post full "/enroll/challenge" {:did did-b :node-name "b"})
+        [_ r-later] (seed/handle full {:method :post :path "/enroll/challenge"
+                                       :body {:did did-b :node-name "b"}}
+                                 (deps :now-ms (+ 100000 seed/challenge-ttl-ms)))]
+    (is (= 503 (:status r-full)))
+    (is (= 200 (:status r-later)))))
+
+(deftest routing-is-uniform-for-unknown-things
+  (let [s (seed/initial-state ledger)]
+    (is (= 404 (:status (second (post s "/nope" {})))))
+    (is (= 405 (:status (second (seed/handle s {:method :get :path "/enroll/claim" :body nil} (deps))))))
+    (is (= 400 (:status (second (seed/handle s {:method :post :path "/enroll/claim" :body "x"} (deps))))))))
+
+(deftest a-trusted-name-is-not-taken-over-via-the-endpoint
+  (let [[s1 r1] (challenge (seed/initial-state ledger) :name "seed")
+        nonce (get-in r1 [:body :nonce])
+        [_ r2] (post s1 "/enroll/claim" (claim-body nonce did-b "seed"))]
+    (is (= 403 (:status r2)))
+    (is (= :node-name-taken-by-another-key (get-in r2 [:body :reason])))))
+
+;; ── operator operations ────────────────────────────────────────────────────
+
+(def admit-led {:admit :auto-on-mesh
+                :nodes {"b" {:id "b" :status "authorized" :did did-b :address "10.77.0.2"}}})
+
+(defn- admin [seed-ledger body & {:keys [path method] :or {path "/admin/sync" method :post}}]
+  (seed/admin seed-ledger {:method method :path path :body body}))
+
+(deftest admin-sync-merges-what-the-seed-holds-into-the-operators-ledger
+  (let [r (admin admit-led {:ledger {:nodes {}}})]
+    (is (= 200 (:status r)))
+    (is (= ["b"] (get-in r [:body :report :added])))
+    (is (= "authorized" (get-in r [:body :ledger :nodes "b" :status])))
+    (is (= admit-led (:ledger r)) "the seed's own ledger is unchanged by a pull")))
+
+(deftest admin-sync-pushes-an-operator-revocation-into-the-seeds-ledger
+  (let [r (admin admit-led {:ledger {:nodes {"b" {:id "b" :status "revoked" :did did-b}}}})]
+    (is (= "revoked" (get-in r [:ledger :nodes "b" :status])) "this is what the server persists")
+    (is (= ["b"] (get-in r [:body :report :revoked-on-seed])))
+    (is (= :auto-on-mesh (:admit (:ledger r))) "the seed keeps its own :admit")))
+
+(deftest admin-sync-never-imports-the-seeds-admit-flag
+  (let [r (admin admit-led {:ledger {:nodes {}}})]
+    (is (not (contains? (get-in r [:body :ledger]) :admit)))))
+
+(deftest a-dry-run-reports-and-persists-nothing
+  (let [r (admin admit-led {:ledger {:nodes {"b" {:id "b" :status "revoked" :did did-b}}} :dry-run? true})]
+    (is (= 200 (:status r)))
+    (is (true? (get-in r [:body :changed?])))
+    (is (= admit-led (:ledger r)))))
+
+(deftest an-admin-op-on-a-ledger-that-just-took-a-join-keeps-the-join
+  ;; the race this exists to close: the join is in the seed ledger the op is given
+  (let [[s1 r1] (challenge (seed/initial-state ledger))
+        nonce (get-in r1 [:body :nonce])
+        [s2 _] (post s1 "/enroll/claim" (claim-body nonce did-b "b"))
+        r (admin (:ledger s2) {:ledger {:nodes {}}})]
+    (is (some #{"b"} (get-in r [:body :report :added])) "the joiner is in the operator's view")
+    (is (= "authorized" (get-in r [:ledger :nodes "b" :status])) "and still in the ledger to persist")))
+
+(deftest admin-refuses-a-bad-body-and-unknown-routes
+  (is (= 400 (:status (admin admit-led {:ledger {:nodes {"x" {:status "bogus"}}}}))))
+  (is (= 400 (:status (admin admit-led "nope"))))
+  (is (= 404 (:status (admin admit-led {} :path "/admin/other"))))
+  (is (= 405 (:status (admin admit-led {} :method :get)))))

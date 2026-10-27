@@ -1,0 +1,108 @@
+(ns murakumo.fleet.spec-test
+  "ADR-2610071730 P1: intent validation, deterministic placement, drift, mesh.
+  Offline; no network."
+  (:require [cljs.test :refer [deftest is testing run-tests]]
+            [murakumo.fleet.spec :as spec]
+            [murakumo.infer.replicated-topology :as rt]
+            [murakumo.fleet.spec-cli :as cli]))
+
+(def did-a "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK")
+(def did-b "did:key:z6MkmQMZJpe1wjnYuXLF8XUNvyDcEJQJ2Jjcc6K8sxoj9GdF")
+
+(defn- node [n & {:as m}]
+  (merge {"node" n "url" (str "http://100.64.0." (count n) ":8796") "enabled" true
+          "failure-domain" "local-site" "owner-id" "00000000-0000-0000-0000-000000000000"
+          "roles" [] "memory-gb" 16}
+         m))
+
+(def intent
+  {"schema" 1 "revision" 1 "spec-version" 2
+   "gateways" [{"node" "gw" "url" "http://100.64.0.9:8797" "enabled" true}]
+   "policies" {"minimum-replicas" {"mishima" 1}}
+   "models" {"mishima" {"kind" "text" "file" "mishima/model/m.gguf"}}
+   "classes" {"mishima-text" {"template" "llama-server" "model" "mishima" "replicas" 2 "context" 32768
+                              "eligible" {"min-memory-gb" 16 "max-pressure" 2}}
+              "itonami-peer" {"template" "itonami-peer" "replicas" "all" "eligible" {"max-pressure" 4}}}
+   "trust" {"a" {"did" did-a "itonami-url" "http://100.64.0.1:7420"}
+            "ops" {"did" did-b "itonami-url" "http://100.64.0.3:7420" "role" "member"}}
+   "nodes" [(node "a" "pins" ["mishima-text"]) (node "bb") (node "ccc") (node "dddd" "memory-gb" 8)]})
+
+(def now 1000000)
+(defn- obs [& {:as m}] (merge {:at-ms now :pressure 1} m))
+(def all-fresh {"a" (obs) "bb" (obs) "ccc" (obs) "dddd" (obs)})
+
+(deftest validates-resident-rollout
+  (let [ok {"sha256" (apply str (repeat 64 "a")) "waves" [["a"] ["bb" "ccc"]] "settle-ms" 1000}
+        bad? (fn [r] (seq (spec/validate (assoc-in intent ["agents" "resident"] r))))]
+    (is (not (bad? ok)))
+    (is (bad? (assoc ok "sha256" nil)) "null sha")
+    (is (bad? (assoc ok "settle-ms" nil)) "NaN settle serialized as null")
+    (is (bad? (assoc ok "settle-ms" 0)))
+    (is (bad? (assoc ok "waves" [["a"] ["a"]])) "a node in two waves")
+    (is (bad? (assoc ok "waves" [["zz"]])) "unknown node")
+    (is (bad? (assoc ok "urls" ["http://x"])) "fallback urls must be https")))
+
+(deftest validates-intent
+  (is (= [] (spec/validate intent)))
+  (testing "NO-ARGV-IN-SPEC"
+    (is (seq (spec/validate (assoc-in intent ["classes" "x"] {"template" "llama-server" "model" "mishima" "replicas" 1
+                                                              "eligible" {} "cmd" "/bin/sh -c rm"}))))
+    (is (seq (spec/validate (assoc-in intent ["classes" "mishima-text" "template"] "arbitrary")))))
+  (testing "schema stays 1, models resolve, trust is did:key, members are marked"
+    (is (seq (spec/validate (assoc intent "schema" 2))))
+    (is (seq (spec/validate (assoc-in intent ["classes" "mishima-text" "model"] "nope"))))
+    (is (seq (spec/validate (assoc-in intent ["trust" "a" "did"] "did:web:x"))))
+    (is (seq (spec/validate (update-in intent ["trust" "ops"] dissoc "role"))))))
+
+(deftest wire-compatible-with-running-residents
+  (is (some? (rt/validate! (js->clj (clj->js intent) :keywordize-keys true) false))
+      "the resident's schema-1 validator accepts the spec-version 2 payload"))
+
+(deftest placement-is-deterministic
+  (let [p (spec/placement intent all-fresh now)]
+    (is (= p (spec/placement intent all-fresh now)))
+    (is (= "a" (first (get-in p ["mishima-text" :nodes]))) "a pinned node comes first")
+    (is (= 2 (count (get-in p ["mishima-text" :nodes]))))
+    (is (= "memory 8 GB < 16" (get-in p ["mishima-text" :excluded "dddd"])))
+    (is (= 4 (count (get-in p ["itonami-peer" :nodes]))) "replicas all")))
+
+(deftest stale-is-unknown-and-pressure-excludes
+  (let [p (spec/placement intent (assoc all-fresh "a" (obs :at-ms 0) "bb" (obs :pressure 4)) now)]
+    (is (= "no fresh observation" (get-in p ["mishima-text" :excluded "a"])))
+    (is (re-find #"pressure" (get-in p ["mishima-text" :excluded "bb"])))
+    (is (= ["ccc"] (get-in p ["mishima-text" :nodes])))
+    (is (get-in p ["mishima-text" :short?]))))
+
+(deftest drift-reports-missing-extra-short-and-declaration
+  (let [ds (spec/drift intent all-fresh {"a" #{"mishima-text"} "dddd" #{"mishima-text"}}
+                       {"a" #{"qwen3-tts"}} now)
+        kinds (set (map :kind ds))]
+    (is (contains? kinds :missing) "placed on the second node but not running there")
+    (is (contains? kinds :extra) "dddd runs it without being eligible")
+    (is (contains? kinds :declaration) "fleet.edn disagrees with the pin")))
+
+(deftest mesh-from-trust
+  (let [t (spec/peers-edn intent "a")]
+    (is (re-find (re-pattern did-b) t))
+    (is (not (re-find (re-pattern did-a) t)) "a node does not trust itself")))
+
+(deftest running-comes-from-ready-lanes
+  (let [i {"models" {"anim" {"kind" "image"} "wai" {"kind" "image"} "mishima" {"kind" "text"}}
+           "classes" {"anim-image" {"template" "comfyui" "model" "anim"}
+                      "wai-image" {"template" "comfyui" "model" "wai"}
+                      "mishima-text" {"template" "llama-server" "model" "mishima"}}}
+        p {"at" 1 "units" {"com.murakumo.comfy" "running" "com.murakumo.mishima" "running"}
+           "lanes" {"image" {"model" "anim" "kind" "image" "ready" true}
+                    "image-wai" {"model" "wai" "kind" "image" "ready" false}}}]
+    (is (= #{"anim-image" "mishima-text"} (:running (spec/l2-entry i p)))
+        "a shared comfy unit counts only for the ready lane; mishima (no lane) falls back to its own unit")))
+
+(deftest class-names-are-injective
+  (is (not= (cli/class-name "Foo" "text") (cli/class-name "foo" "text")))
+  (is (not= (cli/class-name "foo_bar" "text") (cli/class-name "foo-bar" "text")))
+  (is (= "mishima-text" (cli/class-name "mishima" "text")) "plain names stay readable"))
+
+(defmethod cljs.test/report [:cljs.test/default :end-run-tests] [m]
+  (when-not (cljs.test/successful? m) (set! (.-exitCode js/process) 1)))
+
+(run-tests)

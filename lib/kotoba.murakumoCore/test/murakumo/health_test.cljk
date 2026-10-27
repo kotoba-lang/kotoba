@@ -1,0 +1,205 @@
+(ns murakumo.health-test
+  "Pins the decisions health makes without touching a network: what counts as
+  crit, when a restart is refused, and how a series becomes an availability
+  number. The parse fixtures are the tagged lines fanout-script really emits."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.text :as str]
+            [murakumo.health :as h]))
+
+(def th h/default-thresholds)
+
+(defn- row [m] (merge {:name "n" :reachable true :mesh-expected true :serves true :load 1.0 :ncpu 10
+                       :disk-pct 40 :uptime-s 100000 :ports-pct 3 :mesh "200"
+                       :llama-procs 1 :serve "200"} m))
+(defn- codes [x] (set (map :code (:findings x))))
+
+(deftest node-assessment
+  (testing "a healthy node has no findings"
+    (let [a (h/assess-node (row {}))]
+      (is (= :ok (:status a)))
+      (is (empty? (:findings a)))))
+  (testing "unreachable reports only that, not invented fields"
+    (let [a (h/assess-node (row {:reachable false :error "timeout" :mesh nil :load nil}))]
+      (is (= :crit (:status a)))
+      (is (= #{:unreachable} (codes a)))))
+  (testing "load is judged per core"
+    (is (= :ok (:status (h/assess-node (row {:load 6.2 :ncpu 10})))))
+    (is (= :warn (:status (h/assess-node (row {:load 9.5 :ncpu 10})))))
+    (is (= :crit (:status (h/assess-node (row {:load 16 :ncpu 10}))))))
+  (testing "mesh down is crit only where a mesh agent is installed (naphtali serves without one)"
+    (is (contains? (codes (h/assess-node (row {:mesh "000"}))) :mesh-down))
+    (is (empty? (codes (h/assess-node (row {:mesh-expected false :mesh "000"}))))))
+  (testing "serving is judged on the llama-server itself"
+    (is (contains? (codes (h/assess-node (row {:llama-procs 0 :serve nil}))) :serving-down))
+    (is (contains? (codes (h/assess-node (row {:serve "503"}))) :serving-down))
+    (is (empty? (codes (h/assess-node (row {:serves false :llama-procs 0 :serve nil}))))))
+  (testing "port exhaustion explains a failing health probe instead of blaming the server"
+    (let [c (codes (h/assess-node (row {:mesh "000" :ports-pct 97})))]
+      (is (contains? c :port-exhausted))
+      (is (not (contains? c :mesh-down)))))
+  (testing "disk finding carries free space"
+    (is (str/includes? (:msg (first (:findings (h/assess-node (row {:disk-pct 96 :disk-avail-gb 41}))))) "41 GB")))
+  (testing "disk and recent reboot"
+    (is (contains? (codes (h/assess-node (row {:disk-pct 96}))) :disk))
+    (is (= :warn (:status (h/assess-node (row {:disk-pct 88})))))
+    (is (contains? (codes (h/assess-node (row {:uptime-s 90}))) :rebooted))))
+
+(def good-gw {:health-code 200 :health-s 0.5 :models-code 200 :model-ids ["mishima"]})
+
+(deftest gateway-assessment
+  (is (= :ok (:status (h/assess-gateway good-gw nil))))
+  (is (= :crit (:status (h/assess-gateway (assoc good-gw :health-code 502) nil))))
+  (is (= :crit (:status (h/assess-gateway (assoc good-gw :model-ids []) nil))))
+  (is (= :warn (:status (h/assess-gateway (assoc good-gw :health-s 2.5) nil))))
+  (testing "canary regression needs a baseline; without one there is no verdict"
+    (let [c {:ok true :tok-s 3.0 :total-s 8.0}]
+      (is (= :ok (:status (h/assess-gateway (assoc good-gw :canary c) {:tok-s nil :total-s nil}))))
+      (is (= :crit (:status (h/assess-gateway (assoc good-gw :canary c) {:tok-s 9.8 :total-s 8.0}))))
+      (is (= :warn (:status (h/assess-gateway (assoc good-gw :canary {:ok true :tok-s 6.5 :total-s 8.0})
+                                              {:tok-s 9.8 :total-s 8.0}))))
+      (is (= :crit (:status (h/assess-gateway (assoc good-gw :canary {:ok false :code 500}) nil)))))))
+
+(deftest fleet-verdict-and-score
+  (let [ok (row {}) bad (row {:reachable false :error "x"})]
+    (testing "all healthy"
+      (let [a (h/assess-fleet [(row {:name "a"}) (row {:name "b"})] good-gw [])]
+        (is (= :healthy (:verdict a))) (is (= 100 (:score a)))))
+    (testing "one node down is degraded, score reflects it"
+      (let [a (h/assess-fleet [(row {:name "a"}) (row {:name "b"}) (row {:name "c"}) (assoc bad :name "d")] good-gw [])]
+        (is (= :degraded (:verdict a))) (is (= 75 (:score a))) (is (= "3/4" (:reachable a)))))
+    (testing "most of the fleet unreachable is critical"
+      (let [a (h/assess-fleet [ok (assoc bad :name "b") (assoc bad :name "c")] good-gw [])]
+        (is (= :critical (:verdict a)))))
+    (testing "a dead gateway is critical whatever the nodes say"
+      (let [a (h/assess-fleet [ok] (assoc good-gw :health-code 503) [])]
+        (is (= :critical (:verdict a))) (is (= 75 (:score a)))))))
+
+(defn- snap [at nodes gw-status & [canary]]
+  {:health/kind "snapshot" :health/at at :health/score 90
+   :health/nodes nodes :health/gateway {:status gw-status :canary canary}})
+
+(deftest slo-series
+  (let [snaps [(snap "t1" {"a" "ok" "b" "ok"} "ok" {:ok true :tok-s 10 :total-s 8})
+               (snap "t2" {"a" "crit" "b" "ok"} "ok" {:ok true :tok-s 9 :total-s 9})
+               (snap "t3" {"a" "ok" "b" "ok"} "ok" {:ok true :tok-s 11 :total-s 8})
+               (snap "t4" {"a" "crit" "b" "crit"} "crit")
+               (snap "t5" {"a" "ok" "b" "crit"} "ok" {:ok true :tok-s 10 :total-s 8})]
+        s (h/slo snaps 50)
+        by (into {} (map (juxt :node identity) (:nodes s)))]
+    (is (= 5 (:window s)))
+    (is (= 60.0 (:availability (by "a"))))
+    (is (= 60.0 (:availability (by "b"))))
+    (testing "alternating ok/crit is flapping; a steady outage is not"
+      (is (= 4 (:status-changes (by "a"))))
+      (is (contains? (set (:flapping s)) "a"))
+      (is (not (contains? (set (:flapping s)) "b"))))
+    (is (= 80.0 (:gateway-availability s)))
+    (is (= 10 (:tok-s (:canary-baseline s))))))
+
+(deftest heal-plan-rules
+  (let [mk (fn [names down cmd]
+             (let [rows (mapv (fn [n] (row {:name n :restart-cmd cmd
+                                            :mesh (if (contains? down n) "000" "200")})) names)]
+               (assoc (h/assess-fleet rows good-gw []) :rows rows)))
+        names ["a" "b" "c" "d" "e" "f"]
+        now 2000000000000
+        restart (fn [p] (filter #(= :restart (:action %)) p))]
+    (testing "a wedged node with a declared restart command gets an executable action"
+      (let [r (first (restart (h/heal-plan (mk names #{"a"} "systemctl restart x") [] now)))]
+        (is (= "a" (:node r))) (is (true? (:executable r)))
+        (is (= "systemctl restart x" (:command r))) (is (nil? (:blocked r)))))
+    (testing "no declared command means advice only — heal never guesses one"
+      (let [p (h/heal-plan (mk names #{"a"} nil) [] now)]
+        (is (empty? (restart p)))
+        (is (every? (complement :executable) p))
+        (is (str/includes? (:advice (first p)) ":health/restart-cmd"))))
+    (testing "a correlated outage is not restarted node by node"
+      (let [p (h/heal-plan (mk names #{"a" "b" "c"} "x") [] now)]
+        (is (= 3 (count (restart p))))
+        (is (every? :blocked (restart p)))))
+    (testing "cooldown stops a restart loop"
+      (let [recent [{:health/kind "heal" :health/node "a"
+                     :health/at (.toISOString (js/Date. (- now 60000)))}]
+            old [{:health/kind "heal" :health/node "a"
+                  :health/at (.toISOString (js/Date. (- now 7200000)))}]]
+        (is (some? (:blocked (first (restart (h/heal-plan (mk names #{"a"} "x") recent now))))))
+        (is (nil? (:blocked (first (restart (h/heal-plan (mk names #{"a"} "x") old now))))))))
+    (testing "unreachable and port exhaustion are advice, never executable"
+      (let [rows [(row {:name "u" :reachable false :error "t" :restart-cmd "x"})
+                  (row {:name "p" :mesh "000" :ports-pct 99 :restart-cmd "x"})]
+            a (assoc (h/assess-fleet rows good-gw []) :rows rows)
+            p (h/heal-plan a [] now)]
+        (is (seq p))
+        (is (every? (complement :executable) p))))))
+
+(deftest fanout-parse-and-script
+  (let [text (str "N:naphtali:LOAD=1.53\nN:naphtali:NCPU=10\nN:naphtali:DISK=41\n"
+                  "N:naphtali:MESH=200\nN:naphtali:RC=0\n"
+                  "N:aiueos-k16:ssh: connect to host x port 22: Connection timed out\n"
+                  "N:aiueos-k16:RC=255\n")
+        p (h/parse-fanout text ["naphtali" "aiueos-k16"])]
+    (is (= 0 (get-in p ["naphtali" :rc])))
+    (is (= "1.53" (get-in p ["naphtali" :kv :load])))
+    (is (= 255 (get-in p ["aiueos-k16" :rc])))
+    (is (= ["ssh: connect to host x port 22: Connection timed out"] (get-in p ["aiueos-k16" :raw])))
+    (let [r (h/node-row {} {:name "aiueos-k16" :roles ["compute"]} (get p "aiueos-k16"))]
+      (is (false? (:reachable r))) (is (false? (:mesh-expected r)))
+      (is (true? (:serves (h/node-row {} {:name "n" :node/serves ["x" "mishima"]} {:rc 0 :kv {}}))))
+      (is (true? (:serves (h/node-row {} {:name "n" :node/serves "mishima"} {:rc 0 :kv {}}))))
+      (is (true? (:mesh-expected (h/node-row {} {:name "n"} {:rc 0 :kv {:plist "1"}}))))))
+  (testing "the script quotes hostile values instead of interpolating them"
+    (let [s (h/fanout-script [{:name "x" :host "u@h;rm -rf /" :cmd "echo 'a b'"}] 5)]
+      (is (str/includes? s "'u@h;rm -rf /'"))
+      (is (str/includes? s "wait")))))
+
+(deftest parse-gateway-bodies
+  (is (= ["a" "b"] (h/parse-models "{\"data\":[{\"id\":\"a\"},{\"id\":\"b\"}]}")))
+  (is (= [] (h/parse-models "<html>502</html>")))
+  (let [c (h/parse-canary "{\"usage\":{\"completion_tokens\":8},\"timings\":{\"predicted_per_second\":9.826,\"prompt_per_second\":23.82}}\n200 8.14")]
+    (is (true? (:ok c))) (is (= 9.8 (:tok-s c))) (is (= 8.14 (:total-s c))))
+  (is (false? (:ok (h/parse-canary "{\"error\":{\"message\":\"boom\"}}\n500 1.0")))))
+
+(deftest ledger-roundtrip
+  (let [tmp (.join (js/require "node:path") (.tmpdir (js/require "node:os")) (str "health-" (js/Date.now) ".jsonl"))
+        a (h/assess-fleet [(row {:name "a"})] good-gw [])
+        r (h/snapshot-row "2026-09-29T00:00:00Z" a)]
+    ((.-appendFileSync (js/require "node:fs")) tmp "not json\n")
+    (murakumo.bench/append-row! tmp r)
+    (let [{:keys [rows bad]} (h/read-ledger tmp)]
+      (is (= 1 bad))
+      (is (= "healthy" (:health/verdict (first (h/snapshots rows)))))
+      ;; JSON keys come back as keywords; slo must work on the series as READ, not as built
+      (is (= "ok" (get-in (first (h/snapshots rows)) [:health/nodes :a])))
+      (is (= 100.0 (:availability (first (:nodes (h/slo (h/snapshots rows) 10)))))))))
+
+(deftest review-fixes
+  (testing "a host ssh would parse as an option is refused"
+    (is (true? (h/valid-host? "root@100.98.24.37")))
+    (is (true? (h/valid-host? "naphtali")))
+    (is (false? (h/valid-host? "-oProxyCommand=touch /tmp/x")))
+    (is (false? (h/valid-host? "a b")))
+    (is (thrown? js/Error (h/select-nodes {:nodes [{:name "x" :host "-oProxyCommand=id"}]} "all"))))
+  (testing "the fan-out script ends ssh option parsing before the host"
+    (is (str/includes? (h/fanout-script [{:name "x" :host "h" :cmd "c"}] 5) "accept-new -- 'h'")))
+  (testing "a reachable node that returned nothing is not reported healthy"
+    (let [a (h/assess-node (row {:load nil :ncpu nil :serves false :mesh-expected false}))]
+      (is (= :warn (:status a))) (is (contains? (codes a) :probe-empty))))
+  (testing "serving wiped out fleet-wide is critical even when ssh and the gateway are fine"
+    (let [rows [(row {:name "a" :serve nil :llama-procs 0}) (row {:name "b" :serve "000"})]
+          a (h/assess-fleet rows good-gw [])]
+      (is (= :critical (:verdict a)))))
+  (testing "unreachable nodes count toward a correlated outage"
+    (let [rows (concat [(row {:name "w1" :mesh "000" :restart-cmd "x"})
+                        (row {:name "w2" :mesh "000" :restart-cmd "x"})]
+                       (map #(row {:name (str "ok" %)}) (range 8))
+                       (map #(row {:name (str "dark" %) :reachable false :error "t"}) (range 5)))
+          a (assoc (h/assess-fleet (vec rows) good-gw []) :rows (vec rows))
+          r (filter #(= :restart (:action %)) (h/heal-plan a [] 2000000000000))]
+      (is (= 2 (count r))) (is (every? :blocked r))))
+  (testing "flapping counts crossings of the crit boundary, not ok<->warn"
+    (let [snaps (mapv (fn [i st] (snap (str "t" i) {"a" st} "ok"))
+                      (range) ["ok" "warn" "ok" "warn" "ok" "warn"])]
+      (is (empty? (:flapping (h/slo snaps 50)))))
+    (let [snaps (mapv (fn [i st] (snap (str "t" i) {"a" st} "ok"))
+                      (range) ["ok" "crit" "ok" "crit" "ok"])]
+      (is (= ["a"] (:flapping (h/slo snaps 50)))))))
