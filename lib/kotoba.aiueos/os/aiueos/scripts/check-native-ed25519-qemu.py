@@ -6,7 +6,9 @@ clamp, scalar multiplication of the base point, encoding) for the three RFC 8032
 128 bytes per case from word 320 of the browser context; the first 32 bytes are the encoded key. This gate boots
 once, waits for the first completed frame, reads the marker (word 99 = "ED25") and the 96 result words over the
 QEMU monitor and compares the keys with the published RFC 8032 public keys. The seeds are public test vectors: no
-device key exists and nothing is signed. QEMU TCG only.
+device key exists. It also signs the three RFC 8032 section 7.1 messages (lengths 0, 1 and 2) with the
+same seeds and compares the 64-byte signatures byte for byte with the published ones (words 768.. of the context).
+QEMU TCG only.
 """
 import argparse, hashlib, json, os, re, select, struct, subprocess, time
 from pathlib import Path
@@ -18,6 +20,11 @@ CASES = (
     ("rfc8032-test1", "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"),
     ("rfc8032-test2", "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c"),
     ("rfc8032-test3", "fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025"),
+)
+SIGS = (
+    ("rfc8032-test1", "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b"),
+    ("rfc8032-test2", "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00"),
+    ("rfc8032-test3", "6291d657deec24024827e69c3abe01a30ce548a284743a445e3680d7db5ac3ac18ff9b538d16f290ae67f760984dc6594a7c15e9716ed28dc027beceea1ec40a"),
 )
 
 def pin(p):
@@ -67,6 +74,13 @@ def main(a):
             keys.append(dict(case=name, publicKey=got.hex()))
         assert len({k["publicKey"] for k in keys}) == 3, "the three keys must differ"
         events.append(dict(name="ed25519-pubkey", marker=hex(marker), keys=keys))
+        sigs = []
+        for k, (name, expected) in enumerate(SIGS):
+            raw = b"".join(struct.pack("<I", w) for w in words(768 + 16 * k, 16))
+            assert raw.hex() == expected, (name, raw.hex(), expected)
+            sigs.append(dict(case=name, signature=raw.hex(), messageLength=(0, 1, 2)[k]))
+        assert len({s["signature"] for s in sigs}) == 3, "the three signatures must differ"
+        events.append(dict(name="ed25519-sign", signatures=sigs))
         send("quit", 0.5)
     finally:
         try: proc.wait(timeout=15)
@@ -74,7 +88,7 @@ def main(a):
     assert pin(a.media) == media_before, "media changed"
     report = dict(status="PASS_NATIVE_ED25519_QEMU", kernel=pin(a.kernel), efi=pin(a.efi), media=media_before,
                   font=pin(a.font), firmware=pin(a.firmware), observer=pin(Path(__file__)), events=events,
-                  signing=False, deviceKey=False, physicalHardware=False, syntheticInput=False)
+                  signing=True, deviceKey=False, physicalHardware=False, syntheticInput=False)
     (out / "native-ed25519-qemu.json").write_text(json.dumps(report, indent=2) + "\n")
     print(report["status"], len(keys), "keys")
 

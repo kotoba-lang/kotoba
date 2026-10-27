@@ -1,7 +1,7 @@
 (ns aiueos.ed25519
   (:require [aiueos.gf25519 :as gf]
             [aiueos.sha512 :as sha])
-  (:export [aiueos-ed25519-pubkey main]))
+  (:export [aiueos-ed25519-pubkey aiueos-ed25519-sign main]))
 
 ;; Ed25519 public key from a 32-byte seed (RFC 8032 section 5.1.5) for the freestanding aiueos kernel,
 ;; after TweetNaCl: SHA-512 of the seed, clamp, fixed-window-free double-and-add over extended twisted
@@ -99,12 +99,10 @@
                            (bit-xor y (i64-shift-left (bit-and x 1) 7)))]
     (+ 1 (* 0 s))))
 
-;; out (128 bytes): bytes 0..31 the encoded public key; 32..63 scratch (packed x)
-(defn aiueos-ed25519-pubkey [seed :i64 out :i64 ws :i64 hash :i64] :i64
-  (let [sc (kernel-subregion ws 4096 0 4096)
-        h (sha/aiueos-sha512 seed 32 hash sc 4096)
-        ps (put-scalar sc hash 0)
-        id (point-identity sc)
+;; Encode k*B for the scalar bytes already in words 272..303: out (128 bytes) gets the 32-byte encoding at 0
+;; (bytes 32..63 are scratch: the packed x).
+(defn basemul-encode [sc out]
+  (let [id (point-identity sc)
         bs (point-base sc)
         d2 (load-const sc 208 0 0)
         lp (scalar-loop sc 255)
@@ -114,6 +112,145 @@
         py (gf/gf-pack sc out 0 240)
         px (gf/gf-pack sc out 32 224)
         fl (flip-sign-byte out)]
-    (+ 1 (* 0 (+ h (+ ps (+ id (+ bs (+ d2 (+ lp (+ zi (+ tx (+ ty (+ py (+ px fl)))))))))))))))
+    (+ 1 (* 0 (+ id (+ bs (+ d2 (+ lp (+ zi (+ tx (+ ty (+ py (+ px fl)))))))))))))
+
+;; out (128 bytes): bytes 0..31 the encoded public key; 32..63 scratch (packed x)
+(defn aiueos-ed25519-pubkey [seed :i64 out :i64 ws :i64 hash :i64] :i64
+  (let [sc (kernel-subregion ws 4096 0 4096)
+        h (sha/aiueos-sha512 seed 32 hash sc 4096)
+        ps (put-scalar sc hash 0)
+        enc (basemul-encode sc out)]
+    (+ 1 (* 0 (+ h (+ ps enc))))))
+
+;; ---- signing (RFC 8032 5.1.6), messages up to 64 bytes ----
+;; buf (1024 bytes) layout: 0..31 seed (input), 32..63 prefix, 64..95 A, 96..127 R, 128..159 S,
+;; 160..191 k mod L, 192..223 r mod L, 224..255 clamped scalar a, 256..319 message (input),
+;; 320..447 pack scratch, 448..511 hash output, 512..703 hash input. Workspace words 440..503 hold the
+;; 64-limb integer x of the reductions (the field code uses words below 432).
+(defn ld8 [buf at] (kernel-load-u8 (kernel-subregion buf 1024 at 1) 1 0))
+(defn st8 [buf at v]
+  (let [s (kernel-store-u8 (kernel-subregion buf 1024 at 1) 1 0 v)]
+    (+ 1 (* 0 s))))
+
+(defn copy-bytes [buf dst src n i]
+  (if (>= i n) 1
+    (let [s (st8 buf (+ dst i) (ld8 buf (+ src i)))]
+      (copy-bytes buf dst src n (+ i 1 (* 0 s))))))
+
+(defn asr [v k]
+  (- (u64-shift-right (+ v 4503599627370496) k) (i64-shift-left 1 (- 52 k))))
+
+(defn lc [j]
+  (case j 0 237 1 211 2 245 3 92 4 26 5 99 6 18 7 88 8 214 9 156 10 247 11 162 12 222 13 249 14 222 15 20 31 16 0))
+
+(defn xld [ws i] (gf/ld ws (+ 440 i)))
+(defn xst [ws i v] (gf/st ws (+ 440 i) v))
+
+;; x[0..63] := the 64 bytes at buf[at..]
+(defn x-from-buf [ws buf at i]
+  (if (= i 64) 1
+    (let [s (xst ws i (ld8 buf (+ at i)))]
+      (x-from-buf ws buf at (+ i 1 (* 0 s))))))
+
+;; x[0..31] := buf[at..]; x[32..63] := 0
+(defn x-from-scalar [ws buf at i]
+  (if (= i 64) 1
+    (let [s (xst ws i (if (< i 32) (ld8 buf (+ at i)) 0))]
+      (x-from-scalar ws buf at (+ i 1 (* 0 s))))))
+
+;; x[i + j] += k[i] * a[j]
+(defn muladd-inner [ws buf i j]
+  (if (= j 32) 1
+    (let [s (xst ws (+ i j) (+ (xld ws (+ i j)) (* (ld8 buf (+ 160 i)) (ld8 buf (+ 224 j)))))]
+      (muladd-inner ws buf i (+ j 1 (* 0 s))))))
+(defn muladd-outer [ws buf i]
+  (if (= i 32) 1
+    (let [r (muladd-inner ws buf i 0)]
+      (muladd-outer ws buf (+ i 1 (* 0 r))))))
+
+;; TweetNaCl modL, pass 1: for i = 63 down to 32
+(defn modl-inner [ws i j carry]
+  (if (= j (- i 12)) carry
+    (let [xj (+ (xld ws j) (- carry (* 16 (* (xld ws i) (lc (- j (- i 32)))))))
+          c (asr (+ xj 128) 8)
+          s (xst ws j (- xj (i64-shift-left c 8)))]
+      (modl-inner ws i (+ j 1 (* 0 s)) c))))
+(defn modl-outer [ws i]
+  (if (< i 32) 1
+    (let [c (modl-inner ws i (- i 32) 0)
+          s (xst ws (- i 12) (+ (xld ws (- i 12)) c))
+          z (xst ws i 0)]
+      (modl-outer ws (- i (+ 1 (* 0 (+ s z))))))))
+(defn modl-pass2 [ws j carry]
+  (if (= j 32) carry
+    (let [xj (+ (xld ws j) (- carry (* (asr (xld ws 31) 4) (lc j))))
+          c (asr xj 8)
+          s (xst ws j (bit-and xj 255))]
+      (modl-pass2 ws (+ j 1 (* 0 s)) c))))
+(defn modl-pass3 [ws j carry]
+  (if (= j 32) 1
+    (let [s (xst ws j (- (xld ws j) (* carry (lc j))))]
+      (modl-pass3 ws (+ j 1 (* 0 s)) carry))))
+(defn modl-pass4 [ws buf dst i]
+  (if (= i 32) 1
+    (let [s (xst ws (+ i 1) (+ (xld ws (+ i 1)) (asr (xld ws i) 8)))
+          o (st8 buf (+ dst i) (bit-and (xld ws i) 255))]
+      (modl-pass4 ws buf dst (+ i 1 (* 0 (+ s o)))))))
+
+;; reduce x (64 limbs) mod L into 32 bytes at buf[dst..]
+(defn mod-l [ws buf dst]
+  (let [p1 (modl-outer ws 63)
+        c (modl-pass2 ws 0 0)
+        p3 (modl-pass3 ws 0 c)
+        p4 (modl-pass4 ws buf dst 0)]
+    (+ 1 (* 0 (+ p1 (+ p3 p4))))))
+
+;; scalar words 272..303 := the 32 bytes at buf[at..]
+(defn scalar-from-buf [ws buf at i]
+  (if (= i 32) 1
+    (let [s (gf/st ws (+ 272 i) (ld8 buf (+ at i)))]
+      (scalar-from-buf ws buf at (+ i 1 (* 0 s))))))
+
+;; encode k*B for the scalar at buf[at..] into buf[dst..dst+31] (pack scratch at buf[320..447])
+(defn base-encode [ws buf at dst]
+  (let [sf (scalar-from-buf ws buf at 0)
+        enc (basemul-encode ws (kernel-subregion buf 1024 320 128))
+        cp (copy-bytes buf dst 320 32 0)]
+    (+ 1 (* 0 (+ sf (+ enc cp))))))
+
+;; hash buf[512 .. 512+n) into buf[448..511]
+(defn hash-input [ws buf n]
+  (sha/aiueos-sha512 (kernel-subregion buf 1024 512 n) n (kernel-subregion buf 1024 448 64) ws 4096))
+
+(defn sig-out [buf sig i]
+  (if (= i 64) 1
+    (let [s (kernel-store-u8 (kernel-subregion sig 64 i 1) 1 0 (ld8 buf (+ 96 i)))]
+      (sig-out buf sig (+ i 1 (* 0 s))))))
+
+(defn aiueos-ed25519-sign [buf :i64 msglen :i64 sig :i64 ws :i64] :i64
+  (let [sc (kernel-subregion ws 4096 0 4096)
+        h1 (sha/aiueos-sha512 (kernel-subregion buf 1024 0 32) 32 (kernel-subregion buf 1024 448 64) sc 4096)
+        pre (copy-bytes buf 32 480 32 0)
+        a0 (copy-bytes buf 224 448 32 0)
+        a1 (st8 buf 224 (bit-and (ld8 buf 224) 248))
+        a2 (st8 buf 255 (bit-or (bit-and (ld8 buf 255) 127) 64))
+        pa (base-encode sc buf 224 64)
+        i1 (copy-bytes buf 512 32 32 0)
+        i2 (copy-bytes buf 544 256 msglen 0)
+        h2 (hash-input sc buf (+ 32 msglen))
+        x1 (x-from-buf sc buf 448 0)
+        m1 (mod-l sc buf 192)
+        pr (base-encode sc buf 192 96)
+        j1 (copy-bytes buf 512 96 32 0)
+        j2 (copy-bytes buf 544 64 32 0)
+        j3 (copy-bytes buf 576 256 msglen 0)
+        h3 (hash-input sc buf (+ 64 msglen))
+        x2 (x-from-buf sc buf 448 0)
+        m2 (mod-l sc buf 160)
+        x3 (x-from-scalar sc buf 192 0)
+        ma (muladd-outer sc buf 0)
+        m3 (mod-l sc buf 128)
+        o1 (sig-out buf sig 0)]
+    (+ 1 (* 0 (+ h1 (+ pre (+ a0 (+ a1 (+ a2 (+ pa (+ i1 (+ i2 (+ h2 (+ x1 (+ m1 (+ pr (+ j1 (+ j2 (+ j3 (+ h3 (+ x2 (+ m2 (+ x3 (+ ma (+ m3 o1)))))))))))))))))))))))))
 
 (defn main [] :i64 0)
