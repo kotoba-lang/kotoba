@@ -65,6 +65,12 @@ def repository_bootstrap(amu, args):
         if not all(value is not None for value in supplied):
             raise ValueError("explicit Mac bootstrap requires four image/pin arguments")
         return None, None
+    if args.kernel_target != "x86_64-aiueos-kernel-v1":
+        raise ValueError(
+            "the repository bootstrap compiler only knows x86_64-aiueos-kernel-v1, whose "
+            "code limit (1,044,480 bytes) the desktop exceeds; pass --compiler-image/"
+            "--compiler-sha256/--packager-image/--packager-sha256 of a compiler that knows "
+            + args.kernel_target + ", or --kernel-target x86_64-aiueos-kernel-v1")
     descriptor_path = amu / "seed/bootstrap/aarch64-macos/root.json"
     descriptor_pin = verified_file(descriptor_path)
     descriptor = json.loads(descriptor_path.read_text())
@@ -153,7 +159,8 @@ def main(args):
             "build-kotoba-native-desktop.sh", "build-native-desktop-macos.py",
             "build-native-font-macos.py", "build-native-kernel-macos.py",
             "build-native-media-macos.py", "check-native-desktop-qemu.py",
-            "check-native-draft-restart-qemu.py",
+            "check-native-draft-restart-qemu.py", "check-native-consent-qemu.py",
+            "check-native-idle-silent-qemu.py",
             "check-native-media-format.py",
         )
     }
@@ -209,7 +216,6 @@ def main(args):
         kernel = output / "kernel"
         media = output / "media"
         guest = output / "qemu"
-        guest_iso = output / "qemu-iso"
         call("font", scripts["build-native-font-macos.py"], [
             "--amu-source", amu, "--compiler-image", compiler,
             "--compiler-sha256", args.compiler_sha256,
@@ -224,10 +230,12 @@ def main(args):
             raise ValueError("font build receipt mismatch")
 
         kernel_entry = ("workspace-entry.kotoba" if args.profile == "local-draft"
+                        else "consent-entry.kotoba" if args.profile == "consent"
                         else "desktop-entry.kotoba")
         call("kernel", scripts["build-native-kernel-macos.py"], [
             "--compiler-image", compiler, "--compiler-sha256", args.compiler_sha256,
             "--kernel-source", OS / "native" / kernel_entry,
+            "--kernel-target", args.kernel_target,
             "--fuel", FUEL, "--payload", padded,
             "--payload-sha256", font_state["padded"]["sha256"], "--output", kernel])
         kernel_state = json.loads((kernel / "build-state.json").read_text())
@@ -249,18 +257,16 @@ def main(args):
             "--output", media])
         media_state = json.loads((media / "native-media.json").read_text())
         disk = media / "awai-native.img"
-        iso = media / "awai-native.iso"
         if (media_state["state"] != "MACOS_NATIVE_MEDIA_CANDIDATE"
                 or media_state["compiler"] != compiler_pin
                 or media_state["packager"] != packager_pin
                 or media_state["efi"] != kernel_state["efi"]
-                or pin(disk) != media_state["image"]
-                or pin(iso) != media_state["iso"]
-                or media_state["independentISO"]["status"] !=
-                   "PASS_INDEPENDENT_NATIVE_EL_TORITO_ISO_READBACK"):
+                or pin(disk) != media_state["image"]):
             raise ValueError("media build receipt mismatch")
 
         guest_script = ("check-native-draft-restart-qemu.py" if args.profile == "local-draft"
+                        else "check-native-consent-qemu.py" if args.profile == "consent"
+                        else "check-native-idle-silent-qemu.py" if args.profile == "idle"
                         else "check-native-desktop-qemu.py")
         guest_args = [
             "--media", disk, "--efi", efi, "--kernel", image,
@@ -268,18 +274,26 @@ def main(args):
             "--output", guest]
         call("qemu", scripts[guest_script], guest_args)
         receipt_name = ("native-draft-restart.json" if args.profile == "local-draft"
+                        else "native-consent-qemu.json" if args.profile == "consent"
+                        else "native-idle-silent-qemu.json" if args.profile == "idle"
                         else "native-desktop-qemu.json")
         observed = json.loads((guest / receipt_name).read_text())
         expected_status = ("PASS_NATIVE_LOCAL_DRAFT_COLD_RESTORE" if args.profile == "local-draft"
+                           else "PASS_NATIVE_CONSENT_QEMU" if args.profile == "consent"
+                           else "PASS_NATIVE_IDLE_SILENT_QEMU" if args.profile == "idle"
                            else "PASS_NATIVE_DESKTOP_INPUT_QEMU")
-        expected_events = 12
+        expected_events = (12 if args.profile == "local-draft"
+                           else 11 if args.profile == "consent"
+                           else 4 if args.profile == "idle" else 12)
         if (observed["status"] != expected_status
                 or len(observed["events"]) != expected_events
                 or observed["kernel"] != kernel_state["kernel"]
                 or observed["efi"] != kernel_state["efi"]
                 or observed["media"] != media_state["image"]
                 or observed["firmware"] != firmware_pin
-                or observed["observer"] != script_pins[guest_script]):
+                or observed["observer"] != script_pins[guest_script]
+                or (args.profile == "desktop"
+                    and observed.get("layoutTable") != pin(OS / "native/layout-table.json"))):
             raise ValueError("QEMU guest observation is not bound to this build")
         if args.profile == "local-draft":
             if (not observed["nativeATACommit"] or not observed["coldProcessBoot"]
@@ -292,27 +306,28 @@ def main(args):
                            for shot in observed["visibleGoalScreenshots"]
                            for row in shot["glyphs"])):
                 raise ValueError("local-draft persistence verdict is incomplete")
+        elif args.profile == "idle":
+            if (observed["font"] != font_state["padded"]
+                    or observed["measuredGuestFramesAfterFirstFrame"] != 0
+                    or [row["name"] for row in observed["events"]] != [
+                        "first-frame", "idle", "control", "input"]
+                    or observed["events"][1]["newFrames"] != 0
+                    or observed["events"][2]["newFrames"] < 1
+                    or observed["physicalHardware"]):
+                raise ValueError("idle-silent verdict is incomplete")
+        elif args.profile == "consent":
+            if (observed["font"] != font_state["padded"]
+                    or [row["name"] for row in observed["events"]] != [
+                        "first-frame", "itonami-goal-typed", "collapse-key", "collapse-click",
+                        "consent-open",
+                        "launcher-key-ignored", "launcher-click-ignored", "key-deny",
+                        "pointer-deny", "esc-deny", "pointer-allow"]
+                    or observed["syntheticInputProvesHumanConsent"]):
+                raise ValueError("consent surface verdict is incomplete")
         elif (observed["font"] != font_state["padded"]
               or [row["codepoint"] for row in observed["renderedGoalGlyphs"]] != [97, 98]
               or any(row["inkPixels"] <= 0 for row in observed["renderedGoalGlyphs"])):
             raise ValueError("normal desktop visible Goal verdict is incomplete")
-        iso_observed = None
-        if args.profile == "desktop":
-            call("qemu-iso", scripts["check-native-desktop-qemu.py"], [
-                "--media", disk, "--iso", iso, "--efi", efi, "--kernel", image,
-                "--qemu", qemu, "--firmware", firmware, "--font", padded,
-                "--output", guest_iso])
-            iso_observed = json.loads((guest_iso / "native-desktop-qemu.json").read_text())
-            if (iso_observed["status"] != "PASS_NATIVE_DESKTOP_INPUT_QEMU"
-                    or len(iso_observed["events"]) != 12
-                    or iso_observed["kernel"] != kernel_state["kernel"]
-                    or iso_observed["efi"] != kernel_state["efi"]
-                    or iso_observed["iso"] != media_state["iso"]
-                    or iso_observed["independentISO"]["status"] !=
-                       "PASS_INDEPENDENT_NATIVE_EL_TORITO_ISO_READBACK"
-                    or iso_observed["observer"] != script_pins["check-native-desktop-qemu.py"]
-                    or [row["codepoint"] for row in iso_observed["renderedGoalGlyphs"]] != [97, 98]):
-                raise ValueError("ISO QEMU guest observation is not bound to this build")
         if (pin(compiler) != compiler_pin or pin(packager) != packager_pin
                 or (descriptor_pin is not None and
                     repository_bootstrap(amu, argparse.Namespace(
@@ -327,16 +342,21 @@ def main(args):
             raise ValueError("tool or source changed during integrated build")
         state.update(state=("MACOS_NATIVE_DRAFT_RESTORE_QEMU_CANDIDATE"
                             if args.profile == "local-draft"
+                            else "MACOS_NATIVE_CONSENT_QEMU_CANDIDATE" if args.profile == "consent"
+                            else "MACOS_NATIVE_IDLE_SILENT_QEMU_CANDIDATE" if args.profile == "idle"
                             else "MACOS_NATIVE_DESKTOP_QEMU_CANDIDATE"),
                      font=font_state["padded"], kernel=kernel_state["kernel"],
-                     efi=kernel_state["efi"], media=media_state["image"], iso=media_state["iso"],
+                     efi=kernel_state["efi"], media=media_state["image"],
                      guestEvents=len(observed["events"]),
                      guestInputQualified=True, nativeFormatEmission=True,
-                     isoBootQualified=iso_observed is not None,
                      localDraftRestoreQualified=args.profile == "local-draft",
                      qualification=("Mac native local-draft save and cold restore on QEMU"
                                     if args.profile == "local-draft"
-                                    else "Mac native GPT and EFI El Torito ISO QEMU desktop input")
+                                    else "Mac native consent surface (Allow, Deny, modal) on QEMU"
+                                    if args.profile == "consent"
+                                    else "Mac native idle desktop emits no guest frame on a captured virtual NIC (QEMU)"
+                                    if args.profile == "idle"
+                                    else "Mac native build and QEMU desktop input")
                      + "; D2 workspace, release and physical gates separate")
         save()
         print(state["state"], state["media"]["sha256"])
@@ -362,6 +382,15 @@ if __name__ == "__main__":
     parser.add_argument("--firmware", type=Path, required=True)
     parser.add_argument("--firmware-sha256", required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--profile", choices=("desktop", "local-draft"), default="desktop")
+    parser.add_argument("--profile", choices=("desktop", "local-draft", "consent", "idle"), default="desktop")
     parser.add_argument("--distribution", choices=("aiueos", "awai"), default="aiueos")
+    # kernel-v3 (RW at 0x400000) leaves the packager about 3 MiB of room (the compiler's
+    # text cap stays 2 MiB, native/layout-table.json) instead of kernel-v1's
+    # 1,044,480 bytes (the packager's bounded-ELF admission requires RX to end below
+    # RW). The desktop with the consent surface no longer fits v1, so v3 is the
+    # default. It needs a compiler image that knows the target; the repository
+    # bootstrap compiler is v1-only, so that route refuses v3 below.
+    parser.add_argument("--kernel-target",
+                        choices=("x86_64-aiueos-kernel-v1", "x86_64-aiueos-kernel-v3"),
+                        default="x86_64-aiueos-kernel-v3")
     main(parser.parse_args())
