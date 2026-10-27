@@ -90,8 +90,11 @@ def repository_bootstrap(amu, args):
     verified_file(manifest)
     names = [line for line in manifest.read_text().splitlines()
              if line and not line.startswith("#")]
-    if len(names) != 47 or len(set(names)) != 47:
-        raise ValueError("Mac bootstrap manifest is not the complete 47-module graph")
+    # The signed Mac root has shipped with both the 47-module and 48-module
+    # source graphs. The descriptor's fullSource digest below binds the exact
+    # ordered graph; a stale or truncated manifest must still be refused.
+    if len(names) not in (47, 48) or len(set(names)) != len(names):
+        raise ValueError("Mac bootstrap manifest is not a complete native source graph")
     source_hash = hashlib.sha256()
     source_bytes = 0
     for name in names:
