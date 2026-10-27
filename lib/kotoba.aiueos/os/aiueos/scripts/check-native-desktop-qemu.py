@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Observe native framebuffer/input on raw VM media; no rendering verdict shim."""
+"""Observe native framebuffer/input on GPT or EFI El Torito VM media."""
 import argparse,hashlib,importlib.util,json,os,re,select,struct,subprocess,time,zlib
 from pathlib import Path
 HERE=Path(__file__).resolve().parent
@@ -13,7 +13,7 @@ def ppm_png(source,target):
  target.write_bytes(b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('>IIBBBBB',w,h,8,2,0,0,0))+chunk(b'IDAT',zlib.compress(scan))+chunk(b'IEND',b''))
  assert len(set(pixels[i:i+3] for i in range(0,len(pixels),3)))>4
  return pixels
-def main(media,efi,kernel,font,qemu,firmware,out):
+def main(media,efi,kernel,font,qemu,firmware,out,iso=None):
  before=pin(media);image=kernel.read_bytes();font_data=font.read_bytes();assert efi.read_bytes().count(image)==1 and efi.read_bytes().count(font_data)==1
  glyph_count=struct.unpack_from('<I',font_data,8)[0]
  def glyph_index(cp):
@@ -25,9 +25,12 @@ def main(media,efi,kernel,font,qemu,firmware,out):
  # The page-table root is fixed by the kernel target's layout: kernel-v1 has RW at 0x200000, kernel-v3 at 0x400000. An unknown layout fails closed.
  cr3_offset=int(json.loads((HERE.parent/'native'/'layout-table.json').read_text())['rungs'][hex(context)]['pageTableRootOffset'],16)
  spec=importlib.util.spec_from_file_location('reader',HERE/'check-native-media-format.py');reader=importlib.util.module_from_spec(spec);spec.loader.exec_module(reader);format_proof=reader.verify(media,efi)
+ iso_proof=reader.verify_iso(iso,media,efi) if iso else None
+ iso_before=pin(iso) if iso else None
  out.mkdir(parents=True,exist_ok=False)
  args=[str(qemu),'-machine','q35,accel=tcg','-cpu','max','-m','128M','-smp','1','-drive',f'if=pflash,format=raw,readonly=on,file={firmware}',
-       '-drive',f'file={media},format=raw,if=ide,snapshot=on','-boot','order=c','-nic','none','-display','none','-no-reboot',
+       '-drive',(f'file={iso},format=raw,if=ide,media=cdrom,readonly=on' if iso else f'file={media},format=raw,if=ide,snapshot=on'),
+       '-boot',('order=d' if iso else 'order=c'),'-nic','none','-display','none','-no-reboot',
        '-serial','file:serial.log','-debugcon','file:debug.log','-qmp','stdio','-d','int','-D','exceptions.log']
  (out/'command.json').write_text(json.dumps(args,indent=2)+'\n');log=open(out/'qemu.log','wb')
  p=subprocess.Popen(args,cwd=out,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=log,bufsize=0)
@@ -136,7 +139,9 @@ def main(media,efi,kernel,font,qemu,firmware,out):
   key('esc');closed=wait('keyboard-closes-focused-card',lambda s:s['windows']==1 and s['lastKey']==1 and s['framesCompleted']>released['framesCompleted'])
   final=screenshot('desktop-after-input');assert first!=final
   assert pin(media)==before
-  report=dict(status='PASS_NATIVE_DESKTOP_INPUT_QEMU',layoutTable=pin(HERE.parent/'native'/'layout-table.json'),kernel=pin(kernel),efi=pin(efi),media=before,font=pin(font),firmware=pin(firmware),observer=pin(Path(__file__)),independentMedia=format_proof,events=events,renderedGoalGlyphs=visual_glyphs,initialFuelRemaining=initial_fuel,sealedGop=dict(base=base,bytes=size,width=width,height=height,stride=stride,format=fmt,pciBarContained=True),screenshots=['desktop-initial.png','itonami-goal-a.png','itonami-goal-ab.png','desktop-after-input.png'],guestEmulation='QEMU TCG',blockDevice='q35 SATA with temporary overlay',privatePageTables=True,currentDomain=73,nativeCDCI=False,BrowserCSSOMParity=False,dappsExecuted=False,preemptiveScheduler=False,completeKernel=False,physicalHardware=False)
+  if iso:assert pin(iso)==iso_before
+  report=dict(status='PASS_NATIVE_DESKTOP_INPUT_QEMU',layoutTable=pin(HERE.parent/'native'/'layout-table.json'),kernel=pin(kernel),efi=pin(efi),media=before,font=pin(font),firmware=pin(firmware),observer=pin(Path(__file__)),independentMedia=format_proof,events=events,renderedGoalGlyphs=visual_glyphs,initialFuelRemaining=initial_fuel,sealedGop=dict(base=base,bytes=size,width=width,height=height,stride=stride,format=fmt,pciBarContained=True),screenshots=['desktop-initial.png','itonami-goal-a.png','itonami-goal-ab.png','desktop-after-input.png'],guestEmulation='QEMU TCG',blockDevice=('q35 virtual optical EFI El Torito' if iso else 'q35 SATA with temporary overlay'),privatePageTables=True,currentDomain=73,nativeCDCI=False,BrowserCSSOMParity=False,dappsExecuted=False,preemptiveScheduler=False,completeKernel=False,physicalHardware=False)
+  if iso:report.update(iso=iso_before,independentISO=iso_proof)
   (out/'native-desktop-qemu.json').write_text(json.dumps(report,indent=2)+'\n');print(report['status'])
  finally:
   if p.poll() is None:
@@ -150,4 +155,5 @@ def main(media,efi,kernel,font,qemu,firmware,out):
 if __name__=='__main__':
  p=argparse.ArgumentParser()
  for n in ['media','efi','kernel','font','qemu','firmware','output']:p.add_argument('--'+n,type=Path,required=True)
- a=p.parse_args();main(*(getattr(a,n).resolve() for n in ['media','efi','kernel','font','qemu','firmware','output']))
+ p.add_argument('--iso',type=Path)
+ a=p.parse_args();main(*(getattr(a,n).resolve() for n in ['media','efi','kernel','font','qemu','firmware','output']),a.iso.resolve() if a.iso else None)
