@@ -65,6 +65,12 @@ def repository_bootstrap(amu, args):
         if not all(value is not None for value in supplied):
             raise ValueError("explicit Mac bootstrap requires four image/pin arguments")
         return None, None
+    if args.kernel_target != "x86_64-aiueos-kernel-v1":
+        raise ValueError(
+            "the repository bootstrap compiler only knows x86_64-aiueos-kernel-v1, whose "
+            "code limit (1,044,480 bytes) the desktop exceeds; pass --compiler-image/"
+            "--compiler-sha256/--packager-image/--packager-sha256 of a compiler that knows "
+            + args.kernel_target + ", or --kernel-target x86_64-aiueos-kernel-v1")
     descriptor_path = amu / "seed/bootstrap/aarch64-macos/root.json"
     descriptor_pin = verified_file(descriptor_path)
     descriptor = json.loads(descriptor_path.read_text())
@@ -227,6 +233,7 @@ def main(args):
         call("kernel", scripts["build-native-kernel-macos.py"], [
             "--compiler-image", compiler, "--compiler-sha256", args.compiler_sha256,
             "--kernel-source", OS / "native" / kernel_entry,
+            "--kernel-target", args.kernel_target,
             "--fuel", FUEL, "--payload", padded,
             "--payload-sha256", font_state["padded"]["sha256"], "--output", kernel])
         kernel_state = json.loads((kernel / "build-state.json").read_text())
@@ -341,4 +348,12 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--profile", choices=("desktop", "local-draft"), default="desktop")
     parser.add_argument("--distribution", choices=("aiueos", "awai"), default="aiueos")
+    # kernel-v3 (RW at 0x400000) leaves about 3 MiB for code instead of kernel-v1's
+    # 1,044,480 bytes (the packager's bounded-ELF admission requires RX to end below
+    # RW). The desktop with the consent surface no longer fits v1, so v3 is the
+    # default. It needs a compiler image that knows the target; the repository
+    # bootstrap compiler is v1-only, so that route refuses v3 below.
+    parser.add_argument("--kernel-target",
+                        choices=("x86_64-aiueos-kernel-v1", "x86_64-aiueos-kernel-v3"),
+                        default="x86_64-aiueos-kernel-v3")
     main(parser.parse_args())

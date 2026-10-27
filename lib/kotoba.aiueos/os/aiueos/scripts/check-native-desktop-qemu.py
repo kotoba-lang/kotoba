@@ -22,6 +22,8 @@ def main(media,efi,kernel,font,qemu,firmware,out):
   return matches[0]
  goal_glyphs={cp:glyph_index(ord(cp)) for cp in ('a','b')}
  rw=struct.unpack_from('<IIQQQQQQ',image,120);context=rw[3];assert rw[5]==0x240000
+ # The page-table root is fixed by the kernel target's layout: kernel-v1 has RW at 0x200000, kernel-v3 at 0x400000. An unknown layout fails closed.
+ cr3_offset={0x200000:0x30000,0x400000:0x130000}[context]
  spec=importlib.util.spec_from_file_location('reader',HERE/'check-native-media-format.py');reader=importlib.util.module_from_spec(spec);spec.loader.exec_module(reader);format_proof=reader.verify(media,efi)
  out.mkdir(parents=True,exist_ok=False)
  args=[str(qemu),'-machine','q35,accel=tcg','-cpu','max','-m','128M','-smp','1','-drive',f'if=pflash,format=raw,readonly=on,file={firmware}',
@@ -104,7 +106,7 @@ def main(media,efi,kernel,font,qemu,firmware,out):
   assert 2**52<=initial_fuel<=2**53-1,('desktop fuel too short for interaction',initial_fuel)
   registers=hmp('info registers');(out/'registers-native-desktop.txt').write_text(registers)
   reg=lambda name:int(re.search(rf'\b{name}\s*=([0-9a-f]+)',registers,re.I)[1],16)
-  assert reg('CR3')==context+0x30000 and reg('CR0')&0x10000 and reg('EFER')&0x801==0x801
+  assert reg('CR3')==context+cr3_offset and reg('CR0')&0x10000 and reg('EFER')&0x801==0x801
   assert re.search(r'\bCPL=0\b',registers) and struct.unpack('<Q',dump(context+480,8,'current-domain.bin'))[0]==73
   gop=struct.unpack('<8Q',dump(context+30416,64,'sealed-gop.bin'));base,size,width,height,stride,fmt,ready,font_base=gop
   assert ready==0x31504f47 and width==initial['width'] and height==initial['height'] and stride>=width and fmt in (0,1)
