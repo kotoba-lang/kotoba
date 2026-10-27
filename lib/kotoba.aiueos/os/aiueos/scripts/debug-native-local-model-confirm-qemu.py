@@ -316,7 +316,9 @@ def main():
                 if layout_v2:
                     assert (after["ticketMagic"], after["ticketDomain"],
                             after["ticketProcess"], after["ticketGeneration"],
-                            after["ticketModel"]) == (0, 73, code, 1, 1), after
+                            after["ticketModel"]) == (0, 0, 0, 0, 0), after
+                    assert ((directory / "desktop-context.bin").read_bytes()[384:456]
+                            == bytes(72)), "host retained consumed ticket bytes"
                     assert after["generation"] == 2
                     assert after["title"] == "Itonami demo " + chr(expected_token)
                     result_visible = base.screenshot(
