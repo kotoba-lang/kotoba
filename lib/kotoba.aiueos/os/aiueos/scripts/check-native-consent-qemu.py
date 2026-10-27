@@ -132,11 +132,30 @@ def main(args):
         send("sendkey esc", 1.5)
         assert W(87) == 0 and S(2039) == 0 and W(88) == 0 and W(85) == 0
         event("esc-deny", approved=W(88))
-        # Allow button approves exactly as Y does: pending 0, approved 1, loop stop 1
+        # Allow button approves exactly as Y does: pending 0, approved 1, loop stop 1.
+        # Word 2039 keeps the Allow count in bits 1 and up (W2): the home line
+        # "Approved: n" changes only in its digit, and only after an Allow.
+        move_to(px + 24 + 70, py + 164 + 18)
+        before_allow = screenshot("before-allow")
+        assert S(2039) == 0
         send("sendkey ret", 1.5); assert W(87) == 1 and S(2039) == 1
         move_to(px + 24 + 70, py + 164 + 18); click()
-        assert W(87) == 0 and S(2039) == 0 and W(88) == 1 and W(85) == 1
-        event("pointer-allow", pending=W(87), approved=W(88), stop=W(85))
+        assert W(87) == 0 and S(2039) == 2 and W(88) == 1 and W(85) == 1
+        after_allow = screenshot("after-allow")
+        w0, h0, p0 = before_allow
+        assert (w0, h0) == after_allow[:2]
+        # The Approved line of the Itonami home sits at body y + 100 + 20*2 =
+        # window y + 28 + ...; compare only the band under the goal field
+        # (x 180..300, y 180..205 in the 1280x800 desktop). Allow also retitles
+        # the window, so the whole-frame difference is larger than the digit.
+        def band(raw):
+            return [raw[2][3 * (y * raw[0] + x):3 * (y * raw[0] + x) + 3]
+                    for y in range(180, 205) for x in range(180, 300)]
+        assert band(before_allow) != band(after_allow), "the Approved digit did not change after Allow"
+        changed_cols = sorted({i % 120 for i, (u, v) in enumerate(zip(band(before_allow), band(after_allow))) if u != v})
+        assert changed_cols and min(changed_cols) >= 80 and max(changed_cols) - min(changed_cols) < 10, changed_cols
+        event("pointer-allow", pending=W(87), approved=W(88), stop=W(85),
+              approvedCount=S(2039) // 2, changedColumns=[changed_cols[0] + 180, changed_cols[-1] + 180])
     finally:
         try: send("quit", 0.5)
         except Exception: pass
