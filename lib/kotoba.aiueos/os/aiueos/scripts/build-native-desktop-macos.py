@@ -310,7 +310,8 @@ def main(args):
         expected_events = (12 if args.profile == "local-draft"
                            else 12 if args.profile == "consent"
                            else 4 if args.profile == "idle"
-                           else 2 if args.profile in ("cid", "sha512", "gf25519", "ed25519") else 12)
+                           else 3 if args.profile == "ed25519"
+                           else 2 if args.profile in ("cid", "sha512", "gf25519") else 12)
         if (observed["status"] != expected_status
                 or len(observed["events"]) != expected_events
                 or observed["kernel"] != kernel_state["kernel"]
@@ -361,9 +362,10 @@ def main(args):
                 raise ValueError("gf25519 verdict is incomplete")
         elif args.profile == "ed25519":
             if (observed["font"] != font_state["padded"]
-                    or [row["name"] for row in observed["events"]] != ["first-frame", "ed25519-pubkey"]
+                    or [row["name"] for row in observed["events"]] != ["first-frame", "ed25519-pubkey", "ed25519-sign"]
                     or len(observed["events"][1]["keys"]) != 3
-                    or observed["signing"] or observed["deviceKey"] or observed["physicalHardware"]):
+                    or len(observed["events"][2]["signatures"]) != 3
+                    or not observed["signing"] or observed["deviceKey"] or observed["physicalHardware"]):
                 raise ValueError("ed25519 verdict is incomplete")
         elif args.profile == "consent":
             if (observed["font"] != font_state["padded"]
