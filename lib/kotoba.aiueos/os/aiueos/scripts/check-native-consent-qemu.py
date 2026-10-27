@@ -70,6 +70,12 @@ def main(args):
             time.sleep(2)
         assert W(79) >= 1, "no first frame"
         event("first-frame", frames=W(79))
+        # W3a: word 90 reports the CPU's entropy instructions (QEMU -cpu max has both); availability only,
+        # no entropy is drawn because the compiler has no RDRAND/RDSEED intrinsic yet.
+        entropy = W(90)
+        assert entropy == 7, hex(entropy)
+        event("entropy-probe", flags=entropy, rdrand=bool(entropy & 1), rdseed=bool(entropy & 2),
+              leaf7=bool(entropy & 4), drawn=False)
         send("sendkey 2", 1.5); send("sendkey a", 1.5)
         assert S(1) == 1 and S(2) == 2 and S(2038) == 13, (S(1), S(2), S(2038))
         event("itonami-goal-typed", goalLength=S(2038))
