@@ -1,0 +1,742 @@
+(ns inga.state-test
+  "F1's acceptance criterion, stated by ADR-2608038000 as: four replicas reach
+  the same CID, AND the state hydrated from that CID is queryable with
+  Datalog. The second half is the whole point — same-digest was already
+  achievable and was not enough.
+
+  ## Why half of this file is written twice
+
+  `arrangement/commit!` returns a CID on the JVM and a `js/Promise` on
+  ClojureScript, and `restore` likewise. Tests that assume the synchronous
+  shape PASS on the JVM and are silent about the runtime kotobase actually
+  deploys on — which is the exact failure `inga.parity` exists to prevent, so
+  writing these once and only running them on the JVM would have been the same
+  mistake in a different file.
+
+  Every test that touches `root-fn` or `hydrate-fn` therefore appears in both
+  arms: synchronous on `:clj`, `cljs.test/async` on `:cljs`. The assertions are
+  the same ones; only the awaiting differs, exactly as it does for a caller.
+
+  Where this lands in production: `inga.replica/state-root` is REPORTING, not
+  a consensus decision — no adopt or commit path reads it — so a Promise there
+  is a caller's `await`, not a protocol break. That is why this split is
+  liveable rather than a defect."
+  (:require [kotoba.test :refer [deftest is testing]]
+            #?(:cljs [kotoba.test :refer [async]])
+            [ipld.core :as ipld]
+            [inga.fuel :as fuel]
+            [inga.state :as state]))
+
+;; A shared content-addressed block store. Replicas write into the SAME store
+;; because that is the real topology: blocks are immutable and CID-addressed,
+;; so two replicas producing the same block produce the same bytes at the same
+;; address, and the store cannot tell (or care) which of them wrote it.
+(defn- store [] (atom {}))
+
+;; arrangement's platform split is not only in what it RETURNS: on cljs it also
+;; expects `blind-fn`/`encrypt-fn`/`decrypt-fn` to return Promises. Discovered
+;; the only way it can be -- by running the cljs build, which failed inside
+;; arrangement with `.then is not a function` while the JVM suite was green.
+(def blind #?(:clj pr-str :cljs (fn [x] (js/Promise.resolve (pr-str x)))))
+(def crypt #?(:clj identity :cljs (fn [b] (js/Promise.resolve b))))
+(def uncrypt crypt)
+
+(defn- machine-on
+  ([blocks] (machine-on blocks nil))
+  ([blocks emit-fn]
+   (state/machine
+    {:emit-fn emit-fn
+     :decode-block identity           ; a block IS its op list in these tests
+    :put! (fn [cid bytes] (swap! blocks assoc cid bytes))
+    :get-fn (fn [cid] (get @blocks cid))
+    ;; blind-fn/encrypt-fn are arrangement's required keyed-MAC and AEAD
+    ;; seams. Identity-shaped stand-ins here: what F1 is about is the ROOT
+    ;; being content-addressed and restorable, and a real MAC would not make
+    ;; that sharper. arrangement requires them precisely so no caller gets an
+    ;; unblinded index by forgetting an argument, which is why they are passed
+    ;; explicitly rather than defaulted.
+     :blind-fn blind
+     :encrypt-fn crypt})))
+
+(def ops-a [{:op :assert :s "alice" :p "role" :o "witness"}
+            {:op :assert :s "alice" :p "stake" :o 100}
+            {:op :assert :s "bob" :p "role" :o "witness"}])
+(def ops-b [{:op :assert :s "bob" :p "stake" :o 50}
+            {:op :retract :s "alice" :p "stake" :o 100}
+            {:op :assert :s "alice" :p "stake" :o 120}])
+
+(defn- run [machine blocks-seq]
+  (reduce (:apply-fn machine) ((:init-fn machine)) blocks-seq))
+
+;; `settle` is how a caller gets a CID out of arrangement on either runtime.
+;; It is not a shim that hides the difference — the :cljs arm is a real await,
+;; and the tests below still have to say `async done`.
+#?(:cljs
+   (defn- settle [xs f] (-> (js/Promise.all (clj->js xs)) (.then #(f (vec %))))))
+
+(defn- roots-of [ms-and-blocks]
+  (mapv (fn [[m bs]] ((:root-fn m) (run m bs))) ms-and-blocks))
+
+;; ── the same CID from independent runs ───────────────────────────────────────
+
+(defn- same-cid-assertions [roots]
+  (is (= 1 (count (set roots)))
+      "four independent runs of the same committed prefix produce one root")
+  (is (string? (first roots)))
+  (is (re-find #"^b" (first roots))
+      "and it is a CIDv1 base32 string, not a digest of our own invention"))
+
+(deftest four-replicas-reach-the-same-cid
+  (let [blocks (store)
+        rs (roots-of (repeatedly 4 (fn [] [(machine-on blocks) [ops-a ops-b]])))]
+    #?(:clj (same-cid-assertions rs)
+       :cljs (async done (settle rs (fn [cids] (same-cid-assertions cids) (done)))))))
+
+(deftest the-root-is-a-function-of-the-data-not-the-traversal
+  (testing "the same facts asserted in a different order commit to one root"
+    (let [blocks (store)
+          rs (roots-of [[(machine-on blocks) [ops-a]]
+                        [(machine-on blocks) [(vec (reverse ops-a))]]])
+          check (fn [[forward shuffled]]
+                  (is (= forward shuffled) "content-addressed means addressed by content"))]
+      #?(:clj (check rs)
+         :cljs (async done (settle rs (fn [cids] (check cids) (done))))))))
+
+(deftest a-different-prefix-produces-a-different-root
+  (let [blocks (store)
+        rs (roots-of [[(machine-on blocks) [ops-a]]
+                      [(machine-on blocks) [ops-a ops-b]]])
+        check (fn [[a b]]
+                (is (not= a b) "otherwise the root would not be checking anything"))]
+    #?(:clj (check rs)
+       :cljs (async done (settle rs (fn [cids] (check cids) (done)))))))
+
+;; ── the half an opaque digest could never do ─────────────────────────────────
+
+(defn- query-assertions [restored]
+  (is (= #{["alice"] ["bob"]}
+         (state/query restored {:find '[?s] :where '[[?s "role" "witness"]]}))
+      "the state four replicas agreed on is queryable by a party that only had the CID")
+  (is (= #{[120]}
+         (state/query restored {:find '[?v] :where '[["alice" "stake" ?v]]}))
+      "and the retraction in the second block is reflected"))
+
+(deftest the-agreed-root-hydrates-and-answers-datalog
+  (let [blocks (store)
+        m (machine-on blocks)
+        root ((:root-fn m) (run m [ops-a ops-b]))]
+    ;; A cold reader: it has the CID and the block store, and nothing else --
+    ;; no in-memory state carried over from the run.
+    #?(:clj (query-assertions ((:hydrate-fn m) root uncrypt))
+       :cljs (async done
+               (-> (js/Promise.resolve root)
+                   (.then (fn [cid] ((:hydrate-fn m) cid uncrypt)))
+                   (.then (fn [restored] (query-assertions restored) (done))))))))
+
+;; ── F2 wired into F1: exhaustion must change the root ────────────────────────
+
+(defn- metered-machine [blocks budget]
+  (state/machine
+   {:decode-block :ops
+    :put! (fn [cid bytes] (swap! blocks assoc cid bytes))
+    :get-fn (fn [cid] (get @blocks cid))
+    :blind-fn blind
+    :encrypt-fn crypt
+    :fuel {:budget-fn (constantly budget)
+           :cost-fn (fuel/fixed-cost 1)
+           :height-fn :height}}))
+
+(def big-block {:height 1 :ops ops-a})
+
+(defn- metered-root [blocks budget]
+  (let [m (metered-machine blocks budget)]
+    ((:root-fn m) ((:apply-fn m) ((:init-fn m)) big-block))))
+
+(deftest fuel-exhaustion-changes-the-root
+  (testing "the property the whole wiring exists for -- a fuel ledger kept
+            outside the db would leave two replicas that stopped at different
+            ops producing identical CIDs, which would look like agreement"
+    (let [blocks (store)
+          rs [(metered-root blocks 100) (metered-root blocks 1)]
+          check (fn [[generous starved]]
+                  (is (not= generous starved)
+                      "a replica that ran out is visibly a different state, not a silent one"))]
+      #?(:clj (check rs)
+         :cljs (async done (settle rs (fn [cids] (check cids) (done))))))))
+
+(deftest the-same-budget-still-agrees
+  (let [blocks (store)
+        rs (vec (repeatedly 4 #(metered-root blocks 2)))
+        check (fn [cids] (is (= 1 (count (set cids))) "metering does not cost determinism"))]
+    #?(:clj (check rs)
+       :cljs (async done (settle rs (fn [cids] (check cids) (done)))))))
+
+(defn- exhaustion-assertions [restored]
+  (is (= #{[2]} (state/query restored
+                             {:find '[?i]
+                              :where '[["inga.fuel/block/1" "inga.fuel/exhausted-at" ?i]]}))
+      "a reader holding only the CID can see where this block ran out")
+  (is (= #{[1]} (state/query restored
+                             {:find '[?n]
+                              :where '[["inga.fuel/block/1" "inga.fuel/dropped" ?n]]}))))
+
+(deftest the-fuel-record-is-queryable-from-the-cid
+  (let [blocks (store)
+        m (metered-machine blocks 2)
+        root ((:root-fn m) ((:apply-fn m) ((:init-fn m)) big-block))]
+    #?(:clj (exhaustion-assertions ((:hydrate-fn m) root uncrypt))
+       :cljs (async done
+               (-> (js/Promise.resolve root)
+                   (.then (fn [cid] ((:hydrate-fn m) cid uncrypt)))
+                   (.then (fn [restored] (exhaustion-assertions restored) (done))))))))
+
+(defn- clean-block-assertions [restored]
+  (is (= #{} (state/query restored
+                          {:find '[?i]
+                           :where '[["inga.fuel/block/1" "inga.fuel/exhausted-at" ?i]]})))
+  (is (= #{[3]} (state/query restored
+                             {:find '[?n]
+                              :where '[["inga.fuel/block/1" "inga.fuel/applied" ?n]]}))))
+
+(deftest a-block-that-finished-writes-no-exhaustion-datom
+  (testing "an explicit exhausted-at = -1 per block would put a datom into a
+            content-addressed index forever to record that nothing happened"
+    (let [blocks (store)
+          m (metered-machine blocks 100)
+          root ((:root-fn m) ((:apply-fn m) ((:init-fn m)) big-block))]
+      #?(:clj (clean-block-assertions ((:hydrate-fn m) root uncrypt))
+         :cljs (async done
+                 (-> (js/Promise.resolve root)
+                     (.then (fn [cid] ((:hydrate-fn m) cid uncrypt)))
+                     (.then (fn [restored] (clean-block-assertions restored) (done)))))))))
+
+;; ── structural, and identical on both runtimes ───────────────────────────────
+
+(deftest opaque-roots-stay-legal-but-cannot-back-a-kotobase-ref
+  (let [opaque (state/opaque-machine
+                {:init-fn (constantly 0)
+                 :apply-fn (fn [s _] (inc s))
+                 :root-fn (fn [s] (str "digest-" s))})]
+    (testing "an opaque machine is a normal machine"
+      (is (= 2 (reduce (:apply-fn opaque) ((:init-fn opaque)) [:a :b])))
+      (is (false? (state/hydratable? opaque))))
+    (testing "but the gate refuses it, so ADR-2608038000 D6's ordering is enforced by code"
+      (is (thrown? #?(:clj Exception :cljs js/Error)
+                   (state/assert-hydratable! opaque))))
+    (testing "and passes a cid machine"
+      (let [m (machine-on (store))]
+        (is (state/hydratable? m))
+        (is (identical? m (state/assert-hydratable! m)))))))
+
+(deftest a-machine-cannot-be-built-with-a-missing-seam
+  (is (thrown? #?(:clj Exception :cljs js/Error)
+               (state/machine {:decode-block identity :put! (fn [_ _])}))))
+
+(deftest init-is-a-thunk-so-replicas-never-share-state
+  (testing "engi ADR-2608022600: a shared ready-made machine value made four
+            replicas agree on blocks and differ by 200 resting orders"
+    (let [m (machine-on (store))]
+      (is (not (identical? ((:init-fn m)) ((:init-fn m))))
+          "each replica gets its own initial state"))))
+
+(deftest fuel-config-must-be-complete
+  (is (thrown? #?(:clj Exception :cljs js/Error)
+               (state/machine {:decode-block identity :put! (fn [_ _]) :get-fn identity
+                               :blind-fn blind :encrypt-fn crypt
+                               :fuel {:budget-fn (constantly 1)}}))))
+
+;; ── two roots (ADR-2608059000) ───────────────────────────────────────────────
+;;
+;; The acceptance criterion the ADR states for this step is that four replicas
+;; reach the same StateRoot CID AND the datom half still answers Datalog from
+;; that CID -- F1's criterion, not regressed by the actor tree being added
+;; beside it. The test that carries the most weight, though, is
+;; `actors-are-covered-by-the-root`: if the actor tree were built but not
+;; committed into the root node, every other test here would still pass.
+
+;; `ipld/link` demands a real CID -- it accepts any string and fails later,
+;; inside the base32 decoder. These are computed rather than typed so the
+;; tests exercise the encoding a caller will actually hit.
+(def code-cid (ipld/cid (ipld/encode {"definition" "transfer/v1"})))
+(def state-cid (ipld/cid (ipld/encode {"balance-sheet" 1})))
+
+(def actor-ops-a
+  [{:op :actor-put :address "alice"
+    :actor {:code code-cid :state state-cid :nonce 1 :balance 100}}
+   {:op :actor-put :address "bob" :actor {:nonce 0 :balance 50}}])
+
+(defn- root-node [blocks cid]
+  (ipld/get-node (fn [c] (get @blocks c)) cid))
+
+(defn- two-root-assertions [blocks root]
+  (let [node (root-node blocks root)]
+    (is (some? node) "the state root is a block in the store")
+    (is (= 1 (get node "schema-version")))
+    (testing "both children are present and are real tag-42 links"
+      (is (some? (ipld/link-cid (get node "actors"))))
+      (is (some? (ipld/link-cid (get node "datoms")))))
+    (testing "and they are siblings -- neither is reachable only through the other"
+      (is (not= (ipld/link-cid (get node "actors"))
+                (ipld/link-cid (get node "datoms")))))))
+
+(deftest the-state-root-has-two-children
+  (let [blocks (store)
+        m (machine-on blocks)
+        root ((:root-fn m) (run m [ops-a actor-ops-a]))]
+    #?(:clj (two-root-assertions blocks root)
+       :cljs (async done
+               (-> (js/Promise.resolve root)
+                   (.then (fn [cid] (two-root-assertions blocks cid) (done))))))))
+
+(deftest actors-are-covered-by-the-root
+  (testing "identical datoms, different actors -- the roots must differ"
+    (let [blocks (store)
+          rs (roots-of [[(machine-on blocks) [ops-a actor-ops-a]]
+                        [(machine-on blocks) [ops-a [{:op :actor-put :address "alice"
+                                                      :actor {:nonce 1 :balance 999}}
+                                                     {:op :actor-put :address "bob"
+                                                      :actor {:nonce 0 :balance 50}}]]]])
+          check (fn [[a b]]
+                  (is (not= a b)
+                      "otherwise the actor tree is built and then thrown away"))]
+      #?(:clj (check rs)
+         :cljs (async done (settle rs (fn [cids] (check cids) (done))))))))
+
+(deftest four-replicas-reach-the-same-two-root-cid
+  (let [blocks (store)
+        rs (roots-of (repeatedly 4 (fn [] [(machine-on blocks) [ops-a actor-ops-a]])))]
+    #?(:clj (same-cid-assertions rs)
+       :cljs (async done (settle rs (fn [cids] (same-cid-assertions cids) (done)))))))
+
+(defn- both-halves-assertions [restored]
+  (testing "the datom half still answers Datalog -- F1 not regressed"
+    (is (= #{["alice"] ["bob"]}
+           (state/query restored {:find '[?s] :where '[[?s "role" "witness"]]}))))
+  (testing "and the actor half came back too"
+    (is (= {:code code-cid :state state-cid :nonce 1 :balance 100}
+           (get (state/actors restored) "alice")))
+    (is (= {:code nil :state nil :nonce 0 :balance 50}
+           (get (state/actors restored) "bob")))))
+
+(deftest a-cold-reader-with-only-the-cid-gets-both-halves
+  (let [blocks (store)
+        m (machine-on blocks)
+        root ((:root-fn m) (run m [ops-a actor-ops-a]))]
+    #?(:clj (both-halves-assertions ((:hydrate-fn m) root uncrypt))
+       :cljs (async done
+               (-> (js/Promise.resolve root)
+                   (.then (fn [cid] ((:hydrate-fn m) cid uncrypt)))
+                   (.then (fn [restored] (both-halves-assertions restored) (done))))))))
+
+(deftest actor-at-reads-one-actor-without-hydrating-the-rest
+  (let [blocks (store)
+        m (machine-on blocks)
+        root ((:root-fn m) (run m [actor-ops-a]))
+        get-fn (fn [c] (get @blocks c))
+        check (fn [cid]
+                (let [actors-cid (ipld/link-cid (get (root-node blocks cid) "actors"))]
+                  (is (= {:code nil :state nil :nonce 0 :balance 50}
+                         (state/actor-at get-fn actors-cid "bob")))
+                  (is (nil? (state/actor-at get-fn actors-cid "nobody")))))]
+    #?(:clj (check root)
+       :cljs (async done (-> (js/Promise.resolve root)
+                             (.then (fn [cid] (check cid) (done))))))))
+
+;; ── emission: the source-to-projection direction ─────────────────────────────
+
+(defn- projection-assertions [restored]
+  (testing "the CURRENT balance is what pos answers, not every balance ever"
+    (is (= #{[90]}
+           (state/query restored {:find '[?v] :where '[["alice" "inga.actor/balance" ?v]]}))
+        "the retraction in default-emit is the load-bearing half"))
+  (testing "and the actor tree agrees with its own projection"
+    (is (= 90 (:balance (get (state/actors restored) "alice"))))))
+
+(deftest default-emit-projects-the-current-state-not-its-history
+  (let [blocks (store)
+        m (machine-on blocks state/default-emit)
+        root ((:root-fn m)
+              (run m [[{:op :actor-put :address "alice" :actor {:nonce 1 :balance 100}}]
+                      [{:op :actor-put :address "alice" :actor {:nonce 2 :balance 90}}]]))]
+    #?(:clj (projection-assertions ((:hydrate-fn m) root uncrypt))
+       :cljs (async done
+               (-> (js/Promise.resolve root)
+                   (.then (fn [cid] ((:hydrate-fn m) cid uncrypt)))
+                   (.then (fn [restored] (projection-assertions restored) (done))))))))
+
+(defn- delete-assertions [restored]
+  (is (nil? (get (state/actors restored) "alice")) "gone from the source")
+  (is (empty? (state/query restored
+                           {:find '[?v] :where '[["alice" "inga.actor/balance" ?v]]}))
+      "and gone from the projection"))
+
+(deftest actor-delete-removes-from-both-roots
+  (let [blocks (store)
+        m (machine-on blocks state/default-emit)
+        root ((:root-fn m)
+              (run m [[{:op :actor-put :address "alice" :actor {:nonce 1 :balance 100}}]
+                      [{:op :actor-delete :address "alice"}]]))]
+    #?(:clj (delete-assertions ((:hydrate-fn m) root uncrypt))
+       :cljs (async done
+               (-> (js/Promise.resolve root)
+                   (.then (fn [cid] ((:hydrate-fn m) cid uncrypt)))
+                   (.then (fn [restored] (delete-assertions restored) (done))))))))
+
+(defn- no-emit-assertions [restored]
+  (is (= 100 (:balance (get (state/actors restored) "alice")))
+      "the source has the actor")
+  (is (empty? (state/query restored
+                           {:find '[?v] :where '[["alice" "inga.actor/balance" ?v]]}))
+      "and the projection does NOT -- documented, not accidental"))
+
+(deftest without-emit-fn-the-two-roots-are-independent
+  (testing "the honest state of ADR-2608059000 step 1: the invariant is opt-in"
+    (let [blocks (store)
+          m (machine-on blocks)                       ; no :emit-fn
+          root ((:root-fn m)
+                (run m [[{:op :actor-put :address "alice" :actor {:nonce 1 :balance 100}}]]))]
+      #?(:clj (no-emit-assertions ((:hydrate-fn m) root uncrypt))
+         :cljs (async done
+                 (-> (js/Promise.resolve root)
+                     (.then (fn [cid] ((:hydrate-fn m) cid uncrypt)))
+                     (.then (fn [restored] (no-emit-assertions restored) (done)))))))))
+
+;; ── refusals ─────────────────────────────────────────────────────────────────
+
+(deftest query-refuses-a-bare-db
+  (testing "passing a db used to be correct; a silent empty result set would be worse"
+    (let [m (machine-on (store))
+          st (run m [ops-a])]
+      (is (thrown? js/Error
+                   (state/query (:db st) {:find '[?s] :where '[[?s "role" "witness"]]})))
+      (is (= #{["alice"] ["bob"]}
+             (state/query st {:find '[?s] :where '[[?s "role" "witness"]]}))
+          "the state map is what it takes"))))
+
+(deftest an-actor-op-without-an-address-is-refused
+  (let [m (machine-on (store))]
+    (is (thrown? js/Error
+                 (run m [[{:op :actor-put :actor {:balance 1}}]])))))
+
+(deftest a-code-that-is-not-a-cid-is-refused
+  (testing "otherwise the failure is an NPE from inside the base32 decoder"
+    (let [m (machine-on (store))]
+      (is (thrown? js/Error
+                   (run m [[{:op :actor-put :address "alice"
+                             :actor {:code "transfer/v1" :balance 1}}]])))
+      (is (some? (run m [[{:op :actor-put :address "alice"
+                           :actor {:code code-cid :balance 1}}]]))
+          "a real CID goes through"))))
+
+;; ── ADR-2608059000 step 3: emission is metered, and must be deterministic ────
+;;
+;; The ADR's judgment for this step is not "the projection works" — it is that
+;; a projection which stops being a pure function of the transition makes
+;; replicas SPLIT, demonstrably. That property is what turns "emission must be
+;; deterministic" from a sentence in a docstring into something the network
+;; enforces, so it is the thing under test here.
+
+(defn- replica-local-emit
+  "An emission that reads something OUTSIDE the transition — the replica's own
+  identity. This is what a non-deterministic projection looks like in
+  practice: not a random number, but a value that is stable per process and
+  different between processes, which is exactly the kind that survives review."
+  [replica-id]
+  (fn [o prev next]
+    (conj (state/default-emit o prev next)
+          {:op :assert :s (:address o) :p "observed-by" :o replica-id})))
+
+(def actor-block
+  [{:op :actor-put :address "alice" :actor {:nonce 1 :balance 100}}
+   {:op :actor-put :address "bob" :actor {:nonce 0 :balance 50}}])
+
+(deftest deterministic-emission-keeps-replicas-together
+  (let [blocks (store)
+        rs (roots-of (repeatedly 4 (fn [] [(machine-on blocks state/default-emit)
+                                           [actor-block]])))]
+    #?(:clj (same-cid-assertions rs)
+       :cljs (async done (settle rs (fn [cids] (same-cid-assertions cids) (done)))))))
+
+(defn- split-assertions [blocks [a b]]
+  (is (not= a b)
+      "a projection that is not a function of the transition splits the network")
+  (let [na (root-node blocks a)
+        nb (root-node blocks b)]
+    (testing "and the split is in the PROJECTION, not in the source"
+      (is (= (ipld/link-cid (get na "actors")) (ipld/link-cid (get nb "actors")))
+          "both replicas hold the identical actor tree")
+      (is (not= (ipld/link-cid (get na "datoms")) (ipld/link-cid (get nb "datoms")))
+          "and disagree only about what it projects to"))))
+
+(deftest emission-is-deterministic-or-replicas-split
+  (let [blocks (store)
+        rs (roots-of [[(machine-on blocks (replica-local-emit "replica-a")) [actor-block]]
+                      [(machine-on blocks (replica-local-emit "replica-b")) [actor-block]]])]
+    #?(:clj (split-assertions blocks rs)
+       :cljs (async done (settle rs (fn [cids] (split-assertions blocks cids) (done)))))))
+
+;; ── emission is charged for ─────────────────────────────────────────────────
+
+(defn- emitting-machine [blocks budget emit-fn]
+  (state/machine
+   {:decode-block :ops
+    :emit-fn emit-fn
+    :put! (fn [cid bytes] (swap! blocks assoc cid bytes))
+    :get-fn (fn [cid] (get @blocks cid))
+    :blind-fn blind
+    :encrypt-fn crypt
+    :fuel {:budget-fn (constantly budget)
+           :cost-fn (fuel/fixed-cost 1)
+           :height-fn :height}}))
+
+(def one-actor-block
+  {:height 1 :ops [{:op :actor-put :address "alice" :actor {:nonce 1 :balance 100}}]})
+
+(deftest emission-is-charged-not-free
+  (testing "the same op costs more when it projects than when it does not"
+    (let [blocks (store)
+          without ((:apply-fn (emitting-machine blocks 100 nil)) 
+                   ((:init-fn (emitting-machine blocks 100 nil))) one-actor-block)
+          with ((:apply-fn (emitting-machine blocks 100 state/default-emit))
+                ((:init-fn (emitting-machine blocks 100 state/default-emit))) one-actor-block)
+          spent-of (fn [st] (state/query st {:find '[?v]
+                                             :where '[["inga.fuel/block/1" "inga.fuel/spent" ?v]]}))]
+      ;; default-emit on a fresh address asserts nonce + balance and retracts
+      ;; nothing, so the op costs 1 for itself plus 2 for what it projects.
+      (is (= #{[1]} (spent-of without)))
+      (is (= #{[3]} (spent-of with))))))
+
+(deftest an-op-whose-emission-does-not-fit-is-not-applied-at-all
+  (testing "the atomicity the expansion charge exists for"
+    (let [blocks (store)
+          m (emitting-machine blocks 2 state/default-emit)   ; op=1 + emission=2 > 2
+          st ((:apply-fn m) ((:init-fn m)) one-actor-block)]
+      (is (empty? (state/actors st))
+          "the actor was NOT written — a block cannot run out of fuel between a
+           mutation and its projection and commit the half of it that fit")
+      (is (empty? (state/query st {:find '[?v]
+                                   :where '[["alice" "inga.actor/balance" ?v]]}))
+          "and nothing was projected either")
+      (is (= #{[0]} (state/query st {:find '[?v]
+                                     :where '[["inga.fuel/block/1" "inga.fuel/exhausted-at" ?v]]}))
+          "it is recorded as exhausted at op 0, which is what a peer checks"))))
+
+;; ── ADR-2608059000 step 4: only this actor may write here ───────────────────
+;;
+;; The ADR's reason for putting the actor tree UNDER the datom indices is that
+;; it is "a place to enforce 'only this actor may write here' structurally".
+;; Step 1 built the tree; the enforcement is this section. What is under test
+;; is not that a check exists but that a refused op leaves NO trace in either
+;; root except the counted refusal — a rule that half-applies is worse than
+;; none, because the half that landed is what a peer would have to detect.
+
+(defn- governed-machine
+  "A machine with `:authority` on, and optionally an `:invoke-fn` and `:fuel`."
+  ([blocks] (governed-machine blocks nil nil))
+  ([blocks invoke-fn] (governed-machine blocks invoke-fn nil))
+  ([blocks invoke-fn fuel]
+   (state/machine
+    (cond-> {:decode-block :ops
+             :emit-fn state/default-emit
+             :put! (fn [cid bytes] (swap! blocks assoc cid bytes))
+             :get-fn (fn [cid] (get @blocks cid))
+             :blind-fn blind
+             :encrypt-fn crypt
+             :authority {}                       ; default caller-fn is :caller
+             :height-fn :height}
+      invoke-fn (assoc :invoke-fn invoke-fn)
+      fuel (assoc :fuel fuel)))))
+
+(defn- refusals-of [st height reason]
+  (state/query st {:find '[?v]
+                   :where [[(str "inga.refusal/block/" height)
+                            (str "inga.refusal/" (name reason)) '?v]]}))
+
+(deftest an-actor-may-only-write-its-own-address
+  (let [m (governed-machine (store))
+        st ((:apply-fn m) ((:init-fn m))
+            {:height 1
+             :ops [{:op :actor-put :address "alice" :caller "alice"
+                    :actor {:balance 100}}
+                   {:op :actor-put :address "bob" :caller "alice"
+                    :actor {:balance 999}}]})]
+    (is (= 100 (:balance (get (state/actors st) "alice")))
+        "writing your own record is what an actor op is for")
+    (is (nil? (get (state/actors st) "bob"))
+        "and writing someone else's is refused, not applied")
+    (is (empty? (state/query st {:find '[?v]
+                                 :where '[["bob" "inga.actor/balance" ?v]]}))
+        "the projection did not land either — a refusal is refused in BOTH roots")
+    (is (= #{[1]} (refusals-of st 1 :not-self))
+        "and it is counted, so a flood of forged writes is attributable")))
+
+(deftest an-op-with-no-author-is-refused
+  (testing "authority on and nobody named: there is no rule to apply, so no write"
+    (let [m (governed-machine (store))
+          st ((:apply-fn m) ((:init-fn m))
+              {:height 4 :ops [{:op :actor-put :address "alice" :actor {:balance 1}}]})]
+      (is (empty? (state/actors st)))
+      (is (= #{[1]} (refusals-of st 4 :no-caller))))))
+
+(deftest without-authority-any-op-may-write-any-address
+  (testing "the honest statement of what every deployment before step 4 did"
+    (let [m (machine-on (store) state/default-emit)   ; no :authority
+          st (run m [[{:op :actor-put :address "bob" :caller "alice"
+                       :actor {:balance 999}}]])]
+      (is (= 999 (:balance (get (state/actors st) "bob")))))))
+
+(deftest a-caller-fn-may-read-the-author-from-anywhere-in-the-op
+  (testing ":caller is a default, not a schema — decode-block owns the shape"
+    (let [blocks (store)
+          m (state/machine {:decode-block :ops
+                            :put! (fn [cid bytes] (swap! blocks assoc cid bytes))
+                            :get-fn (fn [cid] (get @blocks cid))
+                            :blind-fn blind :encrypt-fn crypt
+                            :authority {:caller-fn (comp :did :envelope)}
+                            :height-fn :height})
+          st ((:apply-fn m) ((:init-fn m))
+              {:height 1 :ops [{:op :actor-put :address "alice"
+                                :envelope {:did "alice"} :actor {:balance 7}}]})]
+      (is (= 7 (:balance (get (state/actors st) "alice")))))))
+
+(defn- refusal-root-assertions [[with-refused without-op]]
+  (is (not= with-refused without-op)
+      "a refusal is a FACT in the root, not a silent drop: the same applied ops
+       reached a different root because one block also refused something, which
+       is what makes a replica that refused a different set visibly wrong"))
+
+(deftest a-refusal-is-inside-the-root
+  (let [blocks (store)
+        m (governed-machine blocks)
+        mine {:op :actor-put :address "alice" :caller "alice" :actor {:balance 1}}
+        theirs {:op :actor-put :address "bob" :caller "alice" :actor {:balance 2}}
+        roots [((:root-fn m) ((:apply-fn m) ((:init-fn m))
+                              {:height 1 :ops [mine theirs]}))
+               ((:root-fn m) ((:apply-fn m) ((:init-fn m))
+                              {:height 1 :ops [mine]}))]]
+    #?(:clj (refusal-root-assertions roots)
+       :cljs (async done (settle roots (fn [rs] (refusal-root-assertions rs) (done)))))))
+
+;; ── the call: `code` is a CID that RUNS ──────────────────────────────────────
+;;
+;; Before this, an actor's `code` was a link the tree carried and nothing read.
+;; ADR-2608059000 says the actor tree buys "`code` as the CID of a checked
+;; definition"; a definition nothing invokes is a comment with a hash.
+
+(def next-state-cid (ipld/cid (ipld/encode {"balance-sheet" 2})))
+
+(defn- put-alice [code]
+  {:op :actor-put :address "alice" :caller "alice"
+   :actor {:code code :state state-cid :nonce 1 :balance 100}})
+
+(deftest a-call-runs-the-actors-code-and-writes-only-its-own-state
+  (let [seen (atom [])
+        invoke (fn [arg] (swap! seen conj arg) {:state next-state-cid})
+        m (governed-machine (store) invoke)
+        st ((:apply-fn m) ((:init-fn m))
+            {:height 1 :ops [(put-alice code-cid)
+                             {:op :actor-call :address "alice" :caller "bob"
+                              :method "credit" :args [5]}]})
+        alice (get (state/actors st) "alice")]
+    (is (= next-state-cid (:state alice))
+        "the call advanced the callee's own state root")
+    (is (= [100 1 code-cid] [(:balance alice) (:nonce alice) (:code alice)])
+        "and touched nothing else — balance, nonce and code are not a call's to move")
+    (is (= [{:address "alice" :caller "bob" :code code-cid :state state-cid
+             :method "credit" :args [5] :fuel nil}]
+           @seen)
+        "the seam is handed the CURRENT code and state, and who called")))
+
+(deftest anyone-may-call-but-only-the-callee-is-written
+  (testing "a call is a message; self-write is about :actor-put, not about this"
+    (let [m (governed-machine (store) (fn [_] {:state next-state-cid}))
+          st ((:apply-fn m) ((:init-fn m))
+              {:height 1 :ops [(put-alice code-cid)
+                               {:op :actor-call :address "alice" :caller "mallory"}]})]
+      (is (= next-state-cid (:state (get (state/actors st) "alice"))))
+      (is (nil? (get (state/actors st) "mallory"))
+          "and the caller did not come into existence by calling"))))
+
+(deftest a-call-that-cannot-run-is-refused-and-counted
+  (let [m (governed-machine (store) (fn [_] {:state next-state-cid}))
+        st ((:apply-fn m) ((:init-fn m))
+            {:height 2 :ops [{:op :actor-put :address "alice" :caller "alice"
+                              :actor {:balance 1}}          ; no :code
+                             {:op :actor-call :address "alice" :caller "alice"}
+                             {:op :actor-call :address "ghost" :caller "alice"}]})]
+    (is (= #{[1]} (refusals-of st 2 :no-code)))
+    (is (= #{[1]} (refusals-of st 2 :no-actor)))
+    (is (= 1 (:balance (get (state/actors st) "alice")))
+        "the refusals changed nothing")))
+
+(deftest a-call-result-that-is-not-a-cid-is-refused-not-thrown
+  (testing "untrusted OUTPUT: refusing is right where throwing is right for a caller's own mistake"
+    (let [m (governed-machine (store) (fn [_] {:state "definitely-not-a-cid"}))
+          st ((:apply-fn m) ((:init-fn m))
+              {:height 3 :ops [(put-alice code-cid)
+                               {:op :actor-call :address "alice" :caller "alice"}]})]
+      (is (= state-cid (:state (get (state/actors st) "alice"))))
+      (is (= #{[1]} (refusals-of st 3 :invalid-result))))))
+
+(deftest a-reason-outside-the-closed-set-is-recorded-as-call-failed
+  (testing "otherwise the ledger's key space is chosen by the code being run"
+    (let [m (governed-machine (store) (fn [_] {:refused :i-just-felt-like-it}))
+          st ((:apply-fn m) ((:init-fn m))
+              {:height 5 :ops [(put-alice code-cid)
+                               {:op :actor-call :address "alice" :caller "alice"}]})]
+      (is (= #{[1]} (refusals-of st 5 :call-failed)))
+      (is (empty? (refusals-of st 5 :i-just-felt-like-it))))))
+
+(deftest a-call-with-no-invoke-fn-is-a-deployment-error
+  (testing "a replica that cannot run code must not quietly refuse what its peers execute"
+    (let [m (governed-machine (store))]
+      (is (thrown? js/Error
+                   ((:apply-fn m) ((:init-fn m))
+                    {:height 1 :ops [(put-alice code-cid)
+                                     {:op :actor-call :address "alice" :caller "alice"}]}))))))
+
+(deftest an-invoke-fn-that-answers-with-neither-shape-is-a-deployment-error
+  (let [m (governed-machine (store) (fn [_] :yes))]
+    (is (thrown? js/Error
+                 ((:apply-fn m) ((:init-fn m))
+                  {:height 1 :ops [(put-alice code-cid)
+                                   {:op :actor-call :address "alice" :caller "alice"}]})))))
+
+(deftest authority-and-invoke-need-a-height-fn
+  (testing "a refusal nobody can locate in the chain is not a record"
+    (let [base {:decode-block :ops :put! (fn [_ _]) :get-fn (constantly nil)
+                :blind-fn blind :encrypt-fn crypt}]
+      (is (thrown? js/Error
+                   (state/machine (assoc base :authority {}))))
+      (is (thrown? js/Error
+                   (state/machine (assoc base :invoke-fn (fn [_] {})))))
+      (is (some? (state/machine (assoc base :authority {} :height-fn :height)))))))
+
+;; ── metering a call ──────────────────────────────────────────────────────────
+
+(def ^:private call-fuel
+  {:budget-fn (constantly 100) :cost-fn (fuel/fixed-cost 7) :height-fn :height})
+
+(deftest a-metered-call-runs-the-code-once-and-is-handed-its-budget
+  (testing "the price the block charges for the op IS the budget the call may spend"
+    (let [runs (atom [])
+          invoke (fn [arg] (swap! runs conj (:fuel arg)) {:state next-state-cid})
+          m (governed-machine (store) invoke call-fuel)
+          st ((:apply-fn m) ((:init-fn m))
+              {:height 1 :ops [(put-alice code-cid)
+                               {:op :actor-call :address "alice" :caller "alice"}]})]
+      (is (= [7] @runs)
+          "once, not twice: pricing an op and performing it share one execution,
+           which the emission seam does not and says so")
+      (is (= next-state-cid (:state (get (state/actors st) "alice")))))))
+
+(deftest a-refused-op-still-costs-the-block
+  (testing "block space is spent whether or not the op was allowed to do anything"
+    (let [m (governed-machine (store) nil call-fuel)
+          st ((:apply-fn m) ((:init-fn m))
+              {:height 1 :ops [{:op :actor-put :address "bob" :caller "alice"
+                                :actor {:balance 1}}]})]
+      (is (= #{[1]} (refusals-of st 1 :not-self)))
+      (is (= #{[7]} (state/query st {:find '[?v]
+                                     :where '[["inga.fuel/block/1" "inga.fuel/spent" ?v]]}))
+          "charged for itself; its emission expanded to nothing because it was refused"))))

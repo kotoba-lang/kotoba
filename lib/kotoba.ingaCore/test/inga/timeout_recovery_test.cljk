@@ -1,0 +1,97 @@
+(ns inga.timeout-recovery-test
+  "One timeout must cost one timeout, not one per block forever after.
+
+  Four replicas over an in-process network with a few milliseconds of
+  delivery delay. The first 1,500 ms drop every message, so every replica
+  times out and the tip is later certified by `vote-on-tip` re-votes in the
+  next view. Before `past-certificate-view` that landed every replica on the
+  view it had just spent, the next proposal was refused
+  `:already-voted-in-this-view`, and the chain moved one block per base
+  timeout from then on (torihiki-node standalone, measured p50 1,020 ms)."
+  (:require [kotoba.test :refer [deftest is]]
+            [inga.replica :as r]
+            [inga.attest :as att]
+            [inga.consensus :as c]
+            [inga.reservation-test :as fixture]
+            [inga-node.seams :as seams]))
+
+(defn- run
+  "Ticks every 10 ms, delivers each message 1-3 ms after it was sent (by send
+  order, so the run is deterministic), and drops everything sent before
+  `partition-until`. Returns the replicas at `until`."
+  ([partition-until until] (run partition-until until identity))
+  ([partition-until until tamper]
+  (let [ws fixture/witnesses
+        states (atom (into {} (for [w ws] [w (r/replica (fixture/opts w))])))
+        q (atom [])
+        sent (atom 0)
+        clock (atom 0)
+        ship (fn [from out]
+               (doseq [{:keys [to msg]} out
+                       t (cond (or (nil? to) (= :all to)) (remove #{from} ws)
+                               (coll? to) to
+                               :else [to])]
+                 (let [n (swap! sent inc)
+                       msg (tamper (assoc msg ::from from))]
+                   (when (>= @clock partition-until)
+                     (swap! q conj [(+ @clock 1 (mod n 3)) n t (dissoc msg ::from)])))))
+        lead (c/leader-for ws 1)
+        [s0 out0] (r/start (get @states lead) 0)]
+    (swap! states assoc lead s0)
+    (ship lead out0)
+    (while (< @clock until)
+      (swap! clock inc)
+      (let [due (sort (filter #(<= (first %) @clock) @q))]
+        (swap! q (fn [v] (vec (remove #(<= (first %) @clock) v))))
+        (doseq [[_ _ t msg] due]
+          (let [[s' out] (r/on-message (get @states t) msg @clock)]
+            (swap! states assoc t s')
+            (ship t out))))
+      (when (zero? (mod @clock 10))
+        (doseq [w ws]
+          (let [[s' out] (r/on-tick (get @states w) @clock)]
+            (swap! states assoc w s')
+            (ship w out)))))
+    @states)))
+
+(deftest a-timeout-does-not-leave-the-chain-one-timeout-per-block
+  (let [at-heal (run 1500 1500)
+        later (run 1500 4500)
+        h0 (apply min (map r/height (vals at-heal)))
+        h1 (apply min (map r/height (vals later)))]
+    ;; 3,000 ms after the partition heals. One block per base timeout would be
+    ;; three; a leader proposes at most once per 100 ms block interval and the
+    ;; four rotate, so a healthy chain makes well over a hundred.
+    (is (> (- h1 h0) 60)
+        (str "only " (- h1 h0) " blocks in 3 s after one timeout"))))
+
+(deftest replicas-agree-after-recovering
+  (let [states (run 1500 4500)
+        h (apply min (map r/height (vals states)))
+        at (fn [s] (some #(when (= h (:inga.block/height %)) ((:hash-fn s) %))
+                         (:chain s)))]
+    (is (pos? h))
+    (is (apply = (map at (vals states))) "every replica holds the same block at the common height")
+    (is (every? empty? (map :equivocations (vals states))))))
+
+(def ^:private huge 9007199254740000)
+
+(defn- inflate
+  "w4 is Byzantine: every vote it sends claims a view near 2^53, correctly
+  signed over that view with its real key."
+  [{:keys [type] :as msg}]
+  (if (and (= :vote type) (= "w4" (::from msg)))
+    (assoc msg :view huge
+           :sig ((seams/sign-fn (fixture/seeds "w4"))
+                 (att/vote-payload fixture/chain-id huge (:height msg) (:block-hash msg) "w4")))
+    msg))
+
+(deftest one-vote-cannot-drag-everybody-to-a-huge-view
+  ;; A certificate's view is the max of its votes' views. Moving a replica to
+  ;; `qc-view + 1` let one signer choose where every honest replica went, and
+  ;; at 2^53 `inc` stops moving and `voted-view` pins it forever.
+  (let [states (run 0 3000 inflate)
+        honest (map states ["w1" "w2" "w3"])]
+    (is (every? #(< (:view (:pm %)) 1000000) honest)
+        (str "views " (mapv (comp :view :pm) honest)))
+    (is (> (apply min (map r/height honest)) 40) "the chain stopped")))

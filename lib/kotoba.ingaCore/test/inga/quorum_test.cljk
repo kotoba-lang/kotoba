@@ -1,0 +1,149 @@
+(ns inga.quorum-test
+  "Two notions of quorum in one system is not a redundancy — it is a question
+  about which one is in force, and the answer was the weaker one."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [inga.consensus :as c]
+            [inga.quorum :as q]
+            [inga.pacemaker :as pm]
+            [inga.sync :as sync]
+            [inga.attest :as att]
+            [inga.stake]
+            [inga.wire]))
+
+;; A Sybil: one holder splits a small bond across many identities.
+;; `bonds` is {did -> {:amount N :roles #{...}}}, not {did -> N}. Getting that
+;; wrong made every stake quorum fail with a total of zero, which reads exactly
+;; like "stake-weighting rejects everything" — a test that is wrong in the
+;; direction of the property it is checking is the worst kind.
+;; Four holders, not three: with three equal holders, two of them plus ANY
+;; number of dust identities is already above two thirds, so the case "Sybils
+;; add nothing" cannot be expressed. The arithmetic has to leave room for the
+;; property being tested.
+(def honest-bonds {"big-1" {:amount 4000} "big-2" {:amount 4000}
+                   "big-3" {:amount 4000} "big-4" {:amount 4000}})
+(def sybil-bonds (into {} (map (fn [i] [(str "sybil-" i) {:amount 1}])) (range 40)))
+(def bonds (merge honest-bonds sybil-bonds))
+(def witness-set (set (keys bonds)))
+(def sybils (set (keys sybil-bonds)))
+
+;; ── the attack head-counting loses to ───────────────────────────────────────
+
+(deftest head-count-falls-to-a-sybil-under-open-admission
+  (testing "the reason ADR-2607994000 replaced it"
+    (let [heads (q/for-set-size (count witness-set))]
+      (is (q/met? heads sybils)
+          "forty identities holding forty units total satisfy a head count")
+      (is (not (q/met? (q/stake-weighted bonds witness-set) sybils))
+          "and satisfy no part of the stake"))))
+
+(deftest stake-weighted-counts-what-was-paid
+  (let [stake? (q/stake-weighted bonds witness-set)]
+    (is (not (q/met? stake? #{"big-1"})) "one third is not two thirds")
+    (is (not (q/met? stake? #{"big-1" "big-2"})) "8000 of 16040 is not enough")
+    (is (q/met? stake? #{"big-1" "big-2" "big-3"}) "12000 of 16040 is")
+    (testing "and adding every Sybil to two honest holders still is not"
+      (is (not (q/met? stake? (into #{"big-1" "big-2"} sybils)))))))
+
+(deftest a-bare-number-means-head-count
+  (is (q/met? 3 #{:a :b :c}))
+  (is (not (q/met? 3 #{:a :b})))
+  (is (thrown? #?(:clj Exception :cljs :default) (q/met? "three" #{:a}))))
+
+;; ── every consumer takes the same thing ─────────────────────────────────────
+
+(defn- nv [w q] {:inga.nv/witness w :inga.nv/view 3 :inga.nv/high-qc q})
+
+(deftest the-pacemaker-takes-a-quorum-predicate
+  (let [msgs (mapv #(nv % nil) sybils)]
+    (is (some? (pm/timeout-certificate msgs (q/for-set-size (count witness-set))))
+        "head count lets a Sybil force a view change")
+    (is (nil? (pm/timeout-certificate msgs (q/stake-weighted bonds witness-set)))
+        "stake does not")))
+
+(deftest attestation-takes-a-quorum-predicate
+  (let [sign (fn [w p] (str "sig<" w "|" p ">"))
+        verify (fn [w p s] (= s (sign w p)))
+        chain "q-test"
+        votes (mapv (fn [w] (att/sign-vote (c/make-vote w "BH" 4) chain 7
+                                           (partial sign w)))
+                    (vec sybils))
+        ;; a certificate every one of whose signatures is genuine
+        qc (att/certify {:inga.qc/block-hash "BH" :inga.qc/height 4
+                         :inga.qc/view 7 :inga.qc/witnesses sybils}
+                        votes)]
+    ;; `witness-set` INCLUDES the Sybils: this is the permissionless-admission
+    ;; case ADR-2607994000 describes, where anyone may register. Membership is
+    ;; therefore satisfied and settles nothing — which is the point. Where
+    ;; admission is managed, membership alone stops this attack; where it is
+    ;; open, only stake does.
+    (is (nil? (att/verify-certificate qc chain (q/for-set-size (count witness-set))
+                                      verify witness-set))
+        "forty real signatures, all from admitted identities, satisfy a head count")
+    (is (= :below-quorum
+           (att/verify-certificate qc chain (q/stake-weighted bonds witness-set)
+                                   verify witness-set))
+        "and buy no stake — which is the whole point")
+    (is (= :not-admitted
+           (att/verify-certificate qc chain (q/for-set-size (count witness-set))
+                                   verify honest-bonds))
+        "under MANAGED admission the same certificate never reaches the quorum question")))
+
+(deftest sync-takes-a-quorum-predicate
+  ;; Above genesis. A certificate for height zero is exempt in inga.sync — the
+  ;; one inga.replica/start fabricates has a single witness and no signatures,
+  ;; and every replica has genesis by construction — so a segment justified at
+  ;; height zero would be testing the exemption rather than the predicate.
+  (let [h (fn [b] (str "H" (:inga.block/height b)))
+        parent {:inga.block/height 1 :inga.block/parent-hash "H0"
+                :inga.block/proposals [] :inga.block/proposer "w" :inga.block/ts 10
+                :inga.block/justify nil}
+        child {:inga.block/height 2 :inga.block/parent-hash "H1"
+               :inga.block/proposals [] :inga.block/proposer "w" :inga.block/ts 20
+               :inga.block/justify {:inga.qc/block-hash "H1" :inga.qc/height 1
+                                    :inga.qc/witnesses sybils}}]
+    (is (nil? (sync/validate-segment h (q/for-set-size (count witness-set))
+                                     parent [child] sync/default-params)))
+    (is (= :below-quorum
+           (sync/validate-segment h (q/stake-weighted bonds witness-set)
+                                  parent [child] sync/default-params)))))
+
+;; ── a stake certificate can lock ────────────────────────────────────────────
+
+(deftest a-stake-certificate-records-its-view
+  (testing "without it, the stake path would have the bug the head-count path had"
+    (let [votes (mapv #(c/make-vote % "BH" 4) ["big-1" "big-2" "big-3"])
+          qc (inga.stake/stake-qc votes bonds witness-set 9)]
+      (is (some? qc))
+      (is (= 9 (pm/qc-view qc)))
+      (is (some? (:locked-qc (pm/on-qc (pm/initial :w) qc)))))))
+
+(deftest stake-survives-the-wire
+  (let [votes (mapv #(c/make-vote % "BH" 4) ["big-1" "big-2" "big-3"])
+        qc (inga.stake/stake-qc votes bonds witness-set 9)
+        [m _] (inga.wire/decode (inga.wire/encode
+                                 {:type :new-view :witness "big-1" :view 9
+                                  :high-qc qc}))]
+    (is (= (:inga.qc/stake qc) (:inga.qc/stake (:high-qc m)))
+        "a stake certificate arriving without its stake must be re-derived or refused")))
+
+;; ── what a quorum resists, declared rather than inferred ─────────────────────
+
+(deftest a-quorum-declares-what-it-resists
+  (testing "modelled on kotobase.storage.core/ref-profiles, for the reason that
+            namespace gives: the failure mode of guessing is silent"
+    (is (= :head-count (q/profile 3)))
+    (is (= :stake-weighted (q/profile (q/stake-weighted {"a" {:amount 1}} #{"a"}))))
+    (is (nil? (q/profile "not a quorum")))))
+
+(deftest a-bare-function-is-head-count-not-unknown
+  (testing "an unlabelled predicate could be anything, and calling that
+            :stake-weighted on the caller's behalf is exactly the silent
+            upgrade this is meant to prevent"
+    (is (= :head-count (q/profile (fn [_] true))))))
+
+(deftest the-profile-survives-being-used
+  (let [sw (q/stake-weighted {"a" {:amount 3} "b" {:amount 1}} #{"a" "b"})]
+    (is (true? (boolean (sw #{"a"}))) "3 of 4 is more than two thirds")
+    (is (false? (boolean (sw #{"b"}))))
+    (is (= :stake-weighted (q/profile sw))
+        "and coercing/calling it does not strip the declaration")))

@@ -1,0 +1,131 @@
+(ns inga.current-ref-read-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [inga.current-ref-read :as current-read]))
+
+(def chain-id "awai-testnet")
+(def witnesses ["w1" "w2" "w3" "w4"])
+(def challenge "V9cv8ouTyRdqdkwZc7uR1A")
+(def ^:private signed-payloads (atom {}))
+(def ^:private signature-counter (atom 0))
+
+(defn- sign [witness payload]
+  (let [signature (str "sig/" witness "/" (swap! signature-counter inc))]
+    (swap! signed-payloads assoc [witness signature] payload)
+    signature))
+
+(defn- verify [witness payload signature]
+  (= payload (get @signed-payloads [witness signature])))
+
+(defn- reply
+  ([witness] (reply witness 7 "bafy-current" challenge 1000))
+  ([witness head-seq head-cid nonce observed-at]
+   (current-read/signed-read
+    {:chain-id chain-id :witness witness :ref "awai/app/test/stable"
+     :head-seq head-seq :head-cid head-cid :challenge nonce
+     :observed-at observed-at}
+    #(sign witness %))))
+
+(defn- context
+  ([] (context {}))
+  ([overrides]
+   (merge {:chain-id chain-id :witnesses witnesses :quorum 3
+           :verify-fn verify :ref "awai/app/test/stable"
+           :challenge challenge :now 1001 :max-age-ms 500}
+          overrides)))
+
+(deftest payload-binds-every-read-claim
+  (let [base (reply "w1")
+        payload (current-read/payload base)]
+    (is (string? payload))
+    (doseq [field [:chain-id :witness :ref :head-seq :head-cid :challenge :observed-at]]
+      (is (not= payload
+                (current-read/payload (update base field #(if (number? %) (inc %) "other"))))
+          (name field)))))
+
+(deftest one-current-head-needs-a-distinct-signed-quorum
+  (let [{:keys [status proof]} (current-read/verify-quorum
+                                [(reply "w3") (reply "w1") (reply "w2") (reply "w2")]
+                                (context))]
+    (is (= :verified status))
+    (is (= 7 (:head-seq proof)))
+    (is (= "bafy-current" (:head-cid proof)))
+    (is (= ["w1" "w2" "w3"] (:witnesses proof)))
+    (is (= 1000 (:observed-at proof)))
+    (is (= 1500 (:expires-at proof)))))
+
+(deftest missing-or-conflicting-quorum-never-produces-a-current-proof
+  (testing "two signatures do not pass the three-of-four profile"
+    (is (= {:status :unresolved :reason :below-quorum}
+           (current-read/verify-quorum [(reply "w1") (reply "w2")] (context))))
+  (testing "two heads with no quorum remain unresolved"
+    (is (= :conflicting-reads
+           (:reason (current-read/verify-quorum
+                     [(reply "w1" 7 "bafy-a" challenge 1000)
+                      (reply "w2" 7 "bafy-a" challenge 1000)
+                      (reply "w3" 8 "bafy-b" challenge 1000)]
+                     (context))))))))
+
+(deftest stale-future-replayed-and-untrusted-replies-do-not-count
+  (is (= :no-valid-reads
+         (:reason (current-read/verify-quorum
+                   [(reply "w1" 7 "bafy-current" challenge 400)
+                    (reply "w2" 7 "bafy-current" challenge 400)
+                    (reply "w3" 7 "bafy-current" challenge 400)]
+                   (context)))))
+  (is (= :no-valid-reads
+         (:reason (current-read/verify-quorum
+                   [(reply "w1" 7 "bafy-current" "old-challenge" 1000)
+                    (reply "w2" 7 "bafy-current" "old-challenge" 1000)
+                    (reply "w3" 7 "bafy-current" "old-challenge" 1000)]
+                   (context)))))
+  (is (= :no-valid-reads
+         (:reason (current-read/verify-quorum
+                   [(reply "w1" 7 "bafy-current" challenge 1002)
+                    (reply "w2" 7 "bafy-current" challenge 1002)
+                    (reply "w3" 7 "bafy-current" challenge 1002)]
+                   (context)))))
+  (is (= :below-quorum
+         (:reason (current-read/verify-quorum
+                   [(reply "w1" 7 "bafy-current" challenge 1000)
+                    (reply "w2" 7 "bafy-current" challenge 1000)
+                    (reply "intruder" 7 "bafy-current" challenge 1000)]
+                   (context))))))
+
+(deftest a-witness-equivocation-invalidates-this-read
+  (let [result (current-read/verify-quorum
+                [(reply "w1" 7 "bafy-a" challenge 1000)
+                 (reply "w1" 8 "bafy-b" challenge 1000)
+                 (reply "w2" 7 "bafy-a" challenge 1000)
+                 (reply "w3" 7 "bafy-a" challenge 1000)]
+                (context))]
+    (is (= {:status :rejected :reason :witness-equivocation} result))))
+
+(deftest changing-a-signed-head-breaks-the-read-quorum
+  (let [tampered (assoc (reply "w1") :head-cid "bafy-forged")
+        result (current-read/verify-quorum
+                [tampered (reply "w2") (reply "w3")]
+                (context))]
+    (is (= :unresolved (:status result)))
+    (is (= :below-quorum (:reason result)))))
+
+(deftest an-absent-ref-can-be-proved-with-a-quorum
+  (let [result (current-read/verify-quorum
+                [(reply "w1" nil nil challenge 1000)
+                 (reply "w2" nil nil challenge 1000)
+                 (reply "w3" nil nil challenge 1000)]
+                (context))]
+    (is (= :verified (:status result)))
+    (is (nil? (get-in result [:proof :head-seq])))
+    (is (nil? (get-in result [:proof :head-cid])))))
+
+(deftest malformed-claims-and-context-fail-closed
+  (is (nil? (current-read/signed-read
+             {:chain-id chain-id :witness "w1" :ref "bad\nref"
+              :head-seq 1 :head-cid "cid" :challenge challenge :observed-at 1000}
+             #(sign "w1" %))))
+  (is (= :rejected
+         (:status (current-read/verify-quorum [(reply "w1")]
+                                               (context {:verify-fn {}})))))
+  (is (= :rejected
+         (:status (current-read/verify-quorum [(reply "w1")]
+                                               (context {:witnesses ["w1" "w1"]}))))))

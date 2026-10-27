@@ -1,0 +1,137 @@
+(ns inga.head-test
+  "What a certificate has to prove. Every test here is a way a head could be
+  accepted that must not be — the failure mode of a ref plane is silent
+  acceptance, not a thrown exception."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [inga.head :as head]))
+
+(def quorum 3)
+(def validators #{"w1" "w2" "w3"})
+
+(defn- sig-for [witness record] (str witness "|" (head/canonical-bytes record)))
+(defn- verify-fn [bytes sig witness] (= sig (str witness "|" bytes)))
+
+(defn- record [& {:keys [seq cid prev ref] :or {seq 0 cid "cid-1" prev nil ref "main"}}]
+  (head/head-record {:ref-name ref :seq seq :cid cid :prev prev :height nil}))
+
+(defn- cert-over [rec ws]
+  {:sigs (mapv (fn [w] {:witness w :sig (sig-for w rec)}) ws)})
+
+(defn- head-of [rec cert] (assoc rec "cert" cert))
+
+(deftest a-quorum-of-real-signatures-verifies
+  (let [r (record)]
+    (is (some? (head/verify-cert r (cert-over r ["w1" "w2" "w3"]) quorum verify-fn validators)))
+    (is (= #{"w1" "w2" "w3"}
+           (:verified-signers (head/verify-cert r (cert-over r ["w1" "w2" "w3"]) quorum verify-fn validators))))))
+
+(deftest below-threshold-is-rejected
+  (let [r (record)]
+    (is (nil? (head/verify-cert r (cert-over r ["w1" "w2"]) quorum verify-fn validators)))))
+
+(deftest one-witness-cannot-reach-quorum-by-repeating-itself
+  (testing "distinct-by-witness, the same rule engi.consensus/qc applies to votes"
+    (let [r (record)
+          repeated {:sigs (repeat 5 {:witness "w1" :sig (sig-for "w1" r)})}]
+      (is (nil? (head/verify-cert r repeated quorum verify-fn validators))
+          "five copies of one signature is one signer"))))
+
+(deftest signatures-must-cover-THIS-record
+  (testing "a certificate lifted from another sequence does not verify here"
+    (let [mine (record :seq 4 :cid "cid-mine")
+          theirs (record :seq 4 :cid "cid-theirs")]
+      (is (nil? (head/verify-cert mine (cert-over theirs ["w1" "w2" "w3"]) quorum verify-fn validators))))))
+
+(deftest a-certificate-for-another-ref-does-not-verify
+  (testing "the failure ADR-2607299900 found in the signed-head plane: a record
+            signed for a different graph was completely valid, and would be
+            accepted as this graph's head if placed under the wrong key"
+    (let [mine (record :ref "main")
+          theirs (record :ref "other")]
+      (is (nil? (head/verify-cert mine (cert-over theirs ["w1" "w2" "w3"]) quorum verify-fn validators))
+          "ref is inside the signed bytes, so a cross-ref cert cannot be reused"))))
+
+(deftest forged-signatures-are-counted-out-not-in
+  (let [r (record)
+        mixed {:sigs [{:witness "w1" :sig (sig-for "w1" r)}
+                      {:witness "w2" :sig (sig-for "w2" r)}
+                      {:witness "w3" :sig "forged"}]}]
+    (is (nil? (head/verify-cert r mixed quorum verify-fn validators))
+        "three named signers, two real ones -- that is two")))
+
+(deftest an-unverifiable-head-reads-as-absent
+  (testing "an untrusted host is expected to be able to serve rubbish"
+    (let [r (record)]
+      (is (nil? (head/verify-head (head-of r (cert-over r ["w1"])) "main" quorum verify-fn validators)))
+      (is (nil? (head/verify-head {"v" "wrong/version"} "main" quorum verify-fn validators)))
+      (is (nil? (head/verify-head {} "main" quorum verify-fn validators)))
+      (is (nil? (head/verify-head nil "main" quorum verify-fn validators)))
+      (is (some? (head/verify-head (head-of r (cert-over r ["w1" "w2" "w3"]))
+                                   "main" quorum verify-fn validators))))))
+
+(deftest another-refs-head-is-not-this-refs-head
+  ;; `a-certificate-for-another-ref-does-not-verify`, above, covers the cert
+  ;; being TRANSPLANTED onto a different record -- and reads like it covers
+  ;; this. It does not. Here nothing is transplanted: the record and its
+  ;; certificate agree perfectly, because they are ref "other"'s real head.
+  ;; The only thing wrong with it is the question it is being used to answer,
+  ;; and until `verify-head` was given the ref name there was nothing in the
+  ;; verifier that could notice. `read-head!` is a dumb untrusted pointer, so
+  ;; serving this under "main" is exactly what it is allowed to do.
+  (let [theirs (record :ref "other" :cid "cid-theirs")
+        genuine (head-of theirs (cert-over theirs ["w1" "w2" "w3"]))]
+    (is (some? (head/verify-head genuine "other" quorum verify-fn validators))
+        "it really is a valid head -- of the ref it names")
+    (is (nil? (head/verify-head genuine "main" quorum verify-fn validators))
+        "and it is not the head of any other ref, however well certified")))
+
+(deftest genesis-and-empty-prev-are-not-confusable
+  (testing "canonical bytes render nil prev as empty, which is unambiguous
+            because a CID is never empty"
+    (is (not= (head/canonical-bytes (record :prev nil))
+              (head/canonical-bytes (record :prev "cid-0"))))
+    (is (= (head/canonical-bytes (record :prev nil))
+           (head/canonical-bytes (record :prev nil)))
+        "and it is deterministic")))
+
+(deftest next-head-derives-the-sequence
+  (let [genesis (head/next-head "main" nil "cid-1" nil)]
+    (is (= 0 (get genesis "seq")))
+    (is (nil? (get genesis "prev")))
+    (let [second' (head/next-head "main" genesis "cid-2" nil)]
+      (is (= 1 (get second' "seq")))
+      (is (= "cid-1" (get second' "prev"))))))
+
+;; ── membership: a certificate cannot vouch for its own signers ──────────────
+;;
+;; Superproject ADR-2608047000 follow-up 4. The namespace docstring said a
+;; certificate proves that quorum witnesses "of a known validator set" signed
+;; the record; nothing here knew the set, and the obvious verify-fn — verify
+;; this signature — does not check membership. Minting keys is free.
+
+(deftest keys-nobody-admitted-do-not-count
+  (let [r (record)]
+    (testing "three outsiders, three GOOD signatures, quorum met -- and refused"
+      (is (nil? (head/verify-cert r (cert-over r ["x1" "x2" "x3"]) quorum verify-fn validators))
+          "before 2026-08-05 this verified: the certificate named its own witnesses"))
+    (testing "outsiders cannot top up a genuine minority to reach the threshold"
+      (is (nil? (head/verify-cert r (cert-over r ["w1" "w2" "x1"]) quorum verify-fn validators))
+          "membership is applied BEFORE the threshold, so an outsider cannot count toward it"))
+    (testing "the admitted majority still verifies with outsiders present"
+      (is (some? (head/verify-cert r (cert-over r ["w1" "w2" "w3" "x1"]) quorum verify-fn validators)))
+      (is (= #{"w1" "w2" "w3"}
+             (:verified-signers (head/verify-cert r (cert-over r ["w1" "w2" "w3" "x1"])
+                                                  quorum verify-fn validators)))
+          "an outsider is not reported as a verified signer either"))
+    (testing "a missing or non-callable set fails CLOSED"
+      (is (nil? (head/verify-cert r (cert-over r ["w1" "w2" "w3"]) quorum verify-fn nil)))
+      (is (nil? (head/verify-cert r (cert-over r ["w1" "w2" "w3"]) quorum verify-fn "not-a-fn"))))
+    (testing "a predicate works as well as a set -- membership can be committed state"
+      (is (some? (head/verify-cert r (cert-over r ["w1" "w2" "w3"]) quorum verify-fn
+                                   (fn [w] (contains? #{"w1" "w2" "w3"} w))))))))
+
+(deftest an-outsider-certified-head-reads-as-absent
+  (let [r (record)
+        forged (head-of r (cert-over r ["x1" "x2" "x3"]))]
+    (is (nil? (head/verify-head forged "main" quorum verify-fn validators))
+        "a head signed entirely by unadmitted keys is not a head")))

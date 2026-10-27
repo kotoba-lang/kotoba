@@ -1,0 +1,192 @@
+(ns inga.departure-test
+  "What happens when a witness LEAVES.
+
+  `replica-test` and the socket harness both test a replica that loses its
+  memory — `evict!` rebuilds one in place and leaves it connected. Neither
+  tests one that stops answering, and those are different failures: an evicted
+  replica still takes its turn, a departed one does not.
+
+  `my-turn?` says what happens, in its own words: *keyed by height, a dead
+  leader holds its turn forever ... a protocol that tolerates one failure in
+  four, not tolerating one failure in four.* This namespace turns that
+  paragraph into something that runs.
+
+  ## The gap these were written for is closed
+
+  The first version of this namespace pinned a STALL as a characterisation
+  test, because a leader that departed held its turn forever. It said to
+  delete it rather than adjust it when the gap closed. It is deleted, and
+  `survives-the-departure-of-the-witness-due-to-lead` says the opposite in
+  its place."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [inga.replica :as r]
+            [inga.consensus :as c]))
+
+(def witnesses [:w1 :w2 :w3 :w4 :w5 :w6 :w7])
+
+(defn- hash-fn [b] (str "h:" (c/canonical-block b)))
+
+(defn- net []
+  (into {} (for [w witnesses]
+             [w (r/replica {:witness w :witnesses witnesses
+                            :quorum (c/quorum-size (count witnesses))
+                            :hash-fn hash-fn})])))
+
+(defn- deliver-all
+  "Run until quiet or `max-steps`. `gone` never receives and never sends —
+  which is the whole difference from `evict!`, where the replica is rebuilt
+  but still participates."
+  [replicas outbox now max-steps gone]
+  (loop [rs replicas ob outbox t now steps 0]
+    (if (or (empty? ob) (>= steps max-steps))
+      [rs steps]
+      (let [[{:keys [from to msg]} & more] ob
+            targets (if (= :all to) (sort (keys rs)) [to])
+            [rs' produced]
+            (reduce (fn [[rs acc] w]
+                      (if (or (= w from) (contains? gone w))
+                        [rs acc]
+                        (let [[s' out] (r/on-message (get rs w) msg t)]
+                          [(assoc rs w s') (into acc (map #(assoc % :from w) out))])))
+                    [rs []] targets)]
+        (recur rs' (vec (concat more produced)) (inc t) (inc steps) )))))
+
+(defn- tick-all [rs t gone max-steps]
+  (let [{:keys [rs ob]}
+        (reduce (fn [acc w]
+                  (if (contains? gone w)
+                    acc
+                    (let [[s' out] (r/on-tick (get (:rs acc) w) t)]
+                      (-> acc (update :rs assoc w s')
+                          (update :ob into (map #(assoc % :from w) out))))))
+                {:rs rs :ob []} (sort (keys rs)))
+        [rs' _] (deliver-all rs ob t max-steps gone)]
+    rs'))
+
+(def ^:private step
+  "Milliseconds between ticks.
+
+  Bigger than `inga.pacemaker/default-params`' base timeout, because a clock
+  that never reaches the deadline never times a view out — and a network that
+  never times out cannot route around anything. The first version of this
+  namespace ticked one millisecond at a time and therefore measured a stall
+  that no amount of correct leadership could have fixed: `pm-view` sat equal
+  to the tip's round and NOT ONE new-view was ever sent."
+  3000)
+
+(defn- boot
+  "Start the chain and let it settle with everyone present."
+  []
+  (let [rs (net)
+        leader (c/leader-for witnesses 1)
+        [s0 out] (r/start (get rs leader) 1000)
+        rs (assoc rs leader s0)
+        [rs _] (deliver-all rs (mapv #(assoc % :from leader) out) 1000 4000 #{})]
+    (reduce #(tick-all %1 %2 #{} 4000) rs (range 1100 (+ 1100 (* 40 step)) step))))
+
+(defn- heights [rs gone]
+  (->> (sort (keys rs)) (remove gone) (map #(r/height (get rs %))) vec))
+
+(deftest a-departure-is-not-an-eviction
+  (testing "the harnesses that exist rebuild a replica; this one removes it"
+    (let [rs (boot)
+          hs (heights rs #{})]
+      (is (every? pos? hs) (str "the chain must be running before anything is removed: " hs))
+      (is (= 1 (count (set hs))) (str "and everyone must agree: " hs)))))
+
+(deftest survives-the-departure-of-the-witness-due-to-lead
+  (testing "the chain routes around a leader that is gone — the gap this closed"
+    ;; This replaced a CHARACTERISATION test that asserted the opposite. That
+    ;; test existed because `my-turn?` was keyed by height, so a dead leader
+    ;; held its turn forever and no other replica could take it — *a protocol
+    ;; that tolerates one failure in four, not tolerating one failure in
+    ;; four*, in its own docstring's words. It said to delete it when the gap
+    ;; closed rather than adjust it, and this is that.
+    ;;
+    ;; What closed it: the round is carried in the block and validated against
+    ;; the parent, and a proposer may claim a HIGHER round when it holds a
+    ;; quorum of new-views for the one below — evidence that the intervening
+    ;; leaders produced nothing. Superproject ADR-2608680000.
+    (let [rs (boot)
+          h (apply max (heights rs #{}))
+          victim (c/leader-for witnesses (inc h))
+          gone #{victim}
+          rs' (reduce #(tick-all %1 %2 gone 4000)
+                      rs (range 200000 (+ 200000 (* 60 step)) step))
+          hs (heights rs' gone)]
+      (is (> (apply max hs) h)
+          (str "height " h " was led by " victim ", which is gone. With the round "
+               "carried and skips justified, the survivors move on. Got " hs))
+      (is (<= 5 (count (remove gone witnesses)))
+          "and a quorum was present throughout — this was never a quorum problem")
+      (testing "and the rounds skipped past the departed leader are visible"
+        (let [tip-round (->> (remove gone witnesses)
+                             (map #(:inga.block/round (r/tip (get rs' %))))
+                             (apply max))]
+          (is (> tip-round (apply max hs))
+              (str "a chain that never skipped a round would have round = height; "
+                   "got round " tip-round " at height " (apply max hs))))))))
+
+(deftest survives-a-departure-that-is-not-the-next-leader
+  (testing "SPECIFICATION — losing a non-leading witness must not stop the chain"
+    (let [rs (boot)
+          h (apply max (heights rs #{}))
+          next-leader (c/leader-for witnesses (inc h))
+          ;; someone who is not due to lead the next height
+          victim (first (remove #{next-leader} witnesses))
+          gone #{victim}
+          rs' (reduce #(tick-all %1 %2 gone 4000) rs (range 200000 (+ 200000 (* 30 step)) step))
+          hs (heights rs' gone)]
+      (is (> (apply max hs) h)
+          (str "the chain must advance past " h " with " victim " gone "
+               "(quorum " (c/quorum-size (count witnesses)) " of "
+               (count witnesses) ", " (dec (count witnesses)) " present). Got " hs)))))
+
+(deftest a-stall-never-costs-safety
+  (testing "SPECIFICATION — a chain that cannot advance must still agree"
+    (let [rs (boot)
+          h (apply max (heights rs #{}))
+          gone #{(c/leader-for witnesses (inc h))}
+          rs' (reduce #(tick-all %1 %2 gone 4000) rs (range 200000 (+ 200000 (* 60 step)) step))
+          committed (->> (sort (keys rs')) (remove gone)
+                         (map #(mapv (fn [b] ((:hash-fn (get rs' %)) b))
+                                     (:committed (get rs' %)))))]
+      (is (= 1 (count (set committed)))
+          "every surviving replica must hold the same committed prefix")
+      (is (every? #(= (first committed) %) committed)
+          "liveness may fail; agreement may not"))))
+
+(deftest a-refused-new-view-says-why
+  (testing "an outcome that produces no message must still leave a record"
+    ;; Measured on the Cloudflare testnet: `new-view-groups` sat at zero while
+    ;; views advanced — every new-view refused, and nothing anywhere saying
+    ;; which of three unrelated reasons it was. Four hypotheses were ruled out
+    ;; one at a time before anyone could ask the replica.
+    (let [s (r/replica {:witness :w1 :witnesses witnesses
+                        :quorum (c/quorum-size (count witnesses))
+                        :hash-fn hash-fn
+                        :chain-id "chain-a"
+                        ;; refuses everything, which is what an unknown key or
+                        ;; a mismatched chain-id looks like from in here
+                        :verify-fn (fn [_ _ _] false)})
+          [s' out] (r/on-message s {:type :new-view :witness :w2 :view 7
+                                    :high-qc nil :sig "sig"} 1000)]
+      (is (empty? out))
+      (is (= {:witness "w2" :view 7 :outcome :bad-signature} (:last-new-view s'))
+          "the refusal has to name itself"))
+    (testing "and an unsigned one is a different reason with a different fix"
+      (let [s (r/replica {:witness :w1 :witnesses witnesses
+                          :quorum (c/quorum-size (count witnesses))
+                          :hash-fn hash-fn :chain-id "chain-a"
+                          :verify-fn (fn [_ _ _] true)})
+            [s' _] (r/on-message s {:type :new-view :witness :w2 :view 7
+                                    :high-qc nil} 1000)]
+        (is (= :unsigned (:outcome (:last-new-view s'))))))
+    (testing "and an accepted one says so, so silence never means success"
+      (let [s (r/replica {:witness :w1 :witnesses witnesses
+                          :quorum (c/quorum-size (count witnesses))
+                          :hash-fn hash-fn :chain-id "chain-a"
+                          :verify-fn (fn [_ _ _] true)})
+            [s' _] (r/on-message s {:type :new-view :witness :w2 :view 7
+                                    :high-qc nil :sig "sig"} 1000)]
+        (is (= :accepted (:outcome (:last-new-view s'))))))))

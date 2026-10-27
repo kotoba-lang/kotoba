@@ -1,0 +1,132 @@
+(ns inga.reservation-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [inga.reservation :as reservation]
+            [inga.commitment :as membership]
+            [inga.consensus :as c]
+            [inga.attest :as att]
+            [inga.head :as head]
+            [inga.replica :as r]
+            [inga-node.seams :as seams]
+            [kotoba.lang.edn :as edn]
+            ["node:crypto" :as crypto]))
+
+(def witnesses ["w1" "w2" "w3" "w4"])
+(def seeds (into {} (for [w witnesses] [w (.toString (crypto/randomBytes 32) "hex")])))
+(def pubkeys (into {} (for [[w s] seeds] [w (seams/public-hex s)])))
+(def chain-id "reservation-test")
+(defn opts [w] {:witness w :witnesses witnesses :quorum 3 :chain-id chain-id
+               :hash-fn seams/hash-fn :sign-fn (seams/sign-fn (seeds w))
+               :verify-fn (seams/verify-fn pubkeys)})
+(def genesis (first (:chain (r/replica (opts "w1")))))
+(defn decode [s] (try (js->clj (js/JSON.parse s)) (catch :default _ nil)))
+(def context {:genesis genesis :chain-id chain-id :witnesses witnesses
+              :quorum 3 :max-blocks 256 :hash-fn seams/hash-fn
+              :verify-fn (seams/verify-fn pubkeys) :decode-proposal decode})
+(defn record [cid] (head/head-record {:ref-name "nonce/17" :seq 0 :prev nil :cid cid :height nil}))
+(def a (record "cid-holder-a-intent-a"))
+(def b (record "cid-holder-b-intent-b"))
+(def a2 (record "cid-holder-a-intent-b"))
+(defn certify [block ws]
+  (let [vs (mapv #(att/sign-vote (c/make-vote % (seams/hash-fn block) (:inga.block/height block))
+                               chain-id (:inga.block/height block) (seams/sign-fn (seeds %))) ws)]
+    (att/certify (c/qc vs 4 (:inga.block/height block)) vs)))
+(defn proof [batches]
+  (let [blocks (reduce (fn [bs records]
+                         (let [parent (peek bs) h (inc (:inga.block/height parent))]
+                           (conj bs (assoc (c/make-block
+                                           {:height h :parent-hash (seams/hash-fn parent)
+                                            :proposals (mapv #(js/JSON.stringify (clj->js %)) records)
+                                            :proposer (c/led-by witnesses h) :ts h
+                                            :justify (certify parent (take 3 witnesses))})
+                                          :inga.block/round h)))) [genesis] batches)]
+    {:blocks blocks :tip-qc (certify (peek blocks) (take 3 witnesses))}))
+(defn status [rec p] (:status (reservation/verify-acquisition rec p context)))
+
+(deftest membership-is-preserved-but-only-first-finalized-wins
+  (doseq [loser [b a2] records [[a loser] [loser a]]]
+    (let [p (proof [records [] []]) block (second (:blocks p))
+          cm-context (assoc context :admitted? (set witnesses))]
+      (is (membership/verify-head a "nonce/17" {:block block :qc (certify block (take 3 witnesses))} cm-context))
+      (is (membership/verify-head loser "nonce/17" {:block block :qc (certify block (take 3 witnesses))} cm-context))
+      (is (= :reserved (status (first records) p)))
+      (is (= :rejected (status (second records) p))))))
+
+(deftest incomplete-broadcast-and-partition-never-grant
+  (is (= :unresolved (status a (proof [[a]]))))
+  (is (= :unresolved (status a (proof [[] [] [a]]))))
+  (let [p (proof [[a] [] []]) minority (certify (peek (:blocks p)) ["w1" "w2"])]
+    (is (= :rejected (status a (assoc p :tip-qc minority)))))
+  (is (= :rejected (status a {:block {} :qc {}}))))
+
+(deftest duplicate-restart-and-expiry-do-not-reallocate
+  (let [p (proof [[a a] [b] [] [] []])
+        restored (edn/read-string (pr-str p))]
+    (is (= :reserved (status a restored)))
+    (is (= :rejected (status b restored)))
+    (is (= :reserved (status a restored)))
+    (is (= :rejected (status (assoc b "seq" 1 "prev" (get a "cid") "epoch" 2 "expired" true) restored))))
+  ;; A presenter is not authenticated by a proof. Same CID remains the same
+  ;; reservation even when two workers present it. No exactly-once-send claim.
+  (is (= :reserved (status a (proof [[a] [] []])))))
+
+(deftest binding-and-prefix-negative-controls
+  (let [p (proof [[a] [] []])]
+    (is (= :unresolved (status (assoc a "ref" "other") p)))
+    (is (= :rejected (status a (assoc-in p [:blocks 1 :inga.block/ts] 999))))
+    (is (= :rejected (:status (reservation/verify-acquisition a p (assoc context :chain-id "other")))) )
+    (is (= :rejected (:status (reservation/verify-acquisition a p (assoc context :quorum 2)))))
+    (is (= :unresolved (status a (update p :blocks #(subvec % 1)))))
+    (is (= :rejected (status a (proof [[(assoc a "v" "wrong") b] [] []]))))))
+
+(deftest conflicting-certificates-expose-the-fault-bound
+  ;; Deliberately make 3/4 witnesses sign BOTH branches. This violates the
+  ;; protocol fault bound. Neither signature verification nor finality
+  ;; syntax can repair it; do not label this an honest consensus execution.
+  (is (= :reserved (status a (proof [[a] [] []]))))
+  (is (= :reserved (status b (proof [[b] [] []])))))
+
+;; Real replica state transitions, real signatures, in-memory transport.
+(defn deliver [rs out partition]
+  (loop [rs rs queue (vec out) budget 10000]
+    (cond
+      (empty? queue) rs
+      (zero? budget) (throw (ex-info "transport did not settle" {}))
+      :else
+      (let [[{:keys [from msg]} & tail] queue
+            [rs' more] (reduce (fn [[states outgoing] w]
+                                 (if (or (= from w) (not (partition from w)))
+                                   [states outgoing]
+                                   (let [[s o] (r/on-message (states w) msg 1000)]
+                                     [(assoc states w s) (into outgoing (map #(assoc % :from w) o))])))
+                               [rs []] witnesses)]
+        (recur rs' (into (vec tail) more) (dec budget))))))
+(defn network [partition]
+  (let [rs (into {} (for [w witnesses]
+                      [w (reduce #(r/submit %1 (js/JSON.stringify (clj->js %2)))
+                                 (r/replica (opts w)) [a b a2])]))
+        started (reduce (fn [states w]
+                          (let [[s out] (r/start (states w) 0)]
+                            (deliver (assoc states w s) (map #(assoc % :from w) out) partition))) rs witnesses)]
+    (reduce (fn [states t]
+              (reduce (fn [ss w]
+                        (let [[s out] (r/on-tick (ss w) t)]
+                          (deliver (assoc ss w s) (map #(assoc % :from w) out) partition))) states witnesses))
+            started (range 100 5100 100))))
+
+(deftest simultaneous-requests-through-real-consensus
+  (let [rs (network (fn [_ _] true))]
+    (doseq [[w s] rs]
+      (let [bs (:chain s) qc (get (:qcs s) (seams/hash-fn (peek bs)))
+            ;; A tip still collecting votes can be omitted with its one
+            ;; predecessor; choose the highest prefix with a real tip QC.
+            certified (last (keep-indexed (fn [i block] (when (get (:qcs s) (seams/hash-fn block)) i)) bs))
+            prefix (subvec (vec bs) 0 (inc certified))
+            p {:blocks prefix :tip-qc (get (:qcs s) (seams/hash-fn (peek prefix)))}]
+        (is (seq (:committed s)) w)
+        (is (= 1 (count (filter #(= :reserved (status % p)) [a b a2]))) w)))))
+
+(deftest two-two-partition-has-no-new-finalized-reservation
+  (let [group {"w1" 1 "w2" 1 "w3" 2 "w4" 2}
+        rs (network #(= (group %1) (group %2)))]
+    (doseq [[_ s] rs]
+      (is (not-any? #(seq (:inga.block/proposals %)) (:committed s))))))

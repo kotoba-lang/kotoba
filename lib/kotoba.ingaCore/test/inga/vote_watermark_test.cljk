@@ -1,0 +1,91 @@
+(ns inga.vote-watermark-test
+  (:require [kotoba.test :refer [deftest is]]
+            [inga.replica :as r]
+            [inga.attest :as att]
+            [inga.stake :as stake]
+            [inga.pacemaker :as pm]
+            [inga.consensus :as c]
+            [inga.reservation-test :as fixture]
+            [inga-node.seams :as seams]))
+
+(def a (second (:blocks (fixture/proof [[fixture/a]]))))
+(def b (second (:blocks (fixture/proof [[fixture/b]]))))
+(defn votes [out] (mapv :msg (filter #(= :vote (get-in % [:msg :type])) out)))
+(defn as-vote [m]
+  (assoc (c/make-vote (:witness m) (:block-hash m) (:height m))
+         :inga.vote/view (:view m) :inga.vote/sig (:sig m)))
+(defn signed-valid? [v]
+  ((seams/verify-fn fixture/pubkeys) (:inga.vote/witness v)
+   (att/vote-payload fixture/chain-id (:inga.vote/view v) (:inga.vote/height v)
+                     (:inga.vote/block-hash v) (:inga.vote/witness v)) (:inga.vote/sig v)))
+
+(deftest syncing-an-alternate-tip-must-not-sign-twice-in-one-view
+  (let [signed (atom []) opts (assoc (fixture/opts "w3") :sign-fn
+                                   (fn [payload] (swap! signed conj payload)
+                                     ((seams/sign-fn (fixture/seeds "w3")) payload)))
+        [s first-out] (r/on-message (r/replica opts) {:type :proposal :block a} 1)
+        first-votes (votes first-out)
+        [next out] (r/on-message s {:type :sync-response :blocks [b]} 2)
+        combined (mapv as-vote (concat first-votes (votes out)))
+        evidence (stake/detect-equivocation combined)]
+    (is (= 1 (count first-votes)))
+    (is (= 0 (r/voted-view s)))
+    (is (= 1 (get-in next [:last-sync :adopted])))
+    (is (every? signed-valid? combined))
+    (is (= 1 (count @signed)) "A valid alternate sync tip must not bypass the spent view")
+    (is (empty? (votes out)))
+    (is (empty? evidence) "No pair of authentic conflicting same-view votes may leave")))
+
+(deftest restart-retains-watermark-even-when-vote-cache-is-empty
+  (let [opts (fixture/opts "w3")
+        [s out-a] (r/on-message (r/replica opts) {:type :proposal :block a} 1)
+        restored (r/resume opts (r/snapshot s))
+        [next out-b] (r/on-message restored {:type :sync-response :blocks [b]} 2)]
+    (is (empty? (:votes restored)))
+    (is (= 0 (r/voted-view restored)))
+    (is (empty? (votes out-b)))
+    (is (empty? (stake/detect-equivocation (map as-vote (concat (votes out-a) (votes out-b))))))
+    (is (= 0 (r/voted-view next)))))
+
+(deftest replay-with-a-restored-watermark-never-regresses-it
+  (let [opts (fixture/opts "w3")
+        replayed (r/with-voted-view (r/replay opts [fixture/genesis a]) 20)
+        [next out] (r/on-message replayed {:type :sync-response :blocks [b]} 2)]
+    (is (>= (r/voted-view next) 20))
+    (is (empty? (votes out)))))
+
+(deftest a-later-view-can-sign-again-after-a-spent-view
+  (let [opts (fixture/opts "w3")
+        [s _] (r/on-message (r/replica opts) {:type :proposal :block a} 1)
+        later (assoc s :pm (pm/enter-at-least (:pm s) 1))
+        [next out] (r/on-message later {:type :sync-response :blocks [b]} 2)
+        later-votes (votes out)]
+    (is (= 1 (count later-votes)))
+    (is (= 1 (:view (first later-votes))))
+    (is (signed-valid? (as-vote (first later-votes))))
+    (is (= 1 (r/voted-view next)))))
+
+(deftest cached-vote-is-resent-without-signing-again
+  (let [signed (atom 0)
+        opts (assoc (fixture/opts "w3") :sign-fn
+                    (fn [payload]
+                      (swap! signed inc)
+                      ((seams/sign-fn (fixture/seeds "w3")) payload)))
+        [s first-out] (r/on-message (r/replica opts) {:type :proposal :block a} 1)
+        [_ repeated-out] (r/on-message s {:type :proposal :block a} 2)]
+    (is (= 1 @signed))
+    (is (= (votes first-out) (votes repeated-out)))
+    (is (= 1 (count (votes repeated-out))))))
+
+(deftest sync-tip-must-still-satisfy-pacemaker-lock
+  (let [opts (fixture/opts "w3")
+        [s _] (r/on-message (r/replica opts) {:type :proposal :block a} 1)
+        locked (-> s
+                   (assoc :pm (pm/enter-at-least (:pm s) 1))
+                   (assoc-in [:pm :locked-qc]
+                             {:inga.qc/block-hash "unrelated-lock"
+                              :inga.qc/view 100}))
+        [next out] (r/on-message locked {:type :sync-response :blocks [b]} 2)]
+    (is (= 1 (get-in next [:last-sync :adopted])))
+    (is (empty? (votes out)))
+    (is (= 0 (r/voted-view next)))))

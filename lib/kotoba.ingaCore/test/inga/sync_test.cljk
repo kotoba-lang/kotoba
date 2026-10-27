@@ -1,0 +1,355 @@
+(ns inga.sync-test
+  "Sync is the one path where a replica takes a sequence of blocks from a
+  stranger and adds it to what it believes."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [inga.consensus :as c]
+            [inga.sync :as sync]))
+
+(def params sync/default-params)
+(def witnesses [:w1 :w2 :w3 :w4])
+(def quorum (c/quorum-size (count witnesses)))   ; 3
+
+;; A hash function that is deterministic and legible in failures.
+(defn- h [b] (str "H" (:inga.block/height b) "/" (:inga.block/proposer b)))
+
+(defn- blk
+  [height parent-hash proposer justify]
+  {:inga.block/height height
+   :inga.block/parent-hash parent-hash
+   :inga.block/proposals []
+   :inga.block/proposer proposer
+   :inga.block/ts (* height 10)
+   :inga.block/justify justify})
+
+(defn- qc-for [b witnesses*]
+  {:inga.qc/block-hash (h b)
+   :inga.qc/height (:inga.block/height b)
+   :inga.qc/witnesses (set witnesses*)
+   :inga.qc/vote-count (count witnesses*)})
+
+(defn- honest-chain
+  "n blocks, each certified by a quorum for its parent."
+  [n]
+  (loop [i 1 prev (blk 0 "genesis" :w1 nil) acc [(blk 0 "genesis" :w1 nil)]]
+    (if (> i n)
+      acc
+      (let [b (blk i (h prev) :w1 (qc-for prev [:w1 :w2 :w3]))]
+        (recur (inc i) b (conj acc b))))))
+
+;; ── what to ask for ─────────────────────────────────────────────────────────
+
+(deftest a-caught-up-replica-asks-for-nothing
+  (is (nil? (sync/request 10 10 params)))
+  (is (nil? (sync/request 11 10 params))))
+
+(deftest a-request-is-bounded
+  (testing "a replica a million behind asks for a window, not a million"
+    (let [r (sync/request 0 1000000 params)]
+      (is (= 1 (:from r)))
+      (is (= 256 (:to r)) "a request whose answer does not fit is one that never completes")))
+  (is (= {:from 6 :to 9} (sync/request 5 9 params))))
+
+;; ── what may be believed ────────────────────────────────────────────────────
+
+(deftest an-honest-segment-is-adopted
+  (let [chain (honest-chain 5)
+        held (subvec chain 0 3)          ; heights 0..2
+        segment (subvec chain 3)         ; heights 3..5
+        r (sync/sync-step h quorum held segment params)]
+    (is (nil? (:reason r)))
+    (is (= 3 (:adopted r)))
+    (is (= 6 (count (:chain r))))))
+
+(deftest a-segment-that-attaches-to-nothing-is-refused
+  (testing "a fabricated history is well-formed; that is the point"
+    (let [chain (honest-chain 5)
+          fabricated (honest-chain 5)     ; identical shape, but we hold nothing
+          held [(blk 0 "genesis" :w9 nil)]  ; a DIFFERENT genesis
+          segment (subvec fabricated 1)]
+      ;; `:does-not-link`, not `:uncertified`. The fabricated history is
+      ;; internally consistent — its certificates are fine — and what is wrong
+      ;; is that its first block names a parent we do not hold. The two used
+      ;; to share a name, and a replica seventy blocks behind reported the
+      ;; certificate one while the fact was this one.
+      (is (= :does-not-link
+             (sync/validate-segment h quorum (first held) segment params))
+          "its first block names a parent we do not have"))))
+
+(deftest a-segment-starting-at-the-wrong-height-is-refused
+  (let [chain (honest-chain 6)
+        held (subvec chain 0 3)
+        skipped (subvec chain 4)]        ; starts at 4, we are at 2
+    (is (= :does-not-attach
+           (sync/validate-segment h quorum (last held) skipped params)))))
+
+(deftest a-gap-is-refused
+  (testing "a gap is a place to hide a block"
+    (let [chain (honest-chain 6)
+          held (subvec chain 0 3)
+          gappy [(nth chain 3) (nth chain 5)]]
+      (is (= :non-contiguous
+             (sync/validate-segment h quorum (last held) gappy params))))))
+
+(deftest an-uncertified-block-is-refused
+  (let [chain (honest-chain 4)
+        held (subvec chain 0 2)
+        segment (vec (subvec chain 2))
+        ;; strip the justification off the second block
+        tampered (assoc-in segment [1 :inga.block/justify] (qc-for (first chain) [:w1 :w2 :w3]))]
+    (is (= :uncertified
+           (sync/validate-segment h quorum (last held) tampered params))
+        "its certificate names a block that is not its parent")))
+
+(deftest a-certificate-below-quorum-is-refused
+  (testing "without distinctness one peer certifies its own fiction"
+    (let [chain (honest-chain 3)
+          held (subvec chain 0 2)
+          segment (vec (subvec chain 2))
+          weak (assoc-in segment [0 :inga.block/justify]
+                         (qc-for (nth chain 1) [:w1 :w1 :w1]))]
+      (is (= :below-quorum
+             (sync/validate-segment h quorum (last held) weak params))))))
+
+(deftest an-oversized-segment-is-refused
+  (testing "an unbounded segment is a memory attack that needs no invalid data"
+    (let [chain (honest-chain 300)
+          held (subvec chain 0 1)
+          huge (vec (subvec chain 1))]
+      (is (= :too-large (sync/validate-segment h quorum (last held) huge params))))))
+
+(deftest an-empty-segment-is-refused
+  (is (= :empty-segment
+         (sync/validate-segment h quorum (blk 0 "genesis" :w1 nil) [] params))))
+
+;; ── the all-or-nothing rule ─────────────────────────────────────────────────
+
+(deftest a-bad-tail-rejects-the-whole-segment
+  (testing "adopting the valid prefix would let a peer choose where our history ends"
+    (let [chain (honest-chain 6)
+          held (subvec chain 0 3)
+          segment (vec (subvec chain 3))
+          ;; the first two are fine, the last is not
+          poisoned (assoc-in segment [2 :inga.block/justify]
+                             (qc-for (first chain) [:w1 :w2 :w3]))
+          r (sync/sync-step h quorum held poisoned params)]
+      (is (= :uncertified (:reason r)))
+      (is (= 0 (:adopted r)))
+      (is (= held (:chain r)) "the chain is returned untouched"))))
+
+(deftest every-refusal-is-in-the-closed-set
+  (let [chain (honest-chain 4)
+        held (subvec chain 0 2)
+        cases [[]                                              ; empty
+               (vec (subvec chain 3))                          ; wrong height
+               [(nth chain 2) (nth chain 2)]]]                 ; non-contiguous
+    (doseq [seg cases]
+      (let [r (sync/validate-segment h quorum (last held) seg params)]
+        (is (some? r))
+        (is (contains? sync/reasons r) (str r " is outside the closed set"))))))
+
+;; ── it agrees with the commit rule ──────────────────────────────────────────
+
+(deftest an-adopted-chain-satisfies-the-commit-rule
+  (testing "sync must not accept a chain inga.consensus would reject"
+    (let [chain (honest-chain 6)
+          held (subvec chain 0 2)
+          segment (vec (subvec chain 2))
+          r (sync/sync-step h quorum held segment params)]
+      ;; honest-chain 6 is SEVEN blocks (heights 0..6), so dropping two leaves five
+      (is (= 5 (:adopted r)))
+      (is (seq (c/three-chain-commits h (:chain r)))
+          "the same three-chain rule finds commits in what sync accepted"))))
+
+;; ── genesis is exempt, and nothing above it is ──────────────────────────────
+
+(deftest a-segment-starting-at-height-one-is-not-refused-for-its-genesis-justify
+  (testing "the first block of any history is justified by the certificate
+            inga.replica/start fabricates — one witness, no signatures,
+            because nobody voted for genesis. Refusing it refused the segment
+            WHOLE, so a replica that had fallen behind could never adopt
+            anything: one deployed validator sat at genesis while the others
+            reached forty-five, and the three that remained had exactly quorum
+            with no margin."
+    (let [h (fn [b] (str "H" (:inga.block/height b)))
+          genesis {:inga.block/height 0 :inga.block/parent-hash "genesis"
+                   :inga.block/proposals [] :inga.block/proposer :w1
+                   :inga.block/ts 0 :inga.block/justify nil}
+          boot {:inga.qc/block-hash "H0" :inga.qc/height 0 :inga.qc/view 0
+                :inga.qc/witnesses #{:w1} :inga.qc/vote-count 1}
+          b1 {:inga.block/height 1 :inga.block/parent-hash "H0"
+              :inga.block/proposals [] :inga.block/proposer :w1
+              :inga.block/ts 10 :inga.block/justify boot}]
+      (is (nil? (sync/validate-segment h 3 genesis [b1] params))
+          "one witness and no signatures, and it is genesis"))))
+
+(deftest a-certificate-above-genesis-still-needs-its-quorum
+  (testing "the exception is height zero and nothing else"
+    (let [h (fn [b] (str "H" (:inga.block/height b)))
+          b1 {:inga.block/height 1 :inga.block/parent-hash "H0"
+              :inga.block/proposals [] :inga.block/proposer :w1
+              :inga.block/ts 10
+              :inga.block/justify {:inga.qc/block-hash "H0" :inga.qc/height 0
+                                   :inga.qc/view 0 :inga.qc/witnesses #{:w1}
+                                   :inga.qc/vote-count 1}}
+          b2 {:inga.block/height 2 :inga.block/parent-hash "H1"
+              :inga.block/proposals [] :inga.block/proposer :w1
+              :inga.block/ts 20
+              :inga.block/justify {:inga.qc/block-hash "H1" :inga.qc/height 1
+                                   :inga.qc/view 1 :inga.qc/witnesses #{:w1}
+                                   :inga.qc/vote-count 1}}]
+      (is (= :below-quorum (sync/validate-segment h 3 b1 [b2] params))))))
+
+;; ── rewinding onto a branch that replaces an uncertified suffix ─────────────
+;;
+;; `sync-step` anchored at the tip and nowhere else, so a segment could only be
+;; APPENDED. That is right for a replica that is BEHIND and cannot resolve a
+;; fork, where a replica is BESIDE: its tip is at the same height as its peers'
+;; and a different block, so every segment they can offer starts at or below
+;; that height and is refused `:does-not-attach` — the one answer that
+;; describes the situation exactly and does nothing about it.
+
+(defn- fork-at
+  "A chain of `n` certified blocks, and a rival block at height `n` proposed by
+  somebody else — two blocks at one height, which is what a fork IS."
+  [n]
+  (let [main (honest-chain n)
+        parent (nth main (dec n))
+        rival (blk n (h parent) :w2 (qc-for parent [:w1 :w2 :w3]))]
+    {:chain main :rival rival :parent parent}))
+
+(deftest a-conflicting-certified-branch-replaces-an-uncertified-suffix
+  (let [{:keys [chain rival]} (fork-at 3)
+        ;; the rival branch, certified past the fork point
+        rival-child (blk 4 (h rival) :w1 (qc-for rival [:w1 :w2 :w3]))
+        r (sync/sync-step h quorum chain [rival rival-child]
+                          (assoc params :floor 1))]
+    (is (= :rewound (:reason r)))
+    (is (= 2 (:adopted r)))
+    (testing "the losing block is gone and the incoming branch is the chain"
+      (is (= ["H0/:w1" "H1/:w1" "H2/:w1" "H3/:w2" "H4/:w1"]
+             (mapv h (:chain r)))))
+    (testing "and it reports how much of our own history it discarded, because
+              silently replacing blocks is the one thing sync must never do
+              quietly"
+      (is (= 1 (:discarded r))))))
+
+(deftest a-segment-that-only-echoes-what-we-hold-is-not-a-rewind
+  (testing "a peer re-offering blocks we already have overlaps completely and
+            disagrees with none of it. Rewinding onto that would discard a
+            suffix to put back identical blocks — and since adopting is what
+            makes a replica vote, it would cast a second vote at a height
+            already voted at. Equivocation, produced by the fork repair, against
+            a peer doing nothing wrong."
+    (let [chain (honest-chain 3)
+          echo [(nth chain 3)]
+          r (sync/sync-step h quorum chain echo (assoc params :floor 1))]
+      (is (zero? (:adopted r)))
+      (is (= :does-not-attach (:reason r)))
+      (is (= chain (:chain r)) "the chain is untouched"))))
+
+(deftest a-rewind-may-never-replace-a-committed-block
+  (testing "committed is final under the 3-chain rule, so a quorum-certified
+            segment that contradicts it is not a fork to resolve — it is a
+            safety alarm, and it gets its own name so it can never be read as
+            ordinary sync noise"
+    (let [{:keys [chain rival]} (fork-at 3)
+          rival-child (blk 4 (h rival) :w1 (qc-for rival [:w1 :w2 :w3]))
+          r (sync/sync-step h quorum chain [rival rival-child]
+                            ;; height 3 is committed
+                            (assoc params :floor 3))]
+      (is (zero? (:adopted r)))
+      (is (= :below-commit (:reason r)))
+      (is (= chain (:chain r))))))
+
+(deftest without-a-floor-the-old-append-only-behaviour-is-unchanged
+  (testing "an existing caller that has not been taught about forks must not
+            silently gain the ability to discard its own history"
+    (let [{:keys [chain rival]} (fork-at 3)
+          rival-child (blk 4 (h rival) :w1 (qc-for rival [:w1 :w2 :w3]))
+          r (sync/sync-step h quorum chain [rival rival-child] params)]
+      (is (zero? (:adopted r)))
+      (is (= :below-commit (:reason r))
+          "the default floor is the tip, so nothing above it can be replaced"))))
+
+(deftest a-conflicting-branch-that-does-not-validate-is-refused-whole
+  (testing "no certified-prefix salvage on the rewind path: replacing a suffix
+            is justified only by the incoming branch being one a quorum
+            certified, and a segment trimmed to make it valid is not that —
+            trimming here would let a peer choose how far back we go"
+    (let [{:keys [chain rival]} (fork-at 3)
+          ;; certified by two witnesses, which is below the quorum of three
+          weak-child (blk 4 (h rival) :w1 (qc-for rival [:w1 :w2]))
+          r (sync/sync-step h quorum chain [rival weak-child]
+                            (assoc params :floor 1))]
+      (is (zero? (:adopted r)))
+      (is (= chain (:chain r)) "nothing was adopted, not even the valid prefix"))))
+
+(deftest conflicts-with-chain-answers-only-about-shared-heights
+  (let [chain (honest-chain 3)
+        {:keys [rival]} (fork-at 3)]
+    (is (true? (sync/conflicts-with-chain? h chain [rival]))
+        "a different block at a height we hold")
+    (is (false? (sync/conflicts-with-chain? h chain [(nth chain 2)]))
+        "the same block at a height we hold")
+    (is (false? (sync/conflicts-with-chain? h chain
+                                            [(blk 9 "somewhere" :w1 nil)]))
+        "a height we do not hold is not a conflict, it is a gap")))
+
+;; ── the shape the deployed chain actually stalled in ────────────────────────
+;;
+;; Measured 2026-08-31 on `torihiki-validator-v3`, sixteen days after it stopped:
+;;
+;;   w1 h 5616 committed 5614 root 48cad367  booted-from-checkpoint true
+;;   w2 h 5635 committed 5633 root eb4e02a9  booted-from-checkpoint true
+;;   w3 h 5635 committed 5633 root eb4e02a9  view 916136 and climbing
+;;   w4 h 5616 committed 5614 root 48cad367
+;;
+;;   /block?height=5615  identical on both branches
+;;   /block?height=5616  DIFFERENT
+;;
+;; So the fork is one block above w1's committed height and nineteen below
+;; w2's. w2's branch is the one a quorum certified; w1 and w4 restored from a
+;; checkpoint and replayed onto a different 5616.
+;;
+;; `sync-step`'s rewind path is exactly the machinery for that, and it was
+;; never reached, because of one line in `on-tick`:
+;;
+;;     :from (inc (height state'))
+;;
+;; A replica asks for blocks ABOVE ITS OWN TIP and can ask for nothing else.
+;; w1, tip 5616, asks from 5617. w2 answers 5617-5634. Every one of those
+;; blocks is above w1's tip, so `(<= start tip-h)` is false,
+;; `conflicts-with-chain?` is never consulted, and the segment goes to the
+;; append path — where its parent is a 5616 w1 does not have.
+;; `:does-not-link`, forever, at one message per view for 900,000 views.
+;;
+;; ADR-2608150200 removed `sync-from` on the grounds that no scenario executed
+;; it. The scenario existed; the harness did not.
+
+(deftest a-segment-above-our-tip-cannot-resolve-a-fork-below-it
+  (testing "the production shape, at the sync layer: our tip conflicts, and
+            everything the peer can offer starts above it"
+    (let [{:keys [chain rival]} (fork-at 3)
+          ;; We are on the rival branch at height 3; the certified branch
+          ;; continues from the block we do not have.
+          ours (conj (vec (take 3 chain)) rival)
+          rival-child (blk 4 (h (nth chain 3)) :w1 (qc-for (nth chain 3) [:w1 :w2 :w3]))
+          ;; What a peer answers when we ask from tip+1.
+          above [rival-child]
+          r (sync/sync-step h quorum ours above (assoc params :floor 2))]
+      (is (zero? (:adopted r)))
+      (is (= :does-not-link (:reason r))
+          "a segment starting above the tip reaches the append path, which is
+           the one path that cannot see a conflict below it")))
+  (testing "and the SAME peer, asked one block lower, resolves it"
+    (let [{:keys [chain rival]} (fork-at 3)
+          ours (conj (vec (take 3 chain)) rival)
+          rival-child (blk 4 (h (nth chain 3)) :w1 (qc-for (nth chain 3) [:w1 :w2 :w3]))
+          ;; Asking from committed+1 instead of tip+1 puts the fork point
+          ;; inside the segment, which is what makes it a rewind.
+          from-below [(nth chain 3) rival-child]
+          r (sync/sync-step h quorum ours from-below (assoc params :floor 2))]
+      (is (= :rewound (:reason r)))
+      (is (= 2 (:adopted r)))
+      (is (= 1 (:discarded r))
+          "the block we had at the fork height was replaced, and sync said so"))))

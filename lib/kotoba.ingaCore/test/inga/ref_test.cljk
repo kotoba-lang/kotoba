@@ -1,0 +1,206 @@
+(ns inga.ref-test
+  "The acceptance test for the whole point of this repo: a ref store that
+  passes kotobase's OWN storage conformance suite, declaring
+  `:linearizable-ref`, with no conditional write anywhere under it.
+
+  The reference quorum below is a cooperative oracle. It models the one
+  property `engi.consensus/qc` proves — at most one certificate per height —
+  and nothing else. That makes this suite a check on the ADAPTER (does it
+  refuse a loser, does it report the winner, does it avoid claiming a publish
+  it cannot read back), NOT evidence about any real quorum's agreement. Said
+  plainly because a conformance suite run against an agreeable oracle is the
+  easiest possible way to believe something false."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [inga.head :as head]
+            [inga.ref :as iref]
+            [kotobase.storage.core :as storage]
+            [kotobase.storage.contract :as contract]
+            [kotobase.storage.memory :as memory]))
+
+;; ── a reference quorum, and a stand-in for signatures ────────────────────────
+;;
+;; The "signature" is `witness|bytes`. It is not crypto and is not pretending
+;; to be: this repo has no crypto dependency, `verify-fn` is injected exactly
+;; so the curve lives at the edge, and what these tests need to exercise is
+;; COUNTING and DISTINCTNESS, which a real curve would not make any sharper.
+
+(def witnesses ["w1" "w2" "w3" "w4"])
+(def quorum 3)
+
+(defn- sig-for [witness record]
+  (str witness "|" (head/canonical-bytes record)))
+
+(defn- verify-fn [bytes sig witness]
+  (= sig (str witness "|" bytes)))
+
+(defn- reference-quorum
+  "Certifies at most one record per [ref seq]. `swap!` gives the
+  at-most-once decision under real JVM threads without a lock."
+  [decided]
+  (fn [record]
+    (let [k [(get record "ref") (get record "seq")]
+          winner (get (swap! decided #(if (contains? % k) % (assoc % k record))) k)]
+      (if (= winner record)
+        {:certified? true
+         :cert {:sigs (mapv (fn [w] {:witness w :sig (sig-for w record)})
+                            (take quorum witnesses))}}
+        {:certified? false :current (get winner "cid")}))))
+
+(defn- store-with
+  "A ref store over a dumb unconditional head store, plus the atoms behind it
+  so a test can look at what actually got written."
+  []
+  (let [heads (atom {})
+        decided (atom {})]
+    {:heads heads
+     :decided decided
+     :refs (iref/ref-store
+            {:read-head! (fn [ref-name] (get @heads ref-name))
+             :write-head! (fn [ref-name h] (swap! heads assoc ref-name h))
+             :propose! (reference-quorum decided)
+             :verify-fn verify-fn
+             :admitted? (set witnesses)
+             :quorum quorum})}))
+
+;; ── the acceptance test ──────────────────────────────────────────────────────
+
+(deftest passes-kotobase-storage-conformance-as-linearizable
+  (let [{:keys [refs]} (store-with)
+        backend (storage/compose {:blocks (memory/memory-store) :refs refs})
+        result (contract/verify backend (fn [ok? label] (is ok? label)))]
+    (is (= {:profile :linearizable-ref :concurrency :verified} result)
+        "the composition claims linearizable refs AND the suite ran the concurrent half")))
+
+(deftest the-object-store-underneath-needs-no-conditional-write
+  (testing "blocks are validated against block-capabilities only"
+    (let [{:keys [refs]} (store-with)
+          blocks (memory/memory-store)
+          backend (storage/compose {:blocks blocks :refs refs})]
+      (is (every? (storage/-capabilities blocks) storage/block-capabilities)
+          "a block store only has to hold immutable CID-addressed bytes")
+      (is (= :linearizable-ref (storage/ref-profile backend))
+          "the composition takes its ref profile from the ref store, not the blocks"))))
+
+;; ── the property the adapter is responsible for ──────────────────────────────
+
+(deftest a-second-writer-at-the-same-sequence-loses
+  (let [{:keys [refs]} (store-with)]
+    (is (:published? (storage/-compare-and-set-ref! refs "main" nil "cid-1")))
+    (let [loser (storage/-compare-and-set-ref! refs "main" nil "cid-other")]
+      (is (false? (:published? loser))
+          "a writer proposing from the same (genesis) base does not also win")
+      (is (= "cid-1" (:current loser))
+          "and it is told which head actually won, so it can retry on the right base"))))
+
+(deftest a-refused-proposal-reports-the-winning-head-not-the-stale-one
+  (let [{:keys [decided refs]} (store-with)]
+    (storage/-compare-and-set-ref! refs "main" nil "cid-1")
+    ;; Pre-decide sequence 1 for someone else, then race it from the head we
+    ;; can legitimately see. This is the case a caller cannot recover from if
+    ;; the store answers `false` with no head: it would retry against the same
+    ;; base forever.
+    (swap! decided assoc ["main" 1]
+           (head/head-record {:ref-name "main" :seq 1 :cid "cid-theirs"
+                              :prev "cid-1" :height nil}))
+    (let [loser (storage/-compare-and-set-ref! refs "main" "cid-1" "cid-mine")]
+      (is (false? (:published? loser)))
+      (is (= "cid-theirs" (:current loser))))))
+
+(deftest a-lost-write-is-not-reported-as-published
+  (testing "certified, but the dumb store dropped it"
+    (let [heads (atom {})
+          decided (atom {})
+          refs (iref/ref-store
+                {:read-head! (fn [ref-name] (get @heads ref-name))
+                 :write-head! (fn [_ _] nil)          ; a store that silently drops
+                 :propose! (reference-quorum decided)
+                 :verify-fn verify-fn
+                 :admitted? (set witnesses)
+                 :quorum quorum})
+          result (storage/-compare-and-set-ref! refs "main" nil "cid-1")]
+      (is (false? (:published? result))
+          "a certificate is not a promise that the bytes landed")
+      (is (nil? (storage/-read-ref refs "main"))))))
+
+(deftest sequence-is-derived-and-the-chain-links
+  (let [{:keys [heads refs]} (store-with)]
+    (storage/-compare-and-set-ref! refs "main" nil "cid-1")
+    (storage/-compare-and-set-ref! refs "main" "cid-1" "cid-2")
+    (let [h (get @heads "main")]
+      (is (= 1 (get h "seq")) "seq is derived from the observed head, never supplied")
+      (is (= "cid-1" (get h "prev")) "and prev links the chain")
+      (is (= 1 (:version (storage/-read-ref refs "main")))
+          "the ref version a caller sees is that sequence"))))
+
+;; ── the head store is dumb, and dumb includes wrong (ADR-2608047000) ─────────
+
+(deftest a-genuinely-certified-head-for-another-ref-is-not-this-refs-head
+  ;; `write-head!` is unconditional and `read-head!` is untrusted -- that is
+  ;; the premise, not a weakness. So the pointer answering a read for "main"
+  ;; with "other"'s real head is inside its contract. Nothing here is forged:
+  ;; the record, its certificate and the quorum all agree. The only thing
+  ;; wrong with the head is which question it is answering.
+  (let [{:keys [refs heads]} (store-with)]
+    (storage/-compare-and-set-ref! refs "main" nil "cid-main")
+    (storage/-compare-and-set-ref! refs "other" nil "cid-other")
+    (is (= "cid-main" (:cid (storage/-read-ref refs "main"))))
+    (testing "the host serves `other`'s certified head under `main`"
+      (swap! heads assoc "main" (get @heads "other"))
+      (is (nil? (storage/-read-ref refs "main"))
+          "a certificate proves the witnesses signed THAT record, not that it answers THIS ref")
+      (testing "and `other` still reads, so this rejects substitution and not the head"
+        (is (= "cid-other" (:cid (storage/-read-ref refs "other"))))))))
+
+;; ── the other way to answer "what is the verified head" ─────────────────────
+
+(deftest head-of-replaces-the-read-and-verify-pair
+  ;; inga's own witnesses sign a vote payload covering a BLOCK HASH, so no
+  ;; quorum certificate satisfies `head/verify-cert` and a deployment on real
+  ;; consensus has to prove its heads another way (`inga.commitment`).
+  ;; `head-of!` is that seam; the certificate form is untouched.
+  (let [heads (atom {})
+        decided (atom {})
+        asked (atom [])
+        refs (iref/ref-store
+              {:write-head! (fn [ref-name h] (swap! heads assoc ref-name h))
+               :propose! (reference-quorum decided)
+               ;; No read-head!, no verify-fn, no admitted?, no quorum: this
+               ;; form does not use them, and demanding them would make a
+               ;; deployment invent seams nothing calls.
+               :head-of! (fn [ref-name]
+                           (swap! asked conj ref-name)
+                           (get @heads ref-name))})]
+    (is (:published? (storage/-compare-and-set-ref! refs "main" nil "cid-1")))
+    (is (= {:cid "cid-1" :version 0} (storage/-read-ref refs "main")))
+    (is (seq @asked) "the seam was actually used, not merely accepted")
+
+    (testing "the compare-and-set still compares — a second writer from the
+              same base loses, and is told the head that won"
+      (let [loser (storage/-compare-and-set-ref! refs "main" nil "cid-other")]
+        (is (false? (:published? loser)))
+        (is (= "cid-1" (:current loser)))))
+
+    (testing "a head-of! that refuses everything reads as an absent ref rather
+              than an error — the same reading `head/verify-head` gives"
+      (let [blind (iref/ref-store
+                   {:write-head! (fn [_ _] nil)
+                    :propose! (reference-quorum (atom {}))
+                    :head-of! (constantly nil)})]
+        (is (nil? (storage/-read-ref blind "main")))))))
+
+(deftest the-certificate-form-still-demands-its-seams
+  (testing "dropping head-of! must not make the original form lenient"
+    (is (thrown? js/Error
+                 (iref/ref-store {:read-head! (constantly nil)
+                                  :write-head! (fn [_ _] nil)
+                                  :propose! (constantly nil)
+                                  :verify-fn verify-fn
+                                  ;; no admitted?
+                                  :quorum quorum})))
+    (is (thrown? js/Error
+                 (iref/ref-store {:read-head! (constantly nil)
+                                  :write-head! (fn [_ _] nil)
+                                  :propose! (constantly nil)
+                                  :verify-fn verify-fn
+                                  :admitted? (set witnesses)
+                                  :quorum 0})))))
