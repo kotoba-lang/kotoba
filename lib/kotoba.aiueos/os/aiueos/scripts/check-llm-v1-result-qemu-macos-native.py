@@ -16,7 +16,7 @@ import sys
 
 HERE = Path(__file__).resolve().parent
 NATIVE = HERE.parent / "native"
-ALIAS_PROBE_SHA256 = "54b6b739daaf6b8b67f78fc339942118a8cf0d054593b4fc6481c95136c8a7c4"
+SOURCE_PROBE_SHA256 = "908ce96b05c44356a2b46dac87a20304210a6bdf5af16c70d7019f64909733f2"
 
 
 def pin(path):
@@ -45,8 +45,8 @@ def main():
     observer = a.observer.resolve(strict=True)
     if a.observer.is_symlink() or pin(observer)["sha256"] != a.observer_sha256:
         p.error("observer must be a regular file with the declared digest")
-    if pin(NATIVE / "llm_v1_header_probe.kotoba")["sha256"] != ALIAS_PROBE_SHA256:
-        p.error("review the alias checks before claiming their QEMU readback")
+    if pin(NATIVE / "llm_v1_header_probe.kotoba")["sha256"] != SOURCE_PROBE_SHA256:
+        p.error("review alias and keyword-boundary checks before QEMU readback")
     output = a.output.resolve()
     output.mkdir(mode=0o700, parents=True, exist_ok=False)
     cases = (("positive", "llm_v1_header_probe.kotoba", True),
@@ -113,6 +113,9 @@ def main():
              "guestEmulation": "QEMU TCG", "wire11Dispatch": False,
              "modelExecution": False, "humanConsent": False,
              "utf8ComponentValidated": True, "aliasingQualified": False,
+             "keywordFieldByteBoundary": {"accepted": 512, "refused": 513,
+                                          "fields": ["model", "finish-reason", "error-code"]},
+             "keywordValueConversionQualified": False,
              "aliasRefusalsObserved": [
                  "model-selected-same-root",
                  "empty-system-prompt-same-root",
