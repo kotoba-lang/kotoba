@@ -17,6 +17,9 @@ from pathlib import Path
 
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
+_boundary_spec = importlib.util.spec_from_file_location('harness_control_process_boundary', ROOT / 'bin/process-boundary.py')
+_boundary = importlib.util.module_from_spec(_boundary_spec)
+_boundary_spec.loader.exec_module(_boundary)
 MANIFEST = ROOT / 'test/native/manifest.json'
 FUEL = 1_000_000
 
@@ -55,7 +58,7 @@ def environment():
     if container and not shutil.which('podman'):
         raise Blocked('local ARM64 Podman VM is required; no compiler fallback')
     if container:
-        vm = subprocess.run(['podman', 'machine', 'ssh', 'uname', '-m'], capture_output=True, text=True, timeout=20)
+        vm = subprocess.run(['podman', 'machine', 'ssh', 'uname', '-m'], capture_output=True, text=True, timeout=20, env=_boundary.clean_env())
         if vm.returncode or vm.stdout.strip() not in ('aarch64', 'arm64'):
             raise Blocked('Podman VM must already be running native ARM64 Linux')
     hostfile = amu / 'scripts/seed/check-wasm32-browser.py'
@@ -64,6 +67,7 @@ def environment():
     spec = importlib.util.spec_from_file_location('amu_browser', hostfile)
     host = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(host)
+    host.subprocess = _boundary.BrowserProcesses()
     browser = host.find_browser(os.environ.get('KOTOBA_BROWSER') or
                                 ('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' if system == 'Darwin' else None))
     if not browser:
@@ -100,7 +104,7 @@ def run_control(cfg, name, method, entry, out):
                      ['compile', prefix + '/verify.kotoba', '--target', 'wasm32-browser', '--output', prefix + '/verify.wasm'],
                      ['compile', prefix + '/verdict.kotoba', '--target', cfg['target'], '--output', prefix + '/verdict.elf', '--format', 'static']]:
             argv = command(cfg, directory, args)
-            env = dict({k:v for k,v in os.environ.items() if not k.startswith('KEXE_')}, KEXE_ALLOW='35,37,38,39', KEXE_CAP_RESOURCES_35=str(directory), KEXE_STACK_BYTES='8388608',
+            env = _boundary.clean_env(KEXE_ALLOW='35,37,38,39', KEXE_CAP_RESOURCES_35=str(directory), KEXE_STACK_BYTES='8388608',
                        KEXE_CPU_SECONDS='30', KEXE_WALL_SECONDS='40')
             result = subprocess.run(argv, capture_output=True, text=True, timeout=50, env=env)
             receipt['commands'].append(dict(args=args, exit=result.returncode, stdout=result.stdout, stderr=result.stderr))

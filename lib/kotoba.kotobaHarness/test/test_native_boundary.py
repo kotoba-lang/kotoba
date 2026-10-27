@@ -94,6 +94,20 @@ class NativeBoundary(unittest.TestCase):
             self.assertEqual(env['KEXE_ALLOW'], '3,7,37,39,41')
             self.assertEqual(env['PATH'], '/native-no-host-tools')
 
+    def test_browser_driver_processes_never_inherit_model_credentials(self):
+        sentinel = object()
+        for module in (transport, controls):
+            driver = SimpleNamespace(subprocess=module._boundary.BrowserProcesses())
+            with patch.dict(os.environ, {'OPENROUTER_API_KEY': 'test-only-secret', 'KEXE_ALLOW': 'everything'}), \
+                 patch.object(subprocess, 'Popen', return_value=sentinel) as launch:
+                for explicit in (None, {'OPENROUTER_API_KEY': 'explicit-secret', 'OPENROUTER_OTHER': 'other', 'PATH': '/browser-tools'}):
+                    self.assertIs(driver.subprocess.Popen(['/browser'], env=explicit), sentinel)
+                    env = launch.call_args.kwargs['env']
+                    self.assertFalse(any(k.startswith(('OPENROUTER_', 'KEXE_')) for k in env))
+                    self.assertEqual(env['PATH'], os.environ['PATH'] if explicit is None else '/browser-tools')
+                self.assertEqual(os.environ['OPENROUTER_API_KEY'], 'test-only-secret')
+                self.assertIs(driver.subprocess.TimeoutExpired, subprocess.TimeoutExpired)
+
     def test_corrupt_compiler_pin_stops_before_execution(self):
         with tempfile.TemporaryDirectory() as directory:
             compiler = Path(directory) / 'compiler'

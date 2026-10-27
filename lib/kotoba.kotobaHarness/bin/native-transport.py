@@ -26,6 +26,10 @@ import urllib.request
 
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
+_boundary_spec = importlib.util.spec_from_file_location('harness_process_boundary', ROOT / 'bin/process-boundary.py')
+_boundary = importlib.util.module_from_spec(_boundary_spec)
+_boundary_spec.loader.exec_module(_boundary)
+clean_env = _boundary.clean_env
 MODULES = ('data', 'catalog', 'ast', 'decision', 'search', 'io', 'verification', 'main', 'gate')
 CLOSURES = {'main': (*MODULES[:-1], 'ledger'), 'gate': ('data', 'io', 'gate'), 'data': ('data',),
             'catalog': ('data', 'catalog'), 'search': ('data', 'catalog', 'ast', 'decision', 'search'),
@@ -43,13 +47,6 @@ def sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def clean_env(**grants):
-    # Credentials are used only by the explicit HTTP transport. They are never
-    # inherited by compilers, guests or Chrome.
-    return dict({k: v for k, v in os.environ.items()
-                 if not k.startswith(('KEXE_', 'OPENROUTER_'))}, **grants)
-
-
 class Native:
     def __init__(self, amu, output):
         obsolete = [key for key in ('NBB', 'KOTOBA_BIN', 'KOTOBA_BROWSER_HOST') if os.environ.get(key)]
@@ -65,7 +62,7 @@ class Native:
             raise Blocked('this whole-harness route requires native ARM64 Linux (macOS: ARM64 Podman VM); no emulation/fallback')
         self.container = platform.system() == 'Darwin'
         if self.container:
-            vm = subprocess.run(['podman', 'machine', 'ssh', 'uname', '-m'], capture_output=True, text=True, timeout=20)
+            vm = subprocess.run(['podman', 'machine', 'ssh', 'uname', '-m'], capture_output=True, text=True, timeout=20, env=clean_env())
             if vm.returncode or vm.stdout.strip() not in ('aarch64', 'arm64'):
                 raise Blocked('an already-running native ARM64 Podman VM is required')
         self.compiler = self.amu / self.pin['compiler']['path']
@@ -148,6 +145,7 @@ class Native:
         spec = importlib.util.spec_from_file_location('amu_browser', self.amu / self.pin['browser-driver']['path'])
         host = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(host)
+        host.subprocess = _boundary.BrowserProcesses()
         browser = host.find_browser(os.environ.get('KOTOBA_BROWSER') or
                    ('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' if platform.system() == 'Darwin' else None))
         if not browser:
