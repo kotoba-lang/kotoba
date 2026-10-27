@@ -164,7 +164,7 @@ def main(args):
             "build-native-font-macos.py", "build-native-kernel-macos.py",
             "build-native-media-macos.py", "check-native-desktop-qemu.py",
             "check-native-draft-restart-qemu.py", "check-native-consent-qemu.py",
-            "check-native-idle-silent-qemu.py",
+            "check-native-idle-silent-qemu.py", "check-native-cid-qemu.py",
             "check-native-media-format.py",
         )
     }
@@ -236,6 +236,7 @@ def main(args):
 
         kernel_entry = ("workspace-entry.kotoba" if args.profile == "local-draft"
                         else "consent-entry.kotoba" if args.profile == "consent"
+                        else "cid-entry.kotoba" if args.profile == "cid"
                         else "desktop-entry.kotoba")
         call("kernel", scripts["build-native-kernel-macos.py"], [
             "--compiler-image", compiler, "--compiler-sha256", args.compiler_sha256,
@@ -247,7 +248,7 @@ def main(args):
         efi = kernel / "BOOTX64.EFI"
         image = kernel / "KERNEL.ELF"
         if (kernel_state["state"] != "MACOS_NATIVE_IMAGE_CANDIDATE"
-                or kernel_state["sourceModuleCount"] != 31
+                or kernel_state["sourceModuleCount"] != (32 if args.profile == "cid" else 31)
                 or kernel_state["fuel"] != FUEL
                 or kernel_state["compiler"] != compiler_pin
                 or pin(efi) != kernel_state["efi"] or pin(image) != kernel_state["kernel"]
@@ -276,6 +277,7 @@ def main(args):
         guest_script = ("check-native-draft-restart-qemu.py" if args.profile == "local-draft"
                         else "check-native-consent-qemu.py" if args.profile == "consent"
                         else "check-native-idle-silent-qemu.py" if args.profile == "idle"
+                        else "check-native-cid-qemu.py" if args.profile == "cid"
                         else "check-native-desktop-qemu.py")
         guest_args = [
             "--media", disk, "--efi", efi, "--kernel", image,
@@ -285,15 +287,18 @@ def main(args):
         receipt_name = ("native-draft-restart.json" if args.profile == "local-draft"
                         else "native-consent-qemu.json" if args.profile == "consent"
                         else "native-idle-silent-qemu.json" if args.profile == "idle"
+                        else "native-cid-qemu.json" if args.profile == "cid"
                         else "native-desktop-qemu.json")
         observed = json.loads((guest / receipt_name).read_text())
         expected_status = ("PASS_NATIVE_LOCAL_DRAFT_COLD_RESTORE" if args.profile == "local-draft"
                            else "PASS_NATIVE_CONSENT_QEMU" if args.profile == "consent"
                            else "PASS_NATIVE_IDLE_SILENT_QEMU" if args.profile == "idle"
+                           else "PASS_NATIVE_CID_QEMU" if args.profile == "cid"
                            else "PASS_NATIVE_DESKTOP_INPUT_QEMU")
         expected_events = (12 if args.profile == "local-draft"
                            else 12 if args.profile == "consent"
-                           else 4 if args.profile == "idle" else 12)
+                           else 4 if args.profile == "idle"
+                           else 2 if args.profile == "cid" else 12)
         if (observed["status"] != expected_status
                 or len(observed["events"]) != expected_events
                 or observed["kernel"] != kernel_state["kernel"]
@@ -324,6 +329,12 @@ def main(args):
                     or observed["events"][2]["newFrames"] < 1
                     or observed["physicalHardware"]):
                 raise ValueError("idle-silent verdict is incomplete")
+        elif args.profile == "cid":
+            if (observed["font"] != font_state["padded"]
+                    or [row["name"] for row in observed["events"]] != ["first-frame", "cid-admit"]
+                    or observed["events"][1]["codes"] != [0, 8, 4, 3]
+                    or observed["urlSchemeHandler"] or observed["physicalHardware"]):
+                raise ValueError("cid admission verdict is incomplete")
         elif args.profile == "consent":
             if (observed["font"] != font_state["padded"]
                     or [row["name"] for row in observed["events"]] != [
@@ -371,6 +382,7 @@ def main(args):
                             if args.profile == "local-draft"
                             else "MACOS_NATIVE_CONSENT_QEMU_CANDIDATE" if args.profile == "consent"
                             else "MACOS_NATIVE_IDLE_SILENT_QEMU_CANDIDATE" if args.profile == "idle"
+                            else "MACOS_NATIVE_CID_QEMU_CANDIDATE" if args.profile == "cid"
                             else "MACOS_NATIVE_DESKTOP_QEMU_CANDIDATE"),
                      font=font_state["padded"], kernel=kernel_state["kernel"],
                      efi=kernel_state["efi"], media=media_state["image"], iso=media_state["iso"],
@@ -384,6 +396,8 @@ def main(args):
                                     if args.profile == "consent"
                                     else "Mac native idle desktop emits no guest frame on a captured virtual NIC (QEMU)"
                                     if args.profile == "idle"
+                                    else "Mac native CID admission self-test (accept, digest, multihash, codec) on QEMU"
+                                    if args.profile == "cid"
                                     else "Mac native GPT and EFI El Torito ISO QEMU desktop input")
                      + "; D2 workspace, release and physical gates separate")
         save()
@@ -410,7 +424,7 @@ if __name__ == "__main__":
     parser.add_argument("--firmware", type=Path, required=True)
     parser.add_argument("--firmware-sha256", required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--profile", choices=("desktop", "local-draft", "consent", "idle"), default="desktop")
+    parser.add_argument("--profile", choices=("desktop", "local-draft", "consent", "idle", "cid"), default="desktop")
     parser.add_argument("--distribution", choices=("aiueos", "awai"), default="aiueos")
     # kernel-v3 (RW at 0x400000) leaves the packager about 3 MiB of room (the compiler's
     # text cap stays 2 MiB, native/layout-table.json) instead of kernel-v1's
