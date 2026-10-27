@@ -287,7 +287,7 @@ def main(args):
                            else "PASS_NATIVE_CONSENT_QEMU" if args.profile == "consent"
                            else "PASS_NATIVE_IDLE_SILENT_QEMU" if args.profile == "idle"
                            else "PASS_NATIVE_DESKTOP_INPUT_QEMU")
-        expected_events = (11 if args.profile == "local-draft"
+        expected_events = (12 if args.profile == "local-draft"
                            else 11 if args.profile == "consent"
                            else 4 if args.profile == "idle" else 12)
         if (observed["status"] != expected_status
