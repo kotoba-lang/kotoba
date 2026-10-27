@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise a fresh native Itonami Y/N choice and local model in two QEMU boots.
+"""Exercise a fresh native Itonami Y/N choice and local model in QEMU boots.
 
 No VNC, guest agent, network, host model service or human key press is used.
 QMP keys verify the guest decision path; they do not prove a human approved it.
@@ -308,11 +308,19 @@ def main():
                 after = snapshot(base, qmp, directory, context)
                 assert after["approved"] == (0 if user_call else 1)
                 assert after["modelToken"] == expected_token
+                if layout_v2:
+                    assert after["generation"] == 2
+                    assert after["title"] == "Itonami demo " + chr(expected_token)
+                    result_visible = base.screenshot(
+                        qmp, directory, font.read_bytes(), goal, "diagnostic-result")
+                else:
+                    result_visible = None
                 boots.append({"boot": 2, "restored": current, "pending": pending,
                               "denied": denied, "screenshot": visible,
                               "approvalScreenshot": {"image": str(approval_png),
                                                      "pin": base.pin(approval_png)},
-                              "userEndpoint": user})
+                              "userEndpoint": user, "after": after,
+                              "resultScreenshot": result_visible})
         finally:
             base.close(process, qmp, log)
         if ordinal == 1:
@@ -320,7 +328,62 @@ def main():
             assert first != bytes(blank) and first[:512] == blank[:512]
             assert first[2048:] == blank[2048:]
         else:
-            assert disk.read_bytes() == first, "model operation changed the Goal draft disk"
+            if layout_v2:
+                second = disk.read_bytes()
+                assert second != first and second[:512] == first[:512]
+                assert second[1536:] == first[1536:]
+                assert struct.unpack_from("<4I", second, 512) == (
+                    0x31484457, 1, 2, 2)
+                assert struct.unpack_from("<7I", second, 1024) == (
+                    0x31544457, 2, 2, len(goal), 1, expected_token, 1)
+                assert base.hashlib.sha256(second[1024:1504]).digest() == second[1504:1536]
+                assert second[992:1024] == second[1504:1536]
+            else:
+                assert disk.read_bytes() == first, "model operation changed the Goal draft disk"
+    if layout_v2:
+        directory = output / "result-restore"
+        process, qmp, log = base.boot(args, directory, disk)
+        try:
+            restored = wait(base, qmp, directory, context, "boot",
+                            lambda s: s["goal"] == base.PREFIX + goal
+                            and s["restore"] == 2 and s["generation"] == 2
+                            and s["pending"] == 0 and s["approved"] == 0
+                            and s["submitted"] == 0
+                            and s["modelToken"] == expected_token
+                            and s["title"] == "Itonami demo " + chr(expected_token))
+            base.key(qmp, "2")
+            reopened = wait(base, qmp, directory, context, "reopened",
+                            lambda s: s["focus"] == 2
+                            and s["modelToken"] == expected_token
+                            and s["pending"] == 0 and s["approved"] == 0
+                            and s["title"] == "Itonami demo " + chr(expected_token))
+            visible = base.screenshot(
+                qmp, directory, font.read_bytes(), goal, "restored-result")
+            boots.append({"boot": 3, "diagnosticResultRestored": restored,
+                          "reopened": reopened, "screenshot": visible})
+        finally:
+            base.close(process, qmp, log)
+        assert disk.read_bytes() == second
+        corrupt_disk = output / "corrupt-result.raw"
+        corrupt = bytearray(second)
+        corrupt[1024 + 20] ^= 1
+        corrupt_disk.write_bytes(corrupt)
+        directory = output / "corrupt-result"
+        process, qmp, log = base.boot(args, directory, corrupt_disk)
+        try:
+            refused = wait(base, qmp, directory, context, "boot",
+                           lambda s: s["goal"] == base.PREFIX
+                           and s["restore"] < 0 and s["generation"] == 0
+                           and s["modelToken"] == 0 and s["pending"] == 0
+                           and s["approved"] == 0)
+        finally:
+            base.close(process, qmp, log)
+        assert corrupt_disk.read_bytes() == bytes(corrupt)
+        modified_disk = output / "modified-slot.raw"
+        modified_disk.write_bytes(first)
+    else:
+        refused = None
+        modified_disk = disk
     # A changed code byte in the sealed slot must fail before the guest copies
     # either user page or computes the local model. Keep the original EFI and
     # the marked disk immutable across this independent third boot.
@@ -333,7 +396,7 @@ def main():
     args.efi = modified_efi
     args.boot_media = None  # The altered EFI is tested through its own FAT boot.
     directory = output / "modified-slot"
-    process, qmp, log = base.boot(args, directory, disk)
+    process, qmp, log = base.boot(args, directory, modified_disk)
     try:
         wait(base, qmp, directory, context, "boot",
              lambda s: s["goal"] == base.PREFIX + goal and s["restore"] == 1)
@@ -370,11 +433,15 @@ def main():
         base.close(process, qmp, log)
         args.efi = original_efi
         args.boot_media = media
-    assert disk.read_bytes() == first, "modified slot boot changed the draft disk"
+    assert modified_disk.read_bytes() == first, "modified slot boot changed the draft disk"
+    if layout_v2:
+        assert disk.read_bytes() == second
     if media is not None:
         assert base.pin(media) == media_pin, "boot media changed during QEMU snapshot runs"
-    report = {"schema": "aiueos.native-local-model-confirm-qemu.v2",
-              "status": ("PASS_NATIVE_USER_MODEL_SYSCALL_AFTER_RESTORE" if user_call
+    report = {"schema": "aiueos.native-local-model-confirm-qemu.v3" if layout_v2 else
+                        "aiueos.native-local-model-confirm-qemu.v2",
+              "status": ("PASS_NATIVE_USER_DIAGNOSTIC_RESULT_COLD_RESTORE" if layout_v2
+                         else "PASS_NATIVE_USER_MODEL_SYSCALL_AFTER_RESTORE" if user_call
                          else "PASS_NATIVE_LOCAL_MODEL_DENY_APPROVE_CPL3_AFTER_RESTORE"),
               "kernelEntry": entry, "userOriginatedModelCall": user_call,
               "build": str(build), "kernel": base.pin(args.kernel), "efi": base.pin(args.efi),
@@ -387,6 +454,7 @@ def main():
               "userElfSha256": USER_V4_ELF_SHA256 if layout_v2 else USER_ELF_SHA256 if user_call else ELF_SHA256,
               "goal": goal, "expectedToken": expected_token,
               "modelContract": base.pin(matrix_path), "boots": boots,
+              "corruptResultRefusal": refused,
               "modifiedSlotRefusal": modified,
               "scratchDisk": base.pin(disk), "qmpTransport": "private-stdio",
               "vncUsed": False, "networkUsed": False, "humanPasswordRequired": False,
