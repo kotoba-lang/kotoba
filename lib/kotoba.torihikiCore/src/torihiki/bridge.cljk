@@ -1,0 +1,232 @@
+(ns torihiki.bridge
+  "The engine's half of `contracts/src/TorihikiBridge.sol`.
+
+  Roadmap D3. Two jobs, both pure:
+
+  1. **What a validator signs.** The contract pays a withdrawal only against
+     EIP-712 signatures from more than 2/3 of its validator set. The digest is
+     computed here, byte for byte as the contract computes it, so a validator
+     can sign a pending claim straight from chain state. If the two
+     disagreed, every signature would recover to a stranger and nothing would
+     ever pay — so the digest is pinned three ways: here, in the contract's
+     own test, and independently with `cast` (see `bridge_test`).
+
+  2. **What a validator attests.** The contract's events are the evidence:
+     `Deposit` becomes `:deposit-attest`, `Withdrawn` becomes
+     `:withdraw-attest`, `WithdrawalInvalidated` becomes
+     `:withdraw-invalidate-attest`. The engine credits, settles or refunds
+     only when a quorum of the active set says the same thing
+     (`torihiki.state`).
+
+  Reading the chain (`eth_getLogs`), holding the bridge signer key, and
+  submitting the signatures are the node's job. This namespace decides what
+  the bytes mean and nothing else, which is the part that has to be testable
+  without a network."
+  (:require [kotoba.lang.text :as str]
+            [kotoba.bytes :as b]
+            [torihiki.keccak :as kc]))
+
+;; ── ABI words ───────────────────────────────────────────────────────────────
+
+(defn- strip0x [h] (str/replace (or h "") #"^0x" ""))
+
+(defn- uint-word
+  "A non-negative integer as a 32-byte big-endian word. i53 at most — the
+  engine's whole numeric domain, and the contract refuses anything larger."
+  [n]
+  (let [n (long n)]
+    (vec (concat (repeat 24 0)
+                 (for [i (range 7 -1 -1)]
+                   (long (mod (quot n (long (Math/pow 256 i))) 256)))))))
+
+(defn- address-word [a]
+  (let [bs (kc/hex->bytes (strip0x a))]
+    (when-not (= 20 (count bs))
+      (throw (ex-info "torihiki.bridge: not a 20-byte address" {:address a})))
+    (vec (concat (repeat 12 0) bs))))
+
+(defn- bytes32 [h]
+  (let [bs (kc/hex->bytes (strip0x h))]
+    (when-not (= 32 (count bs))
+      (throw (ex-info "torihiki.bridge: not 32 bytes" {:hex h})))
+    bs))
+
+(defn- keccak [bs] (kc/digest-bytes bs))
+(defn- keccak-str [s] (keccak (b/utf8-encode s)))
+
+(defn- hex [bs] (str "0x" (kc/bytes->hex bs)))
+
+;; ── EIP-712 ─────────────────────────────────────────────────────────────────
+
+(def ^:private domain-type
+  "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)")
+(def withdrawal-type
+  "Withdrawal(bytes32 chain,uint64 claim,address dest,uint256 amount,uint64 epoch)")
+(def validator-set-type
+  "ValidatorSet(bytes32 chain,uint64 fromEpoch,uint64 epoch,address[] signers,uint64[] powers)")
+(def action-type
+  "Action(bytes32 chain,uint64 epoch,string kind,uint64 claim,uint256 value,uint64 nonce)")
+
+(defn domain-separator
+  "`{:evm-chain-id :contract}` — the chain the contract lives on and its
+  address. The name and version are the contract's constants."
+  [{:keys [evm-chain-id contract]}]
+  (keccak (concat (keccak-str domain-type)
+                  (keccak-str "torihiki-bridge")
+                  (keccak-str "1")
+                  (uint-word evm-chain-id)
+                  (address-word contract))))
+
+(defn- typed-digest [domain struct-hash]
+  (keccak (concat [0x19 0x01] (domain-separator domain) struct-hash)))
+
+(defn withdrawal-digest
+  "What a validator signs to let the contract pay `claim`.
+
+  `chain` is the torihiki chain id string; `epoch` the contract's validator
+  epoch the signature is for. Returns `0x`-prefixed hex."
+  [domain {:keys [chain claim dest amount epoch]}]
+  (hex (typed-digest domain
+                     (keccak (concat (keccak-str withdrawal-type)
+                                     (keccak-str chain)
+                                     (uint-word claim)
+                                     (address-word dest)
+                                     (uint-word amount)
+                                     (uint-word epoch))))))
+
+(defn validator-set-digest
+  "What the current set (contract epoch `from-epoch`) signs to name its
+  successor for `epoch`. `signers` must already be in ascending address order —
+  the contract refuses anything else, so a set signed in another order is a
+  set nobody can install."
+  [domain {:keys [chain from-epoch epoch signers powers]}]
+  (hex (typed-digest domain
+                     (keccak (concat (keccak-str validator-set-type)
+                                     (keccak-str chain)
+                                     (uint-word from-epoch)
+                                     (uint-word epoch)
+                                     (keccak (mapcat address-word signers))
+                                     (keccak (mapcat uint-word powers)))))))
+
+(defn action-digest
+  "What the current set signs for a quorum action: `kind` is \"invalidate\",
+  \"unpause\", \"deposit-cap\" or \"cancel-set\"; `nonce` is the contract's
+  `nonceOf(kind)`."
+  [domain {:keys [chain epoch kind claim value nonce]}]
+  (hex (typed-digest domain
+                     (keccak (concat (keccak-str action-type)
+                                     (keccak-str chain)
+                                     (uint-word epoch)
+                                     (keccak-str kind)
+                                     (uint-word claim)
+                                     (uint-word value)
+                                     (uint-word nonce))))))
+
+;; ── events ──────────────────────────────────────────────────────────────────
+
+(def deposit-event "Deposit(uint64,address,uint256,uint64)")
+(def withdrawn-event "Withdrawn(uint64,address,uint256)")
+(def invalidated-event "WithdrawalInvalidated(uint64)")
+
+(defn topic
+  "topic0 of an event signature — derived, never pasted."
+  [signature]
+  (hex (keccak-str signature)))
+
+(def ^:const min-confirmations
+  "Blocks a log must be under before it is attested. An L2 reorg deeper than
+  this is a different kind of failure; shallower ones are what this skips."
+  12)
+
+(def ^:private max-safe 9007199254740991)
+
+(defn- word->int
+  "A 32-byte word as an integer, or nil if it does not fit in i53. The high
+  bytes are CHECKED, not dropped: a decoder that kept the low 7 bytes of a
+  huge amount would credit a small one."
+  [w]
+  (let [w (strip0x w)]
+    (when (and (= 64 (count w)) (re-matches #"0{50}[0-9a-fA-F]{14}" w))
+      (let [n #?(:clj (Long/parseLong (subs w 50) 16)
+                 :cljs (js/parseInt (subs w 50) 16))]
+        (when (<= n max-safe) n)))))
+
+(defn- topic->address [t]
+  (let [t (strip0x t)]
+    (when (= 64 (count t)) (str "0x" (str/lower (subs t 24))))))
+
+(defn- field [l k] (get l k (get l (name k))))
+
+(defn- confirmed? [l tip]
+  (let [bn (field l :blockNumber)
+        h (when (string? bn)
+            #?(:clj (Long/parseLong (strip0x bn) 16) :cljs (js/parseInt (strip0x bn) 16)))]
+    (and (integer? h) (integer? tip) (>= (- tip h) min-confirmations))))
+
+(defn- ours?
+  "From the configured contract, with the expected topic0, and not removed by
+  a reorg."
+  [l contract t0]
+  (and (= (str/lower (str (field l :address))) (str/lower contract))
+       (= (str/lower (str (first (field l :topics)))) t0)
+       (not (true? (field l :removed)))))
+
+(defn deposit-txid
+  "The id a contract deposit is attested under: the contract's own sequence
+  number, which it assigns once and never reuses. A transaction hash would do
+  too, but one transaction can make two deposits."
+  [contract seq]
+  (str "bridge:" (str/lower contract) ":" seq))
+
+(defn attestations
+  "Every attestation validator account `me` can make from `logs`, given the
+  chain's bridge config `{:contract :asset}` and the EVM head `tip`.
+
+  Logs that are not from the contract, not deep enough, removed, or carry a
+  value the engine cannot represent are skipped, not guessed at."
+  [me {:keys [contract asset]} tip logs]
+  (let [t-dep (topic deposit-event)
+        t-out (topic withdrawn-event)
+        t-inv (topic invalidated-event)]
+    (vec
+     (for [l logs
+           :when (confirmed? l tip)
+           :let [ts (field l :topics)
+                 data (strip0x (field l :data))
+                 word (fn [i] (when (>= (count data) (* 64 (inc i)))
+                                (subs data (* 64 i) (* 64 (inc i)))))
+                 txh (field l :transactionHash)
+                 tx (cond
+                      (ours? l contract t-dep)
+                      (let [account (word->int (nth ts 1 nil))
+                            amount (word->int (word 0))
+                            seq (word->int (word 1))]
+                        (when (and account (pos? account) amount (pos? amount) seq)
+                          {:tx :deposit-attest :account me
+                           :txid (deposit-txid contract seq)
+                           :credit account :amount amount :asset asset}))
+
+                      (ours? l contract t-out)
+                      (let [claim (word->int (nth ts 1 nil))
+                            dest (topic->address (nth ts 2 nil))
+                            amount (word->int (word 0))]
+                        (when (and claim dest amount (string? txh))
+                          {:tx :withdraw-attest :account me
+                           :claim claim :txid txh :dest dest :amount amount}))
+
+                      (ours? l contract t-inv)
+                      (let [claim (word->int (nth ts 1 nil))]
+                        (when (and claim (string? txh))
+                          {:tx :withdraw-invalidate-attest :account me
+                           :claim claim :txid txh})))]
+           :when tx]
+       tx))))
+
+(defn pending-withdrawals
+  "The claims a validator should sign for the contract: every pending
+  withdrawal that names a destination, as `{:claim :account :amount :dest}`."
+  [ex]
+  (vec (for [id (sort (keys (:withdrawals ex {})))
+             :let [w (get-in ex [:withdrawals id])]
+             :when (:dest w)]
+         (assoc (select-keys w [:account :amount :dest]) :claim id))))

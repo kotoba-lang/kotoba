@@ -1,0 +1,427 @@
+(ns torihiki.validators
+  "The validator set, as chain state.
+
+  ## Why it moved here
+
+  `apply-tx :bond` used to say this chain had no registry of validators and
+  that inventing one would put the set in two places. It was right about the
+  second half and that is why the set moves rather than being copied: today
+  the set lives in the node — four public keys in `torihiki-node`'s source,
+  changed by a redeploy — and the chain only knows stake as a number attached
+  to an account. Every property `docs/decentralization-roadmap.md` asks of D2
+  (a set nobody can change alone, key rotation, a slash that follows from
+  evidence rather than from an operator) needs the set to be something the
+  chain agrees on, so the chain is where it has to be.
+
+  ## The shape
+
+  - A validator is a WITNESS NAME (what consensus calls it), a CONSENSUS KEY
+    (what its votes are signed with — not the account's key, so the account
+    can stay cold) and an OPERATOR ACCOUNT, whose bonded stake is its weight.
+  - The ACTIVE set changes only at an EPOCH boundary: the block whose height
+    is a multiple of `:epoch-length`. Inside an epoch the set is fixed, which
+    is what lets consensus read it once and run a whole epoch on it. A
+    registration, a rotation or a retirement takes effect at the next
+    boundary, never mid-epoch.
+  - The next set is every registered validator that is not retiring and not
+    jailed, with at least `:min-stake` bonded, largest stake first, ties by
+    name, at most `:max-validators`. Fewer than `min-set-size` qualifying is
+    not a set: the chain keeps the one it has rather than hand consensus to a
+    group that cannot tolerate a fault.
+  - EQUIVOCATION — two different blocks signed by one consensus key at one
+    height in one view — is proved by the votes themselves, verified against
+    the key that validator held in the epoch the height belongs to. A proved
+    equivocation jails the witness (out at the next boundary, for good) and
+    slashes every bond backing its operator account, including bonds already
+    unbonding. 5% of the slash goes to whoever submitted the proof, the rest to
+    the insurance fund, so the collateral leaves the offender without leaving
+    the exchange.
+
+  ## What is deliberately not here
+
+  Signature verification. The engine has no crypto of its own and the vote
+  format belongs to consensus (`inga.attest/vote-payload`), so `apply-block`
+  is handed a `:vote-verify-fn` by the node and this namespace only asks it.
+  Without one, evidence is refused rather than trusted.
+
+  Liveness slashing. A validator that is merely offline costs the chain its
+  rounds and is not punished here; equivocation is the one offence that is
+  unambiguous from signatures alone."
+  (:require [torihiki.fixed :as fx]
+            [torihiki.clearing :as cl]))
+
+(def ^:const min-set-size
+  "Four: the smallest set that tolerates one Byzantine member (n = 3f + 1)."
+  4)
+
+(def default-params
+  {;; Blocks per epoch. A devnet number: at ~40 blocks/s this is half a minute.
+   :epoch-length 1000
+   ;; Collateral units a validator's operator account must have bonded to it.
+   :min-stake 1
+   :max-validators 32})
+
+(def ^:const slash-reward-percent
+  "Of a slash, the share that goes to the account that proved it. Enough to
+  make watching worth it, small enough that colluding with an equivocator to
+  claim its slash is a loss."
+  5)
+
+;; ── reading ─────────────────────────────────────────────────────────────────
+
+(defn enabled?
+  "A chain configured without validators keeps the old behaviour exactly:
+  nothing here runs and nothing is added to the state root."
+  [ex]
+  (some? (:validator-params ex)))
+
+(defn active-set
+  "The current epoch's set: `[{:witness :pubkey :account :stake} ...]`."
+  [ex]
+  (get-in ex [:epoch :set] []))
+
+(defn epoch-of-height
+  "The epoch record whose blocks include `height`: the current one, the
+  previous one, or nil for anything older."
+  [ex height]
+  (let [cur (:epoch ex)
+        prev (:prev-epoch ex)]
+    (cond
+      (and cur (>= height (:from cur))) cur
+      (and prev (>= height (:from prev))) prev
+      :else nil)))
+
+(defn key-at
+  "The consensus key `witness` held at `height`, or nil."
+  [ex witness height]
+  (some #(when (= witness (:witness %)) (:pubkey %))
+        (:set (epoch-of-height ex height))))
+
+(defn bridge-mode?
+  "Does collateral move only through the bridge contract?"
+  [ex]
+  (some? (:bridge ex)))
+
+(defn member-of-account
+  "The active-set member operated by `account`, or nil."
+  [ex account]
+  (some #(when (= account (:account %)) %) (active-set ex)))
+
+(defn supermajority?
+  "Do the operator accounts in `accounts` hold more than 2/3 of the active
+  set's weight? Weight is the stake each member had when its epoch was
+  installed; a set installed with no stake at all (genesis) counts heads, one
+  each, because zero of zero is not a quorum of anything."
+  [ex accounts]
+  ;; The weight sums saturate (`fx/sadd`) and the threshold avoids its 3x
+  ;; product (`3h > 2t` reads as `h > 2(t − h)`): per-member stake is
+  ;; in-domain, the aggregate is not — three stakes of i53-max cross 2^53 and
+  ;; the raw fold held one number on the JVM and another on JS — and `(* 3
+  ;; have)` with an in-domain `have` over ~3e15 is not a double at all. Both
+  ;; operands of every product below are in-domain (stakes are non-negative,
+  ;; `have` is a subset sum of `total`), so the verdict is identical on both
+  ;; runtimes. Past the ceiling the verdict is read from SATURATED sums — a stated
+  ;; precision loss, the same clamp as every other aggregate here.
+  (let [members (active-set ex)
+        staked? (pos? (reduce fx/sadd 0 (map :stake members)))
+        w (fn [m] (if staked? (:stake m) 1))
+        total (reduce fx/sadd 0 (map w members))
+        have (reduce fx/sadd 0 (map w (filter #(contains? (set accounts) (:account %)) members)))]
+    (and (pos? total) (> have (* 2 (- total have))))))
+(defn operates-live-witness?
+  "Does `account` operate a witness that has not retired?"
+  [ex account]
+  (some (fn [[_ v]] (and (= account (:account v)) (nil? (:retired-at v))))
+        (:validators ex)))
+
+(defn jailed-operator?
+  "Is `account` the operator of a jailed witness? Bonding to it would only
+  hand collateral to the next slash."
+  [ex account]
+  (some (fn [[_ v]] (and (= account (:account v)) (:jailed? v))) (:validators ex)))
+
+(defn publisher-weights
+  "`{operator-account weight}` for the active set: who may publish a price and
+  how much each word weighs (roadmap D4). The weight is the stake recorded when
+  the epoch was installed, or one each for a set installed with none."
+  [ex]
+  (let [members (active-set ex)
+        staked? (pos? (reduce fx/sadd 0 (map :stake members)))]
+    (into {} (map (fn [m] [(:account m) (if staked? (:stake m) 1)])) members)))
+
+(defn publishers
+  "Who may submit a price: the active set's operators when the chain has a
+  validator set, the genesis publisher list otherwise."
+  [ex]
+  (if (enabled? ex)
+    (set (keys (publisher-weights ex)))
+    (:oracle-publishers ex)))
+
+(defn- pubkey-in-use? [ex pubkey]
+  (some (fn [[_ v]] (or (= pubkey (:pubkey v)) (= pubkey (:pending-pubkey v))))
+        (:validators ex)))
+
+;; ── genesis ─────────────────────────────────────────────────────────────────
+
+(declare init*)
+(declare witness-name? pubkey?)
+
+(defn- check-genesis!
+  "A genesis set is trusted by construction, which is exactly why it is
+  checked: nothing after it can correct a set of three, a key shared by two
+  names, or one operator running every member."
+  [genesis {:keys [max-validators]}]
+  (let [ws (map :witness genesis)
+        problem (cond
+                  (< (count genesis) min-set-size) "fewer than four validators"
+                  (< max-validators min-set-size) ":max-validators below four"
+                  (not-every? witness-name? ws) "a malformed witness name"
+                  (not-every? (comp pubkey? :pubkey) genesis) "a malformed consensus key"
+                  (not-every? (comp integer? :account) genesis) "an operator account that is not an integer"
+                  (not (apply distinct? ws)) "a witness name used twice"
+                  (not (apply distinct? (map :pubkey genesis))) "a consensus key used twice"
+                  (not (apply distinct? (map :account genesis))) "an operator account running two witnesses")]
+    (when problem
+      (throw (ex-info (str "torihiki.validators: bad genesis set — " problem)
+                      {:genesis genesis})))))
+
+(defn init
+  "Install the genesis set. `genesis` is `[{:witness :pubkey :account} ...]`;
+  stake is read from the clearing state the exchange starts with, so a genesis
+  set may carry zero stake — epoch 0 is trusted by construction, which is what
+  genesis means, and the first boundary is where stake starts to decide.
+
+  `bridge` (`{:contract :evm-chain-id :asset}`) puts the chain in BRIDGE MODE:
+  collateral arrives only through quorum-attested contract deposits and leaves
+  only through the contract (`torihiki.bridge`). It needs a validator set,
+  because the set is who attests and who signs for the contract."
+  ([ex params] (init ex params nil))
+  ([ex {:keys [genesis] :as params} bridge]
+   (when (and bridge (nil? params))
+     (throw (ex-info "torihiki.validators: :bridge needs :validators" {:bridge bridge})))
+   (cond-> (init* ex genesis params)
+     bridge (assoc :bridge (select-keys bridge [:contract :evm-chain-id :asset])
+                   :invalidated {}))))
+
+(defn- init*
+  [ex genesis params]
+  (if (nil? params)
+    ex
+    (let [params (merge default-params (dissoc params :genesis))
+          _ (check-genesis! genesis params)
+          vs (into {} (for [{:keys [witness pubkey account]} genesis]
+                        [witness {:account account :pubkey pubkey :registered 0}]))]
+      (assoc ex
+             :validator-params params
+             :validators vs
+             :epoch {:n 0 :from 0
+                     :set (vec (for [{:keys [witness pubkey account]} (sort-by :witness genesis)]
+                                 {:witness witness :pubkey pubkey :account account :stake 0}))}
+             :slashed {}))))
+
+;; ── transactions ────────────────────────────────────────────────────────────
+
+(defn- witness-name? [w]
+  (and (string? w) (re-matches #"[a-z0-9][a-z0-9-]{0,31}" w)))
+
+(defn- pubkey? [k]
+  (and (string? k) (<= 1 (count k) 256)))
+
+(defn register
+  "Propose `witness` with consensus key `pubkey`, operated by `account`. The
+  name and the key must both be unused; a key shared by two names is one
+  validator voting twice."
+  [ex {:keys [account witness pubkey]}]
+  (if (or (not (enabled? ex))
+          (not (witness-name? witness))
+          (not (pubkey? pubkey))
+          (contains? (:validators ex) witness)
+          (pubkey-in-use? ex pubkey)
+          ;; One witness per operator account. The account's stake is the
+          ;; witness's weight, so an account with two witnesses would count
+          ;; its stake twice — and with thirty-two it would be the whole set.
+          (operates-live-witness? ex account))
+    ex
+    (assoc-in ex [:validators witness]
+              {:account account :pubkey pubkey :registered (:height ex 0)})))
+
+(defn rotate-key
+  "Queue a new consensus key for `witness`, effective at the next boundary.
+  Only its operator account can, and not once jailed."
+  [ex {:keys [account witness pubkey]}]
+  (let [v (get-in ex [:validators witness])]
+    (if (or (nil? v)
+            (not= account (:account v))
+            (:jailed? v)
+            (not (pubkey? pubkey))
+            (pubkey-in-use? ex pubkey))
+      ex
+      (assoc-in ex [:validators witness :pending-pubkey] pubkey))))
+
+(defn retire
+  "Leave at the next boundary. The bond is not touched: unbonding is a
+  separate transaction with its own delay, so a validator cannot retire and
+  walk away from what it signed in the epoch it is leaving."
+  [ex {:keys [account witness]}]
+  (let [v (get-in ex [:validators witness])]
+    (if (or (nil? v) (not= account (:account v)))
+      ex
+      (assoc-in ex [:validators witness :retiring?] true))))
+
+(defn- slash-account
+  "Take every bond backing `validator-acct` — live and unbonding — out of the
+  delegators' collateral. Returns `[clearing' total]`."
+  [clearing validator-acct]
+  ;; `total` sums what was TAKEN across delegators — per-key in-domain,
+  ;; aggregate past the ceiling (falsify-14b's shape) — and it is recorded in
+  ;; :slashed and debited from :insurance-fund. It folds through `fx/sadd`
+  ;; like every other aggregate: raw, the two delegators' bonds summed to
+  ;; 2^53 + 1 and the two runtimes recorded two different books.
+  (let [take! (fn [c acct amount]
+                (let [have (get-in c [:accounts acct :collateral] 0)
+                      amt (min amount (max 0 have))]
+                  [(update-in c [:accounts acct :collateral] fx/acc (- amt)) amt]))
+        ;; live bonds
+        [c total]
+        (reduce (fn [[c total] acct]
+                  (let [x (get-in c [:bonds acct validator-acct] 0)]
+                    (if (pos? x)
+                      (let [[c amt] (take! c acct x)]
+                        [(update-in c [:bonds acct] dissoc validator-acct) (fx/sadd total amt)])
+                      [c total])))
+                [clearing 0]
+                (sort (keys (:bonds clearing {}))))]
+    ;; unbonding: still answerable until collected
+    (reduce (fn [[c total] acct]
+              (let [q (get-in c [:unbonding acct] [])
+                    hit (filter #(= validator-acct (:validator %)) q)]
+                (if (empty? hit)
+                  [c total]
+                  (let [[c amt] (take! c acct (reduce fx/sadd 0 (map :amount hit)))]
+                    [(assoc-in c [:unbonding acct]
+                               (vec (remove #(= validator-acct (:validator %)) q)))
+                     (fx/sadd total amt)]))))
+            [c total]
+            (sort (keys (:unbonding c {}))))))
+
+(defn evidence-key [{:keys [witness evidence-height view]}]
+  [witness evidence-height view])
+
+(defn- safe-verify
+  "A verifier that throws must not stop the chain: one malformed proof would
+  halt every replica at the same block. A throw is a no."
+  [f & args]
+  (try (true? (apply f args))
+       (catch #?(:clj Throwable :cljs :default) _ false)))
+
+(defn evidence-valid?
+  "Is this a proof of equivocation the chain can act on?
+
+  Two different block hashes, one witness, one height, one view, both signed
+  by the key that witness held in the epoch the height belongs to — checked by
+  the node's `vote-verify-fn`, which knows the vote format."
+  [ex {:keys [witness evidence-height view hash-a sig-a hash-b sig-b]} vote-verify-fn]
+  (let [k (when (and (string? witness) (integer? evidence-height))
+            (key-at ex witness evidence-height))]
+    (boolean
+     (and vote-verify-fn k
+          (integer? view) (not (neg? view))
+          (string? hash-a) (string? hash-b) (not= hash-a hash-b)
+          (string? sig-a) (string? sig-b)
+          (safe-verify vote-verify-fn k witness evidence-height view hash-a sig-a)
+          (safe-verify vote-verify-fn k witness evidence-height view hash-b sig-b)))))
+
+(defn slash
+  "Act on a proof already checked by `evidence-valid?`. Exactly once per
+  `[witness height view]`: a second proof of the same offence pays nothing."
+  [ex {:keys [account witness] :as t}]
+  (let [k (evidence-key t)
+        v (get-in ex [:validators witness])]
+    (if (or (nil? v) (contains? (:slashed ex) k))
+      ex
+      (let [own (fx/sadd (get-in ex [:clearing :bonds (:account v) (:account v)] 0)
+                         (reduce fx/sadd 0 (map :amount (filter #(= (:account v) (:validator %))
+                                                                (get-in ex [:clearing :unbonding (:account v)] [])))))
+            [clearing total] (slash-account (:clearing ex) (:account v))
+            ;; Never to the offender — an operator with little of its own at
+            ;; stake could double-sign on purpose and report itself for a cut
+            ;; of its delegators' money — and never more than the operator
+            ;; itself put up, for the same reason.
+            reward (if (= account (:account v))
+                     0
+                     ;; total x percent is 3.6e16 — past the ceiling while the
+                     ;; reward is far under it. fmul keeps the cut exact; the
+                     ;; raw product rounded on JS and forked the reward (and
+                     ;; with it the insurance fund) from the same evidence.
+                     (min own (fx/fmul total slash-reward-percent 100)))
+            clearing (cond-> clearing
+                       (pos? reward) (cl/deposit account reward)
+                       true (update :insurance-fund fx/acc (- total reward)))]
+        (-> ex
+            (assoc :clearing clearing)
+            (assoc-in [:validators witness :jailed?] true)
+            (assoc-in [:slashed k] {:by account :amount total :height (:height ex 0)}))))))
+
+;; ── the boundary ────────────────────────────────────────────────────────────
+
+(defn next-set
+  "Who would be active if the epoch turned now."
+  [ex]
+  (let [{:keys [min-stake max-validators]} (:validator-params ex)
+        clearing (:clearing ex)]
+    (->> (:validators ex)
+         (remove (fn [[_ v]] (or (:retiring? v) (:jailed? v))))
+         (map (fn [[w v]] {:witness w
+                           :pubkey (or (:pending-pubkey v) (:pubkey v))
+                           :account (:account v)
+                           :stake (cl/stake-of clearing (:account v))}))
+         (filter #(>= (:stake %) min-stake))
+         (sort-by (juxt (comp - :stake) :witness))
+         ;; One per operator account, should a state ever hold two: the
+         ;; account's stake is one weight, not one per name.
+         (reduce (fn [[seen acc] m] (if (seen (:account m)) [seen acc] [(conj seen (:account m)) (conj acc m)]))
+                 [#{} []])
+         second
+         (take max-validators)
+         (sort-by :witness)
+         vec)))
+
+(defn boundary?
+  [ex height]
+  (and (enabled? ex) (pos? height)
+       (zero? (mod height (get-in ex [:validator-params :epoch-length])))))
+
+(defn turn-epoch
+  "At a boundary block, install the next set from the block after it.
+
+  Pending keys become current and retiring validators that are out of the set
+  are marked retired — but only when the new set is installed. If too few qualify,
+  nothing changes at all: the old set, the old keys and the queued changes all
+  carry to the next boundary, so a refused turn loses nobody's request."
+  [ex height]
+  (if-not (boundary? ex height)
+    ex
+    (let [s (next-set ex)]
+      (if (< (count s) min-set-size)
+        (assoc ex :epoch-refused {:height height :qualified (count s)})
+        (let [in-set (set (map :witness s))]
+          (-> ex
+              (assoc :prev-epoch (:epoch ex))
+              (assoc :epoch {:n (inc (get-in ex [:epoch :n] 0)) :from (inc height) :set s})
+              (dissoc :epoch-refused)
+              (update :validators
+                      (fn [vs]
+                        (into {}
+                              (map (fn [[w v]]
+                                      (cond
+                                        ;; Kept, not forgotten: evidence about
+                                        ;; the epoch it is leaving can still
+                                        ;; arrive, and a slash needs to know
+                                        ;; whose account to take it from.
+                                        (and (:retiring? v) (not (in-set w)))
+                                        [w (cond-> v (nil? (:retired-at v)) (assoc :retired-at height))]
+                                        (:pending-pubkey v)
+                                        [w (-> v (assoc :pubkey (:pending-pubkey v))
+                                               (dissoc :pending-pubkey))]
+                                        :else [w v])))
+                              vs)))))))))

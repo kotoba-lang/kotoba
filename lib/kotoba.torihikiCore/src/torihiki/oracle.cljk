@@ -1,0 +1,169 @@
+(ns torihiki.oracle
+  "Where the external price comes from, and why one publisher cannot set it.
+
+  `torihiki.mark` anchors the mark to the oracle precisely so that a thin book
+  cannot be used to liquidate people. That defence is only as good as the
+  oracle: until this namespace existed, `:oracle` was a transaction carrying
+  an already-agreed price, and whoever could send it moved the mark. The hole
+  had simply been pushed one layer down.
+
+  ## The median, not the mean
+
+  The aggregate is the median of fresh submissions. A mean lets one publisher
+  move the result by however much they are willing to lie — the error is
+  proportional to the lie. With a median, a minority of publishers cannot move
+  the result at all, however extreme their submissions, which is the property
+  worth having.
+
+  For an even count the LOWER middle is taken. Averaging the two middles would
+  reintroduce an arithmetic mean over the two most pivotal submissions, and it
+  would reintroduce a division and its rounding. Which of the two is chosen
+  barely matters; that it is stated does.
+
+  ## Quorum and staleness are the same defence
+
+  A price is only aggregated from submissions that are both AUTHORISED and
+  FRESH. Below the quorum the oracle does not update — and, importantly, it is
+  marked stale rather than silently reused.
+
+  A stale oracle stops liquidation. That is the whole reason to track it: the
+  alternative is closing somebody's position at a price nobody currently
+  vouches for. Refusing to liquidate has an obvious cost — bad debt can grow
+  while the feed is down — and it is the smaller cost, because a liquidation
+  is irreversible and waiting is not.
+
+  ## Publishers are not governance
+
+  The publisher set is configured at genesis and this namespace does not
+  change it. Rotating publishers is a governance question, and answering it
+  badly (say, letting the current set vote itself smaller) is worse than not
+  answering it here."
+  (:require [torihiki.fixed :as fx]))
+
+(def default-params
+  {;; how many fresh authorised submissions are needed to publish a price
+   :quorum 3
+   ;; logical seconds after which a submission stops counting
+   :max-age 60})
+
+(defn fresh
+  "Submissions from authorised publishers that are not stale, as a vector of
+  `[publisher price]` sorted by price then publisher.
+
+  Sorted totally, because the median is read positionally: two validators that
+  ordered equal prices differently could pick different publishers' values on
+  an even count and diverge."
+  [submissions publishers now max-age]
+  (->> submissions
+       (keep (fn [[pub {:keys [price ts]}]]
+               (when (and (contains? publishers pub)
+                          (pos? (or price 0))
+                          (<= (- now ts) max-age))
+                 [pub price])))
+       (sort-by (juxt second first))
+       vec))
+
+(defn median
+  "The lower middle of `sorted` (a vector of `[publisher price]`), or nil when
+  empty. Lower middle rather than an average of the two middles — see the ns
+  docstring."
+  [sorted]
+  (when (seq sorted)
+    (second (nth sorted (quot (dec (count sorted)) 2)))))
+
+(defn weighted-median
+  "The price at which half the STAKE sits below, or nil when empty.
+
+  A plain median counts publishers; this counts what they have at risk. The
+  difference is who has to collude: with one publisher one vote, a majority of
+  publishers moves the price however small they are, and publishers are cheap
+  to create. Weighting by stake makes the cost of moving the price the cost of
+  acquiring the stake, which is the property the bond was posted for.
+
+  `stake-of` returns a publisher's stake; a publisher with none contributes
+  nothing, which is the honest reading of an unbonded voice rather than a
+  special case.
+
+  Lower middle again — the first price at which the running stake reaches half
+  the total. Reading it positionally the way the unweighted median does would
+  not mean anything here, because the positions are not equal weights."
+  [sorted stake-of]
+  (when (seq sorted)
+    (let [weights (mapv (fn [[pub _]] (max 0 (or (stake-of pub) 0))) sorted)
+          ;; Saturated like every aggregate: per-publisher stake is in-domain,
+          ;; the total is not (three stakes of i53-max cross 2^53 and the raw
+          ;; fold held one number on the JVM and another on JS). The walk below
+          ;; is then read from the same sums on both runtimes. `(* 2 acc)` is
+          ;; exact on both — twice an in-domain integer is always a double —
+          ;; so the comparison decides identically.
+          total (reduce fx/sadd 0 weights)]
+      (if (zero? total)
+        ;; Nobody has anything at risk. Falling back to the unweighted median
+        ;; is the same answer this had before stake existed, and it is better
+        ;; than no price: the alternative is a market that stops because its
+        ;; publishers are unbonded, which is a governance problem wearing an
+        ;; outage.
+        (median sorted)
+        (loop [i 0 acc 0]
+          (let [acc (fx/sadd acc (nth weights i))]
+            (if (or (>= (* 2 acc) total) (= i (dec (count sorted))))
+              (second (nth sorted i))
+              (recur (inc i) acc))))))))
+
+(defn aggregate
+  "Return `{:price p :n n :stale? false}` when quorum is met, or
+  `{:price nil :n n :stale? true}` when it is not.
+
+  Never returns a price computed from too few submissions. A price the system
+  cannot vouch for is worse than no price, because everything downstream —
+  the mark, margin, liquidation — will treat it as vouched for."
+  ([submissions publishers now params] (aggregate submissions publishers now params nil))
+  ([submissions publishers now {:keys [quorum max-age] :as _params} stake-of]
+   (let [f (fresh submissions publishers now max-age)]
+     (if (>= (count f) quorum)
+       {:price (if stake-of (weighted-median f stake-of) (median f))
+        :n (count f)
+        :weighted? (boolean stake-of)
+        :stale? false}
+       {:price nil :n (count f) :weighted? (boolean stake-of) :stale? true}))))
+
+(defn deviation
+  "How far `price` sits from `reference`, as a rate. Used to report how much a
+  publisher disagrees with the aggregate — a monitoring signal, not an
+  enforcement one. Slashing a publisher for disagreeing would punish the
+  honest one during a genuine dislocation."
+  [price reference]
+  (if (pos? reference)
+    ;; |price - reference| x rate-scale is a 5e24 product for an in-domain
+    ;; price; the quotient is a rate and clamps to the ceiling like every
+    ;; saturating computation here (it used to return an out-of-domain 7.1e23).
+    (fx/fmul (fx/abs* (- price reference)) fx/rate-scale reference)
+    0))
+
+(defn aggregate-weighted
+  "The validator-set oracle (roadmap D4): `weights` is `{publisher weight}` for
+  exactly the publishers allowed to speak — the active set's operators — so a
+  submission from anybody else, or from a validator that has left the set, is
+  not even read.
+
+  A price needs fresh submissions holding MORE THAN 2/3 of the total weight,
+  not a head count. That is the same threshold the chain's blocks need, for
+  the same reason: below it, one third of the set could be absent or lying
+  and the price would still move. Two of four equal validators offline is
+  stale, not a price.
+
+  The price is the stake-weighted median of what is fresh."
+  [submissions weights now max-age]
+  (let [f (fresh submissions (set (keys weights)) now max-age)
+        ;; Both sums saturate (`fx/sadd`) — falsify-14's class at a threshold:
+        ;; the raw total of three i53-max weights was 3 x i53-max, one number
+        ;; on the JVM and another on JS. And the threshold itself avoids its
+        ;; 3x product: `3h > 2t` reads as `h > 2(t − h)`, all operands
+        ;; in-domain (weights are non-negative, `have` is a subset sum of
+        ;; `total`), so every product is twice an in-domain integer — exact on
+        ;; both runtimes — and the verdict is one number.
+        total (reduce fx/sadd 0 (vals weights))
+        have (reduce fx/sadd 0 (map (fn [[pub _]] (get weights pub 0)) f))]
+    (if (and (pos? total) (> have (* 2 (- total have))))
+      {:price (weighted-median f #(get weights % 0)) :n (count f) :weighted? true :stale? false}
+      {:price nil :n (count f) :weighted? true :stale? true})))
