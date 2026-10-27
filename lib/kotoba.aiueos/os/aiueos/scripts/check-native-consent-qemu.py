@@ -161,11 +161,12 @@ def main(args):
             return sum(1 for y in range(y0, y1) for x in range(180, 330)
                        if raw[2][3 * (y * w + x):3 * (y * w + x) + 3] != b"\xff\xff\xff")
         network_ink, telemetry_ink, below_ink = (ink(after_allow, 205, 223), ink(after_allow, 225, 243),
-                                                 ink(after_allow, 250, 290))
-        assert network_ink > 20 and telemetry_ink > 20 and below_ink == 0, (network_ink, telemetry_ink, below_ink)
+                                                 ink(after_allow, 275, 320))
+        keys_ink = ink(after_allow, 255, 273)
+        assert network_ink > 20 and telemetry_ink > 20 and keys_ink > 20 and below_ink == 0, (network_ink, telemetry_ink, keys_ink, below_ink)
         event("pointer-allow", pending=W(87), approved=W(88), stop=W(85),
               approvedCount=S(2039) // 2, changedColumns=[changed_cols[0] + 180, changed_cols[-1] + 180],
-              networkInk=network_ink, telemetryInk=telemetry_ink)
+              networkInk=network_ink, telemetryInk=telemetry_ink, keysHintInk=keys_ink)
     finally:
         try: send("quit", 0.5)
         except Exception: pass
