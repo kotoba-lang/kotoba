@@ -209,6 +209,7 @@ def main(args):
         kernel = output / "kernel"
         media = output / "media"
         guest = output / "qemu"
+        guest_iso = output / "qemu-iso"
         call("font", scripts["build-native-font-macos.py"], [
             "--amu-source", amu, "--compiler-image", compiler,
             "--compiler-sha256", args.compiler_sha256,
@@ -248,11 +249,15 @@ def main(args):
             "--output", media])
         media_state = json.loads((media / "native-media.json").read_text())
         disk = media / "awai-native.img"
+        iso = media / "awai-native.iso"
         if (media_state["state"] != "MACOS_NATIVE_MEDIA_CANDIDATE"
                 or media_state["compiler"] != compiler_pin
                 or media_state["packager"] != packager_pin
                 or media_state["efi"] != kernel_state["efi"]
-                or pin(disk) != media_state["image"]):
+                or pin(disk) != media_state["image"]
+                or pin(iso) != media_state["iso"]
+                or media_state["independentISO"]["status"] !=
+                   "PASS_INDEPENDENT_NATIVE_EL_TORITO_ISO_READBACK"):
             raise ValueError("media build receipt mismatch")
 
         guest_script = ("check-native-draft-restart-qemu.py" if args.profile == "local-draft"
@@ -291,6 +296,23 @@ def main(args):
               or [row["codepoint"] for row in observed["renderedGoalGlyphs"]] != [97, 98]
               or any(row["inkPixels"] <= 0 for row in observed["renderedGoalGlyphs"])):
             raise ValueError("normal desktop visible Goal verdict is incomplete")
+        iso_observed = None
+        if args.profile == "desktop":
+            call("qemu-iso", scripts["check-native-desktop-qemu.py"], [
+                "--media", disk, "--iso", iso, "--efi", efi, "--kernel", image,
+                "--qemu", qemu, "--firmware", firmware, "--font", padded,
+                "--output", guest_iso])
+            iso_observed = json.loads((guest_iso / "native-desktop-qemu.json").read_text())
+            if (iso_observed["status"] != "PASS_NATIVE_DESKTOP_INPUT_QEMU"
+                    or len(iso_observed["events"]) != 12
+                    or iso_observed["kernel"] != kernel_state["kernel"]
+                    or iso_observed["efi"] != kernel_state["efi"]
+                    or iso_observed["iso"] != media_state["iso"]
+                    or iso_observed["independentISO"]["status"] !=
+                       "PASS_INDEPENDENT_NATIVE_EL_TORITO_ISO_READBACK"
+                    or iso_observed["observer"] != script_pins["check-native-desktop-qemu.py"]
+                    or [row["codepoint"] for row in iso_observed["renderedGoalGlyphs"]] != [97, 98]):
+                raise ValueError("ISO QEMU guest observation is not bound to this build")
         if (pin(compiler) != compiler_pin or pin(packager) != packager_pin
                 or (descriptor_pin is not None and
                     repository_bootstrap(amu, argparse.Namespace(
@@ -307,13 +329,14 @@ def main(args):
                             if args.profile == "local-draft"
                             else "MACOS_NATIVE_DESKTOP_QEMU_CANDIDATE"),
                      font=font_state["padded"], kernel=kernel_state["kernel"],
-                     efi=kernel_state["efi"], media=media_state["image"],
+                     efi=kernel_state["efi"], media=media_state["image"], iso=media_state["iso"],
                      guestEvents=len(observed["events"]),
                      guestInputQualified=True, nativeFormatEmission=True,
+                     isoBootQualified=iso_observed is not None,
                      localDraftRestoreQualified=args.profile == "local-draft",
                      qualification=("Mac native local-draft save and cold restore on QEMU"
                                     if args.profile == "local-draft"
-                                    else "Mac native build and QEMU desktop input")
+                                    else "Mac native GPT and EFI El Torito ISO QEMU desktop input")
                      + "; D2 workspace, release and physical gates separate")
         save()
         print(state["state"], state["media"]["sha256"])

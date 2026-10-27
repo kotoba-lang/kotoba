@@ -52,6 +52,53 @@ def verify(image,efi):
  content=b''.join(parts);assert content[:n]==expected and content[n:]==bytes(len(content)-n)
  return dict(status='PASS_INDEPENDENT_NATIVE_GPT_FAT16_READBACK',image=dict(bytes=len(d),sha256=hashlib.sha256(d).hexdigest()),efi=dict(bytes=n,sha256=hashlib.sha256(expected).hexdigest()),partition=[start,end],fileClusters=len(parts),formatEmission=False,installer=False,physicalHardware=False)
 
+def verify_iso(image,disk,efi):
+ # Parse ISO9660 and the EFI El Torito catalog independently of the native
+ # writer, then compare its complete FAT16 image with the qualified GPT ESP.
+ disk_result=verify(disk,efi)
+ d=disk.read_bytes();start,end=disk_result['partition']
+ boot=d[start*512:(end+1)*512]
+ iso=image.read_bytes();block=2048
+ assert len(iso)%block==0 and len(iso)>=24*block
+ pvd=iso[16*block:17*block];brvd=iso[17*block:18*block]
+ term=iso[18*block:19*block]
+ assert pvd[:7]==b'\x01CD001\x01' and brvd[:7]==b'\x00CD001\x01'
+ assert term[:7]==b'\xffCD001\x01'
+ assert brvd[7:39].rstrip(b'\x00')==b'EL TORITO SPECIFICATION'
+ assert struct.unpack_from('<I',pvd,80)[0]==len(iso)//block
+ assert struct.unpack_from('>I',pvd,84)[0]==len(iso)//block
+ assert struct.unpack_from('<H',pvd,128)[0]==block
+ assert struct.unpack_from('>H',pvd,130)[0]==block
+ catalog_lba=struct.unpack_from('<I',brvd,71)[0]
+ catalog=iso[catalog_lba*block:(catalog_lba+1)*block]
+ assert len(catalog)==block and catalog[0:2]==b'\x01\xef'
+ assert catalog[30:32]==b'\x55\xaa'
+ assert sum(struct.unpack_from('<16H',catalog))%65536==0
+ entry=catalog[32:64]
+ assert entry[:2]==b'\x88\x00'
+ sectors=struct.unpack_from('<H',entry,6)[0]
+ image_lba=struct.unpack_from('<I',entry,8)[0]
+ assert sectors==len(boot)//512 and image_lba>=23
+ assert len(boot)==sectors*512
+ payload=iso[image_lba*block:image_lba*block+len(boot)]
+ assert payload==boot
+ assert iso[image_lba*block+len(boot):]==bytes(len(iso)-(image_lba*block+len(boot)))
+ root_lba=struct.unpack_from('<I',pvd,158)[0]
+ root=iso[root_lba*block:(root_lba+1)*block]
+ records=[];at=0
+ while at<len(root) and root[at]:
+  record=root[at:at+root[at]];assert len(record)==root[at]
+  records.append(record);at+=len(record)
+ assert len(records)>=3
+ file_record=records[2]
+ assert file_record[33:33+file_record[32]]==b'ESP.IMG;1'
+ assert struct.unpack_from('<I',file_record,2)[0]==image_lba
+ assert struct.unpack_from('<I',file_record,10)[0]==len(boot)
+ return dict(status='PASS_INDEPENDENT_NATIVE_EL_TORITO_ISO_READBACK',
+             iso=dict(bytes=len(iso),sha256=hashlib.sha256(iso).hexdigest()),
+             bootImage=dict(bytes=len(boot),sha256=hashlib.sha256(boot).hexdigest()),
+             gpt=disk_result['image'],formatEmission=False,release=False,physicalHardware=False)
+
 if __name__=='__main__':
  p=argparse.ArgumentParser();p.add_argument('--image',type=Path,required=True);p.add_argument('--efi',type=Path,required=True);p.add_argument('--output',type=Path);a=p.parse_args();r=verify(a.image,a.efi)
  if a.output:a.output.write_text(json.dumps(r,indent=2)+'\n')

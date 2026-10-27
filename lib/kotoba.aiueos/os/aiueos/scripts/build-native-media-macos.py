@@ -154,6 +154,43 @@ def main(args):
             reader = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(reader)
             independent = reader.verify(output / disk, output / "BOOTX64.EFI")
+            iso = "awai-native.iso"
+            iso_reproduced = "awai-native.reproduced.iso"
+            if b"PASS_NATIVE_EL_TORITO_ISO_BUILD" not in invoke(
+                    "iso-build", "iso-build", iso):
+                raise ValueError("native ISO builder omitted success marker")
+            if b"PASS_NATIVE_EL_TORITO_ISO_VERIFY" not in invoke(
+                    "iso-verify", "iso-verify", iso):
+                raise ValueError("native ISO verifier omitted success marker")
+            invoke("iso-reproduce", "iso-build", iso_reproduced)
+            if pin(output / iso) != pin(output / iso_reproduced):
+                raise ValueError("native ISO reproduction differed")
+            iso_independent = reader.verify_iso(
+                output / iso, output / disk, output / "BOOTX64.EFI")
+            invoke("iso-existing-output", "iso-build", iso, 1)
+            invoke("iso-wrong-efi-digest", "iso-verify", iso, 1,
+                   digest="0" * 64)
+            iso_raw = (output / iso).read_bytes()
+            for name, offset in (("iso-catalog", 19 * 2048 + 1),
+                                 ("iso-efi-content", 23 * 2048 + 1123840 - 1048576 + 512)):
+                damaged = bytearray(iso_raw)
+                damaged[offset] ^= 1
+                path = output / (name + ".iso")
+                path.write_bytes(damaged)
+                invoke(name, "iso-verify", path.name, 1)
+                try:
+                    reader.verify_iso(path, output / disk, output / "BOOTX64.EFI")
+                except (AssertionError, ValueError, struct.error):
+                    pass
+                else:
+                    raise ValueError("independent ISO reader accepted " + name)
+            for name, damaged in (("iso-truncated", iso_raw[:-1]),
+                                  ("iso-trailer", iso_raw + b"\0")):
+                path = output / (name + ".iso")
+                path.write_bytes(damaged)
+                invoke(name, "iso-verify", path.name, 1)
+            if pin(output / iso) != pin(output / iso_reproduced):
+                raise ValueError("negative control modified the ISO")
             raw = (output / disk).read_bytes()
             offsets = {
                 "primary-gpt": 512 + 24, "backup-gpt": len(raw) - 512 + 24,
@@ -183,13 +220,15 @@ def main(args):
                     or pin(output / "media.kotoba") != state["sourceUnity"]
                     or any(pin(path) != {k: v for k, v in identity.items() if k != "name"}
                            for path, identity in zip(parts, identities))
-                    or pin(output / disk) != pin(output / reproduced)):
+                    or pin(output / disk) != pin(output / reproduced)
+                    or pin(output / iso) != pin(output / iso_reproduced)):
                 raise ValueError("source, executable or media drift")
             state.update(state="MACOS_NATIVE_MEDIA_CANDIDATE", tool=pin(program),
                          container=pin(output / "media.kseed"), raw=pin(output / "media.raw"),
                          image=pin(output / disk), independentMedia=independent,
-                         refusalCases=10, nativeFormatEmission=True,
-                         qualification="Mac native media build and format verification; QEMU and release separate")
+                         iso=pin(output / iso), independentISO=iso_independent,
+                         refusalCases=16, nativeFormatEmission=True,
+                         qualification="Mac native GPT/FAT16 and El Torito ISO format verification; QEMU, release and physical gates separate")
             save()
             print(state["state"], state["image"]["sha256"])
         finally:
