@@ -92,13 +92,17 @@ def main(args):
         raise ValueError("user source requires source and expected ELF SHA-256 pins")
     if args.user_source and args.user_slot:
         raise ValueError("choose generated user source or an existing user slot")
-    if args.user_target in ("x86_64-aiueos-user-v3", "x86_64-aiueos-user-v4") and not args.user_source:
-        raise ValueError("user-v3/v4 requires a pinned generated user source")
-    if args.kernel_target == "x86_64-aiueos-kernel-v2":
+    if args.user_target in ("x86_64-aiueos-user-v3", "x86_64-aiueos-user-v4",
+                            "x86_64-aiueos-user-v5") and not args.user_source:
+        raise ValueError("user-v3/v4/v5 requires a pinned generated user source")
+    if args.kernel_target == "x86_64-aiueos-kernel-v3":
+        if (args.user_source or args.user_slot) and args.user_target != "x86_64-aiueos-user-v5":
+            raise ValueError("kernel-v3 requires user-v5")
+    elif args.kernel_target == "x86_64-aiueos-kernel-v2":
         if (args.user_source or args.user_slot) and args.user_target != "x86_64-aiueos-user-v4":
             raise ValueError("kernel-v2 requires user-v4")
-    elif args.user_target == "x86_64-aiueos-user-v4":
-        raise ValueError("user-v4 requires kernel-v2")
+    elif args.user_target in ("x86_64-aiueos-user-v4", "x86_64-aiueos-user-v5"):
+        raise ValueError("user-v4/v5 requires matching kernel layout")
     if ((args.font or args.user_slot or args.user_source)
             and (not args.font or not (args.user_slot or args.user_source) or args.payload)):
         raise ValueError("dual payload requires font and one user payload without legacy payload")
@@ -218,6 +222,7 @@ def main(args):
                 for name in ("boot-user-slot.bin", "boot-user-slot.reproduced.bin"):
                     run("package-" + name, ["package-aiueos-user-payload",
                         "boot-user.elf", "--output", name, "--version",
+                        "v4" if args.user_target == "x86_64-aiueos-user-v5" else
                         "v3" if args.user_target == "x86_64-aiueos-user-v4" else "v2"])
                     slot = stage / name
                     if not slot.is_file() or pin(slot)["bytes"] != 524288:
@@ -337,10 +342,12 @@ if __name__ == "__main__":
     parser.add_argument("--user-source-sha256")
     parser.add_argument("--user-elf-sha256")
     parser.add_argument("--kernel-target", choices=("x86_64-aiueos-kernel-v1",
-                                                     "x86_64-aiueos-kernel-v2"),
+                                                     "x86_64-aiueos-kernel-v2",
+                                                     "x86_64-aiueos-kernel-v3"),
                         default="x86_64-aiueos-kernel-v1")
     parser.add_argument("--user-target", choices=("x86_64-aiueos-user-v2",
                                                   "x86_64-aiueos-user-v3",
-                                                  "x86_64-aiueos-user-v4"),
+                                                  "x86_64-aiueos-user-v4",
+                                                  "x86_64-aiueos-user-v5"),
                         default="x86_64-aiueos-user-v2")
     main(parser.parse_args())
