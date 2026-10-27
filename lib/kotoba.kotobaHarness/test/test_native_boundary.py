@@ -74,7 +74,8 @@ class NativeBoundary(unittest.TestCase):
 
     def test_full_controller_success_frame_followed_by_signal_is_blocked(self):
         with tempfile.TemporaryDirectory() as directory:
-            native = SimpleNamespace(output=Path(directory), command=lambda *a, **kw: ['/native/controller'])
+            native = SimpleNamespace(output=Path(directory), command=lambda *a, **kw: ['/native/controller'],
+                                     environment=transport.clean_env)
             process = SimpleNamespace(stdin=io.BytesIO(), stdout=io.BytesIO(
                 b'{:status :ok :result 0 :fuel {:initial 100 :remaining 99}}\n'),
                 wait=lambda **kw: -9, poll=lambda: -9)
@@ -86,9 +87,12 @@ class NativeBoundary(unittest.TestCase):
 
     def test_credentials_and_ambient_grants_do_not_reach_children(self):
         with patch.dict(os.environ, {'OPENROUTER_API_KEY': 'test-only-secret', 'KEXE_ALLOW': 'everything'}):
-            env = transport.clean_env(KEXE_ALLOW='3,7,37,39,41')
+            native = object.__new__(transport.Native)
+            native.container = False
+            env = native.environment(KEXE_ALLOW='3,7,37,39,41')
             self.assertNotIn('OPENROUTER_API_KEY', env)
             self.assertEqual(env['KEXE_ALLOW'], '3,7,37,39,41')
+            self.assertEqual(env['PATH'], '/native-no-host-tools')
 
     def test_corrupt_compiler_pin_stops_before_execution(self):
         with tempfile.TemporaryDirectory() as directory:

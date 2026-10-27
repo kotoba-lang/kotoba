@@ -81,14 +81,20 @@ class Native:
                     '-e', 'KEXE_CAP_RESOURCES_35=/work:/amu', '-e', 'KEXE_STACK_BYTES=8388608',
                     '-e', 'KEXE_CPU_SECONDS=300', '-e', 'KEXE_WALL_SECONDS=1800',
                     '-e', 'KEXE_FUEL=2000000000', '-e', 'KEXE_STRUCTURED_REPORT=' + ('1' if executable else '0'),
+                    '-e', 'PATH=/native-no-host-tools',
                     '--entrypoint', '/work/' + executable if executable else '/compiler', IMAGE, *args]
         return [str(directory / executable) if executable else str(self.compiler), *args]
+
+    def environment(self, **grants):
+        # Podman itself needs the host PATH; its guest receives the empty
+        # tool path above. Direct Linux guests use absolute executable paths.
+        return clean_env(PATH=os.environ.get('PATH', '') if self.container else '/native-no-host-tools', **grants)
 
     def path(self, directory, name):
         return '/work/' + name if self.container else str(directory / name)
 
     def run(self, directory, args, label):
-        env = clean_env(KEXE_ALLOW='35,37,38,39', KEXE_CAP_RESOURCES_35=f'{directory}:{self.amu}',
+        env = self.environment(KEXE_ALLOW='35,37,38,39', KEXE_CAP_RESOURCES_35=f'{directory}:{self.amu}',
                         KEXE_STACK_BYTES='8388608', KEXE_CPU_SECONDS='300', KEXE_WALL_SECONDS='1800')
         r = subprocess.run(self.command(directory, args), capture_output=True, text=True, timeout=180, env=env)
         (directory / (label + '.stdout')).write_text(r.stdout)
@@ -227,7 +233,7 @@ def receive(stream):
 
 def execute(native, build, config, key=None):
     stderr = open(native.output / 'controller.stderr', 'wb')
-    env = clean_env(KEXE_ALLOW='3,7,37,39,41', KEXE_FUEL='2000000000', KEXE_STRUCTURED_REPORT='1',
+    env = native.environment(KEXE_ALLOW='3,7,37,39,41', KEXE_FUEL='2000000000', KEXE_STRUCTURED_REPORT='1',
                     KEXE_STACK_BYTES='8388608', KEXE_CPU_SECONDS='300', KEXE_WALL_SECONDS='1800')
     process = subprocess.Popen(native.command(build, [], executable='controller.elf', stdin=True), stdin=subprocess.PIPE,
                                stdout=subprocess.PIPE, stderr=stderr, env=env, bufsize=0)

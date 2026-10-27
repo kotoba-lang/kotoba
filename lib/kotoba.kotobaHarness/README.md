@@ -26,6 +26,7 @@ compiler and runner. It does not use x86 emulation. An already-present
 `docker.io/library/alpine:3` image supplies container metadata only: no image
 shell, loader or libraries execute, no image is pulled, and the container has
 no network. On native ARM64 Linux the same pinned binaries run directly.
+Native compiler/guest PATH contains no hosted tools.
 The packed `aarch64-macos` payload target is the Amu/KX64 runner payload format;
 it does not mean this is a Mach-O macOS executable. No public macOS CLI or
 whole-harness x86 qualification is claimed. The x86 backend currently refuses
