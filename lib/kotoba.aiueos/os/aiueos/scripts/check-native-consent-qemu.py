@@ -248,6 +248,8 @@ def main(args):
                        if shot[2][3 * (y * wd + x):3 * (y * wd + x) + 3] != b"\xff\xff\xff")
         assert stars(pass_panel) == 0 and stars(typed_panel) > 10, (stars(pass_panel), stars(typed_panel))
         assert panel_band(typed_panel, 164, 200) == panel_band(pass_panel, 164, 200), "only the passphrase line changes"
+        hint = lambda shot: panel_band(shot, 128, 156)
+        assert hint(typed_panel) != hint(pass_panel), "typing a short passphrase must change the hint line (weak)"
         send("sendkey ret", 1.5); assert W(87) == 4 and seed_words() == [0] * 8, "a 3-letter passphrase must be ignored"
         type_text("d"); assert W(95) == 4 and S(2039) == 3 + 2**31 + 4 * 256
         send("sendkey backspace", 0.8); assert W(95) == 3 and S(2039) == 3 + 2**31 + 3 * 256
@@ -259,7 +261,13 @@ def main(args):
         # Allow, then a real passphrase, then Enter: the seed is drawn, the proof signed, the seed sealed
         send("sendkey f8", 1.5); assert W(87) == 2 and S(2039) == 3
         send("sendkey y", 1.5); assert W(87) == 4
-        type_text("correct horsex"); send("sendkey backspace", 0.8)
+        type_text("correct h")
+        fair_panel = screenshot("passphrase-fair")
+        assert hint(fair_panel) != hint(typed_panel) and hint(fair_panel) != hint(pass_panel), "9 letters must read fair, not weak"
+        type_text("orsex")
+        good_panel = screenshot("passphrase-good")
+        assert hint(good_panel) != hint(fair_panel) and hint(good_panel) != hint(typed_panel), "14 letters must read good"
+        send("sendkey backspace", 0.8)
         assert W(95) == 13 and S(2039) == 3 + 2**31 + 13 * 256
         send("sendkey ret", 6.0)
         assert W(87) == 0 and W(94) == 1, (W(87), W(94))

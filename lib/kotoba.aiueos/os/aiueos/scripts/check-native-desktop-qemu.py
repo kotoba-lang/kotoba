@@ -59,8 +59,10 @@ def main(media,efi,kernel,font,qemu,firmware,out,iso=None):
    surface=struct.unpack('<2048I',dump(context+0x238000,8192,'surface.bin'))
    work=struct.unpack('<2048I',dump(context+0x23a000,8192,'desktop-context.bin'))
    goal_length=surface[2038]
+   title_words=surface[64:96]
+   title=''.join(chr(cp) for cp in title_words[:title_words.index(0)]) if 0 in title_words else None
    goal=''.join(chr(cp) for cp in surface[224:224+goal_length]) if 12<=goal_length<=63 else None
-   return dict(windows=surface[1],focus=surface[2],width=surface[3],height=surface[4],itonamiGoal=goal,x=work[50],y=work[51],buttons=work[67],magic=work[72],keys=work[73],packets=work[75],clicks=work[76],lastKey=work[77],framesStarted=work[78],framesCompleted=work[79],draftGeneration=work[80],draftCommit=work[82],draftEnabled=work[84])
+   return dict(windows=surface[1],focus=surface[2],width=surface[3],height=surface[4],itonamiGoal=goal,itonamiTitle=title,x=work[50],y=work[51],buttons=work[67],magic=work[72],keys=work[73],packets=work[75],clicks=work[76],lastKey=work[77],framesStarted=work[78],framesCompleted=work[79],draftGeneration=work[80],draftCommit=work[82],draftEnabled=work[84])
   def wait(name,predicate,timeout=120):
    end=time.monotonic()+timeout
    while time.monotonic()<end:
@@ -130,6 +132,11 @@ def main(media,efi,kernel,font,qemu,firmware,out,iso=None):
   key('f5');disabled=wait('normal-profile-has-no-draft-commit',lambda s:s['lastKey']==63 and s['framesCompleted']>typed_b['framesCompleted'])
   assert disabled['draftEnabled']==0 and disabled['draftCommit']==0 and disabled['draftGeneration']==0 and disabled['itonamiGoal']=='Goal (RAM):\nab'
   key('backspace');deleted=wait('itonami-native-goal-backspace',lambda s:s['lastKey']==14 and s['itonamiGoal']=='Goal (RAM):\na' and s['framesCompleted']>typed_b['framesCompleted'])
+  before_enter=screenshot('itonami-before-enter')
+  key('ret');unavailable=wait('itonami-enter-reports-no-agent',lambda s:s['lastKey']==28 and s['keys']>deleted['keys'] and s['itonamiGoal']==deleted['itonamiGoal'] and s['itonamiTitle']=='Itonami (no agent)' and s['framesCompleted']>deleted['framesCompleted'])
+  assert screenshot('itonami-agent-unavailable')!=before_enter
+  key('b');resumed=wait('itonami-edit-clears-no-agent-title',lambda s:s['lastKey']==48 and s['itonamiTitle']=='Itonami' and s['itonamiGoal']=='Goal (RAM):\nab' and s['framesCompleted']>unavailable['framesCompleted'])
+  key('backspace');restored=wait('itonami-draft-preserved-after-enter',lambda s:s['lastKey']==14 and s['itonamiTitle']=='Itonami' and s['itonamiGoal']=='Goal (RAM):\na' and s['framesCompleted']>resumed['framesCompleted'])
   call('input-send-event',{'events':[{'type':'rel','data':{'axis':'x','value':80}},{'type':'rel','data':{'axis':'y','value':40}}]})
   moved=wait('mouse-moves-native-pointer',lambda s:s['x']>two['x'] and s['y']>two['y'] and s['packets']>two['packets'] and s['framesCompleted']>two['framesCompleted'])
   call('input-send-event',{'events':[{'type':'btn','data':{'down':True,'button':'left'}}]})
