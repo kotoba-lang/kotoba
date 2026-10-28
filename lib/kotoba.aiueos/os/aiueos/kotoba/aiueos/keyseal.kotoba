@@ -1,0 +1,133 @@
+(ns aiueos.keyseal
+  (:require [aiueos.sha512 :as sha])
+  (:export [aiueos-keyseal-seal aiueos-keyseal-open main]))
+
+;; ADR-0277 W3f: seal a 32-byte device-key seed under a passphrase, and open it again.
+;;
+;;   K      = SHA-512 iterated: h1 = H(pass32 || salt16), h(i+1) = H(h(i) || salt16), K = h(iters)
+;;   ct     = seed xor K[0..32)
+;;   tag    = H(K[32..64) || salt16 || ct32)[0..16)
+;;   blob64 = salt16 || ct32 || tag16
+;;
+;; pass32 is the passphrase padded with zero bytes to 32 (the passphrase alphabet has no NUL, and an empty
+;; passphrase is refused by the caller). Open checks the tag (constant-time accumulation over all 16 bytes)
+;; before it releases the seed; a wrong passphrase or a changed blob returns 0 and leaves the seed output
+;; zero. Scratch (K, the message buffer) is wiped before return. This is a passphrase-derived stream sealing
+;; with an iterated-hash KDF, not a memory-hard one: the strength is the passphrase's, the iteration count
+;; only slows an offline guess. Not constant-time qualified (the hash and the xor loops are data-independent
+;; in length, memory timing is not analysed).
+;;
+;; Regions (extents are fixed so every access size equals its region's extent, JUN-483):
+;; pass 32, salt 16, seed 32, blob 64, k 64, msg 128, work 4096.
+
+(defn put-msg [msg at v] (kernel-store-u8 msg 128 at v))
+
+(defn copy-pass [pass msg i]
+  (if (>= i 32) 0
+    (let [x (put-msg msg i (kernel-load-u8 pass 32 i))]
+      (copy-pass pass msg (+ i (+ 1 (* 0 x)))))))
+
+(defn copy-salt [salt msg at i]
+  (if (>= i 16) 0
+    (let [x (put-msg msg (+ at i) (kernel-load-u8 salt 16 i))]
+      (copy-salt salt msg at (+ i (+ 1 (* 0 x)))))))
+
+(defn copy-hash [k msg i]
+  (if (>= i 64) 0
+    (let [x (put-msg msg i (kernel-load-u8 k 64 i))]
+      (copy-hash k msg (+ i (+ 1 (* 0 x)))))))
+
+(defn derive-loop [salt k msg work n]
+  (if (<= n 0) 1
+    (let [c (copy-hash k msg 0)
+          s (copy-salt salt msg 64 0)
+          h (sha/aiueos-sha512 (kernel-subregion msg 128 0 80) 80 k work 4096)]
+      (derive-loop salt k msg work (- n (+ 1 (* 0 (+ c (+ s h)))))))))
+
+;; k = K (64 bytes). 1 on success.
+(defn derive [pass salt k msg work iters]
+  (let [a (copy-pass pass msg 0)
+        b (copy-salt salt msg 32 0)
+        h (sha/aiueos-sha512 (kernel-subregion msg 128 0 48) 48 k work 4096)
+        r (derive-loop salt k msg work (- iters 1))]
+    (+ 1 (* 0 (+ a (+ b (+ h r)))))))
+
+;; msg = K[32..64) || salt16 || ct32 (80 bytes), then k = H(msg) (the tag is k[0..16))
+(defn build-tag-msg [k salt ct-blob msg i]
+  (if (>= i 32) 0
+    (let [x (put-msg msg i (kernel-load-u8 k 64 (+ 32 i)))
+          y (put-msg msg (+ 48 i) (kernel-load-u8 ct-blob 64 (+ 16 i)))]
+      (build-tag-msg k salt ct-blob msg (+ i (+ 1 (* 0 (+ x y))))))))
+
+(defn tag-hash [k salt blob msg work]
+  (let [a (build-tag-msg k salt blob msg 0)
+        s (copy-salt salt msg 32 0)
+        h (sha/aiueos-sha512 (kernel-subregion msg 128 0 80) 80 k work 4096)]
+    (+ 1 (* 0 (+ a (+ s h))))))
+
+(defn wipe64 [r i]
+  (if (>= i 64) 0
+    (let [x (kernel-store-u8 r 64 i 0)]
+      (wipe64 r (+ i (+ 1 (* 0 x)))))))
+(defn wipe128 [r i]
+  (if (>= i 128) 0
+    (let [x (kernel-store-u8 r 128 i 0)]
+      (wipe128 r (+ i (+ 1 (* 0 x)))))))
+(defn wipe32 [r i]
+  (if (>= i 32) 0
+    (let [x (kernel-store-u8 r 32 i 0)]
+      (wipe32 r (+ i (+ 1 (* 0 x)))))))
+
+;; blob[0..16) = salt (the caller writes it), blob[16..48) = ct, blob[48..64) = tag
+(defn seal-ct [seed k blob i]
+  (if (>= i 32) 0
+    (let [x (kernel-store-u8 blob 64 (+ 16 i)
+                             (bit-xor (kernel-load-u8 seed 32 i) (kernel-load-u8 k 64 i)))]
+      (seal-ct seed k blob (+ i (+ 1 (* 0 x)))))))
+
+(defn put-tag [k blob i]
+  (if (>= i 16) 0
+    (let [x (kernel-store-u8 blob 64 (+ 48 i) (kernel-load-u8 k 64 i))]
+      (put-tag k blob (+ i (+ 1 (* 0 x)))))))
+
+;; salt must equal blob[0..16): the caller fills blob[0..16) first and passes the same 16 bytes as salt.
+(defn aiueos-keyseal-seal [pass salt seed blob k msg work iters]
+  (if (or (< iters 1) (> iters 65536)) 0
+    (let [d (derive pass salt k msg work iters)
+          c (seal-ct seed k blob 0)
+          t (tag-hash k salt blob msg work)
+          p (put-tag k blob 0)
+          w1 (wipe64 k 0)
+          w2 (wipe128 msg 0)]
+      (+ 1 (* 0 (+ d (+ c (+ t (+ p (+ w1 w2))))))))))
+
+;; seed-out gets K[0..32) first, then ct xor K once the tag matched; on a mismatch it is wiped.
+(defn keep-key [k seed-out i]
+  (if (>= i 32) 0
+    (let [x (kernel-store-u8 seed-out 32 i (kernel-load-u8 k 64 i))]
+      (keep-key k seed-out (+ i (+ 1 (* 0 x)))))))
+
+(defn tag-diff [k blob i acc]
+  (if (>= i 16) acc
+    (tag-diff k blob (+ i 1)
+              (bit-or acc (bit-xor (kernel-load-u8 k 64 i) (kernel-load-u8 blob 64 (+ 48 i)))))))
+
+(defn unmask [blob seed-out i]
+  (if (>= i 32) 0
+    (let [x (kernel-store-u8 seed-out 32 i
+                             (bit-xor (kernel-load-u8 seed-out 32 i) (kernel-load-u8 blob 64 (+ 16 i))))]
+      (unmask blob seed-out (+ i (+ 1 (* 0 x)))))))
+
+(defn aiueos-keyseal-open [pass salt blob seed-out k msg work iters]
+  (if (or (< iters 1) (> iters 65536)) 0
+    (let [d (derive pass salt k msg work iters)
+          e (keep-key k seed-out 0)
+          t (tag-hash k salt blob msg work)
+          diff (tag-diff k blob 0 0)
+          ok (if (= diff 0) 1 0)
+          u (if (= ok 1) (unmask blob seed-out 0) (wipe32 seed-out 0))
+          w1 (wipe64 k 0)
+          w2 (wipe128 msg 0)]
+      (+ ok (* 0 (+ d (+ e (+ t (+ u (+ w1 w2))))))))))
+
+(defn main [] :i64 0)
