@@ -172,6 +172,10 @@ def main(args):
         event("entropy-probe", flags=entropy, rdrand=bool(entropy & 1), rdseed=bool(entropy & 2),
               leaf7=bool(entropy & 4), drawn=True, distinctNonZeroDraws=True)
         send("sendkey 2", 1.5); send("sendkey a", 1.5)
+        # a loaded host makes TCG slow: poll for the state instead of trusting a fixed delay (up to 60 s)
+        for _ in range(30):
+            if (S(1), S(2), S(2038)) == (1, 2, 13): break
+            time.sleep(2)
         assert S(1) == 1 and S(2) == 2 and S(2038) == 13, (S(1), S(2), S(2038))
         event("itonami-goal-typed", goalLength=S(2038))
         def move_to(x, y):

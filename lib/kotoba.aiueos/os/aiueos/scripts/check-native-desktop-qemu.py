@@ -140,13 +140,13 @@ def main(media,efi,kernel,font,qemu,firmware,out,iso=None):
   # Native minimize/restore: retain geometry and Goal, skip hidden windows
   # during Tab, never accept typing into a hidden window, restore via dock/key.
   itonami_rect=next(r for r in deleted['windowRects'] if r[0]==2)
-  key('f6');hidden=wait('keyboard-minimizes-itonami',lambda s:s['focus']==1 and s['lastKey']==64 and s['framesCompleted']>deleted['framesCompleted'])
+  key('f2');hidden=wait('keyboard-minimizes-itonami',lambda s:s['focus']==1 and s['lastKey']==60 and s['framesCompleted']>deleted['framesCompleted'])
   assert next(r for r in hidden['windowRects'] if r[0]==2)==itonami_rect[:4]+[itonami_rect[4]+65536]
   key('b');ignored=wait('hidden-goal-ignores-typing',lambda s:s['lastKey']==48 and s['keys']>hidden['keys'])
   assert ignored['itonamiGoal']=='Goal (RAM):\na'
   key('tab');cycled=wait('tab-skips-minimized-window',lambda s:s['lastKey']==15 and s['keys']>ignored['keys'])
   assert cycled['focus']==1
-  key('f6');all_hidden=wait('all-windows-minimized',lambda s:s['focus']==0 and s['lastKey']==64 and s['framesCompleted']>cycled['framesCompleted'])
+  key('f2');all_hidden=wait('all-windows-minimized',lambda s:s['focus']==0 and s['lastKey']==60 and s['framesCompleted']>cycled['framesCompleted'])
   hidden_pixels=screenshot('all-minimized')
   ix,iy,iw,ih=itonami_rect[1:]
   assert hidden_pixels[3*((iy+80)*1280+ix+100):3*((iy+80)*1280+ix+100)+3]==bytes(expected_background(iy+80))
