@@ -44,7 +44,7 @@ def main(args):
                  duration=c[116], maxMS=c[122], missed=c[120], latency=c[118],
                  drained=c[121], active=c[103], clockJumps=c[104], check=c[102],
                  blurCheck=e[1], blur=c[125], blurRows=c[123], blurSkipped=c[124],
-                 reduced=c[99], selected=c[100], mute=c[105], volume=c[106],
+                 reduced=c[99], selected=e[29], attempts=c[100], mute=c[105], volume=c[106],
                  audio=c[107], event=c[108], events=c[109], played=e[19], dropped=e[20],
                  motion=[list(e[128+6*k:134+6*k]) for k in range(4)],
                  inertia=list(e[32:39]), renderError=c[101], overflow=s[427],
@@ -97,6 +97,7 @@ def main(args):
             record('muted-before-first-feedback', muted)
         focus = key('select', 'right', lambda s: s['selected'] == 1)
         assert focus['pending'] == 0
+        assert focus['attempts'] == first['attempts'], 'Dock modified key attempts'
         assert all(ch[3] == ch[1] for ch in focus['motion']), focus
         screen('effects-home')
         record('spring-settles-on-monotonic-timeline', focus)
@@ -168,6 +169,7 @@ def main(args):
         idle = state()
         assert idle['frames'] == settled['frames'] and idle['active'] == 0, (settled, idle)
         record('no-effect-frames-after-settle', idle)
+        assert idle['attempts'] == first['attempts'], 'UI changed key-attempt counter'
         final = idle
     finally:
         guest.close()

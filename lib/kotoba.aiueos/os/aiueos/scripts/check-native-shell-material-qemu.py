@@ -45,10 +45,11 @@ def main(args):
     def state():
         s = guest.dump(guest.context + 0x238000, "surface.bin")
         c = guest.dump(guest.context + 0x23a000, "context.bin")
+        e = guest.dump(guest.context + 0x23c000, "effects.bin")
         n = s[2038]
         return dict(magic=c[72], keys=c[73], lastKey=c[77],
                     frames=c[79], framesStarted=c[78], packets=c[75],
-                    x=c[50], y=c[51], pressed=c[67], reduced=c[99], selected=c[100],
+                    x=c[50], y=c[51], pressed=c[67], reduced=c[99], selected=e[29], attempts=c[100],
                     renderError=c[101], effectActive=c[103], clockScale=c[110],
                     clockMS=c[111], calibration=list(c[126:128]),
                     frameMS=c[116], maxFrameMS=c[122], missed=c[120],
@@ -129,6 +130,7 @@ def main(args):
 
         selected = key("keyboard-focus", "right", lambda s: s["selected"] == 1)
         assert selected["windows"] == 0 and selected["pending"] == 0
+        assert selected["attempts"] == first["attempts"], "Dock modified key attempts"
         assert any(op[0] == 3 and op[5] == 0x6755ff for op in selected["ops"])
         screenshot("keyboard-focus")
         key("keyboard-cancel", "esc", lambda s: s["selected"] == 0 and s["windows"] == 0)
