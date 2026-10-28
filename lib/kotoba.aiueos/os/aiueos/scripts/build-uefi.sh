@@ -142,11 +142,11 @@ kotoba_digest_equal_object=${AIUEOS_KOTOBA_DIGEST_EQUAL_OBJECT:-"$aiueos/kotoba/
 kotoba_catalog_valid_object=${AIUEOS_KOTOBA_CATALOG_VALID_OBJECT:-"$aiueos/kotoba/app-catalog-valid.o"}
 kotoba_app_lookup_object=${AIUEOS_KOTOBA_APP_LOOKUP_OBJECT:-"$aiueos/kotoba/app-lookup-plan.o"}
 kotoba_user_elf_valid_object=${AIUEOS_KOTOBA_USER_ELF_VALID_OBJECT:-"$aiueos/kotoba/user-elf-valid.o"}
-# The rebuild (23dd642) replaced this object's bytes: the digest tracks the
-# committed os/aiueos/kotoba/user-elf-valid.o (ab027deff...), not the
-# pre-rebuild d79cc375... the PLC branch used to pin here. The PLC-RT-SMOKE
-# override below still swaps in plc-user-elf-valid.o with its own digest.
-kotoba_user_elf_valid_sha=941707062dcdd34c77c0bb1794126589cd83ff2d58d1b9c04eb066ba509ff8d2
+# This native Amu object admits the capability-free scalar user profile (caps
+# bitmap 0) and retains the signed legacy bitmap-60 profile, over both data
+# layouts. Keep the object and digest paired; the PLC-RT-SMOKE override below
+# uses its separate validator and digest.
+kotoba_user_elf_valid_sha=da7f7da3c71890ef69f187726e00970620d00754affd5751df4cfd82a346f2b7
 kotoba_user_context_object=${AIUEOS_KOTOBA_USER_CONTEXT_OBJECT:-"$aiueos/kotoba/user-context-build.o"}
 # The kernel-selector twin of the object above, for tasks `iret` enters at ring
 # 0. Same 160-byte frame in the same bounded 4 KiB stack; CS 0x08 / SS 0x10 and
@@ -503,6 +503,10 @@ if [ "${AIUEOS_ECDSA_SIGN_KAT:-0}" = 1 ]; then
   input_smoke_cflags="$input_smoke_cflags -DAIUEOS_ECDSA_SIGN_KAT=1"
 fi
 plc_runtime_link=
+if [ "${AIUEOS_ZERO_CAP_USER_SMOKE:-0}" = 1 ] && [ "${AIUEOS_PLC_RT_SMOKE:-0}" = 1 ]; then
+  echo "error: zero-cap user and PLC smoke profiles are exclusive" >&2
+  exit 1
+fi
 if [ "${AIUEOS_PLC_RT_SMOKE:-0}" = 1 ]; then
   : "${AIUEOS_PLC_ELF:?AIUEOS_PLC_ELF is required for the RT smoke}"
   : "${AIUEOS_PLC_RECEIPT:?AIUEOS_PLC_RECEIPT is required for the RT smoke}"
@@ -512,6 +516,13 @@ if [ "${AIUEOS_PLC_RT_SMOKE:-0}" = 1 ]; then
   plc_runtime_link="$kernel_plc_runtime_object $kernel_plc_embedded_object $kotoba_rt_dispatch_plan_object"
   kotoba_user_elf_valid_object="$aiueos/kotoba/plc-user-elf-valid.o"
   kotoba_user_elf_valid_sha=77c5e791da666e8355a7a877c37841cc63a3f228fbf785656522284a5259bbdd
+fi
+if [ "${AIUEOS_ZERO_CAP_USER_SMOKE:-0}" = 1 ]; then
+  : "${AIUEOS_ZERO_CAP_USER_ELF:?AIUEOS_ZERO_CAP_USER_ELF is required}"
+  : "${AIUEOS_ZERO_CAP_USER_SIGNATURE:?AIUEOS_ZERO_CAP_USER_SIGNATURE is required}"
+  : "${AIUEOS_ZERO_CAP_USER_PUBLIC_KEY:?AIUEOS_ZERO_CAP_USER_PUBLIC_KEY is required}"
+  input_smoke_cflags="$input_smoke_cflags -DAIUEOS_ZERO_CAP_USER_SMOKE=1"
+  plc_runtime_link="$kernel_plc_embedded_object"
 fi
 if [ "${AIUEOS_ECDSA_PUBLIC_KAT:-0}" = 1 ]; then
   input_smoke_cflags="$input_smoke_cflags -DAIUEOS_ECDSA_PUBLIC_KAT=1"
@@ -1374,12 +1385,20 @@ zig cc -target x86_64-freestanding-none -std=c11 -O2 \
   $input_smoke_cflags \
   -c -o "$kernel_framebuffer_object" "$aiueos/kernel/framebuffer.c"
 if [ -n "$plc_runtime_link" ]; then
-  zig cc -target x86_64-freestanding-none -std=c11 -O2 \
-    -ffreestanding -fno-stack-protector -mno-red-zone \
-    -c -o "$kernel_plc_runtime_object" "$aiueos/kernel/plc_runtime.c"
-  python3 "$aiueos/scripts/make-plc-embedded-assembly.py" \
-    "$AIUEOS_PLC_ELF" "$AIUEOS_PLC_RECEIPT" \
-    "$AIUEOS_PLC_SIGNATURE" "$AIUEOS_PLC_PUBLIC_KEY" "$out/plc-embedded.S"
+  if [ "${AIUEOS_PLC_RT_SMOKE:-0}" = 1 ]; then
+    zig cc -target x86_64-freestanding-none -std=c11 -O2 \
+      -ffreestanding -fno-stack-protector -mno-red-zone \
+      -c -o "$kernel_plc_runtime_object" "$aiueos/kernel/plc_runtime.c"
+    python3 "$aiueos/scripts/make-plc-embedded-assembly.py" \
+      "$AIUEOS_PLC_ELF" "$AIUEOS_PLC_RECEIPT" \
+      "$AIUEOS_PLC_SIGNATURE" "$AIUEOS_PLC_PUBLIC_KEY" "$out/plc-embedded.S"
+  else
+    python3 "$aiueos/scripts/make-zero-cap-user-embedded-assembly.py" \
+      "$AIUEOS_ZERO_CAP_USER_ELF" \
+      7f5a8c0a31b5bdf191410f007973413d16e497a20ae7fe86c734b9fea85808b1 \
+      "$AIUEOS_ZERO_CAP_USER_SIGNATURE" "$AIUEOS_ZERO_CAP_USER_PUBLIC_KEY" \
+      "$out/plc-embedded.S"
+  fi
   zig cc -target x86_64-freestanding-none -c \
     -o "$kernel_plc_embedded_object" "$out/plc-embedded.S"
 fi

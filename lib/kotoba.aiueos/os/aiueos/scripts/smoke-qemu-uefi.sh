@@ -9,12 +9,21 @@ serial_log="$out/kernel-serial.log"
 blk_image="$out/virtio-blk-smoke.img"
 qemu=${QEMU_SYSTEM_X86_64:-qemu-system-x86_64}
 plc_signing=
+zero_cap_signing=
 cleanup_plc_signing() {
   [ -z "$plc_signing" ] || [ ! -d "$plc_signing" ] || {
     rm -f "$plc_signing/key.pem" "$plc_signing/signature.der" \
       "$plc_signing/public.der" "$plc_signing/signature.raw" \
       "$plc_signing/public.raw"
     rmdir "$plc_signing"
+  }
+}
+cleanup_zero_cap_signing() {
+  [ -z "$zero_cap_signing" ] || [ ! -d "$zero_cap_signing" ] || {
+    rm -f "$zero_cap_signing/key.pem" "$zero_cap_signing/signature.der" \
+      "$zero_cap_signing/public.der" "$zero_cap_signing/signature.raw" \
+      "$zero_cap_signing/public.raw"
+    rmdir "$zero_cap_signing"
   }
 }
 # One cleanup, one pair of traps. A second `trap ... EXIT` anywhere below would
@@ -26,7 +35,7 @@ cleanup_tpm() {
   [ -z "$tpm_pid" ] || kill "$tpm_pid" 2>/dev/null || true
   [ -z "$tpm_state" ] || rm -rf "$tpm_state"
 }
-cleanup_all() { cleanup_plc_signing; cleanup_tpm; }
+cleanup_all() { cleanup_plc_signing; cleanup_zero_cap_signing; cleanup_tpm; }
 trap cleanup_all 0
 trap 'cleanup_all; exit 1' HUP INT TERM
 
@@ -65,6 +74,38 @@ if [ "${AIUEOS_PLC_RT_SMOKE:-0}" = 1 ]; then
   fi
   export AIUEOS_PLC_ELF AIUEOS_PLC_RECEIPT \
     AIUEOS_PLC_SIGNATURE AIUEOS_PLC_PUBLIC_KEY
+fi
+if [ "${AIUEOS_ZERO_CAP_USER_SMOKE:-0}" = 1 ]; then
+  [ "${AIUEOS_PLC_RT_SMOKE:-0}" != 1 ] || {
+    echo "error: zero-cap user and PLC smoke profiles are exclusive" >&2
+    exit 1
+  }
+  AIUEOS_ZERO_CAP_USER_ELF=${AIUEOS_ZERO_CAP_USER_ELF:-"$aiueos/fixtures/zero-cap-user/scalar.elf"}
+  if { [ -n "${AIUEOS_ZERO_CAP_USER_SIGNATURE:-}" ] && [ -z "${AIUEOS_ZERO_CAP_USER_PUBLIC_KEY:-}" ]; } || \
+     { [ -z "${AIUEOS_ZERO_CAP_USER_SIGNATURE:-}" ] && [ -n "${AIUEOS_ZERO_CAP_USER_PUBLIC_KEY:-}" ]; }; then
+    echo "error: zero-cap signature and public key must be supplied together" >&2
+    exit 1
+  fi
+  if [ -z "${AIUEOS_ZERO_CAP_USER_SIGNATURE:-}" ]; then
+    command -v openssl >/dev/null 2>&1 || {
+      echo "error: openssl is required for signed zero-cap user smoke" >&2
+      exit 1
+    }
+    zero_cap_signing=$(mktemp -d "${TMPDIR:-/tmp}/aiueos-zero-cap-signing.XXXXXX")
+    openssl ecparam -name prime256v1 -genkey -noout \
+      -out "$zero_cap_signing/key.pem" 2>/dev/null
+    openssl dgst -sha256 -sign "$zero_cap_signing/key.pem" \
+      -out "$zero_cap_signing/signature.der" "$AIUEOS_ZERO_CAP_USER_ELF"
+    openssl ec -in "$zero_cap_signing/key.pem" -pubout -conv_form uncompressed \
+      -outform DER -out "$zero_cap_signing/public.der" 2>/dev/null
+    python3 "$aiueos/scripts/make-plc-signature-material.py" \
+      "$zero_cap_signing/signature.der" "$zero_cap_signing/public.der" \
+      "$zero_cap_signing/signature.raw" "$zero_cap_signing/public.raw" >/dev/null
+    AIUEOS_ZERO_CAP_USER_SIGNATURE="$zero_cap_signing/signature.raw"
+    AIUEOS_ZERO_CAP_USER_PUBLIC_KEY="$zero_cap_signing/public.raw"
+  fi
+  export AIUEOS_ZERO_CAP_USER_ELF AIUEOS_ZERO_CAP_USER_SIGNATURE \
+    AIUEOS_ZERO_CAP_USER_PUBLIC_KEY
 fi
 
 # --- freshness floor (ADR-0155) ---------------------------------------------
@@ -1547,6 +1588,19 @@ if [ "${AIUEOS_PLC_RT_SMOKE:-0}" = 1 ]; then
     exit 1
   }
   echo "AIUEOS_PLC_RT_QEMU_OK scans=100 signed-elf tamper-rejected fixed-priority-preemption native-provider apic-release transactional-output safe-state"
+  exit 0
+fi
+if [ "${AIUEOS_ZERO_CAP_USER_SMOKE:-0}" = 1 ]; then
+  [ "$status" -eq 133 ] || {
+    echo "error: zero-cap user smoke produced unexpected QEMU status $status" >&2
+    test -f "$serial_log" && tail -30 "$serial_log" >&2
+    exit 1
+  }
+  grep -F "AIUEOS_ZERO_CAP_USER_OK source=amu-selfhost signature=ecdsa-p256-sha256 tamper=rejected cpl=3 caps=none result=42" "$serial_log" >/dev/null || {
+    echo "error: signed zero-cap CPL3 result was not observed" >&2
+    exit 1
+  }
+  echo "AIUEOS_ZERO_CAP_USER_QEMU_OK signed-cpl3-elf caps=none result=42"
   exit 0
 fi
 
