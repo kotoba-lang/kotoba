@@ -58,15 +58,26 @@ class Boot:
             text += chunk
         return text
 
-    def read(self, addr):
-        self.drain(); self.send(f"xp /1wx {addr:#x}", 0.5)
-        found = re.findall(r"[0-9a-f]{16}: 0x([0-9a-f]{8})", self.drain())
-        assert found, ("xp gave nothing", hex(addr))
-        return int(found[-1], 16)
+    def dump(self, addr, length):
+        # Observe one native range in a single monitor command. The previous
+        # per-word sleep took minutes for the4096-byte wipe assertion and did
+        # not add any guest/device coverage. Keep the exact full-range checks.
+        path = self.out / "keystore-observation.bin"
+        if path.exists(): path.unlink()
+        self.drain()
+        self.send(f"pmemsave {addr:#x} {length} {path.name}", .05)
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if path.exists() and path.stat().st_size == length:
+                raw = path.read_bytes(); path.unlink(); return raw
+            if self.proc.poll() is not None: break
+            time.sleep(.02)
+        raise AssertionError(("native memory observation missing", hex(addr), length))
 
+    def read(self, addr): return struct.unpack("<I", self.dump(addr, 4))[0]
     def S(self, i): return self.read(self.surface + 4 * i)
     def W(self, i): return self.read(self.work + 4 * i)
-    def words(self, first, count): return b"".join(struct.pack("<I", self.W(first + i)) for i in range(count))
+    def words(self, first, count): return self.dump(self.work + 4 * first, 4 * count)
 
     def type_text(self, text):
         for ch in text: self.send("sendkey " + ("spc" if ch == " " else ch), 0.6)
