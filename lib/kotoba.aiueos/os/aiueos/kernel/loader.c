@@ -113,4 +113,35 @@ int aiueos_reset_embedded_plc_context(uint64_t *result,uint64_t runtime_handle) 
   return 1;
 }
 #endif
+#ifdef AIUEOS_ZERO_CAP_USER_SMOKE
+extern const uint8_t aiueos_zero_cap_elf_start[],aiueos_zero_cap_elf_end[];
+extern const uint8_t aiueos_zero_cap_elf_sha256[32];
+extern const uint8_t aiueos_zero_cap_signature[64],aiueos_zero_cap_public_key[64];
+extern uint64_t kotoba_aiueos_ecdsa_p256_sha256_verify(
+  const uint8_t *,const uint8_t *,const uint8_t *,uint8_t *,uint64_t);
+static uint8_t zero_cap_signature_workspace[2048];
+volatile uint64_t aiueos_zero_cap_loader_stage;
+int aiueos_load_embedded_zero_cap_process(unsigned process,uint64_t *entry,uint64_t **result) {
+  uint8_t actual[32],workspace[512],invalid_signature[64];
+  uint64_t size=(uint64_t)(aiueos_zero_cap_elf_end-aiueos_zero_cap_elf_start);
+  aiueos_zero_cap_loader_stage=1;
+  if (!size || size>98304) return 0;
+  if (!kotoba_aiueos_sha256(aiueos_zero_cap_elf_start,size,actual,workspace,sizeof(workspace))) return 0;
+  aiueos_zero_cap_loader_stage=2;
+  if (!kotoba_aiueos_digest_equal(actual,aiueos_zero_cap_elf_sha256,32)) return 0;
+  for (unsigned i=0;i<64;i++) invalid_signature[i]=aiueos_zero_cap_signature[i];
+  invalid_signature[0]^=1;
+  aiueos_zero_cap_loader_stage=3;
+  if (kotoba_aiueos_ecdsa_p256_sha256_verify(invalid_signature,actual,
+      aiueos_zero_cap_public_key,zero_cap_signature_workspace,
+      sizeof(zero_cap_signature_workspace))) return 0;
+  if (!kotoba_aiueos_ecdsa_p256_sha256_verify(aiueos_zero_cap_signature,actual,
+      aiueos_zero_cap_public_key,zero_cap_signature_workspace,
+      sizeof(zero_cap_signature_workspace))) return 0;
+  aiueos_zero_cap_loader_stage=4;
+  if (!load_kotoba_process(process,aiueos_zero_cap_elf_start,size,entry,result)) return 0;
+  aiueos_zero_cap_loader_stage=5;
+  return *result && (*result)[2]==0 && (*result)[10]==0;
+}
+#endif
 int aiueos_kotoba_process_loader_evidence_ready(void) { return (int)loader_evidence; }

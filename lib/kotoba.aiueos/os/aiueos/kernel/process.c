@@ -67,6 +67,9 @@ extern int aiueos_reset_embedded_plc_context(uint64_t *result,uint64_t runtime_h
 extern int aiueos_scheduler_rearm_plc_task(unsigned slot,void (*entry)(uint64_t),
   uint64_t argument,uint64_t user_stack);
 #endif
+#ifdef AIUEOS_ZERO_CAP_USER_SMOKE
+extern int aiueos_load_embedded_zero_cap_process(unsigned process,uint64_t *entry,uint64_t **result);
+#endif
 extern int aiueos_kotoba_process_loader_evidence_ready(void);
 extern int aiueos_kotoba_service_ipc_evidence_ready(void);
 extern uint8_t aiueos_user_text_start[],aiueos_user_text_end[];
@@ -224,7 +227,8 @@ int aiueos_process_address_space_for_domain(uint16_t domain) {
       return processes[slot].address_space;
   return -1;
 }
-static int process_create_in_space(void (*entry)(uint64_t),uint16_t domain,int supplied_space) {
+static int process_create_in_space_with_log(void (*entry)(uint64_t),uint16_t domain,
+                                           int supplied_space,int grant_log) {
   uint64_t address=(uint64_t)(uintptr_t)entry;
   uint64_t plan=kotoba_aiueos_process_create_plan(processes,sizeof(processes),
     domain,PROCESS_CAPACITY,sizeof(processes[0]));
@@ -245,8 +249,10 @@ static int process_create_in_space(void (*entry)(uint64_t),uint16_t domain,int s
   }
   struct user_result *result=aiueos_address_space_private_backing((unsigned)address_space);
   uint64_t private_va=aiueos_address_space_private_va((unsigned)address_space);
-  uint64_t handle=aiueos_capability_ensure_log_handle(domain);
-  if (!result || !private_va || !handle) { aiueos_address_space_reclaim((unsigned)address_space); return -1; }
+  uint64_t handle=grant_log ? aiueos_capability_ensure_log_handle(domain) : 0;
+  if (!result || !private_va || (grant_log && !handle)) {
+    aiueos_address_space_reclaim((unsigned)address_space); return -1;
+  }
   result->handle=handle; result->domain=domain;
   result->message[0]='r'; result->message[1]='i'; result->message[2]='n';
   result->message[3]='g'; result->message[4]=(char)('1'+descriptor); result->message[5]=0;
@@ -270,6 +276,9 @@ static int process_create_in_space(void (*entry)(uint64_t),uint16_t domain,int s
   if (recipe&AIUEOS_PROCESS_CREATE_ACTIVE) p->active=1;
   return (int)descriptor;
 }
+static int process_create_in_space(void (*entry)(uint64_t),uint16_t domain,int supplied_space) {
+  return process_create_in_space_with_log(entry,domain,supplied_space,1);
+}
 static int process_create(void (*entry)(uint64_t),uint16_t domain) {
   return process_create_in_space(entry,domain,-1);
 }
@@ -281,11 +290,24 @@ static int process_create_kotoba_elf(const uint8_t app_id[16],uint16_t domain,ui
     if (address_space>=0) aiueos_address_space_reclaim((unsigned)address_space);
     return -1;
   }
-  uint64_t runtime_handle=aiueos_capability_ensure_runtime_handle(domain);
-  if (!runtime_handle || !*result) {
+  if (!*result) {
     aiueos_address_space_reclaim((unsigned)address_space); return -1;
   }
-  (*result)[10]=runtime_handle;
+  uint64_t cap_bitmap=(*result)[2];
+  if (cap_bitmap==0) {
+    /* A source with no capability calls must not receive a runtime handle. */
+    if ((*result)[10]!=0) {
+      aiueos_address_space_reclaim((unsigned)address_space); return -1;
+    }
+  } else if (cap_bitmap==60) {
+    uint64_t runtime_handle=aiueos_capability_ensure_runtime_handle(domain);
+    if (!runtime_handle) {
+      aiueos_address_space_reclaim((unsigned)address_space); return -1;
+    }
+    (*result)[10]=runtime_handle;
+  } else {
+    aiueos_address_space_reclaim((unsigned)address_space); return -1;
+  }
   return process_create_in_space((void (*)(uint64_t))(uintptr_t)entry,domain,address_space);
 }
 #ifdef AIUEOS_PLC_RT_SMOKE
@@ -343,6 +365,34 @@ int aiueos_process_enter_plc_rt(void) {
   }
   aiueos_plc_process_stage=104;
   return aiueos_plc_rt_scheduler_evidence_ready(AIUEOS_PLC_RT_STRESS_SCANS);
+}
+#endif
+
+#ifdef AIUEOS_ZERO_CAP_USER_SMOKE
+volatile uint64_t aiueos_zero_cap_process_stage;
+int aiueos_process_enter_zero_cap_user(void) {
+  aiueos_zero_cap_process_stage=1;
+  if (!aiueos_scheduler_begin_user_runtime()) return 0;
+  int address_space=aiueos_address_space_claim();
+  uint64_t entry=0,*result=0;
+  aiueos_zero_cap_process_stage=2;
+  if (address_space<0 || !aiueos_load_embedded_zero_cap_process(
+      (unsigned)address_space,&entry,&result)) return 0;
+  aiueos_zero_cap_process_stage=3;
+  int descriptor=process_create_in_space_with_log(
+      (void (*)(uint64_t))(uintptr_t)entry,4,address_space,0);
+  if (descriptor<0 || !result || *result!=0 || result[2]!=0 || result[10]!=0 ||
+      processes[descriptor].result->handle!=0) return 0;
+  aiueos_zero_cap_process_stage=4;
+  __asm__ volatile("sti");
+  uint64_t waits=0;
+  while (*result!=42) {
+    __asm__ volatile("pause");
+    if (++waits>2000000000ULL) return 0;
+  }
+  __asm__ volatile("cli");
+  aiueos_zero_cap_process_stage=5;
+  return result[2]==0 && result[10]==0 && processes[descriptor].result->handle==0;
 }
 #endif
 
