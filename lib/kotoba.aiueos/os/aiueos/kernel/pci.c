@@ -443,9 +443,8 @@ unsigned aiueos_object_store_restored_count(void) { return object_store_restored
 extern int aiueos_aes128_gcm_encrypt(const uint8_t[16], const uint8_t[12],
                                      const uint8_t *, uint32_t,
                                      const uint8_t *, uint32_t, uint8_t *, uint8_t[16]);
-extern int aiueos_aes128_gcm_decrypt(const uint8_t[16], const uint8_t[12],
-                                     const uint8_t *, uint32_t,
-                                     const uint8_t *, uint32_t, const uint8_t[16], uint8_t *);
+extern int aiueos_aes128_gcm_unwrap(const uint8_t[16], const uint8_t[12],
+                                    const uint8_t *, uint32_t, uint8_t *);
 static uint8_t storage_key[16];
 static int storage_key_valid;
 void aiueos_storage_set_key(const uint8_t key[16]) {
@@ -456,14 +455,28 @@ static void storage_nonce(uint64_t sector, uint8_t nonce[12]) {
   for (int i = 0; i < 12; i++) nonce[i] = 0;
   for (int i = 0; i < 8; i++) nonce[4 + i] = (uint8_t)((sector >> (i * 8)) & 0xff);
 }
+/* G3 reads unwrap through the sealer (see aiueos_aes128_gcm_unwrap): the wrap
+   discards the tag on write, so there is nothing to authenticate a read with,
+   and the authenticating decrypt refuses every one of them. */
+static void aiueos_storage_unwrap_sector(uint8_t *sector, uint64_t disk_sector) {
+  uint8_t nonce[12];
+  if (!storage_key_valid) return;
+  storage_nonce(disk_sector, nonce);
+  aiueos_aes128_gcm_unwrap(storage_key, nonce, sector, 512, sector);
+}
+static void aiueos_storage_wrap_disable(void) { storage_key_valid = 0; }
 
-static int virtio_blk_sector_io(struct virtio_blk_request *request, uint8_t *sector,
+/* One sector through the virtio-blk backend. `raw` is the one door that skips
+   the G3 wrap: the blank-volume discriminator must see the bytes as they sit
+   on disk. Everything else is wrapped on write and unwrapped on read, and the
+   two must agree per volume or its bytes mix ciphertext and plaintext. */
+static int virtio_blk_sector_io_ex(struct virtio_blk_request *request, uint8_t *sector,
     uint8_t *status, struct virtq_desc *desc, struct virtq_avail *avail,
     struct virtq_used *used, volatile uint16_t *doorbell, uint16_t *submitted,
-    uint32_t type, uint64_t disk_sector) {
+    uint32_t type, uint64_t disk_sector, int raw) {
   uint16_t old = *submitted, target = old + 1;
   uint8_t crypt_nonce[12], crypt_tag[16];
-  if (storage_key_valid && type == VIRTIO_BLK_T_OUT) {
+  if (!raw && storage_key_valid && type == VIRTIO_BLK_T_OUT) {
     storage_nonce(disk_sector, crypt_nonce);
     aiueos_aes128_gcm_encrypt(storage_key, crypt_nonce, 0, 0, sector, 512, sector, crypt_tag);
   }
@@ -483,10 +496,8 @@ static int virtio_blk_sector_io(struct virtio_blk_request *request, uint8_t *sec
         blk_slow_target = target;
       }
       *submitted = target;
-      if (storage_key_valid && type == VIRTIO_BLK_T_IN) {
-        storage_nonce(disk_sector, crypt_nonce);
-        aiueos_aes128_gcm_decrypt(storage_key, crypt_nonce, 0, 0, sector, 512, crypt_tag, sector);
-      }
+      if (!raw && type == VIRTIO_BLK_T_IN)
+        aiueos_storage_unwrap_sector(sector, disk_sector);
       return 1;
     }
     /* Futile, not slow: the used index has passed the value this wait is
@@ -502,6 +513,14 @@ static int virtio_blk_sector_io(struct virtio_blk_request *request, uint8_t *sec
     else __asm__ volatile("pause");
   }
   return 0;
+}
+
+static int virtio_blk_sector_io(struct virtio_blk_request *request, uint8_t *sector,
+    uint8_t *status, struct virtq_desc *desc, struct virtq_avail *avail,
+    struct virtq_used *used, volatile uint16_t *doorbell, uint16_t *submitted,
+    uint32_t type, uint64_t disk_sector) {
+  return virtio_blk_sector_io_ex(request, sector, status, desc, avail, used,
+                                 doorbell, submitted, type, disk_sector, 0);
 }
 
 /* Redo a committed journal payload into its bounded object sector. The journal
@@ -1749,21 +1768,27 @@ static int virtio_blk(uint8_t b, uint8_t d, uint8_t f) {
   if (!setup_blk_msix(b,d,f,&caps,cfg)) return 0;
   cfg->device_status |= VIRTIO_STATUS_DRIVER_OK;
   uint16_t submitted = 0;
-  if (!virtio_blk_sector_io(request,sector,status,desc,avail,used,doorbell,
-                            &submitted,VIRTIO_BLK_T_IN,0)) return 0;
+  if (!virtio_blk_sector_io_ex(request,sector,status,desc,avail,used,doorbell,
+                            &submitted,VIRTIO_BLK_T_IN,0,1)) return 0;
   {
       if (used->ring[0].id != 0 || used->ring[0].length != 513 || *status != VIRTIO_BLK_S_OK)
         return 0;
       const struct aiuefs_superblock *superblock = (const void *)sector;
       extern uint64_t kotoba_aiueos_superblock_valid(const void *, uint64_t);
       int volume_formatted = 0;
-      if (!kotoba_aiueos_superblock_valid(superblock, 512)) {
-        /* Not an AIUEFS1 volume. Blank (sector 0 all zero) volumes are
-           provisioned in place; anything else -- the GPT boot disk's
-           protective MBR, a foreign filesystem -- is simply not ours. One
-           object store per boot: a second blank disk after admission is not
-           a format candidate. */
-        if (object_store_ready || !aiuefs_sector_all_zero(sector) ||
+      /* G3's wrap changes what the first bytes mean, so this sector-0 read is
+         RAW. Raw all zero is a blank volume -- the unwrap would show keystream
+         where the disk holds zeros. A raw AIUEFS1 superblock is a
+         pre-populated plaintext volume that boots as it arrived: the wrap
+         claims ciphertext at rest only for the volumes this OS provisions,
+         and mixed wrapped and unwrapped bytes on one volume corrupt it. Only
+         a wrapped volume is judged in its unwrapped view. */
+      if (aiuefs_sector_all_zero(sector)) {
+        /* Blank (raw sector 0 all zero) volumes are provisioned in place;
+           anything else -- the GPT boot disk's protective MBR, a foreign
+           filesystem -- is simply not ours. One object store per boot: a
+           second blank disk after admission is not a format candidate. */
+        if (object_store_ready ||
             !aiuefs_format_blank_volume(request,sector,status,desc,avail,used,doorbell,
                                         &submitted,capacity)) return 0;
         volume_formatted = 1;
@@ -1773,6 +1798,13 @@ static int virtio_blk(uint8_t b, uint8_t d, uint8_t f) {
         if (used->ring[0].id != 0 || used->ring[0].length != 513 ||
             *status != VIRTIO_BLK_S_OK) return 0;
         superblock = (const void *)sector;
+        if (!kotoba_aiueos_superblock_valid(superblock, 512)) return 0;
+      } else if (kotoba_aiueos_superblock_valid(superblock, 512)) {
+        /* Pre-populated plaintext volume: reads and writes stay unwrapped for
+           it, exactly as it arrived. */
+        aiueos_storage_wrap_disable();
+      } else {
+        aiueos_storage_unwrap_sector(sector, 0);
         if (!kotoba_aiueos_superblock_valid(superblock, 512)) return 0;
       }
       uint32_t catalog_sector=superblock->catalog_sector,catalog_length=superblock->catalog_length;

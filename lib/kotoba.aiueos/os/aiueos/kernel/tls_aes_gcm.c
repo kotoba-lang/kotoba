@@ -95,6 +95,21 @@ int aiueos_aes128_gcm_decrypt(const uint8_t key[16], const uint8_t nonce[12],
                                   (uint64_t)ct_len, 0) == 0;
 }
 
+/* G3's sector wrap (kernel/pci.c) DISCARDS the GCM tag on write: integrity
+   stays with the journal's record checksums and the wrap is confidentiality
+   only. A sector read therefore carries no tag, cannot authenticate, and must
+   not try -- the decrypt above refuses every record whose tag is absent
+   (garbage in, refused, ciphertext left in place), so routing sector reads
+   through it returns ciphertext to every caller. The CTR keystream is its own
+   inverse, so the unwrapping pass is the SEALER applied to the ciphertext:
+   keystream XOR twice is the identity, and the tag it computes is discarded
+   exactly as the wrap discards it on write. */
+int aiueos_aes128_gcm_unwrap(const uint8_t key[16], const uint8_t nonce[12],
+                             const uint8_t *ct, uint32_t ct_len, uint8_t *pt) {
+  gcm_copy(pt, ct, ct_len);
+  return gcm_call(key, nonce, 0, 0, pt, ct_len, 1) == 0;
+}
+
 extern int64_t kotoba_aiueos_aes128_gcm_selftest(uint8_t *scratch,
                                                  int64_t length);
 
