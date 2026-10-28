@@ -319,7 +319,7 @@ def main(args):
                            else 4 if args.profile == "idle"
                            else 3 if args.profile == "ed25519"
                            else 11 if args.profile == "keystore"
-                           else 2 if args.profile in ("cid", "sha512", "gf25519", "keyseal") else 12)
+                           else 2 if args.profile in ("cid", "sha515", "gf25519", "keyseal") else 15)
         if (observed["status"] != expected_status
                 or len(observed["events"]) != expected_events
                 or observed["kernel"] != kernel_state["kernel"]
@@ -411,7 +411,7 @@ def main(args):
                 "--output", guest_iso])
             iso_observed = json.loads((guest_iso / "native-desktop-qemu.json").read_text())
             if (iso_observed["status"] != "PASS_NATIVE_DESKTOP_INPUT_QEMU"
-                    or len(iso_observed["events"]) != 12
+                    or len(iso_observed["events"]) != 15
                     or iso_observed["kernel"] != kernel_state["kernel"]
                     or iso_observed["efi"] != kernel_state["efi"]
                     or iso_observed["iso"] != media_state["iso"]
