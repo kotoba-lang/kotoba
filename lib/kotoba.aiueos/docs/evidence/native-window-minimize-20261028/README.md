@@ -59,6 +59,17 @@ alternate generation and named malformed/missing-medium refusals still pass.
 This remains the existing plaintext, unsigned diagnostic draft transport,
 not the D2 workspace codec, signed Cell state or distributed durability.
 
+`consent-build.json` is the successful integrated consent entry:
+`MACOS_NATIVE_CONSENT_QEMU_CANDIDATE`. `consent-qemu.json` records
+`PASS_NATIVE_CONSENT_QEMU` and all 20 expected observations. In addition to
+the existing fold, Allow/Deny, key/passphrase, signing, draft-after-key and
+approval-count checks, F6 and a dock click cannot act behind local-model
+consent, and a background dock click cannot act behind the key request.
+`consent-kernel-build.json` binds its distinct entry and complete source
+closure. The ordinary desktop and consent profiles have different artifact
+digests and are qualified separately. All inputs were synthetic; no user
+approved an external operation through this test.
+
 From `lib/kotoba.aiueos`, reproduce on Apple Silicon with the pinned Amu
 checkout and QEMU installed, choosing a fresh private output directory:
 
