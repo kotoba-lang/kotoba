@@ -7,6 +7,7 @@ once, waits for the first completed frame, reads the marker (word 99 = "GF25") a
 QEMU monitor and compares them with Python's big-integer arithmetic mod p. The pairs are a generic pair, (p-1, p-1)
 and (1, 2^254). Results must also be canonical (< p). No key, point arithmetic or signature; QEMU TCG only.
 """
+import native_regions
 import argparse, hashlib, json, os, re, select, struct, subprocess, time
 from pathlib import Path
 
@@ -29,8 +30,8 @@ def main(a):
     media_before = pin(a.media)
     image = a.kernel.read_bytes()
     rw = struct.unpack_from("<IIQQQQQQ", image, 120); context = rw[3]
-    assert rw[5] == 0x240000 and context in (0x200000, 0x400000), (hex(context), hex(rw[5]))
-    work = context + 0x23a000
+    assert rw[5] == native_regions.RW_MEMSZ and context in (0x200000, 0x400000), (hex(context), hex(rw[5]))
+    work = context + native_regions.CONTEXT_OFFSET
     cmd = [str(a.qemu), "-machine", "q35,accel=tcg", "-cpu", "max", "-m", "128M", "-smp", "1",
            "-drive", f"if=pflash,format=raw,readonly=on,file={a.firmware}",
            "-drive", f"file={a.media},format=raw,if=ide,snapshot=on", "-boot", "order=c",

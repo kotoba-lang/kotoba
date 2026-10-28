@@ -11,6 +11,7 @@ again, and a consent-bound signature (F7) verifies under the boot-1 public key. 
 value; only the sealed blob is on the disk (the gate also checks that the seed is not in the disk image).
 QEMU TCG, synthetic input: it proves no human consent and no physical-disk behaviour.
 """
+import native_regions
 import argparse, hashlib, importlib.util, json, os, re, select, struct, subprocess, time
 from pathlib import Path
 
@@ -28,8 +29,8 @@ class Boot:
         image = args.kernel.read_bytes()
         rw = struct.unpack_from("<IIQQQQQQ", image, 120)
         context = rw[3]
-        assert rw[5] == 0x240000 and context in (0x200000, 0x400000), (hex(context), hex(rw[5]))
-        self.surface, self.work = context + 0x238000, context + 0x23a000
+        assert rw[5] == native_regions.RW_MEMSZ and context in (0x200000, 0x400000), (hex(context), hex(rw[5]))
+        self.surface, self.work = context + native_regions.SURFACE_OFFSET, context + native_regions.CONTEXT_OFFSET
         self.out, self.name = out, name
         cmd = [str(args.qemu), "-machine", "q35,accel=tcg", "-cpu", "max", "-m", "128M", "-smp", "1",
                "-drive", f"if=pflash,format=raw,readonly=on,file={args.firmware}",

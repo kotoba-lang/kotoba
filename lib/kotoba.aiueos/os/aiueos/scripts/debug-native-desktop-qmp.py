@@ -7,6 +7,7 @@ For isolated commit and cold-restore assertions, use
 check-native-draft-restart-qemu.py instead.
 """
 
+import native_regions
 import argparse
 import hashlib
 import importlib.util
@@ -124,14 +125,14 @@ class QMPStdio:
 
 
 def read_state(qmp, context, output):
-    for name, offset, size in (('surface.bin', 0x238000, 8192),
-                               ('context.bin', 0x23a000, 8192),
+    for name, offset, size in (('surface.bin', native_regions.SURFACE_OFFSET, native_regions.WINDOW_BYTES),
+                               ('context.bin', native_regions.CONTEXT_OFFSET, native_regions.WINDOW_BYTES),
                                ('fuel.bin', 8, 8)):
         path = output / name
         qmp.call('pmemsave', {'val': context+offset, 'size': size,
                              'filename': str(path)})
-    surface = struct.unpack('<2048I', (output/'surface.bin').read_bytes())
-    work = struct.unpack('<2048I', (output/'context.bin').read_bytes())
+    surface = struct.unpack(f'<{native_regions.WINDOW_BYTES // 4}I', (output/'surface.bin').read_bytes())
+    work = struct.unpack(f'<{native_regions.WINDOW_BYTES // 4}I', (output/'context.bin').read_bytes())
     count = surface[2038]
     goal = ''.join(chr(c) for c in surface[224:224+count]) if 12 <= count <= 63 else None
     signed = lambda value: value if value < 0x80000000 else value-0x100000000
@@ -231,7 +232,7 @@ def main():
     resolve_boot_inputs(args, parser)
     image = args.kernel.read_bytes()
     rw = struct.unpack_from('<IIQQQQQQ', image, 120)
-    if rw[0:2] != (1, 6) or rw[5] != 0x240000:
+    if rw[0:2] != (1, 6) or rw[5] != native_regions.RW_MEMSZ:
         parser.error('unexpected native desktop kernel context contract')
     if args.boot_media:
         if args.efi.read_bytes().count(image) != 1:

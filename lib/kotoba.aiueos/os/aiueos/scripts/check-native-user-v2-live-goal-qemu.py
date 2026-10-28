@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Type two Itonami Goals over private QMP and observe actual CPL3 reads."""
 
+import native_regions
 import argparse
 import hashlib
 import importlib.util
@@ -31,10 +32,10 @@ def pin(path):
 
 
 def state(qmp, output, context):
-    surface_bytes = qmp.dump(context + 0x238000, 8192, "surface.bin", output)
-    work_bytes = qmp.dump(context + 0x23a000, 8192, "desktop-context.bin", output)
-    surface = struct.unpack("<2048I", surface_bytes)
-    work = struct.unpack("<2048I", work_bytes)
+    surface_bytes = qmp.dump(context + native_regions.SURFACE_OFFSET, native_regions.WINDOW_BYTES, "surface.bin", output)
+    work_bytes = qmp.dump(context + native_regions.CONTEXT_OFFSET, native_regions.WINDOW_BYTES, "desktop-context.bin", output)
+    surface = struct.unpack(f"<{native_regions.WINDOW_BYTES // 4}I", surface_bytes)
+    work = struct.unpack(f"<{native_regions.WINDOW_BYTES // 4}I", work_bytes)
     length = surface[2038]
     goal = "".join(map(chr, surface[224:224 + length])) if 12 <= length <= 63 else None
     return {"goal": goal, "focus": surface[2], "keys": work[73],

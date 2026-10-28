@@ -5,6 +5,7 @@ QMP stays on private stdio pipes. The guest does not parse or admit the ELF;
 the source/artifact comparator independently checks the staged code bytes.
 """
 
+import native_regions
 import argparse
 import hashlib
 import importlib.util
@@ -83,7 +84,7 @@ def observe(args):
     image = kernel.read_bytes()
     assert efi.read_bytes().count(image) == 1, "EFI must contain exact kernel once"
     rw = struct.unpack_from("<IIQQQQQQ", image, 120)
-    assert rw[0] == 1 and rw[1] == 6 and rw[5] == 0x240000
+    assert rw[0] == 1 and rw[1] == 6 and rw[5] == native_regions.RW_MEMSZ
     context = rw[3]
     code = context + 0x20000
     request = code + 4096

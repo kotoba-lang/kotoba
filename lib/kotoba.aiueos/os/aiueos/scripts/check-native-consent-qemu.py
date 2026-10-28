@@ -8,6 +8,7 @@ Enter, then checks, from guest memory and from the rendered frame:
   the request is pending does nothing. HMP keys and clicks are synthetic and prove no human
   consent. Reads guest words with xp and pixels from screendump; no guest agent, NIC or VNC.
 """
+import native_regions
 import argparse, hashlib, json, re, struct, subprocess, sys, tempfile, time
 from pathlib import Path
 
@@ -85,8 +86,8 @@ def main(args):
     image = args.kernel.read_bytes()
     rw = struct.unpack_from('<IIQQQQQQ', image, 120)
     context = rw[3]
-    assert rw[5] == 0x240000 and context in (0x200000, 0x400000), (hex(context), hex(rw[5]))
-    surface, work = context + 0x238000, context + 0x23a000
+    assert rw[5] == native_regions.RW_MEMSZ and context in (0x200000, 0x400000), (hex(context), hex(rw[5]))
+    surface, work = context + native_regions.SURFACE_OFFSET, context + native_regions.CONTEXT_OFFSET
     # A provisioned 64 KiB scratch disk (test fixture, as in the draft restart gate): the draft save (F5) then really
     # runs against it and uses the browser context scratch 512..2559.
     scratch = out / "scratch.raw"
