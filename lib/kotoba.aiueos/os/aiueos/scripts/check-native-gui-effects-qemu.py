@@ -100,11 +100,11 @@ def main(args):
         assert all(ch[3] == ch[1] for ch in focus['motion']), focus
         screen('effects-home')
         record('spring-settles-on-monotonic-timeline', focus)
-        calm = key('reduced-motion', 'f10', lambda s: s['reduced'] == 1)
+        calm = key('reduced-motion', 'f1', lambda s: s['reduced'] == 1)
         assert all(ch[3] == 0 for ch in calm['motion'])
         assert calm['mute'] == int(args.muted), calm
         record('reduced-motion-independent-of-mute', calm)
-        key('unreduce', 'f10', lambda s: s['reduced'] == 0)
+        key('unreduce', 'f1', lambda s: s['reduced'] == 0)
         key('cancel-selection', 'esc', lambda s: s['selected'] == 0)
         launched = key('launch', '2', lambda s: s['focus'] == 2)
         assert launched['pending'] == 0
@@ -158,7 +158,7 @@ def main(args):
         modal = wait('pre-display-choice-refused', lambda s: s['keys'] > old['keys'] and s['frames'] > old['frames'])
         assert modal['pending'] == 2, modal
         preferences = tuple(modal[k] for k in ('blur', 'reduced', 'mute', 'volume'))
-        for code in ('f4', 'f10', 'f11', 'f12'):
+        for code in ('f4', 'f1', 'f11', 'f12'):
             panel = key('modal-' + code, code)
             assert panel['pending'] == 2
             assert tuple(panel[k] for k in ('blur', 'reduced', 'mute', 'volume')) == preferences

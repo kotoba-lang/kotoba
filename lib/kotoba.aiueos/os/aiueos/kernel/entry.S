@@ -445,7 +445,7 @@ aiueos_sysret_validation_count: .skip 8
 aiueos_nx_probe_target:
   .byte 0xc3
 
-.section .bss.stack,"aw",@nobits
+.section .high_bss.stack,"aw",@nobits
 .balign 4096
 .global aiueos_kernel_stack_bottom
 aiueos_kernel_stack_bottom:

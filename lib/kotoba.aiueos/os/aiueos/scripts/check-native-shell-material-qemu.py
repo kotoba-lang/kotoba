@@ -159,11 +159,11 @@ def main(args):
         assert released["windows"] == 1 and released["goal"] == "Goal (RAM):\na" and released["pending"] == 0
         record("dock-pointer-release", released, noImplicitOperation=True)
 
-        calm = key("reduced-effects", "f10", lambda s: s["reduced"] == 1)
+        calm = key("reduced-effects", "f1", lambda s: s["reduced"] == 1)
         assert tile(calm, 0x1cf46738) == [icon_left, icon_top, 36, 36]
         assert pixel(screenshot("reduced-effects"), left+4, height-28) == tint
         record("reduced-effects", calm, opaqueGlass=True, stationaryTile=True)
-        restored = key("effects-restored", "f10", lambda s: s["reduced"] == 0)
+        restored = key("effects-restored", "f1", lambda s: s["reduced"] == 0)
         assert tile(restored, 0x1cf46738) == [icon_left-2, icon_top-4, 40, 40]
         assert restored["goal"] == "Goal (RAM):\na" and restored["pending"] == 0
         record("effects-restored", restored, goalPreserved=True)

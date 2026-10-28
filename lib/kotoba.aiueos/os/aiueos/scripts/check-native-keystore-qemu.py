@@ -200,6 +200,47 @@ def main(args):
         b.type_text(PASS); b.send("sendkey ret", 8.0)
         assert b.W(94) == 9 and b.W(96) == 0 and b.words(928, 8) == seed1 and b.words(320, 8) == pub1, "unlock after lock must restore the same key"
         events.append(dict(name="unlock-after-lock", sameKey=True))
+        # Forget (F10) is offered only while locked; it needs the passphrase, then erases sector 4
+        b.send("sendkey f10", 1.5); assert b.W(87) == 0, "Forget must not be offered while the key is unlocked"
+        b.send("sendkey f6", 4.0); assert b.W(94) == 11
+        count = (b.S(2039) >> 2) & 15
+        b.send("sendkey f10", 1.5)
+        assert b.W(87) == 4 and b.W(98) == 2 and b.S(2039) == count * 4 + 128 + 3 + 2**31 + 16384, (b.W(87), b.W(98), hex(b.S(2039)))
+        forget_panel = b.screenshot("forget-passphrase")
+        assert title(forget_panel) != title(unlock_panel), "the forget panel must be titled differently from the unlock panel"
+        assert b.band(forget_panel, px + 20, px + 460, py + 80, py + 104) != b.band(unlock_panel, px + 20, px + 460, py + 80, py + 104), "the action line must say erase"
+        disk_before = scratch.read_bytes()
+        b.type_text(WRONG); b.send("sendkey ret", 8.0)
+        assert b.W(87) == 0 and b.W(94) == 13 and b.W(96) == 1 and b.S(2039) == count * 4 + 128, (b.W(87), b.W(94), b.W(96), hex(b.S(2039)))
+        assert scratch.read_bytes() == disk_before and b.words(928, 8) == bytes(32), "a wrong passphrase must erase nothing and release nothing"
+        events.append(dict(name="forget-wrong-passphrase", refused=True, diskUntouched=True, stillLocked=True))
+        b.send("sendkey f10", 1.5); assert b.W(87) == 4 and b.W(98) == 2
+        b.type_text(PASS); b.send("sendkey esc", 1.5)
+        assert b.W(87) == 0 and b.W(94) == 6 and b.W(96) == 1 and scratch.read_bytes() == disk_before, "Esc must cancel without erasing"
+        b.send("sendkey f10", 1.5); assert b.W(87) == 4 and b.W(98) == 2
+        b.type_text(PASS); b.send("sendkey ret", 8.0)
+        assert b.W(87) == 0 and b.W(94) == 12 and b.W(96) == 0 and b.W(97) == 0, (b.W(87), b.W(94), b.W(96), b.W(97))
+        assert b.S(2039) == count * 4, hex(b.S(2039))
+        assert b.words(848, 16) == bytes(64) and b.words(928, 8) == bytes(32), "the blob and the seed must leave RAM"
+        after = scratch.read_bytes()
+        assert after[4 * 512:5 * 512] == bytes(512), "sector 4 must read back zero"
+        assert after[:4 * 512] == disk_before[:4 * 512] and after[5 * 512:] == disk_before[5 * 512:], "only sector 4 may change"
+        home_forgotten = b.screenshot("home-forgotten")
+        assert key_row(home_forgotten) == key_row(home_none) and did_band(home_forgotten) == did_band(home_none), "the home must read as without a key"
+        b.send("sendkey f7", 1.5); assert b.W(87) == 0, "nothing to sign after Forget"
+        b.send("sendkey f8", 1.5); assert b.W(87) == 2, "F8 must offer to create a key, not to unlock"
+        b.send("sendkey n", 1.5)
+        events.append(dict(name="forget", erased=True, sectorZero=True, onlySector4Changed=True, homeWithoutKey=True))
+    finally:
+        b.quit()
+    # ---- boot 4 (same disk): the forgotten key does not come back ----
+    b = Boot(args, out, "boot4", scratch)
+    try:
+        assert b.W(96) == 0 and b.S(2039) == 0 and b.words(848, 16) == bytes(64), "a forgotten key must not be loaded at boot"
+        b.send("sendkey 2", 1.5); b.send("sendkey a", 1.5)
+        b.send("sendkey f8", 1.5); assert b.W(87) == 2
+        b.send("sendkey n", 1.5)
+        events.append(dict(name="forgotten-after-reboot", notLoaded=True, f8OffersCreate=True))
     finally:
         b.quit()
     # ---- boot 3: no disk. A key that is not stored cannot be locked (it would be lost): Lock refuses and changes nothing ----
