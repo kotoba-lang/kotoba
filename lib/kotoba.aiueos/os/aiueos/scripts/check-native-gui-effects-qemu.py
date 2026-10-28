@@ -177,12 +177,12 @@ def main(args):
         with wave.open(str(wav), 'rb') as w:
             channels, rate, width = w.getnchannels(), w.getframerate(), w.getsampwidth()
             raw = w.readframes(w.getnframes())
-        assert channels == 2 and width == 2 and raw
+        assert channels == 2 and width == 2 and (raw or args.muted)
         samples = struct.unpack('<' + 'h' * (len(raw)//2), raw)
-        peak = max(map(abs, samples))
+        peak = max(map(abs, samples), default=0)
         assert (peak == 0) if args.muted else (peak > 0), peak
         wave_result = dict(**pin(wav), channels=channels, sampleRate=rate, peak=peak,
-                           muted=args.muted, physicalSpeaker=False)
+                           muted=args.muted, pcmBytes=len(raw), physicalSpeaker=False)
     assert pin(args.media) == before
     times = sorted(m['duration'] for m in metrics)
     def pct(p):
