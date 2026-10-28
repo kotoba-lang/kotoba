@@ -4,7 +4,7 @@
 Before the desktop starts the guest seals the RFC 8032 section 7.1 test seed 1 under the public test passphrase
 "correct horse" with aiueos.keyseal (iterated SHA-512 KDF, 1024 rounds; blob = salt16 || ct32 || tag16), then
 opens the blob with the right passphrase, with a wrong one, and after one ciphertext byte was flipped. This gate
-boots once, waits for the first completed frame, reads the marker (word 99 = "KSEA") and the results over the
+boots once, waits for the first completed frame, reads the preserved marker (effects word 51 = "KSEA") and the results over the
 QEMU monitor and compares them with a Python reference of the same construction: the 64-byte blob must equal the
 reference blob byte for byte, the good open returns the seed, and the wrong-passphrase and changed-blob opens
 fail and leave their seed output zero. The seed, passphrase and salt are public test values: no device key is
@@ -75,7 +75,7 @@ def main(a):
         while time.monotonic() < deadline and words(79, 1)[0] < 1: pass
         frames = words(79, 1)[0]; assert frames >= 1, "no first frame"
         events.append(dict(name="first-frame", framesCompleted=frames))
-        marker = words(99, 1)[0]
+        marker = words(2048 + 51, 1)[0]
         assert marker == MARKER, ("the key-seal self-test did not finish", hex(marker))
         status = words(440, 4)
         assert status == [1, 1, 0, 0], ("seal, good open, wrong-passphrase open, changed-blob open", status)

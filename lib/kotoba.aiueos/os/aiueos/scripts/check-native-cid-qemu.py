@@ -3,7 +3,7 @@
 
 Before the desktop starts, the guest runs aiueos.cid-v1-admit four times on the block "abc" and its raw CIDv1
 (01 55 12 20 + sha256) and leaves the result codes in the browser context. This gate boots the image once,
-waits for the first completed frame, and reads the marker (word 99) and the codes (words 100..103) over the
+waits for the first completed frame, and reads the preserved marker/codes (effects words 51..55) over the
 QEMU monitor. Expected: 0 (admitted), 8 (one block byte changed: digest mismatch), 4 (multihash code changed),
 3 (codec changed to one that is not permitted). The three refusals are the negative controls; a kernel that
 returned 0 for all four, or none, fails. There is no ipfs:// scheme handler and no network in this desktop:
@@ -55,7 +55,7 @@ def main(a):
         while time.monotonic() < deadline and word(79) < 1: pass
         frames = word(79); assert frames >= 1, "no first frame"
         events.append(dict(name="first-frame", framesCompleted=frames))
-        marker = word(99); codes = [word(100 + i) for i in range(4)]
+        marker = word(2048 + 51); codes = [word(2048 + 52 + i) for i in range(4)]
         assert marker == MARKER, ("the CID self-test did not finish", hex(marker))
         assert codes == EXPECTED, ("unexpected admission codes", codes)
         assert len(set(codes)) == 4 and codes[0] == 0 and all(c != 0 for c in codes[1:]), codes

@@ -4,7 +4,7 @@
 Before the desktop starts the guest derives the Ed25519 public key (RFC 8032 section 5.1.5: SHA-512 of the seed,
 clamp, scalar multiplication of the base point, encoding) for the three RFC 8032 section 7.1 test seeds and leaves
 128 bytes per case from word 320 of the browser context; the first 32 bytes are the encoded key. This gate boots
-once, waits for the first completed frame, reads the marker (word 99 = "ED25") and the 96 result words over the
+once, waits for the first completed frame, reads the preserved marker (effects word 51 = "ED25") and the 96 result words over the
 QEMU monitor and compares the keys with the published RFC 8032 public keys. The seeds are public test vectors: no
 device key exists. It also signs the three RFC 8032 section 7.1 messages (lengths 0, 1 and 2) with the
 same seeds and compares the 64-byte signatures byte for byte with the published ones (words 768.. of the context).
@@ -64,7 +64,7 @@ def main(a):
         while time.monotonic() < deadline and words(79, 1)[0] < 1: pass
         frames = words(79, 1)[0]; assert frames >= 1, "no first frame"
         events.append(dict(name="first-frame", framesCompleted=frames))
-        marker = words(99, 1)[0]
+        marker = words(2048 + 51, 1)[0]
         assert marker == MARKER, ("the Ed25519 self-test did not finish", hex(marker))
         keys = []
         for k, (name, expected) in enumerate(CASES):
