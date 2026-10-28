@@ -319,7 +319,7 @@ def main(args):
                            else 4 if args.profile == "idle"
                            else 3 if args.profile == "ed25519"
                            else 11 if args.profile == "keystore"
-                           else 2 if args.profile in ("cid", "sha515", "gf25519", "keyseal") else 15)
+                           else 2 if args.profile in ("cid", "sha512", "gf25519", "keyseal") else 15)
         if (observed["status"] != expected_status
                 or len(observed["events"]) != expected_events
                 or observed["kernel"] != kernel_state["kernel"]
