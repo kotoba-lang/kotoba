@@ -157,9 +157,36 @@ def main(args):
         assert key_row(home_wrong) != key_row(home_locked), "the key row must say the passphrase was wrong"
         assert b.words(928, 8) == bytes(32) and b.words(832, 8) == bytes(32), "a refused unlock must leave no seed and no passphrase"
         events.append(dict(name="unlock-wrong-passphrase", refused=True, stillLocked=True, seedBytes=b.words(928, 8).hex()))
-        # right passphrase: the boot-1 key is back
-        b.send("sendkey f8", 1.5); assert b.W(87) == 4 and b.W(98) == 1
-        b.type_text(PASS); b.send("sendkey ret", 8.0)
+        # the delay: keep guessing wrong until the guest refuses to try (no TSC frequency is assumed)
+        assert (b.W(101), b.W(102)) == (0, 0), "no deadline before the 3rd failure"
+        refused_at = None
+        for n in range(2, 14):
+            b.send("sendkey f8", 1.5); assert b.W(87) == 4 and b.W(98) == 1
+            b.type_text(WRONG); b.send("sendkey ret", 8.0)
+            if b.W(94) == 15: refused_at = n; break
+            assert b.W(94) == 8 and b.W(100) == n and attempts_on_disk() == n, (n, b.W(94), b.W(100), attempts_on_disk())
+        assert refused_at is not None and refused_at >= 4, ("the guest never refused", refused_at)
+        assert b.W(87) == 0 and b.W(96) == 1 and (b.S(2039) >> 16) & 1 == 1, (b.W(87), b.W(96), hex(b.S(2039)))
+        assert b.W(100) == refused_at - 1 and attempts_on_disk() == refused_at - 1, "a refused attempt must not be counted"
+        assert b.words(928, 8) == bytes(32) and b.words(832, 8) == bytes(32), "a refused attempt must run no unlock and leave nothing"
+        assert (b.W(101), b.W(102)) != (0, 0), "the deadline must be set"
+        home_wait = b.screenshot("home-wait")
+        assert key_row(home_wait) != key_row(home_wrong) and key_row(home_wait) != key_row(home_locked), "the key row must say to wait"
+        events.append(dict(name="attempt-delay", refusedAtAttempt=refused_at, attemptsRecorded=refused_at - 1,
+                           refusedAttemptNotCounted=True, deadlineSet=True, keyRowSaysWait=True))
+        # a reboot does not skip the wait: the deadline is set from the boot when the record holds 3 or more attempts
+        b.quit()
+        b = Boot(args, out, "boot2c", scratch)
+        assert b.W(96) == 1 and b.W(100) == refused_at - 1 and (b.W(101), b.W(102)) != (0, 0), (b.W(100), b.W(101), b.W(102))
+        b.send("sendkey 2", 1.5); b.send("sendkey a", 1.5)
+        events.append(dict(name="delay-after-reboot", attempts=refused_at - 1, deadlineSetFromBoot=True))
+        # right passphrase: the boot-1 key is back (retried until the deadline has passed)
+        for _ in range(80):
+            b.send("sendkey f8", 1.5); assert b.W(87) == 4 and b.W(98) == 1
+            b.type_text(PASS); b.send("sendkey ret", 8.0)
+            if b.W(94) == 9: break
+            assert b.W(94) == 15, ("only the delay may refuse the right passphrase", b.W(94))
+            time.sleep(10)
         assert b.W(87) == 0 and b.W(94) == 9 and b.W(96) == 0, (b.W(87), b.W(94), b.W(96))
         seed2, pub2 = b.words(928, 8), b.words(320, 8)
         flags2 = b.S(2039)
@@ -224,6 +251,7 @@ def main(args):
         b.quit()
         b = Boot(args, out, "boot2b", scratch)
         assert b.W(96) == 1 and b.W(100) == 1 and b.S(2039) == 128, (b.W(96), b.W(100), hex(b.S(2039)))
+        assert (b.W(101), b.W(102)) == (0, 0), "under 3 attempts there is no deadline after a boot"
         count = 0   # the Approved count is per boot
         b.send("sendkey 2", 1.5); b.send("sendkey a", 1.5)
         events.append(dict(name="attempt-count-after-reboot", count=1, wrongFlagNotPersisted=True))
