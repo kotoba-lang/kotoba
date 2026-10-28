@@ -17,6 +17,7 @@ the report. Keys are synthetic. This is what the guest emits on a virtual NIC un
 does not qualify a physical NIC or a driver.
 """
 import argparse, hashlib, json, os, re, select, socket, struct, subprocess, time
+import native_regions
 from pathlib import Path
 
 if not __debug__:
@@ -47,8 +48,8 @@ def main(a):
     media_before = pin(a.media)
     image = a.kernel.read_bytes()
     rw = struct.unpack_from("<IIQQQQQQ", image, 120); context = rw[3]
-    assert rw[5] == 0x240000 and context in (0x200000, 0x400000), (hex(context), hex(rw[5]))
-    work = context + 0x23a000
+    assert rw[5] == native_regions.RW_MEMSZ and context in (0x200000, 0x400000), (hex(context), hex(rw[5]))
+    work = context + native_regions.CONTEXT_OFFSET
     with socket.socket() as s: s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]
     cap = out / "idle.pcap"
     cmd = [str(a.qemu), "-machine", "q35,accel=tcg", "-cpu", "max", "-m", "128M", "-smp", "1",

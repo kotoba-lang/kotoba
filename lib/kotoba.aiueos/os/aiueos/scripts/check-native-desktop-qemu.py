@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Observe native framebuffer/input on GPT or EFI El Torito VM media."""
+import native_regions
 import argparse,hashlib,importlib.util,json,os,re,select,struct,subprocess,time,zlib
 from pathlib import Path
 HERE=Path(__file__).resolve().parent
@@ -21,7 +22,7 @@ def main(media,efi,kernel,font,qemu,firmware,out,iso=None):
   assert len(matches)==1,('missing or duplicate font glyph',cp)
   return matches[0]
  goal_glyphs={cp:glyph_index(ord(cp)) for cp in ('a','b')}
- rw=struct.unpack_from('<IIQQQQQQ',image,120);context=rw[3];assert rw[5]==0x240000
+ rw=struct.unpack_from('<IIQQQQQQ',image,120);context=rw[3];assert rw[5]==native_regions.RW_MEMSZ
  # The page-table root is fixed by the kernel target's layout: kernel-v1 has RW at 0x200000, kernel-v3 at 0x400000. An unknown layout fails closed.
  cr3_offset=int(json.loads((HERE.parent/'native'/'layout-table.json').read_text())['rungs'][hex(context)]['pageTableRootOffset'],16)
  spec=importlib.util.spec_from_file_location('reader',HERE/'check-native-media-format.py');reader=importlib.util.module_from_spec(spec);spec.loader.exec_module(reader);format_proof=reader.verify(media,efi)
@@ -56,8 +57,8 @@ def main(media,efi,kernel,font,qemu,firmware,out,iso=None):
   def dump(at,n,name):
    assert hmp(f'pmemsave 0x{at:x} {n} {name}')=='';return (out/name).read_bytes()
   def state():
-   surface=struct.unpack('<2048I',dump(context+0x238000,8192,'surface.bin'))
-   work=struct.unpack('<2048I',dump(context+0x23a000,8192,'desktop-context.bin'))
+   surface=struct.unpack(f'<{native_regions.WINDOW_BYTES // 4}I',dump(context+native_regions.SURFACE_OFFSET,native_regions.WINDOW_BYTES,'surface.bin'))
+   work=struct.unpack(f'<{native_regions.WINDOW_BYTES // 4}I',dump(context+native_regions.CONTEXT_OFFSET,native_regions.WINDOW_BYTES,'desktop-context.bin'))
    goal_length=surface[2038]
    title_words=surface[64:96]
    title=''.join(chr(cp) for cp in title_words[:title_words.index(0)]) if 0 in title_words else None
@@ -77,7 +78,7 @@ def main(media,efi,kernel,font,qemu,firmware,out,iso=None):
    assert hmp(f'screendump {name}.ppm')==''
    return ppm_png(out/(name+'.ppm'),out/(name+'.png'))
   def rendered_goal_glyph(name,cp):
-   surface=struct.unpack('<2048I',(out/'surface.bin').read_bytes())
+   surface=struct.unpack(f'<{native_regions.WINDOW_BYTES // 4}I',(out/'surface.bin').read_bytes())
    assert surface[427]==0 and 0<surface[416]<=259,('invalid guest draw list',surface[416],surface[427])
    windows=[surface[5+5*i:10+5*i] for i in range(surface[1])]
    itonami=[window for window in windows if window[0]==2]
