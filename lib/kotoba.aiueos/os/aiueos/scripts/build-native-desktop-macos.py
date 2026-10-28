@@ -169,7 +169,7 @@ def main(args):
             "build-native-media-macos.py", "check-native-desktop-qemu.py",
             "check-native-draft-restart-qemu.py", "check-native-consent-qemu.py",
             "check-native-idle-silent-qemu.py", "check-native-cid-qemu.py", "check-native-sha512-qemu.py", "check-native-gf25519-qemu.py", "check-native-ed25519-qemu.py", "check-native-keyseal-qemu.py", "check-native-keystore-qemu.py",
-            "check-native-media-format.py", "native_regions.py",
+            "check-native-media-format.py", "native_regions.py", "native_ops.py",
         )
     }
     script_pins = {name: verified_file(path) for name, path in scripts.items()}

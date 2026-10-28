@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Observe native framebuffer/input on GPT or EFI El Torito VM media."""
 import native_regions
+import native_ops
 import argparse,hashlib,importlib.util,json,os,re,select,struct,subprocess,time,zlib
 from pathlib import Path
 HERE=Path(__file__).resolve().parent
@@ -85,6 +86,7 @@ def main(media,efi,kernel,font,qemu,firmware,out,iso=None):
    assert len(itonami)==1,('Itonami window absent',windows)
    _,wx,wy,ww,wh=itonami[0]
    ops=[surface[480+6*i:486+6*i] for i in range(surface[416])]
+   ops = native_ops.expand(ops)
    target=[op for op in ops if op[0]==2 and op[3]==goal_glyphs[cp]
            and wx+14<=op[1]<wx+ww-14 and wy+60<=op[2]<wy+100]
    assert len(target)==1,('goal glyph draw op absent or ambiguous',cp,target)

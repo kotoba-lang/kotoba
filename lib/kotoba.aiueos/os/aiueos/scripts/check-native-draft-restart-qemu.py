@@ -5,6 +5,7 @@ The tiny scratch disk is test input, not a D2 workspace image. No physical disk
 is accepted here. Run the native build queue around this controller as usual.
 """
 import native_regions
+import native_ops
 import argparse
 import hashlib
 import importlib.util
@@ -34,6 +35,7 @@ def visible_goal_ink(surface_bytes, font_bytes, pixels, goal):
     _, wx, wy, ww, _ = itonami[0]
     count = struct.unpack_from('<I', font_bytes, 8)[0]
     ops = [surface[480+6*i:486+6*i] for i in range(surface[416])]
+    ops = native_ops.expand(ops)
     body = sorted((op for op in ops if op[0] == 2
                    and wx+14 <= op[1] < wx+ww-14
                    and wy+60 <= op[2] < wy+100), key=lambda op: (op[2], op[1]))
