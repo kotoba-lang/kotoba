@@ -139,6 +139,16 @@ def main(args):
         assert b.W(87) == 2 and b.S(2039) == 3, ("the Create key button must open the key request", b.W(87), hex(b.S(2039)))
         b.send("sendkey n", 1.5); assert b.W(87) == 0
         events.append(dict(name="key-button-create", opensKeyRequest=True))
+        # With a second window open the frame used to sit at 252..254 of 259 ops and the button gave way; pair ops leave room.
+        b.send("sendkey 1", 1.5); b.send("sendkey 2", 1.5)
+        assert b.S(1) == 2, ("two windows must be open", b.S(1))
+        two_win = b.screenshot("home-two-windows")
+        bx, by, bw, bh = b.key_button()
+        assert sum(1 for px in b.band(two_win, bx, bx + bw, by, by + bh) if px != b"\xff\xff\xff") > 3000, ("the key button must be drawn with two windows", b.S(416))
+        b.press_key_button()
+        assert b.W(87) == 2 and b.S(2039) == 3, ("the button must open the key request with two windows", b.W(87), hex(b.S(2039)))
+        b.send("sendkey n", 1.5); assert b.W(87) == 0
+        events.append(dict(name="key-button-two-windows", windows=2, opensKeyRequest=True))
         key_row = lambda shot: b.band(shot, 180, 330, 170, 188)
         assert sum(1 for px in key_row(home_none) if px != b"\xff\xff\xff") > 20, "the key row must be drawn"
         b.send("sendkey f8", 1.5); assert b.W(87) == 2
