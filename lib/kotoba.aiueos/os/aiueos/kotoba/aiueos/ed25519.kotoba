@@ -1,7 +1,7 @@
 (ns aiueos.ed25519
   (:require [aiueos.gf25519 :as gf]
             [aiueos.sha512 :as sha])
-  (:export [aiueos-ed25519-pubkey aiueos-ed25519-sign main]))
+  (:export [aiueos-ed25519-pubkey aiueos-ed25519-sign aiueos-ed25519-verify main]))
 
 ;; Ed25519 public key from a 32-byte seed (RFC 8032 section 5.1.5) for the freestanding aiueos kernel,
 ;; after TweetNaCl: SHA-512 of the seed, clamp, fixed-window-free double-and-add over extended twisted
@@ -17,9 +17,12 @@
 (defn c-y [i] (case i 0 26200 1 26214 2 26214 3 26214 4 26214 5 26214 6 26214 7 26214 8 26214 9 26214 10 26214 11 26214 12 26214 13 26214 14 26214 15 26214 0))
 (defn c-xy [i] (case i 0 56739 1 42423 2 35507 3 28126 4 21237 5 30545 6 40832 7 8432 8 58237 9 25771 10 20110 11 26346 12 30309 13 55179 14 24335 15 26503 0))
 
+(defn c-d [i] (case i 0 30883 1 4953 2 19914 3 30187 4 55467 5 16705 6 2637 7 112 8 59544 9 30585 10 16505 11 36039 12 65139 13 11119 14 27886 15 20995 0))
+(defn c-i [i] (case i 0 41136 1 18958 2 6951 3 50414 4 58488 5 44335 6 6150 7 12099 8 55207 9 15867 10 153 11 11085 12 57099 13 20417 14 9344 15 11139 0))
+
 (defn load-const [ws o which i]
   (if (= i 16) 1
-    (let [v (if (= which 0) (c-d2 i) (if (= which 1) (c-x i) (if (= which 2) (c-y i) (c-xy i))))
+    (let [v (if (= which 0) (c-d2 i) (if (= which 1) (c-x i) (if (= which 2) (c-y i) (if (= which 3) (c-xy i) (if (= which 4) (c-d i) (c-i i))))))
           s (gf/st ws (+ o i) v)]
       (load-const ws o which (+ i 1 (* 0 s))))))
 
@@ -252,5 +255,130 @@
         m3 (mod-l sc buf 128)
         o1 (sig-out buf sig 0)]
     (+ 1 (* 0 (+ h1 (+ pre (+ a0 (+ a1 (+ a2 (+ pa (+ i1 (+ i2 (+ h2 (+ x1 (+ m1 (+ pr (+ j1 (+ j2 (+ j3 (+ h3 (+ x2 (+ m2 (+ x3 (+ ma (+ m3 o1)))))))))))))))))))))))))
+
+;; ---- verification (RFC 8032 5.1.7), messages up to 64 bytes ----
+;; buf (1024 bytes) layout: 0..31 A (the public key), 32..63 R, 64..95 S, 96..159 message (inputs); 160..191 k = H(R, A, M) mod L,
+;; 320..447 pack scratch (R' is encoded at 320..351), 448..511 hash output, 512..703 hash input. Returns 1 when the
+;; signature is valid and 0 for everything else: S not below L, a public key that is not a curve point, or R' != R.
+;; The check is [S]B + [k](-A) = R' and R' == R, as in TweetNaCl crypto_sign_open (A is unpacked negated).
+;; Workspace words in use (the field code keeps 320..431): P 0..63, Q 64..127, temporaries 128..207, 2d 208, D 224, I 240,
+;; c 176, a zero element 304, the saved point 440..503 (free after mod-l).
+(defn copy-words [ws dst src n i]
+  (if (>= i n) 1
+    (let [s (gf/st ws (+ dst i) (gf/ld ws (+ src i)))]
+      (copy-words ws dst src n (+ i 1 (* 0 s))))))
+
+(defn unpack-gf [ws o buf at i]
+  (if (= i 16) 1
+    (let [lo (ld8 buf (+ at (* 2 i)))
+          hi (ld8 buf (+ at (+ (* 2 i) 1)))
+          v (+ lo (* hi 256))
+          s (gf/st ws (+ o i) (if (= i 15) (bit-and v 32767) v))]
+      (unpack-gf ws o buf at (+ i 1 (* 0 s))))))
+
+(defn pow-loop [ws c i a]
+  (if (< a 0) 1
+    (let [m1 (gf/gf-mul ws c c c)
+          m2 (if (= a 1) 0 (gf/gf-mul ws c c i))]
+      (pow-loop ws c i (- a (+ 1 (* 0 (+ m1 m2))))))))
+
+;; o := i^(2^252 - 3); c is a 16-word scratch element
+(defn pow2523 [ws o i c]
+  (let [cp (copy-words ws c i 16 0)
+        lp (pow-loop ws c i 250)
+        o2 (copy-words ws o c 16 0)]
+    (+ 1 (* 0 (+ cp (+ lp o2))))))
+
+(defn bytes-differ [buf a b i acc]
+  (if (= i 32) acc
+    (bytes-differ buf a b (+ i 1) (bit-or acc (bit-xor (ld8 buf (+ a i)) (ld8 buf (+ b i)))))))
+
+;; 1 when the field elements at words x and y differ (compared packed, so the representation does not matter)
+(defn gf-neq [ws buf x y]
+  (let [p1 (gf/gf-pack ws (kernel-subregion buf 1024 320 128) 0 x)
+        p2 (gf/gf-pack ws (kernel-subregion buf 1024 320 128) 32 y)
+        d (bytes-differ buf 320 352 0 0)]
+    (+ (if (= d 0) 0 1) (* 0 (+ p1 p2)))))
+
+(defn gf-parity [ws buf x]
+  (let [p (gf/gf-pack ws (kernel-subregion buf 1024 320 128) 0 x)]
+    (+ (bit-and (ld8 buf 320) 1) (* 0 p))))
+
+;; Q := -A in extended coordinates from the 32 bytes at buf[0..]; 1 on success, 0 when A is not a curve point
+(defn unpackneg [ws buf]
+  (let [d1 (load-const ws 224 4 0)
+        i1 (load-const ws 240 5 0)
+        z (set-elem ws 96 1 0)
+        zr (set-elem ws 304 0 0)
+        y (unpack-gf ws 80 buf 0 0)
+        m1 (gf/gf-mul ws 0 80 80)
+        m2 (gf/gf-mul ws 16 0 224)
+        s1 (gf/gf-sub ws 0 0 96 0)
+        a1 (gf/gf-add ws 16 96 16 0)
+        m3 (gf/gf-mul ws 128 16 16)
+        m4 (gf/gf-mul ws 144 128 128)
+        m5 (gf/gf-mul ws 160 144 128)
+        m6 (gf/gf-mul ws 32 160 0)
+        m7 (gf/gf-mul ws 32 32 16)
+        pw (pow2523 ws 32 32 176)
+        m8 (gf/gf-mul ws 32 32 0)
+        m9 (gf/gf-mul ws 32 32 16)
+        m10 (gf/gf-mul ws 32 32 16)
+        m11 (gf/gf-mul ws 64 32 16)
+        m12 (gf/gf-mul ws 48 64 64)
+        m13 (gf/gf-mul ws 48 48 16)
+        n1 (gf-neq ws buf 48 0)
+        m14 (if (= n1 1) (gf/gf-mul ws 64 64 240) 0)
+        m15 (gf/gf-mul ws 48 64 64)
+        m16 (gf/gf-mul ws 48 48 16)
+        n2 (gf-neq ws buf 48 0)]
+    (if (= n2 1) 0
+      (let [par (gf-parity ws buf 64)
+            sign (u64-shift-right (ld8 buf 31) 7)
+            ng (if (= par sign) (gf/gf-sub ws 64 304 64 0) 0)
+            m17 (gf/gf-mul ws 112 64 80)]
+        (+ 1 (* 0 (+ d1 (+ i1 (+ z (+ zr (+ y (+ m1 (+ m2 (+ s1 (+ a1 (+ m3 (+ m4 (+ m5 (+ m6 (+ m7 (+ pw (+ m8 (+ m9 (+ m10 (+ m11 (+ m12 (+ m13 (+ m14 (+ m15 (+ m16 (+ ng m17)))))))))))))))))))))))))))))))
+
+(defn l-byte [i]
+  (case i 0 237 1 211 2 245 3 92 4 26 5 99 6 18 7 88 8 214 9 156 10 247 11 162 12 222 13 249 14 222 15 20 31 16 0))
+
+;; 1 when S (buf[64..95], little endian) < L
+(defn s-lt-l [buf i]
+  (if (< i 0) 0
+    (let [sb (ld8 buf (+ 64 i))
+          lb (l-byte i)]
+      (if (< sb lb) 1 (if (> sb lb) 0 (s-lt-l buf (- i 1)))))))
+
+(defn aiueos-ed25519-verify [buf :i64 msglen :i64 ws :i64] :i64
+  (let [sc (kernel-subregion ws 4096 0 4096)
+        oks (s-lt-l buf 31)
+        c1 (copy-bytes buf 512 32 32 0)
+        c2 (copy-bytes buf 544 0 32 0)
+        c3 (copy-bytes buf 576 96 msglen 0)
+        h (hash-input sc buf (+ 64 msglen))
+        x1 (x-from-buf sc buf 448 0)
+        m (mod-l sc buf 160)
+        d2 (load-const sc 208 0 0)
+        un (unpackneg sc buf)]
+    (if (and (= oks 1) (= un 1))
+      (let [sk (scalar-from-buf sc buf 160 0)
+            id1 (point-identity sc)
+            l1 (scalar-loop sc 255)
+            sv (copy-words sc 440 0 64 0)
+            id2 (point-identity sc)
+            bs (point-base sc)
+            ss (scalar-from-buf sc buf 64 0)
+            l2 (scalar-loop sc 255)
+            ad (point-add sc 0 440)
+            zi (gf/gf-inv sc 256 32)
+            tx (gf/gf-mul sc 224 0 256)
+            ty (gf/gf-mul sc 240 16 256)
+            out (kernel-subregion buf 1024 320 128)
+            py (gf/gf-pack sc out 0 240)
+            px (gf/gf-pack sc out 32 224)
+            fl (flip-sign-byte out)
+            diff (bytes-differ buf 320 32 0 0)]
+        (+ (if (= diff 0) 1 0) (* 0 (+ c1 (+ c2 (+ c3 (+ h (+ x1 (+ m (+ d2 (+ sk (+ id1 (+ l1 (+ sv (+ id2 (+ bs (+ ss (+ l2 (+ ad (+ zi (+ tx (+ ty (+ py (+ px fl))))))))))))))))))))))))
+      0)))
 
 (defn main [] :i64 0)
