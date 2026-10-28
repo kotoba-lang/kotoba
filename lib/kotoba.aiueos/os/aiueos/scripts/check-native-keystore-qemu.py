@@ -83,6 +83,33 @@ class Boot:
         w = shot[0]
         return [shot[2][3 * (y * w + x):3 * (y * w + x) + 3] for y in range(y0, y1) for x in range(x0, x1)]
 
+    def move_to(self, x, y):
+        for _ in range(60):
+            cx, cy = self.S(2046) - 1, self.S(2047)
+            dx, dy = x - cx, y - cy
+            if abs(dx) <= 2 and abs(dy) <= 2: return
+            step = lambda v: max(-100, min(100, v))
+            self.send(f"mouse_move {step(dx)} {step(dy)}", 0.4)
+        raise AssertionError(("pointer did not reach target", x, y))
+
+    def click(self):
+        self.send("mouse_button 1", 0.5); self.send("mouse_button 0", 1.5)
+
+    def itonami(self):
+        for i in range(self.S(1)):
+            if self.S(5 + 5 * i) == 2:
+                return [self.S(6 + 5 * i), self.S(7 + 5 * i), self.S(8 + 5 * i), self.S(9 + 5 * i)]
+        raise AssertionError("no Itonami window")
+
+    def key_button(self):
+        wx, wy, ww, wh = self.itonami()
+        assert wh > 270 and ww >= 200, (ww, wh)
+        return wx + 14, wy + 232, 150, 26
+
+    def press_key_button(self):
+        x, y, w, h = self.key_button()
+        self.move_to(x + w // 2, y + h // 2); self.click()
+
     def quit(self):
         try: self.send("quit", 0.5)
         except Exception: pass
@@ -105,6 +132,13 @@ def main(args):
         assert b.W(96) == 0 and b.S(2039) == 0, "a blank disk must not look like a stored key"
         b.send("sendkey 2", 1.5); b.send("sendkey a", 1.5)
         home_none = b.screenshot("home-none")
+        bx, by, bw, bh = b.key_button()
+        btn = lambda shot: b.band(shot, bx, bx + bw, by, by + bh)
+        assert sum(1 for px in btn(home_none) if px != b"\xff\xff\xff") > 3000, "the key button must be drawn (blue, 150 x 26)"
+        b.press_key_button()
+        assert b.W(87) == 2 and b.S(2039) == 3, ("the Create key button must open the key request", b.W(87), hex(b.S(2039)))
+        b.send("sendkey n", 1.5); assert b.W(87) == 0
+        events.append(dict(name="key-button-create", opensKeyRequest=True))
         key_row = lambda shot: b.band(shot, 180, 330, 170, 188)
         assert sum(1 for px in key_row(home_none) if px != b"\xff\xff\xff") > 20, "the key row must be drawn"
         b.send("sendkey f8", 1.5); assert b.W(87) == 2
@@ -139,6 +173,11 @@ def main(args):
         assert key_row(home_none) != key_row(home_locked), "the key row must say locked, not none"
         assert did_band(home_none) != did_band(home_locked), "the DID line must read differently when a sealed key is stored"
         assert sum(1 for px in did_band(home_locked) if px != b"\xff\xff\xff") > 20, "the locked DID line must be drawn"
+        bx, by, bw, bh = b.key_button()
+        assert btn(home_locked) != btn(home_none), "the key button must say Unlock, not Create key"
+        b.press_key_button()
+        assert b.W(87) == 4 and b.W(98) == 1, ("the Unlock button must open the unlock request", b.W(87), b.W(98))
+        b.send("sendkey esc", 1.5); assert b.W(87) == 0 and b.W(94) == 6
         b.send("sendkey f7", 1.5); assert b.W(87) == 0, "signing must be impossible while the key is locked"
         events.append(dict(name="boot2-locked", locked=True, blobEqualsDisk=True, seedInRam=False, signingRefused=True))
         # wrong passphrase: refused, still locked
@@ -211,7 +250,8 @@ def main(args):
         # Lock (F6): everything secret leaves RAM, the key goes back to the locked state, the disk is untouched
         count = (b.S(2039) >> 2) & 15
         disk_before = scratch.read_bytes()
-        b.send("sendkey f6", 4.0)
+        assert btn(home_ready) != btn(home_locked) and btn(home_ready) != btn(home_none), "the key button must say Lock"
+        b.press_key_button(); time.sleep(3)
         assert b.W(87) == 0 and b.W(94) == 11 and b.W(96) == 1, (b.W(87), b.W(94), b.W(96))
         assert b.S(2039) == count * 4 + 128, (hex(b.S(2039)), count)
         zero = bytes(32)
