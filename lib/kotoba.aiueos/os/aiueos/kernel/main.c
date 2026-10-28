@@ -7799,6 +7799,22 @@ qwen_runtime_boot_complete:
     serial_string("AIUEOS_PLC_RT_OK profile=aiueos-plc-v1 scheduler=fixed-priority-preemptive priority=5 program=signed-cpl3-elf signature=ecdsa-p256-sha256 tamper=rejected scans=100 inputs=alternating-enable,sensor41..140 transport=syscall release=apic-absolute-ticks cycle=10ticks input=snapshot output=atomic-safe-state capabilities=16,17,18,19 failures=stage,watchdog,budget,deadline,program timing=logical-unqualified\r\n");
     qemu_exit(0x42);
 #endif
+#ifdef AIUEOS_ZERO_CAP_USER_SMOKE
+    extern int aiueos_process_enter_zero_cap_user(void);
+    aiueos_load_task_register();
+    if (!aiueos_process_enter_zero_cap_user()) {
+      extern volatile uint64_t aiueos_zero_cap_process_stage;
+      extern volatile uint64_t aiueos_zero_cap_loader_stage;
+      serial_string("AIUEOS_ZERO_CAP_USER_FAIL stage=");
+      serial_decimal(aiueos_zero_cap_process_stage);
+      serial_string(" loader=");
+      serial_decimal(aiueos_zero_cap_loader_stage);
+      serial_string("\r\n");
+      qemu_exit(0x70);
+    }
+    serial_string("AIUEOS_ZERO_CAP_USER_OK source=amu-selfhost signature=ecdsa-p256-sha256 tamper=rejected cpl=3 caps=none result=42\r\n");
+    qemu_exit(0x42);
+#endif
     debug_string("AIUEOS_KOTOBA_ELF_PROCESS_OK source=catalog apps=2 et-exec segments=rx,rw result=42 domains=4,5\n");
     serial_string("AIUEOS_KOTOBA_ELF_PROCESS_OK source=catalog apps=2 et-exec segments=rx,rw result=42 domains=4,5\r\n");
     aiueos_load_task_register();
