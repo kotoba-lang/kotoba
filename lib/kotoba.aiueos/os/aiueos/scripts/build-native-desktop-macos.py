@@ -318,7 +318,7 @@ def main(args):
                            else 18 if args.profile == "consent"
                            else 4 if args.profile == "idle"
                            else 3 if args.profile == "ed25519"
-                           else 8 if args.profile == "keystore"
+                           else 11 if args.profile == "keystore"
                            else 2 if args.profile in ("cid", "sha512", "gf25519", "keyseal") else 12)
         if (observed["status"] != expected_status
                 or len(observed["events"]) != expected_events
@@ -379,7 +379,8 @@ def main(args):
             if (observed["font"] != font_state["padded"]
                     or [row["name"] for row in observed["events"]] != [
                         "boot1-create", "boot2-locked", "unlock-wrong-passphrase", "unlock-right-passphrase", "sign-after-unlock",
-                        "lock", "unlock-after-lock", "lock-refused-unstored"]
+                        "lock", "unlock-after-lock", "forget-wrong-passphrase", "forget", "forgotten-after-reboot",
+                        "lock-refused-unstored"]
                     or not observed["persistedAcrossReboot"] or not observed["wrongPassphraseRefused"]
                     or observed["physicalHardware"] or observed["syntheticInputProvesHumanConsent"]):
                 raise ValueError("keystore verdict is incomplete")
