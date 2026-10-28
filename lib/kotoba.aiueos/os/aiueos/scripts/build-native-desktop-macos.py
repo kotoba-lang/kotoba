@@ -164,7 +164,7 @@ def main(args):
             "build-native-font-macos.py", "build-native-kernel-macos.py",
             "build-native-media-macos.py", "check-native-desktop-qemu.py",
             "check-native-draft-restart-qemu.py", "check-native-consent-qemu.py",
-            "check-native-idle-silent-qemu.py", "check-native-cid-qemu.py", "check-native-sha512-qemu.py", "check-native-gf25519-qemu.py", "check-native-ed25519-qemu.py",
+            "check-native-idle-silent-qemu.py", "check-native-cid-qemu.py", "check-native-sha512-qemu.py", "check-native-gf25519-qemu.py", "check-native-ed25519-qemu.py", "check-native-keyseal-qemu.py",
             "check-native-media-format.py",
         )
     }
@@ -240,6 +240,7 @@ def main(args):
                         else "sha512-entry.kotoba" if args.profile == "sha512"
                         else "gf-entry.kotoba" if args.profile == "gf25519"
                         else "ed-entry.kotoba" if args.profile == "ed25519"
+                        else "keyseal-entry.kotoba" if args.profile == "keyseal"
                         else "desktop-entry.kotoba")
         call("kernel", scripts["build-native-kernel-macos.py"], [
             "--compiler-image", compiler, "--compiler-sha256", args.compiler_sha256,
@@ -251,7 +252,7 @@ def main(args):
         efi = kernel / "BOOTX64.EFI"
         image = kernel / "KERNEL.ELF"
         if (kernel_state["state"] != "MACOS_NATIVE_IMAGE_CANDIDATE"
-                or kernel_state["sourceModuleCount"] != (35 if args.profile == "cid" else 34)
+                or kernel_state["sourceModuleCount"] != (35 if args.profile in ("cid", "keyseal") else 34)
                 or kernel_state["fuel"] != FUEL
                 or kernel_state["compiler"] != compiler_pin
                 or pin(efi) != kernel_state["efi"] or pin(image) != kernel_state["kernel"]
@@ -284,6 +285,7 @@ def main(args):
                         else "check-native-sha512-qemu.py" if args.profile == "sha512"
                         else "check-native-gf25519-qemu.py" if args.profile == "gf25519"
                         else "check-native-ed25519-qemu.py" if args.profile == "ed25519"
+                        else "check-native-keyseal-qemu.py" if args.profile == "keyseal"
                         else "check-native-desktop-qemu.py")
         guest_args = [
             "--media", disk, "--efi", efi, "--kernel", image,
@@ -297,6 +299,7 @@ def main(args):
                         else "native-sha512-qemu.json" if args.profile == "sha512"
                         else "native-gf25519-qemu.json" if args.profile == "gf25519"
                         else "native-ed25519-qemu.json" if args.profile == "ed25519"
+                        else "native-keyseal-qemu.json" if args.profile == "keyseal"
                         else "native-desktop-qemu.json")
         observed = json.loads((guest / receipt_name).read_text())
         expected_status = ("PASS_NATIVE_LOCAL_DRAFT_COLD_RESTORE" if args.profile == "local-draft"
@@ -306,12 +309,13 @@ def main(args):
                            else "PASS_NATIVE_SHA512_QEMU" if args.profile == "sha512"
                            else "PASS_NATIVE_GF25519_QEMU" if args.profile == "gf25519"
                            else "PASS_NATIVE_ED25519_QEMU" if args.profile == "ed25519"
+                           else "PASS_NATIVE_KEYSEAL_QEMU" if args.profile == "keyseal"
                            else "PASS_NATIVE_DESKTOP_INPUT_QEMU")
         expected_events = (12 if args.profile == "local-draft"
                            else 16 if args.profile == "consent"
                            else 4 if args.profile == "idle"
                            else 3 if args.profile == "ed25519"
-                           else 2 if args.profile in ("cid", "sha512", "gf25519") else 12)
+                           else 2 if args.profile in ("cid", "sha512", "gf25519", "keyseal") else 12)
         if (observed["status"] != expected_status
                 or len(observed["events"]) != expected_events
                 or observed["kernel"] != kernel_state["kernel"]
@@ -367,6 +371,11 @@ def main(args):
                     or len(observed["events"][2]["signatures"]) != 3
                     or not observed["signing"] or observed["deviceKey"] or observed["physicalHardware"]):
                 raise ValueError("ed25519 verdict is incomplete")
+        elif args.profile == "keyseal":
+            if (observed["font"] != font_state["padded"]
+                    or [row["name"] for row in observed["events"]] != ["first-frame", "keyseal-seal-open"]
+                    or not observed["sealed"] or observed["deviceKey"] or observed["physicalHardware"]):
+                raise ValueError("keyseal verdict is incomplete")
         elif args.profile == "consent":
             if (observed["font"] != font_state["padded"]
                     or [row["name"] for row in observed["events"]] != [
@@ -419,6 +428,7 @@ def main(args):
                             else "MACOS_NATIVE_SHA512_QEMU_CANDIDATE" if args.profile == "sha512"
                             else "MACOS_NATIVE_GF25519_QEMU_CANDIDATE" if args.profile == "gf25519"
                             else "MACOS_NATIVE_ED25519_QEMU_CANDIDATE" if args.profile == "ed25519"
+                            else "MACOS_NATIVE_KEYSEAL_QEMU_CANDIDATE" if args.profile == "keyseal"
                             else "MACOS_NATIVE_DESKTOP_QEMU_CANDIDATE"),
                      font=font_state["padded"], kernel=kernel_state["kernel"],
                      efi=kernel_state["efi"], media=media_state["image"], iso=media_state["iso"],
@@ -440,6 +450,8 @@ def main(args):
                                     if args.profile == "gf25519"
                                     else "Mac native Ed25519 public keys from RFC 8032 seeds on QEMU"
                                     if args.profile == "ed25519"
+                                    else "Mac native passphrase key sealing self-test (seal, open, wrong passphrase, changed blob) on QEMU"
+                                    if args.profile == "keyseal"
                                     else "Mac native GPT and EFI El Torito ISO QEMU desktop input")
                      + "; D2 workspace, release and physical gates separate")
         save()
@@ -466,7 +478,7 @@ if __name__ == "__main__":
     parser.add_argument("--firmware", type=Path, required=True)
     parser.add_argument("--firmware-sha256", required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--profile", choices=("desktop", "local-draft", "consent", "idle", "cid", "sha512", "gf25519", "ed25519"), default="desktop")
+    parser.add_argument("--profile", choices=("desktop", "local-draft", "consent", "idle", "cid", "sha512", "gf25519", "ed25519", "keyseal"), default="desktop")
     parser.add_argument("--distribution", choices=("aiueos", "awai"), default="aiueos")
     # kernel-v3 (RW at 0x400000) leaves the packager about 3 MiB of room (the compiler's
     # text cap stays 2 MiB, native/layout-table.json) instead of kernel-v1's
