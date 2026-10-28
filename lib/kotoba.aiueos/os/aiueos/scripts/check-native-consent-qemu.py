@@ -119,6 +119,13 @@ def main(args):
         # than a fixed host delay, now determines when the next input is safe.
         kind = "key" if line.startswith("sendkey ") else "mouse" if line.startswith("mouse_") else None
         previous = completed() if kind else None
+        if previous is not None and previous[85] == 1:
+            # Allow intentionally hands control out of the desktop loop.
+            # Release the host-injected button, but do not require a stopped
+            # input loop to consume it. No further guest action is allowed.
+            assert line == "mouse_button 0" and previous[87] == 0 and previous[88] == 1
+            guest.hmp(line)
+            return
         guest.hmp(line)
         if kind:
             completed(previous, kind)
