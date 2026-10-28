@@ -312,7 +312,7 @@ def main(args):
                            else "PASS_NATIVE_KEYSEAL_QEMU" if args.profile == "keyseal"
                            else "PASS_NATIVE_DESKTOP_INPUT_QEMU")
         expected_events = (12 if args.profile == "local-draft"
-                           else 17 if args.profile == "consent"
+                           else 18 if args.profile == "consent"
                            else 4 if args.profile == "idle"
                            else 3 if args.profile == "ed25519"
                            else 2 if args.profile in ("cid", "sha512", "gf25519", "keyseal") else 12)
@@ -383,7 +383,7 @@ def main(args):
                         "consent-open",
                         "launcher-key-ignored", "launcher-click-ignored", "key-deny",
                         "pointer-deny", "esc-deny", "key-deny", "passphrase-cancel", "key-allow",
-                        "sign-deny", "sign-allow", "pointer-allow"]
+                        "sign-deny", "sign-allow", "draft-after-key", "pointer-allow"]
                     or observed["syntheticInputProvesHumanConsent"]):
                 raise ValueError("consent surface verdict is incomplete")
         elif (observed["font"] != font_state["padded"]

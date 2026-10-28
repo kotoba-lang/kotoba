@@ -87,10 +87,18 @@ def main(args):
     context = rw[3]
     assert rw[5] == 0x240000 and context in (0x200000, 0x400000), (hex(context), hex(rw[5]))
     surface, work = context + 0x238000, context + 0x23a000
+    # A provisioned 64 KiB scratch disk (test fixture, as in the draft restart gate): the draft save (F5) then really
+    # runs against it and uses the browser context scratch 512..2559.
+    scratch = out / "scratch.raw"
+    raw_disk = bytearray(128 * 512)
+    struct.pack_into("<4I", raw_disk, 0, 0x49415741, 0x54465244, 1, 128)
+    scratch.write_bytes(raw_disk)
     cmd = [str(args.qemu), "-machine", "q35,accel=tcg", "-cpu", "max", "-m", "128M", "-smp", "1",
            "-drive", f"if=pflash,format=raw,readonly=on,file={args.firmware}",
            "-drive", f"file={args.media},format=raw,if=ide,snapshot=on", "-boot", "order=c",
-           "-nic", "none", "-display", "none", "-no-reboot", "-monitor", "stdio"]
+           "-nic", "none", "-display", "none", "-no-reboot", "-monitor", "stdio",
+           "-device", "isa-ide,id=draft-controller", "-drive", f"file={scratch},format=raw,if=none,id=draft,cache=directsync",
+           "-device", "ide-hd,drive=draft,bus=draft-controller.0,unit=1,serial=AWAI90DRAFT000001"]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True, cwd=out, bufsize=1)
     import os, select
@@ -207,7 +215,7 @@ def main(args):
         # "Approved: n" changes only in its digit, and only after an Allow.
         # --- ADR-0277 W3: the device key through its own consent request (F8) ---
         # Deny first: N closes the request and no entropy is consumed (the seed bytes stay 0).
-        seed_words = lambda: [W(128 + i) for i in range(8)]
+        seed_words = lambda: [W(928 + i) for i in range(8)]
         assert S(2039) == 0 and seed_words() == [0] * 8 and W(94) == 0
         send("sendkey f8", 1.5); assert W(87) == 2 and S(2039) == 3, (W(87), S(2039))
         key_panel = screenshot("key-request")
@@ -253,7 +261,7 @@ def main(args):
         assert W(87) == 0 and W(94) == 1, (W(87), W(94))
         flags = S(2039)
         assert flags & 3 == 0 and (flags >> 2) & 15 == 1 and (flags >> 6) & 1 == 1, hex(flags)
-        seed = b"".join(struct.pack("<I", W(128 + i)) for i in range(8))
+        seed = b"".join(struct.pack("<I", W(928 + i)) for i in range(8))
         pub = b"".join(struct.pack("<I", W(320 + i)) for i in range(8))
         sig = b"".join(struct.pack("<I", W(768 + i)) for i in range(16))
         proof = b"itonami-w3-key-proof"
@@ -306,12 +314,22 @@ def main(args):
         event("sign-allow", challenge=challenge.decode(), signature=sig2.hex(), verifies=True,
               foreignKeyRefused=True, changedChallengeRefused=True, notTheKeyProof=True,
               approvedCount=(S(2039) >> 2) & 15, seedDisplayed=False)
+        # A draft save (F5) works in the browser context bytes 512..2559; the key seed must live outside them.
+        generation_before = W(82)
+        send("sendkey f5", 3.0)
+        assert W(82) > generation_before, ("the draft save did not run", generation_before, W(82))
+        send("sendkey f7", 1.5); assert W(87) == 3
+        send("sendkey y", 3.0)
+        sig3 = b"".join(struct.pack("<I", W(800 + i)) for i in range(16))
+        assert ed_verify(pub2, challenge, sig3), "the device key seed did not survive a draft save"
+        assert sig3 == sig2, "Ed25519 is deterministic: the same seed must give the same signature"
+        event("draft-after-key", generation=W(82), signatureUnchanged=True, verifies=True)
         move_to(px + 24 + 70, py + 164 + 18)
         before_allow = screenshot("before-allow")
-        assert (S(2039) >> 2) & 15 == 2 and S(2039) & 3 == 0
+        assert (S(2039) >> 2) & 15 == 3 and S(2039) & 3 == 0
         send("sendkey ret", 1.5); assert W(87) == 1 and S(2039) & 3 == 1
         move_to(px + 24 + 70, py + 164 + 18); click()
-        assert W(87) == 0 and (S(2039) >> 2) & 15 == 3 and S(2039) & 3 == 0 and W(88) == 1 and W(85) == 1
+        assert W(87) == 0 and (S(2039) >> 2) & 15 == 4 and S(2039) & 3 == 0 and W(88) == 1 and W(85) == 1
         after_allow = screenshot("after-allow")
         w0, h0, p0 = before_allow
         assert (w0, h0) == after_allow[:2]
