@@ -60,8 +60,8 @@ class Boot:
 
     def dump(self, addr, length):
         # Observe one native range in a single monitor command. The previous
-        # per-word sleep took minutes for the4096-byte wipe assertion and did
-        # not add any guest/device coverage. Keep the exact full-range checks.
+        # per-word sleeps made even sampled-prefix checks slow. The bulk
+        # snapshot below also permits checking every byte of each wipe range.
         path = self.out / "keystore-observation.bin"
         if path.exists(): path.unlink()
         self.drain()
@@ -188,8 +188,8 @@ def main(args):
         assert b.W(87) == 0 and b.W(94) == 11 and b.W(96) == 1, (b.W(87), b.W(94), b.W(96))
         assert b.S(2039) == count * 4 + 128, (hex(b.S(2039)), count)
         zero = bytes(32)
-        assert b.words(928, 8) == zero and b.words(320, 8) == zero and b.words(800, 16) == bytes(64), "seed, public key and signature must be gone"
-        assert b.words(768, 16) == bytes(64) and b.words(512, 8) == zero and b.words(1024, 8) == zero, "signing buffer and workspace must be wiped"
+        assert b.words(928, 8) == zero and b.words(320, 32) == bytes(128) and b.words(800, 16) == bytes(64), "seed, public key and signature must be gone"
+        assert b.words(768, 16) == bytes(64) and b.words(512, 256) == bytes(1024) and b.words(1024, 1024) == bytes(4096), "signing buffer and workspace must be wiped"
         assert scratch.read_bytes() == disk_before, "Lock must not write to the disk"
         b.send("sendkey f7", 1.5); assert b.W(87) == 0, "signing must be impossible while locked"
         home_relocked = b.screenshot("home-relocked")
