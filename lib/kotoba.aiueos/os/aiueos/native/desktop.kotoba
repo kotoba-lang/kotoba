@@ -593,14 +593,39 @@
 ;; the session only. There is no delay yet (a guest time source is not chosen); the counter records, it does not slow.
 (defn count-attempt [ctx]
   (do (put-word ctx 100 (+ (word ctx 100) 1)) (draft-store/store-key)))
+;; ADR-0278 step 3, the delay: after the 3rd failed attempt each further attempt is refused (not blocked: the desktop
+;; keeps running) until a deadline in TSC cycles, 2^30 << (attempts - 3) (the shift is capped at 9). The deadline is
+;; ctx words 101 (low 32 bits) and 102 (high 32 bits), RAM only; a boot with 3 or more attempts in the key record
+;; sets it from the boot, so a reboot does not skip the wait. A refused attempt is not counted and runs no KDF
+;; (ctx word 94 = 15, word 2039 bit 16 = "wait"). The TSC frequency is not known to the guest (not calibrated), so
+;; this is a delay in cycles and only about a second per 2^30 cycles at 1 GHz.
+(defn penalty-cycles [a]
+  (if (< a 3) 0 (i64-shift-left 1073741824 (if (> (- a 3) 9) 9 (- a 3)))))
+(defn set-deadline [ctx a]
+  (let [p (penalty-cycles a)]
+    (if (= p 0)
+      (do (put-word ctx 101 0) (put-word ctx 102 0))
+      (let [d (+ (kernel-rdtsc) p)]
+        (do (put-word ctx 101 (bit-and d 4294967295)) (put-word ctx 102 (quot d 4294967296)))))))
+(defn deadline-pending [ctx]
+  (let [d (+ (* (word ctx 102) 4294967296) (word ctx 101))]
+    (if (and (> d 0) (< (kernel-rdtsc) d)) 1 0)))
+(defn set-wait-flag [s on]
+  (put-word s 2039 (+ (- (word s 2039) (* 65536 (bit-and (quot (word s 2039) 65536) 1))) (* 65536 on))))
+(defn delay-refuse [s ctx]
+  (let [r (pass-close s ctx 0 15)
+        sf (set-wait-flag s 1)]
+    (+ r (* 0 sf))))
 (defn clear-attempts [ctx]
-  (if (> (word ctx 100) 0) (do (put-word ctx 100 0) (draft-store/store-key)) 0))
+  (do (put-word ctx 101 0) (put-word ctx 102 0)
+      (if (> (word ctx 100) 0) (do (put-word ctx 100 0) (draft-store/store-key)) 0)))
 (defn set-wrong-flag [s on]
   (put-word s 2039 (+ (- (word s 2039) (* 32768 (bit-and (quot (word s 2039) 32768) 1))) (* 32768 on))))
 
 (defn unlock-confirm [s ctx]
   (let [n (word ctx 95)]
     (if (or (< n 4) (> n 24)) 1
+     (if (= (deadline-pending ctx) 1) (delay-refuse s ctx)
       (let [ca (count-attempt ctx)
             cs (copy-blob-salt ctx 0)
             d (kdf-run ctx 3328 3360 3456 3520 1024)
@@ -611,13 +636,16 @@
           (let [dd (derive-and-sign ctx)
                 fp (+ (* 65536 (ctx-byte ctx 1280)) (+ (* 256 (ctx-byte ctx 1281)) (ctx-byte ctx 1282)))
                 cl (clear-attempts ctx)
-                sf (set-wrong-flag s 0)]
+                sf (set-wrong-flag s 0)
+                sw (set-wait-flag s 0)]
             (do (put-word ctx 96 0)
-                (+ (pass-close s ctx (+ (- 68 128) (* fp 128)) 9) (* 0 (+ cs (+ d (+ dd (+ cl (+ sf ca)))))))))
+                (+ (pass-close s ctx (+ (- 68 128) (* fp 128)) 9) (* 0 (+ cs (+ d (+ dd (+ cl (+ sf (+ sw ca))))))))))
           (let [w (wipe-range ctx 3712 32 0)
                 r (pass-close s ctx 0 8)
-                sf (set-wrong-flag s 1)]
-            (+ r (* 0 (+ w (+ sf ca))))))))))
+                sf (set-wrong-flag s 1)
+                sw (set-wait-flag s 0)
+                dl (set-deadline ctx (word ctx 100))]
+            (+ r (* 0 (+ w (+ sf (+ sw (+ dl ca)))))))))))))
 
 ;; ADR-0278 step 2: Forget (F10, only while the key is locked, so the typed length and the fingerprint never share
 ;; bits). It is a passphrase request of its own kind (ctx word 98 = 2, word 2039 bit 14): the passphrase must open
@@ -633,6 +661,7 @@
 (defn forget-confirm [s ctx]
   (let [n (word ctx 95)]
     (if (or (< n 4) (> n 24)) 1
+     (if (= (deadline-pending ctx) 1) (delay-refuse s ctx)
       (let [ca (count-attempt ctx)
             cs (copy-blob-salt ctx 0)
             d (kdf-run ctx 3328 3360 3456 3520 1024)
@@ -643,12 +672,12 @@
         (if (= z 1)
           (let [st (draft-store/erase-key)]
             (if (> st 0)
-              (let [w2 (wipe-range ctx 3392 64 0) w3 (wipe-range ctx 3360 16 0) sf (set-wrong-flag s 0)]
-                (do (put-word ctx 96 0) (put-word ctx 97 0) (put-word ctx 100 0)
-                    (+ (pass-close s ctx -128 12) (* 0 (+ cs (+ d (+ w (+ w2 (+ w3 (+ sf ca))))))))))
+              (let [w2 (wipe-range ctx 3392 64 0) w3 (wipe-range ctx 3360 16 0) sf (set-wrong-flag s 0) sw (set-wait-flag s 0)]
+                (do (put-word ctx 96 0) (put-word ctx 97 0) (put-word ctx 100 0) (put-word ctx 101 0) (put-word ctx 102 0)
+                    (+ (pass-close s ctx -128 12) (* 0 (+ cs (+ d (+ w (+ w2 (+ w3 (+ sf (+ sw ca)))))))))))
               (pass-close s ctx 0 14)))
-          (let [r (pass-close s ctx 0 13) sf (set-wrong-flag s 1)]
-            (+ r (* 0 (+ sf ca)))))))))
+          (let [r (pass-close s ctx 0 13) sf (set-wrong-flag s 1) sw (set-wait-flag s 0) dl (set-deadline ctx (word ctx 100))]
+            (+ r (* 0 (+ sf (+ sw (+ dl ca))))))))))))
 
 (defn pass-confirm [s ctx]
   (if (= (word ctx 98) 1) (unlock-confirm s ctx)
@@ -1063,7 +1092,8 @@
                       0)
                     (if (= profile 4)
                       (if (= (draft-store/load-key) 1)
-                        (do (put-word context 96 1) (put-word context 97 1) (put-word surface 2039 128))
+                        (do (put-word context 96 1) (put-word context 97 1) (put-word surface 2039 128)
+                            (set-deadline context (word context 100)))
                         0)
                       0)))
               0)
