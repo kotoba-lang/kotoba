@@ -390,6 +390,9 @@ def main(args):
                 raise ValueError("keyseal verdict is incomplete")
         elif args.profile == "consent":
             if (observed["font"] != font_state["padded"]
+                    or observed["transportObserver"] != script_pins["check-native-draft-restart-qemu.py"]
+                    or observed["desktopObserver"] != script_pins["check-native-desktop-qemu.py"]
+                    or not observed["inputSynchronizedWithCompletedFrames"]
                     or [row["name"] for row in observed["events"]] != [
                         "first-frame", "entropy-probe", "itonami-goal-typed", "collapse-key", "collapse-click",
                         "consent-open",

@@ -6,7 +6,7 @@ Enter, then checks, from guest memory and from the rendered frame:
   the panel is the whole desktop (no dock, nothing to click under it), N and the Deny
   button deny, the Allow button approves exactly as Y does, and a launcher key/click while
   the request is pending does nothing. HMP keys and clicks are synthetic and prove no human
-  consent. Reads guest words with xp and pixels from screendump; no guest agent, NIC or VNC.
+  consent. Reads guest words through private QMP memory snapshots and pixels from screendump; no guest agent, NIC or VNC.
 """
 import argparse, hashlib, importlib.util, json, re, struct, subprocess, sys, tempfile, time
 from pathlib import Path
@@ -93,29 +93,41 @@ def main(args):
     raw_disk = bytearray(128 * 512)
     struct.pack_into("<4I", raw_disk, 0, 0x49415741, 0x54465244, 1, 128)
     scratch.write_bytes(raw_disk)
-    cmd = [str(args.qemu), "-machine", "q35,accel=tcg", "-cpu", "max", "-m", "128M", "-smp", "1",
-           "-drive", f"if=pflash,format=raw,readonly=on,file={args.firmware}",
-           "-drive", f"file={args.media},format=raw,if=ide,snapshot=on", "-boot", "order=c",
-           "-nic", "none", "-display", "none", "-no-reboot", "-monitor", "stdio",
-           "-device", "isa-ide,id=draft-controller", "-drive", f"file={scratch},format=raw,if=none,id=draft,cache=directsync",
-           "-device", "ide-hd,drive=draft,bus=draft-controller.0,unit=1,serial=AWAI90DRAFT000001"]
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, text=True, cwd=out, bufsize=1)
-    import os, select
+    spec = importlib.util.spec_from_file_location("private_qmp", Path(__file__).with_name("check-native-draft-restart-qemu.py"))
+    transport = importlib.util.module_from_spec(spec); spec.loader.exec_module(transport)
+    guest = transport.Guest(args, out / "guest", scratch)
+
+    def words(address, name):
+        return guest.dump(address, name)
+
+    def completed(previous=None, kind=None):
+        deadline = time.monotonic() + 180
+        while time.monotonic() < deadline:
+            c = words(work, "context.bin")
+            if c[101] != 0:
+                raise AssertionError(("native renderer refused the frame", hex(c[101])))
+            event_seen = previous is None or (c[73] > previous[73] if kind == "key" else c[75] > previous[75])
+            frame_seen = previous is None or c[79] > previous[79]
+            if c[79] >= 1 and c[79] == c[78] and event_seen and frame_seen:
+                return c
+            assert guest.process.poll() is None, "guest exited"
+            time.sleep(.02)
+        raise AssertionError(("guest did not finish input/frame", kind, c[73], c[78], c[79]))
+
     def send(line, wait=0.4):
-        proc.stdin.write(line + "\n"); proc.stdin.flush(); time.sleep(wait)
-    def drain():
-        text = ""
-        while select.select([proc.stdout], [], [], 0.2)[0]:
-            chunk = os.read(proc.stdout.fileno(), 65536).decode(errors="replace")
-            if not chunk: break
-            text += chunk
-        return text
+        # Retain the old call signature; completed guest input/frame, rather
+        # than a fixed host delay, now determines when the next input is safe.
+        kind = "key" if line.startswith("sendkey ") else "mouse" if line.startswith("mouse_") else None
+        previous = completed() if kind else None
+        guest.hmp(line)
+        if kind:
+            completed(previous, kind)
+            time.sleep(.12)  # let the synthetic key's release complete
+
     def read(addr):
-        drain(); send(f"xp /1wx {addr:#x}", 0.5)
-        found = re.findall(r"[0-9a-f]{16}: 0x([0-9a-f]{8})", drain())
-        assert found, ("xp gave nothing", hex(addr))
-        return int(found[-1], 16)
+        base = surface if surface <= addr < surface + 8192 else work
+        assert base <= addr < base + 8192 and (addr-base) % 4 == 0
+        return words(base, "surface.bin" if base == surface else "context.bin")[(addr-base)//4]
     S = lambda i: read(surface + 4 * i)
     W = lambda i: read(work + 4 * i)
     events = []
@@ -125,7 +137,8 @@ def main(args):
     def event(name, **detail):
         events.append(dict(name=name, **detail))
     def screenshot(name):
-        send(f"screendump {name}.ppm", 2.0)
+        completed()
+        guest.hmp("screendump " + json.dumps(str(out / (name + ".ppm"))))
         raw = (out / f"{name}.ppm").read_bytes()
         _, dims, _, pixels = raw.split(b"\n", 3)
         width, height = map(int, dims.split())
@@ -373,15 +386,15 @@ def main(args):
               approvedCount=(S(2039) >> 2) & 15, changedColumns=[changed_cols[0] + 180, changed_cols[-1] + 180],
               networkInk=network_ink, telemetryInk=telemetry_ink, keysHintInk=keys_ink)
     finally:
-        try: send("quit", 0.5)
-        except Exception: pass
-        try: proc.wait(timeout=15)
-        except Exception: proc.kill()
+        guest.close()
     media_after = pin(args.media)
     assert media_before == media_after, "media changed"
     report = dict(status="PASS_NATIVE_CONSENT_QEMU", kernel=pin(args.kernel), efi=pin(args.efi),
                   media=media_after, font=pin(args.font), firmware=pin(args.firmware),
                   observer=pin(Path(__file__)), events=events,
+                  transportObserver=pin(Path(__file__).with_name("check-native-draft-restart-qemu.py")),
+                  desktopObserver=pin(Path(__file__).with_name("check-native-desktop-qemu.py")),
+                  inputSynchronizedWithCompletedFrames=True,
                   syntheticInputProvesHumanConsent=False, guestEmulation="QEMU TCG",
                   physicalHardware=False)
     (out / "native-consent-qemu.json").write_text(json.dumps(report, indent=2) + "\n")
