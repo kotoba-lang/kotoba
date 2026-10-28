@@ -86,6 +86,65 @@
                   (* (+ (* row (word ctx 42)) (word ctx 2)) 4))
         (fill-rect s fb fb-bytes ctx (+ row 1)))))
 
+;; Native material ops: rounded solid (3), alpha-tinted glass (4), rounded
+;; RGB565 gradient (5), rectangular RGB565 gradient (6). All coordinates and
+;; colours come from the retained list. No timer, network or host UI is used.
+(defn blend-rgb [under over alpha]
+  (+ (* (quot (+ (* (bit-and (quot under 65536) 255) (- 255 alpha))
+                  (* (bit-and (quot over 65536) 255) alpha)) 255) 65536)
+     (* (quot (+ (* (bit-and (quot under 256) 255) (- 255 alpha))
+                  (* (bit-and (quot over 256) 255) alpha)) 255) 256)
+     (quot (+ (* (bit-and under 255) (- 255 alpha))
+              (* (bit-and over 255) alpha)) 255)))
+
+(defn rgb565 [v]
+  (+ (* (quot (* (bit-and (quot v 2048) 31) 255) 31) 65536)
+     (* (quot (* (bit-and (quot v 32) 63) 255) 63) 256)
+     (quot (* (bit-and v 31) 255) 31)))
+
+(defn corner-inset [radius edge x]
+  (if (or (>= edge radius) (>= x radius)) x
+    (let [dx (- (- radius 1) x)
+          dy (- (- radius 1) edge)]
+      (if (<= (+ (* dx dx) (* dy dy)) (* radius radius)) x
+        (corner-inset radius edge (+ x 1))))))
+
+(defn blend-row [ctx offset]
+  (if (>= offset (word ctx 8)) 0
+    (let [page (kernel-framebuffer-page (quot offset 4096))
+          under (kernel-load-u32-4k page 4096 (mod offset 4096))
+          color (blend-rgb under (word ctx 6) (word ctx 12))
+          stored (kernel-store-u32-4k page 4096 (mod offset 4096) color)]
+      (blend-row ctx (+ offset (+ 4 (* 0 stored)))))))
+
+(defn material-rows [s fb fb-bytes ctx row]
+  (if (>= row (word ctx 9)) 0
+    (let [local (- row (word ctx 3))
+          bottom (- (- (word ctx 5) 1) local)
+          edge (if (< local bottom) local bottom)
+          inset (corner-inset (word ctx 13) edge 0)
+          offset (* (+ (* row (word ctx 42)) (+ (word ctx 2) inset)) 4)]
+      (do (if (>= (word ctx 15) 5)
+            (put-word ctx 6
+              (gop-color ctx (blend-rgb (rgb565 (bit-and (word ctx 37) 65535))
+                                        (rgb565 (quot (word ctx 37) 65536))
+                                        (if (<= (word ctx 5) 1) 0
+                                          (quot (* local 255) (- (word ctx 5) 1))))))
+            0)
+          (put-word ctx 8 (* (+ (* row (word ctx 42))
+                               (- (+ (word ctx 2) (word ctx 4)) inset)) 4))
+          (if (= (word ctx 12) 255) (fill-row s fb fb-bytes ctx offset)
+            (blend-row ctx offset))
+          (material-rows s fb fb-bytes ctx (+ row 1))))))
+
+(defn material-rect [s fb fb-bytes ctx]
+  (let [rw (quot (word ctx 4) 2)
+        rh (quot (word ctx 5) 2)
+        radius (if (< rw rh) rw rh)]
+    (do (put-word ctx 12 (if (= (word ctx 15) 4) (quot (word ctx 37) 16777216) 255))
+        (put-word ctx 13 (if (= (word ctx 15) 6) 0 (if (> radius 12) 12 radius)))
+        (material-rows s fb fb-bytes ctx (word ctx 3)))))
+
 (defn paint-glyph-pixels [s font fb fb-bytes ctx]
   (if (>= (word ctx 4) 16)
     0
@@ -124,15 +183,17 @@
           (put-word ctx 33 y)
           (put-word ctx 34 a)
           (put-word ctx 35 b)
-          (put-word ctx 36 (gop-color ctx rgb))
-          (if (= kind 1)
+          (put-word ctx 36 (gop-color ctx (bit-and rgb 16777215)))
+          (put-word ctx 37 rgb)
+          (if (or (= kind 1) (and (>= kind 3) (<= kind 6)))
             (do (put-word ctx 2 x)
                 (put-word ctx 3 y)
                 (put-word ctx 4 a)
                 (put-word ctx 5 b)
                 (put-word ctx 6 (word ctx 36))
                 (put-word ctx 9 (+ y b))
-                (fill-rect s fb fb-bytes ctx y))
+                (if (= kind 1) (fill-rect s fb fb-bytes ctx y)
+                  (do (put-word ctx 15 kind) (material-rect s fb fb-bytes ctx))))
             (do (put-word ctx 32 x)
                 (put-word ctx 33 y)
                 (put-word ctx 34 b)
@@ -147,11 +208,18 @@
 
 (defn present-frame [s font fb fb-bytes ctx]
   (put-word ctx 78 (+ (word ctx 78) 1))
+  ;; Pointer y keeps visual-only flags above its low 16-bit coordinate:
+  ;; press, reduced effects and dock selection. These never carry authority.
+  (put-word s 2047 (+ (word ctx 51) (* (word ctx 67) 65536)
+                     (* (word ctx 99) 131072) (* (word ctx 100) 262144)))
   (put-word ctx 30 0)
   (put-word ctx 31
             (browser-frame/aiueos-browser-frame2
              s 8192 font (word ctx 45)))
-  (let [result (if (< (word ctx 31) 0) 0 (present-ops s font fb fb-bytes ctx))]
+  ;; The stored count is u32: a negative renderer result wraps above 259.
+  ;; Never walk that value as an op count, even after a refused material/frame.
+  (put-word ctx 101 (if (> (word ctx 31) 259) (word ctx 31) 0))
+  (let [result (if (> (word ctx 31) 259) 0 (present-ops s font fb fb-bytes ctx))]
     (do (put-word ctx 79 (+ (word ctx 79) 1)) result)))
 
 (defn seed-app-label [s id index]
@@ -645,6 +713,20 @@
     (if (= code 21) (allow-pending s ctx)
       (if (or (= code 49) (= code 1)) (deny-pending s ctx) 0))))
 
+(defn select-dock [s ctx step]
+  (let [old (word ctx 100)
+        current (if (= old 0) (if (= (word s 2) 0) 1 (word s 2)) old)
+        next (+ current step)]
+    (do (put-word ctx 100 (if (and (= old 0) (= (word s 2) 0)) (if (< step 0) 4 1) (if (< next 1) 4 (if (> next 4) 1 next)))) 1)))
+
+(defn activate-dock [s ctx]
+  (let [id (word ctx 100)]
+    (do (put-word ctx 100 0)
+        (launch-app s id (word ctx 40) (word ctx 41)))))
+
+(defn launch-key [s ctx id]
+  (do (put-word ctx 100 0) (launch-app s id (word ctx 40) (word ctx 41))))
+
 (defn reduce-key [s code ctx]
   (if (>= (word ctx 87) 2) (key-pending s code ctx)
   (if (and (= (word ctx 86) 4) (= (word ctx 87) 1))
@@ -653,6 +735,11 @@
       (if (or (= code 49) (= code 1))
         (do (put-word ctx 87 0) (put-word s 2039 (- (word s 2039) 1)) (seed-app-label s 2 0) 1)
         0))
+  (if (= code 75) (select-dock s ctx -1)
+  (if (= code 77) (select-dock s ctx 1)
+  (if (= code 68) (do (put-word ctx 99 (- 1 (word ctx 99))) 1)
+  (if (and (> (word ctx 100) 0) (= code 28)) (activate-dock s ctx)
+  (if (and (> (word ctx 100) 0) (= code 1)) (do (put-word ctx 100 0) 1)
   (if (and (= (word ctx 86) 4) (= (word s 2) 2)
            (= code 28) (> (word s 2038) 12))
     (do (put-word ctx 87 1) (put-word s 2039 (+ (word s 2039) 1)) (model-confirm-title s 0) 1)
@@ -668,19 +755,19 @@
            (or (= code 14) (> (goal-codepoint code) 0)))
     (let [changed (edit-itonami-goal s code)]
       (if (= changed 1)
-        (do (put-word ctx 89 0) (seed-app-label s 2 0) 1)
+        (do (put-word ctx 100 0) (put-word ctx 89 0) (seed-app-label s 2 0) 1)
         0))
   (if (= code 1)
     (close-app s (word s 2))
     (if (= code 15)
-      (cycle-window s)
-      (if (= code 2) (launch-app s 1 (word ctx 40) (word ctx 41))
-        (if (= code 3) (launch-app s 2 (word ctx 40) (word ctx 41))
-          (if (= code 4) (launch-app s 3 (word ctx 40) (word ctx 41))
-            (if (= code 5) (launch-app s 4 (word ctx 40) (word ctx 41))
+      (do (put-word ctx 100 0) (cycle-window s))
+      (if (= code 2) (launch-key s ctx 1)
+        (if (= code 3) (launch-key s ctx 2)
+          (if (= code 4) (launch-key s ctx 3)
+            (if (= code 5) (launch-key s ctx 4)
               (if (= code 67) (collapse-focused s (word ctx 41))
                 (if (= code 64) (minimize-focused s)
-                  (if (= code 66) (open-key-request s ctx) (if (= code 65) (open-sign-request s ctx) 0)))))))))))))))))
+                  (if (= code 66) (open-key-request s ctx) (if (= code 65) (open-sign-request s ctx) 0))))))))))))))))))))))
 
 (defn clamp-coordinate [value extent]
   (if (< value 0) 0
@@ -716,10 +803,17 @@
   (let [panel-left (quot (- width 184) 2)
         icon-left (+ panel-left 8 (* 44 (- id 1)))
         icon-top (- height 46)]
-    (if (and (>= x icon-left) (< x (+ icon-left 36))
-             (>= y icon-top) (< y (- height 10)))
+    (if (and (>= x (- icon-left 4)) (< x (+ icon-left 40))
+             (>= y (- icon-top 6)) (< y (- height 6)))
       id
       (if (>= id 4) 0 (hit-dock x y width height (+ id 1))))))
+
+(defn hit-home [s x y width height id]
+  (if (or (< width 760) (< height 560) (not (= (word s 2) 0))) 0
+    (let [left (+ (quot (- width 704) 2) (* 176 (- id 1)))
+          top (quot (- height 240) 2)]
+      (if (in-rect x y (- left 4) (- top 6) 168 190) id
+        (if (>= id 4) 0 (hit-home s x y width height (+ id 1)))))))
 
 (defn hit-window-index [s x y index]
   (if (< index 0)
@@ -839,7 +933,9 @@
         (if (> id 0)
           (launch-app s id (word ctx 40) (word ctx 41))
           (click-window s ctx)))
-      (click-window s ctx))))
+      (let [id (hit-home s (word ctx 50) (word ctx 51) (word ctx 40) (word ctx 41) 1)]
+        (if (> id 0) (launch-app s id (word ctx 40) (word ctx 41))
+          (click-window s ctx))))))
 
 (defn apply-mouse-packet [s ctx]
   (let [raw-x (word ctx 65)
@@ -852,6 +948,7 @@
         y (clamp-coordinate (- old-y dy) (word ctx 41))
         left (bit-and (word ctx 64) 1)]
     (do (put-word ctx 75 (+ (word ctx 75) 1))
+        (put-word ctx 100 0)
         (put-word ctx 50 x)
         (put-word ctx 51 y)
         (put-word s 2046 (+ x 1))
@@ -987,6 +1084,8 @@
             (put-word context 87 0)
             (put-word context 88 0)
             (put-word context 89 0)
+            (put-word context 99 0)
+            (put-word context 100 0)
             (put-word context 90 (entropy-flags))
             (put-word context 91 (entropy-draw (word context 90)))
             (put-word context 92 (entropy-draw (word context 90)))

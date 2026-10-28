@@ -13,6 +13,11 @@ def ppm_png(source,target):
  target.write_bytes(b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('>IIBBBBB',w,h,8,2,0,0,0))+chunk(b'IDAT',zlib.compress(scan))+chunk(b'IEND',b''))
  assert len(set(pixels[i:i+3] for i in range(0,len(pixels),3)))>4
  return pixels
+def expected_background(y,height=800):
+ # Independent expected scanout of the native RGB565 wallpaper (#c6ff -> #cddd).
+ def unpack(v):return ((v>>11)*255//31,((v>>5)&63)*255//63,(v&31)*255//31)
+ t=y*255//max(1,height-1)
+ return tuple((a*(255-t)+b*t)//255 for a,b in zip(unpack(0xc6ff),unpack(0xcddd)))
 def main(media,efi,kernel,font,qemu,firmware,out,iso=None):
  before=pin(media);image=kernel.read_bytes();font_data=font.read_bytes();assert efi.read_bytes().count(image)==1 and efi.read_bytes().count(font_data)==1
  glyph_count=struct.unpack_from('<I',font_data,8)[0]
@@ -144,7 +149,7 @@ def main(media,efi,kernel,font,qemu,firmware,out,iso=None):
   key('f6');all_hidden=wait('all-windows-minimized',lambda s:s['focus']==0 and s['lastKey']==64 and s['framesCompleted']>cycled['framesCompleted'])
   hidden_pixels=screenshot('all-minimized')
   ix,iy,iw,ih=itonami_rect[1:]
-  assert hidden_pixels[3*((iy+80)*1280+ix+100):3*((iy+80)*1280+ix+100)+3]==bytes((0x8f,0xb5,0xd8))
+  assert hidden_pixels[3*((iy+80)*1280+ix+100):3*((iy+80)*1280+ix+100)+3]==bytes(expected_background(iy+80))
   dock_left=(1280-184)//2+8+44
   marker=3*((800-8)*1280+dock_left+16)
   assert hidden_pixels[marker:marker+3]==bytes((0x1a,0x3a,0x6b)), 'minimized app lost its running marker'

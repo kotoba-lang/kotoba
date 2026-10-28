@@ -8,7 +8,7 @@ Enter, then checks, from guest memory and from the rendered frame:
   the request is pending does nothing. HMP keys and clicks are synthetic and prove no human
   consent. Reads guest words with xp and pixels from screendump; no guest agent, NIC or VNC.
 """
-import argparse, hashlib, json, re, struct, subprocess, sys, tempfile, time
+import argparse, hashlib, importlib.util, json, re, struct, subprocess, sys, tempfile, time
 from pathlib import Path
 
 if not __debug__:
@@ -119,6 +119,9 @@ def main(args):
     S = lambda i: read(surface + 4 * i)
     W = lambda i: read(work + 4 * i)
     events = []
+    spec = importlib.util.spec_from_file_location("desktop_observer", Path(__file__).with_name("check-native-desktop-qemu.py"))
+    desktop_observer = importlib.util.module_from_spec(spec); spec.loader.exec_module(desktop_observer)
+    background = desktop_observer.expected_background
     def event(name, **detail):
         events.append(dict(name=name, **detail))
     def screenshot(name):
@@ -184,7 +187,7 @@ def main(args):
         px, py = (width - 480) // 2, (height - 224) // 2
         allow = pixel(shot, px + 24 + 70, py + 164 + 4)
         assert allow == (60, 179, 34), allow
-        assert pixel(shot, width // 2, height - 30) == (0x8f, 0xb5, 0xd8), "dock still drawn under the panel"
+        assert pixel(shot, width // 2, height - 30) == background(height - 30, height), "dock still drawn under the panel"
         assert pixel(shot, px + 1, py + 100) == (0x3b, 0x82, 0xff), "panel border missing"
         event("consent-open", panel=[px, py, 480, 224], allowPixel=allow, dockHidden=True)
         # modal: a launcher key and a launcher click do nothing while the request is pending
@@ -204,7 +207,7 @@ def main(args):
         send("sendkey n", 1.5)
         assert W(87) == 0 and S(2039) == 0 and W(88) == 0 and W(85) == 0 and S(2038) == 13
         shot = screenshot("after-key-deny")
-        assert pixel(shot, width // 2, height - 30) != (0x8f, 0xb5, 0xd8), "dock not back after deny"
+        assert pixel(shot, width // 2, height - 30) != background(height - 30, height), "dock not back after deny"
         event("key-deny", goalLength=S(2038), approved=W(88))
         # Deny button
         send("sendkey ret", 1.5); assert W(87) == 1 and S(2039) == 1

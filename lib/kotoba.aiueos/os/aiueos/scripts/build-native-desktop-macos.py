@@ -166,6 +166,7 @@ def main(args):
             "check-native-draft-restart-qemu.py", "check-native-consent-qemu.py",
             "check-native-idle-silent-qemu.py", "check-native-cid-qemu.py", "check-native-sha512-qemu.py", "check-native-gf25519-qemu.py", "check-native-ed25519-qemu.py", "check-native-keyseal-qemu.py", "check-native-keystore-qemu.py",
             "check-native-media-format.py",
+            "check-native-shell-material-qemu.py",
         )
     }
     script_pins = {name: verified_file(path) for name, path in scripts.items()}
@@ -418,6 +419,25 @@ def main(args):
                     or iso_observed["observer"] != script_pins["check-native-desktop-qemu.py"]
                     or [row["codepoint"] for row in iso_observed["renderedGoalGlyphs"]] != [97, 98, 97]):
                 raise ValueError("ISO QEMU guest observation is not bound to this build")
+        material_observed = None
+        if args.profile == "desktop":
+            call("qemu-material", scripts["check-native-shell-material-qemu.py"], [
+                "--media", disk, "--efi", efi, "--kernel", image, "--font", padded,
+                "--qemu", qemu, "--firmware", firmware, "--output", output / "qemu-material"])
+            material_observed = json.loads((output / "qemu-material/native-shell-material-qemu.json").read_text())
+            if (material_observed["status"] != "PASS_NATIVE_SHELL_MATERIAL_QEMU"
+                    or material_observed["kernel"] != kernel_state["kernel"]
+                    or material_observed["efi"] != kernel_state["efi"]
+                    or material_observed["media"] != media_state["image"]
+                    or material_observed["observer"] != script_pins["check-native-shell-material-qemu.py"]
+                    or material_observed["desktopObserver"] != script_pins["check-native-desktop-qemu.py"]
+                    or material_observed["transportObserver"] != script_pins["check-native-draft-restart-qemu.py"]
+                    or [row["name"] for row in material_observed["events"]] != [
+                        "first-frame-materials", "dock-keyboard-focus", "dock-keyboard-launch",
+                        "dock-pointer-hover", "dock-pointer-press", "dock-pointer-release",
+                        "reduced-effects", "effects-restored", "home-pointer-launch"]
+                    or material_observed["physicalHardware"] or material_observed["syntheticInputProvesHumanConsent"]):
+                raise ValueError("native shell materials observation is not bound to this build")
         if (pin(compiler) != compiler_pin or pin(packager) != packager_pin
                 or (descriptor_pin is not None and
                     repository_bootstrap(amu, argparse.Namespace(
@@ -447,6 +467,8 @@ def main(args):
                      guestEvents=len(observed["events"]),
                      guestInputQualified=True, nativeFormatEmission=True,
                      isoBootQualified=iso_observed is not None,
+                     nativeShellMaterialsQualified=material_observed is not None,
+                     nativeShellMaterialEvents=len(material_observed["events"]) if material_observed else 0,
                      localDraftRestoreQualified=args.profile == "local-draft",
                      qualification=("Mac native local-draft save and cold restore on QEMU"
                                     if args.profile == "local-draft"
