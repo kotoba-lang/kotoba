@@ -58,7 +58,9 @@ RECEIPT_NEGATIVES = ('missing-receipt-file', 'red-verdict',
                      'missing-serial-log', 'tampered-secondary-serial-log',
                      'missing-secondary-serial-log', 'tampered-i3-scale-log',
                      'missing-i3-scale-log', 'tampered-i3-scanout-log',
-                     'missing-i3-scanout-log')
+                     'missing-i3-scanout-log', 'tampered-i2-serial-log',
+                     'missing-i2-serial-log', 'tampered-i2-suspend-log',
+                     'missing-i2-suspend-log', 'mutated-i2-claim')
 A1_RECEIPT = Path('os/aiueos/qualification/receipts/vm-20261024/a1-qmp60/receipt.edn')
 UI_RECEIPT = Path('os/aiueos/qualification/receipts/vm-20261023/ui/receipt.edn')
 BROKER_RECEIPT = Path('os/aiueos/qualification/receipts/vm-20261023/broker/receipt.edn')
@@ -78,12 +80,14 @@ I2_RECEIPT = Path(
     'os/aiueos/qualification/receipts/vm-20261026/i2-battery-power-management/receipt.edn')
 A5_RECEIPT = Path(
     'os/aiueos/qualification/receipts/vm-20261025/a5-first-run-setup/receipt.edn')
-# I2 has synthetic battery input and separate sleep-run evidence. The
-# remaining rows also lack evidence this native core can fully admit.
+# These rows lack evidence this native core can fully admit. I2 is admitted
+# at the VM reference-machine baseline (owner decision, JUN-409 2026-10-28):
+# its battery input is synthetic and its sleep evidence is a separate run,
+# both disclosed in the receipt's caveats; that is not :device evidence.
 UNVERIFIED_ROWS = ('A5', 'C9', 'F2', 'G1', 'G3', 'G5', 'H1', 'H2',
-                   'H3', 'I2', 'I6')
+                   'H3', 'I6')
 EXPECTED_LEDGER = (
-    b'AIUEOS_SCORE 53\n'
+    b'AIUEOS_SCORE 54\n'
     b'AIUEOS_CATEGORY boot weight=10 pass=9 gap=1\n'
     b'AIUEOS_CATEGORY identity weight=6 pass=6 gap=0\n'
     b'AIUEOS_CATEGORY shell weight=15 pass=14 gap=1\n'
@@ -92,7 +96,7 @@ EXPECTED_LEDGER = (
     b'AIUEOS_CATEGORY storage weight=9 pass=3 gap=6\n'
     b'AIUEOS_CATEGORY security weight=9 pass=3 gap=6\n'
     b'AIUEOS_CATEGORY update weight=9 pass=1 gap=8\n'
-    b'AIUEOS_CATEGORY power weight=10 pass=8 gap=2\n'
+    b'AIUEOS_CATEGORY power weight=10 pass=9 gap=1\n'
 )
 
 
@@ -323,7 +327,6 @@ def main():
     observations = {}
     row_controls = tuple(f'row-unadmitted-{row_id}' for row_id in UNVERIFIED_ROWS)
     for name in ('positive', 'canonical-refusal', *NEGATIVES,
-                 'i2-synthetic-with-bound-log',
                  'a5-forged-serial-and-release',
                  'unregistered-tagged-b2-receipt',
                  *RECEIPT_NEGATIVES, *row_controls):
@@ -338,19 +341,6 @@ def main():
         elif name == 'canonical-refusal':
             data = canonical_card
             expected_exit, expected_stdout = 1, b'AIUEOS_SCORE -1\n'
-        elif name == 'i2-synthetic-with-bound-log':
-            data = admitted_subset(canonical_card, keep='I2')
-            expected_exit, expected_stdout = 1, b'AIUEOS_SCORE -1\n'
-            target = directory/I2_RECEIPT
-            serial = target.with_name('kernel-serial.log')
-            receipt_bytes = target.read_bytes()
-            anchor = b':commit "134146345189990190ee18573f593ba7968b1d72"'
-            if receipt_bytes.count(anchor) != 1 or not serial.is_file():
-                raise ValueError('I2 synthetic evidence anchor missing')
-            target.write_bytes(receipt_bytes.replace(
-                anchor, anchor + b'\n :serial-sha256 "'
-                + hashlib.sha256(serial.read_bytes()).hexdigest().encode()
-                + b'"', 1))
         elif name == 'a5-forged-serial-and-release':
             data = admitted_subset(canonical_card, keep='A5')
             anchor = b'"receipt ' + str(A5_RECEIPT).encode() + b'"'
@@ -414,6 +404,11 @@ def main():
                 ('tampered-i3-scale-log', 'missing-i3-scale-log')
                 else I3_RECEIPT.with_name('scanout-two-run-serial.log') if name in
                 ('tampered-i3-scanout-log', 'missing-i3-scanout-log')
+                else I2_RECEIPT.with_name('kernel-serial.log') if name in
+                ('tampered-i2-serial-log', 'missing-i2-serial-log')
+                else I2_RECEIPT.with_name('suspend-run-serial.log') if name in
+                ('tampered-i2-suspend-log', 'missing-i2-suspend-log')
+                else I2_RECEIPT if name == 'mutated-i2-claim'
                 else A2_RECEIPT if name in
                 ('wrong-row-tag', 'missing-row-tag', 'mutated-a2-claim')
                 else I3_RECEIPT if name == 'mutated-i3-claim'
@@ -422,7 +417,8 @@ def main():
                 else A1_RECEIPT)
             if name in ('missing-receipt-file', 'missing-serial-log',
                         'missing-secondary-serial-log', 'missing-i3-scale-log',
-                        'missing-i3-scanout-log'):
+                        'missing-i3-scanout-log', 'missing-i2-serial-log',
+                        'missing-i2-suspend-log'):
                 target.unlink()
             elif name == 'bad-release-signature-field':
                 receipt_bytes = target.read_bytes()
@@ -451,10 +447,14 @@ def main():
                 if receipt_bytes.count(before) != 1:
                     raise ValueError('A2 row tag anchor missing')
                 target.write_bytes(receipt_bytes.replace(before, b':claim-row :A2', 1))
-            elif name in ('mutated-a2-claim', 'mutated-i3-claim'):
+            elif name in ('mutated-a2-claim', 'mutated-i3-claim',
+                          'mutated-i2-claim'):
                 receipt_bytes = target.read_bytes()
                 before = (b'Desktop survives a display change' if name ==
-                          'mutated-a2-claim' else b'Display scaling and external displays')
+                          'mutated-a2-claim' else
+                          b'Battery and power management: on battery'
+                          if name == 'mutated-i2-claim'
+                          else b'Display scaling and external displays')
                 if receipt_bytes.count(before) != 1:
                     raise ValueError(f'receipt claim anchor missing: {name}')
                 target.write_bytes(receipt_bytes.replace(before, b'Unverified claim', 1))
@@ -473,7 +473,8 @@ def main():
                     before, b':row :G4, :commit "8a9f0f', 1))
             elif name in ('tampered-release-json', 'tampered-release-signature',
                           'tampered-serial-log', 'tampered-secondary-serial-log',
-                          'tampered-i3-scale-log', 'tampered-i3-scanout-log'):
+                          'tampered-i3-scale-log', 'tampered-i3-scanout-log',
+                          'tampered-i2-serial-log', 'tampered-i2-suspend-log'):
                 artifact_bytes = target.read_bytes()
                 if not artifact_bytes:
                     raise ValueError('release artifact empty')
@@ -569,7 +570,8 @@ def main():
               'admittedA2I3ReceiptDigestsVerified': True,
               'legacyReceiptContentAndRowsSourcePinned': True,
               'unregisteredTaggedReceiptsRefused': True,
-              'syntheticI2RefusedWithBoundSerialLog': True,
+              'i2VmBaselineAdmittedWithBoundLogs': True,
+              'i2SyntheticBatteryDisclosedNotDeviceEvidence': True,
               'pendingRowsRequireExplicitNativeAdmission': True,
               'legacyUntaggedReceiptRowBindingVerified': True,
               'referencedReceiptSerialDigestsVerified': True,
