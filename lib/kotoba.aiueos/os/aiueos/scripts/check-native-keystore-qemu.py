@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """ADR-0277 W3f: the sealed device key survives a reboot, and a wrong passphrase is refused.
 
-Two boots of the same consent-profile kernel over one provisioned 64 KiB scratch disk (a test fixture; the guest
+Three boots of the same consent-profile kernel (two over one provisioned 64 KiB scratch disk, the third with no disk) (a test fixture; the guest
 never formats a disk). Boot 1: F8, Allow, a passphrase, Enter: the key is created and its sealed blob is written
 to sector 4 and read back (word 97 = 1). QEMU is then quit. Boot 2, same disk: the guest finds the sealed key at
 boot (word 96 = 1, the home says "DID: locked", no seed in RAM, the blob in RAM equals the disk's); F8 opens the
@@ -34,10 +34,11 @@ class Boot:
         cmd = [str(args.qemu), "-machine", "q35,accel=tcg", "-cpu", "max", "-m", "128M", "-smp", "1",
                "-drive", f"if=pflash,format=raw,readonly=on,file={args.firmware}",
                "-drive", f"file={args.media},format=raw,if=ide,snapshot=on", "-boot", "order=c",
-               "-nic", "none", "-display", "none", "-no-reboot", "-monitor", "stdio",
-               "-device", "isa-ide,id=draft-controller",
-               "-drive", f"file={scratch},format=raw,if=none,id=draft,cache=directsync",
-               "-device", "ide-hd,drive=draft,bus=draft-controller.0,unit=1,serial=AWAI90DRAFT000001"]
+               "-nic", "none", "-display", "none", "-no-reboot", "-monitor", "stdio"]
+        if scratch is not None:
+            cmd += ["-device", "isa-ide,id=draft-controller",
+                    "-drive", f"file={scratch},format=raw,if=none,id=draft,cache=directsync",
+                    "-device", "ide-hd,drive=draft,bus=draft-controller.0,unit=1,serial=AWAI90DRAFT000001"]
         self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=subprocess.STDOUT, text=True, cwd=out, bufsize=1)
         deadline = time.monotonic() + 150
@@ -103,6 +104,8 @@ def main(args):
         assert b.W(96) == 0 and b.S(2039) == 0, "a blank disk must not look like a stored key"
         b.send("sendkey 2", 1.5); b.send("sendkey a", 1.5)
         home_none = b.screenshot("home-none")
+        key_row = lambda shot: b.band(shot, 180, 330, 170, 188)
+        assert sum(1 for px in key_row(home_none) if px != b"\xff\xff\xff") > 20, "the key row must be drawn"
         b.send("sendkey f8", 1.5); assert b.W(87) == 2
         key_panel = b.screenshot("key-request")
         b.send("sendkey y", 1.5); assert b.W(87) == 4
@@ -129,6 +132,7 @@ def main(args):
         b.send("sendkey 2", 1.5); b.send("sendkey a", 1.5)
         home_locked = b.screenshot("home-locked")
         did_band = lambda shot: b.band(shot, 180, 330, 150, 168)
+        assert key_row(home_none) != key_row(home_locked), "the key row must say locked, not none"
         assert did_band(home_none) != did_band(home_locked), "the DID line must read differently when a sealed key is stored"
         assert sum(1 for px in did_band(home_locked) if px != b"\xff\xff\xff") > 20, "the locked DID line must be drawn"
         b.send("sendkey f7", 1.5); assert b.W(87) == 0, "signing must be impossible while the key is locked"
@@ -154,6 +158,8 @@ def main(args):
         assert seed2 == seed1 and pub2 == pub1, "the unlocked key is not the stored one"
         assert (flags2 >> 6) & 1 == 1 and (flags2 >> 7) & 0xffffff == int.from_bytes(pub1[:3], "big") and flags2 & 3 == 0, hex(flags2)
         assert b.words(832, 8) == bytes(32), "the passphrase buffer must be wiped after unlock"
+        home_ready = b.screenshot("home-ready")
+        assert key_row(home_ready) != key_row(home_locked) and key_row(home_ready) != key_row(home_none), "the key row must say ready"
         events.append(dict(name="unlock-right-passphrase", unlocked=True, fingerprint=pub2[:3].hex(), samePublicKey=True, sameSeed=True))
         # a consent-bound signature under the restored key verifies under the boot-1 public key
         b.send("sendkey f7", 1.5); assert b.W(87) == 3
@@ -164,6 +170,41 @@ def main(args):
         foreign = consent.ed_public(bytes(range(32)))
         assert not ed_verify(foreign, challenge, sig), "a foreign key must not verify"
         events.append(dict(name="sign-after-unlock", verifies=True, foreignKeyRefused=True, signature=sig.hex()))
+        # Lock (F6): everything secret leaves RAM, the key goes back to the locked state, the disk is untouched
+        count = (b.S(2039) >> 2) & 15
+        disk_before = scratch.read_bytes()
+        b.send("sendkey f6", 4.0)
+        assert b.W(87) == 0 and b.W(94) == 11 and b.W(96) == 1, (b.W(87), b.W(94), b.W(96))
+        assert b.S(2039) == count * 4 + 128, (hex(b.S(2039)), count)
+        zero = bytes(32)
+        assert b.words(928, 8) == zero and b.words(320, 8) == zero and b.words(800, 16) == bytes(64), "seed, public key and signature must be gone"
+        assert b.words(768, 16) == bytes(64) and b.words(512, 8) == zero and b.words(1024, 8) == zero, "signing buffer and workspace must be wiped"
+        assert scratch.read_bytes() == disk_before, "Lock must not write to the disk"
+        b.send("sendkey f7", 1.5); assert b.W(87) == 0, "signing must be impossible while locked"
+        home_relocked = b.screenshot("home-relocked")
+        assert key_row(home_relocked) == key_row(home_locked) and key_row(home_relocked) != key_row(home_ready), "the key row must say locked again"
+        events.append(dict(name="lock", wiped=True, lockedAgain=True, diskUntouched=True, signingRefused=True))
+        # and the right passphrase brings the same key back
+        b.send("sendkey f8", 1.5); assert b.W(87) == 4 and b.W(98) == 1
+        b.type_text(PASS); b.send("sendkey ret", 8.0)
+        assert b.W(94) == 9 and b.W(96) == 0 and b.words(928, 8) == seed1 and b.words(320, 8) == pub1, "unlock after lock must restore the same key"
+        events.append(dict(name="unlock-after-lock", sameKey=True))
+    finally:
+        b.quit()
+    # ---- boot 3: no disk. A key that is not stored cannot be locked (it would be lost): Lock refuses and changes nothing ----
+    b = Boot(args, out, "boot3", None)
+    try:
+        b.send("sendkey 2", 1.5); b.send("sendkey a", 1.5)
+        b.send("sendkey f8", 1.5); assert b.W(87) == 2
+        b.send("sendkey y", 1.5); assert b.W(87) == 4
+        b.type_text(PASS); b.send("sendkey ret", 8.0)
+        assert b.W(94) == 1 and b.W(97) == 0, ("no disk: the key must exist and be RAM-only", b.W(94), b.W(97))
+        flags3, seed3 = b.S(2039), b.words(928, 8)
+        b.send("sendkey f6", 2.0)
+        assert b.W(94) == 10 and b.S(2039) == flags3 and b.words(928, 8) == seed3 and b.W(96) == 0, "Lock must refuse an unstored key and change nothing"
+        b.send("sendkey f7", 1.5); assert b.W(87) == 3, "the unstored key must still sign"
+        b.send("sendkey n", 1.5)
+        events.append(dict(name="lock-refused-unstored", refused=True, keyKept=True))
     finally:
         b.quit()
     assert pin(args.media) == media_before, "media changed"
