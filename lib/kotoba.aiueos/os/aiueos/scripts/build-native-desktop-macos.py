@@ -164,7 +164,7 @@ def main(args):
             "build-native-font-macos.py", "build-native-kernel-macos.py",
             "build-native-media-macos.py", "check-native-desktop-qemu.py",
             "check-native-draft-restart-qemu.py", "check-native-consent-qemu.py",
-            "check-native-idle-silent-qemu.py", "check-native-cid-qemu.py", "check-native-sha512-qemu.py", "check-native-gf25519-qemu.py", "check-native-ed25519-qemu.py", "check-native-keyseal-qemu.py",
+            "check-native-idle-silent-qemu.py", "check-native-cid-qemu.py", "check-native-sha512-qemu.py", "check-native-gf25519-qemu.py", "check-native-ed25519-qemu.py", "check-native-keyseal-qemu.py", "check-native-keystore-qemu.py",
             "check-native-media-format.py",
         )
     }
@@ -235,7 +235,7 @@ def main(args):
             raise ValueError("font build receipt mismatch")
 
         kernel_entry = ("workspace-entry.kotoba" if args.profile == "local-draft"
-                        else "consent-entry.kotoba" if args.profile == "consent"
+                        else "consent-entry.kotoba" if args.profile in ("consent", "keystore")
                         else "cid-entry.kotoba" if args.profile == "cid"
                         else "sha512-entry.kotoba" if args.profile == "sha512"
                         else "gf-entry.kotoba" if args.profile == "gf25519"
@@ -286,6 +286,7 @@ def main(args):
                         else "check-native-gf25519-qemu.py" if args.profile == "gf25519"
                         else "check-native-ed25519-qemu.py" if args.profile == "ed25519"
                         else "check-native-keyseal-qemu.py" if args.profile == "keyseal"
+                        else "check-native-keystore-qemu.py" if args.profile == "keystore"
                         else "check-native-desktop-qemu.py")
         guest_args = [
             "--media", disk, "--efi", efi, "--kernel", image,
@@ -300,6 +301,7 @@ def main(args):
                         else "native-gf25519-qemu.json" if args.profile == "gf25519"
                         else "native-ed25519-qemu.json" if args.profile == "ed25519"
                         else "native-keyseal-qemu.json" if args.profile == "keyseal"
+                        else "native-keystore-qemu.json" if args.profile == "keystore"
                         else "native-desktop-qemu.json")
         observed = json.loads((guest / receipt_name).read_text())
         expected_status = ("PASS_NATIVE_LOCAL_DRAFT_COLD_RESTORE" if args.profile == "local-draft"
@@ -310,11 +312,13 @@ def main(args):
                            else "PASS_NATIVE_GF25519_QEMU" if args.profile == "gf25519"
                            else "PASS_NATIVE_ED25519_QEMU" if args.profile == "ed25519"
                            else "PASS_NATIVE_KEYSEAL_QEMU" if args.profile == "keyseal"
+                           else "PASS_NATIVE_KEYSTORE_QEMU" if args.profile == "keystore"
                            else "PASS_NATIVE_DESKTOP_INPUT_QEMU")
         expected_events = (12 if args.profile == "local-draft"
                            else 18 if args.profile == "consent"
                            else 4 if args.profile == "idle"
                            else 3 if args.profile == "ed25519"
+                           else 5 if args.profile == "keystore"
                            else 2 if args.profile in ("cid", "sha512", "gf25519", "keyseal") else 12)
         if (observed["status"] != expected_status
                 or len(observed["events"]) != expected_events
@@ -371,6 +375,13 @@ def main(args):
                     or len(observed["events"][2]["signatures"]) != 3
                     or not observed["signing"] or observed["deviceKey"] or observed["physicalHardware"]):
                 raise ValueError("ed25519 verdict is incomplete")
+        elif args.profile == "keystore":
+            if (observed["font"] != font_state["padded"]
+                    or [row["name"] for row in observed["events"]] != [
+                        "boot1-create", "boot2-locked", "unlock-wrong-passphrase", "unlock-right-passphrase", "sign-after-unlock"]
+                    or not observed["persistedAcrossReboot"] or not observed["wrongPassphraseRefused"]
+                    or observed["physicalHardware"] or observed["syntheticInputProvesHumanConsent"]):
+                raise ValueError("keystore verdict is incomplete")
         elif args.profile == "keyseal":
             if (observed["font"] != font_state["padded"]
                     or [row["name"] for row in observed["events"]] != ["first-frame", "keyseal-seal-open"]
@@ -429,6 +440,7 @@ def main(args):
                             else "MACOS_NATIVE_GF25519_QEMU_CANDIDATE" if args.profile == "gf25519"
                             else "MACOS_NATIVE_ED25519_QEMU_CANDIDATE" if args.profile == "ed25519"
                             else "MACOS_NATIVE_KEYSEAL_QEMU_CANDIDATE" if args.profile == "keyseal"
+                            else "MACOS_NATIVE_KEYSTORE_QEMU_CANDIDATE" if args.profile == "keystore"
                             else "MACOS_NATIVE_DESKTOP_QEMU_CANDIDATE"),
                      font=font_state["padded"], kernel=kernel_state["kernel"],
                      efi=kernel_state["efi"], media=media_state["image"], iso=media_state["iso"],
@@ -452,6 +464,8 @@ def main(args):
                                     if args.profile == "ed25519"
                                     else "Mac native passphrase key sealing self-test (seal, open, wrong passphrase, changed blob) on QEMU"
                                     if args.profile == "keyseal"
+                                    else "Mac native sealed device key survives a reboot; a wrong passphrase is refused (two boots, QEMU)"
+                                    if args.profile == "keystore"
                                     else "Mac native GPT and EFI El Torito ISO QEMU desktop input")
                      + "; D2 workspace, release and physical gates separate")
         save()
@@ -478,7 +492,7 @@ if __name__ == "__main__":
     parser.add_argument("--firmware", type=Path, required=True)
     parser.add_argument("--firmware-sha256", required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--profile", choices=("desktop", "local-draft", "consent", "idle", "cid", "sha512", "gf25519", "ed25519", "keyseal"), default="desktop")
+    parser.add_argument("--profile", choices=("desktop", "local-draft", "consent", "idle", "cid", "sha512", "gf25519", "ed25519", "keyseal", "keystore"), default="desktop")
     parser.add_argument("--distribution", choices=("aiueos", "awai"), default="aiueos")
     # kernel-v3 (RW at 0x400000) leaves the packager about 3 MiB of room (the compiler's
     # text cap stays 2 MiB, native/layout-table.json) instead of kernel-v1's
