@@ -41,8 +41,10 @@ renderer result, stored as u32, cannot be walked as an enormous op count.
 ## Native evidence
 
 `source-pins.json` binds the six sources/observers to final implementation
-commit `e5cb8a289` (material/home `1fb328b59`, exact blend cache and synchronized
-input `f226e60ab`, terminal handoff observation `e5cb8a289`).
+commit `cca7ff337` (material/home `1fb328b59`, exact blend cache and synchronized
+input `f226e60ab`, terminal handoff observation `e5cb8a289`, distribution-neutral
+shared heading `cca7ff337`). The home says "Your space"; distribution branding
+remains a composition/configuration concern.
 The signed Mac Amu selfhost root is `9d023d99...`. Kotoba emits
 font/kernel/EFI/media; Python stages, hashes and observes native execution.
 No JVM, NBB, Node, C compiler, host UI compositor or Linux guest supplies the UI.
@@ -83,8 +85,10 @@ opaque and modal; the new material/navigation state grants nothing.
 The alpha presenter caches only the immediately previous underlying pixel's
 exact blended result, resetting the cache for every row. It still reads each
 underlying pixel and recomputes when that pixel changes; text under glass is
-never approximated as a uniform band. The pre/post-cache home and restored-Goal
-scanout files were byte-identical. No speedup or frame-rate claim is derived.
+never approximated as a uniform band. The source-fixed pre/post-cache scanouts
+in `cache-scanout-comparison.json` were byte-identical. That comparison predates
+the final neutral heading: its hashes describe the earlier build pair, not
+the final screenshots above. No speedup or frame-rate claim is derived.
 
 An earlier fixed-delay consent run failed its passphrase-length assertion.
 The final observer uses private QMP bulk memory snapshots and waits for both
