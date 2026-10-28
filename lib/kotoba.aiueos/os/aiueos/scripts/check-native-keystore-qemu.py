@@ -130,8 +130,11 @@ def main(args):
         assert b.words(848, 16) == blob1, "the blob read at boot differs from the one written"
         assert b.words(928, 8) == bytes(32) and b.words(320, 8) == bytes(32), "no seed or public key may exist before unlock"
         b.send("sendkey 2", 1.5); b.send("sendkey a", 1.5)
-        home_locked = b.screenshot("home-locked")
         did_band = lambda shot: b.band(shot, 180, 330, 150, 168)
+        for _ in range(8):   # a loaded host redraws late: look again before judging
+            home_locked = b.screenshot("home-locked")
+            if sum(1 for px in did_band(home_locked) if px != b"\xff\xff\xff") > 20: break
+            time.sleep(3)
         assert key_row(home_none) != key_row(home_locked), "the key row must say locked, not none"
         assert did_band(home_none) != did_band(home_locked), "the DID line must read differently when a sealed key is stored"
         assert sum(1 for px in did_band(home_locked) if px != b"\xff\xff\xff") > 20, "the locked DID line must be drawn"
@@ -145,8 +148,13 @@ def main(args):
         title = lambda shot: b.band(shot, px + 20, px + 460, py + 14, py + 40)
         assert title(unlock_panel) != title(create_panel), "the unlock panel must be titled differently from the create panel"
         assert b.band(unlock_panel, px + 20, px + 460, py + 56, py + 80) == b.band(create_panel, px + 20, px + 460, py + 56, py + 80), "the service line is the same"
+        attempts_on_disk = lambda: scratch.read_bytes()[4 * 512 + 12]
+        assert attempts_on_disk() == 0 and b.W(100) == 0, "no failed attempt yet"
         b.type_text(WRONG); b.send("sendkey ret", 8.0)
-        assert b.W(87) == 0 and b.W(94) == 8 and b.W(96) == 1 and b.S(2039) == 128, (b.W(87), b.W(94), b.W(96), hex(b.S(2039)))
+        assert b.W(87) == 0 and b.W(94) == 8 and b.W(96) == 1 and b.S(2039) == 128 + 32768, (b.W(87), b.W(94), b.W(96), hex(b.S(2039)))
+        assert b.W(100) == 1 and attempts_on_disk() == 1, ("the failed attempt must be counted in RAM and in the key record", b.W(100), attempts_on_disk())
+        home_wrong = b.screenshot("home-wrong")
+        assert key_row(home_wrong) != key_row(home_locked), "the key row must say the passphrase was wrong"
         assert b.words(928, 8) == bytes(32) and b.words(832, 8) == bytes(32), "a refused unlock must leave no seed and no passphrase"
         events.append(dict(name="unlock-wrong-passphrase", refused=True, stillLocked=True, seedBytes=b.words(928, 8).hex()))
         # right passphrase: the boot-1 key is back
@@ -155,6 +163,8 @@ def main(args):
         assert b.W(87) == 0 and b.W(94) == 9 and b.W(96) == 0, (b.W(87), b.W(94), b.W(96))
         seed2, pub2 = b.words(928, 8), b.words(320, 8)
         flags2 = b.S(2039)
+        assert b.W(100) == 0 and attempts_on_disk() == 0, "a success must clear the attempt count in RAM and in the record"
+        assert (flags2 >> 15) & 1 == 0 or (flags2 >> 7) & 0xffffff == int.from_bytes(pub1[:3], "big"), "wrong flag handling"
         assert seed2 == seed1 and pub2 == pub1, "the unlocked key is not the stored one"
         assert (flags2 >> 6) & 1 == 1 and (flags2 >> 7) & 0xffffff == int.from_bytes(pub1[:3], "big") and flags2 & 3 == 0, hex(flags2)
         assert b.words(832, 8) == bytes(32), "the passphrase buffer must be wiped after unlock"
@@ -200,12 +210,23 @@ def main(args):
         assert b.band(forget_panel, px + 20, px + 460, py + 80, py + 104) != b.band(unlock_panel, px + 20, px + 460, py + 80, py + 104), "the action line must say erase"
         disk_before = scratch.read_bytes()
         b.type_text(WRONG); b.send("sendkey ret", 8.0)
-        assert b.W(87) == 0 and b.W(94) == 13 and b.W(96) == 1 and b.S(2039) == count * 4 + 128, (b.W(87), b.W(94), b.W(96), hex(b.S(2039)))
-        assert scratch.read_bytes() == disk_before and b.words(928, 8) == bytes(32), "a wrong passphrase must erase nothing and release nothing"
-        events.append(dict(name="forget-wrong-passphrase", refused=True, diskUntouched=True, stillLocked=True))
+        assert b.W(87) == 0 and b.W(94) == 13 and b.W(96) == 1 and b.S(2039) == count * 4 + 128 + 32768, (b.W(87), b.W(94), b.W(96), hex(b.S(2039)))
+        after_wrong = scratch.read_bytes()
+        changed = [i for i in range(len(after_wrong)) if after_wrong[i] != disk_before[i]]
+        assert changed == [4 * 512 + 12] and after_wrong[4 * 512 + 12] == 1 and b.W(100) == 1, ("only the attempt count may change", changed)
+        assert b.words(928, 8) == bytes(32), "a wrong passphrase must erase nothing and release nothing"
+        disk_before = after_wrong
+        events.append(dict(name="forget-wrong-passphrase", refused=True, onlyAttemptCountChanged=True, stillLocked=True))
         b.send("sendkey f10", 1.5); assert b.W(87) == 4 and b.W(98) == 2
         b.type_text(PASS); b.send("sendkey esc", 1.5)
-        assert b.W(87) == 0 and b.W(94) == 6 and b.W(96) == 1 and scratch.read_bytes() == disk_before, "Esc must cancel without erasing"
+        assert b.W(87) == 0 and b.W(94) == 6 and b.W(96) == 1 and scratch.read_bytes() == disk_before, "Esc must cancel without erasing or counting"
+        # the attempt count survives a reboot (it is in the key record); the session's "wrong" flag does not
+        b.quit()
+        b = Boot(args, out, "boot2b", scratch)
+        assert b.W(96) == 1 and b.W(100) == 1 and b.S(2039) == 128, (b.W(96), b.W(100), hex(b.S(2039)))
+        count = 0   # the Approved count is per boot
+        b.send("sendkey 2", 1.5); b.send("sendkey a", 1.5)
+        events.append(dict(name="attempt-count-after-reboot", count=1, wrongFlagNotPersisted=True))
         b.send("sendkey f10", 1.5); assert b.W(87) == 4 and b.W(98) == 2
         b.type_text(PASS); b.send("sendkey ret", 8.0)
         assert b.W(87) == 0 and b.W(94) == 12 and b.W(96) == 0 and b.W(97) == 0, (b.W(87), b.W(94), b.W(96), b.W(97))
