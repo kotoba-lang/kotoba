@@ -166,7 +166,7 @@ def main(args):
             "check-native-draft-restart-qemu.py", "check-native-consent-qemu.py",
             "check-native-idle-silent-qemu.py", "check-native-cid-qemu.py", "check-native-sha512-qemu.py", "check-native-gf25519-qemu.py", "check-native-ed25519-qemu.py", "check-native-keyseal-qemu.py", "check-native-keystore-qemu.py",
             "check-native-media-format.py",
-            "check-native-shell-material-qemu.py",
+            "check-native-shell-material-qemu.py", "check-native-gui-effects-qemu.py",
         )
     }
     script_pins = {name: verified_file(path) for name, path in scripts.items()}
@@ -253,7 +253,7 @@ def main(args):
         efi = kernel / "BOOTX64.EFI"
         image = kernel / "KERNEL.ELF"
         if (kernel_state["state"] != "MACOS_NATIVE_IMAGE_CANDIDATE"
-                or kernel_state["sourceModuleCount"] != (36 if args.profile == "cid" else 35)
+                or kernel_state["sourceModuleCount"] != (38 if args.profile == "cid" else 37)
                 or kernel_state["fuel"] != FUEL
                 or kernel_state["compiler"] != compiler_pin
                 or pin(efi) != kernel_state["efi"] or pin(image) != kernel_state["kernel"]
@@ -441,6 +441,33 @@ def main(args):
                         "reduced-effects", "effects-restored", "home-pointer-launch"]
                     or material_observed["physicalHardware"] or material_observed["syntheticInputProvesHumanConsent"]):
                 raise ValueError("native shell materials observation is not bound to this build")
+        gui_observed = []
+        if args.profile == "desktop":
+            for name, options in (("absent", []), ("audio", ["--audio"]),
+                                  ("muted", ["--audio", "--muted"])):
+                destination = output / ("qemu-effects-" + name)
+                call("qemu-effects-" + name, scripts["check-native-gui-effects-qemu.py"], [
+                    "--media", disk, "--efi", efi, "--kernel", image, "--font", padded,
+                    "--qemu", qemu, "--firmware", firmware, "--output", destination, *options])
+                effect = json.loads((destination / "native-gui-effects.json").read_text())
+                if (effect["status"] != "PASS_NATIVE_GUI_EFFECTS_QEMU"
+                        or len(effect["events"]) != 8
+                        or effect["kernel"] != kernel_state["kernel"]
+                        or effect["efi"] != kernel_state["efi"]
+                        or effect["media"] != media_state["image"]
+                        or effect["font"] != font_state["padded"]
+                        or effect["qemu"] != qemu_pin or effect["firmware"] != firmware_pin
+                        or effect["observer"] != script_pins["check-native-gui-effects-qemu.py"]
+                        or effect["transport"] != script_pins["check-native-draft-restart-qemu.py"]
+                        or effect["physicalHardware"] or effect["smooth60FPSQualified"]
+                        or effect["trustedHumanConsent"]):
+                    raise ValueError("GUI effects observation is not bound to this build: " + name)
+                if name == "absent" and effect["audio"] is not None:
+                    raise ValueError("missing-device control unexpectedly has audio")
+                if name != "absent" and (effect["audio"] is None
+                        or (effect["audio"]["peak"] == 0) != (name == "muted")):
+                    raise ValueError("native WAV positive/mute control failed")
+                gui_observed.append(effect)
         if (pin(compiler) != compiler_pin or pin(packager) != packager_pin
                 or (descriptor_pin is not None and
                     repository_bootstrap(amu, argparse.Namespace(
@@ -471,6 +498,10 @@ def main(args):
                      guestInputQualified=True, nativeFormatEmission=True,
                      isoBootQualified=iso_observed is not None,
                      nativeShellMaterialsQualified=material_observed is not None,
+                     nativeGUIEffectsQualified=len(gui_observed) == 3,
+                     nativeGUIEffectsEvents=sum(len(g["events"]) for g in gui_observed),
+                     nativePCMDevice="Intel 8086:2415 AC97" if gui_observed else None,
+                     native60FPSQualified=False,
                      nativeShellMaterialEvents=len(material_observed["events"]) if material_observed else 0,
                      localDraftRestoreQualified=args.profile == "local-draft",
                      qualification=("Mac native local-draft save and cold restore on QEMU"

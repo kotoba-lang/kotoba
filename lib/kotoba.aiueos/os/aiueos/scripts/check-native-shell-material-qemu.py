@@ -49,7 +49,13 @@ def main(args):
         return dict(magic=c[72], keys=c[73], lastKey=c[77],
                     frames=c[79], framesStarted=c[78], packets=c[75],
                     x=c[50], y=c[51], pressed=c[67], reduced=c[99], selected=c[100],
-                    renderError=c[101], focus=s[2], windows=s[1], pending=c[87],
+                    renderError=c[101], effectActive=c[103], clockScale=c[110],
+                    clockMS=c[111], calibration=list(c[126:128]),
+                    frameMS=c[116], maxFrameMS=c[122], missed=c[120],
+                    blurRows=c[123], blurSkipped=c[124], blur=c[125],
+                    sharedEffectsCheck=c[102], mute=c[105], volume=c[106],
+                    audioReady=c[107], event=c[108], eventCount=c[109],
+                    focus=s[2], windows=s[1], pending=c[87],
                     width=s[3], height=s[4],
                     goal="".join(chr(v) for v in s[224:224+n]),
                     ops=[list(s[480+6*i:486+6*i]) for i in range(min(s[416], 259))],
@@ -58,7 +64,8 @@ def main(args):
     guest.state = state
 
     def wait(name, predicate):
-        s = guest.wait(name, predicate, timeout=150)
+        s = guest.wait(name, lambda now: predicate(now) and now["effectActive"] == 0
+                       and now["frames"] == now["framesStarted"], timeout=150)
         assert s["renderError"] == 0 and s["overflow"] == 0 and 0 < s["opCount"] <= 259, s
         for kind, x, y, a, b, _ in s["ops"]:
             assert 1 <= kind <= 6 and x >= 0 and y >= 0
@@ -105,11 +112,14 @@ def main(args):
     try:
         first = wait("first-frame", lambda s: s["magic"] == 0x31545844 and s["frames"] >= 1)
         assert first["windows"] == 0 and first["selected"] == 0 and first["reduced"] == 0
+        assert first["sharedEffectsCheck"] == 1 and first["clockScale"] > 0, first
+        assert first["blurRows"] > 0 and first["audioReady"] == 0
         width, height = first["width"], first["height"]
         assert (width, height) == (1280, 800)
         left, top = (width - 184) // 2, height - 52
         pixels = screenshot("material-home")
-        expected = desktop.expected_background(height - 28, height)
+        expected = tuple(sum(desktop.expected_background(height - 28 + d, height)[c]
+                             for d in range(-2, 3)) // 5 for c in range(3))
         assert pixel(pixels, 100, 100) == desktop.expected_background(100, height)
         assert pixel(pixels, left, top) == desktop.expected_background(top, height), "dock corner must reveal the background"
         tint, alpha = (248, 250, 255), 176
@@ -176,7 +186,10 @@ def main(args):
                   observer=pin(Path(__file__)), desktopObserver=pin(HERE/"check-native-desktop-qemu.py"),
                   transportObserver=pin(HERE/"check-native-draft-restart-qemu.py"),
                   guestEmulation="QEMU TCG", physicalHardware=False,
-                  syntheticInputProvesHumanConsent=False, backdropBlur=False,
+                  syntheticInputProvesHumanConsent=False, backdropBlur=True,
+                  clockCalibration=first["calibration"],
+                  sharedEffectsCheck=first["sharedEffectsCheck"],
+                  blurBounds=dict(radius=2, maxWidth=192, maxHeight=192, scratchBytes=3920),
                   opticalRefraction=False, frameRateQualified=False, audioHaptics=False)
     (out/"native-shell-material-qemu.json").write_text(json.dumps(result, indent=2)+"\n")
     print(result["status"], len(events))

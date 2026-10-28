@@ -1,5 +1,7 @@
 (ns aiueos.native.desktop
-  (:require [aiueos.browser-frame2 :as browser-frame]
+  (:require [browser.effects :as effects]
+            [aiueos.native.audio :as audio]
+            [aiueos.browser-frame2 :as browser-frame]
             [aiueos.session.app-catalog :as app-catalog]
             [aiueos.native.draft-store :as draft-store]
             [aiueos.ed25519 :as ed]
@@ -41,6 +43,120 @@
     (do (put-word s index 0)
         (clear-surface s (+ index 1)))))
 
+;; Effects metadata uses ONLY context words 102..127 (bytes 408..511).
+;; The draft store owns bytes 512..2559 and key state owns bytes 2560..4095.
+;; 102 self-check, 103 active, 104 discontinuities, 105 mute, 106 volume,
+;; 107 audio readiness, 108 last semantic event, 109 event count;
+;; 110 ticks/ms (0=refused), 111 ms, 112/113 last TSC, 114 frame deadline,
+;; 115/116 frame start/duration, 117 input time+1, 118 max input-to-present,
+;; 119 timed frames, 120 missed deadlines, 121 input bytes drained,
+;; 122 max frame ms, 123 blur rows, 124 over-budget blur ops, 125 blur switch,
+;; 126/127 calibration samples. The separate guarded 16KiB desktop-effects
+;; region owns motion state, immutable blur rows and audio DMA. It is entirely
+;; disjoint from the Browser/IME surface, draft store, key state and crypto.
+;; First 8KiB: metadata/channels, retained-list cache and blur scratch.
+;; Second 8KiB: finite audio DMA followed by the retained-list cache tail.
+(defn tsc-value [ctx]
+  (+ (word ctx 112) (* (word ctx 113) 4294967296)))
+
+(defn save-tsc [ctx now]
+  (do (put-word ctx 112 (bit-and now 4294967295))
+      (put-word ctx 113 (quot now 4294967296))))
+
+(defn pit-wait [remaining]
+  (if (= (bit-and (kernel-in-u8 97) 32) 32) 1
+    (if (= remaining 0) 0
+      (do (kernel-pause) (pit-wait (- remaining 1))))))
+
+(defn calibrate-clock []
+  ;; PIT channel 2, mode 0, speaker disabled; 23864 / 1193182 ~= 20 ms.
+  ;; Its independently advancing output calibrates TSC. Never label raw TSC ms.
+  (let [saved (kernel-in-u8 97)
+        gate-low (kernel-out-u8 97 (bit-and saved 252))
+        mode (kernel-out-u8 67 176)
+        lo (kernel-out-u8 66 56)
+        hi (kernel-out-u8 66 93)
+        start (kernel-rdtsc)
+        gate-high (kernel-out-u8 97 (+ (bit-and saved 252) 1))
+        ready (pit-wait 20000000)
+        finish (kernel-rdtsc)
+        restored (kernel-out-u8 97 saved)]
+    (if (and (= ready 1) (> finish start))
+      (+ (quot (- finish start) 20) (* 0 (+ gate-low mode lo hi gate-high restored))) 0)))
+
+(defn clock-step [ctx]
+  (let [now (kernel-rdtsc)
+        before (tsc-value ctx)
+        scale (word ctx 110)
+        elapsed (if (and (> scale 0) (>= now before)) (quot (- now before) scale) 0)]
+    (if (or (< now before) (> elapsed 1000))
+      (do (save-tsc ctx now)
+          (put-word ctx 104 (+ (word ctx 104) 1))
+          ;; Settle motions after a discontinuity; never replay missed frames.
+          (put-word ctx 111 (+ (word ctx 111) (if (> elapsed 1000) elapsed 1000))) 1)
+      (if (> elapsed 0)
+        (do (save-tsc ctx (+ before (* elapsed scale)))
+            (put-word ctx 111 (+ (word ctx 111) elapsed)) 1) 0))))
+
+(defn sound-event [ctx event]
+  ;; Semantic events never grant authority. The native adapter emits a finite
+  ;; local PCM buffer only when its identified device is ready; else silence.
+  (if (or (= (word ctx 105) 1) (= (word ctx 106) 0)) 0
+    (do (put-word ctx 108 event) (put-word ctx 109 (+ (word ctx 109) 1))
+        (audio/play event (word ctx 106) (word ctx 105)))))
+
+(defn motion-target [s ctx k]
+  (let [left (+ (quot (- (word ctx 40) 184) 2) 8 (* 44 (- k 1)))
+        home-x (+ (quot (- (word ctx 40) 704) 2) (* 176 (- k 1)))
+        x (word ctx 50) y (word ctx 51)
+        chosen (if (> (word ctx 100) 0) (if (= (word ctx 100) k) 1 0)
+                 (if (or (and (>= x (- left 4)) (< x (+ left 40))
+                              (>= y (- (word ctx 41) 52)) (< y (word ctx 41)))
+                         (and (= (word s 2) 0) (>= (word ctx 40) 760)
+                              (>= (word ctx 41) 560)
+                              (>= x (- home-x 4)) (< x (+ home-x 164))
+                              (>= y (- (quot (- (word ctx 41) 240) 2) 6))
+                              (< y (+ (quot (- (word ctx 41) 240) 2) 184)))) 1 0))]
+    (if (> (word ctx 87) 0) 0
+      (if (= chosen 1) (if (= (word ctx 67) 1) 384 1024) 0))))
+
+(defn motion-channels [s ctx k]
+  (if (> k 4) 0
+    (let [state (kernel-subregion (kernel-desktop-effects) 16384 0 8192)
+          slot (+ 128 (* (- k 1) 6))
+          semantic (motion-target s ctx k)
+          target (if (= (word ctx 99) 1) 0 semantic)
+          changed (not (= target (word state (+ slot 1))))
+          elapsed (- (word ctx 111) (word state (+ slot 2)))
+          prior (effects/spring (word state slot) (word state (+ slot 1)) elapsed 0)
+          old (if (< prior 0) 0 (if (> prior 1152) 1152 prior))]
+      (do (if (and (> semantic 0) (= (word state (+ slot 4)) 0))
+            (sound-event ctx 1) 0)
+          (put-word state (+ slot 4) semantic)
+          (if changed
+            (do (put-word state slot old) (put-word state (+ slot 1) target)
+                (put-word state (+ slot 2) (word ctx 111))
+                0) 0)
+          (let [age (- (word ctx 111) (word state (+ slot 2)))
+                snap (if (or (= (word ctx 99) 1) (> (word ctx 87) 0)
+                             (= (word ctx 110) 0)) 1 0)
+                raw (effects/spring (word state slot) target age snap)
+                value (if (< raw 0) 0 (if (> raw 1152) 1152 raw))]
+            (do (if (= snap 1)
+                      (do (put-word state slot target)
+                          (put-word state (+ slot 2) (- (word ctx 111) 200))) 0)
+                (put-word state (+ slot 3) value)
+                (if (and (= snap 0) (< age 200) (not (= (word state slot) target)))
+                  (put-word ctx 103 1) 0)))
+          (motion-channels s ctx (+ k 1))))))
+
+(defn update-effects [s ctx]
+  (let [state (kernel-subregion (kernel-desktop-effects) 16384 0 8192)]
+    (do (put-word state 24 (word ctx 105)) (put-word state 25 (word ctx 106))
+        (put-word state 26 (word ctx 125)) (put-word state 27 (word ctx 99))
+        (put-word state 28 (word ctx 107))
+        (put-word ctx 103 0) (motion-channels s ctx 1))))
+
 (defn font-u16 [font font-bytes offset]
   (let [chunk-offset (* (quot offset 16384) 16384)
         chunk-length 16384]
@@ -48,9 +164,96 @@
      (kernel-subregion font 524288 chunk-offset chunk-length)
      chunk-length (- offset chunk-offset))))
 
+;; Previous retained list: exactly 259*24=6216 bytes, split around the fixed
+;; blur/audio buffers. First 3072 bytes at effects+1024; remaining 3144 at
+;; effects+12800. Audio ends at12800, blur occupies4096..8015. No image growth.
+(defn cached-op-word [index]
+  (let [offset (if (< index 768) (+ 1024 (* index 4))
+                 (+ 12800 (* (- index 768) 4)))]
+    (kernel-load-u32 (kernel-subregion (kernel-desktop-effects) 16384 offset 4) 4 0)))
+
+(defn cache-ops [s index end]
+  (if (>= index end) 0
+    (let [offset (if (< index 768) (+ 1024 (* index 4))
+                   (+ 12800 (* (- index 768) 4)))
+          stored (kernel-store-u32 (kernel-subregion (kernel-desktop-effects) 16384 offset 4)
+                                    4 0 (word s (+ 480 index)))]
+      (cache-ops s (+ index (+ 1 (* 0 stored))) end))))
+
+(defn damage-rect [ctx x y w h]
+  (do (if (< x (word ctx 20)) (put-word ctx 20 x) 0)
+      (if (< y (word ctx 21)) (put-word ctx 21 y) 0)
+      (if (> (+ x w) (word ctx 22)) (put-word ctx 22 (+ x w)) 0)
+      (if (> (+ y h) (word ctx 23)) (put-word ctx 23 (+ y h)) 0)))
+
+(defn intersects-damage [ctx x y w h]
+  (if (and (< x (word ctx 22)) (> (+ x w) (word ctx 20))
+           (< y (word ctx 23)) (> (+ y h) (word ctx 21))) 1 0))
+
+(defn op-differs [s index field]
+  (if (>= field 6) 0
+    (if (not (= (word s (+ 480 (* index 6) field)) (cached-op-word (+ (* index 6) field)))) 1
+      (op-differs s index (+ field 1)))))
+
+(defn list-damage [s ctx index old-count]
+  (if (and (>= index (word ctx 31)) (>= index old-count)) 0
+    (do (if (or (>= index old-count) (>= index (word ctx 31))
+                (= (op-differs s index 0) 1))
+          (do (if (< index old-count)
+                (let [base (* index 6) kind (cached-op-word base)]
+                  (damage-rect ctx (cached-op-word (+ base 1)) (cached-op-word (+ base 2))
+                    (cached-op-word (+ base (if (= kind 2) 4 3)))
+                    (if (= kind 2) 16 (cached-op-word (+ base 4))))) 0)
+              (if (< index (word ctx 31))
+                (let [base (+ 480 (* index 6)) kind (word s base)]
+                  (damage-rect ctx (word s (+ base 1)) (word s (+ base 2))
+                    (word s (+ base (if (= kind 2) 4 3)))
+                    (if (= kind 2) 16 (word s (+ base 4))))) 0)) 0)
+        (list-damage s ctx (+ index 1) old-count))))
+
+(defn blur-damage-pass [s ctx index]
+  (if (>= index (word ctx 31)) 0
+    (let [base (+ 480 (* index 6)) kind (word s base)
+          x (word s (+ base 1)) y (word s (+ base 2))
+          w (word s (+ base 3)) h (word s (+ base 4))]
+      (do (if (and (= kind 4) (<= w 192) (<= h 192)
+                   (< (quot (word s (+ base 5)) 16777216) 255)
+                   (= (word ctx 125) 1)
+                   (= (intersects-damage ctx (- x 2) (- y 2) (+ w 4) (+ h 4)) 1))
+            (damage-rect ctx (if (< x 2) 0 (- x 2)) (if (< y 2) 0 (- y 2))
+                         (+ w (if (< x 2) x 2) 2) (+ h (if (< y 2) y 2) 2)) 0)
+          (blur-damage-pass s ctx (+ index 1))))))
+
+(defn close-blur-damage [s ctx remaining]
+  (if (= remaining 0)
+    ;; Pathological dependency chains use full redraw; never under-invalidate.
+    (do (put-word ctx 20 0) (put-word ctx 21 0)
+        (put-word ctx 22 (word ctx 40)) (put-word ctx 23 (word ctx 41)))
+    (let [a (word ctx 20) b (word ctx 21) c (word ctx 22) d (word ctx 23)]
+      (do (blur-damage-pass s ctx 0)
+          (if (and (= a (word ctx 20)) (= b (word ctx 21))
+                   (= c (word ctx 22)) (= d (word ctx 23))) 0
+            (close-blur-damage s ctx (- remaining 1)))))))
+
+(defn frame-damage [s ctx]
+  (let [state (kernel-subregion (kernel-desktop-effects) 16384 0 8192)]
+    (do (put-word ctx 24 1)
+        (if (or (= (word state 49) 0) (= (word state 50) 1))
+          (do (put-word ctx 20 0) (put-word ctx 21 0)
+              (put-word ctx 22 (word ctx 40)) (put-word ctx 23 (word ctx 41)))
+          (do (put-word ctx 20 (word ctx 40)) (put-word ctx 21 (word ctx 41))
+              (put-word ctx 22 0) (put-word ctx 23 0)
+              (list-damage s ctx 0 (word state 48))
+              (close-blur-damage s ctx 8)))
+        (if (> (word ctx 22) (word ctx 40)) (put-word ctx 22 (word ctx 40)) 0)
+        (if (> (word ctx 23) (word ctx 41)) (put-word ctx 23 (word ctx 41)) 0))))
+
 (defn framebuffer-pixel [fb fb-bytes offset ctx]
-  (let [page (kernel-framebuffer-page (quot offset 4096))]
-    (kernel-store-u32-4k page 4096 (mod offset 4096) (word ctx 6))))
+  (let [x (mod (quot offset 4) (word ctx 42))
+        y (quot (quot offset 4) (word ctx 42))]
+    (if (or (= (word ctx 24) 0) (= (intersects-damage ctx x y 1 1) 1))
+      (let [page (kernel-framebuffer-page (quot offset 4096))]
+        (kernel-store-u32-4k page 4096 (mod offset 4096) (word ctx 6))) 0)))
 
 (defn gop-color [ctx rgb]
   ;; GOP format 0 stores R,G,B bytes; frame2 colours are 0xRRGGBB. Format 1
@@ -69,14 +272,41 @@
 ;; Work words in the renderer context:
 ;;   0..9 rectangle cursor/bounds, 10..11 glyph row and mask
 ;;   30 current op, 31 op count, 32..37 saved op, 40..45 GOP metadata
+(defn fill-page-span [page offset end color]
+  (if (>= offset end) 0
+    (if (and (= (mod offset 8) 0) (<= (+ offset 64) end))
+      (let [pair (+ color (* color 4294967296))
+            a (kernel-store-u64-4k page 4096 offset pair)
+            b (kernel-store-u64-4k page 4096 (+ offset 8) pair)
+            c (kernel-store-u64-4k page 4096 (+ offset 16) pair)
+            d (kernel-store-u64-4k page 4096 (+ offset 24) pair)
+            e (kernel-store-u64-4k page 4096 (+ offset 32) pair)
+            f (kernel-store-u64-4k page 4096 (+ offset 40) pair)
+            g (kernel-store-u64-4k page 4096 (+ offset 48) pair)
+            h (kernel-store-u64-4k page 4096 (+ offset 56) pair)]
+        (fill-page-span page (+ offset (+ 64 (* 0 (+ a b c d e f g h)))) end color))
+      (let [stored (kernel-store-u32-4k page 4096 offset color)]
+        (fill-page-span page (+ offset (+ 4 (* 0 stored))) end color)))))
+
 (defn fill-row [s fb fb-bytes ctx offset]
-  (if (>= offset (word ctx 8))
-    0
-    (do (framebuffer-pixel fb fb-bytes offset ctx)
-        (fill-row s fb fb-bytes ctx (+ offset 4)))))
+  (if (>= offset (word ctx 8)) 0
+    (let [row (quot offset (* (word ctx 42) 4))
+          clipped (= (word ctx 24) 1)
+          left (* (+ (* row (word ctx 42)) (word ctx 20)) 4)
+          right (* (+ (* row (word ctx 42)) (word ctx 22)) 4)
+          first (if (and clipped (< offset left)) left offset)
+          last (if (and clipped (< right (word ctx 8))) right (word ctx 8))]
+      (if (or (>= first last) (and clipped (or (< row (word ctx 21)) (>= row (word ctx 23))))) 0
+        (let [page (kernel-framebuffer-page (quot first 4096))
+              limit (* (+ (quot first 4096) 1) 4096)
+              end (if (< last limit) last limit)]
+          (do (fill-page-span page (mod first 4096) (- end (- limit 4096)) (word ctx 6))
+              (fill-row s fb fb-bytes ctx end)))))))
 
 (defn fill-rect [s fb fb-bytes ctx row]
-  (if (>= row (word ctx 9))
+  (if (and (= (word ctx 24) 1) (< row (word ctx 21)))
+    (fill-rect s fb fb-bytes ctx (word ctx 21))
+    (if (or (>= row (word ctx 9)) (and (= (word ctx 24) 1) (>= row (word ctx 23))))
     0
     (do (put-word ctx 0 row)
         (put-word ctx 8
@@ -84,7 +314,7 @@
                         (word ctx 2) (word ctx 4)) 4))
         (fill-row s fb fb-bytes ctx
                   (* (+ (* row (word ctx 42)) (word ctx 2)) 4))
-        (fill-rect s fb fb-bytes ctx (+ row 1)))))
+        (fill-rect s fb fb-bytes ctx (+ row 1))))))
 
 ;; Native material ops: rounded solid (3), alpha-tinted glass (4), rounded
 ;; RGB565 gradient (5), rectangular RGB565 gradient (6). All coordinates and
@@ -109,18 +339,103 @@
       (if (<= (+ (* dx dx) (* dy dy)) (* radius radius)) x
         (corner-inset radius edge (+ x 1))))))
 
-(defn blend-row [ctx offset]
-  (if (>= offset (word ctx 8)) 0
-    (let [page (kernel-framebuffer-page (quot offset 4096))
-          under (kernel-load-u32-4k page 4096 (mod offset 4096))
+(defn blend-page-span [page ctx offset end]
+  (if (>= offset end) 0
+    (let [under (kernel-load-u32-4k page 4096 offset)
           color (if (and (= (word ctx 19) 1) (= under (word ctx 17)))
                   (word ctx 18) (blend-rgb under (word ctx 6) (word ctx 12)))
-          stored (kernel-store-u32-4k page 4096 (mod offset 4096) color)]
+          stored (kernel-store-u32-4k page 4096 offset color)]
       (do (put-word ctx 17 under) (put-word ctx 18 color) (put-word ctx 19 1)
-          (blend-row ctx (+ offset (+ 4 (* 0 stored))))))))
+          (blend-page-span page ctx (+ offset (+ 4 (* 0 stored))) end)))))
+
+(defn blend-row [ctx offset]
+  (if (>= offset (word ctx 8)) 0
+    (let [row (quot offset (* (word ctx 42) 4))
+          clipped (= (word ctx 24) 1)
+          left (* (+ (* row (word ctx 42)) (word ctx 20)) 4)
+          right (* (+ (* row (word ctx 42)) (word ctx 22)) 4)
+          first (if (and clipped (< offset left)) left offset)
+          last (if (and clipped (< right (word ctx 8))) right (word ctx 8))]
+      (if (or (>= first last) (and clipped (or (< row (word ctx 21)) (>= row (word ctx 23))))) 0
+        (let [page (kernel-framebuffer-page (quot first 4096))
+              limit (* (+ (quot first 4096) 1) 4096)
+              end (if (< last limit) last limit)]
+          (do (blend-page-span page ctx (mod first 4096) (- end (- limit 4096)))
+              (blend-row ctx end)))))))
+
+;; Bounded separable 5x5 backdrop blur for navigation/control surfaces <=192px.
+;; Five rows retain ORIGINAL horizontal-filtered backdrop pixels. A scanline
+;; is replaced only after its future halo row was captured; no output feeds
+;; back into a subsequent sample. Viewport edges extend the nearest pixel.
+;; Large titlebars keep tint; ctx124 exposes the explicit resource fallback.
+(defn bounded-coordinate [v extent]
+  (if (< v 0) 0 (if (>= v extent) (- extent 1) v)))
+
+(defn backdrop-pixel [ctx x y]
+  (let [px (bounded-coordinate x (word ctx 40))
+        py (bounded-coordinate y (word ctx 41))
+        offset (* (+ (* py (word ctx 42)) px) 4)
+        page (kernel-framebuffer-page (quot offset 4096))]
+    (kernel-load-u32-4k page 4096 (mod offset 4096))))
+
+(defn channel-average5 [a b c d e shift]
+  (quot (+ (bit-and (quot a shift) 255) (bit-and (quot b shift) 255)
+           (bit-and (quot c shift) 255) (bit-and (quot d shift) 255)
+           (bit-and (quot e shift) 255)) 5))
+
+(defn average5 [a b c d e]
+  (+ (* (channel-average5 a b c d e 65536) 65536)
+     (* (channel-average5 a b c d e 256) 256)
+     (channel-average5 a b c d e 1)))
+
+(defn capture-blur-row [ctx state source-row ring-row x]
+  (if (>= x (word ctx 4)) 0
+    (let [px (+ (word ctx 2) x)
+          color (average5 (backdrop-pixel ctx (- px 2) source-row)
+                          (backdrop-pixel ctx (- px 1) source-row)
+                          (backdrop-pixel ctx px source-row)
+                          (backdrop-pixel ctx (+ px 1) source-row)
+                          (backdrop-pixel ctx (+ px 2) source-row))]
+      (do (put-word state (+ 1024 (* ring-row 196) x) color)
+          (capture-blur-row ctx state source-row ring-row (+ x 1))))))
+
+(defn seed-blur-rows [ctx index]
+  (if (>= index 5) 0
+    (do (capture-blur-row ctx (kernel-subregion (kernel-desktop-effects) 16384 0 8192)
+                          (+ (word ctx 3) (- index 2)) index 0)
+        (seed-blur-rows ctx (+ index 1)))))
+
+(defn blur-row [ctx state row x end]
+  (if (>= x end) 0
+    (let [index (+ 1024 x)
+          under (average5 (word state index) (word state (+ index 196))
+                          (word state (+ index 392)) (word state (+ index 588))
+                          (word state (+ index 784)))
+          offset (* (+ (* row (word ctx 42)) (word ctx 2) x) 4)
+          page (kernel-framebuffer-page (quot offset 4096))
+          stored (kernel-store-u32-4k page 4096 (mod offset 4096)
+                                     (blend-rgb under (word ctx 6) (word ctx 12)))]
+      (blur-row ctx state row (+ x (+ 1 (* 0 stored))) end))))
+
+(defn blur-rows [ctx local]
+  (if (>= local (word ctx 5)) 0
+    (let [bottom (- (- (word ctx 5) 1) local)
+          edge (if (< local bottom) local bottom)
+          inset (corner-inset (word ctx 13) edge 0)]
+      (do (blur-row ctx (kernel-subregion (kernel-desktop-effects) 16384 0 8192)
+                    (+ (word ctx 3) local) inset (- (word ctx 4) inset))
+          ;; The row about to leave the ring was already sampled. Capture
+          ;; y+3 before its framebuffer row can be overwritten by the blur.
+          (if (< (+ local 1) (word ctx 5))
+            (capture-blur-row ctx (kernel-subregion (kernel-desktop-effects) 16384 0 8192)
+                              (+ (word ctx 3) local 3) (mod local 5) 0) 0)
+          (put-word ctx 123 (+ (word ctx 123) 1))
+          (blur-rows ctx (+ local 1))))))
 
 (defn material-rows [s fb fb-bytes ctx row]
-  (if (>= row (word ctx 9)) 0
+  (if (and (= (word ctx 24) 1) (< row (word ctx 21)))
+    (material-rows s fb fb-bytes ctx (word ctx 21))
+    (if (or (>= row (word ctx 9)) (and (= (word ctx 24) 1) (>= row (word ctx 23)))) 0
     (let [local (- row (word ctx 3))
           bottom (- (- (word ctx 5) 1) local)
           edge (if (< local bottom) local bottom)
@@ -140,7 +455,7 @@
           (put-word ctx 19 0)
           (if (= (word ctx 12) 255) (fill-row s fb fb-bytes ctx offset)
             (blend-row ctx offset))
-          (material-rows s fb fb-bytes ctx (+ row 1))))))
+          (material-rows s fb fb-bytes ctx (+ row 1)))))))
 
 (defn material-rect [s fb fb-bytes ctx]
   (let [rw (quot (word ctx 4) 2)
@@ -148,7 +463,43 @@
         radius (if (< rw rh) rw rh)]
     (do (put-word ctx 12 (if (= (word ctx 15) 4) (quot (word ctx 37) 16777216) 255))
         (put-word ctx 13 (if (= (word ctx 15) 6) 0 (if (> radius 12) 12 radius)))
-        (material-rows s fb fb-bytes ctx (word ctx 3)))))
+        (if (and (= (word ctx 15) 4) (< (word ctx 12) 255)
+                 (= (word ctx 125) 1) (<= (word ctx 4) 192)
+                 (<= (word ctx 5) 192) (= (word ctx 87) 0))
+          (do (seed-blur-rows ctx 0) (blur-rows ctx 0))
+          (do (if (and (= (word ctx 15) 4) (< (word ctx 12) 255)
+                       (= (word ctx 125) 1))
+                (put-word ctx 124 (+ (word ctx 124) 1)) 0)
+              (material-rows s fb fb-bytes ctx (word ctx 3)))))))
+
+(defn blur-test-stripes [s ctx x]
+  (if (>= x 80) 0
+    (do (put-word ctx 2 x) (put-word ctx 3 0) (put-word ctx 4 1)
+        (put-word ctx 5 40) (put-word ctx 9 40)
+        (put-word ctx 6 (if (= (mod x 2) 0) 0 16777215))
+        (fill-rect s 0 0 ctx 0) (blur-test-stripes s ctx (+ x 1)))))
+
+(defn blur-self-check [s ctx]
+  ;; A native pixel oracle against fixed, independently derived values. The
+  ;; first regular frame replaces this small boot fixture before desktop use.
+  ;; 5x5 black/white stripes -> 102/153; white tint alpha128 -> 178/204.
+  (do (blur-test-stripes s ctx 0)
+      (put-word ctx 2 8) (put-word ctx 3 4) (put-word ctx 4 64)
+      (put-word ctx 5 32) (put-word ctx 15 4)
+      (put-word ctx 6 16777215) (put-word ctx 37 0x80ffffff)
+      (material-rect s 0 0 ctx)
+      (let [a (backdrop-pixel ctx 20 16) b (backdrop-pixel ctx 21 16)
+            outside (backdrop-pixel ctx 0 16)]
+        (do (put-word ctx 87 1)
+            (blur-test-stripes s ctx 0)
+            (put-word ctx 2 8) (put-word ctx 3 4) (put-word ctx 4 64)
+            (put-word ctx 5 32) (put-word ctx 15 4)
+            (put-word ctx 6 16777215) (put-word ctx 37 0x80ffffff)
+            (material-rect s 0 0 ctx)
+            (let [plain (backdrop-pixel ctx 20 16)]
+              (do (put-word ctx 87 0)
+                  (if (and (= a 0xb2b2b2) (= b 0xcccccc)
+                           (= outside 0) (= plain 0x808080)) 1 0)))))))
 
 (defn paint-glyph-pixels [s font fb fb-bytes ctx]
   (if (>= (word ctx 4) 16)
@@ -190,6 +541,8 @@
           (put-word ctx 35 b)
           (put-word ctx 36 (gop-color ctx (bit-and rgb 16777215)))
           (put-word ctx 37 rgb)
+          (if (and (= (word ctx 24) 1)
+                   (= (intersects-damage ctx x y (if (= kind 2) b a) (if (= kind 2) 16 b)) 0)) 0
           (if (or (= kind 1) (and (>= kind 3) (<= kind 6)))
             (do (put-word ctx 2 x)
                 (put-word ctx 3 y)
@@ -207,11 +560,15 @@
                 (put-word ctx 5 0)
                 (put-word ctx 6 (word ctx 36))
                 (put-word ctx 11 (glyph-mask-start (word ctx 34)))
-                (paint-glyph-pixels s font fb fb-bytes ctx)))
+                (paint-glyph-pixels s font fb fb-bytes ctx))))
           (put-word ctx 30 (+ (word ctx 30) 1))
           (present-ops s font fb fb-bytes ctx)))))
 
 (defn present-frame [s font fb fb-bytes ctx]
+  (clock-step ctx)
+  (put-word ctx 115 (word ctx 111))
+  (update-effects s ctx)
+  (inertia-step s ctx)
   (put-word ctx 78 (+ (word ctx 78) 1))
   ;; Pointer y keeps visual-only flags above its low 16-bit coordinate:
   ;; press, reduced effects and dock selection. These never carry authority.
@@ -224,8 +581,25 @@
   ;; The stored count is u32: a negative renderer result wraps above 259.
   ;; Never walk that value as an op count, even after a refused material/frame.
   (put-word ctx 101 (if (> (word ctx 31) 259) (word ctx 31) 0))
-  (let [result (if (> (word ctx 31) 259) 0 (present-ops s font fb fb-bytes ctx))]
-    (do (put-word ctx 79 (+ (word ctx 79) 1)) result)))
+  (let [result (if (> (word ctx 31) 259) 0
+                 (do (frame-damage s ctx)
+                     (if (and (< (word ctx 20) (word ctx 22)) (< (word ctx 21) (word ctx 23)))
+                       (present-ops s font fb fb-bytes ctx) 0)
+                     (cache-ops s 0 (* (word ctx 31) 6))
+                     (let [state (kernel-subregion (kernel-desktop-effects) 16384 0 8192)]
+                       (do (put-word state 48 (word ctx 31)) (put-word state 49 1)))))]
+    (do (clock-step ctx)
+        (put-word ctx 116 (- (word ctx 111) (word ctx 115)))
+        (if (> (word ctx 116) (word ctx 122)) (put-word ctx 122 (word ctx 116)) 0)
+        (if (> (word ctx 116) 16)
+          (put-word ctx 120 (+ (word ctx 120) (quot (word ctx 116) 16))) 0)
+        (if (> (word ctx 117) 0)
+          (do (if (> (- (+ (word ctx 111) 1) (word ctx 117)) (word ctx 118))
+                (put-word ctx 118 (- (+ (word ctx 111) 1) (word ctx 117))) 0)
+              (put-word ctx 117 0)) 0)
+        (put-word ctx 119 (+ (word ctx 119) 1))
+        (put-word ctx 114 (+ (word ctx 111) 16))
+        (put-word ctx 79 (+ (word ctx 79) 1)) result)))
 
 (defn seed-app-label [s id index]
   (let [slot (+ 32 (* 32 (- id 1)))
@@ -740,6 +1114,13 @@
       (if (or (= code 49) (= code 1))
         (do (put-word ctx 87 0) (put-word s 2039 (- (word s 2039) 1)) (seed-app-label s 2 0) 1)
         0))
+  (if (= code 61)
+    (let [state (kernel-subregion (kernel-desktop-effects) 16384 0 8192)]
+      (do (put-word state 50 (- 1 (word state 50))) (put-word state 49 0) 1))
+  (if (= code 62) (do (put-word ctx 125 (- 1 (word ctx 125)))
+                     (put-word (kernel-subregion (kernel-desktop-effects) 16384 0 8192) 49 0) 1)
+  (if (= code 87) (do (put-word ctx 105 (- 1 (word ctx 105))) (audio/stop) 1)
+  (if (= code 88) (do (put-word ctx 106 (mod (+ (word ctx 106) 25) 125)) (audio/stop) 1)
   (if (= code 75) (select-dock s ctx -1)
   (if (= code 77) (select-dock s ctx 1)
   (if (= code 68) (do (put-word ctx 99 (- 1 (word ctx 99))) 1)
@@ -772,7 +1153,7 @@
             (if (= code 5) (launch-key s ctx 4)
               (if (= code 67) (collapse-focused s (word ctx 41))
                 (if (= code 64) (minimize-focused s)
-                  (if (= code 66) (open-key-request s ctx) (if (= code 65) (open-sign-request s ctx) 0))))))))))))))))))))))
+                  (if (= code 66) (open-key-request s ctx) (if (= code 65) (open-sign-request s ctx) 0))))))))))))))))))))))))))
 
 (defn clamp-coordinate [value extent]
   (if (< value 0) 0
@@ -873,6 +1254,37 @@
                       (clamp-between (+ y dy) 28 (- height window-height)))
             1))))))
 
+(defn inertia-step [s ctx]
+  (let [state (kernel-subregion (kernel-desktop-effects) 16384 0 8192)
+        id (word state 32) age (- (word ctx 111) (word state 33))]
+    (if (= id 0) 0
+      (if (or (> (word ctx 87) 0) (= (word ctx 99) 1) (= (word ctx 110) 0))
+        (put-word state 32 0)
+        (let [dx (effects/inertia (- (word state 34) 512) age)
+              dy (effects/inertia (- (word state 35) 512) age)]
+          (do (move-window-id s id (- dx (- (word state 36) 64))
+                              (- dy (- (word state 37) 64))
+                              (word ctx 40) (word ctx 41))
+              (put-word state 36 (+ dx 64)) (put-word state 37 (+ dy 64))
+              (if (>= age 180) (put-word state 32 0) (put-word ctx 103 1))))))))
+
+(defn drag-sample [ctx dx dy]
+  (let [state (kernel-subregion (kernel-desktop-effects) 16384 0 8192)
+        dt (- (word ctx 111) (word state 38))]
+    (do (put-word state 34 (+ 512 (if (and (> dt 0) (< dt 100))
+                                  (clamp-between (quot (* dx 1000) dt) -200 200) 0)))
+        (put-word state 35 (+ 512 (if (and (> dt 0) (< dt 100))
+                                  (clamp-between (quot (* dy 1000) dt) -200 200) 0)))
+        (put-word state 38 (word ctx 111)))))
+
+(defn drag-release [ctx]
+  (let [state (kernel-subregion (kernel-desktop-effects) 16384 0 8192)]
+    (if (and (> (word ctx 71) 0) (= (word ctx 87) 0) (= (word ctx 99) 0)
+             (< (- (word ctx 111) (word state 38)) 100))
+      (do (put-word state 32 (word ctx 71))
+          (put-word state 33 (word ctx 111))
+          (put-word state 36 64) (put-word state 37 64)) 0)))
+
 ;; Collapse (roll up to the titlebar): the validated minimum window height is 29.
 ;; Unrolling restores launch-app's height and keeps the window on screen. A
 ;; click on the control left of close, or F9 (scancode 67), toggles it.
@@ -962,14 +1374,20 @@
           (if (> (word ctx 87) 0)
             (consent-click s ctx x y)
             (let [drag-id (titlebar-drag-id s x y (word ctx 40) (word ctx 41))]
-              (do (put-word ctx 76 (+ (word ctx 76) 1))
-                (click-launcher s ctx)
+              (do (put-word (kernel-subregion (kernel-desktop-effects) 16384 0 8192) 32 0)
+                (drag-sample ctx 0 0)
+                (put-word ctx 76 (+ (word ctx 76) 1))
+                (let [old-focus (word s 2) old-count (word s 1)
+                      result (click-launcher s ctx)]
+                  (if (or (not (= old-focus (word s 2))) (not (= old-count (word s 1))))
+                    (sound-event ctx (if (< (word s 1) old-count) 3 2)) (+ 0 (* 0 result))))
                 (put-word ctx 71
                           drag-id))))
           (if (and (= left 1) (> (word ctx 71) 0) (= (word ctx 87) 0))
-            (move-window-id s (word ctx 71) (- x old-x) (- y old-y)
-                            (word ctx 40) (word ctx 41))
-            (if (= left 0) (put-word ctx 71 0) 0)))
+            (do (drag-sample ctx (- x old-x) (- y old-y))
+                (move-window-id s (word ctx 71) (- x old-x) (- y old-y)
+                                (word ctx 40) (word ctx 41)))
+            (if (= left 0) (do (drag-release ctx) (put-word ctx 71 0)) 0)))
         (put-word ctx 67 left)
         1)))
 
@@ -1001,7 +1419,16 @@
                 0
                 (do (put-word ctx 73 (+ (word ctx 73) 1))
                     (put-word ctx 77 (word ctx 69))
-                    (reduce-key s (word ctx 69) ctx) 1)))))))
+                    (put-word (kernel-subregion (kernel-desktop-effects) 16384 0 8192) 32 0)
+                    (let [old-focus (word s 2) old-windows (word s 1)
+                          old-pending (word ctx 87) old-choice (word ctx 100)
+                          result (reduce-key s (word ctx 69) ctx)]
+                      (if (and (> result 0)
+                               (or (not (= old-focus (word s 2)))
+                                   (not (= old-windows (word s 1)))
+                                   (not (= old-pending (word ctx 87)))
+                                   (and (> old-choice 0) (= (word ctx 100) 0))))
+                        (sound-event ctx (if (or (= (word ctx 69) 1) (= (word ctx 69) 49)) 3 2)) 0)) 1)))))))
 
 (defn wait-controller [remaining]
   (if (= (bit-and (kernel-in-u8 100) 2) 0)
@@ -1019,15 +1446,36 @@
       (kernel-out-u8 96 244)
       0))
 
+(defn discard-queued-input [ctx remaining]
+  (if (or (= remaining 0) (= (bit-and (kernel-in-u8 100) 1) 0)) 0
+    (let [discarded (kernel-in-u8 96)]
+      (do (put-word ctx 63 0)
+          (discard-queued-input ctx (- remaining (+ 1 (* 0 discarded))))))))
+
+(defn drain-input [s ctx remaining changed]
+  (if (or (= remaining 0) (= (word ctx 85) 1)
+          (= (bit-and (kernel-in-u8 100) 1) 0)) changed
+    (let [pending (word ctx 87)
+          result (poll-input s ctx)]
+      (do (put-word ctx 121 (+ (word ctx 121) 1))
+          ;; A newly displayed operation cannot consume the remainder of the
+          ;; old hardware batch as its choice. Flush available bytes and draw
+          ;; the modal panel before returning to ordinary ingress.
+          (if (not (= pending (word ctx 87)))
+            (do (discard-queued-input ctx 256) 1)
+            (drain-input s ctx (- remaining 1) (if (> result 0) 1 changed)))))))
+
 (defn desktop-loop [s font fb fb-bytes ctx]
-  (do (put-word ctx 70 (poll-input s ctx))
+  (do (clock-step ctx)
+      (put-word ctx 70 (drain-input s ctx 64 0))
       (if (> (word ctx 70) 0)
-        (present-frame s font fb fb-bytes ctx)
-        0)
-      (if (= (word ctx 85) 1)
-        1
-        (do (kernel-pause)
-            (desktop-loop s font fb fb-bytes ctx)))))
+        (do (if (= (word ctx 117) 0) (put-word ctx 117 (+ (word ctx 111) 1)) 0)
+            (present-frame s font fb fb-bytes ctx))
+        (if (and (= (word ctx 103) 1) (> (word ctx 110) 0)
+                 (>= (word ctx 111) (word ctx 114)))
+          (present-frame s font fb fb-bytes ctx) 0))
+      (if (= (word ctx 85) 1) 1
+        (do (kernel-pause) (desktop-loop s font fb fb-bytes ctx)))))
 
 ;; W3a (ADR-0277): which hardware entropy instructions the CPU reports. Word 90 of
 ;; the context: bit 0 = RDRAND (CPUID.1:ECX bit 30), bit 1 = RDSEED (CPUID.7:EBX
@@ -1094,6 +1542,31 @@
             (put-word context 90 (entropy-flags))
             (put-word context 91 (entropy-draw (word context 90)))
             (put-word context 92 (entropy-draw (word context 90)))
+            (clear-surface (kernel-subregion (kernel-desktop-effects) 16384 0 8192) 0)
+            (put-word (kernel-subregion (kernel-desktop-effects) 16384 0 8192) 0 0x31584645)
+            (put-word context 24 0)
+            (put-word context 102 (effects/self-check))
+            (put-word context 103 0) (put-word context 104 0)
+            (put-word context 105 0) (put-word context 106 25)
+            (put-word context 107 0) (put-word context 108 0)
+            (put-word context 109 0)
+            (put-word context 126 (calibrate-clock))
+            (put-word context 127 (calibrate-clock))
+            (let [a (word context 126) b (word context 127)
+                  difference (if (> a b) (- a b) (- b a))]
+              (put-word context 110
+                (if (and (> a 1000) (< a 100000000) (> b 1000)
+                         (< (* difference 100) (* a 5))) (quot (+ a b) 2) 0)))
+            (put-word context 111 1000)
+            (save-tsc context (kernel-rdtsc))
+            (put-word context 114 0) (put-word context 117 0)
+            (put-word context 118 0) (put-word context 119 0)
+            (put-word context 120 0) (put-word context 121 0)
+            (put-word context 122 0) (put-word context 123 0)
+            (put-word context 124 0) (put-word context 125 1)
+            (put-word (kernel-subregion (kernel-desktop-effects) 16384 0 8192)
+                      1 (blur-self-check surface context))
+            (put-word context 107 (audio/initialize))
             (enable-mouse)
             (clear-surface surface 0)
             (seed-desktop surface width height)
