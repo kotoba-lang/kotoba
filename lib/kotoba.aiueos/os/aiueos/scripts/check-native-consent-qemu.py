@@ -228,12 +228,43 @@ def main(args):
         event("key-allow", fingerprint=pub[:3].hex(), publicKey=pub.hex(), proofMessage=proof.decode(),
               signature=sig.hex(), verifies=True, foreignKeyRefused=True, changedMessageRefused=True,
               changedSignatureRefused=True, seedDisplayed=False, persisted=False)
+        # --- W3 consent-bound signing (F7): a sign request of its own kind, its own consent text ---
+        base = S(2039)
+        sig_words = lambda: [W(800 + i) for i in range(16)]
+        challenge = b"itonami-w3-sign-test"
+        assert W(87) == 0 and base & 3 == 0 and (base >> 31) == 0 and sig_words() == [0] * 16
+        send("sendkey f7", 1.5)
+        assert W(87) == 3 and S(2039) == base + 2**31 + 3, (W(87), hex(S(2039)))
+        sign_panel = screenshot("sign-request")
+        def panel_band(shot, y0, y1):
+            wd = shot[0]
+            return [shot[2][3 * (y * wd + x):3 * (y * wd + x) + 3] for y in range(py + y0, py + y1) for x in range(px + 20, px + 460)]
+        assert panel_band(sign_panel, 52, 100) == panel_band(key_panel, 52, 100), "service/endpoint lines must be the key request's"
+        assert panel_band(sign_panel, 100, 156) != panel_band(key_panel, 100, 156), "action/data lines must differ from the key request"
+        send("sendkey n", 1.5)
+        assert W(87) == 0 and S(2039) == base and sig_words() == [0] * 16 and W(94) == 5
+        event("sign-deny", signatureWords=sig_words(), approvedCount=(S(2039) >> 2) & 15, signed=False)
+        send("sendkey f7", 1.5); assert W(87) == 3
+        send("sendkey y", 3.0)
+        assert W(87) == 0 and W(94) == 4 and S(2039) & 3 == 0 and (S(2039) >> 31) == 0, (W(87), W(94), hex(S(2039)))
+        assert (S(2039) >> 2) & 15 == ((base >> 2) & 15) + 1 and (S(2039) >> 6) & 1 == 1
+        pub2 = b"".join(struct.pack("<I", W(320 + i)) for i in range(8))
+        sig2 = b"".join(struct.pack("<I", W(800 + i)) for i in range(16))
+        assert pub2 == pub and sig2 != bytes(64)
+        assert ed_verify(pub2, challenge, sig2), "the challenge signature does not verify under the device key"
+        assert not ed_verify(foreign, challenge, sig2), "a foreign key must not verify"
+        assert not ed_verify(pub2, challenge + b"!", sig2), "a changed challenge must not verify"
+        assert not ed_verify(pub2, proof, sig2), "a challenge signature must not verify as the key proof"
+        assert not ed_verify(pub2, challenge, sig), "the key-proof signature must not verify as the challenge signature"
+        event("sign-allow", challenge=challenge.decode(), signature=sig2.hex(), verifies=True,
+              foreignKeyRefused=True, changedChallengeRefused=True, notTheKeyProof=True,
+              approvedCount=(S(2039) >> 2) & 15, seedDisplayed=False)
         move_to(px + 24 + 70, py + 164 + 18)
         before_allow = screenshot("before-allow")
-        assert (S(2039) >> 2) & 15 == 1 and S(2039) & 3 == 0
+        assert (S(2039) >> 2) & 15 == 2 and S(2039) & 3 == 0
         send("sendkey ret", 1.5); assert W(87) == 1 and S(2039) & 3 == 1
         move_to(px + 24 + 70, py + 164 + 18); click()
-        assert W(87) == 0 and (S(2039) >> 2) & 15 == 2 and S(2039) & 3 == 0 and W(88) == 1 and W(85) == 1
+        assert W(87) == 0 and (S(2039) >> 2) & 15 == 3 and S(2039) & 3 == 0 and W(88) == 1 and W(85) == 1
         after_allow = screenshot("after-allow")
         w0, h0, p0 = before_allow
         assert (w0, h0) == after_allow[:2]
