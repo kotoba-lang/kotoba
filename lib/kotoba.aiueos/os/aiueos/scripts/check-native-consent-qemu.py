@@ -235,6 +235,20 @@ def main(args):
         keyname = lambda ch: "spc" if ch == " " else ch
         def type_text(text):
             for ch in text: send("sendkey " + keyname(ch), 0.6)
+        # the pointer answers the key request like the keyboard, and the panel is modal for it too
+        send("sendkey f8", 1.5); assert W(87) == 2 and S(2039) == 3
+        windows_before = S(1)
+        move_to(150, 14); click()
+        assert W(87) == 2 and S(1) == windows_before and S(2039) == 3, "a click under the key request must do nothing"
+        move_to(px + 180 + 70, py + 164 + 18); click()
+        assert W(87) == 0 and S(2039) == 0 and W(94) == 3 and seed_words() == [0] * 8, "Deny by pointer on the key request"
+        event("key-request-pointer", modalClickIgnored=True, denyByPointer=True)
+        send("sendkey f8", 1.5); assert W(87) == 2
+        move_to(px + 24 + 70, py + 164 + 18); click()
+        assert W(87) == 4 and S(2039) == 3 + 2**31 and seed_words() == [0] * 8, "Allow by pointer opens the passphrase request"
+        move_to(px + 180 + 70, py + 164 + 18); click()
+        assert W(87) == 0 and S(2039) == 0 and W(94) == 6 and seed_words() == [0] * 8, "Cancel by pointer on the passphrase request"
+        event("passphrase-pointer", allowOpens=True, cancelByPointer=True)
         send("sendkey f8", 1.5); assert W(87) == 2 and S(2039) == 3
         send("sendkey y", 1.5)
         assert W(87) == 4 and S(2039) == 3 + 2**31 and seed_words() == [0] * 8, (W(87), hex(S(2039)))

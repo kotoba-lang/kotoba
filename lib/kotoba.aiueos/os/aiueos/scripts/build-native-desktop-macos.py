@@ -319,7 +319,7 @@ def main(args):
                            else "PASS_NATIVE_KEYSTORE_QEMU" if args.profile == "keystore"
                            else "PASS_NATIVE_DESKTOP_INPUT_QEMU")
         expected_events = (12 if args.profile == "local-draft"
-                           else 18 if args.profile == "consent"
+                           else 20 if args.profile == "consent"
                            else 4 if args.profile == "idle"
                            else 4 if args.profile == "ed25519"
                            else 14 if args.profile == "keystore"
@@ -399,7 +399,7 @@ def main(args):
                         "first-frame", "entropy-probe", "itonami-goal-typed", "collapse-key", "collapse-click",
                         "consent-open",
                         "launcher-key-ignored", "launcher-click-ignored", "key-deny",
-                        "pointer-deny", "esc-deny", "key-deny", "passphrase-cancel", "key-allow",
+                        "pointer-deny", "esc-deny", "key-deny", "key-request-pointer", "passphrase-pointer", "passphrase-cancel", "key-allow",
                         "sign-deny", "sign-allow", "draft-after-key", "pointer-allow"]
                     or observed["syntheticInputProvesHumanConsent"]):
                 raise ValueError("consent surface verdict is incomplete")
