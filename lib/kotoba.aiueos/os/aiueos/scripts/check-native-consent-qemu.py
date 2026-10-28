@@ -66,6 +66,18 @@ def ed_verify(pub, msg, sig):
     k = int.from_bytes(hashlib.sha512(sig[:32] + pub + msg).digest(), "little") % _L
     return _enc(_mul(s, _B)) == _enc(_add(r, _mul(k, a)))
 
+def _kdf(pw, salt, iters):
+    h = hashlib.sha512(pw.ljust(32, b"\0") + salt).digest()
+    for _ in range(iters - 1): h = hashlib.sha512(h + salt).digest()
+    return h
+
+def unseal(pw, blob, iters=1024):
+    """The aiueos.keyseal construction: blob = salt16 || ct32 || tag16; None when the tag does not match."""
+    salt, ct, tag = blob[:16], blob[16:48], blob[48:]
+    k = _kdf(pw, salt, iters)
+    if hashlib.sha512(k[32:] + salt + ct).digest()[:16] != tag: return None
+    return bytes(a ^ b for a, b in zip(ct, k[:32]))
+
 def main(args):
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=False)
@@ -203,8 +215,41 @@ def main(args):
         assert W(87) == 0 and S(2039) == 0 and seed_words() == [0] * 8 and W(94) == 3
         event("key-deny", seedBytes=seed_words(), approvedCount=0)
         # Allow by key Y: a 32-byte seed is drawn, the public key derived, a proof message signed.
+        # Allow on the key request opens the passphrase request; no entropy is drawn until it is confirmed.
+        def panel_band(shot, y0, y1):
+            wd = shot[0]
+            return [shot[2][3 * (y * wd + x):3 * (y * wd + x) + 3] for y in range(py + y0, py + y1) for x in range(px + 20, px + 460)]
+        keyname = lambda ch: "spc" if ch == " " else ch
+        def type_text(text):
+            for ch in text: send("sendkey " + keyname(ch), 0.6)
         send("sendkey f8", 1.5); assert W(87) == 2 and S(2039) == 3
-        send("sendkey y", 3.0)
+        send("sendkey y", 1.5)
+        assert W(87) == 4 and S(2039) == 3 + 2**31 and seed_words() == [0] * 8, (W(87), hex(S(2039)))
+        pass_panel = screenshot("passphrase-request")
+        assert panel_band(pass_panel, 52, 100) != panel_band(key_panel, 52, 100), "the passphrase panel must read differently"
+        # too short: Enter is ignored; letters count, stars follow; Backspace removes one; Esc cancels and wipes
+        type_text("abc"); assert S(2039) == 3 + 2**31 + 3 * 128 and W(95) == 3
+        typed_panel = screenshot("passphrase-typed")
+        def stars(shot):
+            wd = shot[0]
+            return sum(1 for y in range(py + 104, py + 128) for x in range(px + 120, px + 200)
+                       if shot[2][3 * (y * wd + x):3 * (y * wd + x) + 3] != b"\xff\xff\xff")
+        assert stars(pass_panel) == 0 and stars(typed_panel) > 10, (stars(pass_panel), stars(typed_panel))
+        assert panel_band(typed_panel, 164, 200) == panel_band(pass_panel, 164, 200), "only the passphrase line changes"
+        send("sendkey ret", 1.5); assert W(87) == 4 and seed_words() == [0] * 8, "a 3-letter passphrase must be ignored"
+        type_text("d"); assert W(95) == 4 and S(2039) == 3 + 2**31 + 4 * 128
+        send("sendkey backspace", 0.8); assert W(95) == 3 and S(2039) == 3 + 2**31 + 3 * 128
+        assert [W(832 + i) for i in range(8)] != [0] * 8, "the typed letters are in the buffer"
+        send("sendkey esc", 1.5)
+        assert W(87) == 0 and S(2039) == 0 and W(94) == 6 and W(95) == 0, (W(87), hex(S(2039)), W(94))
+        assert seed_words() == [0] * 8 and [W(832 + i) for i in range(8)] == [0] * 8, "cancel must wipe and draw nothing"
+        event("passphrase-cancel", seedBytes=seed_words(), bufferWiped=True)
+        # Allow, then a real passphrase, then Enter: the seed is drawn, the proof signed, the seed sealed
+        send("sendkey f8", 1.5); assert W(87) == 2 and S(2039) == 3
+        send("sendkey y", 1.5); assert W(87) == 4
+        type_text("correct horsex"); send("sendkey backspace", 0.8)
+        assert W(95) == 13 and S(2039) == 3 + 2**31 + 13 * 128
+        send("sendkey ret", 6.0)
         assert W(87) == 0 and W(94) == 1, (W(87), W(94))
         flags = S(2039)
         assert flags & 3 == 0 and (flags >> 2) & 15 == 1 and (flags >> 6) & 1 == 1, hex(flags)
@@ -214,6 +259,11 @@ def main(args):
         proof = b"itonami-w3-key-proof"
         assert seed != bytes(32) and len(set(seed)) > 8, "seed looks empty or constant"
         assert pub == ed_public(seed), ("the guest public key is not the key of its seed", pub.hex())
+        blob = b"".join(struct.pack("<I", W(848 + i)) for i in range(16))
+        assert unseal(b"correct horse", blob) == seed, "the sealed blob does not open to the seed under the passphrase"
+        assert unseal(b"correct horsf", blob) is None and unseal(b"correct", blob) is None, "a wrong passphrase must not open the blob"
+        assert blob[16:48] != seed and blob[:16] != bytes(16), "the seed must not be stored in the clear and the salt must be drawn"
+        assert [W(832 + i) for i in range(8)] == [0] * 8, "the passphrase buffer must be wiped after sealing"
         assert ed_verify(pub, proof, sig), "the guest signature does not verify under its public key"
         # negative controls: a foreign key, a changed message and a changed signature are refused
         foreign = ed_public(bytes(range(32)))
@@ -225,7 +275,7 @@ def main(args):
         key_home = screenshot("key-home")
         # a second request is refused while a key exists (one device key per boot)
         send("sendkey f8", 1.5); assert W(87) == 0 and S(2039) == flags
-        event("key-allow", fingerprint=pub[:3].hex(), publicKey=pub.hex(), proofMessage=proof.decode(),
+        event("key-allow", sealed=True, blob=blob.hex(), fingerprint=pub[:3].hex(), publicKey=pub.hex(), proofMessage=proof.decode(),
               signature=sig.hex(), verifies=True, foreignKeyRefused=True, changedMessageRefused=True,
               changedSignatureRefused=True, seedDisplayed=False, persisted=False)
         # --- W3 consent-bound signing (F7): a sign request of its own kind, its own consent text ---
@@ -236,9 +286,6 @@ def main(args):
         send("sendkey f7", 1.5)
         assert W(87) == 3 and S(2039) == base + 2**31 + 3, (W(87), hex(S(2039)))
         sign_panel = screenshot("sign-request")
-        def panel_band(shot, y0, y1):
-            wd = shot[0]
-            return [shot[2][3 * (y * wd + x):3 * (y * wd + x) + 3] for y in range(py + y0, py + y1) for x in range(px + 20, px + 460)]
         assert panel_band(sign_panel, 52, 100) == panel_band(key_panel, 52, 100), "service/endpoint lines must be the key request's"
         assert panel_band(sign_panel, 100, 156) != panel_band(key_panel, 100, 156), "action/data lines must differ from the key request"
         send("sendkey n", 1.5)

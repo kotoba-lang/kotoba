@@ -2,7 +2,8 @@
   (:require [aiueos.browser-frame2 :as browser-frame]
             [aiueos.session.app-catalog :as app-catalog]
             [aiueos.native.draft-store :as draft-store]
-            [aiueos.ed25519 :as ed])
+            [aiueos.ed25519 :as ed]
+            [aiueos.keyseal :as ks])
   (:export [main workspace-main goal-main goal-draft-main goal-model-main
             show-diagnostic-result]))
 
@@ -414,20 +415,11 @@
                                    (kernel-subregion ctx 8192 4096 4096))]
     (+ 1 (* 0 (+ pk (+ cp sg))))))
 
-;; Allow on the key request: returns 1. The request is closed either way.
+;; Allow on the key request opens the passphrase request (ctx word 87 = 4; word 2039 bits 0, 1 and 31 with
+;; bit 6 clear, the typed length in bits 7..11); no entropy is drawn and no key exists until the passphrase is
+;; confirmed. Returns 1.
 (defn allow-key [s ctx]
-  (let [ok (draw-seed ctx (word ctx 90))]
-    (if (= ok 1)
-      (let [d (derive-and-sign ctx)
-            fp (+ (* 65536 (ctx-byte ctx 1280)) (+ (* 256 (ctx-byte ctx 1281)) (ctx-byte ctx 1282)))]
-        (do (put-word ctx 87 0)
-            (put-word s 2039 (+ (+ (- (word s 2039) 3) 4) (+ 64 (* fp 128))))
-            (put-word ctx 94 1)
-            (+ 1 (* 0 d))))
-      (do (put-word ctx 87 0)
-          (put-word s 2039 (- (word s 2039) 3))
-          (put-word ctx 94 2)
-          1))))
+  (do (put-word ctx 87 4) (put-word ctx 95 0) (put-word s 2039 (+ (word s 2039) 2147483648)) 1))
 
 (defn deny-key [s ctx]
   (do (put-word ctx 87 0) (put-word s 2039 (- (word s 2039) 3)) (put-word ctx 94 3) 1))
@@ -477,12 +469,126 @@
     (do (put-word ctx 87 3) (put-word s 2039 (+ (word s 2039) 2147483651)) 1)
     0))
 
-(defn allow-pending [s ctx] (if (= (word ctx 87) 3) (allow-sign s ctx) (allow-key s ctx)))
-(defn deny-pending [s ctx] (if (= (word ctx 87) 3) (deny-sign s ctx) (deny-key s ctx)))
+;; ADR-0277 W3f: the passphrase request. Keys a-z and space (the goal alphabet) append up to 24 characters
+;; (shown as stars), Backspace removes one, Enter confirms from 4 characters, Esc or the Cancel button cancels
+;; and wipes the buffer; every other key is swallowed. Confirm draws the seed (rdrand; 0 fails closed), draws a
+;; 16-byte salt, derives the public key and the proof signature as before, and seals the seed under the
+;; passphrase with aiueos.keyseal into the 64-byte blob at ctx 3392 (words 848..863), RAM only for now. The
+;; passphrase buffer (ctx 3328..3359) is wiped on every exit. ctx word 95 holds the typed length.
+(defn wipe-pass [ctx i]
+  (if (>= i 32) 0
+    (let [x (put-ctx8 ctx (+ 3328 i) 0)]
+      (wipe-pass ctx (+ i (+ 1 (* 0 x)))))))
+
+(defn set-pass-flags [s old new]
+  (put-word s 2039 (+ (- (word s 2039) (* old 128)) (* new 128))))
+
+(defn pass-type [s ctx cp]
+  (let [n (word ctx 95)]
+    (if (>= n 24) 1
+      (let [x (put-ctx8 ctx (+ 3328 n) cp)]
+        (do (set-pass-flags s n (+ n 1)) (put-word ctx 95 (+ n 1)) (+ 1 (* 0 x)))))))
+
+(defn pass-back [s ctx]
+  (let [n (word ctx 95)]
+    (if (<= n 0) 1
+      (let [x (put-ctx8 ctx (+ 3328 (- n 1)) 0)]
+        (do (set-pass-flags s n (- n 1)) (put-word ctx 95 (- n 1)) (+ 1 (* 0 x)))))))
+
+(defn pass-close [s ctx extra code]
+  (let [n (word ctx 95)
+        w (wipe-pass ctx 0)]
+    (do (put-word s 2039 (+ (- (word s 2039) (+ 2147483651 (* n 128))) extra))
+        (put-word ctx 87 0) (put-word ctx 95 0) (put-word ctx 94 code)
+        (+ 1 (* 0 w)))))
+
+(defn pass-cancel [s ctx] (pass-close s ctx 0 6))
+
+(defn draw-salt [ctx]
+  (let [d0 (kernel-rdrand) d1 (kernel-rdrand)]
+    (if (or (= d0 0) (= d1 0)) 0
+      (let [a (store-draw ctx 3360 d0 0) b (store-draw ctx 3368 d1 0)]
+        (+ 1 (* 0 (+ a b)))))))
+
+(defn copy-salt-blob [ctx i]
+  (if (>= i 16) 0
+    (let [x (put-ctx8 ctx (+ 3392 i) (ctx-byte ctx (+ 3360 i)))]
+      (copy-salt-blob ctx (+ i (+ 1 (* 0 x)))))))
+
+(defn kdf-rounds [ctx salt-off k-off msg-off n]
+  (if (<= n 0) 1
+    (let [r (ks/aiueos-keyseal-round (kernel-subregion ctx 8192 salt-off 16) (kernel-subregion ctx 8192 k-off 64)
+                                     (kernel-subregion ctx 8192 msg-off 128) (kernel-subregion ctx 8192 4096 4096))]
+      (kdf-rounds ctx salt-off k-off msg-off (- n (+ 1 (* 0 r)))))))
+
+;; K into ctx[k-off .. k-off+64) from the 32-byte padded passphrase at pass-off and the salt at salt-off
+(defn kdf-run [ctx pass-off salt-off k-off msg-off iters]
+  (let [f (ks/aiueos-keyseal-first (kernel-subregion ctx 8192 pass-off 32) (kernel-subregion ctx 8192 salt-off 16)
+                                   (kernel-subregion ctx 8192 k-off 64) (kernel-subregion ctx 8192 msg-off 128)
+                                   (kernel-subregion ctx 8192 4096 4096))
+        r (kdf-rounds ctx salt-off k-off msg-off (- iters 1))]
+    (+ 1 (* 0 (+ f r)))))
+
+(defn seal-key [ctx]
+  (let [d (kdf-run ctx 3328 3360 3456 3520 1024)
+        z (ks/aiueos-keyseal-seal-with-k (kernel-subregion ctx 8192 3360 16) (kernel-subregion ctx 8192 512 32)
+                                         (kernel-subregion ctx 8192 3392 64) (kernel-subregion ctx 8192 3456 64)
+                                         (kernel-subregion ctx 8192 3520 128) (kernel-subregion ctx 8192 4096 4096))]
+    (+ 1 (* 0 (+ d z)))))
+
+(defn wipe-range [ctx at n i]
+  (if (>= i n) 0
+    (let [x (put-ctx8 ctx (+ at i) 0)]
+      (wipe-range ctx at n (+ i (+ 1 (* 0 x)))))))
+
+(defn seed-diff [ctx i acc]
+  (if (>= i 32) acc
+    (seed-diff ctx (+ i 1) (bit-or acc (bit-xor (ctx-byte ctx (+ 512 i)) (ctx-byte ctx (+ 3648 i)))))))
+
+;; Read-back before the key is declared: open the fresh blob under the same passphrase into ctx 3648..3679 and
+;; compare with the seed; 1 only when the tag matched and the seed is identical. The copy is wiped.
+(defn verify-seal [ctx]
+  (let [d (kdf-run ctx 3328 3360 3456 3520 1024)
+        z (ks/aiueos-keyseal-open-with-k (kernel-subregion ctx 8192 3360 16) (kernel-subregion ctx 8192 3392 64)
+                                         (kernel-subregion ctx 8192 3648 32) (kernel-subregion ctx 8192 3456 64)
+                                         (kernel-subregion ctx 8192 3520 128) (kernel-subregion ctx 8192 4096 4096))
+        diff (seed-diff ctx 0 0)
+        w (wipe-range ctx 3648 32 0)]
+    (if (and (= z 1) (= diff 0)) (+ 1 (* 0 (+ d w))) 0)))
+
+(defn pass-confirm [s ctx]
+  (let [n (word ctx 95)]
+    (if (or (< n 4) (> n 24)) 1
+      (let [ok (draw-seed ctx (word ctx 90))
+            sk (if (= ok 1) (draw-salt ctx) 0)]
+        (if (and (= ok 1) (= sk 1))
+          (let [d (derive-and-sign ctx)
+                b (copy-salt-blob ctx 0)
+                z (seal-key ctx)
+                v (verify-seal ctx)
+                fp (+ (* 65536 (ctx-byte ctx 1280)) (+ (* 256 (ctx-byte ctx 1281)) (ctx-byte ctx 1282)))]
+            (if (= v 1)
+              (+ (pass-close s ctx (+ 68 (* fp 128)) 1) (* 0 (+ d (+ b z))))
+              (+ (wipe-range ctx 512 32 0) (+ (wipe-range ctx 3392 64 0) (pass-close s ctx 0 7)))))
+          (pass-close s ctx 0 2))))))
+
+(defn pass-pending [s code ctx]
+  (if (= code 1) (pass-cancel s ctx)
+    (if (= code 28) (pass-confirm s ctx)
+      (if (= code 14) (pass-back s ctx)
+        (if (> (goal-codepoint code) 0) (pass-type s ctx (goal-codepoint code)) 0)))))
+
+(defn allow-pending [s ctx]
+  (if (= (word ctx 87) 3) (allow-sign s ctx)
+    (if (= (word ctx 87) 4) (pass-confirm s ctx) (allow-key s ctx))))
+(defn deny-pending [s ctx]
+  (if (= (word ctx 87) 3) (deny-sign s ctx)
+    (if (= (word ctx 87) 4) (pass-cancel s ctx) (deny-key s ctx))))
 
 (defn key-pending [s code ctx]
-  (if (= code 21) (allow-pending s ctx)
-    (if (or (= code 49) (= code 1)) (deny-pending s ctx) 0)))
+  (if (= (word ctx 87) 4) (pass-pending s code ctx)
+    (if (= code 21) (allow-pending s ctx)
+      (if (or (= code 49) (= code 1)) (deny-pending s ctx) 0))))
 
 (defn reduce-key [s code ctx]
   (if (>= (word ctx 87) 2) (key-pending s code ctx)
