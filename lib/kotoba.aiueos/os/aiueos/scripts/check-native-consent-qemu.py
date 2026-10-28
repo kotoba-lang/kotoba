@@ -236,7 +236,7 @@ def main(args):
         pass_panel = screenshot("passphrase-request")
         assert panel_band(pass_panel, 52, 100) != panel_band(key_panel, 52, 100), "the passphrase panel must read differently"
         # too short: Enter is ignored; letters count, stars follow; Backspace removes one; Esc cancels and wipes
-        type_text("abc"); assert S(2039) == 3 + 2**31 + 3 * 128 and W(95) == 3
+        type_text("abc"); assert S(2039) == 3 + 2**31 + 3 * 256 and W(95) == 3
         typed_panel = screenshot("passphrase-typed")
         def stars(shot):
             wd = shot[0]
@@ -245,8 +245,8 @@ def main(args):
         assert stars(pass_panel) == 0 and stars(typed_panel) > 10, (stars(pass_panel), stars(typed_panel))
         assert panel_band(typed_panel, 164, 200) == panel_band(pass_panel, 164, 200), "only the passphrase line changes"
         send("sendkey ret", 1.5); assert W(87) == 4 and seed_words() == [0] * 8, "a 3-letter passphrase must be ignored"
-        type_text("d"); assert W(95) == 4 and S(2039) == 3 + 2**31 + 4 * 128
-        send("sendkey backspace", 0.8); assert W(95) == 3 and S(2039) == 3 + 2**31 + 3 * 128
+        type_text("d"); assert W(95) == 4 and S(2039) == 3 + 2**31 + 4 * 256
+        send("sendkey backspace", 0.8); assert W(95) == 3 and S(2039) == 3 + 2**31 + 3 * 256
         assert [W(832 + i) for i in range(8)] != [0] * 8, "the typed letters are in the buffer"
         send("sendkey esc", 1.5)
         assert W(87) == 0 and S(2039) == 0 and W(94) == 6 and W(95) == 0, (W(87), hex(S(2039)), W(94))
@@ -256,9 +256,10 @@ def main(args):
         send("sendkey f8", 1.5); assert W(87) == 2 and S(2039) == 3
         send("sendkey y", 1.5); assert W(87) == 4
         type_text("correct horsex"); send("sendkey backspace", 0.8)
-        assert W(95) == 13 and S(2039) == 3 + 2**31 + 13 * 128
+        assert W(95) == 13 and S(2039) == 3 + 2**31 + 13 * 256
         send("sendkey ret", 6.0)
         assert W(87) == 0 and W(94) == 1, (W(87), W(94))
+        assert W(97) == 1 and W(96) == 0, ("the sealed blob must be stored on the scratch disk", W(97), W(96))
         flags = S(2039)
         assert flags & 3 == 0 and (flags >> 2) & 15 == 1 and (flags >> 6) & 1 == 1, hex(flags)
         seed = b"".join(struct.pack("<I", W(928 + i)) for i in range(8))
