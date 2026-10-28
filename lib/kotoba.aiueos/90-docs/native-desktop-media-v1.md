@@ -29,9 +29,11 @@ Current local candidates reproduce all31 modules, including the complete kernel
 and live runtime. Nothing supplies a C/reference kernel, object file or
 hosted compiler/packager. `build-kotoba-native-desktop.sh` now invokes
 `build-native-desktop.py`; a hosted bootstrap request refuses. Select an
-actual native Linux compiler and its immutable SHA256 with
+actual host-native compiler and its immutable SHA256 with
 `AIUEOS_AMU_SELFHOST_BIN` and `AIUEOS_AMU_SELFHOST_SHA256`. Owner dependency
-roots are the same pinned inputs used by `build-native-kernel.py`.
+roots are the same pinned inputs used by `build-native-kernel.py`. The current
+qualified build evidence uses Linux ELF; macOS arm64 Mach-O preflight is in
+place, but an Amu-produced Mac full compiler and Mac build are still missing.
 
 The wrapper invokes three native producers: `font-pad.kotoba` preserves the
 checked-in licensed font bytes and pads them to512KiB; Amu compiles the full

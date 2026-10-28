@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """Stage the licensed font and observe native copying/padding; emit no font."""
-import argparse,hashlib,json,os,platform,shutil,struct,subprocess
+import argparse,hashlib,importlib.util,json,os,shutil,struct,subprocess
 from pathlib import Path
 HERE=Path(__file__).resolve().parent
 def pin(p):
  b=p.read_bytes();return dict(bytes=len(b),sha256=hashlib.sha256(b).hexdigest())
 def main(amu,compiler,expected,font,out):
- assert platform.system()=='Linux' and platform.machine() in ('aarch64','arm64','x86_64')
- assert pin(compiler)['sha256']==expected
+ if pin(compiler)['sha256']!=expected:raise ValueError('compiler pin drift')
+ spec=importlib.util.spec_from_file_location('native_kernel',HERE/'build-native-kernel.py');driver=importlib.util.module_from_spec(spec);spec.loader.exec_module(driver)
+ target,suffix=driver.native_tool_spec(driver.inspect_current_host_image(compiler.read_bytes()))
  out.mkdir(parents=True,exist_ok=False);original=pin(font);shutil.copy2(font,out/'original.fnt')
  parts=[amu/'seed/00-ns-static.kotoba',amu/'seed/01-mem.kotoba',amu/'seed/02-io.kotoba',HERE.parent/'native/font-pad.kotoba']
  source=out/'font-pad.kotoba';source.write_bytes(b''.join(p.read_bytes()+b'\n' for p in parts))
- target='x86_64-linux' if platform.machine()=='x86_64' else 'aarch64-linux';tool=out/'font-pad.elf'
+ tool=out/('font-pad'+suffix)
  # KEXE_SECCOMP opt-in passes through when the caller sets it: the hardened
  # runtime fails closed with `kexe-runtime: resource limit setup failed` on a
  # host whose seccomp(2) is unavailable (measured 2026-10-26 in an emulated
