@@ -60,7 +60,10 @@ RECEIPT_NEGATIVES = ('missing-receipt-file', 'red-verdict',
                      'missing-i3-scale-log', 'tampered-i3-scanout-log',
                      'missing-i3-scanout-log', 'tampered-i2-serial-log',
                      'missing-i2-serial-log', 'tampered-i2-suspend-log',
-                     'missing-i2-suspend-log', 'mutated-i2-claim')
+                     'missing-i2-suspend-log', 'mutated-i2-claim',
+                     'tampered-i2-suspend-receipt', 'missing-i2-suspend-receipt',
+                     'tampered-i2-battery-steps', 'missing-i2-battery-steps',
+                     'tampered-i2-suspend-timing', 'missing-i2-suspend-timing')
 A1_RECEIPT = Path('os/aiueos/qualification/receipts/vm-20261024/a1-qmp60/receipt.edn')
 UI_RECEIPT = Path('os/aiueos/qualification/receipts/vm-20261023/ui/receipt.edn')
 BROKER_RECEIPT = Path('os/aiueos/qualification/receipts/vm-20261023/broker/receipt.edn')
@@ -408,6 +411,12 @@ def main():
                 ('tampered-i2-serial-log', 'missing-i2-serial-log')
                 else I2_RECEIPT.with_name('suspend-run-serial.log') if name in
                 ('tampered-i2-suspend-log', 'missing-i2-suspend-log')
+                else I2_RECEIPT.with_name('suspend-run-receipt.edn') if name in
+                ('tampered-i2-suspend-receipt', 'missing-i2-suspend-receipt')
+                else I2_RECEIPT.with_name('battery-steps.txt') if name in
+                ('tampered-i2-battery-steps', 'missing-i2-battery-steps')
+                else I2_RECEIPT.with_name('suspend-timing.txt') if name in
+                ('tampered-i2-suspend-timing', 'missing-i2-suspend-timing')
                 else I2_RECEIPT if name == 'mutated-i2-claim'
                 else A2_RECEIPT if name in
                 ('wrong-row-tag', 'missing-row-tag', 'mutated-a2-claim')
@@ -418,7 +427,8 @@ def main():
             if name in ('missing-receipt-file', 'missing-serial-log',
                         'missing-secondary-serial-log', 'missing-i3-scale-log',
                         'missing-i3-scanout-log', 'missing-i2-serial-log',
-                        'missing-i2-suspend-log'):
+                        'missing-i2-suspend-log', 'missing-i2-suspend-receipt',
+                        'missing-i2-battery-steps', 'missing-i2-suspend-timing'):
                 target.unlink()
             elif name == 'bad-release-signature-field':
                 receipt_bytes = target.read_bytes()
@@ -474,7 +484,9 @@ def main():
             elif name in ('tampered-release-json', 'tampered-release-signature',
                           'tampered-serial-log', 'tampered-secondary-serial-log',
                           'tampered-i3-scale-log', 'tampered-i3-scanout-log',
-                          'tampered-i2-serial-log', 'tampered-i2-suspend-log'):
+                          'tampered-i2-serial-log', 'tampered-i2-suspend-log',
+                          'tampered-i2-suspend-receipt', 'tampered-i2-battery-steps',
+                          'tampered-i2-suspend-timing'):
                 artifact_bytes = target.read_bytes()
                 if not artifact_bytes:
                     raise ValueError('release artifact empty')
