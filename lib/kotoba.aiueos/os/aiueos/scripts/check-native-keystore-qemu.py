@@ -103,6 +103,8 @@ def main(args):
         assert b.W(96) == 0 and b.S(2039) == 0, "a blank disk must not look like a stored key"
         b.send("sendkey 2", 1.5); b.send("sendkey a", 1.5)
         home_none = b.screenshot("home-none")
+        key_row = lambda shot: b.band(shot, 180, 330, 170, 188)
+        assert sum(1 for px in key_row(home_none) if px != b"\xff\xff\xff") > 20, "the key row must be drawn"
         b.send("sendkey f8", 1.5); assert b.W(87) == 2
         key_panel = b.screenshot("key-request")
         b.send("sendkey y", 1.5); assert b.W(87) == 4
@@ -129,6 +131,7 @@ def main(args):
         b.send("sendkey 2", 1.5); b.send("sendkey a", 1.5)
         home_locked = b.screenshot("home-locked")
         did_band = lambda shot: b.band(shot, 180, 330, 150, 168)
+        assert key_row(home_none) != key_row(home_locked), "the key row must say locked, not none"
         assert did_band(home_none) != did_band(home_locked), "the DID line must read differently when a sealed key is stored"
         assert sum(1 for px in did_band(home_locked) if px != b"\xff\xff\xff") > 20, "the locked DID line must be drawn"
         b.send("sendkey f7", 1.5); assert b.W(87) == 0, "signing must be impossible while the key is locked"
@@ -154,6 +157,8 @@ def main(args):
         assert seed2 == seed1 and pub2 == pub1, "the unlocked key is not the stored one"
         assert (flags2 >> 6) & 1 == 1 and (flags2 >> 7) & 0xffffff == int.from_bytes(pub1[:3], "big") and flags2 & 3 == 0, hex(flags2)
         assert b.words(832, 8) == bytes(32), "the passphrase buffer must be wiped after unlock"
+        home_ready = b.screenshot("home-ready")
+        assert key_row(home_ready) != key_row(home_locked) and key_row(home_ready) != key_row(home_none), "the key row must say ready"
         events.append(dict(name="unlock-right-passphrase", unlocked=True, fingerprint=pub2[:3].hex(), samePublicKey=True, sameSeed=True))
         # a consent-bound signature under the restored key verifies under the boot-1 public key
         b.send("sendkey f7", 1.5); assert b.W(87) == 3
