@@ -35,10 +35,11 @@ if segments != [(5, 0x1E1000, 4096), (6, 0x1E2000, 4096)]:
 if data_segment is None or data_segment[1] != 88:
     raise SystemExit("error: unsupported Kotoba user runtime context size")
 context = blob[data_segment[0]:data_segment[0] + data_segment[1]]
-if (struct.unpack_from("<Q", context, 8)[0] != 256 or context[16] != 60 or
+if (struct.unpack_from("<Q", context, 8)[0] != 256 or context[16] not in (0, 60) or
         any(context[17:48]) or struct.unpack_from("<Q", context, 48)[0] != 0x1E1020 or
         any(context[56:80]) or struct.unpack_from("<Q", context, 80)[0] != 0):
     raise SystemExit("error: invalid Kotoba aiueos runtime-v2 context")
 if blob[0x1020:0x102c] != bytes([0xB8,5,0,0,0,0x48,0x8B,0x7F,0x50,0x0F,5,0xC3]):
     raise SystemExit("error: invalid Kotoba aiueos runtime syscall trampoline")
-print("AIUEOS_KOTOBA_USER_ELF_OK entry=1e1000 segments=rx,rw runtime=v2 caps=2,3,4,5")
+caps = "none" if context[16] == 0 else "2,3,4,5"
+print(f"AIUEOS_KOTOBA_USER_ELF_OK entry=1e1000 segments=rx,rw runtime=v2 caps={caps}")
