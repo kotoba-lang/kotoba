@@ -63,7 +63,9 @@ RECEIPT_NEGATIVES = ('missing-receipt-file', 'red-verdict',
                      'missing-i2-suspend-log', 'mutated-i2-claim',
                      'tampered-i2-suspend-receipt', 'missing-i2-suspend-receipt',
                      'tampered-i2-battery-steps', 'missing-i2-battery-steps',
-                     'tampered-i2-suspend-timing', 'missing-i2-suspend-timing')
+                     'tampered-i2-suspend-timing', 'missing-i2-suspend-timing',
+                     'tampered-c9-serial-log', 'missing-c9-serial-log',
+                     'mutated-c9-claim', 'wrong-c9-row-tag')
 A1_RECEIPT = Path('os/aiueos/qualification/receipts/vm-20261024/a1-qmp60/receipt.edn')
 UI_RECEIPT = Path('os/aiueos/qualification/receipts/vm-20261023/ui/receipt.edn')
 BROKER_RECEIPT = Path('os/aiueos/qualification/receipts/vm-20261023/broker/receipt.edn')
@@ -81,19 +83,23 @@ A2_RECEIPT = Path(
     'os/aiueos/qualification/receipts/vm-20261026/a2-display-change/receipt.edn')
 I2_RECEIPT = Path(
     'os/aiueos/qualification/receipts/vm-20261026/i2-battery-power-management/receipt.edn')
+C9_RECEIPT = Path(
+    'os/aiueos/qualification/receipts/vm-20261025/c9-status-area/receipt.edn')
 A5_RECEIPT = Path(
     'os/aiueos/qualification/receipts/vm-20261025/a5-first-run-setup/receipt.edn')
 # These rows lack evidence this native core can fully admit. I2 is admitted
 # at the VM reference-machine baseline (owner decision, JUN-409 2026-10-28):
 # its battery input is synthetic and its sleep evidence is a separate run,
 # both disclosed in the receipt's caveats; that is not :device evidence.
-UNVERIFIED_ROWS = ('A5', 'C9', 'F2', 'G1', 'G3', 'G5', 'H1', 'H2',
+# C9 is admitted the same way: the reference VM has no battery (power renders
+# AC) and the online state is not in the bound log; the receipt discloses both.
+UNVERIFIED_ROWS = ('A5', 'F2', 'G1', 'G3', 'G5', 'H1', 'H2',
                    'H3', 'I6')
 EXPECTED_LEDGER = (
-    b'AIUEOS_SCORE 54\n'
+    b'AIUEOS_SCORE 55\n'
     b'AIUEOS_CATEGORY boot weight=10 pass=9 gap=1\n'
     b'AIUEOS_CATEGORY identity weight=6 pass=6 gap=0\n'
-    b'AIUEOS_CATEGORY shell weight=15 pass=14 gap=1\n'
+    b'AIUEOS_CATEGORY shell weight=15 pass=15 gap=0\n'
     b'AIUEOS_CATEGORY input weight=12 pass=9 gap=3\n'
     b'AIUEOS_CATEGORY web weight=20 pass=0 gap=20\n'
     b'AIUEOS_CATEGORY storage weight=9 pass=3 gap=6\n'
@@ -418,6 +424,9 @@ def main():
                 else I2_RECEIPT.with_name('suspend-timing.txt') if name in
                 ('tampered-i2-suspend-timing', 'missing-i2-suspend-timing')
                 else I2_RECEIPT if name == 'mutated-i2-claim'
+                else C9_RECEIPT.with_name('kernel-serial.log') if name in
+                ('tampered-c9-serial-log', 'missing-c9-serial-log')
+                else C9_RECEIPT if name in ('mutated-c9-claim', 'wrong-c9-row-tag')
                 else A2_RECEIPT if name in
                 ('wrong-row-tag', 'missing-row-tag', 'mutated-a2-claim')
                 else I3_RECEIPT if name == 'mutated-i3-claim'
@@ -428,7 +437,8 @@ def main():
                         'missing-secondary-serial-log', 'missing-i3-scale-log',
                         'missing-i3-scanout-log', 'missing-i2-serial-log',
                         'missing-i2-suspend-log', 'missing-i2-suspend-receipt',
-                        'missing-i2-battery-steps', 'missing-i2-suspend-timing'):
+                        'missing-i2-battery-steps', 'missing-i2-suspend-timing',
+                        'missing-c9-serial-log'):
                 target.unlink()
             elif name == 'bad-release-signature-field':
                 receipt_bytes = target.read_bytes()
@@ -451,6 +461,11 @@ def main():
                 if receipt_bytes.count(before) != 1:
                     raise ValueError('A2 row tag anchor missing')
                 target.write_bytes(receipt_bytes.replace(before, b':row :I3', 1))
+            elif name == 'wrong-c9-row-tag':
+                receipt_bytes = target.read_bytes()
+                if receipt_bytes.count(b':row :C9') != 1:
+                    raise ValueError('C9 row tag anchor missing')
+                target.write_bytes(receipt_bytes.replace(b':row :C9', b':row :C10', 1))
             elif name == 'missing-row-tag':
                 receipt_bytes = target.read_bytes()
                 before = b':row :A2'
@@ -458,10 +473,12 @@ def main():
                     raise ValueError('A2 row tag anchor missing')
                 target.write_bytes(receipt_bytes.replace(before, b':claim-row :A2', 1))
             elif name in ('mutated-a2-claim', 'mutated-i3-claim',
-                          'mutated-i2-claim'):
+                          'mutated-i2-claim', 'mutated-c9-claim'):
                 receipt_bytes = target.read_bytes()
                 before = (b'Desktop survives a display change' if name ==
                           'mutated-a2-claim' else
+                          b'Status area: network, power and clock'
+                          if name == 'mutated-c9-claim' else
                           b'Battery and power management: on battery'
                           if name == 'mutated-i2-claim'
                           else b'Display scaling and external displays')
@@ -486,7 +503,7 @@ def main():
                           'tampered-i3-scale-log', 'tampered-i3-scanout-log',
                           'tampered-i2-serial-log', 'tampered-i2-suspend-log',
                           'tampered-i2-suspend-receipt', 'tampered-i2-battery-steps',
-                          'tampered-i2-suspend-timing'):
+                          'tampered-i2-suspend-timing', 'tampered-c9-serial-log'):
                 artifact_bytes = target.read_bytes()
                 if not artifact_bytes:
                     raise ValueError('release artifact empty')
@@ -583,6 +600,7 @@ def main():
               'legacyReceiptContentAndRowsSourcePinned': True,
               'unregisteredTaggedReceiptsRefused': True,
               'i2VmBaselineAdmittedWithBoundLogs': True,
+              'c9VmBaselineAdmittedWithBoundLog': True,
               'i2SyntheticBatteryDisclosedNotDeviceEvidence': True,
               'pendingRowsRequireExplicitNativeAdmission': True,
               'legacyUntaggedReceiptRowBindingVerified': True,
