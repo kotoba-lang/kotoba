@@ -194,6 +194,12 @@ def main(args):
         move_to(150, 14); click()
         assert S(1) == 1 and W(87) == 1 and S(2039) == 1
         event("launcher-click-ignored", windows=S(1))
+        # Minimize and dock restore must not act behind a consent surface.
+        send("sendkey f6", 1.5)
+        assert S(9) == full and S(2) == 2 and W(87) == 1
+        move_to((width - 184) // 2 + 8 + 44 + 18, height - 28); click()
+        assert S(9) == full and S(2) == 2 and W(87) == 1
+        event("minimize-and-dock-blocked-by-consent", goalLength=S(2038))
         # N denies
         send("sendkey n", 1.5)
         assert W(87) == 0 and S(2039) == 0 and W(88) == 0 and W(85) == 0 and S(2038) == 13
@@ -219,6 +225,12 @@ def main(args):
         assert S(2039) == 0 and seed_words() == [0] * 8 and W(94) == 0
         send("sendkey f8", 1.5); assert W(87) == 2 and S(2039) == 3, (W(87), S(2039))
         key_panel = screenshot("key-request")
+        # All pending kinds, including key and passphrase requests, own the
+        # pointer. A hidden dock click cannot focus another app or minimize it.
+        move_to((width - 184) // 2 + 8 + 18, height - 28); click()
+        send("sendkey f6", 1.5)
+        assert S(1) == 1 and S(2) == 2 and S(9) == full and W(87) == 2
+        event("key-request-blocks-background-pointer")
         send("sendkey n", 1.5)
         assert W(87) == 0 and S(2039) == 0 and seed_words() == [0] * 8 and W(94) == 3
         event("key-deny", seedBytes=seed_words(), approvedCount=0)

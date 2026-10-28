@@ -315,11 +315,11 @@ def main(args):
                            else "PASS_NATIVE_KEYSTORE_QEMU" if args.profile == "keystore"
                            else "PASS_NATIVE_DESKTOP_INPUT_QEMU")
         expected_events = (12 if args.profile == "local-draft"
-                           else 18 if args.profile == "consent"
+                           else 20 if args.profile == "consent"
                            else 4 if args.profile == "idle"
                            else 3 if args.profile == "ed25519"
                            else 5 if args.profile == "keystore"
-                           else 2 if args.profile in ("cid", "sha512", "gf25519", "keyseal") else 12)
+                           else 2 if args.profile in ("cid", "sha512", "gf25519", "keyseal") else 21)
         if (observed["status"] != expected_status
                 or len(observed["events"]) != expected_events
                 or observed["kernel"] != kernel_state["kernel"]
@@ -392,13 +392,13 @@ def main(args):
                     or [row["name"] for row in observed["events"]] != [
                         "first-frame", "entropy-probe", "itonami-goal-typed", "collapse-key", "collapse-click",
                         "consent-open",
-                        "launcher-key-ignored", "launcher-click-ignored", "key-deny",
-                        "pointer-deny", "esc-deny", "key-deny", "passphrase-cancel", "key-allow",
+                        "launcher-key-ignored", "launcher-click-ignored", "minimize-and-dock-blocked-by-consent", "key-deny",
+                        "pointer-deny", "esc-deny", "key-request-blocks-background-pointer", "key-deny", "passphrase-cancel", "key-allow",
                         "sign-deny", "sign-allow", "draft-after-key", "pointer-allow"]
                     or observed["syntheticInputProvesHumanConsent"]):
                 raise ValueError("consent surface verdict is incomplete")
         elif (observed["font"] != font_state["padded"]
-              or [row["codepoint"] for row in observed["renderedGoalGlyphs"]] != [97, 98]
+              or [row["codepoint"] for row in observed["renderedGoalGlyphs"]] != [97, 98, 97]
               or any(row["inkPixels"] <= 0 for row in observed["renderedGoalGlyphs"])):
             raise ValueError("normal desktop visible Goal verdict is incomplete")
         iso_observed = None
@@ -409,14 +409,14 @@ def main(args):
                 "--output", guest_iso])
             iso_observed = json.loads((guest_iso / "native-desktop-qemu.json").read_text())
             if (iso_observed["status"] != "PASS_NATIVE_DESKTOP_INPUT_QEMU"
-                    or len(iso_observed["events"]) != 12
+                    or len(iso_observed["events"]) != expected_events
                     or iso_observed["kernel"] != kernel_state["kernel"]
                     or iso_observed["efi"] != kernel_state["efi"]
                     or iso_observed["iso"] != media_state["iso"]
                     or iso_observed["independentISO"]["status"] !=
                        "PASS_INDEPENDENT_NATIVE_EL_TORITO_ISO_READBACK"
                     or iso_observed["observer"] != script_pins["check-native-desktop-qemu.py"]
-                    or [row["codepoint"] for row in iso_observed["renderedGoalGlyphs"]] != [97, 98]):
+                    or [row["codepoint"] for row in iso_observed["renderedGoalGlyphs"]] != [97, 98, 97]):
                 raise ValueError("ISO QEMU guest observation is not bound to this build")
         if (pin(compiler) != compiler_pin or pin(packager) != packager_pin
                 or (descriptor_pin is not None and

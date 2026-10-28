@@ -60,14 +60,16 @@ def main(media,efi,kernel,font,qemu,firmware,out,iso=None):
    work=struct.unpack('<2048I',dump(context+0x23a000,8192,'desktop-context.bin'))
    goal_length=surface[2038]
    goal=''.join(chr(cp) for cp in surface[224:224+goal_length]) if 12<=goal_length<=63 else None
-   return dict(windows=surface[1],focus=surface[2],width=surface[3],height=surface[4],itonamiGoal=goal,x=work[50],y=work[51],buttons=work[67],magic=work[72],keys=work[73],packets=work[75],clicks=work[76],lastKey=work[77],framesStarted=work[78],framesCompleted=work[79],draftGeneration=work[80],draftCommit=work[82],draftEnabled=work[84])
-  def wait(name,predicate,timeout=120):
+   return dict(windows=surface[1],focus=surface[2],width=surface[3],height=surface[4],itonamiGoal=goal,windowRects=[list(surface[5+5*i:10+5*i]) for i in range(surface[1])],x=work[50],y=work[51],buttons=work[67],magic=work[72],keys=work[73],packets=work[75],clicks=work[76],lastKey=work[77],framesStarted=work[78],framesCompleted=work[79],draftGeneration=work[80],draftCommit=work[82],draftEnabled=work[84])
+  def wait(name,predicate,timeout=120,record=True):
    end=time.monotonic()+timeout
    while time.monotonic()<end:
     assert p.poll() is None,('guest exited',p.returncode)
     s=state();(out/'last-state.json').write_text(json.dumps(s,indent=2)+'\n')
     if predicate(s) and s['framesStarted']==s['framesCompleted']:
-     events.append(dict(name=name,state=s));return s
+
+     if record:events.append(dict(name=name,state=s))
+     return s
     registers=hmp('info registers');(out/'registers-last.txt').write_text(registers)
     time.sleep(.2)
    raise AssertionError((name,'native desktop state not reached',s))
@@ -130,6 +132,48 @@ def main(media,efi,kernel,font,qemu,firmware,out,iso=None):
   key('f5');disabled=wait('normal-profile-has-no-draft-commit',lambda s:s['lastKey']==63 and s['framesCompleted']>typed_b['framesCompleted'])
   assert disabled['draftEnabled']==0 and disabled['draftCommit']==0 and disabled['draftGeneration']==0 and disabled['itonamiGoal']=='Goal (RAM):\nab'
   key('backspace');deleted=wait('itonami-native-goal-backspace',lambda s:s['lastKey']==14 and s['itonamiGoal']=='Goal (RAM):\na' and s['framesCompleted']>typed_b['framesCompleted'])
+  # Native minimize/restore: retain geometry and Goal, skip hidden windows
+  # during Tab, never accept typing into a hidden window, restore via dock/key.
+  itonami_rect=next(r for r in deleted['windowRects'] if r[0]==2)
+  key('f6');hidden=wait('keyboard-minimizes-itonami',lambda s:s['focus']==1 and s['lastKey']==64 and s['framesCompleted']>deleted['framesCompleted'])
+  assert next(r for r in hidden['windowRects'] if r[0]==2)==itonami_rect[:4]+[itonami_rect[4]+65536]
+  key('b');ignored=wait('hidden-goal-ignores-typing',lambda s:s['lastKey']==48 and s['keys']>hidden['keys'])
+  assert ignored['itonamiGoal']=='Goal (RAM):\na'
+  key('tab');cycled=wait('tab-skips-minimized-window',lambda s:s['lastKey']==15 and s['keys']>ignored['keys'])
+  assert cycled['focus']==1
+  key('f6');all_hidden=wait('all-windows-minimized',lambda s:s['focus']==0 and s['lastKey']==64 and s['framesCompleted']>cycled['framesCompleted'])
+  hidden_pixels=screenshot('all-minimized')
+  ix,iy,iw,ih=itonami_rect[1:]
+  assert hidden_pixels[3*((iy+80)*1280+ix+100):3*((iy+80)*1280+ix+100)+3]==bytes((0x8f,0xb5,0xd8))
+  dock_left=(1280-184)//2+8+44
+  marker=3*((800-8)*1280+dock_left+16)
+  assert hidden_pixels[marker:marker+3]==bytes((0x1a,0x3a,0x6b)), 'minimized app lost its running marker'
+  def move_to(x,y):
+   for _ in range(40):
+    now=state();dx=x-now['x'];dy=y-now['y']
+    if abs(dx)<=1 and abs(dy)<=1:return
+    call('input-send-event',{'events':[{'type':'rel','data':{'axis':'x','value':max(-100,min(100,dx))}},{'type':'rel','data':{'axis':'y','value':max(-100,min(100,dy))}}]})
+    wait('pointer-step',lambda s:s['packets']>now['packets'] and s['framesCompleted']>now['framesCompleted'],record=False)
+   raise AssertionError(('pointer did not reach target',x,y,state()))
+  def click():
+   before_press=state()
+   call('input-send-event',{'events':[{'type':'btn','data':{'down':True,'button':'left'}}]})
+   pressed=wait('pointer-press',lambda s:s['buttons']==1 and s['framesCompleted']>before_press['framesCompleted'],record=False)
+   call('input-send-event',{'events':[{'type':'btn','data':{'down':False,'button':'left'}}]})
+   wait('pointer-release',lambda s:s['buttons']==0 and s['framesCompleted']>pressed['framesCompleted'],record=False)
+  move_to(dock_left+18,800-28);click()
+  restored=wait('dock-restores-itonami',lambda s:s['focus']==2 and s['buttons']==0 and s['framesCompleted']>all_hidden['framesCompleted'])
+  assert restored['windows']==2 and restored['itonamiGoal']=='Goal (RAM):\na'
+  assert next(r for r in restored['windowRects'] if r[0]==2)==itonami_rect
+  rendered_goal_glyph('restored-goal','a')
+  move_to(ix+iw-56,iy+14);click()
+  pointer_hidden=wait('pointer-minimizes-itonami',lambda s:s['focus']==0 and s['buttons']==0 and s['framesCompleted']>restored['framesCompleted'])
+  key('2');restored_key=wait('launcher-key-restores-itonami',lambda s:s['focus']==2 and s['lastKey']==3 and s['framesCompleted']>pointer_hidden['framesCompleted'])
+  assert next(r for r in restored_key['windowRects'] if r[0]==2)==itonami_rect
+  assert restored_key['itonamiGoal']=='Goal (RAM):\na'
+  # Restore the other app, then return to Itonami for the original close check.
+  key('1');wait('launcher-restores-other-window',lambda s:s['focus']==1 and s['lastKey']==2)
+  key('2');wait('launcher-focuses-itonami',lambda s:s['focus']==2 and s['lastKey']==3)
   call('input-send-event',{'events':[{'type':'rel','data':{'axis':'x','value':80}},{'type':'rel','data':{'axis':'y','value':40}}]})
   moved=wait('mouse-moves-native-pointer',lambda s:s['x']>two['x'] and s['y']>two['y'] and s['packets']>two['packets'] and s['framesCompleted']>two['framesCompleted'])
   call('input-send-event',{'events':[{'type':'btn','data':{'down':True,'button':'left'}}]})
@@ -140,7 +184,7 @@ def main(media,efi,kernel,font,qemu,firmware,out,iso=None):
   final=screenshot('desktop-after-input');assert first!=final
   assert pin(media)==before
   if iso:assert pin(iso)==iso_before
-  report=dict(status='PASS_NATIVE_DESKTOP_INPUT_QEMU',layoutTable=pin(HERE.parent/'native'/'layout-table.json'),kernel=pin(kernel),efi=pin(efi),media=before,font=pin(font),firmware=pin(firmware),observer=pin(Path(__file__)),independentMedia=format_proof,events=events,renderedGoalGlyphs=visual_glyphs,initialFuelRemaining=initial_fuel,sealedGop=dict(base=base,bytes=size,width=width,height=height,stride=stride,format=fmt,pciBarContained=True),screenshots=['desktop-initial.png','itonami-goal-a.png','itonami-goal-ab.png','desktop-after-input.png'],guestEmulation='QEMU TCG',blockDevice=('q35 virtual optical EFI El Torito' if iso else 'q35 SATA with temporary overlay'),privatePageTables=True,currentDomain=73,nativeCDCI=False,BrowserCSSOMParity=False,dappsExecuted=False,preemptiveScheduler=False,completeKernel=False,physicalHardware=False)
+  report=dict(status='PASS_NATIVE_DESKTOP_INPUT_QEMU',layoutTable=pin(HERE.parent/'native'/'layout-table.json'),kernel=pin(kernel),efi=pin(efi),media=before,font=pin(font),firmware=pin(firmware),observer=pin(Path(__file__)),independentMedia=format_proof,events=events,renderedGoalGlyphs=visual_glyphs,initialFuelRemaining=initial_fuel,sealedGop=dict(base=base,bytes=size,width=width,height=height,stride=stride,format=fmt,pciBarContained=True),screenshots=['desktop-initial.png','itonami-goal-a.png','itonami-goal-ab.png','all-minimized.png','restored-goal.png','desktop-after-input.png'],guestEmulation='QEMU TCG',blockDevice=('q35 virtual optical EFI El Torito' if iso else 'q35 SATA with temporary overlay'),privatePageTables=True,currentDomain=73,nativeCDCI=False,BrowserCSSOMParity=False,dappsExecuted=False,preemptiveScheduler=False,completeKernel=False,physicalHardware=False)
   if iso:report.update(iso=iso_before,independentISO=iso_proof)
   (out/'native-desktop-qemu.json').write_text(json.dumps(report,indent=2)+'\n');print(report['status'])
  finally:
