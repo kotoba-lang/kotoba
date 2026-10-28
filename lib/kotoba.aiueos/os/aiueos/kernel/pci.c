@@ -6725,12 +6725,13 @@ int aiueos_rtl8125_relay_qualification(void) {
 static int rtl8125_execute_job(const struct aiueos_job_request *request) {
   rtl8125_job_error=1;rtl8125_job_cycles=0;
   if(!request) { rtl8125_job_error=2;return 0; }
-  struct aiueos_micro_infer_result inference;
+  struct aiueos_micro_infer_result inference={0};
   uint32_t tsc_low,tsc_high,aux;
   uint64_t started,finished;
   __asm__ volatile("lfence; rdtsc":"=a"(tsc_low),"=d"(tsc_high)::"memory");
   started=((uint64_t)tsc_high<<32)|tsc_low;
-  if(!aiueos_micro_infer_next(request->prompt,request->prompt_length,&inference)) {
+  if(kotoba_aiueos_micro_infer_next(request->prompt,(int64_t)request->prompt_length,
+       (uint8_t *)&inference)!=1) {
     rtl8125_job_error=3;return 0;
   }
   __asm__ volatile("rdtscp; lfence":"=a"(tsc_low),"=d"(tsc_high),"=c"(aux)::"memory");
