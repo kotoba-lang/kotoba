@@ -321,6 +321,10 @@ def main(args):
         send("sendkey backspace", 0.8)
         assert W(95) == 13 and S(2039) == 3 + 2**31 + 13 * 256
         send("sendkey ret", 6.0)
+        # the KDF (1024 SHA-512 rounds) and the signing run in this handler: a loaded host needs longer than any fixed delay
+        for _ in range(240):
+            if W(87) == 0 and W(94) == 1: break
+            time.sleep(0.5)
         assert W(87) == 0 and W(94) == 1, (W(87), W(94))
         assert W(97) == 1 and W(96) == 0, ("the sealed blob must be stored on the scratch disk", W(97), W(96))
         flags = S(2039)

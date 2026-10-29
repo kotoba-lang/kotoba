@@ -167,6 +167,9 @@ def main(args):
         b.send("sendkey y", 1.5); assert b.W(87) == 4
         create_panel = b.screenshot("create-passphrase")
         b.type_text(PASS); b.send("sendkey ret", 8.0)
+        for _ in range(240):   # the KDF and the key derivation run in this handler; a loaded host needs longer than the fixed delay
+            if b.W(87) == 0 and b.W(94) == 1: break
+            time.sleep(0.5)
         assert b.W(87) == 0 and b.W(94) == 1 and b.W(97) == 1, (b.W(87), b.W(94), b.W(97))
         seed1, pub1, blob1 = b.words(928, 8), b.words(320, 8), b.words(848, 16)
         flags1 = b.S(2039)
