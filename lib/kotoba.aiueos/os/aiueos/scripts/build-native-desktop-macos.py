@@ -138,6 +138,7 @@ def main(args):
     sys.path.insert(0, str(HERE))
     import native_regions
     native_regions.verify_amu(amu)
+    native_regions.verify_layout(amu, OS / "native/layout-table.json")
     owners = args.owner_repo_root.resolve(strict=True)
     if not amu.is_dir() or not owners.is_dir():
         raise ValueError("source roots must be directories")
