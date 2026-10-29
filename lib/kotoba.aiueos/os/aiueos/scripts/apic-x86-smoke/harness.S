@@ -98,6 +98,33 @@ long:
   call puts
   movl 0x390(%r8), %edi
   call puthex32
+  # deliver the timer: IDT vector 32 -> handler that mirrors entry.S (incq ticks; EOI via mmio_base)
+  leaq irq(%rip), %rax
+  leaq idt+512(%rip), %rdi
+  movw %ax, (%rdi)
+  movw $0x08, 2(%rdi)
+  movw $0x8E00, 4(%rdi)
+  shrq $16, %rax
+  movw %ax, 6(%rdi)
+  shrq $16, %rax
+  movl %eax, 8(%rdi)
+  movb $0xff, %al
+  outb %al, $0x21
+  outb %al, $0xa1
+  lidt idtr(%rip)
+  sti
+  movl $400000000, %ecx
+8: cmpq $3, obj_data + TICKS(%rip)
+  jae 9f
+  pause
+  loop 8b
+9: cli
+  leaq s_irq(%rip), %rsi
+  call puts
+  xorl %edi, %edi
+  cmpq $3, obj_data + TICKS(%rip)
+  setae %dil
+  call puthex32
   leaq s_done(%rip), %rsi
   call puts
   movw $0xf4, %dx
@@ -145,6 +172,7 @@ s_masked: .asciz "\nlvt-after-mask="
 s_unmasked: .asciz "\nlvt-after-unmask="
 s_cnt1: .asciz "\ncur-count-1="
 s_cnt2: .asciz "\ncur-count-2="
+s_irq: .asciz "\nirq-ticks-ge3="
 s_done: .asciz "\nDONE\n"
 .balign 16
 msr_read:
@@ -161,6 +189,18 @@ msr_write:
   wrmsr
   movl $1, %eax
   ret
+.balign 16
+irq:
+  pushq %rax
+  incq obj_data + TICKS(%rip)
+  movq obj_data + MMIO_BASE(%rip), %rax
+  movl $0, 0xb0(%rax)
+  popq %rax
+  iretq
+.balign 16
+idtr:
+  .word 4095
+  .quad BASE + idt - hdr
 .balign 16
 gdt:
   .quad 0
@@ -182,6 +222,7 @@ pdpt:
 .fill 4096, 1, 0
 pd:
 .fill 16384, 1, 0
+idt: .fill 4096, 1, 0
 .fill 8192, 1, 0
 stack_top:
 image_end:
