@@ -4,12 +4,20 @@
 Each gate is one unity source: the library bodies with their `ns` forms removed, the
 `sha3/` alias dropped, then the gate body. The gate's main returns a bitmask; a pass is
 every bit set. Each mutant changes one line of a library body and must not pass.
-Runs on Linux x86_64 (KX64 under the native runner) and on Apple Silicon (Mac root and
-packager), through lib/kotoba.hata/scripts/native_gate.py.
+Runs on Linux arm64 (the aarch64 payload packed into an aarch64-linux runner image, as
+the arm64 owner lane does), on Apple Silicon (Mac root and packager, through
+lib/kotoba.hata/scripts/native_gate.py) and on Linux x86_64 (KX64 under the native
+runner). The pinned x86_64 KX64 profile refuses string literals (E7101 detail 16), which
+the gates use for their vectors, so x86_64 is not run in CI yet.
 """
 import argparse
+import hashlib
+import json
+import platform
 import re
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -51,16 +59,80 @@ def unity(name, spec, change=None):
         parts.append(strip_ns(text).replace('sha3/', '') if path != spec['gate'] else strip_ns(text))
     return ''.join(parts).encode()
 
+class LinuxArm:
+    """Linux aarch64: compile to an aarch64 payload, pack it into the runner (from
+    --runner-source) as an aarch64-linux image, and read main's result from the
+    structured report."""
+    def __init__(self, args):
+        assert (platform.system(), platform.machine()) in {('Linux', 'aarch64'), ('Linux', 'arm64')}
+        self.compiler = args.compiler.resolve()
+        assert hashlib.sha256(self.compiler.read_bytes()).hexdigest() == args.compiler_sha256
+        self.runner_source = args.runner_source.resolve()
+        self.out = args.output.resolve()
+        self.out.mkdir(parents=True, exist_ok=False, mode=0o700)
+        self.observations, self.artifacts = [], {}
+
+    def call(self, label, argv, env=None):
+        start = time.monotonic()
+        result = subprocess.run(list(map(str, argv)), cwd=self.out, capture_output=True, timeout=900,
+                                env=env or dict(PATH='/nonexistent', KEXE_STACK_BYTES='8388608'))
+        (self.out / (label + '.stdout')).write_bytes(result.stdout)
+        (self.out / (label + '.stderr')).write_bytes(result.stderr)
+        self.observations.append(dict(name=label, exit=result.returncode, seconds=round(time.monotonic() - start, 3)))
+        print(label, result.returncode, result.stderr.decode(errors='replace')[:300], flush=True)
+        return result
+
+    def build(self, label, entry, files):
+        root = self.out / label / 'src'
+        for name, data in files.items():
+            (root / name).parent.mkdir(parents=True, exist_ok=True)
+            (root / name).write_bytes(data)
+        source = root / entry
+        lock = self.out / (label + '.ksl')
+        lock.write_text(f'KSL1\nentry {source}\nroot {root}\n' + ''.join(
+            f'file {hashlib.sha256(data).hexdigest()} {root / name}\n' for name, data in sorted(files.items())))
+        flags = ['--source-path', root, '--source-lock', lock,
+                 '--source-lock-sha256', hashlib.sha256(lock.read_bytes()).hexdigest()]
+        for step, argv in [('check', [self.compiler, 'check', source, *flags]),
+                           ('compile', [self.compiler, 'compile', source, '--target', 'aarch64-macos',
+                                        '--output', self.out / (label + '.kseed'), *flags]),
+                           ('pack', [self.compiler, 'compile', self.runner_source, '--target', 'aarch64-linux',
+                                     '--output', self.out / (label + '.elf'), '--format', 'packed',
+                                     '--payload', self.out / (label + '.kseed')])]:
+            r = self.call(f'{label}-{step}', argv)
+            assert r.returncode == 0 and not r.stderr, (label, step, r.returncode, r.stderr[-500:])
+        image = self.out / (label + '.elf')
+        image.chmod(0o755)
+        self.artifacts[label] = dict(imageSHA256=hashlib.sha256(image.read_bytes()).hexdigest(),
+                                     sources={n: hashlib.sha256(b).hexdigest() for n, b in files.items()})
+        return image
+
+    def run(self, label, image, expected):
+        r = self.call(label, [image], dict(PATH='/nonexistent', KEXE_STACK_BYTES='8388608',
+                                           KEXE_STRUCTURED_REPORT='1', KEXE_ALLOW='-'))
+        match = re.search(rb':result (-?[0-9]+)', r.stdout)
+        assert r.returncode == 0 and match and int(match[1]) == expected, (label, r.returncode, r.stdout[-300:])
+        return r
+
+    def finish(self, status, **details):
+        (self.out / 'evidence.json').write_text(json.dumps(dict(
+            status=status, compilerSHA256=hashlib.sha256(self.compiler.read_bytes()).hexdigest(),
+            runnerSourceSHA256=hashlib.sha256(self.runner_source.read_bytes()).hexdigest(),
+            host=[platform.system(), platform.machine()], artifacts=self.artifacts,
+            observations=self.observations, **details), indent=2) + '\n')
+        print(status, flush=True)
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--compiler', type=Path, required=True)
     parser.add_argument('--compiler-sha256', required=True)
-    parser.add_argument('--runner', type=Path, help='Linux: the native runner')
+    parser.add_argument('--runner', type=Path, help='Linux x86_64: the native runner')
+    parser.add_argument('--runner-source', type=Path, help='Linux arm64: the runner source to pack into')
     parser.add_argument('--packager', type=Path, help='macOS: the Mac packager')
     parser.add_argument('--packager-sha256')
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
-    gate = NativeGate(args)
+    gate = LinuxArm(args) if platform.system() == 'Linux' and platform.machine() in ('aarch64', 'arm64') else NativeGate(args)
     results = {}
     for name, spec in GATES.items():
         entry = f'pq/{name}_gate.kotoba'
