@@ -52,12 +52,13 @@ def main():
     def copy(source, target, names):
         for name in names:
             shutil.copyfile(source / name, target / name)
-    def certify(label):
+    def certify(label, coord=None):
+        coord = coord or coordinator
         # Opaque byte transport. Only the native guest chooses/verifies votes.
         for i in range(3):
-            copy(coordinator, nodes[i], ['request'])
+            copy(coord, nodes[i], ['request'])
             run(label + '-vote-' + str(i), 'vote', nodes[i], option=str(i))
-            shutil.copyfile(nodes[i] / 'response', coordinator / ('vote' + str(i)))
+            shutil.copyfile(nodes[i] / 'response', coord / ('vote' + str(i)))
             if label == 'fence' and i == 1:
                 run('partition-two-votes-refused', 'reject-two', coordinator)
                 shutil.copyfile(coordinator / 'request', coordinator / 'original')
@@ -92,9 +93,9 @@ def main():
                 copy(coordinator, nodes[0], ['request'])
                 run('crash-restart-cannot-equivocate', 'no-equivocation', nodes[0])
                 shutil.copyfile(coordinator / 'original', coordinator / 'request')
-        run(label + '-assemble', 'certificate', coordinator)
+        run(label + '-assemble', 'certificate', coord)
         for i in range(4):
-            copy(coordinator, nodes[i], ['request', 'certificate'])
+            copy(coord, nodes[i], ['request', 'certificate'])
             run(label + '-commit-' + str(i), 'commit', nodes[i], 2, str(i))
             run(label + '-read-' + str(i), 'current', nodes[i], option=str(i))
     run('prepare', 'prepare', coordinator)
@@ -157,6 +158,31 @@ def main():
     run('abandon-expired-no-effect', 'abandon-expired', abandoned, 3)
     run('abandon-terminal-no-replay', 'execute', abandoned, 3)
     run('abandon-object-empty', 'empty-object', abandoned)
+    # AWAI-103: a new writer restores the latest certified C0 state from a fresh
+    # read and stays inactive until the sink durably holds its epoch fence.
+    writer = gate.out / 'writer2'
+    writer.mkdir(mode=0o700)
+    fresh('restore-read', [1, 2, 3], 1)
+    shutil.copyfile(coordinator / 'latest', nodes[1] / 'latest')
+    run('restore-fetch-value', 'fetch', nodes[1])
+    shutil.copyfile(coordinator / 'latest', writer / 'latest')
+    shutil.copyfile(nodes[1] / 'value', writer / 'value')
+    run('writer-restore', 'restore', writer, option='epoch8')
+    run('writer-restore-twice-refused', 'restore', writer, 2, option='epoch8')
+    run('restored-writer-inactive', 'inactive', writer, option='epoch8')
+    run('restored-writer-recovers-epoch9', 'recover9', writer, option='epoch8')
+    certify('epoch9-fence', writer)
+    (writer / 'sinkack').mkdir(mode=0o700)
+    run('activate-without-fence-ack-refused', 'activate', writer, 2, option='epoch9')
+    shutil.copyfile(sink / 'broker.state', writer / 'sinkack' / 'broker.state')
+    run('activate-on-old-fence-refused', 'activate', writer, 2, option='epoch9')
+    copy(writer, sink, ['request', 'certificate'])
+    run('install-epoch9', 'install', sink, option='epoch9')
+    shutil.copyfile(sink / 'broker.state', writer / 'sinkack' / 'broker.state')
+    run('activate-after-durable-fence', 'activate', writer, option='epoch9')
+    run('activated-writer-no-double-admission', 'active', writer, option='epoch9')
+    copy(history, sink, ['request', 'certificate', 'command'])
+    run('epoch8-writer-fenced', 'execute', sink, 0)
     mutant = sources(True)
     source = mutant['hata/replica.kotoba']
     before = b'(if (persist base next (c/slice identity 1 32))\n              (c/append (vector-i64 1)'

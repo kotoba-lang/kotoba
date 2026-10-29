@@ -1,5 +1,5 @@
 (ns hata.store
-  (:export [create load submit complete recover token state])
+  (:export [create load submit complete recover restore activate token state])
   (:require [hata.codec :as c] [hata.authority :as a] [hata.admission :as ad]
             [hata.store-io :as io] [ed25519.selfhost :as ed]))
 
@@ -7,6 +7,9 @@
 ;; belong to the trusted host, not to callers/LLMs. No effect dispatch occurs.
 ;; A snapshot carries state plus retained request/proof/admission-time records.
 ;; Blob: [version state-length record-count record-stride=781 state... records...].
+;; A store restored from a certified quorum head (AWAI-103) stays inactive:
+;; submit/complete refuse until hata.broker/activate has verified that the sink
+;; durably holds this writer's epoch fence. recover (the epoch bump) is allowed.
 (defn- path [base :string name :string] :string
   (string-concat base (string-concat "/awai-admission." name)))
 (defn state [blob :vector-i64] :vector-i64
@@ -54,6 +57,8 @@
           (not (io/rename temp final)) "uncertain:rename"
           (not (io/sync base)) "uncertain:directory-sync"
           :else (string-concat "committed:" (c/hex (token blob))))))
+(defn- restored? [base :string] :bool (io/exists? (path base "restored")))
+(defn- inactive? [base :string] :bool (and (restored? base) (not (io/exists? (path base "active")))))
 (defn- release [base :string result :string] :string
   (if (io/unlock (path base "lock")) result "uncertain:unlock"))
 (defn create [base :string config :vector-i64 p :vector-i64 seed :vector-i64] :string
@@ -112,6 +117,7 @@
   (cond (not (c/safe-base? base)) "rejected:path"
         (not= (vector-count command) 352) "rejected:command"
         (not (seed-matches? p seed)) "rejected:signer"
+        (inactive? base) "rejected:inactive"
         :else
         (let [decision (a/verify p (c/slice command 5 50) (c/slice command 55 297) (vector-at command 0))]
           (cond (not= decision 0) (string-concat "rejected:authority:" (str decision))
@@ -136,9 +142,61 @@
   (cond (not (c/safe-base? base)) "rejected:path"
         (not= (vector-count command) (if recovery 6 14)) "rejected:command"
         (not (seed-matches? p seed)) "rejected:signer"
+        (and (not recovery) (inactive? base)) "rejected:inactive"
         (not (io/lock (path base "lock"))) "rejected:busy"
         :else (release base (change-locked base p seed command recovery))))
 (defn complete [base :string p :vector-i64 seed :vector-i64 command :vector-i64] :string
   (change base p seed command false))
 (defn recover [base :string p :vector-i64 seed :vector-i64 command :vector-i64] :string
   (change base p seed command true))
+(defn- unique-requests? [blob :vector-i64] :bool
+  ;; A legal C0 snapshot retains each stable request id at most once.
+  (loop [i 0]
+    (if (= i (vector-at blob 2)) true
+      (let [x (+ (+ 4 (vector-at blob 1)) (* i 781))]
+        (and (loop [j 0]
+               (if (= j i) true
+                 (and (not (c/equal? (c/slice blob (+ x 27) 4)
+                                     (c/slice blob (+ (+ (+ 4 (vector-at blob 1)) (* j 781)) 27) 4)))
+                      (recur (+ j 1)))))
+             (recur (+ i 1)))))))
+(defn restore [base :string p :vector-i64 seed :vector-i64 blob :vector-i64 head :vector-i64] :string
+  ;; Only hata.broker/restore calls this, after verifying that blob is the
+  ;; certified value of quorum entry head (found by a fresh read). The snapshot
+  ;; must still parse as C0 state bound to this policy and operation, with
+  ;; unique stable ids. Legality of earlier transitions rests on the trusted
+  ;; writer that signed them.
+  (let [s (state blob)]
+    (cond (not (c/safe-base? base)) "rejected:path"
+          (not (a/policy? p)) "rejected:policy"
+          (not (seed-matches? p seed)) "rejected:signer"
+          (or (= (vector-count s) 0) (not= (vector-count head) 4)) "rejected:state"
+          (or (not= (vector-at s 1) (vector-at p 1)) (not= (vector-at s 2) (vector-at p 2))
+              (not (c/equal? (c/slice s 9 4) (c/slice p 8 4)))
+              (not (c/equal? (c/slice s 13 4) (c/slice p 12 4)))) "rejected:binding"
+          (not (unique-requests? blob)) "rejected:request-id-conflict"
+          (not (io/lock (path base "lock"))) "rejected:busy"
+          :else
+          (release base
+            (cond (or (io/exists? (path base "state")) (io/exists? (path base "pending"))
+                      (restored? base)) "rejected:exists"
+                  ;; The marker is durable before the state, so a crash in
+                  ;; between never leaves an active restored store.
+                  (not (and (io/write (path base "restored") (c/hex head))
+                            (io/sync (path base "restored")) (io/sync base))) "rejected:write"
+                  :else (publish base blob seed))))))
+(defn activate [base :string p :vector-i64 seed :vector-i64 fence :vector-i64] :string
+  ;; Only hata.broker/activate calls this, after verifying the sink's durable
+  ;; fence for this epoch; fence is that fence entry's id.
+  (cond (not (c/safe-base? base)) "rejected:path"
+        (not (seed-matches? p seed)) "rejected:signer"
+        (not (restored? base)) "rejected:not-restored"
+        (io/exists? (path base "active")) "duplicate:active"
+        (not (io/lock (path base "lock"))) "rejected:busy"
+        :else
+        (release base
+          (let [s (state (load base p))]
+            (cond (or (= (vector-count s) 0) (not= (vector-at s 1) (vector-at p 1))) "rejected:epoch"
+                  (and (io/write (path base "active") (c/hex fence)) (io/sync (path base "active"))
+                       (io/sync base)) "committed:active"
+                  :else "uncertain:active")))))
