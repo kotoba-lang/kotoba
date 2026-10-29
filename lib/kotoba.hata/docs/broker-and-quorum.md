@@ -171,6 +171,24 @@ python3 lib/kotoba.hata/scripts/check-broker-native.py \
   --runner /absolute/path/candidate-runner.elf --output /new/private/evidence
 ```
 
+On Apple Silicon (JUN-593) the same gate runs with the Mac root compiler and a
+Mac packager whose `fs2-cli-stdio-general` runtime answers these wire-35 text
+requests (kotoba-lang/amu#1687):
+
+```sh
+python3 lib/kotoba.hata/scripts/check-broker-native.py \
+  --compiler /absolute/path/amu-full-root.macho --compiler-sha256 <sha256> \
+  --packager /absolute/path/kotoba-packager-root.macho --packager-sha256 <sha256> \
+  --output /new/private/evidence
+```
+
+There FD 3 is the output directory and each scope directory reaches the guest
+as `/<relative path>`; main's result is the exit status, compared modulo 256
+(Linux reads the full i64 `:result`). Measured 2026-10-29 on an M1 Max:
+`PASS_NATIVE_BROKER_QUORUM`, the same 97 guest calls in the same order as the
+Linux x86_64 CI evidence (run 40854047278), and all 96 results equal modulo
+256, including the non-durable-vote mutant (-17, exit 239).
+
 The Python observer stages explicit closed source files, hashes artifacts,
 launches Native processes and transports opaque bytes. Proposal construction,
 signing, certificate assembly, origin/authority checks, persistence decisions

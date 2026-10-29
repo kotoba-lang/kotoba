@@ -33,7 +33,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--compiler', type=Path, required=True)
     parser.add_argument('--compiler-sha256', required=True)
-    parser.add_argument('--runner', type=Path, required=True)
+    parser.add_argument('--runner', type=Path, help='Linux: the native runner')
+    parser.add_argument('--packager', type=Path, help='macOS: the Mac packager (JUN-593)')
+    parser.add_argument('--packager-sha256')
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
     gate = NativeGate(args)
@@ -64,10 +66,13 @@ def main():
                 run('restart-cannot-equivocate', 'no-equivocation', nodes[0])
                 shutil.copyfile(coordinator / 'original', coordinator / 'request')
                 copy(coordinator, nodes[0], ['request'])
-                env = dict(gate.env('35,38', nodes[0]), KEXE_FUEL='100000000000', KEXE_STRUCTURED_REPORT='1')
-                process = subprocess.Popen([str(gate.runner), str(driver), '0', '0', 'x86_64', '35,38',
-                                            '--', 'vote-hold', str(nodes[0]), '0'], env=env,
-                                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                if gate.darwin:
+                    process = gate.fd3([driver, 'vote-hold', *gate.guest_args([nodes[0]]), '0'], popen=True)
+                else:
+                    env = dict(gate.env('35,38', nodes[0]), KEXE_FUEL='100000000000', KEXE_STRUCTURED_REPORT='1')
+                    process = subprocess.Popen([str(gate.runner), str(driver), '0', '0', 'x86_64', '35,38',
+                                                '--', 'vote-hold', str(nodes[0]), '0'], env=env,
+                                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 deadline = time.monotonic() + 60
                 try:
                     while not (nodes[0] / 'ready').exists():
