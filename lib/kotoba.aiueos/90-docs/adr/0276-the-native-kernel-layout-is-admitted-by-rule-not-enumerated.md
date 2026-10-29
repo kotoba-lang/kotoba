@@ -4,8 +4,15 @@ Date: 2026-10-27
 
 ## Status
 
-Accepted as a decision (owner delegation 2026-10-27: the recommendations below are adopted; see Decisions). **Nothing is implemented yet**;
-the implementation is in Amu (compiler and boot packager) and this repository's gates. It records what was measured on 2026-10-27 while the W1 consent surface of
+Accepted as a decision (owner delegation 2026-10-27: the recommendations below are adopted; see Decisions). **Partly implemented
+(2026-10-29, checked against the code).** Step (a), the owned-region table: the compiler's definition is `seed/97-aiueos-desktop-regions.kotoba`
+(kotoba-lang/amu#1653), the gates read one table (`scripts/native_regions.py`), and the desktop build refuses when the table, or
+`native/layout-table.json` (page-table root and text cap per rung), differs from the compiler (kotoba#994); the layout table is still a repository file,
+not emitted by the compiler. Step (b), the packager rule: kotoba-lang/amu#1666 (budget, overlap by address and by file offset, text up to the RW file offset
+minus a page; ten single-clause negative controls in `check-aiueos-layout-rule-macos-native.py`; the 0x800000 rung is not yet reachable because no slot-version
+defines it). Steps (c) the 0x800000 rung and (d) the read-only data segment (Part B) are **not implemented**; the desktop's RX is 1,505,664 bytes (71.8% of the
+compiler's 2 MiB v3 text cap, measured 2026-10-29), so neither is blocking. The text below is the original design; Linear JUN-479 carries the evidence.
+The implementation is in Amu (compiler and boot packager) and this repository's gates. It records what was measured on 2026-10-27 while the W1 consent surface of
 ADR-0275 outgrew the kernel-v1 layout, and the two changes that remove that class of failure. Part A is owned by the Amu packager
 and the JUN-450 layout contract and needs their owner's decision; Part B is a compiler change.
 
