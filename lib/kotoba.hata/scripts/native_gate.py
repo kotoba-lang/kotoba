@@ -51,7 +51,7 @@ class NativeGate:
         assert result.returncode == expected, (label, result.returncode, result.stdout[-500:], result.stderr[-1000:])
         return result
 
-    def fd3(self, argv, scope=None, popen=False):
+    def fd3(self, argv, scope=None, popen=False, timeout=600):
         """Run (or start) a Mac image with FD 3 = scope (default: the output directory)."""
         fd = os.open(scope or self.out, os.O_RDONLY | os.O_DIRECTORY)
         try:
@@ -59,7 +59,7 @@ class NativeGate:
                       preexec_fn=lambda: os.dup2(fd, 3))
             if popen:
                 return subprocess.Popen(list(map(str, argv)), stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kw)
-            return subprocess.run(list(map(str, argv)), capture_output=True, timeout=600, **kw)
+            return subprocess.run(list(map(str, argv)), capture_output=True, timeout=timeout, **kw)
         finally:
             os.close(fd)
 
@@ -71,9 +71,9 @@ class NativeGate:
             out.append('/' + str(p.relative_to(self.out)) if p.is_absolute() and p.is_relative_to(self.out) else str(a))
         return out
 
-    def mac_call(self, label, argv, expected=0, scope=None):
+    def mac_call(self, label, argv, expected=0, scope=None, timeout=600):
         start = time.monotonic()
-        result = self.fd3(argv, scope)
+        result = self.fd3(argv, scope, timeout=timeout)
         (self.out / (label + '.stdout')).write_bytes(result.stdout)
         (self.out / (label + '.stderr')).write_bytes(result.stderr)
         self.observations.append(dict(name=label, exit=result.returncode,
@@ -137,15 +137,15 @@ class NativeGate:
                                     lockSHA256=sha(lock.read_bytes()), sources={n: sha(b) for n,b in files.items()})
         return image
 
-    def run(self, label, image, expected=0, args=(), allow='-', scope=None):
+    def run(self, label, image, expected=0, args=(), allow='-', scope=None, timeout=600):
         if self.darwin:
             # scope is the Linux grant root; on the Mac FD 3 is always the output directory.
-            return self.mac_call(label, [image, *self.guest_args(args)], expected & 0xff)
+            return self.mac_call(label, [image, *self.guest_args(args)], expected & 0xff, timeout=timeout)
         command = [self.runner, image, 0, 0, 'x86_64', allow]
         if args:
             command += ['--', *args]
         env = dict(self.env(allow, scope), KEXE_FUEL='100000000000', KEXE_STRUCTURED_REPORT='1')
-        result = self.call(label, command, env)
+        result = self.call(label, command, env, timeout=timeout)
         match = re.search(rb':result (-?[0-9]+)\b', result.stdout)
         assert match and int(match[1]) == expected and not result.stderr, (label, result.stdout, result.stderr)
         return result
