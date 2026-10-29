@@ -214,7 +214,7 @@ def main():
     run('install-epoch9', 'install', sink, option='epoch9')
     shutil.copyfile(sink / 'broker.state', writer / 'sinkack' / 'broker.state')
     run('activate-after-durable-fence', 'activate', writer, option='epoch9')
-    run('activated-writer-no-double-admission', 'active', writer, option='epoch9')
+    run('activated-writer-not-gated', 'active', writer, option='epoch9')
     copy(history, sink, ['request', 'certificate', 'command'])
     run('epoch8-writer-fenced', 'execute', sink, 0)
     mutant = sources(True)
