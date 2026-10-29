@@ -72,10 +72,14 @@ class LinuxArm:
         self.out.mkdir(parents=True, exist_ok=False, mode=0o700)
         self.observations, self.artifacts = [], {}
 
+    def env(self, **extra):
+        # The compiler reads sources and the lock through the scoped resource capability.
+        return dict(PATH='/nonexistent', KEXE_STACK_BYTES='8388608', KEXE_CAP_RESOURCES_35=str(self.out), **extra)
+
     def call(self, label, argv, env=None):
         start = time.monotonic()
         result = subprocess.run(list(map(str, argv)), cwd=self.out, capture_output=True, timeout=900,
-                                env=env or dict(PATH='/nonexistent', KEXE_STACK_BYTES='8388608'))
+                                env=env or self.env())
         (self.out / (label + '.stdout')).write_bytes(result.stdout)
         (self.out / (label + '.stderr')).write_bytes(result.stderr)
         self.observations.append(dict(name=label, exit=result.returncode, seconds=round(time.monotonic() - start, 3)))
@@ -108,8 +112,7 @@ class LinuxArm:
         return image
 
     def run(self, label, image, expected):
-        r = self.call(label, [image], dict(PATH='/nonexistent', KEXE_STACK_BYTES='8388608',
-                                           KEXE_STRUCTURED_REPORT='1', KEXE_ALLOW='-'))
+        r = self.call(label, [image], self.env(KEXE_STRUCTURED_REPORT='1', KEXE_ALLOW='-'))
         match = re.search(rb':result (-?[0-9]+)', r.stdout)
         assert r.returncode == 0 and match and int(match[1]) == expected, (label, r.returncode, r.stdout[-300:])
         return r
