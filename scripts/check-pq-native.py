@@ -67,9 +67,11 @@ class LinuxArm:
         assert (platform.system(), platform.machine()) in {('Linux', 'aarch64'), ('Linux', 'arm64')}
         self.compiler = args.compiler.resolve()
         assert hashlib.sha256(self.compiler.read_bytes()).hexdigest() == args.compiler_sha256
-        self.runner_source = args.runner_source.resolve()
         self.out = args.output.resolve()
         self.out.mkdir(parents=True, exist_ok=False, mode=0o700)
+        # The compiler reads only inside its resource scope, so the runner source is copied in.
+        self.runner_source = self.out / 'runner.kotoba'
+        self.runner_source.write_bytes(args.runner_source.read_bytes())
         self.observations, self.artifacts = [], {}
 
     def env(self, **extra):
