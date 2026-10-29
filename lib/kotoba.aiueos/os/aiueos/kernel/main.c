@@ -11,7 +11,6 @@
 #include "qwen35_runtime.h"
 #include "device_result.h"
 #include "device_poll_scheduler.h"
-
 /* ---------------------------------------------------------------------------
    DEVCLIENT-PARITY.  The object against the bytes the C produced.
    ---------------------------------------------------------------------------
@@ -759,7 +758,6 @@ extern const char *aiueos_rtl8125_direct_device_did(void);
 extern int aiueos_rtl8125_device_worker_poll(
     const struct aiueos_boot_info *, uint32_t, uint64_t *, uint32_t *, int *,
     uint64_t *, int *, int *);
-extern enum aiueos_poll_outcome aiueos_rtl8125_device_worker_poll_outcome(void);
 extern int aiueos_rtl8125_device_worker_control_ack(
     const struct aiueos_boot_info *, uint32_t, uint64_t);
 extern int aiueos_rtl8125_device_worker_result(
@@ -4951,11 +4949,7 @@ qwen_runtime_boot_complete:
     aiueos_framebuffer_qualification_screen("AIUEOS K16", "TEST DIRECT HTTPS", "SSD READ ONLY", 0);
     int direct_https_ok = 0;
 #ifdef AIUEOS_PERSISTENT_BOOT
-    /* The poll scheduler owns the cadence (D1: 60 s heartbeat period), the
-       per-boot sequence (D2: a fresh (boot,sequence) for every send,
-       retries included), and the classified failure backoff. */
-    struct aiueos_poll_sched poll_sched;
-    aiueos_poll_sched_init(&poll_sched, boot->tsc_hz, aiueos_read_tsc());
+    struct aiueos_poll_sched poll_sched; aiueos_poll_sched_init(&poll_sched, boot->tsc_hz, aiueos_read_tsc());
 #endif
 #ifdef AIUEOS_MURAKUMO_DEVICE_RESULT
     if (qwen_initial_ok) {
@@ -5110,38 +5104,7 @@ qwen_runtime_boot_complete:
         serial_string(" response-timeout-s=");
         serial_decimal(aiueos_rtl8125_direct_response_timeout_seconds());
         serial_string(" action=reconnect\r\n");
-        {
-          /* D2 failure handling: the disposition drives the wait, and the
-             wait follows murakumo.infer.backoff's two rules (double, bound,
-             jitter; classify).  Not the fixed 5 s retry of ADR-260902. */
-          uint32_t refreshes_before = poll_sched.identity_refreshes;
-          uint16_t poll_jitter = 0;
-          (void)aiueos_cpu_random_bytes((uint8_t *)&poll_jitter,
-                                        sizeof(poll_jitter));
-          aiueos_poll_sched_record(&poll_sched, aiueos_read_tsc(),
-            aiueos_rtl8125_device_worker_poll_outcome(),
-            AIUEOS_POLL_FAIL_REMOTE, poll_jitter);
-          if (poll_sched.enroll_pending) {
-            /* 404: the qualification result POST must come first (it is
-               enrollment + first heartbeat, D4).  Logged, not improvised:
-               the persistent loop has no qualification metrics to send. */
-            debug_string("AIUEOS_MURAKUMO_HEARTBEAT_UNENROLLED action=qualification-result-pending\n");
-            serial_string("AIUEOS_MURAKUMO_HEARTBEAT_UNENROLLED action=qualification-result-pending wait-ms=");
-            serial_decimal((uint32_t)poll_sched.last_delay_ms);
-            serial_string("\r\n");
-          }
-          if (poll_sched.identity_refreshes != refreshes_before) {
-            /* 409: (did,boot,sequence) collided; move to a fresh identity
-               namespace (new boot id) before the next send. */
-            aiueos_device_worker_identity_refresh();
-            debug_string("AIUEOS_MURAKUMO_SEQ_CONFLICT action=refresh-boot-id\n");
-            serial_string("AIUEOS_MURAKUMO_SEQ_CONFLICT action=refresh-boot-id wait-ms=");
-            serial_decimal((uint32_t)poll_sched.last_delay_ms);
-            serial_string("\r\n");
-          }
-          aiueos_k16_management_wait(
-            boot->tsc_hz, (uint32_t)((poll_sched.last_delay_ms + 999U) / 1000U));
-        }
+        AIUEOS_POLL_SCHED_FAIL_WAIT(&poll_sched, boot->tsc_hz);
         continue;
       }
       if (heartbeat_failures) {
@@ -5229,12 +5192,7 @@ qwen_runtime_boot_complete:
         (void)aiueos_framebuffer_inference_screen(&aiueos_qwen35_status);
         debug_string("AIUEOS_MURAKUMO_JOB_POLL_OK job=none ready=true\n");
         serial_string("AIUEOS_MURAKUMO_JOB_POLL_OK job=none ready=true\r\n");
-        /* Fresh poll = liveness renewed: the next one is one heartbeat
-           period out (D1, 60 s; server stale window 120 s). */
-        aiueos_poll_sched_record(&poll_sched, aiueos_read_tsc(),
-          AIUEOS_POLL_OUTCOME_OK, AIUEOS_POLL_FAIL_REMOTE, 0);
-        aiueos_k16_management_wait(
-          boot->tsc_hz, (uint32_t)((poll_sched.last_delay_ms + 999U) / 1000U));
+        AIUEOS_POLL_SCHED_SUCCESS_WAIT(&poll_sched, boot->tsc_hz);
         continue;
       }
       serial_string("AIUEOS_MURAKUMO_JOB_CLAIMED job-id=");

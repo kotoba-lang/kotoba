@@ -117,4 +117,65 @@ void aiueos_poll_sched_clear_enroll(struct aiueos_poll_sched *s);
 enum aiueos_poll_outcome aiueos_poll_sched_status_disposition(
     const uint8_t *http, uint32_t length);
 
+/* ---------------------------------------------------------------------------
+   Kernel-loop glue (JUN-35 gate B line-budget redesign).  These expand AT THE
+   CALL SITE (kernel/main.c), not here: the serial diagnostics and the wait
+   are main.c's file-local services, and gate B ("main.c 行数非増加に再設計して
+   __LINE__ 固定") requires main.c to keep every evidence_stop(__LINE__) line
+   number equal to the pre-PR file, so the block bodies live in this header
+   and each call site in main.c spends exactly one line.  Requires in scope
+   at the call site: aiueos_read_tsc, aiueos_k16_management_wait,
+   debug_string, serial_string, serial_decimal (file-local in main.c),
+   aiueos_cpu_random_bytes and aiueos_device_worker_identity_refresh
+   (device_result.h).  `s` is evaluated more than once: pass an address,
+   not an expression with side effects. */
+
+/* D2 failure path: record the classified outcome (fresh jitter entropy;
+   the disposition drives the wait -- murakumo.infer.backoff's two rules,
+   double/bound/jitter and classify.  Not the fixed 5 s retry of
+   ADR-260902), then the two diagnostics (404 = the qualification result
+   POST is owed, D4; 409 = (did,boot,sequence) collision, move to a fresh
+   identity namespace before the next send), then the wait. */
+#define AIUEOS_POLL_SCHED_FAIL_WAIT(s, tsc_hz)                                 \
+  do {                                                                         \
+    extern enum aiueos_poll_outcome aiueos_rtl8125_device_worker_poll_outcome(void); \
+    uint32_t refreshes_before = (s)->identity_refreshes;                       \
+    uint16_t poll_jitter = 0;                                                  \
+    (void)aiueos_cpu_random_bytes((uint8_t *)&poll_jitter,                     \
+                                  sizeof(poll_jitter));                        \
+    aiueos_poll_sched_record((s), aiueos_read_tsc(),                           \
+      aiueos_rtl8125_device_worker_poll_outcome(),                             \
+      AIUEOS_POLL_FAIL_REMOTE, poll_jitter);                                   \
+    if ((s)->enroll_pending) {                                                 \
+      /* 404: the qualification result POST must come first (it is             \
+         enrollment + first heartbeat, D4).  Logged, not improvised:           \
+         the persistent loop has no qualification metrics to send. */          \
+      debug_string("AIUEOS_MURAKUMO_HEARTBEAT_UNENROLLED action=qualification-result-pending\n"); \
+      serial_string("AIUEOS_MURAKUMO_HEARTBEAT_UNENROLLED action=qualification-result-pending wait-ms="); \
+      serial_decimal((uint32_t)(s)->last_delay_ms);                            \
+      serial_string("\r\n");                                                   \
+    }                                                                          \
+    if ((s)->identity_refreshes != refreshes_before) {                         \
+      /* 409: (did,boot,sequence) collided; move to a fresh identity           \
+         namespace (new boot id) before the next send. */                       \
+      aiueos_device_worker_identity_refresh();                                 \
+      debug_string("AIUEOS_MURAKUMO_SEQ_CONFLICT action=refresh-boot-id\n");   \
+      serial_string("AIUEOS_MURAKUMO_SEQ_CONFLICT action=refresh-boot-id wait-ms="); \
+      serial_decimal((uint32_t)(s)->last_delay_ms);                            \
+      serial_string("\r\n");                                                   \
+    }                                                                          \
+    aiueos_k16_management_wait((tsc_hz),                                       \
+      (uint32_t)(((s)->last_delay_ms + 999U) / 1000U));                        \
+  } while (0)
+
+/* Success path: fresh poll = liveness renewed -- the next one is one
+   heartbeat period out (D1, 60 s; server stale window 120 s). */
+#define AIUEOS_POLL_SCHED_SUCCESS_WAIT(s, tsc_hz)                              \
+  do {                                                                         \
+    aiueos_poll_sched_record((s), aiueos_read_tsc(), AIUEOS_POLL_OUTCOME_OK,   \
+      AIUEOS_POLL_FAIL_REMOTE, 0);                                             \
+    aiueos_k16_management_wait((tsc_hz),                                       \
+      (uint32_t)(((s)->last_delay_ms + 999U) / 1000U));                        \
+  } while (0)
+
 #endif
