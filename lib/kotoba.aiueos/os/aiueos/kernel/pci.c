@@ -7,7 +7,6 @@
 #include "device_worker_protocol.h"
 #include "device_poll_scheduler.h"
 #include "kototama_runtime.h"
-
 #define VIRTIO_VENDOR_ID 0x1af4
 #define VIRTIO_RNG_MODERN_ID 0x1044
 #define VIRTIO_RNG_TRANSITIONAL_ID 0x1005
