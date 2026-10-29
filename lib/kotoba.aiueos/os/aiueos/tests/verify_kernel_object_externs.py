@@ -66,3 +66,64 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# ---- data cells, exported data symbols and the apic object (amu JUN-556 D3, D3b, D4) --------------------------------
+APIC = (HERE / "fixtures" / "kernel-object-apic.o").read_bytes()
+GLOBALS = (HERE / "fixtures" / "kernel-object-globals.o").read_bytes()
+APIC_ARGS = dict(exports="aiueos_apic_timer_mask,aiueos_apic_timer_unmask,aiueos_apic_timer_initialize")
+APIC_EXTERNS = "kotoba_aiueos_msr_read,kotoba_aiueos_msr_write"
+APIC_DATA = "aiueos_apic_timer_ticks,aiueos_apic_mmio_base"
+
+
+def run5(blob, exports, externs, data):
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "t.o"
+        path.write_bytes(blob)
+        args = [sys.executable, "-I", str(VERIFY), str(path), "", exports, externs, data]
+        result = subprocess.run(args, capture_output=True, text=True)
+    return result.returncode, (result.stdout + result.stderr).strip()
+
+
+def sections_of(blob):
+    shoff, = struct.unpack_from("<Q", blob, 40)
+    shnum, shstr = struct.unpack_from("<HH", blob, 60)
+    secs = [struct.unpack_from("<IIQQQQIIQQ", blob, shoff + 64 * i) for i in range(shnum)]
+    table = secs[shstr][4]
+    name = lambda o: blob[table + o:blob.index(b"\0", table + o)].decode()
+    return {name(s[0]): (shoff + 64 * i, s) for i, s in enumerate(secs)}
+
+
+def cells_and_symbols():
+    code, out = run5(APIC, APIC_ARGS["exports"], APIC_EXTERNS, APIC_DATA)
+    assert code == 0 and "imports=2 relocations=7 cells=2 data_symbols=2" in out, out
+    code, out = run5(GLOBALS, "f", "sink", "aiueos_apic_timer_ticks,aiueos_apic_mmio_base")
+    assert code == 0 and "cells=4 data_symbols=2" in out, out
+    # the declarations are the contract: missing or extra ones are refused
+    for label, args in (("no data list", (APIC_ARGS["exports"], APIC_EXTERNS, "")),
+                        ("short data list", (APIC_ARGS["exports"], APIC_EXTERNS, "aiueos_apic_timer_ticks")),
+                        ("data symbol named like an export", (APIC_ARGS["exports"], APIC_EXTERNS, "aiueos_apic_timer_mask,aiueos_apic_mmio_base"))):
+        code, _ = run5(APIC, *args)
+        assert code != 0, label
+    secs = sections_of(APIC)
+    text_off = secs[".text"][1][4]
+    data_hdr, data = secs[".data"]
+    rela_off = secs[".rela.text"][1][4]
+    rels = [struct.unpack_from("<QQq", APIC, rela_off + 24 * i) for i in range(7)]
+    cell_rel = next(r for r in rels if r[1] & 0xFFFFFFFF == 2 and r[2] != -4)
+
+    def tamper(label, edit):
+        blob = bytearray(APIC)
+        edit(blob)
+        code, _ = run5(bytes(blob), APIC_ARGS["exports"], APIC_EXTERNS, APIC_DATA)
+        assert code != 0, f"{label} was accepted"
+    tamper("data section grown", lambda b: struct.pack_into("<Q", b, data_hdr + 32, data[5] + 8))
+    tamper("cell not zero", lambda b: b.__setitem__(data[4] + 88, 1))
+    tamper("cell opcode", lambda b: b.__setitem__(text_off + cell_rel[0] - 3, 0x90))
+    tamper("cell displacement", lambda b: b.__setitem__(text_off + cell_rel[0], 1))
+    tamper("cell addend off the grid", lambda b: struct.pack_into("<q", b, rela_off + 24 * rels.index(cell_rel) + 16, cell_rel[2] + 1))
+    tamper("cell addend beyond 63", lambda b: struct.pack_into("<q", b, rela_off + 24 * rels.index(cell_rel) + 16, 80 + 8 * 64 - 4))
+    print("PASS_KERNEL_OBJECT_CELLS 2 accepted, 3 declaration refusals, 6 tampers refused")
+
+
+cells_and_symbols()
