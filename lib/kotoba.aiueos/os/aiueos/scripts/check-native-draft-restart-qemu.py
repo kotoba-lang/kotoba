@@ -4,6 +4,8 @@
 The tiny scratch disk is test input, not a D2 workspace image. No physical disk
 is accepted here. Run the native build queue around this controller as usual.
 """
+import native_regions
+import native_ops
 import argparse
 import hashlib
 import importlib.util
@@ -25,7 +27,7 @@ def pin(path):
 
 def visible_goal_ink(surface_bytes, font_bytes, pixels, goal):
     """Bind restored text draw ops to dark pixels in the QEMU scanout."""
-    surface = struct.unpack('<2048I', surface_bytes)
+    surface = struct.unpack(f'<{native_regions.WINDOW_BYTES // 4}I', surface_bytes)
     assert surface[427] == 0 and 0 < surface[416] <= 259
     windows = [surface[5+5*i:10+5*i] for i in range(surface[1])]
     itonami = [window for window in windows if window[0] == 2]
@@ -33,6 +35,7 @@ def visible_goal_ink(surface_bytes, font_bytes, pixels, goal):
     _, wx, wy, ww, _ = itonami[0]
     count = struct.unpack_from('<I', font_bytes, 8)[0]
     ops = [surface[480+6*i:486+6*i] for i in range(surface[416])]
+    ops = native_ops.expand(ops)
     body = sorted((op for op in ops if op[0] == 2
                    and wx+14 <= op[1] < wx+ww-14
                    and wy+60 <= op[2] < wy+100), key=lambda op: (op[2], op[1]))
@@ -63,7 +66,7 @@ class Guest:
         # approval merely to bind a socket.
         directory.mkdir(mode=0o700)
         rw = struct.unpack_from('<IIQQQQQQ', args.kernel.read_bytes(), 120)
-        assert rw[0:2]==(1, 6) and rw[5]==0x240000, 'unexpected kernel context contract'
+        assert rw[0:2]==(1, 6) and rw[5]==native_regions.RW_MEMSZ, 'unexpected kernel context contract'
         self.context = rw[3]
         command = [str(args.qemu), '-machine', 'q35,accel=tcg', '-cpu', 'max',
                    '-m', '128M', '-smp', '1', '-drive',
@@ -118,11 +121,11 @@ class Guest:
 
     def dump(self, address, name):
         assert self.hmp(f'pmemsave 0x{address:x} 8192 {name}') == ''
-        return struct.unpack('<2048I', (self.directory/name).read_bytes())
+        return struct.unpack(f'<{native_regions.WINDOW_BYTES // 4}I', (self.directory/name).read_bytes())
 
     def state(self):
-        surface = self.dump(self.context+0x238000, 'surface.bin')
-        context = self.dump(self.context+0x23a000, 'context.bin')
+        surface = self.dump(self.context+native_regions.SURFACE_OFFSET, 'surface.bin')
+        context = self.dump(self.context+native_regions.CONTEXT_OFFSET, 'context.bin')
         length = surface[2038]
         signed = lambda v: v if v<0x80000000 else v-0x100000000
         return dict(goal=''.join(chr(c) for c in surface[224:224+length]) if 12<=length<=63 else None,

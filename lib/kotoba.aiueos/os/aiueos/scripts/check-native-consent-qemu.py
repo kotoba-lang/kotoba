@@ -8,6 +8,7 @@ Enter, then checks, from guest memory and from the rendered frame:
   the request is pending does nothing. HMP keys and clicks are synthetic and prove no human
   consent. Reads guest words through private QMP memory snapshots and pixels from screendump; no guest agent, NIC or VNC.
 """
+import native_regions
 import argparse, hashlib, importlib.util, json, re, struct, subprocess, sys, tempfile, time
 from pathlib import Path
 
@@ -85,8 +86,8 @@ def main(args):
     image = args.kernel.read_bytes()
     rw = struct.unpack_from('<IIQQQQQQ', image, 120)
     context = rw[3]
-    assert rw[5] == 0x240000 and context in (0x200000, 0x400000), (hex(context), hex(rw[5]))
-    surface, work = context + 0x238000, context + 0x23a000
+    assert rw[5] == native_regions.RW_MEMSZ and context in (0x200000, 0x400000), (hex(context), hex(rw[5]))
+    surface, work = context + native_regions.SURFACE_OFFSET, context + native_regions.CONTEXT_OFFSET
     # A provisioned 64 KiB scratch disk (test fixture, as in the draft restart gate): the draft save (F5) then really
     # runs against it and uses the browser context scratch 512..2559.
     scratch = out / "scratch.raw"
@@ -104,8 +105,9 @@ def main(args):
         deadline = time.monotonic() + 180
         while time.monotonic() < deadline:
             c = words(work, "context.bin")
-            if c[101] != 0:
-                raise AssertionError(("native renderer refused the frame", hex(c[101])))
+            effects = words(work + native_regions.WINDOW_BYTES, "effects.bin")
+            if effects[56] != 0:
+                raise AssertionError(("native renderer refused the frame", hex(effects[56])))
             event_seen = previous is None or (c[73] > previous[73] if kind == "key" else c[75] > previous[75])
             frame_seen = previous is None or c[79] > previous[79]
             if c[79] >= 1 and c[79] == c[78] and event_seen and frame_seen:
@@ -269,6 +271,20 @@ def main(args):
         keyname = lambda ch: "spc" if ch == " " else ch
         def type_text(text):
             for ch in text: send("sendkey " + keyname(ch), 0.6)
+        # the pointer answers the key request like the keyboard, and the panel is modal for it too
+        send("sendkey f8", 1.5); assert W(87) == 2 and S(2039) == 3
+        windows_before = S(1)
+        move_to(150, 14); click()
+        assert W(87) == 2 and S(1) == windows_before and S(2039) == 3, "a click under the key request must do nothing"
+        move_to(px + 180 + 70, py + 164 + 18); click()
+        assert W(87) == 0 and S(2039) == 0 and W(94) == 3 and seed_words() == [0] * 8, "Deny by pointer on the key request"
+        event("key-request-pointer", modalClickIgnored=True, denyByPointer=True)
+        send("sendkey f8", 1.5); assert W(87) == 2
+        move_to(px + 24 + 70, py + 164 + 18); click()
+        assert W(87) == 4 and S(2039) == 3 + 2**31 and seed_words() == [0] * 8, "Allow by pointer opens the passphrase request"
+        move_to(px + 180 + 70, py + 164 + 18); click()
+        assert W(87) == 0 and S(2039) == 0 and W(94) == 6 and seed_words() == [0] * 8, "Cancel by pointer on the passphrase request"
+        event("passphrase-pointer", allowOpens=True, cancelByPointer=True)
         send("sendkey f8", 1.5); assert W(87) == 2 and S(2039) == 3
         send("sendkey y", 1.5)
         assert W(87) == 4 and S(2039) == 3 + 2**31 and seed_words() == [0] * 8, (W(87), hex(S(2039)))
@@ -283,6 +299,8 @@ def main(args):
                        if shot[2][3 * (y * wd + x):3 * (y * wd + x) + 3] != b"\xff\xff\xff")
         assert stars(pass_panel) == 0 and stars(typed_panel) > 10, (stars(pass_panel), stars(typed_panel))
         assert panel_band(typed_panel, 164, 200) == panel_band(pass_panel, 164, 200), "only the passphrase line changes"
+        hint = lambda shot: panel_band(shot, 128, 156)
+        assert hint(typed_panel) != hint(pass_panel), "typing a short passphrase must change the hint line (weak)"
         send("sendkey ret", 1.5); assert W(87) == 4 and seed_words() == [0] * 8, "a 3-letter passphrase must be ignored"
         type_text("d"); assert W(95) == 4 and S(2039) == 3 + 2**31 + 4 * 256
         send("sendkey backspace", 0.8); assert W(95) == 3 and S(2039) == 3 + 2**31 + 3 * 256
@@ -294,7 +312,13 @@ def main(args):
         # Allow, then a real passphrase, then Enter: the seed is drawn, the proof signed, the seed sealed
         send("sendkey f8", 1.5); assert W(87) == 2 and S(2039) == 3
         send("sendkey y", 1.5); assert W(87) == 4
-        type_text("correct horsex"); send("sendkey backspace", 0.8)
+        type_text("correct h")
+        fair_panel = screenshot("passphrase-fair")
+        assert hint(fair_panel) != hint(typed_panel) and hint(fair_panel) != hint(pass_panel), "9 letters must read fair, not weak"
+        type_text("orsex")
+        good_panel = screenshot("passphrase-good")
+        assert hint(good_panel) != hint(fair_panel) and hint(good_panel) != hint(typed_panel), "14 letters must read good"
+        send("sendkey backspace", 0.8)
         assert W(95) == 13 and S(2039) == 3 + 2**31 + 13 * 256
         send("sendkey ret", 6.0)
         assert W(87) == 0 and W(94) == 1, (W(87), W(94))
@@ -390,7 +414,7 @@ def main(args):
             return sum(1 for y in range(y0, y1) for x in range(180, 330)
                        if raw[2][3 * (y * w + x):3 * (y * w + x) + 3] != b"\xff\xff\xff")
         network_ink, telemetry_ink, below_ink = (ink(after_allow, 205, 223), ink(after_allow, 225, 243),
-                                                 ink(after_allow, 275, 320))
+                                                 ink(after_allow, 312, 352))
         keys_ink = ink(after_allow, 255, 273)
         assert network_ink > 20 and telemetry_ink > 20 and keys_ink > 20 and below_ink == 0, (network_ink, telemetry_ink, keys_ink, below_ink)
         event("pointer-allow", pending=W(87), approved=W(88), stop=W(85),

@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
-"""Fail-closed validation for the x86_64-aiueos-kernel-v1 object ABI."""
+"""Fail-closed validation for the x86_64-aiueos-kernel-v1 object ABI.
+
+usage: verify-kotoba-kernel-object.py OBJECT [SHA256] [EXPORT[,EXPORT...]]
+
+One export is the original contract. A comma-separated list (at most 8) names
+the exports of a multi-export object (amu JUN-556): every name is exactly one
+GLOBAL FUNC in .text, and there is one .rela.text entry per export, each an
+R_X86_64_PC32 with addend -4 against the same local .data context symbol and
+inside .text. Anything else is refused as before.
+"""
 
 import struct
 import sys
@@ -12,7 +21,9 @@ def fail(message: str) -> None:
 
 
 blob = Path(sys.argv[1]).read_bytes()
-expected_symbol = sys.argv[3] if len(sys.argv) > 3 else "kotoba_aiueos_probe"
+expected_symbols = (sys.argv[3] if len(sys.argv) > 3 else "kotoba_aiueos_probe").split(",")
+if not 1 <= len(expected_symbols) <= 8 or len(set(expected_symbols)) != len(expected_symbols) or "" in expected_symbols:
+    fail("export list must be one to eight distinct names")
 if len(sys.argv) > 2 and sys.argv[2] and hashlib.sha256(blob).hexdigest() != sys.argv[2]:
     fail("fixture digest does not match the pinned compiler output")
 if len(blob) < 64 or blob[:16] != b"\x7fELF\x02\x01\x01\x00" + b"\0" * 8:
@@ -68,23 +79,31 @@ symbols = []
 for offset in range(0, len(section_bytes(sym_index)), 24):
     name, info, other, shndx, value, size = struct.unpack_from("<IBBHQQ", section_bytes(sym_index), offset)
     symbols.append((string_at(symbol_strings, name), info, other, shndx, value, size))
-probes = [item for item in symbols if item[0] == expected_symbol]
-if len(probes) != 1:
-    fail(f"requires exactly one {expected_symbol} symbol")
-_, info, other, shndx, _, size = probes[0]
-if info != 0x12 or other != 0 or shndx != by_name[".text"] or size == 0:
-    fail("export must be a default-visibility GLOBAL FUNC defined in .text")
+for expected_symbol in expected_symbols:
+    probes = [item for item in symbols if item[0] == expected_symbol]
+    if len(probes) != 1:
+        fail(f"requires exactly one {expected_symbol} symbol")
+    _, info, other, shndx, _, size = probes[0]
+    if info != 0x12 or other != 0 or shndx != by_name[".text"] or size == 0:
+        fail("export must be a default-visibility GLOBAL FUNC defined in .text")
 if any(item[3] == 0 and item[0] for item in symbols):
     fail("undefined/imported symbols are forbidden")
 rela = sections[by_name[".rela.text"]]
-if rela[1] != 4 or rela[9] != 24 or rela[6] != sym_index or rela[7] != by_name[".text"] or rela[5] != 24:
-    fail("requires exactly one .rela.text entry")
-rel_offset, rel_info, addend = struct.unpack("<QQq", section_bytes(by_name[".rela.text"]))
-symbol_index, relocation_type = rel_info >> 32, rel_info & 0xFFFFFFFF
-if symbol_index >= len(symbols) or relocation_type != 2 or addend != -4:
-    fail("relocation must be R_X86_64_PC32 with addend -4")
-if symbols[symbol_index][3] != by_name[".data"]:
-    fail("relocation target must be defined in .data")
-if rel_offset + 4 > len(section_bytes(by_name[".text"])):
-    fail("relocation offset exceeds .text")
-print(f"AIUEOS_KOTOBA_OBJECT_OK target=x86_64-aiueos-kernel-v1 export={expected_symbol} imports=0 relocations=1")
+count = len(expected_symbols)
+if rela[1] != 4 or rela[9] != 24 or rela[6] != sym_index or rela[7] != by_name[".text"] or rela[5] != 24 * count:
+    fail("requires exactly one .rela.text entry" if count == 1 else f"requires exactly {count} .rela.text entries")
+text_size = len(section_bytes(by_name[".text"]))
+data_symbols = set()
+for entry in range(count):
+    rel_offset, rel_info, addend = struct.unpack_from("<QQq", section_bytes(by_name[".rela.text"]), entry * 24)
+    symbol_index, relocation_type = rel_info >> 32, rel_info & 0xFFFFFFFF
+    if symbol_index >= len(symbols) or relocation_type != 2 or addend != -4:
+        fail("relocation must be R_X86_64_PC32 with addend -4")
+    if symbols[symbol_index][3] != by_name[".data"]:
+        fail("relocation target must be defined in .data")
+    if rel_offset + 4 > text_size:
+        fail("relocation offset exceeds .text")
+    data_symbols.add(symbol_index)
+if len(data_symbols) != 1:
+    fail("every relocation must name the same context symbol")
+print(f"AIUEOS_KOTOBA_OBJECT_OK target=x86_64-aiueos-kernel-v1 export={','.join(expected_symbols)} imports=0 relocations={count}")

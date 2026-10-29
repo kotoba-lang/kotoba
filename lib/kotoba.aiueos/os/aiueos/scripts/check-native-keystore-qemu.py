@@ -11,6 +11,7 @@ again, and a consent-bound signature (F7) verifies under the boot-1 public key. 
 value; only the sealed blob is on the disk (the gate also checks that the seed is not in the disk image).
 QEMU TCG, synthetic input: it proves no human consent and no physical-disk behaviour.
 """
+import native_regions
 import argparse, hashlib, importlib.util, json, os, re, select, struct, subprocess, time
 from pathlib import Path
 
@@ -28,8 +29,8 @@ class Boot:
         image = args.kernel.read_bytes()
         rw = struct.unpack_from("<IIQQQQQQ", image, 120)
         context = rw[3]
-        assert rw[5] == 0x240000 and context in (0x200000, 0x400000), (hex(context), hex(rw[5]))
-        self.surface, self.work = context + 0x238000, context + 0x23a000
+        assert rw[5] == native_regions.RW_MEMSZ and context in (0x200000, 0x400000), (hex(context), hex(rw[5]))
+        self.surface, self.work = context + native_regions.SURFACE_OFFSET, context + native_regions.CONTEXT_OFFSET
         self.out, self.name = out, name
         cmd = [str(args.qemu), "-machine", "q35,accel=tcg", "-cpu", "max", "-m", "128M", "-smp", "1",
                "-drive", f"if=pflash,format=raw,readonly=on,file={args.firmware}",
@@ -93,6 +94,33 @@ class Boot:
         w = shot[0]
         return [shot[2][3 * (y * w + x):3 * (y * w + x) + 3] for y in range(y0, y1) for x in range(x0, x1)]
 
+    def move_to(self, x, y):
+        for _ in range(60):
+            cx, cy = self.S(2046) - 1, self.S(2047)
+            dx, dy = x - cx, y - cy
+            if abs(dx) <= 2 and abs(dy) <= 2: return
+            step = lambda v: max(-100, min(100, v))
+            self.send(f"mouse_move {step(dx)} {step(dy)}", 0.4)
+        raise AssertionError(("pointer did not reach target", x, y))
+
+    def click(self):
+        self.send("mouse_button 1", 0.5); self.send("mouse_button 0", 1.5)
+
+    def itonami(self):
+        for i in range(self.S(1)):
+            if self.S(5 + 5 * i) == 2:
+                return [self.S(6 + 5 * i), self.S(7 + 5 * i), self.S(8 + 5 * i), self.S(9 + 5 * i)]
+        raise AssertionError("no Itonami window")
+
+    def key_button(self):
+        wx, wy, ww, wh = self.itonami()
+        assert wh > 270 and ww >= 200, (ww, wh)
+        return wx + 14, wy + 232, 150, 26
+
+    def press_key_button(self):
+        x, y, w, h = self.key_button()
+        self.move_to(x + w // 2, y + h // 2); self.click()
+
     def quit(self):
         try: self.send("quit", 0.5)
         except Exception: pass
@@ -115,6 +143,23 @@ def main(args):
         assert b.W(96) == 0 and b.S(2039) == 0, "a blank disk must not look like a stored key"
         b.send("sendkey 2", 1.5); b.send("sendkey a", 1.5)
         home_none = b.screenshot("home-none")
+        bx, by, bw, bh = b.key_button()
+        btn = lambda shot: b.band(shot, bx, bx + bw, by, by + bh)
+        assert sum(1 for px in btn(home_none) if px != b"\xff\xff\xff") > 3000, "the key button must be drawn (blue, 150 x 26)"
+        b.press_key_button()
+        assert b.W(87) == 2 and b.S(2039) == 3, ("the Create key button must open the key request", b.W(87), hex(b.S(2039)))
+        b.send("sendkey n", 1.5); assert b.W(87) == 0
+        events.append(dict(name="key-button-create", opensKeyRequest=True))
+        # With a second window open the frame used to sit at 252..254 of 259 ops and the button gave way; pair ops leave room.
+        b.send("sendkey 1", 1.5); b.send("sendkey 2", 1.5)
+        assert b.S(1) == 2, ("two windows must be open", b.S(1))
+        two_win = b.screenshot("home-two-windows")
+        bx, by, bw, bh = b.key_button()
+        assert sum(1 for px in b.band(two_win, bx, bx + bw, by, by + bh) if px != b"\xff\xff\xff") > 3000, ("the key button must be drawn with two windows", b.S(416))
+        b.press_key_button()
+        assert b.W(87) == 2 and b.S(2039) == 3, ("the button must open the key request with two windows", b.W(87), hex(b.S(2039)))
+        b.send("sendkey n", 1.5); assert b.W(87) == 0
+        events.append(dict(name="key-button-two-windows", windows=2, opensKeyRequest=True))
         key_row = lambda shot: b.band(shot, 180, 330, 170, 188)
         assert sum(1 for px in key_row(home_none) if px != b"\xff\xff\xff") > 20, "the key row must be drawn"
         b.send("sendkey f8", 1.5); assert b.W(87) == 2
@@ -149,8 +194,20 @@ def main(args):
         assert key_row(home_none) != key_row(home_locked), "the key row must say locked, not none"
         assert did_band(home_none) != did_band(home_locked), "the DID line must read differently when a sealed key is stored"
         assert sum(1 for px in did_band(home_locked) if px != b"\xff\xff\xff") > 20, "the locked DID line must be drawn"
+        bx, by, bw, bh = b.key_button()
+        assert btn(home_locked) != btn(home_none), "the key button must say Unlock, not Create key"
+        b.press_key_button()
+        assert b.W(87) == 4 and b.W(98) == 1, ("the Unlock button must open the unlock request", b.W(87), b.W(98))
+        b.send("sendkey esc", 1.5); assert b.W(87) == 0 and b.W(94) == 6
+        # a locked key also shows a Forget button (red, 110 x 26) beside Unlock; it opens the forget request (passphrase kind 2)
+        fx, fy, fw, fh = bx + 160, by, 110, 26
+        assert sum(1 for px in b.band(home_locked, fx, fx + fw, fy, fy + fh) if px != b"\xff\xff\xff") > 2500, "the Forget button must be drawn while locked"
+        assert sum(1 for px in b.band(home_none, fx, fx + fw, fy, fy + fh) if px != b"\xff\xff\xff") < 100, "no Forget button without a stored key"
+        b.move_to(fx + fw // 2, fy + fh // 2); b.click()
+        assert b.W(87) == 4 and b.W(98) == 2, ("the Forget button must open the forget request", b.W(87), b.W(98))
+        b.send("sendkey esc", 1.5); assert b.W(87) == 0
         b.send("sendkey f7", 1.5); assert b.W(87) == 0, "signing must be impossible while the key is locked"
-        events.append(dict(name="boot2-locked", locked=True, blobEqualsDisk=True, seedInRam=False, signingRefused=True))
+        events.append(dict(name="boot2-locked", locked=True, blobEqualsDisk=True, seedInRam=False, signingRefused=True, forgetButton=True))
         # wrong passphrase: refused, still locked
         b.send("sendkey f8", 1.5)
         assert b.W(87) == 4 and b.W(98) == 1 and b.S(2039) == 128 + 3 + 2**31 + 8192, (b.W(87), b.W(98), hex(b.S(2039)))
@@ -168,9 +225,42 @@ def main(args):
         assert key_row(home_wrong) != key_row(home_locked), "the key row must say the passphrase was wrong"
         assert b.words(928, 8) == bytes(32) and b.words(832, 8) == bytes(32), "a refused unlock must leave no seed and no passphrase"
         events.append(dict(name="unlock-wrong-passphrase", refused=True, stillLocked=True, seedBytes=b.words(928, 8).hex()))
-        # right passphrase: the boot-1 key is back
-        b.send("sendkey f8", 1.5); assert b.W(87) == 4 and b.W(98) == 1
-        b.type_text(PASS); b.send("sendkey ret", 8.0)
+        # the delay: keep guessing wrong until the guest refuses to try (no TSC frequency is assumed)
+        assert (b.W(101), b.W(102)) == (0, 0), "no deadline before the 3rd failure"
+        refused_at = None
+        for n in range(2, 14):
+            b.send("sendkey f8", 1.5); assert b.W(87) == 4 and b.W(98) == 1
+            b.type_text(WRONG); b.send("sendkey ret", 8.0)
+            if b.W(94) == 15: refused_at = n; break
+            assert b.W(94) == 8 and b.W(100) == n and attempts_on_disk() == n, (n, b.W(94), b.W(100), attempts_on_disk())
+        assert refused_at is not None and refused_at >= 4, ("the guest never refused", refused_at)
+        assert b.W(87) == 0 and b.W(96) == 1 and (b.S(2039) >> 16) & 1 == 1, (b.W(87), b.W(96), hex(b.S(2039)))
+        assert b.W(100) == refused_at - 1 and attempts_on_disk() == refused_at - 1, "a refused attempt must not be counted"
+        assert b.words(928, 8) == bytes(32) and b.words(832, 8) == bytes(32), "a refused attempt must run no unlock and leave nothing"
+        assert (b.W(101), b.W(102)) != (0, 0), "the deadline must be set"
+        # UI redraw/selection must not overwrite either half of the key deadline.
+        saved_deadline = (b.W(101), b.W(102))
+        b.send("sendkey right", 1.5)
+        assert (b.W(101), b.W(102)) == saved_deadline, "redraw changed the key deadline"
+        b.send("sendkey esc", 1.5)
+        assert (b.W(101), b.W(102)) == saved_deadline, "selection cancel changed the key deadline"
+        home_wait = b.screenshot("home-wait")
+        assert key_row(home_wait) != key_row(home_wrong) and key_row(home_wait) != key_row(home_locked), "the key row must say to wait"
+        events.append(dict(name="attempt-delay", refusedAtAttempt=refused_at, attemptsRecorded=refused_at - 1,
+                           refusedAttemptNotCounted=True, deadlineSet=True, keyRowSaysWait=True))
+        # a reboot does not skip the wait: the deadline is set from the boot when the record holds 3 or more attempts
+        b.quit()
+        b = Boot(args, out, "boot2c", scratch)
+        assert b.W(96) == 1 and b.W(100) == refused_at - 1 and (b.W(101), b.W(102)) != (0, 0), (b.W(100), b.W(101), b.W(102))
+        b.send("sendkey 2", 1.5); b.send("sendkey a", 1.5)
+        events.append(dict(name="delay-after-reboot", attempts=refused_at - 1, deadlineSetFromBoot=True))
+        # right passphrase: the boot-1 key is back (retried until the deadline has passed)
+        for _ in range(80):
+            b.send("sendkey f8", 1.5); assert b.W(87) == 4 and b.W(98) == 1
+            b.type_text(PASS); b.send("sendkey ret", 8.0)
+            if b.W(94) == 9: break
+            assert b.W(94) == 15, ("only the delay may refuse the right passphrase", b.W(94))
+            time.sleep(10)
         assert b.W(87) == 0 and b.W(94) == 9 and b.W(96) == 0, (b.W(87), b.W(94), b.W(96))
         seed2, pub2 = b.words(928, 8), b.words(320, 8)
         flags2 = b.S(2039)
@@ -194,7 +284,8 @@ def main(args):
         # Lock (F6): everything secret leaves RAM, the key goes back to the locked state, the disk is untouched
         count = (b.S(2039) >> 2) & 15
         disk_before = scratch.read_bytes()
-        b.send("sendkey f6", 4.0)
+        assert btn(home_ready) != btn(home_locked) and btn(home_ready) != btn(home_none), "the key button must say Lock"
+        b.press_key_button(); time.sleep(3)
         assert b.W(87) == 0 and b.W(94) == 11 and b.W(96) == 1, (b.W(87), b.W(94), b.W(96))
         assert b.S(2039) == count * 4 + 128, (hex(b.S(2039)), count)
         zero = bytes(32)
@@ -235,6 +326,7 @@ def main(args):
         b.quit()
         b = Boot(args, out, "boot2b", scratch)
         assert b.W(96) == 1 and b.W(100) == 1 and b.S(2039) == 128, (b.W(96), b.W(100), hex(b.S(2039)))
+        assert (b.W(101), b.W(102)) == (0, 0), "under 3 attempts there is no deadline after a boot"
         count = 0   # the Approved count is per boot
         b.send("sendkey 2", 1.5); b.send("sendkey a", 1.5)
         events.append(dict(name="attempt-count-after-reboot", count=1, wrongFlagNotPersisted=True))

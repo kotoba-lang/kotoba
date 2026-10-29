@@ -10,6 +10,7 @@ returned 0 for all four, or none, fails. There is no ipfs:// scheme handler and 
 this proves the kernel can decide that bytes are the content a CID names, not that a URL was opened.
 Input is not used; QEMU TCG only.
 """
+import native_regions
 import argparse, hashlib, json, os, re, select, struct, subprocess, time
 from pathlib import Path
 
@@ -28,8 +29,8 @@ def main(a):
     media_before = pin(a.media)
     image = a.kernel.read_bytes()
     rw = struct.unpack_from("<IIQQQQQQ", image, 120); context = rw[3]
-    assert rw[5] == 0x240000 and context in (0x200000, 0x400000), (hex(context), hex(rw[5]))
-    work = context + 0x23a000
+    assert rw[5] == native_regions.RW_MEMSZ and context in (0x200000, 0x400000), (hex(context), hex(rw[5]))
+    work = context + native_regions.CONTEXT_OFFSET
     cmd = [str(a.qemu), "-machine", "q35,accel=tcg", "-cpu", "max", "-m", "128M", "-smp", "1",
            "-drive", f"if=pflash,format=raw,readonly=on,file={a.firmware}",
            "-drive", f"file={a.media},format=raw,if=ide,snapshot=on", "-boot", "order=c",

@@ -134,6 +134,10 @@ def main(args):
     if args.amu_source.is_symlink() or args.owner_repo_root.is_symlink():
         raise ValueError("source roots must not be symlinks")
     amu = args.amu_source.resolve(strict=True)
+    # the gates keep one region table (native_regions.py); the compiler's definition (Amu seed/97) must equal it
+    sys.path.insert(0, str(HERE))
+    import native_regions
+    native_regions.verify_amu(amu)
     owners = args.owner_repo_root.resolve(strict=True)
     if not amu.is_dir() or not owners.is_dir():
         raise ValueError("source roots must be directories")
@@ -165,7 +169,7 @@ def main(args):
             "build-native-media-macos.py", "check-native-desktop-qemu.py",
             "check-native-draft-restart-qemu.py", "check-native-consent-qemu.py",
             "check-native-idle-silent-qemu.py", "check-native-cid-qemu.py", "check-native-sha512-qemu.py", "check-native-gf25519-qemu.py", "check-native-ed25519-qemu.py", "check-native-keyseal-qemu.py", "check-native-keystore-qemu.py",
-            "check-native-media-format.py",
+            "check-native-media-format.py", "native_regions.py", "native_ops.py",
             "check-native-shell-material-qemu.py", "check-native-gui-effects-qemu.py",
         )
     }
@@ -316,11 +320,11 @@ def main(args):
                            else "PASS_NATIVE_KEYSTORE_QEMU" if args.profile == "keystore"
                            else "PASS_NATIVE_DESKTOP_INPUT_QEMU")
         expected_events = (12 if args.profile == "local-draft"
-                           else 20 if args.profile == "consent"
+                           else 22 if args.profile == "consent"
                            else 4 if args.profile == "idle"
-                           else 3 if args.profile == "ed25519"
-                           else 12 if args.profile == "keystore"
-                           else 2 if args.profile in ("cid", "sha512", "gf25519", "keyseal") else 21)
+                           else 4 if args.profile == "ed25519"
+                           else 16 if args.profile == "keystore"
+                           else 2 if args.profile in ("cid", "sha512", "gf25519", "keyseal") else 24)
         if (observed["status"] != expected_status
                 or len(observed["events"]) != expected_events
                 or observed["kernel"] != kernel_state["kernel"]
@@ -371,7 +375,7 @@ def main(args):
                 raise ValueError("gf25519 verdict is incomplete")
         elif args.profile == "ed25519":
             if (observed["font"] != font_state["padded"]
-                    or [row["name"] for row in observed["events"]] != ["first-frame", "ed25519-pubkey", "ed25519-sign"]
+                    or [row["name"] for row in observed["events"]] != ["first-frame", "ed25519-pubkey", "ed25519-sign", "ed25519-verify"]
                     or len(observed["events"][1]["keys"]) != 3
                     or len(observed["events"][2]["signatures"]) != 3
                     or not observed["signing"] or observed["deviceKey"] or observed["physicalHardware"]):
@@ -379,7 +383,7 @@ def main(args):
         elif args.profile == "keystore":
             if (observed["font"] != font_state["padded"]
                     or [row["name"] for row in observed["events"]] != [
-                        "boot1-create", "boot2-locked", "unlock-wrong-passphrase", "unlock-right-passphrase", "sign-after-unlock",
+                        "key-button-create", "key-button-two-windows", "boot1-create", "boot2-locked", "unlock-wrong-passphrase", "attempt-delay", "delay-after-reboot", "unlock-right-passphrase", "sign-after-unlock",
                         "lock", "unlock-after-lock", "forget-wrong-passphrase", "attempt-count-after-reboot", "forget", "forgotten-after-reboot",
                         "lock-refused-unstored"]
                     or not observed["persistedAcrossReboot"] or not observed["wrongPassphraseRefused"]
@@ -399,7 +403,7 @@ def main(args):
                         "first-frame", "entropy-probe", "itonami-goal-typed", "collapse-key", "collapse-click",
                         "consent-open",
                         "launcher-key-ignored", "launcher-click-ignored", "minimize-and-dock-blocked-by-consent", "key-deny",
-                        "pointer-deny", "esc-deny", "key-request-blocks-background-pointer", "key-deny", "passphrase-cancel", "key-allow",
+                        "pointer-deny", "esc-deny", "key-request-blocks-background-pointer", "key-deny", "key-request-pointer", "passphrase-pointer", "passphrase-cancel", "key-allow",
                         "sign-deny", "sign-allow", "draft-after-key", "pointer-allow"]
                     or observed["syntheticInputProvesHumanConsent"]):
                 raise ValueError("consent surface verdict is incomplete")

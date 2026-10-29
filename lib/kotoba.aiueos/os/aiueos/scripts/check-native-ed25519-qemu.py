@@ -10,6 +10,7 @@ device key exists. It also signs the three RFC 8032 section 7.1 messages (length
 same seeds and compares the 64-byte signatures byte for byte with the published ones (words 768.. of the context).
 QEMU TCG only.
 """
+import native_regions
 import argparse, hashlib, json, os, re, select, struct, subprocess, time
 from pathlib import Path
 
@@ -37,8 +38,8 @@ def main(a):
     media_before = pin(a.media)
     image = a.kernel.read_bytes()
     rw = struct.unpack_from("<IIQQQQQQ", image, 120); context = rw[3]
-    assert rw[5] == 0x240000 and context in (0x200000, 0x400000), (hex(context), hex(rw[5]))
-    work = context + 0x23a000
+    assert rw[5] == native_regions.RW_MEMSZ and context in (0x200000, 0x400000), (hex(context), hex(rw[5]))
+    work = context + native_regions.CONTEXT_OFFSET
     cmd = [str(a.qemu), "-machine", "q35,accel=tcg", "-cpu", "max", "-m", "128M", "-smp", "1",
            "-drive", f"if=pflash,format=raw,readonly=on,file={a.firmware}",
            "-drive", f"file={a.media},format=raw,if=ide,snapshot=on", "-boot", "order=c",
@@ -81,6 +82,28 @@ def main(a):
             sigs.append(dict(case=name, signature=raw.hex(), messageLength=(0, 1, 2)[k]))
         assert len({s["signature"] for s in sigs}) == 3, "the three signatures must differ"
         events.append(dict(name="ed25519-sign", signatures=sigs))
+        # verification in the guest (RFC 8032 5.1.7): the three signatures just made verify, six altered ones do not
+        assert words(98, 1)[0] == int.from_bytes(b"VRFY", "big"), "the verify self-test did not finish"
+        got = words(896, 9)
+        assert got == [1, 1, 1, 0, 0, 0, 0, 0, 0], ("valid x3 then six refusals", got)
+        # the same inputs through the host-side reference: every refused case is invalid there too
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("consent_gate", Path(__file__).resolve().parent / "check-native-consent-qemu.py")
+        consent = importlib.util.module_from_spec(spec); spec.loader.exec_module(consent)
+        pubs = [bytes.fromhex(h) for _, h in CASES]
+        sg = [bytes.fromhex(h) for _, h in SIGS]
+        msgs = [b"", bytes([114]), bytes([175, 130])]
+        for k in range(3): assert consent.ed_verify(pubs[k], msgs[k], sg[k]), ("reference rejects an RFC vector", k)
+        flipped = lambda b, i: b[:i] + bytes([b[i] ^ 1]) + b[i + 1:]
+        L = 2**252 + 27742317777372353535851937790883648493
+        s_big = sg[1][:32] + (int.from_bytes(sg[1][32:], "little") | (0xff << 248)).to_bytes(32, "little")
+        assert int.from_bytes(s_big[32:], "little") >= L
+        refused = [(pubs[1], flipped(msgs[1], 0), sg[1]), (pubs[1], msgs[1], flipped(sg[1], 0)), (pubs[1], msgs[1], flipped(sg[1], 32)),
+                   (pubs[2], msgs[1], sg[1])]
+        for pk, m, sig in refused: assert not consent.ed_verify(pk, m, sig), "reference accepts an altered input"
+        events.append(dict(name="ed25519-verify", valid=got[:3], refused=got[3:], refusedCases=[
+            "changed message", "changed R", "changed S", "foreign public key", "S >= L", "public key not on the curve"],
+            referenceAgrees=True))
         send("quit", 0.5)
     finally:
         try: proc.wait(timeout=15)
@@ -88,7 +111,7 @@ def main(a):
     assert pin(a.media) == media_before, "media changed"
     report = dict(status="PASS_NATIVE_ED25519_QEMU", kernel=pin(a.kernel), efi=pin(a.efi), media=media_before,
                   font=pin(a.font), firmware=pin(a.firmware), observer=pin(Path(__file__)), events=events,
-                  signing=True, deviceKey=False, physicalHardware=False, syntheticInput=False)
+                  signing=True, verifying=True, deviceKey=False, physicalHardware=False, syntheticInput=False)
     (out / "native-ed25519-qemu.json").write_text(json.dumps(report, indent=2) + "\n")
     print(report["status"], len(keys), "keys")
 

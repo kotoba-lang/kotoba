@@ -50,11 +50,11 @@ def main(args):
         return dict(magic=c[72], keys=c[73], lastKey=c[77],
                     frames=c[79], framesStarted=c[78], packets=c[75],
                     x=c[50], y=c[51], pressed=c[67], reduced=c[99], selected=e[29], attempts=c[100],
-                    renderError=c[101], effectActive=c[103], clockScale=c[110],
+                    renderError=e[56], effectActive=c[103], clockScale=c[110],
                     clockMS=c[111], calibration=list(c[126:128]),
                     frameMS=c[116], maxFrameMS=c[122], missed=c[120],
                     blurRows=c[123], blurSkipped=c[124], blur=c[125],
-                    sharedEffectsCheck=c[102], mute=c[105], volume=c[106],
+                    sharedEffectsCheck=e[57], mute=c[105], volume=c[106],
                     audioReady=c[107], event=c[108], eventCount=c[109],
                     focus=s[2], windows=s[1], pending=c[87],
                     width=s[3], height=s[4],
@@ -69,8 +69,12 @@ def main(args):
                        and now["frames"] == now["framesStarted"], timeout=150)
         assert s["renderError"] == 0 and s["overflow"] == 0 and 0 < s["opCount"] <= 259, s
         for kind, x, y, a, b, _ in s["ops"]:
-            assert 1 <= kind <= 6 and x >= 0 and y >= 0
-            width, height = (b, 16) if kind == 2 else (a, b)
+            assert 1 <= kind <= 7 and x >= 0 and y >= 0
+            if kind == 3:
+                assert (b & 255) in (8, 16) and (b >> 8) in (8, 16)
+                width, height = (b & 255) + (b >> 8), 16
+            else:
+                width, height = (b, 16) if kind == 2 else (a, b)
             assert x + width <= s["width"] and y + height <= s["height"], (kind, x, y, a, b)
         return s
 
@@ -131,7 +135,7 @@ def main(args):
         selected = key("keyboard-focus", "right", lambda s: s["selected"] == 1)
         assert selected["windows"] == 0 and selected["pending"] == 0
         assert selected["attempts"] == first["attempts"], "Dock modified key attempts"
-        assert any(op[0] == 3 and op[5] == 0x6755ff for op in selected["ops"])
+        assert any(op[0] == 7 and op[5] == 0x6755ff for op in selected["ops"])
         screenshot("keyboard-focus")
         key("keyboard-cancel", "esc", lambda s: s["selected"] == 0 and s["windows"] == 0)
         key("keyboard-first", "right", lambda s: s["selected"] == 1)
