@@ -1264,10 +1264,13 @@ if [ "${AIUEOS_MURAKUMO_DEVICE_RESULT:-0}" = 1 ]; then
   zig cc -target x86_64-freestanding-none -std=c11 -O2 \
     -ffreestanding -fno-stack-protector -mno-red-zone \
     -c -o "$kernel_device_result_object" "$aiueos/kernel/device_result.c"
-  zig cc -target x86_64-freestanding-none -std=c11 -O2 \
-    -ffreestanding -fno-stack-protector -mno-red-zone \
-    -c -o "$kernel_device_worker_protocol_object" \
-    "$aiueos/kernel/device_worker_protocol.c"
+  # JUN-556: device_worker_protocol is the Kotoba object kotoba/device-worker-protocol.o (Amu object route, D5 + D6),
+  # not a C compile. kernel/device_worker_protocol.c stays as the reference scripts/apic-x86-smoke compares against.
+  kotoba_dwp_object=${AIUEOS_KOTOBA_DEVICE_WORKER_PROTOCOL_OBJECT:-"$aiueos/kotoba/device-worker-protocol.o"}
+  python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_dwp_object" \
+    8f5a190310c27a676bee4ce1a7f0e930bd3a17ba960ef20cf860bc2b1ada2dc6 \
+    aiueos_device_worker_poll_response kotoba_aiueos_device_worker_poll_response
+  cp "$kotoba_dwp_object" "$kernel_device_worker_protocol_object"
 fi
 if [ -z "$model_handoff_link" ] && [ -n "$qwen35_parity_cflags" ]; then
   # The parity build compiles the reference C without the model handoff, so

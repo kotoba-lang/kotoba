@@ -19,7 +19,7 @@ fourth argument the contract is exactly the previous one.
 
 Data cells (amu JUN-556 D3, D3b): .data may hold, after the 80-byte context, 8-byte cells at 80 + 8k (k < 64).
 Every further R_X86_64_PC32 relocation must name the context symbol with addend 80 + 8k - 4 and sit on the zero
-displacement of `mov rax,[rip+disp]` (48 8b 05) or `mov [rip+disp],rax` (48 89 05). The optional fifth argument
+displacement of `mov rax,[rip+disp]` (48 8b 05), `mov [rip+disp],rax` (48 89 05) or `lea rax,[rip+disp]` (48 8d 05, the cell's address for an extern, D6). The optional fifth argument
 names data symbols (at most 16): each is exactly one GLOBAL OBJECT of size 8 in .data at 80 + 8j, distinct from
 every other name. .data is exactly 80 + 8 * (highest cell used or named + 1) bytes and the cells are zero.
 Fixed-address MMIO (D4) is an immediate in .text and adds no relocation, symbol or data to check here.
@@ -181,8 +181,8 @@ for entry in range(count, count + extras):
         k, rest = divmod(addend + 4 - 80, 8)
         if symbol_index != context_index or rest != 0 or not 0 <= k < 64:
             fail("a cell access must be R_X86_64_PC32 against the context with addend 80 + 8k - 4, k < 64")
-        if rel_offset < 3 or rel_offset + 4 > text_size or text[rel_offset - 3:rel_offset] not in (bytes.fromhex("488b05"), bytes.fromhex("488905")):
-            fail("a cell access must be mov rax,[rip+disp] or mov [rip+disp],rax")
+        if rel_offset < 3 or rel_offset + 4 > text_size or text[rel_offset - 3:rel_offset] not in (bytes.fromhex("488b05"), bytes.fromhex("488905"), bytes.fromhex("488d05")):
+            fail("a cell access must be mov rax,[rip+disp], mov [rip+disp],rax or lea rax,[rip+disp] (amu JUN-556 D6, the cell's address)")
         if text[rel_offset:rel_offset + 4] != b"\0\0\0\0":
             fail("a cell access displacement must be zero for the linker")
         cells_used = max(cells_used, k + 1)
