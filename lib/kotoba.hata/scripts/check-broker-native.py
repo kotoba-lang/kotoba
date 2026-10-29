@@ -50,6 +50,13 @@ def main():
     gate.run('quorum-and-existing-admission', image)
     reader = gate.build('read', 'hata/read_native_test.kotoba', sources(read=True))
     gate.run('fresh-read-verdicts', reader)
+    # Negative control: a reader that ignores pending votes adopts the stale
+    # committed head instead of recovering the undistributed certificate.
+    blind = sources(read=True)
+    before = b'votes (if (= (vector-count best) 0) (vector-i64) (votes-for batch offs top best))'
+    assert blind['hata/read.kotoba'].count(before) == 1
+    blind['hata/read.kotoba'] = blind['hata/read.kotoba'].replace(before, b'votes (vector-i64)')
+    gate.run('pending-blind-reader-detected', gate.build('read-blind-control', 'hata/read_native_test.kotoba', blind), 3003)
     driver = gate.build('broker', 'hata/broker_native_test.kotoba', sources(True))
     coordinator = gate.out / 'coordinator'
     sink = gate.out / 'sink'
@@ -61,6 +68,13 @@ def main():
     def copy(source, target, names):
         for name in names:
             shutil.copyfile(source / name, target / name)
+    def fresh(label, indices, expected, stale=()):
+        # The coordinator receives attestations as opaque bytes; only the
+        # native guest signs, verifies and decides.
+        for k, i in enumerate(indices):
+            run(f'{label}-attest-{i}', 'attest-stale' if i in stale else 'attest', nodes[i], option=str(i))
+            shutil.copyfile(nodes[i] / 'attestation', coordinator / f'att{k}')
+        run(label, 'fresh', coordinator, expected)
     def certify(label):
         # Opaque byte transport. Only the native guest chooses/verifies votes.
         for i in range(3):
@@ -101,6 +115,11 @@ def main():
                 copy(coordinator, nodes[0], ['request'])
                 run('crash-restart-cannot-equivocate', 'no-equivocation', nodes[0])
                 shutil.copyfile(coordinator / 'original', coordinator / 'request')
+        if label == 'claim':
+            # Votes held, certificate not yet distributed (coordinator may be lost).
+            fresh('fresh-qc-undistributed-recovered', [0, 1, 2], 2)
+            fresh('fresh-two-votes-unresolved', [0, 1, 3], 3)
+            fresh('fresh-stale-attestation-refused', [0, 1, 2], 0, stale=(2,))
         run(label + '-assemble', 'certificate', coordinator)
         for i in range(4):
             copy(coordinator, nodes[i], ['request', 'certificate'])
@@ -114,6 +133,10 @@ def main():
     copy(coordinator, sink, ['request', 'certificate'])
     run('install', 'install', sink)
     run('install-retry', 'install', sink, 2)
+    fresh('fresh-committed-fence', [1, 2, 3], 1)
+    shutil.copyfile(coordinator / 'latest', gate.out / 'fence-latest')
+    shutil.copyfile(coordinator / 'latest', nodes[3] / 'latest')
+    run('fresh-value-recovered', 'block', nodes[3])
     run('reserve', 'reserve', coordinator)
     certify('claim')
     copy(coordinator, sink, ['request', 'certificate', 'command'])
@@ -154,6 +177,8 @@ def main():
     for block in nodes[0].glob('quorum-value-*'):
         block.write_bytes(b'corrupt')
     run('retained-data-corruption-refused', 'corrupt-current', nodes[0])
+    shutil.copyfile(gate.out / 'fence-latest', nodes[0] / 'latest')
+    run('fresh-corrupt-value-refused', 'block', nodes[0], -21)
     # A second sink is an isolated test fixture, never a production failover
     # replica. It demonstrates conservative abandonment of an unexecuted claim.
     abandoned = gate.out / 'abandoned'
