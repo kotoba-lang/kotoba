@@ -57,17 +57,19 @@ existing owners; Awai presets do not create another language or OS fork.
 
 ## Try Kotoba with Amu
 
-Use the [canonical Kotoba / Amu first-run guide](https://github.com/kotoba-lang/amu/blob/main/examples/foundation-starter/README.md).
-It provides an immutable checkout, compiler and sample digest checks, and
-commands to check, compile and run a small Kotoba program. Change its result
-from 42 to 43, then observe explicit fuel and capability refusals. No account,
-Awai membership, model download or payment is required.
+On an Apple Silicon Mac, use the [native Mac ARM64 first-run guide](https://github.com/kotoba-lang/amu/blob/main/examples/foundation-starter/MACOS-ARM64.md).
+Amu's `bin/amu`, `bin/kotoba` and `bin/kotoba-compiler` are native ARM64
+Mach-O entries. The guide checks image digests and signatures, then checks,
+compiles, packages and executes a small program returning 42 and 43 with
+an explicit directory scope. No Linux VM, hosted runtime, account, model
+download or payment is required.
 
-The public compiler entry is Amu's native Linux x86_64 `bin/amu`, with
-`bin/kotoba` and `bin/kotoba-compiler` aliases in that same Amu checkout.
-Use the guide's host requirements and qualification record. The separate
-[Linux ARM64 diagnostic guide](https://github.com/kotoba-lang/amu/blob/main/examples/foundation-starter/ARM64-PREVIEW.md)
-does not establish a supported ARM, macOS or Windows release.
+Linux users can use the [pinned Linux starter](https://github.com/kotoba-lang/amu/blob/main/examples/foundation-starter/README.md)
+for its separate fuel/capability controls. Current Linux x86_64 entries have
+explicit `*-linux-x86_64` names; the immutable starter snapshot retains its
+original names. The [Linux ARM64 diagnostic guide](https://github.com/kotoba-lang/amu/blob/main/examples/foundation-starter/ARM64-PREVIEW.md)
+and Mac first run each state their own limited qualification. A successful
+first run does not qualify the complete runtime or an independent-user release.
 
 This repository's `bin/kotoba` still dispatches to retired KBB/Clojure host
 routes. Do not use that source launcher for the native first run or install
