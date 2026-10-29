@@ -114,7 +114,8 @@ class LinuxArm:
         return image
 
     def run(self, label, image, expected):
-        r = self.call(label, [image], self.env(KEXE_STRUCTURED_REPORT='1', KEXE_ALLOW='-'))
+        # wire 37 only: the SHA-3 gate prints its oracle lines; nothing else is granted
+        r = self.call(label, [image], self.env(KEXE_STRUCTURED_REPORT='1', KEXE_ALLOW='37'))
         match = re.search(rb':result (-?[0-9]+)', r.stdout)
         assert r.returncode == 0 and match and int(match[1]) == expected, (label, r.returncode, r.stdout[-300:])
         return r
