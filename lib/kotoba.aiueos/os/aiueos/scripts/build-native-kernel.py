@@ -79,7 +79,7 @@ def main(amu):
             raise ValueError('boot payload requires its immutable SHA256 and bounded size')
         state['bootPayload'] = payload_pin
         entry = Path(os.environ.get('AIUEOS_NATIVE_KERNEL_SOURCE', OS / 'native/kernel.kotoba')).resolve()
-        roots = [REPO / 'os', OS, OS / 'kotoba']
+        roots = [REPO / 'os', OS, OS / 'kotoba', REPO.parent / 'kotoba.browser/src']
         owners = {}
         manifest = json.loads(DEPENDENCIES.read_text())
         assert manifest['schema'] == 'aiueos.native-source-dependencies.v1'

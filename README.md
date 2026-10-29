@@ -55,12 +55,29 @@ or node membership, or qualify a release. Awai Node and Itonami also have
 independently qualified paths on other hosts. Common fixes stay in their
 existing owners; Awai presets do not create another language or OS fork.
 
-## Install
+## Try Kotoba with Amu
 
-```sh
-brew tap kotoba-lang/kotoba && brew trust kotoba-lang/kotoba && brew install kotoba
-kotoba -e '(+ 1 2)'
-```
+On an Apple Silicon Mac, use the [native Mac ARM64 first-run guide](https://github.com/kotoba-lang/amu/blob/main/examples/foundation-starter/MACOS-ARM64.md).
+Amu's `bin/amu`, `bin/kotoba` and `bin/kotoba-compiler` are native ARM64
+Mach-O entries. The guide checks image digests and signatures, then checks,
+compiles, packages and executes a small program returning 42 and 43 with
+an explicit directory scope. No Linux VM, hosted runtime, account, model
+download or payment is required.
+
+Linux users can use the [pinned Linux starter](https://github.com/kotoba-lang/amu/blob/main/examples/foundation-starter/README.md)
+for its separate fuel/capability controls. Current Linux x86_64 entries have
+explicit `*-linux-x86_64` names; the immutable starter snapshot retains its
+original names. The [Linux ARM64 diagnostic guide](https://github.com/kotoba-lang/amu/blob/main/examples/foundation-starter/ARM64-PREVIEW.md)
+and Mac first run each state their own limited qualification. A successful
+first run does not qualify the complete runtime or an independent-user release.
+
+This repository's `bin/kotoba` still dispatches to retired KBB/Clojure host
+routes. Do not use that source launcher for the native first run or install
+a hosted runtime to work around a refusal. The former Homebrew and
+`kotoba -e` quick start is not the native starter. The CLI examples below
+describe separate implementation contracts; full native CLI command parity
+and the older package's qualification remain open. Keep the first run on
+the single pinned Amu entry above.
 
 Web3 identity starts from a chain-neutral Kotoba principal controlled by a
 Passkey. EVM smart accounts are explicit CAIP-10 links verified by ERC-1271 or
