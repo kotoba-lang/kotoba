@@ -129,9 +129,28 @@ supply a missing value.
 
 The writer stays trusted: one writer signature per descriptor. An equivocating
 writer is bounded only by one vote per replica and sequence, and can split votes
-so that a read stays at status 3. Restoring C0 state from a recovered head and
-activating a new writer behind a durable sink fence are the next AWAI-103 unit;
-view and roster changes are AWAI-104.
+so that a read stays at status 3. View and roster changes are AWAI-104.
+
+## Writer restore (AWAI-103)
+
+A new writer starts from an empty C0 base. `broker/restore` takes the head a
+fresh read returned, verifies its certificate on the full request (value
+included) and that its epoch is the policy's, and passes the value to
+`store/restore`. That store checks that the value parses as C0 state bound to
+this policy's epoch, domain and operation, with each stable request id at most
+once, writes a durable `restored` marker and only then publishes the state.
+
+A restored store is inactive: `submit` and `complete` return
+`rejected:inactive`; `recover` (the epoch bump) is allowed. The writer recovers
+to a new epoch, certifies a fence entry and installs it at the sink.
+`broker/activate` then reads a durable copy of the sink's sealed state and calls
+`store/activate` only when that state shows the new epoch at or past the fence
+entry. The previous writer is refused by the sink's epoch fence.
+
+Legality of the transitions before the restored head rests on the trusted
+writer's signatures; the restore checks shape and binding, not replayed
+business history. No privileged rollback resistance is claimed without an
+external witness or anchor.
 
 ## Audit history (AWAI-106)
 
