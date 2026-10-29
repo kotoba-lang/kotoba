@@ -23,7 +23,7 @@ displacement of `mov rax,[rip+disp]` (48 8b 05) or `mov [rip+disp],rax` (48 89 0
 names data symbols (at most 16): each is exactly one GLOBAL OBJECT of size 8 in .data at 80 + 8j, distinct from
 every other name. .data is exactly 80 + 8 * (highest cell used or named + 1) bytes and the cells are zero.
 Fixed-address MMIO (D4) is an immediate in .text and adds no relocation, symbol or data to check here.
-Every symbol must be null, the context, an export, a declared extern or a declared data symbol; anything else is refused.
+Every GLOBAL or WEAK symbol must be an export, a declared extern or a declared data symbol; anything else is refused. LOCAL symbols (the context, and what older objects carry) are not checked.
 """
 
 import struct
@@ -119,7 +119,10 @@ data_index = by_name[".data"]
 data_section = sections[data_index]
 declared_names = set(expected_symbols) | set(extern_symbols) | set(data_symbol_names)
 for item in symbols:
-    if item[0] and item[0] != "context" and item[0] not in declared_names:
+    # LOCAL symbols cannot be linked against, and committed objects carry them
+    # (kernel-probe.o has `kotoba_source_entry`); the contract is on what a
+    # linker can see, so only GLOBAL/WEAK names are checked against the declared set.
+    if item[0] and item[0] != "context" and item[1] >> 4 != 0 and item[0] not in declared_names:
         fail(f"unexpected symbol {item[0]}")
 cells_named = 0
 for name in data_symbol_names:
@@ -152,7 +155,10 @@ for entry in range(count):
 if len(context_symbols) != 1:
     fail("every relocation must name the same context symbol")
 context_index = next(iter(context_symbols))
-if symbols[context_index][0] != "context":
+# Newer amu objects name a LOCAL `context` symbol; objects from the older producer
+# relocate against the unnamed LOCAL .data section symbol. Either is the private
+# context; a GLOBAL name (an export, extern or data symbol) never is.
+if symbols[context_index][1] >> 4 != 0 or symbols[context_index][0] not in ("", "context"):
     fail("the shim relocations must name the context symbol")
 calls = 0
 cells_used = 0
