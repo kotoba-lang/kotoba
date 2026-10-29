@@ -78,8 +78,8 @@ The trusted checkpoint writer remains responsible for legal business-state
 transitions: voters authenticate its data and register ordering, not a complete
 replay of C0 business logic. A certificate collected before it reaches any
 committed replica is not an automatically discoverable latest head. A caller
-must retain its ACK/certificate or obtain a fresh quorum read before relying on
-a head; this API alone does not implement a linearizable read protocol.
+must retain its ACK/certificate or obtain a fresh quorum read (below) before
+relying on a head; `replica/current` alone is not a read protocol.
 
 This is a safety-focused, bounded, fixed-roster register, not a complete BFT
 consensus service. Split votes can halt it. Do not erase outstanding votes,
@@ -91,6 +91,47 @@ own voted value and a different certified value at a position; interrupted
 pre-ACK writes may leave additional orphan blocks. A host-provisioned disk
 quota is required; the sequence bound alone is not a disk quota. Disk-full is
 refusal, never a reset. Automatic orphan collection remains unimplemented.
+
+## Fresh read (AWAI-103)
+
+A reader chooses a nonce and asks replicas to attest. `replica/attest`, under
+the replica lock, signs with that replica's voter key the reader's nonce, its
+current snapshot and, when it holds one, its pending vote (re-issued for the
+one descriptor it already voted; a replica never votes twice at a seq):
+
+```text
+Attestation = [1 index nonce4 state-len vote-len] snapshot vote(0|65) signature64
+```
+
+`read/latest` needs three valid attestations from distinct replicas. A
+certificate has three voters; any three responders share at least two of them
+and at most one replica is faulty, so an honest responder holds a certified
+entry either committed or as its pending vote. The latest certified head is
+therefore the highest committed sequence K seen, or K+1 when a responder at K
+holds a pending vote. The result is one of:
+
+| status | meaning | the reader may |
+|---|---|---|
+| 1 | committed head K with its certificate | rely on K |
+| 2 | three pending votes for K+1 assemble a certificate that was never distributed | distribute it (`commit`), then rely on K+1 |
+| 3 | one or two pending votes for K+1 | collect the missing vote or wait; never act on K or K+1 |
+| 4 | nothing certified or pending (genesis) | create the first entry |
+| 0 | refused | retry with a new nonce |
+
+Refusal covers fewer than three distinct valid attestations, two different
+certified heads at one sequence (more than one fault), a nonce other than the
+reader's (a replayed signed snapshot), another roster, any changed word, a
+pending vote by another index, for another sequence or on another parent.
+Invalid attestations are dropped, so one faulty replica cannot forge a head but
+can make a read wait. `replica/block` returns a retained value only when it
+matches the descriptor's length and value hash; any replica that holds it can
+supply a missing value.
+
+The writer stays trusted: one writer signature per descriptor. An equivocating
+writer is bounded only by one vote per replica and sequence, and can split votes
+so that a read stays at status 3. Restoring C0 state from a recovered head and
+activating a new writer behind a durable sink fence are the next AWAI-103 unit;
+view and roster changes are AWAI-104.
 
 ## Broker fence, consume and reconcile
 
@@ -187,14 +228,19 @@ as `/<relative path>`; main's result is the exit status, compared modulo 256
 (Linux reads the full i64 `:result`). Measured 2026-10-29 on an M1 Max:
 `PASS_NATIVE_BROKER_QUORUM`, the same 97 guest calls in the same order as the
 Linux x86_64 CI evidence (run 40854047278), and all 96 results equal modulo
-256, including the non-durable-vote mutant (-17, exit 239).
+256, including the non-durable-vote mutant (-17, exit 239). The fresh-read verdicts
+(`read_native`) are miscompiled on the Mac by the current Mac compiler
+(JUN-595: a multi-module compile reads a wrong vector element; the same code as
+one module is correct); until it is fixed they are qualified on Linux x86_64
+only.
 
 The Python observer stages explicit closed source files, hashes artifacts,
 launches Native processes and transports opaque bytes. Proposal construction,
 signing, certificate assembly, origin/authority checks, persistence decisions
 and semantic test verdicts execute in the Kotoba guest. PATH has no hosted
 language executable. The expected failure from a deliberately non-durable-vote
-mutation must be detected by the same Native no-equivocation verdict.
+mutation must be detected by the same Native no-equivocation verdict. A reader
+that ignores pending votes must be detected by the fresh-read verdict 3003.
 
 The fixture uses four separate private directories and fresh Native processes
 on one physical Linux host. It does not qualify independent-host crash domains,
