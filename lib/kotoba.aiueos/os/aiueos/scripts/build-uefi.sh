@@ -1228,9 +1228,22 @@ zig cc -target x86_64-freestanding-none -std=c11 -O2 \
 zig cc -target x86_64-freestanding-none -std=c11 -O2 \
   -ffreestanding -fno-stack-protector -mno-red-zone \
   -c -o "$kernel_vtd_object" "$aiueos/kernel/vtd.c"
-zig cc -target x86_64-freestanding-none -std=c11 -O2 \
-  -ffreestanding -fno-stack-protector -mno-red-zone \
-  -c -o "$kernel_apic_object" "$aiueos/kernel/apic.c"
+# JUN-556: kernel/apic.c has a Kotoba form (kotoba/apic.kotoba), built by the Amu
+# aiueos object route. Opt in with AIUEOS_KOTOBA_APIC=1; it replaces the C object
+# and the default build is unchanged. Not yet run on x86 (see kotoba/apic.kotoba).
+if [ "${AIUEOS_KOTOBA_APIC:-0}" = 1 ]; then
+  kotoba_apic_object=${AIUEOS_KOTOBA_APIC_OBJECT:-"$aiueos/kotoba/apic.o"}
+  python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_apic_object" \
+    473e02c9f7b53034ae61d7c5ee04eb79788661b4bf5cd329c78fd84aeada85fe \
+    aiueos_apic_timer_mask,aiueos_apic_timer_unmask,aiueos_apic_timer_initialize \
+    kotoba_aiueos_msr_read,kotoba_aiueos_msr_write \
+    aiueos_apic_timer_ticks,aiueos_apic_mmio_base
+  cp "$kotoba_apic_object" "$kernel_apic_object"
+else
+  zig cc -target x86_64-freestanding-none -std=c11 -O2 \
+    -ffreestanding -fno-stack-protector -mno-red-zone \
+    -c -o "$kernel_apic_object" "$aiueos/kernel/apic.c"
+fi
 zig cc -target x86_64-freestanding-none -std=c11 -O2 \
   -ffreestanding -fno-stack-protector -mno-red-zone \
   -c -o "$kernel_memory_object" "$aiueos/kernel/memory.c"
