@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from native_gate import LIB, NativeGate
 
-def sources(integration=False):
+def sources(integration=False, read=False):
     # Exact declared closure; never infer/resolve/flatten the guest language.
     mapping = {f'hata/{n}.kotoba': LIB / f'src/hata/{n}.kotoba'
                for n in ['codec', 'admission', 'authority', 'quorum']}
@@ -21,8 +21,15 @@ def sources(integration=False):
         'sha2/core.kotoba': LIB.parent / 'gov.nist.sha2/kotoba/sha2/core.kotoba',
         'kototama/effect_origins.kotoba': LIB.parent / 'kotoba.kototama/src/kototama/effect_origins.kotoba',
     })
+    if read:
+        # Fresh read (AWAI-103): pure verdicts, no filesystem capability.
+        mapping.pop('hata/quorum_native_test.kotoba')
+        mapping.pop('kototama/effect_origins.kotoba')
+        mapping.update({'hata/read.kotoba': LIB / 'src/hata/read.kotoba',
+                        'hata/read_native_test.kotoba': LIB / 'test/read_native.kotoba'})
     if integration:
         mapping.pop('hata/quorum_native_test.kotoba')
+        mapping['hata/read.kotoba'] = LIB / 'src/hata/read.kotoba'
         mapping.update({f'hata/{n}.kotoba': LIB / f'src/hata/{n}.kotoba'
                         for n in ['seal', 'replica', 'store_io', 'store', 'broker']})
         mapping.update({'hata/broker_fixture.kotoba': LIB / 'test/broker_fixture.kotoba',
@@ -41,6 +48,8 @@ def main():
     gate = NativeGate(args)
     image = gate.build('quorum', 'hata/quorum_native_test.kotoba', sources())
     gate.run('quorum-and-existing-admission', image)
+    reader = gate.build('read', 'hata/read_native_test.kotoba', sources(read=True))
+    gate.run('fresh-read-verdicts', reader)
     driver = gate.build('broker', 'hata/broker_native_test.kotoba', sources(True))
     coordinator = gate.out / 'coordinator'
     sink = gate.out / 'sink'
