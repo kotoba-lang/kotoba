@@ -125,12 +125,16 @@ transform — rather than copied as 256 magic bytes. The round constants are
 successive powers of `x`. `org-nist-sha2` made the same choice for the same
 reason.
 
-## Native port and gate (JUN-553, JUN-352)
+## Native port and gate (JUN-352, AWAI-61)
 
 `kotoba/aes/core.kotoba` (`aes.core`) and `kotoba/aes/gcm.kotoba` (`aes.gcm`) are the AES
 forward cipher (FIPS 197, 128-, 192- and 256-bit keys) and AES-GCM (SP 800-38D, any
 non-empty IV, 128-bit tags) written in native `.kotoba`. Bytes are `:vector-i64` of
-0..255.
+0..255. It is the library port of `src/aes/*.cljk`. It is not the AIUEOS kernel's
+`lib/kotoba.aiueos/os/aiueos/kotoba/aiueos/lib/aes128_gcm_core.kotoba`, which already
+serves the kernel's TLS record layer: that module is AES-128 only and works on a
+1280-byte kernel context region for the freestanding kernel target, so ordinary
+images cannot use it, and kagi's vault uses AES-256-GCM.
 
 - `seal key iv aad plaintext` gives ciphertext ++ tag, or an empty vector for a bad key
   length, an empty IV or a value outside 0..255.
