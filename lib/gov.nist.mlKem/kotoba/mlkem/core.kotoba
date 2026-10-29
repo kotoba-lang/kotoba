@@ -1,0 +1,216 @@
+;; mlkem.core -- ML-KEM-768 (NIST FIPS 203) in native .kotoba (JUN-352 P1b),
+;; ported from src/mlkem/core.cljk. Bytes are :vector-i64 of 0..255.
+;;   keygen d z  -> ek (1184) ++ dk (2400), empty unless d and z are 32 bytes
+;;   encaps ek m -> shared key (32) ++ ciphertext (1088), empty if ek fails the
+;;                  FIPS 203 7.2 checks or m is not 32 bytes
+;;   decaps dk c -> shared key (32), empty if dk fails the 7.3 checks or c has
+;;                  the wrong length; a well-formed wrong c gives J(z || c)
+;;                  (implicit rejection), never an error
+;; The caller supplies all randomness. Not constant-time: see the README.
+;; The NTT tables are 17^BitRev7(i) and 17^(2 BitRev7(i) + 1) mod 3329; the
+;; native gate recomputes and compares them.
+(ns mlkem.core
+  (:export [keygen encaps decaps valid-ek? valid-dk? zetas gammas])
+  (:require [sha3.core :as sha3]))
+
+(defn- md [x :i64] :i64 (let [r (rem x 3329)] (if (< r 0) (+ r 3329) r)))
+(defn zetas [] :vector-i64 (vector-i64 1 1729 2580 3289 2642 630 1897 848 1062 1919 193 797 2786 3260 569 1746 296 2447 1339 1476 3046 56 2240 1333 1426 2094 535 2882 2393 2879 1974 821 289 331 3253 1756 1197 2304 2277 2055 650 1977 2513 632 2865 33 1320 1915 2319 1435 807 452 1438 2868 1534 2402 2647 2617 1481 648 2474 3110 1227 910 17 2761 583 2649 1637 723 2288 1100 1409 2662 3281 233 756 2156 3015 3050 1703 1651 2789 1789 1847 952 1461 2687 939 2308 2437 2388 733 2337 268 641 1584 2298 2037 3220 375 2549 2090 1645 1063 319 2773 757 2099 561 2466 2594 2804 1092 403 1026 1143 2150 2775 886 1722 1212 1874 1029 2110 2935 885 2154))
+(defn gammas [] :vector-i64 (vector-i64 17 3312 2761 568 583 2746 2649 680 1637 1692 723 2606 2288 1041 1100 2229 1409 1920 2662 667 3281 48 233 3096 756 2573 2156 1173 3015 314 3050 279 1703 1626 1651 1678 2789 540 1789 1540 1847 1482 952 2377 1461 1868 2687 642 939 2390 2308 1021 2437 892 2388 941 733 2596 2337 992 268 3061 641 2688 1584 1745 2298 1031 2037 1292 3220 109 375 2954 2549 780 2090 1239 1645 1684 1063 2266 319 3010 2773 556 757 2572 2099 1230 561 2768 2466 863 2594 735 2804 525 1092 2237 403 2926 1026 2303 1143 2186 2150 1179 2775 554 886 2443 1722 1607 1212 2117 1874 1455 1029 2300 2110 1219 2935 394 885 2444 2154 1175))
+
+(defn- slice [v :vector-i64 start :i64 n :i64] :vector-i64
+  (loop [i 0 out (vector-alloc n)] (if (= i n) out (recur (+ i 1) (vector-assoc! out i (vector-at v (+ start i)))))))
+(defn- cat [a :vector-i64 b :vector-i64] :vector-i64
+  (let [na (vector-count a) out (vector-alloc (+ na (vector-count b)))]
+    (loop [i 0] (if (= i (vector-count out)) out
+      (let [z (vector-assoc! out i (if (< i na) (vector-at a i) (vector-at b (- i na))))] (recur (+ i 1)))))))
+(defn- byte1 [v :vector-i64 b :i64] :vector-i64 (cat v (vector-i64 b)))
+
+(defn- poly-add [a :vector-i64 b :vector-i64] :vector-i64
+  (loop [i 0 out (vector-alloc 256)] (if (= i 256) out (recur (+ i 1) (vector-assoc! out i (md (+ (vector-at a i) (vector-at b i))))))))
+(defn- poly-sub [a :vector-i64 b :vector-i64] :vector-i64
+  (loop [i 0 out (vector-alloc 256)] (if (= i 256) out (recur (+ i 1) (vector-assoc! out i (md (- (vector-at a i) (vector-at b i))))))))
+
+(defn- ntt [f :vector-i64] :vector-i64
+  ;; Algorithm 9
+  (let [a (slice f 0 256) z (zetas)]
+    (loop [len 128 i 1]
+      (if (< len 2) a
+        (let [next (loop [start 0 i i]
+                     (if (>= start 256) i
+                       (let [zeta (vector-at z i)
+                             w (loop [j start]
+                                 (if (>= j (+ start len)) 0
+                                   (let [t (md (* zeta (vector-at a (+ j len)))) fj (vector-at a j)
+                                         x (vector-assoc! a (+ j len) (md (- fj t)))
+                                         y (vector-assoc! a j (md (+ fj t)))]
+                                     (recur (+ j 1)))))]
+                         (recur (+ start (* 2 len)) (+ i 1)))))]
+          (recur (quot len 2) next))))))
+
+(defn- ntt-inv [f :vector-i64] :vector-i64
+  ;; Algorithm 10, then times 3303 = 128^-1 mod q
+  (let [a (slice f 0 256) z (zetas)
+        done (loop [len 2 i 127]
+               (if (> len 128) 0
+                 (let [next (loop [start 0 i i]
+                              (if (>= start 256) i
+                                (let [zeta (vector-at z i)
+                                      w (loop [j start]
+                                          (if (>= j (+ start len)) 0
+                                            (let [t (vector-at a j) u (vector-at a (+ j len))
+                                                  x (vector-assoc! a j (md (+ t u)))
+                                                  y (vector-assoc! a (+ j len) (md (* zeta (- u t))))]
+                                              (recur (+ j 1)))))]
+                                  (recur (+ start (* 2 len)) (- i 1)))))]
+                   (recur (* 2 len) next))))]
+    (loop [i 0] (if (= i 256) a (let [x (vector-assoc! a i (md (* (vector-at a i) 3303)))] (recur (+ i 1)))))))
+
+(defn- multiply-ntts [f :vector-i64 g :vector-i64] :vector-i64
+  ;; Algorithms 11 and 12
+  (let [gam (gammas)]
+    (loop [i 0 out (vector-alloc 256)]
+      (if (= i 128) out
+        (let [a0 (vector-at f (* 2 i)) a1 (vector-at f (+ (* 2 i) 1))
+              b0 (vector-at g (* 2 i)) b1 (vector-at g (+ (* 2 i) 1))
+              x (vector-assoc! out (* 2 i) (md (+ (* a0 b0) (md (* (md (* a1 b1)) (vector-at gam i))))))]
+          (recur (+ i 1) (vector-assoc! out (+ (* 2 i) 1) (md (+ (* a0 b1) (* a1 b0))))))))))
+
+(defn- byte-encode [d :i64 f :vector-i64] :vector-i64
+  ;; Algorithm 5: 256 coefficients of d bits, least significant bit first
+  (loop [i 0 buf 0 nb 0 o 0 out (vector-alloc (* 32 d))]
+    (cond (>= nb 8) (recur i (quot buf 256) (- nb 8) (+ o 1) (vector-assoc! out o (rem buf 256)))
+          (= i 256) out
+          :else (recur (+ i 1) (+ buf (* (vector-at f i) (i64-shift-left 1 nb))) (+ nb d) o out))))
+
+(defn- byte-decode [d :i64 b :vector-i64 start :i64] :vector-i64
+  ;; Algorithm 6, from b[start ..]; for d = 12 each value is reduced mod q
+  (let [m (i64-shift-left 1 d)]
+    (loop [i start buf 0 nb 0 o 0 out (vector-alloc 256)]
+      (cond (= o 256) out
+            (>= nb d) (let [x (rem buf m)]
+                        (recur i (quot buf m) (- nb d) (+ o 1) (vector-assoc! out o (if (= d 12) (rem x 3329) x))))
+            :else (recur (+ i 1) (+ buf (* (vector-at b i) (i64-shift-left 1 nb))) (+ nb 8) o out)))))
+
+(defn- compress [d :i64 x :i64] :i64
+  (rem (quot (+ (* 2 (* x (i64-shift-left 1 d))) 3329) 6658) (i64-shift-left 1 d)))
+(defn- decompress [d :i64 y :i64] :i64
+  (quot (+ (* 6658 y) (i64-shift-left 1 d)) (* 2 (i64-shift-left 1 d))))
+(defn- compress-poly [d :i64 f :vector-i64] :vector-i64
+  (loop [i 0 out (vector-alloc 256)] (if (= i 256) out (recur (+ i 1) (vector-assoc! out i (compress d (vector-at f i)))))))
+(defn- decompress-poly [d :i64 f :vector-i64] :vector-i64
+  (loop [i 0 out (vector-alloc 256)] (if (= i 256) out (recur (+ i 1) (vector-assoc! out i (decompress d (vector-at f i)))))))
+
+(defn- sample-from [buf :vector-i64] :vector-i64
+  ;; Algorithm 7 over a squeezed prefix; empty when it runs out
+  (loop [pos 0 n 0 out (vector-alloc 256)]
+    (cond (= n 256) out
+          (> (+ pos 3) (vector-count buf)) (vector-i64)
+          :else
+          (let [c0 (vector-at buf pos) c1 (vector-at buf (+ pos 1)) c2 (vector-at buf (+ pos 2))
+                d1 (+ c0 (* 256 (rem c1 16))) d2 (+ (quot c1 16) (* 16 c2))
+                n1 (if (< d1 3329) (let [z (vector-assoc! out n d1)] (+ n 1)) n)
+                n2 (if (and (< d2 3329) (< n1 256)) (let [z (vector-assoc! out n1 d2)] (+ n1 1)) n1)]
+            (recur (+ pos 3) n2 out)))))
+(defn- sample-ntt [b :vector-i64] :vector-i64
+  ;; SHAKE128 output is prefix-consistent, so a longer one-shot squeeze reads the
+  ;; same bytes as the standard's incremental 168-byte squeezes (168 = 3 * 56).
+  (loop [blocks 3]
+    (let [r (sample-from (sha3/shake128 b (* 168 blocks)))]
+      (if (> (vector-count r) 0) r (recur (+ blocks 2))))))
+
+(defn- bit [b :vector-i64 idx :i64] :i64 (bit-and (i64-shift-right (vector-at b (quot idx 8)) (rem idx 8)) 1))
+(defn- cbd2 [b :vector-i64] :vector-i64
+  ;; Algorithm 8 with eta = 2 (eta1 = eta2 = 2 for ML-KEM-768)
+  (loop [i 0 out (vector-alloc 256)]
+    (if (= i 256) out
+      (let [x (+ (bit b (* 4 i)) (bit b (+ (* 4 i) 1))) y (+ (bit b (+ (* 4 i) 2)) (bit b (+ (* 4 i) 3)))]
+        (recur (+ i 1) (vector-assoc! out i (md (- x y))))))))
+(defn- prf [s :vector-i64 b :i64] :vector-i64 (sha3/shake256 (byte1 s b) 128))
+(defn- noise [s :vector-i64 b :i64] :vector-i64 (cbd2 (prf s b)))
+
+(defn- poly [v :vector-i64 k :i64] :vector-i64 (slice v (* 256 k) 256))
+(defn- matrix [rho :vector-i64] :vector-i64
+  ;; A-hat[i][j] = SampleNTT(rho || j || i), flat at (3 i + j) * 256
+  (loop [ij 0 out (vector-i64)]
+    (if (= ij 9) out (recur (+ ij 1) (cat out (sample-ntt (byte1 (byte1 rho (rem ij 3)) (quot ij 3))))))))
+(defn- dot [a :vector-i64 ai :i64 astride :i64 b :vector-i64] :vector-i64
+  ;; sum over j of a[ai + j * astride] * b[j]
+  (poly-add (poly-add (multiply-ntts (poly a ai) (poly b 0)) (multiply-ntts (poly a (+ ai astride)) (poly b 1)))
+            (multiply-ntts (poly a (+ ai (* 2 astride))) (poly b 2))))
+(defn- encode12x3 [v :vector-i64] :vector-i64
+  (cat (cat (byte-encode 12 (poly v 0)) (byte-encode 12 (poly v 1))) (byte-encode 12 (poly v 2))))
+(defn- decode12x3 [b :vector-i64 start :i64] :vector-i64
+  (cat (cat (byte-decode 12 b start) (byte-decode 12 b (+ start 384))) (byte-decode 12 b (+ start 768))))
+
+(defn- g-hash [b :vector-i64] :vector-i64 (sha3/sha3-512 b))
+(defn- h-hash [b :vector-i64] :vector-i64 (sha3/sha3-256 b))
+
+(defn- kpke-keygen [d :vector-i64] :vector-i64
+  ;; Algorithm 13: ek (1184) ++ dk_pke (1152)
+  (let [gh (g-hash (byte1 d 3)) rho (slice gh 0 32) sigma (slice gh 32 32) a (matrix rho)
+        s-hat (cat (cat (ntt (noise sigma 0)) (ntt (noise sigma 1))) (ntt (noise sigma 2)))
+        t-hat (cat (cat (poly-add (dot a 0 1 s-hat) (ntt (noise sigma 3)))
+                        (poly-add (dot a 3 1 s-hat) (ntt (noise sigma 4))))
+                   (poly-add (dot a 6 1 s-hat) (ntt (noise sigma 5))))]
+    (cat (cat (encode12x3 t-hat) rho) (encode12x3 s-hat))))
+
+(defn- kpke-encrypt [ek :vector-i64 m :vector-i64 r :vector-i64] :vector-i64
+  ;; Algorithm 14: c (1088)
+  (let [t-hat (decode12x3 ek 0) a (matrix (slice ek 1152 32))
+        y-hat (cat (cat (ntt (noise r 0)) (ntt (noise r 1))) (ntt (noise r 2)))
+        u0 (poly-add (ntt-inv (dot a 0 3 y-hat)) (noise r 3))
+        u1 (poly-add (ntt-inv (dot a 1 3 y-hat)) (noise r 4))
+        u2 (poly-add (ntt-inv (dot a 2 3 y-hat)) (noise r 5))
+        mu (decompress-poly 1 (byte-decode 1 m 0))
+        v (poly-add (poly-add (ntt-inv (dot t-hat 0 1 y-hat)) (noise r 6)) mu)]
+    (cat (cat (cat (byte-encode 10 (compress-poly 10 u0)) (byte-encode 10 (compress-poly 10 u1)))
+              (byte-encode 10 (compress-poly 10 u2)))
+         (byte-encode 4 (compress-poly 4 v)))))
+
+(defn- kpke-decrypt [dk :vector-i64 c :vector-i64] :vector-i64
+  ;; Algorithm 15: m (32)
+  (let [u-hat (cat (cat (ntt (decompress-poly 10 (byte-decode 10 c 0))) (ntt (decompress-poly 10 (byte-decode 10 c 320))))
+                   (ntt (decompress-poly 10 (byte-decode 10 c 640))))
+        v (decompress-poly 4 (byte-decode 4 c 960))
+        w (poly-sub v (ntt-inv (dot (decode12x3 dk 0) 0 1 u-hat)))]
+    (byte-encode 1 (compress-poly 1 w))))
+
+(defn- bytes? [v :vector-i64 n :i64] :bool
+  (and (= (vector-count v) n)
+       (loop [i 0] (if (= i n) true (if (and (>= (vector-at v i) 0) (<= (vector-at v i) 255)) (recur (+ i 1)) false)))))
+(defn- same? [a :vector-i64 b :vector-i64] :bool
+  (and (= (vector-count a) (vector-count b))
+       (loop [i 0] (if (= i (vector-count a)) true (if (= (vector-at a i) (vector-at b i)) (recur (+ i 1)) false)))))
+
+(defn valid-ek? [ek :vector-i64] :bool
+  ;; 7.2: length, and every 12-bit coefficient already reduced mod q
+  (and (bytes? ek 1184) (same? (encode12x3 (decode12x3 ek 0)) (slice ek 0 1152))))
+(defn valid-dk? [dk :vector-i64] :bool
+  ;; 7.3: length, and H(ek) where FIPS 203 places it
+  (and (bytes? dk 2400) (same? (h-hash (slice dk 1152 1184)) (slice dk 2336 32))))
+
+(defn keygen [d :vector-i64 z :vector-i64] :vector-i64
+  ;; Algorithm 16: ek ++ dk, dk = dk_pke ++ ek ++ H(ek) ++ z
+  (if (or (not (bytes? d 32)) (not (bytes? z 32))) (vector-i64)
+    (let [kp (kpke-keygen d) ek (slice kp 0 1184)]
+      (cat ek (cat (cat (cat (slice kp 1184 1152) ek) (h-hash ek)) z)))))
+
+(defn encaps [ek :vector-i64 m :vector-i64] :vector-i64
+  ;; Algorithm 17: K ++ c
+  (if (or (not (valid-ek? ek)) (not (bytes? m 32))) (vector-i64)
+    (let [kr (g-hash (cat m (h-hash ek)))]
+      (cat (slice kr 0 32) (kpke-encrypt ek m (slice kr 32 32))))))
+
+(defn decaps [dk :vector-i64 c :vector-i64] :vector-i64
+  ;; Algorithm 18 with implicit rejection; the selection is a byte mask, not a branch
+  (if (or (not (valid-dk? dk)) (not (bytes? c 1088))) (vector-i64)
+    (let [m2 (kpke-decrypt (slice dk 0 1152) c)
+          kr (g-hash (cat m2 (slice dk 2336 32)))
+          k-bar (sha3/shake256 (cat (slice dk 2368 32) c) 32)
+          c2 (kpke-encrypt (slice dk 1152 1184) m2 (slice kr 32 32))
+          differ (loop [i 0 x 0] (if (= i 1088) x (recur (+ i 1) (bit-or x (bit-xor (vector-at c i) (vector-at c2 i))))))
+          mask (if (= differ 0) 0 255)]
+      (loop [i 0 out (vector-alloc 32)]
+        (if (= i 32) out
+          (let [a (vector-at kr i)]
+            (recur (+ i 1) (vector-assoc! out i (bit-xor a (bit-and (bit-xor a (vector-at k-bar i)) mask))))))))))

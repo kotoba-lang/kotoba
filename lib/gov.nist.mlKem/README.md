@@ -67,7 +67,52 @@ kbb --backend sci --classpath src:test:../org-nist-sha3/src run-tests.cljk
 Measured 2026-10-23 on one machine, per operation: about 125-155 ms on nbb/sci and
 about 32-36 ms on the JVM. It favours clarity over speed.
 
-## Non-claims
+## Native port and gate (JUN-352 P1b)
+
+`kotoba/mlkem/core.kotoba` ports `src/mlkem/core.cljk` to native `.kotoba`: `keygen d z`
+returns ek ++ dk (1184 + 2400 bytes), `encaps ek m` returns K ++ c (32 + 1088), and
+`decaps dk c` returns K (32), with implicit rejection for a well-formed wrong `c`. Input
+that fails the FIPS 203 section 7 checks, has the wrong length or holds a value outside
+0..255 gives an empty vector. `valid-ek?` and `valid-dk?` are the section 7 checks. Bytes
+are `:vector-i64` of 0..255 and hashing uses the native SHA-3 port
+(`../gov.nist.sha3/kotoba/sha3/core.kotoba`). SampleNTT squeezes SHAKE128 in one shot and
+squeezes a longer prefix if it runs out; the SHA-3 gate checks that SHAKE output is
+prefix-consistent, so this reads the same bytes as the incremental squeeze.
+
+`kotoba/mlkem/native_gate.kotoba` returns a bitmask (63 = pass): keyGen tc 26 and 27,
+encapsulation tc 26 and 27, decapsulation tc 86 (valid) and 88 (modified ciphertext),
+the key checks ek tc 136 / 137 and dk tc 126 / 128 (all from `test/mlkem/acvp/`), the
+NTT tables recomputed as powers of 17, a keyGen / encaps / decaps round trip with one
+changed ciphertext bit decapsulating to SHAKE256(z || c, 32), and refusal of bad input.
+Long outputs are compared by SHA3-256 digest, computed from the ACVP values with
+Python `hashlib` when the gate was written.
+
+```sh
+G=/Users/junkawasaki/github/workspaces/<agent>/<task>   # a new task-owned directory
+{ echo '(ns mlkem-gate (:export [main]))'
+  sed '/^(ns /,/))$/d' ../gov.nist.sha3/kotoba/sha3/core.kotoba
+  sed '/^(ns /,/))$/d' kotoba/mlkem/core.kotoba | sed 's/sha3\///g'
+  sed '/^(ns /,/))$/d' kotoba/mlkem/native_gate.kotoba; } > "$G/gate.kotoba"
+# compile with the Amu root (Mac: --target aarch64-macos, extract-native main,
+# package fs2-cli-stdio-general, sign) and run with FD 3 = $G
+```
+
+Measured 2026-10-30 on Apple M1 Max with the Amu Mac root of main `91faa123`
+(`amu-full-root.macho`, packaged `fs2-cli-stdio-general`); the gate image ran in
+0.4 s:
+
+| image | change | exit |
+|---|---|---|
+| gate | none | **63** |
+| ctl-zeta | second NTT zeta 1729 -> 1730 | 40 |
+| ctl-mask | implicit-rejection selection inverted | 43 |
+| ctl-ekcheck | ek check without the modulus test | 55 |
+| ctl-cbd | CBD sign inverted | 56 |
+| ctl-dkcheck | dk check compares H(ek) with itself | 55 |
+
+Not yet: the remaining ACVP cases run natively (the `.cljk` suite runs all of them),
+an x86_64 run, and an Amu CI job for this gate.
+
 
 - **Not constant time.** Persistent vectors, data-dependent allocation and rejection
   sampling make no timing guarantee. The branch-free key selection in `decaps` is
@@ -79,9 +124,9 @@ about 32-36 ms on the JVM. It favours clarity over speed.
 - **`.cljk` is a migration input.** Amu's contract (2026-10-22,
   `docs/selfhost-priority.md`) makes `.kotoba` the canonical source and builds one
   native image in which the runtime and providers are Kotoba code linked with the
-  program; there is no separate host. This library is not yet in `.kotoba`, so it does
-  not compile with `amu` to a native image. The algorithm and the known-answer tests
-  are settled here first; the `.kotoba` port is the next step (JUN-352, P1b).
+  program; there is no separate host. The native port is `kotoba/mlkem/core.kotoba`
+  (JUN-352 P1b, below); the `.cljk` sources stay as the reference and for the full
+  ACVP suite.
 - It is the *internal* algorithms of FIPS 203 (16, 17, 18) with explicit randomness,
   plus the section 7 input checks. The standard's key-generation and encapsulation
   wrappers that draw their own randomness are left to the caller.
