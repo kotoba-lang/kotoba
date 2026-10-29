@@ -43,3 +43,15 @@ def open_(key, nonce, aad, sealed):
     ct, tag = sealed[:-16], sealed[-16:]
     if poly1305(block(key, 0, nonce)[:32], mac_data(aad, ct)) != tag: return None
     return encrypt(key, 1, nonce, ct)
+def hchacha20(key, nonce16):
+    # draft-irtf-cfrg-xchacha section 2.2: 20 rounds over the nonce in words 12-15,
+    # output words 0-3 and 12-15 with no final addition
+    s = [0x61707865, 0x3320646e, 0x79622d32, 0x6b206574] + [le32(key, 4 * i) for i in range(8)] + [le32(nonce16, 4 * i) for i in range(4)]
+    for _ in range(10):
+        qr(s, 0, 4, 8, 12); qr(s, 1, 5, 9, 13); qr(s, 2, 6, 10, 14); qr(s, 3, 7, 11, 15)
+        qr(s, 0, 5, 10, 15); qr(s, 1, 6, 11, 12); qr(s, 2, 7, 8, 13); qr(s, 3, 4, 9, 14)
+    return b''.join(s[i].to_bytes(4, 'little') for i in (0, 1, 2, 3, 12, 13, 14, 15))
+def xseal(key, nonce24, aad, pt):
+    return seal(hchacha20(key, nonce24[:16]), bytes(4) + nonce24[16:], aad, pt)
+def xopen(key, nonce24, aad, sealed):
+    return open_(hchacha20(key, nonce24[:16]), bytes(4) + nonce24[16:], aad, sealed)
