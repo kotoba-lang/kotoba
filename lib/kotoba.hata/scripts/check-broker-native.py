@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from native_gate import LIB, NativeGate
 
-def sources(integration=False, read=False):
+def sources(integration=False, read=False, audit=False):
     # Exact declared closure; never infer/resolve/flatten the guest language.
     mapping = {f'hata/{n}.kotoba': LIB / f'src/hata/{n}.kotoba'
                for n in ['codec', 'admission', 'authority', 'quorum']}
@@ -27,9 +27,16 @@ def sources(integration=False, read=False):
         mapping.pop('kototama/effect_origins.kotoba')
         mapping.update({'hata/read.kotoba': LIB / 'src/hata/read.kotoba',
                         'hata/read_native_test.kotoba': LIB / 'test/read_native.kotoba'})
+    if audit:
+        # Audit history (AWAI-106): pure verdicts, no filesystem capability.
+        mapping.pop('hata/quorum_native_test.kotoba')
+        mapping.pop('kototama/effect_origins.kotoba')
+        mapping.update({'hata/audit.kotoba': LIB / 'src/hata/audit.kotoba',
+                        'hata/audit_native_test.kotoba': LIB / 'test/audit_native.kotoba'})
     if integration:
         mapping.pop('hata/quorum_native_test.kotoba')
         mapping['hata/read.kotoba'] = LIB / 'src/hata/read.kotoba'
+        mapping['hata/audit.kotoba'] = LIB / 'src/hata/audit.kotoba'
         mapping.update({f'hata/{n}.kotoba': LIB / f'src/hata/{n}.kotoba'
                         for n in ['seal', 'replica', 'store_io', 'store', 'broker']})
         mapping.update({'hata/broker_fixture.kotoba': LIB / 'test/broker_fixture.kotoba',
@@ -48,6 +55,15 @@ def main():
     gate = NativeGate(args)
     image = gate.build('quorum', 'hata/quorum_native_test.kotoba', sources())
     gate.run('quorum-and-existing-admission', image)
+    auditor = gate.build('audit', 'hata/audit_native_test.kotoba', sources(audit=True))
+    gate.run('audit-history-verdicts', auditor)
+    # Negative control: an auditor that does not check the parent link accepts a
+    # history whose entries are certified but not chained.
+    unchained = sources(audit=True)
+    before = b'(c/equal? (c/slice desc 4 4) prev)'
+    assert unchained['hata/audit.kotoba'].count(before) == 1
+    unchained['hata/audit.kotoba'] = unchained['hata/audit.kotoba'].replace(before, b'true')
+    gate.run('unchained-auditor-detected', gate.build('audit-unchained-control', 'hata/audit_native_test.kotoba', unchained), 4004)
     reader = gate.build('read', 'hata/read_native_test.kotoba', sources(read=True))
     gate.run('fresh-read-verdicts', reader)
     # Negative control: a reader that ignores pending votes adopts the stale
@@ -138,6 +154,7 @@ def main():
     shutil.copyfile(coordinator / 'latest', gate.out / 'fence-latest')
     shutil.copyfile(coordinator / 'latest', nodes[3] / 'latest')
     run('fresh-value-recovered', 'block', nodes[3])
+    run('audit-after-fence', 'audit', nodes[2], option='2')
     run('reserve', 'reserve', coordinator)
     certify('claim')
     copy(coordinator, sink, ['request', 'certificate', 'command'])
@@ -175,6 +192,10 @@ def main():
     run('install-epoch8', 'install', sink, option='epoch8')
     copy(history, sink, ['request', 'certificate', 'command'])
     run('fenced-old-writer', 'execute', sink, 0)
+    run('audit-after-history', 'audit', nodes[1], option='1')
+    tampered = sorted(nodes[3].glob('quorum-log-*'))[0]
+    tampered.write_bytes(tampered.read_bytes().replace(b'awai.quorum.log.v1\n', b'awai.quorum.log.v1\n0', 1))
+    run('audit-tampered-record-refused', 'audit', nodes[3], -31, option='3')
     for block in nodes[0].glob('quorum-value-*'):
         block.write_bytes(b'corrupt')
     run('retained-data-corruption-refused', 'corrupt-current', nodes[0])

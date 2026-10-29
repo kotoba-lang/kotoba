@@ -133,6 +133,26 @@ so that a read stays at status 3. Restoring C0 state from a recovered head and
 activating a new writer behind a durable sink fence are the next AWAI-103 unit;
 view and roster changes are AWAI-104.
 
+## Audit history (AWAI-106)
+
+A replica's snapshot holds only its head, so it cannot by itself show the past
+proposals and certificates. `replica/commit` therefore first writes a sealed
+record of the position, `quorum-log-<seq>` = descriptor and certificate signed
+with the replica key, and only then moves its head: a crash in between leaves a
+record past the head, never a head without its record. `replica/history`
+returns the records 1..K of its committed position as a batch; a missing or
+unsealed record ends the batch early.
+
+`audit/history` accepts a batch only when every entry is certified on this
+roster, entry k has sequence k and its parent is entry k-1 (zero for the
+first). It returns `[K entry-id]`, `[0 0 0 0 0]` for the empty history, and
+`[0]` for a gap, a fork, a forged certificate or trailing bytes; partial history
+is never success. `audit/extends?` accepts a later history only when it holds an
+earlier accepted head at its sequence, so a shorter or diverging history
+(rollback) is refused. This proves agreement with the roster, not that no newer
+history exists: freshness needs `read/latest`, and resistance to a privileged
+rollback of every replica needs an external witness or anchor (not claimed).
+
 ## Broker fence, consume and reconcile
 
 1. Replicate a kind-2 C0 snapshot under a quorum certificate. Install this fence
