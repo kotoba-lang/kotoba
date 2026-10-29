@@ -1,13 +1,21 @@
 #!/usr/bin/env python3
 """Fail-closed validation for the x86_64-aiueos-kernel-v1 object ABI.
 
-usage: verify-kotoba-kernel-object.py OBJECT [SHA256] [EXPORT[,EXPORT...]]
+usage: verify-kotoba-kernel-object.py OBJECT [SHA256] [EXPORT[,EXPORT...]] [EXTERN[,EXTERN...]]
 
 One export is the original contract. A comma-separated list (at most 8) names
 the exports of a multi-export object (amu JUN-556): every name is exactly one
 GLOBAL FUNC in .text, and there is one .rela.text entry per export, each an
 R_X86_64_PC32 with addend -4 against the same local .data context symbol and
 inside .text. Anything else is refused as before.
+
+An optional fourth argument names declared extern functions (amu JUN-556 D1, ADR 0380,
+at most 16). Each is exactly one undefined GLOBAL NOTYPE symbol, distinct from the
+exports. Every .rela.text entry after the per-export context relocations must be an
+R_X86_64_PLT32 with addend -4 against a declared extern, placed on the displacement of a
+`call rel32` (0xE8, zero displacement) that is followed by `mov r9,[rbp-8]`
+(4c 8b 4d f8). Any other undefined symbol is still refused, and without the
+fourth argument the contract is exactly the previous one.
 """
 
 import struct
@@ -24,6 +32,9 @@ blob = Path(sys.argv[1]).read_bytes()
 expected_symbols = (sys.argv[3] if len(sys.argv) > 3 else "kotoba_aiueos_probe").split(",")
 if not 1 <= len(expected_symbols) <= 8 or len(set(expected_symbols)) != len(expected_symbols) or "" in expected_symbols:
     fail("export list must be one to eight distinct names")
+extern_symbols = [name for name in (sys.argv[4] if len(sys.argv) > 4 else "").split(",") if name]
+if len(extern_symbols) > 16 or len(set(extern_symbols)) != len(extern_symbols) or set(extern_symbols) & set(expected_symbols):
+    fail("extern list must be at most sixteen distinct names that are not exports")
 if len(sys.argv) > 2 and sys.argv[2] and hashlib.sha256(blob).hexdigest() != sys.argv[2]:
     fail("fixture digest does not match the pinned compiler output")
 if len(blob) < 64 or blob[:16] != b"\x7fELF\x02\x01\x01\x00" + b"\0" * 8:
@@ -86,13 +97,20 @@ for expected_symbol in expected_symbols:
     _, info, other, shndx, _, size = probes[0]
     if info != 0x12 or other != 0 or shndx != by_name[".text"] or size == 0:
         fail("export must be a default-visibility GLOBAL FUNC defined in .text")
-if any(item[3] == 0 and item[0] for item in symbols):
+for extern_symbol in extern_symbols:
+    declared = [item for item in symbols if item[0] == extern_symbol]
+    if len(declared) != 1 or declared[0][1:] != (0x10, 0, 0, 0, 0):
+        fail(f"extern {extern_symbol} must be exactly one undefined GLOBAL NOTYPE symbol")
+if any(item[3] == 0 and item[0] and item[0] not in extern_symbols for item in symbols):
     fail("undefined/imported symbols are forbidden")
 rela = sections[by_name[".rela.text"]]
 count = len(expected_symbols)
-if rela[1] != 4 or rela[9] != 24 or rela[6] != sym_index or rela[7] != by_name[".text"] or rela[5] != 24 * count:
+call_sites = rela[5] // 24 - count
+if (rela[1] != 4 or rela[9] != 24 or rela[6] != sym_index or rela[7] != by_name[".text"] or rela[5] % 24
+        or call_sites < 0 or (call_sites and not extern_symbols)):
     fail("requires exactly one .rela.text entry" if count == 1 else f"requires exactly {count} .rela.text entries")
-text_size = len(section_bytes(by_name[".text"]))
+text = section_bytes(by_name[".text"])
+text_size = len(text)
 data_symbols = set()
 for entry in range(count):
     rel_offset, rel_info, addend = struct.unpack_from("<QQq", section_bytes(by_name[".rela.text"]), entry * 24)
@@ -106,4 +124,15 @@ for entry in range(count):
     data_symbols.add(symbol_index)
 if len(data_symbols) != 1:
     fail("every relocation must name the same context symbol")
-print(f"AIUEOS_KOTOBA_OBJECT_OK target=x86_64-aiueos-kernel-v1 export={','.join(expected_symbols)} imports=0 relocations={count}")
+for entry in range(count, count + call_sites):
+    rel_offset, rel_info, addend = struct.unpack_from("<QQq", section_bytes(by_name[".rela.text"]), entry * 24)
+    symbol_index, relocation_type = rel_info >> 32, rel_info & 0xFFFFFFFF
+    if symbol_index >= len(symbols) or symbols[symbol_index][0] not in extern_symbols or symbols[symbol_index][3] != 0:
+        fail("a call relocation must name a declared extern")
+    if relocation_type != 4 or addend != -4:
+        fail("call relocation must be R_X86_64_PLT32 with addend -4")
+    if rel_offset < 1 or rel_offset + 8 > text_size or text[rel_offset - 1] != 0xE8 or text[rel_offset:rel_offset + 4] != b"\0\0\0\0":
+        fail("call relocation must sit on the displacement of a call rel32")
+    if text[rel_offset + 4:rel_offset + 8] != bytes.fromhex("4c8b4df8"):
+        fail("an extern call must be followed by mov r9,[rbp-8]")
+print(f"AIUEOS_KOTOBA_OBJECT_OK target=x86_64-aiueos-kernel-v1 export={','.join(expected_symbols)} imports={len(extern_symbols)} relocations={count + call_sites}")
