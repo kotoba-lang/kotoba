@@ -29,9 +29,11 @@ Current local candidates reproduce all31 modules, including the complete kernel
 and live runtime. Nothing supplies a C/reference kernel, object file or
 hosted compiler/packager. `build-kotoba-native-desktop.sh` now invokes
 `build-native-desktop.py`; a hosted bootstrap request refuses. Select an
-actual native Linux compiler and its immutable SHA256 with
+actual host-native compiler and its immutable SHA256 with
 `AIUEOS_AMU_SELFHOST_BIN` and `AIUEOS_AMU_SELFHOST_SHA256`. Owner dependency
-roots are the same pinned inputs used by `build-native-kernel.py`.
+roots are the same pinned inputs used by `build-native-kernel.py`. The current
+qualified build evidence uses Linux ELF; macOS arm64 Mach-O preflight is in
+place, but an Amu-produced Mac full compiler and Mac build are still missing.
 
 The wrapper invokes three native producers: `font-pad.kotoba` preserves the
 checked-in licensed font bytes and pads them to512KiB; Amu compiles the full
@@ -81,11 +83,24 @@ temporary overlay and no NIC. It checks sealed PCI/GOP/font bytes, native
 page-table/domain state, completed frames, keyboard open/close operations,
 mouse movement/click/release and changed screenshots. It checks that the
 Itonami goal changes from keyboard input and returns to the previous text on
-Backspace, and that the original media digest is unchanged. QEMU TCG is guest
-emulation; native
+Backspace, and that the original media digest is unchanged. It also sends
+Enter and checks the received key, the unchanged RAM draft and the changed
+rendered title (`Itonami (no agent)`); the next edit restores the normal title.
+That Enter check does not count as a submitted goal or agent turn. QEMU TCG is
+guest emulation; native
 compiler execution, controller qualification and physical-hardware boot are
 distinct proof surfaces. Virtio block boot and general installer/media
 compatibility are not qualified by this diagnostic.
+
+The desktop's native fuel counter is decremented on each loop iteration.
+The former 2^30 build budget reached zero during a local interactive session:
+QEMU recorded `#UD` at the loop's fuel guard, followed by `HLT`, and later
+keyboard input could not be handled. The desktop builder now uses the maximum
+admitted 53-bit budget (`9007199254740991`), and the QEMU gate reads the
+running kernel's fuel counter and requires it to be at least 2^52. This is a
+practical uptime bound for the current polling profile, not a permanent
+scheduler or unmetered kernel design. Short-budget diagnostic kernels remain
+available through `AIUEOS_NATIVE_FUEL`.
 
 Kernel/EFI/media binaries containing private owner code stay local or in
 the owner's private consumer CI. Public changes contain source and bounded

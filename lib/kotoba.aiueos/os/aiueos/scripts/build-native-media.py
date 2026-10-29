@@ -16,11 +16,10 @@ def pin(path):
  b=path.read_bytes();return dict(bytes=len(b),sha256=hashlib.sha256(b).hexdigest())
 
 def main(amu,compiler,expected,efi,out):
- assert platform.system()=='Linux' and platform.machine() in ('aarch64','arm64','x86_64')
- assert pin(compiler)['sha256']==expected,'compiler pin drift'
+ if pin(compiler)['sha256']!=expected:raise ValueError('compiler pin drift')
+ spec=importlib.util.spec_from_file_location('native_kernel',HERE/'build-native-kernel.py');driver=importlib.util.module_from_spec(spec);spec.loader.exec_module(driver)
+ target,suffix=driver.native_tool_spec(driver.inspect_current_host_image(compiler.read_bytes()))
  out.mkdir(parents=True,exist_ok=False);shutil.copy2(efi,out/'BOOTX64.EFI');original=pin(efi);local=out/'BOOTX64.EFI'
- machine=183 if platform.machine() in ('aarch64','arm64') else 62
- assert compiler.read_bytes()[:4]==b'\x7fELF' and struct.unpack_from('<H',compiler.read_bytes(),18)[0]==machine
  parts=[amu/'seed/00-ns-static.kotoba',amu/'seed/01-mem.kotoba',amu/'seed/02-io.kotoba',HERE.parent/'native/media-builder.kotoba']
  source=out/'media.kotoba';source.write_bytes(b''.join(p.read_bytes()+b'\n' for p in parts))
  # KEXE_SECCOMP opt-in passes through when the caller sets it (seccomp-less
@@ -36,7 +35,7 @@ def main(amu,compiler,expected,efi,out):
   assert r.returncode==expected_exit,(name,r.returncode,r.stderr[-1000:])
   if expected_exit==0:assert not r.stderr,(name,r.stderr)
   return r
- tool=out/'media.elf';target='aarch64-linux' if machine==183 else 'x86_64-linux'
+ tool=out/('media'+suffix)
  run('compile',[compiler,'compile',source,'--target',target,'--output',tool,'--format','static']);tool.chmod(0o755)
  def invoke(name,operation,image,expected_exit=0,input_efi=local,custom=None):
   return run(name,[tool,operation,input_efi,image,original['sha256'],str(input_efi.stat().st_size)],expected_exit,custom)
