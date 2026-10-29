@@ -6,10 +6,10 @@ Enter, then checks, from guest memory and from the rendered frame:
   the panel is the whole desktop (no dock, nothing to click under it), N and the Deny
   button deny, the Allow button approves exactly as Y does, and a launcher key/click while
   the request is pending does nothing. HMP keys and clicks are synthetic and prove no human
-  consent. Reads guest words with xp and pixels from screendump; no guest agent, NIC or VNC.
+  consent. Reads guest words through private QMP memory snapshots and pixels from screendump; no guest agent, NIC or VNC.
 """
 import native_regions
-import argparse, hashlib, json, re, struct, subprocess, sys, tempfile, time
+import argparse, hashlib, importlib.util, json, re, struct, subprocess, sys, tempfile, time
 from pathlib import Path
 
 if not __debug__:
@@ -94,36 +94,60 @@ def main(args):
     raw_disk = bytearray(128 * 512)
     struct.pack_into("<4I", raw_disk, 0, 0x49415741, 0x54465244, 1, 128)
     scratch.write_bytes(raw_disk)
-    cmd = [str(args.qemu), "-machine", "q35,accel=tcg", "-cpu", "max", "-m", "128M", "-smp", "1",
-           "-drive", f"if=pflash,format=raw,readonly=on,file={args.firmware}",
-           "-drive", f"file={args.media},format=raw,if=ide,snapshot=on", "-boot", "order=c",
-           "-nic", "none", "-display", "none", "-no-reboot", "-monitor", "stdio",
-           "-device", "isa-ide,id=draft-controller", "-drive", f"file={scratch},format=raw,if=none,id=draft,cache=directsync",
-           "-device", "ide-hd,drive=draft,bus=draft-controller.0,unit=1,serial=AWAI90DRAFT000001"]
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, text=True, cwd=out, bufsize=1)
-    import os, select
+    spec = importlib.util.spec_from_file_location("private_qmp", Path(__file__).with_name("check-native-draft-restart-qemu.py"))
+    transport = importlib.util.module_from_spec(spec); spec.loader.exec_module(transport)
+    guest = transport.Guest(args, out / "guest", scratch)
+
+    def words(address, name):
+        return guest.dump(address, name)
+
+    def completed(previous=None, kind=None):
+        deadline = time.monotonic() + 180
+        while time.monotonic() < deadline:
+            c = words(work, "context.bin")
+            effects = words(work + native_regions.WINDOW_BYTES, "effects.bin")
+            if effects[56] != 0:
+                raise AssertionError(("native renderer refused the frame", hex(effects[56])))
+            event_seen = previous is None or (c[73] > previous[73] if kind == "key" else c[75] > previous[75])
+            frame_seen = previous is None or c[79] > previous[79]
+            if c[79] >= 1 and c[79] == c[78] and event_seen and frame_seen:
+                return c
+            assert guest.process.poll() is None, "guest exited"
+            time.sleep(.02)
+        raise AssertionError(("guest did not finish input/frame", kind, c[73], c[78], c[79]))
+
     def send(line, wait=0.4):
-        proc.stdin.write(line + "\n"); proc.stdin.flush(); time.sleep(wait)
-    def drain():
-        text = ""
-        while select.select([proc.stdout], [], [], 0.2)[0]:
-            chunk = os.read(proc.stdout.fileno(), 65536).decode(errors="replace")
-            if not chunk: break
-            text += chunk
-        return text
+        # Retain the old call signature; completed guest input/frame, rather
+        # than a fixed host delay, now determines when the next input is safe.
+        kind = "key" if line.startswith("sendkey ") else "mouse" if line.startswith("mouse_") else None
+        previous = completed() if kind else None
+        if previous is not None and previous[85] == 1:
+            # Allow intentionally hands control out of the desktop loop.
+            # Release the host-injected button, but do not require a stopped
+            # input loop to consume it. No further guest action is allowed.
+            assert line == "mouse_button 0" and previous[87] == 0 and previous[88] == 1
+            guest.hmp(line)
+            return
+        guest.hmp(line)
+        if kind:
+            completed(previous, kind)
+            time.sleep(.12)  # let the synthetic key's release complete
+
     def read(addr):
-        drain(); send(f"xp /1wx {addr:#x}", 0.5)
-        found = re.findall(r"[0-9a-f]{16}: 0x([0-9a-f]{8})", drain())
-        assert found, ("xp gave nothing", hex(addr))
-        return int(found[-1], 16)
+        base = surface if surface <= addr < surface + 8192 else work
+        assert base <= addr < base + 8192 and (addr-base) % 4 == 0
+        return words(base, "surface.bin" if base == surface else "context.bin")[(addr-base)//4]
     S = lambda i: read(surface + 4 * i)
     W = lambda i: read(work + 4 * i)
     events = []
+    spec = importlib.util.spec_from_file_location("desktop_observer", Path(__file__).with_name("check-native-desktop-qemu.py"))
+    desktop_observer = importlib.util.module_from_spec(spec); spec.loader.exec_module(desktop_observer)
+    background = desktop_observer.expected_background
     def event(name, **detail):
         events.append(dict(name=name, **detail))
     def screenshot(name):
-        send(f"screendump {name}.ppm", 2.0)
+        completed()
+        guest.hmp("screendump " + json.dumps(str(out / (name + ".ppm"))))
         raw = (out / f"{name}.ppm").read_bytes()
         _, dims, _, pixels = raw.split(b"\n", 3)
         width, height = map(int, dims.split())
@@ -189,7 +213,7 @@ def main(args):
         px, py = (width - 480) // 2, (height - 224) // 2
         allow = pixel(shot, px + 24 + 70, py + 164 + 4)
         assert allow == (60, 179, 34), allow
-        assert pixel(shot, width // 2, height - 30) == (0x8f, 0xb5, 0xd8), "dock still drawn under the panel"
+        assert pixel(shot, width // 2, height - 30) == background(height - 30, height), "dock still drawn under the panel"
         assert pixel(shot, px + 1, py + 100) == (0x3b, 0x82, 0xff), "panel border missing"
         event("consent-open", panel=[px, py, 480, 224], allowPixel=allow, dockHidden=True)
         # modal: a launcher key and a launcher click do nothing while the request is pending
@@ -199,11 +223,17 @@ def main(args):
         move_to(150, 14); click()
         assert S(1) == 1 and W(87) == 1 and S(2039) == 1
         event("launcher-click-ignored", windows=S(1))
+        # Minimize and dock restore must not act behind a consent surface.
+        send("sendkey f6", 1.5)
+        assert S(9) == full and S(2) == 2 and W(87) == 1
+        move_to((width - 184) // 2 + 8 + 44 + 18, height - 28); click()
+        assert S(9) == full and S(2) == 2 and W(87) == 1
+        event("minimize-and-dock-blocked-by-consent", goalLength=S(2038))
         # N denies
         send("sendkey n", 1.5)
         assert W(87) == 0 and S(2039) == 0 and W(88) == 0 and W(85) == 0 and S(2038) == 13
         shot = screenshot("after-key-deny")
-        assert pixel(shot, width // 2, height - 30) != (0x8f, 0xb5, 0xd8), "dock not back after deny"
+        assert pixel(shot, width // 2, height - 30) != background(height - 30, height), "dock not back after deny"
         event("key-deny", goalLength=S(2038), approved=W(88))
         # Deny button
         send("sendkey ret", 1.5); assert W(87) == 1 and S(2039) == 1
@@ -224,6 +254,12 @@ def main(args):
         assert S(2039) == 0 and seed_words() == [0] * 8 and W(94) == 0
         send("sendkey f8", 1.5); assert W(87) == 2 and S(2039) == 3, (W(87), S(2039))
         key_panel = screenshot("key-request")
+        # All pending kinds, including key and passphrase requests, own the
+        # pointer. A hidden dock click cannot focus another app or minimize it.
+        move_to((width - 184) // 2 + 8 + 18, height - 28); click()
+        send("sendkey f6", 1.5)
+        assert S(1) == 1 and S(2) == 2 and S(9) == full and W(87) == 2
+        event("key-request-blocks-background-pointer")
         send("sendkey n", 1.5)
         assert W(87) == 0 and S(2039) == 0 and seed_words() == [0] * 8 and W(94) == 3
         event("key-deny", seedBytes=seed_words(), approvedCount=0)
@@ -385,15 +421,15 @@ def main(args):
               approvedCount=(S(2039) >> 2) & 15, changedColumns=[changed_cols[0] + 180, changed_cols[-1] + 180],
               networkInk=network_ink, telemetryInk=telemetry_ink, keysHintInk=keys_ink)
     finally:
-        try: send("quit", 0.5)
-        except Exception: pass
-        try: proc.wait(timeout=15)
-        except Exception: proc.kill()
+        guest.close()
     media_after = pin(args.media)
     assert media_before == media_after, "media changed"
     report = dict(status="PASS_NATIVE_CONSENT_QEMU", kernel=pin(args.kernel), efi=pin(args.efi),
                   media=media_after, font=pin(args.font), firmware=pin(args.firmware),
                   observer=pin(Path(__file__)), events=events,
+                  transportObserver=pin(Path(__file__).with_name("check-native-draft-restart-qemu.py")),
+                  desktopObserver=pin(Path(__file__).with_name("check-native-desktop-qemu.py")),
+                  inputSynchronizedWithCompletedFrames=True,
                   syntheticInputProvesHumanConsent=False, guestEmulation="QEMU TCG",
                   physicalHardware=False)
     (out / "native-consent-qemu.json").write_text(json.dumps(report, indent=2) + "\n")

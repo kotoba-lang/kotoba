@@ -59,15 +59,26 @@ class Boot:
             text += chunk
         return text
 
-    def read(self, addr):
-        self.drain(); self.send(f"xp /1wx {addr:#x}", 0.5)
-        found = re.findall(r"[0-9a-f]{16}: 0x([0-9a-f]{8})", self.drain())
-        assert found, ("xp gave nothing", hex(addr))
-        return int(found[-1], 16)
+    def dump(self, addr, length):
+        # Observe one native range in a single monitor command. The previous
+        # per-word sleeps made even sampled-prefix checks slow. The bulk
+        # snapshot below also permits checking every byte of each wipe range.
+        path = self.out / "keystore-observation.bin"
+        if path.exists(): path.unlink()
+        self.drain()
+        self.send(f"pmemsave {addr:#x} {length} {path.name}", .05)
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if path.exists() and path.stat().st_size == length:
+                raw = path.read_bytes(); path.unlink(); return raw
+            if self.proc.poll() is not None: break
+            time.sleep(.02)
+        raise AssertionError(("native memory observation missing", hex(addr), length))
 
+    def read(self, addr): return struct.unpack("<I", self.dump(addr, 4))[0]
     def S(self, i): return self.read(self.surface + 4 * i)
     def W(self, i): return self.read(self.work + 4 * i)
-    def words(self, first, count): return b"".join(struct.pack("<I", self.W(first + i)) for i in range(count))
+    def words(self, first, count): return self.dump(self.work + 4 * first, 4 * count)
 
     def type_text(self, text):
         for ch in text: self.send("sendkey " + ("spc" if ch == " " else ch), 0.6)
@@ -227,6 +238,12 @@ def main(args):
         assert b.W(100) == refused_at - 1 and attempts_on_disk() == refused_at - 1, "a refused attempt must not be counted"
         assert b.words(928, 8) == bytes(32) and b.words(832, 8) == bytes(32), "a refused attempt must run no unlock and leave nothing"
         assert (b.W(101), b.W(102)) != (0, 0), "the deadline must be set"
+        # UI redraw/selection must not overwrite either half of the key deadline.
+        saved_deadline = (b.W(101), b.W(102))
+        b.send("sendkey right", 1.5)
+        assert (b.W(101), b.W(102)) == saved_deadline, "redraw changed the key deadline"
+        b.send("sendkey esc", 1.5)
+        assert (b.W(101), b.W(102)) == saved_deadline, "selection cancel changed the key deadline"
         home_wait = b.screenshot("home-wait")
         assert key_row(home_wait) != key_row(home_wrong) and key_row(home_wait) != key_row(home_locked), "the key row must say to wait"
         events.append(dict(name="attempt-delay", refusedAtAttempt=refused_at, attemptsRecorded=refused_at - 1,
@@ -272,8 +289,8 @@ def main(args):
         assert b.W(87) == 0 and b.W(94) == 11 and b.W(96) == 1, (b.W(87), b.W(94), b.W(96))
         assert b.S(2039) == count * 4 + 128, (hex(b.S(2039)), count)
         zero = bytes(32)
-        assert b.words(928, 8) == zero and b.words(320, 8) == zero and b.words(800, 16) == bytes(64), "seed, public key and signature must be gone"
-        assert b.words(768, 16) == bytes(64) and b.words(512, 8) == zero and b.words(1024, 8) == zero, "signing buffer and workspace must be wiped"
+        assert b.words(928, 8) == zero and b.words(320, 32) == bytes(128) and b.words(800, 16) == bytes(64), "seed, public key and signature must be gone"
+        assert b.words(768, 16) == bytes(64) and b.words(512, 256) == bytes(1024) and b.words(1024, 1024) == bytes(4096), "signing buffer and workspace must be wiped"
         assert scratch.read_bytes() == disk_before, "Lock must not write to the disk"
         b.send("sendkey f7", 1.5); assert b.W(87) == 0, "signing must be impossible while locked"
         home_relocked = b.screenshot("home-relocked")

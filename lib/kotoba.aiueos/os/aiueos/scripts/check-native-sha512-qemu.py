@@ -3,7 +3,7 @@
 
 Before the desktop starts, the guest hashes three messages with aiueos.sha512 and leaves the digests in the
 browser context: "abc" (words 320..335), the 112-byte FIPS 180-4 two-block message (336..351) and "abd"
-(352..367). This gate boots once, waits for the first completed frame, reads the marker (word 99 =
+(352..367). This gate boots once, waits for the first completed frame, reads the preserved marker (effects word 51 =
 0x53483531) and the 48 digest words over the QEMU monitor, and compares them with hashlib.sha512 of the
 same messages computed on the host. "abd" is the negative control: it must differ from "abc" and match
 its own digest. No key exists and nothing is signed; QEMU TCG only.
@@ -57,7 +57,7 @@ def main(a):
         while time.monotonic() < deadline and words(79, 1)[0] < 1: pass
         frames = words(79, 1)[0]; assert frames >= 1, "no first frame"
         events.append(dict(name="first-frame", framesCompleted=frames))
-        marker = words(99, 1)[0]
+        marker = words(2048 + 51, 1)[0]
         assert marker == MARKER, ("the SHA-512 self-test did not finish", hex(marker))
         got = {}
         for name, msg, first in CASES:

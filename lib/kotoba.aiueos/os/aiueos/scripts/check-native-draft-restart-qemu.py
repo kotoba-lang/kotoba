@@ -76,6 +76,9 @@ class Guest:
                    '-no-reboot', '-serial', 'file:serial.log',
                    '-debugcon', 'file:debug.log',
                    '-qmp', 'stdio']
+        if getattr(args, "native_audio_wav", False):
+            command += ['-audiodev', 'wav,id=ui,path=ui.wav',
+                        '-device', 'AC97,audiodev=ui']
         if disk:
             command += ['-device', 'isa-ide,id=draft-controller', '-drive',
                         f'file={disk},format=raw,if=none,id=draft,cache=directsync',

@@ -155,6 +155,10 @@ def main(args):
                 relative = source.relative_to(REPO)
                 virtual = "/" + relative.as_posix()
                 sources[virtual] = stage_file(source, stage / relative)
+        # Copy the exact shared Browser effect owner, not a product-local fork.
+        effect = REPO.parent / "kotoba.browser/src/browser/effects.kotoba"
+        sources["/os/browser/effects.kotoba"] = stage_file(
+            effect, stage / "os/browser/effects.kotoba")
         owner_manifest = json.loads(DEPENDENCIES.read_text())
         if owner_manifest["schema"] != "aiueos.native-source-dependencies.v1":
             raise ValueError("unexpected owner dependency manifest")
