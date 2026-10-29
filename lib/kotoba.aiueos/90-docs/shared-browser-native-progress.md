@@ -90,6 +90,16 @@ container; that is a build toolchain property, not a guest runtime dependency.
 The source-bound local receipt and screenshots are in
 [`native-itonami-goal-20261025`](evidence/native-itonami-goal-20261025/README.md).
 
+A later live Mac QEMU session established why Enter appeared unresponsive: the
+guest consumed PS/2 code 28 (input count 18 to 19), but the Goal remained `a`
+and the pre/post screen pixels were identical. The diagnostic card now shows
+`Itonami (no agent)` on Enter, keeps the RAM draft, and returns to its normal
+title on the next edit. This is an unavailable-state response, not a goal
+submission or an agent turn. The same session found the desktop's 2^30 native
+fuel budget expiring during interactive use; see
+[native-desktop-media-v1.md](native-desktop-media-v1.md) for the fuel budget
+(ported from AIUEOS #506).
+
 The protected value runtime and complete surface/input graph are both
 prerequisites of the shared UI event loop. The existing kernel's bounded ABI
 does not yet supply the complete string/document/f64 runtime needed by CSSOM.
