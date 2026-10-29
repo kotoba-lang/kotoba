@@ -188,8 +188,15 @@ def main(args):
         b.press_key_button()
         assert b.W(87) == 4 and b.W(98) == 1, ("the Unlock button must open the unlock request", b.W(87), b.W(98))
         b.send("sendkey esc", 1.5); assert b.W(87) == 0 and b.W(94) == 6
+        # a locked key also shows a Forget button (red, 110 x 26) beside Unlock; it opens the forget request (passphrase kind 2)
+        fx, fy, fw, fh = bx + 160, by, 110, 26
+        assert sum(1 for px in b.band(home_locked, fx, fx + fw, fy, fy + fh) if px != b"\xff\xff\xff") > 2500, "the Forget button must be drawn while locked"
+        assert sum(1 for px in b.band(home_none, fx, fx + fw, fy, fy + fh) if px != b"\xff\xff\xff") < 100, "no Forget button without a stored key"
+        b.move_to(fx + fw // 2, fy + fh // 2); b.click()
+        assert b.W(87) == 4 and b.W(98) == 2, ("the Forget button must open the forget request", b.W(87), b.W(98))
+        b.send("sendkey esc", 1.5); assert b.W(87) == 0
         b.send("sendkey f7", 1.5); assert b.W(87) == 0, "signing must be impossible while the key is locked"
-        events.append(dict(name="boot2-locked", locked=True, blobEqualsDisk=True, seedInRam=False, signingRefused=True))
+        events.append(dict(name="boot2-locked", locked=True, blobEqualsDisk=True, seedInRam=False, signingRefused=True, forgetButton=True))
         # wrong passphrase: refused, still locked
         b.send("sendkey f8", 1.5)
         assert b.W(87) == 4 and b.W(98) == 1 and b.S(2039) == 128 + 3 + 2**31 + 8192, (b.W(87), b.W(98), hex(b.S(2039)))
