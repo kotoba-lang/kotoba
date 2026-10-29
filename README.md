@@ -55,12 +55,27 @@ or node membership, or qualify a release. Awai Node and Itonami also have
 independently qualified paths on other hosts. Common fixes stay in their
 existing owners; Awai presets do not create another language or OS fork.
 
-## Install
+## Try Kotoba with Amu
 
-```sh
-brew tap kotoba-lang/kotoba && brew trust kotoba-lang/kotoba && brew install kotoba
-kotoba -e '(+ 1 2)'
-```
+Use the [canonical Kotoba / Amu first-run guide](https://github.com/kotoba-lang/amu/blob/main/examples/foundation-starter/README.md).
+It provides an immutable checkout, compiler and sample digest checks, and
+commands to check, compile and run a small Kotoba program. Change its result
+from 42 to 43, then observe explicit fuel and capability refusals. No account,
+Awai membership, model download or payment is required.
+
+The public compiler entry is Amu's native Linux x86_64 `bin/amu`, with
+`bin/kotoba` and `bin/kotoba-compiler` aliases in that same Amu checkout.
+Use the guide's host requirements and qualification record. The separate
+[Linux ARM64 diagnostic guide](https://github.com/kotoba-lang/amu/blob/main/examples/foundation-starter/ARM64-PREVIEW.md)
+does not establish a supported ARM, macOS or Windows release.
+
+This repository's `bin/kotoba` still dispatches to retired KBB/Clojure host
+routes. Do not use that source launcher for the native first run or install
+a hosted runtime to work around a refusal. The former Homebrew and
+`kotoba -e` quick start is not the native starter. The CLI examples below
+describe separate implementation contracts; full native CLI command parity
+and the older package's qualification remain open. Keep the first run on
+the single pinned Amu entry above.
 
 Web3 identity starts from a chain-neutral Kotoba principal controlled by a
 Passkey. EVM smart accounts are explicit CAIP-10 links verified by ERC-1271 or
