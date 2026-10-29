@@ -1230,7 +1230,8 @@ zig cc -target x86_64-freestanding-none -std=c11 -O2 \
   -c -o "$kernel_vtd_object" "$aiueos/kernel/vtd.c"
 # JUN-556: kernel/apic.c has a Kotoba form (kotoba/apic.kotoba), built by the Amu
 # aiueos object route. Opt in with AIUEOS_KOTOBA_APIC=1; it replaces the C object
-# and the default build is unchanged. Not yet run on x86 (see kotoba/apic.kotoba).
+# and the default build is unchanged. Executed in scripts/apic-x86-smoke (QEMU TCG), not yet
+# booted as part of the kernel image (see kotoba/apic.kotoba).
 if [ "${AIUEOS_KOTOBA_APIC:-0}" = 1 ]; then
   kotoba_apic_object=${AIUEOS_KOTOBA_APIC_OBJECT:-"$aiueos/kotoba/apic.o"}
   python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_apic_object" \
