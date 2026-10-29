@@ -51,10 +51,23 @@ def main():
     parser.add_argument('--packager', type=Path, help='macOS: the Mac packager (JUN-593)')
     parser.add_argument('--packager-sha256')
     parser.add_argument('--output', type=Path, required=True)
+    # CI runs the two sections in separate lanes: the history section (audit and
+    # fresh-read verdicts, pure, about a hundred Ed25519 operations) took 6-10+
+    # minutes on an x86 runner and pushed the broker lane past its limits.
+    parser.add_argument('--section', choices=['all', 'history', 'broker'], default='all')
     args = parser.parse_args()
     gate = NativeGate(args)
-    image = gate.build('quorum', 'hata/quorum_native_test.kotoba', sources())
-    gate.run('quorum-and-existing-admission', image)
+    if args.section in ('all', 'broker'):
+        image = gate.build('quorum', 'hata/quorum_native_test.kotoba', sources())
+        gate.run('quorum-and-existing-admission', image)
+    if args.section in ('all', 'history'):
+        history(gate)
+    if args.section == 'history':
+        gate.finish('PASS_NATIVE_BROKER_HISTORY', section='history')
+        return
+    broker(gate)
+
+def history(gate):
     auditor = gate.build('audit', 'hata/audit_native_test.kotoba', sources(audit=True))
     gate.run('audit-history-verdicts', auditor)
     # Negative control: an auditor that does not check the parent link accepts a
@@ -65,14 +78,18 @@ def main():
     unchained['hata/audit.kotoba'] = unchained['hata/audit.kotoba'].replace(before, b'true')
     gate.run('unchained-auditor-detected', gate.build('audit-unchained-control', 'hata/audit_native_test.kotoba', unchained), 4004)
     reader = gate.build('read', 'hata/read_native_test.kotoba', sources(read=True))
-    gate.run('fresh-read-verdicts', reader)
+    # One image verifies every case; on a slow x86 runner it has taken over 600 s.
+    gate.run('fresh-read-verdicts', reader, timeout=1800)
     # Negative control: a reader that ignores pending votes adopts the stale
     # committed head instead of recovering the undistributed certificate.
     blind = sources(read=True)
     before = b'votes (if (= (vector-count best) 0) (vector-i64) (votes-for batch offs top best))'
     assert blind['hata/read.kotoba'].count(before) == 1
     blind['hata/read.kotoba'] = blind['hata/read.kotoba'].replace(before, b'votes (vector-i64)')
-    gate.run('pending-blind-reader-detected', gate.build('read-blind-control', 'hata/read_native_test.kotoba', blind), 3003)
+    gate.run('pending-blind-reader-detected', gate.build('read-blind-control', 'hata/read_native_test.kotoba', blind), 3003,
+             timeout=1800)
+
+def broker(gate):
     driver = gate.build('broker', 'hata/broker_native_test.kotoba', sources(True))
     coordinator = gate.out / 'coordinator'
     sink = gate.out / 'sink'
