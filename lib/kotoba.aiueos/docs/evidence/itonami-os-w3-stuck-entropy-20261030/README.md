@@ -18,10 +18,10 @@ Amu `63557e92b` passed explicitly (`--compiler-image` / `--packager-image`):
   passphrase the request closes with code 2, the seed words are all zero and no key exists
   (`stuck-entropy-refused`).
 
-Two stale guards on main were found on the way. `build-native-desktop-macos.py` expected 37 source
-modules (38 for cid); since #1025 added `native/debug_link.kotoba` and `native/rtl8168_debug.kotoba` the
-desktop graph has 38 (39), so every desktop profile was refused at the receipt check; the counts are
-corrected here. Its repository-bootstrap route also accepts only a 47- or 48-module Amu FULL-MANIFEST,
-while Amu main has 49; that route is left unchanged and the roots were passed explicitly.
+The receipts were made at kotoba main \`834be3a89\`, whose desktop graph had 38 source modules.
+\`build-native-desktop-macos.py\` there still expected 37, so for these runs the count was corrected
+locally; main has since moved the guard itself (to 40, after further desktop modules). Its
+repository-bootstrap route accepts only a 47- or 48-module Amu FULL-MANIFEST while Amu main has 49,
+so the roots were passed explicitly.
 
 Not shown: RDSEED in a guest; a physical machine; anything beyond QEMU TCG. Diagnostic, not a release.

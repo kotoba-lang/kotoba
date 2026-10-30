@@ -342,6 +342,32 @@ a retry never runs without its wait. Measured 2026-10-30 (podman, Linux arm64): 
 planned 169 ms and slept 172 ms; the execute retry planned 116 ms and slept 121 ms. A coordinator
 without the grant is refused at its first backoff, and its replica gives up waiting (-94).
 
+**Per-peer budgets, one request in flight, and memory per connection.** `serve-roster` accepts
+any coordinator on its roster (roles 9 and 8 in the driver) and learns from the handshake which one
+it is talking to.
+- **Budget:** each authenticated peer is served at most once in the listener's lifetime. A second
+  session from the same peer is closed before its request is read (-71), while another peer is
+  still served.
+- **One request in flight:** after reading a request, the listener waits up to 2 s for a second
+  frame. If one arrives, the peer is pipelining, and the session is closed without an answer (-72).
+- **Memory:** each connection's work runs inside an `arena-scope`, and only one encoded result
+  (peer and outcome) leaves it. The runtime reclaims a connection's vectors when it ends. Before
+  this, a third full handshake in one process exhausted the vector table
+  (`vector-table-exhausted`); with it, one process completes three full handshakes.
+
+Measured 2026-10-30 (podman, Linux arm64):
+
+| sessions | outcomes |
+|---|---|
+| coordinator 9, coordinator 9 again, coordinator 8 | `[1, -71, 1]`: served, over budget, served |
+| coordinator 8 pipelining, then coordinator 8 | `[-72, 1]`: refused unanswered, then served |
+
+Limits:
+- The wait costs every served request 2 s. The TCP wires have no readiness poll, and a large second
+  frame takes over 300 ms to arrive, because each 16 KiB chunk is one hex-encoded wire call. A
+  300 ms window missed it.
+- The budget is per listener process. No store is shared across processes or hosts.
+
 **Execute over a session.** The effect itself also travels over a session. The sink
 installs the certified fence. The coordinator then reserves a claim, and the claim's votes
 and commits are carried over sessions like the fence's. Finally the coordinator sends the
@@ -368,8 +394,8 @@ The keys in the driver are fixed public test values; a deployment takes ephemera
 KEM randomness from the host's entropy provider and identities from the roster. The CI
 arm64 lane runs it.
 
-Not yet: backpressure, per-peer (rather than per-listener) budgets, reclaiming a
-listener's memory between connections, and separate hosts.
+Not yet: a readiness poll for backpressure without the 2 s wait, budgets shared across
+listener processes, and separate hosts.
 
 ## Verification and scope
 

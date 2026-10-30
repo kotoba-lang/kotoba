@@ -270,6 +270,15 @@ if [ "${AIUEOS_MURAKUMO_DEVICE_RESULT:-0}" = 1 ]; then
     fb42023ba8bb0e42960151dcf8a0f8f3d161628c5b15c8597f6c7d6a76bf5b0b kotoba_aiueos_device_result_text
   device_result_link="$kernel_device_result_object $kernel_device_worker_protocol_object $kotoba_device_worker_poll_object $kotoba_p256_did_object $kotoba_device_result_text_object"
 fi
+# JUN-554: the CPU reads -- device_result.c's RDRAND bytes and qwen35_infer.c's read_cycles in the model-handoff image --
+# are kotoba/cpu-reads.o, over amu ADR 0389's CPU intrinsics. Linked once when either profile is on.
+cpu_reads_link=
+if [ "${AIUEOS_MURAKUMO_DEVICE_RESULT:-0}" = 1 ] || [ "${AIUEOS_QWEN38_MODEL_HANDOFF:-0}" = 1 ]; then
+  kotoba_cpu_reads_object=${AIUEOS_KOTOBA_CPU_READS_OBJECT:-"$aiueos/kotoba/cpu-reads.o"}
+  python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_cpu_reads_object" \
+    f6604b54989c3af07d800ba26adfbe0f5e564bd0abe7fee695d0028bc655da58 kotoba_aiueos_read_cycles,kotoba_aiueos_cpu_random_bytes
+  cpu_reads_link="$kotoba_cpu_reads_object"
+fi
 # JUN-35: the poll scheduler is referenced from main.c under
 # AIUEOS_PERSISTENT_BOOT (init/sequence/record) and from pci.c under
 # AIUEOS_MURAKUMO_DEVICE_RESULT (status disposition), so either flag links it.
@@ -656,7 +665,12 @@ if [ "${AIUEOS_QWEN38_MODEL_HANDOFF:-0}" = 1 ] ||
     kotoba_qwen35_row_bytes_object=${AIUEOS_KOTOBA_QWEN35_ROW_BYTES_OBJECT:-"$aiueos/kotoba/qwen35-row-bytes.o"}
     python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_qwen35_row_bytes_object" \
       f7a3b74b53acef6cd46f4e0f82989557c0b51915bd37e4029f51df673f185618 kotoba_aiueos_qwen35_row_bytes
-    model_handoff_link="$kotoba_qwen35_row_bytes_object $kernel_model_handoff_object $kotoba_model_mapping_plan_object $kotoba_model_handoff_validate_object $kernel_qwen35_runtime_object $kernel_qwen35_quant_object $kernel_qwen35_infer_object $kotoba_qwen35_header_object $kotoba_qwen35_kv_object $kotoba_qwen35_tensor_object"
+    # JUN-554: prepare_bsp_extended_state and cpu_has_avx2 are kotoba/xstate-setup.o in this image (amu ADR 0390's
+    # bit-bounded CR4 / XCR0 intrinsics).
+    kotoba_xstate_setup_object=${AIUEOS_KOTOBA_XSTATE_SETUP_OBJECT:-"$aiueos/kotoba/xstate-setup.o"}
+    python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_xstate_setup_object" \
+      cff42f6ee8a6d8236085bd9bb493d7d882ee7c568a8cad5b96ed91281f1af85a kotoba_aiueos_prepare_extended_state,kotoba_aiueos_cpu_has_avx2
+    model_handoff_link="$kotoba_xstate_setup_object $kotoba_qwen35_row_bytes_object $kernel_model_handoff_object $kotoba_model_mapping_plan_object $kotoba_model_handoff_validate_object $kernel_qwen35_runtime_object $kernel_qwen35_quant_object $kernel_qwen35_infer_object $kotoba_qwen35_header_object $kotoba_qwen35_kv_object $kotoba_qwen35_tensor_object"
   fi
   if [ "${AIUEOS_MODEL_NVME_SLOTS:-0}" = 1 ]; then
     model_slots_cflags="-DAIUEOS_MODEL_NVME_SLOTS=1"
@@ -1562,7 +1576,7 @@ zig ld.lld -nostdlib -static --strip-all $qualification_gc_link -z max-page-size
   "$kernel_acpi_object" "$kotoba_acpi_dmar_object" "$kotoba_acpi_madt_object" "$kernel_vtd_object" "$kernel_apic_object" "$kernel_memory_object" \
   "$kernel_pci_object" "$kernel_rtl8125_object" \
   "$kernel_inference_status_object" \
-  $device_result_link $poll_sched_link $model_handoff_link "$kernel_kototama_runtime_object" "$kotoba_kototama_management_object" \
+  $device_result_link $cpu_reads_link $poll_sched_link $model_handoff_link "$kernel_kototama_runtime_object" "$kotoba_kototama_management_object" \
   "$kotoba_job_protocol_glue_object" \
   "$kotoba_tls_aes_object" "$kotoba_bytes_object" "$kotoba_tls13_keyschedule_object" "$kotoba_tls13_cert_object" "$kotoba_tls13_hello_object" "$kotoba_tls13_verify_object" "$kotoba_tls13_keys_object" "$kotoba_tls13_hs_object" "$kernel_tls13_object" \
   "$kernel_scheduler_object" "$kernel_syscall_object" \

@@ -79,37 +79,10 @@ static void hex_encode(const uint8_t *in, uint32_t bytes, char *out) {
 }
 
 #ifndef AIUEOS_DEVICE_RESULT_TESTING
-static void cpuid(uint32_t leaf, uint32_t subleaf,
-                  uint32_t *a, uint32_t *b, uint32_t *c, uint32_t *d) {
-  __asm__ volatile("cpuid"
-                   : "=a"(*a), "=b"(*b), "=c"(*c), "=d"(*d)
-                   : "a"(leaf), "c"(subleaf));
-}
-
-static int rdrand64(uint64_t *value) {
-  for (uint32_t attempt = 0; attempt < 32; attempt++) {
-    uint8_t ready;
-    uint64_t candidate;
-    __asm__ volatile("rdrand %0; setc %1" : "=r"(candidate), "=qm"(ready));
-    if (ready) { *value = candidate; return 1; }
-    __asm__ volatile("pause");
-  }
-  return 0;
-}
-
+/* CPUID.1:ECX[30] and the RDRAND words are kotoba/cpu-reads.kotoba (JUN-554, over amu ADR 0389's CPU intrinsics). */
+extern int64_t kotoba_aiueos_cpu_random_bytes(uint8_t *, uint64_t);
 int aiueos_cpu_random_bytes(uint8_t *out, uint32_t bytes) {
-  uint32_t a, b, c, d;
-  if (!out || !bytes) return 0;
-  cpuid(1, 0, &a, &b, &c, &d);
-  if (!(c & (1U << 30))) return 0;
-  uint32_t offset = 0;
-  while (offset < bytes) {
-    uint64_t word;
-    if (!rdrand64(&word)) return 0;
-    for (uint32_t i = 0; i < 8 && offset < bytes; i++, offset++)
-      out[offset] = (uint8_t)(word >> (i * 8));
-  }
-  return 1;
+  return kotoba_aiueos_cpu_random_bytes(out, bytes) == 1;
 }
 #else
 extern int aiueos_device_test_random_bytes(uint8_t *, uint32_t);

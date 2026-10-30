@@ -223,6 +223,12 @@ static float silu(float value) {
   return value * sigmoid(value);
 }
 
+/* In the model-handoff image the read is kotoba/cpu-reads.kotoba (JUN-554, amu ADR 0389's kernel-rdtsc: the same lfence;
+   rdtsc); the parity profiles and the host smokes, which do not link it, keep the C. */
+#if defined(AIUEOS_QWEN38_MODEL_HANDOFF) && !defined(AIUEOS_QWEN35_TESTING)
+extern int64_t kotoba_aiueos_read_cycles(void);
+static uint64_t read_cycles(void) { return (uint64_t)kotoba_aiueos_read_cycles(); }
+#else
 static uint64_t read_cycles(void) {
 #if defined(__x86_64__)
   uint32_t low, high;
@@ -232,6 +238,7 @@ static uint64_t read_cycles(void) {
   return 0;
 #endif
 }
+#endif
 
 static float dot_scalar(const float * left, const float * right,
                         uint64_t count) {
@@ -252,6 +259,13 @@ static float dot_scalar(const float * left, const float * right,
 typedef float qwen_v8f __attribute__((vector_size(32), aligned(1)));
 typedef float qwen_v4f __attribute__((vector_size(16), aligned(1)));
 
+/* In the model-handoff image the extended-state setup and the AVX2 probe are kotoba/xstate-setup.kotoba (JUN-554, over amu
+   ADR 0389 / 0390's CPU and bit-bounded CR4 / XCR0 intrinsics); the parity profiles and the host smokes keep the C. */
+#if defined(AIUEOS_QWEN38_MODEL_HANDOFF) && !defined(AIUEOS_QWEN35_TESTING)
+extern int64_t kotoba_aiueos_prepare_extended_state(void);
+extern int64_t kotoba_aiueos_cpu_has_avx2(void);
+static void prepare_bsp_extended_state(void) { (void)kotoba_aiueos_prepare_extended_state(); }
+#else
 static void prepare_bsp_extended_state(void) {
   uint32_t eax, ebx, ecx, edx;
   __asm__ volatile("cpuid"
@@ -270,6 +284,7 @@ static void prepare_bsp_extended_state(void) {
   __asm__ volatile("xsetbv"
                    : : "a"(xcr0_low), "d"(xcr0_high), "c"(0U));
 }
+#endif
 
 __attribute__((target("avx2")))
 static float dot_avx2(const float *left, const float *right, uint64_t count) {
@@ -301,6 +316,9 @@ static float dot_avx2(const float *left, const float *right, uint64_t count) {
   return sum;
 }
 
+#if defined(AIUEOS_QWEN38_MODEL_HANDOFF) && !defined(AIUEOS_QWEN35_TESTING)
+static int cpu_has_avx2(void) { return kotoba_aiueos_cpu_has_avx2() == 1; }
+#else
 static int cpu_has_avx2(void) {
   uint32_t eax, ebx, ecx, edx;
   __asm__ volatile("cpuid"
@@ -321,6 +339,7 @@ static int cpu_has_avx2(void) {
                    : "a"(7U), "c"(0U));
   return (ebx & (1U << 5)) != 0;
 }
+#endif
 #endif
 
 static float dot(const float *left, const float *right, uint64_t count) {
