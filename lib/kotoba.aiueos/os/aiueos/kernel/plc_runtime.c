@@ -52,6 +52,7 @@ static void plc_reset(void) {
    performs the step the object names. */
 extern int64_t kotoba_aiueos_plc_release_step(uint64_t, uint64_t, uint64_t, uint64_t);
 extern int64_t kotoba_aiueos_plc_call_step(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+extern uint64_t kotoba_aiueos_tick_wait(uint64_t ticks, uint64_t ticks_length, uint64_t target, uint64_t rounds);
 
 static int plc_release(uint64_t now) {
   if (kotoba_aiueos_plc_release_step(plc.fault_latched, plc.active, now, plc.next_release) != 1) {
@@ -122,7 +123,11 @@ int aiueos_plc_rt_begin_scan(int32_t enable,int32_t sensor) {
     plc_initialized=1;
   }
   if (plc.active || plc.fault_latched) return 0;
-  while (aiueos_apic_timer_ticks<plc.next_release) __asm__ volatile("sti; hlt; cli");
+  /* kotoba/tick-wait.o: look, then sti; hlt; cli, until the tick counter
+     reaches the release; it answers 2 when its rounds run out, 0 on refusal
+     (the release check below then fails the scan). */
+  for (uint64_t got=2; got==2;)
+    got=kotoba_aiueos_tick_wait((uint64_t)(uintptr_t)&aiueos_apic_timer_ticks,8,plc.next_release,65536);
   uint64_t release=plc.next_release;
   if (aiueos_apic_timer_ticks!=release) return 0;
   plc.physical_input[0]=enable; plc.physical_input[1]=sensor;
