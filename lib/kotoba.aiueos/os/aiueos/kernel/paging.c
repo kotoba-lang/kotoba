@@ -24,11 +24,25 @@ extern uint8_t aiueos_user_text_start[], aiueos_user_text_end[];
 extern uint8_t aiueos_user_data_start[], aiueos_user_data_end[];
 extern uint8_t aiueos_low_end[], aiueos_high_data_start[], aiueos_high_data_end[];
 
-static uint64_t pml4[ENTRY_COUNT] __attribute__((aligned(PAGE_SIZE)));
-static uint64_t pml5[ENTRY_COUNT] __attribute__((aligned(PAGE_SIZE)));
-static uint64_t pdpt[ENTRY_COUNT] __attribute__((aligned(PAGE_SIZE)));
-static uint64_t page_directory[ENTRY_COUNT] __attribute__((aligned(PAGE_SIZE)));
-static uint64_t low_page_table[ENTRY_COUNT] __attribute__((aligned(PAGE_SIZE)));
+/* The final-map tables live in `.high_bss` for the same reason the
+ * transition tables below do: the low kernel/user layout must end at
+ * `aiueos_kernel_bss_end <= 0x1e1000` (the per-process user image window),
+ * and the murakumo-node-pxe profile overran it by 25,024 B.  They are
+ * explicitly zeroed at the top of aiueos_paging_initialize (line ~251)
+ * before being built, while the loader's identity map is still live, so
+ * the section change preserves their zero-initialised semantics
+ * (ADR-0221 pattern); the owned map covers 4..6 MiB from the first owned
+ * CR3 on (page_directory[2]), so every later access is unchanged. */
+static uint64_t pml4[ENTRY_COUNT]
+  __attribute__((section(".high_bss"), aligned(PAGE_SIZE)));
+static uint64_t pml5[ENTRY_COUNT]
+  __attribute__((section(".high_bss"), aligned(PAGE_SIZE)));
+static uint64_t pdpt[ENTRY_COUNT]
+  __attribute__((section(".high_bss"), aligned(PAGE_SIZE)));
+static uint64_t page_directory[ENTRY_COUNT]
+  __attribute__((section(".high_bss"), aligned(PAGE_SIZE)));
+static uint64_t low_page_table[ENTRY_COUNT]
+  __attribute__((section(".high_bss"), aligned(PAGE_SIZE)));
 /* The physical K16 may hand off with control-flow enforcement enabled.  A
  * direct jump from firmware paging to the final split W^X map leaves no
  * independent place to prove whether CR3 itself loaded or the first protected
@@ -52,8 +66,10 @@ static uint64_t transition_pdpt[ENTRY_COUNT]
   __attribute__((section(".high_bss"), aligned(PAGE_SIZE)));
 static uint64_t transition_page_directory[ENTRY_COUNT]
   __attribute__((section(".high_bss"), aligned(PAGE_SIZE)));
-static uint64_t apic_page_directory[ENTRY_COUNT] __attribute__((aligned(PAGE_SIZE)));
-static uint64_t framebuffer_page_directory[ENTRY_COUNT] __attribute__((aligned(PAGE_SIZE)));
+static uint64_t apic_page_directory[ENTRY_COUNT]
+  __attribute__((section(".high_bss"), aligned(PAGE_SIZE)));
+static uint64_t framebuffer_page_directory[ENTRY_COUNT]
+  __attribute__((section(".high_bss"), aligned(PAGE_SIZE)));
 #define PCI_PDPT_SLOTS 4
 #define PCI_DIRECTORY_SLOTS 8
 /* 48 KiB of the low region was these two arrays; they live in `.high_bss`

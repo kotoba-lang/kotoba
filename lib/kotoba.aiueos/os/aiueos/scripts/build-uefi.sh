@@ -27,6 +27,7 @@ kernel_pci_object="$out/kernel-pci.o"
 kernel_rtl8125_object="$out/kernel-rtl8125.o"
 kernel_inference_status_object="$out/kernel-inference-status.o"
 kernel_device_result_object="$out/kernel-device-result.o"
+kernel_device_poll_scheduler_object="$out/kernel-device-poll-scheduler.o"
 kernel_device_worker_protocol_object="$out/kernel-device-worker-protocol.o"
 kernel_model_handoff_object="$out/kernel-model-handoff.o"
 # C-free wave 1 (ADR-0219): the decisions of inference_status.c,
@@ -262,6 +263,13 @@ if [ "${AIUEOS_MURAKUMO_DEVICE_RESULT:-0}" = 1 ] || [ "${AIUEOS_GUEST_BROWSER:-0
 fi
 if [ "${AIUEOS_MURAKUMO_DEVICE_RESULT:-0}" = 1 ]; then
   device_result_link="$kernel_device_result_object $kernel_device_worker_protocol_object $kotoba_device_worker_poll_object"
+fi
+# JUN-35: the poll scheduler is referenced from main.c under
+# AIUEOS_PERSISTENT_BOOT (init/sequence/record) and from pci.c under
+# AIUEOS_MURAKUMO_DEVICE_RESULT (status disposition), so either flag links it.
+poll_sched_link=
+if [ "${AIUEOS_PERSISTENT_BOOT:-0}" = 1 ] || [ "${AIUEOS_MURAKUMO_DEVICE_RESULT:-0}" = 1 ]; then
+  poll_sched_link="$kernel_device_poll_scheduler_object"
 fi
 physical_qualification_cflags=
 physical_network_qualification_cflags=
@@ -1068,7 +1076,7 @@ if [ -n "$model_handoff_link" ] || [ -n "$qwen35_parity_cflags" ]; then
   python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_qwen35_dequant_object" \
     2713ffbac10ad71dad46a899b782c2687820fc2896edab444806867ae62fd730 kotoba_aiueos_qwen35_dequant_row
   python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_qwen35_matvec_object" \
-    916b1b9009c67525b96610a4ede21e4bbe4117987cf9495d4ed0128e61b8a245 kotoba_aiueos_qwen35_matvec
+    0eabd3f84c2efcd3c763106599e43ed217d7f71f85450eeed7293df8c3db8677 kotoba_aiueos_qwen35_matvec
   # FIVE parity profiles, each linking only the objects its stages call. The
   # low region (`aiueos_low_end <= 0x1f4000`) cannot hold every object at once
   # since the tokenizer objects landed -- measured, not assumed, and measured
@@ -1272,6 +1280,12 @@ if [ "${AIUEOS_MURAKUMO_DEVICE_RESULT:-0}" = 1 ]; then
     aiueos_device_worker_poll_response kotoba_aiueos_device_worker_poll_response
   cp "$kotoba_dwp_object" "$kernel_device_worker_protocol_object"
 fi
+if [ -n "$poll_sched_link" ]; then
+  zig cc -target x86_64-freestanding-none -std=c11 -O2 \
+    -ffreestanding -fno-stack-protector -mno-red-zone \
+    -c -o "$kernel_device_poll_scheduler_object" \
+    "$aiueos/kernel/device_poll_scheduler.c"
+fi
 if [ -z "$model_handoff_link" ] && [ -n "$qwen35_parity_cflags" ]; then
   # The parity build compiles the reference C without the model handoff, so
   # the loader never asks for a model and the comparison still runs against
@@ -1463,7 +1477,7 @@ zig ld.lld -nostdlib -static --strip-all $qualification_gc_link -z max-page-size
   "$kernel_acpi_object" "$kernel_vtd_object" "$kernel_apic_object" "$kernel_memory_object" \
   "$kernel_pci_object" "$kernel_rtl8125_object" \
   "$kernel_inference_status_object" \
-  $device_result_link $model_handoff_link "$kernel_kototama_runtime_object" \
+  $device_result_link $poll_sched_link $model_handoff_link "$kernel_kototama_runtime_object" \
   "$kernel_job_protocol_object" \
   "$kernel_tls_aes_object" "$kernel_tls13_object" \
   "$kernel_scheduler_object" "$kernel_syscall_object" \

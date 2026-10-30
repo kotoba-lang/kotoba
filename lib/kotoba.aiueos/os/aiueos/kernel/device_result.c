@@ -152,6 +152,14 @@ static int device_boot_id_ensure(void) {
   return device_boot_id_refresh();
 }
 
+/* A 409 means (did,boot,sequence) was reused with different content.  The
+   caller (poll scheduler loop, main.c) resolves it by moving to a new
+   identity namespace: a fresh boot id makes every later (boot,sequence) key
+   new.  Mechanism only; WHEN to refresh is the scheduler's call. */
+void aiueos_device_worker_identity_refresh(void) {
+  (void)device_boot_id_refresh();
+}
+
 static int base58_encode(const uint8_t *input, uint32_t input_bytes,
                          char *out, uint32_t capacity) {
   uint8_t digits[64] = {0};
