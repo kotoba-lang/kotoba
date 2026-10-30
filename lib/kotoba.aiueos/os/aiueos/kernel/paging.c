@@ -23,6 +23,7 @@ extern uint8_t aiueos_data_start[], aiueos_kernel_end[];
 extern uint8_t aiueos_user_text_start[], aiueos_user_text_end[];
 extern uint8_t aiueos_user_data_start[], aiueos_user_data_end[];
 extern uint8_t aiueos_low_end[], aiueos_high_data_start[], aiueos_high_data_end[];
+extern uint8_t aiueos_kotoba_text_start[], aiueos_kotoba_text_end[];
 
 static uint64_t pml4[ENTRY_COUNT] __attribute__((aligned(PAGE_SIZE)));
 static uint64_t pml5[ENTRY_COUNT] __attribute__((aligned(PAGE_SIZE)));
@@ -279,6 +280,10 @@ int aiueos_paging_initialize(const struct aiueos_boot_info *boot) {
     page_directory[i] = encrypted_ram_page(i * 0x200000ULL) |
       PTE_PRESENT | PTE_WRITABLE | PTE_HUGE | PTE_NX;
   }
+  /* 6..8 MiB is the Kotoba objects' code (kernel/linker.ld .kotoba_text, JUN-556):
+     read-only and executable, the one W^X exception being that a 2 MiB huge page is
+     coarser than the low region's 4 KiB pages. */
+  page_directory[3] = encrypted_ram_page(3 * 0x200000ULL) | PTE_PRESENT | PTE_HUGE;
   for (uint64_t i = 0; i < ENTRY_COUNT; i++) {
     transition_page_directory[i] = encrypted_ram_page(i * 0x200000ULL) |
       PTE_PRESENT | PTE_WRITABLE | PTE_HUGE;
@@ -367,7 +372,11 @@ int aiueos_paging_initialize(const struct aiueos_boot_info *boot) {
          (uint64_t)(uintptr_t)aiueos_low_end <= PROCESS_PRIVATE_BASE &&
          (uint64_t)(uintptr_t)aiueos_high_data_start >= 0x400000ULL &&
          (uint64_t)(uintptr_t)aiueos_high_data_end <= 0x600000ULL &&
-         (uint64_t)(uintptr_t)aiueos_kernel_end <= 0x600000ULL &&
+         (uint64_t)(uintptr_t)aiueos_kotoba_text_start == 0x600000ULL &&
+         (uint64_t)(uintptr_t)aiueos_kotoba_text_end <= 0x800000ULL &&
+         (uint64_t)(uintptr_t)aiueos_kernel_end == 0x800000ULL &&
+         (page_directory[3] & (PTE_PRESENT | PTE_WRITABLE | PTE_HUGE | PTE_NX)) ==
+           (PTE_PRESENT | PTE_HUGE) &&
          (page_directory[2] & (PTE_PRESENT | PTE_WRITABLE | PTE_HUGE | PTE_NX)) ==
            (PTE_PRESENT | PTE_WRITABLE | PTE_HUGE | PTE_NX);
   if (valid) PAGING_PROGRESS((uint32_t)(480U + paging_features));
