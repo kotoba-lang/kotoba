@@ -5,9 +5,81 @@
             [aiueos.session.app-catalog :as app-catalog]
             [aiueos.native.draft-store :as draft-store]
             [aiueos.ed25519 :as ed]
-            [aiueos.keyseal :as ks])
+            [aiueos.keyseal :as ks]
+            [aiueos.native.rtl8168-debug :as dbg])
   (:export [main workspace-main goal-main goal-draft-main goal-model-main
-            show-diagnostic-result]))
+            show-diagnostic-result debug-main]))
+
+;; AWAI-119: context word128 is 1 only in the opt-in debug entry; every
+;; debug-log is then one RTL8168 broadcast record (tag, value). The default
+;; entries never set it and send nothing (W8 idle-silent is unchanged).
+;; Because the board's RTL8168 has not yet put a frame on the wire, the debug
+;; entry also draws its progress straight into the GOP framebuffer: one 5x5
+;; square per drawing op on the bottom row (op index = square index), and
+;; the RTL8168 start word (context word130) as 64 squares above it, bit 63
+;; first, green = 1, red = 0. No font, material or blur code is involved.
+(defn debug-square-row [ctx x y row color]
+  (if (>= row 5) 0
+    (let [offset (* (+ (* (+ y row) (word ctx 42)) x) 4)
+          page (kernel-framebuffer-page (quot offset 4096))]
+      (do (kernel-store-u32-4k page 4096 (mod offset 4096) color)
+          (if (= (mod (+ offset 4) 4096) 0) 0
+            (kernel-store-u32-4k page 4096 (mod (+ offset 4) 4096) color))
+          (debug-square-row ctx x y (+ row 1) color)))))
+
+(defn debug-square [ctx x y color column]
+  (if (>= column 4) 0
+    (do (debug-square-row ctx (+ x column) y 0 color)
+        (debug-square ctx x y color (+ column 2)))))
+
+(defn debug-square-at [ctx index row color]
+  (let [per-row (quot (- (word ctx 40) 8) 6)
+        x (+ 4 (* 6 (mod index per-row)))
+        y (- (word ctx 41) (* 8 (+ row 1 (* 2 (quot index per-row)))))]
+    (if (and (> per-row 0) (> y 0)) (debug-square ctx x y color 0) 0)))
+
+(defn debug-bits [ctx bit]
+  (if (>= bit 64) 0
+    (do (debug-square-at ctx bit 1
+          (gop-color ctx (if (= (bit-and (u64-shift-right (word64 ctx 136) (- 63 bit)) 1) 1)
+                           65280 16711680)))
+        (debug-bits ctx (+ bit 1)))))
+
+;; Context words are u32; 64-bit debug values use a low/high pair.
+(defn put-word64 [ctx i value]
+  (do (put-word ctx i (bit-and value 4294967295))
+      (put-word ctx (+ i 1) (bit-and (u64-shift-right value 32) 4294967295))))
+(defn word64 [ctx i]
+  (bit-or (word ctx i) (i64-shift-left (word ctx (+ i 1)) 32)))
+
+;; The crumb: context words140..171 (physical RW base + WG-CONTEXT + 560),
+;; which the --netlog loader reads on the next boot after a watchdog reset.
+;; kernel-wbinvd writes it back to DRAM; GOP memory is cleared by the
+;; firmware on reset. 0 magic "AIUEKDBG", 1 record count, 2 last tag,
+;; 3 last value, 4 RTL8168 start word, 5 op index, 6 frames presented,
+;; 7 loop turns.
+(defn crumb-put [ctx index value] (put-word64 ctx (+ 140 (* 2 index)) value))
+
+(defn crumb [ctx tag value]
+  (if (= (word ctx 128) 0) 0
+    (do (put-word ctx 131 (+ (word ctx 131) 1))
+        (crumb-put ctx 0 5134741615232239937)
+        (crumb-put ctx 1 (word ctx 131))
+        (crumb-put ctx 2 tag)
+        (crumb-put ctx 3 value)
+        (crumb-put ctx 4 (word64 ctx 136))
+        (crumb-put ctx 5 (word ctx 30))
+        (crumb-put ctx 6 (word ctx 79))
+        (crumb-put ctx 7 (word ctx 129))
+        (kernel-wbinvd))))
+
+(defn debug-log [ctx tag value]
+  (if (= (word ctx 128) 1)
+    (do (crumb ctx tag value)
+        (if (>= tag 4096)
+          (do (debug-square-at ctx (- tag 4096) 0 (gop-color ctx 1118481))
+              (if (= tag 4097) (debug-bits ctx 0) 0)) 0)
+        (dbg/log tag value)) 0))
 
 ;; Guest-specific desktop adapter. The hosted AIUEOS session uses the actual
 ;; browser.surface + cssom.layout pipeline; this module currently consumes the
@@ -469,7 +541,9 @@
           edge (if (< local bottom) local bottom)
           inset (corner-inset (word ctx 13) edge 0)
           offset (* (+ (* row (word ctx 42)) (+ (word ctx 2) inset)) 4)]
-      (do (if (or (= (word ctx 15) 5) (= (word ctx 15) 6))
+      (do (if (and (= (word ctx 79) 0) (= (bit-and row 15) 0))
+            (debug-log ctx (+ 8192 row) (kernel-rdtsc)) 0)
+          (if (or (= (word ctx 15) 5) (= (word ctx 15) 6))
             (put-word ctx 6
               (gop-color ctx (blend-rgb (rgb565 (bit-and (word ctx 37) 65535))
                                         (rgb565 (quot (word ctx 37) 65536))
@@ -574,7 +648,11 @@
           a (word s (+ slot 3))
           b (word s (+ slot 4))
           rgb (word s (+ slot 5))]
-      (do (put-word ctx 32 x)
+      (do (if (< (word ctx 79) 2)
+            (debug-log ctx (+ 4096 (word ctx 30))
+                       (+ (* kind 72057594037927936) (* (bit-and x 65535) 1099511627776)
+                          (* (bit-and y 65535) 16777216) (bit-and a 16777215))) 0)
+          (put-word ctx 32 x)
           (put-word ctx 33 y)
           (put-word ctx 34 a)
           (put-word ctx 35 b)
@@ -601,7 +679,9 @@
 (defn present-frame [s font fb fb-bytes ctx]
   (clock-step ctx)
   (put-word ctx 115 (word ctx 111))
+  (if (< (word ctx 79) 2) (debug-log ctx 33 (word ctx 79)) 0)
   (update-effects s ctx)
+  (if (< (word ctx 79) 2) (debug-log ctx 34 0) 0)
   (inertia-step s ctx)
   (put-word ctx 78 (+ (word ctx 78) 1))
   ;; Pointer y keeps visual-only flags above its low 16-bit coordinate:
@@ -615,10 +695,15 @@
   ;; The stored count is u32: a negative renderer result wraps above 259.
   ;; Never walk that value as an op count, even after a refused material/frame.
   (put-word (kernel-subregion (kernel-desktop-effects) 16384 0 8192) 56 (if (> (word ctx 31) 259) (word ctx 31) 0))
+  (if (< (word ctx 79) 2) (debug-log ctx 35 (word ctx 31)) 0)
   (let [result (if (> (word ctx 31) 259) 0
                  (do (frame-damage s ctx)
+                     (if (< (word ctx 79) 2)
+                       (debug-log ctx 36 (+ (* (word ctx 20) 281474976710656) (* (word ctx 21) 4294967296)
+                                            (* (word ctx 22) 65536) (word ctx 23))) 0)
                      (if (and (< (word ctx 20) (word ctx 22)) (< (word ctx 21) (word ctx 23)))
                        (present-ops s font fb fb-bytes ctx) 0)
+                     (if (< (word ctx 79) 2) (debug-log ctx 37 (word ctx 30)) 0)
                      (cache-ops s 0 (* (word ctx 31) 6))
                      (let [state (kernel-subregion (kernel-desktop-effects) 16384 0 8192)]
                        (do (put-word state 48 (word ctx 31)) (put-word state 49 1)))))]
@@ -1654,7 +1739,11 @@
             (drain-input s ctx (- remaining 1) (if (> result 0) 1 changed)))))))
 
 (defn desktop-loop [s font fb fb-bytes ctx]
-  (do (clock-step ctx)
+  (do (if (= (word ctx 128) 1)
+        (do (put-word ctx 129 (+ (word ctx 129) 1))
+            (if (= (bit-and (word ctx 129) 4095) 0)
+              (debug-log ctx 3840 (+ (* (word ctx 79) 4294967296) (word ctx 129))) 0)) 0)
+      (clock-step ctx)
       (put-word ctx 70 (drain-input s ctx 64 0))
       (if (> (word ctx 70) 0)
         (do (if (= (word ctx 117) 0) (put-word ctx 117 (+ (word ctx 111) 1)) 0)
@@ -1685,7 +1774,7 @@
     (bit-and (kernel-rdrand) 4294967295)
     0))
 
-(defn run-desktop [profile]
+(defn run-desktop-mode [profile debug]
   (let [boot (kernel-boot-info)
         prefix (kernel-subregion boot 16544 0 160)
         width (kernel-framebuffer-width)
@@ -1704,7 +1793,18 @@
             probe-marker (word context 99)
             probe-code0 (word context 100) probe-code1 (word context 101)
             probe-code2 (word context 102) probe-code3 (word context 103)]
-        (do (put-word context 40 width)
+        (do (put-word context 128 debug)
+            (put-word context 129 0)
+            (put-word context 131 0)
+
+            (put-word context 42 stride)
+            (put-word context 43 pixel-format)
+            (put-word context 40 width)
+            (put-word context 41 height)
+            (put-word64 context 136 (if (= debug 1) (dbg/start) 0))
+            (debug-log context 1 (word64 context 136))
+            (debug-log context 2 (+ (* width 4294967296) (* height 65536) stride))
+            (put-word context 40 width)
             (put-word context 41 height)
             (put-word context 42 stride)
             (put-word context 43 pixel-format)
@@ -1750,6 +1850,7 @@
             (put-word context 107 0) (put-word context 108 0)
             (put-word context 109 0)
             (put-word context 110 (initialize-clock context 2))
+            (debug-log context 3 (word context 110))
             (put-word context 111 1000)
             (save-tsc context (kernel-rdtsc))
             (put-word context 114 0) (put-word context 117 0)
@@ -1759,10 +1860,14 @@
             (put-word context 124 0) (put-word context 125 1)
             (put-word (kernel-subregion (kernel-desktop-effects) 16384 0 8192)
                       1 (blur-self-check surface context))
+            (debug-log context 4 0)
             (put-word context 107 (audio/initialize))
+            (debug-log context 5 (word context 107))
             (enable-mouse)
+            (debug-log context 6 (kernel-in-u8 100))
             (clear-surface surface 0)
             (seed-desktop surface width height)
+            (debug-log context 7 0)
             (if (or (= profile 1) (= profile 3) (= profile 4))
               (let [generation (draft-store/restore surface)]
                 (do (put-word surface 229 108)
@@ -1782,11 +1887,13 @@
                         0)
                       0)))
               0)
-            (present-frame surface font 0 fb-bytes context)
+            (debug-log context 8 (present-frame surface font 0 fb-bytes context))
             (desktop-loop surface font 0 fb-bytes context)))
       (kernel-hlt))))
 
+(defn run-desktop [profile] (run-desktop-mode profile 0))
 (defn main [] (run-desktop 0))
+(defn debug-main [] (run-desktop-mode 0 1))
 (defn workspace-main [] (run-desktop 1))
 (defn goal-main [] (run-desktop 2))
 (defn goal-draft-main [] (run-desktop 3))
