@@ -665,7 +665,12 @@ if [ "${AIUEOS_QWEN38_MODEL_HANDOFF:-0}" = 1 ] ||
     kotoba_qwen35_row_bytes_object=${AIUEOS_KOTOBA_QWEN35_ROW_BYTES_OBJECT:-"$aiueos/kotoba/qwen35-row-bytes.o"}
     python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_qwen35_row_bytes_object" \
       f7a3b74b53acef6cd46f4e0f82989557c0b51915bd37e4029f51df673f185618 kotoba_aiueos_qwen35_row_bytes
-    model_handoff_link="$kotoba_qwen35_row_bytes_object $kernel_model_handoff_object $kotoba_model_mapping_plan_object $kotoba_model_handoff_validate_object $kernel_qwen35_runtime_object $kernel_qwen35_quant_object $kernel_qwen35_infer_object $kotoba_qwen35_header_object $kotoba_qwen35_kv_object $kotoba_qwen35_tensor_object"
+    # JUN-554: prepare_bsp_extended_state and cpu_has_avx2 are kotoba/xstate-setup.o in this image (amu ADR 0390's
+    # bit-bounded CR4 / XCR0 intrinsics).
+    kotoba_xstate_setup_object=${AIUEOS_KOTOBA_XSTATE_SETUP_OBJECT:-"$aiueos/kotoba/xstate-setup.o"}
+    python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_xstate_setup_object" \
+      cff42f6ee8a6d8236085bd9bb493d7d882ee7c568a8cad5b96ed91281f1af85a kotoba_aiueos_prepare_extended_state,kotoba_aiueos_cpu_has_avx2
+    model_handoff_link="$kotoba_xstate_setup_object $kotoba_qwen35_row_bytes_object $kernel_model_handoff_object $kotoba_model_mapping_plan_object $kotoba_model_handoff_validate_object $kernel_qwen35_runtime_object $kernel_qwen35_quant_object $kernel_qwen35_infer_object $kotoba_qwen35_header_object $kotoba_qwen35_kv_object $kotoba_qwen35_tensor_object"
   fi
   if [ "${AIUEOS_MODEL_NVME_SLOTS:-0}" = 1 ]; then
     model_slots_cflags="-DAIUEOS_MODEL_NVME_SLOTS=1"
