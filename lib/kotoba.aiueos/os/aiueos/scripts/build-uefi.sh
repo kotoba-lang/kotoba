@@ -1381,6 +1381,11 @@ kotoba_tls13_cert_object=${AIUEOS_KOTOBA_TLS13_CERT_OBJECT:-"$aiueos/kotoba/tls1
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_tls13_cert_object" \
   b756f603d6331cf96a9f7acbffaaa86777483f6985cd4a43630caeee600abb89 \
   kotoba_aiueos_tls13_find_p256_point,kotoba_aiueos_tls13_parse_ecdsa_der
+# JUN-553: tls13.c's ClientHello record and ServerHello validation are kotoba/tls13-hello.o (fuel 4194304).
+kotoba_tls13_hello_object=${AIUEOS_KOTOBA_TLS13_HELLO_OBJECT:-"$aiueos/kotoba/tls13-hello.o"}
+python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_tls13_hello_object" \
+  de0e7b0332eec62d8a97148940c6e449fcee1e642d62a1ceb92ff9c2be514ff3 \
+  kotoba_aiueos_tls13_clienthello,kotoba_aiueos_tls13_serverhello_parse
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_bytes_object" \
   567551de001399c4706927cbffd474b53c15ea35e908945e51fd2176feca6c58 \
   kotoba_aiueos_bytes_copy,kotoba_aiueos_bytes_fill
@@ -1489,7 +1494,7 @@ zig ld.lld -nostdlib -static --strip-all $qualification_gc_link -z max-page-size
   "$kernel_inference_status_object" \
   $device_result_link $model_handoff_link "$kernel_kototama_runtime_object" \
   "$kotoba_job_protocol_glue_object" \
-  "$kotoba_tls_aes_object" "$kotoba_bytes_object" "$kotoba_tls13_keyschedule_object" "$kotoba_tls13_cert_object" "$kernel_tls13_object" \
+  "$kotoba_tls_aes_object" "$kotoba_bytes_object" "$kotoba_tls13_keyschedule_object" "$kotoba_tls13_cert_object" "$kotoba_tls13_hello_object" "$kernel_tls13_object" \
   "$kernel_scheduler_object" "$kernel_syscall_object" \
   "$kernel_process_object" "$kernel_loader_object" \
   "$kernel_smp_object" "$kernel_trampoline_object" \
