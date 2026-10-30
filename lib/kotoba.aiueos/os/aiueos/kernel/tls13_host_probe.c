@@ -276,6 +276,41 @@ int64_t kotoba_aiueos_tls13_finished_mac(const uint8_t *secret, uint64_t secret_
          kotoba_aiueos_tls13_hmac_bool(key, 32, th, 32, out);
 }
 
+/* kotoba/tls13-hs.kotoba on the host: the handshake state machine's decisions, behind the object's interface (JUN-553). */
+int64_t kotoba_aiueos_tls13_hs_step(const uint8_t *buf, uint64_t n, uint64_t flags) {
+  uint32_t total;
+  uint8_t t;
+  int64_t a;
+  if ((n >> 32) || n > 16384 || (flags >> 32)) return 0;
+  if (n < 4) return 1;
+  total = 4 + (((uint32_t)buf[1] << 16) | ((uint32_t)buf[2] << 8) | buf[3]);
+  if (total > 12288) return 0;
+  if (n < total) return 1;
+  t = buf[0];
+  a = t == 0x14 ? ((flags & 1) ? 2 : 0) : t == 0x0b ? 3 : t == 0x0f ? 4 : (flags & 2) ? 6 : 5;
+  return a ? a + ((int64_t)total << 8) : 0;
+}
+
+int64_t kotoba_aiueos_tls13_record_step(const uint8_t *rec, uint64_t n, uint64_t flags) {
+  int64_t hlen;
+  if ((n >> 32) || n > 16384 || (flags >> 32) || n < 5) return 0;
+  hlen = (int64_t)probe_be16(rec + 3) << 8;
+  switch (rec[0]) {
+  case 0x14: return 1;
+  case 0x15: return 2;
+  case 0x16: return (flags & 1) ? 1 : (flags & 2) ? 4 + hlen : 3 + hlen;
+  case 0x17: return !(flags & 4) ? 0 : (flags & 1) ? 6 : 5;
+  default: return 1;
+  }
+}
+
+int64_t kotoba_aiueos_tls13_inner_step(const uint8_t *plain, uint64_t n, uint64_t inner, uint64_t ap) {
+  if ((n >> 32) || n > 16384 || inner > 255) return 0;
+  if (!ap) return inner == 0x15 ? 2 : inner != 0x16 ? 0 : 4;
+  if (inner == 0x15) return (n >= 2 && plain[0] == 1 && plain[1] == 0) ? 9 : 2;
+  return inner != 0x17 ? 7 : 8;
+}
+
 uint64_t kotoba_aiueos_x25519(const uint8_t *scalar, const uint8_t *peer,
                               uint8_t *out, uint8_t *ws) {
   EVP_PKEY *priv = 0, *pub = 0;

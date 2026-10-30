@@ -34,6 +34,10 @@ extern int64_t kotoba_aiueos_tls13_certverify(const uint8_t *, uint64_t, const u
 extern int64_t kotoba_aiueos_tls13_hs_keys(const uint8_t *, uint64_t, const uint8_t *, uint64_t, uint8_t *, uint64_t);
 extern int64_t kotoba_aiueos_tls13_ap_keys(const uint8_t *, uint64_t, const uint8_t *, uint64_t, uint8_t *, uint64_t);
 extern int64_t kotoba_aiueos_tls13_finished_mac(const uint8_t *, uint64_t, const uint8_t *, uint64_t, uint8_t *, uint64_t);
+/* The handshake / record / inner-type decisions are kotoba/tls13-hs.kotoba (JUN-553); see consume_hs_messages. */
+extern int64_t kotoba_aiueos_tls13_hs_step(const uint8_t *, uint64_t, uint64_t);
+extern int64_t kotoba_aiueos_tls13_record_step(const uint8_t *, uint64_t, uint64_t);
+extern int64_t kotoba_aiueos_tls13_inner_step(const uint8_t *, uint64_t, uint64_t, uint64_t);
 
 #define TLS_TR_MAX 12288
 #define TLS_RX_MAX 12288
@@ -390,38 +394,55 @@ int aiueos_tls13_run_certverify(void) {
   return 1;
 }
 
+/* What to do with the next message or record is kotoba/tls13-hs.o (JUN-553): hs_step frames the next handshake message
+   and names it, record_step routes a record, inner_step classifies an opened one. This file keeps the state and
+   performs each step. */
+#define TLS_HS_FAIL 0
+#define TLS_HS_MORE 1
+#define TLS_HS_FINISHED 2
+#define TLS_HS_CERTIFICATE 3
+#define TLS_HS_CERTVERIFY 4
+#define TLS_HS_HASH 5
+#define TLS_HS_SKIP 6
 static int consume_hs_messages(const uint8_t *p, uint32_t n) {
   if (hs_partial_len + n > TLS_HS_MAX) return 0;
   copy_bytes(hs_partial + hs_partial_len, p, n);
   hs_partial_len += n;
-  while (hs_partial_len >= 4) {
-    uint32_t mlen = be24(hs_partial + 1);
-    uint32_t total = 4 + mlen;
-    uint8_t typ = hs_partial[0];
-    if (total > TLS_HS_MAX) return 0;
-    if (hs_partial_len < total) return 1;
-    if (typ == 0x14) {
-      if (!certverify_parsed) return 0;
-      if (!finish_check(hs_partial + 4, mlen)) return 0;
+  for (;;) {
+    int64_t r = kotoba_aiueos_tls13_hs_step(hs_partial, hs_partial_len,
+                                            (certverify_parsed ? 1u : 0u) | (have_server_finished ? 2u : 0u));
+    uint32_t total = (uint32_t)((uint64_t)r >> 8);
+    switch ((int)(r & 0xff)) {
+    case TLS_HS_MORE:
+      return 1;
+    case TLS_HS_FINISHED:
+      if (!finish_check(hs_partial + 4, total - 4)) return 0;
       if (!transcript_add(hs_partial, total)) return 0;
       if (!derive_ap_keys()) return 0;
       handshake_ready = 1;
-    } else if (typ == 0x0b) {
+      break;
+    case TLS_HS_CERTIFICATE:
       if (!parse_certificate(hs_partial, total)) return 0;
       if (!transcript_add(hs_partial, total)) return 0;
-    } else if (typ == 0x0f) {
+      break;
+    case TLS_HS_CERTVERIFY:
       /* Hash transcript BEFORE adding CertificateVerify (RFC 8446 4.4.3). */
       if (!verify_certificate_verify(hs_partial, total)) return 0;
       if (!transcript_add(hs_partial, total)) return 0;
-    } else if (!have_server_finished) {
-      /* EE / others before Finished. Do not hash NST after Finished. */
+      break;
+    case TLS_HS_HASH:
       if (!transcript_add(hs_partial, total)) return 0;
+      break;
+    case TLS_HS_SKIP:
+      /* Do not hash NST after Finished. */
+      break;
+    default:
+      return 0;
     }
     if (hs_partial_len > total)
       copy_bytes(hs_partial, hs_partial + total, hs_partial_len - total);
     hs_partial_len -= total;
   }
-  return 1;
 }
 
 static uint32_t nst_count;
@@ -429,73 +450,83 @@ static uint32_t nst_count;
 static uint8_t last_alert_level;
 static uint8_t last_alert_desc;
 
+#define TLS_REC_ACCEPT 1
+#define TLS_REC_ALERT 2
+#define TLS_REC_SERVERHELLO 3
+#define TLS_REC_HANDSHAKE 4
+#define TLS_REC_OPEN_HS 5
+#define TLS_REC_OPEN_AP 6
+#define TLS_IN_ALERT 2
+#define TLS_IN_HANDSHAKE 4
+#define TLS_IN_POST_HANDSHAKE 7
+#define TLS_IN_APPLICATION 8
+#define TLS_IN_CLOSE_NOTIFY 9
 static int process_record(uint8_t *rec, uint32_t rec_len) {
   uint8_t typ = rec[0];
+  int64_t r, in;
+  uint32_t hlen;
   last_record_type = typ;
   if (!saw_record) {
     saw_record = 1;
     first_record_type = typ;
   }
-  if (typ == 0x14) return 1; /* CCS */
-  if (typ == 0x15) {
+  r = kotoba_aiueos_tls13_record_step(rec, rec_len, (handshake_ready ? 1u : 0u) | (have_sh ? 2u : 0u) |
+                                                    (have_hs_keys ? 4u : 0u));
+  hlen = (uint32_t)((uint64_t)r >> 8);
+  switch ((int)(r & 0xff)) {
+  case TLS_REC_ACCEPT:
+    return 1;
+  case TLS_REC_ALERT:
     if (rec_len >= 7) {
       last_alert_level = rec[5];
       last_alert_desc = rec[6];
     }
     failed = 1;
     return 0;
-  }
-  if (typ == 0x16) {
-    uint32_t hlen = (uint32_t)be16(rec + 3);
-    if (handshake_ready) return 1;
-    if (!have_sh) return parse_serverhello(rec + 5, hlen);
+  case TLS_REC_SERVERHELLO:
+    return parse_serverhello(rec + 5, hlen);
+  case TLS_REC_HANDSHAKE:
     return consume_hs_messages(rec + 5, hlen);
-  }
-  if (typ == 0x17) {
+  case TLS_REC_OPEN_HS:
+  case TLS_REC_OPEN_AP: {
     uint8_t inner;
     uint32_t plen = 0;
+    int ap = (r & 0xff) == TLS_REC_OPEN_AP;
     static uint8_t TLS_SCRATCH plain[TLS_HS_MAX];
-    if (!have_hs_keys) return 0;
-    if (!handshake_ready) {
-      if (!unprotect(s_hs_key, s_hs_iv, s_hs_seq, rec, rec_len, plain, &plen, &inner))
-        return 0;
-      s_hs_seq++;
-      last_inner_type = inner;
-      if (inner == 0x15) {
-        if (plen >= 2) {
-          last_alert_level = plain[0];
-          last_alert_desc = plain[1];
-        }
-        failed = 1;
-        return 0;
-      }
-      if (inner != 0x16) return 0;
-      return consume_hs_messages(plain, plen);
-    }
-    if (!unprotect(s_ap_key, s_ap_iv, s_ap_seq, rec, rec_len, plain, &plen, &inner))
+    if (!unprotect(ap ? s_ap_key : s_hs_key, ap ? s_ap_iv : s_hs_iv, ap ? s_ap_seq : s_hs_seq,
+                   rec, rec_len, plain, &plen, &inner))
       return 0;
-    s_ap_seq++;
+    if (ap) s_ap_seq++; else s_hs_seq++;
     last_inner_type = inner;
-    if (inner == 0x15) {
+    in = kotoba_aiueos_tls13_inner_step(plain, plen, inner, (uint64_t)ap);
+    switch ((int)in) {
+    case TLS_IN_ALERT:
+    case TLS_IN_CLOSE_NOTIFY:
       if (plen >= 2) {
         last_alert_level = plain[0];
         last_alert_desc = plain[1];
       }
       /* close_notify (warning/0): prior application data stays valid. */
-      if (plen >= 2 && plain[0] == 1 && plain[1] == 0) return 1;
+      if (in == TLS_IN_CLOSE_NOTIFY) return 1;
       failed = 1;
       return 0;
-    }
-    if (inner != 0x17) {
+    case TLS_IN_HANDSHAKE:
+      return consume_hs_messages(plain, plen);
+    case TLS_IN_POST_HANDSHAKE:
       nst_count++;
       return 1; /* NST and other post-handshake */
+    case TLS_IN_APPLICATION:
+      if (app_len + plen > TLS_APP_MAX) return 0;
+      copy_bytes(app_buf + app_len, plain, plen);
+      app_len += plen;
+      return 1;
+    default:
+      return 0;
     }
-    if (app_len + plen > TLS_APP_MAX) return 0;
-    copy_bytes(app_buf + app_len, plain, plen);
-    app_len += plen;
-    return 1;
   }
-  return 1;
+  default:
+    return 0;
+  }
 }
 
 void aiueos_tls13_reset(void) {

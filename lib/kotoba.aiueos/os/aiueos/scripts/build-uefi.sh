@@ -1419,6 +1419,12 @@ kotoba_rtl8125_arp_object=${AIUEOS_KOTOBA_RTL8125_ARP_OBJECT:-"$aiueos/kotoba/rt
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_rtl8125_arp_object" \
   cb9e7c6c79589fbda96512cdd0c0b6e8457f1e9608e4b955a1f02130a9708b4c \
   kotoba_aiueos_rtl8125_arp_request,kotoba_aiueos_rtl8125_arp_reply
+# JUN-553: the decisions of tls13.c's handshake state machine (next message, record route, inner type) are
+# kotoba/tls13-hs.o (fuel 4194304); tls13.c keeps the state and performs each step.
+kotoba_tls13_hs_object=${AIUEOS_KOTOBA_TLS13_HS_OBJECT:-"$aiueos/kotoba/tls13-hs.o"}
+python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_tls13_hs_object" \
+  dc3ab407f374976fa80db11b70c5bab09881c4f6aa196b34c2f6b6647a3a1d1b \
+  kotoba_aiueos_tls13_hs_step,kotoba_aiueos_tls13_record_step,kotoba_aiueos_tls13_inner_step
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_bytes_object" \
   567551de001399c4706927cbffd474b53c15ea35e908945e51fd2176feca6c58 \
   kotoba_aiueos_bytes_copy,kotoba_aiueos_bytes_fill
@@ -1527,7 +1533,7 @@ zig ld.lld -nostdlib -static --strip-all $qualification_gc_link -z max-page-size
   "$kernel_inference_status_object" \
   $device_result_link $poll_sched_link $model_handoff_link "$kernel_kototama_runtime_object" \
   "$kotoba_job_protocol_glue_object" \
-  "$kotoba_tls_aes_object" "$kotoba_bytes_object" "$kotoba_tls13_keyschedule_object" "$kotoba_tls13_cert_object" "$kotoba_tls13_hello_object" "$kotoba_tls13_verify_object" "$kotoba_tls13_keys_object" "$kernel_tls13_object" \
+  "$kotoba_tls_aes_object" "$kotoba_bytes_object" "$kotoba_tls13_keyschedule_object" "$kotoba_tls13_cert_object" "$kotoba_tls13_hello_object" "$kotoba_tls13_verify_object" "$kotoba_tls13_keys_object" "$kotoba_tls13_hs_object" "$kernel_tls13_object" \
   "$kernel_scheduler_object" "$kernel_syscall_object" \
   "$kernel_process_object" "$kernel_loader_object" \
   "$kernel_smp_object" "$kernel_trampoline_object" \
