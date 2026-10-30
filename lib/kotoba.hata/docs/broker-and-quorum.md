@@ -239,6 +239,33 @@ mint another request ID. `abandon` is a recovery outcome, not an application
 success receipt. The C0 token inside a dispatch command identifies its original
 local reservation and is not substituted for the quorum parent CAS.
 
+## Broker envelope over an authenticated session (AWAI-102)
+
+Broker exchanges are moving from files copied between private directories onto
+authenticated sessions: Noise XXhfs with ML-KEM-768 and Ed25519 + ML-DSA-65 identities, over
+the native TCP wires (`lib/kotoba.noise`, ADR-0001). Each exchange travels in one
+`hata.wire` envelope (`src/hata/wire.kotoba`), and one envelope is one `noise.frame`.
+
+- **Layout:** version (1, = 1), kind (1), request id (32), body length (4, big-endian), then
+  the body; at most 65535 bytes. Kinds 1-6 are the vote, commit and attest requests and
+  their responses; a response kind is its request kind plus one.
+- **Request id:** `SHA-256("hata.wire.v1/request\n" || handshake hash || sequence (8) ||
+  body)`. A request replayed into another session, or at another position in the same
+  session, has another id. The session owner accepts only the next sequence number.
+- **Opening:** `open` gives the body only for an envelope of exactly the expected version,
+  kind and id and an exact length; anything else is `[-1]`. A response is accepted only
+  under its request's id.
+
+`test/wire_native.kotoba` returns 127, and runs in the history section of
+`scripts/check-broker-native.py`. Its unbound-reply control, an opener that skips the id
+comparison, returns 61. Measured on Apple Silicon (Amu Mac root of main `91faa123`), the
+other mutants give: length check dropped, an out-of-bounds read that traps; sequence
+left out of the id, 55; handshake hash left out of the id, 119.
+
+Not yet: carrying the vote / commit / attest exchanges between replica processes over
+these sessions, the replay window, timeouts and retries, backpressure, per-peer budgets,
+and the re-check of body and C0 authority right before dispatch.
+
 ## Verification and scope
 
 Run the exact source-locked gate on Linux x86_64 with the declared experimental

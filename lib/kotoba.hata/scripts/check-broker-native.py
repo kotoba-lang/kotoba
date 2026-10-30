@@ -68,6 +68,18 @@ def main():
     broker(gate)
 
 def history(gate):
+    # The broker envelope (AWAI-102): versioned, bounded, request ids bound to the session.
+    wire = {f'hata/{n}.kotoba': (LIB / f).read_bytes() for n, f in
+            [('wire', 'src/hata/wire.kotoba'), ('wire_native_test', 'test/wire_native.kotoba')]}
+    wire['sha2/core.kotoba'] = (LIB.parent / 'gov.nist.sha2/kotoba/sha2/core.kotoba').read_bytes()
+    gate.run('wire-envelope-verdicts', gate.build('wire', 'hata/wire_native_test.kotoba', wire), 127)
+    # Negative control: an opener that does not compare the request id accepts a response
+    # bound to another request.
+    unbound = dict(wire)
+    before = b'(not (same? (slice env 2 32) id))'
+    assert unbound['hata/wire.kotoba'].count(before) == 1
+    unbound['hata/wire.kotoba'] = unbound['hata/wire.kotoba'].replace(before, b'false')
+    gate.run('unbound-reply-detected', gate.build('wire-unbound-control', 'hata/wire_native_test.kotoba', unbound), 61)
     auditor = gate.build('audit', 'hata/audit_native_test.kotoba', sources(audit=True))
     gate.run('audit-history-verdicts', auditor)
     # Negative control: an auditor that does not check the parent link accepts a
