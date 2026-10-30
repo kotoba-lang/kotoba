@@ -51,7 +51,6 @@ kernel_qwen35_runtime_object="$out/kernel-qwen35-runtime.o"
 kernel_qwen35_quant_object="$out/kernel-qwen35-quant.o"
 kernel_qwen35_infer_object="$out/kernel-qwen35-infer.o"
 kernel_kototama_runtime_object="$out/kernel-kototama-runtime.o"
-kernel_job_protocol_object="$out/kernel-job-protocol.o"
 kernel_tls13_object="$out/kernel-tls13.o"
 kernel_scheduler_object="$out/kernel-scheduler.o"
 kernel_syscall_object="$out/kernel-syscall.o"
@@ -1367,9 +1366,13 @@ zig cc -target x86_64-freestanding-none -std=c11 -O2 \
   -ffreestanding -fno-stack-protector -mno-red-zone \
   $model_handoff_cflags \
   -c -o "$kernel_kototama_runtime_object" "$aiueos/kernel/kototama_runtime.c"
-zig cc -target x86_64-freestanding-none -std=c11 -O2 \
-  -ffreestanding -fno-stack-protector -mno-red-zone \
-  -c -o "$kernel_job_protocol_object" "$aiueos/kernel/job_protocol.c"
+# JUN-553: job_protocol is the Kotoba object kotoba/job-protocol.o (marshalling for kotoba/job-protocol-dispatch.o;
+# D5 records, D6 cells), not a C compile. kernel/job_protocol.c stays as the reference scripts/job-protocol-diff compares against.
+kotoba_job_protocol_glue_object=${AIUEOS_KOTOBA_JOB_PROTOCOL_GLUE_OBJECT:-"$aiueos/kotoba/job-protocol.o"}
+python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_job_protocol_glue_object" \
+  671f8d84bea2bd0c1e8f680b201b636c8624b5d76f129b419a8a21c1874b3b50 \
+  aiueos_job_request_parse,aiueos_job_result_payload,aiueos_job_commit_valid,aiueos_node_ping_parse,aiueos_node_pong_payload \
+  kotoba_aiueos_job_protocol
 # JUN-556: tls_aes_gcm is the Kotoba object kotoba/tls-aes-gcm.o (Amu object route: 8-parameter exports, ADR 0384, and
 # .bss / .high_bss arrays, ADR 0385), with its byte copy and fill in kotoba/bytes.o, not a C compile.
 # kernel/tls_aes_gcm.c stays as the reference scripts/tls-aes-gcm-diff compares against. Both are linked from kotoba/, so
@@ -1487,7 +1490,7 @@ zig ld.lld -nostdlib -static --strip-all $qualification_gc_link -z max-page-size
   "$kernel_pci_object" "$kernel_rtl8125_object" \
   "$kernel_inference_status_object" \
   $device_result_link $poll_sched_link $model_handoff_link "$kernel_kototama_runtime_object" \
-  "$kernel_job_protocol_object" \
+  "$kotoba_job_protocol_glue_object" \
   "$kotoba_tls_aes_object" "$kotoba_bytes_object" "$kernel_tls13_object" \
   "$kernel_scheduler_object" "$kernel_syscall_object" \
   "$kernel_process_object" "$kernel_loader_object" \
