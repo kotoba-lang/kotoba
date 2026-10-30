@@ -30,6 +30,10 @@ extern int64_t kotoba_aiueos_tls13_serverhello_parse(const uint8_t *, uint64_t, 
 extern int64_t kotoba_aiueos_tls13_finished_ok(const uint8_t *, uint64_t, const uint8_t *, uint64_t, const uint8_t *, uint64_t);
 extern int64_t kotoba_aiueos_tls13_certverify(const uint8_t *, uint64_t, const uint8_t *, uint64_t, uint8_t *, uint64_t,
                                               uint8_t *, uint64_t);
+/* The handshake / application traffic keys and the client Finished MAC are kotoba/tls13-keys.kotoba (JUN-553): 1 is success. */
+extern int64_t kotoba_aiueos_tls13_hs_keys(const uint8_t *, uint64_t, const uint8_t *, uint64_t, uint8_t *, uint64_t);
+extern int64_t kotoba_aiueos_tls13_ap_keys(const uint8_t *, uint64_t, const uint8_t *, uint64_t, uint8_t *, uint64_t);
+extern int64_t kotoba_aiueos_tls13_finished_mac(const uint8_t *, uint64_t, const uint8_t *, uint64_t, uint8_t *, uint64_t);
 
 #define TLS_TR_MAX 12288
 #define TLS_RX_MAX 12288
@@ -148,10 +152,6 @@ static void copy_bytes(uint8_t *d, const uint8_t *s, uint32_t n) {
   uint32_t i;
   for (i = 0; i < n; i++) d[i] = s[i];
 }
-static void zero_bytes(uint8_t *d, uint32_t n) {
-  uint32_t i;
-  for (i = 0; i < n; i++) d[i] = 0;
-}
 
 static int hostname_ok(const char *host, uint32_t *length) {
   uint32_t n = 0;
@@ -240,22 +240,6 @@ static int hkdf_extract(const uint8_t *salt, uint32_t salt_len,
   return hmac_sha256(salt, salt_len, ikm, ikm_len, out);
 }
 
-static int hkdf_expand_label(const uint8_t *secret, const char *label,
-                             const uint8_t *ctx, uint32_t ctx_len,
-                             uint8_t *out, uint32_t out_len) {
-  uint32_t i = 0;
-  while (label[i]) i++;
-  return kotoba_aiueos_tls13_hkdf_expand_label(secret, 32, (const uint8_t *)label, i,
-                                               ctx, ctx_len, out, out_len) == 1;
-}
-
-static int derive_secret(const uint8_t *secret, const char *label,
-                         const uint8_t *msgs, uint32_t msgs_len, uint8_t out[32]) {
-  uint8_t th[32];
-  if (!sha256(msgs, msgs_len, th)) return 0;
-  return hkdf_expand_label(secret, label, th, 32, out, 32);
-}
-
 static int transcript_add(const uint8_t *p, uint32_t n) {
   if (transcript_len + n > TLS_TR_MAX) return 0;
   copy_bytes(transcript + transcript_len, p, n);
@@ -324,24 +308,19 @@ static int unprotect(const uint8_t key[16], const uint8_t iv[12], uint64_t seq,
   return 1;
 }
 
+/* The traffic-key schedule is kotoba/tls13-keys.o (JUN-553): hs_keys fills handshake secret | c hs | s hs | c key | c iv |
+   s key | s iv, ap_keys c key | c iv | s key | s iv; 1 is success and on 0 nothing is copied. */
 static int derive_hs_keys(const uint8_t *server_pub) {
-  uint8_t shared[32], early[32], derived[32], empty_ikm[32];
-  uint8_t c_hs[32], s_hs[32];
-  zero_bytes(empty_ikm, 32);
+  uint8_t shared[32], k[152];
   if (!kotoba_aiueos_x25519(client_scalar, server_pub, shared, x_ws)) return 0;
-  if (!hkdf_extract(0, 0, empty_ikm, 32, early)) return 0;
-  if (!derive_secret(early, "derived", 0, 0, derived)) return 0;
-  if (!hkdf_extract(derived, 32, shared, 32, handshake_secret)) return 0;
-  if (!derive_secret(handshake_secret, "c hs traffic", transcript, transcript_len, c_hs))
-    return 0;
-  if (!derive_secret(handshake_secret, "s hs traffic", transcript, transcript_len, s_hs))
-    return 0;
-  if (!hkdf_expand_label(c_hs, "key", 0, 0, c_hs_key, 16)) return 0;
-  if (!hkdf_expand_label(c_hs, "iv", 0, 0, c_hs_iv, 12)) return 0;
-  if (!hkdf_expand_label(s_hs, "key", 0, 0, s_hs_key, 16)) return 0;
-  if (!hkdf_expand_label(s_hs, "iv", 0, 0, s_hs_iv, 12)) return 0;
-  copy_bytes(c_hs_secret, c_hs, 32);
-  copy_bytes(s_hs_secret, s_hs, 32);
+  if (kotoba_aiueos_tls13_hs_keys(shared, 32, transcript, transcript_len, k, sizeof(k)) != 1) return 0;
+  copy_bytes(handshake_secret, k, 32);
+  copy_bytes(c_hs_secret, k + 32, 32);
+  copy_bytes(s_hs_secret, k + 64, 32);
+  copy_bytes(c_hs_key, k + 96, 16);
+  copy_bytes(c_hs_iv, k + 112, 12);
+  copy_bytes(s_hs_key, k + 124, 16);
+  copy_bytes(s_hs_iv, k + 140, 12);
   have_hs_keys = 1;
   s_hs_seq = 0;
   c_hs_seq = 0;
@@ -349,18 +328,12 @@ static int derive_hs_keys(const uint8_t *server_pub) {
 }
 
 static int derive_ap_keys(void) {
-  uint8_t derived[32], master[32], zeros[32], c_ap[32], s_ap[32];
-  zero_bytes(zeros, 32);
-  if (!derive_secret(handshake_secret, "derived", 0, 0, derived)) return 0;
-  if (!hkdf_extract(derived, 32, zeros, 32, master)) return 0;
-  if (!derive_secret(master, "c ap traffic", transcript, transcript_len, c_ap))
-    return 0;
-  if (!derive_secret(master, "s ap traffic", transcript, transcript_len, s_ap))
-    return 0;
-  if (!hkdf_expand_label(c_ap, "key", 0, 0, c_ap_key, 16)) return 0;
-  if (!hkdf_expand_label(c_ap, "iv", 0, 0, c_ap_iv, 12)) return 0;
-  if (!hkdf_expand_label(s_ap, "key", 0, 0, s_ap_key, 16)) return 0;
-  if (!hkdf_expand_label(s_ap, "iv", 0, 0, s_ap_iv, 12)) return 0;
+  uint8_t k[56];
+  if (kotoba_aiueos_tls13_ap_keys(handshake_secret, 32, transcript, transcript_len, k, sizeof(k)) != 1) return 0;
+  copy_bytes(c_ap_key, k, 16);
+  copy_bytes(c_ap_iv, k + 16, 12);
+  copy_bytes(s_ap_key, k + 28, 16);
+  copy_bytes(s_ap_iv, k + 44, 12);
   s_ap_seq = 0;
   c_ap_seq = 0;
   return 1;
@@ -587,12 +560,10 @@ uint8_t aiueos_tls13_first_record_type(void) { return first_record_type; }
 int aiueos_tls13_handshake_ready(void) { return handshake_ready && !failed; }
 
 int aiueos_tls13_take_finished(uint8_t *out, uint32_t *len) {
-  uint8_t finished_key[32], th[32], verify[32], fin[36];
+  uint8_t verify[32], fin[36];
   uint32_t rec_len = 0;
   if (!handshake_ready || !certverify_ok) return 0;
-  if (!hkdf_expand_label(c_hs_secret, "finished", 0, 0, finished_key, 32)) return 0;
-  if (!sha256(transcript, transcript_len, th)) return 0;
-  if (!hmac_sha256(finished_key, 32, th, 32, verify)) return 0;
+  if (kotoba_aiueos_tls13_finished_mac(c_hs_secret, 32, transcript, transcript_len, verify, 32) != 1) return 0;
   fin[0] = 0x14;
   fin[1] = 0;
   fin[2] = 0;
