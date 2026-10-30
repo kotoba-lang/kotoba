@@ -747,9 +747,9 @@ static int crash_sector_io_polled(uint32_t type) {
   b->desc[1].flags = VIRTQ_DESC_F_NEXT | (type == VIRTIO_BLK_T_IN ? VIRTQ_DESC_F_WRITE : 0);
   b->avail->ring[old & 3] = 0; __asm__ volatile("" ::: "memory");
   b->avail->index = target; *b->doorbell = 0;
-  for (uint32_t budget = 0; budget < 100000000U; budget++) {
-    __asm__ volatile("" ::: "memory");
-    if (b->used->index == target) {
+  for (uint32_t budget = 0, got; budget < 100000000U; budget += 65536U) {   /* kotoba/blk-wait.o, polled (no MSI-X) */
+    got = (uint32_t)kotoba_aiueos_blk_wait((uint64_t)(uintptr_t)b->used, 4096, (uint64_t)(uintptr_t)&aiueos_virtio_blk_irq_count, 8, target, 0, budget, 100000000U - budget < 65536U ? 100000000U - budget : 65536U);
+    if ((got & 3U) == 1U) {
       struct virtq_used_element *completion = &b->used->ring[old & 3];
       uint32_t expected = type == VIRTIO_BLK_T_IN ? 513 : 1;
       if (completion->id != 0 || completion->length != expected ||
@@ -757,7 +757,7 @@ static int crash_sector_io_polled(uint32_t type) {
       b->submitted = target;
       return 1;
     }
-    __asm__ volatile("pause");
+    if (got != 3U) return 0;   /* the index passed target (2): no completion can make them equal, so fail now */
   }
   return 0;
 }
