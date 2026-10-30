@@ -2437,6 +2437,8 @@ static void gpu_drain_now(struct virtq_desc *desc, struct virtq_avail *avail,
   }
 }
 
+extern uint64_t kotoba_aiueos_gpu_reap(uint64_t used, uint64_t used_length, uint64_t resp, uint64_t resp_length,
+                                       uint64_t state, uint64_t resp_len, uint64_t expect);
 static int gpu_ctrl(struct virtq_desc *desc, struct virtq_avail *avail,
                     struct virtq_used *used, volatile uint16_t *doorbell,
                     uint16_t *submitted,
@@ -2455,9 +2457,12 @@ static int gpu_ctrl(struct virtq_desc *desc, struct virtq_avail *avail,
     __asm__ volatile("" ::: "memory");
     int responded = 0;
     while (gpu_used_consumed != used->index) {
-      struct virtq_used_element *done = &used->ring[gpu_used_consumed & 3];
+      /* kotoba/gpu-reap.o: what this used entry is -- 1 the event buffer, the response (2 as expected, 3 short,
+         4 long, 5 the wrong type; only the first), 6 anything else */
+      uint64_t act = kotoba_aiueos_gpu_reap((uint64_t)(uintptr_t)used, 4096, (uint64_t)(uintptr_t)resp, 24,
+          (uint64_t)gpu_used_consumed | (uint64_t)responded << 16, resp_len, expect_type);
       gpu_used_consumed++;
-      if (done->id == 2) {
+      if (act == 1) {
         /* the event buffer: record, clear, re-post */
         gpu_display_events |= gpu_event_buf.events;
         gpu_event_buf.events = 0;
@@ -2468,19 +2473,19 @@ static int gpu_ctrl(struct virtq_desc *desc, struct virtq_avail *avail,
         __asm__ volatile("" ::: "memory");
         avail->index = gpu_avail_next;
         *doorbell = 0;
-      } else if (done->id == 0 && !responded) {
+      } else if (act >= 2 && act <= 5) {
         responded = 1;
-        if (done->length < sizeof(*resp)) {
+        if (act == 3) {
           extern void aiueos_kernel_serial_marker(const char *text);
           aiueos_kernel_serial_marker("AIUEOS_GPU_CMD_FAIL short\r\n");
           *submitted = gpu_avail_next; return 0;
         }
-        if (done->length > resp_len) {
+        if (act == 4) {
           extern void aiueos_kernel_serial_marker(const char *text);
           aiueos_kernel_serial_marker("AIUEOS_GPU_CMD_FAIL long\r\n");
           *submitted = gpu_avail_next; return 0;
         }
-        if (resp->type != expect_type) {
+        if (act == 5) {
           extern void aiueos_kernel_serial_marker(const char *text);
           aiueos_kernel_serial_marker("AIUEOS_GPU_CMD_FAIL type\r\n");
           *submitted = gpu_avail_next; return 0;

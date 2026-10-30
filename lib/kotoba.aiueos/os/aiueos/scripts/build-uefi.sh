@@ -909,6 +909,10 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_blk_wait_objec
 kotoba_kbd_reap_object=${AIUEOS_KOTOBA_KBD_REAP_OBJECT:-"$aiueos/kotoba/kbd-reap.o"}
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_kbd_reap_object" \
   4016035258ccd0e324495e7d9750b35afc7b5bc8d87e4a920427bb4b32f4466d kotoba_aiueos_kbd_reap
+# JUN-598: the virtio-gpu control queue's used-entry classification (gpu_ctrl) is kotoba/gpu-reap.o (fuel 4194304).
+kotoba_gpu_reap_object=${AIUEOS_KOTOBA_GPU_REAP_OBJECT:-"$aiueos/kotoba/gpu-reap.o"}
+python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_gpu_reap_object" \
+  df725440234ee8f825890474fc6a0ce8ac8f39d6db01faa005a812ca98347ac4 kotoba_aiueos_gpu_reap
 # JUN-598: the split-virtqueue ring operations (descriptor + available-ring post, used-ring reads) are
 # kotoba/virtq-ring.o (fuel 4194304); virtio_rng and rng_refill use them first.
 kotoba_virtq_ring_object=${AIUEOS_KOTOBA_VIRTQ_RING_OBJECT:-"$aiueos/kotoba/virtq-ring.o"}
@@ -1682,7 +1686,7 @@ zig ld.lld -nostdlib -static --strip-all $qualification_gc_link -z max-page-size
   $qwen35_kotoba_link $qwen35_parity_link \
   "$kotoba_device_worker_canonical_object" "$kotoba_virtq_wait_object" \
   "$kotoba_sha256_stream_object" "$kotoba_sha256_region_object" "$kotoba_virtq_ring_object" \
-  "$kotoba_device_worker_digest_object" "$kotoba_http_head_object" \
+  "$kotoba_device_worker_digest_object" "$kotoba_http_head_object" "$kotoba_gpu_reap_object" \
   "$kotoba_wm_object" "$kotoba_scanout_object" "$kotoba_broker_object" "$kotoba_session_object" \
   "$kotoba_browser_frame_object" "$kotoba_browser_reduce_object" "$kotoba_browser_frame2_object" "$kotoba_browser_ime_object" \
   "$kotoba_browser_damage_object" "$kotoba_blk_wait_object" \
