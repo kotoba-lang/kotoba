@@ -236,6 +236,46 @@ int64_t kotoba_aiueos_tls13_certverify(const uint8_t *hs, uint64_t n, const uint
   return scheme < 0 ? 0 : ((int64_t)scheme << 1) | (ok ? 1 : 0);
 }
 
+/* kotoba/tls13-keys.kotoba on the host: derive_hs_keys after the X25519, derive_ap_keys and the client Finished MAC, the C
+   they replaced behind the object's interface (JUN-553). */
+static int probe_derive(const uint8_t *secret, const char *label, const uint8_t *msgs, uint32_t n, uint8_t out[32]) {
+  uint8_t th[32];
+  return probe_sha256(msgs, n, th) && probe_expand(secret, label, th, 32, out, 32);
+}
+
+int64_t kotoba_aiueos_tls13_hs_keys(const uint8_t *shared, uint64_t shared_len, const uint8_t *transcript,
+                                    uint64_t transcript_len, uint8_t *o, uint64_t out_len) {
+  static const uint8_t zeros[32] = {0};
+  uint8_t early[32], derived[32];
+  uint32_t tl = (uint32_t)transcript_len;
+  if ((shared_len >> 32) || (transcript_len >> 32) || (out_len >> 32) || shared_len != 32 || out_len < 152) return 0;
+  return kotoba_aiueos_tls13_hmac_bool(zeros, 32, zeros, 32, early) && probe_derive(early, "derived", 0, 0, derived) &&
+         kotoba_aiueos_tls13_hmac_bool(derived, 32, shared, 32, o) &&
+         probe_derive(o, "c hs traffic", transcript, tl, o + 32) && probe_derive(o, "s hs traffic", transcript, tl, o + 64) &&
+         probe_expand(o + 32, "key", 0, 0, o + 96, 16) && probe_expand(o + 32, "iv", 0, 0, o + 112, 12) &&
+         probe_expand(o + 64, "key", 0, 0, o + 124, 16) && probe_expand(o + 64, "iv", 0, 0, o + 140, 12);
+}
+
+int64_t kotoba_aiueos_tls13_ap_keys(const uint8_t *secret, uint64_t secret_len, const uint8_t *transcript,
+                                    uint64_t transcript_len, uint8_t *o, uint64_t out_len) {
+  static const uint8_t zeros[32] = {0};
+  uint8_t derived[32], master[32], c_ap[32], s_ap[32];
+  uint32_t tl = (uint32_t)transcript_len;
+  if ((secret_len >> 32) || (transcript_len >> 32) || (out_len >> 32) || secret_len != 32 || out_len < 56) return 0;
+  return probe_derive(secret, "derived", 0, 0, derived) && kotoba_aiueos_tls13_hmac_bool(derived, 32, zeros, 32, master) &&
+         probe_derive(master, "c ap traffic", transcript, tl, c_ap) && probe_derive(master, "s ap traffic", transcript, tl, s_ap) &&
+         probe_expand(c_ap, "key", 0, 0, o, 16) && probe_expand(c_ap, "iv", 0, 0, o + 16, 12) &&
+         probe_expand(s_ap, "key", 0, 0, o + 28, 16) && probe_expand(s_ap, "iv", 0, 0, o + 44, 12);
+}
+
+int64_t kotoba_aiueos_tls13_finished_mac(const uint8_t *secret, uint64_t secret_len, const uint8_t *transcript,
+                                         uint64_t transcript_len, uint8_t *out, uint64_t out_len) {
+  uint8_t key[32], th[32];
+  if ((secret_len >> 32) || (transcript_len >> 32) || (out_len >> 32) || secret_len != 32 || out_len < 32) return 0;
+  return probe_expand(secret, "finished", 0, 0, key, 32) && probe_sha256(transcript, (uint32_t)transcript_len, th) &&
+         kotoba_aiueos_tls13_hmac_bool(key, 32, th, 32, out);
+}
+
 uint64_t kotoba_aiueos_x25519(const uint8_t *scalar, const uint8_t *peer,
                               uint8_t *out, uint8_t *ws) {
   EVP_PKEY *priv = 0, *pub = 0;
