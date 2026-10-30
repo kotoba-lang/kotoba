@@ -1237,7 +1237,7 @@ extern uint64_t kotoba_aiueos_virtio_cap_valid(
   uint64_t pointer, uint64_t cap_length, uint64_t bar, uint64_t offset, uint64_t length); extern int64_t kotoba_aiueos_virtio_caps_find(uint64_t header, uint64_t header_length, uint64_t record, uint64_t record_length);
 extern uint64_t kotoba_aiueos_pci_extent_valid(uint64_t value, uint64_t size);
 extern uint64_t kotoba_aiueos_pci_region_valid(
-  uint64_t offset, uint64_t bytes, uint64_t bar_length);
+  uint64_t offset, uint64_t bytes, uint64_t bar_length); extern int64_t kotoba_aiueos_pci_bar_kind(int64_t low, int64_t index); extern int64_t kotoba_aiueos_pci_bar_value(int64_t low, int64_t high); extern int64_t kotoba_aiueos_pci_bar_base(int64_t low, int64_t high, int64_t index); extern int64_t kotoba_aiueos_pci_bar_size(int64_t mask_low, int64_t mask_high, int64_t kind);
 static int cap_selftest(void) {
   return kotoba_aiueos_virtio_cap_valid(0x40,20,0,0x1000,0x38) &&
          !kotoba_aiueos_virtio_cap_valid(0x40,20,0,0xfffffff0U,0x40) &&
@@ -1246,14 +1246,14 @@ static int cap_selftest(void) {
 static int read_bar(uint8_t b, uint8_t d, uint8_t f, uint8_t index, uint64_t *base) {
   if (index >= 6 || !base) return 0;
   uint32_t low = config_read(b,d,f,(uint8_t)(0x10 + index * 4));
-  if (low & 1) return 0; /* Port BARs cannot carry modern virtio capabilities. */
-  uint32_t type = (low >> 1) & 3;
-  uint64_t value = low & ~0xfU;
-  if (type == 2) {
-    if (index == 5) return 0;
-    value |= (uint64_t)config_read(b,d,f,(uint8_t)(0x14 + index * 4)) << 32;
-  } else if (type != 0) return 0;
-  if (!value || value == 0xfffffff0ULL) return 0;
+  /* JUN-598: the decode is kotoba/pci-bar.o (an I/O BAR, another type, a
+     64-bit BAR at index 5, a base of 0 or 0xfffffff0 refuse); the next word is
+     read only for a 64-bit BAR, as before. Port BARs cannot carry modern
+     virtio capabilities. */
+  uint32_t high = kotoba_aiueos_pci_bar_kind(low, index) == 2 ?
+    config_read(b,d,f,(uint8_t)(0x14 + index * 4)) : 0;
+  uint64_t value = (uint64_t)kotoba_aiueos_pci_bar_base(low, high, index);
+  if (!value) return 0;
   *base = value; return 1;
 }
 static int parse_cap(uint8_t b, uint8_t d, uint8_t f, uint8_t pointer,
@@ -1308,19 +1308,19 @@ static int bar_extent(uint8_t b, uint8_t d, uint8_t f, uint8_t index,
   uint8_t offset = (uint8_t)(0x10 + index * 4);
   uint32_t command = config_read(b,d,f,0x04);
   uint32_t low = config_read(b,d,f,offset), high = 0;
-  if ((low & 1) || (((low >> 1) & 3) != 0 && ((low >> 1) & 3) != 2)) return 0;
-  int wide = ((low >> 1) & 3) == 2;
-  if (wide) { if (index == 5) return 0; high = config_read(b,d,f,offset + 4); }
+  /* JUN-598: the type check and the size are kotoba/pci-bar.o; the sizing protocol stays here. */
+  uint64_t kind = kotoba_aiueos_pci_bar_kind(low, index);
+  if (!kind) return 0;
+  int wide = kind == 2;
+  if (wide) high = config_read(b,d,f,offset + 4);
   config_write(b,d,f,0x04,command & ~3U);
   config_write(b,d,f,offset,0xffffffffU);
   if (wide) config_write(b,d,f,offset + 4,0xffffffffU);
-  uint64_t mask = (uint64_t)(config_read(b,d,f,offset) & ~0xfU);
-  if (wide) mask |= (uint64_t)config_read(b,d,f,offset + 4) << 32;
+  uint32_t mask_low = config_read(b,d,f,offset), mask_high = wide ? config_read(b,d,f,offset + 4) : 0;
   config_write(b,d,f,offset,low);
   if (wide) config_write(b,d,f,offset + 4,high);
   config_write(b,d,f,0x04,command);
-  uint64_t value = (uint64_t)(low & ~0xfU) | ((uint64_t)high << 32);
-  uint64_t size = wide ? (~mask) + 1 : (uint64_t)(~(uint32_t)mask + 1U);
+  uint64_t value = (uint64_t)kotoba_aiueos_pci_bar_value(low, high), size = (uint64_t)kotoba_aiueos_pci_bar_size(mask_low, mask_high, kind);
   if (!kotoba_aiueos_pci_extent_valid(value,size) || value + size < value) return 0;
   *base = value; *length = size; return 1;
 }

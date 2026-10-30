@@ -899,6 +899,10 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_virtio_caps_ob
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_extent_valid_object" \
   cfde40e55fc8e52d6100183e2e4a7eecd60120be95f9c04234714ad041916ec4 \
   kotoba_aiueos_pci_extent_valid
+# JUN-598: pci.c's BAR arithmetic (read_bar's decode, bar_extent's type check and size) is kotoba/pci-bar.o (fuel 4194304).
+kotoba_pci_bar_object=${AIUEOS_KOTOBA_PCI_BAR_OBJECT:-"$aiueos/kotoba/pci-bar.o"}
+python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_pci_bar_object" \
+  207d3437020090444e836284606b609563ab0cf5ae21663091c5c840e3ca3797 kotoba_aiueos_pci_bar_base,kotoba_aiueos_pci_bar_kind,kotoba_aiueos_pci_bar_value,kotoba_aiueos_pci_bar_size
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_region_valid_object" \
   e71f161385afb5e3c83913633417e59fa53532e2d7ba7f4234ea192988c6e0a6 \
   kotoba_aiueos_pci_region_valid
@@ -1637,7 +1641,7 @@ zig ld.lld -nostdlib -static --strip-all $qualification_gc_link -z max-page-size
   "$kotoba_superblock_valid_object" "$kotoba_journal_build_object" \
   "$kotoba_mutable_build_object" "$kotoba_cap_valid_object" \
   "$kotoba_extent_valid_object" "$kotoba_region_valid_object" "$kotoba_virtio_caps_object" \
-  "$kotoba_pci_config_read_object" "$kotoba_pci_config_write_object" \
+  "$kotoba_pci_config_read_object" "$kotoba_pci_config_write_object" "$kotoba_pci_bar_object" \
   "$kotoba_rtl8125_identify_object" "$kotoba_rtl8125_link_up_object" \
   "$kotoba_rtl8125_ring_build_object" "$kotoba_rtl8125_program_object" \
   "$kotoba_rtl8125_tx_submit_object" "$kotoba_rtl8125_rx_poll_object" "$kotoba_rtl8125_arp_object" \
