@@ -18,7 +18,9 @@
 #define EFI_VARIABLE_BOOTSERVICE_ACCESS 2U
 #define EFI_VARIABLE_RUNTIME_ACCESS 4U
 #define PAGE_SIZE 4096ULL
-#define KERNEL_BUFFER_SIZE (1024ULL * 1024ULL)
+/* 2 MiB since JUN-552 (owner decision 2026-10-30): the default kernel had reached the old 1 MiB as C moved into
+   native-emitted Kotoba objects, which are several times the size of the C they replace until KOTOBA-168. */
+#define KERNEL_BUFFER_SIZE (2ULL * 1024ULL * 1024ULL)
 #define INITRAMFS_BUFFER_SIZE (1024ULL * 1024ULL)
 #define MEMORY_MAP_BUFFER_SIZE (128ULL * 1024ULL)
 #define EFI_ALLOCATE_MAX_ADDRESS 1U
@@ -1045,6 +1047,16 @@ static efi_status read_verified_file(struct efi_file *root, const char16 *path,
   if (file->read(file, size, buffer) != EFI_SUCCESS) {
     file->close(file);
     debug_string(kind_read); return EFI_INVALID_PARAMETER;
+  }
+  /* A read that filled the buffer may have stopped short of the file: the digest of the prefix would then fail as a
+     sha256 mismatch, naming the wrong cause. One more byte tells the two apart. */
+  if (*size == buffer_size) {
+    uint8_t extra = 0;
+    uint64_t one = 1;
+    if (file->read(file, &one, &extra) == EFI_SUCCESS && one) {
+      file->close(file);
+      debug_string("AIUEOS_LOADER_FAIL file-too-large\n"); return EFI_INVALID_PARAMETER;
+    }
   }
   file->close(file);
   uint8_t digest[32];

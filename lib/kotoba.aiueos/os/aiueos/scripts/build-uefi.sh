@@ -1448,6 +1448,10 @@ kotoba_kototama_management_object=${AIUEOS_KOTOBA_KOTOTAMA_MANAGEMENT_OBJECT:-"$
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_kototama_management_object" \
   c44ffea8731894914117d399a2ed0a8b603542586d450899a0d2891e3e747152 \
   kotoba_aiueos_kototama_command,kotoba_aiueos_kototama_reply
+# JUN-552: kernel/acpi.c's DMAR walk is kotoba/acpi-dmar-parse.o (fuel 4194304); acpi.c keeps the discovered globals.
+kotoba_acpi_dmar_object=${AIUEOS_KOTOBA_ACPI_DMAR_OBJECT:-"$aiueos/kotoba/acpi-dmar-parse.o"}
+python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_acpi_dmar_object" \
+  458deaf9b52b345caaaeb1c4ee0ee58a72d2e94974de11a28f3a092fc8aae769 kotoba_aiueos_acpi_dmar_parse
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_bytes_object" \
   567551de001399c4706927cbffd474b53c15ea35e908945e51fd2176feca6c58 \
   kotoba_aiueos_bytes_copy,kotoba_aiueos_bytes_fill
@@ -1551,7 +1555,7 @@ zig ld.lld -nostdlib -static --strip-all $qualification_gc_link -z max-page-size
   -Map "$out/kernel.map" \
   -T "$aiueos/kernel/linker.ld" -o "$kernel" \
   "$kernel_entry_object" "$kernel_object" "$kernel_paging_object" \
-  "$kernel_acpi_object" "$kernel_vtd_object" "$kernel_apic_object" "$kernel_memory_object" \
+  "$kernel_acpi_object" "$kotoba_acpi_dmar_object" "$kernel_vtd_object" "$kernel_apic_object" "$kernel_memory_object" \
   "$kernel_pci_object" "$kernel_rtl8125_object" \
   "$kernel_inference_status_object" \
   $device_result_link $poll_sched_link $model_handoff_link "$kernel_kototama_runtime_object" "$kotoba_kototama_management_object" \
