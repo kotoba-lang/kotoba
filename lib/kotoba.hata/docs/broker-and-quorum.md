@@ -350,14 +350,14 @@ Measured 2026-10-30 (podman, Linux arm64, amu `65359a09`):
 | execute request | sink's answer |
 |---|---|
 | a body other than the committed one (`hellp`) | 0; no object exists afterwards |
-| the committed body (`hello`) | 1; the managed object is written |
+| the committed body (`hello`), reply lost after the effect | the effect ran (1, the dropped reply); the coordinator's retry in a fresh session is answered 2 (already executed); the object exists once |
 | the same request again | 2; no second effect, and the object reads back |
 
 The keys in the driver are fixed public test values; a deployment takes ephemerals and
 KEM randomness from the host's entropy provider and identities from the roster. The CI
 arm64 lane runs it.
 
-Not yet: backoff and retry of commit and execute, backpressure, per-peer (rather than per-listener) budgets, reclaiming a
+Not yet: timed backoff between retries (clock and sleep wires, JUN-360), backpressure, per-peer (rather than per-listener) budgets, reclaiming a
 listener's memory between connections, and separate hosts.
 
 ## Verification and scope

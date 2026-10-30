@@ -210,9 +210,9 @@ def main():
     run('claim-certificate-from-session-votes', broker, ['certificate', str(coordinator), ''], 1)
     for i in range(3):
         exchange(f'claim-commit-attest-{i}', 'ask-commit-attest', i, 47260 + i, 1, 1, serve='serve-commit-attest')
-    def execute(label, mode, port, want):
+    def execute(label, mode, port, want, serve='serve-execute', want_serve=None):
         addr = f'127.0.0.1:{port}'
-        server = subprocess.Popen([str(session), 'serve-execute', str(sink), addr], cwd=gate.out,
+        server = subprocess.Popen([str(session), serve, str(sink), addr], cwd=gate.out,
                                   env=env(KEXE_CAP_RESOURCES_43=addr), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         time.sleep(0.5)
         try:
@@ -223,11 +223,15 @@ def main():
         got = result(out)
         gate.observations.append(dict(name=f'{label}-serve', exit=server.returncode, result=got))
         print(f'{label}-serve', server.returncode, got, flush=True)
-        assert got == want, (label, server.returncode, got, err[-300:])
+        assert got == (want if want_serve is None else want_serve), (label, server.returncode, got, err[-300:])
     # a body other than the committed one: refused at dispatch, and nothing is consumed
     execute('execute-tampered-body-refused', 'ask-execute-tampered', 47270, 0)
     run('no-object-after-refusal', broker, ['empty-object', str(sink), ''], 1)
-    execute('execute-over-session', 'ask-execute', 47271, 1)
+    # the effect runs but its reply is lost; the retry in a fresh session is told it already
+    # ran (2), and the dropped reply was the effect itself (1)
+    execute('execute-reply-lost-retried', 'ask-execute-retry', 47271, 2, serve='serve-execute-drop')
+    assert (sink / 'response-dropped').read_bytes() != (sink / 'response').read_bytes()
+    run('object-after-lost-reply', broker, ['object', str(sink), ''], 1)
     execute('execute-duplicate-no-second-effect', 'ask-execute', 47272, 2)
     run('object-after-session-execute', broker, ['object', str(sink), ''], 1)
     gate.finish('PASS_NATIVE_BROKER_SESSIONS', replicas=3, controls=6, effects=1, retries=1)
