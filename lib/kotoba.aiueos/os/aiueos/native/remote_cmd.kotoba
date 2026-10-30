@@ -1,0 +1,136 @@
+(ns aiueos.native.remote-cmd
+  ;; AWAI-119 stage 3: signed remote commands over the RTL8168 debug link.
+  ;; Only the opt-in desktop debug entry polls this (context word 128 = 1);
+  ;; every other entry has no receive path at all.
+  ;;
+  ;; A command is one UDP datagram to port 7798 whose 96-byte payload is
+  ;;   0  "AIUECMD1"                 8 bytes
+  ;;   8  boot nonce                 8 bytes, little endian
+  ;;  16  counter                    8 bytes, little endian, > the last one
+  ;;  24  command                    4 bytes, little endian
+  ;;  28  argument                   4 bytes, little endian
+  ;;  32  Ed25519 signature over bytes 0..31
+  ;; under the key pinned below (its seed is held on the operator's Mac, never
+  ;; in this repository). The nonce is drawn at boot and broadcast as KDBG
+  ;; tag 0xc000, so a command signed for an earlier boot is refused, and the
+  ;; counter refuses a repeat within the boot.
+  ;;   1 ping        reply KDBG 0xc001 = counter
+  ;;   2 reboot      reply KDBG 0xc002, then reset through port 0xCF9
+  ;;   3 key         reply KDBG 0xc003 = scan code; the desktop handles the
+  ;;                 make code as if the keyboard had sent it
+  ;;   4 screenshot  frames to UDP 7797 (rtl8168-debug `shot`), then KDBG 0xc004
+  ;; A datagram to 7798 that fails a check is answered with KDBG 0xc0ff =
+  ;; reason (2 magic, 3 nonce, 4 counter, 5 signature, 6 command); frames for
+  ;; other ports are released silently.
+  ;; Classical Ed25519 only: the kernel has no ML-DSA verifier yet, so this
+  ;; diagnostic channel is below the repository's post-quantum floor (recorded
+  ;; in AWAI-119); it is never part of a non-debug entry.
+  ;;
+  ;; State: context words 172/173 nonce, 174/175 last counter, 176 accepted,
+  ;; 177 refused. The verifier uses context bytes 2048..2175 (key, signature,
+  ;; message) and the Ed25519 workspace 4096..8191.
+  (:require [aiueos.native.rtl8168-debug :as nic]
+            [aiueos.ed25519 :as ed])
+  (:export [init poll nonce]))
+
+(defn word [region i]
+  (kernel-load-u32 (kernel-subregion region 8192 (* i 4) 4) 4 0))
+(defn put-word [region i value]
+  (kernel-store-u32 (kernel-subregion region 8192 (* i 4) 4) 4 0 value))
+(defn put-word64 [ctx i value]
+  (do (put-word ctx i (bit-and value 4294967295))
+      (put-word ctx (+ i 1) (bit-and (u64-shift-right value 32) 4294967295))))
+(defn word64 [ctx i]
+  (bit-or (word ctx i) (i64-shift-left (word ctx (+ i 1)) 32)))
+(defn put-byte [ctx at v]
+  (let [stored (kernel-store-u8 (kernel-subregion ctx 8192 at 1) 1 0 v)]
+    (+ 1 (* 0 stored))))
+
+;; The operator's public key (AWAI-119 debug link).
+(defn key-byte [i]
+  (case i 0 239 1 206 2 217 3 201 4 134 5 219 6 133 7 212 8 228 9 222 10 37 11 193 12 33 13 31 14 26 15 57 16 163 17 70 18 216 19 230 20 140 21 129 22 37 23 14 24 196 25 93 26 139 27 173 28 159 29 236 30 158 31 219 0))
+(defn magic-byte [i] (case i 0 65 1 73 2 85 3 69 4 67 5 77 6 68 7 49 0))
+
+(defn nonce [ctx] (word64 ctx 172))
+
+;; flags: context word 90, bit 0 = RDRAND (desktop entropy-flags).
+(defn init [ctx flags]
+  (let [drawn (if (= (bit-and flags 1) 1) (kernel-rdrand) 0)
+        value (if (= drawn 0) (kernel-rdtsc) drawn)]
+    (do (put-word64 ctx 172 value)
+        (put-word64 ctx 174 0)
+        (put-word ctx 176 0) (put-word ctx 177 0)
+        (nic/log 49152 value)
+        1)))
+
+(defn payload-byte [i] (nic/rx-byte (+ 42 i)))
+(defn payload-le [i n acc]
+  (if (= n 0) acc
+    (payload-le i (- n 1) (+ (i64-shift-left acc 8) (payload-byte (+ i (- n 1)))))))
+(defn magic-ok [i]
+  (if (>= i 8) 1
+    (if (= (payload-byte i) (magic-byte i)) (magic-ok (+ i 1)) 0)))
+(defn for-us []
+  (and (>= (nic/rx-length) 142)
+       (= (nic/rx-byte 12) 8) (= (nic/rx-byte 13) 0)
+       (= (nic/rx-byte 23) 17)
+       (= (nic/rx-byte 36) 30) (= (nic/rx-byte 37) 118)))
+
+;; key at 2048, signature at 2080, message at 2144 (aiueos.ed25519 verify).
+(defn stage [ctx i]
+  (if (>= i 96) 1
+    (let [a (put-byte ctx (+ 2048 i)
+                      (if (< i 32) (key-byte i)
+                        (if (< i 96) (payload-byte i) 0)))]
+      (stage ctx (+ i (+ 1 (* 0 a)))))))
+(defn stage-message [ctx i]
+  (if (>= i 32) 1
+    (let [a (put-byte ctx (+ 2144 i) (payload-byte i))]
+      (stage-message ctx (+ i (+ 1 (* 0 a)))))))
+(defn signature-ok [ctx]
+  (let [a (stage ctx 0)
+        b (stage-message ctx 0)
+        v (ed/aiueos-ed25519-verify (kernel-subregion ctx 8192 2048 1024) 32
+                                    (kernel-subregion ctx 8192 4096 4096))]
+    (+ v (* 0 (+ a b)))))
+
+(defn refuse [ctx reason]
+  (do (put-word ctx 177 (+ (word ctx 177) 1))
+      (nic/log 49407 reason)
+      0))
+
+;; Returns 0, or 256 + a make code the desktop should handle as a key press.
+;; An unknown command is refused with reason 6 + 256 * command.
+(defn execute [ctx command argument counter geom]
+  (do (put-word64 ctx 174 counter)
+      (put-word ctx 176 (+ (word ctx 176) 1))
+      (if (= command 1) (do (nic/log 49153 counter) 0)
+        (if (= command 2)
+          (do (nic/log 49154 counter)
+              (kernel-out-u8 3321 2)
+              (kernel-out-u8 3321 6)
+              0)
+          (if (and (= command 3) (> argument 0) (< argument 128))
+            (do (nic/log 49155 argument) (+ 256 argument))
+            (if (= command 4)
+              (let [sent (nic/shot (bit-and geom 65535) (bit-and (u64-shift-right geom 16) 65535)
+                                   (bit-and (u64-shift-right geom 32) 65535)
+                                   (bit-and (u64-shift-right geom 48) 255))]
+                (do (nic/log 49156 sent) 0))
+              (refuse ctx (+ 6 (* 256 (bit-and command 65535))))))))))
+
+(defn check [ctx geom]
+  (if (= (magic-ok 0) 0) (refuse ctx 2)
+    (if (not (= (payload-le 8 8 0) (word64 ctx 172))) (refuse ctx 3)
+      (let [counter (payload-le 16 8 0)]
+        (if (<= counter (word64 ctx 174)) (refuse ctx 4)
+          (if (not (= (signature-ok ctx) 1)) (refuse ctx 5)
+            (execute ctx (payload-le 24 4 0) (payload-le 28 4 0) counter geom)))))))
+
+;; One poll: nothing (0) unless a frame is waiting. geom packs the
+;; framebuffer width, height (<< 16), stride (<< 32) and format (<< 48).
+(defn poll [ctx geom]
+  (if (= (nic/rx-length) 0) 0
+    (let [result (if (for-us) (check ctx geom) 0)
+          released (nic/rx-release)]
+      (+ result (* 0 released)))))
