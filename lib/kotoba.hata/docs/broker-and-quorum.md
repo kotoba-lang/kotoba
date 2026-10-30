@@ -331,6 +331,17 @@ the dropped vote, the delivered vote and the coordinator's stored vote to be byt
 and the certificate is assembled from that vote (podman, Linux arm64: the second attempt
 answered 1).
 
+**Backoff between retries.** Between attempts the retrying coordinator waits 100 ms ×
+2^(attempt−1) plus 0–99 ms of jitter, slept on the monotonic clock through wire 7 (`sleep <ms>`,
+JUN-360). The jitter is the clock reading's microsecond digits. It only has to keep two
+coordinators from retrying in lockstep, so it needs no secret randomness. The entropy wire (23)
+would be the natural source, but a call to it crashes the checker of Amu `65359a09` with SIGILL,
+even when `:entropy/draw` is declared. The coordinator records the planned and the measured
+wait. Without the clock grant the wire refuses (`KEXE_CAP {:wire 7 :refused :not-granted}`), so
+a retry never runs without its wait. Measured 2026-10-30 (podman, Linux arm64): the vote retry
+planned 169 ms and slept 172 ms; the execute retry planned 116 ms and slept 121 ms. A coordinator
+without the grant is refused at its first backoff, and its replica gives up waiting (-94).
+
 **Execute over a session.** The effect itself also travels over a session. The sink
 installs the certified fence. The coordinator then reserves a claim, and the claim's votes
 and commits are carried over sessions like the fence's. Finally the coordinator sends the
@@ -357,7 +368,7 @@ The keys in the driver are fixed public test values; a deployment takes ephemera
 KEM randomness from the host's entropy provider and identities from the roster. The CI
 arm64 lane runs it.
 
-Not yet: timed backoff between retries (clock and sleep wires, JUN-360), backpressure, per-peer (rather than per-listener) budgets, reclaiming a
+Not yet: backpressure, per-peer (rather than per-listener) budgets, reclaiming a
 listener's memory between connections, and separate hosts.
 
 ## Verification and scope

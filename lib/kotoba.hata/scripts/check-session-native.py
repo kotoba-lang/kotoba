@@ -72,6 +72,8 @@ def closure(entry):
     return {n: CANDIDATES[n].read_bytes() for n in sorted(seen)}
 
 NET = '35,38,43,44,45,46,47'
+# a retrying coordinator also reads the clock and sleeps (wire 7)
+RETRY = NET + ',7'
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
@@ -87,27 +89,27 @@ def main():
     broker = gate.build('broker', 'hata/broker_native_test.kotoba', BR.sources(True))
     session = gate.build('session', 'hata/session_native_test.kotoba', closure('hata/session_native_test.kotoba'))
 
-    def env(**grants):
-        return gate.env(KEXE_STRUCTURED_REPORT='1', KEXE_ALLOW=NET, KEXE_FUEL='100000000000', **grants)
+    def env(allow=NET, **grants):
+        return gate.env(KEXE_STRUCTURED_REPORT='1', KEXE_ALLOW=allow, KEXE_FUEL='100000000000', **grants)
     def result(stdout):
         m = re.search(rb':result (-?[0-9]+)', stdout)
         return int(m[1]) if m else None
-    def run(label, image, args, expected, **grants):
-        r = gate.call(label, [image, *args], env(**grants))
+    def run(label, image, args, expected, allow=NET, **grants):
+        r = gate.call(label, [image, *args], env(allow, **grants))
         got = result(r.stdout)
         gate.observations[-1]['result'] = got
         if label.endswith('-ask'):
             print(label, 'took', gate.observations[-1].get('seconds'), flush=True)
         assert got == expected, (label, r.returncode, got, r.stdout[-300:], r.stderr[-300:])
         return got
-    def exchange(label, mode, index, port, want_ask, want_serve, serve='serve-vote'):
+    def exchange(label, mode, index, port, want_ask, want_serve, serve='serve-vote', ask_allow=NET):
         addr = f'127.0.0.1:{port}'
         node = gate.out / f'node{index}'
         server = subprocess.Popen([str(session), serve, str(node), addr, str(index)], cwd=gate.out,
                                   env=env(KEXE_CAP_RESOURCES_43=addr), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         time.sleep(0.5)
         try:
-            run(f'{label}-ask', session, [mode, str(coordinator), addr, str(index)], want_ask, KEXE_CAP_RESOURCES_45=addr)
+            run(f'{label}-ask', session, [mode, str(coordinator), addr, str(index)], want_ask, ask_allow, KEXE_CAP_RESOURCES_45=addr)
         finally:
             out, err = server.communicate(timeout=600)
         (gate.out / f'{label}-serve.stdout').write_bytes(out); (gate.out / f'{label}-serve.stderr').write_bytes(err)
@@ -115,6 +117,15 @@ def main():
         gate.observations.append(dict(name=f'{label}-serve', exit=server.returncode, result=got))
         print(f'{label}-serve', server.returncode, got, flush=True)
         assert (got == want_serve) if want_serve is not None else (got is None or got < 0), (label, server.returncode, got, err[-300:])
+
+    def backed_off(label):
+        # BASE/backoff holds [planned ms, measured ms] as two little-endian words in hex
+        raw = bytes.fromhex((coordinator / 'backoff').read_text().strip())
+        planned, measured = int.from_bytes(raw[0:8], 'little'), int.from_bytes(raw[8:16], 'little')
+        gate.observations.append(dict(name=f'{label}-backoff', planned_ms=planned, measured_ms=measured))
+        print(f'{label} backed off {measured} ms (planned {planned})', flush=True)
+        assert 100 <= planned < 200 and planned <= measured < planned + 1000, (label, planned, measured)
+        (coordinator / 'backoff').unlink()
 
     coordinator = gate.out / 'coordinator'
     for d in [coordinator] + [gate.out / f'node{i}' for i in range(4)]:
@@ -204,19 +215,20 @@ def main():
         exchange(f'claim-vote-{i}', 'ask-vote', i, 47250 + i, 1, 1)
     # replica 2's first reply is lost after its vote is durable: the coordinator retries in
     # a fresh session and receives the very same vote, which the certificate then uses
-    exchange('claim-vote-2-retried', 'ask-vote-retry', 2, 47252, 1, 1, serve='serve-drop-then-vote')
+    exchange('claim-vote-2-retried', 'ask-vote-retry', 2, 47252, 1, 1, serve='serve-drop-then-vote', ask_allow=RETRY)
+    backed_off('claim-vote-2-retried')
     dropped, delivered = (gate.out / 'node2' / 'response-dropped').read_bytes(), (gate.out / 'node2' / 'response').read_bytes()
     assert dropped == delivered == (coordinator / 'vote2').read_bytes(), 'a retry produced another vote'
     run('claim-certificate-from-session-votes', broker, ['certificate', str(coordinator), ''], 1)
     for i in range(3):
         exchange(f'claim-commit-attest-{i}', 'ask-commit-attest', i, 47260 + i, 1, 1, serve='serve-commit-attest')
-    def execute(label, mode, port, want, serve='serve-execute', want_serve=None):
+    def execute(label, mode, port, want, serve='serve-execute', want_serve=None, ask_allow=NET):
         addr = f'127.0.0.1:{port}'
         server = subprocess.Popen([str(session), serve, str(sink), addr], cwd=gate.out,
                                   env=env(KEXE_CAP_RESOURCES_43=addr), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         time.sleep(0.5)
         try:
-            run(f'{label}-ask', session, [mode, str(coordinator), addr], want, KEXE_CAP_RESOURCES_45=addr)
+            run(f'{label}-ask', session, [mode, str(coordinator), addr], want, ask_allow, KEXE_CAP_RESOURCES_45=addr)
         finally:
             out, err = server.communicate(timeout=600)
             (gate.out / f'{label}-serve.stdout').write_bytes(out); (gate.out / f'{label}-serve.stderr').write_bytes(err)
@@ -229,12 +241,18 @@ def main():
     run('no-object-after-refusal', broker, ['empty-object', str(sink), ''], 1)
     # the effect runs but its reply is lost; the retry in a fresh session is told it already
     # ran (2), and the dropped reply was the effect itself (1)
-    execute('execute-reply-lost-retried', 'ask-execute-retry', 47271, 2, serve='serve-execute-drop')
+    execute('execute-reply-lost-retried', 'ask-execute-retry', 47271, 2, serve='serve-execute-drop', ask_allow=RETRY)
+    backed_off('execute-reply-lost-retried')
     assert (sink / 'response-dropped').read_bytes() != (sink / 'response').read_bytes()
     run('object-after-lost-reply', broker, ['object', str(sink), ''], 1)
     execute('execute-duplicate-no-second-effect', 'ask-execute', 47272, 2)
     run('object-after-session-execute', broker, ['object', str(sink), ''], 1)
-    gate.finish('PASS_NATIVE_BROKER_SESSIONS', replicas=3, controls=6, effects=1, retries=1)
+    # without the clock grant the retry cannot back off, so it stops (a trap):
+    # a coordinator is never given a retry loop without a wait
+    exchange('retry-without-clock-grant', 'ask-vote-retry', 2, 47253, None, -94, serve='serve-drop-then-vote')
+    assert not (coordinator / 'backoff').exists(), 'a retry backed off without the clock grant'
+    assert b'KEXE_CAP' in (gate.out / 'retry-without-clock-grant-ask.stderr').read_bytes()
+    gate.finish('PASS_NATIVE_BROKER_SESSIONS', replicas=3, controls=7, effects=1, retries=2)
 
 if __name__ == '__main__':
     main()
