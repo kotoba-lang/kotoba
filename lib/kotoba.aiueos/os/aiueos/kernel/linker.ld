@@ -9,7 +9,8 @@ ENTRY(aiueos_kernel_entry)
 SECTIONS {
   . = 0x100000;
   aiueos_text_start = .;
-  .text : ALIGN(4096) { *(.text.entry) *(.text .text.*) }
+  /* Kotoba objects (os/aiueos/kotoba/*.o) put their code in .kotoba_text at 6 MiB instead (below). */
+  .text : ALIGN(4096) { *(.text.entry) *(EXCLUDE_FILE(*/kotoba/*.o) .text EXCLUDE_FILE(*/kotoba/*.o) .text.*) }
   aiueos_text_end = ALIGN(4096);
   . = aiueos_text_end;
   aiueos_rodata_start = .;
@@ -51,8 +52,22 @@ SECTIONS {
   .high_bss (NOLOAD) : ALIGN(4096) { *(.high_bss.stack) *(.high_bss) }
   aiueos_high_data_end = ALIGN(4096);
   . = aiueos_high_data_end;
-  aiueos_kernel_end = ALIGN(4096);
-  ASSERT(aiueos_kernel_end <= 0x600000,
+  ASSERT(aiueos_high_data_end <= 0x600000,
          "high kernel scratch exceeds its writable-NX huge page")
+
+  /* The code of the Kotoba objects (JUN-556): a third R+X segment, because the low
+   * region cannot hold it (qualification/low-region-budget.edn; kernel/tls_aes_gcm.c's
+   * replacement alone overran it by 6.6 KiB). page_directory[3] maps this 6..8 MiB
+   * window read-only and executable as one huge page, so the whole window belongs to
+   * the kernel image: aiueos_kernel_end is its end, and the physical allocator never
+   * hands out a page inside it. Only code goes here; the objects' .data and arrays
+   * stay in .data / .bss / .high_bss. */
+  . = 0x600000;
+  aiueos_kotoba_text_start = .;
+  .kotoba_text : ALIGN(4096) { */kotoba/*.o(.text .text.*) }
+  aiueos_kotoba_text_end = ALIGN(4096);
+  ASSERT(aiueos_kotoba_text_end <= 0x800000,
+         "Kotoba object code exceeds its read-only executable huge page")
+  aiueos_kernel_end = 0x800000;
   /DISCARD/ : { *(.comment) *(.eh_frame) *(.note*) }
 }

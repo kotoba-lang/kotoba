@@ -51,8 +51,6 @@ kernel_qwen35_runtime_object="$out/kernel-qwen35-runtime.o"
 kernel_qwen35_quant_object="$out/kernel-qwen35-quant.o"
 kernel_qwen35_infer_object="$out/kernel-qwen35-infer.o"
 kernel_kototama_runtime_object="$out/kernel-kototama-runtime.o"
-kernel_job_protocol_object="$out/kernel-job-protocol.o"
-kernel_tls_aes_object="$out/kernel-tls-aes-gcm.o"
 kernel_tls13_object="$out/kernel-tls13.o"
 kernel_scheduler_object="$out/kernel-scheduler.o"
 kernel_syscall_object="$out/kernel-syscall.o"
@@ -1368,12 +1366,57 @@ zig cc -target x86_64-freestanding-none -std=c11 -O2 \
   -ffreestanding -fno-stack-protector -mno-red-zone \
   $model_handoff_cflags \
   -c -o "$kernel_kototama_runtime_object" "$aiueos/kernel/kototama_runtime.c"
-zig cc -target x86_64-freestanding-none -std=c11 -O2 \
-  -ffreestanding -fno-stack-protector -mno-red-zone \
-  -c -o "$kernel_job_protocol_object" "$aiueos/kernel/job_protocol.c"
-zig cc -target x86_64-freestanding-none -std=c11 -O2 \
-  -ffreestanding -fno-stack-protector -mno-red-zone \
-  -c -o "$kernel_tls_aes_object" "$aiueos/kernel/tls_aes_gcm.c"
+# JUN-553: job_protocol is the Kotoba object kotoba/job-protocol.o (marshalling for kotoba/job-protocol-dispatch.o;
+# D5 records, D6 cells), not a C compile. kernel/job_protocol.c stays as the reference scripts/job-protocol-diff compares against.
+kotoba_job_protocol_glue_object=${AIUEOS_KOTOBA_JOB_PROTOCOL_GLUE_OBJECT:-"$aiueos/kotoba/job-protocol.o"}
+python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_job_protocol_glue_object" \
+  671f8d84bea2bd0c1e8f680b201b636c8624b5d76f129b419a8a21c1874b3b50 \
+  aiueos_job_request_parse,aiueos_job_result_payload,aiueos_job_commit_valid,aiueos_node_ping_parse,aiueos_node_pong_payload \
+  kotoba_aiueos_job_protocol
+# JUN-556: tls_aes_gcm is the Kotoba object kotoba/tls-aes-gcm.o (Amu object route: 8-parameter exports, ADR 0384, and
+# .bss / .high_bss arrays, ADR 0385), with its byte copy and fill in kotoba/bytes.o, not a C compile.
+# kernel/tls_aes_gcm.c stays as the reference scripts/tls-aes-gcm-diff compares against. Both are linked from kotoba/, so
+# their code lands in kernel/linker.ld's .kotoba_text segment with every other Kotoba object.
+kotoba_tls_aes_object=${AIUEOS_KOTOBA_TLS_AES_GCM_OBJECT:-"$aiueos/kotoba/tls-aes-gcm.o"}
+kotoba_bytes_object=${AIUEOS_KOTOBA_BYTES_OBJECT:-"$aiueos/kotoba/bytes.o"}
+python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_tls_aes_object" \
+  dfae9998bb6fccf72bb3747f74b9e69d4b2727a40d24c078b8e1cee9cb358399 \
+  aiueos_aes128_gcm_encrypt,aiueos_aes128_gcm_decrypt,aiueos_aes128_gcm_unwrap,aiueos_aes128_gcm_selftest \
+  kotoba_aiueos_aes128_gcm,kotoba_aiueos_aes128_gcm_selftest,kotoba_aiueos_bytes_copy,kotoba_aiueos_bytes_fill
+# JUN-553: tls13.c's HMAC-SHA256 and HKDF-Expand-Label are kotoba/tls13-keyschedule.o (its buffers are its own arrays,
+# amu ADR 0387; built at fuel 4194304 because the HMAC copies up to 12 KiB a byte per step).
+kotoba_tls13_keyschedule_object=${AIUEOS_KOTOBA_TLS13_KEYSCHEDULE_OBJECT:-"$aiueos/kotoba/tls13-keyschedule.o"}
+python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_tls13_keyschedule_object" \
+  0fb41bf15a05533aafdc25b76ab87e3148fd964306fd17a697a48fe060c6d526 \
+  kotoba_aiueos_tls13_hmac,kotoba_aiueos_tls13_hkdf_expand_label kotoba_aiueos_sha256
+# JUN-553: tls13.c's certificate parsers (find_p256_point, parse_ecdsa_der) are kotoba/tls13-cert.o (fuel 4194304: the scan
+# walks up to 12 KiB).
+kotoba_tls13_cert_object=${AIUEOS_KOTOBA_TLS13_CERT_OBJECT:-"$aiueos/kotoba/tls13-cert.o"}
+python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_tls13_cert_object" \
+  b756f603d6331cf96a9f7acbffaaa86777483f6985cd4a43630caeee600abb89 \
+  kotoba_aiueos_tls13_find_p256_point,kotoba_aiueos_tls13_parse_ecdsa_der
+# JUN-553: tls13.c's ClientHello record and ServerHello validation are kotoba/tls13-hello.o (fuel 4194304).
+kotoba_tls13_hello_object=${AIUEOS_KOTOBA_TLS13_HELLO_OBJECT:-"$aiueos/kotoba/tls13-hello.o"}
+python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_tls13_hello_object" \
+  de0e7b0332eec62d8a97148940c6e449fcee1e642d62a1ceb92ff9c2be514ff3 \
+  kotoba_aiueos_tls13_clienthello,kotoba_aiueos_tls13_serverhello_parse
+# JUN-553: tls13.c's Finished check and CertificateVerify parse-and-digest are kotoba/tls13-verify.o (fuel 4194304); it calls
+# the SHA-256, key-schedule and certificate objects through externs.
+kotoba_tls13_verify_object=${AIUEOS_KOTOBA_TLS13_VERIFY_OBJECT:-"$aiueos/kotoba/tls13-verify.o"}
+python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_tls13_verify_object" \
+  67d4a6d64190e7a4ab621cb38569f81a8cd96a0722728d0b6210699bd7ae206c \
+  kotoba_aiueos_tls13_finished_ok,kotoba_aiueos_tls13_certverify \
+  kotoba_aiueos_sha256,kotoba_aiueos_tls13_hmac,kotoba_aiueos_tls13_hkdf_expand_label,kotoba_aiueos_tls13_parse_ecdsa_der
+# JUN-553: tls13.c's handshake / application traffic keys and the client Finished MAC are kotoba/tls13-keys.o (fuel 4194304);
+# it calls the SHA-256 and key-schedule objects through externs.
+kotoba_tls13_keys_object=${AIUEOS_KOTOBA_TLS13_KEYS_OBJECT:-"$aiueos/kotoba/tls13-keys.o"}
+python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_tls13_keys_object" \
+  88970f767f0ee68787f50fccb43beb695c3e453bdc35360f39ae943ad9e97a10 \
+  kotoba_aiueos_tls13_hs_keys,kotoba_aiueos_tls13_ap_keys,kotoba_aiueos_tls13_finished_mac \
+  kotoba_aiueos_sha256,kotoba_aiueos_tls13_hmac,kotoba_aiueos_tls13_hkdf_expand_label
+python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_bytes_object" \
+  567551de001399c4706927cbffd474b53c15ea35e908945e51fd2176feca6c58 \
+  kotoba_aiueos_bytes_copy,kotoba_aiueos_bytes_fill
 zig cc -target x86_64-freestanding-none -std=c11 -O2 \
   -ffreestanding -fno-stack-protector -mno-red-zone \
   -c -o "$kernel_tls13_object" "$aiueos/kernel/tls13.c"
@@ -1478,8 +1521,8 @@ zig ld.lld -nostdlib -static --strip-all $qualification_gc_link -z max-page-size
   "$kernel_pci_object" "$kernel_rtl8125_object" \
   "$kernel_inference_status_object" \
   $device_result_link $poll_sched_link $model_handoff_link "$kernel_kototama_runtime_object" \
-  "$kernel_job_protocol_object" \
-  "$kernel_tls_aes_object" "$kernel_tls13_object" \
+  "$kotoba_job_protocol_glue_object" \
+  "$kotoba_tls_aes_object" "$kotoba_bytes_object" "$kotoba_tls13_keyschedule_object" "$kotoba_tls13_cert_object" "$kotoba_tls13_hello_object" "$kotoba_tls13_verify_object" "$kotoba_tls13_keys_object" "$kernel_tls13_object" \
   "$kernel_scheduler_object" "$kernel_syscall_object" \
   "$kernel_process_object" "$kernel_loader_object" \
   "$kernel_smp_object" "$kernel_trampoline_object" \

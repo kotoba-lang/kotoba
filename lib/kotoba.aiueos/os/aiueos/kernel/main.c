@@ -3914,11 +3914,17 @@ void aiueos_exception_dispatch(uint64_t vector, uint64_t error, uint64_t rip,
   fatal_puts(" cr2=");
   fatal_hex(cr2, 16);
   {
-    const uint64_t lo = (uint64_t)(uintptr_t)aiueos_text_start;
-    const uint64_t hi = (uint64_t)(uintptr_t)aiueos_text_end;
+    /* Kotoba object code lives in its own segment (kernel/linker.ld .kotoba_text,
+       JUN-556); a fuel or bounds ud2 there is reported against that segment. */
+    extern uint8_t aiueos_kotoba_text_start[], aiueos_kotoba_text_end[];
+    const uint64_t klo = (uint64_t)(uintptr_t)aiueos_kotoba_text_start;
+    const uint64_t khi = (uint64_t)(uintptr_t)aiueos_kotoba_text_end;
+    const int in_kotoba = rip >= klo && rip + 4 <= khi;
+    const uint64_t lo = in_kotoba ? klo : (uint64_t)(uintptr_t)aiueos_text_start;
+    const uint64_t hi = in_kotoba ? khi : (uint64_t)(uintptr_t)aiueos_text_end;
     if (rip >= lo && rip + 4 <= hi) {
       const uint8_t *at = (const uint8_t *)(uintptr_t)rip;
-      fatal_puts(" rip-text=");
+      fatal_puts(in_kotoba ? " rip-kotoba-text=" : " rip-text=");
       fatal_hex(rip - lo, 8);
       fatal_puts(" insn=");
       for (unsigned i = 0; i < 4; i++) fatal_hex_raw(at[i], 2);
