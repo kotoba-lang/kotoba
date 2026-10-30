@@ -57,6 +57,44 @@ int64_t kotoba_aiueos_tls13_hkdf_expand_label(const uint8_t *secret, uint64_t se
   return 1;
 }
 
+/* kotoba/tls13-cert.kotoba on the host: the C parsers it replaced, behind the object's interface (JUN-553). */
+static const uint8_t probe_spki_prefix[27] = {
+  0x30,0x59,0x30,0x13,0x06,0x07,0x2a,0x86,0x48,0xce,0x3d,0x02,0x01,
+  0x06,0x08,0x2a,0x86,0x48,0xce,0x3d,0x03,0x01,0x07,0x03,0x42,0x00,0x04};
+
+static int probe_der_int(const uint8_t *p, uint32_t n, uint32_t *used, uint8_t out[32]) {
+  uint32_t len, off, skip;
+  if (n < 2 || p[0] != 0x02) return 0;
+  len = p[1];
+  off = 2;
+  if ((len & 0x80) != 0 || len == 0 || off + len > n) return 0;
+  skip = 0;
+  while (skip + 1 < len && p[off + skip] == 0) skip++;
+  if (len - skip > 32) return 0;
+  memset(out, 0, 32);
+  memcpy(out + (32 - (len - skip)), p + off + skip, len - skip);
+  *used = off + len;
+  return 1;
+}
+
+int64_t kotoba_aiueos_tls13_find_p256_point(const uint8_t *p, uint64_t n, uint8_t *out, uint64_t out_len) {
+  uint64_t i;
+  if ((n >> 32) || (out_len >> 32) || n < 91 || n > 16384 || out_len < 64) return 0;
+  for (i = 0; i + 91 <= n; i++)
+    if (!memcmp(p + i, probe_spki_prefix, 27)) { memcpy(out, p + i + 27, 64); return 1; }
+  return 0;
+}
+
+int64_t kotoba_aiueos_tls13_parse_ecdsa_der(const uint8_t *p, uint64_t n, uint8_t *rs, uint64_t rs_len) {
+  uint32_t used = 0, inner;
+  if ((n >> 32) || (rs_len >> 32) || n > 16384 || rs_len < 64 || n < 8 || p[0] != 0x30) return 0;
+  if ((p[1] & 0x80) != 0 || 2u + p[1] != n) return 0;
+  if (!probe_der_int(p + 2, (uint32_t)n - 2, &used, rs)) return 0;
+  inner = 2 + used;
+  if (!probe_der_int(p + inner, (uint32_t)n - inner, &used, rs + 32)) return 0;
+  return inner + used == n;
+}
+
 uint64_t kotoba_aiueos_x25519(const uint8_t *scalar, const uint8_t *peer,
                               uint8_t *out, uint8_t *ws) {
   EVP_PKEY *priv = 0, *pub = 0;

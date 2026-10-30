@@ -18,6 +18,9 @@ extern uint64_t kotoba_aiueos_tls13_record(uint8_t *, uint64_t, uint8_t *,
 extern int64_t kotoba_aiueos_tls13_hmac(const uint8_t *, uint64_t, const uint8_t *, uint64_t, uint8_t *);
 extern int64_t kotoba_aiueos_tls13_hkdf_expand_label(const uint8_t *, uint64_t, const uint8_t *, uint64_t,
                                                      const uint8_t *, uint64_t, uint8_t *, uint64_t);
+/* The certificate parsers are kotoba/tls13-cert.kotoba (JUN-553): 1 is success, as below. */
+extern int64_t kotoba_aiueos_tls13_find_p256_point(const uint8_t *, uint64_t, uint8_t *, uint64_t);
+extern int64_t kotoba_aiueos_tls13_parse_ecdsa_der(const uint8_t *, uint64_t, uint8_t *, uint64_t);
 
 #define TLS_TR_MAX 12288
 #define TLS_RX_MAX 12288
@@ -441,49 +444,12 @@ static int finish_check(const uint8_t *verify, uint32_t n) {
   return 1;
 }
 
-static const uint8_t p256_spki_prefix[27] = {
-  0x30,0x59,0x30,0x13,0x06,0x07,0x2a,0x86,0x48,0xce,0x3d,0x02,0x01,
-  0x06,0x08,0x2a,0x86,0x48,0xce,0x3d,0x03,0x01,0x07,0x03,0x42,0x00,0x04};
-
 static int find_p256_point(const uint8_t *p, uint32_t n, uint8_t out[64]) {
-  uint32_t i, j, hit;
-  if (n < 27 + 64) return 0;
-  for (i = 0; i + 27 + 64 <= n; i++) {
-    hit = 1;
-    for (j = 0; j < 27; j++) {
-      if (p[i + j] != p256_spki_prefix[j]) { hit = 0; break; }
-    }
-    if (hit) {
-      copy_bytes(out, p + i + 27, 64);
-      return 1;
-    }
-  }
-  return 0;
-}
-
-static int der_int_be32(const uint8_t *p, uint32_t n, uint32_t *used, uint8_t out[32]) {
-  uint32_t len, off, skip;
-  if (n < 2 || p[0] != 0x02) return 0;
-  len = p[1];
-  off = 2;
-  if ((len & 0x80) != 0 || len == 0 || off + len > n) return 0;
-  skip = 0;
-  while (skip + 1 < len && p[off + skip] == 0) skip++;
-  if (len - skip > 32) return 0;
-  zero_bytes(out, 32);
-  copy_bytes(out + (32 - (len - skip)), p + off + skip, len - skip);
-  *used = off + len;
-  return 1;
+  return kotoba_aiueos_tls13_find_p256_point(p, n, out, 64) == 1;
 }
 
 static int parse_ecdsa_der(const uint8_t *p, uint32_t n, uint8_t rs[64]) {
-  uint32_t used = 0, inner;
-  if (n < 8 || p[0] != 0x30) return 0;
-  if ((p[1] & 0x80) != 0 || 2u + p[1] != n) return 0;
-  if (!der_int_be32(p + 2, n - 2, &used, rs)) return 0;
-  inner = 2 + used;
-  if (!der_int_be32(p + inner, n - inner, &used, rs + 32)) return 0;
-  return inner + used == n;
+  return kotoba_aiueos_tls13_parse_ecdsa_der(p, n, rs, 64) == 1;
 }
 
 static int parse_certificate(const uint8_t *hs, uint32_t n) {
