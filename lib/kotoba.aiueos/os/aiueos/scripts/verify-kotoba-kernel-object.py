@@ -24,6 +24,11 @@ names data symbols (at most 16): each is exactly one GLOBAL OBJECT of size 8 in 
 every other name. .data is exactly 80 + 8 * (highest cell used or named + 1) bytes and the cells are zero.
 Fixed-address MMIO (D4) is an immediate in .text and adds no relocation, symbol or data to check here.
 Every GLOBAL or WEAK symbol must be an export, a declared extern or a declared data symbol; anything else is refused. LOCAL symbols (the context, and what older objects carry) are not checked.
+
+Arrays (amu JUN-556 C, ADR 0385): an object may also carry .bss and .high_bss, both SHT_NOBITS, SHF_WRITE|SHF_ALLOC, align 16,
+together or not at all. A relocation into one of them is R_X86_64_PC32 against a LOCAL STT_SECTION symbol of that section, with
+0 <= addend + 4 < its size, on the zero displacement of `lea rax,[rip+disp]` (48 8d 05): the address of an array handed to an
+extern. Nothing in .text loads or stores through it.
 """
 
 import struct
@@ -86,9 +91,15 @@ def string_at(table: bytes, offset: int) -> str:
 
 names = [string_at(strings, section[0]) for section in sections]
 allowed = {"", ".text", ".data", ".rela.text", ".symtab", ".strtab", ".shstrtab"}
-if set(names) != allowed or len(names) != len(allowed):
-    fail(f"section set must be exactly {sorted(allowed)!r}, got {names!r}")
+arrays = {".bss", ".high_bss"}
+if not (set(names) == allowed or set(names) == allowed | arrays) or len(names) != len(set(names)):
+    fail(f"section set must be exactly {sorted(allowed)!r}, optionally with both of {sorted(arrays)!r}, got {names!r}")
 by_name = {name: index for index, name in enumerate(names)}
+array_sections = {by_name[name] for name in arrays if name in by_name}
+for index in array_sections:
+    _, stype, sflags, saddr, _, _, slink, sinfo, salign, sentsize = sections[index]
+    if (stype, sflags, saddr, slink, sinfo, salign, sentsize) != (8, 3, 0, 0, 0, 16, 0):
+        fail(f"{names[index]} must be NOBITS, WRITE|ALLOC, align 16")
 if sections[by_name[".text"]][1] != 1 or not sections[by_name[".text"]][2] & 0x4:
     fail(".text must be executable PROGBITS")
 if sections[by_name[".data"]][1] != 1 or sections[by_name[".data"]][2] & 0x4:
@@ -162,6 +173,7 @@ if symbols[context_index][1] >> 4 != 0 or symbols[context_index][0] not in ("", 
     fail("the shim relocations must name the context symbol")
 calls = 0
 cells_used = 0
+arrays_used = 0
 for entry in range(count, count + extras):
     rel_offset, rel_info, addend = struct.unpack_from("<QQq", rela_bytes, entry * 24)
     symbol_index, relocation_type = rel_info >> 32, rel_info & 0xFFFFFFFF
@@ -177,6 +189,13 @@ for entry in range(count, count + extras):
         if text[rel_offset + 4:rel_offset + 8] != bytes.fromhex("4c8b4df8"):
             fail("an extern call must be followed by mov r9,[rbp-8]")
         calls += 1
+    elif relocation_type == 2 and symbols[symbol_index][3] in array_sections:
+        _, info, other, shndx, value, size = symbols[symbol_index]
+        if (info, other, value, size) != (0x03, 0, 0, 0) or not 0 <= addend + 4 < sections[shndx][5]:
+            fail("an array address must be R_X86_64_PC32 against the LOCAL section symbol, inside the section")
+        if rel_offset < 3 or rel_offset + 4 > text_size or text[rel_offset - 3:rel_offset] != bytes.fromhex("488d05") or text[rel_offset:rel_offset + 4] != b"\0\0\0\0":
+            fail("an array address must be lea rax,[rip+disp] with a zero displacement (amu JUN-556 C)")
+        arrays_used += 1
     elif relocation_type == 2:
         k, rest = divmod(addend + 4 - 80, 8)
         if symbol_index != context_index or rest != 0 or not 0 <= k < 64:
@@ -196,4 +215,6 @@ if data_section[5] != 80 + 8 * cells:
 if any(section_bytes(data_index)[80:]):
     fail("data cells must be zero")
 extra = f" cells={cells} data_symbols={len(data_symbol_names)}" if cells or data_symbol_names else ""
+if array_sections:
+    extra += f" bss={sections[by_name['.bss']][5]} high_bss={sections[by_name['.high_bss']][5]} array_relocations={arrays_used}"
 print(f"AIUEOS_KOTOBA_OBJECT_OK target=x86_64-aiueos-kernel-v1 export={','.join(expected_symbols)} imports={len(extern_symbols)} relocations={count + extras}{extra}")

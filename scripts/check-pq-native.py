@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Run the native post-quantum and secure-channel known-answer gates and their mutants
 (JUN-352 P1b: SHA-3, ML-KEM-768, ML-DSA-65; AWAI-117: X25519, ChaCha20-Poly1305 and
-XChaCha20-Poly1305, the pqh-v1 hybrid KEM; JUN-352: AES and AES-GCM; AWAI-102: X-Wing and Noise).
+XChaCha20-Poly1305, the pqh-v1 hybrid KEM; JUN-352: AES and AES-GCM; AWAI-102: X-Wing, Noise, Noise XXhfs, its identity payload, framing and the
+native-TCP demo on Linux).
 
 Each gate is one unity source: the library bodies with their `ns` forms removed, the
 `sha3/` alias dropped, then the gate body. The gate's main returns a bitmask; a pass is
@@ -13,8 +14,10 @@ runner). The pinned x86_64 KX64 profile refuses string literals (E7101 detail 16
 the gates use for their vectors, so x86_64 is not run in CI yet.
 """
 import argparse
+import concurrent.futures
 import hashlib
 import json
+import os
 import platform
 import re
 import subprocess
@@ -79,6 +82,7 @@ MODULE_GATES = {
         'eseed': ('xwing/core.kotoba', 'ek-x (slice eseed 32 32)', 'ek-x (slice eseed 0 32)'),
     }),
     'noise': dict(files=dict(X25519, **CHACHA, **{'sha2/core.kotoba': 'lib/gov.nist.sha2/kotoba/sha2/core.kotoba',
+                                                  'sha3/core.kotoba': SHA3, 'mlkem/core.kotoba': 'lib/gov.nist.mlKem/kotoba/mlkem/core.kotoba',
                                                   'noise/native.kotoba': 'lib/kotoba.noise/kotoba/noise/native.kotoba',
                                                   'noise/native_gate.kotoba': 'lib/kotoba.noise/kotoba/noise/native_gate.kotoba'}),
                   gate_ns='noise.native-gate', groups={g: 31 for g in ['nn-i', 'nn-r', 'xx-i', 'xx-r', 'ik-i', 'ik-r']}, mutants={
@@ -86,6 +90,35 @@ MODULE_GATES = {
         'esse': ('noise/native.kotoba', '(= token 4) (if init (x/x25519-bytes e rs) (x/x25519-bytes s re))',
                  '(= token 4) (if init (x/x25519-bytes s re) (x/x25519-bytes e rs))'),
         'premsg': ('noise/native.kotoba', '(if (= pattern 2) (mix-hash st5', '(if false (mix-hash st5'),
+    }),
+    'xxhfs': dict(files=dict(X25519, **CHACHA, **{'sha2/core.kotoba': 'lib/gov.nist.sha2/kotoba/sha2/core.kotoba',
+                                                  'sha3/core.kotoba': SHA3, 'mlkem/core.kotoba': 'lib/gov.nist.mlKem/kotoba/mlkem/core.kotoba',
+                                                  'noise/native.kotoba': 'lib/kotoba.noise/kotoba/noise/native.kotoba',
+                                                  'noise/xxhfs_gate.kotoba': 'lib/kotoba.noise/kotoba/noise/xxhfs_gate.kotoba'}),
+                  gate_ns='noise.xxhfs-gate', groups={'i': 63, 'r': 63}, mutants={
+        'w-mixkey': ('noise/native.kotoba', '(recur (+ i 1) (mix-key (slice o 0 1646) (slice kc 0 32))', '(recur (+ i 1) (slice o 0 1646)'),
+        'r-mixkey': ('noise/native.kotoba', '(recur (+ i 1) (mix-key (slice o 0 1646) ss) (+ pos n))', '(recur (+ i 1) (slice o 0 1646) (+ pos n))'),
+        'e1-hash': ('noise/native.kotoba', '(let [o (encrypt-and-hash st (slice (kem-pair st) 0 1184))]', '(let [o (cat st (slice (kem-pair st) 0 1184))]'),
+        'kem-half': ('noise/native.kotoba', '(k/decaps (slice (kem-pair o) 1184 2400)', '(k/decaps (slice (kem-pair o) 0 2400)'),
+    }),
+    'identity': dict(files=dict(X25519, **CHACHA, **{'sha2/core.kotoba': 'lib/gov.nist.sha2/kotoba/sha2/core.kotoba',
+                                                     'sha3/core.kotoba': SHA3, 'mlkem/core.kotoba': 'lib/gov.nist.mlKem/kotoba/mlkem/core.kotoba',
+                                                     'mldsa/core.kotoba': 'lib/gov.nist.mlDsa/kotoba/mldsa/core.kotoba',
+                                                     'ed25519/selfhost.kotoba': 'lib/org.ietf.ed25519/kotoba/ed25519/selfhost.kotoba',
+                                                     'noise/native.kotoba': 'lib/kotoba.noise/kotoba/noise/native.kotoba',
+                                                     'noise/identity.kotoba': 'lib/kotoba.noise/kotoba/noise/identity.kotoba',
+                                                     'noise/identity_gate.kotoba': 'lib/kotoba.noise/kotoba/noise/identity_gate.kotoba'}),
+                     gate_ns='noise.identity-gate', groups={'i': 127, 'r': 127}, mutants={
+        'no-want': ('noise/identity.kotoba', '       (same? (slice p 0 1984) want)\n', ''),
+        'no-dsa': ('noise/identity.kotoba', '              (dsa/verify (slice p 32 1952) msg (vector-i64) (slice p 2048 3309))))))', '              true))))'),
+        'no-ed': ('noise/identity.kotoba', '         (and (ed/verify? (slice p 0 32) msg (slice p 1984 64))', '         (and true'),
+    }),
+    'frame': dict(files={'noise/frame.kotoba': 'lib/kotoba.noise/kotoba/noise/frame.kotoba',
+                         'noise/frame_gate.kotoba': 'lib/kotoba.noise/kotoba/noise/frame_gate.kotoba'},
+                  entry='noise/frame_gate.kotoba', passing=63, mutants={
+        'endian': ('noise/frame.kotoba', 'a (vector-assoc! out 0 (quot n 256))\n            b (vector-assoc! out 1 (rem n 256))',
+                   'a (vector-assoc! out 0 (rem n 256))\n            b (vector-assoc! out 1 (quot n 256))'),
+        'limit': ('noise/frame.kotoba', '(if (or (> n 65535) (not (bytes? msg)))', '(if (or (> n 65536) (not (bytes? msg)))'),
     }),
     'aes': dict(files={f'aes/{n}.kotoba': f'lib/gov.nist.aes/kotoba/aes/{n}.kotoba' for n in ['core', 'gcm', 'native_gate']},
                 gate_ns='aes.native-gate', groups={'a': 15, 'b': 7, 'c': 7}, mutants={
@@ -108,6 +141,21 @@ MODULE_GATES = {
                      '(if false (vector-i64)\n            (let [eph-pub'),
     }),
 }
+
+# The TCP demo needs the static runtime's net wires 43-47, which only Linux images answer:
+# it runs on the arm64 lane with exact loopback grants, and again with each grant taken
+# away, which must refuse.
+NET_GRANT = {'KEXE_ALLOW': '43,44,45,46,47', 'KEXE_CAP_RESOURCES_43': '127.0.0.1:47011',
+             'KEXE_CAP_RESOURCES_45': '127.0.0.1:47011'}
+# an exact closure: every pinned module must be reachable from the entry (E6015), so the
+# identity gate's own entry module is left out
+TCP_DEMO = dict(files=dict({k: v for k, v in MODULE_GATES['identity']['files'].items() if k != 'noise/identity_gate.kotoba'}, **{
+    'noise/frame.kotoba': 'lib/kotoba.noise/kotoba/noise/frame.kotoba',
+    'noise/tcp.kotoba': 'lib/kotoba.noise/kotoba/noise/tcp.kotoba',
+    'noise/tcp_demo.kotoba': 'lib/kotoba.noise/kotoba/noise/tcp_demo.kotoba'}),
+    entry='noise/tcp_demo.kotoba', passing=63,
+    controls={'no-dial-wire': dict(NET_GRANT, KEXE_ALLOW='43,44,46,47'),
+              'dial-address-not-granted': dict(NET_GRANT, KEXE_CAP_RESOURCES_45='127.0.0.2:47011')})
 
 def module_files(spec, change=None):
     files = {}
@@ -179,7 +227,9 @@ class LinuxArm:
                                 env=env or self.env())
         (self.out / (label + '.stdout')).write_bytes(result.stdout)
         (self.out / (label + '.stderr')).write_bytes(result.stderr)
-        self.observations.append(dict(name=label, exit=result.returncode, seconds=round(time.monotonic() - start, 3)))
+        # Gates run concurrently (main), so a call keeps a handle on its own observation instead of observations[-1].
+        result.observation = dict(name=label, exit=result.returncode, seconds=round(time.monotonic() - start, 3))
+        self.observations.append(result.observation)
         print(label, result.returncode, result.stderr.decode(errors='replace')[:300], flush=True)
         return result
 
@@ -208,12 +258,13 @@ class LinuxArm:
                                      sources={n: hashlib.sha256(b).hexdigest() for n, b in files.items()})
         return image
 
-    def run(self, label, image, expected):
-        # wire 37 only: the SHA-3 gate prints its oracle lines; nothing else is granted
-        r = self.call(label, [image], self.env(KEXE_STRUCTURED_REPORT='1', KEXE_ALLOW='37'))
+    def run(self, label, image, expected, grants=None):
+        # wire 37 only by default: the SHA-3 gate prints its oracle lines. A gate that
+        # needs more (the TCP demo) names its exact grants, which replace this one.
+        r = self.call(label, [image], self.env(KEXE_STRUCTURED_REPORT='1', **(grants or {'KEXE_ALLOW': '37'})))
         match = re.search(rb':result (-?[0-9]+)', r.stdout)
-        self.observations[-1]['result'] = int(match[1]) if match else None
-        print(label, 'result', self.observations[-1]['result'], flush=True)
+        r.observation['result'] = int(match[1]) if match else None
+        print(label, 'result', r.observation['result'], flush=True)
         assert r.returncode == 0 and match and int(match[1]) == expected, (label, r.returncode, r.stdout[-300:])
         return r
 
@@ -234,14 +285,18 @@ def main():
     parser.add_argument('--packager', type=Path, help='macOS: the Mac packager')
     parser.add_argument('--packager-sha256')
     parser.add_argument('--output', type=Path, required=True)
+    # The gates are independent (own sources, images and output files), so they run concurrently; a gate's own
+    # pass run and mutants stay in order. --jobs 1 is the old serial order (JUN-629).
+    parser.add_argument('--jobs', type=int, default=os.cpu_count() or 2)
     args = parser.parse_args()
     gate = LinuxArm(args) if platform.system() == 'Linux' and platform.machine() in ('aarch64', 'arm64') else NativeGate(args)
     results = {}
-    for name, spec in GATES.items():
+
+    def unity_gate(name, spec):
         entry = f'pq/{name}_gate.kotoba'
         image = gate.build(name, entry, {entry: unity(name, spec)})
         gate.run(name + '-pass', image, spec['passing'])
-        results[name] = dict(passing=spec['passing'], mutants={})
+        result = dict(passing=spec['passing'], mutants={})
         for label, change in spec['mutants'].items():
             mutant = gate.build(f'{name}-{label}', entry, {entry: unity(name, spec, change)})
             try:
@@ -249,17 +304,39 @@ def main():
                 detected = False
             except AssertionError:
                 detected = True
-            results[name]['mutants'][label] = detected
+            result['mutants'][label] = detected
             assert detected, (name, label, 'mutant passed the gate')
-    for name, spec in MODULE_GATES.items():
+        return result
+
+    def module_gate(name, spec):
         passing = module_results(gate, name, spec, name, module_files(spec))
         assert None not in passing.values(), (name, passing)
-        results[name] = dict(passing=passing, mutants={})
+        result = dict(passing=passing, mutants={})
         for label, change in spec['mutants'].items():
             got = module_results(gate, name, spec, f'{name}-{label}', module_files(spec, change))
             detected = None in got.values()
-            results[name]['mutants'][label] = detected
+            result['mutants'][label] = detected
             assert detected, (name, label, 'mutant passed every group')
+        return result
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
+        futures = {name: pool.submit(unity_gate, name, spec) for name, spec in GATES.items()}
+        futures.update({name: pool.submit(module_gate, name, spec) for name, spec in MODULE_GATES.items()})
+        for name in list(GATES) + list(MODULE_GATES):
+            results[name] = futures[name].result()
+    if isinstance(gate, LinuxArm):
+        files = module_files(TCP_DEMO)
+        image = gate.build('tcp-demo', TCP_DEMO['entry'], files)
+        gate.run('tcp-demo-run', image, TCP_DEMO['passing'], NET_GRANT)
+        results['tcp-demo'] = dict(passing=TCP_DEMO['passing'], controls={})
+        for label, grants in TCP_DEMO['controls'].items():
+            try:
+                gate.run(f'tcp-demo-{label}', image, TCP_DEMO['passing'], grants)
+                refused = False
+            except AssertionError:
+                refused = True
+            results['tcp-demo']['controls'][label] = refused
+            assert refused, ('tcp demo ran without', label)
     gate.finish('PASS_PQ_NATIVE_GATES', gates=results)
 
 if __name__ == '__main__':

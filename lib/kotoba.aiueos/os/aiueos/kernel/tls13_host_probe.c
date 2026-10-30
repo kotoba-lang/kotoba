@@ -28,6 +28,289 @@ uint64_t kotoba_aiueos_sha256(const uint8_t *in, uint64_t n, uint8_t out[32],
   return 1;
 }
 
+/* kotoba/tls13-keyschedule.kotoba on the host: HMAC-SHA256 and HKDF-Expand-Label with the object's limits (JUN-553). */
+#include <openssl/hmac.h>
+int64_t kotoba_aiueos_tls13_hmac(const uint8_t *key, uint64_t key_len, const uint8_t *data,
+                                 uint64_t data_len, uint8_t *out) {
+  unsigned int n = 32;
+  if ((key_len >> 32) || (data_len >> 32) || 64 + data_len > 12288) return 0;
+  return HMAC(EVP_sha256(), key, (int)key_len, data, (size_t)data_len, out, &n) ? 1 : 0;
+}
+
+int64_t kotoba_aiueos_tls13_hkdf_expand_label(const uint8_t *secret, uint64_t secret_len,
+                                              const uint8_t *label, uint64_t label_len,
+                                              const uint8_t *ctx, uint64_t ctx_len,
+                                              uint8_t *out, uint64_t out_len) {
+  uint8_t info[256], full[32];
+  uint64_t n;
+  if ((secret_len >> 32) || (label_len >> 32) || (ctx_len >> 32) || (out_len >> 32) ||
+      6 + label_len + ctx_len + 4 > sizeof(info) || out_len > 32) return 0;
+  info[0] = (uint8_t)(out_len >> 8); info[1] = (uint8_t)out_len; info[2] = (uint8_t)(6 + label_len);
+  memcpy(info + 3, "tls13 ", 6);
+  memcpy(info + 9, label, (size_t)label_len);
+  info[9 + label_len] = (uint8_t)ctx_len;
+  if (ctx_len) memcpy(info + 10 + label_len, ctx, (size_t)ctx_len);
+  n = 10 + label_len + ctx_len;
+  info[n] = 0x01;
+  if (!kotoba_aiueos_tls13_hmac(secret, secret_len, info, n + 1, full)) return 0;
+  memcpy(out, full, (size_t)out_len);
+  return 1;
+}
+
+/* kotoba/tls13-cert.kotoba on the host: the C parsers it replaced, behind the object's interface (JUN-553). */
+static const uint8_t probe_spki_prefix[27] = {
+  0x30,0x59,0x30,0x13,0x06,0x07,0x2a,0x86,0x48,0xce,0x3d,0x02,0x01,
+  0x06,0x08,0x2a,0x86,0x48,0xce,0x3d,0x03,0x01,0x07,0x03,0x42,0x00,0x04};
+
+static int probe_der_int(const uint8_t *p, uint32_t n, uint32_t *used, uint8_t out[32]) {
+  uint32_t len, off, skip;
+  if (n < 2 || p[0] != 0x02) return 0;
+  len = p[1];
+  off = 2;
+  if ((len & 0x80) != 0 || len == 0 || off + len > n) return 0;
+  skip = 0;
+  while (skip + 1 < len && p[off + skip] == 0) skip++;
+  if (len - skip > 32) return 0;
+  memset(out, 0, 32);
+  memcpy(out + (32 - (len - skip)), p + off + skip, len - skip);
+  *used = off + len;
+  return 1;
+}
+
+int64_t kotoba_aiueos_tls13_find_p256_point(const uint8_t *p, uint64_t n, uint8_t *out, uint64_t out_len) {
+  uint64_t i;
+  if ((n >> 32) || (out_len >> 32) || n < 91 || n > 16384 || out_len < 64) return 0;
+  for (i = 0; i + 91 <= n; i++)
+    if (!memcmp(p + i, probe_spki_prefix, 27)) { memcpy(out, p + i + 27, 64); return 1; }
+  return 0;
+}
+
+int64_t kotoba_aiueos_tls13_parse_ecdsa_der(const uint8_t *p, uint64_t n, uint8_t *rs, uint64_t rs_len) {
+  uint32_t used = 0, inner;
+  if ((n >> 32) || (rs_len >> 32) || n > 16384 || rs_len < 64 || n < 8 || p[0] != 0x30) return 0;
+  if ((p[1] & 0x80) != 0 || 2u + p[1] != n) return 0;
+  if (!probe_der_int(p + 2, (uint32_t)n - 2, &used, rs)) return 0;
+  inner = 2 + used;
+  if (!probe_der_int(p + inner, (uint32_t)n - inner, &used, rs + 32)) return 0;
+  return inner + used == n;
+}
+
+/* kotoba/tls13-hello.kotoba on the host: the C it replaced, behind the object's interface (JUN-553). */
+static uint16_t probe_be16(const uint8_t *p) {
+  return (uint16_t)(((uint32_t)p[0] << 8) | p[1]);
+}
+
+static const uint8_t probe_ch_template[157] = {
+  0x16,0x03,0x01,0x00,0x98,0x01,0x00,0x00,0x94,0x03,0x03,0xa1,0xe0,0xa1,0xe0,
+  0xa1,0xe0,0xa1,0xe0,0xa1,0xe0,0xa1,0xe0,0xa1,0xe0,0xa1,0xe0,0xa1,0xe0,0xa1,
+  0xe0,0xa1,0xe0,0xa1,0xe0,0xa1,0xe0,0xa1,0xe0,0xa1,0xe0,0xa1,0xe0,0x00,0x00,
+  0x02,0x13,0x01,0x01,0x00,0x00,0x69,0x00,0x00,0x00,0x11,0x00,0x0f,0x00,0x00,
+  0x0c,0x6b,0x6f,0x74,0x6f,0x62,0x61,0x73,0x65,0x2e,0x6e,0x65,0x74,0x00,0x0a,
+  0x00,0x04,0x00,0x02,0x00,0x1d,0x00,0x0d,0x00,0x08,0x00,0x06,0x04,0x03,0x08,
+  0x04,0x04,0x01,0x00,0x2b,0x00,0x03,0x02,0x03,0x04,0x00,0x10,0x00,0x0b,0x00,
+  0x09,0x08,0x68,0x74,0x74,0x70,0x2f,0x31,0x2e,0x31,0x00,0x33,0x00,0x26,0x00,
+  0x24,0x00,0x1d,0x00,0x20,0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0a,
+  0x0b,0x0c,0x0d,0x0e,0x0f,0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,0x18,0x19,
+  0x1a,0x1b,0x1c,0x1d,0x1e,0x1f,0x20};
+
+static int ref_serverhello(const uint8_t *hs, uint32_t n, uint8_t out_pub[32]) {
+  uint32_t off, ext_end, sid;
+  uint8_t server_pub[32];
+  int got_share = 0, got_13 = 0;
+  if (n < 40 || hs[0] != 0x02) return 0;
+  if ((((uint32_t)hs[1] << 16) | ((uint32_t)hs[2] << 8) | hs[3]) + 4 != n) return 0;
+  if (hs[4] != 0x03 || hs[5] != 0x03) return 0;
+  sid = hs[38];
+  if (sid > 32 || 39 + sid + 3 + 2 > n) return 0;
+  off = 39 + sid;
+  if (hs[off] != 0x13 || hs[off + 1] != 0x01) return 0; /* AES-128-GCM */
+  off += 2;
+  if (hs[off] != 0) return 0;
+  off++;
+  if (off + 2 > n) return 0;
+  ext_end = off + 2 + probe_be16(hs + off);
+  off += 2;
+  if (ext_end != n) return 0;
+  while (off + 4 <= ext_end) {
+    uint16_t typ = probe_be16(hs + off);
+    uint16_t elen = probe_be16(hs + off + 2);
+    const uint8_t *ed = hs + off + 4;
+    if (off + 4 + elen > ext_end) return 0;
+    if (typ == 0x002b && elen >= 2 && ed[elen - 2] == 0x03 && ed[elen - 1] == 0x04)
+      got_13 = 1;
+    if (typ == 0x0033 && elen >= 36 && probe_be16(ed) == 0x001d && probe_be16(ed + 2) == 32) {
+      memcpy(server_pub, ed + 4, 32);
+      got_share = 1;
+    }
+    off += 4 + elen;
+  }
+  if (!got_13 || !got_share) return 0;
+  memcpy(out_pub, server_pub, 32);
+  return 1;
+}
+
+int64_t kotoba_aiueos_tls13_serverhello_parse(const uint8_t *hs, uint64_t n, uint8_t *key, uint64_t key_len) {
+  if ((n >> 32) || (key_len >> 32) || n > 16384 || key_len < 32) return 0;
+  return ref_serverhello(hs, (uint32_t)n, key);
+}
+
+int64_t kotoba_aiueos_tls13_clienthello(const uint8_t *host, uint64_t host_len, const uint8_t *random, uint64_t random_len,
+                                        const uint8_t *key, uint64_t key_len, uint8_t *out, uint64_t out_len) {
+  uint64_t total = 145 + host_len;
+  if ((host_len >> 32) || (random_len >> 32) || (key_len >> 32) || (out_len >> 32) || host_len > 255 || total > 256 ||
+      total > out_len || key_len != 32 || (random_len != 0 && random_len != 32)) return 0;
+  memcpy(out, probe_ch_template, 61);
+  out[3] = (uint8_t)((total - 5) >> 8); out[4] = (uint8_t)(total - 5);
+  out[6] = (uint8_t)((total - 9) >> 16); out[7] = (uint8_t)((total - 9) >> 8); out[8] = (uint8_t)(total - 9);
+  if (random_len == 32) memcpy(out + 11, random, 32);
+  out[50] = (uint8_t)((93 + host_len) >> 8); out[51] = (uint8_t)(93 + host_len);
+  out[54] = (uint8_t)((5 + host_len) >> 8); out[55] = (uint8_t)(5 + host_len);
+  out[56] = (uint8_t)((3 + host_len) >> 8); out[57] = (uint8_t)(3 + host_len);
+  out[59] = (uint8_t)(host_len >> 8); out[60] = (uint8_t)host_len;
+  memcpy(out + 61, host, (size_t)host_len);
+  memcpy(out + 61 + host_len, probe_ch_template + 73, 84);
+  memcpy(out + 113 + host_len, key, 32);
+  return (int64_t)total;
+}
+
+/* kotoba/tls13-verify.kotoba on the host: the C it replaced, behind the object's interface (JUN-553). */
+static int probe_sha256(const uint8_t *in, uint32_t n, uint8_t out[32]) { return (int)kotoba_aiueos_sha256(in, n, out, 0, 0); }
+static int kotoba_aiueos_tls13_hmac_bool(const uint8_t *k, uint32_t kl, const uint8_t *d, uint32_t dl, uint8_t out[32]) {
+  return kotoba_aiueos_tls13_hmac(k, kl, d, dl, out) == 1;
+}
+static int probe_expand(const uint8_t *s, const char *label, const uint8_t *c, uint32_t cl, uint8_t *o, uint32_t ol) {
+  uint32_t i = 0;
+  while (label[i]) i++;
+  return kotoba_aiueos_tls13_hkdf_expand_label(s, 32, (const uint8_t *)label, i, c, cl, o, ol) == 1;
+}
+static int ref_finished(const uint8_t *s_hs_secret, const uint8_t *transcript, uint32_t transcript_len, const uint8_t *verify, uint32_t n) {
+  uint8_t finished_key[32], th[32], expect[32];
+  uint32_t i, diff = 0;
+  if (n != 32) return 0;
+  if (!probe_expand(s_hs_secret, "finished", 0, 0, finished_key, 32)) return 0;
+  if (!probe_sha256(transcript, transcript_len, th)) return 0;
+  if (!kotoba_aiueos_tls13_hmac_bool(finished_key, 32, th, 32, expect)) return 0;
+  for (i = 0; i < 32; i++) diff |= (uint32_t)(verify[i] ^ expect[i]);
+  return diff == 0;
+}
+
+static int ref_certverify(const uint8_t *hs, uint32_t n, const uint8_t *transcript, uint32_t transcript_len,
+                          uint8_t *cv_rs, uint8_t *cv_digest, int32_t *scheme_out) {
+  uint32_t mlen, siglen, i;
+  uint8_t th[32], digest[32], rs[64], content[130];
+  static const uint8_t ctx[33] = {'T','L','S',' ','1','.','3',',',' ','s','e','r','v','e','r',' ',
+    'C','e','r','t','i','f','i','c','a','t','e','V','e','r','i','f','y'};
+  uint16_t certverify_scheme;
+  if (n < 8 || hs[0] != 0x0f) return 0;
+  mlen = (((uint32_t)hs[1] << 16) | ((uint32_t)hs[2] << 8) | hs[3]);
+  if (mlen + 4 != n) return 0;
+  certverify_scheme = probe_be16(hs + 4); *scheme_out = certverify_scheme;
+  if (certverify_scheme != 0x0403) return 0;
+  siglen = probe_be16(hs + 6);
+  if (8 + siglen != n) return 0;
+  if (!(kotoba_aiueos_tls13_parse_ecdsa_der(hs + 8, siglen, rs, 64) == 1)) return 0;
+  if (!probe_sha256(transcript, transcript_len, th)) return 0;
+  for (i = 0; i < 64; i++) content[i] = 0x20;
+  memcpy(content + 64, ctx, 33);
+  content[97] = 0;
+  memcpy(content + 98, th, 32);
+  if (!probe_sha256(content, 130, digest)) return 0;
+  memcpy(cv_rs, rs, 64);
+  memcpy(cv_digest, digest, 32);
+  return 1;
+}
+
+int64_t kotoba_aiueos_tls13_finished_ok(const uint8_t *secret, uint64_t secret_len, const uint8_t *transcript,
+                                        uint64_t transcript_len, const uint8_t *verify, uint64_t verify_len) {
+  if ((secret_len >> 32) || (transcript_len >> 32) || (verify_len >> 32)) return 0;
+  return ref_finished(secret, transcript, (uint32_t)transcript_len, verify, (uint32_t)verify_len);
+}
+
+int64_t kotoba_aiueos_tls13_certverify(const uint8_t *hs, uint64_t n, const uint8_t *transcript, uint64_t transcript_len,
+                                       uint8_t *rs, uint64_t rs_len, uint8_t *digest, uint64_t digest_len) {
+  int32_t scheme = -1;
+  int ok;
+  if ((n >> 32) || (transcript_len >> 32) || (rs_len >> 32) || (digest_len >> 32) || n > 16384 || rs_len < 64 ||
+      digest_len < 32) return 0;
+  ok = ref_certverify(hs, (uint32_t)n, transcript, (uint32_t)transcript_len, rs, digest, &scheme);
+  return scheme < 0 ? 0 : ((int64_t)scheme << 1) | (ok ? 1 : 0);
+}
+
+/* kotoba/tls13-keys.kotoba on the host: derive_hs_keys after the X25519, derive_ap_keys and the client Finished MAC, the C
+   they replaced behind the object's interface (JUN-553). */
+static int probe_derive(const uint8_t *secret, const char *label, const uint8_t *msgs, uint32_t n, uint8_t out[32]) {
+  uint8_t th[32];
+  return probe_sha256(msgs, n, th) && probe_expand(secret, label, th, 32, out, 32);
+}
+
+int64_t kotoba_aiueos_tls13_hs_keys(const uint8_t *shared, uint64_t shared_len, const uint8_t *transcript,
+                                    uint64_t transcript_len, uint8_t *o, uint64_t out_len) {
+  static const uint8_t zeros[32] = {0};
+  uint8_t early[32], derived[32];
+  uint32_t tl = (uint32_t)transcript_len;
+  if ((shared_len >> 32) || (transcript_len >> 32) || (out_len >> 32) || shared_len != 32 || out_len < 152) return 0;
+  return kotoba_aiueos_tls13_hmac_bool(zeros, 32, zeros, 32, early) && probe_derive(early, "derived", 0, 0, derived) &&
+         kotoba_aiueos_tls13_hmac_bool(derived, 32, shared, 32, o) &&
+         probe_derive(o, "c hs traffic", transcript, tl, o + 32) && probe_derive(o, "s hs traffic", transcript, tl, o + 64) &&
+         probe_expand(o + 32, "key", 0, 0, o + 96, 16) && probe_expand(o + 32, "iv", 0, 0, o + 112, 12) &&
+         probe_expand(o + 64, "key", 0, 0, o + 124, 16) && probe_expand(o + 64, "iv", 0, 0, o + 140, 12);
+}
+
+int64_t kotoba_aiueos_tls13_ap_keys(const uint8_t *secret, uint64_t secret_len, const uint8_t *transcript,
+                                    uint64_t transcript_len, uint8_t *o, uint64_t out_len) {
+  static const uint8_t zeros[32] = {0};
+  uint8_t derived[32], master[32], c_ap[32], s_ap[32];
+  uint32_t tl = (uint32_t)transcript_len;
+  if ((secret_len >> 32) || (transcript_len >> 32) || (out_len >> 32) || secret_len != 32 || out_len < 56) return 0;
+  return probe_derive(secret, "derived", 0, 0, derived) && kotoba_aiueos_tls13_hmac_bool(derived, 32, zeros, 32, master) &&
+         probe_derive(master, "c ap traffic", transcript, tl, c_ap) && probe_derive(master, "s ap traffic", transcript, tl, s_ap) &&
+         probe_expand(c_ap, "key", 0, 0, o, 16) && probe_expand(c_ap, "iv", 0, 0, o + 16, 12) &&
+         probe_expand(s_ap, "key", 0, 0, o + 28, 16) && probe_expand(s_ap, "iv", 0, 0, o + 44, 12);
+}
+
+int64_t kotoba_aiueos_tls13_finished_mac(const uint8_t *secret, uint64_t secret_len, const uint8_t *transcript,
+                                         uint64_t transcript_len, uint8_t *out, uint64_t out_len) {
+  uint8_t key[32], th[32];
+  if ((secret_len >> 32) || (transcript_len >> 32) || (out_len >> 32) || secret_len != 32 || out_len < 32) return 0;
+  return probe_expand(secret, "finished", 0, 0, key, 32) && probe_sha256(transcript, (uint32_t)transcript_len, th) &&
+         kotoba_aiueos_tls13_hmac_bool(key, 32, th, 32, out);
+}
+
+/* kotoba/tls13-hs.kotoba on the host: the handshake state machine's decisions, behind the object's interface (JUN-553). */
+int64_t kotoba_aiueos_tls13_hs_step(const uint8_t *buf, uint64_t n, uint64_t flags) {
+  uint32_t total;
+  uint8_t t;
+  int64_t a;
+  if ((n >> 32) || n > 16384 || (flags >> 32)) return 0;
+  if (n < 4) return 1;
+  total = 4 + (((uint32_t)buf[1] << 16) | ((uint32_t)buf[2] << 8) | buf[3]);
+  if (total > 12288) return 0;
+  if (n < total) return 1;
+  t = buf[0];
+  a = t == 0x14 ? ((flags & 1) ? 2 : 0) : t == 0x0b ? 3 : t == 0x0f ? 4 : (flags & 2) ? 6 : 5;
+  return a ? a + ((int64_t)total << 8) : 0;
+}
+
+int64_t kotoba_aiueos_tls13_record_step(const uint8_t *rec, uint64_t n, uint64_t flags) {
+  int64_t hlen;
+  if ((n >> 32) || n > 16384 || (flags >> 32) || n < 5) return 0;
+  hlen = (int64_t)probe_be16(rec + 3) << 8;
+  switch (rec[0]) {
+  case 0x14: return 1;
+  case 0x15: return 2;
+  case 0x16: return (flags & 1) ? 1 : (flags & 2) ? 4 + hlen : 3 + hlen;
+  case 0x17: return !(flags & 4) ? 0 : (flags & 1) ? 6 : 5;
+  default: return 1;
+  }
+}
+
+int64_t kotoba_aiueos_tls13_inner_step(const uint8_t *plain, uint64_t n, uint64_t inner, uint64_t ap) {
+  if ((n >> 32) || n > 16384 || inner > 255) return 0;
+  if (!ap) return inner == 0x15 ? 2 : inner != 0x16 ? 0 : 4;
+  if (inner == 0x15) return (n >= 2 && plain[0] == 1 && plain[1] == 0) ? 9 : 2;
+  return inner != 0x17 ? 7 : 8;
+}
+
 uint64_t kotoba_aiueos_x25519(const uint8_t *scalar, const uint8_t *peer,
                               uint8_t *out, uint8_t *ws) {
   EVP_PKEY *priv = 0, *pub = 0;

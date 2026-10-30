@@ -239,6 +239,138 @@ mint another request ID. `abandon` is a recovery outcome, not an application
 success receipt. The C0 token inside a dispatch command identifies its original
 local reservation and is not substituted for the quorum parent CAS.
 
+## Broker envelope over an authenticated session (AWAI-102)
+
+Broker exchanges are moving from files copied between private directories onto
+authenticated sessions: Noise XXhfs with ML-KEM-768 and Ed25519 + ML-DSA-65 identities, over
+the native TCP wires (`lib/kotoba.noise`, ADR-0001). Each exchange travels in one
+`hata.wire` envelope (`src/hata/wire.kotoba`), and one envelope is one `noise.frame`.
+
+- **Layout:** version (1, = 1), kind (1), request id (32), body length (4, big-endian), then
+  the body; at most 65535 bytes. Kinds 1-8 are the vote, commit, attest and execute
+  requests and their responses; a response kind is its request kind plus one.
+- **Request id:** `SHA-256("hata.wire.v1/request\n" || handshake hash || sequence (8) ||
+  body)`. A request replayed into another session, or at another position in the same
+  session, has another id. The session owner accepts only the next sequence number.
+- **Opening:** `open` gives the body only for an envelope of exactly the expected version,
+  kind and id and an exact length; anything else is `[-1]`. A response is accepted only
+  under its request's id.
+
+`test/wire_native.kotoba` returns 127, and runs in the history section of
+`scripts/check-broker-native.py`. Its unbound-reply control, an opener that skips the id
+comparison, returns 61. Measured on Apple Silicon (Amu Mac root of main `91faa123`), the
+other mutants give: length check dropped, an out-of-bounds read that traps; sequence
+left out of the id, 55; handshake hash left out of the id, 119.
+
+`open-request` lets the receiving side check a request it could not predict: it returns
+the body only if the envelope's id equals `request-id(hh, seq, body)` for that very body.
+The gate returns 255 with it; skipping that comparison gives 127.
+
+**Votes between processes.** `test/session_native.kotoba` (driver) and
+`scripts/check-session-native.py` (Linux arm64) carry the quorum's votes between separate
+processes. Each replica serves its vote as the session responder: it requires the
+coordinator's identity, opens the request at sequence 0, votes with `hata.replica/vote`
+and replies under the same id. The coordinator dials, requires the replica's identity and
+stores only the bound reply. The broker driver's `certificate` step then assembles the
+quorum certificate from those votes.
+
+**Commit and attest between processes.** After the certificate, the coordinator opens a
+second session to each replica and sends two requests in order: the commit at sequence 0
+(body: 4-byte big-endian request length, the request, the certificate), answered with
+`hata.replica/commit`'s result, then the attest at sequence 1 (body: the reader's nonce),
+answered with the attestation. The coordinator stores each bound attestation, and the
+broker driver's `fresh` step decides the fresh committed head from them.
+
+Measured 2026-10-30 in the podman machine (Linux arm64) with Amu's committed
+`aarch64-linux-static-root.elf` at `65359a09` (image `8ebb44c5`, also at `91faa123`, image
+`7814504c`). The compiler of the workflow's general Amu pin, `6a77cd91` (image `d5ef9cee`),
+builds a broker driver that traps (SIGILL) in `prepare`, so the CI step checks out
+`65359a09` for these sessions only:
+
+| exchange | result |
+|---|---|
+| replicas 0, 1, 2 vote over their own sessions | vote 1 each; the certificate assembles |
+| coordinator expects another replica's identity | the handshake is refused (replica -21, coordinator -31) |
+| request id made for sequence 1 | the replica refuses it (-23); no vote is written (coordinator -33) |
+| replicas 0, 1, 2 commit (sequence 0) and attest (sequence 1) over a second session | commit 2 and an attestation each; `fresh` decides the committed head (1) |
+| the commit replayed where the attest belongs (sequence 1) | the replica refuses it (-44); no attestation is written (coordinator -55) |
+
+**Unauthenticated peers.** `serve-guarded` is the vote listener for a port anyone can
+reach. Each handshake read has a 10 s deadline. A connection whose handshake fails is
+closed and costs one unit of the listener's connection budget. The listener gives up
+(-62) when the budget is spent, and the first authenticated coordinator gets the vote.
+Message 0 is read before any Noise state exists. Only a frame of exactly its XXhfs length
+(e 32 + e1 1184, empty payload: 1216 bytes) goes on to the handshake.
+
+That pre-check is needed because the static runtime reclaims no vectors within a process,
+and each handshake state costs X25519 work. Without it, three failed connections and a
+wrong-identity handshake exhausted the vector table (`KEXE_TRAP {:kind :arena :reason
+:vector-table-exhausted}`): the listener trapped and gave no vote. A `KEXE_VECTORS` /
+`KEXE_VECTOR_ITEMS` grant did not move that trap point on this image. With the pre-check,
+the same run measured (podman, Linux arm64, amu `65359a09`):
+
+| peer | result |
+|---|---|
+| connects and stays silent | closed at the deadline (10.0 s) |
+| sends a frame that is not message 0 | closed at once |
+| declares a frame and never completes it | closed at the deadline (10.0 s) |
+| completes message 0 but expects another replica's identity | refused (-31) |
+| then the authenticated coordinator | served; replica 3's answer 12 (it already committed this request) is bound to the request id |
+| three failures against a budget of 3 | the listener stops (-62) using 238 fuel; the coordinator's dial is refused, and no vote is written |
+
+A peer that sends a well-formed message 0 still costs the responder a full first message
+(KEM encapsulation and an ML-DSA-65 signature) before XX reveals who the initiator is.
+The connection budget is what bounds that cost.
+
+**Retry after a lost reply.** For the claim, replica 2 votes durably on its first
+connection and then closes it without replying, as if the reply were lost. The coordinator
+sees no reply and opens a fresh session: a new handshake hash, sequence 0 again. It asks
+again, at most three times. `replica/vote` returns the same durable vote for the same
+descriptor, so a retry can never produce a second, different vote. The harness requires
+the dropped vote, the delivered vote and the coordinator's stored vote to be byte-identical,
+and the certificate is assembled from that vote (podman, Linux arm64: the second attempt
+answered 1).
+
+**Backoff between retries.** Between attempts the retrying coordinator waits 100 ms ×
+2^(attempt−1) plus 0–99 ms of jitter, slept on the monotonic clock through wire 7 (`sleep <ms>`,
+JUN-360). The jitter is the clock reading's microsecond digits. It only has to keep two
+coordinators from retrying in lockstep, so it needs no secret randomness. The entropy wire (23)
+would be the natural source, but a call to it crashes the checker of Amu `65359a09` with SIGILL,
+even when `:entropy/draw` is declared. The coordinator records the planned and the measured
+wait. Without the clock grant the wire refuses (`KEXE_CAP {:wire 7 :refused :not-granted}`), so
+a retry never runs without its wait. Measured 2026-10-30 (podman, Linux arm64): the vote retry
+planned 169 ms and slept 172 ms; the execute retry planned 116 ms and slept 121 ms. A coordinator
+without the grant is refused at its first backoff, and its replica gives up waiting (-94).
+
+**Execute over a session.** The effect itself also travels over a session. The sink
+installs the certified fence. The coordinator then reserves a claim, and the claim's votes
+and commits are carried over sessions like the fence's. Finally the coordinator sends the
+claim to the sink as one execute request (kind 7). Its body holds the entry, certificate
+and command, each with a 4-byte length prefix, followed by the effect body.
+
+The sink takes all four only from the session; it has no files for them. It runs
+`hata.broker/execute` on exactly the bytes it received. That call re-verifies, right
+before dispatch:
+- the quorum certificate;
+- the C0 signatures and current policy;
+- the reservation;
+- the body commitment, through `payload-matches?` on the received body.
+
+Measured 2026-10-30 (podman, Linux arm64, amu `65359a09`):
+
+| execute request | sink's answer |
+|---|---|
+| a body other than the committed one (`hellp`) | 0; no object exists afterwards |
+| the committed body (`hello`), reply lost after the effect | the effect ran (1, the dropped reply); the coordinator's retry in a fresh session is answered 2 (already executed); the object exists once |
+| the same request again | 2; no second effect, and the object reads back |
+
+The keys in the driver are fixed public test values; a deployment takes ephemerals and
+KEM randomness from the host's entropy provider and identities from the roster. The CI
+arm64 lane runs it.
+
+Not yet: backpressure, per-peer (rather than per-listener) budgets, reclaiming a
+listener's memory between connections, and separate hosts.
+
 ## Verification and scope
 
 Run the exact source-locked gate on Linux x86_64 with the declared experimental

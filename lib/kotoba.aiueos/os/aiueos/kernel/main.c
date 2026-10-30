@@ -10,7 +10,7 @@
 #include "qwen35_infer.h"
 #include "qwen35_runtime.h"
 #include "device_result.h"
-
+#include "device_poll_scheduler.h"
 /* ---------------------------------------------------------------------------
    DEVCLIENT-PARITY.  The object against the bytes the C produced.
    ---------------------------------------------------------------------------
@@ -3792,6 +3792,22 @@ static void set_idt_gate(uint8_t vector, void (*handler)(void)) {
   }
 }
 
+/* JUN-35: the SIPI trampoline arms no IDT at all (IDTR stays base 0 from
+ * reset), so any exception on CPU 1 faults again during delivery and QEMU
+ * reports a triple fault instead of a status.  The BSP installs this same
+ * table at the "idt-v1" marker before the AP starts; the AP only needs the
+ * register pointed at it.  Call after aiueos_load_gdt(): the gates carry
+ * selector 0x08, which is only a present 64-bit code segment in the kernel's
+ * GDT (the trampoline's 0x08 is a 32-bit code segment, so a delivery through
+ * it would #GP instead). */
+void aiueos_ap_load_idt(void) {
+  const struct descriptor_pointer idtr = {
+    .limit = (uint16_t)(sizeof(idt) - 1),
+    .base = (uint64_t)(uintptr_t)idt
+  };
+  aiueos_load_idt(&idtr);
+}
+
 /* Set immediately before the deliberate end-of-boot ud2 probe. Any exception
    arriving before then is an unexpected fault and receives a best-effort
    durable crash receipt over the polled transport before termination. */
@@ -3898,11 +3914,17 @@ void aiueos_exception_dispatch(uint64_t vector, uint64_t error, uint64_t rip,
   fatal_puts(" cr2=");
   fatal_hex(cr2, 16);
   {
-    const uint64_t lo = (uint64_t)(uintptr_t)aiueos_text_start;
-    const uint64_t hi = (uint64_t)(uintptr_t)aiueos_text_end;
+    /* Kotoba object code lives in its own segment (kernel/linker.ld .kotoba_text,
+       JUN-556); a fuel or bounds ud2 there is reported against that segment. */
+    extern uint8_t aiueos_kotoba_text_start[], aiueos_kotoba_text_end[];
+    const uint64_t klo = (uint64_t)(uintptr_t)aiueos_kotoba_text_start;
+    const uint64_t khi = (uint64_t)(uintptr_t)aiueos_kotoba_text_end;
+    const int in_kotoba = rip >= klo && rip + 4 <= khi;
+    const uint64_t lo = in_kotoba ? klo : (uint64_t)(uintptr_t)aiueos_text_start;
+    const uint64_t hi = in_kotoba ? khi : (uint64_t)(uintptr_t)aiueos_text_end;
     if (rip >= lo && rip + 4 <= hi) {
       const uint8_t *at = (const uint8_t *)(uintptr_t)rip;
-      fatal_puts(" rip-text=");
+      fatal_puts(in_kotoba ? " rip-kotoba-text=" : " rip-text=");
       fatal_hex(rip - lo, 8);
       fatal_puts(" insn=");
       for (unsigned i = 0; i < 4; i++) fatal_hex_raw(at[i], 2);
@@ -4949,7 +4971,7 @@ qwen_runtime_boot_complete:
     aiueos_framebuffer_qualification_screen("AIUEOS K16", "TEST DIRECT HTTPS", "SSD READ ONLY", 0);
     int direct_https_ok = 0;
 #ifdef AIUEOS_PERSISTENT_BOOT
-    uint32_t worker_sequence = 1;
+    struct aiueos_poll_sched poll_sched; aiueos_poll_sched_init(&poll_sched, boot->tsc_hz, aiueos_read_tsc());
 #endif
 #ifdef AIUEOS_MURAKUMO_DEVICE_RESULT
     if (qwen_initial_ok) {
@@ -4966,7 +4988,7 @@ qwen_runtime_boot_complete:
       uint32_t bootstrap_bos = 0;
       int bootstrap_ready = 0, bootstrap_reboot = 0, bootstrap_restart = 0;
       direct_https_ok = aiueos_rtl8125_device_worker_poll(
-        boot, worker_sequence++, &bootstrap_job, &bootstrap_bos,
+        boot, aiueos_poll_sched_take_sequence(&poll_sched), &bootstrap_job, &bootstrap_bos,
         &bootstrap_ready, &bootstrap_control, &bootstrap_reboot,
         &bootstrap_restart);
       serial_string(direct_https_ok
@@ -5088,7 +5110,7 @@ qwen_runtime_boot_complete:
       aiueos_qwen35_status.detail = "POLLING MURAKUMO";
       (void)aiueos_framebuffer_inference_screen(&aiueos_qwen35_status);
       if (!aiueos_rtl8125_device_worker_poll(
-            boot, worker_sequence++, &job_id, &bos_token, &ready,
+            boot, aiueos_poll_sched_take_sequence(&poll_sched), &job_id, &bos_token, &ready,
             &control_id, &reboot_pxe, &restart_runtime)) {
         heartbeat_failures++;
         aiueos_qwen35_status.phase = AIUEOS_INFERENCE_ERROR;
@@ -5104,7 +5126,7 @@ qwen_runtime_boot_complete:
         serial_string(" response-timeout-s=");
         serial_decimal(aiueos_rtl8125_direct_response_timeout_seconds());
         serial_string(" action=reconnect\r\n");
-        aiueos_k16_management_wait(boot->tsc_hz, 5);
+        AIUEOS_POLL_SCHED_FAIL_WAIT(&poll_sched, boot->tsc_hz);
         continue;
       }
       if (heartbeat_failures) {
@@ -5124,7 +5146,7 @@ qwen_runtime_boot_complete:
       serial_string("AIUEOS_MURAKUMO_HEARTBEAT_OK ready=");
       serial_string(ready ? "true" : "false");
       serial_string(" sequence=");
-      serial_decimal(worker_sequence - 1);
+      serial_decimal(poll_sched.sequence);
       serial_string("\r\n");
       if ((reboot_pxe || restart_runtime) && control_id) {
         aiueos_qwen35_status.phase = AIUEOS_INFERENCE_ADMISSION;
@@ -5139,7 +5161,7 @@ qwen_runtime_boot_complete:
         uint32_t control_ack_failures = 0;
         while (control_ack_failures < 12 &&
                !aiueos_rtl8125_device_worker_control_ack(
-                 boot, worker_sequence++, control_id)) {
+                 boot, aiueos_poll_sched_take_sequence(&poll_sched), control_id)) {
           control_ack_failures++;
           serial_string("AIUEOS_MURAKUMO_CONTROL_ACK_RETRY command-id=");
           serial_decimal64(control_id);
@@ -5192,7 +5214,7 @@ qwen_runtime_boot_complete:
         (void)aiueos_framebuffer_inference_screen(&aiueos_qwen35_status);
         debug_string("AIUEOS_MURAKUMO_JOB_POLL_OK job=none ready=true\n");
         serial_string("AIUEOS_MURAKUMO_JOB_POLL_OK job=none ready=true\r\n");
-        aiueos_k16_management_wait(boot->tsc_hz, 30);
+        AIUEOS_POLL_SCHED_SUCCESS_WAIT(&poll_sched, boot->tsc_hz);
         continue;
       }
       serial_string("AIUEOS_MURAKUMO_JOB_CLAIMED job-id=");
@@ -5264,7 +5286,7 @@ qwen_runtime_boot_complete:
         aiueos_cycles_to_ns(job_result.decode_cycles, boot->tsc_hz);
       (void)aiueos_framebuffer_inference_screen(&aiueos_qwen35_status);
       while (!aiueos_rtl8125_device_worker_result(
-               boot, worker_sequence++, job_id, job_result.tokens[0],
+               boot, aiueos_poll_sched_take_sequence(&poll_sched), job_id, job_result.tokens[0],
                job_result.tokens[1], job_result.generated_tokens,
                job_result.decode_tokens, job_result.first_token_cycles,
                job_result.decode_cycles, job_result.total_cycles,

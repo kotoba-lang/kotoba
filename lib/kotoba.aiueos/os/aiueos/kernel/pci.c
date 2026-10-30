@@ -5,8 +5,8 @@
 #include "job_protocol.h"
 #include "device_result.h"
 #include "device_worker_protocol.h"
+#include "device_poll_scheduler.h"
 #include "kototama_runtime.h"
-
 #define VIRTIO_VENDOR_ID 0x1af4
 #define VIRTIO_RNG_MODERN_ID 0x1044
 #define VIRTIO_RNG_TRANSITIONAL_ID 0x1005
@@ -6588,12 +6588,25 @@ static int rtl8125_direct_device_request(uint32_t request_length,
   return 0;
 }
 
+/* What the last poll attempt came back as, for the scheduler's failure
+   classification (main.c reads this after aiueos_rtl8125_device_worker_poll
+   returns 0).  TRANSPORT until a response was actually read.  Classifying
+   the status line here is mechanism for the poll scheduler; what a response
+   MEANS for jobs stays in the kotoba poll-response object (ADR-0219). */
+static enum aiueos_poll_outcome rtl8125_direct_worker_poll_outcome =
+  AIUEOS_POLL_OUTCOME_TRANSPORT;
+
+enum aiueos_poll_outcome aiueos_rtl8125_device_worker_poll_outcome(void) {
+  return rtl8125_direct_worker_poll_outcome;
+}
+
 int aiueos_rtl8125_device_worker_poll(
     const struct aiueos_boot_info *boot, uint32_t sequence,
     uint64_t *job_id, uint32_t *bos_token, int *ready,
     uint64_t *control_id, int *reboot_pxe, int *restart_runtime) {
   if (!boot || !job_id || !bos_token || !ready ||
       !control_id || !reboot_pxe || !restart_runtime) return 0;
+  rtl8125_direct_worker_poll_outcome = AIUEOS_POLL_OUTCOME_TRANSPORT;
   struct aiueos_device_worker_request request = {
     .boot = boot,
     .mac = rtl8125_qualification_device.mac,
@@ -6613,9 +6626,19 @@ int aiueos_rtl8125_device_worker_poll(
   if (!aiueos_device_worker_poll_response(
         aiueos_tls13_app(), aiueos_tls13_app_len(), &poll)) {
     rtl8125_direct_https_error = 60;
+    /* The kotoba object refused the response.  A non-2xx is still readable
+       as a scheduling disposition (404 enroll / 409 sequence conflict); a
+       2xx the object refused is understood by nothing and retries as
+       HTTP_ERROR.  Replay ("replay":true on a 2xx) is a body field the
+       poll-response record does not extract yet. */
+    rtl8125_direct_worker_poll_outcome = aiueos_poll_sched_status_disposition(
+      aiueos_tls13_app(), (uint32_t)aiueos_tls13_app_len());
+    if (rtl8125_direct_worker_poll_outcome == AIUEOS_POLL_OUTCOME_OK)
+      rtl8125_direct_worker_poll_outcome = AIUEOS_POLL_OUTCOME_HTTP_ERROR;
     rtl8125_direct_worker_rx_report(sequence, 'P');
     return 0;
   }
+  rtl8125_direct_worker_poll_outcome = AIUEOS_POLL_OUTCOME_OK;
   rtl8125_direct_worker_rx_report(sequence, 'O');
   *job_id = poll.job_id;
   *control_id = poll.control_id;

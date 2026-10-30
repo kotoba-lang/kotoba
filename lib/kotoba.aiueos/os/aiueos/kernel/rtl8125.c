@@ -21,88 +21,38 @@
 _Static_assert(sizeof(struct aiueos_rtl8125_tx_desc)==32,"RTL8125 TX descriptor");
 _Static_assert(sizeof(struct aiueos_rtl8125_rx_desc)==32,"RTL8125 RX descriptor");
 
-static void bytes_zero(void *value, uint32_t bytes) {
-  uint8_t *p = value;
-  while (bytes--) *p++ = 0;
-}
-
-static uint16_t load_be16(const uint8_t *at) {
-  return (uint16_t)(((uint16_t)at[0] << 8) | at[1]);
-}
-
-static uint32_t load_be32(const uint8_t *at) {
-  return ((uint32_t)at[0] << 24) | ((uint32_t)at[1] << 16) |
-         ((uint32_t)at[2] << 8) | at[3];
-}
-
-static void store_be16(uint8_t *at, uint16_t value) {
-  at[0] = (uint8_t)(value >> 8); at[1] = (uint8_t)value;
-}
-
-static void store_be32(uint8_t *at, uint32_t value) {
-  at[0] = (uint8_t)(value >> 24); at[1] = (uint8_t)(value >> 16);
-  at[2] = (uint8_t)(value >> 8); at[3] = (uint8_t)value;
-}
-
-static int mac_equal(const uint8_t *left, const uint8_t *right) {
-  uint8_t difference = 0;
-  for (unsigned i = 0; i < 6; i++) difference |= left[i] ^ right[i];
-  return difference == 0;
-}
-
-static int mac_broadcast(const uint8_t *mac) {
-  uint8_t all = 0xff;
-  for (unsigned i = 0; i < 6; i++) all &= mac[i];
-  return all == 0xff;
-}
+/* The two peer-bound ARP helpers are kotoba/rtl8125-arp.kotoba (JUN-553): the frame checks and the 42-byte reply,
+   with each MAC's length passed as 6. These wrappers keep the C signatures pci.c's direct-link path calls. */
+extern int64_t kotoba_aiueos_rtl8125_arp_request(const uint8_t *, uint64_t, const uint8_t *, uint64_t,
+                                                 const uint8_t *, uint64_t, uint64_t, uint64_t);
+extern int64_t kotoba_aiueos_rtl8125_arp_reply(uint8_t *, uint64_t, const uint8_t *, uint64_t,
+                                               const uint8_t *, uint64_t, uint64_t, uint64_t);
 
 int aiueos_rtl8125_direct_arp_request(
     const uint8_t *frame, uint32_t frame_length,
     const uint8_t local_mac[6], const uint8_t peer_mac[6],
     uint32_t local_ip, uint32_t peer_ip) {
-  if (!frame || !local_mac || !peer_mac || frame_length < 42U ||
-      !local_ip || !peer_ip) return 0;
-  if ((!mac_broadcast(frame) && !mac_equal(frame, local_mac)) ||
-      !mac_equal(frame + 6, peer_mac) ||
-      load_be16(frame + 12) != 0x0806U ||
-      load_be16(frame + 14) != 1U ||
-      load_be16(frame + 16) != 0x0800U ||
-      frame[18] != 6U || frame[19] != 4U ||
-      load_be16(frame + 20) != 1U ||
-      !mac_equal(frame + 22, peer_mac) ||
-      load_be32(frame + 28) != peer_ip ||
-      load_be32(frame + 38) != local_ip) return 0;
-  return 1;
+  return kotoba_aiueos_rtl8125_arp_request(frame, frame_length, local_mac, 6,
+                                           peer_mac, 6, local_ip, peer_ip) == 1;
 }
 
 uint32_t aiueos_rtl8125_direct_arp_reply(
     uint8_t *frame, uint32_t capacity,
     const uint8_t local_mac[6], const uint8_t peer_mac[6],
     uint32_t local_ip, uint32_t peer_ip) {
-  if (!frame || capacity < 42U || !local_mac || !peer_mac ||
-      !local_ip || !peer_ip) return 0;
-  bytes_zero(frame, 42U);
-  for (unsigned i = 0; i < 6; i++) {
-    frame[i] = peer_mac[i]; frame[6 + i] = local_mac[i];
-    frame[22 + i] = local_mac[i]; frame[32 + i] = peer_mac[i];
-  }
-  store_be16(frame + 12, 0x0806U);
-  store_be16(frame + 14, 1U);
-  store_be16(frame + 16, 0x0800U);
-  frame[18] = 6U; frame[19] = 4U;
-  store_be16(frame + 20, 2U);
-  store_be32(frame + 28, local_ip);
-  store_be32(frame + 38, peer_ip);
-  return 42U;
+  return kotoba_aiueos_rtl8125_arp_reply(frame, capacity, local_mac, 6,
+                                         peer_mac, 6, local_ip, peer_ip) == 42 ? 42U : 0U;
 }
 
 #ifndef AIUEOS_RTL8125_ARP_ONLY
-/* Everything below this line calls a Kotoba object, and a Kotoba kernel object
-   is an `x86_64-aiueos-kernel-v1` ELF.  `scripts/smoke-rtl8125-handoff.sh`
-   builds this file with a HOST compiler to exercise the two ARP helpers above,
-   and on an arm64 host those objects cannot be linked at all -- so it defines
-   AIUEOS_RTL8125_ARP_ONLY and gets the pure-C half.  Nothing in the kernel
-   build defines it; the driver and its self-test are always present there. */
+/* Everything below this line is the driver. `scripts/smoke-rtl8125-handoff.sh` (scripts/rtl8125-arp-diff) builds this
+   file with AIUEOS_RTL8125_ARP_ONLY to link just the two ARP wrappers above into its QEMU image beside
+   kotoba/rtl8125-arp.o. Nothing in the kernel build defines it; the driver and its self-test are always present there. */
+
+static void bytes_zero(void *value, uint32_t bytes) {
+  uint8_t *p = value;
+  while (bytes--) *p++ = 0;
+}
 
 /* ==========================================================================
    THE DRIVER, WHICH IS NOW SEQUENCING (ADR-0140)

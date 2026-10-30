@@ -27,6 +27,7 @@ kernel_pci_object="$out/kernel-pci.o"
 kernel_rtl8125_object="$out/kernel-rtl8125.o"
 kernel_inference_status_object="$out/kernel-inference-status.o"
 kernel_device_result_object="$out/kernel-device-result.o"
+kernel_device_poll_scheduler_object="$out/kernel-device-poll-scheduler.o"
 kernel_device_worker_protocol_object="$out/kernel-device-worker-protocol.o"
 kernel_model_handoff_object="$out/kernel-model-handoff.o"
 # C-free wave 1 (ADR-0219): the decisions of inference_status.c,
@@ -50,8 +51,6 @@ kernel_qwen35_runtime_object="$out/kernel-qwen35-runtime.o"
 kernel_qwen35_quant_object="$out/kernel-qwen35-quant.o"
 kernel_qwen35_infer_object="$out/kernel-qwen35-infer.o"
 kernel_kototama_runtime_object="$out/kernel-kototama-runtime.o"
-kernel_job_protocol_object="$out/kernel-job-protocol.o"
-kernel_tls_aes_object="$out/kernel-tls-aes-gcm.o"
 kernel_tls13_object="$out/kernel-tls13.o"
 kernel_scheduler_object="$out/kernel-scheduler.o"
 kernel_syscall_object="$out/kernel-syscall.o"
@@ -261,7 +260,22 @@ if [ "${AIUEOS_MURAKUMO_DEVICE_RESULT:-0}" = 1 ] || [ "${AIUEOS_GUEST_BROWSER:-0
   ecdsa_public_link="$kotoba_ecdsa_public_object"
 fi
 if [ "${AIUEOS_MURAKUMO_DEVICE_RESULT:-0}" = 1 ]; then
-  device_result_link="$kernel_device_result_object $kernel_device_worker_protocol_object $kotoba_device_worker_poll_object"
+  # JUN-554: device_result.c's did:key text is kotoba/p256-did.o.
+  kotoba_p256_did_object=${AIUEOS_KOTOBA_P256_DID_OBJECT:-"$aiueos/kotoba/p256-did.o"}
+  python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_p256_did_object" \
+    2685660e7286bdbe0be206ba3a521d36a5345eb2b3d15024bdf9e7a21896fd75 kotoba_aiueos_p256_did
+  # JUN-554: aiueos_device_result_http_request's signed canonical text and JSON body are kotoba/device-result-text.o.
+  kotoba_device_result_text_object=${AIUEOS_KOTOBA_DEVICE_RESULT_TEXT_OBJECT:-"$aiueos/kotoba/device-result-text.o"}
+  python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_device_result_text_object" \
+    fb42023ba8bb0e42960151dcf8a0f8f3d161628c5b15c8597f6c7d6a76bf5b0b kotoba_aiueos_device_result_text
+  device_result_link="$kernel_device_result_object $kernel_device_worker_protocol_object $kotoba_device_worker_poll_object $kotoba_p256_did_object $kotoba_device_result_text_object"
+fi
+# JUN-35: the poll scheduler is referenced from main.c under
+# AIUEOS_PERSISTENT_BOOT (init/sequence/record) and from pci.c under
+# AIUEOS_MURAKUMO_DEVICE_RESULT (status disposition), so either flag links it.
+poll_sched_link=
+if [ "${AIUEOS_PERSISTENT_BOOT:-0}" = 1 ] || [ "${AIUEOS_MURAKUMO_DEVICE_RESULT:-0}" = 1 ]; then
+  poll_sched_link="$kernel_device_poll_scheduler_object"
 fi
 physical_qualification_cflags=
 physical_network_qualification_cflags=
@@ -512,7 +526,11 @@ if [ "${AIUEOS_PLC_RT_SMOKE:-0}" = 1 ]; then
   : "${AIUEOS_PLC_SIGNATURE:?AIUEOS_PLC_SIGNATURE is required for the RT smoke}"
   : "${AIUEOS_PLC_PUBLIC_KEY:?AIUEOS_PLC_PUBLIC_KEY is required for the RT smoke}"
   input_smoke_cflags="$input_smoke_cflags -DAIUEOS_PLC_RT_SMOKE=1"
-  plc_runtime_link="$kernel_plc_runtime_object $kernel_plc_embedded_object $kotoba_rt_dispatch_plan_object"
+  # JUN-554: plc_runtime.c's release / capability decisions are kotoba/plc-step.o.
+  kotoba_plc_step_object=${AIUEOS_KOTOBA_PLC_STEP_OBJECT:-"$aiueos/kotoba/plc-step.o"}
+  python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_plc_step_object" \
+    008e592e498754326017a87512e146bbda088f6f3568f0c38f71cd5fb0337fc1 kotoba_aiueos_plc_call_step,kotoba_aiueos_plc_release_step
+  plc_runtime_link="$kernel_plc_runtime_object $kernel_plc_embedded_object $kotoba_rt_dispatch_plan_object $kotoba_plc_step_object"
   kotoba_user_elf_valid_object="$aiueos/kotoba/plc-user-elf-valid.o"
   kotoba_user_elf_valid_sha=77c5e791da666e8355a7a877c37841cc63a3f228fbf785656522284a5259bbdd
 fi
@@ -633,7 +651,12 @@ if [ "${AIUEOS_QWEN38_MODEL_HANDOFF:-0}" = 1 ] ||
     if [ "${AIUEOS_MODEL_TEST_FIXTURE:-0}" = 1 ]; then
       model_handoff_cflags="$model_handoff_cflags -DAIUEOS_MODEL_TEST_FIXTURE=1"
     fi
-    model_handoff_link="$kernel_model_handoff_object $kotoba_model_mapping_plan_object $kotoba_model_handoff_validate_object $kernel_qwen35_runtime_object $kernel_qwen35_quant_object $kernel_qwen35_infer_object $kotoba_qwen35_header_object $kotoba_qwen35_kv_object $kotoba_qwen35_tensor_object"
+    # JUN-554: aiueos_qwen35_quant_row_bytes is kotoba/qwen35-row-bytes.o in this image (qwen35_quant.c keeps the C as the
+    # reference for every other build of it).
+    kotoba_qwen35_row_bytes_object=${AIUEOS_KOTOBA_QWEN35_ROW_BYTES_OBJECT:-"$aiueos/kotoba/qwen35-row-bytes.o"}
+    python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_qwen35_row_bytes_object" \
+      f7a3b74b53acef6cd46f4e0f82989557c0b51915bd37e4029f51df673f185618 kotoba_aiueos_qwen35_row_bytes
+    model_handoff_link="$kotoba_qwen35_row_bytes_object $kernel_model_handoff_object $kotoba_model_mapping_plan_object $kotoba_model_handoff_validate_object $kernel_qwen35_runtime_object $kernel_qwen35_quant_object $kernel_qwen35_infer_object $kotoba_qwen35_header_object $kotoba_qwen35_kv_object $kotoba_qwen35_tensor_object"
   fi
   if [ "${AIUEOS_MODEL_NVME_SLOTS:-0}" = 1 ]; then
     model_slots_cflags="-DAIUEOS_MODEL_NVME_SLOTS=1"
@@ -1068,7 +1091,7 @@ if [ -n "$model_handoff_link" ] || [ -n "$qwen35_parity_cflags" ]; then
   python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_qwen35_dequant_object" \
     2713ffbac10ad71dad46a899b782c2687820fc2896edab444806867ae62fd730 kotoba_aiueos_qwen35_dequant_row
   python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_qwen35_matvec_object" \
-    916b1b9009c67525b96610a4ede21e4bbe4117987cf9495d4ed0128e61b8a245 kotoba_aiueos_qwen35_matvec
+    0eabd3f84c2efcd3c763106599e43ed217d7f71f85450eeed7293df8c3db8677 kotoba_aiueos_qwen35_matvec
   # FIVE parity profiles, each linking only the objects its stages call. The
   # low region (`aiueos_low_end <= 0x1f4000`) cannot hold every object at once
   # since the tokenizer objects landed -- measured, not assumed, and measured
@@ -1272,6 +1295,12 @@ if [ "${AIUEOS_MURAKUMO_DEVICE_RESULT:-0}" = 1 ]; then
     aiueos_device_worker_poll_response kotoba_aiueos_device_worker_poll_response
   cp "$kotoba_dwp_object" "$kernel_device_worker_protocol_object"
 fi
+if [ -n "$poll_sched_link" ]; then
+  zig cc -target x86_64-freestanding-none -std=c11 -O2 \
+    -ffreestanding -fno-stack-protector -mno-red-zone \
+    -c -o "$kernel_device_poll_scheduler_object" \
+    "$aiueos/kernel/device_poll_scheduler.c"
+fi
 if [ -z "$model_handoff_link" ] && [ -n "$qwen35_parity_cflags" ]; then
   # The parity build compiles the reference C without the model handoff, so
   # the loader never asks for a model and the comparison still runs against
@@ -1354,12 +1383,74 @@ zig cc -target x86_64-freestanding-none -std=c11 -O2 \
   -ffreestanding -fno-stack-protector -mno-red-zone \
   $model_handoff_cflags \
   -c -o "$kernel_kototama_runtime_object" "$aiueos/kernel/kototama_runtime.c"
-zig cc -target x86_64-freestanding-none -std=c11 -O2 \
-  -ffreestanding -fno-stack-protector -mno-red-zone \
-  -c -o "$kernel_job_protocol_object" "$aiueos/kernel/job_protocol.c"
-zig cc -target x86_64-freestanding-none -std=c11 -O2 \
-  -ffreestanding -fno-stack-protector -mno-red-zone \
-  -c -o "$kernel_tls_aes_object" "$aiueos/kernel/tls_aes_gcm.c"
+# JUN-553: job_protocol is the Kotoba object kotoba/job-protocol.o (marshalling for kotoba/job-protocol-dispatch.o;
+# D5 records, D6 cells), not a C compile. kernel/job_protocol.c stays as the reference scripts/job-protocol-diff compares against.
+kotoba_job_protocol_glue_object=${AIUEOS_KOTOBA_JOB_PROTOCOL_GLUE_OBJECT:-"$aiueos/kotoba/job-protocol.o"}
+python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_job_protocol_glue_object" \
+  671f8d84bea2bd0c1e8f680b201b636c8624b5d76f129b419a8a21c1874b3b50 \
+  aiueos_job_request_parse,aiueos_job_result_payload,aiueos_job_commit_valid,aiueos_node_ping_parse,aiueos_node_pong_payload \
+  kotoba_aiueos_job_protocol
+# JUN-556: tls_aes_gcm is the Kotoba object kotoba/tls-aes-gcm.o (Amu object route: 8-parameter exports, ADR 0384, and
+# .bss / .high_bss arrays, ADR 0385), with its byte copy and fill in kotoba/bytes.o, not a C compile.
+# kernel/tls_aes_gcm.c stays as the reference scripts/tls-aes-gcm-diff compares against. Both are linked from kotoba/, so
+# their code lands in kernel/linker.ld's .kotoba_text segment with every other Kotoba object.
+kotoba_tls_aes_object=${AIUEOS_KOTOBA_TLS_AES_GCM_OBJECT:-"$aiueos/kotoba/tls-aes-gcm.o"}
+kotoba_bytes_object=${AIUEOS_KOTOBA_BYTES_OBJECT:-"$aiueos/kotoba/bytes.o"}
+python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_tls_aes_object" \
+  dfae9998bb6fccf72bb3747f74b9e69d4b2727a40d24c078b8e1cee9cb358399 \
+  aiueos_aes128_gcm_encrypt,aiueos_aes128_gcm_decrypt,aiueos_aes128_gcm_unwrap,aiueos_aes128_gcm_selftest \
+  kotoba_aiueos_aes128_gcm,kotoba_aiueos_aes128_gcm_selftest,kotoba_aiueos_bytes_copy,kotoba_aiueos_bytes_fill
+# JUN-553: tls13.c's HMAC-SHA256 and HKDF-Expand-Label are kotoba/tls13-keyschedule.o (its buffers are its own arrays,
+# amu ADR 0387; built at fuel 4194304 because the HMAC copies up to 12 KiB a byte per step).
+kotoba_tls13_keyschedule_object=${AIUEOS_KOTOBA_TLS13_KEYSCHEDULE_OBJECT:-"$aiueos/kotoba/tls13-keyschedule.o"}
+python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_tls13_keyschedule_object" \
+  0fb41bf15a05533aafdc25b76ab87e3148fd964306fd17a697a48fe060c6d526 \
+  kotoba_aiueos_tls13_hmac,kotoba_aiueos_tls13_hkdf_expand_label kotoba_aiueos_sha256
+# JUN-553: tls13.c's certificate parsers (find_p256_point, parse_ecdsa_der) are kotoba/tls13-cert.o (fuel 4194304: the scan
+# walks up to 12 KiB).
+kotoba_tls13_cert_object=${AIUEOS_KOTOBA_TLS13_CERT_OBJECT:-"$aiueos/kotoba/tls13-cert.o"}
+python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_tls13_cert_object" \
+  b756f603d6331cf96a9f7acbffaaa86777483f6985cd4a43630caeee600abb89 \
+  kotoba_aiueos_tls13_find_p256_point,kotoba_aiueos_tls13_parse_ecdsa_der
+# JUN-553: tls13.c's ClientHello record and ServerHello validation are kotoba/tls13-hello.o (fuel 4194304).
+kotoba_tls13_hello_object=${AIUEOS_KOTOBA_TLS13_HELLO_OBJECT:-"$aiueos/kotoba/tls13-hello.o"}
+python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_tls13_hello_object" \
+  de0e7b0332eec62d8a97148940c6e449fcee1e642d62a1ceb92ff9c2be514ff3 \
+  kotoba_aiueos_tls13_clienthello,kotoba_aiueos_tls13_serverhello_parse
+# JUN-553: tls13.c's Finished check and CertificateVerify parse-and-digest are kotoba/tls13-verify.o (fuel 4194304); it calls
+# the SHA-256, key-schedule and certificate objects through externs.
+kotoba_tls13_verify_object=${AIUEOS_KOTOBA_TLS13_VERIFY_OBJECT:-"$aiueos/kotoba/tls13-verify.o"}
+python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_tls13_verify_object" \
+  67d4a6d64190e7a4ab621cb38569f81a8cd96a0722728d0b6210699bd7ae206c \
+  kotoba_aiueos_tls13_finished_ok,kotoba_aiueos_tls13_certverify \
+  kotoba_aiueos_sha256,kotoba_aiueos_tls13_hmac,kotoba_aiueos_tls13_hkdf_expand_label,kotoba_aiueos_tls13_parse_ecdsa_der
+# JUN-553: tls13.c's handshake / application traffic keys and the client Finished MAC are kotoba/tls13-keys.o (fuel 4194304);
+# it calls the SHA-256 and key-schedule objects through externs.
+kotoba_tls13_keys_object=${AIUEOS_KOTOBA_TLS13_KEYS_OBJECT:-"$aiueos/kotoba/tls13-keys.o"}
+python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_tls13_keys_object" \
+  88970f767f0ee68787f50fccb43beb695c3e453bdc35360f39ae943ad9e97a10 \
+  kotoba_aiueos_tls13_hs_keys,kotoba_aiueos_tls13_ap_keys,kotoba_aiueos_tls13_finished_mac \
+  kotoba_aiueos_sha256,kotoba_aiueos_tls13_hmac,kotoba_aiueos_tls13_hkdf_expand_label
+# JUN-553: kernel/rtl8125.c's two peer-bound ARP helpers are kotoba/rtl8125-arp.o (fuel 4194304) behind C wrappers.
+kotoba_rtl8125_arp_object=${AIUEOS_KOTOBA_RTL8125_ARP_OBJECT:-"$aiueos/kotoba/rtl8125-arp.o"}
+python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_rtl8125_arp_object" \
+  cb9e7c6c79589fbda96512cdd0c0b6e8457f1e9608e4b955a1f02130a9708b4c \
+  kotoba_aiueos_rtl8125_arp_request,kotoba_aiueos_rtl8125_arp_reply
+# JUN-553: the decisions of tls13.c's handshake state machine (next message, record route, inner type) are
+# kotoba/tls13-hs.o (fuel 4194304); tls13.c keeps the state and performs each step.
+kotoba_tls13_hs_object=${AIUEOS_KOTOBA_TLS13_HS_OBJECT:-"$aiueos/kotoba/tls13-hs.o"}
+python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_tls13_hs_object" \
+  dc3ab407f374976fa80db11b70c5bab09881c4f6aa196b34c2f6b6647a3a1d1b \
+  kotoba_aiueos_tls13_hs_step,kotoba_aiueos_tls13_record_step,kotoba_aiueos_tls13_inner_step
+# JUN-554: kernel/kototama_runtime.c's SSH management protocol (the three commands and their replies) is
+# kotoba/kototama-management.o (fuel 4194304); the C keeps the runtime state and the restart / reboot-pxe side effects.
+kotoba_kototama_management_object=${AIUEOS_KOTOBA_KOTOTAMA_MANAGEMENT_OBJECT:-"$aiueos/kotoba/kototama-management.o"}
+python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_kototama_management_object" \
+  c44ffea8731894914117d399a2ed0a8b603542586d450899a0d2891e3e747152 \
+  kotoba_aiueos_kototama_command,kotoba_aiueos_kototama_reply
+python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_bytes_object" \
+  567551de001399c4706927cbffd474b53c15ea35e908945e51fd2176feca6c58 \
+  kotoba_aiueos_bytes_copy,kotoba_aiueos_bytes_fill
 zig cc -target x86_64-freestanding-none -std=c11 -O2 \
   -ffreestanding -fno-stack-protector -mno-red-zone \
   -c -o "$kernel_tls13_object" "$aiueos/kernel/tls13.c"
@@ -1463,9 +1554,9 @@ zig ld.lld -nostdlib -static --strip-all $qualification_gc_link -z max-page-size
   "$kernel_acpi_object" "$kernel_vtd_object" "$kernel_apic_object" "$kernel_memory_object" \
   "$kernel_pci_object" "$kernel_rtl8125_object" \
   "$kernel_inference_status_object" \
-  $device_result_link $model_handoff_link "$kernel_kototama_runtime_object" \
-  "$kernel_job_protocol_object" \
-  "$kernel_tls_aes_object" "$kernel_tls13_object" \
+  $device_result_link $poll_sched_link $model_handoff_link "$kernel_kototama_runtime_object" "$kotoba_kototama_management_object" \
+  "$kotoba_job_protocol_glue_object" \
+  "$kotoba_tls_aes_object" "$kotoba_bytes_object" "$kotoba_tls13_keyschedule_object" "$kotoba_tls13_cert_object" "$kotoba_tls13_hello_object" "$kotoba_tls13_verify_object" "$kotoba_tls13_keys_object" "$kotoba_tls13_hs_object" "$kernel_tls13_object" \
   "$kernel_scheduler_object" "$kernel_syscall_object" \
   "$kernel_process_object" "$kernel_loader_object" \
   "$kernel_smp_object" "$kernel_trampoline_object" \
@@ -1480,7 +1571,7 @@ zig ld.lld -nostdlib -static --strip-all $qualification_gc_link -z max-page-size
   "$kotoba_pci_config_read_object" "$kotoba_pci_config_write_object" \
   "$kotoba_rtl8125_identify_object" "$kotoba_rtl8125_link_up_object" \
   "$kotoba_rtl8125_ring_build_object" "$kotoba_rtl8125_program_object" \
-  "$kotoba_rtl8125_tx_submit_object" "$kotoba_rtl8125_rx_poll_object" \
+  "$kotoba_rtl8125_tx_submit_object" "$kotoba_rtl8125_rx_poll_object" "$kotoba_rtl8125_arp_object" \
   "$kotoba_x25519_object"   "$kotoba_ecdsa_object" $ecdsa_sign_link $ecdsa_public_link "$kotoba_ime_object" \
   "$kotoba_aes128_gcm_object" "$kotoba_tls13_record_object" \
   $qwen35_kotoba_link $qwen35_parity_link \

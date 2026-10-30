@@ -1,0 +1,339 @@
+;; hata.session-native-test -- broker votes over authenticated sessions between processes
+;; (AWAI-102): Noise XXhfs + ML-KEM-768 with Ed25519 + ML-DSA-65 identities (lib/kotoba.noise,
+;; ADR-0001) over the native TCP wires, each exchange in one hata.wire envelope.
+;;   serve-vote BASE ADDR INDEX : replica INDEX listens on ADDR, completes the handshake as
+;;       responder (the coordinator's identity must be the expected one), opens the request
+;;       with open-request at sequence 0, votes (hata.replica/vote) and returns the vote in
+;;       a response bound to the request id
+;;   ask-vote BASE ADDR INDEX   : the coordinator dials ADDR, completes the handshake as
+;;       initiator (replica INDEX's identity must be the expected one), sends BASE/request
+;;       and writes the bound response to BASE/vote<INDEX>
+;;   ask-wrong ... / ask-replay ... : controls -- expect another replica's identity, or send
+;;       a request whose id was made for sequence 1
+;;   serve-commit-attest BASE ADDR INDEX / ask-commit-attest BASE ADDR INDEX : a second
+;;       session per replica carrying two exchanges in order: at sequence 0 the commit
+;;       (body: 4-byte request length, request, certificate) answered with
+;;       hata.replica/commit's result, at sequence 1 the attest (body: the reader's nonce)
+;;       answered with the attestation, which the coordinator writes to BASE/att<INDEX>.
+;;       The replica accepts only the next sequence number.
+;;   ask-commit-replay ... : control -- after the commit, sends the same commit again where
+;;       the attest belongs (sequence 1)
+;;   serve-drop-then-vote BASE ADDR INDEX / ask-vote-retry BASE ADDR INDEX : the first reply
+;;       is lost after the vote is durable; the coordinator retries in a fresh session and
+;;       gets the same vote
+;;   serve-execute BASE ADDR / ask-execute BASE ADDR : the coordinator sends a certified,
+;;       reserved claim's entry, certificate and command with the effect body to the sink
+;;       (role 5), which runs hata.broker/execute on exactly the bytes it received
+;;   ask-execute-tampered ... : control -- a body other than the one the C0 request commits to
+;;   serve-execute-drop BASE ADDR / ask-execute-retry BASE ADDR : the effect runs and its
+;;       reply is lost; the coordinator retries in a fresh session and is told it already
+;;       ran (2), with no second effect
+;;   serve-guarded BASE ADDR INDEX BUDGET : serve-vote for a listener facing unauthenticated
+;;       peers -- a 10 s deadline on each handshake read, failed handshakes closed, at most
+;;       BUDGET (2-5) connections before it gives up (-62)
+;; Exit (main's result): 1 when the vote was cast / received; negative names the refusal.
+;; Every key and seed here (X25519 static and ephemeral, KEM randomness, identity seeds) is a
+;; fixed public test value, never an operational key. A deployment takes ephemerals and KEM
+;; randomness from the host's entropy provider and identities from the roster.
+(ns hata.session-native-test
+  (:export [main]) (:capabilities [:cli/args :clock/now])
+  (:require [hata.codec :as c] [hata.replica :as replica] [hata.store-io :as io] [hata.quorum-fixture :as qf]
+            [hata.wire :as w] [noise.native :as n] [noise.identity :as id] [noise.tcp :as t]
+            [hata.broker :as broker] [hata.broker-fixture :as bf] [hata.authority-fixture :as f]))
+
+(defn- path [base :string name :string] :string (string-concat base (string-concat "/" name)))
+(defn- read [base :string name :string] :vector-i64
+  (if (io/exists? (path base name)) (c/unhex (io/read (path base name))) (vector-i64)))
+(defn- write [base :string name :string value :vector-i64] :bool (io/write (path base name) (c/hex value)))
+(defn- pat [n :i64 k :i64] :vector-i64
+  (loop [i 0 out (vector-alloc n)] (if (= i n) out (recur (+ i 1) (vector-assoc! out i (rem (+ (* 11 i) (* 37 k) 1) 256))))))
+;; role 0..3 = replicas, 9 = coordinator
+(defn- x-static [role :i64] :vector-i64 (pat 32 (+ 100 role)))
+(defn- x-eph [role :i64] :vector-i64 (pat 32 (+ 120 role)))
+(defn- ed-seed [role :i64] :vector-i64 (pat 32 (+ 140 role)))
+(defn- dsa-xi [role :i64] :vector-i64 (pat 32 (+ 160 role)))
+(defn- want [role :i64] :vector-i64 (id/identity (ed-seed role) (dsa-xi role)))
+(defn- prologue [] :vector-i64 (vector-i64 104 97 116 97 46 98 114 111 107 101 114 46 115 101 115 115 105 111 110 46 118 49))
+(defn- cat [p :vector-i64 q :vector-i64] :vector-i64
+  (let [np (vector-count p) out (vector-alloc (+ np (vector-count q)))]
+    (loop [i 0] (if (= i (vector-count out)) out
+      (let [z (vector-assoc! out i (if (< i np) (vector-at p i) (vector-at q (- i np))))] (recur (+ i 1)))))))
+(defn- g-slice [v :vector-i64 start :i64 n :i64] :vector-i64
+  (loop [i 0 out (vector-alloc n)] (if (= i n) out (recur (+ i 1) (vector-assoc! out i (vector-at v (+ start i)))))))
+(defn- hd [o :vector-i64] :vector-i64 (if (< (vector-count o) (n/state-size)) (vector-i64) (g-slice o 0 (n/state-size))))
+(defn- tl [o :vector-i64] :vector-i64
+  (if (< (vector-count o) (n/state-size)) (vector-i64 -1) (g-slice o (n/state-size) (- (vector-count o) (n/state-size)))))
+(defn- bad? [v :vector-i64] :bool (or (= (vector-count v) 0) (and (= (vector-count v) 1) (= (vector-at v 0) -1))))
+
+;; hata's files hold 64-bit words; an envelope carries bytes: 8 little-endian bytes a word,
+;; the same layout hata.codec hex uses
+(defn- words-bytes [ws :vector-i64] :vector-i64
+  (loop [i 0 out (vector-alloc (* 8 (vector-count ws)))]
+    (if (= i (vector-count out)) out
+      (recur (+ i 1) (vector-assoc! out i (bit-and (u64-shift-right (vector-at ws (quot i 8)) (* 8 (rem i 8))) 255))))))
+(defn- bytes-words [b :vector-i64] :vector-i64
+  (if (not (= (rem (vector-count b) 8) 0)) (vector-i64)
+    (loop [i 0 out (vector-alloc (quot (vector-count b) 8))]
+      (if (= i (vector-count out)) out
+        (recur (+ i 1) (vector-assoc! out i (loop [j 0 x 0] (if (= j 8) x
+                         (recur (+ j 1) (bit-or x (i64-shift-left (vector-at b (+ (* 8 i) j)) (* j 8))))))))))))
+(defn- vote-name [index :i64] :string (cond (= index 1) "vote1" (= index 2) "vote2" (= index 3) "vote3" :else "vote0"))
+
+;; the wires answer a refused dial or an expired accept with a word, not a handle
+(defn- no-handle? [h :string] :bool (or (= h "") (= h "timeout") (= h "refused") (= h "closed")))
+(defn- initiate [h :string me :i64 peer :i64] :vector-i64
+  ;; the XXhfs handshake as initiator; the established state, or empty
+  (let [i0 (n/set-kem (n/initialize 3 true (x-static me) (x-eph me) (vector-i64) (prologue)) (pat 64 (+ 180 me)) (vector-i64))
+        o0 (n/write-message i0 (vector-i64))]
+    (if (or (no-handle? h) (bad? o0) (< (t/send-frame h (tl o0)) 0)) (vector-i64)
+      (let [f1 (t/recv-frame h 20000) u1 (n/read-tokens (hd o0) f1)]
+        (if (bad? u1) (vector-i64)
+          (let [h1 (n/handshake-hash-now (hd u1)) v1 (n/read-payload (hd u1) (tl u1))]
+            (if (or (bad? v1) (not (id/verify-payload (tl v1) h1 (want peer)))) (vector-i64)
+              (let [t2 (n/write-tokens (hd v1))
+                    o2 (n/write-payload (hd t2) (tl t2) (id/payload (ed-seed me) (dsa-xi me) (n/handshake-hash-now (hd t2))))]
+                (if (or (bad? o2) (< (t/send-frame h (tl o2)) 0)) (vector-i64) (hd o2))))))))))
+
+(defn- respond-from [h :string me :i64 peer :i64 ms :i64 f0 :vector-i64] :vector-i64
+  ;; the XXhfs handshake as responder from message 0 already read (F0), each further read
+  ;; bounded by MS; the established state, or empty
+  (let [r0 (n/set-kem (n/initialize 3 false (x-static me) (x-eph me) (vector-i64) (prologue)) (vector-i64) (pat 32 (+ 200 me)))
+        q0 (n/read-message r0 f0)]
+    (if (bad? q0) (vector-i64)
+      (let [t1 (n/write-tokens (hd q0))
+            o1 (n/write-payload (hd t1) (tl t1) (id/payload (ed-seed me) (dsa-xi me) (n/handshake-hash-now (hd t1))))]
+        (if (or (bad? o1) (< (t/send-frame h (tl o1)) 0)) (vector-i64)
+          (let [u2 (n/read-tokens (hd o1) (t/recv-frame h ms))]
+            (if (bad? u2) (vector-i64)
+              (let [h2 (n/handshake-hash-now (hd u2)) v2 (n/read-payload (hd u2) (tl u2))]
+                (if (or (bad? v2) (not (id/verify-payload (tl v2) h2 (want peer)))) (vector-i64) (hd v2))))))))))
+(defn- respond [h :string me :i64 peer :i64] :vector-i64 (respond-from h me peer 20000 (t/recv-frame h 20000)))
+
+(defn- vote-on [base :string s :string st :vector-i64 index :i64] :i64
+  ;; one vote exchange over the established session ST on connection S
+  (let [d (n/transport-decrypt st (t/recv-frame s 20000))]
+        (if (bad? d) -22
+          (let [request (w/open-request (tl d) 1 (n/handshake-hash st) 0)]
+            (if (bad? request) -23
+              (let [vote (replica/vote base (qf/config) (c/append (vector-i64 index) (qf/seed index)) (bytes-words request))
+                    e (n/transport-encrypt (hd d) (w/seal 2 (w/request-id (n/handshake-hash st) 0 request) (words-bytes vote)))]
+                (if (or (= (vector-count vote) 0) (bad? e) (< (t/send-frame s (tl e)) 0)) -24
+                  (if (write base "response" vote) (vector-at vote 0) -25))))))))
+
+(defn- serve-vote [base :string addr :string index :i64] :i64
+  (let [l (t/listen addr) s (t/accept l 20000) st (respond s index 9)]
+    (if (= (vector-count st) 0) -21 (vote-on base s st index))))
+
+;; Unauthenticated peers: the listener gives each connection 10 s per handshake read and
+;; at most BUDGET connections in all. A connection whose handshake fails (silent, not a
+;; Noise message, a frame never completed, the wrong identity) is closed and costs one
+;; unit; the first authenticated coordinator gets the vote. -62: the budget ran out.
+;; Message 0 is read before any handshake state exists, and only a frame of exactly its
+;; XXhfs length (e 32 + e1 1184, empty payload) goes on: this runtime reclaims nothing
+;; within a process, and each state costs X25519 work the image can do only a few times.
+(defn- xxhfs-message-0-bytes [] :i64 1216)
+(defn- serve-guarded [base :string addr :string index :i64 budget :i64] :i64
+  (let [l (t/listen addr)]
+    (loop [spent 0]
+      (if (>= spent budget) -62
+        (let [s (t/accept l 20000)]
+          (if (no-handle? s) -61
+            (let [f0 (t/recv-frame s 10000)
+                  st (if (= (vector-count f0) (xxhfs-message-0-bytes)) (respond-from s index 9 10000 f0) (vector-i64))]
+              (if (= (vector-count st) 0)
+                (let [z (t/close s)] (recur (+ spent 1)))
+                (vote-on base s st index)))))))))
+
+(defn- ask [base :string addr :string index :i64 expect :i64 seq :i64] :i64
+  (let [c (t/dial addr 20000) st (initiate c 9 expect) request (words-bytes (read base "request"))]
+    (if (= (vector-count st) 0) -31
+      (let [rid (w/request-id (n/handshake-hash st) seq request)
+            e (n/transport-encrypt st (w/seal 1 rid request))]
+        (if (or (bad? e) (< (t/send-frame c (tl e)) 0)) -32
+          (let [d (n/transport-decrypt (hd e) (t/recv-frame c 20000))]
+            (if (bad? d) -33
+              (let [vote (w/open (tl d) 2 rid)]
+                (if (bad? vote) -34
+                  (let [ws (bytes-words vote)]
+                    (if (and (> (vector-count ws) 0) (write base (vote-name index) ws)) (vector-at ws 0) -35)))))))))))
+
+;; --- retry: the reply is lost after the vote is durable ------------------------------
+;; The replica votes (durably) on its first connection and closes it without replying, as
+;; if the reply were lost; it serves its second connection normally. The coordinator, on a
+;; missing reply, opens a fresh session (new handshake hash, sequence 0) and asks again, at
+;; most three times. replica/vote gives the same durable vote again, never another one.
+(defn- serve-drop-then-vote [base :string addr :string index :i64] :i64
+  (let [l (t/listen addr) s1 (t/accept l 20000) st1 (respond s1 index 9)]
+    (if (= (vector-count st1) 0) -91
+      (let [d (n/transport-decrypt st1 (t/recv-frame s1 20000))
+            request (if (bad? d) (vector-i64 -1) (w/open-request (tl d) 1 (n/handshake-hash st1) 0))
+            vote (if (bad? request) (vector-i64)
+                   (replica/vote base (qf/config) (c/append (vector-i64 index) (qf/seed index)) (bytes-words request)))]
+        (if (or (= (vector-count vote) 0) (not (write base "response-dropped" vote))) -92
+          (let [z (t/close s1) s2 (t/accept l 20000)]
+            (if (no-handle? s2) -94
+              (let [st2 (respond s2 index 9)] (if (= (vector-count st2) 0) -93 (vote-on base s2 st2 index))))))))))
+
+;; Between attempts the coordinator backs off: 100 ms * 2^(attempt-1) plus 0..99 ms of jitter,
+;; slept on the monotonic clock (wire 7, `sleep <ms>`). The jitter is the reading's microsecond
+;; digits: it only has to keep two coordinators from retrying in lockstep, so it needs no secret
+;; randomness. (The entropy wire, 23, would be the natural source, but a call to it crashes the
+;; checker of Amu 65359a0 with SIGILL.) It writes BASE/backoff = [planned ms, measured ms] and
+;; returns the measured ms. Without the clock grant the wire traps: there is no wait-free retry.
+(defn- decimal-of [s :string] :i64
+  (if (or (= (string-length s) 0) (> (string-length s) 19)) -1
+    (loop [i 0 n 0]
+      (if (= i (string-length s)) n
+        (let [c (string-code-point-at s i)] (if (or (< c 48) (> c 57)) -1 (recur (+ i 1) (+ (* n 10) (- c 48)))))))))
+(defn- backoff [base :string attempt :i64] :i64
+  (let [t0 (decimal-of (typed-cap-call :clock/now :string :string "monotonic"))
+        ms (+ (* 100 (i64-shift-left 1 (- attempt 1))) (rem (quot t0 1000) 100))
+        t1 (decimal-of (typed-cap-call :clock/now :string :string (string-concat "sleep " (string-from-i64 ms))))
+        slept (quot (- t1 t0) 1000000)]
+    (if (and (>= t0 0) (>= t1 t0) (write base "backoff" (vector-i64 ms slept))) slept -1)))
+
+(defn- ask-retry [base :string addr :string index :i64] :i64
+  (loop [attempt 1]
+    (let [r (ask base addr index index 0)]
+      (if (and (= r -33) (< attempt 3))
+        (if (< (backoff base attempt) 0) -36 (recur (+ attempt 1)))
+        r))))
+
+;; --- commit and attest in one session ----------------------------------------------
+(defn- be4 [n :i64] :vector-i64 (vector-i64 (bit-and (i64-shift-right n 24) 255) (bit-and (i64-shift-right n 16) 255)
+                                            (bit-and (i64-shift-right n 8) 255) (bit-and n 255)))
+(defn- nonce [] :vector-i64 (vector-i64 31 32 33 34))
+(defn- att-name [index :i64] :string (cond (= index 1) "att1" (= index 2) "att2" (= index 3) "att3" :else "att0"))
+
+(defn- serve-commit-attest [base :string addr :string index :i64] :i64
+  (let [l (t/listen addr) s (t/accept l 20000) st (respond s index 9)
+        identity (c/append (vector-i64 index) (qf/seed index))]
+    (if (= (vector-count st) 0) -41
+      (let [hh (n/handshake-hash st) d0 (n/transport-decrypt st (t/recv-frame s 20000))
+            b0 (if (bad? d0) (vector-i64 -1) (w/open-request (tl d0) 3 hh 0))]
+        (if (or (bad? d0) (bad? b0) (< (vector-count b0) 4)) -42
+          (let [n0 (+ (* 16777216 (vector-at b0 0)) (* 65536 (vector-at b0 1)) (* 256 (vector-at b0 2)) (vector-at b0 3))
+                request (bytes-words (g-slice b0 4 n0))
+                cert (bytes-words (g-slice b0 (+ 4 n0) (- (vector-count b0) (+ 4 n0))))
+                done (replica/commit base (qf/config) identity request cert)
+                e0 (n/transport-encrypt (hd d0) (w/seal 4 (w/request-id hh 0 b0) (words-bytes done)))]
+            (if (or (= (vector-count done) 0) (bad? e0) (< (t/send-frame s (tl e0)) 0)) -43
+              (let [d1 (n/transport-decrypt (hd e0) (t/recv-frame s 20000))
+                    b1 (if (bad? d1) (vector-i64 -1) (w/open-request (tl d1) 5 hh 1))]
+                (if (or (bad? d1) (bad? b1)) -44
+                  (let [att (replica/attest base (qf/config) identity (bytes-words b1))
+                        e1 (n/transport-encrypt (hd d1) (w/seal 6 (w/request-id hh 1 b1) (words-bytes att)))]
+                    (if (or (= (vector-count att) 0) (bad? e1) (< (t/send-frame s (tl e1)) 0)) -45 1)))))))))))
+
+(defn- ask-commit-attest [base :string addr :string index :i64 replay :bool] :i64
+  (let [c (t/dial addr 20000) st (initiate c 9 index)
+        request (words-bytes (read base "request")) cert (words-bytes (read base "certificate"))]
+    (if (= (vector-count st) 0) -51
+      (let [hh (n/handshake-hash st)
+            b0 (cat (cat (be4 (vector-count request)) request) cert)
+            id0 (w/request-id hh 0 b0)
+            e0 (n/transport-encrypt st (w/seal 3 id0 b0))]
+        (if (or (bad? e0) (< (t/send-frame c (tl e0)) 0)) -52
+          (let [d0 (n/transport-decrypt (hd e0) (t/recv-frame c 20000))
+                r0 (if (bad? d0) (vector-i64 -1) (w/open (tl d0) 4 id0))]
+            (if (or (bad? d0) (bad? r0) (not (= (vector-at (bytes-words r0) 0) 2))) -53
+              (let [b1 (if replay b0 (words-bytes (nonce)))
+                    id1 (if replay id0 (w/request-id hh 1 b1))
+                    e1 (n/transport-encrypt (hd d0) (w/seal (if replay 3 5) id1 b1))]
+                (if (or (bad? e1) (< (t/send-frame c (tl e1)) 0)) -54
+                  (let [d1 (n/transport-decrypt (hd e1) (t/recv-frame c 20000))
+                        r1 (if (bad? d1) (vector-i64 -1) (w/open (tl d1) 6 id1))]
+                    (if (or (bad? d1) (bad? r1)) -55
+                      (if (write base (att-name index) (bytes-words r1)) 1 -56))))))))))))
+
+;; --- execute: the effect broker re-checks what it actually received ------------------
+;; The sink (role 5) takes the entry, certificate, command and body only from the session:
+;; body = for each of entry, certificate, command a 4-byte length and its bytes, then the
+;; effect body. broker/execute re-verifies the certificate, the C0 signatures and the body
+;; commitment on exactly those bytes before it dispatches.
+(defn- rd4 [b :vector-i64 off :i64] :i64
+  (+ (* 16777216 (vector-at b off)) (* 65536 (vector-at b (+ off 1))) (* 256 (vector-at b (+ off 2))) (vector-at b (+ off 3))))
+(defn- part [b :vector-i64 off :i64] :vector-i64
+  ;; the length-prefixed part at OFF, or [-1] when it does not fit
+  (if (> (+ off 4) (vector-count b)) (vector-i64 -1)
+    (let [n (rd4 b off)] (if (> (+ (+ off 4) n) (vector-count b)) (vector-i64 -1) (g-slice b (+ off 4) n)))))
+(defn- hello [] :vector-i64 (vector-i64 104 101 108 108 111))
+(defn- prefixed [ws :vector-i64] :vector-i64 (let [b (words-bytes ws)] (cat (be4 (vector-count b)) b)))
+
+(defn- execute-on [base :string s :string st :vector-i64 drop :bool] :i64
+  ;; one execute exchange over the established session ST on connection S; with DROP the
+  ;; effect runs and the reply is lost (the connection closes without it)
+  (if (= (vector-count st) 0) -71
+      (let [hh (n/handshake-hash st) d (n/transport-decrypt st (t/recv-frame s 20000))
+            b (if (bad? d) (vector-i64 -1) (w/open-request (tl d) 7 hh 0))
+            entry (if (bad? b) (vector-i64 -1) (part b 0))
+            o2 (+ 4 (vector-count entry)) cert (if (bad? entry) (vector-i64 -1) (part b o2))
+            o3 (+ (+ o2 4) (vector-count cert)) cmd (if (bad? cert) (vector-i64 -1) (part b o3))
+            o4 (+ (+ o3 4) (vector-count cmd))]
+        (if (or (bad? d) (bad? b) (bad? entry) (bad? cert) (bad? cmd)) -72
+          (let [call {"entry" (bytes-words entry) "certificate" (bytes-words cert) "command" (bytes-words cmd)
+                      "body" (g-slice b o4 (- (vector-count b) o4))}
+                done (broker/execute base {"policy" (bf/policy 7) "quorum" (qf/config)} (f/checkpoint-seed)
+                                     call (bf/facts ""))
+                e (n/transport-encrypt (hd d) (w/seal 8 (w/request-id hh 0 b) (words-bytes done)))]
+            (if drop
+              (if (and (> (vector-count done) 0) (write base "response-dropped" done)) (let [z (t/close s)] (vector-at done 0)) -75)
+              (if (or (= (vector-count done) 0) (bad? e) (< (t/send-frame s (tl e)) 0)) -73
+                (if (write base "response" done) (vector-at done 0) -74))))))))
+
+(defn- serve-execute [base :string addr :string] :i64
+  (let [l (t/listen addr) s (t/accept l 20000)] (execute-on base s (respond s 5 9) false)))
+
+;; the effect runs on the first connection and its reply is lost; the second connection,
+;; the coordinator's retry in a fresh session, is served normally
+(defn- serve-execute-drop [base :string addr :string] :i64
+  (let [l (t/listen addr) s1 (t/accept l 20000) first (execute-on base s1 (respond s1 5 9) true)]
+    (if (< first 0) first
+      (let [s2 (t/accept l 20000)] (if (no-handle? s2) -76 (execute-on base s2 (respond s2 5 9) false))))))
+
+(defn- ask-execute [base :string addr :string tampered :bool] :i64
+  (let [c (t/dial addr 20000) st (initiate c 9 5)]
+    (if (= (vector-count st) 0) -81
+      (let [hh (n/handshake-hash st)
+            effect (if tampered (vector-i64 104 101 108 108 112) (hello))
+            b (cat (cat (cat (prefixed (read base "request")) (prefixed (read base "certificate")))
+                        (prefixed (read base "command"))) effect)
+            id0 (w/request-id hh 0 b)
+            e (n/transport-encrypt st (w/seal 7 id0 b))]
+        (if (or (bad? e) (< (t/send-frame c (tl e)) 0)) -82
+          (let [d (n/transport-decrypt (hd e) (t/recv-frame c 20000))
+                r (if (bad? d) (vector-i64 -1) (w/open (tl d) 8 id0))]
+            (if (or (bad? d) (bad? r)) -83
+              (let [ws (bytes-words r)]
+                (if (and (> (vector-count ws) 0) (write base "execute-response" ws)) (vector-at ws 0) -84)))))))))
+
+(defn- ask-execute-retry [base :string addr :string] :i64
+  (loop [attempt 1]
+    (let [r (ask-execute base addr false)]
+      (if (and (= r -83) (< attempt 3))
+        (if (< (backoff base attempt) 0) -86 (recur (+ attempt 1)))
+        r))))
+
+(defn main [] :i64
+  (let [mode (typed-cap-call :cli/args :string :string "0")
+        base (typed-cap-call :cli/args :string :string "1")
+        addr (typed-cap-call :cli/args :string :string "2")
+        option (typed-cap-call :cli/args :string :string "3")
+        index (cond (= option "1") 1 (= option "2") 2 (= option "3") 3 :else 0)]
+    (cond (= mode "serve-vote") (serve-vote base addr index)
+          (= mode "ask-vote") (ask base addr index index 0)
+          (= mode "ask-wrong") (ask base addr index (rem (+ index 1) 4) 0)
+          (= mode "ask-replay") (ask base addr index index 1)
+          (= mode "serve-guarded") (let [b (typed-cap-call :cli/args :string :string "4")]
+                                     (serve-guarded base addr index (cond (= b "2") 2 (= b "3") 3 (= b "4") 4 :else 5)))
+          (= mode "serve-execute") (serve-execute base addr)
+          (= mode "ask-execute") (ask-execute base addr false)
+          (= mode "ask-execute-tampered") (ask-execute base addr true)
+          (= mode "serve-execute-drop") (serve-execute-drop base addr)
+          (= mode "ask-execute-retry") (ask-execute-retry base addr)
+          (= mode "serve-drop-then-vote") (serve-drop-then-vote base addr index)
+          (= mode "ask-vote-retry") (ask-retry base addr index)
+          (= mode "serve-commit-attest") (serve-commit-attest base addr index)
+          (= mode "ask-commit-attest") (ask-commit-attest base addr index false)
+          (= mode "ask-commit-replay") (ask-commit-attest base addr index true)
+          :else -1)))
