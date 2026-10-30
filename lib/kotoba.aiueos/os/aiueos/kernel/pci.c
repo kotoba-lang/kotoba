@@ -1234,7 +1234,7 @@ struct virtio_caps {
 };
 
 extern uint64_t kotoba_aiueos_virtio_cap_valid(
-  uint64_t pointer, uint64_t cap_length, uint64_t bar, uint64_t offset, uint64_t length);
+  uint64_t pointer, uint64_t cap_length, uint64_t bar, uint64_t offset, uint64_t length); extern int64_t kotoba_aiueos_virtio_caps_find(uint64_t header, uint64_t header_length, uint64_t record, uint64_t record_length);
 extern uint64_t kotoba_aiueos_pci_extent_valid(uint64_t value, uint64_t size);
 extern uint64_t kotoba_aiueos_pci_region_valid(
   uint64_t offset, uint64_t bytes, uint64_t bar_length); extern int64_t kotoba_aiueos_pci_bar_kind(int64_t low, int64_t index); extern int64_t kotoba_aiueos_pci_bar_value(int64_t low, int64_t high); extern int64_t kotoba_aiueos_pci_bar_base(int64_t low, int64_t high, int64_t index); extern int64_t kotoba_aiueos_pci_bar_size(int64_t mask_low, int64_t mask_high, int64_t kind);
@@ -1269,37 +1269,37 @@ static int parse_cap(uint8_t b, uint8_t d, uint8_t f, uint8_t pointer,
 
 static int find_virtio_caps(uint8_t b, uint8_t d, uint8_t f,
                             struct virtio_caps *caps) {
-  uint16_t status = (uint16_t)(config_read(b,d,f,0x04) >> 16);
-  if (!(status & PCI_STATUS_CAPABILITIES)) return 0;
-  *caps = (struct virtio_caps){0};
-  uint8_t pointer = config8(b,d,f,0x34) & ~3U;
-  uint64_t seen = 0;
-  unsigned steps = 0;
-  for (; pointer && steps < 48; steps++) {
-    if (pointer < 0x40 || pointer > 0xfc || (pointer & 3)) return 0;
-    uint64_t bit = 1ULL << ((pointer - 0x40) >> 2);
-    if (seen & bit) return 0; seen |= bit;
-    uint8_t next = config8(b,d,f,pointer + 1) & ~3U;
-    if (config8(b,d,f,pointer) == PCI_CAP_MSIX) {
-      if (pointer > 0xf4 || caps->msix_pointer) return 0;
-      caps->msix_pointer = pointer;
-    }
-    if (config8(b,d,f,pointer) == PCI_CAP_VENDOR) {
-      uint8_t kind = config8(b,d,f,pointer + 3);
-      if (kind == VIRTIO_CAP_COMMON || kind == VIRTIO_CAP_NOTIFY || kind == VIRTIO_CAP_DEVICE) {
-        struct virtio_pci_cap parsed;
-        if (!parse_cap(b,d,f,pointer,&parsed)) return 0;
-        if (kind == VIRTIO_CAP_COMMON) { caps->common = parsed; caps->have_common = 1; }
-        if (kind == VIRTIO_CAP_NOTIFY) { caps->notify = parsed; caps->have_notify = 1; }
-        if (kind == VIRTIO_CAP_DEVICE) { caps->device = parsed; caps->have_device = 1; }
-      }
-    }
-    pointer = next;
+  /* JUN-598: the bounded capability walk is kotoba/virtio-caps.o, over a
+     snapshot of the 256-byte configuration header (configuration reads have
+     no side effects, so this is the walk the C made read by read). The
+     object refuses the same chains: a pointer outside 0x40..0xfc or not
+     dword-aligned, a pointer seen twice, more than 48 steps, a second MSI-X
+     or one past 0xf4, a common / notify / device capability that
+     kotoba_aiueos_virtio_cap_valid would refuse; and it requires the common
+     configuration (>= 56 bytes) and a notify capability with a multiplier.
+     Its record is the three capabilities, their presence and the MSI-X
+     pointer, little-endian u32s; caps is written only when the walk is
+     admitted, which is the only case a caller reads it. This function keeps
+     the line count it had, so the __LINE__ sites below keep their numbers
+     (the virtio-input failure lines are part of the qualified baseline). */
+  uint8_t header[256];
+  uint32_t record[16];
+  for (unsigned at = 0; at < 256; at += 4) {
+    uint32_t word = config_read(b,d,f,(uint8_t)at);
+    header[at] = (uint8_t)word; header[at + 1] = (uint8_t)(word >> 8);
+    header[at + 2] = (uint8_t)(word >> 16); header[at + 3] = (uint8_t)(word >> 24);
   }
-  if (pointer) return 0; /* Capability chain exceeded the bounded walk. */
-  return caps->have_common && caps->have_notify &&
-         caps->common.length >= sizeof(struct virtio_common_cfg) &&
-         caps->notify.length >= 2 && caps->notify.notify_multiplier;
+  if (!kotoba_aiueos_virtio_caps_find((uint64_t)(uintptr_t)header, sizeof header,
+                                      (uint64_t)(uintptr_t)record, sizeof record))
+    return 0;
+  caps->common = (struct virtio_pci_cap){(uint8_t)record[0], record[1], record[2], record[3]};
+  caps->notify = (struct virtio_pci_cap){(uint8_t)record[4], record[5], record[6], record[7]};
+  caps->device = (struct virtio_pci_cap){(uint8_t)record[8], record[9], record[10], record[11]};
+  caps->have_common = (int)record[12];
+  caps->have_notify = (int)record[13];
+  caps->have_device = (int)record[14];
+  caps->msix_pointer = (uint8_t)record[15];
+  return 1;
 }
 
 static int bar_extent(uint8_t b, uint8_t d, uint8_t f, uint8_t index,

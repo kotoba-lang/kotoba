@@ -1,0 +1,70 @@
+;; find_virtio_caps of kernel/pci.c in Kotoba (JUN-598): the bounded walk of a virtio PCI function's capability list
+;; over a snapshot of its 256-byte configuration header (PCI configuration reads have no side effects, so reading the
+;; header first and walking it is the walk the C did read by read).
+;;
+;; find(cfg, 256, out, 64): 1 when the status register (cfg[6..8)) has the capability-list bit and the chain from
+;; cfg[0x34] & ~3 -- each pointer 0x40..0xfc and dword-aligned, none visited twice, at most 48 -- ends at 0 and yields a
+;; common configuration capability of at least 56 bytes and a notify capability of at least 2 bytes with a non-zero
+;; multiplier; else 0. A vendor capability (0x09) of kind 1 (common), 2 (notify) or 4 (device) must be valid where it
+;; is met, as kotoba_aiueos_virtio_cap_valid admitted it (pointer 64..252, length 16..256 - pointer, BAR < 6, a non-zero
+;; extent that does not wrap 32 bits); the last of each kind is the one kept. At most one MSI-X capability (0x11), at a
+;; pointer up to 0xf4. Reads past the header wrap at 256, as the C's uint8_t offsets did. out (only when the walk itself
+;; succeeds), little-endian u32s: common [0] BAR [4] offset [8] length [12] multiplier, notify [16..32), device
+;; [32..48), [48] have-common [52] have-notify [56] have-device [60] the MSI-X pointer; an absent capability is zeros.
+(ns aiueos.virtio-caps (:export [kotoba_aiueos_virtio_caps_find]))
+(defn- c8 [g :i64 gn :i64 o :i64] :i64 (kernel-load-u8 g gn (bit-and o 255)))
+(defn- c32 [g :i64 gn :i64 o :i64] :i64 (kernel-load-u32 g gn (bit-and o 252)))
+(defn- pow2 [k :i64 acc :i64] :i64 (if (<= k 0) acc (pow2 (- k 1) (* acc 2))))
+;; kotoba_aiueos_virtio_cap_valid's rule over the capability at p
+(defn- cap-ok? [g :i64 gn :i64 p :i64] :bool
+  (let [len (c8 g gn (+ p 2)) bar (c8 g gn (+ p 4)) off (c32 g gn (+ p 8)) ext (c32 g gn (+ p 12))]
+    (and (>= p 64) (<= p 252) (>= len 16) (<= len (- 256 p)) (< bar 6) (> ext 0) (<= ext (- 4294967295 off)))))
+;; found packs the last pointer of each kind: common bits 0..7, notify 8..15, device 16..23, MSI-X 24..31.
+;; state packs the visited set (bits 0..47), the pointer (48..55) and the steps taken (56..61).
+;; Answers found, or -1 when the walk refuses.
+(defn- field [found shift :i64] :i64 (bit-and (u64-shift-right found shift) 255))
+(defn- walk [g :i64 gn :i64 state :i64 found :i64] :i64
+  (let [seen (bit-and state 281474976710655) p (bit-and (u64-shift-right state 48) 255) steps (u64-shift-right state 56)]
+    (cond (= p 0) found
+          (>= steps 48) -1
+          (or (< p 64) (> p 252) (not= (bit-and p 3) 0)) -1
+          :else
+          (let [bit (pow2 (u64-shift-right (- p 64) 2) 1)
+                id (c8 g gn p) next (bit-and (c8 g gn (+ p 1)) 252) kind (c8 g gn (+ p 3))
+                msix-bad (and (= id 17) (or (> p 244) (not= (field found 24) 0)))
+                vendor (and (= id 9) (or (= kind 1) (= kind 2) (= kind 4)))
+                bad (or (not= (bit-and seen bit) 0) msix-bad (and vendor (not (cap-ok? g gn p))))
+                f1 (if (= id 17) (+ (- found (* (field found 24) 16777216)) (* p 16777216)) found)
+                f2 (cond (and vendor (= kind 1)) (+ (- f1 (field f1 0)) p)
+                         (and vendor (= kind 2)) (+ (- f1 (* (field f1 8) 256)) (* p 256))
+                         (and vendor (= kind 4)) (+ (- f1 (* (field f1 16) 65536)) (* p 65536))
+                         :else f1)]
+            (if bad -1
+              (walk g gn (+ (+ seen bit) (+ (* next 281474976710656) (* (+ steps 1) 72057594037927936))) f2))))))
+(defn- put32 [o :i64 on :i64 i :i64 v :i64] :i64 (kernel-store-u32 o on i v))
+;; the capability at p (0 = absent) into out[at..at+16)
+(defn- put-cap [g :i64 gn :i64 o :i64 on :i64 at-p :i64] :i64
+  (let [at (u64-shift-right at-p 8) p (bit-and at-p 255) here (if (= p 0) 0 1)
+        len (c8 g gn (+ p 2))
+        mult (if (>= len 20) (c32 g gn (+ p 16)) 0)
+        w (+ (+ (put32 o on at (* here (c8 g gn (+ p 4)))) (put32 o on (+ at 4) (* here (c32 g gn (+ p 8)))))
+             (+ (put32 o on (+ at 8) (* here (c32 g gn (+ p 12)))) (put32 o on (+ at 12) (* here mult))))]
+    w))
+(defn kotoba_aiueos_virtio_caps_find [cfg :i64 cfg-len :i64 out :i64 out-len :i64] :i64
+  (if (or (= cfg 0) (= out 0) (not= cfg-len 256) (not= out-len 64)) 0
+    (let [status (+ (c8 cfg cfg-len 6) (* 256 (c8 cfg cfg-len 7)))]
+      (if (= (bit-and status 16) 0) 0
+        (let [start (bit-and (c8 cfg cfg-len 52) 252)
+              found (walk cfg cfg-len (* start 281474976710656) 0)]
+          (if (< found 0) 0
+            (let [pc (field found 0) pn (field found 8) pd (field found 16) pm (field found 24)
+                  w1 (put-cap cfg cfg-len out out-len pc) w2 (put-cap cfg cfg-len out out-len (+ (* 16 256) pn))
+                  w3 (put-cap cfg cfg-len out out-len (+ (* 32 256) pd))
+                  hc (if (= pc 0) 0 1) hn (if (= pn 0) 0 1) hd (if (= pd 0) 0 1)
+                  w4 (+ (+ (put32 out out-len 48 hc) (put32 out out-len 52 hn))
+                        (+ (put32 out out-len 56 hd) (put32 out out-len 60 pm)))
+                  common-len (if (= pc 0) 0 (c32 cfg cfg-len (+ pc 12)))
+                  notify-len (if (= pn 0) 0 (c32 cfg cfg-len (+ pn 12)))
+                  notify-mult (if (= pn 0) 0 (if (>= (c8 cfg cfg-len (+ pn 2)) 20) (c32 cfg cfg-len (+ pn 16)) 0))
+                  ok (and (not= pc 0) (not= pn 0) (>= common-len 56) (>= notify-len 2) (not= notify-mult 0))]
+              (+ (if ok 1 0) (* 0 (+ (+ w1 w2) (+ w3 w4)))))))))))
