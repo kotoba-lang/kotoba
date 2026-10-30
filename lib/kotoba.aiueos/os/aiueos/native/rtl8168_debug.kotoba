@@ -1,0 +1,187 @@
+(ns aiueos.native.rtl8168-debug
+  ;; AWAI-119: kernel-stage debug link for a Realtek RTL8168 (10EC:8168, the
+  ;; AMD 6600H board's wired port). After ExitBootServices the firmware's SNP
+  ;; is gone and this kernel has no driver for that NIC, so a stop after the
+  ;; loader's OK report is silent. This is a transmit-only, polled, one-
+  ;; descriptor link: no IRQ, no RX, no address configuration.
+  ;;
+  ;; Frame: Ethernet broadcast, IPv4 0.0.0.0 -> 255.255.255.255, UDP 7799 ->
+  ;; 7799 (the loader netlog port), checksum 0, 35-byte payload
+  ;;   "AIUEOS_KDBG tttt vvvvvvvvvvvvvvvv\r\n"
+  ;; tag t and value v in lowercase hex. The IPv4 header is constant, so its
+  ;; checksum is too: 4500+003F+4011+FFFF+FFFF -> 0x7AAF.
+  ;;
+  ;; Only the opt-in desktop debug entry starts it. Register offsets differ
+  ;; from native.rtl8125: TxPoll is 0x38 (u8, NPQ 0x40), IntrMask/IntrStatus
+  ;; are 0x3C/0x3E (u16), and the descriptor base is written under a
+  ;; Cfg9346 (0x50) unlock. Descriptor format and TxConfig are shared.
+  ;; DMA uses owned window slot 10 (TX descriptor page + frame page); the
+  ;; desktop graph uses no owned window.
+  (:require [capability.dma.map :as dma])
+  (:export [start log]))
+
+(defn pci-address [bus offset]
+  (bit-or 2147483648 (bit-or (* bus 65536) (bit-and offset 252))))
+
+(defn pci-read [bus offset]
+  (let [addressed (kernel-out-u32 3320 (pci-address bus offset))]
+    (+ (kernel-in-u32 3324) (* 0 addressed))))
+
+(defn pci-write [bus offset value]
+  (let [addressed (kernel-out-u32 3320 (pci-address bus offset))
+        written (kernel-out-u32 3324 value)]
+    (+ written (* 0 addressed))))
+
+;; 10EC:8168 at <bus>:00.0, or -1.
+(defn find-bus [bus]
+  (if (> bus 255) -1
+    (if (= (pci-read bus 0) 2171080940) bus (find-bus (+ bus 1)))))
+
+;; BAR2 (64-bit memory) holds the register window on RTL8168 parts.
+(defn register-bar [bus]
+  (let [low (pci-read bus 24)
+        kind (bit-and (quot low 2) 3)
+        address (bit-and low 4294967280)
+        value (if (= kind 2) (+ address (* (pci-read bus 28) 4294967296))
+                (if (= kind 0) address 0))]
+    (if (and (> value 0) (< value 549755809792)) value 0)))
+
+(defn wait-reset [mmio remaining]
+  (if (= (bit-and (kernel-load-u8 mmio 512 55) 16) 0) 1
+    (if (= remaining 0) 0
+      (do (kernel-pause) (wait-reset mmio (- remaining 1))))))
+
+(defn wait-own [tx remaining]
+  (if (= (bit-and (kernel-load-u32-4k tx 4096 0) 2147483648) 0) 1
+    (if (= remaining 0) 0
+      (do (kernel-pause) (wait-own tx (- remaining 1))))))
+
+(defn zero-bytes [page offset remaining]
+  (if (= remaining 0) 1
+    (do (kernel-store-u8-4k page 4096 offset 0)
+        (zero-bytes page (+ offset 1) (- remaining 1)))))
+
+(defn store-le64 [page offset value]
+  (do (kernel-store-u32-4k page 4096 offset (bit-and value 4294967295))
+      (kernel-store-u32-4k page 4096 (+ offset 4) (quot value 4294967296))
+      1))
+
+;; The firmware's ExitBootServices shutdown may leave the function in a PCI
+;; power-management low state, where register reads return all-ones. Walk
+;; the capability list (bounded) and request D0 in PMCSR. Returns the PMCSR
+;; seen before the write, or 65535 when no PM capability was found.
+(defn pm-find [bus pointer remaining]
+  (if (or (= remaining 0) (< pointer 64) (> pointer 252)) 0
+    (let [header (pci-read bus pointer)]
+      (if (= (bit-and header 255) 1) pointer
+        (pm-find bus (bit-and (quot header 256) 252) (- remaining 1))))))
+
+(defn power-on [bus]
+  (let [cap (pm-find bus (bit-and (pci-read bus 52) 252) 48)]
+    (if (= cap 0) 65535
+      (let [control (pci-read bus (+ cap 4))
+            state (bit-and control 65535)]
+        (do (if (= (bit-and state 3) 0) 0
+              (do (pci-write bus (+ cap 4) (bit-and control 4294967292))
+                  (kernel-pause)))
+            state)))))
+
+;; Program the one-descriptor TX ring and enable the transmitter. Repeated
+;; before every record, so a missed or partial start cannot silence log.
+;; MISC (0xF0) bit19 is the RXDV gate on RTL8168EP/H-class parts: while set
+;; it blocks both TX and RX, and a driver shutdown (Linux r8169, and very
+;; likely the firmware's at ExitBootServices) sets it. Clear it here.
+(defn arm [mmio tx]
+  (do (kernel-store-u32 mmio 512 240 (bit-and (kernel-load-u32 mmio 512 240) 4294443007))
+      (kernel-store-u8 mmio 512 80 192)
+      (kernel-store-u32 mmio 512 32 (bit-and tx 4294967295))
+      (kernel-store-u32 mmio 512 36 (quot tx 4294967296))
+      (kernel-store-u8 mmio 512 80 0)
+      (kernel-store-u16 mmio 512 60 0)
+      (kernel-store-u8 mmio 512 55 (bit-or (kernel-load-u8 mmio 512 55) 4))
+      (kernel-store-u32 mmio 512 64 50333440)
+      1))
+
+;; Returns a packed state word for the first record:
+;; bits 0..7 result (1 started, 0 no RTL8168, 2 reset timed out),
+;; 8..15 ChipCmd after start, 16..31 PHYstatus (0x6C), 32..47 PMCSR before
+;; D0, 48..63 low half of the TX base register read back.
+(defn start []
+  (let [bus (find-bus 0)]
+    (if (< bus 0) 0
+      (let [address (register-bar bus)]
+        (if (= address 0) 0
+          (let [pm-state (power-on bus)
+                enabled (pci-write bus 4 (bit-or (bit-and (pci-read bus 4) 65535) 6))
+                mmio (kernel-pci-mmio bus 0 0 address 512)
+                tx (kernel-subregion (kernel-owned-window 10 16384) 16384 0 4096)
+                reset (kernel-store-u8 mmio 512 55 16)
+                reset-done (wait-reset mmio 1000000)
+                cleared (zero-bytes tx 0 16)
+                ring-end (kernel-store-u32-4k tx 4096 0 1073741824)
+                armed (arm mmio tx)
+                isr (kernel-store-u16 mmio 512 62 65535)
+                result (if (= reset-done 1) 1 2)]
+            (+ result
+               (* (bit-and (kernel-load-u8 mmio 512 55) 255) 256)
+               (* (bit-and (kernel-load-u16 mmio 512 108) 65535) 65536)
+               (* (bit-and pm-state 65535) 4294967296)
+               (* (bit-and (kernel-load-u32 mmio 512 32) 65535) 281474976710656)
+               (* 0 (+ enabled reset cleared ring-end armed isr)))))))))
+
+(defn hex-digit [value]
+  (if (< value 10) (+ value 48) (+ value 87)))
+
+(defn store-hex [frame offset value digits]
+  (if (= digits 0) 1
+    (do (kernel-store-u8-4k frame 4096 (+ offset (- digits 1)) (hex-digit (bit-and value 15)))
+        (store-hex frame offset (u64-shift-right value 4) (- digits 1)))))
+
+(defn header-byte [i]
+  (cond (< i 6) 255
+        (= i 12) 8 (= i 13) 0
+        (= i 14) 69 (= i 15) 0 (= i 16) 0 (= i 17) 63
+        (= i 22) 64 (= i 23) 17 (= i 24) 122 (= i 25) 175
+        (and (>= i 30) (< i 34)) 255
+        (= i 34) 30 (= i 35) 119 (= i 36) 30 (= i 37) 119
+        (= i 38) 0 (= i 39) 43
+        :else 0))
+
+(defn prefix-byte [i]
+  (cond (= i 0) 65 (= i 1) 73 (= i 2) 85 (= i 3) 69 (= i 4) 79 (= i 5) 83
+        (= i 6) 95 (= i 7) 75 (= i 8) 68 (= i 9) 66 (= i 10) 71 :else 32))
+
+(defn store-header [frame mmio i]
+  (if (>= i 54) 1
+    (do (kernel-store-u8-4k frame 4096 i
+          (cond (< i 6) (header-byte i)
+                (< i 12) (kernel-load-u8 mmio 512 (- i 6))
+                (< i 42) (header-byte i)
+                :else (prefix-byte (- i 42))))
+        (store-header frame mmio (+ i 1)))))
+
+;; Sends one record; 1 sent, 0 no RTL8168, 3 TX descriptor not returned.
+(defn log [tag value]
+  (let [bus (find-bus 0)]
+    (if (< bus 0) 0
+      (let [address (register-bar bus)]
+        (if (= address 0) 0
+          (let [mmio (kernel-pci-mmio bus 0 0 address 512)
+                window (kernel-owned-window 10 16384)
+                tx (kernel-subregion window 16384 0 4096)
+                frame (kernel-subregion window 16384 4096 4096)]
+            (if (= (wait-own tx 2000000) 0) 3
+                (do (arm mmio tx)
+                    (store-header frame mmio 0)
+                    (store-hex frame 54 tag 4)
+                    (kernel-store-u8-4k frame 4096 58 32)
+                    (store-hex frame 59 value 16)
+                    (kernel-store-u8-4k frame 4096 75 13)
+                    (kernel-store-u8-4k frame 4096 76 10)
+                    (store-le64 tx 8 frame)
+                    (kernel-store-u32-4k tx 4096 4 0)
+                    (dma/release-fence)
+                    (kernel-store-u32-4k tx 4096 0 (dma/tx-command 77))
+                    (dma/release-fence)
+                    (kernel-store-u8 mmio 512 56 64)
+                    (if (= (wait-own tx 2000000) 1) 1 3)))))))))
