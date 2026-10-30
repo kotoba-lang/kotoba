@@ -1171,7 +1171,7 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_value_runtime_
   kotoba_aiueos_value_runtime_cas_verify
 if [ -n "$model_handoff_link" ] || [ -n "$qwen35_parity_cflags" ]; then
   python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_qwen35_dot_object" \
-    2045ea927e0f9ae36d45e766a78ff0a9e2254e2cad9849ccf6b2308111a0c15c kotoba_aiueos_qwen35_dot_f32
+    e3ed8038bab3a5cc0289e8be030a1b81a420a02df0b86ad1e8245eac87b06670 kotoba_aiueos_qwen35_dot_f32
   python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_qwen35_dequant_object" \
     2713ffbac10ad71dad46a899b782c2687820fc2896edab444806867ae62fd730 kotoba_aiueos_qwen35_dequant_row
   python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_qwen35_matvec_object" \
