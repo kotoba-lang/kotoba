@@ -173,6 +173,69 @@ int64_t kotoba_aiueos_tls13_clienthello(const uint8_t *host, uint64_t host_len, 
   return (int64_t)total;
 }
 
+/* kotoba/tls13-verify.kotoba on the host: the C it replaced, behind the object's interface (JUN-553). */
+static int probe_sha256(const uint8_t *in, uint32_t n, uint8_t out[32]) { return (int)kotoba_aiueos_sha256(in, n, out, 0, 0); }
+static int kotoba_aiueos_tls13_hmac_bool(const uint8_t *k, uint32_t kl, const uint8_t *d, uint32_t dl, uint8_t out[32]) {
+  return kotoba_aiueos_tls13_hmac(k, kl, d, dl, out) == 1;
+}
+static int probe_expand(const uint8_t *s, const char *label, const uint8_t *c, uint32_t cl, uint8_t *o, uint32_t ol) {
+  uint32_t i = 0;
+  while (label[i]) i++;
+  return kotoba_aiueos_tls13_hkdf_expand_label(s, 32, (const uint8_t *)label, i, c, cl, o, ol) == 1;
+}
+static int ref_finished(const uint8_t *s_hs_secret, const uint8_t *transcript, uint32_t transcript_len, const uint8_t *verify, uint32_t n) {
+  uint8_t finished_key[32], th[32], expect[32];
+  uint32_t i, diff = 0;
+  if (n != 32) return 0;
+  if (!probe_expand(s_hs_secret, "finished", 0, 0, finished_key, 32)) return 0;
+  if (!probe_sha256(transcript, transcript_len, th)) return 0;
+  if (!kotoba_aiueos_tls13_hmac_bool(finished_key, 32, th, 32, expect)) return 0;
+  for (i = 0; i < 32; i++) diff |= (uint32_t)(verify[i] ^ expect[i]);
+  return diff == 0;
+}
+
+static int ref_certverify(const uint8_t *hs, uint32_t n, const uint8_t *transcript, uint32_t transcript_len,
+                          uint8_t *cv_rs, uint8_t *cv_digest, int32_t *scheme_out) {
+  uint32_t mlen, siglen, i;
+  uint8_t th[32], digest[32], rs[64], content[130];
+  static const uint8_t ctx[33] = {'T','L','S',' ','1','.','3',',',' ','s','e','r','v','e','r',' ',
+    'C','e','r','t','i','f','i','c','a','t','e','V','e','r','i','f','y'};
+  uint16_t certverify_scheme;
+  if (n < 8 || hs[0] != 0x0f) return 0;
+  mlen = (((uint32_t)hs[1] << 16) | ((uint32_t)hs[2] << 8) | hs[3]);
+  if (mlen + 4 != n) return 0;
+  certverify_scheme = probe_be16(hs + 4); *scheme_out = certverify_scheme;
+  if (certverify_scheme != 0x0403) return 0;
+  siglen = probe_be16(hs + 6);
+  if (8 + siglen != n) return 0;
+  if (!(kotoba_aiueos_tls13_parse_ecdsa_der(hs + 8, siglen, rs, 64) == 1)) return 0;
+  if (!probe_sha256(transcript, transcript_len, th)) return 0;
+  for (i = 0; i < 64; i++) content[i] = 0x20;
+  memcpy(content + 64, ctx, 33);
+  content[97] = 0;
+  memcpy(content + 98, th, 32);
+  if (!probe_sha256(content, 130, digest)) return 0;
+  memcpy(cv_rs, rs, 64);
+  memcpy(cv_digest, digest, 32);
+  return 1;
+}
+
+int64_t kotoba_aiueos_tls13_finished_ok(const uint8_t *secret, uint64_t secret_len, const uint8_t *transcript,
+                                        uint64_t transcript_len, const uint8_t *verify, uint64_t verify_len) {
+  if ((secret_len >> 32) || (transcript_len >> 32) || (verify_len >> 32)) return 0;
+  return ref_finished(secret, transcript, (uint32_t)transcript_len, verify, (uint32_t)verify_len);
+}
+
+int64_t kotoba_aiueos_tls13_certverify(const uint8_t *hs, uint64_t n, const uint8_t *transcript, uint64_t transcript_len,
+                                       uint8_t *rs, uint64_t rs_len, uint8_t *digest, uint64_t digest_len) {
+  int32_t scheme = -1;
+  int ok;
+  if ((n >> 32) || (transcript_len >> 32) || (rs_len >> 32) || (digest_len >> 32) || n > 16384 || rs_len < 64 ||
+      digest_len < 32) return 0;
+  ok = ref_certverify(hs, (uint32_t)n, transcript, (uint32_t)transcript_len, rs, digest, &scheme);
+  return scheme < 0 ? 0 : ((int64_t)scheme << 1) | (ok ? 1 : 0);
+}
+
 uint64_t kotoba_aiueos_x25519(const uint8_t *scalar, const uint8_t *peer,
                               uint8_t *out, uint8_t *ws) {
   EVP_PKEY *priv = 0, *pub = 0;

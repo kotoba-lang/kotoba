@@ -25,6 +25,11 @@ extern int64_t kotoba_aiueos_tls13_parse_ecdsa_der(const uint8_t *, uint64_t, ui
 extern int64_t kotoba_aiueos_tls13_clienthello(const uint8_t *, uint64_t, const uint8_t *, uint64_t,
                                                const uint8_t *, uint64_t, uint8_t *, uint64_t);
 extern int64_t kotoba_aiueos_tls13_serverhello_parse(const uint8_t *, uint64_t, uint8_t *, uint64_t);
+/* The Finished check and the CertificateVerify parse-and-digest are kotoba/tls13-verify.kotoba (JUN-553). certverify returns 0
+   before the scheme is read, otherwise scheme << 1 | ok. */
+extern int64_t kotoba_aiueos_tls13_finished_ok(const uint8_t *, uint64_t, const uint8_t *, uint64_t, const uint8_t *, uint64_t);
+extern int64_t kotoba_aiueos_tls13_certverify(const uint8_t *, uint64_t, const uint8_t *, uint64_t, uint8_t *, uint64_t,
+                                              uint8_t *, uint64_t);
 
 #define TLS_TR_MAX 12288
 #define TLS_RX_MAX 12288
@@ -138,9 +143,6 @@ static uint16_t be16(const uint8_t *p) {
 }
 static uint32_t be24(const uint8_t *p) {
   return ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | p[2];
-}
-static void put16(uint8_t *p, uint16_t v) {
-  p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v;
 }
 static void copy_bytes(uint8_t *d, const uint8_t *s, uint32_t n) {
   uint32_t i;
@@ -373,24 +375,13 @@ static int parse_serverhello(const uint8_t *hs, uint32_t n) {
 }
 
 static int finish_check(const uint8_t *verify, uint32_t n) {
-  uint8_t finished_key[32], th[32], expect[32];
-  uint32_t i, diff = 0;
-  if (n != 32) return 0;
-  if (!hkdf_expand_label(s_hs_secret, "finished", 0, 0, finished_key, 32)) return 0;
-  if (!sha256(transcript, transcript_len, th)) return 0;
-  if (!hmac_sha256(finished_key, 32, th, 32, expect)) return 0;
-  for (i = 0; i < 32; i++) diff |= (uint32_t)(verify[i] ^ expect[i]);
-  if (diff) return 0;
+  if (kotoba_aiueos_tls13_finished_ok(s_hs_secret, 32, transcript, transcript_len, verify, n) != 1) return 0;
   have_server_finished = 1;
   return 1;
 }
 
 static int find_p256_point(const uint8_t *p, uint32_t n, uint8_t out[64]) {
   return kotoba_aiueos_tls13_find_p256_point(p, n, out, 64) == 1;
-}
-
-static int parse_ecdsa_der(const uint8_t *p, uint32_t n, uint8_t rs[64]) {
-  return kotoba_aiueos_tls13_parse_ecdsa_der(p, n, rs, 64) == 1;
 }
 
 static int parse_certificate(const uint8_t *hs, uint32_t n) {
@@ -402,26 +393,12 @@ static int parse_certificate(const uint8_t *hs, uint32_t n) {
 }
 
 static int verify_certificate_verify(const uint8_t *hs, uint32_t n) {
-  uint32_t mlen, siglen, i;
-  uint8_t th[32], digest[32], rs[64], content[130];
-  static const uint8_t ctx[33] = {
-    'T','L','S',' ','1','.','3',',',' ','s','e','r','v','e','r',' ',
-    'C','e','r','t','i','f','i','c','a','t','e','V','e','r','i','f','y'};
+  uint8_t digest[32], rs[64];
+  int64_t r;
   if (!have_leaf_pub) return 0;
-  if (n < 8 || hs[0] != 0x0f) return 0;
-  mlen = be24(hs + 1);
-  if (mlen + 4 != n) return 0;
-  certverify_scheme = be16(hs + 4);
-  if (certverify_scheme != 0x0403) return 0; /* ecdsa_secp256r1_sha256 */
-  siglen = be16(hs + 6);
-  if (8 + siglen != n) return 0;
-  if (!parse_ecdsa_der(hs + 8, siglen, rs)) return 0;
-  if (!sha256(transcript, transcript_len, th)) return 0;
-  for (i = 0; i < 64; i++) content[i] = 0x20;
-  copy_bytes(content + 64, ctx, 33);
-  content[97] = 0;
-  copy_bytes(content + 98, th, 32);
-  if (!sha256(content, 130, digest)) return 0;
+  r = kotoba_aiueos_tls13_certverify(hs, n, transcript, transcript_len, rs, 64, digest, 32);
+  if (r) certverify_scheme = (uint16_t)(r >> 1);
+  if (!(r & 1)) return 0;
   copy_bytes(cv_rs, rs, 64);
   copy_bytes(cv_digest, digest, 32);
   certverify_parsed = 1;
