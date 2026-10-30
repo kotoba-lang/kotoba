@@ -247,12 +247,42 @@ def main():
     run('object-after-lost-reply', broker, ['object', str(sink), ''], 1)
     execute('execute-duplicate-no-second-effect', 'ask-execute', 47272, 2)
     run('object-after-session-execute', broker, ['object', str(sink), ''], 1)
+    # per-peer budgets and one request in flight (replica 3, roster coordinators 9 and 8)
+    def roster(label, port, steps):
+        addr = f'127.0.0.1:{port}'
+        node = gate.out / 'node3'
+        server = subprocess.Popen([str(session), 'serve-roster', str(node), addr, '3', str(len(steps))], cwd=gate.out,
+                                  env=env(KEXE_CAP_RESOURCES_43=addr), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        time.sleep(0.5)
+        asks = []
+        try:
+            for n, (mode, served) in enumerate(steps):
+                r = gate.call(f'{label}-{n}-{mode}', [session, mode, str(coordinator), addr, '3'], env(KEXE_CAP_RESOURCES_45=addr))
+                got = result(r.stdout)
+                gate.observations[-1]['result'] = got
+                print(f'{label}-{n}-{mode}', got, flush=True)
+                assert (got is not None and got > 0) if served else got == -33, (label, n, mode, got, r.stderr[-300:])
+                asks.append(got)
+        finally:
+            out, err = server.communicate(timeout=600)
+            (gate.out / f'{label}-serve.stdout').write_bytes(out); (gate.out / f'{label}-serve.stderr').write_bytes(err)
+        got = result(out)
+        raw = bytes.fromhex((node / 'outcomes').read_text().strip())
+        outcomes = [int.from_bytes(raw[i:i + 8], 'little', signed=True) for i in range(0, len(raw), 8)]
+        gate.observations.append(dict(name=f'{label}-serve', exit=server.returncode, result=got, outcomes=outcomes))
+        print(f'{label}-serve', got, outcomes, flush=True)
+        assert got == 1, (label, got, err[-300:])
+        return asks, outcomes
+    asks, outcomes = roster('peer-budget', 47280, [('ask-as-9', True), ('ask-as-9', False), ('ask-as-8', True)])
+    assert outcomes[0] > 0 and outcomes[1] == -71 and outcomes[2] > 0, outcomes
+    asks, outcomes = roster('one-in-flight', 47281, [('ask-pipelined-8', False), ('ask-as-8', True)])
+    assert outcomes[0] == -72 and outcomes[1] > 0, outcomes
     # without the clock grant the retry cannot back off, so it stops (a trap):
     # a coordinator is never given a retry loop without a wait
     exchange('retry-without-clock-grant', 'ask-vote-retry', 2, 47253, None, -94, serve='serve-drop-then-vote')
     assert not (coordinator / 'backoff').exists(), 'a retry backed off without the clock grant'
     assert b'KEXE_CAP' in (gate.out / 'retry-without-clock-grant-ask.stderr').read_bytes()
-    gate.finish('PASS_NATIVE_BROKER_SESSIONS', replicas=3, controls=7, effects=1, retries=2)
+    gate.finish('PASS_NATIVE_BROKER_SESSIONS', replicas=3, controls=9, effects=1, retries=2)
 
 if __name__ == '__main__':
     main()
