@@ -1483,6 +1483,11 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_acpi_dmar_obje
 kotoba_udp_checksum_object=${AIUEOS_KOTOBA_UDP_CHECKSUM_OBJECT:-"$aiueos/kotoba/udp-checksum.o"}
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_udp_checksum_object" \
   a7e2cbee27e20b200facd9968d5916b831ecaf24d262419f834ecc3dbb8fcf15 kotoba_aiueos_udp_checksum_sum
+# JUN-552: pci.c's HTTP response heads (net_http_cid_admit's status line and terminator, rtl8125_http_success) are
+# kotoba/http-head.o (fuel 4194304).
+kotoba_http_head_object=${AIUEOS_KOTOBA_HTTP_HEAD_OBJECT:-"$aiueos/kotoba/http-head.o"}
+python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_http_head_object" \
+  04e69ff13114b6b41733acb585282f40b0a6b12c9c1fe0d050008659d3951986 kotoba_aiueos_http_cid_body,kotoba_aiueos_http_success
 # JUN-552: pci.c's TCP segment builder (net_build_tcp) is kotoba/tcp-build.o (fuel 4194304).
 kotoba_tcp_build_object=${AIUEOS_KOTOBA_TCP_BUILD_OBJECT:-"$aiueos/kotoba/tcp-build.o"}
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_tcp_build_object" \
@@ -1628,7 +1633,7 @@ zig ld.lld -nostdlib -static --strip-all $qualification_gc_link -z max-page-size
   $qwen35_kotoba_link $qwen35_parity_link \
   "$kotoba_device_worker_canonical_object" \
   "$kotoba_sha256_stream_object" "$kotoba_sha256_region_object" \
-  "$kotoba_device_worker_digest_object" \
+  "$kotoba_device_worker_digest_object" "$kotoba_http_head_object" \
   "$kotoba_wm_object" "$kotoba_scanout_object" "$kotoba_broker_object" "$kotoba_session_object" \
   "$kotoba_browser_frame_object" "$kotoba_browser_reduce_object" "$kotoba_browser_frame2_object" "$kotoba_browser_ime_object" \
   "$kotoba_browser_damage_object" \
