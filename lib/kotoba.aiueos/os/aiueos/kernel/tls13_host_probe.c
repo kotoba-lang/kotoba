@@ -95,6 +95,84 @@ int64_t kotoba_aiueos_tls13_parse_ecdsa_der(const uint8_t *p, uint64_t n, uint8_
   return inner + used == n;
 }
 
+/* kotoba/tls13-hello.kotoba on the host: the C it replaced, behind the object's interface (JUN-553). */
+static uint16_t probe_be16(const uint8_t *p) {
+  return (uint16_t)(((uint32_t)p[0] << 8) | p[1]);
+}
+
+static const uint8_t probe_ch_template[157] = {
+  0x16,0x03,0x01,0x00,0x98,0x01,0x00,0x00,0x94,0x03,0x03,0xa1,0xe0,0xa1,0xe0,
+  0xa1,0xe0,0xa1,0xe0,0xa1,0xe0,0xa1,0xe0,0xa1,0xe0,0xa1,0xe0,0xa1,0xe0,0xa1,
+  0xe0,0xa1,0xe0,0xa1,0xe0,0xa1,0xe0,0xa1,0xe0,0xa1,0xe0,0xa1,0xe0,0x00,0x00,
+  0x02,0x13,0x01,0x01,0x00,0x00,0x69,0x00,0x00,0x00,0x11,0x00,0x0f,0x00,0x00,
+  0x0c,0x6b,0x6f,0x74,0x6f,0x62,0x61,0x73,0x65,0x2e,0x6e,0x65,0x74,0x00,0x0a,
+  0x00,0x04,0x00,0x02,0x00,0x1d,0x00,0x0d,0x00,0x08,0x00,0x06,0x04,0x03,0x08,
+  0x04,0x04,0x01,0x00,0x2b,0x00,0x03,0x02,0x03,0x04,0x00,0x10,0x00,0x0b,0x00,
+  0x09,0x08,0x68,0x74,0x74,0x70,0x2f,0x31,0x2e,0x31,0x00,0x33,0x00,0x26,0x00,
+  0x24,0x00,0x1d,0x00,0x20,0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0a,
+  0x0b,0x0c,0x0d,0x0e,0x0f,0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,0x18,0x19,
+  0x1a,0x1b,0x1c,0x1d,0x1e,0x1f,0x20};
+
+static int ref_serverhello(const uint8_t *hs, uint32_t n, uint8_t out_pub[32]) {
+  uint32_t off, ext_end, sid;
+  uint8_t server_pub[32];
+  int got_share = 0, got_13 = 0;
+  if (n < 40 || hs[0] != 0x02) return 0;
+  if ((((uint32_t)hs[1] << 16) | ((uint32_t)hs[2] << 8) | hs[3]) + 4 != n) return 0;
+  if (hs[4] != 0x03 || hs[5] != 0x03) return 0;
+  sid = hs[38];
+  if (sid > 32 || 39 + sid + 3 + 2 > n) return 0;
+  off = 39 + sid;
+  if (hs[off] != 0x13 || hs[off + 1] != 0x01) return 0; /* AES-128-GCM */
+  off += 2;
+  if (hs[off] != 0) return 0;
+  off++;
+  if (off + 2 > n) return 0;
+  ext_end = off + 2 + probe_be16(hs + off);
+  off += 2;
+  if (ext_end != n) return 0;
+  while (off + 4 <= ext_end) {
+    uint16_t typ = probe_be16(hs + off);
+    uint16_t elen = probe_be16(hs + off + 2);
+    const uint8_t *ed = hs + off + 4;
+    if (off + 4 + elen > ext_end) return 0;
+    if (typ == 0x002b && elen >= 2 && ed[elen - 2] == 0x03 && ed[elen - 1] == 0x04)
+      got_13 = 1;
+    if (typ == 0x0033 && elen >= 36 && probe_be16(ed) == 0x001d && probe_be16(ed + 2) == 32) {
+      memcpy(server_pub, ed + 4, 32);
+      got_share = 1;
+    }
+    off += 4 + elen;
+  }
+  if (!got_13 || !got_share) return 0;
+  memcpy(out_pub, server_pub, 32);
+  return 1;
+}
+
+int64_t kotoba_aiueos_tls13_serverhello_parse(const uint8_t *hs, uint64_t n, uint8_t *key, uint64_t key_len) {
+  if ((n >> 32) || (key_len >> 32) || n > 16384 || key_len < 32) return 0;
+  return ref_serverhello(hs, (uint32_t)n, key);
+}
+
+int64_t kotoba_aiueos_tls13_clienthello(const uint8_t *host, uint64_t host_len, const uint8_t *random, uint64_t random_len,
+                                        const uint8_t *key, uint64_t key_len, uint8_t *out, uint64_t out_len) {
+  uint64_t total = 145 + host_len;
+  if ((host_len >> 32) || (random_len >> 32) || (key_len >> 32) || (out_len >> 32) || host_len > 255 || total > 256 ||
+      total > out_len || key_len != 32 || (random_len != 0 && random_len != 32)) return 0;
+  memcpy(out, probe_ch_template, 61);
+  out[3] = (uint8_t)((total - 5) >> 8); out[4] = (uint8_t)(total - 5);
+  out[6] = (uint8_t)((total - 9) >> 16); out[7] = (uint8_t)((total - 9) >> 8); out[8] = (uint8_t)(total - 9);
+  if (random_len == 32) memcpy(out + 11, random, 32);
+  out[50] = (uint8_t)((93 + host_len) >> 8); out[51] = (uint8_t)(93 + host_len);
+  out[54] = (uint8_t)((5 + host_len) >> 8); out[55] = (uint8_t)(5 + host_len);
+  out[56] = (uint8_t)((3 + host_len) >> 8); out[57] = (uint8_t)(3 + host_len);
+  out[59] = (uint8_t)(host_len >> 8); out[60] = (uint8_t)host_len;
+  memcpy(out + 61, host, (size_t)host_len);
+  memcpy(out + 61 + host_len, probe_ch_template + 73, 84);
+  memcpy(out + 113 + host_len, key, 32);
+  return (int64_t)total;
+}
+
 uint64_t kotoba_aiueos_x25519(const uint8_t *scalar, const uint8_t *peer,
                               uint8_t *out, uint8_t *ws) {
   EVP_PKEY *priv = 0, *pub = 0;
