@@ -283,9 +283,9 @@ broker driver's `fresh` step decides the fresh committed head from them.
 
 Measured 2026-10-30 in the podman machine (Linux arm64) with Amu's committed
 `aarch64-linux-static-root.elf` at `65359a09` (image `8ebb44c5`, also at `91faa123`, image
-`7814504c`). The compiler of the workflow's general Amu pin, `6a77cd91` (image `d5ef9cee`),
-builds a broker driver that traps (SIGILL) in `prepare`, so the CI step checks out
-`65359a09` for these sessions only:
+`7814504c`). The compiler of the workflow's earlier Amu pin, `6a77cd91` (image `d5ef9cee`),
+builds a broker driver that traps (SIGILL) in `prepare`; `native-shared` now pins Amu
+`65359a09` for every step:
 
 | exchange | result |
 |---|---|
