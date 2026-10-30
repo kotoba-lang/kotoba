@@ -891,6 +891,11 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_mutable_build_
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_cap_valid_object" \
   0f591a342fe5b4fa959f8a21d36930ec9eca7859302a747ce43f5e3caa20c9c6 \
   kotoba_aiueos_virtio_cap_valid
+# JUN-598: pci.c's virtio capability walk (find_virtio_caps) is kotoba/virtio-caps.o (fuel 4194304), over a snapshot of
+# the 256-byte configuration header.
+kotoba_virtio_caps_object=${AIUEOS_KOTOBA_VIRTIO_CAPS_OBJECT:-"$aiueos/kotoba/virtio-caps.o"}
+python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_virtio_caps_object" \
+  5f3683cdb2ca39922972786c5811d121ff8ee3010fb835bc4d6f7b7f3fcb1568 kotoba_aiueos_virtio_caps_find
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_extent_valid_object" \
   cfde40e55fc8e52d6100183e2e4a7eecd60120be95f9c04234714ad041916ec4 \
   kotoba_aiueos_pci_extent_valid
@@ -1626,7 +1631,7 @@ zig ld.lld -nostdlib -static --strip-all $qualification_gc_link -z max-page-size
   "$kotoba_mutable_valid_object" \
   "$kotoba_superblock_valid_object" "$kotoba_journal_build_object" \
   "$kotoba_mutable_build_object" "$kotoba_cap_valid_object" \
-  "$kotoba_extent_valid_object" "$kotoba_region_valid_object" \
+  "$kotoba_extent_valid_object" "$kotoba_region_valid_object" "$kotoba_virtio_caps_object" \
   "$kotoba_pci_config_read_object" "$kotoba_pci_config_write_object" \
   "$kotoba_rtl8125_identify_object" "$kotoba_rtl8125_link_up_object" \
   "$kotoba_rtl8125_ring_build_object" "$kotoba_rtl8125_program_object" \
