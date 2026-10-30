@@ -3878,22 +3878,19 @@ static int net_ssh_syn_valid(struct aiueos_ssh_io *io, uint32_t received) {
            io->peer_ip, 0, NET_TCP_SYN | NET_TCP_ECE | NET_TCP_CWR);
 }
 
+/* The publickey userauth parsing is kotoba/ssh-userauth.kotoba (JUN-552): which method a USERAUTH_REQUEST names, the
+   publickey request's fields (returned as offsets into the payload) and the authorized-key check of the offered blob. */
+extern int64_t kotoba_aiueos_ssh_userauth_method(const uint8_t *, uint64_t, uint64_t);
+extern int64_t kotoba_aiueos_ssh_userauth_publickey(const uint8_t *, uint64_t, uint8_t *, uint64_t);
+extern int64_t kotoba_aiueos_ssh_authorized_blob(const uint8_t *, uint64_t, const uint8_t *, uint64_t, uint8_t *, uint64_t);
+static uint32_t ssh_le32(const uint8_t *p) {
+  return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
 static int ssh_userauth_method_is(const uint8_t *payload,
                                   uint32_t payload_length,
                                   const char *expected) {
-  uint32_t offset = 1;
-  const uint8_t *username, *service, *method;
-  uint32_t username_length, service_length, method_length;
-  return payload && payload_length > 1U && payload[0] == 50U &&
-    ssh_take_string(payload, payload_length, &offset,
-                    &username, &username_length) &&
-    ssh_take_string(payload, payload_length, &offset,
-                    &service, &service_length) &&
-    ssh_take_string(payload, payload_length, &offset,
-                    &method, &method_length) &&
-    ssh_text_equal(username, username_length, "runtime") &&
-    ssh_text_equal(service, service_length, "ssh-connection") &&
-    ssh_text_equal(method, method_length, expected);
+  uint64_t which = (expected[0] == 'n') ? 0 : 1;   /* "none" or "publickey", the two this file asks for */
+  return kotoba_aiueos_ssh_userauth_method(payload, payload_length, which) == 1;
 }
 
 static int ssh_userauth_publickey_fields(
@@ -3901,57 +3898,26 @@ static int ssh_userauth_publickey_fields(
     int *has_signature, const uint8_t **algorithm,
     uint32_t *algorithm_length, const uint8_t **public_key_blob,
     uint32_t *public_key_blob_length, uint32_t *after_key) {
-  uint32_t offset = 1;
-  const uint8_t *username, *service, *method;
-  uint32_t username_length, service_length, method_length;
+  uint8_t fields[24];
   if (!has_signature || !algorithm || !algorithm_length ||
       !public_key_blob || !public_key_blob_length || !after_key ||
-      !payload || payload_length <= 1U || payload[0] != 50U ||
-      !ssh_take_string(payload, payload_length, &offset,
-                       &username, &username_length) ||
-      !ssh_take_string(payload, payload_length, &offset,
-                       &service, &service_length) ||
-      !ssh_take_string(payload, payload_length, &offset,
-                       &method, &method_length) ||
-      !ssh_text_equal(username, username_length, "runtime") ||
-      !ssh_text_equal(service, service_length, "ssh-connection") ||
-      !ssh_text_equal(method, method_length, "publickey") ||
-      offset >= payload_length) return 0;
-  *has_signature = payload[offset++] != 0;
-  if (!ssh_take_string(payload, payload_length, &offset,
-                       algorithm, algorithm_length) ||
-      !ssh_text_equal(*algorithm, *algorithm_length,
-                      "ecdsa-sha2-nistp256") ||
-      !ssh_take_string(payload, payload_length, &offset,
-                       public_key_blob, public_key_blob_length)) return 0;
-  *after_key = offset;
+      kotoba_aiueos_ssh_userauth_publickey(payload, payload_length, fields, sizeof(fields)) != 1) return 0;
+  *has_signature = fields[0] != 0;
+  *algorithm = payload + ssh_le32(fields + 4);
+  *algorithm_length = ssh_le32(fields + 8);
+  *public_key_blob = payload + ssh_le32(fields + 12);
+  *public_key_blob_length = ssh_le32(fields + 16);
+  *after_key = ssh_le32(fields + 20);
   return 1;
 }
 
 static int ssh_authorized_publickey_blob(const uint8_t *blob,
                                          uint32_t blob_length,
                                          uint8_t public_point[64]) {
-  uint32_t offset = 0;
-  const uint8_t *algorithm, *curve, *point;
-  uint32_t algorithm_length, curve_length, point_length;
-  if (!blob || !public_point ||
-      !ssh_take_string(blob, blob_length, &offset,
-                       &algorithm, &algorithm_length) ||
-      !ssh_take_string(blob, blob_length, &offset,
-                       &curve, &curve_length) ||
-      !ssh_take_string(blob, blob_length, &offset,
-                       &point, &point_length) ||
-      offset != blob_length || point_length != 65U || point[0] != 4U ||
-      !ssh_text_equal(algorithm, algorithm_length,
-                      "ecdsa-sha2-nistp256") ||
-      !ssh_text_equal(curve, curve_length, "nistp256")) return 0;
-  for (uint32_t i = 0; i < 32U; i++) {
-    public_point[i] = point[1U + i];
-    public_point[32U + i] = point[33U + i];
-    if (public_point[i] != ssh_auth_x[i] ||
-        public_point[32U + i] != ssh_auth_y[i]) return 0;
-  }
-  return 1;
+  uint8_t authorized[64];
+  if (!blob || !public_point) return 0;
+  for (uint32_t i = 0; i < 32U; i++) { authorized[i] = ssh_auth_x[i]; authorized[32U + i] = ssh_auth_y[i]; }
+  return kotoba_aiueos_ssh_authorized_blob(blob, blob_length, authorized, 64, public_point, 64) == 1;
 }
 
 /* Drive publickey userauth after NEWKEYS. Derives the session keys, receives the
