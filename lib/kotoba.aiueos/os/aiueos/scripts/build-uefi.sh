@@ -1201,7 +1201,7 @@ if [ -n "$model_handoff_link" ] || [ -n "$qwen35_parity_cflags" ]; then
   case "${AIUEOS_QWEN35_KOTOBA_PARITY:-0}" in
     0|4)
       python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_qwen35_recurrent_object" \
-        1e295fb9bb22b36871d5703b74fc4da5838407a7fea481e7137e343549bebbbc \
+        bdc9bd700972e124dded52075e8e20e33e1fa8b9d977ed22a4da35ac942a8fda \
         kotoba_aiueos_qwen35_recurrent_step
       ;;
   esac
