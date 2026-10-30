@@ -4503,56 +4503,19 @@ static uint16_t net_udp_checksum(const uint8_t *frame, uint32_t udp_length) {
   return sum ? sum : 0xffff;
 }
 
+/* JUN-552: the DISCOVER / REQUEST frame is built by kotoba/dhcp-build.o: zeroed, broadcast from 0.0.0.0 to
+   255.255.255.255 (this machine has no address to send from and does not know who to send to, which is the whole
+   reason the exchange exists), BOOTREQUEST with the broadcast flag (RFC 2131: a client with no address cannot
+   receive a unicast reply), our MAC as chaddr, the cookie, option 53, and for a REQUEST options 50 and 54 -- the
+   address being accepted and the server that offered it, so a second server's offer is declined by omission -- then
+   the parameter request list (mask, router, DNS, lease; asking is not receiving) and END, both checksums included. */
+extern int64_t kotoba_aiueos_dhcp_build(uint64_t frame, uint64_t length, uint64_t mac, uint64_t mac_length,
+                                        uint64_t message_type, uint64_t requested, uint64_t server);
 static uint32_t net_build_dhcp(uint8_t *frame, uint8_t message_type,
                                uint32_t requested, uint32_t server) {
-  uint32_t udp_length = 8 + NET_DHCP_BOOTP;
-  uint32_t total = 20 + udp_length;
-  for (uint32_t i = 0; i < 14 + total; i++) frame[i] = 0;
-  for (unsigned i = 0; i < 6; i++) frame[i] = 0xff;          /* broadcast */
-  for (unsigned i = 0; i < 6; i++) frame[6 + i] = net_mac[i];
-  net_store_be16(frame + 12, 0x0800);                        /* EtherType IPv4 */
-  frame[14] = 0x45;                                          /* version 4, IHL 5 */
-  net_store_be16(frame + 16, (uint16_t)total);
-  net_store_be16(frame + 20, 0x4000);                        /* DF, id 0 (RFC 6864) */
-  frame[22] = 64;                                            /* TTL */
-  frame[23] = 17;                                            /* UDP */
-  /* 0.0.0.0 to 255.255.255.255: this machine has no address to send from and
-     does not know who to send to, which is the whole reason the exchange
-     exists. */
-  net_store_be32(frame + 26, 0);
-  net_store_be32(frame + 30, 0xffffffffU);
-  net_store_be16(frame + 24,
-    (uint16_t)kotoba_aiueos_ipv4_checksum((uint64_t)(uintptr_t)(frame + 14), 20));
-  net_store_be16(frame + 34, 68);                            /* client port */
-  net_store_be16(frame + 36, 67);                            /* server port */
-  net_store_be16(frame + 38, (uint16_t)udp_length);
-  frame[42] = 1;                                             /* BOOTREQUEST */
-  frame[43] = 1;                                             /* Ethernet */
-  frame[44] = 6;                                             /* 6-byte address */
-  net_store_be32(frame + 46, NET_DHCP_XID);
-  /* The broadcast flag. A client with no address configured cannot receive a
-     unicast datagram addressed to an address it does not yet hold, so RFC 2131
-     has it ask for the reply to be broadcast. */
-  net_store_be16(frame + 52, 0x8000);
-  for (unsigned i = 0; i < 6; i++) frame[70 + i] = net_mac[i];
-  net_store_be32(frame + 278, 0x63825363U);                  /* magic cookie */
-  uint32_t at = 282;
-  frame[at++] = 53; frame[at++] = 1; frame[at++] = message_type;
-  if (message_type == NET_DHCP_REQUEST) {
-    /* Both are required in a REQUEST that answers an OFFER: the address being
-       accepted, and which server offered it, so that a second server's offer is
-       declined by omission rather than by silence. */
-    frame[at++] = 50; frame[at++] = 4; net_store_be32(frame + at, requested); at += 4;
-    frame[at++] = 54; frame[at++] = 4; net_store_be32(frame + at, server); at += 4;
-  }
-  /* Parameter request list: subnet mask, router, DNS, lease time. Asking is not
-     receiving -- the admission requires the mask, the server identifier and the
-     lease regardless of what was asked for. */
-  frame[at++] = 55; frame[at++] = 4;
-  frame[at++] = 1; frame[at++] = 3; frame[at++] = 6; frame[at++] = 51;
-  frame[at++] = 255;                                         /* END */
-  net_store_be16(frame + 40, net_udp_checksum(frame, udp_length));
-  return 14 + total;
+  return (uint32_t)kotoba_aiueos_dhcp_build((uint64_t)(uintptr_t)frame, 14 + 20 + 8 + NET_DHCP_BOOTP,
+                                            (uint64_t)(uintptr_t)net_mac, sizeof net_mac,
+                                            message_type, requested, server);
 }
 
 static int net_dhcp_send(struct net_ring *tx, uint8_t *tx_page,

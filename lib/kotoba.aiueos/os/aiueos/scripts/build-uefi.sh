@@ -1487,6 +1487,10 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_arp_icmp_build
 kotoba_udp_checksum_object=${AIUEOS_KOTOBA_UDP_CHECKSUM_OBJECT:-"$aiueos/kotoba/udp-checksum.o"}
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_udp_checksum_object" \
   a7e2cbee27e20b200facd9968d5916b831ecaf24d262419f834ecc3dbb8fcf15 kotoba_aiueos_udp_checksum_sum
+# JUN-552: pci.c's DHCP DISCOVER / REQUEST builder (net_build_dhcp) is kotoba/dhcp-build.o (fuel 4194304).
+kotoba_dhcp_build_object=${AIUEOS_KOTOBA_DHCP_BUILD_OBJECT:-"$aiueos/kotoba/dhcp-build.o"}
+python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_dhcp_build_object" \
+  b54cd5b240b94b58e8ec7176314f42bb014d5ea51d54a27ee7ef394d48cb8ae0 kotoba_aiueos_dhcp_build
 # JUN-552: pci.c's TCP segment builder (net_build_tcp) is kotoba/tcp-build.o (fuel 4194304).
 kotoba_tcp_build_object=${AIUEOS_KOTOBA_TCP_BUILD_OBJECT:-"$aiueos/kotoba/tcp-build.o"}
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_tcp_build_object" \
@@ -1613,7 +1617,7 @@ zig ld.lld -nostdlib -static --strip-all $qualification_gc_link -z max-page-size
   "$kotoba_job_protocol_glue_object" \
   "$kotoba_tls_aes_object" "$kotoba_bytes_object" "$kotoba_tls13_keyschedule_object" "$kotoba_tls13_cert_object" "$kotoba_tls13_hello_object" "$kotoba_tls13_verify_object" "$kotoba_tls13_keys_object" "$kotoba_tls13_hs_object" "$kernel_tls13_object" \
   "$kernel_scheduler_object" "$kernel_syscall_object" "$kotoba_arp_icmp_build_object" \
-  "$kernel_process_object" "$kernel_loader_object" \
+  "$kernel_process_object" "$kernel_loader_object" "$kotoba_dhcp_build_object" \
   "$kernel_smp_object" "$kernel_trampoline_object" \
   "$kernel_ioapic_object" "$kernel_framebuffer_object" $plc_runtime_link $qualification_link \
   "$kotoba_kernel_object" \
