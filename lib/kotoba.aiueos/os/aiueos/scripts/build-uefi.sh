@@ -1452,6 +1452,10 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_kototama_manag
 kotoba_acpi_dmar_object=${AIUEOS_KOTOBA_ACPI_DMAR_OBJECT:-"$aiueos/kotoba/acpi-dmar-parse.o"}
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_acpi_dmar_object" \
   458deaf9b52b345caaaeb1c4ee0ee58a72d2e94974de11a28f3a092fc8aae769 kotoba_aiueos_acpi_dmar_parse
+# JUN-552: aiueos_acpi_initialize's MADT walk is kotoba/acpi-madt-parse.o (fuel 4194304); acpi.c keeps the globals.
+kotoba_acpi_madt_object=${AIUEOS_KOTOBA_ACPI_MADT_OBJECT:-"$aiueos/kotoba/acpi-madt-parse.o"}
+python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_acpi_madt_object" \
+  e5899fc554b156b4bd3c1a9268c70eac290f464fa3ad333644fd621d75332736 kotoba_aiueos_acpi_madt_parse
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_bytes_object" \
   567551de001399c4706927cbffd474b53c15ea35e908945e51fd2176feca6c58 \
   kotoba_aiueos_bytes_copy,kotoba_aiueos_bytes_fill
@@ -1555,7 +1559,7 @@ zig ld.lld -nostdlib -static --strip-all $qualification_gc_link -z max-page-size
   -Map "$out/kernel.map" \
   -T "$aiueos/kernel/linker.ld" -o "$kernel" \
   "$kernel_entry_object" "$kernel_object" "$kernel_paging_object" \
-  "$kernel_acpi_object" "$kotoba_acpi_dmar_object" "$kernel_vtd_object" "$kernel_apic_object" "$kernel_memory_object" \
+  "$kernel_acpi_object" "$kotoba_acpi_dmar_object" "$kotoba_acpi_madt_object" "$kernel_vtd_object" "$kernel_apic_object" "$kernel_memory_object" \
   "$kernel_pci_object" "$kernel_rtl8125_object" \
   "$kernel_inference_status_object" \
   $device_result_link $poll_sched_link $model_handoff_link "$kernel_kototama_runtime_object" "$kotoba_kototama_management_object" \
