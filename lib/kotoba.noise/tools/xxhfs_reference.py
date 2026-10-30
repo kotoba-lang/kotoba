@@ -111,7 +111,8 @@ class Side:
             elif tok == 'ekem1':
                 ct, ss = self.kem.encaps(self.re1, self.m); out += self.enc_hash(ct); self.mix_key(ss)
             else: self.mix_key(self.dh(tok))
-        out += self.enc_hash(payload); self._advance(); return out
+        # a callable payload is computed from h after the tokens (the ADR-0001 identity)
+        out += self.enc_hash(payload(self.h) if callable(payload) else payload); self._advance(); return out
     def read(self, msg):
         pos = 0
         for tok in self.msgs[self.i]:
@@ -123,6 +124,7 @@ class Side:
                 elif tok == 'e1': self.re1 = v
                 else: self.mix_key(self.kem.decaps(self.dz, v))
             else: self.mix_key(self.dh(tok))
+        self.h_before_payload = self.h
         pt = self.dec_hash(msg[pos:]); self._advance(); return pt
     def _advance(self):
         self.i += 1
@@ -136,14 +138,18 @@ class Side:
         pt = C.open_(self.recv, nonce(self.rn), b'', ct); assert pt is not None; self.rn += 1; return pt
 
 def run(pattern, keys, payloads, kem=None, kem_init=None, kem_resp=None):
-    """Both sides through the handshake then transport; -> (messages, handshake hash)."""
+    """Both sides through the handshake then transport; -> (messages, handshake hash).
+    A payload may be a function of h after the message's tokens (an identity payload)."""
     i = Side(pattern, True, keys['is'], keys['ie'], keys['prologue'], kem, *(kem_init or (None, None)))
     r = Side(pattern, False, keys['rs'], keys['re'], keys['prologue'], kem, *(kem_resp or (None, None)))
     out = []
     for j, p in enumerate(payloads):
         a, b = (i, r) if j % 2 == 0 else (r, i)
         if j < 3:
-            c = a.write(p); assert b.read(c) == p
+            h_tokens = []
+            c = a.write((lambda h, f=p: (h_tokens.append(h), f(h))[1]) if callable(p) else p)
+            got = b.read(c)
+            assert got == (p(h_tokens[0]) if callable(p) else p) and (not callable(p) or b.h_before_payload == h_tokens[0])
         else:
             c = a.t_encrypt(p); assert b.t_decrypt(c) == p
         out.append(c)
@@ -158,3 +164,30 @@ def self_check(vector):
 
 def workdir():
     return tempfile.mkdtemp(prefix='xxhfs-')
+
+# --- ADR-0001 identity payload --------------------------------------------------------
+LABEL = b'kotoba-noise-pq-identity/v1\n'
+_DSA = None
+def _dsa():
+    global _DSA
+    if _DSA is None:
+        spec = importlib.util.spec_from_file_location('mldsa_ref', os.path.join(LIB, 'gov.nist.mlDsa', 'tools', 'reference.py'))
+        _DSA = importlib.util.module_from_spec(spec); spec.loader.exec_module(_DSA)
+    return _DSA
+def ed25519(workdir, seed, msg):
+    """-> (public key, signature) through openssl, from the raw RFC 8032 seed."""
+    der = os.path.join(workdir, 'ed-' + seed.hex()[:12] + '.der')
+    open(der, 'wb').write(bytes.fromhex('302e020100300506032b657004220420') + seed)
+    pub = _run('pkey', '-in', der, '-inform', 'DER', '-pubout', '-outform', 'DER')[-32:]
+    mf = os.path.join(workdir, 'ed-msg.bin'); open(mf, 'wb').write(msg)
+    sig = _run('pkeyutl', '-sign', '-inkey', der, '-keyform', 'DER', '-rawin', '-in', mf)
+    return pub, sig
+def identity_payload(workdir, ed_seed, xi, h):
+    d = _dsa()
+    pk, sk = d.keygen(xi)
+    msg = LABEL + h
+    edpub, edsig = ed25519(workdir, ed_seed, msg)
+    mu = d.mu_of(sk[64:128], bytes([0, 0]) + msg, True)   # pure ML-DSA, empty context
+    sig = d.sign_mu(sk, mu, bytes(32))                     # deterministic
+    assert d.verify_mu(pk, d.mu_of(pk, bytes([0, 0]) + msg), sig)
+    return edpub + pk + edsig + sig

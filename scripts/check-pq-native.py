@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run the native post-quantum and secure-channel known-answer gates and their mutants
 (JUN-352 P1b: SHA-3, ML-KEM-768, ML-DSA-65; AWAI-117: X25519, ChaCha20-Poly1305 and
-XChaCha20-Poly1305, the pqh-v1 hybrid KEM; JUN-352: AES and AES-GCM; AWAI-102: X-Wing, Noise and Noise XXhfs).
+XChaCha20-Poly1305, the pqh-v1 hybrid KEM; JUN-352: AES and AES-GCM; AWAI-102: X-Wing, Noise, Noise XXhfs and its identity payload).
 
 Each gate is one unity source: the library bodies with their `ns` forms removed, the
 `sha3/` alias dropped, then the gate body. The gate's main returns a bitmask; a pass is
@@ -93,10 +93,22 @@ MODULE_GATES = {
                                                   'noise/native.kotoba': 'lib/kotoba.noise/kotoba/noise/native.kotoba',
                                                   'noise/xxhfs_gate.kotoba': 'lib/kotoba.noise/kotoba/noise/xxhfs_gate.kotoba'}),
                   gate_ns='noise.xxhfs-gate', groups={'i': 63, 'r': 63}, mutants={
-        'w-mixkey': ('noise/native.kotoba', '(recur (+ i 1) (mix-key (slice o 0 1645) (slice kc 0 32))', '(recur (+ i 1) (slice o 0 1645)'),
-        'r-mixkey': ('noise/native.kotoba', '(recur (+ i 1) (mix-key (slice o 0 1645) ss) (+ pos n))', '(recur (+ i 1) (slice o 0 1645) (+ pos n))'),
+        'w-mixkey': ('noise/native.kotoba', '(recur (+ i 1) (mix-key (slice o 0 1646) (slice kc 0 32))', '(recur (+ i 1) (slice o 0 1646)'),
+        'r-mixkey': ('noise/native.kotoba', '(recur (+ i 1) (mix-key (slice o 0 1646) ss) (+ pos n))', '(recur (+ i 1) (slice o 0 1646) (+ pos n))'),
         'e1-hash': ('noise/native.kotoba', '(let [o (encrypt-and-hash st (slice (kem-pair st) 0 1184))]', '(let [o (cat st (slice (kem-pair st) 0 1184))]'),
         'kem-half': ('noise/native.kotoba', '(k/decaps (slice (kem-pair o) 1184 2400)', '(k/decaps (slice (kem-pair o) 0 2400)'),
+    }),
+    'identity': dict(files=dict(X25519, **CHACHA, **{'sha2/core.kotoba': 'lib/gov.nist.sha2/kotoba/sha2/core.kotoba',
+                                                     'sha3/core.kotoba': SHA3, 'mlkem/core.kotoba': 'lib/gov.nist.mlKem/kotoba/mlkem/core.kotoba',
+                                                     'mldsa/core.kotoba': 'lib/gov.nist.mlDsa/kotoba/mldsa/core.kotoba',
+                                                     'ed25519/selfhost.kotoba': 'lib/org.ietf.ed25519/kotoba/ed25519/selfhost.kotoba',
+                                                     'noise/native.kotoba': 'lib/kotoba.noise/kotoba/noise/native.kotoba',
+                                                     'noise/identity.kotoba': 'lib/kotoba.noise/kotoba/noise/identity.kotoba',
+                                                     'noise/identity_gate.kotoba': 'lib/kotoba.noise/kotoba/noise/identity_gate.kotoba'}),
+                     gate_ns='noise.identity-gate', groups={'i': 127, 'r': 127}, mutants={
+        'no-want': ('noise/identity.kotoba', '       (same? (slice p 0 1984) want)\n', ''),
+        'no-dsa': ('noise/identity.kotoba', '              (dsa/verify (slice p 32 1952) msg (vector-i64) (slice p 2048 3309))))))', '              true))))'),
+        'no-ed': ('noise/identity.kotoba', '         (and (ed/verify? (slice p 0 32) msg (slice p 1984 64))', '         (and true'),
     }),
     'aes': dict(files={f'aes/{n}.kotoba': f'lib/gov.nist.aes/kotoba/aes/{n}.kotoba' for n in ['core', 'gcm', 'native_gate']},
                 gate_ns='aes.native-gate', groups={'a': 15, 'b': 7, 'c': 7}, mutants={
