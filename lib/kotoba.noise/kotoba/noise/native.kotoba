@@ -1,6 +1,7 @@
 ;; noise.native -- the Noise Protocol Framework (rev 34) for
-;; Noise_{NN,XX,IK}_25519_ChaChaPoly_SHA256 in native .kotoba (AWAI-102). XX is the
-;; libp2p handshake. Built on the native X25519 (org.ietf.x25519), ChaCha20-Poly1305
+;; Noise_{NN,XX,IK}_25519_ChaChaPoly_SHA256 and, with the hfs modifier (noise_hfs_spec
+;; 025f0f60, docs/ADR-0001), Noise_XXhfs_25519+MLKEM768_ChaChaPoly_SHA256, in native
+;; .kotoba (AWAI-102). XX is the libp2p handshake. Built on the native X25519 (org.ietf.x25519), ChaCha20-Poly1305
 ;; (org.ietf.chacha20Poly1305) and SHA-256 / HMAC (gov.nist.sha2); ported from the
 ;; .cljk core in src/noise/ (handshake_state, symmetric_state, cipher_state).
 ;;
@@ -8,10 +9,15 @@
 ;;   0 ck(32) 32 h(32) 64 k(32) 96 has-k 97 n 98 s.priv(32) 130 s.pub(32)
 ;;   162 e.priv(32) 194 e.pub(32) 226 rs(32) 258 has-rs 259 re(32) 291 has-re
 ;;   292 message index 293 initiator? 294 pattern 295 done? 296 c1.k(32) 328 c1.n
-;;   329 c2.k(32) 361 c2.n          (STATE = 362)
+;;   329 c2.k(32) 361 c2.n 362 ML-KEM d || z (64) 426 ML-KEM m (32)
+;;   458 received e1 (1184) 1642 has-e1 1643 has-d-z 1644 has-m   (STATE = 1645)
 ;;   initialize pattern initiator? s-priv e-priv rs prologue -> state
-;;       pattern 0 = NN, 1 = XX, 2 = IK; rs is the peer's static key (IK initiator)
-;;       or an empty vector; the caller supplies the ephemeral private key
+;;       pattern 0 = NN, 1 = XX, 2 = IK, 3 = XXhfs; rs is the peer's static key (IK
+;;       initiator) or an empty vector; the caller supplies the ephemeral private key
+;;   set-kem st d-z m -> st with the XXhfs KEM randomness: the FIPS 203 keyGen seed
+;;       d || z (64 bytes) for this side's e1, and m (32) for its ekem1 encapsulation;
+;;       either may be empty when this side never uses it. The KEM tokens refuse
+;;       (empty message) when their input is missing.
 ;;   write-message st payload -> st' ++ message; read-message st message -> st' ++
 ;;       payload. Both give an empty vector when it is not this side's turn, a MAC
 ;;       fails, the message is too short, or the handshake is already done.
@@ -20,11 +26,11 @@
 ;;   handshake-hash st (empty until the handshake is done), remote-static st, state-size
 ;; Not constant time: see the README.
 (ns noise.native
-  (:require [sha2.core :as h] [x25519.core :as x] [chacha20.aead :as a])
+  (:require [sha2.core :as h] [x25519.core :as x] [chacha20.aead :as a] [mlkem.core :as k])
   (:export [initialize write-message read-message transport-encrypt transport-decrypt
-            handshake-hash remote-static state-size]))
+            handshake-hash remote-static state-size set-kem]))
 
-(defn state-size [] :i64 362)
+(defn state-size [] :i64 1645)
 (defn- cat [p :vector-i64 q :vector-i64] :vector-i64
   (let [np (vector-count p) out (vector-alloc (+ np (vector-count q)))]
     (loop [i 0] (if (= i (vector-count out)) out
@@ -39,16 +45,20 @@
 (defn- nine [] :vector-i64 (vector-i64 9 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0))
 
 (defn- protocol-name [pattern :i64] :vector-i64
-  ;; each name is exactly 32 bytes, so h starts as the name itself (section 5.2)
-  (cond (= pattern 0) (vector-i64 78 111 105 115 101 95 78 78 95 50 53 53 49 57 95 67 104 97 67 104 97 80 111 108 121 95 83 72 65 50 53 54)
+  ;; NN / XX / IK names are exactly 32 bytes, so h starts as the name itself; the
+  ;; XXhfs name is 44 bytes, so h starts as its SHA-256 (section 5.2)
+  (cond (= pattern 3) (vector-i64 78 111 105 115 101 95 88 88 104 102 115 95 50 53 53 49 57 43 77 76 75 69 77 55 54 56 95 67 104 97 67 104 97 80 111 108 121 95 83 72 65 50 53 54)
+        (= pattern 0) (vector-i64 78 111 105 115 101 95 78 78 95 50 53 53 49 57 95 67 104 97 67 104 97 80 111 108 121 95 83 72 65 50 53 54)
         (= pattern 1) (vector-i64 78 111 105 115 101 95 88 88 95 50 53 53 49 57 95 67 104 97 67 104 97 80 111 108 121 95 83 72 65 50 53 54)
         :else (vector-i64 78 111 105 115 101 95 73 75 95 50 53 53 49 57 95 67 104 97 67 104 97 80 111 108 121 95 83 72 65 50 53 54)))
 (defn- tokens [pattern :i64] :vector-i64
-  ;; e 1, s 2, ee 3, es 4, se 5, ss 6; -1 ends a message (section 7.4 / 7.5)
-  (cond (= pattern 0) (vector-i64 1 -1 1 3 -1)
+  ;; e 1, s 2, ee 3, es 4, se 5, ss 6, e1 7, ekem1 8; -1 ends a message (section 7.4 / 7.5;
+  ;; XXhfs per noise_hfs_spec section 5: -> e, e1  <- e, ee, ekem1, s, es  -> s, se)
+  (cond (= pattern 3) (vector-i64 1 7 -1 1 3 8 2 4 -1 2 5 -1)
+        (= pattern 0) (vector-i64 1 -1 1 3 -1)
         (= pattern 1) (vector-i64 1 -1 1 3 2 4 -1 2 5 -1)
         :else (vector-i64 1 4 2 6 -1 1 3 5 -1)))
-(defn- message-count [pattern :i64] :i64 (if (= pattern 1) 3 2))
+(defn- message-count [pattern :i64] :i64 (if (or (= pattern 1) (= pattern 3)) 3 2))
 (defn- message-tokens [pattern :i64 index :i64] :vector-i64
   (let [t (tokens pattern)]
     (loop [i 0 m 0 start 0]
@@ -96,9 +106,19 @@
           (= token 5) (if init (x/x25519-bytes s re) (x/x25519-bytes e rs))
           :else (x/x25519-bytes s rs))))
 
+(defn- kem-pair [st :vector-i64] :vector-i64
+  ;; this side's ML-KEM-768 ek (1184) ++ dk (2400), from the d || z set by set-kem
+  (k/keygen (slice st 362 32) (slice st 394 32)))
+
+(defn set-kem [st :vector-i64 d-z :vector-i64 m :vector-i64] :vector-i64
+  (if (not (= (vector-count st) 1645)) (vector-i64)
+    (let [s2 (if (= (vector-count d-z) 64) (put1 (put st 362 d-z) 1643 1) st)]
+      (if (= (vector-count m) 32) (put1 (put s2 426 m) 1644 1) s2))))
+
 (defn initialize [pattern :i64 initiator :bool s-priv :vector-i64 e-priv :vector-i64 rs :vector-i64 prologue :vector-i64] :vector-i64
   (let [name (protocol-name pattern)
-        st0 (put (put (vector-alloc 362) 0 name) 32 name)
+        h0 (if (= (vector-count name) 32) name (h/sha256 name))
+        st0 (put (put (vector-alloc 1645) 0 h0) 32 h0)
         st1 (put1 (put1 (put1 st0 293 (if initiator 1 0)) 294 pattern) 292 0)
         st2 (if (= (vector-count s-priv) 32) (put (put st1 98 s-priv) 130 (x/x25519-bytes s-priv (nine))) st1)
         st3 (if (= (vector-count e-priv) 32) (put (put st2 162 e-priv) 194 (x/x25519-bytes e-priv (nine))) st2)
@@ -114,20 +134,32 @@
     (if (= (vector-at st2 292) (message-count (vector-at st2 294))) (split st2) st2)))
 
 (defn write-message [st :vector-i64 payload :vector-i64] :vector-i64
-  (if (or (not (= (vector-count st) 362)) (not (my-turn? st))) (vector-i64)
+  (if (or (not (= (vector-count st) 1645)) (not (my-turn? st))) (vector-i64)
     (let [ts (message-tokens (vector-at st 294) (vector-at st 292))
           r (loop [i 0 st st msg (vector-i64)]
               (if (= i (vector-count ts)) (cat st msg)
                 (let [t (vector-at ts i)]
                   (cond (= t 1) (recur (+ i 1) (mix-hash st (slice st 194 32)) (cat msg (slice st 194 32)))
                         (= t 2) (let [o (encrypt-and-hash st (slice st 130 32))]
-                                  (recur (+ i 1) (slice o 0 362) (cat msg (slice o 362 (- (vector-count o) 362)))))
+                                  (recur (+ i 1) (slice o 0 1645) (cat msg (slice o 1645 (- (vector-count o) 1645)))))
+                        ;; e1: this side's ML-KEM-768 ek, sent like a static key
+                        (= t 7) (if (= (vector-at st 1643) 0) (vector-i64)
+                                  (let [o (encrypt-and-hash st (slice (kem-pair st) 0 1184))]
+                                    (recur (+ i 1) (slice o 0 1645) (cat msg (slice o 1645 (- (vector-count o) 1645))))))
+                        ;; ekem1: encapsulate to the received e1, send the ciphertext, then MixKey(ss)
+                        (= t 8) (if (or (= (vector-at st 1644) 0) (= (vector-at st 1642) 0)) (vector-i64)
+                                  (let [kc (k/encaps (slice st 458 1184) (slice st 426 32))]
+                                    (if (= (vector-count kc) 0) (vector-i64)
+                                      (let [o (encrypt-and-hash st (slice kc 32 1088))]
+                                        (recur (+ i 1) (mix-key (slice o 0 1645) (slice kc 0 32))
+                                               (cat msg (slice o 1645 (- (vector-count o) 1645))))))))
                         :else (recur (+ i 1) (mix-key st (dh st t)) msg)))))
-          o (encrypt-and-hash (slice r 0 362) payload)]
-      (cat (finish (slice o 0 362)) (cat (slice r 362 (- (vector-count r) 362)) (slice o 362 (- (vector-count o) 362)))))))
+          o (if (< (vector-count r) 1645) (vector-i64) (encrypt-and-hash (slice r 0 1645) payload))]
+      (if (= (vector-count o) 0) (vector-i64)
+        (cat (finish (slice o 0 1645)) (cat (slice r 1645 (- (vector-count r) 1645)) (slice o 1645 (- (vector-count o) 1645))))))))
 
 (defn read-message [st :vector-i64 message :vector-i64] :vector-i64
-  (if (or (not (= (vector-count st) 362)) (my-turn? st) (= (vector-at st 295) 1)) (vector-i64)
+  (if (or (not (= (vector-count st) 1645)) (my-turn? st) (= (vector-at st 295) 1)) (vector-i64)
     (let [ts (message-tokens (vector-at st 294) (vector-at st 292))
           ;; -> st ++ [position] while reading; empty on failure
           r (loop [i 0 st st pos 0]
@@ -140,21 +172,35 @@
                                   (if (> (+ pos n) (vector-count message)) (vector-i64)
                                     (let [o (decrypt-and-hash st (slice message pos n))]
                                       (if (= (vector-count o) 0) (vector-i64)
-                                        (recur (+ i 1) (put1 (put (slice o 0 362) 226 (slice o 362 32)) 258 1) (+ pos n))))))
+                                        (recur (+ i 1) (put1 (put (slice o 0 1645) 226 (slice o 1645 32)) 258 1) (+ pos n))))))
+                        ;; e1: the peer's ML-KEM-768 ek
+                        (= t 7) (let [n (if (= (vector-at st 96) 1) 1200 1184)]
+                                  (if (> (+ pos n) (vector-count message)) (vector-i64)
+                                    (let [o (decrypt-and-hash st (slice message pos n))]
+                                      (if (= (vector-count o) 0) (vector-i64)
+                                        (recur (+ i 1) (put1 (put (slice o 0 1645) 458 (slice o 1645 1184)) 1642 1) (+ pos n))))))
+                        ;; ekem1: decrypt the ciphertext, decapsulate with this side's dk, MixKey(ss)
+                        (= t 8) (let [n (if (= (vector-at st 96) 1) 1104 1088)]
+                                  (if (or (= (vector-at st 1643) 0) (> (+ pos n) (vector-count message))) (vector-i64)
+                                    (let [o (decrypt-and-hash st (slice message pos n))]
+                                      (if (= (vector-count o) 0) (vector-i64)
+                                        (let [ss (k/decaps (slice (kem-pair o) 1184 2400) (slice o 1645 1088))]
+                                          (if (= (vector-count ss) 0) (vector-i64)
+                                            (recur (+ i 1) (mix-key (slice o 0 1645) ss) (+ pos n))))))))
                         :else (recur (+ i 1) (mix-key st (dh st t)) pos)))))]
       (if (= (vector-count r) 0) (vector-i64)
-        (let [pos (vector-at r 362) o (decrypt-and-hash (slice r 0 362) (slice message pos (- (vector-count message) pos)))]
+        (let [pos (vector-at r 1645) o (decrypt-and-hash (slice r 0 1645) (slice message pos (- (vector-count message) pos)))]
           (if (= (vector-count o) 0) (vector-i64)
-            (cat (finish (slice o 0 362)) (slice o 362 (- (vector-count o) 362)))))))))
+            (cat (finish (slice o 0 1645)) (slice o 1645 (- (vector-count o) 1645)))))))))
 
 ;; --- transport (section 5.1 CipherState after Split) ------------------------------
 (defn transport-encrypt [st :vector-i64 payload :vector-i64] :vector-i64
-  (if (or (not (= (vector-count st) 362)) (= (vector-at st 295) 0)) (vector-i64)
+  (if (or (not (= (vector-count st) 1645)) (= (vector-at st 295) 0)) (vector-i64)
     (let [init (= (vector-at st 293) 1) koff (if init 296 329) noff (if init 328 361)
           ct (a/seal (slice st koff 32) (nonce (vector-at st noff)) (vector-i64) payload)]
       (cat (put1 st noff (+ (vector-at st noff) 1)) ct))))
 (defn transport-decrypt [st :vector-i64 message :vector-i64] :vector-i64
-  (if (or (not (= (vector-count st) 362)) (= (vector-at st 295) 0)) (vector-i64)
+  (if (or (not (= (vector-count st) 1645)) (= (vector-at st 295) 0)) (vector-i64)
     (let [init (= (vector-at st 293) 1) koff (if init 329 296) noff (if init 361 328)
           pt (a/open (slice st koff 32) (nonce (vector-at st noff)) (vector-i64) message)]
       (if (and (= (vector-count pt) 1) (= (vector-at pt 0) -1)) (vector-i64)
@@ -162,6 +208,6 @@
 
 (defn handshake-hash [st :vector-i64] :vector-i64
   ;; empty unless st is a state whose handshake is done
-  (if (and (= (vector-count st) 362) (= (vector-at st 295) 1)) (slice st 32 32) (vector-i64)))
+  (if (and (= (vector-count st) 1645) (= (vector-at st 295) 1)) (slice st 32 32) (vector-i64)))
 (defn remote-static [st :vector-i64] :vector-i64
-  (if (and (= (vector-count st) 362) (= (vector-at st 258) 1)) (slice st 226 32) (vector-i64)))
+  (if (and (= (vector-count st) 1645) (= (vector-at st 258) 1)) (slice st 226 32) (vector-i64)))
