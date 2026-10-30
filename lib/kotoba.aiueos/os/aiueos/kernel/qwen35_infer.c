@@ -1002,6 +1002,28 @@ static int linear_zero_coefficient(const float *query, const float *key,
 #endif
 }
 
+/* The residual add each layer ends with, state[i] += x[i] over EMBED floats. In the model-handoff image it is
+   kotoba/qwen35-residual.kotoba (JUN-554, over amu ADR 0391's scalar SSE f32), called per 4096 floats (16 KiB, its
+   window); the parity profiles and the host smokes, which do not link it, keep the C. Every element's add is
+   independent, so the chunks and the C's vectorized loop give the same bits. */
+#if defined(AIUEOS_QWEN38_MODEL_HANDOFF) && !defined(AIUEOS_QWEN35_TESTING)
+extern int64_t kotoba_aiueos_qwen35_residual_add(uint64_t state, uint64_t state_bytes, uint64_t x, uint64_t x_bytes);
+static int residual_add(float *state, const float *x) {
+  for (uint32_t done = 0; done < EMBED; done += 4096U) {
+    uint32_t part = EMBED - done < 4096U ? EMBED - done : 4096U;
+    if (kotoba_aiueos_qwen35_residual_add((uint64_t)(uintptr_t)(state + done), (uint64_t)part * 4,
+                                          (uint64_t)(uintptr_t)(x + done), (uint64_t)part * 4) != 1)
+      return 0;
+  }
+  return 1;
+}
+#else
+static int residual_add(float *state, const float *x) {
+  for (uint32_t index = 0; index < EMBED; index++) state[index] += x[index];
+  return 1;
+}
+#endif
+
 static int ffn(const struct aiueos_qwen35_layer *layer) {
   if (!rms_norm(state, &layer->post_attention_norm, EMBED, normalized) ||
       !matvec(&layer->ffn_gate, normalized, EMBED, scratch_a, FFN) ||
@@ -1009,8 +1031,7 @@ static int ffn(const struct aiueos_qwen35_layer *layer) {
       !activate(QWEN_ACT_SILU_GATE, scratch_a, scratch_b, FFN))
     return 0;
   if (!matvec(&layer->ffn_down, scratch_a, FFN, scratch_b, EMBED)) return 0;
-  for (uint32_t index = 0; index < EMBED; index++) state[index] += scratch_b[index];
-  return 1;
+  return residual_add(state, scratch_b);
 }
 
 static const float *resolved_cached_key(
@@ -1157,7 +1178,7 @@ static int linear_attention(const struct aiueos_qwen35_layer *layer,
 
   if (!matvec(&linear->output, gated, LINEAR_INNER, normalized, EMBED))
     return fail_at(AIUEOS_QWEN35_FAILURE_LINEAR_OUTPUT);
-  for (uint32_t index = 0; index < EMBED; index++) state[index] += normalized[index];
+  if (!residual_add(state, normalized)) return fail_at(AIUEOS_QWEN35_FAILURE_LINEAR_OUTPUT);
   return 1;
 }
 
@@ -1447,7 +1468,7 @@ static int full_attention(const struct aiueos_qwen35_layer *layer,
   }
   if (!matvec(&full->output, scratch_c, LINEAR_INNER, normalized, EMBED))
     return fail_at(AIUEOS_QWEN35_FAILURE_FULL_OUTPUT);
-  for (uint32_t index = 0; index < EMBED; index++) state[index] += normalized[index];
+  if (!residual_add(state, normalized)) return fail_at(AIUEOS_QWEN35_FAILURE_FULL_OUTPUT);
   return 1;
 }
 
