@@ -1234,7 +1234,7 @@ struct virtio_caps {
 };
 
 extern uint64_t kotoba_aiueos_virtio_cap_valid(
-  uint64_t pointer, uint64_t cap_length, uint64_t bar, uint64_t offset, uint64_t length); extern int64_t kotoba_aiueos_virtio_caps_find(uint64_t header, uint64_t header_length, uint64_t record, uint64_t record_length); extern int64_t kotoba_aiueos_virtio_negotiate(uint64_t cfg, uint64_t length); extern int64_t kotoba_aiueos_virtio_queue_setup(uint64_t cfg, uint64_t length, uint64_t record, uint64_t record_length); extern int64_t kotoba_aiueos_virtq_post(uint64_t desc, uint64_t desc_length, uint64_t avail, uint64_t avail_length, uint64_t record, uint64_t record_length); extern int64_t kotoba_aiueos_virtq_used_index(uint64_t used, uint64_t used_length); extern int64_t kotoba_aiueos_virtq_used_elem(uint64_t used, uint64_t used_length, uint64_t slot); extern int64_t kotoba_aiueos_virtq_wait(uint64_t used, uint64_t used_length, uint64_t counter, uint64_t counter_length, uint64_t before, uint64_t want, uint64_t rounds);
+  uint64_t pointer, uint64_t cap_length, uint64_t bar, uint64_t offset, uint64_t length); extern int64_t kotoba_aiueos_virtio_caps_find(uint64_t header, uint64_t header_length, uint64_t record, uint64_t record_length); extern int64_t kotoba_aiueos_virtio_negotiate(uint64_t cfg, uint64_t length); extern int64_t kotoba_aiueos_virtio_queue_setup(uint64_t cfg, uint64_t length, uint64_t record, uint64_t record_length); extern int64_t kotoba_aiueos_virtq_post(uint64_t desc, uint64_t desc_length, uint64_t avail, uint64_t avail_length, uint64_t record, uint64_t record_length); extern int64_t kotoba_aiueos_virtq_used_index(uint64_t used, uint64_t used_length); extern int64_t kotoba_aiueos_virtq_used_elem(uint64_t used, uint64_t used_length, uint64_t slot); extern int64_t kotoba_aiueos_virtq_wait(uint64_t used, uint64_t used_length, uint64_t counter, uint64_t counter_length, uint64_t before, uint64_t want, uint64_t rounds); extern uint64_t kotoba_aiueos_kbd_reap(uint64_t used, uint64_t used_length, uint64_t avail, uint64_t avail_length, uint64_t event, uint64_t event_length, uint64_t state);
 extern uint64_t kotoba_aiueos_pci_extent_valid(uint64_t value, uint64_t size);
 extern uint64_t kotoba_aiueos_pci_region_valid(
   uint64_t offset, uint64_t bytes, uint64_t bar_length); extern int64_t kotoba_aiueos_pci_bar_kind(int64_t low, int64_t index); extern int64_t kotoba_aiueos_pci_bar_value(int64_t low, int64_t high); extern int64_t kotoba_aiueos_pci_bar_base(int64_t low, int64_t high, int64_t index); extern int64_t kotoba_aiueos_pci_bar_size(int64_t mask_low, int64_t mask_high, int64_t kind);
@@ -2022,22 +2022,22 @@ static uint32_t kbd_recycle(int want_press) {
   __asm__ volatile("" ::: "memory");
   uint16_t n = kbd_used->index;
   while (kbd_seen != n) {
-    uint32_t id = kbd_used->ring[kbd_seen % 4].id;
+    /* kotoba/kbd-reap.o reads used element kbd_seen % 4, skips an id past 3 (1),
+       else reads its event and hands the buffer back on the available ring, ring
+       entry before index (2 | key << 2: the press or key event want_press asks for). */
+    uint64_t got = kotoba_aiueos_kbd_reap((uint64_t)(uintptr_t)kbd_used, 4096, (uint64_t)(uintptr_t)kbd_avail, 4096,
+        (uint64_t)(uintptr_t)kbd_event, 4096, (uint64_t)kbd_seen | (uint64_t)(want_press & 3) << 16);
     kbd_seen++;
-    if (id > 3) continue;
-    struct virtio_input_event *ev = kbd_event + id;
+    /* kbd_seen, the event counter, the doorbell and the break stay here, in the
+       order the C had them. */
+    if (got < 2) continue;
     /* Every used entry the reap path touches is counted here, and only here
        (JUN-34, measured 2026-10-23: the boot probe used to count its own read
        of ring slot 0 and the poll path then re-read the same entry, so the
        ring evidence double-counted and lagged what the desktop actually saw). */
     aiueos_input_ring_events++;
-    if (want_press == 1 && !press && ev->type == 1 && ev->value == 1 && ev->code)
-      press = ev->code;
-    if (want_press == 2 && !press && ev->type == 1 && ev->value <= 2 && ev->code)
-      press = (uint32_t)ev->code * 4U + ev->value;
-    kbd_avail->ring[kbd_avail->index % 4] = (uint16_t)id;
+    press = (uint32_t)(got >> 2);
     __asm__ volatile("" ::: "memory");
-    kbd_avail->index++;
     *kbd_doorbell = 0;
     if (press) break;
   }
