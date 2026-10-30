@@ -1,6 +1,9 @@
 #!/bin/sh
 set -eu
 
+# The management protocol is kotoba/kototama-management.o (JUN-554), which a host cc cannot link; this host build uses
+# scripts/kototama-management-diff/host-standin.c, and scripts/kototama-management-diff compares the object itself.
+
 repo=$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)
 work=$(mktemp -d "${TMPDIR:-/tmp}/aiueos-kototama-runtime.XXXXXX")
 trap 'rm -rf "$work"' EXIT HUP INT TERM
@@ -9,6 +12,7 @@ ${CC:-cc} -std=c11 -O2 \
   -DAIUEOS_QWEN38_MODEL_HANDOFF=1 \
   -o "$work/kototama-runtime" \
   "$repo/os/aiueos/kernel/kototama_runtime.c" \
+  "$repo/os/aiueos/scripts/kototama-management-diff/host-standin.c" \
   "$repo/os/aiueos/scripts/kototama_runtime_model.c"
 "$work/kototama-runtime"
 
