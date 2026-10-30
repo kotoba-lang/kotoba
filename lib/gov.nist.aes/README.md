@@ -176,6 +176,7 @@ Built as modules and measured 2026-10-30 on Apple M1 Max with the Amu Mac root o
 Not yet: the other 255 corpus cases natively, decryption of single blocks (GCM does not
 need it), AES-GCM-SIV, and a measurement of timing (the S-box is a table lookup).
 
+## Not here
 
 **Decryption.** GCM, CTR and CCM never invoke the inverse cipher: they
 encrypt a counter and XOR. `InvMixColumns` and an inverse key schedule would

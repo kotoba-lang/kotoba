@@ -123,6 +123,7 @@ Measured 2026-10-30 on Apple M1 Max with the Amu Mac root of main `91faa123`:
 Not run natively: the thousand-round iteration, input-length refusal (the native
 `x25519-bytes` takes 32-byte vectors and does not check), and Wycheproof.
 
+## Not here
 
 **X448.** RFC 7748 defines it too, over a different prime with a different
 limb layout — a second field implementation, not a parameter. Nothing in this

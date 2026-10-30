@@ -75,5 +75,5 @@ Measured 2026-10-30 on Apple M1 Max with the Amu Mac root of main `91faa123`
   (pre-hash) or the external-mu sigGen interface with a separate `tr`.
 - **Heap.** Inside one image a signing that rejects 500-700 times traps (no output)
   before the 814-iteration bound.
-- **Coverage.** The gate runs 12 ACVP cases natively, not the full groups; no x86_64 run
-  and no CI job yet.
+- **Coverage.** The gate runs 12 ACVP cases natively, not the full groups; no x86_64 run.
+  The gate runs in CI on Linux arm64 (`scripts/check-pq-native.py`, since kotoba#1014).

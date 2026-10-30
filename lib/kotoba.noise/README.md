@@ -192,6 +192,7 @@ other implementations test against. The post-quantum extension (ML-KEM-768 mixed
 handshake, Ed25519 + ML-DSA-65 over the handshake hash) is the next step of AWAI-102; this
 port alone is classical X25519.
 
+## Design record
 
 `com-junkawasaki/root` ADR-2607266500 (`90-docs/adr/`) — the overlay data-plane
 gap this closes, and the split between what is implemented and what is injected.
