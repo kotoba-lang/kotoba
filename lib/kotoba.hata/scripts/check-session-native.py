@@ -21,6 +21,7 @@ import argparse
 import hashlib
 import importlib.util
 import re
+import shutil
 import socket
 import subprocess
 import time
@@ -36,7 +37,10 @@ BR = importlib.util.module_from_spec(spec); spec.loader.exec_module(BR)
 # every namespace this driver may reach, by file; the closure is computed from :require
 CANDIDATES = {
     **{f'hata/{n}.kotoba': LIB / f'src/hata/{n}.kotoba' for n in
-       ['codec', 'admission', 'authority', 'quorum', 'seal', 'store_io', 'read', 'replica', 'wire']},
+       ['codec', 'admission', 'authority', 'quorum', 'seal', 'store_io', 'read', 'replica', 'wire',
+        'broker', 'store', 'audit']},
+    'hata/broker_fixture.kotoba': LIB / 'test/broker_fixture.kotoba',
+    'kototama/effect_origins.kotoba': LIB.parent / 'kotoba.kototama/src/kototama/effect_origins.kotoba',
     'hata/quorum_fixture.kotoba': LIB / 'test/quorum_fixture.kotoba',
     'hata/authority_fixture.kotoba': LIB / 'test/authority_fixture.kotoba',
     'hata/session_native_test.kotoba': LIB / 'test/session_native.kotoba',
@@ -184,7 +188,44 @@ def main():
     # failures up to the budget (3): the listener stops before any vote
     guarded('guarded-budget-exhausted', 47241, 3, attacks[:3], -31, -62)
     assert not (coordinator / 'vote3').exists(), 'an exhausted listener produced a vote'
-    gate.finish('PASS_NATIVE_BROKER_SESSIONS', replicas=3, controls=5)
+    # The effect: the sink installs the certified fence, the coordinator reserves a claim
+    # whose votes and commits travel over sessions too, and the claim is executed over a
+    # session. The sink takes entry, certificate, command and body only from the session;
+    # broker/execute re-checks them right there, before it dispatches.
+    sink = gate.out / 'sink'
+    sink.mkdir(mode=0o700)
+    for name in ['request', 'certificate']:
+        shutil.copyfile(coordinator / name, sink / name)
+    run('sink-install-fence', broker, ['install', str(sink), ''], 1)
+    for name in ['request', 'certificate']:
+        (sink / name).unlink()
+    run('reserve-claim', broker, ['reserve', str(coordinator), ''], 1)
+    for i in range(3):
+        exchange(f'claim-vote-{i}', 'ask-vote', i, 47250 + i, 1, 1)
+    run('claim-certificate-from-session-votes', broker, ['certificate', str(coordinator), ''], 1)
+    for i in range(3):
+        exchange(f'claim-commit-attest-{i}', 'ask-commit-attest', i, 47260 + i, 1, 1, serve='serve-commit-attest')
+    def execute(label, mode, port, want):
+        addr = f'127.0.0.1:{port}'
+        server = subprocess.Popen([str(session), 'serve-execute', str(sink), addr], cwd=gate.out,
+                                  env=env(KEXE_CAP_RESOURCES_43=addr), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        time.sleep(0.5)
+        try:
+            run(f'{label}-ask', session, [mode, str(coordinator), addr], want, KEXE_CAP_RESOURCES_45=addr)
+        finally:
+            out, err = server.communicate(timeout=600)
+            (gate.out / f'{label}-serve.stdout').write_bytes(out); (gate.out / f'{label}-serve.stderr').write_bytes(err)
+        got = result(out)
+        gate.observations.append(dict(name=f'{label}-serve', exit=server.returncode, result=got))
+        print(f'{label}-serve', server.returncode, got, flush=True)
+        assert got == want, (label, server.returncode, got, err[-300:])
+    # a body other than the committed one: refused at dispatch, and nothing is consumed
+    execute('execute-tampered-body-refused', 'ask-execute-tampered', 47270, 0)
+    run('no-object-after-refusal', broker, ['empty-object', str(sink), ''], 1)
+    execute('execute-over-session', 'ask-execute', 47271, 1)
+    execute('execute-duplicate-no-second-effect', 'ask-execute', 47272, 2)
+    run('object-after-session-execute', broker, ['object', str(sink), ''], 1)
+    gate.finish('PASS_NATIVE_BROKER_SESSIONS', replicas=3, controls=6, effects=1)
 
 if __name__ == '__main__':
     main()

@@ -18,6 +18,10 @@
 ;;       The replica accepts only the next sequence number.
 ;;   ask-commit-replay ... : control -- after the commit, sends the same commit again where
 ;;       the attest belongs (sequence 1)
+;;   serve-execute BASE ADDR / ask-execute BASE ADDR : the coordinator sends a certified,
+;;       reserved claim's entry, certificate and command with the effect body to the sink
+;;       (role 5), which runs hata.broker/execute on exactly the bytes it received
+;;   ask-execute-tampered ... : control -- a body other than the one the C0 request commits to
 ;;   serve-guarded BASE ADDR INDEX BUDGET : serve-vote for a listener facing unauthenticated
 ;;       peers -- a 10 s deadline on each handshake read, failed handshakes closed, at most
 ;;       BUDGET (2-5) connections before it gives up (-62)
@@ -28,7 +32,8 @@
 (ns hata.session-native-test
   (:export [main]) (:capabilities [:cli/args])
   (:require [hata.codec :as c] [hata.replica :as replica] [hata.store-io :as io] [hata.quorum-fixture :as qf]
-            [hata.wire :as w] [noise.native :as n] [noise.identity :as id] [noise.tcp :as t]))
+            [hata.wire :as w] [noise.native :as n] [noise.identity :as id] [noise.tcp :as t]
+            [hata.broker :as broker] [hata.broker-fixture :as bf] [hata.authority-fixture :as f]))
 
 (defn- path [base :string name :string] :string (string-concat base (string-concat "/" name)))
 (defn- read [base :string name :string] :vector-i64
@@ -193,6 +198,54 @@
                     (if (or (bad? d1) (bad? r1)) -55
                       (if (write base (att-name index) (bytes-words r1)) 1 -56))))))))))))
 
+;; --- execute: the effect broker re-checks what it actually received ------------------
+;; The sink (role 5) takes the entry, certificate, command and body only from the session:
+;; body = for each of entry, certificate, command a 4-byte length and its bytes, then the
+;; effect body. broker/execute re-verifies the certificate, the C0 signatures and the body
+;; commitment on exactly those bytes before it dispatches.
+(defn- rd4 [b :vector-i64 off :i64] :i64
+  (+ (* 16777216 (vector-at b off)) (* 65536 (vector-at b (+ off 1))) (* 256 (vector-at b (+ off 2))) (vector-at b (+ off 3))))
+(defn- part [b :vector-i64 off :i64] :vector-i64
+  ;; the length-prefixed part at OFF, or [-1] when it does not fit
+  (if (> (+ off 4) (vector-count b)) (vector-i64 -1)
+    (let [n (rd4 b off)] (if (> (+ (+ off 4) n) (vector-count b)) (vector-i64 -1) (g-slice b (+ off 4) n)))))
+(defn- hello [] :vector-i64 (vector-i64 104 101 108 108 111))
+(defn- prefixed [ws :vector-i64] :vector-i64 (let [b (words-bytes ws)] (cat (be4 (vector-count b)) b)))
+
+(defn- serve-execute [base :string addr :string] :i64
+  (let [l (t/listen addr) s (t/accept l 20000) st (respond s 5 9)]
+    (if (= (vector-count st) 0) -71
+      (let [hh (n/handshake-hash st) d (n/transport-decrypt st (t/recv-frame s 20000))
+            b (if (bad? d) (vector-i64 -1) (w/open-request (tl d) 7 hh 0))
+            entry (if (bad? b) (vector-i64 -1) (part b 0))
+            o2 (+ 4 (vector-count entry)) cert (if (bad? entry) (vector-i64 -1) (part b o2))
+            o3 (+ (+ o2 4) (vector-count cert)) cmd (if (bad? cert) (vector-i64 -1) (part b o3))
+            o4 (+ (+ o3 4) (vector-count cmd))]
+        (if (or (bad? d) (bad? b) (bad? entry) (bad? cert) (bad? cmd)) -72
+          (let [call {"entry" (bytes-words entry) "certificate" (bytes-words cert) "command" (bytes-words cmd)
+                      "body" (g-slice b o4 (- (vector-count b) o4))}
+                done (broker/execute base {"policy" (bf/policy 7) "quorum" (qf/config)} (f/checkpoint-seed)
+                                     call (bf/facts ""))
+                e (n/transport-encrypt (hd d) (w/seal 8 (w/request-id hh 0 b) (words-bytes done)))]
+            (if (or (= (vector-count done) 0) (bad? e) (< (t/send-frame s (tl e)) 0)) -73
+              (if (write base "response" done) (vector-at done 0) -74))))))))
+
+(defn- ask-execute [base :string addr :string tampered :bool] :i64
+  (let [c (t/dial addr 20000) st (initiate c 9 5)]
+    (if (= (vector-count st) 0) -81
+      (let [hh (n/handshake-hash st)
+            effect (if tampered (vector-i64 104 101 108 108 112) (hello))
+            b (cat (cat (cat (prefixed (read base "request")) (prefixed (read base "certificate")))
+                        (prefixed (read base "command"))) effect)
+            id0 (w/request-id hh 0 b)
+            e (n/transport-encrypt st (w/seal 7 id0 b))]
+        (if (or (bad? e) (< (t/send-frame c (tl e)) 0)) -82
+          (let [d (n/transport-decrypt (hd e) (t/recv-frame c 20000))
+                r (if (bad? d) (vector-i64 -1) (w/open (tl d) 8 id0))]
+            (if (or (bad? d) (bad? r)) -83
+              (let [ws (bytes-words r)]
+                (if (and (> (vector-count ws) 0) (write base "execute-response" ws)) (vector-at ws 0) -84)))))))))
+
 (defn main [] :i64
   (let [mode (typed-cap-call :cli/args :string :string "0")
         base (typed-cap-call :cli/args :string :string "1")
@@ -205,6 +258,9 @@
           (= mode "ask-replay") (ask base addr index index 1)
           (= mode "serve-guarded") (let [b (typed-cap-call :cli/args :string :string "4")]
                                      (serve-guarded base addr index (cond (= b "2") 2 (= b "3") 3 (= b "4") 4 :else 5)))
+          (= mode "serve-execute") (serve-execute base addr)
+          (= mode "ask-execute") (ask-execute base addr false)
+          (= mode "ask-execute-tampered") (ask-execute base addr true)
           (= mode "serve-commit-attest") (serve-commit-attest base addr index)
           (= mode "ask-commit-attest") (ask-commit-attest base addr index false)
           (= mode "ask-commit-replay") (ask-commit-attest base addr index true)

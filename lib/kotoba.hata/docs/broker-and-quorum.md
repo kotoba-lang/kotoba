@@ -247,8 +247,8 @@ the native TCP wires (`lib/kotoba.noise`, ADR-0001). Each exchange travels in on
 `hata.wire` envelope (`src/hata/wire.kotoba`), and one envelope is one `noise.frame`.
 
 - **Layout:** version (1, = 1), kind (1), request id (32), body length (4, big-endian), then
-  the body; at most 65535 bytes. Kinds 1-6 are the vote, commit and attest requests and
-  their responses; a response kind is its request kind plus one.
+  the body; at most 65535 bytes. Kinds 1-8 are the vote, commit, attest and execute
+  requests and their responses; a response kind is its request kind plus one.
 - **Request id:** `SHA-256("hata.wire.v1/request\n" || handshake hash || sequence (8) ||
   body)`. A request replayed into another session, or at another position in the same
   session, has another id. The session owner accepts only the next sequence number.
@@ -322,13 +322,34 @@ A peer that sends a well-formed message 0 still costs the responder a full first
 (KEM encapsulation and an ML-DSA-65 signature) before XX reveals who the initiator is.
 The connection budget is what bounds that cost.
 
+**Execute over a session.** The effect itself also travels over a session. The sink
+installs the certified fence. The coordinator then reserves a claim, and the claim's votes
+and commits are carried over sessions like the fence's. Finally the coordinator sends the
+claim to the sink as one execute request (kind 7). Its body holds the entry, certificate
+and command, each with a 4-byte length prefix, followed by the effect body.
+
+The sink takes all four only from the session; it has no files for them. It runs
+`hata.broker/execute` on exactly the bytes it received. That call re-verifies, right
+before dispatch:
+- the quorum certificate;
+- the C0 signatures and current policy;
+- the reservation;
+- the body commitment, through `payload-matches?` on the received body.
+
+Measured 2026-10-30 (podman, Linux arm64, amu `65359a09`):
+
+| execute request | sink's answer |
+|---|---|
+| a body other than the committed one (`hellp`) | 0; no object exists afterwards |
+| the committed body (`hello`) | 1; the managed object is written |
+| the same request again | 2; no second effect, and the object reads back |
+
 The keys in the driver are fixed public test values; a deployment takes ephemerals and
 KEM randomness from the host's entropy provider and identities from the roster. The CI
 arm64 lane runs it.
 
 Not yet: retries, backpressure, per-peer (rather than per-listener) budgets, reclaiming a
-listener's memory between connections, separate hosts, and the re-check of body and C0
-authority right before dispatch.
+listener's memory between connections, and separate hosts.
 
 ## Verification and scope
 
