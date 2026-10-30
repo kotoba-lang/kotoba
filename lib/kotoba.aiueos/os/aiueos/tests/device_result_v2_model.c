@@ -106,6 +106,31 @@ static uint32_t oracle_number_field(uint8_t *out, uint32_t at,
   return oracle_decimal(out, at, ctx_number_at(ctx, offset));
 }
 
+/* kotoba/p256-did.kotoba on the host (JUN-554): the C it replaced, behind the object's interface. The object itself is
+   compared with that C under QEMU by scripts/p256-did-diff. */
+int64_t kotoba_aiueos_p256_did(const uint8_t *pub, uint64_t pub_len, char *out, uint64_t cap) {
+  static const char alphabet[] = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+  uint8_t mk[35], digits[64] = {0};
+  uint32_t dc = 1, lead = 0, at = 0, j, i;
+  char text[96];
+  if (!out || (pub_len >> 32) || (cap >> 32) || pub_len != 64) return 0;
+  mk[0] = 0x80; mk[1] = 0x24; mk[2] = (pub[63] & 1U) ? 0x03 : 0x02;
+  for (i = 0; i < 32; i++) mk[3 + i] = pub[i];
+  for (j = 0; j < 35; j++) {
+    uint32_t carry = mk[j];
+    for (i = 0; i < dc; i++) { uint32_t v = (uint32_t)digits[i] * 256U + carry; digits[i] = (uint8_t)(v % 58U); carry = v / 58U; }
+    while (carry) { if (dc >= 64) return 0; digits[dc++] = (uint8_t)(carry % 58U); carry /= 58U; }
+  }
+  while (lead < 35 && !mk[lead]) lead++;
+  if (lead + dc + 1 > 64) return 0;
+  for (i = 0; i < 9; i++) text[at++] = "did:key:z"[i];
+  for (i = 0; i < lead; i++) text[at++] = '1';
+  while (dc) text[at++] = alphabet[digits[--dc]];
+  text[at++] = 0;
+  for (i = 0; i < at && i < cap; i++) out[i] = text[i];
+  return at <= cap;
+}
+
 int64_t kotoba_aiueos_device_worker_canonical(uint8_t *ctx, uint64_t ctx_len,
                                               uint8_t *out, uint64_t out_cap) {
   if (ctx_len < 576) return -1;

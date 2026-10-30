@@ -24,8 +24,6 @@ static const uint8_t p256_order[32] = {
   0xbc,0xe6,0xfa,0xad,0xa7,0x17,0x9e,0x84,
   0xf3,0xb9,0xca,0xc2,0xfc,0x63,0x25,0x51
 };
-static const char base58_alphabet[] =
-  "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 static const char hex_alphabet[] = "0123456789abcdef";
 #if defined(__GNUC__) && !defined(AIUEOS_DEVICE_RESULT_TESTING)
 #define AIUEOS_DEVICE_HIGH_BSS __attribute__((section(".high_bss")))
@@ -160,47 +158,10 @@ void aiueos_device_worker_identity_refresh(void) {
   (void)device_boot_id_refresh();
 }
 
-static int base58_encode(const uint8_t *input, uint32_t input_bytes,
-                         char *out, uint32_t capacity) {
-  uint8_t digits[64] = {0};
-  uint32_t digit_count = 1;
-  for (uint32_t j = 0; j < input_bytes; j++) {
-    uint32_t carry = input[j];
-    for (uint32_t i = 0; i < digit_count; i++) {
-      uint32_t value = (uint32_t)digits[i] * 256U + carry;
-      digits[i] = (uint8_t)(value % 58U);
-      carry = value / 58U;
-    }
-    while (carry) {
-      if (digit_count >= sizeof(digits)) return 0;
-      digits[digit_count++] = (uint8_t)(carry % 58U);
-      carry /= 58U;
-    }
-  }
-  uint32_t leading = 0;
-  while (leading < input_bytes && !input[leading]) leading++;
-  uint32_t needed = leading + digit_count;
-  if (needed + 1 > capacity) return 0;
-  uint32_t at = 0;
-  for (uint32_t i = 0; i < leading; i++) out[at++] = '1';
-  while (digit_count) out[at++] = base58_alphabet[digits[--digit_count]];
-  out[at] = 0;
-  return 1;
-}
-
+/* The did:key text (base58btc of the P-256 multikey) is kotoba/p256-did.kotoba (JUN-554). */
+extern int64_t kotoba_aiueos_p256_did(const uint8_t *, uint64_t, char *, uint64_t);
 static int p256_did(const uint8_t public_key[64], char *out, uint32_t capacity) {
-  uint8_t multikey[35];
-  char encoded[64];
-  multikey[0] = 0x80;
-  multikey[1] = 0x24;
-  multikey[2] = (public_key[63] & 1U) ? 0x03 : 0x02;
-  for (uint32_t i = 0; i < 32; i++) multikey[3 + i] = public_key[i];
-  if (!base58_encode(multikey, sizeof(multikey), encoded, sizeof(encoded))) return 0;
-  struct bounded_buffer b = {(uint8_t *)out, 0, capacity, 1};
-  put_text(&b, "did:key:z");
-  put_text(&b, encoded);
-  put_byte(&b, 0);
-  return b.ok;
+  return kotoba_aiueos_p256_did(public_key, 64, out, capacity) == 1;
 }
 
 /* The 576-byte fixed-layout record `contracts/device-worker-canonical-v1.edn`
