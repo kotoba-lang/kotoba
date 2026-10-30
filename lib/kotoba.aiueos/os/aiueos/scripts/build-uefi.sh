@@ -264,7 +264,11 @@ if [ "${AIUEOS_MURAKUMO_DEVICE_RESULT:-0}" = 1 ]; then
   kotoba_p256_did_object=${AIUEOS_KOTOBA_P256_DID_OBJECT:-"$aiueos/kotoba/p256-did.o"}
   python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_p256_did_object" \
     2685660e7286bdbe0be206ba3a521d36a5345eb2b3d15024bdf9e7a21896fd75 kotoba_aiueos_p256_did
-  device_result_link="$kernel_device_result_object $kernel_device_worker_protocol_object $kotoba_device_worker_poll_object $kotoba_p256_did_object"
+  # JUN-554: aiueos_device_result_http_request's signed canonical text and JSON body are kotoba/device-result-text.o.
+  kotoba_device_result_text_object=${AIUEOS_KOTOBA_DEVICE_RESULT_TEXT_OBJECT:-"$aiueos/kotoba/device-result-text.o"}
+  python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_device_result_text_object" \
+    fb42023ba8bb0e42960151dcf8a0f8f3d161628c5b15c8597f6c7d6a76bf5b0b kotoba_aiueos_device_result_text
+  device_result_link="$kernel_device_result_object $kernel_device_worker_protocol_object $kotoba_device_worker_poll_object $kotoba_p256_did_object $kotoba_device_result_text_object"
 fi
 # JUN-35: the poll scheduler is referenced from main.c under
 # AIUEOS_PERSISTENT_BOOT (init/sequence/record) and from pci.c under

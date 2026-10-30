@@ -131,6 +131,55 @@ int64_t kotoba_aiueos_p256_did(const uint8_t *pub, uint64_t pub_len, char *out, 
   return at <= cap;
 }
 
+/* kotoba/device-result-text.kotoba on the host (JUN-554): the C text it replaced, behind the object's interface. The
+   object itself is compared with that C under QEMU by scripts/device-result-text-diff. */
+static int64_t drt_put(uint8_t *o, uint64_t cap, int64_t at, const char *t) {
+  for (uint64_t i = 0; t[i]; i++) { if (at < 0 || (uint64_t)at >= cap) return -1; o[at++] = (uint8_t)t[i]; }
+  return at;
+}
+static int64_t drt_hex(uint8_t *o, uint64_t cap, int64_t at, const uint8_t *in, uint32_t n) {
+  static const char h[] = "0123456789abcdef";
+  for (uint32_t i = 0; i < n; i++) { char two[3] = {h[in[i] >> 4], h[in[i] & 15], 0}; at = drt_put(o, cap, at, two); }
+  return at;
+}
+static int64_t drt_dec(uint8_t *o, uint64_t cap, int64_t at, uint64_t v) {
+  char d[21]; int n = 0; d[20] = 0;
+  do { d[19 - n++] = (char)('0' + v % 10); v /= 10; } while (v);
+  return drt_put(o, cap, at, d + 20 - n);
+}
+static uint64_t drt_num(const uint8_t *r, int k) { uint64_t v = 0; for (int i = 0; i < 8; i++) v = v << 8 | r[192 + k * 8 + i]; return v; }
+int64_t kotoba_aiueos_device_result_text(const uint8_t *r, uint64_t rn, uint64_t mode, uint8_t *o, uint64_t cap) {
+  static const char *names[] = {"token", "second-token", "generated-tokens", "decode-tokens", "model-load-cycles",
+    "first-token-cycles", "decode-cycles", "inference-cycles", "vector-bits", "worker-threads", "tsc-hz"};
+  int64_t at;
+  if (!o || !r || (rn >> 32) || (cap >> 32) || rn < 288 || rn > 512 || cap > 16384 || mode > 1) return 0;
+  if (mode == 0) {
+    at = drt_hex(o, cap, drt_put(o, cap, drt_put(o, cap, 0, "aiueos-k16-result-v2"), "\naiueos-k16-"), r, 6);
+    at = drt_hex(o, cap, drt_put(o, cap, at, "\n"), r + 8, 64);
+    at = drt_hex(o, cap, drt_put(o, cap, at, "\n"), r + 72, 8);
+    at = drt_hex(o, cap, drt_put(o, cap, at, "\n"), r + 80, 32);
+    at = drt_put(o, cap, at, "\nQwen3.8-27B-UD-IQ3_XXS.gguf\n2");
+    for (int k = 0; k < 11; k++) at = drt_dec(o, cap, drt_put(o, cap, at, "\n"), drt_num(r, k));
+    at = drt_hex(o, cap, drt_put(o, cap, at, "\n"), r + 112, 16);
+  } else {
+    at = drt_hex(o, cap, drt_put(o, cap, 0, "{\"node\":\"aiueos-k16-"), r, 6);
+    at = drt_hex(o, cap, drt_put(o, cap, at, "\",\"public-key\":\""), r + 8, 64);
+    at = drt_hex(o, cap, drt_put(o, cap, at, "\",\"boot\":\""), r + 72, 8);
+    at = drt_hex(o, cap, drt_put(o, cap, at, "\",\"model-sha256\":\""), r + 80, 32);
+    at = drt_dec(o, cap, drt_put(o, cap, at, "\",\"model\":\"Qwen3.8-27B-UD-IQ3_XXS.gguf\",\"protocol\":2,\"token\":"), drt_num(r, 0));
+    for (int k = 1; k < 11; k++) {
+      char key[32]; int n = 0; key[n++] = ','; key[n++] = '"';
+      for (const char *c = names[k]; *c; c++) key[n++] = *c;
+      key[n++] = '"'; key[n++] = ':'; key[n] = 0;
+      at = drt_dec(o, cap, drt_put(o, cap, at, key), drt_num(r, k));
+    }
+    at = drt_hex(o, cap, drt_put(o, cap, at, ",\"nonce\":\""), r + 112, 16);
+    at = drt_hex(o, cap, drt_put(o, cap, at, "\",\"signature\":\""), r + 128, 64);
+    at = drt_put(o, cap, at, "\"}");
+  }
+  return at < 0 ? 0 : at;
+}
+
 int64_t kotoba_aiueos_device_worker_canonical(uint8_t *ctx, uint64_t ctx_len,
                                               uint8_t *out, uint64_t out_cap) {
   if (ctx_len < 576) return -1;
