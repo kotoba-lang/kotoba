@@ -1234,7 +1234,7 @@ struct virtio_caps {
 };
 
 extern uint64_t kotoba_aiueos_virtio_cap_valid(
-  uint64_t pointer, uint64_t cap_length, uint64_t bar, uint64_t offset, uint64_t length); extern int64_t kotoba_aiueos_virtio_caps_find(uint64_t header, uint64_t header_length, uint64_t record, uint64_t record_length);
+  uint64_t pointer, uint64_t cap_length, uint64_t bar, uint64_t offset, uint64_t length); extern int64_t kotoba_aiueos_virtio_caps_find(uint64_t header, uint64_t header_length, uint64_t record, uint64_t record_length); extern int64_t kotoba_aiueos_virtio_negotiate(uint64_t cfg, uint64_t length);
 extern uint64_t kotoba_aiueos_pci_extent_valid(uint64_t value, uint64_t size);
 extern uint64_t kotoba_aiueos_pci_region_valid(
   uint64_t offset, uint64_t bytes, uint64_t bar_length); extern int64_t kotoba_aiueos_pci_bar_kind(int64_t low, int64_t index); extern int64_t kotoba_aiueos_pci_bar_value(int64_t low, int64_t high); extern int64_t kotoba_aiueos_pci_bar_base(int64_t low, int64_t high, int64_t index); extern int64_t kotoba_aiueos_pci_bar_size(int64_t mask_low, int64_t mask_high, int64_t kind);
@@ -1508,15 +1508,15 @@ static int map_transport(uint8_t b, uint8_t d, uint8_t f, const struct virtio_ca
 }
 
 static int negotiate(volatile struct virtio_common_cfg *cfg) {
-  cfg->device_status = 0;
-  cfg->device_status = VIRTIO_STATUS_ACK | VIRTIO_STATUS_DRIVER;
-  cfg->device_feature_select = 1;
-  if (!(cfg->device_feature & 1U)) return 0; /* VIRTIO_F_VERSION_1, bit 32 */
-  cfg->driver_feature_select = 1; cfg->driver_feature = 1U;
-  cfg->driver_feature_select = 0; cfg->driver_feature = 0;
-  cfg->device_status |= VIRTIO_STATUS_FEATURES_OK;
-  if (!(cfg->device_status & VIRTIO_STATUS_FEATURES_OK)) return 0;
-  return 1;
+  /* JUN-598: the sequence is kotoba/virtio-negotiate.o, one access of each
+     register's width in this order: device_status = 0, = ACK | DRIVER;
+     device_feature_select = 1; refuse without VIRTIO_F_VERSION_1 (bit 32);
+     driver_feature_select = 1, driver_feature = 1, select = 0, feature = 0;
+     device_status |= FEATURES_OK, and it must read back set. The function
+     keeps its line count, so the __LINE__ sites below keep their numbers
+     (the virtio-input failure lines are part of the qualified baseline). */
+  return kotoba_aiueos_virtio_negotiate((uint64_t)(uintptr_t)cfg,
+                                        sizeof(struct virtio_common_cfg)) == 1;
 }
 
 /* Every device before virtio-net used exactly one queue, so `prepare_queue`
