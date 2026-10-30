@@ -1234,7 +1234,7 @@ struct virtio_caps {
 };
 
 extern uint64_t kotoba_aiueos_virtio_cap_valid(
-  uint64_t pointer, uint64_t cap_length, uint64_t bar, uint64_t offset, uint64_t length); extern int64_t kotoba_aiueos_virtio_caps_find(uint64_t header, uint64_t header_length, uint64_t record, uint64_t record_length); extern int64_t kotoba_aiueos_virtio_negotiate(uint64_t cfg, uint64_t length); extern int64_t kotoba_aiueos_virtio_queue_setup(uint64_t cfg, uint64_t length, uint64_t record, uint64_t record_length); extern int64_t kotoba_aiueos_virtq_post(uint64_t desc, uint64_t desc_length, uint64_t avail, uint64_t avail_length, uint64_t record, uint64_t record_length); extern int64_t kotoba_aiueos_virtq_used_index(uint64_t used, uint64_t used_length); extern int64_t kotoba_aiueos_virtq_used_elem(uint64_t used, uint64_t used_length, uint64_t slot); extern int64_t kotoba_aiueos_virtq_wait(uint64_t used, uint64_t used_length, uint64_t counter, uint64_t counter_length, uint64_t before, uint64_t want, uint64_t rounds); extern uint64_t kotoba_aiueos_kbd_reap(uint64_t used, uint64_t used_length, uint64_t avail, uint64_t avail_length, uint64_t event, uint64_t event_length, uint64_t state);
+  uint64_t pointer, uint64_t cap_length, uint64_t bar, uint64_t offset, uint64_t length); extern int64_t kotoba_aiueos_virtio_caps_find(uint64_t header, uint64_t header_length, uint64_t record, uint64_t record_length); extern int64_t kotoba_aiueos_virtio_negotiate(uint64_t cfg, uint64_t length); extern int64_t kotoba_aiueos_virtio_queue_setup(uint64_t cfg, uint64_t length, uint64_t record, uint64_t record_length); extern int64_t kotoba_aiueos_virtq_post(uint64_t desc, uint64_t desc_length, uint64_t avail, uint64_t avail_length, uint64_t record, uint64_t record_length); extern int64_t kotoba_aiueos_virtq_used_index(uint64_t used, uint64_t used_length); extern int64_t kotoba_aiueos_virtq_used_elem(uint64_t used, uint64_t used_length, uint64_t slot); extern int64_t kotoba_aiueos_virtq_wait(uint64_t used, uint64_t used_length, uint64_t counter, uint64_t counter_length, uint64_t before, uint64_t want, uint64_t rounds); extern uint64_t kotoba_aiueos_kbd_reap(uint64_t used, uint64_t used_length, uint64_t avail, uint64_t avail_length, uint64_t event, uint64_t event_length, uint64_t state); extern uint64_t kotoba_aiueos_msix_program(uint64_t entry, uint64_t entry_length, uint64_t cfg, uint64_t cfg_length, uint64_t address, uint64_t data, uint64_t vector);
 extern uint64_t kotoba_aiueos_pci_extent_valid(uint64_t value, uint64_t size);
 extern uint64_t kotoba_aiueos_pci_region_valid(
   uint64_t offset, uint64_t bytes, uint64_t bar_length); extern int64_t kotoba_aiueos_pci_bar_kind(int64_t low, int64_t index); extern int64_t kotoba_aiueos_pci_bar_value(int64_t low, int64_t high); extern int64_t kotoba_aiueos_pci_bar_base(int64_t low, int64_t high, int64_t index); extern int64_t kotoba_aiueos_pci_bar_size(int64_t mask_low, int64_t mask_high, int64_t kind);
@@ -1428,15 +1428,15 @@ static int setup_rng_msix(uint8_t b, uint8_t d, uint8_t f,
   if (!aiueos_map_pci_mmio(table_base + table_offset,table_bytes) ||
       !aiueos_map_pci_mmio(pba_base + pba_offset,pba_bytes)) return 0;
   struct msix_entry *entry = (void *)(uintptr_t)(table_base + table_offset);
-  entry[0].vector_control = 1;
-  entry[0].address_low =
-    0xfee00000U | ((uint32_t)kotoba_aiueos_cpu_apic_id() << 12);
-  entry[0].address_high = 0;
-  entry[0].data = 34;
+  /* kotoba/msix-entry.o: mask entry 0, write its message (the local APIC,
+     vector 34), assign the queue to MSI-X vector 0 and read it back, then
+     unmask -- one access of each register's width, in this order; 1 only when
+     the device kept the vector (the entry stays masked otherwise). */
+  if (kotoba_aiueos_msix_program((uint64_t)(uintptr_t)&entry[0], sizeof(entry[0]),
+        (uint64_t)(uintptr_t)cfg, sizeof(*cfg),
+        0xfee00000U | ((uint32_t)kotoba_aiueos_cpu_apic_id() << 12), 34, 0) != 1)
+    return 0;
   __asm__ volatile("" ::: "memory");
-  cfg->queue_msix_vector = 0;
-  if (cfg->queue_msix_vector != 0) return 0;
-  entry[0].vector_control = 0;
   config_write(b,d,f,pointer,header | (1U << 31)); /* enable; function mask clear */
   if (!(config_read(b,d,f,pointer) & (1U << 31))) return 0;
   aiueos_virtio_rng_irq_count = 0;
@@ -1476,14 +1476,14 @@ static int setup_blk_msix(uint8_t b, uint8_t d, uint8_t f,
   if (aiueos_vtd_translation_enabled() &&
       !aiueos_vtd_program_msix(((uint16_t)b << 8) | ((uint16_t)d << 3) | f,
                                1,35,destination,&message_address,&message_data)) return 0;
-  entry[1].vector_control = 1;
-  entry[1].address_low = message_address;
-  entry[1].address_high = 0;
-  entry[1].data = message_data;
+  /* kotoba/msix-entry.o, as for the rng: entry 1 with the (possibly remapped)
+     message, queue vector 1, read back, then unmask; a vector the device did
+     not keep fails the setup with the entry still masked. */
+  if (kotoba_aiueos_msix_program((uint64_t)(uintptr_t)&entry[1], sizeof(entry[1]),
+        (uint64_t)(uintptr_t)cfg, sizeof(*cfg),
+        message_address, message_data, 1) != 1)
+    return 0;
   __asm__ volatile("" ::: "memory");
-  cfg->queue_msix_vector = 1;
-  if (cfg->queue_msix_vector != 1) return 0;
-  entry[1].vector_control = 0;
   config_write(b,d,f,pointer,header | (1U << 31));
   if (!(config_read(b,d,f,pointer) & (1U << 31))) return 0;
   aiueos_virtio_blk_irq_count = 0;
