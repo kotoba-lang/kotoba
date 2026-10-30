@@ -25,7 +25,7 @@ PASS, WRONG = "correct horse", "correct horsf"
 
 
 class Boot:
-    def __init__(self, args, out, name, scratch):
+    def __init__(self, args, out, name, scratch, extra=()):
         image = args.kernel.read_bytes()
         rw = struct.unpack_from("<IIQQQQQQ", image, 120)
         context = rw[3]
@@ -40,6 +40,7 @@ class Boot:
             cmd += ["-device", "isa-ide,id=draft-controller",
                     "-drive", f"file={scratch},format=raw,if=none,id=draft,cache=directsync",
                     "-device", "ide-hd,drive=draft,bus=draft-controller.0,unit=1,serial=AWAI90DRAFT000001"]
+        cmd += list(extra)
         self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=subprocess.STDOUT, text=True, cwd=out, bufsize=1)
         deadline = time.monotonic() + 150
