@@ -129,9 +129,48 @@ supply a missing value.
 
 The writer stays trusted: one writer signature per descriptor. An equivocating
 writer is bounded only by one vote per replica and sequence, and can split votes
-so that a read stays at status 3. Restoring C0 state from a recovered head and
-activating a new writer behind a durable sink fence are the next AWAI-103 unit;
-view and roster changes are AWAI-104.
+so that a read stays at status 3. View and roster changes are AWAI-104.
+
+## Writer restore (AWAI-103)
+
+A new writer starts from an empty C0 base. `broker/restore` takes the head a
+fresh read returned, verifies its certificate on the full request (value
+included) and that its epoch is the policy's, and passes the value to
+`store/restore`. That store checks that the value parses as C0 state bound to
+this policy's epoch, domain and operation, with each stable request id at most
+once, writes a durable `restored` marker and only then publishes the state.
+
+A restored store is inactive: `submit` and `complete` return
+`rejected:inactive`; `recover` (the epoch bump) is allowed. The writer recovers
+to a new epoch, certifies a fence entry and installs it at the sink.
+`broker/activate` then reads a durable copy of the sink's sealed state and calls
+`store/activate` only when that state shows the new epoch at or past the fence
+entry. The previous writer is refused by the sink's epoch fence.
+
+Legality of the transitions before the restored head rests on the trusted
+writer's signatures; the restore checks shape and binding, not replayed
+business history. No privileged rollback resistance is claimed without an
+external witness or anchor.
+
+## Audit history (AWAI-106)
+
+A replica's snapshot holds only its head, so it cannot by itself show the past
+proposals and certificates. `replica/commit` therefore first writes a sealed
+record of the position, `quorum-log-<seq>` = descriptor and certificate signed
+with the replica key, and only then moves its head: a crash in between leaves a
+record past the head, never a head without its record. `replica/history`
+returns the records 1..K of its committed position as a batch; a missing or
+unsealed record ends the batch early.
+
+`audit/history` accepts a batch only when every entry is certified on this
+roster, entry k has sequence k and its parent is entry k-1 (zero for the
+first). It returns `[K entry-id]`, `[0 0 0 0 0]` for the empty history, and
+`[0]` for a gap, a fork, a forged certificate or trailing bytes; partial history
+is never success. `audit/extends?` accepts a later history only when it holds an
+earlier accepted head at its sequence, so a shorter or diverging history
+(rollback) is refused. This proves agreement with the roster, not that no newer
+history exists: freshness needs `read/latest`, and resistance to a privileged
+rollback of every replica needs an external witness or anchor (not claimed).
 
 ## Broker fence, consume and reconcile
 

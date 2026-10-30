@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from native_gate import LIB, NativeGate
 
-def sources(integration=False, read=False):
+def sources(integration=False, read=False, audit=False):
     # Exact declared closure; never infer/resolve/flatten the guest language.
     mapping = {f'hata/{n}.kotoba': LIB / f'src/hata/{n}.kotoba'
                for n in ['codec', 'admission', 'authority', 'quorum']}
@@ -27,9 +27,16 @@ def sources(integration=False, read=False):
         mapping.pop('kototama/effect_origins.kotoba')
         mapping.update({'hata/read.kotoba': LIB / 'src/hata/read.kotoba',
                         'hata/read_native_test.kotoba': LIB / 'test/read_native.kotoba'})
+    if audit:
+        # Audit history (AWAI-106): pure verdicts, no filesystem capability.
+        mapping.pop('hata/quorum_native_test.kotoba')
+        mapping.pop('kototama/effect_origins.kotoba')
+        mapping.update({'hata/audit.kotoba': LIB / 'src/hata/audit.kotoba',
+                        'hata/audit_native_test.kotoba': LIB / 'test/audit_native.kotoba'})
     if integration:
         mapping.pop('hata/quorum_native_test.kotoba')
         mapping['hata/read.kotoba'] = LIB / 'src/hata/read.kotoba'
+        mapping['hata/audit.kotoba'] = LIB / 'src/hata/audit.kotoba'
         mapping.update({f'hata/{n}.kotoba': LIB / f'src/hata/{n}.kotoba'
                         for n in ['seal', 'replica', 'store_io', 'store', 'broker']})
         mapping.update({'hata/broker_fixture.kotoba': LIB / 'test/broker_fixture.kotoba',
@@ -44,19 +51,45 @@ def main():
     parser.add_argument('--packager', type=Path, help='macOS: the Mac packager (JUN-593)')
     parser.add_argument('--packager-sha256')
     parser.add_argument('--output', type=Path, required=True)
+    # CI runs the two sections in separate lanes: the history section (audit and
+    # fresh-read verdicts, pure, about a hundred Ed25519 operations) took 6-10+
+    # minutes on an x86 runner and pushed the broker lane past its limits.
+    parser.add_argument('--section', choices=['all', 'history', 'broker'], default='all')
     args = parser.parse_args()
     gate = NativeGate(args)
-    image = gate.build('quorum', 'hata/quorum_native_test.kotoba', sources())
-    gate.run('quorum-and-existing-admission', image)
+    if args.section in ('all', 'broker'):
+        image = gate.build('quorum', 'hata/quorum_native_test.kotoba', sources())
+        gate.run('quorum-and-existing-admission', image)
+    if args.section in ('all', 'history'):
+        history(gate)
+    if args.section == 'history':
+        gate.finish('PASS_NATIVE_BROKER_HISTORY', section='history')
+        return
+    broker(gate)
+
+def history(gate):
+    auditor = gate.build('audit', 'hata/audit_native_test.kotoba', sources(audit=True))
+    gate.run('audit-history-verdicts', auditor)
+    # Negative control: an auditor that does not check the parent link accepts a
+    # history whose entries are certified but not chained.
+    unchained = sources(audit=True)
+    before = b'(c/equal? (c/slice desc 4 4) prev)'
+    assert unchained['hata/audit.kotoba'].count(before) == 1
+    unchained['hata/audit.kotoba'] = unchained['hata/audit.kotoba'].replace(before, b'true')
+    gate.run('unchained-auditor-detected', gate.build('audit-unchained-control', 'hata/audit_native_test.kotoba', unchained), 4004)
     reader = gate.build('read', 'hata/read_native_test.kotoba', sources(read=True))
-    gate.run('fresh-read-verdicts', reader)
+    # One image verifies every case; on a slow x86 runner it has taken over 600 s.
+    gate.run('fresh-read-verdicts', reader, timeout=1800)
     # Negative control: a reader that ignores pending votes adopts the stale
     # committed head instead of recovering the undistributed certificate.
     blind = sources(read=True)
     before = b'votes (if (= (vector-count best) 0) (vector-i64) (votes-for batch offs top best))'
     assert blind['hata/read.kotoba'].count(before) == 1
     blind['hata/read.kotoba'] = blind['hata/read.kotoba'].replace(before, b'votes (vector-i64)')
-    gate.run('pending-blind-reader-detected', gate.build('read-blind-control', 'hata/read_native_test.kotoba', blind), 3003)
+    gate.run('pending-blind-reader-detected', gate.build('read-blind-control', 'hata/read_native_test.kotoba', blind), 3003,
+             timeout=1800)
+
+def broker(gate):
     driver = gate.build('broker', 'hata/broker_native_test.kotoba', sources(True))
     coordinator = gate.out / 'coordinator'
     sink = gate.out / 'sink'
@@ -75,12 +108,13 @@ def main():
             run(f'{label}-attest-{i}', 'attest-stale' if i in stale else 'attest', nodes[i], option=str(i))
             shutil.copyfile(nodes[i] / 'attestation', coordinator / f'att{k}')
         run(label, 'fresh', coordinator, expected)
-    def certify(label):
+    def certify(label, coord=None):
+        coord = coord or coordinator
         # Opaque byte transport. Only the native guest chooses/verifies votes.
         for i in range(3):
-            copy(coordinator, nodes[i], ['request'])
+            copy(coord, nodes[i], ['request'])
             run(label + '-vote-' + str(i), 'vote', nodes[i], option=str(i))
-            shutil.copyfile(nodes[i] / 'response', coordinator / ('vote' + str(i)))
+            shutil.copyfile(nodes[i] / 'response', coord / ('vote' + str(i)))
             if label == 'fence' and i == 1:
                 run('partition-two-votes-refused', 'reject-two', coordinator)
                 shutil.copyfile(coordinator / 'request', coordinator / 'original')
@@ -120,9 +154,9 @@ def main():
             fresh('fresh-qc-undistributed-recovered', [0, 1, 2], 2)
             fresh('fresh-two-votes-unresolved', [0, 1, 3], 3)
             fresh('fresh-stale-attestation-refused', [0, 1, 2], 0, stale=(2,))
-        run(label + '-assemble', 'certificate', coordinator)
+        run(label + '-assemble', 'certificate', coord)
         for i in range(4):
-            copy(coordinator, nodes[i], ['request', 'certificate'])
+            copy(coord, nodes[i], ['request', 'certificate'])
             run(label + '-commit-' + str(i), 'commit', nodes[i], 2, str(i))
             run(label + '-read-' + str(i), 'current', nodes[i], option=str(i))
     run('prepare', 'prepare', coordinator)
@@ -137,6 +171,7 @@ def main():
     shutil.copyfile(coordinator / 'latest', gate.out / 'fence-latest')
     shutil.copyfile(coordinator / 'latest', nodes[3] / 'latest')
     run('fresh-value-recovered', 'block', nodes[3])
+    run('audit-after-fence', 'audit', nodes[2], option='2')
     run('reserve', 'reserve', coordinator)
     certify('claim')
     copy(coordinator, sink, ['request', 'certificate', 'command'])
@@ -174,6 +209,10 @@ def main():
     run('install-epoch8', 'install', sink, option='epoch8')
     copy(history, sink, ['request', 'certificate', 'command'])
     run('fenced-old-writer', 'execute', sink, 0)
+    run('audit-after-history', 'audit', nodes[1], option='1')
+    tampered = sorted(nodes[3].glob('quorum-log-*'))[0]
+    tampered.write_bytes(tampered.read_bytes().replace(b'awai.quorum.log.v1\n', b'awai.quorum.log.v1\n0', 1))
+    run('audit-tampered-record-refused', 'audit', nodes[3], -31, option='3')
     for block in nodes[0].glob('quorum-value-*'):
         block.write_bytes(b'corrupt')
     run('retained-data-corruption-refused', 'corrupt-current', nodes[0])
@@ -191,6 +230,31 @@ def main():
     run('abandon-expired-no-effect', 'abandon-expired', abandoned, 3)
     run('abandon-terminal-no-replay', 'execute', abandoned, 3)
     run('abandon-object-empty', 'empty-object', abandoned)
+    # AWAI-103: a new writer restores the latest certified C0 state from a fresh
+    # read and stays inactive until the sink durably holds its epoch fence.
+    writer = gate.out / 'writer2'
+    writer.mkdir(mode=0o700)
+    fresh('restore-read', [1, 2, 3], 1)
+    shutil.copyfile(coordinator / 'latest', nodes[1] / 'latest')
+    run('restore-fetch-value', 'fetch', nodes[1])
+    shutil.copyfile(coordinator / 'latest', writer / 'latest')
+    shutil.copyfile(nodes[1] / 'value', writer / 'value')
+    run('writer-restore', 'restore', writer, option='epoch8')
+    run('writer-restore-twice-refused', 'restore', writer, 2, option='epoch8')
+    run('restored-writer-inactive', 'inactive', writer, option='epoch8')
+    run('restored-writer-recovers-epoch9', 'recover9', writer, option='epoch8')
+    certify('epoch9-fence', writer)
+    (writer / 'sinkack').mkdir(mode=0o700)
+    run('activate-without-fence-ack-refused', 'activate', writer, 2, option='epoch9')
+    shutil.copyfile(sink / 'broker.state', writer / 'sinkack' / 'broker.state')
+    run('activate-on-old-fence-refused', 'activate', writer, 2, option='epoch9')
+    copy(writer, sink, ['request', 'certificate'])
+    run('install-epoch9', 'install', sink, option='epoch9')
+    shutil.copyfile(sink / 'broker.state', writer / 'sinkack' / 'broker.state')
+    run('activate-after-durable-fence', 'activate', writer, option='epoch9')
+    run('activated-writer-not-gated', 'active', writer, option='epoch9')
+    copy(history, sink, ['request', 'certificate', 'command'])
+    run('epoch8-writer-fenced', 'execute', sink, 0)
     mutant = sources(True)
     source = mutant['hata/replica.kotoba']
     before = b'(if (persist base next (c/slice identity 1 32))\n              (c/append (vector-i64 1)'

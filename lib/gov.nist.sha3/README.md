@@ -55,6 +55,50 @@ halves, so the same code is correct under int32 and int64 bit operators. Measure
 2026-10-23 on one machine: about 3 ms per permutation on nbb/sci and 0.5 ms on the
 JVM. It favours clarity over speed.
 
+## Native port and gate (JUN-352 P1b)
+
+`kotoba/sha3/core.kotoba` is the native `.kotoba` port: `sha3-224`, `sha3-256`,
+`sha3-384`, `sha3-512`, `shake128`, `shake256` and the general `sponge` (rate, domain
+suffix, output length; bad parameters return an empty vector). Bytes are
+`:vector-i64` of 0..255. The Keccak-f[1600] permutation is transcribed from
+`kotoba.vm.evm.native-keccak` (Keccak-256 only, fixed rate and the Ethereum suffix);
+this module adds the general sponge. One lane is one native i64.
+
+`kotoba/sha3/native_gate.kotoba` returns a bitmask (63 = pass) of FIPS 202 known
+answers (SHA3-224/256/384/512 of "" and "abc", SHA3-256 of 200 × 0xA3, SHAKE128/256
+of ""), SHAKE prefix consistency across the rate boundary, output shape, and refusal
+of bad parameters. It also prints 126 oracle lines (all six functions at 21 lengths
+around every rate, SHAKE squeezed to 200 / 300 bytes) for an independent comparison.
+
+```sh
+G=/Users/junkawasaki/github/workspaces/<agent>/<task>   # a new task-owned directory
+{ echo '(ns sha3-gate (:export [main]))'
+  sed '/^(ns /,/))$/d' kotoba/sha3/core.kotoba
+  sed '/^(ns /,/))$/d' kotoba/sha3/native_gate.kotoba; } > "$G/gate.kotoba"
+sed 's/0x0000000000008082/0x0000000000008083/' "$G/gate.kotoba" > "$G/ctl-constant.kotoba"
+sed 's/(sponge bytes 136 6 32))/(sponge bytes 136 1 32))/' "$G/gate.kotoba" > "$G/ctl-suffix.kotoba"
+# compile each with the Amu root (Mac: --target aarch64-macos, extract-native main,
+# package fs2-cli-stdio-general, sign) and run with FD 3 = $G
+```
+
+Measured 2026-10-30 on Apple M1 Max with the Amu Mac root of main `91faa123`
+(`amu-full-root.macho`, packaged `fs2-cli-stdio-general`):
+
+| image | exit |
+|---|---|
+| gate | **63** (all six groups) |
+| ctl-constant (one round constant changed) | 56 |
+| ctl-suffix (SHA3-256 with the Keccak suffix 0x01) | 60 |
+
+All 126 oracle lines equal Python `hashlib` (`sha3_*`, `shake_128`, `shake_256`) for
+the same inputs (byte i = (7i + 3) mod 256). Python only compared the printed lines;
+the image computed every digest.
+
+Not yet: the incremental XOF, the CAVP files under `test/sha3/cavp/` run natively
+(the gate embeds the published examples; the `.cljk` suite runs the CAVP files), a
+an x86_64 run of the gate. It runs in CI on Linux arm64 (`scripts/check-pq-native.py`,
+since kotoba#1014).
+
 ## Non-claims
 
 - **Not constant time.** Persistent vectors and data-dependent allocation make no
@@ -63,9 +107,9 @@ JVM. It favours clarity over speed.
 - **`.cljk` is a migration input.** Amu's contract (2026-10-22, `docs/selfhost-priority.md`)
   makes `.kotoba` the canonical source and builds one native image in which the
   runtime and providers are Kotoba code linked with the program; there is no separate
-  host. This library is not yet in `.kotoba`, so it does not compile with `amu` to a
-  native image. The algorithm and the known-answer tests are settled here first; the
-  `.kotoba` port is the next step (JUN-352, P1b).
+  host. The native port is `kotoba/sha3/core.kotoba` (JUN-352 P1b, below). It covers the
+  one-shot functions; the incremental XOF of `sha3.core` (`xof-absorb` / `xof-squeeze`)
+  is not ported yet.
 - Byte-oriented only: inputs and outputs are whole bytes. SHA-3 variants with
   non-byte bit lengths (the `Len` values that are not multiples of 8) are not
   implemented, and neither are `cSHAKE`, `KMAC`, `TupleHash` or `ParallelHash`

@@ -1,0 +1,66 @@
+;; pqh.hybrid -- the pqh-v1 hybrid KEM (X25519 + ML-KEM-768 -> HKDF-SHA256) in native
+;; .kotoba (AWAI-117). The combiner is byte-for-byte that of
+;; src/kotoba/lang/pqh/pq.cljk (combine-shared-secrets):
+;;   ikm  = X25519 shared secret (32) || ML-KEM-768 shared secret (32)
+;;   salt = UTF-8 "etzhayyim/pqh-v1/kem"
+;;   info = SHA-256(ephemeral X25519 public || ML-KEM ciphertext ||
+;;                  recipient X25519 public || recipient ML-KEM ek) || caller info
+;;   out  = HKDF-SHA256(ikm, salt, info, 32)
+;; Randomness is the caller's: the ephemeral X25519 secret and the 32-byte ML-KEM m.
+;;   encapsulate eph m rx-pub r-ek info -> shared secret (32) ++ ephemeral public (32)
+;;                                         ++ ML-KEM ciphertext (1088)
+;;   decapsulate x-secret dk eph-pub ct rx-pub r-ek info -> shared secret (32)
+;; Both give an empty vector for a wrong length or a non-byte value, when ML-KEM refuses
+;; its input (FIPS 203 section 7 checks), or when the X25519 result is all zeros (a
+;; low-order point). The last refusal is stricter than pq.cljk, which does not check;
+;; it never changes the output of an exchange that succeeds. A tampered ciphertext is
+;; not an error: ML-KEM's implicit rejection gives a different secret, which the AEAD
+;; that uses it then rejects. Not constant time: see the README.
+(ns pqh.hybrid
+  (:require [x25519.core :as x] [mlkem.core :as k] [sha2.core :as h])
+  (:export [encapsulate decapsulate hkdf-sha256]))
+
+(defn- cat [a :vector-i64 b :vector-i64] :vector-i64
+  (let [na (vector-count a) out (vector-alloc (+ na (vector-count b)))]
+    (loop [i 0] (if (= i (vector-count out)) out
+      (let [z (vector-assoc! out i (if (< i na) (vector-at a i) (vector-at b (- i na))))] (recur (+ i 1)))))))
+(defn- slice [v :vector-i64 start :i64 n :i64] :vector-i64
+  (loop [i 0 out (vector-alloc n)] (if (= i n) out (recur (+ i 1) (vector-assoc! out i (vector-at v (+ start i)))))))
+(defn- bytes? [v :vector-i64 n :i64] :bool
+  (and (or (< n 0) (= (vector-count v) n))
+       (loop [i 0] (if (= i (vector-count v)) true (if (and (>= (vector-at v i) 0) (<= (vector-at v i) 255)) (recur (+ i 1)) false)))))
+(defn- salt [] :vector-i64
+  ;; "etzhayyim/pqh-v1/kem"
+  (vector-i64 101 116 122 104 97 121 121 105 109 47 112 113 104 45 118 49 47 107 101 109))
+
+(defn hkdf-sha256 [ikm :vector-i64 s :vector-i64 info :vector-i64 n :i64] :vector-i64
+  ;; RFC 5869 extract and expand, n at most 255 * 32
+  (let [prk (h/hmac-sha256 s ikm)]
+    (loop [i 1 t (vector-i64) okm (vector-i64)]
+      (if (>= (vector-count okm) n) (slice okm 0 n)
+        (let [ti (h/hmac-sha256 prk (cat (cat t info) (vector-i64 i)))]
+          (recur (+ i 1) ti (cat okm ti)))))))
+
+(defn- combine [ss-x :vector-i64 ss-k :vector-i64 eph-pub :vector-i64 ct :vector-i64
+                rx-pub :vector-i64 r-ek :vector-i64 info :vector-i64] :vector-i64
+  (hkdf-sha256 (cat ss-x ss-k) (salt)
+               (cat (h/sha256 (cat (cat (cat eph-pub ct) rx-pub) r-ek)) info) 32))
+
+(defn encapsulate [eph :vector-i64 m :vector-i64 rx-pub :vector-i64 r-ek :vector-i64 info :vector-i64] :vector-i64
+  (if (or (not (bytes? eph 32)) (not (bytes? m 32)) (not (bytes? rx-pub 32)) (not (bytes? info -1))) (vector-i64)
+    (let [kc (k/encaps r-ek m)]
+      (if (= (vector-count kc) 0) (vector-i64)
+        (let [ss-x (x/x25519-bytes eph rx-pub)]
+          (if (not (x/contributory? ss-x)) (vector-i64)
+            (let [eph-pub (x/public-key eph) ct (slice kc 32 1088)]
+              (cat (cat (combine ss-x (slice kc 0 32) eph-pub ct rx-pub r-ek info) eph-pub) ct))))))))
+
+(defn decapsulate [x-secret :vector-i64 dk :vector-i64 eph-pub :vector-i64 ct :vector-i64
+                   rx-pub :vector-i64 r-ek :vector-i64 info :vector-i64] :vector-i64
+  (if (or (not (bytes? x-secret 32)) (not (bytes? eph-pub 32)) (not (bytes? rx-pub 32))
+          (not (bytes? r-ek 1184)) (not (bytes? info -1))) (vector-i64)
+    (let [ss-k (k/decaps dk ct)]
+      (if (= (vector-count ss-k) 0) (vector-i64)
+        (let [ss-x (x/x25519-bytes x-secret eph-pub)]
+          (if (not (x/contributory? ss-x)) (vector-i64)
+            (combine ss-x ss-k eph-pub ct rx-pub r-ek info)))))))
