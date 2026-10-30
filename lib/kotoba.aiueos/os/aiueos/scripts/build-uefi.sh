@@ -1386,6 +1386,13 @@ kotoba_tls13_hello_object=${AIUEOS_KOTOBA_TLS13_HELLO_OBJECT:-"$aiueos/kotoba/tl
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_tls13_hello_object" \
   de0e7b0332eec62d8a97148940c6e449fcee1e642d62a1ceb92ff9c2be514ff3 \
   kotoba_aiueos_tls13_clienthello,kotoba_aiueos_tls13_serverhello_parse
+# JUN-553: tls13.c's Finished check and CertificateVerify parse-and-digest are kotoba/tls13-verify.o (fuel 4194304); it calls
+# the SHA-256, key-schedule and certificate objects through externs.
+kotoba_tls13_verify_object=${AIUEOS_KOTOBA_TLS13_VERIFY_OBJECT:-"$aiueos/kotoba/tls13-verify.o"}
+python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_tls13_verify_object" \
+  67d4a6d64190e7a4ab621cb38569f81a8cd96a0722728d0b6210699bd7ae206c \
+  kotoba_aiueos_tls13_finished_ok,kotoba_aiueos_tls13_certverify \
+  kotoba_aiueos_sha256,kotoba_aiueos_tls13_hmac,kotoba_aiueos_tls13_hkdf_expand_label,kotoba_aiueos_tls13_parse_ecdsa_der
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_bytes_object" \
   567551de001399c4706927cbffd474b53c15ea35e908945e51fd2176feca6c58 \
   kotoba_aiueos_bytes_copy,kotoba_aiueos_bytes_fill
@@ -1494,7 +1501,7 @@ zig ld.lld -nostdlib -static --strip-all $qualification_gc_link -z max-page-size
   "$kernel_inference_status_object" \
   $device_result_link $model_handoff_link "$kernel_kototama_runtime_object" \
   "$kotoba_job_protocol_glue_object" \
-  "$kotoba_tls_aes_object" "$kotoba_bytes_object" "$kotoba_tls13_keyschedule_object" "$kotoba_tls13_cert_object" "$kotoba_tls13_hello_object" "$kernel_tls13_object" \
+  "$kotoba_tls_aes_object" "$kotoba_bytes_object" "$kotoba_tls13_keyschedule_object" "$kotoba_tls13_cert_object" "$kotoba_tls13_hello_object" "$kotoba_tls13_verify_object" "$kernel_tls13_object" \
   "$kernel_scheduler_object" "$kernel_syscall_object" \
   "$kernel_process_object" "$kernel_loader_object" \
   "$kernel_smp_object" "$kernel_trampoline_object" \
