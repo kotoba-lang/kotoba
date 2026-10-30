@@ -272,20 +272,34 @@ processes. Each replica serves its vote as the session responder: it requires th
 coordinator's identity, opens the request at sequence 0, votes with `hata.replica/vote`
 and replies under the same id. The coordinator dials, requires the replica's identity and
 stores only the bound reply. The broker driver's `certificate` step then assembles the
-quorum certificate from those votes. Measured 2026-10-30 in the podman machine (Linux
-arm64) with Amu main's committed `aarch64-linux-static-root.elf`:
+quorum certificate from those votes.
+
+**Commit and attest between processes.** After the certificate, the coordinator opens a
+second session to each replica and sends two requests in order: the commit at sequence 0
+(body: 4-byte big-endian request length, the request, the certificate), answered with
+`hata.replica/commit`'s result, then the attest at sequence 1 (body: the reader's nonce),
+answered with the attestation. The coordinator stores each bound attestation, and the
+broker driver's `fresh` step decides the fresh committed head from them.
+
+Measured 2026-10-30 in the podman machine (Linux arm64) with Amu's committed
+`aarch64-linux-static-root.elf` at `65359a09` (image `8ebb44c5`, also at `91faa123`, image
+`7814504c`). The compiler of the workflow's general Amu pin, `6a77cd91` (image `d5ef9cee`),
+builds a broker driver that traps (SIGILL) in `prepare`, so the CI step checks out
+`65359a09` for these sessions only:
 
 | exchange | result |
 |---|---|
 | replicas 0, 1, 2 vote over their own sessions | vote 1 each; the certificate assembles |
 | coordinator expects another replica's identity | the handshake is refused (replica -21, coordinator -31) |
 | request id made for sequence 1 | the replica refuses it (-23); no vote is written (coordinator -33) |
+| replicas 0, 1, 2 commit (sequence 0) and attest (sequence 1) over a second session | commit 2 and an attestation each; `fresh` decides the committed head (1) |
+| the commit replayed where the attest belongs (sequence 1) | the replica refuses it (-44); no attestation is written (coordinator -55) |
 
 The keys in the driver are fixed public test values; a deployment takes ephemerals and
 KEM randomness from the host's entropy provider and identities from the roster. The CI
 arm64 lane runs it.
 
-Not yet: commit and attest over sessions, timeouts and retries beyond the wire's own,
+Not yet: timeouts and retries beyond the wire's own,
 backpressure, per-peer budgets, separate hosts, and the re-check of body and C0 authority
 right before dispatch.
 
