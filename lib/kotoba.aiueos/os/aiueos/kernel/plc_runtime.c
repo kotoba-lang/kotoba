@@ -48,8 +48,13 @@ static void plc_reset(void) {
   plc.next_release=AIUEOS_PLC_CYCLE_TICKS;
 }
 
+/* What a release or a capability call may do is kotoba/plc-step.kotoba (JUN-554); this file keeps the runtime struct and
+   performs the step the object names. */
+extern int64_t kotoba_aiueos_plc_release_step(uint64_t, uint64_t, uint64_t, uint64_t);
+extern int64_t kotoba_aiueos_plc_call_step(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+
 static int plc_release(uint64_t now) {
-  if (plc.fault_latched || plc.active || now!=plc.next_release) {
+  if (kotoba_aiueos_plc_release_step(plc.fault_latched, plc.active, now, plc.next_release) != 1) {
     plc_safe(AIUEOS_PLC_FAULT_RELEASE); return 0;
   }
   for (unsigned i=0;i<AIUEOS_PLC_IO_COUNT;i++) {
@@ -65,37 +70,20 @@ static int plc_release(uint64_t now) {
 }
 
 static uint64_t plc_call(uint64_t capability,uint64_t argument,uint64_t now) {
-  if (!plc.active) { plc_safe(AIUEOS_PLC_FAULT_CAPABILITY); return 0; }
-  if (capability==AIUEOS_PLC_INPUT_CAP) {
-    unsigned index=(unsigned)argument;
-    if (index>=AIUEOS_PLC_IO_COUNT) { plc_safe(AIUEOS_PLC_FAULT_CAPABILITY); return 0; }
-    return (uint64_t)(int64_t)plc.input_image[index];
+  uint64_t state=(plc.active?1U:0U)|(plc.watchdog?2U:0U)|((uint64_t)(plc.staged&3U)<<2);
+  int64_t r=kotoba_aiueos_plc_call_step(capability,argument,now,state,plc.deadline,plc.budget_end);
+  unsigned index=(unsigned)((uint64_t)r>>16)&0xffU;
+  switch ((int)(r&0xff)) {
+    case 1: return (uint64_t)(int64_t)plc.input_image[index];
+    case 2: plc.shadow_output[index]=(int32_t)argument; plc.staged|=1U<<index; return 1;
+    case 3: plc.watchdog=1; return 1;
+    case 4:
+      for (unsigned i=0;i<AIUEOS_PLC_IO_COUNT;i++)
+        plc.physical_output[i]=plc.shadow_output[i];
+      plc.active=0; return 1;
+    default:
+      plc_safe((enum aiueos_plc_fault)(((uint64_t)r>>8)&0xffU)); return 0;
   }
-  if (capability==AIUEOS_PLC_STAGE_CAP) {
-    unsigned index=(unsigned)(argument>>32);
-    if (index>=AIUEOS_PLC_IO_COUNT || (plc.staged&(1U<<index))) {
-      plc_safe(AIUEOS_PLC_FAULT_STAGE); return 0;
-    }
-    plc.shadow_output[index]=(int32_t)argument;
-    plc.staged|=1U<<index;
-    return 1;
-  }
-  if (capability==AIUEOS_PLC_WATCHDOG_CAP) {
-    if (argument!=1 || plc.watchdog) { plc_safe(AIUEOS_PLC_FAULT_WATCHDOG); return 0; }
-    plc.watchdog=1; return 1;
-  }
-  if (capability==AIUEOS_PLC_COMMIT_CAP) {
-    if (argument!=AIUEOS_PLC_IO_COUNT || plc.staged!=3U) {
-      plc_safe(AIUEOS_PLC_FAULT_STAGE); return 0;
-    }
-    if (!plc.watchdog) { plc_safe(AIUEOS_PLC_FAULT_WATCHDOG); return 0; }
-    if (now>plc.deadline) { plc_safe(AIUEOS_PLC_FAULT_DEADLINE); return 0; }
-    if (now>plc.budget_end) { plc_safe(AIUEOS_PLC_FAULT_BUDGET); return 0; }
-    for (unsigned i=0;i<AIUEOS_PLC_IO_COUNT;i++)
-      plc.physical_output[i]=plc.shadow_output[i];
-    plc.active=0; return 1;
-  }
-  plc_safe(AIUEOS_PLC_FAULT_CAPABILITY); return 0;
 }
 
 static int plc_failure_vectors(void) {
