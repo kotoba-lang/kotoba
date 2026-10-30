@@ -1407,6 +1407,13 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_tls13_verify_o
   67d4a6d64190e7a4ab621cb38569f81a8cd96a0722728d0b6210699bd7ae206c \
   kotoba_aiueos_tls13_finished_ok,kotoba_aiueos_tls13_certverify \
   kotoba_aiueos_sha256,kotoba_aiueos_tls13_hmac,kotoba_aiueos_tls13_hkdf_expand_label,kotoba_aiueos_tls13_parse_ecdsa_der
+# JUN-553: tls13.c's handshake / application traffic keys and the client Finished MAC are kotoba/tls13-keys.o (fuel 4194304);
+# it calls the SHA-256 and key-schedule objects through externs.
+kotoba_tls13_keys_object=${AIUEOS_KOTOBA_TLS13_KEYS_OBJECT:-"$aiueos/kotoba/tls13-keys.o"}
+python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_tls13_keys_object" \
+  88970f767f0ee68787f50fccb43beb695c3e453bdc35360f39ae943ad9e97a10 \
+  kotoba_aiueos_tls13_hs_keys,kotoba_aiueos_tls13_ap_keys,kotoba_aiueos_tls13_finished_mac \
+  kotoba_aiueos_sha256,kotoba_aiueos_tls13_hmac,kotoba_aiueos_tls13_hkdf_expand_label
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_bytes_object" \
   567551de001399c4706927cbffd474b53c15ea35e908945e51fd2176feca6c58 \
   kotoba_aiueos_bytes_copy,kotoba_aiueos_bytes_fill
@@ -1515,7 +1522,7 @@ zig ld.lld -nostdlib -static --strip-all $qualification_gc_link -z max-page-size
   "$kernel_inference_status_object" \
   $device_result_link $poll_sched_link $model_handoff_link "$kernel_kototama_runtime_object" \
   "$kotoba_job_protocol_glue_object" \
-  "$kotoba_tls_aes_object" "$kotoba_bytes_object" "$kotoba_tls13_keyschedule_object" "$kotoba_tls13_cert_object" "$kotoba_tls13_hello_object" "$kotoba_tls13_verify_object" "$kernel_tls13_object" \
+  "$kotoba_tls_aes_object" "$kotoba_bytes_object" "$kotoba_tls13_keyschedule_object" "$kotoba_tls13_cert_object" "$kotoba_tls13_hello_object" "$kotoba_tls13_verify_object" "$kotoba_tls13_keys_object" "$kernel_tls13_object" \
   "$kernel_scheduler_object" "$kernel_syscall_object" \
   "$kernel_process_object" "$kernel_loader_object" \
   "$kernel_smp_object" "$kernel_trampoline_object" \
