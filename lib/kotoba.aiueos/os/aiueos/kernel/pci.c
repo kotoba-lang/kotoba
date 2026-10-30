@@ -4838,56 +4838,25 @@ static int net_udp_rx_checksum_ok(const uint8_t *frame, uint32_t udp_length) {
 }
 
 /* Constant-offset A admission for one caller-owned bounded QNAME. Two layouts:
-   RFC 1035 pointer 0xc00c, or the question copied uncompressed. Anything with
-   an options-style walk stays unwritten -- that would need a Kotoba object
-   and a kotoba-native export that this pin does not list. */
+   RFC 1035 pointer 0xc00c, or the question copied uncompressed. JUN-552: the
+   admission is kotoba/dns-answer.o; it answers 2^32 + A when the A address is
+   reached (the C wrote *out_a there and admitted it only when non-zero), else 0.
+   The UDP checksum is summed over the pseudo header in place, so
+   net_dhcp_scratch is no longer written here. */
+extern int64_t kotoba_aiueos_dns_answer(uint64_t frame, uint64_t length, uint64_t src, uint64_t dst,
+                                        uint64_t server_port, uint64_t question, uint64_t question_length);
 static int net_dns_answer_ok_named(const uint8_t *frame, uint32_t length,
                                    uint32_t src, uint32_t dst,
                                    uint16_t server_port,
                                    const uint8_t *question,
                                    uint32_t question_length,
                                    uint32_t *out_a) {
-  uint32_t total, udp_length, answer;
-  unsigned i;
-  if (!frame || !question || !out_a || question_length < 5 ||
-      question_length > 255 || length < 70 + question_length) return 0;
-  if (net_load_be16(frame + 12) != 0x0800) return 0;
-  if (frame[14] != 0x45 || frame[23] != 17) return 0;
-  total = net_load_be16(frame + 16);
-  if (total < 58 || 14 + total > length) return 0;
-  if (kotoba_aiueos_ipv4_checksum((uint64_t)(uintptr_t)(frame + 14), 20) != 0)
-    return 0;
-  if (net_load_be32(frame + 26) != src) return 0;
-  if (net_load_be32(frame + 30) != dst) return 0;
-  if (net_load_be16(frame + 34) != server_port) return 0;
-  if (net_load_be16(frame + 36) != NET_DNS_CLIENT_PORT) return 0;
-  udp_length = net_load_be16(frame + 38);
-  if (udp_length < 20 + question_length || 20 + udp_length != total) return 0;
-  if (net_load_be16(frame + 40) != 0 && !net_udp_rx_checksum_ok(frame, udp_length))
-    return 0;
-  if (net_load_be16(frame + 42) != NET_DNS_XID) return 0;
-  if ((net_load_be16(frame + 44) & 0x8000) == 0) return 0;   /* QR */
-  if ((net_load_be16(frame + 44) & 0x000f) != 0) return 0;   /* RCODE */
-  if (net_load_be16(frame + 46) != 1) return 0;              /* QDCOUNT */
-  if (net_load_be16(frame + 48) == 0) return 0;              /* ANCOUNT */
-  for (i = 0; i < question_length; i++) {
-    if (frame[54 + i] != question[i]) return 0;
-  }
-  answer = 54 + question_length;
-  if (frame[answer] == 0xc0 && frame[answer + 1] == 0x0c) {
-    if (length < answer + 16) return 0;
-    if (net_load_be16(frame + answer + 2) != 1) return 0;
-    if (net_load_be16(frame + answer + 4) != 1) return 0;
-    if (net_load_be16(frame + answer + 10) != 4) return 0;
-    *out_a = net_load_be32(frame + answer + 12);
-    return *out_a != 0;
-  }
-  if (length < answer + question_length + 10) return 0;
-  for (i = 0; i < question_length; i++) {
-    if (frame[answer + i] != question[i]) return 0;
-  }
-  if (net_load_be16(frame + answer + question_length + 4) != 4) return 0;
-  *out_a = net_load_be32(frame + answer + question_length + 6);
+  int64_t answer;
+  if (!frame || !question || !out_a) return 0;
+  answer = kotoba_aiueos_dns_answer((uint64_t)(uintptr_t)frame, length, src, dst, server_port,
+                                    (uint64_t)(uintptr_t)question, question_length);
+  if (answer < (int64_t)4294967296LL) return 0;
+  *out_a = (uint32_t)answer;
   return *out_a != 0;
 }
 

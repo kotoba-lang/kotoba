@@ -1475,6 +1475,10 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_kototama_manag
 kotoba_acpi_dmar_object=${AIUEOS_KOTOBA_ACPI_DMAR_OBJECT:-"$aiueos/kotoba/acpi-dmar-parse.o"}
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_acpi_dmar_object" \
   458deaf9b52b345caaaeb1c4ee0ee58a72d2e94974de11a28f3a092fc8aae769 kotoba_aiueos_acpi_dmar_parse
+# JUN-552: pci.c's DNS A admission (net_dns_answer_ok_named) is kotoba/dns-answer.o (fuel 4194304).
+kotoba_dns_answer_object=${AIUEOS_KOTOBA_DNS_ANSWER_OBJECT:-"$aiueos/kotoba/dns-answer.o"}
+python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_dns_answer_object" \
+  34811e0ba6d69f4218441a82a258fe523dd1c90b8bd0aa04c015ab920c558645 kotoba_aiueos_dns_answer
 # JUN-552: aiueos_acpi_initialize's MADT walk is kotoba/acpi-madt-parse.o (fuel 4194304); acpi.c keeps the globals.
 kotoba_acpi_madt_object=${AIUEOS_KOTOBA_ACPI_MADT_OBJECT:-"$aiueos/kotoba/acpi-madt-parse.o"}
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_acpi_madt_object" \
@@ -1583,7 +1587,7 @@ zig ld.lld -nostdlib -static --strip-all $qualification_gc_link -z max-page-size
   -T "$aiueos/kernel/linker.ld" -o "$kernel" \
   "$kernel_entry_object" "$kernel_object" "$kernel_paging_object" \
   "$kernel_acpi_object" "$kotoba_acpi_dmar_object" "$kotoba_acpi_madt_object" "$kernel_vtd_object" "$kernel_apic_object" "$kernel_memory_object" \
-  "$kernel_pci_object" "$kernel_rtl8125_object" \
+  "$kernel_pci_object" "$kotoba_dns_answer_object" "$kernel_rtl8125_object" \
   "$kernel_inference_status_object" \
   $device_result_link $cpu_reads_link $ssh_userauth_link $poll_sched_link $model_handoff_link "$kernel_kototama_runtime_object" "$kotoba_kototama_management_object" \
   "$kotoba_job_protocol_glue_object" \
