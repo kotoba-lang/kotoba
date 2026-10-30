@@ -548,7 +548,11 @@ if [ "${AIUEOS_PLC_RT_SMOKE:-0}" = 1 ]; then
   kotoba_plc_step_object=${AIUEOS_KOTOBA_PLC_STEP_OBJECT:-"$aiueos/kotoba/plc-step.o"}
   python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_plc_step_object" \
     008e592e498754326017a87512e146bbda088f6f3568f0c38f71cd5fb0337fc1 kotoba_aiueos_plc_call_step,kotoba_aiueos_plc_release_step
-  plc_runtime_link="$kernel_plc_runtime_object $kernel_plc_embedded_object $kotoba_rt_dispatch_plan_object $kotoba_plc_step_object"
+  # JUN-554: plc_runtime.c's wait for the next scan release is kotoba/tick-wait.o, over amu ADR 0392's halt.
+  kotoba_tick_wait_object=${AIUEOS_KOTOBA_TICK_WAIT_OBJECT:-"$aiueos/kotoba/tick-wait.o"}
+  python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_tick_wait_object" \
+    2c67ca2bee1909cfe1546f88c95a167b4fac15f1cad191b65e7a1b3dd45954f7 kotoba_aiueos_tick_wait
+  plc_runtime_link="$kernel_plc_runtime_object $kernel_plc_embedded_object $kotoba_rt_dispatch_plan_object $kotoba_plc_step_object $kotoba_tick_wait_object"
   kotoba_user_elf_valid_object="$aiueos/kotoba/plc-user-elf-valid.o"
   kotoba_user_elf_valid_sha=77c5e791da666e8355a7a877c37841cc63a3f228fbf785656522284a5259bbdd
 fi
