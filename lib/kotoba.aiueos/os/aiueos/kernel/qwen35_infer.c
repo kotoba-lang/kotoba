@@ -1502,6 +1502,56 @@ static void configure_backend(void) {
 /* The logits of `normalized` against the output projection, and the two
    largest of them. Zero on a malformed tensor, a refused matvec or a
    non-finite logit; the caller names the failure stage. */
+/* In the model-handoff image the selection is kotoba/qwen35-select.kotoba (JUN-554, over amu ADR 0391's scalar SSE
+   f32); the parity profiles and the host smokes, which do not link it, keep the C. The object's 24-byte state is the
+   token, the second token, the two logits' bits and the token of the window's first logit; a window is at most 4096
+   logits (16 KiB). It answers 1, or 0 at the first non-finite logit with the state the logits before it left. */
+#if defined(AIUEOS_QWEN38_MODEL_HANDOFF) && !defined(AIUEOS_QWEN35_TESTING)
+extern int64_t kotoba_aiueos_qwen35_select(uint64_t logits, uint64_t bytes, uint64_t state, uint64_t state_bytes);
+static uint32_t select_float_bits(float value) {
+  union { float value; uint32_t bits; } representation = {value};
+  return representation.bits;
+}
+static float select_bits_float(uint32_t bits) {
+  union { uint32_t bits; float value; } representation = {bits};
+  return representation.value;
+}
+static int select_view(const float *logits, uint32_t first, uint32_t count, struct qwen35_token_choice *choice) {
+  uint32_t state[6] = {choice->token, choice->second_token, select_float_bits(choice->logit),
+                       select_float_bits(choice->second_logit), 0, 0};
+  int ok = 1;
+  for (uint32_t done = 0; ok && done < count; done += 4096) {
+    uint32_t part = count - done < 4096 ? count - done : 4096;
+    state[4] = first + done;
+    ok = kotoba_aiueos_qwen35_select((uint64_t)(uintptr_t)(logits + done), (uint64_t)part * 4,
+                                     (uint64_t)(uintptr_t)state, sizeof state) == 1;
+  }
+  choice->token = state[0];
+  choice->second_token = state[1];
+  choice->logit = select_bits_float(state[2]);
+  choice->second_logit = select_bits_float(state[3]);
+  return ok;
+}
+#else
+static int select_view(const float *logits, uint32_t first, uint32_t count, struct qwen35_token_choice *choice) {
+  for (uint32_t offset = 0; offset < count; offset++) {
+    uint32_t token = first + offset;
+    float logit = logits[offset];
+    if (!finite_float(logit)) return 0;
+    if (logit > choice->logit) {
+      choice->second_logit = choice->logit;
+      choice->second_token = choice->token;
+      choice->logit = logit;
+      choice->token = token;
+    } else if (logit > choice->second_logit) {
+      choice->second_logit = logit;
+      choice->second_token = token;
+    }
+  }
+  return 1;
+}
+#endif
+
 static int select_output_token(const struct aiueos_qwen35_tensor *output,
                                uint32_t vocab,
                                struct qwen35_token_choice *choice) {
@@ -1529,20 +1579,7 @@ static int select_output_token(const struct aiueos_qwen35_tensor *output,
     view.data = output->data + (uint64_t)first * row_bytes;
     view.storage_bytes = (uint64_t)count * row_bytes;
     if (!matvec(&view, normalized, EMBED, scratch_a, count)) return 0;
-    for (uint32_t offset = 0; offset < count; offset++) {
-      uint32_t token = first + offset;
-      float logit = scratch_a[offset];
-      if (!finite_float(logit)) return 0;
-      if (logit > choice->logit) {
-        choice->second_logit = choice->logit;
-        choice->second_token = choice->token;
-        choice->logit = logit;
-        choice->token = token;
-      } else if (logit > choice->second_logit) {
-        choice->second_logit = logit;
-        choice->second_token = token;
-      }
-    }
+    if (!select_view(scratch_a, first, count, choice)) return 0;
   }
   return 1;
 }
