@@ -895,6 +895,11 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_cap_valid_obje
 kotoba_virtio_queue_object=${AIUEOS_KOTOBA_VIRTIO_QUEUE_OBJECT:-"$aiueos/kotoba/virtio-queue.o"}
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_virtio_queue_object" \
   e4de255126250d36cb201bc6552bed3679edc70fa94687ef346133b326149856 kotoba_aiueos_virtio_queue_setup
+# JUN-598: the split-virtqueue ring operations (descriptor + available-ring post, used-ring reads) are
+# kotoba/virtq-ring.o (fuel 4194304); virtio_rng and rng_refill use them first.
+kotoba_virtq_ring_object=${AIUEOS_KOTOBA_VIRTQ_RING_OBJECT:-"$aiueos/kotoba/virtq-ring.o"}
+python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_virtq_ring_object" \
+  bede3873bb93e063ffb8b9ab1e5510fcd48e90629c04d03b100b6762d35b8c61 kotoba_aiueos_virtq_post,kotoba_aiueos_virtq_used_index,kotoba_aiueos_virtq_used_elem
 # JUN-598: pci.c's virtio capability walk (find_virtio_caps) is kotoba/virtio-caps.o (fuel 4194304), over a snapshot of
 # the 256-byte configuration header.
 kotoba_virtio_caps_object=${AIUEOS_KOTOBA_VIRTIO_CAPS_OBJECT:-"$aiueos/kotoba/virtio-caps.o"}
@@ -1662,7 +1667,7 @@ zig ld.lld -nostdlib -static --strip-all $qualification_gc_link -z max-page-size
   "$kotoba_aes128_gcm_object" "$kotoba_tls13_record_object" "$kotoba_virtio_queue_object" \
   $qwen35_kotoba_link $qwen35_parity_link \
   "$kotoba_device_worker_canonical_object" \
-  "$kotoba_sha256_stream_object" "$kotoba_sha256_region_object" \
+  "$kotoba_sha256_stream_object" "$kotoba_sha256_region_object" "$kotoba_virtq_ring_object" \
   "$kotoba_device_worker_digest_object" "$kotoba_http_head_object" \
   "$kotoba_wm_object" "$kotoba_scanout_object" "$kotoba_broker_object" "$kotoba_session_object" \
   "$kotoba_browser_frame_object" "$kotoba_browser_reduce_object" "$kotoba_browser_frame2_object" "$kotoba_browser_ime_object" \

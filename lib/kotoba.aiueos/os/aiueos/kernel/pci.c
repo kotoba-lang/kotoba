@@ -1234,7 +1234,7 @@ struct virtio_caps {
 };
 
 extern uint64_t kotoba_aiueos_virtio_cap_valid(
-  uint64_t pointer, uint64_t cap_length, uint64_t bar, uint64_t offset, uint64_t length); extern int64_t kotoba_aiueos_virtio_caps_find(uint64_t header, uint64_t header_length, uint64_t record, uint64_t record_length); extern int64_t kotoba_aiueos_virtio_negotiate(uint64_t cfg, uint64_t length); extern int64_t kotoba_aiueos_virtio_queue_setup(uint64_t cfg, uint64_t length, uint64_t record, uint64_t record_length);
+  uint64_t pointer, uint64_t cap_length, uint64_t bar, uint64_t offset, uint64_t length); extern int64_t kotoba_aiueos_virtio_caps_find(uint64_t header, uint64_t header_length, uint64_t record, uint64_t record_length); extern int64_t kotoba_aiueos_virtio_negotiate(uint64_t cfg, uint64_t length); extern int64_t kotoba_aiueos_virtio_queue_setup(uint64_t cfg, uint64_t length, uint64_t record, uint64_t record_length); extern int64_t kotoba_aiueos_virtq_post(uint64_t desc, uint64_t desc_length, uint64_t avail, uint64_t avail_length, uint64_t record, uint64_t record_length); extern int64_t kotoba_aiueos_virtq_used_index(uint64_t used, uint64_t used_length); extern int64_t kotoba_aiueos_virtq_used_elem(uint64_t used, uint64_t used_length, uint64_t slot);
 extern uint64_t kotoba_aiueos_pci_extent_valid(uint64_t value, uint64_t size);
 extern uint64_t kotoba_aiueos_pci_region_valid(
   uint64_t offset, uint64_t bytes, uint64_t bar_length); extern int64_t kotoba_aiueos_pci_bar_kind(int64_t low, int64_t index); extern int64_t kotoba_aiueos_pci_bar_value(int64_t low, int64_t high); extern int64_t kotoba_aiueos_pci_bar_base(int64_t low, int64_t high, int64_t index); extern int64_t kotoba_aiueos_pci_bar_size(int64_t mask_low, int64_t mask_high, int64_t kind);
@@ -1352,21 +1352,21 @@ static struct {
    Returns 1 on a completed 32-byte fill. */
 static int rng_refill(void) {
   if (!rng_backend.ready) return 0;
-  rng_backend.desc[0].address = (uint64_t)(uintptr_t)rng_backend.page;
-  rng_backend.desc[0].length = 32;
-  rng_backend.desc[0].flags = VIRTQ_DESC_F_WRITE;
-  rng_backend.desc[0].next = 0;
+  /* JUN-598: descriptor 0 -> the page (32 bytes, device-writable), ring[0] = 0,
+     then the available index: kotoba/virtq-ring.o, in that order. */
   uint64_t before = aiueos_virtio_rng_irq_count;
-  rng_backend.avail->ring[0] = 0;
-  __asm__ volatile("" ::: "memory");
   rng_backend.posted++;
-  rng_backend.avail->index = rng_backend.posted;
+  uint64_t record[6] = {0, (uint64_t)(uintptr_t)rng_backend.page, 32, VIRTQ_DESC_F_WRITE, 0,
+                        (uint64_t)rng_backend.posted << 16};
+  if (!kotoba_aiueos_virtq_post((uint64_t)(uintptr_t)rng_backend.desc, 4096, (uint64_t)(uintptr_t)rng_backend.avail,
+                                4096, (uint64_t)(uintptr_t)record, sizeof record)) return 0;
+  __asm__ volatile("" ::: "memory");
   *rng_backend.doorbell = 0;
   for (uint32_t budget = 0; budget < 100000000U; budget++) {
     __asm__ volatile("" ::: "memory");
     if (aiueos_virtio_rng_irq_count != before &&
-        rng_backend.used->index == rng_backend.posted) {
-      return rng_backend.used->ring[0].length == 32;
+        kotoba_aiueos_virtq_used_index((uint64_t)(uintptr_t)rng_backend.used, 4096) == rng_backend.posted) {
+      return (uint32_t)kotoba_aiueos_virtq_used_elem((uint64_t)(uintptr_t)rng_backend.used, 4096, 0) == 32;
     }
     __asm__ volatile("sti; hlt; cli" ::: "memory");
   }
@@ -1562,17 +1562,17 @@ static int virtio_rng(uint8_t b, uint8_t d, uint8_t f) {
   struct virtq_used *used = aiueos_allocate_physical_page();
   uint8_t *random = aiueos_allocate_physical_page();
   if (!desc || !avail || !used || !random) return 0;
-  desc[0].address = (uint64_t)(uintptr_t)random; desc[0].length = 32;
-  desc[0].flags = VIRTQ_DESC_F_WRITE; desc[0].next = 0;
-  avail->ring[0] = 0; __asm__ volatile("" ::: "memory"); avail->index = 1;
+  uint64_t first[6] = {0, (uint64_t)(uintptr_t)random, 32, VIRTQ_DESC_F_WRITE, 0, (uint64_t)1 << 16};
+  if (!kotoba_aiueos_virtq_post((uint64_t)(uintptr_t)desc, 4096, (uint64_t)(uintptr_t)avail, 4096,
+                                (uint64_t)(uintptr_t)first, sizeof first)) return 0;
   volatile uint16_t *doorbell = prepare_queue(cfg,&caps,notify_base,1,desc,avail,used);
   if (!doorbell || !setup_rng_msix(b,d,f,&caps,cfg)) return 0;
   cfg->device_status |= VIRTIO_STATUS_DRIVER_OK;
   *doorbell = 0;
   for (uint32_t budget = 0; budget < 100000000U; budget++) {
     __asm__ volatile("" ::: "memory");
-    if (aiueos_virtio_rng_irq_count && used->index == 1) {
-      int ok = used->ring[0].id == 0 && used->ring[0].length == 32;
+    if (aiueos_virtio_rng_irq_count && kotoba_aiueos_virtq_used_index((uint64_t)(uintptr_t)used, 4096) == 1) {
+      int ok = kotoba_aiueos_virtq_used_elem((uint64_t)(uintptr_t)used, 4096, 0) == 32;   /* id 0, 32 bytes */
       if (ok) {
         /* Keep the queue alive so aiueos_random_bytes can request more. The
            first batch already sits in `random`; posted is 1 (one avail entry
