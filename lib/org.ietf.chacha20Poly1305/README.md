@@ -139,6 +139,7 @@ with the Amu Mac root of main `91faa123`:
 
 Not yet: Wycheproof, and a measurement of timing.
 
+## Not here
 
 **ChaCha20 with a 64-bit nonce** (the original construction, before RFC 8439
 fixed the split at 96/32). Nothing in this workspace speaks it.

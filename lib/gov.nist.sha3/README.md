@@ -96,7 +96,8 @@ the image computed every digest.
 
 Not yet: the incremental XOF, the CAVP files under `test/sha3/cavp/` run natively
 (the gate embeds the published examples; the `.cljk` suite runs the CAVP files), a
-Linux ARM/x86 run of the gate, and a CI job.
+an x86_64 run of the gate. It runs in CI on Linux arm64 (`scripts/check-pq-native.py`,
+since kotoba#1014).
 
 ## Non-claims
 
