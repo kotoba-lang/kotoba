@@ -1,0 +1,99 @@
+;; aes.gcm -- AES-GCM (NIST SP 800-38D) in native .kotoba (JUN-352, AWAI-61).
+;; Bytes are :vector-i64 of 0..255. 128-, 192- and 256-bit keys, any non-empty IV,
+;; 128-bit tags.
+;;   seal key iv aad plaintext -> ciphertext ++ tag (16); empty for a bad key length, an
+;;                                empty IV or a value that is not a byte
+;;   open key iv aad sealed    -> the plaintext; the one-element vector [-1] when the
+;;                                parameters are bad, sealed is shorter than a tag or the
+;;                                tag does not verify (an empty plaintext is valid, so
+;;                                failure cannot be the empty vector)
+;; A 12-byte IV gives J0 = IV || 0x00000001; any other length is GHASHed (section 7.1).
+;; The counter is the low 32 bits of the block and wraps alone. A 128-bit block is four
+;; 32-bit words in i64, so no shift sees a sign bit. The tag comparison ORs the XOR of
+;; all 16 bytes; nothing is decrypted before it passes. Not constant time: see README.
+(ns aes.gcm
+  (:require [aes.core :as a])
+  (:export [seal open]))
+
+(defn- bytes? [v :vector-i64] :bool
+  (loop [i 0] (if (= i (vector-count v)) true (if (and (>= (vector-at v i) 0) (<= (vector-at v i) 255)) (recur (+ i 1)) false))))
+(defn- slice [v :vector-i64 start :i64 n :i64] :vector-i64
+  (loop [i 0 out (vector-alloc n)] (if (= i n) out (recur (+ i 1) (vector-assoc! out i (vector-at v (+ start i)))))))
+
+(defn- words [b :vector-i64 off :i64] :vector-i64
+  ;; 16 bytes at off (zero past the end) as four big-endian words
+  (loop [w 0 out (vector-alloc 4)]
+    (if (= w 4) out
+      (recur (+ w 1)
+             (vector-assoc! out w
+               (loop [k 0 acc 0]
+                 (if (= k 4) acc
+                   (let [p (+ off (* 4 w) k)]
+                     (recur (+ k 1) (+ (* acc 256) (if (< p (vector-count b)) (vector-at b p) 0)))))))))))
+(defn- unwords [w :vector-i64] :vector-i64
+  (loop [i 0 out (vector-alloc 16)]
+    (if (= i 16) out
+      (recur (+ i 1) (vector-assoc! out i (bit-and (i64-shift-right (vector-at w (quot i 4)) (* 8 (- 3 (rem i 4)))) 255))))))
+(defn- wxor [x :vector-i64 y :vector-i64] :vector-i64
+  (vector-i64 (bit-xor (vector-at x 0) (vector-at y 0)) (bit-xor (vector-at x 1) (vector-at y 1))
+              (bit-xor (vector-at x 2) (vector-at y 2)) (bit-xor (vector-at x 3) (vector-at y 3))))
+
+(defn- gmul [x :vector-i64 y :vector-i64] :vector-i64
+  ;; section 6.3, Algorithm 1: bit 0 is the most significant bit of word 0
+  (loop [i 0 z (vector-i64 0 0 0 0) v y]
+    (if (= i 128) z
+      (let [bit (bit-and (i64-shift-right (vector-at x (quot i 32)) (- 31 (rem i 32))) 1)
+            z2 (if (= bit 1) (wxor z v) z)
+            lsb (bit-and (vector-at v 3) 1)
+            v0 (i64-shift-right (vector-at v 0) 1)
+            v1 (bit-or (i64-shift-right (vector-at v 1) 1) (i64-shift-left (bit-and (vector-at v 0) 1) 31))
+            v2 (bit-or (i64-shift-right (vector-at v 2) 1) (i64-shift-left (bit-and (vector-at v 1) 1) 31))
+            v3 (bit-or (i64-shift-right (vector-at v 3) 1) (i64-shift-left (bit-and (vector-at v 2) 1) 31))]
+        (recur (+ i 1) z2 (vector-i64 (if (= lsb 1) (bit-xor v0 3774873600) v0) v1 v2 v3))))))
+
+(defn- ghash-into [y :vector-i64 h :vector-i64 data :vector-i64] :vector-i64
+  ;; absorb data, zero-padded to whole blocks
+  (loop [j 0 y y] (if (>= j (vector-count data)) y (recur (+ j 16) (gmul (wxor y (words data j)) h)))))
+(defn- lengths [a :i64 b :i64] :vector-i64
+  ;; two 64-bit big-endian bit lengths (each below 2^32 bits here)
+  (vector-i64 (quot (* 8 a) 4294967296) (bit-and (* 8 a) 4294967295) (quot (* 8 b) 4294967296) (bit-and (* 8 b) 4294967295)))
+
+(defn- j0 [sched :vector-i64 h :vector-i64 iv :vector-i64] :vector-i64
+  (if (= (vector-count iv) 12)
+    (vector-i64 (vector-at (words iv 0) 0) (vector-at (words iv 0) 1) (vector-at (words iv 0) 2) 1)
+    (gmul (wxor (ghash-into (vector-i64 0 0 0 0) h iv) (lengths 0 (vector-count iv))) h)))
+
+(defn- gctr [sched :vector-i64 icb :vector-i64 x :vector-i64] :vector-i64
+  ;; section 6.5 with inc32; icb is four words
+  (let [n (vector-count x) out (vector-alloc n)]
+    (loop [j 0 cb icb]
+      (if (>= j n) out
+        (let [ks (a/encrypt sched (unwords cb))
+              z (loop [i 0] (if (or (= i 16) (= (+ j i) n)) 0
+                  (let [y (vector-assoc! out (+ j i) (bit-xor (vector-at x (+ j i)) (vector-at ks i)))] (recur (+ i 1)))))]
+          (recur (+ j 16) (vector-i64 (vector-at cb 0) (vector-at cb 1) (vector-at cb 2) (bit-and (+ (vector-at cb 3) 1) 4294967295))))))))
+
+(defn- tag [sched :vector-i64 h :vector-i64 j :vector-i64 aad :vector-i64 ct :vector-i64] :vector-i64
+  (gctr sched j (unwords (gmul (wxor (ghash-into (ghash-into (vector-i64 0 0 0 0) h aad) h ct)
+                                     (lengths (vector-count aad) (vector-count ct))) h))))
+(defn- inc32 [j :vector-i64] :vector-i64
+  (vector-i64 (vector-at j 0) (vector-at j 1) (vector-at j 2) (bit-and (+ (vector-at j 3) 1) 4294967295)))
+(defn- ok? [sched :vector-i64 key :vector-i64 iv :vector-i64 aad :vector-i64] :bool
+  (and (> (vector-count sched) 0) (> (vector-count iv) 0) (bytes? key) (bytes? iv) (bytes? aad)))
+
+(defn seal [key :vector-i64 iv :vector-i64 aad :vector-i64 plaintext :vector-i64] :vector-i64
+  (let [sched (a/schedule key)]
+    (if (or (not (ok? sched key iv aad)) (not (bytes? plaintext))) (vector-i64)
+      (let [h (words (a/encrypt sched (vector-alloc 16)) 0) j (j0 sched h iv)
+            ct (gctr sched (inc32 j) plaintext) t (tag sched h j aad ct)
+            n (vector-count ct) out (vector-alloc (+ n 16))
+            x (loop [i 0] (if (= i n) 0 (let [y (vector-assoc! out i (vector-at ct i))] (recur (+ i 1)))))]
+        (loop [i 0] (if (= i 16) out (let [y (vector-assoc! out (+ n i) (vector-at t i))] (recur (+ i 1)))))))))
+
+(defn open [key :vector-i64 iv :vector-i64 aad :vector-i64 sealed :vector-i64] :vector-i64
+  (let [sched (a/schedule key)]
+    (if (or (not (ok? sched key iv aad)) (< (vector-count sealed) 16) (not (bytes? sealed))) (vector-i64 -1)
+      (let [h (words (a/encrypt sched (vector-alloc 16)) 0) j (j0 sched h iv)
+            n (- (vector-count sealed) 16) ct (slice sealed 0 n) t (tag sched h j aad ct)
+            differ (loop [i 0 x 0] (if (= i 16) x (recur (+ i 1) (bit-or x (bit-xor (vector-at t i) (vector-at sealed (+ n i)))))))]
+        (if (= differ 0) (gctr sched (inc32 j) ct) (vector-i64 -1))))))

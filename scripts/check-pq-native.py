@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run the native post-quantum and secure-channel known-answer gates and their mutants
 (JUN-352 P1b: SHA-3, ML-KEM-768, ML-DSA-65; AWAI-117: X25519, ChaCha20-Poly1305 and
-XChaCha20-Poly1305, the pqh-v1 hybrid KEM; AWAI-102: X-Wing).
+XChaCha20-Poly1305, the pqh-v1 hybrid KEM; JUN-352: AES and AES-GCM; AWAI-102: X-Wing and Noise).
 
 Each gate is one unity source: the library bodies with their `ns` forms removed, the
 `sha3/` alias dropped, then the gate body. The gate's main returns a bitmask; a pass is
@@ -86,6 +86,16 @@ MODULE_GATES = {
         'esse': ('noise/native.kotoba', '(= token 4) (if init (x/x25519-bytes e rs) (x/x25519-bytes s re))',
                  '(= token 4) (if init (x/x25519-bytes s re) (x/x25519-bytes e rs))'),
         'premsg': ('noise/native.kotoba', '(if (= pattern 2) (mix-hash st5', '(if false (mix-hash st5'),
+    }),
+    'aes': dict(files={f'aes/{n}.kotoba': f'lib/gov.nist.aes/kotoba/aes/{n}.kotoba' for n in ['core', 'gcm', 'native_gate']},
+                gate_ns='aes.native-gate', groups={'a': 15, 'b': 7, 'c': 7}, mutants={
+        'sbox': ('aes/core.kotoba', '(vector-i64 99 124 119 123', '(vector-i64 99 124 119 122'),
+        'mixcol': ('aes/core.kotoba', '(bit-xor (bit-xor x0 (bit-xor x1 a1)) (bit-xor a2 a3))', '(bit-xor (bit-xor x0 x1) (bit-xor a2 a3))'),
+        'sub8': ('aes/core.kotoba', 'sub (and (> nk 6) (= (rem i nk) 4))', 'sub false'),
+        'gfred': ('aes/gcm.kotoba', '(bit-xor v0 3774873600)', '(bit-xor v0 3758096384)'),
+        'carry': ('aes/gcm.kotoba', '(vector-i64 (vector-at cb 0) (vector-at cb 1) (vector-at cb 2) (bit-and (+ (vector-at cb 3) 1) 4294967295))',
+                  '(vector-i64 (vector-at cb 0) (vector-at cb 1) (+ (vector-at cb 2) (quot (+ (vector-at cb 3) 1) 4294967296)) (bit-and (+ (vector-at cb 3) 1) 4294967295))'),
+        'tagcmp': ('aes/gcm.kotoba', '(if (= differ 0) (gctr sched (inc32 j) ct) (vector-i64 -1))', '(gctr sched (inc32 j) ct)'),
     }),
     'pqh': dict(files=dict(X25519, **{'sha3/core.kotoba': SHA3, 'mlkem/core.kotoba': 'lib/gov.nist.mlKem/kotoba/mlkem/core.kotoba',
                                       'sha2/core.kotoba': 'lib/gov.nist.sha2/kotoba/sha2/core.kotoba',
