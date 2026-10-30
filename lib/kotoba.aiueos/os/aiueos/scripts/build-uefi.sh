@@ -639,7 +639,12 @@ if [ "${AIUEOS_QWEN38_MODEL_HANDOFF:-0}" = 1 ] ||
     if [ "${AIUEOS_MODEL_TEST_FIXTURE:-0}" = 1 ]; then
       model_handoff_cflags="$model_handoff_cflags -DAIUEOS_MODEL_TEST_FIXTURE=1"
     fi
-    model_handoff_link="$kernel_model_handoff_object $kotoba_model_mapping_plan_object $kotoba_model_handoff_validate_object $kernel_qwen35_runtime_object $kernel_qwen35_quant_object $kernel_qwen35_infer_object $kotoba_qwen35_header_object $kotoba_qwen35_kv_object $kotoba_qwen35_tensor_object"
+    # JUN-554: aiueos_qwen35_quant_row_bytes is kotoba/qwen35-row-bytes.o in this image (qwen35_quant.c keeps the C as the
+    # reference for every other build of it).
+    kotoba_qwen35_row_bytes_object=${AIUEOS_KOTOBA_QWEN35_ROW_BYTES_OBJECT:-"$aiueos/kotoba/qwen35-row-bytes.o"}
+    python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_qwen35_row_bytes_object" \
+      f7a3b74b53acef6cd46f4e0f82989557c0b51915bd37e4029f51df673f185618 kotoba_aiueos_qwen35_row_bytes
+    model_handoff_link="$kotoba_qwen35_row_bytes_object $kernel_model_handoff_object $kotoba_model_mapping_plan_object $kotoba_model_handoff_validate_object $kernel_qwen35_runtime_object $kernel_qwen35_quant_object $kernel_qwen35_infer_object $kotoba_qwen35_header_object $kotoba_qwen35_kv_object $kotoba_qwen35_tensor_object"
   fi
   if [ "${AIUEOS_MODEL_NVME_SLOTS:-0}" = 1 ]; then
     model_slots_cflags="-DAIUEOS_MODEL_NVME_SLOTS=1"
