@@ -1366,6 +1366,12 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_tls_aes_object
   dfae9998bb6fccf72bb3747f74b9e69d4b2727a40d24c078b8e1cee9cb358399 \
   aiueos_aes128_gcm_encrypt,aiueos_aes128_gcm_decrypt,aiueos_aes128_gcm_unwrap,aiueos_aes128_gcm_selftest \
   kotoba_aiueos_aes128_gcm,kotoba_aiueos_aes128_gcm_selftest,kotoba_aiueos_bytes_copy,kotoba_aiueos_bytes_fill
+# JUN-553: tls13.c's HMAC-SHA256 and HKDF-Expand-Label are kotoba/tls13-keyschedule.o (its buffers are its own arrays,
+# amu ADR 0387; built at fuel 4194304 because the HMAC copies up to 12 KiB a byte per step).
+kotoba_tls13_keyschedule_object=${AIUEOS_KOTOBA_TLS13_KEYSCHEDULE_OBJECT:-"$aiueos/kotoba/tls13-keyschedule.o"}
+python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_tls13_keyschedule_object" \
+  0fb41bf15a05533aafdc25b76ab87e3148fd964306fd17a697a48fe060c6d526 \
+  kotoba_aiueos_tls13_hmac,kotoba_aiueos_tls13_hkdf_expand_label kotoba_aiueos_sha256
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_bytes_object" \
   567551de001399c4706927cbffd474b53c15ea35e908945e51fd2176feca6c58 \
   kotoba_aiueos_bytes_copy,kotoba_aiueos_bytes_fill
@@ -1474,7 +1480,7 @@ zig ld.lld -nostdlib -static --strip-all $qualification_gc_link -z max-page-size
   "$kernel_inference_status_object" \
   $device_result_link $model_handoff_link "$kernel_kototama_runtime_object" \
   "$kernel_job_protocol_object" \
-  "$kotoba_tls_aes_object" "$kotoba_bytes_object" "$kernel_tls13_object" \
+  "$kotoba_tls_aes_object" "$kotoba_bytes_object" "$kotoba_tls13_keyschedule_object" "$kernel_tls13_object" \
   "$kernel_scheduler_object" "$kernel_syscall_object" \
   "$kernel_process_object" "$kernel_loader_object" \
   "$kernel_smp_object" "$kernel_trampoline_object" \

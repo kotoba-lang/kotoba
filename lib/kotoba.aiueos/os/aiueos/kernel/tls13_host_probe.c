@@ -28,6 +28,35 @@ uint64_t kotoba_aiueos_sha256(const uint8_t *in, uint64_t n, uint8_t out[32],
   return 1;
 }
 
+/* kotoba/tls13-keyschedule.kotoba on the host: HMAC-SHA256 and HKDF-Expand-Label with the object's limits (JUN-553). */
+#include <openssl/hmac.h>
+int64_t kotoba_aiueos_tls13_hmac(const uint8_t *key, uint64_t key_len, const uint8_t *data,
+                                 uint64_t data_len, uint8_t *out) {
+  unsigned int n = 32;
+  if ((key_len >> 32) || (data_len >> 32) || 64 + data_len > 12288) return 0;
+  return HMAC(EVP_sha256(), key, (int)key_len, data, (size_t)data_len, out, &n) ? 1 : 0;
+}
+
+int64_t kotoba_aiueos_tls13_hkdf_expand_label(const uint8_t *secret, uint64_t secret_len,
+                                              const uint8_t *label, uint64_t label_len,
+                                              const uint8_t *ctx, uint64_t ctx_len,
+                                              uint8_t *out, uint64_t out_len) {
+  uint8_t info[256], full[32];
+  uint64_t n;
+  if ((secret_len >> 32) || (label_len >> 32) || (ctx_len >> 32) || (out_len >> 32) ||
+      6 + label_len + ctx_len + 4 > sizeof(info) || out_len > 32) return 0;
+  info[0] = (uint8_t)(out_len >> 8); info[1] = (uint8_t)out_len; info[2] = (uint8_t)(6 + label_len);
+  memcpy(info + 3, "tls13 ", 6);
+  memcpy(info + 9, label, (size_t)label_len);
+  info[9 + label_len] = (uint8_t)ctx_len;
+  if (ctx_len) memcpy(info + 10 + label_len, ctx, (size_t)ctx_len);
+  n = 10 + label_len + ctx_len;
+  info[n] = 0x01;
+  if (!kotoba_aiueos_tls13_hmac(secret, secret_len, info, n + 1, full)) return 0;
+  memcpy(out, full, (size_t)out_len);
+  return 1;
+}
+
 uint64_t kotoba_aiueos_x25519(const uint8_t *scalar, const uint8_t *peer,
                               uint8_t *out, uint8_t *ws) {
   EVP_PKEY *priv = 0, *pub = 0;
