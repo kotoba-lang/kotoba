@@ -14,8 +14,10 @@ runner). The pinned x86_64 KX64 profile refuses string literals (E7101 detail 16
 the gates use for their vectors, so x86_64 is not run in CI yet.
 """
 import argparse
+import concurrent.futures
 import hashlib
 import json
+import os
 import platform
 import re
 import subprocess
@@ -225,7 +227,9 @@ class LinuxArm:
                                 env=env or self.env())
         (self.out / (label + '.stdout')).write_bytes(result.stdout)
         (self.out / (label + '.stderr')).write_bytes(result.stderr)
-        self.observations.append(dict(name=label, exit=result.returncode, seconds=round(time.monotonic() - start, 3)))
+        # Gates run concurrently (main), so a call keeps a handle on its own observation instead of observations[-1].
+        result.observation = dict(name=label, exit=result.returncode, seconds=round(time.monotonic() - start, 3))
+        self.observations.append(result.observation)
         print(label, result.returncode, result.stderr.decode(errors='replace')[:300], flush=True)
         return result
 
@@ -259,8 +263,8 @@ class LinuxArm:
         # needs more (the TCP demo) names its exact grants, which replace this one.
         r = self.call(label, [image], self.env(KEXE_STRUCTURED_REPORT='1', **(grants or {'KEXE_ALLOW': '37'})))
         match = re.search(rb':result (-?[0-9]+)', r.stdout)
-        self.observations[-1]['result'] = int(match[1]) if match else None
-        print(label, 'result', self.observations[-1]['result'], flush=True)
+        r.observation['result'] = int(match[1]) if match else None
+        print(label, 'result', r.observation['result'], flush=True)
         assert r.returncode == 0 and match and int(match[1]) == expected, (label, r.returncode, r.stdout[-300:])
         return r
 
@@ -281,14 +285,18 @@ def main():
     parser.add_argument('--packager', type=Path, help='macOS: the Mac packager')
     parser.add_argument('--packager-sha256')
     parser.add_argument('--output', type=Path, required=True)
+    # The gates are independent (own sources, images and output files), so they run concurrently; a gate's own
+    # pass run and mutants stay in order. --jobs 1 is the old serial order (JUN-629).
+    parser.add_argument('--jobs', type=int, default=os.cpu_count() or 2)
     args = parser.parse_args()
     gate = LinuxArm(args) if platform.system() == 'Linux' and platform.machine() in ('aarch64', 'arm64') else NativeGate(args)
     results = {}
-    for name, spec in GATES.items():
+
+    def unity_gate(name, spec):
         entry = f'pq/{name}_gate.kotoba'
         image = gate.build(name, entry, {entry: unity(name, spec)})
         gate.run(name + '-pass', image, spec['passing'])
-        results[name] = dict(passing=spec['passing'], mutants={})
+        result = dict(passing=spec['passing'], mutants={})
         for label, change in spec['mutants'].items():
             mutant = gate.build(f'{name}-{label}', entry, {entry: unity(name, spec, change)})
             try:
@@ -296,17 +304,26 @@ def main():
                 detected = False
             except AssertionError:
                 detected = True
-            results[name]['mutants'][label] = detected
+            result['mutants'][label] = detected
             assert detected, (name, label, 'mutant passed the gate')
-    for name, spec in MODULE_GATES.items():
+        return result
+
+    def module_gate(name, spec):
         passing = module_results(gate, name, spec, name, module_files(spec))
         assert None not in passing.values(), (name, passing)
-        results[name] = dict(passing=passing, mutants={})
+        result = dict(passing=passing, mutants={})
         for label, change in spec['mutants'].items():
             got = module_results(gate, name, spec, f'{name}-{label}', module_files(spec, change))
             detected = None in got.values()
-            results[name]['mutants'][label] = detected
+            result['mutants'][label] = detected
             assert detected, (name, label, 'mutant passed every group')
+        return result
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
+        futures = {name: pool.submit(unity_gate, name, spec) for name, spec in GATES.items()}
+        futures.update({name: pool.submit(module_gate, name, spec) for name, spec in MODULE_GATES.items()})
+        for name in list(GATES) + list(MODULE_GATES):
+            results[name] = futures[name].result()
     if isinstance(gate, LinuxArm):
         files = module_files(TCP_DEMO)
         image = gate.build('tcp-demo', TCP_DEMO['entry'], files)
