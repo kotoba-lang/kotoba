@@ -3792,6 +3792,22 @@ static void set_idt_gate(uint8_t vector, void (*handler)(void)) {
   }
 }
 
+/* JUN-35: the SIPI trampoline arms no IDT at all (IDTR stays base 0 from
+ * reset), so any exception on CPU 1 faults again during delivery and QEMU
+ * reports a triple fault instead of a status.  The BSP installs this same
+ * table at the "idt-v1" marker before the AP starts; the AP only needs the
+ * register pointed at it.  Call after aiueos_load_gdt(): the gates carry
+ * selector 0x08, which is only a present 64-bit code segment in the kernel's
+ * GDT (the trampoline's 0x08 is a 32-bit code segment, so a delivery through
+ * it would #GP instead). */
+void aiueos_ap_load_idt(void) {
+  const struct descriptor_pointer idtr = {
+    .limit = (uint16_t)(sizeof(idt) - 1),
+    .base = (uint64_t)(uintptr_t)idt
+  };
+  aiueos_load_idt(&idtr);
+}
+
 /* Set immediately before the deliberate end-of-boot ud2 probe. Any exception
    arriving before then is an unexpected fault and receives a best-effort
    durable crash receipt over the polled transport before termination. */
