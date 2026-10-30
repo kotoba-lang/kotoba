@@ -21,6 +21,7 @@ import argparse
 import hashlib
 import importlib.util
 import re
+import socket
 import subprocess
 import time
 from pathlib import Path
@@ -91,6 +92,8 @@ def main():
         r = gate.call(label, [image, *args], env(**grants))
         got = result(r.stdout)
         gate.observations[-1]['result'] = got
+        if label.endswith('-ask'):
+            print(label, 'took', gate.observations[-1].get('seconds'), flush=True)
         assert got == expected, (label, r.returncode, got, r.stdout[-300:], r.stderr[-300:])
         return got
     def exchange(label, mode, index, port, want_ask, want_serve, serve='serve-vote'):
@@ -130,7 +133,58 @@ def main():
     (gate.out / 'node3' / 'request').write_bytes((coordinator / 'request').read_bytes())
     exchange('replayed-commit-refused', 'ask-commit-replay', 3, 47230, -55, None, serve='serve-commit-attest')
     assert not (coordinator / 'att3').exists(), 'a control produced an attestation'
-    gate.finish('PASS_NATIVE_BROKER_SESSIONS', replicas=3, controls=3)
+    # unauthenticated peers against a guarded listener (replica 3): each failed handshake
+    # is closed within the 10 s read deadline and costs one unit of the listener's budget
+    def peer(port, kind):
+        s = socket.create_connection(('127.0.0.1', port), timeout=30)
+        t0 = time.monotonic()
+        if kind == 'garbage':
+            s.sendall(b'\x00\x10' + bytes(range(16)))
+        elif kind == 'truncated':
+            s.sendall(b'\x03\xe8' + b'x' * 10)
+        try:
+            while s.recv(65536):
+                pass
+        except ConnectionResetError:
+            pass
+        s.close()
+        took = time.monotonic() - t0
+        gate.observations.append(dict(name=f'unauthenticated-{kind}', closed_after_s=round(took, 2)))
+        print(f'unauthenticated-{kind} closed after {took:.2f}s', flush=True)
+        assert took < 20, (kind, took)
+    def guarded(label, port, budget, attacks, want_ask, want_serve):
+        addr = f'127.0.0.1:{port}'
+        server = subprocess.Popen([str(session), 'serve-guarded', str(gate.out / 'node3'), addr, '3', str(budget)],
+                                  cwd=gate.out, env=env(KEXE_CAP_RESOURCES_43=addr),
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        time.sleep(0.5)
+        try:
+            for kind in attacks:
+                if kind == 'wrong-identity':
+                    run(f'{label}-wrong-identity', session, ['ask-wrong', str(coordinator), addr, '3'], -31,
+                        KEXE_CAP_RESOURCES_45=addr)
+                else:
+                    peer(port, kind)
+            time.sleep(0.3)
+            run(f'{label}-ask', session, ['ask-vote', str(coordinator), addr, '3'], want_ask, KEXE_CAP_RESOURCES_45=addr)
+        finally:
+            out, err = server.communicate(timeout=600)
+            (gate.out / f'{label}-serve.stdout').write_bytes(out); (gate.out / f'{label}-serve.stderr').write_bytes(err)
+            print(f'{label}-serve output', out[-200:], err[-200:], flush=True)
+        got = result(out)
+        gate.observations.append(dict(name=f'{label}-serve', exit=server.returncode, result=got))
+        print(f'{label}-serve', server.returncode, got, flush=True)
+        assert got == want_serve, (label, server.returncode, got, err[-300:])
+    attacks = ['silent', 'garbage', 'truncated', 'wrong-identity']
+    # replica 3 already committed this request in the replayed-commit control, so its
+    # answer is 12 (not the next position): that answer, bound to the request id, is the vote
+    guarded('guarded-vote', 47240, 5, attacks, 12, 12)
+    assert (coordinator / 'vote3').exists(), 'the guarded listener gave no vote'
+    (coordinator / 'vote3').unlink()
+    # failures up to the budget (3): the listener stops before any vote
+    guarded('guarded-budget-exhausted', 47241, 3, attacks[:3], -31, -62)
+    assert not (coordinator / 'vote3').exists(), 'an exhausted listener produced a vote'
+    gate.finish('PASS_NATIVE_BROKER_SESSIONS', replicas=3, controls=5)
 
 if __name__ == '__main__':
     main()

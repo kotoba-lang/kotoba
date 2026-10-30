@@ -295,13 +295,40 @@ builds a broker driver that traps (SIGILL) in `prepare`, so the CI step checks o
 | replicas 0, 1, 2 commit (sequence 0) and attest (sequence 1) over a second session | commit 2 and an attestation each; `fresh` decides the committed head (1) |
 | the commit replayed where the attest belongs (sequence 1) | the replica refuses it (-44); no attestation is written (coordinator -55) |
 
+**Unauthenticated peers.** `serve-guarded` is the vote listener for a port anyone can
+reach. Each handshake read has a 10 s deadline. A connection whose handshake fails is
+closed and costs one unit of the listener's connection budget. The listener gives up
+(-62) when the budget is spent, and the first authenticated coordinator gets the vote.
+Message 0 is read before any Noise state exists. Only a frame of exactly its XXhfs length
+(e 32 + e1 1184, empty payload: 1216 bytes) goes on to the handshake.
+
+That pre-check is needed because the static runtime reclaims no vectors within a process,
+and each handshake state costs X25519 work. Without it, three failed connections and a
+wrong-identity handshake exhausted the vector table (`KEXE_TRAP {:kind :arena :reason
+:vector-table-exhausted}`): the listener trapped and gave no vote. A `KEXE_VECTORS` /
+`KEXE_VECTOR_ITEMS` grant did not move that trap point on this image. With the pre-check,
+the same run measured (podman, Linux arm64, amu `65359a09`):
+
+| peer | result |
+|---|---|
+| connects and stays silent | closed at the deadline (10.0 s) |
+| sends a frame that is not message 0 | closed at once |
+| declares a frame and never completes it | closed at the deadline (10.0 s) |
+| completes message 0 but expects another replica's identity | refused (-31) |
+| then the authenticated coordinator | served; replica 3's answer 12 (it already committed this request) is bound to the request id |
+| three failures against a budget of 3 | the listener stops (-62) using 238 fuel; the coordinator's dial is refused, and no vote is written |
+
+A peer that sends a well-formed message 0 still costs the responder a full first message
+(KEM encapsulation and an ML-DSA-65 signature) before XX reveals who the initiator is.
+The connection budget is what bounds that cost.
+
 The keys in the driver are fixed public test values; a deployment takes ephemerals and
 KEM randomness from the host's entropy provider and identities from the roster. The CI
 arm64 lane runs it.
 
-Not yet: timeouts and retries beyond the wire's own,
-backpressure, per-peer budgets, separate hosts, and the re-check of body and C0 authority
-right before dispatch.
+Not yet: retries, backpressure, per-peer (rather than per-listener) budgets, reclaiming a
+listener's memory between connections, separate hosts, and the re-check of body and C0
+authority right before dispatch.
 
 ## Verification and scope
 
