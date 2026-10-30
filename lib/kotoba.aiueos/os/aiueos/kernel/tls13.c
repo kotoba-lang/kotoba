@@ -21,6 +21,10 @@ extern int64_t kotoba_aiueos_tls13_hkdf_expand_label(const uint8_t *, uint64_t, 
 /* The certificate parsers are kotoba/tls13-cert.kotoba (JUN-553): 1 is success, as below. */
 extern int64_t kotoba_aiueos_tls13_find_p256_point(const uint8_t *, uint64_t, uint8_t *, uint64_t);
 extern int64_t kotoba_aiueos_tls13_parse_ecdsa_der(const uint8_t *, uint64_t, uint8_t *, uint64_t);
+/* The ClientHello record and the ServerHello validation are kotoba/tls13-hello.kotoba (JUN-553). */
+extern int64_t kotoba_aiueos_tls13_clienthello(const uint8_t *, uint64_t, const uint8_t *, uint64_t,
+                                               const uint8_t *, uint64_t, uint8_t *, uint64_t);
+extern int64_t kotoba_aiueos_tls13_serverhello_parse(const uint8_t *, uint64_t, uint8_t *, uint64_t);
 
 #define TLS_TR_MAX 12288
 #define TLS_RX_MAX 12288
@@ -117,18 +121,7 @@ static const uint8_t smoke_scalar[32] = {
   0x5a,0x1e,0x05,0x13,0xc1,0x0d,0x15,0x07,0xa1,0xe0,0x53,0x00,0x6b,0x6f,0x74,0x6f,
   0x62,0x61,0x73,0x65,0x2e,0x6e,0x65,0x74,0x13,0x01,0x03,0x04,0x00,0x1d,0x00,0x20};
 
-static const uint8_t ch_template[157] = {
-  0x16,0x03,0x01,0x00,0x98,0x01,0x00,0x00,0x94,0x03,0x03,0xa1,0xe0,0xa1,0xe0,
-  0xa1,0xe0,0xa1,0xe0,0xa1,0xe0,0xa1,0xe0,0xa1,0xe0,0xa1,0xe0,0xa1,0xe0,0xa1,
-  0xe0,0xa1,0xe0,0xa1,0xe0,0xa1,0xe0,0xa1,0xe0,0xa1,0xe0,0xa1,0xe0,0x00,0x00,
-  0x02,0x13,0x01,0x01,0x00,0x00,0x69,0x00,0x00,0x00,0x11,0x00,0x0f,0x00,0x00,
-  0x0c,0x6b,0x6f,0x74,0x6f,0x62,0x61,0x73,0x65,0x2e,0x6e,0x65,0x74,0x00,0x0a,
-  0x00,0x04,0x00,0x02,0x00,0x1d,0x00,0x0d,0x00,0x08,0x00,0x06,0x04,0x03,0x08,
-  0x04,0x04,0x01,0x00,0x2b,0x00,0x03,0x02,0x03,0x04,0x00,0x10,0x00,0x0b,0x00,
-  0x09,0x08,0x68,0x74,0x74,0x70,0x2f,0x31,0x2e,0x31,0x00,0x33,0x00,0x26,0x00,
-  0x24,0x00,0x1d,0x00,0x20,0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0a,
-  0x0b,0x0c,0x0d,0x0e,0x0f,0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,0x18,0x19,
-  0x1a,0x1b,0x1c,0x1d,0x1e,0x1f,0x20};
+/* The ClientHello template is kotoba/tls13-hello.kotoba's literal stores (JUN-553). */
 
 static const uint8_t default_http_get[] =
   "GET /ipfs/bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku HTTP/1.1\r\n"
@@ -215,35 +208,12 @@ int aiueos_tls13_configure(const char *host,
 }
 
 static int clienthello_build(void) {
-  const uint8_t *host = configured ? configured_host :
-    (const uint8_t *)default_host;
-  uint32_t host_len = configured ? configured_host_len :
-    (uint32_t)(sizeof(default_host) - 1);
-  const uint8_t *tail = ch_template + 73;
-  uint32_t tail_len = (uint32_t)sizeof(ch_template) - 73;
-  uint32_t total = 61 + host_len + tail_len;
-  uint32_t record_payload = total - 5;
-  uint32_t handshake_payload = total - 9;
-  uint32_t extensions_len = 93 + host_len;
-  uint32_t sni_ext_len = 5 + host_len;
-  uint32_t sni_list_len = 3 + host_len;
-  uint32_t i;
-  if (total > TLS_CH_MAX || host_len > 255) return 0;
-  copy_bytes(ch_record, ch_template, 61);
-  put16(ch_record + 3, (uint16_t)record_payload);
-  ch_record[6] = (uint8_t)(handshake_payload >> 16);
-  ch_record[7] = (uint8_t)(handshake_payload >> 8);
-  ch_record[8] = (uint8_t)handshake_payload;
-  if (configured) copy_bytes(ch_record + 11, configured_random, 32);
-  put16(ch_record + 50, (uint16_t)extensions_len);
-  put16(ch_record + 54, (uint16_t)sni_ext_len);
-  put16(ch_record + 56, (uint16_t)sni_list_len);
-  put16(ch_record + 59, (uint16_t)host_len);
-  copy_bytes(ch_record + 61, host, host_len);
-  copy_bytes(ch_record + 61 + host_len, tail, tail_len);
-  for (i = 0; i < 32; i++)
-    ch_record[113 + host_len + i] = client_pub[i];
-  ch_record_len = total;
+  const uint8_t *host = configured ? configured_host : (const uint8_t *)default_host;
+  uint32_t host_len = configured ? configured_host_len : (uint32_t)(sizeof(default_host) - 1);
+  int64_t total = kotoba_aiueos_tls13_clienthello(host, host_len, configured_random, configured ? 32 : 0,
+                                                  client_pub, 32, ch_record, TLS_CH_MAX);
+  if (total <= 0) return 0;
+  ch_record_len = (uint32_t)total;
   return 1;
 }
 
@@ -395,37 +365,8 @@ static int derive_ap_keys(void) {
 }
 
 static int parse_serverhello(const uint8_t *hs, uint32_t n) {
-  uint32_t off, ext_end, sid;
   uint8_t server_pub[32];
-  int got_share = 0, got_13 = 0;
-  if (n < 40 || hs[0] != 0x02) return 0;
-  if (be24(hs + 1) + 4 != n) return 0;
-  if (hs[4] != 0x03 || hs[5] != 0x03) return 0;
-  sid = hs[38];
-  if (sid > 32 || 39 + sid + 3 + 2 > n) return 0;
-  off = 39 + sid;
-  if (hs[off] != 0x13 || hs[off + 1] != 0x01) return 0; /* AES-128-GCM */
-  off += 2;
-  if (hs[off] != 0) return 0;
-  off++;
-  if (off + 2 > n) return 0;
-  ext_end = off + 2 + be16(hs + off);
-  off += 2;
-  if (ext_end != n) return 0;
-  while (off + 4 <= ext_end) {
-    uint16_t typ = be16(hs + off);
-    uint16_t elen = be16(hs + off + 2);
-    const uint8_t *ed = hs + off + 4;
-    if (off + 4 + elen > ext_end) return 0;
-    if (typ == 0x002b && elen >= 2 && ed[elen - 2] == 0x03 && ed[elen - 1] == 0x04)
-      got_13 = 1;
-    if (typ == 0x0033 && elen >= 36 && be16(ed) == 0x001d && be16(ed + 2) == 32) {
-      copy_bytes(server_pub, ed + 4, 32);
-      got_share = 1;
-    }
-    off += 4 + elen;
-  }
-  if (!got_13 || !got_share) return 0;
+  if (kotoba_aiueos_tls13_serverhello_parse(hs, n, server_pub, 32) != 1) return 0;
   if (!transcript_add(hs, n)) return 0;
   have_sh = 1;
   return derive_hs_keys(server_pub);
