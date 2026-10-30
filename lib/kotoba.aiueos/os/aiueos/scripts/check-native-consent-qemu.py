@@ -170,9 +170,13 @@ def main(args):
         draw_a, draw_b = W(91), W(92)
         # Two draws of the guest's RDRAND (QEMU draws them from the host): each is non-zero and they differ
         # (a stuck source or a failed instruction would give 0 or a repeat).
-        assert draw_a != 0 and draw_b != 0 and draw_a != draw_b, (hex(draw_a), hex(draw_b))
+        if args.expect_stuck_entropy:
+            # the constant source of the JUN-482 negative control: the probe sees the repeat
+            assert draw_a != 0 and draw_a == draw_b, ("the stuck control must repeat", hex(draw_a), hex(draw_b))
+        else:
+            assert draw_a != 0 and draw_b != 0 and draw_a != draw_b, (hex(draw_a), hex(draw_b))
         event("entropy-probe", flags=entropy, rdrand=bool(entropy & 1), rdseed=bool(entropy & 2),
-              leaf7=bool(entropy & 4), drawn=True, distinctNonZeroDraws=True)
+              leaf7=bool(entropy & 4), drawn=True, distinctNonZeroDraws=draw_a != draw_b)
         send("sendkey 2", 1.5); send("sendkey a", 1.5)
         # a loaded host makes TCG slow: poll for the state instead of trusting a fixed delay (up to 60 s)
         for _ in range(30):
@@ -336,7 +340,10 @@ def main(args):
             assert media_before == media_after, "media changed"
             report = dict(status="PASS_NATIVE_CONSENT_STUCK_ENTROPY", kernel=pin(args.kernel), efi=pin(args.efi),
                           media=media_after, font=pin(args.font), firmware=pin(args.firmware),
-                          observer=pin(Path(__file__)), events=events, syntheticInputProvesHumanConsent=False,
+                          observer=pin(Path(__file__)), events=events,
+                          transportObserver=pin(Path(__file__).with_name("check-native-draft-restart-qemu.py")),
+                          desktopObserver=pin(Path(__file__).with_name("check-native-desktop-qemu.py")),
+                          inputSynchronizedWithCompletedFrames=True, syntheticInputProvesHumanConsent=False,
                           guestEmulation="QEMU TCG", physicalHardware=False)
             (out / "native-consent-qemu.json").write_text(json.dumps(report, indent=2) + "\n")
             print(report["status"], len(events))

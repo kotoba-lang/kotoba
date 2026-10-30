@@ -326,6 +326,7 @@ def main(args):
                            else "PASS_NATIVE_KEYSTORE_QEMU" if args.profile == "keystore"
                            else "PASS_NATIVE_DESKTOP_INPUT_QEMU")
         expected_events = (12 if args.profile == "local-draft"
+                           else 18 if args.expect_stuck_entropy
                            else 22 if args.profile == "consent"
                            else 4 if args.profile == "idle"
                            else 4 if args.profile == "ed25519"
@@ -409,8 +410,9 @@ def main(args):
                         "first-frame", "entropy-probe", "itonami-goal-typed", "collapse-key", "collapse-click",
                         "consent-open",
                         "launcher-key-ignored", "launcher-click-ignored", "minimize-and-dock-blocked-by-consent", "key-deny",
-                        "pointer-deny", "esc-deny", "key-request-blocks-background-pointer", "key-deny", "key-request-pointer", "passphrase-pointer", "passphrase-cancel", "key-allow",
-                        "sign-deny", "sign-allow", "draft-after-key", "pointer-allow"]
+                        "pointer-deny", "esc-deny", "key-request-blocks-background-pointer", "key-deny", "key-request-pointer", "passphrase-pointer", "passphrase-cancel"]
+                       + (["stuck-entropy-refused"] if args.expect_stuck_entropy else
+                          ["key-allow", "sign-deny", "sign-allow", "draft-after-key", "pointer-allow"])
                     or observed["syntheticInputProvesHumanConsent"]):
                 raise ValueError("consent surface verdict is incomplete")
         elif (observed["font"] != font_state["padded"]
