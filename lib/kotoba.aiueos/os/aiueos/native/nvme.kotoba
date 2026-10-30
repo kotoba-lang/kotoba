@@ -1,0 +1,206 @@
+(ns aiueos.native.nvme
+  ;; AWAI-122 stage 1: a read-only, polled NVMe driver for the opt-in debug
+  ;; entry. It is the first piece of the verified OS update (the running OS
+  ;; fetches a signed image, checks it, then writes the ESP), and of keeping
+  ;; Itonami state on a machine whose only disk is NVMe.
+  ;;
+  ;; Read only: the controller is reset and enabled, and the commands sent are
+  ;; Identify, Create I/O Completion/Submission Queue and Read. No Write, Flush,
+  ;; Format, Dataset Management or Set Features command exists in this file.
+  ;; No interrupt is used (CQ interrupts disabled, INTx disabled in PCI COMMAND).
+  ;;
+  ;; DMA uses owned window slot 4 (five pages): 0 admin SQ, 1 admin CQ, 2 I/O
+  ;; SQ, 3 I/O CQ, 4 data. Each queue has 8 entries. The desktop graph uses no
+  ;; other owned window there (rtl8168-debug has slot 10).
+  ;;
+  ;; State and results are context words 600..663 (the debug desktop's free
+  ;; range; dapps uses 960.., remote-cmd bytes 2048..2175 and 4096..):
+  ;;   600 result (see probe), 601 bus<<8|dev<<3|fn, 602/603 BAR0, 604/605 CAP,
+  ;;   606 VS, 607/608 namespace 1 size in blocks, 609 log2 block size,
+  ;;   610..615 tail/head/phase of the admin and I/O queues, 616 doorbell
+  ;;   stride shift, 617 last completion dword 3, 618 command id,
+  ;;   620..629 model number (40 bytes), 630..645 the first 64 bytes of LBA 1.
+  (:require [capability.dma.map :as dma])
+  (:export [probe read-lba]))
+
+(defn word [region i]
+  (kernel-load-u32 (kernel-subregion region 8192 (* i 4) 4) 4 0))
+(defn put-word [region i value]
+  (kernel-store-u32 (kernel-subregion region 8192 (* i 4) 4) 4 0 value))
+
+(defn pci-address [slot offset]
+  (bit-or 2147483648 (bit-or (* slot 256) (bit-and offset 252))))
+(defn pci-read [slot offset]
+  (let [addressed (kernel-out-u32 3320 (pci-address slot offset))]
+    (+ (kernel-in-u32 3324) (* 0 addressed))))
+(defn pci-write [slot offset value]
+  (let [addressed (kernel-out-u32 3320 (pci-address slot offset))
+        written (kernel-out-u32 3324 value)]
+    (+ written (* 0 addressed))))
+
+;; slot = bus<<8 | dev<<3 | fn. The first function whose class code is
+;; 01:08:02 (mass storage, NVM, NVMe I/O), or -1.
+(defn find-slot [slot]
+  (if (> slot 65535) -1
+    (let [id (pci-read slot 0)]
+      (if (and (not (= (bit-and id 65535) 65535))
+               (= (u64-shift-right (pci-read slot 8) 8) 67586))
+        slot (find-slot (+ slot 1))))))
+
+;; BAR0, 64-bit memory on NVMe; 0 when absent or not memory.
+(defn bar0 [slot]
+  (let [low (pci-read slot 16)
+        kind (bit-and (quot low 2) 3)
+        address (bit-and low 4294967280)
+        value (if (= kind 2) (+ address (* (pci-read slot 20) 4294967296))
+                (if (= kind 0) address 0))]
+    (if (and (= (bit-and low 1) 0) (> value 0) (< value 549755809792)) value 0)))
+
+(defn pm-find [slot pointer remaining]
+  (if (or (= remaining 0) (< pointer 64) (> pointer 252)) 0
+    (let [header (pci-read slot pointer)]
+      (if (= (bit-and header 255) 1) pointer
+        (pm-find slot (bit-and (quot header 256) 252) (- remaining 1))))))
+(defn power-on [slot]
+  (let [cap (pm-find slot (bit-and (pci-read slot 52) 252) 48)]
+    (if (= cap 0) 0
+      (let [control (pci-read slot (+ cap 4))]
+        (if (= (bit-and control 3) 0) 0
+          (do (pci-write slot (+ cap 4) (bit-and control 4294967292))
+              (kernel-pause) 1))))))
+
+(defn bus [ctx] (quot (word ctx 601) 256))
+(defn dev [ctx] (bit-and (quot (word ctx 601) 8) 31))
+(defn fun [ctx] (bit-and (word ctx 601) 7))
+(defn base [ctx] (+ (word ctx 602) (* (word ctx 603) 4294967296)))
+
+;; A register window cannot be returned from a function (its extent would be
+;; lost), so each access opens it.
+(defn reg [ctx offset]
+  (kernel-load-u32-16k (kernel-pci-mmio (bus ctx) (dev ctx) (fun ctx) (base ctx) 16384) 16384 offset))
+(defn put-reg [ctx offset value]
+  (kernel-store-u32-16k (kernel-pci-mmio (bus ctx) (dev ctx) (fun ctx) (base ctx) 16384) 16384 offset value))
+
+(defn page-address [p] (+ (kernel-owned-window 4 20480) (* p 4096)))
+(defn page-u32 [p offset]
+  (kernel-load-u32-4k (kernel-subregion (kernel-owned-window 4 20480) 20480 (* p 4096) 4096) 4096 offset))
+(defn page-u8 [p offset]
+  (kernel-load-u8-4k (kernel-subregion (kernel-owned-window 4 20480) 20480 (* p 4096) 4096) 4096 offset))
+(defn put-page-u32 [p offset value]
+  (kernel-store-u32-4k (kernel-subregion (kernel-owned-window 4 20480) 20480 (* p 4096) 4096) 4096 offset value))
+(defn put-page-u64 [p offset value]
+  (do (put-page-u32 p offset (bit-and value 4294967295))
+      (put-page-u32 p (+ offset 4) (u64-shift-right value 32))))
+(defn zero-page [p offset]
+  (if (>= offset 4096) 1
+    (do (put-page-u32 p offset 0) (zero-page p (+ offset 4)))))
+
+;; CSTS.RDY (bit 0) reaches want; CSTS.CFS (bit 1) or exhaustion gives 0.
+(defn wait-ready [ctx want remaining]
+  (let [csts (reg ctx 28)]
+    (if (= (bit-and csts 2) 2) 0
+      (if (= (bit-and csts 1) want) 1
+        (if (= remaining 0) 0
+          (do (kernel-pause) (wait-ready ctx want (- remaining 1))))))))
+
+;; Queue q: 0 admin (pages 0/1), 1 I/O (pages 2/3). Doorbells are
+;; 0x1000 + (2q) << (2 + DSTRD) for the SQ tail and the next one for the CQ head.
+(defn doorbell [ctx index] (+ 4096 (* index (i64-shift-left 4 (word ctx 616)))))
+
+(defn wait-completion [ctx q remaining]
+  (let [head (word ctx (+ 611 (* q 3)))
+        dw3 (page-u32 (+ (* q 2) 1) (+ (* head 16) 12))]
+    (if (= (bit-and (quot dw3 65536) 1) (word ctx (+ 612 (* q 3))))
+      (let [next (bit-and (+ head 1) 7)]
+        (do (put-word ctx 617 dw3)
+            (put-word ctx (+ 611 (* q 3)) next)
+            (if (= next 0) (put-word ctx (+ 612 (* q 3)) (- 1 (word ctx (+ 612 (* q 3))))) 0)
+            (put-reg ctx (doorbell ctx (+ (* q 2) 1)) next)
+            (bit-and (quot dw3 131072) 32767)))
+      (if (= remaining 0) -1
+        (do (kernel-pause) (wait-completion ctx q (- remaining 1)))))))
+
+(defn zero-sqe [sq at i]
+  (if (>= i 64) 1 (do (put-page-u32 sq (+ at i) 0) (zero-sqe sq at (+ i 4)))))
+
+;; One command, waited for. Returns the completion status (0 = success) or -1.
+(defn submit [ctx q opcode nsid prp cdw10 cdw11 cdw12]
+  (let [tail (word ctx (+ 610 (* q 3)))
+        sq (* q 2)
+        at (* tail 64)
+        id (bit-and (+ (word ctx 618) 1) 65535)]
+    (do (put-word ctx 618 id)
+        (zero-sqe sq at 0)
+        (put-page-u32 sq at (+ opcode (* id 65536)))
+        (put-page-u32 sq (+ at 4) nsid)
+        (put-page-u64 sq (+ at 24) prp)
+        (put-page-u32 sq (+ at 40) cdw10)
+        (put-page-u32 sq (+ at 44) cdw11)
+        (put-page-u32 sq (+ at 48) cdw12)
+        (dma/release-fence)
+        (put-word ctx (+ 610 (* q 3)) (bit-and (+ tail 1) 7))
+        (put-reg ctx (doorbell ctx sq) (bit-and (+ tail 1) 7))
+        (wait-completion ctx q 20000000))))
+
+(defn copy-words [ctx first p offset count]
+  (if (= count 0) 1
+    (do (put-word ctx first (page-u32 p offset))
+        (copy-words ctx (+ first 1) p (+ offset 4) (- count 1)))))
+
+;; Read one logical block into the data page (page 4). Status as submit.
+(defn read-lba [ctx lba]
+  (submit ctx 1 2 1 (page-address 4) (bit-and lba 4294967295) (u64-shift-right lba 32) 0))
+
+(defn fail [ctx code] (do (put-word ctx 600 code) code))
+
+(defn queues [ctx]
+  (if (not (= (submit ctx 0 5 0 (page-address 3) 458753 1 0) 0)) (fail ctx 7)
+    (if (not (= (submit ctx 0 1 0 (page-address 2) 458753 65537 0) 0)) (fail ctx 8)
+      (if (not (= (read-lba ctx 1) 0)) (fail ctx 9)
+        (do (copy-words ctx 630 4 0 16) (fail ctx 15))))))
+
+(defn identify [ctx]
+  (if (not (= (submit ctx 0 6 0 (page-address 4) 1 0 0) 0)) (fail ctx 5)
+    (do (copy-words ctx 620 4 24 10)
+        (if (not (= (submit ctx 0 6 1 (page-address 4) 0 0 0) 0)) (fail ctx 6)
+          (let [flbas (bit-and (page-u8 4 26) 15)
+                shift (page-u8 4 (+ 130 (* flbas 4)))]
+            (do (put-word ctx 607 (page-u32 4 0))
+                (put-word ctx 608 (page-u32 4 4))
+                (put-word ctx 609 shift)
+                (if (or (< shift 9) (> shift 12)) (fail ctx 10) (queues ctx))))))))
+
+(defn bring-up [ctx]
+  (do (put-word ctx 604 (reg ctx 0))
+      (put-word ctx 605 (reg ctx 4))
+      (put-word ctx 606 (reg ctx 8))
+      (put-word ctx 616 (bit-and (word ctx 605) 15))
+      (put-reg ctx 20 0)
+      (if (= (wait-ready ctx 0 100000000) 0) (fail ctx 3)
+        (do (zero-page 0 0) (zero-page 1 0) (zero-page 2 0) (zero-page 3 0) (zero-page 4 0)
+            (put-word ctx 610 0) (put-word ctx 611 0) (put-word ctx 612 1)
+            (put-word ctx 613 0) (put-word ctx 614 0) (put-word ctx 615 1)
+            (put-word ctx 618 0)
+            (put-reg ctx 36 458759)
+            (put-reg ctx 40 (bit-and (page-address 0) 4294967295))
+            (put-reg ctx 44 (u64-shift-right (page-address 0) 32))
+            (put-reg ctx 48 (bit-and (page-address 1) 4294967295))
+            (put-reg ctx 52 (u64-shift-right (page-address 1) 32))
+            (put-reg ctx 20 4587521)
+            (if (= (wait-ready ctx 1 100000000) 0) (fail ctx 4) (identify ctx))))))
+
+;; Result word 600: 1 no NVMe function, 2 no usable BAR0, 3 disable timed out,
+;; 4 enable timed out or controller fatal, 5 Identify Controller, 6 Identify
+;; Namespace 1, 7 Create I/O CQ, 8 Create I/O SQ, 9 Read LBA 1 failed,
+;; 10 block size above 4096, 15 every step passed. Never writes the medium.
+(defn probe [ctx]
+  (let [slot (find-slot 0)]
+    (if (< slot 0) (fail ctx 1)
+      (let [address (bar0 slot)]
+        (do (put-word ctx 601 slot)
+            (put-word ctx 602 (bit-and address 4294967295))
+            (put-word ctx 603 (u64-shift-right address 32))
+            (if (= address 0) (fail ctx 2)
+              (do (power-on slot)
+                  (pci-write slot 4 (bit-or (bit-and (pci-read slot 4) 65535) 1030))
+                  (bring-up ctx))))))))

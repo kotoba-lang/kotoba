@@ -143,6 +143,21 @@ iterations need no power cycle. Evidence:
 Ed25519 only (below the post-quantum floor) and exists only in the debug
 entry; KDBG tags 0x2000.. are taken by the blur timing log.
 
+## Verified network update, stage 1: read-only NVMe (AWAI-122)
+
+A network update is verified only if the installed OS boots from disk, fetches
+the signed image itself, checks it and then writes the ESP. A PXE-served
+`--install v1` image is unverified and cannot be made safe by a loader check,
+since a hostile image is a loader too. Stage 1 is `native/nvme.kotoba`: a
+polled, read-only NVMe driver (Identify, I/O queues, Read; no write command)
+in the debug entry only. It reports KDBG 0xc100..0xc108 and context words
+600..663; DMA is owned window slot 4 (five pages). Gate:
+`build-native-desktop-macos.py --profile nvme` (`check-native-nvme-qemu.py`).
+Its NVMe boots need `-cpu max,phys-bits=37`: with QEMU's default, OVMF puts
+the 64-bit BAR at 768 GiB and the loader's PCI collector, which admits
+addresses below 512 GiB, refuses the boot. Writing, GPT/FAT and the signed
+image follow in later stages.
+
 ## CDCI migration: native only (2026-10-24)
 
 Owner instruction and workspace `AGENTS.md` supersede the historical KBB,
