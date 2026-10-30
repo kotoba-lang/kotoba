@@ -4747,37 +4747,27 @@ static uint32_t net_dns_server(void) {
   return dhcp_dns ? dhcp_dns : NET_DNS_IP;
 }
 
+/* JUN-552: the query is built by kotoba/dns-query.o. Its 24-byte record is the peer's MAC then ours, then
+   little-endian u32s: src, dst, the server port. It zeroes and writes frame[0..54 + question_length), both checksums
+   included (the UDP pseudo header summed in place), and answers that length; a question shorter than 5 or longer than
+   255 bytes is refused (0) with nothing written. */
+extern int64_t kotoba_aiueos_dns_query_build(uint64_t frame, uint64_t length, uint64_t record, uint64_t record_length,
+                                             uint64_t question, uint64_t question_length);
 static uint32_t net_build_dns_query_named(uint8_t *frame, uint32_t src,
                                           uint32_t dst, uint16_t server_port,
                                           const uint8_t *question,
                                           uint32_t question_length) {
-  uint32_t udp_length = 8 + 12 + question_length;
-  uint32_t total = 20 + udp_length;
-  if (!frame || !question || question_length < 5 || question_length > 255)
-    return 0;
-  for (uint32_t i = 0; i < 14 + total; i++) frame[i] = 0;
-  for (unsigned i = 0; i < 6; i++) frame[i] = net_peer_mac[i];
-  for (unsigned i = 0; i < 6; i++) frame[6 + i] = net_mac[i];
-  net_store_be16(frame + 12, 0x0800);
-  frame[14] = 0x45;
-  net_store_be16(frame + 16, (uint16_t)total);
-  net_store_be16(frame + 20, 0x4000);
-  frame[22] = 64;
-  frame[23] = 17;
-  net_store_be32(frame + 26, src);
-  net_store_be32(frame + 30, dst);
-  net_store_be16(frame + 24,
-    (uint16_t)kotoba_aiueos_ipv4_checksum((uint64_t)(uintptr_t)(frame + 14), 20));
-  net_store_be16(frame + 34, NET_DNS_CLIENT_PORT);
-  net_store_be16(frame + 36, server_port);
-  net_store_be16(frame + 38, (uint16_t)udp_length);
-  net_store_be16(frame + 42, NET_DNS_XID);
-  net_store_be16(frame + 44, 0x0100);                        /* RD */
-  net_store_be16(frame + 46, 1);                             /* QDCOUNT */
-  for (uint32_t i = 0; i < question_length; i++)
-    frame[54 + i] = question[i];
-  net_store_be16(frame + 40, net_udp_checksum(frame, udp_length));
-  return 14 + total;
+  uint32_t record[6] = {0};
+  uint8_t *macs = (uint8_t *)record;
+  if (!frame || !question) return 0;
+  for (unsigned i = 0; i < 6; i++) macs[i] = net_peer_mac[i];
+  for (unsigned i = 0; i < 6; i++) macs[6 + i] = net_mac[i];
+  record[3] = src;
+  record[4] = dst;
+  record[5] = server_port;
+  return (uint32_t)kotoba_aiueos_dns_query_build((uint64_t)(uintptr_t)frame, 54 + (uint64_t)question_length,
+                                                 (uint64_t)(uintptr_t)record, sizeof record,
+                                                 (uint64_t)(uintptr_t)question, question_length);
 }
 
 static int net_udp_rx_checksum_ok(const uint8_t *frame, uint32_t udp_length) {

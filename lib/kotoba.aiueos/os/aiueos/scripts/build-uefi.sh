@@ -1491,6 +1491,10 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_tcp_build_obje
 kotoba_dns_answer_object=${AIUEOS_KOTOBA_DNS_ANSWER_OBJECT:-"$aiueos/kotoba/dns-answer.o"}
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_dns_answer_object" \
   34811e0ba6d69f4218441a82a258fe523dd1c90b8bd0aa04c015ab920c558645 kotoba_aiueos_dns_answer
+# JUN-552: pci.c's DNS query builder (net_build_dns_query_named) is kotoba/dns-query.o (fuel 4194304).
+kotoba_dns_query_object=${AIUEOS_KOTOBA_DNS_QUERY_OBJECT:-"$aiueos/kotoba/dns-query.o"}
+python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_dns_query_object" \
+  49da0d3cb999e99a3ed3a4dc60e35c4d1a5fa3767f57a27c4ff73ef1d2d85c94 kotoba_aiueos_dns_query_build
 # JUN-552: aiueos_acpi_initialize's MADT walk is kotoba/acpi-madt-parse.o (fuel 4194304); acpi.c keeps the globals.
 kotoba_acpi_madt_object=${AIUEOS_KOTOBA_ACPI_MADT_OBJECT:-"$aiueos/kotoba/acpi-madt-parse.o"}
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_acpi_madt_object" \
@@ -1600,7 +1604,7 @@ zig ld.lld -nostdlib -static --strip-all $qualification_gc_link -z max-page-size
   "$kernel_entry_object" "$kernel_object" "$kernel_paging_object" \
   "$kernel_acpi_object" "$kotoba_acpi_dmar_object" "$kotoba_acpi_madt_object" "$kernel_vtd_object" "$kernel_apic_object" "$kernel_memory_object" \
   "$kernel_pci_object" "$kotoba_dns_answer_object" "$kotoba_tcp_build_object" "$kotoba_udp_checksum_object" "$kernel_rtl8125_object" \
-  "$kernel_inference_status_object" \
+  "$kernel_inference_status_object" "$kotoba_dns_query_object" \
   $device_result_link $cpu_reads_link $ssh_userauth_link $poll_sched_link $model_handoff_link "$kernel_kototama_runtime_object" "$kotoba_kototama_management_object" \
   "$kotoba_job_protocol_glue_object" \
   "$kotoba_tls_aes_object" "$kotoba_bytes_object" "$kotoba_tls13_keyschedule_object" "$kotoba_tls13_cert_object" "$kotoba_tls13_hello_object" "$kotoba_tls13_verify_object" "$kotoba_tls13_keys_object" "$kotoba_tls13_hs_object" "$kernel_tls13_object" \
