@@ -42,7 +42,14 @@ aiueos_ap_trampoline_lm:
   and $-16, %rsp
   xor %rbp, %rbp
   mov aiueos_ap_trampoline_entry(%rip), %rax
-  jmp *%rax
+  /* Enter with the SysV "as if called" stack convention (RSP = 8 mod 16),
+     exactly like entry.S does for the BSP (`call aiueos_kernel_main`).
+     The old `jmp *%rax` left RSP = 0 mod 16, so every nested C frame ran
+     8 bytes off and the first compiler-emitted aligned SSE spill in the
+     Qwen worker (`movaps` in matvec_range) took #GP(0), which the unarmed
+     IDTR turned into a triple fault (JUN-35, esp3 run 2026-10-30).  The
+     entry function never returns, so the pushed return address is inert. */
+  call *%rax
 
 .balign 8
 aiueos_ap_trampoline_cr3: .quad 0
