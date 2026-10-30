@@ -3255,74 +3255,37 @@ static uint16_t net_ip_id = 1;
 static const uint8_t net_tcp_payload[NET_TCP_PAYLOAD] =
   {'a','i','u','e','o','s','\r','\n'};
 
-/* The TCP checksum covers a 12-byte pseudo-header that cannot be overlaid on
-   the frame: to be contiguous with the TCP header it would have to start at
-   frame offset 22, which puts its address fields at 22..29, while the IPv4
-   header carries them at 26..33 -- four bytes off. So the two are laid out
-   contiguously here instead, and `aiueos-ipv4-checksum` sums them as one range.
-   Laying bytes out is mechanism; the arithmetic stays in the object that
-   already computes exactly this sum for the ICMP path.
-   Static rather than an allocated page because a failed allocation would have
-   to fail the whole NIC probe that ARP and IPv4 have already passed, and this
-   buffer is never touched by DMA -- only the CPU reads it. */
-static uint8_t net_tcp_scratch[4096] __attribute__((section(".high_bss"), aligned(4096)));
-
-static uint16_t net_tcp_checksum(const uint8_t *frame, uint32_t tcp_length,
-                                 uint32_t src, uint32_t dst) {
-  net_store_be32(net_tcp_scratch, src);
-  net_store_be32(net_tcp_scratch + 4, dst);
-  net_tcp_scratch[8] = 0;
-  net_tcp_scratch[9] = 6;                                    /* protocol TCP */
-  net_store_be16(net_tcp_scratch + 10, (uint16_t)tcp_length);
-  for (uint32_t i = 0; i < tcp_length; i++) net_tcp_scratch[12 + i] = frame[34 + i];
-  return (uint16_t)kotoba_aiueos_ipv4_checksum(
-    (uint64_t)(uintptr_t)net_tcp_scratch, 12 + tcp_length);
-}
-
+/* JUN-552: the segment is built by kotoba/tcp-build.o. Its 48-byte record carries what the C read from its arguments
+   and globals: the peer's MAC then ours, then little-endian u32s -- src, dst, sport | dport << 16, sequence,
+   acknowledgement, flags, the IPv4 identification, the window. The object writes frame[0..54 + payload_length) with
+   both checksums (the TCP pseudo header summed in place, so there is no scratch copy any more) and answers 54 +
+   payload_length. 54 bytes without a payload, 62 with the echo, 196 with a ClientHello; the first is under Ethernet's
+   60-byte minimum and is emitted unpadded, which the ARP request at 42 bytes already showed this device and SLIRP both
+   accept. The identification still increments here: distinct IDs help SLIRP tell later TCP segments apart from the
+   ClientHello. */
+extern int64_t kotoba_aiueos_tcp_build(uint64_t frame, uint64_t length, uint64_t record, uint64_t record_length,
+                                       uint64_t payload, uint64_t payload_length);
 static uint32_t net_build_tcp(uint8_t *frame, uint32_t src, uint32_t dst,
                               uint16_t sport, uint16_t dport,
                               uint32_t sequence, uint32_t acknowledgement,
                               uint8_t flags, const uint8_t *payload,
                               uint32_t payload_length) {
-  uint32_t total = 40 + payload_length;                      /* 20 IPv4 + 20 TCP */
-  for (unsigned i = 0; i < 6; i++) frame[i] = net_peer_mac[i];
-  for (unsigned i = 0; i < 6; i++) frame[6 + i] = net_mac[i];
-  net_store_be16(frame + 12, 0x0800);                        /* EtherType IPv4 */
-  frame[14] = 0x45;                                          /* version 4, IHL 5 */
-  frame[15] = 0;
-  net_store_be16(frame + 16, (uint16_t)total);
-  /* Identification 0 with DF set, as for the echo: RFC 6864 permits it because
-     a datagram that may not be fragmented can never need reassembly. Distinct
-     IDs still help SLIRP tell later TCP segments apart from the ClientHello. */
-  net_store_be16(frame + 18, net_ip_id);
+  uint32_t record[12] = {0};
+  uint8_t *macs = (uint8_t *)record;
+  for (unsigned i = 0; i < 6; i++) macs[i] = net_peer_mac[i];
+  for (unsigned i = 0; i < 6; i++) macs[6 + i] = net_mac[i];
+  record[3] = src;
+  record[4] = dst;
+  record[5] = (uint32_t)sport | (uint32_t)dport << 16;
+  record[6] = sequence;
+  record[7] = acknowledgement;
+  record[8] = flags;
+  record[9] = net_ip_id;
+  record[10] = net_tx_window;
   net_ip_id++;
-  net_store_be16(frame + 20, 0x4000);
-  frame[22] = 64;                                            /* TTL */
-  frame[23] = 6;                                             /* TCP */
-  net_store_be16(frame + 24, 0);                             /* checksum covers itself as 0 */
-  net_store_be32(frame + 26, src);
-  net_store_be32(frame + 30, dst);
-  net_store_be16(frame + 24,
-    (uint16_t)kotoba_aiueos_ipv4_checksum((uint64_t)(uintptr_t)(frame + 14), 20));
-  net_store_be16(frame + 34, sport);
-  net_store_be16(frame + 36, dport);
-  net_store_be32(frame + 38, sequence);
-  net_store_be32(frame + 42, acknowledgement);
-  frame[46] = 0x50;                                          /* data offset 5, no options */
-  frame[47] = flags;
-  net_store_be16(frame + 48, net_tx_window);
-  net_store_be16(frame + 50, 0);                             /* checksum covers itself as 0 */
-  net_store_be16(frame + 52, 0);                             /* no urgent data */
-  for (uint32_t i = 0; i < payload_length; i++) frame[54 + i] = payload[i];
-  net_store_be16(frame + 50, net_tcp_checksum(frame, 20 + payload_length, src, dst));
-  /* 54 bytes without a payload, 62 with the echo, 196 with a ClientHello. The
-     first is under Ethernet's 60-byte minimum and is emitted unpadded, which
-     the ARP request at 42 bytes already showed this device and SLIRP both
-     accept -- so nothing here depends on padding that has never been
-     exercised. A real NIC on a real wire pads it itself, and the receiver
-     ignores the difference because the IPv4 total length, not the frame
-     length, says where the datagram ends. */
-  return 14 + total;
+  return (uint32_t)kotoba_aiueos_tcp_build((uint64_t)(uintptr_t)frame, 54 + (uint64_t)payload_length,
+                                           (uint64_t)(uintptr_t)record, sizeof record,
+                                           (uint64_t)(uintptr_t)payload, payload_length);
 }
 
 static int net_tcp_send(struct net_ring *tx, uint8_t *tx_page, uint32_t src,
