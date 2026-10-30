@@ -891,6 +891,10 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_mutable_build_
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_cap_valid_object" \
   0f591a342fe5b4fa959f8a21d36930ec9eca7859302a747ce43f5e3caa20c9c6 \
   kotoba_aiueos_virtio_cap_valid
+# JUN-598: pci.c's virtio queue setup (prepare_queue_index) is kotoba/virtio-queue.o (fuel 4194304).
+kotoba_virtio_queue_object=${AIUEOS_KOTOBA_VIRTIO_QUEUE_OBJECT:-"$aiueos/kotoba/virtio-queue.o"}
+python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_virtio_queue_object" \
+  e4de255126250d36cb201bc6552bed3679edc70fa94687ef346133b326149856 kotoba_aiueos_virtio_queue_setup
 # JUN-598: pci.c's virtio capability walk (find_virtio_caps) is kotoba/virtio-caps.o (fuel 4194304), over a snapshot of
 # the 256-byte configuration header.
 kotoba_virtio_caps_object=${AIUEOS_KOTOBA_VIRTIO_CAPS_OBJECT:-"$aiueos/kotoba/virtio-caps.o"}
@@ -1655,7 +1659,7 @@ zig ld.lld -nostdlib -static --strip-all $qualification_gc_link -z max-page-size
   "$kotoba_rtl8125_ring_build_object" "$kotoba_rtl8125_program_object" \
   "$kotoba_rtl8125_tx_submit_object" "$kotoba_rtl8125_rx_poll_object" "$kotoba_rtl8125_arp_object" "$kotoba_virtio_negotiate_object" \
   "$kotoba_x25519_object"   "$kotoba_ecdsa_object" $ecdsa_sign_link $ecdsa_public_link "$kotoba_ime_object" \
-  "$kotoba_aes128_gcm_object" "$kotoba_tls13_record_object" \
+  "$kotoba_aes128_gcm_object" "$kotoba_tls13_record_object" "$kotoba_virtio_queue_object" \
   $qwen35_kotoba_link $qwen35_parity_link \
   "$kotoba_device_worker_canonical_object" \
   "$kotoba_sha256_stream_object" "$kotoba_sha256_region_object" \
