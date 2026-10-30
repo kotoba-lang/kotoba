@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run the native post-quantum and secure-channel known-answer gates and their mutants
 (JUN-352 P1b: SHA-3, ML-KEM-768, ML-DSA-65; AWAI-117: X25519, ChaCha20-Poly1305 and
-XChaCha20-Poly1305, the pqh-v1 hybrid KEM).
+XChaCha20-Poly1305, the pqh-v1 hybrid KEM; AWAI-102: X-Wing).
 
 Each gate is one unity source: the library bodies with their `ns` forms removed, the
 `sha3/` alias dropped, then the gate body. The gate's main returns a bitmask; a pass is
@@ -69,6 +69,14 @@ MODULE_GATES = {
         'final': ('chacha20/poly1305.kotoba', 'use-g (>= g4 0)', 'use-g false'),
         'tagcmp': ('chacha20/aead.kotoba', '(if (= differ 0) (c/xor-stream key 1 nonce ct) (vector-i64 -1))', '(c/xor-stream key 1 nonce ct)'),
         'hround': ('chacha20/core.kotoba', 'words (vector-i64 0 1 2 3 12 13 14 15)', 'words (vector-i64 0 1 2 3 11 13 14 15)'),
+    }),
+    'xwing': dict(files=dict(X25519, **{'sha3/core.kotoba': SHA3, 'mlkem/core.kotoba': 'lib/gov.nist.mlKem/kotoba/mlkem/core.kotoba',
+                                        'xwing/core.kotoba': 'lib/org.ietf.xwing/kotoba/xwing/core.kotoba',
+                                        'xwing/native_gate.kotoba': 'lib/org.ietf.xwing/kotoba/xwing/native_gate.kotoba'}),
+                  gate_ns='xwing.native-gate', groups={'a': 7, 'b': 7, 'c': 63}, mutants={
+        'label': ('xwing/core.kotoba', '(vector-i64 92 46 47 47 94 92)', '(vector-i64 92 46 47 47 94 93)'),
+        'order': ('xwing/core.kotoba', '(cat (cat (cat (cat ss-m ss-x) ct-x) pk-x) (label))', '(cat (cat (cat (cat ss-x ss-m) ct-x) pk-x) (label))'),
+        'eseed': ('xwing/core.kotoba', 'ek-x (slice eseed 32 32)', 'ek-x (slice eseed 0 32)'),
     }),
     'pqh': dict(files=dict(X25519, **{'sha3/core.kotoba': SHA3, 'mlkem/core.kotoba': 'lib/gov.nist.mlKem/kotoba/mlkem/core.kotoba',
                                       'sha2/core.kotoba': 'lib/gov.nist.sha2/kotoba/sha2/core.kotoba',
