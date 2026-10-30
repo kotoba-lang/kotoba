@@ -3052,19 +3052,15 @@ static uint32_t net_load_be32(const uint8_t *at) {
    device's own config space. */
 static uint8_t net_mac[6] = {0x52,0x54,0x00,0xa1,0xe0,0x51};
 
+/* JUN-552: the ARP request and the ICMP echo request are kotoba/arp-icmp-build.o; it takes the frame's 42 bytes and
+   the peer's MAC then ours (12 bytes), and answers 42. */
+extern int64_t kotoba_aiueos_arp_request_build(uint64_t frame, uint64_t length, uint64_t macs, uint64_t macs_length);
+extern int64_t kotoba_aiueos_icmp_echo_build(uint64_t frame, uint64_t length, uint64_t macs, uint64_t macs_length);
 static uint32_t net_build_arp_request(uint8_t *frame) {
-  for (unsigned i = 0; i < 6; i++) frame[i] = 0xff;          /* broadcast */
-  for (unsigned i = 0; i < 6; i++) frame[6 + i] = net_mac[i];
-  net_store_be16(frame + 12, 0x0806);                        /* EtherType ARP */
-  net_store_be16(frame + 14, 1);                             /* Ethernet */
-  net_store_be16(frame + 16, 0x0800);                        /* IPv4 */
-  frame[18] = 6; frame[19] = 4;
-  net_store_be16(frame + 20, 1);                             /* request */
-  for (unsigned i = 0; i < 6; i++) frame[22 + i] = net_mac[i];
-  net_store_be32(frame + 28, NET_GUEST_IP);
-  for (unsigned i = 0; i < 6; i++) frame[32 + i] = 0;        /* unknown target */
-  net_store_be32(frame + 38, NET_PEER_IP);
-  return 42;
+  uint8_t macs[12] = {0};
+  for (unsigned i = 0; i < 6; i++) macs[6 + i] = net_mac[i];
+  return (uint32_t)kotoba_aiueos_arp_request_build((uint64_t)(uintptr_t)frame, 42,
+                                                   (uint64_t)(uintptr_t)macs, sizeof macs);
 }
 
 /* The ARP cache, which at this point in the stack's life holds exactly one
@@ -3076,33 +3072,13 @@ static uint8_t net_peer_mac[6];
 static int net_peer_mac_known;
 
 static uint32_t net_build_icmp_echo(uint8_t *frame) {
-  for (unsigned i = 0; i < 6; i++) frame[i] = net_peer_mac[i];
-  for (unsigned i = 0; i < 6; i++) frame[6 + i] = net_mac[i];
-  net_store_be16(frame + 12, 0x0800);                        /* EtherType IPv4 */
-  frame[14] = 0x45;                                          /* version 4, IHL 5 */
-  frame[15] = 0;                                             /* no DSCP, no ECN */
-  net_store_be16(frame + 16, 28);                            /* 20 IPv4 + 8 ICMP */
-  /* Identification 0 with DF set: RFC 6864 permits it precisely because a
-     datagram that may not be fragmented can never need to be reassembled. */
-  net_store_be16(frame + 18, 0);
-  net_store_be16(frame + 20, 0x4000);
-  frame[22] = 64;                                            /* TTL */
-  frame[23] = 1;                                             /* ICMP */
-  net_store_be16(frame + 24, 0);                             /* checksum covers itself as 0 */
-  net_store_be32(frame + 26, NET_GUEST_IP);
-  net_store_be32(frame + 30, NET_PEER_IP);
-  net_store_be16(frame + 24,
-    (uint16_t)kotoba_aiueos_ipv4_checksum((uint64_t)(uintptr_t)(frame + 14), 20));
-  frame[34] = 8;                                             /* echo request */
-  frame[35] = 0;
-  net_store_be16(frame + 36, 0);
-  net_store_be16(frame + 38, NET_ICMP_IDENT);
-  net_store_be16(frame + 40, NET_ICMP_SEQUENCE);
-  net_store_be16(frame + 36,
-    (uint16_t)kotoba_aiueos_ipv4_checksum((uint64_t)(uintptr_t)(frame + 34), 8));
+  uint8_t macs[12];
+  for (unsigned i = 0; i < 6; i++) macs[i] = net_peer_mac[i];
+  for (unsigned i = 0; i < 6; i++) macs[6 + i] = net_mac[i];
   /* 42 bytes, the same length as the ARP request the device already accepted,
      so nothing here depends on a minimum-frame rule that has not been tested. */
-  return 42;
+  return (uint32_t)kotoba_aiueos_icmp_echo_build((uint64_t)(uintptr_t)frame, 42,
+                                                 (uint64_t)(uintptr_t)macs, sizeof macs);
 }
 
 /* Everything needed to drive one virtqueue, kept together because the IPv4

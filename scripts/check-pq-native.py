@@ -11,7 +11,8 @@ Runs on Linux arm64 (the aarch64 payload packed into an aarch64-linux runner ima
 the arm64 owner lane does), on Apple Silicon (Mac root and packager, through
 lib/kotoba.hata/scripts/native_gate.py) and on Linux x86_64 (KX64 under the native
 runner). The pinned x86_64 KX64 profile refuses string literals (E7101 detail 16), which
-the gates use for their vectors, so x86_64 is not run in CI yet.
+the unity gates use for their vectors, so x86_64 runs only the module gates, which carry
+their bytes as vector literals (--module-gates-only, AWAI-117).
 """
 import argparse
 import concurrent.futures
@@ -288,6 +289,8 @@ def main():
     # The gates are independent (own sources, images and output files), so they run concurrently; a gate's own
     # pass run and mutants stay in order. --jobs 1 is the old serial order (JUN-629).
     parser.add_argument('--jobs', type=int, default=os.cpu_count() or 2)
+    parser.add_argument('--module-gates-only', action='store_true',
+                        help='skip the unity gates (string-literal vectors), for the x86_64 KX64 profile')
     args = parser.parse_args()
     gate = LinuxArm(args) if platform.system() == 'Linux' and platform.machine() in ('aarch64', 'arm64') else NativeGate(args)
     results = {}
@@ -320,9 +323,10 @@ def main():
         return result
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
-        futures = {name: pool.submit(unity_gate, name, spec) for name, spec in GATES.items()}
+        unity_gates = {} if args.module_gates_only else GATES
+        futures = {name: pool.submit(unity_gate, name, spec) for name, spec in unity_gates.items()}
         futures.update({name: pool.submit(module_gate, name, spec) for name, spec in MODULE_GATES.items()})
-        for name in list(GATES) + list(MODULE_GATES):
+        for name in list(unity_gates) + list(MODULE_GATES):
             results[name] = futures[name].result()
     if isinstance(gate, LinuxArm):
         files = module_files(TCP_DEMO)
@@ -337,7 +341,8 @@ def main():
                 refused = True
             results['tcp-demo']['controls'][label] = refused
             assert refused, ('tcp demo ran without', label)
-    gate.finish('PASS_PQ_NATIVE_GATES', gates=results)
+    gate.finish('PASS_PQ_NATIVE_GATES', gates=results,
+                skipped=sorted(GATES) if args.module_gates_only else [])
 
 if __name__ == '__main__':
     main()
