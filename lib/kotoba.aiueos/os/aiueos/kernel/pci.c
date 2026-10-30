@@ -4502,12 +4502,6 @@ static int net_ssh_listen(struct aiueos_ssh_io *io, unsigned listen_rounds) {
 #define NET_DHCP_STAGE_ACK 4
 #define NET_DHCP_STAGE_DONE 5
 
-/* Never touched by the device's own rings -- the CPU composes the UDP
-   checksum here and net_send copies it into the transmit frame -- so it is
-   static rather than an allocated page, for the reason net_tcp_scratch is.
-   `.high_bss` since 2026-10-26: same CPU-only argument as the TLS scratch,
-   and the payload the NIC reads is ordinary RAM at 4..6 MiB either way. */
-static uint8_t net_dhcp_scratch[2048] __attribute__((aligned(16), section(".high_bss")));
 static uint32_t dhcp_frame_length;
 
 static uint64_t net_mac_value(void) {
@@ -4522,15 +4516,12 @@ static uint64_t net_mac_value(void) {
    the two are laid out contiguously here and summed as one range by the object
    that already computes exactly this sum for ICMP and TCP. Laying bytes out is
    mechanism; the arithmetic is not. */
+/* JUN-552: the pseudo header and the datagram are summed by kotoba/udp-checksum.o in place, rather than copied
+   into net_dhcp_scratch first; it answers kotoba_aiueos_ipv4_checksum's value over that range. */
+extern int64_t kotoba_aiueos_udp_checksum_sum(uint64_t frame, uint64_t length, uint64_t udp_length);
 static uint16_t net_udp_checksum(const uint8_t *frame, uint32_t udp_length) {
-  net_store_be32(net_dhcp_scratch, net_load_be32(frame + 26));
-  net_store_be32(net_dhcp_scratch + 4, net_load_be32(frame + 30));
-  net_dhcp_scratch[8] = 0;
-  net_dhcp_scratch[9] = 17;                                  /* protocol UDP */
-  net_store_be16(net_dhcp_scratch + 10, (uint16_t)udp_length);
-  for (uint32_t i = 0; i < udp_length; i++) net_dhcp_scratch[12 + i] = frame[34 + i];
-  uint16_t sum = (uint16_t)kotoba_aiueos_ipv4_checksum(
-    (uint64_t)(uintptr_t)net_dhcp_scratch, 12 + udp_length);
+  uint16_t sum = (uint16_t)kotoba_aiueos_udp_checksum_sum((uint64_t)(uintptr_t)frame, 34 + (uint64_t)udp_length,
+                                                          udp_length);
   /* RFC 768: a computed checksum of zero goes on the wire as all ones, because
      zero already means "not computed". The admission accepts both. */
   return sum ? sum : 0xffff;
@@ -4780,14 +4771,8 @@ static uint32_t net_build_dns_query_named(uint8_t *frame, uint32_t src,
 }
 
 static int net_udp_rx_checksum_ok(const uint8_t *frame, uint32_t udp_length) {
-  net_store_be32(net_dhcp_scratch, net_load_be32(frame + 26));
-  net_store_be32(net_dhcp_scratch + 4, net_load_be32(frame + 30));
-  net_dhcp_scratch[8] = 0;
-  net_dhcp_scratch[9] = 17;
-  net_store_be16(net_dhcp_scratch + 10, (uint16_t)udp_length);
-  for (uint32_t i = 0; i < udp_length; i++) net_dhcp_scratch[12 + i] = frame[34 + i];
-  return (uint16_t)kotoba_aiueos_ipv4_checksum(
-    (uint64_t)(uintptr_t)net_dhcp_scratch, 12 + udp_length) == 0;
+  return (uint16_t)kotoba_aiueos_udp_checksum_sum((uint64_t)(uintptr_t)frame, 34 + (uint64_t)udp_length,
+                                                 udp_length) == 0;
 }
 
 /* Constant-offset A admission for one caller-owned bounded QNAME. Two layouts:
