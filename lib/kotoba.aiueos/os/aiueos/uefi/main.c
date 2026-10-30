@@ -1694,6 +1694,14 @@ efi_status EFIAPI efi_main(efi_handle image, struct efi_system_table *system) {
           __asm__ volatile("rdtsc" : "=a"(tsc_a), "=d"(tsc_b));
           info.data_key[i] = (uint8_t)((tsc_a >> ((i % 8) * 8)) & 0xff);
         }
+#ifdef AIUEOS_PHYSICAL_QUALIFICATION
+        /* The qualification medium may change only inside its result partition
+           (smoke-qemu-physical-qualification.sh compares every other byte with the
+           pristine image, so the Mac can trust what it reads back). The key is
+           therefore kept for this boot only and nothing is written to the ESP. */
+        have_key = 1;
+        debug_string("AIUEOS_DATA_KEY_EPHEMERAL tsc-entropy weak qualification-medium-unwritten\n");
+#else
         if (kroot->open(kroot, &kfile, data_key_path,
                         3 | 0x8000000000000000ULL, 0x20) == EFI_SUCCESS && kfile) {
           uint64_t w = 16;
@@ -1702,6 +1710,7 @@ efi_status EFIAPI efi_main(efi_handle image, struct efi_system_table *system) {
         }
         have_key = 1;
         debug_string("AIUEOS_DATA_KEY_CREATED tsc-entropy weak\n");
+#endif
       } else {
         debug_string("AIUEOS_DATA_KEY_LOADED\n");
       }
