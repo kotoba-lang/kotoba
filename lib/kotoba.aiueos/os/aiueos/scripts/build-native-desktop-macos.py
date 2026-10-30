@@ -300,6 +300,10 @@ def main(args):
             "--media", disk, "--efi", efi, "--kernel", image,
             "--qemu", qemu, "--firmware", firmware, "--font", padded,
             "--output", guest]
+        if args.expect_stuck_entropy:
+            if args.profile != "consent":
+                raise ValueError("--expect-stuck-entropy needs --profile consent")
+            guest_args.append("--expect-stuck-entropy")
         call("qemu", scripts[guest_script], guest_args)
         receipt_name = ("native-draft-restart.json" if args.profile == "local-draft"
                         else "native-consent-qemu.json" if args.profile == "consent"
@@ -313,7 +317,8 @@ def main(args):
                         else "native-dapps-qemu.json" if args.profile == "dapps"
                         else "native-desktop-qemu.json")
         observed = json.loads((guest / receipt_name).read_text())
-        expected_status = ("PASS_NATIVE_LOCAL_DRAFT_COLD_RESTORE" if args.profile == "local-draft"
+        expected_status = ("PASS_NATIVE_CONSENT_STUCK_ENTROPY" if args.expect_stuck_entropy
+                           else "PASS_NATIVE_LOCAL_DRAFT_COLD_RESTORE" if args.profile == "local-draft"
                            else "PASS_NATIVE_CONSENT_QEMU" if args.profile == "consent"
                            else "PASS_NATIVE_IDLE_SILENT_QEMU" if args.profile == "idle"
                            else "PASS_NATIVE_CID_QEMU" if args.profile == "cid"
@@ -325,6 +330,7 @@ def main(args):
                            else "PASS_NATIVE_DAPPS_QEMU" if args.profile == "dapps"
                            else "PASS_NATIVE_DESKTOP_INPUT_QEMU")
         expected_events = (12 if args.profile == "local-draft"
+                           else 18 if args.expect_stuck_entropy
                            else 22 if args.profile == "consent"
                            else 4 if args.profile == "idle"
                            else 4 if args.profile == "ed25519"
@@ -418,8 +424,9 @@ def main(args):
                         "first-frame", "entropy-probe", "itonami-goal-typed", "collapse-key", "collapse-click",
                         "consent-open",
                         "launcher-key-ignored", "launcher-click-ignored", "minimize-and-dock-blocked-by-consent", "key-deny",
-                        "pointer-deny", "esc-deny", "key-request-blocks-background-pointer", "key-deny", "key-request-pointer", "passphrase-pointer", "passphrase-cancel", "key-allow",
-                        "sign-deny", "sign-allow", "draft-after-key", "pointer-allow"]
+                        "pointer-deny", "esc-deny", "key-request-blocks-background-pointer", "key-deny", "key-request-pointer", "passphrase-pointer", "passphrase-cancel"]
+                       + (["stuck-entropy-refused"] if args.expect_stuck_entropy else
+                          ["key-allow", "sign-deny", "sign-allow", "draft-after-key", "pointer-allow"])
                     or observed["syntheticInputProvesHumanConsent"]):
                 raise ValueError("consent surface verdict is incomplete")
         elif (observed["font"] != font_state["padded"]
@@ -574,6 +581,9 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--profile", choices=("desktop", "local-draft", "consent", "idle", "cid", "sha512", "gf25519", "ed25519", "keyseal", "keystore", "dapps"), default="desktop")
     parser.add_argument("--distribution", choices=("aiueos", "awai"), default="aiueos")
+    parser.add_argument("--expect-stuck-entropy", action="store_true",
+                        help="JUN-482 negative control: the native sources draw from a constant entropy source; "
+                             "the consent gate must see the device-key draw refused")
     # kernel-v3 (RW at 0x400000) leaves the packager about 3 MiB of room (the compiler's
     # text cap stays 2 MiB, native/layout-table.json) instead of kernel-v1's
     # 1,044,480 bytes (the packager's bounded-ELF admission requires RX to end below
