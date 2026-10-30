@@ -543,6 +543,15 @@ static void dequantize_row_iq4_xs(const block_iq4_xs * x, float * y, int64_t k) 
     }
 }
 
+/* The model-handoff image calls kotoba/qwen35-row-bytes.o (JUN-554), linked with the other qwen35 objects; every other
+   build of this file (the parity profiles and the host smokes, which cannot link it) keeps the C, which is the reference
+   scripts/qwen35-row-bytes-diff compares the object with. */
+#if defined(AIUEOS_QWEN38_MODEL_HANDOFF) && !defined(AIUEOS_QWEN35_C_REFERENCE_MATVEC)
+extern int64_t kotoba_aiueos_qwen35_row_bytes(uint64_t, uint64_t);
+uint64_t aiueos_qwen35_quant_row_bytes(uint32_t type, uint64_t elements) {
+  return (uint64_t)kotoba_aiueos_qwen35_row_bytes(type, elements);
+}
+#else
 uint64_t aiueos_qwen35_quant_row_bytes(uint32_t type, uint64_t elements) {
   if (!elements) return 0;
   switch (type) {
@@ -580,6 +589,7 @@ uint64_t aiueos_qwen35_quant_row_bytes(uint32_t type, uint64_t elements) {
       return 0;
   }
 }
+#endif
 
 int aiueos_qwen35_dequantize_row(uint32_t type, const uint8_t * data,
                                   uint64_t elements, float * output) {
