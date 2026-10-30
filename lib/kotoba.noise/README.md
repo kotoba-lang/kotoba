@@ -277,6 +277,56 @@ OpenSSL (checked against RFC 8032 test 1 first) and ML-DSA-65 from the ACVP-vali
 
 The identity seeds in the gate are public test values, never operational keys.
 
+### Framing and native TCP (ADR-0001)
+
+`kotoba/noise/frame.kotoba` (`noise.frame`) frames a message with a 2-byte big-endian
+length, at most 65535 bytes, the way libp2p frames Noise. `frame-end` and `unframe` read
+the first complete frame and report an incomplete one as -1 / `[-1]`.
+`kotoba/noise/frame_gate.kotoba` returns 63:
+
+1. round trips at 0, 1, 255, 256 and 65535 bytes;
+2. big-endian order;
+3. refusal of 65536 bytes and of non-bytes;
+4. incomplete buffers;
+5. back-to-back frames;
+6. the largest frame size.
+
+Mutants: byte order 44, the limit off by one 59, and an incomplete-buffer check dropped,
+which reads out of bounds and traps.
+
+`kotoba/noise/tcp.kotoba` (`noise.tcp`) carries frames over the static runtime's native TCP
+wires 43-47 (amu JUN-292): `listen`, `dial`, `accept`, `send-frame` (hex chunks of at most
+16384 bytes, the wire's budget), `recv-frame` (reads only what the frame still needs) and
+`close`. Only Linux static images answer these wires. The host grants the exact
+addresses, and every refusal is the runtime's.
+
+`kotoba/noise/tcp_demo.kotoba` is one Linux image that listens, dials and accepts on
+127.0.0.1:47011 and runs the XXhfs handshake with identities and two transport messages
+across the socket. It is written by `tools/gen_identity_gate.py` with the identity gate's
+inputs, so every frame on the wire must equal the oracle's message. It returns 63:
+
+1. the five frames equal the oracle;
+2. both handshake hashes;
+3. both identities verify;
+4. every payload arrives;
+5. a 65536-byte message is refused;
+6. end of stream after close.
+
+Measured 2026-10-30 in the podman machine (Linux arm64), built with Amu main's committed
+`aarch64-linux-static-root.elf` (payload compiled to `aarch64-macos`, packed into the
+runner, as the CI arm64 lane does):
+
+| run | grants | result |
+|---|---|---|
+| demo | wires 43-47, 127.0.0.1:47011 for listen and dial | **63** |
+| control | dial wire 45 not granted | `KEXE_CAP {:wire 45 :refused :not-granted}`, exit 120 |
+| control | dial address not granted | `KEXE_TRAP … :net/address-not-granted`, exit 126 |
+
+`tools/run_tcp_demo.py` reproduces it, and `scripts/check-pq-native.py` runs it with both
+controls on the CI arm64 lane. Both sides share one process here. Separate hosts, the
+broker's request/response binding, retries, timeouts, backpressure and host budgets are
+the remaining parts of AWAI-102.
+
 ## Design record
 
 `com-junkawasaki/root` ADR-2607266500 (`90-docs/adr/`) — the overlay data-plane

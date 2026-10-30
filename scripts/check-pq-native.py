@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Run the native post-quantum and secure-channel known-answer gates and their mutants
 (JUN-352 P1b: SHA-3, ML-KEM-768, ML-DSA-65; AWAI-117: X25519, ChaCha20-Poly1305 and
-XChaCha20-Poly1305, the pqh-v1 hybrid KEM; JUN-352: AES and AES-GCM; AWAI-102: X-Wing, Noise, Noise XXhfs and its identity payload).
+XChaCha20-Poly1305, the pqh-v1 hybrid KEM; JUN-352: AES and AES-GCM; AWAI-102: X-Wing, Noise, Noise XXhfs, its identity payload, framing and the
+native-TCP demo on Linux).
 
 Each gate is one unity source: the library bodies with their `ns` forms removed, the
 `sha3/` alias dropped, then the gate body. The gate's main returns a bitmask; a pass is
@@ -110,6 +111,13 @@ MODULE_GATES = {
         'no-dsa': ('noise/identity.kotoba', '              (dsa/verify (slice p 32 1952) msg (vector-i64) (slice p 2048 3309))))))', '              true))))'),
         'no-ed': ('noise/identity.kotoba', '         (and (ed/verify? (slice p 0 32) msg (slice p 1984 64))', '         (and true'),
     }),
+    'frame': dict(files={'noise/frame.kotoba': 'lib/kotoba.noise/kotoba/noise/frame.kotoba',
+                         'noise/frame_gate.kotoba': 'lib/kotoba.noise/kotoba/noise/frame_gate.kotoba'},
+                  entry='noise/frame_gate.kotoba', passing=63, mutants={
+        'endian': ('noise/frame.kotoba', 'a (vector-assoc! out 0 (quot n 256))\n            b (vector-assoc! out 1 (rem n 256))',
+                   'a (vector-assoc! out 0 (rem n 256))\n            b (vector-assoc! out 1 (quot n 256))'),
+        'limit': ('noise/frame.kotoba', '(if (or (> n 65535) (not (bytes? msg)))', '(if (or (> n 65536) (not (bytes? msg)))'),
+    }),
     'aes': dict(files={f'aes/{n}.kotoba': f'lib/gov.nist.aes/kotoba/aes/{n}.kotoba' for n in ['core', 'gcm', 'native_gate']},
                 gate_ns='aes.native-gate', groups={'a': 15, 'b': 7, 'c': 7}, mutants={
         'sbox': ('aes/core.kotoba', '(vector-i64 99 124 119 123', '(vector-i64 99 124 119 122'),
@@ -131,6 +139,21 @@ MODULE_GATES = {
                      '(if false (vector-i64)\n            (let [eph-pub'),
     }),
 }
+
+# The TCP demo needs the static runtime's net wires 43-47, which only Linux images answer:
+# it runs on the arm64 lane with exact loopback grants, and again with each grant taken
+# away, which must refuse.
+NET_GRANT = {'KEXE_ALLOW': '43,44,45,46,47', 'KEXE_CAP_RESOURCES_43': '127.0.0.1:47011',
+             'KEXE_CAP_RESOURCES_45': '127.0.0.1:47011'}
+# an exact closure: every pinned module must be reachable from the entry (E6015), so the
+# identity gate's own entry module is left out
+TCP_DEMO = dict(files=dict({k: v for k, v in MODULE_GATES['identity']['files'].items() if k != 'noise/identity_gate.kotoba'}, **{
+    'noise/frame.kotoba': 'lib/kotoba.noise/kotoba/noise/frame.kotoba',
+    'noise/tcp.kotoba': 'lib/kotoba.noise/kotoba/noise/tcp.kotoba',
+    'noise/tcp_demo.kotoba': 'lib/kotoba.noise/kotoba/noise/tcp_demo.kotoba'}),
+    entry='noise/tcp_demo.kotoba', passing=63,
+    controls={'no-dial-wire': dict(NET_GRANT, KEXE_ALLOW='43,44,46,47'),
+              'dial-address-not-granted': dict(NET_GRANT, KEXE_CAP_RESOURCES_45='127.0.0.2:47011')})
 
 def module_files(spec, change=None):
     files = {}
@@ -231,9 +254,10 @@ class LinuxArm:
                                      sources={n: hashlib.sha256(b).hexdigest() for n, b in files.items()})
         return image
 
-    def run(self, label, image, expected):
-        # wire 37 only: the SHA-3 gate prints its oracle lines; nothing else is granted
-        r = self.call(label, [image], self.env(KEXE_STRUCTURED_REPORT='1', KEXE_ALLOW='37'))
+    def run(self, label, image, expected, grants=None):
+        # wire 37 only by default: the SHA-3 gate prints its oracle lines. A gate that
+        # needs more (the TCP demo) names its exact grants, which replace this one.
+        r = self.call(label, [image], self.env(KEXE_STRUCTURED_REPORT='1', **(grants or {'KEXE_ALLOW': '37'})))
         match = re.search(rb':result (-?[0-9]+)', r.stdout)
         self.observations[-1]['result'] = int(match[1]) if match else None
         print(label, 'result', self.observations[-1]['result'], flush=True)
@@ -283,6 +307,19 @@ def main():
             detected = None in got.values()
             results[name]['mutants'][label] = detected
             assert detected, (name, label, 'mutant passed every group')
+    if isinstance(gate, LinuxArm):
+        files = module_files(TCP_DEMO)
+        image = gate.build('tcp-demo', TCP_DEMO['entry'], files)
+        gate.run('tcp-demo-run', image, TCP_DEMO['passing'], NET_GRANT)
+        results['tcp-demo'] = dict(passing=TCP_DEMO['passing'], controls={})
+        for label, grants in TCP_DEMO['controls'].items():
+            try:
+                gate.run(f'tcp-demo-{label}', image, TCP_DEMO['passing'], grants)
+                refused = False
+            except AssertionError:
+                refused = True
+            results['tcp-demo']['controls'][label] = refused
+            assert refused, ('tcp demo ran without', label)
     gate.finish('PASS_PQ_NATIVE_GATES', gates=results)
 
 if __name__ == '__main__':
