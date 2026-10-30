@@ -1234,7 +1234,7 @@ struct virtio_caps {
 };
 
 extern uint64_t kotoba_aiueos_virtio_cap_valid(
-  uint64_t pointer, uint64_t cap_length, uint64_t bar, uint64_t offset, uint64_t length); extern int64_t kotoba_aiueos_virtio_caps_find(uint64_t header, uint64_t header_length, uint64_t record, uint64_t record_length); extern int64_t kotoba_aiueos_virtio_negotiate(uint64_t cfg, uint64_t length);
+  uint64_t pointer, uint64_t cap_length, uint64_t bar, uint64_t offset, uint64_t length); extern int64_t kotoba_aiueos_virtio_caps_find(uint64_t header, uint64_t header_length, uint64_t record, uint64_t record_length); extern int64_t kotoba_aiueos_virtio_negotiate(uint64_t cfg, uint64_t length); extern int64_t kotoba_aiueos_virtio_queue_setup(uint64_t cfg, uint64_t length, uint64_t record, uint64_t record_length);
 extern uint64_t kotoba_aiueos_pci_extent_valid(uint64_t value, uint64_t size);
 extern uint64_t kotoba_aiueos_pci_region_valid(
   uint64_t offset, uint64_t bytes, uint64_t bar_length); extern int64_t kotoba_aiueos_pci_bar_kind(int64_t low, int64_t index); extern int64_t kotoba_aiueos_pci_bar_value(int64_t low, int64_t high); extern int64_t kotoba_aiueos_pci_bar_base(int64_t low, int64_t high, int64_t index); extern int64_t kotoba_aiueos_pci_bar_size(int64_t mask_low, int64_t mask_high, int64_t kind);
@@ -1530,16 +1530,16 @@ static volatile uint16_t *prepare_queue_index(volatile struct virtio_common_cfg 
                                               struct virtq_desc *desc,
                                               struct virtq_avail *avail,
                                               struct virtq_used *used) {
-  cfg->queue_select = index;
-  if (cfg->queue_size < size || cfg->queue_enable) return 0;
-  cfg->queue_size = size;
-  cfg->queue_desc = (uint64_t)(uintptr_t)desc;
-  cfg->queue_driver = (uint64_t)(uintptr_t)avail;
-  cfg->queue_device = (uint64_t)(uintptr_t)used;
-  cfg->queue_enable = 1;
-  uint64_t delta = (uint64_t)cfg->queue_notify_off * caps->notify.notify_multiplier;
-  if (delta + 2 < delta || delta + 2 > caps->notify.length) return 0;
-  return (volatile void *)(uintptr_t)(notify_base + delta);
+  /* JUN-598: the register sequence is kotoba/virtio-queue.o (select, refuse a
+     too-small or already-enabled queue, size, the three rings, enable, the
+     doorbell offset bounded by the notify capability); it answers the offset
+     + 1, or 0. The function keeps its line count for the __LINE__ sites below. */
+  uint64_t record[7] = {index, size, (uint64_t)(uintptr_t)desc, (uint64_t)(uintptr_t)avail,
+                        (uint64_t)(uintptr_t)used, caps->notify.notify_multiplier, caps->notify.length};
+  int64_t at = kotoba_aiueos_virtio_queue_setup((uint64_t)(uintptr_t)cfg, sizeof(struct virtio_common_cfg),
+                                                (uint64_t)(uintptr_t)record, sizeof record);
+  if (at <= 0) return 0;
+  return (volatile void *)(uintptr_t)(notify_base + (uint64_t)(at - 1));
 }
 
 static volatile uint16_t *prepare_queue(volatile struct virtio_common_cfg *cfg,
