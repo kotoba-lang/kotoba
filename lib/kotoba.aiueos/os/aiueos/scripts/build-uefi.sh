@@ -905,6 +905,10 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_virtq_wait_obj
 kotoba_blk_wait_object=${AIUEOS_KOTOBA_BLK_WAIT_OBJECT:-"$aiueos/kotoba/blk-wait.o"}
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_blk_wait_object" \
   b61dd6150712b072095b9602a55d526f32855f409767690528cc23366af118fa kotoba_aiueos_blk_wait
+# JUN-598: the virtio keyboard's used-ring reap step (kbd_recycle) is kotoba/kbd-reap.o (fuel 4194304).
+kotoba_kbd_reap_object=${AIUEOS_KOTOBA_KBD_REAP_OBJECT:-"$aiueos/kotoba/kbd-reap.o"}
+python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_kbd_reap_object" \
+  4016035258ccd0e324495e7d9750b35afc7b5bc8d87e4a920427bb4b32f4466d kotoba_aiueos_kbd_reap
 # JUN-598: the split-virtqueue ring operations (descriptor + available-ring post, used-ring reads) are
 # kotoba/virtq-ring.o (fuel 4194304); virtio_rng and rng_refill use them first.
 kotoba_virtq_ring_object=${AIUEOS_KOTOBA_VIRTQ_RING_OBJECT:-"$aiueos/kotoba/virtq-ring.o"}
@@ -1682,7 +1686,7 @@ zig ld.lld -nostdlib -static --strip-all $qualification_gc_link -z max-page-size
   "$kotoba_wm_object" "$kotoba_scanout_object" "$kotoba_broker_object" "$kotoba_session_object" \
   "$kotoba_browser_frame_object" "$kotoba_browser_reduce_object" "$kotoba_browser_frame2_object" "$kotoba_browser_ime_object" \
   "$kotoba_browser_damage_object" "$kotoba_blk_wait_object" \
-  "$kotoba_mmio_map_admit_object" \
+  "$kotoba_mmio_map_admit_object" "$kotoba_kbd_reap_object" \
   "$kotoba_acpi_checksum_object" "$kotoba_acpi_table_valid_object" \
   "$kotoba_relay_hello_object" "$kotoba_relay_ack_object" \
   "$kotoba_inference_status_valid_object" "$kotoba_inference_rate_object" \
