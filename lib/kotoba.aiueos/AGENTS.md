@@ -111,6 +111,22 @@ the expanded FS2 Mac compiler fixed point and merged-root diagnostic VM repeat
 have local evidence, while exact-head native Linux compiler/controller gates,
 release and physical qualification remain open.
 
+## Installed itonami dapps run offline (AWAI-120, ADR-0282)
+
+The dock apps are installed itonami dapps: their code is in the OS image and
+starting them reads only local bytes. A dapp never resolves a DNS name; a
+remote operation names its peer by DID/CID, is declared in
+`distributions/awai/dapps/<id>.json` and keeps its own each-operation consent.
+With no network each dapp runs its local core (desktop profile 5,
+`native/dapps-entry.kotoba` + `native/dapps.kotoba`): Murakumo local
+inference, Itonami Goal and key, Yataverse raw-CIDv1 store, Aozora signed
+outbox. Gate: `build-native-desktop-macos.py --profile dapps`
+(`check-native-dapps-qemu.py`, `-nic none`). Keep each app body no longer
+than the static card it replaces: four open windows with longer bodies
+overflowed the renderer's 259 ops and the whole frame was refused (-5).
+State is RAM only on a machine without the draft medium. The QEMU check does
+not qualify physical hardware, and profile 5 is not the default entry.
+
 ## CDCI migration: native only (2026-10-24)
 
 Owner instruction and workspace `AGENTS.md` supersede the historical KBB,
