@@ -258,7 +258,7 @@ def main(args):
         efi = kernel / "BOOTX64.EFI"
         image = kernel / "KERNEL.ELF"
         if (kernel_state["state"] != "MACOS_NATIVE_IMAGE_CANDIDATE"
-                or kernel_state["sourceModuleCount"] != (38 if args.profile == "cid" else 37)
+                or kernel_state["sourceModuleCount"] != (39 if args.profile == "cid" else 38)
                 or kernel_state["fuel"] != FUEL
                 or kernel_state["compiler"] != compiler_pin
                 or pin(efi) != kernel_state["efi"] or pin(image) != kernel_state["kernel"]
@@ -298,6 +298,10 @@ def main(args):
             "--media", disk, "--efi", efi, "--kernel", image,
             "--qemu", qemu, "--firmware", firmware, "--font", padded,
             "--output", guest]
+        if args.expect_stuck_entropy:
+            if args.profile != "consent":
+                raise ValueError("--expect-stuck-entropy needs --profile consent")
+            guest_args.append("--expect-stuck-entropy")
         call("qemu", scripts[guest_script], guest_args)
         receipt_name = ("native-draft-restart.json" if args.profile == "local-draft"
                         else "native-consent-qemu.json" if args.profile == "consent"
@@ -310,7 +314,8 @@ def main(args):
                         else "native-keystore-qemu.json" if args.profile == "keystore"
                         else "native-desktop-qemu.json")
         observed = json.loads((guest / receipt_name).read_text())
-        expected_status = ("PASS_NATIVE_LOCAL_DRAFT_COLD_RESTORE" if args.profile == "local-draft"
+        expected_status = ("PASS_NATIVE_CONSENT_STUCK_ENTROPY" if args.expect_stuck_entropy
+                           else "PASS_NATIVE_LOCAL_DRAFT_COLD_RESTORE" if args.profile == "local-draft"
                            else "PASS_NATIVE_CONSENT_QEMU" if args.profile == "consent"
                            else "PASS_NATIVE_IDLE_SILENT_QEMU" if args.profile == "idle"
                            else "PASS_NATIVE_CID_QEMU" if args.profile == "cid"
@@ -557,6 +562,9 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--profile", choices=("desktop", "local-draft", "consent", "idle", "cid", "sha512", "gf25519", "ed25519", "keyseal", "keystore"), default="desktop")
     parser.add_argument("--distribution", choices=("aiueos", "awai"), default="aiueos")
+    parser.add_argument("--expect-stuck-entropy", action="store_true",
+                        help="JUN-482 negative control: the native sources draw from a constant entropy source; "
+                             "the consent gate must see the device-key draw refused")
     # kernel-v3 (RW at 0x400000) leaves the packager about 3 MiB of room (the compiler's
     # text cap stays 2 MiB, native/layout-table.json) instead of kernel-v1's
     # 1,044,480 bytes (the packager's bounded-ELF admission requires RX to end below

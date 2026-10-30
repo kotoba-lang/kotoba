@@ -323,8 +323,24 @@ def main(args):
         send("sendkey ret", 6.0)
         # the KDF (1024 SHA-512 rounds) and the signing run in this handler: a loaded host needs longer than any fixed delay
         for _ in range(240):
-            if W(87) == 0 and W(94) == 1: break
+            if W(87) == 0 and W(94) in (1, 2): break
             time.sleep(0.5)
+        if args.expect_stuck_entropy:
+            # JUN-482: this desktop was built with a constant entropy source; the health check must
+            # refuse the draw: the request closes with code 2, no seed, no key, nothing sealed
+            assert W(87) == 0 and W(94) == 2, ("a stuck source must refuse the draw", W(87), W(94))
+            assert seed_words() == [0] * 8, "a stuck source must leave no seed"
+            assert (S(2039) >> 6) & 1 == 0 and W(97) == 0, ("a stuck source must create no key", hex(S(2039)), W(97))
+            event("stuck-entropy-refused", code=W(94), seedBytes=seed_words(), keyExists=False)
+            media_after = pin(args.media)
+            assert media_before == media_after, "media changed"
+            report = dict(status="PASS_NATIVE_CONSENT_STUCK_ENTROPY", kernel=pin(args.kernel), efi=pin(args.efi),
+                          media=media_after, font=pin(args.font), firmware=pin(args.firmware),
+                          observer=pin(Path(__file__)), events=events, syntheticInputProvesHumanConsent=False,
+                          guestEmulation="QEMU TCG", physicalHardware=False)
+            (out / "native-consent-qemu.json").write_text(json.dumps(report, indent=2) + "\n")
+            print(report["status"], len(events))
+            return
         assert W(87) == 0 and W(94) == 1, (W(87), W(94))
         assert W(97) == 1 and W(96) == 0, ("the sealed blob must be stored on the scratch disk", W(97), W(96))
         flags = S(2039)
@@ -443,4 +459,6 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     for name in ("media", "efi", "kernel", "font", "qemu", "firmware", "output"):
         p.add_argument("--" + name, type=Path, required=True)
+    p.add_argument("--expect-stuck-entropy", action="store_true",
+                   help="the desktop was built with a constant entropy source: require the device-key draw to be refused (JUN-482)")
     main(p.parse_args())
