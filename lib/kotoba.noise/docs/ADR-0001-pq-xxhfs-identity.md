@@ -1,6 +1,6 @@
 # ADR-0001 — Post-quantum Noise for the native broker: XXhfs + ML-KEM-768, signed identity
 
-- **Status**: Proposed (2026-10-30). Needs the owner's acceptance before it ships.
+- **Status**: Accepted (owner, 2026-10-30).
 - **Issue**: AWAI-102 (native broker transport), following AWAI-117 (native primitives).
 - **Owner direction (2026-10-30)**: choose designs that suit a decentralized network and
   have a track record.
@@ -18,7 +18,7 @@ Filecoin), and the family WireGuard and Lightning use. It reproduces the Cacopho
 vectors byte for byte. Peers are identified by public keys; no certificate authority is
 involved, which suits roster keys and `did:key`.
 
-## Decision (proposed)
+## Decision
 
 ### 1. Confidentiality: the Noise `hfs` modifier with ML-KEM-768
 
