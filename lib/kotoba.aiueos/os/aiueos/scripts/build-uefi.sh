@@ -1479,6 +1479,10 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_kototama_manag
 kotoba_acpi_dmar_object=${AIUEOS_KOTOBA_ACPI_DMAR_OBJECT:-"$aiueos/kotoba/acpi-dmar-parse.o"}
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_acpi_dmar_object" \
   458deaf9b52b345caaaeb1c4ee0ee58a72d2e94974de11a28f3a092fc8aae769 kotoba_aiueos_acpi_dmar_parse
+# JUN-552: pci.c's TCP segment builder (net_build_tcp) is kotoba/tcp-build.o (fuel 4194304).
+kotoba_tcp_build_object=${AIUEOS_KOTOBA_TCP_BUILD_OBJECT:-"$aiueos/kotoba/tcp-build.o"}
+python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_tcp_build_object" \
+  7e8d94399b8af1f56c04d46626c834f62226fd4c44de6632d4db63c101fbf0a3 kotoba_aiueos_tcp_build
 # JUN-552: pci.c's DNS A admission (net_dns_answer_ok_named) is kotoba/dns-answer.o (fuel 4194304).
 kotoba_dns_answer_object=${AIUEOS_KOTOBA_DNS_ANSWER_OBJECT:-"$aiueos/kotoba/dns-answer.o"}
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_dns_answer_object" \
@@ -1591,7 +1595,7 @@ zig ld.lld -nostdlib -static --strip-all $qualification_gc_link -z max-page-size
   -T "$aiueos/kernel/linker.ld" -o "$kernel" \
   "$kernel_entry_object" "$kernel_object" "$kernel_paging_object" \
   "$kernel_acpi_object" "$kotoba_acpi_dmar_object" "$kotoba_acpi_madt_object" "$kernel_vtd_object" "$kernel_apic_object" "$kernel_memory_object" \
-  "$kernel_pci_object" "$kotoba_dns_answer_object" "$kernel_rtl8125_object" \
+  "$kernel_pci_object" "$kotoba_dns_answer_object" "$kotoba_tcp_build_object" "$kernel_rtl8125_object" \
   "$kernel_inference_status_object" \
   $device_result_link $cpu_reads_link $ssh_userauth_link $poll_sched_link $model_handoff_link "$kernel_kototama_runtime_object" "$kotoba_kototama_management_object" \
   "$kotoba_job_protocol_glue_object" \
