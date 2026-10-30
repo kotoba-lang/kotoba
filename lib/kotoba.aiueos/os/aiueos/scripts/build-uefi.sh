@@ -548,7 +548,11 @@ if [ "${AIUEOS_PLC_RT_SMOKE:-0}" = 1 ]; then
   kotoba_plc_step_object=${AIUEOS_KOTOBA_PLC_STEP_OBJECT:-"$aiueos/kotoba/plc-step.o"}
   python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_plc_step_object" \
     008e592e498754326017a87512e146bbda088f6f3568f0c38f71cd5fb0337fc1 kotoba_aiueos_plc_call_step,kotoba_aiueos_plc_release_step
-  plc_runtime_link="$kernel_plc_runtime_object $kernel_plc_embedded_object $kotoba_rt_dispatch_plan_object $kotoba_plc_step_object"
+  # JUN-554: plc_runtime.c's wait for the next scan release is kotoba/tick-wait.o, over amu ADR 0392's halt.
+  kotoba_tick_wait_object=${AIUEOS_KOTOBA_TICK_WAIT_OBJECT:-"$aiueos/kotoba/tick-wait.o"}
+  python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_tick_wait_object" \
+    2c67ca2bee1909cfe1546f88c95a167b4fac15f1cad191b65e7a1b3dd45954f7 kotoba_aiueos_tick_wait
+  plc_runtime_link="$kernel_plc_runtime_object $kernel_plc_embedded_object $kotoba_rt_dispatch_plan_object $kotoba_plc_step_object $kotoba_tick_wait_object"
   kotoba_user_elf_valid_object="$aiueos/kotoba/plc-user-elf-valid.o"
   kotoba_user_elf_valid_sha=77c5e791da666e8355a7a877c37841cc63a3f228fbf785656522284a5259bbdd
 fi
@@ -683,7 +687,11 @@ if [ "${AIUEOS_QWEN38_MODEL_HANDOFF:-0}" = 1 ] ||
     kotoba_qwen35_select_object=${AIUEOS_KOTOBA_QWEN35_SELECT_OBJECT:-"$aiueos/kotoba/qwen35-select.o"}
     python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_qwen35_select_object" \
       89ca0d714a5370a50aec128440711c06ef3537027093874593471098b053ff39 kotoba_aiueos_qwen35_select
-    model_handoff_link="$kotoba_qwen35_select_object $kotoba_xstate_setup_object $kotoba_qwen35_row_bytes_object $kernel_model_handoff_object $kotoba_model_mapping_plan_object $kotoba_model_handoff_validate_object $kernel_qwen35_runtime_object $kernel_qwen35_quant_object $kernel_qwen35_infer_object $kotoba_qwen35_header_object $kotoba_qwen35_kv_object $kotoba_qwen35_tensor_object"
+    # JUN-554: the residual adds are kotoba/qwen35-residual.o in this image (amu ADR 0391's scalar SSE f32).
+    kotoba_qwen35_residual_object=${AIUEOS_KOTOBA_QWEN35_RESIDUAL_OBJECT:-"$aiueos/kotoba/qwen35-residual.o"}
+    python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_qwen35_residual_object" \
+      740aee75e3a779218c616a1bf6470645016f3977540999a6051df3457cffb1c5 kotoba_aiueos_qwen35_residual_add
+    model_handoff_link="$kotoba_qwen35_residual_object $kotoba_qwen35_select_object $kotoba_xstate_setup_object $kotoba_qwen35_row_bytes_object $kernel_model_handoff_object $kotoba_model_mapping_plan_object $kotoba_model_handoff_validate_object $kernel_qwen35_runtime_object $kernel_qwen35_quant_object $kernel_qwen35_infer_object $kotoba_qwen35_header_object $kotoba_qwen35_kv_object $kotoba_qwen35_tensor_object"
   fi
   if [ "${AIUEOS_MODEL_NVME_SLOTS:-0}" = 1 ]; then
     model_slots_cflags="-DAIUEOS_MODEL_NVME_SLOTS=1"
@@ -900,6 +908,23 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_virtio_queue_o
 kotoba_virtq_wait_object=${AIUEOS_KOTOBA_VIRTQ_WAIT_OBJECT:-"$aiueos/kotoba/virtq-wait.o"}
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_virtq_wait_object" \
   9281b05c87fb3e604ea10bad5d40368239cf1e65425213f6f49ffa386a42aaad kotoba_aiueos_virtq_wait
+# JUN-598: the block driver's completion wait (virtio_blk_sector_io_ex) is kotoba/blk-wait.o (fuel 4194304), over amu
+# ADR 0392's kernel-wait-interrupt (MSI-X) and ADR 0393's kernel-pause (polled).
+kotoba_blk_wait_object=${AIUEOS_KOTOBA_BLK_WAIT_OBJECT:-"$aiueos/kotoba/blk-wait.o"}
+python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_blk_wait_object" \
+  b61dd6150712b072095b9602a55d526f32855f409767690528cc23366af118fa kotoba_aiueos_blk_wait
+# JUN-598: the virtio keyboard's used-ring reap step (kbd_recycle) is kotoba/kbd-reap.o (fuel 4194304).
+kotoba_kbd_reap_object=${AIUEOS_KOTOBA_KBD_REAP_OBJECT:-"$aiueos/kotoba/kbd-reap.o"}
+python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_kbd_reap_object" \
+  4016035258ccd0e324495e7d9750b35afc7b5bc8d87e4a920427bb4b32f4466d kotoba_aiueos_kbd_reap
+# JUN-598: the virtio-gpu control queue's used-entry classification (gpu_ctrl) is kotoba/gpu-reap.o (fuel 4194304).
+kotoba_gpu_reap_object=${AIUEOS_KOTOBA_GPU_REAP_OBJECT:-"$aiueos/kotoba/gpu-reap.o"}
+python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_gpu_reap_object" \
+  df725440234ee8f825890474fc6a0ce8ac8f39d6db01faa005a812ca98347ac4 kotoba_aiueos_gpu_reap
+# JUN-598: the virtio MSI-X vector programming (setup_rng_msix, setup_blk_msix) is kotoba/msix-entry.o (fuel 4194304).
+kotoba_msix_entry_object=${AIUEOS_KOTOBA_MSIX_ENTRY_OBJECT:-"$aiueos/kotoba/msix-entry.o"}
+python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_msix_entry_object" \
+  ada8c80a3e730c9ad18e2046969a96bea85aee6ae97989dd350cd7cc23143411 kotoba_aiueos_msix_program
 # JUN-598: the split-virtqueue ring operations (descriptor + available-ring post, used-ring reads) are
 # kotoba/virtq-ring.o (fuel 4194304); virtio_rng and rng_refill use them first.
 kotoba_virtq_ring_object=${AIUEOS_KOTOBA_VIRTQ_RING_OBJECT:-"$aiueos/kotoba/virtq-ring.o"}
@@ -1127,7 +1152,7 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_aes128_gcm_obj
 # object above, even in profiles that do not link them: the digests are what
 # ties the committed artifacts to the sources the oracles graded.
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_qwen35_header_object" \
-  b2e466eebabfdae8aaad8741b552ddeed0033c8814756b0409e59026fa8f72ec \
+  44018b876a97e9035df50d618a91a2f2d5d2439363a5c7b326a9c56b6d565b05 \
   kotoba_aiueos_qwen35_gguf_header_valid
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_qwen35_kv_object" \
   58df1be50a53c63332969963fa580e07101c6045f225367fb8a68de8ebbd5297 \
@@ -1169,7 +1194,7 @@ if [ -n "$model_handoff_link" ] || [ -n "$qwen35_parity_cflags" ]; then
   case "${AIUEOS_QWEN35_KOTOBA_PARITY:-0}" in
     0|5)
       python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_qwen35_rope_object" \
-        51405dd582722833216f7a29b76f43ed5dc14c4f6caccec3a8aa0db473fff914 \
+        470af3dc41f1d1c7a01bc49db7bf11af1d3236ed8228f7056c0c84c502006521 \
         kotoba_aiueos_qwen35_rope
       ;;
   esac
@@ -1673,11 +1698,11 @@ zig ld.lld -nostdlib -static --strip-all $qualification_gc_link -z max-page-size
   $qwen35_kotoba_link $qwen35_parity_link \
   "$kotoba_device_worker_canonical_object" "$kotoba_virtq_wait_object" \
   "$kotoba_sha256_stream_object" "$kotoba_sha256_region_object" "$kotoba_virtq_ring_object" \
-  "$kotoba_device_worker_digest_object" "$kotoba_http_head_object" \
+  "$kotoba_device_worker_digest_object" "$kotoba_http_head_object" "$kotoba_gpu_reap_object" \
   "$kotoba_wm_object" "$kotoba_scanout_object" "$kotoba_broker_object" "$kotoba_session_object" \
   "$kotoba_browser_frame_object" "$kotoba_browser_reduce_object" "$kotoba_browser_frame2_object" "$kotoba_browser_ime_object" \
-  "$kotoba_browser_damage_object" \
-  "$kotoba_mmio_map_admit_object" \
+  "$kotoba_browser_damage_object" "$kotoba_blk_wait_object" "$kotoba_msix_entry_object" \
+  "$kotoba_mmio_map_admit_object" "$kotoba_kbd_reap_object" \
   "$kotoba_acpi_checksum_object" "$kotoba_acpi_table_valid_object" \
   "$kotoba_relay_hello_object" "$kotoba_relay_ack_object" \
   "$kotoba_inference_status_valid_object" "$kotoba_inference_rate_object" \

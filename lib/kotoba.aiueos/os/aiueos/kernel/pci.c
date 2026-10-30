@@ -296,7 +296,7 @@ static uint64_t user_object_value[2];
 static uint8_t user_object_ready,user_object_write_evidence,user_object_replay_evidence;
 static volatile uint64_t user_object_pending[2];
 extern uint64_t kotoba_aiueos_journal_plan(uint64_t valid0, uint64_t sequence0,
-                                           uint64_t valid1, uint64_t sequence1);
+                                           uint64_t valid1, uint64_t sequence1); extern uint64_t kotoba_aiueos_blk_wait(uint64_t used, uint64_t used_length, uint64_t counter, uint64_t counter_length, uint64_t target, uint64_t msix, uint64_t start, uint64_t rounds);
 volatile uint64_t aiueos_virtio_blk_irq_count;
 static int blk_msix_active;
 /* Recorded when the completion wait proves futile rather than merely slow.
@@ -484,15 +484,17 @@ static int virtio_blk_sector_io_ex(struct virtio_blk_request *request, uint8_t *
   desc[1].flags = VIRTQ_DESC_F_NEXT | (type == VIRTIO_BLK_T_IN ? VIRTQ_DESC_F_WRITE : 0);
   avail->ring[old & 3] = 0; __asm__ volatile("" ::: "memory");
   avail->index = target; *doorbell = 0;
-  for (uint32_t budget = 0; budget < 100000000U; budget++) {
-    __asm__ volatile("" ::: "memory");
-    if ((!blk_msix_active || aiueos_virtio_blk_irq_count >= target) && used->index == target) {
+  for (uint32_t budget = 0, got; budget < 100000000U; budget += 65536U) {
+    got = (uint32_t)kotoba_aiueos_blk_wait((uint64_t)(uintptr_t)used, 4096,
+        (uint64_t)(uintptr_t)&aiueos_virtio_blk_irq_count, 8, target, blk_msix_active != 0, budget,
+        100000000U - budget < 65536U ? 100000000U - budget : 65536U);
+    if ((got & 3U) == 1U) {
       struct virtq_used_element *completion = &used->ring[old & 3];
       uint32_t expected = type == VIRTIO_BLK_T_IN ? 513 : 1;
       if (completion->id != 0 || completion->length != expected || *status != VIRTIO_BLK_S_OK)
         return 0;
-      if (budget >= blk_slowest_iters) {
-        blk_slowest_iters = budget; blk_slow_used = used->index;
+      if ((got >> 2) >= blk_slowest_iters) {
+        blk_slowest_iters = got >> 2; blk_slow_used = used->index;
         blk_slow_target = target;
       }
       *submitted = target;
@@ -500,17 +502,15 @@ static int virtio_blk_sector_io_ex(struct virtio_blk_request *request, uint8_t *
         aiueos_storage_unwrap_sector(sector, disk_sector);
       return 1;
     }
-    /* Futile, not slow: the used index has passed the value this wait is
-       looking for, so no future completion can make the equality true. Fail
-       now with the numbers instead of spinning until the harness times out. */
-    if (used->index != target &&
-        (uint16_t)(used->index - target) < 0x8000) {
-      blk_wait_used = used->index; blk_wait_target = target;
+    /* Futile, not slow: kotoba_aiueos_blk_wait (kotoba/blk-wait.o) saw the used index pass
+       the value this wait is looking for, so no future completion can make the equality
+       true. Fail now with the numbers instead of spinning until the harness times out. */
+    if ((got & 3U) == 2U) {
+      blk_wait_used = (uint16_t)(got >> 2); blk_wait_target = target;
       blk_wait_irq = aiueos_virtio_blk_irq_count; blk_wait_overshot = 1;
       return 0;
     }
-    if (blk_msix_active) __asm__ volatile("sti; hlt; cli" ::: "memory");
-    else __asm__ volatile("pause");
+    if (got != 3U) return 0;
   }
   return 0;
 }
@@ -747,9 +747,9 @@ static int crash_sector_io_polled(uint32_t type) {
   b->desc[1].flags = VIRTQ_DESC_F_NEXT | (type == VIRTIO_BLK_T_IN ? VIRTQ_DESC_F_WRITE : 0);
   b->avail->ring[old & 3] = 0; __asm__ volatile("" ::: "memory");
   b->avail->index = target; *b->doorbell = 0;
-  for (uint32_t budget = 0; budget < 100000000U; budget++) {
-    __asm__ volatile("" ::: "memory");
-    if (b->used->index == target) {
+  for (uint32_t budget = 0, got; budget < 100000000U; budget += 65536U) {   /* kotoba/blk-wait.o, polled (no MSI-X) */
+    got = (uint32_t)kotoba_aiueos_blk_wait((uint64_t)(uintptr_t)b->used, 4096, (uint64_t)(uintptr_t)&aiueos_virtio_blk_irq_count, 8, target, 0, budget, 100000000U - budget < 65536U ? 100000000U - budget : 65536U);
+    if ((got & 3U) == 1U) {
       struct virtq_used_element *completion = &b->used->ring[old & 3];
       uint32_t expected = type == VIRTIO_BLK_T_IN ? 513 : 1;
       if (completion->id != 0 || completion->length != expected ||
@@ -757,7 +757,7 @@ static int crash_sector_io_polled(uint32_t type) {
       b->submitted = target;
       return 1;
     }
-    __asm__ volatile("pause");
+    if (got != 3U) return 0;   /* the index passed target (2): no completion can make them equal, so fail now */
   }
   return 0;
 }
@@ -1234,7 +1234,7 @@ struct virtio_caps {
 };
 
 extern uint64_t kotoba_aiueos_virtio_cap_valid(
-  uint64_t pointer, uint64_t cap_length, uint64_t bar, uint64_t offset, uint64_t length); extern int64_t kotoba_aiueos_virtio_caps_find(uint64_t header, uint64_t header_length, uint64_t record, uint64_t record_length); extern int64_t kotoba_aiueos_virtio_negotiate(uint64_t cfg, uint64_t length); extern int64_t kotoba_aiueos_virtio_queue_setup(uint64_t cfg, uint64_t length, uint64_t record, uint64_t record_length); extern int64_t kotoba_aiueos_virtq_post(uint64_t desc, uint64_t desc_length, uint64_t avail, uint64_t avail_length, uint64_t record, uint64_t record_length); extern int64_t kotoba_aiueos_virtq_used_index(uint64_t used, uint64_t used_length); extern int64_t kotoba_aiueos_virtq_used_elem(uint64_t used, uint64_t used_length, uint64_t slot); extern int64_t kotoba_aiueos_virtq_wait(uint64_t used, uint64_t used_length, uint64_t counter, uint64_t counter_length, uint64_t before, uint64_t want, uint64_t rounds);
+  uint64_t pointer, uint64_t cap_length, uint64_t bar, uint64_t offset, uint64_t length); extern int64_t kotoba_aiueos_virtio_caps_find(uint64_t header, uint64_t header_length, uint64_t record, uint64_t record_length); extern int64_t kotoba_aiueos_virtio_negotiate(uint64_t cfg, uint64_t length); extern int64_t kotoba_aiueos_virtio_queue_setup(uint64_t cfg, uint64_t length, uint64_t record, uint64_t record_length); extern int64_t kotoba_aiueos_virtq_post(uint64_t desc, uint64_t desc_length, uint64_t avail, uint64_t avail_length, uint64_t record, uint64_t record_length); extern int64_t kotoba_aiueos_virtq_used_index(uint64_t used, uint64_t used_length); extern int64_t kotoba_aiueos_virtq_used_elem(uint64_t used, uint64_t used_length, uint64_t slot); extern int64_t kotoba_aiueos_virtq_wait(uint64_t used, uint64_t used_length, uint64_t counter, uint64_t counter_length, uint64_t before, uint64_t want, uint64_t rounds); extern uint64_t kotoba_aiueos_kbd_reap(uint64_t used, uint64_t used_length, uint64_t avail, uint64_t avail_length, uint64_t event, uint64_t event_length, uint64_t state); extern uint64_t kotoba_aiueos_msix_program(uint64_t entry, uint64_t entry_length, uint64_t cfg, uint64_t cfg_length, uint64_t address, uint64_t data, uint64_t vector);
 extern uint64_t kotoba_aiueos_pci_extent_valid(uint64_t value, uint64_t size);
 extern uint64_t kotoba_aiueos_pci_region_valid(
   uint64_t offset, uint64_t bytes, uint64_t bar_length); extern int64_t kotoba_aiueos_pci_bar_kind(int64_t low, int64_t index); extern int64_t kotoba_aiueos_pci_bar_value(int64_t low, int64_t high); extern int64_t kotoba_aiueos_pci_bar_base(int64_t low, int64_t high, int64_t index); extern int64_t kotoba_aiueos_pci_bar_size(int64_t mask_low, int64_t mask_high, int64_t kind);
@@ -1428,15 +1428,15 @@ static int setup_rng_msix(uint8_t b, uint8_t d, uint8_t f,
   if (!aiueos_map_pci_mmio(table_base + table_offset,table_bytes) ||
       !aiueos_map_pci_mmio(pba_base + pba_offset,pba_bytes)) return 0;
   struct msix_entry *entry = (void *)(uintptr_t)(table_base + table_offset);
-  entry[0].vector_control = 1;
-  entry[0].address_low =
-    0xfee00000U | ((uint32_t)kotoba_aiueos_cpu_apic_id() << 12);
-  entry[0].address_high = 0;
-  entry[0].data = 34;
+  /* kotoba/msix-entry.o: mask entry 0, write its message (the local APIC,
+     vector 34), assign the queue to MSI-X vector 0 and read it back, then
+     unmask -- one access of each register's width, in this order; 1 only when
+     the device kept the vector (the entry stays masked otherwise). */
+  if (kotoba_aiueos_msix_program((uint64_t)(uintptr_t)&entry[0], sizeof(entry[0]),
+        (uint64_t)(uintptr_t)cfg, sizeof(*cfg),
+        0xfee00000U | ((uint32_t)kotoba_aiueos_cpu_apic_id() << 12), 34, 0) != 1)
+    return 0;
   __asm__ volatile("" ::: "memory");
-  cfg->queue_msix_vector = 0;
-  if (cfg->queue_msix_vector != 0) return 0;
-  entry[0].vector_control = 0;
   config_write(b,d,f,pointer,header | (1U << 31)); /* enable; function mask clear */
   if (!(config_read(b,d,f,pointer) & (1U << 31))) return 0;
   aiueos_virtio_rng_irq_count = 0;
@@ -1476,14 +1476,14 @@ static int setup_blk_msix(uint8_t b, uint8_t d, uint8_t f,
   if (aiueos_vtd_translation_enabled() &&
       !aiueos_vtd_program_msix(((uint16_t)b << 8) | ((uint16_t)d << 3) | f,
                                1,35,destination,&message_address,&message_data)) return 0;
-  entry[1].vector_control = 1;
-  entry[1].address_low = message_address;
-  entry[1].address_high = 0;
-  entry[1].data = message_data;
+  /* kotoba/msix-entry.o, as for the rng: entry 1 with the (possibly remapped)
+     message, queue vector 1, read back, then unmask; a vector the device did
+     not keep fails the setup with the entry still masked. */
+  if (kotoba_aiueos_msix_program((uint64_t)(uintptr_t)&entry[1], sizeof(entry[1]),
+        (uint64_t)(uintptr_t)cfg, sizeof(*cfg),
+        message_address, message_data, 1) != 1)
+    return 0;
   __asm__ volatile("" ::: "memory");
-  cfg->queue_msix_vector = 1;
-  if (cfg->queue_msix_vector != 1) return 0;
-  entry[1].vector_control = 0;
   config_write(b,d,f,pointer,header | (1U << 31));
   if (!(config_read(b,d,f,pointer) & (1U << 31))) return 0;
   aiueos_virtio_blk_irq_count = 0;
@@ -2022,22 +2022,22 @@ static uint32_t kbd_recycle(int want_press) {
   __asm__ volatile("" ::: "memory");
   uint16_t n = kbd_used->index;
   while (kbd_seen != n) {
-    uint32_t id = kbd_used->ring[kbd_seen % 4].id;
+    /* kotoba/kbd-reap.o reads used element kbd_seen % 4, skips an id past 3 (1),
+       else reads its event and hands the buffer back on the available ring, ring
+       entry before index (2 | key << 2: the press or key event want_press asks for). */
+    uint64_t got = kotoba_aiueos_kbd_reap((uint64_t)(uintptr_t)kbd_used, 4096, (uint64_t)(uintptr_t)kbd_avail, 4096,
+        (uint64_t)(uintptr_t)kbd_event, 4096, (uint64_t)kbd_seen | (uint64_t)(want_press & 3) << 16);
     kbd_seen++;
-    if (id > 3) continue;
-    struct virtio_input_event *ev = kbd_event + id;
+    /* kbd_seen, the event counter, the doorbell and the break stay here, in the
+       order the C had them. */
+    if (got < 2) continue;
     /* Every used entry the reap path touches is counted here, and only here
        (JUN-34, measured 2026-10-23: the boot probe used to count its own read
        of ring slot 0 and the poll path then re-read the same entry, so the
        ring evidence double-counted and lagged what the desktop actually saw). */
     aiueos_input_ring_events++;
-    if (want_press == 1 && !press && ev->type == 1 && ev->value == 1 && ev->code)
-      press = ev->code;
-    if (want_press == 2 && !press && ev->type == 1 && ev->value <= 2 && ev->code)
-      press = (uint32_t)ev->code * 4U + ev->value;
-    kbd_avail->ring[kbd_avail->index % 4] = (uint16_t)id;
+    press = (uint32_t)(got >> 2);
     __asm__ volatile("" ::: "memory");
-    kbd_avail->index++;
     *kbd_doorbell = 0;
     if (press) break;
   }
@@ -2437,6 +2437,8 @@ static void gpu_drain_now(struct virtq_desc *desc, struct virtq_avail *avail,
   }
 }
 
+extern uint64_t kotoba_aiueos_gpu_reap(uint64_t used, uint64_t used_length, uint64_t resp, uint64_t resp_length,
+                                       uint64_t state, uint64_t resp_len, uint64_t expect);
 static int gpu_ctrl(struct virtq_desc *desc, struct virtq_avail *avail,
                     struct virtq_used *used, volatile uint16_t *doorbell,
                     uint16_t *submitted,
@@ -2455,9 +2457,12 @@ static int gpu_ctrl(struct virtq_desc *desc, struct virtq_avail *avail,
     __asm__ volatile("" ::: "memory");
     int responded = 0;
     while (gpu_used_consumed != used->index) {
-      struct virtq_used_element *done = &used->ring[gpu_used_consumed & 3];
+      /* kotoba/gpu-reap.o: what this used entry is -- 1 the event buffer, the response (2 as expected, 3 short,
+         4 long, 5 the wrong type; only the first), 6 anything else */
+      uint64_t act = kotoba_aiueos_gpu_reap((uint64_t)(uintptr_t)used, 4096, (uint64_t)(uintptr_t)resp, 24,
+          (uint64_t)gpu_used_consumed | (uint64_t)responded << 16, resp_len, expect_type);
       gpu_used_consumed++;
-      if (done->id == 2) {
+      if (act == 1) {
         /* the event buffer: record, clear, re-post */
         gpu_display_events |= gpu_event_buf.events;
         gpu_event_buf.events = 0;
@@ -2468,19 +2473,19 @@ static int gpu_ctrl(struct virtq_desc *desc, struct virtq_avail *avail,
         __asm__ volatile("" ::: "memory");
         avail->index = gpu_avail_next;
         *doorbell = 0;
-      } else if (done->id == 0 && !responded) {
+      } else if (act >= 2 && act <= 5) {
         responded = 1;
-        if (done->length < sizeof(*resp)) {
+        if (act == 3) {
           extern void aiueos_kernel_serial_marker(const char *text);
           aiueos_kernel_serial_marker("AIUEOS_GPU_CMD_FAIL short\r\n");
           *submitted = gpu_avail_next; return 0;
         }
-        if (done->length > resp_len) {
+        if (act == 4) {
           extern void aiueos_kernel_serial_marker(const char *text);
           aiueos_kernel_serial_marker("AIUEOS_GPU_CMD_FAIL long\r\n");
           *submitted = gpu_avail_next; return 0;
         }
-        if (resp->type != expect_type) {
+        if (act == 5) {
           extern void aiueos_kernel_serial_marker(const char *text);
           aiueos_kernel_serial_marker("AIUEOS_GPU_CMD_FAIL type\r\n");
           *submitted = gpu_avail_next; return 0;
