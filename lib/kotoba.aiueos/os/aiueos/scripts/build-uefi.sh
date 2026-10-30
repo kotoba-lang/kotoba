@@ -270,6 +270,15 @@ if [ "${AIUEOS_MURAKUMO_DEVICE_RESULT:-0}" = 1 ]; then
     fb42023ba8bb0e42960151dcf8a0f8f3d161628c5b15c8597f6c7d6a76bf5b0b kotoba_aiueos_device_result_text
   device_result_link="$kernel_device_result_object $kernel_device_worker_protocol_object $kotoba_device_worker_poll_object $kotoba_p256_did_object $kotoba_device_result_text_object"
 fi
+# JUN-554: the CPU reads -- device_result.c's RDRAND bytes and qwen35_infer.c's read_cycles in the model-handoff image --
+# are kotoba/cpu-reads.o, over amu ADR 0389's CPU intrinsics. Linked once when either profile is on.
+cpu_reads_link=
+if [ "${AIUEOS_MURAKUMO_DEVICE_RESULT:-0}" = 1 ] || [ "${AIUEOS_QWEN38_MODEL_HANDOFF:-0}" = 1 ]; then
+  kotoba_cpu_reads_object=${AIUEOS_KOTOBA_CPU_READS_OBJECT:-"$aiueos/kotoba/cpu-reads.o"}
+  python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_cpu_reads_object" \
+    f6604b54989c3af07d800ba26adfbe0f5e564bd0abe7fee695d0028bc655da58 kotoba_aiueos_read_cycles,kotoba_aiueos_cpu_random_bytes
+  cpu_reads_link="$kotoba_cpu_reads_object"
+fi
 # JUN-35: the poll scheduler is referenced from main.c under
 # AIUEOS_PERSISTENT_BOOT (init/sequence/record) and from pci.c under
 # AIUEOS_MURAKUMO_DEVICE_RESULT (status disposition), so either flag links it.
@@ -1558,7 +1567,7 @@ zig ld.lld -nostdlib -static --strip-all $qualification_gc_link -z max-page-size
   "$kernel_acpi_object" "$kotoba_acpi_dmar_object" "$kernel_vtd_object" "$kernel_apic_object" "$kernel_memory_object" \
   "$kernel_pci_object" "$kernel_rtl8125_object" \
   "$kernel_inference_status_object" \
-  $device_result_link $poll_sched_link $model_handoff_link "$kernel_kototama_runtime_object" "$kotoba_kototama_management_object" \
+  $device_result_link $cpu_reads_link $poll_sched_link $model_handoff_link "$kernel_kototama_runtime_object" "$kotoba_kototama_management_object" \
   "$kotoba_job_protocol_glue_object" \
   "$kotoba_tls_aes_object" "$kotoba_bytes_object" "$kotoba_tls13_keyschedule_object" "$kotoba_tls13_cert_object" "$kotoba_tls13_hello_object" "$kotoba_tls13_verify_object" "$kotoba_tls13_keys_object" "$kotoba_tls13_hs_object" "$kernel_tls13_object" \
   "$kernel_scheduler_object" "$kernel_syscall_object" \

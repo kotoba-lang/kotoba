@@ -223,6 +223,12 @@ static float silu(float value) {
   return value * sigmoid(value);
 }
 
+/* In the model-handoff image the read is kotoba/cpu-reads.kotoba (JUN-554, amu ADR 0389's kernel-rdtsc: the same lfence;
+   rdtsc); the parity profiles and the host smokes, which do not link it, keep the C. */
+#if defined(AIUEOS_QWEN38_MODEL_HANDOFF) && !defined(AIUEOS_QWEN35_TESTING)
+extern int64_t kotoba_aiueos_read_cycles(void);
+static uint64_t read_cycles(void) { return (uint64_t)kotoba_aiueos_read_cycles(); }
+#else
 static uint64_t read_cycles(void) {
 #if defined(__x86_64__)
   uint32_t low, high;
@@ -232,6 +238,7 @@ static uint64_t read_cycles(void) {
   return 0;
 #endif
 }
+#endif
 
 static float dot_scalar(const float * left, const float * right,
                         uint64_t count) {
