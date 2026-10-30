@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Run the native post-quantum known-answer gates (JUN-352 P1b) and their mutants.
+"""Run the native post-quantum and secure-channel known-answer gates and their mutants
+(JUN-352 P1b: SHA-3, ML-KEM-768, ML-DSA-65; AWAI-117: X25519, ChaCha20-Poly1305 and
+XChaCha20-Poly1305, the pqh-v1 hybrid KEM).
 
 Each gate is one unity source: the library bodies with their `ns` forms removed, the
 `sha3/` alias dropped, then the gate body. The gate's main returns a bitmask; a pass is
@@ -45,6 +47,72 @@ GATES = {
                   '(if (or (= (vector-count h) 0) (>= (vnorm z) 524092)) false', '(if (= (vector-count h) 0) false'),
     }),
 }
+
+# Module gates (AWAI-117) are built as modules from the library files, not as a unity
+# source. A gate with groups runs one image per group through a one-line entry module,
+# because one image holds only 10-20 X25519 multiplications.
+X25519 = {'x25519/field.kotoba': 'lib/org.ietf.x25519/kotoba/x25519/field.kotoba',
+          'x25519/core.kotoba': 'lib/org.ietf.x25519/kotoba/x25519/core.kotoba'}
+CHACHA = {f'chacha20/{n}.kotoba': f'lib/org.ietf.chacha20Poly1305/kotoba/chacha20/{n}.kotoba'
+          for n in ['core', 'poly1305', 'aead', 'aead_params']}
+MODULE_GATES = {
+    'x25519': dict(files=dict(X25519, **{'x25519/native_gate.kotoba': 'lib/org.ietf.x25519/kotoba/x25519/native_gate.kotoba'}),
+                   gate_ns='x25519.native-gate', groups={'a': 15, 'b': 7, 'c': 15}, mutants={
+        'a24': ('x25519/core.kotoba', '0 121665))', '0 121666))'),
+        'clamp': ('x25519/core.kotoba', '(bit-and (vector-at k 0) 248)', '(bit-and (vector-at k 0) 255)'),
+        'mask': ('x25519/field.kotoba', '(bit-and limb 32767)', '(bit-and limb 65535)'),
+    }),
+    'chacha20': dict(files=dict(CHACHA, **{'chacha20/native_gate.kotoba': 'lib/org.ietf.chacha20Poly1305/kotoba/chacha20/native_gate.kotoba'}),
+                     entry='chacha20/native_gate.kotoba', passing=255, mutants={
+        'rotl': ('chacha20/core.kotoba', '(vector-at s a)) 16))', '(vector-at s a)) 15))'),
+        'clamp': ('chacha20/poly1305.kotoba', '(bit-and t0 67108863)', '(bit-and t0 268435455)'),
+        'final': ('chacha20/poly1305.kotoba', 'use-g (>= g4 0)', 'use-g false'),
+        'tagcmp': ('chacha20/aead.kotoba', '(if (= differ 0) (c/xor-stream key 1 nonce ct) (vector-i64 -1))', '(c/xor-stream key 1 nonce ct)'),
+        'hround': ('chacha20/core.kotoba', 'words (vector-i64 0 1 2 3 12 13 14 15)', 'words (vector-i64 0 1 2 3 11 13 14 15)'),
+    }),
+    'pqh': dict(files=dict(X25519, **{'sha3/core.kotoba': SHA3, 'mlkem/core.kotoba': 'lib/gov.nist.mlKem/kotoba/mlkem/core.kotoba',
+                                      'sha2/core.kotoba': 'lib/gov.nist.sha2/kotoba/sha2/core.kotoba',
+                                      'pqh/hybrid.kotoba': 'lib/kotoba.pqh/kotoba/pqh/hybrid.kotoba',
+                                      'pqh/native_gate.kotoba': 'lib/kotoba.pqh/kotoba/pqh/native_gate.kotoba'}),
+                gate_ns='pqh.native-gate', groups={'a': 7, 'b': 15, 'c': 15}, mutants={
+        'salt': ('pqh/hybrid.kotoba', '(vector-i64 101 116 122 104', '(vector-i64 100 116 122 104'),
+        'transcript': ('pqh/hybrid.kotoba', '(h/sha256 (cat (cat (cat eph-pub ct) rx-pub) r-ek))', '(h/sha256 (cat (cat eph-pub ct) rx-pub))'),
+        'lowcheck': ('pqh/hybrid.kotoba', '(if (not (x/contributory? ss-x)) (vector-i64)\n            (let [eph-pub',
+                     '(if false (vector-i64)\n            (let [eph-pub'),
+    }),
+}
+
+def module_files(spec, change=None):
+    files = {}
+    for name, path in spec['files'].items():
+        data = (ROOT / path).read_text()
+        if change and change[0] == name:
+            assert data.count(change[1]) == 1, (name, change)
+            data = data.replace(change[1], change[2])
+        files[name] = data.encode()
+    return files
+
+def module_results(gate, name, spec, label, files):
+    """Run every group (or the gate's own main) and return {group: result}."""
+    out = {}
+    if 'groups' not in spec:
+        try:
+            gate.run(label + '-run', gate.build(label, spec['entry'], files), spec['passing'])
+            out['main'] = spec['passing']
+        except AssertionError:
+            out['main'] = None
+        return out
+    for grp, expected in spec['groups'].items():
+        entry = f'pq/{name}_gate_{grp}.kotoba'
+        fs = dict(files)
+        fs[entry] = (f'(ns pq.{name}-gate-{grp} (:require [{spec["gate_ns"]} :as g]) (:export [main]))\n'
+                     f'(defn main [] :i64 (g/group-{grp}))\n').encode()
+        try:
+            gate.run(f'{label}-{grp}-run', gate.build(f'{label}-{grp}', entry, fs), expected)
+            out[grp] = expected
+        except AssertionError:
+            out[grp] = None
+    return out
 
 def strip_ns(text):
     return re.sub(r'^\(ns [^\n]*\n(?:[^\n]*\n)*?[^\n]*\)\)\n', '', text, count=1, flags=re.M)
@@ -156,6 +224,15 @@ def main():
                 detected = True
             results[name]['mutants'][label] = detected
             assert detected, (name, label, 'mutant passed the gate')
+    for name, spec in MODULE_GATES.items():
+        passing = module_results(gate, name, spec, name, module_files(spec))
+        assert None not in passing.values(), (name, passing)
+        results[name] = dict(passing=passing, mutants={})
+        for label, change in spec['mutants'].items():
+            got = module_results(gate, name, spec, f'{name}-{label}', module_files(spec, change))
+            detected = None in got.values()
+            results[name]['mutants'][label] = detected
+            assert detected, (name, label, 'mutant passed every group')
     gate.finish('PASS_PQ_NATIVE_GATES', gates=results)
 
 if __name__ == '__main__':
