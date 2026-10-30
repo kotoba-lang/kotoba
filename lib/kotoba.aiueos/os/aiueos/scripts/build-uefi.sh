@@ -1425,6 +1425,12 @@ kotoba_tls13_hs_object=${AIUEOS_KOTOBA_TLS13_HS_OBJECT:-"$aiueos/kotoba/tls13-hs
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_tls13_hs_object" \
   dc3ab407f374976fa80db11b70c5bab09881c4f6aa196b34c2f6b6647a3a1d1b \
   kotoba_aiueos_tls13_hs_step,kotoba_aiueos_tls13_record_step,kotoba_aiueos_tls13_inner_step
+# JUN-554: kernel/kototama_runtime.c's SSH management protocol (the three commands and their replies) is
+# kotoba/kototama-management.o (fuel 4194304); the C keeps the runtime state and the restart / reboot-pxe side effects.
+kotoba_kototama_management_object=${AIUEOS_KOTOBA_KOTOTAMA_MANAGEMENT_OBJECT:-"$aiueos/kotoba/kototama-management.o"}
+python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_kototama_management_object" \
+  c44ffea8731894914117d399a2ed0a8b603542586d450899a0d2891e3e747152 \
+  kotoba_aiueos_kototama_command,kotoba_aiueos_kototama_reply
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_bytes_object" \
   567551de001399c4706927cbffd474b53c15ea35e908945e51fd2176feca6c58 \
   kotoba_aiueos_bytes_copy,kotoba_aiueos_bytes_fill
@@ -1531,7 +1537,7 @@ zig ld.lld -nostdlib -static --strip-all $qualification_gc_link -z max-page-size
   "$kernel_acpi_object" "$kernel_vtd_object" "$kernel_apic_object" "$kernel_memory_object" \
   "$kernel_pci_object" "$kernel_rtl8125_object" \
   "$kernel_inference_status_object" \
-  $device_result_link $poll_sched_link $model_handoff_link "$kernel_kototama_runtime_object" \
+  $device_result_link $poll_sched_link $model_handoff_link "$kernel_kototama_runtime_object" "$kotoba_kototama_management_object" \
   "$kotoba_job_protocol_glue_object" \
   "$kotoba_tls_aes_object" "$kotoba_bytes_object" "$kotoba_tls13_keyschedule_object" "$kotoba_tls13_cert_object" "$kotoba_tls13_hello_object" "$kotoba_tls13_verify_object" "$kotoba_tls13_keys_object" "$kotoba_tls13_hs_object" "$kernel_tls13_object" \
   "$kernel_scheduler_object" "$kernel_syscall_object" \
