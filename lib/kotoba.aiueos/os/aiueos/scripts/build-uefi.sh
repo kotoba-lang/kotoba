@@ -1479,6 +1479,10 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_kototama_manag
 kotoba_acpi_dmar_object=${AIUEOS_KOTOBA_ACPI_DMAR_OBJECT:-"$aiueos/kotoba/acpi-dmar-parse.o"}
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_acpi_dmar_object" \
   458deaf9b52b345caaaeb1c4ee0ee58a72d2e94974de11a28f3a092fc8aae769 kotoba_aiueos_acpi_dmar_parse
+# JUN-552: pci.c's ARP request and ICMP echo builders are kotoba/arp-icmp-build.o (fuel 4194304).
+kotoba_arp_icmp_build_object=${AIUEOS_KOTOBA_ARP_ICMP_BUILD_OBJECT:-"$aiueos/kotoba/arp-icmp-build.o"}
+python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_arp_icmp_build_object" \
+  1fbb9918b1638382013f2c68e53a6b0b1ce0f920411567eec32d6b8e1c8cdc66 kotoba_aiueos_arp_request_build,kotoba_aiueos_icmp_echo_build
 # JUN-552: pci.c's UDP checksum sum (net_udp_checksum, net_udp_rx_checksum_ok) is kotoba/udp-checksum.o (fuel 4194304).
 kotoba_udp_checksum_object=${AIUEOS_KOTOBA_UDP_CHECKSUM_OBJECT:-"$aiueos/kotoba/udp-checksum.o"}
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_udp_checksum_object" \
@@ -1608,7 +1612,7 @@ zig ld.lld -nostdlib -static --strip-all $qualification_gc_link -z max-page-size
   $device_result_link $cpu_reads_link $ssh_userauth_link $poll_sched_link $model_handoff_link "$kernel_kototama_runtime_object" "$kotoba_kototama_management_object" \
   "$kotoba_job_protocol_glue_object" \
   "$kotoba_tls_aes_object" "$kotoba_bytes_object" "$kotoba_tls13_keyschedule_object" "$kotoba_tls13_cert_object" "$kotoba_tls13_hello_object" "$kotoba_tls13_verify_object" "$kotoba_tls13_keys_object" "$kotoba_tls13_hs_object" "$kernel_tls13_object" \
-  "$kernel_scheduler_object" "$kernel_syscall_object" \
+  "$kernel_scheduler_object" "$kernel_syscall_object" "$kotoba_arp_icmp_build_object" \
   "$kernel_process_object" "$kernel_loader_object" \
   "$kernel_smp_object" "$kernel_trampoline_object" \
   "$kernel_ioapic_object" "$kernel_framebuffer_object" $plc_runtime_link $qualification_link \
