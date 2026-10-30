@@ -14,6 +14,13 @@ extern uint64_t kotoba_aiueos_aes128_gcm(uint8_t *, uint64_t, uint8_t *,
                                          uint64_t, uint64_t);
 extern uint64_t kotoba_aiueos_tls13_record(uint8_t *, uint64_t, uint8_t *,
                                            uint64_t, uint64_t);
+/* HMAC-SHA256 and HKDF-Expand-Label are kotoba/tls13-keyschedule.kotoba (JUN-553): 1 is success, as below. */
+extern int64_t kotoba_aiueos_tls13_hmac(const uint8_t *, uint64_t, const uint8_t *, uint64_t, uint8_t *);
+extern int64_t kotoba_aiueos_tls13_hkdf_expand_label(const uint8_t *, uint64_t, const uint8_t *, uint64_t,
+                                                     const uint8_t *, uint64_t, uint8_t *, uint64_t);
+/* The certificate parsers are kotoba/tls13-cert.kotoba (JUN-553): 1 is success, as below. */
+extern int64_t kotoba_aiueos_tls13_find_p256_point(const uint8_t *, uint64_t, uint8_t *, uint64_t);
+extern int64_t kotoba_aiueos_tls13_parse_ecdsa_der(const uint8_t *, uint64_t, uint8_t *, uint64_t);
 
 #define TLS_TR_MAX 12288
 #define TLS_RX_MAX 12288
@@ -50,11 +57,11 @@ static int certverify_parsed;
 static uint16_t certverify_scheme;
 static uint8_t cv_rs[64];
 static uint8_t cv_digest[32];
-/* The four record/transcript buffers live in `.high_bss` (4..6 MiB), not
+/* The record/transcript buffers live in `.high_bss` (4..6 MiB), not
    `.bss`, since ADR-0221: the Kotoba objects grew the low 2 MiB past
    `aiueos_low_end`, and 61 KiB of TLS scratch was the cheapest thing to move.
-   `main.c` zeroes the section at entry, so they start zero as they did. */
-static uint8_t TLS_SCRATCH hmac_block[64 + TLS_TR_MAX];
+   `main.c` zeroes the section at entry, so they start zero as they did.
+   (The HMAC block is the key-schedule object's own .high_bss array now.) */
 
 static uint8_t TLS_SCRATCH transcript[TLS_TR_MAX];
 static uint32_t transcript_len;
@@ -248,28 +255,7 @@ static int sha256(const uint8_t *in, uint32_t n, uint8_t out[32]) {
 
 static int hmac_sha256(const uint8_t *key, uint32_t key_len,
                        const uint8_t *data, uint32_t data_len, uint8_t out[32]) {
-  uint8_t ipad[64], opad[64], inner[32];
-  uint32_t i;
-  uint8_t kh[32];
-  const uint8_t *k = key;
-  uint32_t klen = key_len;
-  if (64 + data_len > 12288) return 0;
-  if (klen > 64) {
-    if (!sha256(key, klen, kh)) return 0;
-    k = kh;
-    klen = 32;
-  }
-  for (i = 0; i < 64; i++) {
-    uint8_t b = (i < klen) ? k[i] : 0;
-    ipad[i] = (uint8_t)(b ^ 0x36);
-    opad[i] = (uint8_t)(b ^ 0x5c);
-  }
-  copy_bytes(hmac_block, ipad, 64);
-  copy_bytes(hmac_block + 64, data, data_len);
-  if (!sha256(hmac_block, 64 + data_len, inner)) return 0;
-  copy_bytes(hmac_block, opad, 64);
-  copy_bytes(hmac_block + 64, inner, 32);
-  return sha256(hmac_block, 96, out);
+  return kotoba_aiueos_tls13_hmac(key, key_len, data, data_len, out) == 1;
 }
 
 static int hkdf_extract(const uint8_t *salt, uint32_t salt_len,
@@ -285,25 +271,10 @@ static int hkdf_extract(const uint8_t *salt, uint32_t salt_len,
 static int hkdf_expand_label(const uint8_t *secret, const char *label,
                              const uint8_t *ctx, uint32_t ctx_len,
                              uint8_t *out, uint32_t out_len) {
-  uint8_t info[256], full[32];
-  uint32_t labellen = 0;
-  uint32_t i, infolen;
-  const char *prefix = "tls13 ";
-  while (prefix[labellen]) labellen++;
-  i = 0;
+  uint32_t i = 0;
   while (label[i]) i++;
-  if (6 + i + ctx_len + 4 > sizeof(info) || out_len > 32) return 0;
-  put16(info, (uint16_t)out_len);
-  info[2] = (uint8_t)(6 + i);
-  copy_bytes(info + 3, (const uint8_t *)prefix, 6);
-  copy_bytes(info + 9, (const uint8_t *)label, i);
-  info[9 + i] = (uint8_t)ctx_len;
-  if (ctx_len) copy_bytes(info + 10 + i, ctx, ctx_len);
-  infolen = 10 + i + ctx_len;
-  info[infolen] = 0x01;
-  if (!hmac_sha256(secret, 32, info, infolen + 1, full)) return 0;
-  copy_bytes(out, full, out_len);
-  return 1;
+  return kotoba_aiueos_tls13_hkdf_expand_label(secret, 32, (const uint8_t *)label, i,
+                                               ctx, ctx_len, out, out_len) == 1;
 }
 
 static int derive_secret(const uint8_t *secret, const char *label,
@@ -473,49 +444,12 @@ static int finish_check(const uint8_t *verify, uint32_t n) {
   return 1;
 }
 
-static const uint8_t p256_spki_prefix[27] = {
-  0x30,0x59,0x30,0x13,0x06,0x07,0x2a,0x86,0x48,0xce,0x3d,0x02,0x01,
-  0x06,0x08,0x2a,0x86,0x48,0xce,0x3d,0x03,0x01,0x07,0x03,0x42,0x00,0x04};
-
 static int find_p256_point(const uint8_t *p, uint32_t n, uint8_t out[64]) {
-  uint32_t i, j, hit;
-  if (n < 27 + 64) return 0;
-  for (i = 0; i + 27 + 64 <= n; i++) {
-    hit = 1;
-    for (j = 0; j < 27; j++) {
-      if (p[i + j] != p256_spki_prefix[j]) { hit = 0; break; }
-    }
-    if (hit) {
-      copy_bytes(out, p + i + 27, 64);
-      return 1;
-    }
-  }
-  return 0;
-}
-
-static int der_int_be32(const uint8_t *p, uint32_t n, uint32_t *used, uint8_t out[32]) {
-  uint32_t len, off, skip;
-  if (n < 2 || p[0] != 0x02) return 0;
-  len = p[1];
-  off = 2;
-  if ((len & 0x80) != 0 || len == 0 || off + len > n) return 0;
-  skip = 0;
-  while (skip + 1 < len && p[off + skip] == 0) skip++;
-  if (len - skip > 32) return 0;
-  zero_bytes(out, 32);
-  copy_bytes(out + (32 - (len - skip)), p + off + skip, len - skip);
-  *used = off + len;
-  return 1;
+  return kotoba_aiueos_tls13_find_p256_point(p, n, out, 64) == 1;
 }
 
 static int parse_ecdsa_der(const uint8_t *p, uint32_t n, uint8_t rs[64]) {
-  uint32_t used = 0, inner;
-  if (n < 8 || p[0] != 0x30) return 0;
-  if ((p[1] & 0x80) != 0 || 2u + p[1] != n) return 0;
-  if (!der_int_be32(p + 2, n - 2, &used, rs)) return 0;
-  inner = 2 + used;
-  if (!der_int_be32(p + inner, n - inner, &used, rs + 32)) return 0;
-  return inner + used == n;
+  return kotoba_aiueos_tls13_parse_ecdsa_der(p, n, rs, 64) == 1;
 }
 
 static int parse_certificate(const uint8_t *hs, uint32_t n) {
