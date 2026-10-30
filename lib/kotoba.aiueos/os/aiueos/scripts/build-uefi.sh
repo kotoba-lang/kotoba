@@ -1414,6 +1414,11 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_tls13_keys_obj
   88970f767f0ee68787f50fccb43beb695c3e453bdc35360f39ae943ad9e97a10 \
   kotoba_aiueos_tls13_hs_keys,kotoba_aiueos_tls13_ap_keys,kotoba_aiueos_tls13_finished_mac \
   kotoba_aiueos_sha256,kotoba_aiueos_tls13_hmac,kotoba_aiueos_tls13_hkdf_expand_label
+# JUN-553: kernel/rtl8125.c's two peer-bound ARP helpers are kotoba/rtl8125-arp.o (fuel 4194304) behind C wrappers.
+kotoba_rtl8125_arp_object=${AIUEOS_KOTOBA_RTL8125_ARP_OBJECT:-"$aiueos/kotoba/rtl8125-arp.o"}
+python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_rtl8125_arp_object" \
+  cb9e7c6c79589fbda96512cdd0c0b6e8457f1e9608e4b955a1f02130a9708b4c \
+  kotoba_aiueos_rtl8125_arp_request,kotoba_aiueos_rtl8125_arp_reply
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_bytes_object" \
   567551de001399c4706927cbffd474b53c15ea35e908945e51fd2176feca6c58 \
   kotoba_aiueos_bytes_copy,kotoba_aiueos_bytes_fill
@@ -1537,7 +1542,7 @@ zig ld.lld -nostdlib -static --strip-all $qualification_gc_link -z max-page-size
   "$kotoba_pci_config_read_object" "$kotoba_pci_config_write_object" \
   "$kotoba_rtl8125_identify_object" "$kotoba_rtl8125_link_up_object" \
   "$kotoba_rtl8125_ring_build_object" "$kotoba_rtl8125_program_object" \
-  "$kotoba_rtl8125_tx_submit_object" "$kotoba_rtl8125_rx_poll_object" \
+  "$kotoba_rtl8125_tx_submit_object" "$kotoba_rtl8125_rx_poll_object" "$kotoba_rtl8125_arp_object" \
   "$kotoba_x25519_object"   "$kotoba_ecdsa_object" $ecdsa_sign_link $ecdsa_public_link "$kotoba_ime_object" \
   "$kotoba_aes128_gcm_object" "$kotoba_tls13_record_object" \
   $qwen35_kotoba_link $qwen35_parity_link \
