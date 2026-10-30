@@ -687,7 +687,11 @@ if [ "${AIUEOS_QWEN38_MODEL_HANDOFF:-0}" = 1 ] ||
     kotoba_qwen35_select_object=${AIUEOS_KOTOBA_QWEN35_SELECT_OBJECT:-"$aiueos/kotoba/qwen35-select.o"}
     python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_qwen35_select_object" \
       89ca0d714a5370a50aec128440711c06ef3537027093874593471098b053ff39 kotoba_aiueos_qwen35_select
-    model_handoff_link="$kotoba_qwen35_select_object $kotoba_xstate_setup_object $kotoba_qwen35_row_bytes_object $kernel_model_handoff_object $kotoba_model_mapping_plan_object $kotoba_model_handoff_validate_object $kernel_qwen35_runtime_object $kernel_qwen35_quant_object $kernel_qwen35_infer_object $kotoba_qwen35_header_object $kotoba_qwen35_kv_object $kotoba_qwen35_tensor_object"
+    # JUN-554: the residual adds are kotoba/qwen35-residual.o in this image (amu ADR 0391's scalar SSE f32).
+    kotoba_qwen35_residual_object=${AIUEOS_KOTOBA_QWEN35_RESIDUAL_OBJECT:-"$aiueos/kotoba/qwen35-residual.o"}
+    python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_qwen35_residual_object" \
+      740aee75e3a779218c616a1bf6470645016f3977540999a6051df3457cffb1c5 kotoba_aiueos_qwen35_residual_add
+    model_handoff_link="$kotoba_qwen35_residual_object $kotoba_qwen35_select_object $kotoba_xstate_setup_object $kotoba_qwen35_row_bytes_object $kernel_model_handoff_object $kotoba_model_mapping_plan_object $kotoba_model_handoff_validate_object $kernel_qwen35_runtime_object $kernel_qwen35_quant_object $kernel_qwen35_infer_object $kotoba_qwen35_header_object $kotoba_qwen35_kv_object $kotoba_qwen35_tensor_object"
   fi
   if [ "${AIUEOS_MODEL_NVME_SLOTS:-0}" = 1 ]; then
     model_slots_cflags="-DAIUEOS_MODEL_NVME_SLOTS=1"
