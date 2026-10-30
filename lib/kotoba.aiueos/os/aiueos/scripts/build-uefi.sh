@@ -260,7 +260,11 @@ if [ "${AIUEOS_MURAKUMO_DEVICE_RESULT:-0}" = 1 ] || [ "${AIUEOS_GUEST_BROWSER:-0
   ecdsa_public_link="$kotoba_ecdsa_public_object"
 fi
 if [ "${AIUEOS_MURAKUMO_DEVICE_RESULT:-0}" = 1 ]; then
-  device_result_link="$kernel_device_result_object $kernel_device_worker_protocol_object $kotoba_device_worker_poll_object"
+  # JUN-554: device_result.c's did:key text is kotoba/p256-did.o.
+  kotoba_p256_did_object=${AIUEOS_KOTOBA_P256_DID_OBJECT:-"$aiueos/kotoba/p256-did.o"}
+  python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_p256_did_object" \
+    2685660e7286bdbe0be206ba3a521d36a5345eb2b3d15024bdf9e7a21896fd75 kotoba_aiueos_p256_did
+  device_result_link="$kernel_device_result_object $kernel_device_worker_protocol_object $kotoba_device_worker_poll_object $kotoba_p256_did_object"
 fi
 # JUN-35: the poll scheduler is referenced from main.c under
 # AIUEOS_PERSISTENT_BOOT (init/sequence/record) and from pci.c under
