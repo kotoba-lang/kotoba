@@ -322,6 +322,15 @@ A peer that sends a well-formed message 0 still costs the responder a full first
 (KEM encapsulation and an ML-DSA-65 signature) before XX reveals who the initiator is.
 The connection budget is what bounds that cost.
 
+**Retry after a lost reply.** For the claim, replica 2 votes durably on its first
+connection and then closes it without replying, as if the reply were lost. The coordinator
+sees no reply and opens a fresh session: a new handshake hash, sequence 0 again. It asks
+again, at most three times. `replica/vote` returns the same durable vote for the same
+descriptor, so a retry can never produce a second, different vote. The harness requires
+the dropped vote, the delivered vote and the coordinator's stored vote to be byte-identical,
+and the certificate is assembled from that vote (podman, Linux arm64: the second attempt
+answered 1).
+
 **Execute over a session.** The effect itself also travels over a session. The sink
 installs the certified fence. The coordinator then reserves a claim, and the claim's votes
 and commits are carried over sessions like the fence's. Finally the coordinator sends the
@@ -348,7 +357,7 @@ The keys in the driver are fixed public test values; a deployment takes ephemera
 KEM randomness from the host's entropy provider and identities from the roster. The CI
 arm64 lane runs it.
 
-Not yet: retries, backpressure, per-peer (rather than per-listener) budgets, reclaiming a
+Not yet: backoff and retry of commit and execute, backpressure, per-peer (rather than per-listener) budgets, reclaiming a
 listener's memory between connections, and separate hosts.
 
 ## Verification and scope

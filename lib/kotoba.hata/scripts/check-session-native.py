@@ -200,8 +200,13 @@ def main():
     for name in ['request', 'certificate']:
         (sink / name).unlink()
     run('reserve-claim', broker, ['reserve', str(coordinator), ''], 1)
-    for i in range(3):
+    for i in range(2):
         exchange(f'claim-vote-{i}', 'ask-vote', i, 47250 + i, 1, 1)
+    # replica 2's first reply is lost after its vote is durable: the coordinator retries in
+    # a fresh session and receives the very same vote, which the certificate then uses
+    exchange('claim-vote-2-retried', 'ask-vote-retry', 2, 47252, 1, 1, serve='serve-drop-then-vote')
+    dropped, delivered = (gate.out / 'node2' / 'response-dropped').read_bytes(), (gate.out / 'node2' / 'response').read_bytes()
+    assert dropped == delivered == (coordinator / 'vote2').read_bytes(), 'a retry produced another vote'
     run('claim-certificate-from-session-votes', broker, ['certificate', str(coordinator), ''], 1)
     for i in range(3):
         exchange(f'claim-commit-attest-{i}', 'ask-commit-attest', i, 47260 + i, 1, 1, serve='serve-commit-attest')
@@ -225,7 +230,7 @@ def main():
     execute('execute-over-session', 'ask-execute', 47271, 1)
     execute('execute-duplicate-no-second-effect', 'ask-execute', 47272, 2)
     run('object-after-session-execute', broker, ['object', str(sink), ''], 1)
-    gate.finish('PASS_NATIVE_BROKER_SESSIONS', replicas=3, controls=6, effects=1)
+    gate.finish('PASS_NATIVE_BROKER_SESSIONS', replicas=3, controls=6, effects=1, retries=1)
 
 if __name__ == '__main__':
     main()
