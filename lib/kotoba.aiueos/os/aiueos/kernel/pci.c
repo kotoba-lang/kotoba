@@ -5462,16 +5462,19 @@ static int rtl8125_qualify_device(uint8_t b,uint8_t d,uint8_t f) {
   return 0;
 }
 
+/* JUN-598: the enumeration decisions (kotoba/pci-enum.o), shared by this scan and aiueos_virtio_probe. */
+extern int64_t kotoba_aiueos_pci_present(int64_t id); extern int64_t kotoba_aiueos_pci_functions(int64_t header);
+extern int64_t kotoba_aiueos_virtio_driver(int64_t id); extern int64_t kotoba_aiueos_pci_rtl8125(int64_t id);
+extern int64_t kotoba_aiueos_virtio_probe_result(int64_t rng, int64_t blk, int64_t input, int64_t gpu, int64_t present, int64_t virtio);
 int aiueos_rtl8125_physical_qualification(void) {
   rtl8125_qualification_error=1;
   rtl8125_qualification_rx_length=0;
   for(uint16_t bus=0;bus<256;bus++)for(uint8_t dev=0;dev<32;dev++) {
-    uint32_t id0=config_read((uint8_t)bus,dev,0,0);
-    if((id0&0xffffU)==0xffffU)continue;
-    uint8_t functions=(config8((uint8_t)bus,dev,0,0x0e)&0x80)?8:1;
+    if(!kotoba_aiueos_pci_present(config_read((uint8_t)bus,dev,0,0)))continue;
+    uint8_t functions=(uint8_t)kotoba_aiueos_pci_functions(config8((uint8_t)bus,dev,0,0x0e));
     for(uint8_t fn=0;fn<functions;fn++) {
       uint32_t id=config_read((uint8_t)bus,dev,fn,0);
-      if((id&0xffffU)==0x10ecU&&(id>>16)==0x8125U&&
+      if(kotoba_aiueos_pci_rtl8125(id)&&
          rtl8125_qualify_device((uint8_t)bus,dev,fn))return 1;
     }
   }
@@ -6745,41 +6748,34 @@ int aiueos_pci_enumerate(void) {
   virtio_input_devices_seen = 0;
   virtio_input_fail_line = 0;
   virtio_input_fail_reason = 0;
+  /* JUN-598: which functions exist, how many a device has, which virtio driver
+     an ID selects and the result cascade are kotoba/pci-enum.o; the scan, the
+     reads and the driver calls stay here. */
   for (uint16_t bus = 0; bus < 256; bus++) for (uint8_t dev = 0; dev < 32; dev++) {
-    uint32_t id0 = config_read((uint8_t)bus,dev,0,0);
-    if ((id0 & 0xffffU) == 0xffffU) continue;
-    uint8_t functions = (config8((uint8_t)bus,dev,0,0x0e) & 0x80) ? 8 : 1;
+    if (!kotoba_aiueos_pci_present(config_read((uint8_t)bus,dev,0,0))) continue;
+    uint8_t functions = (uint8_t)kotoba_aiueos_pci_functions(config8((uint8_t)bus,dev,0,0x0e));
     for (uint8_t fn = 0; fn < functions; fn++) {
       uint32_t id = config_read((uint8_t)bus,dev,fn,0);
-      if ((id & 0xffffU) == 0xffffU) continue; present++;
-      if ((id & 0xffffU) == VIRTIO_VENDOR_ID) {
-        virtio++;
-        uint16_t device_id = (uint16_t)(id >> 16);
-        if ((device_id == VIRTIO_RNG_MODERN_ID || device_id == VIRTIO_RNG_TRANSITIONAL_ID) &&
-            virtio_rng((uint8_t)bus,dev,fn)) rng_ok = 1;
-        if ((device_id == VIRTIO_BLK_MODERN_ID || device_id == VIRTIO_BLK_TRANSITIONAL_ID) &&
-            virtio_blk((uint8_t)bus,dev,fn)) blk_ok = 1;
-        if (device_id == VIRTIO_INPUT_MODERN_ID || device_id == VIRTIO_INPUT_TRANSITIONAL_ID) {
-          virtio_input_devices_seen++;
-          if (virtio_input((uint8_t)bus,dev,fn)) input_ok = 1;
-        }
-        if ((device_id == VIRTIO_GPU_MODERN_ID || device_id == VIRTIO_GPU_TRANSITIONAL_ID) &&
-            virtio_gpu((uint8_t)bus,dev,fn)) gpu_ok = 1;
-        /* Reported through `aiueos_virtio_net_ready` rather than the return
-           cascade below, which main.c reads bit by bit: a NIC is optional, and
-           folding it into that cascade would make every existing gate that
-           boots without one start failing. */
-        if (device_id == VIRTIO_NET_MODERN_ID || device_id == VIRTIO_NET_TRANSITIONAL_ID)
-          virtio_net((uint8_t)bus,dev,fn);
-#ifdef AIUEOS_AUDIO
-        if (device_id == VIRTIO_SND_MODERN_ID) (void)virtio_sound((uint8_t)bus,dev,fn);
-#endif
+      if (!kotoba_aiueos_pci_present(id)) continue; present++;
+      int64_t driver = kotoba_aiueos_virtio_driver(id);
+      if (!driver) continue;
+      virtio++;
+      if (driver == 2 && virtio_rng((uint8_t)bus,dev,fn)) rng_ok = 1;
+      if (driver == 3 && virtio_blk((uint8_t)bus,dev,fn)) blk_ok = 1;
+      if (driver == 4) {
+        virtio_input_devices_seen++;
+        if (virtio_input((uint8_t)bus,dev,fn)) input_ok = 1;
       }
+      if (driver == 5 && virtio_gpu((uint8_t)bus,dev,fn)) gpu_ok = 1;
+      /* Reported through `aiueos_virtio_net_ready` rather than the return
+         cascade below, which main.c reads bit by bit: a NIC is optional, and
+         folding it into that cascade would make every existing gate that
+         boots without one start failing. */
+      if (driver == 6) virtio_net((uint8_t)bus,dev,fn);
+#ifdef AIUEOS_AUDIO
+      if (driver == 7) (void)virtio_sound((uint8_t)bus,dev,fn);
+#endif
     }
   }
-  if (rng_ok && blk_ok && input_ok && gpu_ok) return 15;
-  if (rng_ok && blk_ok && input_ok) return 7;
-  if (rng_ok && blk_ok) return 3;
-  if (rng_ok) return 2;
-  return present && virtio ? 1 : 0;
+  return (int)kotoba_aiueos_virtio_probe_result(rng_ok, blk_ok, input_ok, gpu_ok, present, virtio);
 }

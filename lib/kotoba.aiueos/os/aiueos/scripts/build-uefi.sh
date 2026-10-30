@@ -899,6 +899,11 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_virtio_caps_ob
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_extent_valid_object" \
   cfde40e55fc8e52d6100183e2e4a7eecd60120be95f9c04234714ad041916ec4 \
   kotoba_aiueos_pci_extent_valid
+# JUN-598: pci.c's enumeration decisions (presence, function count, virtio dispatch, result cascade, the RTL8125 ID)
+# are kotoba/pci-enum.o (fuel 4194304).
+kotoba_pci_enum_object=${AIUEOS_KOTOBA_PCI_ENUM_OBJECT:-"$aiueos/kotoba/pci-enum.o"}
+python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_pci_enum_object" \
+  82a70ee164b0130e1bc6494ea426e2f85a11363e173d7cc172cd49f88cadfc4c kotoba_aiueos_pci_present,kotoba_aiueos_pci_functions,kotoba_aiueos_virtio_driver,kotoba_aiueos_virtio_probe_result,kotoba_aiueos_pci_rtl8125
 # JUN-598: pci.c's virtio feature negotiation (negotiate) is kotoba/virtio-negotiate.o (fuel 4194304).
 kotoba_virtio_negotiate_object=${AIUEOS_KOTOBA_VIRTIO_NEGOTIATE_OBJECT:-"$aiueos/kotoba/virtio-negotiate.o"}
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_virtio_negotiate_object" \
@@ -1646,7 +1651,7 @@ zig ld.lld -nostdlib -static --strip-all $qualification_gc_link -z max-page-size
   "$kotoba_mutable_build_object" "$kotoba_cap_valid_object" \
   "$kotoba_extent_valid_object" "$kotoba_region_valid_object" "$kotoba_virtio_caps_object" \
   "$kotoba_pci_config_read_object" "$kotoba_pci_config_write_object" "$kotoba_pci_bar_object" \
-  "$kotoba_rtl8125_identify_object" "$kotoba_rtl8125_link_up_object" \
+  "$kotoba_rtl8125_identify_object" "$kotoba_rtl8125_link_up_object" "$kotoba_pci_enum_object" \
   "$kotoba_rtl8125_ring_build_object" "$kotoba_rtl8125_program_object" \
   "$kotoba_rtl8125_tx_submit_object" "$kotoba_rtl8125_rx_poll_object" "$kotoba_rtl8125_arp_object" "$kotoba_virtio_negotiate_object" \
   "$kotoba_x25519_object"   "$kotoba_ecdsa_object" $ecdsa_sign_link $ecdsa_public_link "$kotoba_ime_object" \
