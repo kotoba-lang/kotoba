@@ -111,8 +111,10 @@ Measured 2026-10-30 on Apple M1 Max with the Amu Mac root of main `91faa123`
 | ctl-dkcheck | dk check compares H(ek) with itself | 55 |
 
 Not yet: the remaining ACVP cases run natively (the `.cljk` suite runs all of them),
-an x86_64 run, and an Amu CI job for this gate.
+and an x86_64 run. The gate runs in CI on Linux arm64 (`scripts/check-pq-native.py`,
+since kotoba#1014).
 
+## Non-claims
 
 - **Not constant time.** Persistent vectors, data-dependent allocation and rejection
   sampling make no timing guarantee. The branch-free key selection in `decaps` is

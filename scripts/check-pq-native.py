@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run the native post-quantum and secure-channel known-answer gates and their mutants
 (JUN-352 P1b: SHA-3, ML-KEM-768, ML-DSA-65; AWAI-117: X25519, ChaCha20-Poly1305 and
-XChaCha20-Poly1305, the pqh-v1 hybrid KEM; JUN-352: AES and AES-GCM).
+XChaCha20-Poly1305, the pqh-v1 hybrid KEM; JUN-352: AES and AES-GCM; AWAI-102: X-Wing and Noise).
 
 Each gate is one unity source: the library bodies with their `ns` forms removed, the
 `sha3/` alias dropped, then the gate body. The gate's main returns a bitmask; a pass is
@@ -70,6 +70,23 @@ MODULE_GATES = {
         'tagcmp': ('chacha20/aead.kotoba', '(if (= differ 0) (c/xor-stream key 1 nonce ct) (vector-i64 -1))', '(c/xor-stream key 1 nonce ct)'),
         'hround': ('chacha20/core.kotoba', 'words (vector-i64 0 1 2 3 12 13 14 15)', 'words (vector-i64 0 1 2 3 11 13 14 15)'),
     }),
+    'xwing': dict(files=dict(X25519, **{'sha3/core.kotoba': SHA3, 'mlkem/core.kotoba': 'lib/gov.nist.mlKem/kotoba/mlkem/core.kotoba',
+                                        'xwing/core.kotoba': 'lib/org.ietf.xwing/kotoba/xwing/core.kotoba',
+                                        'xwing/native_gate.kotoba': 'lib/org.ietf.xwing/kotoba/xwing/native_gate.kotoba'}),
+                  gate_ns='xwing.native-gate', groups={'a': 7, 'b': 7, 'c': 63}, mutants={
+        'label': ('xwing/core.kotoba', '(vector-i64 92 46 47 47 94 92)', '(vector-i64 92 46 47 47 94 93)'),
+        'order': ('xwing/core.kotoba', '(cat (cat (cat (cat ss-m ss-x) ct-x) pk-x) (label))', '(cat (cat (cat (cat ss-x ss-m) ct-x) pk-x) (label))'),
+        'eseed': ('xwing/core.kotoba', 'ek-x (slice eseed 32 32)', 'ek-x (slice eseed 0 32)'),
+    }),
+    'noise': dict(files=dict(X25519, **CHACHA, **{'sha2/core.kotoba': 'lib/gov.nist.sha2/kotoba/sha2/core.kotoba',
+                                                  'noise/native.kotoba': 'lib/kotoba.noise/kotoba/noise/native.kotoba',
+                                                  'noise/native_gate.kotoba': 'lib/kotoba.noise/kotoba/noise/native_gate.kotoba'}),
+                  gate_ns='noise.native-gate', groups={g: 31 for g in ['nn-i', 'nn-r', 'xx-i', 'xx-r', 'ik-i', 'ik-r']}, mutants={
+        'hkdf': ('noise/native.kotoba', '(h/hmac-sha256 temp (cat o1 (vector-i64 2)))', '(h/hmac-sha256 temp (cat o1 (vector-i64 3)))'),
+        'esse': ('noise/native.kotoba', '(= token 4) (if init (x/x25519-bytes e rs) (x/x25519-bytes s re))',
+                 '(= token 4) (if init (x/x25519-bytes s re) (x/x25519-bytes e rs))'),
+        'premsg': ('noise/native.kotoba', '(if (= pattern 2) (mix-hash st5', '(if false (mix-hash st5'),
+    }),
     'aes': dict(files={f'aes/{n}.kotoba': f'lib/gov.nist.aes/kotoba/aes/{n}.kotoba' for n in ['core', 'gcm', 'native_gate']},
                 gate_ns='aes.native-gate', groups={'a': 15, 'b': 7, 'c': 7}, mutants={
         'sbox': ('aes/core.kotoba', '(vector-i64 99 124 119 123', '(vector-i64 99 124 119 122'),
@@ -113,7 +130,7 @@ def module_results(gate, name, spec, label, files):
             out['main'] = None
         return out
     for grp, expected in spec['groups'].items():
-        entry = f'pq/{name}_gate_{grp}.kotoba'
+        entry = f'pq/{name}_gate_{grp.replace("-", "_")}.kotoba'
         fs = dict(files)
         fs[entry] = (f'(ns pq.{name}-gate-{grp} (:require [{spec["gate_ns"]} :as g]) (:export [main]))\n'
                      f'(defn main [] :i64 (g/group-{grp}))\n').encode()
