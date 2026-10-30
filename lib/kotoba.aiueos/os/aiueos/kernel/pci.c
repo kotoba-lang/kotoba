@@ -853,12 +853,12 @@ int aiueos_uhci_probe(void) {
         for (volatile int spin = 0; spin < 100000; spin++) { }
         out16(uhci_iobase + 0x00, 0x0000);      /* stopped */
         out16(uhci_iobase + 0x04, 0x003f);      /* USBSTS: clear all */
-        /* count the ports from PORTSC1/2 (offsets 0x10/0x12) */
+        /* count the ports from PORTSC1/2 (offsets 0x10/0x12): a port's reserved bit 7 reads 1, and a bus with nothing there reads 0xffff (JUN-598: this was ||, which counted every value) */
         uint16_t p1 = in16(uhci_iobase + 0x10);
         uint16_t p2 = in16(uhci_iobase + 0x12);
         uhci_ports = 0;
-        if ((p1 & 0x0080u) || (p1 != 0xffffu)) uhci_ports++;
-        if ((p2 & 0x0080u) || (p2 != 0xffffu)) uhci_ports++;
+        if ((p1 & 0x0080u) && (p1 != 0xffffu)) uhci_ports++;
+        if ((p2 & 0x0080u) && (p2 != 0xffffu)) uhci_ports++;
         if (uhci_ports) return 1;
       }
     }
