@@ -296,7 +296,7 @@ static uint64_t user_object_value[2];
 static uint8_t user_object_ready,user_object_write_evidence,user_object_replay_evidence;
 static volatile uint64_t user_object_pending[2];
 extern uint64_t kotoba_aiueos_journal_plan(uint64_t valid0, uint64_t sequence0,
-                                           uint64_t valid1, uint64_t sequence1);
+                                           uint64_t valid1, uint64_t sequence1); extern uint64_t kotoba_aiueos_blk_wait(uint64_t used, uint64_t used_length, uint64_t counter, uint64_t counter_length, uint64_t target, uint64_t msix, uint64_t start, uint64_t rounds);
 volatile uint64_t aiueos_virtio_blk_irq_count;
 static int blk_msix_active;
 /* Recorded when the completion wait proves futile rather than merely slow.
@@ -484,15 +484,17 @@ static int virtio_blk_sector_io_ex(struct virtio_blk_request *request, uint8_t *
   desc[1].flags = VIRTQ_DESC_F_NEXT | (type == VIRTIO_BLK_T_IN ? VIRTQ_DESC_F_WRITE : 0);
   avail->ring[old & 3] = 0; __asm__ volatile("" ::: "memory");
   avail->index = target; *doorbell = 0;
-  for (uint32_t budget = 0; budget < 100000000U; budget++) {
-    __asm__ volatile("" ::: "memory");
-    if ((!blk_msix_active || aiueos_virtio_blk_irq_count >= target) && used->index == target) {
+  for (uint32_t budget = 0, got; budget < 100000000U; budget += 65536U) {
+    got = (uint32_t)kotoba_aiueos_blk_wait((uint64_t)(uintptr_t)used, 4096,
+        (uint64_t)(uintptr_t)&aiueos_virtio_blk_irq_count, 8, target, blk_msix_active != 0, budget,
+        100000000U - budget < 65536U ? 100000000U - budget : 65536U);
+    if ((got & 3U) == 1U) {
       struct virtq_used_element *completion = &used->ring[old & 3];
       uint32_t expected = type == VIRTIO_BLK_T_IN ? 513 : 1;
       if (completion->id != 0 || completion->length != expected || *status != VIRTIO_BLK_S_OK)
         return 0;
-      if (budget >= blk_slowest_iters) {
-        blk_slowest_iters = budget; blk_slow_used = used->index;
+      if ((got >> 2) >= blk_slowest_iters) {
+        blk_slowest_iters = got >> 2; blk_slow_used = used->index;
         blk_slow_target = target;
       }
       *submitted = target;
@@ -500,17 +502,15 @@ static int virtio_blk_sector_io_ex(struct virtio_blk_request *request, uint8_t *
         aiueos_storage_unwrap_sector(sector, disk_sector);
       return 1;
     }
-    /* Futile, not slow: the used index has passed the value this wait is
-       looking for, so no future completion can make the equality true. Fail
-       now with the numbers instead of spinning until the harness times out. */
-    if (used->index != target &&
-        (uint16_t)(used->index - target) < 0x8000) {
-      blk_wait_used = used->index; blk_wait_target = target;
+    /* Futile, not slow: kotoba_aiueos_blk_wait (kotoba/blk-wait.o) saw the used index pass
+       the value this wait is looking for, so no future completion can make the equality
+       true. Fail now with the numbers instead of spinning until the harness times out. */
+    if ((got & 3U) == 2U) {
+      blk_wait_used = (uint16_t)(got >> 2); blk_wait_target = target;
       blk_wait_irq = aiueos_virtio_blk_irq_count; blk_wait_overshot = 1;
       return 0;
     }
-    if (blk_msix_active) __asm__ volatile("sti; hlt; cli" ::: "memory");
-    else __asm__ volatile("pause");
+    if (got != 3U) return 0;
   }
   return 0;
 }

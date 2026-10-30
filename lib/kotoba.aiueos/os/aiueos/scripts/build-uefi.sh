@@ -900,6 +900,11 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_virtio_queue_o
 kotoba_virtq_wait_object=${AIUEOS_KOTOBA_VIRTQ_WAIT_OBJECT:-"$aiueos/kotoba/virtq-wait.o"}
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_virtq_wait_object" \
   9281b05c87fb3e604ea10bad5d40368239cf1e65425213f6f49ffa386a42aaad kotoba_aiueos_virtq_wait
+# JUN-598: the block driver's completion wait (virtio_blk_sector_io_ex) is kotoba/blk-wait.o (fuel 4194304), over amu
+# ADR 0392's kernel-wait-interrupt (MSI-X) and ADR 0393's kernel-pause (polled).
+kotoba_blk_wait_object=${AIUEOS_KOTOBA_BLK_WAIT_OBJECT:-"$aiueos/kotoba/blk-wait.o"}
+python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_blk_wait_object" \
+  b61dd6150712b072095b9602a55d526f32855f409767690528cc23366af118fa kotoba_aiueos_blk_wait
 # JUN-598: the split-virtqueue ring operations (descriptor + available-ring post, used-ring reads) are
 # kotoba/virtq-ring.o (fuel 4194304); virtio_rng and rng_refill use them first.
 kotoba_virtq_ring_object=${AIUEOS_KOTOBA_VIRTQ_RING_OBJECT:-"$aiueos/kotoba/virtq-ring.o"}
@@ -1676,7 +1681,7 @@ zig ld.lld -nostdlib -static --strip-all $qualification_gc_link -z max-page-size
   "$kotoba_device_worker_digest_object" "$kotoba_http_head_object" \
   "$kotoba_wm_object" "$kotoba_scanout_object" "$kotoba_broker_object" "$kotoba_session_object" \
   "$kotoba_browser_frame_object" "$kotoba_browser_reduce_object" "$kotoba_browser_frame2_object" "$kotoba_browser_ime_object" \
-  "$kotoba_browser_damage_object" \
+  "$kotoba_browser_damage_object" "$kotoba_blk_wait_object" \
   "$kotoba_mmio_map_admit_object" \
   "$kotoba_acpi_checksum_object" "$kotoba_acpi_table_valid_object" \
   "$kotoba_relay_hello_object" "$kotoba_relay_ack_object" \
