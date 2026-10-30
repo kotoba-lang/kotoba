@@ -1152,7 +1152,7 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_aes128_gcm_obj
 # object above, even in profiles that do not link them: the digests are what
 # ties the committed artifacts to the sources the oracles graded.
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_qwen35_header_object" \
-  b2e466eebabfdae8aaad8741b552ddeed0033c8814756b0409e59026fa8f72ec \
+  44018b876a97e9035df50d618a91a2f2d5d2439363a5c7b326a9c56b6d565b05 \
   kotoba_aiueos_qwen35_gguf_header_valid
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_qwen35_kv_object" \
   58df1be50a53c63332969963fa580e07101c6045f225367fb8a68de8ebbd5297 \
