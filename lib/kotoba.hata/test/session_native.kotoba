@@ -21,6 +21,8 @@
 ;;   serve-drop-then-vote BASE ADDR INDEX / ask-vote-retry BASE ADDR INDEX : the first reply
 ;;       is lost after the vote is durable; the coordinator retries in a fresh session and
 ;;       gets the same vote
+;;   serve-roster BASE ADDR INDEX CONNS / ask-as-9 / ask-as-8 / ask-pipelined-8 ... : per-peer
+;;       budgets (one served request per authenticated coordinator) and one request in flight
 ;;   serve-execute BASE ADDR / ask-execute BASE ADDR : the coordinator sends a certified,
 ;;       reserved claim's entry, certificate and command with the effect body to the sink
 ;;       (role 5), which runs hata.broker/execute on exactly the bytes it received
@@ -143,6 +145,75 @@
               (if (= (vector-count st) 0)
                 (let [z (t/close s)] (recur (+ spent 1)))
                 (vote-on base s st index)))))))))
+
+;; --- per-peer budgets and backpressure --------------------------------------------
+;; serve-roster: the listener accepts any coordinator on its roster (roles 9 and 8) and learns
+;; which one completed the handshake. Each authenticated peer is served at most once in the
+;; listener's lifetime: a second session from the same peer is closed before its request is
+;; read (-71). One request is in flight per session: if a second frame is already waiting when
+;; the first request has been read, the peer is pipelining and the session is closed unanswered
+;; (-72). The listener handles CONNS connections and writes their outcomes to BASE/outcomes.
+(defn- roster-peer [payload :vector-i64 h2 :vector-i64] :i64
+  (cond (id/verify-payload payload h2 (want 9)) 9 (id/verify-payload payload h2 (want 8)) 8 :else -1))
+(defn- respond-roster [h :string me :i64 ms :i64 f0 :vector-i64] :vector-i64
+  ;; the responder handshake against the roster; the state followed by the peer's role, or empty
+  (let [r0 (n/set-kem (n/initialize 3 false (x-static me) (x-eph me) (vector-i64) (prologue)) (vector-i64) (pat 32 (+ 200 me)))
+        q0 (n/read-message r0 f0)]
+    (if (bad? q0) (vector-i64)
+      (let [t1 (n/write-tokens (hd q0))
+            o1 (n/write-payload (hd t1) (tl t1) (id/payload (ed-seed me) (dsa-xi me) (n/handshake-hash-now (hd t1))))]
+        (if (or (bad? o1) (< (t/send-frame h (tl o1)) 0)) (vector-i64)
+          (let [u2 (n/read-tokens (hd o1) (t/recv-frame h ms))]
+            (if (bad? u2) (vector-i64)
+              (let [h2 (n/handshake-hash-now (hd u2)) v2 (n/read-payload (hd u2) (tl u2))
+                    peer (if (bad? v2) -1 (roster-peer (tl v2) h2))]
+                (if (< peer 0) (vector-i64) (cat (hd v2) (vector-i64 peer)))))))))))
+(defn- serve-one [base :string s :string st :vector-i64 index :i64] :i64
+  ;; one request on an authenticated session, refused when a second one is already waiting
+  (let [d (n/transport-decrypt st (t/recv-frame s 20000))
+        request (if (bad? d) (vector-i64 -1) (w/open-request (tl d) 1 (n/handshake-hash st) 0))]
+    (if (or (bad? d) (bad? request)) -22
+      (if (not (bad? (t/recv-frame s 2000))) -72
+        (let [vote (replica/vote base (qf/config) (c/append (vector-i64 index) (qf/seed index)) (bytes-words request))
+              e (n/transport-encrypt (hd d) (w/seal 2 (w/request-id (n/handshake-hash st) 0 request) (words-bytes vote)))]
+          (if (or (= (vector-count vote) 0) (bad? e) (< (t/send-frame s (tl e)) 0)) -24 (vector-at vote 0)))))))
+(defn- serve-roster [base :string addr :string index :i64 conns :i64] :i64
+  (let [l (t/listen addr)]
+    (loop [k 0 served9 0 served8 0 outcomes (vector-i64)]
+      (if (>= k conns) (if (write base "outcomes" outcomes) 1 -73)
+        (let [s (t/accept l 20000)]
+          (if (no-handle? s) (if (write base "outcomes" outcomes) -61 -73)
+            ;; everything one connection allocates lives in an arena scope released when it returns;
+            ;; only the encoded result (peer * 100000 + outcome + 1000) leaves it
+            (let [code (arena-scope
+                         (let [f0 (t/recv-frame s 10000)
+                               r (if (= (vector-count f0) (xxhfs-message-0-bytes)) (respond-roster s index 10000 f0) (vector-i64))
+                               p (if (= (vector-count r) 0) -1 (vector-at r (n/state-size)))
+                               o (cond (< p 0) 0
+                                       (>= (if (= p 9) served9 served8) 1) -71
+                                       :else (serve-one base s (hd r) index))]
+                           (+ (* (if (< p 0) 0 p) 100000) (+ o 1000))))
+                  peer (let [q (quot code 100000)] (if (= q 0) -1 q))
+                  outcome (- (rem code 100000) 1000)
+                  z (t/close s)]
+              (recur (+ k 1) (if (and (= peer 9) (> outcome 0)) (+ served9 1) served9)
+                     (if (and (= peer 8) (> outcome 0)) (+ served8 1) served8)
+                     (vector-conj outcomes outcome)))))))))
+
+;; a coordinator of role ME asks for a vote; PIPELINE sends the next request before the answer
+(defn- ask-as [base :string addr :string index :i64 me :i64 pipeline :bool] :i64
+  (let [c (t/dial addr 20000) st (if (no-handle? c) (vector-i64) (initiate c me index)) request (words-bytes (read base "request"))]
+    (if (= (vector-count st) 0) -31
+      (let [rid (w/request-id (n/handshake-hash st) 0 request)
+            e (n/transport-encrypt st (w/seal 1 rid request))
+            e2 (if (or (not pipeline) (bad? e)) e (n/transport-encrypt (hd e) (w/seal 1 (w/request-id (n/handshake-hash st) 1 request) request)))]
+        ;; both envelopes exist before the first is sent, so a pipelining peer's second frame really
+        ;; is waiting when the first request has been read
+        (if (or (bad? e) (bad? e2) (< (t/send-frame c (tl e)) 0) (and pipeline (< (t/send-frame c (tl e2)) 0))) -32
+          (let [d (n/transport-decrypt (hd e2) (t/recv-frame c 20000))]
+            (if (bad? d) -33
+              (let [vote (w/open (tl d) 2 rid)]
+                (if (bad? vote) -34 (vector-at (bytes-words vote) 0))))))))))
 
 (defn- ask [base :string addr :string index :i64 expect :i64 seq :i64] :i64
   (let [c (t/dial addr 20000) st (initiate c 9 expect) request (words-bytes (read base "request"))]
@@ -326,6 +397,11 @@
           (= mode "ask-replay") (ask base addr index index 1)
           (= mode "serve-guarded") (let [b (typed-cap-call :cli/args :string :string "4")]
                                      (serve-guarded base addr index (cond (= b "2") 2 (= b "3") 3 (= b "4") 4 :else 5)))
+          (= mode "serve-roster") (let [b (typed-cap-call :cli/args :string :string "4")]
+                                    (serve-roster base addr index (cond (= b "1") 1 (= b "2") 2 (= b "3") 3 :else 4)))
+          (= mode "ask-as-9") (ask-as base addr index 9 false)
+          (= mode "ask-as-8") (ask-as base addr index 8 false)
+          (= mode "ask-pipelined-8") (ask-as base addr index 8 true)
           (= mode "serve-execute") (serve-execute base addr)
           (= mode "ask-execute") (ask-execute base addr false)
           (= mode "ask-execute-tampered") (ask-execute base addr true)
