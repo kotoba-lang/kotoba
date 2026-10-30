@@ -15,10 +15,15 @@
   ;; from native.rtl8125: TxPoll is 0x38 (u8, NPQ 0x40), IntrMask/IntrStatus
   ;; are 0x3C/0x3E (u16), and the descriptor base is written under a
   ;; Cfg9346 (0x50) unlock. Descriptor format and TxConfig are shared.
-  ;; DMA uses owned window slot 10 (TX descriptor page + frame page); the
-  ;; desktop graph uses no owned window.
+  ;; DMA uses owned window slot 10: TX descriptor page (0), TX frame page
+  ;; (4096), RX descriptor page (8192) and RX buffer page (12288); the desktop
+  ;; graph uses no owned window.
+  ;;
+  ;; Stage 3 (AWAI-119): one RX descriptor, polled from the debug desktop loop
+  ;; (native/remote_cmd.kotoba decides what a received frame may do), and
+  ;; `shot`, which sends the framebuffer to UDP 7797 in 200-pixel chunks.
   (:require [capability.dma.map :as dma])
-  (:export [start log]))
+  (:export [start log rx-length rx-byte rx-release send-frame link-info shot]))
 
 (defn pci-address [bus offset]
   (bit-or 2147483648 (bit-or (* bus 65536) (bit-and offset 252))))
@@ -102,6 +107,25 @@
       (kernel-store-u32 mmio 512 64 50333440)
       1))
 
+;; RX: one descriptor at window 8192 (EOR, a 1536-byte buffer at 12288).
+;; RDSAR is 0xE4/0xE8 (under the Cfg9346 unlock), RxMaxSize 0xDA, RxConfig
+;; 0x44 = RX128_INT_EN | RX_MULTI_EN | RX_DMA_BURST | RX_EARLY_OFF (r8169's
+;; 8168 setting) | APM | AB: frames to this MAC and broadcasts. ChipCmd RE.
+(defn rx-ready-word [] (+ 3221225472 1536))
+(defn arm-rx [mmio rx buf]
+  (do (zero-bytes rx 0 16)
+      (store-le64 rx 8 buf)
+      (kernel-store-u32-4k rx 4096 0 (rx-ready-word))
+      (dma/release-fence)
+      (kernel-store-u8 mmio 512 80 192)
+      (kernel-store-u32 mmio 512 228 (bit-and rx 4294967295))
+      (kernel-store-u32 mmio 512 232 (quot rx 4294967296))
+      (kernel-store-u8 mmio 512 80 0)
+      (kernel-store-u16 mmio 512 218 1536)
+      (kernel-store-u32 mmio 512 68 53002)
+      (kernel-store-u8 mmio 512 55 (bit-or (kernel-load-u8 mmio 512 55) 12))
+      1))
+
 ;; Returns a packed state word for the first record:
 ;; bits 0..7 result (1 started, 0 no RTL8168, 2 reset timed out),
 ;; 8..15 ChipCmd after start, 16..31 PHYstatus (0x6C), 32..47 PMCSR before
@@ -120,6 +144,8 @@
                 cleared (zero-bytes tx 0 16)
                 ring-end (kernel-store-u32-4k tx 4096 0 1073741824)
                 armed (arm mmio tx)
+                rx-armed (arm-rx mmio (kernel-subregion (kernel-owned-window 10 16384) 16384 8192 4096)
+                                 (kernel-subregion (kernel-owned-window 10 16384) 16384 12288 4096))
                 isr (kernel-store-u16 mmio 512 62 65535)
                 result (if (= reset-done 1) 1 2)]
             (+ result
@@ -127,7 +153,7 @@
                (* (bit-and (kernel-load-u16 mmio 512 108) 65535) 65536)
                (* (bit-and pm-state 65535) 4294967296)
                (* (bit-and (kernel-load-u32 mmio 512 32) 65535) 281474976710656)
-               (* 0 (+ enabled reset cleared ring-end armed isr)))))))))
+               (* 0 (+ enabled reset cleared ring-end armed rx-armed isr)))))))))
 
 (defn hex-digit [value]
   (if (< value 10) (+ value 48) (+ value 87)))
@@ -137,51 +163,142 @@
     (do (kernel-store-u8-4k frame 4096 (+ offset (- digits 1)) (hex-digit (bit-and value 15)))
         (store-hex frame offset (u64-shift-right value 4) (- digits 1)))))
 
+;; Where the RTL8168's registers are: bus * 2^40 + BAR2 address, or 0 (no
+;; device or no BAR). A register window cannot be returned from a function
+;; (its extent would be lost), so each caller opens it with kernel-pci-mmio.
+(defn link-info []
+  (let [bus (find-bus 0)]
+    (if (< bus 0) 0
+      (let [address (register-bar bus)]
+        (if (= address 0) 0 (+ (* bus 1099511627776) address))))))
+(defn info-bus [info] (quot info 1099511627776))
+(defn info-address [info] (bit-and info 1099511627775))
+
+(defn put-be16 [frame offset value]
+  (do (kernel-store-u8-4k frame 4096 offset (bit-and (quot value 256) 255))
+      (kernel-store-u8-4k frame 4096 (+ offset 1) (bit-and value 255))
+      1))
+
+;; IPv4 header checksum of 4500 len 0000 0000 4011 0000 0000 ffff ffff
+;; (no DF, as the stage-1 frame; 0x7AAF for the 63-byte KDBG record).
+(defn fold16 [v] (if (> v 65535) (fold16 (+ (bit-and v 65535) (quot v 65536))) v))
+(defn ip-checksum [total]
+  (- 65535 (fold16 (+ 17664 (+ total (+ 16401 131070))))))
+
 (defn header-byte [i]
   (cond (< i 6) 255
         (= i 12) 8 (= i 13) 0
-        (= i 14) 69 (= i 15) 0 (= i 16) 0 (= i 17) 63
-        (= i 22) 64 (= i 23) 17 (= i 24) 122 (= i 25) 175
+        (= i 14) 69 (= i 22) 64 (= i 23) 17
         (and (>= i 30) (< i 34)) 255
-        (= i 34) 30 (= i 35) 119 (= i 36) 30 (= i 37) 119
-        (= i 38) 0 (= i 39) 43
+        (= i 34) 30 (= i 35) 119
         :else 0))
+
+(defn store-header [frame mmio i]
+  (if (>= i 42) 1
+    (do (kernel-store-u8-4k frame 4096 i
+          (if (and (>= i 6) (< i 12)) (kernel-load-u8 mmio 512 (- i 6)) (header-byte i)))
+        (store-header frame mmio (+ i 1)))))
+
+;; Broadcast one UDP datagram from 7799 to `port`; its payload is already at
+;; frame bytes 42.. (at most 1458). Short frames are padded to 60 bytes.
+;; 1 sent, 3 TX descriptor not returned.
+(defn send-frame [mmio length port]
+  (let [window (kernel-owned-window 10 16384)
+        tx (kernel-subregion window 16384 0 4096)
+        frame (kernel-subregion window 16384 4096 4096)
+        total (+ 28 length)
+        wire (if (< (+ 42 length) 60) 60 (+ 42 length))]
+    (if (= (wait-own tx 2000000) 0) 3
+      (do (arm mmio tx)
+          (store-header frame mmio 0)
+          (put-be16 frame 16 total)
+          (put-be16 frame 24 (ip-checksum total))
+          (put-be16 frame 36 port)
+          (put-be16 frame 38 (+ 8 length))
+          (if (< (+ 42 length) 60) (zero-bytes frame (+ 42 length) (- 60 (+ 42 length))) 1)
+          (store-le64 tx 8 frame)
+          (kernel-store-u32-4k tx 4096 4 0)
+          (dma/release-fence)
+          (kernel-store-u32-4k tx 4096 0 (dma/tx-command wire))
+          (dma/release-fence)
+          (kernel-store-u8 mmio 512 56 64)
+          (if (= (wait-own tx 2000000) 1) 1 3)))))
 
 (defn prefix-byte [i]
   (cond (= i 0) 65 (= i 1) 73 (= i 2) 85 (= i 3) 69 (= i 4) 79 (= i 5) 83
         (= i 6) 95 (= i 7) 75 (= i 8) 68 (= i 9) 66 (= i 10) 71 :else 32))
+(defn store-prefix [frame i]
+  (if (>= i 12) 1
+    (do (kernel-store-u8-4k frame 4096 (+ 42 i) (prefix-byte i))
+        (store-prefix frame (+ i 1)))))
 
-(defn store-header [frame mmio i]
-  (if (>= i 54) 1
-    (do (kernel-store-u8-4k frame 4096 i
-          (cond (< i 6) (header-byte i)
-                (< i 12) (kernel-load-u8 mmio 512 (- i 6))
-                (< i 42) (header-byte i)
-                :else (prefix-byte (- i 42))))
-        (store-header frame mmio (+ i 1)))))
-
-;; Sends one record; 1 sent, 0 no RTL8168, 3 TX descriptor not returned.
+;; Sends one record "AIUEOS_KDBG tttt vvvvvvvvvvvvvvvv" to UDP 7799;
+;; 1 sent, 0 no RTL8168, 3 TX descriptor not returned.
 (defn log [tag value]
-  (let [bus (find-bus 0)]
-    (if (< bus 0) 0
-      (let [address (register-bar bus)]
-        (if (= address 0) 0
-          (let [mmio (kernel-pci-mmio bus 0 0 address 512)
-                window (kernel-owned-window 10 16384)
-                tx (kernel-subregion window 16384 0 4096)
-                frame (kernel-subregion window 16384 4096 4096)]
-            (if (= (wait-own tx 2000000) 0) 3
-                (do (arm mmio tx)
-                    (store-header frame mmio 0)
-                    (store-hex frame 54 tag 4)
-                    (kernel-store-u8-4k frame 4096 58 32)
-                    (store-hex frame 59 value 16)
-                    (kernel-store-u8-4k frame 4096 75 13)
-                    (kernel-store-u8-4k frame 4096 76 10)
-                    (store-le64 tx 8 frame)
-                    (kernel-store-u32-4k tx 4096 4 0)
-                    (dma/release-fence)
-                    (kernel-store-u32-4k tx 4096 0 (dma/tx-command 77))
-                    (dma/release-fence)
-                    (kernel-store-u8 mmio 512 56 64)
-                    (if (= (wait-own tx 2000000) 1) 1 3)))))))))
+  (let [info (link-info)]
+    (if (= info 0) 0
+      (let [mmio (kernel-pci-mmio (info-bus info) 0 0 (info-address info) 512)
+            frame (kernel-subregion (kernel-owned-window 10 16384) 16384 4096 4096)]
+        (do (store-prefix frame 0)
+            (store-hex frame 54 tag 4)
+            (kernel-store-u8-4k frame 4096 58 32)
+            (store-hex frame 59 value 16)
+            (kernel-store-u8-4k frame 4096 75 13)
+            (kernel-store-u8-4k frame 4096 76 10)
+            (send-frame mmio 35 7799))))))
+
+;; RX: the received length (with the 4-byte CRC) once the NIC has returned
+;; the descriptor, else 0. rx-byte reads the buffer; rx-release gives the
+;; descriptor back.
+(defn rx-length []
+  (let [rx (kernel-subregion (kernel-owned-window 10 16384) 16384 8192 4096)
+        opts (kernel-load-u32-4k rx 4096 0)]
+    (if (= (bit-and opts 2147483648) 0) (bit-and opts 16383) 0)))
+(defn rx-byte [i]
+  (kernel-load-u8-16k (kernel-owned-window 10 16384) 16384 (+ 12288 (bit-and i 4095))))
+(defn rx-release []
+  (let [rx (kernel-subregion (kernel-owned-window 10 16384) 16384 8192 4096)]
+    (do (dma/release-fence)
+        (kernel-store-u32-4k rx 4096 0 (rx-ready-word))
+        1)))
+
+;; Screenshot: each datagram to UDP 7797 is "AIUESHOT" row(2, LE) chunk(1)
+;; format(1) width(2, LE), then 200 framebuffer pixels (4 bytes each, as the
+;; GOP stores them) from x = 200 * chunk. Returns the datagrams sent.
+(defn shot-magic [i] (case i 0 65 1 73 2 85 3 69 4 83 5 72 6 79 7 84 0))
+(defn shot-pixels [frame stride y x0 i]
+  (if (>= i 200) 1
+    (let [offset (* (+ (* y stride) (+ x0 i)) 4)
+          page (kernel-framebuffer-page (quot offset 4096))]
+      (do (kernel-store-u32-4k frame 4096 (+ 56 (* 4 i))
+                               (kernel-load-u32-4k page 4096 (mod offset 4096)))
+          (shot-pixels frame stride y x0 (+ i 1))))))
+;; geom packs width (bits 0..15), height (16..31), stride (32..47) and the
+;; GOP pixel format (48..55), to keep each call within five parameters.
+(defn store-shot-magic [frame i]
+  (if (>= i 8) 1
+    (do (kernel-store-u8-4k frame 4096 (+ 42 i) (shot-magic i))
+        (store-shot-magic frame (+ i 1)))))
+(defn shot-chunk [mmio frame geom y chunk]
+  (let [width (bit-and geom 65535)]
+    (do (store-shot-magic frame 0)
+        (kernel-store-u8-4k frame 4096 50 (bit-and y 255))
+        (kernel-store-u8-4k frame 4096 51 (quot y 256))
+        (kernel-store-u8-4k frame 4096 52 chunk)
+        (kernel-store-u8-4k frame 4096 53 (bit-and (u64-shift-right geom 48) 255))
+        (kernel-store-u8-4k frame 4096 54 (bit-and width 255))
+        (kernel-store-u8-4k frame 4096 55 (quot width 256))
+        (shot-pixels frame (bit-and (u64-shift-right geom 32) 65535) y (* 200 chunk) 0)
+        (send-frame mmio 814 7797))))
+;; pos = 16 * row + chunk
+(defn shot-rows [mmio frame geom pos sent]
+  (let [y (quot pos 16) chunk (mod pos 16)]
+    (if (>= y (bit-and (u64-shift-right geom 16) 65535)) sent
+      (if (>= (* 200 chunk) (bit-and geom 65535)) (shot-rows mmio frame geom (* 16 (+ y 1)) sent)
+        (let [r (shot-chunk mmio frame geom y chunk)]
+          (shot-rows mmio frame geom (+ pos 1) (+ sent (if (= r 1) 1 0))))))))
+(defn shot [width height stride format]
+  (let [info (link-info)]
+    (if (= info 0) 0
+      (shot-rows (kernel-pci-mmio (info-bus info) 0 0 (info-address info) 512) (kernel-subregion (kernel-owned-window 10 16384) 16384 4096 4096)
+                 (+ width (+ (* height 65536) (+ (* stride 4294967296) (* format 281474976710656)))) 0 0))))

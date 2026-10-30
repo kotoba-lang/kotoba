@@ -127,6 +127,22 @@ overflowed the renderer's 259 ops and the whole frame was refused (-5).
 State is RAM only on a machine without the draft medium. The QEMU check does
 not qualify physical hardware, and profile 5 is not the default entry.
 
+## Remote control over the RTL8168 debug link (AWAI-119)
+
+On the 6600H (Realtek RTL8168, direct cable to the operator's Mac), the opt-in
+desktop debug entry sends KDBG records to UDP 7799 and polls one RX
+descriptor for signed commands on UDP 7798: ping, reboot (port 0xCF9), key
+(a make code handled as a keyboard press) and screenshot (UDP 7797). Each
+command carries the boot nonce (KDBG 0xc000) and a rising counter, signed
+with Ed25519 under the key pinned in `native/remote_cmd.kotoba`; the seed
+stays on the operator's Mac. Use `os/aiueos/scripts/aiueos-remote.py`.
+Package the image with `--netlog v1 --watchdog v1` and keep UEFI PXE first in
+the boot order: every watchdog reset then boots the served image, so hardware
+iterations need no power cycle. Evidence:
+`docs/evidence/awai119-remote-control-6600h-20261030`. The channel is
+Ed25519 only (below the post-quantum floor) and exists only in the debug
+entry; KDBG tags 0x2000.. are taken by the blur timing log.
+
 ## CDCI migration: native only (2026-10-24)
 
 Owner instruction and workspace `AGENTS.md` supersede the historical KBB,
