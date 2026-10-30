@@ -1357,9 +1357,19 @@ zig cc -target x86_64-freestanding-none -std=c11 -O2 \
 zig cc -target x86_64-freestanding-none -std=c11 -O2 \
   -ffreestanding -fno-stack-protector -mno-red-zone \
   -c -o "$kernel_job_protocol_object" "$aiueos/kernel/job_protocol.c"
-zig cc -target x86_64-freestanding-none -std=c11 -O2 \
-  -ffreestanding -fno-stack-protector -mno-red-zone \
-  -c -o "$kernel_tls_aes_object" "$aiueos/kernel/tls_aes_gcm.c"
+# JUN-556: tls_aes_gcm is the Kotoba object kotoba/tls-aes-gcm.o (Amu object route: 8-parameter exports, ADR 0384, and
+# .bss / .high_bss arrays, ADR 0385), with its byte copy and fill in kotoba/bytes.o, not a C compile.
+# kernel/tls_aes_gcm.c stays as the reference scripts/tls-aes-gcm-diff compares against.
+kotoba_tls_aes_object=${AIUEOS_KOTOBA_TLS_AES_GCM_OBJECT:-"$aiueos/kotoba/tls-aes-gcm.o"}
+kotoba_bytes_object=${AIUEOS_KOTOBA_BYTES_OBJECT:-"$aiueos/kotoba/bytes.o"}
+python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_tls_aes_object" \
+  dfae9998bb6fccf72bb3747f74b9e69d4b2727a40d24c078b8e1cee9cb358399 \
+  aiueos_aes128_gcm_encrypt,aiueos_aes128_gcm_decrypt,aiueos_aes128_gcm_unwrap,aiueos_aes128_gcm_selftest \
+  kotoba_aiueos_aes128_gcm,kotoba_aiueos_aes128_gcm_selftest,kotoba_aiueos_bytes_copy,kotoba_aiueos_bytes_fill
+python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_bytes_object" \
+  567551de001399c4706927cbffd474b53c15ea35e908945e51fd2176feca6c58 \
+  kotoba_aiueos_bytes_copy,kotoba_aiueos_bytes_fill
+cp "$kotoba_tls_aes_object" "$kernel_tls_aes_object"
 zig cc -target x86_64-freestanding-none -std=c11 -O2 \
   -ffreestanding -fno-stack-protector -mno-red-zone \
   -c -o "$kernel_tls13_object" "$aiueos/kernel/tls13.c"
@@ -1465,7 +1475,7 @@ zig ld.lld -nostdlib -static --strip-all $qualification_gc_link -z max-page-size
   "$kernel_inference_status_object" \
   $device_result_link $model_handoff_link "$kernel_kototama_runtime_object" \
   "$kernel_job_protocol_object" \
-  "$kernel_tls_aes_object" "$kernel_tls13_object" \
+  "$kernel_tls_aes_object" "$kotoba_bytes_object" "$kernel_tls13_object" \
   "$kernel_scheduler_object" "$kernel_syscall_object" \
   "$kernel_process_object" "$kernel_loader_object" \
   "$kernel_smp_object" "$kernel_trampoline_object" \
