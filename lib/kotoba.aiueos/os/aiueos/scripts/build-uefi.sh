@@ -1194,7 +1194,7 @@ if [ -n "$model_handoff_link" ] || [ -n "$qwen35_parity_cflags" ]; then
   case "${AIUEOS_QWEN35_KOTOBA_PARITY:-0}" in
     0|5)
       python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_qwen35_rope_object" \
-        51405dd582722833216f7a29b76f43ed5dc14c4f6caccec3a8aa0db473fff914 \
+        470af3dc41f1d1c7a01bc49db7bf11af1d3236ed8228f7056c0c84c502006521 \
         kotoba_aiueos_qwen35_rope
       ;;
   esac
