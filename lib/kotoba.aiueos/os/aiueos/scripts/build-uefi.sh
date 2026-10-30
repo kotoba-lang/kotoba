@@ -899,6 +899,10 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_virtio_caps_ob
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_extent_valid_object" \
   cfde40e55fc8e52d6100183e2e4a7eecd60120be95f9c04234714ad041916ec4 \
   kotoba_aiueos_pci_extent_valid
+# JUN-598: pci.c's virtio feature negotiation (negotiate) is kotoba/virtio-negotiate.o (fuel 4194304).
+kotoba_virtio_negotiate_object=${AIUEOS_KOTOBA_VIRTIO_NEGOTIATE_OBJECT:-"$aiueos/kotoba/virtio-negotiate.o"}
+python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_virtio_negotiate_object" \
+  e902e7ec66f7b78ddaf64123aa9b3f771480f06391bb19295e397e290ba3d5f5 kotoba_aiueos_virtio_negotiate
 # JUN-598: pci.c's BAR arithmetic (read_bar's decode, bar_extent's type check and size) is kotoba/pci-bar.o (fuel 4194304).
 kotoba_pci_bar_object=${AIUEOS_KOTOBA_PCI_BAR_OBJECT:-"$aiueos/kotoba/pci-bar.o"}
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_pci_bar_object" \
@@ -1644,7 +1648,7 @@ zig ld.lld -nostdlib -static --strip-all $qualification_gc_link -z max-page-size
   "$kotoba_pci_config_read_object" "$kotoba_pci_config_write_object" "$kotoba_pci_bar_object" \
   "$kotoba_rtl8125_identify_object" "$kotoba_rtl8125_link_up_object" \
   "$kotoba_rtl8125_ring_build_object" "$kotoba_rtl8125_program_object" \
-  "$kotoba_rtl8125_tx_submit_object" "$kotoba_rtl8125_rx_poll_object" "$kotoba_rtl8125_arp_object" \
+  "$kotoba_rtl8125_tx_submit_object" "$kotoba_rtl8125_rx_poll_object" "$kotoba_rtl8125_arp_object" "$kotoba_virtio_negotiate_object" \
   "$kotoba_x25519_object"   "$kotoba_ecdsa_object" $ecdsa_sign_link $ecdsa_public_link "$kotoba_ime_object" \
   "$kotoba_aes128_gcm_object" "$kotoba_tls13_record_object" \
   $qwen35_kotoba_link $qwen35_parity_link \
