@@ -1,0 +1,121 @@
+;; hata.session-native-test -- broker votes over authenticated sessions between processes
+;; (AWAI-102): Noise XXhfs + ML-KEM-768 with Ed25519 + ML-DSA-65 identities (lib/kotoba.noise,
+;; ADR-0001) over the native TCP wires, each exchange in one hata.wire envelope.
+;;   serve-vote BASE ADDR INDEX : replica INDEX listens on ADDR, completes the handshake as
+;;       responder (the coordinator's identity must be the expected one), opens the request
+;;       with open-request at sequence 0, votes (hata.replica/vote) and returns the vote in
+;;       a response bound to the request id
+;;   ask-vote BASE ADDR INDEX   : the coordinator dials ADDR, completes the handshake as
+;;       initiator (replica INDEX's identity must be the expected one), sends BASE/request
+;;       and writes the bound response to BASE/vote<INDEX>
+;;   ask-wrong ... / ask-replay ... : controls -- expect another replica's identity, or send
+;;       a request whose id was made for sequence 1
+;; Exit (main's result): 1 when the vote was cast / received; negative names the refusal.
+;; Every key and seed here (X25519 static and ephemeral, KEM randomness, identity seeds) is a
+;; fixed public test value, never an operational key. A deployment takes ephemerals and KEM
+;; randomness from the host's entropy provider and identities from the roster.
+(ns hata.session-native-test
+  (:export [main]) (:capabilities [:cli/args])
+  (:require [hata.codec :as c] [hata.replica :as replica] [hata.store-io :as io] [hata.quorum-fixture :as qf]
+            [hata.wire :as w] [noise.native :as n] [noise.identity :as id] [noise.tcp :as t]))
+
+(defn- path [base :string name :string] :string (string-concat base (string-concat "/" name)))
+(defn- read [base :string name :string] :vector-i64
+  (if (io/exists? (path base name)) (c/unhex (io/read (path base name))) (vector-i64)))
+(defn- write [base :string name :string value :vector-i64] :bool (io/write (path base name) (c/hex value)))
+(defn- pat [n :i64 k :i64] :vector-i64
+  (loop [i 0 out (vector-alloc n)] (if (= i n) out (recur (+ i 1) (vector-assoc! out i (rem (+ (* 11 i) (* 37 k) 1) 256))))))
+;; role 0..3 = replicas, 9 = coordinator
+(defn- x-static [role :i64] :vector-i64 (pat 32 (+ 100 role)))
+(defn- x-eph [role :i64] :vector-i64 (pat 32 (+ 120 role)))
+(defn- ed-seed [role :i64] :vector-i64 (pat 32 (+ 140 role)))
+(defn- dsa-xi [role :i64] :vector-i64 (pat 32 (+ 160 role)))
+(defn- want [role :i64] :vector-i64 (id/identity (ed-seed role) (dsa-xi role)))
+(defn- prologue [] :vector-i64 (vector-i64 104 97 116 97 46 98 114 111 107 101 114 46 115 101 115 115 105 111 110 46 118 49))
+(defn- cat [p :vector-i64 q :vector-i64] :vector-i64
+  (let [np (vector-count p) out (vector-alloc (+ np (vector-count q)))]
+    (loop [i 0] (if (= i (vector-count out)) out
+      (let [z (vector-assoc! out i (if (< i np) (vector-at p i) (vector-at q (- i np))))] (recur (+ i 1)))))))
+(defn- g-slice [v :vector-i64 start :i64 n :i64] :vector-i64
+  (loop [i 0 out (vector-alloc n)] (if (= i n) out (recur (+ i 1) (vector-assoc! out i (vector-at v (+ start i)))))))
+(defn- hd [o :vector-i64] :vector-i64 (if (< (vector-count o) (n/state-size)) (vector-i64) (g-slice o 0 (n/state-size))))
+(defn- tl [o :vector-i64] :vector-i64
+  (if (< (vector-count o) (n/state-size)) (vector-i64 -1) (g-slice o (n/state-size) (- (vector-count o) (n/state-size)))))
+(defn- bad? [v :vector-i64] :bool (or (= (vector-count v) 0) (and (= (vector-count v) 1) (= (vector-at v 0) -1))))
+
+;; hata's files hold 64-bit words; an envelope carries bytes: 8 little-endian bytes a word,
+;; the same layout hata.codec hex uses
+(defn- words-bytes [ws :vector-i64] :vector-i64
+  (loop [i 0 out (vector-alloc (* 8 (vector-count ws)))]
+    (if (= i (vector-count out)) out
+      (recur (+ i 1) (vector-assoc! out i (bit-and (u64-shift-right (vector-at ws (quot i 8)) (* 8 (rem i 8))) 255))))))
+(defn- bytes-words [b :vector-i64] :vector-i64
+  (if (not (= (rem (vector-count b) 8) 0)) (vector-i64)
+    (loop [i 0 out (vector-alloc (quot (vector-count b) 8))]
+      (if (= i (vector-count out)) out
+        (recur (+ i 1) (vector-assoc! out i (loop [j 0 x 0] (if (= j 8) x
+                         (recur (+ j 1) (bit-or x (i64-shift-left (vector-at b (+ (* 8 i) j)) (* j 8))))))))))))
+(defn- vote-name [index :i64] :string (cond (= index 1) "vote1" (= index 2) "vote2" (= index 3) "vote3" :else "vote0"))
+
+(defn- initiate [h :string me :i64 peer :i64] :vector-i64
+  ;; the XXhfs handshake as initiator; the established state, or empty
+  (let [i0 (n/set-kem (n/initialize 3 true (x-static me) (x-eph me) (vector-i64) (prologue)) (pat 64 (+ 180 me)) (vector-i64))
+        o0 (n/write-message i0 (vector-i64))]
+    (if (or (bad? o0) (< (t/send-frame h (tl o0)) 0)) (vector-i64)
+      (let [f1 (t/recv-frame h 20000) u1 (n/read-tokens (hd o0) f1)]
+        (if (bad? u1) (vector-i64)
+          (let [h1 (n/handshake-hash-now (hd u1)) v1 (n/read-payload (hd u1) (tl u1))]
+            (if (or (bad? v1) (not (id/verify-payload (tl v1) h1 (want peer)))) (vector-i64)
+              (let [t2 (n/write-tokens (hd v1))
+                    o2 (n/write-payload (hd t2) (tl t2) (id/payload (ed-seed me) (dsa-xi me) (n/handshake-hash-now (hd t2))))]
+                (if (or (bad? o2) (< (t/send-frame h (tl o2)) 0)) (vector-i64) (hd o2))))))))))
+
+(defn- respond [h :string me :i64 peer :i64] :vector-i64
+  ;; the XXhfs handshake as responder; the established state, or empty
+  (let [r0 (n/set-kem (n/initialize 3 false (x-static me) (x-eph me) (vector-i64) (prologue)) (vector-i64) (pat 32 (+ 200 me)))
+        q0 (n/read-message r0 (t/recv-frame h 20000))]
+    (if (bad? q0) (vector-i64)
+      (let [t1 (n/write-tokens (hd q0))
+            o1 (n/write-payload (hd t1) (tl t1) (id/payload (ed-seed me) (dsa-xi me) (n/handshake-hash-now (hd t1))))]
+        (if (or (bad? o1) (< (t/send-frame h (tl o1)) 0)) (vector-i64)
+          (let [u2 (n/read-tokens (hd o1) (t/recv-frame h 20000))]
+            (if (bad? u2) (vector-i64)
+              (let [h2 (n/handshake-hash-now (hd u2)) v2 (n/read-payload (hd u2) (tl u2))]
+                (if (or (bad? v2) (not (id/verify-payload (tl v2) h2 (want peer)))) (vector-i64) (hd v2))))))))))
+
+(defn- serve-vote [base :string addr :string index :i64] :i64
+  (let [l (t/listen addr) s (t/accept l 20000) st (respond s index 9)]
+    (if (= (vector-count st) 0) -21
+      (let [d (n/transport-decrypt st (t/recv-frame s 20000))]
+        (if (bad? d) -22
+          (let [request (w/open-request (tl d) 1 (n/handshake-hash st) 0)]
+            (if (bad? request) -23
+              (let [vote (replica/vote base (qf/config) (c/append (vector-i64 index) (qf/seed index)) (bytes-words request))
+                    e (n/transport-encrypt (hd d) (w/seal 2 (w/request-id (n/handshake-hash st) 0 request) (words-bytes vote)))]
+                (if (or (= (vector-count vote) 0) (bad? e) (< (t/send-frame s (tl e)) 0)) -24
+                  (if (write base "response" vote) (vector-at vote 0) -25))))))))))
+
+(defn- ask [base :string addr :string index :i64 expect :i64 seq :i64] :i64
+  (let [c (t/dial addr 20000) st (initiate c 9 expect) request (words-bytes (read base "request"))]
+    (if (= (vector-count st) 0) -31
+      (let [rid (w/request-id (n/handshake-hash st) seq request)
+            e (n/transport-encrypt st (w/seal 1 rid request))]
+        (if (or (bad? e) (< (t/send-frame c (tl e)) 0)) -32
+          (let [d (n/transport-decrypt (hd e) (t/recv-frame c 20000))]
+            (if (bad? d) -33
+              (let [vote (w/open (tl d) 2 rid)]
+                (if (bad? vote) -34
+                  (let [ws (bytes-words vote)]
+                    (if (and (> (vector-count ws) 0) (write base (vote-name index) ws)) (vector-at ws 0) -35)))))))))))
+
+(defn main [] :i64
+  (let [mode (typed-cap-call :cli/args :string :string "0")
+        base (typed-cap-call :cli/args :string :string "1")
+        addr (typed-cap-call :cli/args :string :string "2")
+        option (typed-cap-call :cli/args :string :string "3")
+        index (cond (= option "1") 1 (= option "2") 2 (= option "3") 3 :else 0)]
+    (cond (= mode "serve-vote") (serve-vote base addr index)
+          (= mode "ask-vote") (ask base addr index index 0)
+          (= mode "ask-wrong") (ask base addr index (rem (+ index 1) 4) 0)
+          (= mode "ask-replay") (ask base addr index index 1)
+          :else -1)))

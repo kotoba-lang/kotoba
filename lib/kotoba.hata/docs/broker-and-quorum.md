@@ -262,9 +262,32 @@ comparison, returns 61. Measured on Apple Silicon (Amu Mac root of main `91faa12
 other mutants give: length check dropped, an out-of-bounds read that traps; sequence
 left out of the id, 55; handshake hash left out of the id, 119.
 
-Not yet: carrying the vote / commit / attest exchanges between replica processes over
-these sessions, the replay window, timeouts and retries, backpressure, per-peer budgets,
-and the re-check of body and C0 authority right before dispatch.
+`open-request` lets the receiving side check a request it could not predict: it returns
+the body only if the envelope's id equals `request-id(hh, seq, body)` for that very body.
+The gate returns 255 with it; skipping that comparison gives 127.
+
+**Votes between processes.** `test/session_native.kotoba` (driver) and
+`scripts/check-session-native.py` (Linux arm64) carry the quorum's votes between separate
+processes. Each replica serves its vote as the session responder: it requires the
+coordinator's identity, opens the request at sequence 0, votes with `hata.replica/vote`
+and replies under the same id. The coordinator dials, requires the replica's identity and
+stores only the bound reply. The broker driver's `certificate` step then assembles the
+quorum certificate from those votes. Measured 2026-10-30 in the podman machine (Linux
+arm64) with Amu main's committed `aarch64-linux-static-root.elf`:
+
+| exchange | result |
+|---|---|
+| replicas 0, 1, 2 vote over their own sessions | vote 1 each; the certificate assembles |
+| coordinator expects another replica's identity | the handshake is refused (replica -21, coordinator -31) |
+| request id made for sequence 1 | the replica refuses it (-23); no vote is written (coordinator -33) |
+
+The keys in the driver are fixed public test values; a deployment takes ephemerals and
+KEM randomness from the host's entropy provider and identities from the roster. The CI
+arm64 lane runs it.
+
+Not yet: commit and attest over sessions, timeouts and retries beyond the wire's own,
+backpressure, per-peer budgets, separate hosts, and the re-check of body and C0 authority
+right before dispatch.
 
 ## Verification and scope
 
