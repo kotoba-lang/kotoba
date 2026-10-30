@@ -78,6 +78,15 @@ MODULE_GATES = {
         'order': ('xwing/core.kotoba', '(cat (cat (cat (cat ss-m ss-x) ct-x) pk-x) (label))', '(cat (cat (cat (cat ss-x ss-m) ct-x) pk-x) (label))'),
         'eseed': ('xwing/core.kotoba', 'ek-x (slice eseed 32 32)', 'ek-x (slice eseed 0 32)'),
     }),
+    'noise': dict(files=dict(X25519, **CHACHA, **{'sha2/core.kotoba': 'lib/gov.nist.sha2/kotoba/sha2/core.kotoba',
+                                                  'noise/native.kotoba': 'lib/kotoba.noise/kotoba/noise/native.kotoba',
+                                                  'noise/native_gate.kotoba': 'lib/kotoba.noise/kotoba/noise/native_gate.kotoba'}),
+                  gate_ns='noise.native-gate', groups={g: 31 for g in ['nn-i', 'nn-r', 'xx-i', 'xx-r', 'ik-i', 'ik-r']}, mutants={
+        'hkdf': ('noise/native.kotoba', '(h/hmac-sha256 temp (cat o1 (vector-i64 2)))', '(h/hmac-sha256 temp (cat o1 (vector-i64 3)))'),
+        'esse': ('noise/native.kotoba', '(= token 4) (if init (x/x25519-bytes e rs) (x/x25519-bytes s re))',
+                 '(= token 4) (if init (x/x25519-bytes s re) (x/x25519-bytes e rs))'),
+        'premsg': ('noise/native.kotoba', '(if (= pattern 2) (mix-hash st5', '(if false (mix-hash st5'),
+    }),
     'pqh': dict(files=dict(X25519, **{'sha3/core.kotoba': SHA3, 'mlkem/core.kotoba': 'lib/gov.nist.mlKem/kotoba/mlkem/core.kotoba',
                                       'sha2/core.kotoba': 'lib/gov.nist.sha2/kotoba/sha2/core.kotoba',
                                       'pqh/hybrid.kotoba': 'lib/kotoba.pqh/kotoba/pqh/hybrid.kotoba',
@@ -111,7 +120,7 @@ def module_results(gate, name, spec, label, files):
             out['main'] = None
         return out
     for grp, expected in spec['groups'].items():
-        entry = f'pq/{name}_gate_{grp}.kotoba'
+        entry = f'pq/{name}_gate_{grp.replace("-", "_")}.kotoba'
         fs = dict(files)
         fs[entry] = (f'(ns pq.{name}-gate-{grp} (:require [{spec["gate_ns"]} :as g]) (:export [main]))\n'
                      f'(defn main [] :i64 (g/group-{grp}))\n').encode()
