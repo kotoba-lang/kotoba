@@ -4789,20 +4789,14 @@ static int net_tcp_data(const uint8_t *frame, const uint8_t **payload,
   return 1;
 }
 
+/* JUN-552: the HTTP response heads are kotoba/http-head.o: the status line and header terminator here (the body's
+   offset, or 0), and rtl8125_http_success's status line. The body's SHA-256 and the digest comparison stay below. */
+extern int64_t kotoba_aiueos_http_cid_body(uint64_t app, uint64_t length);
+extern int64_t kotoba_aiueos_http_success(uint64_t bytes, uint64_t length);
 static int net_http_cid_admit(const uint8_t *app, uint32_t n) {
-  uint32_t i, body = 0;
+  uint32_t body;
   uint8_t digest[32];
-  /* Mechanism: find the compiled status line and header terminator. */
-  if (n < 12) return 0;
-  if (app[0] != 'H' || app[1] != 'T' || app[2] != 'T' || app[3] != 'P') return 0;
-  if (app[5] != '1' || app[9] != '2' || app[10] != '0' || app[11] != '0') return 0;
-  for (i = 0; i + 3 < n; i++) {
-    if (app[i] == '\r' && app[i + 1] == '\n' &&
-        app[i + 2] == '\r' && app[i + 3] == '\n') {
-      body = i + 4;
-      break;
-    }
-  }
+  body = (uint32_t)kotoba_aiueos_http_cid_body((uint64_t)(uintptr_t)app, n);
   if (body == 0) return 0;
   {
     static const uint8_t empty[1] = {0};
@@ -6013,12 +6007,7 @@ static int rtl8125_direct_dns(void) {
 }
 
 static int rtl8125_http_success(const uint8_t *bytes, uint32_t length) {
-  return bytes && length >= 12 &&
-    bytes[0] == 'H' && bytes[1] == 'T' && bytes[2] == 'T' && bytes[3] == 'P' &&
-    bytes[4] == '/' && bytes[5] == '1' && bytes[6] == '.' && bytes[7] == '1' &&
-    bytes[8] == ' ' && bytes[9] == '2' &&
-    bytes[10] >= '0' && bytes[10] <= '9' &&
-    bytes[11] >= '0' && bytes[11] <= '9';
+  return kotoba_aiueos_http_success((uint64_t)(uintptr_t)bytes, length) == 1;
 }
 
 static int rtl8125_direct_tls_pump(uint32_t dst, uint16_t local_port,
