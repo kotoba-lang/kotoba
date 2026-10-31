@@ -1736,18 +1736,11 @@ python3 "$aiueos/scripts/make-initramfs.py" \
   --entry "font/aiueos-16.fnt,$aiueos/fonts/aiueos-16.fnt" \
   --entry "ime/aiueos-kanji.dic,$aiueos/ime/aiueos-kanji.dic" \
   --output "$initramfs" >/dev/null
-python3 - "$kernel" "$initramfs" "$identity_source" <<'PY'
-import hashlib, pathlib, sys
-kernel_digest = hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).digest()
-initramfs_digest = hashlib.sha256(pathlib.Path(sys.argv[2]).read_bytes()).digest()
-def values(digest):
-    return ",".join(f"0x{byte:02x}" for byte in digest)
-pathlib.Path(sys.argv[3]).write_text(
-    "#include <stdint.h>\n"
-    "const uint8_t aiueos_expected_kernel_sha256[32]={" + values(kernel_digest) + "};\n"
-    "const uint8_t aiueos_expected_initramfs_sha256[32]={" + values(initramfs_digest) + "};\n",
-    encoding="ascii")
-PY
+# JUN-555: the kernel/initramfs digest source is written by Kotoba (native/kernel-identity-source.kotoba,
+# seed 03's SHA-256) through the pinned Amu Mac root; without that native route the build refuses.
+sh "$aiueos/scripts/run-native-generator.sh" "$aiueos/native/kernel-identity-source.kotoba" \
+  "$identity_source" --seed 03-source-sha256 --input "kernel=$kernel" --input "initramfs=$initramfs" \
+  -- kernel @size:kernel initramfs @size:initramfs
 zig cc -target x86_64-windows-gnu -std=c11 -O2 -ffreestanding \
   -c -o "$identity_object" "$identity_source"
 if [ "${AIUEOS_EMBEDDED_RELEASE:-0}" = 1 ]; then
