@@ -11,11 +11,16 @@ Runs on Linux arm64 (the aarch64 payload packed into an aarch64-linux runner ima
 the arm64 owner lane does), on Apple Silicon (Mac root and packager, through
 lib/kotoba.hata/scripts/native_gate.py) and on Linux x86_64 (KX64 under the native
 runner). KX64 admits string literals, so the ML-KEM and ML-DSA unity gates, whose
-vectors are hex strings, also run on x86_64 (--gates mlkem,mldsa; slow there, so CI runs
-them on main and nightly, JUN-629). The SHA-3 gate does not: it prints its oracle lines
-with :io/write, and the locked x86 project adapter refuses every capability (amu
-seed/98-x86_64-project.kotoba, E7101 OP-CAP). E7101 detail 16, once recorded here, is the
-scalar ELF64 profile's refusal of string literals, a route these gates do not use
+vectors are hex strings, also run on x86_64 (slow there, so CI runs them on main and
+nightly, JUN-629). The SHA-3 gate prints its oracle lines with :io/write, and the locked
+x86 project adapter refuses every capability (amu seed/98-x86_64-project.kotoba, E7101
+OP-CAP), so x86_64 runs `sha3-x86` instead: the same gate source and library body, with
+g-say rewritten to answer the line's length instead of writing it (PRINT_FREE). Its
+verdict is the same bitmask from the same checks, and both SHA-3 mutants apply to it
+unchanged. Linux arm64 and macOS keep running the printing `sha3` gate; `sha3-x86` is
+not in the default selection and `sha3` is refused on x86_64. CI's x86 lane runs
+--gates mlkem,mldsa,sha3-x86. E7101 detail 16, once recorded here, is the scalar ELF64
+profile's refusal of string literals, a route these gates do not use
 (AWAI-117). --module-gates-only skips every unity gate.
 """
 import argparse
@@ -40,6 +45,11 @@ GATES = {
         'constant': (SHA3, '0x0000000000008082', '0x0000000000008083'),
         'suffix': ('lib/gov.nist.sha3/kotoba/sha3/core.kotoba', '(sponge bytes 136 6 32))', '(sponge bytes 136 1 32))'),
     }),
+    # x86_64 only (AWAI-117, owner decision 2026-10-31): the sha3 gate made print-free. The rewrite is applied
+    # to the gate's own source at build time, so it never drifts from the printing gate; it must match once.
+    'sha3-x86': dict(bodies=[SHA3], gate='lib/gov.nist.sha3/kotoba/sha3/native_gate.kotoba', passing=63, x86_only=True,
+                     rewrite=('(let [x (typed-cap-call :io/write :string :string (string-concat s "\\n"))] 0))',
+                              '(string-length s))'), mutants={}),
     'mlkem': dict(bodies=[SHA3, 'lib/gov.nist.mlKem/kotoba/mlkem/core.kotoba'],
                   gate='lib/gov.nist.mlKem/kotoba/mlkem/native_gate.kotoba', passing=63, mutants={
         'zeta': ('lib/gov.nist.mlKem/kotoba/mlkem/core.kotoba', '(vector-i64 1 1729 ', '(vector-i64 1 1730 '),
@@ -55,6 +65,7 @@ GATES = {
                   '(if (or (= (vector-count h) 0) (>= (vnorm z) 524092)) false', '(if (= (vector-count h) 0) false'),
     }),
 }
+GATES['sha3-x86']['mutants'] = GATES['sha3']['mutants']
 
 # Module gates (AWAI-117) are built as modules from the library files, not as a unity
 # source. A gate with groups runs one image per group through a one-line entry module,
@@ -204,6 +215,10 @@ def unity(name, spec, change=None):
         if change and change[0] == path:
             assert text.count(change[1]) == 1, (name, change)
             text = text.replace(change[1], change[2])
+        if path == spec['gate'] and 'rewrite' in spec:
+            assert text.count(spec['rewrite'][0]) == 1, (name, 'rewrite does not match the gate source once')
+            text = text.replace(*spec['rewrite'])
+            assert ':io/' not in text and 'typed-cap-call' not in text, (name, 'variant still names a capability')
         parts.append(strip_ns(text).replace('sha3/', '') if path != spec['gate'] else strip_ns(text))
     return ''.join(parts).encode()
 
@@ -296,20 +311,34 @@ def main():
     parser.add_argument('--module-gates-only', action='store_true', help='skip every unity gate')
     parser.add_argument('--gates', help='run only these gates (comma-separated unity or module gate names)')
     args = parser.parse_args()
-    selected = set(GATES) | set(MODULE_GATES)
+    selected = {n for n, spec in GATES.items() if not spec.get('x86_only')} | set(MODULE_GATES)
     if args.gates:
         selected = set(args.gates.split(','))
         assert selected <= set(GATES) | set(MODULE_GATES), ('unknown gate', sorted(selected - set(GATES) - set(MODULE_GATES)))
     if args.module_gates_only:
         selected -= set(GATES)
+    x86 = (platform.system(), platform.machine()) == ('Linux', 'x86_64')
+    # x86_64 cannot run the printing SHA-3 gate (see the docstring); it runs sha3-x86.
+    assert not (x86 and 'sha3' in selected), 'sha3 prints through :io/write, refused on x86_64: run sha3-x86'
     gate = LinuxArm(args) if platform.system() == 'Linux' and platform.machine() in ('aarch64', 'arm64') else NativeGate(args)
     results = {}
 
+    def observed(label):
+        """main's result for a run that may have failed its assertion (None if it did not report one)."""
+        if getattr(gate, 'darwin', False):
+            return next((o['exit'] for o in gate.observations if o['name'] == label), None)
+        match = re.search(rb':result (-?[0-9]+)', (gate.out / (label + '.stdout')).read_bytes())
+        return int(match[1]) if match else None
+
     def unity_gate(name, spec):
-        entry = f'pq/{name}_gate.kotoba'
+        entry = f'pq/{name.replace("-", "_")}_gate.kotoba'
         image = gate.build(name, entry, {entry: unity(name, spec)})
         gate.run(name + '-pass', image, spec['passing'])
-        result = dict(passing=spec['passing'], mutants={})
+        result = dict(passing=spec['passing'], mutants={}, mutantResults={},
+                      unitySHA256=hashlib.sha256(unity(name, spec)).hexdigest(),
+                      gateSourceSHA256=hashlib.sha256((ROOT / spec['gate']).read_bytes()).hexdigest(),
+                      variant=('print-free (g-say rewritten to string-length, no capability; result value only)'
+                               if 'rewrite' in spec else 'as committed'))
         for label, change in spec['mutants'].items():
             mutant = gate.build(f'{name}-{label}', entry, {entry: unity(name, spec, change)})
             try:
@@ -318,6 +347,7 @@ def main():
             except AssertionError:
                 detected = True
             result['mutants'][label] = detected
+            result['mutantResults'][label] = observed(f'{name}-{label}-detected')
             assert detected, (name, label, 'mutant passed the gate')
         return result
 
