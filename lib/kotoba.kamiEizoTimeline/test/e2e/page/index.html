@@ -1,0 +1,148 @@
+<!doctype html>
+<html><head><meta charset="utf-8"></head>
+<body>
+<script src="/render-proof-bundle.js"></script>
+<script>
+window.runRenderProof = async function () {
+  const ns = kami.eizo.timeline.e2e.render_proof;
+  const wc = w3.webcodecs;
+
+  if (!ns.timeline_valid_QMARK_()) {
+    throw new Error('timeline invalid: ' + JSON.stringify(ns.validation_errors()));
+  }
+
+  const W = 64, H = 64;
+  const numFrames = ns.timeline_duration();
+  const frameDurationUs = ns.frame_duration_us();
+
+  const canvas = document.createElement('canvas');
+  canvas.width = W; canvas.height = H;
+  const ctx = canvas.getContext('2d');
+
+  const encodedChunks = [];
+  let decoderConfigFromEncoder = null;
+  const encoder = wc.make_video_encoder({
+    output: (chunk, metadata) => {
+      encodedChunks.push(chunk);
+      if (metadata && metadata.decoderConfig) decoderConfigFromEncoder = metadata.decoderConfig;
+    },
+    error: (e) => { throw e; }
+  });
+  wc.configure_video_encoder_BANG_(encoder, {
+    codec: 'avc1.42001f',
+    width: W, height: H,
+    bitrate: 2_000_000,
+    framerate: 24,
+    avc: { format: 'avc' }
+  });
+
+  // Paint + encode every frame using ONLY kami.eizo.timeline's own
+  // frame-accurate clip-at-frame math (color_at_frame_js) to decide what
+  // color that frame is -- no separately-hardcoded frame ranges here.
+  const expectedColors = [];
+  for (let i = 0; i < numFrames; i++) {
+    const rgb = ns.color_at_frame_js(i);
+    if (!rgb) throw new Error('no clip covers frame ' + i + ' -- timeline has a gap at a frame it should not');
+    expectedColors.push(rgb);
+    ctx.fillStyle = 'rgb(' + rgb[0] + ',' + rgb[1] + ',' + rgb[2] + ')';
+    ctx.fillRect(0, 0, W, H);
+    const frame = wc.make_video_frame(canvas, { timestamp: i * frameDurationUs, duration: frameDurationUs });
+    // keyFrame:true on every frame -- an all-intra encode. This is a
+    // proof harness verifying pixel-accurate frame boundaries, not a
+    // production encode profile; forcing keyframes removes inter-frame
+    // prediction as a confound when checking exact cut boundaries.
+    wc.encode_video_frame_BANG_(encoder, frame, { keyFrame: true });
+    wc.close_video_frame_BANG_(frame);
+  }
+  await wc.video_encoder_flush_BANG_(encoder);
+  wc.close_video_encoder_BANG_(encoder);
+
+  if (encodedChunks.length !== numFrames) {
+    throw new Error('expected ' + numFrames + ' encoded chunks, got ' + encodedChunks.length);
+  }
+  if (!decoderConfigFromEncoder) throw new Error('no decoder config emitted by encoder');
+
+  const decodedFrames = [];
+  const decoder = wc.make_video_decoder({
+    output: (frame) => decodedFrames.push(frame),
+    error: (e) => { throw e; }
+  });
+  wc.configure_video_decoder_BANG_(decoder, {
+    codec: decoderConfigFromEncoder.codec,
+    codedWidth: decoderConfigFromEncoder.codedWidth,
+    codedHeight: decoderConfigFromEncoder.codedHeight,
+    description: decoderConfigFromEncoder.description
+  });
+  for (const chunk of encodedChunks) {
+    wc.decode_video_chunk_BANG_(decoder, chunk);
+  }
+  await wc.video_decoder_flush_BANG_(decoder);
+  wc.close_video_decoder_BANG_(decoder);
+
+  if (decodedFrames.length !== numFrames) {
+    throw new Error('expected ' + numFrames + ' decoded frames, got ' + decodedFrames.length);
+  }
+
+  const dst = document.createElement('canvas');
+  dst.width = W; dst.height = H;
+  const dctx = dst.getContext('2d');
+
+  function avgColor(ctx2) {
+    const d = ctx2.getImageData(0, 0, W, H).data;
+    let r = 0, g = 0, b = 0, n = d.length / 4;
+    for (let i = 0; i < d.length; i += 4) { r += d[i]; g += d[i + 1]; b += d[i + 2]; }
+    return [Math.round(r / n), Math.round(g / n), Math.round(b / n)];
+  }
+  function close(a, b, tol) {
+    return Math.abs(a[0] - b[0]) <= tol && Math.abs(a[1] - b[1]) <= tol && Math.abs(a[2] - b[2]) <= tol;
+  }
+  const tol = 40; // H.264 lossy compression tolerance, same as org-w3-webcodecs's own E2E
+
+  const perFrame = [];
+  let pass = true;
+  for (let i = 0; i < numFrames; i++) {
+    dctx.drawImage(decodedFrames[i], 0, 0);
+    const actual = avgColor(dctx);
+    decodedFrames[i].close();
+    const expected = expectedColors[i];
+    const ok = close(actual, expected, tol);
+    if (!ok) pass = false;
+    perFrame.push({ frame: i, expected: expected, decoded: actual, ok: ok });
+  }
+
+  // Explicit boundary checks: wherever the expected color changes between
+  // adjacent frames, that IS a cut kami.eizo.timeline's own clip-at-frame
+  // math implies (frame 5: clip-a->clip-b, frame 10: clip-b->clip-c for
+  // this timeline) -- derived from the same color_at_frame_js oracle used
+  // to render, never re-hardcoded here.
+  const boundaries = [];
+  for (let i = 1; i < numFrames; i++) {
+    const prevExp = expectedColors[i - 1], curExp = expectedColors[i];
+    if (JSON.stringify(prevExp) !== JSON.stringify(curExp)) {
+      boundaries.push({
+        atFrame: i,
+        beforeExpected: prevExp, afterExpected: curExp,
+        beforeDecoded: perFrame[i - 1].decoded, afterDecoded: perFrame[i].decoded,
+        boundaryOk: perFrame[i - 1].ok && perFrame[i].ok
+      });
+    }
+  }
+
+  return {
+    pass: pass && boundaries.every(function (b) { return b.boundaryOk; }) && boundaries.length === 2,
+    tol: tol,
+    numFrames: numFrames,
+    numEncodedChunks: encodedChunks.length,
+    numDecodedFrames: decodedFrames.length,
+    perFrame: perFrame,
+    boundaries: boundaries,
+    decoderConfigUsed: {
+      codec: decoderConfigFromEncoder.codec,
+      codedWidth: decoderConfigFromEncoder.codedWidth,
+      codedHeight: decoderConfigFromEncoder.codedHeight,
+      descriptionByteLength: decoderConfigFromEncoder.description ? decoderConfigFromEncoder.description.byteLength : null
+    }
+  };
+};
+</script>
+</body></html>

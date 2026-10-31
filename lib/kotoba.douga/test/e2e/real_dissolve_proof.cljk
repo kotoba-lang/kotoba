@@ -1,0 +1,259 @@
+(ns real-dissolve-proof
+  "Real-ffmpeg-subprocess proof that douga's :dissolve transition render path
+  (`douga.eizo-timeline/render-plan`'s :video-transitions +
+  `douga.ffmpeg/xfade-transition-cmd`) produces a genuine crossfade -- not a
+  hard cut, not a silently-ignored transition, not a broken/corrupted filter.
+
+  This is the dissolve counterpart to test/e2e/real_ffmpeg_proof.cljk (the
+  Wave-8 hard-cut proof): same pattern (lavfi-generated solid-color stills,
+  a real `kami.eizo.timeline` EDL, the REAL douga code paths, a real ffmpeg
+  child process, real ffprobe, real pixel sampling), but exercising the
+  render path that Wave-8 explicitly does NOT cover: a `:dissolve`
+  video-track transition between two clips.
+
+  Builds a 2-clip `kami.eizo.timeline` EDL -- a 4s red clip and a 4s blue
+  clip -- bridged by a 2s :dissolve transition (kami.eizo.timeline's overlap
+  semantics: the blue clip's timeline-start is 2s *before* the red clip's
+  end, i.e. they overlap by exactly the transition's duration; total EDL
+  duration is 4+4-2=6s, not 4+4=8s). Drives that EDL through the REAL
+  `douga.eizo-timeline/render-plan` (which no longer rejects this -- see
+  this repo's README) to get :video-transitions, then the REAL
+  `douga.ffmpeg/xfade-transition-cmd` to get the actual ffmpeg argv,
+  executes it with a real `ffmpeg` child process, and verifies with
+  `ffprobe` + pixel sampling that:
+    - total duration matches the overlap-adjusted 6.0s (not 8.0s -- proving
+      douga honors kami.eizo.timeline's overlap semantics, not just
+      concatenating clip durations);
+    - before the transition window: pure red;
+    - after the transition window: pure blue;
+    - AT the transition's 25%/50%/75% points: a genuine, monotonically
+      shifting red/blue blend (not a hard cut, not corrupted/black) -- e.g.
+      at 50% through, roughly equal red and blue channel contribution.
+
+  Requires: system `ffmpeg` + `ffprobe` on PATH, and a local checkout of
+  kotoba-lang/kami-eizo-timeline whose src/ is reachable via classpath. Run
+  from the douga repo root:
+
+    kbb --backend sci -cp src:<path-to-kami-eizo-timeline>/src test/e2e/real_dissolve_proof.cljk
+
+  Exits 0 and prints a PASS report on success, exits 1 with the failing
+  assertion(s) printed on failure. Never fabricates a pass: every check
+  below is a real measurement of a real file produced by a real ffmpeg
+  subprocess."
+  (:require [kotoba.lang.text :as str]
+            [kami.eizo.timeline :as tl]
+            [kami.eizo.timeline.timecode :as tc]
+            [douga.eizo-timeline :as det]
+            [douga.ffmpeg :as ffmpeg]
+            ["child_process" :refer [execFileSync]]
+            ["fs" :as fs]
+            ["os" :as os]
+            ["path" :as path]))
+
+;; ---------------------------------------------------------------------------
+;; subprocess helpers (same pattern as test/e2e/real_ffmpeg_proof.cljk)
+
+(defn- exec!
+  [argv]
+  (println (str "\n$ " (str/join " " (map (fn [a] (if (str/includes? a " ") (str "'" a "'") a)) argv))))
+  (execFileSync (first argv) (clj->js (vec (rest argv))) #js {:stdio "inherit"}))
+
+(defn- capture-text! [argv]
+  (str (execFileSync (first argv) (clj->js (vec (rest argv)))
+                      #js {:encoding "utf8" :stdio #js ["ignore" "pipe" "ignore"]})))
+
+(defn- capture-bytes! [argv]
+  (execFileSync (first argv) (clj->js (vec (rest argv)))
+                #js {:stdio #js ["ignore" "pipe" "ignore"] :maxBuffer (* 16 1024 1024)}))
+
+;; ---------------------------------------------------------------------------
+;; report bookkeeping
+
+(def ^:private checks (atom []))
+
+(defn- check! [label pass? detail]
+  (swap! checks conj {:label label :pass pass? :detail detail})
+  (println (str (if pass? "  [PASS] " "  [FAIL] ") label " -- " detail)))
+
+(defn- byte-hex [n] (let [s (.toString n 16)] (if (= 1 (count s)) (str "0" s) s)))
+(defn- rgb-hex [[r g b]] (str "#" (byte-hex r) (byte-hex g) (byte-hex b)))
+
+(defn -main []
+  (let [workdir (fs/mkdtempSync (path/join (os/tmpdir) "douga-real-dissolve-proof-"))
+        res-w 320 res-h 240
+        fps 24
+        ;; two clips, distinct pure colors, each 4s -- bridged by a 2s
+        ;; :dissolve transition (kami.eizo.timeline overlap semantics: clip B
+        ;; starts 2s *before* clip A's end -> total 4+4-2=6s, not 8s).
+        dur-a-s 4.0 dur-b-s 4.0 trans-s 2.0
+        dur-a-f (long (Math/round (* dur-a-s fps)))   ;; 96
+        dur-b-f (long (Math/round (* dur-b-s fps)))   ;; 96
+        trans-f (long (Math/round (* trans-s fps)))]  ;; 48
+    (println (str "workdir: " workdir))
+    (try
+      ;; -- 1. generate real source stills (no external assets) -------------
+      (exec! ["ffmpeg" "-y" "-hide_banner" "-loglevel" "error" "-f" "lavfi"
+             "-i" (str "color=c=red:size=" res-w "x" res-h)
+             "-frames:v" "1" (path/join workdir "red.png")])
+      (exec! ["ffmpeg" "-y" "-hide_banner" "-loglevel" "error" "-f" "lavfi"
+             "-i" (str "color=c=blue:size=" res-w "x" res-h)
+             "-frames:v" "1" (path/join workdir "blue.png")])
+
+      ;; -- 2. build a REAL kami.eizo.timeline EDL with a :dissolve ---------
+      (let [tb (tc/make-timebase fps 1 false)
+            clip-a (det/scene-clip {:scene-index 0
+                                     :frame-blob-key (path/join workdir "red.png")
+                                     :timeline-start 0
+                                     :duration-frames dur-a-f})
+            clip-b (det/scene-clip {:scene-index 1
+                                     :frame-blob-key (path/join workdir "blue.png")
+                                     ;; overlap semantics (kami.eizo.timeline/validate-transition):
+                                     ;; clip-end(A) == timeline-start(B) + transition-duration
+                                     :timeline-start (- dur-a-f trans-f)
+                                     :duration-frames dur-b-f})
+            transition (tl/transition {:id :t1 :type :dissolve
+                                        :from-clip (:clip/id clip-a) :to-clip (:clip/id clip-b)
+                                        :duration trans-f})
+            video-track (tl/track {:id :video-1 :type :video
+                                    :clips [clip-a clip-b] :transitions [transition]})
+            timeline (assoc (tl/timeline {:timebase tb :tracks [video-track]})
+                             :douga/resolution (str res-w "x" res-h))
+            validation (tl/validate-timeline timeline)
+            total-frames (tl/timeline-duration timeline)
+            expected-total-s (/ (double total-frames) fps)]
+
+        (println "\n=== kami.eizo.timeline EDL (2 clips, 1 :dissolve transition) ===")
+        (println (pr-str timeline))
+        (println "\n=== validate-timeline ===")
+        (println (pr-str validation))
+        (check! "EDL is valid (tl/validate-timeline)" (:valid? validation) (pr-str (:errors validation)))
+        (check! "timeline-duration honors overlap (144 frames = 6.0s, not 192 = 8.0s)"
+                (= 144 total-frames) (str total-frames " frames"))
+
+        ;; -- 3. drive the REAL douga.eizo-timeline/render-plan ---------------
+        (let [plan (det/render-plan timeline)]
+          (println "\n=== douga.eizo-timeline/render-plan output ===")
+          (println (pr-str plan))
+          (check! "render-plan no longer throws for a :dissolve transition (v0 used to reject all)"
+                  true "render-plan returned normally")
+          (check! "render-plan surfaces :video-transitions with the :dissolve entry (:transition-type :dissolve)"
+                  (= [{:from-scene-index 0 :to-scene-index 1 :duration-frames trans-f
+                       :transition-type :dissolve}]
+                     (:video-transitions plan))
+                  (pr-str (:video-transitions plan)))
+          (check! "render-plan segments carry :duration-frames"
+                  (= [dur-a-f dur-b-f] (mapv :duration-frames (:segments plan)))
+                  (pr-str (mapv :duration-frames (:segments plan))))
+
+          ;; -- 4. build + execute the REAL xfade-transition-cmd -------------
+          (let [seg-a (first (:segments plan))
+                seg-b (second (:segments plan))
+                out-path (path/join workdir "dissolve.mp4")
+                tr-entry (first (:video-transitions plan))
+                cmd (ffmpeg/xfade-transition-cmd
+                     (:frame-blob-key seg-a) (:frame-blob-key seg-b) out-path
+                     {:width (:width plan) :height (:height plan) :fps (:fps plan)
+                      :from-duration-frames (:duration-frames seg-a)
+                      :to-duration-frames (:duration-frames seg-b)
+                      :transition-duration-frames trans-f
+                      :transition-type (:transition-type tr-entry)})]
+            (println "\n=== douga.ffmpeg/xfade-transition-cmd ===")
+            (println (pr-str cmd))
+            (exec! cmd)
+            (check! "dissolve output file produced"
+                    (and (fs/existsSync out-path) (> (.-size (fs/statSync out-path)) 0))
+                    out-path)
+
+            ;; -- 5. verify with REAL ffprobe ---------------------------------
+            (let [probe-json (js/JSON.parse
+                               (capture-text! ["ffprobe" "-v" "error" "-print_format" "json"
+                                               "-show_entries" "format=duration:stream=width,height,codec_type"
+                                               out-path]))
+                  _ (println "\n=== ffprobe output (real, on dissolve.mp4) ===")
+                  _ (println (js/JSON.stringify probe-json nil 2))
+                  v-stream (first (filter #(= "video" (.-codec_type %)) (.-streams probe-json)))
+                  probed-w (.-width v-stream)
+                  probed-h (.-height v-stream)
+                  probed-dur (js/parseFloat (.-duration (.-format probe-json)))]
+              (check! "ffprobe width == EDL resolution width" (= res-w probed-w) (str probed-w))
+              (check! "ffprobe height == EDL resolution height" (= res-h probed-h) (str probed-h))
+              (check! (str "ffprobe duration ~= " expected-total-s
+                           "s (overlap-adjusted 4+4-2=6.0s, single-invocation xfade, tight tolerance)")
+                      (< (Math/abs (- probed-dur expected-total-s)) 0.1)
+                      (str probed-dur "s"))
+
+              ;; -- 6. REAL pixel-sample proof of a genuine crossfade ---------
+              ;; the transition window (kami.eizo.timeline overlap semantics =
+              ;; ffmpeg xfade offset/duration semantics, see
+              ;; douga.ffmpeg/xfade-transition-cmd docstring) spans
+              ;; [dur-a-s - trans-s, dur-a-s] = [2.0s, 4.0s]. Sample before /
+              ;; 25% / 50% / 75% / after that window and assert the R/B
+              ;; channel blend shifts monotonically red -> blue, with a
+              ;; genuine ~50/50 mix at the midpoint -- not a hard cut (which
+              ;; would show pure red until 4.0s then instantly pure blue) and
+              ;; not a broken filter (black/corrupted frame).
+              (let [cx (- (quot res-w 2) 1) cy (- (quot res-h 2) 1)
+                    window-start (- dur-a-s trans-s)                    ;; 2.0s
+                    checkpoints [{:label "before"  :t (- window-start 1.0)}   ;; 1.0s
+                                 {:label "25%"      :t (+ window-start (* 0.25 trans-s))} ;; 2.5s
+                                 {:label "50%"      :t (+ window-start (* 0.50 trans-s))} ;; 3.0s
+                                 {:label "75%"      :t (+ window-start (* 0.75 trans-s))} ;; 3.5s
+                                 {:label "after"    :t (+ window-start trans-s 1.0)}]     ;; 5.0s
+                    sample!
+                    (fn [t]
+                      (let [raw (capture-bytes! ["ffmpeg" "-hide_banner" "-loglevel" "error" "-i" out-path
+                                                 "-ss" (str t) "-vf" (str "crop=2:2:" cx ":" cy ":exact=1")
+                                                 "-frames:v" "1" "-f" "rawvideo" "-pix_fmt" "rgb24" "-"])]
+                        [(aget raw 0) (aget raw 1) (aget raw 2)]))
+                    samples (mapv (fn [{:keys [label t]}] {:label label :t t :rgb (sample! t)}) checkpoints)]
+
+                (println "\n=== pixel-sample proof across the dissolve window [2.0s, 4.0s] ===")
+                (doseq [{:keys [label t rgb]} samples]
+                  (println (str "  t=" t "s (" label ") -> " (rgb-hex rgb) " " (pr-str rgb))))
+
+                (let [before (:rgb (first samples))
+                      p25 (:rgb (nth samples 1))
+                      p50 (:rgb (nth samples 2))
+                      p75 (:rgb (nth samples 3))
+                      after (:rgb (last samples))]
+                  (check! "before window: pure red (R>=230, B<=25)"
+                          (and (>= (first before) 230) (<= (nth before 2) 25))
+                          (rgb-hex before))
+                  (check! "after window: pure blue (R<=25, B>=230)"
+                          (and (<= (first after) 25) (>= (nth after 2) 230))
+                          (rgb-hex after))
+                  (check! "25% point: majority red, some blue (a genuine blend, not pure red/blue)"
+                          (and (> (first p25) (nth p25 2)) (> (nth p25 2) 25) (< (first p25) 230))
+                          (rgb-hex p25))
+                  (check! "50% point: roughly equal R/B contribution (|R-B| <= 30, both mid-range)"
+                          (and (<= (Math/abs (- (first p50) (nth p50 2))) 30)
+                               (> (first p50) 60) (< (first p50) 200)
+                               (> (nth p50 2) 60) (< (nth p50 2) 200))
+                          (rgb-hex p50))
+                  (check! "75% point: majority blue, some red (a genuine blend, not pure red/blue)"
+                          (and (> (nth p75 2) (first p75)) (> (first p75) 25) (< (nth p75 2) 230))
+                          (rgb-hex p75))
+                  (check! "R channel strictly decreases before -> 25% -> 50% -> 75% -> after"
+                          (apply > (map first [before p25 p50 p75 after]))
+                          (pr-str (map first [before p25 p50 p75 after])))
+                  (check! "B channel strictly increases before -> 25% -> 50% -> 75% -> after"
+                          (apply < (map #(nth % 2) [before p25 p50 p75 after]))
+                          (pr-str (map #(nth % 2) [before p25 p50 p75 after])))
+                  (check! "G channel stays ~0 throughout (no corruption/color-space artifact introducing green)"
+                          (every? #(<= (second %) 10) [before p25 p50 p75 after])
+                          (pr-str (map second [before p25 p50 p75 after])))))))))
+
+      (let [all @checks
+            pass? (every? :pass all)]
+        (println (str "\n=== SUMMARY: " (count (filter :pass all)) "/" (count all) " checks passed ==="))
+        (println (str "workdir (artifacts kept for inspection): " workdir))
+        (println (if pass? "\nRESULT: PASS" "\nRESULT: FAIL"))
+        (js/process.exit (if pass? 0 1)))
+
+      (catch :default e
+        (println "\nERROR:" (.-message e))
+        (println (str "workdir (kept for inspection): " workdir))
+        (println "\nRESULT: FAIL (exception)")
+        (js/process.exit 1)))))
+
+(-main)

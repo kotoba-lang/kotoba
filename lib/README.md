@@ -976,6 +976,13 @@ The bundled standard libraries live in this repository:
 | `kotoba.kamiEngineRotor` | `kotoba.kamiEngineRotor/src` | `rotor.atmosphere`, `rotor.solver` (Kotoba project library) |
 | `kotoba.kamiEngineMultirotor` | `kotoba.kamiEngineMultirotor/src` | `multirotor.closure` (Kotoba project library) |
 | `kotoba.kamiEngineVehicleDesigner` | `kotoba.kamiEngineVehicleDesigner/src` | `vdesign.bev-store`, `vdesign.cad`, `vdesign.cartridge`, `vdesign.cartridge-fcev`, … (Kotoba project library) |
+| `kotoba.kamiEizoTimeline` | `kotoba.kamiEizoTimeline/src` | `kami.eizo.timeline`, `kami.eizo.timeline.timecode` (Kotoba project library) |
+| `kotoba.douga` | `kotoba.douga/src` | `douga.eizo-timeline`, `douga.ffmpeg` (Kotoba project library) |
+| `kotoba.anime` | `kotoba.anime/src` | `anime.production`, `anime.timeline` (Kotoba project library) |
+| `kotoba.kamiEizoCompositor` | `kotoba.kamiEizoCompositor/src` | `kami.eizo.compositor.blend`, `kami.eizo.compositor.chroma-key`, `kami.eizo.compositor.nodes`, `kami.eizo.compositor.roto`, … (Kotoba project library) |
+| `kotoba.kamiEizoGrade` | `kotoba.kamiEizoGrade/src` | `kami.eizo.grade`, `kami.eizo.grade.cdl`, `kami.eizo.grade.curve`, `kami.eizo.grade.lut`, … (Kotoba project library) |
+| `kotoba.kamiMangakaPage` | `kotoba.kamiMangakaPage/src` | `kami.mangaka.komawari`, `kami.mangaka.page` (Kotoba project library) |
+| `kotoba.kamiMangakaReader` | `kotoba.kamiMangakaReader/src` | `kami.mangaka.reader.app`, `kami.mangaka.reader.ssr`, `kami.mangaka.reader.views` (Kotoba project library) |
 
 `catalog.edn` declares exact aliases for old repository/coordinate names.
 `kotoba.*` is a project namespace and requires no DNS ownership. Each package
