@@ -1118,10 +1118,10 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_dhcp_option_ob
   1492a66d9668dc88e1b80536ba5bb4ab232ec4eaaf7d76975670fe058aa1b67f \
   kotoba_aiueos_dhcp_option_u32
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_relay_hello_object" \
-  4c38d1ec0602a46beea61a5759b450da0bef260bdd1f04aab1055d141134958d \
+  3479a5c60d41a052321b944a9fe04ed714d13a7a5ca730e1d2ce582fa1658e7d \
   kotoba_aiueos_relay_hello_payload
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_relay_ack_object" \
-  e5bafb1b7fd0e57ecf2cc5e7521a9c960f9e7005a455c6bd7aecf2e359bd42bb \
+  466804ddcfca61fe51cf16330ad77f6ff74b523be97617ef1cb31f05f4a9a707 \
   kotoba_aiueos_relay_ack_payload_valid
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_inference_status_valid_object" \
   7bffa1b85e1835493a624c85dd4cee15a63f48e180521055efd17d4e700d60a8 \
