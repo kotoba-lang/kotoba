@@ -37,24 +37,24 @@ uint64_t kotoba_aiueos_sha256(const uint8_t *input, uint64_t bytes,
   return 1;
 }
 
-uint64_t kotoba_aiueos_ecdsa_p256_sign(const uint8_t *private_key,
-                                       const uint8_t *digest,
-                                       const uint8_t *nonce,
+uint64_t kotoba_aiueos_ecdsa_p256_sign(const uint8_t *in,
+                                       uint64_t in_length,
                                        uint8_t *signature,
-                                       uint8_t *workspace) {
-  (void)private_key;
-  (void)digest;
-  (void)nonce;
-  (void)workspace;
+                                       uint64_t signature_length,
+                                       uint8_t *workspace, uint64_t workspace_length) {
+  (void)in;
+  (void)in_length;
+  (void)signature_length;
+  (void)workspace; (void)workspace_length;
   memset(signature, 0x55, 64);
   return 1;
 }
 
-uint64_t kotoba_aiueos_ecdsa_p256_public(const uint8_t *private_key,
-                                         uint8_t *public_key,
-                                         uint8_t *workspace) {
-  (void)private_key;
-  (void)workspace;
+uint64_t kotoba_aiueos_ecdsa_p256_public(const uint8_t *private_key, uint64_t private_key_length,
+                                         uint8_t *public_key, uint64_t public_key_length,
+                                         uint8_t *workspace, uint64_t workspace_length) {
+  (void)private_key; (void)private_key_length; (void)public_key_length;
+  (void)workspace; (void)workspace_length;
   memset(public_key, 0x01, 64);
   return 1;
 }

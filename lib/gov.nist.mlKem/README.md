@@ -110,7 +110,17 @@ Measured 2026-10-30 on Apple M1 Max with the Amu Mac root of main `91faa123`
 | ctl-cbd | CBD sign inverted | 56 |
 | ctl-dkcheck | dk check compares H(ek) with itself | 55 |
 
-Not yet: the remaining ACVP cases run natively (the `.cljk` suite runs all of them).
+All 80 committed ACVP ML-KEM-768 tests also run natively (AWAI-117, 2026-11-01):
+`scripts/check-acvp-mlkem-native.py` checks each vector file's sha256, reads it as data
+(no `.cljk` is compiled or run), and generates one entry module per chunk of 5 or 10
+tests, with the bytes as vector literals, built as modules with `sha3/core.kotoba` and
+`mlkem/core.kotoba`. It covers keyGen 25, encapsulation 25, decapsulation 10 (5 of them
+implicit rejection of a modified ciphertext), dk check 10 and ek check 10. In the checks,
+the 5 `modified H` keys and the 5 keys with a coefficient >= q must be refused. All
+three mutants above (zeta, mask, cbd) must fail a chunk. On the Mac (Amu Mac root image
+sha256 `dd71f394…`, packager `7691467c…`) the run gave `PASS_ACVP_MLKEM_NATIVE`: 14
+chunks, about 0.5-1.5 s each. zeta and cbd were caught in keygen-00, and mask in
+decaps-00. CI runs it on the Linux arm64 lane, after the Wycheproof step.
 The gate runs in CI on Linux arm64 (`scripts/check-pq-native.py`, since kotoba#1014) and,
 as a KX64 image, on Linux x86_64 in the `pq-unity` lane on main and nightly (AWAI-117),
 with the same results as arm64 for the pass and every mutant.

@@ -1116,7 +1116,7 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_x25519_object"
   633ec4f074cabbca0d72b4c2943e50c629c2997eaae90fd52f179f6e73084544 \
   kotoba_aiueos_x25519
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_ecdsa_object" \
-  5540c3b633bec183446ac11bdbedfb84970bfe134bd45af6490a3bcded88f855 \
+  c6766cfcd7e7bd4e3584c1aa461a4e8fd89522cff8534afdaa3b256acffebe13 \
   kotoba_aiueos_ecdsa_p256_sha256_verify
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_aes128_gcm_object" \
   e4174d9e1c5c9e7d76673f7aec258b7483d6279f51605371d91558d15940cd3b \
@@ -1219,12 +1219,12 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_device_worker_
   kotoba_aiueos_device_worker_digest
 if [ -n "$ecdsa_sign_link" ]; then
   python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_ecdsa_sign_object" \
-    42496f9fe7c540c869e1bbe1d63e6b2a7e5e9387f5ffb486f89cc3f1a6f0adb6 \
+    459c2be94f79306761661a3ab7cb3df1d0c7785f4d77bce3ae5b0d46d393fec7 \
     kotoba_aiueos_ecdsa_p256_sign
 fi
 if [ -n "$ecdsa_public_link" ]; then
   python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_ecdsa_public_object" \
-    b1b1c6ccef85594c890c0a17be9c9e718c00b54da9615b5bd56510f883de0172 \
+    fa8a89dc88383e2ef47f9bf93087eeff2a9b20038a2b11d9b7ab7865123b47cd \
     kotoba_aiueos_ecdsa_p256_public
 fi
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_ime_object" \

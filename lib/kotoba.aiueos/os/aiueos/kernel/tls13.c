@@ -6,7 +6,7 @@ extern uint64_t kotoba_aiueos_sha256(const uint8_t *, uint64_t, uint8_t[32],
 extern uint64_t kotoba_aiueos_x25519(const uint8_t *, uint64_t, const uint8_t *, uint64_t,
                                      uint8_t *, uint64_t, uint8_t *, uint64_t);
 extern uint64_t kotoba_aiueos_ecdsa_p256_sha256_verify(
-    const uint8_t *, const uint8_t *, const uint8_t *, uint8_t *, uint64_t);
+    const uint8_t *, uint64_t, const uint8_t *, uint64_t, const uint8_t *, uint64_t, uint8_t *, uint64_t);
 /* The TLS 1.3 AEAD and record layer (ADR-0132, ADR-0133). Both return a
    REASON CODE and ZERO IS SUCCESS -- the opposite of the C in this file, so
    every call site has to be written rather than transcribed. */
@@ -387,7 +387,7 @@ int aiueos_tls13_run_certverify(void) {
      TCG; doing it inside feed delayed the ACK until the peer had moved on,
      so HTTP GET never got a body (app=0 after get=1). */
   if (!certverify_parsed || !have_leaf_pub) return 0;
-  if (!kotoba_aiueos_ecdsa_p256_sha256_verify(cv_rs, cv_digest, leaf_pub,
+  if (!kotoba_aiueos_ecdsa_p256_sha256_verify(cv_rs, 64, cv_digest, 32, leaf_pub, 64,
                                               ecdsa_ws, 2048))
     return 0;
   certverify_ok = 1;
@@ -664,10 +664,10 @@ int aiueos_tls13_ecdsa_selftest(void) {
   uint8_t bad[64];
   uint32_t i;
   static uint8_t ws[2048] AIUEOS_TLS_HIGH_BSS;
-  if (!kotoba_aiueos_ecdsa_p256_sha256_verify(sig, digest, pub, ws, 2048)) return 0;
+  if (!kotoba_aiueos_ecdsa_p256_sha256_verify(sig, 64, digest, 32, pub, 64, ws, 2048)) return 0;
   copy_bytes(bad, sig, 64);
   bad[63] = (uint8_t)(bad[63] + 1);
-  if (kotoba_aiueos_ecdsa_p256_sha256_verify(bad, digest, pub, ws, 2048)) return 0;
+  if (kotoba_aiueos_ecdsa_p256_sha256_verify(bad, 64, digest, 32, pub, 64, ws, 2048)) return 0;
   for (i = 0; i < 2048; i++) ws[i] = 0;
   return 1;
 }
