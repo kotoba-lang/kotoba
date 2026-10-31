@@ -962,7 +962,7 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_pci_config_rea
   04ab0830219e6e03552cfc46ccfc56ce34fd1cf84b2f418d3a7916d4aac264d6 \
   kotoba_aiueos_pci_config_read
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_pci_config_write_object" \
-  354f8ca148b0264af2dac50b2d26af9d0b439f641b0dcdf5714fd7465add4ba5 \
+  720c883da6a6f2563b02ec64c139f49a7dfe9d3ee883623e8821f2ff348c7be0 \
   kotoba_aiueos_pci_config_write
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_mmio_map_admit_object" \
   638de7487df737be76d834c57fc02e74026eac9ad9b46d669efee3bfa247014c \
@@ -990,16 +990,16 @@ kotoba_tss_descriptor_object=${AIUEOS_KOTOBA_TSS_DESCRIPTOR_OBJECT:-"$aiueos/kot
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_tss_descriptor_object" \
   dc710d73671b198b765a418414fb34a50ed9d80568412697734f91070f5f795e kotoba_aiueos_tss_descriptor_build
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_pic_disable_object" \
-  c88ff01d1eb89f9cf549f4c0ca24f34928f948cab4a96cad82a8ab518bf7fad1 \
+  77e0b58183e383b81d6b98ecf7179103222612154a57bdaa38c505b79f807e16 \
   kotoba_aiueos_pic_disable
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_cpu_feature_nx_object" \
-  8e6b33fede5b4dd669e91c52d27273c2e36fc883e3b7d7d5b99806ab3e96903d \
+  79ecc1f19884ff42250a1217776a721d85bd388310b2cd1375da67358a6e3666 \
   kotoba_aiueos_cpu_feature_nx
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_cpu_feature_syscall_object" \
-  6255927efd8e44e7b204171426595c8040ee9fec57805c85162acbae5657ae61 \
+  9f3a6ddf02475e71c152dc08d92ee3f8b1a0456c01a7aa64619e0df5826a667f \
   kotoba_aiueos_cpu_feature_syscall
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_cpu_apic_id_object" \
-  078886d7c38cde4761e31a7f5a8b2e10c0facc9491394fb00d2702e515955183 \
+  3bfca72d9259eafc4638e81d2d9c1c306b932b9c19f861c0899e9e35ee213b95 \
   kotoba_aiueos_cpu_apic_id
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_syscall_range_object" \
   b8d28342e37f45afdc6a0023132e8d11da7abb6615a94d6e2a0c6174922146a2 \
