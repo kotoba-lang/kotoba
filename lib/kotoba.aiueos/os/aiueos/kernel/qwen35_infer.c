@@ -691,11 +691,13 @@ static void linear_output_norm_c(float *values, float *gate, uint32_t heads,
 extern uint64_t kotoba_aiueos_qwen35_activation(uint64_t mode, float *a,
                                                 const float *b, uint64_t count,
                                                 uint64_t spare);
-/* Every argument as a word: mode 0 reads `b` as a POINTER (the weights) while
-   modes 1 and 2 read it as a head COUNT, so a typed declaration would have to
-   lie about one of them. */
-extern uint64_t kotoba_aiueos_qwen35_norm(uint64_t mode, uint64_t a, uint64_t b,
-                                          uint64_t c, uint64_t d);
+/* JUN-633: every pointer comes with its own length (amu's native object route).
+   mode_heads is the mode (0..3) | the head count << 8; count is mode 0's count
+   or modes 1..3's width. A length that is not the one the shape gives is
+   refused (-9). */
+extern uint64_t kotoba_aiueos_qwen35_norm(uint64_t mode_heads, uint64_t a, uint64_t a_length,
+                                          uint64_t w, uint64_t w_length, uint64_t o,
+                                          uint64_t o_length, uint64_t count);
 #endif
 
 #ifdef AIUEOS_QWEN35_C_REFERENCE_NORM
@@ -753,9 +755,9 @@ static int rms_norm(const float *input,
                     uint64_t count, float *output) {
   const float *weight = f32_vector(weights, count);
   if (!weight) return 0;
-  return kotoba_aiueos_qwen35_norm(0, (uint64_t)(uintptr_t)input,
-                                   (uint64_t)(uintptr_t)weight, count,
-                                   (uint64_t)(uintptr_t)output) == 0;
+  return kotoba_aiueos_qwen35_norm(0, (uint64_t)(uintptr_t)input, count * 4U,
+                                   (uint64_t)(uintptr_t)weight, count * 4U,
+                                   (uint64_t)(uintptr_t)output, count * 4U, count) == 0;
 }
 
 static int rms_norm_heads_weighted(float *values, uint32_t heads,
@@ -763,14 +765,14 @@ static int rms_norm_heads_weighted(float *values, uint32_t heads,
                                    const struct aiueos_qwen35_tensor *tensor) {
   const float *weights = f32_vector(tensor, width);
   if (!weights) return 0;
-  return kotoba_aiueos_qwen35_norm(2, (uint64_t)(uintptr_t)values, heads,
-                                   width,
-                                   (uint64_t)(uintptr_t)weights) == 0;
+  return kotoba_aiueos_qwen35_norm(2U | (uint64_t)heads << 8, (uint64_t)(uintptr_t)values,
+                                   (uint64_t)heads * width * 4U, (uint64_t)(uintptr_t)weights,
+                                   (uint64_t)width * 4U, 0, 0, width) == 0;
 }
 
 static int l2_norm_heads(float *values, uint32_t heads, uint32_t width) {
-  return kotoba_aiueos_qwen35_norm(1, (uint64_t)(uintptr_t)values, heads,
-                                   width, 0) == 0;
+  return kotoba_aiueos_qwen35_norm(1U | (uint64_t)heads << 8, (uint64_t)(uintptr_t)values,
+                                   (uint64_t)heads * width * 4U, 0, 0, 0, 0, width) == 0;
 }
 
 static int activate(uint32_t mode, float *values, const float *gate,
@@ -796,8 +798,9 @@ static int conv4(float *values, const float *kernel, float *history,
    `values`).  Null is a refusal. */
 static float *linear_output_norm(float *values, float *gate, uint32_t heads,
                                  uint32_t width, const float *weights) {
-  if (kotoba_aiueos_qwen35_norm(3, (uint64_t)(uintptr_t)values, heads, width,
-                                (uint64_t)(uintptr_t)weights) != 0 ||
+  if (kotoba_aiueos_qwen35_norm(3U | (uint64_t)heads << 8, (uint64_t)(uintptr_t)values,
+                                (uint64_t)heads * width * 4U, (uint64_t)(uintptr_t)weights,
+                                (uint64_t)width * 4U, 0, 0, width) != 0 ||
       kotoba_aiueos_qwen35_activation(QWEN_ACT_SILU_GATE, gate, values,
                                       (uint64_t)heads * width, 0) != 0)
     return 0;
@@ -2361,8 +2364,8 @@ static int qwen_parity_norm(void) {
       return 0;
 
   /* A refusal: mode 4 does not exist. */
-  if (kotoba_aiueos_qwen35_norm(4, (uint64_t)(uintptr_t)qwen_parity_norm_obj,
-                                1, 8, 0) != (uint64_t)(int64_t)-2)
+  if (kotoba_aiueos_qwen35_norm(4U | 1U << 8, (uint64_t)(uintptr_t)qwen_parity_norm_obj, 32,
+                                0, 0, 0, 0, 8) != (uint64_t)(int64_t)-2)
     return 0;
   return 1;
 }
