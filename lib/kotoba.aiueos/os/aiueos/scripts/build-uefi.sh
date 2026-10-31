@@ -1014,7 +1014,7 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_capability_obj
   ddf691b6ba53fbc480fbd92657f56a8712d37cfe3dada12acd8ea0c9c7c823c7 \
   kotoba_aiueos_capability_plan
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_capability_mutation_object" \
-  026bcc5a6cc3336d892f3c58cdbf07dbca49f72d8e129f8cb46c29f9fdb7b668 \
+  9cc5f7e67bb5954ddf8562180e88c57d75129e914d4c0df60671e983c6139938 \
   kotoba_aiueos_capability_mutation_plan
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_service_lifecycle_object" \
   2225dd030ff13ce8bef2b6298f86bbb6d75fdb85ed0c20e6a9a30a24a5aef1e7 \
@@ -1050,13 +1050,13 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_qwen35_detoken
   d1713172ee70aaf0c46c3f06fe38a37eb103219192d708fe1b8acf556ec9cea0 \
   kotoba_aiueos_qwen35_detokenize
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_digest_equal_object" \
-  d5af2bd0ed029cb5e2c64445dc28cf360a09f7467e684d0b3ebb8b50f2417a46 \
+  2eaa8a5430555d37d3e90a9b760d9fcbe007ddef5098a2ffa6570d157d0cc7a1 \
   kotoba_aiueos_digest_equal
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_catalog_valid_object" \
-  fb2421c25351d62061b62266f12b63fdd1bf16cd917da2dd852018ad29ac6777 \
+  a19c5656e46b729806150878734f8029a3f4b9665498710e3be6355abd37eb03 \
   kotoba_aiueos_app_catalog_valid
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_app_lookup_object" \
-  ec822fe970c315e15c997372f30cb4c016c482c0192e550117c4c1a69000b771 \
+  51200387544992fb11849df9d5dea35d1bd2a9460b64d06d415d37c9875514b5 \
   kotoba_aiueos_app_lookup_plan
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_user_elf_valid_object" \
   "$kotoba_user_elf_valid_sha" \
@@ -1073,25 +1073,25 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_kernel_context
   c56a7b909582e74c34fee02461f185d494b386fef999b48a5dc659643d7d5ecb \
   kotoba_aiueos_kernel_context_build
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_mapping_plan_object" \
-  bdff4601a48da4627345a8b5bf2018cce70baff7ee56151e56365f6ccb42c66a \
+  f6ed2771091568e6b09f78ea00c1ddd78fc10bb36a9df317596733c8eb920004 \
   kotoba_aiueos_page_mapping_plan
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_process_plan_object" \
-  35b980f64d0238a67662e924a641fead9cb742523911963cf4d5e32db6bc7752 \
+  e78f3b24a6f45bce9e400fddf7d5f2f6803371352d961d506336c99603af7c57 \
   kotoba_aiueos_process_create_plan
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_teardown_plan_object" \
-  2d30a3cf9af5ff5d040f907a476bb16d420fc8bd91fc1c04adfdddfb642ec823 \
+  1c9e0d89cdaf309ee9368ff2f05d45cdd21b0cc54e7d97edcdaaaf04a4276fe3 \
   kotoba_aiueos_process_teardown_plan
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_task_plan_object" \
-  c5c3cc5f553021af742bd5ab674196b76310d4296c88290d665870de7c6f9e63 \
+  70f05a1bc662f6e4ceb8bbfc3c2a62ec8b56137f8061a6d8a436710d18a57fbd \
   kotoba_aiueos_task_slot_plan
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_dispatch_plan_object" \
-  028cc85bcf38dd6b0a702a28904f6e281eda82122599e5fb06e150d718546f6a \
+  38a5921ebad48451995cd0fdea862f91455ebdc13f10707f3376fd8f0999079c \
   kotoba_aiueos_scheduler_dispatch_plan
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_exit_route_object" \
-  548fc48d4c59db4f69d9477da1d776b0de8cbde743ef08681674142d732498c0 \
+  96f5495aac12fd5ab01f7aa0f24e370cac3f9af3b15a81ec6a7c19515b9f67db \
   kotoba_aiueos_task_exit_route
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_service_task_object" \
-  a5ad1725c09d11f4c12f83c867846b6ebede3455e33e7276f7e9c4c5fbd17275 \
+  b54ebc310aecc4b428d9aebc4f059cef41a7983bffef04c6fdc7a8d8a8e89bf0 \
   kotoba_aiueos_service_task_transition
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_rsa2048_object" \
   0f4eeeecdc0605217aae5dfe55cd219c2c9a586a9ca9104d760d87c21642e72c \
@@ -1124,13 +1124,13 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_relay_ack_obje
   e5bafb1b7fd0e57ecf2cc5e7521a9c960f9e7005a455c6bd7aecf2e359bd42bb \
   kotoba_aiueos_relay_ack_payload_valid
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_inference_status_valid_object" \
-  7bffa1b85e1835493a624c85dd4cee15a63f48e180521055efd17d4e700d60a8 \
+  21de5e407a735ac9b312c40810b4a736ab74892934b0be4dc9b924ac04b968bc \
   kotoba_aiueos_inference_status_valid
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_inference_rate_object" \
-  069d218c6a91a3ac4728d461a2089977f39f9d84b2a62dfa2800159d1450a41c \
+  a2db49e900c7c6c0ecaa6540aeaca9d8bb37c2cf17dc107182bd46ce18c26c44 \
   kotoba_aiueos_inference_milli_tokens_per_second
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_model_mapping_plan_object" \
-  c636da1971323aeba566cec7d64a7c116cda77bf75e2248ad4371beda0587d35 \
+  776eb094e302e7b909218df2a96bef104a2290813904b903fde0aaeed894a684 \
   kotoba_aiueos_model_mapping_plan
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_model_handoff_validate_object" \
   057a0ba7a1d150b5eeca2a3e3d8c95642e3aa140181f6f20d5cdbb2f2a8a6c10 \
