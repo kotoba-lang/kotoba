@@ -822,25 +822,10 @@ build_source_dirty=false
 if [ -n "$(git -C "$repo" status --porcelain --untracked-files=no)" ]; then
   build_source_dirty=true
 fi
-python3 - "$build_identity_header" "$build_version" \
-  "$build_source_commit" "$build_source_dirty" <<'PYBUILD'
-from pathlib import Path
-import re
-import sys
-
-out, version, commit, dirty = sys.argv[1:]
-if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?", version):
-    raise SystemExit("error: os/aiueos/VERSION must be a bounded SemVer string")
-if not re.fullmatch(r"[0-9a-f]{40}", commit):
-    raise SystemExit("error: AIUEOS source commit must be a full lowercase git hash")
-suffix = "-DIRTY" if dirty == "true" else ""
-Path(out).write_text(
-    "#ifndef AIUEOS_BUILD_IDENTITY_H\n#define AIUEOS_BUILD_IDENTITY_H\n"
-    f'#define AIUEOS_BUILD_VERSION "{version}"\n'
-    f'#define AIUEOS_BUILD_SOURCE_HASH "{commit[:12]}"\n'
-    f'#define AIUEOS_BUILD_DIRTY_SUFFIX "{suffix}"\n'
-    "#endif\n", encoding="ascii")
-PYBUILD
+# JUN-555: the build-identity header is written by Kotoba (native/build-identity-header.kotoba)
+# through the pinned Amu Mac root. Without that native route the build refuses; there is no Python fallback.
+sh "$aiueos/scripts/run-native-generator.sh" "$aiueos/native/build-identity-header.kotoba" \
+  "$build_identity_header" -- "$build_version" "$build_source_commit" "$build_source_dirty"
 python3 - "$model_identity_header" "$model_total" "$model_part0" \
   "$model_part1" "$model_part2" "$model_sha256" "$model_min_address" \
   "$model_max_address" "$model_parts" "$model_name" "$model_file_prefix" <<'PYMODEL'
