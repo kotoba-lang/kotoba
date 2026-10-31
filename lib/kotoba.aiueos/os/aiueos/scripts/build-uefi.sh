@@ -1008,7 +1008,7 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_copy_in_object
   ff456522bf05ba3caf43e1f8c3226c26830d02f3168a722042bf46731386431d \
   kotoba_aiueos_copy_in
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_allocator_plan_object" \
-  2073156ec60c484bd2d9cdd4e93e2fbee4c9f3eef77c343306f839a4e5bcc0d1 \
+  d7af46c1d649ec2de27e26eeb254694f22c8ec070ce5b4b10de7ea7a0f3411f2 \
   kotoba_aiueos_allocator_plan
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_capability_object" \
   ddf691b6ba53fbc480fbd92657f56a8712d37cfe3dada12acd8ea0c9c7c823c7 \
@@ -1067,10 +1067,10 @@ if [ "${AIUEOS_PLC_RT_SMOKE:-0}" = 1 ]; then
     kotoba_aiueos_rt_scheduler_plan
 fi
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_user_context_object" \
-  7b724a994ebdcb1c223bd381b34162fa6a7044364e35ae0e0894412d8817238f \
+  2b08fca41c7c9ff1c4f9c44b4c631461bbcca467e175cf390265d3f6c4a5cc3e \
   kotoba_aiueos_user_context_build
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_kernel_context_object" \
-  f5bc59c40dde2df00db88a2e6097409c222bed80308778c6f5a94211bea1ef4d \
+  c56a7b909582e74c34fee02461f185d494b386fef999b48a5dc659643d7d5ecb \
   kotoba_aiueos_kernel_context_build
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_mapping_plan_object" \
   bdff4601a48da4627345a8b5bf2018cce70baff7ee56151e56365f6ccb42c66a \
