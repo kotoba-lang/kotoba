@@ -21,6 +21,9 @@ kotoba_msr_write_object=${AIUEOS_KOTOBA_MSR_WRITE_OBJECT:-"$aiueos/kotoba/msr-wr
 # Same shape as the apic.c/MSR omission the comment above records.
 kotoba_acpi_checksum_object=${AIUEOS_KOTOBA_ACPI_CHECKSUM_OBJECT:-"$aiueos/kotoba/acpi-checksum-ok.o"}
 kotoba_acpi_table_valid_object=${AIUEOS_KOTOBA_ACPI_TABLE_VALID_OBJECT:-"$aiueos/kotoba/acpi-table-valid.o"}
+# JUN-709: kernel/acpi.c calls the DMAR and MADT walks, which build-uefi.sh links; the multiboot link needs them too.
+kotoba_acpi_dmar_object=${AIUEOS_KOTOBA_ACPI_DMAR_OBJECT:-"$aiueos/kotoba/acpi-dmar-parse.o"}
+kotoba_acpi_madt_object=${AIUEOS_KOTOBA_ACPI_MADT_OBJECT:-"$aiueos/kotoba/acpi-madt-parse.o"}
 # multiboot/main.c's `legacy_pic_disable` is now a call into this object rather
 # than ten `out8`s -- the same object kernel/main.c calls on the UEFI path, which
 # is the point: ADR-0028's fix existed only here, and the UEFI path had the same
@@ -87,6 +90,10 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_acpi_checksum_
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_acpi_table_valid_object" \
   e0892a0b0da830e332f7c4f0e6204f6d4d65575eb066aa4f3fd9a9a9136e7887 \
   kotoba_aiueos_acpi_table_valid
+python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_acpi_dmar_object" \
+  458deaf9b52b345caaaeb1c4ee0ee58a72d2e94974de11a28f3a092fc8aae769 kotoba_aiueos_acpi_dmar_parse
+python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_acpi_madt_object" \
+  e5899fc554b156b4bd3c1a9268c70eac290f464fa3ad333644fd621d75332736 kotoba_aiueos_acpi_madt_parse
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_pic_disable_object" \
   77e0b58183e383b81d6b98ecf7179103222612154a57bdaa38c505b79f807e16 \
   kotoba_aiueos_pic_disable
@@ -109,6 +116,7 @@ zig ld.lld -T "$aiueos/multiboot/linker.ld" -o "$kernel64" \
   "$mb/entry.o" "$mb/main.o" "$mb/acpi.o" "$mb/apic.o" "$probe" \
   "$kotoba_msr_read_object" "$kotoba_msr_write_object" \
   "$kotoba_acpi_checksum_object" "$kotoba_acpi_table_valid_object" \
+  "$kotoba_acpi_dmar_object" "$kotoba_acpi_madt_object" \
   "$kotoba_pic_disable_object"
 
 # QEMU's Multiboot loader wants an ELFCLASS32/EM_386 container; wrap the linked
