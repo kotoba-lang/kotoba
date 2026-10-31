@@ -7813,9 +7813,9 @@ qwen_runtime_boot_complete:
       extern volatile uint64_t aiueos_plc_loader_stage;
       serial_string("AIUEOS_PLC_RT_FAIL embedded-elf-provider-or-safe-state stage=");
       serial_decimal(aiueos_plc_process_stage);
-      serial_string(" loader=");
-      serial_decimal(aiueos_plc_loader_stage);
-      serial_string("\r\n");
+      serial_string(" loader="); serial_decimal(aiueos_plc_loader_stage); /* JUN-736: and the release refusal */
+      extern uint64_t aiueos_plc_rt_fault(void), aiueos_plc_rt_release_expected(void), aiueos_plc_rt_release_observed(void);
+      serial_string(" fault="); serial_decimal64(aiueos_plc_rt_fault()); serial_string(" release="); serial_decimal64(aiueos_plc_rt_release_expected()); serial_string(" observed="); serial_decimal64(aiueos_plc_rt_release_observed()); serial_string("\r\n");
       qemu_exit(0x70);
     }
     serial_string("AIUEOS_PLC_RT_OK profile=aiueos-plc-v1 scheduler=fixed-priority-preemptive priority=5 program=signed-cpl3-elf signature=ecdsa-p256-sha256 tamper=rejected scans=100 inputs=alternating-enable,sensor41..140 transport=syscall release=apic-absolute-ticks cycle=10ticks input=snapshot output=atomic-safe-state capabilities=16,17,18,19 failures=stage,watchdog,budget,deadline,program timing=logical-unqualified\r\n");

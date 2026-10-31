@@ -1579,8 +1579,17 @@ zig cc -target x86_64-freestanding-none -std=c11 -O2 \
   -c -o "$kernel_framebuffer_object" "$aiueos/kernel/framebuffer.c"
 if [ -n "$plc_runtime_link" ]; then
   if [ "${AIUEOS_PLC_RT_SMOKE:-0}" = 1 ]; then
+    # JUN-736 negative control: AIUEOS_PLC_RT_FORCE_MISS=<scan> builds a kernel that releases that scan one tick late.
+    plc_runtime_cflags=
+    if [ -n "${AIUEOS_PLC_RT_FORCE_MISS:-}" ]; then
+      case "$AIUEOS_PLC_RT_FORCE_MISS" in
+        *[!0-9]*) echo "error: AIUEOS_PLC_RT_FORCE_MISS must be a scan index" >&2; exit 1 ;;
+      esac
+      plc_runtime_cflags="-DAIUEOS_PLC_RT_FORCE_MISS_SCAN=$AIUEOS_PLC_RT_FORCE_MISS"
+    fi
+    # shellcheck disable=SC2086 # intentional optional define
     zig cc -target x86_64-freestanding-none -std=c11 -O2 \
-      -ffreestanding -fno-stack-protector -mno-red-zone \
+      -ffreestanding -fno-stack-protector -mno-red-zone $plc_runtime_cflags \
       -c -o "$kernel_plc_runtime_object" "$aiueos/kernel/plc_runtime.c"
     python3 "$aiueos/scripts/make-plc-embedded-assembly.py" \
       "$AIUEOS_PLC_ELF" "$AIUEOS_PLC_RECEIPT" \

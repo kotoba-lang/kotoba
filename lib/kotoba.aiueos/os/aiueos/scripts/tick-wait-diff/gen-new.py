@@ -4,7 +4,7 @@
 import sys
 src = open(sys.argv[1]).read()
 lo = src.index("  /* kotoba/tick-wait.o: look, then sti; hlt; cli, until the tick counter\n")
-hi = src.index("  uint64_t release=plc.next_release;\n", lo)
+hi = src.index("#ifdef AIUEOS_PLC_RT_FORCE_MISS_SCAN\n", lo)
 loop = src[lo:hi]
 assert "kotoba_aiueos_tick_wait(" in loop
 open(sys.argv[2], "w").write("""#include <stdint.h>
