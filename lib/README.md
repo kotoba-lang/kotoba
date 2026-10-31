@@ -554,7 +554,6 @@ The bundled standard libraries live in this repository:
 | `kotoba.kotobaWasm` | `kotoba.kotobaWasm/src` | `kotoba.wasm.canonical-abi`, `kotoba.wasm.core`, `kotoba.wasm.tools`, `kotoba.wasm.typed` (Kotoba project library) |
 | `kotoba.kotobaAnnex` | `kotoba.kotobaAnnex/src` | `kotoba.annex.archive`, `kotoba.annex.cid`, `kotoba.annex.directory`, `kotoba.annex.grant` (Kotoba project library) |
 | `kotoba.kamiSensorSim` | `kotoba.kamiSensorSim/src` | `sensor-sim`, `sensor-sim.camera`, `sensor-sim.contact`, `sensor-sim.imu` (Kotoba project library) |
-| `kotoba.kamiSceneContracts` | `kotoba.kamiSceneContracts/src` | `kami.scene.authority-manifest`, `kami.scene.contracts`, `kami.scene.fixture-sync`, `kami.scene.mirror-check` (Kotoba project library) |
 | `kotoba.kamiOngakuProject` | `kotoba.kamiOngakuProject/src` | `kami.ongaku.project` (Kotoba project library) |
 | `kotoba.kamiMangakaExpression` | `kotoba.kamiMangakaExpression/src` | `kami.mangaka.expression` (Kotoba project library) |
 | `kotoba.kamiEngineSdk` | `kotoba.kamiEngineSdk/src` | `kami.avatar`, `kami.backend.browser`, `kami.backend.host`, `kami.benchmark` (Kotoba project library) |
@@ -820,7 +819,6 @@ The bundled standard libraries live in this repository:
 | `kotoba.kgraph` | `kotoba.kgraph/src` | `kotoba.kgraph` (Kotoba project library) |
 | `kotoba.kamiWebvr` | `kotoba.kamiWebvr/src` | `kami.webvr.cine-bridge`, `kami.webvr.engine`, `kami.webvr.incident-pregel`, `kami.webvr.types` (Kotoba project library) |
 | `kotoba.kamiUsdNative` | `kotoba.kamiUsdNative/src` | `usd-native` (Kotoba project library) |
-| `kotoba.kamiStudio` | `kotoba.kamiStudio/src` | `kami.studio.ui` (Kotoba project library) |
 | `kotoba.kamiOngakuSampler` | `kotoba.kamiOngakuSampler/src` | `kami.ongaku.sampler` (Kotoba project library) |
 | `kotoba.kamiOngakuSequencer` | `kotoba.kamiOngakuSequencer/src` | `kami.ongaku.sequencer`, `kami.ongaku.sequencer.smf` (Kotoba project library) |
 | `kotoba.kamiOngakuPluginHost` | `kotoba.kamiOngakuPluginHost/src` | `kami.ongaku.plugin-host`, `kami.ongaku.plugin-host.graph` (Kotoba project library) |
@@ -967,6 +965,24 @@ The bundled standard libraries live in this repository:
 | `kotoba.datomSource` | `kotoba.datomSource/src` | `datom.source`, `datom.source.adjacency`, `datom.source.conformance`, `datom.source.plane` (Kotoba project library) |
 | `kotoba.dslCore` | `kotoba.dslCore/src` | `kotoba.dsl.problem` (Kotoba project library) |
 | `kotoba.xml` | `kotoba.xml/src` | `kotoba.xml`, `xml.core`, `xml.parse` (Kotoba project library) |
+| `kotoba.cad` | `kotoba.cad/src` | `kotoba.cad.app`, `kotoba.cad.core`, `kotoba.cad.runner`, `kotoba.cad.ui`, … (Kotoba project library) |
+| `kotoba.kamiEngineCaeSolver` | `kotoba.kamiEngineCaeSolver/src` | `cae.adapter`, `cae.advanced`, `cae.assessment`, `cae.backend`, … (Kotoba project library) |
+| `kotoba.kamiEngineVphysics` | `kotoba.kamiEngineVphysics/src` | `vphysics.backend`, `vphysics.core` (Kotoba project library) |
+| `kotoba.kamiEngineAero` | `kotoba.kamiEngineAero/src` | `aero.bridge`, `aero.case`, `aero.cli`, `aero.lbm`, … (Kotoba project library) |
+| `kotoba.kamiEngineCrash` | `kotoba.kamiEngineCrash/src` | `crash.solver` (Kotoba project library) |
+| `kotoba.kamiEngineEchem` | `kotoba.kamiEngineEchem/src` | `echem.profile`, `echem.solver`, `echem.stack-thermal`, `echem.system` (Kotoba project library) |
+| `kotoba.kamiEngineMotor` | `kotoba.kamiEngineMotor/src` | `motor.bldc`, `motor.dcbus`, `motor.envelope`, `motor.esc`, … (Kotoba project library) |
+| `kotoba.kamiEnginePack` | `kotoba.kamiEnginePack/src` | `pack.solver` (Kotoba project library) |
+| `kotoba.kamiEngineRotor` | `kotoba.kamiEngineRotor/src` | `rotor.atmosphere`, `rotor.solver` (Kotoba project library) |
+| `kotoba.kamiEngineMultirotor` | `kotoba.kamiEngineMultirotor/src` | `multirotor.closure` (Kotoba project library) |
+| `kotoba.kamiEngineVehicleDesigner` | `kotoba.kamiEngineVehicleDesigner/src` | `vdesign.bev-store`, `vdesign.cad`, `vdesign.cartridge`, `vdesign.cartridge-fcev`, … (Kotoba project library) |
+| `kotoba.kamiEizoTimeline` | `kotoba.kamiEizoTimeline/src` | `kami.eizo.timeline`, `kami.eizo.timeline.timecode` (Kotoba project library) |
+| `kotoba.douga` | `kotoba.douga/src` | `douga.eizo-timeline`, `douga.ffmpeg` (Kotoba project library) |
+| `kotoba.anime` | `kotoba.anime/src` | `anime.production`, `anime.timeline` (Kotoba project library) |
+| `kotoba.kamiEizoCompositor` | `kotoba.kamiEizoCompositor/src` | `kami.eizo.compositor.blend`, `kami.eizo.compositor.chroma-key`, `kami.eizo.compositor.nodes`, `kami.eizo.compositor.roto`, … (Kotoba project library) |
+| `kotoba.kamiEizoGrade` | `kotoba.kamiEizoGrade/src` | `kami.eizo.grade`, `kami.eizo.grade.cdl`, `kami.eizo.grade.curve`, `kami.eizo.grade.lut`, … (Kotoba project library) |
+| `kotoba.kamiMangakaPage` | `kotoba.kamiMangakaPage/src` | `kami.mangaka.komawari`, `kami.mangaka.page` (Kotoba project library) |
+| `kotoba.kamiMangakaReader` | `kotoba.kamiMangakaReader/src` | `kami.mangaka.reader.app`, `kami.mangaka.reader.ssr`, `kami.mangaka.reader.views` (Kotoba project library) |
 
 `catalog.edn` declares exact aliases for old repository/coordinate names.
 `kotoba.*` is a project namespace and requires no DNS ownership. Each package

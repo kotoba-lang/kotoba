@@ -446,7 +446,7 @@ if [ -z "${AIUEOS_KOTOBA_FNV_OBJECT:-}" ]; then
 fi
 kotoba_journal_sha=
 if [ -z "${AIUEOS_KOTOBA_JOURNAL_OBJECT:-}" ]; then
-  kotoba_journal_sha=0b97cda6327bb330b7900dacc2a68086d7ac164244b7c1e22908a85e5d94a20f
+  kotoba_journal_sha=9c2ef7a0c5c4f2f087867595c16e89ccb29f76c6795293bf931454f93d55f58f
 fi
 kotoba_kernel_sha=
 if [ -z "${AIUEOS_KOTOBA_KERNEL_OBJECT:-}" ]; then
@@ -983,7 +983,7 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_msr_write_obje
   a6ae6efbe7c3a7543b391b01a9203906532b3c4328fb38bafb2d093b37bfe20d \
   kotoba_aiueos_msr_write
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_idt_gate_object" \
-  52c88178bbd56a1b0c133b6a1ad6e5393b8e38c2a419c20a867e94bc87b3294b \
+  daa5544d40825a98b3b72affdfb449ec374b33f1082a8887d9a4a6513e750e5f \
   kotoba_aiueos_idt_gate_build
 # JUN-599: the GDT's 64-bit TSS descriptor (aiueos_process_initialize) is kotoba/tss-descriptor.o (fuel 4194304).
 kotoba_tss_descriptor_object=${AIUEOS_KOTOBA_TSS_DESCRIPTOR_OBJECT:-"$aiueos/kotoba/tss-descriptor.o"}
@@ -1183,7 +1183,7 @@ if [ -n "$model_handoff_link" ] || [ -n "$qwen35_parity_cflags" ]; then
   python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_qwen35_dequant_object" \
     57eabbacc347c5f3bb6ba395cdf1085f8c625381efc3527c4f2b89b3b5c0d631 kotoba_aiueos_qwen35_dequant_row
   python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_qwen35_matvec_object" \
-    0eabd3f84c2efcd3c763106599e43ed217d7f71f85450eeed7293df8c3db8677 kotoba_aiueos_qwen35_matvec
+    96ba0beb09cbc338a0bc1ae93323f0847090290710cfe4200c6c1c9a7029f927 kotoba_aiueos_qwen35_matvec_check,kotoba_aiueos_qwen35_matvec_row
   # FIVE parity profiles, each linking only the objects its stages call. The
   # low region (`aiueos_low_end <= 0x1f4000`) cannot hold every object at once
   # since the tokenizer objects landed -- measured, not assumed, and measured
