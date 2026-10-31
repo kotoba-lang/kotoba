@@ -11,7 +11,6 @@ random keys. A mutant of the generator must be caught. Observation only.
 """
 
 import argparse
-import os
 from pathlib import Path
 import random
 import subprocess
@@ -68,8 +67,6 @@ def main():
     parser.add_argument("--random", type=int, default=40)
     parser.add_argument("--seed", type=int, default=555)
     args = parser.parse_args()
-    if "AIUEOS_AMU_SOURCE" not in os.environ:
-        raise SystemExit("error: set AIUEOS_AMU_SOURCE to the pinned Amu checkout")
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp)
         accepted = refused = 0
