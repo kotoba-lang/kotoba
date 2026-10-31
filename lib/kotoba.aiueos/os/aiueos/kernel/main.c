@@ -4253,8 +4253,8 @@ void aiueos_kernel_main(const struct aiueos_boot_info *boot) {
        The comparison reuses kotoba_aiueos_digest_equal -- the same fixed-work
        32-byte compare the application catalog admits signatures with. */
     {
-      extern uint64_t kotoba_aiueos_x25519(const uint8_t *, const uint8_t *,
-                                           uint8_t *, uint8_t *);
+      extern uint64_t kotoba_aiueos_x25519(const uint8_t *, uint64_t, const uint8_t *, uint64_t,
+                                           uint8_t *, uint64_t, uint8_t *, uint64_t);
       extern uint64_t kotoba_aiueos_digest_equal(const uint8_t *, const uint8_t *,
                                                  uint64_t);
       static const uint8_t x_scalar[32] = {
@@ -4266,7 +4266,7 @@ void aiueos_kernel_main(const struct aiueos_boot_info *boot) {
         0x0d,0xbf,0x3a,0x0d,0x26,0x38,0x1a,0xf4,0xeb,0xa4,0xa9,0x8e,0xaa,0x9b,0x4e,0x6a};
       static uint8_t x_output[32];
       static uint8_t x_workspace[646];
-      if (!kotoba_aiueos_x25519(x_scalar, x_base, x_output, x_workspace) ||
+      if (!kotoba_aiueos_x25519(x_scalar, 32, x_base, 32, x_output, 32, x_workspace, sizeof x_workspace) ||
           !kotoba_aiueos_digest_equal(x_output, x_expected, 32)) {
         serial_string("AIUEOS_X25519_FAIL rfc7748-base-point\r\n");
         evidence_stop(__LINE__);
