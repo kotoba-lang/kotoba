@@ -1076,19 +1076,19 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_mapping_plan_o
   f6ed2771091568e6b09f78ea00c1ddd78fc10bb36a9df317596733c8eb920004 \
   kotoba_aiueos_page_mapping_plan
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_process_plan_object" \
-  35b980f64d0238a67662e924a641fead9cb742523911963cf4d5e32db6bc7752 \
+  e78f3b24a6f45bce9e400fddf7d5f2f6803371352d961d506336c99603af7c57 \
   kotoba_aiueos_process_create_plan
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_teardown_plan_object" \
   1c9e0d89cdaf309ee9368ff2f05d45cdd21b0cc54e7d97edcdaaaf04a4276fe3 \
   kotoba_aiueos_process_teardown_plan
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_task_plan_object" \
-  c5c3cc5f553021af742bd5ab674196b76310d4296c88290d665870de7c6f9e63 \
+  70f05a1bc662f6e4ceb8bbfc3c2a62ec8b56137f8061a6d8a436710d18a57fbd \
   kotoba_aiueos_task_slot_plan
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_dispatch_plan_object" \
-  028cc85bcf38dd6b0a702a28904f6e281eda82122599e5fb06e150d718546f6a \
+  38a5921ebad48451995cd0fdea862f91455ebdc13f10707f3376fd8f0999079c \
   kotoba_aiueos_scheduler_dispatch_plan
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_exit_route_object" \
-  548fc48d4c59db4f69d9477da1d776b0de8cbde743ef08681674142d732498c0 \
+  96f5495aac12fd5ab01f7aa0f24e370cac3f9af3b15a81ec6a7c19515b9f67db \
   kotoba_aiueos_task_exit_route
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_service_task_object" \
   b54ebc310aecc4b428d9aebc4f059cef41a7983bffef04c6fdc7a8d8a8e89bf0 \
