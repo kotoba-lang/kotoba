@@ -155,8 +155,10 @@ in the debug entry only. It reports KDBG 0xc100..0xc108 and context words
 `build-native-desktop-macos.py --profile nvme` (`check-native-nvme-qemu.py`).
 Its NVMe boots need `-cpu max,phys-bits=37`: with QEMU's default, OVMF puts
 the 64-bit BAR at 768 GiB and the loader's PCI collector, which admits
-addresses below 512 GiB, refuses the boot. Writing, GPT/FAT and the signed
-image follow in later stages.
+addresses below 512 GiB, refuses the boot. On the 6600H it identified the
+256 GB controller (04:00.0) and read LBA 1 (`EFI PART`):
+`docs/evidence/awai122-nvme-read-6600h-20261031`. Writing, GPT/FAT and the
+signed image follow in later stages.
 
 ## CDCI migration: native only (2026-10-24)
 
