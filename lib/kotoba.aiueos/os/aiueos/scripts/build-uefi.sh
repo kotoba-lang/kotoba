@@ -442,7 +442,7 @@ kotoba_relay_ack_object=${AIUEOS_KOTOBA_RELAY_ACK_OBJECT:-"$aiueos/kotoba/relay-
 kotoba_user_elf=${AIUEOS_KOTOBA_USER_ELF:-"$aiueos/kotoba/user-smoke.elf"}
 kotoba_fnv_sha=
 if [ -z "${AIUEOS_KOTOBA_FNV_OBJECT:-}" ]; then
-  kotoba_fnv_sha=c98c7fb1e8a9bffdd8fc290d83042afd4aeda88b92ca15ac4edb9012845af507
+  kotoba_fnv_sha=50993045716efb37366c7513ca89b44a3baa37607bb77e495e922320c37b19d6
 fi
 kotoba_journal_sha=
 if [ -z "${AIUEOS_KOTOBA_JOURNAL_OBJECT:-}" ]; then
@@ -968,7 +968,7 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_mmio_map_admit
   638de7487df737be76d834c57fc02e74026eac9ad9b46d669efee3bfa247014c \
   kotoba_aiueos_mmio_map_admit
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_acpi_checksum_object" \
-  f92dd1922a7d4dd2bb30614d3f8058da671b5f154bd9b5c452174ae8a17a5978 \
+  fa74f733deac18f7c1a0bc126c2bcbc0ab5d3e5f9a9825c9ff1c0a78c2a38d10 \
   kotoba_aiueos_acpi_checksum_ok
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_acpi_table_valid_object" \
   66e621af0bbd4f7436a03a52e945d10f99a87b2608554aa1f9e997b36b1de1f6 \
@@ -1266,7 +1266,7 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_ime_object" \
   ee11f50c9dfb30d03c820bead466b2f1bf18e4e64f3a2bfda98f5a5dd5d4ca34 \
   kotoba_aiueos_ime_commit
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_wm_object" \
-  f0eb2dd827b30c778ac9321963d4da53932802693be72bc5ef8a38f25893d900 \
+  4c80cb6b14c3a4a412e94b69784cf3507c7e48cb7abb0635f918f2aeb31898d0 \
   kotoba_aiueos_wm_hit
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_scanout_object" \
   5318fd39d4d1bba145aeb68e3b0df40843a34e20db9ab2a72390e635d0353bba \
