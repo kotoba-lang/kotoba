@@ -981,6 +981,10 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_msr_write_obje
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_idt_gate_object" \
   52c88178bbd56a1b0c133b6a1ad6e5393b8e38c2a419c20a867e94bc87b3294b \
   kotoba_aiueos_idt_gate_build
+# JUN-599: the GDT's 64-bit TSS descriptor (aiueos_process_initialize) is kotoba/tss-descriptor.o (fuel 4194304).
+kotoba_tss_descriptor_object=${AIUEOS_KOTOBA_TSS_DESCRIPTOR_OBJECT:-"$aiueos/kotoba/tss-descriptor.o"}
+python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_tss_descriptor_object" \
+  dc710d73671b198b765a418414fb34a50ed9d80568412697734f91070f5f795e kotoba_aiueos_tss_descriptor_build
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_pic_disable_object" \
   c88ff01d1eb89f9cf549f4c0ca24f34928f948cab4a96cad82a8ab518bf7fad1 \
   kotoba_aiueos_pic_disable
@@ -1702,7 +1706,7 @@ zig ld.lld -nostdlib -static --strip-all $qualification_gc_link -z max-page-size
   "$kotoba_wm_object" "$kotoba_scanout_object" "$kotoba_broker_object" "$kotoba_session_object" \
   "$kotoba_browser_frame_object" "$kotoba_browser_reduce_object" "$kotoba_browser_frame2_object" "$kotoba_browser_ime_object" \
   "$kotoba_browser_damage_object" "$kotoba_blk_wait_object" "$kotoba_msix_entry_object" \
-  "$kotoba_mmio_map_admit_object" "$kotoba_kbd_reap_object" \
+  "$kotoba_mmio_map_admit_object" "$kotoba_kbd_reap_object" "$kotoba_tss_descriptor_object" \
   "$kotoba_acpi_checksum_object" "$kotoba_acpi_table_valid_object" \
   "$kotoba_relay_hello_object" "$kotoba_relay_ack_object" \
   "$kotoba_inference_status_valid_object" "$kotoba_inference_rate_object" \
