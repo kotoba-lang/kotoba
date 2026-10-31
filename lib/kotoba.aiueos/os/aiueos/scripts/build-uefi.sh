@@ -1586,11 +1586,25 @@ if [ -n "$plc_runtime_link" ]; then
       "$AIUEOS_PLC_ELF" "$AIUEOS_PLC_RECEIPT" \
       "$AIUEOS_PLC_SIGNATURE" "$AIUEOS_PLC_PUBLIC_KEY" "$out/plc-embedded.S"
   else
-    python3 "$aiueos/scripts/make-zero-cap-user-embedded-assembly.py" \
-      "$AIUEOS_ZERO_CAP_USER_ELF" \
-      7f5a8c0a31b5bdf191410f007973413d16e497a20ae7fe86c734b9fea85808b1 \
-      "$AIUEOS_ZERO_CAP_USER_SIGNATURE" "$AIUEOS_ZERO_CAP_USER_PUBLIC_KEY" \
-      "$out/plc-embedded.S"
+    # JUN-555: written by Kotoba (native/zero-cap-user-embedded-assembly.kotoba) through the pinned Amu
+    # Mac root; without that native route the build refuses. make-zero-cap-user-embedded-assembly.py is its
+    # test oracle. The capability-free check stays the observer verify-kotoba-user-elf.py (caps=none), and
+    # the .incbin path is resolved here as Path.resolve() did; a symlinked ELF is refused.
+    zero_cap_sha=7f5a8c0a31b5bdf191410f007973413d16e497a20ae7fe86c734b9fea85808b1
+    [ -f "$AIUEOS_ZERO_CAP_USER_ELF" ] && [ ! -L "$AIUEOS_ZERO_CAP_USER_ELF" ] || {
+      echo "error: zero-cap ELF must be a regular, non-symlink file" >&2
+      exit 1
+    }
+    zero_cap_verified=$(python3 "$aiueos/scripts/verify-kotoba-user-elf.py" "$AIUEOS_ZERO_CAP_USER_ELF" "$zero_cap_sha")
+    case "$zero_cap_verified" in
+      *caps=none*) ;;
+      *) echo "error: zero-cap smoke requires a capability-free ELF" >&2; exit 1 ;;
+    esac
+    zero_cap_elf_path="$(CDPATH= cd -- "$(dirname -- "$AIUEOS_ZERO_CAP_USER_ELF")" && pwd -P)/$(basename -- "$AIUEOS_ZERO_CAP_USER_ELF")"
+    sh "$aiueos/scripts/run-native-generator.sh" "$aiueos/native/zero-cap-user-embedded-assembly.kotoba" \
+      "$out/plc-embedded.S" --seed 03-source-sha256 --input "elf=$AIUEOS_ZERO_CAP_USER_ELF" \
+      --input "signature=$AIUEOS_ZERO_CAP_USER_SIGNATURE" --input "key=$AIUEOS_ZERO_CAP_USER_PUBLIC_KEY" \
+      -- elf @size:elf "$zero_cap_sha" signature @size:signature key @size:key "$zero_cap_elf_path"
   fi
   zig cc -target x86_64-freestanding-none -c \
     -o "$kernel_plc_embedded_object" "$out/plc-embedded.S"
