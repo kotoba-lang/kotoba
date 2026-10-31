@@ -29,6 +29,15 @@ class NativeGate:
             assert getattr(args, 'packager', None) and args.packager_sha256, '--packager is required on macOS'
             self.runner = args.packager.resolve()
             assert sha(self.runner.read_bytes()) == args.packager_sha256
+            # fd3 passes the parent's fd 3 and dup2s each call's directory onto it in the child. Hold fd 3
+            # for the whole run, so a concurrent call's own descriptor is never 3 and closed under a fork (EBADF).
+            try:
+                os.fstat(3)
+            except OSError:
+                reserve = os.open('/dev/null', os.O_RDONLY)
+                if reserve != 3:
+                    os.dup2(reserve, 3, inheritable=False)
+                    os.close(reserve)
         else:
             self.runner = args.runner.resolve()
         self.out = args.output.resolve()
