@@ -29,6 +29,11 @@ cmp "$generated" "$generated_again"
 # retired nbb/JVM route.
 root=${AMU_NATIVE_ROOT:-"$compiler/seed/bootstrap/aarch64-macos/amu-full-root.macho"}
 [ -x "$root" ] || { echo "error: amu native root not found: $root (set AMU_NATIVE_ROOT)" >&2; exit 1; }
+# KOTOBA-175: the first amu root with x86_64-aiueos-user-plc-v1 (amu #1752, ADR 0402). Another root is refused unless
+# its digest is named explicitly in AIUEOS_PLC_AMU_ROOT_SHA256. The run-native-generator.sh pin is separate.
+root_sha=${AIUEOS_PLC_AMU_ROOT_SHA256:-8a3d4f373c003956a2ca60fb3e551ca439e441ce3143f11e73df68aa1f454eb6}
+[ "$(shasum -a 256 "$root" | cut -c1-64)" = "$root_sha" ] || {
+  echo "error: amu native root $root is not the pinned PLC compiler $root_sha" >&2; exit 1; }
 capabilities=16,17,18,19
 printf '{:allow #{%s}}\n' "$(printf '%s' "$capabilities" | sed 's/[0-9][0-9]*/[:cap\/call &]/g; s/,/ /g')" |
   cmp -s - "$policy" || {
