@@ -826,35 +826,11 @@ fi
 # through the pinned Amu Mac root. Without that native route the build refuses; there is no Python fallback.
 sh "$aiueos/scripts/run-native-generator.sh" "$aiueos/native/build-identity-header.kotoba" \
   "$build_identity_header" -- "$build_version" "$build_source_commit" "$build_source_dirty"
-python3 - "$model_identity_header" "$model_total" "$model_part0" \
-  "$model_part1" "$model_part2" "$model_sha256" "$model_min_address" \
-  "$model_max_address" "$model_parts" "$model_name" "$model_file_prefix" <<'PYMODEL'
-from pathlib import Path
-import sys
-
-(out, total, part0, part1, part2, digest, minimum, maximum, parts, name,
- prefix) = sys.argv[1:]
-values = ",".join(f"0x{int(digest[i:i+2], 16):02x}" for i in range(0, 64, 2))
-Path(out).write_text(
-    "#ifndef AIUEOS_MODEL_IDENTITY_H\n#define AIUEOS_MODEL_IDENTITY_H\n"
-    "#include <stdint.h>\n"
-    f"#define AIUEOS_MODEL_TOTAL_BYTES {total}ULL\n"
-    f"#define AIUEOS_MODEL_PART0_BYTES {part0}ULL\n"
-    f"#define AIUEOS_MODEL_PART1_BYTES {part1}ULL\n"
-    f"#define AIUEOS_MODEL_PART2_BYTES {part2}ULL\n"
-    f"#define AIUEOS_MODEL_PART_COUNT {parts}U\n"
-    f'#define AIUEOS_MODEL_PARTS_TEXT "{parts}"\n'
-    f'#define AIUEOS_MODEL_NAME "{name}"\n'
-    f'#define AIUEOS_MODEL_PART0_PATH u"\\\\EFI\\\\AIUEOS\\\\{prefix}0.BIN"\n'
-    f'#define AIUEOS_MODEL_PART1_PATH u"\\\\EFI\\\\AIUEOS\\\\{prefix}1.BIN"\n'
-    f'#define AIUEOS_MODEL_PART2_PATH u"\\\\EFI\\\\AIUEOS\\\\{prefix}2.BIN"\n'
-    f"#define AIUEOS_MODEL_MIN_ADDRESS {minimum}ULL\n"
-    f"#define AIUEOS_MODEL_MAX_ADDRESS {maximum}ULL\n"
-    "#ifndef AIUEOS_MODEL_IDENTITY_MACROS_ONLY\n"
-    "static const uint8_t aiueos_expected_model_sha256[32]={" + values + "};\n"
-    "#endif\n"
-    "#endif\n", encoding="ascii")
-PYMODEL
+# JUN-555: the model-identity header is written by Kotoba (native/model-identity-header.kotoba)
+# through the pinned Amu Mac root; without that native route the build refuses (no Python fallback).
+sh "$aiueos/scripts/run-native-generator.sh" "$aiueos/native/model-identity-header.kotoba" \
+  "$model_identity_header" -- "$model_total" "$model_part0" "$model_part1" "$model_part2" \
+  "$model_sha256" "$model_min_address" "$model_max_address" "$model_parts" "$model_name" "$model_file_prefix"
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_kernel_object" "$kotoba_kernel_sha"
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_journal_object" \
   "$kotoba_journal_sha" kotoba_aiueos_journal_plan
