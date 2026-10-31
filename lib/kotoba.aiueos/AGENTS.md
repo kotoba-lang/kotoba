@@ -166,6 +166,9 @@ kernel compiler only with a literal tail length, so the file's padding is
 built in esp.kotoba and `sha-final` runs once as an "abc" self-test. The
 gate's FAT32 ESP is made with hdiutil, and its NVMe boots carry a writable
 OVMF variable store: without one OVMF writes `\NvVars` to the fixture ESP.
+On the 6600H it hashed the installed `\EFI\ITONAMI\BOOTX64.EFI` (FAT32) to
+exactly the SHA-256 of the image installed on 2026-10-30:
+`docs/evidence/awai122-esp-read-6600h-20261031`.
 The signed image and writing follow in later stages.
 
 ## CDCI migration: native only (2026-10-24)
