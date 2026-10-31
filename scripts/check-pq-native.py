@@ -19,7 +19,9 @@ g-say rewritten to answer the line's length instead of writing it (PRINT_FREE). 
 verdict is the same bitmask from the same checks, and both SHA-3 mutants apply to it
 unchanged. Linux arm64 and macOS keep running the printing `sha3` gate; `sha3-x86` is
 not in the default selection and `sha3` is refused on x86_64. CI's x86 lane runs
---gates mlkem,mldsa,sha3-x86. E7101 detail 16, once recorded here, is the scalar ELF64
+--gates mlkem,mldsa,sha3-x86. Where the printing `sha3` gate runs, its 126 oracle lines are
+compared with Python hashlib (sweep_compare), with a corrupted-line control, and every SHA-3
+mutant's lines must disagree with hashlib too; the print-free `sha3-x86` has no lines to compare. E7101 detail 16, once recorded here, is the scalar ELF64
 profile's refusal of string literals, a route these gates do not use
 (AWAI-117). --module-gates-only skips every unity gate.
 """
@@ -41,7 +43,7 @@ from native_gate import NativeGate  # noqa: E402
 
 SHA3 = 'lib/gov.nist.sha3/kotoba/sha3/core.kotoba'
 GATES = {
-    'sha3': dict(bodies=[SHA3], gate='lib/gov.nist.sha3/kotoba/sha3/native_gate.kotoba', passing=63, mutants={
+    'sha3': dict(bodies=[SHA3], gate='lib/gov.nist.sha3/kotoba/sha3/native_gate.kotoba', passing=63, sweep=True, mutants={
         'constant': (SHA3, '0x0000000000008082', '0x0000000000008083'),
         'suffix': ('lib/gov.nist.sha3/kotoba/sha3/core.kotoba', '(sponge bytes 136 6 32))', '(sponge bytes 136 1 32))'),
     }),
@@ -66,6 +68,53 @@ GATES = {
     }),
 }
 GATES['sha3-x86']['mutants'] = GATES['sha3']['mutants']
+
+# The printing SHA-3 gate's oracle lines are compared with Python hashlib (AWAI-117): the
+# image computes every digest, Python only recomputes them for the same inputs (byte i =
+# (7i + 3) mod 256) and compares. The lengths are read from the gate's own g-len, so the
+# expected set never drifts from the source. Each mutant's lines must disagree, and a
+# corrupted copy of the pass lines must be caught, so the comparison has its own controls.
+SWEEP_LINE = re.compile(r'(sha3-(?:224|256|384|512)) ([0-9]+) ([0-9a-f]+)|(shake128|shake256) ([0-9]+) ([0-9]+) ([0-9a-f]+)')
+
+def sweep_expected():
+    text = (ROOT / GATES['sha3']['gate']).read_text()
+    match = re.search(r'\(defn- g-len \[i :i64\] :i64\n\s+\(vector-at \[([0-9 ]+)\] i\)\)', text)
+    assert match, 'g-len not found in the SHA-3 gate'
+    lengths = [int(x) for x in match[1].split()]
+    out = {}
+    for n in lengths:
+        m = bytes((7 * i + 3) % 256 for i in range(n))
+        for bits in (224, 256, 384, 512):
+            out[(f'sha3-{bits}', n)] = getattr(hashlib, f'sha3_{bits}')(m).hexdigest()
+        out[('shake128', n)] = '200 ' + hashlib.shake_128(m).hexdigest(200)
+        out[('shake256', n)] = '300 ' + hashlib.shake_256(m).hexdigest(300)
+    return out
+
+def sweep_compare(stdout, expected):
+    """Compare the gate's printed oracle lines with hashlib: {lines, mismatches, missing, duplicates, footer}."""
+    seen, mismatches, duplicates, footer = {}, [], [], None
+    for raw in stdout.decode(errors='replace').splitlines():
+        line = raw.strip()
+        if line.startswith('lines '):
+            footer = int(line.split()[1]) if line.split()[1:] and line.split()[1].isdigit() else -1
+            continue
+        match = SWEEP_LINE.fullmatch(line)
+        if not match:
+            continue
+        key = (match[1], int(match[2])) if match[1] else (match[4], int(match[5]))
+        value = match[3] if match[1] else f'{match[6]} {match[7]}'
+        if key in seen:
+            duplicates.append(list(key))
+        seen[key] = value
+        if expected.get(key) != value:
+            mismatches.append(list(key))
+    missing = sorted([list(k) for k in expected if k not in seen])
+    return dict(lines=len(seen), expected=len(expected), mismatches=len(mismatches), firstMismatches=mismatches[:6],
+                missing=len(missing), duplicates=len(duplicates), footer=footer)
+
+def sweep_ok(r):
+    return (r['lines'] == r['expected'] and r['footer'] == r['expected'] and
+            not r['mismatches'] and not r['missing'] and not r['duplicates'])
 
 # Module gates (AWAI-117) are built as modules from the library files, not as a unity
 # source. A gate with groups runs one image per group through a one-line entry module,
@@ -339,6 +388,18 @@ def main():
                       gateSourceSHA256=hashlib.sha256((ROOT / spec['gate']).read_bytes()).hexdigest(),
                       variant=('print-free (g-say rewritten to string-length, no capability; result value only)'
                                if 'rewrite' in spec else 'as committed'))
+        if spec.get('sweep'):
+            expected = sweep_expected()
+            stdout = (gate.out / (name + '-pass.stdout')).read_bytes()
+            sweep = dict(oracle=f'Python {platform.python_version()} hashlib (sha3_*, shake_128, shake_256)',
+                         passLines=sweep_compare(stdout, expected), mutantLines={})
+            assert sweep_ok(sweep['passLines']), (name, 'sweep lines disagree with hashlib', sweep['passLines'])
+            # control: one changed hex digit in one pass line must be caught
+            first = next(l for l in stdout.splitlines() if SWEEP_LINE.fullmatch(l.decode(errors='replace').strip()))
+            flipped = first[:-1] + (b'0' if first[-1:] != b'0' else b'1')
+            sweep['corruptedCopy'] = sweep_compare(stdout.replace(first, flipped, 1), expected)
+            assert sweep['corruptedCopy']['mismatches'] == 1, (name, 'corrupted sweep line not caught', sweep['corruptedCopy'])
+            result['sweep'] = sweep
         for label, change in spec['mutants'].items():
             mutant = gate.build(f'{name}-{label}', entry, {entry: unity(name, spec, change)})
             try:
@@ -349,6 +410,10 @@ def main():
             result['mutants'][label] = detected
             result['mutantResults'][label] = observed(f'{name}-{label}-detected')
             assert detected, (name, label, 'mutant passed the gate')
+            if spec.get('sweep'):
+                got = sweep_compare((gate.out / f'{name}-{label}-detected.stdout').read_bytes(), expected)
+                result['sweep']['mutantLines'][label] = got
+                assert got['mismatches'] > 0, (name, label, 'mutant sweep lines all equal hashlib')
         return result
 
     def module_gate(name, spec):
