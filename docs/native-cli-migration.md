@@ -52,7 +52,7 @@ lock paths are refused; the fixture also denies the FS grant and filesystem scop
 Mutated version/command-set inputs are refused, and unimplemented verbs return
 `:cli/native-execution-unavailable`. The source is
 `src/kotoba/cli_exec.kotoba`; the native ARM fixture executes it through the
-Amu selfhost compiler and pins Kotoba Lang main `6621519576f91624ae79a62b73a81246351a2567`
+Amu selfhost compiler and pins Kotoba Lang main `5dbea46310591154765eeb0ef289bb98ca77a401` (KOTOBA-174: `compile --target` defaults to `:native`)
 for the `--blocks` contract. These are internal check modes. The lock mode does not
 yet perform full semantic admission or compilation, nor expose the CID on the
 public CLI. The public launcher, other `check` modes, and the remaining command

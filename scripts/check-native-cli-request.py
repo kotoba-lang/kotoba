@@ -108,6 +108,17 @@ def main(amu, contract, compiler, out):
     assert ":values [:kotoba]" in data
     changed = data.replace(":values [:kotoba]", ":values [:nbb]", 1)
     run("contract-negative-control", [out / "request.elf", changed, valid_lock, invalid_lock, blocks], guest, expected=1)
+    # KOTOBA-174: a contract whose omitted compile target falls back to Wasm
+    # must turn the fixture red. Byte substitution only; the guest decides.
+    assert data.count(":values [:native :web :wasm] :default :native") == 1
+    wasm_default = data.replace(":values [:native :web :wasm] :default :native",
+                                ":values [:native :web :wasm] :default :wasm", 1)
+    run("wasm-default-negative-control", [out / "request.elf", wasm_default, valid_lock, invalid_lock, blocks],
+        guest, expected=1)
+    no_native = data.replace(":values [:native :web :wasm] :default :native",
+                             ":values [:web :wasm] :default :wasm", 1)
+    run("legacy-wasm-contract-negative-control", [out / "request.elf", no_native, valid_lock, invalid_lock, blocks],
+        guest, expected=1)
     run("grant-negative-control", [out / "request.elf", data, valid_lock, invalid_lock, blocks],
         dict(PATH="/nonexistent", KEXE_ALLOW="-"), expected=1)
     denied = run("fs-grant-negative-control", [out / "request.elf", data, valid_lock, invalid_lock, blocks],

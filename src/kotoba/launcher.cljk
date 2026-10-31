@@ -40,6 +40,7 @@
             [kotoba.codebase-publish :as codebase-publish]
             [kotoba.codebase-typed :as codebase-typed]
             [kotoba.library-release :as library-release]
+            [kotoba.kbb-native :as kbb-native]
             [kotoba.library-source :as library-source]
             [kekkai.cacao :as kekkai-cacao]
             [kekkai.desired-state :as desired-state]
@@ -1473,11 +1474,12 @@
         {:kotoba.cli/ok? false :kotoba.cli/code :codebase/target-required}
         (try
           (let [{:keys [cid name]} (codebase-names/resolve-token root namespace subject)
-                result (codebase-compile/compile! root cid {})]
+                result (codebase-compile/compile! root cid {:target (option-value argv "--target")})]
             (when-let [output (option-value argv "--output")]
               (write-bytes! output (:bytes result)))
             {:kotoba.cli/ok? true :kotoba.cli/code :codebase/compiled
              :kotoba.cli/data {:cid cid :name name
+                               :target (get-in result [:descriptor :target-abi])
                                :artifact-cid (:artifact-cid result)
                                :receipt-cid (:receipt-cid result)
                                :cached? (:cached? result)
@@ -2054,7 +2056,21 @@
    "aarch64-android" :aarch64-android-kotoba-v1
    "aarch64-ios" :aarch64-ios-kotoba-v1})
 
-(def ^:private compile-target-names (vec (keys compile-targets)))
+(def ^:private compile-target-names (vec (cons "native" (keys compile-targets))))
+
+(defn- resolve-compile-target-name
+  "KOTOBA-174 / kotoba-lang lang/cli.edn `compile --target`
+  `:values [:native :web :wasm] :default :native`: an omitted target and
+  `native` both name the host's native target (`<isa>-<os>`). Answers
+  {:requested <argv value or nil> :name <resolved name or nil>}; a nil :name
+  for a native request means the host has no explicit target profile and the
+  caller refuses it by name. It never falls back to Wasm."
+  [argv]
+  (let [requested (option-value argv "--target")]
+    {:requested requested
+     :name (if (or (nil? requested) (= requested "native"))
+             (kbb-native/host-target-name)
+             requested)}))
 
 (defn- compile-backend [target]
   (cond
@@ -2062,11 +2078,30 @@
     (= target :wasm32-kotoba-v1) :kotoba-wasm
     :else :kotoba-native))
 
+(defn- host-native-target
+  "The compile-targets keyword of the host native target, or nil."
+  []
+  (some-> (kbb-native/host-target-name) compile-targets))
+
 (defn- compile-output-extension [target]
   (case (compile-backend target)
     :kotoba-script ".mjs"
     :kotoba-wasm ".wasm"
     ".kexe"))
+
+(defn- compile-run-native
+  "Execute a host-native kexe artifact under the measured kexe_loader
+  (kotoba.kbb-native/run-artifact!), granting no capability."
+  [artifact]
+  (try
+    (let [{:keys [result status]} (kbb-native/run-artifact! artifact)]
+      (if (= status :ok)
+        {:ok? true :result result}
+        {:ok? false :message (str "native run status " (pr-str status))
+         :error {:status status :result result}}))
+    (catch Exception error
+      {:ok? false :message (ex-message error)
+       :error (select-keys (or (ex-data error) {}) [:phase :reason :problem])})))
 
 (defn compile-result
   "Compile Kotoba-owned source through kotoba-lang/amu. Web output is
@@ -2077,9 +2112,14 @@
   (`{:allow #{[:cap/call <id>]}}`); without it the policy is empty and every
   effect is denied.
 
+  An omitted `--target` (or `--target native`) is the host native target
+  (KOTOBA-174); a host with no explicit target profile is refused as
+  `:compile/native-host-unknown`, never defaulted to Wasm.
+
   `--run` after a successful emit executes the artifact: wasm32-kotoba-v1
   on kototama.tender (`kotoba:cap`/`call`), js-kotoba-v1 on Node
-  `instantiateKotoba`. `wasm run <source.kotoba>` stays on kotoba.wasm-exec
+  `instantiateKotoba`, and the host native target's kexe under the measured
+  kexe_loader (kbb-native/run-artifact!, no capability granted). `wasm run <source.kotoba>` stays on kotoba.wasm-exec
   (legacy emit). `wasm run <file.wasm>` of an amu kotoba:cap guest uses
   tender, same as `compile --target wasm --run`."
   [argv]
@@ -2089,7 +2129,7 @@
         extension (some-> entry source-extension)
         policy-result (compile-policy-result argv)
         policy (:kotoba.policy/data policy-result)
-        target-name (or (option-value argv "--target") "wasm")
+        {target-requested :requested target-name :name} (resolve-compile-target-name argv)
         target (get compile-targets target-name)
         output (or (option-value argv "--output")
                    (option-value argv "-o")
@@ -2134,14 +2174,34 @@
       {:kotoba.cli/ok? false :kotoba.cli/code :compile/not-kotoba-source
        :kotoba.cli/data {:entry entry :extension extension}}
 
+      (and (nil? target-name) (contains? #{nil "native"} target-requested))
+      {:kotoba.cli/ok? false :kotoba.cli/code :compile/native-host-unknown
+       :kotoba.cli/message "the host has no explicit native target profile; select a target with --target (it is never defaulted to wasm)"
+       :kotoba.cli/data {:target (or target-requested "native")
+                         :os.arch (System/getProperty "os.arch")
+                         :os.name (System/getProperty "os.name")
+                         :allowed compile-target-names}}
+
       (nil? target)
       {:kotoba.cli/ok? false :kotoba.cli/code :compile/unsupported-target
        :kotoba.cli/data {:target target-name :allowed compile-target-names}}
 
       (and (some #{"--run"} argv)
-           (not (contains? #{:js-kotoba-v1 :wasm32-kotoba-v1} target)))
+           (not (contains? #{:js-kotoba-v1 :wasm32-kotoba-v1} target))
+           (not (and target (= target (host-native-target)))))
       {:kotoba.cli/ok? false :kotoba.cli/code :compile/run-unsupported-target
-       :kotoba.cli/data {:target target-name :allowed ["web" "wasm"]}}
+       :kotoba.cli/data {:target target-name
+                         :allowed (vec (cond-> ["web" "wasm"]
+                                         (host-native-target) (conj "native" (kbb-native/host-target-name))))}}
+
+      ;; The native runner (kbb-native/run-artifact!) grants no capability.
+      (and (some #{"--run"} argv)
+           (= target (host-native-target))
+           (seq (compile-run-cap-ids policy)))
+      {:kotoba.cli/ok? false :kotoba.cli/code :compile/run-unsupported-capability
+       :kotoba.cli/data {:unsupported (compile-run-cap-ids policy)
+                         :hosted {}
+                         :target target-name}}
 
       (and (some #{"--run"} argv)
            (seq (compile-run-unsupported-ids policy)))
@@ -2193,6 +2253,7 @@
                                            [:kotoba.artifact/limits :fuel])
                                    (get-in compiled [:limits :fuel]))
                          :output output :target target-name
+                         :target-requested (or target-requested :default)
                          :backend (compile-backend target)
                          :value-profile (:value-profile compiled)
                          :value-abi (:value-abi compiled)
@@ -2204,10 +2265,14 @@
             (if-not (some #{"--run"} argv)
               {:kotoba.cli/ok? true :kotoba.cli/code :compile/emitted
                :kotoba.cli/data emitted}
-              (let [runtime (if (= target :js-kotoba-v1) :js-kotoba-v1 :kototama)
-                    report (if (= target :js-kotoba-v1)
-                             (compile-run-js output policy)
-                             (compile-run-wasm (:bytes compiled) policy))]
+              (let [runtime (case (compile-backend target)
+                              :kotoba-script :js-kotoba-v1
+                              :kotoba-wasm :kototama
+                              :kotoba-native :kexe-loader)
+                    report (case (compile-backend target)
+                             :kotoba-script (compile-run-js output policy)
+                             :kotoba-wasm (compile-run-wasm (:bytes compiled) policy)
+                             :kotoba-native (compile-run-native (:artifact compiled)))]
                 (if (:ok? report)
                   {:kotoba.cli/ok? true :kotoba.cli/code :compile/ran
                    :kotoba.cli/data (assoc emitted
@@ -2894,7 +2959,11 @@
                                 (guarded-run-result safe-facts plan forms effective-policy
                                                     (when cacao
                                                       {:cacao-grants (:grants cacao)}))
-                                (runtime/run safe-facts plan forms))
+                                ;; KOTOBA-174: every execution path is bounded; the
+                                ;; policy-less CLI run (and `-e`) gets the same
+                                ;; fail-closed step budget as a guarded run.
+                                (runtime/run safe-facts plan forms
+                                             {:step-limit runtime/default-interpreter-step-limit}))
                           ok? (:kotoba.runtime/ok? ran)]
                       {:kotoba.cli/ok? ok?
                        :kotoba.cli/code (if ok? :run/completed :run/failed)

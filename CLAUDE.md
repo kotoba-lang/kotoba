@@ -37,7 +37,7 @@ Repository split policy: `docs/ADR-repository-boundaries.md`.
 | `bin/kotoba` | public launcher; `adl`/`doctor` are routed to JVM-free kbb drivers (`bin/kotoba_adl.cljk`, `bin/kotoba_doctor.cljk`), everything else execs `bin/kotoba-clj` |
 | `bin/kotoba-clj` | explicit JVM launcher: `clojure -M -i tools/cljk_loader.cljk -m kotoba.launcher` |
 | `bin/kbb`, `bin/kbb_*.cljk` | kbb — deny-by-default script runner (amu-compiled `.kotoba` guests, or `--backend sci` for `.cljk`; `-M:<alias>` resolves `deps.edn` aliases) |
-| `src/kotoba/*.cljk` | host implementation: `launcher` (dispatch), `runtime`, `wasm_exec` (Chicory Wasm execution, fuel-bounded), `cap_table`, `host_providers`, adapters (`git_`, `rad_`, `graph_`, `did_`, `deploy_adapter`), `kami_host`, `sensing_host`, `kagi_boundary`, codebase (`codebase_*`, `semantic_codebase`), identity/custody (`principal_*`, `operator_identity`, `passkey_pqc`), security gates (`grade_a`, `key_hierarchy`, `control_adoption`, `crypto_qualification`, `sealed_egress`, `cold_tier_admission`, `anchor_relayer`, `origin_assertion`, …) |
+| `src/kotoba/*.cljk` | host implementation: `launcher` (dispatch), `runtime` (step-bounded interpreter), `kbb_native` (host-native KEXE compile and measured-loader execution, also behind `compile --run` for the host native target), `wasm_exec` (Chicory Wasm execution, fuel-bounded; Wasm is one target), `cap_table`, `host_providers`, adapters (`git_`, `rad_`, `graph_`, `did_`, `deploy_adapter`), `kami_host`, `sensing_host`, `kagi_boundary`, codebase (`codebase_*`, `semantic_codebase`), identity/custody (`principal_*`, `operator_identity`, `passkey_pqc`), security gates (`grade_a`, `key_hierarchy`, `control_adoption`, `crypto_qualification`, `sealed_egress`, `cold_tier_admission`, `anchor_relayer`, `origin_assertion`, …) |
 | `src/*.kotoba` + `src/*_policy.edn` | demo / gate programs and their capability policies |
 | `cores/` | decision cores moved from host code into Kotoba source (see `cores/README.md`) |
 | `lib/catalog.edn`, `lib/kotoba.*`, `src/kotoba/library_source.cljk` | bundled dotted-ID sources, language-owned alias resolution, explicit SCI source imports |
@@ -131,8 +131,13 @@ via `KBB_ENGINE`.
 - New cryptographic boundaries require the post-quantum floor (hybrid
   X25519 + ML-KEM-768 for confidentiality; ML-DSA-65 alongside the classical
   proof for publication/package admission). No classical-only downgrade.
-- Wasm execution is always fuel-bounded (`kotoba.wasm-exec/default-fuel-limit`
-  or `:kotoba.policy/fuel`); never add an unbounded execution path.
+- Every execution path — native, interpreter and Wasm — is fuel- or
+  step-bounded; never add an unbounded execution path. Examples: native KEXE
+  artifacts carry a declared `:fuel` in their fuel ABI and run under the
+  measured loader; the interpreter is bounded by
+  `kotoba.runtime/default-interpreter-step-limit` or
+  `:kotoba.policy/interpreter-step-limit`; Wasm execution is fuel-bounded by
+  `kotoba.wasm-exec/default-fuel-limit` or `:kotoba.policy/fuel`.
 - Chain integration is read + verify only. Transaction signing, broadcast,
   on-chain settlement and AT-MST origination are **etzhayyim-exclusive**
   (operating-entity boundary) and are not implemented here.
