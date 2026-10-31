@@ -554,7 +554,7 @@ if [ "${AIUEOS_PLC_RT_SMOKE:-0}" = 1 ]; then
     2c67ca2bee1909cfe1546f88c95a167b4fac15f1cad191b65e7a1b3dd45954f7 kotoba_aiueos_tick_wait
   plc_runtime_link="$kernel_plc_runtime_object $kernel_plc_embedded_object $kotoba_rt_dispatch_plan_object $kotoba_plc_step_object $kotoba_tick_wait_object"
   kotoba_user_elf_valid_object="$aiueos/kotoba/plc-user-elf-valid.o"
-  kotoba_user_elf_valid_sha=77c5e791da666e8355a7a877c37841cc63a3f228fbf785656522284a5259bbdd
+  kotoba_user_elf_valid_sha=de527141de96c352f5219e8a1d267a43a33a94bbd56baa06c3c007bd69dd49f8
 fi
 if [ "${AIUEOS_ZERO_CAP_USER_SMOKE:-0}" = 1 ]; then
   : "${AIUEOS_ZERO_CAP_USER_ELF:?AIUEOS_ZERO_CAP_USER_ELF is required}"
@@ -1048,7 +1048,7 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_user_elf_valid
   kotoba_aiueos_user_elf_valid
 if [ "${AIUEOS_PLC_RT_SMOKE:-0}" = 1 ]; then
   python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_rt_dispatch_plan_object" \
-    63d74ae94bfa918fc4284a554165d56555105c3b4740735dfbd5d4318c1e7774 \
+    27272f7c3fc4abd51cde0c87455c88dda37ca2b4e265944a82f1aaf80ac4621c \
     kotoba_aiueos_rt_scheduler_plan
 fi
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_user_context_object" \
