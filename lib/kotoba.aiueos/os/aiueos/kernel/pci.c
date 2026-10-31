@@ -365,8 +365,8 @@ extern uint64_t kotoba_aiueos_digest_equal(
   const uint8_t[32],const uint8_t[32],uint64_t);
 extern uint64_t kotoba_aiueos_app_catalog_valid(
   const uint8_t *,uint64_t,uint64_t,const uint32_t[2],uint64_t);
-extern uint64_t kotoba_aiueos_rsa2048_sha256_verify(
-  const uint8_t[256],const uint8_t[32],uint8_t*,uint64_t,uint64_t);
+extern uint64_t kotoba_aiueos_rsa2048_sha256_verify(const uint8_t[256],uint64_t,
+  const uint8_t[32],uint64_t,uint8_t*,uint64_t,uint64_t);
 /* `.high_bss`: both are CPU-only scratch for the Kotoba hash/verify calls,
    reached from the boot selftests after the section is zeroed; the low region
    was one page over its 0x1f4000 budget once main and the scorecard branch
@@ -381,7 +381,7 @@ static int sha256(const uint8_t *bytes,uint64_t length,uint8_t digest[32]) {
 }
 static int rsa2048_sha256_verify(const uint8_t signature[256],const uint8_t digest[32]) {
   return (int)kotoba_aiueos_rsa2048_sha256_verify(
-    signature,digest,rsa2048_workspace,sizeof(rsa2048_workspace),0);
+    signature,256,digest,32,rsa2048_workspace,sizeof(rsa2048_workspace),0);
 }
 /* Admit an initramfs recovery payload through the identical Kotoba SHA-256 +
    RSA-2048 public-key policy used for object-store application admission.
@@ -3457,8 +3457,8 @@ static int net_ssh_id_prefix_ok(const uint8_t *p, uint32_t len) {
    client verified end-to-end; here the crypto comes from the kernel's Kotoba
    objects: X25519 for Q_S/K, SHA-256 for H, and the ECDSA-P256 sign object for
    the host-key signature over H. Assembly is decision-free byte layout. */
-extern uint64_t kotoba_aiueos_x25519(const uint8_t *, const uint8_t *,
-                                     uint8_t *, uint8_t *);
+extern uint64_t kotoba_aiueos_x25519(const uint8_t *, uint64_t, const uint8_t *, uint64_t,
+                                     uint8_t *, uint64_t, uint8_t *, uint64_t);
 extern uint64_t kotoba_aiueos_ecdsa_p256_sign(const uint8_t *, const uint8_t *,
                                               const uint8_t *, uint8_t *,
                                               uint8_t *);
@@ -4273,8 +4273,8 @@ static int net_ssh_kex(struct aiueos_ssh_io *io, uint16_t cport,
   /* 5. ephemeral X25519, shared secret, host-key blob, exchange hash H. */
   uint8_t eph[32], q_s[32], k[32];
   aiueos_random_bytes(eph, 32);
-  if (!kotoba_aiueos_x25519(eph, x25519_base9, q_s, ssh_x25519_ws)) return 0;
-  if (!kotoba_aiueos_x25519(eph, q_c, k, ssh_x25519_ws)) return 0;
+  if (!kotoba_aiueos_x25519(eph, 32, x25519_base9, 32, q_s, 32, ssh_x25519_ws, sizeof ssh_x25519_ws)) return 0;
+  if (!kotoba_aiueos_x25519(eph, 32, q_c, 32, k, 32, ssh_x25519_ws, sizeof ssh_x25519_ws)) return 0;
 
   static uint8_t ks[128] AIUEOS_SSH_HIGH_BSS;
   uint32_t kslen = 0;

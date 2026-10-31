@@ -3,8 +3,8 @@
 
 extern uint64_t kotoba_aiueos_sha256(const uint8_t *, uint64_t, uint8_t[32],
                                      uint8_t *, uint64_t);
-extern uint64_t kotoba_aiueos_x25519(const uint8_t *, const uint8_t *,
-                                     uint8_t *, uint8_t *);
+extern uint64_t kotoba_aiueos_x25519(const uint8_t *, uint64_t, const uint8_t *, uint64_t,
+                                     uint8_t *, uint64_t, uint8_t *, uint64_t);
 extern uint64_t kotoba_aiueos_ecdsa_p256_sha256_verify(
     const uint8_t *, const uint8_t *, const uint8_t *, uint8_t *, uint64_t);
 /* The TLS 1.3 AEAD and record layer (ADR-0132, ADR-0133). Both return a
@@ -316,7 +316,7 @@ static int unprotect(const uint8_t key[16], const uint8_t iv[12], uint64_t seq,
    s key | s iv, ap_keys c key | c iv | s key | s iv; 1 is success and on 0 nothing is copied. */
 static int derive_hs_keys(const uint8_t *server_pub) {
   uint8_t shared[32], k[152];
-  if (!kotoba_aiueos_x25519(client_scalar, server_pub, shared, x_ws)) return 0;
+  if (!kotoba_aiueos_x25519(client_scalar, 32, server_pub, 32, shared, 32, x_ws, sizeof x_ws)) return 0;
   if (kotoba_aiueos_tls13_hs_keys(shared, 32, transcript, transcript_len, k, sizeof(k)) != 1) return 0;
   copy_bytes(handshake_secret, k, 32);
   copy_bytes(c_hs_secret, k + 32, 32);
@@ -556,7 +556,7 @@ void aiueos_tls13_reset(void) {
 
 int aiueos_tls13_clienthello(uint8_t *out, uint32_t *len) {
   copy_bytes(client_scalar, configured ? configured_scalar : smoke_scalar, 32);
-  if (!kotoba_aiueos_x25519(client_scalar, x25519_base, client_pub, x_ws)) return 0;
+  if (!kotoba_aiueos_x25519(client_scalar, 32, x25519_base, 32, client_pub, 32, x_ws, sizeof x_ws)) return 0;
   if (!clienthello_build()) return 0;
   if (!transcript_add(ch_record + 5, ch_record_len - 5)) return 0;
   copy_bytes(out, ch_record, ch_record_len);
