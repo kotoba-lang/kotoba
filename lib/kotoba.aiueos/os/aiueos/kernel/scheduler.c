@@ -57,9 +57,9 @@ extern uint64_t kotoba_aiueos_service_lifecycle(uint64_t generation,
 extern uint64_t kotoba_aiueos_capability_plan(uint64_t slot,
   uint64_t generation, uint64_t type, uint64_t state_rights, uint64_t request);
 extern uint64_t *kotoba_aiueos_user_context_build(uint8_t *stack,
-  uint64_t entry,uint64_t argument,uint64_t user_stack);
+  uint64_t stack_length,uint64_t entry,uint64_t argument,uint64_t user_stack);
 extern uint64_t *kotoba_aiueos_kernel_context_build(uint8_t *stack,
-  uint64_t entry,uint64_t argument);
+  uint64_t stack_length,uint64_t entry,uint64_t argument);
 extern void aiueos_process_set_kernel_stack(uint64_t top);
 extern volatile uint16_t aiueos_current_user_domain;
 extern void *aiueos_allocate_physical_page(void);
@@ -302,12 +302,12 @@ static uint64_t *initial_context(uint8_t *stack, void (*entry)(uint64_t), uint64
    * broken object into a null saved_stack. What guards this object is the
    * pinned SHA-256 the build script verifies before linking it. */
   return (uint64_t *)kotoba_aiueos_kernel_context_build(stack,
-    (uint64_t)(uintptr_t)entry,argument);
+    AIUEOS_TASK_STACK_BYTES,(uint64_t)(uintptr_t)entry,argument);
 }
 static uint64_t *initial_user_context(uint8_t *stack, void (*entry)(uint64_t),
                                       uint64_t argument, uint64_t user_stack) {
-  uint64_t *frame=kotoba_aiueos_user_context_build(stack,(uint64_t)(uintptr_t)entry,
-    argument,user_stack);
+  uint64_t *frame=kotoba_aiueos_user_context_build(stack,AIUEOS_TASK_STACK_BYTES,
+    (uint64_t)(uintptr_t)entry,argument,user_stack);
   struct aiueos_interrupt_context *context=(struct aiueos_interrupt_context *)frame;
   if (!context || context->rip!=(uint64_t)(uintptr_t)entry ||
       context->rdi!=argument || context->cs!=0x23U || context->rflags!=514U ||
