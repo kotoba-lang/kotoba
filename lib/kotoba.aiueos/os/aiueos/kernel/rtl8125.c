@@ -99,8 +99,8 @@ extern uint64_t kotoba_aiueos_rtl8125_ring_build(uint64_t, uint64_t, uint64_t,
 extern uint64_t kotoba_aiueos_rtl8125_program(uint64_t, uint64_t, uint64_t,
                                               uint64_t, uint64_t);
 extern uint64_t kotoba_aiueos_rtl8125_tx_submit(uint64_t, uint64_t, uint64_t,
-                                                uint64_t, uint64_t);
-extern int64_t kotoba_aiueos_rtl8125_rx_poll(uint64_t, uint64_t);
+                                                uint64_t, uint64_t, uint64_t);
+extern int64_t kotoba_aiueos_rtl8125_rx_poll(uint64_t, uint64_t, uint64_t);
 
 static int io_valid(const struct aiueos_rtl8125_io *io) {
   return io && io->context && io->read8 && io->read16 && io->read32 &&
@@ -204,7 +204,7 @@ enum aiueos_rtl8125_result aiueos_rtl8125_tx_submit(
      fences and the doorbell are all inside the object.  So is TX_BUSY. */
   return (enum aiueos_rtl8125_result)kotoba_aiueos_rtl8125_tx_submit(
     (uint64_t)(uintptr_t)device->io.context, RTL_MMIO_WINDOW,
-    (uint64_t)(uintptr_t)device->tx, device->tx_frame_physical, frame_length);
+    (uint64_t)(uintptr_t)device->tx, RTL_DESC_BYTES, device->tx_frame_physical, frame_length);
 }
 
 /* The one status read left in C.  It is one bit of one word and it has no
@@ -226,7 +226,7 @@ enum aiueos_rtl8125_result aiueos_rtl8125_rx_poll(
   if (!device || !device->ready || !frame_length)
     return AIUEOS_RTL8125_INVALID;
   int64_t answer = kotoba_aiueos_rtl8125_rx_poll(
-    (uint64_t)(uintptr_t)device->rx, AIUEOS_RTL8125_FRAME_CAPACITY);
+    (uint64_t)(uintptr_t)device->rx, RTL_DESC_BYTES, AIUEOS_RTL8125_FRAME_CAPACITY);
   if (answer < 0) return (enum aiueos_rtl8125_result)(-answer);
   *frame_length = (uint32_t)answer;
   return AIUEOS_RTL8125_OK;
