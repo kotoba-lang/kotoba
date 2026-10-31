@@ -88,6 +88,15 @@ safe Kotoba はその意味論を deny-by-default の executable Wasm に変換�
 進捗は「Rust の行数を減らす」ではなく、「安全性判断の正本が
 Kotoba component 側へ移った slice が増える」ことで測る。
 
+> **Superseding note (KOTOBA-174, 2026-10-31).** 本節の「Kotoba の confined
+> Wasm component へ段階移行」「deny-by-default の executable Wasm に変換する層」
+> という前提は置き換えられた。kotoba は Wasm を前提にしない。amu selfhost
+> (native) が基盤であり、`kotoba compile` の既定 target は host native target
+> である（kotoba-lang `lang/cli.edn` 5dbea463、`:values [:native :web :wasm]
+> :default :native`、未知 host は名前付きで拒否）。Wasm は明示的に選ぶ build
+> target の一つとして残る。capability confinement と deny-by-default の意味論
+> 自体は target に依らず変わらない。本文は記録として書き換えない。
+
 実装済み slice:
 
 - `crates/kotoba-clj/selfhost/safe_analyzer.kotoba` は safe Kotoba policy 下で

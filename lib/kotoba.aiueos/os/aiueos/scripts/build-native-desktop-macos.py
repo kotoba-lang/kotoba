@@ -260,7 +260,7 @@ def main(args):
         efi = kernel / "BOOTX64.EFI"
         image = kernel / "KERNEL.ELF"
         if (kernel_state["state"] != "MACOS_NATIVE_IMAGE_CANDIDATE"
-                or kernel_state["sourceModuleCount"] != 42
+                or kernel_state["sourceModuleCount"] != 44
                 or kernel_state["fuel"] != FUEL
                 or kernel_state["compiler"] != compiler_pin
                 or pin(efi) != kernel_state["efi"] or pin(image) != kernel_state["kernel"]
@@ -340,7 +340,7 @@ def main(args):
                            else 4 if args.profile == "ed25519"
                            else 16 if args.profile == "keystore"
                            else 11 if args.profile == "dapps"
-                           else 3 if args.profile == "nvme"
+                           else 4 if args.profile == "nvme"
                            else 2 if args.profile in ("cid", "sha512", "gf25519", "keyseal") else 24)
         if (observed["status"] != expected_status
                 or len(observed["events"]) != expected_events
@@ -417,10 +417,11 @@ def main(args):
                 raise ValueError("dapps verdict is incomplete")
         elif args.profile == "nvme":
             if (observed["font"] != font_state["padded"]
-                    or [row["name"] for row in observed["events"]] != ["nvme-512", "nvme-4096", "nvme-absent"]
-                    or [row["result"] for row in observed["events"]] != [15, 15, 1]
+                    or [row["name"] for row in observed["events"]] != ["nvme-fat32", "nvme-fat16-media", "nvme-4096", "nvme-absent"]
+                    or [row["result"] for row in observed["events"]] != [15, 15, 15, 1]
+                    or [row["esp"] for row in observed["events"]] != [15, 15, 3, 1]
                     or not all(row["desktopKeptRunning"] for row in observed["events"])
-                    or not all(row.get("diskUnchanged") for row in observed["events"][:2])
+                    or not all(row.get("diskUnchanged") for row in observed["events"][:3])
                     or observed["writeCommands"] or observed["physicalHardware"]):
                 raise ValueError("nvme verdict is incomplete")
         elif args.profile == "keyseal":
