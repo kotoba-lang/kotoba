@@ -2909,8 +2909,11 @@ extern uint64_t kotoba_aiueos_ipv4_checksum(uint64_t buffer, uint64_t length);
 extern uint64_t kotoba_aiueos_ipv4_icmp_reply_valid(uint64_t frame, uint64_t length,
                                                     uint64_t expected_src, uint64_t ident,
                                                     uint64_t sequence);
-extern uint64_t kotoba_aiueos_tcp_checksum_ok(uint64_t frame, uint64_t ip_total_length,
-                                              uint64_t src, uint64_t dst);
+/* JUN-552: on amu's native object route a frame is a window with its own length, so tcp-checksum-ok takes the
+   frame's readable extent beside it. Both callers' frames sit in a 4 KiB page; they pass 2048, the extent the
+   kotoba-compiler/1 object assumed, so the answer is unchanged. */
+extern uint64_t kotoba_aiueos_tcp_checksum_ok(uint64_t frame, uint64_t frame_length,
+                                              uint64_t ip_total_length, uint64_t src, uint64_t dst);
 extern uint64_t kotoba_aiueos_tcp_segment_valid(uint64_t frame, uint64_t length,
                                                 uint64_t expected_src, uint64_t expected_ack,
                                                 uint64_t expected_flags);
@@ -3286,7 +3289,7 @@ static int net_tcp_send(struct net_ring *tx, uint8_t *tx_page, uint32_t src,
      the same way in both derivations; only the peer can, by dropping the
      segment, and a dropped segment is indistinguishable from a peer that never
      answered until a whole second boot has been spent finding out. */
-  if (!kotoba_aiueos_tcp_checksum_ok((uint64_t)(uintptr_t)frame,
+  if (!kotoba_aiueos_tcp_checksum_ok((uint64_t)(uintptr_t)frame, 2048,
                                      40 + payload_length, src, dst)) {
     tcp_stage = NET_TCP_STAGE_TX_CHECKSUM;
     tcp_cloud_stage = NET_TCP_STAGE_TX_CHECKSUM;
@@ -5775,7 +5778,7 @@ static int rtl8125_tcp_send(uint32_t dst, uint16_t local_port,
                                  local_port, remote_port,
                                  sequence, acknowledgement, flags,
                                  payload, payload_length);
-  if (!kotoba_aiueos_tcp_checksum_ok((uint64_t)(uintptr_t)frame,
+  if (!kotoba_aiueos_tcp_checksum_ok((uint64_t)(uintptr_t)frame, 2048,
                                      40 + payload_length,
                                      RTL_DIRECT_IP, dst)) return 0;
   return rtl8125_direct_tx(bytes);
