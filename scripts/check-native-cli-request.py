@@ -62,7 +62,9 @@ def main(amu, contract, compiler, out):
     run("compile", [compiler, "compile", entry, "--target", "aarch64-macos", "--output", out / "request.kseed",
                     *[part for p in roots for part in ("--source-path", p)], "--source-lock", lock,
                     "--source-lock-sha256", pin(lock)["sha256"]])
-    run("pack", [compiler, "compile", amu / "seed/x86_64-kx64-runner.kotoba", "--target", "aarch64-linux" if arm else "x86_64-linux",
+    if not arm:
+        return x86_blocked(amu, compiler, entry, roots, lock, sources, inputs, contract, out, run, calls)
+    run("pack", [compiler, "compile", amu / "seed/x86_64-kx64-runner.kotoba", "--target", "aarch64-linux",
                  "--output", out / "request.elf", "--format", "packed", "--payload", out / "request.kseed"])
     (out / "request.elf").chmod(0o755)
     # The contract is opaque argv data. Its Kotoba reader and all assertions
@@ -144,6 +146,46 @@ def main(amu, contract, compiler, out):
                   wholeCLIQualified=False, legacyRuntimeFallback=False, cCompilerOrLoader=False, emulation=False)
     (out / "native-cli-request.json").write_text(json.dumps(report, indent=2) + "\n")
     print(report["status"])
+
+
+# KOTOBA-174: x86 execution of this fixture is BLOCKED at the pinned Amu.
+# The kseed above is A64 code; the packed runner route exists only for
+# --target aarch64-linux, and running an ARM image on x86 would be emulation.
+# At Amu ce982703 the only x86_64-linux route that accepts --source-path and
+# --source-lock is the project adapter (seed/98-x86_64-project.kotoba,
+# --format kx64-v1), which refuses every capability call (E7101, OP-CAP);
+# --format static takes one unlocked source file. This fixture needs
+# :cli/args, :io/write and :fs/app-data. The x86 compiler still admits the
+# CID-locked sources (the "compile" call above). The refusal below is
+# asserted, so an Amu that accepts the locked project on x86 turns this red
+# and the x86 execution must then be wired instead of this marker.
+X86_BLOCKED = ("Amu ce982703 has no x86_64-linux route that compiles CID-locked multi-module sources "
+               "with capability calls: kx64-v1 project route refuses capabilities (E7101), static takes "
+               "no source lock, packed runner is aarch64-linux only")
+
+
+def x86_blocked(amu, compiler, entry, roots, lock, sources, inputs, contract, out, run, calls):
+    artifact = out / "request.kx64"
+    refused = run("x86-locked-project-route-refusal",
+                  [compiler, "compile", entry, "--target", "x86_64-linux", "--output", artifact, "--format", "kx64-v1",
+                   *[part for p in roots for part in ("--source-path", p)], "--source-lock", lock,
+                   "--source-lock-sha256", pin(lock)["sha256"]], expected=1)
+    assert b"7101" in refused.stderr and b"KEXE_TRAP" not in refused.stderr, \
+        ("x86 locked project route changed; wire x86 execution", refused.returncode, refused.stderr[-1200:])
+    assert not artifact.exists(), "refused x86 route left an artifact"
+    report = dict(status="BLOCKED_NATIVE_X86_CLI_REQUEST_EXECUTION", reason=X86_BLOCKED,
+                  host=[platform.system(), platform.machine()], inputs=inputs, compiler=pin(compiler),
+                  sources={str(p.relative_to(ROOT)) if p.is_relative_to(ROOT) else "amu/" + str(p.relative_to(amu)): pin(p)
+                           for p in sources},
+                  contract=pin(contract), lock=pin(lock), lockedCompile=pin(out / "request.kseed"),
+                  x86Refusal=refused.stderr.decode(errors="replace")[-400:], calls=calls,
+                  executed=False, nativeGuestOwnsAssertions=False, contractCheckExecutionQualified=False,
+                  lockCheckExecutionQualified=False, commandExecutionQualified=False,
+                  wholeCLIQualified=False, legacyRuntimeFallback=False, cCompilerOrLoader=False, emulation=False)
+    (out / "native-cli-request.json").write_text(json.dumps(report, indent=2) + "\n")
+    print("::warning title=KOTOBA-174 x86 CLI request blocked::" + X86_BLOCKED)
+    print(report["status"])
+
 
 
 if __name__ == "__main__":
