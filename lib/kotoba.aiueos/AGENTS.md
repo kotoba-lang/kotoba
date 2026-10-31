@@ -221,6 +221,10 @@ through fw_cfg file `opt/aiueos/install`, read only under a hypervisor
 tampered copy ("2"). Three boots install, install again (UPDATE.BIN reused,
 no new clusters) and refuse the tampered image; the disk is then parsed on
 the Mac (contents, FAT copies equal, chain lengths, writes inside the ESP).
+On the 6600H it installed the already-installed loader re-signed as version 3
+(result 15 in 52 s; BOOTX64.EFI moved to the new chain and hashed to the
+manifest), and after a signed reboot with PXE stopped the board booted it
+from NVMe: `docs/evidence/awai122-esp-install-6600h-20261031`.
 Disk-first boot is stage 5.
 
 ## CDCI migration: native only (2026-10-24)
