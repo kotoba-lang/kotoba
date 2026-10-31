@@ -1733,13 +1733,14 @@ data[17] ^= 1
 Path(sys.argv[2]).write_bytes(data)
 PYSIG
 fi
-python3 "$aiueos/scripts/make-initramfs.py" \
-  --entry "recovery/user-smoke.elf,$aiueos/kotoba/user-smoke.elf" \
-  --entry "recovery/user-smoke.sig,$recovery_signature" \
-  --entry "recovery/app-catalog.sig,$aiueos/kotoba/app-catalog.sig" \
-  --entry "font/aiueos-16.fnt,$aiueos/fonts/aiueos-16.fnt" \
-  --entry "ime/aiueos-kanji.dic,$aiueos/ime/aiueos-kanji.dic" \
-  --output "$initramfs" >/dev/null
+# JUN-555: the newc initramfs is written by Kotoba (native/initramfs.kotoba) through the pinned Amu Mac
+# root; without that native route the build refuses. make-initramfs.py stays as its test oracle.
+sh "$aiueos/scripts/run-native-generator.sh" "$aiueos/native/initramfs.kotoba" "$initramfs" \
+  --input "e0=$aiueos/kotoba/user-smoke.elf" --input "e1=$recovery_signature" \
+  --input "e2=$aiueos/kotoba/app-catalog.sig" --input "e3=$aiueos/fonts/aiueos-16.fnt" \
+  --input "e4=$aiueos/ime/aiueos-kanji.dic" -- \
+  recovery/user-smoke.elf e0 @size:e0 recovery/user-smoke.sig e1 @size:e1 \
+  recovery/app-catalog.sig e2 @size:e2 font/aiueos-16.fnt e3 @size:e3 ime/aiueos-kanji.dic e4 @size:e4
 # JUN-555: the kernel/initramfs digest source is written by Kotoba (native/kernel-identity-source.kotoba,
 # seed 03's SHA-256) through the pinned Amu Mac root; without that native route the build refuses.
 sh "$aiueos/scripts/run-native-generator.sh" "$aiueos/native/kernel-identity-source.kotoba" \
