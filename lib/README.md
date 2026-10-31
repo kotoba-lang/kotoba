@@ -381,7 +381,6 @@ The bundled standard libraries live in this repository:
 | `kotoba.shaders` | `kotoba.shaders/src` | `kami.shaders`, `kotoba.shaders` (Kotoba project library) |
 | `kotoba.scene2d` | `kotoba.scene2d/src` | `kami.scene2d`, `kami.text`, `kotoba.scene2d` (Kotoba project library) |
 | `kotoba.renderShaders` | `kotoba.renderShaders/src` | `kami.render-shaders`, `kotoba.render-shaders` (Kotoba project library) |
-| `kotoba.host` | `kotoba.host/src` | `kami.audio`, `kami.backend.browser`, `kami.host`, `kami.input` (Kotoba project library) |
 | `kotoba.physics2d` | `kotoba.physics2d/src` | `physics-2d`, `physics-2d.backend`, `physics-2d.stairs` (Kotoba project library) |
 | `kotoba.machineProbe` | `kotoba.machineProbe/src` | `machine.bench`, `machine.bench-cli`, `machine.calibrate-cli`, `machine.curve-cli` (Kotoba project library) |
 | `kotoba.kotobaSema` | `kotoba.kotobaSema/src` | `kotoba.compiler.affine`, `kotoba.compiler.frontend`, `kotoba.compiler.frontend.absence-resolution`, `kotoba.compiler.frontend.analyze` (Kotoba project library) |
@@ -558,12 +557,9 @@ The bundled standard libraries live in this repository:
 | `kotoba.kamiMangakaExpression` | `kotoba.kamiMangakaExpression/src` | `kami.mangaka.expression` (Kotoba project library) |
 | `kotoba.kamiEngineSdk` | `kotoba.kamiEngineSdk/src` | `kami.avatar`, `kami.backend.browser`, `kami.backend.host`, `kami.benchmark` (Kotoba project library) |
 | `kotoba.kamiEngineCfd` | `kotoba.kamiEngineCfd/src` | `kami-cfd`, `kami-cfd.d3`, `kami-cfd.duct`, `kami-cfd.mesh` (Kotoba project library) |
-| `kotoba.kamiContracts` | `kotoba.kamiContracts/src` | `kami.app-fixtures-catalog`, `kami.app-state-machines`, `kami.component`, `kami.contracts.gpu` (Kotoba project library) |
 | `kotoba.kamiCadImport` | `kotoba.kamiCadImport/src` | `cad-import`, `cad-import.demos`, `cad-import.demos.roadster`, `cad-import.demos.synth-sedan` (Kotoba project library) |
 | `kotoba.kamiAutodrive` | `kotoba.kamiAutodrive/src` | `autodrive`, `autodrive.autopilot`, `autodrive.classes`, `autodrive.control` (Kotoba project library) |
 | `kotoba.kamiAppShibuya` | `kotoba.kamiAppShibuya/src` | `kotoba.shibuya` (Kotoba project library) |
-| `kotoba.kamiAppIsekai` | `kotoba.kamiAppIsekai/src` | `kami-app-isekai`, `kami-app-isekai.heightmap-color`, `kami-app-isekai.omniverse`, `kami-app-isekai.pipelines` (Kotoba project library) |
-| `kotoba.kamiAppFixtures` | `kotoba.kamiAppFixtures/src` | `kami.app-fixtures`, `kami.provider.contract` (Kotoba project library) |
 | `kotoba.kagitaba` | `kotoba.kagitaba/src` | `kagitaba.capability`, `kagitaba.category`, `kagitaba.contract`, `kagitaba.field` (Kotoba project library) |
 | `kotoba.kagami` | `kotoba.kagami/src` | `kagami.ci`, `kagami.db`, `kagami.did`, `kagami.governor-bridge` (Kotoba project library) |
 | `kotoba.jpGoDigitalDesignSystem` | `kotoba.jpGoDigitalDesignSystem/src` | `jp-go-dds.behavior`, `jp-go-dds.core`, `jp-go-dds.css`, `jp-go-dds.dark` (Kotoba project library) |
@@ -618,7 +614,6 @@ The bundled standard libraries live in this repository:
 | `kotoba.kamiOngakuNotation` | `kotoba.kamiOngakuNotation/src` | `kami.ongaku.notation`, `kami.ongaku.notation.duration`, `kami.ongaku.notation.musicxml`, `kami.ongaku.notation.pitch` (Kotoba project library) |
 | `kotoba.sdf` | `kotoba.sdf/src` | `sdf` (Kotoba project library) |
 | `kotoba.kamiEngineCad` | `kotoba.kamiEngineCad/src` | `kami.cad` (Kotoba project library) |
-| `kotoba.kamiEngineAppSdk` | `kotoba.kamiEngineAppSdk/src` | `kami-ui-sdk`, `kami-ui-sdk.effect`, `kami-ui-sdk.engine-audio`, `kami-ui-sdk.motion` (Kotoba project library) |
 | `kotoba.kamiAppTatekata` | `kotoba.kamiAppTatekata/src` | `kotoba.tatekata`, `kotoba.tatekata.deposit-field`, `kotoba.tatekata.process`, `kotoba.tatekata.thermal` (Kotoba project library) |
 | `kotoba.kamiAppSarutahikoFactory` | `kotoba.kamiAppSarutahikoFactory/src` | `kotoba.sarutahiko-factory`, `kotoba.sarutahiko-factory.clashes`, `kotoba.sarutahiko-factory.construction-order`, `kotoba.sarutahiko-factory.factory` (Kotoba project library) |
 | `kotoba.ioStorj` | `kotoba.ioStorj/src` | `storj.core`, `storj.gateway`, `storj.linkshare`, `storj.protocols` (Kotoba project library) |
@@ -817,7 +812,6 @@ The bundled standard libraries live in this repository:
 | `kotoba.kiss` | `kotoba.kiss/src` | `kiss.airtime`, `kiss.core` (Kotoba project library) |
 | `kotoba.kip` | `kotoba.kip/src` | `kotoba.kip.core`, `kotoba.kip.quorum`, `kotoba.kip.registry` (Kotoba project library) |
 | `kotoba.kgraph` | `kotoba.kgraph/src` | `kotoba.kgraph` (Kotoba project library) |
-| `kotoba.kamiWebvr` | `kotoba.kamiWebvr/src` | `kami.webvr.cine-bridge`, `kami.webvr.engine`, `kami.webvr.incident-pregel`, `kami.webvr.types` (Kotoba project library) |
 | `kotoba.kamiUsdNative` | `kotoba.kamiUsdNative/src` | `usd-native` (Kotoba project library) |
 | `kotoba.kamiOngakuSampler` | `kotoba.kamiOngakuSampler/src` | `kami.ongaku.sampler` (Kotoba project library) |
 | `kotoba.kamiOngakuSequencer` | `kotoba.kamiOngakuSequencer/src` | `kami.ongaku.sequencer`, `kami.ongaku.sequencer.smf` (Kotoba project library) |
@@ -827,22 +821,16 @@ The bundled standard libraries live in this repository:
 | `kotoba.kamiMangakaScene` | `kotoba.kamiMangakaScene/src` | `mangaka-scene`, `mangaka-scene.camera`, `mangaka-scene.lexicon`, `mangaka-scene.pose` (Kotoba project library) |
 | `kotoba.kamiMangakaRender` | `kotoba.kamiMangakaRender/src` | `kami.mangaka.render` (Kotoba project library) |
 | `kotoba.kamiMangakaQa` | `kotoba.kamiMangakaQa/src` | `kami.mangaka.qa.axes`, `kami.mangaka.qa.geometry`, `kami.mangaka.qa.overlay`, `kami.mangaka.qa.perception` (Kotoba project library) |
-| `kotoba.kamiIsekaiAssets` | `kotoba.kamiIsekaiAssets/src` | `kami.isekai.catalog`, `kami.isekai.chargen`, `kami.isekai.classes`, `kami.isekai.equipment` (Kotoba project library) |
 | `kotoba.kamiGenSdfAgent` | `kotoba.kamiGenSdfAgent/src` | `kami.gen.sdf-agent`, `kami.gen.sdf-agent.critique`, `kami.gen.sdf-agent.propose`, `kami.gen.sdf-agent.render` (Kotoba project library) |
 | `kotoba.scad` | `kotoba.scad/src` | `scad`, `scad.csg`, `scad.evaluator`, `scad.parser` (Kotoba project library) |
 | `kotoba.vegetation` | `kotoba.vegetation/src` | `vegetation`, `vegetation.cull`, `vegetation.instance`, `vegetation.lod` (Kotoba project library) |
 | `kotoba.mesher` | `kotoba.mesher/src` | `mesher`, `mesher.mc-tables` (Kotoba project library) |
 | `kotoba.kamiEngineSculpt` | `kotoba.kamiEngineSculpt/src` | `kami.paint`, `kami.sculpt` (Kotoba project library) |
-| `kotoba.kamiEngineInputMap` | `kotoba.kamiEngineInputMap/src` | `input-map` (Kotoba project library) |
-| `kotoba.kamiEngineHudGpu` | `kotoba.kamiEngineHudGpu/src` | `ui_gpu` (Kotoba project library) |
-| `kotoba.kamiEngineGuest` | `kotoba.kamiEngineGuest/src` | `kotoba.engine-clj`, `kotoba.engine-clj.ast`, `kotoba.engine-clj.codegen`, `kotoba.engine-clj.component` (Kotoba project library) |
-| `kotoba.kamiEngWeb` | `kotoba.kamiEngWeb/src` | `eng-web`, `eng-web.cam`, `eng-web.coverage`, `eng-web.dft` (Kotoba project library) |
 | `kotoba.kamiArticulated` | `kotoba.kamiArticulated/src` | `kami_articulated`, `kami_articulated.urdf` (Kotoba project library) |
 | `kotoba.kamiAppQuarryWalk` | `kotoba.kamiAppQuarryWalk/src` | `kami-app-quarry-walk` (Kotoba project library) |
 | `kotoba.nagare` | `kotoba.nagare/src` | `nagare.demo`, `nagare.diagnostics`, `nagare.field`, `nagare.fvm` (Kotoba project library) |
 | `kotoba.kamiAppGiemonFactory` | `kotoba.kamiAppGiemonFactory/src` | `kami-app-giemon-factory`, `kami-app-giemon-factory.clashes`, `kami-app-giemon-factory.construction-order`, `kami-app-giemon-factory.factory` (Kotoba project library) |
 | `kotoba.kamiAppGiemon` | `kotoba.kamiAppGiemon/src` | `kami-app-giemon`, `kami-app-giemon.armcrawler`, `kami-app-giemon.caterpillar`, `kami-app-giemon.geom` (Kotoba project library) |
-| `kotoba.kamiAppCarSim` | `kotoba.kamiAppCarSim/src` | `kotoba.car-sim`, `kotoba.car-sim.color`, `kotoba.car-sim.controls`, `kotoba.car-sim.garage` (Kotoba project library) |
 | `kotoba.kaiyu` | `kotoba.kaiyu/src` | `kaiyu.core`, `kaiyu.diagnose`, `kaiyu.session` (Kotoba project library) |
 | `kotoba.kaisha` | `kotoba.kaisha/src` | `kaisha.model`, `kaisha.validate` (Kotoba project library) |
 | `kotoba.jsonlogic` | `kotoba.jsonlogic/src` | `jsonlogic.core`, `jsonlogic.ports`, `jsonlogic.validate` (Kotoba project library) |
