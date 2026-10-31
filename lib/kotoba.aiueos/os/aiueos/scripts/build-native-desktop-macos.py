@@ -340,7 +340,7 @@ def main(args):
                            else 4 if args.profile == "ed25519"
                            else 16 if args.profile == "keystore"
                            else 11 if args.profile == "dapps"
-                           else 4 if args.profile == "nvme"
+                           else 7 if args.profile == "nvme"
                            else 2 if args.profile in ("cid", "sha512", "gf25519", "keyseal") else 24)
         if (observed["status"] != expected_status
                 or len(observed["events"]) != expected_events
@@ -417,13 +417,16 @@ def main(args):
                 raise ValueError("dapps verdict is incomplete")
         elif args.profile == "nvme":
             if (observed["font"] != font_state["padded"]
-                    or [row["name"] for row in observed["events"]] != ["nvme-fat32", "nvme-fat16-media", "nvme-4096", "nvme-absent"]
-                    or [row["result"] for row in observed["events"]] != [15, 15, 15, 1]
-                    or [row["esp"] for row in observed["events"]] != [15, 15, 3, 1]
-                    or not all(row["desktopKeptRunning"] for row in observed["events"])
+                    or [row["name"] for row in observed["events"]] != ["nvme-fat32", "nvme-fat16-media", "nvme-4096", "nvme-absent",
+                                                                       "nvme-install", "nvme-install-again", "nvme-install-tampered"]
+                    or [row["result"] for row in observed["events"][:4]] != [15, 15, 15, 1]
+                    or [row["esp"] for row in observed["events"][:4]] != [15, 15, 3, 1]
+                    or not all(row["desktopKeptRunning"] for row in observed["events"][:4])
                     or not all(row.get("diskUnchanged") for row in observed["events"][:3])
-                    or [row["updateSelfTest"] for row in observed["events"]] != [[15, 1, 7]] * 4
-                    or observed["writeCommands"] or observed["physicalHardware"]):
+                    or [row["updateSelfTest"] for row in observed["events"][:4]] != [[15, 1, 7]] * 4
+                    or [row["install"] for row in observed["events"][4:]] != [15, 15, 7]
+                    or not observed["events"][5].get("noNewClusters")
+                    or not observed["writesOnlyThroughInstallHook"] or observed["physicalHardware"]):
                 raise ValueError("nvme verdict is incomplete")
         elif args.profile == "keyseal":
             if (observed["font"] != font_state["padded"]

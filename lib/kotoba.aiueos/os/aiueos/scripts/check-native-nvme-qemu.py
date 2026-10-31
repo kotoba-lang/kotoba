@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""AWAI-122 stages 1-3: the debug entry's read-only NVMe driver identifies a controller and reads LBA 1, then
+"""AWAI-122 stages 1-4: the debug entry's read-only NVMe driver identifies a controller and reads LBA 1, then
 finds the ESP, walks FAT16/FAT32 to the installed loader and takes its SHA-256; then the signed-image
 verifier (native/update.kotoba) runs its self-test.
 
@@ -17,7 +17,14 @@ boot), each with QEMU `-nic none`:
 Every boot also checks the update verifier's self-test (context words 188/189): the RFC 8032 test-1-signed
 5000-byte fixture image is accepted (15), refused with one manifest byte changed (1, signature) and refused
 with one image byte changed (7, digest). The network pull itself needs the RTL8168, which QEMU does not have.
-After every boot the disk image is byte-identical to before (the driver has no write command), and the desktop
+Stage 4 adds three boots on fresh FAT32 fixtures, each with QEMU fw_cfg file opt/aiueos/install (the only
+way the debug entry's install hook runs; a physical board has no fw_cfg): "1" installs the self-test fixture
+(5000 bytes, RFC 8032 test-1 key) as \\EFI\\itonami\\BOOTX64.EFI through the staging file UPDATE.BIN
+(created on first use), then a second boot on the same disk installs it again (UPDATE.BIN reused: its chain
+is cut to the image and no new cluster is taken); "2" offers the fixture with one image byte changed and must leave BOOTX64.EFI as it was. After
+each, the disk is parsed here: file contents, FAT copies equal, chains as long as the sizes, every changed
+sector inside the ESP.
+After every read-only boot the disk image is byte-identical to before (the driver has no write command), and the desktop
 keeps drawing after the probe. The NVMe boots use a 37-bit guest physical address width: with QEMU's default,
 OVMF places the 64-bit NVMe BAR at 768 GiB and the loader's PCI collector, which admits host addresses below
 512 GiB, refuses the boot (as it should). They also get a writable copy of OVMF's variable store, since without
@@ -33,6 +40,8 @@ HERE = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location("keystore_gate", HERE / "check-native-keystore-qemu.py")
 keystore = importlib.util.module_from_spec(spec); spec.loader.exec_module(keystore)
 pin = keystore.pin
+spec = importlib.util.spec_from_file_location("image_tool", HERE / "aiueos-image.py")
+image_tool = importlib.util.module_from_spec(spec); spec.loader.exec_module(image_tool)
 MODEL = "QEMU NVMe Ctrl"
 ESP_GUID = bytes.fromhex("28732AC11FF8D211BA4B00A0C93EC93B")
 OWN_SIZE = 300001
@@ -76,6 +85,86 @@ def header_only_disk(path):
     raw = bytearray(os.urandom(1 << 20))
     raw[4096:8192] = b"EFI PART" + bytes(4088)
     path.write_bytes(bytes(raw))
+
+
+def fat32_volume(raw):
+    """The first GPT partition's FAT32 volume: (start, bpb dict)."""
+    lba, _, size = struct.unpack_from("<QII", raw, 512 + 72)
+    first, last = struct.unpack_from("<QQ", raw, lba * 512 + 32)
+    base = first * 512
+    bps, spc = struct.unpack_from("<HB", raw, base + 11)
+    reserved, fats = struct.unpack_from("<HB", raw, base + 14)
+    fat_size, root = struct.unpack_from("<I", raw, base + 36)[0], struct.unpack_from("<I", raw, base + 44)[0]
+    fat = base + reserved * bps
+    return dict(base=base, end=(last + 1) * 512, bps=bps, cluster=bps * spc, fat=fat, fats=fats,
+                fat_bytes=fat_size * bps, data=fat + fats * fat_size * bps, root=root)
+
+
+def fat32_chain(raw, v, c):
+    chain = []
+    while 2 <= c < 0x0FFFFFF7 and len(chain) < 1 << 20:
+        chain.append(c)
+        c = struct.unpack_from("<I", raw, v["fat"] + 4 * c)[0] & 0x0FFFFFFF
+    assert c >= 0x0FFFFFF8, ("broken chain", c)
+    return chain
+
+
+def fat32_dir(raw, v, c):
+    entries = {}
+    for cl in fat32_chain(raw, v, c):
+        at = v["data"] + (cl - 2) * v["cluster"]
+        for e in range(at, at + v["cluster"], 32):
+            if raw[e] == 0: return entries
+            if raw[e] == 0xE5 or raw[e + 11] == 0x0F: continue
+            first = struct.unpack_from("<H", raw, e + 26)[0] | struct.unpack_from("<H", raw, e + 20)[0] << 16
+            entries[bytes(raw[e:e + 11]).decode("ascii", "replace")] = (first, struct.unpack_from("<I", raw, e + 28)[0], e)
+    return entries
+
+
+def fat32_files(raw):
+    """\\EFI\\ITONAMI's BOOTX64.EFI and UPDATE.BIN contents, after checking the FAT."""
+    v = fat32_volume(raw)
+    for k in range(1, v["fats"]):
+        assert raw[v["fat"]:v["fat"] + v["fat_bytes"]] == raw[v["fat"] + k * v["fat_bytes"]:v["fat"] + (k + 1) * v["fat_bytes"]], "FAT copies differ"
+    efi = fat32_dir(raw, v, v["root"])["EFI        "][0]
+    own = fat32_dir(raw, v, fat32_dir(raw, v, efi)["ITONAMI    "][0])
+    files, used = {}, set()
+    for name in ("BOOTX64 EFI", "UPDATE  BIN"):
+        if name not in own: continue
+        first, size, at = own[name]
+        chain = fat32_chain(raw, v, first)
+        assert len(chain) == (size + v["cluster"] - 1) // v["cluster"], (name, len(chain), size)
+        assert not used & set(chain), "cross-linked chains"
+        used |= set(chain)
+        data = b"".join(bytes(raw[v["data"] + (c - 2) * v["cluster"]:v["data"] + (c - 1) * v["cluster"]]) for c in chain)
+        files[name] = (data[:size], at)
+    return v, files
+
+
+def install_boot(args, out, name, path, request, events):
+    """One stage-4 boot: the debug entry's QEMU hook installs the fixture from fw_cfg `request`."""
+    before = path.read_bytes()
+    vars_copy = out / f"{name}-vars.fd"
+    shutil.copyfile(args.firmware.parent / "edk2-i386-vars.fd", vars_copy)
+    extra = ["-drive", f"if=pflash,format=raw,file={vars_copy}", "-cpu", "max,phys-bits=37",
+             "-drive", f"file={path},format=raw,if=none,id=nv0", "-device", "nvme,serial=AWAI122NVME512,drive=nv0",
+             "-fw_cfg", f"name=opt/aiueos/install,string={request}"]
+    b = keystore.Boot(args, out, name, None, extra, first_frame_seconds=900)
+    try:
+        result, stream, hook = b.W(208), b.W(180), b.W(211)
+        frames = b.W(79)
+        b.send("sendkey 1", 2.0)
+        assert b.W(79) > frames, "the desktop must still draw after the install"
+    finally:
+        b.quit()
+    vars_copy.unlink()
+    after = path.read_bytes()
+    v, files = fat32_files(after)
+    changed = [i for i in range(0, len(before), 512) if after[i:i + 512] != before[i:i + 512]]
+    assert all(v["base"] <= i < v["end"] for i in changed), ("a write outside the ESP", changed[:4])
+    events.append(dict(name=name, request=request, hook=hook, install=result, stream=stream,
+                       changedSectors=len(changed), bootSize=len(files["BOOTX64 EFI"][0])))
+    return before, after, files
 
 
 def boot(args, out, name, kind, events):
@@ -158,10 +247,32 @@ def main(args):
     boot(args, out, "nvme-fat16-media", "fat16", events)
     boot(args, out, "nvme-4096", "4096", events)
     boot(args, out, "nvme-absent", "absent", events)
+    fixture = image_tool.fixture_image()
+    disk = out / "install.img"
+    own = fat32_disk(out, disk)
+    original = fat32_files(disk.read_bytes())[1]["BOOTX64 EFI"][0]
+    assert hashlib.sha256(original).hexdigest() == own["sha256"]
+    _, first, files = install_boot(args, out, "nvme-install", disk, "1", events)
+    assert events[-1]["install"] == 15 and events[-1]["hook"] == 49, events[-1]
+    assert files["BOOTX64 EFI"][0] == fixture and files["UPDATE  BIN"][0][:len(original)] == original
+    assert files["BOOTX64 EFI"][1] // 512 == files["UPDATE  BIN"][1] // 512, "entries in one block"
+    v = fat32_volume(first)
+    _, second, files = install_boot(args, out, "nvme-install-again", disk, "1", events)
+    assert events[-1]["install"] == 15, events[-1]
+    assert files["BOOTX64 EFI"][0] == fixture and files["UPDATE  BIN"][0] == fixture
+    used = lambda raw: {c for c in range(2, (v["fat_bytes"] // 4)) if struct.unpack_from("<I", raw, v["fat"] + 4 * c)[0] & 0x0FFFFFFF}
+    assert used(second) <= used(first), "a second install must reuse UPDATE.BIN's clusters, not take new ones"
+    events[-1]["noNewClusters"] = True
+    disk.unlink()
+    own = fat32_disk(out, disk)
+    _, _, files = install_boot(args, out, "nvme-install-tampered", disk, "2", events)
+    assert events[-1]["install"] == 7 and events[-1]["stream"] == 7, events[-1]
+    assert hashlib.sha256(files["BOOTX64 EFI"][0]).hexdigest() == own["sha256"], "a refused image must not replace BOOTX64.EFI"
+    disk.unlink()
     assert pin(args.media) == media_before
     report = dict(status="PASS_NATIVE_NVME_READ_QEMU", kernel=pin(args.kernel), efi=pin(args.efi), media=media_before,
                   firmware=pin(args.firmware), font=pin(args.font), observer=pin(Path(__file__)), events=events,
-                  network="none (-nic none)", writeCommands=False, physicalHardware=False)
+                  network="none (-nic none)", writesOnlyThroughInstallHook=True, physicalHardware=False)
     (out / "native-nvme-qemu.json").write_text(json.dumps(report, indent=2) + "\n")
     print(report["status"], len(events))
 

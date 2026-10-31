@@ -4,9 +4,12 @@
   ;; fetches a signed image, checks it, then writes the ESP), and of keeping
   ;; Itonami state on a machine whose only disk is NVMe.
   ;;
-  ;; Read only: the controller is reset and enabled, and the commands sent are
-  ;; Identify, Create I/O Completion/Submission Queue and Read. No Write, Flush,
-  ;; Format, Dataset Management or Set Features command exists in this file.
+  ;; The controller is reset and enabled, and the commands sent are Identify,
+  ;; Create I/O Completion/Submission Queue, Read, and (AWAI-122 stage 4) Write
+  ;; and Flush. A write is refused unless it lies wholly inside the write window
+  ;; (context words 646..649, byte offsets [low, high)): probe closes it, and
+  ;; only native/esp opens it, to the ESP partition. No Format, Dataset
+  ;; Management or Set Features command exists in this file.
   ;; No interrupt is used (CQ interrupts disabled, INTx disabled in PCI COMMAND).
   ;;
   ;; DMA uses owned window slot 4 (five pages): 0 admin SQ, 1 admin CQ, 2 I/O
@@ -19,9 +22,10 @@
   ;;   606 VS, 607/608 namespace 1 size in blocks, 609 log2 block size,
   ;;   610..615 tail/head/phase of the admin and I/O queues, 616 doorbell
   ;;   stride shift, 617 last completion dword 3, 618 command id,
-  ;;   620..629 model number (40 bytes), 630..645 the first 64 bytes of LBA 1.
+  ;;   620..629 model number (40 bytes), 630..645 the first 64 bytes of LBA 1,
+  ;;   646/647 write window low, 648/649 write window high (0/0 = closed).
   (:require [capability.dma.map :as dma])
-  (:export [probe read-lba read-4k]))
+  (:export [probe read-lba read-4k write-span flush open-window]))
 
 (defn word [region i]
   (kernel-load-u32 (kernel-subregion region 8192 (* i 4) 4) 4 0))
@@ -154,6 +158,26 @@
     (submit ctx 1 2 1 (page-address 4) (bit-and lba 4294967295) (u64-shift-right lba 32)
             (- (u64-shift-right 4096 (word ctx 609)) 1))))
 
+;; AWAI-122 stage 4. open-window sets the write window (esp: the ESP partition).
+;; write-span writes `len` bytes (a whole number of blocks, inside one page)
+;; from DMA address prp to the block-aligned disk byte offset; -2 when the
+;; span is not inside the window, else the status as submit. flush: status.
+(defn word64 [ctx i] (+ (word ctx i) (* (word ctx (+ i 1)) 4294967296)))
+(defn put-word64 [ctx i value]
+  (do (put-word ctx i (bit-and value 4294967295)) (put-word ctx (+ i 1) (u64-shift-right value 32))))
+(defn open-window [ctx low high]
+  (do (put-word64 ctx 646 low) (put-word64 ctx 648 high) 1))
+(defn write-span [ctx offset prp len]
+  (let [block (i64-shift-left 1 (word ctx 609))
+        lba (u64-shift-right offset (word ctx 609))]
+    (if (or (<= len 0) (not (= (bit-and len (- block 1)) 0)) (not (= (bit-and offset (- block 1)) 0))
+            (> (+ (bit-and prp 4095) len) 4096)
+            (< offset (word64 ctx 646)) (> (+ offset len) (word64 ctx 648)) (>= (word64 ctx 646) (word64 ctx 648)))
+      -2
+      (submit ctx 1 1 1 prp (bit-and lba 4294967295) (u64-shift-right lba 32)
+              (- (u64-shift-right len (word ctx 609)) 1)))))
+(defn flush [ctx] (submit ctx 1 0 1 0 0 0 0))
+
 ;; Read one logical block into the data page (page 4). Status as submit.
 (defn read-lba [ctx lba]
   (submit ctx 1 2 1 (page-address 4) (bit-and lba 4294967295) (u64-shift-right lba 32) 0))
@@ -199,9 +223,11 @@
 ;; Result word 600: 1 no NVMe function, 2 no usable BAR0, 3 disable timed out,
 ;; 4 enable timed out or controller fatal, 5 Identify Controller, 6 Identify
 ;; Namespace 1, 7 Create I/O CQ, 8 Create I/O SQ, 9 Read LBA 1 failed,
-;; 10 block size above 4096, 15 every step passed. Never writes the medium.
+;; 10 block size above 4096, 15 every step passed. The probe writes nothing and
+;; leaves the write window closed.
 (defn probe [ctx]
-  (let [slot (find-slot 0)]
+  (let [closed (open-window ctx 0 0)
+        slot (+ (find-slot 0) (* 0 closed))]
     (if (< slot 0) (fail ctx 1)
       (let [address (bar0 slot)]
         (do (put-word ctx 601 slot)
