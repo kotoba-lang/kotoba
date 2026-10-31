@@ -446,7 +446,7 @@ if [ -z "${AIUEOS_KOTOBA_FNV_OBJECT:-}" ]; then
 fi
 kotoba_journal_sha=
 if [ -z "${AIUEOS_KOTOBA_JOURNAL_OBJECT:-}" ]; then
-  kotoba_journal_sha=0b97cda6327bb330b7900dacc2a68086d7ac164244b7c1e22908a85e5d94a20f
+  kotoba_journal_sha=9c2ef7a0c5c4f2f087867595c16e89ccb29f76c6795293bf931454f93d55f58f
 fi
 kotoba_kernel_sha=
 if [ -z "${AIUEOS_KOTOBA_KERNEL_OBJECT:-}" ]; then
