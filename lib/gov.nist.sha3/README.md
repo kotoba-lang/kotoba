@@ -94,12 +94,42 @@ All 126 oracle lines equal Python `hashlib` (`sha3_*`, `shake_128`, `shake_256`)
 the same inputs (byte i = (7i + 3) mod 256). Python only compared the printed lines;
 the image computed every digest.
 
-Not yet: the incremental XOF, the CAVP files under `test/sha3/cavp/` run natively
-(the gate embeds the published examples; the `.cljk` suite runs the CAVP files), and
-an x86_64 run of this gate: it prints its oracle lines through `:io/write`, which amu's
-locked x86 project adapter refuses (E7101, a capability), so it is skipped there. SHA-3
-itself runs on x86_64 inside the ML-KEM and ML-DSA gates. This gate runs in CI on Linux arm64
-(`scripts/check-pq-native.py`, since kotoba#1014).
+On Linux x86_64 (KX64 under the native runner) the gate cannot print: amu's locked
+x86 project adapter refuses every capability, `:io/write` included (E7101 OP-CAP), and
+that refusal is deliberate. So x86_64 runs a print-free variant, `sha3-x86` in
+`scripts/check-pq-native.py` (AWAI-117, owner decision 2026-10-31). It is not a second
+file. The script builds it from this gate's source at build time with one rewrite:
+`g-say` returns the line's length (`string-length`) instead of writing it. The
+rewrite must match the source exactly once, and the result must name no capability.
+Everything else is unchanged: the same known answers and checks, the same bitmask
+(63 = pass), and the same library body. Both mutants above apply to it unchanged,
+and the 126 sweep digests are still computed but not printed. The gate answers only
+through main's result.
+
+| lane | gate run |
+|---|---|
+| Linux arm64 (PRs, main, nightly) | `sha3`, the printing gate as committed |
+| macOS (local, `native_gate.py`) | `sha3`, the printing gate as committed |
+| Linux x86_64 `pq-unity` lane (main, nightly, dispatch; not PRs, JUN-629) | `sha3-x86`, the print-free variant |
+
+The script refuses `sha3` on x86_64, and `sha3-x86` is not in its default selection.
+Each run's `evidence.json` records, for each gate, the variant it ran, the sha256 of
+the gate source and the generated unity source, and every mutant's result. Measured
+2026-10-31 with the Amu Mac root of main `a4c16e7c`:
+
+- **On the Mac,** `sha3-x86` gives the same results as `sha3`: pass 63, ctl-constant
+  56, ctl-suffix 60, and it writes no stdout.
+- **Cross-compiled to KX64** (`--target x86_64-linux --format kx64-v1`), the variant
+  and both mutants compile (44090 bytes each). The printing gate is refused with
+  `seed: E7101`.
+
+The x86_64 run itself is the CI `pq-unity` lane.
+
+Not yet: the incremental XOF, and running the CAVP files under `test/sha3/cavp/`
+natively (the gate embeds the published examples; the `.cljk` suite runs the CAVP
+files). The x86_64 variant does not compare the sweep lines with `hashlib` (no lane
+does in CI). This gate runs in CI on Linux arm64 (`scripts/check-pq-native.py`, since
+kotoba#1014), and its print-free variant on Linux x86_64.
 
 ## Non-claims
 
