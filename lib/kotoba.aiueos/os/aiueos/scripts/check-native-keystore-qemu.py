@@ -25,7 +25,7 @@ PASS, WRONG = "correct horse", "correct horsf"
 
 
 class Boot:
-    def __init__(self, args, out, name, scratch, extra=()):
+    def __init__(self, args, out, name, scratch, extra=(), first_frame_seconds=150):
         image = args.kernel.read_bytes()
         rw = struct.unpack_from("<IIQQQQQQ", image, 120)
         context = rw[3]
@@ -43,7 +43,7 @@ class Boot:
         cmd += list(extra)
         self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=subprocess.STDOUT, text=True, cwd=out, bufsize=1)
-        deadline = time.monotonic() + 150
+        deadline = time.monotonic() + first_frame_seconds
         while time.monotonic() < deadline:
             if self.W(79) >= 1: break
             time.sleep(2)
