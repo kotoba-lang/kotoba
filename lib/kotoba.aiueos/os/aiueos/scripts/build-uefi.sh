@@ -1002,7 +1002,7 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_cpu_apic_id_ob
   078886d7c38cde4761e31a7f5a8b2e10c0facc9491394fb00d2702e515955183 \
   kotoba_aiueos_cpu_apic_id
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_syscall_range_object" \
-  04dd94e36e17da696f5bd235a7e1359173ab6625366b6db07651c5f255c90d3e \
+  b8d28342e37f45afdc6a0023132e8d11da7abb6615a94d6e2a0c6174922146a2 \
   kotoba_aiueos_syscall_range_valid
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_copy_in_object" \
   9f88efa075c7d10af87299f4eb358633378827a603726f624e26ec3a19d5ab78 \
@@ -1017,7 +1017,7 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_capability_mut
   026bcc5a6cc3336d892f3c58cdbf07dbca49f72d8e129f8cb46c29f9fdb7b668 \
   kotoba_aiueos_capability_mutation_plan
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_service_lifecycle_object" \
-  a61aea52c4186715a8f87f5c3eed861e9c64b9487e5f659ba43cb6165a6dbaac \
+  2225dd030ff13ce8bef2b6298f86bbb6d75fdb85ed0c20e6a9a30a24a5aef1e7 \
   kotoba_aiueos_service_lifecycle
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_service_registry_object" \
   3abb1bb7dbf76b4beb6b42d131590e2b780a9f7716a7ddb96f898f725eae9ea0 \
@@ -1269,13 +1269,13 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_wm_object" \
   f0eb2dd827b30c778ac9321963d4da53932802693be72bc5ef8a38f25893d900 \
   kotoba_aiueos_wm_hit
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_scanout_object" \
-  5ca924dff9fe42620f2313d16f8f62018d9bfbf588c7b142383066cce65d8305 \
+  5318fd39d4d1bba145aeb68e3b0df40843a34e20db9ab2a72390e635d0353bba \
   kotoba_aiueos_scanout_bind
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_broker_object" \
-  713bdc8e4c3d41ea9602fe9184741c15bd7a7b71d6f1b688a766a2d83714a48f \
+  4449df28de58940f106e7ebdd7237fdcaa4bd3a913093fe4f478505e5960951e \
   kotoba_aiueos_broker_admit
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_session_object" \
-  1983e5fa9026b2a356a4c43f6fa84630f6261ebd50c9939c4d657a326659048b \
+  e9b49c362e9583115b06f0095237d20dfad5719d5894ee0cf57fa2a8c0ac87c2 \
   kotoba_aiueos_session_restore
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_browser_frame_object" \
   d828fde6c002264314c9e86ee4bd72ceda2965c97cfd6ba87d6558956c591569 \
