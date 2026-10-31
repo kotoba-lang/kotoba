@@ -1202,7 +1202,7 @@ if [ -n "$model_handoff_link" ] || [ -n "$qwen35_parity_cflags" ]; then
   fi
 fi
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_device_worker_canonical_object" \
-  fdd390542fc7a315bff5a8adb3e7ca78eef493d46e652f45c80a77dba664fc95 \
+  22c34dad88cb82a46c3a39e366f35101f99a0e5cdb0d21d98e5f17435e54ac7d \
   kotoba_aiueos_device_worker_canonical
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_sha256_stream_object" \
   116e6521295545a5090bd7f6fa5c2e9ed5c9d02df590fbda3a7ef170667606dd \
