@@ -1,0 +1,254 @@
+(ns cae.industrial-test
+  (:require [kotoba.lang.error :as kerror] [kotoba.test :refer [deftest is testing]]
+            [cae.industrial]
+            [cae.solver :as cae]))
+
+(deftest industrial-backends-register-on-the-shared-contract
+  (is (every? cae/registered? [:cfd :fem :process :materials :emag :production-des :fatigue])))
+
+(deftest cfd-ventilation-has-physical-monotonicity
+  (let [base {:solver {:kind :cfd} :flow-m3-s 1.0 :duct-diameter-m 0.4 :duct-length-m 10.0}
+        slow (cae/solve base)
+        fast (cae/solve (assoc base :flow-m3-s 2.0))]
+    (is (= :turbulent (:regime slow)))
+    (is (pos? (:pressure-drop-Pa slow)))
+    (is (> (:pressure-drop-Pa fast) (:pressure-drop-Pa slow)))))
+
+(deftest cfd-lumped-fittings-raise-pressure-drop-with-a-conserved-breakdown
+  (let [base {:solver {:kind :cfd} :flow-m3-s 1.0 :duct-diameter-m 0.4 :duct-length-m 10.0}
+        straight (cae/solve base)
+        fitted (cae/solve (assoc base :minor-loss-coefficient 3.0))]
+    (is (= 0.0 (:minor-pressure-drop-Pa straight)))
+    (is (pos? (:minor-pressure-drop-Pa fitted)))
+    (is (> (:pressure-drop-Pa fitted) (:pressure-drop-Pa straight)))
+    (is (= (:pressure-drop-Pa fitted)
+           (+ (:major-pressure-drop-Pa fitted) (:minor-pressure-drop-Pa fitted))))))
+
+(deftest cfd-combustion-heat-source-obeys-the-steady-energy-balance
+  (let [base {:solver {:kind :cfd} :flow-m3-s 1.0 :duct-diameter-m 0.4 :duct-length-m 10.0}
+        cold (cae/solve base)
+        hot (cae/solve (assoc base :fuel-mass-flow-kg-s 0.001
+                               :lower-heating-value-J-kg 5.0e7
+                               :combustion-efficiency 0.8))]
+    (is (= 0.0 (:combustion-heat-W cold)))
+    (is (= 40000.0 (:combustion-heat-W hot)))
+    (is (= (:combustion-heat-W hot) (:total-heat-load-W hot)))
+    (is (> (:outlet-temperature-C hot) (:outlet-temperature-C cold)))))
+
+(deftest every-result-carries-a-screening-and-traceability-envelope
+  (let [r (cae/solve {:case/id "vent-01" :solver {:kind :cfd}
+                      :flow-m3-s 1.0 :duct-diameter-m 0.4 :duct-length-m 10.0})]
+    (is (= :reduced-order (:fidelity r)))
+    (is (= :screening-only (:status r)))
+    (is (= :SI (:units r)))
+    (is (= "vent-01" (:case/id r)))
+    (is (seq (:assumptions r)))))
+
+(deftest fatigue-miner-damage-is-line-in-the-caller-supplied-spectrum
+  (let [;; Synthetic caller-supplied SN curve — the contract invents no
+        ;; material constants, so the test must supply its own.
+        curve {:basquin-b -0.1 :basquin-C 1.0e12}
+        block {:solver {:kind :fatigue} :spectrum
+               [{:stress-range-Pa 100e6 :cycles 1000.0}
+                {:stress-range-Pa 200e6 :cycles 100.0}]
+               :case/id "spectrum-01"}
+        r (cae/solve (merge curve block))
+        [b1 b2] (:blocks r)]
+    (is (= "spectrum-01" (:case/id r)))
+    (is (= :reduced-order (:fidelity r)))
+    (is (= :screening-only (:status r)))
+    (is (= :SI (:units r)))
+    (is (seq (:assumptions r)))
+    (is (every? pos? (map :life-cycles (:blocks r))))
+    ;; Single-block life must reproduce the Basquin law exactly.
+    (is (= (Math/pow (/ 200e6 1.0e12) -10.0) (:life-cycles b2)))
+    (is (= (/ 100.0 (:life-cycles b2)) (:damage-fraction b2)))
+    ;; Miner damage is additive and pass count is its reciprocal.
+    (is (= (+ (:damage-fraction b1) (:damage-fraction b2)) (:damage-per-pass r)))
+    (is (= (/ 1.0 (:damage-per-pass r)) (:spectrum-passes-to-failure r)))
+    (is (= 1100.0 (:fatigue-life-cycles r)))))
+
+(deftest fatigue-mean-stress-goodman-correction-raises-effective-range
+  (let [curve {:basquin-b -0.1 :basquin-C 1.0e12}
+        base {:solver {:kind :fatigue}
+              :spectrum [{:stress-range-Pa 100e6 :cycles 100.0}]}
+        plain (cae/solve (merge curve base))
+        corrected (cae/solve (merge curve
+                                    (assoc-in base [:spectrum 0 :mean-stress-Pa] 100e6)
+                                    {:ultimate-strength-Pa 400e6}))]
+    (is (false? (:goodman-corrected? (first (:blocks plain)))))
+    (is (true? (:goodman-corrected? (first (:blocks corrected)))))
+    ;; sigma_a=50 MPa with sigma_m=100 MPa, su=400 MPa -> 50/(1-0.25)=66.67 MPa
+    ;; effective amplitude, i.e. 133.33 MPa effective range > 100 MPa nominal.
+    (is (= (* 2.0 (/ 50e6 (- 1.0 (/ 100e6 400e6))))
+           (:effective-stress-range-Pa (first (:blocks corrected)))))
+    (is (> (:damage-per-pass corrected) (:damage-per-pass plain)))))
+
+(deftest fatigue-rejects-unmeasured-curves-and-invalid-inputs
+  (let [base {:solver {:kind :fatigue}
+              :spectrum [{:stress-range-Pa 100e6 :cycles 100.0}] :basquin-b -0.1
+              :basquin-C 1.0e12}]
+    ;; No invented defaults: a missing SN curve is refused, not guessed.
+    (is (thrown-with-msg? Exception #"Basquin exponent" (cae/solve (dissoc base :basquin-b))))
+    (is (thrown-with-msg? Exception #"Basquin coefficient" (cae/solve (dissoc base :basquin-C))))
+    (is (thrown-with-msg? Exception #"non-empty :spectrum"
+                          (cae/solve (dissoc base :spectrum))))
+    (is (thrown-with-msg? Exception #"positive" (cae/solve (assoc-in base [:spectrum 0 :cycles] 0.0))))
+    ;; Goodman correction without ultimate strength is refused, not assumed.
+    (is (thrown-with-msg? Exception #"ultimate-strength-Pa"
+                          (cae/solve (assoc-in base [:spectrum 0 :mean-stress-Pa] 50e6))))
+    (is (thrown-with-msg? Exception #"below ultimate strength"
+                          (cae/solve (merge base {:ultimate-strength-Pa 400e6}
+                                          {:spectrum [{:stress-range-Pa 100e6 :cycles 1.0
+                                                       :mean-stress-Pa 400e6}]}))))))
+
+
+(deftest fem-reports-deformation-strength-modal-and-life-results
+  (let [r (cae/solve {:solver {:kind :fem} :length-m 1.0 :area-m2 0.001
+                      :youngs-modulus-Pa 210e9 :load-N 100000.0 :stress-range-Pa 50e6})]
+    (is (= :linear-axial-bar (:model r)))
+    (is (< (:displacement-m r) 0.001))
+    (is (> (:safety-factor r) 1.0))
+    (is (pos? (:first-axial-frequency-Hz r)))
+    (is (pos? (:fatigue-life-cycles r)))))
+
+(deftest fem-cantilever-beam-captures-bending_and_modal_scaling
+  (let [base {:solver {:kind :fem} :element :cantilever-beam
+              :width-m 0.05 :height-m 0.10 :youngs-modulus-Pa 210e9
+              :load-N 1000.0 :length-m 1.0}
+        short (cae/solve base)
+        long (cae/solve (assoc base :length-m 2.0))]
+    (is (= :linear-cantilever-beam (:model short)))
+    (is (pos? (:second-moment-m4 short)))
+    (is (> (:displacement-m long) (* 7.9 (:displacement-m short))))
+    (is (= (:first-natural-frequency-Hz short) (:first-bending-frequency-Hz short)))
+    (is (< (:first-bending-frequency-Hz long) (:first-bending-frequency-Hz short)))
+    (is (pos? (:safety-factor short)))))
+
+(deftest process-material-and-emag-cases-are-dispatched
+  (testing "process variants"
+    (is (= :weld (:process (cae/solve {:solver {:kind :process} :process :weld
+                                        :voltage-V 24 :current-A 200 :travel-speed-mm-s 5}))))
+    (is (= :cast (:process (cae/solve {:solver {:kind :process} :process :cast :mass-kg 10}))))
+    (is (= :roll (:process (cae/solve {:solver {:kind :process} :process :roll
+                                        :initial-thickness-mm 4 :final-thickness-mm 2})))) )
+  (let [m (cae/solve {:solver {:kind :materials} :temperature-K 900 :time-s 120})
+        e (cae/solve {:solver {:kind :emag} :line-voltage-V 400 :current-A 180
+                      :power-factor 0.9 :speed-rpm 4000})]
+    (is (<= 0.0 (:transformed-fraction m) 1.0))
+    (is (> (:hardness-HV m) 180.0))
+    (is (pos? (:torque-Nm e)))
+    (is (> (:winding-temperature-C e) 25.0))))
+
+(deftest arrhenius-jmak-materials-increase-transformation-rate-with-temperature
+  (let [base {:solver {:kind :materials} :time-s 60.0 :avrami-n 1.0
+              :pre-exponential-s-n 1.0 :activation-energy-J-mol 4.0e4}
+        cool (cae/solve (assoc base :temperature-K 700.0))
+        hot (cae/solve (assoc base :temperature-K 900.0))]
+    (is (= :Arrhenius (:kinetics hot)))
+    (is (> (:rate-constant-s-n hot) (:rate-constant-s-n cool)))
+    (is (> (:transformed-fraction hot) (:transformed-fraction cool)))
+    (is (> (:hardness-HV hot) (:hardness-HV cool)))))
+
+(deftest casting-chvorinov-solidification_time_tracks_section_modulus
+  (let [base {:solver {:kind :process} :process :cast :mass-kg 10.0
+              :mold-constant-s-m-2 1.0e7 :surface-area-m2 1.0}
+        thin (cae/solve (assoc base :volume-m3 0.01))
+        thick (cae/solve (assoc base :volume-m3 0.02))]
+    (is (= 1000.0 (:solidification-time-s thin)))
+    (is (= 4000.0 (:solidification-time-s thick)))
+    (is (> (:solidification-time-s thick) (:solidification-time-s thin)))))
+
+(deftest induction-heating-obeys_lumped_electromagnetic_energy_balance
+  (let [r (cae/solve {:solver {:kind :emag} :mode :induction-heating
+                      :heating-power-W 10000.0 :coupling-efficiency 0.8
+                      :thermal-mass-kg 10.0 :specific-heat-J-kgK 500.0 :duration-s 60.0
+                      :initial-temperature-C 20.0})]
+    (is (= :induction-heating (:mode r)))
+    (is (= 8000.0 (:absorbed-power-W r)))
+    (is (= 480000.0 (:absorbed-energy-J r)))
+    (is (= 96.0 (:temperature-rise-K r)))
+    (is (= 116.0 (:final-temperature-C r)))))
+
+(deftest discrete-event-simulation-exposes-production-kpis
+  (let [r (cae/solve {:case/id "line-01" :solver {:kind :production-des} :jobs 12 :arrival-interval-s 10
+                      :stations [{:id :cut :cycle-time-s 8 :availability 1.0}
+                                 {:id :weld :cycle-time-s 12 :availability 0.9}]})]
+    (is (pos? (:makespan-s r)))
+    (is (pos? (:throughput-per-hour r)))
+    (is (pos? (:mean-flow-time-s r)))
+    (is (pos? (:mean-wip r)))
+    (is (= "line-01" (:case/id r)))
+    (is (= 2 (count (:station-utilization r))))
+    (is (every? #(<= 0.0 (:utilization %) 1.0) (:station-utilization r)))))
+
+(deftest production-logistics-are-accounted-for-separately-from-station-work
+  (let [base {:solver {:kind :production-des} :jobs 2 :arrival-interval-s 100
+              :stations [{:id :cut :cycle-time-s 10}
+                         {:id :pack :cycle-time-s 5}]}
+        without-transport (cae/solve base)
+        with-transport (cae/solve (assoc base :stations [{:id :cut :cycle-time-s 10 :transport-time-s 20}
+                                                          {:id :pack :cycle-time-s 5}]))]
+    (is (= 0.0 (:mean-transport-s without-transport)))
+    (is (= 20.0 (:mean-transport-s with-transport)))
+    (is (> (:mean-flow-time-s with-transport) (:mean-flow-time-s without-transport)))
+    (is (> (:makespan-s with-transport) (:makespan-s without-transport)))))
+
+(deftest production-energy-follows_busy_time_and_equipment_power
+  (let [r (cae/solve {:solver {:kind :production-des} :jobs 2 :arrival-interval-s 100
+                      :stations [{:id :cut :cycle-time-s 10 :power-kW 6.0}
+                                 {:id :pack :cycle-time-s 5 :power-kW 3.0}]})
+        expected (+ (/ (* 2.0 10.0 6.0) 3600.0)
+                    (/ (* 2.0 5.0 3.0) 3600.0))]
+    (is (< (Math/abs (- expected (:energy-kWh r))) 1.0e-12))
+    (is (< (Math/abs (- (/ expected 2.0) (:energy-per-job-kWh r))) 1.0e-12))))
+
+(deftest invalid-or-inconsistent-cases-fail-with-actionable-data
+  (letfn [(failure [f]
+            (try (f) nil (catch kerror/ExceptionInfo e (ex-data e))))]
+    (is (= :flow-m3-s
+           (:field (failure #(cae/solve {:solver {:kind :cfd} :flow-m3-s ##NaN
+                                          :duct-diameter-m 0.4 :duct-length-m 10.0})))))
+    (is (= :minor-loss-coefficient
+           (:field (failure #(cae/solve {:solver {:kind :cfd} :flow-m3-s 1
+                                          :duct-diameter-m 0.4 :duct-length-m 10
+                                          :minor-loss-coefficient -0.1})))))
+    (is (= 0.001
+           (:fuel-mass-flow-kg-s
+            (failure #(cae/solve {:solver {:kind :cfd} :flow-m3-s 1
+                                  :duct-diameter-m 0.4 :duct-length-m 10
+                                  :fuel-mass-flow-kg-s 0.001})))))
+    (is (= :basquin-b
+           (:field (failure #(cae/solve {:solver {:kind :fem} :length-m 1 :area-m2 1
+                                          :youngs-modulus-Pa 1 :load-N 1 :basquin-b 0})))))
+    (is (= :truss
+           (:element (failure #(cae/solve {:solver {:kind :fem} :element :truss
+                                            :length-m 1 :area-m2 1 :youngs-modulus-Pa 1 :load-N 1})))))
+    (is (= 1.0e5
+           (:pre-exponential-s-n
+            (failure #(cae/solve {:solver {:kind :materials} :temperature-K 800 :time-s 10
+                                  :pre-exponential-s-n 1.0e5})))))
+    (is (= :forging
+           (:process (failure #(cae/solve {:solver {:kind :process} :process :forging})))))
+    (is (= 1.0e7
+           (:mold-constant-s-m-2
+            (failure #(cae/solve {:solver {:kind :process} :process :cast :mass-kg 10
+                                  :mold-constant-s-m-2 1.0e7})))))
+    (is (:efficiency
+         (failure #(cae/solve {:solver {:kind :emag} :line-voltage-V 400 :current-A 500
+                               :power-factor 0.9 :speed-rpm 3000 :efficiency 0.999
+                               :stator-resistance-ohm 1.0}))))
+    (is (= :coupling-efficiency
+           (:field (failure #(cae/solve {:solver {:kind :emag} :mode :induction-heating
+                                          :heating-power-W 1000 :thermal-mass-kg 1
+                                          :specific-heat-J-kgK 500 :duration-s 10})))))
+    (is (:stations
+         (failure #(cae/solve {:solver {:kind :production-des} :jobs 1
+                               :stations [{:id :same :cycle-time-s 1}
+                                          {:id :same :cycle-time-s 1}]}))))
+    (is (= :power-kW
+           (:field (failure #(cae/solve {:solver {:kind :production-des} :jobs 1
+                                          :stations [{:id :cut :cycle-time-s 1 :power-kW -0.1}]})))))
+    (is (= :transport-time-s
+           (:field (failure #(cae/solve {:solver {:kind :production-des} :jobs 1
+                                          :stations [{:id :cut :cycle-time-s 1 :transport-time-s -1}]})))))))
