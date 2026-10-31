@@ -1,0 +1,102 @@
+;; Native unity fragment, assembled after the exact Amu seed 00/01/02 helpers (JUN-555).
+;; Writes os/aiueos's deterministic newc initramfs: the bytes
+;; scripts/make-initramfs.py wrote for the same entries, in the same order.
+;; argv: output, then one or more triples: archive-name staged-name bytes. Each
+;; staged name is an input beneath the FD 3 scope, read in bounded FS2 slices.
+;; Archive names must be 1..4096 ASCII bytes without NUL or comma (the Python's
+;; ARCHIVE_NAME,SOURCE_PATH form ended a name at its first comma). Mode 0100444,
+;; uid/gid/mtime 0, nlink 1 and sequential inodes from 1; then TRAILER!!!.
+(def INI-MAX-BYTES 67108864)
+(defn- ini-ack? [B :vector-i64 n :i64] :bool
+  (and (= (vector-count B) (+ n 5)) (= (vector-at B 0) 0)
+       (= (vector-at B 1) 70) (= (vector-at B 2) 83)
+       (= (vector-at B 3) 50) (= (vector-at B 4) 0)))
+(defn- ini-decimal? [S :string] :bool
+  (and (> (string-length S) 0) (<= (string-length S) 10)
+       (loop [i 0]
+         (cond (= i (string-length S)) true
+               (or (< (string-code-point-at S i) 48) (> (string-code-point-at S i) 57)) false
+               :else (recur (inc i))))))
+(defn- ini-name? [S :string] :bool
+  (and (> (string-length S) 0) (<= (string-length S) 4096)
+       (loop [i 0]
+         (cond (= i (string-length S)) true
+               (let [c (string-code-point-at S i)] (or (= c 0) (= c 44) (> c 127))) false
+               :else (recur (inc i))))))
+(defn- ini-size [S :string] :i64
+  (if (ini-decimal? S) (mem-parse-dec S 0 (string-length S)) -1))
+;; append n bytes of the staged file to D at `at`, or return [-1]
+(defn- ini-copy [D :vector-i64 at :i64 path :string n :i64] :vector-i64
+  (loop [done 0 V D]
+    (if (= done n) V
+      (let [count (io-min 262144 (- n done))
+            B (vector-i64-from-bytes
+                (typed-cap-call :fs/app-data :string :bytes
+                  (string-concat (io-fs2-header 69 path)
+                    (string-concat (mem-u2dec done) (string-concat ":" (mem-u2dec count))))))]
+        (if (not (ini-ack? B count)) [-1]
+          (recur (+ done count)
+            (loop [i 0 W V]
+              (if (= i count) W (recur (inc i) (vector-assoc! W (+ at done i) (vector-at B (+ i 5))))))))))))
+(defn- ini-pad [n :i64] :i64 (* 4 (quot (+ n 3) 4)))
+(defn- ini-hex8 [value :i64] :string
+  (loop [i 0 acc ""]
+    (if (= i 8) acc
+      (let [d (bit-and (u64-shift-right value (* 4 (- 7 i))) 15)]
+        (recur (inc i) (string-concat acc (string-substring "0123456789abcdef" d (inc d))))))))
+;; header and NUL-terminated name, padded; data follows at the returned offset
+(defn- ini-header [D :vector-i64 at :i64 name :string inode :i64 mode :i64 size :i64] :vector-i64
+  (let [h (-> "070701" (string-concat (ini-hex8 inode)) (string-concat (ini-hex8 mode))
+              (string-concat "00000000000000000000000100000000") (string-concat (ini-hex8 size))
+              (string-concat "00000000000000000000000000000000")
+              (string-concat (ini-hex8 (inc (string-length name)))) (string-concat "00000000")
+              (string-concat name))]
+    (io-bput-str D h 0 (string-length h) at)))
+(defn- ini-entry-bytes [name :string size :i64] :i64
+  (+ (ini-pad (+ 111 (string-length name))) (ini-pad size)))
+(defn- ini-valid? [count :i64] :bool
+  (loop [k 0]
+    (if (= k count) true
+      (let [base (inc (* 3 k)) n (ini-size (io-arg (+ base 2)))]
+        (if (and (ini-name? (io-arg base)) (>= n 0) (<= n INI-MAX-BYTES)) (recur (inc k)) false)))))
+(defn- ini-total [count :i64] :i64
+  (loop [k 0 total (ini-entry-bytes "TRAILER!!!" 0)]
+    (if (= k count) total
+      (let [base (inc (* 3 k))]
+        (recur (inc k) (+ total (ini-entry-bytes (io-arg base) (ini-size (io-arg (+ base 2))))))))))
+(defn- ini-build [count :i64 total :i64] :vector-i64
+  (loop [k 0 at 0 D (vector-alloc total)]
+    (if (= k count)
+      (ini-header D at "TRAILER!!!" 0 0 0)
+      (let [base (inc (* 3 k)) name (io-arg base) n (ini-size (io-arg (+ base 2)))
+            H (ini-header D at name (inc k) 33060 n)
+            data (+ at (ini-pad (+ 111 (string-length name))))
+            C (ini-copy H data (io-arg (inc base)) n)]
+        (if (and (= (vector-count C) 1) (< (vector-at C 0) 0)) C
+          (recur (inc k) (+ data (ini-pad n)) C))))))
+(defn- seed-main [] :i64
+  (let [argc (io-argc) count (quot (- argc 1) 3)]
+    (cond (or (< argc 4) (not= (rem (- argc 1) 3) 0) (> count 64) (not (ini-valid? count)))
+          (let [w (io-err "entry must be ARCHIVE_NAME,SOURCE_PATH\n")] 1)
+          (= (io-exists (io-arg 0)) 1) (let [w (io-err "error: initramfs output exists\n")] 1)
+          (> (ini-total count) (* 2 INI-MAX-BYTES)) (let [w (io-err "error: initramfs too large\n")] 1)
+          :else
+          (let [path (io-arg 0) total (ini-total count) D (ini-build count total)]
+            (if (not= (vector-count D) total)
+              (let [w (io-err "error: initramfs entry slice refused\n")] 1)
+              (let [written (io-write-bytes D path 0 total)
+                    B (loop [at 0 ok true]
+                        (if (or (not ok) (= at total)) ok
+                          (let [c (io-min 262144 (- total at))
+                                S (vector-i64-from-bytes
+                                    (typed-cap-call :fs/app-data :string :bytes
+                                      (string-concat (io-fs2-header 69 path)
+                                        (string-concat (mem-u2dec at) (string-concat ":" (mem-u2dec c))))))]
+                            (recur (+ at c)
+                              (and (ini-ack? S c)
+                                   (loop [i 0]
+                                     (cond (= i c) true
+                                           (not= (vector-at S (+ i 5)) (vector-at D (+ at i))) false
+                                           :else (recur (inc i)))))))))]
+                (if (and (= written total) B) 0
+                  (let [w (io-err "error: initramfs readback differs\n")] 1))))))))
