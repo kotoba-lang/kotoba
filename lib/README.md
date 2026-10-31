@@ -983,6 +983,17 @@ The bundled standard libraries live in this repository:
 | `kotoba.kamiEizoGrade` | `kotoba.kamiEizoGrade/src` | `kami.eizo.grade`, `kami.eizo.grade.cdl`, `kami.eizo.grade.curve`, `kami.eizo.grade.lut`, … (Kotoba project library) |
 | `kotoba.kamiMangakaPage` | `kotoba.kamiMangakaPage/src` | `kami.mangaka.komawari`, `kami.mangaka.page` (Kotoba project library) |
 | `kotoba.kamiMangakaReader` | `kotoba.kamiMangakaReader/src` | `kami.mangaka.reader.app`, `kami.mangaka.reader.ssr`, `kami.mangaka.reader.views` (Kotoba project library) |
+| `kotoba.kamiVehicle` | `kotoba.kamiVehicle/src` | `vehicle`, `vehicle.backend`, `vehicle.beam`, `vehicle.builder`, … (Kotoba project library) |
+| `kotoba.biomech` | `kotoba.biomech/src` | `kotoba.biomech`, `kotoba.biomech.disc`, `kotoba.biomech.fem`, `kotoba.biomech.hemodynamics`, … (Kotoba project library) |
+| `kotoba.freeboard` | `kotoba.freeboard/src` | `freeboard.board`, `freeboard.collab`, `freeboard.doc`, `freeboard.import`, … (Kotoba project library) |
+| `kotoba.kamiEngineAnimation` | `kotoba.kamiEngineAnimation/src` | `kami.animation` (Kotoba project library) |
+| `kotoba.kamiEngineModeling` | `kotoba.kamiEngineModeling/src` | `kami.modeling`, `kami.modeling.assembly`, `kami.modeling.brep`, `kami.modeling.cae`, … (Kotoba project library) |
+| `kotoba.kamiFlow` | `kotoba.kamiFlow/src` | `flow`, `flow.choked`, `flow.pump` (Kotoba project library) |
+| `kotoba.kamiGenHybrid` | `kotoba.kamiGenHybrid/src` | `kami.gen.hybrid`, `kami.gen.hybrid.nodes`, `kami.gen.hybrid.texture`, `kami.gen.hybrid.vrm-export`, … (Kotoba project library) |
+| `kotoba.kamiGenMl3d` | `kotoba.kamiGenMl3d/src` | `kami.gen.ml3d`, `kami.gen.ml3d.fixture`, `kami.gen.ml3d.rig` (Kotoba project library) |
+| `kotoba.kamiGenProcedural` | `kotoba.kamiGenProcedural/src` | `kami.gen.procedural` (Kotoba project library) |
+| `kotoba.kamiWeb` | `kotoba.kamiWeb/src` | `kotoba.web`, `kotoba.web.document`, `kotoba.web.entries`, `kotoba.web.math`, … (Kotoba project library) |
+| `kotoba.swarmChoreo` | `kotoba.swarmChoreo/src` | `kotoba.swarm-choreo.gate`, `kotoba.swarm-choreo.physics-check`, `kotoba.swarm-choreo.ros`, `kotoba.swarm-choreo.show`, … (Kotoba project library) |
 
 `catalog.edn` declares exact aliases for old repository/coordinate names.
 `kotoba.*` is a project namespace and requires no DNS ownership. Each package
