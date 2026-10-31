@@ -1097,25 +1097,25 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_rsa2048_object
   0f4eeeecdc0605217aae5dfe55cd219c2c9a586a9ca9104d760d87c21642e72c \
   kotoba_aiueos_rsa2048_sha256_verify
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_net_arp_object" \
-  b333e29909d521963e300073e8f49639413e754465394ba92b1419ede73a954e \
+  313f50e9abbf947db43db4a03adce8f28d23216db94d6376d2ae31d20bf1c80f \
   kotoba_aiueos_net_arp_reply_valid
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_ipv4_checksum_object" \
-  5bc0305f1f29238bdfff4ed45d66948cda266d811f90356cbbfebace7f250d77 \
+  7a2f1b42f448500789f79b49ae194775dac3b6af0af172011c6f6e2b942e9552 \
   kotoba_aiueos_ipv4_checksum
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_ipv4_icmp_object" \
-  a3465a3e9bb7527957e09d02171c3eafa3d117b854e0ca55258e175afee5b249 \
+  fae69c4c201f4bfdc8a2f0a5579bd5b23b1c7e07fe92305b8f69839a7eec1bed \
   kotoba_aiueos_ipv4_icmp_reply_valid
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_tcp_checksum_object" \
-  e54aaefced0e7ae91315fa41eaf1c22d9fba2110df5da63304962e6199cada4f \
+  e3dbf82a70df7d121a4afaeee57b259774cb9a70af017ca477f2630889f7148b \
   kotoba_aiueos_tcp_checksum_ok
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_tcp_segment_object" \
-  1a6b406a39aa5b5a71798046911e72b7d36c393b08d3d8c123e7e1a52efcaf7b \
+  e263e18c089f850a82189516d9bf2b7832310199a88726a1f4e54cb207a6a997 \
   kotoba_aiueos_tcp_segment_valid
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_dhcp_reply_object" \
-  977208efc1fd8b92160c41fbf99959b6a940662d104cf85717c9decc972d0346 \
+  0ffa22f91ca035fd5fa4195fc7c4b40a08258ad13470b61f0bb8d923a7c0f863 \
   kotoba_aiueos_dhcp_reply_valid
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_dhcp_option_object" \
-  c759b70a5061f03d27c3c94e05fe248e6cccc82182a63a35e674647cf050c482 \
+  1492a66d9668dc88e1b80536ba5bb4ab232ec4eaaf7d76975670fe058aa1b67f \
   kotoba_aiueos_dhcp_option_u32
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_relay_hello_object" \
   4c38d1ec0602a46beea61a5759b450da0bef260bdd1f04aab1055d141134958d \
