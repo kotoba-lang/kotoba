@@ -450,7 +450,7 @@ if [ -z "${AIUEOS_KOTOBA_JOURNAL_OBJECT:-}" ]; then
 fi
 kotoba_kernel_sha=
 if [ -z "${AIUEOS_KOTOBA_KERNEL_OBJECT:-}" ]; then
-  kotoba_kernel_sha=3f7409bff00efaa79ec2e260b6734f740e9d7da002a9eb22a747344591e5d327
+  kotoba_kernel_sha=6853e9de59784ce12caf4ee6582bd7e8f4615f249fce033082f129a3fb92c41b
 fi
 input_smoke_cflags=
 if [ "${AIUEOS_INPUT_SMOKE_SYNTHETIC:-0}" = 1 ]; then
@@ -1263,7 +1263,7 @@ if [ -n "$ecdsa_public_link" ]; then
     kotoba_aiueos_ecdsa_p256_public
 fi
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_ime_object" \
-  ee11f50c9dfb30d03c820bead466b2f1bf18e4e64f3a2bfda98f5a5dd5d4ca34 \
+  0cdc81a87e8d1a10aca416b635e4fd287a9bbe9cc4ea18b9fcddee1555be776a \
   kotoba_aiueos_ime_commit
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_wm_object" \
   4c80cb6b14c3a4a412e94b69784cf3507c7e48cb7abb0635f918f2aeb31898d0 \
