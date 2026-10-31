@@ -983,7 +983,7 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_msr_write_obje
   a6ae6efbe7c3a7543b391b01a9203906532b3c4328fb38bafb2d093b37bfe20d \
   kotoba_aiueos_msr_write
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_idt_gate_object" \
-  52c88178bbd56a1b0c133b6a1ad6e5393b8e38c2a419c20a867e94bc87b3294b \
+  daa5544d40825a98b3b72affdfb449ec374b33f1082a8887d9a4a6513e750e5f \
   kotoba_aiueos_idt_gate_build
 # JUN-599: the GDT's 64-bit TSS descriptor (aiueos_process_initialize) is kotoba/tss-descriptor.o (fuel 4194304).
 kotoba_tss_descriptor_object=${AIUEOS_KOTOBA_TSS_DESCRIPTOR_OBJECT:-"$aiueos/kotoba/tss-descriptor.o"}
