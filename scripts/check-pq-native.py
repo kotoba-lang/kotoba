@@ -10,9 +10,13 @@ every bit set. Each mutant changes one line of a library body and must not pass.
 Runs on Linux arm64 (the aarch64 payload packed into an aarch64-linux runner image, as
 the arm64 owner lane does), on Apple Silicon (Mac root and packager, through
 lib/kotoba.hata/scripts/native_gate.py) and on Linux x86_64 (KX64 under the native
-runner). The pinned x86_64 KX64 profile refuses string literals (E7101 detail 16), which
-the unity gates use for their vectors, so x86_64 runs only the module gates, which carry
-their bytes as vector literals (--module-gates-only, AWAI-117).
+runner). KX64 admits string literals, so the ML-KEM and ML-DSA unity gates, whose
+vectors are hex strings, also run on x86_64 (--gates mlkem,mldsa; slow there, so CI runs
+them on main and nightly, JUN-629). The SHA-3 gate does not: it prints its oracle lines
+with :io/write, and the locked x86 project adapter refuses every capability (amu
+seed/98-x86_64-project.kotoba, E7101 OP-CAP). E7101 detail 16, once recorded here, is the
+scalar ELF64 profile's refusal of string literals, a route these gates do not use
+(AWAI-117). --module-gates-only skips every unity gate.
 """
 import argparse
 import concurrent.futures
@@ -289,9 +293,15 @@ def main():
     # The gates are independent (own sources, images and output files), so they run concurrently; a gate's own
     # pass run and mutants stay in order. --jobs 1 is the old serial order (JUN-629).
     parser.add_argument('--jobs', type=int, default=os.cpu_count() or 2)
-    parser.add_argument('--module-gates-only', action='store_true',
-                        help='skip the unity gates (string-literal vectors), for the x86_64 KX64 profile')
+    parser.add_argument('--module-gates-only', action='store_true', help='skip every unity gate')
+    parser.add_argument('--gates', help='run only these gates (comma-separated unity or module gate names)')
     args = parser.parse_args()
+    selected = set(GATES) | set(MODULE_GATES)
+    if args.gates:
+        selected = set(args.gates.split(','))
+        assert selected <= set(GATES) | set(MODULE_GATES), ('unknown gate', sorted(selected - set(GATES) - set(MODULE_GATES)))
+    if args.module_gates_only:
+        selected -= set(GATES)
     gate = LinuxArm(args) if platform.system() == 'Linux' and platform.machine() in ('aarch64', 'arm64') else NativeGate(args)
     results = {}
 
@@ -323,12 +333,13 @@ def main():
         return result
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
-        unity_gates = {} if args.module_gates_only else GATES
+        unity_gates = {name: spec for name, spec in GATES.items() if name in selected}
+        module_gates = {name: spec for name, spec in MODULE_GATES.items() if name in selected}
         futures = {name: pool.submit(unity_gate, name, spec) for name, spec in unity_gates.items()}
-        futures.update({name: pool.submit(module_gate, name, spec) for name, spec in MODULE_GATES.items()})
-        for name in list(unity_gates) + list(MODULE_GATES):
+        futures.update({name: pool.submit(module_gate, name, spec) for name, spec in module_gates.items()})
+        for name in list(unity_gates) + list(module_gates):
             results[name] = futures[name].result()
-    if isinstance(gate, LinuxArm):
+    if isinstance(gate, LinuxArm) and not args.gates:
         files = module_files(TCP_DEMO)
         image = gate.build('tcp-demo', TCP_DEMO['entry'], files)
         gate.run('tcp-demo-run', image, TCP_DEMO['passing'], NET_GRANT)
@@ -342,7 +353,7 @@ def main():
             results['tcp-demo']['controls'][label] = refused
             assert refused, ('tcp demo ran without', label)
     gate.finish('PASS_PQ_NATIVE_GATES', gates=results,
-                skipped=sorted(GATES) if args.module_gates_only else [])
+                skipped=sorted((set(GATES) | set(MODULE_GATES)) - selected))
 
 if __name__ == '__main__':
     main()
