@@ -1173,7 +1173,7 @@ if [ -n "$model_handoff_link" ] || [ -n "$qwen35_parity_cflags" ]; then
   python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_qwen35_dot_object" \
     e3ed8038bab3a5cc0289e8be030a1b81a420a02df0b86ad1e8245eac87b06670 kotoba_aiueos_qwen35_dot_f32
   python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_qwen35_dequant_object" \
-    2713ffbac10ad71dad46a899b782c2687820fc2896edab444806867ae62fd730 kotoba_aiueos_qwen35_dequant_row
+    57eabbacc347c5f3bb6ba395cdf1085f8c625381efc3527c4f2b89b3b5c0d631 kotoba_aiueos_qwen35_dequant_row
   python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_qwen35_matvec_object" \
     0eabd3f84c2efcd3c763106599e43ed217d7f71f85450eeed7293df8c3db8677 kotoba_aiueos_qwen35_matvec
   # FIVE parity profiles, each linking only the objects its stages call. The
