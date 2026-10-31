@@ -510,8 +510,12 @@ if [ "${AIUEOS_SSH_LISTEN:-0}" = 1 ]; then
     }
   fi
   if [ -n "${AIUEOS_SSH_AUTHORIZED_KEY_HEX:-}" ]; then
-    python3 "$aiueos/scripts/write-ssh-authorized-key-header.py" \
-      "$AIUEOS_SSH_AUTHORIZED_KEY_HEX" "$out/aiueos-ssh-authorized-key.h"
+    # JUN-555: written by Kotoba (native/ssh-authorized-key-header.kotoba) through the pinned Amu Mac
+    # root; without that native route the build refuses. write-ssh-authorized-key-header.py is its test oracle.
+    # The Python created $out here (mkdir parents); the runner only replaces the file.
+    mkdir -p "$out"
+    sh "$aiueos/scripts/run-native-generator.sh" "$aiueos/native/ssh-authorized-key-header.kotoba" \
+      "$out/aiueos-ssh-authorized-key.h" -- "$AIUEOS_SSH_AUTHORIZED_KEY_HEX"
     input_smoke_cflags="$input_smoke_cflags -DAIUEOS_SSH_AUTHORIZED_KEY_HEADER=1"
   fi
 fi
