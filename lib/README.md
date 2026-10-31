@@ -965,6 +965,17 @@ The bundled standard libraries live in this repository:
 | `kotoba.datomSource` | `kotoba.datomSource/src` | `datom.source`, `datom.source.adjacency`, `datom.source.conformance`, `datom.source.plane` (Kotoba project library) |
 | `kotoba.dslCore` | `kotoba.dslCore/src` | `kotoba.dsl.problem` (Kotoba project library) |
 | `kotoba.xml` | `kotoba.xml/src` | `kotoba.xml`, `xml.core`, `xml.parse` (Kotoba project library) |
+| `kotoba.cad` | `kotoba.cad/src` | `kotoba.cad.app`, `kotoba.cad.core`, `kotoba.cad.runner`, `kotoba.cad.ui`, … (Kotoba project library) |
+| `kotoba.kamiEngineCaeSolver` | `kotoba.kamiEngineCaeSolver/src` | `cae.adapter`, `cae.advanced`, `cae.assessment`, `cae.backend`, … (Kotoba project library) |
+| `kotoba.kamiEngineVphysics` | `kotoba.kamiEngineVphysics/src` | `vphysics.backend`, `vphysics.core` (Kotoba project library) |
+| `kotoba.kamiEngineAero` | `kotoba.kamiEngineAero/src` | `aero.bridge`, `aero.case`, `aero.cli`, `aero.lbm`, … (Kotoba project library) |
+| `kotoba.kamiEngineCrash` | `kotoba.kamiEngineCrash/src` | `crash.solver` (Kotoba project library) |
+| `kotoba.kamiEngineEchem` | `kotoba.kamiEngineEchem/src` | `echem.profile`, `echem.solver`, `echem.stack-thermal`, `echem.system` (Kotoba project library) |
+| `kotoba.kamiEngineMotor` | `kotoba.kamiEngineMotor/src` | `motor.bldc`, `motor.dcbus`, `motor.envelope`, `motor.esc`, … (Kotoba project library) |
+| `kotoba.kamiEnginePack` | `kotoba.kamiEnginePack/src` | `pack.solver` (Kotoba project library) |
+| `kotoba.kamiEngineRotor` | `kotoba.kamiEngineRotor/src` | `rotor.atmosphere`, `rotor.solver` (Kotoba project library) |
+| `kotoba.kamiEngineMultirotor` | `kotoba.kamiEngineMultirotor/src` | `multirotor.closure` (Kotoba project library) |
+| `kotoba.kamiEngineVehicleDesigner` | `kotoba.kamiEngineVehicleDesigner/src` | `vdesign.bev-store`, `vdesign.cad`, `vdesign.cartridge`, `vdesign.cartridge-fcev`, … (Kotoba project library) |
 
 `catalog.edn` declares exact aliases for old repository/coordinate names.
 `kotoba.*` is a project namespace and requires no DNS ownership. Each package

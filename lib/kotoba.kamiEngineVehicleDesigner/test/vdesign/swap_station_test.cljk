@@ -1,0 +1,141 @@
+(ns vdesign.swap-station-test
+  "Tests for vdesign.swap-station — decision-order, fail-closed, and
+  audit-log behavior on synthetic fixtures (fixture numbers carry
+  fixture provenance; no Mg/MgH2, hydrogen, or code constant is
+  measured or invented here)."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [vdesign.swap-schedule :as ss]
+            [vdesign.swap-station :as station]
+            [vdesign.powertrain :as pt]))
+
+(def ^:private eff-src "fixture: synthetic efficiency for tests only")
+(def ^:private cart-src "fixture: synthetic cartridge capacity for tests only")
+
+(defn- schedule [& kg-per-interval]
+  (ss/swap-schedule
+    {:fc-profile-kw (mapv (fn [kg] (/ (* kg 0.5 pt/LHV-H2-J) (* 1000.0 3600.0))) kg-per-interval)
+     :dt-s 3600.0
+     :fc-elec-eff 0.5 :eff-source eff-src
+     :cartridge-h2-kg 10.0 :cartridge-source cart-src
+     :spare-cartridges (count kg-per-interval)}))
+
+(defn- station-opts [over]
+  (merge {:human-approval true
+          :approval-ref "fixture: synthetic approval record"
+          :o2-fraction 0.001
+          :o2-source "fixture: synthetic O2 sensor reading"
+          :o2-interlock-limit 0.01
+          :o2-interlock-source "fixture: synthetic declared interlock limit"
+          :inert-gas-available? true
+          :inert-gas-source "fixture: synthetic gas service status"
+          :h2-leak-check :pass
+          :h2-leak-check-source "fixture: synthetic leak check"}
+         over))
+
+;; forces exactly one swap at interval 1: demand 6+6 kg vs cap 10
+(defn- one-swap-schedule [] (schedule 6.0 6.0))
+
+(deftest cleared-swap-produces-effects-and-clear-verdict
+  (testing "a fully-interlocked swap is cleared with install/remove effects"
+    (let [r (station/swap-clearance (one-swap-schedule) (station-opts {}))]
+      (is (= :swap-station-clearance (:kind r)))
+      (is (true? (:clear? r)))
+      (is (= 1 (:cleared (:decisions r))))
+      (is (zero? (+ (:blocked (:decisions r)) (:refused (:decisions r)))))
+      (let [ev (first (:events r))]
+        (is (= 1 (:interval ev)))
+        (is (= :cleared (:decision ev)))
+        (is (= 2 (count (:effects ev))))
+        (is (= #{:install-full-cartridge :remove-spent-cartridge}
+               (set (map :effect (:effects ev)))))))))
+
+(deftest no-swaps-yields-empty-clearance
+  (testing "a schedule with zero swaps is a valid empty clearance"
+    (let [r (station/swap-clearance (schedule 1.0 1.0) (station-opts {}))]
+      (is (= [] (:events r)))
+      (is (zero? (:cleared (:decisions r))))
+      (is (false? (:clear? r)) "no events = nothing proven clear"))))
+
+(deftest missing-human-approval-blocks-first
+  (testing "human approval gate precedes everything (autonomous hazardous operation is forbidden)"
+    (let [r (station/swap-clearance (one-swap-schedule)
+                                    (station-opts {:human-approval false
+                                                   ;; deliberately also broken below:
+                                                   :inert-gas-available? false
+                                                   :h2-leak-check :fail
+                                                   :o2-fraction 0.5}))]
+      (is (= :blocked-human-approval (:decision (first (:events r)))))
+      (is (false? (:clear? r))))))
+
+(deftest refusal-order-inert-then-leak-then-o2
+  (testing "inert gas refusal wins over a failed leak check and bad O2"
+    (let [r (station/swap-clearance (one-swap-schedule)
+                                    (station-opts {:inert-gas-available? false
+                                                   :h2-leak-check :fail
+                                                   :o2-fraction 0.5}))]
+      (is (= :refused-inert-gas-unavailable (:decision (first (:events r)))))))
+  (testing "failed leak check wins over bad O2"
+    (let [r (station/swap-clearance (one-swap-schedule)
+                                    (station-opts {:h2-leak-check :fail
+                                                   :o2-fraction 0.5}))]
+      (is (= :refused-h2-leak-check-failed (:decision (first (:events r)))))))
+  (testing "O2 above the declared limit refuses even with everything else green"
+    (let [r (station/swap-clearance (one-swap-schedule)
+                                    (station-opts {:o2-fraction 0.02}))]
+      (is (= :refused-o2-above-limit (:decision (first (:events r))))))))
+
+(deftest missing-leak-check-blocks-not-passes
+  (testing "a :not-performed leak check is a blocked, never a silent pass"
+    (let [r (station/swap-clearance (one-swap-schedule)
+                                    (station-opts {:h2-leak-check :not-performed}))]
+      (is (= :blocked-h2-leak-check-missing (:decision (first (:events r)))))
+      (is (= 1 (:blocked (:decisions r)))))))
+
+(deftest audit-log-covers-every-event-with-inputs
+  (testing "the audit log records each decision with measured inputs and provenance"
+    (let [r (station/swap-clearance (one-swap-schedule)
+                                    (station-opts {:h2-leak-check :fail}))]
+      (is (= 1 (count (:audit-log r))))
+      (let [a (first (:audit-log r))]
+        (is (zero? (:seq a)))
+        (is (= :refused-h2-leak-check-failed (:decision a)))
+        (is (= :fail (get-in a [:inputs :h2-leak-check])))
+        (is (true? (get-in a [:inputs :human-approval])))
+        (is (= "fixture: synthetic leak check"
+               (get-in a [:provenance :h2-leak-check-source])))
+        (is (= "fixture: synthetic approval record" (get-in a [:provenance :approval-ref])) "approval declared → ref echoed")))
+    (testing "blocked events are audited too, not just cleared ones"
+      (let [r (station/swap-clearance (one-swap-schedule)
+                                      (station-opts {:human-approval false}))]
+        (is (= 1 (count (:audit-log r))))
+        (is (= :blocked-human-approval (:decision (first (:audit-log r)))))))))
+
+(deftest fail-closed-input-validation
+  (testing "non-positive or absent interlock limit is refused loudly"
+    (is (thrown? Exception (station/swap-clearance (one-swap-schedule)
+                                                   (station-opts {:o2-interlock-limit nil}))))
+    (is (thrown? Exception (station/swap-clearance (one-swap-schedule)
+                                                   (station-opts {:o2-interlock-limit 0.0})))))
+  (testing "blank provenance strings are refused loudly"
+    (is (thrown? Exception (station/swap-clearance (one-swap-schedule)
+                                                   (station-opts {:o2-source ""}))))
+    (is (thrown? Exception (station/swap-clearance (one-swap-schedule)
+                                                   (station-opts {:approval-ref "   "})))))
+  (testing "out-of-range O2 reading is refused loudly"
+    (is (thrown? Exception (station/swap-clearance (one-swap-schedule)
+                                                   (station-opts {:o2-fraction 1.5})))))
+  (testing "unreported leak-check value is refused loudly"
+    (is (thrown? Exception (station/swap-clearance (one-swap-schedule)
+                                                   (station-opts {:h2-leak-check nil})))))
+  (testing "approval declared without a reference is refused loudly"
+    (is (thrown? Exception (station/swap-clearance (one-swap-schedule)
+                                                   (station-opts {:approval-ref nil})))))
+  (testing "a non-schedule result is refused loudly"
+    (is (thrown? Exception (station/swap-clearance {:kind :something-else} (station-opts {}))))))
+
+(deftest unmeasured-carried
+  (testing "the honest gap list rides every result"
+    (let [r (station/swap-clearance (one-swap-schedule) (station-opts {}))]
+      (is (true? (get-in r [:unmeasured :purge-volume])))
+      (is (true? (get-in r [:unmeasured :purge-duration])))
+      (is (true? (get-in r [:unmeasured :approver-identity]))))))
