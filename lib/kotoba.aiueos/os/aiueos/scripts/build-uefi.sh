@@ -1748,35 +1748,20 @@ sh "$aiueos/scripts/run-native-generator.sh" "$aiueos/native/kernel-identity-sou
 zig cc -target x86_64-windows-gnu -std=c11 -O2 -ffreestanding \
   -c -o "$identity_object" "$identity_source"
 if [ "${AIUEOS_EMBEDDED_RELEASE:-0}" = 1 ]; then
-  python3 - "$kernel" "$initramfs" "$embedded_source" <<'PYEMBED'
-from pathlib import Path
-import hashlib
-import sys
-
-kernel_path = Path(sys.argv[1]).resolve()
-initramfs_path = Path(sys.argv[2]).resolve()
-kernel = kernel_path.as_posix()
-initramfs = initramfs_path.as_posix()
-kernel_sha256 = hashlib.sha256(kernel_path.read_bytes()).hexdigest()
-initramfs_sha256 = hashlib.sha256(initramfs_path.read_bytes()).hexdigest()
-Path(sys.argv[3]).write_text(
-    f'# aiueos-embedded-kernel-sha256={kernel_sha256}\n'
-    f'# aiueos-embedded-initramfs-sha256={initramfs_sha256}\n'
-    '.section .rdata,"dr"\n'
-    '.balign 16\n'
-    '.globl aiueos_embedded_kernel_start\n'
-    'aiueos_embedded_kernel_start:\n'
-    f'.incbin "{kernel}"\n'
-    '.globl aiueos_embedded_kernel_end\n'
-    'aiueos_embedded_kernel_end:\n'
-    '.balign 16\n'
-    '.globl aiueos_embedded_initramfs_start\n'
-    'aiueos_embedded_initramfs_start:\n'
-    f'.incbin "{initramfs}"\n'
-    '.globl aiueos_embedded_initramfs_end\n'
-    'aiueos_embedded_initramfs_end:\n',
-    encoding='ascii')
-PYEMBED
+  # JUN-555: written by Kotoba (native/embedded-release-assembly.kotoba, seed 03's SHA-256) through the
+  # pinned Amu Mac root; without that native route the build refuses. The .incbin lines name the
+  # absolute, symlink-free paths the Python's Path.resolve() gave; a symlinked input is refused.
+  for embedded_input in "$kernel" "$initramfs"; do
+    [ -f "$embedded_input" ] && [ ! -L "$embedded_input" ] || {
+      echo "error: embedded release input must be a regular, non-symlink file: $embedded_input" >&2
+      exit 1
+    }
+  done
+  embedded_kernel_path="$(CDPATH= cd -- "$(dirname -- "$kernel")" && pwd -P)/$(basename -- "$kernel")"
+  embedded_initramfs_path="$(CDPATH= cd -- "$(dirname -- "$initramfs")" && pwd -P)/$(basename -- "$initramfs")"
+  sh "$aiueos/scripts/run-native-generator.sh" "$aiueos/native/embedded-release-assembly.kotoba" \
+    "$embedded_source" --seed 03-source-sha256 --input "kernel=$kernel" --input "initramfs=$initramfs" \
+    -- kernel @size:kernel "$embedded_kernel_path" initramfs @size:initramfs "$embedded_initramfs_path"
   zig cc -target x86_64-windows-gnu -c \
     -o "$embedded_object" "$embedded_source"
 fi
