@@ -1243,7 +1243,7 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_session_object
   e9b49c362e9583115b06f0095237d20dfad5719d5894ee0cf57fa2a8c0ac87c2 \
   kotoba_aiueos_session_restore
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_browser_frame_object" \
-  d828fde6c002264314c9e86ee4bd72ceda2965c97cfd6ba87d6558956c591569 \
+  324988bdec511a5fce7ee4b94100388686821f09351aa67e126ce8a76d9a2ed9 \
   kotoba_aiueos_browser_frame
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_browser_reduce_object" \
   fd355f2da0d3b5a77c39ee2f7d1c888a127c1af67122b354773bb260cc9c9677 \
@@ -1255,7 +1255,7 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_browser_ime_ob
   52ef6924472cded523d80c9f9dd7c2ad533bb58446240028424e08462bdbbba7 \
   kotoba_aiueos_browser_key
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_browser_damage_object" \
-  5dc5c33880e39b2a656d701230156963b604f04c765298379c8d479d59745ecc \
+  6ce0fd8d98992eea4fdbc2ad0139bcd2440ea201e5e7b61bf592eddac41fd575 \
   kotoba_aiueos_browser_damage
 python3 "$aiueos/scripts/verify-kotoba-user-elf.py" "$kotoba_user_elf" \
   1f0e5897831d0de6bbcb15eec82a6e0c4b402b436689cec051bc6de3b5c4e905
@@ -1586,11 +1586,25 @@ if [ -n "$plc_runtime_link" ]; then
       "$AIUEOS_PLC_ELF" "$AIUEOS_PLC_RECEIPT" \
       "$AIUEOS_PLC_SIGNATURE" "$AIUEOS_PLC_PUBLIC_KEY" "$out/plc-embedded.S"
   else
-    python3 "$aiueos/scripts/make-zero-cap-user-embedded-assembly.py" \
-      "$AIUEOS_ZERO_CAP_USER_ELF" \
-      7f5a8c0a31b5bdf191410f007973413d16e497a20ae7fe86c734b9fea85808b1 \
-      "$AIUEOS_ZERO_CAP_USER_SIGNATURE" "$AIUEOS_ZERO_CAP_USER_PUBLIC_KEY" \
-      "$out/plc-embedded.S"
+    # JUN-555: written by Kotoba (native/zero-cap-user-embedded-assembly.kotoba) through the pinned Amu
+    # Mac root; without that native route the build refuses. make-zero-cap-user-embedded-assembly.py is its
+    # test oracle. The capability-free check stays the observer verify-kotoba-user-elf.py (caps=none), and
+    # the .incbin path is resolved here as Path.resolve() did; a symlinked ELF is refused.
+    zero_cap_sha=7f5a8c0a31b5bdf191410f007973413d16e497a20ae7fe86c734b9fea85808b1
+    [ -f "$AIUEOS_ZERO_CAP_USER_ELF" ] && [ ! -L "$AIUEOS_ZERO_CAP_USER_ELF" ] || {
+      echo "error: zero-cap ELF must be a regular, non-symlink file" >&2
+      exit 1
+    }
+    zero_cap_verified=$(python3 "$aiueos/scripts/verify-kotoba-user-elf.py" "$AIUEOS_ZERO_CAP_USER_ELF" "$zero_cap_sha")
+    case "$zero_cap_verified" in
+      *caps=none*) ;;
+      *) echo "error: zero-cap smoke requires a capability-free ELF" >&2; exit 1 ;;
+    esac
+    zero_cap_elf_path="$(CDPATH= cd -- "$(dirname -- "$AIUEOS_ZERO_CAP_USER_ELF")" && pwd -P)/$(basename -- "$AIUEOS_ZERO_CAP_USER_ELF")"
+    sh "$aiueos/scripts/run-native-generator.sh" "$aiueos/native/zero-cap-user-embedded-assembly.kotoba" \
+      "$out/plc-embedded.S" --seed 03-source-sha256 --input "elf=$AIUEOS_ZERO_CAP_USER_ELF" \
+      --input "signature=$AIUEOS_ZERO_CAP_USER_SIGNATURE" --input "key=$AIUEOS_ZERO_CAP_USER_PUBLIC_KEY" \
+      -- elf @size:elf "$zero_cap_sha" signature @size:signature key @size:key "$zero_cap_elf_path"
   fi
   zig cc -target x86_64-freestanding-none -c \
     -o "$kernel_plc_embedded_object" "$out/plc-embedded.S"
@@ -1733,13 +1747,14 @@ data[17] ^= 1
 Path(sys.argv[2]).write_bytes(data)
 PYSIG
 fi
-python3 "$aiueos/scripts/make-initramfs.py" \
-  --entry "recovery/user-smoke.elf,$aiueos/kotoba/user-smoke.elf" \
-  --entry "recovery/user-smoke.sig,$recovery_signature" \
-  --entry "recovery/app-catalog.sig,$aiueos/kotoba/app-catalog.sig" \
-  --entry "font/aiueos-16.fnt,$aiueos/fonts/aiueos-16.fnt" \
-  --entry "ime/aiueos-kanji.dic,$aiueos/ime/aiueos-kanji.dic" \
-  --output "$initramfs" >/dev/null
+# JUN-555: the newc initramfs is written by Kotoba (native/initramfs.kotoba) through the pinned Amu Mac
+# root; without that native route the build refuses. make-initramfs.py stays as its test oracle.
+sh "$aiueos/scripts/run-native-generator.sh" "$aiueos/native/initramfs.kotoba" "$initramfs" \
+  --input "e0=$aiueos/kotoba/user-smoke.elf" --input "e1=$recovery_signature" \
+  --input "e2=$aiueos/kotoba/app-catalog.sig" --input "e3=$aiueos/fonts/aiueos-16.fnt" \
+  --input "e4=$aiueos/ime/aiueos-kanji.dic" -- \
+  recovery/user-smoke.elf e0 @size:e0 recovery/user-smoke.sig e1 @size:e1 \
+  recovery/app-catalog.sig e2 @size:e2 font/aiueos-16.fnt e3 @size:e3 ime/aiueos-kanji.dic e4 @size:e4
 # JUN-555: the kernel/initramfs digest source is written by Kotoba (native/kernel-identity-source.kotoba,
 # seed 03's SHA-256) through the pinned Amu Mac root; without that native route the build refuses.
 sh "$aiueos/scripts/run-native-generator.sh" "$aiueos/native/kernel-identity-source.kotoba" \
@@ -1748,35 +1763,20 @@ sh "$aiueos/scripts/run-native-generator.sh" "$aiueos/native/kernel-identity-sou
 zig cc -target x86_64-windows-gnu -std=c11 -O2 -ffreestanding \
   -c -o "$identity_object" "$identity_source"
 if [ "${AIUEOS_EMBEDDED_RELEASE:-0}" = 1 ]; then
-  python3 - "$kernel" "$initramfs" "$embedded_source" <<'PYEMBED'
-from pathlib import Path
-import hashlib
-import sys
-
-kernel_path = Path(sys.argv[1]).resolve()
-initramfs_path = Path(sys.argv[2]).resolve()
-kernel = kernel_path.as_posix()
-initramfs = initramfs_path.as_posix()
-kernel_sha256 = hashlib.sha256(kernel_path.read_bytes()).hexdigest()
-initramfs_sha256 = hashlib.sha256(initramfs_path.read_bytes()).hexdigest()
-Path(sys.argv[3]).write_text(
-    f'# aiueos-embedded-kernel-sha256={kernel_sha256}\n'
-    f'# aiueos-embedded-initramfs-sha256={initramfs_sha256}\n'
-    '.section .rdata,"dr"\n'
-    '.balign 16\n'
-    '.globl aiueos_embedded_kernel_start\n'
-    'aiueos_embedded_kernel_start:\n'
-    f'.incbin "{kernel}"\n'
-    '.globl aiueos_embedded_kernel_end\n'
-    'aiueos_embedded_kernel_end:\n'
-    '.balign 16\n'
-    '.globl aiueos_embedded_initramfs_start\n'
-    'aiueos_embedded_initramfs_start:\n'
-    f'.incbin "{initramfs}"\n'
-    '.globl aiueos_embedded_initramfs_end\n'
-    'aiueos_embedded_initramfs_end:\n',
-    encoding='ascii')
-PYEMBED
+  # JUN-555: written by Kotoba (native/embedded-release-assembly.kotoba, seed 03's SHA-256) through the
+  # pinned Amu Mac root; without that native route the build refuses. The .incbin lines name the
+  # absolute, symlink-free paths the Python's Path.resolve() gave; a symlinked input is refused.
+  for embedded_input in "$kernel" "$initramfs"; do
+    [ -f "$embedded_input" ] && [ ! -L "$embedded_input" ] || {
+      echo "error: embedded release input must be a regular, non-symlink file: $embedded_input" >&2
+      exit 1
+    }
+  done
+  embedded_kernel_path="$(CDPATH= cd -- "$(dirname -- "$kernel")" && pwd -P)/$(basename -- "$kernel")"
+  embedded_initramfs_path="$(CDPATH= cd -- "$(dirname -- "$initramfs")" && pwd -P)/$(basename -- "$initramfs")"
+  sh "$aiueos/scripts/run-native-generator.sh" "$aiueos/native/embedded-release-assembly.kotoba" \
+    "$embedded_source" --seed 03-source-sha256 --input "kernel=$kernel" --input "initramfs=$initramfs" \
+    -- kernel @size:kernel "$embedded_kernel_path" initramfs @size:initramfs "$embedded_initramfs_path"
   zig cc -target x86_64-windows-gnu -c \
     -o "$embedded_object" "$embedded_source"
 fi
