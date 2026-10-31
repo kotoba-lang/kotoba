@@ -3778,14 +3778,14 @@ __attribute__((noreturn)) static void evidence_stop(unsigned line) {
  * TSS has none populated), and a present DPL-0 interrupt gate. */
 extern uint64_t kotoba_aiueos_idt_gate_build(uint64_t handler, uint64_t selector,
                                              uint64_t ist, uint64_t attributes,
-                                             void *out);
+                                             void *out, uint64_t out_length);
 
 static void set_idt_gate(uint8_t vector, void (*handler)(void)) {
   /* A refusal writes nothing, so the entry would stay P=0 and every delivery
    * on that vector would #GP with the fault pointing at the IDT. Fail here
    * instead, where the vector is still known. */
   if (!kotoba_aiueos_idt_gate_build((uint64_t)(uintptr_t)handler, 0x08, 0, 0x8e,
-                                    &idt[vector])) {
+                                    &idt[vector], sizeof idt[vector])) {
     debug_string("AIUEOS_KOTOBA_IDT_GATE_FAIL refused\n");
     serial_string("AIUEOS_KOTOBA_IDT_GATE_FAIL refused\r\n");
     qemu_exit(0x69);
