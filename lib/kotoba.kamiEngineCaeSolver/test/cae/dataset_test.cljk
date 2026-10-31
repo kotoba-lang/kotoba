@@ -1,0 +1,127 @@
+(ns cae.dataset-test
+  (:require [cae.dataset :as dataset]
+            [kotoba.lang.edn :as edn]
+            [kotoba.io :as io]
+            [kotoba.test :refer [deftest is testing]]))
+
+(def catalog (-> "cae/datasets.edn" io/resource slurp edn/read-string))
+(def quarantine (-> "cae/dataset-quarantine.edn" io/resource slurp edn/read-string))
+(defn entry [id] (first (filter #(= id (:dataset/id %)) catalog)))
+
+(deftest immutable-manifest-and-content-verification
+  (let [m (dataset/audit-manifest (entry "aethron-cfd-pinn"))
+        observed (into {} (map (fn [{:keys [path sha256 bytes]}]
+                                 [path {:sha256 sha256 :bytes bytes}]) (:files m)))
+        verified (dataset/verify-content m observed)]
+    (is (= :metadata-audited (:status m)))
+    (is (every? #(.contains (:url %) (:revision m)) (dataset/immutable-download-urls m)))
+    (is (= :content-verified (:status verified)))
+    (is (every? :passed? (:content-checks verified)))
+    (is (= :content-rejected (:status (dataset/verify-content m (assoc-in observed ["Flow.csv" :bytes] 1)))))))
+
+(deftest training-and-noncommercial-data-cannot-qualify-industrial-accuracy
+  (let [synthetic (dataset/verify-content
+                   (entry "aethron-cfd-pinn")
+                   (into {} (map (fn [{:keys [path sha256 bytes]}] [path {:sha256 sha256 :bytes bytes}])
+                                 (:files (entry "aethron-cfd-pinn")))))
+        real-noncommercial (assoc (first quarantine) :status :content-verified
+                                                     :data-origin :experiment
+                                                     :intended-use :experimental-validation
+                                                     :validation-role :independent
+                                                     :uncertainty {:status :dataset-dependent}
+                                                     :files [])]
+    (is (= [:not-validation-use :not-independent-experiment :not-independent-from-solver
+            :measurement-uncertainty-missing :held-out-split-missing]
+           (:reasons (dataset/qualification-eligibility synthetic))))
+    (is (some #{:commercial-use-not-permitted}
+              (:reasons (dataset/qualification-eligibility real-noncommercial))))))
+
+(deftest standard-download-profile-is-commercial-compatible-and-fail-closed
+  (is (every? #(true? (:standard-download? (dataset/download-policy %))) catalog))
+  (doseq [candidate quarantine]
+    (is (false? (:standard-download? (dataset/download-policy candidate))))
+    (is (thrown? Exception (dataset/require-standard-download! candidate))))
+  (is (= :research-only (:profile (dataset/download-policy (first quarantine)))))
+  (is (= :blocked-unverified (:profile (dataset/download-policy (last quarantine))))))
+
+(deftest pinned-hugging-face-experiments-have-immutable-byte-manifests
+  (doseq [id ["z24-bridge-processed" "mcc5-thu-motor"]
+          :let [manifest (dataset/audit-manifest (entry id))
+                urls (dataset/immutable-download-urls manifest)]]
+    (is (= :experiment (:data-origin manifest)))
+    (is (true? (:commercial-use? manifest)))
+    (is (every? #(.contains (:url %) (:revision manifest)) urls))
+    (is (some #{:validation :test} (map :split (:files manifest))))
+    (is (every? #(re-matches #"[0-9a-f]{64}" (:sha256 %)) (:files manifest)))))
+
+(deftest z24-fem-validation-refuses-underdocumented-processed-signals
+  (let [manifest (assoc (entry "z24-bridge-processed") :status :content-verified)
+        semantic {:inputs {:descriptor "<f4" :shape [1530 27 6000]}}
+        readiness (dataset/z24-fem-validation-readiness manifest semantic)]
+    (is (false? (:ready? readiness)))
+    (is (= [:sampling-frequency-missing :sensor-layout-missing
+            :damage-label-semantics-missing :measurement-uncertainty-missing
+            :source-dtype-declaration-mismatch]
+           (:reasons readiness)))
+    (is (= [:natural-frequency-hz :mode-shape] (:required-comparison readiness)))))
+
+(deftest malformed-or-floating-revision-is-rejected
+  (testing "main is never an acceptable evidence revision"
+    (is (thrown? Exception (dataset/audit-manifest (assoc (entry "aethron-cfd-pinn") :revision "main")))))
+  (testing "missing hashes are rejected"
+    (is (thrown? Exception
+                 (dataset/audit-manifest (assoc-in (entry "aethron-cfd-pinn") [:files 0 :sha256] nil))))))
+
+(deftest nasa-ofi-parser-preserves-measurement-uncertainty
+  (let [parsed (dataset/parse-nasa-ofi
+                "VARIABLES = X Y Z dX dZ Cf e_Cf\n173.40 0.00 0.00 13.75 7.00 0.004124 0.000082\n")
+        sample (first (:samples parsed))]
+    (is (= 1 (:sample-count parsed)))
+    (is (= 0.004124 (:skin-friction-coefficient sample)))
+    (is (= 0.000082 (:absolute-uncertainty sample)))))
+
+(deftest nasa-cc0-experiment-is-eligible-after-byte-verification
+  (let [m (entry "nasa-tmr-sbse-ofi")
+        observed (into {} (map (fn [{:keys [path sha256 bytes]}] [path {:sha256 sha256 :bytes bytes}]) (:files m)))
+        verified (dataset/verify-content m observed)
+        eligibility (dataset/qualification-eligibility verified)]
+    (is (= :content-verified (:status verified)))
+    (is (:eligible? eligibility))
+    (is (empty? (:reasons eligibility)))))
+
+(deftest nasa-sbse-manifest-pins-both-as-designed-iges-halves
+  (let [files (:files (entry "nasa-tmr-sbse-ofi"))
+        geometry (filter #(= :geometry (:split %)) files)]
+    (is (= 2 (count geometry)))
+    (is (= 39487986 (reduce + (map :bytes geometry))))
+    (is (every? #(re-matches #"[0-9a-f]{64}" (:sha256 %)) geometry))))
+
+(deftest nist-midas-parser-retains-experimental-conditions-and-correlation
+  (let [parsed (dataset/parse-nist-midas-1045
+                (str "Experiment Number:,4002.0\n"
+                     "Initial Temp [C]:,23.0\n"
+                     "Normal Strain Rate [1/s]:,4391.17\n"
+                     "Strain, Measured Stress [MPa], Data Temp [C], Model Stress [MPa],  Model Temp [C]\n"
+                     "0.01,900,30,910,29\n0.02,920,31,900,31\n"))
+        experiment (first (:experiments parsed))
+        report (dataset/calibration-report parsed 20.0)]
+    (is (= 1 (:experiment-count parsed)))
+    (is (= 2 (:sample-count parsed)))
+    (is (= 4391.17 (:normal-strain-rate-1-s experiment)))
+    (is (= :not-provided-in-source (:measurement-uncertainty parsed)))
+    (is (< 15.8 (:rmse-MPa report) 15.9))
+    (is (:passed? report))
+    (is (false? (:experimental-validation? report)))))
+
+(deftest nist-calibration-data-remains-ineligible-for-independent-validation
+  (let [manifest (entry "nist-midas-1045-dynamic-plasticity")
+        observed (into {} (map (fn [{:keys [path sha256 bytes]}]
+                                 [path {:sha256 sha256 :bytes bytes}]) (:files manifest)))
+        verified (dataset/verify-content manifest observed)
+        eligibility (dataset/qualification-eligibility verified)]
+    (is (= "https://data.nist.gov/od/ds/mds2-2393/MIDAS_steel_data_and_fits_to_A1.csv"
+           (:url (first (dataset/immutable-download-urls manifest)))))
+    (is (false? (:eligible? eligibility)))
+    (is (some #{:not-validation-use} (:reasons eligibility)))
+    (is (some #{:not-independent-from-solver} (:reasons eligibility)))
+    (is (some #{:measurement-uncertainty-missing} (:reasons eligibility)))))

@@ -1,0 +1,155 @@
+(ns pack.solver-test
+  "Reference pack throughout: 1.0 kg of high-rate LiPo (cell 180 Wh/kg, 82% of
+  pack mass is cell => 147.6 Wh/kg at pack level, 85% DoD) carrying the 585 W a
+  5 kg quadrotor pulls in hover — the number kami-engine-rotor produces for that
+  airframe. Expected values were computed by hand from the governing equation
+  before the code was run."
+  (:require [kotoba.test :refer [deftest testing is]]
+            [cae.solver :as cae]
+            [pack.solver :as pack]))
+
+(def ref-case {:pack-mass-kg 1.0 :p-elec-W 585.0})
+
+(defn close?
+  ([a b] (close? a b 1.0e-3))
+  ([a b tol] (< (Math/abs (- (double a) (double b)))
+                (* tol (max 1.0 (Math/abs (double b)))))))
+
+;; ── pack level from cell level ────────────────────────────────────────────
+
+(deftest pack-energy-is-cell-energy-times-the-cell-share-of-mass
+  (is (close? (pack/pack-Wh-kg {}) 147.6))                            ; 180 * 0.82
+  (is (close? (pack/pack-Wh-kg {:chemistry :li-ion-energy}) 213.2))   ; 260 * 0.82
+  (testing "a heavier case and BMS means less pack energy for the same cells"
+    (is (< (pack/pack-Wh-kg {:cell-mass-frac 0.70})
+           (pack/pack-Wh-kg {:cell-mass-frac 0.82})))))
+
+;; ── the forward solve ─────────────────────────────────────────────────────
+
+(deftest hand-computed-reference-pack
+  (let [r (pack/solve ref-case)]
+    (is (close? (:nominal-Wh r) 147.6))
+    (is (close? (:c-rate r) 3.96341))
+    (is (close? (:rate-capacity-frac r) 0.959534))
+    (is (close? (:usable-Wh r) 120.383))
+    (is (close? (:endurance-min r) 12.3470))
+    (testing "internal resistance shows up as voltage, not as energy"
+      (is (close? (:sag-frac r) 0.0317073))
+      (is (close? (:v-under-load-frac r) 0.9682927)))
+    (is (false? (:over-rate? r)))))
+
+(deftest endurance-falls-faster-than-power-rises
+  ;; THE test that separates this solver from a constant Wh/kg table.
+  ;; t = DoD * E_nom^k * P^-k, so doubling the load leaves 2^-1.03 = 0.4897 of
+  ;; the endurance, not 0.5. A model without the rate term returns exactly 0.5,
+  ;; and is optimistic by that gap on every drone it sizes.
+  (let [a (pack/solve ref-case)
+        b (pack/solve (assoc ref-case :p-elec-W 1170.0))]
+    (is (close? (/ (:endurance-min b) (:endurance-min a)) 0.489725 2.0e-3))
+    (is (< (/ (:endurance-min b) (:endurance-min a)) 0.5))
+    (is (close? (:endurance-min b) 6.04645))))
+
+(deftest a-bigger-pack-buys-more-than-its-own-share
+  ;; Doubling pack mass halves the C-rate as well as doubling the energy, so
+  ;; endurance rises by 2^k = 2.042, not 2.
+  (let [a (pack/solve ref-case)
+        b (pack/solve (assoc ref-case :pack-mass-kg 2.0))]
+    (is (close? (/ (:endurance-min b) (:endurance-min a)) 2.0420 2.0e-3))
+    (is (> (:endurance-min b) (* 2.0 (:endurance-min a))))))
+
+(deftest chemistry-is-a-trade-not-a-ranking
+  (let [rate   (pack/solve ref-case)
+        energy (pack/solve (assoc ref-case :chemistry :li-ion-energy))]
+    (testing "the energy cell carries more Wh in the same kilogram"
+      (is (> (:nominal-Wh energy) (:nominal-Wh rate))))
+    (testing "but derates harder under load and sags more"
+      (is (< (:rate-capacity-frac energy) (:rate-capacity-frac rate)))
+      (is (> (:sag-frac energy) (:sag-frac rate))))
+    (testing "and it still wins this particular duty, which is only 2.7C"
+      (is (> (:endurance-min energy) (:endurance-min rate))))))
+
+;; ── rate ceiling, both directions ─────────────────────────────────────────
+
+(deftest over-rate-is-flagged-in-both-directions
+  (let [ok      (pack/solve (assoc ref-case :pack-mass-kg 0.20))   ; 19.8C of 45C
+        too-far (pack/solve (assoc ref-case :pack-mass-kg 0.05))]  ; 79.3C of 45C
+    (is (false? (:over-rate? ok)))
+    (is (close? (:c-rate ok) 19.8171))
+    (is (true? (:over-rate? too-far)))
+    (is (close? (:c-rate too-far) 79.2683)))
+  (testing "the ceiling is the chemistry's, not a constant"
+    (is (true?  (:over-rate? (pack/solve {:pack-mass-kg 1.0 :p-elec-W 2000.0
+                                          :chemistry :li-ion-energy}))))   ; 9.4C of 5C
+    (is (false? (:over-rate? (pack/solve {:pack-mass-kg 1.0 :p-elec-W 2000.0
+                                          :chemistry :lipo-highrate}))))))  ; 13.6C of 45C
+
+;; ── the inverse, which is closed form ─────────────────────────────────────
+
+(deftest size-for-endurance-round-trips
+  (let [s (pack/size-for-endurance {:p-elec-W 585.0 :endurance-min 20.0})]
+    (is (close? (:nominal-Wh s) 235.716))
+    (is (close? (:pack-mass-kg s) 1.596993))
+    (testing "solving it forward again returns the endurance that was asked for"
+      (is (close? (:endurance-min s) 20.0 1.0e-6)))
+    (is (close? (:required-Wh (:sized-for s)) 195.0))))
+
+(deftest the-closed-form-agrees-with-brute-force
+  ;; Independent check of the algebra: bisect on pack mass until the forward
+  ;; solve returns the target endurance, and confirm the closed form landed on
+  ;; the same pack. If the exponent were wrong, these would part company.
+  (let [target 20.0
+        p      585.0
+        f      (fn [m] (:endurance-min (pack/solve {:pack-mass-kg m :p-elec-W p})))
+        bisect (loop [lo 0.01 hi 100.0 n 0]
+                 (let [mid (* 0.5 (+ lo hi))]
+                   (if (>= n 200)
+                     mid
+                     (if (< (f mid) target)
+                       (recur mid hi (inc n))
+                       (recur lo mid (inc n))))))
+        closed (:pack-mass-kg (pack/size-for-endurance {:p-elec-W p :endurance-min target}))]
+    (is (close? closed bisect 1.0e-6))))
+
+;; ── refusals ──────────────────────────────────────────────────────────────
+
+(deftest an-unknown-chemistry-is-refused-not-defaulted
+  (let [e (try (pack/solve (assoc ref-case :chemistry :unobtainium))
+               nil (catch clojure.lang.ExceptionInfo e e))]
+    (is (some? e))
+    (is (= :unobtainium (:chemistry (ex-data e))))
+    (is (contains? (set (:known (ex-data e))) :lipo-highrate))))
+
+(deftest impossible-fractions-are-refused
+  (doseq [[k bad] [[:dod 0.0] [:dod 1.5] [:dod -0.2]
+                   [:cell-mass-frac 0.0] [:cell-mass-frac 1.2]]]
+    (let [e (try (pack/solve (assoc ref-case k bad))
+                 nil (catch clojure.lang.ExceptionInfo e e))]
+      (is (some? e) (str k " => " bad " should be refused"))
+      (is (= k (:key (ex-data e)))))))
+
+(deftest non-positive-inputs-are-refused
+  (doseq [[k bad] [[:pack-mass-kg 0.0] [:pack-mass-kg -1.0] [:p-elec-W 0.0]]]
+    (let [e (try (pack/solve (assoc ref-case k bad))
+                 nil (catch clojure.lang.ExceptionInfo e e))]
+      (is (some? e) (str k " => " bad " should be refused"))
+      (is (= k (:key (ex-data e))))))
+  (let [e (try (pack/size-for-endurance {:p-elec-W 585.0 :endurance-min -5.0})
+               nil (catch clojure.lang.ExceptionInfo e e))]
+    (is (= :endurance-min (:key (ex-data e))))))
+
+;; ── contract registration ─────────────────────────────────────────────────
+
+(deftest registers-on-the-cae-solver-contract
+  (is (cae/registered? :rom-pack))
+  (let [base (assoc ref-case :solver {:kind :rom-pack})]
+    (is (close? (:endurance-min (cae/solve base)) 12.3470))
+    (testing ":endurance-min in the case selects the inverse"
+      (is (close? (:pack-mass-kg (cae/solve (assoc base :endurance-min 20.0
+                                                  :pack-mass-kg nil)))
+                  1.596993)))))
+
+(deftest run-datafies-onto-the-datom-log
+  (let [r (pack/run (assoc ref-case :case/id "quad-5kg"))]
+    (is (pos? (:datom-count r)))
+    (is (seq (:datoms r)))
+    (is (close? (:endurance-min r) 12.3470))))
