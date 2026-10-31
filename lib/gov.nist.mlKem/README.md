@@ -110,9 +110,10 @@ Measured 2026-10-30 on Apple M1 Max with the Amu Mac root of main `91faa123`
 | ctl-cbd | CBD sign inverted | 56 |
 | ctl-dkcheck | dk check compares H(ek) with itself | 55 |
 
-Not yet: the remaining ACVP cases run natively (the `.cljk` suite runs all of them),
-and an x86_64 run. The gate runs in CI on Linux arm64 (`scripts/check-pq-native.py`,
-since kotoba#1014).
+Not yet: the remaining ACVP cases run natively (the `.cljk` suite runs all of them).
+The gate runs in CI on Linux arm64 (`scripts/check-pq-native.py`, since kotoba#1014) and,
+as a KX64 image, on Linux x86_64 in the `pq-unity` lane on main and nightly (AWAI-117),
+with the same results as arm64 for the pass and every mutant.
 
 ## Non-claims
 
