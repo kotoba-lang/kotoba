@@ -13,10 +13,10 @@ extern int64_t kotoba_aiueos_device_result_text(const uint8_t *, uint64_t, uint6
 
 extern uint64_t kotoba_aiueos_sha256(
     const uint8_t *, uint64_t, uint8_t[32], uint8_t *, uint64_t);
-extern uint64_t kotoba_aiueos_ecdsa_p256_sign(
-    const uint8_t *, const uint8_t *, const uint8_t *, uint8_t *, uint8_t *);
+extern uint64_t kotoba_aiueos_ecdsa_p256_sign(const uint8_t *in, uint64_t in_length, uint8_t *out, uint64_t out_length, uint8_t *workspace, uint64_t workspace_length);
+static __attribute__((unused)) uint64_t ecdsa_p256_sign_block(const uint8_t *priv, const uint8_t *digest, const uint8_t *k, uint8_t *out, uint8_t *workspace, uint64_t workspace_length) { uint8_t in[96]; for (int i = 0; i < 32; i++) { in[i] = priv[i]; in[32 + i] = digest[i]; in[64 + i] = k[i]; } uint64_t r = kotoba_aiueos_ecdsa_p256_sign(in, 96, out, 64, workspace, workspace_length); for (int i = 0; i < 96; i++) ((volatile uint8_t *)in)[i] = 0; return r; }
 extern uint64_t kotoba_aiueos_ecdsa_p256_public(
-    const uint8_t *, uint8_t *, uint8_t *);
+    const uint8_t *, uint64_t, uint8_t *, uint64_t, uint8_t *, uint64_t);
 extern int aiueos_device_p256_key_load(uint8_t key[32]);
 extern int aiueos_device_p256_key_save(const uint8_t key[32]);
 
@@ -228,7 +228,7 @@ uint32_t aiueos_device_result_http_request(
      per native boot, so refresh here and let all worker requests from this
      boot reuse the resulting id. */
   if (!device_private_key(private_key) ||
-      !kotoba_aiueos_ecdsa_p256_public(private_key, public_key, p256_workspace) ||
+      !kotoba_aiueos_ecdsa_p256_public(private_key, 32, public_key, 64, p256_workspace, sizeof(p256_workspace)) ||
       !random_scalar(nonce_k) ||
       !device_boot_id_refresh() ||
       !aiueos_cpu_random_bytes(nonce, sizeof(nonce))) goto cleanup;
@@ -257,8 +257,8 @@ uint32_t aiueos_device_result_http_request(
   if (canonical_length <= 0 ||
       !kotoba_aiueos_sha256(canonical_bytes, (uint64_t)canonical_length, digest,
                             sha_workspace, sizeof(sha_workspace)) ||
-      !kotoba_aiueos_ecdsa_p256_sign(private_key, digest, nonce_k,
-                                     signature, p256_workspace)) goto cleanup;
+      !ecdsa_p256_sign_block(private_key, digest, nonce_k,
+                                     signature, p256_workspace, sizeof(p256_workspace))) goto cleanup;
   for (uint32_t i = 0; i < 64; i++) rec[128 + i] = signature[i];
 
   uint8_t body_bytes[DEVICE_BODY_MAX];
@@ -325,7 +325,7 @@ uint32_t aiueos_device_worker_http_request(
   uint8_t nonce[16] = {0}, digest[32] = {0}, signature[64] = {0};
   uint32_t request_length = 0;
   if (!device_private_key(private_key) ||
-      !kotoba_aiueos_ecdsa_p256_public(private_key, public_key, p256_workspace) ||
+      !kotoba_aiueos_ecdsa_p256_public(private_key, 32, public_key, 64, p256_workspace, sizeof(p256_workspace)) ||
       !random_scalar(nonce_k) || !device_boot_id_ensure() ||
       !aiueos_cpu_random_bytes(nonce, sizeof(nonce))) goto cleanup;
   if (!p256_did(public_key, did_out, did_capacity)) goto cleanup;
@@ -372,8 +372,8 @@ uint32_t aiueos_device_worker_http_request(
   if (canonical_length <= 0 ||
       !kotoba_aiueos_sha256(canonical_bytes, (uint64_t)canonical_length, digest,
                             sha_workspace, sizeof(sha_workspace)) ||
-      !kotoba_aiueos_ecdsa_p256_sign(private_key, digest, nonce_k,
-                                     signature, p256_workspace)) goto cleanup;
+      !ecdsa_p256_sign_block(private_key, digest, nonce_k,
+                                     signature, p256_workspace, sizeof(p256_workspace))) goto cleanup;
   char signature_hex[129];
   hex_encode(signature, 64, signature_hex);
 

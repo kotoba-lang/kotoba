@@ -332,8 +332,8 @@ uint64_t kotoba_aiueos_x25519(const uint8_t *scalar, uint64_t scalar_length, con
 }
 
 uint64_t kotoba_aiueos_ecdsa_p256_sha256_verify(
-    const uint8_t *sig, const uint8_t *digest, const uint8_t *pub,
-    uint8_t *ws, uint64_t wslen) {
+    const uint8_t *sig, uint64_t sig_length, const uint8_t *digest, uint64_t digest_length, const uint8_t *pub,
+    uint64_t pub_length, uint8_t *ws, uint64_t wslen) { (void)sig_length; (void)digest_length; (void)pub_length;
   EC_KEY *key = 0;
   BIGNUM *x = 0, *y = 0, *r = 0, *s = 0;
   ECDSA_SIG *esig = 0;
