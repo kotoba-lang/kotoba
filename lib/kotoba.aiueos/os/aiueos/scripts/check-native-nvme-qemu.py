@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""AWAI-122 stages 1-2: the debug entry's read-only NVMe driver identifies a controller and reads LBA 1, then
-finds the ESP, walks FAT16/FAT32 to the installed loader and takes its SHA-256.
+"""AWAI-122 stages 1-3: the debug entry's read-only NVMe driver identifies a controller and reads LBA 1, then
+finds the ESP, walks FAT16/FAT32 to the installed loader and takes its SHA-256; then the signed-image
+verifier (native/update.kotoba) runs its self-test.
 
 Four boots of the desktop debug entry (native/desktop-debug-entry.kotoba, which probes NVMe and the ESP once at
 boot), each with QEMU `-nic none`:
@@ -13,6 +14,9 @@ boot), each with QEMU `-nic none`:
   4096   1 MiB with 4096-byte blocks, a GPT header with no partition entries: LBA 1 is bytes 4096..4159 and the
          ESP result is 3 (no ESP);
   absent no NVMe function: NVMe result 1, ESP result 1.
+Every boot also checks the update verifier's self-test (context words 188/189): the RFC 8032 test-1-signed
+5000-byte fixture image is accepted (15), refused with one manifest byte changed (1, signature) and refused
+with one image byte changed (7, digest). The network pull itself needs the RTL8168, which QEMU does not have.
 After every boot the disk image is byte-identical to before (the driver has no write command), and the desktop
 keeps drawing after the probe. The NVMe boots use a 37-bit guest physical address width: with QEMU's default,
 OVMF places the 64-bit NVMe BAR at 768 GiB and the loader's PCI collector, which admits host addresses below
@@ -101,9 +105,12 @@ def boot(args, out, name, kind, events):
     b = keystore.Boot(args, out, name, None, extra, first_frame_seconds=600)
     try:
         result, esp = b.W(600), b.W(676)
+        detail = b.W(189)
+        self_test = [detail & 255, (detail >> 8) & 255, (detail >> 16) & 255]
+        assert b.W(188) == 7 and self_test == [15, 1, 7], ("update self-test", b.W(188), self_test, b.W(180))
         if not block:
             assert result == 1 and esp == 1, ("no NVMe function must give results 1/1", result, esp)
-            row = dict(name=name, result=result, esp=esp)
+            row = dict(name=name, result=result, esp=esp, updateSelfTest=self_test)
         else:
             assert result == 15, ("NVMe probe failed at step", result, hex(b.W(617)))
             model = b.words(620, 10).decode("ascii", "replace").rstrip(" \0")
@@ -115,7 +122,7 @@ def boot(args, out, name, kind, events):
             got = b.words(630, 16)
             assert got == image[block:block + 64], ("LBA 1 differs", got.hex())
             row = dict(name=name, result=result, model=model, blocks=blocks, blockBytes=block,
-                       version=hex(b.W(606)), lba1=got[:8].decode(), esp=esp)
+                       version=hex(b.W(606)), lba1=got[:8].decode(), esp=esp, updateSelfTest=self_test)
             if want is None:
                 assert esp == 3, ("a GPT with no entries must give ESP result 3", esp)
             else:

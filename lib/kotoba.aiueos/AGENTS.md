@@ -169,7 +169,24 @@ OVMF variable store: without one OVMF writes `\NvVars` to the fixture ESP.
 On the 6600H it hashed the installed `\EFI\ITONAMI\BOOTX64.EFI` (FAT32) to
 exactly the SHA-256 of the image installed on 2026-10-30:
 `docs/evidence/awai122-esp-read-6600h-20261031`.
-The signed image and writing follow in later stages.
+Stage 3 is `native/update.kotoba`: remote command 5 makes the board pull a
+signed image over the RTL8168 link (requests to UDP 7796, answers on 7795, in
+1024-byte chunks) and verify it while nothing is written. A signed image is a
+64-byte manifest ("AIUEIMG1", version, size, reserved, SHA-256), its Ed25519
+signature under the image-signing key pinned in update.kotoba (seed on the
+operator's Mac, outside the repository), then the image. The signature is
+checked before any image byte is taken; the image must then match the
+manifest's size and SHA-256. Sign and serve with
+`os/aiueos/scripts/aiueos-image.py`, then start the pull with
+`aiueos-remote.py update`; results are KDBG 0xc120..0xc127 and 0xc005, state
+in context words 180..207, and the page is owned window slot 14. QEMU has no
+RTL8168, so the gate checks the verifier's boot self-test (KDBG 0xc118): it
+accepts a 5000-byte fixture signed with the published RFC 8032 test-1 seed,
+and refuses it when one manifest byte or one image byte is changed, through
+the chunk path the network uses. The network pull is checked only on the
+board. Still open: Ed25519 only (no ML-DSA verifier yet), and no rollback
+protection beyond version >= 1, since no installed version is kept.
+Writing the ESP is stage 4.
 
 ## CDCI migration: native only (2026-10-24)
 

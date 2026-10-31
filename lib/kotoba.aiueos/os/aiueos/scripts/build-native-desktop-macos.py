@@ -260,7 +260,7 @@ def main(args):
         efi = kernel / "BOOTX64.EFI"
         image = kernel / "KERNEL.ELF"
         if (kernel_state["state"] != "MACOS_NATIVE_IMAGE_CANDIDATE"
-                or kernel_state["sourceModuleCount"] != 44
+                or kernel_state["sourceModuleCount"] != 45
                 or kernel_state["fuel"] != FUEL
                 or kernel_state["compiler"] != compiler_pin
                 or pin(efi) != kernel_state["efi"] or pin(image) != kernel_state["kernel"]
@@ -422,6 +422,7 @@ def main(args):
                     or [row["esp"] for row in observed["events"]] != [15, 15, 3, 1]
                     or not all(row["desktopKeptRunning"] for row in observed["events"])
                     or not all(row.get("diskUnchanged") for row in observed["events"][:3])
+                    or [row["updateSelfTest"] for row in observed["events"]] != [[15, 1, 7]] * 4
                     or observed["writeCommands"] or observed["physicalHardware"]):
                 raise ValueError("nvme verdict is incomplete")
         elif args.profile == "keyseal":
