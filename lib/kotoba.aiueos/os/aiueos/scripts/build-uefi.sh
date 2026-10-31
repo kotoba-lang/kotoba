@@ -1055,7 +1055,7 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_service_task_o
   b54ebc310aecc4b428d9aebc4f059cef41a7983bffef04c6fdc7a8d8a8e89bf0 \
   kotoba_aiueos_service_task_transition
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_rsa2048_object" \
-  0f4eeeecdc0605217aae5dfe55cd219c2c9a586a9ca9104d760d87c21642e72c \
+  7c3e0ef8766dcac4fb1e45cb5265c950062fa630c0393e6f5cbfdbc2c595ed01 \
   kotoba_aiueos_rsa2048_sha256_verify
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_net_arp_object" \
   313f50e9abbf947db43db4a03adce8f28d23216db94d6376d2ae31d20bf1c80f \
@@ -1109,7 +1109,7 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_aes128_gcm_sel
   45cee00c5bbf25060691cb86e1cd178c317f9746bf43b6dfde82c3ad0745a3c9 \
   kotoba_aiueos_aes128_gcm_selftest
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_x25519_object" \
-  30db73025df711305c34cd738f489c01ea38c06738c1f44c9e0dc934c6aff4db \
+  633ec4f074cabbca0d72b4c2943e50c629c2997eaae90fd52f179f6e73084544 \
   kotoba_aiueos_x25519
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_ecdsa_object" \
   5540c3b633bec183446ac11bdbedfb84970bfe134bd45af6490a3bcded88f855 \
