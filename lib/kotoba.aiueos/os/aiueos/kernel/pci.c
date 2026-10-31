@@ -5316,7 +5316,7 @@ static uint64_t rtl8125_boot_nonce(void) {
 #define AIUEOS_RELAY_HELLO_CAPACITY 160U
 extern uint64_t kotoba_aiueos_relay_hello_payload(uint64_t out,uint64_t capacity,
                                                   uint64_t nonce_hi,uint64_t nonce_lo,
-                                                  uint64_t mac);
+                                                  uint64_t mac,uint64_t mac_length);
 extern uint64_t kotoba_aiueos_relay_ack_payload_valid(uint64_t payload,uint64_t length,
                                                       uint64_t nonce_hi,uint64_t nonce_lo);
 
@@ -5324,7 +5324,7 @@ static uint32_t rtl8125_build_relay_hello(uint8_t *frame,uint64_t nonce) {
   uint8_t payload[AIUEOS_RELAY_HELLO_CAPACITY];
   uint32_t payload_length=(uint32_t)kotoba_aiueos_relay_hello_payload(
     (uint64_t)(uintptr_t)payload,sizeof(payload),nonce>>32,nonce&0xffffffffULL,
-    (uint64_t)(uintptr_t)rtl8125_qualification_device.mac);
+    (uint64_t)(uintptr_t)rtl8125_qualification_device.mac,sizeof(rtl8125_qualification_device.mac));
   if(!payload_length)return 0;
   uint32_t udp_length=8U+payload_length,total=20U+udp_length;
   for(unsigned i=0;i<6;i++)frame[i]=rtl8125_peer_mac[i];
