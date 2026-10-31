@@ -897,7 +897,7 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_mutable_build_
   c0702160f1f0fb7e2ae4fb66ca145fecee320de1c49875b8e5a92ad0f9a60977 \
   kotoba_aiueos_mutable_object_build
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_cap_valid_object" \
-  0f591a342fe5b4fa959f8a21d36930ec9eca7859302a747ce43f5e3caa20c9c6 \
+  6d3693a9b49a1376cc462c9694eadca7fc6265c786bdbb0a0c947383516ec21e \
   kotoba_aiueos_virtio_cap_valid
 # JUN-598: pci.c's virtio queue setup (prepare_queue_index) is kotoba/virtio-queue.o (fuel 4194304).
 kotoba_virtio_queue_object=${AIUEOS_KOTOBA_VIRTIO_QUEUE_OBJECT:-"$aiueos/kotoba/virtio-queue.o"}
@@ -940,7 +940,7 @@ kotoba_virtio_caps_object=${AIUEOS_KOTOBA_VIRTIO_CAPS_OBJECT:-"$aiueos/kotoba/vi
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_virtio_caps_object" \
   5f3683cdb2ca39922972786c5811d121ff8ee3010fb835bc4d6f7b7f3fcb1568 kotoba_aiueos_virtio_caps_find
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_extent_valid_object" \
-  cfde40e55fc8e52d6100183e2e4a7eecd60120be95f9c04234714ad041916ec4 \
+  127b54ad461415cedcde76fb5bde54e328ce54b570891ff324a0dd1c87c4f189 \
   kotoba_aiueos_pci_extent_valid
 # JUN-598: pci.c's enumeration decisions (presence, function count, virtio dispatch, result cascade, the RTL8125 ID)
 # are kotoba/pci-enum.o (fuel 4194304).
@@ -956,7 +956,7 @@ kotoba_pci_bar_object=${AIUEOS_KOTOBA_PCI_BAR_OBJECT:-"$aiueos/kotoba/pci-bar.o"
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_pci_bar_object" \
   207d3437020090444e836284606b609563ab0cf5ae21663091c5c840e3ca3797 kotoba_aiueos_pci_bar_base,kotoba_aiueos_pci_bar_kind,kotoba_aiueos_pci_bar_value,kotoba_aiueos_pci_bar_size
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_region_valid_object" \
-  e71f161385afb5e3c83913633417e59fa53532e2d7ba7f4234ea192988c6e0a6 \
+  f141c051411958cceba2478b8bb994807765d26aa0488a187caee2404870f243 \
   kotoba_aiueos_pci_region_valid
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_pci_config_read_object" \
   04ab0830219e6e03552cfc46ccfc56ce34fd1cf84b2f418d3a7916d4aac264d6 \
@@ -965,7 +965,7 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_pci_config_wri
   354f8ca148b0264af2dac50b2d26af9d0b439f641b0dcdf5714fd7465add4ba5 \
   kotoba_aiueos_pci_config_write
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_mmio_map_admit_object" \
-  fb6b5591bf9c78b030aaf10aa93d305ac2b0f41cac9278be56507a6ec519e60b \
+  638de7487df737be76d834c57fc02e74026eac9ad9b46d669efee3bfa247014c \
   kotoba_aiueos_mmio_map_admit
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_acpi_checksum_object" \
   f92dd1922a7d4dd2bb30614d3f8058da671b5f154bd9b5c452174ae8a17a5978 \
