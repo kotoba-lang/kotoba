@@ -1059,7 +1059,7 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_service_task_o
   b54ebc310aecc4b428d9aebc4f059cef41a7983bffef04c6fdc7a8d8a8e89bf0 \
   kotoba_aiueos_service_task_transition
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_rsa2048_object" \
-  0f4eeeecdc0605217aae5dfe55cd219c2c9a586a9ca9104d760d87c21642e72c \
+  7c3e0ef8766dcac4fb1e45cb5265c950062fa630c0393e6f5cbfdbc2c595ed01 \
   kotoba_aiueos_rsa2048_sha256_verify
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_net_arp_object" \
   313f50e9abbf947db43db4a03adce8f28d23216db94d6376d2ae31d20bf1c80f \
@@ -1110,16 +1110,16 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_micro_infer_ne
   52dcbd0c677e9d619fb91090526e9bbe863624235ab22c359b2a515261ad4eed \
   kotoba_aiueos_micro_infer_next
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_aes128_gcm_selftest_object" \
-  45cee00c5bbf25060691cb86e1cd178c317f9746bf43b6dfde82c3ad0745a3c9 \
+  406ac2bf1e2ee781e829ad49ccea22065b98b1606c6adfb076147e102c0a2621 \
   kotoba_aiueos_aes128_gcm_selftest
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_x25519_object" \
-  30db73025df711305c34cd738f489c01ea38c06738c1f44c9e0dc934c6aff4db \
+  633ec4f074cabbca0d72b4c2943e50c629c2997eaae90fd52f179f6e73084544 \
   kotoba_aiueos_x25519
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_ecdsa_object" \
-  5540c3b633bec183446ac11bdbedfb84970bfe134bd45af6490a3bcded88f855 \
+  c6766cfcd7e7bd4e3584c1aa461a4e8fd89522cff8534afdaa3b256acffebe13 \
   kotoba_aiueos_ecdsa_p256_sha256_verify
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_aes128_gcm_object" \
-  2b3b4c7d5f8800dc2c9f187e3693210bd1b69d0e434bc2f8ce78d2f236489f46 \
+  e4174d9e1c5c9e7d76673f7aec258b7483d6279f51605371d91558d15940cd3b \
   kotoba_aiueos_aes128_gcm
 # Qwen3.8-27B GGUF admission (ADR-0137). Verified unconditionally like every
 # object above, even in profiles that do not link them: the digests are what
@@ -1134,7 +1134,7 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_qwen35_tensor_
   193edbfc2c2e238980470e366442b11bd7222546b81d78e14d6ce74dbd79a608 \
   kotoba_aiueos_qwen35_tensor_table_bind
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_tls13_record_object" \
-  572b7e33640a413bb68e37f39f09e155282eefe86c33f9e2a31040c70a170d7a \
+  91966270c75d82f1c77307f9b919421cd59e788b7f2dfc485f092ab5a30e45c2 \
   kotoba_aiueos_tls13_record
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_cid_v1_admit_object" \
   4760b9183029babcad5b2d3dcf8418f4a970cbdc289e5c8a1b053d1149d6c333 \
@@ -1206,7 +1206,7 @@ if [ -n "$model_handoff_link" ] || [ -n "$qwen35_parity_cflags" ]; then
   fi
 fi
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_device_worker_canonical_object" \
-  fdd390542fc7a315bff5a8adb3e7ca78eef493d46e652f45c80a77dba664fc95 \
+  22c34dad88cb82a46c3a39e366f35101f99a0e5cdb0d21d98e5f17435e54ac7d \
   kotoba_aiueos_device_worker_canonical
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_sha256_stream_object" \
   116e6521295545a5090bd7f6fa5c2e9ed5c9d02df590fbda3a7ef170667606dd \
@@ -1219,12 +1219,12 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_device_worker_
   kotoba_aiueos_device_worker_digest
 if [ -n "$ecdsa_sign_link" ]; then
   python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_ecdsa_sign_object" \
-    42496f9fe7c540c869e1bbe1d63e6b2a7e5e9387f5ffb486f89cc3f1a6f0adb6 \
+    459c2be94f79306761661a3ab7cb3df1d0c7785f4d77bce3ae5b0d46d393fec7 \
     kotoba_aiueos_ecdsa_p256_sign
 fi
 if [ -n "$ecdsa_public_link" ]; then
   python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_ecdsa_public_object" \
-    b1b1c6ccef85594c890c0a17be9c9e718c00b54da9615b5bd56510f883de0172 \
+    fa8a89dc88383e2ef47f9bf93087eeff2a9b20038a2b11d9b7ab7865123b47cd \
     kotoba_aiueos_ecdsa_p256_public
 fi
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_ime_object" \
@@ -1243,7 +1243,7 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_session_object
   e9b49c362e9583115b06f0095237d20dfad5719d5894ee0cf57fa2a8c0ac87c2 \
   kotoba_aiueos_session_restore
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_browser_frame_object" \
-  d828fde6c002264314c9e86ee4bd72ceda2965c97cfd6ba87d6558956c591569 \
+  324988bdec511a5fce7ee4b94100388686821f09351aa67e126ce8a76d9a2ed9 \
   kotoba_aiueos_browser_frame
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_browser_reduce_object" \
   fd355f2da0d3b5a77c39ee2f7d1c888a127c1af67122b354773bb260cc9c9677 \
@@ -1255,7 +1255,7 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_browser_ime_ob
   52ef6924472cded523d80c9f9dd7c2ad533bb58446240028424e08462bdbbba7 \
   kotoba_aiueos_browser_key
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_browser_damage_object" \
-  5dc5c33880e39b2a656d701230156963b604f04c765298379c8d479d59745ecc \
+  6ce0fd8d98992eea4fdbc2ad0139bcd2440ea201e5e7b61bf592eddac41fd575 \
   kotoba_aiueos_browser_damage
 python3 "$aiueos/scripts/verify-kotoba-user-elf.py" "$kotoba_user_elf" \
   1f0e5897831d0de6bbcb15eec82a6e0c4b402b436689cec051bc6de3b5c4e905
@@ -1579,8 +1579,17 @@ zig cc -target x86_64-freestanding-none -std=c11 -O2 \
   -c -o "$kernel_framebuffer_object" "$aiueos/kernel/framebuffer.c"
 if [ -n "$plc_runtime_link" ]; then
   if [ "${AIUEOS_PLC_RT_SMOKE:-0}" = 1 ]; then
+    # JUN-736 negative control: AIUEOS_PLC_RT_FORCE_MISS=<scan> builds a kernel that releases that scan one tick late.
+    plc_runtime_cflags=
+    if [ -n "${AIUEOS_PLC_RT_FORCE_MISS:-}" ]; then
+      case "$AIUEOS_PLC_RT_FORCE_MISS" in
+        *[!0-9]*) echo "error: AIUEOS_PLC_RT_FORCE_MISS must be a scan index" >&2; exit 1 ;;
+      esac
+      plc_runtime_cflags="-DAIUEOS_PLC_RT_FORCE_MISS_SCAN=$AIUEOS_PLC_RT_FORCE_MISS"
+    fi
+    # shellcheck disable=SC2086 # intentional optional define
     zig cc -target x86_64-freestanding-none -std=c11 -O2 \
-      -ffreestanding -fno-stack-protector -mno-red-zone \
+      -ffreestanding -fno-stack-protector -mno-red-zone $plc_runtime_cflags \
       -c -o "$kernel_plc_runtime_object" "$aiueos/kernel/plc_runtime.c"
     python3 "$aiueos/scripts/make-plc-embedded-assembly.py" \
       "$AIUEOS_PLC_ELF" "$AIUEOS_PLC_RECEIPT" \

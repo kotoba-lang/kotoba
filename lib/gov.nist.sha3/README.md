@@ -94,6 +94,16 @@ All 126 oracle lines equal Python `hashlib` (`sha3_*`, `shake_128`, `shake_256`)
 the same inputs (byte i = (7i + 3) mod 256). Python only compared the printed lines;
 the image computed every digest.
 
+Since AWAI-117 (2026-11-01) `scripts/check-pq-native.py` makes this comparison on every
+run of the printing gate (`sweep_compare`), so it is no longer a manual step. It reads the
+21 lengths from this gate's own `g-len`, recomputes the 126 expected lines with `hashlib`,
+and requires all 126 lines, no duplicates, `lines 126`, and 0 mismatches. It also has
+controls: a copy of the pass lines with one hex digit changed must give exactly 1
+mismatch, and each mutant's lines must disagree with `hashlib` (ctl-constant: 126 of 126
+lines, ctl-suffix: the 21 SHA3-256 lines). Each result is in `evidence.json` under
+`gates.sha3.sweep`. Checked against the Linux arm64 stdout of main run 41238963645 and on
+the Mac (Amu Mac root image sha256 `dd71f394…`, packager `7691467c…`).
+
 On Linux x86_64 (KX64 under the native runner) the gate cannot print: amu's locked
 x86 project adapter refuses every capability, `:io/write` included (E7101 OP-CAP), and
 that refusal is deliberate. So x86_64 runs a print-free variant, `sha3-x86` in
@@ -127,8 +137,8 @@ The x86_64 run itself is the CI `pq-unity` lane.
 
 Not yet: the incremental XOF, and running the CAVP files under `test/sha3/cavp/`
 natively (the gate embeds the published examples; the `.cljk` suite runs the CAVP
-files). The x86_64 variant does not compare the sweep lines with `hashlib` (no lane
-does in CI). This gate runs in CI on Linux arm64 (`scripts/check-pq-native.py`, since
+files). The x86_64 variant prints no sweep lines, so it has nothing to compare with
+`hashlib`; the Linux arm64 lane (PRs, main, nightly) compares them in CI. This gate runs in CI on Linux arm64 (`scripts/check-pq-native.py`, since
 kotoba#1014), and its print-free variant on Linux x86_64.
 
 ## Non-claims

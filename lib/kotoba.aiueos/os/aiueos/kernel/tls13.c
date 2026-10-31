@@ -3,10 +3,10 @@
 
 extern uint64_t kotoba_aiueos_sha256(const uint8_t *, uint64_t, uint8_t[32],
                                      uint8_t *, uint64_t);
-extern uint64_t kotoba_aiueos_x25519(const uint8_t *, const uint8_t *,
-                                     uint8_t *, uint8_t *);
+extern uint64_t kotoba_aiueos_x25519(const uint8_t *, uint64_t, const uint8_t *, uint64_t,
+                                     uint8_t *, uint64_t, uint8_t *, uint64_t);
 extern uint64_t kotoba_aiueos_ecdsa_p256_sha256_verify(
-    const uint8_t *, const uint8_t *, const uint8_t *, uint8_t *, uint64_t);
+    const uint8_t *, uint64_t, const uint8_t *, uint64_t, const uint8_t *, uint64_t, uint8_t *, uint64_t);
 /* The TLS 1.3 AEAD and record layer (ADR-0132, ADR-0133). Both return a
    REASON CODE and ZERO IS SUCCESS -- the opposite of the C in this file, so
    every call site has to be written rather than transcribed. */
@@ -316,7 +316,7 @@ static int unprotect(const uint8_t key[16], const uint8_t iv[12], uint64_t seq,
    s key | s iv, ap_keys c key | c iv | s key | s iv; 1 is success and on 0 nothing is copied. */
 static int derive_hs_keys(const uint8_t *server_pub) {
   uint8_t shared[32], k[152];
-  if (!kotoba_aiueos_x25519(client_scalar, server_pub, shared, x_ws)) return 0;
+  if (!kotoba_aiueos_x25519(client_scalar, 32, server_pub, 32, shared, 32, x_ws, sizeof x_ws)) return 0;
   if (kotoba_aiueos_tls13_hs_keys(shared, 32, transcript, transcript_len, k, sizeof(k)) != 1) return 0;
   copy_bytes(handshake_secret, k, 32);
   copy_bytes(c_hs_secret, k + 32, 32);
@@ -387,7 +387,7 @@ int aiueos_tls13_run_certverify(void) {
      TCG; doing it inside feed delayed the ACK until the peer had moved on,
      so HTTP GET never got a body (app=0 after get=1). */
   if (!certverify_parsed || !have_leaf_pub) return 0;
-  if (!kotoba_aiueos_ecdsa_p256_sha256_verify(cv_rs, cv_digest, leaf_pub,
+  if (!kotoba_aiueos_ecdsa_p256_sha256_verify(cv_rs, 64, cv_digest, 32, leaf_pub, 64,
                                               ecdsa_ws, 2048))
     return 0;
   certverify_ok = 1;
@@ -556,7 +556,7 @@ void aiueos_tls13_reset(void) {
 
 int aiueos_tls13_clienthello(uint8_t *out, uint32_t *len) {
   copy_bytes(client_scalar, configured ? configured_scalar : smoke_scalar, 32);
-  if (!kotoba_aiueos_x25519(client_scalar, x25519_base, client_pub, x_ws)) return 0;
+  if (!kotoba_aiueos_x25519(client_scalar, 32, x25519_base, 32, client_pub, 32, x_ws, sizeof x_ws)) return 0;
   if (!clienthello_build()) return 0;
   if (!transcript_add(ch_record + 5, ch_record_len - 5)) return 0;
   copy_bytes(out, ch_record, ch_record_len);
@@ -664,10 +664,10 @@ int aiueos_tls13_ecdsa_selftest(void) {
   uint8_t bad[64];
   uint32_t i;
   static uint8_t ws[2048] AIUEOS_TLS_HIGH_BSS;
-  if (!kotoba_aiueos_ecdsa_p256_sha256_verify(sig, digest, pub, ws, 2048)) return 0;
+  if (!kotoba_aiueos_ecdsa_p256_sha256_verify(sig, 64, digest, 32, pub, 64, ws, 2048)) return 0;
   copy_bytes(bad, sig, 64);
   bad[63] = (uint8_t)(bad[63] + 1);
-  if (kotoba_aiueos_ecdsa_p256_sha256_verify(bad, digest, pub, ws, 2048)) return 0;
+  if (kotoba_aiueos_ecdsa_p256_sha256_verify(bad, 64, digest, 32, pub, 64, ws, 2048)) return 0;
   for (i = 0; i < 2048; i++) ws[i] = 0;
   return 1;
 }

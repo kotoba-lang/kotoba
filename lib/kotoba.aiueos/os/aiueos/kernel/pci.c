@@ -365,8 +365,8 @@ extern uint64_t kotoba_aiueos_digest_equal(
   const uint8_t[32],const uint8_t[32],uint64_t);
 extern uint64_t kotoba_aiueos_app_catalog_valid(
   const uint8_t *,uint64_t,uint64_t,const uint32_t[2],uint64_t);
-extern uint64_t kotoba_aiueos_rsa2048_sha256_verify(
-  const uint8_t[256],const uint8_t[32],uint8_t*,uint64_t,uint64_t);
+extern uint64_t kotoba_aiueos_rsa2048_sha256_verify(const uint8_t[256],uint64_t,
+  const uint8_t[32],uint64_t,uint8_t*,uint64_t,uint64_t);
 /* `.high_bss`: both are CPU-only scratch for the Kotoba hash/verify calls,
    reached from the boot selftests after the section is zeroed; the low region
    was one page over its 0x1f4000 budget once main and the scorecard branch
@@ -381,7 +381,7 @@ static int sha256(const uint8_t *bytes,uint64_t length,uint8_t digest[32]) {
 }
 static int rsa2048_sha256_verify(const uint8_t signature[256],const uint8_t digest[32]) {
   return (int)kotoba_aiueos_rsa2048_sha256_verify(
-    signature,digest,rsa2048_workspace,sizeof(rsa2048_workspace),0);
+    signature,256,digest,32,rsa2048_workspace,sizeof(rsa2048_workspace),0);
 }
 /* Admit an initramfs recovery payload through the identical Kotoba SHA-256 +
    RSA-2048 public-key policy used for object-store application admission.
@@ -3457,11 +3457,11 @@ static int net_ssh_id_prefix_ok(const uint8_t *p, uint32_t len) {
    client verified end-to-end; here the crypto comes from the kernel's Kotoba
    objects: X25519 for Q_S/K, SHA-256 for H, and the ECDSA-P256 sign object for
    the host-key signature over H. Assembly is decision-free byte layout. */
-extern uint64_t kotoba_aiueos_x25519(const uint8_t *, const uint8_t *,
-                                     uint8_t *, uint8_t *);
-extern uint64_t kotoba_aiueos_ecdsa_p256_sign(const uint8_t *, const uint8_t *,
-                                              const uint8_t *, uint8_t *,
-                                              uint8_t *);
+extern uint64_t kotoba_aiueos_x25519(const uint8_t *, uint64_t, const uint8_t *, uint64_t,
+                                     uint8_t *, uint64_t, uint8_t *, uint64_t);
+extern uint64_t kotoba_aiueos_ecdsa_p256_sign(const uint8_t *in, uint64_t in_length, uint8_t *out, uint64_t out_length, uint8_t *workspace, uint64_t workspace_length);
+static __attribute__((unused)) uint64_t ecdsa_p256_sign_block(const uint8_t *priv, const uint8_t *digest, const uint8_t *k, uint8_t *out, uint8_t *workspace, uint64_t workspace_length) { uint8_t in[96]; for (int i = 0; i < 32; i++) { in[i] = priv[i]; in[32 + i] = digest[i]; in[64 + i] = k[i]; } uint64_t r = kotoba_aiueos_ecdsa_p256_sign(in, 96, out, 64, workspace, workspace_length); for (int i = 0; i < 96; i++) ((volatile uint8_t *)in)[i] = 0; return r; }
+
 /* Fixed ecdsa-sha2-nistp256 host key: d is the private scalar; (x,y)=d*G is the
    public point (precomputed offline -- the kernel has no P-256 base multiply of
    its own). The client harness pins this public key. A per-device key is the
@@ -3480,7 +3480,7 @@ static uint8_t ssh_host_y[32] = {
     defined(AIUEOS_MURAKUMO_DEVICE_RESULT)
 extern int aiueos_device_p256_key_load(uint8_t key[32]);
 extern uint64_t kotoba_aiueos_ecdsa_p256_public(
-  const uint8_t *private_key, uint8_t *public_key, uint8_t *workspace);
+  const uint8_t *private_key, uint64_t private_key_length, uint8_t *public_key, uint64_t public_key_length, uint8_t *workspace, uint64_t workspace_length);
 static uint8_t ssh_host_public_workspace[2048]
   __attribute__((section(".high_bss")));
 static int ssh_device_host_key_ready;
@@ -3497,7 +3497,7 @@ static int ssh_use_device_host_key(void) {
   if (ssh_device_host_key_ready) return 1;
   if (aiueos_device_p256_key_load(private_key) &&
       kotoba_aiueos_ecdsa_p256_public(
-        private_key, public_key, ssh_host_public_workspace)) {
+        private_key, 32, public_key, 64, ssh_host_public_workspace, sizeof(ssh_host_public_workspace))) {
     for (uint32_t i = 0; i < 32; i++) {
       ssh_host_d[i] = private_key[i];
       ssh_host_x[i] = public_key[i];
@@ -3538,8 +3538,8 @@ extern int aiueos_aes128_gcm_encrypt(const uint8_t[16], const uint8_t[12],
 extern int aiueos_aes128_gcm_decrypt(const uint8_t[16], const uint8_t[12],
                                      const uint8_t *, uint32_t,
                                      const uint8_t *, uint32_t, const uint8_t[16], uint8_t *);
-extern uint64_t kotoba_aiueos_ecdsa_p256_sha256_verify(const uint8_t *, const uint8_t *,
-                                                       const uint8_t *, uint8_t *, uint64_t);
+extern uint64_t kotoba_aiueos_ecdsa_p256_sha256_verify(const uint8_t *, uint64_t, const uint8_t *, uint64_t,
+                                                       const uint8_t *, uint64_t, uint8_t *, uint64_t);
 static const uint8_t ssh_v_s[] = "SSH-2.0-aiueos_0.1";  /* V_S without CR-LF */
 #define SSH_V_S_LEN (sizeof(ssh_v_s) - 1)
 static uint8_t ssh_v_c[128] AIUEOS_SSH_HIGH_BSS; /* captured client id line */
@@ -4070,7 +4070,7 @@ static int net_ssh_userauth(struct aiueos_ssh_io *io, uint16_t cport,
           ssh_mpint_to_32(r, rn, rs);
           ssh_mpint_to_32(s, sn, rs + 32);
 
-          if (!kotoba_aiueos_ecdsa_p256_sha256_verify(rs, digest, pub, ssh_verify_ws, 2048)) return 0;
+          if (!kotoba_aiueos_ecdsa_p256_sha256_verify(rs, 64, digest, 32, pub, 64, ssh_verify_ws, sizeof(ssh_verify_ws))) return 0;
           ssh_kex_stage = 11;
         }
       }
@@ -4273,8 +4273,8 @@ static int net_ssh_kex(struct aiueos_ssh_io *io, uint16_t cport,
   /* 5. ephemeral X25519, shared secret, host-key blob, exchange hash H. */
   uint8_t eph[32], q_s[32], k[32];
   aiueos_random_bytes(eph, 32);
-  if (!kotoba_aiueos_x25519(eph, x25519_base9, q_s, ssh_x25519_ws)) return 0;
-  if (!kotoba_aiueos_x25519(eph, q_c, k, ssh_x25519_ws)) return 0;
+  if (!kotoba_aiueos_x25519(eph, 32, x25519_base9, 32, q_s, 32, ssh_x25519_ws, sizeof ssh_x25519_ws)) return 0;
+  if (!kotoba_aiueos_x25519(eph, 32, q_c, 32, k, 32, ssh_x25519_ws, sizeof ssh_x25519_ws)) return 0;
 
   static uint8_t ks[128] AIUEOS_SSH_HIGH_BSS;
   uint32_t kslen = 0;
@@ -4314,7 +4314,7 @@ static int net_ssh_kex(struct aiueos_ssh_io *io, uint16_t cport,
     uint8_t nonce[32];
     aiueos_random_bytes(nonce, 32);
     nonce[0] &= 0x7f;
-    if (kotoba_aiueos_ecdsa_p256_sign(ssh_host_d, e, nonce, rs, ssh_sign_ws))
+    if (ecdsa_p256_sign_block(ssh_host_d, e, nonce, rs, ssh_sign_ws, sizeof(ssh_sign_ws)))
       signed_ok = 1;
   }
   if (!signed_ok) return 0;

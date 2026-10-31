@@ -311,13 +311,13 @@ int64_t kotoba_aiueos_tls13_inner_step(const uint8_t *plain, uint64_t n, uint64_
   return inner != 0x17 ? 7 : 8;
 }
 
-uint64_t kotoba_aiueos_x25519(const uint8_t *scalar, const uint8_t *peer,
-                              uint8_t *out, uint8_t *ws) {
+uint64_t kotoba_aiueos_x25519(const uint8_t *scalar, uint64_t scalar_length, const uint8_t *peer, uint64_t peer_length,
+                              uint8_t *out, uint64_t out_length, uint8_t *ws, uint64_t ws_length) {
   EVP_PKEY *priv = 0, *pub = 0;
   EVP_PKEY_CTX *ctx = 0;
   size_t outlen = 32;
   int ok = 0;
-  (void)ws;
+  (void)ws; (void)ws_length; (void)scalar_length; (void)peer_length; (void)out_length;
   priv = EVP_PKEY_new_raw_private_key(EVP_PKEY_X25519, 0, scalar, 32);
   pub = priv ? EVP_PKEY_new_raw_public_key(EVP_PKEY_X25519, 0, peer, 32) : 0;
   ctx = pub ? EVP_PKEY_CTX_new(priv, 0) : 0;
@@ -332,8 +332,8 @@ uint64_t kotoba_aiueos_x25519(const uint8_t *scalar, const uint8_t *peer,
 }
 
 uint64_t kotoba_aiueos_ecdsa_p256_sha256_verify(
-    const uint8_t *sig, const uint8_t *digest, const uint8_t *pub,
-    uint8_t *ws, uint64_t wslen) {
+    const uint8_t *sig, uint64_t sig_length, const uint8_t *digest, uint64_t digest_length, const uint8_t *pub,
+    uint64_t pub_length, uint8_t *ws, uint64_t wslen) { (void)sig_length; (void)digest_length; (void)pub_length;
   EC_KEY *key = 0;
   BIGNUM *x = 0, *y = 0, *r = 0, *s = 0;
   ECDSA_SIG *esig = 0;

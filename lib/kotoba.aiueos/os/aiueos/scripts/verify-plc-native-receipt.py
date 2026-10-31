@@ -22,7 +22,7 @@ def violations(receipt):
 
     require(receipt.get("format") == "aiueos-plc-native-receipt/v1", "format")
     require(receipt.get("profile") == "aiueos-plc-v1", "profile")
-    require(receipt.get("target") == "x86_64-aiueos-user-v1", "target")
+    require(receipt.get("target") == "x86_64-aiueos-user-plc-v1", "target")
     require(receipt.get("source_language") ==
             "iec-61131-3-structured-text-subset-v1", "source_language")
     for key in ("runtime_linux", "runtime_jvm", "runtime_gc", "dynamic_allocation"):
