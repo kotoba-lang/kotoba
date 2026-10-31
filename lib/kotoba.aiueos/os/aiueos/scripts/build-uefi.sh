@@ -1208,7 +1208,7 @@ if [ -n "$model_handoff_link" ] || [ -n "$qwen35_parity_cflags" ]; then
   case "${AIUEOS_QWEN35_KOTOBA_PARITY:-0}" in
     0|3)
       python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_qwen35_attention_object" \
-        83457f37408b8666ac3aeabad58f6c6dc0dcef4d242a6d3912851188a5a53093 \
+        49b4f39ec6520601ccd70c900c96e3a5ceb13ded358def8c618aee34f261cd17 \
         kotoba_aiueos_qwen35_attention
       ;;
   esac
