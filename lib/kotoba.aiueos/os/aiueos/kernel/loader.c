@@ -65,7 +65,7 @@ extern const uint8_t aiueos_plc_elf_start[],aiueos_plc_elf_end[];
 extern const uint8_t aiueos_plc_elf_sha256[32],aiueos_plc_receipt_sha256[32];
 extern const uint8_t aiueos_plc_signature[64],aiueos_plc_public_key[64];
 extern uint64_t kotoba_aiueos_ecdsa_p256_sha256_verify(
-  const uint8_t *,const uint8_t *,const uint8_t *,uint8_t *,uint64_t);
+  const uint8_t *,uint64_t,const uint8_t *,uint64_t,const uint8_t *,uint64_t,uint8_t *,uint64_t);
 static uint8_t plc_signature_workspace[2048];
 static uint64_t plc_data_offset;
 volatile uint64_t aiueos_plc_loader_stage;
@@ -81,10 +81,10 @@ int aiueos_load_embedded_plc_process(unsigned process,uint64_t *entry,uint64_t *
   uint8_t invalid_signature[64];
   for (unsigned i=0;i<64;i++) invalid_signature[i]=aiueos_plc_signature[i];
   invalid_signature[0]^=1;
-  if (kotoba_aiueos_ecdsa_p256_sha256_verify(invalid_signature,actual,
-      aiueos_plc_public_key,plc_signature_workspace,sizeof(plc_signature_workspace))) return 0;
-  if (!kotoba_aiueos_ecdsa_p256_sha256_verify(aiueos_plc_signature,actual,
-      aiueos_plc_public_key,plc_signature_workspace,sizeof(plc_signature_workspace))) return 0;
+  if (kotoba_aiueos_ecdsa_p256_sha256_verify(invalid_signature,64,actual,32,
+      aiueos_plc_public_key,64,plc_signature_workspace,sizeof(plc_signature_workspace))) return 0;
+  if (!kotoba_aiueos_ecdsa_p256_sha256_verify(aiueos_plc_signature,64,actual,32,
+      aiueos_plc_public_key,64,plc_signature_workspace,sizeof(plc_signature_workspace))) return 0;
   aiueos_plc_loader_stage=4;
   for (unsigned i=0;i<32;i++) nonzero|=aiueos_plc_receipt_sha256[i];
   if (!nonzero) return 0;
@@ -125,7 +125,7 @@ extern const uint8_t aiueos_zero_cap_elf_start[],aiueos_zero_cap_elf_end[];
 extern const uint8_t aiueos_zero_cap_elf_sha256[32];
 extern const uint8_t aiueos_zero_cap_signature[64],aiueos_zero_cap_public_key[64];
 extern uint64_t kotoba_aiueos_ecdsa_p256_sha256_verify(
-  const uint8_t *,const uint8_t *,const uint8_t *,uint8_t *,uint64_t);
+  const uint8_t *,uint64_t,const uint8_t *,uint64_t,const uint8_t *,uint64_t,uint8_t *,uint64_t);
 static uint8_t zero_cap_signature_workspace[2048];
 volatile uint64_t aiueos_zero_cap_loader_stage;
 int aiueos_load_embedded_zero_cap_process(unsigned process,uint64_t *entry,uint64_t **result) {
@@ -139,11 +139,11 @@ int aiueos_load_embedded_zero_cap_process(unsigned process,uint64_t *entry,uint6
   for (unsigned i=0;i<64;i++) invalid_signature[i]=aiueos_zero_cap_signature[i];
   invalid_signature[0]^=1;
   aiueos_zero_cap_loader_stage=3;
-  if (kotoba_aiueos_ecdsa_p256_sha256_verify(invalid_signature,actual,
-      aiueos_zero_cap_public_key,zero_cap_signature_workspace,
+  if (kotoba_aiueos_ecdsa_p256_sha256_verify(invalid_signature,64,actual,32,
+      aiueos_zero_cap_public_key,64,zero_cap_signature_workspace,
       sizeof(zero_cap_signature_workspace))) return 0;
-  if (!kotoba_aiueos_ecdsa_p256_sha256_verify(aiueos_zero_cap_signature,actual,
-      aiueos_zero_cap_public_key,zero_cap_signature_workspace,
+  if (!kotoba_aiueos_ecdsa_p256_sha256_verify(aiueos_zero_cap_signature,64,actual,32,
+      aiueos_zero_cap_public_key,64,zero_cap_signature_workspace,
       sizeof(zero_cap_signature_workspace))) return 0;
   aiueos_zero_cap_loader_stage=4;
   if (!load_kotoba_process(process,aiueos_zero_cap_elf_start,size,entry,result)) return 0;

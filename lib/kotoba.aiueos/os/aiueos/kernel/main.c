@@ -819,17 +819,17 @@ extern int aiueos_rtl8125_ssh_poll(void);
 extern int aiueos_random_selftest(void);
 extern int aiueos_random_bytes(uint8_t *out, uint32_t n);
 /* The ECDSA P-256 deterministic sign object (kotoba/ecdsa-p256-sign.kotoba).
-   ABI: private-32, digest-32, k-32, out-64 (r||s big-endian), workspace-2048;
-   returns 1 unless r or s is zero. */
-extern uint64_t kotoba_aiueos_ecdsa_p256_sign(const uint8_t *priv,
-                                              const uint8_t *digest,
-                                              const uint8_t *k,
-                                              uint8_t *out,
-                                              uint8_t *workspace);
+   ABI: in-96 (private-32 || digest-32 || k-32), 96, out-64 (r||s big-endian), 64, workspace-2048,
+   its length; returns 1 unless r or s is zero. ecdsa_p256_sign_block packs the block. */
+extern uint64_t kotoba_aiueos_ecdsa_p256_sign(const uint8_t *in, uint64_t in_length, uint8_t *out, uint64_t out_length, uint8_t *workspace, uint64_t workspace_length);
+static __attribute__((unused)) uint64_t ecdsa_p256_sign_block(const uint8_t *priv, const uint8_t *digest, const uint8_t *k, uint8_t *out, uint8_t *workspace, uint64_t workspace_length) { uint8_t in[96]; for (int i = 0; i < 32; i++) { in[i] = priv[i]; in[32 + i] = digest[i]; in[64 + i] = k[i]; } uint64_t r = kotoba_aiueos_ecdsa_p256_sign(in, 96, out, 64, workspace, workspace_length); for (int i = 0; i < 96; i++) ((volatile uint8_t *)in)[i] = 0; return r; }
+
+
+
 #ifdef AIUEOS_ECDSA_PUBLIC_KAT
-extern uint64_t kotoba_aiueos_ecdsa_p256_public(const uint8_t *priv,
-                                                uint8_t *out,
-                                                uint8_t *workspace);
+extern uint64_t kotoba_aiueos_ecdsa_p256_public(const uint8_t *priv, uint64_t priv_length,
+                                                uint8_t *out, uint64_t out_length,
+                                                uint8_t *workspace, uint64_t workspace_length);
 static int aiueos_ecdsa_public_kat(void) {
   static const uint8_t d[32] = {
     0xc9,0xaf,0xa9,0xd8,0x45,0xba,0x75,0x16,0x6b,0x5c,0x21,0x57,0x67,0xb1,0xd6,0x93,
@@ -841,7 +841,7 @@ static int aiueos_ecdsa_public_kat(void) {
     0xf2,0xf1,0xb2,0x0c,0x2d,0x7e,0x9f,0x51,0x77,0xa3,0xc2,0x94,0xd4,0x46,0x22,0x99};
   static uint8_t workspace[2048];
   uint8_t out[64];
-  if (!kotoba_aiueos_ecdsa_p256_public(d, out, workspace)) return 0;
+  if (!kotoba_aiueos_ecdsa_p256_public(d, 32, out, 64, workspace, sizeof(workspace))) return 0;
   for (uint32_t i = 0; i < 64; i++) if (out[i] != want[i]) return 0;
   return 1;
 }
@@ -865,7 +865,7 @@ static int aiueos_ecdsa_sign_kat(void) {
     0xf3,0xe9,0x00,0xdb,0xb9,0xaf,0xf4,0x06,0x4d,0xc4,0xab,0x2f,0x84,0x3a,0xcd,0xa8};
   static uint8_t ws[2048];
   uint8_t out[64];
-  if (!kotoba_aiueos_ecdsa_p256_sign(d, h, k, out, ws)) return 0;
+  if (!ecdsa_p256_sign_block(d, h, k, out, ws, sizeof(ws))) return 0;
   for (int i = 0; i < 64; i++) if (out[i] != want[i]) return 0;
   return 1;
 }
@@ -2910,9 +2910,9 @@ void *memcpy(void *d, const void *s, __SIZE_TYPE__ n) { volatile unsigned char *
 extern int aiueos_passkey_sector_read(uint8_t *);
 extern int aiueos_passkey_sector_write(const uint8_t *);
 extern int aiueos_random_bytes(uint8_t *, uint32_t);
-extern uint64_t kotoba_aiueos_ecdsa_p256_sign(const uint8_t *, const uint8_t *, const uint8_t *, uint8_t *, uint8_t *);
-extern uint64_t kotoba_aiueos_ecdsa_p256_public(const uint8_t *, uint8_t *, uint8_t *);
-extern uint64_t kotoba_aiueos_ecdsa_p256_sha256_verify(const uint8_t *, const uint8_t *, const uint8_t *, uint8_t *, uint64_t);
+extern uint64_t kotoba_aiueos_ecdsa_p256_sign(const uint8_t *, uint64_t, uint8_t *, uint64_t, uint8_t *, uint64_t);
+extern uint64_t kotoba_aiueos_ecdsa_p256_public(const uint8_t *, uint64_t, uint8_t *, uint64_t, uint8_t *, uint64_t);
+extern uint64_t kotoba_aiueos_ecdsa_p256_sha256_verify(const uint8_t *, uint64_t, const uint8_t *, uint64_t, const uint8_t *, uint64_t, uint8_t *, uint64_t);
 extern uint64_t kotoba_aiueos_fnv1a(const uint8_t *, uint64_t);
 
 /* in .high_bss: the low region is at its budget (qualification/low-region-budget.edn) */
@@ -2956,7 +2956,7 @@ static int passkey_load(void) {
     }
   }
   if (!passkey_scalar(passkey_d)) return 0;
-  if (!kotoba_aiueos_ecdsa_p256_public(passkey_d, passkey_q, passkey_ws)) return 0;
+  if (!kotoba_aiueos_ecdsa_p256_public(passkey_d, 32, passkey_q, 64, passkey_ws, sizeof(passkey_ws))) return 0;
   for (unsigned i = 0; i < 512; i++) sec[i] = 0;
   { static const char magic[8] = {'A','I','U','E','P','K','Y','1'};
     uint32_t sum;
@@ -2984,14 +2984,14 @@ static int passkey_ceremony(const uint8_t *d, uint8_t session[8], uint8_t sig_ou
   for (unsigned i = 0; i < 32; i++) { msg[i] = challenge[i]; msg[32 + i] = rp[i]; }
   msg[64] = 0x01U;                                   /* flags: user present (the key press) */
   if (!passkey_sha256(msg, 65, h)) return 0;
-  if (!kotoba_aiueos_ecdsa_p256_sign(d, h, k, sig, passkey_ws)) return 0;
+  if (!ecdsa_p256_sign_block(d, h, k, sig, passkey_ws, sizeof(passkey_ws))) return 0;
   *signed_ok = 1;
   for (unsigned i = 0; i < 64; i++) sig_out[i] = sig[i];
   for (unsigned i = 0; i < 32; i++) { sm[i] = challenge[i]; }
   for (unsigned i = 0; i < 64; i++) sm[32 + i] = sig[i];
   if (!passkey_sha256(sm, 96, sd)) return 0;
   for (unsigned i = 0; i < 8; i++) session[i] = sd[i];
-  return kotoba_aiueos_ecdsa_p256_sha256_verify(sig, h, passkey_q, passkey_ws, sizeof(passkey_ws)) != 0;
+  return kotoba_aiueos_ecdsa_p256_sha256_verify(sig, 64, h, 32, passkey_q, 64, passkey_ws, sizeof(passkey_ws)) != 0;
 }
 
 static void passkey_hex(const uint8_t *b, unsigned n) {
