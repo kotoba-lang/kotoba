@@ -1,0 +1,145 @@
+(ns kami.modeling-collaboration-test
+  (:require [kotoba.test :refer [deftest is]] [kami.modeling.collaboration :as collaboration]
+            [kami.modeling.document :as document]))
+
+(def uid #(document/stable-uuid "collaboration-test" %))
+(defn base-document []
+  (let [node-a (uid "a") node-b (uid "b")]
+    (-> (document/document (uid "doc") :mm 0.001)
+        (document/transact "did:plc:seed" {:command :seed}
+                           #(-> % (document/add-node node-a {:node/kind :parameter :value 1} true)
+                                (document/add-node node-b {:node/kind :parameter :value 2} true))))))
+
+(deftest offline-branches-merge-commuting-semantic-edits
+  (let [base (base-document) a (uid "a") b (uid "b")
+        left (collaboration/branch-append (collaboration/branch (collaboration/history base))
+                                          "did:plc:left" 1 :assoc [:document/nodes a :value] 10)
+        right (collaboration/branch-append (collaboration/branch (collaboration/history base))
+                                           "did:plc:right" 1 :assoc [:document/nodes b :value] 20)
+        merged (collaboration/merge-branches left right "did:plc:merge" 2)]
+    (is (= :merged (:merge/status merged)))
+    (is (= 10 (get-in merged [:merge/document :document/nodes a :value])))
+    (is (= 20 (get-in merged [:merge/document :document/nodes b :value])))
+    (is (= 2 (count (get-in merged [:merge/document :document/provenance :parents]))))))
+
+(deftest concurrent-same-parameter-produces-explainable-conflict
+  (let [base (base-document) a (uid "a")
+        left (collaboration/branch-append (collaboration/branch (collaboration/history base))
+                                          "did:plc:left" 1 :assoc [:document/nodes a :value] 10)
+        right (collaboration/branch-append (collaboration/branch (collaboration/history base))
+                                           "did:plc:right" 1 :assoc [:document/nodes a :value] 11)
+        merge (collaboration/merge-branches left right "did:plc:merge" 2)
+        resolution (collaboration/resolve-conflict merge 0 :right "did:plc:reviewer")]
+    (is (= :conflict (:merge/status merge)))
+    (is (= :concurrent-semantic-edit (get-in merge [:merge/conflicts 0 :conflict/kind])))
+    (is (= [:document/nodes a :value] (:resolution/path resolution)))
+    (is (= 11 (:resolution/value resolution)))))
+
+(deftest operation-preconditions-replay-revert-and-audit
+  (let [base (base-document) a (uid "a")
+        op (collaboration/operation (uid "op") "did:plc:editor" 1 (:document/revision base)
+                                    :assoc [:document/nodes a :value] 5 1)
+        history (-> (collaboration/history base) (collaboration/append-operation op) collaboration/checkpoint)
+        inverse (collaboration/inverse-operation base op "did:plc:editor" 2)
+        reverted (collaboration/apply-operation (:history/head history) inverse)]
+    (is (= 5 (get-in history [:history/head :document/nodes a :value])))
+    (is (= 1 (get-in reverted [:document/nodes a :value])))
+    (is (:audit/replay-valid? (collaboration/audit history)))
+    (is (= {"did:plc:editor" 1} (:audit/actors (collaboration/audit history))))
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (collaboration/apply-operation base (assoc op :operation/expected 999))))))
+
+(deftest ten-thousand-operation-snapshot-gate
+  (let [base (base-document) a (uid "a")
+        history (loop [h (collaboration/history base) i 0]
+                  (if (= i 10000) h
+                    (let [head (:history/head h) old (get-in head [:document/nodes a :value])
+                          op (collaboration/operation (uid (str "bulk/" i)) "did:plc:bulk" i
+                                                      (:document/revision head) :assoc
+                                                      [:document/nodes a :value] (inc old) old)]
+                      (recur (collaboration/append-operation h op) (inc i)))))
+        checkpointed (collaboration/checkpoint history)]
+    (is (= 10001 (get-in history [:history/head :document/nodes a :value])))
+    (is (= 10000 (count (:history/operations history))))
+    (is (contains? (:history/snapshots checkpointed) (get-in history [:history/head :document/revision])))
+    (is (:audit/replay-valid? (collaboration/audit history)))))
+
+(deftest authorization-signature-and-tamper-rejection
+  (let [base (base-document) a (uid "a") actor "did:plc:editor"
+        policy (collaboration/access-policy (:document/id base) {actor :editor "did:plc:reader" :viewer})
+        secret {actor "test-secret"}
+        signer (fn [did payload] (str (hash (str (get secret did) "|" payload))))
+        verifier (fn [did payload signature] (= signature (signer did payload)))
+        op (-> (collaboration/operation (uid "signed-op") actor 1 (:document/revision base)
+                                        :assoc [:document/nodes a :value] 9 1)
+               (collaboration/sign-operation signer))
+        accepted (collaboration/append-signed-operation (collaboration/history base) policy op verifier)]
+    (is (collaboration/authorized? policy actor :assoc))
+    (is (not (collaboration/authorized? policy "did:plc:reader" :assoc)))
+    (is (= 9 (get-in accepted [:history/head :document/nodes a :value])))
+    (is (thrown-with-msg? #?(:clj Exception :cljs js/Error) #"signature verification failed"
+                          (collaboration/append-signed-operation (collaboration/history base) policy
+                                                                 (assoc op :operation/value 10) verifier)))
+    (is (thrown-with-msg? #?(:clj Exception :cljs js/Error) #"not authorized"
+                          (collaboration/append-signed-operation (collaboration/history base) policy
+                                                                 (assoc op :operation/actor "did:plc:reader") verifier)))))
+
+(deftest offline-replicas-converge-or-expose-divergence-without-loss
+  (let [base (base-document) a-id (uid "a") b-id (uid "b")
+        op-a (collaboration/operation (uid "sync/a") "did:plc:a" 1 (:document/revision base)
+                                      :assoc [:document/nodes a-id :value] 3 1)
+        op-b (collaboration/operation (uid "sync/b") "did:plc:b" 1 (:document/revision base)
+                                      :assoc [:document/nodes b-id :value] 4 2)
+        ra (collaboration/replica (uid "replica/a")
+                                  (collaboration/append-operation (collaboration/history base) op-a))
+        rb (collaboration/replica (uid "replica/b")
+                                  (collaboration/append-operation (collaboration/history base) op-b))
+        [synced-a synced-b] (collaboration/sync-replicas ra rb)]
+    (is (= :diverged (get-in synced-a [:replica/sync :sync/status])))
+    (is (= 2 (count (get-in synced-a [:replica/sync :sync/tips])))
+        "both offline heads survive for semantic merge")
+    (is (= (:replica/known-operations synced-a) (:replica/known-operations synced-b)))
+    (is (= 2 (count (:replica/known-operations synced-a))))))
+
+(deftest presence-is-explicitly-ephemeral
+  (let [history (collaboration/history (base-document))
+        presence (collaboration/presence (uid "presence-replica") "did:plc:user" [10 20] [(uid "a")] 42)]
+    (is (:presence/ephemeral? presence))
+    (is (collaboration/canonical-history? history))
+    (is (false? (collaboration/canonical-history? (assoc history :history/presence [presence]))))))
+
+(deftest duplicate-delivery-revocation-and-permission-audit
+  (let [base (base-document) a (uid "a") actor "did:plc:editor" owner "did:plc:owner"
+        policy (collaboration/access-policy (:document/id base) {actor :editor owner :owner})
+        op (collaboration/operation (uid "dedupe") actor 1 (:document/revision base)
+                                    :assoc [:document/nodes a :value] 8 1)
+        once (collaboration/append-operation-idempotent (collaboration/history base) op)
+        twice (collaboration/append-operation-idempotent once op)
+        audit (collaboration/permission-audit policy (:history/operations twice))
+        revoked (collaboration/revoke-member policy actor owner)]
+    (is (= 1 (count (:history/operations twice))))
+    (is (= :duplicate (get-in twice [:history/last-delivery :status])))
+    (is (:permission-audit/valid? audit))
+    (is (not (collaboration/authorized? revoked actor :assoc)))
+    (is (thrown? #?(:clj Exception :cljs js/Error) (collaboration/revoke-member policy owner actor)))))
+
+(deftest out-of-order-missing-parent-recovers-after-reconnect
+  (let [base (base-document) a (uid "a")
+        parent (collaboration/operation (uid "fault/parent") "did:plc:a" 1 (:document/revision base)
+                                        :assoc [:document/nodes a :value] 2 1)
+        after-parent (collaboration/apply-operation base parent)
+        child (collaboration/operation (uid "fault/child") "did:plc:a" 2 (:document/revision after-parent)
+                                       :assoc [:document/nodes a :value] 3 2)
+        empty-replica (collaboration/replica (uid "fault/empty") (collaboration/history base))
+        child-only-history (assoc (collaboration/history base) :history/operations [child])
+        child-replica (collaboration/replica (uid "fault/child-replica") child-only-history)
+        [waiting-a waiting-b] (collaboration/sync-replicas empty-replica child-replica)
+        parent-history (collaboration/append-operation (collaboration/history base) parent)
+        repaired-a (assoc waiting-a :replica/history parent-history)
+        [recovered-a recovered-b] (collaboration/resume-sync repaired-a waiting-b)]
+    (is (= :missing-parent (get-in waiting-a [:replica/sync :sync/status])))
+    (is (= 1 (count (get-in waiting-a [:replica/sync :sync/pending]))))
+    (is (= :converged (get-in recovered-a [:replica/sync :sync/status])))
+    (is (= 2 (count (:replica/known-operations recovered-a))))
+    (is (= (:replica/known-operations recovered-a) (:replica/known-operations recovered-b)))
+    (is (= 3 (-> recovered-a :replica/sync :sync/tips vals first (get-in [:document/nodes a :value]))))))

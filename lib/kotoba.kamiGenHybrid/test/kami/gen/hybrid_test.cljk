@@ -1,0 +1,250 @@
+(ns kami.gen.hybrid-test
+  (:require [kotoba.image :as kotoba-image] [kotoba.io :as kio] [kotoba.test :refer [deftest testing is]]
+            [comfyui.node :as node]
+            [comfyui.workflow :as wf]
+            [kami.gen.hybrid :as hybrid]
+            [kami.gen.hybrid.workflow :as hwf]
+            [kami.gen.hybrid.nodes :as nodes]
+            [kami.gen.hybrid.texture :as texture]
+            [character.bin :as bin]
+            [vrm.glb :as glb]
+            [vrm.json :as json]
+            [vrm.gltf-types :as gt]))
+
+(defn- tmp-dir []
+  (let [f (kio/file (str (System/getProperty "java.io.tmpdir") "/kami-gen-hybrid-test-" (System/nanoTime)))]
+    (kio/mkdirs f)
+    (kio/absolute-path f)))
+
+;; ── real GLB skin-weight decode (regression for the coordinate-space bug
+;; fixed in `kami.gen.hybrid.vrm-export/to-world-space`) ──────────────────
+;;
+;; This decodes the ACTUAL exported GLB bytes the same way a real glTF/VRM
+;; viewer would (round-tripping through `vrm.glb/parse-glb` + `vrm.json/
+;; parse`, not inspecting the pre-serialization in-memory data structure),
+;; against this exporter's own known fixed buffer layout
+;; (`vrm_export.clj`'s `append-primitive`: JOINTS_0 = 4x u8 @ byteOffset 0,
+;; WEIGHTS_0 = 4x f32 @ byteOffset 4, sharing one bufferView with
+;; `:byteStride 20`) — not a general-purpose glTF accessor reader.
+
+(defn- decode-vertex-skin
+  "`[joint-idx0..3] [weight0..3]` for vertex `vi` of the JOINTS_0/WEIGHTS_0
+  accessor pair `joints-acc`/`weights-acc` (indices into `(:accessors
+  gltf)`), read directly out of the raw binary buffer `buf` (byte-int
+  vector)."
+  [gltf buf joints-acc weights-acc vi]
+  (let [ja (get-in gltf [:accessors joints-acc])
+        wa (get-in gltf [:accessors weights-acc])
+        bview (get-in gltf [:bufferViews (:bufferView ja)])
+        stride (:byteStride bview)
+        row (+ (:byteOffset bview 0) (* vi stride))
+        j-start (+ row (:byteOffset ja 0))
+        w-start (+ row (:byteOffset wa 0))
+        c0 (bin/cursor buf)
+        [j0 c1] (bin/read-u8 (bin/seek c0 j-start))
+        [j1 c2] (bin/read-u8 c1)
+        [j2 c3] (bin/read-u8 c2)
+        [j3 _c4] (bin/read-u8 c3)
+        [w0 d1] (bin/read-f32-le (bin/seek c0 w-start))
+        [w1 d2] (bin/read-f32-le d1)
+        [w2 d3] (bin/read-f32-le d2)
+        [w3 _d4] (bin/read-f32-le d3)]
+    {:joints [j0 j1 j2 j3] :weights [w0 w1 w2 w3]}))
+
+(defn- primitive-dominant-joint-names
+  "For glTF primitive `prim`, the highest-weight joint NAME (via
+  `joint-names`, index-aligned with the skin's `:joints`) for every one of
+  its vertices."
+  [gltf buf joint-names prim]
+  (let [{:keys [JOINTS_0 WEIGHTS_0]} (:attributes prim)
+        n (:count (get-in gltf [:accessors JOINTS_0]))]
+    (vec
+     (for [vi (range n)]
+       (let [{:keys [joints weights]} (decode-vertex-skin gltf buf JOINTS_0 WEIGHTS_0 vi)
+             top (apply max-key #(nth weights %) (range 4))]
+         (nth joint-names (nth joints top)))))))
+
+(defn- find-primitive-by-material [gltf material-name]
+  (let [mat-idx (first (keep-indexed (fn [i m] (when (= (:name m) material-name) i))
+                                      (:materials gltf)))]
+    (when mat-idx
+      (first (filter #(= (:material %) mat-idx) (get-in gltf [:meshes 0 :primitives]))))))
+
+;; ── costume-prompt->workflow is well-formed per comfyui-clj's own schema ──
+
+(deftest workflow-is-well-formed
+  (let [{:keys [workflow targets]}
+        (hwf/costume-prompt->workflow "penguin kigurumi, chibi, gray/black body, yellow beak"
+                                       {:width 64 :height 64 :seed 42})
+        reg (node/registry (nodes/pack texture/mock-execute-texture (tmp-dir)))
+        result (wf/validate reg workflow)]
+    (testing "structurally a comfyui-clj API-format workflow"
+      (is (map? workflow))
+      (is (every? string? (keys workflow)))
+      (is (every? #(contains? % :class_type) (vals workflow))))
+    (testing "targets are the 3 SaveTextureImage nodes"
+      (is (= #{"save_albedo" "save_normal" "save_roughness"} (set targets))))
+    (testing "passes comfyui-clj's own validate against the real node registry"
+      (is (:valid? result) (pr-str (:errors result))))
+    (testing "checkpoint -> CLIP encode -> sampler -> VAE decode chain shape, per channel"
+      (doseq [c ["albedo" "normal" "roughness"]]
+        (is (= "KSampler" (get-in workflow [(str "sampler_" c) :class_type])))
+        (is (= "VAEDecode" (get-in workflow [(str "decode_" c) :class_type])))
+        (is (= "SaveTextureImage" (get-in workflow [(str "save_" c) :class_type])))
+        (is (= [(str "sampler_" c) 0] (get-in workflow [(str "decode_" c) :inputs :samples])))
+        (is (= [(str "decode_" c) 0] (get-in workflow [(str "save_" c) :inputs :images])))))
+    (testing "rejects a malformed workflow (dangling link) — validate isn't a no-op"
+      (let [bad (assoc-in workflow ["decode_albedo" :inputs :samples] ["no-such-node" 0])]
+        (is (false? (:valid? (wf/validate reg bad))))))))
+
+;; ── full round-trip against the mock texture executor ────────────────
+
+(deftest generate-round-trip-with-mock-executor
+  (let [out-dir (tmp-dir)
+        result (hybrid/generate
+                {:base :race/human
+                 :costume-prompt "penguin kigurumi, chibi, gray/black body, yellow beak"
+                 :seed 42}
+                {:execute-texture texture/mock-execute-texture
+                 :output-dir out-dir
+                 :base-resolution 64})
+        {:keys [body workflow textures vrm]} result]
+
+    (testing ":body is a bare humanoid — no clothing/costume geometry"
+      (is (seq (:parts body)))
+      (is (not-any? #(= "clothing" (:name %)) (:parts body)))
+      (is (some #(= "body" (:name %)) (:parts body)))
+      (is (some #(= "head" (:name %)) (:parts body)))
+      (is (seq (:blendshape-targets body)))
+      (is (seq (get-in body [:skeleton :bones]))))
+
+    (testing ":workflow is well-formed per comfyui-clj's own schema"
+      (let [reg (node/registry (nodes/pack texture/mock-execute-texture out-dir))]
+        (is (:valid? (wf/validate reg workflow)))))
+
+    (testing ":textures are real PNG files sized to the body's UV texture slot"
+      (doseq [[k path] textures]
+        (is (kio/exists? (kio/file ^String path)) (str k " " path))
+        (let [img (kotoba-image/read-file (kio/file ^String path))]
+          (is (= 64 (kotoba-image/width img)) k)
+          (is (= 64 (kotoba-image/height img)) k)))
+      (testing "albedo isn't a degenerate single-color image (real per-pixel checkerboard)"
+        (let [img (kotoba-image/read-file (kio/file ^String (:albedo textures)))
+              colors (set (for [x (range 0 64 4) y (range 0 64 4)] (kotoba-image/get-rgb img x y)))]
+          (is (> (count colors) 1) (pr-str colors)))))
+
+    (testing "same seed+prompt -> same textures (deterministic mock, not random)"
+      (let [out-dir2 (tmp-dir)
+            result2 (hybrid/generate
+                     {:base :race/human
+                      :costume-prompt "penguin kigurumi, chibi, gray/black body, yellow beak"
+                      :seed 42}
+                     {:execute-texture texture/mock-execute-texture
+                      :output-dir out-dir2
+                      :base-resolution 64})
+            img1 (kotoba-image/read-file (kio/file ^String (get-in result [:textures :albedo])))
+            img2 (kotoba-image/read-file (kio/file ^String (get-in result2 [:textures :albedo])))]
+        (is (= (kotoba-image/get-rgb img1 5 5) (kotoba-image/get-rgb img2 5 5)))
+        (is (= (kotoba-image/get-rgb img1 40 12) (kotoba-image/get-rgb img2 40 12)))))
+
+    (testing ":vrm is a real GLB/VRM file with the textures actually attached"
+      (is (some? vrm))
+      (is (kio/exists? (kio/file ^String (:path vrm))))
+      (is (pos? (count (:glb-bytes vrm))))
+      (let [parsed (glb/parse-glb (:glb-bytes vrm))]
+        (is (some? (:json parsed)))
+        (is (some? (:bin parsed))))
+      (let [gltf (get-in vrm [:doc :gltf])
+            materials (:materials gltf)
+            skin-mat (some #(when (= "skin" (:name %)) %) materials)]
+        (is (some? skin-mat) "a :skin material exists")
+        (is (some? (get-in skin-mat [:pbrMetallicRoughness :baseColorTexture :index]))
+            "albedo attached via baseColorTexture")
+        (is (some? (:normalTexture skin-mat)) "normal map attached via normalTexture")
+        (is (some? (get-in skin-mat [:pbrMetallicRoughness :metallicRoughnessTexture :index]))
+            "roughness attached via metallicRoughnessTexture")
+        ;; textures actually resolve to embedded images with real byte data,
+        ;; not just dangling indices
+        (let [tex-idx (get-in skin-mat [:pbrMetallicRoughness :baseColorTexture :index])
+              img-idx (get-in gltf [:textures tex-idx :source])
+              image (get-in gltf [:images img-idx])
+              bv (get-in gltf [:bufferViews (:bufferView image)])]
+          (is (= "image/png" (:mimeType image)))
+          (is (pos? (:byteLength bv)))))
+      (testing "humanoid bone mapping present (hips at minimum)"
+        (is (some #(= :hips (:bone %)) (get-in vrm [:doc :humanoid :human-bones])))))))
+
+;; ── real bug fix regression: eye/face/hair skin weights bind to the head,
+;; not the shoulders ────────────────────────────────────────────────────
+;;
+;; Hand-verified real bug (not hypothetical): `character/generate-
+;; character`'s head/eye/eyebrow/hair parts come out in HEAD-LOCAL
+;; coordinates (centred near the world origin), but `vrm-export.clj` used
+;; to feed those untranslated positions straight into `character.body/
+;; skin-weights` alongside genuinely WORLD-space bone positions — two
+;; different coordinate spaces compared as one. Decoding a real exported
+;; GLB's JOINTS_0/WEIGHTS_0 showed eye_white/iris/pupil vertices ~90-100%
+;; dominantly bound to `leftShoulder`/`rightShoulder` (an eye vertex's
+;; top-4 joints didn't even include `head`), and `hair` skewing toward
+;; `chest`/`neck`/`spine`/`rightShoulder`. Fixed by `to-world-space`
+;; (translates head-local parts by the `head` bone's world position before
+;; any skin-weighting or GLB serialization happens — see that fn's
+;; docstring/namespace comment in `vrm_export.clj`). This test decodes the
+;; real exported artifact and would have caught the original bug.
+(deftest eye-and-face-skin-weights-bind-to-head-not-shoulders
+  (let [out-dir (tmp-dir)
+        {:keys [vrm]} (hybrid/generate
+                       {:base :race/human
+                        :costume-prompt "penguin kigurumi, chibi, gray/black body, yellow beak"
+                        :seed 42}
+                       {:execute-texture texture/mock-execute-texture
+                        :output-dir out-dir
+                        :base-resolution 64})
+        parsed (glb/parse-glb (:glb-bytes vrm))
+        gltf (gt/gltf-document (json/parse (glb/byte-seq->string (:json parsed))))
+        buf (vec (:bin parsed))
+        joint-node-idxs (get-in gltf [:skins 0 :joints])
+        joint-names (mapv #(get-in gltf [:nodes %1 :name]) joint-node-idxs)
+        head-family #{"head" "neck" "jaw" "leftEye" "rightEye"}
+        shoulder-chest-family #{"leftShoulder" "rightShoulder" "chest" "spine" "upperChest"
+                                 "leftUpperArm" "rightUpperArm"}]
+    (testing "eye_white/iris/pupil vertices dominantly bind to a head-family joint"
+      (doseq [mat-name ["eye_white" "iris" "pupil"]]
+        (let [prim (find-primitive-by-material gltf mat-name)]
+          (is (some? prim) (str "no primitive found for material " mat-name))
+          (let [dom (primitive-dominant-joint-names gltf buf joint-names prim)]
+            (is (seq dom) (str mat-name " has no vertices"))
+            (is (every? head-family dom)
+                (str mat-name ": expected every vertex's dominant joint in " head-family
+                     ", got " (frequencies dom)))
+            (is (not-any? shoulder-chest-family dom)
+                (str mat-name ": no vertex should dominantly bind to a shoulder/chest/upper-arm "
+                     "joint, got " (frequencies dom)))))))
+    (testing "eyebrow vertices dominantly bind to a head-family joint too"
+      (let [prim (find-primitive-by-material gltf "eyebrow")]
+        (when prim ;; some hair/brow presets can be empty; only assert when present
+          (let [dom (primitive-dominant-joint-names gltf buf joint-names prim)]
+            (is (every? head-family dom) (str "eyebrow dominant joints: " (frequencies dom)))))))
+    (testing "hair is head-region-dominant overall, not chest/shoulder-dominant"
+      (let [prim (find-primitive-by-material gltf "hair")]
+        (is (some? prim) "no primitive found for material hair")
+        (let [dom (primitive-dominant-joint-names gltf buf joint-names prim)
+              n (count dom)
+              head-frac (/ (count (filter head-family dom)) (double n))]
+          (is (pos? n) "hair has no vertices")
+          (is (> head-frac 0.5)
+              (str "expected a head-family majority (>50%) for hair's dominant joints, got "
+                   (frequencies dom))))))))
+
+;; ── real-execute-texture fails loudly without a live endpoint ─────────
+
+(deftest real-execute-texture-without-endpoint-throws
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"no live ComfyUI/diffusion endpoint"
+                         (texture/real-execute-texture {} {:prompt "x" :width 8 :height 8
+                                                            :seed 0 :channel :albedo}))))
+
+;; ── unsupported base fails loudly rather than silently guessing ──────
+
+(deftest unsupported-base-throws
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unsupported :base"
+                         (hybrid/bare-body :race/elf))))

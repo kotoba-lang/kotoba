@@ -1,0 +1,147 @@
+(ns kami.modeling-cae-test
+  (:require [kotoba.test :refer [deftest is]] [kotoba.io :as io] [kami.modeling.cae :as cae]
+            [kami.modeling.document :as document] [num.cpu :as num-cpu]))
+
+(def uid #(document/stable-uuid "cae-test" %))
+(def steel (cae/isotropic-material (uid "steel") {:name "Steel" :youngs-modulus 200.0e9
+                                                   :poisson-ratio 0.3 :density 7850}))
+(def adapter {:adapter/id "kotoba.reference.bar" :adapter/version "1.0.0"})
+
+(defn bar-study [elements]
+  (let [mesh (cae/bar-mesh 2.0 0.01 elements)]
+    (cae/study (uid (str "study/" elements)) "model-r1" :linear-static mesh steel
+               [(cae/fixed-displacement 0 0.0)] [(cae/nodal-force elements 10000.0)] adapter)))
+
+(deftest linear-bar-matches-analytic-solution-and-balances
+  (let [study (bar-study 8) result (cae/solve-linear-static-bar study)
+        expected (cae/analytic-bar-displacement 10000.0 2.0 200.0e9 0.01)]
+    (is (< (Math/abs (- expected (last (:result/displacement result)))) 1.0e-12))
+    (is (< (Math/abs (get-in result [:result/balance :residual])) 1.0e-8))
+    (is (< (Math/abs (+ 10000.0 (get-in result [:result/reactions 0]))) 1.0e-8))
+    (is (< (Math/abs (- (* 2 (:result/strain-energy result)) (:result/external-work result))) 1.0e-12))
+    (is (= :verified (:result/qualification result)))
+    (is (cae/result-current? study result))))
+
+(deftest mesh-refinement-convergence-and-stale-result
+  (let [studies (mapv bar-study [1 2 4 8])
+        results (mapv cae/solve-linear-static-bar studies)
+        report (cae/convergence-report results)
+        changed (assoc (last studies) :study/source-revision "model-r2")]
+    (is (:convergence/converged? report))
+    (is (every? #(< (Math/abs (- 1.0e-5 %)) 1.0e-12) (:convergence/tip-values report)))
+    (is (false? (cae/result-current? changed (last results))))))
+
+(deftest singular-and-invalid-studies-fail-closed
+  (let [mesh (cae/bar-mesh 1 1 1)
+        unrestrained (cae/study (uid "free") "r1" :linear-static mesh steel
+                                [(cae/fixed-displacement 0 0)] [(cae/nodal-force 1 1)] adapter)
+        broken (assoc unrestrained :study/boundary-conditions [])]
+    (is (thrown? #?(:clj Exception :cljs js/Error) (cae/solve-linear-static-bar broken)))
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (cae/isotropic-material (uid "bad") {:name "Bad" :youngs-modulus -1 :poisson-ratio 0.3})))))
+
+(deftest two-dimensional-truss-parity-stress-and-reaction-balance
+  (let [mesh (cae/truss-mesh-2d [[0 0] [2 0]] [{:element/a 0 :element/b 1 :element/area 0.01}])
+        study (cae/study (uid "truss-2d") "model-r1" :linear-static mesh steel
+                         [(cae/fixed-displacement-2d 0 :x 0) (cae/fixed-displacement-2d 0 :y 0)
+                          (cae/fixed-displacement-2d 1 :y 0)]
+                         [(cae/nodal-force-2d 1 [10000 0])] adapter)
+        result (cae/solve-linear-static-truss-2d study)
+        expected (cae/analytic-bar-displacement 10000 2 200.0e9 0.01)]
+    (is (< (Math/abs (- expected (get-in result [:result/displacement-2d 1 0]))) 1.0e-12))
+    (is (< (Math/abs (- 1.0e6 (get-in result [:result/elements 0 :element/stress]))) 1.0e-6))
+    (is (every? true? (map == [10000 0.0] (get-in result [:result/balance :applied]))))
+    (is (every? true? (map == [-10000.0 0.0] (get-in result [:result/balance :reaction]))))
+    (is (= :verified (:result/qualification result)))))
+
+(deftest three-dimensional-tetrahedron-affine-patch-test
+  (let [nodes [[0 0 0] [1 0 0] [0 1 0] [0 0 1]]
+        mesh (cae/tetra-mesh-3d nodes [{:element/nodes [0 1 2 3]}])
+        alpha 1.0e-4 nu 0.3
+        prescribed (vec (mapcat (fn [[node [x y z]]]
+                                  [(cae/fixed-displacement-3d node :x (* alpha x))
+                                   (cae/fixed-displacement-3d node :y (* (- nu) alpha y))
+                                   (cae/fixed-displacement-3d node :z (* (- nu) alpha z))])
+                                (map-indexed vector nodes)))
+        study (cae/study (uid "tetra-patch") "model-r1" :linear-static mesh steel prescribed
+                         [(cae/nodal-force-3d 0 [0 0 0])] adapter)
+        result (cae/solve-linear-static-tetra-3d study)
+        stress (get-in result [:result/elements 0 :element/stress])]
+    (is (< (Math/abs (- (* 200.0e9 alpha) (first stress))) 1.0))
+    (is (every? #(< (Math/abs %) 1.0) (subvec stress 1 6)))
+    (is (< (Math/abs (- (* 200.0e9 alpha) (get-in result [:result/elements 0 :element/von-mises]))) 1.0))
+    (is (every? #(< (Math/abs %) 1.0e-6) (map + (get-in result [:result/balance :applied])
+                                                  (get-in result [:result/balance :reaction]))))
+    (is (= (/ 1.0 6.0) (get-in result [:result/elements 0 :element/volume])))
+    (is (= :verified (:result/qualification result)))))
+
+(deftest steady-thermal-bar-matches-analytic-temperature-and-heat-balance
+  (let [thermal-steel (cae/isotropic-material (uid "thermal-steel")
+                                               {:name "Thermal steel" :youngs-modulus 200.0e9
+                                                :poisson-ratio 0.3 :thermal-conductivity 50})
+        mesh (cae/bar-mesh 2.0 0.01 8)
+        study (cae/study (uid "thermal") "model-r1" :steady-thermal mesh thermal-steel
+                         [(cae/fixed-temperature 0 300)] [(cae/nodal-heat 8 100)] adapter)
+        result (cae/solve-steady-thermal-bar study)
+        expected (cae/analytic-bar-temperature 300 100 2 50 0.01 2)]
+    (is (< (Math/abs (- expected (last (:result/temperature result)))) 1.0e-9))
+    (is (< (Math/abs (get-in result [:result/balance :residual])) 1.0e-9))
+    (is (< (Math/abs (+ 100 (get-in result [:result/heat-reactions 0]))) 1.0e-9))
+    (is (every? #(< (Math/abs (+ 10000 %)) 1.0e-9) (:result/heat-flux result)))
+    (is (= :verified (:result/qualification result)))
+    (is (cae/result-current? study result))))
+
+(deftest modal-bar-first-frequency-converges-to-analytic-solution
+  (let [expected (cae/analytic-fixed-free-bar-frequency 2.0 200.0e9 7850)
+        results (mapv (fn [elements]
+                        (let [study (cae/study (uid (str "modal/" elements)) "model-r1" :modal
+                                               (cae/bar-mesh 2.0 0.01 elements) steel
+                                               [(cae/fixed-displacement 0 0)] [] adapter)]
+                          (cae/solve-modal-bar study 40))) [2 4 8 16])
+        frequencies (mapv #(get-in % [:result/modes 0 :mode/frequency-hz]) results)
+        errors (mapv #(Math/abs (- % expected)) frequencies)]
+    (is (every? true? (map > errors (rest errors))))
+    (is (< (/ (last errors) expected) 0.001))
+    (is (= 17 (count (get-in (last results) [:result/modes 0 :mode/shape]))))
+    (is (zero? (get-in (last results) [:result/modes 0 :mode/shape 0])))
+    (is (= :verified (:result/qualification (last results))))))
+
+(deftest independent-adapter-comparison-and-qualified-manifest
+  (let [study (bar-study 8)
+        candidate (cae/solve-linear-static-bar study)
+        reference (cae/import-calculix-frd-displacements
+                   (slurp (io/file "test/fixtures/calculix/uniaxial-bar-8.frd"))
+                   {:adapter/id "calculix.ccx" :adapter/version "2.16"
+                    :adapter/image-digest "sha256:b18b56fec00ad965d85e091454f26195d62115ee9a05feb4c130fa15406b6f7a"})
+        comparison (cae/compare-result-fields candidate reference :result/displacement 1.0e-12 1.0e-8)
+        manifest (cae/qualification-manifest
+                  study candidate reference [comparison]
+                  {:evidence/source "CalculiX ccx 2.16 executed FRD result"
+                   :evidence/license "GPL-2.0-or-later" :evidence/case "uniaxial-bar-8"
+                   :evidence/input-sha256 "31bfbcab4124be710eacbdc6db813449e5e14bf46f0528b3bed07e1a9c2e54e8"
+                   :evidence/result-sha256 "e032d250c876fdbac42e64e2b2238eed448d127cebf960cb76622a83085d4465"})]
+    (is (:comparison/pass? comparison))
+    (is (= 9 (count (:comparison/samples comparison))))
+    (is (= 1.0e-5 (last (:result/displacement reference))))
+    (is (= :qualified (:qualification/status manifest)))
+    (is (string? (:qualification/revision manifest)))
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (cae/compare-result-fields candidate candidate :result/displacement 1.0e-12 1.0e-8)))
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (cae/qualification-manifest study candidate reference
+                                             [(assoc comparison :comparison/pass? false)]
+                                             {:evidence/source "x" :evidence/license "x"})))))
+
+(deftest injected-num-pcg-matches-reference-cae-and-retains-provenance
+  (let [study (bar-study 64)
+        reference (cae/solve-linear-static-bar study)
+        accelerated (cae/solve-linear-static-bar-accelerated
+                     study (num-cpu/cpu-backend) {:tolerance 1.0e-10 :max-iterations 200})]
+    (is (= :converged (get-in accelerated [:result/numerics :solver/status])))
+    (is (= :cpu (get-in accelerated [:result/numerics :solver/backend])))
+    (is (< (get-in accelerated [:result/numerics :solver/relative-residual]) 1.0e-10))
+    (is (every? true? (map #(< (Math/abs (- %1 %2)) 1.0e-10)
+                           (:result/displacement reference) (:result/displacement accelerated))))
+    (is (< (Math/abs (get-in accelerated [:result/balance :residual])) 1.0e-7))
+    (is (= (:result/adapter reference) (:result/adapter accelerated)))
+    (is (cae/result-current? study accelerated))))

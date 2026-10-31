@@ -1,0 +1,172 @@
+(ns kami.gen.hybrid.texture
+  "Texture-generation capability implementations, injected into the
+  `comfyui-clj` workflow's `KSampler` node (`kami.gen.hybrid.nodes/pack`) —
+  the DI seam ADR-2607051130 calls for (\"the diffusion compute is injected
+  as a host capability\").
+
+  Two implementations:
+
+  - `mock-execute-texture` — returns real, per-pixel RGBA image data (a
+    checkerboard for :albedo/:roughness, a flat tangent-space normal for
+    :normal) sized to the caller's `:width`/`:height`. This is what tests
+    and this repo's own demonstration run use. It is NOT a diffusion model:
+    the pixels are a deterministic function of `:prompt`/`:seed`/`:channel`,
+    not a learned image. `kami.gen.hybrid.nodes/->SaveTextureImage` writes
+    the returned pixels to a real PNG file on disk (real bytes, real file,
+    just not a diffusion sample).
+  - `real-execute-texture` — a thin wrapper shaped for a live SDXL/FLUX-
+    backed ComfyUI HTTP endpoint. It is structurally complete (submits a
+    prompt, polls history, downloads the resulting image) but there is no
+    live endpoint in this dev environment to call: `network-isekai/backend`
+    (this org's own generation backend) lists image/SDXL generation as
+    \"skeleton only, TODO\" in its README status table as of 2026-07-05.
+    Calling it without `:endpoint` configured throws immediately and
+    loudly rather than silently falling back to a mock."
+  (:import [java.net.http HttpClient HttpRequest HttpRequest$BodyPublishers
+            HttpResponse$BodyHandlers]
+           [java.net URI])
+  (:require [kotoba.bytes :as kbytes]))
+
+;; ── deterministic pseudo-random helpers (no java.util.Random dependency on
+;; call order — a pure hash of (prompt, seed, x, y) so output is reproducible
+;; across runs/JVMs given the same inputs, which is what "mock" should mean
+;; for a test fixture) ──────────────────────────────────────────────────
+
+(defn- string-hash
+  "Deterministic 32-bit FNV-1a hash of `s` — stable across JVM versions,
+  unlike `.hashCode` (whose String algorithm IS specified/stable actually,
+  but FNV keeps this independent of any host string-hash guarantee, and
+  the same primitive is reused below to derive colors/patterns)."
+  [s]
+  (let [bytes (kbytes/utf8-bytes (str s))]
+    (loop [h (unchecked-int -2128831035) i 0]
+      (if (>= i (alength bytes))
+        h
+        (recur (unchecked-multiply (unchecked-int (bit-xor h (aget bytes i))) (unchecked-int 16777619))
+               (inc i))))))
+
+(defn- seeded-color
+  "Deterministic RGB triple in [0,255] derived from `prompt`+`seed`+`salt`."
+  [prompt seed salt]
+  (let [h (string-hash (str prompt "|" seed "|" salt))]
+    [(bit-and (bit-shift-right h 16) 0xFF)
+     (bit-and (bit-shift-right h 8) 0xFF)
+     (bit-and h 0xFF)]))
+
+(defn- clampi [x] (max 0 (min 255 (int x))))
+
+;; ── RGBA8 pixel buffers (real per-pixel data, row-major, 4 bytes/px) ──────
+
+(defn checker-rgba
+  "A `width`x`height` RGBA8 checkerboard (`cell`-px squares) alternating
+  `color-a`/`color-b` (each `[r g b]` 0-255). Real per-pixel data — not a
+  1x1 solid stretched to size."
+  [{:keys [width height cell color-a color-b]
+    :or {cell 32}}]
+  (let [[ar ag ab] color-a
+        [br bg bb] color-b
+        buf (byte-array (* width height 4))]
+    (dotimes [y height]
+      (dotimes [x width]
+        (let [on? (even? (+ (quot x cell) (quot y cell)))
+              [r g b] (if on? [ar ag ab] [br bg bb])
+              i (* 4 (+ x (* y width)))]
+          (aset-byte buf i (unchecked-byte (clampi r)))
+          (aset-byte buf (+ i 1) (unchecked-byte (clampi g)))
+          (aset-byte buf (+ i 2) (unchecked-byte (clampi b)))
+          (aset-byte buf (+ i 3) (unchecked-byte 255)))))
+    buf))
+
+(defn solid-rgba
+  "A `width`x`height` RGBA8 buffer of one flat `[r g b]` color."
+  [{:keys [width height color]}]
+  (let [[r g b] color
+        buf (byte-array (* width height 4))]
+    (dotimes [y height]
+      (dotimes [x width]
+        (let [i (* 4 (+ x (* y width)))]
+          (aset-byte buf i (unchecked-byte (clampi r)))
+          (aset-byte buf (+ i 1) (unchecked-byte (clampi g)))
+          (aset-byte buf (+ i 2) (unchecked-byte (clampi b)))
+          (aset-byte buf (+ i 3) (unchecked-byte 255)))))
+    buf))
+
+;; ── mock capability ────────────────────────────────────────────────────
+
+(defn mock-execute-texture
+  "Injected `KSampler` capability (see `kami.gen.hybrid.nodes/pack`).
+  `params`: `{:prompt :negative-prompt :width :height :seed :channel
+  :steps :cfg :sampler-name :scheduler :denoise}`. Returns
+  `{:width :height :format :rgba8 :pixels <byte-array>}` — real pixels,
+  deterministic per `(prompt, seed, channel)`, NOT a diffusion sample.
+
+  - `:albedo`    — checkerboard of two prompt/seed-derived colors (stands
+                   in for costume coloring/markings).
+  - `:normal`    — flat tangent-space-up normal `(128,128,255)` — the
+                   \"no bump detail\" neutral value; a documented
+                   simplification (there is no learned geometry to derive
+                   real per-pixel normal detail from in the mock).
+  - `:roughness` — checkerboard of two prompt/seed-derived gray levels
+                   (still real per-pixel variation, not a single flat
+                   value, so tests can tell channels apart by content)."
+  [{:keys [prompt seed width height channel] :or {seed 0}}]
+  (let [pixels
+        (case channel
+          :albedo (checker-rgba {:width width :height height :cell (max 8 (quot (min width height) 8))
+                                  :color-a (seeded-color prompt seed :albedo-a)
+                                  :color-b (seeded-color prompt seed :albedo-b)})
+          :normal (solid-rgba {:width width :height height :color [128 128 255]})
+          :roughness (let [g1 (clampi (+ 96 (mod (string-hash (str prompt seed :rough-a)) 96)))
+                           g2 (clampi (+ 96 (mod (string-hash (str prompt seed :rough-b)) 96)))]
+                       (checker-rgba {:width width :height height :cell (max 8 (quot (min width height) 8))
+                                      :color-a [g1 g1 g1] :color-b [g2 g2 g2]}))
+          (throw (ex-info "mock-execute-texture: unknown channel" {:channel channel})))]
+    {:width width :height height :format :rgba8 :pixels pixels}))
+
+;; ── real (structurally complete, not-live) capability ─────────────────
+
+(defn real-execute-texture
+  "Thin client for a live ComfyUI HTTP endpoint (`:endpoint` in `opts`,
+  e.g. `\"https://<host>/comfyui\"`) — POSTs the resolved workflow-node
+  params as a ComfyUI `/prompt` request, polls `/history/<id>` until done,
+  and would return `{:width :height :format :rgba8 :pixels <byte-array>}`
+  from the resulting `/view` image download.
+
+  There is no live endpoint in this dev environment: `network-isekai`'s
+  own `backend/README.md` status table lists image/SDXL generation as
+  \"skeleton only, TODO\" as of 2026-07-05 (this repo is a real consumer
+  that motivates finishing that wiring, per ADR-2607051130's Context, not
+  a place that pretends to have already used it). Calling this without a
+  configured `:endpoint` throws immediately — it never silently falls
+  back to the mock."
+  [{:keys [endpoint] :as opts} params]
+  (when-not endpoint
+    (throw (ex-info
+            (str "real-execute-texture: no live ComfyUI/diffusion endpoint configured. "
+                 "network-isekai/backend/README.md's own status table lists image/SDXL "
+                 "generation as \"skeleton only, TODO\" — there is nothing to call yet. "
+                 "Pass {:execute-texture (partial real-execute-texture {:endpoint \"https://...\"})} "
+                 "once a real backend exists; until then use "
+                 "kami.gen.hybrid.texture/mock-execute-texture.")
+            {:opts opts :params params})))
+  ;; Structurally-real client, unreachable without :endpoint (never invoked
+  ;; in this repo's tests or demonstration run):
+  (let [client (HttpClient/newHttpClient)
+        submit-body (pr-str {:prompt params})
+        submit-req (-> (HttpRequest/newBuilder (URI/create (str endpoint "/prompt")))
+                       (.header "Content-Type" "application/edn")
+                       (.POST (HttpRequest$BodyPublishers/ofString submit-body))
+                       (.build))
+        submit-resp (.send client submit-req (HttpResponse$BodyHandlers/ofString))]
+    (when (>= (.statusCode submit-resp) 300)
+      (throw (ex-info "real-execute-texture: ComfyUI endpoint rejected prompt submission"
+                       {:status (.statusCode submit-resp) :body (.body submit-resp)})))
+    ;; A real implementation would parse `prompt_id` from `submit-resp`,
+    ;; poll GET `<endpoint>/history/<prompt_id>` until the run completes,
+    ;; then GET `<endpoint>/view?filename=...` for the PNG bytes and decode
+    ;; them into the same `{:width :height :format :rgba8 :pixels}` shape
+    ;; `mock-execute-texture` returns. Left unimplemented beyond the
+    ;; request round-trip above: there is no live endpoint to develop
+    ;; and verify this polling/decoding logic against yet (see docstring).
+    (throw (ex-info "real-execute-texture: response handling not implemented (no live backend to develop against yet)"
+                     {:endpoint endpoint}))))

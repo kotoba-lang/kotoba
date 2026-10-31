@@ -1,0 +1,224 @@
+(ns kami.gen.procedural-test
+  "End-to-end coverage of `compose-costumed-character`: asserts on the real
+  SHAPE of the returned map (part/vertex/bone counts, a real parseable VRM
+  round-trip via `vrm.parse`/`vrm.humanoid` — the same functions
+  `kotoba-lang/vrm`'s own test suite uses to validate a compose+export
+  round-trip), not just \"doesn't throw\"."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kami.gen.procedural :as proc]
+            [vrm.parse :as vrm-parse]
+            [vrm.humanoid :as vrm-humanoid]
+            [vrm.vrm-types :as vt]
+            [vrm.glb :as glb]
+            [vrm.json :as json]))
+
+;; ---------------------------------------------------------------------------
+;; Low-level accessor byte decode, independent of `kami.gen.procedural`'s own
+;; accessor-writing code (`add-accessor`) — reading JOINTS_0/WEIGHTS_0 back
+;; out of the raw glTF bufferViews/accessors + binary chunk, the same
+;; technique used to hand-verify the original "rigid mesh has no skin" bug.
+;; ---------------------------------------------------------------------------
+
+(defn- accessor->bytes [gltf bin acc-idx]
+  (let [acc (nth (:accessors gltf) acc-idx)
+        bv (nth (:bufferViews gltf) (:bufferView acc))
+        offset (+ (:byteOffset bv 0) (:byteOffset acc 0))]
+    (subvec (vec bin) offset (+ offset (:byteLength bv)))))
+
+(defn- read-u16-le [bs off] (bit-or (nth bs off) (bit-shift-left (nth bs (inc off)) 8)))
+
+#?(:clj
+   (defn- read-f32-le [bs off]
+     (let [bb (java.nio.ByteBuffer/wrap (byte-array (map unchecked-byte (subvec bs off (+ off 4)))))]
+       (.order bb java.nio.ByteOrder/LITTLE_ENDIAN)
+       (.getFloat bb 0))))
+
+(defn- read-joints-vec4-u16 [gltf bin acc-idx n]
+  (let [bs (accessor->bytes gltf bin acc-idx)]
+    (mapv (fn [i] (mapv #(read-u16-le bs (+ (* i 8) (* % 2))) (range 4))) (range n))))
+
+#?(:clj
+   (defn- read-weights-vec4-f32 [gltf bin acc-idx n]
+     (let [bs (accessor->bytes gltf bin acc-idx)]
+       (mapv (fn [i] (mapv #(read-f32-le bs (+ (* i 16) (* % 4))) (range 4))) (range n)))))
+
+(deftest compose-costumed-character-shape-test
+  (testing "top-level shape"
+    (let [result (proc/compose-costumed-character {:base :race/human :costume :penguin-kigurumi :seed 42})]
+      (is (= #{:body :costume :vrm :render/profile} (set (keys result))))
+      (is (= #{:parts :skeleton :blendshape-targets} (set (keys (:body result)))))
+      (is (seq (:parts (:body result))))
+      (is (seq (:bones (:skeleton (:body result)))))))
+
+  (testing "body: chibi proportions actually changed the generated skeleton height"
+    (let [result (proc/compose-costumed-character {:seed 1 :proportions {:limb-scale 0.6}})
+          bones (:bones (:skeleton (:body result)))
+          hips (first (filter #(= (:name %) "hips") bones))
+          left-lower-leg (first (filter #(= (:name %) "leftLowerLeg") bones))]
+      ;; character.body/generate-humanoid-skeleton scales thigh/shin length
+      ;; by `height` (here driven by :limb-scale) -- a chibi 0.6 limb-scale
+      ;; must produce a visibly shorter thigh bone offset than the
+      ;; unscaled 1.0 default.
+      (is (some? hips))
+      (is (some? left-lower-leg))
+      (is (< (Math/abs (nth (:local-position left-lower-leg) 1)) 0.11))))
+
+  (testing "body: \"body\" part carries real skin weights on every vertex"
+    (let [result (proc/compose-costumed-character {:seed 42})
+          body-part (some #(when (= (:name %) "body") %) (:parts (:body result)))]
+      (is (some? body-part))
+      (is (seq (:vertices body-part)))
+      (is (every? :joint-indices (:vertices body-part)))
+      (is (every? #(= 4 (count (:joint-indices %))) (:vertices body-part)))
+      (is (every? #(< 0.99 (reduce + (:joint-weights %)) ) (:vertices body-part)))))
+
+  (testing "costume: hood/beak mesh is real, non-empty, split into exactly hood+beak materials"
+    (let [result (proc/compose-costumed-character {:seed 42})
+          hood-parts (:hood (:costume result))
+          materials (set (map :material hood-parts))]
+      (is (= #{:hood :beak} materials))
+      (doseq [part hood-parts]
+        (is (pos? (count (:vertices part))))
+        (is (pos? (count (:indices part))))
+        (is (zero? (mod (count (:indices part)) 3)))
+        (is (every? #(= 3 (count (:position %))) (:vertices part))))))
+
+  (testing "costume: body-suit is a padded, still-skinned copy of the body mesh"
+    (let [result (proc/compose-costumed-character {:seed 42})
+          body-part (some #(when (= (:name %) "body") %) (:parts (:body result)))
+          suit-part (:body-suit (:costume result))]
+      (is (= (count (:vertices body-part)) (count (:vertices suit-part))))
+      (is (every? :joint-indices (:vertices suit-part)))
+      ;; every vertex actually moved outward (padding > 0, along a nonzero normal)
+      (is (every? (fn [[a b]] (not= (:position a) (:position b)))
+                  (map vector (:vertices body-part) (:vertices suit-part))))))
+
+  (testing "vrm: real GLB magic + real VRM 1.0 round-trip"
+    (let [result (proc/compose-costumed-character {:seed 7})
+          glb-bytes (:glb-bytes (:vrm result))]
+      (is (pos? (count glb-bytes)))
+      ;; GLB magic "glTF" little-endian header, per glTF 2.0 binary container spec.
+      (is (= [0x67 0x6C 0x54 0x46] (vec (take 4 glb-bytes))))
+      (let [parsed (vrm-parse/parse-vrm glb-bytes)]
+        (is (= :v1-0 (:version parsed)))
+        (is (seq (:human-bones (:humanoid parsed))))
+        ;; every VRM 1.0 required-ish core bone (hips/spine/chest/neck/head)
+        ;; must resolve to a real node.
+        (doseq [required [:hips :spine :chest :neck :head
+                          :left-upper-arm :right-upper-arm
+                          :left-upper-leg :right-upper-leg]]
+          (is (some #(= (:bone %) required) (:human-bones (:humanoid parsed)))
+              (str "missing required humanoid bone " required)))
+        (testing "vrm.humanoid/to-kami-skeleton succeeds against our own exported skin"
+          (let [skel (vrm-humanoid/to-kami-skeleton parsed)]
+            (is (= (count (:bones (:skeleton (:body result)))) (count (:bones skel))))))
+        (testing "meta name reflects base/costume/seed"
+          (is (re-find #"kami-gen-procedural/race/human/penguin-kigurumi/7"
+                       (:name (:meta parsed))))))))
+
+  (testing "render/profile: kami-isekai-assets-style flat fallback"
+    (let [result (proc/compose-costumed-character {:seed 42})
+          profile (:render/profile result)]
+      (is (= #{:color :w :h :geo :emissive} (set (keys profile))))
+      (is (= 3 (count (:color profile))))
+      (is (pos? (:w profile)))
+      (is (pos? (:h profile)))))
+
+  (testing "determinism: same seed -> identical palette; different seed -> different palette"
+    (let [a (proc/compose-costumed-character {:seed 5})
+          b (proc/compose-costumed-character {:seed 5})
+          c (proc/compose-costumed-character {:seed 6})]
+      (is (= (get-in a [:costume :params :palette]) (get-in b [:costume :params :palette])))
+      (is (not= (get-in a [:costume :params :palette]) (get-in c [:costume :params :palette])))))
+
+  (testing "every tunable is overridable via plain EDN, not hidden"
+    (let [small-head (proc/compose-costumed-character {:seed 1 :proportions {:head-scale 1.0 :limb-scale 0.6}})
+          big-head (proc/compose-costumed-character {:seed 1 :proportions {:head-scale 3.0 :limb-scale 0.6}})
+          head-extent (fn [result]
+                        (let [head (some #(when (= (:name %) "head") %) (:parts (:body result)))]
+                          (apply max (map (fn [{[x _ _] :position}] (Math/abs x)) (:vertices head)))))
+          result (proc/compose-costumed-character
+                  {:seed 1
+                   :kigurumi {:hood-radius 0.2 :beak-length 0.15
+                              :palette {:hood-color [0.0 0.0 0.0] :beak-color [1.0 0.5 0.0]}}})]
+      ;; :head-scale is a real post-hoc vertex scale, not a no-op knob.
+      (is (< (head-extent small-head) (head-extent big-head)))
+      (is (= 0.2 (get-in result [:costume :params :hood-radius])))
+      (is (= 0.15 (get-in result [:costume :params :beak-length])))))
+
+  (testing "unsupported base/costume throws rather than silently falling back"
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (proc/compose-costumed-character {:base :race/elf})))
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (proc/compose-costumed-character {:costume :unknown-costume})))))
+
+#?(:clj
+   (deftest rigid-mesh-skin-binding-regression-test
+     ;; Regression test for the "kami-gen-procedural-rigid" mesh node being
+     ;; exported with NO skin at all (a static mesh parented under the scene
+     ;; root): every head-family part (head shell/eyes/eyebrows/hair/kigurumi
+     ;; hood+beak) must bind fully to the `head` joint, and `clothing` must
+     ;; bind fully to the `chest` joint -- never an unbound/zero-weight
+     ;; vertex. Reads the accessors back out of the raw exported glTF
+     ;; (bufferViews + binary chunk), not through `kami.gen.procedural`'s own
+     ;; accessor-writing code, so this would have caught the original bug
+     ;; (which the higher-level `vrm.parse`/`vrm.humanoid` round-trip test
+     ;; above does NOT catch, since an unskinned primitive is still a
+     ;; perfectly valid, parseable glTF primitive).
+     (let [result (proc/compose-costumed-character {:seed 42})
+           bones (:bones (:skeleton (:body result)))
+           bone-idx (into {} (map-indexed (fn [i {:keys [name]}] [name i])) bones)
+           head-idx (bone-idx "head")
+           chest-idx (bone-idx "chest")
+           glb-bytes (:glb-bytes (:vrm result))
+           {:keys [json bin]} (glb/parse-glb glb-bytes)
+           gltf (json/parse (glb/byte-seq->string json))
+           material-name (fn [idx] (:name (nth (:materials gltf) idx)))
+           ;; expected single-bone joint for each material name this pipeline emits.
+           expected-joint {"skin" head-idx "eye_white" head-idx "iris" head-idx "pupil" head-idx
+                            "eyebrow" head-idx "hair" head-idx
+                            "kigurumi-hood" head-idx "kigurumi-beak" head-idx
+                            "clothing" chest-idx}
+           rigid-mesh (first (:meshes gltf))]     ;; mesh 0 = "kami-gen-procedural-rigid"
+       (is (some? head-idx))
+       (is (some? chest-idx))
+       (is (pos? (count (:primitives rigid-mesh))))
+       (doseq [prim (:primitives rigid-mesh)]
+         (let [mat (material-name (:material prim))
+               n (:count (nth (:accessors gltf) (:POSITION (:attributes prim))))
+               expected (get expected-joint mat)]
+           (testing (str "rigid primitive material=" mat " (" n " vertices)")
+             ;; the original bug: no JOINTS_0/WEIGHTS_0 attributes at all.
+             (is (contains? (:attributes prim) :JOINTS_0)
+                 "rigid mesh primitive must carry JOINTS_0 (was completely unskinned before the fix)")
+             (is (contains? (:attributes prim) :WEIGHTS_0))
+             (is (some? expected) (str "no expected joint mapping for material " mat))
+             #?(:clj
+                (when expected
+                  (let [joints (read-joints-vec4-u16 gltf bin (:JOINTS_0 (:attributes prim)) n)
+                        weights (read-weights-vec4-f32 gltf bin (:WEIGHTS_0 (:attributes prim)) n)]
+                    (is (pos? n))
+                    ;; every vertex binds fully (weight ~1.0) to exactly the
+                    ;; expected single joint -- never left at [0 0 0 0]/unbound.
+                    (is (every? #(= expected (first %)) joints)
+                        (str "expected every vertex bound to joint " expected
+                             ", got distinct joint0 values " (vec (distinct (map first joints)))))
+                    (is (every? #(> (first %) 0.99) weights)
+                        "expected every vertex fully weighted ([1,0,0,0]) to its single joint")))))))
+       ;; both mesh nodes reference the one shared skin -- posing that skin
+       ;; now moves the whole figure together, not just the torso.
+       (let [nodes (:nodes gltf)
+             rigid-node (some #(when (= (:name %) "kami-gen-procedural-rigid") %) nodes)
+             body-node (some #(when (= (:name %) "kami-gen-procedural-body") %) nodes)]
+         (is (= 0 (:skin rigid-node)))
+         (is (= 0 (:skin body-node)))))))
+
+(deftest publish-to-asset-hub-test
+  (let [result (proc/compose-costumed-character {:seed 42})
+        entry (proc/publish-to-asset-hub result)]
+    (is (= :model3d (:asset/kind entry)))
+    (is (= :vrm (:asset/format entry)))
+    (is (re-find #"^bafy-sha256-[0-9a-f]{64}$" (get-in entry [:asset/payload :cid :hash])))
+    (is (pos? (get-in entry [:asset/payload :bytes])))
+    (is (true? (get-in entry [:asset/preview :webgpu])))
+    (is (contains? (set (:asset/deps entry)) "kotoba-lang/kami-gen-procedural"))))

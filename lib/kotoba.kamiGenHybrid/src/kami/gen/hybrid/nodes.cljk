@@ -1,0 +1,138 @@
+(ns kami.gen.hybrid.nodes
+  "The `comfyui-clj` node pack this repo registers: a standard txt2img-shaped
+  chain (`CheckpointLoaderSimple` -> `CLIPTextEncode` -> `KSampler` ->
+  `VAEDecode` -> `SaveTextureImage`), API-format compatible with real
+  ComfyUI's own node types of the same names (per `comfyui-clj`'s own design
+  goal). Every node here is a plain map per `comfyui.node`'s contract; only
+  `KSampler` (the actual diffusion-compute step) and `SaveTextureImage` (real
+  file IO) close over injected host capabilities — every other node is pure
+  data plumbing, same engine/inference split `comfyui.std/host-fn-node`
+  documents."
+  (:require [kotoba.image :as kotoba-image] [comfyui.std :as std])
+  (:import
+           [java.io File]))
+
+;; ── pure plumbing nodes ────────────────────────────────────────────────
+
+(def checkpoint-loader-simple
+  "Stands in for ComfyUI's `CheckpointLoaderSimple`: loads a named
+  checkpoint, returning MODEL/CLIP/VAE handles. No real model file exists
+  in this dev environment (see `kami.gen.hybrid.texture`'s docstring) — the
+  \"handle\" is just the checkpoint name string, threaded through the graph
+  so downstream nodes have something real (if inert) to link from, matching
+  real ComfyUI's graph SHAPE without pretending to load real weights."
+  {:type "CheckpointLoaderSimple" :category "loaders"
+   :inputs {:ckpt_name {:type "STRING" :default "sdxl-base-placeholder"}}
+   :outputs [{:name "MODEL" :type "MODEL"} {:name "CLIP" :type "CLIP"} {:name "VAE" :type "VAE"}]
+   :fn (fn [{:keys [ckpt_name]}] [ckpt_name ckpt_name ckpt_name])})
+
+(def clip-text-encode
+  "Stands in for `CLIPTextEncode`: text -> CONDITIONING. No real CLIP model
+  runs here (v0); the \"conditioning\" is the resolved text plus the CLIP
+  handle it closed over, which is exactly what `KSampler` needs from it in
+  this graph and is a real (if not learned-embedding) conditioning value."
+  {:type "CLIPTextEncode" :category "conditioning"
+   :inputs {:text {:type "STRING" :default ""} :clip {:type "CLIP"}}
+   :outputs [{:name "CONDITIONING" :type "CONDITIONING"}]
+   :fn (fn [{:keys [text clip]}] [{:text text :clip clip}])})
+
+(def empty-latent-image
+  "Stands in for `EmptyLatentImage`: allocates the target width/height for
+  the sampler."
+  {:type "EmptyLatentImage" :category "latent"
+   :inputs {:width {:type "INT"} :height {:type "INT"} :batch_size {:type "INT" :default 1}}
+   :outputs [{:name "LATENT" :type "LATENT"}]
+   :fn (fn [{:keys [width height batch_size]}] [{:width width :height height :batch_size batch_size}])})
+
+(defn vae-decode-type
+  "Stands in for `VAEDecode`: LATENT -> IMAGE. In a real backend this is a
+  real tensor decode (latent space -> pixel space); in this repo's mock
+  chain `KSampler`'s injected capability already returns pixel-space RGBA
+  (see `kami.gen.hybrid.texture/mock-execute-texture`), so this node is an
+  honest pass-through here, kept in the graph for shape-fidelity with real
+  ComfyUI (a real backend would make it do real work; a fake decode step
+  would be dishonest, so it stays a documented no-op instead of pretending
+  to decode something that was never encoded)."
+  []
+  {:type "VAEDecode" :category "latent"
+   :inputs {:samples {:type "LATENT"} :vae {:type "VAE"}}
+   :outputs [{:name "IMAGE" :type "IMAGE"}]
+   :fn (fn [{:keys [samples]}] [samples])})
+
+;; ── heavy-compute node (injected) ──────────────────────────────────────
+
+(defn ksampler-type
+  "Stands in for `KSampler`, the one real diffusion-compute step in the
+  graph. `execute-texture-fn` is the injected host capability (`kami.gen.
+  hybrid.texture/mock-execute-texture` or `real-execute-texture`, same DI
+  shape `comfyui.std/host-fn-node` documents)."
+  [execute-texture-fn]
+  (std/host-fn-node
+   {:type "KSampler" :category "sampling"
+    :inputs {:model {:type "MODEL"} :positive {:type "CONDITIONING"} :negative {:type "CONDITIONING"}
+             :latent_image {:type "LATENT"} :seed {:type "INT"} :steps {:type "INT" :default 20}
+             :cfg {:type "FLOAT" :default 7.0} :sampler_name {:type "STRING" :default "euler"}
+             :scheduler {:type "STRING" :default "normal"} :denoise {:type "FLOAT" :default 1.0}
+             :channel {:type "STRING"}}
+    :outputs [{:name "LATENT" :type "LATENT"}]}
+   (fn [{:keys [positive negative latent_image seed steps cfg sampler_name scheduler denoise channel]}]
+     [(execute-texture-fn {:prompt (:text positive)
+                            :negative-prompt (:text negative)
+                            :width (:width latent_image)
+                            :height (:height latent_image)
+                            :seed seed :steps steps :cfg cfg
+                            :sampler-name sampler_name :scheduler scheduler :denoise denoise
+                            :channel (keyword channel)})])))
+
+;; ── output node: real file IO (not "heavy compute", so not injected) ───
+
+(defn- rgba-bytes->buffered-image
+  [width height ^bytes rgba]
+  (let [img (kotoba-image/create width height :argb)]
+    (dotimes [y height]
+      (dotimes [x width]
+        (let [i (* 4 (+ x (* y width)))
+              r (bit-and (aget rgba i) 0xFF)
+              g (bit-and (aget rgba (+ i 1)) 0xFF)
+              b (bit-and (aget rgba (+ i 2)) 0xFF)
+              a (bit-and (aget rgba (+ i 3)) 0xFF)
+              argb (unchecked-int (bit-or (bit-shift-left a 24) (bit-shift-left r 16) (bit-shift-left g 8) b))]
+          (kotoba-image/set-rgb! img x y argb))))
+    img))
+
+(defn write-png!
+  "Writes `{:width :height :pixels <RGBA8 byte-array>}` to a real PNG file
+  at `path`. Returns `path`."
+  [path {:keys [width height pixels]}]
+  (let [f (File. ^String path)]
+    (when-let [parent (.getParentFile f)] (.mkdirs parent))
+    (kotoba-image/write-png-file! (rgba-bytes->buffered-image width height pixels) f))
+  path)
+
+(defn save-texture-image-type
+  "Stands in for `SaveImage`, specialized to write one named texture
+  channel to `output-dir` as a real PNG file. `:output-node? true` marks it
+  as a workflow output per `comfyui.node`'s OUTPUT_NODE convention."
+  [output-dir]
+  {:type "SaveTextureImage" :category "output" :output-node? true
+   :inputs {:images {:type "IMAGE"}
+            :filename_prefix {:type "STRING" :default "kami_gen_hybrid"}
+            :channel {:type "STRING"}}
+   :outputs [{:name "path" :type "STRING"}]
+   :fn (fn [{:keys [images filename_prefix channel]}]
+         (let [path (str output-dir File/separator filename_prefix "_" channel ".png")]
+           [(write-png! path images)]))})
+
+(defn pack
+  "The full node pack for one `kami.gen.hybrid` run: `execute-texture-fn`
+  is the injected diffusion capability, `output-dir` is where generated
+  PNGs are written. Combined with `comfyui.std/all` (primitives this repo
+  doesn't otherwise need but registering is harmless/consistent) via
+  `comfyui.node/registry`."
+  [execute-texture-fn output-dir]
+  [checkpoint-loader-simple
+   clip-text-encode
+   empty-latent-image
+   (ksampler-type execute-texture-fn)
+   (vae-decode-type)
+   (save-texture-image-type output-dir)])
