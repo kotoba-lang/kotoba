@@ -1,0 +1,337 @@
+(ns douga.ffmpeg-test
+  (:require [kotoba.lang.coll :as kcoll] [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.text :as str]
+            [douga.ffmpeg :as ffmpeg]))
+
+(deftest parse-resolution-handles-aliases-and-explicit
+  (is (= [1920 1080] (ffmpeg/parse-resolution "1080p")))
+  (is (= [1280 720] (ffmpeg/parse-resolution "720p")))
+  (is (= [640 360] (ffmpeg/parse-resolution "640x360")))
+  (is (= [1280 720] (ffmpeg/parse-resolution "garbage")))
+  (is (= [1 1] (ffmpeg/parse-resolution nil [1 1]))))
+
+(def timeline
+  {:resolution "1080p"
+   :fps 24
+   :scenes [{:index 0} {:index 1}]
+   :assets [{:kind "scene" :blobKey "frame-0" :meta {:sceneIndex 0}}
+            {:kind "scene" :blobKey "frame-1" :meta {:sceneIndex 1}}
+            {:kind "bgm" :blobKey "bgm-key"}]
+   :lines [{:sceneIndex 0 :lineIndex 1 :voiceBlobKey "v-0-1" :text "second" :speaker "Right"}
+           {:sceneIndex 0 :lineIndex 0 :voiceBlobKey "v-0-0" :text "first" :speaker "Left"}
+           {:sceneIndex 1 :lineIndex 0 :voiceBlobKey "v-1-0" :text "next scene"}]})
+
+(deftest build-render-plan-orders-scenes-and-voices
+  (let [plan (ffmpeg/build-render-plan timeline)]
+    (is (= 2 (count (:segments plan))))
+    (is (= [0 1] (map :scene-index (:segments plan))))
+    (let [seg0 (first (:segments plan))]
+      (is (= "frame-0" (:frame-blob-key seg0)))
+      (is (= ["v-0-0" "v-0-1"] (:voice-blob-keys seg0)))
+      (is (= ["first" "second"] (:texts seg0)))
+      (is (= ["left" "right"] (:speakers seg0))))
+    (is (= "bgm-key" (:bgm-blob-key plan)))
+    (is (= 1920 (:width plan)))
+    (is (= 1080 (:height plan)))
+    (is (= 24 (:fps plan)))))
+
+(deftest build-render-plan-skips-scenes-without-frames
+  (let [plan (ffmpeg/build-render-plan (update timeline :assets
+                                               (fn [xs] (remove #(= "frame-1" (:blobKey %)) xs))))]
+    (is (= [0] (map :scene-index (:segments plan))))))
+
+(deftest build-render-plan-prefers-v2-frames-when-face-layers
+  (let [v2-asset {:kind "scene" :blobKey "frame-0-v2"
+                  :meta {:sceneIndex 0 :layout "kamishibai-cyber-v2-stage"}}
+        tl (-> timeline
+               (update :assets conj v2-asset)
+               (assoc :faceLayers true))
+        plan (ffmpeg/build-render-plan tl)]
+    (is (= "frame-0-v2" (:frame-blob-key (first (:segments plan)))))))
+
+(deftest command-builders-shape
+  (testing "concat-audio-cmd"
+    (let [cmd (ffmpeg/concat-audio-cmd ["a.wav" "b.wav"] "out.wav")]
+      (is (= "ffmpeg" (first cmd)))
+      (is (some #(str/includes? (str %) "concat=n=2") cmd))))
+  (testing "scene-segment-cmd carries resolution and fps"
+    (let [cmd (ffmpeg/scene-segment-cmd "f.png" "a.wav" "out.mp4"
+                                        {:width 1280 :height 720 :fps 30})]
+      (is (some #(str/includes? (str %) "scale=1280:720") cmd))
+      (is (some #(= "30" %) cmd))))
+  (testing "video-segment-cmd trims moving media and supplies stable audio"
+    (let [cmd (ffmpeg/video-segment-cmd "source.mov" "out.mp4"
+                                        {:source-start-sec 1.5 :duration-sec 2
+                                         :width 1920 :height 1080 :fps 30})]
+      (is (= ["ffmpeg" "-y" "-ss" "1.5" "-i" "source.mov"] (subvec cmd 0 6)))
+      (is (some #(= "anullsrc=r=48000:cl=stereo" %) cmd))
+      (is (some #(str/includes? (str %) "scale=1920:1080") cmd))
+      (is (= "out.mp4" (last cmd)))))
+  (testing "concat-list-text escapes single quotes"
+    (is (= "file 'a.mp4'\n" (ffmpeg/concat-list-text ["a.mp4"])))
+    (is (str/includes? (ffmpeg/concat-list-text ["it's.mp4"]) "'\\''"))))
+
+(deftest xfade-transition-cmd-shape
+  (testing "builds a real xfade filter_complex crossfade, offset/duration in seconds"
+    (let [cmd (ffmpeg/xfade-transition-cmd "a.png" "b.png" "out.mp4"
+                                           {:width 320 :height 240 :fps 24
+                                            :from-duration-frames 96
+                                            :to-duration-frames 96
+                                            :transition-duration-frames 48})
+          filter-str (str (second (drop-while #(not= "-filter_complex" %) cmd)))]
+      (is (= "ffmpeg" (first cmd)))
+      (is (= ["a.png" "b.png"] (->> cmd (partition 2 1) (filter #(= "-i" (first %))) (map second))))
+      (is (str/includes? filter-str "xfade=transition=fade"))
+      ;; duration/offset formatting is clj "2.0" vs cljs "2" (native JS
+      ;; number->string) -- assert on the parsed numeric value, not the
+      ;; literal string, so this test passes identically on both platforms.
+      (let [[_ dur] (re-find #"duration=([0-9.]+):offset=" filter-str)
+            [_ off] (re-find #"offset=([0-9.]+)\[v\]" filter-str)]
+        (is (= 2.0 #?(:clj (Double/parseDouble dur) :cljs (js/parseFloat dur))))
+        (is (= 2.0 #?(:clj (Double/parseDouble off) :cljs (js/parseFloat off)))))
+      (is (some #(= "[v]" %) cmd))
+      (is (some #(str/includes? (str %) "scale=320:240") cmd))))
+  (testing "throws when the transition duration exceeds clip A's own duration"
+    (is (thrown? js/Error
+                 (ffmpeg/xfade-transition-cmd "a.png" "b.png" "out.mp4"
+                                              {:width 320 :height 240 :fps 24
+                                               :from-duration-frames 24
+                                               :to-duration-frames 96
+                                               :transition-duration-frames 48}))))
+  (testing ":transition-type :wipe selects xfade's wipeleft mode instead of fade"
+    (let [cmd (ffmpeg/xfade-transition-cmd "a.png" "b.png" "out.mp4"
+                                           {:width 320 :height 240 :fps 24
+                                            :from-duration-frames 96
+                                            :to-duration-frames 96
+                                            :transition-duration-frames 48
+                                            :transition-type :wipe})
+          filter-str (str (second (drop-while #(not= "-filter_complex" %) cmd)))]
+      (is (str/includes? filter-str "xfade=transition=wipeleft"))
+      (is (not (str/includes? filter-str "transition=fade")))))
+  (testing "throws for an unknown :transition-type instead of silently falling back to fade"
+    (is (thrown? js/Error
+                 (ffmpeg/xfade-transition-cmd "a.png" "b.png" "out.mp4"
+                                              {:width 320 :height 240 :fps 24
+                                               :from-duration-frames 96
+                                               :to-duration-frames 96
+                                               :transition-duration-frames 48
+                                               :transition-type :slide})))))
+
+(deftest xfade-chain-cmd-shape
+  (testing "3 clips / 2 chained transitions: builds ONE filter_complex with 2 xfade stages,
+           the second stage consuming the first stage's output label (not a raw source)"
+    (let [segments [{:frame-blob-key "a.png" :duration-frames 96}   ;; 4.0s @ 24fps
+                    {:frame-blob-key "b.png" :duration-frames 96}   ;; 4.0s @ 24fps
+                    {:frame-blob-key "c.png" :duration-frames 96}]  ;; 4.0s @ 24fps
+          transitions [{:duration-frames 48 :transition-type :dissolve}   ;; 2.0s
+                       {:duration-frames 48 :transition-type :wipe}]      ;; 2.0s
+          cmd (ffmpeg/xfade-chain-cmd segments transitions "out.mp4"
+                                      {:width 320 :height 240 :fps 24})
+          filter-str (str (second (drop-while #(not= "-filter_complex" %) cmd)))]
+      (is (= "ffmpeg" (first cmd)))
+      (is (= ["a.png" "b.png" "c.png"]
+             (->> cmd (partition 2 1) (filter #(= "-i" (first %))) (map second))))
+      (is (str/includes? filter-str "xfade=transition=fade"))
+      (is (str/includes? filter-str "xfade=transition=wipeleft"))
+      ;; stage 2 must consume stage 1's OUTPUT label ([vx1]) as an input --
+      ;; not [v1] (which would silently discard the accumulated overlap).
+      (is (re-find #"\[vx1\]\[v2\]xfade=" filter-str))
+      (is (not (re-find #"\[v1\]\[v2\]xfade=" filter-str)))
+      ;; stage 1 offset = D_0 - t1 = 4.0 - 2.0 = 2.0
+      ;; stage 2 offset = D_1 - t2 = (4.0+4.0-2.0) - 2.0 = 4.0  (NOT 4.0-2.0=2.0,
+      ;; the wrong answer a naive per-clip-duration loop would produce)
+      (let [[_ off1] (re-find #"xfade=transition=fade:duration=([0-9.]+):offset=([0-9.]+)\[vx1\]" filter-str)
+            offs (re-seq #"offset=([0-9.]+)" filter-str)]
+        (is (= 2.0 #?(:clj (Double/parseDouble off1) :cljs (js/parseFloat off1))))
+        (is (= [2.0 4.0] (mapv (fn [[_ o]] #?(:clj (Double/parseDouble o) :cljs (js/parseFloat o))) offs))))
+      (is (some #(= "[v]" %) cmd))
+      (is (some #(str/includes? (str %) "scale=320:240") cmd))))
+  (testing "final output duration honors BOTH overlaps: sum(clip durations) - sum(transition durations)"
+    ;; not asserted directly on the argv (ffmpeg computes that at render
+    ;; time) -- this documents the arithmetic the offsets above encode:
+    ;; 4.0+4.0+4.0 - 2.0-2.0 = 8.0s, matching kami.eizo.timeline's own
+    ;; chained-overlap timeline-duration arithmetic.
+    (is (= 8.0 (- (+ 4.0 4.0 4.0) 2.0 2.0))))
+  (testing "degenerates correctly to a single stage for exactly 2 clips / 1 transition"
+    (let [cmd (ffmpeg/xfade-chain-cmd
+               [{:frame-blob-key "a.png" :duration-frames 96}
+                {:frame-blob-key "b.png" :duration-frames 96}]
+               [{:duration-frames 48 :transition-type :dissolve}]
+               "out.mp4" {:width 320 :height 240 :fps 24})
+          filter-str (str (second (drop-while #(not= "-filter_complex" %) cmd)))]
+      (is (re-find #"\[v0\]\[v1\]xfade=transition=fade:duration=2.0:offset=2.0\[v\]" filter-str))))
+  (testing "throws when segment/transition counts don't line up (need N-1 transitions for N segments)"
+    (is (thrown? js/Error
+                 (ffmpeg/xfade-chain-cmd
+                  [{:frame-blob-key "a.png" :duration-frames 96}
+                   {:frame-blob-key "b.png" :duration-frames 96}
+                   {:frame-blob-key "c.png" :duration-frames 96}]
+                  [{:duration-frames 48 :transition-type :dissolve}]
+                  "out.mp4" {:width 320 :height 240 :fps 24}))))
+  (testing "throws when a later transition's duration exceeds the chain's accumulated duration so far"
+    (is (thrown? js/Error
+                 (ffmpeg/xfade-chain-cmd
+                  [{:frame-blob-key "a.png" :duration-frames 24}    ;; 1.0s
+                   {:frame-blob-key "b.png" :duration-frames 24}    ;; 1.0s
+                   {:frame-blob-key "c.png" :duration-frames 96}]   ;; 4.0s
+                  [{:duration-frames 12 :transition-type :dissolve} ;; 0.5s, D_1 = 1.5s
+                   {:duration-frames 48 :transition-type :wipe}]    ;; 2.0s > D_1 = 1.5s -- should throw
+                  "out.mp4" {:width 320 :height 240 :fps 24}))))
+  (testing "throws for an unknown transition-type in any stage before building any argv"
+    (is (thrown? js/Error
+                 (ffmpeg/xfade-chain-cmd
+                  [{:frame-blob-key "a.png" :duration-frames 96}
+                   {:frame-blob-key "b.png" :duration-frames 96}
+                   {:frame-blob-key "c.png" :duration-frames 96}]
+                  [{:duration-frames 48 :transition-type :dissolve}
+                   {:duration-frames 48 :transition-type :slide}]
+                  "out.mp4" {:width 320 :height 240 :fps 24})))))
+
+(deftest sample-timestamps-spreads-evenly-inside-the-clip
+  (is (= [2.0] (ffmpeg/sample-timestamps 4.0 1)))
+  (let [ts (ffmpeg/sample-timestamps 10.0 3)]
+    (is (= 3 (count ts)))
+    (is (apply < ts))
+    (is (every? #(< 0 % 10.0) ts)))
+  (testing "clamps a zero/garbled duration and a non-positive n instead of dividing by zero"
+    (is (= 1 (count (ffmpeg/sample-timestamps 0 0))))
+    (is (every? pos? (ffmpeg/sample-timestamps nil 2)))))
+
+(deftest ffprobe-duration-cmd-shape
+  (let [cmd (ffmpeg/ffprobe-duration-cmd "clip.mp4")]
+    (is (= "ffprobe" (first cmd)))
+    (is (= "clip.mp4" (last cmd)))
+    (is (some #(str/includes? (str %) "duration") cmd))))
+
+(deftest extract-frame-cmd-shape
+  (let [cmd (ffmpeg/extract-frame-cmd "clip.mp4" 1.5 "frame.png")]
+    (is (= "ffmpeg" (first cmd)))
+    (is (= "frame.png" (last cmd)))
+    (is (some #{"1.5"} cmd))
+    (is (some #{"-frames:v"} cmd))))
+
+(deftest audio-overlay-mix-cmd-shape
+  (testing "no overlays -> plain remux, not an error"
+    (let [cmd (ffmpeg/audio-overlay-mix-cmd "v.mp4" [] "out.mp4")]
+      (is (= ["ffmpeg" "-y" "-i" "v.mp4" "-c" "copy" "out.mp4"] cmd))))
+  (testing "blank/absent files are dropped before deciding there is work to do"
+    (is (= ["ffmpeg" "-y" "-i" "v.mp4" "-c" "copy" "out.mp4"]
+           (ffmpeg/audio-overlay-mix-cmd "v.mp4" [{:file ""} {:file nil}] "out.mp4"))))
+  (testing "a looping bed gets -stream_loop before its own -i, and only it"
+    (let [cmd (ffmpeg/audio-overlay-mix-cmd
+               "v.mp4" [{:file "bgm.wav" :loop? true :gain 0.18}
+                        {:file "sfx.wav" :at-sec 7.5}]
+               "out.mp4")
+          idx (fn [x] (kcoll/index-of cmd x))]
+      (is (= 1 (count (filter #{"-stream_loop"} cmd))))
+      (is (< (idx "-stream_loop") (idx "bgm.wav")))
+      (is (< (idx "bgm.wav") (idx "sfx.wav")) "input order follows overlay order")))
+  (testing "cue time becomes adelay milliseconds and gain becomes volume"
+    (let [cmd (ffmpeg/audio-overlay-mix-cmd
+               "v.mp4" [{:file "bgm.wav" :loop? true :gain 0.18}
+                        {:file "sfx.wav" :at-sec 7.5}]
+               "out.mp4")
+          fc (str (second (drop-while #(not= "-filter_complex" %) cmd)))]
+      (is (str/includes? fc "[1:a]adelay=0:all=1,volume=0.18[o1]"))
+      (is (str/includes? fc "[2:a]adelay=7500:all=1,volume=1.0[o2]"))
+      (is (str/includes? fc "[0:a][o1][o2]amix=inputs=3"))
+      (is (str/includes? fc "duration=first") "the video stays length-authoritative")
+      (is (str/includes? fc "normalize=0") "amix must not duck the narration")))
+  (testing "video is stream-copied; only audio is re-encoded"
+    (let [cmd (ffmpeg/audio-overlay-mix-cmd "v.mp4" [{:file "b.wav"}] "out.mp4")]
+      (is (some #{"-c:v"} cmd))
+      (is (= "copy" (nth cmd (inc (kcoll/index-of cmd "-c:v")))))
+      (is (= "aac" (nth cmd (inc (kcoll/index-of cmd "-c:a"))))))))
+
+(deftest video-segment-cmd-audio-and-padding
+  (testing "no audio-path -> silent stream, as before"
+    (let [cmd (ffmpeg/video-segment-cmd "clip.mp4" "seg.mp4"
+                                        {:duration-sec 7 :width 720 :height 1280 :fps 30})]
+      (is (some #(str/includes? (str %) "anullsrc") cmd))))
+  (testing "audio-path becomes input 1 and is mapped as the segment's audio"
+    (let [cmd (ffmpeg/video-segment-cmd "clip.mp4" "seg.mp4"
+                                        {:duration-sec 7 :width 720 :height 1280 :fps 30
+                                         :audio-path "voice.wav"})]
+      (is (not-any? #(str/includes? (str %) "anullsrc") cmd))
+      (is (some #{"voice.wav"} cmd))
+      (is (some #{"1:a:0"} cmd))))
+  (testing "a short generated clip holds its last frame instead of going black"
+    (let [cmd (ffmpeg/video-segment-cmd "clip.mp4" "seg.mp4"
+                                        {:duration-sec 7 :width 720 :height 1280 :fps 30})
+          vf (str (second (drop-while #(not= "-vf" %) cmd)))]
+      (is (str/includes? vf "tpad=stop_mode=clone:stop_duration=7"))
+      (is (some #{"-t"} cmd)))))
+
+;; ---- narrated-concat, added 2026-08-11 -----------------------------------
+;; The expected argv is the one shiropico's assemble_localized_shorts.py
+;; emitted and shipped ep02-05 with. Keeping it verbatim is the point: the
+;; masters already on YouTube were rendered by that exact graph.
+
+(def ^:private shiropico-argv
+  ["ffmpeg" "-y" "-hide_banner" "-loglevel" "error"
+   "-i" "renders/ep02-reboot.mp4" "-i" "renders/ep02-root-cut.mp4" "-i" "masters/ep02-en.aiff"
+   "-filter_complex"
+   (str "[0:v]setpts=PTS-STARTPTS[v0];[1:v]setpts=PTS-STARTPTS[v1];"
+        "[v0][0:a][v1][1:a]concat=n=2:v=1:a=1[video][native];"
+        "[native]volume=0.32[nativeq];[2:a]adelay=350|350,volume=1.35[voice];"
+        "[nativeq][voice]amix=inputs=2:duration=first:dropout_transition=1[audio]")
+   "-map" "[video]" "-map" "[audio]" "-c:v" "libx264" "-preset" "medium"
+   "-crf" "18" "-pix_fmt" "yuv420p" "-c:a" "aac" "-b:a" "192k"
+   "-movflags" "+faststart" "-t" "20.2" "masters/shiropico-ep02-en.mp4"])
+
+(deftest narrated-concat-reproduces-the-shipped-graph
+  (is (= shiropico-argv
+         (ffmpeg/narrated-concat-cmd
+          ["renders/ep02-reboot.mp4" "renders/ep02-root-cut.mp4"]
+          "masters/ep02-en.aiff" "masters/shiropico-ep02-en.mp4"
+          {:seconds 20.2}))))
+
+(deftest narrated-concat-scales-past-two-clips
+  (let [cmd (ffmpeg/narrated-concat-cmd ["a.mp4" "b.mp4" "c.mp4"] "v.aiff" "o.mp4" {})
+        graph (nth cmd (inc (.indexOf cmd "-filter_complex")))]
+    (is (re-find #"concat=n=3:v=1:a=1" graph))
+    (is (re-find #"\[v0\]\[0:a\]\[v1\]\[1:a\]\[v2\]\[2:a\]concat" graph))
+    (testing "the narration is the input after the clips"
+      (is (re-find #"\[3:a\]adelay=" graph)))
+    (testing "no -t when no cut was asked for"
+      (is (neg? (.indexOf cmd "-t"))))))
+
+(deftest narrated-concat-refuses-zero-clips
+  (is (thrown? :default
+               (ffmpeg/narrated-concat-cmd [] "v.aiff" "o.mp4" {}))))
+
+(deftest say-cmd-carries-voice-and-rate
+  (is (= ["say" "-v" "Lekha" "-r" "175" "-o" "out.aiff" "नमस्ते"]
+         (ffmpeg/say-cmd {:voice "Lekha" :rate "175" :out "out.aiff" :text "नमस्ते"}))))
+
+
+(deftest burn-subtitles-cmd-escapes-the-path-and-copies-audio
+  (let [cmd (ffmpeg/burn-subtitles-cmd "cut.mp4" "/tmp/ep:1,a'b.srt" "out.mp4")]
+    (testing "argv shape: one -vf, video re-encoded, audio copied, output last"
+      (is (= "ffmpeg" (first cmd)))
+      (is (= "out.mp4" (last cmd)))
+      (is (= ["-c:a" "copy"] (subvec (vec cmd) (- (count cmd) 3) (dec (count cmd)))))
+      (is (some #{"libx264"} cmd)))
+    (testing "the filter path is escaped for both parsers"
+      (let [vf (nth cmd (inc (kcoll/index-of (vec cmd) "-vf")))]
+        (is (str/starts-with? vf "subtitles=/tmp/ep\\:1\\,a\\'b.srt:force_style='"))
+        (is (str/includes? vf "Alignment=2"))
+        (is (str/includes? vf "MarginV=36") "script units: x4.44 on a 1280-high frame")
+        (is (str/includes? vf "FontSize=14"))))))
+
+(deftest burn-subtitles-cmd-style-is-overridable-and-optional
+  (testing "an override replaces one key and keeps the rest"
+    (let [vf (second (drop-while #(not= % "-vf")
+                                 (ffmpeg/burn-subtitles-cmd "c.mp4" "s.srt" "o.mp4" {:font-size 40})))]
+      (is (str/includes? vf "FontSize=40"))
+      (is (str/includes? vf "FontName=Hiragino Sans"))))
+  (testing "nil-ing every key yields a bare subtitles= filter"
+    (let [vf (second (drop-while #(not= % "-vf")
+                                 (ffmpeg/burn-subtitles-cmd
+                                  "c.mp4" "s.srt" "o.mp4"
+                                  (zipmap (keys ffmpeg/default-subtitle-style) (repeat nil)))))]
+      (is (= "subtitles=s.srt" vf)))))
+
+(deftest subtitles-filter-path-is-identity-on-plain-paths
+  (is (= "/Users/x/target/ep-1.srt" (ffmpeg/subtitles-filter-path "/Users/x/target/ep-1.srt")))
+  (is (= "a\\\\b" (ffmpeg/subtitles-filter-path "a\\b"))))
