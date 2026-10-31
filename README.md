@@ -157,9 +157,11 @@ describes a compatibility account alias; it never replaces the principal.
 IPNS namespace and artifact signing. It is not the default human login ID.
 
 An empty policy denies every host effect, including `:host/http`. Hosted billed
-deploy of those grants is not live. Wasm Component is the primary portable
-profile. The compiler CLI defaults to the host native target; browser/Worker
-builds select their Wasm target explicitly. Bounded native AOT
+deploy of those grants is not live. `kotoba compile` defaults to the host
+native target (`<isa>-<os>`, e.g. `aarch64-macos`; an unknown host is refused
+by name, never defaulted to Wasm). Web and Wasm, including Wasm Component, are
+explicitly selected targets: Wasm is one target, not the foundation
+(KOTOBA-174). Bounded native AOT
 (x86-64/AArch64) still requires admitted capabilities; an ambient OS process
 is not the application execution model.
 
@@ -1099,9 +1101,10 @@ above (contract delta vs the current `lang/cli.edn` pin).
   `wasm-exec`. Kit `:wasm-aot` stays pending. The launcher and kbb v1 bootstrap
   host are still JVM; `bin/kbb` exists but is not yet a self-hosted native
   executable.
-  `kotoba -e '(+ 1 2)'` is compile-and-run
-  sugar (wraps the expression as an exported `main`, compiles Kotoba → core
-  Wasm, runs it) — not a runtime `eval`. Amu additionally emits sealed KEXE
+  `kotoba -e '(+ 1 2)'` is sugar for `run` (wraps the expression as the
+  body of `main` in a throwaway module and runs it through the ordinary
+  `run` path: safe gate, policy and the step-bounded interpreter
+  `kotoba.runtime/run`) — not a runtime `eval`, and it does not emit Wasm. Amu additionally emits sealed KEXE
   artifacts for x86-64 and AArch64 and executes admitted, signed artifacts
   through `tender-native`; see [Native compilation and execution](#native-compilation-and-execution).
 - **Safety model — "safe Kotoba."** Three formal soundness goals: **T1
@@ -1136,7 +1139,22 @@ above (contract delta vs the current `lang/cli.edn` pin).
 ### Current memory-safety position
 
 Current Kotoba is **strongly host-contained but not yet a Rust-equivalent
-ownership/borrow proof**. The safe Wasm profile combines a checked subset,
+ownership/borrow proof**. The position differs by target.
+
+**Native (the default target).** The native backend lowers only the qualified
+checked-KIR slice and refuses everything else. The verifier treats embedded
+KIR as hostile, regenerates the machine code and compares the sealed bytes.
+Each KEXE declares bounded limits (`:memory-bytes`, `:stack-bytes`, `:fuel`)
+and fixed arena capacities (pairs, vectors, string pool) in its context ABI,
+and runs in a supervised loader process whose capability callbacks come only
+from the policy allow bitmap. What native does **not** yet have: there is no
+Wasm-style linear-memory sandbox, so guest code shares the loader process's
+address space and containment rests on the verifier, the bounded arenas and
+process isolation; the raw-memory profiles and the provider evidence below
+were measured on the Wasm profile and are not qualified on native; and there
+is no ownership/borrow proof on either target.
+
+**Wasm (one explicitly selected profile).** The safe Wasm profile combines a checked subset,
 Wasm linear-memory bounds and a policy-derived maximum, bounds-respecting
 accessors, deny-by-default raw dereference and a no-free bump allocator. The
 opt-in `{:kotoba/raw-memory :checked-extents}` profile additionally requires
@@ -1489,9 +1507,13 @@ amu run app.signed.kexe --trust pinned-trust.edn \
 ```
 
 Native compilation supports generic and explicit x86-64/AArch64 targets for
-Linux, macOS, Windows, Android, and iOS. `--run` remains limited to `web` and
-`wasm`; the CLI refuses native `--run` rather than silently using a different
-runtime or an unmeasured loader.
+Linux, macOS, Windows, Android, and iOS; an omitted `--target` (or
+`--target native`) is the host's own `<isa>-<os>` target. `--run` supports
+`web`, `wasm` and the host native target. A native `--run` signs the artifact
+with an ephemeral key and executes it under the measured `kexe_loader`
+supervisor (`kotoba.kbb-native/run-artifact!`) with no capability granted; a
+policy that grants any capability, or a native target that is not the host,
+is refused rather than routed to a different runtime.
 
 The verifier treats embedded KIR as hostile, independently validates its
 structure, lexical scope, call arities, transitive capability effects, ABI and
@@ -1505,9 +1527,9 @@ loader process, and produce an executor-signed receipt.
 Native support is real but deliberately bounded. The qualified scalar,
 control-flow, string, pair, record, and sealed-variant slices run on the host
 ISA; unsupported aggregates, effects, ABIs, or targets fail closed until their
-lowering and verifier rules exist. Wasm Component remains the primary portable
-artifact for ordinary applications, while direct native AOT is supported for
-explicit targets and trusted low-level/aiueos paths. See Amu's
+lowering and verifier rules exist. Native is the default target; Wasm and
+Wasm Component are explicitly selected targets, for example for browser and
+Worker builds. See Amu's
 [`Execution policy`](https://github.com/kotoba-lang/amu#execution-policy) for the
 current boundary.
 
