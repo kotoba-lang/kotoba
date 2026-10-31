@@ -153,15 +153,16 @@ def main(amu, contract, compiler, out):
 # --target aarch64-linux, and running an ARM image on x86 would be emulation.
 # At Amu ce982703 the only x86_64-linux route that accepts --source-path and
 # --source-lock is the project adapter (seed/98-x86_64-project.kotoba,
-# --format kx64-v1), which refuses every capability call (E7101, OP-CAP);
-# --format static takes one unlocked source file. This fixture needs
-# :cli/args, :io/write and :fs/app-data. The x86 compiler still admits the
+# --format kx64-v1). It refuses unsupported value operations (observed:
+# E7102, f64-to-bits in Amu src/kotoba/form.kotoba) and every capability
+# call (E7101, OP-CAP); this fixture needs both, including :cli/args,
+# :io/write and :fs/app-data. --format static takes one unlocked source. The x86 compiler still admits the
 # CID-locked sources (the "compile" call above). The refusal below is
 # asserted, so an Amu that accepts the locked project on x86 turns this red
 # and the x86 execution must then be wired instead of this marker.
-X86_BLOCKED = ("Amu ce982703 has no x86_64-linux route that compiles CID-locked multi-module sources "
-               "with capability calls: kx64-v1 project route refuses capabilities (E7101), static takes "
-               "no source lock, packed runner is aarch64-linux only")
+X86_BLOCKED = ("Amu ce982703 has no x86_64-linux route that compiles this CID-locked multi-module fixture: "
+               "the kx64-v1 project route refuses its value operations (E7102 f64-to-bits in amu form.kotoba) "
+               "and capability calls (E7101), static takes no source lock, packed runner is aarch64-linux only")
 
 
 def x86_blocked(amu, compiler, entry, roots, lock, sources, inputs, contract, out, run, calls):
@@ -170,7 +171,7 @@ def x86_blocked(amu, compiler, entry, roots, lock, sources, inputs, contract, ou
                   [compiler, "compile", entry, "--target", "x86_64-linux", "--output", artifact, "--format", "kx64-v1",
                    *[part for p in roots for part in ("--source-path", p)], "--source-lock", lock,
                    "--source-lock-sha256", pin(lock)["sha256"]], expected=1)
-    assert b"7101" in refused.stderr and b"KEXE_TRAP" not in refused.stderr, \
+    assert (b"seed: E7101" in refused.stderr or b"seed: E7102" in refused.stderr) and b"KEXE_TRAP" not in refused.stderr, \
         ("x86 locked project route changed; wire x86 execution", refused.returncode, refused.stderr[-1200:])
     assert not artifact.exists(), "refused x86 route left an artifact"
     report = dict(status="BLOCKED_NATIVE_X86_CLI_REQUEST_EXECUTION", reason=X86_BLOCKED,

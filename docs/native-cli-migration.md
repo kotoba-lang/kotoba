@@ -63,7 +63,9 @@ compiler. Execution of the fixture on x86 is **blocked** at Amu `ce982703`
 (KOTOBA-174): F3 admits the CID-locked sources (`compile --target aarch64-macos`
 with the source lock), but the only `x86_64-linux` route that accepts a source
 lock, the `kx64-v1` project adapter (`seed/98-x86_64-project.kotoba`), refuses
-every capability call (E7101), `--format static` takes one unlocked source, and
+the fixture's value operations (observed: E7102, `f64-to-bits` in Amu
+`src/kotoba/form.kotoba`) and every capability call (E7101), `--format static`
+takes one unlocked source, and
 the packed kseed runner exists only for `aarch64-linux`. The step asserts that
 refusal and records `BLOCKED_NATIVE_X86_CLI_REQUEST_EXECUTION`; it fails once
 Amu accepts the locked project on x86, so the x86 execution must then be wired.
