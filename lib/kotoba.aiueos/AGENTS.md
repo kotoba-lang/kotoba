@@ -202,7 +202,26 @@ the installed OS, powered off, or on an image without the watchdog still
 needs a manual (or switched-outlet) power cycle.
 Still open: Ed25519 only (no ML-DSA verifier yet), and no rollback
 protection beyond version >= 1, since no installed version is kept.
-Writing the ESP is stage 4.
+Stage 4 writes the ESP (FAT32 only): remote command 6 (`aiueos-remote.py
+install`) pulls and verifies the image as stage 3 and also writes it into the
+staging file `\EFI\ITONAMI\UPDATE.BIN`. `native/esp.kotoba` creates that
+file on first use, with its entry in the same disk block as BOOTX64.EFI's and
+clusters from every FAT copy, and fits its chain to the image (cut and free,
+or extend) so the FAT stays consistent. Only if the stream's SHA-256 matches
+is the staging file flushed, read back from disk and hashed; only if that
+matches too does one block write swap the two entries' first cluster and
+size (BOOTX64.EFI becomes the new image, UPDATE.BIN keeps the old one), and
+the ESP walk must then hash BOOTX64.EFI to the manifest digest (KDBG
+0xc130..0xc136, 0xc006, word 208). NVMe Write and Flush exist but are
+refused outside a write window that only esp opens, to the ESP partition.
+FSInfo is not updated, and a power loss between the FAT and entry writes can
+leave lost clusters (never a changed BOOTX64.EFI). The QEMU gate drives it
+through fw_cfg file `opt/aiueos/install`, read only under a hypervisor
+(CPUID.1:ECX bit 31), which installs the self-test fixture ("1") or a
+tampered copy ("2"). Three boots install, install again (UPDATE.BIN reused,
+no new clusters) and refuse the tampered image; the disk is then parsed on
+the Mac (contents, FAT copies equal, chain lengths, writes inside the ESP).
+Disk-first boot is stage 5.
 
 ## CDCI migration: native only (2026-10-24)
 

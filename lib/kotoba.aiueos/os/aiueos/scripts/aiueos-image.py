@@ -16,7 +16,8 @@ native/update.kotoba; its seed is a 32-byte file kept outside the repository.
 
 serve answers each "AIUEGET1" request (UDP 7796: boot nonce, stream offset, length) with one
 "AIUEDAT1" datagram to UDP 7795 (nonce, offset, length, then the bytes at that offset of SIGNED),
-sent to the link's broadcast address (--broadcast, as aiueos-remote.py). The pull itself is started with `aiueos-remote.py update`.
+sent to the link's broadcast address (--broadcast, as aiueos-remote.py). The pull itself is started with `aiueos-remote.py update` (verify only) or `install` (AWAI-122 stage 4:
+verify, write the ESP's staging file, read it back, then swap it in as BOOTX64.EFI).
 The server is not trusted: the board checks the signature and the digest, and nothing is written.
 """
 import argparse, hashlib, importlib.util, socket, struct, time

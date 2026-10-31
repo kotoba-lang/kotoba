@@ -37,12 +37,31 @@
   ;; 189 self-test results (accept | tampered manifest << 8 | tampered image
   ;; << 16), 190..197 manifest digest words, 200..207 computed digest words.
   ;; The page is owned window slot 14 (one page): the header, then the image
-  ;; bytes of the current 4096-byte block. The verifier uses context bytes
+  ;; bytes of the current 4096-byte block.
+  ;;
+  ;; AWAI-122 stage 4, `install` (remote command 6): the same pull, but once the
+  ;; manifest is accepted the NVMe driver and ESP walk are run again (the
+  ;; verifier's buffer covers their words), the staging file is readied
+  ;; (native/esp prepare) and every 4096-byte block is also written into it.
+  ;; Only when the stream's SHA-256 matches, the staging file is read back
+  ;; from disk and hashed; only when that matches too, esp swap makes it
+  ;; BOOTX64.EFI, and the ESP walk must then hash BOOTX64.EFI to the manifest's
+  ;; digest. Words 208 install result (15 installed; 1..14 and 20..22 as word
+  ;; 180; 40..45 as esp prepare; 46 read-back differs; 47 BOOTX64.EFI after the
+  ;; swap differs; 48 a write or flush failed; 49 NVMe or ESP walk not ready),
+  ;; 209 write mode, 211 the QEMU hook's request.
+  ;; `qemu-hook` is the gate's way in: only under a hypervisor (CPUID.1:ECX
+  ;; bit 31) whose fw_cfg (ports 0x510/0x511) carries the file
+  ;; opt/aiueos/install, it installs the self-test fixture ("1") or the
+  ;; fixture with one image byte changed ("2"). It never installs network data,
+  ;; and a physical board has no fw_cfg. The verifier uses context bytes
   ;; 2048..3071 and 4096..8191, SHA-256 bytes 3072..3647 (as native/esp).
   (:require [aiueos.native.rtl8168-debug :as nic]
+            [aiueos.native.nvme :as nvme]
+            [aiueos.native.esp :as esp]
             [aiueos.ed25519 :as ed]
             [aiueos.lib.sha256-stream :as sha])
-  (:export [self-test pull report]))
+  (:export [self-test pull report install install-report qemu-hook]))
 
 (defn word [region i]
   (kernel-load-u32 (kernel-subregion region 8192 (* i 4) 4) 4 0))
@@ -134,6 +153,11 @@
           (do (pad-block ctx) (zero-pad ctx 0) (put-length ctx (* size 8) 0) (pad-block ctx)))
         (if (= (same-digest ctx 0) 1) (fail ctx 15) (fail ctx 7)))))
 
+;; In write mode (word 209 = 1) the first n page bytes go to the staging file:
+;; 0 done or not in write mode, -1 failed.
+(defn stage-out [ctx n]
+  (if (or (= n 0) (not (= (word ctx 209) 1))) 0
+    (esp/stage-write ctx (kernel-owned-window 14 4096) n)))
 ;; `len` image bytes have just been put at page byte (taken mod 4096). Chunks
 ;; are 1024 bytes in order; only the last may be shorter.
 (defn chunk-done [ctx len]
@@ -145,8 +169,11 @@
               (and (< len 1024) (not (= now size))))
         (fail ctx 6)
         (do (put-word ctx 184 now)
-            (if (= (bit-and now 4095) 0) (absorb ctx 64) 0)
-            (if (= now size) (finish ctx) 14))))))
+            (if (< (if (= (bit-and now 4095) 0) (stage-out ctx 4096) 0) 0) (fail ctx 48)
+              (do (if (= (bit-and now 4095) 0) (absorb ctx 64) 0)
+                  (if (= now size)
+                    (if (< (stage-out ctx (bit-and now 4095)) 0) (fail ctx 48) (finish ctx))
+                    14))))))))
 
 ;; ---- self-test ----
 (defn fixture-0 [i] (case i 0 65 1 73 2 85 3 69 4 73 5 77 6 71 7 49 8 1 9 0 10 0 11 0 12 0 13 0 14 0 15 0 16 136 17 19 18 0 19 0 20 0 21 0 22 0 23 0 24 0 25 0 26 0 27 0 28 0 29 0 30 0 31 0 0))
@@ -174,7 +201,8 @@
   (do (put-header 0 header-flip)
       (if (= (begin ctx 1) 14) (feed ctx 0 image-flip) (word ctx 180))))
 (defn self-test [ctx]
-  (let [a (self-run ctx -1 -1)
+  (let [off (put-word ctx 209 0)
+        a (+ (self-run ctx -1 -1) (* 0 off))
         b (self-run ctx 8 -1)
         c (self-run ctx -1 4097)]
     (do (put-word ctx 189 (+ a (+ (* b 256) (* c 65536))))
@@ -228,7 +256,7 @@
           (do (chunk-done ctx n) (chunks ctx (+ at n))))))))
 ;; The boot nonce is remote-cmd's (context words 172/173).
 (defn pull [ctx]
-  (do (put-word ctx 180 0) (put-word ctx 184 0) (put-word ctx 186 0) (put-word ctx 187 0)
+  (do (put-word ctx 209 0) (put-word ctx 180 0) (put-word ctx 184 0) (put-word ctx 186 0) (put-word ctx 187 0)
       (if (= (nic/link-info) 0) (fail ctx 20)
         (if (= (fetch ctx 0 128 0 0) 0) (fail ctx 21)
           (if (= (begin ctx 0) 14) (chunks ctx 0) (word ctx 180))))))
@@ -246,3 +274,92 @@
       (nic/log 49443 (word ctx 187))
       (report-digest ctx 0)
       (word ctx 180)))
+
+;; ---- AWAI-122 stage 4: install ----
+(defn ifail [ctx code] (do (put-word ctx 208 code) (put-word ctx 209 0) code))
+(defn same-words [ctx a b i]
+  (if (>= i 8) 1 (if (= (word ctx (+ a i)) (word ctx (+ b i))) (same-words ctx a b (+ i 1)) 0)))
+;; After the manifest is accepted: NVMe and the ESP walk again, then the staging
+;; file. 0 ready, else an install code.
+(defn ready [ctx]
+  (if (not (= (nvme/probe ctx) 15)) 49
+    (if (not (= (esp/run ctx) 15)) 49
+      (esp/prepare ctx (word ctx 183)))))
+(defn start-stream [ctx]
+  (do (sha/sha-init (kernel-subregion ctx 8192 3072 512))
+      (put-word ctx 184 0)
+      (put-word ctx 209 1)))
+;; The stream is in: flush, read the staging file back, swap, check BOOTX64.EFI.
+(defn commit [ctx]
+  (let [size (word ctx 183)]
+    (do (put-word ctx 209 0)
+        (if (not (= (word ctx 180) 15)) (ifail ctx (word ctx 180))
+          (if (not (and (= (esp/sync ctx) 1) (= (nvme/flush ctx) 0))) (ifail ctx 48)
+            (if (not (and (= (esp/hash-chain ctx (word ctx 699) size) 15) (= (same-words ctx 680 190 0) 1))) (ifail ctx 46)
+              (if (not (= (esp/swap ctx size) 1)) (ifail ctx 48)
+                (if (and (= (esp/run ctx) 15) (= (word ctx 677) 1) (= (word ctx 675) size)
+                         (= (same-words ctx 680 190 0) 1))
+                  (ifail ctx 15)
+                  (ifail ctx 47)))))))))
+(defn install [ctx]
+  (do (put-word ctx 208 0) (put-word ctx 209 0) (put-word ctx 180 0) (put-word ctx 184 0)
+      (put-word ctx 186 0) (put-word ctx 187 0)
+      (if (= (nic/link-info) 0) (ifail ctx 20)
+        (if (= (fetch ctx 0 128 0 0) 0) (ifail ctx 21)
+          (if (not (= (begin ctx 0) 14)) (ifail ctx (word ctx 180))
+            (let [r (ready ctx)]
+              (if (> r 0) (ifail ctx r)
+                (do (start-stream ctx) (chunks ctx 0) (commit ctx)))))))))
+(defn self-install [ctx flip]
+  (do (put-word ctx 208 0) (put-word ctx 209 0) (put-word ctx 180 0)
+      (put-header 0 -1)
+      (if (not (= (begin ctx 1) 14)) (ifail ctx (word ctx 180))
+        (let [r (ready ctx)]
+          (if (> r 0) (ifail ctx r)
+            (do (start-stream ctx) (feed ctx 0 flip) (commit ctx)))))))
+
+;; KDBG 0xc130 install result | stream result << 8, 0xc131 BOOTX64.EFI first
+;; cluster | size << 32 (after the final walk), 0xc132 staging first cluster,
+;; 0xc133..0xc136 the final walk's SHA-256 (8 bytes each).
+(defn install-digest [ctx i]
+  (if (>= i 4) 1
+    (do (nic/log (+ 49459 i) (+ (* (word ctx (+ 680 (* i 2))) 4294967296) (word ctx (+ 681 (* i 2)))))
+        (install-digest ctx (+ i 1)))))
+(defn install-report [ctx]
+  (do (nic/log 49456 (+ (word ctx 208) (* (word ctx 180) 256)))
+      (nic/log 49457 (+ (word ctx 674) (* (word ctx 675) 4294967296)))
+      (nic/log 49458 (word ctx 699))
+      (install-digest ctx 0)
+      (word ctx 208)))
+
+;; ---- QEMU gate hook (fw_cfg) ----
+(defn fw-byte [] (kernel-in-u8 1297))
+(defn fw-skip [n] (if (<= n 0) 1 (let [b (fw-byte)] (fw-skip (- n (+ 1 (* 0 b)))))))
+(defn fw-be [n acc] (if (= n 0) acc (fw-be (- n 1) (+ (* acc 256) (fw-byte)))))
+;; "opt/aiueos/install" and its NUL
+(defn fw-name-byte [i] (case i 0 111 1 112 2 116 3 47 4 97 5 105 6 117 7 101 8 111 9 115 10 47 11 105 12 110 13 115 14 116 15 97 16 108 17 108 0))
+(defn fw-name [i ok]
+  (if (>= i 56) ok
+    (let [b (fw-byte)]
+      (fw-name (+ i 1) (if (and (= ok 1) (or (>= i 19) (= b (fw-name-byte i)))) 1 0)))))
+(defn fw-find [left]
+  (if (<= left 0) 0
+    (let [size (fw-be 4 0)
+          sel (fw-be 2 0)
+          skip (fw-skip 2)
+          hit (fw-name 0 1)]
+      (if (= (+ hit (* 0 (+ size skip))) 1) sel (fw-find (- left 1))))))
+(defn fw-signature [i]
+  (if (>= i 4) 1 (if (= (fw-byte) (case i 0 81 1 69 2 77 85)) (fw-signature (+ i 1)) 0)))
+(defn fw-request []
+  (if (= (bit-and (kernel-cpuid-ecx 1 0) 2147483648) 0) 0
+    (do (kernel-out-u16 1296 0)
+        (if (= (fw-signature 0) 0) 0
+          (do (kernel-out-u16 1296 25)
+              (let [sel (fw-find (least (fw-be 4 0) 256))]
+                (if (= sel 0) 0 (do (kernel-out-u16 1296 sel) (fw-byte)))))))))
+(defn qemu-hook [ctx]
+  (let [b (fw-request)]
+    (do (put-word ctx 211 b)
+        (if (= b 49) (self-install ctx -1)
+          (if (= b 50) (self-install ctx 4097) 0)))))
