@@ -554,7 +554,6 @@ The bundled standard libraries live in this repository:
 | `kotoba.kotobaWasm` | `kotoba.kotobaWasm/src` | `kotoba.wasm.canonical-abi`, `kotoba.wasm.core`, `kotoba.wasm.tools`, `kotoba.wasm.typed` (Kotoba project library) |
 | `kotoba.kotobaAnnex` | `kotoba.kotobaAnnex/src` | `kotoba.annex.archive`, `kotoba.annex.cid`, `kotoba.annex.directory`, `kotoba.annex.grant` (Kotoba project library) |
 | `kotoba.kamiSensorSim` | `kotoba.kamiSensorSim/src` | `sensor-sim`, `sensor-sim.camera`, `sensor-sim.contact`, `sensor-sim.imu` (Kotoba project library) |
-| `kotoba.kamiSceneContracts` | `kotoba.kamiSceneContracts/src` | `kami.scene.authority-manifest`, `kami.scene.contracts`, `kami.scene.fixture-sync`, `kami.scene.mirror-check` (Kotoba project library) |
 | `kotoba.kamiOngakuProject` | `kotoba.kamiOngakuProject/src` | `kami.ongaku.project` (Kotoba project library) |
 | `kotoba.kamiMangakaExpression` | `kotoba.kamiMangakaExpression/src` | `kami.mangaka.expression` (Kotoba project library) |
 | `kotoba.kamiEngineSdk` | `kotoba.kamiEngineSdk/src` | `kami.avatar`, `kami.backend.browser`, `kami.backend.host`, `kami.benchmark` (Kotoba project library) |
@@ -820,7 +819,6 @@ The bundled standard libraries live in this repository:
 | `kotoba.kgraph` | `kotoba.kgraph/src` | `kotoba.kgraph` (Kotoba project library) |
 | `kotoba.kamiWebvr` | `kotoba.kamiWebvr/src` | `kami.webvr.cine-bridge`, `kami.webvr.engine`, `kami.webvr.incident-pregel`, `kami.webvr.types` (Kotoba project library) |
 | `kotoba.kamiUsdNative` | `kotoba.kamiUsdNative/src` | `usd-native` (Kotoba project library) |
-| `kotoba.kamiStudio` | `kotoba.kamiStudio/src` | `kami.studio.ui` (Kotoba project library) |
 | `kotoba.kamiOngakuSampler` | `kotoba.kamiOngakuSampler/src` | `kami.ongaku.sampler` (Kotoba project library) |
 | `kotoba.kamiOngakuSequencer` | `kotoba.kamiOngakuSequencer/src` | `kami.ongaku.sequencer`, `kami.ongaku.sequencer.smf` (Kotoba project library) |
 | `kotoba.kamiOngakuPluginHost` | `kotoba.kamiOngakuPluginHost/src` | `kami.ongaku.plugin-host`, `kami.ongaku.plugin-host.graph` (Kotoba project library) |
