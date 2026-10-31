@@ -959,7 +959,7 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_region_valid_o
   f141c051411958cceba2478b8bb994807765d26aa0488a187caee2404870f243 \
   kotoba_aiueos_pci_region_valid
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_pci_config_read_object" \
-  04ab0830219e6e03552cfc46ccfc56ce34fd1cf84b2f418d3a7916d4aac264d6 \
+  30d5ac6bef46dc1b55fe10a8c61c80398495f799510fdeeccdf7ff0273600da7 \
   kotoba_aiueos_pci_config_read
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_pci_config_write_object" \
   720c883da6a6f2563b02ec64c139f49a7dfe9d3ee883623e8821f2ff348c7be0 \
@@ -977,10 +977,10 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_vtd_admit_obje
   7daff182be91f268039076b5d99331f9fb2c2df74923d8122d1f8872b50c70e0 \
   kotoba_aiueos_vtd_admit
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_msr_read_object" \
-  da3add0a82de4562a8da117105e9a40a67e87c8086ca9b71851c4a9d9e673e0c \
+  bd9203d4d6021700fdcd473cf70f2579a544e0c8260f3b1c899e943bf76f4879 \
   kotoba_aiueos_msr_read
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_msr_write_object" \
-  a6ae6efbe7c3a7543b391b01a9203906532b3c4328fb38bafb2d093b37bfe20d \
+  02d1cb87b65945911ca0ad627b3744a0a190024e904bf7e0b32bd98d6b6c475d \
   kotoba_aiueos_msr_write
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_idt_gate_object" \
   daa5544d40825a98b3b72affdfb449ec374b33f1082a8887d9a4a6513e750e5f \
