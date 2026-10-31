@@ -12,6 +12,7 @@ a screenshot arrives on 7797 and is written as a PNG.
   aiueos-remote.py --key SEED type aba       # make codes for a-z and space
   aiueos-remote.py --key SEED shot out.png
   aiueos-remote.py --key SEED reboot
+  aiueos-remote.py --key SEED --wait 600 update   # pull and verify the image `aiueos-image.py serve` offers
 
 This tool only signs, sends and observes; the board decides. It is a diagnostic channel for the opt-in
 debug entry on a direct cable, not a product remote-access service.
@@ -119,7 +120,7 @@ def main():
     p.add_argument("--key", type=Path, required=True, help="32-byte Ed25519 seed file (mode 0600)")
     p.add_argument("--broadcast", default="10.77.0.255")
     p.add_argument("--wait", type=float, default=15.0, help="seconds to wait for the nonce and replies")
-    p.add_argument("command", choices=("ping", "reboot", "key", "type", "shot"))
+    p.add_argument("command", choices=("ping", "reboot", "key", "type", "shot", "update"))
     p.add_argument("value", nargs="?")
     args = p.parse_args()
     if args.key.stat().st_mode & 0o077:
@@ -135,6 +136,14 @@ def main():
         send(args, seed, nonce, counter, 1, 0); print(reply(log, {0xC001}, args.wait))
     elif args.command == "reboot":
         send(args, seed, nonce, counter, 2, 0); print(reply(log, {0xC002}, args.wait))
+    elif args.command == "update":
+        # AWAI-122 stage 3: the board pulls the image, then reports KDBG 0xC120..0xC127 and 0xC005.
+        send(args, seed, nonce, counter, 5, 0)
+        for tag, value in records(log, time.monotonic() + args.wait):
+            if 0xC120 <= tag <= 0xC127 or tag in (0xC005, 0xC0FF):
+                print(f"{tag:04x} {value:016x}", flush=True)
+            if tag in (0xC005, 0xC0FF):
+                break
     elif args.command == "key":
         send(args, seed, nonce, counter, 3, int(args.value, 0)); print(reply(log, {0xC003}, args.wait))
     elif args.command == "type":

@@ -1,0 +1,248 @@
+(ns aiueos.native.update
+  ;; AWAI-122 stage 3: pull a signed OS image over the RTL8168 debug link and
+  ;; verify it. Nothing is written: the image is hashed as it arrives and only
+  ;; the verdict is kept. Stage 4 writes the ESP.
+  ;;
+  ;; A signed image (scripts/aiueos-image.py) is a 128-byte header, then the
+  ;; image. The header is a 64-byte manifest
+  ;;    0 "AIUEIMG1", 8 version (u64 LE, >= 1), 16 size (u64 LE, 1..32 MiB),
+  ;;   24 reserved (zero), 32 SHA-256 of the image
+  ;; and an Ed25519 signature over it under the image-signing key pinned below
+  ;; (its seed is held on the operator's Mac, never in this repository). The
+  ;; signature is checked before any image byte is taken; the image is then
+  ;; accepted only if its length and SHA-256 equal the manifest's.
+  ;;
+  ;; Transport (`pull`, started by remote command 5): one request at a time,
+  ;; broadcast to UDP 7796, "AIUEGET1" boot nonce, stream offset (u64 LE),
+  ;; length (u32 LE, at most 1024); the answer is a datagram to UDP 7795,
+  ;; "AIUEDAT1" nonce offset length, then the bytes. A request is repeated up
+  ;; to 8 times (about 2^30 TSC cycles each) before the pull fails. The server
+  ;; is untrusted; the nonce only keeps stale answers apart.
+  ;;
+  ;; `self-test` runs the same verifier on a 5000-byte fixture image signed with
+  ;; the RFC 8032 section 7.1 test 1 seed (published, so the fixture proves the
+  ;; code path, not a key): it must accept the fixture, refuse it with one
+  ;; manifest byte changed (signature) and refuse it with one image byte changed
+  ;; (digest), all through the same chunk path the network uses.
+  ;;
+  ;; Classical Ed25519 only, and no rollback protection beyond version >= 1:
+  ;; the kernel has no ML-DSA verifier yet and keeps no installed version.
+  ;;
+  ;; State: context words 180 result (0 none, 1 signature refused, 2 magic,
+  ;; 3 size, 4 version, 5 reserved not zero, 6 chunk out of order, 7 digest
+  ;; differs, 14 manifest accepted and image in progress, 15 verified, 20 no
+  ;; NIC, 21 no answer, 22 transmit failed), 181/182 version, 183 size, 184
+  ;; image bytes taken, 186 repeated requests, 187 stream offset of the last
+  ;; failed request, 188 self-test verdict (7 = all three cases as expected),
+  ;; 189 self-test results (accept | tampered manifest << 8 | tampered image
+  ;; << 16), 190..197 manifest digest words, 200..207 computed digest words.
+  ;; The page is owned window slot 14 (one page): the header, then the image
+  ;; bytes of the current 4096-byte block. The verifier uses context bytes
+  ;; 2048..3071 and 4096..8191, SHA-256 bytes 3072..3647 (as native/esp).
+  (:require [aiueos.native.rtl8168-debug :as nic]
+            [aiueos.ed25519 :as ed]
+            [aiueos.lib.sha256-stream :as sha])
+  (:export [self-test pull report]))
+
+(defn word [region i]
+  (kernel-load-u32 (kernel-subregion region 8192 (* i 4) 4) 4 0))
+(defn put-word [region i value]
+  (kernel-store-u32 (kernel-subregion region 8192 (* i 4) 4) 4 0 value))
+(defn word64 [ctx i] (+ (word ctx i) (* (word ctx (+ i 1)) 4294967296)))
+(defn put-word64 [ctx i value]
+  (do (put-word ctx i (bit-and value 4294967295))
+      (put-word ctx (+ i 1) (u64-shift-right value 32))))
+(defn put-byte [ctx at value] (kernel-store-u8 (kernel-subregion ctx 8192 at 1) 1 0 value))
+(defn pg [at] (kernel-load-u8-4k (kernel-owned-window 14 4096) 4096 at))
+(defn put-pg [at value] (kernel-store-u8-4k (kernel-owned-window 14 4096) 4096 at value))
+(defn pg-le [at n acc]
+  (if (= n 0) acc (pg-le at (- n 1) (+ (i64-shift-left acc 8) (pg (+ at (- n 1)))))))
+(defn least [a b] (if (< a b) a b))
+(defn fail [ctx code] (do (put-word ctx 180 code) code))
+
+;; The image-signing public key (AWAI-122).
+(defn key-byte [i]
+  (case i 0 198 1 29 2 42 3 186 4 74 5 103 6 8 7 1 8 141 9 74 10 74 11 181 12 157 13 110 14 162 15 154 16 150 17 44 18 251 19 175 20 29 21 101 22 209 23 148 24 253 25 58 26 108 27 79 28 79 29 54 30 160 31 187 0))
+;; RFC 8032 section 7.1 test 1 public key: the self-test only.
+(defn test-key-byte [i]
+  (case i 0 215 1 90 2 152 3 1 4 130 5 177 6 10 7 183 8 213 9 75 10 254 11 211 12 201 13 100 14 7 15 58 16 14 17 225 18 114 19 243 20 218 21 166 22 35 23 37 24 175 25 2 26 26 27 104 28 247 29 7 30 81 31 26 0))
+(defn magic-byte [i] (case i 0 65 1 73 2 85 3 69 4 73 5 77 6 71 7 49 0))
+(defn magic-ok [i] (if (>= i 8) 1 (if (= (pg i) (magic-byte i)) (magic-ok (+ i 1)) 0)))
+
+;; Verifier buffer (context 2048): key 0..31, signature 32..95, manifest 96..159.
+(defn stage [ctx test i]
+  (if (>= i 160) 1
+    (do (put-byte ctx (+ 2048 i)
+                  (if (< i 32) (if (= test 1) (test-key-byte i) (key-byte i))
+                    (if (< i 96) (pg (+ 32 i)) (pg (- i 96)))))
+        (stage ctx test (+ i 1)))))
+(defn be-word [at] (+ (* (pg at) 16777216) (+ (* (pg (+ at 1)) 65536) (+ (* (pg (+ at 2)) 256) (pg (+ at 3))))))
+(defn save-digest [ctx i]
+  (if (>= i 8) 1 (do (put-word ctx (+ 190 i) (be-word (+ 32 (* i 4)))) (save-digest ctx (+ i 1)))))
+
+;; The header is at page bytes 0..127. Returns 14 when the manifest is accepted.
+(defn begin [ctx test]
+  (let [staged (stage ctx test 0)
+        v (ed/aiueos-ed25519-verify (kernel-subregion ctx 8192 2048 1024) 64
+                                    (kernel-subregion ctx 8192 4096 4096))
+        size (pg-le 16 8 0)
+        version (pg-le 8 8 0)]
+    (if (not (= (+ v (* 0 staged)) 1)) (fail ctx 1)
+      (if (= (magic-ok 0) 0) (fail ctx 2)
+        (if (not (= (pg-le 24 8 0) 0)) (fail ctx 5)
+          (if (or (<= size 0) (> size 33554432)) (fail ctx 3)
+            (if (< version 1) (fail ctx 4)
+              (do (put-word64 ctx 181 version)
+                  (put-word ctx 183 size)
+                  (put-word ctx 184 0)
+                  (save-digest ctx 0)
+                  (sha/sha-init (kernel-subregion ctx 8192 3072 512))
+                  (fail ctx 14)))))))))
+
+;; k whole 64-byte blocks from the start of the page.
+(defn absorb [ctx k]
+  (sha/sha-blocks (kernel-subregion ctx 8192 3072 512) (kernel-owned-window 14 4096) 4096 0 k))
+(defn zero-pad [ctx i]
+  (if (>= i 64) 1 (do (put-byte ctx (+ 3584 i) 0) (zero-pad ctx (+ i 1)))))
+(defn copy-tail [ctx at i r]
+  (if (>= i r) 1 (do (put-byte ctx (+ 3584 i) (pg (+ at i))) (copy-tail ctx at (+ i 1) r))))
+(defn put-length [ctx bits i]
+  (if (>= i 8) 1
+    (do (put-byte ctx (+ 3584 (- 63 i)) (bit-and (u64-shift-right bits (* i 8)) 255))
+        (put-length ctx bits (+ i 1)))))
+(defn pad-block [ctx]
+  (sha/sha-block (kernel-subregion ctx 8192 3072 512) (kernel-subregion ctx 8192 3584 64)))
+(defn same-digest [ctx i]
+  (if (>= i 8) 1
+    (let [h (sha/load32 (kernel-subregion ctx 8192 3072 512) (+ 64 i))]
+      (do (put-word ctx (+ 200 i) h)
+          (if (= h (word ctx (+ 190 i))) (same-digest ctx (+ i 1))
+            (do (same-digest ctx (+ i 1)) 0))))))
+;; The last page holds t = size mod 4096 bytes (none when the size is a whole
+;; number of pages: chunk-done has absorbed it already).
+(defn finish [ctx]
+  (let [size (word ctx 183)
+        t (bit-and size 4095)
+        whole (quot t 64)
+        r (bit-and t 63)]
+    (do (if (> whole 0) (absorb ctx whole) 0)
+        (zero-pad ctx 0)
+        (copy-tail ctx (* whole 64) 0 r)
+        (put-byte ctx (+ 3584 r) 128)
+        (if (< r 56)
+          (do (put-length ctx (* size 8) 0) (pad-block ctx))
+          (do (pad-block ctx) (zero-pad ctx 0) (put-length ctx (* size 8) 0) (pad-block ctx)))
+        (if (= (same-digest ctx 0) 1) (fail ctx 15) (fail ctx 7)))))
+
+;; `len` image bytes have just been put at page byte (taken mod 4096). Chunks
+;; are 1024 bytes in order; only the last may be shorter.
+(defn chunk-done [ctx len]
+  (let [got (word ctx 184)
+        size (word ctx 183)
+        now (+ got len)]
+    (if (not (= (word ctx 180) 14)) (word ctx 180)
+      (if (or (<= len 0) (> len 1024) (> now size) (not (= (bit-and got 1023) 0))
+              (and (< len 1024) (not (= now size))))
+        (fail ctx 6)
+        (do (put-word ctx 184 now)
+            (if (= (bit-and now 4095) 0) (absorb ctx 64) 0)
+            (if (= now size) (finish ctx) 14))))))
+
+;; ---- self-test ----
+(defn fixture-0 [i] (case i 0 65 1 73 2 85 3 69 4 73 5 77 6 71 7 49 8 1 9 0 10 0 11 0 12 0 13 0 14 0 15 0 16 136 17 19 18 0 19 0 20 0 21 0 22 0 23 0 24 0 25 0 26 0 27 0 28 0 29 0 30 0 31 0 0))
+(defn fixture-1 [i] (case i 0 9 1 131 2 226 3 158 4 8 5 146 6 112 7 82 8 64 9 131 10 186 11 53 12 148 13 118 14 208 15 202 16 20 17 221 18 22 19 248 20 171 21 248 22 48 23 202 24 116 25 73 26 68 27 194 28 186 29 182 30 42 31 212 0))
+(defn fixture-2 [i] (case i 0 124 1 100 2 124 3 75 4 232 5 170 6 182 7 27 8 33 9 189 10 242 11 242 12 185 13 107 14 234 15 127 16 174 17 178 18 217 19 204 20 32 21 228 22 142 23 118 24 35 25 199 26 63 27 37 28 100 29 21 30 134 31 128 0))
+(defn fixture-3 [i] (case i 0 9 1 236 2 237 3 145 4 163 5 112 6 34 7 111 8 12 9 2 10 157 11 128 12 53 13 93 14 200 15 56 16 169 17 108 18 21 19 173 20 171 21 248 22 151 23 119 24 34 25 80 26 175 27 100 28 98 29 64 30 12 31 2 0))
+(defn fixture-header [i]
+  (if (< i 32) (fixture-0 i) (if (< i 64) (fixture-1 (- i 32)) (if (< i 96) (fixture-2 (- i 64)) (fixture-3 (- i 96))))))
+;; The fixture image: byte i = (31 i + 7 (i >> 8) + 1) mod 256, 5000 bytes.
+(defn fixture-byte [i] (bit-and (+ (* i 31) (+ (* (u64-shift-right i 8) 7) 1)) 255))
+(defn put-header [i flip]
+  (if (>= i 128) 1
+    (do (put-pg i (bit-xor (fixture-header i) (if (= i flip) 1 0))) (put-header (+ i 1) flip))))
+(defn fill [base at i n flip]
+  (if (>= i n) 1
+    (do (put-pg (+ base i) (bit-xor (fixture-byte (+ at i)) (if (= (+ at i) flip) 1 0)))
+        (fill base at (+ i 1) n flip))))
+(defn feed [ctx at flip]
+  (if (or (>= at 5000) (not (= (word ctx 180) 14))) (word ctx 180)
+    (let [n (least 1024 (- 5000 at))]
+      (do (fill (bit-and at 4095) at 0 n flip)
+          (chunk-done ctx n)
+          (feed ctx (+ at n) flip)))))
+(defn self-run [ctx header-flip image-flip]
+  (do (put-header 0 header-flip)
+      (if (= (begin ctx 1) 14) (feed ctx 0 image-flip) (word ctx 180))))
+(defn self-test [ctx]
+  (let [a (self-run ctx -1 -1)
+        b (self-run ctx 8 -1)
+        c (self-run ctx -1 4097)]
+    (do (put-word ctx 189 (+ a (+ (* b 256) (* c 65536))))
+        (put-word ctx 188 (+ (if (= a 15) 1 0) (+ (if (= b 1) 2 0) (if (= c 7) 4 0))))
+        (put-word ctx 180 0)
+        (word ctx 188))))
+
+;; ---- network pull ----
+(defn get-byte [i] (case i 0 65 1 73 2 85 3 69 4 71 5 69 6 84 7 49 0))
+(defn dat-byte [i] (case i 0 65 1 73 2 85 3 69 4 68 5 65 6 84 7 49 0))
+(defn put-le [at value n i]
+  (if (>= i n) 1
+    (do (nic/put-payload (+ at i) (bit-and (u64-shift-right value (* i 8)) 255))
+        (put-le at value n (+ i 1)))))
+(defn put-get-magic [i]
+  (if (>= i 8) 1 (do (nic/put-payload i (get-byte i)) (put-get-magic (+ i 1)))))
+(defn request [nonce offset len]
+  (do (put-get-magic 0)
+      (put-le 8 nonce 8 0) (put-le 16 offset 8 0) (put-le 24 len 4 0)
+      (nic/send 28 7796)))
+(defn rx-le [at n acc]
+  (if (= n 0) acc (rx-le at (- n 1) (+ (i64-shift-left acc 8) (nic/rx-byte (+ at (- n 1)))))))
+(defn dat-magic [i] (if (>= i 8) 1 (if (= (nic/rx-byte (+ 42 i)) (dat-byte i)) (dat-magic (+ i 1)) 0)))
+;; A datagram to UDP 7795 answering (nonce, offset) with exactly len bytes.
+(defn answer? [nonce offset len]
+  (and (>= (nic/rx-length) (+ 70 len))
+       (= (nic/rx-byte 12) 8) (= (nic/rx-byte 13) 0) (= (nic/rx-byte 23) 17)
+       (= (nic/rx-byte 36) 30) (= (nic/rx-byte 37) 115)
+       (= (dat-magic 0) 1) (= (rx-le 50 8 0) nonce) (= (rx-le 58 8 0) offset) (= (rx-le 66 4 0) len)))
+(defn copy-in [dst i n]
+  (if (>= i n) 1 (do (put-pg (+ dst i) (nic/rx-byte (+ 70 i))) (copy-in dst (+ i 1) n))))
+;; 1 when the answer was copied to page byte dst, 0 when none came in time.
+(defn wait [nonce offset len dst until]
+  (if (> (kernel-rdtsc) until) 0
+    (if (= (nic/rx-length) 0) (wait nonce offset len dst until)
+      (if (answer? nonce offset len)
+        (let [c (copy-in dst 0 len)] (+ (nic/rx-release) (* 0 c)))
+        (do (nic/rx-release) (wait nonce offset len dst until))))))
+(defn fetch [ctx offset len dst tries]
+  (if (>= tries 8) (do (put-word ctx 187 offset) 0)
+    (do (if (> tries 0) (put-word ctx 186 (+ (word ctx 186) 1)) 0)
+        (if (= (request (word64 ctx 172) offset len) 1)
+          (if (= (wait (word64 ctx 172) offset len dst (+ (kernel-rdtsc) 1073741824)) 1) 1
+            (fetch ctx offset len dst (+ tries 1)))
+          (fetch ctx offset len dst (+ tries 1))))))
+(defn chunks [ctx at]
+  (let [size (word ctx 183)]
+    (if (or (>= at size) (not (= (word ctx 180) 14))) (word ctx 180)
+      (let [n (least 1024 (- size at))]
+        (if (= (fetch ctx (+ 128 at) n (bit-and at 4095) 0) 0) (fail ctx 21)
+          (do (chunk-done ctx n) (chunks ctx (+ at n))))))))
+;; The boot nonce is remote-cmd's (context words 172/173).
+(defn pull [ctx]
+  (do (put-word ctx 180 0) (put-word ctx 184 0) (put-word ctx 186 0) (put-word ctx 187 0)
+      (if (= (nic/link-info) 0) (fail ctx 20)
+        (if (= (fetch ctx 0 128 0 0) 0) (fail ctx 21)
+          (if (= (begin ctx 0) 14) (chunks ctx 0) (word ctx 180))))))
+
+;; KDBG 0xc120 result | repeats << 16, 0xc121 version, 0xc122 size | taken << 32,
+;; 0xc123 failed offset, 0xc124..0xc127 the computed SHA-256 (8 bytes each).
+(defn report-digest [ctx i]
+  (if (>= i 4) 1
+    (do (nic/log (+ 49444 i) (+ (* (word ctx (+ 200 (* i 2))) 4294967296) (word ctx (+ 201 (* i 2)))))
+        (report-digest ctx (+ i 1)))))
+(defn report [ctx]
+  (do (nic/log 49440 (+ (word ctx 180) (* (word ctx 186) 65536)))
+      (nic/log 49441 (word64 ctx 181))
+      (nic/log 49442 (+ (word ctx 183) (* (word ctx 184) 4294967296)))
+      (nic/log 49443 (word ctx 187))
+      (report-digest ctx 0)
+      (word ctx 180)))
