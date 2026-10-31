@@ -1183,7 +1183,7 @@ if [ -n "$model_handoff_link" ] || [ -n "$qwen35_parity_cflags" ]; then
   python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_qwen35_dequant_object" \
     57eabbacc347c5f3bb6ba395cdf1085f8c625381efc3527c4f2b89b3b5c0d631 kotoba_aiueos_qwen35_dequant_row
   python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_qwen35_matvec_object" \
-    0eabd3f84c2efcd3c763106599e43ed217d7f71f85450eeed7293df8c3db8677 kotoba_aiueos_qwen35_matvec
+    96ba0beb09cbc338a0bc1ae93323f0847090290710cfe4200c6c1c9a7029f927 kotoba_aiueos_qwen35_matvec_check,kotoba_aiueos_qwen35_matvec_row
   # FIVE parity profiles, each linking only the objects its stages call. The
   # low region (`aiueos_low_end <= 0x1f4000`) cannot hold every object at once
   # since the tokenizer objects landed -- measured, not assumed, and measured
