@@ -25,9 +25,24 @@
   ;;   676 result (see run), 677 path (1 ITONAMI, 2 BOOT), 680..687 digest
   ;;   words, big-endian. Context bytes 3072..3583 are the SHA-256 state and
   ;;   3584..3647 the padding block.
+  ;;
+  ;; AWAI-122 stage 4 (FAT32 only): `prepare`, `stage-write`, `swap`. The
+  ;; staging file \EFI\ITONAMI\UPDATE.BIN must have its directory entry in the
+  ;; same disk block as BOOTX64.EFI's; `prepare` creates it once (a free entry
+  ;; in that block, clusters taken from the FAT in every FAT copy, written and
+  ;; flushed before the entry), `stage-write` writes the image into its
+  ;; clusters, and `swap` exchanges the two entries' first cluster and size in
+  ;; one block write: BOOTX64.EFI becomes the new image and UPDATE.BIN keeps the
+  ;; old one. Writes go through nvme/write-span inside the ESP window
+  ;; (open-window). The cached page is written back when dirty (word 653)
+  ;; before another page is read, and by `sync`. FSInfo is not updated.
+  ;; More words: 653 dirty, 664 last cluster + 1, 688 FAT copies, 689 FAT
+  ;; bytes, 690/691 the ESP's last LBA, 692/693 staging cursor (cluster,
+  ;; byte in it), 695/696 BOOTX64.EFI entry offset, 697/698 UPDATE.BIN entry
+  ;; offset, 699 staging first cluster.
   (:require [aiueos.native.nvme :as nvme]
             [aiueos.lib.sha256-stream :as sha])
-  (:export [run]))
+  (:export [run open-window prepare stage-write sync swap hash-chain]))
 
 (defn word [region i]
   (kernel-load-u32 (kernel-subregion region 8192 (* i 4) 4) 4 0))
@@ -40,10 +55,17 @@
 (defn put-byte [ctx at value] (kernel-store-u8 (kernel-subregion ctx 8192 at 1) 1 0 value))
 
 ;; The cached page: make the page holding disk byte `offset` current.
+(defn data-address [] (+ (kernel-owned-window 4 20480) 16384))
+;; Write the cached page back if it is dirty: 1 done, 0 failed.
+(defn sync [ctx]
+  (if (= (word ctx 653) 0) 1
+    (if (= (nvme/write-span ctx (- (word64 ctx 650) 1) (data-address) 4096) 0)
+      (do (put-word ctx 653 0) 1)
+      (do (put-word ctx 652 (+ (word ctx 652) 1)) 0))))
 (defn ensure [ctx offset]
   (let [page (- offset (bit-and offset 4095))]
     (if (= (word64 ctx 650) (+ page 1)) 1
-      (if (= (nvme/read-4k ctx page) 0)
+      (if (and (= (sync ctx) 1) (= (nvme/read-4k ctx page) 0))
         (do (put-word64 ctx 650 (+ page 1)) 1)
         (do (put-word64 ctx 650 0) (put-word ctx 652 (+ (word ctx 652) 1)) 0)))))
 (defn data-u8 [offset]
@@ -63,15 +85,17 @@
 (defn find-esp [ctx table size i count]
   (if (>= i count) -1
     (let [at (+ table (* i size))]
-      (if (esp-entry? ctx at) (u64 ctx (+ at 32))
+      (if (esp-entry? ctx at) (do (put-word64 ctx 690 (u64 ctx (+ at 40))) (u64 ctx (+ at 32)))
         (find-esp ctx table size (+ i 1) count)))))
 
-;; 11-byte 8.3 names: 0 "EFI", 1 "ITONAMI", 2 "BOOT", 3 "BOOTX64 EFI".
+;; 11-byte 8.3 names: 0 "EFI", 1 "ITONAMI", 2 "BOOT", 3 "BOOTX64 EFI",
+;; 4 "UPDATE  BIN".
 (defn name-byte [n i]
   (if (= n 0) (case i 0 69 1 70 2 73 32)
     (if (= n 1) (case i 0 73 1 84 2 79 3 78 4 65 5 77 6 73 32)
       (if (= n 2) (case i 0 66 1 79 2 79 3 84 32)
-        (case i 0 66 1 79 2 79 3 84 4 88 5 54 6 52 8 69 9 70 10 73 32)))))
+        (if (= n 3) (case i 0 66 1 79 2 79 3 84 4 88 5 54 6 52 8 69 9 70 10 73 32)
+          (case i 0 85 1 80 2 68 3 65 4 84 5 69 8 66 9 73 10 78 32))))))
 (defn name-match [ctx at n i]
   (if (>= i 11) 1
     (if (= (u8 ctx (+ at i)) (name-byte n i)) (name-match ctx at n (+ i 1)) 0)))
@@ -209,6 +233,9 @@
           (put-word ctx 670 root-entries)
           (put-word64 ctx 671 (+ base (* data-sector bps)))
           (put-word ctx 673 (u32 ctx (+ base 44)))
+          (put-word ctx 664 (+ clusters 2))
+          (put-word ctx 688 fats)
+          (put-word ctx 689 (* fat-size bps))
           1))))
 
 ;; Result word 676: 1 NVMe probe did not pass, 2 no GPT header, 3 no ESP entry,
@@ -233,7 +260,7 @@
               (fail ctx 7))))))))
 
 (defn run [ctx]
-  (do (put-word64 ctx 650 0) (put-word ctx 652 0) (put-word ctx 677 0)
+  (do (put-word64 ctx 650 0) (put-word ctx 652 0) (put-word ctx 653 0) (put-word ctx 677 0)
       (if (not (= (word ctx 600) 15)) (fail ctx 1)
       (if (not (self-test ctx)) (fail ctx 10)
         (let [block (i64-shift-left 1 (word ctx 609))]
@@ -246,3 +273,155 @@
                 (let [base (* first block)]
                   (do (put-word64 ctx 660 base)
                       (if (= (bpb ctx base) 0) (fail ctx 4) (walk ctx))))))))))))
+
+;; ---- AWAI-122 stage 4: write (FAT32 only) ----
+(defn data-store [at value] (kernel-store-u8-4k (kernel-subregion (kernel-owned-window 4 20480) 20480 16384 4096) 4096 at value))
+(defn poke8 [ctx offset value]
+  (if (= (ensure ctx offset) 0) 0
+    (do (data-store (bit-and offset 4095) (bit-and value 255)) (put-word ctx 653 1) 1)))
+(defn poke16 [ctx offset value]
+  (do (poke8 ctx offset value) (poke8 ctx (+ offset 1) (u64-shift-right value 8))))
+(defn poke32 [ctx offset value]
+  (do (poke16 ctx offset (bit-and value 65535)) (poke16 ctx (+ offset 2) (u64-shift-right value 16))))
+
+;; The write window is the ESP partition (run must have found it).
+(defn open-window [ctx]
+  (let [block (i64-shift-left 1 (word ctx 609))]
+    (nvme/open-window ctx (word64 ctx 660) (* (+ (word64 ctx 690) 1) block))))
+
+;; The disk offset of entry n in the directory at cluster c, or -2.
+(defn locate [ctx c pos n guard]
+  (if (or (= guard 0) (not (valid-cluster? ctx c))) -2
+    (if (>= pos (word ctx 665))
+      (let [next (next-cluster ctx c)]
+        (if (last-cluster? ctx next) -2 (locate ctx next 0 n (- guard 1))))
+      (let [at (+ (cluster-offset ctx c) pos)
+            r (entry ctx at n)]
+        (if (= r -3) -2 (if (= r -1) (locate ctx c (+ pos 32) n guard) at))))))
+;; A free entry (first byte 0 or 0xE5) in [at, end), or -1.
+(defn free-slot [ctx at end]
+  (if (>= at end) -1
+    (let [b (u8 ctx at)] (if (or (= b 0) (= b 229)) at (free-slot ctx (+ at 32) end)))))
+
+(defn fat-at [ctx c k] (+ (word64 ctx 666) (+ (* k (word ctx 689)) (* c 4))))
+(defn set-fat [ctx c value k]
+  (if (>= k (word ctx 688)) 1
+    (do (poke32 ctx (fat-at ctx c k) (bit-or (bit-and (u32 ctx (fat-at ctx c k)) 4026531840) value))
+        (set-fat ctx c value (+ k 1)))))
+(defn free? [ctx c] (= (bit-and (u32 ctx (fat-at ctx c 0)) 268435455) 0))
+(defn count-free [ctx c acc need]
+  (if (or (>= acc need) (>= c (word ctx 664))) acc
+    (count-free ctx (+ c 1) (if (free? ctx c) (+ acc 1) acc) need)))
+;; Link `need` free clusters from c on; returns the first. prev 0 = none yet.
+(defn alloc [ctx c need prev first]
+  (if (= need 0) (do (set-fat ctx prev 268435455 0) first)
+    (if (>= c (word ctx 664)) -1
+      (if (free? ctx c)
+        (do (if (> prev 0) (set-fat ctx prev c 0) 0)
+            (alloc ctx (+ c 1) (- need 1) c (if (= first 0) c first)))
+        (alloc ctx (+ c 1) need prev first)))))
+(defn entry-first [ctx at] (+ (u16 ctx (+ at 26)) (* (u16 ctx (+ at 20)) 65536)))
+(defn set-entry [ctx at first size]
+  (do (poke16 ctx (+ at 20) (u64-shift-right first 16))
+      (poke16 ctx (+ at 26) (bit-and first 65535))
+      (poke32 ctx (+ at 28) size)))
+(defn new-entry [ctx at i first size]
+  (if (< i 32)
+    (do (poke8 ctx (+ at i) (if (< i 11) (name-byte 4 i) (if (= i 11) 32 0))) (new-entry ctx at (+ i 1) first size))
+    (set-entry ctx at first size)))
+(defn flushed [ctx] (and (= (sync ctx) 1) (= (nvme/flush ctx) 0)))
+;; Free the chain from c on (every FAT copy).
+(defn free-rest [ctx c guard]
+  (if (or (= guard 0) (not (valid-cluster? ctx c))) 1
+    (let [n (next-cluster ctx c)]
+      (do (set-fat ctx c 0 0) (if (last-cluster? ctx n) 1 (free-rest ctx n (- guard 1)))))))
+;; Make the chain whose k-th cluster is c exactly `need` clusters long: end it
+;; there and free the rest, or extend it from free clusters. 0 done, 43 too
+;; few free clusters, 44 a broken chain.
+(defn fit-chain [ctx c k need guard]
+  (if (or (= guard 0) (not (valid-cluster? ctx c))) 44
+    (let [n (next-cluster ctx c)]
+      (if (= k need)
+        (do (set-fat ctx c 268435455 0) (if (last-cluster? ctx n) 0 (do (free-rest ctx n 1048576) 0)))
+        (if (last-cluster? ctx n)
+          (if (< (count-free ctx 2 0 (- need k)) (- need k)) 43
+            (if (< (alloc ctx 2 (- need k) c 0) 2) 43 0))
+          (fit-chain ctx n (+ k 1) need (- guard 1)))))))
+
+;; Ready the staging file for `size` bytes. run must have passed with path 1
+;; on FAT32. 0 ready, else 40 not FAT32 \EFI\ITONAMI\BOOTX64.EFI, 41 no free
+;; entry in BOOTX64.EFI's block, 42 UPDATE.BIN is in another block, 43 too few
+;; free clusters, 44 UPDATE.BIN's chain is broken, 45 a write failed. The
+;; staging chain is then fitted to the image (fit-chain) and its entry's size
+;; set to the chain, so the FAT stays consistent after the swap.
+(defn provision [ctx own size]
+  (let [block (i64-shift-left 1 (word ctx 609))
+        start (- own (bit-and own (- block 1)))
+        slot (free-slot ctx start (+ start block))
+        need (quot (+ size (- (word ctx 665) 1)) (word ctx 665))]
+    (if (< slot 0) 41
+      (if (< (count-free ctx 2 0 need) need) 43
+        (let [first (alloc ctx 2 need 0 0)]
+          (if (< first 2) 43
+            (if (not (flushed ctx)) 45
+              (do (new-entry ctx slot 0 first (* need (word ctx 665)))
+                  (if (flushed ctx) (do (put-word64 ctx 697 slot) 0) 45)))))))))
+(defn prepare [ctx size]
+  (if (or (not (= (word ctx 676) 15)) (not (= (word ctx 677) 1)) (not (= (word ctx 662) 32))) 40
+    (let [dir (dir-lookup ctx (root-lookup ctx 0) 1)
+          c (bit-and dir 4294967295)
+          own (if (< dir 0) -2 (locate ctx c 0 3 65536))
+          staged (if (< dir 0) -2 (locate ctx c 0 4 65536))
+          block (i64-shift-left 1 (word ctx 609))]
+      (if (< own 0) 40
+        (do (open-window ctx)
+            (put-word64 ctx 695 own)
+            (let [r (if (< staged 0) (provision ctx own size)
+                      (if (= (- staged (bit-and staged (- block 1))) (- own (bit-and own (- block 1))))
+                        (do (put-word64 ctx 697 staged) 0) 42))]
+              (if (> r 0) r
+                (let [first (entry-first ctx (word64 ctx 697))
+                      cb (word ctx 665)
+                      need (quot (+ size (- cb 1)) cb)
+                      fitted (fit-chain ctx first 1 need 1048576)]
+                  (if (> fitted 0) fitted
+                    (if (not (flushed ctx)) 45
+                      (do (poke32 ctx (+ (word64 ctx 697) 28) (* need cb))
+                          (if (flushed ctx)
+                            (do (put-word ctx 699 first) (put-word ctx 692 first) (put-word ctx 693 0) 0)
+                            45))))))))))))
+
+(defn stage-piece [ctx src off len]
+  (if (>= off len) 0
+    (let [c (word ctx 692) pos (word ctx 693) cb (word ctx 665)
+          block (i64-shift-left 1 (word ctx 609))]
+      (if (>= pos cb)
+        (let [next (next-cluster ctx c)]
+          (if (not (valid-cluster? ctx next)) -1
+            (do (put-word ctx 692 next) (put-word ctx 693 0) (stage-piece ctx src off len))))
+        (let [n (least (- len off) (- cb pos))
+              span (* (quot (+ n (- block 1)) block) block)]
+          (if (= (nvme/write-span ctx (+ (cluster-offset ctx c) pos) (+ src off) span) 0)
+            (do (put-word ctx 693 (+ pos n)) (stage-piece ctx src (+ off n) len))
+            -1))))))
+
+;; Write len bytes (<= 4096) from DMA address src into the staging chain at the
+;; cursor. 0 done, -1 the chain ended or a write failed.
+(defn stage-write [ctx src len]
+  (stage-piece ctx src 0 len))
+
+;; SHA-256 of `size` bytes of the chain from `first` (digest words 680..687,
+;; result word 676 as hash-file).
+(defn hash-chain [ctx first size]
+  (hash-file ctx (+ first (* size 4294967296))))
+
+;; BOOTX64.EFI := (staging first cluster, size); UPDATE.BIN := its old
+;; (first cluster, size). Both entries share one block, so this is one block
+;; write. 1 done, 0 a write failed.
+(defn swap [ctx size]
+  (let [own (word64 ctx 695) staged (word64 ctx 697)
+        old-first (entry-first ctx own) old-size (u32 ctx (+ own 28))
+        new-first (entry-first ctx staged)]
+    (do (set-entry ctx own new-first size)
+        (set-entry ctx staged old-first old-size)
+        (if (flushed ctx) 1 0))))
