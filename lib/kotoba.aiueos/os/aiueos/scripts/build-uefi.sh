@@ -1110,7 +1110,7 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_micro_infer_ne
   52dcbd0c677e9d619fb91090526e9bbe863624235ab22c359b2a515261ad4eed \
   kotoba_aiueos_micro_infer_next
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_aes128_gcm_selftest_object" \
-  45cee00c5bbf25060691cb86e1cd178c317f9746bf43b6dfde82c3ad0745a3c9 \
+  406ac2bf1e2ee781e829ad49ccea22065b98b1606c6adfb076147e102c0a2621 \
   kotoba_aiueos_aes128_gcm_selftest
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_x25519_object" \
   633ec4f074cabbca0d72b4c2943e50c629c2997eaae90fd52f179f6e73084544 \
@@ -1119,7 +1119,7 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_ecdsa_object" 
   c6766cfcd7e7bd4e3584c1aa461a4e8fd89522cff8534afdaa3b256acffebe13 \
   kotoba_aiueos_ecdsa_p256_sha256_verify
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_aes128_gcm_object" \
-  2b3b4c7d5f8800dc2c9f187e3693210bd1b69d0e434bc2f8ce78d2f236489f46 \
+  e4174d9e1c5c9e7d76673f7aec258b7483d6279f51605371d91558d15940cd3b \
   kotoba_aiueos_aes128_gcm
 # Qwen3.8-27B GGUF admission (ADR-0137). Verified unconditionally like every
 # object above, even in profiles that do not link them: the digests are what
@@ -1134,7 +1134,7 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_qwen35_tensor_
   193edbfc2c2e238980470e366442b11bd7222546b81d78e14d6ce74dbd79a608 \
   kotoba_aiueos_qwen35_tensor_table_bind
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_tls13_record_object" \
-  572b7e33640a413bb68e37f39f09e155282eefe86c33f9e2a31040c70a170d7a \
+  91966270c75d82f1c77307f9b919421cd59e788b7f2dfc485f092ab5a30e45c2 \
   kotoba_aiueos_tls13_record
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_cid_v1_admit_object" \
   4760b9183029babcad5b2d3dcf8418f4a970cbdc289e5c8a1b053d1149d6c333 \
