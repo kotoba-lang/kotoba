@@ -359,6 +359,27 @@ if [ "${AIUEOS_TEST_IVRS:-0}" = 1 ]; then iommu_args="-device amd-iommu"; fi
 # decision, and that is the thing actually under test here -- the taxonomy
 # records TPM2 as blocked on "a firmware this machine does not have", which is
 # a claim about OVMF, not about the device, and was never measured.
+# JUN-736: the PLC RT profile releases each scan on an exact APIC tick, and
+# without icount QEMU drives the APIC timer from the HOST clock. Measured
+# 2026-11-01 at load 17-30 with a tick trace: a host stall inside the timer ISR
+# (which EOIs before it calls the scheduler) let the next period's interrupt be
+# taken at iret, before tick-wait's cli, so the counter went release-1 ->
+# release+1 inside one sti; hlt; cli and the release was refused at a random
+# scan (3 of 6 traced runs; 2 of 12 untraced main runs passed). That is the
+# instrument, not the scan, so this profile ties the guest clock to the guest's
+# instruction count (ADR-0211: a deterministic guest clock; nothing here
+# reports a whole-run count). shift=4 is 16 ns per instruction, so one tick
+# (1.6 ms) is 100,000 instructions. In-guest rdtsc brackets under it measured
+# at most 3,747 instructions per timer ISR and 3,944 from a scan's first
+# capability call to its commit, a 26x and 100x margin on the tick and the
+# 4-tick budget. shift=0 (ADR-0211's counting setting) also passed, but its
+# boot took 466 s of QEMU time against 178 s at shift=4 (load ~105), because
+# every tick is then 1.6M instructions to execute. A late release is still refused (AIUEOS_PLC_RT_FORCE_MISS
+# proves it); AIUEOS_PLC_RT_ICOUNT=0 boots the host-clock arm for comparison.
+icount_args=
+if [ "${AIUEOS_PLC_RT_SMOKE:-0}" = 1 ] && [ "${AIUEOS_PLC_RT_ICOUNT:-1}" = 1 ]; then
+  icount_args="-icount shift=4,sleep=off"
+fi
 tpm_args=
 if [ "${AIUEOS_TEST_TPM2:-0}" = 1 ]; then
   if command -v swtpm >/dev/null 2>&1; then
@@ -1343,6 +1364,7 @@ PY
     -chardev file,id=debug,path="$log" \
     -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
     $iommu_args \
+    $icount_args \
     $tpm_args \
     $usb_args \
     $net_args \
@@ -1577,6 +1599,28 @@ if [ "$status" -eq 124 ]; then
   exit 1
 fi
 
+if [ "${AIUEOS_PLC_RT_SMOKE:-0}" = 1 ] && [ -n "${AIUEOS_PLC_RT_FORCE_MISS:-}" ]; then
+  # Negative control (JUN-736): scan N released one tick late must stop the run
+  # at stage 4+N with FAULT_RELEASE (1) latched, observed = release + 1.
+  miss_stage=$((4 + AIUEOS_PLC_RT_FORCE_MISS))
+  [ "$status" -eq 225 ] || {
+    echo "error: forced missed release produced QEMU status $status, expected 225 (0x70)" >&2
+    test -f "$serial_log" && tail -30 "$serial_log" >&2
+    exit 1
+  }
+  miss_line=$(grep -a -o "AIUEOS_PLC_RT_FAIL embedded-elf-provider-or-safe-state stage=$miss_stage loader=7 fault=1 release=[0-9]* observed=[0-9]*" "$serial_log" | head -1)
+  miss_release=${miss_line##* release=}; miss_release=${miss_release%% *}
+  miss_observed=${miss_line##*observed=}
+  [ -n "$miss_line" ] && [ "$miss_observed" -eq $((miss_release + 1)) ] || {
+    echo "error: forced missed release at scan $AIUEOS_PLC_RT_FORCE_MISS was not refused with fault=1 at release+1" >&2
+    test -f "$serial_log" && grep -a "AIUEOS_PLC_RT" "$serial_log" >&2
+    exit 1
+  }
+  ! grep -a -q "AIUEOS_PLC_RT_OK" "$serial_log" || {
+    echo "error: forced missed release still printed AIUEOS_PLC_RT_OK" >&2; exit 1; }
+  echo "AIUEOS_PLC_RT_MISS_REFUSED_OK scan=$AIUEOS_PLC_RT_FORCE_MISS stage=$miss_stage fault=release release=$miss_release observed=$miss_observed"
+  exit 0
+fi
 if [ "${AIUEOS_PLC_RT_SMOKE:-0}" = 1 ]; then
   [ "$status" -eq 133 ] || {
     echo "error: PLC RT smoke produced unexpected QEMU status $status" >&2
@@ -1587,7 +1631,8 @@ if [ "${AIUEOS_PLC_RT_SMOKE:-0}" = 1 ]; then
     echo "error: native PLC RT provider evidence was not observed" >&2
     exit 1
   }
-  echo "AIUEOS_PLC_RT_QEMU_OK scans=100 signed-elf tamper-rejected fixed-priority-preemption native-provider apic-release transactional-output safe-state"
+  plc_clock=icount-shift4; [ -n "$icount_args" ] || plc_clock=host
+  echo "AIUEOS_PLC_RT_QEMU_OK scans=100 signed-elf tamper-rejected fixed-priority-preemption native-provider apic-release transactional-output safe-state clock=$plc_clock"
   exit 0
 fi
 if [ "${AIUEOS_ZERO_CAP_USER_SMOKE:-0}" = 1 ]; then
