@@ -95,9 +95,11 @@ the same inputs (byte i = (7i + 3) mod 256). Python only compared the printed li
 the image computed every digest.
 
 Not yet: the incremental XOF, the CAVP files under `test/sha3/cavp/` run natively
-(the gate embeds the published examples; the `.cljk` suite runs the CAVP files), a
-an x86_64 run of the gate. It runs in CI on Linux arm64 (`scripts/check-pq-native.py`,
-since kotoba#1014).
+(the gate embeds the published examples; the `.cljk` suite runs the CAVP files), and
+an x86_64 run of this gate: it prints its oracle lines through `:io/write`, which amu's
+locked x86 project adapter refuses (E7101, a capability), so it is skipped there. SHA-3
+itself runs on x86_64 inside the ML-KEM and ML-DSA gates. This gate runs in CI on Linux arm64
+(`scripts/check-pq-native.py`, since kotoba#1014).
 
 ## Non-claims
 

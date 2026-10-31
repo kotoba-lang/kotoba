@@ -82,13 +82,13 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_msr_write_obje
   a6ae6efbe7c3a7543b391b01a9203906532b3c4328fb38bafb2d093b37bfe20d \
   kotoba_aiueos_msr_write
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_acpi_checksum_object" \
-  f92dd1922a7d4dd2bb30614d3f8058da671b5f154bd9b5c452174ae8a17a5978 \
+  fa74f733deac18f7c1a0bc126c2bcbc0ab5d3e5f9a9825c9ff1c0a78c2a38d10 \
   kotoba_aiueos_acpi_checksum_ok
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_acpi_table_valid_object" \
-  66e621af0bbd4f7436a03a52e945d10f99a87b2608554aa1f9e997b36b1de1f6 \
+  e0892a0b0da830e332f7c4f0e6204f6d4d65575eb066aa4f3fd9a9a9136e7887 \
   kotoba_aiueos_acpi_table_valid
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_pic_disable_object" \
-  c88ff01d1eb89f9cf549f4c0ca24f34928f948cab4a96cad82a8ab518bf7fad1 \
+  77e0b58183e383b81d6b98ecf7179103222612154a57bdaa38c505b79f807e16 \
   kotoba_aiueos_pic_disable
 
 zig cc -target x86_64-freestanding-none \
