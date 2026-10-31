@@ -184,7 +184,23 @@ RTL8168, so the gate checks the verifier's boot self-test (KDBG 0xc118): it
 accepts a 5000-byte fixture signed with the published RFC 8032 test-1 seed,
 and refuses it when one manifest byte or one image byte is changed, through
 the chunk path the network uses. The network pull is checked only on the
-board. Still open: Ed25519 only (no ML-DSA verifier yet), and no rollback
+board. On the 6600H the self-test passed and one boot pulled the 6 MB image in
+13.3 s (result 15, digest equal to the signed SHA-256), refused it under
+another key (1, no image bytes taken) and refused it with one byte changed
+(7): `docs/evidence/awai122-signed-image-6600h-20261031`. That run found an
+RTL8168 RX stall: a frame arriving while the single RX descriptor is the
+kernel's raises RxDescUnavail and the chip receives nothing more until
+IntrStatus is cleared, which the boot-time NVMe/ESP work made happen every
+boot (signed commands were dead on main since stage 1). `rx-release` now
+clears IntrStatus; KDBG 0xc00f (frames seen, last frame) and 0xc00e (RX
+descriptor, ChipCmd, RxConfig) are logged with the nonce heartbeat.
+Hardware iterations need no power cycle while a `--watchdog v1` debug image
+runs: it resets about every 100 s into whatever PXE serves, so swap the served
+image and wait for KDBG 0008 (desktop loop up) before sending commands; a
+command sent during boot is lost with that boot's nonce. A board running
+the installed OS, powered off, or on an image without the watchdog still
+needs a manual (or switched-outlet) power cycle.
+Still open: Ed25519 only (no ML-DSA verifier yet), and no rollback
 protection beyond version >= 1, since no installed version is kept.
 Writing the ESP is stage 4.
 
