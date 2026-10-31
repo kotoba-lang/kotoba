@@ -1,15 +1,19 @@
 #!/bin/sh
 # JUN-555: run one Kotoba build generator natively with the pinned Amu Mac root.
 #
-#   run-native-generator.sh GENERATOR.kotoba DEST [--input NAME=PATH]... -- [ARG]...
+#   run-native-generator.sh GENERATOR.kotoba DEST [--seed NAME] [--input NAME=PATH]... -- [ARG]...
 #
-# The generator source is appended to the exact Amu seed 00/01/02 helpers,
+# The generator source is appended to the exact Amu seed 00/01/02 helpers (and any
+# further pinned seed module named by --seed, such as 03-source-sha256),
 # compiled by the pinned Amu compiler, packaged by the pinned packager
 # (fs2-cli-stdio-general) and run with an empty environment and its FD 3 scope
 # set to a fresh private directory. That directory holds only the named inputs,
 # so the program can read those and write nothing outside it. It is called as
 # `program out ARG...`; on exit 0 with an empty stderr its `out` file replaces
 # DEST. Anything else refuses: there is no Python or hosted fallback.
+# An ARG `@size:NAME` is replaced by the byte size of the staged input NAME: on this
+# Amu root the FS2 whole-file read and stat trap, so generators read their inputs
+# in bounded slices of a size the runner measured on its own private copy.
 #
 # AIUEOS_AMU_SOURCE names the Amu checkout (default: the kotoba-lang/amu sibling of
 # this kotoba checkout). Its compiler, packager and seed bytes must match the pins.
@@ -27,6 +31,7 @@ amu=${AIUEOS_AMU_SOURCE:-"$here/../../../../../../amu"}
   || die "needs the Apple Silicon Amu root; this host has no native route (no Python fallback)"
 [ -d "$amu" ] || die "Amu source not found at $amu (set AIUEOS_AMU_SOURCE)"
 amu=$(CDPATH= cd -- "$amu" && pwd)
+case "$amu" in *[[:space:]]*) die "Amu source path must not contain whitespace: $amu" ;; esac
 [ -f "$generator" ] && [ ! -L "$generator" ] || die "generator source missing or a symlink: $generator"
 
 # Amu 3c9eb7f7 (seed/bootstrap/aarch64-macos/root.json and the seeds it was built with).
@@ -43,13 +48,26 @@ pin "$packager" e95284408f091c8979ef74ece57116a4df2250e61e42074da5dc95ca30264142
 pin "$amu/seed/00-ns-static.kotoba" 4ec4d56aef26b60bf4fdb9d070691c9355055e4ff79db960790f1afc4b7fd8b1
 pin "$amu/seed/01-mem.kotoba" 8a3a191d6e735f16363228854714869ea8d71d15373cedb40c359a1f9cd36159
 pin "$amu/seed/02-io.kotoba" 6427f01e724a57142590a6b1942cfbca24ea4e4bbdd82e6ecbdecd50d8df1238
+seed_pin() {
+  case "$1" in
+    03-source-sha256) echo 40be511b6879d1c4c6a4b443b796ec1ef5cbe561d5c69c6ae52b8e62a96393d1 ;;
+    *) die "no pinned Amu seed module named $1" ;;
+  esac
+}
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/aiueos-native-generator.XXXXXX")
 trap 'rm -rf "$work"' EXIT HUP INT TERM
 mkdir "$work/build" "$work/scope"
+extra_seeds=
 
 while [ "$#" -gt 0 ] && [ "$1" != -- ]; do
-  [ "$1" = --input ] && [ "$#" -ge 2 ] || die "expected --input NAME=PATH or --"
+  if [ "$1" = --seed ] && [ "$#" -ge 2 ]; then
+    pin "$amu/seed/$2.kotoba" "$(seed_pin "$2")"
+    extra_seeds="$extra_seeds $amu/seed/$2.kotoba"
+    shift 2
+    continue
+  fi
+  [ "$1" = --input ] && [ "$#" -ge 2 ] || die "expected --seed NAME, --input NAME=PATH or --"
   name=${2%%=*} path=${2#*=}
   case "$name" in ''|out|*/*|.*) die "invalid input name: $name" ;; esac
   [ "$name" != "$2" ] && [ -f "$path" ] || die "input missing: $2"
@@ -60,7 +78,7 @@ done
 [ "$#" -gt 0 ] || die "missing -- before the generator arguments"
 shift
 
-for part in "$amu/seed/00-ns-static.kotoba" "$amu/seed/01-mem.kotoba" "$amu/seed/02-io.kotoba" "$generator"; do
+for part in "$amu/seed/00-ns-static.kotoba" "$amu/seed/01-mem.kotoba" "$amu/seed/02-io.kotoba" $extra_seeds "$generator"; do
   cat "$part"
   echo
 done > "$work/build/generator.kotoba"
@@ -83,6 +101,17 @@ chmod 755 "$work/build/generator.macho"
 /usr/bin/codesign --force --sign - "$work/build/generator.macho" 2>/dev/null \
   || die "ad-hoc signing the generator failed"
 
+for arg do
+  shift
+  case "$arg" in
+    @size:*)
+      name=${arg#@size:}
+      case "$name" in ''|out|*/*|.*) die "invalid input name: $name" ;; esac
+      [ -f "$work/scope/$name" ] || die "@size names no staged input: $name"
+      arg=$(wc -c < "$work/scope/$name" | tr -d ' ') ;;
+  esac
+  set -- "$@" "$arg"
+done
 status=0
 (cd "$work/scope" && env -i PATH=/nonexistent "$work/build/generator.macho" out "$@" 3<.) \
   > "$work/run.stdout" 2> "$work/run.stderr" || status=$?
