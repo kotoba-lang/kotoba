@@ -40,7 +40,7 @@ def main():
     digest = hashlib.sha256(blob).hexdigest()
     if (receipt.get("format") != "aiueos-plc-native-receipt/v1" or
             receipt.get("profile") != "aiueos-plc-v1" or
-            receipt.get("target") != "x86_64-aiueos-user-v1"):
+            receipt.get("target") != "x86_64-aiueos-user-plc-v1"):
         raise SystemExit("error: incompatible PLC receipt")
     if not SHA256.fullmatch(str(receipt.get("native_elf_sha256", ""))) or \
             receipt["native_elf_sha256"] != digest:
@@ -61,6 +61,9 @@ def main():
                                  for index in range(0, 64, 2))
     signature_asm = ",".join(f"0x{value:02x}" for value in signature)
     public_key_asm = ",".join(f"0x{value:02x}" for value in public_key)
+    # KOTOBA-175: each array 16-byte aligned, as the zero-cap twin does. The x86-64 ABI aligns a global array of 16 or
+    # more bytes to 16, so the compiler may copy one with movaps: loader.c's signature copy #GPs (measured 2026-11-01)
+    # when an 8280-byte ELF leaves the arrays after it at 8 mod 16.
     args.output.write_text(
         '.section .rodata.plc_elf,"a",@progbits\n'
         '.balign 16\n'
@@ -69,15 +72,19 @@ def main():
         'aiueos_plc_elf_start:\n'
         f'.incbin "{path}"\n'
         'aiueos_plc_elf_end:\n'
+        '.balign 16\n'
         '.global aiueos_plc_elf_sha256\n'
         'aiueos_plc_elf_sha256:\n'
         f'.byte {digest_bytes}\n'
+        '.balign 16\n'
         '.global aiueos_plc_receipt_sha256\n'
         'aiueos_plc_receipt_sha256:\n'
         f'.byte {receipt_bytes_asm}\n'
+        '.balign 16\n'
         '.global aiueos_plc_signature\n'
         'aiueos_plc_signature:\n'
         f'.byte {signature_asm}\n'
+        '.balign 16\n'
         '.global aiueos_plc_public_key\n'
         'aiueos_plc_public_key:\n'
         f'.byte {public_key_asm}\n', encoding="ascii")
