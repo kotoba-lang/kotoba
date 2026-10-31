@@ -1050,13 +1050,13 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_qwen35_detoken
   d1713172ee70aaf0c46c3f06fe38a37eb103219192d708fe1b8acf556ec9cea0 \
   kotoba_aiueos_qwen35_detokenize
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_digest_equal_object" \
-  d5af2bd0ed029cb5e2c64445dc28cf360a09f7467e684d0b3ebb8b50f2417a46 \
+  2eaa8a5430555d37d3e90a9b760d9fcbe007ddef5098a2ffa6570d157d0cc7a1 \
   kotoba_aiueos_digest_equal
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_catalog_valid_object" \
-  fb2421c25351d62061b62266f12b63fdd1bf16cd917da2dd852018ad29ac6777 \
+  a19c5656e46b729806150878734f8029a3f4b9665498710e3be6355abd37eb03 \
   kotoba_aiueos_app_catalog_valid
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_app_lookup_object" \
-  ec822fe970c315e15c997372f30cb4c016c482c0192e550117c4c1a69000b771 \
+  51200387544992fb11849df9d5dea35d1bd2a9460b64d06d415d37c9875514b5 \
   kotoba_aiueos_app_lookup_plan
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_user_elf_valid_object" \
   "$kotoba_user_elf_valid_sha" \
@@ -1124,13 +1124,13 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_relay_ack_obje
   e5bafb1b7fd0e57ecf2cc5e7521a9c960f9e7005a455c6bd7aecf2e359bd42bb \
   kotoba_aiueos_relay_ack_payload_valid
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_inference_status_valid_object" \
-  7bffa1b85e1835493a624c85dd4cee15a63f48e180521055efd17d4e700d60a8 \
+  21de5e407a735ac9b312c40810b4a736ab74892934b0be4dc9b924ac04b968bc \
   kotoba_aiueos_inference_status_valid
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_inference_rate_object" \
   069d218c6a91a3ac4728d461a2089977f39f9d84b2a62dfa2800159d1450a41c \
   kotoba_aiueos_inference_milli_tokens_per_second
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_model_mapping_plan_object" \
-  c636da1971323aeba566cec7d64a7c116cda77bf75e2248ad4371beda0587d35 \
+  776eb094e302e7b909218df2a96bef104a2290813904b903fde0aaeed894a684 \
   kotoba_aiueos_model_mapping_plan
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_model_handoff_validate_object" \
   057a0ba7a1d150b5eeca2a3e3d8c95642e3aa140181f6f20d5cdbb2f2a8a6c10 \
