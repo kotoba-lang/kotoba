@@ -58,9 +58,18 @@ yet perform full semantic admission or compilation, nor expose the CID on the
 public CLI. The public launcher, other `check` modes, and the remaining command
 execution paths are still open.
 
-The same native fixture is wired to the x86 controller job using the complete
-native x86 F3 compiler and x86 runner. That x86 CLI check requires a terminal
-CI run and artifact readback before qualification.
+The x86 controller job runs the same script with the complete native x86 F3
+compiler. Execution of the fixture on x86 is **blocked** at Amu `ce982703`
+(KOTOBA-174): F3 admits the CID-locked sources (`compile --target aarch64-macos`
+with the source lock), but the only `x86_64-linux` route that accepts a source
+lock, the `kx64-v1` project adapter (`seed/98-x86_64-project.kotoba`), refuses
+the fixture's value operations (observed: E7102, `f64-to-bits` in Amu
+`src/kotoba/form.kotoba`) and every capability call (E7101), `--format static`
+takes one unlocked source, and
+the packed kseed runner exists only for `aarch64-linux`. The step asserts that
+refusal and records `BLOCKED_NATIVE_X86_CLI_REQUEST_EXECUTION`; it fails once
+Amu accepts the locked project on x86, so the x86 execution must then be wired.
+x86 request execution is not qualified.
 
 An input path for `cli-contract` and unsupported `--source-path`, `--json`,
 `--safe=false`, or non-Kotoba target forms are refused rather than silently accepted.
