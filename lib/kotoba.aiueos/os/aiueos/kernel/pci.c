@@ -1235,13 +1235,13 @@ struct virtio_caps {
 
 extern uint64_t kotoba_aiueos_virtio_cap_valid(
   uint64_t pointer, uint64_t cap_length, uint64_t bar, uint64_t offset, uint64_t length); extern int64_t kotoba_aiueos_virtio_caps_find(uint64_t header, uint64_t header_length, uint64_t record, uint64_t record_length); extern int64_t kotoba_aiueos_virtio_negotiate(uint64_t cfg, uint64_t length); extern int64_t kotoba_aiueos_virtio_queue_setup(uint64_t cfg, uint64_t length, uint64_t record, uint64_t record_length); extern int64_t kotoba_aiueos_virtq_post(uint64_t desc, uint64_t desc_length, uint64_t avail, uint64_t avail_length, uint64_t record, uint64_t record_length); extern int64_t kotoba_aiueos_virtq_used_index(uint64_t used, uint64_t used_length); extern int64_t kotoba_aiueos_virtq_used_elem(uint64_t used, uint64_t used_length, uint64_t slot); extern int64_t kotoba_aiueos_virtq_wait(uint64_t used, uint64_t used_length, uint64_t counter, uint64_t counter_length, uint64_t before, uint64_t want, uint64_t rounds); extern uint64_t kotoba_aiueos_kbd_reap(uint64_t used, uint64_t used_length, uint64_t avail, uint64_t avail_length, uint64_t event, uint64_t event_length, uint64_t state); extern uint64_t kotoba_aiueos_msix_program(uint64_t entry, uint64_t entry_length, uint64_t cfg, uint64_t cfg_length, uint64_t address, uint64_t data, uint64_t vector);
-extern uint64_t kotoba_aiueos_pci_extent_valid(uint64_t value, uint64_t size);
+extern uint64_t kotoba_aiueos_pci_extent_valid(uint64_t value, uint64_t size); extern int64_t kotoba_aiueos_virtio_window(int64_t bar, int64_t offset, int64_t length);
 extern uint64_t kotoba_aiueos_pci_region_valid(
   uint64_t offset, uint64_t bytes, uint64_t bar_length); extern int64_t kotoba_aiueos_pci_bar_kind(int64_t low, int64_t index); extern int64_t kotoba_aiueos_pci_bar_value(int64_t low, int64_t high); extern int64_t kotoba_aiueos_pci_bar_base(int64_t low, int64_t high, int64_t index); extern int64_t kotoba_aiueos_pci_bar_size(int64_t mask_low, int64_t mask_high, int64_t kind);
-static int cap_selftest(void) {
-  return kotoba_aiueos_virtio_cap_valid(0x40,20,0,0x1000,0x38) &&
-         !kotoba_aiueos_virtio_cap_valid(0x40,20,0,0xfffffff0U,0x40) &&
-         !kotoba_aiueos_virtio_cap_valid(0x40,20,0,0,0);
+static int cap_selftest(void) { /* JUN-600: and kotoba/virtio-window.o, which forms map_transport's windows */
+  return kotoba_aiueos_virtio_cap_valid(0x40,20,0,0x1000,0x38) && kotoba_aiueos_virtio_window(0xfe000000LL,0x1000,0x38) == 0xfe001000LL &&
+         !kotoba_aiueos_virtio_cap_valid(0x40,20,0,0xfffffff0U,0x40) && !kotoba_aiueos_virtio_window((int64_t)0xffffffff00000000ULL,0x1000,0x38) &&
+         !kotoba_aiueos_virtio_cap_valid(0x40,20,0,0,0) && !kotoba_aiueos_virtio_window(0,0x1000,0x38);
 }
 static int read_bar(uint8_t b, uint8_t d, uint8_t f, uint8_t index, uint64_t *base) {
   if (index >= 6 || !base) return 0;
@@ -1495,15 +1495,15 @@ static int setup_blk_msix(uint8_t b, uint8_t d, uint8_t f,
 static int map_transport(uint8_t b, uint8_t d, uint8_t f, const struct virtio_caps *caps,
                          volatile struct virtio_common_cfg **cfg_out,
                          uint64_t *notify_base_out) {
-  uint64_t common_bar, notify_bar;
+  uint64_t common_bar, notify_bar, common = 0, notify = 0; /* JUN-600: the windows are kotoba/virtio-window.o */
   if (!read_bar(b,d,f,caps->common.bar,&common_bar) ||
       !read_bar(b,d,f,caps->notify.bar,&notify_bar) ||
-      common_bar + caps->common.offset < common_bar ||
-      notify_bar + caps->notify.offset < notify_bar ||
-      !aiueos_map_pci_mmio(common_bar + caps->common.offset, caps->common.length) ||
-      !aiueos_map_pci_mmio(notify_bar + caps->notify.offset, caps->notify.length)) return 0;
-  *cfg_out = (volatile void *)(uintptr_t)(common_bar + caps->common.offset);
-  *notify_base_out = notify_bar + caps->notify.offset;
+      !(common = (uint64_t)kotoba_aiueos_virtio_window((int64_t)common_bar, caps->common.offset, caps->common.length)) ||
+      !(notify = (uint64_t)kotoba_aiueos_virtio_window((int64_t)notify_bar, caps->notify.offset, caps->notify.length)) ||
+      !aiueos_map_pci_mmio(common, caps->common.length) ||
+      !aiueos_map_pci_mmio(notify, caps->notify.length)) return 0;
+  *cfg_out = (volatile void *)(uintptr_t)common;
+  *notify_base_out = notify;
   return 1;
 }
 
