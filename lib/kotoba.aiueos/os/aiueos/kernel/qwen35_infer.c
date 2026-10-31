@@ -688,9 +688,13 @@ static void linear_output_norm_c(float *values, float *gate, uint32_t heads,
 #define QWEN_ACT_CONV4_NEXT 6U
 
 #if AIUEOS_QWEN35_KOTOBA_PARITY == 2 || !defined(AIUEOS_QWEN35_C_REFERENCE_NORM)
-extern uint64_t kotoba_aiueos_qwen35_activation(uint64_t mode, float *a,
-                                                const float *b, uint64_t count,
-                                                uint64_t spare);
+/* JUN-633: every pointer comes with its own length (amu's native object route).
+   mode_channel is the mode (0..6) | the channel << 8; modes 5 and 6 (the conv)
+   compute that one channel, so conv4 calls once per channel. A length the
+   shape does not give, or a channel past count, is refused (-9). */
+extern uint64_t kotoba_aiueos_qwen35_activation(uint64_t mode_channel, float *a, uint64_t a_length,
+                                                const float *b, uint64_t b_length, float *h,
+                                                uint64_t h_length, uint64_t count);
 /* JUN-633: every pointer comes with its own length (amu's native object route).
    mode_heads is the mode (0..3) | the head count << 8; count is mode 0's count
    or modes 1..3's width. A length that is not the one the shape gives is
@@ -777,17 +781,24 @@ static int l2_norm_heads(float *values, uint32_t heads, uint32_t width) {
 
 static int activate(uint32_t mode, float *values, const float *gate,
                     uint64_t count) {
-  return kotoba_aiueos_qwen35_activation(mode, values, gate, count, 0) == 0;
+  return kotoba_aiueos_qwen35_activation(mode, values, count * 4U, gate, gate ? count * 4U : 0, 0, 0,
+                                         count) == 0;
 }
 
-/* The conv is modes 5 and 6 of the activation object, with the history's
-   address in its fifth word. Mode 6 refuses a null history; a later token
-   without a cache is not a state this pass can reach. */
+/* The conv is modes 5 and 6 of the activation object, one channel per call
+   (each channel touches only its own value, kernel row and history row), with
+   the history as its third region. Mode 6 refuses a null history; a later token
+   without a cache is not a state this pass can reach. The loop makes at least
+   one call, so a zero count is refused by the object as before. */
 static int conv4(float *values, const float *kernel, float *history,
                  uint64_t position, uint64_t count) {
-  return kotoba_aiueos_qwen35_activation(
-    position ? QWEN_ACT_CONV4_NEXT : QWEN_ACT_CONV4_FIRST, values, kernel,
-    count, (uint64_t)(uintptr_t)history) == 0;
+  uint64_t mode = position ? QWEN_ACT_CONV4_NEXT : QWEN_ACT_CONV4_FIRST, channel = 0;
+  do {
+    if (kotoba_aiueos_qwen35_activation(mode | channel << 8, values, count * 4U, kernel, count * 16U,
+                                        history, history ? count * 12U : 0, count) != 0)
+      return 0;
+  } while (++channel < count);
+  return 1;
 }
 
 /* The output norm is mode 3 of the norm object, in place over `values`; the
@@ -801,8 +812,8 @@ static float *linear_output_norm(float *values, float *gate, uint32_t heads,
   if (kotoba_aiueos_qwen35_norm(3U | (uint64_t)heads << 8, (uint64_t)(uintptr_t)values,
                                 (uint64_t)heads * width * 4U, (uint64_t)(uintptr_t)weights,
                                 (uint64_t)width * 4U, 0, 0, width) != 0 ||
-      kotoba_aiueos_qwen35_activation(QWEN_ACT_SILU_GATE, gate, values,
-                                      (uint64_t)heads * width, 0) != 0)
+      kotoba_aiueos_qwen35_activation(QWEN_ACT_SILU_GATE, gate, (uint64_t)heads * width * 4U, values,
+                                      (uint64_t)heads * width * 4U, 0, 0, (uint64_t)heads * width) != 0)
     return 0;
   return gate;
 }
@@ -2236,13 +2247,13 @@ static int qwen_parity_activation(void) {
         return 0;
   }
   /* Refusals, so the object is not merely believed to compute. */
-  if (kotoba_aiueos_qwen35_activation(7, qwen_parity_act_obj,
-                                      qwen_parity_act_gate,
-                                      QWEN_PARITY_ACT, 0) != (uint64_t)(int64_t)-2)
+  if (kotoba_aiueos_qwen35_activation(7, qwen_parity_act_obj, QWEN_PARITY_ACT * 4U,
+                                      qwen_parity_act_gate, QWEN_PARITY_ACT * 4U, 0, 0,
+                                      QWEN_PARITY_ACT) != (uint64_t)(int64_t)-2)
     return 0;
-  if (kotoba_aiueos_qwen35_activation(QWEN_ACT_CONV4_NEXT, qwen_parity_act_obj,
-                                      qwen_parity_conv_kernel,
-                                      QWEN_PARITY_ACT, 0) != (uint64_t)(int64_t)-5)
+  if (kotoba_aiueos_qwen35_activation(QWEN_ACT_CONV4_NEXT, qwen_parity_act_obj, QWEN_PARITY_ACT * 4U,
+                                      qwen_parity_conv_kernel, QWEN_PARITY_ACT * 16U, 0, 0,
+                                      QWEN_PARITY_ACT) != (uint64_t)(int64_t)-5)
     return 0;
   return 1;
 }
