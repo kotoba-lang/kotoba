@@ -1,0 +1,192 @@
+(ns multirotor.closure-test
+  "Baseline aircraft throughout: 1.5 kg of payload, 20 minutes of hover, four
+  rotors, 90 N/m^2 disc loading, 2:1 thrust margin, high-rate LiPo. It closes at
+  4.926 kg on 413 mm rotors drawing 558 W — a real quadrotor of that class.
+
+  These numbers moved on 2026-08-30 when motor mass stopped coming from the
+  traction-motor shear model (40-53% heavy at this scale) and started coming
+  from motor.bldc, fitted to published motors. The aircraft got LIGHTER, and
+  with it the feasible envelope grew: designs that used to be reported as
+  non-existent now close."
+  (:require [kotoba.test :refer [deftest testing is]]
+            [multirotor.closure :as mc]
+            [rotor.solver :as rotor]
+            [pack.solver :as pack]))
+
+(def baseline {:payload-kg 1.5 :endurance-min 20.0})
+
+(defn close?
+  ([a b] (close? a b 1.0e-3))
+  ([a b tol] (< (Math/abs (- (double a) (double b)))
+                (* tol (max 1.0 (Math/abs (double b)))))))
+
+;; ── it closes, and on a real aircraft ─────────────────────────────────────
+
+(deftest the-baseline-closes
+  (let [r (mc/check baseline)
+        d (:design r)]
+    (is (true? (:converged? r)))
+    (is (true? (:feasible? r)))
+    (is (empty? (:violations r)))
+    (is (close? (:mtow-kg r) 4.925570))
+    (testing "the breakdown"
+      (let [b (:breakdown d)]
+        (is (close? (:battery-kg b)   1.5228831))
+        (is (close? (:motors-kg b)    0.3058849))
+        (is (close? (:rotors-kg b)    0.1154308))
+        (is (close? (:structure-kg b) 1.2313716))))
+    (testing "the aircraft"
+      (is (close? (* 1000.0 (:d-rotor-m (:rotor d))) 413.3222))
+      (is (close? (:p-elec-hover-W d) 557.7661))
+      (is (close? (:c-rate-hover d) 2.4814139)))))
+
+(deftest the-breakdown-sums-to-the-mass
+  (let [d (:design (mc/close-mass baseline))]
+    (is (close? (reduce + (vals (:breakdown d))) (:mtow-kg d) 1.0e-12))))
+
+(deftest the-converged-mass-is-a-fixed-point
+  ;; Feed the answer back in: a converged mass must reproduce itself to within
+  ;; the tolerance the loop stops at, and no looser. Asserting tighter than
+  ;; `tolerance-kg` would be asserting something the algorithm never promised.
+  (let [r (mc/close-mass baseline)
+        again (mc/step (:concept r) (:mtow-kg r))
+        residual (Math/abs (- (:mtow-kg again) (:mtow-kg r)))]
+    (is (< residual mc/tolerance-kg))
+    (is (pos? residual) "a zero residual would mean step is not being run")))
+
+(deftest the-loop-climbs-from-a-strict-lower-bound
+  ;; Seeded at payload + avionics, which the aircraft must carry whatever else
+  ;; it is made of, and monotone from there — so stopping early under-reports
+  ;; rather than over-reports.
+  (let [{:keys [history concept]} (mc/close-mass baseline)
+        floor (+ (:payload-kg concept) (:avionics-kg concept))]
+    (is (> (count history) 1))
+    (is (every? #(>= % floor) history))
+    (is (= history (sort history)))))
+
+(deftest the-efficiency-chain-is-wired-through
+  ;; The electrical hover draw must be the rotors' shaft power divided by the
+  ;; motor and ESC efficiencies — a dropped rotor count or a dropped efficiency
+  ;; both show up here.
+  (let [r (mc/close-mass baseline)
+        d (:design r)
+        c (:concept r)]
+    (is (close? (:p-elec-hover-W d)
+                (/ (* (:rotors c) (:p-shaft-W (:rotor d)))
+                   (* (:eta-motor c) (:eta-esc c)))
+                1.0e-12))
+    (testing "and the battery counted is the battery that draw sizes"
+      (is (close? (:battery-kg (:breakdown d))
+                  (:pack-mass-kg (pack/size-for-endurance
+                                  {:p-elec-W (:p-elec-hover-W d)
+                                   :endurance-min (:endurance-min c)
+                                   :chemistry (:chemistry c) :dod (:dod c)
+                                   :cell-mass-frac (:cell-mass-frac c)}))
+                  1.0e-12)))
+    (testing "and the rotor is the rotor that mass needs"
+      (is (close? (:d-rotor-m (:rotor d))
+                  (:d-rotor-m (rotor/size-for-thrust
+                               {:thrust-N (/ (* (:mtow-kg r) mc/g) (:rotors c))
+                                :disc-loading-N-m2 (:disc-loading-N-m2 c)
+                                :tip-mach (:tip-mach c) :altitude-m (:altitude-m c)
+                                :fm (:fm c)}))
+                  ;; the converged mass carries a residual of at most
+                  ;; tolerance-kg (0.1 g on 5.3 kg), so the rotor sized from it
+                  ;; agrees to about 2e-5 relative — not to machine precision
+                  1.0e-4)))))
+
+(deftest peak-power-is-the-thrust-margin-to-the-three-halves
+  ;; Hovering at half throttle means peak thrust is 2x, and momentum theory
+  ;; charges 2^1.5 = 2.828 for it. This is why a thin margin is expensive.
+  (let [d (:design (mc/close-mass baseline))]
+    (is (close? (/ (:p-elec-peak-W d) (:p-elec-hover-W d)) 2.828427))
+    (is (close? (/ (:c-rate-peak d) (:c-rate-hover d)) 2.828427))))
+
+;; ── the two ways a design fails are DIFFERENT findings ────────────────────
+
+(deftest over-the-ceiling-is-not-the-same-as-no-fixed-point
+  ;; This is the distinction the closure exists to make. 12 kg for 12 minutes is
+  ;; a real aircraft that weighs 27 kg — too heavy for the 25 kg class, but it
+  ;; exists. 1.5 kg for an hour does not exist at any mass. Reporting the first
+  ;; as the second tells an engineer to abandon a design that is merely in the
+  ;; wrong class.
+  (let [heavy   (mc/check {:payload-kg 12.0 :endurance-min 12.0})
+        nowhere (mc/check {:payload-kg 1.5 :endurance-min 60.0})]
+    (testing "closes, but over the ceiling"
+      (is (true? (:converged? heavy)))
+      (is (close? (:mtow-kg heavy) 26.9409 2.0e-3))
+      (is (= [:mtow-limit] (mapv :gate (:violations heavy)))))
+    (testing "does not close at all"
+      (is (false? (:converged? nowhere)))
+      (is (= [:mass-closure] (mapv :gate (:violations nowhere)))))
+    (testing "raising the ceiling rescues one and not the other"
+      (is (true? (:feasible? (mc/check {:payload-kg 12.0 :endurance-min 12.0
+                                        :mtow-limit-kg 50.0}))))
+      (is (false? (:feasible? (mc/check {:payload-kg 1.5 :endurance-min 60.0
+                                         :mtow-limit-kg 50.0})))))))
+
+(deftest an-hour-of-hover-does-not-exist-on-these-cells
+  (let [r (mc/check {:payload-kg 1.5 :endurance-min 60.0 :mtow-limit-kg 1.0e9})]
+    (is (false? (:converged? r)))
+    (is (= :mass-spiral-runaway (:reason r)))
+    (is (> (:mtow-kg r) mc/runaway-kg))))
+
+(deftest closure-depends-on-payload-as-well-as-endurance
+  ;; Rotor and motor mass grow faster than linearly in mass, so the loop is
+  ;; superlinear: the same duty can close for a light payload and not for a
+  ;; heavy one. A model where hover power were merely linear in mass would close
+  ;; or fail for both. Measured at the boundary, which moved outward when motor
+  ;; mass was calibrated.
+  (is (true?  (:converged? (mc/close-mass {:payload-kg 0.1 :endurance-min 38.0
+                                           :mtow-limit-kg 1.0e9}))))
+  (is (false? (:converged? (mc/close-mass {:payload-kg 1.5 :endurance-min 38.0
+                                           :mtow-limit-kg 1.0e9}))))
+  (testing "and the boundary itself is a real edge, not a cliff at every payload"
+    (is (true?  (:converged? (mc/close-mass {:payload-kg 1.5 :endurance-min 34.0
+                                             :mtow-limit-kg 1.0e9}))))
+    (is (false? (:converged? (mc/close-mass {:payload-kg 5.0 :endurance-min 34.0
+                                             :mtow-limit-kg 1.0e9}))))))
+
+(deftest more-payload-and-more-endurance-both-cost-mass
+  (let [m #(:mtow-kg (mc/close-mass %))]
+    (is (< (m baseline) (m (assoc baseline :payload-kg 3.0))))
+    (is (< (m baseline) (m (assoc baseline :endurance-min 25.0))))))
+
+;; ── the gates, in both directions ─────────────────────────────────────────
+
+(deftest blade-stall-at-peak-thrust-is-caught
+  (let [ok     (mc/check baseline)
+        thin   (mc/check (assoc baseline :hover-throttle 0.25))]
+    (is (close? (:blade-loading (:rotor-peak (:design ok))) 0.0787431))
+    (is (not (some #{:blade-stall} (map :gate (:violations ok)))))
+    (testing "a 4:1 thrust margin doubles blade loading past the stall limit"
+      (is (close? (:blade-loading (:rotor-peak (:design thin))) 0.1574863 2.0e-3))
+      (is (some #{:blade-stall} (map :gate (:violations thin)))))))
+
+(deftest a-pack-sized-by-hover-can-fail-at-peak
+  ;; The gate that only exists because hover and climb are different loads.
+  (let [ok  (mc/check baseline)                                    ; 7.0C of 45C
+        bad (mc/check (assoc baseline :hover-throttle 0.3
+                             :chemistry :li-ion-energy))]          ; 14.7C of 5C
+    (is (not (some #{:pack-rate-peak} (map :gate (:violations ok)))))
+    (is (close? (:c-rate-peak (:design ok)) 7.0184983))
+    (is (true? (:converged? bad)))
+    (is (some #{:pack-rate-peak} (map :gate (:violations bad))))
+    (is (> (:c-rate-peak (:design bad)) (:max-C (:pack (:design bad)))))))
+
+;; ── refusals ──────────────────────────────────────────────────────────────
+
+(deftest an-airframe-that-is-its-own-payload-is-refused
+  (doseq [bad [1.0 1.5 0.0 -0.1]]
+    (let [e (try (mc/close-mass (assoc baseline :structure-frac bad))
+                 nil (catch clojure.lang.ExceptionInfo e e))]
+      (is (some? e) (str ":structure-frac " bad " should be refused"))
+      (is (= :structure-frac (:key (ex-data e)))))))
+
+(deftest non-positive-requirements-are-refused
+  (doseq [[k bad] [[:payload-kg 0.0] [:endurance-min -1.0] [:rotors 0]
+                   [:hover-throttle 0.0] [:eta-motor -0.5]]]
+    (let [e (try (mc/close-mass (assoc baseline k bad))
+                 nil (catch clojure.lang.ExceptionInfo e e))]
+      (is (some? e) (str k " => " bad " should be refused"))
+      (is (= k (:key (ex-data e)))))))

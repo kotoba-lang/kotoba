@@ -1,0 +1,118 @@
+(ns motor.dcbus-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [motor.dcbus :as dcbus]
+            [cae.solver :as cae]))
+
+(defn- approx= [a b & [tol]]
+  (<= (Math/abs (- (double a) (double b))) (or tol 1e-9)))
+
+(def ^:private base-case
+  {:demand-kw [10.0 30.0 20.0 -5.0 15.0]
+   :dt-h 0.1
+   :p-fc-max-kW 20.0
+   :p-bat-dis-max-kW 15.0
+   :p-bat-chg-max-kW 10.0
+   :soc-min-kWh 1.0
+   :soc-max-kWh 5.0
+   :soc-init-kWh 4.0})
+
+(deftest hand-checked-balance
+  (testing "fc caps at rating; battery covers the deficit; regen charges"
+    (let [r (dcbus/balance base-case)
+          rows (:intervals r)
+          [i0 i1 i2 i3 i4] rows]
+      ;; interval 0: demand 10 <= fc 20 → fc serves 10, battery idle
+      (is (approx= 10.0 (:fc-kw i0)))
+      (is (approx= 0.0 (:batt-dis-kw i0)))
+      (is (approx= 0.0 (:unmet-kw i0)))
+      ;; interval 1: demand 30, fc caps at 20, deficit 10 from battery
+      (is (approx= 20.0 (:fc-kw i1)))
+      (is (approx= 10.0 (:batt-dis-kw i1)))
+      (is (approx= 0.0 (:unmet-kw i1)))
+      ;; interval 2: demand 20 == fc rating → no battery draw
+      (is (approx= 20.0 (:fc-kw i2)))
+      (is (approx= 0.0 (:batt-dis-kw i2)))
+      ;; interval 3: regen -5 kWh? no, -5 kW → battery charges 5 (cap 10)
+      (is (approx= 0.0 (:fc-kw i3)))
+      (is (approx= 5.0 (:batt-chg-kw i3)))
+      (is (approx= 0.0 (:regen-not-absorbed-kw i3)))
+      ;; interval 4: demand 15 <= 20 → fc serves it
+      (is (approx= 15.0 (:fc-kw i4)))
+      (is (approx= 0.0 (:batt-dis-kw i4)))
+      (is (true? (:feasible? r)))
+      (is (= :dcbus-balance (:solver r))))))
+
+(deftest soc-window-respected
+  (testing "discharge stops at :soc-min and reports unmet"
+    ;; demand 60 (fc caps 20, deficit 40) for dt=1h; battery cap 15 kW but
+    ;; only 3 kWh of energy to the floor: max deliverable = 3 kW·h / 1 h = 3 kW
+    (let [r (dcbus/balance {:demand-kw [60.0]
+                            :dt-h 1.0
+                            :p-fc-max-kW 20.0
+                            :p-bat-dis-max-kW 15.0
+                            :p-bat-chg-max-kW 10.0
+                            :soc-min-kWh 1.0
+                            :soc-max-kWh 5.0
+                            :soc-init-kWh 4.0})
+          row (first (:intervals r))]
+      (is (approx= 20.0 (:fc-kw row)))
+      ;; deliverable to floor = 4-1 = 3 kWh over 1 h = 3 kW
+      (is (approx= 3.0 (:batt-dis-kw row)))
+      (is (approx= 37.0 (:unmet-kw row)))   ; 40 - 3
+      (is (approx= 1.0 (:soc-end-kWh row)))
+      ;; energy sums reflect the same
+      (is (approx= 37.0 (:unmet-kWh (:energy r))))
+      (is (false? (:feasible? r))))))
+
+(deftest regen-not-absorbed
+  (testing "regen above charge cap or above headroom is reported, never dropped"
+    ;; -30 kW regen, charge cap 10, headroom from soc=4 to max=5 = 1 kWh
+    ;; over dt 1h = 1 kW. So absorbed = min(30, 10, 1) = 1 kW, unabsorbed 29.
+    (let [r (dcbus/balance {:demand-kw [-30.0]
+                            :dt-h 1.0
+                            :p-fc-max-kW 20.0
+                            :p-bat-dis-max-kW 15.0
+                            :p-bat-chg-max-kW 10.0
+                            :soc-min-kWh 1.0
+                            :soc-max-kWh 5.0
+                            :soc-init-kWh 4.0})
+          row (first (:intervals r))]
+      (is (approx= 0.0 (:fc-kw row)))
+      (is (approx= 1.0 (:batt-chg-kw row)))
+      (is (approx= 29.0 (:regen-not-absorbed-kw row)))
+      (is (approx= 5.0 (:soc-end-kWh row)))
+      (is (approx= 29.0 (:regen-not-absorbed-kWh (:energy r))))
+      (is (false? (:feasible? r))))))
+
+(deftest energy-conservation-sum
+  (testing "per-interval energy = kWh sums across the series"
+    (let [r (dcbus/balance base-case)
+          e (:energy r)]
+      (is (approx= (* 0.1 (+ 10 30 20 -5 15)) (:demand-kWh e)))
+      (is (approx= 0.0
+                   (- (+ (:batt-discharge-kWh e) (:fc-kWh e))
+                      (+ (:batt-charge-kWh e) (:unmet-kWh e)
+                         (:demand-kWh e))))))))
+
+(deftest refusals
+  (testing "missing/non-positive numbers refuse loudly (no invented constants)"
+    (doseq [[k v] [[:p-fc-max-kW 0.0] [:p-bat-dis-max-kW -1.0]
+                   [:p-bat-chg-max-kW 0.0] [:dt-h -0.5]]]
+      (is (thrown? Exception (dcbus/balance (assoc base-case k v)))
+          (str "non-positive " (name k) " must throw"))))
+  (testing "soc window inverted or init outside window refuses"
+    (is (thrown? Exception (dcbus/balance (assoc base-case :soc-max-kWh 0.9))))
+    (is (thrown? Exception (dcbus/balance (assoc base-case :soc-init-kWh 6.0))))
+    (is (thrown? Exception (dcbus/balance (assoc base-case :soc-init-kWh 0.0))))))
+
+(deftest unmeasured-declared
+  (testing "result names what it does NOT model"
+    (let [r (dcbus/balance base-case)]
+      (is (true? (:bus-converter-losses (:unmeasured r))))
+      (is (true? (:battery-round-trip-loss (:unmeasured r))))
+      (is (true? (:fc-partial-load-curve (:unmeasured r)))))))
+
+(deftest registered-on-cae-solver-contract
+  (testing "dispatchable through the shared cae.solver contract"
+    (is (= :dcbus-balance
+           (:solver (cae/solve (assoc base-case :solver {:kind :dcbus-balance})))))))

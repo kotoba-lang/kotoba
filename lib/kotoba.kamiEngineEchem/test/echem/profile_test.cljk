@@ -1,0 +1,173 @@
+(ns echem.profile-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [echem.system :as sys]
+            [echem.profile :as prof]
+            [cae.solver :as cae]))
+
+(def case
+  {:bop-frac 0.15 :bop-source "fixture: synthetic screening value"})
+
+(deftest skips-preserve-the-original-time-grid
+  (let [r (prof/demand-profile case
+            {:p-net-kw [80.0 1.0e6 80.0 80.0] :dt-s 10.0
+             :profile-source "fixture: separated feasible intervals" :on-infeasible :skip})
+        rate (:h2-kg-per-s (sys/demand-point case 80.0))]
+    (is (< (Math/abs (- (:h2-kg r) (* rate 10.0))) 1.0e-12))
+    (is (= (/ 800.0 3600.0) (:energy-kwh-net r)))
+    (is (= 10.0 (:integrated-duration-s r)))
+    (is (= [0 1] (:skipped-interval-indices r)))))
+
+(deftest isolated-feasible-samples-do-not-create-an-interval
+  (doseq [powers [[80.0 1.0e6] [1.0e6 80.0] [80.0 1.0e6 80.0]]]
+    (let [r (prof/demand-profile case
+              {:p-net-kw powers :dt-s 10.0 :profile-source "fixture: no known interval"
+               :on-infeasible :skip})]
+      (is (zero? (:h2-kg r)))
+      (is (zero? (:energy-kwh-net r)))
+      (is (zero? (:integrated-duration-s r))))))
+
+(deftest dc-dc-demand-hits-bus-target-and-energy-identity
+  (doseq [bop [{:bop-frac 0.15} {:bop-kw 5.0}]]
+   (let [r (prof/demand-profile
+            (merge bop {:bop-source "fixture" :dc-dc-eff 0.97 :dc-dc-source "fixture"})
+            {:p-net-kw [80.0 80.0] :dt-s 10.0 :profile-source "fixture"})
+        pt (first (:points r))
+        chemical-kwh (/ (* (:h2-kg r) sys/h2-lhv-j-per-kg) 3.6e6)]
+    (is (< (Math/abs (- 80.0 (:bus-kw pt))) 1.0e-6))
+    (is (< (Math/abs (- (:energy-kwh-net r) (* chemical-kwh (:eta-bus-min r)))) 1.0e-8)))))
+
+(deftest profile-registers-the-common-solver-contract
+  (let [c {:bop-frac 0.15 :bop-source "fixture" :p-net-kw [80.0 80.0]
+           :dt-s 10.0 :profile-source "fixture" :solver {:kind :rom-fc-profile}}]
+    (is (= (prof/demand-profile c c) (cae/solve c)))))
+
+(def req
+  {:p-net-kw [80.0 80.0 80.0 80.0]
+   :dt-s 10.0
+   :profile-source "fixture: synthetic constant duty cycle"})
+
+(deftest constant-profile-closed-form
+  (testing "a constant net demand integrates to the exact analytic value"
+    (let [r  (prof/demand-profile case req)
+          p1 (sys/demand-point case 80.0)
+          dt-total (* 10.0 3)]                  ; trapezoid over constant = ṁ·(N-1)·dt
+      (is (= :rom-fc-profile (:solver r)))
+      (is (= 4 (:samples r)))
+      (is (< (Math/abs (- (:h2-kg r) (* (:h2-kg-per-s p1) dt-total)))
+             (* 1.0e-12 (:h2-kg r))))
+      (is (< (Math/abs (- (:energy-kwh-net r) (/ (* 80.0 dt-total) 3600.0)))
+             1.0e-12))
+      (is (= (:eta-sys p1) (:eta-sys-min r) (:eta-sys-max r)))
+      (is (= 80.0 (:peak-net-kw r)))
+      (is (zero? (:infeasible-count r))))))
+
+(deftest two-sample-linear-ramp
+  (testing "trapezoid is exact for the 2-sample profile: mean of the two rates"
+    (let [r (prof/demand-profile case (assoc req :p-net-kw [40.0 80.0]))
+          m40 (:h2-kg-per-s (sys/demand-point case 40.0))
+          m80 (:h2-kg-per-s (sys/demand-point case 80.0))
+          expect (* 10.0 (/ (+ m40 m80) 2.0))]
+      (is (= 2 (:samples r)))
+      (is (< (Math/abs (- (:h2-kg r) expect)) (* 1.0e-12 expect)))
+      ;; energy: trapezoid of [40 80] kW over 10 s = 600 kW·s = 1/6 kWh
+      (is (< (Math/abs (- (:energy-kwh-net r) (/ 600.0 3600.0))) 1.0e-12)))))
+
+(deftest efficiency-envelope-sweeps
+  (testing "a wide sweep reports min/max eta from the ROM, not a scalar"
+    (let [r (prof/demand-profile case (assoc req :p-net-kw [5.0 80.0 80.0 5.0]))]
+      (is (< (:eta-sys-min r) (:eta-sys-max r))
+          "polarization curve makes low-load efficiency differ from high-load")
+      (is (= 80.0 (:peak-net-kw r)))
+      (is (= 4 (:samples r))))))
+
+(deftest dc-dc-stage-composes-through-profile
+  (testing "eta-bus envelope present when the case carries a DC/DC stage"
+    (let [r (prof/demand-profile (merge case {:dc-dc-eff 0.97
+                                              :dc-dc-source "fixture: synthetic"})
+                                 (assoc req :p-net-kw [5.0 80.0 80.0 5.0]))]
+      (is (< (:eta-bus-min r) (:eta-bus-max r) 1.0))
+      (is (= (* (:eta-sys-max r) 0.97) (:eta-bus-max r))))))
+
+(deftest per-sample-points-compose
+  (testing "per-sample points reuse demand-point numbers verbatim"
+    (let [r  (prof/demand-profile case req)
+          p1 (sys/demand-point case 80.0)
+          pt (first (:points r))]
+      (is (= (:stack-kw p1) (:stack-kw pt)))
+      (is (= (:eta-sys p1) (:eta-sys pt)))
+      (is (= (:h2-kg-per-s p1) (:h2-kg-per-s pt)))
+      (is (= [0 1 2 3] (mapv :sample (:points r)))))))
+
+(deftest provenance-travels
+  (testing "profile-source and BoP provenance are echoed; unmeasured declared"
+    (let [r (prof/demand-profile case req)]
+      (is (= "fixture: synthetic constant duty cycle"
+             (get-in r [:provenance :profile-source])))
+      (is (= "fixture: synthetic screening value"
+             (get-in r [:provenance :bop-source])))
+      (is (get-in r [:unmeasured :startup-shutdown-parasitics]))
+      (is (get-in r [:unmeasured :thermal-lag-of-stack]))
+      (is (get-in r [:unmeasured :purge-recirculation]))
+      (is (get-in r [:unmeasured :trapezoidal-interpolation-error]))
+      (is (false? (get-in r [:unmeasured :infeasible-gap]))))))
+
+;; ---- infeasible handling: refuse by default, skip only on request ----
+
+(deftest refuses-infeasible-by-default
+  (testing "a demand above the stack peak refuses with the offending indices"
+    (is (thrown-with-msg? Exception #"infeasible sample"
+          (prof/demand-profile case
+                               (assoc req :p-net-kw [80.0 1.0e6 80.0 80.0]))))))
+
+(deftest skip-mode-integrates-feasible-only
+  (testing ":on-infeasible :skip integrates only the feasible samples and reports the gap"
+    (let [r (prof/demand-profile case
+                                 (assoc req :p-net-kw [80.0 1.0e6 80.0 80.0]
+                                        :on-infeasible :skip))]
+      (is (= 3 (:samples r)))
+      (is (= 1 (:infeasible-count r)))
+      (is (= [1] (:infeasible-indices r)))
+      (is (true? (get-in r [:unmeasured :infeasible-gap]))))))
+
+(deftest all-infeasible-refuses-even-in-skip-mode
+  (is (thrown-with-msg? Exception #"no feasible samples"
+        (prof/demand-profile case
+                             (assoc req :p-net-kw [1.0e6 1.0e6]
+                                    :on-infeasible :skip)))))
+
+;; ---- refusals ----
+
+(deftest refuses-missing-or-blank-profile-source
+  (is (thrown? Exception (prof/demand-profile case (dissoc req :profile-source))))
+  (is (thrown? Exception (prof/demand-profile case (assoc req :profile-source "")))))
+
+(deftest refuses-bad-profile-shape
+  (is (thrown? Exception (prof/demand-profile case (assoc req :p-net-kw [80.0]))))
+  (is (thrown? Exception (prof/demand-profile case (assoc req :p-net-kw []))))
+  (is (thrown? Exception (prof/demand-profile case (assoc req :p-net-kw '(80.0 80.0)))))
+  (is (thrown? Exception (prof/demand-profile case (assoc req :dt-s 0.0))))
+  (is (thrown? Exception (prof/demand-profile case (assoc req :dt-s -1.0))))
+  (is (thrown? Exception (prof/demand-profile case (assoc req :dt-s ##NaN)))))
+
+(deftest refuses-non-physical-power-samples
+  (is (thrown? Exception (prof/demand-profile case (assoc req :p-net-kw [80.0 -1.0]))))
+  (is (thrown? Exception (prof/demand-profile case (assoc req :p-net-kw [80.0 ##Inf]))))
+  (is (thrown? Exception (prof/demand-profile case (assoc req :p-net-kw [80.0 ##NaN])))))
+
+(deftest refuses-bad-on-infeasible
+  (is (thrown? Exception (prof/demand-profile case (assoc req :on-infeasible :fabricate)))))
+
+(deftest delegates-provenance-refusal-to-system
+  (testing "fail closed downstream: BoP provenance is enforced by demand-point"
+    (is (thrown? Exception
+          (prof/demand-profile {:bop-frac 0.15}   ; no :bop-source
+                               req)))))
+
+(deftest h2-mass-consistent-with-lhv-energy
+  (testing "ṁ·LHV identity survives the integration for a constant profile"
+    (let [r  (prof/demand-profile case req)
+          p1 (sys/demand-point case 80.0)
+          ;; chemical energy of the integrated H2 at the stack's own efficiency
+          e-chem-kwh (/ (* (:h2-kg r) sys/h2-lhv-j-per-kg) 3.6e6)
+          e-net-kwh  (/ (:energy-kwh-net r) (:eta-sys p1))]
+      (is (< (Math/abs (- e-chem-kwh e-net-kwh)) (* 1.0e-9 e-chem-kwh))))))

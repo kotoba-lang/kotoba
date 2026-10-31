@@ -1,0 +1,133 @@
+(ns vdesign.reactor-heat-test
+  "Tests for vdesign.reactor-heat — declared-enthalpy arithmetic, heater
+  deficit discipline, and fail-closed validation on synthetic fixtures
+  (fixture numbers carry fixture provenance; no Mg/MgH2, hydrogen, or
+  code constant is measured or invented here)."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [vdesign.hydrogen :as hyd]
+            [vdesign.swap-schedule :as ss]
+            [vdesign.reactor-heat :as rh]
+            [vdesign.powertrain :as pt]))
+
+(def ^:private eff-src "fixture: synthetic efficiency for tests only")
+(def ^:private cart-src "fixture: synthetic cartridge capacity for tests only")
+(def ^:private dh-src "fixture: synthetic desorption enthalpy for tests only")
+(def ^:private heater-src "fixture: synthetic heater capability for tests only")
+(def ^:private dh 2.0e6)  ; fixture enthalpy, J/kg MgH2 — synthetic, unmeasured
+
+(defn- schedule [& kg-per-interval]
+  (ss/swap-schedule
+    {:fc-profile-kw (mapv (fn [kg] (/ (* kg 0.5 pt/LHV-H2-J) (* 1000.0 3600.0))) kg-per-interval)
+     :dt-s 3600.0
+     :fc-elec-eff 0.5 :eff-source eff-src
+     :cartridge-h2-kg 10.0 :cartridge-source cart-src
+     :spare-cartridges (count kg-per-interval)}))
+
+(defn- consumption [kw-profile]
+  (hyd/consumption-profile
+    {:fc-profile-kw kw-profile :dt-s 3600.0
+     :fc-elec-eff 0.5}))
+
+(def ^:private heat-opts
+  {:dh-j-per-kg-mgh2 dh :dh-source dh-src})
+
+(defn- approx= [a b]
+  (< (Math/abs (- (double a) (double b))) (* 1e-9 (max 1.0 (Math/abs (double a))))))
+
+(deftest heat-arithmetic-is-exact-declared-multiplication
+  (testing "per-interval heat = mgh2-kg · declared dh, dt-scaled power"
+    (let [c (consumption [1.0 1.0])
+          r (rh/reactor-heat c heat-opts)
+          ;; interval draw: E = 1 kW·3600 s = 3.6 MJ elec; H2 = E/(0.5·LHV)
+          h2-kg (/ (* 1.0 3600.0 1000.0) (* 0.5 pt/LHV-H2-J))
+          wh2 (/ (* 2.0 1.008) (+ 24.305 (* 2.0 1.008)))
+          mgh2 (/ h2-kg wh2)]
+      (is (= :reactor-heat-demand (:kind r)))
+      (is (= 2 (count (:intervals r))))
+      (is (approx= (* mgh2 dh 2) (* 1000.0 (get-in r [:heat :total-kj]))))
+      (is (approx= (/ (* mgh2 dh) 3600.0 1000.0) (get-in r [:heat :peak-kw])))
+      ;; every row carries its declared-input arithmetic
+      (is (approx= (/ (* mgh2 dh) 1000.0) (:heat-kj (first (:intervals r))))))))
+
+(deftest kind-guard-refuses-non-consumption-inputs
+  (testing "a result with neither accepted kind is refused loudly"
+    (is (thrown? #?(:clj Exception :cljs js/Error) (rh/reactor-heat {:kind :bev-pack} heat-opts)))
+    (is (thrown? #?(:clj Exception :cljs js/Error) (rh/reactor-heat nil heat-opts)))))
+
+(deftest works-from-both-accepted-upstream-kinds
+  (testing "swap-schedule results are accepted"
+    (let [r (rh/reactor-heat (schedule 1.0 1.0) heat-opts)]
+      (is (= :cartridge-swap-schedule (get-in r [:provenance :source-kind])))
+      (is (= 2 (count (:intervals r))))))
+  (testing "hydrogen-consumption results are accepted"
+    (let [r (rh/reactor-heat (consumption [1.0]) heat-opts)]
+      (is (= :hydrogen-consumption (get-in r [:provenance :source-kind]))))))
+
+(deftest heater-deficit-discipline
+  (testing "an adequate declared heater reports zero shortfall and adequate?"
+    (let [c (schedule 1.0 1.0)
+          ;; demand = 2 intervals · 0.5 kg-ish desorption each — size the
+          ;; heater from the contract's own output, then re-declare it
+          probe (rh/reactor-heat c heat-opts)
+          pk (get-in probe [:heat :peak-kw])
+          r (rh/reactor-heat c (assoc heat-opts
+                                      :heater-kw (* 2.0 pk)
+                                      :heater-source heater-src))]
+      (is (true? (:adequate? r)))
+      (is (zero? (get-in r [:heater :total-shortfall-kj])))
+      (is (nil? (get-in r [:heater :first-shortfall-at])))
+      (is (every? #(or (nil? (:shortfall-kj %)) (zero? (:shortfall-kj %)))
+                  (:intervals r)))))
+  (testing "an undersized heater reports the shortfall, never clips it"
+    (let [c (schedule 1.0 1.0)
+          probe (rh/reactor-heat c heat-opts)
+          pk (get-in probe [:heat :peak-kw])
+          r (rh/reactor-heat c (assoc heat-opts
+                                      :heater-kw (* 0.5 pk)
+                                      :heater-source heater-src))]
+      (is (false? (:adequate? r)))
+      (is (pos? (get-in r [:heater :total-shortfall-kj])))
+      (is (= 0 (get-in r [:heater :first-shortfall-at])))
+      (is (pos? (:shortfall-kj (first (:intervals r))))))))
+
+(deftest no-heater-omits-verdict-keys
+  (testing "without :heater-kw there is no adequacy claim at all"
+    (let [r (rh/reactor-heat (consumption [1.0]) heat-opts)]
+      (is (not (contains? r :adequate?)))
+      (is (not (contains? r :heater)))
+      (is (every? (fn [row] (nil? (:shortfall-kj row))) (:intervals r))))))
+
+(deftest unmeasured-carried
+  (testing "the honest gap list rides every result"
+    (let [r (rh/reactor-heat (consumption [1.0]) heat-opts)]
+      (is (true? (get-in r [:unmeasured :desorption-enthalpy])))
+      (is (true? (get-in r [:unmeasured :desorption-kinetics])))
+      (is (true? (get-in r [:unmeasured :refill-absorption-heat])))
+      (is (= dh (get-in r [:provenance :dh-j-per-kg-mgh2])))
+      (is (= dh-src (get-in r [:provenance :dh-source]))))))
+
+(deftest fail-closed-input-validation
+  (testing "non-positive or absent enthalpy is refused loudly"
+    (is (thrown? #?(:clj Exception :cljs js/Error) (rh/reactor-heat (consumption [1.0])
+                                            {:dh-j-per-kg-mgh2 nil :dh-source dh-src})))
+    (is (thrown? #?(:clj Exception :cljs js/Error) (rh/reactor-heat (consumption [1.0])
+                                            {:dh-j-per-kg-mgh2 0.0 :dh-source dh-src})))
+    (is (thrown? #?(:clj Exception :cljs js/Error) (rh/reactor-heat (consumption [1.0])
+                                            {:dh-j-per-kg-mgh2 -1.0 :dh-source dh-src}))))
+  (testing "blank provenance is refused loudly"
+    (is (thrown? #?(:clj Exception :cljs js/Error) (rh/reactor-heat (consumption [1.0])
+                                            {:dh-j-per-kg-mgh2 dh :dh-source ""})))
+    (is (thrown? #?(:clj Exception :cljs js/Error) (rh/reactor-heat (consumption [1.0])
+                                            (assoc heat-opts :heater-kw 1.0 :heater-source "  ")))))
+  (testing "heater-source without heater-kw is refused"
+    (is (thrown? #?(:clj Exception :cljs js/Error) (rh/reactor-heat (consumption [1.0])
+                                            (assoc heat-opts :heater-source heater-src)))))
+  (testing "non-positive heater-kw is refused"
+    (is (thrown? #?(:clj Exception :cljs js/Error) (rh/reactor-heat (consumption [1.0])
+                                            (assoc heat-opts :heater-kw 0.0 :heater-source heater-src))))
+    (is (thrown? #?(:clj Exception :cljs js/Error) (rh/reactor-heat (consumption [1.0])
+                                            (assoc heat-opts :heater-kw -3.0 :heater-source heater-src)))))
+  (testing "upstream missing dt-s is refused"
+    (is (thrown? #?(:clj Exception :cljs js/Error) (rh/reactor-heat {:kind :cartridge-swap-schedule
+                                             :intervals [] :provenance {}}
+                                            heat-opts)))))

@@ -435,9 +435,9 @@ static int matvec_range(const struct aiueos_qwen35_tensor *tensor,
    tensor is handed over in row chunks of `2097152 / cols` -- 409 rows of
    an EMBED-wide tensor, 120 of an FFN-wide one -- and a refusal partway
    leaves the output half written, which the return value says. */
-extern uint64_t kotoba_aiueos_qwen35_matvec(uint8_t *arena, uint64_t arena_bytes,
-                                            const uint8_t *plan,
-                                            uint64_t plan_bytes);
+/* JUN-633: the object is now built on amu's native route as a plan check and a
+   row export; qwen_matvec_kotoba (qwen35_matvec_plan.h) keeps this contract. */
+#include "qwen35_matvec_plan.h"
 
 #define QWEN_MATVEC_ARENA_BASE 4096ULL
 #define QWEN_MATVEC_ARENA_END (64ULL * 1024ULL * 1024ULL * 1024ULL)
@@ -488,7 +488,7 @@ static int matvec_range(const struct aiueos_qwen35_tensor *tensor,
     uint64_t stop = end - row < chunk ? end : row + chunk;
     qwen_plan_u64(plan, 64, row);
     qwen_plan_u64(plan, 72, stop);
-    if (kotoba_aiueos_qwen35_matvec((uint8_t *)(uintptr_t)QWEN_MATVEC_ARENA_BASE,
+    if (qwen_matvec_kotoba((uint8_t *)(uintptr_t)QWEN_MATVEC_ARENA_BASE,
                                     QWEN_MATVEC_ARENA_END - QWEN_MATVEC_ARENA_BASE,
                                     plan, 96) != 0)
       return 0;
@@ -2140,7 +2140,7 @@ static int qwen_parity_matvec(uint32_t type) {
   qwen_parity_write_u64(qwen_parity_plan, 56, scratch_offset);
   qwen_parity_write_u64(qwen_parity_plan, 64, 0);
   qwen_parity_write_u64(qwen_parity_plan, 72, QWEN_PARITY_ROWS);
-  if (kotoba_aiueos_qwen35_matvec(qwen_parity_arena, arena_bytes,
+  if (qwen_matvec_kotoba(qwen_parity_arena, arena_bytes,
                                   qwen_parity_plan, 96) != 0)
     return 0;
   {
@@ -2155,7 +2155,7 @@ static int qwen_parity_matvec(uint32_t type) {
      self-test that only ever sees agreement has not shown the object
      discriminates. */
   qwen_parity_write_u32(qwen_parity_plan, 4, 1);
-  if (kotoba_aiueos_qwen35_matvec(qwen_parity_arena, arena_bytes,
+  if (qwen_matvec_kotoba(qwen_parity_arena, arena_bytes,
                                   qwen_parity_plan, 96) !=
       (uint64_t)(int64_t)-4)
     return 0;

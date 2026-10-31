@@ -1,0 +1,194 @@
+(ns multirotor.closure
+  "The multirotor MASS SPIRAL, and the refusal that comes out of it.
+
+  A car's mass enters through road load, so the spiral is gentle and almost
+  always closes. On a rotorcraft THRUST EQUALS WEIGHT: every gram added must be
+  carried by rotors that must grow, turned by motors that must grow, fed by a
+  pack that must grow, mounted on structure that is a fraction of the total.
+  The loop gain is high, and a specification that does not close is ordinary
+  rather than exotic — `1.5 kg of payload for three hours` is not a hard design,
+  it is an aircraft that does not exist on these cells.
+
+  So the useful output of this namespace is not a mass. It is a VERDICT:
+
+      converged  -> here is the aircraft, broken down
+      diverged   -> no self-consistent mass exists; this is the refusal
+
+  Divergence is the design-side equivalent of a safety governor's refusal, the
+  same role `vdesign.physics/close-mass` plays for cars. It is the reason a
+  proposer — an LLM, a catalogue, an optimistic engineer — cannot quietly hand
+  back a 2 kg drone that flies for three hours.
+
+  Sizing is delegated, not reimplemented: `rotor.solver` for thrust and shaft
+  power, `motor.solver` for the motor that turns it, `pack.solver` for the
+  battery that feeds it. This namespace owns only the loop and the verdict.
+
+  NOT modelled: aerodynamic interference between rotors, ground effect, wind and
+  gust margin, centre-of-gravity and packaging, cooling, structural loads beyond
+  a mass fraction, or any regulatory class boundary other than the MTOW ceiling
+  the caller passes in."
+  (:require [rotor.solver :as rotor]
+            [pack.solver :as pack]
+            [motor.bldc :as bldc]))
+
+(def ^:const g 9.80665)
+(def ^:const max-iterations 120)
+(def ^:const tolerance-kg 1.0e-4)
+(def ^:const runaway-kg 1.0e4)
+
+(def defaults
+  "Everything the loop needs that the caller did not say. Each is a real
+  engineering choice, not a neutral value — they are collected here so a design
+  that depends on one of them can be seen to."
+  {:rotors 4
+   :disc-loading-N-m2 90.0    ; N/m^2 — lower is bigger, quieter, more efficient
+   :hover-throttle 0.5        ; hover at half of maximum thrust => 2:1 margin
+   :fm 0.65                   ; rotor figure of merit
+   :tip-mach 0.45
+   :altitude-m 0.0
+   :eta-motor 0.85
+   :eta-esc 0.95
+   :structure-frac 0.25       ; frame, arms, landing gear as a share of MTOW
+   :avionics-kg 0.25          ; flight controller, GPS, radio, wiring
+   :chemistry :lipo-highrate
+   :dod 0.85
+   :cell-mass-frac 0.82
+   :mtow-limit-kg 25.0})      ; the common small-UAS ceiling; caller may override
+
+(defn- require-positive!
+  [m ks]
+  (doseq [k ks]
+    (let [v (get m k)]
+      (when-not (and (number? v) (pos? v))
+        (throw (ex-info "multirotor closure needs a positive value"
+                        {:key k :value v}))))))
+
+(defn step
+  "One pass of the spiral: given a guess at MTOW, size the whole aircraft and
+  return the mass that guess IMPLIES, with everything used to get there.
+
+  Exposed rather than private so a caller can check the converged design against
+  the components directly instead of trusting the loop."
+  [concept mtow-kg]
+  (let [{:keys [rotors disc-loading-N-m2 hover-throttle fm tip-mach altitude-m
+                eta-motor eta-esc endurance-min payload-kg avionics-kg
+                structure-frac chemistry dod cell-mass-frac]} concept
+        eta        (* eta-motor eta-esc)
+        t-hover    (/ (* mtow-kg g) rotors)
+        r-hover    (rotor/size-for-thrust {:thrust-N t-hover
+                                           :disc-loading-N-m2 disc-loading-N-m2
+                                           :tip-mach tip-mach :altitude-m altitude-m
+                                           :fm fm})
+        p-elec-hov (/ (* rotors (:p-shaft-W r-hover)) eta)
+        pk         (pack/size-for-endurance {:p-elec-W p-elec-hov
+                                             :endurance-min endurance-min
+                                             :chemistry chemistry :dod dod
+                                             :cell-mass-frac cell-mass-frac})
+        ;; The pack is sized for HOVER but must survive the climb, so the peak
+        ;; draw is checked against the pack that hover sized — a constraint a
+        ;; hover-only calculation never sees.
+        r-peak     (rotor/hover (assoc r-hover :thrust-N (/ t-hover hover-throttle)))
+        p-elec-pk  (/ (* rotors (:p-shaft-W r-peak)) eta)
+        ;; Motor mass comes from motors that exist (motor.bldc), not from the
+        ;; traction-motor shear model, which is 40-53% heavy two orders of
+        ;; magnitude below the size it was written for. The motor's own
+        ;; electrical input is shaft power over MOTOR efficiency; the ESC sits
+        ;; upstream of that and is not part of the motor's mass.
+        mot        (bldc/solve {:p-peak-W (/ (:p-shaft-W r-peak) eta-motor)})
+        breakdown  {:payload-kg   payload-kg
+                    :avionics-kg  avionics-kg
+                    :battery-kg   (:pack-mass-kg pk)
+                    :motors-kg    (* rotors (:mass-kg mot))
+                    :rotors-kg    (* rotors (:rotor-mass-kg r-hover))
+                    :structure-kg (* structure-frac mtow-kg)}]
+    {:mtow-kg (reduce + (vals breakdown))
+     :breakdown breakdown
+     :rotor r-hover :rotor-peak r-peak :pack pk :motor mot
+     :p-elec-hover-W p-elec-hov :p-elec-peak-W p-elec-pk
+     :c-rate-hover (:c-rate pk)
+     :c-rate-peak (/ p-elec-pk (:nominal-Wh pk))}))
+
+(defn close-mass
+  "Iterate the spiral to a fixed point, seeded from below at the mass that must
+  be carried no matter what. Returns
+  {:converged? :mtow-kg :design :iterations :history} and, when it does not
+  close, :reason — :mass-spiral-runaway when the mass grows without bound,
+  :no-fixed-point when it is still moving after the iteration budget.
+
+  The MTOW ceiling is deliberately NOT consulted here. `Exceeds the 25 kg class
+  limit` and `no self-consistent mass exists` are different findings with
+  different fixes, and stopping the iteration at the ceiling would report the
+  first as the second — a design that closes at 30 kg would be indistinguishable
+  from one that closes nowhere. The ceiling is a gate in `check`."
+  [concept]
+  (let [c (merge defaults concept)]
+    (require-positive! c [:payload-kg :endurance-min :rotors :disc-loading-N-m2
+                          :hover-throttle :eta-motor :eta-esc :mtow-limit-kg])
+    (when-not (< 0.0 (:structure-frac c) 1.0)
+      (throw (ex-info "structure mass fraction must be in (0, 1) — at 1 the
+                      airframe is its own payload and nothing closes"
+                      {:key :structure-frac :value (:structure-frac c)})))
+    (loop [m    (+ (:payload-kg c) (:avionics-kg c))    ; a strict lower bound
+           n    0
+           hist []]
+      (let [d     (step c m)
+            m'    (:mtow-kg d)
+            hist' (conj hist m')]
+        (cond
+          (< (Math/abs (- m' m)) tolerance-kg)
+          {:converged? true :mtow-kg m' :design d :concept c
+           :iterations n :history hist'}
+
+          (> m' runaway-kg)
+          {:converged? false :mtow-kg m' :design d :concept c
+           :iterations n :history hist' :reason :mass-spiral-runaway}
+
+          (>= n max-iterations)
+          {:converged? false :mtow-kg m' :design d :concept c
+           :iterations n :history hist' :reason :no-fixed-point}
+
+          :else (recur m' (inc n) hist'))))))
+
+(defn check
+  "The full verdict. Every gate is independent and a design must pass all of
+  them; a design that closes but stalls its blades at peak thrust is not a
+  design. Returns {:feasible? :violations [..] :mtow-kg :design :margins}."
+  [concept]
+  (let [{:keys [converged? mtow-kg design reason iterations history concept] :as r}
+        (close-mass concept)
+        limit  (:mtow-limit-kg concept)
+        pk     (:pack design)
+        viol (cond-> []
+               (not converged?)
+               (conj {:gate :mass-closure :reason reason
+                      :detail (str "no self-consistent mass: the spiral reached "
+                                   (Math/round (double mtow-kg)) " kg")})
+
+               (and converged? (> mtow-kg limit))
+               (conj {:gate :mtow-limit :reason :over-ceiling
+                      :detail (str (Math/round (double mtow-kg)) " kg exceeds the "
+                                   limit " kg ceiling")})
+
+               (:stalled? (:rotor-peak design))
+               (conj {:gate :blade-stall :reason :ct-sigma-over-limit
+                      :detail (str "blade loading " (:blade-loading (:rotor-peak design))
+                                   " at peak thrust")})
+
+               (:over-rate? pk)
+               (conj {:gate :pack-rate-hover :reason :c-rate-over-cell-limit
+                      :detail (str "hover draws " (:c-rate pk) "C of "
+                                   (:max-C pk) "C")})
+
+               (> (:c-rate-peak design) (:max-C pk))
+               (conj {:gate :pack-rate-peak :reason :c-rate-over-cell-limit
+                      :detail (str "peak draws " (:c-rate-peak design) "C of "
+                                   (:max-C pk) "C — the pack was sized by hover")}))]
+    (assoc r
+           :feasible? (empty? viol)
+           :violations viol
+           :iterations iterations
+           :history history
+           :margins {:mtow-headroom-kg (- limit mtow-kg)
+                     :blade-loading-peak (:blade-loading (:rotor-peak design))
+                     :c-rate-peak (:c-rate-peak design)
+                     :c-rate-max (:max-C pk)})))
