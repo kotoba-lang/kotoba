@@ -3,7 +3,7 @@
 ;; The optional :oracle marker is validated here. Canonical seal and KIR hash
 ;; identity are composed below; full runtime semantics remain separate work.
 (ns kotoba.verifier.artifact-envelope
-  {:kotoba/export [kexe-header-shape? code-bytes-shape? kexe-integrity? kexe-compatibility-match? kexe-module-outline? kexe-function-identities-match? kexe-function-boundaries-valid? kexe-function-effects-valid? kexe-function-record-shapes-valid?]}
+  {:kotoba/export [kexe-header-shape? code-bytes-shape? kexe-integrity? kexe-compatibility-match? kexe-module-outline? kexe-function-identities-match? kexe-function-boundaries-valid? kexe-function-effects-valid? kexe-function-record-shapes-valid? kexe-function-effects-match?]}
   (:require [kotoba.artifact.core :as artifact]
             [kotoba.kir.compatibility :as compatibility]
             [kotoba.kir.float-usage :as float-usage]))
@@ -371,6 +371,32 @@
 (defn- vector-item [value :document index :i64] :document
   (option-value-of [:option :document] (document-vector-at value index) (document-null)))
 
+(defn- list-item [value :document index :i64] :document
+  (option-value-of [:option :document] (document-list-at value index) (document-null)))
+
+(defn- function-index [functions :document name :document] :i64
+  (loop [index 0]
+    (if (= index (document-count functions)) -1
+      (if (document-equal? (field (vector-item functions index) :name) name)
+        index
+        (recur (+ index 1))))))
+
+(defn- name-in-vector? [names :document name :document] :bool
+  (loop [index 0]
+    (if (= index (document-count names)) false
+      (or (document-equal? (vector-item names index) name)
+          (recur (+ index 1))))))
+
+(defn- capability-effects-subset? [callee-effects :document caller-effects :document] :bool
+  (loop [index 0]
+    (if (= index (document-count callee-effects)) true
+      (let [effect (option-value-of [:option :document]
+                     (document-set-at callee-effects index) (document-null))]
+        (and (or (document-equal? effect (document-keyword :state))
+                 (document-equal? effect (document-keyword :abort))
+                 (document-set-contains? caller-effects effect))
+             (recur (+ index 1)))))))
+
 (defn- type-tag? [type :document tag :keyword] :bool
   (and (= (document-kind type) :vector)
        (> (document-count type) 0)
@@ -666,6 +692,183 @@
         (if (= index (document-count functions)) true
           (and (function-record-shape-valid? (vector-item functions index))
                (recur (+ index 1))))))))
+
+(defn- cap-effect-of-call [form :document arity :i64] :document
+  (if (or (not (= (document-kind form) :list))
+          (not (= (document-count form) arity))) (document-null)
+    (let [decoded (document-i64-value (list-item form 1))]
+      (if (not (option-some?-of [:option :i64] decoded)) (document-null)
+        (let [id (option-value-of [:option :i64] decoded -1)]
+          (if (<= 0 id 255)
+            (document-vector (document-keyword :cap/call) (document-i64 id))
+            (document-null)))))))
+
+(defn- body-container-effect-witness? [form :document functions :document
+                                      effect :document visited :document depth :i64
+                                      start :i64] :bool
+  (let [kind (document-kind form)]
+    (loop [index start]
+      (if (= index (document-count form)) false
+        (let [item (if (= kind :list) (list-item form index)
+                     (if (= kind :vector) (vector-item form index)
+                       (if (= kind :set)
+                         (option-value-of [:option :document] (document-set-at form index) (document-null))
+                         (option-value-of [:option :document] (document-map-entry-at form index) (document-vector))))) ]
+          (or (body-effect-witness? item functions effect visited (+ depth 1))
+              (recur (+ index 1))))))))
+
+(defn- body-list-effect-witness? [form :document functions :document effect :document
+                                 visited :document depth :i64] :bool
+  (if (= (document-count form) 0) false
+    (let [operator (list-item form 0)
+          cap-call (document-symbol (symbol "cap-call"))
+          typed-cap-call (document-symbol (symbol "typed-cap-call"))]
+      (if (document-equal? operator cap-call)
+        (let [found (cap-effect-of-call form 3)]
+          (or (and (not (= (document-kind found) :null))
+                   (document-equal? found effect))
+              (and (= (document-count form) 3)
+                   (body-effect-witness? (list-item form 2) functions effect visited (+ depth 1)))))
+        (if (document-equal? operator typed-cap-call)
+          (let [found (cap-effect-of-call form 5)]
+            (or (and (not (= (document-kind found) :null))
+                     (document-equal? found effect))
+                (and (= (document-count form) 5)
+                     (body-effect-witness? (list-item form 4) functions effect visited (+ depth 1)))))
+          (let [callee-index (function-index functions operator)]
+            (if (< callee-index 0)
+              (body-container-effect-witness? form functions effect visited depth 1)
+              (let [callee (vector-item functions callee-index)
+                    callee-name (field callee :name)
+                    callee-visited (document-vector-conj visited callee-name)]
+                (or (and (not (name-in-vector? visited callee-name))
+                         (body-effect-witness? (field callee :body) functions effect callee-visited (+ depth 1)))
+                    (body-container-effect-witness? form functions effect visited depth 1))))))))))
+
+(defn- body-effect-witness? [form :document functions :document effect :document
+                             visited :document depth :i64] :bool
+  (if (> depth 256) false
+    (let [kind (document-kind form)]
+      (if (= kind :list)
+        (body-list-effect-witness? form functions effect visited depth)
+        (if (or (= kind :vector) (= kind :set) (= kind :map))
+          (body-container-effect-witness? form functions effect visited depth 0)
+          false)))))
+
+(defn- body-container-effects-covered? [form :document functions :document
+                                       declared :document visited :document depth :i64
+                                       start :i64] :bool
+  (let [kind (document-kind form)]
+    (loop [index start]
+      (if (= index (document-count form)) true
+        (let [item (if (= kind :list) (list-item form index)
+                     (if (= kind :vector) (vector-item form index)
+                       (if (= kind :set)
+                         (option-value-of [:option :document] (document-set-at form index) (document-null))
+                         (option-value-of [:option :document] (document-map-entry-at form index) (document-vector))))) ]
+          (and (body-effects-covered? item functions declared visited (+ depth 1))
+               (recur (+ index 1))))))))
+
+(defn- body-list-effects-covered? [form :document functions :document declared :document
+                                  visited :document depth :i64] :bool
+  (if (= (document-count form) 0) false
+    (let [operator (list-item form 0)
+          cap-call (document-symbol (symbol "cap-call"))
+          typed-cap-call (document-symbol (symbol "typed-cap-call"))]
+      (if (document-equal? operator cap-call)
+        (let [effect (cap-effect-of-call form 3)]
+          (and (not (= (document-kind effect) :null))
+               (document-set-contains? declared effect)
+               (body-effects-covered? (list-item form 2) functions declared visited (+ depth 1))))
+        (if (document-equal? operator typed-cap-call)
+          (let [effect (cap-effect-of-call form 5)]
+            (and (not (= (document-kind effect) :null))
+                 (document-set-contains? declared effect)
+                 (body-effects-covered? (list-item form 4) functions declared visited (+ depth 1))))
+          (let [callee-index (function-index functions operator)]
+            (if (< callee-index 0)
+              (body-container-effects-covered? form functions declared visited depth 1)
+              (let [callee (vector-item functions callee-index)
+                    callee-name (field callee :name)
+                    callee-effects (field callee :effects)
+                    callee-visited (document-vector-conj visited callee-name)]
+                (and (capability-effects-subset? callee-effects declared)
+                     (or (name-in-vector? visited callee-name)
+                         (body-effects-covered? (field callee :body) functions callee-effects
+                                                callee-visited (+ depth 1)))
+                     (body-container-effects-covered? form functions declared visited depth 1))))))))))
+
+(defn- body-effects-covered? [form :document functions :document declared :document
+                              visited :document depth :i64] :bool
+  (if (> depth 256) false
+    (let [kind (document-kind form)]
+      (if (= kind :list)
+        (body-list-effects-covered? form functions declared visited depth)
+        (if (or (= kind :vector) (= kind :set) (= kind :map))
+          (body-container-effects-covered? form functions declared visited depth 0)
+          true)))))
+
+(defn- function-cap-effects-realized? [function :document functions :document] :bool
+  (let [effects (field function :effects)
+        name (field function :name)
+        body (field function :body)
+        visited (document-vector name)]
+    (loop [index 0]
+      (if (= index (document-count effects)) true
+        (let [effect (option-value-of [:option :document]
+                       (document-set-at effects index) (document-null))]
+          (and (or (not (type-tag? effect :cap/call))
+                   (body-effect-witness? body functions effect visited 0))
+               (recur (+ index 1))))))))
+
+(defn- effect-set-subset? [subset :document superset :document] :bool
+  (loop [index 0]
+    (if (= index (document-count subset)) true
+      (if (document-set-contains? superset
+            (option-value-of [:option :document] (document-set-at subset index) (document-null)))
+        (recur (+ index 1)) false))))
+
+(defn- effect-in-functions? [functions :document effect :document] :bool
+  (loop [index 0]
+    (if (= index (document-count functions)) false
+      (if (document-set-contains? (field (vector-item functions index) :effects) effect)
+        true
+        (recur (+ index 1))))))
+
+(defn- function-effect-row-matches? [functions :document module-effects :document] :bool
+  (let [function-effects-fit?
+        (loop [function-index 0]
+          (if (= function-index (document-count functions)) true
+            (if (effect-set-subset? (field (vector-item functions function-index) :effects) module-effects)
+              (recur (+ function-index 1)) false)))
+        module-effects-fit?
+        (loop [effect-index 0]
+          (if (= effect-index (document-count module-effects)) true
+            (let [effect (option-value-of [:option :document]
+                           (document-set-at module-effects effect-index) (document-null))]
+              (if (effect-in-functions? functions effect)
+                (recur (+ effect-index 1)) false))))]
+    (and function-effects-fit? module-effects-fit?)))
+
+(defn kexe-function-effects-match? [program :document] :bool
+  (if (or (not (kexe-module-outline? program))
+          (not (kexe-function-record-shapes-valid? program))) false
+    (let [functions (field program :functions)
+          module-effects (field program :effects)]
+      (let [function-bodies-fit?
+            (loop [index 0]
+              (if (= index (document-count functions)) true
+                (let [function (vector-item functions index)
+                      name (field function :name)
+                      effects (field function :effects)]
+                  (if (body-effects-covered? (field function :body) functions effects
+                                             (document-vector name) 0)
+                    (if (function-cap-effects-realized? function functions)
+                      (recur (+ index 1)) false)
+                    false))))]
+        (if function-bodies-fit?
+          (function-effect-row-matches? functions module-effects)
+          false)))))
 
 (defn kexe-function-boundaries-valid? [program :document] :bool
   (if (not (kexe-module-outline? program)) false
