@@ -398,3 +398,14 @@ slot4 selection.42-module USB/NVMe12 and PXE hub smoke pass; the exact
 candidate is running with firmware init15/LE advertising ingress. Owner
 clarifies the present LED is slow/brief, so actual new-pairing mode is not
 yet established. Fn+Q standby is being checked before Fn+Control+4.
+
+
+LE send successor: use non-flushable PBF00 for Host-to-Controller LE data
+(Core Vol4 E5.4.2). Wait for the prior USB OUT completion before writing
+the shared DMA buffer; the driver independently refuses writes while busy.
+Native LE6 header and OUT ownership controls pass, with aggregateffff,
+42-module USB/NVMe12 and PXE hub smoke. Slot4 advertising/link completes
+on hardware, but first retries receive only ATT MTU/connection-parameter
+requests before disconnect(reason8); SMP/keyboard/mouse input are not yet
+qualified. Completed obsolete QEMU test disks52 were archived byte-exact
+with decompressed SHA verification, reclaiming2070MiB; manifest retained.
