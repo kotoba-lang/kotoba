@@ -235,3 +235,29 @@ HCI/ROM versions are still unmeasured; its `rtl8851bu` firmware candidate is
 not yet selected or qualified. Selection back to `05:00.4` restored the
 accepted keyboard path and retained Goal `aba`. See
 `physical-bluetooth-adapter.json`. No scan or pairing occurred.
+
+## Bounded HCI control/event identification
+
+Signed profile6 command8 (`bt-probe <BDF>`) explicitly enables a diagnostic
+HCI event channel for USB interfaces `e0/01/01`; default USB enumeration
+still refuses these as boot HID. It configures only interrupt-IN and EP0,
+then issues standard HCI Reset (`0x0c03`) and Read Local Version (`0x1001`).
+Single-function devices use device requests; composite functions use their
+interface number. It waits for EP0 status before arming interrupt-IN, so
+synchronous control polling cannot discard the HCI event completion.
+
+The native response validator requires exact length, Command Complete, the
+matching opcode, command credits and success status. Twelve pure positive/
+refusal vectors run inside the native controller fixture. Kind3 is never
+passed to keyboard/mouse reducers, and unsolicited events are not rearmed
+by the desktop. Only an explicit diagnostic probe accepts this channel.
+The product graph now has37 modules, adding `native/bluetooth_hci.kotoba`.
+
+`c008` returns the probe status. `c190..19c` contain phase, Reset/version
+results, HCI version/revision, LMP version, manufacturer, LMP subversion,
+self-check mask and the final response status/event/opcode/length. Version
+fields are valid only when `c008=c190=15`. Phase17 refuses a non-Bluetooth
+selection;18/19 mean Reset/version failure. Negative operation results in
+u32 diagnostic words use their low32-bit two's-complement encoding.
+No ACL, scan, connection, pairing, firmware download or bond key is sent.
+This HCI identification path does not yet implement HOGP keyboard/mouse input.

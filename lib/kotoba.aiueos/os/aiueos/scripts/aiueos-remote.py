@@ -122,7 +122,7 @@ def main():
     p.add_argument("--key", type=Path, required=True, help="32-byte Ed25519 seed file (mode 0600)")
     p.add_argument("--broadcast", default="10.77.0.255")
     p.add_argument("--wait", type=float, default=15.0, help="seconds to wait for the nonce and replies")
-    p.add_argument("command", choices=("ping", "reboot", "key", "type", "shot", "update", "install", "usb-select"))
+    p.add_argument("command", choices=("ping", "reboot", "key", "type", "shot", "update", "install", "usb-select", "bt-probe"))
     p.add_argument("value", nargs="?")
     args = p.parse_args()
     if args.key.stat().st_mode & 0o077:
@@ -148,15 +148,16 @@ def main():
                 print(f"{tag:04x} {value:016x}", flush=True)
             if tag in (done, 0xC0FF):
                 break
-    elif args.command == "usb-select":
+    elif args.command in ("usb-select", "bt-probe"):
         slot = int(args.value, 0)
         if not 0 <= slot <= 65535:
             raise SystemExit("PCI slot must be bus<<8 | device<<3 | function (0..65535)")
-        send(args, seed, nonce, counter, 7, slot)
+        done = 0xC007 if args.command == "usb-select" else 0xC008
+        send(args, seed, nonce, counter, 7 if args.command == "usb-select" else 8, slot)
         for tag, value in records(log, time.monotonic() + args.wait):
-            if tag in (0xC007, 0xC0FF) or 0xC170 <= tag <= 0xC172 or 0xC180 <= tag <= 0xC18B:
+            if tag in (done, 0xC0FF) or 0xC170 <= tag <= 0xC172 or 0xC180 <= tag <= 0xC19C:
                 print(f"{tag:04x} {value:016x}", flush=True)
-            if tag in (0xC007, 0xC0FF):
+            if tag in (done, 0xC0FF):
                 break
         else:
             raise SystemExit("no USB selection result received")
