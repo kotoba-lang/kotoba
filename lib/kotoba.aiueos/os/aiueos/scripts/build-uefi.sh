@@ -1246,13 +1246,13 @@ python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_browser_frame_
   324988bdec511a5fce7ee4b94100388686821f09351aa67e126ce8a76d9a2ed9 \
   kotoba_aiueos_browser_frame
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_browser_reduce_object" \
-  fd355f2da0d3b5a77c39ee2f7d1c888a127c1af67122b354773bb260cc9c9677 \
+  c1ff35db4e8333670814cc103e86d715267bf70e6ac70eea4d46bde7da5424a4 \
   kotoba_aiueos_browser_reduce
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_browser_frame2_object" \
-  e753f2658573c2c681e60e1c37cd7c802d65925aa055cf01b734f9eefc5b506c \
+  f0da075523310a85253d9742988597e7b304616c191165268ae34bd7a123458d \
   kotoba_aiueos_browser_frame2
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_browser_ime_object" \
-  52ef6924472cded523d80c9f9dd7c2ad533bb58446240028424e08462bdbbba7 \
+  7d951a770819afdc3a20a9bcf4b81c2142a5ee71ada10e48bba2fecdc4919afa \
   kotoba_aiueos_browser_key
 python3 "$aiueos/scripts/verify-kotoba-kernel-object.py" "$kotoba_browser_damage_object" \
   6ce0fd8d98992eea4fdbc2ad0139bcd2440ea201e5e7b61bf592eddac41fd575 \
