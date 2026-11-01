@@ -358,3 +358,13 @@ correct bundle and rejects a changed byte and missing firmware.41-module
 USB/NVMe12 and exact PXE hub smoke pass. Physical upload/RF/Studio pairing
 remain unqualified at this candidate record. Binary provenance and Realtek
 redistribution notice are included; no firmware disassembly or flash write.
+
+
+Physical BLE radio successor: controller version becomes048a/d230 after the
+pinned RAM upload. Patched Realtek emits bounded vendor telemetry before
+Reset Complete; consume it without accepting it as a completion. Exact CC
+checks remain required. Eighteen native HCI controls, HOGP14, USB/NVMe12 and
+PXE hub smoke pass. The successor initializes with result15 and receives LE
+advertising events with no transport error. Studio pairing/encryption/input
+remain open, pending the owner's slot4 pairing-mode refresh. This is not a
+firmware RAM readback/attestation or durable bond/reconnect qualification.

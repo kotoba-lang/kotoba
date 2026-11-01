@@ -64,7 +64,7 @@ def main(a):
                 'checks': ['initial fallback HID', 'two initial HID', 'out-of-range refusal',
                            'non-xHCI refusal', 'refusals retain HID count', 'select empty host',
                            'reselect HID host', 'draft range retained', 'NVMe state range retained', 'failed host refuses DMA reuse',
-                           'HCI14 framing vectors', 'non-Bluetooth probe refused', 'large HCI complete accepted', 'oversized HCI complete refused', 'HOGP14 native report/admission refusals'],
+                           'HCI18 framing vectors', 'non-Bluetooth probe refused', 'large HCI complete accepted', 'oversized HCI complete refused', 'HOGP14 native report/admission refusals'],
                 'artifacts': {n: pin(getattr(a, n)) for n in ('efi', 'kernel', 'media', 'qemu', 'firmware')},
                 'observer': pin(Path(__file__)), 'physicalHardware': False,
                 'BluetoothTransportQualified': False, 'simultaneousHosts': False,
