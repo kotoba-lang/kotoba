@@ -522,3 +522,20 @@ hub with existing keyboard, HID count2. Itonami/Yataverse overlap is prepared
 and the screenshot no longer contains boot diagnostic dots/bands. Owner
 feedback on actual overlap/Dock movement flicker is pending; a still image
 and native pixel equivalence do not qualify temporal smoothness.
+
+
+2026-11-02 JUN-502 Window/Dock flicker follow-up: owner reports slight
+improvement from cursor save-under but remaining Window/Dock icon flicker.
+The changed-scene path now composes bounded tiles in borrowed retained-op
+cache bytes1024..4095, then copies each final changed GOP pixel once. The
+cache is rebuilt after present. Band indices at12800..13835 reduce command
+walks, adaptive widths96/48/32/24/16 and8-row interiors retain a2px halo per
+local blur (max4,768 pixels). More complex/nonopaque scenes use the direct
+reference painter; F3 is retained as the pixel oracle. No ABI/memory grant
+or pinned compiler change. All visual debug marks and verbose boot per-op
+traces are removed; signed UDP control and DRAM/UDP diagnostic records stay.
+Native pixel12, exact PXE USB2-hub smoke and standard USB/NVMe12 pass on
+the final candidate. Earlier v7/v8/v11 failed fixed-timing USB regressions
+and are retained as failed, with initial TCG latency observations. The
+final candidate is not a60Hz/VSync/full-frame atomic compositor claim.
+Physical flicker acceptance remains required; HHKB testing stays paused.
