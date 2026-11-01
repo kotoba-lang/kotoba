@@ -172,3 +172,15 @@ Mouse enumeration, movement and clicks remain pending after connection and
 reboot (this candidate has no hotplug). See `physical-keyboard-input.json`
 and its two actual screen readbacks. No driver change or reset was needed
 to record this clarification; the current PXE candidate remains live.
+
+## Read-only xHCI inventory
+
+Profile 6 now logs up to eight PCI xHCI functions without changing their
+PCI command, firmware ownership, run state, DMA pointers or selected-host
+private state. At tag `0xc280 + host*32` it emits the BDF, then PCI ID, PCI
+command, CAPLENGTH/version, HCSPARAMS1/2, HCCPARAMS1, DBOFF and RTSOFF;
+the following sixteen fields are PORTSC snapshots. Disabled/unavailable
+MMIO and ports beyond MaxPorts are reported as all ones. Only bounded
+register reads of a memory-enabled controller with a valid BAR are allowed.
+This distinguishes other physical USB port routes without claiming
+simultaneous-controller input, device enumeration or Trackpad support.
