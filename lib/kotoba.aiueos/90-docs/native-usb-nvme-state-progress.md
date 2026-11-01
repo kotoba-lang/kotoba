@@ -390,3 +390,11 @@ keyboard14/HCI18,42-module USB/NVMe12 and PXE hub smoke. No real Studio
 mouse/key input is qualified; observed HHKB naming still needs selection
 diagnosis. Parser scratch uses the dead input context second1024 bytes;
 fixtures first select an empty host before borrowing output contexts.
+
+
+Peer-name diagnostic successor: retain at most16 friendly-name bytes only
+for an HHKB prefix, never peer addresses/keys/reports, while keeping exact
+slot4 selection.42-module USB/NVMe12 and PXE hub smoke pass; the exact
+candidate is running with firmware init15/LE advertising ingress. Owner
+clarifies the present LED is slow/brief, so actual new-pairing mode is not
+yet established. Fn+Q standby is being checked before Fn+Control+4.
