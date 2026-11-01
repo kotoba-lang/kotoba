@@ -193,3 +193,19 @@ host still accepts keyboard `1c4f:0002`; simultaneous-host input is unimplemente
 See `physical-controller-inventory.json`. All five controllers request two
 scratchpads each; extending simultaneous ownership must preserve the bounded
 USB/NVMe/NIC DMA allocation rather than reuse a running host's buffers.
+
+After the owner confirmed pressing `h` once on the reconnected HHKB, a new
+actual screen readback still showed Goal `aba`. Its top800x570 pixels are
+identical to the pre-action frame. No synthetic `h` was sent. HHKB input
+therefore remains unqualified; the selected `1c4f:0002` keyboard and the
+connected port on `06:00.0` cannot be identified as HHKB from this evidence.
+The owner was asked to distinguish wired USB mode, Bluetooth, and a hub/switch
+path before attributing a controller or report-format fault. See
+`physical-hhkb-input.json` and `hardware-hhkb-h.png`.
+
+The owner initially reported direct wired USB mode, then clarified that
+Bluetooth may be the active mode and explicitly requested Bluetooth support.
+Treat the HHKB transport as unresolved. AWAI-142 now tracks active Bluetooth
+adapter discovery, HCI transport and pairing/input work separately; no Bluetooth
+adapter, pairing or HID-over-Bluetooth input is qualified by the above USB
+or framebuffer observations.
