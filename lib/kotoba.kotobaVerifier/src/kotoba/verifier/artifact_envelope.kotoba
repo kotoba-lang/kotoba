@@ -3,7 +3,7 @@
 ;; The optional :oracle marker is validated here. Canonical seal and KIR hash
 ;; identity are composed below; full runtime semantics remain separate work.
 (ns kotoba.verifier.artifact-envelope
-  {:kotoba/export [kexe-header-shape? code-bytes-shape? kexe-integrity? kexe-compatibility-match? kexe-module-outline? kexe-function-identities-match?]}
+  {:kotoba/export [kexe-header-shape? code-bytes-shape? kexe-integrity? kexe-compatibility-match? kexe-module-outline? kexe-function-identities-match? kexe-function-boundaries-valid?]}
   (:require [kotoba.artifact.core :as artifact]
             [kotoba.kir.compatibility :as compatibility]
             [kotoba.kir.float-usage :as float-usage]))
@@ -349,3 +349,252 @@
                                        true
                                        (recur (+ export-index 1))))))
                             (recur (+ index 1))))))))))))
+
+(defn- vector-item [value :document index :i64] :document
+  (option-value-of [:option :document] (document-vector-at value index) (document-null)))
+
+(defn- type-tag? [type :document tag :keyword] :bool
+  (and (= (document-kind type) :vector)
+       (> (document-count type) 0)
+       (document-equal? (vector-item type 0) (document-keyword tag))))
+
+(defn- qualified-keyword? [value :document] :bool
+  (if (not (= (document-kind value) :keyword)) false
+    (let [printed (document-edn-print value)]
+      (>= (string-find-byte printed 47 0) 0))))
+
+(defn- pair-key-collision-from? [pairs :document left-index :i64] :bool
+  (let [left-key (vector-item (vector-item pairs left-index) 0)]
+    (loop [right-index (+ left-index 1)]
+      (if (= right-index (document-count pairs)) false
+        (or (document-equal? left-key (vector-item (vector-item pairs right-index) 0))
+            (recur (+ right-index 1)))))))
+
+(defn- unique-pair-keys? [pairs :document] :bool
+  (loop [left-index 0]
+    (if (= left-index (document-count pairs)) true
+      (and (not (pair-key-collision-from? pairs left-index))
+           (recur (+ left-index 1))))))
+
+;; Single-recursive-descriptor port of the independent native ABI type tables
+;; in verify-program!. `mode` keeps the record/word/handle recurrences explicit
+;; without importing the compiler's admission predicate into the verifier.
+;; Function identity, closure-index, pair-chain, result-refinement and effect
+;; checks remain separate verifier slices.
+(defn- native-kir-type? [type :document mode :keyword depth :i64] :bool
+  (if (= mode :qualified-ref)
+    (and (type-tag? type :ref)
+         (= (document-count type) 2)
+         (qualified-keyword? (vector-item type 1)))
+    (if (= mode :word-value)
+      (or (document-equal? type (document-keyword :i64))
+          (document-equal? type (document-keyword :bool))
+          (document-equal? type (document-keyword :string))
+          (document-equal? type (document-keyword :keyword))
+          (document-equal? type (document-keyword :document))
+          (document-equal? type (document-keyword :option-i64))
+          (document-equal? type (document-keyword :result-i64))
+          (and (<= depth 8)
+               (type-tag? type :option)
+               (= (document-count type) 2)
+               (or (native-kir-type? (vector-item type 1) :word-value (+ depth 1))
+                   (native-kir-type? (vector-item type 1) :scalar-record 0)))
+          (and (<= depth 8)
+               (type-tag? type :set)
+               (= (document-count type) 2)
+               (or (native-kir-type? (vector-item type 1) :word-value (+ depth 1))
+                   (native-kir-type? (vector-item type 1) :scalar-record 0)))
+          (and (<= depth 8)
+               (type-tag? type :result)
+               (= (document-count type) 3)
+               (native-kir-type? (vector-item type 1) :word-value (+ depth 1))
+               (native-kir-type? (vector-item type 2) :word-value (+ depth 1))))
+      (if (= mode :scalar-record)
+        (and (< depth 32)
+             (type-tag? type :record)
+             (= (document-count type) 3)
+             (qualified-keyword? (vector-item type 1))
+             (= (document-kind (vector-item type 2)) :vector)
+             (<= (document-count (vector-item type 2)) 32)
+             (unique-pair-keys? (vector-item type 2))
+             (loop [index 0]
+               (let [fields (vector-item type 2)]
+                 (if (= index (document-count fields)) true
+                   (let [pair (vector-item fields index)
+                         item-type (vector-item pair 1)]
+                     (and (= (document-kind pair) :vector)
+                          (= (document-count pair) 2)
+                          (= (document-kind (vector-item pair 0)) :keyword)
+                          (or (document-equal? item-type (document-keyword :i64))
+                              (document-equal? item-type (document-keyword :bool))
+                              (document-equal? item-type (document-keyword :string))
+                              (document-equal? item-type (document-keyword :keyword))
+                              (document-equal? item-type (document-keyword :document))
+                              (native-kir-type? item-type :word-value (+ depth 1))
+                              (native-kir-type? item-type :qualified-ref 0)
+                              (document-equal? item-type (document-keyword :vector-i64))
+                              (and (type-tag? item-type :list)
+                                   (= (document-count item-type) 2)
+                                   (native-kir-type? item-type :handle 0))
+                              (native-kir-type? item-type :scalar-record (+ depth 1)))
+                          (recur (+ index 1))))))))
+        (if (= mode :variant-boundary)
+          (and (type-tag? type :variant)
+               (= (document-count type) 3)
+               (qualified-keyword? (vector-item type 1))
+               (= (document-kind (vector-item type 2)) :vector)
+               (<= 1 (document-count (vector-item type 2)))
+               (<= (document-count (vector-item type 2)) 32)
+               (unique-pair-keys? (vector-item type 2))
+               (loop [index 0]
+                 (let [cases (vector-item type 2)]
+                   (if (= index (document-count cases)) true
+                     (let [pair (vector-item cases index)
+                           payload (vector-item pair 1)]
+                       (and (= (document-kind pair) :vector)
+                            (= (document-count pair) 2)
+                            (= (document-kind (vector-item pair 0)) :keyword)
+                            (or (document-equal? payload (document-keyword :i64))
+                                (document-equal? payload (document-keyword :bool))
+                                (native-kir-type? payload :scalar-record 0))
+                            (recur (+ index 1))))))))
+          (if (= mode :boundary)
+            (or (document-equal? type (document-keyword :i64))
+                (document-equal? type (document-keyword :bool))
+                (document-equal? type (document-keyword :string))
+                (document-equal? type (document-keyword :keyword))
+                (document-equal? type (document-keyword :document))
+                (document-equal? type (document-keyword :f64))
+                (native-kir-type? type :word-value 0)
+                (and (native-kir-type? type :scalar-record 0)
+                     (not (native-kir-type? type :private-handle 0)))
+                (native-kir-type? type :variant-boundary 0)
+                (native-kir-type? type :qualified-ref 0))
+            (if (= mode :private-handle)
+              (if (document-equal? type (document-keyword :vector-i64)) true
+                (if (and (type-tag? type :record) (= (document-count type) 3)
+                         (= (document-kind (vector-item type 2)) :vector))
+                  (loop [index 0]
+                    (let [fields (vector-item type 2)]
+                      (if (= index (document-count fields)) false
+                        (let [pair (vector-item fields index)]
+                          (or (document-equal? (vector-item pair 1) (document-keyword :vector-i64))
+                              (native-kir-type? (vector-item pair 1) :private-handle 0)
+                              (recur (+ index 1)))))))
+                  false))
+              (if (= mode :handle-member)
+                (and (= (document-kind type) :vector)
+                     (= (document-count type) 2)
+                     (= (document-kind (vector-item type 0)) :keyword)
+                     (native-kir-type? (vector-item type 1) :handle (+ depth 1)))
+                (if (= mode :handle)
+                  (or (native-kir-type? type :word-value 0)
+                      (native-kir-type? type :scalar-record 0)
+                      (document-equal? type (document-keyword :vector-i64))
+                      (native-kir-type? type :qualified-ref 0)
+                      (and (<= depth 32)
+                           (or (type-tag? type :record) (type-tag? type :variant))
+                           (= (document-count type) 3)
+                           (qualified-keyword? (vector-item type 1))
+                           (= (document-kind (vector-item type 2)) :vector)
+                           (<= 1 (document-count (vector-item type 2)))
+                           (<= (document-count (vector-item type 2)) 32)
+                           (unique-pair-keys? (vector-item type 2))
+                           (loop [index 0]
+                             (let [members (vector-item type 2)]
+                               (if (= index (document-count members)) true
+                                 (and (native-kir-type? (vector-item members index) :handle-member depth)
+                                      (recur (+ index 1)))))))
+                      (and (<= depth 32)
+                           (type-tag? type :vector)
+                           (= (document-count type) 2)
+                           (= (document-kind (vector-item type 1)) :vector)
+                           (<= 1 (document-count (vector-item type 1)))
+                           (<= (document-count (vector-item type 1)) 32)
+                           (loop [index 0]
+                             (let [members (vector-item type 1)]
+                               (if (= index (document-count members)) true
+                                 (and (native-kir-type? (vector-item members index) :handle (+ depth 1))
+                                      (recur (+ index 1)))))))
+                      (and (<= depth 32)
+                           (type-tag? type :option)
+                           (= (document-count type) 2)
+                           (or (document-equal? (vector-item type 1) (document-keyword :bytes))
+                               (native-kir-type? (vector-item type 1) :handle (+ depth 1))))
+                      (and (<= depth 32)
+                           (type-tag? type :list)
+                           (= (document-count type) 2)
+                           (native-kir-type? (vector-item type 1) :handle (+ depth 1)))
+                      (and (<= depth 32)
+                           (type-tag? type :map)
+                           (= (document-count type) 3)
+                           (or (document-equal? (vector-item type 1) (document-keyword :i64))
+                               (document-equal? (vector-item type 1) (document-keyword :bool))
+                               (document-equal? (vector-item type 1) (document-keyword :string))
+                               (document-equal? (vector-item type 1) (document-keyword :keyword)))
+                           (native-kir-type? (vector-item type 2) :handle (+ depth 1)))
+                      (and (<= depth 32)
+                           (type-tag? type :result)
+                           (= (document-count type) 3)
+                           (native-kir-type? (vector-item type 1) :handle (+ depth 1))
+                           (native-kir-type? (vector-item type 2) :handle (+ depth 1))))
+                  false)))))))))
+
+(defn- native-function-type? [type :document exported? :bool] :bool
+  (or (native-kir-type? type :boundary 0)
+      (document-equal? type (document-keyword :vector-i64))
+      (document-equal? type (document-keyword :bytes))
+      (and (not exported?)
+           (or (document-equal? type (document-keyword :vector-f64))
+               (document-equal? type (document-keyword :string-index))
+               (native-kir-type? type :handle 0)))))
+
+(defn kexe-function-boundaries-valid? [program :document] :bool
+  (if (not (kexe-module-outline? program)) false
+    (let [functions (field program :functions)
+          exports (field program :exports)
+          entry (field program :entry)]
+      (loop [index 0]
+        (if (= index (document-count functions)) true
+          (let [function (vector-item functions index)
+                name (field function :name)
+                exported?
+                (loop [export-index 0]
+                  (if (= export-index (document-count exports)) false
+                    (or (document-equal? name (vector-item exports export-index))
+                        (recur (+ export-index 1)))))
+                is-entry? (document-equal? name entry)
+                params (field function :params)
+                result (field function :result)
+                result-ok? (or (document-equal? result (document-keyword :i64))
+                               (document-equal? result (document-keyword :bool))
+                               (document-equal? result (document-keyword :string))
+                               (document-equal? result (document-keyword :f64))
+                               (and exported? (not is-entry?) (= (document-count params) 0)
+                                    (or (document-equal? result (document-keyword :vector-i64))
+                                        (document-equal? result (document-keyword :vector-f64))))
+                               (native-function-type? result exported?))]
+            (and (function-identity-shape? function)
+                 (<= (document-count params) 64)
+                 result-ok?
+                 (loop [param-index 0]
+                   (if (= param-index (document-count params)) true
+                     (and (= (document-kind (vector-item params param-index)) :symbol)
+                          (recur (+ param-index 1)))))
+                 (loop [param-index 0]
+                   (if (= param-index (document-count params)) true
+                     (let [param-name (vector-item params param-index)]
+                       (and (not (loop [prior-index 0]
+                                   (if (= prior-index param-index) false
+                                     (or (document-equal? param-name (vector-item params prior-index))
+                                         (recur (+ prior-index 1))))))
+                            (recur (+ param-index 1))))))
+                 (or (= (document-kind (field function :param-types)) :null)
+                     (let [param-types (field function :param-types)]
+                       (and (= (document-kind param-types) :vector)
+                            (= (document-count param-types) (document-count params))
+                            (loop [param-index 0]
+                              (if (= param-index (document-count param-types)) true
+                                (and (native-function-type? (vector-item param-types param-index) exported?)
+                                     (recur (+ param-index 1))))))))
+                 (recur (+ index 1)))))))))
