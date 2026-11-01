@@ -427,3 +427,16 @@ Source comment discrepancy observed at bluetooth_hogp.kotoba handle-signal:
 the comment mentions malformed/out-of-range connection parameter requests,
 but the code returns rejection1 for every well-framed request. This existing
 policy was left in place; it is not evidence of parameter-update support.
+
+
+Physical controller KAT on the43-module passkey candidate reports7ff:
+eight SC vectors plus official c1, changed-nonce refusal and official s1.
+The exact media's USB/NVMe12 criteria also pass with a task-only observer
+that drains HMP while waiting and raises the read deadline15s to60s. The
+unmodified observer attempts failed memory observation (one after11 events,
+one during outbox signing); those failures are retained and not relabeled.
+The native fixture and acceptance predicates were unchanged.
+Physical pairing/input remain open: owner reports slot4 fast blue, while
+received friendly names currently include Studio1/3. No other slot is selected.
+An in-place re-probe during scan fails reset-response18; a clean one-shot
+PXE boot restores RF scanning instead. No firmware flash or OS install.
