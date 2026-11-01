@@ -409,3 +409,21 @@ on hardware, but first retries receive only ATT MTU/connection-parameter
 requests before disconnect(reason8); SMP/keyboard/mouse input are not yet
 qualified. Completed obsolete QEMU test disks52 were archived byte-exact
 with decompressed SHA verification, reclaiming2070MiB; manifest retained.
+
+
+Passkey successor (AWAI-142): the corrected LE/USB send candidate received a
+real SMP Pairing Response (CID6/length7/opcode2), then failed its overly
+strict feature condition40. The host MITM request plus peer keyboard IO
+selects Passkey Entry even when the peer MITM bit is clear (Core Vol3 H
+2.3.5.1). SC remains preferred; a native LE Legacy c1/s1 passkey path and
+encrypted, negotiated RAM-only LTK distribution are now implemented.
+Native SMP10 selection/refusal and c1 p1/p2 layout controls join the
+aggregateffff controller fixture. The43-module kernel/EFI reproduce and
+exact PXE root-keyboard/hub-mouse smoke passes. Full USB/NVMe regression
+is still running; controller c1/s1 KAT and real pairing/input are pending.
+No inference about Studio's actual SC support is made before feature capture.
+
+Source comment discrepancy observed at bluetooth_hogp.kotoba handle-signal:
+the comment mentions malformed/out-of-range connection parameter requests,
+but the code returns rejection1 for every well-framed request. This existing
+policy was left in place; it is not evidence of parameter-update support.
