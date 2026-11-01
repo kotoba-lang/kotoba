@@ -79,7 +79,11 @@ def main(args):
                  "-device", "nvme,serial=AWAI120STATE,drive=nv0"]
         if usb == "second":
             extra += ["-device", "qemu-xhci,id=empty"]
-        if usb:
+        if usb == "hub":
+            extra += ["-device", "qemu-xhci,id=usb", "-device", "usb-kbd,bus=usb.0,port=1",
+                      "-device", "usb-hub,id=hub,bus=usb.0,port=2",
+                      "-device", "usb-mouse,bus=usb.0,port=2.1"]
+        elif usb:
             extra += ["-device", "qemu-xhci,id=usb", "-device", "usb-kbd,bus=usb.0,port=1",
                       "-device", "usb-mouse,bus=usb.0,port=2"]
         b = StateBoot(args, out, name, None, extra, first_frame_seconds=600)
@@ -254,6 +258,17 @@ def main(args):
         active.quit()
         active = None
         events.append(dict(name="empty-first-controller-halted-second-hid-active"))
+        active = boot("hub-child", usb="hub")
+        active.send("sendkey 2", 1)
+        before = active.W(73)
+        active.send("sendkey v", 1)
+        assert active.S(2) == 2 and active.W(73) == before + 1
+        x, y = active.W(50), active.W(51)
+        active.send("mouse_move 9 6", 1)
+        assert (active.W(50), active.W(51)) == (x + 9, y + 6)
+        active.quit()
+        active = None
+        events.append(dict(name="root-keyboard-and-usb2-hub-child-mouse"))
         assert pin(Path(__file__)) == observer, "observer source changed during the run"
         status = "PASS_NATIVE_USB_HID_NVME_STATE_QEMU"
     except BaseException:

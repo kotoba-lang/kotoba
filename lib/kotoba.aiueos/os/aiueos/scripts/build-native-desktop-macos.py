@@ -261,7 +261,7 @@ def main(args):
         efi = kernel / "BOOTX64.EFI"
         image = kernel / "KERNEL.ELF"
         if (kernel_state["state"] != "MACOS_NATIVE_IMAGE_CANDIDATE"
-                or kernel_state["sourceModuleCount"] != 49
+                or kernel_state["sourceModuleCount"] != 36
                 or kernel_state["fuel"] != FUEL
                 or kernel_state["compiler"] != compiler_pin
                 or pin(efi) != kernel_state["efi"] or pin(image) != kernel_state["kernel"]
@@ -344,7 +344,7 @@ def main(args):
                            else 4 if args.profile == "ed25519"
                            else 16 if args.profile == "keystore"
                            else 11 if args.profile == "dapps"
-                           else 11 if args.profile == "input-state"
+                           else 12 if args.profile == "input-state"
                            else 7 if args.profile == "nvme"
                            else 2 if args.profile in ("cid", "sha512", "gf25519", "keyseal") else 24)
         if (observed["status"] != expected_status

@@ -14,7 +14,8 @@ USB. QEMU's injected keys do not prove human consent or physical hardware.
 
 ## Input boundary
 
-The bounded host handles two direct-root boot keyboard/mouse interfaces,
+The bounded host handles two boot keyboard/mouse interfaces, directly or
+through one USB2 hub with up to8 ports,
 32/64-byte xHCI contexts, command/event/transfer ring cycles and BIOS ownership
 handoff and up to two 4KiB scratchpad buffers. If the first controller
 initializes but accepts no HID, it is halted before the next controller is
@@ -22,7 +23,7 @@ tried with the shared DMA memory. At most two controllers are tried; devices
 across two simultaneously active controllers are not supported. Per-host port
 state and enumeration-stage diagnostics distinguish empty ports from failures. It refuses controllers requiring
 more than two scratchpads, out-of-window registers,
-non-boot HID, hubs and unhandled descriptors. Modified chords remain unhandled
+non-boot HID, nested/USB3 hubs and unhandled descriptors. Modified chords remain unhandled
 by the current lower-case Goal editor. Rollover/error reports and held keys
 are rejected. A modal transition quarantines keyboard reports until release;
 queued keys cannot approve a newly opened operation. Relative mouse movement
@@ -105,3 +106,41 @@ HID kind with the port stage. The USB 2.0 timing rationale is also described by
 [Microsoft's USB driver team](https://techcommunity.microsoft.com/blog/microsoftusbblog/how-does-usb-stack-enumerate-a-device/270685/).
 The interactive netlog PXE variant omits the opt-in90s hardware watchdog;
 it has no install flag and leaves the prior server fallback intact.
+
+## USB2 hub composition and code cap
+
+A directly plugged mouse can still be behind the 6600H's observed Genesys
+05e3:0610 hub. The bounded hub path powers/resets ports, waits for recovery,
+sets child route strings and, for low/full-speed children of a high-speed hub,
+sets the parent TT slot/port. It supports one hub and at most two HID devices;
+there is no hub hotplug, nesting or general report-HID admission. EP0 is first
+read at8 bytes; a valid full-speed max-packet change is evaluated before the
+full descriptor. The QEMU gate adds a root keyboard and USB2-hub child mouse.
+
+The USB structure layout stays inside pages0..2:
+
+| Bytes within USB DMA window | Owner |
+| --- | --- |
+| 0..6143 | Three complete64-byte-stride output contexts |
+| 6144..8191 | Keyboard/mouse EP0 and interrupt rings |
+| 8192..10303 | Complete33-context input context |
+| 10304..10815 | Hub EP0 ring |
+| 10816..11071 | 16-entry event ring |
+| 11072..11327 | Command ring |
+| 11328..11519 | DCBAA, ERST and scratchpad pointer array |
+| 11520..11647 | Two64-byte report buffers |
+| 11648..12159 | Descriptor buffer |
+
+Scratchpads remain at pages3/14. Hub private state uses page9 words288..343,
+after previous reports256..271 and before the draft scratch starting at1536
+bytes. Input-context clearing stops at10304, so it cannot wipe the hub ring.
+
+The shared desktop graph exceeded the existing2MiB kernel-v3 text cap while
+linking the unused diagnostic `native/kernel` through legacy wrapper functions.
+The product desktop roots now omit that unused import/wrapper while retaining
+their actual main, eight typed ValueRuntime exports and domain admission.
+The pinned native kernel-v3 backend still owns the controlled fault shim;
+`native/kernel`, its diagnostic entry and compiler/ABI are unchanged. Product
+closures are pinned at36 modules. This source composition does not extend
+CPL3 or full-OS qualification; normal desktop, ATA restore and offline-dapps
+regressions are recorded separately alongside the input/hub gate.
