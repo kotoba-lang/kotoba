@@ -18,6 +18,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import native_media_retention
 
 
 HERE = Path(__file__).resolve().parent
@@ -240,7 +241,22 @@ def main(args):
                          iso=pin(output / iso), independentISO=iso_independent,
                          refusalCases=16, nativeFormatEmission=True,
                          qualification="Mac native GPT/FAT16 and El Torito ISO format verification; QEMU, release and physical gates separate")
+            controls = []
+            for name, source, operation, offset in native_media_retention.specifications(len(raw)):
+                try:
+                    record = native_media_retention.make_record(output, name, source, operation, offset)
+                    if record is not None:
+                        controls.append(record)
+                except (OSError, ValueError, IndexError) as error:
+                    print(f"negative control retained: {name}: {error}", file=sys.stderr)
+            state["reconstructableControls"] = controls
             save()
+            for record in controls:
+                try:
+                    if not native_media_retention.discard_control(output, record):
+                        print(f"negative control retained: {record['name']}", file=sys.stderr)
+                except (OSError, ValueError, IndexError) as error:
+                    print(f"negative control retained: {record['name']}: {error}", file=sys.stderr)
             # Only successful builds may discard reproduction copies. Keep the
             # original images, digests, logs and all failed build artifacts.
             for original, copy in ((disk, reproduced), (iso, iso_reproduced)):
