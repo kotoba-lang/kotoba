@@ -376,3 +376,17 @@ USB/NVMe12, HCI18/HOGP14 native controls and exact PXE hub smoke pass. The
 exact successor is running on6600H with firmware init15 and LE advertising
 ingress. Studio pairing/input still await the owner's slot4 mode refresh;
 this source/native interop change is not a physical Studio input receipt.
+
+
+HHKB embedded mouse candidate: prefer Report protocol and retain separate
+keyboard/mouse value handles and CCCDs in one authenticated HID service.
+Boot keyboard/mouse fallback stays bounded. The native HID Mouse parser
+requires a Mouse Application collection and relative signed8/12/16-bit XY,
+validates buttons/padding/Report ID and optionally decodes wheel/AC Pan.
+Full signed deltas reach the shared desktop pointer reducer; it acts on
+left click/drag and retains the full button mask. Contextual UI/scroll
+actions are not added. Native mouse16 plus mouse auth8 controls pass, with
+keyboard14/HCI18,42-module USB/NVMe12 and PXE hub smoke. No real Studio
+mouse/key input is qualified; observed HHKB naming still needs selection
+diagnosis. Parser scratch uses the dead input context second1024 bytes;
+fixtures first select an empty host before borrowing output contexts.
