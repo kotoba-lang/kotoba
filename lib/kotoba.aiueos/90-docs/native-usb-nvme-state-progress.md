@@ -95,3 +95,13 @@ are connected directly. Signed debug keys independently verified NVMe Goal
 The actual saved/restored Goal pixel regions match. This is hardware-reset
 Goal persistence, not physical HID input, full power loss, or physical
 key/outbox restoration. See `physical-goal-restore.json` and its five frames.
+
+The controller-selection successor found the wired devices on AMD 1022:161e
+at 05:00.4 after halting the empty 05:00.3 host. One boot HID enumerated;
+another port failed Address Device with completion code 4. The next candidate
+uses a fresh PIT channel2 mode0 one-shot for at least12ms of reset/address
+recovery, restoring gate/speaker control even on timeout. It logs the accepted
+HID kind with the port stage. The USB 2.0 timing rationale is also described by
+[Microsoft's USB driver team](https://techcommunity.microsoft.com/blog/microsoftusbblog/how-does-usb-stack-enumerate-a-device/270685/).
+The interactive netlog PXE variant omits the opt-in90s hardware watchdog;
+it has no install flag and leaves the prior server fallback intact.
