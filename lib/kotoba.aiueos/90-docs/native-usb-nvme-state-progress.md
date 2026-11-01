@@ -184,3 +184,12 @@ MMIO and ports beyond MaxPorts are reported as all ones. Only bounded
 register reads of a memory-enabled controller with a valid BAR are allowed.
 This distinguishes other physical USB port routes without claiming
 simultaneous-controller input, device enumeration or Trackpad support.
+
+The inventory successor completed its physical PXE boot and read five xHCI
+functions. `06:00.0` port1 reports connected but not enabled (`0x6e1`),
+outside the selected `05:00.4` host. The owner reconnected an HHKB before
+this boot, but PORTSC alone identifies neither HHKB nor Trackpad. The selected
+host still accepts keyboard `1c4f:0002`; simultaneous-host input is unimplemented.
+See `physical-controller-inventory.json`. All five controllers request two
+scratchpads each; extending simultaneous ownership must preserve the bounded
+USB/NVMe/NIC DMA allocation rather than reuse a running host's buffers.
