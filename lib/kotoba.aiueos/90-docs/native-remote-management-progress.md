@@ -56,7 +56,12 @@ nonceabcdd8fd0b4a30ee. The Mac SSH alias observed the new nonce after PXE
 reboot. USB0504 selected successfully. Signed v4 image verifies(result15),
 wrong signing key refuses(1), changed image byte refuses(7). Each operation
 reports controller resume15, and a fresh SSH signed ping succeeds afterwards.
-Complete800x600 screenshot retains Itonami Goal aba/Approved0. Actual physical
-Trackpad movement after these maintenance operations is pending owner input.
+Complete800x600 screenshot retains Itonami Goal aba/Approved0.
+On 2026-11-02 the owner answered that the Apple Trackpad pointer moved after
+this complete maintenance sequence. A fresh signed ping reports the same boot
+nonce as the three verify/refusal cases. This closes the pending physical
+pointer-movement check; it does not verify a gesture after each individual case,
+post-maintenance keyboard/click behavior, or drag latency. The separately
+reported severe window-drag delay remains open as JUN-502.
 No command6/install was invoked. The valid signed v4 is a development probe
 artifact and must not later be republished as a different image at version4.
