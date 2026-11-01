@@ -144,3 +144,13 @@ The pinned native kernel-v3 backend still owns the controlled fault shim;
 closures are pinned at36 modules. This source composition does not extend
 CPL3 or full-OS qualification; normal desktop, ATA restore and offline-dapps
 regressions are recorded separately alongside the input/hub gate.
+
+The 13:39JST physical successor initialized the high-speed Genesys hub
+(`stage0x9000f`) and read all four downstream ports as powered with no device
+connected (`0x0100`). One boot keyboard is accepted; mouse input is still
+unqualified. The loader catalog also contains additional AMD functions at
+06:00.0/.3/.4, outside this candidate's two-controller fallback. Their route
+and the owner's exact mouse/socket remain to be checked. The actual Goal
+frame still matches saved `aba` after this36-module product boot. See
+`physical-hub-result.json`. The interactive candidate stays live without the
+90s watchdog; no install or server-fallback replacement occurred.
