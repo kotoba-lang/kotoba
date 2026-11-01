@@ -209,3 +209,21 @@ Treat the HHKB transport as unresolved. AWAI-142 now tracks active Bluetooth
 adapter discovery, HCI transport and pairing/input work separately; no Bluetooth
 adapter, pairing or HID-over-Bluetooth input is qualified by the above USB
 or framebuffer observations.
+
+## Signed single-controller probe (AWAI-142)
+
+The profile6 debug client now accepts `usb-select 0x0600` (PCI BDF encoded as
+`bus<<8 | device<<3 | function`). Command7 uses the existing signature, nonce
+and replay counter. It refuses non-xHCI and out-of-range targets before
+stopping the current host. It observes HCHalted before clearing USB state
+and starting the new controller. Failed initialization requires PXE reboot;
+its DMA is never speculatively reused. Draft/private NVMe bytes at1536+
+remain intact. After selection the desktop discards queued PS/2 bytes and
+quarantines USB keyboard reports until all keys are released.
+
+`c007` is the operation result; `c170..172` report BDF, status and accepted
+HID count, and `c180..18b` report descriptor metadata. This is one host at a
+time, for adapter/device identification. It does not implement Bluetooth
+HCI, radio discovery, pairing or wireless HID input. `usb-controller-test-entry`
+and `check-native-usb-controller-qemu.py` exercise ten native control/refusal
+cases, including empty/active host reselection and preserved state ranges.

@@ -12,6 +12,7 @@ a screenshot arrives on 7797 and is written as a PNG.
   aiueos-remote.py --key SEED type aba       # make codes for a-z and space
   aiueos-remote.py --key SEED shot out.png
   aiueos-remote.py --key SEED reboot
+  aiueos-remote.py --key SEED usb-select 0x0600  # profile6 only, one xHCI host at a time
   aiueos-remote.py --key SEED --wait 600 update   # pull and verify the image `aiueos-image.py serve` offers
   aiueos-remote.py --key SEED --wait 600 install  # pull, verify and install it as BOOTX64.EFI on the ESP
 
@@ -121,7 +122,7 @@ def main():
     p.add_argument("--key", type=Path, required=True, help="32-byte Ed25519 seed file (mode 0600)")
     p.add_argument("--broadcast", default="10.77.0.255")
     p.add_argument("--wait", type=float, default=15.0, help="seconds to wait for the nonce and replies")
-    p.add_argument("command", choices=("ping", "reboot", "key", "type", "shot", "update", "install"))
+    p.add_argument("command", choices=("ping", "reboot", "key", "type", "shot", "update", "install", "usb-select"))
     p.add_argument("value", nargs="?")
     args = p.parse_args()
     if args.key.stat().st_mode & 0o077:
@@ -147,6 +148,18 @@ def main():
                 print(f"{tag:04x} {value:016x}", flush=True)
             if tag in (done, 0xC0FF):
                 break
+    elif args.command == "usb-select":
+        slot = int(args.value, 0)
+        if not 0 <= slot <= 65535:
+            raise SystemExit("PCI slot must be bus<<8 | device<<3 | function (0..65535)")
+        send(args, seed, nonce, counter, 7, slot)
+        for tag, value in records(log, time.monotonic() + args.wait):
+            if tag in (0xC007, 0xC0FF) or 0xC170 <= tag <= 0xC172 or 0xC180 <= tag <= 0xC18B:
+                print(f"{tag:04x} {value:016x}", flush=True)
+            if tag in (0xC007, 0xC0FF):
+                break
+        else:
+            raise SystemExit("no USB selection result received")
     elif args.command == "key":
         send(args, seed, nonce, counter, 3, int(args.value, 0)); print(reply(log, {0xC003}, args.wait))
     elif args.command == "type":
