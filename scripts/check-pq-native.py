@@ -225,6 +225,19 @@ NET_GRANT = {'KEXE_ALLOW': '43,44,45,46,47', 'KEXE_CAP_RESOURCES_43': '127.0.0.1
              'KEXE_CAP_RESOURCES_45': '127.0.0.1:47011'}
 # an exact closure: every pinned module must be reachable from the entry (E6015), so the
 # identity gate's own entry module is left out
+MODULE_GATES['datagram'] = dict(files=dict(
+    {k: v for k, v in MODULE_GATES['noise']['files'].items() if k != 'noise/native_gate.kotoba'}, **{
+        'noise/datagram.kotoba': 'lib/kotoba.noise/kotoba/noise/datagram.kotoba',
+        'noise/datagram_gate.kotoba': 'lib/kotoba.noise/kotoba/noise/datagram_gate.kotoba'}),
+    entry='noise/datagram_gate.kotoba', passing=255, mutants={
+        'replay': ('noise/datagram.kotoba', '(= (vector-at st slot) (+ n 1))', 'false'),
+        'window': ('noise/datagram.kotoba', '(- top 2048)', '(- top 2049)'),
+        'expiry': ('noise/datagram.kotoba', '(- now (vector-at st 66)) 180)', '(- now (vector-at st 66)) 181)'),
+        'header-ad': ('noise/datagram.kotoba', '(defn- associated-data [hdr :vector-i64] :vector-i64 hdr)',
+                      '(defn- associated-data [hdr :vector-i64] :vector-i64 (vector-i64))'),
+        'peer': ('noise/datagram.kotoba', '(not (same? (n/remote-static hs) expected))', 'false')
+    })
+
 TCP_DEMO = dict(files=dict({k: v for k, v in MODULE_GATES['identity']['files'].items() if k != 'noise/identity_gate.kotoba'}, **{
     'noise/frame.kotoba': 'lib/kotoba.noise/kotoba/noise/frame.kotoba',
     'noise/tcp.kotoba': 'lib/kotoba.noise/kotoba/noise/tcp.kotoba',
