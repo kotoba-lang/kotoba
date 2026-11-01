@@ -122,16 +122,19 @@ def main():
     p.add_argument("--key", type=Path, required=True, help="32-byte Ed25519 seed file (mode 0600)")
     p.add_argument("--broadcast", default="10.77.0.255")
     p.add_argument("--wait", type=float, default=15.0, help="seconds to wait for the nonce and replies")
+    p.add_argument("--nonce", type=lambda value: int(value, 0), help="explicit last-observed boot nonce when periodic discovery is unavailable; stale values are refused by the board")
     p.add_argument("command", choices=("ping", "reboot", "key", "type", "shot", "update", "install", "usb-select", "bt-probe", "ble-init", "ble-crypto", "ble-scan", "ble-connect", "ble-status", "ble-firmware"))
     p.add_argument("value", nargs="?")
     args = p.parse_args()
+    if args.nonce is not None and not 0 < args.nonce < 1 << 64:
+        p.error("--nonce must be a nonzero unsigned 64-bit boot nonce")
     if args.key.stat().st_mode & 0o077:
         raise SystemExit("the key file must not be readable by others")
     seed = args.key.read_bytes()
     assert len(seed) == 32, "the key file must hold a 32-byte seed"
     log = listen(7799, 0.5)
     shots = listen(7797, 0.5) if args.command == "shot" else None
-    nonce = wait_nonce(log, args.wait)
+    nonce = args.nonce if args.nonce is not None else wait_nonce(log, args.wait)
     counter = time.time_ns()
     print(f"nonce {nonce:016x}")
     if args.command == "ping":
