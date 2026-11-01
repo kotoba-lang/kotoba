@@ -154,3 +154,21 @@ and the owner's exact mouse/socket remain to be checked. The actual Goal
 frame still matches saved `aba` after this36-module product boot. See
 `physical-hub-result.json`. The interactive candidate stays live without the
 90s watchdog; no install or server-fallback replacement occurred.
+
+## Physical keyboard readback and mouse clarification
+
+Later owner input changed the actual Goal frame from saved `aba` to `abakk`
+and then `abakkj`; no `k` or `j` was injected through the signed debug client.
+The owner confirmed pressing `k` two or more times, so this does not establish
+a duplicate-input fault. Physical keyboard text ingress is observed, while
+the USB/legacy per-source path has not been separately counted.
+
+The owner then clarified that the Buffalo mouse was **not yet connected**.
+The earlier direct-wired description therefore must not be used to infer a
+mouse controller-routing or hub-enumeration failure. Front USB-A is the
+intended connection. The requested keyboard/mouse port swap was abandoned
+because it is difficult; keep the keyboard in place and use an empty socket.
+Mouse enumeration, movement and clicks remain pending after connection and
+reboot (this candidate has no hotplug). See `physical-keyboard-input.json`
+and its two actual screen readbacks. No driver change or reset was needed
+to record this clarification; the current PXE candidate remains live.
