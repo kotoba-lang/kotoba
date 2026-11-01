@@ -482,3 +482,17 @@ QEMU read-only5000Mb/s USB MSD validates SS8, EP0 packet8, draft/NVMe marker
 preservation and HID return (aggregateffff).43-module native kernel/EFI,
 standard USB/NVMe12 and exact PXE USB2-hub smoke pass. Physical probe/input
 remain pending; this does not add USB3 hub downstream or USB3 HID support.
+
+
+Physical SS probe on305e24b3d identifies root5 as05e3:0626/class09/00/03,
+bcdUSB0320, and refuses it after identity(stage35). It is a USB3 hub, not
+HHKB. Owner confirms HHKB cable is data-tested and asks to pause HHKB
+validation, switching to reconnected Apple USB-C Trackpad. On0504 USB2
+hub05e3:0610/root2/downstream1,05ac:0324 is accepted as boot mouse
+03/01/02,endpoint83,maxpacket64;1c4f:0002 remains the keyboard. Actual
+owner finger action moves the visible pointer; actual physical press click
+opens Itonami, with Goalaba and approval0 preserved. A subsequent drag
+request produces an overlapping Yataverse/Itonami screenshot, so intended
+Itonami drag is not independently qualified. Owner reports flicker on
+overlap/icon/pointer movement; compositor repair continues in JUN-502.
+No Apple multitouch/gesture, BT or smoothness qualification is claimed.
