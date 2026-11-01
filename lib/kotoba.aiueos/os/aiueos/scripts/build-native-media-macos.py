@@ -68,6 +68,10 @@ def main(args):
     verify_macho(compiler, args.compiler_sha256)
     verify_macho(packager, args.packager_sha256)
     original_efi = pin(efi)
+    retention_helper = HERE / "native_media_retention.py"
+    if retention_helper.is_symlink() or not retention_helper.is_file():
+        raise ValueError("retention helper must be a regular file")
+    retention_pin = pin(retention_helper)
     if original_efi["sha256"] != args.efi_sha256 or not (512 <= original_efi["bytes"] <= 6291456):
         raise ValueError("EFI digest or size mismatch")
     output = args.output.resolve()
@@ -77,6 +81,7 @@ def main(args):
         "compiler": pin(compiler), "packager": pin(packager), "efi": original_efi,
         "linuxJVMNodeOrCCompiler": False, "nativeFormatEmission": False,
         "qemuBootQualified": False, "physicalHardwareQualified": False, "calls": [],
+        "retentionHelper": retention_pin,
     }
 
     def save():
@@ -232,6 +237,7 @@ def main(args):
                     or pin(output / "media.kotoba") != state["sourceUnity"]
                     or any(pin(path) != {k: v for k, v in identity.items() if k != "name"}
                            for path, identity in zip(parts, identities))
+                    or pin(retention_helper) != retention_pin
                     or pin(output / disk) != pin(output / reproduced)
                     or pin(output / iso) != pin(output / iso_reproduced)):
                 raise ValueError("source, executable or media drift")
