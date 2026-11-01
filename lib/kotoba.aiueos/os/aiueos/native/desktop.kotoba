@@ -9,11 +9,13 @@
             [aiueos.native.rtl8168-debug :as dbg]
             [aiueos.native.remote-cmd :as remote]
             [aiueos.native.nvme :as nvme]
+            [aiueos.native.nvme-state :as state]
             [aiueos.native.esp :as esp]
             [aiueos.native.update :as update]
-            [aiueos.native.dapps :as dapps])
+            [aiueos.native.dapps :as dapps]
+            [aiueos.native.xhci :as usb])
   (:export [main workspace-main goal-main goal-draft-main goal-model-main
-            show-diagnostic-result debug-main dapps-main]))
+            show-diagnostic-result debug-main dapps-main input-main]))
 
 ;; AWAI-119: context word128 is 1 only in the opt-in debug entry; every
 ;; debug-log is then one RTL8168 broadcast record (tag, value). The default
@@ -1350,7 +1352,7 @@
 ;; bounded micro model in place, shows the token in the Itonami title as profile 4's result does, records the run
 ;; in Murakumo and stays in the loop. Nothing is sent; the dapps profile has no network driver.
 (defn allow-model [s ctx]
-  (if (= (word ctx 86) 5)
+  (if (>= (word ctx 86) 5)
     (let [token (dapps/local-token s)]
       (do (put-word ctx 87 0) (put-word s 2039 (+ (word s 2039) 3))
           (if (> token 0)
@@ -1409,9 +1411,9 @@
   (if (and (>= (word ctx 86) 4) (= (word s 2) 2)
            (= code 28) (> (word s 2038) 12))
     (do (put-word ctx 87 1) (put-word s 2039 (+ (word s 2039) 1)) (model-confirm-title s 0) 1)
-  (if (and (= (word ctx 86) 5) (= (word s 2) 3) (= code 28))
+  (if (and (>= (word ctx 86) 5) (= (word s 2) 3) (= code 28))
     (dapps/yataverse-store s ctx)
-  (if (and (= (word ctx 86) 5) (= (word s 2) 4) (= code 28))
+  (if (and (>= (word ctx 86) 5) (= (word s 2) 4) (= code 28))
     (if (= (dapps/aozora-enter s ctx) 1)
       (do (put-word s 30 1)
           (if (= (open-sign-request s ctx) 1) 1 (do (put-word s 30 0) 0)))
@@ -1420,7 +1422,8 @@
            (= code 28) (> (word s 2038) 12))
     (do (put-word ctx 85 1) 1)
   (if (and (= (word ctx 84) 1) (= (word s 2) 2) (= code 63))
-    (let [generation (draft-store/commit s (word ctx 80))]
+    (let [mounted (if (and (= (word ctx 86) 6) (= (state/ready) 0)) (state/provision) 0)
+          generation (+ (draft-store/commit s (word ctx 80)) (* 0 mounted))]
       (do (put-word ctx 82 generation)
           (if (> generation 0) (put-word ctx 80 generation) 0)
           1))
@@ -1716,9 +1719,33 @@
           (put-word ctx 63 0)
           (apply-mouse-packet s ctx))))))
 
+;; USB HID goes through the same desktop reducers as PS/2. Stop a report on
+;; a modal transition; other keys in that report cannot approve the new panel.
+(defn usb-keys [s ctx d i]
+  (if (>= i 8) 0
+    (let [code (usb/next-key d i) pending (word ctx 87)]
+      (if (= code 0) (usb-keys s ctx d (+ i 1))
+        (do (put-word ctx 73 (+ (word ctx 73) 1)) (put-word ctx 77 code)
+            (reduce-key s code ctx)
+            (if (not (= pending (word ctx 87))) (do (usb/quarantine) 1)
+              (+ 1 (usb-keys s ctx d (+ i 1)))))))))
+(defn usb-input [s ctx]
+  (let [ready (usb/poll)]
+    (if (<= ready 0) 0
+      (let [d (- ready 1) kind (usb/report-kind d)
+            changed (if (= kind 1) (usb-keys s ctx d 2)
+                      (if (and (= kind 2) (>= (usb/report-length d) 3)
+                               (= (bit-and (usb/report-byte d 0) 248) 0))
+                        (do (put-word ctx 64 (usb/report-byte d 0))
+                            (put-word ctx 65 (usb/report-byte d 1))
+                            ;; USB positive Y is down; PS/2 positive Y is up.
+                            (put-word ctx 66 (mod (- 256 (usb/report-byte d 2)) 256))
+                            (apply-mouse-packet s ctx)) 0))]
+        (+ changed (* 0 (usb/acknowledge d)))))))
+
 (defn poll-input [s ctx]
   (do (put-word ctx 68 (kernel-in-u8 100))
-      (if (= (bit-and (word ctx 68) 1) 0)
+      (if (or (= (word ctx 68) 255) (= (bit-and (word ctx 68) 1) 0))
         0
         (do (put-word ctx 69 (kernel-in-u8 96))
             (if (= (bit-and (word ctx 68) 32) 32)
@@ -1762,6 +1789,7 @@
 
 (defn drain-input [s ctx remaining changed]
   (if (or (= remaining 0) (= (word ctx 85) 1)
+          (= (kernel-in-u8 100) 255)
           (= (bit-and (kernel-in-u8 100) 1) 0)) changed
     (let [pending (word ctx 87)
           result (poll-input s ctx)]
@@ -1801,25 +1829,26 @@
 ;; NVMe and ESP words 600..699.
 ;; AWAI-122 stage 4: after the ESP report, update/qemu-hook (only under QEMU with
 ;; the gate's fw_cfg file) installs the self-test fixture and reports 0xc130..
+(defn storage-word64 [ctx i] (+ (state/word ctx i) (* (state/word ctx (+ i 1)) 4294967296)))
 (defn esp-digest [ctx i]
   (if (>= i 4) 1
-    (do (dbg/log (+ 49426 i) (+ (* (word ctx (+ 680 (* i 2))) 4294967296) (word ctx (+ 681 (* i 2)))))
+    (do (dbg/log (+ 49426 i) (+ (* (state/word ctx (+ 680 (* i 2))) 4294967296) (state/word ctx (+ 681 (* i 2)))))
         (esp-digest ctx (+ i 1)))))
 (defn nvme-model [ctx i]
   (if (>= i 5) 1
-    (do (dbg/log (+ 49412 i) (word64 ctx (+ 620 (* i 2)))) (nvme-model ctx (+ i 1)))))
+    (do (dbg/log (+ 49412 i) (storage-word64 ctx (+ 620 (* i 2)))) (nvme-model ctx (+ i 1)))))
 (defn nvme-report [ctx]
   (let [t (update/self-test ctx)
-        logged (dbg/log 49432 (+ t (* (word ctx 189) 256)))
+        logged (dbg/log 49432 (+ t (* (state/word ctx 189) 256)))
         r (+ (nvme/probe ctx) (* 0 logged))]
-    (do (dbg/log 49408 (+ r (* (word ctx 601) 65536)))
-        (dbg/log 49409 (word64 ctx 607))
-        (dbg/log 49410 (+ (word ctx 609) (* (word ctx 606) 256)))
-        (dbg/log 49411 (word64 ctx 630))
+    (do (dbg/log 49408 (+ r (* (state/word ctx 601) 65536)))
+        (dbg/log 49409 (storage-word64 ctx 607))
+        (dbg/log 49410 (+ (state/word ctx 609) (* (state/word ctx 606) 256)))
+        (dbg/log 49411 (storage-word64 ctx 630))
         (nvme-model ctx 0)
         (esp/run ctx)
-        (dbg/log 49424 (+ (word ctx 676) (+ (* (word ctx 677) 256) (* (word ctx 662) 65536))))
-        (dbg/log 49425 (word ctx 675))
+        (dbg/log 49424 (+ (state/word ctx 676) (+ (* (state/word ctx 677) 256) (* (state/word ctx 662) 65536))))
+        (dbg/log 49425 (state/word ctx 675))
         (esp-digest ctx 0)
         (if (> (update/qemu-hook ctx) 0) (update/install-report ctx) 0)
         r)))
@@ -1834,7 +1863,8 @@
                   (dbg/log 49167 (remote/rx-stats ctx))
                   (dbg/log 49166 (dbg/rx-descriptor))) 0)) 0)
       (clock-step ctx)
-      (put-word ctx 70 (drain-input s ctx 64 0))
+      (put-word ctx 70 (+ (drain-input s ctx 64 0)
+                         (if (= (word ctx 86) 6) (usb-input s ctx) 0)))
       (if (> (word ctx 70) 0)
         (do (if (= (word ctx 117) 0) (put-word ctx 117 (+ (word ctx 111) 1)) 0)
             (present-frame s font fb fb-bytes ctx))
@@ -1927,6 +1957,7 @@
             (put-word context 92 (entropy-draw (word context 90)))
             (if (= debug 1) (remote/init context (word context 90)) 0)
             (if (= debug 1) (nvme-report context) 0)
+            (if (= profile 6) (state/mount 0) 0)
             (clear-surface (kernel-subregion (kernel-desktop-effects) 16384 0 8192) 0)
             ;; Effects words51..55 are observation-only fixture results,
             ;; separate from preferences, motion, blur/cache and audio DMA.
@@ -1957,10 +1988,14 @@
             (debug-log context 5 (word context 107))
             (enable-mouse)
             (debug-log context 6 (kernel-in-u8 100))
+            (if (= profile 6) (do (put-word context 138 (usb/start))
+                                  (put-word context 139 (usb/self-check))
+                                  (debug-log context 49472 (usb/result))
+                                  (debug-log context 49473 (usb/devices))) 0)
             (clear-surface surface 0)
             (seed-desktop surface width height)
             (debug-log context 7 0)
-            (if (= profile 5) (dapps/init surface context) 0)
+            (if (or (= profile 5) (= profile 6)) (dapps/init surface context) 0)
             (if (or (= profile 1) (= profile 3) (>= profile 4))
               (let [generation (draft-store/restore surface)]
                 (do (put-word surface 229 108)
@@ -1980,6 +2015,7 @@
                         0)
                       0)))
               0)
+            (if (= profile 6) (dapps/refresh surface context) 0)
             (debug-log context 8 (present-frame surface font 0 fb-bytes context))
             (desktop-loop surface font 0 fb-bytes context)))
       (kernel-hlt))))
@@ -1993,3 +2029,4 @@
 (defn goal-model-main [] (run-desktop 4))
 ;; AWAI-120 / ADR-0282: the installed itonami dapps, offline (profile 5).
 (defn dapps-main [] (run-desktop 5))
+(defn input-main [] (run-desktop-mode 6 1))

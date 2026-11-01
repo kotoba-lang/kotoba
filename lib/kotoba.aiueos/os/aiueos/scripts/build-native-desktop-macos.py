@@ -169,7 +169,7 @@ def main(args):
             "build-native-font-macos.py", "build-native-kernel-macos.py",
             "build-native-media-macos.py", "check-native-desktop-qemu.py",
             "check-native-draft-restart-qemu.py", "check-native-consent-qemu.py",
-            "check-native-idle-silent-qemu.py", "check-native-cid-qemu.py", "check-native-sha512-qemu.py", "check-native-gf25519-qemu.py", "check-native-ed25519-qemu.py", "check-native-keyseal-qemu.py", "check-native-keystore-qemu.py", "check-native-dapps-qemu.py", "check-native-nvme-qemu.py",
+            "check-native-idle-silent-qemu.py", "check-native-cid-qemu.py", "check-native-sha512-qemu.py", "check-native-gf25519-qemu.py", "check-native-ed25519-qemu.py", "check-native-keyseal-qemu.py", "check-native-keystore-qemu.py", "check-native-dapps-qemu.py", "check-native-nvme-qemu.py", "check-native-input-state-qemu.py",
             "check-native-media-format.py", "native_regions.py", "native_ops.py",
             "check-native-shell-material-qemu.py", "check-native-gui-effects-qemu.py",
         )
@@ -248,6 +248,7 @@ def main(args):
                         else "ed-entry.kotoba" if args.profile == "ed25519"
                         else "keyseal-entry.kotoba" if args.profile == "keyseal"
                         else "dapps-entry.kotoba" if args.profile == "dapps"
+                        else "input-entry.kotoba" if args.profile == "input-state"
                         else "desktop-debug-entry.kotoba" if args.profile == "nvme"
                         else "desktop-entry.kotoba")
         call("kernel", scripts["build-native-kernel-macos.py"], [
@@ -260,7 +261,7 @@ def main(args):
         efi = kernel / "BOOTX64.EFI"
         image = kernel / "KERNEL.ELF"
         if (kernel_state["state"] != "MACOS_NATIVE_IMAGE_CANDIDATE"
-                or kernel_state["sourceModuleCount"] != 45
+                or kernel_state["sourceModuleCount"] != 49
                 or kernel_state["fuel"] != FUEL
                 or kernel_state["compiler"] != compiler_pin
                 or pin(efi) != kernel_state["efi"] or pin(image) != kernel_state["kernel"]
@@ -296,6 +297,7 @@ def main(args):
                         else "check-native-keyseal-qemu.py" if args.profile == "keyseal"
                         else "check-native-keystore-qemu.py" if args.profile == "keystore"
                         else "check-native-dapps-qemu.py" if args.profile == "dapps"
+                        else "check-native-input-state-qemu.py" if args.profile == "input-state"
                         else "check-native-nvme-qemu.py" if args.profile == "nvme"
                         else "check-native-desktop-qemu.py")
         guest_args = [
@@ -317,6 +319,7 @@ def main(args):
                         else "native-keyseal-qemu.json" if args.profile == "keyseal"
                         else "native-keystore-qemu.json" if args.profile == "keystore"
                         else "native-dapps-qemu.json" if args.profile == "dapps"
+                        else "native-input-state-qemu.json" if args.profile == "input-state"
                         else "native-nvme-qemu.json" if args.profile == "nvme"
                         else "native-desktop-qemu.json")
         observed = json.loads((guest / receipt_name).read_text())
@@ -331,6 +334,7 @@ def main(args):
                            else "PASS_NATIVE_KEYSEAL_QEMU" if args.profile == "keyseal"
                            else "PASS_NATIVE_KEYSTORE_QEMU" if args.profile == "keystore"
                            else "PASS_NATIVE_DAPPS_QEMU" if args.profile == "dapps"
+                           else "PASS_NATIVE_USB_HID_NVME_STATE_QEMU" if args.profile == "input-state"
                            else "PASS_NATIVE_NVME_READ_QEMU" if args.profile == "nvme"
                            else "PASS_NATIVE_DESKTOP_INPUT_QEMU")
         expected_events = (12 if args.profile == "local-draft"
@@ -340,6 +344,7 @@ def main(args):
                            else 4 if args.profile == "ed25519"
                            else 16 if args.profile == "keystore"
                            else 11 if args.profile == "dapps"
+                           else 10 if args.profile == "input-state"
                            else 7 if args.profile == "nvme"
                            else 2 if args.profile in ("cid", "sha512", "gf25519", "keyseal") else 24)
         if (observed["status"] != expected_status
@@ -415,6 +420,11 @@ def main(args):
                     or observed["network"] != "none (-nic none)" or observed["dnsResolved"]
                     or observed["physicalHardware"] or observed["syntheticInputProvesHumanConsent"]):
                 raise ValueError("dapps verdict is incomplete")
+        elif args.profile == "input-state":
+            if (observed["physicalHardware"] or observed["syntheticInputProvesHumanConsent"]
+                    or observed["D2WorkspaceCodec"] or observed["BluetoothQualified"]
+                    or observed["USBHubQualified"]):
+                raise ValueError("input/state qualification boundary changed")
         elif args.profile == "nvme":
             if (observed["font"] != font_state["padded"]
                     or [row["name"] for row in observed["events"]] != ["nvme-fat32", "nvme-fat16-media", "nvme-4096", "nvme-absent",
@@ -571,6 +581,8 @@ def main(args):
                                     if args.profile == "keystore"
                                     else "Mac native installed itonami dapps run their offline cores with no NIC (QEMU)"
                                     if args.profile == "dapps"
+                                    else "Mac native USB boot HID (PS/2 disabled) and NVMe app-state cold/crash restore on QEMU"
+                                    if args.profile == "input-state"
                                     else "Mac native GPT and EFI El Torito ISO QEMU desktop input")
                      + "; D2 workspace, release and physical gates separate")
         save()
@@ -597,7 +609,7 @@ if __name__ == "__main__":
     parser.add_argument("--firmware", type=Path, required=True)
     parser.add_argument("--firmware-sha256", required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--profile", choices=("desktop", "local-draft", "consent", "idle", "cid", "sha512", "gf25519", "ed25519", "keyseal", "keystore", "dapps", "nvme"), default="desktop")
+    parser.add_argument("--profile", choices=("desktop", "local-draft", "consent", "idle", "cid", "sha512", "gf25519", "ed25519", "keyseal", "keystore", "dapps", "nvme", "input-state"), default="desktop")
     parser.add_argument("--distribution", choices=("aiueos", "awai"), default="aiueos")
     parser.add_argument("--expect-stuck-entropy", action="store_true",
                         help="JUN-482 negative control: the native sources draw from a constant entropy source; "
