@@ -42,7 +42,7 @@ def main(a):
             while time.monotonic() < end:
                 data = debug.read_bytes() if debug.exists() else b''
                 if b'USBSEL ' in data:
-                    assert b'USBSEL 3fff\n' in data, data[-1000:]
+                    assert b'USBSEL 7fff\n' in data, data[-1000:]
                     status = 'PASS_NATIVE_USB_CONTROLLER_SELECTION_QEMU'
                     break
                 assert p.poll() is None, (p.returncode, (out / 'qemu.log').read_text()[-1000:])
@@ -60,11 +60,11 @@ def main(a):
                     p.kill()
                     p.wait(timeout=10)
             (out / 'receipt.json').write_text(json.dumps({
-                'status': status, 'nativeMask': '3fff' if status.startswith('PASS') else None,
+                'status': status, 'nativeMask': '7fff' if status.startswith('PASS') else None,
                 'checks': ['initial fallback HID', 'two initial HID', 'out-of-range refusal',
                            'non-xHCI refusal', 'refusals retain HID count', 'select empty host',
                            'reselect HID host', 'draft range retained', 'NVMe state range retained', 'failed host refuses DMA reuse',
-                           'HCI14 framing vectors', 'non-Bluetooth probe refused', 'large HCI complete accepted', 'oversized HCI complete refused'],
+                           'HCI14 framing vectors', 'non-Bluetooth probe refused', 'large HCI complete accepted', 'oversized HCI complete refused', 'HOGP14 native report/admission refusals'],
                 'artifacts': {n: pin(getattr(a, n)) for n in ('efi', 'kernel', 'media', 'qemu', 'firmware')},
                 'observer': pin(Path(__file__)), 'physicalHardware': False,
                 'BluetoothTransportQualified': False, 'simultaneousHosts': False,

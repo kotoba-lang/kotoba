@@ -337,3 +337,14 @@ The previous Amu worktree was removed externally. The exact original compiler
 SHA2387a32d… was recovered from tracked Amu commitfe5d4855… / blob646dc6ba…,
 with the same packager SHA7691467… and byte-identical three font/media seed
 parts. Layout-source checks still pass. No compiler upgrade was adopted.
+
+
+AWAI-142 SC/HOGP candidate (2026-11-01): controller AES-CMAC/f4/f5/f6 passes
+all eight Bluetooth Core/RFC4493 vectors on6600H; LE buffers251×8 and P256
+key generation pass without firmware upload. Add owner-selected Studio4 scanning,
+controller ECDH, SC20-round passkey, encryption gating, bounded ACL reassembly,
+GATT HID discovery and Boot/report-map-validated keyboard notification ingress.
+Native controller/HOGP14 refusals, USB/NVMe12 observations and exact PXE hub
+smoke pass. These gates do not qualify real pairing or physical wireless input.
+Session keys stay in RAM: durable bond/reboot reconnect, BLE mouse/NKRO and
+classic HID remain open. Signed crypto test refuses an active pairing session.
