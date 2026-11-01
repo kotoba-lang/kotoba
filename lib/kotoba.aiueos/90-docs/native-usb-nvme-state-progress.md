@@ -227,3 +227,11 @@ time, for adapter/device identification. It does not implement Bluetooth
 HCI, radio discovery, pairing or wireless HID input. `usb-controller-test-entry`
 and `check-native-usb-controller-qemu.py` exercise ten native control/refusal
 cases, including empty/active host reselection and preserved state ranges.
+
+Signed selection identified `0bda:b850`, interface `e0/01/01`, on `06:00.0`
+port1. These are Bluetooth HCI USB class codes. Pinned Linux
+`cbbddb6b08cc9900a87cccaa9b22bbe06aa4f50a` maps this ID to Realtek8851BE.
+HCI/ROM versions are still unmeasured; its `rtl8851bu` firmware candidate is
+not yet selected or qualified. Selection back to `05:00.4` restored the
+accepted keyboard path and retained Goal `aba`. See
+`physical-bluetooth-adapter.json`. No scan or pairing occurred.
