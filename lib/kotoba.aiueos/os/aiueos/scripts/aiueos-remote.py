@@ -147,7 +147,7 @@ def main():
         done = 0xC005 if args.command == "update" else 0xC006
         send(args, seed, nonce, counter, 5 if args.command == "update" else 6, 0)
         for tag, value in records(log, time.monotonic() + args.wait):
-            if 0xC120 <= tag <= 0xC127 or 0xC130 <= tag <= 0xC136 or tag in (done, 0xC0FF):
+            if 0xC120 <= tag <= 0xC127 or 0xC130 <= tag <= 0xC136 or tag in (0xC141, done, 0xC0FF):
                 print(f"{tag:04x} {value:016x}", flush=True)
             if tag in (done, 0xC0FF):
                 break

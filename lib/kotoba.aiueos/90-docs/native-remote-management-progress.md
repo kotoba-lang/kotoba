@@ -49,3 +49,14 @@ region anchors and a real524KiB font payload; early refused roots and the
 no-payload boot failure remain recorded. Final source reproduces the exact
 tested product ELF/EFI. Version floor remains>=1 in this unit: automatic
 installation is not enabled yet. No physical ESP update in this unit.
+
+
+Physical maintenance on6600H: source7d7c03bae, EFI7fe3318c…93d5871,
+nonceabcdd8fd0b4a30ee. The Mac SSH alias observed the new nonce after PXE
+reboot. USB0504 selected successfully. Signed v4 image verifies(result15),
+wrong signing key refuses(1), changed image byte refuses(7). Each operation
+reports controller resume15, and a fresh SSH signed ping succeeds afterwards.
+Complete800x600 screenshot retains Itonami Goal aba/Approved0. Actual physical
+Trackpad movement after these maintenance operations is pending owner input.
+No command6/install was invoked. The valid signed v4 is a development probe
+artifact and must not later be republished as a different image at version4.
