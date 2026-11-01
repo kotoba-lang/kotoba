@@ -452,3 +452,18 @@ keys. This v3 source candidate is not yet booted on6600H; v2 keeps scanning.
 Owner confirms Control/Command remapping; retry using assigned Control
 was requested, with no reset or keymap modification. Actual link/input
 qualification still requires authenticated selected-slot hardware evidence.
+
+
+Owner USB-first followup (AWAI-141): retain the BT slot4/name discrepancy
+in AWAI-142 rather than infer remapping is the cause. The latest v3 full
+native build and USB/NVMe12 pass with the standard observer. Physical6600H
+still runs v2 while USB is probed. Owner confirms Fn+V ends with four blue
+(USB mode), cable to6600H rear USB-A. Selected0503/0504/0603/0604;0504
+identifies existing1c4f:0002 boot keyboard and05e3:0610 USB2 hub, with no
+connected hub child. The other three root controllers show no connect bit.
+0504 root5 is a connected unsupported SuperSpeed path(stage17), so this
+probe is not a full USB3 inventory. Local Mac USB has no HHKB/PFU entry.
+After the owner's actual u+pointing-stick action, Goal remainsaba and the
+visible pointer position is unchanged. This does not establish a parser
+fault: the HHKB data connection itself is not yet identified. A single
+HHKB-side USB-C reconnect was requested; no forced USB/keymap reset.
