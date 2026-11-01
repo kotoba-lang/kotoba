@@ -1,0 +1,539 @@
+(ns aiueos.native.bluetooth-hogp
+  ;; One owner-selected HHKB Studio. RAM session keys only, never emitted.
+  ;; Advertising names select a candidate; passkey authentication binds it to
+  ;; the physical keyboard. No HID report is admitted before passkey authentication + encryption.
+  (:require [aiueos.native.xhci :as usb] [aiueos.native.bluetooth-le :as le]
+            [aiueos.native.bluetooth-sc :as sc] [aiueos.native.bluetooth-legacy :as legacy] [aiueos.native.usb-hid :as hid]
+            [aiueos.native.hid-mouse :as mouse])
+  (:export [scan connect poll diagnostic next-key acknowledge quarantine self-check mouse-gate-check transport-check pairing-check name-check]))
+(defn b [i] :i64 (usb/ble-state i))
+(defn p [i v] :i64 (usb/ble-put i (bit-and v 255)))
+(defn w [i] :i64 (+ (b (+ 256 (* i 4))) (* (b (+ 257 (* i 4))) 256)
+  (* (b (+ 258 (* i 4))) 65536) (* (b (+ 259 (* i 4))) 16777216)))
+(defn put [i v] :i64
+  (do (p (+ 256 (* i 4)) v) (p (+ 257 (* i 4)) (u64-shift-right v 8))
+      (p (+ 258 (* i 4)) (u64-shift-right v 16)) (p (+ 259 (* i 4)) (u64-shift-right v 24))))
+(defn fill [dst n v] :i64 (if (= n 0) 1 (do (p dst v) (fill (+ dst 1) (- n 1) v))))
+(defn copy [src dst n] :i64 (if (= n 0) 1 (do (p dst (b src)) (copy (+ src 1) (+ dst 1) (- n 1)))))
+(defn equal [a c n diff] :i64
+  (if (= n 0) (if (= diff 0) 1 0)
+    (equal (+ a 1) (+ c 1) (- n 1) (bit-or diff (bit-xor (b a) (b c))))))
+(defn h16 [off] :i64 (+ (le/packet off) (* (le/packet (+ off 1)) 256)))
+(defn r [i] :i64 (b (+ 720 i)))
+(defn r16 [i] :i64 (+ (r i) (* (r (+ i 1)) 256)))
+(defn tx [i v] :i64 (p (+ 1281 i) v))
+(defn tx16 [i v] :i64 (do (tx i (bit-and v 255)) (tx (+ i 1) (quot v 256))))
+(defn tx-copy [src off n] :i64 (if (= n 0) 1 (do (tx off (b src)) (tx-copy (+ src 1) (+ off 1) (- n 1)))))
+(defn params [src off n] :i64
+  (if (= n 0) 1 (do (usb/ble-param off (b src)) (params (+ src 1) (+ off 1) (- n 1)))))
+(defn fail [code] :i64
+  (do (put 0 128) (put 1 code) (put 12 0) (le/put 11 0) (fill 224 32 0)
+      (mouse/reset) (fill 336 16 0) (fill 2000 16 0) (fill 384 150 0) (fill 544 160 0) (fill 1792 32 0) 0))
+(defn diagnostic [i] :i64
+  (case i 0 (w 0) 1 (w 1) 2 (w 9) 3 (w 10) 4 (le/word 10) 5 (le/word 11)
+    6 (if (= (w 0) 2) (u16 1774) (w 7)) 7 (if (= (w 0) 2) (u16 1776) (w 8))
+    8 (if (= (w 0) 2) (u16 1778) (if (and (>= (w 0) 4) (< (w 0) 11)) (+ (u16 1944) (* (u16 1946) 65536)) (+ (u16 1816) (* (u16 1840) 65536)))) 9 (if (= (w 0) 2) (load-report 1956 0 0) (if (> (b 2019) 0) (+ (load-report 2016 0 0) (i64-shift-left (b 2000) 48)) (if (and (>= (w 0) 4) (< (w 0) 11)) (+ (u16 1948) (* (u16 1950) 65536) (i64-shift-left (b 1952) 32)) (w 12))))
+    10 (u16 1782) 11 (u16 1784) 12 (+ (u16 1786) (* (u16 1788) 256)) 13 (usb/ble-diagnostic 9) 14 (if (< (w 0) 4) (load-report 1920 0 0) (+ (u16 1936) (* (u16 1938) 65536)))
+    15 (if (< (w 0) 4) (load-report 1928 0 0) (+ (b 1940) (* (le/word 13) 256))) 0))
+(defn pump-control [] :i64
+  (if (= (le/wait-event 0) 1) (le/control-event) 0))
+(defn tx-data [i n] :i64
+  (if (>= i n) 1 (do (usb/ble-tx (+ 8 i) (b (+ 1281 i))) (tx-data (+ i 1) n))))
+(defn send-wait [n fuel] :i64
+  (if (= (usb/ble-send (+ n 8)) 1)
+    (do (le/put 12 (- (le/word 12) 1)) (put 7 (+ (w 7) 1)) 1)
+    (if (= fuel 0) (fail 20) (do (pump-control) (usb/recovery) (send-wait n (- fuel 1))))))
+(defn credit-wait [fuel] :i64
+  (if (> (le/word 12) 0) 1
+    (if (= fuel 0) 0 (do (pump-control) (usb/recovery) (credit-wait (- fuel 1))))))
+(defn acl-header [handle] :i64
+  ;; Core Vol4 E5.4.2: Host->Controller LE starts with PBF00, non-flushable.
+  ;; PBF10 is not negotiated here and must never be set on outbound LE ACL.
+  (if (and (>= handle 0) (<= handle 3839)) handle -1))
+(defn tx-ready-wait [fuel] :i64
+  (if (= (usb/ble-tx-ready) 1) 1
+    (if (= fuel 0) 0 (do (pump-control) (usb/recovery) (tx-ready-wait (- fuel 1))))))
+(defn send [cid n] :i64
+  (if (or (< (acl-header (le/word 10)) 0) (< n 1) (> (+ n 4) (le/word 4)) (> n 247)) (fail 21)
+    (if (not (= (credit-wait 100) 1)) (fail 22)
+      (if (not (= (tx-ready-wait 100) 1)) (fail 20)
+        (if (< (acl-header (le/word 10)) 0) (fail 21)
+          (do (p16 1944 (acl-header (le/word 10))) (p16 1946 (+ n 4))
+              (p16 1948 cid) (p16 1950 n) (p 1952 (b 1281))
+              (usb/ble-tx 0 (bit-and (le/word 10) 255))
+              (usb/ble-tx 1 (quot (acl-header (le/word 10)) 256))
+              (usb/ble-tx 2 (+ n 4)) (usb/ble-tx 3 0) (usb/ble-tx 4 n) (usb/ble-tx 5 0)
+              (usb/ble-tx 6 cid) (usb/ble-tx 7 0) (tx-data 0 n) (send-wait n 100)))))))
+(defn smp [opcode src n] :i64
+  (do (tx 0 opcode) (tx-copy src 1 n) (send 6 (+ n 1))))
+(defn acl-copy [src dst n] :i64
+  (if (= n 0) 1 (do (p dst (usb/ble-byte 2 src)) (acl-copy (+ src 1) (+ dst 1) (- n 1)))))
+(defn acl-word [i] :i64 (+ (usb/ble-byte 2 i) (* (usb/ble-byte 2 (+ i 1)) 256)))
+;; Bounded HCI ACL reassembly. A foreign handle never changes the session.
+(defn receive-acl [] :i64
+  (let [n (usb/ble-length 2) flags (acl-word 0) payload (acl-word 2)]
+    (if (or (< n 4) (not (= n (+ payload 4))) (not (= (bit-and flags 49152) 0))
+            (not (= (bit-and flags 4095) (le/word 10))))
+      (do (usb/ble-release 2) 0)
+      (let [pb (bit-and (quot flags 4096) 3)]
+        (if (or (= pb 0) (= pb 2))
+          (if (or (< payload 4) (> (acl-word 4) 272) (< (acl-word 4) (- payload 4)))
+            (do (usb/ble-release 2) (fail 23))
+            (do (put 4 (- payload 4)) (put 5 (acl-word 4)) (put 6 (acl-word 6))
+                (acl-copy 8 720 (- payload 4)) (usb/ble-release 2)
+                (if (= (w 4) (w 5)) (do (put 2 (w 4)) (put 3 (w 6)) (put 4 0) 1) 0)))
+          (if (and (= pb 1) (> (w 4) 0) (<= (+ (w 4) payload) (w 5)))
+            (do (acl-copy 4 (+ 720 (w 4)) payload) (put 4 (+ (w 4) payload)) (usb/ble-release 2)
+                (if (= (w 4) (w 5)) (do (put 2 (w 4)) (put 3 (w 6)) (put 4 0) 1) 0))
+            (do (usb/ble-release 2) (put 4 0) (fail 24))))))))
+(defn name-byte [i] :i64
+  (case i 0 72 1 72 2 75 3 66 5 83 6 116 7 117 8 100 9 105 10 111 0))
+(defn name-padding [at end] :i64
+  (if (>= at end) 1 (if (= (le/packet at) 0) (name-padding (+ at 1) end) 0)))
+(defn name-match [at n i] :i64
+  (if (= i 11) (if (and (>= n 12) (= (le/packet (+ at 11)) 52) (= (name-padding (+ at 12) (+ at n)) 1)) 1 0)
+    (if (= i 4)
+      (if (or (= (le/packet (+ at i)) 32) (= (le/packet (+ at i)) 45)) (name-match at n (+ i 1)) 0)
+      (if (= (le/packet (+ at i)) (name-byte i)) (name-match at n (+ i 1)) 0))))
+(defn ad-name [at end] :i64
+  (if (>= at end) 0
+    (let [n (le/packet at) typ (le/packet (+ at 1))]
+      (if (= n 0) 0
+        (if (or (< n 1) (> (+ at n 1) end)) 0
+          (do (if (or (= typ 8) (= typ 9))
+                (do (p16 1776 (+ (u16 1776) 1))
+                    (if (and (>= n 5) (= (le/packet (+ at 2)) 72) (= (le/packet (+ at 3)) 72)
+                             (= (le/packet (+ at 4)) 75) (= (le/packet (+ at 5)) 66))
+                      (do (p16 1778 (+ (u16 1778) 1)) (p16 1780 (- n 1))
+                          (fill 1920 16 0) (event-copy (+ at 2) 1920 (min (- n 1) 16))) 0)) 0)
+          (if (and (or (= typ 8) (= typ 9)) (>= (- n 1) 11) (<= (- n 1) 30)
+                   (= (name-match (+ at 2) (- n 1) 0) 1)) 1
+            (ad-name (+ at n 1) end))))))))
+(defn event-copy [src dst n] :i64
+  (if (= n 0) 1 (do (p dst (le/packet src)) (event-copy (+ src 1) (+ dst 1) (- n 1)))))
+(defn adverts [at count] :i64
+  (do (p16 1774 (+ (u16 1774) 1))
+  (if (= count 0) 0
+    (if (> (+ at 9) (le/word 3)) (fail 25)
+      (let [n (le/packet (+ at 8)) end (+ at 9 n)]
+        (if (>= end (le/word 3)) (fail 26)
+          (if (and (or (= (le/packet at) 0) (= (le/packet at) 4)) (<= (le/packet (+ at 1)) 1))
+            (let [before (u16 1778) matched (ad-name (+ at 9) end)]
+              (do (if (not (= before (u16 1778)))
+                    (do (event-copy (+ at 2) 1956 6) (p 1962 (le/packet (+ at 1))) (p 1963 (le/packet at))) 0)
+                  (if (= matched 1)
+                    (do (put 13 (le/packet (+ at 1))) (event-copy (+ at 2) 352 6) (put 0 3) 1)
+                    (adverts (+ end 1) (- count 1)))))
+            (adverts (+ end 1) (- count 1)))))))))
+(defn scan [] :i64
+  (if (or (not (= (usb/ble-diagnostic 0) 1)) (not (= (le/diagnostic 0) 15))
+          (and (not (= (w 0) 0)) (not (= (w 0) 2)) (not (= (w 0) 3)))) 0
+    (do (fill 256 128 0) (fill 1740 52 0) (fill 1920 44 0) (fill 1984 56 0) (put 0 2)
+        (usb/ble-param 0 1) (usb/ble-param 1 96) (usb/ble-param 2 0)
+        (usb/ble-param 3 48) (usb/ble-param 4 0) (usb/ble-param 5 0) (usb/ble-param 6 0)
+        (if (not (= (le/command 8203 7 6) 1)) (fail 27)
+          (do (usb/ble-param 0 1) (usb/ble-param 1 0)
+              (if (= (le/command 8204 2 6) 1) 1 (fail 28)))))))
+(defn status-wait [opcode fuel] :i64
+  (if (or (= fuel 0) (not (= (le/wait-event 200) 1))) 0
+    (if (= (le/control-event) 1) (status-wait opcode (- fuel 1))
+      (if (and (= (le/packet 0) 15) (= (le/word 3) 6) (= (le/packet 2) 0) (= (h16 4) opcode)) 1 0))))
+(defn command-status [opcode n] :i64
+  (if (= (usb/ble-command opcode n) 1) (status-wait opcode 16) 0))
+(defn passkey-random [fuel] :i64
+  (if (or (= fuel 0) (not (= (sc/random 360 8) 1))) 0
+    (let [v (+ (b 360) (* (b 361) 256) (* (b 362) 65536))]
+      (if (< v 16000000) (do (put 10 (mod v 1000000)) 1) (passkey-random (- fuel 1))))))
+(defn connect [] :i64
+  (if (or (not (= (usb/ble-diagnostic 0) 1)) (not (= (w 0) 3))) 0
+    (do (usb/ble-param 0 0) (usb/ble-param 1 0)
+        (if (not (= (le/command 8204 2 6) 1)) (fail 29)
+          (if (not (= (passkey-random 8) 1)) (fail 30)
+            (do (usb/ble-param 0 96) (usb/ble-param 1 0) (usb/ble-param 2 48) (usb/ble-param 3 0)
+                (usb/ble-param 4 0) (usb/ble-param 5 (w 13)) (params 352 6 6) (usb/ble-param 12 0)
+                (usb/ble-param 13 24) (usb/ble-param 14 0) (usb/ble-param 15 40) (usb/ble-param 16 0)
+                (usb/ble-param 17 0) (usb/ble-param 18 0) (usb/ble-param 19 244) (usb/ble-param 20 1)
+                (usb/ble-param 21 0) (usb/ble-param 22 0) (usb/ble-param 23 0) (usb/ble-param 24 0)
+                (if (= (command-status 8205 25) 1) (do (put 0 4) 1) (fail 31))))))))
+(defn connected-address [i diff] :i64
+  (if (>= i 6) (if (= diff 0) 1 0)
+    (connected-address (+ i 1) (bit-or diff (bit-xor (le/packet (+ 8 i)) (b (+ 352 i)))))))
+(defn addresses [i] :i64
+  (if (>= i 6) 1
+    (do (p (+ 705 i) (b (- 149 i))) (p (+ 712 i) (b (- 357 i))) (addresses (+ i 1)))))
+(defn pair-request [] :i64
+  (do (p 528 0) (p 529 0) (p 530 13) (p 531 16) (p 532 0) (p 533 1) (p 1984 1) (copy 528 1985 6)
+      (p 704 0) (p 711 (w 13)) (addresses 0)
+      (if (= (smp 1 528 6) 1) (do (put 0 5) 1) (fail 32))))
+(defn dhkey-wait [fuel] :i64
+  (if (or (= fuel 0) (not (= (le/wait-event 400) 1))) 0
+    (if (= (le/control-event) 1) (dhkey-wait (- fuel 1))
+      (if (and (= (le/packet 0) 62) (= (le/packet 2) 9) (= (le/word 3) 36) (= (le/packet 3) 0))
+        (event-copy 4 224 32) 0))))
+(defn dhkey [] :i64
+  (do (params 384 0 64) (if (= (command-status 8230 64) 1) (dhkey-wait 16) 0)))
+(defn round-z [] :i64 (+ 128 (bit-and (u64-shift-right (w 10) (w 9)) 1)))
+(defn confirm [] :i64
+  (if (not (= (sc/random 448 16) 1)) (fail 33)
+    (if (not (= (sc/f4 160 384 448 (round-z) 640) 1)) (fail 34)
+      (if (= (smp 3 640 16) 1) (do (put 0 7) 1) (fail 35)))))
+(defn derive [] :i64
+  (do (fill 336 16 0) (p 336 (w 10)) (p 337 (u64-shift-right (w 10) 8)) (p 338 (u64-shift-right (w 10) 16))
+      (if (not (= (sc/f5 224 448 464 704 711 512 496) 1)) (fail 36)
+        (if (not (= (sc/f6 512 448 464 336 528 704 711 640) 1)) (fail 37)
+          (if (= (smp 13 640 16) 1) (do (put 0 9) 1) (fail 38))))))
+(defn start-encryption [] :i64
+  (do (usb/ble-param 0 (bit-and (le/word 10) 255)) (usb/ble-param 1 (quot (le/word 10) 256))
+      (fill 544 10 0) (params 544 2 10) (params 496 12 16)
+      (if (= (command-status 8217 28) 1) (do (put 0 10) 1) (fail 39))))
+(defn pair-mode [io oob auth key initdist respdist] :i64
+  ;; Our DisplayOnly + MITM request and a keyboard peer select Passkey Entry
+  ;; even when the responder does not itself set MITM (Core Vol3 H2.3.5.1).
+  (if (and (or (= io 2) (= io 4)) (= oob 0) (= key 16)
+           (= (bit-and auth 192) 0) (<= (bit-and auth 3) 1)
+           (= initdist 0) (<= respdist 1))
+    (if (= (bit-and auth 8) 8) 2 1) 0))
+(defn legacy-confirm [] :i64
+  (do (fill 336 16 0) (p 336 (w 10)) (p 337 (u64-shift-right (w 10) 8)) (p 338 (u64-shift-right (w 10) 16))
+      (if (not (= (sc/random 448 16) 1)) (fail 33)
+        (if (not (= (legacy/c1 448 640) 1)) (fail 34)
+          (if (= (smp 3 640 16) 1) (do (put 0 7) 1) (fail 35))))))
+(defn pair-response [] :i64
+  (do (copy 720 1992 7) (fill 2016 8 0) (copy 721 2016 6)
+      (let [mode (pair-mode (r 1) (r 2) (r 3) (r 4) (r 5) (r 6))]
+        (if (= mode 0) (fail 40)
+          (do (p 2000 mode) (p 2001 (r 6)) (copy 721 534 3)
+              (if (= mode 2) (do (put 0 6) (smp 12 160 64)) (legacy-confirm)))))))
+(defn distributed-key [op n] :i64
+  (if (and (= (b 2000) 1) (= (b 2001) 1) (= (w 12) 1) (= (le/word 11) 1)
+           (or (= (w 0) 11) (= (w 0) 15)))
+    (if (and (= op 6) (= n 17) (= (b 2002) 0)) (do (copy 721 496 16) (p 2002 1) 1)
+      (if (and (= op 7) (= n 11) (= (b 2002) 1)) (do (copy 721 2004 10) (p 2002 3) 1) (fail 50)))
+    (fail 50)))
+(defn handle-smp [] :i64
+  (let [op (r 0) n (w 2) stage (w 0)]
+    (if (and (= op 11) (= n 2)) 0
+      (if (= op 5) (fail (+ 256 (r 1)))
+        (if (or (= op 6) (= op 7)) (distributed-key op n)
+          (if (and (= stage 5) (= op 2) (= n 7)) (pair-response)
+            (if (and (= stage 6) (= op 12) (= n 65))
+              (do (copy 721 384 64)
+                  (if (= (equal 384 160 64 0) 1) (fail 41)
+                    (if (= (dhkey) 1) (do (put 9 0) (confirm)) (fail 42))))
+              (if (and (= stage 7) (= op 3) (= n 17))
+                (do (copy 721 480 16) (put 0 8) (smp 4 448 16))
+                (if (and (= stage 8) (= op 4) (= n 17))
+                  (do (copy 721 464 16)
+                      (let [ok (if (= (b 2000) 1) (legacy/c1 464 640) (sc/f4 384 160 464 (round-z) 640))]
+                        (if (not (= ok 1)) (fail 43)
+                          (if (not (= (equal 640 480 16 0) 1)) (fail 44)
+                            (if (= (b 2000) 1)
+                              (if (= (legacy/s1 464 448 496) 1) (do (p 2003 1) (start-encryption)) (fail 36))
+                              (if (= (w 9) 19) (derive) (do (put 9 (+ (w 9) 1)) (confirm))))))))
+                  (if (and (= stage 9) (= op 13) (= n 17))
+                    (if (not (= (sc/f6 512 464 448 336 534 711 704 640) 1)) (fail 45)
+                      (if (= (equal 640 721 16 0) 1) (start-encryption) (fail 46)))
+                    (fail 47)))))))))))
+(defn connection-event [] :i64
+  (if (and (= (w 0) 4) (or (and (= (le/packet 2) 1) (= (le/word 3) 21))
+                     (and (= (le/packet 2) 10) (= (le/word 3) 33))))
+    (if (not (and (= (le/packet 3) 0) (= (le/packet 6) 0) (= (le/packet 7) (w 13))
+                  (= (connected-address 0 0) 1))) (fail 48)
+      (do (le/put 10 (h16 4)) (le/put 12 (le/word 5)) (pair-request))) 0))
+(defn connection-parameters [] :i64
+  (if (and (= (le/word 3) 13) (= (h16 3) (le/word 10)))
+    (let [minimum (h16 5) maximum (h16 7) latency (h16 9) timeout (h16 11)]
+      (do (usb/ble-param 0 (le/packet 3)) (usb/ble-param 1 (le/packet 4))
+          (if (and (>= minimum 6) (>= maximum minimum) (<= maximum 3200) (<= latency 499)
+                   (>= timeout 10) (<= timeout 3200) (> (* timeout 4) (* (+ latency 1) maximum)))
+            (do (event-copy 5 360 8) (params 360 2 8) (usb/ble-param 10 0) (usb/ble-param 11 0)
+                (usb/ble-param 12 0) (usb/ble-param 13 0) (le/command 8224 14 8))
+            (do (usb/ble-param 2 59) (le/command 8225 3 8))))) 0))
+(defn handle-event [] :i64
+  (if (= (le/control-event) 1)
+    (if (and (>= (w 0) 5) (< (w 0) 128) (= (le/word 10) 65535)) (fail 49) 0)
+    (if (= (le/packet 0) 62)
+      (if (and (= (w 0) 2) (= (le/packet 2) 2) (>= (le/word 3) 4)) (adverts 4 (le/packet 3))
+        (if (= (le/packet 2) 6) (connection-parameters) (connection-event))) 0)))
+(defn handle-signal [] :i64
+  ;; LE Connection Parameter Update response: reject malformed/out-of-range
+  ;; requests rather than treating arbitrary signaling bytes as HID.
+  (if (and (= (w 2) 12) (= (r 0) 18) (= (r16 2) 8))
+    (do (tx 0 19) (tx 1 (r 1)) (tx16 2 2) (tx16 4 1) (send 5 6)) 0))
+(defn poll [] :i64
+  (if (or (not (= (usb/ble-diagnostic 0) 1)) (= (w 0) 0) (= (w 0) 128)) 0
+    (do (p16 1782 (mod (+ (u16 1782) 1) 65536))
+        (let [event (le/wait-event 0)]
+          (if (= event 1) (do (p16 1786 (le/packet 0)) (p16 1788 (le/packet 2)) (handle-event))
+            (if (not (= event -3)) (p16 1784 (- 0 event)) 0)))
+        (if (and (= (w 0) 10) (= (le/word 11) 1)) (do (put 12 1) (put 0 11) (begin-hid)) 0)
+        (if (= (usb/ble-poll) 2)
+          (if (= (receive-acl) 1)
+            (do (put 8 (+ (w 8) 1)) (p16 1936 (w 3)) (p16 1938 (w 2)) (p 1940 (r 0))
+                (if (= (w 3) 6) (handle-smp) (if (= (w 3) 5) (handle-signal) (if (= (w 3) 4) (handle-att) 0)))) 0) 0)
+
+        (if (= (w 0) 15) (+ (u16 1770) (* (mouse/pending) 2)) 0))))
+
+(defn u16 [at] :i64 (+ (b at) (* (b (+ at 1)) 256)))
+(defn p16 [at v] :i64 (do (p at v) (p (+ at 1) (quot v 256))))
+(defn char-at [i field] :i64 (u16 (+ 1540 (+ (* i 8) field))))
+(defn request [opcode start end uuid state] :i64
+  (do (tx 0 opcode) (tx16 1 start) (tx16 3 end) (tx16 5 uuid) (put 21 state)
+      (put 19 start) (put 22 opcode) (send 4 7)))
+(defn discover-services [start] :i64 (request 16 start 65535 10240 1))
+(defn discover-chars [start] :i64 (request 8 start (w 18) 10243 2))
+(defn services [at size] :i64
+  (if (>= at (w 2))
+    (if (= (w 19) 65536) (fail 60) (discover-services (w 19)))
+    (let [start (r16 at) end (r16 (+ at 2))]
+      (if (or (< start (w 19)) (< end start) (> (+ at size) (w 2))) (fail 61)
+        (if (and (= size 6) (= (r16 (+ at 4)) 6162))
+          (do (put 17 start) (put 18 end) (put 20 0) (discover-chars start))
+          (do (put 19 (+ end 1)) (services (+ at size) size)))))))
+(defn chars [at size] :i64
+  (if (>= at (w 2))
+    (if (> (w 19) (w 18)) (choose-input 0) (discover-chars (w 19)))
+    (let [decl (r16 at) value (r16 (+ at 3)) n (w 20) dst (+ 1540 (* n 8))]
+      (if (or (>= n 24) (< decl (w 19)) (<= value decl) (> value (w 18)) (> (+ at size) (w 2))) (fail 62)
+        (do (p16 dst decl) (p16 (+ dst 2) value) (p16 (+ dst 4) (if (= size 7) (r16 (+ at 5)) 0))
+            (p (+ dst 6) (r (+ at 2))) (put 20 (+ n 1)) (put 19 (+ decl 1))
+            (if (and (= size 7) (= (r16 (+ at 5)) 10830)) (p16 1742 value) 0)
+            (if (and (= size 7) (= (r16 (+ at 5)) 10827)) (p16 1746 value) 0)
+            (chars (+ at size) size))))))
+(defn find-char [uuid i] :i64
+  (if (>= i (w 20)) -1
+    (if (and (= (char-at i 4) uuid) (= (bit-and (b (+ 1546 (* i 8))) 16) 16)) i (find-char uuid (+ i 1)))))
+(defn begin-hid [] :i64
+  (do (fill 1816 72 0) (mouse/reset) (p16 1824 1) (discover-services 1)))
+(defn select-input [i kind] :i64
+  (do (if (> kind 0) (p16 1764 0) 0) (p16 1766 i) (p16 1768 kind) (put 16 (char-at i 2))
+      (p16 1750 (if (< (+ i 1) (w 20)) (- (char-at (+ i 1) 0) 1) (w 18)))
+      (p16 1744 0) (p16 1752 0) (discover-descriptors (+ (w 16) 1))))
+(defn choose-boot [kind] :i64
+  (if (>= kind 2) (subscribe-all)
+    (let [i (find-char (if (= kind 0) 10786 10803) 0)]
+      (if (< i 0) (choose-boot (+ kind 1)) (select-input i (+ kind 1))))))
+(defn choose-input [from] :i64
+  (let [i (find-char 10829 from)]
+    (if (>= i 0) (select-input i 0)
+      (if (or (> (u16 1816) 0) (> (u16 1840) 0)) (subscribe-all)
+        (do (p16 1824 0) (choose-boot 0))))))
+(defn discover-descriptors [start] :i64
+  (if (> start (u16 1750)) (descriptors-done)
+    (do (tx 0 4) (tx16 1 start) (tx16 3 (u16 1750)) (put 19 start) (put 21 3) (put 22 4) (send 4 5))))
+(defn descriptors [at size] :i64
+  (if (>= at (w 2)) (discover-descriptors (w 19))
+    (let [handle (r16 at) uuid (if (= size 4) (r16 (+ at 2)) 0)]
+      (if (or (< handle (w 19)) (> handle (u16 1750)) (> (+ at size) (w 2))) (fail 64)
+        (do (if (= uuid 10498) (p16 1744 handle) 0) (if (= uuid 10504) (p16 1752 handle) 0)
+            (put 19 (+ handle 1)) (descriptors (+ at size) size))))))
+(defn read-value [handle state] :i64
+  (do (tx 0 10) (tx16 1 handle) (put 21 state) (put 22 10) (send 4 3)))
+(defn save-keyboard [] :i64
+  (do (p16 1816 (w 16)) (p16 1818 (u16 1744)) (p16 1832 (u16 1764))))
+(defn save-mouse [] :i64
+  (do (p16 1840 (w 16)) (p16 1842 (u16 1744)) (p 1844 (u16 1764))))
+(defn descriptors-done [] :i64
+  (if (= (u16 1824) 0)
+    (do (if (> (u16 1744) 0)
+          (if (= (u16 1768) 1) (save-keyboard) (do (mouse/boot) (save-mouse))) 0)
+        (choose-boot (u16 1768)))
+    (if (or (= (u16 1744) 0) (= (u16 1752) 0)) (choose-input (+ (u16 1766) 1))
+      (read-value (u16 1752) 4))))
+(defn evaluate-map [] :i64
+  (do (if (and (= (u16 1816) 0) (= (report-layout (u16 1764) (u16 1760)) 1)) (save-keyboard)
+        (if (and (= (u16 1840) 0) (= (mouse/layout (u16 1764) (u16 1760)) 1)) (save-mouse) 0))
+      (choose-input (+ (u16 1766) 1))))
+(defn map-complete [] :i64 (do (p16 1828 1) (evaluate-map)))
+(defn map-copy [at n offset] :i64
+  (if (= n 0) 1
+    (do (usb/ble-map-put offset (r at)) (map-copy (+ at 1) (- n 1) (+ offset 1)))))
+(defn read-map [] :i64
+  (if (= (u16 1746) 0) (fail 66)
+    (do (p16 1760 0) (read-value (u16 1746) 5))))
+(defn map-part [] :i64
+  (let [n (- (w 2) 1) total (+ (u16 1760) n)]
+    (if (> total 1024) (fail 67)
+      (do (map-copy 1 n (u16 1760)) (p16 1760 total)
+          (if (= n 22)
+            (do (tx 0 12) (tx16 1 (u16 1746)) (tx16 3 total) (put 22 12) (send 4 5))
+            (map-complete))))))
+(defn subscribe-step [kind] :i64
+  (if (>= kind 3)
+    (do (put 21 7) (put 0 15) (fill 1792 16 0) (p16 1770 0) (p16 1772 0)
+        (mouse/acknowledge) (p 1862 0) (mouse/set-report 0) 1)
+    (let [cccd (if (= kind 1) (u16 1818) (u16 1842))]
+      (if (= cccd 0) (subscribe-step (+ kind 1))
+        (do (tx 0 18) (tx16 1 cccd) (tx16 3 1) (p16 1826 kind)
+            (put 21 6) (put 22 18) (send 4 5))))))
+(defn subscribe-all [] :i64
+  (if (or (not (= (w 12) 1)) (not (= (le/word 11) 1))) (fail 68)
+    (if (and (= (u16 1816) 0) (= (u16 1840) 0)) (fail 63)
+      (do (if (> (u16 1742) 0)
+            (do (tx 0 82) (tx16 1 (u16 1742)) (tx 3 (u16 1824)) (send 4 4)) 0)
+          (subscribe-step 1)))))
+(defn report-pack [at i acc] :i64
+  (if (= i 8) acc (report-pack at (+ i 1) (bit-or acc (i64-shift-left (r (+ at i)) (* i 8))))))
+(defn store-report [dst report i] :i64
+  (if (= i 8) 1 (do (p (+ dst i) (u64-shift-right report (* i 8))) (store-report dst report (+ i 1)))))
+(defn load-report [src i acc] :i64
+  (if (= i 8) acc (load-report src (+ i 1) (bit-or acc (i64-shift-left (b (+ src i)) (* i 8))))))
+(defn admit [handle report n] :i64
+  (if (and (= (w 0) 15) (= (w 12) 1) (= (le/word 11) 1) (> handle 0) (= handle (u16 1816))
+           (= (hid/keyboard-valid report n) 1)) 1 0))
+(defn keyboard-notification [] :i64
+  (if (and (= (w 2) 11) (= (admit (r16 1) (report-pack 3 0 0) 8) 1))
+    (if (= (u16 1772) 1)
+      (do (if (= (report-pack 3 0 0) 0) (do (p16 1772 0) (fill 1792 16 0)) 0) 0)
+      (do (copy 1792 1800 8) (store-report 1792 (report-pack 3 0 0) 0) (p16 1770 1) 1)) 0))
+(defn mouse-admit [handle value n] :i64
+  (if (and (= (w 0) 15) (= (w 12) 1) (= (le/word 11) 1)
+           (> handle 0) (= handle (u16 1840)) (= (mouse/valid value n) 1)) 1 0))
+(defn notification [] :i64
+  (if (= (r16 1) (u16 1816)) (keyboard-notification)
+    (if (and (>= (w 2) 4) (<= (w 2) 11)
+             (= (mouse-admit (r16 1) (report-pack 3 0 0) (- (w 2) 3)) 1))
+      (mouse/ingress (report-pack 3 0 0) (- (w 2) 3)) 0)))
+(defn handle-secured-att [] :i64
+  (if (or (not (= (w 12) 1)) (not (= (le/word 11) 1))) (fail 69)
+    (let [op (r 0) state (w 21)]
+      (if (= op 27) (notification)
+        (if (and (= op 2) (= (w 2) 3))
+          (do (tx 0 3) (tx16 1 23) (send 4 3))
+          (if (= op 1)
+            (if (and (= (w 2) 5) (= (r 1) (w 22)))
+              (if (and (= state 5) (= (w 22) 12) (> (u16 1760) 0)
+                       (= (r16 2) (u16 1746)) (or (= (r 4) 7) (= (r 4) 10))) (map-complete)
+                (if (= (r 4) 10) (case state 2 (choose-input 0) 3 (descriptors-done) (fail 71))
+                  (fail (+ 512 (r 4))))) (fail 71))
+            (case state
+              1 (if (and (= op 17) (or (= (r 1) 6) (= (r 1) 20)) (= (mod (- (w 2) 2) (r 1)) 0)) (services 2 (r 1)) (fail 72))
+              2 (if (and (= op 9) (or (= (r 1) 7) (= (r 1) 21)) (= (mod (- (w 2) 2) (r 1)) 0)) (chars 2 (r 1)) (fail 73))
+              3 (if (and (= op 5) (or (= (r 1) 1) (= (r 1) 2))) (descriptors 2 (if (= (r 1) 1) 4 18)) (fail 74))
+              4 (if (and (= op 11) (= (w 2) 3))
+                  (if (= (r 2) 1) (do (p16 1764 (r 1)) (if (= (u16 1828) 1) (evaluate-map) (read-map))) (choose-input (+ (u16 1766) 1))) (fail 75))
+              5 (if (or (and (= (w 22) 10) (= op 11)) (and (= (w 22) 12) (= op 13))) (map-part) (fail 76))
+              6 (if (and (= op 19) (= (w 2) 1)) (subscribe-step (+ (u16 1826) 1)) (fail 77))
+              0)))))))
+(defn handle-att [] :i64
+  ;; ATT MTU negotiation is connection control and may precede SMP. It grants
+  ;; no input: every notification still needs the paired+encrypted gate.
+  (if (and (= (r 0) 2) (= (w 2) 3))
+    (do (tx 0 3) (tx16 1 23) (send 4 3))
+    (if (and (= (w 12) 1) (= (le/word 11) 1)) (handle-secured-att) 0)))
+(defn next-key [i] :i64
+  (if (and (= (u16 1770) 1) (= (w 0) 15) (= (le/word 11) 1))
+    (hid/new-key (load-report 1800 0 0) (load-report 1792 0 0) i) 0))
+(defn acknowledge [] :i64 (do (p16 1770 0) (mouse/acknowledge)))
+(defn quarantine [] :i64 (do (p16 1770 0) (p16 1772 1) (mouse/quarantine)))
+;; USB HID short-item parser, bounded to1024 bytes and the selected Report ID.
+;; Admit only modifiers8/reserved8/six-key-array48. No NKRO guess or ID byte.
+(defn item-value [at n i acc] :i64
+  (if (= i n) acc (item-value at n (+ i 1) (+ acc (i64-shift-left (usb/ble-map (+ at i)) (* i 8))))))
+(defn map-input [bits mask page size count minusage maxusage flags] :i64
+  (let [width (* size count)]
+    (if (and (= bits 0) (= page 7) (= size 1) (= count 8) (= minusage 224) (= maxusage 231) (= (bit-and flags 7) 2)) 1
+      (if (and (= bits 8) (= width 8) (= (bit-and flags 1) 1)) 2
+        (if (and (= bits 16) (= page 7) (= size 8) (= count 6) (= (bit-and flags 7) 0)) 4 0)))))
+(defn map-items [at n selected id page size count minusage maxusage bits mask fuel] :i64
+  (if (= at n) (if (and (= bits 64) (= mask 7)) 1 0)
+    (if (or (> at n) (= fuel 0)) 0
+      (let [prefix (usb/ble-map at) len (case (bit-and prefix 3) 3 4 (bit-and prefix 3))
+            next (+ at 1 len) typ (bit-and (quot prefix 4) 3) tag (quot prefix 16)]
+        (if (or (= prefix 254) (> next n)) 0
+          (let [v (item-value (+ at 1) len 0 0)]
+            (if (= typ 1)
+              (case tag
+                0 (map-items next n selected id v size count minusage maxusage bits mask (- fuel 1))
+                7 (map-items next n selected id page v count minusage maxusage bits mask (- fuel 1))
+                8 (if (or (= v 0) (> v 255)) 0 (map-items next n selected v page size count minusage maxusage bits mask (- fuel 1)))
+                9 (map-items next n selected id page size v minusage maxusage bits mask (- fuel 1))
+                10 0 11 0
+                (map-items next n selected id page size count minusage maxusage bits mask (- fuel 1)))
+              (if (= typ 2)
+                (map-items next n selected id page size count (if (= tag 1) v minusage) (if (= tag 2) v maxusage) bits mask (- fuel 1))
+                (if (and (= typ 0) (= tag 8) (= id selected))
+                  (let [part (map-input bits mask page size count minusage maxusage v)]
+                    (if (= part 0) 0 (map-items next n selected id page size count 0 0 (+ bits (* size count)) (bit-or mask part) (- fuel 1))))
+                  (map-items next n selected id page size count (if (= typ 0) 0 minusage) (if (= typ 0) 0 maxusage) bits mask (- fuel 1)))))))))))
+(defn report-layout [selected n] :i64
+  (if (or (< n 1) (> n 1024)) 0 (map-items 0 n selected 0 0 0 0 0 0 0 0 1024)))
+
+(defn map-vector [i] :i64
+  (case i 0 5 1 1 2 9 3 6 4 161 5 1 6 133 7 1 8 5 9 7 10 25 11 224 12 41 13 231
+    14 21 15 0 16 37 17 1 18 117 19 1 20 149 21 8 22 129 23 2 24 117 25 8 26 149 27 1
+    28 129 29 1 30 149 31 6 32 117 33 8 34 21 35 0 36 37 37 101 38 5 39 7 40 25 41 0
+    42 41 43 101 44 129 45 0 46 192 0))
+(defn stage-map [i] :i64
+  (if (>= i 47) 1 (do (usb/ble-map-put i (map-vector i)) (stage-map (+ i 1)))))
+(defn test-bit [v bit] :i64 (if (= v 1) bit 0))
+(defn self-check [] :i64
+  (do (put 0 15) (put 12 1) (put 16 42) (p16 1816 42) (le/put 11 1)
+      (let [a (test-bit (admit 42 262144 8) 1)
+            b (test-bit (- 1 (admit 43 262144 8)) 2)
+            c (test-bit (- 1 (admit 42 262144 7)) 4)
+            d (test-bit (- 1 (admit 42 262400 8)) 8)
+            e (test-bit (- 1 (admit 42 65536 8)) 16)]
+        (do (put 12 0)
+            (let [f (test-bit (- 1 (admit 42 262144 8)) 32)]
+              (do (put 12 1) (le/put 11 0)
+                  (let [g (test-bit (- 1 (admit 42 262144 8)) 64)]
+                    (do (le/put 11 1) (put 0 5)
+                        (let [h (test-bit (- 1 (admit 42 262144 8)) 128)]
+                          (do (stage-map 0)
+                              (+ a b c d e f g h
+                                 (test-bit (report-layout 1 47) 256)
+                                 (test-bit (- 1 (report-layout 2 47)) 512)
+                                 (test-bit (- 1 (report-layout 1 45)) 1024)
+                                 (test-bit (- 1 (report-layout 1 1025)) 2048)
+                                 (test-bit (- 1 (hid/new-key 262144 262144 2)) 4096)
+                                 (test-bit (if (= (hid/new-key 0 262144 2) 30) 1 0) 8192))))))))))))
+
+(defn mouse-gate-check [] :i64
+  (do (mouse/boot) (p16 1840 84) (put 0 15) (put 12 1) (le/put 11 1)
+      (let [a (test-bit (mouse-admit 84 197121 3) 1)
+            b (test-bit (- 1 (mouse-admit 85 197121 3)) 2)
+            c (test-bit (- 1 (mouse-admit 84 197121 4)) 4)
+            d (test-bit (- 1 (mouse-admit 84 197129 3)) 8)]
+        (do (put 12 0)
+            (let [e (test-bit (- 1 (mouse-admit 84 197121 3)) 16)]
+              (do (put 12 1) (le/put 11 0)
+                  (let [f (test-bit (- 1 (mouse-admit 84 197121 3)) 32)]
+                    (do (le/put 11 1) (put 0 5)
+                        (let [g (test-bit (- 1 (mouse-admit 84 197121 3)) 64)]
+                          (do (put 0 15) (p16 1840 0)
+                              (+ a b c d e f g (test-bit (- 1 (mouse-admit 0 197121 3)) 128))))))))))))
+
+(defn transport-check [] :i64
+  (+ (if (= (acl-header 16) 16) 1 0)
+     (if (= (acl-header 0) 0) 2 0)
+     (if (= (acl-header 3839) 3839) 4 0)
+     (if (= (acl-header 3840) -1) 8 0)
+     (if (= (acl-header 0x2010) -1) 16 0)
+     (if (= (acl-header 65535) -1) 32 0)))
+
+(defn pairing-check [] :i64
+  (+ (if (= (pair-mode 2 0 13 16 0 1) 2) 1 0)
+     (if (= (pair-mode 4 0 9 16 0 0) 2) 2 0)
+     (if (= (pair-mode 2 0 1 16 0 1) 1) 4 0)
+     (if (= (pair-mode 3 0 13 16 0 1) 0) 8 0)
+     (if (= (pair-mode 2 1 13 16 0 1) 0) 16 0)
+     (if (= (pair-mode 2 0 13 7 0 1) 0) 32 0)
+     (if (= (pair-mode 2 0 205 16 0 1) 0) 64 0)
+     (if (= (pair-mode 2 0 15 16 0 1) 0) 128 0)
+     (if (= (pair-mode 2 0 13 16 1 1) 0) 256 0)
+     (if (= (pair-mode 2 0 13 16 0 3) 0) 512 0)))
+
+(defn stage-name [slot i] :i64
+  (if (= i 16) 1
+    (do (p (+ 1024 i) (if (= i 4) 45 (if (= i 11) slot (if (< i 11) (name-byte i) 0))))
+        (stage-name slot (+ i 1)))))
+(defn name-check [] :i64
+  (do (stage-name 52 0)
+      (let [a (name-match 0 12 0) c (name-match 0 16 0) bare (- 1 (name-match 0 11 0))]
+        (do (stage-name 49 0)
+            (let [one (- 1 (name-match 0 12 0))]
+              (do (stage-name 51 0)
+                  (let [three (- 1 (name-match 0 12 0))]
+                    (do (stage-name 52 0) (p 1036 1)
+                        (+ a (* c 2) (* bare 4) (* one 8) (* three 16) (* (- 1 (name-match 0 16 0)) 32))))))))))

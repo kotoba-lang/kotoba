@@ -37,6 +37,11 @@
   ;; message) and the Ed25519 workspace 4096..8191.
   (:require [aiueos.native.rtl8168-debug :as nic]
             [aiueos.native.update :as update]
+            [aiueos.native.xhci :as usb]
+            [aiueos.native.bluetooth-le :as ble]
+            [aiueos.native.bluetooth-sc :as sc] [aiueos.native.bluetooth-legacy :as legacy]
+            [aiueos.native.bluetooth-hogp :as hogp]
+            [aiueos.native.bluetooth-firmware :as firmware]
             [aiueos.ed25519 :as ed])
   (:export [init poll nonce rx-stats]))
 
@@ -106,7 +111,57 @@
       (nic/log 49407 reason)
       0))
 
-;; Returns 0, or 256 + a make code the desktop should handle as a key press.
+;; Command7 selects a PCI xHCI BDF in profile6 only. It never pairs or
+;; accepts non-boot input. c007=result; c170..172=active BDF/status/HID count;
+;; c180..18b=descriptor metadata for two HID probes and one hub probe.
+(defn usb-device-report [d]
+  (if (>= d 3) 1
+    (do (nic/log (+ 49536 (* d 4)) (usb/device-diagnostic d 0))
+        (nic/log (+ 49537 (* d 4)) (usb/device-diagnostic d 1))
+        (nic/log (+ 49538 (* d 4)) (usb/device-diagnostic d 2))
+        (nic/log (+ 49539 (* d 4)) (usb/device-diagnostic d 3))
+        (usb-device-report (+ d 1)))))
+;; Per-port enumeration snapshots identify failed links independently of
+;; accepted HID count. No reports, keys or peer addresses are emitted.
+(defn usb-port-report [port]
+  (if (> port (min 16 (bit-and (quot (usb/controller-diagnostic 0 1) 16777216) 255))) 1
+    (do (nic/log (+ 49568 (* (- port 1) 2)) (usb/port-state 0 port))
+        (nic/log (+ 49569 (* (- port 1) 2)) (usb/port-stage 0 port))
+        (usb-port-report (+ port 1)))))
+(defn usb-hub-report [port]
+  (if (> port (usb/hub-ports)) 1
+    (do (nic/log (+ 49600 (* (- port 1) 2)) (usb/hub-port-state port))
+        (nic/log (+ 49601 (* (- port 1) 2)) (usb/hub-port-stage port))
+        (usb-hub-report (+ port 1)))))
+(defn bluetooth-report [i]
+  (if (>= i 15) 1
+    (do (nic/log (+ 49552 i) (usb/bluetooth-diagnostic i)) (bluetooth-report (+ i 1)))))
+(defn ble-report [i]
+  (if (>= i 10) 1
+    (do (nic/log (+ 49616 i) (ble/diagnostic i)) (ble-report (+ i 1)))))
+(defn initialize-ble [ctx argument]
+  (let [result (ble/initialize argument)]
+    (do (put-word ctx 138 (usb/result)) (ble-report 0)
+        (nic/log 49161 result) 1)))
+(defn hogp-report [i]
+  (if (>= i 16) 1 (do (nic/log (+ 49632 i) (hogp/diagnostic i)) (hogp-report (+ i 1)))))
+(defn operate-hogp [command]
+  (let [result (case command 11 (hogp/scan) 12 (hogp/connect) 1)]
+    (do (hogp-report 0) (nic/log (+ 49152 command) result) 1)))
+(defn probe-bluetooth [ctx argument]
+  (let [probed (usb/probe-bluetooth argument)]
+    (do (put-word ctx 138 (usb/result))
+        (nic/log 49520 (usb/diagnostic 6))
+        (nic/log 49521 (usb/result)) (nic/log 49522 (usb/devices))
+        (usb-device-report 0) (usb-port-report 1) (usb-hub-report 1) (bluetooth-report 0) (nic/log 49160 probed) 1)))
+(defn select-usb [ctx argument]
+  (let [selected (usb/select-controller argument)]
+    (do (put-word ctx 138 (usb/result))
+        (nic/log 49520 (usb/diagnostic 6))
+        (nic/log 49521 (usb/result)) (nic/log 49522 (usb/devices))
+        (usb-device-report 0) (usb-port-report 1) (usb-hub-report 1) (nic/log 49159 selected) 1)))
+
+;; Returns0, 1 after USB selection, or256 + a keyboard make code.
 ;; An unknown command is refused with reason 6 + 256 * command.
 (defn execute [ctx command argument counter geom]
   (do (put-word64 ctx 174 counter)
@@ -124,17 +179,32 @@
                                    (bit-and (u64-shift-right geom 32) 65535)
                                    (bit-and (u64-shift-right geom 48) 255))]
                 (do (nic/log 49156 sent) 0))
-              (if (= command 5)
+              (if (and (= command 5) (not (= (word ctx 86) 6)))
                 (let [released (nic/rx-release)
                       pulled (update/pull ctx)
                       reported (update/report ctx)]
                   (do (nic/log 49157 (+ pulled (* 0 (+ released reported)))) 0))
-                (if (= command 6)
+                (if (and (= command 6) (not (= (word ctx 86) 6)))
                   (let [released (nic/rx-release)
                         installed (update/install ctx)
                         reported (+ (update/report ctx) (update/install-report ctx))]
                     (do (nic/log 49158 (+ installed (* 0 (+ released reported)))) 0))
-                  (refuse ctx (+ 6 (* 256 (bit-and command 65535))))))))))))
+                  (if (and (= command 7) (= (word ctx 86) 6))
+                    (select-usb ctx argument)
+                    (if (and (= command 8) (= (word ctx 86) 6))
+                      (probe-bluetooth ctx argument)
+                      (if (and (= command 9) (= (word ctx 86) 6))
+                        (initialize-ble ctx argument)
+                        (if (and (= command 10) (= (word ctx 86) 6))
+                          (do (nic/log 49162 (if (and (= (usb/ble-diagnostic 0) 1) (= (ble/diagnostic 0) 15)
+                                                    (= (hogp/diagnostic 0) 0)) (+ (sc/self-check) (* 256 (legacy/self-check))) 0)) 1)
+                        (if (and (>= command 11) (<= command 13) (= (word ctx 86) 6))
+                          (operate-hogp command)
+                        (if (and (= command 16) (= (word ctx 86) 6))
+                          (let [result (firmware/load)]
+                            (do (nic/log 49648 (firmware/diagnostic 0)) (nic/log 49649 (firmware/diagnostic 1))
+                                (ble-report 0) (nic/log 49168 result) 1))
+                        (refuse ctx (+ 6 (* 256 (bit-and command 65535))))))))))))))))))
 
 (defn check [ctx geom]
   (if (= (magic-ok 0) 0) (refuse ctx 2)
