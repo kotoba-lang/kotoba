@@ -122,7 +122,7 @@ def main():
     p.add_argument("--key", type=Path, required=True, help="32-byte Ed25519 seed file (mode 0600)")
     p.add_argument("--broadcast", default="10.77.0.255")
     p.add_argument("--wait", type=float, default=15.0, help="seconds to wait for the nonce and replies")
-    p.add_argument("command", choices=("ping", "reboot", "key", "type", "shot", "update", "install", "usb-select", "bt-probe", "ble-init", "ble-crypto", "ble-scan", "ble-connect", "ble-status"))
+    p.add_argument("command", choices=("ping", "reboot", "key", "type", "shot", "update", "install", "usb-select", "bt-probe", "ble-init", "ble-crypto", "ble-scan", "ble-connect", "ble-status", "ble-firmware"))
     p.add_argument("value", nargs="?")
     args = p.parse_args()
     if args.key.stat().st_mode & 0o077:
@@ -148,14 +148,14 @@ def main():
                 print(f"{tag:04x} {value:016x}", flush=True)
             if tag in (done, 0xC0FF):
                 break
-    elif args.command in ("usb-select", "bt-probe", "ble-init", "ble-crypto", "ble-scan", "ble-connect", "ble-status"):
+    elif args.command in ("usb-select", "bt-probe", "ble-init", "ble-crypto", "ble-scan", "ble-connect", "ble-status", "ble-firmware"):
         slot = int(args.value, 0)
         if not 0 <= slot <= 65535:
             raise SystemExit("PCI slot must be bus<<8 | device<<3 | function (0..65535)")
-        done = {"usb-select": 0xC007, "bt-probe": 0xC008, "ble-init": 0xC009, "ble-crypto": 0xC00A, "ble-scan": 0xC00B, "ble-connect": 0xC00C, "ble-status": 0xC00D}[args.command]
-        send(args, seed, nonce, counter, {"usb-select": 7, "bt-probe": 8, "ble-init": 9, "ble-crypto": 10, "ble-scan": 11, "ble-connect": 12, "ble-status": 13}[args.command], slot)
+        done = {"usb-select": 0xC007, "bt-probe": 0xC008, "ble-init": 0xC009, "ble-crypto": 0xC00A, "ble-scan": 0xC00B, "ble-connect": 0xC00C, "ble-status": 0xC00D, "ble-firmware": 0xC010}[args.command]
+        send(args, seed, nonce, counter, {"usb-select": 7, "bt-probe": 8, "ble-init": 9, "ble-crypto": 10, "ble-scan": 11, "ble-connect": 12, "ble-status": 13, "ble-firmware": 16}[args.command], slot)
         for tag, value in records(log, time.monotonic() + args.wait):
-            if tag in (done, 0xC0FF) or 0xC170 <= tag <= 0xC172 or 0xC180 <= tag <= 0xC1EF:
+            if tag in (done, 0xC0FF) or 0xC170 <= tag <= 0xC172 or 0xC180 <= tag <= 0xC1FF:
                 print(f"{tag:04x} {value:016x}", flush=True)
             if tag in (done, 0xC0FF):
                 break

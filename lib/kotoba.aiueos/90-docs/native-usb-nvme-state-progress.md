@@ -348,3 +348,13 @@ Native controller/HOGP14 refusals, USB/NVMe12 observations and exact PXE hub
 smoke pass. These gates do not qualify real pairing or physical wireless input.
 Session keys stay in RAM: durable bond/reboot reconnect, BLE mouse/NKRO and
 classic HID remain open. Signed crypto test refuses an active pairing session.
+
+
+AWAI-142 Realtek firmware candidate: native producer preserves the font and
+places the pinned, unmodified49760-byte rtl8851bu firmware and6-byte config
+in its unused padding. Runtime SHA256 and the fixed eco1/key0 bundle layout
+are checked before0xfc20 streams to controller RAM. Native QEMU admits the
+correct bundle and rejects a changed byte and missing firmware.41-module
+USB/NVMe12 and exact PXE hub smoke pass. Physical upload/RF/Studio pairing
+remain unqualified at this candidate record. Binary provenance and Realtek
+redistribution notice are included; no firmware disassembly or flash write.
