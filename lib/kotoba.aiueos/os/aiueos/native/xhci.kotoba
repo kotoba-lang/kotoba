@@ -1,9 +1,10 @@
 (ns aiueos.native.xhci
   ;; Polled, bounded xHCI host for two direct-root USB boot HID devices.
   ;; Intel xHCI 1.2: command/event/transfer rings and input contexts.
-  ;; Owned pages 0..3 hold DMA, page 9 holds private host state. NVMe owns
-  ;; 4..8; RTL8168 owns 10..13; update owns 14. No overlap and no borrowed RAM.
-  ;; Refuse controllers needing scratchpads, >16KiB register offsets, hubs,
+  ;; Owned pages 0..2 hold rings/contexts; 3 and 14 are scratchpad pages.
+  ;; Page 9 holds private host state; NVMe owns 4..8, RTL8168 owns 10..13.
+  ;; Profile 6 refuses update commands, whose staging page would be 14.
+  ;; Refuse controllers needing >2 scratchpads, >16KiB register offsets, hubs,
   ;; non-boot HID and devices above high speed. Those are explicit follow-ups.
   (:require [capability.dma.map :as dma]
             [aiueos.native.usb-hid :as hid])
@@ -51,11 +52,11 @@
           (legacy-handoff (if (= (bit-and (quot cap 256) 255) 0) 0
                             (+ off (* (bit-and (quot cap 256) 255) 4))) (- remaining 1)))))))
 
-;; Event ring: 64 entries at 0. Snapshot before releasing a consumed event.
+;; Event ring: 32 entries at 0. Snapshot before releasing a consumed event.
 (defn event []
   (let [at (* (s 11) 16) ctl (mem (+ at 12))]
     (if (not (= (bit-and ctl 1) (s 12))) 0
-      (let [next (mod (+ (s 11) 1) 64)]
+      (let [next (mod (+ (s 11) 1) 32)]
         (do (dma/release-fence)
             (put 14 (mem at)) (put 15 (mem (+ at 4))) (put 16 (mem (+ at 8))) (put 17 ctl)
             (put 11 next) (if (= next 0) (put 12 (- 1 (s 12))) 0)
@@ -69,24 +70,24 @@
 (defn trb [off parameter status ctl]
   (do (m64 off parameter) (mput (+ off 8) status) (mput (+ off 12) ctl) 1))
 (defn command [kind parameter extra]
-  (let [idx (s 9) at (+ 1024 (* idx 16)) cycle (s 10)]
+  (let [idx (s 9) at (+ 512 (* idx 16)) cycle (s 10)]
     (do (trb at parameter 0 (+ (* kind 1024) extra cycle))
-        (if (= idx 62)
-          (do (trb 2032 (address 1024) 0 (+ 6146 cycle)) (put 9 0) (put 10 (- 1 cycle)))
+        (if (= idx 14)
+          (do (trb 752 (address 512) 0 (+ 6146 cycle)) (put 9 0) (put 10 (- 1 cycle)))
           (put 9 (+ idx 1)))
         (dma/release-fence) (rput (s 5) 0)
         (wait-event 33 (address at) 2000000))))
 
-;; Input context is shared only during synchronous enumeration. Two output
+;; Input context at8192 is shared only during synchronous enumeration. Two output
 ;; contexts fit even when CSZ=64. Device fields start at private word 64+d*32.
 (defn ds [d f] (s (+ 64 (+ (* d 32) f))))
 (defn dp [d f v] (put (+ 64 (+ (* d 32) f)) v))
 (defn out-base [d] (+ 4096 (* d 2048)))
-(defn ep-ring [d ep] (+ 12288 (+ (* d 1024) (* ep 512))))
+(defn ep-ring [d ep] (+ 1024 (+ (* d 1024) (* ep 512))))
 (defn ring-next [d ep count]
   (let [field (if (= ep 0) 8 10) cyc (+ field 1)
         idx (+ (ds d field) count)]
-    (if (>= idx 30)
+    (if (>= idx 29)
       (do (trb (+ (ep-ring d ep) (* idx 16)) (address (ep-ring d ep)) 0 (+ 6146 (ds d cyc)))
           (dp d field 0) (dp d cyc (- 1 (ds d cyc))))
       (dp d field idx))))
@@ -94,7 +95,7 @@
   (let [ring (ep-ring d 0) at (+ ring (* (ds d 8) 16)) cyc (ds d 9)
         status (+ at (if (> length 0) 32 16))]
     (do (trb at setup 8 (+ 2112 cyc (if (= length 0) 0 (if (= input 1) 196608 131072))))
-        (if (> length 0) (trb (+ at 16) (address 11264) length (+ 3072 cyc (* input 65536))) 0)
+        (if (> length 0) (trb (+ at 16) (address 3200) length (+ 3072 cyc (* input 65536))) 0)
         (trb status 0 0 (+ 4128 cyc (if (or (= length 0) (= input 0)) 65536 0)))
         (ring-next d 0 (if (> length 0) 3 2))
         (dma/release-fence) (rput (+ (s 5) (* (ds d 0) 4)) 1)
@@ -110,25 +111,25 @@
 ;; interrupt IN endpoint. Other classes never get a transfer ring.
 (defn parse-config [d at end active]
   (if (>= at end) 0
-    (let [len (b (+ 11264 at)) typ (b (+ 11265 at))]
+    (let [len (b (+ 3200 at)) typ (b (+ 3201 at))]
       (if (or (< len 2) (> (+ at len) end)) 0
         (if (and (= typ 4) (>= len 9))
-          (let [protocol (b (+ 11271 at))
-                accepted (if (and (= (b (+ 11269 at)) 3) (= (b (+ 11270 at)) 1)
+          (let [protocol (b (+ 3207 at))
+                accepted (if (and (= (b (+ 3205 at)) 3) (= (b (+ 3206 at)) 1)
                                   (or (= protocol 1) (= protocol 2))) protocol 0)]
-            (do (dp d 7 (b (+ 11266 at))) (parse-config d (+ at len) end accepted)))
+            (do (dp d 7 (b (+ 3202 at))) (parse-config d (+ at len) end accepted)))
           (if (and (= typ 5) (>= len 7) (> active 0)
-                   (= (bit-and (b (+ 11266 at)) 128) 128)
-                   (= (bit-and (b (+ 11267 at)) 3) 3))
-            (let [ep (bit-and (b (+ 11266 at)) 15)
-                  mps (+ (b (+ 11268 at)) (* (b (+ 11269 at)) 256))]
+                   (= (bit-and (b (+ 3202 at)) 128) 128)
+                   (= (bit-and (b (+ 3203 at)) 3) 3))
+            (let [ep (bit-and (b (+ 3202 at)) 15)
+                  mps (+ (b (+ 3204 at)) (* (b (+ 3205 at)) 256))]
               (if (or (= ep 0) (> mps 8) (< mps (if (= active 1) 8 3))) 0
-                (do (dp d 3 (+ (* ep 2) 1)) (dp d 4 active) (dp d 5 (b (+ 11270 at))) (dp d 6 mps) 1)))
+                (do (dp d 3 (+ (* ep 2) 1)) (dp d 4 active) (dp d 5 (b (+ 3206 at))) (dp d 6 mps) 1)))
             (parse-config d (+ at len) end active)))))))
 (defn interval-log [n e] (if (or (>= e 10) (<= n 1)) e (interval-log (quot (+ n 1) 2) (+ e 1))))
 (defn arm [d]
   (let [off (+ (ep-ring d 1) (* (ds d 10) 16))]
-    (do (trb off (address (+ 14336 (* d 64))) (ds d 6) (+ 1056 (ds d 11)))
+    (do (trb off (address (+ 3072 (* d 64))) (ds d 6) (+ 1056 (ds d 11)))
         (dp d 12 off) (ring-next d 1 1) (dma/release-fence)
         (rput (+ (s 5) (* (ds d 0) 4)) (ds d 3)) 1)))
 (defn configure [d]
@@ -148,7 +149,7 @@
     (let [slot (quot (s 17) 16777216) cs (s 7) mps (if (= speed 3) 64 8)]
       (if (or (< slot 1) (> slot 2)) 0
         (do (dp d 0 slot) (dp d 1 port) (dp d 2 speed) (dp d 8 0) (dp d 9 1)
-            (m64 (+ 2048 (* slot 8)) (address (out-base d)))
+            (m64 (+ 768 (* slot 8)) (address (out-base d)))
             (zero 8192 11264) (mput 8196 3)
             (mput (+ 8192 cs) (+ (* speed 1048576) 134217728))
             (mput (+ 8196 cs) (* port 65536))
@@ -158,7 +159,7 @@
             (if (not (= (command 11 (address 8192) (* slot 16777216)) 1)) 0
               (if (not (= (descriptor d 1 18) 1)) 0
                 (if (not (= (descriptor d 2 9) 1)) 0
-                  (let [total (+ (b 11266) (* (b 11267) 256)) config (b 11269)]
+                  (let [total (+ (b 3202) (* (b 3203) 256)) config (b 3205)]
                     (if (or (< total 9) (> total 512)) 0
                       (if (not (= (descriptor d 2 total) 1)) 0
                         (if (not (= (parse-config d 0 total 0) 1)) 0
@@ -179,20 +180,32 @@
 )
 (defn arm-devices [d]
   (if (>= d (s 18)) 1 (do (arm d) (arm-devices (+ d 1)))))
+(defn clear-pad [i offset]
+  (if (>= offset 4096) 1
+    (do (if (= i 0) (mput (+ 12288 offset) 0)
+          (kernel-store-u32-4k (kernel-owned-window 14 4096) 4096 offset 0))
+        (clear-pad i (+ offset 4)))))
+(defn scratchpads [i]
+  (if (>= i (s 19))
+    (if (> (s 19) 0) (m64 768 (address 896)) 0)
+    (do (clear-pad i 0)
+        (m64 (+ 896 (* i 8)) (if (= i 0) (address 12288) (kernel-owned-window 14 4096)))
+        (scratchpads (+ i 1)))))
 (defn initialize []
-  (let [op (s 4) rt (s 6) hcs2 (reg 8)]
+  (let [op (s 4) rt (s 6) hcs2 (reg 8)
+        pads (+ (bit-and (quot hcs2 134217728) 31) (* (bit-and (quot hcs2 2097152) 31) 32))]
     (if (or (< (bit-and (reg 4) 255) 2) (> (s 5) 16368) (> rt 16320) (> (+ op 1280) 16384)
-            (> (bit-and (quot hcs2 134217728) 31) 0) (> (bit-and (quot hcs2 2097152) 31) 0)) (fail 3)
+            (> pads 2)) (fail 3)
       (do (rput op 0)
           (if (= (wait-reg (+ op 4) 1 1 2000000) 0) (fail 4)
             (do (rput op 2)
                 (if (or (= (wait-reg op 2 0 2000000) 0) (= (wait-reg (+ op 4) 2048 0 2000000) 0)) (fail 5)
                   (if (= (bit-and (reg (+ op 8)) 1) 0) (fail 6)
-                    (do (zero 0 16384) (put 9 0) (put 10 1) (put 11 0) (put 12 1)
-                        (m64 3072 (address 0)) (mput 3080 64)
-                        (r64 (+ op 48) (address 2048)) (r64 (+ op 24) (+ (address 1024) 1))
+                    (do (zero 0 12288) (put 19 pads) (put 9 0) (put 10 1) (put 11 0) (put 12 1)
+                        (m64 832 (address 0)) (mput 840 32) (scratchpads 0)
+                        (r64 (+ op 48) (address 768)) (r64 (+ op 24) (+ (address 512) 1))
                         (rput (+ op 56) 2) (rput (+ rt 40) 1)
-                        (r64 (+ rt 48) (address 3072)) (r64 (+ rt 56) (address 0))
+                        (r64 (+ rt 48) (address 832)) (r64 (+ rt 56) (address 0))
                         (dma/release-fence) (rput op 1)
                         (if (= (wait-reg (+ op 4) 1 0 2000000) 0) (fail 7)
                           (do (put 18 (ports 1 0)) (arm-devices 0) (fail 15))))))))))))
@@ -233,7 +246,7 @@
                      (or (= code 1) (= code 13)))
               (do (dp d 14 (- (ds d 6) (bit-and (s 16) 16777215))) (+ d 1))
               (do (dp d 13 0) 0))))))))
-(defn report-byte [d i] (b (+ 14336 (+ (* d 64) i))))
+(defn report-byte [d i] (b (+ 3072 (+ (* d 64) i))))
 (defn report-kind [d] (ds d 4))
 (defn report-length [d] (ds d 14))
 (defn devices [] (s 18))

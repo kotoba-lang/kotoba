@@ -16,7 +16,8 @@ USB. QEMU's injected keys do not prove human consent or physical hardware.
 
 The bounded host handles two direct-root boot keyboard/mouse interfaces,
 32/64-byte xHCI contexts, command/event/transfer ring cycles and BIOS ownership
-handoff. It refuses scratchpad-requiring controllers, out-of-window registers,
+handoff and up to two 4KiB scratchpad buffers. It refuses controllers requiring
+more than two scratchpads, out-of-window registers,
 non-boot HID, hubs and unhandled descriptors. Modified chords remain unhandled
 by the current lower-case Goal editor. Rollover/error reports and held keys
 are rejected. A modal transition quarantines keyboard reports until release;
@@ -58,8 +59,10 @@ Owned page 9 is reserved for host state, never named by a DMA descriptor:
 | 1536..3583 | draft slot, hash and readback scratch |
 | 3584..3995 | profile 6 NVMe/ESP controller state (words 600..702) |
 
-USB DMA owns pages 0..3, NVMe DMA 4..8, RTL8168 DMA 10..13 and update staging
-14. Browser-context 2048..3071 is crypto scratch. Effects 12800..15943 is
+USB rings and contexts own pages 0..2; scratchpads own pages 3 and 14.
+NVMe DMA owns 4..8 and RTL8168 DMA owns 10..13. Profile 6 refuses signed
+remote update/install commands (5/6), since their staging page 14 belongs to
+xHCI in this profile. Other profiles retain the existing update path. Browser-context 2048..3071 is crypto scratch. Effects 12800..15943 is
 retained draw-list cache, not free scratch. The tests must exercise signing,
 redraw and a subsequent save to catch aliases between these owners.
 
@@ -68,3 +71,15 @@ redraw and a subsequent save to catch aliases between these owners.
 See the source-bound receipt under `docs/evidence/awai120-usb-nvme-state-20261101/`
 for completed checks. Source, QEMU qualification, PR/CI, merge, PXE boot and
 physical-device acceptance are tracked separately in AWAI-120 and AWAI-121.
+
+## 6600H first PXE measurements
+
+The 2026-11-01 candidate completed its one-shot PXE transfer and reached the
+Itonami desktop. NVMe Identify, ESP walking and installed-image hashing passed.
+The first USB driver returned 3 with zero devices. Its successor's capability
+logs identified AMD 1022:161d, HCSPARAMS2 `0x140000f1` (two scratchpads),
+64-byte contexts, doorbells `0x2000` and runtime registers `0x1000`.
+That measured requirement motivated the bounded scratchpad allocation above.
+These measurements do not establish physical keyboard/mouse input or state
+save/restore. See `physical-first-boot.json`; later receipts must record the
+successor's physical results separately.
