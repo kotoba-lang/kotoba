@@ -368,3 +368,11 @@ PXE hub smoke pass. The successor initializes with result15 and receives LE
 advertising events with no transport error. Studio pairing/encryption/input
 remain open, pending the owner's slot4 pairing-mode refresh. This is not a
 firmware RAM readback/attestation or durable bond/reconnect qualification.
+
+
+ATT control successor: allow MTU23 negotiation on the selected connection
+before SMP, while dropping unpaired/unencrypted HID notifications.41-module
+USB/NVMe12, HCI18/HOGP14 native controls and exact PXE hub smoke pass. The
+exact successor is running on6600H with firmware init15 and LE advertising
+ingress. Studio pairing/input still await the owner's slot4 mode refresh;
+this source/native interop change is not a physical Studio input receipt.
