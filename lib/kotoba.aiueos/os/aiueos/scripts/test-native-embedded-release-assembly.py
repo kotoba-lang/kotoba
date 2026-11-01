@@ -13,7 +13,6 @@ sizes. A mutant of the generator must be caught. Observation only.
 """
 
 import argparse
-import os
 from pathlib import Path
 import random
 import subprocess
@@ -81,8 +80,6 @@ def main():
     parser.add_argument("--random", type=int, default=12)
     parser.add_argument("--seed", type=int, default=555)
     args = parser.parse_args()
-    if "AIUEOS_AMU_SOURCE" not in os.environ:
-        raise SystemExit("error: set AIUEOS_AMU_SOURCE to the pinned Amu checkout")
     rng = random.Random(args.seed)
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp)
@@ -104,7 +101,9 @@ def main():
         mutant.write_text(source.replace("(vector-at B (+ i 5))", "(vector-at B (+ i 4))", 1))
         if mutant.read_text() == source:
             raise SystemExit("error: mutant did not apply")
-        kernel, initramfs = files[0]
+        # The first pair with a non-empty kernel: an empty input never reaches
+        # the mutated byte, so the control must use one that does.
+        kernel, initramfs = next(p for p in files if Path(p[0]).stat().st_size > 64)
         if native(work, mutant, kernel, initramfs) == oracle(work, kernel, initramfs):
             raise SystemExit("error: the comparison did not catch the mutant")
         print(f"PASS_NATIVE_EMBEDDED_RELEASE_ASSEMBLY cases={len(files)} mutant=caught")

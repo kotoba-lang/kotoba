@@ -14,7 +14,6 @@ Observation only.
 """
 
 import argparse
-import os
 from pathlib import Path
 import random
 import shutil
@@ -62,8 +61,6 @@ def main():
     parser.add_argument("--random", type=int, default=12)
     parser.add_argument("--seed", type=int, default=555)
     args = parser.parse_args()
-    if "AIUEOS_AMU_SOURCE" not in os.environ:
-        raise SystemExit("error: set AIUEOS_AMU_SOURCE to the pinned Amu checkout")
     rng = random.Random(args.seed)
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp).resolve()
