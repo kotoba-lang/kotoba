@@ -22,11 +22,11 @@
 ;; AWAI-119: context word128 is 1 only in the opt-in debug entry; every
 ;; debug-log is then one RTL8168 broadcast record (tag, value). The default
 ;; entries never set it and send nothing (W8 idle-silent is unchanged).
-;; Because the board's RTL8168 has not yet put a frame on the wire, the debug
-;; entry also draws its progress straight into the GOP framebuffer: one 5x5
-;; square per drawing op on the bottom row (op index = square index), and
-;; the RTL8168 start word (context word130) as 64 squares above it, bit 63
-;; first, green = 1, red = 0. No font, material or blur code is involved.
+;; Before the first frame starts, the debug entry also draws boot progress
+;; directly into GOP: one5x5 square per tag and the RTL8168 start bits.
+;; The first complete frame erases these marks. Later diagnostics use UDP/
+;; DRAM crumbs only: out-of-band GOP writes would invalidate damage/cursor
+;; caches and leave marks that appear/disappear during pointer movement.
 (defn debug-square-row [ctx x y row color]
   (if (>= row 5) 0
     (let [offset (* (+ (* (+ y row) (word ctx 42)) x) 4)
@@ -85,7 +85,7 @@
 (defn debug-log [ctx tag value]
   (if (= (word ctx 128) 1)
     (do (crumb ctx tag value)
-        (if (>= tag 4096)
+        (if (and (>= tag 4096) (= (word ctx 78) 0))
           (do (debug-square-at ctx (- tag 4096) 0 (gop-color ctx 1118481))
               (if (= tag 4097) (debug-bits ctx 0) 0)) 0)
         (dbg/log tag value)) 0))
@@ -721,6 +721,74 @@
           (put-word ctx 30 (+ (word ctx 30) 1))
           (present-ops s font fb fb-bytes ctx)))))
 
+;; JUN-502: retain only the 78 opaque pixels under the canonical12-row arrow.
+;; Effects cache ends15944;16000..16311 is disjoint from blur/audio/ops.
+;; Words58..64: valid,x,y,base-op-count,fast-frames,FB-stores,base-raster-frames.
+(defn cursor-state [i]
+  (word (kernel-subregion (kernel-desktop-effects) 16384 0 8192) i))
+(defn cursor-put [i v]
+  (put-word (kernel-subregion (kernel-desktop-effects) 16384 0 8192) i v))
+(defn cursor-count [x y width height r]
+  (if (or (>= r 12) (>= (+ y r) height)) 0
+    (+ 1 (if (and (>= r 2) (<= r 10) (> (- width x) 1)) 1 0)
+       (cursor-count x y width height (+ r 1)))))
+(defn cursor-rect [s index x y width color]
+  (let [base (+ 480 (* index 6))]
+    (if (and (= (word s base) 1) (= (word s (+ base 1)) x) (= (word s (+ base 2)) y)
+             (= (word s (+ base 3)) width) (= (word s (+ base 4)) 1) (= (word s (+ base 5)) color)) 1 0)))
+(defn cursor-tail [s ctx index x y r]
+  (if (or (>= r 12) (>= (+ y r) (word ctx 41))) (if (= index (word ctx 31)) 1 0)
+    (let [outer (min (+ r 1) (- (word ctx 40) x))
+          inner (if (and (>= r 2) (<= r 10) (> (- (word ctx 40) x) 1)) 1 0)]
+      (if (not (= (cursor-rect s index x (+ y r) outer 1118481) 1)) 0
+        (if (and (= inner 1) (not (= (cursor-rect s (+ index 1) (+ x 1) (+ y r)
+                                  (min (- r 1) (- (word ctx 40) (+ x 1))) 16777215) 1))) 0
+          (cursor-tail s ctx (+ index 1 inner) x y (+ r 1)))))))
+(defn cursor-prefix-same [s index end]
+  (if (>= index end) 1
+    (if (= (op-differs s index 0) 1) 0 (cursor-prefix-same s (+ index 1) end))))
+(defn cursor-pixels [ctx x y phase r c]
+  (if (or (>= r 12) (>= (+ y r) (word ctx 41))) 0
+    (if (> c r) (cursor-pixels ctx x y phase (+ r 1) 0)
+      (do (if (< (+ x c) (word ctx 40))
+            (let [offset (* (+ (* (+ y r) (word ctx 42)) x c) 4)
+                  page (kernel-framebuffer-page (quot offset 4096)) local (mod offset 4096)
+                  saved (+ 16000 (* (+ (quot (* r (+ r 1)) 2) c) 4))
+                  current (kernel-load-u32-4k page 4096 local)]
+              (if (= phase 1)
+                (kernel-store-u32-16k (kernel-desktop-effects) 16384 saved current)
+                (let [color (if (= phase 0) (kernel-load-u32-16k (kernel-desktop-effects) 16384 saved)
+                              (if (and (>= r 2) (<= r 10) (> c 0) (< c r)) 16777215 1118481))]
+                  (if (= current color) 0
+                    (do (kernel-store-u32-4k page 4096 local color)
+                        (cursor-put 63 (+ (cursor-state 63) 1))))))) 0)
+          (cursor-pixels ctx x y phase r (+ c 1))))))
+(defn cursor-debug-tail [s ctx index end]
+  (if (or (>= index end) (>= (word ctx 79) 2)) 0
+    (let [base (+ 480 (* index 6))]
+      (do (debug-log ctx (+ 4096 index)
+            (+ (* (word s base) 72057594037927936) (* (bit-and (word s (+ base 1)) 65535) 1099511627776)
+               (* (bit-and (word s (+ base 2)) 65535) 16777216) (bit-and (word s (+ base 3)) 16777215)))
+          (cursor-debug-tail s ctx (+ index 1) end)))))
+(defn present-composited [s font fb fb-bytes ctx]
+  (let [full (word ctx 31) x (- (word s 2046) 1) y (bit-and (word s 2047) 65535)
+        inside (and (> (word s 2046) 0) (>= x 0) (< x (word ctx 40)) (< y (word ctx 41)))
+        count (if inside (cursor-count x y (word ctx 40) (word ctx 41) 0) 0)
+        base (- full count) tail (if (and inside (>= base 0)) (cursor-tail s ctx base x y 0) 0)
+        fast (and (= tail 1) (= (cursor-state 58) 1) (= (cursor-state 49) 1)
+                  (= (cursor-state 50) 0) (= base (cursor-state 61)) (= (cursor-prefix-same s 0 base) 1))]
+    (do (if (= (cursor-state 58) 1) (cursor-pixels ctx (cursor-state 59) (cursor-state 60) 0 0 0) 0)
+        (cursor-put 58 0)
+        (if fast (cursor-put 62 (+ (cursor-state 62) 1))
+          (do (cursor-put 64 (+ (cursor-state 64) 1))
+              (if (= tail 1) (put-word ctx 31 base) 0)
+              (present-ops s font fb fb-bytes ctx) (put-word ctx 31 full)))
+        (if (= tail 1)
+          (do (cursor-pixels ctx x y 1 0 0) (cursor-debug-tail s ctx base full)
+              (cursor-pixels ctx x y 2 0 0) (cursor-put 59 x) (cursor-put 60 y)
+              (cursor-put 61 base) (cursor-put 58 1)) 0)
+        (put-word ctx 30 full))))
+
 (defn present-frame [s font fb fb-bytes ctx]
   (clock-step ctx)
   (put-word ctx 115 (word ctx 111))
@@ -747,7 +815,7 @@
                        (debug-log ctx 36 (+ (* (word ctx 20) 281474976710656) (* (word ctx 21) 4294967296)
                                             (* (word ctx 22) 65536) (word ctx 23))) 0)
                      (if (and (< (word ctx 20) (word ctx 22)) (< (word ctx 21) (word ctx 23)))
-                       (present-ops s font fb fb-bytes ctx) 0)
+                       (present-composited s font fb fb-bytes ctx) 0)
                      (if (< (word ctx 79) 2) (debug-log ctx 37 (word ctx 30)) 0)
                      (cache-ops s 0 (* (word ctx 31) 6))
                      (let [state (kernel-subregion (kernel-desktop-effects) 16384 0 8192)]

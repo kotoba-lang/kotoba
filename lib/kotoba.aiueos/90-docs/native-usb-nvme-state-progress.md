@@ -496,3 +496,20 @@ request produces an overlapping Yataverse/Itonami screenshot, so intended
 Itonami drag is not independently qualified. Owner reports flicker on
 overlap/icon/pointer movement; compositor repair continues in JUN-502.
 No Apple multitouch/gesture, BT or smoothness qualification is claimed.
+
+
+2026-11-02 JUN-502 cursor flicker candidate: canonical clipped-arrow suffix
+is checked against frame2 ops. When all base ops match, restore/capture only
+78 opaque pixels (312 bytes at effects16000..16311) and redraw the cursor
+without replaying backgrounds/windows. Metadata58..64 is disjoint from
+motion/blur/audio/op cache; compiler/ABI allocation unchanged. Changed scenes
+and forced-full retain the ordinary renderer. Initial equivalence exposed
+4304 differing diagnostic-mark pixels: debug GOP squares now stop when the
+first frame starts, while UDP/DRAM logs remain. This also replaces the stale
+header comment saying RTL8168 wire output was still unconfirmed.
+Native pixel6 validates no base raster for opaque/overlap/edge pointer moves,
+unchanged outside pixels, exact roundtrip and full-raster controls; stores
+were72/156/4 respectively. Dock material equivalence, modal cursor no-approval
+and fresh denial(status3,zero key material) pass. Standard USB/NVMe12 and
+exact PXE USB2-hub smoke pass. Physical flicker/60Hz are not yet qualified;
+this is not a full offscreen or VSync compositor.
