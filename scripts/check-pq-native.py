@@ -124,6 +124,14 @@ X25519 = {'x25519/field.kotoba': 'lib/org.ietf.x25519/kotoba/x25519/field.kotoba
 CHACHA = {f'chacha20/{n}.kotoba': f'lib/org.ietf.chacha20Poly1305/kotoba/chacha20/{n}.kotoba'
           for n in ['core', 'poly1305', 'aead', 'aead_params']}
 MODULE_GATES = {
+    'blake2s': dict(files={
+        'noise/blake2s_native.kotoba': 'lib/kotoba.noise/kotoba/noise/blake2s_native.kotoba',
+        'noise/blake2s_gate.kotoba': 'lib/kotoba.noise/kotoba/noise/blake2s_gate.kotoba'},
+        entry='noise/blake2s_gate.kotoba', passing=31, mutants={
+            'rotation': ('noise/blake2s_native.kotoba', '(bit-xor vb vc2) 7)', '(bit-xor vb vc2) 6)'),
+            'final': ('noise/blake2s_native.kotoba', '(if final (vector-assoc!', '(if false (vector-assoc!'),
+            'long-key': ('noise/blake2s_native.kotoba', '(> (vector-count key) 64)', '(> (vector-count key) 65)')
+        }),
     'x25519': dict(files=dict(X25519, **{'x25519/native_gate.kotoba': 'lib/org.ietf.x25519/kotoba/x25519/native_gate.kotoba'}),
                    gate_ns='x25519.native-gate', groups={'a': 15, 'b': 7, 'c': 15}, mutants={
         'a24': ('x25519/core.kotoba', '0 121665))', '0 121666))'),
@@ -149,16 +157,18 @@ MODULE_GATES = {
     'noise': dict(files=dict(X25519, **CHACHA, **{'sha2/core.kotoba': 'lib/gov.nist.sha2/kotoba/sha2/core.kotoba',
                                                   'sha3/core.kotoba': SHA3, 'mlkem/core.kotoba': 'lib/gov.nist.mlKem/kotoba/mlkem/core.kotoba',
                                                   'noise/native.kotoba': 'lib/kotoba.noise/kotoba/noise/native.kotoba',
+                                                  'noise/blake2s_native.kotoba': 'lib/kotoba.noise/kotoba/noise/blake2s_native.kotoba',
                                                   'noise/native_gate.kotoba': 'lib/kotoba.noise/kotoba/noise/native_gate.kotoba'}),
-                  gate_ns='noise.native-gate', groups={g: 31 for g in ['nn-i', 'nn-r', 'xx-i', 'xx-r', 'ik-i', 'ik-r']}, mutants={
-        'hkdf': ('noise/native.kotoba', '(h/hmac-sha256 temp (cat o1 (vector-i64 2)))', '(h/hmac-sha256 temp (cat o1 (vector-i64 3)))'),
+                  gate_ns='noise.native-gate', groups={g: 31 for g in ['nn-i', 'nn-r', 'xx-i', 'xx-r', 'ik-i', 'ik-r', 'ikb-i', 'ikb-r']}, mutants={
+        'hkdf': ('noise/native.kotoba', '(mac pattern temp (cat o1 (vector-i64 2)))', '(mac pattern temp (cat o1 (vector-i64 3)))'),
         'esse': ('noise/native.kotoba', '(= token 4) (if init (x/x25519-bytes e rs) (x/x25519-bytes s re))',
                  '(= token 4) (if init (x/x25519-bytes s re) (x/x25519-bytes e rs))'),
-        'premsg': ('noise/native.kotoba', '(if (= pattern 2) (mix-hash st5', '(if false (mix-hash st5'),
+        'premsg': ('noise/native.kotoba', '(if (or (= pattern 2) (= pattern 4)) (mix-hash st5', '(if false (mix-hash st5'),
     }),
     'xxhfs': dict(files=dict(X25519, **CHACHA, **{'sha2/core.kotoba': 'lib/gov.nist.sha2/kotoba/sha2/core.kotoba',
                                                   'sha3/core.kotoba': SHA3, 'mlkem/core.kotoba': 'lib/gov.nist.mlKem/kotoba/mlkem/core.kotoba',
                                                   'noise/native.kotoba': 'lib/kotoba.noise/kotoba/noise/native.kotoba',
+                                                  'noise/blake2s_native.kotoba': 'lib/kotoba.noise/kotoba/noise/blake2s_native.kotoba',
                                                   'noise/xxhfs_gate.kotoba': 'lib/kotoba.noise/kotoba/noise/xxhfs_gate.kotoba'}),
                   gate_ns='noise.xxhfs-gate', groups={'i': 63, 'r': 63}, mutants={
         'w-mixkey': ('noise/native.kotoba', '(recur (+ i 1) (mix-key (slice o 0 1646) (slice kc 0 32))', '(recur (+ i 1) (slice o 0 1646)'),
@@ -171,6 +181,7 @@ MODULE_GATES = {
                                                      'mldsa/core.kotoba': 'lib/gov.nist.mlDsa/kotoba/mldsa/core.kotoba',
                                                      'ed25519/selfhost.kotoba': 'lib/org.ietf.ed25519/kotoba/ed25519/selfhost.kotoba',
                                                      'noise/native.kotoba': 'lib/kotoba.noise/kotoba/noise/native.kotoba',
+                                                  'noise/blake2s_native.kotoba': 'lib/kotoba.noise/kotoba/noise/blake2s_native.kotoba',
                                                      'noise/identity.kotoba': 'lib/kotoba.noise/kotoba/noise/identity.kotoba',
                                                      'noise/identity_gate.kotoba': 'lib/kotoba.noise/kotoba/noise/identity_gate.kotoba'}),
                      gate_ns='noise.identity-gate', groups={'i': 127, 'r': 127}, mutants={
