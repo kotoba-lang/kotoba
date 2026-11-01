@@ -440,3 +440,15 @@ Physical pairing/input remain open: owner reports slot4 fast blue, while
 received friendly names currently include Studio1/3. No other slot is selected.
 An in-place re-probe during scan fails reset-response18; a clean one-shot
 PXE boot restores RF scanning instead. No firmware flash or OS install.
+
+
+Studio selection correction: the older name-match allowed an unnumbered
+11-byte HHKB-Studio name despite the intended slot4-only policy. It now
+requires suffix4 (optional zero padding) and rejects other/missing slots.
+Native name6 controls and the exact PXE root-keyboard/hub-mouse smoke pass.
+Public diagnostics retain the HHKB-prefix advertiser address/type/event so
+slot display/name discrepancies can be compared without dumping packets or
+keys. This v3 source candidate is not yet booted on6600H; v2 keeps scanning.
+Owner confirms Control/Command remapping; retry using assigned Control
+was requested, with no reset or keymap modification. Actual link/input
+qualification still requires authenticated selected-slot hardware evidence.
