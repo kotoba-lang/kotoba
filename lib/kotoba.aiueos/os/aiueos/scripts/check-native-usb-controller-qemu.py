@@ -31,6 +31,9 @@ def main(a):
            '-drive', f'file={a.media},format=raw,if=ide,snapshot=on', '-boot', 'order=c',
            '-device', 'qemu-xhci,id=empty', '-device', 'qemu-xhci,id=hid',
            '-device', 'usb-kbd,bus=hid.0,port=1', '-device', 'usb-mouse,bus=hid.0,port=2',
+           '-device', 'qemu-xhci,id=ss',
+           '-drive', f'if=none,id=stick,format=raw,readonly=on,file={a.media}',
+           '-device', 'usb-storage,bus=ss.0,port=1,drive=stick',
            '-nic', 'none', '-display', 'none', '-no-reboot', '-serial', 'none',
            '-debugcon', f'file:{debug}', '-monitor', 'stdio']
     (out / 'command.json').write_text(json.dumps(cmd, indent=2) + '\n')
@@ -64,7 +67,7 @@ def main(a):
                 'checks': ['initial fallback HID', 'two initial HID', 'out-of-range refusal',
                            'non-xHCI refusal', 'refusals retain HID count', 'select empty host',
                            'reselect HID host', 'draft range retained', 'NVMe state range retained', 'failed host refuses DMA reuse',
-                           'HCI18 framing vectors', 'non-Bluetooth probe refused', 'large HCI complete accepted', 'oversized HCI complete refused', 'HOGP14 native keyboard report/admission refusals', 'mouse16 descriptor/decode controls', 'mouse8 encrypted-handle admission controls', 'LE6 non-flushable ACL header controls', 'USB OUT buffer rejects writes while device owns it', 'SMP10 passkey method/feature rejection controls', 'legacy c1 p1/p2 wire-endian layout against Core sample', 'Studio4 name6 controls reject other slots and missing suffix'],
+                           'HCI18 framing vectors', 'non-Bluetooth probe refused', 'large HCI complete accepted', 'oversized HCI complete refused', 'HOGP14 native keyboard report/admission refusals', 'mouse16 descriptor/decode controls', 'mouse8 encrypted-handle admission controls', 'LE6 non-flushable ACL header controls', 'USB OUT buffer rejects writes while device owns it', 'SMP10 passkey method/feature rejection controls', 'legacy c1 p1/p2 wire-endian layout against Core sample', 'Studio4 name6 controls reject other slots and missing suffix', 'SS8 descriptor-only root probe and endpoint0 exponent refusals; HID reselect; media unchanged'],
                 'artifacts': {n: pin(getattr(a, n)) for n in ('efi', 'kernel', 'media', 'qemu', 'firmware')},
                 'observer': pin(Path(__file__)), 'physicalHardware': False,
                 'BluetoothTransportQualified': False, 'simultaneousHosts': False,

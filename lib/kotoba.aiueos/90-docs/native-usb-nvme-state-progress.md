@@ -467,3 +467,18 @@ After the owner's actual u+pointing-stick action, Goal remainsaba and the
 visible pointer position is unchanged. This does not establish a parser
 fault: the HHKB data connection itself is not yet identified. A single
 HHKB-side USB-C reconnect was requested; no forced USB/keymap reset.
+
+
+After the owner replugged Studio USB-C, the four external-port controller
+selections still show the same USB2 topology;0504 is restored for the
+existing keyboard. A known data-capable cable check is pending, without
+assuming a defective cable. The remaining connected SuperSpeed root5
+was not identified by the old high-speed-only driver. A bounded native
+USB3 descriptor-only probe now checks Supported Protocol/root range/SlotType0,
+sets512-byte EP0 and validates exponent9 plus USB3 header. It records VID/PID
+and device class, then refuses configuration/input and disables the slot
+(stage35). Diagnostic field2 bit31 marks a device-class tuple, field3=bcdUSB.
+QEMU read-only5000Mb/s USB MSD validates SS8, EP0 packet8, draft/NVMe marker
+preservation and HID return (aggregateffff).43-module native kernel/EFI,
+standard USB/NVMe12 and exact PXE USB2-hub smoke pass. Physical probe/input
+remain pending; this does not add USB3 hub downstream or USB3 HID support.
