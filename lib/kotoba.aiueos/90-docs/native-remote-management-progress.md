@@ -34,3 +34,18 @@ macOS-style update choices/notification, OS-native SSH, and Kekkai app
 installation on both the Mac and6600H (JUN-757). The source-bound native
 input-maintenance candidate is still under verification; no NVMe OS update
 or new physical candidate has been installed by this unit.
+
+
+2026-11-02 native update maintenance candidate: run-update stops the active
+non-radio xHCI and observes HCHalted before borrowing scratchpad14. Context
+3072..3711 is copied into stopped USB memory0..639, restored before selecting
+the same host again. Pending modals/missing or failed hosts/radio refuse the
+borrow. Public key/fixture constants are word-packed without byte changes.
+Standard USB/NVMe12 and exact PXE hub smoke pass. The native component'sff
+mask exercises8 controls, including changed signature/digest, all1024 public
+key/app-pattern bytes retained and actual keyboard/mouse input after USB
+reinitialization. The fixture needs the complete ValueRuntime root/caller
+region anchors and a real524KiB font payload; early refused roots and the
+no-payload boot failure remain recorded. Final source reproduces the exact
+tested product ELF/EFI. Version floor remains>=1 in this unit: automatic
+installation is not enabled yet. No physical ESP update in this unit.
