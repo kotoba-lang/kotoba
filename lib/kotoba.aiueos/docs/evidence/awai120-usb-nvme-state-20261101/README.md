@@ -17,3 +17,8 @@ qualify 6600H, hubs, wireless receivers, Bluetooth, canonical D2, encrypted
 backup, physical power-loss safety or a production release. Full local build
 outputs remain in the task workspace; no private dependency source or key is
 included in this evidence directory.
+
+`pxe-candidate.json` records the separate netlog/watchdog loader variant. It
+passed a USB-input QEMU smoke and is queued for one PXE boot using the existing
+server control; the prior fallback image is unchanged. There is no `--install`
+flag and no physical boot or disk modification was observed.
