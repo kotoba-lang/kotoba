@@ -303,3 +303,13 @@ a6600H bond or wireless input success. No further USB switching or reset
 of Studio configuration was requested. The ROM candidate's native control/
 framing fixtures, USB/NVMe twelve observations and exact PXE hub smoke pass;
 its physical query is recorded separately after deployment.
+
+The ROM successor passed on the physical6600H. Its guarded0xfc6d command
+returned a successful7-byte Command Complete and ROM eco0. The firmware
+selector will therefore require chip ID1, subject to vendor artifact and
+project checks. Native packet mask0x3fff also passed. Returning to05:00.4
+reaccepted keyboard1c4f:0002, retained Goal `aba`, and reported its five root
+ports and four hub-port snapshots. See `physical-rtl-rom.json`; the USB3
+root-port refusal remains distinct from Studio's confirmed BT target3 mode.
+The shared logger was not growing, so the actual signed client's responses
+were saved directly. No firmware binary was acquired/loaded or pairing done.
