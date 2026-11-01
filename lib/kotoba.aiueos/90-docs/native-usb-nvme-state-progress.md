@@ -271,3 +271,35 @@ Linux RTL8851B USB firmware-family entry. No firmware was downloaded/loaded.
 Returning to05:00.4 reaccepted the original keyboard and retained Goal `aba`.
 See `physical-hci-control.json`. ACL, LE/SMP/ATT/GATT/HOGP, explicit pairing,
 protected bonds and actual wireless input remain unimplemented/unqualified.
+
+## HHKB Studio and ROM selection follow-up
+
+The owner identified the keyboard as HHKB Studio and reported that
+Fn+Control+0 did not switch its connection. Treat its active transport as
+unconfirmed; no USB-mode or HHKB-input acceptance follows from the cable.
+PFU's Studio FAQ documents Fn+V LED diagnostics (final blue4=USB, blue1=BT),
+which was requested without changing its keymap. The forced USB procedure
+can erase mappings on older firmware and has not been attempted. Studio's
+official specification declares Bluetooth5.0 LE/HOGP. Sources:
+https://faq.pfu.jp/faq/show/7987?site_domain=hhkb and
+https://happyhackingkb.com/manual/studio/ug-jis/jp/ug/topic/specification.html .
+
+The HCI probe now adds Read ROM Version0xfc6d only for VID:PID0bda:b850
+and the observed HCI/manufacturer/LMP tuple. The seventh response byte is
+the eco version used to select a firmware patch. Other controllers receive
+no vendor opcode. c19d/c19e report its result and eco; phase20 means ROM
+query failure. Base version fields remain valid when c191=c192=1, including
+when the later ROM query fails. No firmware is downloaded or loaded here.
+The framing self-check has14 positive/refusal vectors (mask0x3fff).
+
+Signed USB/BT probes also report per-port enumeration snapshots in
+c1a0..c1bf and hub-port snapshots in c1c0..c1cf before their completion tag.
+Accepted-device count alone cannot establish that an external link was
+absent: these fields retain reset/address/configuration failures separately.
+
+The owner then reported one final blue LED at position3 for Fn+V. Per the
+Studio guide, record Bluetooth target slot3 as selected, without inferring
+a6600H bond or wireless input success. No further USB switching or reset
+of Studio configuration was requested. The ROM candidate's native control/
+framing fixtures, USB/NVMe twelve observations and exact PXE hub smoke pass;
+its physical query is recorded separately after deployment.

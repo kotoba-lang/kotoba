@@ -155,7 +155,7 @@ def main():
         done = 0xC007 if args.command == "usb-select" else 0xC008
         send(args, seed, nonce, counter, 7 if args.command == "usb-select" else 8, slot)
         for tag, value in records(log, time.monotonic() + args.wait):
-            if tag in (done, 0xC0FF) or 0xC170 <= tag <= 0xC172 or 0xC180 <= tag <= 0xC19C:
+            if tag in (done, 0xC0FF) or 0xC170 <= tag <= 0xC172 or 0xC180 <= tag <= 0xC1CF:
                 print(f"{tag:04x} {value:016x}", flush=True)
             if tag in (done, 0xC0FF):
                 break
