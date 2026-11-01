@@ -261,3 +261,13 @@ selection;18/19 mean Reset/version failure. Negative operation results in
 u32 diagnostic words use their low32-bit two's-complement encoding.
 No ACL, scan, connection, pairing, firmware download or bond key is sent.
 This HCI identification path does not yet implement HOGP keyboard/mouse input.
+
+The HCI successor completed its physical PXE boot. On Realtek `0bda:b850`,
+Reset and Read Local Version both passed through EP0 and interrupt-IN0x81
+(MPS16, interval1). It returned HCI version0x0c/revision0x000b, LMP
+version0x0c/subversion0x8851 and manufacturer0x005d; the final Command Complete
+was14 bytes, opcode0x1001, status0. The measured tuple matches the pinned
+Linux RTL8851B USB firmware-family entry. No firmware was downloaded/loaded.
+Returning to05:00.4 reaccepted the original keyboard and retained Goal `aba`.
+See `physical-hci-control.json`. ACL, LE/SMP/ATT/GATT/HOGP, explicit pairing,
+protected bonds and actual wireless input remain unimplemented/unqualified.
