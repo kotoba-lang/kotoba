@@ -513,3 +513,12 @@ were72/156/4 respectively. Dock material equivalence, modal cursor no-approval
 and fresh denial(status3,zero key material) pass. Standard USB/NVMe12 and
 exact PXE USB2-hub smoke pass. Physical flicker/60Hz are not yet qualified;
 this is not a full offscreen or VSync compositor.
+
+
+Cursor candidate7f3c0d450 was served one-shot over the preserved PXE path
+(EFI28882576d44bf40760cf81ad4ebabd8fb12ea25bfb70e6c1c41535ce29380854).
+New boot nonce15d645da047583d7;05ac:0324 re-enumerates behind0504 USB2
+hub with existing keyboard, HID count2. Itonami/Yataverse overlap is prepared
+and the screenshot no longer contains boot diagnostic dots/bands. Owner
+feedback on actual overlap/Dock movement flicker is pending; a still image
+and native pixel equivalence do not qualify temporal smoothness.
