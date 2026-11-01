@@ -29,6 +29,31 @@ job must not mark these acceptance criteria Done. Legacy JVM/JS lint, Q9,
 runtime-values, SDK packaging, library and package admission jobs no longer
 run in CI; preserve their fixtures while porting their checks to native code.
 
+## AIUEOS UEFI image gate (JUN-709)
+
+Owner decision 2026-11-01: the AIUEOS image CI job lives in this repository.
+kotoba-lang/aiueos dropped its image CI in #491 and has had no `os/` tree since
+#536, so the `aiueos-uefi` job in `native-shared.yml` is the only CI that builds
+and boots `lib/kotoba.aiueos`. It runs on push to main, the nightly schedule and
+workflow_dispatch, not on pull requests (PR tiering is JUN-629), on
+`ubuntu-24.04-arm`: `scripts/fetch-native-amu.sh`, Zig 0.15.2 from ziglang.org
+checked against its sha256, apt `qemu-system-x86` and `ovmf`, `build-uefi.sh`,
+`smoke-qemu-uefi.sh` (default profile, `AIUEOS_UEFI_SMOKE_OK`), `smoke-qemu-multiboot.sh`
+(the `build-multiboot.sh` link and a QEMU multiboot boot), and a negative
+control (`AIUEOS_CORRUPT_KERNEL=1`: the loader must refuse with
+`AIUEOS_LOADER_FAIL kernel-sha256` and the success marker must be absent).
+The native generators run with seccomp enforced (`AIUEOS_NATIVE_SECCOMP` unset).
+The image sha256 lines, the plain-build images, timings and the host record are
+uploaded as `aiueos-uefi-linux-arm64`.
+
+The image bytes depend on the Zig build: the official ziglang.org 0.15.2 gives
+the same KERNEL.ELF/BOOTX64.EFI on the runner, linux/arm64 podman and macOS
+arm64, while Homebrew's zig 0.15.2 gives different bytes. Compare hashes only
+against the official build. Not covered: the `AIUEOS_PLC_RT_SMOKE=1` profile
+(its program builder `build-plc-native-program.sh` needs the macOS Amu root),
+the GRUB multiboot smoke, the x86_64 Linux host build, release media and
+physical hardware.
+
 ## JUN-93 shared native text
 
 The canonical text owner is lib/kotoba.text; kotoba-lang/text is archived.
