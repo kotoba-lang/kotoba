@@ -77,6 +77,8 @@ def main(args):
                  "-drive", f"if=pflash,format=raw,file={variables}",
                  "-drive", f"file={target},format=raw,if=none,id=nv0,cache=directsync",
                  "-device", "nvme,serial=AWAI120STATE,drive=nv0"]
+        if usb == "second":
+            extra += ["-device", "qemu-xhci,id=empty"]
         if usb:
             extra += ["-device", "qemu-xhci,id=usb", "-device", "usb-kbd,bus=usb.0,port=1",
                       "-device", "usb-mouse,bus=usb.0,port=2"]
@@ -239,6 +241,19 @@ def main(args):
         active.quit()
         active = None
         events.append(dict(name="usb-absent-no-input"))
+        # A first controller with no HID must halt before the shared DMA
+        # pages are assigned to a second controller carrying both devices.
+        active = boot("second-controller", usb="second")
+        active.send("sendkey 2", 1)
+        before = active.W(73)
+        active.send("sendkey c", 1)
+        assert active.S(2) == 2 and active.W(73) == before + 1
+        x, y = active.W(50), active.W(51)
+        active.send("mouse_move 7 5", 1)
+        assert (active.W(50), active.W(51)) == (x + 7, y + 5)
+        active.quit()
+        active = None
+        events.append(dict(name="empty-first-controller-halted-second-hid-active"))
         assert pin(Path(__file__)) == observer, "observer source changed during the run"
         status = "PASS_NATIVE_USB_HID_NVME_STATE_QEMU"
     except BaseException:

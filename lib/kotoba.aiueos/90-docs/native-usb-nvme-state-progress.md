@@ -16,7 +16,11 @@ USB. QEMU's injected keys do not prove human consent or physical hardware.
 
 The bounded host handles two direct-root boot keyboard/mouse interfaces,
 32/64-byte xHCI contexts, command/event/transfer ring cycles and BIOS ownership
-handoff and up to two 4KiB scratchpad buffers. It refuses controllers requiring
+handoff and up to two 4KiB scratchpad buffers. If the first controller
+initializes but accepts no HID, it is halted before the next controller is
+tried with the shared DMA memory. At most two controllers are tried; devices
+across two simultaneously active controllers are not supported. Per-host port
+state and enumeration-stage diagnostics distinguish empty ports from failures. It refuses controllers requiring
 more than two scratchpads, out-of-window registers,
 non-boot HID, hubs and unhandled descriptors. Modified chords remain unhandled
 by the current lower-case Goal editor. Rollover/error reports and held keys
@@ -83,3 +87,11 @@ That measured requirement motivated the bounded scratchpad allocation above.
 These measurements do not establish physical keyboard/mouse input or state
 save/restore. See `physical-first-boot.json`; later receipts must record the
 successor's physical results separately.
+
+The scratchpad successor subsequently initialized on the 6600H (`c140=15`)
+but reported zero accepted HID devices. The owner confirms wired USB devices
+are connected directly. Signed debug keys independently verified NVMe Goal
+`aba` save and restore across two CF9 resets; an unsaved `z` was discarded.
+The actual saved/restored Goal pixel regions match. This is hardware-reset
+Goal persistence, not physical HID input, full power loss, or physical
+key/outbox restoration. See `physical-goal-restore.json` and its five frames.

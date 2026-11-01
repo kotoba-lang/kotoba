@@ -8,7 +8,7 @@
   ;; non-boot HID and devices above high speed. Those are explicit follow-ups.
   (:require [capability.dma.map :as dma]
             [aiueos.native.usb-hid :as hid])
-  (:export [start poll report-byte report-length report-kind acknowledge result next-key devices quarantine self-check diagnostic]))
+  (:export [start poll report-byte report-length report-kind acknowledge result next-key devices quarantine self-check diagnostic attempts controller-diagnostic port-state port-stage]))
 
 (defn s [i] (kernel-load-u32-4k (kernel-owned-window 9 4096) 4096 (* i 4)))
 (defn put [i v] (kernel-store-u32-4k (kernel-owned-window 9 4096) 4096 (* i 4) v))
@@ -40,6 +40,21 @@
 (defn fail [code] (do (put 0 code) code))
 (defn result [] (s 0))
 (defn diagnostic [i] (if (and (>= i 0) (< i 8)) (s (+ 24 i)) 0))
+(defn attempts [] (s 32))
+(defn record-base [host] (+ 128 (* host 56)))
+(defn controller-diagnostic [host i]
+  (if (and (>= host 0) (< host (s 32)) (>= i 0) (< i 8)) (s (+ (record-base host) i)) 0))
+(defn port-word [host port i]
+  (if (and (>= host 0) (< host (s 32)) (>= port 1) (<= port 16))
+    (s (+ (record-base host) (+ 8 (+ (* (- port 1) 3) i)))) 0))
+(defn port-state [host port]
+  (+ (port-word host port 0) (* (port-word host port 1) 4294967296)))
+(defn port-stage [host port] (port-word host port 2))
+(defn port-put [port i v]
+  (put (+ (record-base (- (s 32) 1)) (+ 8 (+ (* (- port 1) 3) i))) v))
+(defn record-capabilities [i]
+  (if (>= i 8) 1
+    (do (put (+ (record-base (- (s 32) 1)) i) (s (+ 24 i))) (record-capabilities (+ i 1)))))
 (defn self-check [] (hid/self-check))
 (defn legacy-handoff [off remaining]
   (if (= off 0) 1
@@ -144,10 +159,12 @@
         (mput (+ ep 16) (+ 8 (* (ds d 6) 65536)))
         (if (= (command 12 (address 8192) (* (ds d 0) 16777216)) 1)
           (do (dp d 10 0) (dp d 11 1) (dp d 13 1) 1) 0))))
+(defn enum-fail [d stage]
+  (do (dp d 16 (+ stage (* (quot (s 16) 16777216) 256))) 0))
 (defn enumerate [d port speed]
-  (if (not (= (command 9 0 0) 1)) 0
+  (if (not (= (command 9 0 0) 1)) (enum-fail d 1)
     (let [slot (quot (s 17) 16777216) cs (s 7) mps (if (= speed 3) 64 8)]
-      (if (or (< slot 1) (> slot 2)) 0
+      (if (or (< slot 1) (> slot 2)) (enum-fail d 2)
         (do (dp d 0 slot) (dp d 1 port) (dp d 2 speed) (dp d 8 0) (dp d 9 1)
             (m64 (+ 768 (* slot 8)) (address (out-base d)))
             (zero 8192 11264) (mput 8196 3)
@@ -156,25 +173,30 @@
             (mput (+ 8192 (* cs 2) 4) (+ 38 (* mps 65536)))
             (m64 (+ 8192 (* cs 2) 8) (+ (address (ep-ring d 0)) 1))
             (mput (+ 8192 (* cs 2) 16) 8)
-            (if (not (= (command 11 (address 8192) (* slot 16777216)) 1)) 0
-              (if (not (= (descriptor d 1 18) 1)) 0
-                (if (not (= (descriptor d 2 9) 1)) 0
+            (if (not (= (command 11 (address 8192) (* slot 16777216)) 1)) (enum-fail d 3)
+              (if (not (= (descriptor d 1 18) 1)) (enum-fail d 4)
+                (if (not (= (descriptor d 2 9) 1)) (enum-fail d 5)
                   (let [total (+ (b 3202) (* (b 3203) 256)) config (b 3205)]
-                    (if (or (< total 9) (> total 512)) 0
-                      (if (not (= (descriptor d 2 total) 1)) 0
-                        (if (not (= (parse-config d 0 total 0) 1)) 0
-                          (if (not (= (control d (setup-value 2304 config 0 0) 0 0) 1)) 0
-                            (if (not (= (control d (setup-value 2849 0 (ds d 7) 0) 0 0) 1)) 0
-                              (configure d)))))))))))))))
+                    (if (or (< total 9) (> total 512)) (enum-fail d 6)
+                      (if (not (= (descriptor d 2 total) 1)) (enum-fail d 7)
+                        (if (not (= (parse-config d 0 total 0) 1)) (enum-fail d 8)
+                          (if (not (= (control d (setup-value 2304 config 0 0) 0 0) 1)) (enum-fail d 9)
+                            (if (not (= (control d (setup-value 2849 0 (ds d 7) 0) 0 0) 1)) (enum-fail d 10)
+                              (if (= (configure d) 1) (do (dp d 16 15) 1) (enum-fail d 11))))))))))))))))
 (defn ports [port devices]
   (if (or (> port (s 8)) (>= devices 2)) devices
-    (let [off (+ (s 4) (+ 1024 (* (- port 1) 16))) val (reg off)]
+    (let [off (+ (s 4) (+ 1024 (* (- port 1) 16)))
+          val (+ (reg off) (* 0 (do (dp devices 0 0) (dp devices 16 0))))
+          logged (port-put port 0 val)]
       (if (= (bit-and val 1) 0) (ports (+ port 1) devices)
         (do (rput off (+ (bit-and val 3584) 16))
-            (if (= (wait-reg off 18 2 2000000) 0) (ports (+ port 1) devices)
+            (if (= (wait-reg off 18 2 2000000) 0)
+              (do (port-put port 1 (reg off)) (port-put port 2 16) (ports (+ port 1) devices))
               (let [speed (bit-and (quot (reg off) 1024) 15)]
                 (let [ok (if (and (>= speed 1) (<= speed 3)) (enumerate devices port speed) 0)]
-                  (do (if (and (= ok 0) (> (ds devices 0) 0))
+                  (do (port-put port 1 (reg off))
+                      (port-put port 2 (if (and (>= speed 1) (<= speed 3)) (ds devices 16) 17))
+                      (if (and (= ok 0) (> (ds devices 0) 0))
                         (command 10 0 (* (ds devices 0) 16777216)) 0)
                       (ports (+ port 1) (+ devices ok))))))))))
 )
@@ -194,7 +216,7 @@
 (defn initialize []
   (let [op (s 4) rt (s 6) hcs2 (reg 8)
         pads (+ (bit-and (quot hcs2 134217728) 31) (* (bit-and (quot hcs2 2097152) 31) 32))]
-    (if (or (< (bit-and (reg 4) 255) 2) (> (s 5) 16368) (> rt 16320) (> (+ op 1280) 16384)
+    (if (or (< (bit-and (reg 4) 255) 2) (> (s 8) 16) (> (s 5) 16368) (> rt 16320) (> (+ op 1280) 16384)
             (> pads 2)) (fail 3)
       (do (rput op 0)
           (if (= (wait-reg (+ op 4) 1 1 2000000) 0) (fail 4)
@@ -212,9 +234,7 @@
 (defn clear-state [i]
   (if (>= i 1536) 1
     (do (kernel-store-u32-4k (kernel-owned-window 9 4096) 4096 i 0) (clear-state (+ i 4)))))
-(defn start []
-  (let [cleared (clear-state 0)
-        slot (+ (find 0) (* cleared 0))]
+(defn start-controller [slot]
     (if (< slot 0) (fail 1)
       (let [bar (pci slot 16) hi (if (= (bit-and bar 6) 4) (pci slot 20) 0)]
         (if (or (and (= (bit-and bar 4294967280) 0) (= hi 0)) (not (= (bit-and bar 1) 0)) (>= hi 128)) (fail 2)
@@ -229,7 +249,22 @@
               (put 24 (reg 0)) (put 25 (reg 4)) (put 26 (reg 8))
               (put 27 (reg 16)) (put 28 (s 5)) (put 29 (s 6))
               (put 30 slot) (put 31 (pci slot 0))
-              (if (= (legacy-handoff (* (quot (reg 16) 65536) 4) 32) 1) (initialize) (fail 8))))))))
+              (record-capabilities 0)
+              (if (= (legacy-handoff (* (quot (reg 16) 65536) 4) 32) 1) (initialize) (fail 8)))))))
+(defn clear-devices [i]
+  (if (>= i 128) 1 (do (put i 0) (clear-devices (+ i 1)))))
+(defn start-from [slot host]
+  (do (put 32 (+ host 1)) (put 18 0) (clear-devices 64)
+      (let [r (start-controller slot) next (if (= host 0) (find (+ slot 1)) -1)]
+        (if (and (= r 15) (= (s 18) 0) (>= next 0))
+          ;; Never point a second controller at memory still owned by a
+          ;; running first controller. A failed halt stops the search.
+          (do (rput (s 4) 0)
+              (if (= (wait-reg (+ (s 4) 4) 1 1 2000000) 1)
+                (start-from next (+ host 1)) (fail 4))) r))))
+(defn start []
+  (let [cleared (clear-state 0) slot (+ (find 0) (* cleared 0))]
+    (if (< slot 0) (fail 1) (start-from slot 0))))
 
 ;; poll returns device index+1 for a completed HID report. Acknowledge only
 ;; after the desktop has consumed it; errors never become input events.

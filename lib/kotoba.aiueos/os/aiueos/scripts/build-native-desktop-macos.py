@@ -344,7 +344,7 @@ def main(args):
                            else 4 if args.profile == "ed25519"
                            else 16 if args.profile == "keystore"
                            else 11 if args.profile == "dapps"
-                           else 10 if args.profile == "input-state"
+                           else 11 if args.profile == "input-state"
                            else 7 if args.profile == "nvme"
                            else 2 if args.profile in ("cid", "sha512", "gf25519", "keyseal") else 24)
         if (observed["status"] != expected_status
