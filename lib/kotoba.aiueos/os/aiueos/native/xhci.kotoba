@@ -9,7 +9,7 @@
   (:require [capability.dma.map :as dma]
             [aiueos.native.usb-hid :as hid]
             [aiueos.native.bluetooth-hci :as hci])
-  (:export [start poll report-byte report-length report-kind acknowledge result next-key devices quarantine self-check diagnostic attempts controller-diagnostic port-state port-stage device-diagnostic hub-ports hub-port-state hub-port-stage next-controller inventory select-controller probe-bluetooth bluetooth-diagnostic]))
+  (:export [start poll report-byte report-length report-kind acknowledge result next-key devices quarantine self-check diagnostic attempts controller-diagnostic port-state port-stage device-diagnostic hub-ports hub-port-state hub-port-stage next-controller inventory select-controller probe-bluetooth bluetooth-diagnostic ble-start ble-command ble-param ble-poll ble-byte ble-length ble-release ble-tx ble-send ble-state ble-put ble-diagnostic recovery]))
 
 (defn s [i] (kernel-load-u32-4k (kernel-owned-window 9 4096) 4096 (* i 4)))
 (defn put [i v] (kernel-store-u32-4k (kernel-owned-window 9 4096) 4096 (* i 4) v))
@@ -124,11 +124,27 @@
             (put 11 next) (if (= next 0) (put 12 (- 1 (s 12))) 0)
             (r64 (+ (s 6) 56) (+ (address (+ 10816 (* next 16))) 8))
             (bit-and (quot ctl 1024) 63))))))
+;; Full Bluetooth transport owns unused contexts only after single-device
+;; admission. Cached completions are not rearmed until their consumer releases.
+(defn bt-save [kind]
+  (if (and (= kind 32) (= (s 50) 1) (= (quot (s 17) 16777216) (s 64)))
+    (let [off (s 14) high (s 15) code (quot (s 16) 16777216)
+          ep (bit-and (quot (s 17) 65536) 31)
+          ch (if (and (= off (bit-and (address (s 54)) 4294967295))
+                      (= high (u64-shift-right (address (s 54)) 32)) (= ep (s 67))) 0
+               (if (and (= off (bit-and (address (s 55)) 4294967295))
+                        (= high (u64-shift-right (address (s 55)) 32)) (= ep (s 88))) 1
+                 (if (and (= off (bit-and (address (s 56)) 4294967295))
+                          (= high (u64-shift-right (address (s 56)) 32)) (= ep (s 90))) 2 -1)))]
+      (if (< ch 0) 0
+        (if (or (= code 1) (= code 13))
+          (do (put (+ 51 ch) (if (= ch 2) 1 (+ 1 (- 512 (bit-and (s 16) 16777215))))) 1)
+          (do (put 59 code) (put (+ 51 ch) 1024) 0)))) 0))
 (defn wait-event [kind ptr fuel]
   (let [got (event)]
     (if (and (= got kind) (= (s 14) (bit-and ptr 4294967295)) (= (s 15) (u64-shift-right ptr 32)))
       (quot (s 16) 16777216)
-      (if (= fuel 0) -1 (do (kernel-pause) (wait-event kind ptr (- fuel 1)))))))
+      (if (= fuel 0) -1 (do (bt-save got) (kernel-pause) (wait-event kind ptr (- fuel 1)))))))
 (defn trb [off parameter status ctl]
   (do (m64 off parameter) (mput (+ off 8) status) (mput (+ off 12) ctl) 1))
 (defn command [kind parameter extra]
@@ -257,16 +273,33 @@
                   (if (not (= (hub-power 1) 1)) (enum-fail 2 26)
                     (if (not (= (hub-wait (max 100 (ds 2 23))) 1)) (enum-fail 2 27)
                       (do (dp 2 13 1) (dp 2 4 9) (dp 2 16 589839) 1)))))))))))
+(defn parse-bulk [d at end active]
+  (if (>= at end) (if (and (> (ds d 24) 0) (> (ds d 26) 0)) 1 0)
+    (let [len (b (+ 11648 at)) typ (b (+ 11649 at))]
+      (if (or (< len 2) (> (+ at len) end)) 0
+        (if (and (= typ 4) (>= len 9))
+          (parse-bulk d (+ at len) end
+            (if (and (= (b (+ 11650 at)) (ds d 7)) (= (b (+ 11651 at)) 0)) 1 0))
+          (if (and (= active 1) (= typ 5) (>= len 7) (= (bit-and (b (+ 11651 at)) 3) 2))
+            (let [addr (b (+ 11650 at)) ep (bit-and addr 15)
+                  field (if (= (bit-and addr 128) 128) 24 26)
+                  mps (+ (b (+ 11652 at)) (* (b (+ 11653 at)) 256))]
+              (if (or (= ep 0) (< mps 8) (> mps 512)
+                      (not (= (bit-and mps (- mps 1)) 0)) (not (= (ds d field) 0))) 0
+                (do (dp d field (+ (* ep 2) (if (= field 24) 1 0)))
+                    (dp d (+ field 1) mps) (parse-bulk d (+ at len) end active))))
+            (parse-bulk d (+ at len) end active)))))))
 (defn configure-hid [d]
   (if (not (= (descriptor d 2 9) 1)) (enum-fail d 5)
     (let [total (+ (b 11650) (* (b 11651) 256)) config (b 11653)]
       (if (or (< total 9) (> total 512)) (enum-fail d 6)
         (if (not (= (descriptor d 2 total) 1)) (enum-fail d 7)
           (if (not (= (parse-config d 0 total 0) 1)) (enum-fail d 8)
+            (if (and (= (ds d 4) 3) (not (= (parse-bulk d 0 total 0) 1))) (enum-fail d 29)
             (if (not (= (control d (setup-value 2304 config 0 0) 0 0) 1)) (enum-fail d 9)
               (if (and (not (= (ds d 4) 3))
                        (not (= (control d (setup-value 2849 0 (ds d 7) 0) 0 0) 1))) (enum-fail d 10)
-                (if (= (configure d) 1) (do (dp d 16 (+ 15 (* (ds d 4) 65536))) 1) (enum-fail d 11))))))))))
+                (if (= (configure d) 1) (do (dp d 16 (+ 15 (* (ds d 4) 65536))) 1) (enum-fail d 11)))))))))))
 (defn read-device [d]
   (if (not (= (recovery) 1)) (enum-fail d 12)
     (if (not (= (descriptor d 1 8) 1)) (enum-fail d 4)
@@ -445,6 +478,7 @@
 (defn match-device [d slot]
   (if (>= d (s 18)) -1 (if (= (ds d 0) slot) d (match-device (+ d 1) slot))))
 (defn poll []
+  (if (= (s 50) 1) (do (bt-save (event)) 0)
   (if (not (= (s 0) 15)) 0
     (let [kind (event)]
       (if (not (= kind 32)) 0
@@ -454,7 +488,7 @@
                      (= (bit-and (quot (s 17) 65536) 31) (ds d 3))
                      (or (= code 1) (= code 13)))
               (do (dp d 14 (- (ds d 6) (bit-and (s 16) 16777215))) (+ d 1))
-              (do (dp d 13 0) 0))))))))
+              (do (dp d 13 0) 0)))))))))
 (defn report-byte [d i] (b (+ 11520 (+ (* d 64) i))))
 (defn report-kind [d] (ds d 4))
 (defn report-length [d] (ds d 14))
@@ -531,3 +565,72 @@
                                 (put 41 (+ (report-byte 0 10) (* (report-byte 0 11) 256)))
                                 (put 42 (+ (report-byte 0 12) (* (report-byte 0 13) 256)))
                                 (let [result (rtl-rom)] (do (put 35 result) result))))))))))))))
+
+;; Full LE transport: on this one-port, single-device radio only, output
+;; contexts1/2 are unreferenced. 2048..4095 is private host state,4096..4607
+;; event IN,4608..5119 ACL IN,5120..5631 ACL OUT,5632..6143 reserved.
+;; Completed input-context8192..10303 may hold crypto workspace after the
+;; final endpoint configuration. No NVMe/NIC/font/private-draft alias exists.
+(defn ble-state [i] (if (and (>= i 0) (< i 2048)) (b (+ 2048 i)) 0))
+(defn ble-put [i v]
+  (if (and (>= i 0) (< i 2048))
+    (kernel-store-u8-16k (kernel-owned-window 0 16384) 16384 (+ 2048 i) v) 0))
+(defn ble-diagnostic [i] (if (and (>= i 0) (< i 14)) (s (+ 50 i)) 0))
+(defn ble-param [i v]
+  (if (and (>= i 0) (< i 255))
+    (kernel-store-u8-16k (kernel-owned-window 0 16384) 16384 (+ 11651 i) v) 0))
+(defn bt-ctx [ep mps ring typ]
+  (let [at (+ 8192 (* (+ ep 1) (s 7)))]
+    (do (mput (+ at 4) (+ 6 (+ (* typ 8) (* mps 65536))))
+        (m64 (+ at 8) (+ (address ring) 1)) (mput (+ at 16) 512))))
+(defn bt-arm [ch length]
+  (let [field (case ch 0 10 1 28 30) idx (ds 0 field) cyc (ds 0 (+ field 1))
+        ring (+ 6656 (* ch 512)) at (+ ring (* idx 16))
+        ep (case ch 0 (ds 0 3) 1 (ds 0 24) (ds 0 26))]
+    (do (trb at (address (+ 4096 (* ch 512))) length (+ 1060 cyc))
+        (put (+ 54 ch) at)
+        (if (= idx 29)
+          (do (trb (+ ring 480) (address ring) 0 (+ 6146 cyc))
+              (dp 0 field 0) (dp 0 (+ field 1) (- 1 cyc)))
+          (dp 0 field (+ idx 1)))
+        (dma/release-fence) (rput (+ (s 5) (* (ds 0 0) 4)) ep) 1)))
+(defn ble-command [opcode n]
+  (if (or (not (= (s 50) 1)) (< n 0) (> n 255) (< opcode 0) (> opcode 65535)) 0
+    (let [request (if (= (ds 0 23) 224) 32 33) index (if (= request 32) 0 (ds 0 7))]
+      (do (kernel-store-u8-16k (kernel-owned-window 0 16384) 16384 11648 (bit-and opcode 255))
+          (kernel-store-u8-16k (kernel-owned-window 0 16384) 16384 11649 (quot opcode 256))
+          (kernel-store-u8-16k (kernel-owned-window 0 16384) 16384 11650 n)
+          (control 0 (setup-value request 0 index (+ n 3)) (+ n 3) 0)))))
+(defn ble-poll []
+  (if (not (= (s 50) 1)) 0
+    (do (bt-save (event))
+        (if (> (s 59) 0) -1 (if (> (s 51) 0) 1 (if (> (s 52) 0) 2 0))))))
+(defn ble-length [ch] (if (and (>= ch 1) (<= ch 2)) (- (s (+ 50 ch)) 1) 0))
+(defn ble-byte [ch i]
+  (if (and (>= ch 1) (<= ch 2) (>= i 0) (< i 512)) (b (+ 4096 (+ (* (- ch 1) 512) i))) 0))
+(defn ble-release [ch]
+  (if (and (>= ch 1) (<= ch 2) (> (s (+ 50 ch)) 0))
+    (do (put (+ 50 ch) 0) (bt-arm (- ch 1) 512)) 0))
+(defn ble-tx [i v]
+  (if (and (>= i 0) (< i 512))
+    (kernel-store-u8-16k (kernel-owned-window 0 16384) 16384 (+ 5120 i) v) 0))
+(defn ble-send [n]
+  (if (or (not (= (s 50) 1)) (= (s 53) 0) (< n 4) (> n 512)) 0
+    (do (put 53 0) (bt-arm 2 n))))
+(defn ble-start [slot]
+  (let [probed (probe-bluetooth slot)]
+    (if (not (= probed 15)) probed
+      (if (or (not (= (s 8) 1)) (not (= (ds 0 0) 1))
+              (not (= (ds 0 17) 0xb8500bda)) (> (ds 2 13) 0)
+              (= (ds 0 24) (ds 0 26)) (= (ds 0 24) (ds 0 3))
+              (= (ds 0 26) (ds 0 3))) 21
+        (let [in (ds 0 24) out (ds 0 26) cs (s 7)]
+          (do (zero 2048 6144) (zero 7168 8192) (zero 8192 10304)
+              (mput 8196 (+ 1 (+ (i64-shift-left 1 in) (i64-shift-left 1 out)))) (copy-slot 0 0)
+              (mput (+ 8192 cs) (bit-or (bit-and (mem (+ 8192 cs)) 134217727)
+                (* (max (ds 0 3) (max in out)) 134217728)))
+              (bt-ctx in (ds 0 25) 7168 6) (bt-ctx out (ds 0 27) 7680 2)
+              (if (not (= (command 12 (address 8192) (* (ds 0 0) 16777216)) 1)) 22
+                (do (dp 0 28 0) (dp 0 29 1) (dp 0 30 0) (dp 0 31 1)
+                    (put 51 0) (put 52 0) (put 53 1) (put 59 0)
+                    (put 50 1) (bt-arm 0 512) (bt-arm 1 512) 15))))))))

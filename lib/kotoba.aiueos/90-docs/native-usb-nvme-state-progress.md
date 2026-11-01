@@ -313,3 +313,27 @@ ports and four hub-port snapshots. See `physical-rtl-rom.json`; the USB3
 root-port refusal remains distinct from Studio's confirmed BT target3 mode.
 The shared logger was not growing, so the actual signed client's responses
 were saved directly. No firmware binary was acquired/loaded or pairing done.
+
+## Full Bluetooth transport / LE bring-up candidate
+
+Owner selected unused Studio slot4 for6600H; slot3 remains assigned as before.
+Full transport is admitted only on the measured single-port/single-slot
+0bda:b850 radio without a hub. Once endpoint configuration completes, unused
+output contexts become CPU state2048..4095, event IN4096..4607, ACL IN4608..5119
+and ACL OUT5120..5631. Input context8192..10303 remains available only after
+configuration, for subsequent crypto scratch. No NVMe/NIC/font alias changes.
+Asynchronous completions arriving during EP0 waits are cached until released.
+The event path accepts bounded USB HCI events through257 bytes.
+
+Signed command9 (`ble-init <BDF>`) initializes event masks, reads local address,
+LE buffers/features and supported commands, checks controller AES against
+a FIPS197 known answer, and requests a local P256 key. These are local
+controller operations, not radio scanning, pairing or input admission.
+An ACL packet pending during a command remains owned until later processing.
+Native14 controller/framing checks and USB/NVMe12 observations pass; actual
+full transport/LE measurements are separate. The product graph is38 modules.
+
+The previous Amu worktree was removed externally. The exact original compiler
+SHA2387a32d… was recovered from tracked Amu commitfe5d4855… / blob646dc6ba…,
+with the same packager SHA7691467… and byte-identical three font/media seed
+parts. Layout-source checks still pass. No compiler upgrade was adopted.

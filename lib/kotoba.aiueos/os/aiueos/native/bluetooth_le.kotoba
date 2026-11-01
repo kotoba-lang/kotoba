@@ -1,0 +1,99 @@
+(ns aiueos.native.bluetooth-le
+  ;; Explicit LE bring-up. No scan, pairing or input admission during init.
+  (:require [aiueos.native.xhci :as usb]
+            [aiueos.native.bluetooth-hci :as hci])
+  (:export [initialize diagnostic packet command wait-event]))
+(defn word [i]
+  (+ (usb/ble-state (* i 4)) (+ (* (usb/ble-state (+ (* i 4) 1)) 256)
+     (+ (* (usb/ble-state (+ (* i 4) 2)) 65536) (* (usb/ble-state (+ (* i 4) 3)) 16777216)))))
+(defn put [i v]
+  (do (usb/ble-put (* i 4) (bit-and v 255))
+      (usb/ble-put (+ (* i 4) 1) (bit-and (u64-shift-right v 8) 255))
+      (usb/ble-put (+ (* i 4) 2) (bit-and (u64-shift-right v 16) 255))
+      (usb/ble-put (+ (* i 4) 3) (bit-and (u64-shift-right v 24) 255))))
+(defn diagnostic [i] (if (and (>= i 0) (< i 10)) (word i) 0))
+(defn packet [i] (if (and (>= i 0) (< i 257)) (usb/ble-state (+ 1024 i)) 0))
+(defn capture [i n]
+  (if (>= i n) 1 (do (usb/ble-put (+ 1024 i) (usb/ble-byte 1 i)) (capture (+ i 1) n))))
+(defn wait-event [fuel]
+  (let [ready (usb/ble-poll)]
+    (if (= ready 1)
+      (let [n (usb/ble-length 1)]
+        (if (or (< n 2) (> n 257) (not (= (+ (usb/ble-byte 1 1) 2) n)))
+          (do (usb/ble-release 1) -4)
+          (do (capture 0 n) (put 3 n) (usb/ble-release 1) 1)))
+      (if (< ready 0) -7
+        (if (= fuel 0) -3
+            (if (= (usb/recovery) 1) (wait-event (- fuel 1)) -2))))))
+(defn head [i acc]
+  (if (>= i 8) acc (head (+ i 1) (+ acc (i64-shift-left (packet i) (* i 8))))))
+(defn le16 [off] (+ (packet off) (* (packet (+ off 1)) 256)))
+(defn completed [at count]
+  (if (= count 0) 1
+    (do (if (= (le16 at) (word 10)) (put 12 (min (word 5) (+ (word 12) (le16 (+ at 2))))) 0)
+        (completed (+ at 4) (- count 1)))))
+(defn control-event []
+  (if (and (= (packet 0) 19) (>= (word 3) 3)
+           (= (word 3) (+ 3 (* 4 (packet 2)))))
+    (do (completed 3 (packet 2)) 1)
+    (if (and (= (packet 0) 5) (= (word 3) 6) (= (packet 2) 0))
+      (do (if (= (le16 3) (word 10))
+            (do (put 10 65535) (put 11 0) (put 13 (packet 5))) 0) 1)
+      (if (and (or (= (packet 0) 8) (= (packet 0) 89))
+               (>= (word 3) 6) (= (le16 3) (word 10)))
+        (do (put 11 (if (and (= (packet 2) 0) (= (packet 5) 1)
+                             (or (= (packet 0) 8) (= (packet 6) 16))) 1 0)) 1) 0))))
+(defn wait-complete [opcode expected fuel]
+  (let [got (wait-event 200)]
+    (if (not (= got 1)) (do (put 2 (+ 256 (- 0 got))) 0)
+      (if (= (control-event) 1)
+        (if (= fuel 0) 0 (wait-complete opcode expected (- fuel 1)))
+        (do (put 2 (packet 5))
+            (hci/command-complete (head 0 0) (word 3) opcode expected))))))
+(defn command [opcode n expected]
+  (do (put 1 opcode)
+      (if (not (= (usb/ble-command opcode n) 1)) (do (put 2 255) 0)
+        (wait-complete opcode expected 16))))
+(defn mask-bytes [value i]
+  (if (>= i 8) 1 (do (usb/ble-param i (bit-and (u64-shift-right value (* i 8)) 255)) (mask-bytes value (+ i 1)))))
+(defn copy-packet [src dst n]
+  (if (= n 0) 1
+    (do (usb/ble-put dst (packet src)) (copy-packet (+ src 1) (+ dst 1) (- n 1)))))
+(defn aes-params [i]
+  (if (>= i 16) 1
+    (do (usb/ble-param i (- 15 i)) (usb/ble-param (+ 16 i) (* (- 15 i) 17)) (aes-params (+ i 1)))))
+(defn aes-expected [i]
+  (case i 0 90 1 197 2 180 3 112 4 128 5 183 6 205 7 216 8 48 9 4 10 123 11 106 12 216 13 224 14 196 105))
+(defn aes-match [i diff]
+  (if (>= i 16) (if (= diff 0) 1 0)
+    (aes-match (+ i 1) (bit-or diff (bit-xor (packet (+ 6 i)) (aes-expected i))))))
+(defn p256 []
+  (do (put 1 8229)
+  (if (not (= (usb/ble-command 8229 0) 1)) 0
+    (if (not (= (wait-event 200) 1)) 0
+      (do (put 2 (if (= (packet 0) 15) (packet 2) (packet 5)))
+      (if (not (and (= (word 3) 6) (= (packet 0) 15) (= (packet 2) 0)
+                    (= (+ (packet 4) (* (packet 5) 256)) 8229))) 0
+        (if (not (= (wait-event 400) 1)) 0
+          (if (and (= (word 3) 68) (= (packet 0) 62) (= (packet 2) 8) (= (packet 3) 0))
+            (copy-packet 4 160 64) 0))))))))
+(defn initialize [slot]
+  (let [started (usb/ble-start slot)]
+    (if (not (= started 15)) started
+      (do (put 0 1) (put 10 65535) (put 11 0) (mask-bytes 0x2000800000046090 0)
+          (if (not (= (command 3073 8 6) 1)) (do (put 0 2) 2)
+            (do (mask-bytes 1023 0)
+                (if (not (= (command 8193 8 6) 1)) (do (put 0 3) 3)
+                  (if (not (= (command 4105 0 12) 1)) (do (put 0 4) 4)
+                    (do (copy-packet 6 144 6)
+                        (if (not (= (command 8194 0 9) 1)) (do (put 0 5) 5)
+                          (do (put 4 (+ (packet 6) (* (packet 7) 256))) (put 5 (packet 8)) (put 12 (packet 8))
+                              (if (not (= (command 8195 0 14) 1)) (do (put 0 6) 6)
+                                (do (copy-packet 6 64 8)
+                                    (if (not (= (command 4098 0 70) 1)) (do (put 0 7) 7)
+                                      (do (copy-packet 6 80 64) (aes-params 0)
+                                          (if (not (= (command 8215 32 22) 1)) (do (put 0 8) 8)
+                                            (do (put 7 (aes-match 0 0))
+                                                (if (not (= (word 7) 1)) (do (put 0 9) 9)
+                                                  (do (put 6 (p256))
+                                                      (put 0 (if (= (word 6) 1) 15 10)) (word 0))))))))))))))))))))
