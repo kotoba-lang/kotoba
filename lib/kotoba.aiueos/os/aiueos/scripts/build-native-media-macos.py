@@ -17,6 +17,7 @@ import re
 import shutil
 import struct
 import subprocess
+import sys
 
 
 HERE = Path(__file__).resolve().parent
@@ -25,6 +26,16 @@ HERE = Path(__file__).resolve().parent
 def pin(path):
     raw = path.read_bytes()
     return {"bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+
+
+def remove_reproduced_copy(original, copy):
+    """Remove a verified duplicate while preserving the original image."""
+    if original.is_symlink() or copy.is_symlink():
+        return False
+    if pin(original) != pin(copy):
+        return False
+    copy.unlink()
+    return True
 
 
 def verify_macho(path, expected):
@@ -230,6 +241,14 @@ def main(args):
                          refusalCases=16, nativeFormatEmission=True,
                          qualification="Mac native GPT/FAT16 and El Torito ISO format verification; QEMU, release and physical gates separate")
             save()
+            # Only successful builds may discard reproduction copies. Keep the
+            # original images, digests, logs and all failed build artifacts.
+            for original, copy in ((disk, reproduced), (iso, iso_reproduced)):
+                try:
+                    if not remove_reproduced_copy(output / original, output / copy):
+                        print(f"reproduction copy retained: {copy}", file=sys.stderr)
+                except OSError as error:
+                    print(f"reproduction copy retained: {copy}: {error}", file=sys.stderr)
             print(state["state"], state["image"]["sha256"])
         finally:
             os.close(scope)
