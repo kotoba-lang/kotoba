@@ -539,3 +539,12 @@ the final candidate. Earlier v7/v8/v11 failed fixed-timing USB regressions
 and are retained as failed, with initial TCG latency observations. The
 final candidate is not a60Hz/VSync/full-frame atomic compositor claim.
 Physical flicker acceptance remains required; HHKB testing stays paused.
+
+
+Tiled v13 physical readiness: source95b1ee030, EFIae46e043…fc4de8a
+transferred6062592 bytes over the running PXE server; one-shot consumed.
+New noncec75eeef8203e89fd and signed ping/key/screenshot acknowledgements
+confirm the desktop loop is up. Explicit host0504 accepts keyboard1c4f:0002
+and Apple05ac:0324 (HID2). Complete800x600/600-row screenshot reads back
+Yataverse over Itonami with Dock. Owner Window/Dock temporal feedback is
+pending; no screenshot polling during that check. NVMe OS image unchanged.
