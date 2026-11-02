@@ -69,4 +69,36 @@ This is **not streaming**: the test-only reader materializes all segments into o
 
 The shared `sha2.core/sha256-segments-hex` reuses the existing SHA-256 compression logic and processes a list of `:bytes` values plus a skipped prefix, without a full `vector-i64` copy. It rejects invalid skip/aggregate lengths and caps input at 2,147,483,647 bytes. The ARM64 source-composed `sha_segments_gate.kotoba` covers 24 independent expected-value cases including empty chunks, prefix boundaries, SHA padding boundaries and 1 MiB input; result `1000` passed. Setting its encoded bit length to zero in a temporary control produced result `2`. The pre-existing SHA-224/SHA-256/HMAC native corpus also reported result `63`; project linking, x86 and full corpus/oracle qualification of the extension remain open. The SHA2 library's existing AGENTS.md and README describe the original eight-export surface; this new ninth export extends that surface and those documents have not been rewritten by this change.
 
+### Local layout verification candidate
+
+`fune.layout-check/verify-layout` accepts an absolute layout path and an explicit immutable manifest digest. It checks the `oci-layout` version marker, bounded strict `index.json` and a single matching manifest descriptor including media type and size. It reads the manifest and config by verified digest, applies config policy, and inspects **each** layer after its descriptor digest passes. It returns a reason string; `ok` means only that these checks passed on the bytes read by this call. It neither extracts nor retains an immutable rootfs. A caller must not treat `ok` as a grant, launch authorization, or proof that later path reads yield the same bytes. The limited profile still refuses many valid OCI layouts and image types.
+
+The test-only `layout_check_runner.kotoba` returns 0 for `ok` and 1 for a refusal. In Linux static images, `KEXE_COMMAND=1` maps this return value to an OS exit code **only when `KEXE_STRUCTURED_REPORT` is unset**; default and structured-report modes can exit zero on a nonzero guest result. This adapter is not a production CLI. A qualified controller must verify the guest result and must not rely on the OS status in those other modes. Missing/denied FS2 paths may trap rather than return a reason; these are failures, not an empty successful read.
+
+For a local feasibility check, first stage `stage_layer_fixtures.py "$G/fixtures"`, then run `stage_layout_fixtures.py "$G/fixtures" "$G/layout-fixtures-new"` into a **new** task-owned directory. Compose SHA2, JCS, image-manifest, image-config, layer-tar, layout-check and the test-only runner bodies, preserving the alias substitutions used above and replacing `layout/verify-layout` in the runner. Compile with the same ARM64 root. Run the resulting ELF in the offline container with `KEXE_COMMAND=1`, no structured-report variable, and the layout directory as the scoped `KEXE_CAP_RESOURCES_35` grant. The test fixture digests are printed when staged.
+
+```sh
+{
+  printf '(ns fune-layout-check-test (:export [main]))\n'
+  sed '1,/\]))$/d' lib/gov.nist.sha2/kotoba/sha2/core.kotoba
+  sed '1,/\]))$/d' lib/org.ietf.jcs/kotoba/jcs/reader.kotoba
+  sed '1,/\]))$/d;s@json/@@g;s@sha/@@g' lib/kotoba.fune/kotoba/fune/image_manifest.kotoba
+  sed '1,/\]))$/d;s@json/@@g;s@manifest/@@g' lib/kotoba.fune/kotoba/fune/image_config.kotoba
+  sed '1,/\]))$/d;s@manifest/@@g' lib/kotoba.fune/kotoba/fune/layer_tar.kotoba
+  sed '1,/\]))$/d;s@manifest/@@g;s@config/@@g;s@layer/@@g;s@json/@@g' lib/kotoba.fune/kotoba/fune/layout_check.kotoba
+  sed '1,/\]))$/d;s@layout/verify-layout@verify-layout@g' lib/kotoba.fune/test/fune/layout_check_runner.kotoba
+} > "$G/layout-check-test.kotoba"
+podman run --rm --pull never --platform linux/arm64 --network none \
+  -e KEXE_CAP_RESOURCES_35=/gate -v "$G:/gate" -w /gate docker.io/library/alpine:3 \
+  sh -c './root.elf compile /gate/layout-check-test.kotoba --target aarch64-linux --output /gate/new-layout-check.elf --format static && chmod +x /gate/new-layout-check.elf'
+podman run --rm --pull never --platform linux/arm64 --network none \
+  -e KEXE_CAP_RESOURCES_35=/gate/layout-fixtures-new -e KEXE_COMMAND=1 \
+  -v "$G:/gate" -w /gate docker.io/library/alpine:3 /gate/new-layout-check.elf \
+  /gate/layout-fixtures-new/good sha256:65d85cbf52167eeb2bacc60972d64614b2f1a1fbbe7b4af5ac833c227b67d679
+```
+
+On 2026-11-02 the native candidate accepted one- and two-layer fixtures. It refused a tampered config, first layer or second layer; a wrong layout marker; absent, size-mismatched or duplicate matching index descriptor; and a validly hashed tar containing a symlink. A missing blob and a filesystem symlink outside the granted layout trapped with exit 126. A control that stopped after the first layer incorrectly accepted the second-layer mutation, showing that case detects the missing iteration. A read-only Podman-exported Alpine ARM64 layout passed marker/index/manifest/config and layer digest before refusing its unsupported tar symlink. No file was extracted or executed.
+
+Resource limits in this candidate are checked **after** FS2 has read each response; FS2 still materializes the full layer, so an oversized file can consume provider resources or trap before policy validation. The test-only segmented adapter assumes the first response chunk contains the complete FS2 acknowledgement. Atomic snapshot identity, pre-read bounds, source-locked project linkage, multiple-layer application, executable path resolution and a fail-closed production command controller remain open.
+
 Remaining work includes the byte-oriented filesystem and bounded streaming path, real OCI fixtures, broader config semantics, tar safety and whiteouts, integration with qualified source locks and native project linking, and Linux runtime enforcement. Do not use this partial component to launch untrusted images.

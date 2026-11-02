@@ -1,0 +1,118 @@
+;; Read-only local OCI layout verification candidate (JUN-776).
+;; It does not extract, authorize, or execute an image. The caller must grant
+;; only the intended layout directory to :fs/app-data.
+(ns fune.layout-check
+  (:export [verify-layout])
+  (:capabilities [:fs/app-data])
+  (:require [fune.image-manifest :as manifest] [fune.image-config :as config] [fune.layer-tar :as layer] [jcs.reader :as json]))
+
+(defn- layout-root-ok? [root :string] :bool
+  (let [b (vector-i64-from-bytes (string-to-utf8 root)) n (vector-count b)]
+    (if (or (= n 0) (> n 3900) (not (= (vector-at b 0) 47))) false
+      (loop [i 1 start 1]
+        (if (= i n)
+          (let [len (- i start)]
+            (not (or (and (= len 1) (= (vector-at b start) 46))
+                     (and (= len 2) (= (vector-at b start) 46) (= (vector-at b (+ start 1)) 46)))))
+          (let [c (vector-at b i)]
+            (if (= c 0) false
+              (if (= c 47)
+                (let [len (- i start)]
+                  (if (or (= len 0) (and (= len 1) (= (vector-at b start) 46))
+                          (and (= len 2) (= (vector-at b start) 46) (= (vector-at b (+ start 1)) 46)))
+                    false (recur (+ i 1) (+ i 1))))
+                (recur (+ i 1) start)))))))))
+
+(defn- layout-path [root :string digest :string] :string
+  ;; digest-valid? is checked before this function, so byte index 7 is ASCII.
+  (string-concat root (string-concat "/blobs/sha256/" (string-substring digest 7 71))))
+
+(defn- layout-read-frame [path :string] :string
+  (let [prefix (string-from-utf8 (bytes-from-vector-i64 [0 70 83 50 0 65]))
+        nul (string-from-utf8 (bytes-from-vector-i64 [0]))]
+    (string-concat prefix (string-concat path nul))))
+
+(defn- layout-read-small [path :string] :vector-i64
+  (let [r (vector-i64-from-bytes (typed-cap-call :fs/app-data :string :bytes (layout-read-frame path))) n (vector-count r)]
+    (if (and (>= n 5) (= (vector-at r 0) 0) (= (vector-at r 1) 70) (= (vector-at r 2) 83)
+             (= (vector-at r 3) 50) (= (vector-at r 4) 0))
+      (loop [i 5 out (vector-alloc (- n 5))]
+        (if (= i n) out (recur (+ i 1) (vector-assoc! out (- i 5) (vector-at r i)))))
+      (vector-alloc 0))))
+
+(defn- layout-read-layer [path :string] [:list :bytes]
+  (let [chunks (typed-cap-call :fs/app-data :string [:list :bytes] (layout-read-frame path))]
+    (if (= (vector-count chunks) 0) (typed-list-new [:list :bytes])
+      (let [first (typed-list-nth [:list :bytes] chunks 0) n (bytes-count first)]
+        (if (or (< n 5) (not (= (bytes-at first 0) 0)) (not (= (bytes-at first 1) 70))
+                (not (= (bytes-at first 2) 83)) (not (= (bytes-at first 3) 50)) (not (= (bytes-at first 4) 0)))
+          (typed-list-new [:list :bytes])
+          (loop [i 1 out (typed-list-conj [:list :bytes] (typed-list-new [:list :bytes]) (bytes-slice first 5 n))]
+            (if (= i (vector-count chunks)) out
+              (recur (+ i 1) (typed-list-conj [:list :bytes] out (typed-list-nth [:list :bytes] chunks i))))))))))
+
+(defn- layout-marker-ok? [b :vector-i64] :bool
+  (if (or (> (vector-count b) 1024) (not (json/json-valid? b))) false
+    (let [start (loop [i 0]
+                  (if (and (< i (vector-count b))
+                           (or (= (vector-at b i) 32) (= (vector-at b i) 9) (= (vector-at b i) 10) (= (vector-at b i) 13)))
+                    (recur (+ i 1)) i))]
+      (if (not (= (json/json-kind b start) 1)) false
+        (let [v (json/json-member b start "imageLayoutVersion")]
+          (and (= (json/json-count b start) 1) (= (json/json-kind b v) 3)
+               (= (json/json-string b v) "1.0.0")))))))
+
+;; The caller chooses the immutable manifest digest. index.json is checked
+;; for exactly one matching image-manifest descriptor; tags never choose it.
+(defn- layout-index-ok? [b :vector-i64 expected :string manifest-size :i64] :bool
+  (if (or (> (vector-count b) 1048576) (not (json/json-valid? b))) false
+    (let [start (loop [i 0]
+                  (if (and (< i (vector-count b))
+                           (or (= (vector-at b i) 32) (= (vector-at b i) 9) (= (vector-at b i) 10) (= (vector-at b i) 13)))
+                    (recur (+ i 1)) i))
+          version (json/json-member b start "schemaVersion")
+          entries (json/json-member b start "manifests")]
+      (if (or (not (= (json/json-kind b start) 1)) (not (= (json/json-kind b version) 4))
+              (not (json/json-int-ok? b version)) (not (= (json/json-int b version) 2))
+              (not (= (json/json-kind b entries) 2))) false
+        (let [n (json/json-count b entries)]
+          (if (or (= n 0) (> n 128)) false
+            (loop [i 0 matches 0]
+              (if (= i n) (= matches 1)
+                (let [item (json/json-element b entries i)
+                      d (json/json-member b item "digest") media (json/json-member b item "mediaType")
+                      size (json/json-member b item "size")]
+                  (if (or (not (= (json/json-kind b item) 1)) (not (= (json/json-kind b d) 3))
+                          (not (manifest/digest-valid? (json/json-string b d)))
+                          (not (= (json/json-kind b media) 3)) (not (= (json/json-kind b size) 4))
+                          (not (json/json-int-ok? b size)) (< (json/json-int b size) 0)) false
+                    (let [match (= (json/json-string b d) expected)]
+                      (if (and match (or (not (= (json/json-string b media) "application/vnd.oci.image.manifest.v1+json"))
+                                         (not (= (json/json-int b size) manifest-size)))) false
+                        (recur (+ i 1) (+ matches (if match 1 0)))))))))))))))
+
+(defn- layout-layers-problem [root :string expected :string m :vector-i64] :string
+  (let [n (manifest/layer-count m expected)]
+    (if (< n 0) "fune/manifest-invalid"
+      (loop [i 0]
+        (if (= i n) "ok"
+          (let [digest (manifest/layer-digest m expected i)]
+            (if (not (manifest/digest-valid? digest)) "fune/descriptor-digest"
+              (let [chunks (layout-read-layer (layout-path root digest))
+                    p (layer/layer-segments-archive-problem m expected i chunks)]
+                (if (= p "ok") (recur (+ i 1)) p)))))))))
+
+(defn verify-layout [root :string expected :string] :string
+  (cond (not (layout-root-ok? root)) "fune/layout-root"
+        (not (manifest/digest-valid? expected)) "fune/expected-digest"
+        :else (if (not (layout-marker-ok? (layout-read-small (string-concat root "/oci-layout")))) "fune/layout-marker"
+          (let [m (layout-read-small (layout-path root expected))
+                index (layout-read-small (string-concat root "/index.json"))
+                p (manifest/manifest-problem m expected)]
+            (if (not (= p "ok")) p
+              (if (not (layout-index-ok? index expected (vector-count m))) "fune/layout-index"
+              (let [digest (manifest/config-digest m expected)]
+                (if (not (manifest/digest-valid? digest)) "fune/descriptor-digest"
+                  (let [cfg (layout-read-small (layout-path root digest))
+                        q (config/config-policy-problem m expected cfg)]
+                    (if (= q "ok") (layout-layers-problem root expected m) q))))))))))
