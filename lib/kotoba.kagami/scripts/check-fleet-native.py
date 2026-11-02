@@ -50,6 +50,13 @@ def main():
      [:signature :string] [:signer :string] [:valid-until-nil :bool]]]})
   (:export [main]))\n'''
     mutations = {
+        'decimal-leading-zero': '(and (> (- end start) 1) (= (string-code-point-at s start) 48))',
+        'layout-prefix': '(not (fn-at? raw 0 prefix))',
+        'layout-sequence': '(not (fn-at? raw (+ value-at 64) mid))',
+        'layout-parent': '(not (fn-at? raw seq-end parent-label))',
+        'layout-expiry': '(not (fn-at? raw (+ parent-at 64) sig-label))',
+        'layout-signer': '(not (fn-at? raw (+ sig-at 128) did-label))',
+        'layout-length': '(not (= n (+ end 2)))',
         'subject': '(not (string=? (get h :name) "fleet-db"))',
         'sequence': '(not (= seq (+ anchor-seq 1)))',
         'parent': '(not (string=? (get h :parent) anchor-hash))',
@@ -66,7 +73,7 @@ def main():
         source = source.replace('ed/', '').replace('sha/', '') + '\n' + test
         image = gate.build(label, 'fixture.kotoba', {'fixture.kotoba': source.encode()})
         gate.run(label + '-run', image, expected=0 if needle is None else 1)
-    gate.finish('PASS_FLEET_NATIVE_SUCCESSOR', scope='synthetic and public historical fixtures only; no receiver, trust store, history synchronization or deployment',
+    gate.finish('PASS_FLEET_NATIVE_SUCCESSOR', scope='strict serialized EDN and synthetic/public historical fixtures only; no receiver, trust store, history synchronization or deployment',
                 sourceSHA256=module.sha(native.encode()), testSHA256=module.sha(test.encode()), mutations=list(mutations))
     evidence_path = gate.out / 'evidence.json'
     evidence = json.loads(evidence_path.read_text())
