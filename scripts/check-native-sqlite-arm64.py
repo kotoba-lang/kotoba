@@ -32,6 +32,7 @@ FIXTURES = (
     ("sqlite.notepad-unsupported-schema-refusal", PACKAGE / "test/native/notepad-unsupported-schema-refusal.kotoba"),
     ("sqlite.interior-page-encoder", PACKAGE / "test/native/interior-page-encoder.kotoba"),
     ("sqlite.interior-root-image", PACKAGE / "test/native/interior-root-image.kotoba"),
+    ("sqlite.interior-root-job-delete", PACKAGE / "test/native/interior-root-job-delete.kotoba"),
 )
 LEGACY_FIXTURE = PACKAGE / "test/fixtures/legacy-cron-notepad-20261102.sqlite"
 UNSUPPORTED_SCHEMA_FIXTURE = PACKAGE / "test/fixtures/unsupported-cron-notepad-20261102.sqlite"
@@ -163,6 +164,13 @@ def main(amu, compiler, out, amu_pin=None):
     if not interior_root_path.is_file() or interior_root_path.stat().st_size != 7 * 4096:
         raise RuntimeError("Kotoba did not publish the expected seven-page interior-root SQLite image")
 
+    interior_job_delete = out / receipts[6]["image"]
+    interior_job_delete_path = out / "data/interior-root-job-delete.db"
+    run("sqlite-interior-root-job-delete", [interior_job_delete, "data/interior-root-job-delete.db"],
+        out, guest_env, calls, timeout=300)
+    if not interior_job_delete_path.is_file() or interior_job_delete_path.stat().st_size != 3 * 4096:
+        raise RuntimeError("Kotoba did not publish the expected three-page empty job-delete image")
+
     interior_split_path = out / "data/interior-root-split.db"
     if not interior_split_path.is_file() or interior_split_path.stat().st_size != 7 * 4096:
         raise RuntimeError("Kotoba did not publish the split-upsert interior-root SQLite image")
@@ -217,6 +225,13 @@ def main(amu, compiler, out, amu_pin=None):
             "databaseSha256": sha(interior_root_path),
             "databaseBytes": interior_root_path.stat().st_size,
             "result": "Kotoba constructed and FS2-published a seven-page SQLite image with table/index interior roots, reopened it, read both rows, and returned an empty refusal for upsert on the unsupported root shape",
+        },
+        "interiorRootJobDelete": {
+            "fixture": "sqlite.interior-root-job-delete",
+            "image": receipts[6]["image"],
+            "databaseSha256": sha(interior_job_delete_path),
+            "databaseBytes": interior_job_delete_path.stat().st_size,
+            "result": "Kotoba deleted all rows for one job from a generated two-leaf table/index root, collapsed both roots to empty leaves, published through FS2, reopened the SQLite image, and verified the deleted key was absent",
         },
         "interiorRootSplitUpsert": {
             "fixture": "sqlite.interior-root-image",
