@@ -157,7 +157,8 @@ def main(amu, compiler, out, amu_pin=None):
     interior_root_path = out / "data/interior-root.db"
     run("sqlite-interior-root-image-fs2-write-read-and-refusal",
         [interior_root, "data/interior-root.db", "data/interior-root-split.db",
-         "data/interior-root-repeat.db", "data/interior-root-update.db"],
+         "data/interior-root-repeat.db", "data/interior-root-update.db",
+         "data/interior-root-delete.db"],
         out, guest_env, calls, timeout=300)
     if not interior_root_path.is_file() or interior_root_path.stat().st_size != 7 * 4096:
         raise RuntimeError("Kotoba did not publish the expected seven-page interior-root SQLite image")
@@ -171,6 +172,9 @@ def main(amu, compiler, out, amu_pin=None):
     interior_update_path = out / "data/interior-root-update.db"
     if not interior_update_path.is_file() or interior_update_path.stat().st_size != 7 * 4096:
         raise RuntimeError("Kotoba did not publish the updated interior-root SQLite image")
+    interior_delete_path = out / "data/interior-root-delete.db"
+    if not interior_delete_path.is_file() or interior_delete_path.stat().st_size != 3 * 4096:
+        raise RuntimeError("Kotoba did not publish the collapsed interior-root deletion image")
 
     receipt = {
         "schema": "kotoba.sqlite.native-linux-arm64.v1",
@@ -232,8 +236,15 @@ def main(amu, compiler, out, amu_pin=None):
             "databaseBytes": interior_update_path.stat().st_size,
             "result": "Kotoba updated one existing key under the exact two-leaf roots, preserved the other row values, published through FS2, reopened, and read the replacement value through Kotoba",
         },
+        "interiorRootDeleteJob": {
+            "fixture": "sqlite.interior-root-image",
+            "image": receipts[5]["image"],
+            "databaseSha256": sha(interior_delete_path),
+            "databaseBytes": interior_delete_path.stat().st_size,
+            "result": "Kotoba deleted one job from the exact two-leaf roots, collapsed the remaining single-row tree to leaf roots, FS2-published/reopened, and preserved the other job's value through Kotoba readback",
+        },
         "sidecarRefusals": sidecar_cases,
-        "result": "Kotoba positive upsert/readback, pre-existing WAL/SHM/rollback-journal refusals, existing SQLite mutation/reopen including rowid 128+, unsupported-schema refusal/preservation, interior-page encoder controls, interior-root image write/read, first root split, repeated two-leaf interior-root upserts, capacity refusal, and interior-root existing-key update passed",
+        "result": "Kotoba positive upsert/readback, pre-existing WAL/SHM/rollback-journal refusals, existing SQLite mutation/reopen including rowid 128+, unsupported-schema refusal/preservation, interior-page encoder controls, interior-root image write/read, first root split, repeated two-leaf interior-root upserts, capacity refusal, interior-root existing-key update, and key/job deletion with root collapse passed",
         "hostSqliteOracle": False,
     }
     (out / "native-sqlite-arm64.json").write_text(json.dumps(receipt, indent=2) + "\n")
