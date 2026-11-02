@@ -173,16 +173,21 @@ runtime dependency. Source hashes and result are in
 [`native-export-readback-20261102.json`](../lib/kotoba.sql/evidence/native-export-readback-20261102.json).
 
 Subsequent exact-source native receipts qualify bounded operations on the
-same three-page image: first-row insertion, increasing composite-key appends,
-exact-key deletion, per-job deletion preserving unrelated rows, and update of
-an existing row preserving rowid/key. Each fixture reads results through the
-Kotoba reader, writes through Amu FS2, and uses a read-only SQLite 3.54.1
-oracle for integrity and row/index readback. See the
-[`native evidence directory`](../lib/kotoba.sql/evidence/). These results do
-not establish arbitrary-order insertion or a general upsert: keys must
-currently be appended in increasing composite `(job_id,key)` order. A
-follow-up native attempt to remove this restriction failed and was reverted;
-it is not part of the qualified source.
+same three-page image: first-row insertion, increasing appends, unique
+composite-key insertion in arbitrary order, exact-key deletion, per-job
+deletion preserving unrelated rows, and update of an existing row preserving
+rowid/key. Each fixture reads results through the Kotoba reader, writes
+through Amu FS2, and uses a read-only SQLite 3.54.1 oracle for integrity and
+row/index readback. See the
+[`native evidence directory`](../lib/kotoba.sql/evidence/), including the
+[`unordered insert and delete receipt`](../lib/kotoba.sql/evidence/notepad-unordered-insert-native-20261102.json).
+The unordered fixture inserts job-a keys before and between existing keys in
+the PK index while retaining table rowid order, refuses a duplicate, then
+deletes one key and verifies the surviving rowids. A first implementation
+attempt exposed an intermediate-image page-placement error; the corrected
+source replaces the table page in place and the source-locked native run now
+passes. This does not establish general SQL upsert semantics: a duplicate
+key is refused and existing-row update is a separate bounded operation.
 
 The implementation remains a bounded codec, reader, initializer, and
 single-leaf mutation slice, not a complete SQLite engine or transactional
