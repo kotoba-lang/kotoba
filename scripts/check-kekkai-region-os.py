@@ -127,6 +127,22 @@ ROSTER_MUTATIONS={
  'rd-overflow':('(if negative 8 7)', '(if negative 8 8)'),
  'rd-wipe':('(do (clear work 0) 0)', '(do (clear work 98304) 0)')}
 
+SESSION_MUTATIONS={
+ 'ms-self':('(self-match owner 0)', '(or (self-match owner 0) true)'),
+ 'ms-bind':('(initialize (kernel-subregion owner 262144 33280 8192) 8192 role 1)', '(initialize (kernel-subregion owner 262144 33280 8192) 8192 role 0)'),
+ 'ms-version':('(decimal owner (r/version owner 262144) 1000000000000000000 false)', '(decimal owner (do (r/version owner 262144) 0) 1000000000000000000 false)'),
+ 'ms-unicode':('(+ 240 (quot scalar 262144))', '(+ 241 (quot scalar 262144))'),
+ 'ms-timeout':('(< (- now (ld owner 32800)) 90)', '(<= (- now (ld owner 32800)) 90)'),
+ 'ms-lifetime':('(not= (d/advice (kernel-subregion owner 262144 41472 17408) 17408 now) 2)', '(or (not= (d/advice (kernel-subregion owner 262144 41472 17408) 17408 now) 2) true)'),
+ 'ms-ik-wipe':('(clear owner 33280 41472)', '(clear owner 41472 41472)'),
+ 'ms-stop':('(clear (kernel-subregion owner length 0 262144) 32768 65536)', '(clear (kernel-subregion owner length 0 262144) 65536 65536)'),
+ 'ms-start-active':('(= (poll owner length now) 0)', '(or (= (poll owner length now) 0) true)'),
+ 'ms-handshake-transaction':('(and (>= result 0) (= (handshake-commit owner now) 1))', '(and (= (handshake-commit owner now) 1) (>= result 0))'),
+ 'ms-datagram-transaction':('(if (>= result 0) (copy owner 41472 147456 17408 0) 0)', '(do (copy owner 41472 147456 17408 0) 0)'),
+ 'ms-early-output':('(if (>= count 0) (do (put owner 32808 now) (output-copy owner output capacity count 0)) 0)', '(if (>= count 0) (do (put owner 32808 now) (output-copy owner output capacity count 0)) (if (> capacity 0) (kernel-store-u8-64k output capacity 0 0) 0))'),
+ 'ms-output-alias':('(separate owner 262144 output capacity)', '(or (separate owner 262144 output capacity) true)'),
+ 'mr-wipe':('(zero owner 32768 65536) 1)))))', '(zero owner 65536 65536) 1)))))')}
+
 def pin(path):
     raw=path.read_bytes();return dict(bytes=len(raw),sha256=hashlib.sha256(raw).hexdigest())
 
@@ -201,13 +217,14 @@ def check_chacha(words,raw,out,state):
 
 def main(a):
     out=a.output.resolve();out.mkdir(mode=0o700,parents=True,exist_ok=False)
-    chacha=a.component=='chacha';x25519=a.component=='x25519';ik=a.component=='ik';datagram=a.component=='datagram';ed=a.component=='ed25519';envelope=a.component=='envelope';roster=a.component=='roster';klink=a.component=='kekkai-link';link=a.component=='udp-link' or klink;protocol=ik or datagram or klink;dual=chacha or x25519 or protocol or link or ed or envelope or roster
+    chacha=a.component=='chacha';x25519=a.component=='x25519';ik=a.component=='ik';datagram=a.component=='datagram';ed=a.component=='ed25519';envelope=a.component=='envelope';roster=a.component=='roster';session=a.component=='session';klink=a.component=='kekkai-link';link=a.component=='udp-link' or klink;protocol=ik or datagram or klink;dual=chacha or x25519 or protocol or link or ed or envelope or roster or session
     namespace='aiueos.native.kekkai-link-gate' if klink else ('aiueos.native.udp-link-gate' if link else ('noise.datagram-region-gate' if datagram else ('noise.ik-region-gate' if ik else ('aiueos.native.x25519-region-gate' if x25519 else ('chacha20.region-gate' if chacha else 'noise.blake2s-region-gate')))))
     slug='kekkai-link' if klink else ('udp-link' if link else ('datagram' if datagram else ('ik' if ik else ('x25519' if x25519 else ('chacha20' if chacha else 'blake2s')))))
     mutations=KEKKAI_LINK_MUTATIONS if klink else (UDP_LINK_MUTATIONS if link else (DATAGRAM_MUTATIONS if datagram else (IK_MUTATIONS if ik else (X25519_MUTATIONS if x25519 else (CHACHA_MUTATIONS if chacha else MUTATIONS)))))
     if ed:namespace='aiueos.native.ed25519-region-gate';slug='ed25519';mutations=ED_MUTATIONS
     if envelope:namespace='kekkai.envelope-region-gate';slug='envelope';mutations=ENVELOPE_MUTATIONS
     if roster:namespace='kekkai.roster-region-gate';slug='roster';mutations=ROSTER_MUTATIONS
+    if session:namespace='kekkai.session-region-gate';slug='session';mutations=SESSION_MUTATIONS
     if a.mutation and a.mutation not in mutations:raise ValueError('mutation/component differ')
     state=dict(schema='kekkai.os-region-'+slug+'.v1',state='STAGING',mutation=a.mutation,
                calls=[],physicalDeployment=False,appInstallQualified=False,
@@ -263,8 +280,9 @@ def main(a):
         if ed:core=ROOT/'lib/kotoba.aiueos/os/aiueos/kotoba/aiueos/ed25519_region.kotoba';fixture=ROOT/'lib/kotoba.aiueos/os/aiueos/native/ed25519_region_gate.kotoba'
         if envelope:core=ROOT/'lib/kotoba.kekkai/kotoba/kekkai/envelope_region.kotoba';fixture=ROOT/'lib/kotoba.kekkai/tools/envelope_region_gate.kotoba'
         if roster:core=ROOT/'lib/kotoba.kekkai/kotoba/kekkai/roster_region.kotoba';fixture=ROOT/'lib/kotoba.kekkai/tools/roster_region_gate.kotoba'
+        if session:core=ROOT/'lib/kotoba.kekkai/kotoba/kekkai/session_region.kotoba';fixture=ROOT/'lib/kotoba.kekkai/tools/session_region_gate.kotoba'
         core_bytes=core.read_bytes();state['ownerSource']=pin(core);state['fixtureSource']=pin(fixture)
-        if a.mutation and not chacha and not (klink and a.mutation=='kw-duplicate') and not (ed and a.mutation.startswith(('es-','ee-'))) and not (roster and a.mutation.startswith('rd-')):
+        if a.mutation and not chacha and not (klink and a.mutation=='kw-duplicate') and not (ed and a.mutation.startswith(('es-','ee-'))) and not (roster and a.mutation.startswith('rd-')) and not (session and a.mutation.startswith('mr-')):
             old,new=mutations[a.mutation];text=core_bytes.decode()
             if text.count(old)!=1:raise ValueError('mutation is not unique')
             core_bytes=text.replace(old,new).encode()
@@ -274,11 +292,34 @@ def main(a):
         if ed:files=[('aiueos/ed25519_region.kotoba',core_bytes),('aiueos/native/ed25519_region_gate.kotoba',fixture.read_bytes())]
         if envelope:files=[('kekkai/envelope_region.kotoba',core_bytes),('kekkai/envelope_region_gate.kotoba',fixture.read_bytes())]
         if roster:files=[('kekkai/roster_region.kotoba',core_bytes),('kekkai/roster_region_gate.kotoba',fixture.read_bytes())]
+        if session:files=[('kekkai/session_region.kotoba',core_bytes),('kekkai/session_region_gate.kotoba',fixture.read_bytes())]
         owner_root='/ed25519-owner' if ed else ('/link-owner' if link else ('/x25519-owner' if x25519 else ('/chacha-owner' if chacha else '/noise-owner')))
         if envelope:owner_root='/envelope-owner'
         if roster:owner_root='/roster-owner'
+        if session:owner_root='/session-owner'
         for virtual,raw in files:
             target=stage/owner_root.lstrip('/')/virtual;target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(raw)
+        if session:
+            state['dependencySources']={}
+            dependencies=[('/roster-owner/kekkai/roster_region.kotoba','lib/kotoba.kekkai/kotoba/kekkai/roster_region.kotoba'),
+                ('/roster-owner/kekkai/envelope_region.kotoba','lib/kotoba.kekkai/kotoba/kekkai/envelope_region.kotoba'),
+                ('/edn-owner/kotoba/edn/region.kotoba','lib/kotoba.edn/src/kotoba/edn/region.kotoba'),
+                ('/os/aiueos/native/legacy_crypto_kat.kotoba','lib/kotoba.aiueos/os/aiueos/native/legacy_crypto_kat.kotoba'),
+                ('/x25519-owner/aiueos/x25519.kotoba','lib/kotoba.aiueos/os/aiueos/kotoba/x25519.kotoba')]
+            for name in ['ed25519','ed25519_verify','sha512','sha512_stream','gf25519','ed25519_region','lib/sha256_stream']:
+                dependencies.append(('/os/aiueos/kotoba/aiueos/'+name+'.kotoba','lib/kotoba.aiueos/os/aiueos/kotoba/aiueos/'+name+'.kotoba'))
+            for name in ['ik_region','datagram_region','blake2s_region']:
+                dependencies.append(('/noise-owner/noise/'+name+'.kotoba','lib/kotoba.noise/kotoba/noise/'+name+'.kotoba'))
+            for name in ['region','region_ops','aead_region']:
+                dependencies.append(('/chacha-owner/chacha20/'+name+'.kotoba','lib/org.ietf.chacha20Poly1305/kotoba/chacha20/'+name+'.kotoba'))
+            for virtual,relative in dependencies:
+                dep=ROOT/relative;state['dependencySources'][relative]=pin(dep);raw=dep.read_bytes()
+                if relative=='lib/kotoba.kekkai/kotoba/kekkai/roster_region.kotoba' and a.mutation and a.mutation.startswith('mr-'):
+                    old,new=mutations[a.mutation];text=raw.decode()
+                    if text.count(old)!=1:raise ValueError('managed roster mutation is not unique')
+                    raw=text.replace(old,new).encode();state['mutationSource']=dict(name=relative,original=pin(dep),mutated=dict(bytes=len(raw),sha256=hashlib.sha256(raw).hexdigest()))
+                target=stage/virtual.lstrip('/');target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(raw)
+            roots+=['/roster-owner','/edn-owner','/x25519-owner','/noise-owner','/chacha-owner']
         if ed or envelope or roster:
             state['dependencySources']={}
             for name in ['ed25519','ed25519_verify','sha512','sha512_stream','gf25519']:
@@ -352,6 +393,15 @@ def main(a):
         (stage/('boot-font.bin' if dual else 'boot-payload.bin')).write_bytes(payload.read_bytes())
         state['bootPayload']=None if dual else pin(payload)
         if dual:
+            if session:
+                reference=ROOT/'lib/kotoba.kekkai/tools/session_region_reference.py'
+                blob,session_cases=load('managed_session_reference',reference).fixtures(a.session_suite,a.mutation)
+                state['referenceSources']={str(q.relative_to(ROOT)):pin(q) for q in [reference,OS_SCRIPTS/'check-native-ed25519-qemu.py',OS_SCRIPTS/'check-native-consent-qemu.py',ROOT/'lib/org.ietf.x25519/tools/reference.py',ROOT/'lib/org.ietf.chacha20Poly1305/tools/reference.py']}
+                state['cases']=session_cases
+                font=bytearray(payload.read_bytes());end=393216+len(blob)
+                if len(font)!=524288 or end>len(font) or any(font[393216:end]):raise ValueError('session diagnostic tail unavailable')
+                font[393216:end]=blob;(stage/'boot-font.bin').write_bytes(font)
+                (out/'session-vectors.bin').write_bytes(blob);state['vectorData']=pin(out/'session-vectors.bin')
             if roster:
                 reference=ROOT/'lib/kotoba.kekkai/tools/roster_region_reference.py'
                 blob,roster_cases=load('roster_public_reference',reference).fixtures(a.roster_suite,a.mutation)
@@ -458,7 +508,7 @@ def main(a):
         peer=None
         try:
             extra=['-serial','file:serial.log','-debugcon','file:debug.log','-d','int,cpu_reset','-D','qemu-debug.log']
-            if roster:extra+=['-qmp','unix:roster-qmp.sock,server=on,wait=off']
+            if roster or session:extra+=['-qmp','unix:roster-qmp.sock,server=on,wait=off']
             if link:
                 peer=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);peer.bind(('127.0.0.1',0))
                 with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as reservation:
@@ -472,31 +522,39 @@ def main(a):
                 link_peer=ROOT/('scripts/native_kekkai_link_peer.py' if klink else 'scripts/native_udp_link_peer.py');state['linkPeerObserver']=pin(link_peer)
                 state['state']='NATIVE_LINK_RUNNING';save()
                 state['linkResult'],link_good=load('native_udp_link_peer',link_peer).exercise(boot,peer,target,out)
-            if x25519 or protocol or ed or envelope or roster:
+            if x25519 or protocol or ed or envelope or roster or session:
                 started=time.monotonic();state['state']='NATIVE_RUNNING';save()
                 while boot.W(79)==1:
                     if boot.proc.poll() is not None:raise RuntimeError('region guest terminated')
-                    if envelope or roster:
+                    if envelope or roster or session:
                         log=out/'qemu-debug.log'
                         traps=re.findall(rb'v=06 [^\n]*IP=0008:([0-9a-f]+)',log.read_bytes()) if log.exists() else []
                         if any(0x100000<=int(pc,16)<0x400000 for pc in traps):
                             state['nativeInvalidOpcodePCs']=[pc.decode() for pc in traps];save()
                             raise RuntimeError('native region guest halted on an invalid opcode; not a bounded refusal')
                     state['completedCases']=boot.W(78)
-                    if roster:
+                    if roster or session:
                         state['nativeProgress']=list(struct.unpack('<13I',boot.dump(boot.work+74*4,52)))
                     save()
                     if time.monotonic()-started>a.execution_seconds:raise TimeoutError('region native execution deadline')
                     time.sleep(2)
             words=struct.unpack('<6I',boot.dump(boot.work+74*4,24))
             if link:raw=b''
-            elif roster:
+            elif roster or session:
                 low,high=struct.unpack('<2I',boot.dump(boot.work+400,8));address=low+(high<<32)
                 if not 0<address<1<<39:raise ValueError('native roster request address differs')
                 raw=boot.dump(address,65536)
                 (out/'native-roster-transient.bin').write_bytes(boot.dump(address+65536,196608))
                 roster_trace=boot.dump(boot.work+1024,2816)
                 roster_extra=boot.dump(boot.work+82*4,20)
+                if session:
+                    low,high=struct.unpack('<2I',boot.dump(boot.work+408,8));other_address=low+(high<<32)
+                    if not 0<other_address<1<<39 or not (address+262144<=other_address or other_address+262144<=address):raise ValueError('managed owner and caller IO allocations overlap')
+                    session_counts=struct.unpack('<2I',boot.dump(boot.work+80*4,8))
+                    if not 0<=session_counts[0]<=2048 or not 0<=session_counts[1]<=1024:raise ValueError('managed trace count exceeds its allocation')
+                    (out/'native-session-returns.bin').write_bytes(boot.dump(other_address+196608,session_counts[0]*16))
+                    (out/'native-session-hashes.bin').write_bytes(boot.dump(other_address+229376,session_counts[1]*32))
+                    (out/'native-session-output.bin').write_bytes(boot.dump(other_address+65536,65536))
             elif envelope:
                 low,high=struct.unpack('<2I',boot.dump(boot.work+400,8));address=low+(high<<32)
                 if not 0<address<1<<39:raise ValueError('native envelope request address differs')
@@ -586,6 +644,24 @@ def main(a):
                 if not good:raise AssertionError('native envelope/control mismatch: '+str(observed))
                 state['state']='PASS_NATIVE_OS_SIGNED_ENVELOPE'
             state['kernelReproduced']=True;state['efiReproduced']=True;save();print(state['state'],json.dumps(observed));return
+        if session:
+            (out/'native-session-state.bin').write_bytes(raw)
+            returns=(out/'native-session-returns.bin').read_bytes();hashes=(out/'native-session-hashes.bin').read_bytes();pairs=list(struct.iter_unpack('<qq',returns))
+            case_count=state['cases']['count'];expected_hashes=bytes.fromhex(''.join(state['cases']['expectedNativeHashes']))
+            case_assertions=list(struct.unpack('<%dI'%case_count,roster_trace[512:512+case_count*4]))
+            state['observed']=dict(nativeAssertionFailures=words[1],completed=words[5],caseCount=words[4],guards=words[0],guardsCompleted=words[2],canary=words[3],
+                transientWiped=(out/'native-roster-transient.bin').read_bytes()==bytes(196608),sessionWiped=raw[32768:65536]==bytes(32768),
+                ownerAndCallerIODisjoint=True,returnPairs=pairs,returnPairsMatch=all(a==e for a,e in pairs),hashCount=session_counts[1],hashesMatch=hashes==expected_hashes,caseAssertions=case_assertions)
+            state['artifacts']={n:pin(q) for n,q in [('kernel',kernel),('efi',efi),('media',media),('qemu',a.qemu),('firmware',a.firmware)]}
+            good=words==(30,0,1,1,case_count,2) and state['observed']['transientWiped'] and raw[32768:65536]==bytes(32768) and state['observed']['returnPairsMatch'] and state['observed']['hashesMatch'] and not any(case_assertions) and session_counts[1]==case_count*2
+            if a.mutation:
+                if (words[0],words[2],words[3],words[4],words[5])!=(30,1,1,case_count,2) or session_counts[1]!=case_count*2:raise AssertionError('managed fault did not normally complete')
+                if good or words[1]==0:raise AssertionError('managed fault survived')
+                state['state']='DETECTED_NATIVE_MANAGED_SESSION_MUTATION'
+            else:
+                if not good:raise AssertionError('native managed session differs: '+str(state['observed']))
+                state['state']='PASS_NATIVE_OS_MANAGED_SESSION'
+            state['kernelReproduced']=True;state['efiReproduced']=True;save();print(state['state'],json.dumps(state['observed']));return
         if roster:
             (out/'native-roster-state.bin').write_bytes(raw)
             transient_zero=(out/'native-roster-transient.bin').read_bytes()==bytes(196608)
@@ -700,8 +776,9 @@ if __name__=='__main__':
     for name in ['compiler','packager','amu-source','source-stage','payload','qemu','firmware','output']:p.add_argument('--'+name,type=Path,required=True)
     for name in ['compiler-sha256','packager-sha256','source-lock-sha256','payload-sha256','qemu-sha256','firmware-sha256']:p.add_argument('--'+name,required=True)
     p.add_argument('--first-frame-seconds',type=float,default=240)
-    p.add_argument('--component',choices=['blake2s','chacha','x25519','ik','datagram','udp-link','kekkai-link','ed25519','envelope','roster'],default='blake2s')
+    p.add_argument('--component',choices=['blake2s','chacha','x25519','ik','datagram','udp-link','kekkai-link','ed25519','envelope','roster','session'],default='blake2s')
     p.add_argument('--execution-seconds',type=float,default=3600)
     p.add_argument('--roster-suite',choices=['policy','bounds','faults'],default='policy')
-    p.add_argument('--mutation',choices=[*MUTATIONS,*CHACHA_MUTATIONS,*X25519_MUTATIONS,*IK_MUTATIONS,*DATAGRAM_MUTATIONS,*UDP_LINK_MUTATIONS,*KEKKAI_LINK_MUTATIONS,*ED_MUTATIONS,*ENVELOPE_MUTATIONS,*ROSTER_MUTATIONS])
+    p.add_argument('--session-suite',choices=['policy','handshake-responder','handshake-initiator','transport-responder','transport-initiator','faults'],default='policy')
+    p.add_argument('--mutation',choices=[*MUTATIONS,*CHACHA_MUTATIONS,*X25519_MUTATIONS,*IK_MUTATIONS,*DATAGRAM_MUTATIONS,*UDP_LINK_MUTATIONS,*KEKKAI_LINK_MUTATIONS,*ED_MUTATIONS,*ENVELOPE_MUTATIONS,*ROSTER_MUTATIONS,*SESSION_MUTATIONS])
     main(p.parse_args())

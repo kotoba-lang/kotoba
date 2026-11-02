@@ -97,7 +97,7 @@ compiler2MiB code cap and existing request/stack grants. Kernel, EFI, user ELF
 and slot reproduce. The legacy signature-byte verifier and wire/NIC regression
 remain distinct evidence. Failed syntax/type/provenance/name/stack probes are
 retained; a compiler refusal or halted VM is not a successful negative test.
-The legacy `AGENTS.md` line24 saying no Kekkai module has a native gate already
+The legacy `AGENTS.md` line20 saying no Kekkai module has a native gate already
 predates the previous region/wire proofs; this unit adds only the bounded
 roster qualification and does not claim whole legacy control-plane coverage.
 
