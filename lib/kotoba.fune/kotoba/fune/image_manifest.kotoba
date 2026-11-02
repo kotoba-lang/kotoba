@@ -1,0 +1,103 @@
+;; OCI image manifest envelope and referenced-byte verification (JUN-776).
+;; This is not a config policy, unpacker, image admission or execution grant.
+;; `ok` applies only to the operation named by the called function.
+(ns fune.image-manifest
+  (:export [manifest-problem config-bytes-problem layer-bytes-problem])
+  (:require [jcs.reader :as json] [sha2.core :as sha]))
+
+(defn- fune-ws? [c :i64] :bool
+  (or (= c 32) (= c 9) (= c 10) (= c 13)))
+
+(defn- fune-start [b :vector-i64] :i64
+  (loop [i 0]
+    (if (and (< i (vector-count b)) (fune-ws? (vector-at b i)))
+      (recur (+ i 1)) i)))
+
+(defn- fune-octets? [b :vector-i64] :bool
+  (loop [i 0]
+    (if (= i (vector-count b)) true
+      (let [v (vector-at b i)]
+        (if (and (>= v 0) (<= v 255)) (recur (+ i 1)) false)))))
+
+(defn- fune-str= [b :vector-i64 i :i64 s :string] :bool
+  (if (= (json/json-kind b i) 3) (= (json/json-string b i) s) false))
+
+(defn- fune-digest? [s :string] :bool
+  (let [b (vector-i64-from-bytes (string-to-utf8 s))]
+    (if (not (= (vector-count b) 71)) false
+      (if (not (and (= (vector-at b 0) 115) (= (vector-at b 1) 104)
+                    (= (vector-at b 2) 97) (= (vector-at b 3) 50)
+                    (= (vector-at b 4) 53) (= (vector-at b 5) 54)
+                    (= (vector-at b 6) 58))) false
+        (loop [i 7]
+          (if (= i 71) true
+            (let [c (vector-at b i)]
+              (if (or (and (>= c 48) (<= c 57)) (and (>= c 97) (<= c 102)))
+                (recur (+ i 1)) false))))))))
+
+;; Admit exactly the three fields whose semantics this component checks.
+(defn- fune-descriptor-problem [b :vector-i64 i :i64 media :string max-size :i64] :string
+  (if (not (= (json/json-kind b i) 1)) "fune/descriptor-type"
+    (let [m (json/json-member b i "mediaType")
+          d (json/json-member b i "digest")
+          s (json/json-member b i "size")]
+      (cond (not (= (json/json-count b i) 3)) "fune/descriptor-fields"
+            (not (fune-str= b m media)) "fune/descriptor-media-type"
+            (not (= (json/json-kind b d) 3)) "fune/descriptor-digest"
+            (not (fune-digest? (json/json-string b d))) "fune/descriptor-digest"
+            (not (= (json/json-kind b s) 4)) "fune/descriptor-size"
+            (not (json/json-int-ok? b s)) "fune/descriptor-size"
+            (or (< (json/json-int b s) 0) (> (json/json-int b s) max-size)) "fune/descriptor-size"
+            :else "ok"))))
+
+(defn- fune-layers-problem [b :vector-i64 arr :i64] :string
+  (if (not (= (json/json-kind b arr) 2)) "fune/layers-type"
+    (let [n (json/json-count b arr)]
+      (if (or (< n 1) (> n 32)) "fune/layers-count"
+        (loop [i 0]
+          (if (= i n) "ok"
+            (let [p (fune-descriptor-problem b (json/json-element b arr i)
+                      "application/vnd.oci.image.layer.v1.tar" 268435456)]
+              (if (= p "ok") (recur (+ i 1)) p))))))))
+
+(defn manifest-problem [b :vector-i64 expected :string] :string
+  (cond (> (vector-count b) 1048576) "fune/manifest-size"
+        (not (fune-octets? b)) "fune/non-octet"
+        (not (fune-digest? expected)) "fune/expected-digest"
+        (not (= (string-concat "sha256:" (sha/sha256-hex b)) expected)) "fune/manifest-digest"
+        (not (json/json-valid? b)) "fune/manifest-json"
+        :else (let [root (fune-start b)]
+          (if (not (= (json/json-kind b root) 1)) "fune/manifest-type"
+            (let [v (json/json-member b root "schemaVersion")
+                  m (json/json-member b root "mediaType")
+                  c (json/json-member b root "config")
+                  l (json/json-member b root "layers")]
+              (cond (not (= (json/json-count b root) 4)) "fune/manifest-fields"
+                    (not (= (json/json-kind b v) 4)) "fune/schema-version"
+                    (not (json/json-int-ok? b v)) "fune/schema-version"
+                    (not (= (json/json-int b v) 2)) "fune/schema-version"
+                    (not (fune-str= b m "application/vnd.oci.image.manifest.v1+json")) "fune/manifest-media-type"
+                    :else (let [p (fune-descriptor-problem b c "application/vnd.oci.image.config.v1+json" 1048576)]
+                            (if (= p "ok") (fune-layers-problem b l) p))))))))
+
+;; Revalidates the manifest before taking descriptor facts from its bytes.
+(defn- fune-blob-problem [manifest :vector-i64 blob :vector-i64 descriptor :i64] :string
+  (let [size (json/json-member manifest descriptor "size")
+        digest (json/json-member manifest descriptor "digest")]
+    (cond (not (= (vector-count blob) (json/json-int manifest size))) "fune/blob-size"
+          (not (fune-octets? blob)) "fune/non-octet"
+          (not (= (string-concat "sha256:" (sha/sha256-hex blob)) (json/json-string manifest digest))) "fune/blob-digest"
+          :else "ok")))
+
+(defn config-bytes-problem [manifest :vector-i64 expected :string blob :vector-i64] :string
+  (let [p (manifest-problem manifest expected)]
+    (if (not (= p "ok")) p
+      (let [root (fune-start manifest)]
+        (fune-blob-problem manifest blob (json/json-member manifest root "config"))))))
+
+(defn layer-bytes-problem [manifest :vector-i64 expected :string index :i64 blob :vector-i64] :string
+  (let [p (manifest-problem manifest expected)]
+    (if (not (= p "ok")) p
+      (let [root (fune-start manifest) layers (json/json-member manifest root "layers")]
+        (if (or (< index 0) (>= index (json/json-count manifest layers))) "fune/layer-index"
+          (fune-blob-problem manifest blob (json/json-element manifest layers index)))))))
