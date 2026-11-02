@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compile/boot the allocation-free Noise hash owner under the actual OS ABI.
+"""Compile/boot allocation-free Noise hash or ChaChaPoly under the OS ABI.
 
 Mac observer/stager only. Amu discovers/compiles/packages all guest code;
 QEMU executes the region implementation and native KAT/refusal assertions.
@@ -27,6 +27,15 @@ MUTATIONS={
  'carry':('(put st 228 (+ (ld st 228) 1))','(put st 228 (ld st 228))'),
  'overflow':('(not (and (= (ld st 224) 4294967295) (= (ld st 228) 4294967295)))','true'),
  'phase':('(= (ld st 236) 1)','(or (= (ld st 236) 1) (= (ld st 236) 2))')}
+CHACHA_MUTATIONS={
+ 'chacha-rotate':('(wp st b (rot (bit-xor (w st b) (w st c)) 7))','(wp st b (rot (bit-xor (w st b) (w st c)) 6))'),
+ 'chacha-clamp':('67108611','67108863'),
+ 'chacha-aad':('(do (poly-add st value) (aad-count st) 1)','(do (poly-add st 0) (aad-count st) 1)'),
+ 'chacha-padding':('(do (poly-add st 0) (pad st (- n 1)))','(do (poly-add st 1) (pad st (- n 1)))'),
+ 'chacha-tag':('(if (>= i 16) diff','(if (>= i 15) diff'),
+ 'chacha-alias':('(separate input n output capacity)','true'),
+ 'chacha-early-open':('(mac-end st input input-bytes (- n 16))',
+   '(mac-end st input input-bytes (- n 16)) (put st 496 0) (put st 504 (- n 16)) (crypt st input input-bytes output capacity)')}
 
 def pin(path):
     raw=path.read_bytes();return dict(bytes=len(raw),sha256=hashlib.sha256(raw).hexdigest())
@@ -35,9 +44,42 @@ def load(name,path):
     spec=importlib.util.spec_from_file_location(name,path)
     module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module);return module
 
+def check_chacha(words,raw,out,state):
+    path=ROOT/'lib/org.ietf.chacha20Poly1305/tools/reference.py'
+    reference=load('region_chacha_reference',path);state['reference']=pin(path)
+    if reference.block(bytes(range(32)),1,bytes.fromhex('000000090000004a00000000')).hex()!=('10f1e7e4d13b5915500fdd1fa32071c4c7d1f4c733c068030422aa9ac3d46c4e'
+      'd2826446079faa0914c2d705d98b02a2b5129cd1de164eb9cbd083e8a2503c4e'):raise ValueError('RFC block reference differs')
+    rfckey=bytes.fromhex('85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b')
+    rfcmsg=b'Cryptographic Forum Research Group'
+    if reference.poly1305(rfckey,rfcmsg).hex()!='a8061dc1305136c6c22b8baf0c0127a9':raise ValueError('RFC Poly1305 reference differs')
+    key=bytes((i*3+7)%256 for i in range(32));nonce=bytes((i*5+11)%256 for i in range(32,56))
+    plaintext=lambda n:bytes((i*17+3)%256 for i in range(n));aad=lambda n:bytes((i*11+5)%256 for i in range(n))
+    frames=[]
+    for size in [12,24]:
+        for n in [1024,4096,16383,65511,65519]:
+            frames.append((reference.seal if size==12 else reference.xseal)(key,nonce[:size],aad(8),plaintext(n)))
+    for size in [12,24]:
+        k=key if size==12 else reference.hchacha20(key,nonce[:16]);iv=nonce[:12] if size==12 else bytes(4)+nonce[16:]
+        for counter in [0,1,2147483647,4294967295]:frames.append(reference.block(k,counter,iv))
+    for variant in [0,1]:
+        for n in range(258):frames.append(reference.poly1305(key if variant==0 else bytes([255])*32,plaintext(n)))
+    frames.append(reference.poly1305(rfckey,rfcmsg))
+    for size in [12,24]:
+        for n in range(258):frames.append((reference.seal if size==12 else reference.xseal)(key,nonce[:size],aad((n*7)%65),plaintext(n)))
+    if len(frames)!=1051:raise ValueError('reference case count differs')
+    expected=b''.join(hashlib.blake2s(frame).digest() for frame in frames)
+    (out/'expected-frame-hashes.bin').write_bytes(expected)
+    mismatches=[i for i in range(1051) if raw[i*32:i*32+32]!=expected[i*32:i*32+32]]
+    observed=dict(knownPoly1305Answer=words[0],nativeAssertionFailures=words[1],guardsCompleted=words[2],canary=words[3],frameHashCount=words[4],completed=words[5],mismatchedFrameHashes=mismatches)
+    return observed,words==(1,0,1,1,1051,1) and not mismatches
+
 def main(a):
     out=a.output.resolve();out.mkdir(mode=0o700,parents=True,exist_ok=False)
-    state=dict(schema='kekkai.os-region-blake2s.v1',state='STAGING',mutation=a.mutation,
+    chacha=a.component=='chacha';namespace='chacha20.region-gate' if chacha else 'noise.blake2s-region-gate'
+    slug='chacha20' if chacha else 'blake2s'
+    mutations=CHACHA_MUTATIONS if chacha else MUTATIONS
+    if a.mutation and a.mutation not in mutations:raise ValueError('mutation/component differ')
+    state=dict(schema='kekkai.os-region-'+slug+'.v1',state='STAGING',mutation=a.mutation,
                calls=[],physicalDeployment=False,appInstallQualified=False,
                productUserABIQualified=False,existingABIExportsRetained=True,
                observer=pin(Path(__file__)),pythonVersion=sys.version.split()[0])
@@ -79,26 +121,38 @@ def main(a):
     (if (and (> width 0) (> registered 0) (= published 73) (= enabled 1))
       (fixture/run) 0)))'''
         for old,new in [
-          ('aiueos.native.usb-update-test-entry','aiueos.native.kekkai-blake2s-region-entry'),
-          ('[aiueos.native.usb-update-probe :as fixture]','[noise.blake2s-region-gate :as fixture]'),
+          ('aiueos.native.usb-update-test-entry','aiueos.native.kekkai-'+slug+'-region-entry'),
+          ('[aiueos.native.usb-update-probe :as fixture]','['+namespace+' :as fixture]'),
           (before,'(defn main [] :i64\n  (fixture/run))')]:
             if source.count(old)!=1:raise ValueError('baseline entry changed')
             source=source.replace(old,new)
-        entry='/os/aiueos/native/kekkai-blake2s-region-entry.kotoba'
+        entry='/os/aiueos/native/kekkai-'+slug+'-region-entry.kotoba'
         (stage/entry.lstrip('/')).write_text(source)
-        core=ROOT/'lib/kotoba.noise/kotoba/noise/blake2s_region.kotoba'
-        fixture=ROOT/'lib/kotoba.noise/tools/blake2s_region_gate.kotoba'
+        core=ROOT/('lib/org.ietf.chacha20Poly1305/kotoba/chacha20/region.kotoba' if chacha else 'lib/kotoba.noise/kotoba/noise/blake2s_region.kotoba')
+        fixture=ROOT/('lib/org.ietf.chacha20Poly1305/tools/region_gate.kotoba' if chacha else 'lib/kotoba.noise/tools/blake2s_region_gate.kotoba')
         core_bytes=core.read_bytes();state['ownerSource']=pin(core);state['fixtureSource']=pin(fixture)
         if a.mutation:
-            old,new=MUTATIONS[a.mutation];text=core_bytes.decode()
+            old,new=mutations[a.mutation];text=core_bytes.decode()
             if text.count(old)!=1:raise ValueError('mutation is not unique')
             core_bytes=text.replace(old,new).encode()
-        for virtual,raw in [('noise/blake2s_region.kotoba',core_bytes),('noise/blake2s_region_gate.kotoba',fixture.read_bytes())]:
-            target=stage/'noise-owner'/virtual;target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(raw)
+        files=([('chacha20/region.kotoba',core_bytes),('chacha20/region_gate.kotoba',fixture.read_bytes())] if chacha else
+               [('noise/blake2s_region.kotoba',core_bytes),('noise/blake2s_region_gate.kotoba',fixture.read_bytes())])
+        for virtual,raw in files:
+            target=stage/('chacha-owner' if chacha else 'noise-owner')/virtual;target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(raw)
+        if chacha:
+            secondary=ROOT/'lib/kotoba.noise/kotoba/noise/blake2s_region.kotoba';state['secondaryOwnerSource']=pin(secondary)
+            target=stage/'noise-owner/noise/blake2s_region.kotoba';target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(secondary.read_bytes())
+            roots.append('/chacha-owner')
         roots.append('/noise-owner');flags=[v for r in roots for v in ('--source-path',r)]
         payload=a.payload.resolve(strict=True)
         if pin(payload)['sha256']!=a.payload_sha256:raise ValueError('boot payload pin differs')
-        (stage/'boot-payload.bin').write_bytes(payload.read_bytes());state['bootPayload']=pin(payload)
+        (stage/('boot-font.bin' if chacha else 'boot-payload.bin')).write_bytes(payload.read_bytes())
+        state['bootPayload']=None if chacha else pin(payload)
+        if chacha:
+            state['bootFont']=pin(payload)
+            user=ROOT/'lib/kotoba.aiueos/os/aiueos/native/itonami-local-model-user-v3.kotoba'
+            (stage/'boot-user-source.kotoba').write_bytes(user.read_bytes());state['diagnosticUserSource']=pin(user)
+            state['userCodeExecuted']=False
         fd=os.open(stage,os.O_RDONLY|os.O_DIRECTORY)
         if fd!=3:os.dup2(fd,3);os.close(fd)
         def run(label,argv):
@@ -107,6 +161,14 @@ def main(a):
             state['calls'].append(dict(label=label,argv=argv,exit=p.returncode,stdout=p.stdout.decode(errors='replace'),stderr=p.stderr.decode(errors='replace')));save()
             if p.returncode or p.stderr:raise RuntimeError(label+': '+p.stderr.decode(errors='replace')[:1000])
             return p.stdout
+        if chacha:
+            for name in ['boot-user.elf','boot-user.reproduced.elf']:
+                run('compile-'+name,['compile','boot-user-source.kotoba','--target','x86_64-aiueos-user-v5','--output',name])
+            if pin(stage/'boot-user.elf')!=pin(stage/'boot-user.reproduced.elf'):raise ValueError('user image reproduction differs')
+            for name in ['boot-user-slot.bin','boot-user-slot.reproduced.bin']:
+                run('package-'+name,['package-aiueos-user-payload','boot-user.elf','--output',name,'--version','v4'])
+            if pin(stage/'boot-user-slot.bin')!=pin(stage/'boot-user-slot.reproduced.bin'):raise ValueError('user slot reproduction differs')
+            state['diagnosticUserELF']=pin(stage/'boot-user.elf');state['diagnosticUserSlot']=pin(stage/'boot-user-slot.bin')
         modules=run('modules',['modules',entry,*flags]);graph={}
         for line in modules.decode().splitlines():
             namespace,virtual=line.split(' ',1)
@@ -119,7 +181,8 @@ def main(a):
         for name in ['KERNEL.ELF','KERNEL.reproduced.ELF']:run('compile-'+name,[*compile_args,'--output',name])
         if (stage/'KERNEL.ELF').read_bytes()!=(stage/'KERNEL.reproduced.ELF').read_bytes():raise ValueError('kernel reproduction differs')
         for name in ['BOOTX64.EFI','BOOTX64.reproduced.EFI']:
-            run('package-'+name,['package-aiueos-boot','KERNEL.ELF','--output',name,'--payload','boot-payload.bin','--pci-resources','v1'])
+            boot_args=['--font','boot-font.bin','--user-slot','boot-user-slot.bin'] if chacha else ['--payload','boot-payload.bin']
+            run('package-'+name,['package-aiueos-boot','KERNEL.ELF','--output',name,*boot_args,'--pci-resources','v1'])
         if (stage/'BOOTX64.EFI').read_bytes()!=(stage/'BOOTX64.reproduced.EFI').read_bytes():raise ValueError('EFI reproduction differs')
         efi=stage/'BOOTX64.EFI';kernel=stage/'KERNEL.ELF'
         cmd=[sys.executable,str(OS_SCRIPTS/'build-native-media-macos.py'),'--amu-source',str(a.amu_source.resolve(strict=True)),
@@ -137,19 +200,37 @@ def main(a):
         boot=keys.Boot.__new__(keys.Boot)
         try:
             keys.Boot.__init__(boot,SimpleNamespace(kernel=kernel,efi=efi,media=media,qemu=a.qemu,firmware=a.firmware),out,'region-crypto',None,
-                               extra=('-serial','file:serial.log','-debugcon','file:debug.log'),first_frame_seconds=a.first_frame_seconds)
+                               extra=('-serial','file:serial.log','-debugcon','file:debug.log','-d','int,cpu_reset','-D','qemu-debug.log'),first_frame_seconds=a.first_frame_seconds)
             words=struct.unpack('<6I',boot.dump(boot.work+74*4,24))
-            raw=boot.dump(boot.work+keys.native_regions.WINDOW_BYTES,303*32)
+            if chacha:
+                lo,hi=struct.unpack('<2I',boot.dump(boot.work+400,8));address=lo+(hi<<32)
+                if not 0<address<1<<39:raise ValueError('native output region address differs')
+                raw=boot.dump(address+4096,1051*32)
+            else:raw=boot.dump(boot.work+keys.native_regions.WINDOW_BYTES,303*32)
         except BaseException:
             if hasattr(boot,'proc') and boot.proc.poll() is None:
                 (out/'failure-context.bin').write_bytes(boot.dump(boot.work,8192))
                 boot.send('info registers');state['failureRegisters']=boot.drain();save()
+            if hasattr(boot,'proc'):
+                state['qemuExitCode']=boot.proc.poll()
+                (out/'failure-qemu.log').write_text(boot.drain());save()
             raise
         finally:
             if hasattr(boot,'proc'):boot.quit()
         (out/'native-digests.bin').write_bytes(raw)
         if pin(media)!=media_before:raise ValueError('fixture medium changed during QEMU boot')
         state['mediaUnchanged']=True
+        if chacha:
+            observed,good=check_chacha(words,raw,out,state)
+            state['observed']=observed;state['artifacts']={n:pin(p) for n,p in [('kernel',kernel),('efi',efi),('media',media),('qemu',a.qemu),('firmware',a.firmware)]}
+            if a.mutation:
+                if words[3:]!=(1,1051,1):raise AssertionError('mutation did not complete bounded native controls')
+                if good:raise AssertionError('mutation escaped native controls')
+                state['state']='DETECTED_NATIVE_MUTATION'
+            else:
+                if not good:raise AssertionError('native chacha/control mismatch: '+str(observed))
+                state['state']='PASS_NATIVE_OS_REGION_CHACHA20_POLY1305'
+            state['kernelReproduced']=True;state['efiReproduced']=True;save();print(state['state'],json.dumps(observed));return
         if hashlib.blake2s(b'abc').hexdigest()!='508c5e8c327c14e2e1a72ba34eeb452f37458b209ed63a294d999b4c86675982':raise ValueError('reference KAT differs')
         if hmac.digest(b'',b'','blake2s').hex()!='eaf4bb25938f4d20e72656bbbc7a9bf63c0c18537333c35bdb67db1402661acd':raise ValueError('reference HMAC KAT differs')
         pattern=lambda n:bytes((i*17+3)%256 for i in range(n))
@@ -179,5 +260,6 @@ if __name__=='__main__':
     for name in ['compiler','packager','amu-source','source-stage','payload','qemu','firmware','output']:p.add_argument('--'+name,type=Path,required=True)
     for name in ['compiler-sha256','packager-sha256','source-lock-sha256','payload-sha256','qemu-sha256','firmware-sha256']:p.add_argument('--'+name,required=True)
     p.add_argument('--first-frame-seconds',type=float,default=240)
-    p.add_argument('--mutation',choices=MUTATIONS)
+    p.add_argument('--component',choices=['blake2s','chacha'],default='blake2s')
+    p.add_argument('--mutation',choices=[*MUTATIONS,*CHACHA_MUTATIONS])
     main(p.parse_args())

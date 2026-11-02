@@ -1,0 +1,235 @@
+;; JUN-757: RFC8439 / XChaCha20-Poly1305 without heap vectors or host crypto.
+;; A caller-owned512-byte state contains key[0..31], nonce[32..55], workspace.
+;; init(st,length,nonce-size12/24), aad-byte*, set-length, seal/open consume one operation.
+;; set-length stores the message/sealed length separately from buffer capacities.
+;; seal/open(st,input,input-capacity,output,capacity) require a full512-byte
+;; state and disjoint immutable input/output regions. Both regions are bounded
+;; by64KiB; seal <=65519 bytes, open <=65535 bytes, preserving Kekkai's full
+;; datagram envelope. AAD streams with a checked64-bit byte count.
+;; seal returns ciphertext+tag length; open returns plaintext length, including
+;; zero for authenticated empty input. -1 refuses. Shape/alias refusals do not
+;; mutate; failed authentication changes private workspace but NOT output.
+;; No plaintext is written until ALL16 tag bytes match. Caller must keep the
+;; input immutable throughout the call and enforce nonce uniqueness.
+;; block/block-byte and streaming Poly1305 are separate public primitives.
+;; wipe clears512 bytes. Key/intermediates otherwise remain. Not a constant-
+;; time qualification, socket, identity, app approval or memory grant.
+(ns chacha20.region
+  (:export [init aad-byte set-length seal open block block-byte
+            poly-init poly-byte poly-finish tag-byte wipe]))
+(defn- ld [st at] (kernel-load-u32 st 512 at))
+(defn- put [st at x] (kernel-store-u32 st 512 at x))
+(defn- b [st at] (kernel-load-u8 st 512 at))
+(defn- p [st at x] (kernel-store-u8 st 512 at x))
+(defn- m32 [x] (bit-and x 4294967295))
+(defn- m26 [x] (bit-and x 67108863))
+(defn- rot [x n] (m32 (bit-or (i64-shift-left x n) (u64-shift-right x (- 32 n)))))
+(defn- fill [st at end x]
+  (if (>= at end) 1 (do (p st at x) (fill st (+ at 1) end x))))
+(defn- copy [st src dst n]
+  (if (<= n 0) 1 (do (p st dst (b st src)) (copy st (+ src 1) (+ dst 1) (- n 1)))))
+(defn- w [st i] (ld st (+ 192 (* i 4))))
+(defn- wp [st i x] (put st (+ 192 (* i 4)) x))
+(defn- qr [st ids]
+  (let [a (mod ids 16) b (mod (quot ids 16) 16)
+        c (mod (quot ids 256) 16) d (quot ids 4096)]
+    (do (wp st a (m32 (+ (w st a) (w st b))))
+        (wp st d (rot (bit-xor (w st d) (w st a)) 16))
+        (wp st c (m32 (+ (w st c) (w st d))))
+        (wp st b (rot (bit-xor (w st b) (w st c)) 12))
+        (wp st a (m32 (+ (w st a) (w st b))))
+        (wp st d (rot (bit-xor (w st d) (w st a)) 8))
+        (wp st c (m32 (+ (w st c) (w st d))))
+        (wp st b (rot (bit-xor (w st b) (w st c)) 7)) 1)))
+(defn- rounds [st i]
+  (if (>= i 10) 1
+    (do (qr st 51264) (qr st 55633) (qr st 60002) (qr st 64371)
+        (qr st 64080) (qr st 52065) (qr st 55410) (qr st 59715)
+        (rounds st (+ i 1)))))
+(defn- initial-word [st key nonce counter mode+i]
+  (let [mode (quot mode+i 32) i (mod mode+i 32)]
+    (cond (< i 4) (case i 0 1634760805 1 857760878 2 2036477234 1797285236)
+          (< i 12) (ld st (+ key (* (- i 4) 4)))
+          (= mode 1) (ld st (+ nonce (* (- i 12) 4)))
+          (= i 12) counter
+          :else (ld st (+ nonce (* (- i 13) 4))))))
+(defn- initial [st key nonce counter mode+i]
+  (if (>= (mod mode+i 32) 16) 1
+    (do (put st (+ 128 (* (mod mode+i 32) 4)) (initial-word st key nonce counter mode+i))
+        (wp st (mod mode+i 32) (ld st (+ 128 (* (mod mode+i 32) 4))))
+        (initial st key nonce counter (+ mode+i 1)))))
+(defn- h-output [st i]
+  (if (>= i 8) 1
+    (do (put st (+ 64 (* i 4)) (w st (if (< i 4) i (+ i 8)))) (h-output st (+ i 1)))))
+(defn- working-key [st size]
+  (if (= size 12) (do (copy st 0 64 32) (copy st 32 96 12))
+    (do (initial st 0 32 0 32) (rounds st 0) (h-output st 0)
+        (fill st 96 100 0) (copy st 48 100 8))))
+(defn- block-output [st i]
+  (if (>= i 16) 1
+    (do (put st (+ 256 (* i 4)) (m32 (+ (w st i) (ld st (+ 128 (* i 4))))))
+        (block-output st (+ i 1)))))
+(defn- block-internal [st counter]
+  (do (initial st 64 96 counter 0) (rounds st 0) (block-output st 0)))
+(defn block [st length counter size]
+  (if (or (< length 512) (< counter 0) (> counter 4294967295)
+          (not (or (= size 12) (= size 24)))) 0
+    (do (fill st 64 512 0) (working-key st size) (block-internal st counter) (put st 480 5) 1)))
+(defn block-byte [st length i]
+  (if (or (< length 512) (< i 0) (>= i 64)) -1
+    (if (= (ld st 480) 5) (b st (+ 256 i)) -1)))
+
+;; Poly1305 uses five26-bit limbs. Products/sums stay below2^61 for valid
+;; state. D[5] temporarily occupies the no-longer-needed ChaCha initial state.
+(defn- r [st i] (ld st (+ 320 (* i 4))))
+(defn- h [st i] (ld st (+ 352 (* i 4))))
+(defn- hp [st i x] (put st (+ 352 (* i 4)) x))
+(defn- d [st i] (+ (ld st (+ 128 (* i 8))) (* (ld st (+ 132 (* i 8))) 4294967296)))
+(defn- dp [st i x]
+  (do (put st (+ 128 (* i 8)) (m32 x)) (put st (+ 132 (* i 8)) (u64-shift-right x 32))))
+(defn- dot [st which j acc]
+  (if (>= j 5) acc
+    (dot st which (+ j 1)
+      (+ acc (* (h st j) (if (<= j which) (r st (- which j)) (* 5 (r st (+ which 5 (- 0 j))))))))))
+(defn- products [st i]
+  (if (>= i 5) 1 (do (dp st i (dot st i 0 0)) (products st (+ i 1)))))
+(defn- carry [st i c]
+  (if (>= i 5)
+    (let [x (+ (h st 0) (* c 5))]
+      (do (hp st 1 (+ (h st 1) (u64-shift-right x 26))) (hp st 0 (m26 x))))
+    (do (hp st i (m26 (+ (d st i) c)))
+        (carry st (+ i 1) (u64-shift-right (+ (d st i) c) 26)))))
+(defn- poly-block [st high]
+  (do (hp st 0 (+ (h st 0) (m26 (ld st 400))))
+      (hp st 1 (+ (h st 1) (m26 (bit-or (u64-shift-right (ld st 400) 26) (i64-shift-left (ld st 404) 6)))))
+      (hp st 2 (+ (h st 2) (m26 (bit-or (u64-shift-right (ld st 404) 20) (i64-shift-left (ld st 408) 12)))))
+      (hp st 3 (+ (h st 3) (m26 (bit-or (u64-shift-right (ld st 408) 14) (i64-shift-left (ld st 412) 18)))))
+      (hp st 4 (+ (h st 4) (bit-or (u64-shift-right (ld st 412) 8) high)))
+      (products st 0) (carry st 0 0) (fill st 400 416 0) (put st 416 0) 1))
+(defn- poly-key [st]
+  (do (fill st 320 432 0)
+      (put st 320 (m26 (ld st 256)))
+      (put st 324 (bit-and (bit-or (u64-shift-right (ld st 256) 26) (i64-shift-left (ld st 260) 6)) 67108611))
+      (put st 328 (bit-and (bit-or (u64-shift-right (ld st 260) 20) (i64-shift-left (ld st 264) 12)) 67092735))
+      (put st 332 (bit-and (bit-or (u64-shift-right (ld st 264) 14) (i64-shift-left (ld st 268) 18)) 66076671))
+      (put st 336 (bit-and (u64-shift-right (ld st 268) 8) 1048575))
+      (copy st 272 384 16) (put st 464 1) 1))
+(defn- poly-add [st x]
+  (do (p st (+ 400 (ld st 416)) x) (put st 416 (+ (ld st 416) 1))
+      (if (= (ld st 416) 16) (poly-block st 16777216) 0) 1))
+(defn poly-init [st length]
+  (if (< length 512) 0
+    (do (fill st 64 512 0) (copy st 0 256 32) (poly-key st))))
+(defn- poly-valid [st]
+  (and (= (ld st 464) 1) (< (ld st 416) 16)))
+(defn poly-byte [st length value]
+  (if (< length 512) 0
+    (if (and (poly-valid st) (>= value 0) (<= value 255)) (poly-add st value) 0)))
+(defn- normalize [st i]
+  (if (>= i 4)
+    (do (hp st 0 (+ (h st 0) (* 5 (u64-shift-right (h st 4) 26))))
+        (hp st 4 (m26 (h st 4)))
+        (hp st 1 (+ (h st 1) (u64-shift-right (h st 0) 26))) (hp st 0 (m26 (h st 0))))
+    (do (hp st (+ i 1) (+ (h st (+ i 1)) (u64-shift-right (h st i) 26)))
+        (hp st i (m26 (h st i))) (normalize st (+ i 1)))))
+(defn- plus-five [st i c]
+  (if (>= i 5) c
+    (do (put st (+ 128 (* i 4)) (m26 (+ (h st i) c)))
+        (plus-five st (+ i 1) (u64-shift-right (+ (h st i) c) 26)))))
+(defn- choose-g [st i]
+  (if (>= i 5) 1
+    (do (hp st i (ld st (+ 128 (* i 4)))) (choose-g st (+ i 1)))))
+(defn- final-word [st i]
+  (case i 0 (m32 (bit-or (h st 0) (i64-shift-left (h st 1) 26)))
+    1 (m32 (bit-or (u64-shift-right (h st 1) 6) (i64-shift-left (h st 2) 20)))
+    2 (m32 (bit-or (u64-shift-right (h st 2) 12) (i64-shift-left (h st 3) 14)))
+    (m32 (bit-or (u64-shift-right (h st 3) 18) (i64-shift-left (h st 4) 8)))))
+(defn- tag-words [st i c]
+  (if (>= i 4) 1
+    (do (put st (+ 432 (* i 4)) (m32 (+ (final-word st i) (ld st (+ 384 (* i 4))) c)))
+        (tag-words st (+ i 1) (u64-shift-right (+ (final-word st i) (ld st (+ 384 (* i 4))) c) 32)))))
+(defn- poly-done [st]
+  (do (if (> (ld st 416) 0) (do (p st (+ 400 (ld st 416)) 1) (poly-block st 0)) 0)
+      (normalize st 1) (if (> (plus-five st 0 5) 0) (choose-g st 0) 0) (normalize st 1)
+      (tag-words st 0 0) (put st 464 2) 1))
+(defn poly-finish [st length]
+  (if (< length 512) 0 (if (poly-valid st) (poly-done st) 0)))
+(defn tag-byte [st length i]
+  (if (or (< length 512) (< i 0) (>= i 16)) -1
+    (if (= (ld st 464) 2) (b st (+ 432 i)) -1)))
+
+(defn init [st length size]
+  (if (or (< length 512) (not (or (= size 12) (= size 24)))) 0
+    (do (fill st 64 512 0) (working-key st size) (block-internal st 0)
+        (poly-key st) (put st 480 1) (put st 484 1128812594) 1)))
+(defn- valid [st]
+  (and (= (ld st 484) 1128812594) (= (ld st 480) 1) (poly-valid st)
+       (= (ld st 416) (mod (ld st 488) 16))))
+(defn- aad-count [st]
+  (if (= (ld st 488) 4294967295)
+    (do (put st 488 0) (put st 492 (+ (ld st 492) 1)))
+    (put st 488 (+ (ld st 488) 1))))
+(defn aad-byte [st length value]
+  (if (< length 512) 0
+    (if (and (valid st) (>= value 0) (<= value 255)
+             (not (and (= (ld st 488) 4294967295) (= (ld st 492) 4294967295))))
+      (do (poly-add st value) (aad-count st) 1) 0)))
+(defn set-length [st length n]
+  (if (or (< length 512) (< n 0) (> n 65535)) 0
+    (if (valid st) (do (put st 500 n) 1) 0)))
+(defn- separate [a n b m]
+  (or (= n 0) (= m 0) (<= (+ a n) b) (<= (+ b m) a)))
+(defn- shape [st input n output capacity]
+  (and (>= n 0) (<= n 65536) (>= capacity 0) (<= capacity 65536)
+       (separate st 512 input n) (separate st 512 output capacity)
+       (separate input n output capacity)))
+(defn- pad [st n]
+  (if (<= n 0) 1 (do (poly-add st 0) (pad st (- n 1)))))
+(defn- feed [st input capacity i]
+  (if (>= i (ld st 504)) 1
+    (do (poly-add st (kernel-load-u8-64k input capacity i)) (feed st input capacity (+ i 1)))))
+(defn- mac-lengths [st n i]
+  (if (>= i 16) 1
+    (do (poly-add st (bit-and (u64-shift-right
+          (if (< i 4) (ld st 488) (if (< i 8) (ld st 492) (if (< i 12) n 0)))
+          (* (mod i 4) 8)) 255)) (mac-lengths st n (+ i 1)))))
+(defn- mac-end [st input capacity n]
+  (do (put st 504 n) (feed st input capacity 0) (pad st (mod (- 16 (mod n 16)) 16))
+      (mac-lengths st n 0) (poly-done st)))
+(defn- crypt [st input input-bytes output capacity]
+  (if (>= (ld st 496) (ld st 504)) 1
+    (do (if (= (mod (ld st 496) 64) 0) (block-internal st (+ 1 (quot (ld st 496) 64))) 0)
+        (kernel-store-u8-64k output capacity (ld st 496)
+          (bit-xor (kernel-load-u8-64k input input-bytes (ld st 496))
+                   (b st (+ 256 (mod (ld st 496) 64)))))
+        (put st 496 (+ (ld st 496) 1)) (crypt st input input-bytes output capacity))))
+(defn- copy-tag [st output capacity n+i]
+  (if (>= (mod n+i 32) 16) 1
+    (do (kernel-store-u8-64k output capacity (+ (quot n+i 32) (mod n+i 32))
+            (b st (+ 432 (mod n+i 32)))) (copy-tag st output capacity (+ n+i 1)))))
+(defn seal [st input input-bytes output capacity]
+  (let [n (ld st 500)]
+  (if (not (and (shape st input input-bytes output capacity) (valid st)
+                 (<= n input-bytes) (<= n 65519) (<= (+ n 16) capacity))) -1
+    (do (pad st (mod (- 16 (mod (ld st 488) 16)) 16))
+        (put st 496 0) (put st 504 n) (crypt st input input-bytes output capacity)
+        (mac-end st output capacity n)
+        (copy-tag st output capacity (* n 32))
+        (put st 480 2) (+ n 16)))))
+(defn- tag-diff [st input capacity i diff]
+  (if (>= i 16) diff
+    (tag-diff st input capacity (+ i 1)
+      (bit-or diff (bit-xor (b st (+ 432 i)) (kernel-load-u8-64k input capacity (+ (- (ld st 500) 16) i)))))))
+(defn open [st input input-bytes output capacity]
+  (let [n (ld st 500)]
+  (if (not (and (shape st input input-bytes output capacity) (valid st)
+                (>= n 16) (<= n 65535) (<= n input-bytes)
+                (<= (- n 16) capacity))) -1
+    (do (pad st (mod (- 16 (mod (ld st 488) 16)) 16))
+        (mac-end st input input-bytes (- n 16))
+        (if (not (= (tag-diff st input input-bytes 0 0) 0)) (do (put st 480 4) -1)
+          (do (put st 496 0) (put st 504 (- n 16)) (crypt st input input-bytes output capacity)
+              (put st 480 3) (- n 16)))))))
+(defn wipe [st length]
+  (if (< length 512) 0 (fill st 0 512 0)))
+
