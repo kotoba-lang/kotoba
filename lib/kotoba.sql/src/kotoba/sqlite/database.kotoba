@@ -4,7 +4,8 @@
 
 (ns kotoba.sqlite.database
   {:kotoba/export [create-cron-notepad validate-cron-notepad-image
-                   insert-first-notepad-row insert-second-notepad-row]}
+                   insert-first-notepad-row insert-second-notepad-row
+                   append-notepad-row]}
   (:require [kotoba.sqlite.header :as header]
             [kotoba.sqlite.notepad-record :as notepad-record]
             [kotoba.sqlite.page :as page]
@@ -247,14 +248,81 @@
                  (+ (vector-at spans offset-index)
                     (vector-at spans (+ offset-index 1))))))
 
-;; Append rowid 2 after the exact one-row image made by
-;; insert-first-notepad-row. SQLite table rowids increase, and the composite
-;; primary-key index must also sort after its existing key. This deliberately
-;; refuses page splits, overflow payloads, duplicate/out-of-order keys, and
-;; any image outside this three-page one-row shape.
-(defn insert-second-notepad-row [image :bytes page-size :i64
-                                 job-id :bytes key :bytes value :bytes
-                                 updated-at :bytes] :bytes
+(defn- index-cell-payload [index-page :bytes page-size :i64 cell-index :i64]
+                           :bytes
+  (let [cell-offset (page/cell-pointer index-page page-size 3 0 cell-index)
+        size (if (< cell-offset 0)
+               (vector-i64 -1 -1)
+               (varint/decode index-page cell-offset))
+        payload-offset (vector-at size 1)
+        payload-size (vector-at size 0)]
+    (if (or (< payload-offset 0)
+            (< payload-size 1)
+            (> (+ payload-offset payload-size) page-size))
+      (empty-bytes)
+      (bytes-slice index-page payload-offset (+ payload-offset payload-size)))))
+
+(defn- index-rowid [payload :bytes fields :vector-i64] :i64
+  (let [serial (vector-at fields 7)
+        offset (vector-at fields 8)
+        length (vector-at fields 9)]
+    (cond
+      (= serial 9) 1
+      (and (= serial 1) (= length 1)) (bytes-at payload offset)
+      :else -1)))
+
+(defn- index-cell-matches-row? [payload :bytes fields :vector-i64
+                                image :bytes rows :vector-i64 row-base :i64]
+                                :bool
+  (let [job (safe-span payload fields 2)
+        key (safe-span payload fields 5)
+        job-offset (vector-at rows (+ row-base 1))
+        job-length (vector-at rows (+ row-base 2))
+        key-offset (vector-at rows (+ row-base 3))
+        key-length (vector-at rows (+ row-base 4))
+        rowid (vector-at rows row-base)]
+    (and (= (vector-count fields) 10)
+         (= (vector-at fields 1) (+ 13 (* (bytes-count job) 2)))
+         (= (vector-at fields 4) (+ 13 (* (bytes-count key) 2)))
+         (= (bytes-count job) job-length)
+         (= (bytes-count key) key-length)
+         (bytes-equal? job (bytes-slice image job-offset (+ job-offset job-length)) 0)
+         (bytes-equal? key (bytes-slice image key-offset (+ key-offset key-length)) 0)
+         (= (index-rowid payload fields) rowid))))
+
+(defn- index-cells-match-rows? [index-page :bytes page-size :i64
+                               image :bytes rows :vector-i64 index :i64]
+                               :bool
+  (if (= index (quot (vector-count rows) 9))
+    true
+    (let [payload (index-cell-payload index-page page-size index)
+          fields (record/decode payload)
+          row-base (* index 9)]
+      (and (not= (bytes-count payload) 0)
+           (= (vector-count fields) 10)
+           (index-cell-matches-row? payload fields image rows row-base)
+           (if (= index 0)
+             (index-cells-match-rows? index-page page-size image rows
+                                      (+ index 1))
+             (let [previous-payload (index-cell-payload index-page page-size
+                                                        (- index 1))
+                   previous-fields (record/decode previous-payload)
+                   previous-job (safe-span previous-payload previous-fields 2)
+                   previous-key (safe-span previous-payload previous-fields 5)
+                   job (safe-span payload fields 2)
+                   key (safe-span payload fields 5)]
+               (and (or (> (compare-bytes previous-job job 0) 0)
+                        (and (= (compare-bytes previous-job job 0) 0)
+                             (< (compare-bytes previous-key key 0) 0)))
+                    (index-cells-match-rows? index-page page-size image rows
+                                             (+ index 1)))))))))
+
+;; Append one in-order row to the existing single-page table and PK index.
+;; Before mutation it verifies the current table/index cardinality and every
+;; index entry against the corresponding row; splits and overflow refuse.
+(defn append-notepad-row [image :bytes page-size :i64
+                          job-id :bytes key :bytes value :bytes
+                          updated-at :bytes] :bytes
   (let [header-fields (header/decode image)
         rows (reader/read-notepad-image image page-size)
         empty-image (create-cron-notepad page-size)
@@ -266,37 +334,28 @@
         index-page (bytes-slice image (* page-size 2) (* page-size 3))
         table-header (page/decode-header table-page page-size table-page-number 0)
         index-header (page/decode-header index-page page-size index-page-number 0)
+        row-count (quot (vector-count rows) 9)
+        last-row-base (if (< (vector-count rows) 9)
+                        0
+                        (- (vector-count rows) 9))
+        next-rowid (if (< (vector-count rows) 9)
+                     -1
+                     (+ (vector-at rows last-row-base) 1))
         table-payload (notepad-record/encode job-id key value updated-at)
-        table-cell-page (page/append-table-leaf-cell table-page table-payload 2
+        table-cell-page (page/append-table-leaf-cell table-page table-payload next-rowid
                                                     page-size table-page-number 0)
-        prior-job-id (safe-span image rows 1)
-        prior-key (safe-span image rows 3)
-        index-cell-offset (page/cell-pointer index-page page-size index-page-number 0 0)
-        index-size (if (< index-cell-offset 0)
-                     (vector-i64 -1 -1)
-                     (varint/decode index-page index-cell-offset))
-        index-payload-offset (vector-at index-size 1)
-        index-payload-size (vector-at index-size 0)
-        index-payload (if (or (< index-payload-offset 0)
-                              (< index-payload-size 0)
-                              (> (+ index-payload-offset index-payload-size)
-                                 (bytes-count index-page)))
-                        (empty-bytes)
-                        (bytes-slice index-page index-payload-offset
-                                     (+ index-payload-offset index-payload-size)))
-        index-fields (record/decode index-payload)
-        index-job-id (safe-span index-payload index-fields 2)
-        index-key (safe-span index-payload index-fields 5)
-        index-rowid-type (if (>= (vector-count index-fields) 8)
-                           (vector-at index-fields 7) -1)
         index-data (bytes-concat (bytes-concat job-id key)
-                                 (bytes-from-vector-i64 (vector-i64 2)))
+                                 (bytes-from-vector-i64
+                                   (vector-i64 (if (< next-rowid 1) 1 next-rowid))))
         index-record (record/encode
-                       (vector-i64 (text-serial job-id) (text-serial key) 1)
+                       (vector-i64 (text-serial job-id) (text-serial key)
+                                   (if (= next-rowid 1) 9 1))
                        index-data)
         index-cell (page/encode-index-leaf-cell index-record page-size 0)
         index-cell-page (page/append-index-leaf-cell index-page index-cell
                                                      page-size index-page-number 0)
+        prior-job-id (safe-span image rows (+ last-row-base 1))
+        prior-key (safe-span image rows (+ last-row-base 3))
         next-header (header/advance-change-counter (bytes-slice image 0 100))
         next-image (bytes-concat
                      (bytes-concat
@@ -308,19 +367,14 @@
             (not= (vector-at header-fields 0) page-size)
             (not= (vector-at header-fields 5) 3)
             (not schema-page-match)
-            (not= (vector-count rows) 9)
-            (not= (vector-at rows 0) 1)
+            (= (vector-count rows) 0)
+            (not= (* row-count 9) (vector-count rows))
             (not= (vector-at table-header 0) 13)
-            (not= (vector-at table-header 3) 1)
+            (not= (vector-at table-header 3) row-count)
             (not= (vector-at index-header 0) 10)
-            (not= (vector-at index-header 3) 1)
-            (< index-cell-offset 0)
-            (not= (vector-count index-fields) 10)
-            (not= index-rowid-type 9)
-            (not (and (bytes-equal? index-job-id prior-job-id 0)
-                      (= (bytes-count index-job-id) (bytes-count prior-job-id))))
-            (not (and (bytes-equal? index-key prior-key 0)
-                      (= (bytes-count index-key) (bytes-count prior-key))))
+            (not= (vector-at index-header 3) row-count)
+            (> next-rowid 127)
+            (not (index-cells-match-rows? index-page page-size image rows 0))
             (or (> (compare-bytes prior-job-id job-id 0) 0)
                 (and (= (compare-bytes prior-job-id job-id 0) 0)
                      (>= (compare-bytes prior-key key 0) 0)))
@@ -329,8 +383,13 @@
             (= (bytes-count index-record) 0)
             (= (bytes-count index-cell-page) 0)
             (= (bytes-count next-header) 0)
-            (not= (vector-count next-rows) 18)
-            (not= (vector-at next-rows 0) 1)
-            (not= (vector-at next-rows 9) 2))
+            (not= (vector-count next-rows) (+ (vector-count rows) 9))
+            (not= (vector-at next-rows last-row-base) (vector-at rows last-row-base))
+            (not= (vector-at next-rows (+ last-row-base 9)) next-rowid))
       (empty-bytes)
       next-image)))
+
+(defn insert-second-notepad-row [image :bytes page-size :i64
+                                 job-id :bytes key :bytes value :bytes
+                                 updated-at :bytes] :bytes
+  (append-notepad-row image page-size job-id key value updated-at))
