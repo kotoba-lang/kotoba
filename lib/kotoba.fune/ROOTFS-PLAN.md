@@ -135,3 +135,41 @@ held-snapshot path, not all possible host races. The test used the draft ARM64
 worker in Amu PR #1785. Source composition, local VM observation, and a Python
 test observer do not qualify project linking, native x86, a production process
 supervisor, an OCI-compliant extractor or workload execution.
+
+## Full-layout stream preflight candidate
+
+`fune.layout-stream/emit-layout-hex` is a separate output-capable module. It
+first runs the bounded layout marker, index, manifest, config and all-layer
+planner checks without writing a worker stream. After that preflight it reads
+the manifest again through a bounded sealed snapshot and checks the caller's
+expected digest again. It then verifies each layer again and sends bytes from
+that layer's held snapshot. This deliberately does two verification passes;
+it avoids treating an earlier path read as a future extraction grant, at the
+cost of additional I/O and hashing. `fune.layout-check` remains declared with
+only `:fs/app-data`; the stream module separately requests `:io/write`.
+
+On ARM64, a native observer connected this producer to the native worker and
+read back the 16,643-byte and 1 MiB fixtures. Bad marker, index, config digest,
+unsupported architecture, and a corrupted final layer all failed preflight
+before **any** stream byte was emitted. Separately compiled controls that
+removed marker validation or config validation accepted their corresponding
+bad fixtures and failed the observer. The native candidate supervisor also
+passed its good, corrupted-layer and 1 MiB cases with this producer. Prior
+read-only layout planning still accepted the good fixture and refused the
+corrupt layer when composed without the streaming module.
+
+A test-only producer changed one byte of the final layer *after* preflight,
+keeping the layer size unchanged. The second-pass digest check refused it;
+the observer saw 59 stream bytes from earlier entries, then the producer and
+worker failed. A separate control with digest comparison disabled accepted the
+same mutation and failed the observer. This shows why a supervisor must
+discard the whole private tree on **every** later failure; preflight does not
+make the source paths immutable. The test fixture's original and mutated
+layers were independently checked to have equal length and differ by one byte.
+
+The stream still depends on caller-authenticated executable and manifest
+digests, explicit acknowledgment count, and the draft Amu supervisor/worker.
+It does not publish the rootfs, start a program, support general OCI features,
+or establish a same-principal security boundary. `ok` from the producer alone
+is not an execution authorization. Source-composed ARM64 and local VM tests do
+not qualify source-locked project linking, native x86, hosted CI or a release.

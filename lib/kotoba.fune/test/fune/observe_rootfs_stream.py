@@ -15,7 +15,8 @@ from pathlib import Path
 DIGEST = "sha256:abeeb5676fc9f826390bebd952b0a8336beda3230f1dab60b8cfde84f160aebf"
 
 
-def run_case(guest, worker, root, good, digest=DIGEST, expected=None):
+def run_case(guest, worker, root, good, digest=DIGEST, expected=None,
+             expected_error=b"fune/blob-digest", preflight=False):
     env = {"PATH": "/nonexistent", "KEXE_ALLOW": "35,37,38,39", "KEXE_COMMAND": "1",
            "KEXE_FUEL": "100000000000", "KEXE_STACK_BYTES": "8388608",
            "KEXE_CAP_RESOURCES_35": str(root)}
@@ -39,12 +40,14 @@ def run_case(guest, worker, root, good, digest=DIGEST, expected=None):
         diagnostics = source.stderr.read()
         source_code = source.wait(timeout=60)
         if not good:
-            assert source_code != 0 and b"fune/blob-digest" in diagnostics, (source_code, diagnostics)
+            assert source_code != 0 and expected_error in diagnostics, (source_code, diagnostics)
             sink.stdin.close()
             sink.stdin = None
             out, err = sink.communicate(timeout=20)
             assert sink.returncode == 2 and b"FREFUSE:" in err, (sink.returncode, out, err)
-            return {"case": "tampered", "producerExit": source_code, "workerExit": sink.returncode,
+            if preflight:
+                assert transferred == 0 and not out, (transferred, out)
+            return {"case": root.name, "producerExit": source_code, "workerExit": sink.returncode,
                     "streamBytes": transferred}
         assert source_code == 0 and not diagnostics, (source_code, diagnostics)
         assert sink.stdout.read(3) == b"KKK", "directory, create and replacement acknowledgments"
@@ -74,9 +77,21 @@ if __name__ == "__main__":
     parser.add_argument("--worker", type=Path, required=True)
     parser.add_argument("--layouts", type=Path, required=True)
     parser.add_argument("--large-digest", help="also check the independently staged 1 MiB fixture")
+    parser.add_argument("--full-layout", action="store_true", help="check layout metadata before any stream")
+    parser.add_argument("--bad-arch-digest", help="manifest digest of the unsupported architecture fixture")
     args = parser.parse_args()
     print(run_case(args.guest.resolve(), args.worker.resolve(), (args.layouts / "plan-binary").resolve(), True))
-    print(run_case(args.guest.resolve(), args.worker.resolve(), (args.layouts / "plan-binary-third-tampered").resolve(), False))
+    print(run_case(args.guest.resolve(), args.worker.resolve(), (args.layouts / "plan-binary-third-tampered").resolve(), False,
+                   preflight=args.full_layout))
+    if args.full_layout:
+        for name, reason in (("plan-binary-bad-marker", b"fune/layout-marker"),
+                             ("plan-binary-bad-index", b"fune/layout-index"),
+                             ("plan-binary-bad-config", b"fune/blob-digest")):
+            print(run_case(args.guest.resolve(), args.worker.resolve(), (args.layouts / name).resolve(), False,
+                           expected_error=reason, preflight=True))
+        assert args.bad_arch_digest
+        print(run_case(args.guest.resolve(), args.worker.resolve(), (args.layouts / "plan-binary-bad-arch").resolve(), False,
+                       digest=args.bad_arch_digest, expected_error=b"fune/config-platform", preflight=True))
     if args.large_digest:
         print(run_case(args.guest.resolve(), args.worker.resolve(), (args.layouts / "plan-binary-max").resolve(),
                        True, digest=args.large_digest, expected=bytes(range(256)) * 4096))

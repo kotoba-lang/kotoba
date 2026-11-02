@@ -100,13 +100,15 @@ print('layer', 'sha256:' + ld)
 
 # Independent full-manifest planner fixtures. The order deliberately matters:
 # the bounded planner requires an explicit directory before a child file.
-def plan_layout(name, layers):
+def plan_layout(name, layers, arch=None):
     root = base / name
     blobs = root / 'blobs' / 'sha256'
     blobs.mkdir(parents=True)
     (root / 'oci-layout').write_text('{"imageLayoutVersion":"1.0.0"}')
     layer_digests = [hashlib.sha256(data).hexdigest() for data in layers]
     plan_config_obj = json.loads(config)
+    if arch is not None:
+        plan_config_obj['architecture'] = arch
     plan_config_obj['rootfs']['diff_ids'] = ['sha256:' + digest for digest in layer_digests]
     plan_config = json.dumps(plan_config_obj, separators=(',', ':')).encode()
     plan_manifest_obj = json.loads(manifest)
@@ -127,7 +129,23 @@ def plan_layout(name, layers):
 
 plan_digests = plan_layout('plan-good', [other, layer, (source / 'replacement.tar').read_bytes()])
 binary_digests = plan_layout('plan-binary', [other, layer, (source / 'binary-replacement.tar').read_bytes()])
+plan_layout('plan-binary-bad-arch', [other, layer, (source / 'binary-replacement.tar').read_bytes()], arch='amd64')
 plan_layout('plan-binary-max', [other, layer, (source / 'max-replacement.tar').read_bytes()])
+for name in ('plan-binary-bad-marker', 'plan-binary-bad-index', 'plan-binary-bad-config'):
+    shutil.copytree(base / 'plan-binary', base / name)
+(base / 'plan-binary-bad-marker' / 'oci-layout').write_text('{"imageLayoutVersion":"2.0.0"}')
+# Preserve the original digest but make the index descriptor's size incorrect.
+bad_index = base / 'plan-binary-bad-index' / 'index.json'
+bad_index_obj = json.loads(bad_index.read_bytes())
+bad_index_obj['manifests'][0]['size'] += 1
+bad_index.write_text(json.dumps(bad_index_obj, separators=(',', ':')))
+binary_manifest_hex = json.loads((base / 'plan-binary' / 'index.json').read_bytes())['manifests'][0]['digest'].split(':', 1)[1]
+binary_manifest = json.loads((base / 'plan-binary' / 'blobs' / 'sha256' / binary_manifest_hex).read_bytes())
+binary_config_hex = binary_manifest['config']['digest'].split(':', 1)[1]
+bad_config = base / 'plan-binary-bad-config' / 'blobs' / 'sha256' / binary_config_hex
+bad_config_data = bytearray(bad_config.read_bytes())
+bad_config_data[-1] ^= 1
+bad_config.write_bytes(bad_config_data)
 plan_layout('plan-parent-missing', [layer, other])
 plan_layout('plan-duplicate', [other, (source / 'duplicate.tar').read_bytes()])
 shutil.copytree(base / 'plan-good', base / 'plan-second-tampered')
