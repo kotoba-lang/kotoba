@@ -1,0 +1,58 @@
+(ns kagami.fleet-store-native
+  (:export [advance])
+  (:require [kagami.fleet-native :as fleet] [hata.store-io :as io] [hata.codec :as codec]))
+
+;; File is only a cache of an independently trusted checkpoint. Callers must
+;; provision it from trusted state and must never derive their trust from it.
+;; All writers must use the same stable lock inode. The caller owns out.
+(defn fs-path [base :string name :string] :string
+  (string-concat base (string-concat "/" name)))
+(defn fs-hex? [s :string] :bool
+  (if (not (= (string-byte-length s) 64)) false
+    (let [b (vector-i64-from-bytes (string-to-utf8 s))]
+      (loop [i 0]
+        (if (= i 64) true
+          (let [c (vector-at b i)]
+            (if (or (and (>= c 48) (<= c 57)) (and (>= c 97) (<= c 102)))
+              (recur (+ i 1)) false)))))))
+(defn fs-hex-bytes [v :vector-i64 offset :i64] :string
+  (let [digits "0123456789abcdef" out (vector-alloc 64)]
+    (loop [i 0]
+      (if (= i 32) (string-from-utf8 (bytes-from-vector-i64 out))
+        (let [b (vector-at v (+ offset i))
+              a (vector-assoc! out (* i 2) (string-code-point-at digits (quot b 16)))
+              z (vector-assoc! out (+ (* i 2) 1) (string-code-point-at digits (rem b 16)))]
+          (recur (+ i 1)))))))
+(defn fs-snapshot [seq :i64 hash :string value :string signer :string] :string
+  (string-concat "fleet-checkpoint/v1\n" (string-concat (string-from-i64 seq)
+    (string-concat "\n" (string-concat hash (string-concat "\n" (string-concat value
+      (string-concat "\n" (string-concat signer "\n")))))))))
+(defn fs-persist [base :string text :string] :bool
+  (let [temp (fs-path base "fleet.state.pending") final (fs-path base "fleet.state")]
+    (and (io/write temp text) (io/sync temp) (io/rename temp final) (io/sync base))))
+
+;; Return committed/stale/busy/invalid/uncertain. Uncertain includes every I/O
+;; or unlock failure, including a rename that might already have reached disk.
+;; Committed requires all sync calls and unlock to succeed. Out changes only
+;; on committed; it is not a persistent checkpoint or a trusted signer store.
+(defn advance [out :vector-i64 base :string seq :i64 hash :string value :string signer :string heads :document] :string
+  (if (or (not (= (vector-count out) 64)) (not (codec/safe-base? base))
+          (< seq 0) (not (fs-hex? hash)) (not (fs-hex? value))) "invalid"
+    (let [result (arena-scope
+      (let [plan (vector-alloc 64)]
+        (if (not (fleet/verify-edn-plan-into plan heads seq hash signer)) 1
+          (if (not (io/lock (fs-path base "fleet.lock"))) 2
+            (let [old (fs-snapshot seq hash value signer)
+                  observed (io/read (fs-path base "fleet.state"))
+                  status (if (not (string=? old observed)) 3
+                           (if (fs-persist base (fs-snapshot (+ seq (document-count heads))
+                                (fs-hex-bytes plan 0) (fs-hex-bytes plan 32) signer)) 0 4))
+                  unlocked (io/unlock (fs-path base "fleet.lock"))]
+              (if (not unlocked) 4
+                (if (not (= status 0)) status
+                  (loop [i 0]
+                    (if (= i 64) 0
+                      (let [ignored (vector-assoc! out i (vector-at plan i))]
+                        (recur (+ i 1))))))))))))]
+      (cond (= result 0) "committed" (= result 1) "invalid" (= result 2) "busy"
+            (= result 3) "stale" :else "uncertain"))))
