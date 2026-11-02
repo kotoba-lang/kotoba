@@ -41,6 +41,49 @@
         (if (= i n) out (recur (+ i 1) (vector-assoc! out (- i 5) (vector-at r i)))))
       (vector-alloc 0))))
 
+;; FS2 F reports metadata without materializing file data. The subsequent V
+;; operation checks the exact size again before copying and sealing it, so a
+;; replacement or in-place size change between F and V cannot bypass the cap.
+(defn- layout-size-field [reply :string limit :i64] :i64
+  (let [n (string-byte-length reply)
+        valid (and (>= n 8) (= (string-substring reply 0 5) "\u0000FS2\u0000"))]
+    (if (not valid) -1
+      (let [space (loop [i 5]
+                    (cond (>= i n) -1 (= (string-code-point-at reply i) 32) i
+                          (or (< (string-code-point-at reply i) 48) (> (string-code-point-at reply i) 57)) -1
+                          :else (recur (+ i 1))))]
+        (if (or (< space 6) (>= (+ space 1) n)) -1
+          (loop [i (+ space 1) total 0 digits 0]
+            (if (>= i n) -1
+              (let [c (string-code-point-at reply i)]
+                (cond (= c 32) (if (> digits 0) total -1)
+                      (or (< c 48) (> c 57)) -1
+                      (> total (quot (- limit (- c 48)) 10)) -1
+                      :else (recur (+ i 1) (+ (* total 10) (- c 48)) (+ digits 1)))))))))))
+
+(defn- layout-digit [n :i64] :string
+  (case n 0 "0" 1 "1" 2 "2" 3 "3" 4 "4" 5 "5" 6 "6" 7 "7" 8 "8" "9"))
+(defn- layout-dec [n :i64] :string
+  (if (< n 10) (layout-digit n) (str (layout-dec (quot n 10)) (layout-digit (rem n 10)))))
+(defn- layout-frame [op :string path :string tail :string] :string
+  (str "\u0000FS2\u0000" op path "\u0000" tail))
+
+(defn- layout-read-small-bounded [path :string limit :i64] :vector-i64
+  (let [metadata (typed-cap-call :fs/app-data :string :string (layout-frame "F" path ""))
+        size (layout-size-field metadata limit)]
+    (if (< size 0) (vector-alloc 0)
+      (let [opened (typed-cap-call :fs/app-data :string :string (layout-frame "V" path (layout-dec size)))]
+        (if (not (= opened "\u0000FS2\u00001")) (vector-alloc 0)
+          (let [reply (typed-cap-call :fs/app-data :string :bytes (layout-frame "W" path (str "0:" (layout-dec size))))
+                closed (snapshot/close-snapshot path)
+                valid (and closed (= (bytes-count reply) (+ size 5)) (= (bytes-at reply 0) 0)
+                           (= (bytes-at reply 1) 70) (= (bytes-at reply 2) 83)
+                           (= (bytes-at reply 3) 50) (= (bytes-at reply 4) 0))]
+            (if valid (vector-i64-from-bytes (bytes-slice reply 5 (+ size 5))) (vector-alloc 0))))))))
+
+(defn- layout-metadata [path :string limit :i64 snapshots :bool] :vector-i64
+  (if snapshots (layout-read-small-bounded path limit) (layout-read-small path)))
+
 (defn- layout-read-layer [path :string] [:list :bytes]
   (let [chunks (typed-cap-call :fs/app-data :string [:list :bytes] (layout-read-frame path))]
     (if (= (vector-count chunks) 0) (typed-list-new [:list :bytes])
@@ -117,15 +160,15 @@
 (defn- layout-verify [root :string expected :string snapshots :bool] :string
   (cond (not (layout-root-ok? root)) "fune/layout-root"
         (not (manifest/digest-valid? expected)) "fune/expected-digest"
-        :else (if (not (layout-marker-ok? (layout-read-small (string-concat root "/oci-layout")))) "fune/layout-marker"
-          (let [m (layout-read-small (layout-path root expected))
-                index (layout-read-small (string-concat root "/index.json"))
+        :else (if (not (layout-marker-ok? (layout-metadata (string-concat root "/oci-layout") 1024 snapshots))) "fune/layout-marker"
+          (let [m (layout-metadata (layout-path root expected) 1048576 snapshots)
+                index (layout-metadata (string-concat root "/index.json") 1048576 snapshots)
                 p (manifest/manifest-problem m expected)]
             (if (not (= p "ok")) p
               (if (not (layout-index-ok? index expected (vector-count m))) "fune/layout-index"
               (let [digest (manifest/config-digest m expected)]
                 (if (not (manifest/digest-valid? digest)) "fune/descriptor-digest"
-                  (let [cfg (layout-read-small (layout-path root digest))
+                  (let [cfg (layout-metadata (layout-path root digest) 1048576 snapshots)
                         q (config/config-policy-problem m expected cfg)]
                     (if (= q "ok")
                       (if snapshots (layout-snapshot-layers-problem root expected m) (layout-layers-problem root expected m))

@@ -6,6 +6,9 @@ import shutil
 import sys
 from pathlib import Path
 
+if len(sys.argv) not in (3, 4) or (len(sys.argv) == 4 and sys.argv[3] != '--resource-cases'):
+    raise SystemExit('usage: stage_layout_fixtures.py SOURCE NEW_DEST [--resource-cases]')
+
 source = Path(sys.argv[1])
 base = Path(sys.argv[2])
 base.mkdir(parents=True, exist_ok=False)
@@ -94,3 +97,26 @@ print('unsafe-tar-manifest', 'sha256:' + hashlib.sha256(unsafe_manifest).hexdige
 print('manifest', 'sha256:' + md)
 print('config', 'sha256:' + cd)
 print('layer', 'sha256:' + ld)
+
+if len(sys.argv) == 4:
+    # Sparse files exercise pre-read bounds without allocating their full size.
+    for name, rel, size in (
+        ('oversize-marker', 'oci-layout', 1025),
+        ('oversize-index', 'index.json', 536870912),
+        ('oversize-manifest', 'blobs/sha256/' + md, 536870912),
+        ('oversize-config', 'blobs/sha256/' + cd, 536870912),
+    ):
+        target = base / name
+        shutil.copytree(base / 'good', target)
+        with (target / rel).open('r+b') as file:
+            file.truncate(size)
+        print(name, size)
+    for name, rel, size in (('limit-marker', 'oci-layout', 1024),
+                             ('limit-index', 'index.json', 1048576)):
+        target = base / name
+        shutil.copytree(base / 'good', target)
+        file = target / rel
+        data = file.read_bytes()
+        file.write_bytes(data + b' ' * (size - len(data)))
+        print(name, size)
+    shutil.copytree(base / 'good', base / 'race-marker')

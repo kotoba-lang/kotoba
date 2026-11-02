@@ -77,10 +77,28 @@ layer, showing that the negative case detects skipped layers. A binary built
 with the old runtime refused the snapshot operation instead of falling back.
 The original `verify-layout` also accepted the good fixture and refused a
 changed second layer when built with that old runtime. These test runners are
-not production CLIs. Marker, index, manifest and config reads are still whole
-file reads whose limits are checked after the provider returns; only layer
-reads use the bounded snapshot path. The provider's sealed memfd consumes up
-to the declared layer size in kernel-managed memory.
+not production CLIs. For the snapshot route, marker, index, manifest and config
+sizes are read from FS2 metadata before opening a snapshot; V rechecks the size
+and seals the copy, and W reads at most the accepted bound. A changed size
+between metadata and V refuses. The original `verify-layout` still performs
+unbounded provider reads before its checks. The provider's sealed memfd consumes
+up to the declared layer size in kernel-managed memory.
+
+On ARM64, `observe_layout_metadata.py` traced the actual fstat/read boundary.
+It observed no reads of a 512 MiB index before size refusal. In a separate
+disposable layout it grew the marker immediately after metadata fstat; V
+refused the changed size (stage 15, exit 126). A rebuilt control that bypassed
+the bounded snapshot metadata route failed this race observation. Valid marker
+and index inputs padded to exactly 1024 bytes and 1 MiB respectively were
+accepted. This test does not prove all filesystem races or native x86 behavior.
+
+Stage disposable oversized and race inputs with
+`stage_layout_fixtures.py SOURCE NEW_DEST --resource-cases`. On native Linux,
+run `observe_layout_metadata.py --image IMAGE --layout NEW_DEST/race-marker
+--digest DIGEST --output NEW_REPORT --case race` and separately use
+`--layout NEW_DEST/oversize-index --case oversize`. The first invocation
+intentionally enlarges its marker, and each report directory must be new.
+The observer uses ptrace on its own child only; the guest supplies the verdict.
 
 For the snapshot layout runner, compose the existing SHA2, JSON and image
 manifest bodies, then add `image_config.kotoba`, `layer_tar.kotoba`,
