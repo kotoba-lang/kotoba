@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Build source-bound native fleet successor fixtures with negative controls.
 
-Only public synthetic signatures are used; this does not test a receiver,
+Public synthetic signatures and a public, untrusted historical record are used.
+This does not test a receiver,
 checkpoint authority, persistent trust, rotation, transport, or deployment.
 """
 import argparse
 import importlib.util
+import json
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -64,8 +66,13 @@ def main():
         source = source.replace('ed/', '').replace('sha/', '') + '\n' + test
         image = gate.build(label, 'fixture.kotoba', {'fixture.kotoba': source.encode()})
         gate.run(label + '-run', image, expected=0 if needle is None else 1)
-    gate.finish('PASS_FLEET_NATIVE_SUCCESSOR', scope='synthetic primitive only; no receiver, trust store, history synchronization or deployment',
+    gate.finish('PASS_FLEET_NATIVE_SUCCESSOR', scope='synthetic and public historical fixtures only; no receiver, trust store, history synchronization or deployment',
                 sourceSHA256=module.sha(native.encode()), testSHA256=module.sha(test.encode()), mutations=list(mutations))
+    evidence_path = gate.out / 'evidence.json'
+    evidence = json.loads(evidence_path.read_text())
+    evidence['publicTestKeysOnly'] = False  # includes an untrusted historical signer
+    evidence['historicalSignerTrusted'] = False
+    evidence_path.write_text(json.dumps(evidence, indent=2) + '\n')
 
 
 if __name__ == '__main__':
