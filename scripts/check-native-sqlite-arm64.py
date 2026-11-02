@@ -88,13 +88,23 @@ def main(amu, compiler, out, amu_pin=None):
                      KEXE_COMMAND="1")
     receipts = []
     for fixture_module, _ in FIXTURES:
-        lock_lines = ["KSL1", f"entry {staged[fixture_module]}"]
         graph = dict(MODULES)
         graph[fixture_module] = next(source for name, source in FIXTURES if name == fixture_module)
         graph_paths = {module: staged[module] for module in graph}
-        lock_lines.append(f"root {source_root}")
-        lock_lines.extend(f"file {sha(path)} {path}"
-                          for _, path in sorted(graph_paths.items(), key=lambda item: item[1].as_posix()))
+        if fixture_module == "sqlite.interior-root-job-delete":
+            # Use KSL2 for the new standalone fixture so its full multi-module
+            # graph is bound by exact namespace-to-path mappings. This avoids
+            # root-search ambiguity while retaining an exact byte pin for
+            # every module and the entry source.
+            lock_lines = ["KSL2", f"entry {staged[fixture_module]}"]
+            lock_lines.extend(f"module {module} {path}"
+                              for module, path in sorted(graph_paths.items()))
+            lock_lines.extend(f"file {sha(path)} {path}"
+                              for path in sorted(graph_paths.values(), key=lambda item: item.as_posix()))
+        else:
+            lock_lines = ["KSL1", f"entry {staged[fixture_module]}", f"root {source_root}"]
+            lock_lines.extend(f"file {sha(path)} {path}"
+                              for path in sorted(graph_paths.values(), key=lambda item: item.as_posix()))
         lock = out / (fixture_module.replace(".", "-") + ".ksl")
         lock.write_text("\n".join(lock_lines) + "\n")
         stem = fixture_module.replace(".", "-")
