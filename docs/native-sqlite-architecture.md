@@ -58,8 +58,9 @@ SQL compatibility.
 
 1. Pure Kotoba SQLite v3 codec: 100-byte database header encode/decode,
    empty one-page database image construction, page-size and encoding
-   validation, 1..9-byte varints, serial types, record encode/decode, and
-   checked page offsets. No file writes in this unit.
+   validation, 1..9-byte varints, serial types, record encode/decode, bounded
+   table-leaf cell encoding, and checked page offsets. No file writes in this
+   unit.
 2. Schema and B-tree reader: validate `sqlite_schema`, resolve the table and
    composite primary-key index, walk leaf/interior pages, and reject malformed
    pointers, cycles, overflow chains, unsupported collations, and unsupported
@@ -105,6 +106,8 @@ dated oracle only; oracle success never substitutes for Kotoba/Amu execution.
 The Kotoba package now has source for the fixed database header, signed-i64
 varints, four-TEXT notepad records, generic record-layout spans, B-tree page
 headers/cell pointers, table-leaf cells, and table-interior cell boundaries.
+It can also encode a table-leaf cell when its payload fits on the page; it
+refuses negative rowids and payloads requiring overflow pages.
 On 2026-11-02, source-locked Amu Mac ARM64 runtime fixtures passed for positive
 codec calls, malformed/truncated refusal sentinels, and negative-varint empty
 encoding. A separate source-locked fixture constructs empty database images
