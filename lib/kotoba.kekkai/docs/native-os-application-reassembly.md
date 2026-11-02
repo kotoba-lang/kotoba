@@ -119,3 +119,14 @@ revoke/reconnect, protected identities/config/entropy/clock/durable floors,
 native SSH, isolation/security/operations and distributed-OS/L1 acceptance.
 PXE/SSH and the owner's physical-input pause remain. No physical deployment,
 production release, trusted approval or Reddit spend is implied.
+
+## Later receive-composition unit
+
+The separate [native managed application receiver](native-application-receive.md)
+connects actual authenticated NIC ingress to the full-capacity reassembly owner.
+Its source-bound evidence is recorded separately; the earlier receipt and its
+component scope above remain unchanged. This establishes the responder kernel diagnostic
+receive/reassembly path. Product integration, complete
+request/reply schema and pending service context, directed socket/policy/fresh
+consent, actual Mac/6600H app installation/live peer, native SSH and production
+isolation/operations/OS/L1 acceptance remain open.

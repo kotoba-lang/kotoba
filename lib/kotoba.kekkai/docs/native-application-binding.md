@@ -66,3 +66,14 @@ smoke and old NIC regression alone do not establish reception, completed
 messages, correct lifecycle binding, app installation or a live connection.
 Those remain open along with service authorization/consent, native Mac backend,
 native SSH, physical/security/operations and full OS/L1 production acceptance.
+
+## Later receive-composition unit
+
+The separate [native managed application receiver](native-application-receive.md)
+connects actual authenticated NIC ingress to the full-capacity reassembly owner.
+Its source-bound evidence is recorded separately; the earlier receipt and its
+component scope above remain unchanged. This establishes the responder kernel diagnostic
+receive/reassembly path. Product integration, complete
+request/reply schema and pending service context, directed socket/policy/fresh
+consent, actual Mac/6600H app installation/live peer, native SSH and production
+isolation/operations/OS/L1 acceptance remain open.
