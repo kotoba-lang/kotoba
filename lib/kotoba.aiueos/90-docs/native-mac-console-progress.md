@@ -94,4 +94,3 @@ modifier chords, uppercase/general Unicode/IME, clipboard policy, dynamic
 resolution, reconnect/held-button fault qualification, trusted remote app
 consent, OS-native SSH and Kekkai transport. Physical Trackpad/HHKB acceptance
 is owner-paused; JUN-502 drag/flicker and AWAI-121 ChromeOS parity stay open.
-
