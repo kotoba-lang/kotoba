@@ -98,34 +98,44 @@
     (string-concat (string-from-utf8 (bytes-from-vector-i64 (vector-i64 (+ 65 form))))
       (string-concat path (string-concat "\u0000" tail)))))
 
-(defn- db-fs2-unlink-outcome [path :string] :i64
+(defn- db-fs2-remove-outcome [form :i64 path :string] :i64
   (let [response (typed-cap-call :fs/app-data :string :string
-                   (db-fs2-string-frame 9 path ""))]
+                   (db-fs2-string-frame form path ""))]
     (if (and (>= (string-byte-length response) 6)
              (string=? (string-substring response 0 5) "\u0000FS2\u0000"))
       (let [payload (string-substring response 5 (string-length response))]
         (if (string=? payload "1") 1 (if (string=? payload "0") 0 -1)))
       -1)))
 
-(defn- db-fs2-temp-name [prefix :string] :string
+(defn- db-fs2-temp-name [directory :string prefix :string] :string
   (let [response (typed-cap-call :fs/app-data :string :string
-                   (db-fs2-string-frame 13 "." prefix))
+                   (db-fs2-string-frame 13 directory prefix))
         acknowledged (and (>= (string-byte-length response) 5)
                           (string=? (string-substring response 0 5) "\u0000FS2\u0000"))
-        name (if acknowledged (string-substring response 5 (string-length response)) "")
+        returned-path (if acknowledged (string-substring response 5 (string-length response)) "")
+        name (loop [index 0 slash -1]
+               (if (= index (string-length returned-path))
+                 (if (< slash 0) returned-path
+                   (string-substring returned-path (+ slash 1) (string-length returned-path)))
+                 (recur (+ index 1)
+                   (if (= (string-code-point-at returned-path index) 47) index slash))))
         prefix-length (string-length prefix)
-        valid-suffix (and (= (string-length name) (+ prefix-length 12))
+        suffix-length (- (string-length name) prefix-length)
+        suffix-valid? (and (>= suffix-length 0)
           (loop [index prefix-length]
             (if (= index (string-length name)) true
               (let [code (string-code-point-at name index)]
                 (if (or (and (>= code 48) (<= code 57))
-                        (and (>= code 97) (<= code 102)))
+                        (and (>= code 97) (<= code 122)))
                   (recur (+ index 1))
-                  false)))))]
-    (if (and acknowledged valid-suffix
-             (string=? (string-substring name 0 prefix-length) prefix))
-      name
-      "")))
+                  false)))))
+        valid-suffix (and (or (= suffix-length 6) (= suffix-length 12)) suffix-valid?)]
+    (if (string=? response "\u0000FS2\u0000Z")
+      "\u0000REFUSED"
+      (if (and acknowledged valid-suffix
+               (string=? (string-substring name 0 prefix-length) prefix))
+        name
+        ""))))
 
 (defn- db-sqlite-header-valid? [image :bytes page-size :i64] :bool
   (and (>= (bytes-count image) (* page-size 3))
@@ -155,45 +165,82 @@
           (bytes-concat (bytes-from-vector-i64 (vector-i64 1)) image)
           (bytes-from-vector-i64 (vector-i64 0)))))))
 
-;; Publish through a fresh exclusive random temp in the FS2 authority root. A
-;; single persistent lock serializes image replacements. Unique names avoid
-;; clobbering unrelated app-data entries; a crash may leave an inert orphan
-;; stage, but the database remains old or renamed and the next write proceeds.
+;; The qualified FS2 providers expose different N products. macOS N at the
+;; authority root creates a randomized file (12 hex suffix); Linux creates a
+;; randomized directory (6 alphanumeric suffix). Keep B paths provider-relative
+;; and use FS35-scoped paths for durability/rename. Linux publishes a fixed file
+;; inside the private directory and removes the empty directory afterward.
 (defn- db-fs2-publish-image [path :string image :bytes] :bytes
   (let [path (db-fs35-scoped-path path)
         parent (db-fs2-parent path)
         parent-directory (if (or (string=? parent "") (string=? parent ".")) "/" parent)
         temporary-prefix "kotoba-sqlite-"
-        lock-path "/.kotoba-sqlite-lock"
+        stage-file-name "image.sqlite"
+        lock-path (if (or (string=? parent "") (string=? parent "."))
+                    ".kotoba-sqlite-lock"
+                    (string-concat parent "/.kotoba-sqlite-lock"))
+        scoped-lock-path (db-fs35-scoped-path lock-path)
         acquired (and (not (string=? path ""))
-                      (db-fs35-one? (string-concat lock-path "FLOCK_SEP")))]
+                      (db-fs35-one? (string-concat scoped-lock-path "FLOCK_SEP")))]
     (if (not acquired) (bytes-from-vector-i64 (vector-i64 4))
       (if (not (db-sqlite-sidecars-clear? path))
-        (if (db-fs35-one? (string-concat lock-path "UNLOCK_SEP"))
+        (if (db-fs35-one? (string-concat scoped-lock-path "UNLOCK_SEP"))
           (bytes-from-vector-i64 (vector-i64 6))
           (bytes-from-vector-i64 (vector-i64 5)))
-      (let [temporary (db-fs2-temp-name temporary-prefix)
-            temporary-path (if (string=? temporary "") ""
-                             (string-concat "/" temporary))
-            request (db-fs2-frame 1 (string-to-utf8 temporary) image)
+      (let [parent-request (if (or (string=? parent "") (string=? parent "."))
+                             "." parent)
+            parent-temporary (db-fs2-temp-name parent-request temporary-prefix)
+            parent-refused? (string=? parent-temporary "\u0000REFUSED")
+            root-candidate (if parent-refused?
+                             (db-fs2-temp-name "." temporary-prefix) "")
+            root-temporary (if (string=? root-candidate "\u0000REFUSED") "" root-candidate)
+            parent-staging? (and (not (string=? parent-temporary ""))
+                                 (not parent-refused?))
+            temporary (if parent-staging? parent-temporary root-temporary)
+            flat-file-provider? (= (- (string-length temporary) (string-length temporary-prefix)) 12)
+            temporary-directory (if flat-file-provider? temporary
+                                  (if parent-staging?
+                                    (string-concat parent (string-concat "/" temporary))
+                                    temporary))
+            temporary-path (if flat-file-provider? temporary
+                             (string-concat temporary-directory
+                               (string-concat "/" stage-file-name)))
+            scoped-temporary-path (db-fs35-scoped-path temporary-path)
+            scoped-temporary-directory (db-fs35-scoped-path temporary-directory)
+            scoped-parent-directory (db-fs35-scoped-path parent-directory)
+            request (db-fs2-frame 1 (string-to-utf8 temporary-path) image)
             staged-response (if (not (string=? temporary ""))
                               (db-fs2-call request) (db-empty-bytes))
             staged (and (not (string=? temporary ""))
                         (db-fs2-acknowledged? staged-response)
                         (db-fs2-bytes-equal? (db-fs2-payload staged-response) image))
             file-sync (if staged
-                        (db-fs35-one? (string-concat temporary-path "FSYNC_SEP")) false)
+                        (db-fs35-one? (string-concat scoped-temporary-path "FSYNC_SEP")) false)
             renamed (if file-sync
-                      (db-fs35-one? (string-concat temporary-path
+                      (db-fs35-one? (string-concat scoped-temporary-path
                                         (string-concat "RENAME_SEP" path))) false)
-            directory-sync (if renamed
-                             (db-fs35-one? (string-concat parent-directory "FSYNC_SEP")) false)
-            cleanup (if (and (not renamed) (not (string=? temporary "")))
-                      (>= (db-fs2-unlink-outcome temporary) 0) true)
-            unlocked (db-fs35-one? (string-concat lock-path "UNLOCK_SEP"))]
+            stage-file-exists (if (string=? temporary "") -1
+                                (db-fs35-exists-state scoped-temporary-path))
+            remove-stage-file (if renamed
+                                (= stage-file-exists 0)
+                                (if (= stage-file-exists 1)
+                                  (= (db-fs2-remove-outcome (if flat-file-provider? 4 9)
+                                                            temporary-path) 1)
+                                  (= stage-file-exists 0)))
+            stage-directory-exists (if (or flat-file-provider? (string=? temporary "")) 0
+                                     (db-fs35-exists-state scoped-temporary-directory))
+            remove-stage-directory (if (= stage-directory-exists 1)
+                                     (= (db-fs2-remove-outcome 10 temporary-directory) 1)
+                                     (= stage-directory-exists 0))
+            cleanup (and remove-stage-file remove-stage-directory)
+            directory-sync (if cleanup
+                             (db-fs35-one? (string-concat scoped-parent-directory "FSYNC_SEP")) false)
+            unlocked (db-fs35-one? (string-concat scoped-lock-path "UNLOCK_SEP"))]
         (cond
           (and staged file-sync renamed directory-sync cleanup unlocked)
           (bytes-from-vector-i64 (vector-i64 0))
+          (and renamed (not cleanup))
+          (bytes-from-vector-i64 (vector-i64 7))
           (and renamed (not directory-sync))
           (bytes-from-vector-i64 (vector-i64 2))
           (and renamed directory-sync (not unlocked))
@@ -206,7 +253,8 @@
 ;; succeeded but parent durability is unknown; [3] if durable publication
 ;; succeeded but unlock failed; [4] if the writer lock was busy; [5] if lock
 ;; release failed before publication; [6] if a WAL, SHM, or rollback-journal
-;; sidecar exists or its absence could not be established.
+;; sidecar exists or its absence could not be established; [7] if publication
+;; is durable but stage cleanup failed.
 (defn write-cron-notepad-image [path :bytes image :bytes page-size :i64] :bytes
   (if (not (db-sqlite-header-valid? image page-size))
     (bytes-from-vector-i64 (vector-i64 1))

@@ -306,4 +306,47 @@ coordination and races with external SQLite processes remain unqualified. It
 does not qualify concurrent-process contention or lock fairness,
 power-loss injection between commit steps, general SQLite transaction
 semantics, WAL/rollback-journal handling, arbitrary page layouts or splits,
-Linux x86_64/ARM64, or Itonami cutover. Random orphan-stage collection and those gates remain open.
+Linux x86_64/ARM64, or Itonami cutover at that checkpoint. Random orphan-stage collection and those gates remain open.
+
+## ARM64 native publication qualification (2026-11-02)
+
+An Amu selfhost F2 compiler built source-locked Kotoba fixtures into static
+`aarch64-linux` programs and ran them with `PATH=/nonexistent` on Linux ARM64.
+The positive fixture created the notepad image, upserted one row, published
+the image through FS2, reopened it through Kotoba, and verified the value.
+Separate controls confirmed refusal with pre-existing `-wal`, `-shm`, and
+`-journal` files while preserving both the database and each sidecar. The
+native receipt records the Amu source revision, compiler and fixture
+hashes; no host SQLite oracle was used for this Linux run. This qualifies that
+Linux execution path only; it does not establish x86_64 Linux or standard
+SQLite locking and journal recovery. A separate dated, read-only SQLite 3.54.1 oracle check then
+reported `integrity_check=ok`, the expected row and primary-key autoindex,
+4096-byte pages, and three pages; see
+[`Linux read-only oracle receipt`](../lib/kotoba.sql/evidence/notepad-upsert-linux-arm64-readonly-oracle-20261102.json).
+
+The providers expose different FS2 N behavior. On macOS, requesting a parent
+directory returned the refusal payload `Z`, while requesting `.` returned a
+randomized 12-hex file basename. On Linux, N under the database parent creates
+a randomized directory with a 6-character lowercase alphanumeric suffix.
+Kotoba now validates these response shapes, uses provider-relative FS2 B paths,
+and selects the matching file/directory cleanup form. This is based on the
+measured Amu provider contracts; other providers and suffix formats are not
+qualified.
+
+The current source passed the existing Amu full-bootstrap macOS ARM64 positive
+and refusal harness and the source-locked Amu selfhost Linux ARM64 gate, both
+with `PATH=/nonexistent`. The Linux gate used Amu revision
+`ce982703375bedc0039b61b1a821407d228ea98a`, matching Kotoba CI's pinned
+dependency. Receipts are tracked at
+[`macOS ARM64`](../lib/kotoba.sql/evidence/notepad-upsert-macos-arm64-native-20261102.json),
+[`Linux ARM64`](../lib/kotoba.sql/evidence/notepad-upsert-linux-arm64-native-20261102.json),
+and the separate [Linux read-only oracle](../lib/kotoba.sql/evidence/notepad-upsert-linux-arm64-readonly-oracle-20261102.json).
+The native receipts share database source SHA-256
+`98698cc6d9aed02f5168cac239b416cf557edd756634be93601fa91d9e141759`. Mac
+covered sequential publication, bounded overflow rows, refusal controls, and
+read-only SQLite oracle readback. Linux covered native publication/reopen and
+the three sidecar refusal controls; a separate read-only SQLite 3.54.1 oracle
+checked integrity and the expected row/index. This qualifies these exact
+ARM64 provider routes only. Linux x86_64, standard SQLite byte-range locking,
+external-process races, WAL/recovery, crash injection/recovery, and Itonami
+wiring remain open.
