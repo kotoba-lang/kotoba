@@ -6,6 +6,22 @@ Products import / copy these exact browser assets and pin revision / digest.
 No build step or Node / JVM / NBB runtime is required. Product-local validators
 and approval brokers are not substitutes for this implementation.
 
+## Local-state declarations
+
+`local-state` declares an adapter, a schema name and a positive integer version.
+Use `adapter: 'memory'` for volatile application state when an app does not use
+IndexedDB, OPFS or localStorage. Explicit user exports or URL snapshots do not
+turn in-memory state into a persistent storage adapter. The validator does not
+provide a store, migrate state, persist it or grant an operation; products own
+their local-state implementation. The existing `indexeddb`, `opfs` and
+`localstorage` declarations remain supported.
+
+A local-only app can declare `operations: []`, with no requested capabilities,
+host eligibility or supported selectors. Its canonical derived policy is
+`connect-src 'none'`, and its broker refuses every invocation before consent.
+This does not turn the same-document `trusted-page-v1` profile into a sandbox
+for untrusted scripts or resolve KOTOBA-159's broader consent-enforcement review.
+
 ## Trusted shell and operation authority
 
 The verified host shell owns its document, publisher pins, eligibility,
