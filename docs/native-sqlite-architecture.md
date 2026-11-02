@@ -391,3 +391,10 @@ or mutate these interior table/index roots, split overflowing roots, rebalance
 pages, or verify a two-leaf database through a SQLite oracle. The current
 notepad mutation path continues to refuse page-split and interior-root shapes;
 dynamic B-tree mutation remains the next implementation requirement.
+
+The same exact-source Amu fixture now also decodes the generated index-interior
+cell boundary and checks its left child, payload size, and payload span. The
+updated receipt is
+[`index-interior decoder receipt`](../lib/kotoba.sql/evidence/index-interior-decoder-native-linux-arm64-20261102.json).
+This still does not traverse an index tree or prove database-level ordering;
+the positive payload here is only a page-codec vector.
