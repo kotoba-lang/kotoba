@@ -50,6 +50,8 @@ def main():
      [:signature :string] [:signer :string] [:valid-until-nil :bool]]]})
   (:export [main]))\n'''
     mutations = {
+        'batch-size': '(> n 16)',
+        'batch-failure': '(not (option-some?-of [:option :string] next))',
         'decimal-leading-zero': '(and (> (- end start) 1) (= (string-code-point-at s start) 48))',
         'layout-prefix': '(not (fn-at? raw 0 prefix))',
         'layout-sequence': '(not (fn-at? raw (+ value-at 64) mid))',
@@ -73,7 +75,7 @@ def main():
         source = source.replace('ed/', '').replace('sha/', '') + '\n' + test
         image = gate.build(label, 'fixture.kotoba', {'fixture.kotoba': source.encode()})
         gate.run(label + '-run', image, expected=0 if needle is None else 1)
-    gate.finish('PASS_FLEET_NATIVE_SUCCESSOR', scope='strict serialized EDN and synthetic/public historical fixtures only; no receiver, trust store, history synchronization or deployment',
+    gate.finish('PASS_FLEET_NATIVE_SUCCESSOR', scope='bounded batch, strict EDN and synthetic/public historical fixtures only; no receiver, trust store, durable sync or deployment',
                 sourceSHA256=module.sha(native.encode()), testSHA256=module.sha(test.encode()), mutations=list(mutations))
     evidence_path = gate.out / 'evidence.json'
     evidence = json.loads(evidence_path.read_text())
