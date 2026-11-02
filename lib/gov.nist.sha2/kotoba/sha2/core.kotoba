@@ -1,7 +1,7 @@
 ;; sha2.core -- SHA-224 and SHA-256 (FIPS 180-4) and HMAC-SHA-256 (FIPS 198-1)
 ;; in the Amu selfhost seed subset, so a loaderless static image hashes with
-;; no host digest. The same eight exports, names and arities as
-;; src/sha2/core.cljk:
+;; no host digest. It preserves the eight exports, names and arities of
+;; src/sha2/core.cljk and adds a bounded segmented SHA-256 operation:
 ;;
 ;;   sha256 / sha224          bytes -> 32 / 28 bytes
 ;;   sha256-hex / sha224-hex  bytes -> lowercase hex
@@ -11,6 +11,8 @@
 ;;   hmac-sha256-hex          the same, as lowercase hex
 ;;   hex                      bytes -> lowercase hex, two digits per byte
 ;;   u32                      a negative i64 read as unsigned 32-bit
+;;   sha256-segments-hex      byte chunks and prefix length -> lowercase hex,
+;;                            or "" on invalid length/prefix
 ;;
 ;; Bytes are :vector-i64 of 0..255. Words are i64 held in 0..2^32-1 by
 ;; s2-m32; u64-shift-right is the spec's SHR, and every rotation masks.
@@ -21,7 +23,7 @@
 ;; selfhost bodies (ed25519.selfhost has its own rotr). README "Native gate"
 ;; runs the vectors and the oracle corpus.
 (ns sha2.core
-  (:export [hex hmac-sha256 hmac-sha256-hex sha224 sha224-hex sha256 sha256-hex u32]))
+  (:export [hex hmac-sha256 hmac-sha256-hex sha224 sha224-hex sha256 sha256-hex sha256-segments-hex u32]))
 
 (defn u32 [x :i64] :i64 (if (neg? x) (+ x 4294967296) x))
 
@@ -145,6 +147,58 @@
 (defn sha256-hex [data :vector-i64] :string (hex (sha256 data)))
 
 (defn sha224-hex [data :vector-i64] :string (hex (sha224 data)))
+
+;; SHA-256 over an already-present list of byte segments. The digest core and
+;; round constants above are shared with sha256; no file I/O or host digest is
+;; involved. This avoids a full vector-i64 copy but does not make a provider's
+;; whole-file read streaming. The two GiB bound keeps total and bit-length
+;; arithmetic exact on both native targets and bounds caller work.
+(defn- s2-segments-length [segments [:list :bytes]] :i64
+  (loop [i 0 total 0]
+    (if (= i (vector-count segments)) total
+      (let [n (bytes-count (typed-list-nth [:list :bytes] segments i))]
+        (if (> n (- 2147483647 total)) -1 (recur (+ i 1) (+ total n)))))))
+
+(defn- s2-compress-buffer [w :vector-i64 block :vector-i64 k :vector-i64] :vector-i64
+  (s2-add (s2-rounds (s2-begin (s2-expand (s2-load w block 0 64))) k)))
+
+(defn- s2-segment-update [w :vector-i64 block :vector-i64 k :vector-i64 chunk :bytes start :i64 used :i64] :i64
+  (loop [i start n used]
+    (if (= i (bytes-count chunk)) n
+      (let [x (vector-assoc! block n (bytes-at chunk i)) next (+ n 1)
+            done (if (= next 64) (s2-compress-buffer w block k) w)]
+        (recur (+ i 1) (if (= next 64) 0 next))))))
+
+(defn- s2-segments-update [segments [:list :bytes] skip :i64 w :vector-i64 block :vector-i64 k :vector-i64] :i64
+  (loop [i 0 remaining skip used 0]
+    (if (= i (vector-count segments)) used
+      (let [chunk (typed-list-nth [:list :bytes] segments i) n (bytes-count chunk)
+            start (if (> remaining n) n remaining)
+            next (s2-segment-update w block k chunk start used)]
+        (recur (+ i 1) (- remaining start) next)))))
+
+(defn- s2-zero-from [block :vector-i64 i :i64] :vector-i64
+  (loop [j i v block]
+    (if (= j 64) v (recur (+ j 1) (vector-assoc! v j 0)))))
+
+(defn- s2-segments-final [w :vector-i64 block :vector-i64 k :vector-i64 used :i64 length :i64] :vector-i64
+  (let [padded (vector-assoc! block used 128)
+        cleared (s2-zero-from padded (+ used 1))
+        one (if (> used 55) (s2-compress-buffer w cleared k) w)
+        final (if (> used 55) (s2-zero-from block 0) block)
+        bits (* length 8)
+        with-length (loop [i 0 v final]
+          (if (= i 8) v
+            (recur (+ i 1) (vector-assoc! v (+ 56 i) (bit-and (u64-shift-right bits (* (- 7 i) 8)) 255)))))
+        result (s2-compress-buffer one with-length k)]
+    (s2-out result 8)))
+
+(defn sha256-segments-hex [segments [:list :bytes] skip :i64] :string
+  (let [total (s2-segments-length segments)]
+    (if (or (< total 0) (< skip 0) (> skip total)) ""
+      (let [w (s2-work (s2-iv 8)) k (s2-k) block (vector-alloc 64)
+            used (s2-segments-update segments skip w block k)]
+        (hex (s2-segments-final w block k used (- total skip)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; HMAC (FIPS 198-1): K0 is the key hashed when longer than the block, then
