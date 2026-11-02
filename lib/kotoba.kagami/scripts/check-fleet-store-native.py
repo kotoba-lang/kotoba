@@ -49,6 +49,9 @@ for mode in ['init','edn-invalid','state-old','edn','state-new']:
 shorthand = gate.out / 'edn-shorthand'; shorthand.mkdir()
 for mode in ['init','edn-shorthand','state-new']:
  run('shorthand-'+mode+str(len(gate.observations)),mode,shorthand)
+successor = gate.out / 'successor'; successor.mkdir()
+for mode in ['init','successor-invalid','state-old','successor','state-new','successor-second']:
+ run('successor-'+mode+str(len(gate.observations)),mode,successor)
 race = gate.out / 'race'; race.mkdir(); run('race-init', 'init', race)
 # Each contender may observe a held lock or the newly committed checkpoint.
 def race_one(i):
@@ -69,6 +72,12 @@ run('race-reopen', 'state-new', race)
 # Deliberately broken implementations must fail the same behavioral checks.
 store_source = sources['kagami/fleet_store_native.kotoba']
 ingress_source = sources['kagami/fleet_announce_edn.kotoba']
+needle=b'(document-vector (document-string announced))'
+if store_source.count(needle)!=1: raise ValueError('unexpected successor adapter')
+mutant=dict(sources);mutant['kagami/fleet_store_native.kotoba']=store_source.replace(needle,b'(document-vector)')
+broken=gate.build('control-successor-refusal','kagami/fleet_store_native_test.kotoba',mutant)
+directory=gate.out/'control-successor-refusal-state';directory.mkdir();run('control-init-successor-refusal','init',directory)
+gate.run('control-detected-successor-refusal',broken,26,['successor',directory],'35,38',directory)
 # On the Mac host, reproduce the pre-fix trap as a negative control: slicing
 # a six-byte prefix through a multibyte character traps instead of rejecting.
 if gate.darwin:
@@ -81,8 +90,8 @@ if gate.darwin:
  directory=gate.out/'control-utf8-prefix-state';directory.mkdir();run('control-init-utf8-prefix','init',directory)
  gate.mac_call('control-detected-utf8-prefix',[broken,*gate.guest_args(['edn-invalid',directory])],-signal.SIGTRAP)
 needle=b'(not (lexical-safe? normalized))'
-if ingress_source.count(needle)!=1: raise ValueError('unexpected EDN ingress guard')
-mutant=dict(sources);mutant['kagami/fleet_announce_edn.kotoba']=ingress_source.replace(needle,b'true')
+if ingress_source.count(needle)!=2: raise ValueError('unexpected EDN ingress guards')
+mutant=dict(sources);mutant['kagami/fleet_announce_edn.kotoba']=ingress_source.replace(needle,b'true',1)
 broken=gate.build('control-edn-refuse-all','kagami/fleet_store_native_test.kotoba',mutant)
 directory=gate.out/'control-edn-refuse-all-state';directory.mkdir();run('control-init-edn-refuse-all','init',directory)
 gate.run('control-detected-edn-refuse-all',broken,23,['edn',directory],'35,38',directory)
