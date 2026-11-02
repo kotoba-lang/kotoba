@@ -95,14 +95,27 @@ mutant=dict(sources);mutant['kagami/fleet_announce_edn.kotoba']=ingress_source.r
 broken=gate.build('control-edn-refuse-all','kagami/fleet_store_native_test.kotoba',mutant)
 directory=gate.out/'control-edn-refuse-all-state';directory.mkdir();run('control-init-edn-refuse-all','init',directory)
 gate.run('control-detected-edn-refuse-all',broken,23,['edn',directory],'35,38',directory)
-needle=b'(if present (io/read file) "")'
-if store_source.count(needle)!=1: raise ValueError('unexpected missing-checkpoint guard')
-mutant=dict(sources);mutant['kagami/fleet_store_native.kotoba']=store_source.replace(needle,b'(io/read file)')
+needle=b'(fs-read-checkpoint file)'
+if store_source.count(needle)!=1: raise ValueError('unexpected safe-read invocation')
+mutant=dict(sources);mutant['kagami/fleet_store_native.kotoba']=store_source.replace(needle,b'(option-some-of [:option :string] (io/read file))')
 broken=gate.build('control-missing-checkpoint','kagami/fleet_store_native_test.kotoba',mutant)
 directory=gate.out/'control-missing-checkpoint-state';directory.mkdir()
 if gate.darwin:
  r=gate.fd3([broken,*gate.guest_args(['missing',directory])])
  if r.returncode!=-signal.SIGTRAP or r.stdout or r.stderr: raise ValueError(('missing control',r.returncode,r.stdout,r.stderr))
+invalid_checkpoint=gate.out/'invalid-checkpoint';invalid_checkpoint.mkdir()
+damaged=b'fleet-checkpoint/v1\n\xff\n'; (invalid_checkpoint/'fleet.state').write_bytes(damaged)
+run('invalid-checkpoint-uncertain','invalid-checkpoint',invalid_checkpoint)
+if (invalid_checkpoint/'fleet.state').read_bytes()!=damaged: raise ValueError('invalid checkpoint changed')
+oversize=gate.out/'oversize-checkpoint';oversize.mkdir()
+(oversize/'fleet.state').write_bytes(b'x' * (1048576 + 1))
+run('oversize-checkpoint-uncertain','invalid-checkpoint',oversize)
+if (oversize/'fleet.state').stat().st_size != 1048577: raise ValueError('oversize checkpoint changed')
+symlink=gate.out/'symlink-checkpoint';symlink.mkdir()
+target=symlink/'original';target.write_text('unchanged')
+(symlink/'fleet.state').symlink_to('original')
+run('symlink-checkpoint-uncertain','invalid-checkpoint',symlink)
+if target.read_text()!='unchanged' or not (symlink/'fleet.state').is_symlink(): raise ValueError('symlink checkpoint changed')
 for label,needle,replacement,mode,expected in [
  ('verify-bypass', b'(not (fleet/verify-edn-plan-into plan heads seq hash signer))', b'false', 'invalid', 4),
  ('compare-bypass', b'(string=? old observed)', b'true', 'stale', 6),
