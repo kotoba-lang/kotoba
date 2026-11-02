@@ -92,3 +92,46 @@ must print `ok` and exit 0; both metadata conflicts must print
 `fune/rootfs-plan`, and both tampered cases must print `fune/blob-digest`, all
 with exit 1. The separate test-only first-layer-only mutant prints `ok` for
 the tampered case. No real rootfs is created by these tests.
+
+## Verified snapshot to worker stream candidate
+
+`fune.rootfs-stream` emits the private-root worker's ASCII-hex input protocol
+through `:io/write`. The caller invokes `rootfs-stream-start` once, then calls
+`emit-layer-hex` in manifest order with one trusted planner state. Each call
+verifies the descriptor digest and tar structure, retains that exact sealed
+snapshot while it checks paths and streams payload chunks, then closes it.
+Directories and new files become `M` and `F`, regular-file replacements `U`;
+a repeated directory produces no filesystem command. File payloads over 1 MiB
+are refused to match the current worker. This does not validate the OCI layout
+marker, index or config; the caller must do that separately.
+
+Earlier valid commands can already have reached the worker when a later entry
+or layer fails. A supervisor must reject any failed producer, worker or pipe,
+kill/discard the worker and its entire private tree, and never use stdout for
+other text or structured reporting. The API does not currently authenticate a
+supervisor, check worker acknowledgments, issue a commit, publish a rootfs or
+start a process. In particular, producer success alone is not proof of worker
+success, and a future reopening of a path is not covered by the old snapshot.
+The bounded worker, planner and no-links/whiteouts profile still admit only a
+small subset of OCI images.
+
+The ARM64 `rootfs_stream_runner.kotoba` and `observe_rootfs_stream.py` are a
+local test, not the missing production supervisor. The Python observer forwards
+native producer stdout to native worker stdin unchanged and checks child status
+and a diagnostic worker readback. A single authenticated manifest with three
+layers created a directory and file, then replaced it with 16,643 bytes that
+contain every byte value. Readback matched those bytes; a separate fixture
+also streamed and read back the 1 MiB per-file boundary. A corrupt final layer
+made the native producer exit 1 with `fune/blob-digest`; closing the pipe made
+the worker exit 2 rather than publish its partially populated private tree.
+A separately compiled digest-check-removal control incorrectly accepted that
+corruption and failed the observation.
+
+A second test-only producer overwrote the original last-layer file *after*
+verification and snapshot creation but before streaming its payload. The
+observer still read the original 16,643 bytes from the worker; the disposable
+source file independently contained `changed` afterward. This exercises the
+held-snapshot path, not all possible host races. The test used the draft ARM64
+worker in Amu PR #1785. Source composition, local VM observation, and a Python
+test observer do not qualify project linking, native x86, a production process
+supervisor, an OCI-compliant extractor or workload execution.

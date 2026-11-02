@@ -60,6 +60,8 @@ fix_checksum(badmode)
 cases = {
     'good': valid,
     'replacement': archive('bin/hello', data=b'updated'),
+    'binary-replacement': archive('bin/hello', data=bytes(range(256)) * 65 + b'end'),
+    'max-replacement': archive('bin/hello', data=bytes(range(256)) * 4096),
     'directory': archive('bin/', tarfile.DIRTYPE, b''),
     'prefix': archive('a' * 90 + '/' + 'b' * 40),
     'multi': multi_archive(),

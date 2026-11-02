@@ -126,6 +126,8 @@ def plan_layout(name, layers):
     return layer_digests
 
 plan_digests = plan_layout('plan-good', [other, layer, (source / 'replacement.tar').read_bytes()])
+binary_digests = plan_layout('plan-binary', [other, layer, (source / 'binary-replacement.tar').read_bytes()])
+plan_layout('plan-binary-max', [other, layer, (source / 'max-replacement.tar').read_bytes()])
 plan_layout('plan-parent-missing', [layer, other])
 plan_layout('plan-duplicate', [other, (source / 'duplicate.tar').read_bytes()])
 shutil.copytree(base / 'plan-good', base / 'plan-second-tampered')
@@ -136,6 +138,10 @@ shutil.copytree(base / 'plan-good', base / 'plan-third-tampered')
 bad_replacement = bytearray((source / 'replacement.tar').read_bytes())
 bad_replacement[-1] ^= 1
 (base / 'plan-third-tampered' / 'blobs' / 'sha256' / plan_digests[2]).write_bytes(bad_replacement)
+shutil.copytree(base / 'plan-binary', base / 'plan-binary-third-tampered')
+bad_binary = bytearray((source / 'binary-replacement.tar').read_bytes())
+bad_binary[512] ^= 1
+(base / 'plan-binary-third-tampered' / 'blobs' / 'sha256' / binary_digests[2]).write_bytes(bad_binary)
 
 if len(sys.argv) == 4:
     # Sparse files exercise pre-read bounds without allocating their full size.
