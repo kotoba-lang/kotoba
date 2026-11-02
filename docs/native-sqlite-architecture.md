@@ -189,6 +189,14 @@ source replaces the table page in place and the source-locked native run now
 passes. This does not establish general SQL upsert semantics: a duplicate
 key is refused and existing-row update is a separate bounded operation.
 
+The native header codec now also exposes a validated in-memory page-count
+replacement. Its source-locked Amu ARM64 fixture accepts a valid new page
+count, advances the change counter and version-valid-for together, and refuses
+zero, out-of-range, and malformed headers. This is a prerequisite for an
+overflow-page writer; it does not append pages, implement overflow writes, or
+make the returned image crash-atomic. See
+[`header page-count receipt`](../lib/kotoba.sql/evidence/notepad-page-count-header-native-20261102.json).
+
 The implementation remains a bounded codec, reader, initializer, and
 single-leaf mutation slice, not a complete SQLite engine or transactional
 storage layer. It does not yet qualify arbitrary database layouts, page-split
