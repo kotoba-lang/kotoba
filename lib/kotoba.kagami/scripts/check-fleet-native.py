@@ -50,6 +50,8 @@ def main():
      [:signature :string] [:signer :string] [:valid-until-nil :bool]]]})
   (:export [main]))\n'''
     mutations = {
+        'plan-atomic-output': '(let [verified (verify-edn-chain heads anchor-seq anchor-hash allowed-did)]',
+        'plan-value': '(ed/hex-bytes (string-substring raw value-at (+ value-at 64)))',
         'atomic-output': '(let [r (verify-edn-chain heads anchor-seq anchor-hash allowed-did)]',
         'batch-size': '(> n 16)',
         'batch-failure': '(not (option-some?-of [:option :string] next))',
@@ -71,7 +73,7 @@ def main():
         candidate = native
         if needle:
             assert candidate.count(needle) == 1, label
-            candidate = candidate.replace(needle, '(let [ignored (vector-assoc! out 0 0) r (verify-edn-chain heads anchor-seq anchor-hash allowed-did)]' if label == 'atomic-output' else 'true' if label == 'signature' else 'false')
+            candidate = candidate.replace(needle, '(let [ignored (vector-assoc! out 0 0) r (verify-edn-chain heads anchor-seq anchor-hash allowed-did)]' if label == 'atomic-output' else '(let [ignored (vector-assoc! out 0 0) verified (verify-edn-chain heads anchor-seq anchor-hash allowed-did)]' if label == 'plan-atomic-output' else '(vector-alloc 32)' if label == 'plan-value' else 'true' if label == 'signature' else 'false')
         source = header + '\n'.join(map(remove_ns, [ed, sha, candidate]))
         source = source.replace('ed/', '').replace('sha/', '') + '\n' + test
         image = gate.build(label, 'fixture.kotoba', {'fixture.kotoba': source.encode()})
