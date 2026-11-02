@@ -30,7 +30,7 @@ image = gate.build('store', 'kagami/fleet_store_native_test.kotoba', sources)
 base = gate.out / 'normal'; base.mkdir()
 def run(label, mode, directory=base, expected=0):
  return gate.run(label, image, expected, [mode, directory], '35,38', directory)
-for mode in ['init', 'state-old', 'invalid', 'state-old', 'success', 'state-new', 'stale', 'state-new']:
+for mode in ['init', 'state-old', 'invalid', 'state-old', 'success', 'state-new', 'already', 'state-new']:
  run('normal-'+mode+str(len(gate.observations)), mode)
 race = gate.out / 'race'; race.mkdir(); run('race-init', 'init', race)
 # Each contender may observe a held lock or the newly committed checkpoint.
@@ -47,19 +47,21 @@ def race_one(i):
  return int(m.group(1))
 with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
  results=list(pool.map(race_one,range(2)))
-if results.count(10)!=1 or any(x not in (10,11,12) for x in results): raise ValueError(('race',results))
+if results.count(10)!=1 or any(x not in (10,11,12,16) for x in results): raise ValueError(('race',results))
 run('race-reopen', 'state-new', race)
 # Deliberately broken implementations must fail the same behavioral checks.
 store_source = sources['kagami/fleet_store_native.kotoba']
 for label,needle,replacement,mode,expected in [
  ('verify-bypass', b'(not (fleet/verify-edn-plan-into plan heads seq hash signer))', b'false', 'invalid', 4),
- ('compare-bypass', b'(not (string=? old observed))', b'false', 'stale', 6)]:
+ ('compare-bypass', b'(string=? old observed)', b'true', 'stale', 6),
+ ('replay-bypass', b'(string=? next observed)', b'true', 'stale', 6)]:
  if store_source.count(needle)!=1: raise ValueError('unexpected store source: '+label)
  mutant=dict(sources); mutant['kagami/fleet_store_native.kotoba']=store_source.replace(needle,replacement)
  broken=gate.build('control-'+label,'kagami/fleet_store_native_test.kotoba',mutant)
  directory=gate.out/('control-'+label+'-state'); directory.mkdir()
  run('control-init-'+label,'init',directory)
- if label=='compare-bypass': run('control-advance-'+label,'success',directory)
+ if label in ('compare-bypass','replay-bypass'):
+  path=directory/'fleet.state'; path.write_bytes(path.read_bytes().replace(b'0000000000000000',b'0000000000000009',1))
  gate.run('control-detected-'+label,broken,expected,[mode,directory],'35,38',directory)
 # Disk data is not a trust source: reject a modified stored value unchanged.
 tamper=gate.out/'tamper';tamper.mkdir();run('tamper-init','init',tamper)
@@ -84,6 +86,16 @@ for stage,needle,replacement,expected_state in [
  run('fault-init-'+stage, 'init', directory)
  gate.run('fault-observe-'+stage, variant, 0, ['fault', directory], '35,38', directory)
  run('fault-reopen-'+stage, expected_state, directory)
+# Reconciliation must not return already-committed when either fsync fails.
+for stage,condition in [('retry-file-sync',b'(>= (string-index-of path "fleet.state") 0)'),
+                        ('retry-dir-sync',b'(< (string-index-of path "fleet.state") 0)')]:
+ mutant=dict(sources)
+ mutant['hata/store_io.kotoba']=io.replace(sync,b'(let [ok '+sync+b'] (if '+condition+b' false ok))')
+ variant=gate.build('fault-'+stage,'kagami/fleet_store_native_test.kotoba',mutant)
+ directory=gate.out/('fault-'+stage+'-state');directory.mkdir()
+ run('fault-init-'+stage,'init',directory);run('fault-commit-'+stage,'success',directory)
+ gate.run('fault-observe-'+stage,variant,0,['fault',directory],'35,38',directory)
+ run('fault-reopen-'+stage,'state-new',directory)
 # Pause a test-only adapter after an operation, verify the real lock is held,
 # SIGKILL the writer and reopen from a fresh process. No power cut is simulated.
 pause_helper = b"""
@@ -126,8 +138,8 @@ for stage,needle,replacement,expected_state in [
   stdout,stderr=child.communicate(timeout=10)
  if child.returncode!=-signal.SIGKILL or stdout or stderr: raise ValueError(('unexpected writer exit',stage,child.returncode,stdout,stderr))
  run('crash-reopen-'+stage,expected_state,directory)
- run('crash-retry-'+stage,'success' if expected_state=='state-old' else 'stale',directory)
+ run('crash-retry-'+stage,'success' if expected_state=='state-old' else 'already',directory)
  run('crash-final-'+stage,'state-new',directory)
- crash_results.append({'stage':stage,'exit':child.returncode,'reopened':expected_state,'retry':'success' if expected_state=='state-old' else 'stale'})
-gate.finish('PASS_FLEET_STORE_SYNTHETIC', observerSHA256=native.sha(Path(__file__).read_bytes()), raceResults=results, crashResults=crash_results, injectedFaults=['write','file-sync','rename','dir-sync'], negativeControls=['signature-verification-bypass','checkpoint-compare-bypass','modified-checkpoint'],
+ crash_results.append({'stage':stage,'exit':child.returncode,'reopened':expected_state,'retry':'success' if expected_state=='state-old' else 'already'})
+gate.finish('PASS_FLEET_STORE_SYNTHETIC', observerSHA256=native.sha(Path(__file__).read_bytes()), raceResults=results, crashResults=crash_results, injectedFaults=['write','file-sync','rename','dir-sync','retry-file-sync','retry-dir-sync'], negativeControls=['signature-verification-bypass','checkpoint-compare-bypass','replay-compare-bypass','modified-checkpoint'],
  scope='local native synthetic data and SIGKILL only; no power-cut test, rollback protection, real trust, network or release')
