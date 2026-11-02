@@ -28,7 +28,9 @@ MODULES = (
 FIXTURES = (
     ("sqlite.notepad-linux-storage", PACKAGE / "test/native/notepad-linux-storage.kotoba"),
     ("sqlite.notepad-sidecar-refusal", PACKAGE / "test/native/notepad-sidecar-refusal.kotoba"),
+    ("sqlite.notepad-existing-file-mutation", PACKAGE / "test/native/notepad-existing-file-mutation.kotoba"),
 )
+LEGACY_FIXTURE = PACKAGE / "test/fixtures/legacy-cron-notepad-20261102.sqlite"
 
 
 def sha(path):
@@ -56,6 +58,8 @@ def main(amu, compiler, out, amu_pin=None):
     out = Path(out).resolve()
     out.mkdir(parents=True, exist_ok=False)
     (out / "data").mkdir()
+    legacy_fixture_sha256 = sha(LEGACY_FIXTURE)
+    (out / "data/legacy.db").write_bytes(LEGACY_FIXTURE.read_bytes())
     source_root = out / "src"
     staged = {}
     for module, source in (*MODULES, *FIXTURES):
@@ -119,6 +123,11 @@ def main(amu, compiler, out, amu_pin=None):
                               "databaseSha256": database_before, "preserved": True})
         sidecar.unlink()
 
+    legacy_mutation = out / receipts[2]["image"]
+    legacy_path = out / "data/legacy.db"
+    run("sqlite-existing-file-mutation", [legacy_mutation, "data/legacy.db"], out, guest_env,
+        calls, timeout=300)
+
     receipt = {
         "schema": "kotoba.sqlite.native-linux-arm64.v1",
         "platform": [platform.system(), platform.machine()],
@@ -130,8 +139,15 @@ def main(amu, compiler, out, amu_pin=None):
                     for module, path in sorted(staged.items())},
         "fixtures": receipts,
         "databaseSha256": database_before,
+        "legacyFixtureSha256": legacy_fixture_sha256,
+        "legacyMutation": {
+            "fixture": LEGACY_FIXTURE.name,
+            "image": legacy_mutation.name,
+            "inputDatabase": "SQLite 3.54.1 standard file generated once with three existing rows",
+            "nativeResult": "updated an existing row, inserted a second row for a different job, deleted one job, published atomically, reopened and read back through Kotoba",
+        },
         "sidecarRefusals": sidecar_cases,
-        "result": "Kotoba positive upsert/readback and pre-existing WAL, SHM, and rollback-journal refusals passed",
+        "result": "Kotoba positive upsert/readback, pre-existing WAL/SHM/rollback-journal refusals, and existing SQLite database mutation/reopen passed",
         "hostSqliteOracle": False,
     }
     (out / "native-sqlite-arm64.json").write_text(json.dumps(receipt, indent=2) + "\n")
