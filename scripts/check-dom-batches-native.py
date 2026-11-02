@@ -24,6 +24,9 @@ def main(args):
     env = dict(PATH='/nonexistent', KEXE_STACK_BYTES='8388608',
                KEXE_CAP_RESOURCES_35=':'.join(map(str, [out, *roots])))
     results = []
+    runner_source = out / 'runner.kotoba'
+    if args.target == 'arm64':
+        runner_source.write_bytes(args.runner_source.read_bytes())
 
     def run(name, command, extra=None):
         proc = subprocess.run(list(map(str, command)), cwd=out,
@@ -54,7 +57,7 @@ def main(args):
         run(case + '-compile', cmd + flags)
         if args.target == 'arm64':
             image = out / (case + '.elf')
-            run(case + '-pack', [compiler, 'compile', args.runner_source, '--target', 'aarch64-linux',
+            run(case + '-pack', [compiler, 'compile', runner_source, '--target', 'aarch64-linux',
                                  '--output', image, '--format', 'packed', '--payload', artifact])
             image.chmod(0o755)
             command = [image]
