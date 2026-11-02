@@ -62,9 +62,21 @@ USB/hub smoke and35 host tests. The existing2MiB internal code budget and
 actual product/user ABI were retained. Initial E7104 attempts are recorded;
 shared input presentation and exact public numeric/magic tables reduced
 generated code. Native QEMU compares the actual packed command, log,
-legacy screenshot and band-header bytes with independent literals. This
-candidate still needs actual post-render wire/viewport timing and runtime
-activation readback before claiming a live latency improvement.
+legacy screenshot and band-header bytes with independent literals. The
+subsequent live readback is recorded in `damage-priority-live.json`.
+
+The no-install PXE image booted on6600H and returned actual post-render
+counter/rows. On one boot with the same source, two explicit legacy-profile
+samples took3.498/3.714s to show the new cursor and erase the old one in the
+RFB harness; two enabled-profile samples took0.562/0.650s. The enabled samples
+read back78 changed cursor pixels in two updates, with matching full counters.
+These are host-observed samples, not panel or human-smoothness bounds.
+The private management profile and local adapter are enabled. Native Mac
+Screen Sharing opened Itonami, typed `r` to show `abar`, and restored `aba`
+with Backspace, with Approved0/Network off. The next single PXE boot is
+reserved for the same checked image; the existing fallback is preserved.
+Production install/update, protocol negotiation across arbitrary fallback
+images and whole-release acceptance remain separate open work.
 
 `os/aiueos/scripts/aiueos-console-macos.py --config PRIVATE_CONFIG` starts
 the adapter. The owner-only JSON configuration names `sshHost` (only
