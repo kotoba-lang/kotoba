@@ -13,6 +13,19 @@ leaves the supplied state unchanged on a single-entry refusal. The state is
 trusted mutable state: callers must not forge or modify it and must present
 layers in order. It is not an externally verifiable admission token.
 
+`rootfs-plan-entry` exposes accepted rows in insertion order as kind, mode and
+path bytes. A cross-layer replacement updates the stored mode, including when a
+directory requires no new creation command. This retains metadata needed for
+future finalization; it does not change the worker protocol or filesystem modes.
+The current worker still creates directories as 0700 and files as 0600, so this
+plan cannot yet provide image-permission semantics or executable files.
+The source-composed ARM64 planner gate checked file replacement, repeated
+directory mode updates, invalid indices and unchanged state on refusal. A
+separately built mutant discarding modes failed that gate. The source-composed
+layout producer still passed the native worker readback and refusal fixtures,
+including a 1 MiB file and a repeated-directory layer. Project linking, x86
+and filesystem mode application are not established by those observations.
+
 `fune.rootfs-snapshot-plan/verify-layer-plan-hold` verifies a layer digest and
 tar structure in the same sealed snapshot, then traverses from offset zero and
 feeds its entries to the planner. It checks an actual zero terminator instead
