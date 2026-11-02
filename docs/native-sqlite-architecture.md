@@ -31,8 +31,11 @@ qualified runtime/build/package path.
   behavior, not a native provider.
 - Kotoba has `:bytes` primitives and `kotoba.bytes`. SQLite pages are binary;
   UTF-8 string file operations are insufficient.
-- Amu KX64 has no SQLite API. The raw byte filesystem contract still needs
-  native lowering/provider/admission and source-bound execution evidence.
+- Amu KX64 has no SQLite API. Amu already has a resource-scoped FS2 provider
+  for raw byte reads/writes and range reads (`kotoba-lang/amu/seed/72-linux-fs2.kotoba`);
+  this task still needs a Kotoba SQL adapter and exact source-pinned execution
+  evidence for the selected Amu runtime/target. Existing provider candidate
+  checks do not qualify SQLite locking, journal/WAL handling, or atomic commits.
 - The AIUEOS object-route `extern-*` mechanism is a different execution path
   and cannot qualify product kexe. C compiler/loader/runtime are excluded by
   the Kotoba and Amu selfhost contracts.
@@ -40,11 +43,12 @@ qualified runtime/build/package path.
 ## Ownership and API boundary
 
 The high-level Kotoba library owns SQLite v3 semantics. Amu owns the native
-byte capability provider and its resource/authority boundary. The capability
-does not accept SQL text and does not hold database handles. Kotoba receives
-bounded byte snapshots and returns a validated new image plus the exact write
-set; Amu validates each path and commits through the scoped filesystem
-provider. This keeps SQL meaning and schema admission in canonical Kotoba.
+FS2 byte provider and its resource/authority boundary. The capability does not
+accept SQL text and does not hold database handles. Kotoba receives bounded
+byte snapshots and returns a validated new image plus an explicit commit
+protocol; the adapter uses only scoped FS2 operations and must not treat a raw
+write as atomic. SQLite locking, journal/WAL recovery, and commit ordering stay
+in canonical Kotoba semantics and require separate qualification.
 
 The public API will expose a narrow typed database/session surface rather than
 JDBC-shaped ambient handles. Initial operations are schema/open validation,
@@ -138,8 +142,10 @@ database-image builder now combines the header, two `sqlite_schema` rows, an
 empty table root, and an empty primary-key autoindex root into a three-page
 file image. This is a schema initializer, not a general database writer or a
 query/update engine. The source-locked native fixture assembles and checks
-three-page images at 512 and 4,096-byte page sizes, and refuses page size 513;
-the image has not yet been exported for independent SQLite readback.
+three-page images at 512 and 4,096-byte page sizes, validates both generated
+`sqlite_schema` records against the admitted DDL/root pages, rejects a
+one-page empty image, and refuses page size 513; the image has not yet been
+exported for independent SQLite readback.
 Zero-length data uses `bytes-from-vector-i64`; a standalone guest
 probe using `bytes-empty` exited 139, so that Amu runtime issue remains open.
 

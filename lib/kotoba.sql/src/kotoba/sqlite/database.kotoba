@@ -3,9 +3,10 @@
 ;; general SQL executor and does not open or mutate existing database files.
 
 (ns kotoba.sqlite.database
-  {:kotoba/export [create-cron-notepad]}
+  {:kotoba/export [create-cron-notepad validate-cron-notepad-image]}
   (:require [kotoba.sqlite.header :as header]
             [kotoba.sqlite.page :as page]
+            [kotoba.sqlite.record :as record]
             [kotoba.sqlite.schema :as schema]))
 
 (def table-name
@@ -28,6 +29,88 @@
       (vector-i64 101 121 32 84 69 88 84 32 78 79 84 32 78 85 76 76 44 32 118 97 108 117 101 32 84 69 88 84 32 78 79 84 32 78 85 76 76 44 32 117 112 100 97 116 101 100 95 97 116 32 84 69 88 84 32 78 79 84 32 78 85 76 76 44)))
     (bytes-from-vector-i64
       (vector-i64 32 80 82 73 77 65 82 89 32 75 69 89 32 40 106 111 98 95 105 100 44 32 107 101 121 41 41))))
+
+(defn- bytes-equal? [left :bytes right :bytes index :i64] :bool
+  (if (= index (bytes-count right))
+    (= (bytes-count left) (bytes-count right))
+    (and (= (bytes-at left index) (bytes-at right index))
+         (bytes-equal? left right (+ index 1)))))
+
+(defn- field-matches? [payload :bytes layout :vector-i64 field :i64
+                      expected :bytes] :bool
+  (let [serial-index (+ 1 (* field 3))
+        offset-index (+ serial-index 1)
+        length-index (+ serial-index 2)
+        offset (vector-at layout offset-index)
+        length (vector-at layout length-index)]
+    (and (>= (vector-at layout 0) (+ field 1))
+         (>= (vector-at layout serial-index) 13)
+         (= length (bytes-count expected))
+         (bytes-equal? (bytes-slice payload offset (+ offset length))
+                       expected 0))))
+
+(defn- field-root-page? [payload :bytes layout :vector-i64 field :i64
+                         root-page :i64] :bool
+  (let [serial-index (+ 1 (* field 3))
+        offset-index (+ serial-index 1)
+        length-index (+ serial-index 2)
+        offset (vector-at layout offset-index)]
+    (and (>= (vector-at layout 0) (+ field 1))
+         (= (vector-at layout serial-index) 1)
+         (= (vector-at layout length-index) 1)
+         (= (bytes-at payload offset) root-page))))
+
+(defn- table-schema-record? [payload :bytes] :bool
+  (let [layout (record/decode payload)]
+    (and (= (vector-at layout 0) 5)
+         (field-matches? payload layout 0
+                         (bytes-from-vector-i64 (vector-i64 116 97 98 108 101)))
+         (field-matches? payload layout 1 table-name)
+         (field-matches? payload layout 2 table-name)
+         (field-root-page? payload layout 3 2)
+         (field-matches? payload layout 4 create-table-sql))))
+
+(defn- index-schema-record? [payload :bytes] :bool
+  (let [layout (record/decode payload)
+        index-name (bytes-concat (bytes-concat index-prefix table-name)
+                                 index-suffix)]
+    (and (= (vector-at layout 0) 5)
+         (field-matches? payload layout 0
+                         (bytes-from-vector-i64 (vector-i64 105 110 100 101 120)))
+         (field-matches? payload layout 1 index-name)
+         (field-matches? payload layout 2 table-name)
+         (field-root-page? payload layout 3 3)
+         (= (vector-at layout 13) 0))))
+
+(defn- schema-row-valid? [page-image :bytes page-size :i64 cell-index :i64
+                          rowid :i64 table-row? :bool] :bool
+  (let [cell-offset (page/cell-pointer page-image page-size 1 0 cell-index)]
+    (if (< cell-offset 0)
+      false
+      (let [cell (page/decode-table-leaf-cell page-image page-size 1 0 cell-offset)
+            payload-size (vector-at cell 0)
+            payload-offset (vector-at cell 2)
+            local-size (vector-at cell 3)
+            overflow-page (vector-at cell 4)]
+        (if (or (< payload-size 0)
+                (not= payload-size local-size)
+                (not= overflow-page 0)
+                (> (+ payload-offset payload-size) page-size))
+          false
+          (let [payload (bytes-slice page-image payload-offset
+                                     (+ payload-offset payload-size))]
+            (and (= (vector-at cell 1) rowid)
+                 (if table-row?
+                   (table-schema-record? payload)
+                   (index-schema-record? payload)))))))))
+
+(defn- empty-root? [image :bytes page-size :i64 page-number :i64
+                    expected-type :i64] :bool
+  (let [start (* (- page-number 1) page-size)
+        page-image (bytes-slice image start (+ start page-size))
+        fields (page/decode-header page-image page-size page-number 0)]
+    (and (= (vector-at fields 0) expected-type)
+         (= (vector-at fields 3) 0))))
 
 (defn- empty-bytes [] :bytes
   (bytes-from-vector-i64 (vector-i64)))
@@ -74,3 +157,27 @@
           db-header
           (bytes-concat (suffix root-page 100) table-page))
         index-page))))
+
+;; Validate this exact admitted initial schema image. This is not a general
+;; sqlite_schema lookup or a page-tree walker.
+(defn validate-cron-notepad-image [image :bytes] :bool
+  (let [fields (header/decode image)
+        page-size (vector-at fields 0)
+        page-count (vector-at fields 5)]
+    (if (or (< page-size 512)
+            (= page-size -1)
+            (not= page-count 3)
+            (not= (bytes-count image) (* page-size page-count))
+            (not= (vector-at fields 1) 1)
+            (not= (vector-at fields 2) 1)
+            (not= (vector-at fields 4) 1)
+            (not= (bytes-at image 47) 4))
+      false
+      (let [first-page (bytes-slice image 0 page-size)
+            first-fields (page/decode-header first-page page-size 1 0)]
+        (and (= (vector-at first-fields 0) 13)
+             (= (vector-at first-fields 3) 2)
+             (schema-row-valid? first-page page-size 0 1 true)
+             (schema-row-valid? first-page page-size 1 2 false)
+             (empty-root? image page-size 2 13)
+             (empty-root? image page-size 3 10))))))
