@@ -7,6 +7,26 @@ alias `itonami-6600h`. The actual OS ingress still verifies signed commands,
 the current boot nonce and a rising request counter. This is a Mac host
 administration adapter, separate from OS-native SSH, Kekkai and app runtime.
 
+The progressive candidate obtains one verified row for geometry and sends
+ServerInit before a full-screen read. A non-incremental update still covers
+the entire requested area (RFC6143 section7.5.3), as a sequence of rectangles
+with at most32 rows each. The first real rectangle can leave while later
+bands are still being captured, and input runs between native band requests.
+Small viewports do not trigger full-screen captures. Missing/malformed bands
+close the session; they are never replaced with black or stale pixels.
+Only pixels actually delivered to that viewer enter the incremental cache.
+An incremental request cannot cancel a queued full refresh; disjoint pending
+regions are retained, with a64-request backlog cap. The channel's native
+nonce/signature and remote-approval restrictions remain unchanged.
+
+`progressive-readback.json` binds the candidate source,17 RFB and8 channel
+tests and four same-boot hardware runs. In that harness the first complete
+rectangle arrived at0.733–0.740s rather than4.759–4.815s. A signed hover
+followed by a requested64x32 region took0.349–0.407s rather than4.181–4.483s;
+cursor pixel changes were read back independently. Whole-screen completion
+still took4.35–4.37s. These are protocol-harness samples, not human-visible
+first paint, physical input-to-panel latency or drag-smoothness acceptance.
+
 `os/aiueos/scripts/aiueos-console-macos.py --config PRIVATE_CONFIG` starts
 the adapter. The owner-only JSON configuration names `sshHost` (only
 `itonami-6600h`), `vncPassword` (an owner-only eight-byte file), optional
@@ -81,7 +101,7 @@ took5.84–7.28s and persistent captures3.97–4.34s. The final lifecycle-cleanu
 revision has a separate repeat in the same receipt. Eight channel tests
 exercise framing, denied operations, malformed/repeated identities, generic
 private failures, response bounds and no replay after an ambiguous input
-timeout. The RFB suite now has ten tests, including failed initial-capture
+timeout. At that stage the RFB suite had ten tests, including failed initial-capture
 cleanup. Actual signed hover motion changed only the expected cursor pixels;
 reboot, stale-nonce key input and an invalid pointer were refused. These
 measurements do not qualify Sidecar responsiveness or native OS SSH.

@@ -223,6 +223,29 @@ def pixels(rgb, fmt):
     return out
 
 
+class FrameCache:
+    """Only pixels actually sent to this viewer may suppress an update."""
+    def __init__(self,width,height):
+        if not (0<width<=3200 and 0<height<=8192):
+            raise ValueError('native dimensions outside console bounds')
+        self.width=width;self.rgb=bytearray(width*height*3)
+        self.valid=bytearray(width*height)
+
+    def known(self,x,y,w,h):
+        return all(all(self.valid[row*self.width+x:row*self.width+x+w]) for row in range(y,y+h))
+
+    def same(self,x,y,w,h,part):
+        return self.known(x,y,w,h) and all(
+            self.rgb[(row*self.width+x)*3:(row*self.width+x+w)*3]==part[(row-y)*w*3:(row-y+1)*w*3]
+            for row in range(y,y+h))
+
+    def remember(self,x,y,w,h,part):
+        for row in range(y,y+h):
+            offset=row*self.width+x
+            self.rgb[offset*3:(offset+w)*3]=part[(row-y)*w*3:(row-y+1)*w*3]
+            self.valid[offset:offset+w]=b'\x01'*w
+
+
 def session(sock, bridge, password, interval):
     sock.settimeout(30); sock.sendall(b'RFB 003.008\n')
     version=receive(sock,12)
@@ -242,18 +265,31 @@ def session(sock, bridge, password, interval):
     print('ITONAMI_CONSOLE_AUTHENTICATED',flush=True)
     bridge.begin()
     try:
-        width,height,initial = bridge.capture()
+        # Geometry is enough for ServerInit. Do not block client input on a
+        # full capture or imply that the probe row was delivered to the viewer.
+        width,height,probe = bridge.capture_band(0,1)
+        cache=FrameCache(width,height)
+        if len(probe)!=width*3:raise ValueError('invalid geometry probe row')
         name = b'Itonami 6600H - local SSH console (diagnostic)'
         sock.sendall(struct.pack('>HH',width,height)+DEFAULT_FORMAT+struct.pack('>I',len(name))+name)
     except (OSError,ValueError,RuntimeError,EOFError,subprocess.TimeoutExpired):
         bridge.release()
         raise
     print('ITONAMI_CONSOLE_FRAMEBUFFER_READY',flush=True)
-    lock = threading.Lock(); cv = threading.Condition(); requests = collections.deque(maxlen=1)
+    lock = threading.Lock(); cv = threading.Condition(); requests = collections.deque()
     closed = threading.Event(); fmt = [pixel_format(DEFAULT_FORMAT)]; modifiers = set()
 
+    def enqueue(request):
+        # Merge only identical regions. An incremental request cannot cancel
+        # an outstanding full refresh or silently drop a disjoint region.
+        if requests and requests[-1][1:]==request[1:]:
+            requests[-1]=(min(requests[-1][0],request[0]),*request[1:])
+        else:
+            if len(requests)>=64:raise ValueError('frame request queue limit reached')
+            requests.append(request)
+
     def frames():
-        previous = None; last_capture = 0; cached = initial; last_errors = bridge.errors; next_row=0
+        last_capture = 0; last_errors = bridge.errors; next_row=0
         last_response=0;last_input=bridge.input_serial
         try:
             while not closed.is_set():
@@ -264,35 +300,40 @@ def session(sock, bridge, password, interval):
                     original_request=(incremental,x,y,w,h)
                 closed.wait(max(0,interval-(time.monotonic()-last_capture)))
                 if closed.is_set(): return
-                if previous is not None and incremental:
+                full=not incremental or not cache.known(x,y,w,h)
+                if not full:
                     # A client request receives one bounded strip, then the
                     # next request advances the scan. Never wait a full screen
                     # before giving queued keys/button edges a turn.
                     row=y+(next_row%h); count=min(32,y+h-row)
-                    nw,nh,rgb=bridge.capture_band(row,count)
-                    if (nw,nh)!=(width,height): raise ValueError('native dimensions changed; reconnect required')
-                    changed=bytearray(cached);changed[row*width*3:(row+count)*width*3]=rgb;cached=bytes(changed)
                     next_row=(row-y+count)%h;y=row;h=count
-                elif previous is not None:
-                    nw,nh,cached = bridge.capture()
-                    if (nw,nh) != (width,height): raise ValueError('native dimensions changed; reconnect required')
-                last_capture = time.monotonic()
-                same = incremental and cached == previous
-                if bridge.errors != last_errors:
-                    with lock: sock.sendall(b'\x02')
-                    last_errors = bridge.errors
-                if same and bridge.input_serial==last_input and time.monotonic()-last_response<1:
-                    # Keep the incremental request outstanding while scanning
-                    # unchanged strips. Native Screen Sharing waits for a
-                    # changed update rather than polling after an empty one.
-                    with cv:
-                        if not requests: requests.append(original_request)
-                    continue
+
+                def read_band(row,count):
+                    nw,nh,rgb=bridge.capture_band(row,count)
+                    if (nw,nh)!=(width,height) or len(rgb)!=width*count*3:
+                        raise ValueError('native dimensions/band changed; reconnect required')
+                    return b''.join(rgb[(i*width+x)*3:(i*width+x+w)*3] for i in range(count))
+
+                if not full:
+                    part=read_band(y,h);last_capture=time.monotonic()
+                    if cache.same(x,y,w,h,part) and bridge.input_serial==last_input and time.monotonic()-last_response<1:
+                        with cv:enqueue(original_request)
+                        continue
                 with lock:
-                    part = b''.join(cached[(row*width+x)*3:(row*width+x+w)*3] for row in range(y,y+h))
-                    sock.sendall(b'\0\0\0\1'+struct.pack('>HHHHi',x,y,w,h,0)+pixels(part,selected_format))
+                    if bridge.errors != last_errors:
+                        sock.sendall(b'\x02');last_errors=bridge.errors
+                    # RFC6143 non-incremental requests receive the entire
+                    # requested area. Stream multiple real rectangles in one
+                    # update rather than taking a full-screen snapshot first.
+                    sock.sendall(struct.pack('>BBH',0,0,(h+31)//32))
+                    for row in range(y,y+h,32):
+                        if closed.is_set():return
+                        count=min(32,y+h-row)
+                        strip=read_band(row,count) if full else part
+                        sock.sendall(struct.pack('>HHHHi',x,row,w,count,0)+pixels(strip,selected_format))
+                        cache.remember(x,row,w,count,strip)
+                        last_capture=time.monotonic()
                 last_response=time.monotonic();last_input=bridge.input_serial
-                previous = cached
         except (OSError,ValueError,RuntimeError,EOFError,subprocess.TimeoutExpired):
             closed.set()
             try: sock.shutdown(socket.SHUT_RDWR)
@@ -315,7 +356,7 @@ def session(sock, bridge, password, interval):
                 incremental,x,y,w,h = struct.unpack('>BHHHH',receive(sock,9))
                 if incremental not in (0,1) or not (w and h and x+w<=width and y+h<=height):
                     raise ValueError('framebuffer request outside native viewport')
-                with cv: requests.append((incremental,x,y,w,h)); cv.notify()
+                with cv: enqueue((incremental,x,y,w,h)); cv.notify()
             elif kind == 4:
                 down,_,keysym = struct.unpack('>BHI',receive(sock,7))
                 if down not in (0,1): raise ValueError('invalid key direction')

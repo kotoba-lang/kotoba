@@ -31,6 +31,22 @@ class Backend:
     def release(self): self.releases += 1
 
 
+class TallBackend(Backend):
+    def __init__(self,block=False,fail=False):
+        super().__init__();self.reads=[];self.tail=threading.Event();self.key=threading.Event()
+        self.allow=threading.Event();self.block=block;self.fail=fail
+    def capture(self):raise AssertionError('streaming must not use a whole-frame capture')
+    def capture_band(self,row,count):
+        self.reads.append((row,count))
+        if row>=32:
+            self.tail.set()
+            if self.block and not self.allow.wait(5):raise RuntimeError('fixture tail remained blocked')
+            if self.fail:raise RuntimeError('fixture missing tail')
+        return 4,65,bytes(v for y in range(row,row+count) for x in range(4) for v in (x,y,7))
+    def input(self,*args):
+        super().input(*args);self.key.set()
+
+
 class Tests(unittest.TestCase):
     def test_system_cipher_public_kat(self):
         # FIPS DES public known-answer vector, with the VNC bit-order inverse.
@@ -46,7 +62,7 @@ class Tests(unittest.TestCase):
                 with server: c.session(server,backend,PASSWORD,.5)
             except (ValueError,EOFError,OSError,RuntimeError) as e: errors.append(type(e).__name__)
         t=threading.Thread(target=serve); t.start()
-        self.addCleanup(client.close); self.addCleanup(lambda:t.join(10))
+        self.addCleanup(lambda:t.join(10)); self.addCleanup(client.close)
         self.assertEqual(c.receive(client,12),b'RFB 003.008\n'); client.sendall(version)
         if version==b'RFB 003.003\n':self.assertEqual(c.receive(client,4),struct.pack('>I',2))
         else:
@@ -54,10 +70,10 @@ class Tests(unittest.TestCase):
         challenge=c.receive(client,16)
         return client,backend,t,challenge,errors
 
-    def authenticate(self,client,challenge):
+    def authenticate(self,client,challenge,dimensions=(3,2)):
         client.sendall(c.vnc_response(PASSWORD,challenge)); self.assertEqual(c.receive(client,4),bytes(4))
         client.sendall(b'\x01'); header=c.receive(client,24)
-        self.assertEqual(struct.unpack('>HH',header[:4]),(3,2))
+        self.assertEqual(struct.unpack('>HH',header[:4]),dimensions)
         c.receive(client,struct.unpack('>I',header[20:24])[0])
 
     def test_wrong_auth_never_reaches_backend(self):
@@ -76,6 +92,94 @@ class Tests(unittest.TestCase):
         t.join(3)
         self.assertFalse(t.is_alive());self.assertEqual(b.releases,1)
         self.assertEqual(errors,['RuntimeError'])
+
+    def test_initial_rectangles_stream_before_tail_and_keep_input_live(self):
+        backend=TallBackend(block=True);self.addCleanup(backend.allow.set)
+        client,b,t,challenge,errors=self.start(backend=backend);self.authenticate(client,challenge,(4,65))
+        self.assertEqual(b.reads,[(0,1)])
+        client.sendall(struct.pack('>BBHHHH',3,0,0,0,4,65))
+        self.assertEqual(c.receive(client,4),struct.pack('>BBH',0,0,3))
+        self.assertEqual(struct.unpack('>HHHHi',c.receive(client,12)),(0,0,4,32,0))
+        expected=bytes(v for y in range(32) for x in range(4) for v in (7,y,x,0))
+        self.assertEqual(c.receive(client,4*32*4),expected)
+        self.assertTrue(b.tail.wait(2));self.assertFalse(b.allow.is_set())
+        client.sendall(struct.pack('>BBHI',4,1,0,ord('a')))
+        self.assertTrue(b.key.wait(2));self.assertEqual(b.events,[('console-key',30)])
+        b.allow.set()
+        for row,count in [(32,32),(64,1)]:
+            self.assertEqual(struct.unpack('>HHHHi',c.receive(client,12)),(0,row,4,count,0))
+            self.assertEqual(c.receive(client,4*count*4),bytes(v for y in range(row,row+count) for x in range(4) for v in (7,y,x,0)))
+        self.assertEqual(b.reads,[(0,1),(0,32),(32,32),(64,1)])
+        client.close();t.join(3);self.assertEqual(b.releases,1)
+
+    def test_first_small_viewport_does_not_read_the_rest_of_the_screen(self):
+        client,b,t,challenge,errors=self.start(backend=TallBackend());self.authenticate(client,challenge,(4,65))
+        client.sendall(struct.pack('>BBHHHH',3,0,1,33,2,4))
+        self.assertEqual(c.receive(client,4),struct.pack('>BBH',0,0,1))
+        self.assertEqual(struct.unpack('>HHHHi',c.receive(client,12)),(1,33,2,4,0))
+        self.assertEqual(c.receive(client,2*4*4),bytes(v for y in range(33,37) for x in [1,2] for v in (7,y,x,0)))
+        self.assertEqual(b.reads,[(0,1),(33,4)])
+        client.close();t.join(3)
+
+    def test_incremental_region_not_previously_delivered_is_fully_sent(self):
+        client,b,t,challenge,errors=self.start(backend=TallBackend());self.authenticate(client,challenge,(4,65))
+        client.sendall(struct.pack('>BBHHHH',3,0,0,0,1,65))
+        self.assertEqual(c.receive(client,4),struct.pack('>BBH',0,0,3))
+        for count in [32,32,1]:c.receive(client,12+count*4)
+        # The native band included x=1..3, but those pixels were not sent.
+        client.sendall(struct.pack('>BBHHHH',3,1,1,0,3,65))
+        self.assertEqual(c.receive(client,4),struct.pack('>BBH',0,0,3))
+        for row,count in [(0,32),(32,32),(64,1)]:
+            self.assertEqual(struct.unpack('>HHHHi',c.receive(client,12)),(1,row,3,count,0))
+            c.receive(client,3*count*4)
+        client.close();t.join(3)
+
+    def test_missing_tail_closes_instead_of_filling_unread_rows(self):
+        client,b,t,challenge,errors=self.start(backend=TallBackend(fail=True));self.authenticate(client,challenge,(4,65))
+        client.sendall(struct.pack('>BBHHHH',3,0,0,0,4,65))
+        self.assertEqual(c.receive(client,4),struct.pack('>BBH',0,0,3))
+        c.receive(client,12+4*32*4)
+        with self.assertRaises(EOFError):c.receive(client,12)
+        t.join(3);self.assertFalse(t.is_alive());self.assertEqual(b.releases,1)
+
+    def test_pending_full_refresh_survives_incremental_request_for_same_region(self):
+        backend=TallBackend(block=True);self.addCleanup(backend.allow.set)
+        client,b,t,challenge,errors=self.start(backend=backend);self.authenticate(client,challenge,(4,65))
+        client.sendall(struct.pack('>BBHHHH',3,0,0,0,4,65))
+        c.receive(client,4+12+4*32*4);self.assertTrue(b.tail.wait(2))
+        client.sendall(struct.pack('>BBHHHH',3,0,0,0,4,40)+struct.pack('>BBHHHH',3,1,0,0,4,40))
+        # A key is ordered after both requests on the stream.
+        client.sendall(struct.pack('>BBHI',4,1,0,ord('a')));self.assertTrue(b.key.wait(2))
+        b.allow.set();c.receive(client,12+4*32*4+12+4*4)
+        self.assertEqual(c.receive(client,4),struct.pack('>BBH',0,0,2))
+        for row,count in [(0,32),(32,8)]:
+            self.assertEqual(struct.unpack('>HHHHi',c.receive(client,12)),(0,row,4,count,0));c.receive(client,4*count*4)
+        client.close();t.join(3)
+
+    def test_disjoint_pending_regions_are_not_silently_dropped(self):
+        backend=TallBackend(block=True);self.addCleanup(backend.allow.set)
+        client,b,t,challenge,errors=self.start(backend=backend);self.authenticate(client,challenge,(4,65))
+        client.sendall(struct.pack('>BBHHHH',3,0,0,0,4,65))
+        c.receive(client,4+12+4*32*4);self.assertTrue(b.tail.wait(2))
+        for x,y in [(0,0),(1,1)]:client.sendall(struct.pack('>BBHHHH',3,0,x,y,1,1))
+        client.sendall(struct.pack('>BBHI',4,1,0,ord('a')));self.assertTrue(b.key.wait(2))
+        b.allow.set();c.receive(client,12+4*32*4+12+4*4)
+        for x,y in [(0,0),(1,1)]:
+            self.assertEqual(c.receive(client,4),struct.pack('>BBH',0,0,1))
+            self.assertEqual(struct.unpack('>HHHHi',c.receive(client,12)),(x,y,1,1,0))
+            self.assertEqual(c.receive(client,4),bytes([7,y,x,0]))
+        client.close();t.join(3)
+
+    def test_frame_request_backlog_is_bounded(self):
+        backend=TallBackend(block=True);self.addCleanup(backend.allow.set)
+        client,b,t,challenge,errors=self.start(backend=backend);self.authenticate(client,challenge,(4,65))
+        client.sendall(struct.pack('>BBHHHH',3,0,0,0,4,65))
+        c.receive(client,4+12+4*32*4);self.assertTrue(b.tail.wait(2))
+        client.sendall(b''.join(struct.pack('>BBHHHH',3,0,i%2,0,1,1) for i in range(65)))
+        with self.assertRaises(EOFError):c.receive(client,12)
+        b.allow.set();t.join(3)
+        self.assertFalse(t.is_alive());self.assertEqual(b.releases,1)
+        self.assertIn('ValueError',errors)
 
     def test_standard_and_apple_version_negotiation(self):
         for version in (b'RFB 003.003\n',b'RFB 003.007\n',b'RFB 003.889\n'):
