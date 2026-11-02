@@ -77,7 +77,7 @@ def main(args):
                          'image': sha(image), 'sources': {str(p): sha(p) for p in files}})
         return image, r
 
-    for name in CASES:
+    for name in ([args.case] if args.case else CASES):
         source = (owner / 'test/native' / (name + '.kotoba')).resolve(strict=True)
         entry = output / ('entry-' + name + '.kotoba')
         entry.write_bytes(source.read_bytes())
@@ -85,8 +85,10 @@ def main(args):
         if name == 'html_fragment_wire':
             lines = [line[5:] for line in r.stdout.splitlines() if line.startswith(b'WIRE ')]
             escaped = [line[9:] for line in r.stdout.splitlines() if line.startswith(b'WIRE_ESC ')]
-            assert len(lines) == len(escaped) == 1
-            json.loads(lines[0]); json.loads(escaped[0])
+            semantic = [line[9:] for line in r.stdout.splitlines() if line.startswith(b'WIRE_SEM ')]
+            assert len(lines) == len(escaped) == len(semantic) == 1
+            json.loads(lines[0]); json.loads(escaped[0]); assert isinstance(json.loads(semantic[0]), list)
+            (output / 'semantic-wire.json').write_bytes(semantic[0] + b'\n')
             denied = run(name + '-denied', [image], dict(env, KEXE_STRUCTURED_REPORT='1', KEXE_ALLOW='-'), success=False)
             assert b':wire 37 :refused :not-granted' in denied.stdout + denied.stderr
             assert not any(line.startswith(b'WIRE ') for line in denied.stdout.splitlines())
@@ -105,6 +107,7 @@ def main(args):
 
 if __name__ == '__main__':
     p = argparse.ArgumentParser()
+    p.add_argument('--case', choices=CASES, help='run one named fixture plus the negative control')
     p.add_argument('--compiler', type=Path, required=True)
     p.add_argument('--compiler-sha256', required=True)
     p.add_argument('--runner-source', type=Path, required=True)
