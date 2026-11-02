@@ -12,7 +12,7 @@ import time
 
 ROOT = Path(__file__).resolve().parents[1]
 CASES = ('numeric_ref_html', 'html_named_ref', 'html_named_corpus', 'html_data_token',
-         'html_attribute_token', 'html_tag', 'html_tokens', 'html_fragment', 'html_fragment_wire', 'html_chunk_limit', 'html_chunk_budget', 'html_fragment_bounds', 'html_fragment_semantics')
+         'html_attribute_token', 'html_tag', 'html_tokens', 'html_fragment', 'html_fragment_wire', 'html_chunk_limit', 'html_chunk_budget', 'html_fragment_bounds', 'html_fragment_semantics', 'html_list', 'html_list_eof', 'html_list_refusal')
 
 
 def sha(path):
