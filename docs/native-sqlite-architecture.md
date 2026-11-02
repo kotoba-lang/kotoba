@@ -375,3 +375,19 @@ those shapes still fail closed. It also does not qualify arbitrary SQLite
 schemas, WAL or rollback-journal recovery, standard byte-range/concurrent
 locking, crash recovery, Linux x86_64, or Itonami wiring. Python is used only
 for the separate dated read-only oracle and is not part of the native path.
+
+## Interior-page encoder prerequisite (2026-11-02)
+
+Kotoba now exposes bounded encoders for table-interior cells, index-interior
+cells, and one-cell table/index interior pages. The source-pinned Amu selfhost
+Linux ARM64 fixture checked child pointers, table separator rowid, index
+payload framing, page headers/right-child values, and refusal of invalid child
+numbers, a negative separator, and an index interior root on page 1. The exact
+Amu pin and source/program hashes are in the
+[`interior-page encoder receipt`](../lib/kotoba.sql/evidence/interior-page-encoder-native-linux-arm64-20261102.json).
+
+This qualifies page construction primitives only. Kotoba still does not walk
+or mutate these interior table/index roots, split overflowing roots, rebalance
+pages, or verify a two-leaf database through a SQLite oracle. The current
+notepad mutation path continues to refuse page-split and interior-root shapes;
+dynamic B-tree mutation remains the next implementation requirement.

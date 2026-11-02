@@ -30,6 +30,7 @@ FIXTURES = (
     ("sqlite.notepad-sidecar-refusal", PACKAGE / "test/native/notepad-sidecar-refusal.kotoba"),
     ("sqlite.notepad-existing-file-mutation", PACKAGE / "test/native/notepad-existing-file-mutation.kotoba"),
     ("sqlite.notepad-unsupported-schema-refusal", PACKAGE / "test/native/notepad-unsupported-schema-refusal.kotoba"),
+    ("sqlite.interior-page-encoder", PACKAGE / "test/native/interior-page-encoder.kotoba"),
 )
 LEGACY_FIXTURE = PACKAGE / "test/fixtures/legacy-cron-notepad-20261102.sqlite"
 UNSUPPORTED_SCHEMA_FIXTURE = PACKAGE / "test/fixtures/unsupported-cron-notepad-20261102.sqlite"
@@ -147,6 +148,10 @@ def main(amu, compiler, out, amu_pin=None):
     if sha(unsupported_path) != unsupported_before or unsupported_before != unsupported_schema_sha256:
         raise RuntimeError("Kotoba changed a database with an unsupported cron_notepad schema")
 
+    interior_encoder = out / receipts[4]["image"]
+    run("sqlite-interior-page-encoder-positive-and-refusal",
+        [interior_encoder], out, guest_env, calls, timeout=300)
+
     receipt = {
         "schema": "kotoba.sqlite.native-linux-arm64.v1",
         "platform": [platform.system(), platform.machine()],
@@ -176,8 +181,12 @@ def main(amu, compiler, out, amu_pin=None):
             "nativeResult": "Kotoba refused upsert/publication for the standard five-column cron_notepad schema",
             "preserved": sha(unsupported_path) == unsupported_before,
         },
+        "interiorPageEncoder": {
+            "fixture": "sqlite.interior-page-encoder",
+            "result": "Kotoba encoded and decoded bounded table/index interior pages and refused invalid child/page inputs",
+        },
         "sidecarRefusals": sidecar_cases,
-        "result": "Kotoba positive upsert/readback, pre-existing WAL/SHM/rollback-journal refusals, existing SQLite mutation/reopen including rowid 128+, and unsupported-schema refusal/preservation passed",
+        "result": "Kotoba positive upsert/readback, pre-existing WAL/SHM/rollback-journal refusals, existing SQLite mutation/reopen including rowid 128+, unsupported-schema refusal/preservation, and interior-page encoder controls passed",
         "hostSqliteOracle": False,
     }
     (out / "native-sqlite-arm64.json").write_text(json.dumps(receipt, indent=2) + "\n")
