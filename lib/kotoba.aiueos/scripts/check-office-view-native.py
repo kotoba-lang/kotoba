@@ -17,6 +17,16 @@ if not gate.darwin:raise ValueError('gate currently qualifies macOS Arm only')
 paths={'aiueos/office_view.kotoba':root/'lib/kotoba.aiueos/os/aiueos/kotoba/aiueos/office_view.kotoba','aiueos/office_view_native_test.kotoba':root/'lib/kotoba.aiueos/test/aiueos/office_view_native_test.kotoba'}
 sources={k:p.read_bytes() for k,p in paths.items()};parser=gate.build('view','aiueos/office_view_native_test.kotoba',sources)
 sha=lambda x:hashlib.sha256(x).hexdigest()
+def index_of(wire, wanted):
+ data=wire.encode();pos=4;index=0
+ while pos<len(data)-1:
+  fields=[]
+  for _ in range(8):
+   end=data.index(b':',pos); size=int(data[pos:end]);pos=end+1
+   fields.append(data[pos:pos+size].decode());pos+=size
+  if fields[3]==wanted:return index
+  index+=1
+ raise ValueError('target not in view: '+wanted)
 report={}
 for name,build in [('bunsho',bunsho),('hyokeisan',hyokeisan),('zuhyo',zuhyo)]:
  receipt=json.loads((build/'build-receipt.json').read_text());source=(build/'program.kotoba').read_bytes();wasm=(build/'program.wasm').read_bytes()
@@ -29,10 +39,23 @@ for name,build in [('bunsho',bunsho),('hyokeisan',hyokeisan),('zuhyo',zuhyo)]:
  if not count.isdigit() or int(count)<2 or tag!='div':raise ValueError((name,result))
  field={'bunsho':'b0','hyokeisan':'c0','zuhyo':'body'}[name]
  content='表現😀\n二行'
- edited=gate.run(name+'-edit',image,args=['step',init,field,'input',content]).stdout.decode().removesuffix('\n')
+ idx=index_of(wire,field)
+ event=gate.run(name+'-event',parser,args=[wire,'action',str(idx),'input',content]).stdout.decode()
+ if event!='app|input|'+field+'|'+content+'\n':raise ValueError((name,'event mapping'))
+ route,kind,target,value=event.removesuffix('\n').split('|',3)
+ edited=gate.run(name+'-edit',image,args=['step',init,target,kind,value]).stdout.decode().removesuffix('\n')
  updated=gate.run(name+'-edited-view',image,args=['view',edited]).stdout.decode()
  parsed=gate.run(name+'-edited-decode',parser,args=[updated,'']).stdout.decode().strip()
  if content not in updated or not parsed.endswith(':div'):raise ValueError((name,'edited view'))
+ button_key={'bunsho':'mode','hyokeisan':'backup-export','zuhyo':'mode'}[name]
+ button_idx=index_of(wire,button_key)
+ click=gate.run(name+'-button-event',parser,args=[wire,'action',str(button_idx),'click','']).stdout.decode()
+ expected_route='host' if name=='hyokeisan' else 'app'
+ if click!=expected_route+'|click|'+button_key+'|\n':raise ValueError((name,'button mapping'))
+ if expected_route=='app':
+  route,kind,target,value=click.removesuffix('\n').split('|',3)
+  toggled=gate.run(name+'-button-step',image,args=['step',init,target,kind,value]).stdout.decode().removesuffix('\n')
+  if toggled==init:raise ValueError((name,'button did not change state'))
  report[name]={'sourceSha256':sha(source),'wasmSha256':sha(wasm),'viewSha256':sha(wire.encode()),'nodes':int(count),'root':tag,
                'editedViewSha256':sha(updated.encode()),'editedNodes':int(parsed.split(':')[0])}
 def frame(x):return str(len(x.encode()))+':'+x
@@ -41,6 +64,18 @@ def node(tag='div',typ='',key='',value='',text='',children='0'):
 positive='BV2|'+node(children='1')+node('textarea',key='body',value='日本😀\n二行')+'\n'
 if gate.run('unicode-multiline',parser,args=[positive,'']).stdout != b'2:div\n':raise ValueError('unicode')
 if gate.run('unicode-value-index',parser,args=[positive,'inspect']).stdout != '日本😀\n二行\n'.encode():raise ValueError('incorrect indexed field')
+if gate.run('textarea-action',parser,args=[positive,'action','1','input','新😀\n二行']).stdout != 'app|input|body|新😀\n二行\n'.encode():raise ValueError('textarea event')
+for label,idx,kind,value in [('negative','-1','input','x'),('past-end','2','input','x'),('root-input','0','input','x'),('wrong-click','1','click',''),('bad-kind','1','submit',''),('textarea-cr','1','input','a\rb')]:
+ if gate.run('action-reject-'+label,parser,expected=3,args=[positive,'action',idx,kind,value]).stdout:raise ValueError(label+' output')
+button='BV2|'+node('button',typ='button',key='add',text='追加')+'\n'
+if gate.run('button-action',parser,args=[button,'action','0','click','']).stdout != b'app|click|add|\n':raise ValueError('button event')
+for key in ['backup-import','backup-export','backup-restore','workbook-upgrade']:
+ wire='BV2|'+node('button',typ='button',key=key,text='操作')+'\n'
+ if gate.run('host-action-'+key,parser,args=[wire,'action','0','click','']).stdout != ('host|click|'+key+'|\n').encode():raise ValueError('host action route '+key)
+
+for label,wire,idx,kind,value in [('click-with-value',button,'0','click','x'),('button-input',button,'0','input','x'),('missing-key','BV2|'+node('button',typ='button')+'\n','0','click',''),('invalid-view','bad','0','click','')]:
+ if gate.run('action-reject-'+label,parser,expected=3,args=[wire,'action',idx,kind,value]).stdout:raise ValueError(label+' output')
+
 # 512 total nodes admitted; 513 and oversized child counts refuse.
 full='BV2|'+node(children='16')+(node(children='31')+node('span')*31)*15+node(children='30')+node('span')*30+'\n'
 if gate.run('max-nodes',parser,args=[full,'']).stdout != b'512:div\n':raise ValueError('node limit')
@@ -65,5 +100,11 @@ if sources['aiueos/office_view.kotoba'].count(needle)!=1:raise ValueError('mutat
 mutant=dict(sources);mutant['aiueos/office_view.kotoba']=mutant['aiueos/office_view.kotoba'].replace(needle,b'false')
 broken=gate.build('mutant','aiueos/office_view_native_test.kotoba',mutant)
 if gate.run('mutation-detected',broken,args=[bad['unknown-tag'],'']).stdout!=b'1:script\n':raise ValueError('negative control')
+needle=b'(string=? tag "button") (string=? value "")'
+if sources['aiueos/office_view.kotoba'].count(needle)!=1:raise ValueError('action mutation anchor')
+mutant=dict(sources);mutant['aiueos/office_view.kotoba']=mutant['aiueos/office_view.kotoba'].replace(needle,b'true (string=? value "")')
+broken=gate.build('action-mutant','aiueos/office_view_native_test.kotoba',mutant)
+if gate.run('action-mutation-detected',broken,args=[positive,'action','1','click','']).stdout!=b'app|click|body|\n':raise ValueError('action negative control')
+
 gate.finish('PASS_OFFICE_VIEW_NATIVE',observerSHA256=sha(Path(__file__).read_bytes()),apps=report,refusals=list(bad),
-            scope='macOS Arm native synthetic inputs; no Itonami OS rendering, QEMU execution, real migration or publication')
+            scope='macOS Arm native synthetic views and actions; no Itonami OS rendering/input, QEMU execution, real migration or publication')
