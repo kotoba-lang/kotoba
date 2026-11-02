@@ -231,3 +231,33 @@ file create/update operations plus 128 mode operations and read back the final
 mode. The previous supervisor rejected that valid 640-operation stream; a
 source-pinned Amu candidate accepted it and refused an extra acknowledgment. The fixture is narrowly scoped and
 does not prove arbitrary OCI support.
+
+## Process-to-rootfs consistency candidate
+
+`fune.process-rootfs/process-rootfs-problem` checks a digest-bound config against
+a trusted final plan. It selects the first entrypoint element, or the first
+`Cmd` element when the entrypoint is missing or empty. It requires an absolute,
+non-normalized ASCII path to an explicitly planned regular file with at least
+one execute bit. The working directory defaults to `/`; a non-root value must
+identify an explicit planned directory. Dot, dot-dot, empty components and
+unsupported path bytes refuse. This is a separate check: the existing image
+validator still accepts data-only images.
+
+`fune.layout-process/verify-layout-process` first verifies the complete layout,
+then freshly reads and digest-checks manifest and config and replans every
+verified held layer before applying the process check. It discards the plan.
+The result is diagnostic: it does not freeze future input, establish a runtime
+UID/GID's actual permissions, verify an executable interpreter, prove mount or
+namespace isolation, persist a rootfs, or authorize execution. A caller must
+bind its own verified snapshot and plan to the eventual execution.
+
+On ARM64 Linux, a source-composed native gate checked entrypoint/Cmd selection,
+default and explicit working directories, missing and wrong-type paths, no
+execute bit, traversal, config digest tampering and unchanged image admission.
+Separate no-execute-check and traversal-check mutants failed the gate. A second
+native gate used independently staged OCI layouts: an executable fixture passed;
+no-execute, missing executable, missing cwd, a later layer removing execute bits,
+and a corrupted layer refused. Generate the fixtures with
+`test/fune/stage_process_layouts.py OUTPUT` and supply its printed digests to
+`test/fune/layout_process_gate.kotoba`. These tests do not establish source-
+locked project linking, x86 behavior or execution of an OCI workload.
