@@ -120,3 +120,7 @@ actual hostile CPL3 denial, physical performance/operations or OS/L1 release.
 The diagnostic packages but never executes its user ELF. Protected-state
 assumptions are not a product process-isolation qualification. Physical
 HHKB/Trackpad acceptance remains paused and existing management paths remain.
+
+The explicit [main-derived compiler profile](native-receive-compiler-main.md)
+qualifies this same responder corpus separately and retains the original
+source/artifact/runtime receipts without a silent producer replacement.

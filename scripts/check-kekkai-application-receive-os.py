@@ -19,7 +19,9 @@ import time
 
 ROOT = Path(__file__).resolve().parents[1]
 BASELINE_SHA = '7819846b94d5504396fc19506e7cfce98b9a1a79a34181acffdc2e28ec7cb804'
-COMPILER_SHA = '3eb3f37318b35a612c6322d638f24060f1e6579d31f12573a2ea1cae88239521'
+COMPILER_PROFILES = {
+    'pool-v4-35f-reference': '3eb3f37318b35a612c6322d638f24060f1e6579d31f12573a2ea1cae88239521',
+    'pool-v4-main-2f842': 'efec34486903fc189eb9e3a6d45e02edeaa7f7edf73a9e3e12586c8de048b225'}
 PUBLIC = [
     'scripts/native_application_receive_peer.py', 'scripts/native_udp_link_peer.py',
     'lib/kotoba.kekkai/tools/application_receive_reference.py',
@@ -79,10 +81,10 @@ def main(a):
         qmp_path = a.amu_source/'scripts/seed/check-aiueos-application-pool-macos-native.py'
         gdb_path = ROOT/'scripts/check-kekkai-application-reassembly-os.py'
         mac, pool, checkpoint = load('receive_mac',mac_path),load('receive_qmp',qmp_path),load('receive_gdb',gdb_path)
-        assert mac.verify_macho(a.compiler) == dict(bytes=3826784,sha256=COMPILER_SHA)
+        assert mac.verify_macho(a.compiler) == dict(bytes=3826784,sha256=COMPILER_PROFILES[a.compiler_profile])
         assert pin(a.qemu)['sha256'] == a.qemu_sha256
         assert pin(a.firmware)['sha256'] == a.firmware_sha256
-        report.update(compiler=pin(a.compiler),baseline=pin(a.baseline),qemu=pin(a.qemu),firmware=pin(a.firmware),
+        report.update(compiler=pin(a.compiler),compilerProfile=a.compiler_profile,baseline=pin(a.baseline),qemu=pin(a.qemu),firmware=pin(a.firmware),
             nativeHelpers={str(p.relative_to(a.amu_source)):pin(p) for p in [mac_path,qmp_path]},gdbObserver=pin(gdb_path))
         for virtual,sha in baseline['sourceGraph'].items():
             source = base/'source'/virtual.lstrip('/')
@@ -285,6 +287,7 @@ def main(a):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--compiler',type=Path,required=True)
+    parser.add_argument('--compiler-profile',choices=sorted(COMPILER_PROFILES),required=True)
     parser.add_argument('--amu-source',type=Path,required=True)
     parser.add_argument('--baseline',type=Path,required=True)
     parser.add_argument('--qemu',type=Path,required=True)
