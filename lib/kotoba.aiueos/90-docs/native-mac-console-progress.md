@@ -104,6 +104,15 @@ physical input-to-panel latency or native-client human smoothness acceptance.
 Whole-screen refresh and drag smoothness remain open. No native image,
 NVMe content, command admission, app consent or listener scope changed.
 
+The committed fair adapter was then activated by restarting only the existing
+Mac console LaunchAgent. Native macOS Screen Sharing reauthenticated and
+displayed the desktop; `r` changed Goal `aba` to `abar`, and Backspace
+restored `aba`. Approved remained0, Network off, DID/key none. The same
+native boot answered a signed status afterward. The console remains loopback
+only; the existing SSH/PXE processes, fallback and checked next-boot
+reservation were preserved. See `fair-capture-live.json`. This deployment
+does not supply native-client human drag-smoothness acceptance.
+
 `os/aiueos/scripts/aiueos-console-macos.py --config PRIVATE_CONFIG` starts
 the adapter. The owner-only JSON configuration names `sshHost` (only
 `itonami-6600h`), `vncPassword` (an owner-only eight-byte file), optional
