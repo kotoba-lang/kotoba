@@ -129,6 +129,7 @@ def plan_layout(name, layers, arch=None):
 
 plan_digests = plan_layout('plan-good', [other, layer, (source / 'replacement.tar').read_bytes()])
 binary_digests = plan_layout('plan-binary', [other, layer, (source / 'binary-replacement.tar').read_bytes()])
+plan_layout('plan-binary-repeat-dir', [other, other, layer, (source / 'binary-replacement.tar').read_bytes()])
 plan_layout('plan-binary-bad-arch', [other, layer, (source / 'binary-replacement.tar').read_bytes()], arch='amd64')
 plan_layout('plan-binary-max', [other, layer, (source / 'max-replacement.tar').read_bytes()])
 for name in ('plan-binary-bad-marker', 'plan-binary-bad-index', 'plan-binary-bad-config'):

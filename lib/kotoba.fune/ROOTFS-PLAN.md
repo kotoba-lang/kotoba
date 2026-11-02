@@ -109,7 +109,7 @@ Earlier valid commands can already have reached the worker when a later entry
 or layer fails. A supervisor must reject any failed producer, worker or pipe,
 kill/discard the worker and its entire private tree, and never use stdout for
 other text or structured reporting. The API does not currently authenticate a
-supervisor, check worker acknowledgments, issue a commit, publish a rootfs or
+supervisor, check worker acknowledgments, publish a rootfs or
 start a process. In particular, producer success alone is not proof of worker
 success, and a future reopening of a path is not covered by the old snapshot.
 The bounded worker, planner and no-links/whiteouts profile still admit only a
@@ -168,8 +168,31 @@ make the source paths immutable. The test fixture's original and mutated
 layers were independently checked to have equal length and differ by one byte.
 
 The stream still depends on caller-authenticated executable and manifest
-digests, explicit acknowledgment count, and the draft Amu supervisor/worker.
+digests and the draft Amu supervisor/worker.
 It does not publish the rootfs, start a program, support general OCI features,
 or establish a same-principal security boundary. `ok` from the producer alone
 is not an execution authorization. Source-composed ARM64 and local VM tests do
 not qualify source-locked project linking, native x86, hosted CI or a release.
+
+## Terminal operation count
+
+The planner tracks the number of emitted mutation commands, bounded to 512.
+Reusing a directory in a later layer does not add a command; a file create or
+replacement does. After all layers stream successfully, `emit-layout-hex`
+sends a terminal `C` frame carrying that count. The worker compares it to the
+number it completed and emits `D` only on a match, after which it refuses more
+writes. The native supervisor checks that its worker response ends in `D`;
+the caller no longer supplies an acknowledgment count. `D` only closes this
+diagnostic command stream: it does not persist a rootfs, authenticate the
+producer, or authorize execution. The caller must still authenticate both image
+digests, and the supervisor destroys the private tree after the test run.
+
+The native ARM64 planner gate checked the 512-command boundary and confirmed
+that a repeated directory does not increase the count. A four-layer fixture
+with a repeated directory produced three worker acknowledgments followed by
+`D`, and the file readback still matched. The native supervisor rejected
+separately compiled producer fixtures with an incorrect count and with no
+terminal frame. A worker mutant that skipped the count comparison and a
+supervisor mutant that ignored `D` each incorrectly accepted the corresponding
+fixture, so both negative controls failed. These tests use draft native images
+and do not establish an authenticated executable authority or runtime release.

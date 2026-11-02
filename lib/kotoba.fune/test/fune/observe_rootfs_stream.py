@@ -50,7 +50,7 @@ def run_case(guest, worker, root, good, digest=DIGEST, expected=None,
             return {"case": root.name, "producerExit": source_code, "workerExit": sink.returncode,
                     "streamBytes": transferred}
         assert source_code == 0 and not diagnostics, (source_code, diagnostics)
-        assert sink.stdout.read(3) == b"KKK", "directory, create and replacement acknowledgments"
+        assert sink.stdout.read(4) == b"KKKD", "worker acknowledgments and checked terminal count"
         path = b"bin/hello"
         if expected is None:
             expected = bytes(range(256)) * 65 + b"end"
@@ -79,6 +79,7 @@ if __name__ == "__main__":
     parser.add_argument("--large-digest", help="also check the independently staged 1 MiB fixture")
     parser.add_argument("--full-layout", action="store_true", help="check layout metadata before any stream")
     parser.add_argument("--bad-arch-digest", help="manifest digest of the unsupported architecture fixture")
+    parser.add_argument("--repeat-dir-digest", help="also check a repeated-directory fixture")
     args = parser.parse_args()
     print(run_case(args.guest.resolve(), args.worker.resolve(), (args.layouts / "plan-binary").resolve(), True))
     print(run_case(args.guest.resolve(), args.worker.resolve(), (args.layouts / "plan-binary-third-tampered").resolve(), False,
@@ -95,4 +96,7 @@ if __name__ == "__main__":
     if args.large_digest:
         print(run_case(args.guest.resolve(), args.worker.resolve(), (args.layouts / "plan-binary-max").resolve(),
                        True, digest=args.large_digest, expected=bytes(range(256)) * 4096))
+    if args.repeat_dir_digest:
+        print(run_case(args.guest.resolve(), args.worker.resolve(), (args.layouts / "plan-binary-repeat-dir").resolve(),
+                       True, digest=args.repeat_dir_digest))
     print("PASS_FUNE_NATIVE_STREAM_OBSERVATION")
