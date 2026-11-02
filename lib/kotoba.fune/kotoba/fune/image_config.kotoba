@@ -1,0 +1,87 @@
+;; Bounded OCI image-config policy for the proposed fune profile (JUN-776).
+;; Only bytes bound by a verified manifest may reach the config parser.
+;; Success is not rootfs verification, runtime admission or authorization.
+(ns fune.image-config
+  (:export [config-policy-problem])
+  (:require [fune.image-manifest :as manifest] [jcs.reader :as json]))
+
+(defn- cfg-ws? [c :i64] :bool (or (= c 32) (= c 9) (= c 10) (= c 13)))
+(defn- cfg-start [b :vector-i64] :i64
+  (loop [i 0] (if (and (< i (vector-count b)) (cfg-ws? (vector-at b i))) (recur (+ i 1)) i)))
+(defn- cfg-str= [b :vector-i64 i :i64 s :string] :bool
+  (if (= (json/json-kind b i) 3) (= (json/json-string b i) s) false))
+
+;; json-valid? has already proved the string is valid UTF-8 and its escapes.
+(defn- cfg-string-ok? [b :vector-i64 i :i64] :bool
+  (if (not (= (json/json-kind b i) 3)) false
+    (let [v (json/json-string-bytes b i) n (vector-count v)]
+      (if (> n 65536) false
+        (loop [j 0] (if (= j n) true (if (= (vector-at v j) 0) false (recur (+ j 1)))))))))
+
+(defn- cfg-array-ok? [b :vector-i64 i :i64 nonempty :bool] :bool
+  (if (not (= (json/json-kind b i) 2)) false
+    (let [n (json/json-count b i)]
+      (if (or (> n 128) (and nonempty (= n 0))) false
+        (loop [j 0 total 0]
+          (if (= j n) true
+            (let [p (json/json-element b i j)]
+              (if (not (cfg-string-ok? b p)) false
+                (let [next (+ total (vector-count (json/json-string-bytes b p)))]
+                  (if (> next 65536) false (recur (+ j 1) next)))))))))))
+
+(defn- cfg-absolute? [b :vector-i64 i :i64] :bool
+  (if (not (cfg-string-ok? b i)) false
+    (let [v (json/json-string-bytes b i)]
+      (and (> (vector-count v) 0) (= (vector-at v 0) 47)))))
+
+(defn- cfg-array-bytes [b :vector-i64 i :i64] :i64
+  (loop [j 0 n (json/json-count b i) total 0]
+    (if (= j n) total
+      (recur (+ j 1) n (+ total (vector-count (json/json-string-bytes b (json/json-element b i j))))))))
+
+;; Env is deliberately empty until safe duplicate-name and execution semantics
+;; are implemented; silently dropping or rewriting image environment is unsafe.
+(defn- cfg-process-problem [b :vector-i64 i :i64] :string
+  (if (not (= (json/json-kind b i) 1)) "fune/config-process-type"
+    (let [ep (json/json-member b i "Entrypoint") cmd (json/json-member b i "Cmd")
+          env (json/json-member b i "Env") cwd (json/json-member b i "WorkingDir")]
+      (cond (not (= (json/json-count b i) 4)) "fune/config-process-fields"
+            (not (cfg-array-ok? b ep true)) "fune/config-entrypoint"
+            (not (cfg-absolute? b (json/json-element b ep 0))) "fune/config-entrypoint"
+            (not (cfg-array-ok? b cmd false)) "fune/config-cmd"
+            (not (= (json/json-kind b env) 2)) "fune/config-env"
+            (not (= (json/json-count b env) 0)) "fune/config-env"
+            (not (cfg-absolute? b cwd)) "fune/config-working-dir"
+            (> (+ (cfg-array-bytes b ep) (+ (cfg-array-bytes b cmd) (vector-count (json/json-string-bytes b cwd)))) 65536) "fune/config-arguments-size"
+            :else "ok"))))
+
+(defn- cfg-diffs-problem [config :vector-i64 rootfs :i64 manifest :vector-i64 layers :i64] :string
+  (if (not (= (json/json-kind config rootfs) 1)) "fune/config-rootfs"
+    (let [typ (json/json-member config rootfs "type") ds (json/json-member config rootfs "diff_ids")]
+      (cond (not (= (json/json-count config rootfs) 2)) "fune/config-rootfs"
+            (not (cfg-str= config typ "layers")) "fune/config-rootfs"
+            (not (= (json/json-kind config ds) 2)) "fune/config-diffids"
+            (not (= (json/json-count config ds) (json/json-count manifest layers))) "fune/config-diffids"
+            :else (loop [j 0 n (json/json-count config ds)]
+              (if (= j n) "ok"
+                (let [d (json/json-element config ds j)
+                      layer (json/json-element manifest layers j)
+                      ref (json/json-member manifest layer "digest")]
+                  (if (and (= (json/json-kind config d) 3)
+                           (= (json/json-string config d) (json/json-string manifest ref)))
+                    (recur (+ j 1) n) "fune/config-diffids"))))))))
+
+(defn config-policy-problem [manifest-bytes :vector-i64 expected :string config :vector-i64] :string
+  (let [p (manifest/config-bytes-problem manifest-bytes expected config)]
+    (if (not (= p "ok")) p
+      (if (not (json/json-valid? config)) "fune/config-json"
+        (let [root (cfg-start config)]
+          (if (not (= (json/json-kind config root) 1)) "fune/config-type"
+            (let [arch (json/json-member config root "architecture") os (json/json-member config root "os")
+                  rootfs (json/json-member config root "rootfs") process (json/json-member config root "config")
+                  layers (json/json-member manifest-bytes (cfg-start manifest-bytes) "layers")]
+              (cond (not (= (json/json-count config root) 4)) "fune/config-fields"
+                    (not (cfg-str= config arch "arm64")) "fune/config-platform"
+                    (not (cfg-str= config os "linux")) "fune/config-platform"
+                    :else (let [q (cfg-diffs-problem config rootfs manifest-bytes layers)]
+                      (if (= q "ok") (cfg-process-problem config process) q))))))))))
