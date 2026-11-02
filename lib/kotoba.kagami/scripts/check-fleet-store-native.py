@@ -69,6 +69,17 @@ run('race-reopen', 'state-new', race)
 # Deliberately broken implementations must fail the same behavioral checks.
 store_source = sources['kagami/fleet_store_native.kotoba']
 ingress_source = sources['kagami/fleet_announce_edn.kotoba']
+# On the Mac host, reproduce the pre-fix trap as a negative control: slicing
+# a six-byte prefix through a multibyte character traps instead of rejecting.
+if gate.darwin:
+ needle = (b'(= (vector-at v (+ i 1)) 58) (= (vector-at v (+ i 2)) 112)\n'
+           b'                                    (= (vector-at v (+ i 3)) 105) (= (vector-at v (+ i 4)) 110)\n'
+           b'                                    (= (vector-at v (+ i 5)) 123)')
+ if ingress_source.count(needle)!=1: raise ValueError('unexpected UTF-8 prefix guard')
+ mutant=dict(sources);mutant['kagami/fleet_announce_edn.kotoba']=ingress_source.replace(needle,b'(string=? (string-substring raw i (+ i 6)) "#:pin{")')
+ broken=gate.build('control-utf8-prefix','kagami/fleet_store_native_test.kotoba',mutant)
+ directory=gate.out/'control-utf8-prefix-state';directory.mkdir();run('control-init-utf8-prefix','init',directory)
+ gate.mac_call('control-detected-utf8-prefix',[broken,*gate.guest_args(['edn-invalid',directory])],-signal.SIGTRAP)
 needle=b'(not (lexical-safe? normalized))'
 if ingress_source.count(needle)!=1: raise ValueError('unexpected EDN ingress guard')
 mutant=dict(sources);mutant['kagami/fleet_announce_edn.kotoba']=ingress_source.replace(needle,b'true')
