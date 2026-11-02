@@ -598,3 +598,31 @@ CI path. It does not establish standard SQLite locking, WAL/rollback recovery,
 crash-safe transactions, arbitrary page-tree support, Linux x86_64, or Itonami
 integration. Kotoba PR #1172 remains open and draft; its exact-head Linux
 x86_64 workflow is still in progress.
+
+## Delete a job from generated two-leaf roots (2026-11-03)
+
+Exact-head run
+[`41539246706`](https://github.com/kotoba-lang/kotoba/actions/runs/41539246706)
+passed the Amu selfhost/Kotoba CLI native ARM64 job at commit
+`678c0e3d06cf37006574b74dfde0ed0860b43af2`. The KSL2-pinned Kotoba fixture
+created a two-leaf table/index root, deleted all rows for one job, collapsed
+both roots to empty leaves, published and reopened through FS2, and confirmed
+the deleted key was absent through Kotoba. The resulting SQLite image is
+12,288 bytes with SHA-256
+`dcdf3bcb14056d2643244e79cfdd1c2e8f9a74ce182cf7ada1f998f571a92ee1`.
+
+An immutable read-only Python 3.15.0 / SQLite 3.54.1 check of the byte-identical
+image reported `integrity_check=ok`, 4096-byte pages, three pages, no rows, and
+the expected `cron_notepad` table and composite primary-key autoindex. The
+local run used the pinned Amu compiler and runner whose SHA-256 values match
+the CI receipt; the CI artifact itself records the matching database digest.
+Receipts:
+[`native ARM64`](../lib/kotoba.sql/evidence/interior-root-job-delete-native-linux-arm64-20261103.json)
+and
+[`read-only SQLite oracle`](../lib/kotoba.sql/evidence/interior-root-job-delete-readonly-oracle-20261103.json).
+
+This qualifies this generated two-leaf job deletion and root collapse only.
+It does not qualify arbitrary page trees, transaction/WAL recovery, standard
+SQLite locking, crash consistency, Linux x86_64, or Itonami integration. The
+separate x86 controller and wasm compile jobs had not completed when the
+receipt was written.
