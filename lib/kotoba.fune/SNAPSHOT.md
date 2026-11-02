@@ -41,8 +41,10 @@ use a disposable copy. These are local ARM64 checks, not source-locked project
 linkage, native x86 qualification, CI, a release, or Docker compatibility.
 For the test-only runner set `KEXE_COMMAND=1` and leave
 `KEXE_STRUCTURED_REPORT` unset so nonzero guest results become process errors.
-The existing read-only layout checker still uses whole-file FS2 reads and does
-not call this snapshot function. Layer application, safe transactional rootfs,
+The original `verify-layout` still uses whole-file FS2 reads. The separate
+`verify-layout-snapshots` uses this snapshot function for every layer and
+closes each snapshot after inspection; an `ok` result does not authorize later
+reopening the source paths. Layer application, safe transactional rootfs,
 compression, whiteouts, links and actual container lifecycle remain open.
 
 `fune.snapshot-archive/verify-archive-and-hold` adds tar inspection to that
@@ -65,6 +67,32 @@ or terminator validation failed their negative controls. An Alpine ARM64
 layer passed digest checking but was refused for its unsupported symlink.
 These checks use the test-only `snapshot_archive_gate.kotoba`; the positive
 `hold` mode overwrites its input, so use a disposable fixture copy.
+
+The test-only `layout_snapshot_runner.kotoba` calls the new whole-layout route.
+With the rebuilt ARM64 root from Amu PR #1785, one- and two-layer layouts
+passed. Altered first or second layers and config, invalid layout marker/index,
+duplicate index entry and unsupported tar were refused; missing and symlinked
+blobs trapped closed. A first-layer-only mutant accepted the changed second
+layer, showing that the negative case detects skipped layers. A binary built
+with the old runtime refused the snapshot operation instead of falling back.
+The original `verify-layout` also accepted the good fixture and refused a
+changed second layer when built with that old runtime. These test runners are
+not production CLIs. Marker, index, manifest and config reads are still whole
+file reads whose limits are checked after the provider returns; only layer
+reads use the bounded snapshot path. The provider's sealed memfd consumes up
+to the declared layer size in kernel-managed memory.
+
+For the snapshot layout runner, compose the existing SHA2, JSON and image
+manifest bodies, then add `image_config.kotoba`, `layer_tar.kotoba`,
+`snapshot.kotoba`, `snapshot_archive.kotoba`, `layout_check.kotoba` and the
+test runner in that order, replacing their namespace aliases with local names
+as in the other seed examples. Stage a fresh layout with
+`stage_layout_fixtures.py`. Run the runner with a scope covering that layout,
+the explicit manifest digest, `KEXE_COMMAND=1`, and structured reporting
+unset. Its output `ok` with exit 0 is a test verdict only. `two-layers-bad`
+must print `fune/blob-digest` and exit 1. For a negative control, replace the
+snapshot loop's `(if (= i n) "ok"` with `(if (>= i 1) "ok"` in a temporary
+composed source: the same corrupt second layer then prints `ok` and exits 0.
 
 To repeat the native fixture, prepare the layer fixtures as described in the
 README and make a disposable copy of `good.tar`. With `G` set to a task-owned
