@@ -71,7 +71,8 @@ for label,needle,replacement in [
  ('announce-type',b'(not (string=? message-type "head-announce"))',b'false'),
  ('announce-graph',b'(not (string=? graph "fleet-db"))',b'false'),
  ('announce-sequence',b'(= head-seq (+ seq (document-count heads)))',b'true'),
- ('announce-value',b'(string=? head-value (fs-hex-bytes plan 32))',b'true')]:
+ ('announce-value',b'(string=? head-value (fs-hex-bytes plan 32))',b'true'),
+ ('announce-record',b'(string=? announced-head last-head)',b'true')]:
  if store_source.count(needle)!=1: raise ValueError('unexpected announcement source: '+label)
  mutant=dict(sources);mutant['kagami/fleet_store_native.kotoba']=store_source.replace(needle,replacement)
  broken=gate.build('control-'+label,'kagami/fleet_store_native_test.kotoba',mutant)
