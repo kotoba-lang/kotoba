@@ -369,12 +369,14 @@ and [`high-rowid readback`](../lib/kotoba.sql/evidence/high-rowid-native-readonl
 
 This extends the measured Linux ARM64 behavior from creating and reopening an
 initial image to bounded mutation of the exact admitted four-TEXT schema and
-positive rowids through 130. It does not implement B-tree root/page splitting
-or qualify databases whose existing table or index roots are interior pages;
-those shapes still fail closed. It also does not qualify arbitrary SQLite
+positive rowids through 130. At this receipt's source revision, B-tree root
+splitting was not implemented and databases whose existing table or index
+roots were interior pages failed closed. A later source change adds a first
+split implementation; it is not yet runtime-qualified. Arbitrary SQLite
 schemas, WAL or rollback-journal recovery, standard byte-range/concurrent
-locking, crash recovery, Linux x86_64, or Itonami wiring. Python is used only
-for the separate dated read-only oracle and is not part of the native path.
+locking, crash recovery, Linux x86_64, and Itonami wiring also remain open.
+Python is used only for the separate dated read-only oracle and is not part of
+the native path.
 
 ## Interior-page encoder prerequisite (2026-11-02)
 
@@ -386,11 +388,11 @@ numbers, a negative separator, and an index interior root on page 1. The exact
 Amu pin and source/program hashes are in the
 [`interior-page encoder receipt`](../lib/kotoba.sql/evidence/interior-page-encoder-native-linux-arm64-20261102.json).
 
-This qualifies page construction primitives only. Kotoba still does not walk
-or mutate these interior table/index roots, split overflowing roots, rebalance
-pages, or verify a two-leaf database through a SQLite oracle. The current
-notepad mutation path continues to refuse page-split and interior-root shapes;
-dynamic B-tree mutation remains the next implementation requirement.
+This receipt qualifies page-construction primitives only. At that source
+revision Kotoba did not walk or mutate these interior table/index roots, split
+overflowing roots, rebalance pages, or verify a two-leaf database through a
+SQLite oracle. The later first-split source change is described below; the
+native qualification remains pending.
 
 The same exact-source Amu fixture now also decodes the generated index-interior
 cell boundary and checks its left child, payload size, and payload span. The
@@ -401,12 +403,12 @@ the positive payload here is only a page-codec vector.
 
 ## Kotoba-built table/index interior-root image (2026-11-02)
 
-A new source-pinned Amu selfhost Linux ARM64 fixture composes a seven-page
+A source-pinned Amu selfhost Linux ARM64 fixture composes a seven-page
 SQLite database through Kotoba: the table and composite primary-key index each
 have an interior root, and their child leaves hold two rows/keys. Kotoba
 publishes the image through FS2, reopens it, and reads both values through its
-table reader. The current upsert path returns its fail-closed empty refusal
-for this unsupported interior-root shape. A separate Python 3.15.0 / SQLite
+table reader. The upsert path refuses mutation of this pre-existing interior-
+root shape. A separate Python 3.15.0 / SQLite
 3.54.1 read-only immutable oracle reports `integrity_check=ok`, page_count 7,
 both expected rows, and the composite primary-key autoindex. Native and oracle
 receipts are
@@ -416,7 +418,26 @@ and [`interior-root readback`](../lib/kotoba.sql/evidence/interior-root-readonly
 Two initial oracle runs caught fixture construction errors (a duplicated
 promoted index separator and an incorrect rowid serial type); the corrected
 image passes independent integrity check. This verifies Kotoba's page
-construction and table reading for this two-leaf image. It is not evidence of
-general dynamic splitting or index traversal, and existing interior-root
-mutation remains unsupported. WAL/recovery, concurrent SQLite locking,
-crash recovery, Linux x86_64, and Itonami wiring remain open.
+construction and table reading for this two-leaf image, but not the dynamic
+split code below or index-tree traversal. Existing interior-root mutation
+remains unsupported. WAL/recovery, concurrent SQLite locking, crash recovery,
+Linux x86_64, and Itonami wiring remain open.
+
+## First bounded table/index root split — implementation pending qualification (2026-11-02)
+
+Kotoba commit `34c10ebd25a40b77d946037d8b76d60adf864b52` adds a first split
+path to notepad upsert. When an exact three-page `cron_notepad` with single-
+leaf table and index roots can no longer append, Kotoba materializes its rows,
+adds the new row, rebuilds table and composite-PK index leaves, and constructs
+one-cell interior roots. The scope admits only child leaves that fit, rejects
+overflow rows and malformed inputs, and does not support further upserts to an
+already interior-root database.
+
+The source-pinned native fixture and Linux ARM64 gate were extended to fill the
+database to the split, publish with FS2, reopen and look up a value through
+Kotoba, and require a subsequent upsert to refuse. Local source-pin audit,
+gate-script `py_compile`, and `git diff --check` passed. At the time of this
+note, CI run `41464479549` and Native shared run `41464479463` were queued;
+native execution and a separate read-only SQLite integrity/row/index oracle
+have not yet qualified the split. Their outcomes must be recorded separately
+before claiming this behavior is usable.
