@@ -519,6 +519,33 @@ capacity. It does not qualify deeper splits, arbitrary page layouts, WAL or
 rollback-journal processing, atomic/crash-safe transactions, concurrent
 locking, Linux x86_64, or Itonami integration.
 
+## Existing-key update and deletion under interior roots (2026-11-03)
+
+Exact-head Amu selfhost run
+[`41516926597`](https://github.com/kotoba-lang/kotoba/actions/runs/41516926597)
+passed loaderless rebuild, compiler verification, All12, and the native Linux
+ARM64 SQLite publication/readback/sidecar gate at head
+`9930187571af20c7d0fdf0924e6a97c8e99f5074`. The Amu pin was
+`ce982703375bedc0039b61b1a821407d228ea98a`; the native compiler SHA-256 was
+`02f50955fa2fdc33efed05bcc47ba39dc0e70014f0b0f290b8200af2cb99900e`.
+
+The two-leaf-root fixture updated an existing value, preserved the other rows,
+published through FS2, reopened, and read the replacement through Kotoba. It
+also deleted one key and checked the survivor in memory, then deleted one job,
+collapsed the one-row table/index trees to three leaf pages, published and
+reopened through FS2, and read back the other job through Kotoba. A separate
+Python 3.15.0 / SQLite 3.54.1 immutable read-only check reported
+`integrity_check=ok` for both emitted artifacts: the seven-page update image
+has eight rows, while the three-page delete image contains only the preserved
+`job-b/cursor` row. The native and oracle details are recorded in the
+[interior-root mutation receipt](../lib/kotoba.sql/evidence/interior-root-delete-native-linux-arm64-20261103.json)
+and [separate read-only oracle receipt](../lib/kotoba.sql/evidence/interior-root-mutation-readonly-oracle-20261103.json).
+
+This qualifies only the exact two-leaf-root fixtures and the tested one-row
+root-collapse deletion on Linux ARM64. Deletion that leaves two or more rows,
+arbitrary/deeper trees, WAL or rollback-journal processing, standard SQLite
+locking, crash consistency, Linux x86_64, and Itonami integration remain open.
+
 ## Native Linux gate scope (2026-11-03)
 
 Rechecked Kotoba Actions run
