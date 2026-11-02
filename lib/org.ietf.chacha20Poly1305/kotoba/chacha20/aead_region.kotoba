@@ -1,0 +1,86 @@
+;; Allocation-free AEAD-only import surface, backed by the same region ops.
+;; State/layout/arguments and refusal semantics match chacha20.region exactly.
+;; The caller owns/wipes its512-byte state; this module adds no authority.
+;; The current OS compiler validates all loaded entry points, including unused
+;; raw block/Poly entry points. This import keeps the required AEAD operations
+;; in an IK product graph; the full compatibility API is still available.
+;; set-length resets byte offsets to zero. set-offsets selects bounded input/
+;; output positions without changing either actual buffer capacity. Seal/open
+;; check offset+logical length before any mutation; returns exclude offsets.
+(ns chacha20.aead-region (:require [chacha20.region-ops :as o])
+  (:export [init aad-byte set-length set-offsets seal open]))
+(defn init [st length size]
+  (if (or (< length 512) (not (or (= size 12) (= size 24)))) 0
+    (do (o/fill st 64 512 0) (o/working-key st size) (o/block-internal st 0)
+        (o/poly-key st) (o/put st 480 1) (o/put st 484 1128812594) 1)))
+(defn- valid [st]
+  (and (= (o/ld st 484) 1128812594) (= (o/ld st 480) 1) (o/poly-valid st)
+       (= (o/ld st 416) (mod (o/ld st 488) 16))))
+(defn- aad-count [st]
+  (if (= (o/ld st 488) 4294967295)
+    (do (o/put st 488 0) (o/put st 492 (+ (o/ld st 492) 1)))
+    (o/put st 488 (+ (o/ld st 488) 1))))
+(defn aad-byte [st length value]
+  (if (< length 512) 0
+    (if (and (valid st) (>= value 0) (<= value 255)
+             (not (and (= (o/ld st 488) 4294967295) (= (o/ld st 492) 4294967295))))
+      (do (o/poly-add st value) (aad-count st) 1) 0)))
+(defn set-offsets [st length input-offset output-offset]
+  (if (or (< length 512) (< input-offset 0) (> input-offset 65536) (< output-offset 0) (> output-offset 65536)) 0
+    (if (valid st) (do (o/put st 468 input-offset) (o/put st 472 output-offset) 1) 0)))
+(defn set-length [st length n]
+  (if (or (< length 512) (< n 0) (> n 65535)) 0
+    (if (valid st) (do (o/put st 500 n) (set-offsets st length 0 0)) 0)))
+(defn- separate [a n b m]
+  (or (= n 0) (= m 0) (<= (+ a n) b) (<= (+ b m) a)))
+(defn- shape [st input n output capacity]
+  (and (>= n 0) (<= n 65536) (>= capacity 0) (<= capacity 65536)
+       (separate st 512 input n) (separate st 512 output capacity)
+       (separate input n output capacity)))
+(defn- pad [st n]
+  (if (<= n 0) 1 (do (o/poly-add st 0) (pad st (- n 1)))))
+(defn- feed [st input capacity i]
+  (if (>= i (o/ld st 504)) 1
+    (do (o/poly-add st (kernel-load-u8-64k input capacity (+ i (o/ld st 476)))) (feed st input capacity (+ i 1)))))
+(defn- mac-lengths [st n i]
+  (if (>= i 16) 1
+    (do (o/poly-add st (bit-and (u64-shift-right
+          (if (< i 4) (o/ld st 488) (if (< i 8) (o/ld st 492) (if (< i 12) n 0)))
+          (* (mod i 4) 8)) 255)) (mac-lengths st n (+ i 1)))))
+(defn- mac-end [st input capacity n offset]
+  (do (o/put st 476 offset) (o/put st 504 n) (feed st input capacity 0) (pad st (mod (- 16 (mod n 16)) 16))
+      (mac-lengths st n 0) (o/poly-done st)))
+(defn- crypt [st input input-bytes output capacity]
+  (if (>= (o/ld st 496) (o/ld st 504)) 1
+    (do (if (= (mod (o/ld st 496) 64) 0) (o/block-internal st (+ 1 (quot (o/ld st 496) 64))) 0)
+        (kernel-store-u8-64k output capacity (+ (o/ld st 496) (o/ld st 472))
+          (bit-xor (kernel-load-u8-64k input input-bytes (+ (o/ld st 496) (o/ld st 468)))
+                   (o/b st (+ 256 (mod (o/ld st 496) 64)))))
+        (o/put st 496 (+ (o/ld st 496) 1)) (crypt st input input-bytes output capacity))))
+(defn- copy-tag [st output capacity n+i]
+  (if (>= (mod n+i 32) 16) 1
+    (do (kernel-store-u8-64k output capacity (+ (o/ld st 472) (quot n+i 32) (mod n+i 32))
+            (o/b st (+ 432 (mod n+i 32)))) (copy-tag st output capacity (+ n+i 1)))))
+(defn seal [st input input-bytes output capacity]
+  (let [n (o/ld st 500)]
+  (if (not (and (shape st input input-bytes output capacity) (valid st)
+                 (<= (+ n (o/ld st 468)) input-bytes) (<= n 65519) (<= (+ n 16 (o/ld st 472)) capacity))) -1
+    (do (pad st (mod (- 16 (mod (o/ld st 488) 16)) 16))
+        (o/put st 496 0) (o/put st 504 n) (crypt st input input-bytes output capacity)
+        (mac-end st output capacity n (o/ld st 472))
+        (copy-tag st output capacity (* n 32))
+        (o/put st 480 2) (+ n 16)))))
+(defn- tag-diff [st input capacity i diff]
+  (if (>= i 16) diff
+    (tag-diff st input capacity (+ i 1)
+      (bit-or diff (bit-xor (o/b st (+ 432 i)) (kernel-load-u8-64k input capacity (+ (o/ld st 468) (- (o/ld st 500) 16) i)))))))
+(defn open [st input input-bytes output capacity]
+  (let [n (o/ld st 500)]
+  (if (not (and (shape st input input-bytes output capacity) (valid st)
+                (>= n 16) (<= n 65535) (<= (+ n (o/ld st 468)) input-bytes)
+                (<= (+ (- n 16) (o/ld st 472)) capacity))) -1
+    (do (pad st (mod (- 16 (mod (o/ld st 488) 16)) 16))
+        (mac-end st input input-bytes (- n 16) (o/ld st 468))
+        (if (not (= (tag-diff st input input-bytes 0 0) 0)) (do (o/put st 480 4) -1)
+          (do (o/put st 496 0) (o/put st 504 (- n 16)) (crypt st input input-bytes output capacity)
+              (o/put st 480 3) (- n 16)))))))
