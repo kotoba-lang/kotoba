@@ -441,3 +441,21 @@ note, CI run `41464479549` and Native shared run `41464479463` were queued;
 native execution and a separate read-only SQLite integrity/row/index oracle
 have not yet qualified the split. Their outcomes must be recorded separately
 before claiming this behavior is usable.
+
+### Split artifact readback and native fixture correction (2026-11-03)
+
+The exact-pin Linux ARM64 run `41475188287` produced the seven-page database
+through Kotoba and FS2. The native fixture returned 13 because its KNV1
+readback check inspected byte offset 6 for the first value byte even though a
+1,150-byte value has a two-byte SQLite varint length; the value begins at
+offset 7. The split path therefore reached artifact generation, but its full
+native fixture has not yet passed.
+
+A separate Python 3.15.0 / SQLite 3.54.1 read-only immutable oracle opened the
+artifact and reported `integrity_check=ok`, page size 4096, page count 7, the
+expected table and composite primary-key index, and four ordered rows with
+1,150-byte values. Artifact SHA-256 and row details are recorded in the
+[dated split oracle receipt](../lib/kotoba.sql/evidence/interior-root-split-readonly-oracle-20261103.json).
+This oracle confirms the generated artifact only; it is not a Kotoba runtime
+or CI dependency. The fixture assertion is corrected in the source, and a new
+exact-pin native run must pass before the split is qualified.
