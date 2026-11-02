@@ -27,8 +27,13 @@ def main(a):
     try:
         keys.Boot.__init__(b,a,out,'console-policy',None,first_frame_seconds=180)
         c = struct.unpack('<178I',b.dump(b.work,712))
-        observed = dict(shapeMask=c[74],modalMask=c[75],bandMask=c[76],identityMask=c[77],tailMask=c[78],refusals=c[177],pending=c[87])
-        assert observed == dict(shapeMask=1023,modalMask=63,bandMask=255,identityMask=63,tailMask=3,refusals=10,pending=0), observed
+        observed = dict(shapeMask=c[74],modalMask=c[75],bandMask=c[76],identityMask=c[77],tailMask=c[78],damageMask=c[80],publicTableBoundsMask=c[81],refusals=c[177],pending=c[87])
+        assert observed == dict(shapeMask=1023,modalMask=63,bandMask=255,identityMask=63,tailMask=3,damageMask=255,publicTableBoundsMask=63,refusals=10,pending=0), observed
+        public=struct.unpack('<15I',b.dump(b.work+800,60))
+        assert public==tuple(b'AIUECMD1')+(108,109,110,78,79,111,80),public
+        assert struct.unpack('<12I',b.dump(b.work+860,48))==tuple(b'AIUEOS_KDBG ')
+        assert struct.unpack('<8I',b.dump(b.work+908,32))==tuple(b'AIUESHOT')
+        assert struct.unpack('<8I',b.dump(b.work+940,32))==tuple(b'AIUEBND2')
         assert pin(a.media) == before
         status = 'PASS_NATIVE_REMOTE_CONSOLE_POLICY_QEMU'
     finally:

@@ -20,6 +20,7 @@ class Backend:
     def __init__(self):
         self.errors=0;self.input_serial=0;self.events=[];self.captures=0;self.releases=0;self.band_read=threading.Event();self.mutated=False
     def begin(self): pass
+    def damage_band(self,first,count):return None
     def capture(self):
         self.captures += 1
         return 3,2,bytes([255,0,0,0,255,0,0,0,255,255,255,255,128,128,128,0,0,0])

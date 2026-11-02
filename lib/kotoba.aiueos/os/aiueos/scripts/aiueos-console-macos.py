@@ -87,6 +87,7 @@ class Bridge:
         if host != 'itonami-6600h': raise ValueError('unsupported management host')
         self.host = host; self.cv = threading.Condition(); self.queue = collections.deque()
         self.channel=None
+        self.geometry=None;self.dirty_rows=collections.OrderedDict()
         self.stopped = False; self.active = False; self.session_nonce = None; self.last_pointer = (0,0,0); self.errors = 0; self.input_serial=0
         self.thread = threading.Thread(target=self.run,daemon=True); self.thread.start()
 
@@ -102,7 +103,9 @@ class Bridge:
 
     def begin(self):
         if self.channel:self.channel.close()
-        self.session_nonce=None;self.channel=channel.Channel(self.host)
+        self.session_nonce=None;self.geometry=None
+        with self.cv:self.dirty_rows.clear()
+        self.channel=channel.Channel(self.host)
         try:self.session_nonce = self.ssh('status')['bootNonce']
         except (OSError,ValueError,RuntimeError):
             self.channel.close();self.channel=None;raise
@@ -133,14 +136,54 @@ class Bridge:
                 kind,values = self.queue.popleft()
                 self.active = kind != '_barrier'
             if kind == '_barrier':
-                values[0].set(); continue
+                values[0].set()
+                with self.cv:self.cv.notify_all()
+                continue
             if kind == 'pointer-edge':kind='pointer'
-            try: self.ssh(kind,'nonce='+self.session_nonce,*(str(v) for v in values))
+            try:
+                reply=self.ssh(kind,'nonce='+self.session_nonce,*(str(v) for v in values))
+                self.record_damage(reply)
             except (OSError,ValueError,RuntimeError,subprocess.TimeoutExpired):
                 self.errors += 1
                 print('ITONAMI_CONSOLE_INPUT_REFUSED',flush=True)
             finally:
                 with self.cv: self.active=False; self.cv.notify_all()
+
+    def record_damage(self,reply):
+        post=reply.get('postRender')
+        if post is None:return  # Explicit older native protocol profile.
+        if type(post) is not dict or set(post)!={'counter','rows'} or reply.get('bootNonce')!=self.session_nonce:
+            raise ValueError('post-render session/shape differs')
+        replies=reply.get('replies')
+        if (not isinstance(replies,list) or len(replies)!=1 or type(replies[0]) is not dict
+                or type(replies[0].get('value')) is not int):
+            raise ValueError('post-render admission reply differs')
+        expected=replies[0]['value']
+        if not 0<expected<1<<64 or post['counter']!=f'{expected:016x}':
+            raise ValueError('post-render counter differs')
+        rows=post['rows']
+        if rows is None:return
+        if (not self.geometry or type(rows) is not list or len(rows)!=2 or
+                any(type(x) is not int for x in rows) or not 0<=rows[0]<rows[1]<=self.geometry[1]):
+            raise ValueError('post-render rows outside framebuffer')
+        first,last=rows[0]//32,(rows[1]-1)//32
+        # Old/new cursor locations are at the interval's edges. Refresh both
+        # before its conservative interior, without calling any pixel valid.
+        order=[first] if first==last else [first,last,*range(first+1,last)]
+        with self.cv:
+            for row in reversed(order):
+                self.dirty_rows.pop(row,None);self.dirty_rows[row]=expected
+                self.dirty_rows.move_to_end(row,last=False)
+
+    def damage_band(self,first,count):
+        with self.cv:
+            self.cv.wait_for(lambda:not self.queue and not self.active)
+            for row in list(self.dirty_rows):
+                start=max(first,row*32);end=min(first+count,(row+1)*32)
+                if start<end:
+                    self.dirty_rows.pop(row)
+                    return start,end-start
+        return None
 
     def capture_band(self, first, count):
         # At most one32-row capture can be ahead of a newly queued input.
@@ -151,6 +194,8 @@ class Bridge:
         if not (magic==b'IRGBBND1' and nonce==int(self.session_nonce,16) and (row,rows)==(first,count)
                 and 0<w<=3200 and first+count<=h<=8192 and len(raw)==24+w*count*3):
             raise ValueError('management band identity/geometry differs')
+        if self.geometry is not None and self.geometry!=(w,h):raise ValueError('native dimensions changed')
+        self.geometry=(w,h)
         return w,h,raw[24:]
 
     def capture(self):
@@ -175,7 +220,8 @@ class Bridge:
             if not barrier.wait(20): raise RuntimeError('console release did not drain')
         finally:
             if self.channel:self.channel.close();self.channel=None
-            self.session_nonce=None
+            with self.cv:
+                self.session_nonce=None;self.geometry=None;self.dirty_rows.clear();self.cv.notify_all()
 
 
 def receive(sock, size):
@@ -289,7 +335,7 @@ def session(sock, bridge, password, interval):
             requests.append(request)
 
     def frames():
-        last_capture = 0; last_errors = bridge.errors; next_row=0
+        last_capture = 0; last_errors = bridge.errors; next_row=0;priority_streak=0
         last_response=0;last_input=bridge.input_serial
         try:
             while not closed.is_set():
@@ -305,8 +351,14 @@ def session(sock, bridge, password, interval):
                     # A client request receives one bounded strip, then the
                     # next request advances the scan. Never wait a full screen
                     # before giving queued keys/button edges a turn.
-                    row=y+(next_row%h); count=min(32,y+h-row)
-                    next_row=(row-y+count)%h;y=row;h=count
+                    hint=bridge.damage_band(y,h) if priority_streak<3 else None
+                    if hint:
+                        y,h=hint;priority_streak+=1
+                    else:
+                        row=y+(next_row%h);count=min(32,y+h-row)
+                        next_row=(row-y+count)%h;y=row;h=count;priority_streak=0
+                else:priority_streak=0
+                if closed.is_set():return
 
                 def read_band(row,count):
                     nw,nh,rgb=bridge.capture_band(row,count)

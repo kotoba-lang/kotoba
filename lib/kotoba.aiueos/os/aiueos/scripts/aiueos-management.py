@@ -61,11 +61,27 @@ def watch(state):
             if tag == 0xc000 and value: save_nonce(state, value)
 
 
+def rendered_rows(sock,counter,seconds=15):
+    """Counter-bound post-render hint, never authority or pixel validity."""
+    matched=False
+    for tag,value in remote.records(sock,time.monotonic()+seconds):
+        if tag==0xc0ff:raise RuntimeError('native post-render operation refused')
+        if tag==0xc015:matched=value==counter
+        elif tag==0xc016 and matched:
+            if value==0:return None
+            top,bottom=value&65535,value>>16
+            if not 0<=top<bottom<=8192:raise ValueError('invalid native damage rows')
+            return [top,bottom]
+    raise RuntimeError('native post-render counter/rows missing')
+
+
 def operation(cfg,state,words,seed=None):
     op,args=words[0],words[1:]
     modes = {'status': 'ping', 'ping': 'ping', 'reboot': 'reboot', 'key': 'key',
              'type': 'type', 'usb-select': 'usb-select', 'screenshot': 'shot', 'pointer': 'pointer', 'console-key': 'console-key', 'screenshot-band':'band'}
     if op not in modes: raise ValueError('unsupported management operation')
+    if 'frameDamageHints' in cfg and type(cfg['frameDamageHints']) is not bool:
+        raise ValueError('frameDamageHints must explicitly select a boolean protocol profile')
     cmd = modes[op]
     expected_nonce = None
     if cmd in ('pointer','console-key','band') and args and args[0].startswith('nonce='):
@@ -127,7 +143,7 @@ def locked_operation(cfg,state,op,cmd,args,expected_nonce,key,seed,log):
     counter = time.time_ns()
     values = ([x | (y << 13) | (left << 26)] if cmd == 'pointer' else
               [remote.SCAN[c] for c in args[0]] if cmd == 'type' else [int(args[0],0) if args else 0])
-    replies = []
+    replies = [];post_render=None
     for index, value in enumerate(values):
         remote.send(argparse.Namespace(broadcast=cfg.get('broadcast','10.77.0.255')), seed,
                     nonce,counter+index,ids[cmd],value)
@@ -136,8 +152,12 @@ def locked_operation(cfg,state,op,cmd,args,expected_nonce,key,seed,log):
         if cmd in ('ping','reboot','pointer','console-key') and reply[1] != counter+index: raise RuntimeError('reply counter differs')
         if cmd in ('key','type') and reply[1] != value: raise RuntimeError('reply key differs')
         replies.append(dict(tag=f'{reply[0]:04x}',value=reply[1]))
-    return 0,json.dumps(dict(transport='Mac loopback SSH -> signed UDP',nativeSSH=False,
-                          operation=op,bootNonce=f'{nonce:016x}',replies=replies)).encode()
+        if cfg.get('frameDamageHints') is True and cmd in ('pointer','console-key'):
+            post_render=dict(counter=f'{counter+index:016x}',rows=rendered_rows(log,counter+index))
+    response=dict(transport='Mac loopback SSH -> signed UDP',nativeSSH=False,
+                  operation=op,bootNonce=f'{nonce:016x}',replies=replies)
+    if post_render is not None:response['postRender']=post_render
+    return 0,json.dumps(response).encode()
 
 def main(a):
     cfg=private_json(a.config.resolve(strict=True));state=Path(cfg['state'])

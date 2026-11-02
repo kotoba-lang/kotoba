@@ -34,6 +34,38 @@ viewer. Backspace restored `aba`; Approved remained0 and Network remained
 off. This verifies native-client compatibility and local input/readback,
 not human timing or a trusted app approval. See `progressive-deployment.json`.
 
+## Post-render damage priority candidate
+
+The debug desktop now emits KDBG c015 (the complete64-bit accepted input
+counter) and c016 (top/bottom rows, two16-bit edges) after the corresponding
+native present-frame returns. The earlier c012/c013 admission replies remain
+unchanged. The interval comes from the existing renderer's conservative
+damage bounds, clipped to the viewport; refused or empty frames report0.
+This is a scheduling hint, not authenticated pixel data or an app approval.
+
+The private Mac management configuration must explicitly set
+`frameDamageHints: true` only for a qualified image with this protocol.
+Absent/false selects the existing legacy profile. With the new profile
+selected, missing or mismatched post-render records fail; they never cause
+an automatic downgrade or replay of the input. The viewer checks the boot,
+full counter and actual framebuffer height, prioritizes the interval edges
+and then its interior, and reads every displayed pixel through the existing
+32-row transport. At most three priority reads precede a background read,
+so unrelated physical input/animation still gets scanned. Hints coalesce
+within256 row buckets and never make an unseen pixel valid. Disconnect and
+new sessions clear the hints; a closed viewer cannot start a new capture
+after waiting for an input's native result.
+
+`damage-priority.json` records the35-module native component,44-module
+product reproduction, normal12-event USB/NVMe regression, no-install PXE
+USB/hub smoke and35 host tests. The existing2MiB internal code budget and
+actual product/user ABI were retained. Initial E7104 attempts are recorded;
+shared input presentation and exact public numeric/magic tables reduced
+generated code. Native QEMU compares the actual packed command, log,
+legacy screenshot and band-header bytes with independent literals. This
+candidate still needs actual post-render wire/viewport timing and runtime
+activation readback before claiming a live latency improvement.
+
 `os/aiueos/scripts/aiueos-console-macos.py --config PRIVATE_CONFIG` starts
 the adapter. The owner-only JSON configuration names `sshHost` (only
 `itonami-6600h`), `vncPassword` (an owner-only eight-byte file), optional
