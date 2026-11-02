@@ -116,3 +116,22 @@ These are PIT-calibrated TSC CPU phases for app/focus switching, not drag or
 input-to-panel latency. They show why removing GOP reads needs physical
 verification. Sparse-candidate deployment and human drag acceptance are
 separate remaining gates.
+
+## Physical scene comparison, drag acceptance pending
+
+The exact sparse-v3 PXE/netlog image626e4ee1…5de2f9 is now running on the
+6600H (source0fc8842e3, kernel10225112…4f200d). TFTP completion and one-shot
+consumption, a fresh signed ping, USB0504 result15 and visible Goal aba cold
+restore are observed. No OS image was installed into NVMe; PXE fallback and
+Mac SSH bridge remain. The same four-window focus-switch sequence (six per
+mode) changes normal scene median544.50→205.03ms, GOP copy443.75→99.47ms,
+raster94.89→99.21ms. Reduced mode scene517.98→183.44ms, copy436.55→98.66ms,
+raster76.00→78.67ms. This establishes less CPU time for this physical scene
+sequence, particularly GOP transfer, with no raster-speed claim. It is not
+a drag or panel-latency measurement. No ChromeOS same-hardware timing exists.
+
+The separate existing12-scenario pointer/compositor gate also passes on the
+exact candidate, including dock icons, overlap drag, viewport clipping and
+modal pointer movement without granting approval. The owner has been asked
+once to judge actual Trackpad drag and residual Window/Dock flicker. No
+acceptance answer has arrived yet, and JUN-502 remains open.
