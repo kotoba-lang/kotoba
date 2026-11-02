@@ -287,11 +287,48 @@
                                     4 0 (word s (+ 480 index)))]
       (cache-ops s (+ index (+ 1 (* 0 stored))) end))))
 
+;; Conservative 64x64 dirty-cell map: the final72 bytes16312..16383, after
+;; cursor save-under16000..16311 and retained ops ending15944. 18u32/576
+;; bits; larger displays fall back to dense damage. Effects83=enabled,85=cols.
+(defn dirty-word [i]
+  (kernel-load-u32 (kernel-subregion (kernel-desktop-effects) 16384 (+ 16312 (* i 4)) 4) 4 0))
+(defn dirty-put [i v]
+  (kernel-store-u32 (kernel-subregion (kernel-desktop-effects) 16384 (+ 16312 (* i 4)) 4) 4 0 v))
+(defn dirty-clear [i]
+  (if (>= i 18) 0 (do (dirty-put i 0) (dirty-clear (+ i 1)))))
+(defn dirty-start [ctx]
+  (let [cols (quot (+ (word ctx 40) 63) 64) rows (quot (+ (word ctx 41) 63) 64)]
+    (do (tile-put 85 cols) (tile-put 83 (if (and (> cols 0) (> rows 0) (<= (* cols rows) 576)) 1 0))
+        (if (= (tile-state 83) 1) (dirty-clear 0) 0))))
+(defn dirty-cells [col row right bottom]
+  (if (> row bottom) 0
+    (if (> col right) 0
+      (let [bit (+ (* row (tile-state 85)) col) i (quot bit 32)]
+        (do (dirty-put i (bit-or (dirty-word i) (i64-shift-left 1 (mod bit 32))))
+            (dirty-cells (+ col 1) row right bottom))))))
+(defn dirty-rows [left row right bottom]
+  (if (> row bottom) 0
+    (do (dirty-cells left row right bottom) (dirty-rows left (+ row 1) right bottom))))
+(defn dirty-rect [ctx x y w h]
+  (if (= (tile-state 83) 0) 0
+    (let [left (max 0 x) top (max 0 y)
+          right (min (word ctx 40) (+ x w)) bottom (min (word ctx 41) (+ y h))]
+      (if (and (< left right) (< top bottom))
+        (dirty-rows (quot left 64) (quot top 64) (quot (- right 1) 64) (quot (- bottom 1) 64)) 0))))
+(defn dirty-at [x y]
+  (if (= (tile-state 83) 0) 1
+    (let [bit (+ (* (quot y 64) (tile-state 85)) (quot x 64))]
+      (if (= (bit-and (dirty-word (quot bit 32)) (i64-shift-left 1 (mod bit 32))) 0) 0 1))))
+(defn dirty-limit [x y end]
+  (if (or (>= x end) (= (dirty-at x y) 0)) x
+    (dirty-limit (min end (+ x (- 64 (mod x 64)))) y end)))
 (defn damage-rect [ctx x y w h]
-  (do (if (< x (word ctx 20)) (put-word ctx 20 x) 0)
-      (if (< y (word ctx 21)) (put-word ctx 21 y) 0)
-      (if (> (+ x w) (word ctx 22)) (put-word ctx 22 (+ x w)) 0)
-      (if (> (+ y h) (word ctx 23)) (put-word ctx 23 (+ y h)) 0)))
+  (if (or (<= w 0) (<= h 0)) 0
+    (do (dirty-rect ctx x y w h)
+        (if (< x (word ctx 20)) (put-word ctx 20 x) 0)
+        (if (< y (word ctx 21)) (put-word ctx 21 y) 0)
+        (if (> (+ x w) (word ctx 22)) (put-word ctx 22 (+ x w)) 0)
+        (if (> (+ y h) (word ctx 23)) (put-word ctx 23 (+ y h)) 0))))
 
 (defn intersects-damage [ctx x y w h]
   (if (and (< x (word ctx 22)) (> (+ x w) (word ctx 20))
@@ -307,20 +344,46 @@
   (if (= kind 2) b (if (= kind 3) (+ (bit-and b 255) (quot b 256)) a)))
 (defn op-height [kind b] (if (or (= kind 2) (= kind 3)) 16 b))
 
+;; Constant opaque rects keep identical intersection pixels after translation.
+;; Rounded opaque kind7 keeps only the common inner core (12px inset), and
+;; vertical gradients kind6 require unchanged y or identical endpoint colours.
+;; Glyph/alpha/other shape/colour changes retain conservative full damage.
+;; Temporary ctx0..3 hold the intersection only during list comparison.
+(defn damage-outside [ctx x y w h]
+  (do (damage-rect ctx x y w (- (word ctx 1) y))
+      (damage-rect ctx x (word ctx 3) w (- (+ y h) (word ctx 3)))
+      (damage-rect ctx x (word ctx 1) (- (word ctx 0) x) (- (word ctx 3) (word ctx 1)))
+      (damage-rect ctx (word ctx 2) (word ctx 1) (- (+ x w) (word ctx 2)) (- (word ctx 3) (word ctx 1)))))
+(defn translated-damage [s ctx index]
+  (let [old (* index 6) new (+ 480 old) kind (word s new)
+        x (word s (+ new 1)) y (word s (+ new 2))
+        ox (cached-op-word (+ old 1)) oy (cached-op-word (+ old 2))
+        w (word s (+ new 3)) h (word s (+ new 4)) color (word s (+ new 5))
+        pad (if (= kind 7) 12 0)
+        left (+ (max x ox) pad) top (+ (max y oy) pad)
+        right (- (min (+ x w) (+ ox w)) pad) bottom (- (min (+ y h) (+ oy h)) pad)]
+    (if (and (or (= kind 1) (= kind 7)
+                 (and (= kind 6) (or (= y oy) (= (bit-and color 65535) (quot color 65536)))))
+             (= kind (cached-op-word old))
+             (= w (cached-op-word (+ old 3))) (= h (cached-op-word (+ old 4)))
+             (= (word s (+ new 5)) (cached-op-word (+ old 5))) (< left right) (< top bottom))
+      (do (put-word ctx 0 left) (put-word ctx 1 top) (put-word ctx 2 right) (put-word ctx 3 bottom)
+          (damage-outside ctx ox oy w h) (damage-outside ctx x y w h) 1) 0)))
 (defn list-damage [s ctx index old-count]
   (if (and (>= index (word ctx 31)) (>= index old-count)) 0
     (do (if (or (>= index old-count) (>= index (word ctx 31))
                 (= (op-differs s index 0) 1))
-          (do (if (< index old-count)
-                (let [base (* index 6) kind (cached-op-word base)]
-                  (damage-rect ctx (cached-op-word (+ base 1)) (cached-op-word (+ base 2))
-                    (op-width kind (cached-op-word (+ base 3)) (cached-op-word (+ base 4)))
-                    (op-height kind (cached-op-word (+ base 4))))) 0)
-              (if (< index (word ctx 31))
-                (let [base (+ 480 (* index 6)) kind (word s base)]
-                  (damage-rect ctx (word s (+ base 1)) (word s (+ base 2))
-                    (op-width kind (word s (+ base 3)) (word s (+ base 4)))
-                    (op-height kind (word s (+ base 4))))) 0)) 0)
+          (if (and (< index old-count) (< index (word ctx 31)) (= (translated-damage s ctx index) 1)) 0
+            (do (if (< index old-count)
+                  (let [base (* index 6) kind (cached-op-word base)]
+                    (damage-rect ctx (cached-op-word (+ base 1)) (cached-op-word (+ base 2))
+                      (op-width kind (cached-op-word (+ base 3)) (cached-op-word (+ base 4)))
+                      (op-height kind (cached-op-word (+ base 4))))) 0)
+                (if (< index (word ctx 31))
+                  (let [base (+ 480 (* index 6)) kind (word s base)]
+                    (damage-rect ctx (word s (+ base 1)) (word s (+ base 2))
+                      (op-width kind (word s (+ base 3)) (word s (+ base 4)))
+                      (op-height kind (word s (+ base 4))))) 0))) 0)
         (list-damage s ctx (+ index 1) old-count))))
 
 (defn blur-damage-pass [s ctx index]
@@ -339,7 +402,7 @@
 (defn close-blur-damage [s ctx remaining]
   (if (= remaining 0)
     ;; Pathological dependency chains use full redraw; never under-invalidate.
-    (do (put-word ctx 20 0) (put-word ctx 21 0)
+    (do (tile-put 83 0) (put-word ctx 20 0) (put-word ctx 21 0)
         (put-word ctx 22 (word ctx 40)) (put-word ctx 23 (word ctx 41)))
     (let [a (word ctx 20) b (word ctx 21) c (word ctx 22) d (word ctx 23)]
       (do (blur-damage-pass s ctx 0)
@@ -349,9 +412,9 @@
 
 (defn frame-damage [s ctx]
   (let [state (kernel-subregion (kernel-desktop-effects) 16384 0 8192)]
-    (do (put-word ctx 24 1)
+    (do (put-word ctx 24 1) (dirty-start ctx)
         (if (or (= (word state 49) 0) (= (word state 50) 1))
-          (do (put-word ctx 20 0) (put-word ctx 21 0)
+          (do (tile-put 83 0) (put-word ctx 20 0) (put-word ctx 21 0)
               (put-word ctx 22 (word ctx 40)) (put-word ctx 23 (word ctx 41)))
           (do (put-word ctx 20 (word ctx 40)) (put-word ctx 21 (word ctx 41))
               (put-word ctx 22 0) (put-word ctx 23 0)
@@ -744,17 +807,21 @@
   (if (>= y (tile-state 77)) 1
     (do (if (= x (tile-state 74))
           (do (band-index s ctx 0 (max 0 (- y 10)) (+ y 18) 0) (tile-put 86 1)) 0)
-    (if (>= x (tile-state 76)) (tile-walk s font ctx (tile-state 74) (+ y 8) paint)
-      (let [limit (min 96 (- (tile-state 76) x)) h (min 8 (- (tile-state 77) y))
-            reset (tile-put 87 0)
-            blurs (tile-blurs s ctx 0 (- x 10) (- y 10) (+ limit 20) (+ h 20))
-            step (if (= blurs 0) 96 (if (= blurs 1) 48 (if (= blurs 2) 32 (if (= blurs 3) 24 16))))
-            w (min limit step)]
-        (if (> blurs 4) 0
-          (do (if (= paint 1)
-                (do (if (> blurs (tile-state 82)) (tile-put 82 blurs) 0)
-                    (render-tile s font ctx x y w h (* blurs 2))) 0)
-              (tile-walk s font ctx (+ x w (* 0 reset)) y paint))))))))
+    (if (>= x (tile-state 76))
+      (tile-walk s font ctx (tile-state 74) (+ y (min 8 (- 64 (mod y 64)))) paint)
+      (if (= (dirty-at x y) 0)
+        (tile-walk s font ctx (min (tile-state 76) (+ x (- 64 (mod x 64)))) y paint)
+        (let [end (dirty-limit x y (min (+ x 96) (tile-state 76))) limit (- end x)
+              h (min 8 (min (- 64 (mod y 64)) (- (tile-state 77) y)))
+              reset (tile-put 87 0)
+              blurs (tile-blurs s ctx 0 (- x 10) (- y 10) (+ limit 20) (+ h 20))
+              step (if (= blurs 0) 96 (if (= blurs 1) 48 (if (= blurs 2) 32 (if (= blurs 3) 24 16))))
+              w (min limit step)]
+          (if (> blurs 4) 0
+            (do (if (= paint 1)
+                  (do (if (> blurs (tile-state 82)) (tile-put 82 blurs) 0)
+                      (render-tile s font ctx x y w h (* blurs 2))) 0)
+                (tile-walk s font ctx (+ x w (* 0 reset)) y paint)))))))))
 (defn present-scene [s font ctx]
   (let [kind (word s 480)
         opaque (and (> (word ctx 31) 0) (or (= kind 1) (= kind 6))

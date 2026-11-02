@@ -112,6 +112,7 @@ def main(a):
                                 geometryBefore=geometry, geometryAfter=actual,
                                 before=old, after=new,
                                 guestSceneMS=(total/new['scale'] if new['scale'] > 0 else None)))
+            pixel_control(f'{count}-windows-{reduced}-drag-{index}')
         old = settled(); b.send('mouse_button 0', .05); released = settled(old['frames'])
         assert released['pressed'] == 0 and released['dragID'] == 0
         pixel_control(f'{count}-windows-effects-'+('reduced' if reduced else 'normal'))
@@ -134,7 +135,7 @@ def main(a):
         drags(4,4,False)
         key('f1'); assert settled()['reduced'] == 1
         drags(4,4,True)
-        assert len(samples) == 24 and len(controls) == 4
+        assert len(samples) == 24 and len(controls) == 28
         assert pin(a.media) == before_media
         status = 'PASS_NATIVE_DRAG_PROFILE_QEMU'
     finally:

@@ -36,6 +36,15 @@ def main(a):
         assert len(data) == table['length'] <= 64
         assert hashlib.sha256(data).hexdigest() == table['sha256']
         expected += data.ljust(64, b'\0')
+    hid_fixture = HERE.parent/'native/fixtures/hid-mouse-public-bytes.json'
+    hid_tables = json.loads(hid_fixture.read_text())['fixtures']
+    assert len(hid_tables) == 2
+    hid_expected = b''
+    for table in hid_tables:
+        raw = bytes(table['bytes'])
+        assert len(raw) == table['length'] <= 80
+        assert hashlib.sha256(raw).hexdigest() == table['sha256']
+        hid_expected += raw.ljust(80, b'\0')
     out = a.output.resolve(); out.mkdir(parents=True, exist_ok=False, mode=0o700)
     before = pin(a.media); b = None; status = 'FAILED'; metadata = None
     try:
@@ -45,6 +54,8 @@ def main(a):
         got = b.dump(b.work+1024, 1216)
         assert got == expected, 'native packed public bytes differ from original literals'
         assert b.dump(b.work+2240, 38) == bytes(38), 'out-of-range case default changed'
+        assert b.dump(b.work+2304, 160) == hid_expected, 'packed HID descriptor bytes changed'
+        assert b.dump(b.work+2464, 4) == bytes(4), 'HID descriptor bounds changed'
         # A wrong public oracle must be detected, independently of hashes.
         changed = bytearray(expected); changed[0] ^= 1
         assert got != changed
@@ -64,6 +75,7 @@ def main(a):
             b.quit()
         (out/'receipt.json').write_text(json.dumps(dict(
             status=status, comparedNativeSelectorBytes=1216, outOfRangeBytes=38,
+            hidDescriptorBytes=139, hidSelectorBytes=160, hidBoundsBytes=4, hidFixture=pin(hid_fixture),
             changedOracleRejected=True if status.startswith('PASS') else None,
             publicOriginalBytes=sum(t['length'] for t in tables), metadata=metadata,
             artifacts={n:pin(getattr(a,n)) for n in ('efi','kernel','media','qemu','firmware','fixture')},

@@ -76,3 +76,43 @@ raster work remains dominant. The change avoids hardware framebuffer reads,
 but its physical benefit and the effect of additional stores require direct
 measurement. Physical smoothness is not accepted. Further raster/damage
 reduction remains necessary if hardware measurements do not close the gap.
+
+## Conservative sparse damage candidate
+
+The next candidate uses a576-bit 64×64-cell mask in effects16312..16383,
+after the cursor save-under16000..16311. Effects83/85 hold enable/columns;
+no cache, cursor, audio or blur range overlaps. Larger displays, full
+invalidation and pathological blur chains retain dense fallback. Tile rows
+stop at cell boundaries, skip clean cells and coalesce only marked runs.
+
+Only identical-position-in-list opaque paint is considered: kind1 constant
+rectangles, kind7 rounded rectangles with a conservative12px inner inset,
+and kind6 vertical gradients when y is unchanged or both endpoints match.
+Other changes mark both complete boxes. Code review caught the initial
+incorrect assumption that kind6 was constant; that v2 artifact was never
+deployed, and v3 contains the explicit gradient restriction.
+
+The first sparse build exceeded the unchanged RXcap by5937 bytes. Existing
+public SC KAT constants are now packed in u64 words, and two existing HID
+descriptor vectors in u32 words. Native21-module component execution matches
+the same369 SC bytes/1216 selector bytes/38 bounds, plus139 HID bytes/160
+selector bytes/4 bounds. The original literal digests remain in fixtures.
+No test, feature, ABI or memory allowance was removed or expanded.
+
+The exact44-module v3 reproduces ELF/EFI, passes USB/NVMe12 and PXE hub
+keyboard/mouse smoke, and passes24 USB drags with28 full-reference pixel
+comparisons. The observer now compares each held-button drag frame, so an
+alternating six-step round trip cannot hide a transient rendering error.
+Normal one/four-window QEMU scene medians are343/391ms, raster227/302ms,
+copy86/46ms. Actual core pixel stores per sample fall from505197 (span) to
+243053/136557. Timing is diagnostic: the observer changed and other gate VMs
+also ran. It is not a controlled physical speed or ChromeOS comparison.
+
+The separate physical profile-v5 baseline boot is observed from one-shot PXE
+transfer, fresh signed ping, USB0504 resume15 and Goal aba cold readback.
+At800×600, six four-window focus switches have median scene544.50ms,
+raster94.89ms and GOP copy443.75ms; reduced effects517.98/76.00/436.55ms.
+These are PIT-calibrated TSC CPU phases for app/focus switching, not drag or
+input-to-panel latency. They show why removing GOP reads needs physical
+verification. Sparse-candidate deployment and human drag acceptance are
+separate remaining gates.
