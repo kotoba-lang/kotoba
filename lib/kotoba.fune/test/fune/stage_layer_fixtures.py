@@ -80,3 +80,7 @@ for name, data in cases.items():
     (out / (name + '.config')).write_bytes(config)
     (out / (name + '.manifest')).write_bytes(manifest)
     print(name, sha(manifest), sha(data), len(data))
+
+alpine = (Path(__file__).parent / 'fixtures' / 'alpine-3.24.3-arm64-manifest.json').read_bytes()
+(out / 'alpine.manifest').write_bytes(alpine)
+print('alpine-manifest', sha(alpine), len(alpine))
