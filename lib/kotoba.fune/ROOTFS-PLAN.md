@@ -302,9 +302,9 @@ a digest-tampered config. Separately compiled controls that dropped Cmd or
 bypassed process/config verification failed the gate. The runnable stream now
 sends this value in its terminal `T` frame; a source-pinned ARM64 worker staged
 and returned matching bytes for independent UTF-8/empty-argument and 9 KiB
-fixtures, and rejected malformed frames. The worker only checks bounded framing,
-absolute paths and NULs; it does not establish complete config validity or
-authorize execution. Authenticated handoff, UID/GID, interpreter resolution and
+fixtures, and rejected malformed frames. The worker checks bounded framing,
+absolute paths, NULs and actual private executable/cwd inodes; it does not
+establish complete config validity, UID access or authorize execution. Authenticated handoff, UID/GID, interpreter resolution and
 isolation remain open. x86 and source-locked project linking remain unqualified.
 
 The normalized default cwd counts toward the 65,536-byte spec payload
