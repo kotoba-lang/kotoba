@@ -78,6 +78,32 @@ reserved for the same checked image; the existing fallback is preserved.
 Production install/update, protocol negotiation across arbitrary fallback
 images and whole-release acceptance remain separate open work.
 
+## Continuous-input capture fairness
+
+The previous adapter waited for the entire input queue to become idle before
+querying changed rows or reading pixels. Continuous drag motion could keep
+that wait alive until the gesture ended. Both queries now take an ordered
+turn on the same worker as native input. Later motion follows the queued
+read; earlier keys/button edges retain their order. Reads retain the existing
+32-row limit and256-item work bound. Disconnect cancels unsent reads and
+drains the final button release; an in-flight failure is returned once.
+
+`fair-capture.json` records41 host tests, including six queue controls, and
+four same-boot physical RFB/SSH/native-pointer samples in ABBA order. Each
+sample injects240 small titlebar motion requests, then returns the window
+and cursor to their original positions. The final complete screen was
+byte-identical to its initial screen in every sample. The previous queue
+returned no update during either gesture; its first update took5.389/5.357s.
+The fair queue returned six updates during each gesture, five with changed
+pixels. Its first update took0.707/0.706s; the first changed window strip
+arrived at1.634/1.670s. Those strips contain more changed bytes than the
+cursor's entire bounded path, corroborating actual window movement.
+
+These are protocol-harness samples with an unchanged native boot, not
+physical input-to-panel latency or native-client human smoothness acceptance.
+Whole-screen refresh and drag smoothness remain open. No native image,
+NVMe content, command admission, app consent or listener scope changed.
+
 `os/aiueos/scripts/aiueos-console-macos.py --config PRIVATE_CONFIG` starts
 the adapter. The owner-only JSON configuration names `sshHost` (only
 `itonami-6600h`), `vncPassword` (an owner-only eight-byte file), optional

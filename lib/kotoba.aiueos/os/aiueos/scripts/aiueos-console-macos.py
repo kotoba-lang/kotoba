@@ -81,6 +81,14 @@ def png_rgb(data):
     return w,h,b''.join(raw[y*(w*3+1)+1:(y+1)*(w*3+1)] for y in range(h))
 
 
+class WorkerCall:
+    def __init__(self):
+        self.done=threading.Event();self.result=None;self.error=None
+
+    def finish(self,result=None,error=None):
+        self.result=result;self.error=error;self.done.set()
+
+
 class Bridge:
     """One worker orders native keys/button edges; only adjacent motion coalesces."""
     def __init__(self, host):
@@ -88,7 +96,7 @@ class Bridge:
         self.host = host; self.cv = threading.Condition(); self.queue = collections.deque()
         self.channel=None
         self.geometry=None;self.dirty_rows=collections.OrderedDict()
-        self.stopped = False; self.active = False; self.session_nonce = None; self.last_pointer = (0,0,0); self.errors = 0; self.input_serial=0
+        self.stopped = False; self.closing=False; self.active = False; self.session_nonce = None; self.last_pointer = (0,0,0); self.errors = 0; self.input_serial=0
         self.thread = threading.Thread(target=self.run,daemon=True); self.thread.start()
 
     def ssh(self, *args, screenshot=False):
@@ -104,7 +112,7 @@ class Bridge:
     def begin(self):
         if self.channel:self.channel.close()
         self.session_nonce=None;self.geometry=None
-        with self.cv:self.dirty_rows.clear()
+        with self.cv:self.dirty_rows.clear();self.closing=False
         self.channel=channel.Channel(self.host)
         try:self.session_nonce = self.ssh('status')['bootNonce']
         except (OSError,ValueError,RuntimeError):
@@ -114,7 +122,7 @@ class Bridge:
         item = (kind,tuple(values))
         with self.cv:
             if self.stopped: return
-            if self.session_nonce is None: raise RuntimeError('no authenticated console session')
+            if self.session_nonce is None or self.closing: raise RuntimeError('no authenticated console session')
             if kind == 'pointer':
                 # Preserve every down/up edge and ordering relative to keys.
                 edge=values[2]!=self.last_pointer[2]
@@ -138,6 +146,16 @@ class Bridge:
             if kind == '_barrier':
                 values[0].set()
                 with self.cv:self.cv.notify_all()
+                continue
+            if kind in ('_capture','_damage'):
+                call,*args=values
+                try:
+                    result=(self._capture_band if kind=='_capture' else self._damage_band)(*args)
+                    call.finish(result=result)
+                except (OSError,ValueError,RuntimeError,subprocess.TimeoutExpired) as error:
+                    call.finish(error=error)
+                finally:
+                    with self.cv:self.active=False;self.cv.notify_all()
                 continue
             if kind == 'pointer-edge':kind='pointer'
             try:
@@ -175,9 +193,24 @@ class Bridge:
                 self.dirty_rows.pop(row,None);self.dirty_rows[row]=expected
                 self.dirty_rows.move_to_end(row,last=False)
 
-    def damage_band(self,first,count):
+    def worker_call(self,kind,*args):
+        call=WorkerCall()
         with self.cv:
-            self.cv.wait_for(lambda:not self.queue and not self.active)
+            if self.stopped or self.closing or self.session_nonce is None:
+                raise RuntimeError('no authenticated console session')
+            if len(self.queue)>=256:raise RuntimeError('console work queue limit reached')
+            self.queue.append((kind,(call,*args)));self.cv.notify_all()
+        # Later motion is queued behind this finite read instead of extending
+        # an idle wait forever. Only this worker uses the native channel.
+        call.done.wait()
+        if call.error is not None:raise call.error
+        return call.result
+
+    def damage_band(self,first,count):
+        return self.worker_call('_damage',first,count)
+
+    def _damage_band(self,first,count):
+        with self.cv:
             for row in list(self.dirty_rows):
                 start=max(first,row*32);end=min(first+count,(row+1)*32)
                 if start<end:
@@ -186,8 +219,10 @@ class Bridge:
         return None
 
     def capture_band(self, first, count):
+        return self.worker_call('_capture',first,count)
+
+    def _capture_band(self, first, count):
         # At most one32-row capture can be ahead of a newly queued input.
-        with self.cv: self.cv.wait_for(lambda:not self.queue and not self.active)
         raw=self.ssh('screenshot-band','nonce='+self.session_nonce,str(first),str(count),screenshot=True)
         if len(raw)<24: raise ValueError('truncated management band')
         magic,nonce,row,rows,w,h=struct.unpack_from('<8sQHHHH',raw)
@@ -211,7 +246,11 @@ class Bridge:
         with self.cv:
             # Session close cancels unsent input. A final release is ordered
             # after any in-flight SSH command and before a new client starts.
+            self.closing=True
             x,y,left = self.last_pointer
+            for kind,values in self.queue:
+                if kind in ('_capture','_damage'):
+                    values[0].finish(error=RuntimeError('console session closed before read'))
             self.queue.clear()
             self.queue.append(('pointer',(x,y,0)))
             self.queue.append(('_barrier',(barrier,)))
