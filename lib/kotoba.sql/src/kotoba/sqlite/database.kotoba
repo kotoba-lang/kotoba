@@ -1,12 +1,14 @@
 ;; Initial three-page SQLite file for Itonami's cron_notepad table.
-;; This writes only the schema roots and empty table/index leaves; it is not a
-;; general SQL executor and does not open or mutate existing database files.
+;; Pure SQLite transforms build and mutate the bounded Itonami notepad image.
+;; The FS2 byte adapter at the top of this module reads and writes whole images;
+;; its direct writes are not atomic and are not a SQLite transaction.
 
 (ns kotoba.sqlite.database
   {:kotoba/export [create-cron-notepad validate-cron-notepad-image
                    insert-first-notepad-row insert-second-notepad-row
                    append-notepad-row update-notepad-row
-                   upsert-notepad-row delete-notepad-key delete-notepad-job]}
+                   upsert-notepad-row delete-notepad-key delete-notepad-job read-cron-notepad-image
+                   write-cron-notepad-image]}
   (:require [kotoba.sqlite.header :as header]
             [kotoba.sqlite.notepad-record :as notepad-record]
             [kotoba.sqlite.page :as page]
@@ -14,6 +16,90 @@
             [kotoba.sqlite.schema :as schema]
             [kotoba.sqlite.varint :as varint]
             [kotoba.sqlite.reader :as reader]))
+
+(def db-fs2-prefix
+  (bytes-from-vector-i64 (vector-i64 0 70 83 50 0)))
+
+(defn- db-empty-bytes [] :bytes
+  (bytes-from-vector-i64 (vector-i64)))
+
+(defn- db-fs2-frame [form :i64 path :bytes tail :bytes] :bytes
+  (bytes-concat
+    (bytes-concat
+      (bytes-concat
+        (bytes-concat db-fs2-prefix (bytes-from-vector-i64 (vector-i64 (+ 65 form))))
+        path)
+      (bytes-from-vector-i64 (vector-i64 0)))
+    tail))
+
+(defn- db-fs2-call [request :bytes] :bytes
+  (typed-cap-call :fs/app-data-bytes :bytes :bytes request))
+
+(defn- db-fs2-acknowledged? [response :bytes] :bool
+  (and (>= (bytes-count response) 5)
+       (= (bytes-at response 0) 0)
+       (= (bytes-at response 1) 70)
+       (= (bytes-at response 2) 83)
+       (= (bytes-at response 3) 50)
+       (= (bytes-at response 4) 0)))
+
+(defn- db-fs2-payload [response :bytes] :bytes
+  (if (db-fs2-acknowledged? response)
+    (bytes-slice response 5 (bytes-count response))
+    (db-empty-bytes)))
+
+(defn- db-fs2-bytes-equal? [left :bytes right :bytes] :bool
+  (and (= (bytes-count left) (bytes-count right))
+       (loop [offset 0]
+         (if (= offset (bytes-count right))
+           true
+           (and (= (bytes-at left offset) (bytes-at right offset))
+                (recur (+ offset 1)))))))
+
+(defn- db-fs2-path-operation [form :i64 path :bytes] :bytes
+  (let [request (db-fs2-frame form path (db-empty-bytes))]
+    ;; Mac ARM64 currently qualifies the pair-backed string request to raw
+    ;; bytes response form for FS2 reads; kind-9 -> kind-9 read is unqualified.
+    (typed-cap-call :fs/app-data :string :bytes (string-from-utf8 request))))
+
+(defn- db-sqlite-header-valid? [image :bytes page-size :i64] :bool
+  (and (>= (bytes-count image) (* page-size 3))
+       (= (mod (bytes-count image) page-size) 0)
+       (loop [index 0]
+         (if (= index 16)
+           (let [encoded-size (+ (* (bytes-at image 16) 256)
+                                (bytes-at image 17))]
+             (and (or (and (= page-size 65536) (= encoded-size 1))
+                      (= page-size encoded-size))
+                  (= (bytes-at image 18) 1)
+                  (= (bytes-at image 19) 1)))
+           (and (= (bytes-at image index)
+                   (vector-at (vector-i64 83 81 76 105 116 101 32 102 111
+                                          114 109 97 116 32 51 0) index))
+                (recur (+ index 1)))))))
+
+;; Return a leading status byte followed by the image on success. An absent,
+;; malformed, unacknowledged, or unsupported database returns only zero.
+(defn read-cron-notepad-image [path :bytes page-size :i64] :bytes
+  (let [response (db-fs2-path-operation 0 path)
+        image (db-fs2-payload response)]
+    (if (and (db-fs2-acknowledged? response) (db-sqlite-header-valid? image page-size))
+      (bytes-concat (bytes-from-vector-i64 (vector-i64 1)) image)
+      (bytes-from-vector-i64 (vector-i64 0)))))
+
+;; Return [0] only when FS2 echoes the entire written image. Form B writes the
+;; destination directly; callers must not treat this as an atomic transaction.
+(defn write-cron-notepad-image [path :bytes image :bytes page-size :i64] :bytes
+  (if (not (db-sqlite-header-valid? image page-size))
+    (bytes-from-vector-i64 (vector-i64 1))
+    (let [response (db-fs2-call (db-fs2-frame 1 path image))
+          written (db-fs2-payload response)]
+      (if (and (db-fs2-acknowledged? response)
+               (= (bytes-count written) (bytes-count image))
+               (db-fs2-bytes-equal? written image))
+        (bytes-from-vector-i64 (vector-i64 0))
+        (bytes-from-vector-i64 (vector-i64 1))))))
+
 
 (def table-name
   (bytes-from-vector-i64

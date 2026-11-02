@@ -237,3 +237,30 @@ writes, atomic/crash-safe persistence, locks/concurrent writers, WAL or
 rollback-journal recovery, Linux x86_64/ARM64, or Itonami operations. Itonami
 launcher wiring and the selected one-time offline converter remain paused
 until those native gates pass.
+
+## FS2 storage adapter boundary (2026-11-02)
+
+The native FS2 export and independent read-only SQLite readback above qualify
+image export and the exercised Amu path only. They do not qualify a Kotoba
+storage adapter or atomic database replacement. The current macOS ARM64 runtime
+packager source describes a scoped FS2 callback slice for forms D/A/B/C/E/F
+(`amu/seed/macos-fs2-runtime-packager.kotoba`); the Linux FS2 seed contains
+additional temp-create, unlink, rename, and fsync operations. Those extra
+operations are required for the planned staged replacement protocol and have
+not been qualified by the macOS artifact.
+
+A KSL2-pinned Amu full-bootstrap ARM64 run now exercised the Kotoba FS2 adapter:
+one form-B whole-image write of the seven-page fixture and one form-A raw-byte
+read, followed by Kotoba lookup of the 16-KiB value. Read-only Python 3.15.0
+`sqlite3` / SQLite 3.54.1 reported `integrity_check=ok`, the expected rows and
+composite primary-key index, page_count 7, and four overflow pages. The receipt
+is [`native storage roundtrip`](../lib/kotoba.sql/evidence/notepad-storage-roundtrip-native-20261102.json).
+The Mac provider requires an FD3-scoped basename for form B/C. The passing
+reader uses the already exercised pair-backed string request to raw-byte
+response shape; an initial kind-9-to-kind-9 read stopped in the Mac FS2 wrapper.
+These results qualify direct whole-file write/read only. Form B writes directly
+to the destination, so atomic replacement and crash durability are not
+established. The Mac runtime artifact does not yet expose the Linux seed's
+temp-create/fsync/rename/unlink forms. WAL or rollback-journal support,
+locking, crash recovery, Linux qualification, and Itonami storage cutover remain
+open.
