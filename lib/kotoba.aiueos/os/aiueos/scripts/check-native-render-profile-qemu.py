@@ -45,6 +45,18 @@ def main(a):
         assert len(raw) == table['length'] <= 80
         assert hashlib.sha256(raw).hexdigest() == table['sha256']
         hid_expected += raw.ljust(80, b'\0')
+    text_fixture = HERE.parent/'native/fixtures/ui-text-public-words.json'
+    text_lines = json.loads(text_fixture.read_text())['lines']
+    assert len(text_lines) == 51 and [x['line'] for x in text_lines] == list(range(51))
+    text_expected = b''.join(struct.pack('<24I', *(line['words'] + [0]*(24-len(line['words'])))) for line in text_lines)
+    legacy_fixture = HERE.parent/'native/fixtures/bluetooth-legacy-public-bytes.json'
+    legacy_tables = json.loads(legacy_fixture.read_text())['fixtures']
+    assert len(legacy_tables) == 9
+    legacy_expected = b''
+    for table in legacy_tables:
+        raw = bytes(table['bytes'])
+        assert len(raw) == table['length'] <= 32 and hashlib.sha256(raw).hexdigest() == table['sha256']
+        legacy_expected += raw.ljust(32, b'\0')
     out = a.output.resolve(); out.mkdir(parents=True, exist_ok=False, mode=0o700)
     before = pin(a.media); b = None; status = 'FAILED'; metadata = None
     try:
@@ -56,6 +68,10 @@ def main(a):
         assert b.dump(b.work+2240, 38) == bytes(38), 'out-of-range case default changed'
         assert b.dump(b.work+2304, 160) == hid_expected, 'packed HID descriptor bytes changed'
         assert b.dump(b.work+2464, 4) == bytes(4), 'HID descriptor bounds changed'
+        assert b.dump(b.work+2560, 4896) == text_expected, 'packed UI words changed'
+        assert b.dump(b.work+7456, 416) == bytes(416), 'UI table default/bounds changed'
+        assert b.dump(b.surface+1024, 288) == legacy_expected, 'legacy KAT bytes changed'
+        assert b.dump(b.surface+1312, 18) == bytes(18), 'legacy KAT bounds changed'
         # A wrong public oracle must be detected, independently of hashes.
         changed = bytearray(expected); changed[0] ^= 1
         assert got != changed
@@ -76,6 +92,8 @@ def main(a):
         (out/'receipt.json').write_text(json.dumps(dict(
             status=status, comparedNativeSelectorBytes=1216, outOfRangeBytes=38,
             hidDescriptorBytes=139, hidSelectorBytes=160, hidBoundsBytes=4, hidFixture=pin(hid_fixture),
+            publicUITextWords=sum(len(x['words']) for x in text_lines), uiSelectorWords=1224, uiBoundsWords=104, uiFixture=pin(text_fixture),
+            legacyOriginalBytes=sum(x['length'] for x in legacy_tables), legacySelectorBytes=288, legacyBoundsBytes=18, legacyFixture=pin(legacy_fixture),
             changedOracleRejected=True if status.startswith('PASS') else None,
             publicOriginalBytes=sum(t['length'] for t in tables), metadata=metadata,
             artifacts={n:pin(getattr(a,n)) for n in ('efi','kernel','media','qemu','firmware','fixture')},
