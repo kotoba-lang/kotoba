@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compile/boot region hash, AEAD, X25519 or IK under the actual OS ABI.
+"""Compile/boot region hash, AEAD, X25519, IK or datagrams under the OS ABI.
 
 Mac observer/stager only. Amu discovers/compiles/packages all guest code;
 QEMU executes the region implementation and native KAT/refusal assertions.
@@ -59,6 +59,22 @@ IK_MUTATIONS={
  'ik-prefix':('(= (prefix-diff st input input-bytes 0 0) 0)', '(>= (prefix-diff st input input-bytes 0 0) 0)'),
  'ik-split':('(if (= (ld st 4) 1) (do (copy st 2336 352 32) (copy st 128 384 32))',
               '(if (= (ld st 4) 0) (do (copy st 2336 352 32) (copy st 128 384 32))')}
+DATAGRAM_MUTATIONS={
+ 'dg-peer':('(= (peer-diff hs expected 0 0) 0)', '(>= (peer-diff hs expected 0 0) 0)'),
+ 'dg-aad':('(u64-shift-right counter (* i 8))', '(u64-shift-right 0 (* i 8))'),
+ 'dg-high-nonce':('(bit-and (u64-shift-right counter (* (- i 4) 8)) 255)', '(if (< i 8) (bit-and (u64-shift-right counter (* (- i 4) 8)) 255) 0)'),
+ 'dg-duplicate':('(not (= (ld st (+ 128 (* (mod number 2048) 8))) (+ number 1)))', '(not (> (ld st (+ 128 (* (mod number 2048) 8))) (+ number 1)))'),
+ 'dg-window':('(<= number (- (ld st 16) 2048))', '(< number (- (ld st 16) 2048))'),
+ 'dg-early-mark':('(do (cipher st 1 (- (ld st 48) 8) (counter input input-bytes))', '(do (put st (+ 128 (* (mod (counter input input-bytes) 2048) 8)) (+ (counter input input-bytes) 1)) (cipher st 1 (- (ld st 48) 8) (counter input input-bytes))'),
+ 'dg-send-counter':('(put st 8 (+ (ld st 8) 1))', '(put st 8 (+ (ld st 8) 2))'),
+ 'dg-send-clock':('(put st 8 (+ (ld st 8) 1)) (put st 32 now)', '(put st 8 (+ (ld st 8) 1)) (put st 32 (ld st 32))'),
+ 'dg-receive-clock':('(put st 40 (+ (ld st 40) 1)) (put st 32 now)', '(put st 40 (+ (ld st 40) 1)) (put st 32 (ld st 32))'),
+ 'dg-expiry':('(>= (- now (ld st 24)) 180)', '(> (- now (ld st 24)) 180)'),
+ 'dg-rekey':('(>= (- now (ld st 24)) 120)', '(> (- now (ld st 24)) 120)'),
+ 'dg-send-limit':('(>= (ld st 8) 9007199254740990)', '(> (ld st 8) 9007199254740990)'),
+ 'dg-receive-limit':('(>= (ld st 40) 9007199254740990)', '(> (ld st 40) 9007199254740990)'),
+ 'dg-wire-limit':('(< number 9007199254740990)', '(<= number 9007199254740990)'),
+ 'dg-state-alias':('(separate st 17408 input input-bytes)', 'true')}
 
 def pin(path):
     raw=path.read_bytes();return dict(bytes=len(raw),sha256=hashlib.sha256(raw).hexdigest())
@@ -134,10 +150,10 @@ def check_chacha(words,raw,out,state):
 
 def main(a):
     out=a.output.resolve();out.mkdir(mode=0o700,parents=True,exist_ok=False)
-    chacha=a.component=='chacha';x25519=a.component=='x25519';ik=a.component=='ik';dual=chacha or x25519 or ik
-    namespace='noise.ik-region-gate' if ik else ('aiueos.native.x25519-region-gate' if x25519 else ('chacha20.region-gate' if chacha else 'noise.blake2s-region-gate'))
-    slug='ik' if ik else ('x25519' if x25519 else ('chacha20' if chacha else 'blake2s'))
-    mutations=IK_MUTATIONS if ik else (X25519_MUTATIONS if x25519 else (CHACHA_MUTATIONS if chacha else MUTATIONS))
+    chacha=a.component=='chacha';x25519=a.component=='x25519';ik=a.component=='ik';datagram=a.component=='datagram';protocol=ik or datagram;dual=chacha or x25519 or protocol
+    namespace='noise.datagram-region-gate' if datagram else ('noise.ik-region-gate' if ik else ('aiueos.native.x25519-region-gate' if x25519 else ('chacha20.region-gate' if chacha else 'noise.blake2s-region-gate')))
+    slug='datagram' if datagram else ('ik' if ik else ('x25519' if x25519 else ('chacha20' if chacha else 'blake2s')))
+    mutations=DATAGRAM_MUTATIONS if datagram else (IK_MUTATIONS if ik else (X25519_MUTATIONS if x25519 else (CHACHA_MUTATIONS if chacha else MUTATIONS)))
     if a.mutation and a.mutation not in mutations:raise ValueError('mutation/component differ')
     state=dict(schema='kekkai.os-region-'+slug+'.v1',state='STAGING',mutation=a.mutation,
                calls=[],physicalDeployment=False,appInstallQualified=False,
@@ -188,20 +204,20 @@ def main(a):
             source=source.replace(old,new)
         entry='/os/aiueos/native/kekkai-'+slug+'-region-entry.kotoba'
         (stage/entry.lstrip('/')).write_text(source)
-        core=ROOT/('lib/kotoba.noise/kotoba/noise/ik_region.kotoba' if ik else ('lib/kotoba.aiueos/os/aiueos/kotoba/x25519.kotoba' if x25519 else ('lib/org.ietf.chacha20Poly1305/kotoba/chacha20/region.kotoba' if chacha else 'lib/kotoba.noise/kotoba/noise/blake2s_region.kotoba')))
-        fixture=ROOT/('lib/kotoba.noise/tools/ik_region_gate.kotoba' if ik else ('lib/kotoba.aiueos/os/aiueos/native/x25519_region_gate.kotoba' if x25519 else ('lib/org.ietf.chacha20Poly1305/tools/region_gate.kotoba' if chacha else 'lib/kotoba.noise/tools/blake2s_region_gate.kotoba')))
+        core=ROOT/('lib/kotoba.noise/kotoba/noise/datagram_region.kotoba' if datagram else ('lib/kotoba.noise/kotoba/noise/ik_region.kotoba' if ik else ('lib/kotoba.aiueos/os/aiueos/kotoba/x25519.kotoba' if x25519 else ('lib/org.ietf.chacha20Poly1305/kotoba/chacha20/region.kotoba' if chacha else 'lib/kotoba.noise/kotoba/noise/blake2s_region.kotoba'))))
+        fixture=ROOT/('lib/kotoba.noise/tools/datagram_region_gate.kotoba' if datagram else ('lib/kotoba.noise/tools/ik_region_gate.kotoba' if ik else ('lib/kotoba.aiueos/os/aiueos/native/x25519_region_gate.kotoba' if x25519 else ('lib/org.ietf.chacha20Poly1305/tools/region_gate.kotoba' if chacha else 'lib/kotoba.noise/tools/blake2s_region_gate.kotoba'))))
         core_bytes=core.read_bytes();state['ownerSource']=pin(core);state['fixtureSource']=pin(fixture)
         if a.mutation and not chacha:
             old,new=mutations[a.mutation];text=core_bytes.decode()
             if text.count(old)!=1:raise ValueError('mutation is not unique')
             core_bytes=text.replace(old,new).encode()
-        files=([('noise/ik_region.kotoba',core_bytes),('noise/ik_region_gate.kotoba',fixture.read_bytes())] if ik else ([('aiueos/x25519.kotoba',core_bytes),('aiueos/native/x25519_region_gate.kotoba',fixture.read_bytes())] if x25519 else
+        files=([('noise/datagram_region.kotoba',core_bytes),('noise/datagram_region_gate.kotoba',fixture.read_bytes())] if datagram else ([('noise/ik_region.kotoba',core_bytes),('noise/ik_region_gate.kotoba',fixture.read_bytes())] if ik else ([('aiueos/x25519.kotoba',core_bytes),('aiueos/native/x25519_region_gate.kotoba',fixture.read_bytes())] if x25519 else
               ([('chacha20/region.kotoba',core_bytes),('chacha20/region_gate.kotoba',fixture.read_bytes())] if chacha else
-               [('noise/blake2s_region.kotoba',core_bytes),('noise/blake2s_region_gate.kotoba',fixture.read_bytes())])))
+               [('noise/blake2s_region.kotoba',core_bytes),('noise/blake2s_region_gate.kotoba',fixture.read_bytes())]))))
         owner_root='/x25519-owner' if x25519 else ('/chacha-owner' if chacha else '/noise-owner')
         for virtual,raw in files:
             target=stage/owner_root.lstrip('/')/virtual;target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(raw)
-        if chacha or ik:
+        if chacha or protocol:
             state['regionProfileSources']={}
             for name in ['region_ops.kotoba','aead_region.kotoba']:
                 original=ROOT/'lib/org.ietf.chacha20Poly1305/kotoba/chacha20'/name
@@ -213,15 +229,18 @@ def main(a):
                     raw=text.replace(old,new).encode()
                     state['mutationSource']=dict(name=name,original=pin(original),mutated=dict(bytes=len(raw),sha256=hashlib.sha256(raw).hexdigest()))
                 target=stage/'chacha-owner/chacha20'/name;target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(raw)
-        if chacha or ik:
+        if chacha or protocol:
             secondary=ROOT/'lib/kotoba.noise/kotoba/noise/blake2s_region.kotoba';state['secondaryOwnerSource']=pin(secondary)
             target=stage/'noise-owner/noise/blake2s_region.kotoba';target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(secondary.read_bytes())
             if chacha:roots.append('/noise-owner')
-        if ik:
+        if protocol:
             state['dependencySources']={}
-            for root,virtual,relative in [('/x25519-owner','aiueos/x25519.kotoba','lib/kotoba.aiueos/os/aiueos/kotoba/x25519.kotoba')]:
+            dependencies=[('/x25519-owner','aiueos/x25519.kotoba','lib/kotoba.aiueos/os/aiueos/kotoba/x25519.kotoba')]
+            if datagram:dependencies.append(('/noise-owner','noise/ik_region.kotoba','lib/kotoba.noise/kotoba/noise/ik_region.kotoba'))
+            for root,virtual,relative in dependencies:
                 dependency=ROOT/relative;state['dependencySources'][relative]=pin(dependency)
-                target=stage/root.lstrip('/')/virtual;target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(dependency.read_bytes());roots.append(root)
+                target=stage/root.lstrip('/')/virtual;target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(dependency.read_bytes())
+                if root!=owner_root:roots.append(root)
             roots.append('/chacha-owner')
         roots.append(owner_root);flags=[v for r in roots for v in ('--source-path',r)]
         payload=a.payload.resolve(strict=True)
@@ -229,16 +248,17 @@ def main(a):
         (stage/('boot-font.bin' if dual else 'boot-payload.bin')).write_bytes(payload.read_bytes())
         state['bootPayload']=None if dual else pin(payload)
         if dual:
-            if ik:
-                reference=ROOT/'lib/kotoba.noise/tools/ik_region_reference.py'
+            if protocol:
+                reference=ROOT/('lib/kotoba.noise/tools/datagram_region_reference.py' if datagram else 'lib/kotoba.noise/tools/ik_region_reference.py')
                 blob,expected_ik,descriptions=load('ik_public_reference',reference).fixtures()
                 state['referenceSources']={str(p.relative_to(ROOT)):pin(p) for p in [reference,ROOT/'lib/kotoba.noise/test/noise/cacophony_vectors.edn',
                     ROOT/'lib/org.ietf.x25519/tools/reference.py',ROOT/'lib/org.ietf.chacha20Poly1305/tools/reference.py']}
+                if datagram:state['referenceSources']['lib/kotoba.noise/tools/ik_region_reference.py']=pin(ROOT/'lib/kotoba.noise/tools/ik_region_reference.py')
                 state['cases']=descriptions
                 font=bytearray(payload.read_bytes());end=393216+len(blob)
                 if len(font)!=524288 or end>len(font) or any(font[393216:end]):raise ValueError('IK diagnostic tail is unavailable')
                 font[393216:end]=blob;(stage/'boot-font.bin').write_bytes(font)
-                (out/'ik-vectors.bin').write_bytes(blob);(out/'expected-ik-records.bin').write_bytes(expected_ik)
+                (out/'ik-vectors.bin').write_bytes(blob);(out/('expected-datagram-records.bin' if datagram else 'expected-ik-records.bin')).write_bytes(expected_ik)
                 state['vectorData']=pin(out/'ik-vectors.bin')
             if x25519:
                 blob,expected_x,expected_returns=x25519_vectors(state)
@@ -305,7 +325,7 @@ def main(a):
         try:
             keys.Boot.__init__(boot,SimpleNamespace(kernel=kernel,efi=efi,media=media,qemu=a.qemu,firmware=a.firmware),out,'region-crypto',None,
                                extra=('-serial','file:serial.log','-debugcon','file:debug.log','-d','int,cpu_reset','-D','qemu-debug.log'),first_frame_seconds=a.first_frame_seconds)
-            if x25519 or ik:
+            if x25519 or protocol:
                 started=time.monotonic();state['state']='NATIVE_RUNNING';save()
                 while boot.W(79)==1:
                     if boot.proc.poll() is not None:raise RuntimeError('region guest terminated')
@@ -313,7 +333,7 @@ def main(a):
                     if time.monotonic()-started>a.execution_seconds:raise TimeoutError('region native execution deadline')
                     time.sleep(2)
             words=struct.unpack('<6I',boot.dump(boot.work+74*4,24))
-            if ik:raw=boot.dump(boot.work+4096,95*32)
+            if protocol:raw=boot.dump(boot.work+4096,(39 if datagram else 95)*32)
             elif dual:
                 lo,hi=struct.unpack('<2I',boot.dump(boot.work+400,8));address=lo+(hi<<32)
                 if not 0<address<1<<39:raise ValueError('native output region address differs')
@@ -336,19 +356,20 @@ def main(a):
         (out/'native-digests.bin').write_bytes(raw)
         if pin(media)!=media_before:raise ValueError('fixture medium changed during QEMU boot')
         state['mediaUnchanged']=True
-        if ik:
-            (out/'native-ik-records.bin').write_bytes(raw)
-            mismatch=[i for i in range(95) if raw[i*32:i*32+32]!=expected_ik[i*32:i*32+32]]
+        if protocol:
+            count=39 if datagram else 95
+            (out/('native-datagram-records.bin' if datagram else 'native-ik-records.bin')).write_bytes(raw)
+            mismatch=[i for i in range(count) if raw[i*32:i*32+32]!=expected_ik[i*32:i*32+32]]
             observed=dict(cacophonyAnswer=words[0],nativeAssertionFailures=words[1],guardsCompleted=words[2],canary=words[3],recordCount=words[4],completed=words[5],mismatchedRecords=mismatch)
             state['observed']=observed;state['artifacts']={n:pin(p) for n,p in [('kernel',kernel),('efi',efi),('media',media),('qemu',a.qemu),('firmware',a.firmware)]}
-            good=words==(1,0,1,1,95,2) and not mismatch
+            good=words==(1,0,1,1,count,2) and not mismatch
             if a.mutation:
-                if words[2:]!=(1,1,95,2):raise AssertionError('IK mutant did not complete bounded controls')
+                if words[2:]!=(1,1,count,2):raise AssertionError('protocol mutant did not complete bounded controls')
                 if good:raise AssertionError('IK mutation escaped native controls')
                 state['state']='DETECTED_NATIVE_MUTATION'
             else:
                 if not good:raise AssertionError('native IK/control mismatch: '+str(observed))
-                state['state']='PASS_NATIVE_OS_REGION_IK'
+                state['state']='PASS_NATIVE_OS_REGION_DATAGRAM' if datagram else 'PASS_NATIVE_OS_REGION_IK'
             state['kernelReproduced']=True;state['efiReproduced']=True;save();print(state['state'],json.dumps(observed));return
         if x25519:
             (out/'native-x25519.bin').write_bytes(raw)
@@ -408,7 +429,7 @@ if __name__=='__main__':
     for name in ['compiler','packager','amu-source','source-stage','payload','qemu','firmware','output']:p.add_argument('--'+name,type=Path,required=True)
     for name in ['compiler-sha256','packager-sha256','source-lock-sha256','payload-sha256','qemu-sha256','firmware-sha256']:p.add_argument('--'+name,required=True)
     p.add_argument('--first-frame-seconds',type=float,default=240)
-    p.add_argument('--component',choices=['blake2s','chacha','x25519','ik'],default='blake2s')
+    p.add_argument('--component',choices=['blake2s','chacha','x25519','ik','datagram'],default='blake2s')
     p.add_argument('--execution-seconds',type=float,default=3600)
-    p.add_argument('--mutation',choices=[*MUTATIONS,*CHACHA_MUTATIONS,*X25519_MUTATIONS,*IK_MUTATIONS])
+    p.add_argument('--mutation',choices=[*MUTATIONS,*CHACHA_MUTATIONS,*X25519_MUTATIONS,*IK_MUTATIONS,*DATAGRAM_MUTATIONS])
     main(p.parse_args())
