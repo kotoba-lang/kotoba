@@ -86,6 +86,14 @@ cleanup. Actual signed hover motion changed only the expected cursor pixels;
 reboot, stale-nonce key input and an invalid pointer were refused. These
 measurements do not qualify Sidecar responsiveness or native OS SSH.
 
+The local loopback console was restarted on the committed candidate and
+passed wrong-password refusal plus two authenticated800x600 RFB captures
+across disconnect/reconnect. Authentication-to-first-frame took6.00–6.45s
+in these live sessions; this is distinct from the isolated3.89s backend
+capture and still leaves substantial interactive latency. See
+`persistent-deployment.json`. The existing SSH listener and native PXE boot
+were preserved, and the post-test signed status returned the same boot nonce.
+
 The actual Mac Screen Sharing app displayed the desktop, entered `r`
 (independent band readback `abar`), deleted it and opened Murakumo by pointer
 click. A separate real loopback RFB wire session drove signed drag/typing
