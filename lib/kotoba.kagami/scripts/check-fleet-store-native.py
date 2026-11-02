@@ -32,6 +32,9 @@ def run(label, mode, directory=base, expected=0):
  return gate.run(label, image, expected, [mode, directory], '35,38', directory)
 for mode in ['init', 'state-old', 'invalid', 'state-old', 'success', 'state-new', 'already', 'state-new']:
  run('normal-'+mode+str(len(gate.observations)), mode)
+announce = gate.out / 'announce'; announce.mkdir()
+for mode in ['init','announce-invalid','state-old','announce','state-new','announce-already','state-new']:
+ run('announce-'+mode+str(len(gate.observations)),mode,announce)
 race = gate.out / 'race'; race.mkdir(); run('race-init', 'init', race)
 # Each contender may observe a held lock or the newly committed checkpoint.
 def race_one(i):
@@ -63,6 +66,17 @@ for label,needle,replacement,mode,expected in [
  if label in ('compare-bypass','replay-bypass'):
   path=directory/'fleet.state'; path.write_bytes(path.read_bytes().replace(b'0000000000000000',b'0000000000000009',1))
  gate.run('control-detected-'+label,broken,expected,[mode,directory],'35,38',directory)
+# Each announcement field must be bound to the verified record.
+for label,needle,replacement in [
+ ('announce-type',b'(not (string=? message-type "head-announce"))',b'false'),
+ ('announce-graph',b'(not (string=? graph "fleet-db"))',b'false'),
+ ('announce-sequence',b'(= head-seq (+ seq (document-count heads)))',b'true'),
+ ('announce-value',b'(string=? head-value (fs-hex-bytes plan 32))',b'true')]:
+ if store_source.count(needle)!=1: raise ValueError('unexpected announcement source: '+label)
+ mutant=dict(sources);mutant['kagami/fleet_store_native.kotoba']=store_source.replace(needle,replacement)
+ broken=gate.build('control-'+label,'kagami/fleet_store_native_test.kotoba',mutant)
+ directory=gate.out/('control-'+label+'-state');directory.mkdir();run('control-init-'+label,'init',directory)
+ gate.run('control-detected-'+label,broken,17,['announce-invalid',directory],'35,38',directory)
 # Disk data is not a trust source: reject a modified stored value unchanged.
 tamper=gate.out/'tamper';tamper.mkdir();run('tamper-init','init',tamper)
 path=tamper/'fleet.state'; damaged=path.read_bytes().replace(b'0000000000000000',b'0000000000000009',1);path.write_bytes(damaged)
@@ -141,5 +155,5 @@ for stage,needle,replacement,expected_state in [
  run('crash-retry-'+stage,'success' if expected_state=='state-old' else 'already',directory)
  run('crash-final-'+stage,'state-new',directory)
  crash_results.append({'stage':stage,'exit':child.returncode,'reopened':expected_state,'retry':'success' if expected_state=='state-old' else 'already'})
-gate.finish('PASS_FLEET_STORE_SYNTHETIC', observerSHA256=native.sha(Path(__file__).read_bytes()), raceResults=results, crashResults=crash_results, injectedFaults=['write','file-sync','rename','dir-sync','retry-file-sync','retry-dir-sync'], negativeControls=['signature-verification-bypass','checkpoint-compare-bypass','replay-compare-bypass','modified-checkpoint'],
+gate.finish('PASS_FLEET_STORE_SYNTHETIC', observerSHA256=native.sha(Path(__file__).read_bytes()), raceResults=results, crashResults=crash_results, injectedFaults=['write','file-sync','rename','dir-sync','retry-file-sync','retry-dir-sync'], negativeControls=['signature-verification-bypass','checkpoint-compare-bypass','replay-compare-bypass','announcement-type','announcement-graph','announcement-sequence','announcement-value','modified-checkpoint'],
  scope='local native synthetic data and SIGKILL only; no power-cut test, rollback protection, real trust, network or release')
