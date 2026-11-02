@@ -29,8 +29,10 @@ FIXTURES = (
     ("sqlite.notepad-linux-storage", PACKAGE / "test/native/notepad-linux-storage.kotoba"),
     ("sqlite.notepad-sidecar-refusal", PACKAGE / "test/native/notepad-sidecar-refusal.kotoba"),
     ("sqlite.notepad-existing-file-mutation", PACKAGE / "test/native/notepad-existing-file-mutation.kotoba"),
+    ("sqlite.notepad-unsupported-schema-refusal", PACKAGE / "test/native/notepad-unsupported-schema-refusal.kotoba"),
 )
 LEGACY_FIXTURE = PACKAGE / "test/fixtures/legacy-cron-notepad-20261102.sqlite"
+UNSUPPORTED_SCHEMA_FIXTURE = PACKAGE / "test/fixtures/unsupported-cron-notepad-20261102.sqlite"
 
 
 def sha(path):
@@ -60,6 +62,8 @@ def main(amu, compiler, out, amu_pin=None):
     (out / "data").mkdir()
     legacy_fixture_sha256 = sha(LEGACY_FIXTURE)
     (out / "data/legacy.db").write_bytes(LEGACY_FIXTURE.read_bytes())
+    unsupported_schema_sha256 = sha(UNSUPPORTED_SCHEMA_FIXTURE)
+    (out / "data/unsupported.db").write_bytes(UNSUPPORTED_SCHEMA_FIXTURE.read_bytes())
     source_root = out / "src"
     staged = {}
     for module, source in (*MODULES, *FIXTURES):
@@ -128,6 +132,14 @@ def main(amu, compiler, out, amu_pin=None):
     run("sqlite-existing-file-mutation", [legacy_mutation, "data/legacy.db"], out, guest_env,
         calls, timeout=300)
 
+    unsupported_schema_image = out / receipts[3]["image"]
+    unsupported_path = out / "data/unsupported.db"
+    unsupported_before = sha(unsupported_path)
+    run("sqlite-unsupported-schema-refusal", [unsupported_schema_image, "data/unsupported.db"],
+        out, guest_env, calls, timeout=300)
+    if sha(unsupported_path) != unsupported_before or unsupported_before != unsupported_schema_sha256:
+        raise RuntimeError("Kotoba changed a database with an unsupported cron_notepad schema")
+
     receipt = {
         "schema": "kotoba.sqlite.native-linux-arm64.v1",
         "platform": [platform.system(), platform.machine()],
@@ -146,8 +158,14 @@ def main(amu, compiler, out, amu_pin=None):
             "inputDatabase": "SQLite 3.54.1 standard file generated once with three existing rows",
             "nativeResult": "updated an existing row, inserted a second row for a different job, deleted one job, published atomically, reopened and read back through Kotoba",
         },
+        "unsupportedSchema": {
+            "fixture": UNSUPPORTED_SCHEMA_FIXTURE.name,
+            "inputSha256": unsupported_schema_sha256,
+            "nativeResult": "Kotoba refused upsert/publication for the standard five-column cron_notepad schema",
+            "preserved": sha(unsupported_path) == unsupported_before,
+        },
         "sidecarRefusals": sidecar_cases,
-        "result": "Kotoba positive upsert/readback, pre-existing WAL/SHM/rollback-journal refusals, and existing SQLite database mutation/reopen passed",
+        "result": "Kotoba positive upsert/readback, pre-existing WAL/SHM/rollback-journal refusals, existing SQLite mutation/reopen, and unsupported-schema refusal/preservation passed",
         "hostSqliteOracle": False,
     }
     (out / "native-sqlite-arm64.json").write_text(json.dumps(receipt, indent=2) + "\n")
