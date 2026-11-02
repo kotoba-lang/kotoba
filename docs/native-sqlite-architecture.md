@@ -231,12 +231,33 @@ also remain open. Receipt:
 [`native upsert contract`](../lib/kotoba.sql/evidence/notepad-upsert-contract-native-20261102.json).
 
 The implementation remains a bounded codec, reader, initializer, and
-single-leaf mutation slice, not a complete SQLite engine or transactional
-storage layer. It does not yet qualify arbitrary database layouts, page-split
-writes, atomic/crash-safe persistence, locks/concurrent writers, WAL or
-rollback-journal recovery, Linux x86_64/ARM64, or Itonami operations. Itonami
-launcher wiring and the selected one-time offline converter remain paused
-until those native gates pass.
+mutation slice, not a complete SQLite engine or transactional storage layer.
+It does not yet qualify arbitrary database layouts, atomic/crash-safe
+persistence, locks/concurrent writers, WAL or rollback-journal recovery, Linux
+x86_64, or Itonami operations. Itonami launcher wiring and the selected
+one-time offline converter remain paused until the required native gates pass.
+
+### First interior-root split (2026-11-03)
+
+An exact-source Amu selfhost Linux ARM64 fixture filled the admitted
+three-page `cron_notepad` image, split both the table and primary-key index
+roots into two child leaves, published the seven-page result through native
+FS2, reopened it, and read a value through Kotoba. It refused the next upsert
+because a second split was not yet implemented. The separate, one-time
+read-only Python 3.15.0 / SQLite 3.54.1 oracle checked the same output digest,
+reported `integrity_check=ok`, and read the four expected ordered keys and
+unique primary-key index. The oracle is evidence for this artifact only and
+does not participate in the native gate. Receipts:
+[`Linux ARM64 native split`](../lib/kotoba.sql/evidence/interior-root-split-native-linux-arm64-20261103.json)
+and
+[`read-only SQLite readback`](../lib/kotoba.sql/evidence/interior-root-split-readonly-oracle-20261103.json).
+
+This qualifies only the first split from the exact generated schema image on
+Linux ARM64. Repeated updates on an already-interior root, arbitrary SQLite
+layouts, Linux x86_64, transactions/atomicity, locks/concurrency,
+WAL/rollback-journal recovery, crash recovery, and Itonami integration remain
+open. A subsequent repeated-upsert native gate is in progress and is not
+counted as qualified here.
 
 ## FS2 storage adapter boundary (initial checkpoint, 2026-11-02)
 
