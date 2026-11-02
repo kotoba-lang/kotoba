@@ -19,7 +19,7 @@ a screenshot arrives on 7797 and is written as a PNG.
 This tool only signs, sends and observes; the board decides. It is a diagnostic channel for the opt-in
 debug entry on a direct cable, not a product remote-access service.
 """
-import argparse, hashlib, socket, struct, time, zlib
+import argparse, hashlib, json, socket, struct, time, zlib
 from pathlib import Path
 
 # --- RFC 8032 Ed25519 (signing on the operator's Mac) ---
@@ -123,7 +123,7 @@ def main():
     p.add_argument("--broadcast", default="10.77.0.255")
     p.add_argument("--wait", type=float, default=15.0, help="seconds to wait for the nonce and replies")
     p.add_argument("--nonce", type=lambda value: int(value, 0), help="explicit last-observed boot nonce when periodic discovery is unavailable; stale values are refused by the board")
-    p.add_argument("command", choices=("ping", "reboot", "key", "type", "shot", "update", "install", "usb-select", "bt-probe", "ble-init", "ble-crypto", "ble-scan", "ble-connect", "ble-status", "ble-firmware"))
+    p.add_argument("command", choices=("ping", "reboot", "key", "type", "shot", "update", "install", "usb-select", "bt-probe", "ble-init", "ble-crypto", "ble-scan", "ble-connect", "ble-status", "ble-firmware", "render-stats"))
     p.add_argument("value", nargs="?")
     args = p.parse_args()
     if args.nonce is not None and not 0 < args.nonce < 1 << 64:
@@ -139,6 +139,28 @@ def main():
     print(f"nonce {nonce:016x}")
     if args.command == "ping":
         send(args, seed, nonce, counter, 1, 0); print(reply(log, {0xC001}, args.wait))
+    elif args.command == "render-stats":
+        if args.value is not None:
+            p.error("render-stats takes no argument")
+        send(args, seed, nonce, counter, 17, 0)
+        values = {}; complete = False
+        for tag, value in records(log, time.monotonic() + args.wait):
+            if 0xC380 <= tag <= 0xC397:
+                values[tag] = value
+            if tag == 0xC0FF:
+                raise RuntimeError(f"renderer statistics refused: {value}")
+            if tag == 0xC011 and value == counter:
+                complete = True
+                break
+        if not complete or len(values) != 24:
+            raise RuntimeError("incomplete renderer statistics reply")
+        names = ('cyclesPerMS', 'listCycles', 'damageCycles', 'composeCycles', 'cacheCycles',
+                 'totalCycles', 'sceneLastCycles', 'sceneMaxCycles', 'pointerLastCycles',
+                 'sceneFrames', 'pointerFrames', 'profileFrames', 'tiles', 'tileStores',
+                 'lastMode', 'tiledFrames', 'sceneListCycles', 'sceneDamageCycles',
+                 'sceneCacheCycles', 'sceneTotalCycles', 'tileRasterCycles', 'tileCopyCycles',
+                 'sceneTileRasterCycles', 'sceneTileCopyCycles')
+        print(json.dumps(dict(zip(names, (values[0xC380+i] for i in range(24)))), sort_keys=True))
     elif args.command == "reboot":
         send(args, seed, nonce, counter, 2, 0); print(reply(log, {0xC002}, args.wait))
     elif args.command in ("update", "install"):
