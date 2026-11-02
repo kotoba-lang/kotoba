@@ -54,3 +54,25 @@ to F1; F10 was not sent to the physical6600H. Key assignments were not remapped.
 Receipts: `docs/evidence/jun502-drag-profile-20261102/`. No profile candidate has
 been deployed by this unit, and no improvement or physical smoothness is yet
 claimed. The goal remains open until the remaining roadmap gates also pass.
+
+## Page-span transfer candidate
+
+The next candidate removes per-pixel GOP reads/page resolution/comparison. It
+copies each completed tile in page-bounded spans, pairing aligned pixels into
+u64 stores and retaining a u32 tail. Only completed final pixels reach GOP.
+This writes every core tile pixel, including unchanged values; tileStores
+continues to count actual pixel stores, so its volume increases. No intermediate
+layer is exposed. No allocation or ABI expansion is used.
+
+The exact44-module candidate passes USB/NVMe12, all24 drag samples/four pixel
+controls, and all12 pointer/compositor scenarios including clipped edges,
+window overlap, dock materials and modal pointer movement without approval.
+The observer now also retains its owned VM handle if its constructor fails.
+
+QEMU transfer medians change from152/151ms to141/147ms (one/four normal
+windows), while total scene medians are439/869ms against445/841ms baseline.
+These samples do not establish an overall drag-speed improvement; four-window
+raster work remains dominant. The change avoids hardware framebuffer reads,
+but its physical benefit and the effect of additional stores require direct
+measurement. Physical smoothness is not accepted. Further raster/damage
+reduction remains necessary if hardware measurements do not close the gap.
