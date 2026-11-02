@@ -14,6 +14,9 @@ for build,receipt in ((normal,r0),(small,r1)):
  for name,key in (('program.wasm','wasmSha256'),('program.kotoba','sourceSha256')):
   if sha((build/name).read_bytes())!=receipt[key]:raise ValueError('candidate digest mismatch: '+name)
 if r0['sourceSha256']!=r1['sourceSha256'] or r1['compilerSha256']!=experiment['instrumentedCompilerSha256']:raise ValueError('source/compiler mismatch')
+pool=experiment['limits']['KXRT-POOL']
+if pool not in (1048576,4194304):raise ValueError('unexpected pool')
+refusal_from=8 if pool==1048576 else 32
 spec=importlib.util.spec_from_file_location('harness',amu/'scripts/seed/check-js-browser.py');h=importlib.util.module_from_spec(spec);spec.loader.exec_module(h)
 def frame(x):return str(len(x.encode('utf-8')))+':'+x
 runs=[]
@@ -30,7 +33,7 @@ for n in (2,4,8,16,24,32):
  row['sameOutput']=row['normal']['exit']==0 and row['compact']['exit']==0 and row['normal']['outputSha256']==row['compact']['outputSha256']
  report['cases'][str(n)]=row
  if not (row['normal']['exit']==0 and (row['normal']['report'] or '').startswith('{:status :ok :result 0')):raise ValueError('baseline refused '+str(n))
- if n<=4 and not row['sameOutput']:raise ValueError('small case differs '+str(n))
- if n>=8 and not (row['compact']['exit']==120 and ':arena :string-pool' in row['compact']['stderr']):raise ValueError('expected budget refusal missing '+str(n))
+ if n<refusal_from and not row['sameOutput']:raise ValueError('small case differs '+str(n))
+ if n>=refusal_from and not (row['compact']['exit']==120 and ':arena :string-pool' in row['compact']['stderr']):raise ValueError('expected budget refusal missing '+str(n))
 (out/'result.json').write_text(json.dumps(report,ensure_ascii=False,indent=2)+'\n')
 print(json.dumps({k:{'normal':v['normal']['exit'],'compact':v['compact']['exit'],'sameOutput':v['sameOutput'],'compactError':v['compact']['stderr']} for k,v in report['cases'].items()},ensure_ascii=False),flush=True)

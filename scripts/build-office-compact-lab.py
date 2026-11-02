@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Build an isolated experimental compact Wasm runtime compiler; not for release.
 
-Usage: script AMU_DIR NEW_OUTPUT_DIR
+Usage: script AMU_DIR NEW_OUTPUT_DIR [1048576|4194304]
 """
 import hashlib,importlib.util,json,sys
 from pathlib import Path
 from types import SimpleNamespace
-if len(sys.argv)!=3:raise SystemExit(__doc__)
+if len(sys.argv) not in (3,4):raise SystemExit(__doc__)
+pool_bytes=int(sys.argv[3]) if len(sys.argv)==4 else 1048576
+if pool_bytes not in (1048576,4194304):raise ValueError("unsupported lab pool")
 amu=Path(sys.argv[1]).resolve();out=Path(sys.argv[2]).resolve();out.mkdir(parents=True,exist_ok=False)
 def load(name,path):
  spec=importlib.util.spec_from_file_location(name,path);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m);return m
@@ -26,7 +28,7 @@ for name in names:
  if name=='seed/82-wasm32-rt.kotoba':
   if text.count(old)!=1:raise ValueError('instrumentation anchor changed')
   text=text.replace(old,new)
-  limits={'KXRT-PAIRS':65536,'KXRT-POOL':1048576,'KXRT-VECTORS':8192,'KXRT-REGIONS':8192,'KXRT-ITEMS':131072,'KXRT-VECTOR-MAX':131072,'KXRT-VALUE-MAX':262144}
+  limits={'KXRT-PAIRS':65536,'KXRT-POOL':pool_bytes,'KXRT-VECTORS':8192,'KXRT-REGIONS':8192,'KXRT-ITEMS':131072,'KXRT-VECTOR-MAX':131072,'KXRT-VALUE-MAX':262144}
   import re
   for key,value in limits.items():
    text,n=re.subn(r'\(def '+key+r' \d+\)',f'(def {key} {value})',text,count=1)
