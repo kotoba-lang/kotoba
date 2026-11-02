@@ -98,3 +98,16 @@ dated oracle only; oracle success never substitutes for Kotoba/Amu execution.
   capability model.
 - Which subset of SQLite schema/index/collation/encoding versions is admitted;
   every unsupported form must fail closed before mutation.
+
+## Implementation checkpoint (2026-11-02)
+
+The Kotoba package now has source for the fixed database header, signed-i64
+varints, four-TEXT notepad records, generic record-layout spans, B-tree page
+headers/cell pointers, and table-leaf cells. The table-interior cell decoder
+now also extracts its left-child page and rowid boundary. These are source
+components only: no full page-tree walk, `sqlite_schema` reader, overflow
+traversal, SQL operation layer, Amu byte provider, or database mutation path
+is qualified. The current Amu Mac CLI cannot compile this imported multi-file
+package through its exposed source-lock route (E6015), so no Kotoba/Amu
+runtime result is claimed. Continue with the pinned Amu project-build route
+and native byte capability before consumer wiring.
