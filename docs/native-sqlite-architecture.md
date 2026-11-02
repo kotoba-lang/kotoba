@@ -204,14 +204,23 @@ SQLite 3.54.1 reported `integrity_check=ok`, page_count 7, the expected row,
 and the unique composite primary-key index. Receipt:
 [`first-row overflow writer`](../lib/kotoba.sql/evidence/notepad-overflow-first-row-writer-native-20261102.json).
 This qualifies overflow only while inserting the first row into the exact
-empty image. Existing-row update/delete/reinsert on an image with overflow
-pages and arbitrary database layouts remain unqualified.
+empty image. A subsequent exact-source Amu ARM64 fixture appended a second
+row, updated the 16-KiB row (rebuilding its four-page overflow chain), deleted
+the second row, checked successful and missing-key reads in Kotoba, and
+exported the seven-page image through FD3-scoped FS2. Read-only Python
+`sqlite3` / SQLite 3.54.1 reported `integrity_check=ok`, one expected row with
+all 16,384 value bytes and the updated timestamp, four overflow pages, and the
+unique composite primary-key index. The receipt is
+[`overflow mutation`](../lib/kotoba.sql/evidence/notepad-overflow-mutation-native-20261102.json).
+This qualifies only the exact sqlite_schema page-1 image with one table leaf
+and one index leaf. Arbitrary layouts, page splits, delete/reinsert
+combinations beyond the exercised sequence, and persistence transactions
+remain unqualified.
 
 The implementation remains a bounded codec, reader, initializer, and
 single-leaf mutation slice, not a complete SQLite engine or transactional
 storage layer. It does not yet qualify arbitrary database layouts, page-split
-writes or general overflow-page mutation, atomic/crash-safe persistence,
-locks/concurrent writers, WAL or
+writes, atomic/crash-safe persistence, locks/concurrent writers, WAL or
 rollback-journal recovery, Linux x86_64/ARM64, or Itonami operations. Itonami
 launcher wiring and the selected one-time offline converter remain paused
 until those native gates pass.
