@@ -1,4 +1,4 @@
-# kotoba-lang/wasm-webcomponent
+# kotoba.wasmWebcomponent
 
 Kototama's **browser host** — a small, dependency-free library for hosting a
 `kotoba wasm emit` binary as a browser WebComponent, running it via the
@@ -6,9 +6,9 @@ browser's own native `WebAssembly` engine. Already-AOT-compiled machine code,
 no interpreter, no JVM, no `com.dylibso.chicory`, no wasmtime.
 
 The product is [`kototama`](https://github.com/kotoba-lang/kototama) (言霊).
-This library stays extracted so any repo can adopt the same pattern instead
-of depending on kototama core (ADR-2607061630 / ADR-2608139980).
-kototama's own `web/` imports from here rather than duplicating the code.
+The canonical source is `lib/kotoba.wasmWebcomponent` in the `kotoba` monorepo.
+The former standalone `kotoba-lang/wasm-webcomponent` repository is archived.
+Other repositories can adopt this host without depending on kototama core.
 
 Guest binaries are produced by [`amu`](https://github.com/kotoba-lang/amu)
 (編む), not by this host.
