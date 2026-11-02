@@ -546,6 +546,25 @@ root-collapse deletion on Linux ARM64. Deletion that leaves two or more rows,
 arbitrary/deeper trees, WAL or rollback-journal processing, standard SQLite
 locking, crash consistency, Linux x86_64, and Itonami integration remain open.
 
+## Multi-row deletion within the admitted two-leaf roots (2026-11-03)
+
+The exact-head Amu selfhost ARM64 run
+[`41520888287`](https://github.com/kotoba-lang/kotoba/actions/runs/41520888287)
+passed loaderless rebuild, compiler verification, All12, and the native SQLite
+publication/readback/sidecar step. From the eight-row repeated-upsert fixture,
+Kotoba deleted `repeat-a`, rebuilt both table/index leaves with seven rows,
+published through FS2, reopened the image, and verified both missing and
+preserved values through Kotoba. The native result is recorded in the
+[multi-row deletion receipt](../lib/kotoba.sql/evidence/interior-root-multi-delete-native-linux-arm64-20261103.json).
+
+A separate Python 3.15.0 / SQLite 3.54.1 immutable read-only connection
+reported `integrity_check=ok`, page size 4096, page count 7, and exactly the
+seven expected remaining keys. See the [read-only oracle receipt](../lib/kotoba.sql/evidence/interior-root-multi-delete-readonly-oracle-20261103.json).
+This qualifies one key deletion leaving seven rows on this exact two-leaf
+image. It does not qualify arbitrary multi-row deletion, deeper or arbitrary
+trees, WAL/recovery, standard SQLite locking, crash consistency, Linux x86_64,
+or Itonami integration.
+
 ## Native Linux gate scope (2026-11-03)
 
 Rechecked Kotoba Actions run
