@@ -117,13 +117,39 @@ def write_png(path, width, height, rows):
                            + chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b""))
 
 
+def receive_band(sock, nonce, counter, first, count, seconds):
+    """Reject stale/malformed bands; never fill missing pixels with black."""
+    chunks = {}; geometry = None; until = time.monotonic()+seconds
+    while time.monotonic() < until:
+        try: data, _ = sock.recvfrom(4096)
+        except socket.timeout: continue
+        if len(data) < 34 or data[:8] != b'AIUEBND2': continue
+        _,boot,request,y,chunk,fmt,width,height,valid = struct.unpack_from('<8sQQHBBHHH',data)
+        if (boot,request) != (nonce,counter): continue
+        if not (len(data)==834 and 0<width<=3200 and first+count<=height<=8192 and
+                first<=y<first+count and fmt in (0,1) and chunk<(width+199)//200 and
+                valid==min(200,width-chunk*200)):
+            raise RuntimeError('malformed native screenshot band')
+        if geometry is None: geometry=(width,height,fmt)
+        if geometry != (width,height,fmt): raise RuntimeError('band geometry changed')
+        rgb=bytearray()
+        for at in range(34,34+valid*4,4):
+            a,b,c,_=data[at:at+4];rgb.extend((a,b,c) if fmt==0 else (c,b,a))
+        key=(y,chunk); value=bytes(rgb)
+        if key in chunks and chunks[key] != value: raise RuntimeError('conflicting band duplicate')
+        chunks[key]=value
+        if len(chunks)==count*((width+199)//200):
+            return width,height,b''.join(chunks[y,c] for y in range(first,first+count) for c in range((width+199)//200))
+    raise RuntimeError('incomplete native screenshot band')
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--key", type=Path, required=True, help="32-byte Ed25519 seed file (mode 0600)")
     p.add_argument("--broadcast", default="10.77.0.255")
     p.add_argument("--wait", type=float, default=15.0, help="seconds to wait for the nonce and replies")
     p.add_argument("--nonce", type=lambda value: int(value, 0), help="explicit last-observed boot nonce when periodic discovery is unavailable; stale values are refused by the board")
-    p.add_argument("command", choices=("ping", "reboot", "key", "type", "shot", "update", "install", "usb-select", "bt-probe", "ble-init", "ble-crypto", "ble-scan", "ble-connect", "ble-status", "ble-firmware", "render-stats"))
+    p.add_argument("command", choices=("ping", "reboot", "key", "type", "shot", "update", "install", "usb-select", "bt-probe", "ble-init", "ble-crypto", "ble-scan", "ble-connect", "ble-status", "ble-firmware", "render-stats", "pointer", "console-key"))
     p.add_argument("value", nargs="?")
     args = p.parse_args()
     if args.nonce is not None and not 0 < args.nonce < 1 << 64:
@@ -139,6 +165,28 @@ def main():
     print(f"nonce {nonce:016x}")
     if args.command == "ping":
         send(args, seed, nonce, counter, 1, 0); print(reply(log, {0xC001}, args.wait))
+    elif args.command in ("pointer", "console-key"):
+        if args.value is None:
+            p.error(args.command + " requires an argument")
+        if args.command == "pointer":
+            try:
+                x, y, pressed = (int(v, 0) for v in args.value.split(','))
+            except (ValueError, TypeError):
+                p.error("pointer expects x,y,left-button (0 or 1)")
+            if not (0 <= x < 8192 and 0 <= y < 8192 and pressed in (0, 1)):
+                p.error("pointer outside finite coordinate/button range")
+            command, argument = 18, x | (y << 13) | (pressed << 26)
+        else:
+            try: argument = int(args.value, 0)
+            except ValueError: p.error("console-key expects a scan code")
+            if not 0 < argument < 128: p.error("scan code outside1..127")
+            command = 19
+        send(args, seed, nonce, counter, command, argument)
+        accepted = reply(log, {0xC000+command}, args.wait)
+        if accepted is None or accepted[0] == 0xC0FF or accepted[1] != counter:
+            raise RuntimeError(f"console input not accepted: {accepted}")
+        print(json.dumps(dict(command=args.command, acceptedCounter=counter, argument=argument,
+                              presentationConfirmed=False)))
     elif args.command == "render-stats":
         if args.value is not None:
             p.error("render-stats takes no argument")
