@@ -13,4 +13,4 @@ actual=$("$AMU" run "$here/probe.kotoba")
 sed 's/model-mismatches 16 4 0 0/model-mismatches 16 16 0 0/' "$here/probe.kotoba" > "$work/negative.kotoba"
 negative=$("$AMU" run "$work/negative.kotoba")
 [ "$negative" = 1 ] || { echo "negative control not detected: $negative" >&2; exit 1; }
-printf '%s\n' 'flash probe native model: 20 assertions passed; negative control detected'
+printf '%s\n' 'flash probe native model: 23 assertions passed; negative control detected'

@@ -10,8 +10,7 @@ capacity of either attached SSD. The core is independently designed and does
 not implement the `f3probe` algorithm.
 
 The sample plan uses block 0, powers of two below the reported block count,
-and the final block. A duplicate final block is intentional and must be
-coalesced by the host before any writes. Input is a logical sector count from
+and the final block, omitting it when it duplicates a power of two. Input is a logical sector count from
 2 through 2^62; the list is at most 64 entries. The pure simulator models a
 simple wraparound device and detects some aliases within the chosen samples.
 Other fake controllers, caches, remapping, faults, and capacities can evade the
@@ -33,7 +32,7 @@ for broader evidence; reliability over time needs separate testing.
    cancellation, disconnect, identity/geometry change, timeout or restart
    invalidates it. No write occurs until exclusive access and this choice are
    confirmed. Release exclusive access on every failure.
-3. The host coalesces the plan and writes a complete logical block at each
+3. The host validates the plan and writes a complete logical block at each
    address using independently generated, per-run unpredictable data bound to
    the address. It validates offsets and checked byte-size arithmetic before
    each I/O. It then flushes, closes and reopens the **same** device, verifies
