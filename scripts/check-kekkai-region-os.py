@@ -16,6 +16,7 @@ from pathlib import Path
 import struct
 import subprocess
 import sys
+import time
 from types import SimpleNamespace
 
 ROOT=Path(__file__).resolve().parents[1]
@@ -36,6 +37,14 @@ CHACHA_MUTATIONS={
  'chacha-alias':('(separate input n output capacity)','true'),
  'chacha-early-open':('(mac-end st input input-bytes (- n 16))',
    '(mac-end st input input-bytes (- n 16)) (put st 496 0) (put st 504 (- n 16)) (crypt st input input-bytes output capacity)')}
+X25519_MUTATIONS={
+ 'x25519-clamp':('(kernel-load-u8-4k scalar scalar-len 0) 248)', '(kernel-load-u8-4k scalar scalar-len 0) 255)'),
+ 'x25519-point-mask':('(kernel-load-u8-4k point point-len 31) 127)', '(kernel-load-u8-4k point point-len 31) 63)'),
+ 'x25519-a24':('(* 121665 (x-limb ws ws-len (x-s-ma) i))', '(* 121666 (x-limb ws ws-len (x-s-ma) i))'),
+ 'x25519-swap':('(bit-xor kt swap)', '0'),
+ 'x25519-invert':('(defn- x-inv-bit [t] (if (= t 2) 0 (if (= t 4) 0 1)))', '(defn- x-inv-bit [t] (if (= t 2) 1 (if (= t 4) 0 1)))'),
+ 'x25519-freeze':('(x-freeze-pass ws ws-len slot 0 (+ 19 (* 0 gate)))', '(x-freeze-pass ws ws-len slot 0 (+ 18 (* 0 gate)))'),
+ 'x25519-contributory':('(if (= (x-or-bytes out 32 0 (* 0 emitted)) 0) 0 1)', '(if (= (x-or-bytes out 32 0 (* 0 emitted)) 0) 1 1)')}
 
 def pin(path):
     raw=path.read_bytes();return dict(bytes=len(raw),sha256=hashlib.sha256(raw).hexdigest())
@@ -43,6 +52,42 @@ def pin(path):
 def load(name,path):
     spec=importlib.util.spec_from_file_location(name,path)
     module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module);return module
+
+def x25519_vectors(state):
+    owner=ROOT/'lib/org.ietf.x25519'
+    corpus=owner/'test/wycheproof/x25519_test.json'
+    reference=owner/'tools/reference.py';ref=load('os_x25519_reference',reference)
+    state['vectorCorpus']=pin(corpus);state['reference']=pin(reference)
+    h=bytes.fromhex;nine=bytes([9])+bytes(31)
+    k1=h('a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4')
+    u1=h('e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c')
+    k2=h('4b66e9d4d1b4673c5ad22691957d6af5c11b6421e0ea01d42ca4169e7918ba0d')
+    u2=h('e5210f12786811d3f4b7959d0538ae2c31dbe7106fc03c3efc4cd549c715a493')
+    alice=h('77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a')
+    bob=h('5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb')
+    ap=h('8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a')
+    bp=h('de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f')
+    shared=h('4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742')
+    v1=h('c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552')
+    rows=[(k1,u1,v1),(k2,u2,h('95cbde9476e8907d7aade45cb4b873f88b595a68799fa152e6f8f7647aac7957')),
+          (alice,nine,ap),(bob,nine,bp),(alice,bp,shared),(bob,ap,shared),
+          (nine,nine,h('422c8e7a6227d7bca1350b3e2bb7279f7897b87bb6854b783c60e80311ae3079')),
+          (k1,u1[:31]+bytes([u1[31]|128]),v1),(k1,bytes(32),bytes(32)),
+          (k1,h('e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800'),bytes(32))]
+    tests=json.loads(corpus.read_text())
+    cases=[t for g in tests['testGroups'] for t in g['tests']]
+    if tests['numberOfTests']!=518 or len(cases)!=518 or len({t['tcId'] for t in cases})!=518:
+        raise ValueError('X25519 corpus count/IDs differ')
+    rows.extend((h(t['private']),h(t['public']),h(t['shared'])) for t in cases)
+    blob=bytearray(64+len(rows)*128);blob[:8]=b'X25519G1';struct.pack_into('<I',blob,8,len(rows))
+    for i,(key,point,expected) in enumerate(rows):
+        if not len(key)==len(point)==len(expected)==32 or ref.x25519(key,point)!=expected:
+            raise ValueError('independent X25519 vector disagreement at '+str(i))
+        at=64+i*128;blob[at:at+96]=key+point+expected
+        struct.pack_into('<II',blob,at+96,i,int(expected!=bytes(32)))
+    state['vectorCount']=len(rows);state['wycheproofCases']=len(cases)
+    state['contributoryRefusals']=sum(expected==bytes(32) for _,_,expected in rows)
+    return bytes(blob),b''.join(expected for _,_,expected in rows),struct.pack('<528I',*(int(v!=bytes(32)) for _,_,v in rows))
 
 def check_chacha(words,raw,out,state):
     path=ROOT/'lib/org.ietf.chacha20Poly1305/tools/reference.py'
@@ -75,9 +120,10 @@ def check_chacha(words,raw,out,state):
 
 def main(a):
     out=a.output.resolve();out.mkdir(mode=0o700,parents=True,exist_ok=False)
-    chacha=a.component=='chacha';namespace='chacha20.region-gate' if chacha else 'noise.blake2s-region-gate'
-    slug='chacha20' if chacha else 'blake2s'
-    mutations=CHACHA_MUTATIONS if chacha else MUTATIONS
+    chacha=a.component=='chacha';x25519=a.component=='x25519';dual=chacha or x25519
+    namespace='aiueos.native.x25519-region-gate' if x25519 else ('chacha20.region-gate' if chacha else 'noise.blake2s-region-gate')
+    slug='x25519' if x25519 else ('chacha20' if chacha else 'blake2s')
+    mutations=X25519_MUTATIONS if x25519 else (CHACHA_MUTATIONS if chacha else MUTATIONS)
     if a.mutation and a.mutation not in mutations:raise ValueError('mutation/component differ')
     state=dict(schema='kekkai.os-region-'+slug+'.v1',state='STAGING',mutation=a.mutation,
                calls=[],physicalDeployment=False,appInstallQualified=False,
@@ -128,28 +174,43 @@ def main(a):
             source=source.replace(old,new)
         entry='/os/aiueos/native/kekkai-'+slug+'-region-entry.kotoba'
         (stage/entry.lstrip('/')).write_text(source)
-        core=ROOT/('lib/org.ietf.chacha20Poly1305/kotoba/chacha20/region.kotoba' if chacha else 'lib/kotoba.noise/kotoba/noise/blake2s_region.kotoba')
-        fixture=ROOT/('lib/org.ietf.chacha20Poly1305/tools/region_gate.kotoba' if chacha else 'lib/kotoba.noise/tools/blake2s_region_gate.kotoba')
+        core=ROOT/('lib/kotoba.aiueos/os/aiueos/kotoba/x25519.kotoba' if x25519 else ('lib/org.ietf.chacha20Poly1305/kotoba/chacha20/region.kotoba' if chacha else 'lib/kotoba.noise/kotoba/noise/blake2s_region.kotoba'))
+        fixture=ROOT/('lib/kotoba.aiueos/os/aiueos/native/x25519_region_gate.kotoba' if x25519 else ('lib/org.ietf.chacha20Poly1305/tools/region_gate.kotoba' if chacha else 'lib/kotoba.noise/tools/blake2s_region_gate.kotoba'))
         core_bytes=core.read_bytes();state['ownerSource']=pin(core);state['fixtureSource']=pin(fixture)
         if a.mutation:
             old,new=mutations[a.mutation];text=core_bytes.decode()
             if text.count(old)!=1:raise ValueError('mutation is not unique')
             core_bytes=text.replace(old,new).encode()
-        files=([('chacha20/region.kotoba',core_bytes),('chacha20/region_gate.kotoba',fixture.read_bytes())] if chacha else
-               [('noise/blake2s_region.kotoba',core_bytes),('noise/blake2s_region_gate.kotoba',fixture.read_bytes())])
+        files=([('aiueos/x25519.kotoba',core_bytes),('aiueos/native/x25519_region_gate.kotoba',fixture.read_bytes())] if x25519 else
+              ([('chacha20/region.kotoba',core_bytes),('chacha20/region_gate.kotoba',fixture.read_bytes())] if chacha else
+               [('noise/blake2s_region.kotoba',core_bytes),('noise/blake2s_region_gate.kotoba',fixture.read_bytes())]))
+        owner_root='/x25519-owner' if x25519 else ('/chacha-owner' if chacha else '/noise-owner')
         for virtual,raw in files:
-            target=stage/('chacha-owner' if chacha else 'noise-owner')/virtual;target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(raw)
+            target=stage/owner_root.lstrip('/')/virtual;target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(raw)
         if chacha:
             secondary=ROOT/'lib/kotoba.noise/kotoba/noise/blake2s_region.kotoba';state['secondaryOwnerSource']=pin(secondary)
             target=stage/'noise-owner/noise/blake2s_region.kotoba';target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(secondary.read_bytes())
-            roots.append('/chacha-owner')
-        roots.append('/noise-owner');flags=[v for r in roots for v in ('--source-path',r)]
+            roots.append('/noise-owner')
+        roots.append(owner_root);flags=[v for r in roots for v in ('--source-path',r)]
         payload=a.payload.resolve(strict=True)
         if pin(payload)['sha256']!=a.payload_sha256:raise ValueError('boot payload pin differs')
-        (stage/('boot-font.bin' if chacha else 'boot-payload.bin')).write_bytes(payload.read_bytes())
-        state['bootPayload']=None if chacha else pin(payload)
-        if chacha:
-            state['bootFont']=pin(payload)
+        (stage/('boot-font.bin' if dual else 'boot-payload.bin')).write_bytes(payload.read_bytes())
+        state['bootPayload']=None if dual else pin(payload)
+        if dual:
+            if x25519:
+                blob,expected_x,expected_returns=x25519_vectors(state)
+                # Public diagnostic data goes in the pinned font's unused tail;
+                # its existing header/glyphs/firmware remain byte-identical.
+                font=bytearray(payload.read_bytes());end=393216+len(blob)
+                if len(font)!=524288 or end>len(font) or any(font[393216:end]):
+                    raise ValueError('X25519 diagnostic vector tail is unavailable')
+                font[393216:end]=blob
+                (stage/'boot-font.bin').write_bytes(font)
+                (out/'x25519-vectors.bin').write_bytes(blob)
+                state['vectorData']=pin(out/'x25519-vectors.bin')
+                (out/'expected-x25519.bin').write_bytes(expected_x)
+                (out/'expected-returns.bin').write_bytes(expected_returns)
+            state['bootFont']=pin(stage/'boot-font.bin')
             user=ROOT/'lib/kotoba.aiueos/os/aiueos/native/itonami-local-model-user-v3.kotoba'
             (stage/'boot-user-source.kotoba').write_bytes(user.read_bytes());state['diagnosticUserSource']=pin(user)
             state['userCodeExecuted']=False
@@ -161,7 +222,7 @@ def main(a):
             state['calls'].append(dict(label=label,argv=argv,exit=p.returncode,stdout=p.stdout.decode(errors='replace'),stderr=p.stderr.decode(errors='replace')));save()
             if p.returncode or p.stderr:raise RuntimeError(label+': '+p.stderr.decode(errors='replace')[:1000])
             return p.stdout
-        if chacha:
+        if dual:
             for name in ['boot-user.elf','boot-user.reproduced.elf']:
                 run('compile-'+name,['compile','boot-user-source.kotoba','--target','x86_64-aiueos-user-v5','--output',name])
             if pin(stage/'boot-user.elf')!=pin(stage/'boot-user.reproduced.elf'):raise ValueError('user image reproduction differs')
@@ -181,7 +242,7 @@ def main(a):
         for name in ['KERNEL.ELF','KERNEL.reproduced.ELF']:run('compile-'+name,[*compile_args,'--output',name])
         if (stage/'KERNEL.ELF').read_bytes()!=(stage/'KERNEL.reproduced.ELF').read_bytes():raise ValueError('kernel reproduction differs')
         for name in ['BOOTX64.EFI','BOOTX64.reproduced.EFI']:
-            boot_args=['--font','boot-font.bin','--user-slot','boot-user-slot.bin'] if chacha else ['--payload','boot-payload.bin']
+            boot_args=['--font','boot-font.bin','--user-slot','boot-user-slot.bin'] if dual else ['--payload','boot-payload.bin']
             run('package-'+name,['package-aiueos-boot','KERNEL.ELF','--output',name,*boot_args,'--pci-resources','v1'])
         if (stage/'BOOTX64.EFI').read_bytes()!=(stage/'BOOTX64.reproduced.EFI').read_bytes():raise ValueError('EFI reproduction differs')
         efi=stage/'BOOTX64.EFI';kernel=stage/'KERNEL.ELF'
@@ -201,11 +262,22 @@ def main(a):
         try:
             keys.Boot.__init__(boot,SimpleNamespace(kernel=kernel,efi=efi,media=media,qemu=a.qemu,firmware=a.firmware),out,'region-crypto',None,
                                extra=('-serial','file:serial.log','-debugcon','file:debug.log','-d','int,cpu_reset','-D','qemu-debug.log'),first_frame_seconds=a.first_frame_seconds)
+            if x25519:
+                started=time.monotonic();state['state']='NATIVE_RUNNING';save()
+                while boot.W(79)==1:
+                    if boot.proc.poll() is not None:raise RuntimeError('X25519 guest terminated')
+                    state['completedCases']=boot.W(78);save()
+                    if time.monotonic()-started>a.execution_seconds:raise TimeoutError('X25519 native execution deadline')
+                    time.sleep(2)
             words=struct.unpack('<6I',boot.dump(boot.work+74*4,24))
-            if chacha:
+            if dual:
                 lo,hi=struct.unpack('<2I',boot.dump(boot.work+400,8));address=lo+(hi<<32)
                 if not 0<address<1<<39:raise ValueError('native output region address differs')
-                raw=boot.dump(address+4096,1051*32)
+                if x25519:
+                    raw=boot.dump(address,528*32)
+                    native_returns=boot.dump(address+20000,528*4)
+                    (out/'native-returns.bin').write_bytes(native_returns)
+                else:raw=boot.dump(address+4096,1051*32)
             else:raw=boot.dump(boot.work+keys.native_regions.WINDOW_BYTES,303*32)
         except BaseException:
             if hasattr(boot,'proc') and boot.proc.poll() is None:
@@ -220,6 +292,24 @@ def main(a):
         (out/'native-digests.bin').write_bytes(raw)
         if pin(media)!=media_before:raise ValueError('fixture medium changed during QEMU boot')
         state['mediaUnchanged']=True
+        if x25519:
+            (out/'native-x25519.bin').write_bytes(raw)
+            mismatch=[i for i in range(528) if raw[i*32:i*32+32]!=expected_x[i*32:i*32+32]]
+            returns=[i for i in range(528) if native_returns[i*4:i*4+4]!=expected_returns[i*4:i*4+4]]
+            observed=dict(outputMismatchCases=words[0],returnMismatchCases=words[1],inputMutationCases=words[2],
+                          canaryFailures=words[3],caseCount=words[4],completed=words[5],
+                          independentOutputMismatches=mismatch,independentReturnMismatches=returns)
+            state['observed']=observed;state['artifacts']={n:pin(p) for n,p in [('kernel',kernel),('efi',efi),('media',media),('qemu',a.qemu),('firmware',a.firmware)]}
+            good=words==(0,0,0,0,528,2) and not mismatch and not returns
+            if a.mutation:
+                if words[2:]!=(0,0,528,2):raise AssertionError('X25519 mutant did not complete bounded controls')
+                if good:raise AssertionError('X25519 mutation escaped native controls')
+                state['state']='DETECTED_NATIVE_MUTATION'
+            else:
+                if not good:raise AssertionError('native X25519/control mismatch: '+str(observed))
+                state['state']='PASS_NATIVE_OS_REGION_X25519'
+            state['kernelReproduced']=True;state['efiReproduced']=True;save()
+            print(state['state'],json.dumps({**observed,'independentOutputMismatches':len(mismatch),'independentReturnMismatches':len(returns)}));return
         if chacha:
             observed,good=check_chacha(words,raw,out,state)
             state['observed']=observed;state['artifacts']={n:pin(p) for n,p in [('kernel',kernel),('efi',efi),('media',media),('qemu',a.qemu),('firmware',a.firmware)]}
@@ -260,6 +350,7 @@ if __name__=='__main__':
     for name in ['compiler','packager','amu-source','source-stage','payload','qemu','firmware','output']:p.add_argument('--'+name,type=Path,required=True)
     for name in ['compiler-sha256','packager-sha256','source-lock-sha256','payload-sha256','qemu-sha256','firmware-sha256']:p.add_argument('--'+name,required=True)
     p.add_argument('--first-frame-seconds',type=float,default=240)
-    p.add_argument('--component',choices=['blake2s','chacha'],default='blake2s')
-    p.add_argument('--mutation',choices=[*MUTATIONS,*CHACHA_MUTATIONS])
+    p.add_argument('--component',choices=['blake2s','chacha','x25519'],default='blake2s')
+    p.add_argument('--execution-seconds',type=float,default=3600)
+    p.add_argument('--mutation',choices=[*MUTATIONS,*CHACHA_MUTATIONS,*X25519_MUTATIONS])
     main(p.parse_args())
