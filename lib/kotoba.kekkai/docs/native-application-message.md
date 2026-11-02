@@ -1,5 +1,10 @@
 # Native application request/response data schema — JUN-757
 
+Follow-up: [native256 local request context](native-application-pending.md)
+now composes this schema with actual managed-session binding and native-issued
+IDs. Completed-message/controller, service/socket/endpoint/fresh-consent and
+actual installed Mac/6600H app qualification remain open.
+
 `kekkai.application-message-region/decode` adds the canonical private HTTP
 message shape to the native migration. It is a data decoder, not an installed
 Mac/OS application, HTTP service, socket policy or consent gate.
