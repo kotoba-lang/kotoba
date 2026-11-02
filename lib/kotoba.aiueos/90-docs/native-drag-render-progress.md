@@ -158,8 +158,11 @@ does not qualify all input arrival schedules or continuous input under load.
 
 An additional pause-based busy-paint experiment was invalid: QEMU v10.0.3
 ui/input.c:321–323 discards key events sent while stopped. Its unconsumed
-F5 is not an OS input-loss finding. A corrected running-input control is
-being investigated separately; the native loss claim is withdrawn. See
+F5 is not an OS input-loss finding. The corrected running-input control captures started2/presented1, then
+resumes before sending F5. It consumes exactly one make (count2,lastscan63),
+finishes frame3 and refuses save with-24/generation0 without resending.
+The native loss claim is withdrawn; this one case does not qualify all
+input-under-load schedules. See
 https://github.com/qemu/qemu/blob/v10.0.3/ui/input.c#L321-L323 .
 
 The old material-op comment described rounded solid as kind3; actual
