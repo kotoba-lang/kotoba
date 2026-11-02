@@ -36,6 +36,7 @@
   ;; 177 refused. The verifier uses context bytes 2048..2175 (key, signature,
   ;; message) and the Ed25519 workspace 4096..8191.
   (:require [aiueos.native.rtl8168-debug :as nic]
+            [aiueos.native.render-profile :as profile]
             [aiueos.native.update :as update]
             [aiueos.native.xhci :as usb]
             [aiueos.native.bluetooth-le :as ble]
@@ -43,7 +44,7 @@
             [aiueos.native.bluetooth-hogp :as hogp]
             [aiueos.native.bluetooth-firmware :as firmware]
             [aiueos.ed25519 :as ed])
-  (:export [init poll nonce rx-stats]))
+  (:export [init poll nonce rx-stats run-update pointer-command console-key-command band-valid]))
 
 (defn word [region i]
   (kernel-load-u32 (kernel-subregion region 8192 (* i 4) 4) 4 0))
@@ -60,7 +61,7 @@
 
 ;; The operator's public key (AWAI-119 debug link).
 (defn key-byte [i]
-  (case i 0 239 1 206 2 217 3 201 4 134 5 219 6 133 7 212 8 228 9 222 10 37 11 193 12 33 13 31 14 26 15 57 16 163 17 70 18 216 19 230 20 140 21 129 22 37 23 14 24 196 25 93 26 139 27 173 28 159 29 236 30 158 31 219 0))
+  (bit-and (u64-shift-right (case (quot i 4) 0 3386494703 1 3565542278 2 3240484580 3 958013217 4 3872933539 5 237339020 6 2911591876 7 3684625567 0) (* (mod i 4) 8)) 255))
 (defn magic-byte [i] (case i 0 65 1 73 2 85 3 69 4 67 5 77 6 68 7 49 0))
 
 (defn nonce [ctx] (word64 ctx 172))
@@ -161,11 +162,79 @@
         (nic/log 49521 (usb/result)) (nic/log 49522 (usb/devices))
         (usb-device-report 0) (usb-port-report 1) (usb-hub-report 1) (nic/log 49159 selected) 1)))
 
+;; Update SHA scratch overlaps the sealed-key blob at3072..3711. Preserve
+;; these bytes in stopped xHCI memory0..639; raw seed3712 and dapps3744+
+;; are never touched. Restore BEFORE controller initialization reclaims it.
+(defn update-snapshot [ctx restore i]
+  (if (>= i 640) 1
+    (do (if (= restore 1)
+          (kernel-store-u32 (kernel-subregion ctx 8192 (+ 3072 i) 4) 4 0
+            (kernel-load-u32-16k (kernel-owned-window 0 16384) 16384 i))
+          (kernel-store-u32-16k (kernel-owned-window 0 16384) 16384 i
+            (kernel-load-u32 (kernel-subregion ctx 8192 (+ 3072 i) 4) 4 0)))
+        (update-snapshot ctx restore (+ i 4)))))
+(defn run-update [ctx command]
+  (let [input (= (word ctx 86) 6) slot (if input (usb/diagnostic 6) 0)
+        stopped (if input (if (= (word ctx 87) 0) (usb/quiesce) 0) 1)]
+    (if (= stopped 0) (do (nic/log (+ 49152 command) 51) 0)
+      (do (if input (update-snapshot ctx 0 0) 0)
+          (nic/rx-release)
+          ;; command0 is the trusted component fixture, never admitted by
+          ;; execute/check on the wire. It exercises the same borrow/restore
+          ;; with the public signature/digest self-test and no disk write.
+          (let [result (if (= command 0) (update/self-test ctx)
+                         (if (= command 5) (update/pull ctx) (update/install ctx)))
+                reported (+ (update/report ctx) (if (= command 6) (update/install-report ctx) 0))
+                restored (if input (update-snapshot ctx 1 0) 1)
+                resumed (if input (usb/select-controller slot) 0)]
+            (do (if input (nic/log 49473 resumed) 0)
+                (nic/log (+ 49152 command) (+ result (* 0 (+ reported restored))))
+                (if input 1 0)))))))
+
 ;; Returns0, 1 after USB selection, or256 + a keyboard make code.
 ;; An unknown command is refused with reason 6 + 256 * command.
+(defn render-report [ctx counter i]
+  ;; c380..c397 are numeric renderer counters only, outside USB inventory.
+  (if (>= i 24) (do (nic/log 49169 counter) 0)
+    (let [v (if (= i 0) (word ctx 110)
+              (if (<= i 8) (profile/read64 (+ 90 (* i 2)))
+                (if (>= i 16) (profile/read64 (+ 112 (* (- i 16) 2)))
+                  (profile/value (case i 9 108 10 109 11 110 12 78 13 79 14 111 15 80 0)))))]
+      (do (nic/log (+ 50048 i) v) (render-report ctx counter (+ i 1))))))
+
+;; Remote console ingress uses the same signature/nonce/counter gate. It
+;; carries pixels/keys, never a capability approval. Motion/release can cross
+;; a modal surface; presses and keys other than Deny/Escape cannot answer it.
+(defn pointer-command [ctx argument counter geom]
+  (let [x (bit-and argument 8191) y (bit-and (u64-shift-right argument 13) 8191)
+        pressed (bit-and (u64-shift-right argument 26) 1)]
+    (if (or (< argument 0) (>= argument 134217728) (>= x (bit-and geom 65535))
+            (>= y (bit-and (u64-shift-right geom 16) 65535))) (refuse ctx 8)
+      (if (and (> (word ctx 87) 0) (= pressed 1)) (refuse ctx 9)
+        (do (nic/log 49170 counter) (+ 512 argument))))))
+(defn console-key-command [ctx argument counter]
+  (if (or (<= argument 0) (>= argument 128)) (refuse ctx 8)
+    (if (and (> (word ctx 87) 0) (not (= argument 1)) (not (= argument 49))) (refuse ctx 9)
+      (do (nic/log 49171 counter) (+ 256 argument)))))
+
+(defn band-valid [argument geom] :bool
+  (let [first (bit-and argument 65535) count (u64-shift-right argument 16)
+        width (bit-and geom 65535) height (bit-and (u64-shift-right geom 16) 65535)]
+    (and (>= argument 0) (> count 0) (<= count 32) (> width 0) (<= width 3200)
+         (<= (+ first count) height))))
+(defn band-command [ctx argument counter geom]
+  (if (not (band-valid argument geom)) (refuse ctx 8)
+    (let [sent (nic/band geom argument (word64 ctx 172) counter)
+          expected (* (quot (+ (bit-and geom 65535) 199) 200) (u64-shift-right argument 16))]
+      (if (= sent expected) (do (nic/log 49172 counter) 0) (refuse ctx 10)))))
+
 (defn execute [ctx command argument counter geom]
   (do (put-word64 ctx 174 counter)
       (put-word ctx 176 (+ (word ctx 176) 1))
+      (if (= command 18) (pointer-command ctx argument counter geom)
+      (if (= command 19) (console-key-command ctx argument counter)
+      (if (= command 20) (band-command ctx argument counter geom)
+      (if (= command 17) (render-report ctx counter 0)
       (if (= command 1) (do (nic/log 49153 counter) 0)
         (if (= command 2)
           (do (nic/log 49154 counter)
@@ -179,16 +248,8 @@
                                    (bit-and (u64-shift-right geom 32) 65535)
                                    (bit-and (u64-shift-right geom 48) 255))]
                 (do (nic/log 49156 sent) 0))
-              (if (and (= command 5) (not (= (word ctx 86) 6)))
-                (let [released (nic/rx-release)
-                      pulled (update/pull ctx)
-                      reported (update/report ctx)]
-                  (do (nic/log 49157 (+ pulled (* 0 (+ released reported)))) 0))
-                (if (and (= command 6) (not (= (word ctx 86) 6)))
-                  (let [released (nic/rx-release)
-                        installed (update/install ctx)
-                        reported (+ (update/report ctx) (update/install-report ctx))]
-                    (do (nic/log 49158 (+ installed (* 0 (+ released reported)))) 0))
+              (if (= command 5) (run-update ctx command)
+                (if (= command 6) (run-update ctx command)
                   (if (and (= command 7) (= (word ctx 86) 6))
                     (select-usb ctx argument)
                     (if (and (= command 8) (= (word ctx 86) 6))
@@ -204,7 +265,7 @@
                           (let [result (firmware/load)]
                             (do (nic/log 49648 (firmware/diagnostic 0)) (nic/log 49649 (firmware/diagnostic 1))
                                 (ble-report 0) (nic/log 49168 result) 1))
-                        (refuse ctx (+ 6 (* 256 (bit-and command 65535))))))))))))))))))
+                        (refuse ctx (+ 6 (* 256 (bit-and command 65535))))))))))))))))))))))
 
 (defn check [ctx geom]
   (if (= (magic-ok 0) 0) (refuse ctx 2)

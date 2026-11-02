@@ -84,7 +84,8 @@ def main(a):
         events.append(dict(name=label, before=old, after=new, outsideCursorUnchanged=True,
                            exactRoundtrip=True, forcedFullRasterEqual=True if full_control else None))
     try:
-        b=keys.Boot(a,out,'cursor',None,['-machine','q35,accel=tcg,i8042=off','-cpu','max,phys-bits=37',
+        b=keys.Boot.__new__(keys.Boot)
+        keys.Boot.__init__(b,a,out,'cursor',None,['-machine','q35,accel=tcg,i8042=off','-cpu','max,phys-bits=37',
                     '-device','qemu-xhci,id=usb','-device','usb-kbd,bus=usb.0,port=1',
                     '-device','usb-mouse,bus=usb.0,port=2'],first_frame_seconds=600)
         assert b.W(138)==15
@@ -145,7 +146,7 @@ def main(a):
                     (out/'failure-state.json').write_text(json.dumps(state(),indent=2)+'\n')
                     screen('failure')
                 except Exception: pass
-            b.quit()
+            if hasattr(b, 'proc'): b.quit()
         (out/'receipt.json').write_text(json.dumps(dict(status=status, events=events,
             artifacts={n:pin(getattr(a,n)) for n in ('media','efi','kernel','font','qemu','firmware')},
             observer=pin(Path(__file__)), helper=pin(HERE/'check-native-keystore-qemu.py'),

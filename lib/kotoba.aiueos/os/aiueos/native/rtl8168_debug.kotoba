@@ -23,7 +23,7 @@
   ;; (native/remote_cmd.kotoba decides what a received frame may do), and
   ;; `shot`, which sends the framebuffer to UDP 7797 in 200-pixel chunks.
   (:require [capability.dma.map :as dma])
-  (:export [start log rx-length rx-byte rx-release send-frame link-info shot put-payload send rx-descriptor]))
+  (:export [start log rx-length rx-byte rx-release send-frame link-info shot band shot-pixels put-payload send rx-descriptor]))
 
 (defn pci-address [bus offset]
   (bit-or 2147483648 (bit-or (* bus 65536) (bit-and offset 252))))
@@ -66,10 +66,10 @@
     (do (kernel-store-u8-4k page 4096 offset 0)
         (zero-bytes page (+ offset 1) (- remaining 1)))))
 
-(defn store-le64 [page offset value]
-  (do (kernel-store-u32-4k page 4096 offset (bit-and value 4294967295))
-      (kernel-store-u32-4k page 4096 (+ offset 4) (quot value 4294967296))
-      1))
+(defn store-le64 [page offset value i]
+  (if (>= i 8) 1
+    (do (kernel-store-u8-4k page 4096 (+ offset i) (bit-and (u64-shift-right value (* i 8)) 255))
+        (store-le64 page offset value (+ i 1)))))
 
 ;; The firmware's ExitBootServices shutdown may leave the function in a PCI
 ;; power-management low state, where register reads return all-ones. Walk
@@ -114,7 +114,7 @@
 (defn rx-ready-word [] (+ 3221225472 1536))
 (defn arm-rx [mmio rx buf]
   (do (zero-bytes rx 0 16)
-      (store-le64 rx 8 buf)
+      (store-le64 rx 8 buf 0)
       (kernel-store-u32-4k rx 4096 0 (rx-ready-word))
       (dma/release-fence)
       (kernel-store-u8 mmio 512 80 192)
@@ -216,7 +216,7 @@
           (put-be16 frame 36 port)
           (put-be16 frame 38 (+ 8 length))
           (if (< (+ 42 length) 60) (zero-bytes frame (+ 42 length) (- 60 (+ 42 length))) 1)
-          (store-le64 tx 8 frame)
+          (store-le64 tx 8 frame 0)
           (kernel-store-u32-4k tx 4096 4 0)
           (dma/release-fence)
           (kernel-store-u32-4k tx 4096 0 (dma/tx-command wire))
@@ -296,30 +296,33 @@
 ;; format(1) width(2, LE), then 200 framebuffer pixels (4 bytes each, as the
 ;; GOP stores them) from x = 200 * chunk. Returns the datagrams sent.
 (defn shot-magic [i] (case i 0 65 1 73 2 85 3 69 4 83 5 72 6 79 7 84 0))
-(defn shot-pixels [frame stride y x0 i]
+(defn shot-pixels [frame geom y x0 i]
   (if (>= i 200) 1
-    (let [offset (* (+ (* y stride) (+ x0 i)) 4)
-          page (kernel-framebuffer-page (quot offset 4096))]
-      (do (kernel-store-u32-4k frame 4096 (+ 56 (* 4 i))
-                               (kernel-load-u32-4k page 4096 (mod offset 4096)))
-          (shot-pixels frame stride y x0 (+ i 1))))))
+    (let [offset (* (+ (* y (bit-and (u64-shift-right geom 32) 65535)) (+ x0 i)) 4)
+          pixel (if (>= (+ x0 i) (bit-and geom 65535)) 0
+                    (kernel-load-u32-4k (kernel-framebuffer-page (quot offset 4096)) 4096 (mod offset 4096)))]
+      (do (kernel-store-u32-4k frame 4096 (+ (if (= (u64-shift-right geom 56) 1) 76 56) (* 4 i)) pixel)
+          (shot-pixels frame geom y x0 (+ i 1))))))
 ;; geom packs width (bits 0..15), height (16..31), stride (32..47) and the
 ;; GOP pixel format (48..55), to keep each call within five parameters.
-(defn store-shot-magic [frame i]
+(defn store-shot-magic [frame geom i]
   (if (>= i 8) 1
-    (do (kernel-store-u8-4k frame 4096 (+ 42 i) (shot-magic i))
-        (store-shot-magic frame (+ i 1)))))
+    (do (kernel-store-u8-4k frame 4096 (+ 42 i)
+          (if (= (u64-shift-right geom 56) 1) (case i 0 65 1 73 2 85 3 69 4 66 5 78 6 68 7 50 0) (shot-magic i)))
+        (store-shot-magic frame geom (+ i 1)))))
 (defn shot-chunk [mmio frame geom y chunk]
-  (let [width (bit-and geom 65535)]
-    (do (store-shot-magic frame 0)
-        (kernel-store-u8-4k frame 4096 50 (bit-and y 255))
-        (kernel-store-u8-4k frame 4096 51 (quot y 256))
-        (kernel-store-u8-4k frame 4096 52 chunk)
-        (kernel-store-u8-4k frame 4096 53 (bit-and (u64-shift-right geom 48) 255))
-        (kernel-store-u8-4k frame 4096 54 (bit-and width 255))
-        (kernel-store-u8-4k frame 4096 55 (quot width 256))
-        (shot-pixels frame (bit-and (u64-shift-right geom 32) 65535) y (* 200 chunk) 0)
-        (send-frame mmio 814 7797))))
+  (let [width (bit-and geom 65535) band (= (u64-shift-right geom 56) 1) base (if band 66 50)]
+    (do (store-shot-magic frame geom 0)
+        (kernel-store-u8-4k frame 4096 base (bit-and y 255))
+        (kernel-store-u8-4k frame 4096 (+ base 1) (quot y 256))
+        (kernel-store-u8-4k frame 4096 (+ base 2) chunk)
+        (kernel-store-u8-4k frame 4096 (+ base 3) (bit-and (u64-shift-right geom 48) 255))
+        (kernel-store-u8-4k frame 4096 (+ base 4) (bit-and width 255))
+        (kernel-store-u8-4k frame 4096 (+ base 5) (quot width 256))
+        (if band (do (kernel-store-u8-4k frame 4096 74 (bit-and (min 200 (- width (* 200 chunk))) 255))
+                     (kernel-store-u8-4k frame 4096 75 0)) 0)
+        (shot-pixels frame geom y (* 200 chunk) 0)
+        (send-frame mmio (if band 834 814) 7797))))
 ;; pos = 16 * row + chunk
 (defn shot-rows [mmio frame geom pos sent]
   (let [y (quot pos 16) chunk (mod pos 16)]
@@ -332,3 +335,18 @@
     (if (= info 0) 0
       (shot-rows (kernel-pci-mmio (info-bus info) 0 0 (info-address info) 512) (kernel-subregion (kernel-owned-window 10 16384) 16384 4096 4096)
                  (+ width (+ (* height 65536) (+ (* stride 4294967296) (* format 281474976710656)))) 0 0))))
+
+;; Bounded readback: AIUEBND2 + boot nonce/u64 + request counter/u64 +
+;; row/u16, chunk/u8, format/u8, width/u16, height/u16, valid pixels/u16.
+;; At most32 rows; remote-cmd validates the geometry before entering here.
+(defn band [geom rows nonce counter]
+  (let [info (link-info) first (bit-and rows 65535) count (u64-shift-right rows 16)
+        frame (kernel-subregion (kernel-owned-window 10 16384) 16384 4096 4096)]
+    ;; Identity is byte-stored before the NIC branch, so a NIC-less native
+    ;; component can execute the exact encoder without sending a datagram.
+    (do (store-le64 frame 50 nonce 0) (store-le64 frame 58 counter 0)
+        (kernel-store-u8-4k frame 4096 72 (bit-and (u64-shift-right geom 16) 255))
+        (kernel-store-u8-4k frame 4096 73 (bit-and (u64-shift-right geom 24) 255))
+        (if (= info 0) 0
+          (shot-rows (kernel-pci-mmio (info-bus info) 0 0 (info-address info) 512) frame
+            (+ (bit-and geom 72057589743026175) (* (+ first count) 65536) 72057594037927936) (* first 16) 0)))))
