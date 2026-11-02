@@ -31,10 +31,10 @@ def fix_checksum(buf):
     checksum = sum(buf[:512])
     buf[148:156] = ('%06o\0 ' % checksum).encode('ascii')
 
-def multi_archive():
+def multi_archive(duplicate=False):
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode='w', format=tarfile.USTAR_FORMAT) as tar:
-        for name, data in [('one', b'a'), ('two', b'bc')]:
+        for name, data in [('one', b'a'), ('one' if duplicate else 'two', b'bc')]:
             entry = tarfile.TarInfo(name)
             entry.size = len(data)
             tar.addfile(entry, io.BytesIO(data))
@@ -62,6 +62,7 @@ cases = {
     'directory': archive('bin/', tarfile.DIRTYPE, b''),
     'prefix': archive('a' * 90 + '/' + 'b' * 40),
     'multi': multi_archive(),
+    'duplicate': multi_archive(duplicate=True),
     'absolute': archive('/etc/passwd'),
     'traversal': archive('bin/../escape'),
     'whiteout': archive('bin/.wh.removed'),
