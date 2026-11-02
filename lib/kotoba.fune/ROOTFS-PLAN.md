@@ -261,3 +261,22 @@ and a corrupted layer refused. Generate the fixtures with
 `test/fune/stage_process_layouts.py OUTPUT` and supply its printed digests to
 `test/fune/layout_process_gate.kotoba`. These tests do not establish source-
 locked project linking, x86 behavior or execution of an OCI workload.
+
+`fune.layout-stream/emit-runnable-layout-hex` is a separate candidate from the
+ordinary extraction stream. It reads digest-bound config before streaming and
+checks it against the same final plan whose held snapshots supplied the worker
+commands. It emits final modes and the terminal `C` only after that check. If
+the process check fails, earlier file commands may already have reached the
+worker; the supervisor must close/discard that worker and never publish its
+partial tree. The existing extraction-only stream continues to support data
+images. This route checks an entrypoint but does not deliver argv/environment or
+start a workload; it is not an execution authorization.
+
+On ARM64, the candidate worker and supervisor accepted the executable fixture
+and refused no-execute, missing executable, missing cwd, final-layer mode
+removal and corrupted-layer fixtures. The worker discarded partial streams
+without `D`; the corrupt layer emitted no bytes. A separately built producer
+mutant with the process check removed incorrectly succeeded on the no-execute
+fixture. The existing extraction-only stream still passed the data-image
+readback. These are source-composed local observations, not x86, production
+isolation, source-locked linking or release qualification.
