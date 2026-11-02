@@ -398,3 +398,25 @@ updated receipt is
 [`index-interior decoder receipt`](../lib/kotoba.sql/evidence/index-interior-decoder-native-linux-arm64-20261102.json).
 This still does not traverse an index tree or prove database-level ordering;
 the positive payload here is only a page-codec vector.
+
+## Kotoba-built table/index interior-root image (2026-11-02)
+
+A new source-pinned Amu selfhost Linux ARM64 fixture composes a seven-page
+SQLite database through Kotoba: the table and composite primary-key index each
+have an interior root, and their child leaves hold two rows/keys. Kotoba
+publishes the image through FS2, reopens it, and reads both values through its
+table reader. The current upsert path returns its fail-closed empty refusal
+for this unsupported interior-root shape. A separate Python 3.15.0 / SQLite
+3.54.1 read-only immutable oracle reports `integrity_check=ok`, page_count 7,
+both expected rows, and the composite primary-key autoindex. Native and oracle
+receipts are
+[`native interior-root gate`](../lib/kotoba.sql/evidence/interior-root-native-linux-arm64-20261102.json)
+and [`interior-root readback`](../lib/kotoba.sql/evidence/interior-root-readonly-oracle-20261102.json).
+
+Two initial oracle runs caught fixture construction errors (a duplicated
+promoted index separator and an incorrect rowid serial type); the corrected
+image passes independent integrity check. This verifies Kotoba's page
+construction and table reading for this two-leaf image. It is not evidence of
+general dynamic splitting or index traversal, and existing interior-root
+mutation remains unsupported. WAL/recovery, concurrent SQLite locking,
+crash recovery, Linux x86_64, and Itonami wiring remain open.

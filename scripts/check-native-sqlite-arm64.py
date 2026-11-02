@@ -31,6 +31,7 @@ FIXTURES = (
     ("sqlite.notepad-existing-file-mutation", PACKAGE / "test/native/notepad-existing-file-mutation.kotoba"),
     ("sqlite.notepad-unsupported-schema-refusal", PACKAGE / "test/native/notepad-unsupported-schema-refusal.kotoba"),
     ("sqlite.interior-page-encoder", PACKAGE / "test/native/interior-page-encoder.kotoba"),
+    ("sqlite.interior-root-image", PACKAGE / "test/native/interior-root-image.kotoba"),
 )
 LEGACY_FIXTURE = PACKAGE / "test/fixtures/legacy-cron-notepad-20261102.sqlite"
 UNSUPPORTED_SCHEMA_FIXTURE = PACKAGE / "test/fixtures/unsupported-cron-notepad-20261102.sqlite"
@@ -152,6 +153,13 @@ def main(amu, compiler, out, amu_pin=None):
     run("sqlite-interior-page-encoder-positive-and-refusal",
         [interior_encoder], out, guest_env, calls, timeout=300)
 
+    interior_root = out / receipts[5]["image"]
+    interior_root_path = out / "data/interior-root.db"
+    run("sqlite-interior-root-image-fs2-write-read-and-refusal",
+        [interior_root, "data/interior-root.db"], out, guest_env, calls, timeout=300)
+    if not interior_root_path.is_file() or interior_root_path.stat().st_size != 7 * 4096:
+        raise RuntimeError("Kotoba did not publish the expected seven-page interior-root SQLite image")
+
     receipt = {
         "schema": "kotoba.sqlite.native-linux-arm64.v1",
         "platform": [platform.system(), platform.machine()],
@@ -185,8 +193,14 @@ def main(amu, compiler, out, amu_pin=None):
             "fixture": "sqlite.interior-page-encoder",
             "result": "Kotoba encoded and decoded bounded table/index interior pages and refused invalid child/page inputs",
         },
+        "interiorRootImage": {
+            "fixture": "sqlite.interior-root-image",
+            "databaseSha256": sha(interior_root_path),
+            "databaseBytes": interior_root_path.stat().st_size,
+            "result": "Kotoba constructed and FS2-published a seven-page SQLite image with table/index interior roots, reopened it, read both rows, and returned an empty refusal for upsert on the unsupported root shape",
+        },
         "sidecarRefusals": sidecar_cases,
-        "result": "Kotoba positive upsert/readback, pre-existing WAL/SHM/rollback-journal refusals, existing SQLite mutation/reopen including rowid 128+, unsupported-schema refusal/preservation, and interior-page encoder controls passed",
+        "result": "Kotoba positive upsert/readback, pre-existing WAL/SHM/rollback-journal refusals, existing SQLite mutation/reopen including rowid 128+, unsupported-schema refusal/preservation, interior-page encoder controls, and interior-root image write/read/refusal passed",
         "hostSqliteOracle": False,
     }
     (out / "native-sqlite-arm64.json").write_text(json.dumps(receipt, indent=2) + "\n")
