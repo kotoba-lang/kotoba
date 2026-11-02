@@ -68,6 +68,14 @@ for name,build in [('bunsho',bunsho),('hyokeisan',hyokeisan),('zuhyo',zuhyo)]:
   original_idx=index_of(legacy_view,'backup-original')
   if gate.run('bunsho-original-action',parser,args=[legacy_view,'current',str(original_idx),'click','']).stdout!=b'host|click|backup-original|\n':raise ValueError('original action route')
   if gate.run('bunsho-original-extract',image,args=['legacy-original',imported]).stdout.decode()!=original+'\n':raise ValueError('original bytes changed')
+ if name=='hyokeisan':
+  title='旧表';metadata='[{"sheetId":0,"title":"A"}]';grid='{"A":[["雪"]]}\n'
+  imported=gate.run('hyokeisan-original-import',image,args=['legacy',title,metadata,grid]).stdout.decode().removesuffix('\n')
+  legacy_view=gate.run('hyokeisan-original-view',image,args=['view',imported]).stdout.decode()
+  for part,value in [('title',title),('sheets',metadata),('grid',grid)]:
+   key='backup-legacy-'+part;idx=index_of(legacy_view,key)
+   if gate.run('hyokeisan-original-action-'+part,parser,args=[legacy_view,'current',str(idx),'click','']).stdout!=('host|click|'+key+'|\n').encode():raise ValueError(key+' action')
+   if gate.run('hyokeisan-original-extract-'+part,image,args=['legacy-source',imported,part]).stdout.decode()!=value+'\n':raise ValueError(part+' bytes changed')
  report[name]={'sourceSha256':sha(source),'wasmSha256':sha(wasm),'viewSha256':sha(wire.encode()),'nodes':int(count),'root':tag,
                'editedViewSha256':sha(updated.encode()),'editedNodes':int(parsed.split(':')[0])}
 def frame(x):return str(len(x.encode()))+':'+x
@@ -81,7 +89,7 @@ for label,idx,kind,value in [('negative','-1','input','x'),('past-end','2','inpu
  if gate.run('action-reject-'+label,parser,expected=3,args=[positive,'action',idx,kind,value]).stdout:raise ValueError(label+' output')
 button='BV2|'+node('button',typ='button',key='add',text='追加')+'\n'
 if gate.run('button-action',parser,args=[button,'action','0','click','']).stdout != b'app|click|add|\n':raise ValueError('button event')
-for key in ['backup-import','backup-export','backup-restore','backup-original','workbook-upgrade']:
+for key in ['backup-import','backup-export','backup-restore','backup-original','backup-legacy-pull','backup-legacy-title','backup-legacy-sheets','backup-legacy-grid','workbook-upgrade']:
  wire='BV2|'+node('button',typ='button',key=key,text='操作')+'\n'
  if gate.run('host-action-'+key,parser,args=[wire,'action','0','click','']).stdout != ('host|click|'+key+'|\n').encode():raise ValueError('host action route '+key)
 
