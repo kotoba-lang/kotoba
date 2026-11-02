@@ -61,6 +61,13 @@ for name,build in [('bunsho',bunsho),('hyokeisan',hyokeisan),('zuhyo',zuhyo)]:
   route,kind,target,value=click.removesuffix('\n').split('|',3)
   toggled=gate.run(name+'-button-step',image,args=['step',init,target,kind,value]).stdout.decode().removesuffix('\n')
   if toggled==init:raise ValueError((name,'button did not change state'))
+ if name=='bunsho':
+  original=json.dumps({'found':True,'document':{'documentId':'d1','title':'旧','revisionId':'r1','body':[{'elementId':'b1','kind':'paragraph','text':'元😀'}]}},ensure_ascii=False)+'\n'
+  imported=gate.run('bunsho-original-import',image,args=['legacy-import',original]).stdout.decode().removesuffix('\n')
+  legacy_view=gate.run('bunsho-original-view',image,args=['view',imported]).stdout.decode()
+  original_idx=index_of(legacy_view,'backup-original')
+  if gate.run('bunsho-original-action',parser,args=[legacy_view,'current',str(original_idx),'click','']).stdout!=b'host|click|backup-original|\n':raise ValueError('original action route')
+  if gate.run('bunsho-original-extract',image,args=['legacy-original',imported]).stdout.decode()!=original+'\n':raise ValueError('original bytes changed')
  report[name]={'sourceSha256':sha(source),'wasmSha256':sha(wasm),'viewSha256':sha(wire.encode()),'nodes':int(count),'root':tag,
                'editedViewSha256':sha(updated.encode()),'editedNodes':int(parsed.split(':')[0])}
 def frame(x):return str(len(x.encode()))+':'+x
@@ -74,7 +81,7 @@ for label,idx,kind,value in [('negative','-1','input','x'),('past-end','2','inpu
  if gate.run('action-reject-'+label,parser,expected=3,args=[positive,'action',idx,kind,value]).stdout:raise ValueError(label+' output')
 button='BV2|'+node('button',typ='button',key='add',text='追加')+'\n'
 if gate.run('button-action',parser,args=[button,'action','0','click','']).stdout != b'app|click|add|\n':raise ValueError('button event')
-for key in ['backup-import','backup-export','backup-restore','workbook-upgrade']:
+for key in ['backup-import','backup-export','backup-restore','backup-original','workbook-upgrade']:
  wire='BV2|'+node('button',typ='button',key=key,text='操作')+'\n'
  if gate.run('host-action-'+key,parser,args=[wire,'action','0','click','']).stdout != ('host|click|'+key+'|\n').encode():raise ValueError('host action route '+key)
 
