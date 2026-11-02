@@ -265,12 +265,13 @@ locked project linking, x86 behavior or execution of an OCI workload.
 `fune.layout-stream/emit-runnable-layout-hex` is a separate candidate from the
 ordinary extraction stream. It reads digest-bound config before streaming and
 checks it against the same final plan whose held snapshots supplied the worker
-commands. It emits final modes and the terminal `C` only after that check. If
+commands. It emits final modes and the terminal `T` process-spec frame only
+after that check. If
 the process check fails, earlier file commands may already have reached the
 worker; the supervisor must close/discard that worker and never publish its
 partial tree. The existing extraction-only stream continues to support data
-images. This route checks an entrypoint but does not deliver argv/environment or
-start a workload; it is not an execution authorization.
+images. This route sends bounded argv/environment and cwd metadata to the
+matching draft worker; it does not start a workload or authorize execution.
 
 On ARM64, the candidate worker and supervisor accepted the executable fixture
 and refused no-execute, missing executable, missing cwd, final-layer mode
@@ -298,7 +299,16 @@ encoded byte fixtures for Entrypoint+Cmd, empty arguments, non-ASCII environment
 values, Cmd fallback and default cwd. It exercised 256 argv and 128 environment
 entries, rejected an over-limit array, bad environment, non-executable path and
 a digest-tampered config. Separately compiled controls that dropped Cmd or
-bypassed process/config verification failed the gate. This mutable value is not
-passed to the worker and is not an execution grant; its eventual transport,
-parser, integrity binding, UID/GID and isolation remain open. No x86 or
-source-locked project-link qualification is implied.
+bypassed process/config verification failed the gate. The runnable stream now
+sends this value in its terminal `T` frame; a source-pinned ARM64 worker staged
+and returned matching bytes for independent UTF-8/empty-argument and 9 KiB
+fixtures, and rejected malformed frames. The worker only checks bounded framing,
+absolute paths and NULs; it does not establish complete config validity or
+authorize execution. Authenticated handoff, UID/GID, interpreter resolution and
+isolation remain open. x86 and source-locked project linking remain unqualified.
+
+The normalized default cwd counts toward the 65,536-byte spec payload
+bound: native boundary cases accepted 65,536 and refused 65,537 bytes, and a
+control removing that bound failed. A debug-built worker mutant that skipped
+framing validation incorrectly accepted invalid spec magic; the source-pinned
+worker and supervisor refused it.

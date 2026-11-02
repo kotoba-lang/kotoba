@@ -37,9 +37,9 @@ def stage(root, layers, command, cwd):
         return "sha256:" + digest
 
     layer_values = [(blob(data), len(data)) for data in layers]
+    process = command if isinstance(command, dict) else {"Entrypoint": [command], "Cmd": [], "Env": [], "WorkingDir": cwd}
     cfg = encode({"architecture": "arm64", "os": "linux",
-                  "rootfs": {"type": "layers", "diff_ids": [d for d, _ in layer_values]},
-                  "config": {"Entrypoint": [command], "Cmd": [], "Env": [], "WorkingDir": cwd}})
+                  "rootfs": {"type": "layers", "diff_ids": [d for d, _ in layer_values]}, "config": process})
     config_digest = blob(cfg)
     m = encode({"schemaVersion": 2, "mediaType": "application/vnd.oci.image.manifest.v1+json",
                 "config": {"mediaType": "application/vnd.oci.image.config.v1+json", "digest": config_digest, "size": len(cfg)},
@@ -58,6 +58,10 @@ def main(output):
              "noexec": ([tar([base[0], ("bin/run", 0o644, False)])], "/bin/run", "/bin"),
              "missing": ([tar(base)], "/bin/missing", "/bin"),
              "badcwd": ([tar(base)], "/bin/run", "/missing"),
+             "args": ([tar(base)], {"Entrypoint": ["/bin/run", "--x"], "Cmd": ["", "y"],
+                                      "Env": ["A=1", "Z=雪"], "WorkingDir": "/bin"}, "/bin"),
+             "args-big": ([tar(base)], {"Entrypoint": ["/bin/run", "x" * 9000], "Cmd": [],
+                                          "Env": [], "WorkingDir": "/"}, "/"),
              "replaced": ([tar(base), tar([("bin/run", 0o644, False)])], "/bin/run", "/bin")}
     digests = {name: stage(output / name, *args) for name, args in cases.items()}
     shutil.copytree(output / "good", output / "corrupt")
