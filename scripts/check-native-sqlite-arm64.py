@@ -156,7 +156,8 @@ def main(amu, compiler, out, amu_pin=None):
     interior_root = out / receipts[5]["image"]
     interior_root_path = out / "data/interior-root.db"
     run("sqlite-interior-root-image-fs2-write-read-and-refusal",
-        [interior_root, "data/interior-root.db", "data/interior-root-split.db"],
+        [interior_root, "data/interior-root.db", "data/interior-root-split.db",
+         "data/interior-root-repeat.db"],
         out, guest_env, calls, timeout=300)
     if not interior_root_path.is_file() or interior_root_path.stat().st_size != 7 * 4096:
         raise RuntimeError("Kotoba did not publish the expected seven-page interior-root SQLite image")
@@ -164,6 +165,9 @@ def main(amu, compiler, out, amu_pin=None):
     interior_split_path = out / "data/interior-root-split.db"
     if not interior_split_path.is_file() or interior_split_path.stat().st_size != 7 * 4096:
         raise RuntimeError("Kotoba did not publish the split-upsert interior-root SQLite image")
+    interior_repeat_path = out / "data/interior-root-repeat.db"
+    if not interior_repeat_path.is_file() or interior_repeat_path.stat().st_size != 7 * 4096:
+        raise RuntimeError("Kotoba did not publish the repeated interior-root SQLite image")
 
     receipt = {
         "schema": "kotoba.sqlite.native-linux-arm64.v1",
@@ -209,10 +213,17 @@ def main(amu, compiler, out, amu_pin=None):
             "image": receipts[5]["image"],
             "databaseSha256": sha(interior_split_path),
             "databaseBytes": interior_split_path.stat().st_size,
-            "result": "Kotoba appended rows to a single-leaf image until full, split table/index roots into two leaves on a subsequent upsert, published via FS2, reopened/read a value, and refused a follow-up upsert",
+            "result": "Kotoba appended rows to a single-leaf image until full, split table/index roots into two leaves, published via FS2, reopened/read a value, then accepted two more bounded upserts against the exact two-leaf roots before refusing the next capacity-exceeding upsert",
+        },
+        "interiorRootRepeatUpsert": {
+            "fixture": "sqlite.interior-root-image",
+            "image": receipts[5]["image"],
+            "databaseSha256": sha(interior_repeat_path),
+            "databaseBytes": interior_repeat_path.stat().st_size,
+            "result": "Kotoba published the repeated-upsert two-leaf SQLite image through FS2 and reopened/read both inserted values through Kotoba",
         },
         "sidecarRefusals": sidecar_cases,
-        "result": "Kotoba positive upsert/readback, pre-existing WAL/SHM/rollback-journal refusals, existing SQLite mutation/reopen including rowid 128+, unsupported-schema refusal/preservation, interior-page encoder controls, interior-root image write/read/refusal, and single-leaf full-root split upsert passed",
+        "result": "Kotoba positive upsert/readback, pre-existing WAL/SHM/rollback-journal refusals, existing SQLite mutation/reopen including rowid 128+, unsupported-schema refusal/preservation, interior-page encoder controls, interior-root image write/read, first root split, repeated two-leaf interior-root upserts, and capacity refusal passed",
         "hostSqliteOracle": False,
     }
     (out / "native-sqlite-arm64.json").write_text(json.dumps(receipt, indent=2) + "\n")
