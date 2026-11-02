@@ -4,6 +4,8 @@ import argparse
 import concurrent.futures
 import importlib.util
 import re
+import signal
+import time
 import subprocess
 from pathlib import Path
 
@@ -82,5 +84,50 @@ for stage,needle,replacement,expected_state in [
  run('fault-init-'+stage, 'init', directory)
  gate.run('fault-observe-'+stage, variant, 0, ['fault', directory], '35,38', directory)
  run('fault-reopen-'+stage, expected_state, directory)
-gate.finish('PASS_FLEET_STORE_SYNTHETIC', observerSHA256=native.sha(Path(__file__).read_bytes()), raceResults=results, injectedFaults=['write','file-sync','rename','dir-sync'], negativeControls=['signature-verification-bypass','checkpoint-compare-bypass','modified-checkpoint'],
- scope='local native synthetic data; trusted checkpoint supplied externally; no rollback protection, real trust, network or release')
+# Pause a test-only adapter after an operation, verify the real lock is held,
+# SIGKILL the writer and reopen from a fresh process. No power cut is simulated.
+pause_helper = b"""
+(defn- pause-after [enabled :bool ok :bool] :bool
+  (if (and enabled ok)
+    (let [base (typed-cap-call :cli/args :string :string "1")
+          signal (typed-cap-call :fs/app-data :string :string
+                   (string-concat base "/readyWRITE_SEPready"))]
+      (if (not= signal "ready") false
+        (loop [i 0] (if (= i 9223372036854775807) false (recur (+ i 1)))))) ok))
+"""
+crash_results=[]
+for stage,needle,replacement,expected_state in [
+ ('partial-write',write,b'(pause-after true (= (typed-cap-call :fs/app-data :string :string (string-concat path \"WRITE_SEPpartial\")) \"partial\"))','state-old'),
+ ('write',write,b'(pause-after true '+write+b')','state-old'),
+ ('file-sync',sync,b'(pause-after (>= (string-index-of path "fleet.state.pending") 0) '+sync+b')','state-old'),
+ ('rename',rename,b'(pause-after true '+rename+b')','state-new'),
+ ('dir-sync',sync,b'(pause-after (< (string-index-of path "fleet.state.pending") 0) '+sync+b')','state-new')]:
+ if io.count(needle)!=1: raise ValueError('unexpected I/O source: '+stage)
+ modified=io.replace(b'(:capabilities [:fs/app-data])',b'(:capabilities [:fs/app-data :cli/args])')
+ modified=modified.replace(needle,replacement)+pause_helper
+ mutant=dict(sources);mutant['hata/store_io.kotoba']=modified
+ writer=gate.build('crash-'+stage,'kagami/fleet_store_native_test.kotoba',mutant)
+ directory=gate.out/('crash-'+stage+'-state');directory.mkdir();run('crash-init-'+stage,'init',directory)
+ if gate.darwin:
+  child=gate.fd3([writer,*gate.guest_args(['race',directory])],popen=True)
+ else:
+  command=[gate.runner,writer,'0','0','x86_64','35,38','--','race',directory]
+  env=dict(gate.env('35,38',directory),KEXE_FUEL='100000000000',KEXE_STRUCTURED_REPORT='1')
+  child=subprocess.Popen(list(map(str,command)),cwd=gate.out,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+ try:
+  deadline=time.monotonic()+60
+  while not (directory/'ready').exists():
+   if child.poll() is not None: raise ValueError(('writer exited before hook',stage,child.communicate()))
+   if time.monotonic()>=deadline: raise TimeoutError(('writer hook',stage))
+   time.sleep(.01)
+  run('crash-lock-held-'+stage,'race',directory,11)
+ finally:
+  if child.poll() is None: child.kill()
+  stdout,stderr=child.communicate(timeout=10)
+ if child.returncode!=-signal.SIGKILL or stdout or stderr: raise ValueError(('unexpected writer exit',stage,child.returncode,stdout,stderr))
+ run('crash-reopen-'+stage,expected_state,directory)
+ run('crash-retry-'+stage,'success' if expected_state=='state-old' else 'stale',directory)
+ run('crash-final-'+stage,'state-new',directory)
+ crash_results.append({'stage':stage,'exit':child.returncode,'reopened':expected_state,'retry':'success' if expected_state=='state-old' else 'stale'})
+gate.finish('PASS_FLEET_STORE_SYNTHETIC', observerSHA256=native.sha(Path(__file__).read_bytes()), raceResults=results, crashResults=crash_results, injectedFaults=['write','file-sync','rename','dir-sync'], negativeControls=['signature-verification-bypass','checkpoint-compare-bypass','modified-checkpoint'],
+ scope='local native synthetic data and SIGKILL only; no power-cut test, rollback protection, real trust, network or release')
