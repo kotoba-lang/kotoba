@@ -5,7 +5,7 @@
 (ns kotoba.sqlite.database
   {:kotoba/export [create-cron-notepad validate-cron-notepad-image
                    insert-first-notepad-row insert-second-notepad-row
-                   append-notepad-row delete-notepad-key]}
+                   append-notepad-row delete-notepad-key delete-notepad-job]}
   (:require [kotoba.sqlite.header :as header]
             [kotoba.sqlite.notepad-record :as notepad-record]
             [kotoba.sqlite.page :as page]
@@ -311,7 +311,7 @@
                    previous-key (safe-span previous-payload previous-fields 5)
                    job (safe-span payload fields 2)
                    key (safe-span payload fields 5)]
-               (and (or (> (compare-bytes previous-job job 0) 0)
+               (and (or (< (compare-bytes previous-job job 0) 0)
                         (and (= (compare-bytes previous-job job 0) 0)
                              (< (compare-bytes previous-key key 0) 0)))
                     (index-cells-match-rows? index-page page-size image rows
@@ -403,27 +403,42 @@
          (= (bytes-count row-key) (bytes-count key))
          (bytes-equal? row-key key 0))))
 
+(defn- row-job-matches? [image :bytes rows :vector-i64 row-base :i64
+                         job-id :bytes] :bool
+  (let [row-job (safe-span image rows (+ row-base 1))]
+    (and (= (bytes-count row-job) (bytes-count job-id))
+         (bytes-equal? row-job job-id 0))))
+
+(defn- row-delete-matches? [image :bytes rows :vector-i64 row-base :i64
+                            delete-job? :bool job-id :bytes key :bytes] :bool
+  (if delete-job?
+    (row-job-matches? image rows row-base job-id)
+    (row-key-matches? image rows row-base job-id key)))
+
 (defn- row-field [image :bytes rows :vector-i64 row-base :i64 field :i64]
                  :bytes
   (safe-span image rows (+ row-base 1 (* field 2))))
 
-(defn- key-present? [image :bytes rows :vector-i64 row-index :i64
-                     job-id :bytes key :bytes] :bool
+(defn- delete-target-count [image :bytes rows :vector-i64 row-index :i64
+                            delete-job? :bool job-id :bytes key :bytes] :i64
   (if (= row-index (quot (vector-count rows) 9))
-    false
-    (if (row-key-matches? image rows (* row-index 9) job-id key)
-      true
-      (key-present? image rows (+ row-index 1) job-id key))))
+    0
+    (+ (if (row-delete-matches? image rows (* row-index 9)
+                                delete-job? job-id key)
+         1 0)
+       (delete-target-count image rows (+ row-index 1) delete-job?
+                            job-id key))))
 
 (defn- rebuild-table-leaf [image :bytes rows :vector-i64 page-size :i64
-                           row-index :i64 job-id :bytes key :bytes
+                           row-index :i64 delete-job? :bool
+                           job-id :bytes key :bytes
                            page-image :bytes] :bytes
   (if (= row-index (quot (vector-count rows) 9))
     page-image
     (let [row-base (* row-index 9)
           rowid (vector-at rows row-base)
           next-page
-            (if (row-key-matches? image rows row-base job-id key)
+            (if (row-delete-matches? image rows row-base delete-job? job-id key)
               page-image
               (page/append-table-leaf-cell
                 page-image
@@ -436,10 +451,11 @@
       (if (= (bytes-count next-page) 0)
         (empty-bytes)
         (rebuild-table-leaf image rows page-size (+ row-index 1)
-                            job-id key next-page)))))
+                            delete-job? job-id key next-page)))))
 
 (defn- rebuild-index-leaf [image :bytes rows :vector-i64 page-size :i64
-                           row-index :i64 job-id :bytes key :bytes
+                           row-index :i64 delete-job? :bool
+                           job-id :bytes key :bytes
                            page-image :bytes] :bytes
   (if (= row-index (quot (vector-count rows) 9))
     page-image
@@ -459,22 +475,24 @@
                        row-data)
           row-cell (page/encode-index-leaf-cell row-record page-size 0)
           next-page
-            (if (row-key-matches? image rows row-base job-id key)
+            (if (row-delete-matches? image rows row-base delete-job? job-id key)
               page-image
               (page/append-index-leaf-cell page-image row-cell page-size 3 0))]
       (if (= (bytes-count next-page) 0)
         (empty-bytes)
         (rebuild-index-leaf image rows page-size (+ row-index 1)
-                            job-id key next-page)))))
+                            delete-job? job-id key next-page)))))
 
-(defn- delete-valid-notepad-key [image :bytes rows :vector-i64 page-size :i64
-                                 job-id :bytes key :bytes] :bytes
-  (let [found (key-present? image rows 0 job-id key)
+(defn- delete-valid-notepad [image :bytes rows :vector-i64 page-size :i64
+                             delete-job? :bool job-id :bytes key :bytes] :bytes
+  (let [deleted-count (delete-target-count image rows 0 delete-job? job-id key)
         empty-table (page/encode-empty-leaf-page 13 page-size 2 0)
         empty-index (page/encode-empty-leaf-page 10 page-size 3 0)
-        table-page (rebuild-table-leaf image rows page-size 0 job-id key
+        table-page (rebuild-table-leaf image rows page-size 0 delete-job?
+                                       job-id key
                                        empty-table)
-        index-page (rebuild-index-leaf image rows page-size 0 job-id key
+        index-page (rebuild-index-leaf image rows page-size 0 delete-job?
+                                       job-id key
                                        empty-index)
         next-header (header/advance-change-counter (bytes-slice image 0 100))
         next-image (bytes-concat
@@ -483,18 +501,19 @@
                        (bytes-concat table-page index-page))
                      (bytes-slice image (* page-size 3) (bytes-count image)))
         next-rows (reader/read-notepad-image next-image page-size)]
-    (if (not found)
+    (if (= deleted-count 0)
       image
       (if (or (= (bytes-count table-page) 0)
               (= (bytes-count index-page) 0)
               (= (bytes-count next-header) 0)
-              (not= (vector-count next-rows) (- (vector-count rows) 9)))
+              (not= (vector-count next-rows)
+                    (- (vector-count rows) (* deleted-count 9))))
         (empty-bytes)
         next-image))))
 
-;; Delete exactly one (job_id,key) row from the admitted single-page roots.
-;; Surviving rowids and row values are preserved; page images are compacted.
-;; A missing key is a no-op. Unsupported shapes or index/table disagreement
+;; Delete an exact (job_id,key), or all rows for one job, from the admitted
+;; single-page roots. Surviving rowids and values are preserved; pages compact.
+;; Missing targets are no-ops. Unsupported shapes or index/table disagreement
 ;; refuse before changing the image.
 (defn delete-notepad-key [image :bytes page-size :i64
                           job-id :bytes key :bytes] :bytes
@@ -520,4 +539,29 @@
             (> row-count 127)
             (not (index-cells-match-rows? index-page page-size image rows 0)))
       (empty-bytes)
-      (delete-valid-notepad-key image rows page-size job-id key))))
+      (delete-valid-notepad image rows page-size false job-id key))))
+
+(defn delete-notepad-job [image :bytes page-size :i64 job-id :bytes] :bytes
+  (let [header-fields (header/decode image)
+        rows (reader/read-notepad-image image page-size)
+        empty-image (create-cron-notepad page-size)
+        schema-page-match (bytes-equal? (bytes-slice image 100 page-size)
+                                        (bytes-slice empty-image 100 page-size) 0)
+        table-page (bytes-slice image (* page-size 1) (* page-size 2))
+        index-page (bytes-slice image (* page-size 2) (* page-size 3))
+        table-header (page/decode-header table-page page-size 2 0)
+        index-header (page/decode-header index-page page-size 3 0)
+        row-count (quot (vector-count rows) 9)]
+    (if (or (not= (bytes-count image) (* page-size 3))
+            (not= (vector-at header-fields 0) page-size)
+            (not= (vector-at header-fields 5) 3)
+            (not schema-page-match)
+            (not= (* row-count 9) (vector-count rows))
+            (not= (vector-at table-header 0) 13)
+            (not= (vector-at table-header 3) row-count)
+            (not= (vector-at index-header 0) 10)
+            (not= (vector-at index-header 3) row-count)
+            (> row-count 127)
+            (not (index-cells-match-rows? index-page page-size image rows 0)))
+      (empty-bytes)
+      (delete-valid-notepad image rows page-size true job-id (empty-bytes)))))
