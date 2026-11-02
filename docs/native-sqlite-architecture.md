@@ -105,7 +105,8 @@ dated oracle only; oracle success never substitutes for Kotoba/Amu execution.
 
 The Kotoba package now has source for the fixed database header, signed-i64
 varints, four-TEXT notepad records, generic record-layout spans, B-tree page
-headers/cell pointers, table-leaf cells, and table-interior cell boundaries.
+headers/cell pointers, table-leaf cells, table-interior cell boundaries, and
+`sqlite_schema` table/primary-key autoindex record encoding.
 It can also encode a table-leaf cell when its payload fits on the page; it
 refuses negative rowids and payloads requiring overflow pages. A separate
 page builder places a cell into a bounded table-leaf page, including the
@@ -129,7 +130,11 @@ The ordered append fixture placed and decoded two cells in rowid order on both
 page-2 and page-1 leaf pages and refused an out-of-order rowid.
 The generic record encoder round-trips through the decoder, including a
 64-column record whose header-size varint occupies two bytes; its negative
-fixtures refuse reserved serial types and mismatched value widths.
+fixtures refuse reserved serial types and mismatched value widths. Schema
+entry fixtures encode the Itonami `cron_notepad` table DDL with rootpage 2 and
+its primary-key autoindex row with rootpage 3 and NULL SQL; rootpage-width and
+invalid-rootpage cases are also checked. The records have not yet been placed
+into a complete database image.
 The images have not yet been exported for independent SQLite readback.
 Zero-length data uses `bytes-from-vector-i64`; a standalone guest
 probe using `bytes-empty` exited 139, so that Amu runtime issue remains open.
